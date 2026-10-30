@@ -47,6 +47,19 @@ regardless). Both are performance-only (`out` and the pools are bitwise the plai
 `plan.declaration`: `cache_write_in_norm_rope`, `use_pdl` (the resolved switch), `use_pdl_requested` (`None` = the default),
 `use_pdl_effective` and `pdl_stages`; `"_CacheWrite"` is absent from `stages` where the write-through is folded in.
 
+## Members served
+
+One block, members by geometry: the kernels serve every GQA geometry at head dim 256 that passes the geometry gate
+(`Qwen35BlockGeometry.unsupported_reason`: `d_model % 256 == 0`, `rope_dim` 64 or 128), and the tests pin the family's rows -- the
+Qwen3.5-397B shards (32 / 2 at `d_model` 4096; 24 / 2 at 2560 for the 27B-class shards) and the **Qwen3.8-27B dense attention layer**
+(`d_model` 5120, 24 query / 4 KV heads x 256, `rope_dim` 64, `qk_norm_eps` 1e-6; `n_qkvg` 14336, GQA group 6), the geometry row cuDNN
+Frontend `4c8e24355` pins in its own layout contract and family table. For that member the three forms are validated here at the shapes
+a serving stack hands over: decode `q_len` 1 at page 16 and 4 at page 32 (batch 1 and 4, a padded entry among them, contexts to 2048
+keys) on the packed decode tile's claimed routes, extend as a 512-token step with an empty prefix and as a 512-token chunk behind a
+512-row cached prefix, the dense prefill at 512 tokens, and the packed K|V pool of "Arguments and layouts" -- the row
+`qwen_3_5_block_support(...)` advertises, with every declination around it (another `rope_dim`, another head dim, a `d_model` off the
+projection tile, a step past 32 decode rows) typed by name. No performance number is claimed for it in this draft.
+
 ## A step, vLLM-shaped
 
 ```python
@@ -57,13 +70,15 @@ from flashinfer.qwen_3_5_block import (
 )
 
 geometry = Qwen35BlockGeometry(d_model=4096, num_qo_heads=32, num_kv_heads=2)   # Qwen3.5-397B at TP 1; 16 / 1 at TP 2, 8 / 1 at TP 4, ...
+# the Qwen3.8-27B dense attention layer: Qwen35BlockGeometry(d_model=5120, num_qo_heads=24, num_kv_heads=4) -- see "Members served"
 assert qwen_3_5_block_support(torch.device("cuda"), geometry).served               # the init-time dispatch predicate (never raises)
 
 # load time: the merged qkv_proj weight (rows [q_proj (per-head [q_h | gate_h]) | k_proj | v_proj]) -> the block's bands
 weights = qwen_3_5_block_pack_weights(layer.qkv_proj.weight, layer.q_norm.weight, layer.k_norm.weight, geometry)
 w_o = layer.o_proj.weight                                                           # [d_model, H_q * 256], used as is
 
-# per step: the cache the stack allocated (FlashInfer NHD 5-D [num_pages, 2, page_size, H_kv, 256]; HND or a (k, v) pair also bind)
+# per step: the cache the stack allocated (FlashInfer NHD 5-D [num_pages, 2, page_size, H_kv, 256]; HND, a (k, v) pair, or the stack's
+# packed K|V pool [num_pages, H_kv, page_size, 512] as kv_layout="UNIFIED" also bind)
 cos, sin = qwen_3_5_block_rope_tables(positions, rotary_emb.cos_sin_cache)        # or the tables the stack already holds
 out = qwen_3_5_block_bf16_decode(hidden_states, cos, sin, weights, w_o, geometry=geometry,
                                  kv_cache=kv_cache, slot_mapping=slot_mapping,
@@ -78,11 +93,15 @@ out = qwen_3_5_block_bf16_extend(hidden_states, cos, sin, weights, w_o, geometry
 ## Arguments and layouts
 
 - **`kv_cache`**: FlashInfer's 5-D `[num_pages, 2, page_size, H_kv, D]` (`kv_layout="NHD"`) or `[num_pages, 2, H_kv, page_size, D]`
-  (`"HND"`) buffer, or a `(k_cache, v_cache)` pair of 4-D tensors in those layouts; bf16. The block binds its
-  `[num_pages, H_kv, page_size, D]` views by strides (no copy, no repack); `D` must be contiguous, every other stride a
-  16-byte multiple, the base 16-byte aligned. `page_size` is a positive multiple of 16 (16 / 32 / 64 / 128 validated) and is
-  read from the cache's shape by the functional entry points. The pools' page count, layout and strides are compiled into a
-  plan: another cache is another plan.
+  (`"HND"`) buffer, a `(k_cache, v_cache)` pair of 4-D tensors in those layouts, or -- `kv_layout="UNIFIED"` -- the serving stack's
+  packed K|V pool: ONE `[num_pages, H_kv, page_size, 2 x D]` tensor per layer with K in columns `[0, D)` and V in `[D, 2D)` of every
+  row (the 24 / 4 model family's `[pages, 4, 16 or 32, 512]` bf16 cache), bound as its two half views `kv[..., :D]` / `kv[..., D:]`
+  (both with strides `(H_kv x page_size x 2D, page_size x 2D, 2D, 1)` on a contiguous pool; the vendored tree's `unified` pool
+  layout); bf16. The block binds its `[num_pages, H_kv, page_size, D]` views by strides (no copy, no repack); `D` must be
+  contiguous, every other stride a 16-byte multiple, the base 16-byte aligned. `page_size` is a positive multiple of 16
+  (16 / 32 / 64 / 128 validated) and is read from the cache's shape by the functional entry points. The pools' page count, layout
+  and strides are compiled into a plan: another cache is another plan. The Qwen 3.8 sibling package spells its own stack's
+  NHD-ordered row `[num_pages, page_size, H_kv, 2 x D]` with the same word: the same binding, each stack's own axis order.
 - **`block_table`**: the dense `[batch, max_pages]` int32 table as vLLM holds it (row `0` = the NULL block of a padded
   entry); any row stride (a row slice of a wider table binds as a view) -- the row stride is compiled in, so plan with the
   table the steps will bind. The CSR triple (`kv_indptr`, `kv_indices`, `kv_last_page_len`) is not accepted.
@@ -102,6 +121,14 @@ out = qwen_3_5_block_bf16_extend(hidden_states, cos, sin, weights, w_o, geometry
   the same function under every value.
 - Every VALUE in the index tensors is device data (never read on the host); only the FORM is checked, host-side and
   typed, before any launch.
+
+The three cache spellings (`qwen_3_5_block_support(...).kv_layouts` / `.kv_layout_shapes`):
+
+| `kv_layout` | the cache tensor | the block's two views |
+|---|---|---|
+| `"NHD"` | `[num_pages, 2, page_size, H_kv, D]`, or a `(k, v)` pair of `[num_pages, page_size, H_kv, D]` | `kv[:, 0]` / `kv[:, 1]`, the page and head axes swapped by strides |
+| `"HND"` | `[num_pages, 2, H_kv, page_size, D]`, or a `(k, v)` pair of `[num_pages, H_kv, page_size, D]` | `kv[:, 0]` / `kv[:, 1]` |
+| `"UNIFIED"` | `[num_pages, H_kv, page_size, 2 x D]`, the packed K\|V pool | `kv[..., :D]` / `kv[..., D:]` |
 
 ## Capture and replay
 
@@ -131,6 +158,7 @@ out = qwen_3_5_block_bf16_extend(hidden_states, cos, sin, weights, w_o, geometry
 |---|---|
 | not cc 10.7; `nvidia-cutlass-dsl` absent, below 4.8.0 or without the Rubin target; f16 / fp8 on the bf16 entry; `head_dim != 256`, `d_model % 256`, `rope_dim` not 64 / 128, more than 32 decode rows | `NotImplementedError` naming the device / version / feature (and `qwen_3_5_block_support` reports it without raising) |
 | a malformed tensor (dtype, rank, shape, strides, alignment, device), a page size off the contract, a call outside the plan's capacities, a token count off the small-capacity plans' multiple | `ValueError` naming the operand and the expected form |
+| a `UNIFIED` cache that is not ONE 4-D `[num_pages, H_kv, page_size, 2 x D]` tensor (a 5-D buffer or a `(k, v)` pair under that spelling, another trailing shape, another dtype, a head dim that is not contiguous, a stride or a base off the 16-byte rule), or a cache of another layout / page count than the plan's pools | `ValueError` naming the operand and the expected form -- for a 5-D buffer or a pair, the spelling it binds under |
 | `prepare` / `plan` under capture; a functional entry point under capture on a bucket without a cached plan; `clear_plan_cache()` under capture | `RuntimeError` naming the remedy |
 
 No silent fallback: an unserved case never runs a slower path.
@@ -149,8 +177,8 @@ page sizes); the first probe on a served device and the first plan re-read them 
 - bf16 activations, weights and pools; `head_dim = 256`; `d_model % 256 == 0`; `rope_dim` 64 (the Qwen3.5 value) or 128
   (`qwen_3_5_block_support(...).rope_dims`: the fused norm + RoPE projection rotates whole 64-column epilogue-subtile pairs below
   the head dim, and the norm + RoPE kernels of the lowered decode chain shuffle 16 x a power-of-two elements -- 32 / 256 fail the
-  first rule, 192 the second); GQA groups as the Qwen3.5 shards have them
-  (32 / 2, 24 / 2, 16 / 1, 8 / 1, 4 / 1 ...); the decode envelope `q_len_per_req <= 4` claimed (the packed 16- / 32-column decode
+  first rule, 192 the second); GQA groups as the Qwen3.5 shards and the Qwen3.8-27B dense layer have them
+  (32 / 2, 24 / 2, 24 / 4, 16 / 1, 8 / 1, 4 / 1 ...); the decode envelope `q_len_per_req <= 4` claimed (the packed 16- / 32-column decode
   tile), up to 32 routed and declared -- the 64-column tile in one or two token units, the paged prefill tile with the group packed
   where the step fills the part (`batch x num_kv_heads >= 64`), the unpacked tile past a group's packed routes;
   `plan.declaration["decode_route"]` names the kernel, its width, token units and KV streams -- and a typed decline past it; no LSE
@@ -267,7 +295,12 @@ plan and workspace retained, `clear_plan_cache()` their release), cached steps u
 declines at plan time and at run time, the compiled-plan cache's location and reload path, the weight packer at TP 1 / 2 / 4 / 8
 (bitwise the cuDNN Frontend loader), the RoPE table helper, the plan cache's ownership contract on CPU (an eager-only plan freed
 at eviction, a captured one retained and revived, a cold bucket under capture refused) and the import-isolation test (the
-`cudnn` package blocked).
+`cudnn` package blocked). The Qwen3.8-27B dense member (24 / 4 at `d_model` 5120, `test_dense_27b.py`): decode `q_len` 1 at page 16
+and 4 at page 32 at batch 1 and 4 (a padded entry among them, contexts to 2048 keys) on the packed decode tile's claimed routes, a
+512-token extend step with an empty prefix and a 512-token chunk behind a 512-row cached prefix, the dense prefill at 512 tokens, the
+probe's verdict and the typed declines around the geometry; the packed K|V pool (`kv_layout="UNIFIED"`) bitwise the two-tensor HND
+pool holding the same bytes on the decode and the extend forms, its half views' identity and strides, and every malformed packed
+pool refused by name.
 Validated on an SM107 (cc 10.7) GPU with `nvidia-cutlass-dsl` 4.8.0 and torch 2.14 in a Python environment without the
 cudnn-frontend package; the public and internal CI matrices have no SM107 runner, so the GPU tests skip there and the CPU tests
 (support, weights, RoPE, plan cache, isolation) run everywhere, including under the CI images' `nvidia-cutlass-dsl` 4.7.0, where the
