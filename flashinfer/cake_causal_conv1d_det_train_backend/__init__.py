@@ -13,12 +13,12 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
-Backend of :mod:`flashinfer.cake_causal_conv1d_train`: the Cake packed width-4
+Backend of :mod:`flashinfer.cake_causal_conv1d_det_train`: the Cake packed width-4
 depthwise causal convolution + SiLU training forward / backward (SM100 / SM103 /
 SM107) as one self-contained package (host API bodies, the ``cake_jit`` registry,
 the pinned ``cake_build`` loader and the generated CUDA sources under ``csrc/``).
 The stable, ``@flashinfer_api``-decorated entry points and the full user-facing
-documentation live in :mod:`flashinfer.cake_causal_conv1d_train`; import that
+documentation live in :mod:`flashinfer.cake_causal_conv1d_det_train`; import that
 module.
 
 Host design (the knobs are keywords; no environment variable):
@@ -45,7 +45,7 @@ Host design (the knobs are keywords; no environment variable):
 - The forward (the dynamic token-chunk programs) takes its token chunks from
   int32 counters, two per channel tile, in a forward workspace that is zero
   before its first launch and that every launch leaves zero: a caller-owned
-  buffer (``workspace=``, from :func:`cake_causal_conv1d_train_forward_workspace`)
+  buffer (``workspace=``, from :func:`cake_causal_conv1d_det_train_forward_workspace`)
   or, when omitted, a zeroed buffer this module keeps per (device, current
   stream), grown as needed and never zeroed again; inside a CUDA Graph capture
   an omitted workspace is a zeroed buffer of the call's own (its zeroing is
@@ -130,7 +130,7 @@ def _device_arch(device: torch.device) -> str:
     return arch
 
 
-def is_cake_causal_conv1d_train_supported(device: torch.device) -> bool:
+def is_cake_causal_conv1d_det_train_supported(device: torch.device) -> bool:
     """Whether ``device`` has the exported routes every architecture ships (``fwd`` and ``bwd``).
 
     The optional routes (bias, BF16 taps / gradients, FP32 SiLU') are checked
@@ -371,7 +371,7 @@ def _launch(
     return scalars, grid
 
 
-def cake_causal_conv1d_train_backward_workspace_bytes(
+def cake_causal_conv1d_det_train_backward_workspace_bytes(
     S: int, C: int, device: torch.device
 ) -> int:
     """Bytes of the caller-owned backward workspace for ``C`` channels on ``device``.
@@ -411,16 +411,16 @@ def cake_causal_conv1d_train_backward_workspace_bytes(
     )
 
 
-def cake_causal_conv1d_train_backward_workspace(
+def cake_causal_conv1d_det_train_backward_workspace(
     S: int, C: int, device: torch.device
 ) -> torch.Tensor:
     """Allocate a backward workspace (see ``..._workspace_bytes``; no zeroing is needed)."""
 
-    nbytes = cake_causal_conv1d_train_backward_workspace_bytes(S, C, device)
+    nbytes = cake_causal_conv1d_det_train_backward_workspace_bytes(S, C, device)
     return torch.empty(nbytes, dtype=torch.uint8, device=torch.device(device))
 
 
-def cake_causal_conv1d_train_forward_workspace_bytes(
+def cake_causal_conv1d_det_train_forward_workspace_bytes(
     S: int, C: int, device: torch.device
 ) -> int:
     """Bytes of the caller-owned forward workspace for ``C`` channels on ``device``.
@@ -448,13 +448,13 @@ def cake_causal_conv1d_train_forward_workspace_bytes(
     return 4 * forward_workspace_words(_device_arch(device), C)
 
 
-def cake_causal_conv1d_train_forward_workspace(
+def cake_causal_conv1d_det_train_forward_workspace(
     S: int, C: int, device: torch.device
 ) -> torch.Tensor:
     """Allocate a zeroed int32 forward workspace (see ``..._workspace_bytes``); keep it for every later forward
     call of one stream."""
 
-    nbytes = cake_causal_conv1d_train_forward_workspace_bytes(S, C, device)
+    nbytes = cake_causal_conv1d_det_train_forward_workspace_bytes(S, C, device)
     return torch.zeros(nbytes // 4, dtype=torch.int32, device=torch.device(device))
 
 
@@ -483,7 +483,7 @@ def _forward_work(
         if ws.numel() < words:
             raise ValueError(
                 f"workspace holds {ws.numel()} int32 words; this call needs at least "
-                f"{words}; allocate cake_causal_conv1d_train_forward_workspace(S, C, device)"
+                f"{words}; allocate cake_causal_conv1d_det_train_forward_workspace(S, C, device)"
             )
         return ws
     if words == 0:
@@ -521,13 +521,13 @@ def _partial_view(
         raise ValueError(
             f"workspace holds {ws.numel()} bytes; this call needs at least "
             f"{nbytes}; allocate "
-            "cake_causal_conv1d_train_backward_workspace_bytes(S, C, device) bytes"
+            "cake_causal_conv1d_det_train_backward_workspace_bytes(S, C, device) bytes"
         )
     taps = int(record["workspace_rule"]["taps"])
     return ws[:nbytes].view(torch.float32).view(rows, C, taps)
 
 
-def cake_causal_conv1d_train_forward(
+def cake_causal_conv1d_det_train_forward(
     x: torch.Tensor,
     weight: torch.Tensor,
     cu_seqlens: torch.Tensor,
@@ -557,7 +557,7 @@ def cake_causal_conv1d_train_forward(
         Preallocated BF16 output of ``x``'s shape, contiguous.
     workspace : torch.Tensor, optional
         Caller-owned int32 buffer from
-        :func:`cake_causal_conv1d_train_forward_workspace` (the token-chunk
+        :func:`cake_causal_conv1d_det_train_forward_workspace` (the token-chunk
         counters, zero before its first launch; every launch leaves it zero,
         so one buffer serves every later call of one stream).  Two launches
         that may run at once need two buffers.  When omitted the package
@@ -614,7 +614,7 @@ def cake_causal_conv1d_train_forward(
     return y
 
 
-def cake_causal_conv1d_train_backward(
+def cake_causal_conv1d_det_train_backward(
     x: torch.Tensor,
     weight: torch.Tensor,
     cu_seqlens: torch.Tensor,
@@ -633,7 +633,7 @@ def cake_causal_conv1d_train_backward(
     ----------
     x, weight, cu_seqlens, bias
         The forward's inputs (same contracts as
-        :func:`cake_causal_conv1d_train_forward`); nothing else is saved.
+        :func:`cake_causal_conv1d_det_train_forward`); nothing else is saved.
     dy : torch.Tensor
         BF16 gradient of ``y``, ``x``'s shape, contiguous.
     silu_grad_preactivation : {"bf16", "fp32"}
@@ -644,7 +644,7 @@ def cake_causal_conv1d_train_backward(
         reduction (~2e-7).  ``dx`` is within one BF16 ulp of exact either way.
     workspace : torch.Tensor, optional
         Caller-owned ``uint8`` buffer from
-        :func:`cake_causal_conv1d_train_backward_workspace`; allocated when
+        :func:`cake_causal_conv1d_det_train_backward_workspace`; allocated when
         omitted.
     dx, dweight, dbias : torch.Tensor, optional
         Preallocated outputs: BF16 of ``x``'s shape, ``[C, 4]`` and ``[C]``
@@ -665,7 +665,7 @@ def cake_causal_conv1d_train_backward(
     host-side rule (``cake_jit.selected_modules``; the data is never read), so a
     given ``(S, C, device)`` and route always run the same program.  The
     ``workspace`` is sized for every program of every route
-    (:func:`cake_causal_conv1d_train_backward_workspace_bytes`); the selected
+    (:func:`cake_causal_conv1d_det_train_backward_workspace_bytes`); the selected
     program uses the leading rows of its own grid.
 
     A call is two ordinary launches on the current stream: the selected
@@ -748,7 +748,7 @@ def cake_causal_conv1d_train_backward(
     scalars, grid = _launch(record, S, C, num_docs, device_index=device_index)
     grid_x = grid[0]
     if workspace is None:
-        workspace = cake_causal_conv1d_train_backward_workspace(S, C, device)
+        workspace = cake_causal_conv1d_det_train_backward_workspace(S, C, device)
     rows = partial_rows(grid_x, scalars["n_ch_tiles"])
     partial = _partial_view(workspace, record, C=C, rows=rows, device=device)
     values: dict[str, object] = {
@@ -782,12 +782,12 @@ def cake_causal_conv1d_train_backward(
     return dx_out, dw_out, db_out
 
 
-class CakeCausalConv1dFunction(torch.autograd.Function):
+class CakeCausalConv1dDetFunction(torch.autograd.Function):
     """Autograd wrapper saving only ``(x, weight, cu_seqlens, bias)`` for the backward.
 
     ``forward(x, weight, cu_seqlens, bias=None, silu_grad_preactivation="bf16")``
     returns ``y``; the backward runs the fused ``dx`` + deterministic
-    ``dweight`` (+ ``dbias``) pair of launches of :func:`cake_causal_conv1d_train_backward`
+    ``dweight`` (+ ``dbias``) pair of launches of :func:`cake_causal_conv1d_det_train_backward`
     on the incoming gradient (materialized as a contiguous BF16 tensor when
     autograd hands over another layout or dtype) and returns the gradients of
     ``weight`` and ``bias`` in the parameters' dtypes.
@@ -795,7 +795,7 @@ class CakeCausalConv1dFunction(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, x, weight, cu_seqlens, bias=None, silu_grad_preactivation="bf16"):
-        y = cake_causal_conv1d_train_forward(x, weight, cu_seqlens, bias=bias)
+        y = cake_causal_conv1d_det_train_forward(x, weight, cu_seqlens, bias=bias)
         ctx.save_for_backward(x, weight, cu_seqlens, bias)
         ctx.silu_grad_preactivation = _silu_grad_preactivation(silu_grad_preactivation)
         return y
@@ -806,7 +806,7 @@ class CakeCausalConv1dFunction(torch.autograd.Function):
         if grad_y is None:
             grad_y = torch.zeros_like(x)
         dy = grad_y.to(torch.bfloat16).contiguous()
-        grads = cake_causal_conv1d_train_backward(
+        grads = cake_causal_conv1d_det_train_backward(
             x,
             weight,
             cu_seqlens,
@@ -818,7 +818,7 @@ class CakeCausalConv1dFunction(torch.autograd.Function):
         return grads[0], grads[1], None, dbias, None
 
 
-def cake_causal_conv1d(
+def cake_causal_conv1d_det(
     x: torch.Tensor,
     weight: torch.Tensor,
     cu_seqlens: torch.Tensor,
@@ -841,7 +841,7 @@ def cake_causal_conv1d(
         FP32 or BF16 ``[C]`` contiguous per-channel bias.
     silu_grad_preactivation : {"bf16", "fp32"}
         The weight gradient's SiLU' policy (see
-        :func:`cake_causal_conv1d_train_backward`).
+        :func:`cake_causal_conv1d_det_train_backward`).
 
     Returns
     -------
@@ -851,9 +851,30 @@ def cake_causal_conv1d(
         (and ``dbias``) in the parameters' dtypes.
     """
 
-    return CakeCausalConv1dFunction.apply(
+    return CakeCausalConv1dDetFunction.apply(
         x, weight, cu_seqlens, bias, silu_grad_preactivation
     )
+
+
+# Compatibility names of the entry points, bound to the same objects as the det names.  They are attributes, not
+# ``__all__`` entries.
+CakeCausalConv1dFunction = CakeCausalConv1dDetFunction
+cake_causal_conv1d = cake_causal_conv1d_det
+cake_causal_conv1d_train_backward = cake_causal_conv1d_det_train_backward
+cake_causal_conv1d_train_backward_workspace = (
+    cake_causal_conv1d_det_train_backward_workspace
+)
+cake_causal_conv1d_train_backward_workspace_bytes = (
+    cake_causal_conv1d_det_train_backward_workspace_bytes
+)
+cake_causal_conv1d_train_forward = cake_causal_conv1d_det_train_forward
+cake_causal_conv1d_train_forward_workspace = (
+    cake_causal_conv1d_det_train_forward_workspace
+)
+cake_causal_conv1d_train_forward_workspace_bytes = (
+    cake_causal_conv1d_det_train_forward_workspace_bytes
+)
+is_cake_causal_conv1d_train_supported = is_cake_causal_conv1d_det_train_supported
 
 
 __all__ = [
@@ -861,13 +882,13 @@ __all__ = [
     "PARAMETER_DTYPES",
     "SILU_GRAD_PREACTIVATIONS",
     "SUPPORTED_COMPUTE_CAPABILITIES",
-    "CakeCausalConv1dFunction",
-    "cake_causal_conv1d",
-    "cake_causal_conv1d_train_backward",
-    "cake_causal_conv1d_train_backward_workspace",
-    "cake_causal_conv1d_train_backward_workspace_bytes",
-    "cake_causal_conv1d_train_forward",
-    "cake_causal_conv1d_train_forward_workspace",
-    "cake_causal_conv1d_train_forward_workspace_bytes",
-    "is_cake_causal_conv1d_train_supported",
+    "CakeCausalConv1dDetFunction",
+    "cake_causal_conv1d_det",
+    "cake_causal_conv1d_det_train_backward",
+    "cake_causal_conv1d_det_train_backward_workspace",
+    "cake_causal_conv1d_det_train_backward_workspace_bytes",
+    "cake_causal_conv1d_det_train_forward",
+    "cake_causal_conv1d_det_train_forward_workspace",
+    "cake_causal_conv1d_det_train_forward_workspace_bytes",
+    "is_cake_causal_conv1d_det_train_supported",
 ]

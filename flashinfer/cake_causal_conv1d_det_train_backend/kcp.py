@@ -21,7 +21,7 @@ before each continuing fragment, received from the ranks that hold them by one
 derivative back to the predecessor fragments, which fold it into their last
 rows' ``dx`` before the one BF16 rounding.  ``cake_causal_conv1d_kcp(x_local,
 weight, ctx)`` is the autograd entry; the stable, ``@flashinfer_api``-decorated
-facade is :mod:`flashinfer.cake_causal_conv1d_train`.  This module imports
+facade is :mod:`flashinfer.cake_causal_conv1d_det_train`.  This module imports
 only ``os``, torch, torch.distributed, tvm_ffi and its own package.
 
 Registry contract (``kcp_jit``, the KCP records beside the zero-history

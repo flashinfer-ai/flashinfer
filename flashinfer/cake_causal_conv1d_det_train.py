@@ -57,7 +57,7 @@ The forward is one ordinary launch: the co-resident CTAs of each channel tile
 take the tile's tokens in chunks from int32 counters on the device (the CTAs
 that finish first take the tail), so ``y`` is the same bits whatever CTA
 computes a chunk.  The counters live in a forward workspace of
-``cake_causal_conv1d_train_forward_workspace_bytes(S, C, device)`` bytes that is
+``cake_causal_conv1d_det_train_forward_workspace_bytes(S, C, device)`` bytes that is
 zero before its first launch and that every launch leaves zero, so one buffer
 serves every later forward call of one stream, CUDA Graph replays included.  A
 caller may own it (``workspace=``); otherwise the package keeps one zeroed
@@ -77,7 +77,7 @@ route, and within a route the channel count selects one of the architecture's
 programs through a host-side rule of the backend's registry (never the data),
 so a given ``(S, C, device)`` and route always run the same program.  The
 workspace size is the maximum over every backward program of every route, so
-one buffer of ``cake_causal_conv1d_train_backward_workspace_bytes(S, C,
+one buffer of ``cake_causal_conv1d_det_train_backward_workspace_bytes(S, C,
 device)`` serves whichever program a call selects.  Before capturing a CUDA
 Graph, build every library of the device's architecture (the backend's
 ``cake_jit.specs_for_arch``) so that no JIT build happens inside the capture;
@@ -85,29 +85,29 @@ the captured graph holds the program selected for its shape and route.
 
 Usage::
 
-    y = cake_causal_conv1d_train_forward(x, weight, cu_seqlens)
-    dx, dweight = cake_causal_conv1d_train_backward(x, weight, cu_seqlens, dy)
+    y = cake_causal_conv1d_det_train_forward(x, weight, cu_seqlens)
+    dx, dweight = cake_causal_conv1d_det_train_backward(x, weight, cu_seqlens, dy)
 
     # a bias (FP32 or BF16, like the taps) adds a third output
-    y = cake_causal_conv1d_train_forward(x, weight, cu_seqlens, bias=bias)
-    dx, dweight, dbias = cake_causal_conv1d_train_backward(x, weight, cu_seqlens, dy, bias=bias)
+    y = cake_causal_conv1d_det_train_forward(x, weight, cu_seqlens, bias=bias)
+    dx, dweight, dbias = cake_causal_conv1d_det_train_backward(x, weight, cu_seqlens, dy, bias=bias)
 
     # SiLU' at the unrounded FP32 preactivation for a ~2e-7 rel-L2 weight gradient
-    dx, dweight = cake_causal_conv1d_train_backward(
+    dx, dweight = cake_causal_conv1d_det_train_backward(
         x, weight, cu_seqlens, dy, silu_grad_preactivation="fp32"
     )
 
     # autograd (saves x, weight, bias and cu_seqlens only)
-    y = cake_causal_conv1d(x, weight, cu_seqlens, bias)
+    y = cake_causal_conv1d_det(x, weight, cu_seqlens, bias)
 
     # caller-owned backward workspace (per-CTA FP32 partials, no zeroing needed)
-    ws = cake_causal_conv1d_train_backward_workspace(S, C, x.device)
-    dx, dweight = cake_causal_conv1d_train_backward(x, weight, cu_seqlens, dy, workspace=ws)
+    ws = cake_causal_conv1d_det_train_backward_workspace(S, C, x.device)
+    dx, dweight = cake_causal_conv1d_det_train_backward(x, weight, cu_seqlens, dy, workspace=ws)
 
     # caller-owned forward workspace (zeroed int32 token-chunk counters, left zero
     # by every launch: keep one per stream and reuse it for every later call)
-    fws = cake_causal_conv1d_train_forward_workspace(S, C, x.device)
-    y = cake_causal_conv1d_train_forward(x, weight, cu_seqlens, workspace=fws)
+    fws = cake_causal_conv1d_det_train_forward_workspace(S, C, x.device)
+    y = cake_causal_conv1d_det_train_forward(x, weight, cu_seqlens, workspace=fws)
 
     # context-parallel training: this rank's fragments of the packed batch, with the
     # history rows of the preceding fragments exchanged through the KCP context
@@ -125,17 +125,17 @@ from typing import Any, Optional, Sequence
 
 import torch
 
-from . import cake_causal_conv1d_train_backend as _backend
+from . import cake_causal_conv1d_det_train_backend as _backend
 from .api_logging import flashinfer_api
-from .cake_causal_conv1d_train_backend import (  # noqa: F401
+from .cake_causal_conv1d_det_train_backend import (  # noqa: F401
     ARCHES,
     SUPPORTED_COMPUTE_CAPABILITIES,
-    CakeCausalConv1dFunction,
-    cake_causal_conv1d_train_backward_workspace,
-    cake_causal_conv1d_train_backward_workspace_bytes,
-    cake_causal_conv1d_train_forward_workspace,
-    cake_causal_conv1d_train_forward_workspace_bytes,
-    is_cake_causal_conv1d_train_supported,
+    CakeCausalConv1dDetFunction,
+    cake_causal_conv1d_det_train_backward_workspace,
+    cake_causal_conv1d_det_train_backward_workspace_bytes,
+    cake_causal_conv1d_det_train_forward_workspace,
+    cake_causal_conv1d_det_train_forward_workspace_bytes,
+    is_cake_causal_conv1d_det_train_supported,
 )
 
 # The three stable entry points are real ``def``s here (public-API tooling reads the
@@ -145,7 +145,7 @@ from .cake_causal_conv1d_train_backend import (  # noqa: F401
 
 
 @flashinfer_api
-def cake_causal_conv1d_train_forward(
+def cake_causal_conv1d_det_train_forward(
     x: torch.Tensor,
     weight: torch.Tensor,
     cu_seqlens: torch.Tensor,
@@ -177,11 +177,11 @@ def cake_causal_conv1d_train_forward(
         Preallocated BF16 output of ``x``'s shape, contiguous.
     workspace : torch.Tensor, optional
         Caller-owned ``int32`` buffer from
-        :func:`cake_causal_conv1d_train_forward_workspace` (the token-chunk
+        :func:`cake_causal_conv1d_det_train_forward_workspace` (the token-chunk
         counters: zero before its first launch, left zero by every launch, so
         one buffer serves every later call of one stream, CUDA Graph replays
         included; two launches that may run at once need two buffers).  Its
-        size (:func:`cake_causal_conv1d_train_forward_workspace_bytes`) is the
+        size (:func:`cake_causal_conv1d_det_train_forward_workspace_bytes`) is the
         most over every forward route.  When omitted the package uses a zeroed
         buffer it keeps per (device, current stream), or a zeroed buffer of the
         call's own inside a CUDA Graph capture.
@@ -194,13 +194,13 @@ def cake_causal_conv1d_train_forward(
         first token.  ``S == 0`` returns the empty output without launching.
     """
 
-    return _backend.cake_causal_conv1d_train_forward(
+    return _backend.cake_causal_conv1d_det_train_forward(
         x, weight, cu_seqlens, bias=bias, out=out, workspace=workspace
     )
 
 
 @flashinfer_api
-def cake_causal_conv1d_train_backward(
+def cake_causal_conv1d_det_train_backward(
     x: torch.Tensor,
     weight: torch.Tensor,
     cu_seqlens: torch.Tensor,
@@ -237,7 +237,7 @@ def cake_causal_conv1d_train_backward(
     ----------
     x, weight, cu_seqlens, bias
         The forward's inputs (same contracts as
-        :func:`cake_causal_conv1d_train_forward`); nothing else is saved.
+        :func:`cake_causal_conv1d_det_train_forward`); nothing else is saved.
     dy : torch.Tensor
         BF16 gradient of ``y``, ``x``'s shape, contiguous.
     silu_grad_preactivation : {"bf16", "fp32"}
@@ -249,10 +249,10 @@ def cake_causal_conv1d_train_backward(
         both.
     workspace : torch.Tensor, optional
         Caller-owned ``uint8`` buffer from
-        :func:`cake_causal_conv1d_train_backward_workspace` (the per-CTA FP32
+        :func:`cake_causal_conv1d_det_train_backward_workspace` (the per-CTA FP32
         ``dweight`` / ``dbias`` partials; fully written by the kernel, so it
         needs no zeroing); allocated when omitted.  Its size
-        (:func:`cake_causal_conv1d_train_backward_workspace_bytes`) is the
+        (:func:`cake_causal_conv1d_det_train_backward_workspace_bytes`) is the
         maximum over every backward program of every route, so one buffer
         serves whichever program a call selects.
     dx, dweight, dbias : torch.Tensor, optional
@@ -271,7 +271,7 @@ def cake_causal_conv1d_train_backward(
     returns the empty ``dx`` and zero gradients without launching.
     """
 
-    return _backend.cake_causal_conv1d_train_backward(
+    return _backend.cake_causal_conv1d_det_train_backward(
         x,
         weight,
         cu_seqlens,
@@ -286,7 +286,7 @@ def cake_causal_conv1d_train_backward(
 
 
 @flashinfer_api
-def cake_causal_conv1d(
+def cake_causal_conv1d_det(
     x: torch.Tensor,
     weight: torch.Tensor,
     cu_seqlens: torch.Tensor,
@@ -309,7 +309,7 @@ def cake_causal_conv1d(
         FP32 or BF16 ``[C]`` contiguous per-channel bias.
     silu_grad_preactivation : {"bf16", "fp32"}
         The weight gradient's SiLU' policy (see
-        :func:`cake_causal_conv1d_train_backward`).
+        :func:`cake_causal_conv1d_det_train_backward`).
 
     Returns
     -------
@@ -317,11 +317,11 @@ def cake_causal_conv1d(
         BF16 ``y`` of ``x``'s shape.  The backward saves only ``x``, ``weight``,
         ``bias`` and ``cu_seqlens`` and launches the fused ``dx`` +
         deterministic ``dweight`` (+ ``dbias``) kernel of
-        :func:`cake_causal_conv1d_train_backward`; the parameters' gradients
+        :func:`cake_causal_conv1d_det_train_backward`; the parameters' gradients
         come in the parameters' dtypes.
     """
 
-    return _backend.cake_causal_conv1d(
+    return _backend.cake_causal_conv1d_det(
         x, weight, cu_seqlens, bias, silu_grad_preactivation=silu_grad_preactivation
     )
 
@@ -338,7 +338,7 @@ def cake_causal_conv1d_kcp(
 
     The first tokens of a fragment that continues a document read the history rows of the preceding fragment
     (exchanged through the context's halo collective) instead of zeros, so the result equals the single-rank
-    :func:`cake_causal_conv1d` of the whole batch on this rank's tokens.  The KCP path takes FP32 taps and no
+    :func:`cake_causal_conv1d_det` of the whole batch on this rank's tokens.  The KCP path takes FP32 taps and no
     bias (the package's pre-round-6 contract).
 
     Parameters
@@ -352,7 +352,7 @@ def cake_causal_conv1d_kcp(
         From ``flashinfer.kda_train.build_kcp_context`` (the same context the KDA step of the rank uses).
     recompute_handle : KcpRecomputeHandle, optional
         Keyword-only, default ``None`` (unchanged behavior).  A handle (any object with an ``entries`` dict, such as
-        ``flashinfer.cake_causal_conv1d_train.KcpRecomputeHandle``) makes the checkpoint recompute of
+        ``flashinfer.cake_causal_conv1d_det_train.KcpRecomputeHandle``) makes the checkpoint recompute of
         this call run without the forward halo exchange: the original forward exchanges as always and stores its
         history rows (the saved set's own tensor, key ``"conv"``) in the handle; torch's recompute of the forward
         inside the backward reads them back, so ``y`` and the gradients are bitwise those of the same checkpoint
@@ -372,7 +372,7 @@ def cake_causal_conv1d_kcp(
         fused ``dx`` + deterministic FP32 ``dweight`` kernel of this rank's fragments.
     """
 
-    from .cake_causal_conv1d_train_backend import kcp as _kcp
+    from .cake_causal_conv1d_det_train_backend import kcp as _kcp
 
     return _kcp.cake_causal_conv1d_kcp(
         x_local, weight, ctx, recompute_handle=recompute_handle
@@ -421,18 +421,39 @@ def cake_causal_conv1d_kcp_multi(
         The ``n`` BF16 outputs, each of its input's shape.
     """
 
-    from .cake_causal_conv1d_train_backend import kcp as _kcp
+    from .cake_causal_conv1d_det_train_backend import kcp as _kcp
 
     return _kcp.cake_causal_conv1d_kcp_multi(
         xs, weights, ctx, recompute_handle=recompute_handle
     )
 
 
+# Compatibility names of the single-rank entry points, each bound to the same object as its det name
+# (one ``flashinfer_api`` wrapper per entry point).  They are attributes, not ``__all__`` entries.
+CakeCausalConv1dFunction = CakeCausalConv1dDetFunction
+cake_causal_conv1d = cake_causal_conv1d_det
+cake_causal_conv1d_train_backward = cake_causal_conv1d_det_train_backward
+cake_causal_conv1d_train_backward_workspace = (
+    cake_causal_conv1d_det_train_backward_workspace
+)
+cake_causal_conv1d_train_backward_workspace_bytes = (
+    cake_causal_conv1d_det_train_backward_workspace_bytes
+)
+cake_causal_conv1d_train_forward = cake_causal_conv1d_det_train_forward
+cake_causal_conv1d_train_forward_workspace = (
+    cake_causal_conv1d_det_train_forward_workspace
+)
+cake_causal_conv1d_train_forward_workspace_bytes = (
+    cake_causal_conv1d_det_train_forward_workspace_bytes
+)
+is_cake_causal_conv1d_train_supported = is_cake_causal_conv1d_det_train_supported
+
+
 def __getattr__(name: str) -> Any:
     # ``KcpRecomputeHandle`` (the KCP route's checkpoint recompute handle) resolves on first access, so importing the
     # facade does not import the KCP host module (torch.distributed, the KCP loader), like the entry point above.
     if name == "KcpRecomputeHandle":
-        from .cake_causal_conv1d_train_backend.kcp import KcpRecomputeHandle
+        from .cake_causal_conv1d_det_train_backend.kcp import KcpRecomputeHandle
 
         return KcpRecomputeHandle
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
@@ -441,16 +462,16 @@ def __getattr__(name: str) -> Any:
 __all__ = [
     "ARCHES",
     "SUPPORTED_COMPUTE_CAPABILITIES",
-    "CakeCausalConv1dFunction",
+    "CakeCausalConv1dDetFunction",
     "KcpRecomputeHandle",  # noqa: F822 - resolved by __getattr__
-    "cake_causal_conv1d",
+    "cake_causal_conv1d_det",
+    "cake_causal_conv1d_det_train_backward",
+    "cake_causal_conv1d_det_train_backward_workspace",
+    "cake_causal_conv1d_det_train_backward_workspace_bytes",
+    "cake_causal_conv1d_det_train_forward",
+    "cake_causal_conv1d_det_train_forward_workspace",
+    "cake_causal_conv1d_det_train_forward_workspace_bytes",
     "cake_causal_conv1d_kcp",
     "cake_causal_conv1d_kcp_multi",
-    "cake_causal_conv1d_train_backward",
-    "cake_causal_conv1d_train_backward_workspace",
-    "cake_causal_conv1d_train_backward_workspace_bytes",
-    "cake_causal_conv1d_train_forward",
-    "cake_causal_conv1d_train_forward_workspace",
-    "cake_causal_conv1d_train_forward_workspace_bytes",
-    "is_cake_causal_conv1d_train_supported",
+    "is_cake_causal_conv1d_det_train_supported",
 ]

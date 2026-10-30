@@ -63,8 +63,8 @@ This suite exercises the backend package alone: it names the package once,
 through ``tests.test_helpers.cake_package``, and imports nothing else from
 flashinfer, so a build that vendors the package under another import path
 runs it unchanged after pointing that table entry at its package.  The
-``flashinfer.cake_causal_conv1d_train`` facade and the ``flashinfer``
-top-level exposure are covered by ``test_cake_causal_conv1d_train_api.py``.
+``flashinfer.cake_causal_conv1d_det_train`` facade and the ``flashinfer``
+top-level exposure are covered by ``test_cake_causal_conv1d_det_train_api.py``.
 """
 
 from __future__ import annotations
@@ -80,26 +80,28 @@ import torch
 
 from tests.test_helpers.cake_package import cake_package
 
-pkg = cake_package("cake_causal_conv1d_train")
-cake_build = cake_package("cake_causal_conv1d_train", "cake_build")
-loader = cake_package("cake_causal_conv1d_train", "cake_jit")
-kcp_loader = cake_package("cake_causal_conv1d_train", "kcp_jit")
-cake_causal_conv1d = pkg.cake_causal_conv1d
-cake_causal_conv1d_train_backward = pkg.cake_causal_conv1d_train_backward
-cake_causal_conv1d_train_backward_workspace = (
-    pkg.cake_causal_conv1d_train_backward_workspace
+pkg = cake_package("cake_causal_conv1d_det_train")
+cake_build = cake_package("cake_causal_conv1d_det_train", "cake_build")
+loader = cake_package("cake_causal_conv1d_det_train", "cake_jit")
+kcp_loader = cake_package("cake_causal_conv1d_det_train", "kcp_jit")
+cake_causal_conv1d_det = pkg.cake_causal_conv1d_det
+cake_causal_conv1d_det_train_backward = pkg.cake_causal_conv1d_det_train_backward
+cake_causal_conv1d_det_train_backward_workspace = (
+    pkg.cake_causal_conv1d_det_train_backward_workspace
 )
-cake_causal_conv1d_train_backward_workspace_bytes = (
-    pkg.cake_causal_conv1d_train_backward_workspace_bytes
+cake_causal_conv1d_det_train_backward_workspace_bytes = (
+    pkg.cake_causal_conv1d_det_train_backward_workspace_bytes
 )
-cake_causal_conv1d_train_forward = pkg.cake_causal_conv1d_train_forward
-cake_causal_conv1d_train_forward_workspace = (
-    pkg.cake_causal_conv1d_train_forward_workspace
+cake_causal_conv1d_det_train_forward = pkg.cake_causal_conv1d_det_train_forward
+cake_causal_conv1d_det_train_forward_workspace = (
+    pkg.cake_causal_conv1d_det_train_forward_workspace
 )
-cake_causal_conv1d_train_forward_workspace_bytes = (
-    pkg.cake_causal_conv1d_train_forward_workspace_bytes
+cake_causal_conv1d_det_train_forward_workspace_bytes = (
+    pkg.cake_causal_conv1d_det_train_forward_workspace_bytes
 )
-is_cake_causal_conv1d_train_supported = pkg.is_cake_causal_conv1d_train_supported
+is_cake_causal_conv1d_det_train_supported = (
+    pkg.is_cake_causal_conv1d_det_train_supported
+)
 
 SUPPORTED_CAPABILITIES = ((10, 0), (10, 3), (10, 7))
 WIDTH = 4
@@ -245,13 +247,13 @@ def _supported() -> bool:
     return (
         torch.cuda.is_available()
         and _capability() in SUPPORTED_CAPABILITIES
-        and is_cake_causal_conv1d_train_supported(_device())
+        and is_cake_causal_conv1d_det_train_supported(_device())
     )
 
 
 pytestmark = pytest.mark.skipif(
     not _supported(),
-    reason="cake_causal_conv1d_train needs an SM100 / SM103 / SM107 device with exported routes",
+    reason="cake_causal_conv1d_det_train needs an SM100 / SM103 / SM107 device with exported routes",
 )
 
 
@@ -578,7 +580,7 @@ def _check(
         label
         or f"S={S} C={C} docs={docs} w={w.dtype} b={None if b is None else b.dtype} {policy}"
     )
-    y = cake_causal_conv1d_train_forward(x, w, cu, bias=b)
+    y = cake_causal_conv1d_det_train_forward(x, w, cu, bias=b)
     assert (
         y.dtype == torch.bfloat16
         and tuple(y.shape) == tuple(x.shape)
@@ -597,7 +599,7 @@ def _check(
         if dbias_dtype is None
         else torch.empty(C, dtype=dbias_dtype, device=_device())
     )
-    grads = cake_causal_conv1d_train_backward(
+    grads = cake_causal_conv1d_det_train_backward(
         x,
         w,
         cu,
@@ -653,7 +655,7 @@ def _route_inputs(S: int, C: int, docs, kind: str, *, key: int = 0):
 def _backward(x, w, cu, dy, b, policy, **kwargs):
     """``(dx, dweight, dbias_or_None)`` of one backward call."""
 
-    grads = cake_causal_conv1d_train_backward(
+    grads = cake_causal_conv1d_det_train_backward(
         x, w, cu, dy, bias=b, silu_grad_preactivation=policy, **kwargs
     )
     return grads[0], grads[1], (grads[2] if b is not None else None)
@@ -856,15 +858,15 @@ def test_main_grid_literal_table() -> None:
 # the kernel module's rules-test rows on both sides of the token and channel
 # boundaries; C = 512 is the first channel-selected program of every arch.
 BWD_FALLBACK = {
-    "sm_100a": "cake_causal_conv1d_train_9bfa65707a49df6a48ce",
-    "sm_103a": "cake_causal_conv1d_train_9bfa65707a49df6a48ce",
-    "sm_107a": "cake_causal_conv1d_train_b4f7ff5a3dd9ddd2f41c",
+    "sm_100a": "cake_causal_conv1d_det_train_9bfa65707a49df6a48ce",
+    "sm_103a": "cake_causal_conv1d_det_train_9bfa65707a49df6a48ce",
+    "sm_107a": "cake_causal_conv1d_det_train_b4f7ff5a3dd9ddd2f41c",
 }
-BWD_R200_ST4 = "cake_causal_conv1d_train_9a07bcaa0223632640ee"
+BWD_R200_ST4 = "cake_causal_conv1d_det_train_9a07bcaa0223632640ee"
 BWD_AT_512 = {
-    "sm_100a": "cake_causal_conv1d_train_37e428406a0cc4a8ca1b",
-    "sm_103a": "cake_causal_conv1d_train_d46036aa2bc5f90bb0f6",
-    "sm_107a": "cake_causal_conv1d_train_d46036aa2bc5f90bb0f6",
+    "sm_100a": "cake_causal_conv1d_det_train_37e428406a0cc4a8ca1b",
+    "sm_103a": "cake_causal_conv1d_det_train_d46036aa2bc5f90bb0f6",
+    "sm_107a": "cake_causal_conv1d_det_train_d46036aa2bc5f90bb0f6",
 }
 BWD_SELECTION_TOKENS = (250340, 262143, 262144, 300007)
 BWD_SELECTION_CHANNELS = (128, 248, 255, 256, 384, 504, 511, 512)
@@ -928,7 +930,7 @@ def test_backward_launches_the_whole_rank_grid(monkeypatch) -> None:
         launched.extend((name, dict(values), grid) for name, grid in launches)
 
     monkeypatch.setattr(pkg, "run_modules", record_launches)
-    cake_causal_conv1d_train_backward(x, w, cu, dy)
+    cake_causal_conv1d_det_train_backward(x, w, cu, dy)
     main = loader.selected_modules(arch, "bwd", C=C, S=S)[0]
     record = loader.MODULES[main]
     assert [name for name, _, _ in launched] == [main, record["reduce"]]
@@ -1082,10 +1084,12 @@ def test_batched_layout_matches_the_packed_one(case) -> None:
 
     S, C, docs = case
     x, w, cu, dy = _inputs(S, C, docs)
-    y = cake_causal_conv1d_train_forward(x, w, cu)
-    dx, dw = cake_causal_conv1d_train_backward(x, w, cu, dy)
-    y3 = cake_causal_conv1d_train_forward(x.unsqueeze(0), w, cu)
-    dx3, dw3 = cake_causal_conv1d_train_backward(x.unsqueeze(0), w, cu, dy.unsqueeze(0))
+    y = cake_causal_conv1d_det_train_forward(x, w, cu)
+    dx, dw = cake_causal_conv1d_det_train_backward(x, w, cu, dy)
+    y3 = cake_causal_conv1d_det_train_forward(x.unsqueeze(0), w, cu)
+    dx3, dw3 = cake_causal_conv1d_det_train_backward(
+        x.unsqueeze(0), w, cu, dy.unsqueeze(0)
+    )
     assert tuple(y3.shape) == (1, S, C) and tuple(dx3.shape) == (1, S, C)
     assert torch.equal(y3[0], y) and torch.equal(dx3[0], dx) and torch.equal(dw3, dw)
 
@@ -1097,16 +1101,16 @@ def test_document_isolation() -> None:
     x, w, cu, dy = _inputs(S, C, docs)
     lens = doc_lengths(S, docs)
     starts = [0, *torch.tensor(lens).cumsum(0).tolist()]
-    y = cake_causal_conv1d_train_forward(x, w, cu)
-    dx, _dw = cake_causal_conv1d_train_backward(x, w, cu, dy)
+    y = cake_causal_conv1d_det_train_forward(x, w, cu)
+    dx, _dw = cake_causal_conv1d_det_train_backward(x, w, cu, dy)
     # Perturb every token of document 2 (the 257-token one) in x and dy.
     a, b = starts[2], starts[3]
     x2 = x.clone()
     x2[a:b] = (x2[a:b].float() * -1.5 + 0.25).to(torch.bfloat16)
     dy2 = dy.clone()
     dy2[a:b] = (dy2[a:b].float() * 2.0).to(torch.bfloat16)
-    y2 = cake_causal_conv1d_train_forward(x2, w, cu)
-    dx2, _dw2 = cake_causal_conv1d_train_backward(x2, w, cu, dy2)
+    y2 = cake_causal_conv1d_det_train_forward(x2, w, cu)
+    dx2, _dw2 = cake_causal_conv1d_det_train_backward(x2, w, cu, dy2)
     assert not torch.equal(y2[a:b], y[a:b]), "the perturbed document did not change"
     outside = torch.ones(S, dtype=torch.bool, device=_device())
     outside[a:b] = False
@@ -1121,19 +1125,19 @@ def test_document_isolation() -> None:
 def test_dweight_is_bitwise_identical_over_three_launches(case) -> None:
     S, C, docs = case
     x, w, cu, dy = _inputs(S, C, docs)
-    workspace = cake_causal_conv1d_train_backward_workspace(S, C, _device())
+    workspace = cake_causal_conv1d_det_train_backward_workspace(S, C, _device())
     results = []
     for _repeat in range(3):
         dx = torch.full((S, C), float("nan"), dtype=torch.bfloat16, device=_device())
         dw = torch.full((C, WIDTH), float("nan"), dtype=torch.float32, device=_device())
         # Poison the workspace: the kernel must rewrite every partial row it reduces.
         workspace.view(torch.float32).fill_(float("nan"))
-        cake_causal_conv1d_train_backward(
+        cake_causal_conv1d_det_train_backward(
             x, w, cu, dy, workspace=workspace, dx=dx, dweight=dw
         )
         torch.cuda.synchronize()
         results.append((dx.clone(), dw.clone()))
-    fresh_dx, fresh_dw = cake_causal_conv1d_train_backward(x, w, cu, dy)
+    fresh_dx, fresh_dw = cake_causal_conv1d_det_train_backward(x, w, cu, dy)
     for dx, dw in results[1:]:
         assert torch.equal(dx, results[0][0])
         assert torch.equal(dw, results[0][1])
@@ -1169,7 +1173,7 @@ def test_backward_programs_switch_on_channel_count(kind) -> None:
         assert len(selected) == 1, f"S={S} C={C}: {selected}"
         launched.add(selected[0])
         x, w, cu, dy, b, policy = _route_inputs(S, C, docs, kind)
-        workspace = cake_causal_conv1d_train_backward_workspace(S, C, _device())
+        workspace = cake_causal_conv1d_det_train_backward_workspace(S, C, _device())
         # Poison the whole buffer (sized for the largest partial buffer over every route): the selected
         # program must rewrite every partial row (and dbias row) it reduces.
         workspace.view(torch.float32).fill_(float("nan"))
@@ -1215,7 +1219,7 @@ def test_forward_programs_switch_on_channel_count(kind) -> None:
             launched.add(selected[0])
             x, w, cu, _, b, _ = _route_inputs(S, C, docs, FORWARD_ROUTE_SETTINGS[kind])
             label = f"{kind} S={S} C={C} docs={docs} program={selected[0]}"
-            y = cake_causal_conv1d_train_forward(x, w, cu, bias=b)
+            y = cake_causal_conv1d_det_train_forward(x, w, cu, bias=b)
             _assert_within(
                 y,
                 reference_forward(x, w, cu, b),
@@ -1268,7 +1272,7 @@ def test_routed_rows_match_fallback_dx_bitwise(case) -> None:
         pytest.skip(f"S={S} C={C} runs the fallback program {fallback} on {arch}")
     device = _device()
     x, w, cu, dy = _inputs(S, C, docs)
-    dx, dw = cake_causal_conv1d_train_backward(x, w, cu, dy)
+    dx, dw = cake_causal_conv1d_det_train_backward(x, w, cu, dy)
     record = loader.MODULES[fallback]
     scalars = loader.plan(
         S,
@@ -1311,13 +1315,13 @@ def test_routed_rows_match_fallback_dx_bitwise(case) -> None:
 def test_preallocated_outputs_are_written_in_place() -> None:
     S, C, docs = 1000, 512, "perf"
     x, w, cu, dy = _inputs(S, C, docs)
-    y_ref = cake_causal_conv1d_train_forward(x, w, cu)
-    dx_ref, dw_ref = cake_causal_conv1d_train_backward(x, w, cu, dy)
+    y_ref = cake_causal_conv1d_det_train_forward(x, w, cu)
+    dx_ref, dw_ref = cake_causal_conv1d_det_train_backward(x, w, cu, dy)
     out = torch.full((S, C), float("nan"), dtype=torch.bfloat16, device=_device())
     dx = torch.full((S, C), float("nan"), dtype=torch.bfloat16, device=_device())
     dw = torch.full((C, WIDTH), float("nan"), dtype=torch.float32, device=_device())
-    assert cake_causal_conv1d_train_forward(x, w, cu, out=out) is out
-    got = cake_causal_conv1d_train_backward(x, w, cu, dy, dx=dx, dweight=dw)
+    assert cake_causal_conv1d_det_train_forward(x, w, cu, out=out) is out
+    got = cake_causal_conv1d_det_train_backward(x, w, cu, dy, dx=dx, dweight=dw)
     assert len(got) == 2 and got[0] is dx and got[1] is dw
     assert (
         torch.equal(out, y_ref) and torch.equal(dx, dx_ref) and torch.equal(dw, dw_ref)
@@ -1332,7 +1336,7 @@ def test_preallocated_bias_outputs_are_written_in_place() -> None:
     dx = torch.full((S, C), float("nan"), dtype=torch.bfloat16, device=_device())
     dw = torch.full((C, WIDTH), float("nan"), dtype=torch.float32, device=_device())
     db = torch.full((C,), float("nan"), dtype=torch.float32, device=_device())
-    got = cake_causal_conv1d_train_backward(
+    got = cake_causal_conv1d_det_train_backward(
         x, w, cu, dy, bias=b, dx=dx, dweight=dw, dbias=db
     )
     assert len(got) == 3 and got[0] is dx and got[1] is dw and got[2] is db
@@ -1349,13 +1353,13 @@ def _capture_and_replay(cases, kind: str, *, key: int) -> int:
     captured = []
     for S, C, docs in cases:
         x, w, cu, dy, b, policy = _route_inputs(S, C, docs, kind, key=key)
-        eager_y = cake_causal_conv1d_train_forward(x, w, cu, bias=b)
+        eager_y = cake_causal_conv1d_det_train_forward(x, w, cu, bias=b)
         eager = (eager_y, *_backward(x, w, cu, dy, b, policy))
         y = torch.empty_like(x)
         dx = torch.empty_like(x)
         dw = torch.empty(C, WIDTH, dtype=w.dtype, device=device)
         db = None if b is None else torch.empty(C, dtype=b.dtype, device=device)
-        workspace = cake_causal_conv1d_train_backward_workspace(S, C, device)
+        workspace = cake_causal_conv1d_det_train_backward_workspace(S, C, device)
 
         def step(
             x=x,
@@ -1370,8 +1374,8 @@ def _capture_and_replay(cases, kind: str, *, key: int) -> int:
             db=db,
             ws=workspace,
         ):
-            cake_causal_conv1d_train_forward(x, w, cu, bias=b, out=y)
-            cake_causal_conv1d_train_backward(
+            cake_causal_conv1d_det_train_forward(x, w, cu, bias=b, out=y)
+            cake_causal_conv1d_det_train_backward(
                 x,
                 w,
                 cu,
@@ -1457,7 +1461,7 @@ def test_backward_launches_the_selected_program_then_its_reduce(monkeypatch) -> 
     # The backward issues its pair through run_modules, the forward its program through run_module.
     monkeypatch.setattr(pkg, "run_module", record_launch)
     monkeypatch.setattr(pkg, "run_modules", record_launches)
-    cake_causal_conv1d_train_backward(x, w, cu, dy)
+    cake_causal_conv1d_det_train_backward(x, w, cu, dy)
     arch = _arch()
     main = loader.selected_modules(arch, "bwd", C=C, S=S)[0]
     record = loader.MODULES[main]
@@ -1486,7 +1490,7 @@ def test_backward_launches_the_selected_program_then_its_reduce(monkeypatch) -> 
     with pytest.raises(ValueError, match="needs the channel count"):
         loader.launch_grid(reduce, device_index=device.index)
     launched.clear()
-    cake_causal_conv1d_train_forward(x, w, cu)
+    cake_causal_conv1d_det_train_forward(x, w, cu)
     assert [name for name, _, _, _ in launched] == list(
         loader.selected_modules(arch, "fwd", C=C, S=S)
     )
@@ -1537,7 +1541,7 @@ def test_backward_keeps_its_speed_beside_a_resident_side_kernel(
     device = _device()
     S, C, docs = 261393, 512, "perf"
     x, w, cu, dy = _inputs(S, C, docs)
-    workspace = cake_causal_conv1d_train_backward_workspace(S, C, device)
+    workspace = cake_causal_conv1d_det_train_backward_workspace(S, C, device)
     dx = torch.empty_like(x)
     dw = torch.empty(C, WIDTH, dtype=torch.float32, device=device)
     side = torch.cuda.Stream(device=device)
@@ -1553,7 +1557,7 @@ def test_backward_keeps_its_speed_beside_a_resident_side_kernel(
                 )  # one 1-thread CTA, resident for milliseconds
         torch.cuda._sleep(1_000_000)  # let it become resident before the backward
         start.record()
-        cake_causal_conv1d_train_backward(
+        cake_causal_conv1d_det_train_backward(
             x, w, cu, dy, workspace=workspace, dx=dx, dweight=dw
         )
         end.record()
@@ -1585,15 +1589,15 @@ def test_zero_tokens_return_empty_outputs() -> None:
     w = torch.zeros(C, WIDTH, dtype=torch.float32, device=_device())
     b = torch.zeros(C, dtype=torch.bfloat16, device=_device())
     cu = torch.zeros(2, dtype=torch.int32, device=_device())
-    y = cake_causal_conv1d_train_forward(x, w, cu)
+    y = cake_causal_conv1d_det_train_forward(x, w, cu)
     assert tuple(y.shape) == (0, C) and y.dtype == torch.bfloat16
-    dx, dw = cake_causal_conv1d_train_backward(x, w, cu, x)
+    dx, dw = cake_causal_conv1d_det_train_backward(x, w, cu, x)
     assert tuple(dx.shape) == (0, C)
     assert torch.equal(dw, torch.zeros_like(dw))
     # With a bias the empty call returns three zero gradients in the parameters' dtypes, without a launch.
-    y = cake_causal_conv1d_train_forward(x, w.to(torch.bfloat16), cu, bias=b)
+    y = cake_causal_conv1d_det_train_forward(x, w.to(torch.bfloat16), cu, bias=b)
     assert tuple(y.shape) == (0, C)
-    dx, dw, db = cake_causal_conv1d_train_backward(
+    dx, dw, db = cake_causal_conv1d_det_train_backward(
         x, w, cu, x, bias=b, silu_grad_preactivation="fp32"
     )
     assert tuple(dx.shape) == (0, C) and dw.dtype == torch.float32
@@ -1605,7 +1609,7 @@ def test_zero_tokens_return_empty_outputs() -> None:
 
 @pytest.mark.parametrize("kind", tuple(ROUTE_SETTINGS))
 def test_autograd_end_to_end(kind) -> None:
-    """``cake_causal_conv1d`` returns the forward's bits and its backward the fused kernel's gradients, in the
+    """``cake_causal_conv1d_det`` returns the forward's bits and its backward the fused kernel's gradients, in the
     parameters' dtypes, under every route; a non-contiguous incoming gradient is materialized."""
 
     _require_route(kind)
@@ -1614,9 +1618,9 @@ def test_autograd_end_to_end(kind) -> None:
     x = x0.detach().clone().requires_grad_(True)
     w = w0.detach().clone().requires_grad_(True)
     b = None if b0 is None else b0.detach().clone().requires_grad_(True)
-    y = cake_causal_conv1d(x, w, cu, b, silu_grad_preactivation=policy)
+    y = cake_causal_conv1d_det(x, w, cu, b, silu_grad_preactivation=policy)
     assert torch.equal(
-        y.detach(), cake_causal_conv1d_train_forward(x0, w0, cu, bias=b0)
+        y.detach(), cake_causal_conv1d_det_train_forward(x0, w0, cu, bias=b0)
     )
     y.backward(dy)
     dx_ref, dw_ref, db_ref = _backward(x0, w0, cu, dy, b0, policy)
@@ -1627,7 +1631,7 @@ def test_autograd_end_to_end(kind) -> None:
     x = x0.detach().clone().requires_grad_(True)
     w = w0.detach().clone().requires_grad_(True)
     b = None if b0 is None else b0.detach().clone().requires_grad_(True)
-    cake_causal_conv1d(x, w, cu, b, silu_grad_preactivation=policy).backward(
+    cake_causal_conv1d_det(x, w, cu, b, silu_grad_preactivation=policy).backward(
         dy.t().contiguous().t()
     )
     assert torch.equal(x.grad, dx_ref) and torch.equal(w.grad, dw_ref)
@@ -1762,7 +1766,7 @@ def test_nan_poisoned_workspace_per_route(kind) -> None:
     _require_route(kind)
     for S, C, docs in ROUTE_CASES:
         x, w, cu, dy, b, policy = _route_inputs(S, C, docs, kind)
-        workspace = cake_causal_conv1d_train_backward_workspace(S, C, _device())
+        workspace = cake_causal_conv1d_det_train_backward_workspace(S, C, _device())
         workspace.view(torch.float32).fill_(float("nan"))
         _check(
             S, C, docs, x=x, w=w, cu=cu, dy=dy, b=b, policy=policy, workspace=workspace
@@ -1805,8 +1809,8 @@ def test_dt_route_with_f32_taps_matches_default_route_bitwise(case) -> None:
     S, C, docs = case
     arch, device = _arch(), _device()
     x, w, cu, dy = _inputs(S, C, docs)
-    dx, dw = cake_causal_conv1d_train_backward(x, w, cu, dy)
-    dx_dt, dw_dt = cake_causal_conv1d_train_backward(
+    dx, dw = cake_causal_conv1d_det_train_backward(x, w, cu, dy)
+    dx_dt, dw_dt = cake_causal_conv1d_det_train_backward(
         x, w, cu, dy, dweight=torch.empty(C, WIDTH, dtype=BF16, device=device)
     )
     assert dw_dt.dtype == BF16
@@ -1902,8 +1906,8 @@ def test_workspace_bytes_and_layout() -> None:
     ]
     assert list(owners) == expected_owners
     for C in (128, 136, 1280, 8192):
-        small = cake_causal_conv1d_train_backward_workspace_bytes(1, C, device)
-        large = cake_causal_conv1d_train_backward_workspace_bytes(262401, C, device)
+        small = cake_causal_conv1d_det_train_backward_workspace_bytes(1, C, device)
+        large = cake_causal_conv1d_det_train_backward_workspace_bytes(262401, C, device)
         assert small == large > 0, "the workspace is independent of S"
         layout = loader.workspace_layout(record, C, device_index=device.index)
         _, _, n_ch_tiles = loader.channel_split(
@@ -1951,9 +1955,10 @@ def test_workspace_bytes_and_layout() -> None:
                     loader.launch_grid(selected, device_index=device.index)[0],
                     n_ch_tiles,
                 )
-                assert loader.partial_bytes(
-                    selected, C, rows
-                ) <= cake_causal_conv1d_train_backward_workspace_bytes(1, C, device), (
+                capacity = cake_causal_conv1d_det_train_backward_workspace_bytes(
+                    1, C, device
+                )
+                assert loader.partial_bytes(selected, C, rows) <= capacity, (
                     kind,
                     C,
                     selected["library"],
@@ -1976,16 +1981,16 @@ def test_workspace_bytes_and_layout() -> None:
         threads // (136 // vec),
         1,
     )
-    workspace = cake_causal_conv1d_train_backward_workspace(65536, 512, device)
+    workspace = cake_causal_conv1d_det_train_backward_workspace(65536, 512, device)
     assert (
         workspace.dtype == torch.uint8
         and workspace.numel()
-        == cake_causal_conv1d_train_backward_workspace_bytes(1, 512, device)
+        == cake_causal_conv1d_det_train_backward_workspace_bytes(1, 512, device)
     )
     with pytest.raises(ValueError):
-        cake_causal_conv1d_train_backward_workspace_bytes(-1, 512, device)
+        cake_causal_conv1d_det_train_backward_workspace_bytes(-1, 512, device)
     with pytest.raises(ValueError):
-        cake_causal_conv1d_train_backward_workspace_bytes(1, 130, device)
+        cake_causal_conv1d_det_train_backward_workspace_bytes(1, 130, device)
 
 
 # Forward workspace rows: whole-row and multi-sub-tile tiles, the forward's fallback tiles (1344, 1600), a
@@ -2032,17 +2037,17 @@ def test_forward_workspace_bytes() -> None:
     for C in (8, 128, 136, 1024, 1160, 1280, 1344, 1600, 2560, 3200, 8192):
         tiles = _forward_tiles(C)
         assert loader.forward_workspace_words(arch, C) == 2 * tiles, C
-        small = cake_causal_conv1d_train_forward_workspace_bytes(1, C, device)
-        large = cake_causal_conv1d_train_forward_workspace_bytes(262401, C, device)
+        small = cake_causal_conv1d_det_train_forward_workspace_bytes(1, C, device)
+        large = cake_causal_conv1d_det_train_forward_workspace_bytes(262401, C, device)
         assert small == large == 4 * 2 * tiles, C
-    workspace = cake_causal_conv1d_train_forward_workspace(65536, 2560, device)
+    workspace = cake_causal_conv1d_det_train_forward_workspace(65536, 2560, device)
     assert workspace.dtype == torch.int32 and workspace.device == device
     assert workspace.numel() == 2 * _forward_tiles(2560) and workspace.is_contiguous()
     assert int(torch.count_nonzero(workspace)) == 0
     with pytest.raises(ValueError):
-        cake_causal_conv1d_train_forward_workspace_bytes(-1, 512, device)
+        cake_causal_conv1d_det_train_forward_workspace_bytes(-1, 512, device)
     with pytest.raises(ValueError):
-        cake_causal_conv1d_train_forward_workspace_bytes(1, 130, device)
+        cake_causal_conv1d_det_train_forward_workspace_bytes(1, 130, device)
 
 
 def test_forward_reuses_one_workspace_over_calls_and_routes() -> None:
@@ -2050,11 +2055,11 @@ def test_forward_reuses_one_workspace_over_calls_and_routes() -> None:
     leaves the counters zero, and ``y`` is within the reference and bitwise the call without a workspace."""
 
     device = _device()
-    workspace = cake_causal_conv1d_train_forward_workspace(
+    workspace = cake_causal_conv1d_det_train_forward_workspace(
         1,
         max(
             FORWARD_WORKSPACE_CASES,
-            key=lambda case: cake_causal_conv1d_train_forward_workspace_bytes(
+            key=lambda case: cake_causal_conv1d_det_train_forward_workspace_bytes(
                 1, case[1], device
             ),
         )[1],
@@ -2075,13 +2080,14 @@ def test_forward_reuses_one_workspace_over_calls_and_routes() -> None:
     for repeat in range(3):
         for kind, S, C, x, w, cu, b, expected in problems:
             label = f"repeat {repeat} {kind} S={S} C={C}"
-            y = cake_causal_conv1d_train_forward(x, w, cu, bias=b, workspace=workspace)
+            y = cake_causal_conv1d_det_train_forward(
+                x, w, cu, bias=b, workspace=workspace
+            )
             torch.cuda.synchronize(device)
             assert int(torch.count_nonzero(workspace)) == 0, label
             _assert_within(y, expected, atol=Y_ATOL, rtol=Y_RTOL, label=f"y {label}")
-            assert torch.equal(y, cake_causal_conv1d_train_forward(x, w, cu, bias=b)), (
-                label
-            )
+            again = cake_causal_conv1d_det_train_forward(x, w, cu, bias=b)
+            assert torch.equal(y, again), label
 
 
 def test_forward_on_two_streams_with_two_workspaces() -> None:
@@ -2091,12 +2097,12 @@ def test_forward_on_two_streams_with_two_workspaces() -> None:
     device = _device()
     S, C, docs = 131072, 1280, "perf"
     x, w, cu, _ = _inputs(S, C, docs, key=17)
-    expected = cake_causal_conv1d_train_forward(x, w, cu)
+    expected = cake_causal_conv1d_det_train_forward(x, w, cu)
     torch.cuda.synchronize(device)
     streams = [torch.cuda.Stream(device=device) for _ in range(2)]
     assert streams[0].cuda_stream != streams[1].cuda_stream
     workspaces = [
-        cake_causal_conv1d_train_forward_workspace(S, C, device) for _ in streams
+        cake_causal_conv1d_det_train_forward_workspace(S, C, device) for _ in streams
     ]
     calls = 6
     for owned in (True, False):
@@ -2106,7 +2112,7 @@ def test_forward_on_two_streams_with_two_workspaces() -> None:
         for i in range(calls):
             for s, stream in enumerate(streams):
                 with torch.cuda.stream(stream):
-                    cake_causal_conv1d_train_forward(
+                    cake_causal_conv1d_det_train_forward(
                         x,
                         w,
                         cu,
@@ -2148,18 +2154,18 @@ def test_forward_workspace_cache_per_device_and_stream() -> None:
     stream.wait_stream(torch.cuda.current_stream(device))
     other.wait_stream(torch.cuda.current_stream(device))
     with torch.cuda.stream(stream):
-        y1 = cake_causal_conv1d_train_forward(*small)
+        y1 = cake_causal_conv1d_det_train_forward(*small)
         first = cache[key]
         assert first.dtype == torch.int32 and first.numel() == 2 * _forward_tiles(512)
-        y2 = cake_causal_conv1d_train_forward(*small)
+        y2 = cake_causal_conv1d_det_train_forward(*small)
         assert cache[key] is first
-        y3 = cake_causal_conv1d_train_forward(*large)
+        y3 = cake_causal_conv1d_det_train_forward(*large)
         grown = cache[key]
         assert grown is not first and grown.numel() == 2 * _forward_tiles(2560)
-        y4 = cake_causal_conv1d_train_forward(*small)
+        y4 = cake_causal_conv1d_det_train_forward(*small)
         assert cache[key] is grown
     with torch.cuda.stream(other):
-        y5 = cake_causal_conv1d_train_forward(*small)
+        y5 = cake_causal_conv1d_det_train_forward(*small)
     torch.cuda.synchronize(device)
     assert cache[other_key].data_ptr() != cache[key].data_ptr()
     assert int(torch.count_nonzero(cache[key])) == 0
@@ -2184,26 +2190,26 @@ def test_forward_cuda_graph_with_and_without_workspace() -> None:
         _require_route(settings)
         S, C, docs = 4097, 1344, (1000, 0, 3, 3094)
         x, w, cu, _, b, _ = _route_inputs(S, C, docs, settings, key=23)
-        eager = cake_causal_conv1d_train_forward(x, w, cu, bias=b)
-        workspace = cake_causal_conv1d_train_forward_workspace(S, C, device)
+        eager = cake_causal_conv1d_det_train_forward(x, w, cu, bias=b)
+        workspace = cake_causal_conv1d_det_train_forward_workspace(S, C, device)
         y_owned, y_own_buffer = torch.empty_like(x), torch.empty_like(x)
         side = torch.cuda.Stream(device=device)
         side.wait_stream(torch.cuda.current_stream(device))
         with torch.cuda.stream(side):
-            cake_causal_conv1d_train_forward(
+            cake_causal_conv1d_det_train_forward(
                 x, w, cu, bias=b, out=y_owned, workspace=workspace
             )
-            cake_causal_conv1d_train_forward(x, w, cu, bias=b, out=y_own_buffer)
+            cake_causal_conv1d_det_train_forward(x, w, cu, bias=b, out=y_own_buffer)
         torch.cuda.current_stream(device).wait_stream(side)
         torch.cuda.synchronize(device)
         before = {key: held.data_ptr() for key, held in cache.items()}
         owned, own_buffer = torch.cuda.CUDAGraph(), torch.cuda.CUDAGraph()
         with torch.cuda.graph(owned, stream=side):
-            cake_causal_conv1d_train_forward(
+            cake_causal_conv1d_det_train_forward(
                 x, w, cu, bias=b, out=y_owned, workspace=workspace
             )
         with torch.cuda.graph(own_buffer, stream=side):
-            cake_causal_conv1d_train_forward(x, w, cu, bias=b, out=y_own_buffer)
+            cake_causal_conv1d_det_train_forward(x, w, cu, bias=b, out=y_own_buffer)
         assert {key: held.data_ptr() for key, held in cache.items()} == before, kind
         for replay in range(GRAPH_REPLAYS):
             y_owned.fill_(float("nan"))
@@ -2232,34 +2238,34 @@ def test_forward_cuda_graph_with_and_without_workspace() -> None:
 def test_forward_workspace_validation() -> None:
     S, C = 4097, 1280
     x, w, cu, _ = _inputs(S, C, (1000, 0, 3, 3094))
-    words = cake_causal_conv1d_train_forward_workspace_bytes(S, C, _device()) // 4
+    words = cake_causal_conv1d_det_train_forward_workspace_bytes(S, C, _device()) // 4
     with pytest.raises(ValueError, match="workspace holds"):
-        cake_causal_conv1d_train_forward(
+        cake_causal_conv1d_det_train_forward(
             x,
             w,
             cu,
             workspace=torch.zeros(words - 1, dtype=torch.int32, device=_device()),
         )
     with pytest.raises(ValueError, match="torch.int32"):
-        cake_causal_conv1d_train_forward(
+        cake_causal_conv1d_det_train_forward(
             x,
             w,
             cu,
             workspace=torch.zeros(4 * words, dtype=torch.uint8, device=_device()),
         )
     with pytest.raises(ValueError, match="1-D"):
-        cake_causal_conv1d_train_forward(
+        cake_causal_conv1d_det_train_forward(
             x,
             w,
             cu,
             workspace=torch.zeros(1, words, dtype=torch.int32, device=_device()),
         )
     with pytest.raises(ValueError, match="must live on"):
-        cake_causal_conv1d_train_forward(
+        cake_causal_conv1d_det_train_forward(
             x, w, cu, workspace=torch.zeros(words, dtype=torch.int32)
         )
     with pytest.raises(TypeError):
-        cake_causal_conv1d_train_forward(x, w, cu, workspace=[0] * words)
+        cake_causal_conv1d_det_train_forward(x, w, cu, workspace=[0] * words)
 
 
 def test_argument_validation() -> None:
@@ -2267,41 +2273,41 @@ def test_argument_validation() -> None:
     x, w, cu, dy = _inputs(S, C, None)
     b = _bias_input(C, F32)
     with pytest.raises(ValueError, match="multiple of 8"):
-        cake_causal_conv1d_train_forward(
+        cake_causal_conv1d_det_train_forward(
             x[:, :130].contiguous(), w[:130].contiguous(), cu
         )
     with pytest.raises(ValueError, match="width-4"):
-        cake_causal_conv1d_train_forward(x, w[:, :3].contiguous(), cu)
+        cake_causal_conv1d_det_train_forward(x, w[:, :3].contiguous(), cu)
     with pytest.raises(ValueError, match="width-4"):
-        cake_causal_conv1d_train_forward(
+        cake_causal_conv1d_det_train_forward(
             x, torch.cat([w, w[:, :1]], dim=1).contiguous(), cu
         )
     with pytest.raises(ValueError, match="one row per channel"):
-        cake_causal_conv1d_train_forward(x, w[: C // 2].contiguous(), cu)
+        cake_causal_conv1d_det_train_forward(x, w[: C // 2].contiguous(), cu)
     with pytest.raises(ValueError, match="torch.int32"):
-        cake_causal_conv1d_train_forward(x, w, cu.long())
+        cake_causal_conv1d_det_train_forward(x, w, cu.long())
     with pytest.raises(ValueError, match="cu_seqlens"):
-        cake_causal_conv1d_train_forward(x, w, cu[:1])
+        cake_causal_conv1d_det_train_forward(x, w, cu[:1])
     with pytest.raises(ValueError, match="shape"):
-        cake_causal_conv1d_train_backward(x, w, cu, dy[: S - 1])
+        cake_causal_conv1d_det_train_backward(x, w, cu, dy[: S - 1])
     with pytest.raises(ValueError, match="contiguous"):
-        cake_causal_conv1d_train_forward(x.t().contiguous().t(), w, cu)
+        cake_causal_conv1d_det_train_forward(x.t().contiguous().t(), w, cu)
     with pytest.raises(ValueError, match="torch.bfloat16"):
-        cake_causal_conv1d_train_forward(x.float(), w, cu)
+        cake_causal_conv1d_det_train_forward(x.float(), w, cu)
     # Per buffer: the taps are FP32 or BF16 (the binding no longer checks the untyped tap / bias pointers,
     # so the host is the only guard), as are the bias and the gradient outs; the bias is one value per channel.
     with pytest.raises(
         ValueError, match="weight must be torch.float32 or torch.bfloat16"
     ):
-        cake_causal_conv1d_train_forward(x, w.half(), cu)
+        cake_causal_conv1d_det_train_forward(x, w.half(), cu)
     with pytest.raises(
         ValueError, match="weight must be torch.float32 or torch.bfloat16"
     ):
-        cake_causal_conv1d_train_backward(x, w.half(), cu, dy)
+        cake_causal_conv1d_det_train_backward(x, w.half(), cu, dy)
     with pytest.raises(
         ValueError, match="dweight must be torch.float32 or torch.bfloat16"
     ):
-        cake_causal_conv1d_train_backward(
+        cake_causal_conv1d_det_train_backward(
             x,
             w,
             cu,
@@ -2311,21 +2317,21 @@ def test_argument_validation() -> None:
     with pytest.raises(
         ValueError, match="bias must be torch.float32 or torch.bfloat16"
     ):
-        cake_causal_conv1d_train_forward(x, w, cu, bias=b.half())
+        cake_causal_conv1d_det_train_forward(x, w, cu, bias=b.half())
     with pytest.raises(
         ValueError, match="bias must be torch.float32 or torch.bfloat16"
     ):
-        cake_causal_conv1d_train_backward(x, w, cu, dy, bias=b.half())
+        cake_causal_conv1d_det_train_backward(x, w, cu, dy, bias=b.half())
     with pytest.raises(ValueError, match=r"bias must be a \[C\]"):
-        cake_causal_conv1d_train_forward(x, w, cu, bias=b[: C // 2].contiguous())
+        cake_causal_conv1d_det_train_forward(x, w, cu, bias=b[: C // 2].contiguous())
     with pytest.raises(ValueError, match=r"bias must be a \[C\]"):
-        cake_causal_conv1d_train_forward(x, w, cu, bias=w[:, :1].contiguous())
+        cake_causal_conv1d_det_train_forward(x, w, cu, bias=w[:, :1].contiguous())
     with pytest.raises(ValueError, match="contiguous"):
-        cake_causal_conv1d_train_forward(x, w, cu, bias=w[:, 0])
+        cake_causal_conv1d_det_train_forward(x, w, cu, bias=w[:, 0])
     with pytest.raises(
         ValueError, match="dbias must be torch.float32 or torch.bfloat16"
     ):
-        cake_causal_conv1d_train_backward(
+        cake_causal_conv1d_det_train_backward(
             x,
             w,
             cu,
@@ -2334,21 +2340,23 @@ def test_argument_validation() -> None:
             dbias=torch.empty(C, dtype=torch.float16, device=_device()),
         )
     with pytest.raises(ValueError, match="dbias must have shape"):
-        cake_causal_conv1d_train_backward(
+        cake_causal_conv1d_det_train_backward(
             x, w, cu, dy, bias=b, dbias=torch.empty(C + 8, dtype=F32, device=_device())
         )
     with pytest.raises(ValueError, match="dbias"):
-        cake_causal_conv1d_train_backward(x, w, cu, dy, dbias=torch.empty_like(b))
+        cake_causal_conv1d_det_train_backward(x, w, cu, dy, dbias=torch.empty_like(b))
     with pytest.raises(ValueError, match="silu_grad_preactivation"):
-        cake_causal_conv1d_train_backward(x, w, cu, dy, silu_grad_preactivation="fp16")
+        cake_causal_conv1d_det_train_backward(
+            x, w, cu, dy, silu_grad_preactivation="fp16"
+        )
     with pytest.raises(ValueError, match="silu_grad_preactivation"):
-        cake_causal_conv1d(x, w, cu, silu_grad_preactivation="bf32")
+        cake_causal_conv1d_det(x, w, cu, silu_grad_preactivation="bf32")
     with pytest.raises(ValueError, match="shape"):
-        cake_causal_conv1d_train_forward(
+        cake_causal_conv1d_det_train_forward(
             x, w, cu, out=torch.empty(S + 1, C, dtype=torch.bfloat16, device=_device())
         )
     with pytest.raises(ValueError, match="contiguous"):
-        cake_causal_conv1d_train_backward(
+        cake_causal_conv1d_det_train_backward(
             x,
             w,
             cu,
@@ -2356,13 +2364,13 @@ def test_argument_validation() -> None:
             dx=torch.empty(C, S, dtype=torch.bfloat16, device=_device()).t(),
         )
     with pytest.raises(ValueError, match="workspace holds"):
-        cake_causal_conv1d_train_backward(
+        cake_causal_conv1d_det_train_backward(
             x, w, cu, dy, workspace=torch.empty(16, dtype=torch.uint8, device=_device())
         )
     with pytest.raises(ValueError, match="CUDA"):
-        cake_causal_conv1d_train_forward(x.cpu(), w.cpu(), cu.cpu())
+        cake_causal_conv1d_det_train_forward(x.cpu(), w.cpu(), cu.cpu())
     with pytest.raises(TypeError):
-        cake_causal_conv1d_train_forward(x, w, [0, S])
+        cake_causal_conv1d_det_train_forward(x, w, [0, S])
 
 
 def test_every_route_ships_on_every_architecture() -> None:
@@ -2396,7 +2404,7 @@ def test_registry_records_reference_the_build_manifest() -> None:
     assert manifest["schema"] == "cake-build/1"
     # The manifest names the package by its FlashInfer import path, also in a copy
     # vendored under another name (``pkg.__name__`` is then the copy's).
-    assert manifest["package"] == "flashinfer.cake_causal_conv1d_train_backend"
+    assert manifest["package"] == "flashinfer.cake_causal_conv1d_det_train_backend"
     libraries = cake_build.libraries_by_name()
     package = Path(cake_build.__file__).parent
     referenced = set()

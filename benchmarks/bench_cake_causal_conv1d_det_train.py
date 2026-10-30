@@ -53,10 +53,10 @@ not a gate: the kernel's own GPU time is unchanged either way.
 
 Example::
 
-    python benchmarks/bench_cake_causal_conv1d_train.py
-    python benchmarks/bench_cake_causal_conv1d_train.py --channels 512 --tokens 250340 --json out.json
-    python benchmarks/bench_cake_causal_conv1d_train.py --weight-dtype bfloat16 --bias bfloat16
-    python benchmarks/bench_cake_causal_conv1d_train.py --silu-grad-preactivation fp32 --channels 512 1280
+    python benchmarks/bench_cake_causal_conv1d_det_train.py
+    python benchmarks/bench_cake_causal_conv1d_det_train.py --channels 512 --tokens 250340 --json out.json
+    python benchmarks/bench_cake_causal_conv1d_det_train.py --weight-dtype bfloat16 --bias bfloat16
+    python benchmarks/bench_cake_causal_conv1d_det_train.py --silu-grad-preactivation fp32 --channels 512 1280
 """
 
 from __future__ import annotations
@@ -69,14 +69,14 @@ from typing import Callable, Optional
 
 import torch
 
-from flashinfer.cake_causal_conv1d_train import (
-    cake_causal_conv1d_train_backward,
-    cake_causal_conv1d_train_backward_workspace,
-    cake_causal_conv1d_train_forward,
-    cake_causal_conv1d_train_forward_workspace,
-    is_cake_causal_conv1d_train_supported,
+from flashinfer.cake_causal_conv1d_det_train import (
+    cake_causal_conv1d_det_train_backward,
+    cake_causal_conv1d_det_train_backward_workspace,
+    cake_causal_conv1d_det_train_forward,
+    cake_causal_conv1d_det_train_forward_workspace,
+    is_cake_causal_conv1d_det_train_supported,
 )
-from flashinfer.cake_causal_conv1d_train_backend import cake_jit as loader
+from flashinfer.cake_causal_conv1d_det_train_backend import cake_jit as loader
 from flashinfer.testing import bench_gpu_time
 
 WIDTH = 4
@@ -282,21 +282,21 @@ class Cake(Comparator):
         db = (
             None if b is None else torch.empty(channels, dtype=b.dtype, device=x.device)
         )
-        workspace = cake_causal_conv1d_train_backward_workspace(
+        workspace = cake_causal_conv1d_det_train_backward_workspace(
             tokens, channels, x.device
         )
-        forward_workspace = cake_causal_conv1d_train_forward_workspace(
+        forward_workspace = cake_causal_conv1d_det_train_forward_workspace(
             tokens, channels, x.device
         )
 
         def fwd():
-            cake_causal_conv1d_train_forward(
+            cake_causal_conv1d_det_train_forward(
                 x, w, cu, bias=b, out=y, workspace=forward_workspace
             )
             return y
 
         def bwd(dy):
-            return cake_causal_conv1d_train_backward(
+            return cake_causal_conv1d_det_train_backward(
                 x,
                 w,
                 cu,
@@ -560,9 +560,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     )
 
     device = torch.device("cuda", torch.cuda.current_device())
-    if not is_cake_causal_conv1d_train_supported(device):
+    if not is_cake_causal_conv1d_det_train_supported(device):
         raise SystemExit(
-            "cake_causal_conv1d_train has no exported route on this device"
+            "cake_causal_conv1d_det_train has no exported route on this device"
         )
     arch = loader.arch_for_capability(torch.cuda.get_device_capability(device))
     route = mode.backward_route()
