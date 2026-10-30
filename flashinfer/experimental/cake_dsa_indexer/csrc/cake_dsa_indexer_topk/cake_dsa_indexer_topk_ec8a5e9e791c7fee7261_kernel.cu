@@ -1429,9 +1429,26 @@ kernel_cake_dsa_indexer_topk_ec8a5e9e791c7fee7261(const __grid_constant__ CUtens
                                         unsigned long long edge_c = 0;
                                         int digit_prev = 0;
                                         int dummy_idx_c = hist_base + 1536;
+#if __CUDA_ARCH__ == 1000
+                                        unsigned long long s0_ent[1];
+                                        s0_ent[0] = (unsigned long long)Cand[buf_pair];
+                                        int s0_c = 0;
+                                        int hit_c = 0;
+                                        int h0s_c = 0;
+#else
+#endif
                                         #pragma unroll 1
                                         for (int p_1 = 0; p_1 < 8; p_1++) {
                                             int shift_c = 56 - 8 * p_1;
+#if __CUDA_ARCH__ == 1000
+                                            int skip_s = 0;
+                                            if (p_1 == 1) {
+                                                if (hit_c != 0) {
+                                                    skip_s = 1;
+                                                }
+                                            }
+#else
+#endif
                                             asm volatile("barrier.sync %0, 64;" :: "r"(pair_bar) : "memory");
                                             if (half == 0) {
                                                 s_hist[hist_base + lane_0 * 8] = 0;
@@ -1443,8 +1460,79 @@ kernel_cake_dsa_indexer_topk_ec8a5e9e791c7fee7261(const __grid_constant__ CUtens
                                                 s_hist[hist_base + lane_0 * 8 + 6] = 0;
                                                 s_hist[hist_base + lane_0 * 8 + 7] = 0;
                                             }
+#if __CUDA_ARCH__ == 1000
+                                            if (half == 0) {
+                                                if (skip_s != 0) {
+                                                    int h1_lane = 0;
+                                                    if (lane_0 != 0) {
+                                                        int h1_v0_0 = s_hist[hist_base + lane_0 * 8 + 1536];
+                                                        s_hist[hist_base + lane_0 * 8] = h1_v0_0;
+                                                        h1_lane += h1_v0_0;
+                                                    }
+                                                    int h1_v_0 = s_hist[hist_base + lane_0 * 8 + 1 + 1536];
+                                                    s_hist[hist_base + lane_0 * 8 + 1] = h1_v_0;
+                                                    h1_lane += h1_v_0;
+                                                    int h1_v_1 = s_hist[hist_base + lane_0 * 8 + 2 + 1536];
+                                                    s_hist[hist_base + lane_0 * 8 + 2] = h1_v_1;
+                                                    h1_lane += h1_v_1;
+                                                    int h1_v_2 = s_hist[hist_base + lane_0 * 8 + 3 + 1536];
+                                                    s_hist[hist_base + lane_0 * 8 + 3] = h1_v_2;
+                                                    h1_lane += h1_v_2;
+                                                    int h1_v_3 = s_hist[hist_base + lane_0 * 8 + 4 + 1536];
+                                                    s_hist[hist_base + lane_0 * 8 + 4] = h1_v_3;
+                                                    h1_lane += h1_v_3;
+                                                    int h1_v_4 = s_hist[hist_base + lane_0 * 8 + 5 + 1536];
+                                                    s_hist[hist_base + lane_0 * 8 + 5] = h1_v_4;
+                                                    h1_lane += h1_v_4;
+                                                    int h1_v_5 = s_hist[hist_base + lane_0 * 8 + 6 + 1536];
+                                                    s_hist[hist_base + lane_0 * 8 + 6] = h1_v_5;
+                                                    h1_lane += h1_v_5;
+                                                    int h1_v_6 = s_hist[hist_base + lane_0 * 8 + 7 + 1536];
+                                                    s_hist[hist_base + lane_0 * 8 + 7] = h1_v_6;
+                                                    h1_lane += h1_v_6;
+                                                    int h1_sum;
+                                                    asm volatile("redux.sync.add.s32 %0, %1, 0xffffffff;" : "=r"(h1_sum) : "r"(h1_lane));
+                                                    if (lane_0 == 0) {
+                                                        s_hist[hist_base] = h0s_c - h1_sum;
+                                                    }
+                                                }
+                                            } else if (p_1 == 0) {
+                                                if (lane_0 != 0) {
+                                                    s_hist[hist_base + lane_0 * 8 + 1536] = 0;
+                                                }
+                                                s_hist[hist_base + lane_0 * 8 + 1 + 1536] = 0;
+                                                s_hist[hist_base + lane_0 * 8 + 2 + 1536] = 0;
+                                                s_hist[hist_base + lane_0 * 8 + 3 + 1536] = 0;
+                                                s_hist[hist_base + lane_0 * 8 + 4 + 1536] = 0;
+                                                s_hist[hist_base + lane_0 * 8 + 5 + 1536] = 0;
+                                                s_hist[hist_base + lane_0 * 8 + 6 + 1536] = 0;
+                                                s_hist[hist_base + lane_0 * 8 + 7 + 1536] = 0;
+                                            }
+#else
+#endif
                                             asm volatile("barrier.sync %0, 64;" :: "r"(pair_bar) : "memory");
                                             int cand_pos = 0;
+#if __CUDA_ARCH__ == 1000
+                                            int n_save = n_cand;
+                                            if (skip_s != 0) {
+                                                n_cand = 0;
+                                            }
+                                            int pw_c = (int)(prefix_c & 65535);
+                                            if (p_1 == 0) {
+                                                unsigned int bits_2 = (unsigned int)(s0_ent[0] >> 32);
+                                                int kid_2 = (int)(unsigned int)(s0_ent[0] & 4294967295);
+                                                unsigned int magnitude_3 = bits_2 & 2147483647;
+                                                unsigned int m_3 = ((magnitude_3 != 0) ? bits_2 : zero_u);
+                                                unsigned int key32_3 = (((m_3 & sign_mask) != 0) ? ~m_3 : m_3 | sign_mask);
+                                                if (magnitude_3 > nan_floor) {
+                                                    key32_3 = zero_u;
+                                                }
+                                                unsigned long long key64_3 = (unsigned long long)key32_3 << 32 | (unsigned long long)(unsigned int)kid_2;
+                                                unsigned long long key_2 = key64_3;
+                                                s0_c = (int)(key_2 >> 56 & 255);
+                                            }
+#else
+#endif
                                             #pragma unroll 1
                                             for (int e0_1 = 0; e0_1 < n_cand; e0_1 += 256) {
                                                 unsigned long long ent_c[8];
@@ -1458,6 +1546,15 @@ kernel_cake_dsa_indexer_topk_ec8a5e9e791c7fee7261(const __grid_constant__ CUtens
                                                 #pragma unroll
                                                 for (int u_6 = 0; u_6 < 8; u_6++) {
                                                     int valid_c = ((n_cand > e0_1 + lane_0 + 32 * u_6) ? 1 : 0);
+#if __CUDA_ARCH__ == 1000
+                                                    unsigned int bits_3 = (unsigned int)(ent_c[u_6] >> 32);
+                                                    int kid_3 = (int)(unsigned int)(ent_c[u_6] & 4294967295);
+                                                    unsigned int magnitude_4 = bits_3 & 2147483647;
+                                                    unsigned int m_4 = ((magnitude_4 != 0) ? bits_3 : zero_u);
+                                                    unsigned int key32_4 = (((m_4 & sign_mask) != 0) ? ~m_4 : m_4 | sign_mask);
+                                                    if (magnitude_4 > nan_floor) {
+                                                        key32_4 = zero_u;
+#else
                                                     unsigned int bits_2 = (unsigned int)(ent_c[u_6] >> 32);
                                                     int kid_2 = (int)(unsigned int)(ent_c[u_6] & 4294967295);
                                                     unsigned int magnitude_3 = bits_2 & 2147483647;
@@ -1465,24 +1562,48 @@ kernel_cake_dsa_indexer_topk_ec8a5e9e791c7fee7261(const __grid_constant__ CUtens
                                                     unsigned int key32_3 = (((m_3 & sign_mask) != 0) ? ~m_3 : m_3 | sign_mask);
                                                     if (magnitude_3 > nan_floor) {
                                                         key32_3 = zero_u;
+#endif
                                                     }
+#if __CUDA_ARCH__ == 1000
+                                                    unsigned long long key64_4 = (unsigned long long)key32_4 << 32 | (unsigned long long)(unsigned int)kid_3;
+                                                    unsigned long long key_3 = key64_4;
+                                                    unsigned long long key_c = key_3;
+#else
                                                     unsigned long long key64_3 = (unsigned long long)key32_3 << 32 | (unsigned long long)(unsigned int)kid_2;
                                                     unsigned long long key_2 = key64_3;
                                                     unsigned long long key_c = key_2;
+#endif
                                                     unsigned long long ks_c = key_c >> (unsigned long long)shift_c;
                                                     int digit_c = (int)(ks_c & 255);
                                                     if (p_1 == 0) {
                                                         int bin_c0 = ((valid_c != 0) ? hist_base + digit_c : dummy_idx_c);
                                                         atomicAdd(&s_hist[bin_c0], 1);
+#if __CUDA_ARCH__ == 1000
+                                                        int bin_h1 = ((valid_c != 0 && digit_c == s0_c) ? dummy_idx_c + (int)(key_c >> 48 & 255) : dummy_idx_c);
+                                                        atomicAdd(&s_hist[bin_h1], 1);
+#else
+#endif
                                                     } else {
+#if __CUDA_ARCH__ == 1000
+                                                        int dprev_c = (int)(ks_c >> 8 & 65535);
+#else
                                                         int dprev_c = (int)(ks_c >> 8 & 255);
+#endif
                                                         int keep_c = 0;
                                                         int stay_c = 0;
                                                         if (valid_c != 0) {
+#if __CUDA_ARCH__ == 1000
+                                                            if (dprev_c > pw_c) {
+#else
                                                             if (dprev_c > digit_prev) {
+#endif
                                                                 keep_c = 1;
                                                             }
+#if __CUDA_ARCH__ == 1000
+                                                            if (dprev_c == pw_c) {
+#else
                                                             if (dprev_c == digit_prev) {
+#endif
                                                                 stay_c = 1;
                                                             }
                                                         }
@@ -1512,7 +1633,11 @@ kernel_cake_dsa_indexer_topk_ec8a5e9e791c7fee7261(const __grid_constant__ CUtens
                                                 }
                                             }
                                             if (p_1 > 0) {
+#if __CUDA_ARCH__ == 1000
+                                                n_cand = ((skip_s == 0) ? cand_pos : n_save);
+#else
                                                 n_cand = cand_pos;
+#endif
                                             }
                                             asm volatile("barrier.sync %0, 64;" :: "r"(pair_bar) : "memory");
                                             int lane_bins_c[8];
@@ -1642,6 +1767,13 @@ kernel_cake_dsa_indexer_topk_ec8a5e9e791c7fee7261(const __grid_constant__ CUtens
                                             kept_above_c += above_cnt_c;
                                             digit_prev = target_lane_c * 8 + digit_sel_c;
                                             prefix_c = prefix_c << 8 | (unsigned long long)(unsigned int)digit_prev;
+#if __CUDA_ARCH__ == 1000
+                                            if (p_1 == 0) {
+                                                hit_c = ((digit_prev == s0_c) ? 1 : 0);
+                                                h0s_c = bucket_cnt_c;
+                                            }
+#else
+#endif
                                             edge_c = prefix_c << (unsigned long long)shift_c;
                                             if (kept_above_c + bucket_cnt_c <= top_k) {
                                                 break;
@@ -1661,6 +1793,15 @@ kernel_cake_dsa_indexer_topk_ec8a5e9e791c7fee7261(const __grid_constant__ CUtens
                                             for (int u_8 = 0; u_8 < 8; u_8++) {
                                                 int keep_f = 0;
                                                 if (n_cand > e0_2 + lane_0 + 32 * u_8) {
+#if __CUDA_ARCH__ == 1000
+                                                    unsigned int bits_4 = (unsigned int)(ent_f[u_8] >> 32);
+                                                    int kid_4 = (int)(unsigned int)(ent_f[u_8] & 4294967295);
+                                                    unsigned int magnitude_5 = bits_4 & 2147483647;
+                                                    unsigned int m_5 = ((magnitude_5 != 0) ? bits_4 : zero_u);
+                                                    unsigned int key32_5 = (((m_5 & sign_mask) != 0) ? ~m_5 : m_5 | sign_mask);
+                                                    if (magnitude_5 > nan_floor) {
+                                                        key32_5 = zero_u;
+#else
                                                     unsigned int bits_3 = (unsigned int)(ent_f[u_8] >> 32);
                                                     int kid_3 = (int)(unsigned int)(ent_f[u_8] & 4294967295);
                                                     unsigned int magnitude_4 = bits_3 & 2147483647;
@@ -1668,10 +1809,17 @@ kernel_cake_dsa_indexer_topk_ec8a5e9e791c7fee7261(const __grid_constant__ CUtens
                                                     unsigned int key32_4 = (((m_4 & sign_mask) != 0) ? ~m_4 : m_4 | sign_mask);
                                                     if (magnitude_4 > nan_floor) {
                                                         key32_4 = zero_u;
+#endif
                                                     }
+#if __CUDA_ARCH__ == 1000
+                                                    unsigned long long key64_5 = (unsigned long long)key32_5 << 32 | (unsigned long long)(unsigned int)kid_4;
+                                                    unsigned long long key_4 = key64_5;
+                                                    keep_f = ((key_4 >= edge_c) ? 1 : 0);
+#else
                                                     unsigned long long key64_4 = (unsigned long long)key32_4 << 32 | (unsigned long long)(unsigned int)kid_3;
                                                     unsigned long long key_3 = key64_4;
                                                     keep_f = ((key_3 >= edge_c) ? 1 : 0);
+#endif
                                                 }
                                                 unsigned int _vote_3 = __ballot_sync(0xFFFFFFFF, keep_f != 0);
                                                 if (keep_f != 0) {
@@ -1681,10 +1829,17 @@ kernel_cake_dsa_indexer_topk_ec8a5e9e791c7fee7261(const __grid_constant__ CUtens
                                                         slot_f = row_base + (long long)(top_k - 1 - rank_f);
                                                     }
                                                     float score_f = 0.0f;
+#if __CUDA_ARCH__ == 1000
+                                                    unsigned int bits_6 = (unsigned int)(ent_f[u_8] >> 32);
+                                                    score_f = reinterpret_cast<float*>(&bits_6)[0];
+                                                    int kid_5 = (int)(unsigned int)(ent_f[u_8] & 4294967295);
+                                                    Indices[slot_f] = kid_5;
+#else
                                                     unsigned int bits_4 = (unsigned int)(ent_f[u_8] >> 32);
                                                     score_f = reinterpret_cast<float*>(&bits_4)[0];
                                                     int kid_4 = (int)(unsigned int)(ent_f[u_8] & 4294967295);
                                                     Indices[slot_f] = kid_4;
+#endif
                                                     Scores[slot_f] = score_f;
                                                 }
                                                 out_pos += (int)(unsigned int)__popc(_vote_3);
@@ -1719,6 +1874,15 @@ kernel_cake_dsa_indexer_topk_ec8a5e9e791c7fee7261(const __grid_constant__ CUtens
                                                 for (int u_10 = 0; u_10 < 8; u_10++) {
                                                     int keep_wf = 0;
                                                     if (mid_w > e0_3 + lane_0 + 32 * u_10) {
+#if __CUDA_ARCH__ == 1000
+                                                        unsigned int bits_7 = (unsigned int)(ent_wf[u_10] >> 32);
+                                                        int kid_6 = (int)(unsigned int)(ent_wf[u_10] & 4294967295);
+                                                        unsigned int magnitude_6 = bits_7 & 2147483647;
+                                                        unsigned int m_6 = ((magnitude_6 != 0) ? bits_7 : zero_u);
+                                                        unsigned int key32_6 = (((m_6 & sign_mask) != 0) ? ~m_6 : m_6 | sign_mask);
+                                                        if (magnitude_6 > nan_floor) {
+                                                            key32_6 = zero_u;
+#else
                                                         unsigned int bits_6 = (unsigned int)(ent_wf[u_10] >> 32);
                                                         int kid_5 = (int)(unsigned int)(ent_wf[u_10] & 4294967295);
                                                         unsigned int magnitude_5 = bits_6 & 2147483647;
@@ -1726,19 +1890,33 @@ kernel_cake_dsa_indexer_topk_ec8a5e9e791c7fee7261(const __grid_constant__ CUtens
                                                         unsigned int key32_5 = (((m_5 & sign_mask) != 0) ? ~m_5 : m_5 | sign_mask);
                                                         if (magnitude_5 > nan_floor) {
                                                             key32_5 = zero_u;
+#endif
                                                         }
+#if __CUDA_ARCH__ == 1000
+                                                        unsigned long long key64_6 = (unsigned long long)key32_6 << 32 | (unsigned long long)(unsigned int)kid_6;
+                                                        unsigned long long key_5 = key64_6;
+                                                        keep_wf = ((key_5 >= edge_out) ? 1 : 0);
+#else
                                                         unsigned long long key64_5 = (unsigned long long)key32_5 << 32 | (unsigned long long)(unsigned int)kid_5;
                                                         unsigned long long key_4 = key64_5;
                                                         keep_wf = ((key_4 >= edge_out) ? 1 : 0);
+#endif
                                                     }
                                                     unsigned int vote_1 = __ballot_sync(0xFFFFFFFF, keep_wf != 0);
                                                     if (keep_wf != 0) {
                                                         long long slot_wf = row_base + (long long)(front_w + (int)(unsigned int)__popc(vote_1 & lower_lanes));
                                                         float score_wf = 0.0f;
+#if __CUDA_ARCH__ == 1000
+                                                        unsigned int bits_8 = (unsigned int)(ent_wf[u_10] >> 32);
+                                                        score_wf = reinterpret_cast<float*>(&bits_8)[0];
+                                                        int kid_7 = (int)(unsigned int)(ent_wf[u_10] & 4294967295);
+                                                        Indices[slot_wf] = kid_7;
+#else
                                                         unsigned int bits_7 = (unsigned int)(ent_wf[u_10] >> 32);
                                                         score_wf = reinterpret_cast<float*>(&bits_7)[0];
                                                         int kid_6 = (int)(unsigned int)(ent_wf[u_10] & 4294967295);
                                                         Indices[slot_wf] = kid_6;
+#endif
                                                         Scores[slot_wf] = score_wf;
                                                     }
                                                     front_w += (int)(unsigned int)__popc(vote_1);
@@ -1760,6 +1938,15 @@ kernel_cake_dsa_indexer_topk_ec8a5e9e791c7fee7261(const __grid_constant__ CUtens
                                                 for (int u_12 = 0; u_12 < 8; u_12++) {
                                                     int keep_wb = 0;
                                                     if (c_final > e0_4 + lane_0 + 32 * u_12) {
+#if __CUDA_ARCH__ == 1000
+                                                        unsigned int bits_9 = (unsigned int)(ent_wb[u_12] >> 32);
+                                                        int kid_8 = (int)(unsigned int)(ent_wb[u_12] & 4294967295);
+                                                        unsigned int magnitude_7 = bits_9 & 2147483647;
+                                                        unsigned int m_7 = ((magnitude_7 != 0) ? bits_9 : zero_u);
+                                                        unsigned int key32_7 = (((m_7 & sign_mask) != 0) ? ~m_7 : m_7 | sign_mask);
+                                                        if (magnitude_7 > nan_floor) {
+                                                            key32_7 = zero_u;
+#else
                                                         unsigned int bits_8 = (unsigned int)(ent_wb[u_12] >> 32);
                                                         int kid_7 = (int)(unsigned int)(ent_wb[u_12] & 4294967295);
                                                         unsigned int magnitude_6 = bits_8 & 2147483647;
@@ -1767,19 +1954,33 @@ kernel_cake_dsa_indexer_topk_ec8a5e9e791c7fee7261(const __grid_constant__ CUtens
                                                         unsigned int key32_6 = (((m_6 & sign_mask) != 0) ? ~m_6 : m_6 | sign_mask);
                                                         if (magnitude_6 > nan_floor) {
                                                             key32_6 = zero_u;
+#endif
                                                         }
+#if __CUDA_ARCH__ == 1000
+                                                        unsigned long long key64_7 = (unsigned long long)key32_7 << 32 | (unsigned long long)(unsigned int)kid_8;
+                                                        unsigned long long key_6 = key64_7;
+                                                        keep_wb = ((key_6 >= edge_out) ? 1 : 0);
+#else
                                                         unsigned long long key64_6 = (unsigned long long)key32_6 << 32 | (unsigned long long)(unsigned int)kid_7;
                                                         unsigned long long key_5 = key64_6;
                                                         keep_wb = ((key_5 >= edge_out) ? 1 : 0);
+#endif
                                                     }
                                                     unsigned int vote_1_1 = __ballot_sync(0xFFFFFFFF, keep_wb != 0);
                                                     if (keep_wb != 0) {
                                                         long long slot_wb = row_base + (long long)(n_sel - 1 - (back_w + (int)(unsigned int)__popc(vote_1_1 & lower_lanes)));
                                                         float score_wb = 0.0f;
+#if __CUDA_ARCH__ == 1000
+                                                        unsigned int bits_10 = (unsigned int)(ent_wb[u_12] >> 32);
+                                                        score_wb = reinterpret_cast<float*>(&bits_10)[0];
+                                                        int kid_9 = (int)(unsigned int)(ent_wb[u_12] & 4294967295);
+                                                        Indices[slot_wb] = kid_9;
+#else
                                                         unsigned int bits_9 = (unsigned int)(ent_wb[u_12] >> 32);
                                                         score_wb = reinterpret_cast<float*>(&bits_9)[0];
                                                         int kid_8 = (int)(unsigned int)(ent_wb[u_12] & 4294967295);
                                                         Indices[slot_wb] = kid_8;
+#endif
                                                         Scores[slot_wb] = score_wb;
                                                     }
                                                     back_w += (int)(unsigned int)__popc(vote_1_1);

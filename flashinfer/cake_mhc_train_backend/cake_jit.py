@@ -63,11 +63,13 @@ route (``FN_SPLIT_PROGRAM[arch] = (fnp, fnTp)``; the forward operand layout
 ``want_t = 0`` and the transposed layout ``want_t = 1`` of the backward) with
 its launch grid :func:`fn_split_grid` (``FN_SPLIT_GRID`` per program: 256
 CTAs, 512 for the 128-thread form) and
-:func:`bwd_slab_program` names the column-slab form per token count and
-architecture (the token-count bands ``BWD_SLAB_BANDS`` ahead of the
+:func:`bwd_slab_program` names the column-slab form per token count, SM count
+and architecture (the token-count bands ``BWD_SLAB_BANDS`` ahead of the
 per-architecture ``BWD_SLAB_PROGRAM``: the dynamic-schedule form ``dynr`` on
-sm_100a and sm_103a, ``xrsg`` on sm_107a and on sm_100a for
-``1024 < T <= 4096``); the residual mixing's program of record is per
+sm_100a and sm_103a, ``xrsg`` on sm_107a; on sm_100a for ``1024 < T <= 4096``
+its late-claim form ``dynl``, which ``BWD_SLAB_FIT`` replaces with ``xrsg``
+where the K7 units fit the SMs and at the chunk counts / runs it lists); the
+residual mixing's program of record is per
 architecture too (``FWD_FINISH_PROGRAM`` / :func:`fwd_finish_program`, its
 launch grid :func:`k4_grid_of_record`), and the token-owner band
 ``BWD_TOKEN_BANDS`` (sm_107a) / reduction refinement ``BWD_REDUCE_PARTS``
@@ -2979,6 +2981,71 @@ MODULES: dict[str, dict[str, Any]] = {
             "workspace": "bwd",
         },
     },
+    "cake_mhc_train_bwd_slab__dynl": {
+        "arches": [
+            "sm_100a",
+        ],
+        "arg_plan": [
+            ["buffer", "X"],
+            ["buffer", "dY"],
+            ["buffer", "dU"],
+            ["buffer", "dzp"],
+            ["buffer", "fnTp"],
+            ["buffer", "dX"],
+            ["buffer", "tokp"],
+            ["buffer", "dfn_part"],
+            ["parameter", "T"],
+            ["parameter", "P"],
+            ["parameter", "rpc"],
+            ["buffer", "ticket"],
+            ["launch", "enable_pdl"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "chunks_rule": "k7_chunks",
+            "kind": "slab_chunks",
+            "slabs": 64,
+        },
+        "hidden": 4096,
+        "kernel": "cake_mhc_train_bwd_slab__dynl",
+        "kernel_symbol": "kernel_cake_mhc_train_bwd_slab__dynl",
+        "launch": {
+            "block": (384, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 228480,
+            "persistent_ctas_per_sm": 1,
+            "use_pdl": "runtime",
+        },
+        "library": "cake_mhc_train_bwd_slab__dynl",
+        "logical": {
+            "P": "parts",
+            "T": "rows",
+            "X": "x_flat",
+            "dU": "du",
+            "dX": "dx_flat",
+            "dY": "dy_flat",
+            "dfn_part": "dfn_part",
+            "dzp": "dzp_rows",
+            "fnTp": "fnTp",
+            "rpc": "rows_per_chunk",
+            "ticket": "ticket",
+            "tokp": "tokp",
+        },
+        "role": "bwd_slab",
+        "select_rule": {
+            "kind": "program",
+            "program": "dynl",
+            "rule": "bwd_slab_program",
+        },
+        "workspace_rule": {
+            "kind": "regions",
+            "workspace": "bwd",
+        },
+    },
     "cake_mhc_train_bwd_slab__dynr": {
         "arches": [
             "sm_100a",
@@ -3582,6 +3649,7 @@ ROUTES: dict[str, dict[str, list[str]]] = {
             "cake_mhc_train_bwd_token__rt64",
             "cake_mhc_train_bwd_slab__dynr",
             "cake_mhc_train_bwd_slab__xrsg",
+            "cake_mhc_train_bwd_slab__dynl",
             "cake_mhc_train_bwd_reduce__s27_wcvt_fadd_fshfl",
             "cake_mhc_train_bwd_reduce__wpu4_spred",
             "cake_mhc_train_bwd_reduce__wpu4_fadd",
@@ -4179,15 +4247,39 @@ BWD_TOKEN_BANDS = {
 # 1.03 and the path within 1.0625 (GB200 and GB300, 152 SMs). sm_107a has no such form (xrsg).
 BWD_SLAB_PROGRAM = {"sm_100a": "dynr", "sm_103a": "dynr", "sm_107a": "xrsg"}
 # BWD_SLAB_BANDS: the column-slab pass's token-count bands per architecture ((above, at_most, program), at_most None =
-# unbounded), checked before BWD_SLAB_PROGRAM. sm_100a keeps xrsg for 1024 < T <= 4096: at the 4096 row on 148 SMs
-# (B200) the backward path with dynr took 1.0086 / 1.0109 / 1.0102 of its time with xrsg (kernel sum, three runs in
-# two sessions; dynr itself 1.013-1.016 of xrsg), above the 1.01 bound. The 152-SM sm_100a board (GB200) read 0.9940
-# / 0.9972 there, but the bands have no SM-count axis, so the band holds on every sm_100a board and the contention
-# gain at those rows is not taken (path under the co-scheduled load: dynr 0.705 of xrsg on B200, 0.763 on GB200).
+# unbounded), checked before BWD_SLAB_PROGRAM. sm_100a routes "dynl" (dynr + claim="late": the load warp draws the
+# next unit when it loads the current unit's last tile, not one unit ahead; fn_group=4: the first round's groups of four
+# units of one slab load its fn^T pieces once; fn_release="dv": a unit frees them after its last tile's dv' MMAs;
+# bitwise with xrsg) for 1024 < T <= 4096: there dynr's one-ahead claim cost the backward path 1.0086 / 1.0109 / 1.0102
+# of its time with xrsg at the 4096 row on 148 SMs (B200; kernel sum, above the 1.01 bound). At the P = 16 rows (2945,
+# 3008, 3072, 4033, 4064, 4096 on 148 SMs) the late claim alone took 1.0055-1.0145 of xrsg's K7 time and 1.0031-1.0092
+# of its path, dynl 0.9918-1.0045 and 0.9943-1.0028 (two B200 sessions; identical-program control 0.9971-1.0020 and
+# 0.9978-1.0013). With a 128-thread side CTA on every SM xrsg does not finish while the side load runs; dynl stays
+# within 1.030-1.041 of its unloaded path there, and under the co-scheduled load (16 CTAs x 640 threads) its path takes
+# 0.69-0.73 of xrsg's.
 BWD_SLAB_BANDS = {
-    "sm_100a": ((1024, 4096, "xrsg"),),
+    "sm_100a": ((1024, 4096, "dynl"),),
     "sm_103a": (),
     "sm_107a": (),
+}
+# BWD_SLAB_FIT: (program, replacement, P values, (P, above, at_most) runs) per architecture -- where the band names
+# `program` and the K7 units of the call fit the SM count (k7_chunks(T, sm_count).units <= sm_count: one round, every
+# CTA one unit, no ticket drawn), its chunk count P is one of the listed values, or its P is a run's P with
+# above < T <= at_most, `replacement` is launched instead. On sm_100a ("dynl", "xrsg", (9, 19), ((7, 1536, 1792),
+# (7, 1920, 2240))): at the one-round rows (P = 2 on 148 SMs, e.g. 1536, 2048, 2560, 3584) every form with the
+# 160-register pool and the compact token table took 1.0054-1.0118 of xrsg's backward path (the footprint; the claim
+# draws nothing there); at the P = 9 rows dynl (the late claim alone; these readings predate fn_group / fn_release)
+# read 0.9984-1.0076 except 2304, 1.0135 / 1.0108 (two B200 sessions; P = 11 rows 0.9982-1.0051, P = 13 rows
+# 0.9924-0.9970); at the P = 19 rows (152 SMs only: 2305-2432, 3585-3648) it read 1.0069 at 2368 and 1.0155 at
+# 3616 (GB200). The P = 7 rows exist on 152 SMs only; in the runs 1537-1792 and
+# 1921-2240 dynl read 1.0147 at 1728, and with a 128-thread side CTA on every SM its path took 1.0783 / 1.0784 of its
+# unloaded path at 2048 (two GB200 sessions; the bound is 1.0625), where the other P = 7 runs read 0.9965-1.0064 and
+# a loaded path of 1.0299-1.0496 (1216 / 1280: one GB200 session, 2560 / 3072 / 3584: two). So xrsg stays the
+# program at these rows and a full-SM side load still holds them (a coverage boundary of FlashInfer #7046).
+BWD_SLAB_FIT = {
+    "sm_100a": ("dynl", "xrsg", (9, 19), ((7, 1536, 1792), (7, 1920, 2240))),
+    "sm_103a": None,
+    "sm_107a": None,
 }
 # BWD_REDUCE_PROGRAM: the final reduction's program per architecture outside every band of BWD_REDUCE_REGIMES
 # ((program, above, at_most) by token count, at_most None = unbounded). sm_107a (two
@@ -4452,12 +4544,24 @@ def bwd_token_program(
 def bwd_slab_program(
     T, sm_count, arch
 ):  # -> the column-slab pass's program of record for T tokens on sm_count SMs
-    for above, at_most, program in BWD_SLAB_BANDS[
+    program = BWD_SLAB_PROGRAM[arch]
+    for above, at_most, band in BWD_SLAB_BANDS[
         arch
     ]:  # the token-count bands come first
         if above < T and (at_most is None or at_most >= T):
-            return program
-    return BWD_SLAB_PROGRAM[arch]
+            program = band
+            break
+    fit = BWD_SLAB_FIT[arch]
+    if fit is not None and program == fit[0]:
+        P, units = k7_chunks(T, sm_count)[:2]
+        kept = P in fit[2] or any(
+            p == P and above < T <= at_most for p, above, at_most in fit[3]
+        )
+        if (
+            units <= sm_count or kept
+        ):  # one round of K7 units, or a chunk count / (P, T) run the band keeps on xrsg
+            program = fit[1]
+    return program
 
 
 def bwd_reduce_program(
@@ -5303,6 +5407,7 @@ __all__ = [
     "BWD_REDUCE_PROGRAM",
     "BWD_REDUCE_REGIMES",
     "BWD_SLAB_BANDS",
+    "BWD_SLAB_FIT",
     "BWD_SLAB_PROGRAM",
     "BWD_TOKEN_BANDS",
     "BWD_TOKEN_PROGRAM",

@@ -1,22 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""The FROST GEMM engine's knobs: one :class:`~cudnn.gemm.frost.tile_config.TileConfig`
-spelled in the shared ``cudnn.knob_type`` vocabulary.
-
-A TileConfig is pure geometry and is reconstructed exactly from its canonical
-name (``tile_config.by_name``), so the knob record is that name's components
-as integers: the backend's own ``TILE_M`` / ``TILE_N`` / ``TILEK`` /
-``TILE_CGA_M`` / ``TILE_CGA_N`` / ``SPLIT_K_SLC`` / ``SWAP_AB`` where the meaning
-matches, and the frontend-only ``PIPELINE_ARCH`` / ``MMA_TILE_M`` / ``MMA_TILE_N``
-/ ``MMA_TILE_K`` / ``CTA_GROUP`` / ``WARPS_M`` / ``WARPS_N`` for the axes the
-backend has no word for. K extents are BYTES, as in TileConfig, so one record
-serves every dtype.
-
-``GemmKnobs`` travels natively inside ``PlanConfig.knobs``; the engine converts
-at the public boundary (``FrostGemmEngine.knobs_to_public`` /
-``knobs_from_public``). A replayed record is honored exactly or declined
-(``plan_config``): never snapped to a neighbouring config.
-"""
+"""The FROST GEMM engine's knobs: one :class:`~cudnn.gemm.frost.tile_config.TileConfig` spelled in the shared ``cudnn.knob_type`` vocabulary."""
 
 from __future__ import annotations
 
@@ -44,6 +28,7 @@ class GemmKnobs:
     warps_n: Optional[int] = None
     split_k_slices: int = 1
     swap_ab: bool = False
+    cluster_k_reduce: bool = False
 
     # (field, cudnn.knob_type member, required)
     _PUBLIC_KNOBS = (
@@ -61,9 +46,8 @@ class GemmKnobs:
         ("warps_n", "WARPS_N", False),
         ("split_k_slices", "SPLIT_K_SLC", False),
         ("swap_ab", "SWAP_AB", False),
+        ("cluster_k_reduce", "CLUSTER_K_REDUCE", False),
     )
-
-    # ---- TileConfig <-> knobs ---------------------------------------------
 
     @classmethod
     def from_config(cls, cfg: TileConfig) -> "GemmKnobs":
@@ -90,6 +74,7 @@ class GemmKnobs:
             warps_n=int(m.group("warps_n")) if m.group("warps_n") else None,
             split_k_slices=int(m.group("split_k") or 1),
             swap_ab=bool(m.group("swap_ab")),
+            cluster_k_reduce=bool(m.group("cluster_k_reduce")),
         )
 
     @property
@@ -109,18 +94,15 @@ class GemmKnobs:
             name += f"_warps{self.warps_m}x{self.warps_n}"
         if self.split_k_slices > 1:
             name += f"_splitK{self.split_k_slices}"
+        if self.cluster_k_reduce:
+            name += "_clusterKReduce"
         if self.swap_ab:
             name += "_swapAB"
         return name
 
     def to_config(self) -> TileConfig:
-        """The TileConfig these knobs name. Raises (``KeyError`` for an unknown
-        spelling, ``NotImplementedError`` / ``ValueError`` from the family's
-        geometry checks) when the record names no config the catalog or the
-        family constructors admit -- the caller declines, never snaps."""
+        """The TileConfig these knobs name."""
         return by_name(self.config_name)
-
-    # ---- public vocabulary ---------------------------------------------
 
     def to_public(self) -> dict:
         """``{cudnn.knob_type: int}``: every axis this record carries (bools as 0/1)."""
@@ -153,9 +135,9 @@ class GemmKnobs:
                 value = int(value)
             if not isinstance(value, int):
                 raise ValueError(f"knob {knob.name} value must be an int, got {value!r}")
-            if field == "swap_ab":
+            if field in ("swap_ab", "cluster_k_reduce"):
                 if value not in (0, 1):
-                    raise ValueError(f"knob SWAP_AB must be 0 or 1, got {value}")
+                    raise ValueError(f"knob {knob.name} must be 0 or 1, got {value}")
                 kwargs[field] = bool(value)
             elif field == "split_k_slices" and value < 1:
                 # 0 would spell the same name as one slice and replay as it

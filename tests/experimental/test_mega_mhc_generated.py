@@ -1245,6 +1245,7 @@ def test_h4096_values_and_replay(tokens, layout):
             first = current
         for name, value in current.items():
             assert bitwise_equal(value, first[name]), f"{name} differs between launches"
+        stream.wait_stream(torch.cuda.current_stream())
     stream.wait_stream(torch.cuda.current_stream())
 
 
@@ -1792,6 +1793,7 @@ def test_h4096_quant_graph_replay_equals_eager(layout):
             graph.replay()
         stream.synchronize()
         replayed = {name: value.clone() for name, value in plan.outputs.items()}
+        stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(stream):
             poison(plan.outputs)
             plan.run()
@@ -1801,6 +1803,7 @@ def test_h4096_quant_graph_replay_equals_eager(layout):
         check_h4096_layout(
             plan.outputs, values, layout, label=f"repeat {repeat} ", **kw
         )
+        stream.wait_stream(torch.cuda.current_stream())
     stream.wait_stream(torch.cuda.current_stream())
 
 
