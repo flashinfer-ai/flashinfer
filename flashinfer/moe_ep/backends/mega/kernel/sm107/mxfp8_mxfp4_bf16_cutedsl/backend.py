@@ -1,5 +1,14 @@
 """Rubin MegaMoE with MXFP4 weights and MXFP8 E4M3 activations."""
 
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from ..mxfp4_mxfp4_bf16_cutedsl.config import (
+        Sm107_Mxfp4_Mxfp4_Bf16_Cutedsl_MegaMoeConfig,
+    )
+
 from ......core.kernel.registry import register_mega_kernel
 from ..mxfp8_mxfp8_bf16_cutedsl.backend import Sm107Mxfp8BlockScaledMegaKernelBackend
 from .config import Sm107_Mxfp8_Mxfp4_Bf16_Cutedsl_MegaMoeConfig
@@ -10,7 +19,11 @@ from .weights import preprocess_mega_weights, validate_transformed_mega_weights
 class Sm107Mxfp8Mxfp4MegaKernelBackend(Sm107Mxfp8BlockScaledMegaKernelBackend):
     """Reuse MXFP8 staging and communication with packed FP4 expert weights."""
 
-    def __init__(self, config: Sm107_Mxfp8_Mxfp4_Bf16_Cutedsl_MegaMoeConfig) -> None:
+    def __init__(
+        self,
+        config: Sm107_Mxfp8_Mxfp4_Bf16_Cutedsl_MegaMoeConfig
+        | Sm107_Mxfp4_Mxfp4_Bf16_Cutedsl_MegaMoeConfig,
+    ) -> None:
         super().__init__(config)
 
     @classmethod
