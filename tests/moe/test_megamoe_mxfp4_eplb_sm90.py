@@ -268,6 +268,9 @@ def _worker(rank, args):
         changed = slots.set_replica_plan(swapped, copies, base)
         assert changed == sum(1 for e in hot if e // H != rank)
         listed = slots.copy_list.cpu()[:changed, 0].tolist()
+        # Installed again before the copy ran: the pending slots stay listed.
+        assert slots.set_replica_plan(swapped, copies, base) == changed
+        assert slots.copy_list.cpu()[:changed, 0].tolist() == listed
         buffer.stage(x, sf, idx, routing)
         slots.remap(m, block_m)
         expected_stats = _expected_stats(
@@ -676,6 +679,12 @@ def _planner_worker(rank, args):
         slots.plan_and_remap(m, block_m)
         cold = check_plan(prev, counts, block_m, 0, ("cold", m))
         assert int(slots.copy_count.item()) == sum(1 for e in cold[0][rank] if e >= 0)
+        # Planned again before the kernel consumed the list: same tables, and
+        # the slots still waiting for their copy stay listed.
+        pending = tables()[3:]
+        buffer.stage(x, sf, idx, routing)
+        slots.plan_and_remap(m, block_m)
+        assert tables()[:2] == cold[:2] and tables()[3:] == pending, ("pending", m)
         stats_expected = 2 * stats_expected + _expected_stats(
             idx, counts, cold[1], cold[0], block_m, rank
         )

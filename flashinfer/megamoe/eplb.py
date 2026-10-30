@@ -62,6 +62,7 @@ def _check_geometry(
     num_redundant_slots: int,
     num_physical_experts: int,
 ) -> None:
+    """Reject a slot geometry the kernels do not support or the buffer was not sized for."""
     if not 0 < num_ranks <= _MAX_RANKS:
         raise ValueError(f"num_ranks must be in [1, {_MAX_RANKS}]")
     if num_experts <= 0 or num_experts % num_ranks:
@@ -130,6 +131,7 @@ class MegaMoEExpertSlots:
     l2_global_scales: torch.Tensor
 
     def __init__(self, symm_buffer, num_experts: int, num_redundant_slots: int) -> None:
+        """Allocate the workspace and the weight arena of this rank's slots over the buffer's group."""
         import torch.distributed._symmetric_memory as symm_mem
 
         b = symm_buffer
@@ -212,18 +214,20 @@ class MegaMoEExpertSlots:
         torch.cuda.synchronize()
 
     def _words(self, offset: int, shape: Tuple[int, ...]) -> torch.Tensor:
+        """View of ``shape`` over the workspace words starting at ``offset``."""
         return self.workspace[offset : offset + math.prod(shape)].view(*shape)
 
     def _plane_view(
         self, name: str, shape: Tuple[int, ...], dtype: torch.dtype
     ) -> torch.Tensor:
+        """``[slots, *shape]`` view of one weight plane of the arena."""
         offset, bytes_per_slot = self._planes[name]
         flat = self.arena[offset : offset + bytes_per_slot * self.num_slots_per_rank]
         return flat.view(dtype).view(self.num_slots_per_rank, *shape)
 
     def _fill_resident_copies(self) -> None:
-        # One copy per expert, its resident rank, with an unbounded block
-        # budget: a remap sends everything resident.
+        """One copy per expert, its resident rank, with an unbounded block
+        budget: a remap sends everything resident."""
         self.copies.fill_(-1)
         self.copies[:, 0, 0] = (
             torch.arange(self.num_experts, device=self.copies.device, dtype=torch.int32)
@@ -232,6 +236,7 @@ class MegaMoEExpertSlots:
         self.copies[:, 0, 1] = _RESIDENT_BOUND
 
     def _reset_plan(self) -> None:
+        """Empty every slot and route every expert to its resident rank."""
         self.slot_expert.fill_(-1)
         self._fill_resident_copies()
         self.expert_base.zero_()
@@ -305,8 +310,9 @@ class MegaMoEExpertSlots:
 
         The changed slots are listed in ``copy_list``; call :meth:`copy_weights`
         before the kernel, or pass the slots to the kernel as ``expert_slots``
-        so it copies them itself. The routing of the next call must be remapped
-        under the new tables (:meth:`remap`).
+        so it copies them itself. A slot still listed by an earlier plan whose
+        copy has not run stays listed. The routing of the next call must be
+        remapped under the new tables (:meth:`remap`).
         """
         R, S, E, H = (
             self.num_ranks,
@@ -324,10 +330,13 @@ class MegaMoEExpertSlots:
                     "a rank's redundant slots must hold distinct non-resident experts"
                 )
         prev = self.slot_expert.cpu()
+        pending = int(self.copy_count.item())
+        waiting = set(self.copy_list.cpu()[:pending, 0].tolist())
         changed = [
             (s, int(table[self.rank, s]))
             for s in range(S)
-            if 0 <= int(table[self.rank, s]) != int(prev[self.rank, s])
+            if int(table[self.rank, s]) >= 0
+            and (int(table[self.rank, s]) != int(prev[self.rank, s]) or s in waiting)
         ]
         self.slot_expert.copy_(table)
         if copies is None:
@@ -440,6 +449,7 @@ class MegaMoEExpertSlots:
         self.copy_count.zero_()
 
     def _check_tokens(self, num_tokens: int) -> None:
+        """Reject a destroyed buffer or a token count outside its capacity."""
         b = self.symm_buffer
         if b.buffer is None:
             raise ValueError("symmetric buffer has been destroyed")
@@ -447,9 +457,11 @@ class MegaMoEExpertSlots:
             raise ValueError("num_tokens must fit the buffer capacity")
 
     def _plane_specs(self, names: Sequence[str]) -> List[int]:
+        """Flat (offset, bytes per slot) list of the named arena planes, for the kernels."""
         return [v for name in names for v in self._planes[name]]
 
     def _in_kernel_copy_args(self) -> Tuple[Any, ...]:
+        """Trailing arguments of the fused kernel's in-kernel weight copy entry."""
         return (
             self.workspace,
             self.arena,
@@ -462,6 +474,7 @@ class MegaMoEExpertSlots:
     def _check_kernel_operands(
         self, symm_buffer, l1_weights, l2_weights, l1_global_scales, l2_global_scales
     ) -> None:
+        """Require the kernel's buffer, weights and scales to be this object's own views."""
         if symm_buffer is not self.symm_buffer:
             raise ValueError("expert_slots belong to another symmetric buffer")
         for tensor, view in (

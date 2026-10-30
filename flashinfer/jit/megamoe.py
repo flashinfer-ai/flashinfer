@@ -315,8 +315,8 @@ def get_megamoe_sm90_mxfp4_uri(
     fast_math,
     in_kernel_weight_copy: bool = False,
 ) -> str:
-    # Include every compile-time policy in the key, including rank width and
-    # the in-kernel weight copy of a replica plan.
+    """Module key of the MXFP4 fused kernel: every compile-time policy, the rank
+    width and whether the kernel copies the weights of a replica plan."""
     uri = get_megamoe_sm90_nvfp4_uri(
         plan,
         num_sms,
@@ -345,6 +345,7 @@ def gen_megamoe_sm90_mxfp4_module(
     fast_math,
     in_kernel_weight_copy: bool = False,
 ) -> JitSpec:
+    """JIT spec of the MXFP4 fused kernel, with or without the in-kernel weight copy."""
     uri = get_megamoe_sm90_mxfp4_uri(
         plan,
         num_sms,
@@ -380,6 +381,7 @@ def gen_megamoe_sm90_mxfp4_module(
 
 
 def get_megamoe_sm90_eplb_uri(num_ranks, num_experts, num_redundant_slots) -> str:
+    """Module key of the replica-plan kernels, one per slot geometry."""
     return f"megamoe_sm90_eplb_r{num_ranks}_e{num_experts}_s{num_redundant_slots}"
 
 

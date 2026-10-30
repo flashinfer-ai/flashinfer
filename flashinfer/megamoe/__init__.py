@@ -113,6 +113,7 @@ def _run_kernel(
     extra_jit_args=(),
     extra_kernel_args=(),
 ):
+    """Launch ``entry`` of the module ``factory`` builds for ``plan`` and buffer ``b``."""
     module = _get_jit_module(factory, *_jit_args(factory, plan, b), *extra_jit_args)
     getattr(module, entry)(
         y,
@@ -595,7 +596,8 @@ def mxfp4_mega_moe(
         INT32 vector with one entry per local expert. Receive counts are
         accumulated in place; initialize the vector before first use.
     l1_global_scales, l2_global_scales : torch.Tensor, optional
-        FP32 vectors with one multiplier per local expert. Omitted scales use 1.
+        FP32 vectors with one multiplier per local expert. Omitted scales use 1,
+        or the slots' arena scales when ``expert_slots`` is given.
     expert_slots : MegaMoEExpertSlots, optional
         Redundant expert slots of this buffer. The kernel then copies the slots
         listed in the slots' workspace (:meth:`MegaMoEExpertSlots.set_replica_plan`)
@@ -616,6 +618,13 @@ def mxfp4_mega_moe(
     """
     b = symm_buffer
     m = int(num_tokens if num_tokens is not None else y.shape[0])
+    if expert_slots is not None:
+        # The slots' arena carries the resident scales; an omitted argument
+        # must not silently run the kernel without them.
+        if l1_global_scales is None:
+            l1_global_scales = expert_slots.l1_global_scales
+        if l2_global_scales is None:
+            l2_global_scales = expert_slots.l2_global_scales
     _validate_call(
         y,
         l1_weights,

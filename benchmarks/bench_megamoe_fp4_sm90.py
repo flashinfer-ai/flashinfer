@@ -12,6 +12,9 @@ call (plan and remap, then the kernel with the in-kernel weight copy), timed as
 a whole and as the kernel alone. ``--routing-trace`` replays recorded routing
 (a dict with ``layers``, a list of ``[tokens, topk]`` logical-id tensors, plus
 ``num_experts`` and ``num_topk``) instead of random routing, one case per layer.
+Every replay of a case re-plans the same routing, so after the first plan the
+slots already hold their experts and the timed kernel copies no weights: the
+replica-plan arm is measured in the steady state of one chunk.
 """
 
 import argparse
@@ -56,7 +59,8 @@ def _capture(stages, repeats):
 
 
 def _load_trace(path, experts, topk):
-    trace = torch.load(path, map_location="cpu", mmap=True)
+    """Per-layer logical routing of a recorded trace, checked against the model shape."""
+    trace = torch.load(path, map_location="cpu", mmap=True, weights_only=True)
     if int(trace["num_experts"]) != experts or int(trace["num_topk"]) != topk:
         raise ValueError(
             f"trace is for {trace['num_experts']} experts / top-{trace['num_topk']}"
@@ -72,6 +76,7 @@ def _trace_slice(rows, m, rank):
 
 
 def _worker(rank, args):
+    """One rank: build every arm, capture it in a graph and time the interleaved replays."""
     from flashinfer import megamoe as api
     from flashinfer.jit import env
     from flashinfer.jit.megamoe import (
@@ -561,6 +566,8 @@ if __name__ == "__main__":
     args = parser.parse_args()
     if args.repeats < 1 or args.rounds < 1:
         parser.error("repeats and rounds must be positive")
+    if args.trace_layers < 1:
+        parser.error("trace layers must be positive")
     if args.cold_l2 and args.repeats != 1:
         parser.error("cold L2 timing requires --repeats 1")
     if args.redundant_slots and args.reference_runner:

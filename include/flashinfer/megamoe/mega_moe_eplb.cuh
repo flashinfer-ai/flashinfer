@@ -216,7 +216,16 @@ CUTLASS_DEVICE void eplb_plan_from_histogram(
   }
   __syncthreads();
 
-  // Setup: all histograms, the previous slot table, holders, blocks.
+  // Setup: all histograms, the previous slot table, holders, blocks. Slots
+  // listed by an earlier plan whose copy has not run yet (a nonzero copy
+  // count: the copy clears it) must be listed again, whatever they hold;
+  // thread 0 writes the copy list, so it alone keeps the mask.
+  uint32_t pending_mask = 0;
+  if (thread_idx == 0) {
+    const auto count = min(static_cast<uint32_t>(*g.copy_count), S);
+    for (uint32_t i = 0; i < count; ++i)
+      pending_mask |= 1u << static_cast<uint32_t>(g.copy_list[i].x);
+  }
   for (uint32_t i = thread_idx; i < R * E; i += kNumThreads)
     sm.hist[i] =
         static_cast<int32_t>(ptx::ld_volatile(reinterpret_cast<const uint32_t*>(g.hist + i)));
@@ -487,7 +496,7 @@ CUTLASS_DEVICE void eplb_plan_from_histogram(
     int32_t count = 0;
     for (uint32_t s = 0; s < S; ++s) {
       const auto e = sm.new_slot[rank * S + s];
-      if (e >= 0 and e != sm.prev_slot[rank * S + s]) {
+      if (e >= 0 and (e != sm.prev_slot[rank * S + s] or ((pending_mask >> s) & 1u))) {
         g.copy_list[count++] = make_int2(static_cast<int32_t>(s), e);
         // In-kernel weight copy: the MegaMoE kernel counts its CTAs into these.
         g.copy_done[s * 2] = 0;
