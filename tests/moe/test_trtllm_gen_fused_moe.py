@@ -3036,6 +3036,95 @@ def test_fp8_block_scale_routed_activation_type_relu2_smoke():
         )
 
 
+@pytest.mark.parametrize(
+    "routing_method_type", [RoutingMethodType.Renormalize, RoutingMethodType.DeepSeekV3]
+)
+@pytest.mark.parametrize("num_tokens", [1, 300])
+def test_mxfp8_block_scale_moe_routing_replay_out(routing_method_type, num_tokens):
+    """MXFP8 block-scale MoE writes the selected experts into routing_replay_out."""
+    compute_capability = get_compute_capability(torch.device(device="cuda"))
+    if compute_capability[0] not in [10]:
+        pytest.skip("These tests are only guaranteed to work on SM100 and SM103 GPUs.")
+
+    torch.manual_seed(0)
+    device = torch.device("cuda:0")
+    hidden_size = 512
+    intermediate_size = 512
+    num_experts = 128
+    top_k = 6
+    is_dsv3 = routing_method_type == RoutingMethodType.DeepSeekV3
+
+    planted = torch.rand((num_tokens, num_experts), device=device).argsort(dim=-1)[
+        :, :top_k
+    ]
+    routing_logits = 0.1 * torch.randn((num_tokens, num_experts), device=device)
+    routing_logits.scatter_add_(
+        -1, planted, torch.full(planted.shape, 10.0, device=device)
+    )
+    routing_logits = routing_logits.to(torch.float32 if is_dsv3 else torch.bfloat16)
+    routing_bias = (
+        torch.zeros(num_experts, device=device, dtype=torch.bfloat16)
+        if is_dsv3
+        else None
+    )
+
+    hidden_states = torch.randn(
+        (num_tokens, hidden_size), device=device, dtype=torch.bfloat16
+    )
+    gemm1_weights = torch.randn(
+        (num_experts, intermediate_size, hidden_size),
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    gemm2_weights = torch.randn(
+        (num_experts, hidden_size, intermediate_size),
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    quant_impl = FP8BlockScaleMoe(fp8_quantization_type=QuantMode.FP8_BLOCK_SCALE_MXFP8)
+    quant_weights = quant_impl.quantize_weights(
+        gemm1_weights, gemm2_weights, hidden_states
+    )
+    quant_inputs = quant_impl.quantize_inputs(hidden_states)
+
+    routing_replay_out = torch.full(
+        (num_tokens, top_k), -1, device=device, dtype=torch.int16
+    )
+    output = trtllm_fp8_block_scale_moe(
+        routing_logits=routing_logits,
+        routing_bias=routing_bias,
+        hidden_states=quant_inputs["hidden_states"],
+        hidden_states_scale=quant_inputs["hidden_states_scale"],
+        gemm1_weights=quant_weights["gemm1_weights"],
+        gemm1_weights_scale=quant_weights["gemm1_scales"],
+        gemm2_weights=quant_weights["gemm2_weights"],
+        gemm2_weights_scale=quant_weights["gemm2_scales"],
+        num_experts=num_experts,
+        top_k=top_k,
+        n_group=1 if is_dsv3 else None,
+        topk_group=1 if is_dsv3 else None,
+        intermediate_size=intermediate_size,
+        local_expert_offset=0,
+        local_num_experts=num_experts,
+        routed_scaling_factor=2.5 if is_dsv3 else None,
+        routing_method_type=routing_method_type.value,
+        use_shuffled_weight=True,
+        weight_layout=WeightLayout.MajorK.value,
+        enable_pdl=True,
+        fp8_quantization_type=Fp8QuantizationType.MxFp8,
+        activation_type=ActivationType.Relu2.value,
+        routing_replay_out=routing_replay_out,
+    )
+
+    assert torch.isfinite(output).all()
+    torch.testing.assert_close(
+        routing_replay_out.long().sort(dim=-1).values,
+        planted.sort(dim=-1).values,
+        rtol=0,
+        atol=0,
+    )
+
+
 def test_fp8_block_scale_moe_swiglu_oa_activation_param_validation():
     """FP8 block-scale OA params are scoped to the block-scale recipes with SwiGLU.
 
