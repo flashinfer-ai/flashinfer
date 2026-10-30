@@ -25,8 +25,8 @@ Differences from the base kernel:
   (``auto_heads_per_cta``: all value heads of a key head per CTA from 1.5-3.6 waves of CTA
   slots with flush rows and from 0.8-1 without, not 8, except Philox above 6 rounds at T <= 4
   in random order on a partial-device launch);
-* the fp32 copies of bf16 ``A_log`` / ``dt_bias`` are safe across streams and re-made after an
-  in-place update.
+* the fp32 copies of bf16 ``A_log`` / ``dt_bias`` are safe across streams and refreshed in place
+  after an in-place update (same address, so graphs captured earlier read the new values).
 
 Same contract as the base kernel (fp16-state arm: bf16 q/k/v/a/b and
 outputs, fp16 state pool, bf16 k ring, bf16 or fp16 u ring, fp32 g ring), same 32-slot
@@ -182,7 +182,7 @@ _PZ_AUTO_T = (2, 3, 4, 5, 6, 7, 8)
 # faster kernel in 134 of 140 cells and at most 1.3 % (warm) / 3.0 % (serving-like, T = 6
 # B = 160, where warm L2 has the other kernel 2 % ahead) slower. Flush rows possible (None /
 # "some" / "flush_first"): >= 8 items at every T.
-_PZ_AUTO_MIN_ITEMS = {
+_PZ_AUTO_MIN_ITEMS: dict[str, float | dict[int, float]] = {
     "none": {2: 3.5, 3: 2.4, 4: 2.4, 5: 2.4, 6: 5.0, 7: 5.5, 8: 5.5},
     "some": 8,
 }
@@ -4431,17 +4431,19 @@ _ROW_ID: dict = {}
 
 def _cached_f32(t: torch.Tensor) -> torch.Tensor:
     """fp32 copy of a per-layer constant (A_log / dt_bias), cached by object identity and
-    re-made when the tensor is updated in place (its version counter, e.g. a weight reload;
-    inference-mode tensors have no version counter, so for them only by identity).
+    refreshed in place when the tensor is updated in place (its version counter, e.g. a weight
+    reload; inference-mode tensors have no version counter, so for them only by identity). The
+    copy keeps its address, so CUDA graphs captured before the update read the new values.
 
     The copy is written on the stream that makes it. Another stream (e.g. the other die's
-    stream of a die-localized split) must not read it before that write completes, so the
-    first time each other stream uses the copy it waits for the conversion's event (and the copy
-    is recorded on that stream for the caching allocator). Later launches on that stream are
-    ordered after the wait by stream order, so they make no CUDA call. Under graph capture a hit
-    makes no CUDA call: the copy was enqueued before the capture, and torch.cuda.graph
-    synchronizes the device when it begins. A first sight (or an updated tensor) during a capture
-    converts inside the graph and is not cached."""
+    stream of a uGPU call) must not read it before that write completes, so the first time each
+    other stream uses the copy it waits for the conversion's event (and the copy is recorded on
+    that stream for the caching allocator). Later launches on that stream are ordered after the
+    wait by stream order, so they make no CUDA call. A refresh synchronizes the device first
+    (launches on any stream may still read the old values) and makes every other stream wait
+    again. Under graph capture a hit makes no CUDA call: the copy was enqueued before the
+    capture, and torch.cuda.graph synchronizes the device when it begins. A first sight (or an
+    updated tensor) during a capture converts inside the graph and is not cached."""
     if t.dtype == torch.float32 and t.is_contiguous():
         return t
     sid = torch._C._cuda_getCurrentRawStream(t.device.index)
@@ -4456,6 +4458,15 @@ def _cached_f32(t: torch.Tensor) -> torch.Tensor:
     if ent is None or ent[3] != ver:
         if capturing:
             return t.float().contiguous()
+        if ent is not None and ent[0].shape == t.shape:
+            # in place: graphs captured earlier keep reading this address
+            torch.cuda.synchronize(t.device)
+            c = ent[0]
+            c.copy_(t)
+            ev = torch.cuda.Event()
+            ev.record(cur)
+            _F32_CACHE[id(t)] = (c, ev, {sid}, ver)
+            return c
         c = t.float().contiguous()
         ev = torch.cuda.Event()
         ev.record(cur)
@@ -4720,7 +4731,8 @@ def auto_heads_per_cta(
     # flush rows first moves the caps of partial-device launches only
     ff = flush_hint == "flush_first" and not whole_device
     slow_philox = sr == "philox" and sr_rounds > _HPC_PHILOX_FAST_ROUNDS
-    cap1 = _HPC1_MAX_WAVES
+    cap1: float = _HPC1_MAX_WAVES
+    cap2: float
     if T is None:
         cap2 = _HPC2_MAX_WAVES
     elif flush_hint == "none":
@@ -4784,9 +4796,10 @@ def _pz_auto(
 ) -> bool:
     """persistent=None: the persistent kernel where it measured faster (see _PZ_AUTO_T and
     _PZ_AUTO_MIN_ITEMS)."""
-    min_items = _PZ_AUTO_MIN_ITEMS["none" if flush_hint == "none" else "some"]
-    if isinstance(min_items, dict):  # by T
-        min_items = min_items.get(T, math.inf)
+    tab = _PZ_AUTO_MIN_ITEMS["none" if flush_hint == "none" else "some"]
+    min_items = float(
+        tab.get(T, math.inf) if isinstance(tab, dict) else tab
+    )  # by T or flat
     return (
         (target.major, target.minor) in _PZ_CC
         and T in _PZ_AUTO_T

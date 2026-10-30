@@ -3490,6 +3490,10 @@ def gated_delta_rule_mtp_ucache_flush(
                 f"backend 'auto' or 'umma', got {backend!r}."
             )
         _why = _umma_unavailable_reason(device, T, H, HK, HV, True, pdl_trigger)
+        if _why is None:
+            _cc = torch.cuda.get_device_capability(device)
+            if _cc not in ((10, 0), (10, 7)):
+                _why = f"the Rubin build runs on sm_100a / sm_107a only, got sm_{_cc[0]}{_cc[1]}"
         if _why is None and _UMMA_RUBIN is None:
             _why = (
                 "flashinfer.gdn_kernels.gdn_replay_mtp_umma_rubin could not be imported"

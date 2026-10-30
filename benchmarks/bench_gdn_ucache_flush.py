@@ -713,6 +713,9 @@ def main():
         help="sustained DRAM peak (TB/s) for DRAM %% (with --dram-bytes)",
     )
     args = ap.parse_args()
+    bad = [r for r in args.rates if not (math.isfinite(r) and 0 <= r <= 100)]
+    if bad:
+        ap.error(f"--rates: percentages in [0, 100], got {bad}")
     args.rates = [int(r) if float(r).is_integer() else r for r in args.rates]
     if (args.localized or args.persistent) and args.arm not in _UMMA_SR:
         ap.error("--localized / --persistent: umma or rubin arms only")

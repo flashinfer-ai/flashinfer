@@ -58,6 +58,14 @@ def _umma():
     return getattr(_rubin_mod(), _RUBIN[1])
 
 
+def _skip_if_no_rubin_module():
+    """CPU-only policy tests: skip when the Rubin module cannot be imported (no cutlass-dsl)."""
+    try:
+        _rubin_mod()
+    except ImportError as e:
+        pytest.skip(f"Rubin build module unavailable: {e}")
+
+
 def _skip_if_no_rubin_build():
     from flashinfer.utils import get_compute_capability
 
@@ -106,6 +114,7 @@ def test_auto_heads_per_cta_rubin_caps():
     whole-device launches at T = 2-4 (odd heads per key: one hpc = 1 wave at T >= 5). Without
     T: the 8-wave cap whatever the hint and rounding (also the base file's policy test, run here
     against this build)."""
+    _skip_if_no_rubin_module()
     f = _rubin_mod().auto_heads_per_cta
     die = (8, 106)  # one die of a Rubin uGPU launch: key heads and SMs (424 CTA slots)
     assert [f(b, *die) for b in (13, 14, 212, 213)] == [1, 2, 2, 4]
@@ -230,6 +239,7 @@ def test_persistent_auto_items():
     _PZ_AUTO_MIN_ITEMS["none"][T] (H = 8 on a 106-SM die: B >= 53 x items, e.g. T = 2 186,
     T = 4 128, T = 8 292), 8 otherwise (B >= 424); never on a whole-device launch, at T = 1, with
     fewer heads per CTA or with grid_override."""
+    _skip_if_no_rubin_module()
     from types import SimpleNamespace
 
     M = _rubin_mod()
@@ -352,6 +362,7 @@ def test_small_b_row_order_rule(monkeypatch):
     x 4 / hpc CTAs per row on 106 SMs: B <= 6 / 13 / 26 at hpc = 1 / 2 / 4), or without flush rows
     (flush_hint "none"), ignores row_order; larger grids, the persistent kernel and sm_100a keep
     it; a call without row_order stays without. CPU-only."""
+    _skip_if_no_rubin_module()
     rubin, b200 = _targets()
 
     def ro(B, T, tgt=rubin, **kw):
@@ -379,6 +390,7 @@ def test_small_b_launch_bound(monkeypatch):
     value heads per key head compiles with a 2-CTA/SM launch bound, except the register-split
     builds (setmaxnreg assumes 64 registers per thread) and Philox (no measured gain); larger
     grids, other heads per key head, the persistent kernel and sm_100a keep 4. CPU-only."""
+    _skip_if_no_rubin_module()
     M = _rubin_mod()
     rubin, b200 = _targets()
 
@@ -421,6 +433,7 @@ def test_small_b_build_options():
     vsmem / D-build masks) at T >= 5 with 1 head per CTA, no rolled head loop in the
     round-to-nearest 2-head builds; 4 heads per CTA, stochastic rounding's roll and the
     persistent build unchanged. CPU-only."""
+    _skip_if_no_rubin_module()
     M = _rubin_mod()
     keys = ("rmw_loop", "pro_reorder", "vsmem", "d_mask", "roll", "roll_f", "mixed_fma")
 
@@ -775,8 +788,9 @@ def test_bf16_gate_params_two_streams():
 
 
 def test_bf16_gate_params_inplace_update():
-    """The fp32 copy of a bf16 A_log / dt_bias is re-made after an in-place update of the same
-    object (e.g. a weight reload), not served stale."""
+    """The fp32 copy of a bf16 A_log / dt_bias is refreshed after an in-place update of the same
+    object (e.g. a weight reload), not served stale, and keeps its address: a CUDA graph captured
+    before the update replays with the new values, also after the freed blocks are reused."""
     _skip_if_no_rubin_build()
     T, B = 4, 8
     fm = W - T + 1
@@ -819,6 +833,51 @@ def test_bf16_gate_params_inplace_update():
     got = run(A_, dt_)
     for name, x, y in zip(("y", "pool", "k", "u", "g"), ref, got, strict=True):
         assert torch.equal(x, y), name
+    # a graph captured before the update reads the refreshed copy (same address)
+    A_g, dt_g = A_log.clone(), dt_bias.clone()
+    run(A_g, dt_g)  # caches A_g / dt_g outside the capture
+    gbufs = [x.clone() for x in (pool, kc, uc, gc)]
+    y_g = torch.empty_like(v)
+
+    def call():
+        fn(
+            A_g,
+            a,
+            dt_g,
+            q=q,
+            k=k,
+            v=v,
+            b=b,
+            initial_state_source=gbufs[0],
+            initial_state_indices=idx,
+            k_cache=gbufs[1],
+            u_cache=gbufs[2],
+            g_cache=gbufs[3],
+            hist_len=hl,
+            cache_base=cb,
+            scale=SCALE,
+            flush_min=fm,
+            restart_hist_on_flush=False,
+            output=y_g,
+        )
+
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        call()
+    A_g.copy_(A_new)
+    dt_g.copy_(dt_new)
+    run(A_g, dt_g)  # one eager call after the update: refreshes the copies
+    junk = [
+        torch.full((1 << 16,), 1e4, device=DEV) for _ in range(64)
+    ]  # reuse freed blocks
+    for x, x0 in zip(gbufs, (pool, kc, uc, gc), strict=True):
+        x.copy_(x0)
+    g.replay()
+    torch.cuda.synchronize()
+    got = [_pz_bits(x) for x in [y_g] + gbufs]
+    for name, x, y in zip(("y", "pool", "k", "u", "g"), ref, got, strict=True):
+        assert torch.equal(x, y), ("graph", name)
+    del junk
     # inference-mode tensors (no version counter) are cached by identity
     with torch.inference_mode():
         A_i, dt_i = A_new.clone(), dt_new.clone()
@@ -1353,6 +1412,7 @@ def test_ugpu_path_rule():
     green-context launches
     above it under capture; sm_100a, 2 or 3 value heads per key head and persistent /
     grid_override calls keep the old paths."""
+    _skip_if_no_rubin_module()
     M = _rubin_mod()
     from flashinfer.gdn_kernels.device_target import GdnDeviceTarget
 
@@ -1632,3 +1692,34 @@ def test_dispatcher_ugpu_cursor_checks():
                 flush_min=fm,
                 restart_hist_on_flush=True,
             )
+
+
+def test_dispatcher_ugpu_unsupported_arch(monkeypatch):
+    """uGPU buffers on an arch the Rubin build does not run on (e.g. sm_103) get the dispatcher's
+    ValueError, not the kernel entry's NotImplementedError."""
+    _skip_if_no_rubin_build()
+    mod = _base._flashinfer_fp16_state()
+    case, fm = _pz_case(4, 133, "FVVPF")
+    q, k, v, a, b, A_log, dt_bias, pool, kc, uc, gc, hl, cb, idx = case
+    bufs = [_ugpu_split(x, 2, "parts") for x in (pool, kc, uc, gc)]
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *_a, **_k: (10, 3))
+    with pytest.raises(ValueError, match="sm_103"):
+        mod.gated_delta_rule_mtp_ucache_flush(
+            A_log,
+            a,
+            dt_bias,
+            q=q,
+            k=k,
+            v=v,
+            b=b,
+            initial_state_source=bufs[0],
+            initial_state_indices=idx,
+            k_cache=bufs[1],
+            u_cache=bufs[2],
+            g_cache=bufs[3],
+            hist_len=hl,
+            cache_base=cb,
+            scale=SCALE,
+            flush_min=fm,
+            restart_hist_on_flush=False,
+        )
