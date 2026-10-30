@@ -87,13 +87,16 @@ def _device_streams() -> bool:
 
 
 def _stage1_builds(man) -> list:
-    """The manifest's stage-1 rows without the no-tail twins (``no_tail``) and the compact-list twins
-    (``compact_list``), which ``test_no_tail_twins_match_their_fused_tail_builds`` and
-    ``test_compact_list_twins_sample_as_the_pipeline`` check on their own."""
+    """The manifest's stage-1 rows without the no-tail twins (``no_tail``), the compact-list twins (``compact_list``)
+    and the lean-scan twin (``lean``), which ``test_no_tail_twins_match_their_fused_tail_builds``,
+    ``test_compact_list_twins_sample_as_the_pipeline`` and ``test_lean_twin_matches_its_parent_build`` check on their
+    own."""
     return [
         v
         for v in man["stage1"]
-        if not v.get("no_tail", False) and not v.get("compact_list", False)
+        if not v.get("no_tail", False)
+        and not v.get("compact_list", False)
+        and not v.get("lean", False)
     ]
 
 
@@ -5867,7 +5870,8 @@ def test_compact_list_twins_sample_as_the_pipeline():
             or v["coarse_push"]
             or v["leader_push"]
         )
-    assert len(cs._stage1_variants()) == len(man["stage1"]) - len(compact)
+    lean = [v for v in man["stage1"] if v.get("lean", False)]
+    assert len(cs._stage1_variants()) == len(man["stage1"]) - len(compact) - len(lean)
     assert not any(stream for _, _, stream in cs._stage1_variants(101376))
     for sm_count, vocab, batch, k in itertools.product(
         (84, 170, 188), (32768, 128256, 151936), (1, 17, 64, 128), (10, 1000)
@@ -6474,3 +6478,434 @@ def test_compact_list_route_samples_like_the_plan_without_the_picks(monkeypatch)
                 base, got, (vbin, bbin, large, k if isinstance(k, int) else "row")
             )
     _clear_plan_caches()
+
+
+# ------------------------------------------------------------------------------- round 21: the lean-scan twin
+
+# Round 21: the two-launch chains of the (4, 16) resident on the V = 32768 rows of 1, 2, 4, 8 and 16 batches with
+# 768 < top-k <= 1024 on GB300 (152 SMs) and B200 (148 SMs) take its lean-scan twin (launch_flags bit 14); nothing else
+# in the plan moves.
+_R21_LEAN_BATCHES = frozenset({1, 2, 4, 8, 16})
+# (device, vocab, batch, top-k) -> (plan without the rule, plan with it) of every owner cell the rule changes.
+_R21_LEAN_PLAN_CHANGES = {
+    (name, 32768, batch, 1000): ("4_16_0 f2 2L", "4_16_0 f16386 2L")
+    for name in ("GB300", "B200")
+    for batch in (1, 2, 4, 8, 16)
+}
+# The wide-grid cells the rule moves: GB300 and B200, batch 1, 2, 4, 8 and 16, top-k 769, 800, 1000 and 1024.
+_R21_LEAN_WIDE_MOVED = 2 * 5 * 4
+
+
+def test_lean_twin_is_no_stage1_variant_of_its_own():
+    """Round 21: the lean-scan twin (``lean``, the symbol suffixed ``_lean``) doubles the (4, 16) register-resident
+    fused-tail build with the same launch resources; launch_flags bit 14 selects it.  It is no stage-1 variant of its
+    own (the cost model never ranks it), it does not decide whether the (4, 16) resident carries the fused tail, and the
+    binding source gives every stage-1 row its lean column."""
+    import re
+
+    man = load_manifest()
+    lean = [v for v in man["stage1"] if v.get("lean", False)]
+    assert [v["symbol"] for v in lean] == ["kernel_cake_radix_topk_c4_e16_lean"]
+    twin = lean[0]
+    builds = {v["symbol"]: v for v in man["stage1"]}
+    parent = builds[twin["symbol"][: -len("_lean")]]
+    shared = {key for key in twin if key not in ("symbol", "lean")}
+    assert shared == {key for key in parent if key not in ("symbol", "lean")}
+    assert all(twin[key] == parent[key] for key in shared)
+    assert all("lean" in v for v in man["stage1"]) and not parent["lean"]
+    assert (twin["cluster"], twin["ept"], bool(twin["stream"])) == cs._LEAN_TWIN_BUILD
+    assert twin["fused_tail"] and not (
+        twin["fused_block_tail"] or twin["no_tail"] or twin["compact_list"]
+    )
+    assert cs._stage1_has_lean(*cs._LEAN_TWIN_BUILD)
+    assert cs._stage1_has_fused_tail(*cs._LEAN_TWIN_BUILD)
+    others = {(v["cluster"], v["ept"], bool(v["stream"])) for v in man["stage1"]}
+    assert not any(cs._stage1_has_lean(*key) for key in others - {cs._LEAN_TWIN_BUILD})
+    for limit in (None, _FULL_SMEM_OPTIN, 101376):
+        rows = [
+            v
+            for v in man["stage1"]
+            if not v.get("compact_list", False)
+            and (limit is None or int(v["dynamic_smem_bytes"]) <= limit)
+        ]
+        variants = cs._stage1_variants(limit)
+        assert variants == [
+            (v["cluster"], v["ept"], bool(v["stream"])) for v in rows if not v["lean"]
+        ]
+        assert len(variants) == len(rows) - sum(v["lean"] for v in rows)
+    source = cake_sampling_jit._binding_source(man)
+    table = next(
+        line
+        for line in source.splitlines()
+        if line.startswith("#define CAKE_SAMPLING_STAGE1_TABLE(X)")
+    )
+    entries = [e.split(", ") for e in re.findall(r"X\(([^)]*)\)", table)]
+    assert [e[0] for e in entries] == [v["symbol"] for v in man["stage1"]]
+    assert all(len(e) == 18 for e in entries)
+    assert [e[-1] for e in entries] == [
+        "1" if v["lean"] else "0" for v in man["stage1"]
+    ]
+
+
+def test_lean_twin_cells_change_only_their_cells(monkeypatch):
+    """The round-21 rule (``_LEAN_TWIN_CELLS_BY_DEVICE``: V = 32768, batch 1, 2, 4, 8 and 16 on the 152-SM compute
+    capability 10.3 device and the 148-SM 10.0 device) changes the launch plans of the owner cells on the emulated
+    devices exactly on the cells of ``_R21_LEAN_PLAN_CHANGES``, against the plans without it.  On a wide grid (vocab on
+    both sides of 32768, batch 1-32, top-k on both sides of 768) it changes only those devices' V = 32768 rows of
+    ``_R21_LEAN_BATCHES`` batches with 768 < top-k <= fused_block_tail_kcap whose plan is the (4, 16) resident's
+    two-launch chain without a fused tail or the no-tail twin, each by launch_flags bit 14 alone (the same stage-1
+    variant, stage-2/3 slab and form); the other batches, a 10.3 device with 148 or 160 SMs and every other device keep
+    every plan.  ``top_k_probs_to_slab`` never takes the twin.
+    CUDA is reported present, as on the emulated devices, so no GPU is needed."""
+    assert {
+        (10, 3, 152): {32768: _R21_LEAN_BATCHES},
+        (10, 0, 148): {32768: _R21_LEAN_BATCHES},
+    } == cs._LEAN_TWIN_CELLS_BY_DEVICE
+    emulated = {
+        **_PLAN_DEVICES,
+        "B300": ((10, 3), 148, _FULL_SMEM_OPTIN),
+        "GB300 160 SMs": ((10, 3), 160, _FULL_SMEM_OPTIN),
+    }
+
+    def without_rule(cells=_PLAN_CELLS):
+        with monkeypatch.context() as m:
+            m.setattr(cs, "_LEAN_TWIN_CELLS_BY_DEVICE", {})
+            return _emulated_launch_plans(m, emulated, cells, cuda=True)
+
+    new = _emulated_launch_plans(monkeypatch, emulated, cuda=True)
+    old = without_rule()
+    changed = {
+        cell: (_plan_text(old[cell]), _plan_text(plan))
+        for cell, plan in new.items()
+        if plan != old[cell]
+    }
+    assert changed == _R21_LEAN_PLAN_CHANGES
+    cells = tuple(
+        itertools.product(
+            (16385, 24576, 30000, 32767, 32768, 32769, 65536),
+            (1, 2, 3, 4, 7, 8, 9, 15, 16, 17, 32),
+            (64, 65, 768, 769, 800, 1000, 1024),
+        )
+    )
+    new = _emulated_launch_plans(monkeypatch, emulated, cells, cuda=True)
+    old = without_rule(cells)
+    kcap = cs._fused_block_tail_kcap()
+    chain_bits = cs._FLAG_FUSE_TAIL | cs._FLAG_FUSE_BLOCK_TAIL | cs._FLAG_NO_TAIL
+    moved = 0
+    for cell, plan in new.items():
+        name, vocab, batch, k = cell
+        before = old[cell]
+        if (
+            name in ("GB300", "B200")
+            and vocab == 32768
+            and batch in _R21_LEAN_BATCHES
+            and cs._BLOCK_TAIL_MIN_K < k <= kcap
+            and before is not None
+            and (before.cluster, before.ept, before.stream) == cs._LEAN_TWIN_BUILD
+            and not before.one_launch
+            and not before.launch_flags & chain_bits
+        ):
+            assert plan == before._replace(
+                launch_flags=before.launch_flags | cs._FLAG_LEAN
+            ), cell
+            moved += 1
+        else:
+            assert plan == before, cell
+    assert moved == _R21_LEAN_WIDE_MOVED
+    devices = {
+        1 << 16: ((10, 3), 152, _FULL_SMEM_OPTIN),
+        (1 << 16) + 1: ((10, 0), 148, _FULL_SMEM_OPTIN),
+    }
+    with monkeypatch.context() as m:
+        m.setattr(torch.cuda, "is_available", lambda: True)
+        m.setattr(cs, "_device_capability", lambda index: devices[index][0])
+        m.setattr(cs, "_sm_count", lambda index: devices[index][1])
+        m.setattr(cs, "_smem_optin", lambda index: devices[index][2])
+        for name in (
+            "_block_tail_enabled",
+            "_row_span_diet_capability",
+            "_stream_prepass_flag",
+            "_stage23_variant_flags",
+        ):
+            m.setattr(cs, name, inspect.unwrap(getattr(cs, name)))
+        slab_plan = inspect.unwrap(cs._slab_plan)
+        for index, batch, k in itertools.product(
+            devices, range(1, 17), (769, 1000, 1024)
+        ):
+            assert not slab_plan(index, batch, 32768, k)[3] & cs._FLAG_LEAN
+
+
+def _poisoned(*shape, dtype):
+    """A CUDA tensor of ``shape`` whose every 32-bit word holds 0x7FBADBAD (a NaN as float32), viewed as ``dtype``."""
+    return torch.full(shape, 0x7FBADBAD, device="cuda", dtype=torch.int32).view(dtype)
+
+
+def _lean_rows(batch, vocab, seed):
+    """``batch`` probability rows of ``vocab`` entries with the adversarial rows of the round-21 twin tests in front:
+    ties across the cut, a uniform row, +inf entries, NaN entries, an all-zero row, fewer than 769 non-zero entries
+    and a mixed NaN / +inf / negative row."""
+    pn = _probs(batch, vocab, seed=seed).cpu().numpy()
+    edits = (
+        ((np.arange(1500) * 13) % vocab, np.float32(2**-11)),
+        (slice(None), np.float32(1.0 / vocab)),
+        ([7, 4096, vocab - 1], np.float32(np.inf)),
+        ([3, 1000, 20000], np.float32(np.nan)),
+        (slice(None), np.float32(0.0)),
+        (slice(500, None), np.float32(0.0)),
+        ([1, 2, 3, 4], np.array([np.nan, np.inf, -1.0, -np.inf], dtype=np.float32)),
+    )
+    for r, (where, value) in zip(range(batch), edits, strict=False):
+        pn[r, where] = value
+    return torch.tensor(pn, device="cuda")
+
+
+def _lean_pair(module, probs, k, p, flags, emit_renorm, seed=0x21, offset=5):
+    """Outputs of the (4, 16) resident's launch form ``flags`` (the parent) and of ``flags`` | bit 14 (the twin):
+    stage 1, then the stage-2/3 launch of the (256, 4) slab unless ``flags`` fuses the two-warp tail.  Every buffer
+    starts poisoned (``_poisoned``); returns two tuples of int32 views of (vals, idxs, count, samples, renorm)."""
+    batch = probs.shape[0]
+    kmax = k if isinstance(k, int) else int(k.max().item())
+    p_args = (probs, float(p), 1) if isinstance(p, (int, float)) else (p, 0.0, 2)
+    stream = torch.cuda.current_stream().cuda_stream
+    runs = []
+    for f in (flags, flags | cs._FLAG_LEAN):
+        vals = _poisoned(batch, SLAB, dtype=torch.float32)
+        idxs = _poisoned(batch, SLAB, dtype=torch.int32)
+        cnt = _poisoned(batch, dtype=torch.int32)
+        out = _poisoned(batch, dtype=torch.int32)
+        rn = _poisoned(batch, SLAB, dtype=torch.float32)
+        k_args = (cnt, int(k), 1) if isinstance(k, int) else (k, 0, 2)
+        module.radix_topk(
+            probs,
+            k_args[0],
+            k_args[1],
+            k_args[2],
+            vals,
+            idxs,
+            cnt,
+            4,
+            16,
+            0,
+            p_args[0],
+            p_args[1],
+            p_args[2],
+            out,
+            rn,
+            seed,
+            offset,
+            emit_renorm,
+            f,
+            stream,
+        )
+        if not f & cs._FLAG_FUSE_TAIL:
+            threads, items = choose_stage23(kmax)
+            module.sparse_topp_sample(
+                vals,
+                idxs,
+                cnt,
+                p_args[0],
+                p_args[1],
+                p_args[2],
+                out,
+                rn,
+                seed,
+                offset,
+                emit_renorm,
+                threads,
+                items,
+                stage23_variant_flags(probs.device),
+                1,
+                stream,
+            )
+        torch.cuda.synchronize()
+        runs.append(
+            tuple(t.view(torch.int32).clone() for t in (vals, idxs, cnt, out, rn))
+        )
+    return runs
+
+
+def test_lean_twin_matches_its_parent_build(monkeypatch):
+    """Round 21: the lean-scan twin's outputs are byte for byte those of the (4, 16) resident build it doubles: the
+    slab (values, indices, count), the samples and the renormalized weights of the two-launch chain (flags 0 and 2,
+    scalar and per-row top-k / top-p, emit_renorm 0 and 1) and of the fused two-warp tail (bit 0, top-k
+    fused_tail_kcap), on the adversarial rows of ``_lean_rows`` and from poisoned buffers, and the chain's output is
+    the reference's.  Through the public entry point with a caller's workspace (with and without ``renorm_out``), a
+    launch the rule moves to the twin writes the same bytes as the plan without the rule, and on this device the rule
+    moves exactly the (4, 16) resident's chains of its listed cells.  On a device ``_LEAN_TWIN_CELLS_BY_DEVICE`` lists,
+    every tested cell is listed and its plan is that chain before the bytes are compared, so the comparison cannot
+    pass on a plan that never takes the twin."""
+    _require_supported_device()
+    module = load_cake_sampling_module()
+    vocab = 32768
+    for batch, k, p, seed in (
+        (1, 1000, 0.9, 2101),
+        (4, 769, 0.5, 2102),
+        (8, 800, 1.0, 2103),
+        (16, 1024, 1e-6, 2104),
+        (16, 1000, 0.9, 2105),
+    ):
+        probs = _lean_rows(batch, vocab, seed)
+        pn = probs.cpu().numpy()
+        k_row = torch.tensor(
+            [769 + (r * 37) % 256 for r in range(batch)],
+            device="cuda",
+            dtype=torch.int32,
+        )
+        p_row = torch.linspace(0.05, 1.0, batch, device="cuda", dtype=torch.float32)
+        for kk, pp in ((k, p), (k_row, p_row)):
+            for flags, emit in ((2, 1), (2, 0), (0, 1)):
+                where = (batch, "row" if not isinstance(kk, int) else kk, flags, emit)
+                parent, twin = _lean_pair(module, probs, kk, pp, flags, emit)
+                for name, a, b in zip(
+                    ("vals", "idxs", "count", "samples", "renorm"),
+                    parent,
+                    twin,
+                    strict=True,
+                ):
+                    assert torch.equal(a, b), (*where, name)
+                if emit:
+                    vals, idxs, cnt, out, rn = (t.cpu().numpy() for t in twin)
+                    run = Run(
+                        out, rn.view(np.float32), vals.view(np.float32), idxs, cnt
+                    )
+                    _check(
+                        run,
+                        pn,
+                        kk if isinstance(kk, int) else kk.cpu().numpy(),
+                        pp if isinstance(pp, (int, float)) else pp.cpu().numpy(),
+                        0x21,
+                        5,
+                    )
+        for emit in (0, 1):
+            parent, twin = _lean_pair(
+                module, probs, cs._fused_tail_kcap(), 0.9, cs._FLAG_FUSE_TAIL, emit
+            )
+            for name, a, b in zip(
+                ("vals", "idxs", "count", "samples", "renorm"),
+                parent,
+                twin,
+                strict=True,
+            ):
+                assert torch.equal(a, b), (batch, "fused", emit, name)
+    # the public entry point with a caller's workspace: the rule on this device's cells against the plan without it
+    device = torch.cuda.current_device()
+    here = (*cs._device_capability(device), cs._sm_count(device))
+    chain_bits = cs._FLAG_FUSE_TAIL | cs._FLAG_FUSE_BLOCK_TAIL | cs._FLAG_NO_TAIL
+    for batch, k, seed in ((1, 1000, 2111), (8, 769, 2112), (16, 1024, 2113)):
+        probs = _lean_rows(batch, vocab, seed)
+        k_row = torch.tensor(
+            [k - (r * 7) % 200 for r in range(batch)], device="cuda", dtype=torch.int32
+        )
+        p_row = torch.linspace(0.2, 1.0, batch, device="cuda", dtype=torch.float32)
+        plans = []
+        for table in ({}, {here: {vocab: frozenset(range(1, 17))}}):
+            with monkeypatch.context() as m:
+                m.setattr(cs, "_LEAN_TWIN_CELLS_BY_DEVICE", table)
+                _clear_plan_caches()
+                plans.append(cs._launch_plan(device, batch, vocab, k))
+        _clear_plan_caches()
+        plan0, plan1 = plans
+        chain = (
+            (plan0.cluster, plan0.ept, plan0.stream) == cs._LEAN_TWIN_BUILD
+            and not plan0.one_launch
+            and not plan0.launch_flags & chain_bits
+        )
+        listed = batch in cs._LEAN_TWIN_CELLS_BY_DEVICE.get(here, {}).get(vocab, ())
+        if here in cs._LEAN_TWIN_CELLS_BY_DEVICE:
+            # a device the table lists takes the twin on every tested cell: its plan is the (4, 16) chain, so the
+            # byte comparison below runs the twin against the parent build
+            assert listed and chain, (batch, k, plan0)
+        assert plan1 == (
+            plan0._replace(launch_flags=plan0.launch_flags | cs._FLAG_LEAN)
+            if chain
+            else plan0
+        ), (batch, k, plan0, plan1)
+        assert cs._launch_plan(device, batch, vocab, k) == (plan1 if listed else plan0)
+        _clear_plan_caches()
+        for kk, pp in ((k, 0.9), (k_row, p_row)):
+            for with_renorm in (False, True):
+                results = []
+                for table in ({}, {here: {vocab: frozenset(range(1, 17))}}):
+                    ws = (
+                        _poisoned(batch, SLAB, dtype=torch.float32),
+                        _poisoned(batch, SLAB, dtype=torch.int32),
+                        _poisoned(batch, dtype=torch.int32),
+                    )
+                    out = _poisoned(batch, dtype=torch.int32)
+                    rn = _poisoned(batch, SLAB, dtype=torch.float32)
+                    with monkeypatch.context() as m:
+                        m.setattr(cs, "_LEAN_TWIN_CELLS_BY_DEVICE", table)
+                        _clear_plan_caches()
+                        top_k_top_p_sampling_from_probs(
+                            probs,
+                            kk,
+                            pp,
+                            top_k_max=k,
+                            philox_seed=0x2121,
+                            philox_offset=9,
+                            out=out,
+                            renorm_out=rn if with_renorm else None,
+                            workspace=ws,
+                        )
+                        torch.cuda.synchronize()
+                    results.append(
+                        tuple(t.view(torch.int32).clone() for t in (*ws, out, rn))
+                    )
+                _clear_plan_caches()
+                for name, a, b in zip(
+                    ("vals", "idxs", "count", "samples", "renorm"),
+                    *results,
+                    strict=True,
+                ):
+                    assert torch.equal(a, b), (batch, k, with_renorm, name)
+    _clear_plan_caches()
+
+
+def test_lean_twin_refusals():
+    """The module rejects launch_flags bit 14 on a streaming variant, together with bit 3 (whole-CTA tail) or bit 12
+    (no-tail twin), and on a register-resident variant other than (4, 16), which ships no lean-scan build."""
+    _require_supported_device()
+    module = load_cake_sampling_module()
+    man = load_manifest()
+    probs = _probs(2, 32768)
+    other = next(
+        (v["cluster"], v["ept"])
+        for v in _stage1_builds(man)
+        if not v["stream"] and (v["cluster"], v["ept"]) != (4, 16)
+    )
+    stream_build = next(
+        (v["cluster"], v["ept"]) for v in _stage1_builds(man) if v["stream"]
+    )
+    lean = cs._FLAG_LEAN
+    for (c, e, st), flags in (
+        ((*stream_build, 1), lean),
+        ((4, 16, 0), lean | cs._FLAG_FUSE_BLOCK_TAIL),
+        ((4, 16, 0), lean | cs._FLAG_NO_TAIL),
+        ((*other, 0), lean),
+    ):
+        vals, idxs, cnt = _ws(2)
+        out = torch.empty(2, device="cuda", dtype=torch.int32)
+        rn = torch.empty(2, SLAB, device="cuda")
+        with pytest.raises(Exception, match="launch_flags bit 14"):
+            module.radix_topk(
+                probs,
+                cnt,
+                1000,
+                1,
+                vals,
+                idxs,
+                cnt,
+                c,
+                e,
+                st,
+                probs,
+                0.9,
+                1,
+                out,
+                rn,
+                7,
+                1,
+                1,
+                flags,
+                torch.cuda.current_stream().cuda_stream,
+            )

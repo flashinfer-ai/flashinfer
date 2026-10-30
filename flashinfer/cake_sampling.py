@@ -301,11 +301,13 @@ def _stage1_variants(smem_limit: Optional[int] = None) -> list[tuple[int, int, b
     The frozen variants were sized for the 227 KB opt-in limit of 9.x-11.x devices; 12.x devices
     opt in to 99 KB, so the larger register-resident variants are not candidates there.  The
     compact-list twins (``compact_list``, launch_flags bit 13) are not variants of their own: their
-    (cluster, ept) are those of the full-list streams they double, which do not fit a 12.x opt-in."""
+    (cluster, ept) are those of the full-list streams they double, which do not fit a 12.x opt-in.
+    Nor is the lean-scan twin (``lean``, launch_flags bit 14) of the (4, 16) resident it doubles."""
     return [
         (v["cluster"], v["ept"], bool(v["stream"]))
         for v in load_manifest()["stage1"]
         if not v.get("compact_list", False)
+        and not v.get("lean", False)
         and (smem_limit is None or int(v["dynamic_smem_bytes"]) <= smem_limit)
     ]
 
@@ -461,10 +463,10 @@ def _stage1_has_fused_tail(cluster: int, ept: int, stream: bool) -> bool:
     """Whether the frozen variant is built with the fused stage-2/3 tail (manifest ``fused_tail``).
 
     The (8, 48) resident is a large-k pick and ships without the tail (inlining it cost that variant
-    2-7 % of stage-1 time on Blackwell / Rubin), so a launch that lands there takes two kernels.  The no-tail twins
-    (manifest ``no_tail``) are forms of a fused-tail variant and do not decide it."""
+    2-7 % of stage-1 time on Blackwell / Rubin), so a launch that lands there takes two kernels.  The no-tail and
+    lean-scan twins (manifest ``no_tail`` / ``lean``) are forms of a fused-tail variant and do not decide it."""
     for v in load_manifest()["stage1"]:
-        if v.get("no_tail", False):
+        if v.get("no_tail", False) or v.get("lean", False):
             continue
         if (v["cluster"], v["ept"], bool(v["stream"])) == (cluster, ept, stream):
             return bool(v["fused_tail"])
@@ -965,6 +967,11 @@ _FLAG_NO_TAIL = 4096
 # of compute capability 12.x.  A warp whose segment overflows takes the exact fallback; every output is bit-identical.
 # Only ``_compact_launch_plan`` takes it, on the cells of ``_COMPACT_PICKS_BY_DEVICE``.
 _FLAG_COMPACT_LIST = 8192
+# Stage-1 launch_flags bit 14: the lean-scan form (`_lean` twin) of the (4, 16) register-resident fused-tail build, whose
+# candidate-list and collect block scans read the sixteen warp sums with one shared load and two warp reductions and
+# whose candidate-list scan keeps no trailing barrier; every output is bit-identical.  Only ``_lean_twin_flag`` takes
+# it, on the cells of ``_LEAN_TWIN_CELLS_BY_DEVICE``.
+_FLAG_LEAN = 16384
 # The build-selection bits a no-tail twin shares with the build it doubles (manifest key per bit).
 _NO_TAIL_SHARED_BITS = (
     (_FLAG_COARSE_SAMPLE, "coarse_sample"),
@@ -1317,6 +1324,66 @@ def _no_tail_flag(
         if _stage1_has_no_tail(int(cluster), int(ept), bool(stream), build)
         else 0
     )
+
+
+# Two-launch chains of the (4, 16) register-resident build that take its lean-scan twin (launch_flags bit 14), per device
+# (capability, SM count): vocab -> the batches whose launches take it for 768 < top_k_max <= fused_block_tail_kcap.
+# Round 21: on GB300 (152 SMs) and B200 (148 SMs) these V = 32768 rows run the `c4_e16` + (256, 4) chain; the twin
+# replaces the sixteen-step warp-sum chains of stage 1's candidate-list and collect block scans by one shared load and
+# two warp reductions and drops the candidate-list scan's trailing barrier, writing the same slab, so the chain keeps
+# its stage-2/3 launch and every output.  The table lists the batches 1, 2, 4, 8 and 16, where the twin was measured
+# faster than the build it doubles on two nodes of each device; the other batches keep the parent build.  A listed cell
+# whose plan is not that chain (another stage-1 build, a fused tail or a no-tail twin) keeps its plan, and so does every
+# other device; ``top_k_probs_to_slab`` never takes the twin.
+_LEAN_TWIN_BUILD = (4, 16, False)
+_LEAN_TWIN_CELLS_BY_DEVICE: dict[tuple[int, int, int], dict[int, frozenset[int]]] = {
+    # GB300 (152 SMs)
+    (10, 3, 152): {32768: frozenset({1, 2, 4, 8, 16})},
+    # B200 (148 SMs)
+    (10, 0, 148): {32768: frozenset({1, 2, 4, 8, 16})},
+}
+
+
+@functools.cache
+def _stage1_has_lean(cluster: int, ept: int, stream: bool) -> bool:
+    """Whether the frozen variant ships the lean-scan twin (a manifest entry with ``lean``): the kernel taken by
+    launch_flags bit 14.  Every output is bit-identical to the build it doubles."""
+    return any(
+        (v["cluster"], v["ept"], bool(v["stream"])) == (cluster, ept, stream)
+        and v.get("lean", False)
+        for v in load_manifest()["stage1"]
+    )
+
+
+def _lean_twin_flag(
+    cluster: int,
+    ept: int,
+    stream: bool,
+    chain_flags: int,
+    batch: int,
+    vocab: int,
+    top_k_max: Optional[int],
+    capability: tuple[int, int],
+    sm_count: int,
+) -> int:
+    """Stage-1 ``launch_flags`` bit 14 for a two-launch chain of ``batch`` rows of ``vocab`` entries (``chain_flags``:
+    the chain's flags so far): the lean-scan twin when the chain runs ``_LEAN_TWIN_BUILD`` without a fused tail or the
+    no-tail twin, the device (``capability``, ``sm_count``) lists the cell in ``_LEAN_TWIN_CELLS_BY_DEVICE``,
+    768 < top_k_max <= fused_block_tail_kcap and the frozen module ships the twin; else 0."""
+    if (int(cluster), int(ept), bool(stream)) != _LEAN_TWIN_BUILD:
+        return 0
+    if int(chain_flags) & (_FLAG_FUSE_TAIL | _FLAG_FUSE_BLOCK_TAIL | _FLAG_NO_TAIL):
+        return 0
+    if top_k_max is None or not (
+        _BLOCK_TAIL_MIN_K < top_k_max <= _fused_block_tail_kcap()
+    ):
+        return 0
+    batches = _LEAN_TWIN_CELLS_BY_DEVICE.get(
+        (int(capability[0]), int(capability[1]), int(sm_count)), {}
+    ).get(int(vocab))
+    if not batches or int(batch) not in batches:
+        return 0
+    return _FLAG_LEAN if _stage1_has_lean(int(cluster), int(ept), bool(stream)) else 0
 
 
 # Fused-tail variants whose small-top-k launch takes the two-launch chain (stage 1 on the no-tail twin) on a multi-wave
@@ -2533,6 +2600,18 @@ def _launch_plan(
     if cell_form is not None:
         launch_flags |= _no_tail_flag(cluster, ept, stream, launch_flags, batch, None)
         stage23_flags = cell_form
+    if not (fused or fused_block):
+        launch_flags |= _lean_twin_flag(
+            cluster,
+            ept,
+            stream,
+            launch_flags,
+            batch,
+            vocab,
+            top_k_max,
+            capability,
+            sm_count,
+        )
     return _LaunchPlan(
         cluster,
         ept,
