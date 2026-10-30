@@ -57,7 +57,7 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define SMEM_STAGE_BUF_STRIDE 32768
 #define SMEM_TOTAL 50176
 #define THREADS 128
-#define LAUNCH_MIN_BLOCKS 3
+#define LAUNCH_MIN_BLOCKS 2
 
 #include <math_constants.h>
 #include <cooperative_groups.h>
@@ -130,19 +130,6 @@ __device__ __forceinline__ float approx_rcp(float x) {
 
 
 
-
-
-__device__ __forceinline__ void tma_2d_gmem2smem(
-    int dst, const void *tmap_ptr, int x, int y, int mbar_addr) {
-    asm volatile(
-        "cp.async.bulk.tensor.2d.shared::cta.global"
-        ".mbarrier::complete_tx::bytes"
-        " [%0], [%1, {%2, %3}], [%4];"
-        :: "r"(dst), "l"(tmap_ptr), "r"(x), "r"(y),
-           "r"(mbar_addr) : "memory");
-}
-
-
 __device__ __forceinline__ void cp_async_bulk_gmem2smem(
     unsigned smem_addr, const void* gmem_ptr, unsigned bytes, int mbar_addr) {
     asm volatile(
@@ -162,7 +149,7 @@ __device__ __forceinline__ float mul_f32_rn_noftz(float a, float b) {
 extern "C" {
 
 __global__ __launch_bounds__(128, LAUNCH_MIN_BLOCKS) void
-kernel_cake_causal_conv1d_train_5288d132a5cc927ae729(__nv_bfloat16* __restrict__ x, float* __restrict__ w, int* __restrict__ cu, __nv_bfloat16* __restrict__ dy, __nv_bfloat16* __restrict__ dx, float* __restrict__ dw, float* __restrict__ partial, __nv_bfloat16* __restrict__ hist, int* __restrict__ hist_row_off, float* __restrict__ dpre_tail, int* __restrict__ tail_row_off, int S, int C, int num_docs, int search_steps, int ct_vec, int n_sub, int n_ch_tiles, const __grid_constant__ CUtensorMap x_map, const __grid_constant__ CUtensorMap dy_map)
+kernel_cake_causal_conv1d_det_train_6ea6d5fc9e7fa3f2d039_kcp(__nv_bfloat16* __restrict__ x, float* __restrict__ w, int* __restrict__ cu, __nv_bfloat16* __restrict__ dy, __nv_bfloat16* __restrict__ dx, float* __restrict__ dw, float* __restrict__ partial, __nv_bfloat16* __restrict__ hist, int* __restrict__ hist_row_off, float* __restrict__ dpre_tail, int* __restrict__ tail_row_off, int S, int C, int num_docs, int search_steps, int ct_vec, int n_sub, int n_ch_tiles)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -918,11 +905,6 @@ kernel_cake_causal_conv1d_train_5288d132a5cc927ae729(__nv_bfloat16* __restrict__
                     mbarrier_arrive_expect_tx(stage_full_addr + (bslot_2) * 8, rows_k_3 * (2 * cb));
                     cp_async_bulk_gmem2smem(sx_2, reinterpret_cast<const uint8_t*>(x + src0_2), rows_k_3 * cb, stage_full_addr + (bslot_2) * 8);
                     cp_async_bulk_gmem2smem(sx_2 + 2048, reinterpret_cast<const uint8_t*>(dy + src0_2), rows_k_3 * cb, stage_full_addr + (bslot_2) * 8);
-                } else if (rstride == 512) {
-                    mbarrier_arrive_expect_tx(stage_full_addr + (bslot_2) * 8, 4096);
-                    int cc = (int)c64_1;
-                    tma_2d_gmem2smem(sx_2, (&x_map), cc, t0 + k0_1 * 4, stage_full_addr + (bslot_2) * 8);
-                    tma_2d_gmem2smem(sx_2 + 2048, (&dy_map), cc, t0 + k0_1 * 4, stage_full_addr + (bslot_2) * 8);
                 } else {
                     mbarrier_arrive_expect_tx(stage_full_addr + (bslot_2) * 8, rows_k_3 * (2 * cb));
                     #pragma unroll 1
@@ -1518,11 +1500,6 @@ kernel_cake_causal_conv1d_train_5288d132a5cc927ae729(__nv_bfloat16* __restrict__
                         mbarrier_arrive_expect_tx(stage_full_addr + (bslot_0_1) * 8, rows_k_5 * (2 * cb_1));
                         cp_async_bulk_gmem2smem(sx_3, reinterpret_cast<const uint8_t*>(x + src0_3), rows_k_5 * cb_1, stage_full_addr + (bslot_0_1) * 8);
                         cp_async_bulk_gmem2smem(sx_3 + 2048, reinterpret_cast<const uint8_t*>(dy + src0_3), rows_k_5 * cb_1, stage_full_addr + (bslot_0_1) * 8);
-                    } else if (rstride == 512) {
-                        mbarrier_arrive_expect_tx(stage_full_addr + (bslot_0_1) * 8, 4096);
-                        int cc_1 = (int)c64_1;
-                        tma_2d_gmem2smem(sx_3, (&x_map), cc_1, t0 + kn_1 * 4, stage_full_addr + (bslot_0_1) * 8);
-                        tma_2d_gmem2smem(sx_3 + 2048, (&dy_map), cc_1, t0 + kn_1 * 4, stage_full_addr + (bslot_0_1) * 8);
                     } else {
                         mbarrier_arrive_expect_tx(stage_full_addr + (bslot_0_1) * 8, rows_k_5 * (2 * cb_1));
                         #pragma unroll 1

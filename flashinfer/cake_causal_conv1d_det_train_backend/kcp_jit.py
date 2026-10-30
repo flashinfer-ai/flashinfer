@@ -100,7 +100,7 @@ from .cake_jit import (  # noqa: F401  (re-exported: the host plan over a record
 # ``launch.use_pdl``, ``arg_plan`` and ``logical``) are rewritten by the
 # exporter from the rendered program; every other field is host plan.
 MODULES: dict[str, dict[str, Any]] = {
-    "cake_causal_conv1d_train_675940a7a4fc0dba4b53": {
+    "cake_causal_conv1d_det_train_675940a7a4fc0dba4b53_kcp": {
         "arches": [
             "sm_100a",
             "sm_103a",
@@ -144,8 +144,8 @@ MODULES: dict[str, dict[str, Any]] = {
             },
             "kind": "co_resident",
         },
-        "kernel": "cake_causal_conv1d_train_675940a7a4fc0dba4b53",
-        "kernel_symbol": "kernel_cake_causal_conv1d_train_675940a7a4fc0dba4b53",
+        "kernel": "cake_causal_conv1d_det_train_675940a7a4fc0dba4b53_kcp",
+        "kernel_symbol": "kernel_cake_causal_conv1d_det_train_675940a7a4fc0dba4b53_kcp",
         "launch": {
             "block": (128, 1, 1),
             "cluster": (1, 1, 1),
@@ -153,7 +153,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 33792,
             "use_pdl": False,
         },
-        "library": "cake_causal_conv1d_train_675940a7a4fc0dba4b53",
+        "library": "cake_causal_conv1d_det_train_675940a7a4fc0dba4b53_kcp",
         "logical": {
             "C": "C",
             "S": "S",
@@ -172,7 +172,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "role": "kcp_fwd",
         "workspace_rule": None,
     },
-    "cake_causal_conv1d_train_5288d132a5cc927ae729": {
+    "cake_causal_conv1d_det_train_5288d132a5cc927ae729_kcp": {
         "arches": [
             "sm_100a",
             "sm_103a",
@@ -221,8 +221,8 @@ MODULES: dict[str, dict[str, Any]] = {
             },
             "kind": "co_resident",
         },
-        "kernel": "cake_causal_conv1d_train_5288d132a5cc927ae729",
-        "kernel_symbol": "kernel_cake_causal_conv1d_train_5288d132a5cc927ae729",
+        "kernel": "cake_causal_conv1d_det_train_5288d132a5cc927ae729_kcp",
+        "kernel_symbol": "kernel_cake_causal_conv1d_det_train_5288d132a5cc927ae729_kcp",
         "launch": {
             "block": (128, 1, 1),
             "cluster": (1, 1, 1),
@@ -230,7 +230,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 50176,
             "use_pdl": False,
         },
-        "library": "cake_causal_conv1d_train_5288d132a5cc927ae729",
+        "library": "cake_causal_conv1d_det_train_5288d132a5cc927ae729_kcp",
         "logical": {
             "C": "C",
             "S": "S",
@@ -262,7 +262,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "taps": 4,
         },
     },
-    "cake_causal_conv1d_train_6ea6d5fc9e7fa3f2d039": {
+    "cake_causal_conv1d_det_train_6ea6d5fc9e7fa3f2d039_kcp": {
         "arches": [
             "sm_107a",
         ],
@@ -302,8 +302,8 @@ MODULES: dict[str, dict[str, Any]] = {
             },
             "kind": "co_resident",
         },
-        "kernel": "cake_causal_conv1d_train_6ea6d5fc9e7fa3f2d039",
-        "kernel_symbol": "kernel_cake_causal_conv1d_train_6ea6d5fc9e7fa3f2d039",
+        "kernel": "cake_causal_conv1d_det_train_6ea6d5fc9e7fa3f2d039_kcp",
+        "kernel_symbol": "kernel_cake_causal_conv1d_det_train_6ea6d5fc9e7fa3f2d039_kcp",
         "launch": {
             "block": (128, 1, 1),
             "cluster": (1, 1, 1),
@@ -311,7 +311,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 50176,
             "use_pdl": False,
         },
-        "library": "cake_causal_conv1d_train_6ea6d5fc9e7fa3f2d039",
+        "library": "cake_causal_conv1d_det_train_6ea6d5fc9e7fa3f2d039_kcp",
         "logical": {
             "C": "C",
             "S": "S",
@@ -338,7 +338,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "taps": 4,
         },
     },
-    "cake_causal_conv1d_train_7485529a1755e5bd3036": {
+    "cake_causal_conv1d_det_train_7485529a1755e5bd3036_kcp": {
         "arches": [
             "sm_100a",
             "sm_103a",
@@ -384,8 +384,8 @@ MODULES: dict[str, dict[str, Any]] = {
             },
             "kind": "co_resident",
         },
-        "kernel": "cake_causal_conv1d_train_7485529a1755e5bd3036",
-        "kernel_symbol": "kernel_cake_causal_conv1d_train_7485529a1755e5bd3036",
+        "kernel": "cake_causal_conv1d_det_train_7485529a1755e5bd3036_kcp",
+        "kernel_symbol": "kernel_cake_causal_conv1d_det_train_7485529a1755e5bd3036_kcp",
         "launch": {
             "block": (128, 1, 1),
             "cluster": (1, 1, 1),
@@ -393,7 +393,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 82944,
             "use_pdl": False,
         },
-        "library": "cake_causal_conv1d_train_7485529a1755e5bd3036",
+        "library": "cake_causal_conv1d_det_train_7485529a1755e5bd3036_kcp",
         "logical": {
             "C": "C",
             "S": "S",
@@ -430,7 +430,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "taps": 4,
         },
     },
-    "cake_causal_conv1d_train_17cd42fb05079bbbf840": {
+    "cake_causal_conv1d_det_train_17cd42fb05079bbbf840_kcp": {
         "arches": [
             "sm_100a",
             "sm_103a",
@@ -471,8 +471,8 @@ MODULES: dict[str, dict[str, Any]] = {
             },
             "kind": "co_resident",
         },
-        "kernel": "cake_causal_conv1d_train_17cd42fb05079bbbf840",
-        "kernel_symbol": "kernel_cake_causal_conv1d_train_17cd42fb05079bbbf840",
+        "kernel": "cake_causal_conv1d_det_train_17cd42fb05079bbbf840_kcp",
+        "kernel_symbol": "kernel_cake_causal_conv1d_det_train_17cd42fb05079bbbf840_kcp",
         "launch": {
             "block": (128, 1, 1),
             "cluster": (1, 1, 1),
@@ -480,7 +480,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 0,
             "use_pdl": False,
         },
-        "library": "cake_causal_conv1d_train_17cd42fb05079bbbf840",
+        "library": "cake_causal_conv1d_det_train_17cd42fb05079bbbf840_kcp",
         "logical": {
             "C": "C",
             "S": "S",
@@ -506,38 +506,38 @@ MODULES: dict[str, dict[str, Any]] = {
 ROUTES: dict[str, dict[str, list[str]]] = {
     "sm_100a": {
         "kcp_bwd": [
-            "cake_causal_conv1d_train_5288d132a5cc927ae729",
-            "cake_causal_conv1d_train_7485529a1755e5bd3036",
+            "cake_causal_conv1d_det_train_5288d132a5cc927ae729_kcp",
+            "cake_causal_conv1d_det_train_7485529a1755e5bd3036_kcp",
         ],
         "kcp_bwd_head": [
-            "cake_causal_conv1d_train_17cd42fb05079bbbf840",
+            "cake_causal_conv1d_det_train_17cd42fb05079bbbf840_kcp",
         ],
         "kcp_fwd": [
-            "cake_causal_conv1d_train_675940a7a4fc0dba4b53",
+            "cake_causal_conv1d_det_train_675940a7a4fc0dba4b53_kcp",
         ],
     },
     "sm_103a": {
         "kcp_bwd": [
-            "cake_causal_conv1d_train_5288d132a5cc927ae729",
-            "cake_causal_conv1d_train_7485529a1755e5bd3036",
+            "cake_causal_conv1d_det_train_5288d132a5cc927ae729_kcp",
+            "cake_causal_conv1d_det_train_7485529a1755e5bd3036_kcp",
         ],
         "kcp_bwd_head": [
-            "cake_causal_conv1d_train_17cd42fb05079bbbf840",
+            "cake_causal_conv1d_det_train_17cd42fb05079bbbf840_kcp",
         ],
         "kcp_fwd": [
-            "cake_causal_conv1d_train_675940a7a4fc0dba4b53",
+            "cake_causal_conv1d_det_train_675940a7a4fc0dba4b53_kcp",
         ],
     },
     "sm_107a": {
         "kcp_bwd": [
-            "cake_causal_conv1d_train_6ea6d5fc9e7fa3f2d039",
-            "cake_causal_conv1d_train_7485529a1755e5bd3036",
+            "cake_causal_conv1d_det_train_6ea6d5fc9e7fa3f2d039_kcp",
+            "cake_causal_conv1d_det_train_7485529a1755e5bd3036_kcp",
         ],
         "kcp_bwd_head": [
-            "cake_causal_conv1d_train_17cd42fb05079bbbf840",
+            "cake_causal_conv1d_det_train_17cd42fb05079bbbf840_kcp",
         ],
         "kcp_fwd": [
-            "cake_causal_conv1d_train_675940a7a4fc0dba4b53",
+            "cake_causal_conv1d_det_train_675940a7a4fc0dba4b53_kcp",
         ],
     },
 }

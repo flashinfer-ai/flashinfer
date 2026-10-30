@@ -139,7 +139,7 @@ __device__ __forceinline__ float mul_f32_rn_noftz(float a, float b) {
 extern "C" {
 
 __global__ __launch_bounds__(128, LAUNCH_MIN_BLOCKS) void
-kernel_cake_causal_conv1d_train_675940a7a4fc0dba4b53(__nv_bfloat16* __restrict__ x, float* __restrict__ w, int* __restrict__ cu, __nv_bfloat16* __restrict__ y, __nv_bfloat16* __restrict__ hist, int* __restrict__ hist_row_off, int S, int C, int num_docs, int search_steps, int ct_vec, int n_sub, int n_ch_tiles)
+kernel_cake_causal_conv1d_det_train_675940a7a4fc0dba4b53_kcp(__nv_bfloat16* __restrict__ x, float* __restrict__ w, int* __restrict__ cu, __nv_bfloat16* __restrict__ y, __nv_bfloat16* __restrict__ hist, int* __restrict__ hist_row_off, int S, int C, int num_docs, int search_steps, int ct_vec, int n_sub, int n_ch_tiles)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
