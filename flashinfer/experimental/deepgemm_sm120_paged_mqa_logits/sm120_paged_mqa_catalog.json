@@ -1407,15 +1407,15 @@
           "h32:p128:n1:a1:c16k": [
             [
               1,
-              null
+              "sm120:fp8:h32:p128:n1:a1:mx_bta_ha_wr_ef"
             ],
             [
               8,
-              null
+              "sm120:fp8:h32:p128:n1:a1:mx_bta_ha_wr_ef"
             ],
             [
               32,
-              null
+              "sm120:fp8:h32:p128:n1:a1:mx_bta_ha_wr_ef"
             ],
             [
               64,
@@ -1433,7 +1433,7 @@
           "h32:p128:n1:a1:c4k": [
             [
               8,
-              null
+              "sm120:fp8:h32:p128:n1:a1:mx_bta_ha_wr_ef"
             ],
             [
               64,
@@ -1465,11 +1465,11 @@
             ],
             [
               8,
-              null
+              "sm120:fp8:h32:p128:n2:a2:mx_bta_ha_wr_ef"
             ],
             [
               32,
-              null
+              "sm120:fp8:h32:p128:n2:a2:mx_bta_ha_wr_ef"
             ],
             [
               64,
@@ -1487,11 +1487,11 @@
           "h32:p128:n2:a2:c4k": [
             [
               8,
-              null
+              "sm120:fp8:h32:p128:n2:a2:mx_bta_ha_wr_ef"
             ],
             [
               64,
-              null
+              "sm120:fp8:h32:p128:n2:a2:mx_bta_ha_wr_ef"
             ],
             [
               256,
@@ -1515,11 +1515,11 @@
           "h32:p128:n3:a3:c16k": [
             [
               1,
-              null
+              "sm120:fp8:h32:p128:n3:a3:mx_bta_ha_wr_ef"
             ],
             [
               8,
-              null
+              "sm120:fp8:h32:p128:n3:a3:mx_bta_ha_wr_ef"
             ],
             [
               32,
@@ -1541,7 +1541,7 @@
           "h32:p128:n3:a3:c4k": [
             [
               64,
-              null
+              "sm120:fp8:h32:p128:n3:a3:mx_bta_ha_wr_ef"
             ],
             [
               256,
@@ -1565,11 +1565,11 @@
           "h32:p128:n4:a4:c16k": [
             [
               8,
-              null
+              "sm120:fp8:h32:p128:n4:a4:mx_bta_ha_wr_ef"
             ],
             [
               32,
-              null
+              "sm120:fp8:h32:p128:n4:a4:mx_bta_ha_wr_ef"
             ],
             [
               64,
@@ -1587,7 +1587,7 @@
           "h32:p128:n4:a4:c4k": [
             [
               64,
-              null
+              "sm120:fp8:h32:p128:n4:a4:mx_bta_ha_wr_ef"
             ],
             [
               256,
@@ -1627,7 +1627,7 @@
             ],
             [
               32,
-              null
+              "sm120:fp8:h32:p128:n5:a5:mx_bta_ha_wr_ef"
             ],
             [
               64,
@@ -1642,6 +1642,16 @@
               "sm120:fp8:h32:p128:n5:a5:bta_ha_wr_kmax_ef"
             ]
           ],
+          "h32:p128:n5:a5:c4k": [
+            [
+              64,
+              "sm120:fp8:h32:p128:n5:a5:mx_bta_ha_wr_ef"
+            ],
+            [
+              256,
+              null
+            ]
+          ],
           "h32:p128:n5:a5:c64k": [
             [
               8,
@@ -1653,7 +1663,7 @@
             ],
             [
               128,
-              null
+              "sm120:fp8:h32:p128:n5:a5:bta_ha_wr_kmax_ef"
             ]
           ],
           "h32:p128:n6:a2:c16k": [
@@ -1721,7 +1731,7 @@
             ],
             [
               8,
-              null
+              "sm120:fp8:h32:p64:n1:a1:mx_bta_ha_wr_ef"
             ],
             [
               32,
@@ -1743,11 +1753,11 @@
           "h32:p64:n1:a1:c4k": [
             [
               8,
-              null
+              "sm120:fp8:h32:p64:n1:a1:mx_bta_ha_wr_ef"
             ],
             [
               64,
-              null
+              "sm120:fp8:h32:p64:n1:a1:mx_bta_ha_wr_ef"
             ],
             [
               256,
@@ -1775,7 +1785,7 @@
             ],
             [
               8,
-              null
+              "sm120:fp8:h32:p64:n2:a2:mx_bta_ha_wr_ef"
             ],
             [
               32,
@@ -1797,11 +1807,11 @@
           "h32:p64:n2:a2:c4k": [
             [
               8,
-              null
+              "sm120:fp8:h32:p64:n2:a2:mx_bta_ha_wr_ef"
             ],
             [
               64,
-              null
+              "sm120:fp8:h32:p64:n2:a2:mx_bta_ha_wr_ef"
             ],
             [
               256,
@@ -1829,7 +1839,7 @@
             ],
             [
               8,
-              null
+              "sm120:fp8:h32:p64:n3:a3:mx_bta_ha_wr_ef"
             ],
             [
               32,
@@ -1851,7 +1861,7 @@
           "h32:p64:n3:a3:c4k": [
             [
               64,
-              null
+              "sm120:fp8:h32:p64:n3:a3:mx_bta_ha_wr_ef"
             ],
             [
               256,
@@ -1887,11 +1897,11 @@
           "h32:p64:n4:a4:c16k": [
             [
               8,
-              null
+              "sm120:fp8:h32:p64:n4:a4:mx_bta_ha_wr_ef"
             ],
             [
               32,
-              null
+              "sm120:fp8:h32:p64:n4:a4:mx_bta_ha_wr_ef"
             ],
             [
               64,
@@ -1909,7 +1919,7 @@
           "h32:p64:n4:a4:c4k": [
             [
               64,
-              null
+              "sm120:fp8:h32:p64:n4:a4:mx_bta_ha_wr_ef"
             ],
             [
               256,
@@ -1945,7 +1955,7 @@
           "h32:p64:n5:a5:c16k": [
             [
               8,
-              null
+              "sm120:fp8:h32:p64:n5:a5:mx_bta_ha_wr_ef"
             ],
             [
               32,
@@ -1964,6 +1974,16 @@
               "sm120:fp8:h32:p64:n5:a5:bta_ha_wr_kmax_ef"
             ]
           ],
+          "h32:p64:n5:a5:c4k": [
+            [
+              64,
+              "sm120:fp8:h32:p64:n5:a5:mx_bta_ha_wr_ef"
+            ],
+            [
+              256,
+              null
+            ]
+          ],
           "h32:p64:n5:a5:c64k": [
             [
               8,
@@ -1975,7 +1995,7 @@
             ],
             [
               128,
-              null
+              "sm120:fp8:h32:p64:n5:a5:bta_ha_wr_kmax_ef"
             ]
           ],
           "h32:p64:n6:a2:c16k": [
@@ -2033,7 +2053,7 @@
             ],
             [
               128,
-              null
+              "sm120:fp8:h32:p64:n6:a6:bta_ha_wr_kmax_ef"
             ]
           ],
           "h64:p64:n1:a1:c16k": [
@@ -2043,7 +2063,7 @@
             ],
             [
               8,
-              null
+              "sm120:fp8:h64:p64:n1:a1:mx_bta_ha_wr_ef"
             ],
             [
               32,
@@ -2065,11 +2085,11 @@
           "h64:p64:n1:a1:c4k": [
             [
               8,
-              null
+              "sm120:fp8:h64:p64:n1:a1:mx_bta_ha_wr_ef"
             ],
             [
               64,
-              null
+              "sm120:fp8:h64:p64:n1:a1:mx_bta_ha_wr_ef"
             ],
             [
               256,
@@ -2097,11 +2117,11 @@
             ],
             [
               8,
-              null
+              "sm120:fp8:h64:p64:n2:a2:mx_bta_ha_wr_ef"
             ],
             [
               32,
-              null
+              "sm120:fp8:h64:p64:n2:a2:mx_bta_ha_wr_ef"
             ],
             [
               64,
@@ -2123,7 +2143,7 @@
             ],
             [
               64,
-              null
+              "sm120:fp8:h64:p64:n2:a2:mx_bta_ha_wr_ef"
             ],
             [
               256,
@@ -2215,11 +2235,11 @@
           "h64:p64:n4:a4:c16k": [
             [
               8,
-              null
+              "sm120:fp8:h64:p64:n4:a4:mx_bta_ha_wr_ef"
             ],
             [
               32,
-              null
+              "sm120:fp8:h64:p64:n4:a4:mx_bta_ha_wr_ef"
             ],
             [
               64,
@@ -2227,17 +2247,17 @@
             ],
             [
               128,
-              null
+              "sm120:fp8:h64:p64:n4:a4:bta_ha_wr_ef"
             ],
             [
               256,
-              null
+              "sm120:fp8:h64:p64:n4:a4:bta_ha_wr_ef"
             ]
           ],
           "h64:p64:n4:a4:c4k": [
             [
               64,
-              null
+              "sm120:fp8:h64:p64:n4:a4:mx_bta_ha_wr_ef"
             ],
             [
               256,
@@ -2251,11 +2271,11 @@
             ],
             [
               32,
-              null
+              "sm120:fp8:h64:p64:n4:a4:bta_ha_wr_ef"
             ],
             [
               128,
-              null
+              "sm120:fp8:h64:p64:n4:a4:bta_ha_wr_ef"
             ]
           ],
           "h64:p64:n5:a2:c16k": [
@@ -2293,13 +2313,13 @@
             ],
             [
               32,
-              null
+              "sm120:fp8:h64:p64:n5:a2:atom2_mx_bta_ha_wr"
             ]
           ],
           "h64:p64:n6:a2:c16k": [
             [
               1,
-              null
+              "sm120:fp8:h64:p64:n6:a2:atom2_mx_bta_ha_wr"
             ],
             [
               8,
@@ -2331,7 +2351,7 @@
             ],
             [
               32,
-              null
+              "sm120:fp8:h64:p64:n6:a2:atom2_mx_bta_ha_wr"
             ]
           ]
         },
@@ -2563,10 +2583,20 @@
             ],
             [
               64,
-              null
+              "sm120:fp8:h32:p128:n5:a5:mpf_bta_ha_k2q_ef"
             ],
             [
               128,
+              "sm120:fp8:h32:p128:n5:a5:mpf_bta_ha_k2q_ef"
+            ],
+            [
+              256,
+              "sm120:fp8:h32:p128:n5:a5:mpf_bta_ha_k2q_ef"
+            ]
+          ],
+          "h32:p128:n5:a5:c4k": [
+            [
+              64,
               null
             ],
             [
@@ -2581,11 +2611,11 @@
             ],
             [
               32,
-              null
+              "sm120:fp8:h32:p128:n5:a5:mpf_bta_ha_k2q_ef"
             ],
             [
               128,
-              null
+              "sm120:fp8:h32:p128:n5:a5:mpf_bta_ha_k2q_ef"
             ]
           ],
           "h32:p128:n6:a2:c16k": [
@@ -2619,7 +2649,7 @@
             ],
             [
               256,
-              null
+              "sm120:fp8:h32:p128:n6:a6:mpf_bta_ha_k2q_ef"
             ]
           ],
           "h32:p128:n6:a6:c4k": [
@@ -2859,7 +2889,7 @@
             ],
             [
               128,
-              null
+              "sm120:fp8:h32:p64:n4:a4:mpf_bta_ha_k2q_ef"
             ]
           ],
           "h32:p64:n5:a2:c16k": [
@@ -2885,11 +2915,21 @@
             ],
             [
               64,
-              null
+              "sm120:fp8:h32:p64:n5:a5:mpf_bta_ha_k2q_ef"
             ],
             [
               128,
               "sm120:fp8:h32:p64:n5:a5:mpf_bta_ha_k2q_ef"
+            ],
+            [
+              256,
+              "sm120:fp8:h32:p64:n5:a5:mpf_bta_ha_k2q_ef"
+            ]
+          ],
+          "h32:p64:n5:a5:c4k": [
+            [
+              64,
+              null
             ],
             [
               256,
@@ -2903,11 +2943,11 @@
             ],
             [
               32,
-              null
+              "sm120:fp8:h32:p64:n5:a5:mpf_bta_ha_k2q_ef"
             ],
             [
               128,
-              null
+              "sm120:fp8:h32:p64:n5:a5:mpf_bta_ha_k2q_ef"
             ]
           ],
           "h32:p64:n6:a2:c16k": [
@@ -3097,7 +3137,7 @@
             ],
             [
               64,
-              null
+              "sm120:fp8:h64:p64:n3:a3:mpf_bta_ha_sp_kf2q_ef"
             ],
             [
               128,
@@ -3115,7 +3155,7 @@
             ],
             [
               256,
-              null
+              "sm120:fp8:h64:p64:n3:a3:mpf_bta_ha_sp_kf2q_ef"
             ]
           ],
           "h64:p64:n3:a3:c64k": [
@@ -3125,7 +3165,7 @@
             ],
             [
               32,
-              null
+              "sm120:fp8:h64:p64:n3:a3:mpf_bta_ha_sp_kf2q_ef"
             ],
             [
               128,
@@ -3228,10 +3268,16 @@
               null
             ]
           ],
+          "h64:p64:n5:a3:c4k": [
+            [
+              256,
+              "sm120:fp8:h64:p64:n5:a5:atom5_mpf_bta_ha_k2q_ef"
+            ]
+          ],
           "h64:p64:n6:a2:c16k": [
             [
               1,
-              null
+              "sm120:fp8:h64:p64:n6:a2:atom2_mpf_bta_ha_k2q"
             ],
             [
               8,
@@ -3243,7 +3289,7 @@
             ],
             [
               64,
-              null
+              "sm120:fp8:h64:p64:n6:a6:atom6_mpf_bta_ha_ef"
             ]
           ],
           "h64:p64:n6:a2:c4k": [
