@@ -422,6 +422,26 @@ def test_llama4_fused_shared_experts_rejected():
         )
 
 
+@pytest.mark.parametrize(
+    "routing_method", [RoutingMethodType.MiniMax2, RoutingMethodType.Renormalize]
+)
+def test_fused_shared_experts_ep_shard_rejected(routing_method):
+    """Shared ids follow the routed range, so an EP shard must be rejected."""
+    num_experts = 16
+    logits = make_logits(4, num_experts, torch.float32, 0)
+    bias = make_bias(num_experts, torch.bfloat16, 1)
+    with pytest.raises(Exception, match="without expert parallelism"):
+        trtllm_gen_routing(
+            logits,
+            bias if routing_method == RoutingMethodType.MiniMax2 else None,
+            routing_method,
+            4,
+            num_fused_shared_experts=1,
+            local_expert_offset=8,
+            local_num_experts=8,
+        )
+
+
 def _fused_shared_kwargs(routing_method, num_experts, seed):
     """trtllm_gen_routing kwargs for one routingCustom method."""
     if routing_method == RoutingMethodType.MiniMax2:
