@@ -1039,12 +1039,14 @@ class _Tcgen05Window(NamedTuple):
 # rows without a bias that no window above admits then go to PACKED_M64_N8 on 8 rows at
 # inputs that are a multiple of 64: at 4480 to 7167 output features and inputs of 2048
 # to 4352 or 5632 to 6144, at 7168 to 16384 output features and inputs of 2048 to 6144,
-# and at 7168 to 9216 output features and inputs above 6152 up to 8192.  PACKED serves 9
-# to 16 rows at 4224 to 16384 output features and inputs of 2048 to 12288, also where
+# and at 7168 to 9216 output features and inputs above 6152 up to 8192.  PACKED_BOX8
+# serves the other 8-row inputs of 2048 to 8192 at 4480 to 4608 output features, and 8
+# rows at 3584 to 4479 output features and inputs of 6152 to 8192.  PACKED serves 9
+# to 16 rows at 4097 to 16384 output features and inputs of 2048 to 12288, also where
 # its grid takes more than one wave.  PACKED_BOX8 serves 8 rows at 4112 to 4464 output
 # features and inputs of 2048 to 6144, and 1 to 7 rows there when the input is a
 # multiple of 64.  Last, on inputs that are a multiple of 64, PACKED_M64_N8 serves 1 to
-# 7 rows at 9216 to 16384 output features and inputs of 2048 to 4096, and at 8192 output
+# 7 rows at 8193 to 16384 output features and inputs of 2048 to 4096, and at 8192 output
 # features and inputs of 10240 to 12288; 8 rows at 16400 to 24576 output features and
 # inputs of 2048 to 6144, at 6144 to 16384 output features and inputs of 1024 to 1984,
 # and at 7168 to 7808 output features and inputs of 8256 to 12288; and 1 to 8 rows at
@@ -1304,6 +1306,12 @@ _SM100 = (
     ),
     _Tcgen05Window("PACKED_BOX8", 8, 8, False, 7168, 7808, 8200, 9992),
     _Tcgen05Window("PACKED_M64_N8", 8, 8, False, 10240, 16384, 2056, 6136),
+    _Tcgen05Window("PACKED_BOX8", 8, 8, False, 4480, 4608, 2048, 8192),
+    _Tcgen05Window("PACKED_BOX8", 8, 8, False, 3584, 4479, 6152, 8192),
+    _Tcgen05Window(
+        "PACKED_M64_N8", 1, 7, False, 8193, 9215, 2048, 4096, input_features_multiple=64
+    ),
+    _Tcgen05Window("PACKED", 9, 16, False, 4097, 4223, 2048, 12288),
 )
 _SM103 = (
     _Tcgen05Window("PACKED_NARROW_FULL_STAGES", 1, 6, True, 32, 384, 8192, 20480),
