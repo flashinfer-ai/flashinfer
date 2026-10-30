@@ -74,3 +74,25 @@ Until then the C++ stays as-is and the DSL kernel lives beside it.
   swizzle remap (L2 group from PickSwizzle, raster heuristic), replacing the library
   runtime scheduler.  First bench comparison on GB200 next; then split-K, stream-K
   decision, Hopper.
+- Fri 30 Oct 2026, first bench (GB200, TP4, M 1024/4096/8192, CUDA-graph timing): DSL
+  2-12% behind the C++ on plain tiles, 23-50% on the two rows where the C++ picks split-K
+  (not ported yet), 24% on mlp.down 8192.  With fp16 activations (native convert on both
+  sides) the gap is gone: mlp.down 372.0 vs 371.4 us, und.q 128.8 vs 132.6 (DSL ahead),
+  gate_up 400 vs 384.  So the bf16 gap is the ALU e4m3->bf16 path: the aarch64 DSL wheel
+  only bundles the CUDA 12 toolchain (CUDA_VERSION 12.9); the x86 wheel has cu13 and the
+  one-instruction cvt.  Parity must be measured on x86 B200, or with the cu13 libs here.
+- Fri 30 Oct 2026, night: split-K ported (algo 5: 2sm256x128 tile over K-slices writing
+  fp32 partials [splits, m, n], then `w8a16_fp8_splitk_reduce.py` sums, scales, adds bias,
+  casts).  Two dead ends on the way, both `cudaErrorIllegalInstruction` at launch, found
+  with compute-sanitizer + cuobjdump: a 3-D operand view with the K-slice as the batch
+  mode traps in the activation TMA load (UTMALDG), and a 3-D C view [n, m, splits] traps
+  in the TMA store (UTMASTG).  Every tensor is now 2-D: the operands span the whole K and
+  a tile's slice is a k-tile offset (`tile_l * k_tiles_per_slice`), the partials are
+  C[n, splits*m] with the slice an activation-row offset.  `splits` is a compile-time
+  constant.  Full matrix passes (algos 1,2,3,4,7,5; bias on/off; swizzled shapes), bitwise
+  equal to the C++ split-K.  GB200 bench after split-K (C++ / DSL us): und.kv 15.3/17.4,
+  21.8/23.1, 28.1/28.2 (was 25.1/25.9 for the first two).  Remaining gaps are the
+  2sm256x160/192 tiles: attn.out 1024/4096 +16%, und.q 4096 +7%, gen.qkv +5-8%, mlp.down
+  4096 +6%; attn.out 8192 the DSL is 4% ahead.  Note: `CUTE_DSL_DISABLE_FILE_CACHING=1`
+  in the run scripts (the DSL keeps a compile cache under $TMPDIR keyed on the entry
+  function; kept off while the kernel source changes often).

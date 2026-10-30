@@ -55,7 +55,12 @@ class Sm100W8A16Fp8GemmKernel:
         transform_fragment_size: int,
         enable_pdl: bool,
         debug: bool = False,
+        partial_output: bool = False,
     ):
+        # partial_output: split-K mode.  The L mode of the operands is the K-slice,
+        # C is fp32 partials [n, m, splits] and the epilogue applies no scale / bias
+        # (the reduce kernel does, see w8a16_fp8_splitk_reduce.py).
+        self.partial_output = partial_output
         # debug: every warp role writes its tile count and a wait-site marker into the
         # `dbg` buffer (16 Int32 per CTA: slots 0-5 tile counts of scheduler, activation
         # TMA, weight TMA, transform, MMA, epilogue; slots 8-13 their markers).  Give it
@@ -372,21 +377,30 @@ class Sm100W8A16Fp8GemmKernel:
         n: cutlass.Int64,
         m: cutlass.Int64,
         k: cutlass.Int64,
+        splits: cutlass.Constexpr,
         max_active_clusters: cutlass.Constexpr,
         stream: cuda.CUstream,
     ):
-        """Build the logical tensors: weight [n, k] and activation [m, k] K-major,
-        out [m, n] row-major seen as C[n, m] column-major; scale is one fp32; bias is
-        [n] in the activation dtype (any pointer when ``has_bias`` is False); dbg is
-        the debug buffer (any pointer when ``debug`` is False)."""
+        """Build the logical tensors.  ``k`` is one K-slice (the whole K when
+        ``splits`` is 1).  Weight [n, K] and activation [m, K] are K-major 2-D
+        tensors over the whole K (a size-1 batch mode); a tile's K-slice is its
+        k-tile range offset by ``tile_l * k_tiles_per_slice``.  Out [m, n] row-major
+        is C[n, m, 1]; the fp32 partials [splits, m, n] are C[n, splits * m, 1],
+        slice ``l`` being activation rows ``l * m`` to ``(l + 1) * m``.
+
+        Every tensor is 2-D on purpose: with the slice as a third (batch) mode the
+        TMA loads and stores the DSL emits trap with an illegal instruction.
+        """
+        self.splits = splits
+        k_total = k * splits
         weight = cute.make_tensor(
-            weight_ptr, cute.make_ordered_layout((n, k, 1), order=(1, 0, 2))
+            weight_ptr, cute.make_ordered_layout((n, k_total, 1), order=(1, 0, 2))
         )
         activation = cute.make_tensor(
-            activation_ptr, cute.make_ordered_layout((m, k, 1), order=(1, 0, 2))
+            activation_ptr, cute.make_ordered_layout((m, k_total, 1), order=(1, 0, 2))
         )
         output = cute.make_tensor(
-            output_ptr, cute.make_ordered_layout((n, m, 1), order=(0, 1, 2))
+            output_ptr, cute.make_ordered_layout((n, m * splits, 1), order=(0, 1, 2))
         )
         scale = cute.make_tensor(scale_ptr, cute.make_layout((1,)))
         bias = cute.make_tensor(bias_ptr, cute.make_layout((n,)))
@@ -468,7 +482,7 @@ class Sm100W8A16Fp8GemmKernel:
 
         @cute.struct
         class SharedStorage:
-            tile_info: cute.struct.MemRange[cutlass.Int32, 4 * self.num_tile_info_stage]
+            tile_info: cute.struct.MemRange[cutlass.Int32, 8 * self.num_tile_info_stage]
             a_load2trans_full_mbar_ptr: cute.struct.MemRange[
                 cutlass.Int64, self.num_load2trans_stage
             ]
@@ -680,7 +694,7 @@ class Sm100W8A16Fp8GemmKernel:
             cute.make_layout((self.cta_tile_shape_mnk[0], 2))
         )
         sTile_info = storage.tile_info.get_tensor(
-            cute.make_layout((4, self.num_tile_info_stage), stride=(1, 4))
+            cute.make_layout((8, self.num_tile_info_stage), stride=(1, 8))
         )
 
         a_full_mcast_mask = None
@@ -706,7 +720,8 @@ class Sm100W8A16Fp8GemmKernel:
         gC_mnl_simt = cute.local_tile(
             tensor_c, cute.slice_(self.mma_tiler, (None, None, 0)), (None, None, None)
         )
-        k_tile_cnt = cutlass.Int32(cute.size(gA_mkl, mode=[3]))
+        # k-tiles of one K-slice (the whole K when not split).
+        k_tile_cnt = cutlass.Int32(cute.size(gA_mkl, mode=[3]) // self.splits)
 
         thr_mma = tiled_mma.get_slice(mma_tile_coord_v)
         tCgA = thr_mma.partition_A(gA_mkl)
@@ -762,7 +777,7 @@ class Sm100W8A16Fp8GemmKernel:
             tile_info_producer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer, self.num_tile_info_stage
             )
-            act_rows = cutlass.Int32(cute.size(tensor_c.shape[1]))
+            act_rows = cutlass.Int32(cute.size(tensor_c.shape[1]) // self.splits)
             act_tiles = cutlass.Int32(
                 cute.ceil_div(act_rows, self.cta_tile_shape_mnk[1])
             )
@@ -790,6 +805,8 @@ class Sm100W8A16Fp8GemmKernel:
                 major_clusters = clusters_n
                 minor_clusters = clusters_m
             total_clusters = clusters_m * clusters_n
+            num_slices = cutlass.Int32(self.splits)
+            total_work = total_clusters * num_slices
             _, _, num_persistent = cute.arch.grid_dim()
             lin = cutlass.Int32(bidz)
             swizzle = self.swizzle_size
@@ -801,9 +818,12 @@ class Sm100W8A16Fp8GemmKernel:
             not_last_tile = cutlass.Boolean(1)
             dbg_tiles = cutlass.Int32(0)
             while not_last_tile:
-                has_work = lin < total_clusters
-                major = lin % major_clusters
-                minor = lin // major_clusters
+                has_work = lin < total_work
+                # Slices are the slowest mode: all tiles of slice 0, then slice 1, ...
+                tile_l = lin // total_clusters
+                lin_mn = lin % total_clusters
+                major = lin_mn % major_clusters
+                minor = lin_mn // major_clusters
                 if cutlass.const_expr(swizzle > 1):
                     if major < first_residual_major and minor < first_residual_minor:
                         major_div = major // swizzle
@@ -851,6 +871,7 @@ class Sm100W8A16Fp8GemmKernel:
                         cur_sTile_info[1] = act_start
                         cur_sTile_info[2] = group_idx
                         cur_sTile_info[3] = distance_to_boundary
+                        cur_sTile_info[4] = tile_l
                     cute.arch.fence_proxy("async.shared", space="cta")
                     self.sched_sync_barrier.arrive_and_wait()
                     tile_info_pipeline.producer_commit(tile_info_producer_state)
@@ -867,7 +888,7 @@ class Sm100W8A16Fp8GemmKernel:
             tile_info_consumer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Consumer, self.num_tile_info_stage
             )
-            work_tile, tile_info_consumer_state = self._next_work_tile(
+            work_tile, tile_info_consumer_state, tile_l = self._next_work_tile(
                 tile_info_pipeline, tile_info_consumer_state, sTile_info
             )
             b_load2mma_producer_state = pipeline.make_pipeline_state(
@@ -887,19 +908,23 @@ class Sm100W8A16Fp8GemmKernel:
                     )
                     else (0, work_tile.coord_n)
                 )
+                tBgB_l = tBgB[(None, None, None, 0)]
                 tBgB_slice = cute.make_tensor(
                     (
-                        tBgB.iterator[0] + coord_n_offset[0],
-                        coord_n_offset[1] + tBgB.iterator[1],
+                        tBgB_l.iterator[0] + coord_n_offset[0],
+                        coord_n_offset[1] + tBgB_l.iterator[1],
                     ),
-                    cute.slice_(tBgB.layout, (None, 0, None, 0)),
+                    cute.slice_(tBgB_l.layout, (None, 0, None)),
                 )
+                k_tile_base = tile_l * k_tile_cnt
                 b_load2mma_producer_state.reset_count()
                 for _k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
                     b_load2mma_pipeline.producer_acquire(b_load2mma_producer_state)
                     cute.copy(
                         tma_atom_b,
-                        tBgB_slice[(None, b_load2mma_producer_state.count)],
+                        tBgB_slice[
+                            (None, k_tile_base + b_load2mma_producer_state.count)
+                        ],
                         tBsB[(None, b_load2mma_producer_state.index)],
                         tma_bar_ptr=b_load2mma_pipeline.producer_get_barrier(
                             b_load2mma_producer_state
@@ -913,7 +938,7 @@ class Sm100W8A16Fp8GemmKernel:
                     with cute.arch.elect_one():
                         dbg[dbg_base + 1] = dbg_tiles
                         dbg[dbg_base + 9] = cutlass.Int32(2)
-                work_tile, tile_info_consumer_state = self._next_work_tile(
+                work_tile, tile_info_consumer_state, tile_l = self._next_work_tile(
                     tile_info_pipeline, tile_info_consumer_state, sTile_info
                 )
             b_load2mma_pipeline.producer_tail(b_load2mma_producer_state)
@@ -924,7 +949,7 @@ class Sm100W8A16Fp8GemmKernel:
             tile_info_consumer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Consumer, self.num_tile_info_stage
             )
-            work_tile, tile_info_consumer_state = self._next_work_tile(
+            work_tile, tile_info_consumer_state, tile_l = self._next_work_tile(
                 tile_info_pipeline, tile_info_consumer_state, sTile_info
             )
             a_load2trans_producer_state = pipeline.make_pipeline_state(
@@ -943,6 +968,7 @@ class Sm100W8A16Fp8GemmKernel:
                         0,
                     )
                 ]
+                k_tile_base = tile_l * k_tile_cnt
                 a_load2trans_producer_state.reset_count()
                 peek_load2trans_empty_status = cutlass.Boolean(1)
                 if a_load2trans_producer_state.count < k_tile_cnt:
@@ -957,7 +983,9 @@ class Sm100W8A16Fp8GemmKernel:
                     )
                     cute.copy(
                         tma_atom_a,
-                        tAgA_slice[(None, a_load2trans_producer_state.count)],
+                        tAgA_slice[
+                            (None, k_tile_base + a_load2trans_producer_state.count)
+                        ],
                         tAsA[(None, a_load2trans_producer_state.index)],
                         tma_bar_ptr=a_load2trans_pipeline.producer_get_barrier(
                             a_load2trans_producer_state
@@ -977,7 +1005,7 @@ class Sm100W8A16Fp8GemmKernel:
                     with cute.arch.elect_one():
                         dbg[dbg_base + 2] = dbg_tiles
                         dbg[dbg_base + 10] = cutlass.Int32(2)
-                work_tile, tile_info_consumer_state = self._next_work_tile(
+                work_tile, tile_info_consumer_state, tile_l = self._next_work_tile(
                     tile_info_pipeline, tile_info_consumer_state, sTile_info
                 )
             a_load2trans_pipeline.producer_tail(a_load2trans_producer_state)
@@ -1012,7 +1040,7 @@ class Sm100W8A16Fp8GemmKernel:
             tile_info_consumer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Consumer, self.num_tile_info_stage
             )
-            work_tile, tile_info_consumer_state = self._next_work_tile(
+            work_tile, tile_info_consumer_state, tile_l = self._next_work_tile(
                 tile_info_pipeline, tile_info_consumer_state, sTile_info
             )
             a_load2trans_consumer_state = pipeline.make_pipeline_state(
@@ -1049,7 +1077,7 @@ class Sm100W8A16Fp8GemmKernel:
                         with cute.arch.elect_one():
                             dbg[dbg_base + 3] = dbg_tiles
                             dbg[dbg_base + 11] = cutlass.Int32(2)
-                work_tile, tile_info_consumer_state = self._next_work_tile(
+                work_tile, tile_info_consumer_state, tile_l = self._next_work_tile(
                     tile_info_pipeline, tile_info_consumer_state, sTile_info
                 )
             trans2mma_pipeline.producer_tail(trans2mma_producer_state)
@@ -1074,7 +1102,7 @@ class Sm100W8A16Fp8GemmKernel:
             tile_info_consumer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Consumer, self.num_tile_info_stage
             )
-            work_tile, tile_info_consumer_state = self._next_work_tile(
+            work_tile, tile_info_consumer_state, tile_l = self._next_work_tile(
                 tile_info_pipeline, tile_info_consumer_state, sTile_info
             )
             trans2mma_consumer_state = pipeline.make_pipeline_state(
@@ -1158,7 +1186,7 @@ class Sm100W8A16Fp8GemmKernel:
                     with cute.arch.elect_one():
                         dbg[dbg_base + 4] = dbg_tiles
                         dbg[dbg_base + 12] = cutlass.Int32(5)
-                work_tile, tile_info_consumer_state = self._next_work_tile(
+                work_tile, tile_info_consumer_state, tile_l = self._next_work_tile(
                     tile_info_pipeline, tile_info_consumer_state, sTile_info
                 )
             acc_pipeline.producer_tail(acc_producer_state)
@@ -1232,10 +1260,11 @@ class Sm100W8A16Fp8GemmKernel:
             tile_info_consumer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Consumer, self.num_tile_info_stage
             )
-            work_tile, tile_info_consumer_state = self._next_work_tile(
+            work_tile, tile_info_consumer_state, tile_l = self._next_work_tile(
                 tile_info_pipeline, tile_info_consumer_state, sTile_info
             )
             weight_rows = cutlass.Int32(cute.size(tensor_c.shape[0]))
+            act_rows = cutlass.Int32(cute.size(tensor_c.shape[1]) // self.splits)
             num_prev_subtiles = cutlass.Int32(0)
             assert self.cta_tile_shape_mnk[0] == 128, (
                 "the bias staging uses the 128 epilogue threads, one per CTA-tile row"
@@ -1244,6 +1273,9 @@ class Sm100W8A16Fp8GemmKernel:
             epi_tile_count = cutlass.Int32(0)
             while work_tile.is_valid_tile:
                 m_base = work_tile.cta_coord_m * self.cta_tile_shape_mnk[0]
+                # The tile's activation offset within C: its K-slice's rows follow
+                # the previous slices' (split-K partials).
+                coord_n = work_tile.coord_n + tile_l * act_rows
                 if cutlass.const_expr(self.debug):
                     if epi_tidx == 0:
                         dbg[dbg_base + 13] = cutlass.Int32(1)
@@ -1259,9 +1291,9 @@ class Sm100W8A16Fp8GemmKernel:
                     )
                 ]
                 tma_store_offset_coord = (
-                    (work_tile.coord_n, 0)
+                    (coord_n, 0)
                     if cutlass.const_expr(self.c_layout.is_n_major_c())
-                    else (0, work_tile.coord_n)
+                    else (0, coord_n)
                 )
                 bSG_gC = cute.make_tensor(
                     (
@@ -1284,7 +1316,7 @@ class Sm100W8A16Fp8GemmKernel:
                     )
                 ]
                 tTR_gC = cute.make_tensor(
-                    tTR_gC.iterator + (work_tile.coord_n * tensor_c.layout.stride[1]),
+                    tTR_gC.iterator + (coord_n * tensor_c.layout.stride[1]),
                     tTR_gC.layout,
                 )
                 tTR_gC = cute.group_modes(tTR_gC, 3, cute.rank(tTR_gC))
@@ -1326,7 +1358,9 @@ class Sm100W8A16Fp8GemmKernel:
                     m_thr_slice = m_thr_offset[(None, None, None, subtile_idx)]
                     # scale * acc (+ bias[row]) in fp32: vectorized without the bias,
                     # per element (the row comes from the identity partition) with it.
-                    if cutlass.const_expr(self.has_bias):
+                    if cutlass.const_expr(self.partial_output):
+                        pass  # fp32 partials: the reduce applies scale and bias
+                    elif cutlass.const_expr(self.has_bias):
                         for i in cutlass.range(cute.size(tTR_rAcc), unroll_full=True):
                             tTR_rAcc[i] = (
                                 scale_val * tTR_rAcc[i]
@@ -1376,7 +1410,7 @@ class Sm100W8A16Fp8GemmKernel:
                     if epi_tidx == 0:
                         dbg[dbg_base + 5] = dbg_tiles
                         dbg[dbg_base + 13] = cutlass.Int32(3)
-                work_tile, tile_info_consumer_state = self._next_work_tile(
+                work_tile, tile_info_consumer_state, tile_l = self._next_work_tile(
                     tile_info_pipeline, tile_info_consumer_state, sTile_info
                 )
 
@@ -1398,11 +1432,12 @@ class Sm100W8A16Fp8GemmKernel:
         sTile_info: cute.Tensor,
     ):
         """Consume the next tile_info record (one group, so group index 1 = done);
-        returns it with the advanced consumer state."""
+        returns it with the advanced consumer state and the tile's K-slice."""
         tile_info_pipeline.consumer_wait(tile_info_consumer_state)
         work_tile = mixed_input_utils.make_contiguous_group_work_tile_info(
             1, sTile_info[(None, tile_info_consumer_state.index)]
         )
+        tile_l = sTile_info[(4, tile_info_consumer_state.index)]
         cute.arch.fence_proxy("async.shared", space="cta")
         tile_info_pipeline.consumer_release(tile_info_consumer_state)
         tile_info_consumer_state.advance()
@@ -1410,7 +1445,7 @@ class Sm100W8A16Fp8GemmKernel:
         # pipeline state handed to a @cute.jit helper is rebuilt from its MLIR values on
         # entry, so the caller's object does not see the advance (same reason
         # _transform_tile returns its states).
-        return work_tile, tile_info_consumer_state
+        return work_tile, tile_info_consumer_state, tile_l
 
     # --------------------------------------------------------------- sizing
     @staticmethod
@@ -1452,7 +1487,7 @@ class Sm100W8A16Fp8GemmKernel:
         bytes_per_pipeline_stage = 16
         num_tile_info_stage = 3
         tile_info_bytes = (
-            cute.size_in_bytes(cute.Int32, cute.make_layout((4, num_tile_info_stage)))
+            cute.size_in_bytes(cute.Int32, cute.make_layout((8, num_tile_info_stage)))
             + bytes_per_pipeline_stage * num_tile_info_stage
         )
         bias_bytes = 2 * 4 * cta_tile_shape_mnk[0]

@@ -86,6 +86,22 @@ def _sm100_use_stream_k(m: int, n: int, k: int, num_sms: int) -> bool:
     return 2 <= waves <= 3 and tail * 3 <= clusters
 
 
+def sm100_splits_for(m: int, n: int, k: int, num_sms: int) -> int:
+    """W8A16Sm100SplitsFor: the split-K slice count actually used: the model's
+    choice, or, when the variant is forced on a grid the model would not split,
+    the smallest s >= 2 dividing the k-tile count.  0 = K cannot be split."""
+    s = _sm100_split_k(m, n, k, num_sms)
+    if s >= 2:
+        return s
+    ktiles = k // 128
+    if k % 128 != 0 or ktiles < 2:
+        return 0
+    for c in range(2, 9):
+        if ktiles % c == 0:
+            return c
+    return 0
+
+
 def sm100_pick_algo(m: int, n: int, k: int, num_sms: int) -> int:
     """W8A16Sm100PickAlgo: the launcher's variant for a problem."""
     if n <= 128 and m >= 16384:
@@ -148,6 +164,8 @@ def _get_sm100_kernel(
     stream,
     enable_pdl: bool = False,
     debug: bool = False,
+    partial_output: bool = False,
+    splits: int = 1,
 ):
     import cutlass.cute as cute
 
@@ -167,6 +185,8 @@ def _get_sm100_kernel(
         max_active_clusters,
         enable_pdl,
         debug,
+        partial_output,
+        splits,
     )
     compiled = _KERNEL_CACHE.get(key)
     if compiled is not None:
@@ -182,6 +202,7 @@ def _get_sm100_kernel(
         transform_fragment_size=transform_fragment_size,
         enable_pdl=enable_pdl,
         debug=debug,
+        partial_output=partial_output,
     )
     compiled = cute.compile(
         kernel.wrapper,
@@ -189,7 +210,32 @@ def _get_sm100_kernel(
         n,
         m,
         k,
+        splits=splits,
         max_active_clusters=max_active_clusters,
+        stream=stream,
+        options="--opt-level 2 --enable-tvm-ffi",
+    )
+    _KERNEL_CACHE[key] = compiled
+    return compiled
+
+
+def _get_reduce_kernel(act_dtype: torch.dtype, has_bias: bool, pointers: Tuple, stream):
+    """The split-K reduce (sum of slices, scale, bias, cast), compiled once per
+    activation dtype and bias presence."""
+    import cutlass.cute as cute
+
+    from .kernels.cute_dsl.w8a16_fp8_splitk_reduce import W8A16SplitKReduce
+
+    key = ("reduce", act_dtype, has_bias)
+    compiled = _KERNEL_CACHE.get(key)
+    if compiled is not None:
+        return compiled
+    compiled = cute.compile(
+        W8A16SplitKReduce(has_bias).wrapper,
+        *pointers,
+        1,
+        8,
+        1,
         stream=stream,
         options="--opt-level 2 --enable-tvm-ffi",
     )
@@ -249,8 +295,23 @@ def w8a16_fp8_gemm_cute_dsl(
     num_sms = get_device_sm_count(act.device)
     if algo == 0:
         algo = sm100_pick_algo(m, n, k, num_sms)
-    if algo in (_SM100_SPLITK, _SM100_STREAMK):
+    if algo == _SM100_STREAMK:
+        algo = 1  # not ported yet
+    # Split-K: the 256x128 tile over `splits` K-slices writing fp32 partials, then
+    # the reduce.  The GEMM's `out` is then the partials buffer and the kernel does
+    # no scale / bias.
+    splits = 1
+    partials = None
+    if algo == _SM100_SPLITK:
+        splits = sm100_splits_for(m, n, k, num_sms)
+        if splits < 2:
+            raise ValueError(
+                f"w8a16_fp8_gemm split-K cannot slice K={k}: K must be a multiple of "
+                "128 whose k-tile count has a divisor in 2..8"
+            )
         algo = 1
+        partials = torch.empty((splits, m, n), dtype=torch.float32, device=act.device)
+    k_slice = k // splits
     mma_tiler, two_sm, cluster, _ = _SM100_TILES[algo]
     swizzle_size = sm100_pick_swizzle(m, n, k)
     raster_along_m = sm100_raster_along_m(m, n, mma_tiler, two_sm)
@@ -258,6 +319,8 @@ def w8a16_fp8_gemm_cute_dsl(
     act_ctype = cutlass.BFloat16 if act.dtype == torch.bfloat16 else cutlass.Float16
     bias_tensor = bias if has_bias else weight_scale  # any valid pointer when unused
     bias_ctype = act_ctype if has_bias else cutlass.Float32
+    gemm_out = partials if partials is not None else out
+    gemm_out_ctype = cutlass.Float32 if partials is not None else act_ctype
     pointers = (
         make_ptr(
             cutlass.Float8E4M3FN,
@@ -275,7 +338,12 @@ def w8a16_fp8_gemm_cute_dsl(
         make_ptr(
             bias_ctype, bias_tensor.data_ptr(), cute.AddressSpace.gmem, assumed_align=4
         ),
-        make_ptr(act_ctype, out.data_ptr(), cute.AddressSpace.gmem, assumed_align=16),
+        make_ptr(
+            gemm_out_ctype,
+            gemm_out.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=16,
+        ),
         make_ptr(
             cutlass.Int32,
             (debug_buffer if debug_buffer is not None else weight_scale).data_ptr(),
@@ -295,20 +363,57 @@ def w8a16_fp8_gemm_cute_dsl(
         pointers,
         n,
         m,
-        k,
+        k_slice,
         stream,
         debug=debug_buffer is not None,
+        partial_output=partials is not None,
+        splits=splits,
     )
     compiled(
         weight.data_ptr(),
         act.data_ptr(),
         weight_scale.data_ptr(),
         bias_tensor.data_ptr(),
-        out.data_ptr(),
+        gemm_out.data_ptr(),
         (debug_buffer if debug_buffer is not None else weight_scale).data_ptr(),
         n,
         m,
-        k,
+        k_slice,
         stream,
     )
+    if partials is not None:
+        reduce_pointers = (
+            make_ptr(
+                cutlass.Float32,
+                partials.data_ptr(),
+                cute.AddressSpace.gmem,
+                assumed_align=16,
+            ),
+            make_ptr(
+                cutlass.Float32,
+                weight_scale.data_ptr(),
+                cute.AddressSpace.gmem,
+                assumed_align=4,
+            ),
+            make_ptr(
+                bias_ctype,
+                bias_tensor.data_ptr(),
+                cute.AddressSpace.gmem,
+                assumed_align=16,
+            ),
+            make_ptr(
+                act_ctype, out.data_ptr(), cute.AddressSpace.gmem, assumed_align=16
+            ),
+        )
+        reduce = _get_reduce_kernel(act.dtype, has_bias, reduce_pointers, stream)
+        reduce(
+            partials.data_ptr(),
+            weight_scale.data_ptr(),
+            bias_tensor.data_ptr(),
+            out.data_ptr(),
+            m,
+            n,
+            splits,
+            stream,
+        )
     return out
