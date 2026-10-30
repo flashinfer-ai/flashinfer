@@ -229,7 +229,10 @@ def test_fp32_intermediate_buffer_large_batch_int64_offsets():
     device = torch.device("cuda")
     B, T8, HV32, H8 = 528, 8, 32, 8
     pool_slots = B * (T8 + 1) + 1
-    need = (B * T8 * HV32 + pool_slots * HV32) * V * K * 4 * 1.2
+    # Peak residency: the buffer plus BOTH pools (``pool`` and its scatter
+    # clone live simultaneously); the comparison below is per batch row, so
+    # no gathered full-size tensor is ever materialized.
+    need = (B * T8 * HV32 + 2 * pool_slots * HV32) * V * K * 4 * 1.2
     free, _ = torch.cuda.mem_get_info()
     if free < need:
         pytest.skip(f"needs ~{need / 2**30:.1f} GiB free device memory")
@@ -279,8 +282,12 @@ def test_fp32_intermediate_buffer_large_batch_int64_offsets():
     torch.cuda.synchronize()
 
     torch.testing.assert_close(out_buffer, out_scatter, atol=0, rtol=0)
-    flat_pool = pool_scatter[scat_idx.reshape(-1).long()].reshape(B, T8, HV32, V, K)
-    torch.testing.assert_close(buffer, flat_pool, atol=0, rtol=0)
+    # Compare per batch row to keep the peak at buffer + two pools (a full
+    # advanced-index gather would transiently add another buffer-size copy).
+    for i in range(B):
+        torch.testing.assert_close(
+            buffer[i], pool_scatter[scat_idx[i].long()], atol=0, rtol=0
+        )
 
 
 if __name__ == "__main__":
