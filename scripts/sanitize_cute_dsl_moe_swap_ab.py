@@ -159,7 +159,6 @@ def _terminate(process):
 
 @pytest.mark.parametrize("opt_level", [3], ids=lambda n: f"O{n}")
 @pytest.mark.parametrize("ep", [8], ids=lambda n: f"ep{n}")
-@pytest.mark.parametrize("apply_topk_in_fc1", [False], ids=["topk_fc2"])
 @pytest.mark.parametrize("local_tokens", _TOKENS, ids=lambda n: f"t{n}")
 @pytest.mark.parametrize("mode", _MODES)
 @pytest.mark.parametrize(
@@ -173,7 +172,6 @@ def _terminate(process):
 def test_cute_dsl_moe_sanitizer(
     opt_level,
     ep,
-    apply_topk_in_fc1,
     mode,
     local_tokens,
     tool,
@@ -194,7 +192,6 @@ def test_cute_dsl_moe_sanitizer(
         pytest.skip("requires one CUDA GPU")
     if torch.cuda.get_device_capability(0) not in ((10, 0), (10, 3)):
         pytest.skip("requires SM100 or SM103")
-    assert not apply_topk_in_fc1
     assert not use_per_token or quant_mode == "w4a4"
     command = [
         sanitizer,

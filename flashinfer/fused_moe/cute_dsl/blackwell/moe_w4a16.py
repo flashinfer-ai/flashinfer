@@ -456,17 +456,8 @@ def launch_w4a16_moe(
         enable_pdl=enable_pdl,
         **workspace.moe_sort_buffers,
     )
-    num_tokens = int(x.size(0))
-    route_slots = get_max_num_permuted_tokens(
-        num_tokens, top_k, num_local_experts, route_tile
-    )
-    num_route_tiles = route_slots // route_tile
-    tile_idx_to_expert_idx = tile_idx_to_expert_idx[:num_route_tiles]
-    tile_idx_to_mn_limit = tile_idx_to_mn_limit[:num_route_tiles]
-    expanded_idx_to_permuted_idx = expanded_idx_to_permuted_idx[:num_tokens]
-    permuted_idx_to_expanded_idx = permuted_idx_to_expanded_idx[:route_slots]
-    hidden_workspace = workspace.hidden_workspace[:route_slots]
-    intermediate = workspace.intermediate[:route_slots]
+    hidden_workspace = workspace.hidden_workspace
+    intermediate = workspace.intermediate
     _run_grouped_gemm(
         weight=w1_weight,
         weight_sf=w1_weight_sf,

@@ -1025,6 +1025,7 @@ class CuteDslFusedMoERunner(TunableRunner):
                 )
             elif self.quant_mode in ("w4a8", "mxfp8"):
                 tactic = canonicalize_w4a8_tactic(tactic)
+
         params = _extract_tactic_params(tactic)
 
         (

@@ -964,9 +964,6 @@ class Sm100W4A16GroupedGemmKernel:
         a_op = mixed_input_utils.get_tma_atom_kind(
             self.is_a_mcast, self.use_2cta_instrs, False
         )
-        b_op = mixed_input_utils.get_tma_atom_kind(
-            self.is_b_mcast, self.use_2cta_instrs, True
-        )
         smem_layout_a_per_stage = cute.slice_(self.smem_layout_a, (None, None, None, 0))
         tma_atom_a, tma_tensor_a = cute.nvgpu.make_tiled_tma_atom_A(
             a_op,
@@ -1015,6 +1012,9 @@ class Sm100W4A16GroupedGemmKernel:
             )
             tma_tensor_b = b
         else:
+            b_op = mixed_input_utils.get_tma_atom_kind(
+                self.is_b_mcast, self.use_2cta_instrs, True
+            )
             tma_atom_b, tma_tensor_b = cute.nvgpu.make_tiled_tma_atom_B(
                 b_op,
                 b,
@@ -1394,10 +1394,6 @@ class Sm100W4A16GroupedGemmKernel:
             cute.slice_(self.mma_tiler, (None, 0, None)),
             (None, None, None),
         )
-        # (bN, bK, loopN, loopK, loopL)
-        gB_nkl = cute.local_tile(
-            mB_nkl, cute.slice_(self.mma_tiler, (0, None, None)), (None, None, None)
-        )
         # (bM, bN, loopM, loopN, loopL)
         gC_mnl = cute.local_tile(
             mC_mnl,
@@ -1417,8 +1413,6 @@ class Sm100W4A16GroupedGemmKernel:
         tCgA = thr_mma.partition_A(gA_mkl)
         # (MMA, MMA_M, MMA_K, loopM, loopK, loopL)
         tCgS = thr_mma.partition_A(gS_mkl)
-        # (MMA, MMA_N, MMA_K, loopN, loopK, loopL)
-        tCgB = thr_mma.partition_B(gB_nkl)
         # (MMA, MMA_M, MMA_N, loopM, loopN, loopL)
         tCgC = thr_mma.partition_C(gC_mnl)
         tCgC_simt = thr_mma.partition_C(gC_mnl_simt)
@@ -1465,12 +1459,18 @@ class Sm100W4A16GroupedGemmKernel:
         tSgS = cute.filter_zeros(tSgS)
 
         # TMA load B partition_S/D
-        b_cta_layout = cute.make_layout(
-            cute.slice_(cluster_layout_vmnk, (0, None, 0, 0)).shape
-        )
-        # ((atom_v, rest_v), STAGE)
-        # ((atom_v, rest_v), loopM, loopK, loopL)
         if cutlass.const_expr(not self.gather_input):
+            # (bN, bK, loopN, loopK, loopL)
+            gB_nkl = cute.local_tile(
+                mB_nkl, cute.slice_(self.mma_tiler, (0, None, None)), (None, None, None)
+            )
+            # (MMA, MMA_N, MMA_K, loopN, loopK, loopL)
+            tCgB = thr_mma.partition_B(gB_nkl)
+            b_cta_layout = cute.make_layout(
+                cute.slice_(cluster_layout_vmnk, (0, None, 0, 0)).shape
+            )
+            # ((atom_v, rest_v), STAGE)
+            # ((atom_v, rest_v), loopM, loopK, loopL)
             tBsB, tBgB = cpasync.tma_partition(
                 tma_atom_b,
                 block_in_cluster_coord_vmnk[1],

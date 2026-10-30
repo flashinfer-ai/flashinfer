@@ -16,12 +16,12 @@
 
 from typing import Any, Dict, Optional, Tuple, Union
 
-import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import torch
 
 from flashinfer.cute_dsl.utils import (
+    current_cuda_stream,
     cutlass_to_torch_dtype,
     get_cutlass_dtype,
     get_num_sm,
@@ -139,7 +139,7 @@ def _run_blockscaled_gemm(
             "Unsupported split block-scaled GEMM shape, output dtype, or K steps"
         )
     mma_m, route_tile = mma_tiler_mn
-    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    stream = current_cuda_stream()
     pointers = (
         _blockscaled_ptr(weight, weight_dtype, 32),
         _blockscaled_ptr(weight_sf, sf_dtype),
@@ -211,15 +211,14 @@ def _run_blockscaled_gemm(
         use_fused_finalize,
         enable_pdl,
     )
-    tile_k, native_mma_k = (
-        (256, 64)
-        if activation_dtype is cutlass.Float4E2M1FN
-        and weight_dtype is cutlass.Float4E2M1FN
-        else (128, 32)
-    )
     compiled = _blockscaled_kernel_cache.get(key)
-    args = (*pointers, channels, routes, reduction, experts, num_tokens)
     if compiled is None:
+        tile_k, native_mma_k = (
+            (256, 64)
+            if activation_dtype is cutlass.Float4E2M1FN
+            and weight_dtype is cutlass.Float4E2M1FN
+            else (128, 32)
+        )
         if (
             native_mma_k == 64
             and sf_vec_size == 16
@@ -262,6 +261,7 @@ def _run_blockscaled_gemm(
             enable_pdl=enable_pdl,
             max_active_clusters=num_sms,
         )
+        args = (*pointers, channels, routes, reduction, experts, num_tokens)
         compiled = cute.compile(kernel.wrapper, *args, stream=stream)
         _blockscaled_kernel_cache[key] = compiled
     # Channels, reduction, and experts already specialize the cache entry.
@@ -376,8 +376,8 @@ def launch_gather_gemm(
         or num_non_exiting_tiles.numel() != 1
     ):
         raise ValueError("metadata capacity mismatch")
-    if a.data_ptr() % 16 or a.shape[1] * a.element_size() % 16:
-        raise ValueError("payload rows and storage require 16-byte alignment")
+    if a.shape[1] * a.element_size() % 16:
+        raise ValueError("payload rows require 16-byte alignment")
     if a.data_ptr() % 32 or a_scale.data_ptr() % 4:
         raise ValueError("unaligned gather input storage")
     normalized_activation_type, expected_gated = normalize_cute_dsl_moe_activation_type(
@@ -454,7 +454,6 @@ def launch_gather_gemm(
         # Scale factor layout for output
         scale_atom_n = sf_vec_size * 4
         scale_rest_n = (intermediate_size + scale_atom_n - 1) // scale_atom_n
-        route_tile = mma_tiler_mn[1]
         scale_rest_m = (
             (permuted_m + route_tile - 1) // route_tile * ((route_tile + 127) // 128)
         )

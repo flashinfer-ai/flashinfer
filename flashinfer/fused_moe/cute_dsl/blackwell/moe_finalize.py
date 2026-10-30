@@ -160,10 +160,7 @@ class _MoeFinalizeKernel:
         # The caller guarantees routing is ready before FC2 signals us.
         # Only expert outputs depend on the still-running FC2 grid.
         for slot in cutlass.range_constexpr(self.top_k):
-            if cutlass.const_expr(self.input_is_expanded):
-                rows[slot] = cutlass.Int32(mapping[(token_idx, slot)] >= 0)
-            else:
-                rows[slot] = mapping[(token_idx, slot)]
+            rows[slot] = mapping[(token_idx, slot)]
             weights[slot] = cutlass.Float32(scales[(token_idx, slot)])
 
         if cutlass.const_expr(self.enable_pdl):
@@ -172,12 +169,11 @@ class _MoeFinalizeKernel:
         # Match MegaMoE's first-slot multiply and subsequent ordered FP32 FMA.
         # Mask before loading: nonlocal routes have no initialized expert row.
         for slot in cutlass.range_constexpr(self.top_k):
-            row = cutlass.Int64(rows[slot])
-            valid = rows[slot] >= 0
             if cutlass.const_expr(self.input_is_expanded):
                 row = route_base + slot
-                valid = rows[slot] != 0
-            if valid:
+            else:
+                row = cutlass.Int64(rows[slot])
+            if rows[slot] >= 0:
                 for vector in cutlass.range_constexpr(self.vectors_per_thread):
                     vector_column = column + vector * self.threads * 8
                     if vector_column < self.hidden_size:
@@ -221,9 +217,8 @@ def moe_unpermute(
     Routing metadata must be ready before FC2 signals this dependent grid.
     Blockscaled FC2 may read routing before its dependency wait, using the
     prior grid's publication; it republishes routing before signaling combine.
-    W4A16's earlier permute waits
-    for sort before signaling FC1. Metadata reads precede this kernel's
-    PDL wait; all expert-output reads follow it.
+    W4A16 FC1 waits for sort before publishing routing and signaling FC2.
+    Metadata reads precede this kernel's PDL wait; all expert-output reads follow it.
     Negative mapping entries skip their row entirely. An all-masked token
     writes exactly positive zero. Like MegaMoE's deterministic combine, slot
     zero uses an FP32 multiply and later slots use FP32 FMA, with round-to-nearest

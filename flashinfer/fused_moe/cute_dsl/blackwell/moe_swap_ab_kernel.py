@@ -1580,11 +1580,9 @@ class Sm100BlockScaledGroupedGemmKernel:
         # though each CTA stores only its half of the B activation tile.
         self.sfb_row_blocks = max(1, self.allocated_n // 128)
         self.sfb_stage_bytes = self.sfb_row_blocks * self.sf_stage_bytes
-        self.activation_type = activation_type
         self.top_k = top_k
         self.use_fused_finalize = use_fused_finalize
         self.enable_pdl = enable_pdl
-        self.output_dtype = output_dtype
         self.max_active_clusters = max_active_clusters
         if max_active_clusters < self.cta_group_size:
             raise ValueError("The launch needs at least one complete CTA group")
@@ -2063,11 +2061,9 @@ class Sm100BlockScaledGroupedGemmKernel:
     ):
         num_channels = cute.assume(num_channels, divby=128)
         reduction_size = cute.assume(reduction_size, divby=self.sf_block_k)
-        gated = self.activation_type in (
-            ActivationType.Swiglu.value,
-            ActivationType.GegluTanh.value,
+        out_channels = cute.assume(
+            num_channels // (2 if self.epilogue.gated else 1), divby=16
         )
-        out_channels = cute.assume(num_channels // (2 if gated else 1), divby=16)
         source_rows = num_tokens if self.gather_input else num_routes
         # FC1 scales still belong to original tokens; the epilogue indexes them
         # through the unchanged route mapping. FC2 scales belong to route rows.
@@ -3103,7 +3099,7 @@ class Sm100BlockScaledGroupedGemmKernel:
                 info_state = pipeline.make_pipeline_state(
                     pipeline.PipelineUserType.Consumer, self.num_tile_info_stages
                 )
-                tile, scheduled_expert, scheduled_valid, info_state = self.next_work(
+                tile, _, scheduled_valid, info_state = self.next_work(
                     info_pipe, info_state, sInfo, block, total_tiles
                 )
                 while tile >= 0:
@@ -3223,50 +3219,39 @@ class Sm100BlockScaledGroupedGemmKernel:
                             )
                             if cutlass.const_expr(self.enable_iket):
                                 _iket.range_pop()
-                                _iket.range_push("mma_umma0_issue")
-                            _blockscaled_dynamic_mma(
-                                mma_accumulator,
-                                fragment_a[
-                                    (
-                                        None,
-                                        None,
-                                        None,
-                                        consumer.index * self.channel_tiles,
-                                    )
-                                ],
-                                fragment_b[(None, None, None, consumer.index)],
-                                tSFA,
-                                tile_sfb,
-                                valid,
-                                k_tile,
-                                self.instruction,
-                                self.descriptor,
-                                tiled_mma,
-                                stage_k,
-                                self.native_mma_k,
-                            )
-                            if cutlass.const_expr(self.enable_iket):
-                                _iket.range_pop()
-                            if cutlass.const_expr(self.channel_tiles == 2):
+                            for channel_tile in cutlass.range_constexpr(
+                                self.channel_tiles
+                            ):
                                 if cutlass.const_expr(self.enable_iket):
-                                    _iket.range_push("mma_umma1_issue")
-                                mma_accumulator1 = cute.make_tensor(
-                                    mma_accumulator.iterator
-                                    + cute.assume(self.allocated_n, divby=32),
-                                    acc_layout,
-                                )
+                                    _iket.range_push(
+                                        "mma_umma0_issue"
+                                        if channel_tile == 0
+                                        else "mma_umma1_issue"
+                                    )
+                                tile_accumulator = mma_accumulator
+                                tile_sfa = tSFA
+                                if cutlass.const_expr(channel_tile > 0):
+                                    tile_accumulator = cute.make_tensor(
+                                        mma_accumulator.iterator
+                                        + cute.assume(
+                                            channel_tile * self.allocated_n, divby=32
+                                        ),
+                                        acc_layout,
+                                    )
+                                    tile_sfa = tSFA1
                                 _blockscaled_dynamic_mma(
-                                    mma_accumulator1,
+                                    tile_accumulator,
                                     fragment_a[
                                         (
                                             None,
                                             None,
                                             None,
-                                            consumer.index * self.channel_tiles + 1,
+                                            consumer.index * self.channel_tiles
+                                            + channel_tile,
                                         )
                                     ],
                                     fragment_b[(None, None, None, consumer.index)],
-                                    tSFA1,
+                                    tile_sfa,
                                     tile_sfb,
                                     valid,
                                     k_tile,
@@ -3288,10 +3273,8 @@ class Sm100BlockScaledGroupedGemmKernel:
                             consumer.advance()
                     acc_pipe.producer_commit(producer)
                     producer.advance()
-                    tile, scheduled_expert, scheduled_valid, info_state = (
-                        self.next_work(
-                            info_pipe, info_state, sInfo, tile + grid, total_tiles
-                        )
+                    tile, _, scheduled_valid, info_state = self.next_work(
+                        info_pipe, info_state, sInfo, tile + grid, total_tiles
                     )
         elif warp < 8:
             if cutlass.const_expr(self.gather_input):
