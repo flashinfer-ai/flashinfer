@@ -190,9 +190,13 @@ def make_inputs(spec, seed, device):
 def cake_arm(spec, inp):
     """The prepared Cake launch of the row (allocation-free replays)."""
     if spec["family"] == "router":
-        prepared = cake_backend.prepare_router_fp32_det_gemm(inp["A"], inp["B"], inp["out"])
+        prepared = cake_backend.prepare_router_fp32_det_gemm(
+            inp["A"], inp["B"], inp["out"]
+        )
     elif spec["family"] == "proj" and spec["op"] == "wgrad":
-        prepared = cake_backend.prepare_projection_det_wgrad(inp["G"], inp["X"], inp["out"])
+        prepared = cake_backend.prepare_projection_det_wgrad(
+            inp["G"], inp["X"], inp["out"]
+        )
     else:
         prepared = cake_backend.prepare_dense_projection_det_gemm(
             inp["A"], inp["B"], inp["out"]
@@ -207,7 +211,9 @@ def eager_arm(spec, inp):
         return lambda: cake_backend.router_fp32_det_gemm(inp["A"], inp["B"], inp["out"])
     if spec["family"] == "proj" and spec["op"] == "wgrad":
         return lambda: cake_backend.projection_det_wgrad(inp["G"], inp["X"], inp["out"])
-    return lambda: cake_backend.dense_projection_det_gemm(inp["A"], inp["B"], inp["out"])
+    return lambda: cake_backend.dense_projection_det_gemm(
+        inp["A"], inp["B"], inp["out"]
+    )
 
 
 def torch_arm(spec, inp):

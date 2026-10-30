@@ -4460,7 +4460,9 @@ def plan_router_fp32_det_gemm(
     if lda % 4 != 0 or A_eff.data_ptr() % 16 != 0:
         raise ValueError("router_fp32_det_gemm: A rows must be 16-byte aligned")
     if B_eff.data_ptr() % 16 != 0:
-        raise ValueError("router_fp32_det_gemm: B must start at a 16-byte aligned address")
+        raise ValueError(
+            "router_fp32_det_gemm: B must start at a 16-byte aligned address"
+        )
     # the kernel's output view: [M_eff, N_eff] row-major, or [N_eff, M_eff] with the transposed store = out
     if out.stride(1) != 1 or out.stride(0) % 4 != 0 or N_eff % 8 != 0:
         raise ValueError(
