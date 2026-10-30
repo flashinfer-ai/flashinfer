@@ -850,7 +850,6 @@ def test_fp4_moe_gemm_bias_prims_ts(bias, moe_impl, cache_permute_indices):
 def test_mxfp4_mxfp8_prims_ts_unpadded_scale_row(hidden_size, cache_permute_indices):
     """Compact MXFP8 activation scales whose row (hidden_size // 32) is not a
     multiple of 16 bytes go through the flat Prims-TS op correctly."""
-    _skip_prims_ts_on_sm107()
     intermediate_size = 512
     run_moe_test(
         num_tokens=32,
