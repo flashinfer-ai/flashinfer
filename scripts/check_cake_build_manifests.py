@@ -377,14 +377,14 @@ PACKAGES: tuple[Package, ...] = (
         refs_generic,
     ),
     Package(
-        "flashinfer.cake_mhc_train_backend",
-        "flashinfer/cake_mhc_train_backend",
+        "flashinfer.cake_mhc_det_train_backend",
+        "flashinfer/cake_mhc_det_train_backend",
         "cake_jit.py",
         refs_generic,
     ),
     Package(
-        "flashinfer.cake_mhc_train_head_backend",
-        "flashinfer/cake_mhc_train_head_backend",
+        "flashinfer.cake_mhc_det_train_head_backend",
+        "flashinfer/cake_mhc_det_train_head_backend",
         "cake_jit.py",
         refs_generic,
     ),

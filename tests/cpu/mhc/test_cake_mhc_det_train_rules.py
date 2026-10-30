@@ -66,69 +66,69 @@ import pytest
 
 from tests.test_helpers.cake_package import cake_package
 
-loader = cake_package("cake_mhc_train", "cake_jit")
+loader = cake_package("cake_mhc_det_train", "cake_jit")
 
 SM_COUNTS = (148, 152, 208, 216)
 BOARDS = (("sm_100a", 148), ("sm_103a", 152), ("sm_107a", 208), ("sm_107a", 216))
 ARCHES = ("sm_100a", "sm_103a", "sm_107a")
 # Program key -> library per kernel, the libraries the registry ships (generated from the records).
 SPLIT_LIBRARY = {
-    "b16": "cake_mhc_train_fn_split",
-    "tv128": "cake_mhc_train_fn_split__tv128",
-    "tv128_t128": "cake_mhc_train_fn_split__tv128_t128",
+    "b16": "cake_mhc_det_train_fn_split",
+    "tv128": "cake_mhc_det_train_fn_split__tv128",
+    "tv128_t128": "cake_mhc_det_train_fn_split__tv128_t128",
 }
 MAP_LIBRARY = {
-    "ss_st4": "cake_mhc_train_fwd_map",
-    "nsx": "cake_mhc_train_fwd_map__nsx",
-    "nsx_st5_mb1": "cake_mhc_train_fwd_map__nsx_st5_mb1",
-    "nsx_g2_ol2l": "cake_mhc_train_fwd_map__nsx_g2_ol2l",
-    "ns96_g2_ol2l": "cake_mhc_train_fwd_map__ns96_g2_ol2l",
-    "nsx_ct": "cake_mhc_train_fwd_map__nsx_ct",
-    "tk_nsx_g2_ol2l_ct": "cake_mhc_train_fwd_map__tk_nsx_g2_ol2l_ct",
+    "ss_st4": "cake_mhc_det_train_fwd_map",
+    "nsx": "cake_mhc_det_train_fwd_map__nsx",
+    "nsx_st5_mb1": "cake_mhc_det_train_fwd_map__nsx_st5_mb1",
+    "nsx_g2_ol2l": "cake_mhc_det_train_fwd_map__nsx_g2_ol2l",
+    "ns96_g2_ol2l": "cake_mhc_det_train_fwd_map__ns96_g2_ol2l",
+    "nsx_ct": "cake_mhc_det_train_fwd_map__nsx_ct",
+    "tk_nsx_g2_ol2l_ct": "cake_mhc_det_train_fwd_map__tk_nsx_g2_ol2l_ct",
     # nsx's ticket form is not exported: where the rule names it (no SM count of record) its __tk record runs nsx
-    "tk_nsx_ct": "cake_mhc_train_fwd_map__nsx",
+    "tk_nsx_ct": "cake_mhc_det_train_fwd_map__nsx",
 }
 COEF_LIBRARY = {
-    "qe_mb10": "cake_mhc_train_fwd_coef__qe_mb10",
-    "qe_mb10_pu4": "cake_mhc_train_fwd_coef__qe_mb10_pu4",
-    "st8_lp2": "cake_mhc_train_fwd_coef__st8_lp2",
-    "lp2_w8_adj": "cake_mhc_train_fwd_coef__lp2_w8_adj",
-    "st16_w4_tree": "cake_mhc_train_fwd_coef__st16_w4_tree",
-    "qe_mb10_tree": "cake_mhc_train_fwd_coef__qe_mb10_tree",
-    "st16_lp2_as_el_qd": "cake_mhc_train_fwd_coef__st16_lp2_as_el_qd",
-    "st8_lp2_as_el_qd": "cake_mhc_train_fwd_coef__st8_lp2_as_el_qd",
-    "pfl2_qmt": "cake_mhc_train_fwd_coef__pfl2_qmt",
-    "g2_el": "cake_mhc_train_fwd_coef__g2_el",
-    "st8_lp2_tree_asel_qd": "cake_mhc_train_fwd_coef__st8_lp2_tree_asel_qd",
-    "lp2_w8_adj_qe": "cake_mhc_train_fwd_coef__lp2_w8_adj_qe",
+    "qe_mb10": "cake_mhc_det_train_fwd_coef__qe_mb10",
+    "qe_mb10_pu4": "cake_mhc_det_train_fwd_coef__qe_mb10_pu4",
+    "st8_lp2": "cake_mhc_det_train_fwd_coef__st8_lp2",
+    "lp2_w8_adj": "cake_mhc_det_train_fwd_coef__lp2_w8_adj",
+    "st16_w4_tree": "cake_mhc_det_train_fwd_coef__st16_w4_tree",
+    "qe_mb10_tree": "cake_mhc_det_train_fwd_coef__qe_mb10_tree",
+    "st16_lp2_as_el_qd": "cake_mhc_det_train_fwd_coef__st16_lp2_as_el_qd",
+    "st8_lp2_as_el_qd": "cake_mhc_det_train_fwd_coef__st8_lp2_as_el_qd",
+    "pfl2_qmt": "cake_mhc_det_train_fwd_coef__pfl2_qmt",
+    "g2_el": "cake_mhc_det_train_fwd_coef__g2_el",
+    "st8_lp2_tree_asel_qd": "cake_mhc_det_train_fwd_coef__st8_lp2_tree_asel_qd",
+    "lp2_w8_adj_qe": "cake_mhc_det_train_fwd_coef__lp2_w8_adj_qe",
 }
 TOKEN_LIBRARY = {
-    "dot_ao8": "cake_mhc_train_bwd_token__dot_ao8",
-    "ao22_rae7_pd1_ntr": "cake_mhc_train_bwd_token__ao22_rae7_pd1_ntr",
-    "ao15_rae8_tma_ntr": "cake_mhc_train_bwd_token__ao15_rae8_tma_ntr",
-    "ao22_rae7_rf3_pd1_l2l_ntr": "cake_mhc_train_bwd_token__ao22_rae7_rf3_pd1_l2l_ntr",
-    "ao22_rae7_pd1_tma_ntr": "cake_mhc_train_bwd_token__ao22_rae7_pd1_tma_ntr",
-    "dot_ao8_l2l": "cake_mhc_train_bwd_token__dot_ao8_l2l",
+    "dot_ao8": "cake_mhc_det_train_bwd_token__dot_ao8",
+    "ao22_rae7_pd1_ntr": "cake_mhc_det_train_bwd_token__ao22_rae7_pd1_ntr",
+    "ao15_rae8_tma_ntr": "cake_mhc_det_train_bwd_token__ao15_rae8_tma_ntr",
+    "ao22_rae7_rf3_pd1_l2l_ntr": "cake_mhc_det_train_bwd_token__ao22_rae7_rf3_pd1_l2l_ntr",
+    "ao22_rae7_pd1_tma_ntr": "cake_mhc_det_train_bwd_token__ao22_rae7_pd1_tma_ntr",
+    "dot_ao8_l2l": "cake_mhc_det_train_bwd_token__dot_ao8_l2l",
 }
 # The run-time-count records (select rule ``run_time_iters``): record -> the kernel it stands in for at every
 # Sinkhorn count but the compiled one (the count is their ``sinkhorn_iters`` argument, at most SINKHORN_ITERS_MAX).
 RUN_TIME_ITERS = {
-    "cake_mhc_train_fwd_coef__rt64": "cake_mhc_train_fwd_coef",
-    "cake_mhc_train_bwd_token__rt64": "cake_mhc_train_bwd_token",
+    "cake_mhc_det_train_fwd_coef__rt64": "cake_mhc_det_train_fwd_coef",
+    "cake_mhc_det_train_bwd_token__rt64": "cake_mhc_det_train_bwd_token",
 }
 SLAB_LIBRARY = {
-    "xrsg": "cake_mhc_train_bwd_slab__xrsg",
-    "dynr": "cake_mhc_train_bwd_slab__dynr",
-    "dynl": "cake_mhc_train_bwd_slab__dynl",
+    "xrsg": "cake_mhc_det_train_bwd_slab__xrsg",
+    "dynr": "cake_mhc_det_train_bwd_slab__dynr",
+    "dynl": "cake_mhc_det_train_bwd_slab__dynl",
 }
 REDUCE_LIBRARY = {
-    "pt64": "cake_mhc_train_bwd_reduce__pt64",
-    "pt32": "cake_mhc_train_bwd_reduce__pt32",
-    "wpu4": "cake_mhc_train_bwd_reduce__wpu4",
-    "s27_wcvt_spred": "cake_mhc_train_bwd_reduce__s27_wcvt_spred",
-    "s27_wcvt_fadd_fshfl": "cake_mhc_train_bwd_reduce__s27_wcvt_fadd_fshfl",
-    "wpu4_fadd": "cake_mhc_train_bwd_reduce__wpu4_fadd",
-    "wpu4_spred": "cake_mhc_train_bwd_reduce__wpu4_spred",
+    "pt64": "cake_mhc_det_train_bwd_reduce__pt64",
+    "pt32": "cake_mhc_det_train_bwd_reduce__pt32",
+    "wpu4": "cake_mhc_det_train_bwd_reduce__wpu4",
+    "s27_wcvt_spred": "cake_mhc_det_train_bwd_reduce__s27_wcvt_spred",
+    "s27_wcvt_fadd_fshfl": "cake_mhc_det_train_bwd_reduce__s27_wcvt_fadd_fshfl",
+    "wpu4_fadd": "cake_mhc_det_train_bwd_reduce__wpu4_fadd",
+    "wpu4_spred": "cake_mhc_det_train_bwd_reduce__wpu4_spred",
 }
 COEF_TOKENS_PER_CTA = {
     "qe_mb10": 8,
@@ -154,110 +154,110 @@ REDUCE_GRID = {
     "wpu4_spred": 411,
 }
 FINISH_LIBRARY = {
-    "production": "cake_mhc_train_fwd_finish",
-    "r2": "cake_mhc_train_fwd_finish__r2",
+    "production": "cake_mhc_det_train_fwd_finish",
+    "r2": "cake_mhc_det_train_fwd_finish__r2",
 }
 # Library -> the architectures whose routes name a record of it (generated from the records).
 LIBRARY_ARCHES = {
-    "cake_mhc_train_bwd_prepare": ("sm_100a", "sm_103a", "sm_107a"),
-    "cake_mhc_train_bwd_prepare__t128": ("sm_100a", "sm_103a", "sm_107a"),
-    "cake_mhc_train_bwd_reduce__pt32": ("sm_103a",),
-    "cake_mhc_train_bwd_reduce__pt64": ("sm_103a",),
-    "cake_mhc_train_bwd_reduce__s27_wcvt_fadd_fshfl": ("sm_100a",),
-    "cake_mhc_train_bwd_reduce__s27_wcvt_spred": ("sm_107a",),
-    "cake_mhc_train_bwd_reduce__wpu4": ("sm_107a",),
-    "cake_mhc_train_bwd_reduce__wpu4_fadd": ("sm_100a", "sm_107a"),
-    "cake_mhc_train_bwd_reduce__wpu4_spred": ("sm_100a",),
-    "cake_mhc_train_bwd_slab__dynl": ("sm_100a",),
-    "cake_mhc_train_bwd_slab__dynr": ("sm_100a", "sm_103a"),
-    "cake_mhc_train_bwd_slab__xrsg": ("sm_100a", "sm_107a"),
-    "cake_mhc_train_bwd_token__ao15_rae8_tma_ntr": ("sm_100a", "sm_103a", "sm_107a"),
-    "cake_mhc_train_bwd_token__ao22_rae7_pd1_ntr": ("sm_100a", "sm_103a", "sm_107a"),
-    "cake_mhc_train_bwd_token__ao22_rae7_pd1_tma_ntr": ("sm_100a", "sm_107a"),
-    "cake_mhc_train_bwd_token__ao22_rae7_rf3_pd1_l2l_ntr": ("sm_107a",),
-    "cake_mhc_train_bwd_token__dot_ao8": ("sm_100a", "sm_103a"),
-    "cake_mhc_train_bwd_token__dot_ao8_l2l": ("sm_107a",),
-    "cake_mhc_train_bwd_token__rt64": ("sm_100a", "sm_103a", "sm_107a"),
-    "cake_mhc_train_fn_split": ("sm_100a", "sm_103a", "sm_107a"),
-    "cake_mhc_train_fn_split__tv128": ("sm_100a", "sm_103a"),
-    "cake_mhc_train_fn_split__tv128_t128": ("sm_107a",),
-    "cake_mhc_train_fwd_coef__g2_el": ("sm_107a",),
-    "cake_mhc_train_fwd_coef__lp2_w8_adj": ("sm_100a", "sm_103a"),
-    "cake_mhc_train_fwd_coef__lp2_w8_adj_qe": ("sm_107a",),
-    "cake_mhc_train_fwd_coef__pfl2_qmt": ("sm_107a",),
-    "cake_mhc_train_fwd_coef__qe_mb10": ("sm_103a",),
-    "cake_mhc_train_fwd_coef__qe_mb10_pu4": ("sm_100a", "sm_103a"),
-    "cake_mhc_train_fwd_coef__qe_mb10_tree": ("sm_100a", "sm_103a", "sm_107a"),
-    "cake_mhc_train_fwd_coef__rt64": ("sm_100a", "sm_103a", "sm_107a"),
-    "cake_mhc_train_fwd_coef__st16_lp2_as_el_qd": ("sm_100a", "sm_103a", "sm_107a"),
-    "cake_mhc_train_fwd_coef__st16_w4_tree": ("sm_100a", "sm_103a", "sm_107a"),
-    "cake_mhc_train_fwd_coef__st8_lp2": ("sm_100a", "sm_103a"),
-    "cake_mhc_train_fwd_coef__st8_lp2_as_el_qd": ("sm_100a",),
-    "cake_mhc_train_fwd_coef__st8_lp2_tree_asel_qd": ("sm_107a",),
-    "cake_mhc_train_fwd_collapse": ("sm_100a", "sm_103a", "sm_107a"),
-    "cake_mhc_train_fwd_finish": ("sm_100a", "sm_103a"),
-    "cake_mhc_train_fwd_finish__r2": ("sm_107a",),
-    "cake_mhc_train_fwd_map": ("sm_107a",),
-    "cake_mhc_train_fwd_map__ns96_g2_ol2l": ("sm_100a",),
-    "cake_mhc_train_fwd_map__nsx": ("sm_103a",),
-    "cake_mhc_train_fwd_map__nsx_ct": ("sm_103a",),
-    "cake_mhc_train_fwd_map__nsx_g2_ol2l": ("sm_100a", "sm_103a", "sm_107a"),
-    "cake_mhc_train_fwd_map__nsx_st5_mb1": ("sm_100a", "sm_103a", "sm_107a"),
-    "cake_mhc_train_fwd_map__tk_nsx_g2_ol2l_ct": ("sm_100a", "sm_103a"),
+    "cake_mhc_det_train_bwd_prepare": ("sm_100a", "sm_103a", "sm_107a"),
+    "cake_mhc_det_train_bwd_prepare__t128": ("sm_100a", "sm_103a", "sm_107a"),
+    "cake_mhc_det_train_bwd_reduce__pt32": ("sm_103a",),
+    "cake_mhc_det_train_bwd_reduce__pt64": ("sm_103a",),
+    "cake_mhc_det_train_bwd_reduce__s27_wcvt_fadd_fshfl": ("sm_100a",),
+    "cake_mhc_det_train_bwd_reduce__s27_wcvt_spred": ("sm_107a",),
+    "cake_mhc_det_train_bwd_reduce__wpu4": ("sm_107a",),
+    "cake_mhc_det_train_bwd_reduce__wpu4_fadd": ("sm_100a", "sm_107a"),
+    "cake_mhc_det_train_bwd_reduce__wpu4_spred": ("sm_100a",),
+    "cake_mhc_det_train_bwd_slab__dynl": ("sm_100a",),
+    "cake_mhc_det_train_bwd_slab__dynr": ("sm_100a", "sm_103a"),
+    "cake_mhc_det_train_bwd_slab__xrsg": ("sm_100a", "sm_107a"),
+    "cake_mhc_det_train_bwd_token__ao15_rae8_tma_ntr": ("sm_100a", "sm_103a", "sm_107a"),
+    "cake_mhc_det_train_bwd_token__ao22_rae7_pd1_ntr": ("sm_100a", "sm_103a", "sm_107a"),
+    "cake_mhc_det_train_bwd_token__ao22_rae7_pd1_tma_ntr": ("sm_100a", "sm_107a"),
+    "cake_mhc_det_train_bwd_token__ao22_rae7_rf3_pd1_l2l_ntr": ("sm_107a",),
+    "cake_mhc_det_train_bwd_token__dot_ao8": ("sm_100a", "sm_103a"),
+    "cake_mhc_det_train_bwd_token__dot_ao8_l2l": ("sm_107a",),
+    "cake_mhc_det_train_bwd_token__rt64": ("sm_100a", "sm_103a", "sm_107a"),
+    "cake_mhc_det_train_fn_split": ("sm_100a", "sm_103a", "sm_107a"),
+    "cake_mhc_det_train_fn_split__tv128": ("sm_100a", "sm_103a"),
+    "cake_mhc_det_train_fn_split__tv128_t128": ("sm_107a",),
+    "cake_mhc_det_train_fwd_coef__g2_el": ("sm_107a",),
+    "cake_mhc_det_train_fwd_coef__lp2_w8_adj": ("sm_100a", "sm_103a"),
+    "cake_mhc_det_train_fwd_coef__lp2_w8_adj_qe": ("sm_107a",),
+    "cake_mhc_det_train_fwd_coef__pfl2_qmt": ("sm_107a",),
+    "cake_mhc_det_train_fwd_coef__qe_mb10": ("sm_103a",),
+    "cake_mhc_det_train_fwd_coef__qe_mb10_pu4": ("sm_100a", "sm_103a"),
+    "cake_mhc_det_train_fwd_coef__qe_mb10_tree": ("sm_100a", "sm_103a", "sm_107a"),
+    "cake_mhc_det_train_fwd_coef__rt64": ("sm_100a", "sm_103a", "sm_107a"),
+    "cake_mhc_det_train_fwd_coef__st16_lp2_as_el_qd": ("sm_100a", "sm_103a", "sm_107a"),
+    "cake_mhc_det_train_fwd_coef__st16_w4_tree": ("sm_100a", "sm_103a", "sm_107a"),
+    "cake_mhc_det_train_fwd_coef__st8_lp2": ("sm_100a", "sm_103a"),
+    "cake_mhc_det_train_fwd_coef__st8_lp2_as_el_qd": ("sm_100a",),
+    "cake_mhc_det_train_fwd_coef__st8_lp2_tree_asel_qd": ("sm_107a",),
+    "cake_mhc_det_train_fwd_collapse": ("sm_100a", "sm_103a", "sm_107a"),
+    "cake_mhc_det_train_fwd_finish": ("sm_100a", "sm_103a"),
+    "cake_mhc_det_train_fwd_finish__r2": ("sm_107a",),
+    "cake_mhc_det_train_fwd_map": ("sm_107a",),
+    "cake_mhc_det_train_fwd_map__ns96_g2_ol2l": ("sm_100a",),
+    "cake_mhc_det_train_fwd_map__nsx": ("sm_103a",),
+    "cake_mhc_det_train_fwd_map__nsx_ct": ("sm_103a",),
+    "cake_mhc_det_train_fwd_map__nsx_g2_ol2l": ("sm_100a", "sm_103a", "sm_107a"),
+    "cake_mhc_det_train_fwd_map__nsx_st5_mb1": ("sm_100a", "sm_103a", "sm_107a"),
+    "cake_mhc_det_train_fwd_map__tk_nsx_g2_ol2l_ct": ("sm_100a", "sm_103a"),
 }
 # Libraries launched under several records (one record per selection rule, in registry order).
 MULTI_RECORDS = {
-    "cake_mhc_train_fn_split__tv128": ["cake_mhc_train_fn_split__tv128__t"],
-    "cake_mhc_train_fn_split__tv128_t128": ["cake_mhc_train_fn_split__tv128_t128__t"],
-    "cake_mhc_train_fwd_map__nsx_st5_mb1": [
-        "cake_mhc_train_fwd_map__nsx_st5_mb1",
-        "cake_mhc_train_fwd_map__nsx_st5_mb1__a3",
-        "cake_mhc_train_fwd_map__nsx_st5_mb1__a7",
+    "cake_mhc_det_train_fn_split__tv128": ["cake_mhc_det_train_fn_split__tv128__t"],
+    "cake_mhc_det_train_fn_split__tv128_t128": ["cake_mhc_det_train_fn_split__tv128_t128__t"],
+    "cake_mhc_det_train_fwd_map__nsx_st5_mb1": [
+        "cake_mhc_det_train_fwd_map__nsx_st5_mb1",
+        "cake_mhc_det_train_fwd_map__nsx_st5_mb1__a3",
+        "cake_mhc_det_train_fwd_map__nsx_st5_mb1__a7",
     ],
-    "cake_mhc_train_fwd_map__nsx": [
-        "cake_mhc_train_fwd_map__nsx",
-        "cake_mhc_train_fwd_map__nsx__tk",
+    "cake_mhc_det_train_fwd_map__nsx": [
+        "cake_mhc_det_train_fwd_map__nsx",
+        "cake_mhc_det_train_fwd_map__nsx__tk",
     ],
-    "cake_mhc_train_fwd_map__nsx_g2_ol2l": [
-        "cake_mhc_train_fwd_map__nsx_g2_ol2l",
-        "cake_mhc_train_fwd_map__nsx_g2_ol2l__a3",
-        "cake_mhc_train_fwd_map__nsx_g2_ol2l__a7",
+    "cake_mhc_det_train_fwd_map__nsx_g2_ol2l": [
+        "cake_mhc_det_train_fwd_map__nsx_g2_ol2l",
+        "cake_mhc_det_train_fwd_map__nsx_g2_ol2l__a3",
+        "cake_mhc_det_train_fwd_map__nsx_g2_ol2l__a7",
     ],
-    "cake_mhc_train_fwd_map": ["cake_mhc_train_fwd_map__hi"],
-    "cake_mhc_train_bwd_prepare": [
-        "cake_mhc_train_bwd_prepare__g2sm_le1024",
-        "cake_mhc_train_bwd_prepare__gt8192",
-        "cake_mhc_train_bwd_prepare__gt65536",
+    "cake_mhc_det_train_fwd_map": ["cake_mhc_det_train_fwd_map__hi"],
+    "cake_mhc_det_train_bwd_prepare": [
+        "cake_mhc_det_train_bwd_prepare__g2sm_le1024",
+        "cake_mhc_det_train_bwd_prepare__gt8192",
+        "cake_mhc_det_train_bwd_prepare__gt65536",
     ],
-    "cake_mhc_train_bwd_prepare__t128": [
-        "cake_mhc_train_bwd_prepare__t128",
-        "cake_mhc_train_bwd_prepare__t128__a3",
-        "cake_mhc_train_bwd_prepare__t128__a7",
+    "cake_mhc_det_train_bwd_prepare__t128": [
+        "cake_mhc_det_train_bwd_prepare__t128",
+        "cake_mhc_det_train_bwd_prepare__t128__a3",
+        "cake_mhc_det_train_bwd_prepare__t128__a7",
     ],
-    "cake_mhc_train_bwd_token__ao22_rae7_pd1_ntr": [
-        "cake_mhc_train_bwd_token__ao22_rae7_pd1_ntr",
-        "cake_mhc_train_bwd_token__ao22_rae7_pd1_ntr__a3",
-        "cake_mhc_train_bwd_token__ao22_rae7_pd1_ntr__a7",
+    "cake_mhc_det_train_bwd_token__ao22_rae7_pd1_ntr": [
+        "cake_mhc_det_train_bwd_token__ao22_rae7_pd1_ntr",
+        "cake_mhc_det_train_bwd_token__ao22_rae7_pd1_ntr__a3",
+        "cake_mhc_det_train_bwd_token__ao22_rae7_pd1_ntr__a7",
     ],
-    "cake_mhc_train_bwd_token__ao15_rae8_tma_ntr": [
-        "cake_mhc_train_bwd_token__ao15_rae8_tma_ntr",
-        "cake_mhc_train_bwd_token__ao15_rae8_tma_ntr__a3",
-        "cake_mhc_train_bwd_token__ao15_rae8_tma_ntr__a7",
+    "cake_mhc_det_train_bwd_token__ao15_rae8_tma_ntr": [
+        "cake_mhc_det_train_bwd_token__ao15_rae8_tma_ntr",
+        "cake_mhc_det_train_bwd_token__ao15_rae8_tma_ntr__a3",
+        "cake_mhc_det_train_bwd_token__ao15_rae8_tma_ntr__a7",
     ],
-    "cake_mhc_train_bwd_token__dot_ao8": [
-        "cake_mhc_train_bwd_token__dot_ao8",
-        "cake_mhc_train_bwd_token__dot_ao8__a3",
+    "cake_mhc_det_train_bwd_token__dot_ao8": [
+        "cake_mhc_det_train_bwd_token__dot_ao8",
+        "cake_mhc_det_train_bwd_token__dot_ao8__a3",
     ],
-    "cake_mhc_train_bwd_slab__xrsg": [
-        "cake_mhc_train_bwd_slab__xrsg",
-        "cake_mhc_train_bwd_slab__xrsg__a7",
+    "cake_mhc_det_train_bwd_slab__xrsg": [
+        "cake_mhc_det_train_bwd_slab__xrsg",
+        "cake_mhc_det_train_bwd_slab__xrsg__a7",
     ],
 }
 N_RECORDS, N_LIBRARIES = 60, 45
 RECORD_SCALARS = {
-    "cake_mhc_train_fn_split": {"want_t": 0},
-    "cake_mhc_train_fn_split__tv128__t": {"want_t": 1},
-    "cake_mhc_train_fn_split__tv128_t128__t": {"want_t": 1},
+    "cake_mhc_det_train_fn_split": {"want_t": 0},
+    "cake_mhc_det_train_fn_split__tv128__t": {"want_t": 1},
+    "cake_mhc_det_train_fn_split__tv128_t128__t": {"want_t": 1},
 }
 # The reference master's per-architecture tables of record (generated from the master text).
 TABLES = {
@@ -1090,134 +1090,134 @@ RULES_ROWS = (
     (65536, 216, 'sm_107a', 65536, True, 8, 4096, 432, 27, 1728, 216, 2432, 432, 152, 4096, 864, 131072, 65536, 65536, 55574784, 64542976, 'b16', 'tv128_t128', 256, 512, 'lp2_w8_adj_qe', 'ss_st4', 'dot_ao8_l2l', 'xrsg', 'wpu4_fadd', 411, 't128', 'r2'),
 )  # fmt: skip
 LAUNCH_FACTS = {
-    "cake_mhc_train_fn_split": ((256, 1, 1), 0, 1),
-    "cake_mhc_train_fn_split__tv128__t": ((256, 1, 1), 0, 1),
-    "cake_mhc_train_fn_split__tv128_t128__t": ((128, 1, 1), 0, 1),
-    "cake_mhc_train_fwd_map__nsx_st5_mb1": ((192, 1, 1), 144384, 1),
-    "cake_mhc_train_fwd_map__nsx": ((192, 1, 1), 115712, 2),
-    "cake_mhc_train_fwd_map__nsx__tk": ((192, 1, 1), 115712, 2),
-    "cake_mhc_train_fwd_map__nsx_ct": ((192, 1, 1), 114816, 2),
-    "cake_mhc_train_fwd_map__nsx_g2_ol2l": ((192, 1, 1), 115712, 2),
-    "cake_mhc_train_fwd_map__tk_nsx_g2_ol2l_ct": ((192, 1, 1), 114944, 2),
-    "cake_mhc_train_fwd_map__nsx_st5_mb1__a3": ((192, 1, 1), 144384, 1),
-    "cake_mhc_train_fwd_map__ns96_g2_ol2l": ((192, 1, 1), 115712, 2),
-    "cake_mhc_train_fwd_map__nsx_g2_ol2l__a3": ((192, 1, 1), 115712, 2),
-    "cake_mhc_train_fwd_map__nsx_st5_mb1__a7": ((192, 1, 1), 144384, 1),
-    "cake_mhc_train_fwd_map__nsx_g2_ol2l__a7": ((192, 1, 1), 115712, 2),
-    "cake_mhc_train_fwd_map__hi": ((192, 1, 1), 115712, 2),
-    "cake_mhc_train_fwd_coef__qe_mb10_tree": ((128, 1, 1), 0, 1),
-    "cake_mhc_train_fwd_coef__rt64": ((128, 1, 1), 0, 1),
-    "cake_mhc_train_fwd_coef__st16_w4_tree": ((128, 1, 1), 6400, 1),
-    "cake_mhc_train_fwd_coef__st16_lp2_as_el_qd": ((128, 1, 1), 12800, 1),
-    "cake_mhc_train_fwd_coef__qe_mb10": ((128, 1, 1), 0, 1),
-    "cake_mhc_train_fwd_coef__st8_lp2": ((128, 1, 1), 6400, 1),
-    "cake_mhc_train_fwd_coef__qe_mb10_pu4": ((128, 1, 1), 0, 1),
-    "cake_mhc_train_fwd_coef__lp2_w8_adj": ((128, 1, 1), 0, 1),
-    "cake_mhc_train_fwd_coef__st8_lp2_as_el_qd": ((128, 1, 1), 6400, 1),
-    "cake_mhc_train_fwd_coef__pfl2_qmt": ((128, 1, 1), 0, 1),
-    "cake_mhc_train_fwd_coef__g2_el": ((128, 1, 1), 25600, 1),
-    "cake_mhc_train_fwd_coef__st8_lp2_tree_asel_qd": ((128, 1, 1), 6400, 1),
-    "cake_mhc_train_fwd_coef__lp2_w8_adj_qe": ((128, 1, 1), 0, 1),
-    "cake_mhc_train_fwd_collapse": ((256, 1, 1), 0, 1),
-    "cake_mhc_train_fwd_finish": ((256, 1, 1), 0, 1),
-    "cake_mhc_train_fwd_finish__r2": ((256, 1, 1), 0, 1),
-    "cake_mhc_train_bwd_prepare__g2sm_le1024": ((256, 1, 1), 1280, 1),
-    "cake_mhc_train_bwd_prepare__t128": ((128, 1, 1), 640, 1),
-    "cake_mhc_train_bwd_prepare__t128__a3": ((128, 1, 1), 640, 1),
-    "cake_mhc_train_bwd_prepare__t128__a7": ((128, 1, 1), 640, 1),
-    "cake_mhc_train_bwd_prepare__gt8192": ((256, 1, 1), 1280, 1),
-    "cake_mhc_train_bwd_prepare__gt65536": ((256, 1, 1), 1280, 1),
-    "cake_mhc_train_bwd_token__ao22_rae7_pd1_ntr": ((256, 1, 1), 91136, 2),
-    "cake_mhc_train_bwd_token__ao15_rae8_tma_ntr": ((256, 1, 1), 91136, 2),
-    "cake_mhc_train_bwd_token__dot_ao8": ((256, 1, 1), 91136, 2),
-    "cake_mhc_train_bwd_token__ao22_rae7_pd1_ntr__a3": ((256, 1, 1), 91136, 2),
-    "cake_mhc_train_bwd_token__rt64": ((256, 1, 1), 71296, 2),
-    "cake_mhc_train_bwd_token__ao22_rae7_pd1_tma_ntr": ((256, 1, 1), 91136, 2),
-    "cake_mhc_train_bwd_token__dot_ao8__a3": ((256, 1, 1), 91136, 2),
-    "cake_mhc_train_bwd_token__ao15_rae8_tma_ntr__a3": ((256, 1, 1), 91136, 2),
-    "cake_mhc_train_bwd_token__ao22_rae7_rf3_pd1_l2l_ntr": ((256, 1, 1), 91136, 2),
-    "cake_mhc_train_bwd_token__ao22_rae7_pd1_ntr__a7": ((256, 1, 1), 91136, 2),
-    "cake_mhc_train_bwd_token__dot_ao8_l2l": ((256, 1, 1), 91136, 2),
-    "cake_mhc_train_bwd_token__ao15_rae8_tma_ntr__a7": ((256, 1, 1), 91136, 2),
-    "cake_mhc_train_bwd_slab__dynl": ((384, 1, 1), 228480, 1),
-    "cake_mhc_train_bwd_slab__dynr": ((384, 1, 1), 228480, 1),
-    "cake_mhc_train_bwd_slab__xrsg": ((384, 1, 1), 232448, 1),
-    "cake_mhc_train_bwd_slab__xrsg__a7": ((384, 1, 1), 232448, 1),
-    "cake_mhc_train_bwd_reduce__pt64": ((64, 1, 1), 2688, 1),
-    "cake_mhc_train_bwd_reduce__pt32": ((32, 1, 1), 2432, 1),
-    "cake_mhc_train_bwd_reduce__s27_wcvt_fadd_fshfl": ((256, 1, 1), 4224, 1),
-    "cake_mhc_train_bwd_reduce__wpu4_spred": ((256, 1, 1), 4224, 1),
-    "cake_mhc_train_bwd_reduce__wpu4_fadd": ((256, 1, 1), 4224, 1),
-    "cake_mhc_train_bwd_reduce__s27_wcvt_spred": ((256, 1, 1), 4224, 1),
-    "cake_mhc_train_bwd_reduce__wpu4": ((256, 1, 1), 4224, 1),
+    "cake_mhc_det_train_fn_split": ((256, 1, 1), 0, 1),
+    "cake_mhc_det_train_fn_split__tv128__t": ((256, 1, 1), 0, 1),
+    "cake_mhc_det_train_fn_split__tv128_t128__t": ((128, 1, 1), 0, 1),
+    "cake_mhc_det_train_fwd_map__nsx_st5_mb1": ((192, 1, 1), 144384, 1),
+    "cake_mhc_det_train_fwd_map__nsx": ((192, 1, 1), 115712, 2),
+    "cake_mhc_det_train_fwd_map__nsx__tk": ((192, 1, 1), 115712, 2),
+    "cake_mhc_det_train_fwd_map__nsx_ct": ((192, 1, 1), 114816, 2),
+    "cake_mhc_det_train_fwd_map__nsx_g2_ol2l": ((192, 1, 1), 115712, 2),
+    "cake_mhc_det_train_fwd_map__tk_nsx_g2_ol2l_ct": ((192, 1, 1), 114944, 2),
+    "cake_mhc_det_train_fwd_map__nsx_st5_mb1__a3": ((192, 1, 1), 144384, 1),
+    "cake_mhc_det_train_fwd_map__ns96_g2_ol2l": ((192, 1, 1), 115712, 2),
+    "cake_mhc_det_train_fwd_map__nsx_g2_ol2l__a3": ((192, 1, 1), 115712, 2),
+    "cake_mhc_det_train_fwd_map__nsx_st5_mb1__a7": ((192, 1, 1), 144384, 1),
+    "cake_mhc_det_train_fwd_map__nsx_g2_ol2l__a7": ((192, 1, 1), 115712, 2),
+    "cake_mhc_det_train_fwd_map__hi": ((192, 1, 1), 115712, 2),
+    "cake_mhc_det_train_fwd_coef__qe_mb10_tree": ((128, 1, 1), 0, 1),
+    "cake_mhc_det_train_fwd_coef__rt64": ((128, 1, 1), 0, 1),
+    "cake_mhc_det_train_fwd_coef__st16_w4_tree": ((128, 1, 1), 6400, 1),
+    "cake_mhc_det_train_fwd_coef__st16_lp2_as_el_qd": ((128, 1, 1), 12800, 1),
+    "cake_mhc_det_train_fwd_coef__qe_mb10": ((128, 1, 1), 0, 1),
+    "cake_mhc_det_train_fwd_coef__st8_lp2": ((128, 1, 1), 6400, 1),
+    "cake_mhc_det_train_fwd_coef__qe_mb10_pu4": ((128, 1, 1), 0, 1),
+    "cake_mhc_det_train_fwd_coef__lp2_w8_adj": ((128, 1, 1), 0, 1),
+    "cake_mhc_det_train_fwd_coef__st8_lp2_as_el_qd": ((128, 1, 1), 6400, 1),
+    "cake_mhc_det_train_fwd_coef__pfl2_qmt": ((128, 1, 1), 0, 1),
+    "cake_mhc_det_train_fwd_coef__g2_el": ((128, 1, 1), 25600, 1),
+    "cake_mhc_det_train_fwd_coef__st8_lp2_tree_asel_qd": ((128, 1, 1), 6400, 1),
+    "cake_mhc_det_train_fwd_coef__lp2_w8_adj_qe": ((128, 1, 1), 0, 1),
+    "cake_mhc_det_train_fwd_collapse": ((256, 1, 1), 0, 1),
+    "cake_mhc_det_train_fwd_finish": ((256, 1, 1), 0, 1),
+    "cake_mhc_det_train_fwd_finish__r2": ((256, 1, 1), 0, 1),
+    "cake_mhc_det_train_bwd_prepare__g2sm_le1024": ((256, 1, 1), 1280, 1),
+    "cake_mhc_det_train_bwd_prepare__t128": ((128, 1, 1), 640, 1),
+    "cake_mhc_det_train_bwd_prepare__t128__a3": ((128, 1, 1), 640, 1),
+    "cake_mhc_det_train_bwd_prepare__t128__a7": ((128, 1, 1), 640, 1),
+    "cake_mhc_det_train_bwd_prepare__gt8192": ((256, 1, 1), 1280, 1),
+    "cake_mhc_det_train_bwd_prepare__gt65536": ((256, 1, 1), 1280, 1),
+    "cake_mhc_det_train_bwd_token__ao22_rae7_pd1_ntr": ((256, 1, 1), 91136, 2),
+    "cake_mhc_det_train_bwd_token__ao15_rae8_tma_ntr": ((256, 1, 1), 91136, 2),
+    "cake_mhc_det_train_bwd_token__dot_ao8": ((256, 1, 1), 91136, 2),
+    "cake_mhc_det_train_bwd_token__ao22_rae7_pd1_ntr__a3": ((256, 1, 1), 91136, 2),
+    "cake_mhc_det_train_bwd_token__rt64": ((256, 1, 1), 71296, 2),
+    "cake_mhc_det_train_bwd_token__ao22_rae7_pd1_tma_ntr": ((256, 1, 1), 91136, 2),
+    "cake_mhc_det_train_bwd_token__dot_ao8__a3": ((256, 1, 1), 91136, 2),
+    "cake_mhc_det_train_bwd_token__ao15_rae8_tma_ntr__a3": ((256, 1, 1), 91136, 2),
+    "cake_mhc_det_train_bwd_token__ao22_rae7_rf3_pd1_l2l_ntr": ((256, 1, 1), 91136, 2),
+    "cake_mhc_det_train_bwd_token__ao22_rae7_pd1_ntr__a7": ((256, 1, 1), 91136, 2),
+    "cake_mhc_det_train_bwd_token__dot_ao8_l2l": ((256, 1, 1), 91136, 2),
+    "cake_mhc_det_train_bwd_token__ao15_rae8_tma_ntr__a7": ((256, 1, 1), 91136, 2),
+    "cake_mhc_det_train_bwd_slab__dynl": ((384, 1, 1), 228480, 1),
+    "cake_mhc_det_train_bwd_slab__dynr": ((384, 1, 1), 228480, 1),
+    "cake_mhc_det_train_bwd_slab__xrsg": ((384, 1, 1), 232448, 1),
+    "cake_mhc_det_train_bwd_slab__xrsg__a7": ((384, 1, 1), 232448, 1),
+    "cake_mhc_det_train_bwd_reduce__pt64": ((64, 1, 1), 2688, 1),
+    "cake_mhc_det_train_bwd_reduce__pt32": ((32, 1, 1), 2432, 1),
+    "cake_mhc_det_train_bwd_reduce__s27_wcvt_fadd_fshfl": ((256, 1, 1), 4224, 1),
+    "cake_mhc_det_train_bwd_reduce__wpu4_spred": ((256, 1, 1), 4224, 1),
+    "cake_mhc_det_train_bwd_reduce__wpu4_fadd": ((256, 1, 1), 4224, 1),
+    "cake_mhc_det_train_bwd_reduce__s27_wcvt_spred": ((256, 1, 1), 4224, 1),
+    "cake_mhc_det_train_bwd_reduce__wpu4": ((256, 1, 1), 4224, 1),
 }
 RECORD_ARCHES = {
-    "cake_mhc_train_fn_split": ("sm_100a", "sm_103a", "sm_107a"),
-    "cake_mhc_train_fn_split__tv128__t": ("sm_100a", "sm_103a"),
-    "cake_mhc_train_fn_split__tv128_t128__t": ("sm_107a",),
-    "cake_mhc_train_fwd_map__nsx_st5_mb1": ("sm_103a",),
-    "cake_mhc_train_fwd_map__nsx": ("sm_103a",),
-    "cake_mhc_train_fwd_map__nsx__tk": ("sm_103a",),
-    "cake_mhc_train_fwd_map__nsx_ct": ("sm_103a",),
-    "cake_mhc_train_fwd_map__nsx_g2_ol2l": ("sm_103a",),
-    "cake_mhc_train_fwd_map__tk_nsx_g2_ol2l_ct": ("sm_100a", "sm_103a"),
-    "cake_mhc_train_fwd_map__nsx_st5_mb1__a3": ("sm_100a",),
-    "cake_mhc_train_fwd_map__ns96_g2_ol2l": ("sm_100a",),
-    "cake_mhc_train_fwd_map__nsx_g2_ol2l__a3": ("sm_100a",),
-    "cake_mhc_train_fwd_map__nsx_st5_mb1__a7": ("sm_107a",),
-    "cake_mhc_train_fwd_map__nsx_g2_ol2l__a7": ("sm_107a",),
-    "cake_mhc_train_fwd_map__hi": ("sm_107a",),
-    "cake_mhc_train_fwd_coef__qe_mb10_tree": ("sm_100a", "sm_103a", "sm_107a"),
-    "cake_mhc_train_fwd_coef__st16_w4_tree": ("sm_100a", "sm_103a", "sm_107a"),
-    "cake_mhc_train_fwd_coef__st16_lp2_as_el_qd": ("sm_100a", "sm_103a", "sm_107a"),
-    "cake_mhc_train_fwd_coef__qe_mb10": ("sm_103a",),
-    "cake_mhc_train_fwd_coef__st8_lp2": ("sm_100a", "sm_103a"),
-    "cake_mhc_train_fwd_coef__qe_mb10_pu4": ("sm_100a", "sm_103a"),
-    "cake_mhc_train_fwd_coef__lp2_w8_adj": ("sm_100a", "sm_103a"),
-    "cake_mhc_train_fwd_coef__st8_lp2_as_el_qd": ("sm_100a",),
-    "cake_mhc_train_fwd_coef__pfl2_qmt": ("sm_107a",),
-    "cake_mhc_train_fwd_coef__g2_el": ("sm_107a",),
-    "cake_mhc_train_fwd_coef__st8_lp2_tree_asel_qd": ("sm_107a",),
-    "cake_mhc_train_fwd_coef__lp2_w8_adj_qe": ("sm_107a",),
-    "cake_mhc_train_fwd_coef__rt64": ("sm_100a", "sm_103a", "sm_107a"),
-    "cake_mhc_train_fwd_collapse": ("sm_100a", "sm_103a", "sm_107a"),
-    "cake_mhc_train_fwd_finish": ("sm_100a", "sm_103a"),
-    "cake_mhc_train_fwd_finish__r2": ("sm_107a",),
-    "cake_mhc_train_bwd_prepare__g2sm_le1024": ("sm_100a",),
-    "cake_mhc_train_bwd_prepare__t128": ("sm_103a",),
-    "cake_mhc_train_bwd_prepare__t128__a3": ("sm_100a",),
-    "cake_mhc_train_bwd_prepare__t128__a7": ("sm_107a",),
-    "cake_mhc_train_bwd_prepare__gt8192": ("sm_100a", "sm_103a"),
-    "cake_mhc_train_bwd_prepare__gt65536": ("sm_107a",),
-    "cake_mhc_train_bwd_token__ao22_rae7_pd1_ntr": ("sm_103a",),
-    "cake_mhc_train_bwd_token__ao15_rae8_tma_ntr": ("sm_103a",),
-    "cake_mhc_train_bwd_token__dot_ao8": ("sm_103a",),
-    "cake_mhc_train_bwd_token__ao22_rae7_pd1_ntr__a3": ("sm_100a",),
-    "cake_mhc_train_bwd_token__ao22_rae7_pd1_tma_ntr": ("sm_100a", "sm_107a"),
-    "cake_mhc_train_bwd_token__dot_ao8__a3": ("sm_100a",),
-    "cake_mhc_train_bwd_token__ao15_rae8_tma_ntr__a3": ("sm_100a",),
-    "cake_mhc_train_bwd_token__ao22_rae7_rf3_pd1_l2l_ntr": ("sm_107a",),
-    "cake_mhc_train_bwd_token__ao22_rae7_pd1_ntr__a7": ("sm_107a",),
-    "cake_mhc_train_bwd_token__dot_ao8_l2l": ("sm_107a",),
-    "cake_mhc_train_bwd_token__ao15_rae8_tma_ntr__a7": ("sm_107a",),
-    "cake_mhc_train_bwd_token__rt64": ("sm_100a", "sm_103a", "sm_107a"),
-    "cake_mhc_train_bwd_slab__dynl": ("sm_100a",),
-    "cake_mhc_train_bwd_slab__dynr": ("sm_100a", "sm_103a"),
-    "cake_mhc_train_bwd_slab__xrsg": ("sm_100a",),
-    "cake_mhc_train_bwd_slab__xrsg__a7": ("sm_107a",),
-    "cake_mhc_train_bwd_reduce__pt64": ("sm_103a",),
-    "cake_mhc_train_bwd_reduce__pt32": ("sm_103a",),
-    "cake_mhc_train_bwd_reduce__s27_wcvt_fadd_fshfl": ("sm_100a",),
-    "cake_mhc_train_bwd_reduce__wpu4_spred": ("sm_100a",),
-    "cake_mhc_train_bwd_reduce__wpu4_fadd": ("sm_100a", "sm_107a"),
-    "cake_mhc_train_bwd_reduce__s27_wcvt_spred": ("sm_107a",),
-    "cake_mhc_train_bwd_reduce__wpu4": ("sm_107a",),
+    "cake_mhc_det_train_fn_split": ("sm_100a", "sm_103a", "sm_107a"),
+    "cake_mhc_det_train_fn_split__tv128__t": ("sm_100a", "sm_103a"),
+    "cake_mhc_det_train_fn_split__tv128_t128__t": ("sm_107a",),
+    "cake_mhc_det_train_fwd_map__nsx_st5_mb1": ("sm_103a",),
+    "cake_mhc_det_train_fwd_map__nsx": ("sm_103a",),
+    "cake_mhc_det_train_fwd_map__nsx__tk": ("sm_103a",),
+    "cake_mhc_det_train_fwd_map__nsx_ct": ("sm_103a",),
+    "cake_mhc_det_train_fwd_map__nsx_g2_ol2l": ("sm_103a",),
+    "cake_mhc_det_train_fwd_map__tk_nsx_g2_ol2l_ct": ("sm_100a", "sm_103a"),
+    "cake_mhc_det_train_fwd_map__nsx_st5_mb1__a3": ("sm_100a",),
+    "cake_mhc_det_train_fwd_map__ns96_g2_ol2l": ("sm_100a",),
+    "cake_mhc_det_train_fwd_map__nsx_g2_ol2l__a3": ("sm_100a",),
+    "cake_mhc_det_train_fwd_map__nsx_st5_mb1__a7": ("sm_107a",),
+    "cake_mhc_det_train_fwd_map__nsx_g2_ol2l__a7": ("sm_107a",),
+    "cake_mhc_det_train_fwd_map__hi": ("sm_107a",),
+    "cake_mhc_det_train_fwd_coef__qe_mb10_tree": ("sm_100a", "sm_103a", "sm_107a"),
+    "cake_mhc_det_train_fwd_coef__st16_w4_tree": ("sm_100a", "sm_103a", "sm_107a"),
+    "cake_mhc_det_train_fwd_coef__st16_lp2_as_el_qd": ("sm_100a", "sm_103a", "sm_107a"),
+    "cake_mhc_det_train_fwd_coef__qe_mb10": ("sm_103a",),
+    "cake_mhc_det_train_fwd_coef__st8_lp2": ("sm_100a", "sm_103a"),
+    "cake_mhc_det_train_fwd_coef__qe_mb10_pu4": ("sm_100a", "sm_103a"),
+    "cake_mhc_det_train_fwd_coef__lp2_w8_adj": ("sm_100a", "sm_103a"),
+    "cake_mhc_det_train_fwd_coef__st8_lp2_as_el_qd": ("sm_100a",),
+    "cake_mhc_det_train_fwd_coef__pfl2_qmt": ("sm_107a",),
+    "cake_mhc_det_train_fwd_coef__g2_el": ("sm_107a",),
+    "cake_mhc_det_train_fwd_coef__st8_lp2_tree_asel_qd": ("sm_107a",),
+    "cake_mhc_det_train_fwd_coef__lp2_w8_adj_qe": ("sm_107a",),
+    "cake_mhc_det_train_fwd_coef__rt64": ("sm_100a", "sm_103a", "sm_107a"),
+    "cake_mhc_det_train_fwd_collapse": ("sm_100a", "sm_103a", "sm_107a"),
+    "cake_mhc_det_train_fwd_finish": ("sm_100a", "sm_103a"),
+    "cake_mhc_det_train_fwd_finish__r2": ("sm_107a",),
+    "cake_mhc_det_train_bwd_prepare__g2sm_le1024": ("sm_100a",),
+    "cake_mhc_det_train_bwd_prepare__t128": ("sm_103a",),
+    "cake_mhc_det_train_bwd_prepare__t128__a3": ("sm_100a",),
+    "cake_mhc_det_train_bwd_prepare__t128__a7": ("sm_107a",),
+    "cake_mhc_det_train_bwd_prepare__gt8192": ("sm_100a", "sm_103a"),
+    "cake_mhc_det_train_bwd_prepare__gt65536": ("sm_107a",),
+    "cake_mhc_det_train_bwd_token__ao22_rae7_pd1_ntr": ("sm_103a",),
+    "cake_mhc_det_train_bwd_token__ao15_rae8_tma_ntr": ("sm_103a",),
+    "cake_mhc_det_train_bwd_token__dot_ao8": ("sm_103a",),
+    "cake_mhc_det_train_bwd_token__ao22_rae7_pd1_ntr__a3": ("sm_100a",),
+    "cake_mhc_det_train_bwd_token__ao22_rae7_pd1_tma_ntr": ("sm_100a", "sm_107a"),
+    "cake_mhc_det_train_bwd_token__dot_ao8__a3": ("sm_100a",),
+    "cake_mhc_det_train_bwd_token__ao15_rae8_tma_ntr__a3": ("sm_100a",),
+    "cake_mhc_det_train_bwd_token__ao22_rae7_rf3_pd1_l2l_ntr": ("sm_107a",),
+    "cake_mhc_det_train_bwd_token__ao22_rae7_pd1_ntr__a7": ("sm_107a",),
+    "cake_mhc_det_train_bwd_token__dot_ao8_l2l": ("sm_107a",),
+    "cake_mhc_det_train_bwd_token__ao15_rae8_tma_ntr__a7": ("sm_107a",),
+    "cake_mhc_det_train_bwd_token__rt64": ("sm_100a", "sm_103a", "sm_107a"),
+    "cake_mhc_det_train_bwd_slab__dynl": ("sm_100a",),
+    "cake_mhc_det_train_bwd_slab__dynr": ("sm_100a", "sm_103a"),
+    "cake_mhc_det_train_bwd_slab__xrsg": ("sm_100a",),
+    "cake_mhc_det_train_bwd_slab__xrsg__a7": ("sm_107a",),
+    "cake_mhc_det_train_bwd_reduce__pt64": ("sm_103a",),
+    "cake_mhc_det_train_bwd_reduce__pt32": ("sm_103a",),
+    "cake_mhc_det_train_bwd_reduce__s27_wcvt_fadd_fshfl": ("sm_100a",),
+    "cake_mhc_det_train_bwd_reduce__wpu4_spred": ("sm_100a",),
+    "cake_mhc_det_train_bwd_reduce__wpu4_fadd": ("sm_100a", "sm_107a"),
+    "cake_mhc_det_train_bwd_reduce__s27_wcvt_spred": ("sm_107a",),
+    "cake_mhc_det_train_bwd_reduce__wpu4": ("sm_107a",),
 }
 # The backward prepare's CTA forms of record -> library (generated from the records; the production record's library
 # everywhere, the 128-thread one-token form's where k5_program routes it).
 K5_FORM_LIBRARY = {
-    "production": "cake_mhc_train_bwd_prepare",
-    "t128": "cake_mhc_train_bwd_prepare__t128",
+    "production": "cake_mhc_det_train_bwd_prepare",
+    "t128": "cake_mhc_det_train_bwd_prepare__t128",
 }
 K5_FORM_OF_LIBRARY = {library: form for form, library in K5_FORM_LIBRARY.items()}
 # The token-count bands (above, at_most] where the per-call PDL attribute is off, per architecture, edge and call path
@@ -1256,8 +1256,8 @@ PDL_OFF_BANDS = {
     "sm_107a": {},
 }
 EVERYWHERE = {
-    "cake_mhc_train_fwd_collapse",
-    "cake_mhc_train_bwd_prepare",
+    "cake_mhc_det_train_fwd_collapse",
+    "cake_mhc_det_train_bwd_prepare",
 }
 # The residual mixing's record per architecture (when the master defines FWD_FINISH_PROGRAM; the production
 # record everywhere otherwise).
@@ -1270,11 +1270,11 @@ LIBRARIES = sorted(LIBRARY_ARCHES)
 # the mapping pass, on sm_100a and sm_103a; K2 on every architecture; K6 on sm_107a; K7 on sm_100a and sm_103a; K8
 # on sm_100a and sm_107a).
 PROGRAM_RULE_KERNELS = {
-    "cake_mhc_train_fwd_map": (MAP_LIBRARY, "fwd_map_program"),
-    "cake_mhc_train_fwd_coef": (COEF_LIBRARY, "fwd_coef_program"),
-    "cake_mhc_train_bwd_token": (TOKEN_LIBRARY, "bwd_token_program"),
-    "cake_mhc_train_bwd_slab": (SLAB_LIBRARY, "bwd_slab_program"),
-    "cake_mhc_train_bwd_reduce": (REDUCE_LIBRARY, "bwd_reduce_program"),
+    "cake_mhc_det_train_fwd_map": (MAP_LIBRARY, "fwd_map_program"),
+    "cake_mhc_det_train_fwd_coef": (COEF_LIBRARY, "fwd_coef_program"),
+    "cake_mhc_det_train_bwd_token": (TOKEN_LIBRARY, "bwd_token_program"),
+    "cake_mhc_det_train_bwd_slab": (SLAB_LIBRARY, "bwd_slab_program"),
+    "cake_mhc_det_train_bwd_reduce": (REDUCE_LIBRARY, "bwd_reduce_program"),
 }
 
 
@@ -1735,7 +1735,7 @@ def test_records_are_consistent() -> None:
     assert len(modules) == len(RECORD_ARCHES) == N_RECORDS
     libraries = sorted({record["library"] for record in modules.values()})
     assert len(libraries) == N_LIBRARIES and all(
-        name.startswith("cake_mhc_train_") for name in libraries
+        name.startswith("cake_mhc_det_train_") for name in libraries
     )
     assert libraries == LIBRARIES
     assert set(libraries) == {
@@ -1775,7 +1775,7 @@ def test_records_are_consistent() -> None:
         )
         assert library_arches == LIBRARY_ARCHES[record["library"]], name
         assert set(record["arches"]) <= set(library_arches), name
-        if _is(name, "cake_mhc_train_bwd_prepare"):
+        if _is(name, "cake_mhc_det_train_bwd_prepare"):
             form = K5_FORM_OF_LIBRARY[
                 record["library"]
             ]  # the CTA form the record launches (its library)
@@ -1811,7 +1811,7 @@ def test_records_are_consistent() -> None:
             assert rule["kind"] in loader.SELECT_RULE_KINDS, name
             if rule["kind"] == "chunk_rows_band":
                 assert set(rule) == {"kind", "ranges"} and _is(
-                    name, "cake_mhc_train_bwd_token"
+                    name, "cake_mhc_det_train_bwd_token"
                 ), name
                 assert all(
                     len(span) == 2 and span[0] >= 0 for span in rule["ranges"]
@@ -1850,7 +1850,7 @@ def test_records_are_consistent() -> None:
                 assert set(rule) >= {"kind", "above", "at_most"}, name
             if rule["kind"] == "units_fit":
                 assert set(rule) == {"kind", "above", "at_most", "fit"} and _is(
-                    name, "cake_mhc_train_fwd_map"
+                    name, "cake_mhc_det_train_fwd_map"
                 ), name
             if rule["kind"] == "ctas_band":
                 assert set(rule) == {
@@ -1858,7 +1858,7 @@ def test_records_are_consistent() -> None:
                     "hi_inclusive",
                 }, name  # fmt: skip
                 assert rule["tile_rows"] == 8 and _is(
-                    name, "cake_mhc_train_fwd_coef"
+                    name, "cake_mhc_det_train_fwd_coef"
                 ), name
                 assert rule["lo_ctas_per_sm"] in (None, 1, 10, 12) and rule[
                     "hi_ctas_per_sm"
@@ -1867,9 +1867,9 @@ def test_records_are_consistent() -> None:
                 assert set(rule) == {"kind", "above", "at_most"}, name
                 assert _is(
                     name,
-                    "cake_mhc_train_fwd_map",
-                    "cake_mhc_train_bwd_reduce",
-                    "cake_mhc_train_bwd_prepare",
+                    "cake_mhc_det_train_fwd_map",
+                    "cake_mhc_det_train_bwd_reduce",
+                    "cake_mhc_det_train_bwd_prepare",
                 ), name
         # the kernel parameters carry logical names; the grid triple and the per-call ``enable_pdl`` switch of a
         # ``use_pdl="runtime"`` record are the call's own arguments (no logical name)
@@ -1951,7 +1951,7 @@ def test_records_are_consistent() -> None:
         reduces = _first_programs(loader.bwd_reduce_program, arch, sms)
         # the token-owner run-time-count record closes the token-owner records
         assert libs(loader.ROUTES[arch]["bwd_finish_h4096"]) == [
-            split, *tokens, "cake_mhc_train_bwd_token__rt64", *slabs, *[REDUCE_LIBRARY[p] for p in reduces]
+            split, *tokens, "cake_mhc_det_train_bwd_token__rt64", *slabs, *[REDUCE_LIBRARY[p] for p in reduces]
         ], arch  # fmt: skip
         assert loader.ROUTES[arch]["bwd_finish_h4096"][0] == f"{split}__t"
         # the fn split records launch their program's fixed grid (the rules' fn_split_grid / fn_split_grid_t columns)
@@ -1966,12 +1966,12 @@ def test_records_are_consistent() -> None:
         maps = [
             n
             for n in libs(loader.ROUTES[arch]["fwd_prepare_h4096"])
-            if n.startswith("cake_mhc_train_fwd_map")
+            if n.startswith("cake_mhc_det_train_fwd_map")
         ]
         coefs = [
             n
             for n in libs(loader.ROUTES[arch]["fwd_prepare_h4096"])
-            if n.startswith("cake_mhc_train_fwd_coef")
+            if n.startswith("cake_mhc_det_train_fwd_coef")
         ]
         assert set(maps) == {
             MAP_LIBRARY[loader.fwd_map_program(T, sm, arch)]
@@ -1979,7 +1979,7 @@ def test_records_are_consistent() -> None:
             for sm in SM_COUNTS
         }, arch
         # the coefficient-pass records the rules dispatch, then the run-time-count record
-        assert coefs[-1] == "cake_mhc_train_fwd_coef__rt64", arch
+        assert coefs[-1] == "cake_mhc_det_train_fwd_coef__rt64", arch
         assert set(coefs[:-1]) == {
             COEF_LIBRARY[loader.fwd_coef_program(T, sm, arch)]
             for T in DISPATCH_T
@@ -1992,7 +1992,7 @@ def test_records_are_consistent() -> None:
         )
         assert (
             loader.ROUTES[arch]["fwd_prepare_h4096"][-1]
-            == "cake_mhc_train_fwd_collapse"
+            == "cake_mhc_det_train_fwd_collapse"
         )
         assert loader.ROUTES[arch]["fwd_finish_h4096"] == [FINISH_OF[arch]], arch
         assert (
@@ -2014,8 +2014,8 @@ def test_records_are_consistent() -> None:
         assert modules[name]["role"] == (
             "fn_split_fwd" if scalars["want_t"] == 0 else "fn_split_bwd"
         ), name
-        assert _is(name, "cake_mhc_train_fn_split")
-    assert {n for n in modules if _is(n, "cake_mhc_train_fn_split")} == set(
+        assert _is(name, "cake_mhc_det_train_fn_split")
+    assert {n for n in modules if _is(n, "cake_mhc_det_train_fn_split")} == set(
         RECORD_SCALARS
     )
 
@@ -2039,15 +2039,15 @@ def test_every_call_selects_one_record_per_dispatched_kernel(
         for kind in ("fwd_prepare", "fwd_recompute"):
             selected = loader.selected_modules(arch, 4096, kind, rows=T, sm_count=sm)
             assert (
-                only(selected, "cake_mhc_train_fn_split")
+                only(selected, "cake_mhc_det_train_fn_split")
                 == SPLIT_LIBRARY[loader.fn_split_program(arch, 0)]
             )
             assert (
-                only(selected, "cake_mhc_train_fwd_map")
+                only(selected, "cake_mhc_det_train_fwd_map")
                 == MAP_LIBRARY[loader.fwd_map_program(T, sm, arch)]
             ), (arch, sm, T)
             assert (
-                only(selected, "cake_mhc_train_fwd_coef")
+                only(selected, "cake_mhc_det_train_fwd_coef")
                 == COEF_LIBRARY[loader.fwd_coef_program(T, sm, arch)]
             ), (arch, sm, T)
             others = [
@@ -2055,13 +2055,13 @@ def test_every_call_selects_one_record_per_dispatched_kernel(
                 for n in selected
                 if not _is(
                     n,
-                    "cake_mhc_train_fn_split",
-                    "cake_mhc_train_fwd_map",
-                    "cake_mhc_train_fwd_coef",
+                    "cake_mhc_det_train_fn_split",
+                    "cake_mhc_det_train_fwd_map",
+                    "cake_mhc_det_train_fwd_coef",
                 )
             ]
             assert others == (
-                ["cake_mhc_train_fwd_collapse"] if kind == "fwd_prepare" else []
+                ["cake_mhc_det_train_fwd_collapse"] if kind == "fwd_prepare" else []
             ), (arch, sm, T, kind)
             assert list(selected) == [
                 n for n in loader.route_modules(arch, 4096, kind) if n in selected
@@ -2070,19 +2070,19 @@ def test_every_call_selects_one_record_per_dispatched_kernel(
             arch, 4096, "bwd_finish", rows=T, sm_count=sm
         )
         assert (
-            only(selected, "cake_mhc_train_fn_split")
+            only(selected, "cake_mhc_det_train_fn_split")
             == SPLIT_LIBRARY[loader.fn_split_program(arch, 1)]
         )
         assert (
-            only(selected, "cake_mhc_train_bwd_token")
+            only(selected, "cake_mhc_det_train_bwd_token")
             == TOKEN_LIBRARY[loader.bwd_token_program(T, sm, arch)]
         ), (arch, sm, T)
         assert (
-            only(selected, "cake_mhc_train_bwd_slab")
+            only(selected, "cake_mhc_det_train_bwd_slab")
             == SLAB_LIBRARY[loader.bwd_slab_program(T, sm, arch)]
         ), (arch, sm, T)
         assert (
-            only(selected, "cake_mhc_train_bwd_reduce")
+            only(selected, "cake_mhc_det_train_bwd_reduce")
             == REDUCE_LIBRARY[loader.bwd_reduce_program(T, sm, arch)]
         ), (arch, sm, T)
         assert len(selected) == 4 and list(selected) == [
@@ -2099,7 +2099,7 @@ def test_every_call_selects_one_record_per_dispatched_kernel(
         form = loader.k5_program(T, sm, arch)
         assert (
             len(selected) == 1
-            and only(selected, "cake_mhc_train_bwd_prepare") == K5_FORM_LIBRARY[form]
+            and only(selected, "cake_mhc_det_train_bwd_prepare") == K5_FORM_LIBRARY[form]
         ), (arch, sm, T)
         rule5 = modules[selected[0]]["grid_rule"]
         want5 = -(-T // rule5["rows_per_cta"])
@@ -2131,12 +2131,12 @@ def test_pdl_only_where_the_kernel_waits_for_the_preceding_grid() -> None:
         name: (
             "runtime"
             if name in runtime
-            else not _is(name, "cake_mhc_train_fn_split", "cake_mhc_train_fwd_map")
+            else not _is(name, "cake_mhc_det_train_fn_split", "cake_mhc_det_train_fwd_map")
         )
         for name in loader.MODULES
     }
     assert runtime == {name for name in loader.MODULES if _is(name, *loader.PDL_EDGES)}
-    n_map = sum(1 for name in loader.MODULES if _is(name, "cake_mhc_train_fwd_map"))
+    n_map = sum(1 for name in loader.MODULES if _is(name, "cake_mhc_det_train_fwd_map"))
     assert (
         sum(1 for value in pdl.values() if value is False)
         == len(RECORD_SCALARS) + n_map
@@ -2146,7 +2146,7 @@ def test_pdl_only_where_the_kernel_waits_for_the_preceding_grid() -> None:
     # one record of each layout -- the forward one (want_t 0) opens fwd_prepare / fwd_recompute, the transposed one
     # (want_t 1) opens bwd_finish.
     assert {
-        name for name in loader.MODULES if _is(name, "cake_mhc_train_fn_split")
+        name for name in loader.MODULES if _is(name, "cake_mhc_det_train_fn_split")
     } == set(RECORD_SCALARS)
     assert all(scalars.get("want_t") in (0, 1) for scalars in RECORD_SCALARS.values())
     assert {loader.MODULES[name]["library"] for name in RECORD_SCALARS} == set(
@@ -2179,7 +2179,7 @@ def test_pdl_bands_of_record() -> None:
     assert loader.PDL_OFF_BANDS == PDL_OFF_BANDS
     assert tuple(loader.PDL_OFF_BANDS) == ARCHES
     assert set(loader.PDL_EDGES) == {
-        "cake_mhc_train_fwd_collapse", "cake_mhc_train_bwd_prepare", "cake_mhc_train_bwd_slab", "cake_mhc_train_bwd_reduce"
+        "cake_mhc_det_train_fwd_collapse", "cake_mhc_det_train_bwd_prepare", "cake_mhc_det_train_bwd_slab", "cake_mhc_det_train_bwd_reduce"
     }  # fmt: skip
     rows_of_record = {row["T"] for row in _rows()}
     for arch, edges in loader.PDL_OFF_BANDS.items():
@@ -2238,9 +2238,9 @@ def test_pdl_bands_of_record() -> None:
                     assert loader.enable_pdl(name, T, arch, path) == (
                         0 if off else 1
                     ), (name, arch, path, T)
-    assert loader.enable_pdl("cake_mhc_train_fn_split", 1024, "sm_103a", "forward") == 1
+    assert loader.enable_pdl("cake_mhc_det_train_fn_split", 1024, "sm_103a", "forward") == 1
     with pytest.raises(ValueError, match="call path"):
-        loader.enable_pdl("cake_mhc_train_fwd_collapse", 1024, "sm_103a", "other")
+        loader.enable_pdl("cake_mhc_det_train_fwd_collapse", 1024, "sm_103a", "other")
 
 
 @pytest.mark.cpu_only
@@ -2272,7 +2272,7 @@ def test_launch_facts_of_record() -> None:
             library
         )  # the records of a library agree on their launch
     pools = {4 * 28672 + 1024: 2, 3 * 28672 + 1024: 2, 5 * 28672 + 1024: 1}
-    for name in (n for n in loader.MODULES if _is(n, "cake_mhc_train_fwd_map")):
+    for name in (n for n in loader.MODULES if _is(n, "cake_mhc_det_train_fwd_map")):
         block, smem, pcs = facts[name]
         if loader.MODULES[name]["library"].endswith("_ct"):
             # the tail-control forms keep the control records after the ring, not in the 1024-byte prefix:
@@ -2281,10 +2281,10 @@ def test_launch_facts_of_record() -> None:
             continue
         assert block == (192, 1, 1) and smem in pools and pcs == pools[smem], name
     for name, record in loader.MODULES.items():
-        if _is(name, "cake_mhc_train_fwd_coef"):
+        if _is(name, "cake_mhc_det_train_fwd_coef"):
             want = (
                 ((512, 1, 1), 0, 1)
-                if record["library"] == "cake_mhc_train_fwd_coef"
+                if record["library"] == "cake_mhc_det_train_fwd_coef"
                 else None
             )
             if want is None:
@@ -2354,7 +2354,7 @@ def test_launch_grids_follow_the_rules(
                 == (row[column], 1, 1)
                 == (loader.fn_split_grid(arch, want_t), 1, 1)
             ), (arch, selected)
-        for name in (n for n in modules if _is(n, "cake_mhc_train_fwd_map")):
+        for name in (n for n in modules if _is(n, "cake_mhc_det_train_fwd_map")):
             persistent = modules[name]["grid_rule"].get("ctas_per_sm")
             if persistent:
                 # persistent CTAs per SM: min(ctas_per_sm x SMs, units); equal to k1_grid exactly where the record
@@ -2365,7 +2365,7 @@ def test_launch_grids_follow_the_rules(
                 continue
             assert grid(name) == (row["k1_grid"], 1, 1), name
         program_of = {library: program for program, library in COEF_LIBRARY.items()}
-        for name in (n for n in modules if _is(n, "cake_mhc_train_fwd_coef")):
+        for name in (n for n in modules if _is(n, "cake_mhc_det_train_fwd_coef")):
             program = program_of.get(modules[name]["library"])
             tokens = 8 if name in RUN_TIME_ITERS else COEF_TOKENS_PER_CTA[program]
             assert grid(name) == (-(-T // tokens), 1, 1), name
@@ -2377,7 +2377,7 @@ def test_launch_grids_follow_the_rules(
         # One trip per CTA (the production forms): two column halves per token for the collapse, four tokens
         # times two halves per CTA for the residual mixing, two tokens per CTA for the backward prepare.
         assert (
-            grid("cake_mhc_train_fwd_collapse")
+            grid("cake_mhc_det_train_fwd_collapse")
             == (row["k3_grid"], 1, 1)
             == (2 * T, 1, 1)
         )
@@ -2397,7 +2397,7 @@ def test_launch_grids_follow_the_rules(
         # the backward prepare: every record's own rule (the form's one-trip grid ceil(T / rows_per_cta), or
         # min(ceil(T / 2), grid_per_sm x SMs) on the production band record); the record the call selects launches the
         # row's k5_grid and is of the library of the row's CTA form (k5_program)
-        for name in (n for n in modules if _is(n, "cake_mhc_train_bwd_prepare")):
+        for name in (n for n in modules if _is(n, "cake_mhc_det_train_bwd_prepare")):
             per_sm = modules[name]["grid_rule"]["grid_per_sm"]
             trip = -(-T // modules[name]["grid_rule"]["rows_per_cta"])
             want = min(trip, per_sm * sm) if per_sm else trip
@@ -2429,7 +2429,7 @@ def test_launch_grids_follow_the_rules(
             assert len(bands) == 1, (arch, T, bands)
             _, at_most, per_sm = bands[0]
             assert row["k5_grid"] == min(-(-T // rows5), per_sm * sm), (arch, sm, T)
-            assert selected == f"cake_mhc_train_bwd_prepare__g{per_sm}sm_le{at_most}", (
+            assert selected == f"cake_mhc_det_train_bwd_prepare__g{per_sm}sm_le{at_most}", (
                 arch,
                 T,
                 selected,
@@ -2439,7 +2439,7 @@ def test_launch_grids_follow_the_rules(
             assert selected == K5_FORM_LIBRARY[form] or selected.startswith(
                 K5_FORM_LIBRARY[form] + "__"
             ), (arch, T, selected)
-        for name in (*TOKEN_LIBRARY.values(), "cake_mhc_train_bwd_token__rt64"):
+        for name in (*TOKEN_LIBRARY.values(), "cake_mhc_det_train_bwd_token__rt64"):
             assert grid(name) == (row["G6"], 1, 1), name
         for name in SLAB_LIBRARY.values():
             assert grid(name) == (row["k7_grid"], 1, 1), name
@@ -2450,9 +2450,9 @@ def test_launch_grids_follow_the_rules(
             1,
             1,
         )
-        for name in (n for n in modules if _is(n, "cake_mhc_train_bwd_slab")):
+        for name in (n for n in modules if _is(n, "cake_mhc_det_train_bwd_slab")):
             assert grid(name) == (row["k7_grid"], 1, 1), name
-    some_coef = next(n for n in modules if _is(n, "cake_mhc_train_fwd_coef"))
+    some_coef = next(n for n in modules if _is(n, "cake_mhc_det_train_fwd_coef"))
     with pytest.raises(ValueError):
         loader.launch_grid(modules[some_coef], 0, device_index=0)
 

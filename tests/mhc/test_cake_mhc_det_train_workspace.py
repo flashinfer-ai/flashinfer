@@ -16,7 +16,7 @@ limitations under the License.
 Workspace reuse across token counts for the Cake four-stream mHC training
 package (hidden 4096, 4 streams; SM100 / SM103 / SM107).
 
-A caller-owned workspace sized by ``cake_mhc_train_{forward,backward}_workspace_bytes(T_max)``
+A caller-owned workspace sized by ``cake_mhc_det_train_{forward,backward}_workspace_bytes(T_max)``
 serves every token count up to ``T_max`` and CUDA Graph replays at a smaller
 ``T``; its ticket words must be zero on first use and the kernels leave them
 zero.  The dynamic-schedule column-slab form (sm_103a up to 4096 tokens,
@@ -55,8 +55,8 @@ import torch
 
 from tests.test_helpers.cake_package import PACKAGES, cake_package
 
-pkg = cake_package("cake_mhc_train")
-loader = cake_package("cake_mhc_train", "cake_jit")
+pkg = cake_package("cake_mhc_det_train")
+loader = cake_package("cake_mhc_det_train", "cake_jit")
 
 SUPPORTED_CAPABILITIES = ((10, 0), (10, 3), (10, 7))
 STREAMS, HIDDEN, N, MAPPING_ROWS = 4, 4096, 16384, 24
@@ -85,13 +85,13 @@ def _supported() -> bool:
     return (
         torch.cuda.is_available()
         and torch.cuda.get_device_capability(_device()) in SUPPORTED_CAPABILITIES
-        and pkg.is_cake_mhc_train_supported(_device())
+        and pkg.is_cake_mhc_det_train_supported(_device())
     )
 
 
 pytestmark = pytest.mark.skipif(
     not _supported(),
-    reason="cake_mhc_train needs an SM100 / SM103 / SM107 device with exported routes",
+    reason="cake_mhc_det_train needs an SM100 / SM103 / SM107 device with exported routes",
 )
 
 
@@ -130,12 +130,12 @@ def _inputs(T: int) -> dict:
 
 
 def _step(i: dict, fwd_ws, bwd_ws) -> dict:
-    U, stats = pkg.cake_mhc_train_forward_prepare(
+    U, stats = pkg.cake_mhc_det_train_forward_prepare(
         i["X"], i["fn"], i["scale"], i["base"], workspace=fwd_ws
     )
-    Y = pkg.cake_mhc_train_forward_finish(i["X"], i["B"], stats)
-    dB, gstats = pkg.cake_mhc_train_backward_prepare(i["dY"], i["B"], i["X"], stats)
-    dX, dfn, dscale, dbase = pkg.cake_mhc_train_backward_finish(
+    Y = pkg.cake_mhc_det_train_forward_finish(i["X"], i["B"], stats)
+    dB, gstats = pkg.cake_mhc_det_train_backward_prepare(i["dY"], i["B"], i["X"], stats)
+    dX, dfn, dscale, dbase = pkg.cake_mhc_det_train_backward_finish(
         i["X"], i["dY"], i["dU"], i["B"], i["fn"], i["scale"], i["base"], stats, gstats,
         workspace=bwd_ws,
     )  # fmt: skip
@@ -197,8 +197,8 @@ def _assert_tickets_zero(fwd_ws, bwd_ws, T: int, what: str) -> None:
 def test_caller_workspace_reused_across_token_counts(name: str) -> None:
     Ts = SEQUENCES[name]
     t_max = max(Ts)
-    fwd_ws = pkg.cake_mhc_train_forward_workspace(t_max, _device())
-    bwd_ws = pkg.cake_mhc_train_backward_workspace(t_max, _device())
+    fwd_ws = pkg.cake_mhc_det_train_forward_workspace(t_max, _device())
+    bwd_ws = pkg.cake_mhc_det_train_backward_workspace(t_max, _device())
     for n, T in enumerate(Ts):
         ref = _fresh(T)
         what = f"{name} call {n} (T={T} on a buffer of T={t_max})"
@@ -210,8 +210,8 @@ def test_caller_workspace_reused_across_token_counts(name: str) -> None:
 
 @pytest.mark.parametrize(("t_max", "t_small"), GRAPHS)
 def test_graph_captured_at_a_smaller_token_count(t_max: int, t_small: int) -> None:
-    fwd_ws = pkg.cake_mhc_train_forward_workspace(t_max, _device())
-    bwd_ws = pkg.cake_mhc_train_backward_workspace(t_max, _device())
+    fwd_ws = pkg.cake_mhc_det_train_forward_workspace(t_max, _device())
+    bwd_ws = pkg.cake_mhc_det_train_backward_workspace(t_max, _device())
     ref_small = _fresh(t_small)
     small = _inputs(t_small)
     side = torch.cuda.Stream()
@@ -276,10 +276,10 @@ for T in (int(t) for t in sys.argv[2].split(",")):
         return 0 if ws is None else int(torch.count_nonzero(ws[ticket["offset"] : ticket["offset"] + ticket["bytes"]]))
     call = {"T": T, "ticket_before": nonzero()}
     print(json.dumps(call), flush=True)
-    got = [t.clone() for t in pkg.cake_mhc_train_backward_finish(*args)]
+    got = [t.clone() for t in pkg.cake_mhc_det_train_backward_finish(*args)]
     call["ticket_after"] = nonzero()
     fresh = torch.zeros(layout["total_bytes"], dtype=torch.uint8, device=dev)
-    ref = pkg.cake_mhc_train_backward_finish(*args, workspace=fresh)
+    ref = pkg.cake_mhc_det_train_backward_finish(*args, workspace=fresh)
     torch.cuda.synchronize()
     call["differs"] = [n for n, a, b in zip(("dX", "dfn", "dscale", "dbase"), got, ref) if not torch.equal(a, b)]
     print(json.dumps(call), flush=True)
@@ -295,7 +295,7 @@ def test_default_workspace_reported_sequence(Ts: tuple) -> None:
             sys.executable,
             "-c",
             _REPORTED_CHILD,
-            PACKAGES["cake_mhc_train"],
+            PACKAGES["cake_mhc_det_train"],
             ",".join(map(str, Ts)),
         ],
         cwd=Path(__file__).resolve().parents[2],

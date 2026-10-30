@@ -21,9 +21,9 @@ token-owner pass, which take the count as a kernel argument.  This module checks
 
 * the selection (pure host rules: at 20 no run-time-count record launches, at any other count the coefficient
   and token-owner passes launch exactly their run-time-count record) is checked on CPU in
-  ``tests/cpu/mhc/test_cake_mhc_train_rules.py``;
+  ``tests/cpu/mhc/test_cake_mhc_det_train_rules.py``;
 * the numerics at counts 1, 2, 5, 10, 19, 21, 30, 50 and 64 on T = 1, 7, 1024 and 16263: every output against an FP64
-  reference evaluated at the same count, under the absolute bars of ``test_cake_mhc_train.py`` (BF16 outputs at atol =
+  reference evaluated at the same count, under the absolute bars of ``test_cake_mhc_det_train.py`` (BF16 outputs at atol =
   rtol = 1e-2 with no mismatch; the FP32 statistics, gradient statistics and parameter gradients at rel-L2 <= 1e-5;
   ``dscale`` / ``dbase`` per element <= 1e-4 of max(|ref|, RMS(ref))), and the comparator-relative clause of the
   parameter gradients over 25 draws at three counts;
@@ -31,7 +31,7 @@ token-owner pass, which take the count as a kernel argument.  This module checks
   autograd functions (``save_stats`` True and False) give bitwise the outputs and gradients of the direct entry points;
 * that changing the count in one process loads no module after the first run-time-count call, and the argument checks.
 
-The reference is the same arithmetic as ``test_cake_mhc_train.py``'s with the count as a parameter.
+The reference is the same arithmetic as ``test_cake_mhc_det_train.py``'s with the count as a parameter.
 """
 
 from __future__ import annotations
@@ -44,13 +44,13 @@ import torch
 
 from tests.test_helpers.cake_package import cake_package
 
-pkg = cake_package("cake_mhc_train")
-loader = cake_package("cake_mhc_train", "cake_jit")
-forward_prepare = pkg.cake_mhc_train_forward_prepare
-forward_stats = pkg.cake_mhc_train_forward_stats
-forward_finish = pkg.cake_mhc_train_forward_finish
-backward_prepare = pkg.cake_mhc_train_backward_prepare
-backward_finish = pkg.cake_mhc_train_backward_finish
+pkg = cake_package("cake_mhc_det_train")
+loader = cake_package("cake_mhc_det_train", "cake_jit")
+forward_prepare = pkg.cake_mhc_det_train_forward_prepare
+forward_stats = pkg.cake_mhc_det_train_forward_stats
+forward_finish = pkg.cake_mhc_det_train_forward_finish
+backward_prepare = pkg.cake_mhc_det_train_backward_prepare
+backward_finish = pkg.cake_mhc_det_train_backward_finish
 
 SUPPORTED_CAPABILITIES = ((10, 0), (10, 3), (10, 7))
 STREAMS, HIDDEN, N, MAPPING_ROWS = 4, 4096, 16384, 24
@@ -75,18 +75,18 @@ def _supported() -> bool:
     return (
         torch.cuda.is_available()
         and torch.cuda.get_device_capability(_device()) in SUPPORTED_CAPABILITIES
-        and pkg.is_cake_mhc_train_supported(_device())
+        and pkg.is_cake_mhc_det_train_supported(_device())
     )
 
 
 needs_device = pytest.mark.skipif(
     not _supported(),
-    reason="cake_mhc_train needs an SM100 / SM103 / SM107 device with exported routes",
+    reason="cake_mhc_det_train needs an SM100 / SM103 / SM107 device with exported routes",
 )
 
 
 # ----------------------------------------------------------------------------------------------------------------
-# Reference (the arithmetic of test_cake_mhc_train.py with the Sinkhorn count as a parameter)
+# Reference (the arithmetic of test_cake_mhc_det_train.py with the Sinkhorn count as a parameter)
 
 
 def _set_ieee_fp32() -> None:
@@ -373,12 +373,12 @@ def test_paths_agree_bitwise(T: int, iters: int) -> None:
         fn = i["fn"].clone().requires_grad_(True)
         scale = i["scale"].clone().requires_grad_(True)
         base = i["base"].clone().requires_grad_(True)
-        Ua, handle = pkg.cake_mhc_train_prepare(
+        Ua, handle = pkg.cake_mhc_det_train_prepare(
             X, fn, scale, base, sinkhorn_iters=iters, save_stats=save_stats
         )
         Ua.retain_grad()
         Ba = (Ua.float() + i["B"].float()).to(BF16)
-        Ya = pkg.cake_mhc_train_finish(X, Ba, handle)
+        Ya = pkg.cake_mhc_det_train_finish(X, Ba, handle)
         (Ya.float() * i["dY"].float()).sum().backward()
         label = f"T={T} sinkhorn_iters={iters} save_stats={save_stats}"
         assert torch.equal(Ua.detach(), U) and torch.equal(Ya.detach(), Y), label
@@ -427,6 +427,6 @@ def test_count_validation() -> None:
         with pytest.raises(NotImplementedError):
             forward_prepare(X, fn, scale, base, sinkhorn_iters=iters)
         with pytest.raises(NotImplementedError):
-            pkg.cake_mhc_train_prepare(X, fn, scale, base, sinkhorn_iters=iters)
+            pkg.cake_mhc_det_train_prepare(X, fn, scale, base, sinkhorn_iters=iters)
     for iters in (1, 20.0, SINKHORN_ITERS_MAX):
         forward_prepare(X, fn, scale, base, sinkhorn_iters=iters)

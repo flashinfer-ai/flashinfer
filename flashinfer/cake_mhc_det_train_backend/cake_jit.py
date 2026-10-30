@@ -108,7 +108,7 @@ from typing import Any, Optional, Sequence
 # ``block`` / ``cluster`` / ``cooperative`` / ``dynamic_smem_bytes`` /
 # ``use_pdl``); everything else is the host plan.
 MODULES: dict[str, dict[str, Any]] = {
-    "cake_mhc_train_fn_split": {
+    "cake_mhc_det_train_fn_split": {
         "arches": [
             "sm_100a",
             "sm_103a",
@@ -129,8 +129,8 @@ MODULES: dict[str, dict[str, Any]] = {
             "kind": "fixed",
         },
         "hidden": 4096,
-        "kernel": "cake_mhc_train_fn_split",
-        "kernel_symbol": "kernel_cake_mhc_train_fn_split",
+        "kernel": "cake_mhc_det_train_fn_split",
+        "kernel_symbol": "kernel_cake_mhc_det_train_fn_split",
         "launch": {
             "block": (256, 1, 1),
             "cluster": (1, 1, 1),
@@ -139,7 +139,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "persistent_ctas_per_sm": 1,
             "use_pdl": False,
         },
-        "library": "cake_mhc_train_fn_split",
+        "library": "cake_mhc_det_train_fn_split",
         "logical": {
             "fn": "fn",
             "fnTp": "fnTp",
@@ -153,7 +153,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "workspace": "fwd",
         },
     },
-    "cake_mhc_train_fn_split__tv128__t": {
+    "cake_mhc_det_train_fn_split__tv128__t": {
         "arches": [
             "sm_100a",
             "sm_103a",
@@ -173,8 +173,8 @@ MODULES: dict[str, dict[str, Any]] = {
             "kind": "fixed",
         },
         "hidden": 4096,
-        "kernel": "cake_mhc_train_fn_split__tv128",
-        "kernel_symbol": "kernel_cake_mhc_train_fn_split__tv128",
+        "kernel": "cake_mhc_det_train_fn_split__tv128",
+        "kernel_symbol": "kernel_cake_mhc_det_train_fn_split__tv128",
         "launch": {
             "block": (256, 1, 1),
             "cluster": (1, 1, 1),
@@ -183,7 +183,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "persistent_ctas_per_sm": 1,
             "use_pdl": False,
         },
-        "library": "cake_mhc_train_fn_split__tv128",
+        "library": "cake_mhc_det_train_fn_split__tv128",
         "logical": {
             "fn": "fn",
             "fnTp": "fnTp",
@@ -197,7 +197,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "workspace": "bwd",
         },
     },
-    "cake_mhc_train_fn_split__tv128_t128__t": {
+    "cake_mhc_det_train_fn_split__tv128_t128__t": {
         "arches": [
             "sm_107a",
         ],
@@ -216,8 +216,8 @@ MODULES: dict[str, dict[str, Any]] = {
             "kind": "fixed",
         },
         "hidden": 4096,
-        "kernel": "cake_mhc_train_fn_split__tv128_t128",
-        "kernel_symbol": "kernel_cake_mhc_train_fn_split__tv128_t128",
+        "kernel": "cake_mhc_det_train_fn_split__tv128_t128",
+        "kernel_symbol": "kernel_cake_mhc_det_train_fn_split__tv128_t128",
         "launch": {
             "block": (128, 1, 1),
             "cluster": (1, 1, 1),
@@ -226,7 +226,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "persistent_ctas_per_sm": 1,
             "use_pdl": False,
         },
-        "library": "cake_mhc_train_fn_split__tv128_t128",
+        "library": "cake_mhc_det_train_fn_split__tv128_t128",
         "logical": {
             "fn": "fn",
             "fnTp": "fnTp",
@@ -240,7 +240,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "workspace": "bwd",
         },
     },
-    "cake_mhc_train_fwd_map__nsx_st5_mb1": {
+    "cake_mhc_det_train_fwd_map__nsx_st5_mb1": {
         "arches": [
             "sm_103a",
         ],
@@ -265,8 +265,8 @@ MODULES: dict[str, dict[str, Any]] = {
             "units_rule": "k1_units",
         },
         "hidden": 4096,
-        "kernel": "cake_mhc_train_fwd_map__nsx_st5_mb1",
-        "kernel_symbol": "kernel_cake_mhc_train_fwd_map__nsx_st5_mb1",
+        "kernel": "cake_mhc_det_train_fwd_map__nsx_st5_mb1",
+        "kernel_symbol": "kernel_cake_mhc_det_train_fwd_map__nsx_st5_mb1",
         "launch": {
             "block": (192, 1, 1),
             "cluster": (1, 1, 1),
@@ -275,7 +275,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "persistent_ctas_per_sm": 1,
             "use_pdl": False,
         },
-        "library": "cake_mhc_train_fwd_map__nsx_st5_mb1",
+        "library": "cake_mhc_det_train_fwd_map__nsx_st5_mb1",
         "logical": {
             "FNP": "fnp",
             "T": "rows",
@@ -298,7 +298,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "workspace": "fwd",
         },
     },
-    "cake_mhc_train_fwd_map__nsx": {
+    "cake_mhc_det_train_fwd_map__nsx": {
         "arches": [
             "sm_103a",
         ],
@@ -323,8 +323,8 @@ MODULES: dict[str, dict[str, Any]] = {
             "units_rule": "k1_units",
         },
         "hidden": 4096,
-        "kernel": "cake_mhc_train_fwd_map__nsx",
-        "kernel_symbol": "kernel_cake_mhc_train_fwd_map__nsx",
+        "kernel": "cake_mhc_det_train_fwd_map__nsx",
+        "kernel_symbol": "kernel_cake_mhc_det_train_fwd_map__nsx",
         "launch": {
             "block": (192, 1, 1),
             "cluster": (1, 1, 1),
@@ -333,7 +333,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "persistent_ctas_per_sm": 2,
             "use_pdl": False,
         },
-        "library": "cake_mhc_train_fwd_map__nsx",
+        "library": "cake_mhc_det_train_fwd_map__nsx",
         "logical": {
             "FNP": "fnp",
             "T": "rows",
@@ -355,7 +355,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "workspace": "fwd",
         },
     },
-    "cake_mhc_train_fwd_map__nsx__tk": {
+    "cake_mhc_det_train_fwd_map__nsx__tk": {
         "arches": [
             "sm_103a",
         ],
@@ -380,8 +380,8 @@ MODULES: dict[str, dict[str, Any]] = {
             "units_rule": "k1_units",
         },
         "hidden": 4096,
-        "kernel": "cake_mhc_train_fwd_map__nsx",
-        "kernel_symbol": "kernel_cake_mhc_train_fwd_map__nsx",
+        "kernel": "cake_mhc_det_train_fwd_map__nsx",
+        "kernel_symbol": "kernel_cake_mhc_det_train_fwd_map__nsx",
         "launch": {
             "block": (192, 1, 1),
             "cluster": (1, 1, 1),
@@ -390,7 +390,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "persistent_ctas_per_sm": 2,
             "use_pdl": False,
         },
-        "library": "cake_mhc_train_fwd_map__nsx",
+        "library": "cake_mhc_det_train_fwd_map__nsx",
         "logical": {
             "FNP": "fnp",
             "T": "rows",
@@ -412,7 +412,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "workspace": "fwd",
         },
     },
-    "cake_mhc_train_fwd_map__nsx_ct": {
+    "cake_mhc_det_train_fwd_map__nsx_ct": {
         "arches": [
             "sm_103a",
         ],
@@ -437,8 +437,8 @@ MODULES: dict[str, dict[str, Any]] = {
             "units_rule": "k1_units",
         },
         "hidden": 4096,
-        "kernel": "cake_mhc_train_fwd_map__nsx_ct",
-        "kernel_symbol": "kernel_cake_mhc_train_fwd_map__nsx_ct",
+        "kernel": "cake_mhc_det_train_fwd_map__nsx_ct",
+        "kernel_symbol": "kernel_cake_mhc_det_train_fwd_map__nsx_ct",
         "launch": {
             "block": (192, 1, 1),
             "cluster": (1, 1, 1),
@@ -447,7 +447,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "persistent_ctas_per_sm": 2,
             "use_pdl": False,
         },
-        "library": "cake_mhc_train_fwd_map__nsx_ct",
+        "library": "cake_mhc_det_train_fwd_map__nsx_ct",
         "logical": {
             "FNP": "fnp",
             "T": "rows",
@@ -469,7 +469,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "workspace": "fwd",
         },
     },
-    "cake_mhc_train_fwd_map__nsx_g2_ol2l": {
+    "cake_mhc_det_train_fwd_map__nsx_g2_ol2l": {
         "arches": [
             "sm_103a",
         ],
@@ -494,8 +494,8 @@ MODULES: dict[str, dict[str, Any]] = {
             "units_rule": "k1_units",
         },
         "hidden": 4096,
-        "kernel": "cake_mhc_train_fwd_map__nsx_g2_ol2l",
-        "kernel_symbol": "kernel_cake_mhc_train_fwd_map__nsx_g2_ol2l",
+        "kernel": "cake_mhc_det_train_fwd_map__nsx_g2_ol2l",
+        "kernel_symbol": "kernel_cake_mhc_det_train_fwd_map__nsx_g2_ol2l",
         "launch": {
             "block": (192, 1, 1),
             "cluster": (1, 1, 1),
@@ -504,7 +504,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "persistent_ctas_per_sm": 2,
             "use_pdl": False,
         },
-        "library": "cake_mhc_train_fwd_map__nsx_g2_ol2l",
+        "library": "cake_mhc_det_train_fwd_map__nsx_g2_ol2l",
         "logical": {
             "FNP": "fnp",
             "T": "rows",
@@ -526,7 +526,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "workspace": "fwd",
         },
     },
-    "cake_mhc_train_fwd_map__tk_nsx_g2_ol2l_ct": {
+    "cake_mhc_det_train_fwd_map__tk_nsx_g2_ol2l_ct": {
         "arches": [
             "sm_100a",
             "sm_103a",
@@ -552,8 +552,8 @@ MODULES: dict[str, dict[str, Any]] = {
             "units_rule": "k1_units",
         },
         "hidden": 4096,
-        "kernel": "cake_mhc_train_fwd_map__tk_nsx_g2_ol2l_ct",
-        "kernel_symbol": "kernel_cake_mhc_train_fwd_map__tk_nsx_g2_ol2l_ct",
+        "kernel": "cake_mhc_det_train_fwd_map__tk_nsx_g2_ol2l_ct",
+        "kernel_symbol": "kernel_cake_mhc_det_train_fwd_map__tk_nsx_g2_ol2l_ct",
         "launch": {
             "block": (192, 1, 1),
             "cluster": (1, 1, 1),
@@ -562,7 +562,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "persistent_ctas_per_sm": 2,
             "use_pdl": False,
         },
-        "library": "cake_mhc_train_fwd_map__tk_nsx_g2_ol2l_ct",
+        "library": "cake_mhc_det_train_fwd_map__tk_nsx_g2_ol2l_ct",
         "logical": {
             "FNP": "fnp",
             "T": "rows",
@@ -584,7 +584,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "workspace": "fwd",
         },
     },
-    "cake_mhc_train_fwd_map__nsx_st5_mb1__a3": {
+    "cake_mhc_det_train_fwd_map__nsx_st5_mb1__a3": {
         "arches": [
             "sm_100a",
         ],
@@ -609,8 +609,8 @@ MODULES: dict[str, dict[str, Any]] = {
             "units_rule": "k1_units",
         },
         "hidden": 4096,
-        "kernel": "cake_mhc_train_fwd_map__nsx_st5_mb1",
-        "kernel_symbol": "kernel_cake_mhc_train_fwd_map__nsx_st5_mb1",
+        "kernel": "cake_mhc_det_train_fwd_map__nsx_st5_mb1",
+        "kernel_symbol": "kernel_cake_mhc_det_train_fwd_map__nsx_st5_mb1",
         "launch": {
             "block": (192, 1, 1),
             "cluster": (1, 1, 1),
@@ -619,7 +619,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "persistent_ctas_per_sm": 1,
             "use_pdl": False,
         },
-        "library": "cake_mhc_train_fwd_map__nsx_st5_mb1",
+        "library": "cake_mhc_det_train_fwd_map__nsx_st5_mb1",
         "logical": {
             "FNP": "fnp",
             "T": "rows",
@@ -642,7 +642,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "workspace": "fwd",
         },
     },
-    "cake_mhc_train_fwd_map__ns96_g2_ol2l": {
+    "cake_mhc_det_train_fwd_map__ns96_g2_ol2l": {
         "arches": [
             "sm_100a",
         ],
@@ -667,8 +667,8 @@ MODULES: dict[str, dict[str, Any]] = {
             "units_rule": "k1_units",
         },
         "hidden": 4096,
-        "kernel": "cake_mhc_train_fwd_map__ns96_g2_ol2l",
-        "kernel_symbol": "kernel_cake_mhc_train_fwd_map__ns96_g2_ol2l",
+        "kernel": "cake_mhc_det_train_fwd_map__ns96_g2_ol2l",
+        "kernel_symbol": "kernel_cake_mhc_det_train_fwd_map__ns96_g2_ol2l",
         "launch": {
             "block": (192, 1, 1),
             "cluster": (1, 1, 1),
@@ -677,7 +677,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "persistent_ctas_per_sm": 2,
             "use_pdl": False,
         },
-        "library": "cake_mhc_train_fwd_map__ns96_g2_ol2l",
+        "library": "cake_mhc_det_train_fwd_map__ns96_g2_ol2l",
         "logical": {
             "FNP": "fnp",
             "T": "rows",
@@ -700,7 +700,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "workspace": "fwd",
         },
     },
-    "cake_mhc_train_fwd_map__nsx_g2_ol2l__a3": {
+    "cake_mhc_det_train_fwd_map__nsx_g2_ol2l__a3": {
         "arches": [
             "sm_100a",
         ],
@@ -725,8 +725,8 @@ MODULES: dict[str, dict[str, Any]] = {
             "units_rule": "k1_units",
         },
         "hidden": 4096,
-        "kernel": "cake_mhc_train_fwd_map__nsx_g2_ol2l",
-        "kernel_symbol": "kernel_cake_mhc_train_fwd_map__nsx_g2_ol2l",
+        "kernel": "cake_mhc_det_train_fwd_map__nsx_g2_ol2l",
+        "kernel_symbol": "kernel_cake_mhc_det_train_fwd_map__nsx_g2_ol2l",
         "launch": {
             "block": (192, 1, 1),
             "cluster": (1, 1, 1),
@@ -735,7 +735,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "persistent_ctas_per_sm": 2,
             "use_pdl": False,
         },
-        "library": "cake_mhc_train_fwd_map__nsx_g2_ol2l",
+        "library": "cake_mhc_det_train_fwd_map__nsx_g2_ol2l",
         "logical": {
             "FNP": "fnp",
             "T": "rows",
@@ -757,7 +757,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "workspace": "fwd",
         },
     },
-    "cake_mhc_train_fwd_map__nsx_st5_mb1__a7": {
+    "cake_mhc_det_train_fwd_map__nsx_st5_mb1__a7": {
         "arches": [
             "sm_107a",
         ],
@@ -782,8 +782,8 @@ MODULES: dict[str, dict[str, Any]] = {
             "units_rule": "k1_units",
         },
         "hidden": 4096,
-        "kernel": "cake_mhc_train_fwd_map__nsx_st5_mb1",
-        "kernel_symbol": "kernel_cake_mhc_train_fwd_map__nsx_st5_mb1",
+        "kernel": "cake_mhc_det_train_fwd_map__nsx_st5_mb1",
+        "kernel_symbol": "kernel_cake_mhc_det_train_fwd_map__nsx_st5_mb1",
         "launch": {
             "block": (192, 1, 1),
             "cluster": (1, 1, 1),
@@ -792,7 +792,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "persistent_ctas_per_sm": 1,
             "use_pdl": False,
         },
-        "library": "cake_mhc_train_fwd_map__nsx_st5_mb1",
+        "library": "cake_mhc_det_train_fwd_map__nsx_st5_mb1",
         "logical": {
             "FNP": "fnp",
             "T": "rows",
@@ -815,7 +815,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "workspace": "fwd",
         },
     },
-    "cake_mhc_train_fwd_map__nsx_g2_ol2l__a7": {
+    "cake_mhc_det_train_fwd_map__nsx_g2_ol2l__a7": {
         "arches": [
             "sm_107a",
         ],
@@ -840,8 +840,8 @@ MODULES: dict[str, dict[str, Any]] = {
             "units_rule": "k1_units",
         },
         "hidden": 4096,
-        "kernel": "cake_mhc_train_fwd_map__nsx_g2_ol2l",
-        "kernel_symbol": "kernel_cake_mhc_train_fwd_map__nsx_g2_ol2l",
+        "kernel": "cake_mhc_det_train_fwd_map__nsx_g2_ol2l",
+        "kernel_symbol": "kernel_cake_mhc_det_train_fwd_map__nsx_g2_ol2l",
         "launch": {
             "block": (192, 1, 1),
             "cluster": (1, 1, 1),
@@ -850,7 +850,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "persistent_ctas_per_sm": 2,
             "use_pdl": False,
         },
-        "library": "cake_mhc_train_fwd_map__nsx_g2_ol2l",
+        "library": "cake_mhc_det_train_fwd_map__nsx_g2_ol2l",
         "logical": {
             "FNP": "fnp",
             "T": "rows",
@@ -873,7 +873,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "workspace": "fwd",
         },
     },
-    "cake_mhc_train_fwd_map__hi": {
+    "cake_mhc_det_train_fwd_map__hi": {
         "arches": [
             "sm_107a",
         ],
@@ -898,8 +898,8 @@ MODULES: dict[str, dict[str, Any]] = {
             "units_rule": "k1_units",
         },
         "hidden": 4096,
-        "kernel": "cake_mhc_train_fwd_map",
-        "kernel_symbol": "kernel_cake_mhc_train_fwd_map",
+        "kernel": "cake_mhc_det_train_fwd_map",
+        "kernel_symbol": "kernel_cake_mhc_det_train_fwd_map",
         "launch": {
             "block": (192, 1, 1),
             "cluster": (1, 1, 1),
@@ -908,7 +908,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "persistent_ctas_per_sm": 2,
             "use_pdl": False,
         },
-        "library": "cake_mhc_train_fwd_map",
+        "library": "cake_mhc_det_train_fwd_map",
         "logical": {
             "FNP": "fnp",
             "T": "rows",
@@ -930,7 +930,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "workspace": "fwd",
         },
     },
-    "cake_mhc_train_fwd_coef__qe_mb10_tree": {
+    "cake_mhc_det_train_fwd_coef__qe_mb10_tree": {
         "arches": [
             "sm_100a",
             "sm_103a",
@@ -957,8 +957,8 @@ MODULES: dict[str, dict[str, Any]] = {
             "rows_per_tile": 8,
         },
         "hidden": 4096,
-        "kernel": "cake_mhc_train_fwd_coef__qe_mb10_tree",
-        "kernel_symbol": "kernel_cake_mhc_train_fwd_coef__qe_mb10_tree",
+        "kernel": "cake_mhc_det_train_fwd_coef__qe_mb10_tree",
+        "kernel_symbol": "kernel_cake_mhc_det_train_fwd_coef__qe_mb10_tree",
         "launch": {
             "block": (128, 1, 1),
             "cluster": (1, 1, 1),
@@ -967,7 +967,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "persistent_ctas_per_sm": 1,
             "use_pdl": True,
         },
-        "library": "cake_mhc_train_fwd_coef__qe_mb10_tree",
+        "library": "cake_mhc_det_train_fwd_coef__qe_mb10_tree",
         "logical": {
             "T": "rows",
             "base": "base",
@@ -991,7 +991,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "workspace": "fwd",
         },
     },
-    "cake_mhc_train_fwd_coef__st16_w4_tree": {
+    "cake_mhc_det_train_fwd_coef__st16_w4_tree": {
         "arches": [
             "sm_100a",
             "sm_103a",
@@ -1018,8 +1018,8 @@ MODULES: dict[str, dict[str, Any]] = {
             "rows_per_tile": 4,
         },
         "hidden": 4096,
-        "kernel": "cake_mhc_train_fwd_coef__st16_w4_tree",
-        "kernel_symbol": "kernel_cake_mhc_train_fwd_coef__st16_w4_tree",
+        "kernel": "cake_mhc_det_train_fwd_coef__st16_w4_tree",
+        "kernel_symbol": "kernel_cake_mhc_det_train_fwd_coef__st16_w4_tree",
         "launch": {
             "block": (128, 1, 1),
             "cluster": (1, 1, 1),
@@ -1028,7 +1028,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "persistent_ctas_per_sm": 1,
             "use_pdl": True,
         },
-        "library": "cake_mhc_train_fwd_coef__st16_w4_tree",
+        "library": "cake_mhc_det_train_fwd_coef__st16_w4_tree",
         "logical": {
             "T": "rows",
             "base": "base",
@@ -1052,7 +1052,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "workspace": "fwd",
         },
     },
-    "cake_mhc_train_fwd_coef__st16_lp2_as_el_qd": {
+    "cake_mhc_det_train_fwd_coef__st16_lp2_as_el_qd": {
         "arches": [
             "sm_100a",
             "sm_103a",
@@ -1079,8 +1079,8 @@ MODULES: dict[str, dict[str, Any]] = {
             "rows_per_tile": 8,
         },
         "hidden": 4096,
-        "kernel": "cake_mhc_train_fwd_coef__st16_lp2_as_el_qd",
-        "kernel_symbol": "kernel_cake_mhc_train_fwd_coef__st16_lp2_as_el_qd",
+        "kernel": "cake_mhc_det_train_fwd_coef__st16_lp2_as_el_qd",
+        "kernel_symbol": "kernel_cake_mhc_det_train_fwd_coef__st16_lp2_as_el_qd",
         "launch": {
             "block": (128, 1, 1),
             "cluster": (1, 1, 1),
@@ -1089,7 +1089,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "persistent_ctas_per_sm": 1,
             "use_pdl": True,
         },
-        "library": "cake_mhc_train_fwd_coef__st16_lp2_as_el_qd",
+        "library": "cake_mhc_det_train_fwd_coef__st16_lp2_as_el_qd",
         "logical": {
             "T": "rows",
             "base": "base",
@@ -1113,7 +1113,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "workspace": "fwd",
         },
     },
-    "cake_mhc_train_fwd_coef__qe_mb10": {
+    "cake_mhc_det_train_fwd_coef__qe_mb10": {
         "arches": [
             "sm_103a",
         ],
@@ -1138,8 +1138,8 @@ MODULES: dict[str, dict[str, Any]] = {
             "rows_per_tile": 8,
         },
         "hidden": 4096,
-        "kernel": "cake_mhc_train_fwd_coef__qe_mb10",
-        "kernel_symbol": "kernel_cake_mhc_train_fwd_coef__qe_mb10",
+        "kernel": "cake_mhc_det_train_fwd_coef__qe_mb10",
+        "kernel_symbol": "kernel_cake_mhc_det_train_fwd_coef__qe_mb10",
         "launch": {
             "block": (128, 1, 1),
             "cluster": (1, 1, 1),
@@ -1148,7 +1148,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "persistent_ctas_per_sm": 1,
             "use_pdl": True,
         },
-        "library": "cake_mhc_train_fwd_coef__qe_mb10",
+        "library": "cake_mhc_det_train_fwd_coef__qe_mb10",
         "logical": {
             "T": "rows",
             "base": "base",
@@ -1172,7 +1172,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "workspace": "fwd",
         },
     },
-    "cake_mhc_train_fwd_coef__st8_lp2": {
+    "cake_mhc_det_train_fwd_coef__st8_lp2": {
         "arches": [
             "sm_100a",
             "sm_103a",
@@ -1198,8 +1198,8 @@ MODULES: dict[str, dict[str, Any]] = {
             "rows_per_tile": 8,
         },
         "hidden": 4096,
-        "kernel": "cake_mhc_train_fwd_coef__st8_lp2",
-        "kernel_symbol": "kernel_cake_mhc_train_fwd_coef__st8_lp2",
+        "kernel": "cake_mhc_det_train_fwd_coef__st8_lp2",
+        "kernel_symbol": "kernel_cake_mhc_det_train_fwd_coef__st8_lp2",
         "launch": {
             "block": (128, 1, 1),
             "cluster": (1, 1, 1),
@@ -1208,7 +1208,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "persistent_ctas_per_sm": 1,
             "use_pdl": True,
         },
-        "library": "cake_mhc_train_fwd_coef__st8_lp2",
+        "library": "cake_mhc_det_train_fwd_coef__st8_lp2",
         "logical": {
             "T": "rows",
             "base": "base",
@@ -1232,7 +1232,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "workspace": "fwd",
         },
     },
-    "cake_mhc_train_fwd_coef__qe_mb10_pu4": {
+    "cake_mhc_det_train_fwd_coef__qe_mb10_pu4": {
         "arches": [
             "sm_100a",
             "sm_103a",
@@ -1258,8 +1258,8 @@ MODULES: dict[str, dict[str, Any]] = {
             "rows_per_tile": 8,
         },
         "hidden": 4096,
-        "kernel": "cake_mhc_train_fwd_coef__qe_mb10_pu4",
-        "kernel_symbol": "kernel_cake_mhc_train_fwd_coef__qe_mb10_pu4",
+        "kernel": "cake_mhc_det_train_fwd_coef__qe_mb10_pu4",
+        "kernel_symbol": "kernel_cake_mhc_det_train_fwd_coef__qe_mb10_pu4",
         "launch": {
             "block": (128, 1, 1),
             "cluster": (1, 1, 1),
@@ -1268,7 +1268,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "persistent_ctas_per_sm": 1,
             "use_pdl": True,
         },
-        "library": "cake_mhc_train_fwd_coef__qe_mb10_pu4",
+        "library": "cake_mhc_det_train_fwd_coef__qe_mb10_pu4",
         "logical": {
             "T": "rows",
             "base": "base",
@@ -1292,7 +1292,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "workspace": "fwd",
         },
     },
-    "cake_mhc_train_fwd_coef__lp2_w8_adj": {
+    "cake_mhc_det_train_fwd_coef__lp2_w8_adj": {
         "arches": [
             "sm_100a",
             "sm_103a",
@@ -1318,8 +1318,8 @@ MODULES: dict[str, dict[str, Any]] = {
             "rows_per_tile": 8,
         },
         "hidden": 4096,
-        "kernel": "cake_mhc_train_fwd_coef__lp2_w8_adj",
-        "kernel_symbol": "kernel_cake_mhc_train_fwd_coef__lp2_w8_adj",
+        "kernel": "cake_mhc_det_train_fwd_coef__lp2_w8_adj",
+        "kernel_symbol": "kernel_cake_mhc_det_train_fwd_coef__lp2_w8_adj",
         "launch": {
             "block": (128, 1, 1),
             "cluster": (1, 1, 1),
@@ -1328,7 +1328,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "persistent_ctas_per_sm": 1,
             "use_pdl": True,
         },
-        "library": "cake_mhc_train_fwd_coef__lp2_w8_adj",
+        "library": "cake_mhc_det_train_fwd_coef__lp2_w8_adj",
         "logical": {
             "T": "rows",
             "base": "base",
@@ -1352,7 +1352,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "workspace": "fwd",
         },
     },
-    "cake_mhc_train_fwd_coef__st8_lp2_as_el_qd": {
+    "cake_mhc_det_train_fwd_coef__st8_lp2_as_el_qd": {
         "arches": [
             "sm_100a",
         ],
@@ -1377,8 +1377,8 @@ MODULES: dict[str, dict[str, Any]] = {
             "rows_per_tile": 8,
         },
         "hidden": 4096,
-        "kernel": "cake_mhc_train_fwd_coef__st8_lp2_as_el_qd",
-        "kernel_symbol": "kernel_cake_mhc_train_fwd_coef__st8_lp2_as_el_qd",
+        "kernel": "cake_mhc_det_train_fwd_coef__st8_lp2_as_el_qd",
+        "kernel_symbol": "kernel_cake_mhc_det_train_fwd_coef__st8_lp2_as_el_qd",
         "launch": {
             "block": (128, 1, 1),
             "cluster": (1, 1, 1),
@@ -1387,7 +1387,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "persistent_ctas_per_sm": 1,
             "use_pdl": True,
         },
-        "library": "cake_mhc_train_fwd_coef__st8_lp2_as_el_qd",
+        "library": "cake_mhc_det_train_fwd_coef__st8_lp2_as_el_qd",
         "logical": {
             "T": "rows",
             "base": "base",
@@ -1411,7 +1411,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "workspace": "fwd",
         },
     },
-    "cake_mhc_train_fwd_coef__pfl2_qmt": {
+    "cake_mhc_det_train_fwd_coef__pfl2_qmt": {
         "arches": [
             "sm_107a",
         ],
@@ -1436,8 +1436,8 @@ MODULES: dict[str, dict[str, Any]] = {
             "rows_per_tile": 8,
         },
         "hidden": 4096,
-        "kernel": "cake_mhc_train_fwd_coef__pfl2_qmt",
-        "kernel_symbol": "kernel_cake_mhc_train_fwd_coef__pfl2_qmt",
+        "kernel": "cake_mhc_det_train_fwd_coef__pfl2_qmt",
+        "kernel_symbol": "kernel_cake_mhc_det_train_fwd_coef__pfl2_qmt",
         "launch": {
             "block": (128, 1, 1),
             "cluster": (1, 1, 1),
@@ -1446,7 +1446,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "persistent_ctas_per_sm": 1,
             "use_pdl": True,
         },
-        "library": "cake_mhc_train_fwd_coef__pfl2_qmt",
+        "library": "cake_mhc_det_train_fwd_coef__pfl2_qmt",
         "logical": {
             "T": "rows",
             "base": "base",
@@ -1470,7 +1470,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "workspace": "fwd",
         },
     },
-    "cake_mhc_train_fwd_coef__g2_el": {
+    "cake_mhc_det_train_fwd_coef__g2_el": {
         "arches": [
             "sm_107a",
         ],
@@ -1495,8 +1495,8 @@ MODULES: dict[str, dict[str, Any]] = {
             "rows_per_tile": 16,
         },
         "hidden": 4096,
-        "kernel": "cake_mhc_train_fwd_coef__g2_el",
-        "kernel_symbol": "kernel_cake_mhc_train_fwd_coef__g2_el",
+        "kernel": "cake_mhc_det_train_fwd_coef__g2_el",
+        "kernel_symbol": "kernel_cake_mhc_det_train_fwd_coef__g2_el",
         "launch": {
             "block": (128, 1, 1),
             "cluster": (1, 1, 1),
@@ -1505,7 +1505,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "persistent_ctas_per_sm": 1,
             "use_pdl": True,
         },
-        "library": "cake_mhc_train_fwd_coef__g2_el",
+        "library": "cake_mhc_det_train_fwd_coef__g2_el",
         "logical": {
             "T": "rows",
             "base": "base",
@@ -1529,7 +1529,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "workspace": "fwd",
         },
     },
-    "cake_mhc_train_fwd_coef__st8_lp2_tree_asel_qd": {
+    "cake_mhc_det_train_fwd_coef__st8_lp2_tree_asel_qd": {
         "arches": [
             "sm_107a",
         ],
@@ -1554,8 +1554,8 @@ MODULES: dict[str, dict[str, Any]] = {
             "rows_per_tile": 8,
         },
         "hidden": 4096,
-        "kernel": "cake_mhc_train_fwd_coef__st8_lp2_tree_asel_qd",
-        "kernel_symbol": "kernel_cake_mhc_train_fwd_coef__st8_lp2_tree_asel_qd",
+        "kernel": "cake_mhc_det_train_fwd_coef__st8_lp2_tree_asel_qd",
+        "kernel_symbol": "kernel_cake_mhc_det_train_fwd_coef__st8_lp2_tree_asel_qd",
         "launch": {
             "block": (128, 1, 1),
             "cluster": (1, 1, 1),
@@ -1564,7 +1564,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "persistent_ctas_per_sm": 1,
             "use_pdl": True,
         },
-        "library": "cake_mhc_train_fwd_coef__st8_lp2_tree_asel_qd",
+        "library": "cake_mhc_det_train_fwd_coef__st8_lp2_tree_asel_qd",
         "logical": {
             "T": "rows",
             "base": "base",
@@ -1588,7 +1588,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "workspace": "fwd",
         },
     },
-    "cake_mhc_train_fwd_coef__lp2_w8_adj_qe": {
+    "cake_mhc_det_train_fwd_coef__lp2_w8_adj_qe": {
         "arches": [
             "sm_107a",
         ],
@@ -1613,8 +1613,8 @@ MODULES: dict[str, dict[str, Any]] = {
             "rows_per_tile": 8,
         },
         "hidden": 4096,
-        "kernel": "cake_mhc_train_fwd_coef__lp2_w8_adj_qe",
-        "kernel_symbol": "kernel_cake_mhc_train_fwd_coef__lp2_w8_adj_qe",
+        "kernel": "cake_mhc_det_train_fwd_coef__lp2_w8_adj_qe",
+        "kernel_symbol": "kernel_cake_mhc_det_train_fwd_coef__lp2_w8_adj_qe",
         "launch": {
             "block": (128, 1, 1),
             "cluster": (1, 1, 1),
@@ -1623,7 +1623,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "persistent_ctas_per_sm": 1,
             "use_pdl": True,
         },
-        "library": "cake_mhc_train_fwd_coef__lp2_w8_adj_qe",
+        "library": "cake_mhc_det_train_fwd_coef__lp2_w8_adj_qe",
         "logical": {
             "T": "rows",
             "base": "base",
@@ -1647,7 +1647,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "workspace": "fwd",
         },
     },
-    "cake_mhc_train_fwd_coef__rt64": {
+    "cake_mhc_det_train_fwd_coef__rt64": {
         "arches": [
             "sm_100a",
             "sm_103a",
@@ -1675,8 +1675,8 @@ MODULES: dict[str, dict[str, Any]] = {
             "rows_per_tile": 8,
         },
         "hidden": 4096,
-        "kernel": "cake_mhc_train_fwd_coef__rt64",
-        "kernel_symbol": "kernel_cake_mhc_train_fwd_coef__rt64",
+        "kernel": "cake_mhc_det_train_fwd_coef__rt64",
+        "kernel_symbol": "kernel_cake_mhc_det_train_fwd_coef__rt64",
         "launch": {
             "block": (128, 1, 1),
             "cluster": (1, 1, 1),
@@ -1685,7 +1685,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "persistent_ctas_per_sm": 1,
             "use_pdl": True,
         },
-        "library": "cake_mhc_train_fwd_coef__rt64",
+        "library": "cake_mhc_det_train_fwd_coef__rt64",
         "logical": {
             "T": "rows",
             "base": "base",
@@ -1708,7 +1708,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "workspace": "fwd",
         },
     },
-    "cake_mhc_train_fwd_collapse": {
+    "cake_mhc_det_train_fwd_collapse": {
         "arches": [
             "sm_100a",
             "sm_103a",
@@ -1733,8 +1733,8 @@ MODULES: dict[str, dict[str, Any]] = {
             "rows_per_cta": 1,
         },
         "hidden": 4096,
-        "kernel": "cake_mhc_train_fwd_collapse",
-        "kernel_symbol": "kernel_cake_mhc_train_fwd_collapse",
+        "kernel": "cake_mhc_det_train_fwd_collapse",
+        "kernel_symbol": "kernel_cake_mhc_det_train_fwd_collapse",
         "launch": {
             "block": (256, 1, 1),
             "cluster": (1, 1, 1),
@@ -1743,7 +1743,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "persistent_ctas_per_sm": 1,
             "use_pdl": "runtime",
         },
-        "library": "cake_mhc_train_fwd_collapse",
+        "library": "cake_mhc_det_train_fwd_collapse",
         "logical": {
             "T": "rows",
             "stats": "stats",
@@ -1754,7 +1754,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "select_rule": None,
         "workspace_rule": None,
     },
-    "cake_mhc_train_fwd_finish": {
+    "cake_mhc_det_train_fwd_finish": {
         "arches": [
             "sm_100a",
             "sm_103a",
@@ -1778,8 +1778,8 @@ MODULES: dict[str, dict[str, Any]] = {
             "rows_per_cta": 4,
         },
         "hidden": 4096,
-        "kernel": "cake_mhc_train_fwd_finish",
-        "kernel_symbol": "kernel_cake_mhc_train_fwd_finish",
+        "kernel": "cake_mhc_det_train_fwd_finish",
+        "kernel_symbol": "kernel_cake_mhc_det_train_fwd_finish",
         "launch": {
             "block": (256, 1, 1),
             "cluster": (1, 1, 1),
@@ -1788,7 +1788,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "persistent_ctas_per_sm": 1,
             "use_pdl": True,
         },
-        "library": "cake_mhc_train_fwd_finish",
+        "library": "cake_mhc_det_train_fwd_finish",
         "logical": {
             "T": "rows",
             "b": "b",
@@ -1800,7 +1800,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "select_rule": None,
         "workspace_rule": None,
     },
-    "cake_mhc_train_fwd_finish__r2": {
+    "cake_mhc_det_train_fwd_finish__r2": {
         "arches": [
             "sm_107a",
         ],
@@ -1823,8 +1823,8 @@ MODULES: dict[str, dict[str, Any]] = {
             "rows_per_cta": 2,
         },
         "hidden": 4096,
-        "kernel": "cake_mhc_train_fwd_finish__r2",
-        "kernel_symbol": "kernel_cake_mhc_train_fwd_finish__r2",
+        "kernel": "cake_mhc_det_train_fwd_finish__r2",
+        "kernel_symbol": "kernel_cake_mhc_det_train_fwd_finish__r2",
         "launch": {
             "block": (256, 1, 1),
             "cluster": (1, 1, 1),
@@ -1833,7 +1833,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "persistent_ctas_per_sm": 1,
             "use_pdl": True,
         },
-        "library": "cake_mhc_train_fwd_finish__r2",
+        "library": "cake_mhc_det_train_fwd_finish__r2",
         "logical": {
             "T": "rows",
             "b": "b",
@@ -1845,7 +1845,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "select_rule": None,
         "workspace_rule": None,
     },
-    "cake_mhc_train_bwd_prepare__g2sm_le1024": {
+    "cake_mhc_det_train_bwd_prepare__g2sm_le1024": {
         "arches": [
             "sm_100a",
         ],
@@ -1871,8 +1871,8 @@ MODULES: dict[str, dict[str, Any]] = {
             "rows_per_cta": 2,
         },
         "hidden": 4096,
-        "kernel": "cake_mhc_train_bwd_prepare",
-        "kernel_symbol": "kernel_cake_mhc_train_bwd_prepare",
+        "kernel": "cake_mhc_det_train_bwd_prepare",
+        "kernel_symbol": "kernel_cake_mhc_det_train_bwd_prepare",
         "launch": {
             "block": (256, 1, 1),
             "cluster": (1, 1, 1),
@@ -1881,7 +1881,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "persistent_ctas_per_sm": 1,
             "use_pdl": "runtime",
         },
-        "library": "cake_mhc_train_bwd_prepare",
+        "library": "cake_mhc_det_train_bwd_prepare",
         "logical": {
             "T": "rows",
             "b": "b",
@@ -1899,7 +1899,7 @@ MODULES: dict[str, dict[str, Any]] = {
         },
         "workspace_rule": None,
     },
-    "cake_mhc_train_bwd_prepare__t128": {
+    "cake_mhc_det_train_bwd_prepare__t128": {
         "arches": [
             "sm_103a",
         ],
@@ -1925,8 +1925,8 @@ MODULES: dict[str, dict[str, Any]] = {
             "rows_per_cta": 1,
         },
         "hidden": 4096,
-        "kernel": "cake_mhc_train_bwd_prepare__t128",
-        "kernel_symbol": "kernel_cake_mhc_train_bwd_prepare__t128",
+        "kernel": "cake_mhc_det_train_bwd_prepare__t128",
+        "kernel_symbol": "kernel_cake_mhc_det_train_bwd_prepare__t128",
         "launch": {
             "block": (128, 1, 1),
             "cluster": (1, 1, 1),
@@ -1935,7 +1935,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "persistent_ctas_per_sm": 1,
             "use_pdl": "runtime",
         },
-        "library": "cake_mhc_train_bwd_prepare__t128",
+        "library": "cake_mhc_det_train_bwd_prepare__t128",
         "logical": {
             "T": "rows",
             "b": "b",
@@ -1953,7 +1953,7 @@ MODULES: dict[str, dict[str, Any]] = {
         },
         "workspace_rule": None,
     },
-    "cake_mhc_train_bwd_prepare__t128__a3": {
+    "cake_mhc_det_train_bwd_prepare__t128__a3": {
         "arches": [
             "sm_100a",
         ],
@@ -1979,8 +1979,8 @@ MODULES: dict[str, dict[str, Any]] = {
             "rows_per_cta": 1,
         },
         "hidden": 4096,
-        "kernel": "cake_mhc_train_bwd_prepare__t128",
-        "kernel_symbol": "kernel_cake_mhc_train_bwd_prepare__t128",
+        "kernel": "cake_mhc_det_train_bwd_prepare__t128",
+        "kernel_symbol": "kernel_cake_mhc_det_train_bwd_prepare__t128",
         "launch": {
             "block": (128, 1, 1),
             "cluster": (1, 1, 1),
@@ -1989,7 +1989,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "persistent_ctas_per_sm": 1,
             "use_pdl": "runtime",
         },
-        "library": "cake_mhc_train_bwd_prepare__t128",
+        "library": "cake_mhc_det_train_bwd_prepare__t128",
         "logical": {
             "T": "rows",
             "b": "b",
@@ -2007,7 +2007,7 @@ MODULES: dict[str, dict[str, Any]] = {
         },
         "workspace_rule": None,
     },
-    "cake_mhc_train_bwd_prepare__t128__a7": {
+    "cake_mhc_det_train_bwd_prepare__t128__a7": {
         "arches": [
             "sm_107a",
         ],
@@ -2033,8 +2033,8 @@ MODULES: dict[str, dict[str, Any]] = {
             "rows_per_cta": 1,
         },
         "hidden": 4096,
-        "kernel": "cake_mhc_train_bwd_prepare__t128",
-        "kernel_symbol": "kernel_cake_mhc_train_bwd_prepare__t128",
+        "kernel": "cake_mhc_det_train_bwd_prepare__t128",
+        "kernel_symbol": "kernel_cake_mhc_det_train_bwd_prepare__t128",
         "launch": {
             "block": (128, 1, 1),
             "cluster": (1, 1, 1),
@@ -2043,7 +2043,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "persistent_ctas_per_sm": 1,
             "use_pdl": "runtime",
         },
-        "library": "cake_mhc_train_bwd_prepare__t128",
+        "library": "cake_mhc_det_train_bwd_prepare__t128",
         "logical": {
             "T": "rows",
             "b": "b",
@@ -2061,7 +2061,7 @@ MODULES: dict[str, dict[str, Any]] = {
         },
         "workspace_rule": None,
     },
-    "cake_mhc_train_bwd_prepare__gt8192": {
+    "cake_mhc_det_train_bwd_prepare__gt8192": {
         "arches": [
             "sm_100a",
             "sm_103a",
@@ -2088,8 +2088,8 @@ MODULES: dict[str, dict[str, Any]] = {
             "rows_per_cta": 2,
         },
         "hidden": 4096,
-        "kernel": "cake_mhc_train_bwd_prepare",
-        "kernel_symbol": "kernel_cake_mhc_train_bwd_prepare",
+        "kernel": "cake_mhc_det_train_bwd_prepare",
+        "kernel_symbol": "kernel_cake_mhc_det_train_bwd_prepare",
         "launch": {
             "block": (256, 1, 1),
             "cluster": (1, 1, 1),
@@ -2098,7 +2098,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "persistent_ctas_per_sm": 1,
             "use_pdl": "runtime",
         },
-        "library": "cake_mhc_train_bwd_prepare",
+        "library": "cake_mhc_det_train_bwd_prepare",
         "logical": {
             "T": "rows",
             "b": "b",
@@ -2116,7 +2116,7 @@ MODULES: dict[str, dict[str, Any]] = {
         },
         "workspace_rule": None,
     },
-    "cake_mhc_train_bwd_prepare__gt65536": {
+    "cake_mhc_det_train_bwd_prepare__gt65536": {
         "arches": [
             "sm_107a",
         ],
@@ -2142,8 +2142,8 @@ MODULES: dict[str, dict[str, Any]] = {
             "rows_per_cta": 2,
         },
         "hidden": 4096,
-        "kernel": "cake_mhc_train_bwd_prepare",
-        "kernel_symbol": "kernel_cake_mhc_train_bwd_prepare",
+        "kernel": "cake_mhc_det_train_bwd_prepare",
+        "kernel_symbol": "kernel_cake_mhc_det_train_bwd_prepare",
         "launch": {
             "block": (256, 1, 1),
             "cluster": (1, 1, 1),
@@ -2152,7 +2152,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "persistent_ctas_per_sm": 1,
             "use_pdl": "runtime",
         },
-        "library": "cake_mhc_train_bwd_prepare",
+        "library": "cake_mhc_det_train_bwd_prepare",
         "logical": {
             "T": "rows",
             "b": "b",
@@ -2170,7 +2170,7 @@ MODULES: dict[str, dict[str, Any]] = {
         },
         "workspace_rule": None,
     },
-    "cake_mhc_train_bwd_token__ao22_rae7_pd1_ntr": {
+    "cake_mhc_det_train_bwd_token__ao22_rae7_pd1_ntr": {
         "arches": [
             "sm_103a",
         ],
@@ -2200,8 +2200,8 @@ MODULES: dict[str, dict[str, Any]] = {
             "kind": "chunks",
         },
         "hidden": 4096,
-        "kernel": "cake_mhc_train_bwd_token__ao22_rae7_pd1_ntr",
-        "kernel_symbol": "kernel_cake_mhc_train_bwd_token__ao22_rae7_pd1_ntr",
+        "kernel": "cake_mhc_det_train_bwd_token__ao22_rae7_pd1_ntr",
+        "kernel_symbol": "kernel_cake_mhc_det_train_bwd_token__ao22_rae7_pd1_ntr",
         "launch": {
             "block": (256, 1, 1),
             "cluster": (1, 1, 1),
@@ -2210,7 +2210,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "persistent_ctas_per_sm": 2,
             "use_pdl": True,
         },
-        "library": "cake_mhc_train_bwd_token__ao22_rae7_pd1_ntr",
+        "library": "cake_mhc_det_train_bwd_token__ao22_rae7_pd1_ntr",
         "logical": {
             "T": "rows",
             "X": "x",
@@ -2238,7 +2238,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "workspace": "bwd",
         },
     },
-    "cake_mhc_train_bwd_token__ao15_rae8_tma_ntr": {
+    "cake_mhc_det_train_bwd_token__ao15_rae8_tma_ntr": {
         "arches": [
             "sm_103a",
         ],
@@ -2268,8 +2268,8 @@ MODULES: dict[str, dict[str, Any]] = {
             "kind": "chunks",
         },
         "hidden": 4096,
-        "kernel": "cake_mhc_train_bwd_token__ao15_rae8_tma_ntr",
-        "kernel_symbol": "kernel_cake_mhc_train_bwd_token__ao15_rae8_tma_ntr",
+        "kernel": "cake_mhc_det_train_bwd_token__ao15_rae8_tma_ntr",
+        "kernel_symbol": "kernel_cake_mhc_det_train_bwd_token__ao15_rae8_tma_ntr",
         "launch": {
             "block": (256, 1, 1),
             "cluster": (1, 1, 1),
@@ -2278,7 +2278,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "persistent_ctas_per_sm": 2,
             "use_pdl": True,
         },
-        "library": "cake_mhc_train_bwd_token__ao15_rae8_tma_ntr",
+        "library": "cake_mhc_det_train_bwd_token__ao15_rae8_tma_ntr",
         "logical": {
             "T": "rows",
             "X": "x",
@@ -2306,7 +2306,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "workspace": "bwd",
         },
     },
-    "cake_mhc_train_bwd_token__dot_ao8": {
+    "cake_mhc_det_train_bwd_token__dot_ao8": {
         "arches": [
             "sm_103a",
         ],
@@ -2336,8 +2336,8 @@ MODULES: dict[str, dict[str, Any]] = {
             "kind": "chunks",
         },
         "hidden": 4096,
-        "kernel": "cake_mhc_train_bwd_token__dot_ao8",
-        "kernel_symbol": "kernel_cake_mhc_train_bwd_token__dot_ao8",
+        "kernel": "cake_mhc_det_train_bwd_token__dot_ao8",
+        "kernel_symbol": "kernel_cake_mhc_det_train_bwd_token__dot_ao8",
         "launch": {
             "block": (256, 1, 1),
             "cluster": (1, 1, 1),
@@ -2346,7 +2346,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "persistent_ctas_per_sm": 2,
             "use_pdl": True,
         },
-        "library": "cake_mhc_train_bwd_token__dot_ao8",
+        "library": "cake_mhc_det_train_bwd_token__dot_ao8",
         "logical": {
             "T": "rows",
             "X": "x",
@@ -2375,7 +2375,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "workspace": "bwd",
         },
     },
-    "cake_mhc_train_bwd_token__ao22_rae7_pd1_ntr__a3": {
+    "cake_mhc_det_train_bwd_token__ao22_rae7_pd1_ntr__a3": {
         "arches": [
             "sm_100a",
         ],
@@ -2405,8 +2405,8 @@ MODULES: dict[str, dict[str, Any]] = {
             "kind": "chunks",
         },
         "hidden": 4096,
-        "kernel": "cake_mhc_train_bwd_token__ao22_rae7_pd1_ntr",
-        "kernel_symbol": "kernel_cake_mhc_train_bwd_token__ao22_rae7_pd1_ntr",
+        "kernel": "cake_mhc_det_train_bwd_token__ao22_rae7_pd1_ntr",
+        "kernel_symbol": "kernel_cake_mhc_det_train_bwd_token__ao22_rae7_pd1_ntr",
         "launch": {
             "block": (256, 1, 1),
             "cluster": (1, 1, 1),
@@ -2415,7 +2415,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "persistent_ctas_per_sm": 2,
             "use_pdl": True,
         },
-        "library": "cake_mhc_train_bwd_token__ao22_rae7_pd1_ntr",
+        "library": "cake_mhc_det_train_bwd_token__ao22_rae7_pd1_ntr",
         "logical": {
             "T": "rows",
             "X": "x",
@@ -2442,7 +2442,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "workspace": "bwd",
         },
     },
-    "cake_mhc_train_bwd_token__ao22_rae7_pd1_tma_ntr": {
+    "cake_mhc_det_train_bwd_token__ao22_rae7_pd1_tma_ntr": {
         "arches": [
             "sm_100a",
             "sm_107a",
@@ -2473,8 +2473,8 @@ MODULES: dict[str, dict[str, Any]] = {
             "kind": "chunks",
         },
         "hidden": 4096,
-        "kernel": "cake_mhc_train_bwd_token__ao22_rae7_pd1_tma_ntr",
-        "kernel_symbol": "kernel_cake_mhc_train_bwd_token__ao22_rae7_pd1_tma_ntr",
+        "kernel": "cake_mhc_det_train_bwd_token__ao22_rae7_pd1_tma_ntr",
+        "kernel_symbol": "kernel_cake_mhc_det_train_bwd_token__ao22_rae7_pd1_tma_ntr",
         "launch": {
             "block": (256, 1, 1),
             "cluster": (1, 1, 1),
@@ -2483,7 +2483,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "persistent_ctas_per_sm": 2,
             "use_pdl": True,
         },
-        "library": "cake_mhc_train_bwd_token__ao22_rae7_pd1_tma_ntr",
+        "library": "cake_mhc_det_train_bwd_token__ao22_rae7_pd1_tma_ntr",
         "logical": {
             "T": "rows",
             "X": "x",
@@ -2510,7 +2510,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "workspace": "bwd",
         },
     },
-    "cake_mhc_train_bwd_token__dot_ao8__a3": {
+    "cake_mhc_det_train_bwd_token__dot_ao8__a3": {
         "arches": [
             "sm_100a",
         ],
@@ -2540,8 +2540,8 @@ MODULES: dict[str, dict[str, Any]] = {
             "kind": "chunks",
         },
         "hidden": 4096,
-        "kernel": "cake_mhc_train_bwd_token__dot_ao8",
-        "kernel_symbol": "kernel_cake_mhc_train_bwd_token__dot_ao8",
+        "kernel": "cake_mhc_det_train_bwd_token__dot_ao8",
+        "kernel_symbol": "kernel_cake_mhc_det_train_bwd_token__dot_ao8",
         "launch": {
             "block": (256, 1, 1),
             "cluster": (1, 1, 1),
@@ -2550,7 +2550,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "persistent_ctas_per_sm": 2,
             "use_pdl": True,
         },
-        "library": "cake_mhc_train_bwd_token__dot_ao8",
+        "library": "cake_mhc_det_train_bwd_token__dot_ao8",
         "logical": {
             "T": "rows",
             "X": "x",
@@ -2577,7 +2577,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "workspace": "bwd",
         },
     },
-    "cake_mhc_train_bwd_token__ao15_rae8_tma_ntr__a3": {
+    "cake_mhc_det_train_bwd_token__ao15_rae8_tma_ntr__a3": {
         "arches": [
             "sm_100a",
         ],
@@ -2607,8 +2607,8 @@ MODULES: dict[str, dict[str, Any]] = {
             "kind": "chunks",
         },
         "hidden": 4096,
-        "kernel": "cake_mhc_train_bwd_token__ao15_rae8_tma_ntr",
-        "kernel_symbol": "kernel_cake_mhc_train_bwd_token__ao15_rae8_tma_ntr",
+        "kernel": "cake_mhc_det_train_bwd_token__ao15_rae8_tma_ntr",
+        "kernel_symbol": "kernel_cake_mhc_det_train_bwd_token__ao15_rae8_tma_ntr",
         "launch": {
             "block": (256, 1, 1),
             "cluster": (1, 1, 1),
@@ -2617,7 +2617,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "persistent_ctas_per_sm": 2,
             "use_pdl": True,
         },
-        "library": "cake_mhc_train_bwd_token__ao15_rae8_tma_ntr",
+        "library": "cake_mhc_det_train_bwd_token__ao15_rae8_tma_ntr",
         "logical": {
             "T": "rows",
             "X": "x",
@@ -2644,7 +2644,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "workspace": "bwd",
         },
     },
-    "cake_mhc_train_bwd_token__ao22_rae7_rf3_pd1_l2l_ntr": {
+    "cake_mhc_det_train_bwd_token__ao22_rae7_rf3_pd1_l2l_ntr": {
         "arches": [
             "sm_107a",
         ],
@@ -2674,8 +2674,8 @@ MODULES: dict[str, dict[str, Any]] = {
             "kind": "chunks",
         },
         "hidden": 4096,
-        "kernel": "cake_mhc_train_bwd_token__ao22_rae7_rf3_pd1_l2l_ntr",
-        "kernel_symbol": "kernel_cake_mhc_train_bwd_token__ao22_rae7_rf3_pd1_l2l_ntr",
+        "kernel": "cake_mhc_det_train_bwd_token__ao22_rae7_rf3_pd1_l2l_ntr",
+        "kernel_symbol": "kernel_cake_mhc_det_train_bwd_token__ao22_rae7_rf3_pd1_l2l_ntr",
         "launch": {
             "block": (256, 1, 1),
             "cluster": (1, 1, 1),
@@ -2684,7 +2684,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "persistent_ctas_per_sm": 2,
             "use_pdl": True,
         },
-        "library": "cake_mhc_train_bwd_token__ao22_rae7_rf3_pd1_l2l_ntr",
+        "library": "cake_mhc_det_train_bwd_token__ao22_rae7_rf3_pd1_l2l_ntr",
         "logical": {
             "T": "rows",
             "X": "x",
@@ -2711,7 +2711,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "workspace": "bwd",
         },
     },
-    "cake_mhc_train_bwd_token__ao22_rae7_pd1_ntr__a7": {
+    "cake_mhc_det_train_bwd_token__ao22_rae7_pd1_ntr__a7": {
         "arches": [
             "sm_107a",
         ],
@@ -2741,8 +2741,8 @@ MODULES: dict[str, dict[str, Any]] = {
             "kind": "chunks",
         },
         "hidden": 4096,
-        "kernel": "cake_mhc_train_bwd_token__ao22_rae7_pd1_ntr",
-        "kernel_symbol": "kernel_cake_mhc_train_bwd_token__ao22_rae7_pd1_ntr",
+        "kernel": "cake_mhc_det_train_bwd_token__ao22_rae7_pd1_ntr",
+        "kernel_symbol": "kernel_cake_mhc_det_train_bwd_token__ao22_rae7_pd1_ntr",
         "launch": {
             "block": (256, 1, 1),
             "cluster": (1, 1, 1),
@@ -2751,7 +2751,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "persistent_ctas_per_sm": 2,
             "use_pdl": True,
         },
-        "library": "cake_mhc_train_bwd_token__ao22_rae7_pd1_ntr",
+        "library": "cake_mhc_det_train_bwd_token__ao22_rae7_pd1_ntr",
         "logical": {
             "T": "rows",
             "X": "x",
@@ -2778,7 +2778,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "workspace": "bwd",
         },
     },
-    "cake_mhc_train_bwd_token__dot_ao8_l2l": {
+    "cake_mhc_det_train_bwd_token__dot_ao8_l2l": {
         "arches": [
             "sm_107a",
         ],
@@ -2808,8 +2808,8 @@ MODULES: dict[str, dict[str, Any]] = {
             "kind": "chunks",
         },
         "hidden": 4096,
-        "kernel": "cake_mhc_train_bwd_token__dot_ao8_l2l",
-        "kernel_symbol": "kernel_cake_mhc_train_bwd_token__dot_ao8_l2l",
+        "kernel": "cake_mhc_det_train_bwd_token__dot_ao8_l2l",
+        "kernel_symbol": "kernel_cake_mhc_det_train_bwd_token__dot_ao8_l2l",
         "launch": {
             "block": (256, 1, 1),
             "cluster": (1, 1, 1),
@@ -2818,7 +2818,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "persistent_ctas_per_sm": 2,
             "use_pdl": True,
         },
-        "library": "cake_mhc_train_bwd_token__dot_ao8_l2l",
+        "library": "cake_mhc_det_train_bwd_token__dot_ao8_l2l",
         "logical": {
             "T": "rows",
             "X": "x",
@@ -2845,7 +2845,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "workspace": "bwd",
         },
     },
-    "cake_mhc_train_bwd_token__ao15_rae8_tma_ntr__a7": {
+    "cake_mhc_det_train_bwd_token__ao15_rae8_tma_ntr__a7": {
         "arches": [
             "sm_107a",
         ],
@@ -2875,8 +2875,8 @@ MODULES: dict[str, dict[str, Any]] = {
             "kind": "chunks",
         },
         "hidden": 4096,
-        "kernel": "cake_mhc_train_bwd_token__ao15_rae8_tma_ntr",
-        "kernel_symbol": "kernel_cake_mhc_train_bwd_token__ao15_rae8_tma_ntr",
+        "kernel": "cake_mhc_det_train_bwd_token__ao15_rae8_tma_ntr",
+        "kernel_symbol": "kernel_cake_mhc_det_train_bwd_token__ao15_rae8_tma_ntr",
         "launch": {
             "block": (256, 1, 1),
             "cluster": (1, 1, 1),
@@ -2885,7 +2885,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "persistent_ctas_per_sm": 2,
             "use_pdl": True,
         },
-        "library": "cake_mhc_train_bwd_token__ao15_rae8_tma_ntr",
+        "library": "cake_mhc_det_train_bwd_token__ao15_rae8_tma_ntr",
         "logical": {
             "T": "rows",
             "X": "x",
@@ -2912,7 +2912,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "workspace": "bwd",
         },
     },
-    "cake_mhc_train_bwd_token__rt64": {
+    "cake_mhc_det_train_bwd_token__rt64": {
         "arches": [
             "sm_100a",
             "sm_103a",
@@ -2945,8 +2945,8 @@ MODULES: dict[str, dict[str, Any]] = {
             "kind": "chunks",
         },
         "hidden": 4096,
-        "kernel": "cake_mhc_train_bwd_token__rt64",
-        "kernel_symbol": "kernel_cake_mhc_train_bwd_token__rt64",
+        "kernel": "cake_mhc_det_train_bwd_token__rt64",
+        "kernel_symbol": "kernel_cake_mhc_det_train_bwd_token__rt64",
         "launch": {
             "block": (256, 1, 1),
             "cluster": (1, 1, 1),
@@ -2955,7 +2955,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "persistent_ctas_per_sm": 2,
             "use_pdl": True,
         },
-        "library": "cake_mhc_train_bwd_token__rt64",
+        "library": "cake_mhc_det_train_bwd_token__rt64",
         "logical": {
             "T": "rows",
             "X": "x",
@@ -2981,7 +2981,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "workspace": "bwd",
         },
     },
-    "cake_mhc_train_bwd_slab__dynl": {
+    "cake_mhc_det_train_bwd_slab__dynl": {
         "arches": [
             "sm_100a",
         ],
@@ -3010,8 +3010,8 @@ MODULES: dict[str, dict[str, Any]] = {
             "slabs": 64,
         },
         "hidden": 4096,
-        "kernel": "cake_mhc_train_bwd_slab__dynl",
-        "kernel_symbol": "kernel_cake_mhc_train_bwd_slab__dynl",
+        "kernel": "cake_mhc_det_train_bwd_slab__dynl",
+        "kernel_symbol": "kernel_cake_mhc_det_train_bwd_slab__dynl",
         "launch": {
             "block": (384, 1, 1),
             "cluster": (1, 1, 1),
@@ -3020,7 +3020,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "persistent_ctas_per_sm": 1,
             "use_pdl": "runtime",
         },
-        "library": "cake_mhc_train_bwd_slab__dynl",
+        "library": "cake_mhc_det_train_bwd_slab__dynl",
         "logical": {
             "P": "parts",
             "T": "rows",
@@ -3046,7 +3046,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "workspace": "bwd",
         },
     },
-    "cake_mhc_train_bwd_slab__dynr": {
+    "cake_mhc_det_train_bwd_slab__dynr": {
         "arches": [
             "sm_100a",
             "sm_103a",
@@ -3076,8 +3076,8 @@ MODULES: dict[str, dict[str, Any]] = {
             "slabs": 64,
         },
         "hidden": 4096,
-        "kernel": "cake_mhc_train_bwd_slab__dynr",
-        "kernel_symbol": "kernel_cake_mhc_train_bwd_slab__dynr",
+        "kernel": "cake_mhc_det_train_bwd_slab__dynr",
+        "kernel_symbol": "kernel_cake_mhc_det_train_bwd_slab__dynr",
         "launch": {
             "block": (384, 1, 1),
             "cluster": (1, 1, 1),
@@ -3086,7 +3086,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "persistent_ctas_per_sm": 1,
             "use_pdl": "runtime",
         },
-        "library": "cake_mhc_train_bwd_slab__dynr",
+        "library": "cake_mhc_det_train_bwd_slab__dynr",
         "logical": {
             "P": "parts",
             "T": "rows",
@@ -3112,7 +3112,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "workspace": "bwd",
         },
     },
-    "cake_mhc_train_bwd_slab__xrsg": {
+    "cake_mhc_det_train_bwd_slab__xrsg": {
         "arches": [
             "sm_100a",
         ],
@@ -3140,8 +3140,8 @@ MODULES: dict[str, dict[str, Any]] = {
             "slabs": 64,
         },
         "hidden": 4096,
-        "kernel": "cake_mhc_train_bwd_slab__xrsg",
-        "kernel_symbol": "kernel_cake_mhc_train_bwd_slab__xrsg",
+        "kernel": "cake_mhc_det_train_bwd_slab__xrsg",
+        "kernel_symbol": "kernel_cake_mhc_det_train_bwd_slab__xrsg",
         "launch": {
             "block": (384, 1, 1),
             "cluster": (1, 1, 1),
@@ -3150,7 +3150,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "persistent_ctas_per_sm": 1,
             "use_pdl": "runtime",
         },
-        "library": "cake_mhc_train_bwd_slab__xrsg",
+        "library": "cake_mhc_det_train_bwd_slab__xrsg",
         "logical": {
             "P": "parts",
             "T": "rows",
@@ -3175,7 +3175,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "workspace": "bwd",
         },
     },
-    "cake_mhc_train_bwd_slab__xrsg__a7": {
+    "cake_mhc_det_train_bwd_slab__xrsg__a7": {
         "arches": [
             "sm_107a",
         ],
@@ -3203,8 +3203,8 @@ MODULES: dict[str, dict[str, Any]] = {
             "slabs": 64,
         },
         "hidden": 4096,
-        "kernel": "cake_mhc_train_bwd_slab__xrsg",
-        "kernel_symbol": "kernel_cake_mhc_train_bwd_slab__xrsg",
+        "kernel": "cake_mhc_det_train_bwd_slab__xrsg",
+        "kernel_symbol": "kernel_cake_mhc_det_train_bwd_slab__xrsg",
         "launch": {
             "block": (384, 1, 1),
             "cluster": (1, 1, 1),
@@ -3213,7 +3213,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "persistent_ctas_per_sm": 1,
             "use_pdl": "runtime",
         },
-        "library": "cake_mhc_train_bwd_slab__xrsg",
+        "library": "cake_mhc_det_train_bwd_slab__xrsg",
         "logical": {
             "P": "parts",
             "T": "rows",
@@ -3234,7 +3234,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "workspace": "bwd",
         },
     },
-    "cake_mhc_train_bwd_reduce__pt64": {
+    "cake_mhc_det_train_bwd_reduce__pt64": {
         "arches": [
             "sm_103a",
         ],
@@ -3258,8 +3258,8 @@ MODULES: dict[str, dict[str, Any]] = {
             "kind": "fixed",
         },
         "hidden": 4096,
-        "kernel": "cake_mhc_train_bwd_reduce__pt64",
-        "kernel_symbol": "kernel_cake_mhc_train_bwd_reduce__pt64",
+        "kernel": "cake_mhc_det_train_bwd_reduce__pt64",
+        "kernel_symbol": "kernel_cake_mhc_det_train_bwd_reduce__pt64",
         "launch": {
             "block": (64, 1, 1),
             "cluster": (1, 1, 1),
@@ -3268,7 +3268,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "persistent_ctas_per_sm": 1,
             "use_pdl": "runtime",
         },
-        "library": "cake_mhc_train_bwd_reduce__pt64",
+        "library": "cake_mhc_det_train_bwd_reduce__pt64",
         "logical": {
             "accumulate": "accumulate",
             "dbase": "dbase",
@@ -3290,7 +3290,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "workspace": "bwd",
         },
     },
-    "cake_mhc_train_bwd_reduce__pt32": {
+    "cake_mhc_det_train_bwd_reduce__pt32": {
         "arches": [
             "sm_103a",
         ],
@@ -3314,8 +3314,8 @@ MODULES: dict[str, dict[str, Any]] = {
             "kind": "fixed",
         },
         "hidden": 4096,
-        "kernel": "cake_mhc_train_bwd_reduce__pt32",
-        "kernel_symbol": "kernel_cake_mhc_train_bwd_reduce__pt32",
+        "kernel": "cake_mhc_det_train_bwd_reduce__pt32",
+        "kernel_symbol": "kernel_cake_mhc_det_train_bwd_reduce__pt32",
         "launch": {
             "block": (32, 1, 1),
             "cluster": (1, 1, 1),
@@ -3324,7 +3324,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "persistent_ctas_per_sm": 1,
             "use_pdl": "runtime",
         },
-        "library": "cake_mhc_train_bwd_reduce__pt32",
+        "library": "cake_mhc_det_train_bwd_reduce__pt32",
         "logical": {
             "accumulate": "accumulate",
             "dbase": "dbase",
@@ -3346,7 +3346,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "workspace": "bwd",
         },
     },
-    "cake_mhc_train_bwd_reduce__s27_wcvt_fadd_fshfl": {
+    "cake_mhc_det_train_bwd_reduce__s27_wcvt_fadd_fshfl": {
         "arches": [
             "sm_100a",
         ],
@@ -3370,8 +3370,8 @@ MODULES: dict[str, dict[str, Any]] = {
             "kind": "fixed",
         },
         "hidden": 4096,
-        "kernel": "cake_mhc_train_bwd_reduce__s27_wcvt_fadd_fshfl",
-        "kernel_symbol": "kernel_cake_mhc_train_bwd_reduce__s27_wcvt_fadd_fshfl",
+        "kernel": "cake_mhc_det_train_bwd_reduce__s27_wcvt_fadd_fshfl",
+        "kernel_symbol": "kernel_cake_mhc_det_train_bwd_reduce__s27_wcvt_fadd_fshfl",
         "launch": {
             "block": (256, 1, 1),
             "cluster": (1, 1, 1),
@@ -3380,7 +3380,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "persistent_ctas_per_sm": 1,
             "use_pdl": "runtime",
         },
-        "library": "cake_mhc_train_bwd_reduce__s27_wcvt_fadd_fshfl",
+        "library": "cake_mhc_det_train_bwd_reduce__s27_wcvt_fadd_fshfl",
         "logical": {
             "accumulate": "accumulate",
             "dbase": "dbase",
@@ -3402,7 +3402,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "workspace": "bwd",
         },
     },
-    "cake_mhc_train_bwd_reduce__wpu4_spred": {
+    "cake_mhc_det_train_bwd_reduce__wpu4_spred": {
         "arches": [
             "sm_100a",
         ],
@@ -3426,8 +3426,8 @@ MODULES: dict[str, dict[str, Any]] = {
             "kind": "fixed",
         },
         "hidden": 4096,
-        "kernel": "cake_mhc_train_bwd_reduce__wpu4_spred",
-        "kernel_symbol": "kernel_cake_mhc_train_bwd_reduce__wpu4_spred",
+        "kernel": "cake_mhc_det_train_bwd_reduce__wpu4_spred",
+        "kernel_symbol": "kernel_cake_mhc_det_train_bwd_reduce__wpu4_spred",
         "launch": {
             "block": (256, 1, 1),
             "cluster": (1, 1, 1),
@@ -3436,7 +3436,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "persistent_ctas_per_sm": 1,
             "use_pdl": "runtime",
         },
-        "library": "cake_mhc_train_bwd_reduce__wpu4_spred",
+        "library": "cake_mhc_det_train_bwd_reduce__wpu4_spred",
         "logical": {
             "accumulate": "accumulate",
             "dbase": "dbase",
@@ -3458,7 +3458,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "workspace": "bwd",
         },
     },
-    "cake_mhc_train_bwd_reduce__wpu4_fadd": {
+    "cake_mhc_det_train_bwd_reduce__wpu4_fadd": {
         "arches": [
             "sm_100a",
             "sm_107a",
@@ -3483,8 +3483,8 @@ MODULES: dict[str, dict[str, Any]] = {
             "kind": "fixed",
         },
         "hidden": 4096,
-        "kernel": "cake_mhc_train_bwd_reduce__wpu4_fadd",
-        "kernel_symbol": "kernel_cake_mhc_train_bwd_reduce__wpu4_fadd",
+        "kernel": "cake_mhc_det_train_bwd_reduce__wpu4_fadd",
+        "kernel_symbol": "kernel_cake_mhc_det_train_bwd_reduce__wpu4_fadd",
         "launch": {
             "block": (256, 1, 1),
             "cluster": (1, 1, 1),
@@ -3493,7 +3493,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "persistent_ctas_per_sm": 1,
             "use_pdl": "runtime",
         },
-        "library": "cake_mhc_train_bwd_reduce__wpu4_fadd",
+        "library": "cake_mhc_det_train_bwd_reduce__wpu4_fadd",
         "logical": {
             "accumulate": "accumulate",
             "dbase": "dbase",
@@ -3515,7 +3515,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "workspace": "bwd",
         },
     },
-    "cake_mhc_train_bwd_reduce__s27_wcvt_spred": {
+    "cake_mhc_det_train_bwd_reduce__s27_wcvt_spred": {
         "arches": [
             "sm_107a",
         ],
@@ -3539,8 +3539,8 @@ MODULES: dict[str, dict[str, Any]] = {
             "kind": "fixed",
         },
         "hidden": 4096,
-        "kernel": "cake_mhc_train_bwd_reduce__s27_wcvt_spred",
-        "kernel_symbol": "kernel_cake_mhc_train_bwd_reduce__s27_wcvt_spred",
+        "kernel": "cake_mhc_det_train_bwd_reduce__s27_wcvt_spred",
+        "kernel_symbol": "kernel_cake_mhc_det_train_bwd_reduce__s27_wcvt_spred",
         "launch": {
             "block": (256, 1, 1),
             "cluster": (1, 1, 1),
@@ -3549,7 +3549,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "persistent_ctas_per_sm": 1,
             "use_pdl": "runtime",
         },
-        "library": "cake_mhc_train_bwd_reduce__s27_wcvt_spred",
+        "library": "cake_mhc_det_train_bwd_reduce__s27_wcvt_spred",
         "logical": {
             "accumulate": "accumulate",
             "dbase": "dbase",
@@ -3571,7 +3571,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "workspace": "bwd",
         },
     },
-    "cake_mhc_train_bwd_reduce__wpu4": {
+    "cake_mhc_det_train_bwd_reduce__wpu4": {
         "arches": [
             "sm_107a",
         ],
@@ -3595,8 +3595,8 @@ MODULES: dict[str, dict[str, Any]] = {
             "kind": "fixed",
         },
         "hidden": 4096,
-        "kernel": "cake_mhc_train_bwd_reduce__wpu4",
-        "kernel_symbol": "kernel_cake_mhc_train_bwd_reduce__wpu4",
+        "kernel": "cake_mhc_det_train_bwd_reduce__wpu4",
+        "kernel_symbol": "kernel_cake_mhc_det_train_bwd_reduce__wpu4",
         "launch": {
             "block": (256, 1, 1),
             "cluster": (1, 1, 1),
@@ -3605,7 +3605,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "persistent_ctas_per_sm": 1,
             "use_pdl": "runtime",
         },
-        "library": "cake_mhc_train_bwd_reduce__wpu4",
+        "library": "cake_mhc_det_train_bwd_reduce__wpu4",
         "logical": {
             "accumulate": "accumulate",
             "dbase": "dbase",
@@ -3641,162 +3641,162 @@ MODULES: dict[str, dict[str, Any]] = {
 ROUTES: dict[str, dict[str, list[str]]] = {
     "sm_100a": {
         "bwd_finish_h4096": [
-            "cake_mhc_train_fn_split__tv128__t",
-            "cake_mhc_train_bwd_token__ao22_rae7_pd1_ntr__a3",
-            "cake_mhc_train_bwd_token__ao22_rae7_pd1_tma_ntr",
-            "cake_mhc_train_bwd_token__dot_ao8__a3",
-            "cake_mhc_train_bwd_token__ao15_rae8_tma_ntr__a3",
-            "cake_mhc_train_bwd_token__rt64",
-            "cake_mhc_train_bwd_slab__dynr",
-            "cake_mhc_train_bwd_slab__xrsg",
-            "cake_mhc_train_bwd_slab__dynl",
-            "cake_mhc_train_bwd_reduce__s27_wcvt_fadd_fshfl",
-            "cake_mhc_train_bwd_reduce__wpu4_spred",
-            "cake_mhc_train_bwd_reduce__wpu4_fadd",
+            "cake_mhc_det_train_fn_split__tv128__t",
+            "cake_mhc_det_train_bwd_token__ao22_rae7_pd1_ntr__a3",
+            "cake_mhc_det_train_bwd_token__ao22_rae7_pd1_tma_ntr",
+            "cake_mhc_det_train_bwd_token__dot_ao8__a3",
+            "cake_mhc_det_train_bwd_token__ao15_rae8_tma_ntr__a3",
+            "cake_mhc_det_train_bwd_token__rt64",
+            "cake_mhc_det_train_bwd_slab__dynr",
+            "cake_mhc_det_train_bwd_slab__xrsg",
+            "cake_mhc_det_train_bwd_slab__dynl",
+            "cake_mhc_det_train_bwd_reduce__s27_wcvt_fadd_fshfl",
+            "cake_mhc_det_train_bwd_reduce__wpu4_spred",
+            "cake_mhc_det_train_bwd_reduce__wpu4_fadd",
         ],
         "bwd_prepare_h4096": [
-            "cake_mhc_train_bwd_prepare__g2sm_le1024",
-            "cake_mhc_train_bwd_prepare__t128__a3",
-            "cake_mhc_train_bwd_prepare__gt8192",
+            "cake_mhc_det_train_bwd_prepare__g2sm_le1024",
+            "cake_mhc_det_train_bwd_prepare__t128__a3",
+            "cake_mhc_det_train_bwd_prepare__gt8192",
         ],
         "fwd_finish_h4096": [
-            "cake_mhc_train_fwd_finish",
+            "cake_mhc_det_train_fwd_finish",
         ],
         "fwd_prepare_h4096": [
-            "cake_mhc_train_fn_split",
-            "cake_mhc_train_fwd_map__nsx_st5_mb1__a3",
-            "cake_mhc_train_fwd_map__ns96_g2_ol2l",
-            "cake_mhc_train_fwd_map__nsx_g2_ol2l__a3",
-            "cake_mhc_train_fwd_map__tk_nsx_g2_ol2l_ct",
-            "cake_mhc_train_fwd_coef__st16_w4_tree",
-            "cake_mhc_train_fwd_coef__qe_mb10_tree",
-            "cake_mhc_train_fwd_coef__st16_lp2_as_el_qd",
-            "cake_mhc_train_fwd_coef__qe_mb10_pu4",
-            "cake_mhc_train_fwd_coef__st8_lp2_as_el_qd",
-            "cake_mhc_train_fwd_coef__st8_lp2",
-            "cake_mhc_train_fwd_coef__lp2_w8_adj",
-            "cake_mhc_train_fwd_coef__rt64",
-            "cake_mhc_train_fwd_collapse",
+            "cake_mhc_det_train_fn_split",
+            "cake_mhc_det_train_fwd_map__nsx_st5_mb1__a3",
+            "cake_mhc_det_train_fwd_map__ns96_g2_ol2l",
+            "cake_mhc_det_train_fwd_map__nsx_g2_ol2l__a3",
+            "cake_mhc_det_train_fwd_map__tk_nsx_g2_ol2l_ct",
+            "cake_mhc_det_train_fwd_coef__st16_w4_tree",
+            "cake_mhc_det_train_fwd_coef__qe_mb10_tree",
+            "cake_mhc_det_train_fwd_coef__st16_lp2_as_el_qd",
+            "cake_mhc_det_train_fwd_coef__qe_mb10_pu4",
+            "cake_mhc_det_train_fwd_coef__st8_lp2_as_el_qd",
+            "cake_mhc_det_train_fwd_coef__st8_lp2",
+            "cake_mhc_det_train_fwd_coef__lp2_w8_adj",
+            "cake_mhc_det_train_fwd_coef__rt64",
+            "cake_mhc_det_train_fwd_collapse",
         ],
         "fwd_recompute_h4096": [
-            "cake_mhc_train_fn_split",
-            "cake_mhc_train_fwd_map__nsx_st5_mb1__a3",
-            "cake_mhc_train_fwd_map__ns96_g2_ol2l",
-            "cake_mhc_train_fwd_map__nsx_g2_ol2l__a3",
-            "cake_mhc_train_fwd_map__tk_nsx_g2_ol2l_ct",
-            "cake_mhc_train_fwd_coef__st16_w4_tree",
-            "cake_mhc_train_fwd_coef__qe_mb10_tree",
-            "cake_mhc_train_fwd_coef__st16_lp2_as_el_qd",
-            "cake_mhc_train_fwd_coef__qe_mb10_pu4",
-            "cake_mhc_train_fwd_coef__st8_lp2_as_el_qd",
-            "cake_mhc_train_fwd_coef__st8_lp2",
-            "cake_mhc_train_fwd_coef__lp2_w8_adj",
-            "cake_mhc_train_fwd_coef__rt64",
+            "cake_mhc_det_train_fn_split",
+            "cake_mhc_det_train_fwd_map__nsx_st5_mb1__a3",
+            "cake_mhc_det_train_fwd_map__ns96_g2_ol2l",
+            "cake_mhc_det_train_fwd_map__nsx_g2_ol2l__a3",
+            "cake_mhc_det_train_fwd_map__tk_nsx_g2_ol2l_ct",
+            "cake_mhc_det_train_fwd_coef__st16_w4_tree",
+            "cake_mhc_det_train_fwd_coef__qe_mb10_tree",
+            "cake_mhc_det_train_fwd_coef__st16_lp2_as_el_qd",
+            "cake_mhc_det_train_fwd_coef__qe_mb10_pu4",
+            "cake_mhc_det_train_fwd_coef__st8_lp2_as_el_qd",
+            "cake_mhc_det_train_fwd_coef__st8_lp2",
+            "cake_mhc_det_train_fwd_coef__lp2_w8_adj",
+            "cake_mhc_det_train_fwd_coef__rt64",
         ],
     },
     "sm_103a": {
         "bwd_finish_h4096": [
-            "cake_mhc_train_fn_split__tv128__t",
-            "cake_mhc_train_bwd_token__ao22_rae7_pd1_ntr",
-            "cake_mhc_train_bwd_token__ao15_rae8_tma_ntr",
-            "cake_mhc_train_bwd_token__dot_ao8",
-            "cake_mhc_train_bwd_token__rt64",
-            "cake_mhc_train_bwd_slab__dynr",
-            "cake_mhc_train_bwd_reduce__pt64",
-            "cake_mhc_train_bwd_reduce__pt32",
+            "cake_mhc_det_train_fn_split__tv128__t",
+            "cake_mhc_det_train_bwd_token__ao22_rae7_pd1_ntr",
+            "cake_mhc_det_train_bwd_token__ao15_rae8_tma_ntr",
+            "cake_mhc_det_train_bwd_token__dot_ao8",
+            "cake_mhc_det_train_bwd_token__rt64",
+            "cake_mhc_det_train_bwd_slab__dynr",
+            "cake_mhc_det_train_bwd_reduce__pt64",
+            "cake_mhc_det_train_bwd_reduce__pt32",
         ],
         "bwd_prepare_h4096": [
-            "cake_mhc_train_bwd_prepare__t128",
-            "cake_mhc_train_bwd_prepare__gt8192",
+            "cake_mhc_det_train_bwd_prepare__t128",
+            "cake_mhc_det_train_bwd_prepare__gt8192",
         ],
         "fwd_finish_h4096": [
-            "cake_mhc_train_fwd_finish",
+            "cake_mhc_det_train_fwd_finish",
         ],
         "fwd_prepare_h4096": [
-            "cake_mhc_train_fn_split",
-            "cake_mhc_train_fwd_map__nsx_st5_mb1",
-            "cake_mhc_train_fwd_map__nsx_ct",
-            "cake_mhc_train_fwd_map__nsx",
-            "cake_mhc_train_fwd_map__nsx__tk",
-            "cake_mhc_train_fwd_map__nsx_g2_ol2l",
-            "cake_mhc_train_fwd_map__tk_nsx_g2_ol2l_ct",
-            "cake_mhc_train_fwd_coef__qe_mb10_tree",
-            "cake_mhc_train_fwd_coef__st16_w4_tree",
-            "cake_mhc_train_fwd_coef__st16_lp2_as_el_qd",
-            "cake_mhc_train_fwd_coef__qe_mb10",
-            "cake_mhc_train_fwd_coef__st8_lp2",
-            "cake_mhc_train_fwd_coef__qe_mb10_pu4",
-            "cake_mhc_train_fwd_coef__lp2_w8_adj",
-            "cake_mhc_train_fwd_coef__rt64",
-            "cake_mhc_train_fwd_collapse",
+            "cake_mhc_det_train_fn_split",
+            "cake_mhc_det_train_fwd_map__nsx_st5_mb1",
+            "cake_mhc_det_train_fwd_map__nsx_ct",
+            "cake_mhc_det_train_fwd_map__nsx",
+            "cake_mhc_det_train_fwd_map__nsx__tk",
+            "cake_mhc_det_train_fwd_map__nsx_g2_ol2l",
+            "cake_mhc_det_train_fwd_map__tk_nsx_g2_ol2l_ct",
+            "cake_mhc_det_train_fwd_coef__qe_mb10_tree",
+            "cake_mhc_det_train_fwd_coef__st16_w4_tree",
+            "cake_mhc_det_train_fwd_coef__st16_lp2_as_el_qd",
+            "cake_mhc_det_train_fwd_coef__qe_mb10",
+            "cake_mhc_det_train_fwd_coef__st8_lp2",
+            "cake_mhc_det_train_fwd_coef__qe_mb10_pu4",
+            "cake_mhc_det_train_fwd_coef__lp2_w8_adj",
+            "cake_mhc_det_train_fwd_coef__rt64",
+            "cake_mhc_det_train_fwd_collapse",
         ],
         "fwd_recompute_h4096": [
-            "cake_mhc_train_fn_split",
-            "cake_mhc_train_fwd_map__nsx_st5_mb1",
-            "cake_mhc_train_fwd_map__nsx_ct",
-            "cake_mhc_train_fwd_map__nsx",
-            "cake_mhc_train_fwd_map__nsx__tk",
-            "cake_mhc_train_fwd_map__nsx_g2_ol2l",
-            "cake_mhc_train_fwd_map__tk_nsx_g2_ol2l_ct",
-            "cake_mhc_train_fwd_coef__qe_mb10_tree",
-            "cake_mhc_train_fwd_coef__st16_w4_tree",
-            "cake_mhc_train_fwd_coef__st16_lp2_as_el_qd",
-            "cake_mhc_train_fwd_coef__qe_mb10",
-            "cake_mhc_train_fwd_coef__st8_lp2",
-            "cake_mhc_train_fwd_coef__qe_mb10_pu4",
-            "cake_mhc_train_fwd_coef__lp2_w8_adj",
-            "cake_mhc_train_fwd_coef__rt64",
+            "cake_mhc_det_train_fn_split",
+            "cake_mhc_det_train_fwd_map__nsx_st5_mb1",
+            "cake_mhc_det_train_fwd_map__nsx_ct",
+            "cake_mhc_det_train_fwd_map__nsx",
+            "cake_mhc_det_train_fwd_map__nsx__tk",
+            "cake_mhc_det_train_fwd_map__nsx_g2_ol2l",
+            "cake_mhc_det_train_fwd_map__tk_nsx_g2_ol2l_ct",
+            "cake_mhc_det_train_fwd_coef__qe_mb10_tree",
+            "cake_mhc_det_train_fwd_coef__st16_w4_tree",
+            "cake_mhc_det_train_fwd_coef__st16_lp2_as_el_qd",
+            "cake_mhc_det_train_fwd_coef__qe_mb10",
+            "cake_mhc_det_train_fwd_coef__st8_lp2",
+            "cake_mhc_det_train_fwd_coef__qe_mb10_pu4",
+            "cake_mhc_det_train_fwd_coef__lp2_w8_adj",
+            "cake_mhc_det_train_fwd_coef__rt64",
         ],
     },
     "sm_107a": {
         "bwd_finish_h4096": [
-            "cake_mhc_train_fn_split__tv128_t128__t",
-            "cake_mhc_train_bwd_token__ao22_rae7_rf3_pd1_l2l_ntr",
-            "cake_mhc_train_bwd_token__ao22_rae7_pd1_tma_ntr",
-            "cake_mhc_train_bwd_token__ao22_rae7_pd1_ntr__a7",
-            "cake_mhc_train_bwd_token__dot_ao8_l2l",
-            "cake_mhc_train_bwd_token__ao15_rae8_tma_ntr__a7",
-            "cake_mhc_train_bwd_token__rt64",
-            "cake_mhc_train_bwd_slab__xrsg__a7",
-            "cake_mhc_train_bwd_reduce__s27_wcvt_spred",
-            "cake_mhc_train_bwd_reduce__wpu4",
-            "cake_mhc_train_bwd_reduce__wpu4_fadd",
+            "cake_mhc_det_train_fn_split__tv128_t128__t",
+            "cake_mhc_det_train_bwd_token__ao22_rae7_rf3_pd1_l2l_ntr",
+            "cake_mhc_det_train_bwd_token__ao22_rae7_pd1_tma_ntr",
+            "cake_mhc_det_train_bwd_token__ao22_rae7_pd1_ntr__a7",
+            "cake_mhc_det_train_bwd_token__dot_ao8_l2l",
+            "cake_mhc_det_train_bwd_token__ao15_rae8_tma_ntr__a7",
+            "cake_mhc_det_train_bwd_token__rt64",
+            "cake_mhc_det_train_bwd_slab__xrsg__a7",
+            "cake_mhc_det_train_bwd_reduce__s27_wcvt_spred",
+            "cake_mhc_det_train_bwd_reduce__wpu4",
+            "cake_mhc_det_train_bwd_reduce__wpu4_fadd",
         ],
         "bwd_prepare_h4096": [
-            "cake_mhc_train_bwd_prepare__t128__a7",
-            "cake_mhc_train_bwd_prepare__gt65536",
+            "cake_mhc_det_train_bwd_prepare__t128__a7",
+            "cake_mhc_det_train_bwd_prepare__gt65536",
         ],
         "fwd_finish_h4096": [
-            "cake_mhc_train_fwd_finish__r2",
+            "cake_mhc_det_train_fwd_finish__r2",
         ],
         "fwd_prepare_h4096": [
-            "cake_mhc_train_fn_split",
-            "cake_mhc_train_fwd_map__nsx_st5_mb1__a7",
-            "cake_mhc_train_fwd_map__nsx_g2_ol2l__a7",
-            "cake_mhc_train_fwd_map__hi",
-            "cake_mhc_train_fwd_coef__st16_w4_tree",
-            "cake_mhc_train_fwd_coef__pfl2_qmt",
-            "cake_mhc_train_fwd_coef__st16_lp2_as_el_qd",
-            "cake_mhc_train_fwd_coef__g2_el",
-            "cake_mhc_train_fwd_coef__qe_mb10_tree",
-            "cake_mhc_train_fwd_coef__st8_lp2_tree_asel_qd",
-            "cake_mhc_train_fwd_coef__lp2_w8_adj_qe",
-            "cake_mhc_train_fwd_coef__rt64",
-            "cake_mhc_train_fwd_collapse",
+            "cake_mhc_det_train_fn_split",
+            "cake_mhc_det_train_fwd_map__nsx_st5_mb1__a7",
+            "cake_mhc_det_train_fwd_map__nsx_g2_ol2l__a7",
+            "cake_mhc_det_train_fwd_map__hi",
+            "cake_mhc_det_train_fwd_coef__st16_w4_tree",
+            "cake_mhc_det_train_fwd_coef__pfl2_qmt",
+            "cake_mhc_det_train_fwd_coef__st16_lp2_as_el_qd",
+            "cake_mhc_det_train_fwd_coef__g2_el",
+            "cake_mhc_det_train_fwd_coef__qe_mb10_tree",
+            "cake_mhc_det_train_fwd_coef__st8_lp2_tree_asel_qd",
+            "cake_mhc_det_train_fwd_coef__lp2_w8_adj_qe",
+            "cake_mhc_det_train_fwd_coef__rt64",
+            "cake_mhc_det_train_fwd_collapse",
         ],
         "fwd_recompute_h4096": [
-            "cake_mhc_train_fn_split",
-            "cake_mhc_train_fwd_map__nsx_st5_mb1__a7",
-            "cake_mhc_train_fwd_map__nsx_g2_ol2l__a7",
-            "cake_mhc_train_fwd_map__hi",
-            "cake_mhc_train_fwd_coef__st16_w4_tree",
-            "cake_mhc_train_fwd_coef__pfl2_qmt",
-            "cake_mhc_train_fwd_coef__st16_lp2_as_el_qd",
-            "cake_mhc_train_fwd_coef__g2_el",
-            "cake_mhc_train_fwd_coef__qe_mb10_tree",
-            "cake_mhc_train_fwd_coef__st8_lp2_tree_asel_qd",
-            "cake_mhc_train_fwd_coef__lp2_w8_adj_qe",
-            "cake_mhc_train_fwd_coef__rt64",
+            "cake_mhc_det_train_fn_split",
+            "cake_mhc_det_train_fwd_map__nsx_st5_mb1__a7",
+            "cake_mhc_det_train_fwd_map__nsx_g2_ol2l__a7",
+            "cake_mhc_det_train_fwd_map__hi",
+            "cake_mhc_det_train_fwd_coef__st16_w4_tree",
+            "cake_mhc_det_train_fwd_coef__pfl2_qmt",
+            "cake_mhc_det_train_fwd_coef__st16_lp2_as_el_qd",
+            "cake_mhc_det_train_fwd_coef__g2_el",
+            "cake_mhc_det_train_fwd_coef__qe_mb10_tree",
+            "cake_mhc_det_train_fwd_coef__st8_lp2_tree_asel_qd",
+            "cake_mhc_det_train_fwd_coef__lp2_w8_adj_qe",
+            "cake_mhc_det_train_fwd_coef__rt64",
         ],
     },
 }
@@ -3906,13 +3906,13 @@ WORKSPACE_REGIONS: dict[str, list[dict[str, Any]]] = {
 # and ``__tv128_t128``) writes the forward operand layout (``want_t = 0``) or
 # the transposed layout of the backward (``want_t = 1``).
 RECORD_SCALARS: dict[str, dict[str, int]] = {
-    "cake_mhc_train_fn_split": {
+    "cake_mhc_det_train_fn_split": {
         "want_t": 0,
     },
-    "cake_mhc_train_fn_split__tv128__t": {
+    "cake_mhc_det_train_fn_split__tv128__t": {
         "want_t": 1,
     },
-    "cake_mhc_train_fn_split__tv128_t128__t": {
+    "cake_mhc_det_train_fn_split__tv128_t128__t": {
         "want_t": 1,
     },
 }
@@ -4021,7 +4021,7 @@ FN_SPLIT_PROGRAM = {
     "sm_107a": ("b16", "tv128_t128"),
 }
 # FN_SPLIT_GRID: the launch grid per fn-split program (both layouts launch the same count; T-independent): 256 CTAs of
-# 256 threads for "b16" / "tv128", 512 CTAs of 128 threads for "tv128_t128" -- what mhc_fn_split.grid_for_symbol
+# 256 threads for "b16" / "tv128", 512 CTAs of 128 threads for "tv128_t128" -- what mhc_det_fn_split.grid_for_symbol
 # returns for the entry's symbol and the kernel-tests launch passes.
 FN_SPLIT_GRID = {"b16": 256, "tv128": 256, "tv128_t128": 512}
 # FWD_MAP_BANDS: (above, at_most, program) of the mapping pass by token count (at_most None = unbounded); outside every
@@ -4107,7 +4107,7 @@ FWD_MAP_CLAIM = {
     "sm_107a": (),
 }
 # FWD_COEF_REGIMES: the coefficient pass's dispatch per architecture, in grid units of the 8-token CTA (grid =
-# ceil(T / 8) = mhc_fwd_coef.grid_rule(T, tokens_per_cta=8); every form bitwise the production chain). "round5" =
+# ceil(T / 8) = mhc_det_fwd_coef.grid_rule(T, tokens_per_cta=8); every form bitwise the production chain). "round5" =
 # the `form_overrides(T, sm_count, P_K)` of record on sm_103a (P_K = the host rule's K-unit
 # count k1_units(T, sm_count, arch).P_K incl. PK_BANDS): "st16_w4_tree" (tokens_per_cta=4, stage=16, sum_tree;
 # 0.9424-0.9601 of st16_w4 at 1024-1208) while grid < sm_count and P_K <= 16, "qe_mb10_tree" (tokens_per_cta=8,
@@ -4340,7 +4340,7 @@ BWD_REDUCE_PARTS = {
     "sm_107a": {"wpu4": (("wpu4_fadd", 15, None),)},
 }
 # 384 / 768 / 1536 / 3072 dfn CTAs (256- / 128- / 64- / 32-thread CTAs) + 1 or 27 parameter CTAs
-# (mhc_bwd_reduce.grid_for).
+# (mhc_det_bwd_reduce.grid_for).
 BWD_REDUCE_GRID = {
     "f64": 385,
     "s27": 411,
@@ -4357,7 +4357,7 @@ BWD_REDUCE_GRID = {
 # K5_GRID_BANDS: (above, at_most, grid_per_sm) per architecture -- the backward prepare's launch grid by token count
 # inside a band the design's persistent M1 grid min(ceil(T / 2), grid_per_sm x sm_count) (grid-stride
 # trips of the same binary: a host rule only, the program bytes are unchanged), outside every band the one-trip
-# production grid ceil(T / 2) (mhc_bwd_prepare.grid_rule(T, sm_count, rows_per_cta=2)). On sm_103a 2 x SMs = 304
+# production grid ceil(T / 2) (mhc_det_bwd_prepare.grid_rule(T, sm_count, rows_per_cta=2)). On sm_103a 2 x SMs = 304
 # CTAs for T <= 4096: g304 / production 0.9879 / 0.9865 / 0.9888 / 0.9865 at 1024 and 0.9868 / 0.9884 / 0.9872 /
 # 0.9863 at 4096 in four sessions on two nodes (bitwise, repeat 0; sanitizer PASS at grids 256 / 304 in both g2
 # sessions; g256 no gain at 4096, g456 a regression), slower on all eleven rows above 4096 in both sessions
@@ -4458,7 +4458,7 @@ def fwd_coef_program(
     regime = FWD_COEF_REGIMES[arch]
     if regime == "production":
         return "w16"
-    grid = -(-T // 8)  # mhc_fwd_coef.grid_rule(T, tokens_per_cta=8)
+    grid = -(-T // 8)  # mhc_det_fwd_coef.grid_rule(T, tokens_per_cta=8)
     if regime == "round2":
         if T < 4096:
             return "st16_w4"
@@ -5098,10 +5098,10 @@ def selected_modules(
 PDL_PATHS = ("forward", "backward", "checkpoint")
 # Library stem -> the edge its records sit on (predecessor -> dependent).
 PDL_EDGES = {
-    "cake_mhc_train_bwd_prepare": "K1->K5",
-    "cake_mhc_train_bwd_reduce": "K7->K8",
-    "cake_mhc_train_bwd_slab": "K6->K7",
-    "cake_mhc_train_fwd_collapse": "K1->K3",
+    "cake_mhc_det_train_bwd_prepare": "K1->K5",
+    "cake_mhc_det_train_bwd_reduce": "K7->K8",
+    "cake_mhc_det_train_bwd_slab": "K6->K7",
+    "cake_mhc_det_train_fwd_collapse": "K1->K3",
 }
 PDL_OFF_BANDS: dict[str, dict[str, dict[str, tuple[tuple[int, int], ...]]]] = {
     "sm_100a": {

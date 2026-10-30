@@ -24,8 +24,8 @@ the per-device default workspaces exist before the capture), in three forms:
 * the direct entry points ``forward_prepare`` -> ``forward_finish`` ->
   ``backward_prepare`` -> ``backward_finish`` (the branch backward
   ``dU = dB @ W^T`` in between);
-* the autograd entry points ``cake_mhc_train_prepare`` /
-  ``cake_mhc_train_finish`` and ``loss.backward()`` (``save_stats`` both ways);
+* the autograd entry points ``cake_mhc_det_train_prepare`` /
+  ``cake_mhc_det_train_finish`` and ``loss.backward()`` (``save_stats`` both ways);
 * the same layer inside a non-reentrant ``torch.utils.checkpoint``
   (``preserve_rng_state=False``: the layer draws no random numbers);
 
@@ -48,8 +48,8 @@ from torch.utils.checkpoint import checkpoint
 
 from tests.test_helpers.cake_package import cake_package
 
-pkg = cake_package("cake_mhc_train")
-loader = cake_package("cake_mhc_train", "cake_jit")
+pkg = cake_package("cake_mhc_det_train")
+loader = cake_package("cake_mhc_det_train", "cake_jit")
 
 SUPPORTED_CAPABILITIES = ((10, 0), (10, 3), (10, 7))
 STREAMS, HIDDEN, N, MAPPING_ROWS = 4, 4096, 16384, 24
@@ -65,13 +65,13 @@ def _supported() -> bool:
     return (
         torch.cuda.is_available()
         and torch.cuda.get_device_capability(_device()) in SUPPORTED_CAPABILITIES
-        and pkg.is_cake_mhc_train_supported(_device())
+        and pkg.is_cake_mhc_det_train_supported(_device())
     )
 
 
 pytestmark = pytest.mark.skipif(
     not _supported(),
-    reason="cake_mhc_train needs an SM100 / SM103 / SM107 device with exported routes",
+    reason="cake_mhc_det_train needs an SM100 / SM103 / SM107 device with exported routes",
 )
 
 
@@ -104,8 +104,8 @@ def _workspaces(T: int, caller_owned: bool):
     if not caller_owned:
         return None, None
     return (
-        pkg.cake_mhc_train_forward_workspace(T, _device()),
-        pkg.cake_mhc_train_backward_workspace(T, _device()),
+        pkg.cake_mhc_det_train_forward_workspace(T, _device()),
+        pkg.cake_mhc_det_train_backward_workspace(T, _device()),
     )
 
 
@@ -117,7 +117,7 @@ def _leaves(i: dict) -> list:
 
 def _layer(i: dict, wsf, wsb, save_stats: bool):
     def layer(X, fn, scale, base):
-        U, handle = pkg.cake_mhc_train_prepare(
+        U, handle = pkg.cake_mhc_det_train_prepare(
             X,
             fn,
             scale,
@@ -126,7 +126,7 @@ def _layer(i: dict, wsf, wsb, save_stats: bool):
             workspace=wsf,
             backward_workspace=wsb,
         )
-        return pkg.cake_mhc_train_finish(X, U @ i["W"], handle)
+        return pkg.cake_mhc_det_train_finish(X, U @ i["W"], handle)
 
     return layer
 
@@ -135,11 +135,11 @@ def _direct_step(i: dict, wsf, wsb):
     X, fn, scale, base, W, dY = (i[k] for k in ("X", "fn", "scale", "base", "W", "dY"))
 
     def step() -> dict:
-        U, stats = pkg.cake_mhc_train_forward_prepare(X, fn, scale, base, workspace=wsf)
+        U, stats = pkg.cake_mhc_det_train_forward_prepare(X, fn, scale, base, workspace=wsf)
         B = U @ W
-        Y = pkg.cake_mhc_train_forward_finish(X, B, stats)
-        dB, gstats = pkg.cake_mhc_train_backward_prepare(dY, B, X, stats)
-        dX, dfn, dscale, dbase = pkg.cake_mhc_train_backward_finish(
+        Y = pkg.cake_mhc_det_train_forward_finish(X, B, stats)
+        dB, gstats = pkg.cake_mhc_det_train_backward_prepare(dY, B, X, stats)
+        dX, dfn, dscale, dbase = pkg.cake_mhc_det_train_backward_finish(
             X, dY, dB @ W.t(), B, fn, scale, base, stats, gstats, workspace=wsb
         )
         return {

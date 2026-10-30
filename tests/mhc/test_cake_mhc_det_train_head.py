@@ -13,7 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
-Tests of the Cake mHC training head (``flashinfer.cake_mhc_train``): the stream
+Tests of the Cake mHC training head (``flashinfer.cake_mhc_det_train``): the stream
 mean ``Y = X.mean(dim=1)`` of BF16 ``X`` ``[T, 4, H]`` and its gradient, bit
 for bit against torch (signed zeros and NaN encodings included) at hidden
 4096, 5120 and 7168, through the forward / backward entry points, the
@@ -28,7 +28,7 @@ import torch
 import torch.utils.checkpoint
 
 import flashinfer
-from flashinfer import cake_mhc_train as facade
+from flashinfer import cake_mhc_det_train as facade
 from flashinfer.utils import get_compute_capability
 
 SUPPORTED_CAPABILITIES = ((10, 0), (10, 3), (10, 7))
@@ -66,7 +66,7 @@ def _supported(hidden: int | None = None) -> bool:
     return (
         torch.cuda.is_available()
         and get_compute_capability(_device()) in SUPPORTED_CAPABILITIES
-        and facade.is_cake_mhc_train_head_supported(_device(), hidden)
+        and facade.is_cake_mhc_det_train_head_supported(_device(), hidden)
     )
 
 
@@ -132,10 +132,10 @@ def test_forward_backward_bitwise(hidden: int, T: int, kind: str) -> None:
     dY = _draw((T, hidden), kind, g)
     dX0 = _draw((T, 4, hidden), kind, g)
 
-    _assert_bitwise(facade.cake_mhc_train_head_forward(X), X.mean(dim=1))
-    _assert_bitwise(facade.cake_mhc_train_head_backward(dY), _torch_grad(X, dY))
+    _assert_bitwise(facade.cake_mhc_det_train_head_forward(X), X.mean(dim=1))
+    _assert_bitwise(facade.cake_mhc_det_train_head_backward(dY), _torch_grad(X, dY))
     dX = dX0.clone()
-    out = facade.cake_mhc_train_head_backward(dY, dX=dX, accumulate=True)
+    out = facade.cake_mhc_det_train_head_backward(dY, dX=dX, accumulate=True)
     assert out is dX
     _assert_bitwise(dX, _torch_accumulated(X, dY, dX0))
 
@@ -148,58 +148,58 @@ def test_preallocated_outputs_and_zero_tokens(hidden: int) -> None:
     X = _draw((300, 4, hidden), "randn", g)
     dY = _draw((300, hidden), "randn", g)
     Y = torch.full((300, hidden), float("nan"), dtype=BF16, device=_device())
-    assert facade.cake_mhc_train_head_forward(X, out=Y) is Y
+    assert facade.cake_mhc_det_train_head_forward(X, out=Y) is Y
     _assert_bitwise(Y, X.mean(dim=1))
     dX = torch.full((300, 4, hidden), float("nan"), dtype=BF16, device=_device())
-    assert facade.cake_mhc_train_head_backward(dY, dX=dX) is dX
+    assert facade.cake_mhc_det_train_head_backward(dY, dX=dX) is dX
     _assert_bitwise(dX, _torch_grad(X, dY))
 
     empty = torch.empty((0, 4, hidden), dtype=BF16, device=_device())
-    assert facade.cake_mhc_train_head_forward(empty).shape == (0, hidden)
-    assert facade.cake_mhc_train_head_backward(empty[:, 0]).shape == (0, 4, hidden)
+    assert facade.cake_mhc_det_train_head_forward(empty).shape == (0, hidden)
+    assert facade.cake_mhc_det_train_head_backward(empty[:, 0]).shape == (0, 4, hidden)
 
 
 def test_argument_checks() -> None:
     X = torch.zeros((8, 4, 4096), dtype=BF16, device=_device())
     with pytest.raises(ValueError, match="hidden"):
-        facade.cake_mhc_train_head_forward(
+        facade.cake_mhc_det_train_head_forward(
             torch.zeros((8, 4, 4000), dtype=BF16, device=_device())
         )
     with pytest.raises(ValueError, match="float32|bfloat16"):
-        facade.cake_mhc_train_head_forward(X.float())
+        facade.cake_mhc_det_train_head_forward(X.float())
     with pytest.raises(ValueError, match="contiguous"):
-        facade.cake_mhc_train_head_forward(
+        facade.cake_mhc_det_train_head_forward(
             torch.zeros((4, 8, 4096), dtype=BF16, device=_device()).transpose(0, 1)
         )
     with pytest.raises(ValueError, match="aligned"):
-        facade.cake_mhc_train_head_forward(
+        facade.cake_mhc_det_train_head_forward(
             torch.zeros(8 * 4 * 4096 + 8, dtype=BF16, device=_device())[8:].view(
                 8, 4, 4096
             )
         )
     with pytest.raises(ValueError, match=r"\[T, 4, hidden\]"):
-        facade.cake_mhc_train_head_forward(
+        facade.cake_mhc_det_train_head_forward(
             torch.zeros((8, 3, 4096), dtype=BF16, device=_device())
         )
     with pytest.raises(ValueError, match="contiguous"):
-        facade.cake_mhc_train_head_forward(
+        facade.cake_mhc_det_train_head_forward(
             X, out=torch.empty((8, 4096 * 2), dtype=BF16, device=_device())[:, :4096]
         )
     with pytest.raises(ValueError, match="shape"):
-        facade.cake_mhc_train_head_forward(
+        facade.cake_mhc_det_train_head_forward(
             X, out=torch.empty((8, 5120), dtype=BF16, device=_device())
         )
     dY = torch.zeros((8, 4096), dtype=BF16, device=_device())
     with pytest.raises(ValueError, match="accumulate"):
-        facade.cake_mhc_train_head_backward(dY, accumulate=True)
+        facade.cake_mhc_det_train_head_backward(dY, accumulate=True)
     with pytest.raises(ValueError, match="shape"):
-        facade.cake_mhc_train_head_backward(
+        facade.cake_mhc_det_train_head_backward(
             dY, dX=torch.empty((8, 4, 5120), dtype=BF16, device=_device())
         )
     with pytest.raises(ValueError, match="overlap"):
-        facade.cake_mhc_train_head_backward(X.view(-1)[: 8 * 4096].view(8, 4096), dX=X)
+        facade.cake_mhc_det_train_head_backward(X.view(-1)[: 8 * 4096].view(8, 4096), dX=X)
     with pytest.raises(ValueError, match="overlap"):
-        facade.cake_mhc_train_head_forward(X, out=X.view(-1)[: 8 * 4096].view(8, 4096))
+        facade.cake_mhc_det_train_head_forward(X, out=X.view(-1)[: 8 * 4096].view(8, 4096))
 
 
 @pytest.mark.parametrize("hidden", HIDDEN)
@@ -211,19 +211,19 @@ def test_autograd_matches_torch(hidden: int) -> None:
     dY = _draw((513, hidden), "spread", g)
     ours = X.detach().requires_grad_(True)
     ref = X.detach().requires_grad_(True)
-    Y = facade.cake_mhc_train_head(ours)
+    Y = facade.cake_mhc_det_train_head(ours)
     _assert_bitwise(Y, ref.mean(dim=1))
     # Two backward passes: the second accumulates into X.grad exactly as torch's does.
     for _ in range(2):
-        facade.cake_mhc_train_head(ours).backward(dY)
+        facade.cake_mhc_det_train_head(ours).backward(dY)
         ref.mean(dim=1).backward(dY)
         _assert_bitwise(ours.grad, ref.grad)
     # A non-contiguous incoming gradient (the expanded gradient of a sum) is read through a copy.
     ours.grad = ref.grad = None
-    facade.cake_mhc_train_head(ours).float().sum().backward()
+    facade.cake_mhc_det_train_head(ours).float().sum().backward()
     ref.mean(dim=1).float().sum().backward()
     _assert_bitwise(ours.grad, ref.grad)
-    assert flashinfer.cake_mhc_train_head is facade.cake_mhc_train_head
+    assert flashinfer.cake_mhc_det_train_head is facade.cake_mhc_det_train_head
 
 
 @pytest.mark.parametrize("use_reentrant", [False, True])
@@ -239,7 +239,7 @@ def test_activation_checkpoint(use_reentrant: bool) -> None:
     ours = X.detach().requires_grad_(True)
     ref = X.detach().requires_grad_(True)
     out = torch.utils.checkpoint.checkpoint(
-        block, ours, facade.cake_mhc_train_head, use_reentrant=use_reentrant
+        block, ours, facade.cake_mhc_det_train_head, use_reentrant=use_reentrant
     )
     want = block(ref, lambda x: x.mean(dim=1))
     _assert_bitwise(out, want)
@@ -259,9 +259,9 @@ def test_cuda_graph_capture() -> None:
     acc0 = dXa.clone()
 
     def step() -> None:
-        facade.cake_mhc_train_head_forward(X, out=Y)
-        facade.cake_mhc_train_head_backward(dY, dX=dX)
-        facade.cake_mhc_train_head_backward(dY, dX=dXa, accumulate=True)
+        facade.cake_mhc_det_train_head_forward(X, out=Y)
+        facade.cake_mhc_det_train_head_backward(dY, dX=dX)
+        facade.cake_mhc_det_train_head_backward(dY, dX=dXa, accumulate=True)
 
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())

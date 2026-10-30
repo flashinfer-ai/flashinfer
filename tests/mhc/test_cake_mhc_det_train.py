@@ -60,7 +60,7 @@ the IEEE-FP32 evaluation of the same reference (TF32 off):
   spec-literal mask figures (maximum ulp, ``n(> 2 ulp)``, strict band verdict,
   the single-draw refined verdict) as the literal record; the IEEE-FP32
   comparator itself exceeds 2 ulp on that band;
-* checkpoint replay (``forward_stats``, ``cake_mhc_train_prepare(save_stats=False)``)
+* checkpoint replay (``forward_stats``, ``cake_mhc_det_train_prepare(save_stats=False)``)
   gives bitwise the same statistics and gradients as the saved path;
 * the autograd wrappers keep nothing of a connection alive once its backward
   has run (plain graphs, non-reentrant and reentrant checkpoints, a backward
@@ -85,9 +85,9 @@ This suite exercises the backend package alone: it names the package once,
 through ``tests.test_helpers.cake_package``, and imports nothing else from
 flashinfer, so a build that vendors the package under another import path
 runs it unchanged after pointing that table entry at its package.  The
-``flashinfer.cake_mhc_train`` facade and the ``flashinfer`` top-level
-exposure are covered by ``test_cake_mhc_train_api.py``; the host rules by
-``test_cake_mhc_train_rules.py``.
+``flashinfer.cake_mhc_det_train`` facade and the ``flashinfer`` top-level
+exposure are covered by ``test_cake_mhc_det_train_api.py``; the host rules by
+``test_cake_mhc_det_train_rules.py``.
 """
 
 from __future__ import annotations
@@ -103,19 +103,19 @@ import torch
 
 from tests.test_helpers.cake_package import cake_package
 
-pkg = cake_package("cake_mhc_train")
-cake_build = cake_package("cake_mhc_train", "cake_build")
-loader = cake_package("cake_mhc_train", "cake_jit")
-forward_prepare = pkg.cake_mhc_train_forward_prepare
-forward_stats = pkg.cake_mhc_train_forward_stats
-forward_finish = pkg.cake_mhc_train_forward_finish
-backward_prepare = pkg.cake_mhc_train_backward_prepare
-backward_finish = pkg.cake_mhc_train_backward_finish
-forward_workspace = pkg.cake_mhc_train_forward_workspace
-backward_workspace = pkg.cake_mhc_train_backward_workspace
-forward_workspace_bytes = pkg.cake_mhc_train_forward_workspace_bytes
-backward_workspace_bytes = pkg.cake_mhc_train_backward_workspace_bytes
-is_supported = pkg.is_cake_mhc_train_supported
+pkg = cake_package("cake_mhc_det_train")
+cake_build = cake_package("cake_mhc_det_train", "cake_build")
+loader = cake_package("cake_mhc_det_train", "cake_jit")
+forward_prepare = pkg.cake_mhc_det_train_forward_prepare
+forward_stats = pkg.cake_mhc_det_train_forward_stats
+forward_finish = pkg.cake_mhc_det_train_forward_finish
+backward_prepare = pkg.cake_mhc_det_train_backward_prepare
+backward_finish = pkg.cake_mhc_det_train_backward_finish
+forward_workspace = pkg.cake_mhc_det_train_forward_workspace
+backward_workspace = pkg.cake_mhc_det_train_backward_workspace
+forward_workspace_bytes = pkg.cake_mhc_det_train_forward_workspace_bytes
+backward_workspace_bytes = pkg.cake_mhc_det_train_backward_workspace_bytes
+is_supported = pkg.is_cake_mhc_det_train_supported
 
 SUPPORTED_CAPABILITIES = ((10, 0), (10, 3), (10, 7))
 STREAMS, HIDDEN, N, MAPPING_ROWS = 4, 4096, 16384, 24
@@ -190,7 +190,7 @@ def _supported() -> bool:
 
 pytestmark = pytest.mark.skipif(
     not _supported(),
-    reason="cake_mhc_train needs an SM100 / SM103 / SM107 device with exported routes",
+    reason="cake_mhc_det_train needs an SM100 / SM103 / SM107 device with exported routes",
 )
 
 
@@ -1039,11 +1039,11 @@ def test_checkpoint_replay_is_bitwise(T: int) -> None:
         fn = i["fn"].clone().requires_grad_(True)
         scale = i["scale"].clone().requires_grad_(True)
         base = i["base"].clone().requires_grad_(True)
-        U, handle = pkg.cake_mhc_train_prepare(
+        U, handle = pkg.cake_mhc_det_train_prepare(
             X, fn, scale, base, save_stats=save_stats
         )
         B = (U.float() + i["B"].float()).to(BF16)
-        Y = pkg.cake_mhc_train_finish(X, B, handle)
+        Y = pkg.cake_mhc_det_train_finish(X, B, handle)
         (Y.float() * i["dY"].float()).sum().backward()
         grads.append(
             (X.grad.clone(), fn.grad.clone(), scale.grad.clone(), base.grad.clone())
@@ -1095,11 +1095,11 @@ def test_checkpoint_keeps_nothing_alive(T: int, save_stats: bool) -> None:
     i = _make_inputs(T, seed=SEED + 41)
 
     def connection(X, fn, scale, base):
-        U, handle = pkg.cake_mhc_train_prepare(
+        U, handle = pkg.cake_mhc_det_train_prepare(
             X, fn, scale, base, save_stats=save_stats
         )
         B = (U.float() + i["B"].float()).to(BF16)
-        return pkg.cake_mhc_train_finish(X, B, handle)
+        return pkg.cake_mhc_det_train_finish(X, B, handle)
 
     def leaves() -> list:
         return [i[k].clone().requires_grad_(True) for k in ("X", "fn", "scale", "base")]
@@ -1119,7 +1119,7 @@ def test_checkpoint_keeps_nothing_alive(T: int, save_stats: bool) -> None:
 @pytest.mark.parametrize("T", (129, 2049))
 @pytest.mark.parametrize("save_stats", (True, False))
 def test_checkpoint_after_prepare_replays_statistics(T: int, save_stats: bool) -> None:
-    """A non-reentrant ``torch.utils.checkpoint`` region that starts after ``cake_mhc_train_prepare`` (the branch and
+    """A non-reentrant ``torch.utils.checkpoint`` region that starts after ``cake_mhc_det_train_prepare`` (the branch and
     the finish inside it, the prepare outside) keeps nothing beyond its output after the forward; its backward reruns
     the finish on a handle that already released the statistics, which the finish forward replays bitwise, so the
     gradients equal the plain run bit for bit."""
@@ -1129,17 +1129,17 @@ def test_checkpoint_after_prepare_replays_statistics(T: int, save_stats: bool) -
 
     def finish(X, U, handle):
         B = (U.float() + i["B"].float()).to(BF16)
-        return pkg.cake_mhc_train_finish(X, B, handle)
+        return pkg.cake_mhc_det_train_finish(X, B, handle)
 
     def leaves() -> list:
         return [i[k].clone().requires_grad_(True) for k in ("X", "fn", "scale", "base")]
 
     plain = leaves()
-    U, handle = pkg.cake_mhc_train_prepare(*plain, save_stats=save_stats)
+    U, handle = pkg.cake_mhc_det_train_prepare(*plain, save_stats=save_stats)
     (finish(plain[0], U, handle).float() * i["dY"].float()).sum().backward()
 
     checkpointed = leaves()
-    U, handle = pkg.cake_mhc_train_prepare(*checkpointed, save_stats=save_stats)
+    U, handle = pkg.cake_mhc_det_train_prepare(*checkpointed, save_stats=save_stats)
     # pinned: save_stats=False releases it in the finish forward
     stats = handle.state.stats
     before = _live_bytes()
@@ -1167,10 +1167,10 @@ def _two_layers(
     from torch.utils.checkpoint import checkpoint
 
     def connection(x, fn, scale, base):
-        U, handle = pkg.cake_mhc_train_prepare(
+        U, handle = pkg.cake_mhc_det_train_prepare(
             x, fn, scale, base, save_stats=save_stats
         )
-        return pkg.cake_mhc_train_finish(x, U, handle)
+        return pkg.cake_mhc_det_train_finish(x, U, handle)
 
     def layer(x, k):
         return connection(connection(x, *params[2 * k]), *params[2 * k + 1])
@@ -1223,9 +1223,9 @@ def test_repeated_backward_with_retain_graph(T: int, save_stats: bool) -> None:
     i = _make_inputs(T, seed=SEED + 56)
 
     def graph(leaves: list) -> tuple:
-        U, handle = pkg.cake_mhc_train_prepare(*leaves, save_stats=save_stats)
+        U, handle = pkg.cake_mhc_det_train_prepare(*leaves, save_stats=save_stats)
         B = (U.float() + i["B"].float()).to(BF16)
-        return U, pkg.cake_mhc_train_finish(leaves[0], B, handle)
+        return U, pkg.cake_mhc_det_train_finish(leaves[0], B, handle)
 
     leaves = _connection_leaves(i)
     U, Y = graph(leaves)
@@ -1261,10 +1261,10 @@ def test_reentrant_checkpoint(T: int, save_stats: bool, region: str) -> None:
 
     def finish(X, U, handle):
         B = (U.float() + i["B"].float()).to(BF16)
-        return pkg.cake_mhc_train_finish(X, B, handle)
+        return pkg.cake_mhc_det_train_finish(X, B, handle)
 
     def connection(X, fn, scale, base):
-        U, handle = pkg.cake_mhc_train_prepare(
+        U, handle = pkg.cake_mhc_det_train_prepare(
             X, fn, scale, base, save_stats=save_stats
         )
         return finish(X, U, handle)
@@ -1277,7 +1277,7 @@ def test_reentrant_checkpoint(T: int, save_stats: bool, region: str) -> None:
     if region == "connection":
         Y = checkpoint(connection, *checkpointed, use_reentrant=True)
     else:
-        U, handle = pkg.cake_mhc_train_prepare(*checkpointed, save_stats=save_stats)
+        U, handle = pkg.cake_mhc_det_train_prepare(*checkpointed, save_stats=save_stats)
         Y = checkpoint(finish, checkpointed[0], U, handle, use_reentrant=True)
         del U
     Y.backward(i["dY"])
@@ -1307,11 +1307,11 @@ def test_backward_without_the_prepare_node(T: int, prepare: str) -> None:
     )
 
     def step() -> tuple:
-        U, handle = pkg.cake_mhc_train_prepare(*leaves)
+        U, handle = pkg.cake_mhc_det_train_prepare(*leaves)
         B = (U.float() + i["B"].float()).to(BF16)
         if prepare == "not_recorded":
             B.requires_grad_(True)
-        Y = pkg.cake_mhc_train_finish(leaves[0], B, handle)
+        Y = pkg.cake_mhc_det_train_finish(leaves[0], B, handle)
         return Y, B, handle, torch.autograd.grad(Y, [B], i["dY"])
 
     step()
@@ -1339,15 +1339,15 @@ def test_interleaved_connections(save_stats: bool) -> None:
 
     def run(interleaved: bool) -> list:
         la, lb = _connection_leaves(a), _connection_leaves(b)
-        Ua, ha = pkg.cake_mhc_train_prepare(*la, save_stats=save_stats)
+        Ua, ha = pkg.cake_mhc_det_train_prepare(*la, save_stats=save_stats)
         if interleaved:
-            Ub, hb = pkg.cake_mhc_train_prepare(*lb, save_stats=save_stats)
-            Yb = pkg.cake_mhc_train_finish(lb[0], branch(b, Ub), hb)
-            Ya = pkg.cake_mhc_train_finish(la[0], branch(a, Ua), ha)
+            Ub, hb = pkg.cake_mhc_det_train_prepare(*lb, save_stats=save_stats)
+            Yb = pkg.cake_mhc_det_train_finish(lb[0], branch(b, Ub), hb)
+            Ya = pkg.cake_mhc_det_train_finish(la[0], branch(a, Ua), ha)
         else:
-            Ya = pkg.cake_mhc_train_finish(la[0], branch(a, Ua), ha)
-            Ub, hb = pkg.cake_mhc_train_prepare(*lb, save_stats=save_stats)
-            Yb = pkg.cake_mhc_train_finish(lb[0], branch(b, Ub), hb)
+            Ya = pkg.cake_mhc_det_train_finish(la[0], branch(a, Ua), ha)
+            Ub, hb = pkg.cake_mhc_det_train_prepare(*lb, save_stats=save_stats)
+            Yb = pkg.cake_mhc_det_train_finish(lb[0], branch(b, Ub), hb)
         torch.autograd.backward([Ya, Yb], [a["dY"], b["dY"]])
         return [p.grad for p in la + lb]
 
@@ -1530,19 +1530,19 @@ def test_changing_eps_in_one_process_does_not_rebuild() -> None:
 @pytest.mark.parametrize("T", (7, 2049))
 @pytest.mark.parametrize("save_stats", (True, False))
 def test_autograd_end_to_end(T: int, save_stats: bool) -> None:
-    """``cake_mhc_train_prepare`` / ``cake_mhc_train_finish`` around a branch, against the FP64 reference with the
+    """``cake_mhc_det_train_prepare`` / ``cake_mhc_det_train_finish`` around a branch, against the FP64 reference with the
     branch output and the branch's ``dU`` the autograd graph produced."""
     i = _make_inputs(T, seed=SEED + 31)
     X = i["X"].clone().requires_grad_(True)
     fn = i["fn"].clone().requires_grad_(True)
     scale = i["scale"].clone().requires_grad_(True)
     base = i["base"].clone().requires_grad_(True)
-    U, handle = pkg.cake_mhc_train_prepare(X, fn, scale, base, save_stats=save_stats)
+    U, handle = pkg.cake_mhc_det_train_prepare(X, fn, scale, base, save_stats=save_stats)
     U.retain_grad()
     B = (U.float() + i["B"].float()).to(
         BF16
     )  # the branch: dB/dU = 1, so the branch backward hands dB on as dU
-    Y = pkg.cake_mhc_train_finish(X, B, handle)
+    Y = pkg.cake_mhc_det_train_finish(X, B, handle)
     (Y.float() * i["dY"].float()).sum().backward()
     assert U.grad is not None and U.grad.dtype == BF16
     j = {**i, "B": B.detach(), "dU": U.grad.detach()}
@@ -1618,7 +1618,7 @@ def test_workspace_bytes_and_layout() -> None:
     )
     assert torch.count_nonzero(ws) == 0
     ws.fill_(1)
-    pkg.cake_mhc_train_reset_workspace(ws)
+    pkg.cake_mhc_det_train_reset_workspace(ws)
     assert torch.count_nonzero(ws) == 0
     with pytest.raises(ValueError):
         forward_workspace_bytes(-1, _device())
@@ -1661,7 +1661,7 @@ def test_argument_validation() -> None:
     with pytest.raises(ValueError):
         forward_prepare(X.cpu(), fn.cpu(), scale.cpu(), base.cpu())
     # The epsilons are launch arguments of the compiled programs (any finite positive value runs); the Sinkhorn
-    # iteration count is an integer from 1 to SINKHORN_ITERS_MAX (test_cake_mhc_train_iters.py runs the counts).
+    # iteration count is an integer from 1 to SINKHORN_ITERS_MAX (test_cake_mhc_det_train_iters.py runs the counts).
     for kwargs in (
         {"rms_eps": 1e-6},
         {"hc_eps": 1e-5},
@@ -1718,7 +1718,7 @@ def test_argument_validation() -> None:
     )
     assert all(torch.equal(a, b) for a, b in zip(with_b, without_b, strict=False))
     with pytest.raises(TypeError):
-        pkg.cake_mhc_train_finish(X, i["B"], object())
+        pkg.cake_mhc_det_train_finish(X, i["B"], object())
 
 
 def test_registry_records_reference_the_build_manifest() -> None:

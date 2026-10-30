@@ -44,7 +44,7 @@ from collections.abc import Sequence
 from typing import Any
 
 MODULES: dict[str, dict[str, Any]] = {
-    "cake_mhc_train_head_fwd": {
+    "cake_mhc_det_train_head_fwd": {
         "arches": [
             "sm_100a",
             "sm_103a",
@@ -61,8 +61,8 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "vectors", "threads": 256, "vector_elems": 8},
-        "kernel": "cake_mhc_train_head_fwd",
-        "kernel_symbol": "kernel_cake_mhc_train_head_fwd",
+        "kernel": "cake_mhc_det_train_head_fwd",
+        "kernel_symbol": "kernel_cake_mhc_det_train_head_fwd",
         "launch": {
             "block": (256, 1, 1),
             "cluster": (1, 1, 1),
@@ -70,7 +70,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 0,
             "use_pdl": False,
         },
-        "library": "cake_mhc_train_head_fwd",
+        "library": "cake_mhc_det_train_head_fwd",
         "logical": {
             "T": "rows",
             "hv": "hv",
@@ -79,7 +79,7 @@ MODULES: dict[str, dict[str, Any]] = {
         },
         "role": "head_fwd",
     },
-    "cake_mhc_train_head_bwd": {
+    "cake_mhc_det_train_head_bwd": {
         "arches": [
             "sm_100a",
             "sm_103a",
@@ -96,8 +96,8 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "vectors", "threads": 256, "vector_elems": 16},
-        "kernel": "cake_mhc_train_head_bwd",
-        "kernel_symbol": "kernel_cake_mhc_train_head_bwd",
+        "kernel": "cake_mhc_det_train_head_bwd",
+        "kernel_symbol": "kernel_cake_mhc_det_train_head_bwd",
         "launch": {
             "block": (256, 1, 1),
             "cluster": (1, 1, 1),
@@ -105,7 +105,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 0,
             "use_pdl": False,
         },
-        "library": "cake_mhc_train_head_bwd",
+        "library": "cake_mhc_det_train_head_bwd",
         "logical": {
             "T": "rows",
             "dx": "dx",
@@ -114,7 +114,7 @@ MODULES: dict[str, dict[str, Any]] = {
         },
         "role": "head_bwd",
     },
-    "cake_mhc_train_head_bwd__acc": {
+    "cake_mhc_det_train_head_bwd__acc": {
         "arches": [
             "sm_100a",
             "sm_103a",
@@ -131,8 +131,8 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "vectors", "threads": 256, "vector_elems": 16},
-        "kernel": "cake_mhc_train_head_bwd__acc",
-        "kernel_symbol": "kernel_cake_mhc_train_head_bwd__acc",
+        "kernel": "cake_mhc_det_train_head_bwd__acc",
+        "kernel_symbol": "kernel_cake_mhc_det_train_head_bwd__acc",
         "launch": {
             "block": (256, 1, 1),
             "cluster": (1, 1, 1),
@@ -140,7 +140,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 0,
             "use_pdl": False,
         },
-        "library": "cake_mhc_train_head_bwd__acc",
+        "library": "cake_mhc_det_train_head_bwd__acc",
         "logical": {
             "T": "rows",
             "dx": "dx",
@@ -153,9 +153,9 @@ MODULES: dict[str, dict[str, Any]] = {
 # The module record of each public call: the forward, the backward that writes
 # ``dX`` and the backward that adds into it (``accumulate=True``).
 ROLES: dict[str, str] = {
-    "head_fwd": "cake_mhc_train_head_fwd",
-    "head_bwd": "cake_mhc_train_head_bwd",
-    "head_bwd_acc": "cake_mhc_train_head_bwd__acc",
+    "head_fwd": "cake_mhc_det_train_head_fwd",
+    "head_bwd": "cake_mhc_det_train_head_bwd",
+    "head_bwd_acc": "cake_mhc_det_train_head_bwd__acc",
 }
 
 # One verified build per architecture: B200 (``sm_100a``), B300 (``sm_103a``)

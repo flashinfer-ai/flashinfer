@@ -311,6 +311,39 @@ from .cake_causal_conv1d_train import (
 from .cake_causal_conv1d_train import (
     cake_causal_conv1d_train_forward_workspace_bytes as cake_causal_conv1d_train_forward_workspace_bytes,
 )
+from .cake_mhc_det_train import CakeMHCDetTrainFinishFunction as CakeMHCDetTrainFinishFunction
+from .cake_mhc_det_train import CakeMHCDetTrainHeadFunction as CakeMHCDetTrainHeadFunction
+from .cake_mhc_det_train import CakeMHCDetTrainPrepareFunction as CakeMHCDetTrainPrepareFunction
+from .cake_mhc_det_train import (
+    cake_mhc_det_train_backward_finish as cake_mhc_det_train_backward_finish,
+)
+from .cake_mhc_det_train import (
+    cake_mhc_det_train_backward_prepare as cake_mhc_det_train_backward_prepare,
+)
+from .cake_mhc_det_train import (
+    cake_mhc_det_train_backward_workspace_bytes as cake_mhc_det_train_backward_workspace_bytes,
+)
+from .cake_mhc_det_train import cake_mhc_det_train_finish as cake_mhc_det_train_finish
+from .cake_mhc_det_train import (
+    cake_mhc_det_train_forward_finish as cake_mhc_det_train_forward_finish,
+)
+from .cake_mhc_det_train import (
+    cake_mhc_det_train_forward_prepare as cake_mhc_det_train_forward_prepare,
+)
+from .cake_mhc_det_train import (
+    cake_mhc_det_train_forward_stats as cake_mhc_det_train_forward_stats,
+)
+from .cake_mhc_det_train import (
+    cake_mhc_det_train_forward_workspace_bytes as cake_mhc_det_train_forward_workspace_bytes,
+)
+from .cake_mhc_det_train import cake_mhc_det_train_head as cake_mhc_det_train_head
+from .cake_mhc_det_train import (
+    cake_mhc_det_train_head_backward as cake_mhc_det_train_head_backward,
+)
+from .cake_mhc_det_train import (
+    cake_mhc_det_train_head_forward as cake_mhc_det_train_head_forward,
+)
+from .cake_mhc_det_train import cake_mhc_det_train_prepare as cake_mhc_det_train_prepare
 from .cake_mhc_train import CakeMHCTrainFinishFunction as CakeMHCTrainFinishFunction
 from .cake_mhc_train import CakeMHCTrainHeadFunction as CakeMHCTrainHeadFunction
 from .cake_mhc_train import CakeMHCTrainPrepareFunction as CakeMHCTrainPrepareFunction

@@ -14,12 +14,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 Tests of the flashinfer public surface of the Cake four-stream mHC training
-kernels (SM100 / SM103 / SM107): the ``flashinfer.cake_mhc_train`` facade and
+kernels (SM100 / SM103 / SM107): the ``flashinfer.cake_mhc_det_train`` facade and
 its re-exports from the ``flashinfer`` top-level package.  The facade's entry
-points are pass-throughs to ``flashinfer.cake_mhc_train_backend``; this module
+points are pass-throughs to ``flashinfer.cake_mhc_det_train_backend``; this module
 checks that identity (same objects at the top level, same bits as the backend,
 documented keyword arguments) and leaves the numerical contract to
-``test_cake_mhc_train.py``, which imports only the backend package.
+``test_cake_mhc_det_train.py``, which imports only the backend package.
 """
 
 from __future__ import annotations
@@ -30,27 +30,27 @@ import pytest
 import torch
 
 import flashinfer
-import flashinfer.cake_mhc_train_backend as backend
-from flashinfer import cake_mhc_train as facade
-from flashinfer.cake_mhc_train_backend import cake_jit as loader
+import flashinfer.cake_mhc_det_train_backend as backend
+from flashinfer import cake_mhc_det_train as facade
+from flashinfer.cake_mhc_det_train_backend import cake_jit as loader
 from flashinfer.jit.env import has_flashinfer_jit_cache
 from flashinfer.utils import get_compute_capability
 
 SUPPORTED_CAPABILITIES = ((10, 0), (10, 3), (10, 7))
 ENTRY_POINTS = (
-    "cake_mhc_train_forward_prepare",
-    "cake_mhc_train_forward_stats",
-    "cake_mhc_train_forward_finish",
-    "cake_mhc_train_backward_prepare",
-    "cake_mhc_train_backward_finish",
-    "cake_mhc_train_prepare",
-    "cake_mhc_train_finish",
+    "cake_mhc_det_train_forward_prepare",
+    "cake_mhc_det_train_forward_stats",
+    "cake_mhc_det_train_forward_finish",
+    "cake_mhc_det_train_backward_prepare",
+    "cake_mhc_det_train_backward_finish",
+    "cake_mhc_det_train_prepare",
+    "cake_mhc_det_train_finish",
 )
 HELPERS = (
-    "cake_mhc_train_forward_workspace_bytes",
-    "cake_mhc_train_backward_workspace_bytes",
-    "CakeMHCTrainPrepareFunction",
-    "CakeMHCTrainFinishFunction",
+    "cake_mhc_det_train_forward_workspace_bytes",
+    "cake_mhc_det_train_backward_workspace_bytes",
+    "CakeMHCDetTrainPrepareFunction",
+    "CakeMHCDetTrainFinishFunction",
 )
 SEED = 2032
 
@@ -63,7 +63,7 @@ def _supported() -> bool:
     return (
         torch.cuda.is_available()
         and get_compute_capability(_device()) in SUPPORTED_CAPABILITIES
-        and facade.is_cake_mhc_train_supported(_device())
+        and facade.is_cake_mhc_det_train_supported(_device())
     )
 
 
@@ -93,7 +93,7 @@ def test_entry_points_document_every_keyword() -> None:
                     parameter.name,
                 )
     for name in ("rms_eps", "hc_eps", "sinkhorn_iters"):
-        parameter = inspect.signature(facade.cake_mhc_train_forward_prepare).parameters[
+        parameter = inspect.signature(facade.cake_mhc_det_train_forward_prepare).parameters[
             name
         ]
         assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
@@ -101,7 +101,7 @@ def test_entry_points_document_every_keyword() -> None:
 
 pytestmark_gpu = pytest.mark.skipif(
     not _supported(),
-    reason="cake_mhc_train needs an SM100 / SM103 / SM107 device with exported routes",
+    reason="cake_mhc_det_train needs an SM100 / SM103 / SM107 device with exported routes",
 )
 
 
@@ -137,21 +137,21 @@ def _inputs(T: int) -> dict[str, torch.Tensor]:
 def test_facade_entry_points_match_the_backend(T: int) -> None:
     """The facade forwards every argument: each entry point returns the same bits as the backend package's."""
     i = _inputs(T)
-    U, stats = facade.cake_mhc_train_forward_prepare(
+    U, stats = facade.cake_mhc_det_train_forward_prepare(
         i["X"], i["fn"], i["scale"], i["base"]
     )
-    U_b, stats_b = backend.cake_mhc_train_forward_prepare(
+    U_b, stats_b = backend.cake_mhc_det_train_forward_prepare(
         i["X"], i["fn"], i["scale"], i["base"]
     )
     assert torch.equal(U, U_b) and torch.equal(stats, stats_b)
     assert torch.equal(
-        facade.cake_mhc_train_forward_stats(i["X"], i["fn"], i["scale"], i["base"]),
+        facade.cake_mhc_det_train_forward_stats(i["X"], i["fn"], i["scale"], i["base"]),
         stats,
     )
-    Y = facade.cake_mhc_train_forward_finish(i["X"], i["B"], stats)
-    assert torch.equal(Y, backend.cake_mhc_train_forward_finish(i["X"], i["B"], stats))
-    dB, gstats = facade.cake_mhc_train_backward_prepare(i["dY"], i["B"], i["X"], stats)
-    dB_b, gstats_b = backend.cake_mhc_train_backward_prepare(
+    Y = facade.cake_mhc_det_train_forward_finish(i["X"], i["B"], stats)
+    assert torch.equal(Y, backend.cake_mhc_det_train_forward_finish(i["X"], i["B"], stats))
+    dB, gstats = facade.cake_mhc_det_train_backward_prepare(i["dY"], i["B"], i["X"], stats)
+    dB_b, gstats_b = backend.cake_mhc_det_train_backward_prepare(
         i["dY"], i["B"], i["X"], stats
     )
     assert torch.equal(dB, dB_b) and torch.equal(gstats, gstats_b)
@@ -166,12 +166,12 @@ def test_facade_entry_points_match_the_backend(T: int) -> None:
         stats,
         gstats,
     )
-    outputs = facade.cake_mhc_train_backward_finish(*args)
-    outputs_b = backend.cake_mhc_train_backward_finish(*args)
+    outputs = facade.cake_mhc_det_train_backward_finish(*args)
+    outputs_b = backend.cake_mhc_det_train_backward_finish(*args)
     assert all(torch.equal(a, b) for a, b in zip(outputs, outputs_b, strict=False))
-    assert facade.cake_mhc_train_forward_workspace_bytes(
+    assert facade.cake_mhc_det_train_forward_workspace_bytes(
         T, _device()
-    ) == backend.cake_mhc_train_forward_workspace_bytes(T, _device())
+    ) == backend.cake_mhc_det_train_forward_workspace_bytes(T, _device())
 
 
 @pytestmark_gpu
@@ -184,9 +184,9 @@ def test_autograd_wrappers_match_the_backend() -> None:
         fn = i["fn"].clone().requires_grad_(True)
         scale = i["scale"].clone().requires_grad_(True)
         base = i["base"].clone().requires_grad_(True)
-        U, handle = module.cake_mhc_train_prepare(X, fn, scale, base)
+        U, handle = module.cake_mhc_det_train_prepare(X, fn, scale, base)
         B = (U.float() + i["B"].float()).to(torch.bfloat16)
-        Y = module.cake_mhc_train_finish(X, B, handle)
+        Y = module.cake_mhc_det_train_finish(X, B, handle)
         (Y.float() * i["dY"].float()).sum().backward()
         grads.append(
             (X.grad.clone(), fn.grad.clone(), scale.grad.clone(), base.grad.clone())
