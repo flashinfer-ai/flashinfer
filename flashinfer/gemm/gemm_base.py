@@ -9160,7 +9160,8 @@ def _b12x_gemm_fp4_runner(
 
         Tactics are tuples:
             (mma_tiler_mn, cluster_shape_mn, swap_ab, use_prefetch, kernel_type, use_tma_store)
-        where kernel_type is always "sm120" and use_tma_store is always None.
+        where kernel_type is always "sm120" and use_tma_store=None selects
+        the store path from the output row alignment.
         """
 
         def get_valid_tactics(
@@ -9254,6 +9255,11 @@ def _b12x_gemm_fp4_runner(
                 use_tma_store,
             ) = tactic
 
+            # TMA requires 16-byte output rows, also for cached/tuned tactics.
+            use_tma_store = (
+                use_tma_store is not False and n % (128 // c_cutlass_dtype.width) == 0
+            )
+
             kernel_a, kernel_b = a, b.T
             kernel_a_sf, kernel_b_sf = a_descale, b_descale.T
 
@@ -9282,6 +9288,7 @@ def _b12x_gemm_fp4_runner(
                 use_prefetch=use_prefetch,
                 enable_pdl=enable_pdl,
                 swap_ab=swap_ab,
+                use_tma_store=use_tma_store,
             )
 
             # swap_ab is device-internal (applied in the kernel ctor); public C
