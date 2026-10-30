@@ -2578,6 +2578,13 @@ ROLES = ("fwd", "bwd", "reduce")
 # architecture of its record); ``channels_per_cta`` launches ``ceil(C /
 # channels_per_cta)`` CTAs (the reduce programs).
 GRID_KINDS = ("co_resident", "occupancy", "channels_per_cta")
+# The opt-in backward grid multiples a call may choose (the backend's
+# ``bwd_grid_mult``): the main program launches that many times its untrimmed
+# ``occupancy`` grid, a finer static partition of the token axis; 1 is the
+# default grid.  The programs follow the launch's CTA count, so every multiple
+# runs the same programs.  Rendered by the exporter from the backward kernel's
+# rule.
+GRID_MULT_CHOICES: tuple[int, ...] = (1, 2, 3, 4)
 # The selection-rule vocabulary of a forward or backward record
 # (``record["select_rule"]["kind"]``); of the records whose rule admits a call
 # the one of the highest channel threshold runs, and a record without a rule is
