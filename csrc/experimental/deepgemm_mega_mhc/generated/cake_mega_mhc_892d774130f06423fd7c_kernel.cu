@@ -184,6 +184,13 @@ __device__ __forceinline__ void mbarrier_arrive_expect_tx(int mbar_addr, uint32_
 
 
 
+__device__ __forceinline__ float approx_rcp(float x) {
+    float y;
+    asm("rcp.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
+    return y;
+}
+
+
 __device__ __forceinline__ float max_noftz(float a, float b) {
     float c;
     asm("max.f32 %0, %1, %2;" : "=f"(c) : "f"(a), "f"(b));
@@ -4323,13 +4330,51 @@ kernel_cake_mega_mhc_892d774130f06423fd7c(const __grid_constant__ CUtensorMap re
                 unsigned int floored_bits = __as_u32(max_noftz(scale_raw, 1e-10f));
                 float pow2 = __uint_as_float(floored_bits + 8388607 & 2139095040);
                 float scale = ((fp8_sf_ue8m0 != 0) ? pow2 : scale_raw);
+                float rcp_0 = approx_rcp(scale);
+                float _neg_108;
+                asm("neg.f32 %0, %1;" : "=f"(_neg_108) : "f"(scale));
+                float _fma_107;
+                asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(_fma_107) : "f"(_neg_108), "f"(rcp_0), "f"(1.0f));
+                float r_2;
+                asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(r_2) : "f"(rcp_0), "f"(_fma_107), "f"(rcp_0));
+                bool in_range = scale >= 8.6736174e-19f && scale < 1.1529215e+18f;
                 float q_2[8];
                 #pragma unroll
                 for (int j_1 = 0; j_1 < 4; j_1++) {
-                    float _fdiv_107 = __fdiv_rn(__uint_as_float(normalized_words[j_1] << 16), scale);
-                    q_2[2 * j_1] = _fdiv_107;
-                    float _fdiv_108 = __fdiv_rn(__uint_as_float(normalized_words[j_1] & 4294901760u), scale);
-                    q_2[2 * j_1 + 1] = _fdiv_108;
+                    float lo_4 = __uint_as_float(normalized_words[j_1] << 16);
+                    float hi_4 = __uint_as_float(normalized_words[j_1] & 4294901760u);
+                    float q0;
+                    asm("mul.rn.f32 %0, %1, %2;" : "=f"(q0) : "f"(lo_4), "f"(r_2));
+                    float _neg_112;
+                    asm("neg.f32 %0, %1;" : "=f"(_neg_112) : "f"(lo_4));
+                    float _fma_111;
+                    asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(_fma_111) : "f"(scale), "f"(q0), "f"(_neg_112));
+                    float _neg_110;
+                    asm("neg.f32 %0, %1;" : "=f"(_neg_110) : "f"(_fma_111));
+                    float _fma_109;
+                    asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(_fma_109) : "f"(_neg_110), "f"(r_2), "f"(q0));
+                    q_2[2 * j_1] = _fma_109;
+                    float q0_0;
+                    asm("mul.rn.f32 %0, %1, %2;" : "=f"(q0_0) : "f"(hi_4), "f"(r_2));
+                    float _neg_116;
+                    asm("neg.f32 %0, %1;" : "=f"(_neg_116) : "f"(hi_4));
+                    float _fma_115;
+                    asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(_fma_115) : "f"(scale), "f"(q0_0), "f"(_neg_116));
+                    float _neg_114;
+                    asm("neg.f32 %0, %1;" : "=f"(_neg_114) : "f"(_fma_115));
+                    float _fma_113;
+                    asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(_fma_113) : "f"(_neg_114), "f"(r_2), "f"(q0_0));
+                    q_2[2 * j_1 + 1] = _fma_113;
+                }
+                int _warp_vote_117 = __all_sync(0xFFFFFFFF, in_range);
+                if (_warp_vote_117 == 0) {
+                    #pragma unroll
+                    for (int j_2 = 0; j_2 < 4; j_2++) {
+                        float _fdiv_118 = __fdiv_rn(__uint_as_float(normalized_words[j_2] << 16), scale);
+                        q_2[2 * j_2] = _fdiv_118;
+                        float _fdiv_119 = __fdiv_rn(__uint_as_float(normalized_words[j_2] & 4294901760u), scale);
+                        q_2[2 * j_2 + 1] = _fdiv_119;
+                    }
                 }
                 unsigned long long off_0 = (unsigned long long)token_1 * 4096 + (unsigned long long)(hidden_pack_1 * 256) + (unsigned long long)(lane_in_warp * 8);
                 unsigned int _packed_0[2];
@@ -4364,8 +4409,8 @@ kernel_cake_mega_mhc_892d774130f06423fd7c(const __grid_constant__ CUtensorMap re
                 asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %2, 0; @p_ st.global.f32 [%0], %1; }" :: "l"(reinterpret_cast<uint64_t>(y_fp8_sf + sf_idx)), "f"(scale), "r"((unsigned int)(lane_in_warp % 16 == 0)) : "memory");
                 if (pack_1 + 1 < 4) {
                     #pragma unroll
-                    for (int j_2 = 0; j_2 < 4; j_2++) {
-                        weight_cache[j_2] = next_weight[j_2];
+                    for (int j_3 = 0; j_3 < 4; j_3++) {
+                        weight_cache[j_3] = next_weight[j_3];
                     }
                 }
             }
