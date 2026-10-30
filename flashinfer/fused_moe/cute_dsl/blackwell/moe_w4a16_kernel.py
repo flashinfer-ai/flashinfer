@@ -49,7 +49,7 @@ from cutlass.utils.mixed_input_helpers import TransformMode
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass._mlir import ir
 from cutlass._mlir.dialects import builtin, llvm
-from cutlass.cutlass_dsl import Boolean, Int32, T, dsl_user_op
+from cutlass.cutlass_dsl import Boolean, Int32, dsl_user_op
 
 from flashinfer.tllm_enums import (
     ActivationType,
@@ -79,35 +79,28 @@ _TMA_CACHE_HINT_EVICT_FIRST = 0x12F0000000000000
 _TMA_CACHE_HINT_EVICT_LAST = 0x14F0000000000000
 
 
-@dsl_user_op
-def _w4a16_scaled_tanh(value, beta: float, loc=None, ip=None):
+@cute.jit
+def _w4a16_scaled_tanh_pair(values, beta: cutlass.Constexpr[float]):
     """Match MegaMoE's beta*tanh(value/beta) rounding for W4A16 SiTU."""
     # The reciprocal is rounded once from the Python beta. Keep the tanh's
     # multiply and subtraction separate, as in the existing MegaMoE oracle.
-    return cutlass.Float32(
-        llvm.inline_asm(
-            T.f32(),
-            [
-                cutlass.Float32(value).ir_value(loc=loc, ip=ip),
-                cutlass.Float32(beta).ir_value(loc=loc, ip=ip),
-                cutlass.Float32(1.0 / beta).ir_value(loc=loc, ip=ip),
-            ],
-            "{\n\t.reg .f32 x, exponent, denominator, inverse, result;\n\t"
-            "mul.rn.f32 x, $1, $3;\n\t"
-            "mul.rn.f32 x, x, 0fC038AA3B;\n\t"
-            "ex2.approx.ftz.f32 exponent, x;\n\t"
-            "add.rn.f32 denominator, exponent, 0f3F800000;\n\t"
-            "rcp.approx.ftz.f32 inverse, denominator;\n\t"
-            "mul.rn.f32 result, inverse, 0f40000000;\n\t"
-            "sub.rn.f32 result, result, 0f3F800000;\n\t"
-            "mul.rn.f32 $0, $2, result;\n\t}",
-            "=f,f,f,f",
-            has_side_effects=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
-            loc=loc,
-            ip=ip,
-        )
+    inv_beta = cutlass.Float32(1.0 / beta)
+    beta_f32 = cutlass.Float32(beta)
+    neg_two_log2e = cutlass.Float32(-2.885390043258667)
+    x = cute.arch.mul_packed_f32x2(values, (inv_beta, inv_beta), rnd="rn")
+    x = cute.arch.mul_packed_f32x2(x, (neg_two_log2e, neg_two_log2e), rnd="rn")
+    denominator = cute.arch.add_packed_f32x2(
+        (cute.math.exp2(x[0], fastmath=True), cute.math.exp2(x[1], fastmath=True)),
+        (1.0, 1.0),
+        rnd="rn",
     )
+    inverse = (
+        cute.arch.rcp_approx(denominator[0]),
+        cute.arch.rcp_approx(denominator[1]),
+    )
+    result = cute.arch.mul_packed_f32x2(inverse, (2.0, 2.0), rnd="rn")
+    result = cute.arch.sub_packed_f32x2(result, (1.0, 1.0), rnd="rn")
+    return cute.arch.mul_packed_f32x2((beta_f32, beta_f32), result, rnd="rn")
 
 
 def _align_n(x, alignment: int):
@@ -2404,9 +2397,8 @@ class Sm100W4A16GroupedGemmKernel:
                                 self.activation_type == ActivationType.Swiglu.value
                                 and self.situ_beta is not None
                             ):
-                                bounded_gate = (
-                                    _w4a16_scaled_tanh(gate_pair[0], self.situ_beta),
-                                    _w4a16_scaled_tanh(gate_pair[1], self.situ_beta),
+                                bounded_gate = _w4a16_scaled_tanh_pair(
+                                    gate_pair, self.situ_beta
                                 )
                                 gate_log2e = cute.arch.mul_packed_f32x2(
                                     gate_pair,
@@ -2429,13 +2421,8 @@ class Sm100W4A16GroupedGemmKernel:
                                 if cutlass.const_expr(
                                     self.situ_linear_beta is not None
                                 ):
-                                    up_pair = (
-                                        _w4a16_scaled_tanh(
-                                            up_pair[0], self.situ_linear_beta
-                                        ),
-                                        _w4a16_scaled_tanh(
-                                            up_pair[1], self.situ_linear_beta
-                                        ),
+                                    up_pair = _w4a16_scaled_tanh_pair(
+                                        up_pair, self.situ_linear_beta
                                     )
                                 result = cute.arch.mul_packed_f32x2(
                                     up_pair, situ_gate_pair
