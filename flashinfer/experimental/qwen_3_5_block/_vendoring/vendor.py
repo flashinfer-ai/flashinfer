@@ -817,7 +817,7 @@ def gen_vendor_md(
         "Patch P3 rewords every comment / docstring line of the closure that named an internal host or an internal file path, or used internal workflow "
         'vocabulary (the files and counts are in the Patches table; the context-anchored patterns are `REGEX_PATCHES` in `vendor.py`).  Generic phrases ("the perf '
         'node", "the dev node"), the warp-lane prose of the kernels (a TMA / CUDA lane, the numbered loop-stage comments of the DSA kernels, a '
-        'producer / consumer hand-over, the fp32 pair names `h0..h3`, the caller-provided operands), the row labels of the kernel docstrings\' barrier tables and references to internal engineering notes by title remain; they name no host, path or person.  '
+        "producer / consumer hand-over, the fp32 pair names `h0..h3`, the caller-provided operands), the row labels of the kernel docstrings' barrier tables and references to internal engineering notes by title remain; they name no host, path or person.  "
         "Once the upstream files are scrubbed, P3 is dropped at the next re-vendor.\n",
     ]
     return "".join(lines)
