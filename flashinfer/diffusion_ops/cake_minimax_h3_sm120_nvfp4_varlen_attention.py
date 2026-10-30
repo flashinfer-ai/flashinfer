@@ -340,14 +340,20 @@ def _plan_rows(plan, device: torch.device) -> tuple:
     return cached[0], cached[1], cached[2]
 
 
+# The drain order of the head-major unit rows (``_plan_rows_head_major``): on a plan of at most
+# ``_HEAD_MAJOR_TAIL_CLASSES`` key-tile counts, the last ``_HEAD_MAJOR_TAIL_ROUNDS`` x (plan grid) units run
+# longest first.
+_HEAD_MAJOR_TAIL_ROUNDS = 4
+_HEAD_MAJOR_TAIL_CLASSES = 2
 _PLAN_ROWS_HM: dict = {}
 
 
 def _plan_rows_head_major(plan, device: torch.device) -> torch.Tensor:
     """int32 ``[4 * num_units]`` unit rows of the overlapped form, head-major: every unit of head 0, then of head 1,
-    ..., each head's units in segment and Q-tile order, with the rows of ``_plan_rows``.  The attention CTAs take
-    the units in this order, so the heads become ready in the producers' order.  Cached per plan like
-    ``_plan_rows``."""
+    ..., each head's units in segment and Q-tile order, with the rows of ``_plan_rows``; on a plan of at most
+    ``_HEAD_MAJOR_TAIL_CLASSES`` key-tile counts the last ``_HEAD_MAJOR_TAIL_ROUNDS`` x ``plan.grid`` units then
+    run longest first.  The attention CTAs take the units in this order, so the heads become ready in the
+    producers' order.  Cached per plan like ``_plan_rows``."""
     key = (id(plan), _device_index(device))
     cached = _PLAN_ROWS_HM.get(key)
     if cached is not None and cached[1] is plan:
@@ -362,6 +368,19 @@ def _plan_rows_head_major(plan, device: torch.device) -> torch.Tensor:
         for head in range(plan.num_heads)
         for seg, tile, a, b in per_head
     ]
+    # On a plan whose non-empty segments take at most ``_HEAD_MAJOR_TAIL_CLASSES`` key-tile counts (a short and
+    # a long class), the last ``_HEAD_MAJOR_TAIL_ROUNDS`` x ``plan.grid`` units (the grid is the SM count, or the
+    # unit count when smaller), the ones the CTAs claim as they drain, run longest first (a stable sort by key
+    # tiles): the short units of those heads fill the end of the schedule instead of leaving long units to start
+    # last.  Plans of more classes keep the head-major order.
+    if (
+        len({_ceil_div(b - a, _BLOCK_N) for _seg, _tile, a, b in per_head})
+        <= _HEAD_MAJOR_TAIL_CLASSES
+    ):
+        drain = len(rows) - min(len(rows), _HEAD_MAJOR_TAIL_ROUNDS * int(plan.grid))
+        rows[drain:] = sorted(
+            rows[drain:], key=lambda row: -_ceil_div(row[3] - row[2], _BLOCK_N)
+        )
     if len(rows) != plan.num_units:
         raise RuntimeError(
             f"head-major unit rows: {len(rows)} units, the plan has {plan.num_units}"
