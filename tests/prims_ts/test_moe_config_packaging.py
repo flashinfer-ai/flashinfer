@@ -22,7 +22,10 @@ import pytest
 
 _PACKAGE_NAME = "flashinfer.prims_ts.moe"
 _PACKAGE_PATH = "flashinfer/prims_ts/moe"
-_CONFIG_NAME = "prims_ts_moe_configs.json"
+_CONFIG_NAMES = (
+    "prims_ts_moe_configs.json",
+    "prims_ts_moe_configs_sm107.json",
+)
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
@@ -32,13 +35,16 @@ def test_prims_ts_moe_config_is_declared_as_package_data():
         pytest.skip("pyproject.toml is only available in source-tree test runs")
 
     contents = pyproject.read_text(encoding="utf-8")
-    assert f'"{_PACKAGE_NAME}" = ["{_CONFIG_NAME}"]' in contents
+    assert f'"{_PACKAGE_NAME}" = [' in contents
+    for config_name in _CONFIG_NAMES:
+        assert f'"{config_name}"' in contents
 
 
 def test_prims_ts_moe_config_is_available_as_runtime_resource():
-    config = resources.files(_PACKAGE_NAME).joinpath(_CONFIG_NAME)
-    assert config.is_file()
-    assert config.read_text(encoding="utf-8").strip()
+    for config_name in _CONFIG_NAMES:
+        config = resources.files(_PACKAGE_NAME).joinpath(config_name)
+        assert config.is_file()
+        assert config.read_text(encoding="utf-8").strip()
 
 
 def test_prims_ts_moe_config_is_in_prebuilt_wheel():
@@ -50,4 +56,5 @@ def test_prims_ts_moe_config_is_in_prebuilt_wheel():
     assert wheel.is_file(), f"FLASHINFER_TEST_WHEEL is not a file: {wheel}"
     with zipfile.ZipFile(wheel) as archive:
         members = set(archive.namelist())
-    assert f"{_PACKAGE_PATH}/{_CONFIG_NAME}" in members
+    for config_name in _CONFIG_NAMES:
+        assert f"{_PACKAGE_PATH}/{config_name}" in members

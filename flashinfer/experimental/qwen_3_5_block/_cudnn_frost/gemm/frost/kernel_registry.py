@@ -535,6 +535,71 @@ class MainloopKernelTemplate(KernelTemplate):
         return None
 
 
+def sm120_padded_e2m1_sides(chain: FusionChain) -> tuple[bool, bool]:
+    """Which side (A, B) of a mixed MXFP4 x MXFP8 block-scale pair the sm120 MoE
+    block-scale templates load through TMA's *padded* e2m1 form (``.b4x16_p64``).
+
+    OPT-IN: ``(False, False)`` unless the chain carries ``block_scale.padded_e2m1``
+    (``jit_from_cudnn_graph(..., padded_e2m1=True)``). The default is the packed
+    form (``.b4x16``, 64-byte rows, fragment registers built from the packed
+    words), which measures level with the padded one on the kernel and ahead of
+    it end to end once the TMA descriptors carry the 128-byte L2 promotion
+    (#1880): the padded SMEM tile is twice its GMEM payload, so the ring loses
+    stages.
+
+    ``kind::mxf8f6f4`` reads e2m1 from bits [5:2] of an 8-bit container. The
+    padded form lands every 16 values in a 16-byte SMEM chunk (8 B payload + 8 B
+    zero), so the row is the fp8 side's 128 bytes and
+    ``ldmatrix.m8n16.x4.shared.b8x16.b4x16_p64`` expands the fragment in hardware
+    (one shift per register follows) instead of the LDS + PRMT/shift/mask chain
+    that builds it from packed words. Its TMA box must be exactly 64 payload
+    bytes: a 128-element K tile of a K that is a multiple of 128, so a shorter K
+    (any multiple of 32, e.g. gpt-oss's 2880) stays packed. The gathered token
+    (``mode == "gather"``, TMA ``tile::gather4``) also stays packed on every K.
+    A request no side can honor is a decline (``sm120_padded_e2m1_reject``),
+    never a silent fallback.
+    """
+    bs = chain.block_scale
+    if bs is None or not bs.padded_e2m1 or not bs.mixed_width or chain.matmul.K % 128:
+        return False, False
+    gather = chain.has_moe and chain.moe.mode == "gather"
+    token_is_b = chain.has_moe and isinstance(chain.moe, MoeSwapAbSpec)
+    padded_a = bs.a_dtype == "fp4_e2m1" and not (gather and not token_is_b)
+    padded_b = bs.b_dtype == "fp4_e2m1" and not (gather and token_is_b)
+    return padded_a, padded_b
+
+
+def sm120_padded_e2m1_reject(chain: FusionChain) -> str | None:
+    """Why a ``padded_e2m1`` request cannot be honored on ``chain``, or ``None``
+    (no request, or at least one e2m1 side takes the padded form -- a request is
+    honored on every side the hardware form allows)."""
+    bs = chain.block_scale
+    if bs is None or not bs.padded_e2m1:
+        return None
+    if not bs.mixed_width:
+        return f"padded_e2m1 applies to the e2m1 side of a mixed MXFP4 x MXFP8 block-scale pair only; got {bs.a_dtype} x {bs.b_dtype}"
+    if chain.matmul.K % 128:
+        return (
+            "padded_e2m1 needs K a multiple of 128 (a 128-element K tile is one 64-byte TMA .b4x16_p64 box); "
+            f"got K={chain.matmul.K}, which only the packed form runs"
+        )
+    if not any(sm120_padded_e2m1_sides(chain)):
+        return "padded_e2m1: the only e2m1 operand is the gathered token (TMA tile::gather4), which stays packed on every K"
+    return None
+
+
+def _sm120_block_scale_row_bytes(chain: FusionChain, kb: int) -> tuple[int, int]:
+    """SMEM bytes of one K row per side of an sm120 block-scale stage: one
+    ``kb`` (128 B) span, except the packed e2m1 side of a mixed pair, which holds
+    the fp8 K tile in half the bytes (its padded form, and every other operand,
+    holds ``kb``)."""
+    bs = chain.block_scale
+    padded_a, padded_b = sm120_padded_e2m1_sides(chain)
+    a_kb = kb // 2 if bs.mixed_width and bs.a_dtype == "fp4_e2m1" and not padded_a else kb
+    b_kb = kb // 2 if bs.mixed_width and bs.b_dtype == "fp4_e2m1" and not padded_b else kb
+    return a_kb, b_kb
+
+
 class Sm120KernelTemplate(KernelTemplate):
     COMPUTE_WARPS = 8  # WARPS_M * WARPS_N in every sm120 template
 
@@ -547,10 +612,10 @@ class Sm120KernelTemplate(KernelTemplate):
             bs = chain.block_scale
             # The K tile counts fp8 elements unless both operands are e2m1, so an
             # SMEM K row is one cta_tile_k_bytes span -- except the packed e2m1
-            # side of a mixed pair, whose row holds the fp8 K-tile in half the bytes.
+            # side of a mixed pair, whose row holds the fp8 K-tile in half the
+            # bytes (its padded form holds the whole span: sm120_padded_e2m1_sides).
             kb = config.cta_tile_k_bytes
-            a_kb = kb // 2 if bs.mixed_width and bs.a_dtype == "fp4_e2m1" else kb
-            b_kb = kb // 2 if bs.mixed_width and bs.b_dtype == "fp4_e2m1" else kb
+            a_kb, b_kb = _sm120_block_scale_row_bytes(chain, kb)
             sf_k = kb * 8 // (4 if bs.is_fp4 else 8) // bs.block_size
             # A one-sided graph's raw-FP8 side reads an identity scale register:
             # no SF box in the stage.
@@ -584,7 +649,12 @@ class Sm120KernelTemplate(KernelTemplate):
         if self.block_scale:
             bs = chain.block_scale
             sf_k = kb * 8 // (4 if bs.is_fp4 else 8) // bs.block_size
-            a_tile, b_tile = config.cta_tile_m * kb, config.cta_tile_n * kb
+            # The same per-side rows as multi_gemm_ab_stages: the packed e2m1 side
+            # of a mixed pair holds the fp8 K-tile in half the bytes (its opt-in
+            # padded form the whole span: sm120_padded_e2m1_sides), and the ring
+            # this sizes (sA_elems * ab_stages) is laid out in those bytes.
+            a_kb, b_kb = _sm120_block_scale_row_bytes(chain, kb)
+            a_tile, b_tile = config.cta_tile_m * a_kb, config.cta_tile_n * b_kb
             sf_tiles = (-(-config.cta_tile_m // 128) * 128 * sf_k, -(-config.cta_tile_n // 128) * 128 * sf_k)
         else:
             cta_smem_m, cta_smem_n, _k = config.cta_smem_tile_mnk(DTYPE_BYTES[chain.matmul.a_dtype])

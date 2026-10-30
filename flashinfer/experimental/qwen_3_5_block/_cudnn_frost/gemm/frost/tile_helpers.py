@@ -238,6 +238,144 @@ def moe_combine_add_vector(ptr, values, dtype: cutlass.Constexpr, count: cutlass
 
 
 @cute.jit
+def moe_combine_stage(
+    staging,
+    values,
+    output,
+    token_index,
+    token_ks,
+    scores,
+    row,
+    group_end,
+    tile_col,
+    col,
+    columns,
+    output_row_stride,
+    top_k: cutlass.Constexpr,
+    tile_width: cutlass.Constexpr,
+    width: cutlass.Constexpr,
+    dtype: cutlass.Constexpr,
+):
+    """Stage weighted row fragments, or atomically reduce unsupported tails."""
+    if row < group_end:
+        token = token_index[row]
+        slot = token_ks[row]
+        if (token >= 0) & (token < scores.shape[0]) & (slot >= 0) & (slot < top_k):
+            weighted = values * cutlass.full_like(values, scores[token, slot])
+            row_base = output + cutlass.Int64(token) * output_row_stride
+            if ((row_base + tile_col).toint() % 16 == 0) & (tile_col + tile_width <= columns):
+                staging.store(weighted.to(dtype), alignment=16)
+            else:
+                destination = row_base + cutlass.Int64(col)
+                elements: cutlass.Constexpr = 128 // dtype.width
+                for start in cutlass.range_constexpr(0, width, elements):
+                    if col + start + elements <= columns:
+                        moe_combine_add_vector(destination + start, weighted[start : start + elements], dtype, elements)
+                    else:
+                        for element in cutlass.range_constexpr(elements):
+                            if col + start + element < columns:
+                                moe_combine_add(destination + start + element, weighted[start + element], dtype)
+
+
+@cute.jit
+def moe_combine_bulk(
+    staging,
+    output,
+    token_index,
+    token_ks,
+    scores,
+    row,
+    group_end,
+    col,
+    columns,
+    output_row_stride,
+    top_k: cutlass.Constexpr,
+    width: cutlass.Constexpr,
+    dtype: cutlass.Constexpr,
+):
+    """Reduce a complete staged feature tile, then release this thread's row.
+
+    Only its owning thread writes and reads a shared row. The async proxy fence
+    publishes those writes; read completion permits reuse without a CTA barrier.
+    Alignment and tail checks match moe_combine_stage's fallback predicate.
+    """
+    if row < group_end:
+        token = token_index[row]
+        slot = token_ks[row]
+        if (token >= 0) & (token < scores.shape[0]) & (slot >= 0) & (slot < top_k):
+            destination = output + cutlass.Int64(token) * output_row_stride + cutlass.Int64(col)
+            if (destination.toint() % 16 == 0) & (col + width <= columns):
+                cute.arch.fence_view_async_shared()
+                if cutlass.const_expr(dtype == cutlass.Float32):
+                    instruction = "cp.reduce.async.bulk.global.shared::cta.bulk_group.add.f32 [$0], [$1], $2;"
+                elif cutlass.const_expr(dtype == cutlass.BFloat16):
+                    instruction = "cp.reduce.async.bulk.global.shared::cta.bulk_group.add.noftz.bf16 [$0], [$1], $2;"
+                else:
+                    instruction = "cp.reduce.async.bulk.global.shared::cta.bulk_group.add.noftz.f16 [$0], [$1], $2;"
+                llvm.inline_asm(
+                    None,
+                    [destination.toint().ir_value(), cutlass.Int32(staging.toint()).ir_value(), cutlass.Int32(width * dtype.width // 8).ir_value()],
+                    instruction,
+                    "l,r,r,~{memory}",
+                    has_side_effects=True,
+                )
+                nvvm.cp_async_bulk_commit_group()
+                nvvm.cp_async_bulk_wait_group(0, read=True)
+
+
+@cute.jit
+def moe_combine_swap_bulk(
+    staging,
+    output,
+    token_index,
+    token_ks,
+    scores,
+    feature,
+    route_begin,
+    group_end,
+    columns,
+    feature_stride,
+    output_row_stride,
+    tid,
+    top_k: cutlass.Constexpr,
+    width: cutlass.Constexpr,
+    features: cutlass.Constexpr,
+):
+    """Publish a transposed BF16 tile and reduce one feature segment per token.
+
+    All 128 epilogue threads contribute features to each staged token row.
+    Publish before the first barrier, and wait for every async reader before
+    the second barrier permits any thread to overwrite the shared tile.
+    """
+    cute.arch.fence_view_async_shared()
+    nvvm.barrier_cta_sync(barrier_id=1, thread_count=128)
+    if tid < width:
+        route = route_begin + tid
+        if route < group_end:
+            token = token_index[route]
+            slot = token_ks[route]
+            if (token >= 0) & (token < scores.shape[0]) & (slot >= 0) & (slot < top_k):
+                destination = output + cutlass.Int64(token) * output_row_stride + cutlass.Int64(feature) * feature_stride
+                source = staging + tid * features
+                if (feature + features <= columns) & (feature_stride == 1) & (destination.toint() % 16 == 0):
+                    llvm.inline_asm(
+                        None,
+                        [destination.toint().ir_value(), cutlass.Int32(source.toint()).ir_value(), cutlass.Int32(features * 2).ir_value()],
+                        "cp.reduce.async.bulk.global.shared::cta.bulk_group.add.noftz.bf16 [$0], [$1], $2;",
+                        "l,r,r,~{memory}",
+                        has_side_effects=True,
+                    )
+                    nvvm.cp_async_bulk_commit_group()
+                    nvvm.cp_async_bulk_wait_group(0, read=True)
+                else:
+                    for f in range(features):
+                        if feature + f < columns:
+                            value = (source + f).load().to(cutlass.Float32)
+                            moe_combine_add(destination + cutlass.Int64(f) * feature_stride, value, cutlass.BFloat16)
+    nvvm.barrier_cta_sync(barrier_id=1, thread_count=128)
+
+
+@cute.jit
 def moe_scatter_row(token_index, token_ks, row, group_end, output_rows, top_k: cutlass.Constexpr):
     """Map a routed row to its token/top-k slot; clip padding with an OOB row."""
     dst = cutlass.Int32(output_rows)

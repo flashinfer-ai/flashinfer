@@ -311,8 +311,11 @@ if [ "$FAIL_COUNT" -gt 0 ]; then
         echo "  - $name"
     done
 fi
-if [ "${#SELECTORS[@]}" -gt 0 ] && [ "$RAN_COUNT" -eq 0 ]; then
-    echo "WARNING: selectors matched 0 tests (use --list to see all available test names)"
+# A run that executed nothing is not a pass.  Exiting 0 here would let a typo'd
+# selector read as a green CI run.
+if [ "$RAN_COUNT" -eq 0 ]; then
+    echo "FAILED: 0 tests ran (selectors matched nothing; use --list to see all available test names)" >&2
+    exit 2
 fi
 
 exit "$FAIL_COUNT"

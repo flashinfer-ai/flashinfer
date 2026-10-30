@@ -155,7 +155,8 @@ void Run(TensorView a_q, TensorView a_k, TensorView a_v, TensorView a_state, Ten
   CheckRank(a_ssm_state_indices, "ssm_state_indices", 2);
   CheckUnitInnerStride(a_ssm_state_indices, "ssm_state_indices");
   check_same_device(a_ssm_state_indices, a_q, "ssm_state_indices", "q");
-  TVM_FFI_CHECK((a_num_tokens == 1), ValueError) << KERNEL_NAME << ": requires (num_tokens == 1)";
+  TVM_FFI_CHECK((a_heads >= 1LL), ValueError) << KERNEL_NAME << ": requires (heads >= 1)";
+  TVM_FFI_CHECK((a_num_tokens == 1LL), ValueError) << KERNEL_NAME << ": requires (num_tokens == 1)";
   TVM_FFI_CHECK(grid_x > 0 && grid_y > 0 && grid_z > 0, ValueError)
       << KERNEL_NAME << ": the grid (" << grid_x << ", " << grid_y << ", " << grid_z
       << ") must be positive";

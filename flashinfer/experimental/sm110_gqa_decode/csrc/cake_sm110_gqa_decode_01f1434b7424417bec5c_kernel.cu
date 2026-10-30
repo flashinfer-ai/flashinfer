@@ -14,40 +14,8 @@
  * limitations under the License.
  */
 
-typedef signed char        int8_t;
-typedef unsigned char      uint8_t;
-typedef unsigned short     uint16_t;
-typedef unsigned int       uint32_t;
-#if defined(__CUDACC_RTC__)
-typedef unsigned long long uint64_t;
-#else
-typedef unsigned long      uint64_t;
-#endif
-static_assert(sizeof(uint64_t) == 8, "Cake requires an LP64 CUDA host ABI");
-typedef signed int         int32_t;
-typedef short int          int16_t;
-struct __align__(64) CakeTensorMap64 { uint64_t opaque[16]; };
-static_assert(sizeof(CakeTensorMap64) == 128, "64-aligned tensor-map ABI size");
-static_assert(alignof(CakeTensorMap64) == 64, "64-aligned tensor-map ABI alignment");
+#include "cake_sm110_gqa_decode_device_abi.cuh"
 
-#if defined(__CUDACC_RTC__)
-typedef struct __align__(128) { uint64_t opaque[16]; } CUtensorMap;
-#else
-#include <cuda.h>
-#endif
-
-static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 bytes");
-#include <cuda_bf16.h>
-#include <cuda_fp8.h>
-
-__device__ __forceinline__ int make_warp_uniform(int x) {
-    int result;
-    asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1F, 0xFFFFFFFF;"
-                 : "=r"(result) : "r"(x));
-    return result;
-}
-
-#define CAKE_INF CUDART_INF_F
 #define NUM_MAIN_STAGES 1
 #define SMEM_MAXIMA_OFF 0
 #define SMEM_MAXIMA_STAGE_BYTES 128
@@ -66,29 +34,7 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define LAUNCH_MIN_BLOCKS 2
 
 #include <math_constants.h>
-
-__device__ __forceinline__ float approx_exp2(float x) {
-    float y;
-    asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
-    return y;
-}
-
-
-__device__ __forceinline__ float approx_rcp(float x) {
-    float y;
-    asm("rcp.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
-    return y;
-}
-
-
-__device__ __forceinline__ void mul_f32x2_noftz_inplace(float2* a, float2 b) {
-    asm("mul.rn.f32x2 %0, %0, %1;"
-        : "+l"(*(unsigned long long*)a) : "l"(*(unsigned long long*)&b));
-}
-
-
-// ex2_emulation_f32x2 defined in softmax_frag_exp2_cast helper (or standalone)
-
+#include "cake_sm110_gqa_decode_device_helpers.cuh"
 extern "C" {
 
 __global__ __launch_bounds__(256, LAUNCH_MIN_BLOCKS) void

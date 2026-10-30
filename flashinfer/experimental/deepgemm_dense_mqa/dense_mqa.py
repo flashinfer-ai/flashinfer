@@ -51,13 +51,23 @@ the Q stage, no metadata buffer; not a ``:short`` shape,
 blocks) or -- where the catalog carries ``policy.dense_kvsplit`` -- the
 production text under its in-kernel KV-split plan (the ``:kvsplit`` routes:
 ``K > dense_kvsplit.min_kv`` and fewer query blocks than the architecture's
-catalogued SM count ``dense_kvsplit.sm_count[arch]``; the plan text of the
+catalogued SM count ``dense_kvsplit.sm_count[arch]``, or -- where
+``dense_kvsplit.fullgrid[arch]`` -- ``K > dense_kvsplit.fullgrid_min_kv`` and
+``sm_count[arch] <= ceil(Q / 2) <= dense_kvsplit.max_q_blocks``, the ``qle2048``
+plan's whole-grid band; the plan text of the
 query count -- ``q1`` / ``qle128`` / ``qle2048`` -- recomputes the tiered
 schedule in every CTA and writes it into the plan's own ``metadata`` buffer,
 launch grid = the SM count).  The KV-split gate is the only SM-count dependent
 rule and is applied at the catalogued count, not the device's; it is consulted
 before the ``:short`` / ``:ts`` shape gates, so a call inside both it and the
 ``:ts`` gate is named by its KV-split plan.
+
+A ``:kvsplit`` route record of the full kind may carry ``stage_buckets``
+(``{arch: [{"kv_max": K, "stages": [[stage, program], ...]}, ...]}``): a plan
+whose KV length is at most an entry's ``kv_max`` launches the first such entry's
+stages on that architecture (:func:`route_stages`) -- its partial-kind twin's
+program, with the same host call, logits and schedule words as the record's
+program; the route name, its admission and its metadata buffer are the record's.
 """
 
 from __future__ import annotations
@@ -67,7 +77,7 @@ import json
 from pathlib import Path
 
 _ARCHES = {(10, 0): "sm_100a", (10, 3): "sm_103a"}
-CATALOG_SCHEMA = "dense_mqa.v12"
+CATALOG_SCHEMA = "dense_mqa.v13"
 NUM_HEADS = 32  # default head count of the public helpers
 BLOCK_QH = 128  # query rows x heads per MMA tile
 BLOCK_Q = BLOCK_QH // NUM_HEADS
@@ -161,13 +171,25 @@ def stage_programs(stage, arches):
     return dict(by_arch)
 
 
+def route_stages(record, arch, keys):
+    """The stages a route record launches on ``arch`` for the KV length ``keys`` (``kv.shape[0]``): the first
+    ``stage_buckets[arch]`` entry with ``keys <= kv_max`` (``[[stage, program], ...]``, one program name per
+    stage), else the record's ``stages``."""
+    for bucket in record.get("stage_buckets", {}).get(arch, ()):
+        if keys <= int(bucket["kv_max"]):
+            return bucket["stages"]
+    return record["stages"]
+
+
 def program_names(route=None, arch=None):
-    """Names of the catalogued programs: all of them, those a route launches on ``arch`` (stage order, then
-    the sequence), or -- without ``arch`` -- the sorted union over the architectures of what the route launches."""
+    """Names of the catalogued programs: all of them, those a route may launch on ``arch`` (stage order, then
+    its ``stage_buckets`` programs for ``arch``, then the sequence; a plan's ``program_names`` are the ones it
+    launches), or -- without ``arch`` -- the sorted union over the architectures."""
     catalog = _catalog()
     if route is None:
         return sorted(catalog["programs"])
     record = catalog["routes"].get(route) or catalog["paged_routes"][route]
+    buckets = record.get("stage_buckets", {})
     if arch is None:
         names = sorted(
             {
@@ -175,9 +197,19 @@ def program_names(route=None, arch=None):
                 for stage in record["stages"]
                 for program in stage_programs(stage, catalog["arches"]).values()
             }
+            | {
+                program
+                for entries in buckets.values()
+                for entry in entries
+                for _stage, program in entry["stages"]
+            }
         )
     else:
         names = [stage_program(stage, arch) for stage in record["stages"]]
+        for entry in buckets.get(arch, ()):
+            for _stage, program in entry["stages"]:
+                if program not in names:
+                    names.append(program)
     if record.get("sequence"):
         names.append(record["sequence"])
     return names
@@ -506,9 +538,11 @@ def h64_kvsplit_plan(queries, keys, num_heads=64, *, arch):
     count of ``arch`` (``dense_kvsplit.sm_count[arch]``; no device query -- a device whose SM count differs from its
     architecture's entry is routed as the catalogue says, the program takes the launch grid at runtime): the plan
     text (``q1`` / ``qle128`` / ``qle2048``, the inclusive query bands ``dense_kvsplit.plans``) when
-    ``K > dense_kvsplit.min_kv`` and ``ceil(Q / block_q) < sm_count``, else ``None`` (the grid-stride route).
-    ``None`` as well for 32 heads, when the catalog has no ``dense_kvsplit`` policy, or when the catalogued SM count
-    exceeds ``dense_kvsplit.max_sms`` (the plan's CTA bound)."""
+    ``K > dense_kvsplit.min_kv`` and ``ceil(Q / block_q) < sm_count``, or -- the whole-grid band, where
+    ``dense_kvsplit.fullgrid[arch]`` -- ``K > dense_kvsplit.fullgrid_min_kv`` and
+    ``sm_count <= ceil(Q / block_q) <= dense_kvsplit.max_q_blocks`` (the ``qle2048`` plan: the same program at grid =
+    the SM count); else ``None`` (the grid-stride route).  ``None`` as well for 32 heads, when the catalog has no
+    ``dense_kvsplit`` policy, or when the catalogued SM count exceeds ``dense_kvsplit.max_sms`` (the plan's CTA bound)."""
     gate = _catalog()["policy"].get("dense_kvsplit")
     if gate is None or num_heads == NUM_HEADS:
         return None
@@ -520,8 +554,19 @@ def h64_kvsplit_plan(queries, keys, num_heads=64, *, arch):
         return None
     bq = block_q(num_heads)
     blocks = (queries + bq - 1) // bq
-    if blocks >= sm_count or keys <= int(gate["min_kv"]):
+    if keys <= int(gate["min_kv"]):
         return None
+    if blocks >= sm_count:
+        # the whole-grid band of the qle2048 plan (per architecture; its KV bound is the ``:ts`` routes' bound, so the
+        # ``:ts`` gate keeps 256 < K <= fullgrid_min_kv at these block counts)
+        fullgrid = gate["fullgrid"]
+        enabled = fullgrid[arch] if isinstance(fullgrid, dict) else bool(fullgrid)
+        if not (
+            enabled
+            and blocks <= int(gate["max_q_blocks"])
+            and keys > int(gate["fullgrid_min_kv"])
+        ):
+            return None
     for plan, (low, high) in gate["plans"].items():
         if int(low) <= queries <= int(high):
             return plan
@@ -1188,7 +1233,7 @@ class DenseMqaPlan:
         if sequence:
             selections = [(None, sequence)]
         else:
-            stages = self.route["stages"]
+            stages = route_stages(self.route, arch, keys)
             selections = [(stage[0], stage_program(stage, arch)) for stage in stages]
         self.program_names = [program for _stage, program in selections]
         for stage_name, program in selections:

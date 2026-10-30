@@ -119,6 +119,11 @@ __device__ __forceinline__ __nv_bfloat162 __as_bf16x2(unsigned int v) {
     return __nv_bfloat162(raw);
 }
 
+__device__ __forceinline__ float2 cake_bf16x2_to_f32x2(__nv_bfloat162 v) {
+    const unsigned int w = *reinterpret_cast<const unsigned int*>(&v);
+    return make_float2(__uint_as_float(w << 16), __uint_as_float(w & 0xffff0000u));
+}
+
 extern "C" {
 
 __global__ __launch_bounds__(288) void
@@ -130,12 +135,7 @@ kernel_cake_rmsnorm_train_682675bda578f5b7a312(__nv_bfloat16* __restrict__ x, __
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
-#if __CUDA_ARCH__ == 1000
-    asm volatile("{ .reg .u64 smem_ptr; cvta.to.shared.u64 smem_ptr, %1; cvt.u32.u64 %0, smem_ptr; }" : "=r"(smem) : "l"(smem_raw));
-    smem = make_warp_uniform(smem);
-#else
     smem = (int)(unsigned long long)__cvta_generic_to_shared(smem_raw);
-#endif
 
     const int mbar_base = smem;
     #define full_addr (mbar_base + 0)
@@ -209,8 +209,8 @@ kernel_cake_rmsnorm_train_682675bda578f5b7a312(__nv_bfloat16* __restrict__ x, __
             for (int first = bid * 8; first < T; first += num_bids * 8) {
                 int row = first + rg;
                 int slot = k % 4;
-                int parity = k / 4 & 1;
-                mbarrier_wait(full_addr + (slot) * 8, parity);
+                int _parity_full = (int)((unsigned int)k / 4 % 2);
+                mbarrier_wait(full_addr + (slot) * 8, _parity_full);
                 int xaddr = ring_c + slot * 24576 + rg * 3072 + g0 * 16;
                 #pragma unroll
                 for (int c_1 = 0; c_1 < 2; c_1++) {
@@ -281,19 +281,33 @@ kernel_cake_rmsnorm_train_682675bda578f5b7a312(__nv_bfloat16* __restrict__ x, __
                             float out[8];
                             #pragma unroll
                             for (int q = 0; q < 4; q++) {
-                                float2 _cvt_f32_0 = __bfloat1622float2(__as_bf16x2(xw[c_2 * 12 + v_2 * 4 + q]));
-                                float2 _cvt_f32_1 = __bfloat1622float2(__as_bf16x2(wreg[c_2 * 12 + v_2 * 4 + q]));
+                                float2 _cvt_f32_0 = cake_bf16x2_to_f32x2(__as_bf16x2(xw[c_2 * 12 + v_2 * 4 + q]));
+                                float2 _cvt_f32_1 = cake_bf16x2_to_f32x2(__as_bf16x2(wreg[c_2 * 12 + v_2 * 4 + q]));
                                 out[2 * q] = _cvt_f32_0.x * rstd * _cvt_f32_1.x;
                                 out[2 * q + 1] = _cvt_f32_0.y * rstd * _cvt_f32_1.y;
                             }
-                            {
-                                __nv_bfloat162 _pk[4];
-                                _pk[0] = __floats2bfloat162_rn(out[0 + 0], out[0 + 1]);
-                                _pk[1] = __floats2bfloat162_rn(out[0 + 2], out[0 + 3]);
-                                _pk[2] = __floats2bfloat162_rn(out[0 + 4], out[0 + 5]);
-                                _pk[3] = __floats2bfloat162_rn(out[0 + 6], out[0 + 7]);
-                                *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(y + (obase + (long long)((g0 + c_2 * 32) * 8 + v_2 * 512))))[0]) = *reinterpret_cast<uint4*>(&_pk[0]);
+                            unsigned int _packed_0[4];
+                            #pragma unroll
+                            for (int _lp = 0; _lp < 1; _lp++) {
+                                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(out[_lp*2 + 0], out[_lp*2+1 + 0]));
+                                _packed_0[_lp] = *(uint32_t*)&_bf2;
                             }
+                            #pragma unroll
+                            for (int _lp = 0; _lp < 1; _lp++) {
+                                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(out[_lp*2 + 2], out[_lp*2+1 + 2]));
+                                _packed_0[_lp + 1] = *(uint32_t*)&_bf2;
+                            }
+                            #pragma unroll
+                            for (int _lp = 0; _lp < 1; _lp++) {
+                                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(out[_lp*2 + 4], out[_lp*2+1 + 4]));
+                                _packed_0[_lp + 2] = *(uint32_t*)&_bf2;
+                            }
+                            #pragma unroll
+                            for (int _lp = 0; _lp < 1; _lp++) {
+                                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(out[_lp*2 + 6], out[_lp*2+1 + 6]));
+                                _packed_0[_lp + 3] = *(uint32_t*)&_bf2;
+                            }
+                            reinterpret_cast<int4*>(y + (obase + (long long)((g0 + c_2 * 32) * 8 + v_2 * 512)))[0] = reinterpret_cast<int4*>(_packed_0)[0];
                         }
                     }
                 }
@@ -311,10 +325,10 @@ kernel_cake_rmsnorm_train_682675bda578f5b7a312(__nv_bfloat16* __restrict__ x, __
             #pragma unroll 1
             for (int first_p = bid * 8; first_p < T; first_p += num_bids * 8) {
                 int slot_p = k_p % 4;
-                int parity_p = k_p / 4 & 1;
                 int rows_k = ((T - first_p) < (8) ? (T - first_p) : (8));
                 int sbase = ring_p + slot_p * 24576;
-                mbarrier_wait(empty_addr + (slot_p) * 8, parity_p);
+                int _parity_empty = (int)((unsigned int)k_p / 4 % 2);
+                mbarrier_wait(empty_addr + (slot_p) * 8, _parity_empty);
                 if (lane_p == 0) {
                     mbarrier_arrive_expect_tx(full_addr + (slot_p) * 8, rows_k * 3072);
                 }

@@ -52,25 +52,36 @@ collectives, the merge chain tables, the segment plan ``P`` / ``NSEG`` and the
 segment table) is derived on demand by ``ctx.heads(H)`` and cached.
 
 Segment plan rule.  ``kcp_plan(n_frag, NC_max_frag, H, sm_count)`` picks the
-segments per fragment ``P`` (``NSEG = n_frag * P``) with the shipped ``"wave_fill1"``
-rule (the one-wave fill on top of lever L-C, adopted in this revision): on a rank
+segments per fragment ``P`` (``NSEG = n_frag * P``) with the shipped
+``"wave_fill1_p1tie"`` rule (the one-wave fill rule plus the P = 1 tie line, on top of the
+earlier ``"wave"`` rule): on a rank
 with at most ``WAVE_N_FRAG_MAX = 3`` fragments (N_MAX) whose longest fragment
 exceeds the chain cap (``NC_max_frag >= WAVE_MIN_NC_MAX_FRAG = 257`` chunks, i.e.
 ``P_chain >= 2``), the argmin over ``P in [P_chain, min(64, NC_max_frag)]`` of the
 equal-segment wave cost
 ``ceil(n_frag P H / SM) * ceil(NC_max_frag / P) * t_walk + (P - 1) * t_compose``
-(constants ``WAVE_RULE_10NS``, smallest ``P`` on ties; the earlier ``"wave"`` rule
-of lever L-C); on a one-fragment rank below the
+(constants ``WAVE_RULE_10NS``, smallest ``P`` on ties; the earlier ``"wave"`` rule); on a
+one-fragment rank below the
 cap (``0 < NC_max_frag < 257``) the one-wave fill ``clamp(floor(SM / H), P_chain,
 min(64, NC_max_frag))`` -- the largest ``P`` whose ``P H`` CTAs run one CTA per SM
 instead of the occ ``ceil`` (the one-wave fill rule, :data:`WAVE_FILL_N_FRAG_MAX`; a rank with
 ``H > SM`` keeps the occ ``P``); every other rank (two or three fragments below
 the cap, more than three fragments, or an empty longest fragment) keeps the
-earlier ``"occ"`` rule ``clamp(max(P_occ, P_chain), 1, ...)``.  ``"wave"`` (the
-earlier rule), ``"occ"`` and ``"wave_fill"`` (the fill on every rank with at most
-three fragments; implemented, not adopted) stay selectable through the private
-test knob ``_kcp_test_knobs={"p_rule": ...}`` (``CAKE_KCP_TEST_KNOBS=1``) for the
-A/B record.  Every rule is a pure function of (fragment table, H, SM count).
+earlier ``"occ"`` rule ``clamp(max(P_occ, P_chain), 1, ...)`` (the occupancy rule); and -- the
+P = 1 tie line -- on a two- or three-fragment rank below the cap whose ``P = 1``
+walks run one wave (``n_frag H <= SM``) with an LPT makespan over the rank's
+ACTUAL fragment chunk counts (:func:`p1_tie_steps`, the wave model's waves x steps
+generalised to unequal fragments) not above the makespan at the base rule's ``P``,
+``P = 1`` (one chain per fragment, no segment composition; :data:`P1_TIE_BASE`).
+``"wave_fill1"`` (the previous rule), ``"wave"`` (the earlier rule), ``"occ"`` and
+``"wave_fill"`` (the fill on every rank with at most three fragments; implemented,
+not adopted) stay selectable through the private test knob
+``_kcp_test_knobs={"p_rule": ...}`` (after :func:`enable_test_knobs`) for the A/B
+record.  Every rule is a pure function of (fragment table, H, SM count).  A ``P``
+change alters the segment recomposition (not bitwise in general);
+for the tie line the bitwise proof set found every changed gate row
+bitwise identical between ``P = 2`` and ``P = 1`` on their own operands (the
+composition is exact there), re-proven on the merged tree.
 
 Exchange layouts (one ``all_to_all_single`` per direction; ``s`` = one FP32
 ``[128, 128]`` state of one head = 16384 elements; owner ``j`` holds heads
@@ -90,8 +101,12 @@ Exchange layouts (one ``all_to_all_single`` per direction; ``s`` = one FP32
 
 from __future__ import annotations
 
+import bisect
 import dataclasses
-import os
+import operator
+import weakref
+from collections.abc import Mapping
+from typing import Any
 
 import torch
 import torch.distributed as dist
@@ -109,25 +124,26 @@ P_RULES = (
     "wave",
     "wave_fill1",
     "wave_fill",
-)  # kcp_plan P rules: "wave_fill1" = the shipped rule = "wave" + the one-wave
-# fill on one-fragment ranks below the chain cap; "wave" = the earlier rule (lever L-C); "occ" = the design note §7.2 rule;
-# "wave_fill" = the fill on every rank with n_frag <= 3 (the second knob value; implemented, not adopted)
-# Shipped P rule (the one-wave fill on top of the earlier wave rule of lever L-C):
-# the public API plans with it; "wave", "occ" and "wave_fill" stay selectable through the private test
-# knob ``_kcp_test_knobs={"p_rule": ...}`` for the A/B record.  Every rule is a pure function of
-# (fragment table, H, SM count), so G3 holds under any of them.
-P_RULE_DEFAULT = "wave_fill1"
+    "wave_fill1_p1tie",
+)  # kcp_plan P rules: "wave_fill1_p1tie" = the shipped rule = "wave_fill1" + P = 1
+# on two- / three-fragment ranks below the chain cap whose P = 1 LPT walk makespan over the actual fragment chunk counts is <= the
+# base rule's (p1_tie_steps; one wave: n_frag H <= SM); "wave_fill1" = the previous shipped rule = "wave"
+# + the one-wave fill on one-fragment ranks below the chain cap; "wave" = the earlier rule; "occ" = the design note §7.2
+# rule; "wave_fill" = the fill on every rank with n_frag <= 3 (the second knob value; implemented, not adopted)
+# Shipped P rule (the one-wave fill rule plus the P = 1 tie line, on top of the earlier
+# wave rule): the public API plans with it; "wave_fill1", "wave", "occ" and
+# "wave_fill" stay selectable through the private test knob ``_kcp_test_knobs={"p_rule": ...}`` for the A/B
+# record.  Every rule is a pure function of (fragment table, H, SM count), so G3 holds under any of them.
+P_RULE_DEFAULT = "wave_fill1_p1tie"  # shipped; "wave_fill1" = the previous default, via _kcp_test_knobs only
 # The shipped default of ``save_transfer`` (the design note §6.2) -- the merge owner
 # keeps its c1 receive tensor (and the home rank its M_seg at P > 1) for the backward instead of re-sending M_f^T in b1.
 # Default of the byte queries below and of ``cake_kcp.KcpOptions``; ``False`` (the earlier recompute form) stays
 # selectable through the ``save_transfer`` argument; ``kcp_saved_bytes`` reports the delta.
 SAVE_TRANSFER_DEFAULT = True
-# Lever L-C wave-aware P rule: per-CTA-step constants at one CTA per SM on GB300, H = 64, in 10 ns
-# units (exact integer arithmetic keeps the argmin and its ties identical on every rank).  Sources (P2A / M1 generated files):
-# t_tape 2.85 us = P2A timeline.md "Q1 CP4 C B1" rank 3 #11 / #12 (64 CTAs x 244 steps 0.706 ms -> 2.893; 192 CTAs = 2 waves x 244
-# steps 1.378 ms -> 2.824); t_xfer 3.5 us = M1 k3_micro.md "t_step us (one chain, per wave)" tf32_hilo z-q6 3.515 / c-cp8 3.317;
-# t_offset 1.2 us = timeline.md rank 3 #5 (0.581 ms / (2 waves x 244 steps) = 1.19); t_compose 20.4 us = M1 refit.md P_bal table
-# "t_compose us/step" 20.389 (K4 map-mode c16 step).
+# Wave-aware P rule: per-CTA-step constants at one CTA per SM on GB300, H = 64, in 10 ns units (exact integer arithmetic
+# keeps the argmin and its ties identical on every rank), measured on the CP4 / CP8 profiles and the walk / merge
+# micro-benchmarks: t_tape 2.85 us (the K1 tape step), t_xfer 3.5 us (the K3 transfer step), t_offset 1.2 us (the K1
+# offset step), t_compose 20.4 us (the K4 map-mode step at 16 columns).
 WAVE_RULE_10NS = {"tape": 285, "xfer": 350, "offset": 120, "compose": 2040}
 # N_MAX (a plan constant, part of the pure function of the fragment table, H and SM count): the
 # wave rule applies to a rank with at most this many fragments; ranks with more keep P_occ (the measured
@@ -138,8 +154,8 @@ WAVE_N_FRAG_MAX = 3
 # fragments of <= 256 chunks (Q1 CP16: 244) the extra segments' compose / staging cost exceeds the shorter walks
 # (measured CP16 C +5.0 % B1 / +6.4 % B3, CP16 Z +7.3 % B3 at the unconditioned wave P).
 WAVE_MIN_NC_MAX_FRAG = MAX_CHAIN_STEPS + 1
-# The one-wave fill rules: the "one-wave
-# fill" rules -- "wave_fill1" is the shipped default since this revision, "wave_fill" stays a test knob value.  Below
+# The one-wave fill rules: "wave_fill1_p1tie" is the shipped default ("wave_fill1" plus the P = 1 tie line; "wave_fill1"
+# was the previous default), "wave_fill" stays a test knob value.  Below
 # the chain cap (NC_max_frag < WAVE_MIN_NC_MAX_FRAG) the earlier "wave" rule keeps the occ P = ceil(SM / (n_frag H)), which on the one-fragment CP16 C ranks (NC 222-256, H = 64) launches 192 CTAs on
 # 152 SMs (40 SMs host two CTAs: 148-172 step-times for 74-86-step chains); the fill rule takes the LARGEST P whose
 # n_frag P H CTAs run one CTA per SM, floor(SM / (n_frag H)) (= 2 -> 128 CTAs, one wave of 111-128 steps, the floor's
@@ -148,9 +164,32 @@ WAVE_MIN_NC_MAX_FRAG = MAX_CHAIN_STEPS + 1
 # n_frag <= WAVE_N_FRAG_MAX (two-fragment H = 64 ranks move P 2 -> 1).  Above the cap both are the shipped wave argmin.
 # At H <= 4 on 152 SMs floor(SM / H) equals ceil(SM / H) (38; 64-cap at H = 1), so every H <= 4 row keeps its program.
 WAVE_FILL_N_FRAG_MAX = {"wave_fill1": 1, "wave_fill": WAVE_N_FRAG_MAX}
+# The P = 1 tie line of the shipped rule:
+# below the chain cap a two-fragment H = 64 rank
+# keeps the occ P = ceil(152 / 128) = 2 (256 CTAs: two waves of ceil(NC / 2) steps) although the wave model scores P = 1
+# (128 CTAs, one wave of NC steps) at the same or fewer walk step-times (111 vs 2 x 56 = 112 on Q2 CP16 Z) and P = 2 adds the
+# segment-composition K4 launches (map before c1, carry_in / carry_start after c2, tmap / dcarry in the backward) plus the
+# backward's offset re-walk (replay mode; the saved-mode backward reads the kept carry plane).  "wave_fill1_p1tie" =
+# "wave_fill1", then P := 1 on a rank with 2 <= n_frag <= WAVE_N_FRAG_MAX,
+# 0 < NC_max_frag < WAVE_MIN_NC_MAX_FRAG, P > 1 and n_frag H <= SM (P = 1 runs one wave) when the LPT makespan of the walks
+# at P = 1 over the rank's actual fragment chunk counts is <= the makespan at the base rule's P (p1_tie_steps: the wave
+# model's waves x steps generalised to unequal fragments through lpt_makespan; equal fragments reproduce it exactly).  The
+# compose term then favours P = 1 as well.  Unequal fragments (CP16 C two-fragment ranks, e.g. [170, 59] chunks) keep P = 2:
+# their P = 1 makespan is the long fragment alone.  At H <= 4 the base P fills the SMs with short chains, so no H <= 4 rank
+# changes.  A P change alters the segment recomposition and is not bitwise in general;
+# for THIS rule the bitwise proof set found every changed gate row (the CP16 Z,
+# CP8 Z and CP4 D / Z rows at H = 64) bitwise identical between P = 2 and P = 1 on their own operands -- the
+# segment composition is exact on them -- so the adoption needed no FP64 re-judge; the proof was re-run on the merged tree.
+P1_TIE_BASE = {
+    "wave_fill1_p1tie": "wave_fill1"
+}  # p1tie rule -> the rule whose P it starts from
 ALIGN = 256  # every table starts on a 256 B boundary (cake_backend.ALIGN)
 LAYOUTS = ("contiguous", "zigzag", "zigzag_per_document")
 EXPLICIT_LAYOUT = "explicit"
+# The int32 tables of the KCP saved set, in buffer order: the four chunk tables of the existing chunk-parallel stages and
+# the boundary kernels' segment table (``[NSEG + 1]``, their ``seq_chunk_start`` argument).  The existing backend's own
+# fifth table is the block table of its segmented recurrences (``cake_backend.TABLE_NAMES[4]``, ``seg_table``), which
+# the KCP route does not launch.
 TABLE_NAMES = (
     "chunk_bos",
     "chunk_len",
@@ -165,12 +204,14 @@ TILE_D = 0  # half 0 of a b1 pair tile [2][128][128]: the adjoint offset d_f (ha
 TILE_STRIDE_PLANE = 1  # kernel argument tile_stride: dense plane (c2 S_in, b2 dS_out, b1 offsets-only, carry, the P > 1 staging planes)
 TILE_STRIDE_PAIR = 2  # interleaved pair (c1 [B_f | M_f^T], b1 [d_f | M_f^T] with maps)
 SUMMARY_TILE = 2 * TILE  # elements of one c1 summary tile of one head
-TEST_KNOBS_ENV = "CAKE_KCP_TEST_KNOBS"
+# The process's opt-in to the private ``_kcp_test_knobs`` hook and the test-only record set (``build.test.json``):
+# :func:`enable_test_knobs` sets it; the package reads no environment variable.
+_TEST_KNOBS_ENABLED = False
 PRECISION_MODES = (
     0,
     1,
     2,
-)  # 0 shipped TF32 hi/lo, 1 explicit three-MMA (R1 test), 2 plain TF32 (optional cross-check)
+)  # the TF32 hi/lo walk's static knob: 0 the hi/lo form the transfer_walk knob selects, 1 explicit three-MMA (R1 test), 2 plain TF32 (optional cross-check)
 FLAG_CROSSING_IN = 1
 FLAG_CROSSING_OUT = 2
 FLAG_CONTINUING = 4  # the fragment's first outputs read convolution history rows (document offset > 0)
@@ -182,6 +223,154 @@ def _ceil_div(a: int, b: int) -> int:
 
 def _round_up(n: int, m: int) -> int:
     return _ceil_div(n, m) * m
+
+
+# ----------------------------------------------------------------------------------------------------------------
+# Host-built integer tables on the device without a synchronizing call
+
+# Test knobs of build_kcp_context (after enable_test_knobs(), for the A/B record and the negative control of the
+# host-synchronization tests): ``upload="blocking"`` = the previous per-table ``torch.tensor(values, device=)`` copies
+# (pageable; each synchronizes the stream), eager at preparation as before; ``table_cache="workspace"`` = the previous
+# per-workspace table-set cache (keyed by the context) instead of the context's own.
+UPLOADS = ("async", "blocking")
+UPLOAD_DEFAULT = "async"
+TABLE_CACHES = ("context", "workspace")
+TABLE_CACHE_DEFAULT = "context"
+
+
+def _stream_capturing(s) -> bool:
+    """Whether the CUDA stream ``s`` captures a graph (the state of ``s`` itself, not of the current stream)."""
+    with torch.cuda.device(s.device), torch.cuda.stream(s):
+        return torch.cuda.is_current_stream_capturing()
+
+
+@dataclasses.dataclass(eq=False)
+class KcpUpload:
+    """One asynchronous upload: the device ``blob`` its tables view, the ``stream`` that ran the copy and the ``ready``
+    event recorded after it (:meth:`KcpContext.wait_ready`)."""
+
+    blob: Any
+    stream: Any
+    ready: Any
+
+
+def _upload_blocking(
+    specs: dict[str, tuple], device: torch.device
+) -> dict[str, torch.Tensor]:
+    """The previous path of the ``upload="blocking"`` knob: one pageable ``torch.tensor(values, device=)`` per table."""
+    out = {}
+    for name, (values, dtype, shape) in specs.items():
+        t = torch.tensor(list(values), dtype=dtype, device=device)
+        out[name] = t if shape is None else t.reshape(shape)
+    return out
+
+
+def _upload_tables(
+    specs: dict[str, tuple], device, *, stream=None
+) -> tuple[dict[str, torch.Tensor], KcpUpload | None]:
+    """Device copies of integer tables built on the host (``name -> (values, dtype, shape)``; ``values`` a flat or
+    nested sequence of ints, ``shape`` ``None`` = the sequence's own shape) without a synchronizing CUDA call.
+
+    ``torch.tensor(values, device=cuda)`` copies from pageable memory and synchronizes the stream once per table, so a
+    table built behind queued device work waits for that work.  Here every table is laid out at a 256-byte boundary
+    (:data:`ALIGN`) of one pinned ``uint8`` staging buffer, and one ``copy_(non_blocking=True)`` on ``stream``
+    (default: the current stream of ``device``) moves them into one device blob; the host caching allocator records
+    the copy on the staging block, so the block is reused only after the copy has run.  An event recorded after the
+    copy is returned with the blob in a :class:`KcpUpload`.  Each table is a contiguous view of the blob with the dtype,
+    shape and values of ``torch.tensor(values, dtype)``.  On a non-CUDA device the tables are plain tensors and no
+    record is returned.  Under CUDA-graph capture this raises ``RuntimeError``: a captured copy would re-read a host
+    buffer the graph does not own (the same rule as GDN's ``upload_tables``, whose code this follows)."""
+    device = torch.device(device)
+    items: list[tuple[str, torch.Tensor, tuple[int, ...]]] = []
+    for name, (values, dtype, shape) in specs.items():
+        cpu = torch.tensor(list(values), dtype=dtype)
+        shape = tuple(cpu.shape) if shape is None else tuple(int(x) for x in shape)
+        flat = cpu.reshape(-1)
+        numel = 1
+        for x in shape:
+            numel *= x
+        if flat.numel() != numel:
+            raise ValueError(
+                f"_upload_tables: table {name!r} holds {flat.numel()} values, shape {shape} needs {numel}"
+            )
+        items.append((name, flat, shape))
+    if device.type != "cuda":
+        return {name: flat.view(shape).to(device) for name, flat, shape in items}, None
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError(
+            "_upload_tables: a table upload under CUDA-graph capture would re-read host memory the graph does not own; "
+            "run the first call of a context eagerly (graph='replay' does) or prepare it before the capture"
+        )
+    offsets, total = [], 0
+    for _name, flat, _shape in items:
+        offsets.append(total)
+        total += _round_up(flat.numel() * flat.element_size(), ALIGN)
+    s = torch.cuda.current_stream(device) if stream is None else stream
+    with torch.cuda.device(device), torch.cuda.stream(s):
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "_upload_tables: the upload stream is capturing a CUDA graph"
+            )
+        staging = torch.zeros(
+            (total,), dtype=torch.uint8, pin_memory=True
+        )  # the alignment padding is defined, never read
+        for (_name, flat, _shape), off in zip(items, offsets, strict=True):
+            n = flat.numel() * flat.element_size()
+            if n:
+                staging[off : off + n].copy_(flat.view(torch.uint8))
+        blob = torch.empty((total,), dtype=torch.uint8, device=device)
+        blob.copy_(
+            staging, non_blocking=True
+        )  # cudaMemcpyAsync from pinned memory; the staging block is held until the copy has run
+        ready = torch.cuda.Event()
+        ready.record(s)
+    out = {}
+    for (name, flat, shape), off in zip(items, offsets, strict=True):
+        n = flat.numel() * flat.element_size()
+        out[name] = blob[off : off + n].view(flat.dtype).view(shape)
+    return out, KcpUpload(blob=blob, stream=s, ready=ready)
+
+
+class _LazyTables(Mapping):
+    """``KcpHeadPlan.device_tables``: the head plan's device tables, uploaded together (one asynchronous copy through
+    the context) when one of them is first read.  The shipped launch path reads none of them (it uploads its own
+    walk / index / chain tables per table set), so a byte query or a prepared head plan does no device work."""
+
+    def __init__(self, ctx: Any, specs: dict[str, tuple], device: torch.device) -> None:
+        self._specs = specs
+        self._device = device
+        self._tables: dict[str, torch.Tensor] | None = None
+        self._ctx: Any
+        try:
+            self._ctx = weakref.ref(ctx)
+        except TypeError:  # a context type without weak references
+            self._ctx = lambda c=ctx: c
+
+    def _materialize(self) -> dict[str, torch.Tensor]:
+        if self._tables is None:
+            ctx = self._ctx()
+            up = getattr(ctx, "upload_tables", None)
+            self._tables = (
+                up(self._specs, self._device)
+                if up is not None
+                else _upload_tables(self._specs, self._device)[0]
+            )
+        return self._tables
+
+    def __getitem__(self, name: str) -> torch.Tensor:
+        if name not in self._specs:
+            raise KeyError(name)
+        return self._materialize()[name]
+
+    def __iter__(self):
+        return iter(self._specs)
+
+    def __len__(self) -> int:
+        return len(self._specs)
+
+    @property
+    def uploaded(self) -> bool:
+        return self._tables is not None
 
 
 # ----------------------------------------------------------------------------------------------------------------
@@ -546,7 +735,8 @@ def kcp_partition(
 
 
 # ----------------------------------------------------------------------------------------------------------------
-# CPU-built tables of the existing chunk-parallel stages (the ``table`` / ``seg_table`` programs' contract)
+# CPU-built tables: the four chunk tables of the existing chunk-parallel stages (the ``table`` program's contract) and the
+# boundary kernels' segment table
 
 
 def chunk_geometry(T: int, num_seqs: int) -> tuple[int, int, int]:
@@ -593,7 +783,8 @@ def chunk_tables(cu_seqlens_local: tuple[int, ...]) -> dict[str, list[int]]:
 
 def seg_chunk_start(seq_chunk_start: list[int], P: int) -> list[int]:
     """``seg_chunk_start[d * P + p] = seq_chunk_start[d] + (p * n_d) // P``, ``[N * P] = NC``: segment ``p`` of local
-    sequence ``d`` is pseudo-sequence ``d * P + p`` (bitwise the ``kda_chunk_train_seg_table_v1`` output)."""
+    sequence ``d`` is pseudo-sequence ``d * P + p`` -- the ``[NSEG + 1]`` segment table the boundary kernels (K1-K4) take
+    as their ``seq_chunk_start`` argument (the form of the earlier segment-table program of the chunk-parallel stages)."""
     N = len(seq_chunk_start) - 1
     P = int(P)
     if P < 1:
@@ -609,8 +800,11 @@ def seg_chunk_start(seq_chunk_start: list[int], P: int) -> list[int]:
 
 
 def table_layout(NC_pad: int, N: int, NSEG: int) -> tuple[tuple[str, int, int], ...]:
-    """``(name, word offset, words)`` of the five tables inside one int32 buffer, each 256 B aligned (the existing
-    ``cake_backend._table_layout`` with the segment table always present on the KCP route)."""
+    """``(name, word offset, words)`` of the five tables inside one int32 buffer, each 256 B aligned: the four chunk
+    tables as the existing backend lays them out (``cake_backend._table_layout`` without a segment table), then the
+    boundary kernels' ``[NSEG + 1]`` segment table in the same form, always present on the KCP route.  The existing
+    backend's fifth table (``seg_table``, ``NSEG + 2 * N + 1`` words: the block table of its segmented recurrences) is
+    another object: the KCP route never launches those recurrences and never hands this buffer to them."""
     words_per_align = ALIGN // 4
     tables = [
         ("chunk_bos", NC_pad),
@@ -692,7 +886,7 @@ def lpt_makespan(chains: "list[tuple[int, int]]", machines: int) -> int:
 def wave_rule_cost_10ns(
     n_frag: int, NC_max_frag: int, H: int, sm_count: int, P: int
 ) -> int:
-    """Lever L-C cost model of ``P`` segments per fragment (10 ns units, exact integers; the rule of
+    """Cost model of ``P`` segments per fragment (10 ns units, exact integers; the rule of
     record): the three walks (K1 offset, K3 transfer, K1 tape; one CTA per SM, equal segments) each take
     ``ceil(n_frag P H / SM)`` waves of ``ceil(NC_max_frag / P)`` CTA-steps, plus ``P - 1`` K4 compose steps."""
     waves = _ceil_div(n_frag * P * H, sm_count)
@@ -751,6 +945,52 @@ def wave_rule_lpt_P(nc_frags: "list[int]", H: int, sm_count: int) -> int:
     return best_P
 
 
+def p1_tie_steps(nc_frags: "list[int]", H: int, sm_count: int, P: int) -> int:
+    """CTA step-times (LPT makespan at one CTA per SM) of one equal-segment walk of ``P`` segments per fragment over a
+    rank's fragments of ``nc_frags`` chunks: ``P * H`` chains of ``ceil(NC_f / P)`` steps per non-empty fragment ``f`` on
+    ``sm_count`` SMs (:func:`lpt_makespan`).  Equal fragments reproduce the wave model's ``ceil(n_frag P H / SM) x
+    ceil(NC / P)`` exactly; unequal fragments are charged their actual makespan (the "wave_fill1_p1tie" tie test)."""
+    P, H = int(P), int(H)
+    chains = [(_ceil_div(int(nc), P), P * H) for nc in nc_frags if int(nc) > 0]
+    return lpt_makespan(chains, int(sm_count)) if chains else 0
+
+
+def _p1_tie(
+    n_frag: int,
+    NC_max_frag: int,
+    H: int,
+    sm_count: int,
+    P: int,
+    nc_frags: "list[int] | None",
+) -> int:
+    """The "wave_fill1_p1tie" line: ``1`` when the rank has 2..WAVE_N_FRAG_MAX fragments below the chain cap, the base
+    rule took ``P > 1``, ``P = 1`` runs one wave (``n_frag H <= SM``) and the P = 1 walk makespan over the fragment chunk
+    counts does not exceed the base ``P``'s; otherwise the base ``P``.  ``nc_frags`` = the rank's fragment chunk counts
+    (``None``: ``n_frag`` equal fragments of ``NC_max_frag`` chunks, the pure (n_frag, NC_max) form of the examples)."""
+    if nc_frags is None:
+        frags = [NC_max_frag] * n_frag
+    else:
+        frags = [int(x) for x in nc_frags]
+        if (
+            len(frags) != n_frag
+            or max(frags, default=0) != NC_max_frag
+            or min(frags, default=0) < 0
+        ):
+            raise ValueError(
+                f"kcp_plan: nc_frags={frags} must list n_frag={n_frag} fragment chunk counts >= 0 with max NC_max_frag={NC_max_frag}"
+            )
+    if not (
+        2 <= n_frag <= WAVE_N_FRAG_MAX
+        and 0 < NC_max_frag < WAVE_MIN_NC_MAX_FRAG
+        and P > 1
+        and n_frag * H <= sm_count
+    ):
+        return P
+    if p1_tie_steps(frags, H, sm_count, 1) <= p1_tie_steps(frags, H, sm_count, P):
+        return 1
+    return P
+
+
 def kcp_plan(
     n_frag: int,
     NC_max_frag: int,
@@ -759,9 +999,11 @@ def kcp_plan(
     *,
     P_bal: int = P_BAL_INACTIVE,
     p_rule: str = P_RULE_DEFAULT,
+    nc_frags: "list[int] | None" = None,
 ) -> KcpSegmentPlan:
-    """The KCP plan rule (``p_rule="wave_fill1"``, the shipped default since this revision: the one-wave fill
-    on the earlier ``"wave"`` rule of lever L-C).  The ``"wave"`` rule::
+    """The KCP plan rule (``p_rule="wave_fill1_p1tie"``, the shipped default: the one-wave fill on the earlier
+    ``"wave"`` rule plus the P = 1 tie line; ``"wave_fill1"`` = the previous default, the fill without the tie
+    line).  The ``"wave"`` rule::
 
         P_occ   = ceil(SM / (n_frag * H))                 # one transfer-walk CTA per SM
         P_chain = ceil(NC_max_frag / 256)                 # no walk chain longer than 256 steps
@@ -776,11 +1018,11 @@ def kcp_plan(
     walks at one CTA per SM plus the K4 compose chain.  The wave line applies only to ranks with
     ``n_frag <= WAVE_N_FRAG_MAX`` (3) whose longest fragment exceeds the chain cap (``NC_max_frag >=
     WAVE_MIN_NC_MAX_FRAG`` = 257 chunks, i.e. ``P_chain >= 2``); every other rank keeps the occ ``P``
-    (many-fragment D ranks and short fragments measured slower at every ``P > 1``).  ``p_rule="occ"`` (the round-0
-    §7.2 rule, selectable only through the ``p_rule`` test knob for the A/B record) uses the ``clamp`` line on every
+    (many-fragment D ranks and short fragments measured slower at every ``P > 1``).  ``p_rule="occ"`` (the earlier
+    §7.2 occupancy rule, selectable only through the ``p_rule`` test knob for the A/B record) uses the ``clamp`` line on every
     rank.  ``P_occ`` / ``P_chain`` / ``P_bal`` are reported under every rule.
 
-    The one-wave fill rule (``"wave_fill1"`` shipped, ``"wave_fill"`` test knob only; :data:`WAVE_FILL_N_FRAG_MAX`)::
+    The one-wave fill rule (``"wave_fill1"`` the previous shipped rule, ``"wave_fill"`` test knob only; :data:`WAVE_FILL_N_FRAG_MAX`)::
 
         P_fill  = floor(SM / (n_frag * H))
         P       = clamp(P_fill, P_chain, min(64, NC_max_frag))   if p_rule in ("wave_fill1", "wave_fill") and
@@ -790,6 +1032,20 @@ def kcp_plan(
 
     i.e. below the chain cap the largest segment count that still runs one CTA per SM (``P_bal`` does not enter); ``p_rule="wave"`` (the earlier rule, selectable through the test knob) is the first
     block alone.
+
+    The P = 1 tie rule ``"wave_fill1_p1tie"`` (the shipped rule)::
+
+        P       = 1    if p_rule == "wave_fill1_p1tie" and 2 <= n_frag <= WAVE_N_FRAG_MAX and 0 < NC_max_frag < 257 and
+                       P_wave_fill1 > 1 and n_frag H <= SM and
+                       p1_tie_steps(nc_frags, H, SM, 1) <= p1_tie_steps(nc_frags, H, SM, P_wave_fill1)
+                = the "wave_fill1" rule above                                                    otherwise
+
+    with ``nc_frags`` the rank's fragment chunk counts (``None`` = ``n_frag`` equal fragments of ``NC_max_frag`` chunks;
+    :func:`_build_head_plan` passes the actual counts) and :func:`p1_tie_steps` the LPT makespan of one equal-segment
+    walk at one CTA per SM -- the wave model's ``waves x steps`` for equal fragments.  The segment-composition K4
+    launches and the backward's offset re-walk (replay mode; the saved-mode backward reads the kept carry plane) exist
+    only at ``P > 1``; the one-wave P = 1 walk of 128 CTAs runs at a
+    higher per-step cost than the two-wave 256-CTA walk, which the GPU A/B measures.
 
     A pure function of ``(fragment table, H, SM count)``.  A rank without fragments has ``P = 1``, ``NSEG = 0``;
     when every fragment is empty (``NC_max_frag = 0``) the lower bound wins: ``P = 1``.
@@ -819,7 +1075,10 @@ def kcp_plan(
         )
     p_occ = _ceil_div(sm_count, n_frag * H)
     p_chain = max(1, _ceil_div(NC_max_frag, MAX_CHAIN_STEPS))
-    fill_n_frag_max = WAVE_FILL_N_FRAG_MAX.get(p_rule)
+    base_rule = P1_TIE_BASE.get(
+        p_rule, p_rule
+    )  # "wave_fill1_p1tie" starts from the "wave_fill1" P
+    fill_n_frag_max = WAVE_FILL_N_FRAG_MAX.get(base_rule)
     p_fill = sm_count // (n_frag * H)
     if (
         fill_n_frag_max is not None
@@ -829,7 +1088,7 @@ def kcp_plan(
     ):
         P = max(p_chain, min(MAX_SEGMENTS, NC_max_frag, p_fill))
     elif (
-        p_rule != "occ"
+        base_rule != "occ"
         and n_frag <= WAVE_N_FRAG_MAX
         and NC_max_frag >= WAVE_MIN_NC_MAX_FRAG
     ):
@@ -841,6 +1100,12 @@ def kcp_plan(
     else:
         upper = min(MAX_SEGMENTS, NC_max_frag, max(p_chain, int(P_bal)))
         P = max(1, min(max(p_occ, p_chain), upper))
+    if p_rule in P1_TIE_BASE:
+        P = _p1_tie(n_frag, NC_max_frag, H, sm_count, P, nc_frags)
+    elif nc_frags is not None:
+        _p1_tie(
+            n_frag, NC_max_frag, H, sm_count, 1, nc_frags
+        )  # validation only: the other rules ignore the counts
     return KcpSegmentPlan(
         P=P,
         NSEG=n_frag * P,
@@ -932,11 +1197,16 @@ def _halo_sources(part: KcpPartition, halo: int):
                 chains.setdefault(f.doc, []).append(f)
     for lst in chains.values():
         lst.sort(key=lambda f: f.off)
+    # per document the sorted fragment offsets: the owner of token t is the last fragment starting at or before t
+    # (the non-empty fragments of a document tile it, so a bisect replaces the O(chain) scan)
+    starts = {doc: [g.off for g in lst] for doc, lst in chains.items()}
 
     def owner(doc: int, t: int) -> KcpFragment:
-        for g in chains[doc]:
-            if g.off <= t < g.end:
-                return g
+        lst = chains.get(doc)
+        if lst:
+            i = bisect.bisect_right(starts[doc], t) - 1
+            if i >= 0 and t < lst[i].end:
+                return lst[i]
         raise ValueError(f"halo plan: document {doc} token {t} has no owning fragment")
 
     hist: dict[tuple[int, int], tuple] = {}
@@ -1086,7 +1356,7 @@ class KcpHeadPlan:
     crossing-out fragment -> ``dS_out`` slot; segments ``< P - 1`` -> adjoint carry slot), ``out_index`` (``P = 1``:
     the c1 send element of a crossing-out fragment, else ``-1``; ``P > 1``: the staging slot ``= segment``),
     ``walk_seg_offset`` (segments the offset walks visit) and ``walk_seg_tape`` (all).  ``h0_index_fused`` /
-    ``dht_index_fused`` are the one-pool form of the same tables for lever L-B (``fused_walks``; the shipped
+    ``dht_index_fused`` are the one-pool form of the same tables for the fused walks (``fused_walks``; the shipped
     form since an earlier revision; ``fused_walks=0`` through the test knob): at ``P > 1`` every segment's initial state (final adjoint) sits in the carry plane -- segment 0 of a
     crossing-in fragment in the extra slot ``n_frag (P - 1) + in_slot`` that the ``carry_in`` merge fills with its
     ``S_in`` tiles (``write_states``), the last segment of a crossing-out fragment in ``n_frag (P - 1) + out_slot``
@@ -1102,7 +1372,9 @@ class KcpHeadPlan:
     (``dS_out`` of the predecessor in the b2 send buffer).  ``hg_stride[table]`` is the element stride between
     consecutive heads of each offset table (``SUMMARY_TILE`` in the pair buffers, ``TILE`` in the planes).  Every
     offset is ``-1`` or a non-negative multiple of 4 floats (checked here, before any launch).
-    ``device_tables`` holds the int32 / int64 device copies of the tables the kernels read."""
+    ``device_tables`` maps the tables' names to their int32 / int64 device copies, uploaded together (one asynchronous
+    copy) when one of them is first read: the shipped launch path uploads its own per-table-set copies, so building a
+    head plan (``ctx.heads(H)``, the byte queries) is host work only."""
 
     H: int
     Hg: int
@@ -1148,7 +1420,7 @@ class KcpHeadPlan:
     adj_m_off_b1: tuple[int, ...]
     adj_m_off_c1: tuple[int, ...]
     adj_out_off: tuple[int, ...]
-    device_tables: dict[str, torch.Tensor]
+    device_tables: Mapping[str, torch.Tensor]
 
     @property
     def P(self) -> int:
@@ -1313,8 +1585,11 @@ def _build_head_plan(ctx: KcpContext, H: int) -> KcpHeadPlan:
     )
 
     # -- segment plan and the K1 / K2 / K3 segment index tables
-    nc_max_frag = max((_ceil_div(f.length, CHUNK) for f in mine), default=0)
-    seg = kcp_plan(ctx.n_frag, nc_max_frag, H, ctx.sm_count, p_rule=ctx.p_rule)
+    nc_frags = [_ceil_div(f.length, CHUNK) for f in mine]
+    nc_max_frag = max(nc_frags, default=0)
+    seg = kcp_plan(
+        ctx.n_frag, nc_max_frag, H, ctx.sm_count, p_rule=ctx.p_rule, nc_frags=nc_frags
+    )
     P, NSEG = seg.P, seg.NSEG
     seg_table = (
         tuple(seg_chunk_start(list(ctx.seq_chunk_start), P)) if ctx.n_frag else (0,)
@@ -1344,7 +1619,7 @@ def _build_head_plan(ctx: KcpContext, H: int) -> KcpHeadPlan:
                 out_index.append(s)
                 walk_offset.append(s)
     walk_tape = list(range(NSEG))
-    # the one-pool tables of lever L-B (fused_walks; the shipped form since an earlier revision, fused_walks=0 via the knob)
+    # the one-pool tables of the fused walks (fused_walks; the shipped form since an earlier revision, fused_walks=0 via the knob)
     extra = ctx.n_frag * (P - 1)
     h0_fused, dht_fused = [], []
     for f in mine:
@@ -1448,53 +1723,48 @@ def _build_head_plan(ctx: KcpContext, H: int) -> KcpHeadPlan:
     numel["carry"] = (ctx.n_frag * (P - 1) * H * TILE) if P > 1 else 0
     numel["carry_fused"] = (
         ((extra + max(n_in, n_out)) * H * TILE) if P > 1 else 0
-    )  # lever L-B's carry plane
+    )  # the fused walks' carry plane
     dev = ctx.device
     i32, i64 = torch.int32, torch.int64
 
-    def t(values, dtype=i32):
-        return torch.tensor(list(values), dtype=dtype, device=dev)
+    def tiles(rows) -> tuple:
+        return ([list(x) for x in rows], i32, (len(rows), H))
 
-    device_tables = {
-        "seg_chunk_start": t(seg_table),
-        "h0_index": t(h0_index),
-        "carry_index": t(carry_index),
-        "dht_index": t(dht_index),
-        "dcarry_index": t(dcarry_index),
-        "out_index": t(out_index),
-        "walk_seg_offset": t(walk_offset),
-        "walk_seg_tape": t(walk_tape),
-        "out_tile": torch.tensor(
-            [list(x) for x in out_tile], dtype=i32, device=dev
-        ).reshape(len(out_tile), H),
-        "h0_tile": torch.tensor(
-            [list(x) for x in h0_tile], dtype=i32, device=dev
-        ).reshape(len(h0_tile), H),
-        "dht_tile": torch.tensor(
-            [list(x) for x in dht_tile], dtype=i32, device=dev
-        ).reshape(len(dht_tile), H),
-        "b1_d_tile_d": torch.tensor(
-            [list(x) for x in b1_d_tile_d], dtype=i32, device=dev
-        ).reshape(len(b1_d_tile_d), H),
-        "b1_d_tile_dm": torch.tensor(
-            [list(x) for x in b1_d_tile_dm], dtype=i32, device=dev
-        ).reshape(len(b1_d_tile_dm), H),
-        "b1_m_tile_dm": torch.tensor(
-            [list(x) for x in b1_m_tile_dm], dtype=i32, device=dev
-        ).reshape(len(b1_m_tile_dm), H),
-        "fwd_chain_start": t(fwd_start),
-        "fwd_chain_doc": t(fwd_doc),
-        "fwd_m_off": t(fwd_m, i64),
-        "fwd_b_off": t(fwd_b, i64),
-        "fwd_out_off": t(fwd_out, i64),
-        "adj_chain_start": t(adj_start),
-        "adj_chain_doc": t(adj_doc),
-        "adj_d_off_d": t(adj_dd, i64),
-        "adj_d_off_dm": t(adj_ddm, i64),
-        "adj_m_off_b1": t(adj_mb1, i64),
-        "adj_m_off_c1": t(adj_mc1, i64),
-        "adj_out_off": t(adj_out, i64),
+    specs: dict[str, tuple] = {
+        "seg_chunk_start": (seg_table, i32, None),
+        "h0_index": (h0_index, i32, None),
+        "carry_index": (carry_index, i32, None),
+        "dht_index": (dht_index, i32, None),
+        "dcarry_index": (dcarry_index, i32, None),
+        "out_index": (out_index, i32, None),
+        "walk_seg_offset": (walk_offset, i32, None),
+        "walk_seg_tape": (walk_tape, i32, None),
+        "out_tile": tiles(out_tile),
+        "h0_tile": tiles(h0_tile),
+        "dht_tile": tiles(dht_tile),
+        "b1_d_tile_d": tiles(b1_d_tile_d),
+        "b1_d_tile_dm": tiles(b1_d_tile_dm),
+        "b1_m_tile_dm": tiles(b1_m_tile_dm),
+        "fwd_chain_start": (fwd_start, i32, None),
+        "fwd_chain_doc": (fwd_doc, i32, None),
+        "fwd_m_off": (fwd_m, i64, None),
+        "fwd_b_off": (fwd_b, i64, None),
+        "fwd_out_off": (fwd_out, i64, None),
+        "adj_chain_start": (adj_start, i32, None),
+        "adj_chain_doc": (adj_doc, i32, None),
+        "adj_d_off_d": (adj_dd, i64, None),
+        "adj_d_off_dm": (adj_ddm, i64, None),
+        "adj_m_off_b1": (adj_mb1, i64, None),
+        "adj_m_off_c1": (adj_mc1, i64, None),
+        "adj_out_off": (adj_out, i64, None),
     }
+    # host-only by default: the tables are uploaded (one asynchronous copy) when one is first read; the upload="blocking"
+    # knob keeps the previous eager per-table copies
+    device_tables: Mapping[str, torch.Tensor] = (
+        _upload_blocking(specs, dev)
+        if getattr(ctx, "upload", UPLOAD_DEFAULT) == "blocking"
+        else _LazyTables(ctx, specs, dev)
+    )
     return KcpHeadPlan(
         H=H,
         Hg=Hg,
@@ -1572,8 +1842,8 @@ class KcpContext:
     layers; never reads a tensor's contents.
 
     Local problem: ``T_r`` tokens in ``n_frag`` local sequences (``cu_seqlens_local`` int32 device ``[n_frag + 1]``,
-    ``frag_table`` int32 device ``[n_frag, 4]`` = ``(doc, off, len, flags)`` with ``FLAG_CROSSING_IN`` /
-    ``FLAG_CROSSING_OUT`` / ``FLAG_CONTINUING``).  Crossing lists: ``in_slot[slot]`` / ``out_slot[slot]`` (``-1``
+    ``frag_rows`` = ``(doc, off, len, flags)`` per fragment with ``FLAG_CROSSING_IN`` / ``FLAG_CROSSING_OUT`` /
+    ``FLAG_CONTINUING``, as int32 device ``[n_frag, 4]`` in ``frag_table`` on first read).  Crossing lists: ``in_slot[slot]`` / ``out_slot[slot]`` (``-1``
     when not crossing) number the rank's crossing-in / crossing-out fragments in local order (``n_in`` / ``n_out``;
     ``N_in`` / ``N_out`` are the group totals; ``*_by_rank`` and ``*_all`` the per-rank counts / tables every owner
     needs).  ``chains[doc]`` are the ``(rank, slot)`` of each document's non-empty fragments in order.  Tables of the
@@ -1595,7 +1865,7 @@ class KcpContext:
     n_frag: int
     cu_seqlens_local_cpu: tuple[int, ...]
     cu_seqlens_local: torch.Tensor
-    frag_table: torch.Tensor
+    frag_rows: tuple[tuple[int, int, int, int], ...]
     in_slot: tuple[int, ...]
     out_slot: tuple[int, ...]
     n_in: int
@@ -1620,15 +1890,90 @@ class KcpContext:
     tables: dict[str, torch.Tensor]
     halo: KcpHaloPlan
     halo_tables: dict[str, torch.Tensor]
-    p_rule: str = P_RULE_DEFAULT  # plan rule: "wave_fill1" shipped; "wave" / "occ" / "wave_fill" via the test knob
+    p_rule: str = P_RULE_DEFAULT  # plan rule: "wave_fill1_p1tie" shipped; "wave_fill1" (previous) / "wave" / "occ" / "wave_fill" via the test knob
     sequence: KcpSequence = dataclasses.field(default_factory=KcpSequence, repr=False)
+    upload: str = UPLOAD_DEFAULT  # test knob: "async" (shipped) | "blocking" (the previous pageable copies)
+    table_cache: str = TABLE_CACHE_DEFAULT  # test knob: "context" (shipped) | "workspace" (the previous cache)
     _head_plans: dict[int, KcpHeadPlan] = dataclasses.field(
         default_factory=dict, repr=False
     )
+    # the launch table sets of cake_kcp (``_Tables`` per (H, fused_walks, walk_geometry)): shared by every workspace
+    # (and by workspace=None calls); they hold this context only weakly
+    _table_sets: dict = dataclasses.field(default_factory=dict, repr=False)
+    _uploads: list = dataclasses.field(
+        default_factory=list, repr=False
+    )  # KcpUpload records, in issue order
+    _waited: dict = dataclasses.field(
+        default_factory=dict, repr=False
+    )  # stream handle -> number of records ordered on it
+    _lazy: dict = dataclasses.field(
+        default_factory=dict, repr=False
+    )  # tables uploaded on first read (frag_table)
 
     @property
     def fragments(self) -> tuple[KcpFragment, ...]:
         return self.partition.fragments[self.rank]
+
+    @property
+    def frag_table(self) -> torch.Tensor:
+        """int32 ``[n_frag, 4]`` ``(doc, off, len, flags)`` on the context's device, uploaded at its first read (no
+        kernel reads it)."""
+        t = self._lazy.get("frag_table")
+        if t is None:
+            t = self._lazy["frag_table"] = self.upload_tables(
+                {
+                    "frag_table": (
+                        [list(r) for r in self.frag_rows],
+                        torch.int32,
+                        (self.n_frag, 4),
+                    )
+                }
+            )["frag_table"]
+        return t
+
+    def upload_tables(
+        self, specs: dict[str, tuple], device=None, *, stream=None, record: bool = True
+    ) -> dict[str, torch.Tensor]:
+        """Device copies of host-built tables of this context (``name -> (values, dtype, shape)``, see
+        :func:`_upload_tables`): one pinned non-blocking copy on ``stream`` (default: the current stream), recorded
+        for :meth:`wait_ready` (``record``: tables that live as long as the context -- its own, its head plans', its
+        table sets'; the record holds the blob); under the ``upload="blocking"`` test knob the previous per-table
+        pageable copies."""
+        device = self.device if device is None else torch.device(device)
+        if self.upload == "blocking":
+            return _upload_blocking(specs, device)
+        out, rec = _upload_tables(specs, device, stream=stream)
+        if rec is not None and record:
+            self._uploads.append(rec)
+        return out
+
+    @property
+    def ready(self):
+        """The CUDA event recorded after the context's own tables were copied (``None`` on a non-CUDA device or under
+        the ``upload="blocking"`` knob)."""
+        return self._uploads[0].ready if self._uploads else None
+
+    def wait_ready(self, stream=None) -> None:
+        """Order every upload of this context before the later work of ``stream`` (default: the current stream of
+        the context's device), without blocking the host: once per (upload, stream), ``stream.wait_event`` on the
+        upload's event plus ``record_stream`` of its blob for an upload made on another stream; nothing for an upload
+        made on ``stream`` itself (stream order covers it) and nothing while ``stream`` captures a CUDA graph (the capture
+        state of ``stream`` itself, not of the current stream).  The KDA and conv halo entry points call it on every
+        call; a caller that prepares a context on another stream calls it before handing the context's tables to work
+        of its own."""
+        n = len(self._uploads)
+        if not n:
+            return
+        s = torch.cuda.current_stream(self.device) if stream is None else stream
+        key = s.cuda_stream
+        i = self._waited.get(key, 0)
+        if i >= n or _stream_capturing(s):
+            return
+        for rec in self._uploads[i:n]:
+            if rec.stream.cuda_stream != key:
+                s.wait_event(rec.ready)
+                rec.blob.record_stream(s)
+        self._waited[key] = n
 
     @property
     def ring_eligible(self) -> bool:
@@ -1727,6 +2072,8 @@ def build_kcp_context(
     conv_kernel_size: int = 4,
     *,
     sm_count: int | None = None,
+    heads=None,
+    stream=None,
     _kcp_test_knobs: dict | None = None,
 ) -> KcpContext:
     """The :class:`KcpContext` of ``rank`` (the KCP contract §3.1).
@@ -1738,10 +2085,22 @@ def build_kcp_context(
     CUDA device's multiprocessor count; ``1`` on a non-CUDA device = no occupancy pressure, ``P = P_chain``).
     Out-of-range problems are rejected here, before any launch: ``n_frag > 65536`` (the layout table's document
     search), int32 overflows of the kernels' offsets (``heads(H)``).  ``_kcp_test_knobs`` is the private test hook
-    (SPEC-11; accepted only with ``CAKE_KCP_TEST_KNOBS=1``): its ``p_rule`` selects the plan's ``P`` rule for this
-    context (:data:`P_RULE_DEFAULT` = ``"wave_fill1"`` without the knob; ``"wave"`` = the earlier rule, ``"occ"`` = the
-    earlier rule, ``"wave_fill"`` = the unadopted fill on every rank with at most three fragments, kept for the A/B
-    record); the public API never selects a rule other than the default.
+    (SPEC-11; accepted only after :func:`enable_test_knobs`): its ``p_rule`` selects the plan's ``P`` rule for this
+    context (:data:`P_RULE_DEFAULT` = ``"wave_fill1_p1tie"`` without the knob;
+    ``"wave_fill1"`` = the previous rule (the fill without the tie line), ``"wave"`` = the equal-segment wave rule
+    above the chain cap alone, ``"occ"`` = the occupancy rule, ``"wave_fill"`` = the unadopted fill on every rank with
+    at most three fragments, kept for the A/B record); the
+    public API never selects a rule other than the default.  The knobs ``upload="blocking"`` / ``table_cache="workspace"``
+    keep the previous pageable per-table copies / the per-workspace table-set cache (A/B record, negative control).
+
+    Host synchronization: the context's device tables (``tables``, ``halo_tables``, ``cu_seqlens_local``) are copied
+    in ONE pinned non-blocking copy on ``stream`` (default: the current stream of ``device``), so the host never waits
+    for device work queued before it -- a pack can be prepared while the previous one runs.  ``heads`` (an int or a
+    sequence of ints) also derives the head plans of those head counts here (host work only; their device tables are
+    uploaded only when read).  The tables are valid for work enqueued on ``stream`` after this call; for another
+    stream ``S`` call ``ctx.wait_ready(S)`` (the KDA and conv halo entry points call ``ctx.wait_ready()`` on their
+    current stream themselves).  A thread other than the one that runs the pack must pass ``stream`` (the current
+    stream is per thread).  Not under CUDA-graph capture (``RuntimeError``).
     """
     if not isinstance(part, KcpPartition):
         raise TypeError(
@@ -1773,7 +2132,39 @@ def build_kcp_context(
     sm_count = int(sm_count)
     if sm_count < 1:
         raise ValueError(f"build_kcp_context: sm_count must be >= 1, got {sm_count}")
-    p_rule = validate_test_knobs(_kcp_test_knobs)["p_rule"]
+    knobs = _kcp_test_knobs
+    upload, table_cache = UPLOAD_DEFAULT, TABLE_CACHE_DEFAULT
+    if isinstance(knobs, dict) and ("upload" in knobs or "table_cache" in knobs):
+        if not test_knobs_enabled():
+            raise ValueError(
+                f"_kcp_test_knobs is a private test hook: it is accepted only after {ENABLE_TEST_KNOBS}"
+            )
+        knobs = dict(knobs)
+        upload = str(knobs.pop("upload", UPLOAD_DEFAULT))
+        table_cache = str(knobs.pop("table_cache", TABLE_CACHE_DEFAULT))
+        if upload not in UPLOADS:
+            raise ValueError(
+                f"_kcp_test_knobs: upload must be one of {UPLOADS}, got {upload!r}"
+            )
+        if table_cache not in TABLE_CACHES:
+            raise ValueError(
+                f"_kcp_test_knobs: table_cache must be one of {TABLE_CACHES}, got {table_cache!r}"
+            )
+        if table_cache == "workspace" and upload != "blocking":
+            # the previous per-workspace table sets are not recorded on the context: their asynchronous copies
+            # would be unordered for a later call on another stream
+            raise ValueError(
+                "_kcp_test_knobs: table_cache='workspace' (the previous path) needs upload='blocking'"
+            )
+    p_rule = validate_test_knobs(knobs)["p_rule"]
+    head_counts: tuple[int, ...]
+    if heads is None:
+        head_counts = ()
+    else:
+        try:  # an int-like scalar (int, numpy / 0-d torch integer)
+            head_counts = (operator.index(heads),)
+        except TypeError:
+            head_counts = tuple(int(h) for h in heads)
     mine = part.fragments[rank]
     n_frag = len(mine)
     if n_frag > MAX_FRAGS:
@@ -1808,38 +2199,49 @@ def build_kcp_context(
     tables_cpu = chunk_tables(local_cu)
     nc_max, nc_pad, rows = chunk_geometry(T_r, n_frag)
     i32 = torch.int32
-    tables = {
-        name: torch.tensor(list(values), dtype=i32, device=device)
-        for name, values in tables_cpu.items()
-    }
     flags = [
         (FLAG_CROSSING_IN if f.crossing_in else 0)
         | (FLAG_CROSSING_OUT if f.crossing_out else 0)
         | (FLAG_CONTINUING if (f.length > 0 and f.off > 0) else 0)
         for f in mine
     ]
-    frag_rows = [
-        [f.doc, f.off, f.length, fl] for f, fl in zip(mine, flags, strict=True)
-    ]
-    frag_table = torch.tensor(frag_rows, dtype=i32, device=device).reshape(n_frag, 4)
+    frag_rows = tuple(
+        (f.doc, f.off, f.length, fl) for f, fl in zip(mine, flags, strict=True)
+    )
     halo_plan = _halo_plan(part, rank, halo, local_cu)
-    halo_tables = {
-        "hist_row_off": torch.tensor(
-            [list(r) for r in halo_plan.hist_row_off], dtype=i32, device=device
-        ).reshape(n_frag, halo),
-        "tail_row_off": torch.tensor(
-            [list(r) for r in halo_plan.tail_row_off], dtype=i32, device=device
-        ).reshape(n_frag, halo),
-        "head_row_off": torch.tensor(
-            [[list(c) for c in r] for r in halo_plan.head_row_off],
-            dtype=i32,
-            device=device,
-        ).reshape(n_frag, halo, halo),
-        "hist_index": torch.tensor(
-            list(halo_plan.hist_index), dtype=torch.int64, device=device
-        ),
+    # the tables the token-side stages and the conv halo read: one upload (the frag_table has no reader: on first read)
+    specs: dict[str, tuple] = {
+        name: (values, i32, None) for name, values in tables_cpu.items()
     }
-    return KcpContext(
+    specs.update(
+        hist_row_off=(
+            [list(r) for r in halo_plan.hist_row_off],
+            i32,
+            (n_frag, halo),
+        ),
+        tail_row_off=(
+            [list(r) for r in halo_plan.tail_row_off],
+            i32,
+            (n_frag, halo),
+        ),
+        head_row_off=(
+            [[list(c) for c in r] for r in halo_plan.head_row_off],
+            i32,
+            (n_frag, halo, halo),
+        ),
+        hist_index=(list(halo_plan.hist_index), torch.int64, None),
+        cu_seqlens_local=(list(local_cu), i32, None),
+    )
+    if upload == "blocking":
+        dev_tables, rec = _upload_blocking(specs, device), None
+    else:
+        dev_tables, rec = _upload_tables(specs, device, stream=stream)
+    tables = {name: dev_tables[name] for name in tables_cpu}
+    halo_tables = {
+        name: dev_tables[name]
+        for name in ("hist_row_off", "tail_row_off", "head_row_off", "hist_index")
+    }
+    ctx = KcpContext(
         partition=part,
         rank=rank,
         world_size=W,
@@ -1851,8 +2253,8 @@ def build_kcp_context(
         T_r=T_r,
         n_frag=n_frag,
         cu_seqlens_local_cpu=local_cu,
-        cu_seqlens_local=torch.tensor(list(local_cu), dtype=i32, device=device),
-        frag_table=frag_table,
+        cu_seqlens_local=dev_tables["cu_seqlens_local"],
+        frag_rows=frag_rows,
         in_slot=in_slot_all[rank],
         out_slot=out_slot_all[rank],
         n_in=n_in_by[rank],
@@ -1877,7 +2279,16 @@ def build_kcp_context(
         tables=tables,
         halo=halo_plan,
         halo_tables=halo_tables,
+        upload=upload,
+        table_cache=table_cache,
     )
+    if rec is not None:
+        ctx._uploads.append(rec)
+    if upload == "blocking":  # the previous path: every table at preparation
+        ctx.frag_table  # noqa: B018
+    for H in head_counts:
+        ctx.heads(H)
+    return ctx
 
 
 # ----------------------------------------------------------------------------------------------------------------
@@ -1889,42 +2300,102 @@ def _check_save_mode(save_mode: str) -> None:
         raise ValueError(f"save_mode must be 'light' or 'tape', got {save_mode!r}")
 
 
+# What a checkpoint recompute handle keeps of one KDA call (``cake_kcp.chunk_kda_kcp(..., recompute_handle=,
+# checkpoint_keep=)``): ``"states"`` (the default) the incoming states ``S_in`` -- the call runs with
+# ``save_transfer=False`` --, ``"transfer"`` also the owner's c1 receive tensor (``save_transfer=True``).
+CHECKPOINT_KEEPS = ("states", "transfer")
+
+
+def _check_checkpoint_keep(
+    checkpoint_keep: str | None, save_transfer: bool | None
+) -> bool:
+    """The ``save_transfer`` a byte query reads: ``None`` -> ``SAVE_TRANSFER_DEFAULT`` without a tier; a tier fixes it
+    (``"states"`` -> ``False``, ``"transfer"`` -> ``True``) and an explicit value that contradicts it raises, as the
+    entry point does."""
+    if checkpoint_keep is None:
+        return SAVE_TRANSFER_DEFAULT if save_transfer is None else bool(save_transfer)
+    if checkpoint_keep not in CHECKPOINT_KEEPS:
+        raise ValueError(
+            f"checkpoint_keep must be None or one of {CHECKPOINT_KEEPS}, got {checkpoint_keep!r}"
+        )
+    transfer = checkpoint_keep == "transfer"
+    if save_transfer is not None and bool(save_transfer) != transfer:
+        raise ValueError(
+            f"checkpoint_keep={checkpoint_keep!r} runs the call with save_transfer={transfer}; "
+            f"save_transfer={save_transfer!r} contradicts it"
+        )
+    return transfer
+
+
 def kcp_saved_bytes(
     ctx: KcpContext,
     *,
     H: int = 64,
     save_mode: str = "light",
-    save_transfer: bool = SAVE_TRANSFER_DEFAULT,
+    save_transfer: bool | None = None,
     with_conv: bool = True,
     C: int = 8192,
+    saved_carry: bool = True,
+    checkpoint_keep: str | None = None,
 ) -> int:
     """Saved-set bytes of one layer on this rank (the KCP contract §3.2 ``kcp_saved_bytes(ctx, ...)``)::
 
-    256 * T_r * H + tables_bytes(NC_pad, n_frag, NSEG)        # Aqk / Akk on the token rows + the int32 tables
+    tables_bytes(NC_pad, n_frag, NSEG)                         # the int32 tables
     + n_in * s                                                 # S_in, s = H * 128 * 128 * 4
     + [save_transfer] * N_out * 2 * s * Hg_r / H               # the owner's whole c1 receive tensor
     + [save_transfer] * [P > 1] * NSEG * s                     # M_seg of the segmented fragments (home rank)
+    + [saved_carry] * [P > 1] * (n_frag * (P - 1) + max(n_in, n_out)) * s   # the forward's carry plane (shipped)
     + [with_conv] * sum_cont hist_valid * C * 2                # the hist row pool (BF16)
     save_mode="tape": + NC_pad * H * 32768 + R * H * 256       # the forward's h tape and v_new
 
     ``save_transfer`` defaults to :data:`SAVE_TRANSFER_DEFAULT` (``True`` since an earlier revision);
     the two ``[save_transfer]`` terms are the delta against the earlier recompute form (``save_transfer=False``).
+    ``saved_carry`` (default ``True`` = the shipped default: the forward of a ``P > 1`` rank keeps its carry plane in
+    the saved set) counts the whole carry plane of a ``P > 1`` rank under the shipped fused tape walks (one extra slot
+    per crossing fragment); ``False`` = the re-walk form of the test knob ``saved_carry=0``.
+
+    The set carries no token-row ``Aqk`` / ``Akk`` (the ``256 * T_r * H`` term of its earlier version): the backward
+    recomputes the internal rows in both modes.
 
     The retained ``S_in`` and c1 tensors are the padded receive buffers (``s`` -> ``n_owners Hg`` tiles,
     ``Hg_r`` -> ``Hg_pad_r``); identical to the formula for ``H = 64``, and the padding is reported by
     ``kcp_comm_bytes(...)["padding"]``.  ``M_seg`` stays the dense copy of §9 (``NSEG s``).
-    """
+
+    ``checkpoint_keep`` (``None`` = the saved set above): the bytes a checkpoint recompute handle retains for this
+    layer while its backward is pending -- the tensors the handle's ``"kda"`` entry holds (exactly
+    ``handle.nbytes()`` of a handle that served this call alone) plus, with ``with_conv``, one convolution's
+    history pool (its ``"conv"`` entry)::
+
+    n_in * s_pad                                               # S_in: "states" and "transfer"
+    + ["transfer"] * N_out * 2 * s * Hg_r / H                  # the owner's whole c1 receive tensor
+    + [with_conv] * n_hist_rows * C * 2                        # one convolution's hist pool (BF16)
+
+    The tier fixes ``save_transfer`` (``False`` / ``True``; ``None``, the default, is ``SAVE_TRANSFER_DEFAULT``
+    without a tier; an explicit value that contradicts the tier raises ``ValueError``, as the entry point does);
+    ``save_mode`` and ``saved_carry`` are not read.  The saved set itself is released by the checkpoint as before
+    (#7039)."""
     _check_save_mode(save_mode)
+    save_transfer = _check_checkpoint_keep(checkpoint_keep, save_transfer)
     H, C = int(H), int(C)
     hp = ctx.heads(H)
+    if checkpoint_keep is not None:
+        numel = kcp_pool_numel(ctx, H=H)
+        kept = numel["S_in"] * 4
+        if checkpoint_keep == "transfer":
+            kept += numel["c1_recv"] * 4
+        if with_conv:
+            kept += ctx.halo.n_hist_rows * C * 2
+        return kept
     s = H * STATE_TILE_BYTES
     s_pad = hp.n_owners * hp.Hg * STATE_TILE_BYTES  # = s without padding
-    total = 256 * ctx.T_r * H + tables_bytes(ctx.NC_pad, ctx.n_frag, hp.NSEG)
+    total = tables_bytes(ctx.NC_pad, ctx.n_frag, hp.NSEG)
     total += ctx.n_in * s_pad
     if save_transfer:
         total += ctx.N_out * 2 * hp.Hg_pad_by_rank[ctx.rank] * STATE_TILE_BYTES
         if hp.P > 1:
             total += hp.NSEG * s
+    if saved_carry and hp.P > 1:
+        total += (ctx.n_frag * (hp.P - 1) + max(ctx.n_in, ctx.n_out)) * s
     if with_conv:
         total += ctx.halo.n_hist_rows * C * 2
     if save_mode == "tape":
@@ -1937,8 +2408,9 @@ def kcp_comm_bytes(
     *,
     H: int = 64,
     C: int = 8192,
-    save_transfer: bool = SAVE_TRANSFER_DEFAULT,
+    save_transfer: bool | None = None,
     boundary_mode: str = "saved",
+    checkpoint_keep: str | None = None,
 ) -> dict:
     """Bytes this rank moves per collective and per boundary (the KCP contract §3.2 ``kcp_comm_bytes(ctx)``; ``send`` / ``recv``
     per collective, totals ``B1`` = forward (c1, c2, halo_fwd), ``B2`` = backward from the saved context (b1 with
@@ -1948,10 +2420,23 @@ def kcp_comm_bytes(
     ``bwd_adjoint_bytes`` of the harness ``kcp_shapes.comm_bytes`` (plus the padding when ``H % Hg != 0``).
     ``padding`` reports the padding bytes contained in c1 / c2 / b1 / b2 (``send`` / ``recv``), their ``B1`` /
     ``B2`` sums, the padding retained inside the saved ``S_in`` (``s_in_saved``), the ``padded_owner`` and the
-    ``pad_tiles_per_slot``; all zero for the production ``H = 64``."""
+    ``pad_tiles_per_slot``; all zero for the production ``H = 64``.
+
+    ``checkpoint_keep`` (``"states"`` | ``"transfer"``; ``None`` = the table above): the traffic of a checkpointed
+    step with a recompute handle of that tier.  The tier fixes ``save_transfer`` (``False`` / ``True``; an explicit
+    value that contradicts it raises ``ValueError``, as the entry point does; ``None``, the default, is
+    ``SAVE_TRANSFER_DEFAULT`` without a tier), so ``B2`` (``b1`` in the ``dm`` form under ``"states"``) is the
+    backward's traffic; the recompute moves nothing (``recompute``: no c1 / c2, and no ``halo_fwd`` when the
+    convolution carries its own handle), so the step moves ``B1 + B2`` instead of the ``B1 + B1 + B2`` of a
+    checkpoint without a handle; the table also reports ``checkpoint_keep``."""
     if boundary_mode not in ("saved", "replay"):
         raise ValueError(
             f"boundary_mode must be 'saved' or 'replay', got {boundary_mode!r}"
+        )
+    save_transfer = _check_checkpoint_keep(checkpoint_keep, save_transfer)
+    if checkpoint_keep is not None and boundary_mode != "saved":
+        raise ValueError(
+            "checkpoint_keep describes a saved-mode call: it needs boundary_mode='saved'"
         )
     H, C = int(H), int(C)
     hp = ctx.heads(H)
@@ -2001,7 +2486,7 @@ def kcp_comm_bytes(
     }
     padding["B1"] = total(padding["c1"], padding["c2"])
     padding["B2"] = total(padding["b1"], padding["b2"])
-    return {
+    table = {
         **coll,
         "b1_replay": b1_replay,
         "padding": padding,
@@ -2021,6 +2506,73 @@ def kcp_comm_bytes(
         "save_transfer": bool(save_transfer),
         "boundary_mode": boundary_mode,
     }
+    if checkpoint_keep is not None:
+        table["checkpoint_keep"] = checkpoint_keep
+        table["recompute"] = {"send": 0, "recv": 0}
+    return table
+
+
+# The pools of a rank's KCP workspace (``cake_kcp.KcpWorkspace``) that share one storage: each backward send pool
+# reuses the bytes of the forward send pool beside it.  A forward call waits its c1 / c2 sends before it returns and
+# a replay-mode backward runs its forward (waiting those sends) before the first write of b1_send / b2_send, so the
+# lifetimes never overlap; c1_recv keeps its own storage (the replay-mode backward's adjoint merge reads it).
+SHARED_POOLS = (("c1_send", "b1_send"), ("c2_send", "b2_send"))
+# Pools a workspace allocates on first use only: the ring exchange's hop buffers (``exchange="ring"``), which the
+# a2a exchange never reads.
+LAZY_POOLS = ("ring_out", "ring_in")
+# Pools a forward-only workspace (``backward=False``) allocates on first use only: the c1 receive pool and, at
+# ``P > 1``, the staging plane of the transfers and the carry plane.  A forward without a saved set reads all three;
+# a forward with one writes a fresh saved carry plane in place of ``carry`` and, under ``save_transfer``, fresh
+# saved-set tensors in place of the :data:`FWD_TRANSFER_POOLS` (without it, and under the ring exchange, it reads
+# them: the a2a exchange receives c1 into ``c1_recv``, the ring exchange receives no c1 tensor); a backward
+# workspace sizes them up front.
+FWD_LAZY_POOLS = ("c1_recv", "stage_m", "carry")
+# The :data:`FWD_LAZY_POOLS` that ``save_transfer`` replaces with fresh saved-set tensors (the c1 receive tensor,
+# ``M_seg``).
+FWD_TRANSFER_POOLS = ("c1_recv", "stage_m")
+# The pools a workspace sizes for a forward (``backward=False``) and the ones a backward workspace adds.
+FWD_POOLS = (
+    "c1_send",
+    "c1_recv",
+    "c2_send",
+    "stage_b",
+    "stage_m",
+    "carry",
+    "eye",
+) + LAZY_POOLS
+BWD_POOLS = ("b1_send", "b1_recv", "b2_send", "b2_recv")
+
+
+def kcp_pool_numel(
+    ctx: KcpContext, *, H: int = 64, fused_walks: int = 1
+) -> dict[str, int]:
+    """Elements (FP32) of every pool of a rank's KCP workspace and of the call's fresh ``S_in``, by buffer name: the
+    one source of the sizes ``cake_kcp`` gives its pools and fresh tensors.  ``fused_walks`` (shipped ``1``) adds one
+    carry slot per crossing fragment at ``P > 1``; at ``P > 1`` ``c1_send`` also holds one staging tile per head of each
+    crossing-out fragment of this rank (its ``M_f``, transposed into the send layout by the forward)."""
+    H = int(H)
+    hp = ctx.heads(H)
+    n, P, NSEG = hp.numel, int(hp.P), int(hp.NSEG)
+    n_in, n_out = int(ctx.n_in), int(ctx.n_out)
+    n_carry = int(ctx.n_frag) * (P - 1) if P > 1 else 0
+    if fused_walks and P > 1:
+        n_carry += max(n_in, n_out)
+    return {
+        "c1_send": int(n["c1_send"]) + (n_out * H * TILE if P > 1 else 0),
+        "c1_recv": int(n["c1_recv"]),
+        "c2_send": int(n["c2_send"]),
+        "S_in": int(n["c2_recv"]),
+        "b1_send": max(int(n["b1_send_d"]), int(n["b1_send_dm"])),
+        "b1_recv": max(int(n["b1_recv_d"]), int(n["b1_recv_dm"])),
+        "b2_send": int(n["b2_send"]),
+        "b2_recv": int(n["b2_recv"]),
+        "stage_b": NSEG * H * TILE if P > 1 else 0,
+        "stage_m": NSEG * H * TILE if P > 1 else 0,
+        "carry": n_carry * H * TILE,
+        "eye": TILE,
+        "ring_out": max(n_in, n_out) * H * TILE,
+        "ring_in": max(n_in, n_out) * H * TILE,
+    }
 
 
 def kcp_arena_layout(
@@ -2032,42 +2584,87 @@ def kcp_arena_layout(
     save_transfer: bool = SAVE_TRANSFER_DEFAULT,
     C: int = 8192,
 ) -> dict[str, int]:
-    """The KCP arena's transient buffers in bytes (``KcpWorkspace``; SPEC-4: the saved-set tensors ``S_in``, the
-    c1 receive tensor with ``save_transfer``, ``M_seg`` with ``save_transfer`` at ``P > 1`` and ``hist`` are NOT
-    here).  ``forward`` / ``backward`` are the two lifetimes' sums; ``arena`` is their maximum (one reusable arena).
-    ``staging`` is the ``P > 1`` pair of dense planes ``stage_b`` / ``stage_m`` (``[NSEG, H, 128, 128]`` each; transient
-    in both lifetimes; the ``stage_m`` plane retained as ``M_seg`` with ``save_transfer`` is counted by :func:`kcp_saved_bytes`)."""
+    """The KCP pools of a rank's workspace (``cake_kcp.KcpWorkspace``) in bytes, as the workspace allocates them.
+
+    ``pool.<name>``: the bytes each pool of a forward (``backward=False``) or a backward workspace needs
+    (:func:`kcp_pool_numel`, 4 B per element); ``arena``: the bytes the workspace allocates -- every pool once, each
+    :data:`SHARED_POOLS` pair as one storage of the larger need, the :data:`LAZY_POOLS` not at all (``ring``: the bytes
+    a call with ``exchange="ring"`` adds on first use) and, in a forward workspace, the :data:`FWD_LAZY_POOLS` a
+    forward with a saved set leaves unread not at all either: all three under ``save_transfer``, ``carry`` alone
+    without it (the a2a forward then reads the :data:`FWD_TRANSFER_POOLS`), so ``arena`` is the workspace after its
+    forwards with a saved set (``lazy``: the bytes the first forward without a saved set adds; zero in a backward
+    workspace, which counts every pool in ``arena``).  The ring exchange receives no c1 tensor: its forward workspace
+    holds ``pool.c1_recv`` bytes fewer than the ``save_transfer=False`` ``arena`` (the option resolves to ``False``
+    there) and ``ring`` more.  The saved set (``S_in``, the c1 receive tensor kept with ``save_transfer``, ``M_seg``, the forward's saved
+    copy of the carry plane; :func:`kcp_saved_bytes`; the ``carry`` pool the backward's adjoint carries use is a
+    workspace pool) and the convolution route's halo rows (per-call tensors; their traffic: :func:`kcp_comm_bytes`
+    ``halo_fwd`` / ``halo_bwd``) are never workspace pools, so ``C`` leaves the workspace unchanged, and so does
+    ``save_transfer`` a backward workspace."""
     _check_save_mode(save_mode)
-    H, C = int(H), int(C)
-    hp = ctx.heads(H)
-    n, halo = hp.numel, ctx.halo
-    staging = n["staging"]
-    fwd = {
-        "c1_send": n["c1_send"] * 4,
-        "c1_recv": 0 if save_transfer else n["c1_recv"] * 4,
-        "c2_send": n["c2_send"] * 4,
-        "staging": staging * 4,
-        "carry": n["carry"] * 4,
-        "halo_send": sum(halo.fwd_send_rows) * C * 2,
+    numel = kcp_pool_numel(ctx, H=H)
+    need = {
+        name: numel[name] * 4 for name in FWD_POOLS + (BWD_POOLS if backward else ())
     }
-    b1_send, b1_recv = hp.b1_splits(not save_transfer)
-    bwd = {
-        "b1_send": sum(b1_send) * 4,
-        "b1_recv": sum(b1_recv) * 4,
-        "b2_send": n["b2_send"] * 4,
-        "b2_recv": n["b2_recv"] * 4,
-        "staging": staging * 4,
-        "carry": n["carry"] * 4,
-        "dpre_head": halo.n_head_rows * C * 4,
-        "dpre_tail": halo.n_tail_rows * C * 4,
-    }
-    out = {f"fwd.{k}": v for k, v in fwd.items()}
-    if backward:
-        out.update({f"bwd.{k}": v for k, v in bwd.items()})
-    out["forward"] = sum(fwd.values())
-    out["backward"] = sum(bwd.values()) if backward else 0
-    out["arena"] = max(out["forward"], out["backward"])
+    shared = {name for pair in SHARED_POOLS for name in pair}
+    # the forward-only pools no forward with a saved set reads: left to a forward without one
+    deferred = (
+        ()
+        if backward
+        else tuple(
+            name
+            for name in FWD_LAZY_POOLS
+            if save_transfer or name not in FWD_TRANSFER_POOLS
+        )
+    )
+    lazy = LAZY_POOLS + deferred
+    arena = sum(
+        v for name, v in need.items() if name not in shared and name not in lazy
+    )
+    arena += sum(
+        max((need[name] for name in pair if name in need), default=0)
+        for pair in SHARED_POOLS
+    )
+    out = {f"pool.{name}": v for name, v in need.items()}
+    out["ring"] = sum(need[name] for name in LAZY_POOLS)
+    out["lazy"] = sum(need[name] for name in deferred)
+    out["arena"] = arena
     return out
+
+
+# The paths of the existing backend's plan the KCP's local stages take their records from: the forward without a
+# saved set (its records read the internal ``Aqk`` / ``Akk`` rows the intra program writes; the output program is
+# the KCP's own) and the checkpoint replay for both backward modes (its prep keeps the internal ``dout`` copy K2 and
+# the KCP's ``dav`` read; its WY and fused-gradient records read the recomputed internal rows).
+LOCAL_PATH_FWD = "fwd_nosave"
+LOCAL_PATH_BWD = "replay"
+# The layout of a forward-only local arena: the KCP route's own forward layout (``cake_backend.FWD_KCP_SLOTS``; no
+# state blocks, the internal Akk rows under the h tape), which the existing backend's forward layout contains.
+LOCAL_LAYOUT_FWD_ONLY = "fwd_kcp"
+
+
+def local_fwd_layout(backward: bool, save_mode: str = "light") -> str:
+    """The forward layout (``cake_backend.KdaWorkspace`` ``fwd_layout``) of a rank's local arena:
+    :data:`LOCAL_LAYOUT_FWD_ONLY` for a forward-only light workspace, else ``"fwd"`` (a backward workspace keeps the
+    existing backend's layouts, so a forward on it runs on that arena's ``fwd`` views)."""
+    return LOCAL_LAYOUT_FWD_ONLY if not backward and save_mode == "light" else "fwd"
+
+
+def intra_writes_tables(plan, path: str = LOCAL_PATH_FWD) -> bool:
+    """Whether the existing backend's intra record of ``path`` (a :class:`cake_backend.Plan`) computes the chunk
+    layout from ``cu_seqlens`` and writes the tables itself (its logical vocabulary binds ``cu_seqlens``): the kernel
+    backend then hands it a scratch table set so the KCP's CPU-built tables are never rewritten by a kernel."""
+    from . import (
+        cake_jit,
+    )  # the registry literal; imported here so the metadata module stays torch-only
+
+    record = plan.record("fwd_intra", path)
+    return "cu_seqlens" in cake_jit.MODULES[record]["logical"].values()
+
+
+def local_scratch_table_bytes(plan) -> int:
+    """Bytes of the scratch table set of :func:`intra_writes_tables` on the arena of ``plan`` (its table buffer: the
+    four chunk tables and the block table, 256 B aligned), zero where the intra record reads the tables instead."""
+    return int(plan.table_words()) * 4 if intra_writes_tables(plan) else 0
 
 
 def kcp_workspace_bytes(
@@ -2080,8 +2677,15 @@ def kcp_workspace_bytes(
     C: int = 8192,
 ) -> int:
     """Caller-held workspace bytes of one rank: the existing backend's local arena for ``(T_r, n_frag, H)``
-    (``kda_train_workspace_bytes``; zero on a rank without tokens) plus the KCP arena of transient buffers
-    (:func:`kcp_arena_layout`; CONSISTENCY-6, SPEC-4: saved-set tensors are counted by :func:`kcp_saved_bytes`)."""
+    (``kda_train_workspace_bytes``; zero on a rank without tokens; a forward-only light workspace,
+    ``backward=False``, takes the KCP forward layout :data:`LOCAL_LAYOUT_FWD_ONLY`, 2432 B per internal token-head)
+    with the intra record's scratch table set where it writes one (:func:`local_scratch_table_bytes`), plus the KCP
+    arena of transient buffers (:func:`kcp_arena_layout`; CONSISTENCY-6, SPEC-4: saved-set tensors are counted by
+    :func:`kcp_saved_bytes`).  A forward-only workspace has two states: these bytes after its forwards with a saved
+    set (the training forward) under ``save_transfer`` -- pass the forward's value: without it such a forward also
+    allocates the :data:`FWD_TRANSFER_POOLS` -- and ``kcp_arena_layout(..., save_transfer=save_transfer)["lazy"]``
+    more once a forward without one has read the rest of the :data:`FWD_LAZY_POOLS`.  The ring exchange's hop pools
+    (``["ring"]``) are not counted; its forward-only workspace holds no c1 receive pool (``["pool.c1_recv"]``)."""
     _check_save_mode(save_mode)
     local = 0
     if ctx.T_r > 0:
@@ -2097,8 +2701,19 @@ def kcp_workspace_bytes(
                 backward=backward,
                 save_mode=save_mode,
                 sm_count=ctx.sm_count,
+                fwd_layout=local_fwd_layout(backward, save_mode),
             )
         )
+        # the scratch table set where the intra record writes one (the rule is architecture-independent; the
+        # buffer size follows the same segment-count convention as the arena bytes above)
+        if intra_writes_tables(
+            cake_backend.plan(ctx.T_r, ctx.n_frag, int(H), ctx.sm_count)
+        ):
+            local += int(
+                cake_backend.tables_bytes(
+                    ctx.T_r, ctx.n_frag, int(H), sm_count=ctx.sm_count
+                )
+            )
     arena = kcp_arena_layout(
         ctx,
         H=H,
@@ -2114,19 +2729,36 @@ def kcp_workspace_bytes(
 # Private test knobs (the design note §10.1, SPEC-11)
 
 
+ENABLE_TEST_KNOBS = "cake_kcp_plan.enable_test_knobs()"
+
+
+def enable_test_knobs(enabled: bool = True) -> bool:
+    """Opt this process into (``True``) or out of (``False``) the private ``_kcp_test_knobs`` hook of the KCP entry
+    points and the test-only programs of ``build.test.json``; returns the previous setting.  A test hook: the shipped
+    route never needs it, and without it no option reaches a test-only program (SPEC-11)."""
+    global _TEST_KNOBS_ENABLED
+    previous, _TEST_KNOBS_ENABLED = _TEST_KNOBS_ENABLED, bool(enabled)
+    return previous
+
+
+def test_knobs_enabled() -> bool:
+    """Whether the process opted into the private test hook (:func:`enable_test_knobs`)."""
+    return _TEST_KNOBS_ENABLED
+
+
 def validate_test_knobs(knobs) -> dict:
     """Normalize ``_kcp_test_knobs``: ``None`` -> the public defaults ``{"precision_mode": 0, "p_rule":
-    P_RULE_DEFAULT}`` (``"wave_fill1"``); a dict is accepted only when the environment variable ``CAKE_KCP_TEST_KNOBS=1``
-    is set, holds only known keys and selects a known ``precision_mode`` (0 shipped TF32 hi/lo; 1 the explicit
+    P_RULE_DEFAULT}`` (``"wave_fill1_p1tie"``); a dict is accepted only after :func:`enable_test_knobs`, holds only known keys and selects a known ``precision_mode`` (0 the hi/lo form of the TF32 walk; 1 the explicit
     three-MMA form of the R1 bitwise test; 2 plain TF32, the optional G2 cross-check) and a known ``p_rule``
-    (:data:`P_RULES`; ``"wave"`` = the earlier rule, ``"occ"`` = the occupancy rule, ``"wave_fill"`` = the unadopted
-    fill, read by :func:`build_kcp_context`).  The public API can
+    (:data:`P_RULES`; ``"wave_fill1"`` = the previous rule (the fill without the tie line), ``"wave"`` = the equal-segment
+    wave rule above the chain cap alone, ``"occ"`` = the occupancy rule, ``"wave_fill"`` = the unadopted fill; read by
+    :func:`build_kcp_context`).  The public API can
     therefore never select a non-zero mode or a P rule other than the shipped one."""
     if knobs is None:
         return {"precision_mode": 0, "p_rule": P_RULE_DEFAULT}
-    if os.environ.get(TEST_KNOBS_ENV) != "1":
+    if not test_knobs_enabled():
         raise ValueError(
-            f"_kcp_test_knobs is a private test hook: it is accepted only with {TEST_KNOBS_ENV}=1 in the environment"
+            f"_kcp_test_knobs is a private test hook: it is accepted only after {ENABLE_TEST_KNOBS}"
         )
     if not isinstance(knobs, dict):
         raise TypeError(f"_kcp_test_knobs must be a dict, got {type(knobs).__name__}")
@@ -2167,10 +2799,18 @@ __all__ = [
     "P_RULES",
     "P_RULE_DEFAULT",
     "SAVE_TRANSFER_DEFAULT",
+    "SHARED_POOLS",
+    "LAZY_POOLS",
+    "FWD_LAZY_POOLS",
+    "FWD_TRANSFER_POOLS",
+    "FWD_POOLS",
+    "BWD_POOLS",
     "STATE_TILE_BYTES",
     "SUMMARY_TILE",
     "TABLE_NAMES",
-    "TEST_KNOBS_ENV",
+    "ENABLE_TEST_KNOBS",
+    "enable_test_knobs",
+    "test_knobs_enabled",
     "TILE",
     "TILE_B",
     "TILE_M",
@@ -2187,6 +2827,7 @@ __all__ = [
     "head_groups",
     "kcp_arena_layout",
     "kcp_comm_bytes",
+    "kcp_pool_numel",
     "kcp_partition",
     "kcp_plan",
     "kcp_saved_bytes",
@@ -2198,11 +2839,13 @@ __all__ = [
     "table_words",
     "tables_bytes",
     "validate_test_knobs",
+    "P1_TIE_BASE",
     "WAVE_FILL_N_FRAG_MAX",
     "WAVE_MIN_NC_MAX_FRAG",
     "WAVE_N_FRAG_MAX",
     "WAVE_RULE_10NS",
     "lpt_makespan",
+    "p1_tie_steps",
     "wave_rule_cost_10ns",
     "wave_rule_cost_us",
     "wave_rule_lpt_cost_10ns",

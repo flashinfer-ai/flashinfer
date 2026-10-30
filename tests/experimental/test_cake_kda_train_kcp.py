@@ -15,35 +15,33 @@ limitations under the License.
 
 CPU tests of the KCP metadata layer (``cake_kcp_plan``): partitions against the rows of record, exchange
 splits and chain tables, head ownership, the plan rule, the byte queries, the private test knobs; the GPU parity test
-of the CPU-built chunk / segment tables against the ``table`` / ``seg_table`` programs (``-k gpu``); and the FP64
+of the CPU-built chunk tables against the ``table`` program (``-k gpu``); and the FP64
 fake backend against the unpartitioned FP64 reference (``-k fake``).  Rows, reference partitions and operands come
-from the reference harness (``kcp_shapes``, ``kcp_inputs``) and the reference module ``reference_kcp`` when they are on
-``PYTHONPATH``; the harness-backed tests are skipped otherwise.
+from the reference harness ``tests/test_helpers/cake_kda_kcp_shapes.py`` / ``cake_kda_kcp_inputs.py``, the FP64
+reference from ``tests/test_helpers/cake_kda_kcp_reference.py``.
 """
 
+import ctypes
+import gc
 import json
 import os
 import time
 import types
 import warnings
+import weakref
 
 import pytest
 import torch
 
+from tests.test_helpers import cake_kda_kcp_shapes as kcp_shapes
+from tests.test_helpers.cake_kda_train_kcp_saved import written_carry, written_tensors
 from tests.test_helpers.cake_package import cake_package
 
 kp = cake_package("cake_kda_train", "cake_kcp_plan")
 cake_backend = cake_package("cake_kda_train", "cake_backend")
 cake_jit = cake_package("cake_kda_train", "cake_jit")
+cake_kcp_jit = cake_package("cake_kda_train", "cake_kcp_jit")
 
-try:  # the reference harness (rows of record and the reference partitions)
-    import kcp_shapes
-except ImportError:  # pragma: no cover - the harness is an optional environment module
-    kcp_shapes = None
-
-HARNESS = pytest.mark.skipif(
-    kcp_shapes is None, reason="reference harness kcp_shapes not on PYTHONPATH"
-)
 SM_COUNT = 152  # GB300; the plan rule's examples of the design note §7.2
 EVIDENCE_DIR = os.environ.get("KCP_EVIDENCE_DIR")
 LAYOUT_NAMES = {"C": "contiguous", "Z": "zigzag", "D": "zigzag_per_document"}
@@ -66,8 +64,6 @@ def _evidence(name: str, record: dict) -> None:
 def _cases():
     """(row, W, layout letter) of every C row (all its CP and layouts, the explicit ragged tables as 'R'), every
     adversarial row of record and every perf pack at CP {2, 4, 8, 16} x {C, Z, D}."""
-    if kcp_shapes is None:
-        return []
     cases = []
     for row in kcp_shapes.CORRECT.values():
         for W in row.cp:
@@ -116,7 +112,6 @@ def contexts(part, sm_count: int = SM_COUNT):
     ]
 
 
-@HARNESS
 @pytest.mark.parametrize("case", CASES, ids=CASE_IDS)
 def test_partition_matches_the_harness(case) -> None:
     """Gate 1: kcp_partition == kcp_shapes.partition / links / local_cu_seqlens on every row, CP and layout."""
@@ -150,7 +145,6 @@ def test_partition_matches_the_harness(case) -> None:
     )
 
 
-@HARNESS
 @pytest.mark.parametrize("case", CASES, ids=CASE_IDS)
 def test_splits_chains_and_bytes(case) -> None:
     """Gate 2: split sizes sum to the §7.4 buffer sizes on every rank and agree pairwise; the chain tables cover every
@@ -449,12 +443,18 @@ def test_head_ownership_rows(H, W) -> None:
         assert (cb["padding"]["B1"]["send"] + cb["padding"]["B1"]["recv"] > 0) == (
             pad_tiles > 0
         )
-        assert (
-            kp.kcp_saved_bytes(ctx, H=H, with_conv=False, save_transfer=False)
-            == 256 * ctx.T_r * H
-            + kp.tables_bytes(ctx.NC_pad, ctx.n_frag, hp.NSEG)
-            + ctx.n_in * n_owners * Hg * kp.STATE_TILE_BYTES
+        # saved set: tables + padded S_in + the carry plane of a P > 1 rank (kept
+        # by default; saved_carry=False counts the plane-less re-walk form)
+        tb_bytes = kp.tables_bytes(ctx.NC_pad, ctx.n_frag, hp.NSEG)
+        no_plane = tb_bytes + ctx.n_in * n_owners * Hg * kp.STATE_TILE_BYTES
+        plane_slots = ctx.n_frag * (hp.P - 1) + max(ctx.n_in, ctx.n_out)
+        plane = plane_slots * H * kp.STATE_TILE_BYTES if hp.P > 1 else 0
+        got = kp.kcp_saved_bytes(ctx, H=H, with_conv=False, save_transfer=False)
+        got_no_plane = kp.kcp_saved_bytes(
+            ctx, H=H, with_conv=False, save_transfer=False, saved_carry=False
         )
+        assert got == no_plane + plane
+        assert got_no_plane == no_plane
         if (
             hp.Hg_r == 0
         ):  # a rank owning no heads: empty owner-side splits and chains, still a party to every collective
@@ -571,20 +571,31 @@ def test_zero_token_rank_keeps_chains_and_splits() -> None:
 
 
 def test_kcp_plan_examples() -> None:
-    """Gate 3: the shipped default rule is wave_fill1 (the one-wave fill on the earlier wave rule of
-    lever L-C), and the §7.2 examples at 152 SMs hold under the earlier occ rule, now selected explicitly."""
-    assert kp.P_RULE_DEFAULT == "wave_fill1" and kp.P_RULE_DEFAULT in kp.P_RULES
+    """Gate 3: the shipped default rule is wave_fill1_p1tie (the one-wave fill rule plus the P = 1 tie line, on top of the
+    earlier wave rule), and the §7.2 examples at 152 SMs hold
+    under the earlier occ rule, now selected explicitly."""
+    assert kp.P_RULE_DEFAULT == "wave_fill1_p1tie" and kp.P_RULE_DEFAULT in kp.P_RULES
     dflt = kp.kcp_plan(1, 256, 64, SM_COUNT)
-    assert dflt == kp.kcp_plan(1, 256, 64, SM_COUNT, p_rule="wave_fill1")
+    assert dflt == kp.kcp_plan(1, 256, 64, SM_COUNT, p_rule="wave_fill1_p1tie")
+    fill1 = kp.kcp_plan(1, 256, 64, SM_COUNT, p_rule="wave_fill1")
+    assert (dflt.P, dflt.NSEG) == (
+        fill1.P,
+        fill1.NSEG,
+    )  # one fragment: the P = 1 tie line does not apply
     # 256 chunks is AT the chain cap, not above it: the wave line does not apply; the earlier wave
     # rule gives the occ P = 3 (192 CTAs on 152 SMs), the shipped one-wave fill the largest one-CTA-per-SM P = 2
     wave = kp.kcp_plan(1, 256, 64, SM_COUNT, p_rule="wave")
     assert (wave.p_rule, wave.P, wave.P_occ, wave.P_chain) == ("wave", 3, 3, 1)
     assert wave.P == kp.kcp_plan(1, 256, 64, SM_COUNT, p_rule="occ").P
-    assert (dflt.p_rule, dflt.P, dflt.P_occ, dflt.P_chain) == ("wave_fill1", 2, 3, 1)
+    assert (dflt.p_rule, dflt.P, dflt.P_occ, dflt.P_chain) == (
+        "wave_fill1_p1tie",
+        2,
+        3,
+        1,
+    )
     # the first NC above the cap: P_chain = 2 and the wave line applies under the shipped rule as under wave
     above = kp.kcp_plan(1, 257, 64, SM_COUNT)
-    assert (above.p_rule, above.P_chain) == ("wave_fill1", 2) and above.P >= 2
+    assert (above.p_rule, above.P_chain) == ("wave_fill1_p1tie", 2) and above.P >= 2
     assert above.P == kp.kcp_plan(1, 257, 64, SM_COUNT, p_rule="wave").P
     assert kp.kcp_plan(12, 64, 64, SM_COUNT, p_rule="occ").P == 1  # D / CP16 Q3
     assert kp.kcp_plan(1, 256, 64, SM_COUNT, p_rule="occ").P == 3  # C / CP16
@@ -619,7 +630,7 @@ def test_kcp_plan_examples() -> None:
     )
 
 
-# Lever L-C.  Rule of record: on ranks with n_frag <= WAVE_N_FRAG_MAX = 3 the "wave"
+# The plan rule.  Rule of record: on ranks with n_frag <= WAVE_N_FRAG_MAX = 3 the "wave"
 # rule is argmin_P over P in [P_chain, min(64, NC_max)] (smallest P on ties) of
 #   ceil(n_frag P H / SM) x ceil(NC_max / P) x t_walk + (P - 1) x t_compose,  t_walk = 2.85 + 3.5 + 1.2 us, t_compose = 20.4 us
 # (10-ns integers); ranks with more fragments, and ranks whose longest fragment is <= 256 chunks (P_chain = 1), keep the occ P.  Information form (b) (superseded): the same
@@ -798,7 +809,7 @@ def test_lpt_makespan_matches_the_job_by_job_greedy() -> None:
 
 
 def test_kcp_plan_wave_rule_examples() -> None:
-    """Lever L-C at 152 SMs, H = 64: the rule of record equals the hand-derived argmin on ranks with <= 3 fragments,
+    """The plan rule at 152 SMs, H = 64: the rule of record equals the hand-derived argmin on ranks with <= 3 fragments,
     the occ P on guarded ranks; the information form (b) equals its hand values and the oracle; occ is untouched."""
     walk = sum(kp.WAVE_RULE_10NS[k] for k in ("tape", "xfer", "offset"))
     assert (walk, kp.WAVE_RULE_10NS["compose"], kp.WAVE_N_FRAG_MAX) == (
@@ -929,7 +940,7 @@ def test_kcp_plan_wave_rule_examples() -> None:
     assert (dflt_488.P, dflt_488.NSEG, dflt_488.p_rule) == (
         wave_488.P,
         wave_488.NSEG,
-        "wave_fill1",
+        "wave_fill1_p1tie",
     )  # above the chain cap the shipped default (wave_fill1) is the wave rule
     assert kp.kcp_plan(1, 488, 64, SM_COUNT, p_rule="occ").P == 3
     with pytest.raises(ValueError, match="p_rule"):
@@ -972,7 +983,6 @@ def test_kcp_plan_wave_rule_is_pure_in_sm_count() -> None:
         )
 
 
-@HARNESS
 @pytest.mark.parametrize("W", (4, 8, 16))
 def test_kcp_plan_wave_rule_on_q1_c(monkeypatch, W) -> None:
     """The Q1 C fragment sets at CP4 / CP8 / CP16 (hand-derived from Q1's lengths) and the P of the rules per rank
@@ -989,8 +999,8 @@ def test_kcp_plan_wave_rule_on_q1_c(monkeypatch, W) -> None:
         8: [2, 3, 2, 3, 2, 3, 3, 3],
         16: [3, 2, 3, 3, 2, 3, 3, 3, 2, 3, 3, 3, 3, 3, 3, 3],
     }[W]
-    monkeypatch.delenv(kp.TEST_KNOBS_ENV, raising=False)
-    with pytest.raises(ValueError, match="CAKE_KCP_TEST_KNOBS"):
+    monkeypatch.setattr(kp, "_TEST_KNOBS_ENABLED", False)
+    with pytest.raises(ValueError, match="enable_test_knobs"):
         kp.build_kcp_context(
             part,
             None,
@@ -1000,7 +1010,7 @@ def test_kcp_plan_wave_rule_on_q1_c(monkeypatch, W) -> None:
             sm_count=SM_COUNT,
             _kcp_test_knobs={"p_rule": "wave"},
         )
-    monkeypatch.setenv(kp.TEST_KNOBS_ENV, "1")
+    monkeypatch.setattr(kp, "_TEST_KNOBS_ENABLED", True)
     expect_wave = [7] * W if W in (4, 8) else expect_occ
     expect_dflt = (
         [7] * W if W in (4, 8) else [2] * W
@@ -1035,10 +1045,14 @@ def test_kcp_plan_wave_rule_on_q1_c(monkeypatch, W) -> None:
             sm_count=SM_COUNT,
             _kcp_test_knobs={"p_rule": "wave"},
         )
-        assert (occ.p_rule, wave.p_rule, dflt.p_rule) == ("occ", "wave", "wave_fill1")
+        assert (occ.p_rule, wave.p_rule, dflt.p_rule) == (
+            "occ",
+            "wave",
+            "wave_fill1_p1tie",
+        )
         assert (dflt.heads(64).P, dflt.describe(64)["p_rule"]) == (
             expect_dflt[r],
-            "wave_fill1",
+            "wave_fill1_p1tie",
         )
         assert (
             dflt.heads(64).P
@@ -1098,7 +1112,6 @@ def test_kcp_plan_wave_rule_on_q1_c(monkeypatch, W) -> None:
     )
 
 
-@HARNESS
 @pytest.mark.parametrize(
     "case", LANE_LC_ROWS, ids=[f"{n}-cp{W}-{lay}-H{H}" for n, W, lay, H in LANE_LC_ROWS]
 )
@@ -1110,7 +1123,7 @@ def test_kcp_plan_wave_rule_lane_rows(monkeypatch, case) -> None:
     name, W, lay, H = case
     row = kcp_shapes.ROWS[name]
     _frags, part = harness_partition(row, W, lay)
-    monkeypatch.setenv(kp.TEST_KNOBS_ENV, "1")
+    monkeypatch.setattr(kp, "_TEST_KNOBS_ENABLED", True)
     ranks = []
     for r in range(W):
         mine = part.fragments[r]
@@ -1215,7 +1228,13 @@ def test_kcp_plan_wave_fill_examples() -> None:
     H = 64 ranks move 2 -> 1 under wave_fill only, every rank above the chain cap and every H <= 4 rank keeps its program,
     the public default is untouched."""
     SM = SM_COUNT
-    assert kp.P_RULES == ("occ", "wave", "wave_fill1", "wave_fill")
+    assert kp.P_RULES == (
+        "occ",
+        "wave",
+        "wave_fill1",
+        "wave_fill",
+        "wave_fill1_p1tie",
+    )
     assert kp.WAVE_FILL_N_FRAG_MAX == {"wave_fill1": 1, "wave_fill": 3}
     for nc in (222, 244, 256):
         assert kp.kcp_plan(1, nc, 64, SM, p_rule="occ").P == 3
@@ -1311,18 +1330,20 @@ def test_kcp_plan_wave_fill_examples() -> None:
         2,
         "wave_fill1",
     )
-    assert kp.kcp_plan(1, 244, 64, SM).P == 2 and kp.P_RULE_DEFAULT == "wave_fill1"
+    assert (
+        kp.kcp_plan(1, 244, 64, SM).P == 2 and kp.P_RULE_DEFAULT == "wave_fill1_p1tie"
+    )
     with pytest.raises(ValueError, match="p_rule"):
         kp.kcp_plan(1, 244, 64, SM, p_rule="fill")
     _evidence("plan_wave_fill_examples", {"pass": True})
 
 
 def test_wave_fill_knobs_are_gated(monkeypatch) -> None:
-    monkeypatch.delenv(kp.TEST_KNOBS_ENV, raising=False)
-    with pytest.raises(ValueError, match="CAKE_KCP_TEST_KNOBS"):
+    monkeypatch.setattr(kp, "_TEST_KNOBS_ENABLED", False)
+    with pytest.raises(ValueError, match="enable_test_knobs"):
         kp.validate_test_knobs({"p_rule": "wave_fill1"})
-    assert kp.validate_test_knobs(None)["p_rule"] == "wave_fill1"
-    monkeypatch.setenv(kp.TEST_KNOBS_ENV, "1")
+    assert kp.validate_test_knobs(None)["p_rule"] == "wave_fill1_p1tie"
+    monkeypatch.setattr(kp, "_TEST_KNOBS_ENABLED", True)
     for rule in ("wave_fill1", "wave_fill"):
         assert kp.validate_test_knobs({"p_rule": rule}) == {
             "precision_mode": 0,
@@ -1334,8 +1355,6 @@ def _kb_rows():
     """Enumeration set: every C row at its CP / layouts for H in {1, 4, 64} (the H2 gate-2 / gate-4
     rows and their H coverage), the CP16 semantics row C6, every adversarial row at its CP in layouts C / Z (A3v2: D / Z),
     and every perf pack at CP {2, 4, 8, 16} x {C, Z, D} at H = 64."""
-    if kcp_shapes is None:
-        return []
     rows = []
     for row in kcp_shapes.CORRECT.values():
         for W in row.cp:
@@ -1357,7 +1376,6 @@ def _kb_rows():
 KB_ROWS = _kb_rows()
 
 
-@HARNESS
 @pytest.mark.parametrize(
     "case", KB_ROWS, ids=[f"{n}-cp{W}-{lay}-H{H}" for n, W, lay, H in KB_ROWS]
 )
@@ -1370,7 +1388,7 @@ def test_kcp_plan_wave_fill_lane_rows(monkeypatch, case) -> None:
     name, W, lay, H = case
     row = kcp_shapes.ROWS[name]
     _frags, part = harness_partition(row, W, lay)
-    monkeypatch.setenv(kp.TEST_KNOBS_ENV, "1")
+    monkeypatch.setattr(kp, "_TEST_KNOBS_ENABLED", True)
     ranks = []
     for r in range(W):
         mine = part.fragments[r]
@@ -1438,6 +1456,534 @@ def test_kcp_plan_wave_fill_lane_rows(monkeypatch, case) -> None:
             ranks[r]["wave_fill1"],
             "wave_fill1",
         )
+
+
+# --------------------------------------------------------------------------- the P = 1 tie rule and the fused carry merges
+
+
+def _p1tie_ref(n_frag: int, nc_frags, H: int, sm: int) -> int:
+    """Oracle of the "wave_fill1_p1tie" rule: the "wave_fill1" P, then 1 on a rank with 2..3 fragments below
+    the chain cap whose base P > 1 runs more CTAs than one wave of P = 1 (n_frag H <= SM) when the LPT makespan of one
+    equal-segment walk at P = 1 over the fragment chunk counts is <= the base P's (the wave model's waves x steps on equal
+    fragments)."""
+    nc_frags = [int(x) for x in nc_frags]
+    nc_max = max(nc_frags, default=0)
+    base = kp.kcp_plan(n_frag, nc_max, H, sm, p_rule="wave_fill1").P
+    if (
+        2 <= n_frag <= kp.WAVE_N_FRAG_MAX
+        and 0 < nc_max < kp.WAVE_MIN_NC_MAX_FRAG
+        and base > 1
+        and n_frag * H <= sm
+    ):
+
+        def steps(P: int) -> int:
+            return kp.lpt_makespan(
+                [(-(-nc // P), P * H) for nc in nc_frags if nc > 0], sm
+            )
+
+        if steps(1) <= steps(base):
+            return 1
+    return base
+
+
+def test_kcp_plan_p1tie_examples() -> None:
+    """The P = 1 tie rule at 152 SMs: equal two-fragment H = 64 ranks below the chain cap (the CP16 / CP8
+    Z ranks of record) move P 2 -> 1; unequal two-fragment ranks (CP16 C ranks cut by a document boundary), three-fragment
+    ranks, one-fragment ranks, ranks above the cap and every H <= 4 rank keep the shipped program; nc_frags is validated;
+    the public default is untouched."""
+    SM = SM_COUNT
+    assert kp.P1_TIE_BASE == {"wave_fill1_p1tie": "wave_fill1"}
+    assert "wave_fill1_p1tie" in kp.P_RULES and kp.P_RULE_DEFAULT == "wave_fill1_p1tie"
+    for nc in (56, 111, 118, 122, 125, 128, 200, 256):
+        assert kp.kcp_plan(2, nc, 64, SM, p_rule="wave_fill1").P == 2
+        assert kp.kcp_plan(2, nc, 64, SM, p_rule="wave_fill1_p1tie").P == 1
+        assert (
+            kp.kcp_plan(2, nc, 64, SM, p_rule="wave_fill1_p1tie", nc_frags=[nc, nc]).P
+            == 1
+        )
+        assert kp.p1_tie_steps([nc, nc], 64, SM, 1) == nc
+        assert kp.p1_tie_steps([nc, nc], 64, SM, 2) == 2 * -(-nc // 2) >= nc
+        assert _p1tie_ref(2, [nc, nc], 64, SM) == 1
+    # equal fragments reproduce the wave model's waves x steps exactly
+    for n_frag, nc, P in (
+        (2, 111, 2),
+        (2, 111, 1),
+        (3, 122, 1),
+        (1, 244, 2),
+        (1, 244, 3),
+        (2, 170, 2),
+        (2, 60, 19),
+    ):
+        waves = -(-(n_frag * P * 64) // SM)
+        assert kp.p1_tie_steps([nc] * n_frag, 64, SM, P) == waves * -(-nc // P)
+    # unequal two-fragment ranks: P = 1 walks the long fragment alone -> the base P stays
+    for frags in ([170, 59], [200, 30], [60, 62], [130, 100], [111, 50]):
+        nc = max(frags)
+        assert (
+            kp.kcp_plan(2, nc, 64, SM, p_rule="wave_fill1_p1tie", nc_frags=frags).P == 2
+        ), frags
+        assert kp.p1_tie_steps(frags, 64, SM, 1) > kp.p1_tie_steps(frags, 64, SM, 2)
+        assert _p1tie_ref(2, frags, 64, SM) == 2
+    assert (
+        kp.p1_tie_steps([60, 62], 64, SM, 2) == 61
+    )  # LPT: 31 + 30 on 80 of the 152 SMs
+    assert kp.p1_tie_steps([170, 59], 64, SM, 2) == 115  # 85 + 30
+    assert (
+        kp.kcp_plan(2, 100, 64, SM, p_rule="wave_fill1_p1tie", nc_frags=[100, 100]).P
+        == 1
+    )
+    # an empty second fragment: one live chain group of 64 CTAs at P = 1 (111 steps) vs 128 CTAs x 56 at P = 2 -> stays 2
+    assert (
+        kp.kcp_plan(2, 111, 64, SM, p_rule="wave_fill1_p1tie", nc_frags=[111, 0]).P == 2
+    )
+    # three-fragment H = 64 ranks (P_occ = 1 already), ranks above the cap (the wave argmin), one-fragment ranks (the
+    # fill), many-fragment ranks: unchanged
+    for n_frag, nc in (
+        (3, 122),
+        (3, 80),
+        (2, 257),
+        (2, 488),
+        (3, 300),
+        (1, 244),
+        (1, 100),
+        (1, 488),
+        (4, 100),
+        (8, 251),
+    ):
+        assert (
+            kp.kcp_plan(n_frag, nc, 64, SM, p_rule="wave_fill1_p1tie").P
+            == kp.kcp_plan(n_frag, nc, 64, SM, p_rule="wave_fill1").P
+        ), (n_frag, nc)
+    # H <= 4 ranks keep their program: the base P fills the SMs with chains of ceil(NC / P) < NC steps
+    for n_frag, nc, H in (
+        (2, 14, 4),
+        (2, 100, 4),
+        (2, 256, 4),
+        (3, 20, 4),
+        (3, 4, 4),
+        (3, 128, 4),
+        (2, 2, 4),
+        (2, 1, 4),
+        (2, 79, 1),
+        (3, 16, 1),
+        (2, 1, 1),
+        (3, 256, 1),
+    ):
+        assert (
+            kp.kcp_plan(n_frag, nc, H, SM, p_rule="wave_fill1_p1tie").P
+            == kp.kcp_plan(n_frag, nc, H, SM, p_rule="wave_fill1").P
+        ), (n_frag, nc, H)
+    # 148 SMs (GB200): the same move; SM = 1: no occupancy pressure, base P = 1 already
+    assert kp.kcp_plan(2, 122, 64, 148, p_rule="wave_fill1_p1tie").P == 1
+    assert (
+        kp.kcp_plan(2, 122, 64, 1, p_rule="wave_fill1_p1tie").P
+        == kp.kcp_plan(2, 122, 64, 1, p_rule="wave_fill1").P
+        == 1
+    )
+    # the plan terms are reported alike; the rule name travels
+    a = kp.kcp_plan(2, 111, 64, SM, p_rule="wave_fill1_p1tie")
+    b = kp.kcp_plan(2, 111, 64, SM, p_rule="wave_fill1")
+    assert (a.P, a.NSEG, a.P_occ, a.P_chain, a.P_bal, a.n_frag, a.NC_max_frag) == (
+        1,
+        2,
+        b.P_occ,
+        b.P_chain,
+        b.P_bal,
+        2,
+        111,
+    )
+    assert (a.p_rule, b.P, b.NSEG, b.p_rule) == ("wave_fill1_p1tie", 2, 4, "wave_fill1")
+    # nc_frags is validated for every rule; the other rules ignore the counts
+    for rule in kp.P_RULES:
+        with_counts = kp.kcp_plan(2, 111, 64, SM, p_rule=rule, nc_frags=[111, 111]).P
+        plain = kp.kcp_plan(2, 111, 64, SM, p_rule=rule).P
+        assert with_counts == plain, rule
+        assert (
+            plain == kp.kcp_plan(2, 111, 64, SM, p_rule=rule, nc_frags=[111, 50]).P
+            or rule == "wave_fill1_p1tie"
+        )
+        for bad in ([111], [111, 112], [111, -1], [111, 50, 10]):
+            with pytest.raises(ValueError, match="nc_frags"):
+                kp.kcp_plan(2, 111, 64, SM, p_rule=rule, nc_frags=bad)
+    assert kp.kcp_plan(0, 0, 64, SM, p_rule="wave_fill1_p1tie").P == 1
+    assert kp.kcp_plan(2, 0, 64, SM, p_rule="wave_fill1_p1tie").P == 1
+    assert kp.kcp_plan(2, 111, 64, SM).P == 1  # the shipped default
+    assert kp.kcp_plan(2, 111, 64, SM, nc_frags=[111, 111]).P == 1
+    assert kp.kcp_plan(2, 111, 64, SM, p_rule="wave_fill1").P == 2
+    assert kp.kcp_plan(2, 111, 64, SM, p_rule="wave_fill1", nc_frags=[111, 111]).P == 2
+    with pytest.raises(ValueError, match="p_rule"):
+        kp.kcp_plan(2, 111, 64, SM, p_rule="p1tie")
+    _evidence("plan_p1tie_examples", {"pass": True})
+
+
+def _two_doc_two_rank_partition(chunks: int = 100):
+    """Two documents of two equal fragments across two ranks: every rank holds a document-start (crossing-out) fragment
+    and a document-last (crossing-in) fragment of ``chunks`` chunks -- the two-fragment Z rank shape of the tie rule."""
+    n = chunks * 64
+    cu = torch.tensor([0, 2 * n, 4 * n], dtype=torch.int64)
+    return kp.kcp_partition(
+        cu, 2, fragments=[[(0, 0, n), (1, n, n)], [(0, n, n), (1, 0, n)]]
+    )
+
+
+def test_p1tie_knob_is_gated_and_plans(monkeypatch) -> None:
+    monkeypatch.setattr(kp, "_TEST_KNOBS_ENABLED", False)
+    with pytest.raises(ValueError, match="enable_test_knobs"):
+        kp.validate_test_knobs({"p_rule": "wave_fill1_p1tie"})
+    part = _two_doc_two_rank_partition(100)
+    ctx0 = kp.build_kcp_context(part, None, 0, "cpu", 4, sm_count=SM_COUNT)
+    assert (ctx0.p_rule, ctx0.heads(64).P, ctx0.heads(64).NSEG) == (
+        "wave_fill1_p1tie",
+        1,
+        2,
+    )
+    monkeypatch.setattr(kp, "_TEST_KNOBS_ENABLED", True)
+    ctx_fill1 = kp.build_kcp_context(
+        part,
+        None,
+        0,
+        "cpu",
+        4,
+        sm_count=SM_COUNT,
+        _kcp_test_knobs={"p_rule": "wave_fill1"},
+    )
+    assert (ctx_fill1.p_rule, ctx_fill1.heads(64).P, ctx_fill1.heads(64).NSEG) == (
+        "wave_fill1",
+        2,
+        4,
+    )
+    assert kp.validate_test_knobs({"p_rule": "wave_fill1_p1tie"}) == {
+        "precision_mode": 0,
+        "p_rule": "wave_fill1_p1tie",
+    }
+    for r in range(2):
+        ctx = kp.build_kcp_context(
+            part,
+            None,
+            r,
+            "cpu",
+            4,
+            sm_count=SM_COUNT,
+            _kcp_test_knobs={"p_rule": "wave_fill1_p1tie"},
+        )
+        assert (ctx.p_rule, ctx.heads(64).P, ctx.heads(64).NSEG) == (
+            "wave_fill1_p1tie",
+            1,
+            2,
+        )
+        assert ctx.describe(64)["p_rule"] == "wave_fill1_p1tie"
+        assert ctx.heads(4).P == ctx0.heads(4).P  # H = 4: unchanged
+    # an unequal pair (170 + 59 chunks on one rank) keeps P = 2 under the knob
+    n1, n2 = 170 * 64, 59 * 64
+    part_u = kp.kcp_partition(
+        torch.tensor([0, 2 * n1, 2 * n1 + 2 * n2], dtype=torch.int64),
+        2,
+        fragments=[[(0, 0, n1), (1, n2, n2)], [(0, n1, n1), (1, 0, n2)]],
+    )
+    ctx_u = kp.build_kcp_context(
+        part_u,
+        None,
+        0,
+        "cpu",
+        4,
+        sm_count=SM_COUNT,
+        _kcp_test_knobs={"p_rule": "wave_fill1_p1tie"},
+    )
+    assert ctx_u.heads(64).P == 2
+
+
+_INV_WALKS = ("offset", "all", "live", "in", "m_b1", "start", "end")
+
+
+def _inventory(ctx, H: int) -> dict:
+    """Inventory of one rank's tables under ``ctx.p_rule`` (CPU): P / NSEG, the K4 chain families (chains,
+    elements), the walk lists (segments, CTAs = segments x H, LPT step-times at one CTA per SM, longest segment) and
+    whether the fused carry launches save a launch (both families non-empty)."""
+    tb = cake_kcp._Tables(ctx, H)
+    seg_table = [int(x) for x in tb.hp.seg_chunk_start]
+
+    def walk(lst) -> dict:
+        steps = [seg_table[s + 1] - seg_table[s] for s in lst]
+        groups: dict[int, int] = {}
+        for st in steps:
+            if st > 0:
+                groups[st] = groups.get(st, 0) + H
+        return {
+            "segs": len(lst),
+            "ctas": len(lst) * H,
+            "lpt_steps": kp.lpt_makespan(list(groups.items()), ctx.sm_count)
+            if groups
+            else 0,
+            "max_steps": max(steps, default=0),
+        }
+
+    chains = {k: int(c.n_chains) for k, c in tb.chains.items()}
+    return {
+        "P": int(tb.P),
+        "NSEG": int(tb.NSEG),
+        "n_in": int(tb.n_in),
+        "n_out": int(tb.n_out),
+        "n_frag": int(tb.n_frag),
+        "chains": chains,
+        "elems": {k: int(c.n_elems) for k, c in tb.chains.items()},
+        "walks": {
+            "offset": walk(tb.walk_offset),
+            "all": walk(tb.walk_all),
+            "live": walk(tb.walk_live),
+            "in": walk(tb.walk_in),
+            "m_b1": walk(tb.walk_m_b1),
+            "start": walk(tb.walk_start),
+            "end": walk(tb.walk_end),
+        },
+        "transpose_tiles": int(sum(len(row) for row in tb.mf_tiles)),
+        "fuse_saves_fwd": int(chains["carry_start"] > 0 and chains["carry_in"] > 0),
+        "fuse_saves_bwd": int(chains["dcarry_end"] > 0 and chains["dcarry_cross"] > 0),
+    }
+
+
+# the rows of :func:`_kb_rows` on which the P = 1 tie rule changes at least one rank's P at 152 SMs (the enumeration
+# of record of the rule's adoption): the two-fragment Z ranks of the perf packs at CP 8 / 16 and four coverage rows, all
+# H = 64
+P1TIE_CHANGED_ROWS = frozenset(
+    [(f"Q{i}", W, "Z", 64) for i in range(1, 7) for W in (8, 16)]
+    + [("C2", 4, "D", 64), ("C2", 4, "Z", 64), ("C6", 8, "Z", 64), ("C8", 8, "Z", 64)]
+)
+
+
+@pytest.mark.parametrize(
+    "case", KB_ROWS, ids=[f"{n}-cp{W}-{lay}-H{H}" for n, W, lay, H in KB_ROWS]
+)
+def test_kcp_plan_p1tie_lane_rows(monkeypatch, case) -> None:
+    """Plan enumeration of the P = 1 tie rule: per rank of every row of :func:`_kb_rows` the P under the previous rule
+    "wave_fill1" (named explicitly: the default is the tie rule itself) and under the shipped default "wave_fill1_p1tie"
+    (with the actual fragment chunk counts), the P = 1 / base-P walk makespans of the tie test, and -- for the H = 64 rows
+    at CP 8 / 16 -- the K4 / walk inventory of both programs (the pre-estimate reads it).  The module equals the oracle, the
+    rule changes only two- / three-fragment ranks below the cap whose base P exceeds 1, never an H <= 4 rank, the rows it
+    changes are exactly :data:`P1TIE_CHANGED_ROWS`, and a context built without a knob plans with it.  Evidence record
+    `plan_p1tie_rows`."""
+    name, W, lay, H = case
+    row = kcp_shapes.ROWS[name]
+    _frags, part = harness_partition(row, W, lay)
+    monkeypatch.setattr(kp, "_TEST_KNOBS_ENABLED", True)
+    assert (
+        kp.P_RULE_DEFAULT == "wave_fill1_p1tie"
+        and kp.P1_TIE_BASE[kp.P_RULE_DEFAULT] == "wave_fill1"
+    )
+    want_inv = H == 64 and W >= 8
+    ranks = []
+    for r in range(W):
+        mine = part.fragments[r]
+        actual = [-(-f.length // 64) for f in mine]
+        n_frag, nc = len(mine), max(actual, default=0)
+        base = kp.kcp_plan(
+            n_frag, nc, H, SM_COUNT, p_rule="wave_fill1", nc_frags=actual
+        ).P
+        cand = kp.kcp_plan(n_frag, nc, H, SM_COUNT, nc_frags=actual).P
+        assert (
+            cand
+            == kp.kcp_plan(
+                n_frag, nc, H, SM_COUNT, p_rule="wave_fill1_p1tie", nc_frags=actual
+            ).P
+        ), (case, r)
+        rec = {
+            "rank": r,
+            "nc_frags": actual,
+            "n_frag": n_frag,
+            "nc_max": nc,
+            "frags": [
+                (f.doc, f.off, f.length, bool(f.crossing_in), bool(f.crossing_out))
+                for f in mine
+            ],
+            "wave_fill1": base,
+            "wave_fill1_p1tie": cand,
+            "steps_p1": kp.p1_tie_steps(actual, H, SM_COUNT, 1) if nc else 0,
+            "steps_base": kp.p1_tie_steps(actual, H, SM_COUNT, base) if nc else 0,
+            "sm148": kp.kcp_plan(
+                n_frag, nc, H, 148, p_rule="wave_fill1_p1tie", nc_frags=actual
+            ).P,
+        }
+        assert cand == _p1tie_ref(n_frag, actual, H, SM_COUNT), (case, rec)
+        if cand != base:
+            assert cand == 1 and base > 1 and 2 <= n_frag <= 3 and 0 < nc < 257, (
+                case,
+                rec,
+            )
+            assert rec["steps_p1"] <= rec["steps_base"], (case, rec)
+        if H <= 4:
+            assert cand == base, (case, rec)
+        if want_inv:
+            ctx_b = kp.build_kcp_context(
+                part,
+                None,
+                r,
+                "cpu",
+                4,
+                sm_count=SM_COUNT,
+                _kcp_test_knobs={"p_rule": "wave_fill1"},
+            )
+            ctx_c = kp.build_kcp_context(part, None, r, "cpu", 4, sm_count=SM_COUNT)
+            inv_b, inv_c = _inventory(ctx_b, H), _inventory(ctx_c, H)
+            assert (inv_b["P"], inv_c["P"]) == (base, cand), (case, rec)
+            if cand == base:
+                assert inv_b == inv_c
+            rec["inv_wave_fill1"], rec["inv_p1tie"] = inv_b, inv_c
+        ranks.append(rec)
+    changed = [x["rank"] for x in ranks if x["wave_fill1_p1tie"] != x["wave_fill1"]]
+    assert bool(changed) == ((name, W, lay, H) in P1TIE_CHANGED_ROWS), (case, changed)
+    _evidence(
+        "plan_p1tie_rows",
+        {
+            "row": name,
+            "cp": W,
+            "layout": lay,
+            "H": H,
+            "sm": SM_COUNT,
+            "wave_fill1": [x["wave_fill1"] for x in ranks],
+            "wave_fill1_p1tie": [x["wave_fill1_p1tie"] for x in ranks],
+            "changed": changed,
+            "inventory": want_inv,
+            "ranks": ranks,
+        },
+    )
+    for r in changed[:1] or [0]:
+        ctx = kp.build_kcp_context(part, None, r, "cpu", 4, sm_count=SM_COUNT)
+        assert (ctx.p_rule, ctx.heads(H).P, ctx.describe(H)["p_rule"]) == (
+            "wave_fill1_p1tie",
+            ranks[r]["wave_fill1_p1tie"],
+            "wave_fill1_p1tie",
+        )
+
+
+def test_merge_fuse_knob_and_fused_carry_chains(monkeypatch) -> None:
+    """``merge_fuse`` is a gated test knob ("none" shipped | "carry"); the fused chain families
+    carry_both / dcarry_both are the concatenation of carry_start + carry_in / dcarry_end + dcarry_cross (same pools; every
+    chain keeps its elements, initial state and final slot), non-empty at P > 1 on a rank holding both fragment kinds, empty
+    at P = 1; the default options and the other families are untouched."""
+    monkeypatch.setattr(kp, "_TEST_KNOBS_ENABLED", False)
+    assert cake_kcp.MERGE_FUSES == ("none", "carry")
+    assert cake_kcp.MERGE_FUSE_DEFAULT == "none"
+    assert cake_kcp.P2_KNOBS["merge_fuse"] == cake_kcp.MERGE_FUSES
+    assert cake_kcp._options({}).merge_fuse == "none"
+    assert "merge_fuse" not in cake_kcp._OPTION_KEYS
+    with pytest.raises(ValueError, match="enable_test_knobs"):
+        cake_kcp._options({"_kcp_test_knobs": {"merge_fuse": "carry"}})
+    with pytest.raises(TypeError):
+        cake_kcp._options({"merge_fuse": "carry"})
+    monkeypatch.setattr(kp, "_TEST_KNOBS_ENABLED", True)
+    o = cake_kcp._options({"_kcp_test_knobs": {"merge_fuse": "carry"}})
+    assert (o.merge_fuse, o.schedule, o.fused_walks, o.cols_rule) == (
+        "carry",
+        "wait_first",
+        1,
+        "fixed",
+    )
+    o = cake_kcp._options(
+        {
+            "_kcp_test_knobs": {
+                "merge_fuse": "carry",
+                "cols_rule": "by_chains",
+                "p_rule": "wave_fill1_p1tie",
+            }
+        }
+    )
+    assert (o.merge_fuse, o.cols_rule, o.p_rule) == (
+        "carry",
+        "by_chains",
+        "wave_fill1_p1tie",
+    )
+    assert (
+        cake_kcp._options({"_kcp_test_knobs": {"merge_fuse": "none"}}).merge_fuse
+        == "none"
+    )
+    with pytest.raises(ValueError, match="merge_fuse"):
+        cake_kcp._options({"_kcp_test_knobs": {"merge_fuse": "all"}})
+    spec = cake_kcp._Tables.FAMILIES
+    assert (
+        spec["carry_both"] == {**spec["carry_start"], "x0": "S_in"} == spec["carry_in"]
+    )
+    assert (
+        spec["dcarry_both"]
+        == {**spec["dcarry_end"], "x0": "b2_recv"}
+        == spec["dcarry_cross"]
+    )
+    part = _two_doc_two_rank_partition(100)
+    for r in range(2):
+        ctx = kp.build_kcp_context(
+            part,
+            None,
+            r,
+            "cpu",
+            4,
+            sm_count=SM_COUNT,
+            _kcp_test_knobs={"p_rule": "wave_fill1"},
+        )  # P = 2 on the tie shape: the shipped tie rule plans P = 1 here
+        tb = cake_kcp._Tables(ctx, 64)
+        assert tb.P == 2 and (tb.n_in, tb.n_out) == (1, 1)
+        for both, a, b in (
+            ("carry_both", "carry_start", "carry_in"),
+            ("dcarry_both", "dcarry_end", "dcarry_cross"),
+        ):
+            ca, cb, cf = tb.chains[a], tb.chains[b], tb.chains[both]
+            assert (ca.n_chains, cb.n_chains, cf.n_chains) == (64, 64, 128)
+            assert cf.ncols == ca.ncols == cb.ncols == cake_kcp.D
+            assert cf.elem_m == ca.elem_m + cb.elem_m
+            assert cf.elem_c == ca.elem_c + cb.elem_c
+            assert cf.elem_y == ca.elem_y + cb.elem_y
+            assert cf.x0_index == ca.x0_index + cb.x0_index
+            assert cf.y_final == ca.y_final + cb.y_final
+            assert cf.chain_start == ca.chain_start + [
+                ca.n_elems + s for s in cb.chain_start[1:]
+            ]
+            assert all(x == -1 for x in ca.x0_index) and all(
+                x >= 0 for x in cb.x0_index
+            )
+            cf.check_alignment()
+            tb._check_chain(both, cf)
+        d = tb.describe()["chains"]
+        assert d["carry_both"] == {
+            "n_chains": 128,
+            "n_elems": d["carry_start"]["n_elems"] + d["carry_in"]["n_elems"],
+        }
+        assert d["dcarry_both"] == {
+            "n_chains": 128,
+            "n_elems": d["dcarry_end"]["n_elems"] + d["dcarry_cross"]["n_elems"],
+        }
+        inv = _inventory(ctx, 64)
+        assert (inv["fuse_saves_fwd"], inv["fuse_saves_bwd"]) == (1, 1)
+    e = cake_kcp.Chains.concat(cake_kcp.Chains(), cake_kcp.Chains())
+    assert (e.n_chains, e.n_elems, e.chain_start) == (0, 0, [0])
+    with pytest.raises(ValueError, match="ncols"):
+        cake_kcp.Chains.concat(cake_kcp.Chains(128), cake_kcp.Chains(256))
+    one = cake_kcp.Chains()
+    one.add([(0, -1, -1), (16384, 16384, -1)], x0=-1, y_final=32768)
+    two = cake_kcp.Chains.concat(one, one)
+    assert (
+        two.chain_start == [0, 2, 4]
+        and two.x0_index == [-1, -1]
+        and two.y_final == [32768, 32768]
+    )
+    # P = 1 (an eight-fragment D rank): the fused families are empty like their parts
+    tb1 = cake_kcp._Tables(
+        kp.build_kcp_context(_small_partition(4), None, 1, "cpu", 4, sm_count=SM_COUNT),
+        64,
+    )
+    assert tb1.P == 1
+    assert all(
+        tb1.chains[k].n_chains == 0
+        for k in (
+            "carry_start",
+            "carry_in",
+            "carry_both",
+            "dcarry_end",
+            "dcarry_cross",
+            "dcarry_both",
+        )
+    )
+    inv1 = _inventory(
+        kp.build_kcp_context(_small_partition(4), None, 1, "cpu", 4, sm_count=SM_COUNT),
+        64,
+    )
+    assert (inv1["fuse_saves_fwd"], inv1["fuse_saves_bwd"]) == (0, 0)
 
 
 def test_limits_are_rejected_before_launch() -> None:
@@ -1591,9 +2137,116 @@ def test_partition_validation_and_defaults() -> None:
     )
 
 
+def _halo_sources_scan(part, halo: int):
+    """Reference of :func:`cake_kcp_plan._halo_sources`: the previous owner lookup, a linear scan of the document
+    chain for every halo row (O(chain) per row)."""
+    chains: dict = {}
+    for frs in part.fragments:
+        for f in frs:
+            if f.length > 0:
+                chains.setdefault(f.doc, []).append(f)
+    for lst in chains.values():
+        lst.sort(key=lambda f: f.off)
+
+    def owner(doc, t):
+        for g in chains[doc]:
+            if g.off <= t < g.end:
+                return g
+        raise ValueError(f"document {doc} token {t} has no owning fragment")
+
+    hist, tail = {}, {}
+    for frs in part.fragments:
+        for f in frs:
+            if f.length > 0 and f.off > 0:
+                rows = []
+                for k in range(halo):
+                    t = f.off - halo + k
+                    if t < 0:
+                        rows.append(None)
+                    else:
+                        g = owner(f.doc, t)
+                        rows.append((g.rank, g.slot, t - g.off))
+                hist[(f.rank, f.slot)] = tuple(rows)
+            if f.crossing_out:
+                length = part.doc_length(f.doc)
+                rows = []
+                for m in range(halo):
+                    p = f.end + m
+                    if p >= length:
+                        rows.append(None)
+                    else:
+                        s = owner(f.doc, p)
+                        rows.append((s.rank, s.slot, p - s.off))
+                tail[(f.rank, f.slot)] = tuple(rows)
+    return hist, tail
+
+
+def _random_ragged_partition(rng, W: int):
+    """An explicit ragged table: 1-6 documents (1 to 5000 tokens), each cut at random points into pieces on random
+    ranks (one-token pieces included), plus zero-length pieces."""
+    lengths = [
+        rng.choice((rng.randint(1, 8), rng.randint(1, 300), rng.randint(1, 5000)))
+        for _ in range(rng.randint(1, 6))
+    ]
+    cu = [0]
+    for n in lengths:
+        cu.append(cu[-1] + n)
+    per_rank: list[list[tuple[int, int, int]]] = [[] for _ in range(W)]
+    for d, n in enumerate(lengths):
+        k = rng.randint(1, min(n, 2 * W + 3))
+        bounds = [0, *sorted(rng.sample(range(1, n), k - 1)), n]
+        for a, b in zip(bounds, bounds[1:], strict=False):
+            per_rank[rng.randrange(W)].append((d, a, b - a))
+        for _ in range(rng.randint(0, 2)):
+            per_rank[rng.randrange(W)].append((d, rng.randint(0, n), 0))
+    for frs in per_rank:
+        frs.sort(key=lambda x: (x[0], x[1]))
+    return kp.kcp_partition(cu, W, fragments=per_rank)
+
+
+def test_halo_sources_bisect_matches_the_scan_on_random_partitions() -> None:
+    """The per-document bisect of ``_halo_sources`` gives the integers of the linear owner scan on random ragged tables
+    (one-token and zero-length fragments included) and on the C / Z / D layouts of the same documents, W = 2..64, for
+    halo widths 1..4 (3 is the shipped width of the width-4 conv)."""
+    import random
+
+    rng = random.Random(7815)
+    n_parts = 0
+    n_hist = 0
+    for W in range(2, 65):
+        parts = [_random_ragged_partition(rng, W) for _ in range(3)]
+        cu = parts[0].cu_seqlens
+        parts += [kp.kcp_partition(cu, W, layout=lay) for lay in kp.LAYOUTS]
+        for part in parts:
+            for halo in (1, 2, 3, 4):
+                got = kp._halo_sources(part, halo)
+                want = _halo_sources_scan(part, halo)
+                assert got == want, (W, part.layout, halo)
+                n_hist += len(got[0]) + len(got[1])
+            n_parts += 1
+    assert n_parts == 63 * (3 + len(kp.LAYOUTS)) and n_hist > 0
+
+
+def test_halo_sources_bisect_matches_the_scan_on_the_rows_of_record() -> None:
+    """The bisect owner lookup of ``_halo_sources`` equals the linear scan on every row, CP and layout of record."""
+    assert CASES
+    for name, W, lay in CASES:
+        _frags, part = harness_partition(kcp_shapes.ROWS[name], W, lay)
+        for halo in (1, 3, 4):
+            assert kp._halo_sources(part, halo) == _halo_sources_scan(part, halo), (
+                name,
+                W,
+                lay,
+                halo,
+            )
+
+
 def test_tables_follow_the_kernel_contract() -> None:
-    """chunk_bos / chunk_len / seq_chunk_start / seq_order / seg_chunk_start of the spec formulas; the table layout
-    equals the existing backend's with the segment table present."""
+    """chunk_bos / chunk_len / seq_chunk_start / seq_order / seg_chunk_start of the spec formulas; the four chunk tables
+    are laid out as the existing backend lays them out, and the boundary kernels' ``[NSEG + 1]`` segment table follows
+    them in the same 256 B-aligned form.  The existing backend's own fifth table is a different object since its segmented
+    recurrences took a block table (``seg_table``, ``NSEG + 2 * N + 1`` words): the two layouts agree on the first four
+    entries, and the KCP's fifth entry keeps the width the K1-K4 ``seq_chunk_start`` argument has."""
     cu = (0, 1, 1, 66, 130, 130, 193)  # 1 token, empty, 65, 64, empty, 63
     t = kp.chunk_tables(cu)
     assert t["seq_chunk_start"] == [0, 1, 1, 3, 4, 4, 5]
@@ -1620,7 +2273,16 @@ def test_tables_follow_the_kernel_contract() -> None:
         seg[9:12] == [3, 3, 3] and seg[12:15] == [4, 4, 4] and seg[15:18] == [4, 4, 4]
     )
     layout = kp.table_layout(nc_pad, 6, 18)
-    assert layout == cake_backend._table_layout(nc_pad, 6, 18)
+    assert layout[:4] == cake_backend._table_layout(nc_pad, 6, 0)
+    assert layout[4] == (
+        "seg_chunk_start",
+        256,
+        19,
+    )  # NSEG + 1 words in the slot after seq_order
+    assert cake_backend.TABLE_NAMES[:4] == kp.TABLE_NAMES[:4]
+    assert (
+        cake_backend._table_layout(nc_pad, 6, 18)[4][0] != kp.TABLE_NAMES[4]
+    )  # the backend's block table: not this table
     assert (
         kp.tables_bytes(nc_pad, 6, 18) == 4 * 64 * 5
     )  # five 256 B-aligned tables of < 64 words each
@@ -1639,16 +2301,38 @@ def test_byte_queries_and_knobs(monkeypatch) -> None:
     s = 64 * kp.STATE_TILE_BYTES
     assert kp.SAVE_TRANSFER_DEFAULT is True  # shipped default
     assert kp.kcp_saved_bytes(ctx) == kp.kcp_saved_bytes(ctx, save_transfer=True)
+    assert (
+        hp.P > 1
+    )  # 3000 tokens in one fragment at 152 SMs: P_occ = ceil(152 / 64) = 3
+    plane = (
+        (ctx.n_frag * (hp.P - 1) + max(ctx.n_in, ctx.n_out)) * s
+    )  # the whole carry plane of the P > 1 rank (fused walks: one extra slot per crossing fragment)
     base = kp.kcp_saved_bytes(
         ctx, save_transfer=False
     )  # literal form: H = 64, light, no transfer, conv, C = 8192
     assert (
         base
-        == 256 * ctx.T_r * 64
-        + kp.tables_bytes(ctx.NC_pad, ctx.n_frag, hp.NSEG)
+        == kp.tables_bytes(ctx.NC_pad, ctx.n_frag, hp.NSEG)
         + ctx.n_in * s
+        + plane
         + ctx.halo.n_hist_rows * 8192 * 2
-    )
+    )  # no token-row Aqk / Akk term: the saved set carries none; the carry plane is part of the shipped set
+    assert cake_kcp.KCP_SAVED_VERSION == 2
+    fields = cake_kcp.KcpSaved.__dataclass_fields__
+    assert "Aqk" not in fields and "Akk" not in fields
+    assert cake_kcp.KcpSaved._OPTIONAL == ("c1_recv", "M_seg", "carry")
+    assert cake_kcp.KcpSaved.__dataclass_fields__["carry"].default is None
+    assert kp.kcp_saved_bytes(ctx) == kp.kcp_saved_bytes(
+        ctx, saved_carry=True
+    )  # the shipped default counts the carry plane
+    assert (
+        kp.kcp_saved_bytes(ctx) - kp.kcp_saved_bytes(ctx, saved_carry=False) == plane
+    )  # saved_carry=False = the re-walk form of the test knob: no plane term
+    for c in [*contexts(_small_partition(4)), *ctxs]:
+        p_c = c.heads(64).P
+        assert kp.kcp_saved_bytes(c) - kp.kcp_saved_bytes(c, saved_carry=False) == (
+            (c.n_frag * (p_c - 1) + max(c.n_in, c.n_out)) * s if p_c > 1 else 0
+        )  # the plane term exists on P > 1 ranks only
     assert (
         kp.kcp_saved_bytes(ctx, save_transfer=False, with_conv=False)
         == base - ctx.halo.n_hist_rows * 8192 * 2
@@ -1658,9 +2342,6 @@ def test_byte_queries_and_knobs(monkeypatch) -> None:
     ) - base == ctx.N_out * 2 * hp.Hg_r * kp.STATE_TILE_BYTES + (
         hp.NSEG * s if hp.P > 1 else 0
     )
-    assert (
-        hp.P > 1
-    )  # 3000 tokens in one fragment at 152 SMs: P_occ = ceil(152 / 64) = 3
     assert (
         kp.kcp_saved_bytes(ctx, save_mode="tape", save_transfer=False) - base
         == ctx.NC_pad * 64 * 32768 + ctx.R * 64 * 256
@@ -1705,42 +2386,52 @@ def test_byte_queries_and_knobs(monkeypatch) -> None:
     local = cake_backend.workspace_bytes(
         ctx.T_r, ctx.n_frag, 64, backward=True, save_mode="light", sm_count=SM_COUNT
     )
-    assert kp.kcp_arena_layout(ctx) == kp.kcp_arena_layout(ctx, save_transfer=True)
-    arena = kp.kcp_arena_layout(ctx, save_transfer=False)
-    assert ws == local + arena["arena"] and arena["arena"] == max(
-        arena["forward"], arena["backward"]
-    )
+    # the pools do not depend on save_transfer / C: the kept c1 tensor and the halo rows are per-call tensors (SPEC-4)
+    arena = kp.kcp_arena_layout(ctx)
     assert (
-        arena["fwd.c1_recv"] == hp.numel["c1_recv"] * 4
-        and kp.kcp_arena_layout(ctx, save_transfer=True)["fwd.c1_recv"] == 0
+        arena
+        == kp.kcp_arena_layout(ctx, save_transfer=False)
+        == kp.kcp_arena_layout(ctx, C=4096)
     )
+    assert ws == ws_t == local + arena["arena"]
+    assert arena["pool.c1_recv"] == hp.numel["c1_recv"] * 4
     assert (
-        arena["fwd.staging"]
-        == arena["bwd.staging"]
+        arena["pool.stage_b"] + arena["pool.stage_m"]
         == hp.NSEG * 64 * kp.SUMMARY_TILE * 4
     )
-    assert (
-        kp.kcp_arena_layout(ctx, save_transfer=True)["fwd.staging"]
-        == arena["fwd.staging"]
+    # one storage per SHARED_POOLS pair (b1_send = c1_send, b2_send = c2_send); the ring pools on first use
+    assert kp.SHARED_POOLS == (("c1_send", "b1_send"), ("c2_send", "b2_send"))
+    assert kp.LAZY_POOLS == ("ring_out", "ring_in")
+    alone = ("c1_recv", "stage_b", "stage_m", "carry", "eye", "b1_recv", "b2_recv")
+    assert arena["arena"] == sum(arena[f"pool.{n}"] for n in alone) + sum(
+        max(arena[f"pool.{a}"], arena[f"pool.{b}"]) for a, b in kp.SHARED_POOLS
     )
-    assert kp.kcp_workspace_bytes(ctx, backward=False, save_transfer=False) <= ws
-    assert ws_t <= ws  # the kept c1 tensor leaves the arena (SPEC-4)
+    assert arena["ring"] == arena["pool.ring_out"] + arena["pool.ring_in"] > 0
+    fwd = kp.kcp_arena_layout(ctx, backward=False)
+    assert "pool.b1_send" not in fwd and fwd["arena"] < arena["arena"]
+    assert kp.kcp_workspace_bytes(ctx, backward=False) < ws
     # knobs
-    monkeypatch.delenv(kp.TEST_KNOBS_ENV, raising=False)
-    assert kp.validate_test_knobs(None) == {"precision_mode": 0, "p_rule": "wave_fill1"}
+    monkeypatch.setattr(kp, "_TEST_KNOBS_ENABLED", False)
+    assert kp.validate_test_knobs(None) == {
+        "precision_mode": 0,
+        "p_rule": "wave_fill1_p1tie",
+    }
     assert kp.validate_test_knobs(None)["p_rule"] == kp.P_RULE_DEFAULT
-    with pytest.raises(ValueError, match="CAKE_KCP_TEST_KNOBS"):
+    with pytest.raises(ValueError, match="enable_test_knobs"):
         kp.validate_test_knobs({"precision_mode": 2})
-    with pytest.raises(ValueError, match="CAKE_KCP_TEST_KNOBS"):
+    with pytest.raises(ValueError, match="enable_test_knobs"):
         kp.validate_test_knobs({"precision_mode": 0})
-    with pytest.raises(ValueError, match="CAKE_KCP_TEST_KNOBS"):
+    with pytest.raises(ValueError, match="enable_test_knobs"):
         kp.validate_test_knobs({"p_rule": "wave"})
-    monkeypatch.setenv(kp.TEST_KNOBS_ENV, "1")
+    monkeypatch.setattr(kp, "_TEST_KNOBS_ENABLED", True)
     assert kp.validate_test_knobs({"precision_mode": 1}) == {
         "precision_mode": 1,
-        "p_rule": "wave_fill1",
+        "p_rule": "wave_fill1_p1tie",
     }
-    assert kp.validate_test_knobs({}) == {"precision_mode": 0, "p_rule": "wave_fill1"}
+    assert kp.validate_test_knobs({}) == {
+        "precision_mode": 0,
+        "p_rule": "wave_fill1_p1tie",
+    }
     assert kp.validate_test_knobs({"p_rule": "occ"}) == {
         "precision_mode": 0,
         "p_rule": "occ",
@@ -1767,19 +2458,19 @@ def test_byte_queries_and_knobs(monkeypatch) -> None:
     assert set(ctx.describe(64)) >= {"rank", "T_r", "halo", "heads"}
 
 
-# --------------------------------------------------------------------------- the schedule / fused-walk / column-rule levers
+# --------------------------------------------------------------------------- the schedule / fused-walk / column-rule knobs
 
 cake_kcp = cake_package("cake_kda_train", "cake_kcp")
 LEVER_TENSORS = ("out", "dq", "dk", "dv", "dg", "dbeta")
 
 
 def test_round1_knobs_are_gated_and_validated(monkeypatch) -> None:
-    """``schedule`` (L-A), ``fused_walks`` (L-B) and ``cols_rule`` (D1) are test knobs: refused
-    without ``CAKE_KCP_TEST_KNOBS=1``, never public keywords (``graph`` is the exception, public
+    """``schedule``, ``fused_walks`` and ``cols_rule`` are test knobs: refused
+    without :func:`cake_kcp_plan.enable_test_knobs`, never public keywords (``graph`` is the exception, public
     since this revision), validated against their admitted values; the
     shipped defaults since an earlier revision are the pair wait_first + fused_walks=1 (one tape launch per
     phase) with the registry's K4 records (cols_rule fixed); overlap / fused_walks=0 stay selectable."""
-    monkeypatch.delenv(cake_kcp.TEST_KNOBS_ENV, raising=False)
+    monkeypatch.setattr(kp, "_TEST_KNOBS_ENABLED", False)
     o = cake_kcp._options({})
     assert (o.schedule, o.fused_walks, o.cols_rule) == ("wait_first", 1, "fixed")
     assert (
@@ -1790,7 +2481,7 @@ def test_round1_knobs_are_gated_and_validated(monkeypatch) -> None:
         {"fused_walks": 1},
         {"cols_rule": "by_chains"},
     ):
-        with pytest.raises(ValueError, match="CAKE_KCP_TEST_KNOBS"):
+        with pytest.raises(ValueError, match="enable_test_knobs"):
             cake_kcp._options({"_kcp_test_knobs": knob})
     for key in cake_kcp.P2_KNOBS:
         if (
@@ -1801,7 +2492,7 @@ def test_round1_knobs_are_gated_and_validated(monkeypatch) -> None:
             continue
         with pytest.raises(TypeError):
             cake_kcp._options({key: 1})
-    monkeypatch.setenv(cake_kcp.TEST_KNOBS_ENV, "1")
+    monkeypatch.setattr(kp, "_TEST_KNOBS_ENABLED", True)
     o = cake_kcp._options(
         {
             "_kcp_test_knobs": {
@@ -1855,6 +2546,111 @@ def test_ring_exchange_contract() -> None:
         )
 
 
+def test_host_trim_knob_is_gated_and_validated(monkeypatch) -> None:
+    """``host_trim`` is a private test knob: refused without
+    :func:`cake_kcp_plan.enable_test_knobs`, never a public keyword, validated against :data:`HOST_TRIMS`; the shipped default is 1
+    (the trimmed host path of the eager call), 0 selects the previous host path (the same launches
+    in the same order) for the A/B record."""
+    monkeypatch.setattr(kp, "_TEST_KNOBS_ENABLED", False)
+    assert cake_kcp.HOST_TRIM_DEFAULT == 1 and cake_kcp.HOST_TRIMS == (0, 1)
+    assert cake_kcp._options({}).host_trim == 1
+    with pytest.raises(ValueError, match="enable_test_knobs"):
+        cake_kcp._options({"_kcp_test_knobs": {"host_trim": 0}})
+    with pytest.raises(TypeError):
+        cake_kcp._options({"host_trim": 1})
+    monkeypatch.setattr(kp, "_TEST_KNOBS_ENABLED", True)
+    assert cake_kcp._options({"_kcp_test_knobs": {"host_trim": 1}}).host_trim == 1
+    assert cake_kcp._options({"_kcp_test_knobs": {"host_trim": 0}}).host_trim == 0
+    o = cake_kcp._options(
+        {
+            "_kcp_test_knobs": {
+                "host_trim": 1,
+                "fused_walks": 1,
+                "walk_geometry": "lpt_tape_one_cta_per_sm",
+            }
+        }
+    )
+    assert (o.host_trim, o.fused_walks, o.walk_geometry) == (
+        1,
+        1,
+        "lpt_tape_one_cta_per_sm",
+    )
+    for bad in ({"host_trim": 2}, {"host_trim": -1}):
+        with pytest.raises(ValueError):
+            cake_kcp._options({"_kcp_test_knobs": bad})
+    with pytest.raises(TypeError):
+        cake_kcp._options({"host_trim": 0})
+
+
+def test_saved_carry_knob_is_gated_and_validated(monkeypatch) -> None:
+    """``saved_carry`` is a private test knob: refused without :func:`cake_kcp_plan.enable_test_knobs`, never a public keyword,
+    validated against :data:`SAVED_CARRIES`; the shipped default is 1 (the forward of a ``P > 1`` rank keeps its
+    carry plane in the saved set -- ``KcpSaved.carry``, an optional tensor that travels through ``tensors()`` /
+    ``flags()`` / ``from_tensors`` like the other two -- and the saved-mode backward reads it), 0 selects the re-walk
+    of the forward carries for the A/B record."""
+    monkeypatch.setattr(kp, "_TEST_KNOBS_ENABLED", False)
+    assert cake_kcp.SAVED_CARRY_DEFAULT == 1 and cake_kcp.SAVED_CARRIES == (0, 1)
+    assert cake_kcp.P2_KNOBS["saved_carry"] == cake_kcp.SAVED_CARRIES
+    assert cake_kcp._options({}).saved_carry == 1
+    assert cake_kcp.KcpOptions().saved_carry == 1
+    assert "saved_carry" not in cake_kcp._OPTION_KEYS
+    with pytest.raises(ValueError, match="enable_test_knobs"):
+        cake_kcp._options({"_kcp_test_knobs": {"saved_carry": 0}})
+    with pytest.raises(TypeError):
+        cake_kcp._options({"saved_carry": 0})
+    monkeypatch.setattr(kp, "_TEST_KNOBS_ENABLED", True)
+    assert cake_kcp._options({"_kcp_test_knobs": {"saved_carry": 1}}).saved_carry == 1
+    assert cake_kcp._options({"_kcp_test_knobs": {"saved_carry": 0}}).saved_carry == 0
+    assert cake_kcp._options({"_kcp_test_knobs": {"saved_carry": "0"}}).saved_carry == 0
+    o = cake_kcp._options(
+        {"_kcp_test_knobs": {"saved_carry": 0, "host_trim": 1, "fused_walks": 1}}
+    )
+    assert (o.saved_carry, o.host_trim, o.fused_walks) == (0, 1, 1)
+    for bad in ({"saved_carry": 2}, {"saved_carry": -1}):
+        with pytest.raises(ValueError):
+            cake_kcp._options({"_kcp_test_knobs": bad})
+    with pytest.raises(TypeError):
+        cake_kcp._options({"saved_carry": 1})
+    # the saved set with and without the plane: flags / tensors / from_tensors round trip
+    meta = dict(
+        version=cake_kcp.KCP_SAVED_VERSION,
+        T_r=8,
+        H=4,
+        n_frag=1,
+        P=2,
+        Hg=4,
+        scale=0.5,
+        save_mode="light",
+        save_transfer=True,
+        offset_class="fla",
+        exchange="a2a",
+        precision_mode=0,
+        transfer_walk="bf16x3_hw64",
+    )
+    s_in, c1, m_seg, plane = (
+        torch.zeros(n, dtype=torch.float32) for n in (3, 5, 7, 11)
+    )
+    with_plane = cake_kcp.KcpSaved(
+        S_in=s_in, c1_recv=c1, M_seg=m_seg, carry=plane, ctx=None, **meta
+    )
+    without = cake_kcp.KcpSaved(S_in=s_in, c1_recv=c1, M_seg=m_seg, ctx=None, **meta)
+    assert without.carry is None and without.flags() == (True, True, False)
+    assert with_plane.flags() == (True, True, True)
+    assert [t.numel() for t in without.tensors()] == [3, 5, 7]
+    assert [t.numel() for t in with_plane.tensors()] == [3, 5, 7, 11]
+    assert with_plane.bytes - without.bytes == 11 * 4
+    for saved in (without, with_plane):
+        back = cake_kcp.KcpSaved.from_tensors(
+            saved.tensors(), saved.flags(), saved.meta(), None
+        )
+        assert back.flags() == saved.flags() and back.meta() == saved.meta()
+        assert (back.carry is None) == (saved.carry is None)
+        assert back.carry is None or back.carry is plane
+    assert (
+        "saved_carry" not in with_plane.meta()
+    )  # the plane's presence travels as a flag, not as metadata
+
+
 def test_ring_exchange_resolves_save_transfer() -> None:
     """``exchange="ring"`` has no ``save_transfer=True`` form (the ring path receives no c1 tensor),
     so an unset ``save_transfer`` resolves to ``False`` for the ring and to ``SAVE_TRANSFER_DEFAULT`` (``True``)
@@ -1903,16 +2699,16 @@ def test_graph_knob_is_gated_and_validated(monkeypatch) -> None:
     """``graph`` is a public keyword of the entry points since this
     revision (validated against ``GRAPH_MODES``; shipped default ``GRAPH_DEFAULT == "off"``, the eager path)
     and stays reachable through the gated ``_kcp_test_knobs`` for the A/B record (refused without
-    ``CAKE_KCP_TEST_KNOBS=1``; a knob value contradicting the keyword is a ``ValueError``).  A call is never
+    :func:`cake_kcp_plan.enable_test_knobs`; a knob value contradicting the keyword is a ``ValueError``).  A call is never
     captured without a caller-owned workspace, under ``exchange="ring"``
     or ``debug_sequence``; the validity key tells operands apart by data pointer, shape, stride and dtype, keeps one
     entry per key, and the first call of a key is eager bookkeeping only."""
-    monkeypatch.delenv(cake_kcp.TEST_KNOBS_ENV, raising=False)
+    monkeypatch.setattr(kp, "_TEST_KNOBS_ENABLED", False)
     assert cake_kcp.GRAPH_MODES == ("off", "replay")
     assert cake_kcp.P2_KNOBS["graph"] == cake_kcp.GRAPH_MODES
     assert cake_kcp.GRAPH_DEFAULT == "off" and "GRAPH_DEFAULT" in cake_kcp.__all__
     assert cake_kcp._options({}).graph == "off"
-    with pytest.raises(ValueError, match="CAKE_KCP_TEST_KNOBS"):
+    with pytest.raises(ValueError, match="enable_test_knobs"):
         cake_kcp._options({"_kcp_test_knobs": {"graph": "replay"}})
     # the public keyword needs no environment gate and is validated like every option
     assert "graph" in cake_kcp._OPTION_KEYS
@@ -1922,7 +2718,7 @@ def test_graph_knob_is_gated_and_validated(monkeypatch) -> None:
         cake_kcp._options({"graph": "capture"})
     with pytest.raises(ValueError, match="graph"):
         cake_kcp.KcpOptions(graph="capture").check()
-    monkeypatch.setenv(cake_kcp.TEST_KNOBS_ENV, "1")
+    monkeypatch.setattr(kp, "_TEST_KNOBS_ENABLED", True)
     on = cake_kcp._options({"_kcp_test_knobs": {"graph": "replay"}})
     assert on.graph == "replay"
     # the knob form (A/B record) and the keyword may agree, never contradict
@@ -1938,9 +2734,18 @@ def test_graph_knob_is_gated_and_validated(monkeypatch) -> None:
     with pytest.raises(ValueError):
         cake_kcp._options({"_kcp_test_knobs": {"graph": "capture"}})
     # graph_cap (the cache-config form of a captured call) is a gated knob, never a public keyword
-    assert cake_kcp.GRAPH_CAPS == ("none", "capture_pref")
+    # (plus the kernel-node forms "node_attr" / "node_attr_post"; "node_attr" is
+    # GRAPH_CAP_DEFAULT)
+    assert cake_kcp.GRAPH_CAPS == (
+        "none",
+        "capture_pref",
+        "node_attr",
+        "node_attr_post",
+    )
+    assert cake_kcp.GRAPH_NODE_CAPS == ("node_attr", "node_attr_post")
     assert cake_kcp.P2_KNOBS["graph_cap"] == cake_kcp.GRAPH_CAPS
     assert cake_kcp.GRAPH_CAP_DEFAULT in cake_kcp.GRAPH_CAPS
+    assert cake_kcp.GRAPH_CAP_DEFAULT == "node_attr"
     assert "graph_cap" not in cake_kcp._OPTION_KEYS
     assert cake_kcp._options({}).graph_cap == cake_kcp.GRAPH_CAP_DEFAULT
     for cap in cake_kcp.GRAPH_CAPS:
@@ -1952,10 +2757,10 @@ def test_graph_knob_is_gated_and_validated(monkeypatch) -> None:
         cake_kcp._options({"_kcp_test_knobs": {"graph_cap": "always"}})
     with pytest.raises(TypeError):
         cake_kcp._options({"graph_cap": "none"})
-    monkeypatch.delenv(cake_kcp.TEST_KNOBS_ENV, raising=False)
-    with pytest.raises(ValueError, match="CAKE_KCP_TEST_KNOBS"):
+    monkeypatch.setattr(kp, "_TEST_KNOBS_ENABLED", False)
+    with pytest.raises(ValueError, match="enable_test_knobs"):
         cake_kcp._options({"_kcp_test_knobs": {"graph_cap": "none"}})
-    monkeypatch.setenv(cake_kcp.TEST_KNOBS_ENV, "1")
+    monkeypatch.setattr(kp, "_TEST_KNOBS_ENABLED", True)
     ctx = object()
     t = [torch.empty(4, 2, 128, dtype=torch.bfloat16) for _ in range(5)]
     flags = (True, "light")
@@ -2052,7 +2857,7 @@ def test_cols_rule_thresholds() -> None:
 
 
 def _check_fused_tables(ctx, H: int) -> dict:
-    """The L-B tables of one rank against the separate-walk tables (``fused_walks=0``) of ``cake_kcp``."""
+    """The fused-walk tables of one rank against the separate-walk tables (``fused_walks=0``) of ``cake_kcp``."""
     TILE = cake_kcp.TILE
     tb0 = cake_kcp._Tables(ctx, H, fused_walks=0)
     tb1 = cake_kcp._Tables(ctx, H, fused_walks=1)
@@ -2123,6 +2928,18 @@ def _check_fused_tables(ctx, H: int) -> dict:
     outs = [f for f in live if f.crossing_out]
     for name, c0 in tb0.chains.items():
         c1 = tb1.chains[name]
+        if name in ("carry_both", "dcarry_both"):
+            # the fused chain families: in each table the concatenation of their two parts (whose own fused / unfused
+            # relation is checked below); the carry_in / dcarry_cross first elements differ by design
+            a, b = (
+                ("carry_start", "carry_in")
+                if name == "carry_both"
+                else ("dcarry_end", "dcarry_cross")
+            )
+            for tb in (tb0, tb1):
+                both = cake_kcp.Chains.concat(tb.chains[a], tb.chains[b])
+                assert tb.chains[name].as_dict() == both.as_dict(), name
+            continue
         d0, d1 = c0.as_dict(), c1.as_dict()
         for key in (
             "ncols",
@@ -2185,27 +3002,26 @@ def _fused_cases():
             ),
         )
     )
-    if kcp_shapes is not None:
-        for name, W, lay in (
-            ("Q1", 4, "C"),
-            ("Q1", 4, "Z"),
-            ("Q1", 4, "D"),
-            ("Q1", 8, "C"),
-            ("Q1", 16, "C"),
-            ("Q1", 16, "Z"),
-            ("C1", 4, "C"),
-            ("C2", 4, "Z"),
-            ("C3", 4, "D"),
-            ("C4b", 4, "R"),
-            ("C5", 4, "R"),
-            ("C7", 4, "R"),
-        ):
-            cases.append(
-                (
-                    f"{name}-cp{W}-{lay}",
-                    harness_partition(kcp_shapes.ROWS[name], W, lay)[1],
-                )
+    for name, W, lay in (
+        ("Q1", 4, "C"),
+        ("Q1", 4, "Z"),
+        ("Q1", 4, "D"),
+        ("Q1", 8, "C"),
+        ("Q1", 16, "C"),
+        ("Q1", 16, "Z"),
+        ("C1", 4, "C"),
+        ("C2", 4, "Z"),
+        ("C3", 4, "D"),
+        ("C4b", 4, "R"),
+        ("C5", 4, "R"),
+        ("C7", 4, "R"),
+    ):
+        cases.append(
+            (
+                f"{name}-cp{W}-{lay}",
+                harness_partition(kcp_shapes.ROWS[name], W, lay)[1],
             )
+        )
     return cases
 
 
@@ -2215,7 +3031,7 @@ FUSED_CASES = _fused_cases()
 @pytest.mark.parametrize("case", FUSED_CASES, ids=[c[0] for c in FUSED_CASES])
 @pytest.mark.parametrize("H", (4, 64))
 def test_fused_walk_tables(case, H) -> None:
-    """L-B: with ``fused_walks=1`` every live segment of every rank has a valid initial-state
+    """With ``fused_walks=1`` every live segment of every rank has a valid initial-state
     (final-adjoint) slot in one pool, the walk lists have one launch per phase, the carry plane grows by one slot per
     crossing fragment, and the only chain-table change is the publication of the ``S_in`` / ``dS_out`` copies."""
     name, part = case
@@ -2294,9 +3110,9 @@ INDEX_TABLES = (
 def test_walk_geometry_knob_is_gated_and_validated(monkeypatch) -> None:
     """``walk_geometry`` is a test knob: shipped default ``"lpt_tape_one_cta_per_sm"`` since this
     revision (``"shipped"`` = the earlier geometry, selectable through the knob), refused
-    without ``CAKE_KCP_TEST_KNOBS=1``, never a public keyword, validated against :data:`WALK_GEOMETRIES` in the
+    without :func:`cake_kcp_plan.enable_test_knobs`, never a public keyword, validated against :data:`WALK_GEOMETRIES` in the
     options and in the tables; the knob is recorded by the tables' ``describe()``."""
-    monkeypatch.delenv(cake_kcp.TEST_KNOBS_ENV, raising=False)
+    monkeypatch.setattr(kp, "_TEST_KNOBS_ENABLED", False)
     assert cake_kcp.WALK_GEOMETRY_DEFAULT == "lpt_tape_one_cta_per_sm"
     assert cake_kcp.WALK_GEOMETRIES == (
         "shipped",
@@ -2308,13 +3124,13 @@ def test_walk_geometry_knob_is_gated_and_validated(monkeypatch) -> None:
     )
     assert cake_kcp.P2_KNOBS["walk_geometry"] == cake_kcp.WALK_GEOMETRIES
     assert cake_kcp._options({}).walk_geometry == "lpt_tape_one_cta_per_sm"
-    with pytest.raises(ValueError, match="CAKE_KCP_TEST_KNOBS"):
+    with pytest.raises(ValueError, match="enable_test_knobs"):
         cake_kcp._options({"_kcp_test_knobs": {"walk_geometry": "shipped"}})
-    with pytest.raises(ValueError, match="CAKE_KCP_TEST_KNOBS"):
+    with pytest.raises(ValueError, match="enable_test_knobs"):
         cake_kcp._options({"_kcp_test_knobs": {"walk_geometry": "lpt_chains"}})
     with pytest.raises(TypeError):
         cake_kcp._options({"walk_geometry": "lpt_chains"})
-    monkeypatch.setenv(cake_kcp.TEST_KNOBS_ENV, "1")
+    monkeypatch.setattr(kp, "_TEST_KNOBS_ENABLED", True)
     for g in cake_kcp.WALK_GEOMETRIES:
         o = cake_kcp._options({"_kcp_test_knobs": {"walk_geometry": g}})
         assert (o.walk_geometry, o.schedule, o.fused_walks) == (g, "wait_first", 1)
@@ -2455,7 +3271,6 @@ def test_walk_geometry_tables(case, H) -> None:
         _evidence("walk_geometry", {"case": name, "H": H, "rank": ctx.rank, **rec})
 
 
-@HARNESS
 @pytest.mark.parametrize(
     "case",
     [c for c in CASES if c[0].startswith("Q") and c[1] in (8, 16)],
@@ -2521,25 +3336,22 @@ def device() -> torch.device:
     return _device_or_skip()
 
 
-PARITY_CASES = (
-    [c for c in CASES if kcp_shapes.ROWS[c[0]].kind != "perf"]
-    if kcp_shapes is not None
-    else []
-)
+PARITY_CASES = [c for c in CASES if kcp_shapes.ROWS[c[0]].kind != "perf"]
 PARITY_IDS = [f"{name}-cp{W}-{lay}" for name, W, lay in PARITY_CASES]
 PARITY_EXTRA_P = (
     1,
     3,
     64,
-)  # segment counts launched beside the plan's own P (empty segments, P > chunks, P = 1)
+)  # segment counts checked beside the plan's own P (empty segments, P > chunks, P = 1)
 
 
-@HARNESS
 @pytest.mark.parametrize("case", PARITY_CASES, ids=PARITY_IDS)
 def test_gpu_table_parity(device, case) -> None:
-    """Gate 5 (R15): the CPU-built chunk_bos / chunk_len / seq_chunk_start / seq_order / seg_chunk_start are bitwise
-    the kda_chunk_train_layout_table_v1 / seg_table_v1 outputs on every rank of every C row, adversarial row and
-    ragged table (one launch of each program per rank and segment count; pad entries pre-filled with a sentinel)."""
+    """Gate 5 (R15): the CPU-built chunk_bos / chunk_len / seq_chunk_start / seq_order are bitwise the
+    kda_chunk_train_layout_table_v1 output on every rank of every C row, adversarial row and ragged table (one launch
+    per rank; pad entries pre-filled with a sentinel), and the boundary kernels' segment table follows its formula from
+    that output for the plan's P and the extra segment counts (its own program left the package with the segmented
+    recurrences' block table; the kernels that read it are covered by the FP64-referenced rows)."""
     name, W, layout = case
     row = kcp_shapes.ROWS[name]
     _frags, part = harness_partition(row, W, layout)
@@ -2615,23 +3427,12 @@ def test_gpu_table_parity(device, case) -> None:
                 failures.append((r, table))
         hp = ctx.heads(row.h)
         for P in sorted({hp.P, *PARITY_EXTRA_P}):
-            seg = torch.full((N * P + 1,), -7, dtype=i32, device=device)
-            cake_jit.run_module(
-                "seg_table",
-                {
-                    "seq_chunk_start": scs,
-                    "num_seqs": N,
-                    "segments": P,
-                    "seg_chunk_start": seg,
-                },
-                grid=(1, 1, 1),
-                device_index=device.index,
-            )
-            torch.cuda.synchronize(device)
+            # the segment table from the device-built seq_chunk_start (the table program's output) must equal the
+            # CPU formula from the CPU-built one; at the plan's P it is the head plan's table
             want_seg = kp.seg_chunk_start(list(ctx.seq_chunk_start), P)
             if P == hp.P:
                 assert tuple(want_seg) == hp.seg_chunk_start
-            equal = seg.cpu().tolist() == want_seg
+            equal = kp.seg_chunk_start(got["seq_chunk_start"], P) == want_seg
             checked += 1
             _evidence(
                 "parity",
@@ -2652,6 +3453,731 @@ def test_gpu_table_parity(device, case) -> None:
                 failures.append((r, f"seg_chunk_start[P={P}]"))
     assert checked > 0
     assert not failures, f"table parity failures (rank, table): {failures}"
+
+
+# --------------------------------------------------------------------------- checkpoint recompute (issue #7815)
+# One rank here (world == 1: the KCP collectives of one rank are local copies, counted by the call's own
+# ``n_collectives``); the NCCL rows with per-phase collective counts are in test_cake_kda_train_kcp_dist.py.
+
+CKPT_ROWS = [((3000,), 2), ((300, 724, 476), 2), ((300, 724, 476), 64)]
+CKPT_IDS = [f"s{'_'.join(map(str, lens))}-h{H}" for lens, H in CKPT_ROWS]
+
+
+def _ckpt_problem(device, lengths, H):
+    """A one-rank problem: the context, the operands (the delta rule's contract) and ``dout``."""
+    from tests.test_helpers.cake_kda_train_reference import make_inputs
+
+    cu = [0]
+    for n in lengths:
+        cu.append(cu[-1] + n)
+    part = kp.kcp_partition(cu, 1)
+    ctx = kp.build_kcp_context(part, None, 0, device)
+    ops = make_inputs(lengths, H, device)
+    names = ("q", "k", "v", "g", "beta", "dout")
+    return ctx, {n: ops[n].to(device).contiguous() for n in names}
+
+
+def _requested_bytes(device) -> int:
+    return int(torch.cuda.memory_stats(device).get("requested_bytes.all.current", 0))
+
+
+@pytest.mark.parametrize("lengths,H", CKPT_ROWS, ids=CKPT_IDS)
+def test_gpu_checkpoint_retains_nothing_without_a_handle(device, lengths, H) -> None:
+    """#7039 for KDA (``recompute_handle=None``): after a non-reentrant checkpointed forward of ``chunk_kda_kcp``
+    (after a warm-up step of the same form) the bytes still requested are the output's alone -- the saved set is
+    released by the checkpoint and nothing else keeps a tensor -- with a per-call and with a caller-held workspace."""
+    from torch.utils.checkpoint import checkpoint
+
+    ctx, ops = _ckpt_problem(device, lengths, H)
+    ws = cake_kcp.KcpWorkspace()
+    retained = {}
+    for form, wsp in (("per_call", None), ("caller_ws", ws)):
+
+        def fn(*a, _w=wsp):
+            return cake_kcp.chunk_kda_kcp(*a, ctx, None, "light", "saved", _w)
+
+        for step in ("warm", "measure"):
+            leaves = [
+                ops[n].detach().clone().requires_grad_(True)
+                for n in ("q", "k", "v", "g", "beta")
+            ]
+            torch.cuda.synchronize(device)
+            gc.collect()
+            before = _requested_bytes(device)
+            out = checkpoint(fn, *leaves, use_reentrant=False)
+            torch.cuda.synchronize(device)
+            if step == "measure":
+                retained[form] = (
+                    _requested_bytes(device) - before - out.numel() * out.element_size()
+                )
+            out.backward(ops["dout"])
+            del out, leaves
+    assert retained == {"per_call": 0, "caller_ws": 0}, retained
+
+
+TENSOR_NAMES = ("out", "dq", "dk", "dv", "dg", "dbeta")
+
+
+def _bits(t: torch.Tensor) -> torch.Tensor:
+    """Bit view: -0.0 vs 0.0 and NaN payloads count as differences."""
+    return t.contiguous().view(torch.int16 if t.element_size() == 2 else torch.int32)
+
+
+def _same(a: dict, b: dict, names=TENSOR_NAMES + ("dw",)) -> bool:
+    """``dw``: the gradient of the ``out * w`` consumer (``dout * out`` of the forward the backward read: the
+    recompute's under a checkpoint)."""
+    return all(
+        a[n].dtype == b[n].dtype
+        and a[n].shape == b[n].shape
+        and torch.equal(_bits(a[n]), _bits(b[n]))
+        for n in names
+    )
+
+
+def _poison(device) -> None:
+    """Fill the caching allocator's free blocks (large and small pool) with all-ones bits (NaN in BF16 / FP32): rows
+    of a fresh ``torch.empty`` tensor that no kernel writes then read as NaN, not as a stale earlier result."""
+    torch.cuda.synchronize(device)
+    torch.cuda.empty_cache()
+    big = torch.full((1 << 27,), -1, dtype=torch.int32, device=device)  # 512 MiB
+    small = [
+        torch.full((1 << 17,), -1, dtype=torch.int32, device=device) for _ in range(256)
+    ]  # 512 KiB each: the small pool's 2 MiB segments
+    torch.cuda.synchronize(device)
+    del big, small
+
+
+# the launches a bound recompute may drop: the exchange (c1 / c2 or the ring hops) and its feeders (the owner merge,
+# the P = 1 summaries, the P > 1 map merge and transpose)
+DROPPABLE = {
+    "a2a:c1",
+    "a2a:c2",
+    "kcp_affine_merge",
+    "kcp_fwdh_offset",
+    "kcp_transfer_walk",
+    "kcp_transpose_tiles",
+}
+
+
+def _removed_launches(orig: list, replay: list) -> list:
+    """The original forward's launches the replay drops.  The replay must be the original sequence with launches
+    deleted -- same order, nothing added; asserted -- and every dropped one an exchange launch or a feeder of it."""
+    removed, i = [], 0
+    for s in orig:
+        if i < len(replay) and replay[i] == s:
+            i += 1
+        else:
+            removed.append(s)
+    assert i == len(replay), (
+        f"the replay adds or reorders launches: {replay[i:]} (original {orig})"
+    )
+    bad = [s for s in removed if s not in DROPPABLE and not s.startswith("ring:")]
+    assert not bad, (bad, orig, replay)
+    return removed
+
+
+class _PhaseCounter:
+    """Counts the KCP exchanges (``KcpCall.a2a``: c1 / c2 / b1 / b2; one rank exchanges by local copies) per phase:
+    ``orig``, ``recompute`` (set by the checkpoint's ``context_fn``, re-entered per recompute) and ``bwd``."""
+
+    def __init__(self, monkeypatch) -> None:
+        self.phase = "orig"
+        self.calls: dict[str, int] = {}
+        self._stack: list[str] = []
+        original = cake_kcp.KcpCall.a2a
+
+        def counting(call_self, *a, **kw):
+            self.calls[self.phase] = self.calls.get(self.phase, 0) + 1
+            return original(call_self, *a, **kw)
+
+        monkeypatch.setattr(cake_kcp.KcpCall, "a2a", counting)
+
+    def recompute_cm(self):
+        counter = self
+
+        class _Phase:
+            def __enter__(self):
+                counter._stack.append(counter.phase)
+                counter.phase = "recompute"
+                return self
+
+            def __exit__(self, *exc):
+                counter.phase = counter._stack.pop()
+                return False
+
+        return _Phase()
+
+    def table(self) -> dict[str, int]:
+        return {p: self.calls.get(p, 0) for p in ("orig", "recompute", "bwd")}
+
+
+def _ckpt_pass(
+    ctx,
+    ops,
+    *,
+    ckpt=True,
+    handle=None,
+    keep=None,
+    reentrant=False,
+    counter=None,
+    twice=False,
+    early_stop=True,
+    ws=None,
+    poison=False,
+    **opts,
+):
+    """``out``, the five gradients and ``dw`` of ``chunk_kda_kcp(...) * w`` (``w`` a leaf of ones: no bit of ``out``
+    or of its gradient changes, but the backward of the product reads the ``out`` of the forward it belongs to -- the
+    recompute's under a checkpoint), directly or under a checkpoint, and the LAST_CALL records of the original
+    forward, of the recompute (popped before each backward and required afterwards) and of the backward.  Under a
+    checkpoint every recompute's ``out`` is asserted bitwise the original forward's.  ``poison``: :func:`_poison`
+    before the pass."""
+    import contextlib
+
+    from torch.utils.checkpoint import checkpoint, set_checkpoint_early_stop
+
+    device = ops["q"].device
+    if poison:
+        _poison(device)
+    leaves = [
+        ops[n].detach().clone().requires_grad_(True)
+        for n in ("q", "k", "v", "g", "beta")
+    ]
+    w = torch.ones_like(ops["dout"]).requires_grad_(True)
+    kw = {} if handle is None else {"recompute_handle": handle}
+    if keep is not None:
+        kw["checkpoint_keep"] = keep
+    outs = []
+
+    def fn(q_, k_, v_, g_, b_, h_, w_):
+        if h_ is not None:
+            kw["recompute_handle"] = h_
+        y = cake_kcp.chunk_kda_kcp(
+            q_, k_, v_, g_, b_, ctx, None, "light", "saved", ws, **kw, **opts
+        )
+        outs.append(y.detach().clone())
+        return y * w_
+
+    cake_kcp.LAST_CALL.pop("fwd", None)
+    with set_checkpoint_early_stop(early_stop):
+        if not ckpt:
+            out = fn(*leaves, handle, w)
+        elif reentrant:
+            out = checkpoint(fn, *leaves, handle, w, use_reentrant=True)
+        else:
+            cm = counter.recompute_cm if counter is not None else contextlib.nullcontext
+            out = checkpoint(
+                fn,
+                *leaves,
+                handle,
+                w,
+                use_reentrant=False,
+                context_fn=lambda: (contextlib.nullcontext(), cm()),
+            )
+        rec_orig = dict(cake_kcp.LAST_CALL["fwd"])
+        if counter is not None:
+            counter.phase = "bwd"
+        if ckpt:
+            cake_kcp.LAST_CALL.pop("fwd")
+        out.backward(ops["dout"], retain_graph=twice)
+        rec_fwd_after = dict(cake_kcp.LAST_CALL["fwd"])  # KeyError: no recompute ran
+        rec_bwd = dict(cake_kcp.LAST_CALL["bwd"])
+        if twice:
+            if ckpt:
+                cake_kcp.LAST_CALL.pop("fwd")
+            out.backward(ops["dout"])
+            if ckpt:
+                assert (
+                    cake_kcp.LAST_CALL["fwd"]["recompute_handle"]
+                    == (rec_fwd_after["recompute_handle"])
+                    and cake_kcp.LAST_CALL["fwd"]["n_collectives"]
+                    == (rec_fwd_after["n_collectives"])
+                )
+    assert len(outs) == (1 + (2 if twice else 1) if ckpt else 1), len(outs)
+    for o in outs[
+        1:
+    ]:  # the recompute's out (read by the product's backward): bitwise the original's
+        assert torch.equal(_bits(o), _bits(outs[0])), "the recompute's out differs"
+    res = {"out": out.detach(), "dw": w.grad}
+    res.update(
+        {
+            f"d{n}": lf.grad
+            for n, lf in zip(("q", "k", "v", "g", "beta"), leaves, strict=True)
+        }
+    )
+    return res, (rec_orig, rec_fwd_after, rec_bwd)
+
+
+@pytest.mark.parametrize("reentrant", [False, True], ids=["nonreentrant", "reentrant"])
+@pytest.mark.parametrize("keep", ["states", "transfer"])
+@pytest.mark.parametrize("lengths,H", CKPT_ROWS, ids=CKPT_IDS)
+def test_gpu_recompute_handle_is_bitwise_and_exchange_free(
+    device, monkeypatch, lengths, H, keep, reentrant
+) -> None:
+    """With a recompute handle the original forward exchanges and stores its entry ("capture"), torch's recompute
+    binds it ("replay") and issues no exchange (``n_collectives == 0``; the plain checkpoint's recompute, the
+    positive control, issues c1 + c2); the recompute's ``out`` (read by the ``out * w`` consumer), ``out``, the five
+    gradients and ``dw`` are bitwise the plain checkpoint's, the direct pass's and the explicit forward / backward
+    calls'; the recompute's launches are the original's in order minus the exchange and its feeders; the entry holds
+    the tier's tensors.  One rank: no fragment crosses a rank (``n_in == 0``), so the stored ``S_in`` / c1 receive
+    tensors are empty and the binding and its bytes are shown by the NCCL rows of test_cake_kda_train_kcp_dist.py
+    only; these rows cover the phases, the counts, the launches and ``out``."""
+    ctx, ops = _ckpt_problem(device, lengths, H)
+    assert ctx.n_in == 0
+    out_e, saved_e = cake_kcp.chunk_kda_kcp_fwd(
+        *(ops[n] for n in ("q", "k", "v", "g", "beta")), ctx
+    )
+    grads_e = cake_kcp.chunk_kda_kcp_bwd(
+        *(ops[n] for n in ("q", "k", "v", "g", "beta")),
+        ctx,
+        ops["dout"],
+        saved=saved_e,
+    )
+    explicit = dict(
+        zip(("out", "dq", "dk", "dv", "dbeta", "dg"), (out_e, *grads_e), strict=True)
+    )
+    direct, _ = _ckpt_pass(ctx, ops, ckpt=False)
+    plain_cc = _PhaseCounter(monkeypatch)
+    plain, recs_plain = _ckpt_pass(ctx, ops, reentrant=reentrant, counter=plain_cc)
+    monkeypatch.undo()
+    handle = cake_kcp.KcpRecomputeHandle()
+    cc = _PhaseCounter(monkeypatch)
+    got, recs = _ckpt_pass(
+        ctx, ops, handle=handle, keep=keep, reentrant=reentrant, counter=cc
+    )
+    monkeypatch.undo()
+    assert _same(direct, explicit, TENSOR_NAMES), (
+        "recompute_handle=None differs from the explicit calls"
+    )
+    assert torch.equal(_bits(direct["dw"]), _bits(ops["dout"] * out_e))
+    assert _same(plain, direct), "plain checkpoint differs from the direct pass"
+    assert _same(got, plain), (
+        "checkpoint with a handle differs from the plain checkpoint"
+    )
+    # the call's own collective counter: the original forward c1 + c2, the recompute none, the backward b1 + b2
+    assert recs[0]["recompute_handle"] == "capture" and recs[0]["n_collectives"] == 2
+    assert recs[1]["recompute_handle"] == "replay" and recs[1]["n_collectives"] == 0
+    assert recs[2]["n_collectives"] == 2
+    assert recs_plain[1]["recompute_handle"] is None
+    assert (
+        recs_plain[1]["n_collectives"] == 2
+    )  # positive control: the plain recompute exchanges
+    assert not any(s.startswith("a2a:") for s in recs[1]["sequence"]), recs[1][
+        "sequence"
+    ]
+    # the recompute launches the original forward's programs in order minus the exchange and its feeders only
+    removed = _removed_launches(recs[0]["sequence"], recs[1]["sequence"])
+    assert removed.count("a2a:c1") == 1 and removed.count("a2a:c2") == 1, removed
+    assert _removed_launches(recs_plain[0]["sequence"], recs_plain[1]["sequence"]) == []
+    if (
+        reentrant
+    ):  # the recompute runs inside the backward without a context_fn: counted as "bwd"
+        assert plain_cc.table() == {"orig": 2, "recompute": 0, "bwd": 4}
+        assert cc.table() == {"orig": 2, "recompute": 0, "bwd": 2}
+    else:
+        assert plain_cc.table() == {"orig": 2, "recompute": 2, "bwd": 2}
+        assert cc.table() == {"orig": 2, "recompute": 0, "bwd": 2}
+    entry = handle.entries[cake_kcp.HANDLE_KEY]
+    assert set(n for n, t in entry.items() if isinstance(t, torch.Tensor)) == (
+        {"S_in", "c1_recv"} if keep == "transfer" else {"S_in"}
+    )
+    assert entry["ctx"] is ctx
+    assert (
+        handle.nbytes()
+        == kp.kcp_saved_bytes(ctx, H=H, checkpoint_keep=keep, with_conv=False)
+        == 0
+    )  # one rank: empty (see the docstring)
+    assert recs[0]["P"] == recs[1]["P"]
+    handle.clear()
+    assert handle.nbytes() == 0 and not handle.entries
+
+
+def test_gpu_recompute_handle_retain_graph_early_stop_and_nesting(
+    device, monkeypatch
+) -> None:
+    """``retain_graph`` + a second backward binds the entry again (no exchange) and accumulates exactly twice; early
+    stop off is bitwise too; nested checkpoints with the handle created outside both regions never exchange in a
+    recompute; a handle created inside the outer region is empty in the outer recompute, which then exchanges once
+    (c1 + c2) -- still bitwise."""
+    import contextlib
+
+    from torch.utils.checkpoint import checkpoint
+
+    ctx, ops = _ckpt_problem(device, (3000,), 2)
+    direct, _ = _ckpt_pass(ctx, ops, ckpt=False)
+    cc = _PhaseCounter(monkeypatch)
+    twice, _ = _ckpt_pass(
+        ctx, ops, handle=cake_kcp.KcpRecomputeHandle(), counter=cc, twice=True
+    )
+    monkeypatch.undo()
+    assert cc.table() == {"orig": 2, "recompute": 0, "bwd": 4}
+    for n in (*TENSOR_NAMES[1:], "dw"):
+        assert torch.equal(_bits(twice[n]), _bits(direct[n] + direct[n])), n
+    for keep in ("states", "transfer"):
+        cc = _PhaseCounter(monkeypatch)
+        late, recs = _ckpt_pass(
+            ctx,
+            ops,
+            handle=cake_kcp.KcpRecomputeHandle(),
+            keep=keep,
+            counter=cc,
+            early_stop=False,
+        )
+        monkeypatch.undo()
+        assert _same(late, direct) and cc.table() == {
+            "orig": 2,
+            "recompute": 0,
+            "bwd": 2,
+        }, (keep, cc.table())
+
+    def nested(inside: bool):
+        counter = _PhaseCounter(monkeypatch)
+        leaves = [
+            ops[n].detach().clone().requires_grad_(True)
+            for n in ("q", "k", "v", "g", "beta")
+        ]
+        w = torch.ones_like(ops["dout"]).requires_grad_(True)
+        outs = []
+
+        def inner(q_, k_, v_, g_, b_, h_):
+            y = cake_kcp.chunk_kda_kcp(q_, k_, v_, g_, b_, ctx, recompute_handle=h_)
+            outs.append(y.detach().clone())
+            return y
+
+        def outer(q_, k_, v_, g_, b_, h_, w_):
+            hh = cake_kcp.KcpRecomputeHandle() if inside else h_
+            yi = checkpoint(inner, q_, k_, v_, g_, b_, hh, use_reentrant=False)
+            # the product saves the outer recompute's yi (its backward reads it); no bit of out or dout changes
+            return yi * w_
+
+        out = checkpoint(
+            outer,
+            *leaves,
+            cake_kcp.KcpRecomputeHandle(),
+            w,
+            use_reentrant=False,
+            context_fn=lambda: (contextlib.nullcontext(), counter.recompute_cm()),
+        )
+        counter.phase = "bwd"
+        out.backward(ops["dout"])
+        table = counter.table()
+        monkeypatch.undo()
+        assert len(outs) >= 2 and all(
+            torch.equal(_bits(o), _bits(outs[0])) for o in outs[1:]
+        ), len(outs)
+        res = {"out": out.detach(), "dw": w.grad}
+        res.update(
+            {
+                f"d{n}": lf.grad
+                for n, lf in zip(("q", "k", "v", "g", "beta"), leaves, strict=True)
+            }
+        )
+        return res, table
+
+    out_res, out_table = nested(False)
+    in_res, in_table = nested(True)
+    assert _same(out_res, direct) and _same(in_res, direct)
+    # outside both regions: the outer recompute (recompute phase) and the inner recompute (counted in the backward
+    # phase, outside the outer's context) bind the entry; only the backward exchanges
+    assert out_table == {"orig": 2, "recompute": 0, "bwd": 2}, out_table
+    # inside the outer region: the outer recompute's inner forward is an original forward (exchanges, stores)
+    assert in_table == {"orig": 2, "recompute": 2, "bwd": 2}, in_table
+
+
+@pytest.mark.parametrize("lengths,H", CKPT_ROWS, ids=CKPT_IDS)
+def test_gpu_recompute_handle_overlap_schedule_and_ring(
+    device, monkeypatch, lengths, H
+) -> None:
+    """The bound branch of the overlap schedule (``_kcp_test_knobs={"schedule": "overlap"}``, both tiers) and the
+    ring exchange (``"states"``, both schedules): the handle's recompute issues no exchange, its launches are the
+    original's in order minus the exchange and its feeders, and every result (the recompute's ``out`` included) is
+    bitwise the plain checkpoint's of the same options, the direct pass's of the same options and the shipped direct
+    pass's.  One rank: no document crosses a rank, so the ring has no hop; under the overlap schedule the
+    document-start (forward) and document-end (backward) tape walks then run alone -- they used to be skipped,
+    leaving those rows of ``out`` and of the gradients unwritten.  Every pass starts from a poisoned allocator
+    (:func:`_poison`), so an unwritten row reads as NaN."""
+    ctx, ops = _ckpt_problem(device, lengths, H)
+    shipped, _ = _ckpt_pass(ctx, ops, ckpt=False, poison=True)
+    monkeypatch.setattr(kp, "_TEST_KNOBS_ENABLED", True)
+    overlap = {"_kcp_test_knobs": {"schedule": "overlap"}}
+    arms = [
+        ("overlap", overlap, "states"),
+        ("overlap", overlap, "transfer"),
+        ("ring", {"exchange": "ring"}, "states"),
+        ("ring_overlap", {"exchange": "ring", **overlap}, "states"),
+    ]
+    for name, opts, keep in arms:
+        tag = (name, keep)
+        direct, _ = _ckpt_pass(ctx, ops, ckpt=False, poison=True, **opts)
+        plain, recs_plain = _ckpt_pass(ctx, ops, poison=True, **opts)
+        handle = cake_kcp.KcpRecomputeHandle()
+        got, recs = _ckpt_pass(ctx, ops, handle=handle, keep=keep, poison=True, **opts)
+        assert _same(direct, shipped), f"{tag}: direct differs from the shipped form"
+        assert _same(plain, direct), f"{tag}: plain checkpoint differs"
+        assert _same(got, plain), f"{tag}: checkpoint with a handle differs"
+        assert recs[0]["recompute_handle"] == "capture", tag
+        assert recs[1]["recompute_handle"] == "replay", tag
+        assert recs[1]["n_collectives"] == 0, tag
+        assert recs_plain[1]["n_collectives"] == recs_plain[0]["n_collectives"], tag
+        assert recs[0]["n_collectives"] == (0 if name.startswith("ring") else 2), tag
+        _removed_launches(recs[0]["sequence"], recs[1]["sequence"])
+        assert not any(s.startswith(("a2a:", "ring:")) for s in recs[1]["sequence"]), (
+            tag
+        )
+        assert sorted(handle.entries[cake_kcp.HANDLE_KEY]) == sorted(
+            ["S_in", "ctx", "fingerprint"] + (["c1_recv"] if keep == "transfer" else [])
+        ), tag
+
+
+def test_gpu_recompute_handle_misuse_raises(device, monkeypatch) -> None:
+    """Every refusal of a call with a handle, before any launch (no entry stored): graph replay (keyword and knob),
+    a CUDA-graph capture, ``debug_sequence``, ``spec3_probe``, ``boundary_mode="replay"``, an object without an
+    ``entries`` dict, ``checkpoint_keep`` without a handle or of another value, a contradicting ``save_transfer``,
+    ``"transfer"`` with the ring -- in the wrapper and in the autograd Function.  A forward outside the backward
+    that finds an entry raises; a recompute whose entry belongs to another context, configuration or holds another
+    tensor raises inside the backward; a torch without the phase binding refuses the handle; a handle that lost its
+    entry before the recompute makes it an original forward again (exchanges, stores, still bitwise)."""
+    from torch.utils.checkpoint import checkpoint
+
+    ctx, ops = _ckpt_problem(device, (300, 724, 476), 2)
+    q, k, v, g, beta = (ops[n] for n in ("q", "k", "v", "g", "beta"))
+    handle = cake_kcp.KcpRecomputeHandle()
+    cake_kcp.chunk_kda_kcp(q, k, v, g, beta, ctx, recompute_handle=handle)
+    assert cake_kcp.LAST_CALL["fwd"]["recompute_handle"] == "capture"
+    with pytest.raises(RuntimeError, match="per layer and micro-step"):
+        cake_kcp.chunk_kda_kcp(q, k, v, g, beta, ctx, recompute_handle=handle)
+    fresh = cake_kcp.KcpRecomputeHandle()
+    refusals = [
+        (ValueError, "graph='off'", {"graph": "replay"}),
+        (ValueError, "debug_sequence", {"debug_sequence": True}),
+        (ValueError, "spec3_probe", {"spec3_probe": "record"}),
+        (ValueError, "contradicts", {"save_transfer": True}),
+        (
+            ValueError,
+            "contradicts",
+            {"checkpoint_keep": "transfer", "save_transfer": False},
+        ),
+        (ValueError, "ring", {"checkpoint_keep": "transfer", "exchange": "ring"}),
+        (ValueError, "checkpoint_keep", {"checkpoint_keep": "saved"}),
+    ]
+    for exc, match, kw in refusals:
+        with pytest.raises(exc, match=match):
+            cake_kcp.chunk_kda_kcp(q, k, v, g, beta, ctx, recompute_handle=fresh, **kw)
+    with pytest.raises(ValueError, match="boundary_mode"):
+        cake_kcp.chunk_kda_kcp(
+            q, k, v, g, beta, ctx, boundary_mode="replay", recompute_handle=fresh
+        )
+    with pytest.raises(ValueError, match="needs recompute_handle"):
+        cake_kcp.chunk_kda_kcp(q, k, v, g, beta, ctx, checkpoint_keep="states")
+    with pytest.raises(TypeError, match="entries"):
+        cake_kcp.chunk_kda_kcp(q, k, v, g, beta, ctx, recompute_handle=object())
+    monkeypatch.setattr(kp, "_TEST_KNOBS_ENABLED", True)
+    with pytest.raises(ValueError, match="graph='off'"):
+        cake_kcp.chunk_kda_kcp(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            ctx,
+            recompute_handle=fresh,
+            _kcp_test_knobs={"graph": "replay"},
+        )
+    graph = torch.cuda.CUDAGraph()
+    with pytest.raises(ValueError, match="capture"), torch.cuda.graph(graph):
+        cake_kcp.chunk_kda_kcp(q, k, v, g, beta, ctx, recompute_handle=fresh)
+    del graph
+    # the public autograd Function refuses like the wrapper
+    fn_args = (q, k, v, g, beta, ctx, None, "light")
+    with pytest.raises(ValueError, match="graph='off'"):
+        cake_kcp.ChunkKDAKcpFunction.apply(
+            *fn_args, "saved", None, {"graph": "replay"}, fresh
+        )
+    with pytest.raises(ValueError, match="boundary_mode"):
+        cake_kcp.ChunkKDAKcpFunction.apply(*fn_args, "replay", None, {}, fresh)
+    with pytest.raises(TypeError, match="entries"):
+        cake_kcp.ChunkKDAKcpFunction.apply(*fn_args, "saved", None, {}, object())
+    graph = torch.cuda.CUDAGraph()
+    with pytest.raises(ValueError, match="capture"), torch.cuda.graph(graph):
+        cake_kcp.ChunkKDAKcpFunction.apply(*fn_args, "saved", None, {}, fresh)
+    del graph
+    assert not fresh.entries, "a refused call stored an entry"
+    # a recompute whose entry does not describe it raises inside the backward
+    other_ctx, _ = _ckpt_problem(device, (300, 724, 476), 2)
+
+    def tamper_ctx(e):
+        e["ctx"] = other_ctx
+
+    def tamper_fp(e):
+        fp = dict(e["fingerprint"])
+        fp["modes"] = (("use_qk_l2norm_in_kernel", True),)
+        e["fingerprint"] = tuple(fp.items())
+
+    def tamper_tensor(e):
+        e["S_in"] = e["S_in"].new_empty((e["S_in"].numel() + 1,))
+
+    def tamper_keep(e):
+        fp = dict(e["fingerprint"])
+        fp["keep"] = "transfer"
+        e["fingerprint"] = tuple(fp.items())
+
+    for tamper, match in (
+        (tamper_ctx, "another KcpContext"),
+        (tamper_fp, r"differs in \['modes'\]"),
+        (tamper_tensor, "S_in"),
+        (tamper_keep, r"differs in \['keep'\]"),
+    ):
+        h = cake_kcp.KcpRecomputeHandle()
+        leaves = [x.detach().clone().requires_grad_(True) for x in (q, k, v, g, beta)]
+
+        def fn(q_, k_, v_, g_, b_, h_):
+            return cake_kcp.chunk_kda_kcp(q_, k_, v_, g_, b_, ctx, recompute_handle=h_)
+
+        out = checkpoint(fn, *leaves, h, use_reentrant=False)
+        tamper(h.entries["kda"])
+        with pytest.raises(ValueError, match=match):
+            out.backward(ops["dout"])
+    # the entry dropped before the recompute: the recompute is an original forward (exchanges and stores)
+    direct, _ = _ckpt_pass(ctx, ops, ckpt=False)
+    h = cake_kcp.KcpRecomputeHandle()
+    leaves = [x.detach().clone().requires_grad_(True) for x in (q, k, v, g, beta)]
+    out = checkpoint(
+        lambda *a: cake_kcp.chunk_kda_kcp(*a[:5], ctx, recompute_handle=a[5]),
+        *leaves,
+        h,
+        use_reentrant=False,
+    )
+    h.clear()
+    out.backward(ops["dout"])
+    assert cake_kcp.LAST_CALL["fwd"]["recompute_handle"] == "capture"
+    assert cake_kcp.LAST_CALL["fwd"]["n_collectives"] == 2 and "kda" in h.entries
+    res = {"out": out.detach()}
+    res.update(
+        {
+            f"d{n}": lf.grad
+            for n, lf in zip(("q", "k", "v", "g", "beta"), leaves, strict=True)
+        }
+    )
+    assert _same(res, direct, TENSOR_NAMES)
+    # a torch without the phase binding refuses the handle (and only the handle)
+    monkeypatch.setattr(cake_kcp, "_GRAPH_TASK_ID_USABLE", False)
+    with pytest.raises(RuntimeError, match="_current_graph_task_id"):
+        cake_kcp.chunk_kda_kcp(
+            q, k, v, g, beta, ctx, recompute_handle=cake_kcp.KcpRecomputeHandle()
+        )
+    cake_kcp.chunk_kda_kcp(q, k, v, g, beta, ctx)
+
+
+def test_recompute_handle_object_phase_rules_and_options(monkeypatch) -> None:
+    """CPU: the handle object (slots, ``nbytes`` of distinct tensors, ``clear``); the phase rules of ``_handle_lookup``
+    (no entry -> original forward anywhere; entry inside the backward -> replay; entry outside -> raise); the tier's
+    option resolution."""
+    h = cake_kcp.KcpRecomputeHandle()
+    assert cake_kcp.KcpRecomputeHandle.__slots__ == ("entries",) and h.nbytes() == 0
+    a = torch.zeros(10, dtype=torch.float32)
+    b = torch.zeros(3, dtype=torch.bfloat16)
+    h.entries["kda"] = {
+        "S_in": a,
+        "c1_recv": b,
+        "ctx": object(),
+        "fingerprint": (("k", 1),),
+    }
+    h.entries["conv"] = {"hist": b, "shape": (3,)}  # the same tensor counts once
+    assert h.nbytes() == 40 + 6
+    h.clear()
+    assert h.nbytes() == 0 and h.entries == {}
+    for in_bwd, has_entry, want in (
+        (False, False, None),
+        (True, False, None),
+        (True, True, "entry"),
+        (False, True, RuntimeError),
+    ):
+        monkeypatch.setattr(cake_kcp, "_kcp_in_backward", lambda v=in_bwd: v)
+        hh = cake_kcp.KcpRecomputeHandle()
+        if has_entry:
+            hh.entries["kda"] = {"S_in": a}
+        if want is RuntimeError:
+            with pytest.raises(RuntimeError, match="outside the backward"):
+                cake_kcp._handle_lookup(hh)
+        else:
+            got = cake_kcp._handle_lookup(hh)
+            assert (got is None) if want is None else (got is hh.entries["kda"])
+    monkeypatch.undo()
+    base = cake_kcp._options({})
+    assert base.save_transfer is True
+    assert cake_kcp._handle_options(base, None, None).save_transfer is False
+    assert cake_kcp._handle_options(base, "states", False).save_transfer is False
+    assert cake_kcp._handle_options(base, "transfer", None) is base
+    ring = cake_kcp._options({"exchange": "ring"})
+    assert cake_kcp._handle_options(ring, "states", None) is ring
+    with pytest.raises(ValueError, match="ring"):
+        cake_kcp._handle_options(ring, "transfer", None)
+    with pytest.raises(ValueError, match="contradicts"):
+        cake_kcp._handle_options(base, "states", True)
+    assert cake_kcp.CHECKPOINT_KEEPS == kp.CHECKPOINT_KEEPS == ("states", "transfer")
+
+
+@pytest.mark.parametrize("W", (2, 4, 8, 16))
+def test_recompute_handle_byte_queries(W) -> None:
+    """CPU: ``kcp_saved_bytes(checkpoint_keep=...)`` is the handle's retained bytes -- ``S_in`` (+ the c1 receive
+    tensor under ``"transfer"``) as the call's pools size them, + one convolution's hist pool with ``with_conv`` --
+    and ``kcp_comm_bytes(checkpoint_keep=...)`` is the table of the tier's ``save_transfer`` plus the tier and an empty
+    recompute; ``None`` keeps both queries unchanged; an explicit ``save_transfer`` that contradicts the tier raises
+    in both, as in the entry point."""
+    for lengths, layout in (
+        ((700, 1, 1300, 999), "zigzag_per_document"),
+        ((3000,), "contiguous"),
+        ((100, 640, 77, 1000, 129), "zigzag"),
+    ):
+        part = _small_partition(W, lengths=lengths, layout=layout)
+        for ctx in contexts(part):
+            for H in (4, 64):
+                numel = kp.kcp_pool_numel(ctx, H=H)
+                states = numel["S_in"] * 4
+                transfer = states + numel["c1_recv"] * 4
+                hist = ctx.halo.n_hist_rows * 512 * 2
+                assert (
+                    states
+                    == ctx.n_in
+                    * ctx.heads(H).n_owners
+                    * ctx.heads(H).Hg
+                    * kp.STATE_TILE_BYTES
+                )
+                q = kp.kcp_saved_bytes
+                assert q(ctx, H=H, checkpoint_keep="states", with_conv=False) == states
+                assert (
+                    q(ctx, H=H, checkpoint_keep="transfer", with_conv=False) == transfer
+                )
+                assert q(ctx, H=H, C=512, checkpoint_keep="states") == states + hist
+                assert q(ctx, H=H, checkpoint_keep="states", save_transfer=False) == q(
+                    ctx, H=H, checkpoint_keep="states"
+                )  # an agreeing explicit value; a contradicting one raises (below)
+                assert q(ctx, H=H) == q(ctx, H=H, checkpoint_keep=None)
+                for keep, st in (("states", False), ("transfer", True)):
+                    cb = kp.kcp_comm_bytes(ctx, H=H, checkpoint_keep=keep)
+                    ref = kp.kcp_comm_bytes(ctx, H=H, save_transfer=st)
+                    assert cb.pop("checkpoint_keep") == keep
+                    assert cb.pop("recompute") == {"send": 0, "recv": 0}
+                    assert cb == ref
+                assert "checkpoint_keep" not in kp.kcp_comm_bytes(ctx, H=H)
+    ctx = contexts(_small_partition(W))[0]
+    with pytest.raises(ValueError, match="checkpoint_keep"):
+        kp.kcp_saved_bytes(ctx, checkpoint_keep="saved")
+    with pytest.raises(ValueError, match="checkpoint_keep"):
+        kp.kcp_comm_bytes(ctx, checkpoint_keep="all")
+    with pytest.raises(ValueError, match="boundary_mode='saved'"):
+        kp.kcp_comm_bytes(ctx, checkpoint_keep="states", boundary_mode="replay")
+    for keep, contradicting in (("states", True), ("transfer", False)):
+        with pytest.raises(ValueError, match="contradicts"):
+            kp.kcp_saved_bytes(ctx, checkpoint_keep=keep, save_transfer=contradicting)
+        with pytest.raises(ValueError, match="contradicts"):
+            kp.kcp_comm_bytes(ctx, checkpoint_keep=keep, save_transfer=contradicting)
+        assert kp.kcp_comm_bytes(
+            ctx, checkpoint_keep=keep, save_transfer=not contradicting
+        ) == kp.kcp_comm_bytes(ctx, checkpoint_keep=keep)
+    assert kp.kcp_saved_bytes(ctx, save_transfer=None) == kp.kcp_saved_bytes(
+        ctx, save_transfer=kp.SAVE_TRANSFER_DEFAULT
+    )
 
 
 # --------------------------------------------------------------------------- FP64 fake backend (`-k fake`)
@@ -2678,8 +4204,6 @@ _REFS: dict = {}
 
 @pytest.fixture(scope="module")
 def fake():
-    pytest.importorskip("kcp_inputs")
-    pytest.importorskip("reference_kcp")
     from tests.test_helpers import cake_kcp_fake_backend as fb
 
     return fb
@@ -2692,9 +4216,7 @@ def _progress(msg: str) -> None:
 def _reference_of(fake, row):
     ref = _REFS.get(row.name)
     if ref is None:
-        ref = fake.load_or_compute_reference(
-            row, os.environ.get("KCP_REF_DIR"), progress=_progress
-        )
+        ref = fake.compute_reference(row, progress=_progress)
         _REFS[row.name] = ref
     return ref
 
@@ -2711,7 +4233,6 @@ def _assert_close_to_reference(fake, res, ref, row, docs, tag: str) -> dict:
     return m
 
 
-@HARNESS
 @pytest.mark.parametrize("case", FAKE_CASES, ids=FAKE_IDS)
 def test_fake_backend_matches_fp64_reference(fake, case) -> None:
     """Gate 6: the FP64 fake backend (W emulated ranks, dict collectives, the reference per-fragment compute) equals the
@@ -2758,7 +4279,6 @@ def test_fake_backend_matches_fp64_reference(fake, case) -> None:
     )
 
 
-@HARNESS
 def test_fake_backend_save_transfer_is_bitwise(fake) -> None:
     """save_transfer=True (the owner keeps the c1 receive tensor) gives bitwise the save_transfer=False gradients."""
     row = kcp_shapes.ROWS["C2"]
@@ -2779,7 +4299,6 @@ def test_fake_backend_save_transfer_is_bitwise(fake) -> None:
     )
 
 
-@HARNESS
 @pytest.mark.parametrize(
     "case", [("C1", 4, "C"), ("C3", 4, "D")], ids=["C1-cp4-C", "C3-cp4-D"]
 )
@@ -2814,12 +4333,11 @@ def test_fake_backend_document_alone_equals_slice(fake, case) -> None:
         )
 
 
-@HARNESS
-def test_fake_backend_transfer_matches_lane_p(fake) -> None:
+def test_fake_backend_transfer_matches_basis_transfer(fake) -> None:
     """The identity / v = 0 transfer map equals the reference basis-vector ``transfer`` helper (FP64) on a 63-token fragment."""
     row = kcp_shapes.ROWS["C5"]
     ranks = fake.build_ranks(row, 4, "R", progress=_progress)
-    err = fake._transfer_matches_lane_p(ranks.frag_ops(0, 0), row.h)
+    err = fake._transfer_matches_basis_transfer(ranks.frag_ops(0, 0), row.h)
     _progress(
         f"transfer (identity, v = 0) vs the reference transfer(): max |diff| {err:.3e}"
     )
@@ -2830,8 +4348,11 @@ def test_fake_backend_transfer_matches_lane_p(fake) -> None:
     )
 
 
-@pytest.mark.parametrize("graph_cap", ["none", "capture_pref"])
-def test_gpu_graph_replay_is_bitwise(device, monkeypatch, graph_cap) -> None:
+@pytest.mark.parametrize("walk_form", ["auto", "full"])
+@pytest.mark.parametrize(
+    "graph_cap", ["none", "capture_pref", "node_attr", "node_attr_post"]
+)
+def test_gpu_graph_replay_is_bitwise(device, monkeypatch, graph_cap, walk_form) -> None:
     """The graph-replay option, KDA module, one rank (``world == 1``: no collective): under the public keyword
     ``graph="replay"`` the first call of a validity key runs eagerly, the second is captured and replayed once, later
     calls replay the graph; ``out`` and the five gradients are bitwise the eager (``graph="off"``) results on every call.
@@ -2840,14 +4361,32 @@ def test_gpu_graph_replay_is_bitwise(device, monkeypatch, graph_cap) -> None:
     Both cache-config forms of a capture (knob ``graph_cap``: ``"none"`` / ``"capture_pref"``) capture
     and replay under the shipped capped geometry: the per-launch bracket is skipped inside the capture
     (``capture_skips`` grows), the eager calls record ``cache_config="bracket"`` and the captured / replayed calls
-    record the arm (with the set / reset evidence of the capture-wide preference under ``"capture_pref"``)."""
-    monkeypatch.setenv(cake_kcp.TEST_KNOBS_ENV, "1")
-    knobs = {"_kcp_test_knobs": {"graph_cap": graph_cap}}
+    record the arm (with the set / reset evidence of the capture-wide preference under ``"capture_pref"``).  The kernel-node
+    forms ``"node_attr"`` / ``"node_attr_post"`` capture and replay bitwise too: no
+    launch is skipped (``capture_skips`` unchanged), every captured tape launch gets the carveout attribute (``node_attrs``
+    grows by the tape launches of the captured calls, recorded as ``cache_config_nodes``).  The cap applies to the
+    full-width launches of the capped programs only (a two-CTA launch runs uncapped), so the expectations follow the
+    forms the calls launched (``LAST_CALL[kind]["walk_forms"]``): under ``walk_form="auto"`` the registry's rule
+    decides per launch, under ``"full"`` every launch is full-width and the bracket / skip / node-attribute paths are
+    exercised."""
+    monkeypatch.setattr(kp, "_TEST_KNOBS_ENABLED", True)
+    knobs = {"_kcp_test_knobs": {"graph_cap": graph_cap, "walk_form": walk_form}}
     backend = cake_kcp.get_backend()
     programs = backend.programs() if hasattr(backend, "programs") else None
-    capped = isinstance(programs, cake_kcp._FiPrograms) and bool(
-        cake_kcp.WALK_CAP_PROGRAMS.get(cake_kcp.WALK_GEOMETRY_DEFAULT)
-    )
+    cap_programs = cake_kcp.WALK_CAP_PROGRAMS.get(cake_kcp.WALK_GEOMETRY_DEFAULT, ())
+    capped = isinstance(programs, cake_kcp._FiPrograms) and bool(cap_programs)
+
+    def n_capped(rec) -> int:
+        """The call's launches under the cap: full-width launches of the capped programs (``walk_forms``)."""
+        return sum(
+            1
+            for name, form, _ in rec["walk_forms"]
+            if cake_kcp._PROGRAM_OF[name] in cap_programs and form == "full"
+        )
+
+    def eager_cc(rec) -> str:
+        return "bracket" if capped and n_capped(rec) else "none"
+
     dt = backend.dtypes
     H = 2
     cu = torch.tensor([0, 300, 1024, 1500], dtype=torch.int64)
@@ -2861,7 +4400,7 @@ def test_gpu_graph_replay_is_bitwise(device, monkeypatch, graph_cap) -> None:
 
     def unit(
         x,
-    ):  # the delta rule's operand contract (harness kcp_inputs): q / k L2-normalized per head; raw randn keys blow the state up
+    ):  # the delta rule's operand contract (cake_kda_kcp_inputs): q / k L2-normalized per head; raw randn keys blow the state up
         return x * torch.rsqrt((x * x).sum(-1, keepdim=True) + 1e-6)
 
     q = unit(randn(T, H, cake_kcp.D)).to(dt["q"])
@@ -2890,7 +4429,11 @@ def test_gpu_graph_replay_is_bitwise(device, monkeypatch, graph_cap) -> None:
         )
 
     cake_kcp.graph_cache_clear()
-    ref, ev0, recs0 = run(graph="off")
+    # the eager reference requests the SPEC-3 probe (off by default): the first saved-mode backward of the process
+    # runs it, and the replay-mode calls below (probe off) must still match the reference bitwise
+    probing = backend._spec3_pending and backend.local_stages and T > 0
+    ref, ev0, recs0 = run(graph="off", spec3_probe="record", **knobs)
+    assert not probing or (recs0[1]["spec3"] or {}).get("checked"), recs0[1]["spec3"]
     ref = tuple(
         x.clone() for x in ref
     )  # copies taken before any other call: the comparison stays explicit
@@ -2898,14 +4441,18 @@ def test_gpu_graph_replay_is_bitwise(device, monkeypatch, graph_cap) -> None:
         "the eager reference is not finite: the operands violate the delta rule's contract"
     )
     assert ev0 == ("eager", "eager") and recs0[0]["graph"] == "off"
-    eager_cc = "bracket" if capped else "none"
     assert (recs0[0]["cache_config"], recs0[1]["cache_config"]) == (
-        eager_cc,
-        eager_cc,
+        eager_cc(recs0[0]),
+        eager_cc(recs0[1]),
     ), recs0
+    if (
+        capped and walk_form == "full"
+    ):  # every tape launch full-width: the eager bracket on both calls
+        assert n_capped(recs0[0]) >= 1 and n_capped(recs0[1]) >= 1, recs0
     fallback0 = cake_kcp.GRAPH_STATS["fallback"]
     skips0 = programs.capture_skips if capped else None
-    events, ccs, brackets = [], [], []
+    nodes0 = programs.node_attrs if capped else None
+    events, ccs, brackets, nodes, caps, inv = [], [], [], [], [], []
     try:
         for _ in range(4):
             res, ev, recs = run(graph="replay", **knobs)
@@ -2914,6 +4461,14 @@ def test_gpu_graph_replay_is_bitwise(device, monkeypatch, graph_cap) -> None:
             brackets.append(
                 (recs[0]["cache_config_bracket"], recs[1]["cache_config_bracket"])
             )
+            nodes.append(
+                (
+                    recs[0].get("cache_config_nodes") or 0,
+                    recs[1].get("cache_config_nodes") or 0,
+                )
+            )
+            caps.append((n_capped(recs[0]), n_capped(recs[1])))
+            inv.append(recs)
             assert all(torch.equal(a, b) for a, b in zip(res, ref, strict=True)), events
         assert [e[0] for e in events] == ["eager", "capture", "replay", "replay"], (
             events
@@ -2922,16 +4477,63 @@ def test_gpu_graph_replay_is_bitwise(device, monkeypatch, graph_cap) -> None:
         assert cake_kcp.GRAPH_STATS["fallback"] == fallback0
         assert cake_kcp.LAST_CALL["fwd"]["graph"] == "replay"
         cap_cc = graph_cap if capped else "none"
-        assert [c[0] for c in ccs] == [eager_cc, cap_cc, cap_cc, cap_cc], ccs
-        assert [c[1] for c in ccs] == [eager_cc, eager_cc, cap_cc, cap_cc], ccs
-        if capped:
-            assert (
-                programs.capture_skips > skips0
-            )  # the capped programs launched bare inside the captures
+        assert [c[0] for c in ccs] == [eager_cc(inv[0][0]), cap_cc, cap_cc, cap_cc], ccs
+        # the backward's validity key hashes the workspace pools and the saved tensors: whether the second
+        # replay-mode call repeats the first call's key (capture at the second call, like the forward) or sees a
+        # key the first calls changed (capture at the third) depends on which pools those calls create -- both
+        # were observed (sm_100a two-level-carry rows: second; sm_103a: third) -- so the sequence is pinned by its
+        # structure: eager calls, one capture, replays after it
+        bwd_events = [e[1] for e in events]
+        cap_b = bwd_events.index("capture")
+        assert cap_b in (1, 2), events
+        assert bwd_events == ["eager"] * cap_b + ["capture"] + ["replay"] * (
+            3 - cap_b
+        ), events
+        assert [c[1] for c in ccs] == [eager_cc(inv[i][1]) for i in range(cap_b)] + [
+            cap_cc
+        ] * (4 - cap_b), ccs
+        n_cap_captured = (
+            caps[1][0] + caps[cap_b][1]
+        )  # the capped (full-width tape) launches inside the two captures
+        if capped and walk_form == "full":
+            assert n_cap_captured >= 2, (
+                caps
+            )  # both captures hold full-width tape launches
+        if capped and graph_cap in cake_kcp.GRAPH_NODE_CAPS:
+            # kernel-node cap forms: nothing launched bare; every captured capped launch carries the node attribute
+            assert programs.capture_skips == skips0, (programs.capture_skips, skips0)
+            assert programs.node_attrs == nodes0 + n_cap_captured, (
+                programs.node_attrs,
+                nodes0,
+                caps,
+            )
+            assert nodes[1][0] == caps[1][0] and nodes[cap_b][1] == caps[cap_b][1], (
+                nodes,
+                caps,
+            )
+            assert [n[0] for n in nodes[1:]] == [caps[1][0]] * 3, (
+                nodes
+            )  # the replays carry the capture's record
+            assert brackets[1][0] is None and brackets[cap_b][1] is None, brackets
+            if n_cap_captured:
+                evidence = programs.node_attr_log
+                assert evidence and all(
+                    e["rc"] == 0
+                    and e["node_type"] == 0
+                    and e["readback"] == cake_kcp.GRAPH_NODE_CARVEOUT
+                    for log in evidence.values()
+                    for e in log
+                ), evidence
+        elif capped:
+            assert programs.capture_skips == skips0 + n_cap_captured, (
+                programs.capture_skips,
+                skips0,
+                caps,
+            )  # each capped launch inside a capture launches bare and counts one skip
             if graph_cap == "capture_pref":
                 for b in (
                     brackets[1][0],
-                    brackets[2][1],
+                    brackets[cap_b][1],
                 ):  # the forward's and the backward's capture evidence
                     assert [e["set"] for e in b] == [
                         cake_kcp.WALK_CACHE_CONFIG_CAP,
@@ -2939,7 +4541,7 @@ def test_gpu_graph_replay_is_bitwise(device, monkeypatch, graph_cap) -> None:
                     ], b
                     assert all(e["rc"] == 0 and e["readback"] == e["set"] for e in b), b
             else:
-                assert brackets[1][0] is None and brackets[2][1] is None, brackets
+                assert brackets[1][0] is None and brackets[cap_b][1] is None, brackets
         out2, _ = cake_kcp.chunk_kda_kcp_fwd(
             q.clone(), k, v, g, beta, ctx, workspace=ws, graph="replay", **knobs
         )
@@ -2950,22 +4552,32 @@ def test_gpu_graph_replay_is_bitwise(device, monkeypatch, graph_cap) -> None:
         assert n_entries >= 2 and cake_kcp.graph_cache_clear() == 0
     finally:
         cake_kcp.graph_cache_clear()
-    res, ev, _ = run(graph="off")
+    res, ev, _ = run(graph="off", **knobs)
     assert ev == ("eager", "eager") and all(
         torch.equal(a, b) for a, b in zip(res, ref, strict=True)
     )
     _evidence(
-        f"gpu_graph_replay_{graph_cap}",
+        f"gpu_graph_replay_{graph_cap}_{walk_form}",
         {
             "module": "cake_kcp",
             "T": T,
             "H": H,
             "graph_cap": graph_cap,
+            "walk_form": walk_form,
+            "walk_forms_eager": [list(map(list, r["walk_forms"])) for r in recs0],
             "capped_geometry": capped,
             "events": events,
             "cache_config": ccs,
             "cache_config_bracket": brackets,
             "capture_skips_delta": (programs.capture_skips - skips0)
+            if capped
+            else None,
+            "node_attrs_delta": (programs.node_attrs - nodes0) if capped else None,
+            "cache_config_nodes": nodes,
+            "capped_launches": caps,
+            "node_attr_log": {
+                f"{k[0]}:{k[1]}": v for k, v in programs.node_attr_log.items()
+            }
             if capped
             else None,
             "bitwise": True,
@@ -3011,7 +4623,7 @@ def test_capped_launch_without_cudart_degrades(monkeypatch) -> None:
     assert len(runtime_warnings) == 1 and "unavailable" in str(
         runtime_warnings[0].message
     )
-    assert jit.launched == [(program, 4, 0, 0, "tf32_hilo")]
+    assert jit.launched == [(program, 4, 0, 0, "bf16x3_hw64")]
     assert (
         programs.carveout_log == {}
         and programs.carveout_state == {}
@@ -3067,7 +4679,7 @@ def test_capped_launch_skips_the_bracket_inside_a_capture(monkeypatch) -> None:
     call = _fake_call(cake_kcp.WALK_GEOMETRY_DEFAULT)
     programs.launch(program, [], grid=4, device_index=0, args={"_call": call})
     assert (
-        jit.launched == [(program, 4, 0, 0, "tf32_hilo")]
+        jit.launched == [(program, 4, 0, 0, "bf16x3_hw64")]
         and sets == []
         and programs.capture_skips == 1
     )
@@ -3106,3 +4718,1769 @@ def test_capped_launch_skips_the_bracket_inside_a_capture(monkeypatch) -> None:
         walk_geometry=cake_kcp.WALK_GEOMETRY_DEFAULT,
     )
     assert cake_kcp._graph_cap_bracket(none_) == ("none", None)
+
+
+def test_spec3_probe_is_a_keyword_and_the_package_reads_no_environment_switch(
+    monkeypatch,
+) -> None:
+    """The SPEC-3 probe's mode is the entry points' ``spec3_probe`` keyword (``"off"`` by default, ``"record"``,
+    ``"warn"``, ``"assert"``); no environment variable selects it.  The package's sources read no environment
+    variable: the private ``_kcp_test_knobs`` hook opens only after :func:`cake_kcp_plan.enable_test_knobs`."""
+    assert cake_kcp._options({}).spec3_probe == "off"
+    for mode in cake_kcp.SPEC3_PROBES:
+        assert cake_kcp._options({"spec3_probe": mode}).spec3_probe == mode
+    for bad in ("0", "1", "", None):
+        with pytest.raises(ValueError, match="spec3_probe"):
+            cake_kcp._options({"spec3_probe": bad})
+    assert not hasattr(cake_kcp, "SPEC3_ENV")
+    monkeypatch.setenv("CAKE_KCP_SPEC3", "0")
+    assert cake_kcp.KernelBackend()._spec3_pending
+    # the earlier environment opt-in of the test hook opens nothing
+    monkeypatch.setattr(kp, "_TEST_KNOBS_ENABLED", False)
+    monkeypatch.setenv("CAKE_KCP_TEST_KNOBS", "1")
+    assert not kp.test_knobs_enabled() and not cake_kcp_jit.test_knobs_enabled()
+    with pytest.raises(ValueError, match="enable_test_knobs"):
+        cake_kcp._options({"_kcp_test_knobs": {"precision_mode": 1}})
+    assert kp.enable_test_knobs() is False and kp.test_knobs_enabled()
+    assert (
+        cake_kcp._options({"_kcp_test_knobs": {"precision_mode": 1}}).precision_mode
+        == 1
+    )
+    assert kp.enable_test_knobs(False) is True and not kp.test_knobs_enabled()
+    package = os.path.dirname(cake_kcp.__file__)
+    for name in sorted(os.listdir(package)):
+        if not name.endswith(".py"):
+            continue
+        with open(os.path.join(package, name), encoding="utf-8") as f:
+            for number, line in enumerate(f, 1):
+                assert "os.environ" not in line and "getenv" not in line, (
+                    f"{name}:{number}: {line.strip()}"
+                )
+
+
+def test_host_trim_options_passthrough() -> None:
+    """Trimmed host path: ``chunk_kda_kcp`` validates the options once; the autograd node passes the validated ``KcpOptions``
+    through ``_kcp_options`` and ``_options`` returns it unchanged (it travels alone)."""
+    opts = cake_kcp._options({"exchange": "a2a"})
+    assert cake_kcp._options({"_kcp_options": opts}) is opts
+    with pytest.raises(TypeError):
+        cake_kcp._options({"_kcp_options": opts, "exchange": "a2a"})
+    with pytest.raises(TypeError):
+        cake_kcp._options({"_kcp_options": {"exchange": "a2a"}})
+
+
+def test_host_trim_workspace_fast_paths() -> None:
+    """Trimmed host path: ``ensure(host_trim=True)`` returns the last tables for the same (ctx, H, device, backward, knobs) and
+    takes the full path otherwise; ``pool(cached=True)`` returns the same ``[:n]`` view while the pool is unchanged."""
+    part = _small_partition(4, lengths=(3000,), layout="contiguous")
+    ctx = kp.build_kcp_context(part, None, 1, "cpu", 4, sm_count=SM_COUNT)
+    ws = cake_kcp.KcpWorkspace(local=False)
+    tb = ws.ensure(ctx, 64, device="cpu", backward=False, host_trim=True)
+    assert ws.ensure(ctx, 64, device="cpu", backward=False, host_trim=True) is tb
+    assert ws._last_ensure is not None and ws._last_ensure[0] is ctx
+    assert not ws.has("b1_send")
+    assert (
+        ws.ensure(ctx, 64, device="cpu", backward=True, host_trim=True) is tb
+    )  # another signature: the full path
+    assert ws.has("b1_send")
+    assert (
+        ws.ensure(ctx, 64, device="cpu", backward=False) is tb
+    )  # the untrimmed path never consults the fast path
+    n = tb.sizes["c1_send"]
+    v1 = ws.pool("c1_send", n, cached=True)
+    assert ws.pool("c1_send", n, cached=True) is v1
+    v0 = ws.pool("c1_send", n)
+    assert v0 is not v1 and v0.data_ptr() == v1.data_ptr() and v0.shape == v1.shape
+    ws._pools["c1_send"] = torch.empty_like(
+        ws._pools["c1_send"]
+    )  # a re-sized pool invalidates the cached view
+    v2 = ws.pool("c1_send", n, cached=True)
+    assert (
+        v2 is not v1
+        and v2.data_ptr() == ws._pools["c1_send"].data_ptr()
+        and v2.shape == v0.shape
+    )
+
+
+def test_workspace_pools_shared_lazy_and_predicted() -> None:
+    """The workspace's KCP pools against the plan module's byte query on the CPU (no local arena): every ``(ctx, H)``
+    of the C / Z / D partitions at W = 2 / 4 / 8 / 16, H = 4 / 64, allocates exactly ``kcp_arena_layout(...)["arena"]``
+    bytes for a forward and a backward workspace; each :data:`SHARED_POOLS` pair is one tensor of the larger need,
+    whichever ensure came first; the ring pools stay unallocated until a call reads them, then hold their size and
+    add ``kcp_arena_layout(...)["ring"]`` bytes; on a forward-only workspace the :data:`FWD_LAZY_POOLS` (c1 receive,
+    transfer staging, carry) stay unallocated until a call reads them, then hold their size and add
+    ``kcp_arena_layout(..., backward=False)["lazy"]`` bytes (the two states of the forward-only prediction), while a
+    backward ensure sizes them up front; without ``save_transfer`` the first state holds the
+    :data:`FWD_TRANSFER_POOLS` a saving forward reads and ``lazy`` is the carry plane alone, the same second state;
+    the pool sizes are the plan module's (:func:`kcp_pool_numel`)."""
+    assert kp.FWD_LAZY_POOLS == ("c1_recv", "stage_m", "carry")
+    assert kp.FWD_TRANSFER_POOLS == ("c1_recv", "stage_m")
+    assert not set(kp.FWD_LAZY_POOLS) & set(kp.LAZY_POOLS)
+    assert set(kp.FWD_LAZY_POOLS) <= set(kp.FWD_POOLS)
+    seen_p = seen_ring = seen_lazy = 0
+    for W in (2, 4, 8, 16):
+        for lengths, layout in (
+            ((3000,), "contiguous"),
+            ((40, 40), "zigzag"),
+            ((700, 1, 1300, 999), "zigzag_per_document"),
+        ):
+            part = _small_partition(W, lengths=lengths, layout=layout)
+            for r, ctx in enumerate(contexts(part)):
+                for H in (4, 64):
+                    tb = cake_kcp.KcpWorkspace(local=False).tables(ctx, H)
+                    assert tb.sizes == kp.kcp_pool_numel(ctx, H=H)
+                    seen_p += tb.P > 1
+                    full = kp.kcp_arena_layout(ctx, H=H)
+                    fwd = kp.kcp_arena_layout(ctx, H=H, backward=False)
+                    lazy = sum(fwd[f"pool.{name}"] for name in kp.FWD_LAZY_POOLS)
+                    assert fwd["lazy"] == lazy and full["lazy"] == 0
+                    # the forward-only workspace of the previous rule (every non-ring pool up front) is both states
+                    assert fwd["arena"] + fwd["lazy"] == sum(
+                        fwd[f"pool.{name}"]
+                        for name in kp.FWD_POOLS
+                        if name not in kp.LAZY_POOLS
+                    )
+                    # forward first, then backward (the pair grows in place of both names)
+                    ws = cake_kcp.KcpWorkspace(local=False)
+                    ws.ensure(ctx, H, device="cpu", backward=False)
+                    assert ws.bytes == fwd["arena"], (W, layout, r, H)
+                    assert not ws.has("b1_send") and not ws.has("ring_out")
+                    assert not any(ws.has(name) for name in kp.FWD_LAZY_POOLS)
+                    # a forward that reads the lazy pools (one without a saved set) allocates them at their size
+                    ws_n = cake_kcp.KcpWorkspace(local=False)
+                    ws_n.ensure(ctx, H, device="cpu", backward=False)
+                    for name in kp.FWD_LAZY_POOLS:
+                        v = ws_n.pool(name, tb.sizes[name])
+                        assert v.numel() == tb.sizes[name], (name, W, layout, r, H)
+                    assert ws_n.bytes == fwd["arena"] + fwd["lazy"], (W, layout, r, H)
+                    ws_n.ensure(ctx, H, device="cpu", backward=False)
+                    assert (
+                        ws_n.bytes == fwd["arena"] + fwd["lazy"]
+                    )  # a later ensure keeps them
+                    ws_n.ensure(ctx, H, device="cpu", backward=True)
+                    assert ws_n.bytes == full["arena"], (W, layout, r, H)
+                    seen_lazy += fwd["lazy"] > 0
+                    # without save_transfer a saving forward reads the transfer pools (the a2a c1 receive, M_seg^T
+                    # in the staging plane): the first state holds them, a forward without a saved set adds the carry
+                    nt = kp.kcp_arena_layout(
+                        ctx, H=H, backward=False, save_transfer=False
+                    )
+                    assert kp.kcp_arena_layout(ctx, H=H, save_transfer=False) == full
+                    assert nt["arena"] == fwd["arena"] + sum(
+                        fwd[f"pool.{name}"] for name in kp.FWD_TRANSFER_POOLS
+                    )
+                    assert nt["lazy"] == fwd["pool.carry"]
+                    assert nt["arena"] + nt["lazy"] == fwd["arena"] + fwd["lazy"]
+                    ws_t = cake_kcp.KcpWorkspace(local=False)
+                    ws_t.ensure(ctx, H, device="cpu", backward=False)
+                    for name in kp.FWD_TRANSFER_POOLS:
+                        ws_t.pool(name, tb.sizes[name])
+                    assert ws_t.bytes == nt["arena"] and not ws_t.has("carry"), (
+                        W,
+                        layout,
+                        r,
+                        H,
+                    )
+                    ws.ensure(ctx, H, device="cpu", backward=True)
+                    assert ws.bytes == full["arena"], (W, layout, r, H)
+                    for name in kp.FWD_LAZY_POOLS:  # sized by the backward ensure
+                        assert ws.has(name) and ws.pool(name).numel() == tb.sizes[name]
+                    for a, b in kp.SHARED_POOLS:
+                        assert ws.pool(a) is ws.pool(b)
+                        assert ws.pool(a).numel() == max(tb.sizes[a], tb.sizes[b])
+                    for name in kp.FWD_POOLS + kp.BWD_POOLS:
+                        if name not in kp.LAZY_POOLS:
+                            assert ws.pool(name).numel() >= tb.sizes[name]
+                    assert not ws.has("ring_out") and not ws.has("ring_in")
+                    # a backward workspace from the start: the same storage
+                    ws2 = cake_kcp.KcpWorkspace(ctx, H, device="cpu", local=False)
+                    assert ws2.bytes == full["arena"]
+                    assert ws2.pool("c1_send") is ws2.pool("b1_send")
+                    # a ring call's first read allocates the hop pools (a zero need allocates nothing)
+                    for name in kp.LAZY_POOLS:
+                        v = ws.pool(name, tb.sizes[name])
+                        assert v.numel() == tb.sizes[name]
+                    assert ws.bytes == full["arena"] + full["ring"]
+                    seen_ring += full["ring"] > 0
+    assert (
+        seen_p > 0 and seen_ring > 0 and seen_lazy > 0
+    )  # the rows cover the P > 1 and the crossing-fragment forms
+
+
+FWD_KCP_BUFFERS = frozenset(
+    ("gk", "kb", "akk_int", "h", "kg", "qg", "v_new", "aqk_int", "u", "w")
+)
+
+
+def test_forward_only_layout_bytes_and_prediction() -> None:
+    """The KCP forward-only layout (``fwd_kcp``) on the host: every buffer the KCP forward binds (the local intra / WY /
+    output programs' rows and the K1 / K3 walks' operands), no segment state blocks, ``akk_int`` under the ``h`` tape
+    beside ``kb`` (both dead before the tape walk writes ``h``), exactly 2432 B per internal token-head -- at least
+    128 below the existing backend's forward layout on every plan; the byte queries take it only for a forward-only
+    light arena of the whole problem.  The rank prediction of a forward-only workspace (state after forwards with a
+    saved set) is the ``fwd_kcp`` local arena, the scratch table set and the non-lazy pools (plus the transfer pools
+    without ``save_transfer``); the backward prediction is unchanged and independent of ``save_transfer``."""
+    rows = ((3000, 1, 4), (2999, 4, 64), (64 * 257, 3, 16), (1, 1, 1), (5000, 7, 2))
+    for (S, N, H), arch in ((row, arch) for row in rows for arch in cake_jit.ARCHES):
+        p = cake_backend.plan(S, N, H, SM_COUNT, arch)
+        R = p.R
+        regions = {r.name: r for r in p.layout("fwd_kcp")}
+        assert set(regions) == FWD_KCP_BUFFERS, (S, N, H, arch)
+        assert p.workspace_bytes("fwd_kcp") == 2432 * R * H
+        assert p.workspace_bytes("fwd") - p.workspace_bytes("fwd_kcp") >= 128 * R * H
+        h, kb, akk = regions["h"], regions["kb"], regions["akk_int"]
+        assert kb.offset == h.offset and akk.offset == h.offset + 256 * R * H
+        assert akk.offset + akk.nbytes <= h.offset + h.nbytes
+        assert kb.lifetime == akk.lifetime == (1, 2) and h.lifetime == (3, 4)
+        for name in FWD_KCP_BUFFERS - {"kb", "akk_int", "h"}:
+            r = regions[name]
+            assert not any(  # every other buffer keeps a slot of its own
+                o.offset < r.offset + r.nbytes and r.offset < o.offset + o.nbytes
+                for o in regions.values()
+                if o is not r
+            ), name
+        q = {"sm_count": SM_COUNT, "arch": arch}
+        assert (
+            cake_backend.workspace_bytes(
+                S, N, H, backward=False, fwd_layout="fwd_kcp", **q
+            )
+            == p.arena_bytes(backward=False, fwd_layout="fwd_kcp")
+            == 2432 * R * H
+        )
+        assert cake_backend.workspace_bytes(
+            S, N, H, backward=False, **q
+        ) == p.workspace_bytes("fwd")
+        bad = [
+            {"backward": True, "fwd_layout": "fwd_kcp"},
+            {"backward": False, "fwd_layout": "fwd_kcp", "save_mode": "tape"},
+            {"backward": False, "fwd_layout": "bwd"},
+        ]
+        if not p.proportional:  # the rows the batched option serves at all
+            bad.append(
+                {
+                    "backward": False,
+                    "fwd_layout": "fwd_kcp",
+                    "arena": cake_backend.KdaArena(batch_tokens=S),
+                }
+            )
+        for kw in bad:
+            with pytest.raises(ValueError, match="fwd_layout"):
+                cake_backend.workspace_bytes(S, N, H, **q, **kw)
+    assert cake_backend.FWD_LAYOUTS == ("fwd", "fwd_kcp")
+    assert "fwd_kcp" not in cake_backend.MODES
+    assert cake_backend.SLOTS["fwd_kcp"] is cake_backend.FWD_KCP_SLOTS
+    # the lifetime table: 2432 B per internal token-head over the slots, the farthest occupant of each
+    per_slot: dict[int, int] = {}
+    for row in cake_backend.lifetime_table("fwd_kcp"):
+        assert row["unit"] == "R*H"
+        end = row["sub_offset_per_th"] + row["bytes_per_th"]
+        per_slot[row["slot"]] = max(per_slot.get(row["slot"], 0), end)
+    assert sum(per_slot.values()) == 2432
+    # the rank's layout rule: the KCP forward layout for a forward-only light workspace alone
+    assert kp.LOCAL_LAYOUT_FWD_ONLY == cake_kcp.LOCAL_LAYOUT_FWD_ONLY == "fwd_kcp"
+    assert (
+        kp.local_fwd_layout(False) == kp.local_fwd_layout(False, "light") == "fwd_kcp"
+    )
+    assert kp.local_fwd_layout(True) == kp.local_fwd_layout(False, "tape") == "fwd"
+    # the rank predictions: forward-only = fwd_kcp local arena + scratch tables + the non-lazy pools
+    seen = 0
+    for W in (2, 4, 8, 16):
+        for lengths, layout in (
+            ((3000,), "contiguous"),
+            ((40, 40), "zigzag"),
+            ((700, 1, 1300, 999), "zigzag_per_document"),
+        ):
+            part = _small_partition(W, lengths=lengths, layout=layout)
+            for r, ctx in enumerate(contexts(part)):
+                for H in (4, 64):
+                    full = kp.kcp_arena_layout(ctx, H=H)
+                    fwd = kp.kcp_arena_layout(ctx, H=H, backward=False)
+                    pred_b = kp.kcp_workspace_bytes(ctx, H=H)
+                    pred_f = kp.kcp_workspace_bytes(ctx, H=H, backward=False)
+                    # without save_transfer the forward-only prediction holds the transfer pools a saving forward
+                    # reads; the backward prediction does not depend on it
+                    transfer = sum(fwd[f"pool.{n}"] for n in kp.FWD_TRANSFER_POOLS)
+                    assert (
+                        kp.kcp_workspace_bytes(ctx, H=H, save_transfer=False) == pred_b
+                    )
+                    assert (
+                        kp.kcp_workspace_bytes(
+                            ctx, H=H, backward=False, save_transfer=False
+                        )
+                        == pred_f + transfer
+                    ), (W, layout, r, H)
+                    if ctx.T_r == 0:
+                        assert pred_f == fwd["arena"] and pred_b == full["arena"]
+                        continue
+                    args = (ctx.T_r, ctx.n_frag, H)
+                    local_b = cake_backend.workspace_bytes(
+                        *args, backward=True, sm_count=SM_COUNT
+                    )
+                    local_f = cake_backend.workspace_bytes(
+                        *args, backward=False, fwd_layout="fwd_kcp", sm_count=SM_COUNT
+                    )
+                    old_f = cake_backend.workspace_bytes(
+                        *args, backward=False, sm_count=SM_COUNT
+                    )
+                    assert local_f == 2432 * ctx.R * H, (W, layout, r, H)
+                    assert old_f - local_f >= 128 * ctx.R * H
+                    scratch = (
+                        pred_b - full["arena"] - local_b
+                    )  # the intra record's table set (both directions)
+                    assert scratch >= 0
+                    assert pred_f == local_f + scratch + fwd["arena"], (W, layout, r, H)
+                    seen += 1
+    assert seen > 0
+
+
+def test_host_trim_backward_walk_sublists_are_table_owned() -> None:
+    """Trimmed host path: the backward's tape-replay walk lists ``s % P == 0`` / ``!= 0`` of ``walk_all`` are the table set's own
+    list objects (one device copy per table set on the trimmed path, not one per call), and an identity-keyed cache
+    fed with fresh objects stays bounded."""
+    for lengths, layout in (
+        ((3000,), "contiguous"),
+        ((700, 1, 1300, 999), "zigzag_per_document"),
+        ((40, 40), "zigzag"),
+    ):
+        part = _small_partition(4, lengths=lengths, layout=layout)
+        ctx = kp.build_kcp_context(part, None, 1, "cpu", 4, sm_count=SM_COUNT)
+        tb = cake_kcp._Tables(ctx, 64, fused_walks=1)
+        p0, rest = tb.walk_all_p0, tb.walk_all_rest
+        assert tb.walk_all_p0 is p0 and tb.walk_all_rest is rest
+        assert p0 == [s for s in tb.walk_all if s % tb.P == 0]
+        assert rest == [s for s in tb.walk_all if s % tb.P != 0]
+        assert sorted(p0 + rest) == sorted(tb.walk_all)
+        if p0:
+            d0 = tb.dev_list(p0, "cpu")
+            assert tb.dev_list(tb.walk_all_p0, "cpu") is d0 and d0.tolist() == p0
+        if tb.P == 1:
+            assert rest == [] and p0 == list(tb.walk_all)
+    # the bound: fresh list objects miss every time and the cache is emptied at ID_CACHE_MAX entries
+    keep = []
+    for i in range(cake_kcp._Tables.ID_CACHE_MAX + 5):
+        fresh = [i, i + 1]
+        keep.append(fresh)
+        tb.dev_list(fresh, "cpu")
+    assert 0 < len(tb._dev_lists) <= cake_kcp._Tables.ID_CACHE_MAX
+    assert tb.dev_list(tb.walk_offset, "cpu") is tb.dev_list(tb.walk_offset, "cpu")
+
+
+def test_host_trim_table_identity_caches() -> None:
+    """Trimmed host path: the table set's identity-keyed device copies (walk lists, the segment table, tile tables, Indexed
+    metadata, chain tables) hold the same integers as the content-keyed copies of today's path."""
+    from flashinfer.experimental.cake_kda_train import cake_kcp_jit
+
+    part = _small_partition(4, lengths=(3000,), layout="contiguous")
+    ctx = kp.build_kcp_context(part, None, 1, "cpu", 4, sm_count=SM_COUNT)
+    tb = cake_kcp._Tables(ctx, 64, fused_walks=1)
+    assert tb.P > 1
+    w1 = tb.dev_list(tb.walk_offset, "cpu")
+    assert tb.dev_list(tb.walk_offset, "cpu") is w1
+    assert w1.dtype == torch.int32 and w1.tolist() == [int(s) for s in tb.walk_offset]
+    copy = list(tb.walk_offset)
+    w2 = tb.dev_list(copy, "cpu")
+    assert w2 is not w1 and torch.equal(
+        w2, w1
+    )  # another list object: another entry, the same integers
+    seg = tb.dev_list(tb.hp.seg_chunk_start, "cpu")
+    assert seg.tolist() == [int(x) for x in tb.hp.seg_chunk_start]
+    cpu = torch.device("cpu")
+    t_id = tb.device_tiles(tb.mf_tiles, cpu, by_identity=True)
+    assert tb.device_tiles(tb.mf_tiles, cpu, by_identity=True) is t_id
+    assert torch.equal(t_id, tb.device_tiles(tb.mf_tiles, cpu))
+    meta = tb.indexed_meta(tb.h0_index, tb.s_in_tiles, 64, "cpu")
+    assert tb.indexed_meta(tb.h0_index, tb.s_in_tiles, 64, "cpu") is meta
+    plain = cake_kcp.Indexed(
+        torch.empty(0),
+        tuple(int(i) for i in tb.h0_index),
+        tuple(tuple(int(t) for t in row) for row in tb.s_in_tiles),
+    )
+    assert (meta.index, meta.tiles, meta.addr) == (
+        plain.index,
+        plain.tiles,
+        plain.addressing(64),
+    )
+    assert meta.dev_index.dtype == torch.int32 and meta.dev_index.tolist() == list(
+        plain.index
+    )
+    ix = cake_kcp.Indexed(torch.empty(0), meta.index, meta.tiles, meta)
+    assert ix.addressing(64) == plain.addressing(64) and ix.meta is meta
+    assert cake_kcp.Indexed(torch.empty(0), meta.index, meta.tiles).meta is None
+    for name, ch in tb.chains.items():
+        mine = ch.device_tables("cpu")
+        assert ch.device_tables("cpu") is mine
+        ref = cake_kcp_jit._chain_tables(ch, "cpu")
+        assert set(mine) == set(ref), name
+        for k in ref:
+            assert mine[k].dtype == ref[k].dtype and torch.equal(mine[k], ref[k]), (
+                name,
+                k,
+            )
+    empty = cake_kcp.Chains(8)
+    e_mine, e_ref = empty.device_tables("cpu"), cake_kcp_jit._chain_tables(empty, "cpu")
+    for k in e_ref:
+        assert e_mine[k].dtype == e_ref[k].dtype and torch.equal(e_mine[k], e_ref[k]), k
+
+
+def test_host_trim_kernel_backend_run_skips_the_discarded_abi() -> None:
+    """Trimmed host path: under host_trim a launch goes to the provider's ``run_program`` without the positional ABI (which that
+    form discards), keeping the D1 bookkeeping of the merge (alignment check, ``cols_per_cta`` None, ``merge_log``);
+    an explicit cols rule takes today's path (ABI + the ``_c<cols>`` record)."""
+    calls: list = []
+
+    class FakeJit:
+        def run_program(self, name, args, *, device_index):
+            calls.append(("run_program", name, args.get("chains"), device_index))
+
+        def run_module(self, record, values, *, grid, device_index):
+            calls.append(("run_module", record, grid, device_index))
+
+    ch = cake_kcp.Chains(cake_kcp.D)
+    ch.add([(0, -1, -1)], x0=-1, y_final=0)
+    big = cake_kcp.Chains(
+        cake_kcp.D
+    )  # > COLS_RULE_CHAINS state chains: by_chains asks for the explicit c16 record
+    for i in range(cake_kcp.COLS_RULE_CHAINS + 1):
+        big.add([(4 * i, -1, -1)], x0=-1, y_final=4 * i)
+    y, m = torch.zeros(2 * cake_kcp.TILE), torch.zeros(2 * cake_kcp.TILE)
+
+    def call(
+        host_trim: int,
+        cols_rule: str = "fixed",
+        geometry: str = cake_kcp.WALK_GEOMETRY_DEFAULT,
+    ):
+        return types.SimpleNamespace(
+            host_trim=host_trim,
+            cols_rule=cols_rule,
+            merge_log=[],
+            device=torch.device("cpu"),
+            walk_geometry=geometry,
+            scratch={},
+            precision_mode=0,
+            transfer_walk="bf16x3_hw64",
+        )
+
+    backend = cake_kcp.KernelBackend(programs=cake_kcp._FiPrograms(FakeJit()))
+    c1 = call(1)
+    args = {
+        "family": "fwd",
+        "m": m,
+        "c": None,
+        "x0": None,
+        "y": y,
+        "chains": ch,
+        "transpose_m": 0,
+        "write_states": 1,
+        "_call": c1,
+    }
+    backend.run("kcp_affine_merge", args)
+    assert calls == [("run_program", "kcp_affine_merge", ch, None)]
+    assert (
+        args["cols_per_cta"] is None
+        and c1.merge_log == [("fwd", cake_kcp.D, 1, None)]
+        and id(ch) in backend._checked_chains
+    )
+    calls.clear()
+    c0 = call(0)
+    backend.run("kcp_affine_merge", {**args, "_call": c0})
+    assert calls == [
+        ("run_program", "kcp_affine_merge", ch, None)
+    ] and c0.merge_log == [("fwd", cake_kcp.D, 1, None)]
+    calls.clear()
+    c2 = call(1, cols_rule="by_chains")
+    backend.run("kcp_affine_merge", {**args, "chains": big, "_call": c2})
+    n_cta = (cake_kcp.COLS_RULE_CHAINS + 1) * (cake_kcp.D // 16)
+    assert calls == [("run_module", "kcp_affine_merge_c16", (n_cta, 1, 1), None)]
+    assert (
+        c2.merge_log == [("fwd", cake_kcp.D, cake_kcp.COLS_RULE_CHAINS + 1, 16)]
+        and id(big) in backend._checked_chains
+    )
+    calls.clear()
+    c3 = call(1, geometry="shipped")
+    backend.run("kcp_fwdh_tape", {"walk": [0, 1], "h0": None, "out": None, "_call": c3})
+    assert calls == [("run_program", "kcp_fwdh_tape", None, None)]
+
+
+def test_walk_form_of_decides_once_per_table_set() -> None:
+    """``_walk_form_of`` (the record form of a K1 / K2 walk launch) evaluates the registry's rule once per
+    ``(program, walk list, H, SM count, knob)`` of the call's table set and looks the form up on every later launch:
+    the forms of a per-launch evaluation (the rule's inputs are static per ``(ctx, H)``), a fresh equal list finding
+    the same entry, the knob's forced forms passing through; a provider without a form rule gives ``"full"``."""
+    part = kp.kcp_partition((0, 64 * 200, 64 * 350), 4, layout="contiguous")
+    ctx = kp.build_kcp_context(part, None, 0, "cpu", 4, sm_count=148)
+    tb = cake_kcp._Tables(ctx, 64)
+    evaluated: list[tuple] = []
+
+    def rule(program, chains, num_heads, sm_count, *, knob="auto"):
+        evaluated.append((program, tuple(chains), num_heads, sm_count, knob))
+        return cake_kcp_jit.walk_form(program, chains, num_heads, sm_count, knob=knob)
+
+    programs = types.SimpleNamespace(
+        jit=types.SimpleNamespace(
+            walk_form=rule,
+            WALK_FORM_RULES=cake_kcp_jit.WALK_FORM_RULES,
+            sm_count=lambda index: 148,
+        )
+    )
+    seg = [int(x) for x in tb.hp.seg_chunk_start]
+    lists = {
+        "offset": tb.walk_offset,
+        "in": tb.walk_in,
+        "live": tb.walk_live,
+        "end": tb.walk_end,
+        "first": list(tb.walk_offset[:1]),  # a list unlike the others: its own entry
+    }
+
+    def call(knob: str):
+        return types.SimpleNamespace(
+            tb=tb, H=64, device=torch.device("cpu"), walk_form=knob
+        )
+
+    forms: dict[
+        tuple, str
+    ] = {}  # (knob, program, walk tuple) -> form: one rule evaluation each
+    for knob in ("auto", "full", "split"):
+        for name in cake_kcp_jit.WALK_FORM_RULES:
+            for tag, lst in lists.items():
+                if not lst:
+                    continue
+                want = cake_kcp_jit.walk_form(
+                    name, [seg[s + 1] - seg[s] for s in lst], 64, 148, knob=knob
+                )
+                forms[(knob, name, tuple(lst))] = want
+                for _ in range(3):  # the first launch evaluates, the others look up
+                    got = cake_kcp._walk_form_of(
+                        call(knob), programs, name, {"walk": lst}
+                    )
+                    assert got == want, (knob, name, tag, got, want)
+                fresh = {
+                    "walk": [int(s) for s in lst]
+                }  # a fresh equal list: the same entry
+                assert cake_kcp._walk_form_of(call(knob), programs, name, fresh) == want
+    # every distinct (knob, program, walk list) evaluated exactly once (equal lists share the entry)
+    assert len(forms) >= 3 * len(cake_kcp_jit.WALK_FORM_RULES) * 2, len(forms)
+    assert sorted(evaluated) == sorted(
+        (name, tuple(seg[s + 1] - seg[s] for s in walk), 64, 148, knob)
+        for (knob, name, walk) in forms
+    ), (len(evaluated), len(forms))
+    assert all(form == knob for (knob, _, _), form in forms.items() if knob != "auto")
+    assert {
+        forms[("auto", name, tuple(tb.walk_offset))]
+        for name in cake_kcp_jit.WALK_FORM_RULES
+    } >= {"split"}  # the tape programs' rule
+    bare = types.SimpleNamespace(jit=types.SimpleNamespace())
+    assert (
+        cake_kcp._walk_form_of(
+            types.SimpleNamespace(), bare, "kcp_fwdh_offset", {"walk": tb.walk_offset}
+        )
+        == "full"
+    )
+
+
+class _FakeGraphRt:
+    """A CUDA-runtime double of the capture-graph entry points of the kernel-node cap forms: one
+    active capture whose next operation depends on one kernel node; records every call."""
+
+    def __init__(
+        self, *, status: int = 1, n_deps: int = 1, node_type: int = 0, rc_set: int = 0
+    ) -> None:
+        self.status, self.n_deps, self.node_type, self.rc_set = (
+            status,
+            n_deps,
+            node_type,
+            rc_set,
+        )
+        self.calls: list[tuple] = []
+        self.values: dict[int, int] = {}
+        self.next_node = 0x1000
+        self._keep: list = []
+
+    def cudaRuntimeGetVersion(self, ver):
+        ver._obj.value = 13000  # the double speaks CUDA 13: the plain export has the 7-argument (v3) form
+        return 0
+
+    def cudaStreamGetCaptureInfo(self, stream, status, cid, graph, deps, edges, n_deps):
+        node = self.next_node
+        self.next_node += 0x10
+        status._obj.value = self.status
+        cid._obj.value = 7
+        graph._obj.value = 0xBEEF
+        handle = ctypes.c_void_p(node)
+        self._keep.append(
+            handle
+        )  # the array the runtime would own: valid until the next capture call
+        deps._obj.contents = handle
+        n_deps._obj.value = self.n_deps
+        self.calls.append(("info", stream.value))
+        return 0
+
+    def cudaGraphNodeGetType(self, node, node_type):
+        node_type._obj.value = self.node_type
+        self.calls.append(("type", node.value))
+        return 0
+
+    def cudaGraphKernelNodeSetAttribute(self, node, attr, value):
+        self.calls.append(("set", node.value, attr, value._obj[0]))
+        if self.rc_set:
+            return self.rc_set
+        self.values[node.value] = value._obj[0]
+        return 0
+
+    def cudaGraphKernelNodeGetAttribute(self, node, attr, value):
+        self.calls.append(("get", node.value, attr))
+        value._obj[0] = self.values.get(node.value, 0xFFFFFFFF)
+        return 0
+
+    def cudaGetLastError(self):
+        self.calls.append(("lasterror",))
+        return 0
+
+
+def _fake_node_call(form: str) -> types.SimpleNamespace:
+    return types.SimpleNamespace(
+        walk_geometry=cake_kcp.WALK_GEOMETRY_DEFAULT,
+        scratch={},
+        opts=types.SimpleNamespace(graph_cap=form),
+    )
+
+
+def _fake_stream(monkeypatch) -> None:
+    monkeypatch.setattr(
+        torch.cuda,
+        "current_stream",
+        lambda device_index=None: types.SimpleNamespace(cuda_stream=0x5151),
+    )
+
+
+def test_capped_launch_sets_the_node_attribute_inside_a_capture(monkeypatch) -> None:
+    """The kernel-node cap ``graph_cap="node_attr"``: inside a stream capture a capped program
+    launches bare and the kernel node it just added (``cudaStreamGetCaptureInfo``, ``_v2`` on CUDA 12: one dependency node of an active
+    capture, type kernel) gets the preferred shared-memory carveout launch attribute ``GRAPH_NODE_CARVEOUT`` with a
+    read-back; nothing is counted as a capture skip; the call records the number of capped launches; the evidence log keeps
+    the first records per (program, device).  ``"node_attr_post"`` keeps the node handle for :meth:`apply_node_caps` instead,
+    which sets the attributes after the capture.  Without the graph entry points both forms report ``unavailable`` and the
+    launch falls back to the bare capture-skip form.  A capture-info reply without exactly one kernel-node dependency degrades
+    the same way: uncapped launch, one warning per process, the reason on the call."""
+    rt = _FakeGraphRt()
+    monkeypatch.setattr(cake_kcp, "_CUDART_CACHE", {"rt": rt, "graph": rt})
+    monkeypatch.setattr(cake_kcp, "_capturing", lambda: True)
+    _fake_stream(monkeypatch)
+    stats0 = dict(cake_kcp.CACHE_CONFIG_STATS)
+    jit = _FakeJit()
+    programs = cake_kcp._FiPrograms(jit)
+    program = cake_kcp.WALK_CAP_PROGRAMS[cake_kcp.WALK_GEOMETRY_DEFAULT][0]
+    call = _fake_node_call("node_attr")
+    programs.launch(program, [], grid=4, device_index=0, args={"_call": call})
+    programs.launch(program, [], grid=4, device_index=0, args={"_call": call})
+    assert jit.launched == [(program, 4, 0, 0, "bf16x3_hw64")] * 2
+    assert programs.capture_skips == 0 and programs.node_attrs == 2
+    assert (
+        call.scratch["node_attr_launches"] == 2
+        and "node_attr_pending" not in call.scratch
+    )
+    kinds = [c[0] for c in rt.calls]
+    assert kinds == ["info", "type", "set", "get"] * 2, kinds
+    sets = [c for c in rt.calls if c[0] == "set"]
+    assert all(
+        c[2] == cake_kcp._LAUNCH_ATTR_SHMEM_CARVEOUT
+        and c[3] == cake_kcp.GRAPH_NODE_CARVEOUT
+        for c in sets
+    ), sets
+    assert [c[1] for c in sets] == [
+        0x1000,
+        0x1010,
+    ]  # one node per launch, the just-captured one
+    log = programs.node_attr_log[(program, 0)]
+    assert [e["node"] for e in log] == [0x1000, 0x1010]
+    assert all(
+        e["rc"] == 0
+        and e["readback"] == cake_kcp.GRAPH_NODE_CARVEOUT
+        and e["node_type"] == 0
+        and e["status"] == 1
+        and e["n_deps"] == 1
+        and e["stream"] == 0x5151
+        and e["immediate"] is True
+        for e in log
+    ), log
+    assert (
+        cake_kcp.CACHE_CONFIG_STATS["node_attr_launches"]
+        == stats0["node_attr_launches"] + 2
+    )
+    assert cake_kcp.CACHE_CONFIG_STATS["capture_skips"] == stats0["capture_skips"]
+    # the evidence log keeps four records per (program, device); the counters keep counting
+    for _ in range(4):
+        programs.launch(program, [], grid=4, device_index=0, args={"_call": call})
+    assert len(programs.node_attr_log[(program, 0)]) == 4 and programs.node_attrs == 6
+    # the bracket form of a captured call: node_attr / node_attr_post, or unavailable without the entry points
+    cap = types.SimpleNamespace(
+        opts=types.SimpleNamespace(graph_cap="node_attr"),
+        walk_geometry=cake_kcp.WALK_GEOMETRY_DEFAULT,
+    )
+    assert cake_kcp._graph_cap_bracket(cap) == ("node_attr", None)
+    cap.opts.graph_cap = "node_attr_post"
+    assert cake_kcp._graph_cap_bracket(cap) == ("node_attr_post", None)
+    cap.walk_geometry = "shipped"
+    assert cake_kcp._graph_cap_bracket(cap) == ("none", None)
+    # node_attr_post: the handles are kept on the call and set afterwards
+    post = _fake_node_call("node_attr_post")
+    programs.launch(program, [], grid=4, device_index=0, args={"_call": post})
+    programs.launch(program, [], grid=4, device_index=0, args={"_call": post})
+    assert (
+        post.scratch["node_attr_launches"] == 0
+        and len(post.scratch["node_attr_pending"]) == 2
+    )
+    n_set = len([c for c in rt.calls if c[0] == "set"])
+    assert programs.apply_node_caps(post) == 2
+    assert len([c for c in rt.calls if c[0] == "set"]) == n_set + 2
+    assert (
+        post.scratch["node_attr_launches"] == 2
+        and "node_attr_pending" not in post.scratch
+    )
+    assert programs.node_attrs == 8
+    # a failing set inside the capture raises (the capture then falls back to the eager path, recorded by _graph_capture)
+    bad = _FakeGraphRt(rc_set=1)
+    monkeypatch.setattr(cake_kcp, "_CUDART_CACHE", {"rt": bad, "graph": bad})
+    programs2 = cake_kcp._FiPrograms(_FakeJit())
+    with pytest.raises(RuntimeError, match="cudaGraphKernelNodeSetAttribute"):
+        programs2.launch(
+            program,
+            [],
+            grid=4,
+            device_index=0,
+            args={"_call": _fake_node_call("node_attr")},
+        )
+    assert ("lasterror",) in bad.calls
+    # a capture whose dependency set is not one kernel node DEGRADES: the launch is
+    # issued uncapped, one RuntimeWarning per process, the call records the reason -- never an exception / eager fallback
+    odd = _FakeGraphRt(n_deps=2)
+    monkeypatch.setattr(cake_kcp, "_CUDART_CACHE", {"rt": odd, "graph": odd})
+    odd_call = _fake_node_call("node_attr")
+    skips0 = programs2.capture_skips
+    degraded0 = cake_kcp.CACHE_CONFIG_STATS["node_attr_degraded"]
+    with pytest.warns(RuntimeWarning, match="one dependency node"):
+        programs2.launch(
+            program,
+            [],
+            grid=4,
+            device_index=0,
+            args={"_call": odd_call},
+        )
+    assert programs2.capture_skips == skips0 + 1
+    assert cake_kcp.CACHE_CONFIG_STATS["node_attr_degraded"] == degraded0 + 1
+    assert "one dependency node" in odd_call.scratch["node_attr_degraded"]
+    assert "node_attr_launches" not in odd_call.scratch
+    assert not any(c[0] == "set" for c in odd.calls)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")  # remembered: no second warning in the process
+        programs2.launch(
+            program,
+            [],
+            grid=4,
+            device_index=0,
+            args={"_call": odd_call},
+        )
+    assert programs2.capture_skips == skips0 + 2 and programs2.node_attrs == 0
+    # without the graph entry points: unavailable, and the launch takes the capture-skip form
+    monkeypatch.setattr(cake_kcp, "_CUDART_CACHE", {"rt": object(), "graph": None})
+    programs3 = cake_kcp._FiPrograms(_FakeJit())
+    plain = _fake_node_call("node_attr")
+    programs3.launch(program, [], grid=4, device_index=0, args={"_call": plain})
+    assert (
+        programs3.capture_skips == 1
+        and programs3.node_attrs == 0
+        and plain.scratch == {}
+    )
+    cap.walk_geometry = cake_kcp.WALK_GEOMETRY_DEFAULT
+    cap.opts.graph_cap = "node_attr"
+    assert cake_kcp._graph_cap_bracket(cap) == ("unavailable", None)
+    # the shipped forms are untouched by the kernel-node forms (the capture skip)
+    none_ = _fake_node_call("none")
+    programs3.launch(program, [], grid=4, device_index=0, args={"_call": none_})
+    assert programs3.capture_skips == 2 and none_.scratch == {}
+
+
+def test_graph_entry_points_missing_degrades(monkeypatch) -> None:
+    """A CUDA runtime without the capture-graph entry points: one ``RuntimeWarning`` naming them, ``_cudart_graph_available()``
+    is ``None`` (remembered), the shipped forms are unaffected."""
+    monkeypatch.setattr(cake_kcp, "_CUDART_CACHE", {"rt": object()})
+    monkeypatch.setattr(cake_kcp, "_cudart", lambda: types.SimpleNamespace())
+    with pytest.warns(RuntimeWarning, match="cudaStreamGetCaptureInfo") as rec:
+        assert cake_kcp._cudart_graph_available() is None
+    assert len([w for w in rec if issubclass(w.category, RuntimeWarning)]) == 1
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        assert (
+            cake_kcp._cudart_graph_available() is None
+        )  # remembered: no second warning
+    assert cake_kcp._CUDART_CACHE["graph"] is None
+
+
+def test_capture_info_export_name_resolution() -> None:
+    """CUDA 12.3+ exports the 7-argument stream-capture-info call as ``cudaStreamGetCaptureInfo_v3``, CUDA 11.3-12.x the
+    6-argument form as ``..._v2``, and CUDA 13 (13000+) the 7-argument form under the plain name (observed: libcudart.so.13
+    exports neither suffixed name); the module resolves the first name present and its arity, and a plain name on a pre-13 runtime
+    (the pre-11.3 form without dependency nodes) is unusable."""
+    assert cake_kcp._CUDART_CAPTURE_INFO_NAMES == (
+        "cudaStreamGetCaptureInfo_v3",
+        "cudaStreamGetCaptureInfo_v2",
+        "cudaStreamGetCaptureInfo",
+    )
+    ns = types.SimpleNamespace
+    assert (
+        cake_kcp._capture_info_name(
+            ns(cudaStreamGetCaptureInfo_v2=1, cudaStreamGetCaptureInfo=2)
+        )
+        == "cudaStreamGetCaptureInfo_v2"
+    )
+    assert (
+        cake_kcp._capture_info_name(
+            ns(cudaStreamGetCaptureInfo_v3=1, cudaStreamGetCaptureInfo_v2=1)
+        )
+        == "cudaStreamGetCaptureInfo_v3"
+    )
+    assert (
+        cake_kcp._capture_info_name(ns(cudaStreamGetCaptureInfo=2))
+        == "cudaStreamGetCaptureInfo"
+    )
+    assert cake_kcp._capture_info_name(ns()) is None
+    assert cake_kcp._capture_info_arity(ns(), "cudaStreamGetCaptureInfo_v3") == 7
+    assert cake_kcp._capture_info_arity(ns(), "cudaStreamGetCaptureInfo_v2") == 6
+
+    def version(v):
+        def fn(ver):
+            ver._obj.value = v
+            return 0
+
+        return fn
+
+    assert (
+        cake_kcp._capture_info_arity(
+            ns(cudaRuntimeGetVersion=version(13000)), "cudaStreamGetCaptureInfo"
+        )
+        == 7
+    )
+    assert (
+        cake_kcp._capture_info_arity(
+            ns(cudaRuntimeGetVersion=version(12090)), "cudaStreamGetCaptureInfo"
+        )
+        == 0
+    )
+    assert (
+        cake_kcp._capture_info_arity(ns(), "cudaStreamGetCaptureInfo") == 0
+    )  # no version call: unusable
+    assert cake_kcp._CUDART_GRAPH_ENTRY_POINTS == (
+        "cudaGraphNodeGetType",
+        "cudaGraphKernelNodeSetAttribute",
+        "cudaGraphKernelNodeGetAttribute",
+    )
+    rt = _FakeGraphRt()  # the double speaks CUDA 13
+    assert cake_kcp._runtime_version(rt) == 13000
+    assert cake_kcp._capture_info_arity(rt, cake_kcp._capture_info_name(rt)) == 7
+
+
+def test_host_trim_templates_live_on_the_arena_and_weakly_key_the_table_set() -> None:
+    """Template-cache ownership: the trimmed path's ``begin_call`` template (the call-independent values of
+    one (arena, table set, direction)) is cached on the local arena whose views it holds, keyed by the table set's
+    identity with a WEAK reference to it (a hit is valid only while that table set object is alive and identical);
+    the backend keeps no template cache, so a table set or an arena dies when its owner drops it -- a training loop
+    with a new context / workspace per step retains nothing.  Dead entries are purged on the next miss."""
+
+    class Arena:  # the local arena's surface used by begin_call: plan geometry and the layout views
+        def __init__(self, ctx, H: int) -> None:
+            self.plan = types.SimpleNamespace(
+                S=int(ctx.T_r),
+                N=int(ctx.n_frag),
+                H=int(H),
+                NC_pad=int(ctx.NC_pad),
+                R=int(ctx.R),
+                NSEG=4,
+                P=2,
+                seg_arg=2,
+                proportional=0,
+            )
+            self.fwd_layout = cake_kcp.LOCAL_LAYOUT_FWD
+            n = max(int(ctx.NC_pad), 1)
+            self._views = {
+                mode: types.SimpleNamespace(
+                    h=torch.zeros(n, 2, cake_kcp.D),
+                    dh=torch.zeros(n, 2, cake_kcp.D),
+                    w=torch.zeros(4),
+                )
+                for mode in (cake_kcp.LOCAL_LAYOUT_FWD, cake_kcp.LOCAL_LAYOUT_BWD)
+            }
+
+        def views(self, mode: str):
+            return self._views[mode]
+
+    def call_for(arena, ctx, tb, H: int, backward: bool, host_trim: int = 1):
+        return types.SimpleNamespace(
+            local=arena,
+            ctx=ctx,
+            tb=tb,
+            T_r=int(ctx.T_r),
+            H=int(H),
+            backward=backward,
+            host_trim=host_trim,
+            ops={},
+            scale=1.0,
+            scratch={},
+            local_values=None,
+        )
+
+    part = _small_partition(4, lengths=(3000,), layout="contiguous")
+    ctx = kp.build_kcp_context(part, None, 1, "cpu", 4, sm_count=SM_COUNT)
+    H = 64
+    tb = cake_kcp._Tables(ctx, H, fused_walks=1)
+    arena = Arena(ctx, H)
+    backend = cake_kcp.KernelBackend()
+    assert not hasattr(
+        backend, "_local_templates"
+    )  # no template cache on the long-lived backend
+    c1 = call_for(arena, ctx, tb, H, False)
+    backend.begin_call(c1)
+    c2 = call_for(arena, ctx, tb, H, False)
+    backend.begin_call(c2)
+    assert (
+        c1.local_values["h2d"] is c2.local_values["h2d"]
+    )  # the cached template: the same view objects per call
+    assert c1.local_values is not c2.local_values and c1.scratch[
+        "views"
+    ] is arena.views("fwd")
+    cache = getattr(arena, cake_kcp.TEMPLATE_CACHE_ATTR)
+    assert set(cache) == {(id(tb), False)}
+    assert (
+        isinstance(cache[(id(tb), False)][0], weakref.ref)
+        and cache[(id(tb), False)][0]() is tb
+    )
+    c3 = call_for(arena, ctx, tb, H, True)
+    backend.begin_call(c3)
+    assert set(cache) == {(id(tb), False), (id(tb), True)} and "dh2d" in c3.local_values
+    # the table set dies although the arena and the backend live on: only a weak reference points at it
+    wr_tb = weakref.ref(tb)
+    del tb, c1, c2, c3
+    gc.collect()
+    assert wr_tb() is None
+    # a new table set on the same arena misses, purges the dead entries and leaves one live entry
+    ctx2 = kp.build_kcp_context(part, None, 1, "cpu", 4, sm_count=SM_COUNT)
+    tb2 = cake_kcp._Tables(ctx2, H, fused_walks=1)
+    c4 = call_for(arena, ctx2, tb2, H, False)
+    backend.begin_call(c4)
+    assert set(cache) == {(id(tb2), False)} and cache[(id(tb2), False)][0]() is tb2
+    # the arena dies with its templates; the backend holds nothing of it
+    wr_arena = weakref.ref(arena)
+    del arena, c4, cache
+    gc.collect()
+    assert wr_arena() is None
+    # the previous host path (host_trim = 0) builds the values per call and caches nothing on the arena
+    arena_b = Arena(ctx2, H)
+    c0 = call_for(arena_b, ctx2, tb2, H, False, host_trim=0)
+    backend.begin_call(c0)
+    assert not hasattr(arena_b, cake_kcp.TEMPLATE_CACHE_ATTR)
+    assert c0.local_values["h2d"].data_ptr() == arena_b.views("fwd").h.data_ptr()
+
+
+LOCAL_RECORD_CASES = [
+    (4, "sm_103a", 152),
+    (64, "sm_103a", 152),
+    (64, "sm_107a", 216),
+    (4, "sm_100a", 148),
+]
+
+
+@pytest.mark.parametrize(
+    "H,arch,sm",
+    LOCAL_RECORD_CASES,
+    ids=[f"h{h}-{a}-{s}" for h, a, s in LOCAL_RECORD_CASES],
+)
+def test_local_stage_values_cover_the_records(H, arch, sm) -> None:
+    """The local stages against the existing backend's registry on the CPU: the kernel backend's value dict of a
+    forward (no token-row copies: the saved set carries none), a saved-mode backward and a replay backward binds
+    every logical name of every
+    record it launches -- the plan's records on the forward path without a saved set and on the replay path, the
+    direct WY record where the plan fuses the WY representation into a recurrence the KCP does not run, and the
+    KCP-owned ``kcp_fwd_o`` / ``kcp_dav`` on their grids; the two backward modes launch the same records on the same
+    grids; the intra record that computes the layout itself gets the arena's scratch table set (and the workspace
+    bytes count it) while every other program reads the context's tables."""
+    part = _small_partition(2)
+    ctx = kp.build_kcp_context(part, None, 0, "cpu", 4, sm_count=sm)
+    assert ctx.T_r > 0
+    plan = cake_backend.plan(ctx.T_r, ctx.n_frag, H, sm, arch)
+    tb = cake_kcp._Tables(ctx, H, fused_walks=1)
+    launches: list[tuple[str, str, tuple[int, int, int], dict]] = []
+
+    class Arena:  # the arena's surface used by begin_call / stage: the plan, the layout views, the launcher
+        def __init__(self, fwd_layout: str = cake_kcp.LOCAL_LAYOUT_FWD) -> None:
+            self.plan = plan
+            self.device = torch.device("cpu")
+            self.device_index = 0
+            self.arch = arch
+            self.launcher = self._launch
+            self.fwd_layout = fwd_layout
+            self._views: dict = {}
+
+        def views(self, mode: str):
+            ns = self._views.get(mode)
+            if ns is None:
+                ns = types.SimpleNamespace()
+                for r in plan.layout(mode):
+                    small = (
+                        torch.zeros(2, cake_kcp.D)
+                        if r.name in ("h", "dh")
+                        else torch.zeros(1)
+                    )
+                    setattr(ns, r.name, small)
+                self._views[mode] = ns
+            return ns
+
+        def _launch(self, record, values, *, grid, device_index) -> None:
+            launches.append(("backend", record, grid, dict(values)))
+
+    class Provider:
+        def run_record(self, record, values, *, grid, device_index) -> None:
+            launches.append(("kcp", record, grid, dict(values)))
+
+    arena = Arena()
+    backend = cake_kcp.KernelBackend(programs=Provider())
+
+    def call_for(backward: bool, *, ops, out=None, grads=None, local=arena):
+        return types.SimpleNamespace(
+            local=local,
+            ctx=ctx,
+            tb=tb,
+            T_r=int(ctx.T_r),
+            H=H,
+            backward=backward,
+            host_trim=1,
+            ops=ops,
+            scale=0.5,
+            scratch={},
+            local_values=None,
+            out=out,
+            grads=grads,
+            device=torch.device("cpu"),
+            opts=cake_kcp._options({"spec3_probe": "off"}),
+        )
+
+    def run(call, stages) -> list:
+        backend.begin_call(call)
+        for name, extra in stages:
+            backend.stage(name, call, **extra)
+        done = list(launches)
+        launches.clear()
+        return done
+
+    ops = {n: torch.zeros(1) for n in ("q", "k", "v", "g", "beta")}
+    fwd_call = call_for(False, ops=ops, out=torch.zeros(1))
+    fwd = run(fwd_call, (("fwd_intra", {}), ("wy_fwd", {}), ("fwd_o", {})))
+    bwd_ops = {**ops, "dout": torch.zeros(1)}
+    grads = {n: torch.zeros(1) for n in ("dq", "dk", "dv", "dg", "dbeta")}
+    saved = types.SimpleNamespace(S_in=torch.zeros(1), c1_recv=None, M_seg=None)
+    bwd_stages = (
+        ("fwd_intra", {}),
+        ("wy", {}),
+        ("dav", {}),
+        ("dqkg", {}),
+        ("glm_intra", {}),
+        ("gate_epilogue", {}),
+    )
+    bwd = run(
+        call_for(True, ops=bwd_ops, grads=grads),
+        (("bwd_prep", {"saved": saved}), *bwd_stages),
+    )
+    replay = run(
+        call_for(True, ops=bwd_ops, grads=grads),
+        (("bwd_prep", {"saved": None}), *bwd_stages),
+    )
+    # the two backward modes: the same records on the same grids
+    assert [(k, r, g) for k, r, g, _ in replay] == [(k, r, g) for k, r, g, _ in bwd]
+    # a forward-only arena (the KCP forward layout): the same records on the same grids, every logical name bound
+    # by that layout's views (no segment state blocks), the internal Akk rows its own
+    lean = Arena(cake_kcp.LOCAL_LAYOUT_FWD_ONLY)
+    fwd_lean = run(
+        call_for(False, ops=ops, out=torch.zeros(1), local=lean),
+        (("fwd_intra", {}), ("wy_fwd", {}), ("fwd_o", {})),
+    )
+    assert [(k, r, g) for k, r, g, _ in fwd_lean] == [(k, r, g) for k, r, g, _ in fwd]
+    lean_views = lean.views(cake_kcp.LOCAL_LAYOUT_FWD_ONLY)
+    assert set(vars(lean_views)) == FWD_KCP_BUFFERS
+    for kind, record, _grid, values in fwd_lean:
+        logical = set(
+            (cake_jit if kind == "backend" else cake_kcp_jit)
+            .MODULES[record]["logical"]
+            .values()
+        )
+        assert not logical - set(values), (record, sorted(logical - set(values)))
+        assert not {"seg_b", "seg_m", "hseg", "seg_state"} & set(values), record
+        for name in logical & FWD_KCP_BUFFERS:
+            assert values[name] is getattr(lean_views, name), (record, name)
+    assert fwd_lean[0][3]["aqk_ext"] is fwd_lean[0][3]["akk_ext"] is lean_views.akk_int
+    # spec3_probe="off": the saved-mode backward ran no probe and left it pending for a later call
+    assert backend._spec3_pending and backend.spec3 is None
+    # every launched record of the existing backend's registry finds its logical names in the value dict
+    for kind, record, _grid, values in fwd + bwd:
+        if kind == "backend":
+            missing = set(cake_jit.MODULES[record]["logical"].values()) - set(values)
+            assert not missing, (record, sorted(missing))
+    # the records of record and their paths
+    f, b = cake_kcp.LOCAL_PATH_FWD, cake_kcp.LOCAL_PATH_BWD
+
+    def expect(stage: str, path: str) -> str:
+        if stage in cake_kcp.WY_DIRECT_RECORDS and not plan.dispatched(stage, path):
+            return cake_kcp.WY_DIRECT_RECORDS[stage]
+        return plan.record(stage, path)
+
+    assert [r for _, r, _, _ in fwd] == [
+        expect("fwd_intra", f),
+        expect("wy_fwd", f),
+        "kcp_fwd_o",
+    ]
+    assert [r for _, r, _, _ in bwd] == [
+        expect("bwd_prep", b),
+        expect("fwd_intra", b),
+        expect("wy", b),
+        "kcp_dav",
+        expect("dqkg", b),
+        expect("glm_intra", b),
+        # the gate epilogue launches only where the plan's GLM intra program does not fuse it (sm_100a: glm_intra;
+        # sm_103a runs glm_intra_v14 and sm_107a glm_intra_v18, and the stage call launches nothing)
+        *([expect("gate_epilogue", b)] if plan.dispatched("gate_epilogue", b) else []),
+    ]
+    assert plan.dispatched("gate_epilogue", b) == (arch == "sm_100a")
+    assert expect("glm_intra", b) == {
+        "sm_103a": "glm_intra_v14",
+        "sm_107a": "glm_intra_v18",
+    }.get(arch, "glm_intra")
+    if (
+        H == 64 and arch != "sm_107a"
+    ):  # the plan fuses the WY representation into its recurrences there
+        assert (
+            not plan.dispatched("wy_fwd", f)
+            and [r for _, r, _, _ in fwd][1] == "wy_fwd"
+        )
+    # the write switches (no token-row copies on this route: the saved set carries none), the scratch tables and
+    # the grids
+    intra, bintra = fwd[0][3], bwd[1][3]
+    assert (intra["write_ext"], intra["write_int"], intra["write_prep"]) == (0, 1, 1)
+    assert (bintra["write_ext"], bintra["write_int"], bintra["write_prep"]) == (0, 1, 0)
+    assert (
+        intra["aqk_ext"]
+        is intra["akk_ext"]
+        is arena.views(cake_kcp.LOCAL_LAYOUT_FWD).akk_int
+    )
+    assert (
+        bintra["aqk_ext"]
+        is bintra["akk_ext"]
+        is arena.views(cake_kcp.LOCAL_LAYOUT_BWD).akk_int
+    )
+    assert "Aqk" not in fwd_call.scratch and "Akk" not in fwd_call.scratch
+    if kp.intra_writes_tables(plan):
+        scratch = getattr(arena, cake_kcp.SCRATCH_TABLES_ATTR)
+        assert intra["seg_table"] is scratch["seg_table"]
+        assert intra["chunk_bos"] is scratch["chunk_bos"]
+        assert intra["cu_seqlens"] is ctx.cu_seqlens_local
+        assert kp.local_scratch_table_bytes(plan) == plan.table_words() * 4 > 0
+    else:
+        assert "seg_table" not in intra and "cu_seqlens" not in intra
+        assert kp.local_scratch_table_bytes(plan) == 0
+    assert (
+        fwd[1][3]["chunk_bos"] is ctx.tables["chunk_bos"]
+    )  # the WY program reads the context's tables
+    assert fwd[2][2] == (max(1, min(plan.NC_pad * H, sm)), 1, 1)
+    assert bwd[3][2] == (plan.NC_pad // 2, H, 1)
+    for kind, record, grid, _values in fwd + bwd:
+        if kind == "backend":
+            stage = cake_jit.MODULES[record]["stage"]
+            path = f if record in [r for _, r, _, _ in fwd] else b
+            if plan.dispatched(stage, path):
+                assert grid == plan.grid(stage, path)
+            else:
+                assert grid == cake_jit.launch_grid(
+                    record,
+                    num_chunks_pad=plan.NC_pad,
+                    num_seqs=plan.N,
+                    num_heads=H,
+                    sm_count=sm,
+                )
+    # the workspace prediction counts the scratch set
+    scratch_bytes = (
+        cake_backend.tables_bytes(ctx.T_r, ctx.n_frag, H, sm_count=sm)
+        if kp.intra_writes_tables(plan)
+        else 0
+    )
+    assert kp.kcp_workspace_bytes(ctx, H=H) == (
+        cake_backend.workspace_bytes(
+            ctx.T_r, ctx.n_frag, H, backward=True, save_mode="light", sm_count=sm
+        )
+        + scratch_bytes
+        + kp.kcp_arena_layout(ctx, H=H)["arena"]
+    )
+    # the KCP-owned records (the registry's kcp_fwd_o / kcp_dav) find their logical names too
+    for kind, record, _grid, values in fwd + bwd:
+        if kind == "kcp":
+            missing = set(cake_kcp_jit.MODULES[record]["logical"].values()) - set(
+                values
+            )
+            assert not missing, (record, sorted(missing))
+
+
+def test_gpu_host_trim_fresh_context_per_call_releases_everything(device) -> None:
+    """Template-cache ownership (KDA module, one rank): a training loop that builds a NEW context and
+    workspace per step must not grow device memory -- after each step's objects are dropped the workspace, its
+    local arena and the context are collected (weak references die) and ``torch.cuda.memory_allocated`` returns to
+    the level after the first step; the fresh-context results are bitwise the first step's (same kernels, same
+    argument order)."""
+    backend = cake_kcp.get_backend()
+    dt = backend.dtypes
+    H = 2
+    cu = torch.tensor([0, 300, 1024, 1500], dtype=torch.int64)
+    part = kp.kcp_partition(cu, 1)
+    T = int(kp.build_kcp_context(part, None, 0, device).T_r)
+    gen = torch.Generator(device=device).manual_seed(0x3837)
+
+    def randn(*shape):
+        return torch.randn(*shape, device=device, generator=gen, dtype=torch.float32)
+
+    def unit(
+        x,
+    ):  # the delta rule's operand contract (cake_kda_kcp_inputs): q / k L2-normalized per head
+        return x * torch.rsqrt((x * x).sum(-1, keepdim=True) + 1e-6)
+
+    q = unit(randn(T, H, cake_kcp.D)).to(dt["q"])
+    k = unit(randn(T, H, cake_kcp.D)).to(dt["k"])
+    v = (0.5 * randn(T, H, cake_kcp.D)).to(dt["v"])
+    g = (-5.0 * torch.sigmoid(randn(T, H, cake_kcp.D))).to(dt["g"])
+    beta = torch.sigmoid(randn(T, H)).to(dt["beta"])
+    dout = (0.5 * randn(T, H, cake_kcp.D)).to(dt["dout"])
+
+    def step():
+        ctx = kp.build_kcp_context(part, None, 0, device)
+        ws = cake_kcp.KcpWorkspace(state_dtype=dt["state"], local=backend.local_stages)
+        out, saved = cake_kcp.chunk_kda_kcp_fwd(q, k, v, g, beta, ctx, workspace=ws)
+        grads = cake_kcp.chunk_kda_kcp_bwd(
+            q, k, v, g, beta, ctx, dout, saved=saved, workspace=ws
+        )
+        assert cake_kcp.LAST_CALL["bwd"]["host_trim"] == cake_kcp.HOST_TRIM_DEFAULT
+        refs = [weakref.ref(ws), weakref.ref(ctx)] + (
+            [weakref.ref(ws.local)] if ws.local is not None else []
+        )
+        return tuple(x.detach().clone() for x in (out, *grads)), refs
+
+    cake_kcp.graph_cache_clear()
+    first, refs = step()
+    assert all(torch.isfinite(x.float()).all().item() for x in first)
+    gc.collect()
+    torch.cuda.synchronize(device)
+    assert all(r() is None for r in refs), (
+        "the first step's workspace / arena / context are retained"
+    )
+    base = torch.cuda.memory_allocated(device)
+    for i in range(3):
+        res, refs = step()
+        assert all(torch.equal(a, b) for a, b in zip(first, res, strict=True)), i
+        del res
+        gc.collect()
+        torch.cuda.synchronize(device)
+        assert all(r() is None for r in refs), (
+            i,
+            "a fresh context's workspace / arena / context is retained",
+        )
+        now = torch.cuda.memory_allocated(device)
+        assert now == base, (i, now - base)
+
+
+def test_gpu_workspace_upgrade_releases_superseded_storage_first(device) -> None:
+    """A backward ``ensure`` on a forward workspace releases the forward-only local arena and every pool it outgrows
+    before allocating their successors: the old and the new storage never coexist, so the upgrade's allocation
+    high-water equals its final growth.  A pool growth alone (the shared c1 / b1 send storage outgrown, no arena
+    change, a cached view of the old storage present) frees the old storage and peaks at exactly its final allocation.
+    Rows: the contiguous and the per-document zigzag partitions at W = 2 / 4, every rank with tokens, H = 4 / 64.  (The
+    weakref checks are leak checks; the high-water assertions are the ones a late release fails.)"""
+    seen = pooled = 0
+    for W, lengths, layout in (
+        (2, (3000,), "contiguous"),
+        (4, (700, 1, 1300, 999), "zigzag_per_document"),
+    ):
+        part = _small_partition(W, lengths=lengths, layout=layout)
+        for r in range(W):
+            ctx = kp.build_kcp_context(part, None, r, device)
+            if ctx.T_r == 0:
+                continue
+            for H in (4, 64):
+                ws = cake_kcp.KcpWorkspace()
+                ws.ensure(ctx, H, backward=False)
+                fwd_arena = weakref.ref(ws.local)
+                torch.cuda.synchronize(device)
+                base = torch.cuda.memory_allocated(device)
+                torch.cuda.reset_peak_memory_stats(device)
+                ws.ensure(ctx, H, backward=True)
+                torch.cuda.synchronize(device)
+                grown = torch.cuda.memory_allocated(device) - base
+                peak = torch.cuda.max_memory_allocated(device) - base
+                assert ws.local.backward and fwd_arena() is None, (W, layout, r, H)
+                assert grown > 0 and peak <= grown + (1 << 20), (
+                    W,
+                    layout,
+                    r,
+                    H,
+                    peak,
+                    grown,
+                )
+                seen += 1
+                n = ws._pools["b1_send"].numel()
+                if n > 0:
+                    ws.pool(
+                        "c1_send", n, cached=True
+                    )  # a cached view of the old storage
+                    old = weakref.ref(ws._pools["b1_send"])
+                    torch.cuda.synchronize(device)
+                    torch.cuda.reset_peak_memory_stats(device)
+                    assert ws._grow("b1_send", 2 * n, ws.device)
+                    torch.cuda.synchronize(device)
+                    assert ws._pools["c1_send"] is ws._pools["b1_send"]
+                    assert old() is None and not ws._slices, (W, layout, r, H)
+                    now = torch.cuda.memory_allocated(device)
+                    assert torch.cuda.max_memory_allocated(device) == now, (
+                        W,
+                        layout,
+                        r,
+                        H,
+                        torch.cuda.max_memory_allocated(device) - now,
+                    )
+                    pooled += 1
+                del ws
+    assert seen > 0 and pooled > 0, (seen, pooled)
+
+
+@pytest.mark.parametrize("graph", ["off", "replay"])
+def test_gpu_first_training_step_releases_the_forward_arena(device, graph) -> None:
+    """First training step on an empty workspace (KDA module, one rank): the forward sizes the workspace for the
+    forward only and the backward upgrades it.  Under both ``graph`` settings the first step's allocation high-water
+    is no higher than the second step's (the retained workspace plus the step's own peak; both steps run eagerly, as
+    no key of the second step was seen before), and the forward-only local arena is collected by the end of the step
+    (under ``"replay"`` the upgrade drops the cache entries that pin it, the upgrading call's own entry included).
+    Both steps run the shipped defaults, so the SPEC-3 probe stays off (when requested it runs once per backend, on
+    the first saved-mode backward, and adds its row copies to that backward's peak)."""
+    backend = cake_kcp.get_backend()
+    dt = backend.dtypes
+    H = 2
+    cu = torch.tensor([0, 300, 1024, 1500], dtype=torch.int64)
+    part = kp.kcp_partition(cu, 1)
+    ctx = kp.build_kcp_context(part, None, 0, device)
+    T = int(ctx.T_r)
+    gen = torch.Generator(device=device).manual_seed(0x3837)
+
+    def randn(*shape):
+        return torch.randn(*shape, device=device, generator=gen, dtype=torch.float32)
+
+    def unit(x):  # the delta rule's operand contract: q / k L2-normalized per head
+        return x * torch.rsqrt((x * x).sum(-1, keepdim=True) + 1e-6)
+
+    q = unit(randn(T, H, cake_kcp.D)).to(dt["q"])
+    k = unit(randn(T, H, cake_kcp.D)).to(dt["k"])
+    v = (0.5 * randn(T, H, cake_kcp.D)).to(dt["v"])
+    g = (-5.0 * torch.sigmoid(randn(T, H, cake_kcp.D))).to(dt["g"])
+    beta = torch.sigmoid(randn(T, H)).to(dt["beta"])
+    dout = (0.5 * randn(T, H, cake_kcp.D)).to(dt["dout"])
+    ws = cake_kcp.KcpWorkspace(state_dtype=dt["state"], local=backend.local_stages)
+
+    def step() -> tuple:
+        out, saved = cake_kcp.chunk_kda_kcp_fwd(
+            q, k, v, g, beta, ctx, workspace=ws, graph=graph
+        )
+        arena = weakref.ref(ws.local) if ws.local is not None else None
+        grads = cake_kcp.chunk_kda_kcp_bwd(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            ctx,
+            dout,
+            saved=saved,
+            workspace=ws,
+            graph=graph,
+        )
+        assert cake_kcp.LAST_CALL["bwd"].get("spec3") is None, (
+            "the default backward ran the SPEC-3 probe"
+        )
+        return tuple(x.detach().clone() for x in (out, *grads)), arena
+
+    cake_kcp.graph_cache_clear()
+    gc.collect()
+    torch.cuda.synchronize(device)
+    try:
+        base0 = torch.cuda.memory_allocated(device)
+        torch.cuda.reset_peak_memory_stats(device)
+        first, fwd_arena = step()
+        torch.cuda.synchronize(device)
+        hw_first = torch.cuda.max_memory_allocated(device) - base0
+        assert all(torch.isfinite(x.float()).all().item() for x in first)
+        gc.collect()
+        assert fwd_arena is not None and fwd_arena() is None, (
+            graph,
+            "the forward-only arena outlives the first step",
+        )
+        assert ws.local is not None and ws.local.backward
+        del first
+        gc.collect()
+        torch.cuda.synchronize(device)
+        torch.cuda.reset_peak_memory_stats(device)
+        eager = cake_kcp.GRAPH_STATS["eager"]
+        second, _ = step()
+        torch.cuda.synchronize(device)
+        hw_second = torch.cuda.max_memory_allocated(device) - base0
+        if graph != "off":
+            assert cake_kcp.GRAPH_STATS["eager"] == eager + 2, (
+                "the second step did not run eagerly"
+            )
+        assert hw_first <= hw_second + (1 << 20), (graph, hw_first, hw_second)
+        del second
+    finally:  # the cached entries pin ws / ctx: never leak them into later tests
+        cake_kcp.graph_cache_clear()
+
+
+def _unit_operands(device, T: int, H: int, seed: int = 0x3837) -> dict:
+    """Seeded operands of the delta rule's contract (harness kcp_inputs: q / k L2-normalized per head, natural-log
+    decay in (-5, 0)) and a ``dout``, in the backend's dtypes."""
+    dt = cake_kcp.get_backend().dtypes
+    gen = torch.Generator(device=device).manual_seed(seed)
+
+    def randn(*shape):
+        return torch.randn(*shape, device=device, generator=gen, dtype=torch.float32)
+
+    def unit(x):
+        return x * torch.rsqrt((x * x).sum(-1, keepdim=True) + 1e-6)
+
+    D = cake_kcp.D
+    return {
+        "q": unit(randn(T, H, D)).to(dt["q"]),
+        "k": unit(randn(T, H, D)).to(dt["k"]),
+        "v": (0.5 * randn(T, H, D)).to(dt["v"]),
+        "g": (-5.0 * torch.sigmoid(randn(T, H, D))).to(dt["g"]),
+        "beta": torch.sigmoid(randn(T, H)).to(dt["beta"]),
+        "dout": (0.5 * randn(T, H, D)).to(dt["dout"]),
+    }
+
+
+# (document lengths, H) of one rank: one document of 23 chunks (P > 1 on every exported device, a segment cut after
+# every chunk), two documents of 16 and 10 chunks (P > 1) and five documents with boundaries inside chunks, of 1 /
+# 10 / 2 / 16 / 3 chunks, at 64 heads (P = 1); the documents of the last row start on internal chunks 0, 1, 11, 13
+# and 29, so chunk pairs of the pair-shaped programs straddle documents there
+FWD_ONLY_ROWS = (
+    ((1450,), 2),
+    ((1000, 577), 4),
+    ((50, 640, 77, 1000, 129), 64),
+)
+
+
+def test_gpu_forward_only_layout_is_bitwise_and_lean(device) -> None:
+    """The forward-only workspace (KDA module, one rank, the rows of ``FWD_ONLY_ROWS``: P = 1 and P > 1).  A saving
+    forward on an empty workspace runs on the KCP forward layout (2432 B per internal token-head), allocates none of
+    the lazy pools and holds exactly ``kcp_workspace_bytes(..., backward=False)``; its high-water is its end state
+    (the workspace, the output and the saved set: no transient above it).  Its ``out`` and saved set are bitwise
+    those of the forward on a backward workspace (the existing backend's ``fwd`` views), also with the arena filled
+    with NaN before the call (on either layout: no result depends on an arena byte the call did not write, the
+    output program's reads of the pad chunks' ``h`` entries included).  The backward on it releases the forward-only
+    arena, allocates the backward one (the backward workspace's bytes) and gives bitwise the backward workspace's
+    gradients; the first training step on an empty workspace peaks no higher than a later step.  A forward without a
+    saved set allocates the lazy pools at their size (the second prediction state, ``kcp_arena_layout(...)["lazy"]``
+    more) with the same ``out``.  With ``save_transfer=False`` a saving forward also allocates the transfer pools
+    (``kcp_workspace_bytes(..., backward=False, save_transfer=False)``) with the same ``out`` and ``S_in``, and a
+    forward without a saved set then reaches the same second state.  ``workspace=None`` (every forward on a
+    forward-only arena of its own) gives bitwise the same results, explicitly and through autograd."""
+    backend = cake_kcp.get_backend()
+    assert backend.local_stages
+    dt = backend.dtypes
+    seen_p1 = seen_pn = 0
+
+    def new_ws():
+        return cake_kcp.KcpWorkspace(state_dtype=dt["state"], local=True)
+
+    def same(a, b) -> bool:
+        return len(a) == len(b) and all(
+            torch.equal(x, y) for x, y in zip(a, b, strict=True)
+        )
+
+    for lengths, H in FWD_ONLY_ROWS:
+        part = _small_partition(1, lengths=lengths, layout="contiguous")
+        ctx = kp.build_kcp_context(part, None, 0, device)
+        P = ctx.heads(H).P
+        seen_p1 += P == 1
+        seen_pn += P > 1
+        x = _unit_operands(device, int(ctx.T_r), H)
+        q, k, v, g, beta, dout = (x[n] for n in ("q", "k", "v", "g", "beta", "dout"))
+        row = (lengths, H, P)
+
+        def fwd(ws, **kw):
+            return cake_kcp.chunk_kda_kcp_fwd(q, k, v, g, beta, ctx, workspace=ws, **kw)
+
+        def bwd(ws, saved):
+            return cake_kcp.chunk_kda_kcp_bwd(
+                q, k, v, g, beta, ctx, dout, saved=saved, workspace=ws
+            )
+
+        # the reference: a backward workspace (the forward on the existing backend's fwd views of its arena)
+        ws_b = new_ws()
+        ws_b.ensure(ctx, H, device=device, backward=True)
+        out_b, saved_b = fwd(ws_b)
+        grads_b = bwd(ws_b, saved_b)
+        assert ws_b.local.backward and ws_b.local.fwd_layout == "fwd", row
+        assert ws_b.bytes == kp.kcp_workspace_bytes(ctx, H=H), row
+        assert all(torch.isfinite(t.float()).all().item() for t in (out_b, *grads_b))
+        # the forward-only workspace: layout, lazy pools, bytes, high-water, bitwise out / saved set
+        ws_f = new_ws()
+        gc.collect()
+        torch.cuda.synchronize(device)
+        base = torch.cuda.memory_allocated(device)
+        torch.cuda.reset_peak_memory_stats(device)
+        out_f, saved_f = fwd(ws_f)
+        torch.cuda.synchronize(device)
+        hw_fwd = torch.cuda.max_memory_allocated(device) - base
+        end_fwd = torch.cuda.memory_allocated(device) - base
+        local = ws_f.local
+        assert not local.backward and local.fwd_layout == "fwd_kcp", row
+        assert local.bytes == 2432 * local.plan.R * H, row
+        assert not any(ws_f.has(n) for n in kp.FWD_LAZY_POOLS), row
+        pred_f = kp.kcp_workspace_bytes(ctx, H=H, backward=False)
+        assert ws_f.bytes == pred_f, (row, ws_f.bytes, pred_f)
+        # no transient above the end state (the workspace, out and the saved set alive): both are allocator block
+        # sizes, so the caching allocator's rounding cancels.  The window frees nothing allocated before it: each row
+        # deletes its tensors at its end (else rebinding out_f / saved_f here frees the previous row's out + saved
+        # set inside the window, and hw_fwd - end_fwd reads their bytes, e.g. 6640640 B after ((1450,), 2))
+        assert hw_fwd <= end_fwd + (1 << 20), (row, hw_fwd, end_fwd)
+        assert torch.equal(out_f, out_b), row
+        assert saved_f.flags() == saved_b.flags(), row
+        assert same(written_tensors(saved_f), written_tensors(saved_b)), row
+        # the arena's content never reaches a result: a NaN arena (0xFF bytes: NaN in BF16 and FP32) on either layout
+        for ws in (ws_f, ws_b):
+            ws.local.arena.fill_(0xFF)
+            out_p, saved_p = fwd(ws)
+            assert torch.equal(out_p, out_b), (row, ws.local.fwd_layout)
+            assert same(written_tensors(saved_p), written_tensors(saved_b)), (
+                row,
+                ws.local.fwd_layout,
+            )
+        assert ws_f.local is local and not any(ws_f.has(n) for n in kp.FWD_LAZY_POOLS)
+        # the backward upgrades the workspace (the forward-only arena released first) with bitwise gradients
+        fwd_arena = weakref.ref(local)
+        del local
+        grads_f = bwd(ws_f, saved_f)
+        gc.collect()
+        assert fwd_arena() is None, row
+        assert ws_f.local.backward and ws_f.local.fwd_layout == "fwd", row
+        assert ws_f.bytes == ws_b.bytes, row
+        assert same(grads_f, grads_b), row
+        # a forward without a saved set: the lazy pools at their size, the second prediction state
+        ws_n = new_ws()
+        out_n, none = fwd(ws_n, save_for_backward=False)
+        assert none is None and torch.equal(out_n, out_b), row
+        tb = ws_n.tables(ctx, H)
+        for n in kp.FWD_LAZY_POOLS:
+            assert (ws_n.pool(n).numel() if ws_n.has(n) else 0) == tb.sizes[n], (row, n)
+        lazy = kp.kcp_arena_layout(ctx, H=H, backward=False)["lazy"]
+        assert ws_n.bytes == pred_f + lazy, (row, ws_n.bytes, pred_f, lazy)
+        assert (lazy > 0) == (P > 1), (
+            row
+        )  # one rank: no c1 receive; the staging and carry planes at P > 1
+        del ws_n, out_n
+        # a saving forward without save_transfer reads the transfer pools (that option's first state); a forward
+        # without a saved set then adds the carry plane, the same second state
+        ws_t = new_ws()
+        out_t, saved_t = fwd(ws_t, save_transfer=False)
+        assert torch.equal(out_t, out_b) and not ws_t.has("carry"), row
+        for n, a, b in (
+            ("S_in", saved_t.S_in, saved_b.S_in),
+            ("carry", written_carry(saved_t), written_carry(saved_b)),
+        ):
+            assert (a is None) == (b is None) and (a is None or torch.equal(a, b)), (
+                row,
+                n,
+            )
+        pred_t = kp.kcp_workspace_bytes(ctx, H=H, backward=False, save_transfer=False)
+        assert ws_t.bytes == pred_t, (row, ws_t.bytes, pred_t)
+        out_t, _ = fwd(ws_t, save_for_backward=False)
+        lay_t = kp.kcp_arena_layout(ctx, H=H, backward=False, save_transfer=False)
+        assert torch.equal(out_t, out_b), row
+        assert ws_t.bytes == pred_t + lay_t["lazy"] == pred_f + lazy, row
+        del ws_t, out_t, saved_t
+        # workspace=None: every forward on a forward-only arena of its own, explicitly and through autograd
+        out_0, saved_0 = fwd(None)
+        assert torch.equal(out_0, out_b)
+        assert same(written_tensors(saved_0), written_tensors(saved_b)), row
+        assert same(bwd(None, saved_0), grads_b), row
+        leaves = [t.detach().clone().requires_grad_(True) for t in (q, k, v, g, beta)]
+        out_a = cake_kcp.chunk_kda_kcp(*leaves, ctx)
+        out_a.backward(dout)
+        dq, dk, dv, dbeta, dg = grads_b
+        assert torch.equal(out_a.detach(), out_b), row
+        assert same([t.grad for t in leaves], [dq, dk, dv, dg, dbeta]), row
+        del out_0, saved_0, leaves, out_a
+        # the first training step on an empty workspace peaks no higher than a later step
+        ws_s = new_ws()
+        gc.collect()
+        torch.cuda.synchronize(device)
+        base0 = torch.cuda.memory_allocated(device)
+        torch.cuda.reset_peak_memory_stats(device)
+        o1, s1 = fwd(ws_s)
+        g1 = bwd(ws_s, s1)
+        torch.cuda.synchronize(device)
+        hw_first = torch.cuda.max_memory_allocated(device) - base0
+        assert torch.equal(o1, out_b) and same(g1, grads_b), row
+        del o1, s1, g1
+        gc.collect()
+        torch.cuda.synchronize(device)
+        torch.cuda.reset_peak_memory_stats(device)
+        o2, s2 = fwd(ws_s)
+        g2 = bwd(ws_s, s2)
+        torch.cuda.synchronize(device)
+        hw_second = torch.cuda.max_memory_allocated(device) - base0
+        assert torch.equal(o2, out_b) and same(g2, grads_b), row
+        assert hw_first <= hw_second + (1 << 20), (row, hw_first, hw_second)
+        # every tensor of the row: the next row's forward window must free nothing (see hw_fwd above)
+        del o2, s2, g2, ws_s, ws_f, ws_b, ws, out_b, saved_b, grads_b, out_f, saved_f
+        del grads_f, out_p, saved_p, tb, a, b, dq, dk, dv, dbeta, dg
+    assert seen_p1 > 0 and seen_pn > 0, (seen_p1, seen_pn)
+
+
+def test_gpu_graph_replay_on_the_forward_only_layout_then_backward(device) -> None:
+    """``graph="replay"`` on a forward-only workspace (KDA module, one rank, P > 1): the forward's key is captured on
+    the KCP forward layout and replayed (eager calls, one capture, replays; no lazy pool allocated), bitwise the eager
+    forward; the backward from the replayed forward's saved set then upgrades the workspace -- the upgrade drops the
+    cache entries that pin the forward-only arena, which is collected -- with bitwise gradients, and the later steps
+    on the upgraded workspace capture and replay bitwise."""
+    backend = cake_kcp.get_backend()
+    assert backend.local_stages
+    dt = backend.dtypes
+    H = 2
+    part = _small_partition(1, lengths=(1450,), layout="contiguous")
+    ctx = kp.build_kcp_context(part, None, 0, device)
+    assert ctx.heads(H).P > 1
+    x = _unit_operands(device, int(ctx.T_r), H)
+    q, k, v, g, beta, dout = (x[n] for n in ("q", "k", "v", "g", "beta", "dout"))
+
+    def new_ws():
+        return cake_kcp.KcpWorkspace(state_dtype=dt["state"], local=True)
+
+    def same(a, b) -> bool:
+        return len(a) == len(b) and all(
+            torch.equal(x, y) for x, y in zip(a, b, strict=True)
+        )
+
+    ws_r = new_ws()  # the eager reference
+    out_r, saved_r = cake_kcp.chunk_kda_kcp_fwd(q, k, v, g, beta, ctx, workspace=ws_r)
+    grads_r = cake_kcp.chunk_kda_kcp_bwd(
+        q, k, v, g, beta, ctx, dout, saved=saved_r, workspace=ws_r
+    )
+    ws = new_ws()
+    cake_kcp.graph_cache_clear()
+    try:
+        events = []
+        for _ in range(4):
+            out, saved = cake_kcp.chunk_kda_kcp_fwd(
+                q, k, v, g, beta, ctx, workspace=ws, graph="replay"
+            )
+            events.append(cake_kcp.LAST_CALL["fwd"]["graph_event"])
+            assert torch.equal(out, out_r)
+            assert same(written_tensors(saved), written_tensors(saved_r))
+            assert not ws.local.backward and ws.local.fwd_layout == "fwd_kcp"
+            assert not any(ws.has(n) for n in kp.FWD_LAZY_POOLS)
+        cap = events.index("capture") if "capture" in events else -1
+        assert cap in (1, 2), events
+        assert events == ["eager"] * cap + ["capture"] + ["replay"] * (3 - cap), events
+        fwd_arena = weakref.ref(ws.local)
+        grads = cake_kcp.chunk_kda_kcp_bwd(
+            q, k, v, g, beta, ctx, dout, saved=saved, workspace=ws, graph="replay"
+        )
+        assert same(grads, grads_r)
+        assert ws.local.backward and ws.local.fwd_layout == "fwd"
+        del out, saved, grads
+        gc.collect()
+        assert fwd_arena() is None, "a cached graph keeps the forward-only arena alive"
+        events = []
+        for _ in range(4):
+            out, saved = cake_kcp.chunk_kda_kcp_fwd(
+                q, k, v, g, beta, ctx, workspace=ws, graph="replay"
+            )
+            grads = cake_kcp.chunk_kda_kcp_bwd(
+                q, k, v, g, beta, ctx, dout, saved=saved, workspace=ws, graph="replay"
+            )
+            events.append(
+                (
+                    cake_kcp.LAST_CALL["fwd"]["graph_event"],
+                    cake_kcp.LAST_CALL["bwd"]["graph_event"],
+                )
+            )
+            assert torch.equal(out, out_r) and same(grads, grads_r), events
+        assert [e[0] for e in events] == ["eager", "capture", "replay", "replay"], (
+            events
+        )
+        assert events[-1][1] == "replay" and "capture" in [e[1] for e in events], events
+    finally:  # the cached entries pin ws / ctx: never leak them into later tests
+        cake_kcp.graph_cache_clear()
+
+
+def test_gpu_graph_replay_after_a_forward_without_a_saved_set(device) -> None:
+    """``graph="replay"`` on a forward-only workspace whose lazy pools a forward without a saved set allocates (KDA
+    module, one rank, P > 1): the saving forwards capture and replay first (no lazy pool); the first forward without
+    a saved set allocates the lazy pools and drops the captured saving forward's entry (its key holds the pools as
+    they were, so no later call matches it, and its graph would keep its memory); those forwards then run eagerly
+    twice (the key before and after the allocation), capture once and replay, bitwise the eager ``out``; the saving
+    forwards after them capture again and replay bitwise."""
+    backend = cake_kcp.get_backend()
+    assert backend.local_stages
+    dt = backend.dtypes
+    H = 2
+    part = _small_partition(1, lengths=(1450,), layout="contiguous")
+    ctx = kp.build_kcp_context(part, None, 0, device)
+    assert ctx.heads(H).P > 1
+    x = _unit_operands(device, int(ctx.T_r), H)
+    q, k, v, g, beta = (x[n] for n in ("q", "k", "v", "g", "beta"))
+
+    def new_ws():
+        return cake_kcp.KcpWorkspace(state_dtype=dt["state"], local=True)
+
+    def fwd(ws, **kw):
+        return cake_kcp.chunk_kda_kcp_fwd(q, k, v, g, beta, ctx, workspace=ws, **kw)
+
+    out_r, saved_r = fwd(new_ws())  # the eager reference
+    ws = new_ws()
+
+    def captured() -> int:  # the cached graphs that pin ws
+        return sum(
+            e.graph is not None and any(p is ws for p in e.pins)
+            for e in cake_kcp._GRAPHS.values()
+        )
+
+    def run(save: bool, n: int) -> list[str]:
+        events = []
+        for _ in range(n):
+            out, saved = fwd(ws, save_for_backward=save, graph="replay")
+            events.append(cake_kcp.LAST_CALL["fwd"]["graph_event"])
+            assert torch.equal(out, out_r), events
+            if save:
+                assert all(
+                    torch.equal(a, b)
+                    for a, b in zip(
+                        written_tensors(saved), written_tensors(saved_r), strict=True
+                    )
+                ), events
+            else:
+                assert saved is None, events
+        return events
+
+    cake_kcp.graph_cache_clear()
+    try:
+        events = run(True, 4)
+        assert events.count("capture") == 1 and events[-1] == "replay", events
+        assert captured() == 1 and not any(ws.has(n) for n in kp.FWD_LAZY_POOLS)
+        events = run(False, 4)
+        assert events == ["eager", "eager", "capture", "replay"], events
+        assert all(ws.has(n) for n in kp.FWD_LAZY_POOLS)
+        assert captured() == 1, (
+            "the captured saving forward's unreachable entry stays cached"
+        )
+        events = run(True, 3)
+        assert events == ["eager", "capture", "replay"], events
+        assert captured() == 2
+    finally:  # the cached entries pin ws / ctx: never leak them into later tests
+        cake_kcp.graph_cache_clear()

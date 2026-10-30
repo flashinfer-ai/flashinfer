@@ -154,6 +154,31 @@ def fp32_to_fp8_pack(values, *, dtype: Type[cutlass.Numeric]):
     return cutlass.Vector.from_elements((u0, u1, u2, u3), cutlass.Int32)
 
 
+@cute.jit
+def bf16_words_to_e4m3_words(w0: cutlass.Int32, w1: cutlass.Int32, w2: cutlass.Int32, w3: cutlass.Int32):
+    """The e4m3 rounding OF A PACKED bf16 ROW: four ``bf16x2`` words (8 elements, element ``2w`` in the low half of word ``w``) into two
+    ``e4m3x4`` words ``(u0, u1)`` -- ``u0`` holds elements 0..3 in byte order, ``u1`` elements 4..7.  Each bf16 is widened to fp32 EXACTLY
+    (a bit move: bf16 is the top half of an fp32) and rounded ONCE by ``cvt.rn.satfinite.e4m3x2.f32`` (round-to-nearest-even, saturating
+    at +-448, never a NaN from a finite value), so the result is bitwise ``bf16_row.to(torch.float8_e4m3fn)`` on the torch pinned here --
+    the convention of the indexer's e4m3 compressed-key cache (the serving stacks' ``x.to(bf16).to(e4m3)`` chain and the prefill form's
+    per-tensor cast of the bf16 rows): one rounding convention across every writer, so a cache primed by one writer and appended by
+    another is bitwise.  ``cvt...e4m3x2 d, a, b`` puts ``a`` in the UPPER byte, so the operands are ``(hi, lo)`` -- the order
+    :func:`fp32_to_fp8_pack` spells.  Needs sm_89+ (the fp8 ``cvt``); the callers decline older parts by name at compile time."""
+    return inline_ptx(
+        "{ .reg .b16 lo0, hi0, lo1, hi1, e0, e1; .reg .f32 f0, f1, f2, f3;\n"
+        "mov.b32 {lo0, hi0}, $2; mov.b32 f0, {0, lo0}; mov.b32 f1, {0, hi0};\n"
+        "mov.b32 {lo1, hi1}, $3; mov.b32 f2, {0, lo1}; mov.b32 f3, {0, hi1};\n"
+        "cvt.rn.satfinite.e4m3x2.f32 e0, f1, f0; cvt.rn.satfinite.e4m3x2.f32 e1, f3, f2;\n"
+        "mov.b32 $0, {e0, e1};\n"
+        "mov.b32 {lo0, hi0}, $4; mov.b32 f0, {0, lo0}; mov.b32 f1, {0, hi0};\n"
+        "mov.b32 {lo1, hi1}, $5; mov.b32 f2, {0, lo1}; mov.b32 f3, {0, hi1};\n"
+        "cvt.rn.satfinite.e4m3x2.f32 e0, f1, f0; cvt.rn.satfinite.e4m3x2.f32 e1, f3, f2;\n"
+        "mov.b32 $1, {e0, e1}; }",
+        write_only_types=[cutlass.Int32, cutlass.Int32],
+        read_only_args=[w0, w1, w2, w3],
+    )
+
+
 # ---------------------------------------------------------------------------
 # Rubin's FUSED descale-and-pack: cvt.rn.satfinite.scaled::n1::ue8m0.{e4m3,e5m2}x2.f32
 # (sm_107a only) -- the block-scale quantizers' FMUL-free pack.  Semantics MEASURED on
@@ -810,6 +835,46 @@ def lane_group_sum(value: cutlass.Float32, lanes: cutlass.Constexpr[int]) -> cut
 
 
 @cute.jit
+def rmsnorm_rstd(sum_sq_partial: cutlass.Float32, lanes: cutlass.Constexpr[int], d: cutlass.Constexpr[int], eps: cutlass.Float32) -> cutlass.Float32:
+    """RMSNorm reciprocal scale of one ``d``-element row spread over ``lanes``
+    consecutive lanes: ``rsqrt(sum(x^2) / d + eps)``.
+
+    ``sum_sq_partial`` is the calling lane's partial sum of squares over the elements it
+    holds; the group total comes from :func:`lane_group_sum`, so every lane of
+    the group returns the same value.  ``1 / d`` is a trace-time constant (one
+    multiply, never a divide) and the rsqrt is the fast-math MUFU form.  This is
+    the reduction the gated attention block's norm kernels compute; spell it
+    through this helper rather than inline.
+    """
+    return cute.math.rsqrt(lane_group_sum(sum_sq_partial, lanes) * cutlass.Float32(1.0 / d) + eps, fastmath=True)
+
+
+@cute.jit
+def rope_rotate_half(
+    y: cutlass.Float32, cos_v: cutlass.Float32, sin_v: cutlass.Float32, lane: cutlass.Int32, half_lanes: cutlass.Constexpr[int]
+) -> cutlass.Float32:
+    """NeoX ``rotate_half`` RoPE for ONE element of a lane-distributed row.
+
+    A row's leading ``ROPE_DIM`` elements sit on lanes ``[0, 2 * half_lanes)``
+    of their lane group, ``ELEMS`` per lane, so element ``e`` and its partner
+    ``e +- ROPE_DIM / 2`` are the SAME sub-index on lanes ``lane`` and
+    ``lane ^ half_lanes``: one butterfly shuffle fetches the partner, the sign is
+    ``-`` on the first half and ``+`` on the second, and the result is
+    ``y * cos + rotate_half(y) * sin`` with duplicated-half tables
+    (``cos[e] == cos[e + ROPE_DIM / 2]``).
+
+    ``shfl.sync`` with the full mask: EVERY lane of the warp must reach this
+    call, lanes outside the rope band included; the caller keeps the result on
+    the rope lanes only.  ``half_lanes`` must be a power of two so the butterfly
+    stays inside an aligned lane group, and ``lane`` is the index WITHIN the
+    group (``tidx % lanes``), not the hardware lane id.
+    """
+    partner = cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, y, cutlass.Int32(half_lanes), 31, kind=nvvm.Shfl.BFLY))
+    signed = -partner if lane < cutlass.Int32(half_lanes) else partner
+    return y * cos_v + signed * sin_v
+
+
+@cute.jit
 def l2norm_inv(sum_sq: cutlass.Float32) -> cutlass.Float32:
     """Inverse L2 norm, ``rsqrt(sum_sq + L2_NORM_EPS)``; a zero row normalizes to zero."""
     return cute.math.rsqrt(sum_sq + cutlass.Float32(L2_NORM_EPS), fastmath=True)
@@ -1243,3 +1308,24 @@ def atomic_max_f32_bits(slot: cute.Tensor, value: cutlass.Float32) -> None:
     them all.  Call it from ONE lane (lane 0 after :func:`warp_abs_max_f32_shfl` / :func:`warp_abs_max_f32`)."""
     ptr = Pointer(slot.iterator.raw_ptr(), dtype=cutlass.Int32)
     nvvm.atomicrmw(nvvm.AtomicOp.MAX, ptr, value.bitcast(cutlass.Int32))
+
+
+@cutlass.cute.jit
+def quad_reduce_max(val: cutlass.Float32) -> cutlass.Float32:
+    """The max over the FOUR lanes of a thread quad (lanes ``4 g .. 4 g + 3``: the lanes that share an ``m16n8`` C-fragment row), two
+    ``shfl.sync.bfly`` steps (offsets 2, 1) on the full warp mask -- every lane of the quad holds the result.  ``ftz`` max (FMNMX; the
+    operands are scores, a flushed sub-normal max changes no exp2).  The SM120 SDPA kernels carry the same two shuffles as
+    ``sm120/_common.nvvm_threadquad_reduction_max``; this is the arch-neutral home so an sm107 ``mma.sync`` kernel need not import an
+    sm120 module.  Call it from EVERY lane of the warp (``shfl.sync`` with the full mask)."""
+    val = cute.math.max(val, cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, val, 2, 0x1F, kind=nvvm.Shfl.BFLY)), ftz=True)
+    val = cute.math.max(val, cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, val, 1, 0x1F, kind=nvvm.Shfl.BFLY)), ftz=True)
+    return val
+
+
+@cutlass.cute.jit
+def quad_reduce_sum(val: cutlass.Float32) -> cutlass.Float32:
+    """The sum over the four lanes of a thread quad (see :func:`quad_reduce_max`): offsets 2 then 1, a FIXED order, so every lane of
+    the quad holds the bitwise-same sum and two launches agree bitwise.  Call it from every lane of the warp."""
+    val = val + cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, val, 2, 0x1F, kind=nvvm.Shfl.BFLY))
+    val = val + cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, val, 1, 0x1F, kind=nvvm.Shfl.BFLY))
+    return val

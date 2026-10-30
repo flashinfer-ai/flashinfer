@@ -130,13 +130,10 @@ class GmemAResource(MemoryResource):
         else:
             token_tile = tile_coord_m
             token_rows = self.cfg.tile_m
-        self.tile_expert_idx = self.tile_idx_view.load(
-            idx=token_tile // Int32(self.cfg.token_metadata_stride), vector_size=1
-        )[0]
+        token_cga = token_tile // Int32(self.cfg.token_cluster_dim)
+        self.tile_expert_idx = self.tile_idx_view.load(idx=token_cga, vector_size=1)[0]
         self.tile_mn_limit = self._local_tile_limit(
-            self.mn_limit_view.load(
-                idx=token_tile // Int32(self.cfg.token_metadata_stride), vector_size=1
-            )[0],
+            self.mn_limit_view.load(idx=token_cga, vector_size=1)[0],
             token_tile,
             token_rows,
         )
@@ -153,11 +150,11 @@ class GmemAResource(MemoryResource):
 
     @cute.jit
     def _a_coords(
-        self, stage_info: StageInfo
+        self, stage_info: StageInfo, k_tile_idx
     ) -> tuple[Int32, Int32, Int32, Int32, Int32]:
         """Build the A coordinates from the cached per-tile metadata."""
         tile_coord_m, _, _ = stage_info.work_tile.tile_idx
-        coord_k = stage_info.loop_offset * Int32(self.cfg.tile_k)
+        coord_k = k_tile_idx * Int32(self.cfg.tile_k)
         expert_idx = self.tile_expert_idx
 
         coord_mn = tile_coord_m * Int32(self.cfg.tile_m)
@@ -182,14 +179,16 @@ class GmemAResource(MemoryResource):
         self, stage_info: StageInfo
     ) -> tuple[Int32, Int32, Int32, Int32, Int32]:
         self._load_tile_metadata(stage_info)
-        return self._a_coords(stage_info)
+        # Head work runs outside the K loop, so ``stage_info.loop_offset`` is None.
+        # Every CTA starts at K tile 0 (no split-K).
+        return self._a_coords(stage_info, Int32(0))
 
     @consumer_work(returns=(coord_a_k, coord_a_mn, coord_a_l, expert_idx, mn_limit))
     @cute.jit
     def compute_a_coords_loop(
         self, stage_info: StageInfo
     ) -> tuple[Int32, Int32, Int32, Int32, Int32]:
-        return self._a_coords(stage_info)
+        return self._a_coords(stage_info, stage_info.loop_offset)
 
 
 @dataclass(kw_only=True)
@@ -244,13 +243,10 @@ class GmemBResource(MemoryResource):
         else:
             token_tile = tile_coord_m
             token_rows = self.cfg.tile_m
-        self.tile_expert_idx = self.tile_idx_view.load(
-            idx=token_tile // Int32(self.cfg.token_metadata_stride), vector_size=1
-        )[0]
+        token_cga = token_tile // Int32(self.cfg.token_cluster_dim)
+        self.tile_expert_idx = self.tile_idx_view.load(idx=token_cga, vector_size=1)[0]
         self.tile_mn_limit = self._local_tile_limit(
-            self.mn_limit_view.load(
-                idx=token_tile // Int32(self.cfg.token_metadata_stride), vector_size=1
-            )[0],
+            self.mn_limit_view.load(idx=token_cga, vector_size=1)[0],
             token_tile,
             token_rows,
         )
@@ -266,10 +262,12 @@ class GmemBResource(MemoryResource):
         return local_limit
 
     @cute.jit
-    def _b_coords(self, stage_info: StageInfo) -> tuple[Int32, Int32, Int32, Int32]:
+    def _b_coords(
+        self, stage_info: StageInfo, k_tile_idx
+    ) -> tuple[Int32, Int32, Int32, Int32]:
         """Build the B coordinates from the cached per-tile metadata."""
         _, tile_coord_n, _ = stage_info.work_tile.tile_idx
-        coord_k = stage_info.loop_offset * Int32(self.cfg.tile_k)
+        coord_k = k_tile_idx * Int32(self.cfg.tile_k)
         expert_idx = self.tile_expert_idx
 
         coord_mn = tile_coord_n * Int32(self.cfg.tile_n)
@@ -291,7 +289,9 @@ class GmemBResource(MemoryResource):
         self, stage_info: StageInfo
     ) -> tuple[Int32, Int32, Int32, Int32]:
         self._load_tile_metadata(stage_info)
-        return self._b_coords(stage_info)
+        # Head work runs outside the K loop, so ``stage_info.loop_offset`` is None.
+        # Every CTA starts at K tile 0 (no split-K).
+        return self._b_coords(stage_info, Int32(0))
 
     @consumer_work(returns=(coord_b_k, coord_b_mn, coord_b_l, mn_limit))
     @cute.jit
@@ -313,4 +313,4 @@ class GmemBResource(MemoryResource):
     def compute_b_coords_loop(
         self, stage_info: StageInfo
     ) -> tuple[Int32, Int32, Int32, Int32]:
-        return self._b_coords(stage_info)
+        return self._b_coords(stage_info, stage_info.loop_offset)

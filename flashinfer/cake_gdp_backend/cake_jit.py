@@ -39,19 +39,28 @@ static-token-count program of the call's ``T`` whose band admits the call's
 runtime-token-count program of the route (``T`` up to its ``max_t_steps``).
 Batch size and head count are runtime scalars, so a changed problem size never
 recompiles anything.  Two kernel bodies ship: the lane-owns-rows body
-(``variant`` ``l8r4`` / ``l8r2`` / ``l4r2``, one CTA per batch row and head)
+(``variant`` ``l8r4`` / ``l8r4p`` / ``l8r4w5`` / ``l8r2`` / ``l4r2``, one
+CTA per batch row and head)
 and, for ``T = 1`` with ``B x HV <= 160``, the row-partition body
 (``splitv8_tile8``, eight CTAs per state head); each record names its body
 (``body``: ``lanerow`` for the lane-owns-rows body, ``splitv`` for the row
-partition).  A band may differ per architecture (SM90 has no one-wave-of-5
-``l8r4w5`` program at ``T = 1`` and owns the one-CTA-per-SM rows of ``T = 4``
-with ``l4r2``): a selection cell then names the ``arches`` it applies to, and a
+partition).  A band may differ per architecture (SM90 has neither the
+one-wave ``l8r4p`` program nor the one-wave-of-5 ``l8r4w5`` program at
+``T = 1`` and owns the one-CTA-per-SM
+rows of ``T = 4`` with ``l4r2``): a selection cell then names the ``arches``
+it applies to, and a
 cell without ``arches`` applies on every architecture its record is delivered
 for.
 
-Prefill: the ``prefill`` route holds the single-pass programs of the chunked
-prefill body (``body`` ``prefill_sm90``), one per flag set the public call may
-need (``select_rule`` ``prefill_flags``: initial state none / given /
+Prefill: the ``prefill`` route holds the single-pass programs of two kernel
+bodies: the V6 fork-order body (``body`` ``prefill_sm90_v6``: the plain, the
+initial-state and the pool-indexed flag sets, final state stored) and the
+merged chunked prefill body (``body`` ``prefill_sm90``: the unit programs and
+the ``split_items`` programs); the BODY ROUTE OF RECORD below
+(``prefill_body_class``) picks the body of every sequence from its chunk
+count, ``H``, ``n`` and the SM count, and a call launches once per body
+present (``prefill_launch_plan``).  Within a body, one program per flag set
+the public call may need (``select_rule`` ``prefill_flags``: initial state none / given /
 pool-indexed, final state stored or not, ``g=None`` / ``beta=None`` (the
 ``unit_gates`` / ``unit_beta`` programs, from zeros; both absent is no shipped
 program); ``selected_prefill_module``), each walking every (sequence, head)
@@ -60,16 +69,20 @@ route also holds that body's ``split_items`` programs (the gate-saturation
 split: a long sequence runs as ``p`` independent items per head over the
 host's item table -- formal 9, ``output_slot_indices``; ``total_tiles`` = items
 -- and ``selected_prefill_module(..., split_items=True)`` names them; the
-facade takes them when ``prefill_split_table`` of the rules of record below
-finds a sequence to split and the exact programs otherwise).
+facade takes them for the merged-class sequences of a call, which the split
+rules of record below always cut).
 Every grid is computed from host integers; no tensor is read on the host.
 
 The program name ``cake_gdp_<20 hex>`` is the first twenty hex digits of the
 SHA-256 of the compact JSON ``{"build": <build keywords, sorted>, "module":
 <dotted kernel module>}`` of the kernel the program was rendered from; the
 record's ``build`` spells those keywords: ``variant`` (the body's geometry:
-``l8r4`` = eight lanes per state row, four rows per lane; ``l8r2``; ``l4r2``;
-``l4r4`` for the runtime programs; ``splitv8_tile8`` = eight CTAs of eight rows
+``l8r4`` = eight lanes per state row, four rows per lane; ``l8r4p`` and
+``l8r4w5`` = that geometry with the producer preload, for one wave of four
+CTAs per SM and for the many-wave rows (``B x HV > 64 x SM
+count``); ``l8r2``;
+``l4r2``; ``l4r4`` for the runtime programs; ``splitv8_tile8`` = eight CTAs of
+eight rows
 per head), ``num_householder`` (``n``),
 ``t_steps`` (a fixed token count compiled in; ``None`` for a runtime token
 count up to ``max_t_steps``) and ``use_qk_l2norm``.  Prefill: the six flags
@@ -236,193 +249,6 @@ MODULES: dict[str, dict[str, Any]] = {
             "above": 0,
             "at_most": 160,
             "kind": "state_heads_between",
-        },
-    },
-    "cake_gdp_2284543bbf1112b1c47c": {
-        "arches": [
-            "sm_90a",
-        ],
-        "arg_plan": [
-            [
-                "buffer",
-                "Q",
-            ],
-            [
-                "buffer",
-                "K",
-            ],
-            [
-                "buffer",
-                "V",
-            ],
-            [
-                "buffer",
-                "O",
-            ],
-            [
-                "buffer",
-                "gate",
-            ],
-            [
-                "buffer",
-                "beta",
-            ],
-            [
-                "buffer",
-                "cu_seqlens",
-            ],
-            [
-                "buffer",
-                "state_indices",
-            ],
-            [
-                "buffer",
-                "output_slot_indices",
-            ],
-            [
-                "buffer",
-                "initial_state",
-            ],
-            [
-                "buffer",
-                "output_state",
-            ],
-            [
-                "buffer",
-                "tensormap_workspace",
-            ],
-            [
-                "parameter",
-                "initial_state_stride_slot",
-            ],
-            [
-                "parameter",
-                "output_state_stride_slot",
-            ],
-            [
-                "parameter",
-                "scale",
-            ],
-            [
-                "parameter",
-                "num_seqs",
-            ],
-            [
-                "parameter",
-                "total_tokens",
-            ],
-            [
-                "parameter",
-                "num_heads",
-            ],
-            [
-                "parameter",
-                "num_householder",
-            ],
-            [
-                "parameter",
-                "total_tiles",
-            ],
-            [
-                "parameter",
-                "metadata_i64_mask",
-            ],
-            [
-                "buffer",
-                "ainv_workspace",
-            ],
-            [
-                "parameter",
-                "ainv_chunk_stride",
-            ],
-            [
-                "grid",
-                "grid_x",
-            ],
-            [
-                "grid",
-                "grid_y",
-            ],
-            [
-                "grid",
-                "grid_z",
-            ],
-        ],
-        "body": "prefill_sm90",
-        "build": {
-            "debug_trace": False,
-            "desc_iter": False,
-            "exact_diag": True,
-            "inverse": "blk32",
-            "io_dtype": "bf16",
-            "l_tile": None,
-            "mask_fast": False,
-            "o_store": "st_global",
-            "segment_pass": False,
-            "solve_ablate": False,
-            "solve_block": 4,
-            "solve_ilp": 1,
-            "solve_overlap": True,
-            "solve_prefetch": 0,
-            "split_decay": True,
-            "split_items": False,
-            "split_state": None,
-            "split_w": None,
-            "store_final_state": True,
-            "unit_beta": False,
-            "unit_gates": False,
-            "use_initial_state": True,
-            "use_state_indices": False,
-            "wait_hint": None,
-        },
-        "ffi_entry": "run",
-        "grid_rule": {
-            "kind": "tiles",
-        },
-        "kernel": "cake_gdp_2284543bbf1112b1c47c",
-        "kernel_symbol": "kernel_cake_gdp_2284543bbf1112b1c47c",
-        "launch": {
-            "block": (512, 1, 1),
-            "cluster": (1, 1, 1),
-            "cooperative": False,
-            "dynamic_smem_bytes": 226304,
-            "use_pdl": False,
-        },
-        "library": "cake_gdp_2284543bbf1112b1c47c",
-        "logical": {
-            "K": "k",
-            "O": "o",
-            "Q": "q",
-            "V": "v",
-            "ainv_chunk_stride": "ainv_chunk_stride",
-            "ainv_workspace": "ainv_workspace",
-            "beta": "beta",
-            "cu_seqlens": "cu_seqlens",
-            "gate": "gate",
-            "initial_state": "initial_state",
-            "initial_state_stride_slot": "initial_state_stride_slot",
-            "metadata_i64_mask": "metadata_i64_mask",
-            "num_heads": "num_heads",
-            "num_householder": "num_householder",
-            "num_seqs": "num_seqs",
-            "output_slot_indices": "output_slot_indices",
-            "output_state": "output_state",
-            "output_state_stride_slot": "output_state_stride_slot",
-            "scale": "scale",
-            "state_indices": "state_indices",
-            "tensormap_workspace": "tensormap_workspace",
-            "total_tiles": "total_tiles",
-            "total_tokens": "total_tokens",
-        },
-        "role": "prefill",
-        "select_rule": {
-            "kind": "prefill_flags",
-            "segment_pass": False,
-            "store_final_state": True,
-            "unit_beta": False,
-            "unit_gates": False,
-            "use_initial_state": True,
-            "use_state_indices": False,
         },
     },
     "cake_gdp_245414df8449fb1825a1": {
@@ -1530,8 +1356,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "select_rule": {
             "above": 160,
             "at_most": None,
-            "ctas_per_sm_above": 4,
-            "ctas_per_sm_at_most": 5,
+            "ctas_per_sm_above": 64,
             "kind": "state_heads_between",
         },
     },
@@ -1820,193 +1645,6 @@ MODULES: dict[str, dict[str, Any]] = {
             "at_most": None,
             "ctas_per_sm_above": 2,
             "kind": "state_heads_between",
-        },
-    },
-    "cake_gdp_767a1a02abbb3f3d443a": {
-        "arches": [
-            "sm_90a",
-        ],
-        "arg_plan": [
-            [
-                "buffer",
-                "Q",
-            ],
-            [
-                "buffer",
-                "K",
-            ],
-            [
-                "buffer",
-                "V",
-            ],
-            [
-                "buffer",
-                "O",
-            ],
-            [
-                "buffer",
-                "gate",
-            ],
-            [
-                "buffer",
-                "beta",
-            ],
-            [
-                "buffer",
-                "cu_seqlens",
-            ],
-            [
-                "buffer",
-                "state_indices",
-            ],
-            [
-                "buffer",
-                "output_slot_indices",
-            ],
-            [
-                "buffer",
-                "initial_state",
-            ],
-            [
-                "buffer",
-                "output_state",
-            ],
-            [
-                "buffer",
-                "tensormap_workspace",
-            ],
-            [
-                "parameter",
-                "initial_state_stride_slot",
-            ],
-            [
-                "parameter",
-                "output_state_stride_slot",
-            ],
-            [
-                "parameter",
-                "scale",
-            ],
-            [
-                "parameter",
-                "num_seqs",
-            ],
-            [
-                "parameter",
-                "total_tokens",
-            ],
-            [
-                "parameter",
-                "num_heads",
-            ],
-            [
-                "parameter",
-                "num_householder",
-            ],
-            [
-                "parameter",
-                "total_tiles",
-            ],
-            [
-                "parameter",
-                "metadata_i64_mask",
-            ],
-            [
-                "buffer",
-                "ainv_workspace",
-            ],
-            [
-                "parameter",
-                "ainv_chunk_stride",
-            ],
-            [
-                "grid",
-                "grid_x",
-            ],
-            [
-                "grid",
-                "grid_y",
-            ],
-            [
-                "grid",
-                "grid_z",
-            ],
-        ],
-        "body": "prefill_sm90",
-        "build": {
-            "debug_trace": False,
-            "desc_iter": False,
-            "exact_diag": True,
-            "inverse": "blk32",
-            "io_dtype": "bf16",
-            "l_tile": None,
-            "mask_fast": False,
-            "o_store": "st_global",
-            "segment_pass": False,
-            "solve_ablate": False,
-            "solve_block": 4,
-            "solve_ilp": 1,
-            "solve_overlap": True,
-            "solve_prefetch": 0,
-            "split_decay": True,
-            "split_items": False,
-            "split_state": None,
-            "split_w": None,
-            "store_final_state": True,
-            "unit_beta": False,
-            "unit_gates": False,
-            "use_initial_state": True,
-            "use_state_indices": True,
-            "wait_hint": None,
-        },
-        "ffi_entry": "run",
-        "grid_rule": {
-            "kind": "tiles",
-        },
-        "kernel": "cake_gdp_767a1a02abbb3f3d443a",
-        "kernel_symbol": "kernel_cake_gdp_767a1a02abbb3f3d443a",
-        "launch": {
-            "block": (512, 1, 1),
-            "cluster": (1, 1, 1),
-            "cooperative": False,
-            "dynamic_smem_bytes": 226304,
-            "use_pdl": False,
-        },
-        "library": "cake_gdp_767a1a02abbb3f3d443a",
-        "logical": {
-            "K": "k",
-            "O": "o",
-            "Q": "q",
-            "V": "v",
-            "ainv_chunk_stride": "ainv_chunk_stride",
-            "ainv_workspace": "ainv_workspace",
-            "beta": "beta",
-            "cu_seqlens": "cu_seqlens",
-            "gate": "gate",
-            "initial_state": "initial_state",
-            "initial_state_stride_slot": "initial_state_stride_slot",
-            "metadata_i64_mask": "metadata_i64_mask",
-            "num_heads": "num_heads",
-            "num_householder": "num_householder",
-            "num_seqs": "num_seqs",
-            "output_slot_indices": "output_slot_indices",
-            "output_state": "output_state",
-            "output_state_stride_slot": "output_state_stride_slot",
-            "scale": "scale",
-            "state_indices": "state_indices",
-            "tensormap_workspace": "tensormap_workspace",
-            "total_tiles": "total_tiles",
-            "total_tokens": "total_tokens",
-        },
-        "role": "prefill",
-        "select_rule": {
-            "kind": "prefill_flags",
-            "segment_pass": False,
-            "store_final_state": True,
-            "unit_beta": False,
-            "unit_gates": False,
-            "use_initial_state": True,
-            "use_state_indices": True,
         },
     },
     "cake_gdp_78fc9caafee16e2af047": {
@@ -2482,193 +2120,6 @@ MODULES: dict[str, dict[str, Any]] = {
             "kind": "state_heads_between",
         },
     },
-    "cake_gdp_bbc97d2b44d494994d50": {
-        "arches": [
-            "sm_90a",
-        ],
-        "arg_plan": [
-            [
-                "buffer",
-                "Q",
-            ],
-            [
-                "buffer",
-                "K",
-            ],
-            [
-                "buffer",
-                "V",
-            ],
-            [
-                "buffer",
-                "O",
-            ],
-            [
-                "buffer",
-                "gate",
-            ],
-            [
-                "buffer",
-                "beta",
-            ],
-            [
-                "buffer",
-                "cu_seqlens",
-            ],
-            [
-                "buffer",
-                "state_indices",
-            ],
-            [
-                "buffer",
-                "output_slot_indices",
-            ],
-            [
-                "buffer",
-                "initial_state",
-            ],
-            [
-                "buffer",
-                "output_state",
-            ],
-            [
-                "buffer",
-                "tensormap_workspace",
-            ],
-            [
-                "parameter",
-                "initial_state_stride_slot",
-            ],
-            [
-                "parameter",
-                "output_state_stride_slot",
-            ],
-            [
-                "parameter",
-                "scale",
-            ],
-            [
-                "parameter",
-                "num_seqs",
-            ],
-            [
-                "parameter",
-                "total_tokens",
-            ],
-            [
-                "parameter",
-                "num_heads",
-            ],
-            [
-                "parameter",
-                "num_householder",
-            ],
-            [
-                "parameter",
-                "total_tiles",
-            ],
-            [
-                "parameter",
-                "metadata_i64_mask",
-            ],
-            [
-                "buffer",
-                "ainv_workspace",
-            ],
-            [
-                "parameter",
-                "ainv_chunk_stride",
-            ],
-            [
-                "grid",
-                "grid_x",
-            ],
-            [
-                "grid",
-                "grid_y",
-            ],
-            [
-                "grid",
-                "grid_z",
-            ],
-        ],
-        "body": "prefill_sm90",
-        "build": {
-            "debug_trace": False,
-            "desc_iter": False,
-            "exact_diag": True,
-            "inverse": "blk32",
-            "io_dtype": "bf16",
-            "l_tile": None,
-            "mask_fast": False,
-            "o_store": "st_global",
-            "segment_pass": False,
-            "solve_ablate": False,
-            "solve_block": 4,
-            "solve_ilp": 1,
-            "solve_overlap": True,
-            "solve_prefetch": 0,
-            "split_decay": True,
-            "split_items": False,
-            "split_state": None,
-            "split_w": None,
-            "store_final_state": False,
-            "unit_beta": False,
-            "unit_gates": False,
-            "use_initial_state": False,
-            "use_state_indices": False,
-            "wait_hint": None,
-        },
-        "ffi_entry": "run",
-        "grid_rule": {
-            "kind": "tiles",
-        },
-        "kernel": "cake_gdp_bbc97d2b44d494994d50",
-        "kernel_symbol": "kernel_cake_gdp_bbc97d2b44d494994d50",
-        "launch": {
-            "block": (512, 1, 1),
-            "cluster": (1, 1, 1),
-            "cooperative": False,
-            "dynamic_smem_bytes": 226304,
-            "use_pdl": False,
-        },
-        "library": "cake_gdp_bbc97d2b44d494994d50",
-        "logical": {
-            "K": "k",
-            "O": "o",
-            "Q": "q",
-            "V": "v",
-            "ainv_chunk_stride": "ainv_chunk_stride",
-            "ainv_workspace": "ainv_workspace",
-            "beta": "beta",
-            "cu_seqlens": "cu_seqlens",
-            "gate": "gate",
-            "initial_state": "initial_state",
-            "initial_state_stride_slot": "initial_state_stride_slot",
-            "metadata_i64_mask": "metadata_i64_mask",
-            "num_heads": "num_heads",
-            "num_householder": "num_householder",
-            "num_seqs": "num_seqs",
-            "output_slot_indices": "output_slot_indices",
-            "output_state": "output_state",
-            "output_state_stride_slot": "output_state_stride_slot",
-            "scale": "scale",
-            "state_indices": "state_indices",
-            "tensormap_workspace": "tensormap_workspace",
-            "total_tiles": "total_tiles",
-            "total_tokens": "total_tokens",
-        },
-        "role": "prefill",
-        "select_rule": {
-            "kind": "prefill_flags",
-            "segment_pass": False,
-            "store_final_state": False,
-            "unit_beta": False,
-            "unit_gates": False,
-            "use_initial_state": False,
-            "use_state_indices": False,
-        },
-    },
     "cake_gdp_c8580552e73f2264f8eb": {
         "arches": [
             "sm_90a",
@@ -2856,66 +2307,67 @@ MODULES: dict[str, dict[str, Any]] = {
             "use_state_indices": False,
         },
     },
-    "cake_gdp_d67e14f85ace851d938c": {
+    "cake_gdp_e156ee45668b2455e46d": {
         "arches": [
-            "sm_90a",
+            "sm_100a",
+            "sm_103a",
         ],
         "arg_plan": [
             [
                 "buffer",
-                "Q",
+                "q",
             ],
             [
                 "buffer",
-                "K",
+                "k",
             ],
             [
                 "buffer",
-                "V",
+                "v",
             ],
             [
                 "buffer",
-                "O",
+                "state",
             ],
             [
                 "buffer",
-                "gate",
+                "A_log",
             ],
             [
                 "buffer",
-                "beta",
+                "a",
             ],
             [
                 "buffer",
-                "cu_seqlens",
+                "dt_bias",
             ],
             [
                 "buffer",
-                "state_indices",
+                "b",
             ],
             [
                 "buffer",
-                "output_slot_indices",
+                "out",
             ],
             [
                 "buffer",
-                "initial_state",
+                "initial_state_indices",
             ],
             [
                 "buffer",
-                "output_state",
+                "output_state_indices",
             ],
             [
                 "buffer",
-                "tensormap_workspace",
+                "ssm_state_indices",
             ],
             [
                 "parameter",
-                "initial_state_stride_slot",
+                "heads",
             ],
             [
                 "parameter",
-                "output_state_stride_slot",
+                "num_tokens",
             ],
             [
                 "parameter",
@@ -2923,35 +2375,11 @@ MODULES: dict[str, dict[str, Any]] = {
             ],
             [
                 "parameter",
-                "num_seqs",
+                "disable_state_update",
             ],
             [
                 "parameter",
-                "total_tokens",
-            ],
-            [
-                "parameter",
-                "num_heads",
-            ],
-            [
-                "parameter",
-                "num_householder",
-            ],
-            [
-                "parameter",
-                "total_tiles",
-            ],
-            [
-                "parameter",
-                "metadata_i64_mask",
-            ],
-            [
-                "buffer",
-                "ainv_workspace",
-            ],
-            [
-                "parameter",
-                "ainv_chunk_stride",
+                "use_ssm_state_indices",
             ],
             [
                 "grid",
@@ -2966,81 +2394,62 @@ MODULES: dict[str, dict[str, Any]] = {
                 "grid_z",
             ],
         ],
-        "body": "prefill_sm90",
+        "body": "lanerow",
         "build": {
-            "debug_trace": False,
-            "desc_iter": False,
-            "exact_diag": True,
-            "inverse": "blk32",
-            "io_dtype": "bf16",
-            "l_tile": None,
-            "mask_fast": False,
-            "o_store": "st_global",
-            "segment_pass": False,
-            "solve_ablate": False,
-            "solve_block": 4,
-            "solve_ilp": 1,
-            "solve_overlap": True,
-            "solve_prefetch": 0,
-            "split_decay": True,
-            "split_items": False,
-            "split_state": None,
-            "split_w": None,
-            "store_final_state": True,
-            "unit_beta": False,
-            "unit_gates": False,
-            "use_initial_state": False,
-            "use_state_indices": False,
-            "wait_hint": None,
+            "max_t_steps": 8,
+            "num_householder": 3,
+            "t_steps": 1,
+            "use_qk_l2norm": True,
+            "variant": "l8r4p",
         },
         "ffi_entry": "run",
         "grid_rule": {
-            "kind": "tiles",
+            "ctas_per_state": 1,
+            "kind": "state_heads",
         },
-        "kernel": "cake_gdp_d67e14f85ace851d938c",
-        "kernel_symbol": "kernel_cake_gdp_d67e14f85ace851d938c",
+        "kernel": "cake_gdp_e156ee45668b2455e46d",
+        "kernel_symbol": "kernel_cake_gdp_e156ee45668b2455e46d",
         "launch": {
-            "block": (512, 1, 1),
-            "cluster": (1, 1, 1),
+            "block": (
+                128,
+                1,
+                1,
+            ),
+            "cluster": (
+                1,
+                1,
+                1,
+            ),
             "cooperative": False,
-            "dynamic_smem_bytes": 226304,
+            "dynamic_smem_bytes": 2944,
             "use_pdl": False,
         },
-        "library": "cake_gdp_d67e14f85ace851d938c",
+        "library": "cake_gdp_e156ee45668b2455e46d",
         "logical": {
-            "K": "k",
-            "O": "o",
-            "Q": "q",
-            "V": "v",
-            "ainv_chunk_stride": "ainv_chunk_stride",
-            "ainv_workspace": "ainv_workspace",
-            "beta": "beta",
-            "cu_seqlens": "cu_seqlens",
-            "gate": "gate",
-            "initial_state": "initial_state",
-            "initial_state_stride_slot": "initial_state_stride_slot",
-            "metadata_i64_mask": "metadata_i64_mask",
-            "num_heads": "num_heads",
-            "num_householder": "num_householder",
-            "num_seqs": "num_seqs",
-            "output_slot_indices": "output_slot_indices",
-            "output_state": "output_state",
-            "output_state_stride_slot": "output_state_stride_slot",
+            "A_log": "A_log",
+            "a": "a",
+            "b": "b",
+            "disable_state_update": "disable_state_update",
+            "dt_bias": "dt_bias",
+            "heads": "heads",
+            "initial_state_indices": "initial_state_indices",
+            "k": "k",
+            "num_tokens": "num_tokens",
+            "out": "out",
+            "output_state_indices": "output_state_indices",
+            "q": "q",
             "scale": "scale",
-            "state_indices": "state_indices",
-            "tensormap_workspace": "tensormap_workspace",
-            "total_tiles": "total_tiles",
-            "total_tokens": "total_tokens",
+            "ssm_state_indices": "ssm_state_indices",
+            "state": "state",
+            "use_ssm_state_indices": "use_ssm_state_indices",
+            "v": "v",
         },
-        "role": "prefill",
+        "role": "decode",
         "select_rule": {
-            "kind": "prefill_flags",
-            "segment_pass": False,
-            "store_final_state": True,
-            "unit_beta": False,
-            "unit_gates": False,
-            "use_initial_state": False,
-            "use_state_indices": False,
+            "above": 160,
+            "at_most": None,
+            "ctas_per_sm_at_most": 4,
+            "kind": "state_heads_between",
         },
     },
     "cake_gdp_f2f0c7abbf10082a6996": {
@@ -3158,7 +2567,7 @@ MODULES: dict[str, dict[str, Any]] = {
                 1,
             ),
             "cooperative": False,
-            "dynamic_smem_bytes": 6400,
+            "dynamic_smem_bytes": 2304,
             "use_pdl": False,
         },
         "library": "cake_gdp_f2f0c7abbf10082a6996",
@@ -3522,17 +2931,8 @@ MODULES: dict[str, dict[str, Any]] = {
                     "sm_103a",
                 ],
                 "at_most": None,
-                "ctas_per_sm_at_most": 4,
-                "kind": "state_heads_between",
-            },
-            {
-                "above": 160,
-                "arches": [
-                    "sm_100a",
-                    "sm_103a",
-                ],
-                "at_most": None,
-                "ctas_per_sm_above": 5,
+                "ctas_per_sm_above": 4,
+                "ctas_per_sm_at_most": 64,
                 "kind": "state_heads_between",
             },
             {
@@ -3544,6 +2944,528 @@ MODULES: dict[str, dict[str, Any]] = {
                 "kind": "state_heads_between",
             },
         ],
+    },
+    "cake_gdp_0de8fd0ee57885709a1c": {
+        "arches": [
+            "sm_90a",
+        ],
+        "arg_plan": [
+            [
+                "buffer",
+                "Q",
+            ],
+            [
+                "buffer",
+                "K",
+            ],
+            [
+                "buffer",
+                "V",
+            ],
+            [
+                "buffer",
+                "O",
+            ],
+            [
+                "buffer",
+                "gate",
+            ],
+            [
+                "buffer",
+                "beta",
+            ],
+            [
+                "buffer",
+                "cu_seqlens",
+            ],
+            [
+                "buffer",
+                "state_indices",
+            ],
+            [
+                "buffer",
+                "output_slot_indices",
+            ],
+            [
+                "buffer",
+                "initial_state",
+            ],
+            [
+                "buffer",
+                "output_state",
+            ],
+            [
+                "buffer",
+                "tensormap_workspace",
+            ],
+            [
+                "parameter",
+                "initial_state_stride_slot",
+            ],
+            [
+                "parameter",
+                "output_state_stride_slot",
+            ],
+            [
+                "parameter",
+                "scale",
+            ],
+            [
+                "parameter",
+                "num_seqs",
+            ],
+            [
+                "parameter",
+                "total_tokens",
+            ],
+            [
+                "parameter",
+                "num_heads",
+            ],
+            [
+                "parameter",
+                "num_householder",
+            ],
+            [
+                "parameter",
+                "total_tiles",
+            ],
+            [
+                "parameter",
+                "metadata_i64_mask",
+            ],
+            [
+                "buffer",
+                "ainv_workspace",
+            ],
+            [
+                "parameter",
+                "ainv_chunk_stride",
+            ],
+            [
+                "grid",
+                "grid_x",
+            ],
+            [
+                "grid",
+                "grid_y",
+            ],
+            [
+                "grid",
+                "grid_z",
+            ],
+        ],
+        "body": "prefill_sm90_v6",
+        "build": {
+            "arm": "fork_exact_serial_wl_abo_sl4p_fk_pb_ogu",
+            "issue": "A3",
+            "kring": 3,
+            "plan": "p32_232_208",
+            "ring": "qk3_o1",
+            "segment_pass": False,
+            "store_final_state": True,
+            "unit_beta": False,
+            "unit_gates": False,
+            "use_initial_state": False,
+            "use_state_indices": False,
+        },
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "tiles",
+        },
+        "kernel": "cake_gdp_0de8fd0ee57885709a1c",
+        "kernel_symbol": "kernel_cake_gdp_0de8fd0ee57885709a1c",
+        "launch": {
+            "block": (384, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 197376,
+            "use_pdl": False,
+        },
+        "library": "cake_gdp_0de8fd0ee57885709a1c",
+        "logical": {
+            "K": "k",
+            "O": "o",
+            "Q": "q",
+            "V": "v",
+            "ainv_chunk_stride": "ainv_chunk_stride",
+            "ainv_workspace": "ainv_workspace",
+            "beta": "beta",
+            "cu_seqlens": "cu_seqlens",
+            "gate": "gate",
+            "initial_state": "initial_state",
+            "initial_state_stride_slot": "initial_state_stride_slot",
+            "metadata_i64_mask": "metadata_i64_mask",
+            "num_heads": "num_heads",
+            "num_householder": "num_householder",
+            "num_seqs": "num_seqs",
+            "output_slot_indices": "output_slot_indices",
+            "output_state": "output_state",
+            "output_state_stride_slot": "output_state_stride_slot",
+            "scale": "scale",
+            "state_indices": "state_indices",
+            "tensormap_workspace": "tensormap_workspace",
+            "total_tiles": "total_tiles",
+            "total_tokens": "total_tokens",
+        },
+        "role": "prefill",
+        "select_rule": {
+            "kind": "prefill_flags",
+            "segment_pass": False,
+            "store_final_state": True,
+            "unit_beta": False,
+            "unit_gates": False,
+            "use_initial_state": False,
+            "use_state_indices": False,
+        },
+    },
+    "cake_gdp_c81addff1e986f49ec99": {
+        "arches": [
+            "sm_90a",
+        ],
+        "arg_plan": [
+            [
+                "buffer",
+                "Q",
+            ],
+            [
+                "buffer",
+                "K",
+            ],
+            [
+                "buffer",
+                "V",
+            ],
+            [
+                "buffer",
+                "O",
+            ],
+            [
+                "buffer",
+                "gate",
+            ],
+            [
+                "buffer",
+                "beta",
+            ],
+            [
+                "buffer",
+                "cu_seqlens",
+            ],
+            [
+                "buffer",
+                "state_indices",
+            ],
+            [
+                "buffer",
+                "output_slot_indices",
+            ],
+            [
+                "buffer",
+                "initial_state",
+            ],
+            [
+                "buffer",
+                "output_state",
+            ],
+            [
+                "buffer",
+                "tensormap_workspace",
+            ],
+            [
+                "parameter",
+                "initial_state_stride_slot",
+            ],
+            [
+                "parameter",
+                "output_state_stride_slot",
+            ],
+            [
+                "parameter",
+                "scale",
+            ],
+            [
+                "parameter",
+                "num_seqs",
+            ],
+            [
+                "parameter",
+                "total_tokens",
+            ],
+            [
+                "parameter",
+                "num_heads",
+            ],
+            [
+                "parameter",
+                "num_householder",
+            ],
+            [
+                "parameter",
+                "total_tiles",
+            ],
+            [
+                "parameter",
+                "metadata_i64_mask",
+            ],
+            [
+                "buffer",
+                "ainv_workspace",
+            ],
+            [
+                "parameter",
+                "ainv_chunk_stride",
+            ],
+            [
+                "grid",
+                "grid_x",
+            ],
+            [
+                "grid",
+                "grid_y",
+            ],
+            [
+                "grid",
+                "grid_z",
+            ],
+        ],
+        "body": "prefill_sm90_v6",
+        "build": {
+            "arm": "fork_exact_serial_wl_abo_sl4p_fk_pb_ogu",
+            "issue": "A3",
+            "kring": 3,
+            "plan": "p32_232_208",
+            "ring": "qk3_o1",
+            "segment_pass": False,
+            "store_final_state": True,
+            "unit_beta": False,
+            "unit_gates": False,
+            "use_initial_state": True,
+            "use_state_indices": False,
+        },
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "tiles",
+        },
+        "kernel": "cake_gdp_c81addff1e986f49ec99",
+        "kernel_symbol": "kernel_cake_gdp_c81addff1e986f49ec99",
+        "launch": {
+            "block": (384, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 197376,
+            "use_pdl": False,
+        },
+        "library": "cake_gdp_c81addff1e986f49ec99",
+        "logical": {
+            "K": "k",
+            "O": "o",
+            "Q": "q",
+            "V": "v",
+            "ainv_chunk_stride": "ainv_chunk_stride",
+            "ainv_workspace": "ainv_workspace",
+            "beta": "beta",
+            "cu_seqlens": "cu_seqlens",
+            "gate": "gate",
+            "initial_state": "initial_state",
+            "initial_state_stride_slot": "initial_state_stride_slot",
+            "metadata_i64_mask": "metadata_i64_mask",
+            "num_heads": "num_heads",
+            "num_householder": "num_householder",
+            "num_seqs": "num_seqs",
+            "output_slot_indices": "output_slot_indices",
+            "output_state": "output_state",
+            "output_state_stride_slot": "output_state_stride_slot",
+            "scale": "scale",
+            "state_indices": "state_indices",
+            "tensormap_workspace": "tensormap_workspace",
+            "total_tiles": "total_tiles",
+            "total_tokens": "total_tokens",
+        },
+        "role": "prefill",
+        "select_rule": {
+            "kind": "prefill_flags",
+            "segment_pass": False,
+            "store_final_state": True,
+            "unit_beta": False,
+            "unit_gates": False,
+            "use_initial_state": True,
+            "use_state_indices": False,
+        },
+    },
+    "cake_gdp_55a7b3c2baf155618309": {
+        "arches": [
+            "sm_90a",
+        ],
+        "arg_plan": [
+            [
+                "buffer",
+                "Q",
+            ],
+            [
+                "buffer",
+                "K",
+            ],
+            [
+                "buffer",
+                "V",
+            ],
+            [
+                "buffer",
+                "O",
+            ],
+            [
+                "buffer",
+                "gate",
+            ],
+            [
+                "buffer",
+                "beta",
+            ],
+            [
+                "buffer",
+                "cu_seqlens",
+            ],
+            [
+                "buffer",
+                "state_indices",
+            ],
+            [
+                "buffer",
+                "output_slot_indices",
+            ],
+            [
+                "buffer",
+                "initial_state",
+            ],
+            [
+                "buffer",
+                "output_state",
+            ],
+            [
+                "buffer",
+                "tensormap_workspace",
+            ],
+            [
+                "parameter",
+                "initial_state_stride_slot",
+            ],
+            [
+                "parameter",
+                "output_state_stride_slot",
+            ],
+            [
+                "parameter",
+                "scale",
+            ],
+            [
+                "parameter",
+                "num_seqs",
+            ],
+            [
+                "parameter",
+                "total_tokens",
+            ],
+            [
+                "parameter",
+                "num_heads",
+            ],
+            [
+                "parameter",
+                "num_householder",
+            ],
+            [
+                "parameter",
+                "total_tiles",
+            ],
+            [
+                "parameter",
+                "metadata_i64_mask",
+            ],
+            [
+                "buffer",
+                "ainv_workspace",
+            ],
+            [
+                "parameter",
+                "ainv_chunk_stride",
+            ],
+            [
+                "grid",
+                "grid_x",
+            ],
+            [
+                "grid",
+                "grid_y",
+            ],
+            [
+                "grid",
+                "grid_z",
+            ],
+        ],
+        "body": "prefill_sm90_v6",
+        "build": {
+            "arm": "fork_exact_serial_wl_abo_sl4p_fk_pb_ogu",
+            "issue": "A3",
+            "kring": 3,
+            "plan": "p32_232_208",
+            "ring": "qk3_o1",
+            "segment_pass": False,
+            "store_final_state": True,
+            "unit_beta": False,
+            "unit_gates": False,
+            "use_initial_state": True,
+            "use_state_indices": True,
+        },
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "tiles",
+        },
+        "kernel": "cake_gdp_55a7b3c2baf155618309",
+        "kernel_symbol": "kernel_cake_gdp_55a7b3c2baf155618309",
+        "launch": {
+            "block": (384, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 197376,
+            "use_pdl": False,
+        },
+        "library": "cake_gdp_55a7b3c2baf155618309",
+        "logical": {
+            "K": "k",
+            "O": "o",
+            "Q": "q",
+            "V": "v",
+            "ainv_chunk_stride": "ainv_chunk_stride",
+            "ainv_workspace": "ainv_workspace",
+            "beta": "beta",
+            "cu_seqlens": "cu_seqlens",
+            "gate": "gate",
+            "initial_state": "initial_state",
+            "initial_state_stride_slot": "initial_state_stride_slot",
+            "metadata_i64_mask": "metadata_i64_mask",
+            "num_heads": "num_heads",
+            "num_householder": "num_householder",
+            "num_seqs": "num_seqs",
+            "output_slot_indices": "output_slot_indices",
+            "output_state": "output_state",
+            "output_state_stride_slot": "output_state_stride_slot",
+            "scale": "scale",
+            "state_indices": "state_indices",
+            "tensormap_workspace": "tensormap_workspace",
+            "total_tiles": "total_tiles",
+            "total_tokens": "total_tokens",
+        },
+        "role": "prefill",
+        "select_rule": {
+            "kind": "prefill_flags",
+            "segment_pass": False,
+            "store_final_state": True,
+            "unit_beta": False,
+            "unit_gates": False,
+            "use_initial_state": True,
+            "use_state_indices": True,
+        },
     },
 }
 ROUTES: dict[str, dict[str, list[str]]] = {
@@ -3567,10 +3489,9 @@ ROUTES: dict[str, dict[str, list[str]]] = {
             "cake_gdp_3425d6511e4eab4896cd",
         ],
         "prefill": [
-            "cake_gdp_d67e14f85ace851d938c",
-            "cake_gdp_bbc97d2b44d494994d50",
-            "cake_gdp_2284543bbf1112b1c47c",
-            "cake_gdp_767a1a02abbb3f3d443a",
+            "cake_gdp_0de8fd0ee57885709a1c",
+            "cake_gdp_c81addff1e986f49ec99",
+            "cake_gdp_55a7b3c2baf155618309",
             "cake_gdp_c8580552e73f2264f8eb",
             "cake_gdp_f39daf3dd3cf89844fc1",
             "cake_gdp_3220d37914678385a837",
@@ -3587,8 +3508,9 @@ ROUTES: dict[str, dict[str, list[str]]] = {
         ],
         "decode_nh3": [
             "cake_gdp_f2f0c7abbf10082a6996",
-            "cake_gdp_fefa1931e0ddadb74891",
+            "cake_gdp_e156ee45668b2455e46d",
             "cake_gdp_4d40c98af90453032200",
+            "cake_gdp_fefa1931e0ddadb74891",
             "cake_gdp_27eb88658ee4bdc4ae35",
             "cake_gdp_3cbdef34ce5b580c2216",
             "cake_gdp_5970bfa6676087a3ce92",
@@ -3607,8 +3529,9 @@ ROUTES: dict[str, dict[str, list[str]]] = {
         ],
         "decode_nh3": [
             "cake_gdp_f2f0c7abbf10082a6996",
-            "cake_gdp_fefa1931e0ddadb74891",
+            "cake_gdp_e156ee45668b2455e46d",
             "cake_gdp_4d40c98af90453032200",
+            "cake_gdp_fefa1931e0ddadb74891",
             "cake_gdp_27eb88658ee4bdc4ae35",
             "cake_gdp_3cbdef34ce5b580c2216",
             "cake_gdp_5970bfa6676087a3ce92",
@@ -3738,10 +3661,11 @@ def route_modules(
 def _selects(rule: Any, state_heads: int, sm_count: int, arch: str) -> bool:
     """Whether a static program's band admits ``state_heads = B x HV`` on a device of ``sm_count`` SMs of ``arch``:
     ``above < state_heads <= at_most`` (``at_most`` ``None`` = unbounded) within the wave bounds
-    ``state_heads <= ctas_per_sm_at_most x sm_count`` / ``state_heads > ctas_per_sm_above x sm_count`` when the
-    rule carries them.  A cell naming ``arches`` applies on those architectures only (a band that differs per
-    architecture); a list of such cells is a band of several intervals and admits when any cell does.  ``None`` (a
-    runtime program) admits everything."""
+    ``state_heads <= ctas_per_sm_at_most x sm_count`` / ``state_heads > ctas_per_sm_above x sm_count`` and the
+    inclusive ``state_heads >= ctas_per_sm_at_least x sm_count`` / ``state_heads < ctas_per_sm_below x sm_count``
+    when the rule carries them.  A cell naming ``arches`` applies on those architectures only (a band that differs
+    per architecture); a list of such cells is a band of several intervals and admits when any cell does.  ``None``
+    (a runtime program) admits everything."""
 
     if rule is None:
         return True
@@ -3759,13 +3683,19 @@ def _selects(rule: Any, state_heads: int, sm_count: int, arch: str) -> bool:
         at_most is not None and state_heads > int(at_most)
     ):
         return False
-    waves_at_most, waves_above = (
+    waves_at_most, waves_above, waves_at_least, waves_below = (
         rule.get("ctas_per_sm_at_most"),
         rule.get("ctas_per_sm_above"),
+        rule.get("ctas_per_sm_at_least"),
+        rule.get("ctas_per_sm_below"),
     )
     if waves_at_most is not None and state_heads > int(waves_at_most) * sm_count:
         return False
     if waves_above is not None and state_heads <= int(waves_above) * sm_count:
+        return False
+    if waves_at_least is not None and state_heads < int(waves_at_least) * sm_count:
+        return False
+    if waves_below is not None and state_heads >= int(waves_below) * sm_count:
         return False
     return True
 
@@ -3907,6 +3837,7 @@ def _prefill_flags(rule: Any) -> dict[str, bool]:
 def selected_prefill_module(
     arch: str,
     *,
+    body: str | None = None,
     use_initial_state: bool,
     use_state_indices: bool,
     store_final_state: bool,
@@ -3920,7 +3851,9 @@ def selected_prefill_module(
     ``unit_beta`` off) or absent (``g=None`` / ``beta=None``: the unit programs; both absent is no shipped
     program); never a segment pass.  ``flags`` names further flags of the records' build signatures: a rule not
     spelling one of them is read as off, and a program whose rule spells a flag on is selected only when it is
-    asked for.  Exactly one program must match."""
+    asked for.  ``body`` restricts the search to the programs of one kernel body (``prefill_sm90_v6``, the V6 body,
+    or ``prefill_sm90``, the merged body: ``prefill_body_class`` of the BODY ROUTE OF RECORD below picks the body of
+    every sequence); None searches every body of the route.  Exactly one program must match."""
 
     wanted = {
         "use_initial_state": bool(use_initial_state),
@@ -3933,6 +3866,8 @@ def selected_prefill_module(
     }
     matches = []
     for name in prefill_route_modules(arch, PREFILL_ROUTE):
+        if body is not None and MODULES[name]["body"] != body:
+            continue
         spelled = _prefill_flags(MODULES[name]["select_rule"])
         if all(
             spelled.get(flag, False) == value for flag, value in wanted.items()
@@ -3940,7 +3875,7 @@ def selected_prefill_module(
             matches.append(name)
     if len(matches) != 1:
         raise ValueError(
-            f"{len(matches)} programs of the {PREFILL_ROUTE!r} route on {arch!r} spell the flags {wanted}: {matches}"
+            f"{len(matches)} programs of the {PREFILL_ROUTE!r} route on {arch!r} of body {body!r} spell the flags {wanted}: {matches}"
         )
     return matches[0]
 
@@ -4060,6 +3995,116 @@ def split_table(
 
 
 # ---- END SPLIT RULES OF RECORD ----
+
+# ---- BODY ROUTE OF RECORD (GDP prefill sm_90a body choice per sequence; one text in every copy) ----
+ROUTE_BODY_P3 = "prefill_sm90"  # the merged body: every contract flag, the split items, the unit programs
+ROUTE_BODY_V6 = "prefill_sm90_v6"  # the V6 fork-order body: h0 seed, slot pool, one item per (seq, head)
+ROUTE_BODIES = (ROUTE_BODY_P3, ROUTE_BODY_V6)
+ROUTE_STEP_COST_TENTHS = 36  # a merged-body chunk-step costs 3.6 V6 steps: 7.926 us per merged-body step over 2.203 us per V6 step, both with an initial state, paired H100 measurements over 18 rows (2026-10-27); the fit from the zero-seed V6 step was 31
+# every split item is costed with its warm-up from a zero seed
+ROUTE_WARMUP_CHUNKS = SPLIT_WARMUP_MAX
+ROUTE_MIN_CHUNKS_P3 = 384  # below it the split's warm-up does not pay: every 18-row case under 384 chunks is a V6 win
+
+
+def route_chunk_steps(cu_seqlens, n: int, total_tokens: int | None = None) -> list[int]:
+    """The chunk count of every sequence of the batch: ``split_chunks`` of its clamped length (``split_sequence_bounds``
+    of ``cu_seqlens``, any sequence of ``N + 1`` integers; ``total_tokens`` defaults to its last entry)."""
+    raw = [int(x) for x in cu_seqlens]
+    total = raw[-1] if total_tokens is None else int(total_tokens)
+    chunks = []
+    for seq in range(len(raw) - 1):
+        start, end = split_sequence_bounds(raw[seq], raw[seq + 1], total)
+        chunks.append(split_chunks(end - start, n))
+    return chunks
+
+
+def prefill_body_costs(
+    seq_chunks: int,
+    H: int,
+    n: int,
+    sm_count: int,
+) -> tuple[int, int]:
+    """The cost of one sequence of ``seq_chunks`` chunks under each body as if it were the whole call, ``(cost_v6,
+    cost_p3)`` in tenths of a V6 chunk-step: its chunk-steps over the CTAs its grid occupies (``min(sm_count, items)``),
+    a V6 step costing 10 and a merged-body step ``ROUTE_STEP_COST_TENTHS``. The V6 body runs one item per head over the
+    sequence's chunks; the merged body runs the ``split_count`` items per head, each over ``ceil(chunks / p)`` chunks
+    and the warm-up of ``ROUTE_WARMUP_CHUNKS``. An empty sequence is ``(0, 0)``."""
+    if seq_chunks <= 0 or H <= 0:
+        return 0, 0
+    p, _ = split_count(seq_chunks, H, n, sm_count)
+    cost_v6 = 10 * -(-(H * seq_chunks) // min(sm_count, H))
+    items = H * p
+    item_steps = -(-seq_chunks // p) + ROUTE_WARMUP_CHUNKS
+    waves_p3 = -(-(items * item_steps) // min(sm_count, items))
+    cost_p3 = ROUTE_STEP_COST_TENTHS * waves_p3
+    return cost_v6, cost_p3
+
+
+def prefill_body_class(
+    seq_chunks: int,
+    H: int,
+    n: int,
+    sm_count: int,
+    *,
+    store_final_state: bool = True,
+    unit_gates: bool = False,
+    unit_beta: bool = False,
+) -> str:
+    """The body of one sequence: a function of its own chunk count, ``H``, ``n``, the SM count and the call's flags,
+    never of the batch (a sequence runs the same body alone and in any batch). ``ROUTE_BODY_P3`` for a unit-gate /
+    unit-beta call (no V6 unit program); ``ROUTE_BODY_V6`` for a call without a final state (no merged split program
+    there, and the V6 step is the cheaper), for a sequence under ``ROUTE_MIN_CHUNKS_P3`` chunks (an empty one included:
+    both bodies copy its initial state bitwise) and whenever its merged cost is not below its V6 cost; ``ROUTE_BODY_P3``
+    otherwise -- ``split_count`` then cuts such a sequence (``p >= 2``), so the merged class always runs a split
+    program."""
+    if unit_gates or unit_beta:
+        return ROUTE_BODY_P3
+    if not store_final_state or seq_chunks < ROUTE_MIN_CHUNKS_P3:
+        return ROUTE_BODY_V6
+    cost_v6, cost_p3 = prefill_body_costs(seq_chunks, H, n, sm_count)
+    return ROUTE_BODY_P3 if cost_p3 < cost_v6 else ROUTE_BODY_V6
+
+
+def prefill_body_classes(
+    cu_seqlens,
+    n: int,
+    H: int,
+    sm_count: int,
+    *,
+    store_final_state: bool = True,
+    unit_gates: bool = False,
+    unit_beta: bool = False,
+    total_tokens: int | None = None,
+) -> list[str]:
+    """The body of every sequence of a batch: ``prefill_body_class`` over ``route_chunk_steps``."""
+    return [
+        prefill_body_class(
+            chunks,
+            H,
+            n,
+            sm_count,
+            store_final_state=store_final_state,
+            unit_gates=unit_gates,
+            unit_beta=unit_beta,
+        )
+        for chunks in route_chunk_steps(cu_seqlens, n, total_tokens)
+    ]
+
+
+def prefill_launch_plan(classes) -> list[tuple[str, list[int]]]:
+    """The launches of a batch from its sequences' bodies: one per body present, in ``ROUTE_BODIES`` order, each with
+    the ascending indices of the sequences of that class. One body -> one launch of the whole batch (every performance
+    row); two -> two launches, each over its own sequences' tokens, state slots and O rows alone (no row is touched by
+    both), run on the indexed program of its body with the dense state tensors as pools and ``slot = sequence``."""
+    plan = []
+    for body in ROUTE_BODIES:
+        seqs = [seq for seq, cls in enumerate(classes) if cls == body]
+        if seqs:
+            plan.append((body, seqs))
+    return plan
+
+
+# ---- END BODY ROUTE OF RECORD ----
 
 
 def prefill_split_table(
@@ -4227,6 +4272,9 @@ __all__ = [
     "PREFILL_ROUTE",
     "PREFILL_SPLIT_FLAG",
     "ROUTES",
+    "ROUTE_BODIES",
+    "ROUTE_BODY_P3",
+    "ROUTE_BODY_V6",
     "STATE_ALIGNMENT_BYTES",
     "STATE_STRIDE_ELEMENTS",
     "arch_for_capability",
@@ -4235,10 +4283,15 @@ __all__ = [
     "library_name",
     "load",
     "max_num_tokens",
+    "prefill_body_class",
+    "prefill_body_classes",
+    "prefill_body_costs",
+    "prefill_launch_plan",
     "prefill_route_applies",
     "prefill_route_modules",
     "prefill_split_table",
     "route_applies",
+    "route_chunk_steps",
     "route_key",
     "route_modules",
     "run_module",

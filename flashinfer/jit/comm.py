@@ -25,6 +25,7 @@ from .utils import write_if_different
 from . import env as jit_env
 import os
 import pathlib
+import sys
 import jinja2
 from itertools import product
 from typing import Any, Dict, List, Literal, Tuple
@@ -306,11 +307,38 @@ def gen_ulysses_a2a_module() -> JitSpec:
     )
 
 
+def gen_ulysses_pcie_module() -> JitSpec:
+    """Build the optional single-node PCIe/mlx5 Ulysses transport.
+
+    Reached for ``backend="pcie"`` -- named explicitly, or chosen by ``auto``
+    behind the experimental opt-in -- and deliberately absent from
+    ``flashinfer/aot.py``, so nothing else ever needs rdma-core.
+
+    ``csrc/ulysses_pcie_transport.cuh`` is intentionally not in ``sources``
+    (a ``.cuh`` there would become its own translation unit); ninja's depfile
+    tracks it for rebuilds.
+    """
+    # The CI Conda environment provides rdma-core headers and libraries under
+    # sys.prefix rather than the system paths searched by nvcc and the linker.
+    rdma_prefix = pathlib.Path(sys.prefix)
+    rdma_include = rdma_prefix / "include"
+    rdma_lib = rdma_prefix / "lib"
+    return gen_jit_spec(
+        "ulysses_pcie",
+        [jit_env.FLASHINFER_CSRC_DIR / "ulysses_pcie.cu"],
+        extra_include_paths=[rdma_include]
+        if (rdma_include / "infiniband/mlx5dv.h").is_file()
+        else [],
+        extra_ldflags=([f"-L{rdma_lib}"] if (rdma_lib / "libmlx5.so").is_file() else [])
+        + ["-libverbs", "-lmlx5", "-lcuda"],
+    )
+
+
 CakeAlltoAllTarget = Literal["sm100a", "sm103a"]
 
 _CAKE_ALLTOALL_GENERATED_SOURCE = {
-    "sm100a": "cake_moe_alltoall_sm100.cu",
-    "sm103a": "cake_moe_alltoall_sm103.cu",
+    "sm100a": "cake_moe_alltoall_kernels.cu",
+    "sm103a": "cake_moe_alltoall_kernels.cu",
 }
 _CAKE_ALLTOALL_NVCC_FLAGS = {
     "sm100a": sm100a_nvcc_flags,
@@ -373,7 +401,7 @@ def gen_nvlink_one_sided_alltoall_module() -> JitSpec:
 
     Includes the CFT counted-write path, which is compiled in when the CUDA
     toolkit provides the logical-endpoint API (13.4+) and resolved from the
-    driver at runtime.
+    driver at runtime, and the Lamport path for small steps.
     """
     nv_internal = jit_env.FLASHINFER_CSRC_DIR / "nv_internal"
     common = nv_internal / "cpp" / "common"
@@ -384,6 +412,7 @@ def gen_nvlink_one_sided_alltoall_module() -> JitSpec:
         "nvlink_one_sided_alltoall",
         [
             jit_env.FLASHINFER_CSRC_DIR / "nvlink_one_sided_alltoall.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "nvlink_one_sided_lamport.cu",
             nv_internal
             / "tensorrt_llm"
             / "kernels"

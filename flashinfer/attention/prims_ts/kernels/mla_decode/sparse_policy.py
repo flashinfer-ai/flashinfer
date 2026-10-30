@@ -39,6 +39,7 @@ class SparseMlaProfile:
     kv_pipeline_stages: int = 0
     kv_tile_size: int = 128
     page_pipeline_stages: int = 0
+    whole_kv_tile: bool = False
 
 
 def _base_fp8(rows, heads, capacity, sm_count):
@@ -447,10 +448,84 @@ def _size_buffers(profile, *, rows, heads, query_length, capacity, dtype, sm_cou
     return profile
 
 
-def select_sparse_mla_profile(*, rows, heads, query_length, capacity, dtype, sm_count):
+def select_sparse_mla_profile(
+    *,
+    rows,
+    heads,
+    query_length,
+    capacity,
+    dtype,
+    sm_count,
+    rope_dim=0,
+    kv_cache_format="native",
+):
     """Resolve one complete schedule from the validated public plan bounds."""
+    if (
+        kv_cache_format in ("nvfp4", "nvfp4.fp8rope", "fp8")
+        and dtype == "fp8"
+        and rope_dim in (0, 64)
+        and heads <= 32
+        and capacity >= 512
+        and (rows * 2 >= sm_count or heads >= 16)
+    ):
+        # Retain complete converted tiles even when the query grid is small.
+        # Fill one resident wave with power-of-two KV partitions, preserving
+        # at least two tiles per split for the eight-issuer steady-state loop.
+        # Persistent 1CTA queues do not enumerate KV splits, so small grids
+        # use the same reuse resources with a nonpersistent split schedule.
+        persistent = rows * 2 >= sm_count
+        split_limit = min(capacity // 128 // 2, max(1, sm_count // rows))
+        splits = 1 if persistent else 1 << (split_limit.bit_length() - 1)
+        # Above sixteen heads, WS M64 wins on GB300: its N256 PV consumes
+        # Dv512 in two passes, whereas the narrow Swap-AB path needs four.
+        keep = heads > 16
+        return SparseMlaProfile(
+            family="keep" if keep else "swap",
+            tile_size_q=64 if keep else 8 if heads <= 8 else 16,
+            split_kv=splits,
+            gather_issue_warps=8,
+            reuse_kv=True,
+            whole_kv_tile=True,
+            single_kv_stream=not keep,
+            uniform_offset_cache=keep,
+            paired_correction=keep,
+            scheduler="clc" if persistent else "nonpersistent",
+        )
     choose = _choose_fp8 if dtype == "fp8" else _choose_bf16
     profile = choose(rows, heads, query_length, capacity, sm_count)
+    if (
+        kv_cache_format != "native"
+        and dtype == "fp8"
+        and query_length <= 8
+        and capacity >= 2048
+        and rows >= 16
+        and rows * 2 < sm_count
+    ):
+        if heads == 64 or (
+            heads == 128 and kv_cache_format == "fp8" and rows * 4 < sm_count
+        ):
+            # Small packed grids still benefit from whole-record gathers and
+            # retained WS tiles. At low row counts, two M64 head tiles also
+            # beat group-2 mixed-pool startup despite repeating KV conversion.
+            # Power-of-two splits fill most of a resident wave without adding
+            # a short split for a source-boundary tile.
+            work = rows * ceil(heads / 64)
+            split_limit = min(capacity // 128, max(1, sm_count // work))
+            wave_splits = 1 << (split_limit.bit_length() - 1)
+            profile = SparseMlaProfile(
+                family="keep",
+                split_kv=wave_splits,
+                gather_issue_warps=8,
+                reuse_kv=True,
+                reuse_kv_stages=10,
+                whole_kv_tile=True,
+                uniform_offset_cache=True,
+                paired_correction=True,
+            )
+        elif profile.family == "2cta":
+            # Conversion makes longer per-cluster loops costly. Use the same
+            # resident-wave split sizing below, with two SMs per cluster.
+            profile = replace(profile, split_kv=0)
     profile = _size_buffers(
         profile,
         rows=rows,
@@ -460,6 +535,32 @@ def select_sparse_mla_profile(*, rows, heads, query_length, capacity, dtype, sm_
         dtype=dtype,
         sm_count=sm_count,
     )
+    if (
+        rope_dim
+        and dtype == "bf16"
+        and profile.family == "2cta"
+        and profile.kv_pipeline_stages
+    ):
+        # Each CTA's Q RoPE tail needs 64*rope_dim BF16 elements. A combined
+        # K/V stage holds 64*128, so trade whole prefetch stages for that storage.
+        profile = replace(
+            profile,
+            kv_pipeline_stages=max(
+                4, profile.kv_pipeline_stages - ceil(rope_dim / 128)
+            ),
+        )
+    if rope_dim and profile.reuse_kv:
+        if dtype == "bf16" and profile.family == "keep":
+            # A D576 M64 query plus a retained BK128 BF16 tile exceeds SMEM.
+            # BK64 retains one five-slice K tile plus one prefetched slice;
+            # its pipeline serializes PV before the next complete QK tile.
+            profile = replace(profile, kv_tile_size=64, reuse_kv_stages=6)
+        else:
+            retained_tiles = 2 if dtype == "fp8" else 1
+            profile = replace(
+                profile,
+                reuse_kv_stages=max(profile.reuse_kv_stages, retained_tiles * 5),
+            )
     tile = profile.tile_size_q or {"swap": 16, "keep": 64, "2cta": 128}[profile.family]
     work = rows * ceil(heads / tile)
     splits = profile.split_kv
@@ -486,6 +587,10 @@ def select_sparse_mla_profile(*, rows, heads, query_length, capacity, dtype, sm_
         )
     # Retaining K through PV requires a single owner of the V dimension.
     reuse = profile.reuse_kv and v_ctas == 1
+    if profile.family == "2cta" and kv_cache_format != "native":
+        # Convert each CTA's64 K rows once, then exchange the peer's V
+        # features through DSMEM. Buffering depends on the QK width.
+        profile = replace(profile, balanced_registers=True)
     return replace(
         profile,
         tile_size_q=tile,
@@ -493,4 +598,85 @@ def select_sparse_mla_profile(*, rows, heads, query_length, capacity, dtype, sm_
         head_dim_ctas=v_ctas,
         reuse_kv=reuse,
         reuse_kv_stages=profile.reuse_kv_stages if reuse else 0,
+    )
+
+
+# D576 (DSA) sparse MLA: one CTA per (query token, 64 heads) on the 1CTA
+# keeps-MMA-AB q64 schedule with four Gather4 issue warps and the uniform quad
+# cache (fixed by the D576 1CTA config). Only the split varies with the plan:
+# below D576_SPLIT_KV_MIN_CTAS CTAs most SMs would idle, so every token's top-k
+# list is split into S contiguous tile ranges (one CTA each) and the 1CTA GMEM
+# reducer merges the partials, following trtllm-gen's MLA generation rule.
+D576_SPLIT_KV_MIN_CTAS = 96
+D576_SPLIT_KV_CHOICES = (16, 8, 4, 2)
+
+
+def _d576_v_split(total_ctas: int, sm_count: int) -> int:
+    """V head-dim split of a split launch of ``total_ctas`` CTAs: 4 / 2 while the
+    grid fills at most a quarter / half of the SMs, else 1."""
+    if total_ctas * 4 <= sm_count:
+        return 4
+    if total_ctas * 2 <= sm_count:
+        return 2
+    return 1
+
+
+def select_sparse_mla_d576_split(
+    num_ctas: int, sparse_mla_top_k: int, sm_count: int
+) -> tuple[int, int]:
+    """Return ``(split_kv, head_dim_split)`` for an E4M3 launch of ``num_ctas`` CTAs.
+
+    trtllm-gen's MLA generation rule: split the top-k list so every CTA keeps
+    at least two 128-key tiles within one wave (a top-k of one tile pair:
+    one tile, if the V split then applies), then, while fewer than half the
+    SMs have work, split the 512 V columns over 4 (or 2) CTAs.  Each V
+    slice repeats the QK / softmax of its tiles, but a one- or two-tile CTA is
+    bound by its fixed latency (Q load, first gather, the single QK-softmax-PV
+    chain, the partial-O store), which the slice cuts.  B200, K=2048: B1 is
+    8 x 4 = 32 CTAs instead of 16 x 1.
+    """
+    if num_ctas >= D576_SPLIT_KV_MIN_CTAS:
+        return 1, 1
+    pairs = -(-sparse_mla_top_k // 256)
+    limit = min(pairs, sm_count // num_ctas)
+    split = next((s for s in D576_SPLIT_KV_CHOICES if s <= limit), 1)
+    if split == 1 and sparse_mla_top_k > 128 and num_ctas * 4 <= sm_count:
+        # A single tile pair (top-k <= 256): one tile per CTA, so the V split
+        # below can apply.  B200, top-k 256: B1 9.77 -> 7.52 us (trtllm-gen
+        # 8.13), B32 9.78 -> 9.35; without the V split (B64) one-tile CTAs
+        # are slower (10.6 -> 12.0), hence the quarter-wave bound.
+        split = 2
+    if split == 1:
+        return 1, 1
+    return split, _d576_v_split(num_ctas * split, sm_count)
+
+
+def prefer_sparse_d576_reload(
+    *, rows, heads, query_length, capacity, sm_count, general_profile
+):
+    """Choose native FP8 reload versus the general retained-KV/2CTA pipeline.
+
+    ``capacity`` is the primary top-k slot count and ``rows`` is B*Q. H128
+    benefits from sharing KV in 2CTA beyond the measured four-or-more native
+    KV-partition region. For H64, small grids and short lists favor early K
+    release. Longer queries increase within-request reuse; measured GB300
+    crossovers keep q<=16 on reload, q<=32 through four SM-sized row groups,
+    and larger query grids on retained KV. These are schedule crossovers, not
+    supported-shape limits. ``general_profile`` is the existing alternative:
+    its narrow-Q/V partitions and cluster finish beat a separate native merge
+    on short lists. The native reload launch alone uses grid-z per row.
+    """
+    if rows > 65535:
+        return False
+    if capacity <= 512 and general_profile.family == "swap":
+        return False
+    if heads == 128:
+        return select_sparse_mla_d576_split(rows * 2, capacity, sm_count)[0] >= 4
+    if heads != 64:
+        return False
+    return (
+        capacity <= 256
+        or rows <= sm_count
+        or query_length <= 16
+        or (query_length <= 32 and rows <= 4 * sm_count)
     )

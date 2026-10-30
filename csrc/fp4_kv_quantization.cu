@@ -122,7 +122,9 @@ __device__ uint32_t quantize_fp16_to_e2m1_with_scaling(InType (&vec)[4], float g
   fp8_scale_val = tmp.__x;
   sf_value = static_cast<float>(tmp);
 
-  output_scale = vecMax != 0 ? reciprocal_approximate_ftz(sf_value * global_scale) : 0.0f;
+  // Guard the post-rounding sf_value, not vecMax: the fp8 SF conversion can underflow small
+  // vecMax values to zero, and reciprocal(0) = inf turns zero elements into NaN (see #2441).
+  output_scale = sf_value != 0 ? reciprocal_approximate_ftz(sf_value * global_scale) : 0.0f;
 
   if (block_scale_out) {
     *block_scale_out = fp8_scale_val;
