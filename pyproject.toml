@@ -158,6 +158,12 @@ exclude = [
 ]
 # Generated sources for the experimental exact-SM103a MXFP8 MegaMoE backend.
 "flashinfer.experimental.cake_mxfp8_megamoe_ep16" = ["csrc/**"]
+# Generated CuTe DSL programs of the experimental SM103 / SM107 FP8 / UE8M0 paged MQA decode
+# logits backend, compiled on demand.
+"flashinfer.experimental.cake_fp8_ue8m0_paged_mqa_logits_decode" = ["csrc/**"]
+# Generated CuTe DSL programs of the experimental SM103 / SM107 FP8 / UE8M0 paged MQA prefill
+# logits backend, compiled on demand.
+"flashinfer.experimental.cake_fp8_ue8m0_paged_mqa_logits_prefill" = ["csrc/**"]
 # Generated programs, hand-written bindings and manifest of the experimental
 # exact-SM103a W8A8 MXFP8 MegaMoE EP16 backend, compiled on demand.
 "flashinfer.experimental.cake_w8a8_megamoe_ep16" = ["csrc/**"]
