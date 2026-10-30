@@ -422,35 +422,21 @@ def test_llama4_fused_shared_experts_rejected():
         )
 
 
-def _fused_shared_case(routing_method, logits, top_k, tile_tokens_dim, seed):
-    """(reference thunk, trtllm_gen_routing kwargs) for one routingCustom method."""
-    num_experts = logits.shape[1]
+def _fused_shared_kwargs(routing_method, num_experts, seed):
+    """trtllm_gen_routing kwargs for one routingCustom method."""
     if routing_method == RoutingMethodType.MiniMax2:
         bias = make_bias(num_experts, torch.bfloat16, seed + 1)
-        return (
-            lambda: routing_reference_minimax2(
-                logits, bias, top_k, num_experts, tile_tokens_dim, 1.0
-            ),
-            {"routing_bias": bias, "routed_scaling_factor": 1.0},
-        )
+        return {"routing_bias": bias, "routed_scaling_factor": 1.0}
     if routing_method == RoutingMethodType.DeepSeekV3:
         # n_group = 1 takes the routingCustom no-groups path, not the grouped kernel.
         bias = make_bias(num_experts, torch.bfloat16, seed + 1)
-        return (
-            lambda: routing_reference_no_aux(
-                logits, bias, top_k, 1, 1, 2.5, tile_tokens_dim
-            ),
-            {
-                "routing_bias": bias,
-                "n_group": 1,
-                "topk_group": 1,
-                "routed_scaling_factor": 2.5,
-            },
-        )
-    reference = next(
-        p.values[1] for p in CUSTOM_METHODS if p.values[0] == routing_method
-    )
-    return (lambda: reference(logits, top_k, num_experts, tile_tokens_dim)), {}
+        return {
+            "routing_bias": bias,
+            "n_group": 1,
+            "topk_group": 1,
+            "routed_scaling_factor": 2.5,
+        }
+    return {"routing_bias": None}
 
 
 FUSED_SHARED_METHODS = [
@@ -463,33 +449,32 @@ FUSED_SHARED_METHODS = [
 def run_and_check_fused_shared(
     routing_method, num_tokens, num_experts, top_k, num_shared, tile_tokens_dim
 ):
-    """Routed slots must match the method's oracle; the shared experts must
-    occupy slots [top_k, top_k + S) as ids E + i at weight 1.0 and be permuted
-    together with the routed experts over E + S experts."""
+    """The routed slots must equal the num_fused_shared_experts=0 result (whose
+    selection the per-method tests above check against the host oracles); the
+    shared experts must occupy slots [top_k, top_k + S) as ids E + i at weight
+    1.0 and be permuted together with the routed experts over E + S experts.
+
+    Comparing against the routed-only call rather than the oracle keeps the
+    check exact at large batches, where sigmoid + bias selection keys of
+    distinct logits can sit within float rounding of each other."""
     seed = stable_seed("fused_shared", int(routing_method), num_tokens, num_experts)
     logits = make_logits(num_tokens, num_experts, torch.float32, seed)
-    reference, kwargs = _fused_shared_case(
-        routing_method, logits, top_k, tile_tokens_dim, seed
-    )
-    _, ref_scores = reference()
-    ref_scores = torch.cat(
-        (ref_scores.float(), torch.ones(num_tokens, num_shared, device="cuda")), dim=1
-    )
-    # Widened oracle: routed TopK of the method's dense weights, then the shared
-    # ids [E, E + S) appended for every token, padded per expert.
-    permute_info = routing_reference(
-        ref_scores[:, :num_experts], top_k, tile_tokens_dim, num_shared
-    )
-    routing_bias = kwargs.pop("routing_bias", None)
-    result = trtllm_gen_routing(
-        logits,
-        routing_bias,
-        routing_method,
-        top_k,
-        num_fused_shared_experts=num_shared,
-        tile_tokens_dim=tile_tokens_dim,
-        **kwargs,
-    )
+    kwargs = _fused_shared_kwargs(routing_method, num_experts, seed)
+    routing_bias = kwargs.pop("routing_bias")
+
+    def route(num_fused_shared_experts):
+        return trtllm_gen_routing(
+            logits,
+            routing_bias,
+            routing_method,
+            top_k,
+            num_fused_shared_experts=num_fused_shared_experts,
+            tile_tokens_dim=tile_tokens_dim,
+            **kwargs,
+        )
+
+    routed = route(0)
+    result = route(num_shared)
     total_top_k = top_k + num_shared
     assert result.topk_ids.shape == (num_tokens, total_top_k)
 
@@ -499,7 +484,21 @@ def run_and_check_fused_shared(
     assert (result.topk_ids[:, top_k:] == shared_ids).all(), "shared expert ids"
     assert (result.topk_weights[:, top_k:].float() == 1.0).all(), "shared weights"
 
+    # Dense routed weights of the routed-only call, widened by the shared
+    # experts: the oracle for selection and for the per-expert padded layout.
+    dense = torch.zeros(num_tokens, num_experts, device="cuda")
+    dense.scatter_(1, routed.topk_ids.long(), routed.topk_weights.float())
+    permute_info = routing_reference(dense, top_k, tile_tokens_dim, num_shared)
+    ref_scores = torch.cat(
+        (dense, torch.ones(num_tokens, num_shared, device="cuda")), dim=1
+    )
     check_selection(result, permute_info, ref_scores, total_top_k)
+    torch.testing.assert_close(
+        result.topk_weights.float(),
+        ref_scores.gather(1, result.topk_ids.long()),
+        atol=0,
+        rtol=0,
+    )
     check_permutation(result, permute_info, num_tokens, total_top_k)
 
 
