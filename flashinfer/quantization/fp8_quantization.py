@@ -305,7 +305,8 @@ def mxfp8_quantize(
     backend : {"cuda", "cute-dsl"}
         Backend to use:
 
-        - ``"cuda"``: stable JIT-compiled CUDA kernel (default).
+        - ``"cuda"``: stable JIT-compiled kernel (default). CUDA inputs
+          require SM100 or newer; CPU inputs use the host implementation.
         - ``"cute-dsl"``: CuTe-DSL kernel (SM100+, **experimental**).
     sf_swizzle_layout : SfLayout, optional
         Swizzle layout for scale factors; when supplied this overrides
@@ -318,6 +319,12 @@ def mxfp8_quantize(
         ``FLOAT8_E4M3`` and ``sf`` is the scale-factor tensor whose
         shape depends on the chosen layout and ``sf_vec_size`` (fixed at
         ``32`` here).
+
+    Raises
+    ------
+    ValueError
+        If ``backend="cuda"`` receives a CUDA tensor on a device older
+        than SM100.
 
     Warnings
     --------
@@ -359,6 +366,13 @@ def mxfp8_quantize(
         )
     else:
         # backend == "cuda"
+        if input.device.type == "cuda":
+            major, minor = get_compute_capability(input.device)
+            if major < 10:
+                raise ValueError(
+                    "mxfp8_quantize with backend='cuda' requires SM100 or newer, "
+                    f"got SM{major}{minor}"
+                )
         if enable_pdl is None:
             enable_pdl = device_support_pdl(input.device)
         x_q, sf = get_mxfp8_quantization_sm100_module().mxfp8_quantize_sm100(
