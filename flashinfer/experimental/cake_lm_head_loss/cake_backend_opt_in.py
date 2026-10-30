@@ -83,6 +83,7 @@ from .cake_backend import (
     _Launch,
     _OWNED_VALUES,
     _RECOUNT,
+    _assert_on_device,
     _carve,
     _check_output,
     _deferred_operands,
@@ -386,13 +387,6 @@ def _check_count_on_host(labels: torch.Tensor, count: int) -> None:
     ``>= 0`` and :func:`_check_given_count`'s ``ValueError`` on a mismatch (a compacted call's count is checked by
     :func:`given_valid_rows`)."""
     _check_given_count(count, int((labels >= 0).sum()))
-
-
-def _assert_on_device(condition: torch.Tensor, message: str) -> None:
-    try:
-        torch._assert_async(condition, message)
-    except TypeError:  # a PyTorch without the message argument
-        torch._assert_async(condition)
 
 
 def given_valid_rows(
@@ -4895,13 +4889,15 @@ PRELOAD_ROWS = (
 def preload(device: Optional[Union[torch.device, int, str]] = None) -> None:
     """Do part of the one-time work of a process's first call ahead of it, then wait for the device once.
 
-    ``preload`` loads every library ``device``'s architecture registers (a JIT build when the package ships no
-    prebuilt ``aot/`` library), creates the per-device side stream and its fork event, the hidden count's pinned cell
-    and event, the int32 count constant and the constant cells, launches each PyTorch operator of the valid-row count
-    paths once on a few rows (``ge``, ``cumsum``, ``searchsorted``, ``eq``, ``_assert_async``, ``nonzero``,
-    ``index_select``, ``index_copy_``, ``where``) and then synchronizes ``device``.  It does not launch the package's
-    kernels: under the driver's lazy module loading (``CUDA_MODULE_LOADING=LAZY``, the default) each kernel form still
-    loads at its first launch.  ``device``: a CUDA device, its index or ``None`` (the current device)."""
+    ``preload`` loads every library of the stages ``device``'s architecture registers in ``cake_jit.STAGES`` (a JIT
+    build when the package ships no prebuilt ``aot/`` library; the candidate-support stages of ``cake_support`` are
+    not among them and still load at their first call), creates the per-device side stream and its fork event, the
+    hidden count's pinned cell and event, the int32 count constant and the constant cells, launches each PyTorch
+    operator of the valid-row count paths once on a few rows (``ge``, ``cumsum``, ``searchsorted``, ``eq``,
+    ``_assert_async``, ``nonzero``, ``index_select``, ``index_copy_``, ``where``) and then synchronizes ``device``.
+    It does not launch the package's kernels: under the driver's lazy module loading (``CUDA_MODULE_LOADING=LAZY``,
+    the default) each kernel form still loads at its first launch.  ``device``: a CUDA device, its index or ``None``
+    (the current device)."""
     if device is None:
         dev = torch.device("cuda", torch.cuda.current_device())
     elif isinstance(device, int):

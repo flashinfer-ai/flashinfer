@@ -555,16 +555,123 @@ def chunked_lm_head_preload(device: Optional[Union[torch.device, int, str]] = No
     r"""Do part of the one-time work of a process's first chunked LM-head call
     ahead of it, then wait for the device once (SM100 / SM103 only).
 
-    Loads every generated library of ``device``'s architecture (a JIT build
-    when the package ships no prebuilt library), creates the per-device side
-    stream (PyTorch's stream pool), the count cells and constants, launches the
-    PyTorch operators of the valid-row count paths once and synchronizes.  It
+    Loads every generated library of the loss and log-probability entries for
+    ``device``'s architecture (a JIT build when the package ships no prebuilt
+    library; the candidate-support entries' libraries still load at their first
+    call), creates the per-device side stream (PyTorch's stream pool), the
+    count cells and constants, launches the PyTorch operators of the valid-row
+    count paths once and synchronizes.  It
     does not launch the package's kernels: under the driver's lazy module
     loading (``CUDA_MODULE_LOADING=LAZY``, the default) each kernel form still
     loads at its first launch.  ``device``: a CUDA device, its index or
     ``None`` (the current device).
     """
     _cake_backend_opt_in().preload(device)
+
+
+@functools.cache
+def _cake_support() -> ModuleType:
+    # The candidate-support entries live in their own module of the package; it
+    # binds its kernels through the backend's cache, configured on first use.
+    _cake_backend()
+    from .experimental.cake_lm_head_loss import cake_support
+
+    return cake_support
+
+
+@flashinfer_experimental_api(feature=_FEATURE)
+def chunked_lm_head_support_logprob(
+    X: torch.Tensor,
+    W: torch.Tensor,
+    support_ids: torch.Tensor,
+    support_offsets: torch.Tensor,
+    labels: Optional[torch.Tensor] = None,
+    *,
+    k_cap: int,
+    temperature: Union[None, float, torch.Tensor] = 1.0,
+    chunk_size: Optional[int] = None,
+    check_inputs: bool = False,
+    backend: str = "cake",
+) -> torch.Tensor:
+    r"""Differentiable log-probabilities over a ragged candidate support per token, SM100 / SM103 only.
+
+    The candidates of row ``t`` are ``support_ids[support_offsets[t]:support_offsets[t + 1]]`` (int32 or
+    int64 ids, unique inside a row, any order; int32 or int64 offsets, ``support_offsets[0] = 0``,
+    nondecreasing, ``support_offsets[T] = M``; at most ``k_cap`` per row, never trimmed).  With
+    ``z = X @ W^T`` as a BF16 GEMM (FP32 accumulation, one rounding) and the temperature ``tau_t``:
+    ``logp_j = z_j / tau_t - logsumexp_{k in row t}(z_k / tau_t)`` in FP32, ``0`` on a row of one
+    candidate or none.  ``labels is None``: the packed FP32 ``logp [M]`` in caller order; otherwise
+    the selected FP32 ``logp [T]`` at the int64 ``labels`` (``-100``: 0 with zero gradient; any other
+    label must be one of the row's candidates).  ``temperature``: a finite positive number or an FP32
+    ``[T]`` tensor on ``X``'s device (not differentiable; checked on every row).  ``chunk_size``: the
+    token chunk of the dense pass form and of the large-support weight gradient (default 4096).
+    Invalid support is detected on the device: ``check_inputs=False`` queues an asynchronous
+    assertion (no synchronization; a violation ends the CUDA context), ``check_inputs=True`` reads the
+    validation word back once and raises ``ValueError`` naming the rule and the row.  Gradients flow
+    to ``X`` and ``W`` (BF16, FP32 accumulation, one cast each); outputs and gradients are bitwise
+    reproducible run to run.  ``X [T, H]`` BF16 row-major (``H`` a multiple of 256), ``W [V, H]`` BF16
+    contiguous (``V`` a multiple of 256, at most 1572864).
+    """
+    if backend != "cake":
+        raise ValueError(
+            "the candidate-support LM-head kernels currently support backend='cake'"
+        )
+    return _cake_support().chunked_lm_head_support_logprob(
+        X,
+        W,
+        support_ids,
+        support_offsets,
+        labels,
+        k_cap=k_cap,
+        temperature=temperature,
+        chunk_size=chunk_size,
+        check_inputs=check_inputs,
+        backend="cake",
+    )
+
+
+@flashinfer_experimental_api(feature=_FEATURE)
+def chunked_lm_head_support_kl(
+    X: torch.Tensor,
+    W: torch.Tensor,
+    support_ids: torch.Tensor,
+    support_offsets: torch.Tensor,
+    teacher_logprobs: torch.Tensor,
+    *,
+    k_cap: int,
+    temperature: Union[None, float, torch.Tensor] = 1.0,
+    return_logprobs: bool = False,
+    chunk_size: Optional[int] = None,
+    check_inputs: bool = False,
+    backend: str = "cake",
+):
+    r"""Unreduced forward KL from a detached teacher over a ragged candidate support, SM100 / SM103 only.
+
+    ``KL_t = sum_j Q_j (lq_j - logp_j)`` over the candidates of row ``t`` with ``Q_j = exp(lq_j) > 0``,
+    for the FP32 teacher log-probabilities ``teacher_logprobs [M]`` aligned with ``support_ids``
+    (``requires_grad=False``; ``-inf`` entries drop out) and the student ``logp`` of
+    :func:`chunked_lm_head_support_logprob` on the same support; ``0`` on a row of one candidate or
+    none.  Returns the FP32 ``kl [T]``, or ``(kl, logp)`` with the differentiable packed student
+    ``logp [M]`` when ``return_logprobs=True``.  Weighting, reduction and any ``tau ** 2`` factor
+    belong to the caller.  Other arguments as in :func:`chunked_lm_head_support_logprob`.
+    """
+    if backend != "cake":
+        raise ValueError(
+            "the candidate-support LM-head kernels currently support backend='cake'"
+        )
+    return _cake_support().chunked_lm_head_support_kl(
+        X,
+        W,
+        support_ids,
+        support_offsets,
+        teacher_logprobs,
+        k_cap=k_cap,
+        temperature=temperature,
+        return_logprobs=return_logprobs,
+        chunk_size=chunk_size,
+        check_inputs=check_inputs,
+        backend="cake",
+    )
 
 
 # Read once at import: a malformed value fails here, naming the variable, not

@@ -332,6 +332,89 @@ entry points runs the same chunk loop with PyTorch operators at the same
 rounding boundaries on any device (the host-layer tests use it); the public API
 accepts `backend="cake"` only.
 
+## Candidate-support entry points (`cake_support.py`)
+
+```python
+from flashinfer.chunked_lm_head import (
+    chunked_lm_head_support_kl,
+    chunked_lm_head_support_logprob,
+)
+
+logp = chunked_lm_head_support_logprob(X, W, ids, offsets, k_cap=k_cap)          # packed [M] FP32
+sel = chunked_lm_head_support_logprob(X, W, ids, offsets, labels, k_cap=k_cap)   # selected [T] FP32
+kl, logp = chunked_lm_head_support_kl(X, W, ids, offsets, teacher_logprobs, k_cap=k_cap,
+                                      temperature=tau, return_logprobs=True)
+```
+
+* A ragged candidate support per token (sampling-mask replay, restricted-support
+  self-distillation): row `t` normalizes `z = X @ W^T` over its candidates
+  `ids[offsets[t]:offsets[t + 1]]` only.  `ids [M]` and `offsets [T + 1]` are
+  int32 or int64; ids are unique inside a row, in any order, and repeat freely
+  across rows; `K_t <= k_cap` (a recorded support is never trimmed).  Limits:
+  `H` and `V` multiples of 256, `V <= 1572864` (the validation stage's
+  shared-memory bitmap), `M <= 2^31 - 2^16`.
+* Numerics: the BF16 logits at the support (FP32 accumulation, one rounding),
+  then FP32 `q = RN(z / tau_t)`, an exact row maximum, the row sums in a fixed
+  32-lane order, precise `expf` / `logf`, no fast math.  Rows of one candidate
+  or none give `logp = 0` and `KL = 0` (selects).  `KL_t = sum_j Q_j (lq_j -
+  logp_j)` over the entries with `Q_j = exp(lq_j) > 0` of a detached FP32
+  teacher aligned with `ids`.  Gradients flow to `X` and `W` only (BF16 `dz` at
+  the support, FP32 accumulation, one cast each); the temperature (a positive
+  number or an FP32 `[T]` tensor, the same rules as `chunked_lm_head_logprob`,
+  checked on every row) is a constant.
+* Validation: one kernel forms an int64 error word over the offsets, the cap,
+  the id range, repeated ids and the labels (`-100` ignored; any other label
+  must be one of the row's candidates; a label on an empty row is an error).
+  `check_inputs=False` queues an asynchronous device assertion (no
+  synchronization; a violation ends the CUDA context, like an out-of-range
+  PyTorch index); `check_inputs=True` reads the word back once and raises
+  `ValueError` naming the rule and the row.  Every later kernel clamps the
+  indices it reads, and the sparse `dW` pass drops a pair whose id is outside
+  `[0, V)`, so it stays in bounds for any input.
+* Passes: the logits at the support, the forward row stage, the backward row
+  stage (`dz [M]`), `dX` and `dW`.  Each of the logits, `dX` and `dW` passes has
+  a sparse form (work proportional to `M`: a gather GEMM over tiles of 128
+  pairs; one CTA per token adding its pairs' `W` rows; the sorted unique keys
+  `(id << 32) | pair` and one owner per id adding its pairs' `X` rows, a long
+  segment cut into parts summed in part order) and a dense form (the shipped
+  logits / dX / weight-gradient GEMMs per token chunk and vocabulary block on
+  `W[v0:v1]` views, plus a gather / scatter at the support; `H` a multiple of
+  512 for dX / dW).  A host rule on `M / T` picks the form per pass
+  (`cake_support.SUPPORT_DENSE_MIN_MEAN_K`, constants calibrated per
+  architecture); no
+  synchronization.  The sparse `dW` is stored directly in BF16 up to `2^23`
+  pairs; above that pair ranges accumulate in an FP32 `[V, H]` sum.
+* Memory: no `[T, V]` or `[chunk, V]` tensor in the sparse form; the packed
+  state is `O(M)` (BF16 `z` and `dz`, int32 copies of int64 indices) and
+  `O(T)`; `cake_support.support_memory_report(T, H, V, M, ...)` gives the device
+  bytes of a step by bucket, with the measured `torch.sort` bytes per key
+  (`SORT_BYTES_PER_KEY`) and the split of a long `dW` segment chosen to keep its
+  FP32 partial rows within 128 MiB (table below).
+* Determinism: one owner and one order per sum, no atomics on values; reruns
+  are bitwise equal.  The bits of `dX` / `dW` depend on the pass form,
+  `chunk_size`, the dense vocabulary block and the sparse split (fixed
+  functions of the sizes).  `backend="reference"` on the `cake_support`
+  entry points runs every stage with PyTorch operators at the same rounding
+  boundaries (a development aid that materializes `[chunk, V]` blocks).
+
+Device bytes of one step from `support_memory_report` at `T = 16384`,
+`H = 6144`, `V = 154880` (packed log-probabilities and KL, int64 indices;
+MB = 10^6 bytes).  Each workspace column counts every temporary of its phase
+at once, so it is an upper bound.
+
+| pass forms, pairs `M` | packed state + outputs | forward workspace | backward workspace | FP32 `dW` sum | BF16 `dX` + `dW` |
+|---|---|---|---|---|---|
+| sparse, `2^20` | 11 | 0 | 166 | 0 | 2104 |
+| sparse, `2^23` (the largest BF16-stored `dW`) | 84 | 0 | 623 | 0 | 2104 |
+| sparse, `2^24` (`dW` in ranges of `2^22` pairs) | 168 | 0 | 387 | 3806 | 2104 |
+| dense, `2^23`, `chunk_size` 4096 | 84 | 128 | 346 | 3806 | 2104 |
+| dense, `2^23`, `chunk_size` 16384 | 84 | 512 | 1334 | 0 | 2104 |
+
+The sparse backward workspace is `dz` (2 B per pair), 60.25 B per pair of
+the `dW` pair range (pair and row indices, keys, sort) and at most 128 MiB
+of FP32 partial rows; it does not depend on `V`.  The dense workspace is `dz`
+plus blocks of `chunk_size` rows and at most 16384 vocabulary columns.
+
 ## Switches and environment variables
 
 Every switch above is a keyword argument of each entry point it affects
@@ -578,6 +661,10 @@ workspace; the logits GEMM's output descriptor covers the chunk's rows only.
   through FlashInfer (`gen_jit_spec`, sources digest-verified first);
   `cake_jit.specs_for_arch(arch)` lists the JIT specs of an architecture for
   `flashinfer.jit.build_jit_specs`.
+* `cake_support.py` -- the candidate-support entry points: their host checks,
+  the shared temperature resolver's use, the plan of the pass forms, the
+  launches of the support kernels and of the shipped GEMMs (dense form), the
+  memory report, the reference engine and the autograd `Function`.
 * `cake_backend.py` -- validation, chunk plans, workspace layout, memory
   accounting, argument-plan binding, the prepared runner, the torch reference
   path, the autograd `Function`s and the eager entry points.
@@ -605,8 +692,14 @@ The registry holds one record per architecture (`sm_100a`, `sm_103a`),
 `cake_lm_head_loss_<arch>`, geometry-free (`H` / `V` and the rules' outputs are
 launch scalars: every `H` a multiple of 512 and `V` a multiple of 256 runs on
 it), with the sixteen base stages above plus the sixteen structural forms the
-rules can reach (`abi = lm_head_loss_v1`), exported from the kernel snapshot
-named in the pull request.
+rules can reach (`abi = lm_head_loss_v1`) and the fourteen candidate-support
+programs (`cake_support.SUPPORT_STAGES`: the validation stage per index width,
+the two row stages, the gather and scatter of the dense form, the support
+logits gather GEMM and the segment gather-accumulate dX / dW / combine kernels
+in their BF16 and FP32-accumulate modes), exported from the kernel snapshot
+named in the pull request.  `tests/experimental/test_cake_lm_head_support.py`
+tests the candidate-support entries (host rules and the reference backend on
+any device, the cake backend on a registered device).
 
 Tests: `tests/experimental/test_cake_lm_head_loss.py` and the public-API suite
 `tests/experimental/test_cake_lm_head_loss_api.py` (the host-layer tests
