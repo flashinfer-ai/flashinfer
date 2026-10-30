@@ -147,6 +147,7 @@ def _get_sm100_kernel(
     k: int,
     stream,
     enable_pdl: bool = False,
+    debug: bool = False,
 ):
     import cutlass.cute as cute
 
@@ -165,6 +166,7 @@ def _get_sm100_kernel(
         transform_fragment_size,
         max_active_clusters,
         enable_pdl,
+        debug,
     )
     compiled = _KERNEL_CACHE.get(key)
     if compiled is not None:
@@ -179,6 +181,7 @@ def _get_sm100_kernel(
         raster_along_m=raster_along_m,
         transform_fragment_size=transform_fragment_size,
         enable_pdl=enable_pdl,
+        debug=debug,
     )
     compiled = cute.compile(
         kernel.wrapper,
@@ -201,10 +204,13 @@ def w8a16_fp8_gemm_cute_dsl(
     bias: Optional[torch.Tensor] = None,
     out: Optional[torch.Tensor] = None,
     algo: int = 0,
+    debug_buffer: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Blackwell W8A16 GEMM in CuTe-DSL.  ``algo`` as the C++ op's codes (0 = the
     dispatcher's choice); split-K and stream-K codes are not implemented yet and
-    fall back to the plain 256x128 tile."""
+    fall back to the plain 256x128 tile.  ``debug_buffer``: an Int32 tensor of at
+    least 16 * 4096 entries (pinned host memory to watch a hang) that the kernel's
+    debug build writes its per-CTA progress into; None = the production build."""
     import cutlass
     import cutlass.cute as cute
 
@@ -270,6 +276,12 @@ def w8a16_fp8_gemm_cute_dsl(
             bias_ctype, bias_tensor.data_ptr(), cute.AddressSpace.gmem, assumed_align=4
         ),
         make_ptr(act_ctype, out.data_ptr(), cute.AddressSpace.gmem, assumed_align=16),
+        make_ptr(
+            cutlass.Int32,
+            (debug_buffer if debug_buffer is not None else weight_scale).data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=4,
+        ),
     )
     stream = current_cuda_stream()
     max_active_clusters = get_max_active_clusters(cluster[0] * cluster[1])
@@ -285,6 +297,7 @@ def w8a16_fp8_gemm_cute_dsl(
         m,
         k,
         stream,
+        debug=debug_buffer is not None,
     )
     compiled(
         weight.data_ptr(),
@@ -292,6 +305,7 @@ def w8a16_fp8_gemm_cute_dsl(
         weight_scale.data_ptr(),
         bias_tensor.data_ptr(),
         out.data_ptr(),
+        (debug_buffer if debug_buffer is not None else weight_scale).data_ptr(),
         n,
         m,
         k,

@@ -54,7 +54,13 @@ class Sm100W8A16Fp8GemmKernel:
         raster_along_m: bool,
         transform_fragment_size: int,
         enable_pdl: bool,
+        debug: bool = False,
     ):
+        # debug: every warp role writes its tile count and a wait-site marker into the
+        # `dbg` buffer (16 Int32 per CTA: slots 0-5 tile counts of scheduler, activation
+        # TMA, weight TMA, transform, MMA, epilogue; slots 8-13 their markers).  Give it
+        # pinned host memory and poll it to see where a hang sits.
+        self.debug = debug
         self.acc_dtype = cutlass.Float32
         self.mma_tiler = mma_tiler_mnk
         self.use_2cta_instrs = use_2cta_instrs
@@ -352,6 +358,7 @@ class Sm100W8A16Fp8GemmKernel:
         scale_ptr: cute.Pointer,
         bias_ptr: cute.Pointer,
         output_ptr: cute.Pointer,
+        dbg_ptr: cute.Pointer,
         n: cutlass.Int64,
         m: cutlass.Int64,
         k: cutlass.Int64,
@@ -360,7 +367,8 @@ class Sm100W8A16Fp8GemmKernel:
     ):
         """Build the logical tensors: weight [n, k] and activation [m, k] K-major,
         out [m, n] row-major seen as C[n, m] column-major; scale is one fp32; bias is
-        [n] in the activation dtype (any pointer when ``has_bias`` is False)."""
+        [n] in the activation dtype (any pointer when ``has_bias`` is False); dbg is
+        the debug buffer (any pointer when ``debug`` is False)."""
         weight = cute.make_tensor(
             weight_ptr, cute.make_ordered_layout((n, k, 1), order=(1, 0, 2))
         )
@@ -372,8 +380,9 @@ class Sm100W8A16Fp8GemmKernel:
         )
         scale = cute.make_tensor(scale_ptr, cute.make_layout((1,)))
         bias = cute.make_tensor(bias_ptr, cute.make_layout((n,)))
+        dbg = cute.make_tensor(dbg_ptr, cute.make_layout((16 * 4096,)))
         return self(
-            weight, activation, scale, bias, output, max_active_clusters, stream
+            weight, activation, scale, bias, output, dbg, max_active_clusters, stream
         )
 
     @cute.jit
@@ -384,6 +393,7 @@ class Sm100W8A16Fp8GemmKernel:
         scale: cute.Tensor,
         bias: cute.Tensor,
         c: cute.Tensor,
+        dbg: cute.Tensor,
         max_active_clusters: cutlass.Constexpr,
         stream: cuda.CUstream,
     ):
@@ -496,6 +506,7 @@ class Sm100W8A16Fp8GemmKernel:
             c,
             scale,
             bias,
+            dbg,
             self.cluster_layout_vmnk,
             self.smem_layout_a,
             self.smem_layout_a_transform,
@@ -526,6 +537,7 @@ class Sm100W8A16Fp8GemmKernel:
         tensor_c: cute.Tensor,
         scale: cute.Tensor,
         bias: cute.Tensor,
+        dbg: cute.Tensor,
         cluster_layout_vmnk: cute.Layout,
         a_smem_layout: cute.ComposedLayout,
         a_smem_layout_transform: cute.ComposedLayout,
@@ -537,6 +549,8 @@ class Sm100W8A16Fp8GemmKernel:
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         tidx, _, _ = cute.arch.thread_idx()
         bidx, bidy, bidz = cute.arch.block_idx()
+        gdx, gdy, _ = cute.arch.grid_dim()
+        dbg_base = (bidx + gdx * (bidy + gdy * bidz)) * 16
         if warp_idx == self.epilog_warp_id[0]:
             cpasync.prefetch_descriptor(tma_atom_a)
             cpasync.prefetch_descriptor(tma_atom_b)
@@ -748,6 +762,7 @@ class Sm100W8A16Fp8GemmKernel:
             )
             work_tile = tile_sched.initial_work_tile_info()
             not_last_tile = cutlass.Boolean(1)
+            dbg_tiles = cutlass.Int32(0)
             while not_last_tile:
                 cluster_tile_coord_mnl = work_tile.tile_idx
                 cta_tile_coord_m = (
@@ -771,7 +786,15 @@ class Sm100W8A16Fp8GemmKernel:
                     )
                 is_dense_tile = has_work and (act_tile_idx < act_tiles)
                 if is_dense_tile or not has_work:
+                    if cutlass.const_expr(self.debug):
+                        with cute.arch.elect_one():
+                            dbg[dbg_base + 8] = cutlass.Int32(1)
                     tile_info_pipeline.producer_acquire(tile_info_producer_state)
+                    if cutlass.const_expr(self.debug):
+                        dbg_tiles += 1
+                        with cute.arch.elect_one():
+                            dbg[dbg_base + 8] = cutlass.Int32(2)
+                            dbg[dbg_base + 0] = dbg_tiles
                     act_start = cutlass.Int32(-1)
                     group_idx = cutlass.Int32(1)  # 1 = no work (group_count is 1)
                     distance_to_boundary = cutlass.Int32(-1)
@@ -802,7 +825,7 @@ class Sm100W8A16Fp8GemmKernel:
             tile_info_consumer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Consumer, self.num_tile_info_stage
             )
-            work_tile = self._next_work_tile(
+            work_tile, tile_info_consumer_state = self._next_work_tile(
                 tile_info_pipeline, tile_info_consumer_state, sTile_info
             )
             b_load2mma_producer_state = pipeline.make_pipeline_state(
@@ -810,7 +833,11 @@ class Sm100W8A16Fp8GemmKernel:
             )
             if cutlass.const_expr(self.enable_pdl):
                 griddepcontrol_wait()
+            dbg_tiles = cutlass.Int32(0)
             while work_tile.is_valid_tile:
+                if cutlass.const_expr(self.debug):
+                    with cute.arch.elect_one():
+                        dbg[dbg_base + 9] = cutlass.Int32(1)
                 coord_n_offset = (
                     (work_tile.coord_n, 0)
                     if cutlass.const_expr(
@@ -839,7 +866,12 @@ class Sm100W8A16Fp8GemmKernel:
                     )
                     b_load2mma_pipeline.producer_commit(b_load2mma_producer_state)
                     b_load2mma_producer_state.advance()
-                work_tile = self._next_work_tile(
+                if cutlass.const_expr(self.debug):
+                    dbg_tiles += 1
+                    with cute.arch.elect_one():
+                        dbg[dbg_base + 1] = dbg_tiles
+                        dbg[dbg_base + 9] = cutlass.Int32(2)
+                work_tile, tile_info_consumer_state = self._next_work_tile(
                     tile_info_pipeline, tile_info_consumer_state, sTile_info
                 )
             b_load2mma_pipeline.producer_tail(b_load2mma_producer_state)
@@ -850,13 +882,17 @@ class Sm100W8A16Fp8GemmKernel:
             tile_info_consumer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Consumer, self.num_tile_info_stage
             )
-            work_tile = self._next_work_tile(
+            work_tile, tile_info_consumer_state = self._next_work_tile(
                 tile_info_pipeline, tile_info_consumer_state, sTile_info
             )
             a_load2trans_producer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer, self.num_load2trans_stage
             )
+            dbg_tiles = cutlass.Int32(0)
             while work_tile.is_valid_tile:
+                if cutlass.const_expr(self.debug):
+                    with cute.arch.elect_one():
+                        dbg[dbg_base + 10] = cutlass.Int32(1)
                 tAgA_slice = tAgA[
                     (
                         None,
@@ -894,7 +930,12 @@ class Sm100W8A16Fp8GemmKernel:
                                 a_load2trans_producer_state
                             )
                         )
-                work_tile = self._next_work_tile(
+                if cutlass.const_expr(self.debug):
+                    dbg_tiles += 1
+                    with cute.arch.elect_one():
+                        dbg[dbg_base + 2] = dbg_tiles
+                        dbg[dbg_base + 10] = cutlass.Int32(2)
+                work_tile, tile_info_consumer_state = self._next_work_tile(
                     tile_info_pipeline, tile_info_consumer_state, sTile_info
                 )
             a_load2trans_pipeline.producer_tail(a_load2trans_producer_state)
@@ -929,7 +970,7 @@ class Sm100W8A16Fp8GemmKernel:
             tile_info_consumer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Consumer, self.num_tile_info_stage
             )
-            work_tile = self._next_work_tile(
+            work_tile, tile_info_consumer_state = self._next_work_tile(
                 tile_info_pipeline, tile_info_consumer_state, sTile_info
             )
             a_load2trans_consumer_state = pipeline.make_pipeline_state(
@@ -938,7 +979,12 @@ class Sm100W8A16Fp8GemmKernel:
             trans2mma_producer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer, self.num_trans2mma_stage
             )
+            dbg_tiles = cutlass.Int32(0)
             while work_tile.is_valid_tile:
+                if cutlass.const_expr(self.debug):
+                    if warp_idx == self.transform_warp_id[0]:
+                        with cute.arch.elect_one():
+                            dbg[dbg_base + 11] = cutlass.Int32(1)
                 a_load2trans_consumer_state, trans2mma_producer_state = (
                     self._transform_tile(
                         a_load2trans_pipeline,
@@ -955,7 +1001,13 @@ class Sm100W8A16Fp8GemmKernel:
                         k_tile_cnt,
                     )
                 )
-                work_tile = self._next_work_tile(
+                if cutlass.const_expr(self.debug):
+                    dbg_tiles += 1
+                    if warp_idx == self.transform_warp_id[0]:
+                        with cute.arch.elect_one():
+                            dbg[dbg_base + 3] = dbg_tiles
+                            dbg[dbg_base + 11] = cutlass.Int32(2)
+                work_tile, tile_info_consumer_state = self._next_work_tile(
                     tile_info_pipeline, tile_info_consumer_state, sTile_info
                 )
             trans2mma_pipeline.producer_tail(trans2mma_producer_state)
@@ -980,7 +1032,7 @@ class Sm100W8A16Fp8GemmKernel:
             tile_info_consumer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Consumer, self.num_tile_info_stage
             )
-            work_tile = self._next_work_tile(
+            work_tile, tile_info_consumer_state = self._next_work_tile(
                 tile_info_pipeline, tile_info_consumer_state, sTile_info
             )
             trans2mma_consumer_state = pipeline.make_pipeline_state(
@@ -992,6 +1044,7 @@ class Sm100W8A16Fp8GemmKernel:
             acc_producer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer, self.num_acc_stage
             )
+            dbg_tiles = cutlass.Int32(0)
             while work_tile.is_valid_tile:
                 tCtAcc = accumulators[(None, None, None, acc_producer_state.index)]
                 b_load2mma_consumer_state.reset_count()
@@ -1004,13 +1057,25 @@ class Sm100W8A16Fp8GemmKernel:
                                 trans2mma_consumer_state
                             )
                         )
+                    if cutlass.const_expr(self.debug):
+                        with cute.arch.elect_one():
+                            dbg[dbg_base + 12] = cutlass.Int32(1)
                     acc_pipeline.producer_acquire(acc_producer_state)
                     tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
                     for _k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
+                        if cutlass.const_expr(self.debug):
+                            with cute.arch.elect_one():
+                                dbg[dbg_base + 12] = cutlass.Int32(2)
                         trans2mma_pipeline.consumer_wait(
                             trans2mma_consumer_state, peek_trans2mma_full_status
                         )
+                        if cutlass.const_expr(self.debug):
+                            with cute.arch.elect_one():
+                                dbg[dbg_base + 12] = cutlass.Int32(3)
                         b_load2mma_pipeline.consumer_wait(b_load2mma_consumer_state)
+                        if cutlass.const_expr(self.debug):
+                            with cute.arch.elect_one():
+                                dbg[dbg_base + 12] = cutlass.Int32(4)
                         num_kblocks = cute.size(tCrA, mode=[2])
                         for kblock_idx in cutlass.range(num_kblocks, unroll_full=True):
                             kblock_coord_a = (
@@ -1046,7 +1111,12 @@ class Sm100W8A16Fp8GemmKernel:
                             )
                     acc_pipeline.producer_commit(acc_producer_state)
                 acc_producer_state.advance()
-                work_tile = self._next_work_tile(
+                if cutlass.const_expr(self.debug):
+                    dbg_tiles += 1
+                    with cute.arch.elect_one():
+                        dbg[dbg_base + 4] = dbg_tiles
+                        dbg[dbg_base + 12] = cutlass.Int32(5)
+                work_tile, tile_info_consumer_state = self._next_work_tile(
                     tile_info_pipeline, tile_info_consumer_state, sTile_info
                 )
             acc_pipeline.producer_tail(acc_producer_state)
@@ -1120,7 +1190,7 @@ class Sm100W8A16Fp8GemmKernel:
             tile_info_consumer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Consumer, self.num_tile_info_stage
             )
-            work_tile = self._next_work_tile(
+            work_tile, tile_info_consumer_state = self._next_work_tile(
                 tile_info_pipeline, tile_info_consumer_state, sTile_info
             )
             weight_rows = cutlass.Int32(cute.size(tensor_c.shape[0]))
@@ -1132,8 +1202,12 @@ class Sm100W8A16Fp8GemmKernel:
                 "the per-thread bias register assumes the 32x32b TMEM load (128 rows)"
             )
             thread_row = m_thr_offset[(0, 0, 0, 0)][0]
+            dbg_tiles = cutlass.Int32(0)
             while work_tile.is_valid_tile:
                 m_base = work_tile.cta_coord_m * self.cta_tile_shape_mnk[0]
+                if cutlass.const_expr(self.debug):
+                    if epi_tidx == 0:
+                        dbg[dbg_base + 13] = cutlass.Int32(1)
 
                 bSG_gC = bSG_gC_partitioned[
                     (
@@ -1181,6 +1255,9 @@ class Sm100W8A16Fp8GemmKernel:
                 tTR_tAcc = cute.group_modes(tTR_tAcc, 3, cute.rank(tTR_tAcc))
 
                 acc_pipeline.consumer_wait(acc_consumer_state)
+                if cutlass.const_expr(self.debug):
+                    if epi_tidx == 0:
+                        dbg[dbg_base + 13] = cutlass.Int32(2)
                 # Scale and bias are read after the accumulator wait so that under PDL
                 # they are ordered behind the preceding grid too.
                 scale_val = cutlass.Float32(scale[0])
@@ -1243,7 +1320,12 @@ class Sm100W8A16Fp8GemmKernel:
                             cute.flatten(tTR_gC[(None, None, None, subtile_idx)]),
                             pred=cute.flatten(tCpC),
                         )
-                work_tile = self._next_work_tile(
+                if cutlass.const_expr(self.debug):
+                    dbg_tiles += 1
+                    if epi_tidx == 0:
+                        dbg[dbg_base + 5] = dbg_tiles
+                        dbg[dbg_base + 13] = cutlass.Int32(3)
+                work_tile, tile_info_consumer_state = self._next_work_tile(
                     tile_info_pipeline, tile_info_consumer_state, sTile_info
                 )
 
@@ -1264,7 +1346,8 @@ class Sm100W8A16Fp8GemmKernel:
         tile_info_consumer_state: pipeline.PipelineState,
         sTile_info: cute.Tensor,
     ):
-        """Consume the next tile_info record (one group, so group index 1 = done)."""
+        """Consume the next tile_info record (one group, so group index 1 = done);
+        returns it with the advanced consumer state."""
         tile_info_pipeline.consumer_wait(tile_info_consumer_state)
         work_tile = mixed_input_utils.make_contiguous_group_work_tile_info(
             1, sTile_info[(None, tile_info_consumer_state.index)]
@@ -1272,7 +1355,11 @@ class Sm100W8A16Fp8GemmKernel:
         cute.arch.fence_proxy("async.shared", space="cta")
         tile_info_pipeline.consumer_release(tile_info_consumer_state)
         tile_info_consumer_state.advance()
-        return work_tile
+        # The advanced state is returned, not relied on as an in-place mutation: a
+        # pipeline state handed to a @cute.jit helper is rebuilt from its MLIR values on
+        # entry, so the caller's object does not see the advance (same reason
+        # _transform_tile returns its states).
+        return work_tile, tile_info_consumer_state
 
     # --------------------------------------------------------------- sizing
     @staticmethod
