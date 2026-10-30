@@ -357,6 +357,13 @@ kernel_cake_ulysses_a2a_0f6daa3f5ad400c9b220(__nv_bfloat16* __restrict__ inp, __
                     reinterpret_cast<int4*>(_gst_9)[0] = reinterpret_cast<int4*>(first_0)[0];
                 }
             }
+            if (sub * 7680 + (480 + tid_0) < units) {
+                {
+                    auto _gst_10 = peer_signals + (2048 + (zone_slot + (480 + tid_0)) * 4);
+                    __builtin_assume(__isGlobal(_gst_10));
+                    reinterpret_cast<int4*>(_gst_10)[0] = reinterpret_cast<int4*>(first_1)[0];
+                }
+            }
         }
     }
     if (tid_0 == 480) {
@@ -426,11 +433,11 @@ kernel_cake_ulysses_a2a_0f6daa3f5ad400c9b220(__nv_bfloat16* __restrict__ inp, __
                     unsigned int dst_3 = (quotient_13 + (batch_3 * 7 + rank) * sequences) * block_units + remainder_13;
                     unsigned int vec_0[4];
                     {
-                        uint4 _uv4_11 = *reinterpret_cast<const uint4*>(inp_words + (src_6 * 4) + 0);
-                        vec_0[0 + 0] = _uv4_11.x;
-                        vec_0[0 + 1] = _uv4_11.y;
-                        vec_0[0 + 2] = _uv4_11.z;
-                        vec_0[0 + 3] = _uv4_11.w;
+                        uint4 _uv4_12 = *reinterpret_cast<const uint4*>(inp_words + (src_6 * 4) + 0);
+                        vec_0[0 + 0] = _uv4_12.x;
+                        vec_0[0 + 1] = _uv4_12.y;
+                        vec_0[0 + 2] = _uv4_12.z;
+                        vec_0[0 + 3] = _uv4_12.w;
                     }
                     unsigned int unit_13 = sub * 7680 + (2400 + tid_0);
                     unsigned int clamped_13 = ((unit_13 < units) ? unit_13 : last_unit_2);
@@ -444,11 +451,11 @@ kernel_cake_ulysses_a2a_0f6daa3f5ad400c9b220(__nv_bfloat16* __restrict__ inp, __
                     unsigned int dst_4 = (quotient_14 + (batch_4 * 7 + rank) * sequences) * block_units + remainder_14;
                     unsigned int vec_1[4];
                     {
-                        uint4 _uv4_12 = *reinterpret_cast<const uint4*>(inp_words + (src_6_1 * 4) + 0);
-                        vec_1[0 + 0] = _uv4_12.x;
-                        vec_1[0 + 1] = _uv4_12.y;
-                        vec_1[0 + 2] = _uv4_12.z;
-                        vec_1[0 + 3] = _uv4_12.w;
+                        uint4 _uv4_13 = *reinterpret_cast<const uint4*>(inp_words + (src_6_1 * 4) + 0);
+                        vec_1[0 + 0] = _uv4_13.x;
+                        vec_1[0 + 1] = _uv4_13.y;
+                        vec_1[0 + 2] = _uv4_13.z;
+                        vec_1[0 + 3] = _uv4_13.w;
                     }
                     unsigned int unit_14 = sub * 7680 + (2880 + tid_0);
                     unsigned int clamped_14 = ((unit_14 < units) ? unit_14 : last_unit_2);
@@ -462,11 +469,11 @@ kernel_cake_ulysses_a2a_0f6daa3f5ad400c9b220(__nv_bfloat16* __restrict__ inp, __
                     unsigned int dst_5 = (quotient_15 + (batch_5 * 7 + rank) * sequences) * block_units + remainder_15;
                     unsigned int vec_2[4];
                     {
-                        uint4 _uv4_13 = *reinterpret_cast<const uint4*>(inp_words + (src_7 * 4) + 0);
-                        vec_2[0 + 0] = _uv4_13.x;
-                        vec_2[0 + 1] = _uv4_13.y;
-                        vec_2[0 + 2] = _uv4_13.z;
-                        vec_2[0 + 3] = _uv4_13.w;
+                        uint4 _uv4_14 = *reinterpret_cast<const uint4*>(inp_words + (src_7 * 4) + 0);
+                        vec_2[0 + 0] = _uv4_14.x;
+                        vec_2[0 + 1] = _uv4_14.y;
+                        vec_2[0 + 2] = _uv4_14.z;
+                        vec_2[0 + 3] = _uv4_14.w;
                     }
                     unsigned int unit_15 = sub * 7680 + (3360 + tid_0);
                     unsigned int clamped_15 = ((unit_15 < units) ? unit_15 : last_unit_2);
@@ -480,40 +487,42 @@ kernel_cake_ulysses_a2a_0f6daa3f5ad400c9b220(__nv_bfloat16* __restrict__ inp, __
                     unsigned int dst_6 = (quotient_16 + (batch_6 * 7 + rank) * sequences) * block_units + remainder_16;
                     unsigned int vec_3[4];
                     {
-                        uint4 _uv4_14 = *reinterpret_cast<const uint4*>(inp_words + (src_8 * 4) + 0);
-                        vec_3[0 + 0] = _uv4_14.x;
-                        vec_3[0 + 1] = _uv4_14.y;
-                        vec_3[0 + 2] = _uv4_14.z;
-                        vec_3[0 + 3] = _uv4_14.w;
+                        uint4 _uv4_15 = *reinterpret_cast<const uint4*>(inp_words + (src_8 * 4) + 0);
+                        vec_3[0 + 0] = _uv4_15.x;
+                        vec_3[0 + 1] = _uv4_15.y;
+                        vec_3[0 + 2] = _uv4_15.z;
+                        vec_3[0 + 3] = _uv4_15.w;
                     }
                     if (!zoned) {
                         if (unit_8 < units) {
                             {
-                                auto _gst_15 = peer_words + (dst * 4);
-                                __builtin_assume(__isGlobal(_gst_15));
-                                reinterpret_cast<int4*>(_gst_15)[0] = reinterpret_cast<int4*>(first_0)[0];
+                                auto _gst_16 = peer_words + (dst * 4);
+                                __builtin_assume(__isGlobal(_gst_16));
+                                reinterpret_cast<int4*>(_gst_16)[0] = reinterpret_cast<int4*>(first_0)[0];
                             }
                         }
                     }
-                    if (unit_9 < units) {
-                        {
-                            auto _gst_16 = peer_words + (dst_0 * 4);
-                            __builtin_assume(__isGlobal(_gst_16));
-                            reinterpret_cast<int4*>(_gst_16)[0] = reinterpret_cast<int4*>(first_1)[0];
+                    if (!zoned) {
+                        if (unit_9 < units) {
+                            {
+                                auto _gst_17 = peer_words + (dst_0 * 4);
+                                __builtin_assume(__isGlobal(_gst_17));
+                                reinterpret_cast<int4*>(_gst_17)[0] = reinterpret_cast<int4*>(first_1)[0];
+                            }
                         }
                     }
                     if (unit_10 < units) {
                         {
-                            auto _gst_17 = peer_words + (dst_1 * 4);
-                            __builtin_assume(__isGlobal(_gst_17));
-                            reinterpret_cast<int4*>(_gst_17)[0] = reinterpret_cast<int4*>(first_2)[0];
+                            auto _gst_18 = peer_words + (dst_1 * 4);
+                            __builtin_assume(__isGlobal(_gst_18));
+                            reinterpret_cast<int4*>(_gst_18)[0] = reinterpret_cast<int4*>(first_2)[0];
                         }
                     }
                     if (unit_11 < units) {
                         {
-                            auto _gst_18 = peer_words + (dst_2 * 4);
-                            __builtin_assume(__isGlobal(_gst_18));
-                            reinterpret_cast<int4*>(_gst_18)[0] = reinterpret_cast<int4*>(first_3)[0];
+                            auto _gst_19 = peer_words + (dst_2 * 4);
+                            __builtin_assume(__isGlobal(_gst_19));
+                            reinterpret_cast<int4*>(_gst_19)[0] = reinterpret_cast<int4*>(first_3)[0];
                         }
                     }
                     unsigned int unit_16 = sub * 7680 + (3840 + tid_0);
@@ -528,11 +537,11 @@ kernel_cake_ulysses_a2a_0f6daa3f5ad400c9b220(__nv_bfloat16* __restrict__ inp, __
                     unsigned int dst_7 = (quotient_17 + (batch_7 * 7 + rank) * sequences) * block_units + remainder_17;
                     unsigned int vec_4[4];
                     {
-                        uint4 _uv4_19 = *reinterpret_cast<const uint4*>(inp_words + (src_9 * 4) + 0);
-                        vec_4[0 + 0] = _uv4_19.x;
-                        vec_4[0 + 1] = _uv4_19.y;
-                        vec_4[0 + 2] = _uv4_19.z;
-                        vec_4[0 + 3] = _uv4_19.w;
+                        uint4 _uv4_20 = *reinterpret_cast<const uint4*>(inp_words + (src_9 * 4) + 0);
+                        vec_4[0 + 0] = _uv4_20.x;
+                        vec_4[0 + 1] = _uv4_20.y;
+                        vec_4[0 + 2] = _uv4_20.z;
+                        vec_4[0 + 3] = _uv4_20.w;
                     }
                     unsigned int unit_17 = sub * 7680 + (4320 + tid_0);
                     unsigned int clamped_17 = ((unit_17 < units) ? unit_17 : last_unit_2);
@@ -546,11 +555,11 @@ kernel_cake_ulysses_a2a_0f6daa3f5ad400c9b220(__nv_bfloat16* __restrict__ inp, __
                     unsigned int dst_8 = (quotient_18 + (batch_8 * 7 + rank) * sequences) * block_units + remainder_18;
                     unsigned int vec_5[4];
                     {
-                        uint4 _uv4_20 = *reinterpret_cast<const uint4*>(inp_words + (src_10 * 4) + 0);
-                        vec_5[0 + 0] = _uv4_20.x;
-                        vec_5[0 + 1] = _uv4_20.y;
-                        vec_5[0 + 2] = _uv4_20.z;
-                        vec_5[0 + 3] = _uv4_20.w;
+                        uint4 _uv4_21 = *reinterpret_cast<const uint4*>(inp_words + (src_10 * 4) + 0);
+                        vec_5[0 + 0] = _uv4_21.x;
+                        vec_5[0 + 1] = _uv4_21.y;
+                        vec_5[0 + 2] = _uv4_21.z;
+                        vec_5[0 + 3] = _uv4_21.w;
                     }
                     unsigned int unit_18 = sub * 7680 + (4800 + tid_0);
                     unsigned int clamped_18 = ((unit_18 < units) ? unit_18 : last_unit_2);
@@ -564,11 +573,11 @@ kernel_cake_ulysses_a2a_0f6daa3f5ad400c9b220(__nv_bfloat16* __restrict__ inp, __
                     unsigned int dst_9 = (quotient_19 + (batch_9 * 7 + rank) * sequences) * block_units + remainder_19;
                     unsigned int vec_6[4];
                     {
-                        uint4 _uv4_21 = *reinterpret_cast<const uint4*>(inp_words + (src_11 * 4) + 0);
-                        vec_6[0 + 0] = _uv4_21.x;
-                        vec_6[0 + 1] = _uv4_21.y;
-                        vec_6[0 + 2] = _uv4_21.z;
-                        vec_6[0 + 3] = _uv4_21.w;
+                        uint4 _uv4_22 = *reinterpret_cast<const uint4*>(inp_words + (src_11 * 4) + 0);
+                        vec_6[0 + 0] = _uv4_22.x;
+                        vec_6[0 + 1] = _uv4_22.y;
+                        vec_6[0 + 2] = _uv4_22.z;
+                        vec_6[0 + 3] = _uv4_22.w;
                     }
                     unsigned int unit_19 = sub * 7680 + (5280 + tid_0);
                     unsigned int clamped_19 = ((unit_19 < units) ? unit_19 : last_unit_2);
@@ -582,38 +591,38 @@ kernel_cake_ulysses_a2a_0f6daa3f5ad400c9b220(__nv_bfloat16* __restrict__ inp, __
                     unsigned int dst_10 = (quotient_20 + (batch_10 * 7 + rank) * sequences) * block_units + remainder_20;
                     unsigned int vec_7[4];
                     {
-                        uint4 _uv4_22 = *reinterpret_cast<const uint4*>(inp_words + (src_12 * 4) + 0);
-                        vec_7[0 + 0] = _uv4_22.x;
-                        vec_7[0 + 1] = _uv4_22.y;
-                        vec_7[0 + 2] = _uv4_22.z;
-                        vec_7[0 + 3] = _uv4_22.w;
+                        uint4 _uv4_23 = *reinterpret_cast<const uint4*>(inp_words + (src_12 * 4) + 0);
+                        vec_7[0 + 0] = _uv4_23.x;
+                        vec_7[0 + 1] = _uv4_23.y;
+                        vec_7[0 + 2] = _uv4_23.z;
+                        vec_7[0 + 3] = _uv4_23.w;
                     }
                     if (unit_12 < units) {
                         {
-                            auto _gst_23 = peer_words + (dst_3 * 4);
-                            __builtin_assume(__isGlobal(_gst_23));
-                            reinterpret_cast<int4*>(_gst_23)[0] = reinterpret_cast<int4*>(vec_0)[0];
+                            auto _gst_24 = peer_words + (dst_3 * 4);
+                            __builtin_assume(__isGlobal(_gst_24));
+                            reinterpret_cast<int4*>(_gst_24)[0] = reinterpret_cast<int4*>(vec_0)[0];
                         }
                     }
                     if (unit_13 < units) {
                         {
-                            auto _gst_24 = peer_words + (dst_4 * 4);
-                            __builtin_assume(__isGlobal(_gst_24));
-                            reinterpret_cast<int4*>(_gst_24)[0] = reinterpret_cast<int4*>(vec_1)[0];
+                            auto _gst_25 = peer_words + (dst_4 * 4);
+                            __builtin_assume(__isGlobal(_gst_25));
+                            reinterpret_cast<int4*>(_gst_25)[0] = reinterpret_cast<int4*>(vec_1)[0];
                         }
                     }
                     if (unit_14 < units) {
                         {
-                            auto _gst_25 = peer_words + (dst_5 * 4);
-                            __builtin_assume(__isGlobal(_gst_25));
-                            reinterpret_cast<int4*>(_gst_25)[0] = reinterpret_cast<int4*>(vec_2)[0];
+                            auto _gst_26 = peer_words + (dst_5 * 4);
+                            __builtin_assume(__isGlobal(_gst_26));
+                            reinterpret_cast<int4*>(_gst_26)[0] = reinterpret_cast<int4*>(vec_2)[0];
                         }
                     }
                     if (unit_15 < units) {
                         {
-                            auto _gst_26 = peer_words + (dst_6 * 4);
-                            __builtin_assume(__isGlobal(_gst_26));
-                            reinterpret_cast<int4*>(_gst_26)[0] = reinterpret_cast<int4*>(vec_3)[0];
+                            auto _gst_27 = peer_words + (dst_6 * 4);
+                            __builtin_assume(__isGlobal(_gst_27));
+                            reinterpret_cast<int4*>(_gst_27)[0] = reinterpret_cast<int4*>(vec_3)[0];
                         }
                     }
                     unsigned int unit_20 = sub * 7680 + (5760 + tid_0);
@@ -628,11 +637,11 @@ kernel_cake_ulysses_a2a_0f6daa3f5ad400c9b220(__nv_bfloat16* __restrict__ inp, __
                     unsigned int dst_11 = (quotient_21 + (batch_11 * 7 + rank) * sequences) * block_units + remainder_21;
                     unsigned int vec_8[4];
                     {
-                        uint4 _uv4_27 = *reinterpret_cast<const uint4*>(inp_words + (src_13 * 4) + 0);
-                        vec_8[0 + 0] = _uv4_27.x;
-                        vec_8[0 + 1] = _uv4_27.y;
-                        vec_8[0 + 2] = _uv4_27.z;
-                        vec_8[0 + 3] = _uv4_27.w;
+                        uint4 _uv4_28 = *reinterpret_cast<const uint4*>(inp_words + (src_13 * 4) + 0);
+                        vec_8[0 + 0] = _uv4_28.x;
+                        vec_8[0 + 1] = _uv4_28.y;
+                        vec_8[0 + 2] = _uv4_28.z;
+                        vec_8[0 + 3] = _uv4_28.w;
                     }
                     unsigned int unit_21 = sub * 7680 + (6240 + tid_0);
                     unsigned int clamped_21 = ((unit_21 < units) ? unit_21 : last_unit_2);
@@ -646,11 +655,11 @@ kernel_cake_ulysses_a2a_0f6daa3f5ad400c9b220(__nv_bfloat16* __restrict__ inp, __
                     unsigned int dst_12 = (quotient_22 + (batch_12 * 7 + rank) * sequences) * block_units + remainder_22;
                     unsigned int vec_9[4];
                     {
-                        uint4 _uv4_28 = *reinterpret_cast<const uint4*>(inp_words + (src_14 * 4) + 0);
-                        vec_9[0 + 0] = _uv4_28.x;
-                        vec_9[0 + 1] = _uv4_28.y;
-                        vec_9[0 + 2] = _uv4_28.z;
-                        vec_9[0 + 3] = _uv4_28.w;
+                        uint4 _uv4_29 = *reinterpret_cast<const uint4*>(inp_words + (src_14 * 4) + 0);
+                        vec_9[0 + 0] = _uv4_29.x;
+                        vec_9[0 + 1] = _uv4_29.y;
+                        vec_9[0 + 2] = _uv4_29.z;
+                        vec_9[0 + 3] = _uv4_29.w;
                     }
                     unsigned int unit_22 = sub * 7680 + (6720 + tid_0);
                     unsigned int clamped_22 = ((unit_22 < units) ? unit_22 : last_unit_2);
@@ -664,11 +673,11 @@ kernel_cake_ulysses_a2a_0f6daa3f5ad400c9b220(__nv_bfloat16* __restrict__ inp, __
                     unsigned int dst_13 = (quotient_23 + (batch_13 * 7 + rank) * sequences) * block_units + remainder_23;
                     unsigned int vec_10[4];
                     {
-                        uint4 _uv4_29 = *reinterpret_cast<const uint4*>(inp_words + (src_15 * 4) + 0);
-                        vec_10[0 + 0] = _uv4_29.x;
-                        vec_10[0 + 1] = _uv4_29.y;
-                        vec_10[0 + 2] = _uv4_29.z;
-                        vec_10[0 + 3] = _uv4_29.w;
+                        uint4 _uv4_30 = *reinterpret_cast<const uint4*>(inp_words + (src_15 * 4) + 0);
+                        vec_10[0 + 0] = _uv4_30.x;
+                        vec_10[0 + 1] = _uv4_30.y;
+                        vec_10[0 + 2] = _uv4_30.z;
+                        vec_10[0 + 3] = _uv4_30.w;
                     }
                     unsigned int unit_23 = sub * 7680 + (7200 + tid_0);
                     unsigned int clamped_23 = ((unit_23 < units) ? unit_23 : last_unit_2);
@@ -682,66 +691,66 @@ kernel_cake_ulysses_a2a_0f6daa3f5ad400c9b220(__nv_bfloat16* __restrict__ inp, __
                     unsigned int dst_14 = (quotient_24 + (batch_14 * 7 + rank) * sequences) * block_units + remainder_24;
                     unsigned int vec_11[4];
                     {
-                        uint4 _uv4_30 = *reinterpret_cast<const uint4*>(inp_words + (src_16 * 4) + 0);
-                        vec_11[0 + 0] = _uv4_30.x;
-                        vec_11[0 + 1] = _uv4_30.y;
-                        vec_11[0 + 2] = _uv4_30.z;
-                        vec_11[0 + 3] = _uv4_30.w;
+                        uint4 _uv4_31 = *reinterpret_cast<const uint4*>(inp_words + (src_16 * 4) + 0);
+                        vec_11[0 + 0] = _uv4_31.x;
+                        vec_11[0 + 1] = _uv4_31.y;
+                        vec_11[0 + 2] = _uv4_31.z;
+                        vec_11[0 + 3] = _uv4_31.w;
                     }
                     if (unit_16 < units) {
                         {
-                            auto _gst_31 = peer_words + (dst_7 * 4);
-                            __builtin_assume(__isGlobal(_gst_31));
-                            reinterpret_cast<int4*>(_gst_31)[0] = reinterpret_cast<int4*>(vec_4)[0];
+                            auto _gst_32 = peer_words + (dst_7 * 4);
+                            __builtin_assume(__isGlobal(_gst_32));
+                            reinterpret_cast<int4*>(_gst_32)[0] = reinterpret_cast<int4*>(vec_4)[0];
                         }
                     }
                     if (unit_17 < units) {
                         {
-                            auto _gst_32 = peer_words + (dst_8 * 4);
-                            __builtin_assume(__isGlobal(_gst_32));
-                            reinterpret_cast<int4*>(_gst_32)[0] = reinterpret_cast<int4*>(vec_5)[0];
+                            auto _gst_33 = peer_words + (dst_8 * 4);
+                            __builtin_assume(__isGlobal(_gst_33));
+                            reinterpret_cast<int4*>(_gst_33)[0] = reinterpret_cast<int4*>(vec_5)[0];
                         }
                     }
                     if (unit_18 < units) {
                         {
-                            auto _gst_33 = peer_words + (dst_9 * 4);
-                            __builtin_assume(__isGlobal(_gst_33));
-                            reinterpret_cast<int4*>(_gst_33)[0] = reinterpret_cast<int4*>(vec_6)[0];
+                            auto _gst_34 = peer_words + (dst_9 * 4);
+                            __builtin_assume(__isGlobal(_gst_34));
+                            reinterpret_cast<int4*>(_gst_34)[0] = reinterpret_cast<int4*>(vec_6)[0];
                         }
                     }
                     if (unit_19 < units) {
                         {
-                            auto _gst_34 = peer_words + (dst_10 * 4);
-                            __builtin_assume(__isGlobal(_gst_34));
-                            reinterpret_cast<int4*>(_gst_34)[0] = reinterpret_cast<int4*>(vec_7)[0];
+                            auto _gst_35 = peer_words + (dst_10 * 4);
+                            __builtin_assume(__isGlobal(_gst_35));
+                            reinterpret_cast<int4*>(_gst_35)[0] = reinterpret_cast<int4*>(vec_7)[0];
                         }
                     }
                     if (unit_20 < units) {
                         {
-                            auto _gst_35 = peer_words + (dst_11 * 4);
-                            __builtin_assume(__isGlobal(_gst_35));
-                            reinterpret_cast<int4*>(_gst_35)[0] = reinterpret_cast<int4*>(vec_8)[0];
+                            auto _gst_36 = peer_words + (dst_11 * 4);
+                            __builtin_assume(__isGlobal(_gst_36));
+                            reinterpret_cast<int4*>(_gst_36)[0] = reinterpret_cast<int4*>(vec_8)[0];
                         }
                     }
                     if (unit_21 < units) {
                         {
-                            auto _gst_36 = peer_words + (dst_12 * 4);
-                            __builtin_assume(__isGlobal(_gst_36));
-                            reinterpret_cast<int4*>(_gst_36)[0] = reinterpret_cast<int4*>(vec_9)[0];
+                            auto _gst_37 = peer_words + (dst_12 * 4);
+                            __builtin_assume(__isGlobal(_gst_37));
+                            reinterpret_cast<int4*>(_gst_37)[0] = reinterpret_cast<int4*>(vec_9)[0];
                         }
                     }
                     if (unit_22 < units) {
                         {
-                            auto _gst_37 = peer_words + (dst_13 * 4);
-                            __builtin_assume(__isGlobal(_gst_37));
-                            reinterpret_cast<int4*>(_gst_37)[0] = reinterpret_cast<int4*>(vec_10)[0];
+                            auto _gst_38 = peer_words + (dst_13 * 4);
+                            __builtin_assume(__isGlobal(_gst_38));
+                            reinterpret_cast<int4*>(_gst_38)[0] = reinterpret_cast<int4*>(vec_10)[0];
                         }
                     }
                     if (unit_23 < units) {
                         {
-                            auto _gst_38 = peer_words + (dst_14 * 4);
-                            __builtin_assume(__isGlobal(_gst_38));
-                            reinterpret_cast<int4*>(_gst_38)[0] = reinterpret_cast<int4*>(vec_11)[0];
+                            auto _gst_39 = peer_words + (dst_14 * 4);
+                            __builtin_assume(__isGlobal(_gst_39));
+                            reinterpret_cast<int4*>(_gst_39)[0] = reinterpret_cast<int4*>(vec_11)[0];
                         }
                     }
                 } else {
@@ -802,11 +811,11 @@ kernel_cake_ulysses_a2a_0f6daa3f5ad400c9b220(__nv_bfloat16* __restrict__ inp, __
                         unsigned int dst_16 = (quotient_26 + (batch_16 * 7 + rank) * sequences) * block_units + remainder_26;
                         unsigned int vec_12[4];
                         {
-                            uint4 _uv4_39 = *reinterpret_cast<const uint4*>(inp_words + (src_18 * 4) + 0);
-                            vec_12[0 + 0] = _uv4_39.x;
-                            vec_12[0 + 1] = _uv4_39.y;
-                            vec_12[0 + 2] = _uv4_39.z;
-                            vec_12[0 + 3] = _uv4_39.w;
+                            uint4 _uv4_40 = *reinterpret_cast<const uint4*>(inp_words + (src_18 * 4) + 0);
+                            vec_12[0 + 0] = _uv4_40.x;
+                            vec_12[0 + 1] = _uv4_40.y;
+                            vec_12[0 + 2] = _uv4_40.z;
+                            vec_12[0 + 3] = _uv4_40.w;
                         }
                         unsigned int unit_25 = base + 480;
                         unsigned int clamped_25 = ((unit_25 < chi_1) ? unit_25 : last_unit_3);
@@ -820,11 +829,11 @@ kernel_cake_ulysses_a2a_0f6daa3f5ad400c9b220(__nv_bfloat16* __restrict__ inp, __
                         unsigned int dst_15_1 = (quotient_27 + (batch_15_1 * 7 + rank) * sequences) * block_units + remainder_27;
                         unsigned int vec_13[4];
                         {
-                            uint4 _uv4_40 = *reinterpret_cast<const uint4*>(inp_words + (src_17_1 * 4) + 0);
-                            vec_13[0 + 0] = _uv4_40.x;
-                            vec_13[0 + 1] = _uv4_40.y;
-                            vec_13[0 + 2] = _uv4_40.z;
-                            vec_13[0 + 3] = _uv4_40.w;
+                            uint4 _uv4_41 = *reinterpret_cast<const uint4*>(inp_words + (src_17_1 * 4) + 0);
+                            vec_13[0 + 0] = _uv4_41.x;
+                            vec_13[0 + 1] = _uv4_41.y;
+                            vec_13[0 + 2] = _uv4_41.z;
+                            vec_13[0 + 3] = _uv4_41.w;
                         }
                         unsigned int unit_26 = base + 960;
                         unsigned int clamped_26 = ((unit_26 < chi_1) ? unit_26 : last_unit_3);
@@ -838,11 +847,11 @@ kernel_cake_ulysses_a2a_0f6daa3f5ad400c9b220(__nv_bfloat16* __restrict__ inp, __
                         unsigned int dst_16_1 = (quotient_28 + (batch_16_1 * 7 + rank) * sequences) * block_units + remainder_28;
                         unsigned int vec_14[4];
                         {
-                            uint4 _uv4_41 = *reinterpret_cast<const uint4*>(inp_words + (src_18_1 * 4) + 0);
-                            vec_14[0 + 0] = _uv4_41.x;
-                            vec_14[0 + 1] = _uv4_41.y;
-                            vec_14[0 + 2] = _uv4_41.z;
-                            vec_14[0 + 3] = _uv4_41.w;
+                            uint4 _uv4_42 = *reinterpret_cast<const uint4*>(inp_words + (src_18_1 * 4) + 0);
+                            vec_14[0 + 0] = _uv4_42.x;
+                            vec_14[0 + 1] = _uv4_42.y;
+                            vec_14[0 + 2] = _uv4_42.z;
+                            vec_14[0 + 3] = _uv4_42.w;
                         }
                         unsigned int unit_27 = base + 1440;
                         unsigned int clamped_27 = ((unit_27 < chi_1) ? unit_27 : last_unit_3);
@@ -856,11 +865,11 @@ kernel_cake_ulysses_a2a_0f6daa3f5ad400c9b220(__nv_bfloat16* __restrict__ inp, __
                         unsigned int dst_17 = (quotient_29 + (batch_17 * 7 + rank) * sequences) * block_units + remainder_29;
                         unsigned int vec_15[4];
                         {
-                            uint4 _uv4_42 = *reinterpret_cast<const uint4*>(inp_words + (src_19 * 4) + 0);
-                            vec_15[0 + 0] = _uv4_42.x;
-                            vec_15[0 + 1] = _uv4_42.y;
-                            vec_15[0 + 2] = _uv4_42.z;
-                            vec_15[0 + 3] = _uv4_42.w;
+                            uint4 _uv4_43 = *reinterpret_cast<const uint4*>(inp_words + (src_19 * 4) + 0);
+                            vec_15[0 + 0] = _uv4_43.x;
+                            vec_15[0 + 1] = _uv4_43.y;
+                            vec_15[0 + 2] = _uv4_43.z;
+                            vec_15[0 + 3] = _uv4_43.w;
                         }
                         unsigned int unit_28 = base + 1920;
                         unsigned int clamped_28 = ((unit_28 < chi_1) ? unit_28 : last_unit_3);
@@ -874,11 +883,11 @@ kernel_cake_ulysses_a2a_0f6daa3f5ad400c9b220(__nv_bfloat16* __restrict__ inp, __
                         unsigned int dst_18 = (quotient_30 + (batch_18 * 7 + rank) * sequences) * block_units + remainder_30;
                         unsigned int vec_16[4];
                         {
-                            uint4 _uv4_43 = *reinterpret_cast<const uint4*>(inp_words + (src_20 * 4) + 0);
-                            vec_16[0 + 0] = _uv4_43.x;
-                            vec_16[0 + 1] = _uv4_43.y;
-                            vec_16[0 + 2] = _uv4_43.z;
-                            vec_16[0 + 3] = _uv4_43.w;
+                            uint4 _uv4_44 = *reinterpret_cast<const uint4*>(inp_words + (src_20 * 4) + 0);
+                            vec_16[0 + 0] = _uv4_44.x;
+                            vec_16[0 + 1] = _uv4_44.y;
+                            vec_16[0 + 2] = _uv4_44.z;
+                            vec_16[0 + 3] = _uv4_44.w;
                         }
                         unsigned int unit_29 = base + 2400;
                         unsigned int clamped_29 = ((unit_29 < chi_1) ? unit_29 : last_unit_3);
@@ -892,11 +901,11 @@ kernel_cake_ulysses_a2a_0f6daa3f5ad400c9b220(__nv_bfloat16* __restrict__ inp, __
                         unsigned int dst_19 = (quotient_31 + (batch_19 * 7 + rank) * sequences) * block_units + remainder_31;
                         unsigned int vec_17[4];
                         {
-                            uint4 _uv4_44 = *reinterpret_cast<const uint4*>(inp_words + (src_21 * 4) + 0);
-                            vec_17[0 + 0] = _uv4_44.x;
-                            vec_17[0 + 1] = _uv4_44.y;
-                            vec_17[0 + 2] = _uv4_44.z;
-                            vec_17[0 + 3] = _uv4_44.w;
+                            uint4 _uv4_45 = *reinterpret_cast<const uint4*>(inp_words + (src_21 * 4) + 0);
+                            vec_17[0 + 0] = _uv4_45.x;
+                            vec_17[0 + 1] = _uv4_45.y;
+                            vec_17[0 + 2] = _uv4_45.z;
+                            vec_17[0 + 3] = _uv4_45.w;
                         }
                         unsigned int unit_30 = base + 2880;
                         unsigned int clamped_30 = ((unit_30 < chi_1) ? unit_30 : last_unit_3);
@@ -910,11 +919,11 @@ kernel_cake_ulysses_a2a_0f6daa3f5ad400c9b220(__nv_bfloat16* __restrict__ inp, __
                         unsigned int dst_20 = (quotient_32 + (batch_20 * 7 + rank) * sequences) * block_units + remainder_32;
                         unsigned int vec_18[4];
                         {
-                            uint4 _uv4_45 = *reinterpret_cast<const uint4*>(inp_words + (src_22 * 4) + 0);
-                            vec_18[0 + 0] = _uv4_45.x;
-                            vec_18[0 + 1] = _uv4_45.y;
-                            vec_18[0 + 2] = _uv4_45.z;
-                            vec_18[0 + 3] = _uv4_45.w;
+                            uint4 _uv4_46 = *reinterpret_cast<const uint4*>(inp_words + (src_22 * 4) + 0);
+                            vec_18[0 + 0] = _uv4_46.x;
+                            vec_18[0 + 1] = _uv4_46.y;
+                            vec_18[0 + 2] = _uv4_46.z;
+                            vec_18[0 + 3] = _uv4_46.w;
                         }
                         unsigned int unit_31 = base + 3360;
                         unsigned int clamped_31 = ((unit_31 < chi_1) ? unit_31 : last_unit_3);
@@ -928,38 +937,38 @@ kernel_cake_ulysses_a2a_0f6daa3f5ad400c9b220(__nv_bfloat16* __restrict__ inp, __
                         unsigned int dst_21 = (quotient_33 + (batch_21 * 7 + rank) * sequences) * block_units + remainder_33;
                         unsigned int vec_19[4];
                         {
-                            uint4 _uv4_46 = *reinterpret_cast<const uint4*>(inp_words + (src_23 * 4) + 0);
-                            vec_19[0 + 0] = _uv4_46.x;
-                            vec_19[0 + 1] = _uv4_46.y;
-                            vec_19[0 + 2] = _uv4_46.z;
-                            vec_19[0 + 3] = _uv4_46.w;
+                            uint4 _uv4_47 = *reinterpret_cast<const uint4*>(inp_words + (src_23 * 4) + 0);
+                            vec_19[0 + 0] = _uv4_47.x;
+                            vec_19[0 + 1] = _uv4_47.y;
+                            vec_19[0 + 2] = _uv4_47.z;
+                            vec_19[0 + 3] = _uv4_47.w;
                         }
                         if (unit_24 < chi_1) {
                             {
-                                auto _gst_47 = out_words + (dst_16 * 4);
-                                __builtin_assume(__isGlobal(_gst_47));
-                                reinterpret_cast<int4*>(_gst_47)[0] = reinterpret_cast<int4*>(vec_12)[0];
+                                auto _gst_48 = out_words + (dst_16 * 4);
+                                __builtin_assume(__isGlobal(_gst_48));
+                                reinterpret_cast<int4*>(_gst_48)[0] = reinterpret_cast<int4*>(vec_12)[0];
                             }
                         }
                         if (unit_25 < chi_1) {
                             {
-                                auto _gst_48 = out_words + (dst_15_1 * 4);
-                                __builtin_assume(__isGlobal(_gst_48));
-                                reinterpret_cast<int4*>(_gst_48)[0] = reinterpret_cast<int4*>(vec_13)[0];
+                                auto _gst_49 = out_words + (dst_15_1 * 4);
+                                __builtin_assume(__isGlobal(_gst_49));
+                                reinterpret_cast<int4*>(_gst_49)[0] = reinterpret_cast<int4*>(vec_13)[0];
                             }
                         }
                         if (unit_26 < chi_1) {
                             {
-                                auto _gst_49 = out_words + (dst_16_1 * 4);
-                                __builtin_assume(__isGlobal(_gst_49));
-                                reinterpret_cast<int4*>(_gst_49)[0] = reinterpret_cast<int4*>(vec_14)[0];
+                                auto _gst_50 = out_words + (dst_16_1 * 4);
+                                __builtin_assume(__isGlobal(_gst_50));
+                                reinterpret_cast<int4*>(_gst_50)[0] = reinterpret_cast<int4*>(vec_14)[0];
                             }
                         }
                         if (unit_27 < chi_1) {
                             {
-                                auto _gst_50 = out_words + (dst_17 * 4);
-                                __builtin_assume(__isGlobal(_gst_50));
-                                reinterpret_cast<int4*>(_gst_50)[0] = reinterpret_cast<int4*>(vec_15)[0];
+                                auto _gst_51 = out_words + (dst_17 * 4);
+                                __builtin_assume(__isGlobal(_gst_51));
+                                reinterpret_cast<int4*>(_gst_51)[0] = reinterpret_cast<int4*>(vec_15)[0];
                             }
                         }
                         unsigned int unit_32 = base + 3840;
@@ -974,11 +983,11 @@ kernel_cake_ulysses_a2a_0f6daa3f5ad400c9b220(__nv_bfloat16* __restrict__ inp, __
                         unsigned int dst_22 = (quotient_34 + (batch_22 * 7 + rank) * sequences) * block_units + remainder_34;
                         unsigned int vec_20[4];
                         {
-                            uint4 _uv4_51 = *reinterpret_cast<const uint4*>(inp_words + (src_24 * 4) + 0);
-                            vec_20[0 + 0] = _uv4_51.x;
-                            vec_20[0 + 1] = _uv4_51.y;
-                            vec_20[0 + 2] = _uv4_51.z;
-                            vec_20[0 + 3] = _uv4_51.w;
+                            uint4 _uv4_52 = *reinterpret_cast<const uint4*>(inp_words + (src_24 * 4) + 0);
+                            vec_20[0 + 0] = _uv4_52.x;
+                            vec_20[0 + 1] = _uv4_52.y;
+                            vec_20[0 + 2] = _uv4_52.z;
+                            vec_20[0 + 3] = _uv4_52.w;
                         }
                         unsigned int unit_33 = base + 4320;
                         unsigned int clamped_33 = ((unit_33 < chi_1) ? unit_33 : last_unit_3);
@@ -992,11 +1001,11 @@ kernel_cake_ulysses_a2a_0f6daa3f5ad400c9b220(__nv_bfloat16* __restrict__ inp, __
                         unsigned int dst_23 = (quotient_35 + (batch_23 * 7 + rank) * sequences) * block_units + remainder_35;
                         unsigned int vec_21[4];
                         {
-                            uint4 _uv4_52 = *reinterpret_cast<const uint4*>(inp_words + (src_25 * 4) + 0);
-                            vec_21[0 + 0] = _uv4_52.x;
-                            vec_21[0 + 1] = _uv4_52.y;
-                            vec_21[0 + 2] = _uv4_52.z;
-                            vec_21[0 + 3] = _uv4_52.w;
+                            uint4 _uv4_53 = *reinterpret_cast<const uint4*>(inp_words + (src_25 * 4) + 0);
+                            vec_21[0 + 0] = _uv4_53.x;
+                            vec_21[0 + 1] = _uv4_53.y;
+                            vec_21[0 + 2] = _uv4_53.z;
+                            vec_21[0 + 3] = _uv4_53.w;
                         }
                         unsigned int unit_34 = base + 4800;
                         unsigned int clamped_34 = ((unit_34 < chi_1) ? unit_34 : last_unit_3);
@@ -1010,11 +1019,11 @@ kernel_cake_ulysses_a2a_0f6daa3f5ad400c9b220(__nv_bfloat16* __restrict__ inp, __
                         unsigned int dst_24 = (quotient_36 + (batch_24 * 7 + rank) * sequences) * block_units + remainder_36;
                         unsigned int vec_22[4];
                         {
-                            uint4 _uv4_53 = *reinterpret_cast<const uint4*>(inp_words + (src_26 * 4) + 0);
-                            vec_22[0 + 0] = _uv4_53.x;
-                            vec_22[0 + 1] = _uv4_53.y;
-                            vec_22[0 + 2] = _uv4_53.z;
-                            vec_22[0 + 3] = _uv4_53.w;
+                            uint4 _uv4_54 = *reinterpret_cast<const uint4*>(inp_words + (src_26 * 4) + 0);
+                            vec_22[0 + 0] = _uv4_54.x;
+                            vec_22[0 + 1] = _uv4_54.y;
+                            vec_22[0 + 2] = _uv4_54.z;
+                            vec_22[0 + 3] = _uv4_54.w;
                         }
                         unsigned int unit_35 = base + 5280;
                         unsigned int clamped_35 = ((unit_35 < chi_1) ? unit_35 : last_unit_3);
@@ -1028,38 +1037,38 @@ kernel_cake_ulysses_a2a_0f6daa3f5ad400c9b220(__nv_bfloat16* __restrict__ inp, __
                         unsigned int dst_25 = (quotient_37 + (batch_25 * 7 + rank) * sequences) * block_units + remainder_37;
                         unsigned int vec_23[4];
                         {
-                            uint4 _uv4_54 = *reinterpret_cast<const uint4*>(inp_words + (src_27 * 4) + 0);
-                            vec_23[0 + 0] = _uv4_54.x;
-                            vec_23[0 + 1] = _uv4_54.y;
-                            vec_23[0 + 2] = _uv4_54.z;
-                            vec_23[0 + 3] = _uv4_54.w;
+                            uint4 _uv4_55 = *reinterpret_cast<const uint4*>(inp_words + (src_27 * 4) + 0);
+                            vec_23[0 + 0] = _uv4_55.x;
+                            vec_23[0 + 1] = _uv4_55.y;
+                            vec_23[0 + 2] = _uv4_55.z;
+                            vec_23[0 + 3] = _uv4_55.w;
                         }
                         if (unit_28 < chi_1) {
                             {
-                                auto _gst_55 = out_words + (dst_18 * 4);
-                                __builtin_assume(__isGlobal(_gst_55));
-                                reinterpret_cast<int4*>(_gst_55)[0] = reinterpret_cast<int4*>(vec_16)[0];
+                                auto _gst_56 = out_words + (dst_18 * 4);
+                                __builtin_assume(__isGlobal(_gst_56));
+                                reinterpret_cast<int4*>(_gst_56)[0] = reinterpret_cast<int4*>(vec_16)[0];
                             }
                         }
                         if (unit_29 < chi_1) {
                             {
-                                auto _gst_56 = out_words + (dst_19 * 4);
-                                __builtin_assume(__isGlobal(_gst_56));
-                                reinterpret_cast<int4*>(_gst_56)[0] = reinterpret_cast<int4*>(vec_17)[0];
+                                auto _gst_57 = out_words + (dst_19 * 4);
+                                __builtin_assume(__isGlobal(_gst_57));
+                                reinterpret_cast<int4*>(_gst_57)[0] = reinterpret_cast<int4*>(vec_17)[0];
                             }
                         }
                         if (unit_30 < chi_1) {
                             {
-                                auto _gst_57 = out_words + (dst_20 * 4);
-                                __builtin_assume(__isGlobal(_gst_57));
-                                reinterpret_cast<int4*>(_gst_57)[0] = reinterpret_cast<int4*>(vec_18)[0];
+                                auto _gst_58 = out_words + (dst_20 * 4);
+                                __builtin_assume(__isGlobal(_gst_58));
+                                reinterpret_cast<int4*>(_gst_58)[0] = reinterpret_cast<int4*>(vec_18)[0];
                             }
                         }
                         if (unit_31 < chi_1) {
                             {
-                                auto _gst_58 = out_words + (dst_21 * 4);
-                                __builtin_assume(__isGlobal(_gst_58));
-                                reinterpret_cast<int4*>(_gst_58)[0] = reinterpret_cast<int4*>(vec_19)[0];
+                                auto _gst_59 = out_words + (dst_21 * 4);
+                                __builtin_assume(__isGlobal(_gst_59));
+                                reinterpret_cast<int4*>(_gst_59)[0] = reinterpret_cast<int4*>(vec_19)[0];
                             }
                         }
                         unsigned int unit_36 = base + 5760;
@@ -1074,11 +1083,11 @@ kernel_cake_ulysses_a2a_0f6daa3f5ad400c9b220(__nv_bfloat16* __restrict__ inp, __
                         unsigned int dst_26 = (quotient_38 + (batch_26 * 7 + rank) * sequences) * block_units + remainder_38;
                         unsigned int vec_24[4];
                         {
-                            uint4 _uv4_59 = *reinterpret_cast<const uint4*>(inp_words + (src_28 * 4) + 0);
-                            vec_24[0 + 0] = _uv4_59.x;
-                            vec_24[0 + 1] = _uv4_59.y;
-                            vec_24[0 + 2] = _uv4_59.z;
-                            vec_24[0 + 3] = _uv4_59.w;
+                            uint4 _uv4_60 = *reinterpret_cast<const uint4*>(inp_words + (src_28 * 4) + 0);
+                            vec_24[0 + 0] = _uv4_60.x;
+                            vec_24[0 + 1] = _uv4_60.y;
+                            vec_24[0 + 2] = _uv4_60.z;
+                            vec_24[0 + 3] = _uv4_60.w;
                         }
                         unsigned int unit_37 = base + 6240;
                         unsigned int clamped_37 = ((unit_37 < chi_1) ? unit_37 : last_unit_3);
@@ -1092,11 +1101,11 @@ kernel_cake_ulysses_a2a_0f6daa3f5ad400c9b220(__nv_bfloat16* __restrict__ inp, __
                         unsigned int dst_27 = (quotient_39 + (batch_27 * 7 + rank) * sequences) * block_units + remainder_39;
                         unsigned int vec_25[4];
                         {
-                            uint4 _uv4_60 = *reinterpret_cast<const uint4*>(inp_words + (src_29 * 4) + 0);
-                            vec_25[0 + 0] = _uv4_60.x;
-                            vec_25[0 + 1] = _uv4_60.y;
-                            vec_25[0 + 2] = _uv4_60.z;
-                            vec_25[0 + 3] = _uv4_60.w;
+                            uint4 _uv4_61 = *reinterpret_cast<const uint4*>(inp_words + (src_29 * 4) + 0);
+                            vec_25[0 + 0] = _uv4_61.x;
+                            vec_25[0 + 1] = _uv4_61.y;
+                            vec_25[0 + 2] = _uv4_61.z;
+                            vec_25[0 + 3] = _uv4_61.w;
                         }
                         unsigned int unit_38 = base + 6720;
                         unsigned int clamped_38 = ((unit_38 < chi_1) ? unit_38 : last_unit_3);
@@ -1110,11 +1119,11 @@ kernel_cake_ulysses_a2a_0f6daa3f5ad400c9b220(__nv_bfloat16* __restrict__ inp, __
                         unsigned int dst_28 = (quotient_40 + (batch_28 * 7 + rank) * sequences) * block_units + remainder_40;
                         unsigned int vec_26[4];
                         {
-                            uint4 _uv4_61 = *reinterpret_cast<const uint4*>(inp_words + (src_30 * 4) + 0);
-                            vec_26[0 + 0] = _uv4_61.x;
-                            vec_26[0 + 1] = _uv4_61.y;
-                            vec_26[0 + 2] = _uv4_61.z;
-                            vec_26[0 + 3] = _uv4_61.w;
+                            uint4 _uv4_62 = *reinterpret_cast<const uint4*>(inp_words + (src_30 * 4) + 0);
+                            vec_26[0 + 0] = _uv4_62.x;
+                            vec_26[0 + 1] = _uv4_62.y;
+                            vec_26[0 + 2] = _uv4_62.z;
+                            vec_26[0 + 3] = _uv4_62.w;
                         }
                         unsigned int unit_39 = base + 7200;
                         unsigned int clamped_39 = ((unit_39 < chi_1) ? unit_39 : last_unit_3);
@@ -1128,66 +1137,66 @@ kernel_cake_ulysses_a2a_0f6daa3f5ad400c9b220(__nv_bfloat16* __restrict__ inp, __
                         unsigned int dst_29 = (quotient_41 + (batch_29 * 7 + rank) * sequences) * block_units + remainder_41;
                         unsigned int vec_27[4];
                         {
-                            uint4 _uv4_62 = *reinterpret_cast<const uint4*>(inp_words + (src_31 * 4) + 0);
-                            vec_27[0 + 0] = _uv4_62.x;
-                            vec_27[0 + 1] = _uv4_62.y;
-                            vec_27[0 + 2] = _uv4_62.z;
-                            vec_27[0 + 3] = _uv4_62.w;
+                            uint4 _uv4_63 = *reinterpret_cast<const uint4*>(inp_words + (src_31 * 4) + 0);
+                            vec_27[0 + 0] = _uv4_63.x;
+                            vec_27[0 + 1] = _uv4_63.y;
+                            vec_27[0 + 2] = _uv4_63.z;
+                            vec_27[0 + 3] = _uv4_63.w;
                         }
                         if (unit_32 < chi_1) {
                             {
-                                auto _gst_63 = out_words + (dst_22 * 4);
-                                __builtin_assume(__isGlobal(_gst_63));
-                                reinterpret_cast<int4*>(_gst_63)[0] = reinterpret_cast<int4*>(vec_20)[0];
+                                auto _gst_64 = out_words + (dst_22 * 4);
+                                __builtin_assume(__isGlobal(_gst_64));
+                                reinterpret_cast<int4*>(_gst_64)[0] = reinterpret_cast<int4*>(vec_20)[0];
                             }
                         }
                         if (unit_33 < chi_1) {
                             {
-                                auto _gst_64 = out_words + (dst_23 * 4);
-                                __builtin_assume(__isGlobal(_gst_64));
-                                reinterpret_cast<int4*>(_gst_64)[0] = reinterpret_cast<int4*>(vec_21)[0];
+                                auto _gst_65 = out_words + (dst_23 * 4);
+                                __builtin_assume(__isGlobal(_gst_65));
+                                reinterpret_cast<int4*>(_gst_65)[0] = reinterpret_cast<int4*>(vec_21)[0];
                             }
                         }
                         if (unit_34 < chi_1) {
                             {
-                                auto _gst_65 = out_words + (dst_24 * 4);
-                                __builtin_assume(__isGlobal(_gst_65));
-                                reinterpret_cast<int4*>(_gst_65)[0] = reinterpret_cast<int4*>(vec_22)[0];
+                                auto _gst_66 = out_words + (dst_24 * 4);
+                                __builtin_assume(__isGlobal(_gst_66));
+                                reinterpret_cast<int4*>(_gst_66)[0] = reinterpret_cast<int4*>(vec_22)[0];
                             }
                         }
                         if (unit_35 < chi_1) {
                             {
-                                auto _gst_66 = out_words + (dst_25 * 4);
-                                __builtin_assume(__isGlobal(_gst_66));
-                                reinterpret_cast<int4*>(_gst_66)[0] = reinterpret_cast<int4*>(vec_23)[0];
+                                auto _gst_67 = out_words + (dst_25 * 4);
+                                __builtin_assume(__isGlobal(_gst_67));
+                                reinterpret_cast<int4*>(_gst_67)[0] = reinterpret_cast<int4*>(vec_23)[0];
                             }
                         }
                         if (unit_36 < chi_1) {
                             {
-                                auto _gst_67 = out_words + (dst_26 * 4);
-                                __builtin_assume(__isGlobal(_gst_67));
-                                reinterpret_cast<int4*>(_gst_67)[0] = reinterpret_cast<int4*>(vec_24)[0];
+                                auto _gst_68 = out_words + (dst_26 * 4);
+                                __builtin_assume(__isGlobal(_gst_68));
+                                reinterpret_cast<int4*>(_gst_68)[0] = reinterpret_cast<int4*>(vec_24)[0];
                             }
                         }
                         if (unit_37 < chi_1) {
                             {
-                                auto _gst_68 = out_words + (dst_27 * 4);
-                                __builtin_assume(__isGlobal(_gst_68));
-                                reinterpret_cast<int4*>(_gst_68)[0] = reinterpret_cast<int4*>(vec_25)[0];
+                                auto _gst_69 = out_words + (dst_27 * 4);
+                                __builtin_assume(__isGlobal(_gst_69));
+                                reinterpret_cast<int4*>(_gst_69)[0] = reinterpret_cast<int4*>(vec_25)[0];
                             }
                         }
                         if (unit_38 < chi_1) {
                             {
-                                auto _gst_69 = out_words + (dst_28 * 4);
-                                __builtin_assume(__isGlobal(_gst_69));
-                                reinterpret_cast<int4*>(_gst_69)[0] = reinterpret_cast<int4*>(vec_26)[0];
+                                auto _gst_70 = out_words + (dst_28 * 4);
+                                __builtin_assume(__isGlobal(_gst_70));
+                                reinterpret_cast<int4*>(_gst_70)[0] = reinterpret_cast<int4*>(vec_26)[0];
                             }
                         }
                         if (unit_39 < chi_1) {
                             {
-                                auto _gst_70 = out_words + (dst_29 * 4);
-                                __builtin_assume(__isGlobal(_gst_70));
-                                reinterpret_cast<int4*>(_gst_70)[0] = reinterpret_cast<int4*>(vec_27)[0];
+                                auto _gst_71 = out_words + (dst_29 * 4);
+                                __builtin_assume(__isGlobal(_gst_71));
+                                reinterpret_cast<int4*>(_gst_71)[0] = reinterpret_cast<int4*>(vec_27)[0];
                             }
                         }
                     }
@@ -1226,11 +1235,11 @@ kernel_cake_ulysses_a2a_0f6daa3f5ad400c9b220(__nv_bfloat16* __restrict__ inp, __
                         unsigned int dst_31 = (quotient_43 + (batch_31 * 7 + rank) * sequences) * block_units + remainder_43;
                         unsigned int vec_28[4];
                         {
-                            uint4 _uv4_71 = *reinterpret_cast<const uint4*>(inp_words + (src_33 * 4) + 0);
-                            vec_28[0 + 0] = _uv4_71.x;
-                            vec_28[0 + 1] = _uv4_71.y;
-                            vec_28[0 + 2] = _uv4_71.z;
-                            vec_28[0 + 3] = _uv4_71.w;
+                            uint4 _uv4_72 = *reinterpret_cast<const uint4*>(inp_words + (src_33 * 4) + 0);
+                            vec_28[0 + 0] = _uv4_72.x;
+                            vec_28[0 + 1] = _uv4_72.y;
+                            vec_28[0 + 2] = _uv4_72.z;
+                            vec_28[0 + 3] = _uv4_72.w;
                         }
                         unsigned int unit_41 = stripe + (480 + tid_0);
                         unsigned int clamped_41 = ((unit_41 < units) ? unit_41 : last);
@@ -1244,11 +1253,11 @@ kernel_cake_ulysses_a2a_0f6daa3f5ad400c9b220(__nv_bfloat16* __restrict__ inp, __
                         unsigned int dst_30_1 = (quotient_44 + (batch_30_1 * 7 + rank) * sequences) * block_units + remainder_44;
                         unsigned int vec_29[4];
                         {
-                            uint4 _uv4_72 = *reinterpret_cast<const uint4*>(inp_words + (src_32_1 * 4) + 0);
-                            vec_29[0 + 0] = _uv4_72.x;
-                            vec_29[0 + 1] = _uv4_72.y;
-                            vec_29[0 + 2] = _uv4_72.z;
-                            vec_29[0 + 3] = _uv4_72.w;
+                            uint4 _uv4_73 = *reinterpret_cast<const uint4*>(inp_words + (src_32_1 * 4) + 0);
+                            vec_29[0 + 0] = _uv4_73.x;
+                            vec_29[0 + 1] = _uv4_73.y;
+                            vec_29[0 + 2] = _uv4_73.z;
+                            vec_29[0 + 3] = _uv4_73.w;
                         }
                         unsigned int unit_42 = stripe + (960 + tid_0);
                         unsigned int clamped_42 = ((unit_42 < units) ? unit_42 : last);
@@ -1262,11 +1271,11 @@ kernel_cake_ulysses_a2a_0f6daa3f5ad400c9b220(__nv_bfloat16* __restrict__ inp, __
                         unsigned int dst_31_1 = (quotient_45 + (batch_31_1 * 7 + rank) * sequences) * block_units + remainder_45;
                         unsigned int vec_30[4];
                         {
-                            uint4 _uv4_73 = *reinterpret_cast<const uint4*>(inp_words + (src_33_1 * 4) + 0);
-                            vec_30[0 + 0] = _uv4_73.x;
-                            vec_30[0 + 1] = _uv4_73.y;
-                            vec_30[0 + 2] = _uv4_73.z;
-                            vec_30[0 + 3] = _uv4_73.w;
+                            uint4 _uv4_74 = *reinterpret_cast<const uint4*>(inp_words + (src_33_1 * 4) + 0);
+                            vec_30[0 + 0] = _uv4_74.x;
+                            vec_30[0 + 1] = _uv4_74.y;
+                            vec_30[0 + 2] = _uv4_74.z;
+                            vec_30[0 + 3] = _uv4_74.w;
                         }
                         unsigned int unit_43 = stripe + (1440 + tid_0);
                         unsigned int clamped_43 = ((unit_43 < units) ? unit_43 : last);
@@ -1280,11 +1289,11 @@ kernel_cake_ulysses_a2a_0f6daa3f5ad400c9b220(__nv_bfloat16* __restrict__ inp, __
                         unsigned int dst_32 = (quotient_46 + (batch_32 * 7 + rank) * sequences) * block_units + remainder_46;
                         unsigned int vec_31[4];
                         {
-                            uint4 _uv4_74 = *reinterpret_cast<const uint4*>(inp_words + (src_34 * 4) + 0);
-                            vec_31[0 + 0] = _uv4_74.x;
-                            vec_31[0 + 1] = _uv4_74.y;
-                            vec_31[0 + 2] = _uv4_74.z;
-                            vec_31[0 + 3] = _uv4_74.w;
+                            uint4 _uv4_75 = *reinterpret_cast<const uint4*>(inp_words + (src_34 * 4) + 0);
+                            vec_31[0 + 0] = _uv4_75.x;
+                            vec_31[0 + 1] = _uv4_75.y;
+                            vec_31[0 + 2] = _uv4_75.z;
+                            vec_31[0 + 3] = _uv4_75.w;
                         }
                         unsigned int unit_44 = stripe + (1920 + tid_0);
                         unsigned int clamped_44 = ((unit_44 < units) ? unit_44 : last);
@@ -1298,11 +1307,11 @@ kernel_cake_ulysses_a2a_0f6daa3f5ad400c9b220(__nv_bfloat16* __restrict__ inp, __
                         unsigned int dst_33 = (quotient_47 + (batch_33 * 7 + rank) * sequences) * block_units + remainder_47;
                         unsigned int vec_32[4];
                         {
-                            uint4 _uv4_75 = *reinterpret_cast<const uint4*>(inp_words + (src_35 * 4) + 0);
-                            vec_32[0 + 0] = _uv4_75.x;
-                            vec_32[0 + 1] = _uv4_75.y;
-                            vec_32[0 + 2] = _uv4_75.z;
-                            vec_32[0 + 3] = _uv4_75.w;
+                            uint4 _uv4_76 = *reinterpret_cast<const uint4*>(inp_words + (src_35 * 4) + 0);
+                            vec_32[0 + 0] = _uv4_76.x;
+                            vec_32[0 + 1] = _uv4_76.y;
+                            vec_32[0 + 2] = _uv4_76.z;
+                            vec_32[0 + 3] = _uv4_76.w;
                         }
                         unsigned int unit_45 = stripe + (2400 + tid_0);
                         unsigned int clamped_45 = ((unit_45 < units) ? unit_45 : last);
@@ -1316,11 +1325,11 @@ kernel_cake_ulysses_a2a_0f6daa3f5ad400c9b220(__nv_bfloat16* __restrict__ inp, __
                         unsigned int dst_34 = (quotient_48 + (batch_34 * 7 + rank) * sequences) * block_units + remainder_48;
                         unsigned int vec_33[4];
                         {
-                            uint4 _uv4_76 = *reinterpret_cast<const uint4*>(inp_words + (src_36 * 4) + 0);
-                            vec_33[0 + 0] = _uv4_76.x;
-                            vec_33[0 + 1] = _uv4_76.y;
-                            vec_33[0 + 2] = _uv4_76.z;
-                            vec_33[0 + 3] = _uv4_76.w;
+                            uint4 _uv4_77 = *reinterpret_cast<const uint4*>(inp_words + (src_36 * 4) + 0);
+                            vec_33[0 + 0] = _uv4_77.x;
+                            vec_33[0 + 1] = _uv4_77.y;
+                            vec_33[0 + 2] = _uv4_77.z;
+                            vec_33[0 + 3] = _uv4_77.w;
                         }
                         unsigned int unit_46 = stripe + (2880 + tid_0);
                         unsigned int clamped_46 = ((unit_46 < units) ? unit_46 : last);
@@ -1334,11 +1343,11 @@ kernel_cake_ulysses_a2a_0f6daa3f5ad400c9b220(__nv_bfloat16* __restrict__ inp, __
                         unsigned int dst_35 = (quotient_49 + (batch_35 * 7 + rank) * sequences) * block_units + remainder_49;
                         unsigned int vec_34[4];
                         {
-                            uint4 _uv4_77 = *reinterpret_cast<const uint4*>(inp_words + (src_37 * 4) + 0);
-                            vec_34[0 + 0] = _uv4_77.x;
-                            vec_34[0 + 1] = _uv4_77.y;
-                            vec_34[0 + 2] = _uv4_77.z;
-                            vec_34[0 + 3] = _uv4_77.w;
+                            uint4 _uv4_78 = *reinterpret_cast<const uint4*>(inp_words + (src_37 * 4) + 0);
+                            vec_34[0 + 0] = _uv4_78.x;
+                            vec_34[0 + 1] = _uv4_78.y;
+                            vec_34[0 + 2] = _uv4_78.z;
+                            vec_34[0 + 3] = _uv4_78.w;
                         }
                         unsigned int unit_47 = stripe + (3360 + tid_0);
                         unsigned int clamped_47 = ((unit_47 < units) ? unit_47 : last);
@@ -1352,38 +1361,38 @@ kernel_cake_ulysses_a2a_0f6daa3f5ad400c9b220(__nv_bfloat16* __restrict__ inp, __
                         unsigned int dst_36 = (quotient_50 + (batch_36 * 7 + rank) * sequences) * block_units + remainder_50;
                         unsigned int vec_35[4];
                         {
-                            uint4 _uv4_78 = *reinterpret_cast<const uint4*>(inp_words + (src_38 * 4) + 0);
-                            vec_35[0 + 0] = _uv4_78.x;
-                            vec_35[0 + 1] = _uv4_78.y;
-                            vec_35[0 + 2] = _uv4_78.z;
-                            vec_35[0 + 3] = _uv4_78.w;
+                            uint4 _uv4_79 = *reinterpret_cast<const uint4*>(inp_words + (src_38 * 4) + 0);
+                            vec_35[0 + 0] = _uv4_79.x;
+                            vec_35[0 + 1] = _uv4_79.y;
+                            vec_35[0 + 2] = _uv4_79.z;
+                            vec_35[0 + 3] = _uv4_79.w;
                         }
                         if (unit_40 < units) {
                             {
-                                auto _gst_79 = peer_words + (dst_31 * 4);
-                                __builtin_assume(__isGlobal(_gst_79));
-                                reinterpret_cast<int4*>(_gst_79)[0] = reinterpret_cast<int4*>(vec_28)[0];
+                                auto _gst_80 = peer_words + (dst_31 * 4);
+                                __builtin_assume(__isGlobal(_gst_80));
+                                reinterpret_cast<int4*>(_gst_80)[0] = reinterpret_cast<int4*>(vec_28)[0];
                             }
                         }
                         if (unit_41 < units) {
                             {
-                                auto _gst_80 = peer_words + (dst_30_1 * 4);
-                                __builtin_assume(__isGlobal(_gst_80));
-                                reinterpret_cast<int4*>(_gst_80)[0] = reinterpret_cast<int4*>(vec_29)[0];
+                                auto _gst_81 = peer_words + (dst_30_1 * 4);
+                                __builtin_assume(__isGlobal(_gst_81));
+                                reinterpret_cast<int4*>(_gst_81)[0] = reinterpret_cast<int4*>(vec_29)[0];
                             }
                         }
                         if (unit_42 < units) {
                             {
-                                auto _gst_81 = peer_words + (dst_31_1 * 4);
-                                __builtin_assume(__isGlobal(_gst_81));
-                                reinterpret_cast<int4*>(_gst_81)[0] = reinterpret_cast<int4*>(vec_30)[0];
+                                auto _gst_82 = peer_words + (dst_31_1 * 4);
+                                __builtin_assume(__isGlobal(_gst_82));
+                                reinterpret_cast<int4*>(_gst_82)[0] = reinterpret_cast<int4*>(vec_30)[0];
                             }
                         }
                         if (unit_43 < units) {
                             {
-                                auto _gst_82 = peer_words + (dst_32 * 4);
-                                __builtin_assume(__isGlobal(_gst_82));
-                                reinterpret_cast<int4*>(_gst_82)[0] = reinterpret_cast<int4*>(vec_31)[0];
+                                auto _gst_83 = peer_words + (dst_32 * 4);
+                                __builtin_assume(__isGlobal(_gst_83));
+                                reinterpret_cast<int4*>(_gst_83)[0] = reinterpret_cast<int4*>(vec_31)[0];
                             }
                         }
                         unsigned int unit_48 = stripe + (3840 + tid_0);
@@ -1398,11 +1407,11 @@ kernel_cake_ulysses_a2a_0f6daa3f5ad400c9b220(__nv_bfloat16* __restrict__ inp, __
                         unsigned int dst_37 = (quotient_51 + (batch_37 * 7 + rank) * sequences) * block_units + remainder_51;
                         unsigned int vec_36[4];
                         {
-                            uint4 _uv4_83 = *reinterpret_cast<const uint4*>(inp_words + (src_39 * 4) + 0);
-                            vec_36[0 + 0] = _uv4_83.x;
-                            vec_36[0 + 1] = _uv4_83.y;
-                            vec_36[0 + 2] = _uv4_83.z;
-                            vec_36[0 + 3] = _uv4_83.w;
+                            uint4 _uv4_84 = *reinterpret_cast<const uint4*>(inp_words + (src_39 * 4) + 0);
+                            vec_36[0 + 0] = _uv4_84.x;
+                            vec_36[0 + 1] = _uv4_84.y;
+                            vec_36[0 + 2] = _uv4_84.z;
+                            vec_36[0 + 3] = _uv4_84.w;
                         }
                         unsigned int unit_49 = stripe + (4320 + tid_0);
                         unsigned int clamped_49 = ((unit_49 < units) ? unit_49 : last);
@@ -1416,11 +1425,11 @@ kernel_cake_ulysses_a2a_0f6daa3f5ad400c9b220(__nv_bfloat16* __restrict__ inp, __
                         unsigned int dst_38 = (quotient_52 + (batch_38 * 7 + rank) * sequences) * block_units + remainder_52;
                         unsigned int vec_37[4];
                         {
-                            uint4 _uv4_84 = *reinterpret_cast<const uint4*>(inp_words + (src_40 * 4) + 0);
-                            vec_37[0 + 0] = _uv4_84.x;
-                            vec_37[0 + 1] = _uv4_84.y;
-                            vec_37[0 + 2] = _uv4_84.z;
-                            vec_37[0 + 3] = _uv4_84.w;
+                            uint4 _uv4_85 = *reinterpret_cast<const uint4*>(inp_words + (src_40 * 4) + 0);
+                            vec_37[0 + 0] = _uv4_85.x;
+                            vec_37[0 + 1] = _uv4_85.y;
+                            vec_37[0 + 2] = _uv4_85.z;
+                            vec_37[0 + 3] = _uv4_85.w;
                         }
                         unsigned int unit_50 = stripe + (4800 + tid_0);
                         unsigned int clamped_50 = ((unit_50 < units) ? unit_50 : last);
@@ -1434,11 +1443,11 @@ kernel_cake_ulysses_a2a_0f6daa3f5ad400c9b220(__nv_bfloat16* __restrict__ inp, __
                         unsigned int dst_39 = (quotient_53 + (batch_39 * 7 + rank) * sequences) * block_units + remainder_53;
                         unsigned int vec_38[4];
                         {
-                            uint4 _uv4_85 = *reinterpret_cast<const uint4*>(inp_words + (src_41 * 4) + 0);
-                            vec_38[0 + 0] = _uv4_85.x;
-                            vec_38[0 + 1] = _uv4_85.y;
-                            vec_38[0 + 2] = _uv4_85.z;
-                            vec_38[0 + 3] = _uv4_85.w;
+                            uint4 _uv4_86 = *reinterpret_cast<const uint4*>(inp_words + (src_41 * 4) + 0);
+                            vec_38[0 + 0] = _uv4_86.x;
+                            vec_38[0 + 1] = _uv4_86.y;
+                            vec_38[0 + 2] = _uv4_86.z;
+                            vec_38[0 + 3] = _uv4_86.w;
                         }
                         unsigned int unit_51 = stripe + (5280 + tid_0);
                         unsigned int clamped_51 = ((unit_51 < units) ? unit_51 : last);
@@ -1452,38 +1461,38 @@ kernel_cake_ulysses_a2a_0f6daa3f5ad400c9b220(__nv_bfloat16* __restrict__ inp, __
                         unsigned int dst_40 = (quotient_54 + (batch_40 * 7 + rank) * sequences) * block_units + remainder_54;
                         unsigned int vec_39[4];
                         {
-                            uint4 _uv4_86 = *reinterpret_cast<const uint4*>(inp_words + (src_42 * 4) + 0);
-                            vec_39[0 + 0] = _uv4_86.x;
-                            vec_39[0 + 1] = _uv4_86.y;
-                            vec_39[0 + 2] = _uv4_86.z;
-                            vec_39[0 + 3] = _uv4_86.w;
+                            uint4 _uv4_87 = *reinterpret_cast<const uint4*>(inp_words + (src_42 * 4) + 0);
+                            vec_39[0 + 0] = _uv4_87.x;
+                            vec_39[0 + 1] = _uv4_87.y;
+                            vec_39[0 + 2] = _uv4_87.z;
+                            vec_39[0 + 3] = _uv4_87.w;
                         }
                         if (unit_44 < units) {
                             {
-                                auto _gst_87 = peer_words + (dst_33 * 4);
-                                __builtin_assume(__isGlobal(_gst_87));
-                                reinterpret_cast<int4*>(_gst_87)[0] = reinterpret_cast<int4*>(vec_32)[0];
+                                auto _gst_88 = peer_words + (dst_33 * 4);
+                                __builtin_assume(__isGlobal(_gst_88));
+                                reinterpret_cast<int4*>(_gst_88)[0] = reinterpret_cast<int4*>(vec_32)[0];
                             }
                         }
                         if (unit_45 < units) {
                             {
-                                auto _gst_88 = peer_words + (dst_34 * 4);
-                                __builtin_assume(__isGlobal(_gst_88));
-                                reinterpret_cast<int4*>(_gst_88)[0] = reinterpret_cast<int4*>(vec_33)[0];
+                                auto _gst_89 = peer_words + (dst_34 * 4);
+                                __builtin_assume(__isGlobal(_gst_89));
+                                reinterpret_cast<int4*>(_gst_89)[0] = reinterpret_cast<int4*>(vec_33)[0];
                             }
                         }
                         if (unit_46 < units) {
                             {
-                                auto _gst_89 = peer_words + (dst_35 * 4);
-                                __builtin_assume(__isGlobal(_gst_89));
-                                reinterpret_cast<int4*>(_gst_89)[0] = reinterpret_cast<int4*>(vec_34)[0];
+                                auto _gst_90 = peer_words + (dst_35 * 4);
+                                __builtin_assume(__isGlobal(_gst_90));
+                                reinterpret_cast<int4*>(_gst_90)[0] = reinterpret_cast<int4*>(vec_34)[0];
                             }
                         }
                         if (unit_47 < units) {
                             {
-                                auto _gst_90 = peer_words + (dst_36 * 4);
-                                __builtin_assume(__isGlobal(_gst_90));
-                                reinterpret_cast<int4*>(_gst_90)[0] = reinterpret_cast<int4*>(vec_35)[0];
+                                auto _gst_91 = peer_words + (dst_36 * 4);
+                                __builtin_assume(__isGlobal(_gst_91));
+                                reinterpret_cast<int4*>(_gst_91)[0] = reinterpret_cast<int4*>(vec_35)[0];
                             }
                         }
                         unsigned int unit_52 = stripe + (5760 + tid_0);
@@ -1498,11 +1507,11 @@ kernel_cake_ulysses_a2a_0f6daa3f5ad400c9b220(__nv_bfloat16* __restrict__ inp, __
                         unsigned int dst_41 = (quotient_55 + (batch_41 * 7 + rank) * sequences) * block_units + remainder_55;
                         unsigned int vec_40[4];
                         {
-                            uint4 _uv4_91 = *reinterpret_cast<const uint4*>(inp_words + (src_43 * 4) + 0);
-                            vec_40[0 + 0] = _uv4_91.x;
-                            vec_40[0 + 1] = _uv4_91.y;
-                            vec_40[0 + 2] = _uv4_91.z;
-                            vec_40[0 + 3] = _uv4_91.w;
+                            uint4 _uv4_92 = *reinterpret_cast<const uint4*>(inp_words + (src_43 * 4) + 0);
+                            vec_40[0 + 0] = _uv4_92.x;
+                            vec_40[0 + 1] = _uv4_92.y;
+                            vec_40[0 + 2] = _uv4_92.z;
+                            vec_40[0 + 3] = _uv4_92.w;
                         }
                         unsigned int unit_53 = stripe + (6240 + tid_0);
                         unsigned int clamped_53 = ((unit_53 < units) ? unit_53 : last);
@@ -1516,11 +1525,11 @@ kernel_cake_ulysses_a2a_0f6daa3f5ad400c9b220(__nv_bfloat16* __restrict__ inp, __
                         unsigned int dst_42 = (quotient_56 + (batch_42 * 7 + rank) * sequences) * block_units + remainder_56;
                         unsigned int vec_41[4];
                         {
-                            uint4 _uv4_92 = *reinterpret_cast<const uint4*>(inp_words + (src_44 * 4) + 0);
-                            vec_41[0 + 0] = _uv4_92.x;
-                            vec_41[0 + 1] = _uv4_92.y;
-                            vec_41[0 + 2] = _uv4_92.z;
-                            vec_41[0 + 3] = _uv4_92.w;
+                            uint4 _uv4_93 = *reinterpret_cast<const uint4*>(inp_words + (src_44 * 4) + 0);
+                            vec_41[0 + 0] = _uv4_93.x;
+                            vec_41[0 + 1] = _uv4_93.y;
+                            vec_41[0 + 2] = _uv4_93.z;
+                            vec_41[0 + 3] = _uv4_93.w;
                         }
                         unsigned int unit_54 = stripe + (6720 + tid_0);
                         unsigned int clamped_54 = ((unit_54 < units) ? unit_54 : last);
@@ -1534,11 +1543,11 @@ kernel_cake_ulysses_a2a_0f6daa3f5ad400c9b220(__nv_bfloat16* __restrict__ inp, __
                         unsigned int dst_43 = (quotient_57 + (batch_43 * 7 + rank) * sequences) * block_units + remainder_57;
                         unsigned int vec_42[4];
                         {
-                            uint4 _uv4_93 = *reinterpret_cast<const uint4*>(inp_words + (src_45 * 4) + 0);
-                            vec_42[0 + 0] = _uv4_93.x;
-                            vec_42[0 + 1] = _uv4_93.y;
-                            vec_42[0 + 2] = _uv4_93.z;
-                            vec_42[0 + 3] = _uv4_93.w;
+                            uint4 _uv4_94 = *reinterpret_cast<const uint4*>(inp_words + (src_45 * 4) + 0);
+                            vec_42[0 + 0] = _uv4_94.x;
+                            vec_42[0 + 1] = _uv4_94.y;
+                            vec_42[0 + 2] = _uv4_94.z;
+                            vec_42[0 + 3] = _uv4_94.w;
                         }
                         unsigned int unit_55 = stripe + (7200 + tid_0);
                         unsigned int clamped_55 = ((unit_55 < units) ? unit_55 : last);
@@ -1552,66 +1561,66 @@ kernel_cake_ulysses_a2a_0f6daa3f5ad400c9b220(__nv_bfloat16* __restrict__ inp, __
                         unsigned int dst_44 = (quotient_58 + (batch_44 * 7 + rank) * sequences) * block_units + remainder_58;
                         unsigned int vec_43[4];
                         {
-                            uint4 _uv4_94 = *reinterpret_cast<const uint4*>(inp_words + (src_46 * 4) + 0);
-                            vec_43[0 + 0] = _uv4_94.x;
-                            vec_43[0 + 1] = _uv4_94.y;
-                            vec_43[0 + 2] = _uv4_94.z;
-                            vec_43[0 + 3] = _uv4_94.w;
+                            uint4 _uv4_95 = *reinterpret_cast<const uint4*>(inp_words + (src_46 * 4) + 0);
+                            vec_43[0 + 0] = _uv4_95.x;
+                            vec_43[0 + 1] = _uv4_95.y;
+                            vec_43[0 + 2] = _uv4_95.z;
+                            vec_43[0 + 3] = _uv4_95.w;
                         }
                         if (unit_48 < units) {
                             {
-                                auto _gst_95 = peer_words + (dst_37 * 4);
-                                __builtin_assume(__isGlobal(_gst_95));
-                                reinterpret_cast<int4*>(_gst_95)[0] = reinterpret_cast<int4*>(vec_36)[0];
+                                auto _gst_96 = peer_words + (dst_37 * 4);
+                                __builtin_assume(__isGlobal(_gst_96));
+                                reinterpret_cast<int4*>(_gst_96)[0] = reinterpret_cast<int4*>(vec_36)[0];
                             }
                         }
                         if (unit_49 < units) {
                             {
-                                auto _gst_96 = peer_words + (dst_38 * 4);
-                                __builtin_assume(__isGlobal(_gst_96));
-                                reinterpret_cast<int4*>(_gst_96)[0] = reinterpret_cast<int4*>(vec_37)[0];
+                                auto _gst_97 = peer_words + (dst_38 * 4);
+                                __builtin_assume(__isGlobal(_gst_97));
+                                reinterpret_cast<int4*>(_gst_97)[0] = reinterpret_cast<int4*>(vec_37)[0];
                             }
                         }
                         if (unit_50 < units) {
                             {
-                                auto _gst_97 = peer_words + (dst_39 * 4);
-                                __builtin_assume(__isGlobal(_gst_97));
-                                reinterpret_cast<int4*>(_gst_97)[0] = reinterpret_cast<int4*>(vec_38)[0];
+                                auto _gst_98 = peer_words + (dst_39 * 4);
+                                __builtin_assume(__isGlobal(_gst_98));
+                                reinterpret_cast<int4*>(_gst_98)[0] = reinterpret_cast<int4*>(vec_38)[0];
                             }
                         }
                         if (unit_51 < units) {
                             {
-                                auto _gst_98 = peer_words + (dst_40 * 4);
-                                __builtin_assume(__isGlobal(_gst_98));
-                                reinterpret_cast<int4*>(_gst_98)[0] = reinterpret_cast<int4*>(vec_39)[0];
+                                auto _gst_99 = peer_words + (dst_40 * 4);
+                                __builtin_assume(__isGlobal(_gst_99));
+                                reinterpret_cast<int4*>(_gst_99)[0] = reinterpret_cast<int4*>(vec_39)[0];
                             }
                         }
                         if (unit_52 < units) {
                             {
-                                auto _gst_99 = peer_words + (dst_41 * 4);
-                                __builtin_assume(__isGlobal(_gst_99));
-                                reinterpret_cast<int4*>(_gst_99)[0] = reinterpret_cast<int4*>(vec_40)[0];
+                                auto _gst_100 = peer_words + (dst_41 * 4);
+                                __builtin_assume(__isGlobal(_gst_100));
+                                reinterpret_cast<int4*>(_gst_100)[0] = reinterpret_cast<int4*>(vec_40)[0];
                             }
                         }
                         if (unit_53 < units) {
                             {
-                                auto _gst_100 = peer_words + (dst_42 * 4);
-                                __builtin_assume(__isGlobal(_gst_100));
-                                reinterpret_cast<int4*>(_gst_100)[0] = reinterpret_cast<int4*>(vec_41)[0];
+                                auto _gst_101 = peer_words + (dst_42 * 4);
+                                __builtin_assume(__isGlobal(_gst_101));
+                                reinterpret_cast<int4*>(_gst_101)[0] = reinterpret_cast<int4*>(vec_41)[0];
                             }
                         }
                         if (unit_54 < units) {
                             {
-                                auto _gst_101 = peer_words + (dst_43 * 4);
-                                __builtin_assume(__isGlobal(_gst_101));
-                                reinterpret_cast<int4*>(_gst_101)[0] = reinterpret_cast<int4*>(vec_42)[0];
+                                auto _gst_102 = peer_words + (dst_43 * 4);
+                                __builtin_assume(__isGlobal(_gst_102));
+                                reinterpret_cast<int4*>(_gst_102)[0] = reinterpret_cast<int4*>(vec_42)[0];
                             }
                         }
                         if (unit_55 < units) {
                             {
-                                auto _gst_102 = peer_words + (dst_44 * 4);
-                                __builtin_assume(__isGlobal(_gst_102));
-                                reinterpret_cast<int4*>(_gst_102)[0] = reinterpret_cast<int4*>(vec_43)[0];
+                                auto _gst_103 = peer_words + (dst_44 * 4);
+                                __builtin_assume(__isGlobal(_gst_103));
+                                reinterpret_cast<int4*>(_gst_103)[0] = reinterpret_cast<int4*>(vec_43)[0];
                             }
                         }
                     } else {
@@ -1672,11 +1681,11 @@ kernel_cake_ulysses_a2a_0f6daa3f5ad400c9b220(__nv_bfloat16* __restrict__ inp, __
                             unsigned int dst_46 = (quotient_60 + (batch_46 * 7 + rank) * sequences) * block_units + remainder_60;
                             unsigned int vec_44[4];
                             {
-                                uint4 _uv4_103 = *reinterpret_cast<const uint4*>(inp_words + (src_48 * 4) + 0);
-                                vec_44[0 + 0] = _uv4_103.x;
-                                vec_44[0 + 1] = _uv4_103.y;
-                                vec_44[0 + 2] = _uv4_103.z;
-                                vec_44[0 + 3] = _uv4_103.w;
+                                uint4 _uv4_104 = *reinterpret_cast<const uint4*>(inp_words + (src_48 * 4) + 0);
+                                vec_44[0 + 0] = _uv4_104.x;
+                                vec_44[0 + 1] = _uv4_104.y;
+                                vec_44[0 + 2] = _uv4_104.z;
+                                vec_44[0 + 3] = _uv4_104.w;
                             }
                             unsigned int unit_57 = base_1 + 480;
                             unsigned int clamped_57 = ((unit_57 < chi_3) ? unit_57 : last_1);
@@ -1690,11 +1699,11 @@ kernel_cake_ulysses_a2a_0f6daa3f5ad400c9b220(__nv_bfloat16* __restrict__ inp, __
                             unsigned int dst_45_1 = (quotient_61 + (batch_45_1 * 7 + rank) * sequences) * block_units + remainder_61;
                             unsigned int vec_45[4];
                             {
-                                uint4 _uv4_104 = *reinterpret_cast<const uint4*>(inp_words + (src_47_1 * 4) + 0);
-                                vec_45[0 + 0] = _uv4_104.x;
-                                vec_45[0 + 1] = _uv4_104.y;
-                                vec_45[0 + 2] = _uv4_104.z;
-                                vec_45[0 + 3] = _uv4_104.w;
+                                uint4 _uv4_105 = *reinterpret_cast<const uint4*>(inp_words + (src_47_1 * 4) + 0);
+                                vec_45[0 + 0] = _uv4_105.x;
+                                vec_45[0 + 1] = _uv4_105.y;
+                                vec_45[0 + 2] = _uv4_105.z;
+                                vec_45[0 + 3] = _uv4_105.w;
                             }
                             unsigned int unit_58 = base_1 + 960;
                             unsigned int clamped_58 = ((unit_58 < chi_3) ? unit_58 : last_1);
@@ -1708,11 +1717,11 @@ kernel_cake_ulysses_a2a_0f6daa3f5ad400c9b220(__nv_bfloat16* __restrict__ inp, __
                             unsigned int dst_46_1 = (quotient_62 + (batch_46_1 * 7 + rank) * sequences) * block_units + remainder_62;
                             unsigned int vec_46[4];
                             {
-                                uint4 _uv4_105 = *reinterpret_cast<const uint4*>(inp_words + (src_48_1 * 4) + 0);
-                                vec_46[0 + 0] = _uv4_105.x;
-                                vec_46[0 + 1] = _uv4_105.y;
-                                vec_46[0 + 2] = _uv4_105.z;
-                                vec_46[0 + 3] = _uv4_105.w;
+                                uint4 _uv4_106 = *reinterpret_cast<const uint4*>(inp_words + (src_48_1 * 4) + 0);
+                                vec_46[0 + 0] = _uv4_106.x;
+                                vec_46[0 + 1] = _uv4_106.y;
+                                vec_46[0 + 2] = _uv4_106.z;
+                                vec_46[0 + 3] = _uv4_106.w;
                             }
                             unsigned int unit_59 = base_1 + 1440;
                             unsigned int clamped_59 = ((unit_59 < chi_3) ? unit_59 : last_1);
@@ -1726,11 +1735,11 @@ kernel_cake_ulysses_a2a_0f6daa3f5ad400c9b220(__nv_bfloat16* __restrict__ inp, __
                             unsigned int dst_47 = (quotient_63 + (batch_47 * 7 + rank) * sequences) * block_units + remainder_63;
                             unsigned int vec_47[4];
                             {
-                                uint4 _uv4_106 = *reinterpret_cast<const uint4*>(inp_words + (src_49 * 4) + 0);
-                                vec_47[0 + 0] = _uv4_106.x;
-                                vec_47[0 + 1] = _uv4_106.y;
-                                vec_47[0 + 2] = _uv4_106.z;
-                                vec_47[0 + 3] = _uv4_106.w;
+                                uint4 _uv4_107 = *reinterpret_cast<const uint4*>(inp_words + (src_49 * 4) + 0);
+                                vec_47[0 + 0] = _uv4_107.x;
+                                vec_47[0 + 1] = _uv4_107.y;
+                                vec_47[0 + 2] = _uv4_107.z;
+                                vec_47[0 + 3] = _uv4_107.w;
                             }
                             unsigned int unit_60 = base_1 + 1920;
                             unsigned int clamped_60 = ((unit_60 < chi_3) ? unit_60 : last_1);
@@ -1744,11 +1753,11 @@ kernel_cake_ulysses_a2a_0f6daa3f5ad400c9b220(__nv_bfloat16* __restrict__ inp, __
                             unsigned int dst_48 = (quotient_64 + (batch_48 * 7 + rank) * sequences) * block_units + remainder_64;
                             unsigned int vec_48[4];
                             {
-                                uint4 _uv4_107 = *reinterpret_cast<const uint4*>(inp_words + (src_50 * 4) + 0);
-                                vec_48[0 + 0] = _uv4_107.x;
-                                vec_48[0 + 1] = _uv4_107.y;
-                                vec_48[0 + 2] = _uv4_107.z;
-                                vec_48[0 + 3] = _uv4_107.w;
+                                uint4 _uv4_108 = *reinterpret_cast<const uint4*>(inp_words + (src_50 * 4) + 0);
+                                vec_48[0 + 0] = _uv4_108.x;
+                                vec_48[0 + 1] = _uv4_108.y;
+                                vec_48[0 + 2] = _uv4_108.z;
+                                vec_48[0 + 3] = _uv4_108.w;
                             }
                             unsigned int unit_61 = base_1 + 1920 + 480;
                             unsigned int clamped_61 = ((unit_61 < chi_3) ? unit_61 : last_1);
@@ -1762,11 +1771,11 @@ kernel_cake_ulysses_a2a_0f6daa3f5ad400c9b220(__nv_bfloat16* __restrict__ inp, __
                             unsigned int dst_49 = (quotient_65 + (batch_49 * 7 + rank) * sequences) * block_units + remainder_65;
                             unsigned int vec_49[4];
                             {
-                                uint4 _uv4_108 = *reinterpret_cast<const uint4*>(inp_words + (src_51 * 4) + 0);
-                                vec_49[0 + 0] = _uv4_108.x;
-                                vec_49[0 + 1] = _uv4_108.y;
-                                vec_49[0 + 2] = _uv4_108.z;
-                                vec_49[0 + 3] = _uv4_108.w;
+                                uint4 _uv4_109 = *reinterpret_cast<const uint4*>(inp_words + (src_51 * 4) + 0);
+                                vec_49[0 + 0] = _uv4_109.x;
+                                vec_49[0 + 1] = _uv4_109.y;
+                                vec_49[0 + 2] = _uv4_109.z;
+                                vec_49[0 + 3] = _uv4_109.w;
                             }
                             unsigned int unit_62 = base_1 + 1920 + 960;
                             unsigned int clamped_62 = ((unit_62 < chi_3) ? unit_62 : last_1);
@@ -1780,11 +1789,11 @@ kernel_cake_ulysses_a2a_0f6daa3f5ad400c9b220(__nv_bfloat16* __restrict__ inp, __
                             unsigned int dst_50 = (quotient_66 + (batch_50 * 7 + rank) * sequences) * block_units + remainder_66;
                             unsigned int vec_50[4];
                             {
-                                uint4 _uv4_109 = *reinterpret_cast<const uint4*>(inp_words + (src_52 * 4) + 0);
-                                vec_50[0 + 0] = _uv4_109.x;
-                                vec_50[0 + 1] = _uv4_109.y;
-                                vec_50[0 + 2] = _uv4_109.z;
-                                vec_50[0 + 3] = _uv4_109.w;
+                                uint4 _uv4_110 = *reinterpret_cast<const uint4*>(inp_words + (src_52 * 4) + 0);
+                                vec_50[0 + 0] = _uv4_110.x;
+                                vec_50[0 + 1] = _uv4_110.y;
+                                vec_50[0 + 2] = _uv4_110.z;
+                                vec_50[0 + 3] = _uv4_110.w;
                             }
                             unsigned int unit_63 = base_1 + 1920 + 1440;
                             unsigned int clamped_63 = ((unit_63 < chi_3) ? unit_63 : last_1);
@@ -1798,38 +1807,38 @@ kernel_cake_ulysses_a2a_0f6daa3f5ad400c9b220(__nv_bfloat16* __restrict__ inp, __
                             unsigned int dst_51 = (quotient_67 + (batch_51 * 7 + rank) * sequences) * block_units + remainder_67;
                             unsigned int vec_51[4];
                             {
-                                uint4 _uv4_110 = *reinterpret_cast<const uint4*>(inp_words + (src_53 * 4) + 0);
-                                vec_51[0 + 0] = _uv4_110.x;
-                                vec_51[0 + 1] = _uv4_110.y;
-                                vec_51[0 + 2] = _uv4_110.z;
-                                vec_51[0 + 3] = _uv4_110.w;
+                                uint4 _uv4_111 = *reinterpret_cast<const uint4*>(inp_words + (src_53 * 4) + 0);
+                                vec_51[0 + 0] = _uv4_111.x;
+                                vec_51[0 + 1] = _uv4_111.y;
+                                vec_51[0 + 2] = _uv4_111.z;
+                                vec_51[0 + 3] = _uv4_111.w;
                             }
                             if (unit_56 < chi_3) {
                                 {
-                                    auto _gst_111 = out_words + (dst_46 * 4);
-                                    __builtin_assume(__isGlobal(_gst_111));
-                                    reinterpret_cast<int4*>(_gst_111)[0] = reinterpret_cast<int4*>(vec_44)[0];
+                                    auto _gst_112 = out_words + (dst_46 * 4);
+                                    __builtin_assume(__isGlobal(_gst_112));
+                                    reinterpret_cast<int4*>(_gst_112)[0] = reinterpret_cast<int4*>(vec_44)[0];
                                 }
                             }
                             if (unit_57 < chi_3) {
                                 {
-                                    auto _gst_112 = out_words + (dst_45_1 * 4);
-                                    __builtin_assume(__isGlobal(_gst_112));
-                                    reinterpret_cast<int4*>(_gst_112)[0] = reinterpret_cast<int4*>(vec_45)[0];
+                                    auto _gst_113 = out_words + (dst_45_1 * 4);
+                                    __builtin_assume(__isGlobal(_gst_113));
+                                    reinterpret_cast<int4*>(_gst_113)[0] = reinterpret_cast<int4*>(vec_45)[0];
                                 }
                             }
                             if (unit_58 < chi_3) {
                                 {
-                                    auto _gst_113 = out_words + (dst_46_1 * 4);
-                                    __builtin_assume(__isGlobal(_gst_113));
-                                    reinterpret_cast<int4*>(_gst_113)[0] = reinterpret_cast<int4*>(vec_46)[0];
+                                    auto _gst_114 = out_words + (dst_46_1 * 4);
+                                    __builtin_assume(__isGlobal(_gst_114));
+                                    reinterpret_cast<int4*>(_gst_114)[0] = reinterpret_cast<int4*>(vec_46)[0];
                                 }
                             }
                             if (unit_59 < chi_3) {
                                 {
-                                    auto _gst_114 = out_words + (dst_47 * 4);
-                                    __builtin_assume(__isGlobal(_gst_114));
-                                    reinterpret_cast<int4*>(_gst_114)[0] = reinterpret_cast<int4*>(vec_47)[0];
+                                    auto _gst_115 = out_words + (dst_47 * 4);
+                                    __builtin_assume(__isGlobal(_gst_115));
+                                    reinterpret_cast<int4*>(_gst_115)[0] = reinterpret_cast<int4*>(vec_47)[0];
                                 }
                             }
                             unsigned int unit_64 = base_1 + 3840;
@@ -1844,11 +1853,11 @@ kernel_cake_ulysses_a2a_0f6daa3f5ad400c9b220(__nv_bfloat16* __restrict__ inp, __
                             unsigned int dst_52 = (quotient_68 + (batch_52 * 7 + rank) * sequences) * block_units + remainder_68;
                             unsigned int vec_52[4];
                             {
-                                uint4 _uv4_115 = *reinterpret_cast<const uint4*>(inp_words + (src_54 * 4) + 0);
-                                vec_52[0 + 0] = _uv4_115.x;
-                                vec_52[0 + 1] = _uv4_115.y;
-                                vec_52[0 + 2] = _uv4_115.z;
-                                vec_52[0 + 3] = _uv4_115.w;
+                                uint4 _uv4_116 = *reinterpret_cast<const uint4*>(inp_words + (src_54 * 4) + 0);
+                                vec_52[0 + 0] = _uv4_116.x;
+                                vec_52[0 + 1] = _uv4_116.y;
+                                vec_52[0 + 2] = _uv4_116.z;
+                                vec_52[0 + 3] = _uv4_116.w;
                             }
                             unsigned int unit_65 = base_1 + 3840 + 480;
                             unsigned int clamped_65 = ((unit_65 < chi_3) ? unit_65 : last_1);
@@ -1862,11 +1871,11 @@ kernel_cake_ulysses_a2a_0f6daa3f5ad400c9b220(__nv_bfloat16* __restrict__ inp, __
                             unsigned int dst_53 = (quotient_69 + (batch_53 * 7 + rank) * sequences) * block_units + remainder_69;
                             unsigned int vec_53[4];
                             {
-                                uint4 _uv4_116 = *reinterpret_cast<const uint4*>(inp_words + (src_55 * 4) + 0);
-                                vec_53[0 + 0] = _uv4_116.x;
-                                vec_53[0 + 1] = _uv4_116.y;
-                                vec_53[0 + 2] = _uv4_116.z;
-                                vec_53[0 + 3] = _uv4_116.w;
+                                uint4 _uv4_117 = *reinterpret_cast<const uint4*>(inp_words + (src_55 * 4) + 0);
+                                vec_53[0 + 0] = _uv4_117.x;
+                                vec_53[0 + 1] = _uv4_117.y;
+                                vec_53[0 + 2] = _uv4_117.z;
+                                vec_53[0 + 3] = _uv4_117.w;
                             }
                             unsigned int unit_66 = base_1 + 3840 + 960;
                             unsigned int clamped_66 = ((unit_66 < chi_3) ? unit_66 : last_1);
@@ -1880,11 +1889,11 @@ kernel_cake_ulysses_a2a_0f6daa3f5ad400c9b220(__nv_bfloat16* __restrict__ inp, __
                             unsigned int dst_54 = (quotient_70 + (batch_54 * 7 + rank) * sequences) * block_units + remainder_70;
                             unsigned int vec_54[4];
                             {
-                                uint4 _uv4_117 = *reinterpret_cast<const uint4*>(inp_words + (src_56 * 4) + 0);
-                                vec_54[0 + 0] = _uv4_117.x;
-                                vec_54[0 + 1] = _uv4_117.y;
-                                vec_54[0 + 2] = _uv4_117.z;
-                                vec_54[0 + 3] = _uv4_117.w;
+                                uint4 _uv4_118 = *reinterpret_cast<const uint4*>(inp_words + (src_56 * 4) + 0);
+                                vec_54[0 + 0] = _uv4_118.x;
+                                vec_54[0 + 1] = _uv4_118.y;
+                                vec_54[0 + 2] = _uv4_118.z;
+                                vec_54[0 + 3] = _uv4_118.w;
                             }
                             unsigned int unit_67 = base_1 + 3840 + 1440;
                             unsigned int clamped_67 = ((unit_67 < chi_3) ? unit_67 : last_1);
@@ -1898,38 +1907,38 @@ kernel_cake_ulysses_a2a_0f6daa3f5ad400c9b220(__nv_bfloat16* __restrict__ inp, __
                             unsigned int dst_55 = (quotient_71 + (batch_55 * 7 + rank) * sequences) * block_units + remainder_71;
                             unsigned int vec_55[4];
                             {
-                                uint4 _uv4_118 = *reinterpret_cast<const uint4*>(inp_words + (src_57 * 4) + 0);
-                                vec_55[0 + 0] = _uv4_118.x;
-                                vec_55[0 + 1] = _uv4_118.y;
-                                vec_55[0 + 2] = _uv4_118.z;
-                                vec_55[0 + 3] = _uv4_118.w;
+                                uint4 _uv4_119 = *reinterpret_cast<const uint4*>(inp_words + (src_57 * 4) + 0);
+                                vec_55[0 + 0] = _uv4_119.x;
+                                vec_55[0 + 1] = _uv4_119.y;
+                                vec_55[0 + 2] = _uv4_119.z;
+                                vec_55[0 + 3] = _uv4_119.w;
                             }
                             if (unit_60 < chi_3) {
                                 {
-                                    auto _gst_119 = out_words + (dst_48 * 4);
-                                    __builtin_assume(__isGlobal(_gst_119));
-                                    reinterpret_cast<int4*>(_gst_119)[0] = reinterpret_cast<int4*>(vec_48)[0];
+                                    auto _gst_120 = out_words + (dst_48 * 4);
+                                    __builtin_assume(__isGlobal(_gst_120));
+                                    reinterpret_cast<int4*>(_gst_120)[0] = reinterpret_cast<int4*>(vec_48)[0];
                                 }
                             }
                             if (unit_61 < chi_3) {
                                 {
-                                    auto _gst_120 = out_words + (dst_49 * 4);
-                                    __builtin_assume(__isGlobal(_gst_120));
-                                    reinterpret_cast<int4*>(_gst_120)[0] = reinterpret_cast<int4*>(vec_49)[0];
+                                    auto _gst_121 = out_words + (dst_49 * 4);
+                                    __builtin_assume(__isGlobal(_gst_121));
+                                    reinterpret_cast<int4*>(_gst_121)[0] = reinterpret_cast<int4*>(vec_49)[0];
                                 }
                             }
                             if (unit_62 < chi_3) {
                                 {
-                                    auto _gst_121 = out_words + (dst_50 * 4);
-                                    __builtin_assume(__isGlobal(_gst_121));
-                                    reinterpret_cast<int4*>(_gst_121)[0] = reinterpret_cast<int4*>(vec_50)[0];
+                                    auto _gst_122 = out_words + (dst_50 * 4);
+                                    __builtin_assume(__isGlobal(_gst_122));
+                                    reinterpret_cast<int4*>(_gst_122)[0] = reinterpret_cast<int4*>(vec_50)[0];
                                 }
                             }
                             if (unit_63 < chi_3) {
                                 {
-                                    auto _gst_122 = out_words + (dst_51 * 4);
-                                    __builtin_assume(__isGlobal(_gst_122));
-                                    reinterpret_cast<int4*>(_gst_122)[0] = reinterpret_cast<int4*>(vec_51)[0];
+                                    auto _gst_123 = out_words + (dst_51 * 4);
+                                    __builtin_assume(__isGlobal(_gst_123));
+                                    reinterpret_cast<int4*>(_gst_123)[0] = reinterpret_cast<int4*>(vec_51)[0];
                                 }
                             }
                             unsigned int unit_68 = base_1 + 5760;
@@ -1944,11 +1953,11 @@ kernel_cake_ulysses_a2a_0f6daa3f5ad400c9b220(__nv_bfloat16* __restrict__ inp, __
                             unsigned int dst_56 = (quotient_72 + (batch_56 * 7 + rank) * sequences) * block_units + remainder_72;
                             unsigned int vec_56[4];
                             {
-                                uint4 _uv4_123 = *reinterpret_cast<const uint4*>(inp_words + (src_58 * 4) + 0);
-                                vec_56[0 + 0] = _uv4_123.x;
-                                vec_56[0 + 1] = _uv4_123.y;
-                                vec_56[0 + 2] = _uv4_123.z;
-                                vec_56[0 + 3] = _uv4_123.w;
+                                uint4 _uv4_124 = *reinterpret_cast<const uint4*>(inp_words + (src_58 * 4) + 0);
+                                vec_56[0 + 0] = _uv4_124.x;
+                                vec_56[0 + 1] = _uv4_124.y;
+                                vec_56[0 + 2] = _uv4_124.z;
+                                vec_56[0 + 3] = _uv4_124.w;
                             }
                             unsigned int unit_69 = base_1 + 5760 + 480;
                             unsigned int clamped_69 = ((unit_69 < chi_3) ? unit_69 : last_1);
@@ -1962,11 +1971,11 @@ kernel_cake_ulysses_a2a_0f6daa3f5ad400c9b220(__nv_bfloat16* __restrict__ inp, __
                             unsigned int dst_57 = (quotient_73 + (batch_57 * 7 + rank) * sequences) * block_units + remainder_73;
                             unsigned int vec_57[4];
                             {
-                                uint4 _uv4_124 = *reinterpret_cast<const uint4*>(inp_words + (src_59 * 4) + 0);
-                                vec_57[0 + 0] = _uv4_124.x;
-                                vec_57[0 + 1] = _uv4_124.y;
-                                vec_57[0 + 2] = _uv4_124.z;
-                                vec_57[0 + 3] = _uv4_124.w;
+                                uint4 _uv4_125 = *reinterpret_cast<const uint4*>(inp_words + (src_59 * 4) + 0);
+                                vec_57[0 + 0] = _uv4_125.x;
+                                vec_57[0 + 1] = _uv4_125.y;
+                                vec_57[0 + 2] = _uv4_125.z;
+                                vec_57[0 + 3] = _uv4_125.w;
                             }
                             unsigned int unit_70 = base_1 + 5760 + 960;
                             unsigned int clamped_70 = ((unit_70 < chi_3) ? unit_70 : last_1);
@@ -1980,11 +1989,11 @@ kernel_cake_ulysses_a2a_0f6daa3f5ad400c9b220(__nv_bfloat16* __restrict__ inp, __
                             unsigned int dst_58 = (quotient_74 + (batch_58 * 7 + rank) * sequences) * block_units + remainder_74;
                             unsigned int vec_58[4];
                             {
-                                uint4 _uv4_125 = *reinterpret_cast<const uint4*>(inp_words + (src_60 * 4) + 0);
-                                vec_58[0 + 0] = _uv4_125.x;
-                                vec_58[0 + 1] = _uv4_125.y;
-                                vec_58[0 + 2] = _uv4_125.z;
-                                vec_58[0 + 3] = _uv4_125.w;
+                                uint4 _uv4_126 = *reinterpret_cast<const uint4*>(inp_words + (src_60 * 4) + 0);
+                                vec_58[0 + 0] = _uv4_126.x;
+                                vec_58[0 + 1] = _uv4_126.y;
+                                vec_58[0 + 2] = _uv4_126.z;
+                                vec_58[0 + 3] = _uv4_126.w;
                             }
                             unsigned int unit_71 = base_1 + 5760 + 1440;
                             unsigned int clamped_71 = ((unit_71 < chi_3) ? unit_71 : last_1);
@@ -1998,66 +2007,66 @@ kernel_cake_ulysses_a2a_0f6daa3f5ad400c9b220(__nv_bfloat16* __restrict__ inp, __
                             unsigned int dst_59 = (quotient_75 + (batch_59 * 7 + rank) * sequences) * block_units + remainder_75;
                             unsigned int vec_59[4];
                             {
-                                uint4 _uv4_126 = *reinterpret_cast<const uint4*>(inp_words + (src_61 * 4) + 0);
-                                vec_59[0 + 0] = _uv4_126.x;
-                                vec_59[0 + 1] = _uv4_126.y;
-                                vec_59[0 + 2] = _uv4_126.z;
-                                vec_59[0 + 3] = _uv4_126.w;
+                                uint4 _uv4_127 = *reinterpret_cast<const uint4*>(inp_words + (src_61 * 4) + 0);
+                                vec_59[0 + 0] = _uv4_127.x;
+                                vec_59[0 + 1] = _uv4_127.y;
+                                vec_59[0 + 2] = _uv4_127.z;
+                                vec_59[0 + 3] = _uv4_127.w;
                             }
                             if (unit_64 < chi_3) {
                                 {
-                                    auto _gst_127 = out_words + (dst_52 * 4);
-                                    __builtin_assume(__isGlobal(_gst_127));
-                                    reinterpret_cast<int4*>(_gst_127)[0] = reinterpret_cast<int4*>(vec_52)[0];
+                                    auto _gst_128 = out_words + (dst_52 * 4);
+                                    __builtin_assume(__isGlobal(_gst_128));
+                                    reinterpret_cast<int4*>(_gst_128)[0] = reinterpret_cast<int4*>(vec_52)[0];
                                 }
                             }
                             if (unit_65 < chi_3) {
                                 {
-                                    auto _gst_128 = out_words + (dst_53 * 4);
-                                    __builtin_assume(__isGlobal(_gst_128));
-                                    reinterpret_cast<int4*>(_gst_128)[0] = reinterpret_cast<int4*>(vec_53)[0];
+                                    auto _gst_129 = out_words + (dst_53 * 4);
+                                    __builtin_assume(__isGlobal(_gst_129));
+                                    reinterpret_cast<int4*>(_gst_129)[0] = reinterpret_cast<int4*>(vec_53)[0];
                                 }
                             }
                             if (unit_66 < chi_3) {
                                 {
-                                    auto _gst_129 = out_words + (dst_54 * 4);
-                                    __builtin_assume(__isGlobal(_gst_129));
-                                    reinterpret_cast<int4*>(_gst_129)[0] = reinterpret_cast<int4*>(vec_54)[0];
+                                    auto _gst_130 = out_words + (dst_54 * 4);
+                                    __builtin_assume(__isGlobal(_gst_130));
+                                    reinterpret_cast<int4*>(_gst_130)[0] = reinterpret_cast<int4*>(vec_54)[0];
                                 }
                             }
                             if (unit_67 < chi_3) {
                                 {
-                                    auto _gst_130 = out_words + (dst_55 * 4);
-                                    __builtin_assume(__isGlobal(_gst_130));
-                                    reinterpret_cast<int4*>(_gst_130)[0] = reinterpret_cast<int4*>(vec_55)[0];
+                                    auto _gst_131 = out_words + (dst_55 * 4);
+                                    __builtin_assume(__isGlobal(_gst_131));
+                                    reinterpret_cast<int4*>(_gst_131)[0] = reinterpret_cast<int4*>(vec_55)[0];
                                 }
                             }
                             if (unit_68 < chi_3) {
                                 {
-                                    auto _gst_131 = out_words + (dst_56 * 4);
-                                    __builtin_assume(__isGlobal(_gst_131));
-                                    reinterpret_cast<int4*>(_gst_131)[0] = reinterpret_cast<int4*>(vec_56)[0];
+                                    auto _gst_132 = out_words + (dst_56 * 4);
+                                    __builtin_assume(__isGlobal(_gst_132));
+                                    reinterpret_cast<int4*>(_gst_132)[0] = reinterpret_cast<int4*>(vec_56)[0];
                                 }
                             }
                             if (unit_69 < chi_3) {
                                 {
-                                    auto _gst_132 = out_words + (dst_57 * 4);
-                                    __builtin_assume(__isGlobal(_gst_132));
-                                    reinterpret_cast<int4*>(_gst_132)[0] = reinterpret_cast<int4*>(vec_57)[0];
+                                    auto _gst_133 = out_words + (dst_57 * 4);
+                                    __builtin_assume(__isGlobal(_gst_133));
+                                    reinterpret_cast<int4*>(_gst_133)[0] = reinterpret_cast<int4*>(vec_57)[0];
                                 }
                             }
                             if (unit_70 < chi_3) {
                                 {
-                                    auto _gst_133 = out_words + (dst_58 * 4);
-                                    __builtin_assume(__isGlobal(_gst_133));
-                                    reinterpret_cast<int4*>(_gst_133)[0] = reinterpret_cast<int4*>(vec_58)[0];
+                                    auto _gst_134 = out_words + (dst_58 * 4);
+                                    __builtin_assume(__isGlobal(_gst_134));
+                                    reinterpret_cast<int4*>(_gst_134)[0] = reinterpret_cast<int4*>(vec_58)[0];
                                 }
                             }
                             if (unit_71 < chi_3) {
                                 {
-                                    auto _gst_134 = out_words + (dst_59 * 4);
-                                    __builtin_assume(__isGlobal(_gst_134));
-                                    reinterpret_cast<int4*>(_gst_134)[0] = reinterpret_cast<int4*>(vec_59)[0];
+                                    auto _gst_135 = out_words + (dst_59 * 4);
+                                    __builtin_assume(__isGlobal(_gst_135));
+                                    reinterpret_cast<int4*>(_gst_135)[0] = reinterpret_cast<int4*>(vec_59)[0];
                                 }
                             }
                         }
@@ -2151,11 +2160,11 @@ kernel_cake_ulysses_a2a_0f6daa3f5ad400c9b220(__nv_bfloat16* __restrict__ inp, __
                     unsigned int dst_63 = (quotient_81 + (batch_63 * 7 + rank) * sequences) * block_units + remainder_81;
                     unsigned int vec_60[4];
                     {
-                        uint4 _uv4_135 = *reinterpret_cast<const uint4*>(inp_words + (src_63 * 4) + 0);
-                        vec_60[0 + 0] = _uv4_135.x;
-                        vec_60[0 + 1] = _uv4_135.y;
-                        vec_60[0 + 2] = _uv4_135.z;
-                        vec_60[0 + 3] = _uv4_135.w;
+                        uint4 _uv4_136 = *reinterpret_cast<const uint4*>(inp_words + (src_63 * 4) + 0);
+                        vec_60[0 + 0] = _uv4_136.x;
+                        vec_60[0 + 1] = _uv4_136.y;
+                        vec_60[0 + 2] = _uv4_136.z;
+                        vec_60[0 + 3] = _uv4_136.w;
                     }
                     unsigned int unit_77 = sub * 7680 + (2400 + tid_0);
                     unsigned int clamped_77 = ((unit_77 < units) ? unit_77 : last_unit_4);
@@ -2173,11 +2182,11 @@ kernel_cake_ulysses_a2a_0f6daa3f5ad400c9b220(__nv_bfloat16* __restrict__ inp, __
                     unsigned int dst_64 = (quotient_82 + (batch_64 * 7 + rank) * sequences) * block_units + remainder_82;
                     unsigned int vec_61[4];
                     {
-                        uint4 _uv4_136 = *reinterpret_cast<const uint4*>(inp_words + (src_62_1 * 4) + 0);
-                        vec_61[0 + 0] = _uv4_136.x;
-                        vec_61[0 + 1] = _uv4_136.y;
-                        vec_61[0 + 2] = _uv4_136.z;
-                        vec_61[0 + 3] = _uv4_136.w;
+                        uint4 _uv4_137 = *reinterpret_cast<const uint4*>(inp_words + (src_62_1 * 4) + 0);
+                        vec_61[0 + 0] = _uv4_137.x;
+                        vec_61[0 + 1] = _uv4_137.y;
+                        vec_61[0 + 2] = _uv4_137.z;
+                        vec_61[0 + 3] = _uv4_137.w;
                     }
                     unsigned int unit_78 = sub * 7680 + (2880 + tid_0);
                     unsigned int clamped_78 = ((unit_78 < units) ? unit_78 : last_unit_4);
@@ -2195,11 +2204,11 @@ kernel_cake_ulysses_a2a_0f6daa3f5ad400c9b220(__nv_bfloat16* __restrict__ inp, __
                     unsigned int dst_65 = (quotient_83 + (batch_65 * 7 + rank) * sequences) * block_units + remainder_83;
                     unsigned int vec_62[4];
                     {
-                        uint4 _uv4_137 = *reinterpret_cast<const uint4*>(inp_words + (src_63_1 * 4) + 0);
-                        vec_62[0 + 0] = _uv4_137.x;
-                        vec_62[0 + 1] = _uv4_137.y;
-                        vec_62[0 + 2] = _uv4_137.z;
-                        vec_62[0 + 3] = _uv4_137.w;
+                        uint4 _uv4_138 = *reinterpret_cast<const uint4*>(inp_words + (src_63_1 * 4) + 0);
+                        vec_62[0 + 0] = _uv4_138.x;
+                        vec_62[0 + 1] = _uv4_138.y;
+                        vec_62[0 + 2] = _uv4_138.z;
+                        vec_62[0 + 3] = _uv4_138.w;
                     }
                     unsigned int unit_79 = sub * 7680 + (3360 + tid_0);
                     unsigned int clamped_79 = ((unit_79 < units) ? unit_79 : last_unit_4);
@@ -2217,40 +2226,42 @@ kernel_cake_ulysses_a2a_0f6daa3f5ad400c9b220(__nv_bfloat16* __restrict__ inp, __
                     unsigned int dst_66 = (quotient_84 + (batch_66 * 7 + rank) * sequences) * block_units + remainder_84;
                     unsigned int vec_63[4];
                     {
-                        uint4 _uv4_138 = *reinterpret_cast<const uint4*>(inp_words + (src_64 * 4) + 0);
-                        vec_63[0 + 0] = _uv4_138.x;
-                        vec_63[0 + 1] = _uv4_138.y;
-                        vec_63[0 + 2] = _uv4_138.z;
-                        vec_63[0 + 3] = _uv4_138.w;
+                        uint4 _uv4_139 = *reinterpret_cast<const uint4*>(inp_words + (src_64 * 4) + 0);
+                        vec_63[0 + 0] = _uv4_139.x;
+                        vec_63[0 + 1] = _uv4_139.y;
+                        vec_63[0 + 2] = _uv4_139.z;
+                        vec_63[0 + 3] = _uv4_139.w;
                     }
                     if (!zoned) {
                         if (unit_72 < units) {
                             {
-                                auto _gst_139 = peer_words + (dst_61 * 4);
-                                __builtin_assume(__isGlobal(_gst_139));
-                                reinterpret_cast<int4*>(_gst_139)[0] = reinterpret_cast<int4*>(first_0)[0];
+                                auto _gst_140 = peer_words + (dst_61 * 4);
+                                __builtin_assume(__isGlobal(_gst_140));
+                                reinterpret_cast<int4*>(_gst_140)[0] = reinterpret_cast<int4*>(first_0)[0];
                             }
                         }
                     }
-                    if (unit_73 < units) {
-                        {
-                            auto _gst_140 = peer_words + (dst_60_1 * 4);
-                            __builtin_assume(__isGlobal(_gst_140));
-                            reinterpret_cast<int4*>(_gst_140)[0] = reinterpret_cast<int4*>(first_1)[0];
+                    if (!zoned) {
+                        if (unit_73 < units) {
+                            {
+                                auto _gst_141 = peer_words + (dst_60_1 * 4);
+                                __builtin_assume(__isGlobal(_gst_141));
+                                reinterpret_cast<int4*>(_gst_141)[0] = reinterpret_cast<int4*>(first_1)[0];
+                            }
                         }
                     }
                     if (unit_74 < units) {
                         {
-                            auto _gst_141 = peer_words + (dst_61_1 * 4);
-                            __builtin_assume(__isGlobal(_gst_141));
-                            reinterpret_cast<int4*>(_gst_141)[0] = reinterpret_cast<int4*>(first_2)[0];
+                            auto _gst_142 = peer_words + (dst_61_1 * 4);
+                            __builtin_assume(__isGlobal(_gst_142));
+                            reinterpret_cast<int4*>(_gst_142)[0] = reinterpret_cast<int4*>(first_2)[0];
                         }
                     }
                     if (unit_75 < units) {
                         {
-                            auto _gst_142 = peer_words + (dst_62 * 4);
-                            __builtin_assume(__isGlobal(_gst_142));
-                            reinterpret_cast<int4*>(_gst_142)[0] = reinterpret_cast<int4*>(first_3)[0];
+                            auto _gst_143 = peer_words + (dst_62 * 4);
+                            __builtin_assume(__isGlobal(_gst_143));
+                            reinterpret_cast<int4*>(_gst_143)[0] = reinterpret_cast<int4*>(first_3)[0];
                         }
                     }
                     unsigned int unit_80 = sub * 7680 + (3840 + tid_0);
@@ -2269,11 +2280,11 @@ kernel_cake_ulysses_a2a_0f6daa3f5ad400c9b220(__nv_bfloat16* __restrict__ inp, __
                     unsigned int dst_67 = (quotient_85 + (batch_67 * 7 + rank) * sequences) * block_units + remainder_85;
                     unsigned int vec_64[4];
                     {
-                        uint4 _uv4_143 = *reinterpret_cast<const uint4*>(inp_words + (src_65 * 4) + 0);
-                        vec_64[0 + 0] = _uv4_143.x;
-                        vec_64[0 + 1] = _uv4_143.y;
-                        vec_64[0 + 2] = _uv4_143.z;
-                        vec_64[0 + 3] = _uv4_143.w;
+                        uint4 _uv4_144 = *reinterpret_cast<const uint4*>(inp_words + (src_65 * 4) + 0);
+                        vec_64[0 + 0] = _uv4_144.x;
+                        vec_64[0 + 1] = _uv4_144.y;
+                        vec_64[0 + 2] = _uv4_144.z;
+                        vec_64[0 + 3] = _uv4_144.w;
                     }
                     unsigned int unit_81 = sub * 7680 + (4320 + tid_0);
                     unsigned int clamped_81 = ((unit_81 < units) ? unit_81 : last_unit_4);
@@ -2291,11 +2302,11 @@ kernel_cake_ulysses_a2a_0f6daa3f5ad400c9b220(__nv_bfloat16* __restrict__ inp, __
                     unsigned int dst_68 = (quotient_86 + (batch_68 * 7 + rank) * sequences) * block_units + remainder_86;
                     unsigned int vec_65[4];
                     {
-                        uint4 _uv4_144 = *reinterpret_cast<const uint4*>(inp_words + (src_66 * 4) + 0);
-                        vec_65[0 + 0] = _uv4_144.x;
-                        vec_65[0 + 1] = _uv4_144.y;
-                        vec_65[0 + 2] = _uv4_144.z;
-                        vec_65[0 + 3] = _uv4_144.w;
+                        uint4 _uv4_145 = *reinterpret_cast<const uint4*>(inp_words + (src_66 * 4) + 0);
+                        vec_65[0 + 0] = _uv4_145.x;
+                        vec_65[0 + 1] = _uv4_145.y;
+                        vec_65[0 + 2] = _uv4_145.z;
+                        vec_65[0 + 3] = _uv4_145.w;
                     }
                     unsigned int unit_82 = sub * 7680 + (4800 + tid_0);
                     unsigned int clamped_82 = ((unit_82 < units) ? unit_82 : last_unit_4);
@@ -2313,11 +2324,11 @@ kernel_cake_ulysses_a2a_0f6daa3f5ad400c9b220(__nv_bfloat16* __restrict__ inp, __
                     unsigned int dst_69 = (quotient_87 + (batch_69 * 7 + rank) * sequences) * block_units + remainder_87;
                     unsigned int vec_66[4];
                     {
-                        uint4 _uv4_145 = *reinterpret_cast<const uint4*>(inp_words + (src_67 * 4) + 0);
-                        vec_66[0 + 0] = _uv4_145.x;
-                        vec_66[0 + 1] = _uv4_145.y;
-                        vec_66[0 + 2] = _uv4_145.z;
-                        vec_66[0 + 3] = _uv4_145.w;
+                        uint4 _uv4_146 = *reinterpret_cast<const uint4*>(inp_words + (src_67 * 4) + 0);
+                        vec_66[0 + 0] = _uv4_146.x;
+                        vec_66[0 + 1] = _uv4_146.y;
+                        vec_66[0 + 2] = _uv4_146.z;
+                        vec_66[0 + 3] = _uv4_146.w;
                     }
                     unsigned int unit_83 = sub * 7680 + (5280 + tid_0);
                     unsigned int clamped_83 = ((unit_83 < units) ? unit_83 : last_unit_4);
@@ -2335,38 +2346,38 @@ kernel_cake_ulysses_a2a_0f6daa3f5ad400c9b220(__nv_bfloat16* __restrict__ inp, __
                     unsigned int dst_70 = (quotient_88 + (batch_70 * 7 + rank) * sequences) * block_units + remainder_88;
                     unsigned int vec_67[4];
                     {
-                        uint4 _uv4_146 = *reinterpret_cast<const uint4*>(inp_words + (src_68 * 4) + 0);
-                        vec_67[0 + 0] = _uv4_146.x;
-                        vec_67[0 + 1] = _uv4_146.y;
-                        vec_67[0 + 2] = _uv4_146.z;
-                        vec_67[0 + 3] = _uv4_146.w;
+                        uint4 _uv4_147 = *reinterpret_cast<const uint4*>(inp_words + (src_68 * 4) + 0);
+                        vec_67[0 + 0] = _uv4_147.x;
+                        vec_67[0 + 1] = _uv4_147.y;
+                        vec_67[0 + 2] = _uv4_147.z;
+                        vec_67[0 + 3] = _uv4_147.w;
                     }
                     if (unit_76 < units) {
                         {
-                            auto _gst_147 = peer_words + (dst_63 * 4);
-                            __builtin_assume(__isGlobal(_gst_147));
-                            reinterpret_cast<int4*>(_gst_147)[0] = reinterpret_cast<int4*>(vec_60)[0];
+                            auto _gst_148 = peer_words + (dst_63 * 4);
+                            __builtin_assume(__isGlobal(_gst_148));
+                            reinterpret_cast<int4*>(_gst_148)[0] = reinterpret_cast<int4*>(vec_60)[0];
                         }
                     }
                     if (unit_77 < units) {
                         {
-                            auto _gst_148 = peer_words + (dst_64 * 4);
-                            __builtin_assume(__isGlobal(_gst_148));
-                            reinterpret_cast<int4*>(_gst_148)[0] = reinterpret_cast<int4*>(vec_61)[0];
+                            auto _gst_149 = peer_words + (dst_64 * 4);
+                            __builtin_assume(__isGlobal(_gst_149));
+                            reinterpret_cast<int4*>(_gst_149)[0] = reinterpret_cast<int4*>(vec_61)[0];
                         }
                     }
                     if (unit_78 < units) {
                         {
-                            auto _gst_149 = peer_words + (dst_65 * 4);
-                            __builtin_assume(__isGlobal(_gst_149));
-                            reinterpret_cast<int4*>(_gst_149)[0] = reinterpret_cast<int4*>(vec_62)[0];
+                            auto _gst_150 = peer_words + (dst_65 * 4);
+                            __builtin_assume(__isGlobal(_gst_150));
+                            reinterpret_cast<int4*>(_gst_150)[0] = reinterpret_cast<int4*>(vec_62)[0];
                         }
                     }
                     if (unit_79 < units) {
                         {
-                            auto _gst_150 = peer_words + (dst_66 * 4);
-                            __builtin_assume(__isGlobal(_gst_150));
-                            reinterpret_cast<int4*>(_gst_150)[0] = reinterpret_cast<int4*>(vec_63)[0];
+                            auto _gst_151 = peer_words + (dst_66 * 4);
+                            __builtin_assume(__isGlobal(_gst_151));
+                            reinterpret_cast<int4*>(_gst_151)[0] = reinterpret_cast<int4*>(vec_63)[0];
                         }
                     }
                     unsigned int unit_84 = sub * 7680 + (5760 + tid_0);
@@ -2385,11 +2396,11 @@ kernel_cake_ulysses_a2a_0f6daa3f5ad400c9b220(__nv_bfloat16* __restrict__ inp, __
                     unsigned int dst_71 = (quotient_89 + (batch_71 * 7 + rank) * sequences) * block_units + remainder_89;
                     unsigned int vec_68[4];
                     {
-                        uint4 _uv4_151 = *reinterpret_cast<const uint4*>(inp_words + (src_69 * 4) + 0);
-                        vec_68[0 + 0] = _uv4_151.x;
-                        vec_68[0 + 1] = _uv4_151.y;
-                        vec_68[0 + 2] = _uv4_151.z;
-                        vec_68[0 + 3] = _uv4_151.w;
+                        uint4 _uv4_152 = *reinterpret_cast<const uint4*>(inp_words + (src_69 * 4) + 0);
+                        vec_68[0 + 0] = _uv4_152.x;
+                        vec_68[0 + 1] = _uv4_152.y;
+                        vec_68[0 + 2] = _uv4_152.z;
+                        vec_68[0 + 3] = _uv4_152.w;
                     }
                     unsigned int unit_85 = sub * 7680 + (6240 + tid_0);
                     unsigned int clamped_85 = ((unit_85 < units) ? unit_85 : last_unit_4);
@@ -2407,11 +2418,11 @@ kernel_cake_ulysses_a2a_0f6daa3f5ad400c9b220(__nv_bfloat16* __restrict__ inp, __
                     unsigned int dst_72 = (quotient_90 + (batch_72 * 7 + rank) * sequences) * block_units + remainder_90;
                     unsigned int vec_69[4];
                     {
-                        uint4 _uv4_152 = *reinterpret_cast<const uint4*>(inp_words + (src_70 * 4) + 0);
-                        vec_69[0 + 0] = _uv4_152.x;
-                        vec_69[0 + 1] = _uv4_152.y;
-                        vec_69[0 + 2] = _uv4_152.z;
-                        vec_69[0 + 3] = _uv4_152.w;
+                        uint4 _uv4_153 = *reinterpret_cast<const uint4*>(inp_words + (src_70 * 4) + 0);
+                        vec_69[0 + 0] = _uv4_153.x;
+                        vec_69[0 + 1] = _uv4_153.y;
+                        vec_69[0 + 2] = _uv4_153.z;
+                        vec_69[0 + 3] = _uv4_153.w;
                     }
                     unsigned int unit_86 = sub * 7680 + (6720 + tid_0);
                     unsigned int clamped_86 = ((unit_86 < units) ? unit_86 : last_unit_4);
@@ -2429,11 +2440,11 @@ kernel_cake_ulysses_a2a_0f6daa3f5ad400c9b220(__nv_bfloat16* __restrict__ inp, __
                     unsigned int dst_73 = (quotient_91 + (batch_73 * 7 + rank) * sequences) * block_units + remainder_91;
                     unsigned int vec_70[4];
                     {
-                        uint4 _uv4_153 = *reinterpret_cast<const uint4*>(inp_words + (src_71 * 4) + 0);
-                        vec_70[0 + 0] = _uv4_153.x;
-                        vec_70[0 + 1] = _uv4_153.y;
-                        vec_70[0 + 2] = _uv4_153.z;
-                        vec_70[0 + 3] = _uv4_153.w;
+                        uint4 _uv4_154 = *reinterpret_cast<const uint4*>(inp_words + (src_71 * 4) + 0);
+                        vec_70[0 + 0] = _uv4_154.x;
+                        vec_70[0 + 1] = _uv4_154.y;
+                        vec_70[0 + 2] = _uv4_154.z;
+                        vec_70[0 + 3] = _uv4_154.w;
                     }
                     unsigned int unit_87 = sub * 7680 + (7200 + tid_0);
                     unsigned int clamped_87 = ((unit_87 < units) ? unit_87 : last_unit_4);
@@ -2451,66 +2462,66 @@ kernel_cake_ulysses_a2a_0f6daa3f5ad400c9b220(__nv_bfloat16* __restrict__ inp, __
                     unsigned int dst_74 = (quotient_92 + (batch_74 * 7 + rank) * sequences) * block_units + remainder_92;
                     unsigned int vec_71[4];
                     {
-                        uint4 _uv4_154 = *reinterpret_cast<const uint4*>(inp_words + (src_72 * 4) + 0);
-                        vec_71[0 + 0] = _uv4_154.x;
-                        vec_71[0 + 1] = _uv4_154.y;
-                        vec_71[0 + 2] = _uv4_154.z;
-                        vec_71[0 + 3] = _uv4_154.w;
+                        uint4 _uv4_155 = *reinterpret_cast<const uint4*>(inp_words + (src_72 * 4) + 0);
+                        vec_71[0 + 0] = _uv4_155.x;
+                        vec_71[0 + 1] = _uv4_155.y;
+                        vec_71[0 + 2] = _uv4_155.z;
+                        vec_71[0 + 3] = _uv4_155.w;
                     }
                     if (unit_80 < units) {
                         {
-                            auto _gst_155 = peer_words + (dst_67 * 4);
-                            __builtin_assume(__isGlobal(_gst_155));
-                            reinterpret_cast<int4*>(_gst_155)[0] = reinterpret_cast<int4*>(vec_64)[0];
+                            auto _gst_156 = peer_words + (dst_67 * 4);
+                            __builtin_assume(__isGlobal(_gst_156));
+                            reinterpret_cast<int4*>(_gst_156)[0] = reinterpret_cast<int4*>(vec_64)[0];
                         }
                     }
                     if (unit_81 < units) {
                         {
-                            auto _gst_156 = peer_words + (dst_68 * 4);
-                            __builtin_assume(__isGlobal(_gst_156));
-                            reinterpret_cast<int4*>(_gst_156)[0] = reinterpret_cast<int4*>(vec_65)[0];
+                            auto _gst_157 = peer_words + (dst_68 * 4);
+                            __builtin_assume(__isGlobal(_gst_157));
+                            reinterpret_cast<int4*>(_gst_157)[0] = reinterpret_cast<int4*>(vec_65)[0];
                         }
                     }
                     if (unit_82 < units) {
                         {
-                            auto _gst_157 = peer_words + (dst_69 * 4);
-                            __builtin_assume(__isGlobal(_gst_157));
-                            reinterpret_cast<int4*>(_gst_157)[0] = reinterpret_cast<int4*>(vec_66)[0];
+                            auto _gst_158 = peer_words + (dst_69 * 4);
+                            __builtin_assume(__isGlobal(_gst_158));
+                            reinterpret_cast<int4*>(_gst_158)[0] = reinterpret_cast<int4*>(vec_66)[0];
                         }
                     }
                     if (unit_83 < units) {
                         {
-                            auto _gst_158 = peer_words + (dst_70 * 4);
-                            __builtin_assume(__isGlobal(_gst_158));
-                            reinterpret_cast<int4*>(_gst_158)[0] = reinterpret_cast<int4*>(vec_67)[0];
+                            auto _gst_159 = peer_words + (dst_70 * 4);
+                            __builtin_assume(__isGlobal(_gst_159));
+                            reinterpret_cast<int4*>(_gst_159)[0] = reinterpret_cast<int4*>(vec_67)[0];
                         }
                     }
                     if (unit_84 < units) {
                         {
-                            auto _gst_159 = peer_words + (dst_71 * 4);
-                            __builtin_assume(__isGlobal(_gst_159));
-                            reinterpret_cast<int4*>(_gst_159)[0] = reinterpret_cast<int4*>(vec_68)[0];
+                            auto _gst_160 = peer_words + (dst_71 * 4);
+                            __builtin_assume(__isGlobal(_gst_160));
+                            reinterpret_cast<int4*>(_gst_160)[0] = reinterpret_cast<int4*>(vec_68)[0];
                         }
                     }
                     if (unit_85 < units) {
                         {
-                            auto _gst_160 = peer_words + (dst_72 * 4);
-                            __builtin_assume(__isGlobal(_gst_160));
-                            reinterpret_cast<int4*>(_gst_160)[0] = reinterpret_cast<int4*>(vec_69)[0];
+                            auto _gst_161 = peer_words + (dst_72 * 4);
+                            __builtin_assume(__isGlobal(_gst_161));
+                            reinterpret_cast<int4*>(_gst_161)[0] = reinterpret_cast<int4*>(vec_69)[0];
                         }
                     }
                     if (unit_86 < units) {
                         {
-                            auto _gst_161 = peer_words + (dst_73 * 4);
-                            __builtin_assume(__isGlobal(_gst_161));
-                            reinterpret_cast<int4*>(_gst_161)[0] = reinterpret_cast<int4*>(vec_70)[0];
+                            auto _gst_162 = peer_words + (dst_73 * 4);
+                            __builtin_assume(__isGlobal(_gst_162));
+                            reinterpret_cast<int4*>(_gst_162)[0] = reinterpret_cast<int4*>(vec_70)[0];
                         }
                     }
                     if (unit_87 < units) {
                         {
-                            auto _gst_162 = peer_words + (dst_74 * 4);
-                            __builtin_assume(__isGlobal(_gst_162));
-                            reinterpret_cast<int4*>(_gst_162)[0] = reinterpret_cast<int4*>(vec_71)[0];
+                            auto _gst_163 = peer_words + (dst_74 * 4);
+                            __builtin_assume(__isGlobal(_gst_163));
+                            reinterpret_cast<int4*>(_gst_163)[0] = reinterpret_cast<int4*>(vec_71)[0];
                         }
                     }
                 } else {
@@ -2579,11 +2590,11 @@ kernel_cake_ulysses_a2a_0f6daa3f5ad400c9b220(__nv_bfloat16* __restrict__ inp, __
                         unsigned int dst_76 = (quotient_94 + (batch_76 * 7 + rank) * sequences) * block_units + remainder_94;
                         unsigned int vec_72[4];
                         {
-                            uint4 _uv4_163 = *reinterpret_cast<const uint4*>(inp_words + (src_74 * 4) + 0);
-                            vec_72[0 + 0] = _uv4_163.x;
-                            vec_72[0 + 1] = _uv4_163.y;
-                            vec_72[0 + 2] = _uv4_163.z;
-                            vec_72[0 + 3] = _uv4_163.w;
+                            uint4 _uv4_164 = *reinterpret_cast<const uint4*>(inp_words + (src_74 * 4) + 0);
+                            vec_72[0 + 0] = _uv4_164.x;
+                            vec_72[0 + 1] = _uv4_164.y;
+                            vec_72[0 + 2] = _uv4_164.z;
+                            vec_72[0 + 3] = _uv4_164.w;
                         }
                         unsigned int unit_89 = base_2 + 480;
                         unsigned int clamped_89 = ((unit_89 < chi_5) ? unit_89 : last_unit_5);
@@ -2601,11 +2612,11 @@ kernel_cake_ulysses_a2a_0f6daa3f5ad400c9b220(__nv_bfloat16* __restrict__ inp, __
                         unsigned int dst_75_1 = (quotient_95 + (batch_75_1 * 7 + rank) * sequences) * block_units + remainder_95;
                         unsigned int vec_73[4];
                         {
-                            uint4 _uv4_164 = *reinterpret_cast<const uint4*>(inp_words + (src_73_1 * 4) + 0);
-                            vec_73[0 + 0] = _uv4_164.x;
-                            vec_73[0 + 1] = _uv4_164.y;
-                            vec_73[0 + 2] = _uv4_164.z;
-                            vec_73[0 + 3] = _uv4_164.w;
+                            uint4 _uv4_165 = *reinterpret_cast<const uint4*>(inp_words + (src_73_1 * 4) + 0);
+                            vec_73[0 + 0] = _uv4_165.x;
+                            vec_73[0 + 1] = _uv4_165.y;
+                            vec_73[0 + 2] = _uv4_165.z;
+                            vec_73[0 + 3] = _uv4_165.w;
                         }
                         unsigned int unit_90 = base_2 + 960;
                         unsigned int clamped_90 = ((unit_90 < chi_5) ? unit_90 : last_unit_5);
@@ -2623,11 +2634,11 @@ kernel_cake_ulysses_a2a_0f6daa3f5ad400c9b220(__nv_bfloat16* __restrict__ inp, __
                         unsigned int dst_76_1 = (quotient_96 + (batch_76_1 * 7 + rank) * sequences) * block_units + remainder_96;
                         unsigned int vec_74[4];
                         {
-                            uint4 _uv4_165 = *reinterpret_cast<const uint4*>(inp_words + (src_74_1 * 4) + 0);
-                            vec_74[0 + 0] = _uv4_165.x;
-                            vec_74[0 + 1] = _uv4_165.y;
-                            vec_74[0 + 2] = _uv4_165.z;
-                            vec_74[0 + 3] = _uv4_165.w;
+                            uint4 _uv4_166 = *reinterpret_cast<const uint4*>(inp_words + (src_74_1 * 4) + 0);
+                            vec_74[0 + 0] = _uv4_166.x;
+                            vec_74[0 + 1] = _uv4_166.y;
+                            vec_74[0 + 2] = _uv4_166.z;
+                            vec_74[0 + 3] = _uv4_166.w;
                         }
                         unsigned int unit_91 = base_2 + 1440;
                         unsigned int clamped_91 = ((unit_91 < chi_5) ? unit_91 : last_unit_5);
@@ -2645,11 +2656,11 @@ kernel_cake_ulysses_a2a_0f6daa3f5ad400c9b220(__nv_bfloat16* __restrict__ inp, __
                         unsigned int dst_77 = (quotient_97 + (batch_77 * 7 + rank) * sequences) * block_units + remainder_97;
                         unsigned int vec_75[4];
                         {
-                            uint4 _uv4_166 = *reinterpret_cast<const uint4*>(inp_words + (src_75 * 4) + 0);
-                            vec_75[0 + 0] = _uv4_166.x;
-                            vec_75[0 + 1] = _uv4_166.y;
-                            vec_75[0 + 2] = _uv4_166.z;
-                            vec_75[0 + 3] = _uv4_166.w;
+                            uint4 _uv4_167 = *reinterpret_cast<const uint4*>(inp_words + (src_75 * 4) + 0);
+                            vec_75[0 + 0] = _uv4_167.x;
+                            vec_75[0 + 1] = _uv4_167.y;
+                            vec_75[0 + 2] = _uv4_167.z;
+                            vec_75[0 + 3] = _uv4_167.w;
                         }
                         unsigned int unit_92 = base_2 + 1920;
                         unsigned int clamped_92 = ((unit_92 < chi_5) ? unit_92 : last_unit_5);
@@ -2667,11 +2678,11 @@ kernel_cake_ulysses_a2a_0f6daa3f5ad400c9b220(__nv_bfloat16* __restrict__ inp, __
                         unsigned int dst_78 = (quotient_98 + (batch_78 * 7 + rank) * sequences) * block_units + remainder_98;
                         unsigned int vec_76[4];
                         {
-                            uint4 _uv4_167 = *reinterpret_cast<const uint4*>(inp_words + (src_76 * 4) + 0);
-                            vec_76[0 + 0] = _uv4_167.x;
-                            vec_76[0 + 1] = _uv4_167.y;
-                            vec_76[0 + 2] = _uv4_167.z;
-                            vec_76[0 + 3] = _uv4_167.w;
+                            uint4 _uv4_168 = *reinterpret_cast<const uint4*>(inp_words + (src_76 * 4) + 0);
+                            vec_76[0 + 0] = _uv4_168.x;
+                            vec_76[0 + 1] = _uv4_168.y;
+                            vec_76[0 + 2] = _uv4_168.z;
+                            vec_76[0 + 3] = _uv4_168.w;
                         }
                         unsigned int unit_93 = base_2 + 2400;
                         unsigned int clamped_93 = ((unit_93 < chi_5) ? unit_93 : last_unit_5);
@@ -2689,11 +2700,11 @@ kernel_cake_ulysses_a2a_0f6daa3f5ad400c9b220(__nv_bfloat16* __restrict__ inp, __
                         unsigned int dst_79 = (quotient_99 + (batch_79 * 7 + rank) * sequences) * block_units + remainder_99;
                         unsigned int vec_77[4];
                         {
-                            uint4 _uv4_168 = *reinterpret_cast<const uint4*>(inp_words + (src_77 * 4) + 0);
-                            vec_77[0 + 0] = _uv4_168.x;
-                            vec_77[0 + 1] = _uv4_168.y;
-                            vec_77[0 + 2] = _uv4_168.z;
-                            vec_77[0 + 3] = _uv4_168.w;
+                            uint4 _uv4_169 = *reinterpret_cast<const uint4*>(inp_words + (src_77 * 4) + 0);
+                            vec_77[0 + 0] = _uv4_169.x;
+                            vec_77[0 + 1] = _uv4_169.y;
+                            vec_77[0 + 2] = _uv4_169.z;
+                            vec_77[0 + 3] = _uv4_169.w;
                         }
                         unsigned int unit_94 = base_2 + 2880;
                         unsigned int clamped_94 = ((unit_94 < chi_5) ? unit_94 : last_unit_5);
@@ -2711,11 +2722,11 @@ kernel_cake_ulysses_a2a_0f6daa3f5ad400c9b220(__nv_bfloat16* __restrict__ inp, __
                         unsigned int dst_80 = (quotient_100 + (batch_80 * 7 + rank) * sequences) * block_units + remainder_100;
                         unsigned int vec_78[4];
                         {
-                            uint4 _uv4_169 = *reinterpret_cast<const uint4*>(inp_words + (src_78 * 4) + 0);
-                            vec_78[0 + 0] = _uv4_169.x;
-                            vec_78[0 + 1] = _uv4_169.y;
-                            vec_78[0 + 2] = _uv4_169.z;
-                            vec_78[0 + 3] = _uv4_169.w;
+                            uint4 _uv4_170 = *reinterpret_cast<const uint4*>(inp_words + (src_78 * 4) + 0);
+                            vec_78[0 + 0] = _uv4_170.x;
+                            vec_78[0 + 1] = _uv4_170.y;
+                            vec_78[0 + 2] = _uv4_170.z;
+                            vec_78[0 + 3] = _uv4_170.w;
                         }
                         unsigned int unit_95 = base_2 + 3360;
                         unsigned int clamped_95 = ((unit_95 < chi_5) ? unit_95 : last_unit_5);
@@ -2733,38 +2744,38 @@ kernel_cake_ulysses_a2a_0f6daa3f5ad400c9b220(__nv_bfloat16* __restrict__ inp, __
                         unsigned int dst_81 = (quotient_101 + (batch_81 * 7 + rank) * sequences) * block_units + remainder_101;
                         unsigned int vec_79[4];
                         {
-                            uint4 _uv4_170 = *reinterpret_cast<const uint4*>(inp_words + (src_79 * 4) + 0);
-                            vec_79[0 + 0] = _uv4_170.x;
-                            vec_79[0 + 1] = _uv4_170.y;
-                            vec_79[0 + 2] = _uv4_170.z;
-                            vec_79[0 + 3] = _uv4_170.w;
+                            uint4 _uv4_171 = *reinterpret_cast<const uint4*>(inp_words + (src_79 * 4) + 0);
+                            vec_79[0 + 0] = _uv4_171.x;
+                            vec_79[0 + 1] = _uv4_171.y;
+                            vec_79[0 + 2] = _uv4_171.z;
+                            vec_79[0 + 3] = _uv4_171.w;
                         }
                         if (unit_88 < chi_5) {
                             {
-                                auto _gst_171 = out_words + (dst_76 * 4);
-                                __builtin_assume(__isGlobal(_gst_171));
-                                reinterpret_cast<int4*>(_gst_171)[0] = reinterpret_cast<int4*>(vec_72)[0];
+                                auto _gst_172 = out_words + (dst_76 * 4);
+                                __builtin_assume(__isGlobal(_gst_172));
+                                reinterpret_cast<int4*>(_gst_172)[0] = reinterpret_cast<int4*>(vec_72)[0];
                             }
                         }
                         if (unit_89 < chi_5) {
                             {
-                                auto _gst_172 = out_words + (dst_75_1 * 4);
-                                __builtin_assume(__isGlobal(_gst_172));
-                                reinterpret_cast<int4*>(_gst_172)[0] = reinterpret_cast<int4*>(vec_73)[0];
+                                auto _gst_173 = out_words + (dst_75_1 * 4);
+                                __builtin_assume(__isGlobal(_gst_173));
+                                reinterpret_cast<int4*>(_gst_173)[0] = reinterpret_cast<int4*>(vec_73)[0];
                             }
                         }
                         if (unit_90 < chi_5) {
                             {
-                                auto _gst_173 = out_words + (dst_76_1 * 4);
-                                __builtin_assume(__isGlobal(_gst_173));
-                                reinterpret_cast<int4*>(_gst_173)[0] = reinterpret_cast<int4*>(vec_74)[0];
+                                auto _gst_174 = out_words + (dst_76_1 * 4);
+                                __builtin_assume(__isGlobal(_gst_174));
+                                reinterpret_cast<int4*>(_gst_174)[0] = reinterpret_cast<int4*>(vec_74)[0];
                             }
                         }
                         if (unit_91 < chi_5) {
                             {
-                                auto _gst_174 = out_words + (dst_77 * 4);
-                                __builtin_assume(__isGlobal(_gst_174));
-                                reinterpret_cast<int4*>(_gst_174)[0] = reinterpret_cast<int4*>(vec_75)[0];
+                                auto _gst_175 = out_words + (dst_77 * 4);
+                                __builtin_assume(__isGlobal(_gst_175));
+                                reinterpret_cast<int4*>(_gst_175)[0] = reinterpret_cast<int4*>(vec_75)[0];
                             }
                         }
                         unsigned int unit_96 = base_2 + 3840;
@@ -2783,11 +2794,11 @@ kernel_cake_ulysses_a2a_0f6daa3f5ad400c9b220(__nv_bfloat16* __restrict__ inp, __
                         unsigned int dst_82 = (quotient_102 + (batch_82 * 7 + rank) * sequences) * block_units + remainder_102;
                         unsigned int vec_80[4];
                         {
-                            uint4 _uv4_175 = *reinterpret_cast<const uint4*>(inp_words + (src_80 * 4) + 0);
-                            vec_80[0 + 0] = _uv4_175.x;
-                            vec_80[0 + 1] = _uv4_175.y;
-                            vec_80[0 + 2] = _uv4_175.z;
-                            vec_80[0 + 3] = _uv4_175.w;
+                            uint4 _uv4_176 = *reinterpret_cast<const uint4*>(inp_words + (src_80 * 4) + 0);
+                            vec_80[0 + 0] = _uv4_176.x;
+                            vec_80[0 + 1] = _uv4_176.y;
+                            vec_80[0 + 2] = _uv4_176.z;
+                            vec_80[0 + 3] = _uv4_176.w;
                         }
                         unsigned int unit_97 = base_2 + 4320;
                         unsigned int clamped_97 = ((unit_97 < chi_5) ? unit_97 : last_unit_5);
@@ -2805,11 +2816,11 @@ kernel_cake_ulysses_a2a_0f6daa3f5ad400c9b220(__nv_bfloat16* __restrict__ inp, __
                         unsigned int dst_83 = (quotient_103 + (batch_83 * 7 + rank) * sequences) * block_units + remainder_103;
                         unsigned int vec_81[4];
                         {
-                            uint4 _uv4_176 = *reinterpret_cast<const uint4*>(inp_words + (src_81 * 4) + 0);
-                            vec_81[0 + 0] = _uv4_176.x;
-                            vec_81[0 + 1] = _uv4_176.y;
-                            vec_81[0 + 2] = _uv4_176.z;
-                            vec_81[0 + 3] = _uv4_176.w;
+                            uint4 _uv4_177 = *reinterpret_cast<const uint4*>(inp_words + (src_81 * 4) + 0);
+                            vec_81[0 + 0] = _uv4_177.x;
+                            vec_81[0 + 1] = _uv4_177.y;
+                            vec_81[0 + 2] = _uv4_177.z;
+                            vec_81[0 + 3] = _uv4_177.w;
                         }
                         unsigned int unit_98 = base_2 + 4800;
                         unsigned int clamped_98 = ((unit_98 < chi_5) ? unit_98 : last_unit_5);
@@ -2827,11 +2838,11 @@ kernel_cake_ulysses_a2a_0f6daa3f5ad400c9b220(__nv_bfloat16* __restrict__ inp, __
                         unsigned int dst_84 = (quotient_104 + (batch_84 * 7 + rank) * sequences) * block_units + remainder_104;
                         unsigned int vec_82[4];
                         {
-                            uint4 _uv4_177 = *reinterpret_cast<const uint4*>(inp_words + (src_82 * 4) + 0);
-                            vec_82[0 + 0] = _uv4_177.x;
-                            vec_82[0 + 1] = _uv4_177.y;
-                            vec_82[0 + 2] = _uv4_177.z;
-                            vec_82[0 + 3] = _uv4_177.w;
+                            uint4 _uv4_178 = *reinterpret_cast<const uint4*>(inp_words + (src_82 * 4) + 0);
+                            vec_82[0 + 0] = _uv4_178.x;
+                            vec_82[0 + 1] = _uv4_178.y;
+                            vec_82[0 + 2] = _uv4_178.z;
+                            vec_82[0 + 3] = _uv4_178.w;
                         }
                         unsigned int unit_99 = base_2 + 5280;
                         unsigned int clamped_99 = ((unit_99 < chi_5) ? unit_99 : last_unit_5);
@@ -2849,38 +2860,38 @@ kernel_cake_ulysses_a2a_0f6daa3f5ad400c9b220(__nv_bfloat16* __restrict__ inp, __
                         unsigned int dst_85 = (quotient_105 + (batch_85 * 7 + rank) * sequences) * block_units + remainder_105;
                         unsigned int vec_83[4];
                         {
-                            uint4 _uv4_178 = *reinterpret_cast<const uint4*>(inp_words + (src_83 * 4) + 0);
-                            vec_83[0 + 0] = _uv4_178.x;
-                            vec_83[0 + 1] = _uv4_178.y;
-                            vec_83[0 + 2] = _uv4_178.z;
-                            vec_83[0 + 3] = _uv4_178.w;
+                            uint4 _uv4_179 = *reinterpret_cast<const uint4*>(inp_words + (src_83 * 4) + 0);
+                            vec_83[0 + 0] = _uv4_179.x;
+                            vec_83[0 + 1] = _uv4_179.y;
+                            vec_83[0 + 2] = _uv4_179.z;
+                            vec_83[0 + 3] = _uv4_179.w;
                         }
                         if (unit_92 < chi_5) {
                             {
-                                auto _gst_179 = out_words + (dst_78 * 4);
-                                __builtin_assume(__isGlobal(_gst_179));
-                                reinterpret_cast<int4*>(_gst_179)[0] = reinterpret_cast<int4*>(vec_76)[0];
+                                auto _gst_180 = out_words + (dst_78 * 4);
+                                __builtin_assume(__isGlobal(_gst_180));
+                                reinterpret_cast<int4*>(_gst_180)[0] = reinterpret_cast<int4*>(vec_76)[0];
                             }
                         }
                         if (unit_93 < chi_5) {
                             {
-                                auto _gst_180 = out_words + (dst_79 * 4);
-                                __builtin_assume(__isGlobal(_gst_180));
-                                reinterpret_cast<int4*>(_gst_180)[0] = reinterpret_cast<int4*>(vec_77)[0];
+                                auto _gst_181 = out_words + (dst_79 * 4);
+                                __builtin_assume(__isGlobal(_gst_181));
+                                reinterpret_cast<int4*>(_gst_181)[0] = reinterpret_cast<int4*>(vec_77)[0];
                             }
                         }
                         if (unit_94 < chi_5) {
                             {
-                                auto _gst_181 = out_words + (dst_80 * 4);
-                                __builtin_assume(__isGlobal(_gst_181));
-                                reinterpret_cast<int4*>(_gst_181)[0] = reinterpret_cast<int4*>(vec_78)[0];
+                                auto _gst_182 = out_words + (dst_80 * 4);
+                                __builtin_assume(__isGlobal(_gst_182));
+                                reinterpret_cast<int4*>(_gst_182)[0] = reinterpret_cast<int4*>(vec_78)[0];
                             }
                         }
                         if (unit_95 < chi_5) {
                             {
-                                auto _gst_182 = out_words + (dst_81 * 4);
-                                __builtin_assume(__isGlobal(_gst_182));
-                                reinterpret_cast<int4*>(_gst_182)[0] = reinterpret_cast<int4*>(vec_79)[0];
+                                auto _gst_183 = out_words + (dst_81 * 4);
+                                __builtin_assume(__isGlobal(_gst_183));
+                                reinterpret_cast<int4*>(_gst_183)[0] = reinterpret_cast<int4*>(vec_79)[0];
                             }
                         }
                         unsigned int unit_100 = base_2 + 5760;
@@ -2899,11 +2910,11 @@ kernel_cake_ulysses_a2a_0f6daa3f5ad400c9b220(__nv_bfloat16* __restrict__ inp, __
                         unsigned int dst_86 = (quotient_106 + (batch_86 * 7 + rank) * sequences) * block_units + remainder_106;
                         unsigned int vec_84[4];
                         {
-                            uint4 _uv4_183 = *reinterpret_cast<const uint4*>(inp_words + (src_84 * 4) + 0);
-                            vec_84[0 + 0] = _uv4_183.x;
-                            vec_84[0 + 1] = _uv4_183.y;
-                            vec_84[0 + 2] = _uv4_183.z;
-                            vec_84[0 + 3] = _uv4_183.w;
+                            uint4 _uv4_184 = *reinterpret_cast<const uint4*>(inp_words + (src_84 * 4) + 0);
+                            vec_84[0 + 0] = _uv4_184.x;
+                            vec_84[0 + 1] = _uv4_184.y;
+                            vec_84[0 + 2] = _uv4_184.z;
+                            vec_84[0 + 3] = _uv4_184.w;
                         }
                         unsigned int unit_101 = base_2 + 6240;
                         unsigned int clamped_101 = ((unit_101 < chi_5) ? unit_101 : last_unit_5);
@@ -2921,11 +2932,11 @@ kernel_cake_ulysses_a2a_0f6daa3f5ad400c9b220(__nv_bfloat16* __restrict__ inp, __
                         unsigned int dst_87 = (quotient_107 + (batch_87 * 7 + rank) * sequences) * block_units + remainder_107;
                         unsigned int vec_85[4];
                         {
-                            uint4 _uv4_184 = *reinterpret_cast<const uint4*>(inp_words + (src_85 * 4) + 0);
-                            vec_85[0 + 0] = _uv4_184.x;
-                            vec_85[0 + 1] = _uv4_184.y;
-                            vec_85[0 + 2] = _uv4_184.z;
-                            vec_85[0 + 3] = _uv4_184.w;
+                            uint4 _uv4_185 = *reinterpret_cast<const uint4*>(inp_words + (src_85 * 4) + 0);
+                            vec_85[0 + 0] = _uv4_185.x;
+                            vec_85[0 + 1] = _uv4_185.y;
+                            vec_85[0 + 2] = _uv4_185.z;
+                            vec_85[0 + 3] = _uv4_185.w;
                         }
                         unsigned int unit_102 = base_2 + 6720;
                         unsigned int clamped_102 = ((unit_102 < chi_5) ? unit_102 : last_unit_5);
@@ -2943,11 +2954,11 @@ kernel_cake_ulysses_a2a_0f6daa3f5ad400c9b220(__nv_bfloat16* __restrict__ inp, __
                         unsigned int dst_88 = (quotient_108 + (batch_88 * 7 + rank) * sequences) * block_units + remainder_108;
                         unsigned int vec_86[4];
                         {
-                            uint4 _uv4_185 = *reinterpret_cast<const uint4*>(inp_words + (src_86 * 4) + 0);
-                            vec_86[0 + 0] = _uv4_185.x;
-                            vec_86[0 + 1] = _uv4_185.y;
-                            vec_86[0 + 2] = _uv4_185.z;
-                            vec_86[0 + 3] = _uv4_185.w;
+                            uint4 _uv4_186 = *reinterpret_cast<const uint4*>(inp_words + (src_86 * 4) + 0);
+                            vec_86[0 + 0] = _uv4_186.x;
+                            vec_86[0 + 1] = _uv4_186.y;
+                            vec_86[0 + 2] = _uv4_186.z;
+                            vec_86[0 + 3] = _uv4_186.w;
                         }
                         unsigned int unit_103 = base_2 + 7200;
                         unsigned int clamped_103 = ((unit_103 < chi_5) ? unit_103 : last_unit_5);
@@ -2965,66 +2976,66 @@ kernel_cake_ulysses_a2a_0f6daa3f5ad400c9b220(__nv_bfloat16* __restrict__ inp, __
                         unsigned int dst_89 = (quotient_109 + (batch_89 * 7 + rank) * sequences) * block_units + remainder_109;
                         unsigned int vec_87[4];
                         {
-                            uint4 _uv4_186 = *reinterpret_cast<const uint4*>(inp_words + (src_87 * 4) + 0);
-                            vec_87[0 + 0] = _uv4_186.x;
-                            vec_87[0 + 1] = _uv4_186.y;
-                            vec_87[0 + 2] = _uv4_186.z;
-                            vec_87[0 + 3] = _uv4_186.w;
+                            uint4 _uv4_187 = *reinterpret_cast<const uint4*>(inp_words + (src_87 * 4) + 0);
+                            vec_87[0 + 0] = _uv4_187.x;
+                            vec_87[0 + 1] = _uv4_187.y;
+                            vec_87[0 + 2] = _uv4_187.z;
+                            vec_87[0 + 3] = _uv4_187.w;
                         }
                         if (unit_96 < chi_5) {
                             {
-                                auto _gst_187 = out_words + (dst_82 * 4);
-                                __builtin_assume(__isGlobal(_gst_187));
-                                reinterpret_cast<int4*>(_gst_187)[0] = reinterpret_cast<int4*>(vec_80)[0];
+                                auto _gst_188 = out_words + (dst_82 * 4);
+                                __builtin_assume(__isGlobal(_gst_188));
+                                reinterpret_cast<int4*>(_gst_188)[0] = reinterpret_cast<int4*>(vec_80)[0];
                             }
                         }
                         if (unit_97 < chi_5) {
                             {
-                                auto _gst_188 = out_words + (dst_83 * 4);
-                                __builtin_assume(__isGlobal(_gst_188));
-                                reinterpret_cast<int4*>(_gst_188)[0] = reinterpret_cast<int4*>(vec_81)[0];
+                                auto _gst_189 = out_words + (dst_83 * 4);
+                                __builtin_assume(__isGlobal(_gst_189));
+                                reinterpret_cast<int4*>(_gst_189)[0] = reinterpret_cast<int4*>(vec_81)[0];
                             }
                         }
                         if (unit_98 < chi_5) {
                             {
-                                auto _gst_189 = out_words + (dst_84 * 4);
-                                __builtin_assume(__isGlobal(_gst_189));
-                                reinterpret_cast<int4*>(_gst_189)[0] = reinterpret_cast<int4*>(vec_82)[0];
+                                auto _gst_190 = out_words + (dst_84 * 4);
+                                __builtin_assume(__isGlobal(_gst_190));
+                                reinterpret_cast<int4*>(_gst_190)[0] = reinterpret_cast<int4*>(vec_82)[0];
                             }
                         }
                         if (unit_99 < chi_5) {
                             {
-                                auto _gst_190 = out_words + (dst_85 * 4);
-                                __builtin_assume(__isGlobal(_gst_190));
-                                reinterpret_cast<int4*>(_gst_190)[0] = reinterpret_cast<int4*>(vec_83)[0];
+                                auto _gst_191 = out_words + (dst_85 * 4);
+                                __builtin_assume(__isGlobal(_gst_191));
+                                reinterpret_cast<int4*>(_gst_191)[0] = reinterpret_cast<int4*>(vec_83)[0];
                             }
                         }
                         if (unit_100 < chi_5) {
                             {
-                                auto _gst_191 = out_words + (dst_86 * 4);
-                                __builtin_assume(__isGlobal(_gst_191));
-                                reinterpret_cast<int4*>(_gst_191)[0] = reinterpret_cast<int4*>(vec_84)[0];
+                                auto _gst_192 = out_words + (dst_86 * 4);
+                                __builtin_assume(__isGlobal(_gst_192));
+                                reinterpret_cast<int4*>(_gst_192)[0] = reinterpret_cast<int4*>(vec_84)[0];
                             }
                         }
                         if (unit_101 < chi_5) {
                             {
-                                auto _gst_192 = out_words + (dst_87 * 4);
-                                __builtin_assume(__isGlobal(_gst_192));
-                                reinterpret_cast<int4*>(_gst_192)[0] = reinterpret_cast<int4*>(vec_85)[0];
+                                auto _gst_193 = out_words + (dst_87 * 4);
+                                __builtin_assume(__isGlobal(_gst_193));
+                                reinterpret_cast<int4*>(_gst_193)[0] = reinterpret_cast<int4*>(vec_85)[0];
                             }
                         }
                         if (unit_102 < chi_5) {
                             {
-                                auto _gst_193 = out_words + (dst_88 * 4);
-                                __builtin_assume(__isGlobal(_gst_193));
-                                reinterpret_cast<int4*>(_gst_193)[0] = reinterpret_cast<int4*>(vec_86)[0];
+                                auto _gst_194 = out_words + (dst_88 * 4);
+                                __builtin_assume(__isGlobal(_gst_194));
+                                reinterpret_cast<int4*>(_gst_194)[0] = reinterpret_cast<int4*>(vec_86)[0];
                             }
                         }
                         if (unit_103 < chi_5) {
                             {
-                                auto _gst_194 = out_words + (dst_89 * 4);
-                                __builtin_assume(__isGlobal(_gst_194));
-                                reinterpret_cast<int4*>(_gst_194)[0] = reinterpret_cast<int4*>(vec_87)[0];
+                                auto _gst_195 = out_words + (dst_89 * 4);
+                                __builtin_assume(__isGlobal(_gst_195));
+                                reinterpret_cast<int4*>(_gst_195)[0] = reinterpret_cast<int4*>(vec_87)[0];
                             }
                         }
                     }
@@ -3071,11 +3082,11 @@ kernel_cake_ulysses_a2a_0f6daa3f5ad400c9b220(__nv_bfloat16* __restrict__ inp, __
                         unsigned int dst_91 = (quotient_111 + (batch_91 * 7 + rank) * sequences) * block_units + remainder_111;
                         unsigned int vec_88[4];
                         {
-                            uint4 _uv4_195 = *reinterpret_cast<const uint4*>(inp_words + (src_89 * 4) + 0);
-                            vec_88[0 + 0] = _uv4_195.x;
-                            vec_88[0 + 1] = _uv4_195.y;
-                            vec_88[0 + 2] = _uv4_195.z;
-                            vec_88[0 + 3] = _uv4_195.w;
+                            uint4 _uv4_196 = *reinterpret_cast<const uint4*>(inp_words + (src_89 * 4) + 0);
+                            vec_88[0 + 0] = _uv4_196.x;
+                            vec_88[0 + 1] = _uv4_196.y;
+                            vec_88[0 + 2] = _uv4_196.z;
+                            vec_88[0 + 3] = _uv4_196.w;
                         }
                         unsigned int unit_105 = stripe_1 + (480 + tid_0);
                         unsigned int clamped_105 = ((unit_105 < units) ? unit_105 : last_2);
@@ -3093,11 +3104,11 @@ kernel_cake_ulysses_a2a_0f6daa3f5ad400c9b220(__nv_bfloat16* __restrict__ inp, __
                         unsigned int dst_90_1 = (quotient_112 + (batch_90_1 * 7 + rank) * sequences) * block_units + remainder_112;
                         unsigned int vec_89[4];
                         {
-                            uint4 _uv4_196 = *reinterpret_cast<const uint4*>(inp_words + (src_88_1 * 4) + 0);
-                            vec_89[0 + 0] = _uv4_196.x;
-                            vec_89[0 + 1] = _uv4_196.y;
-                            vec_89[0 + 2] = _uv4_196.z;
-                            vec_89[0 + 3] = _uv4_196.w;
+                            uint4 _uv4_197 = *reinterpret_cast<const uint4*>(inp_words + (src_88_1 * 4) + 0);
+                            vec_89[0 + 0] = _uv4_197.x;
+                            vec_89[0 + 1] = _uv4_197.y;
+                            vec_89[0 + 2] = _uv4_197.z;
+                            vec_89[0 + 3] = _uv4_197.w;
                         }
                         unsigned int unit_106 = stripe_1 + (960 + tid_0);
                         unsigned int clamped_106 = ((unit_106 < units) ? unit_106 : last_2);
@@ -3115,11 +3126,11 @@ kernel_cake_ulysses_a2a_0f6daa3f5ad400c9b220(__nv_bfloat16* __restrict__ inp, __
                         unsigned int dst_91_1 = (quotient_113 + (batch_91_1 * 7 + rank) * sequences) * block_units + remainder_113;
                         unsigned int vec_90[4];
                         {
-                            uint4 _uv4_197 = *reinterpret_cast<const uint4*>(inp_words + (src_89_1 * 4) + 0);
-                            vec_90[0 + 0] = _uv4_197.x;
-                            vec_90[0 + 1] = _uv4_197.y;
-                            vec_90[0 + 2] = _uv4_197.z;
-                            vec_90[0 + 3] = _uv4_197.w;
+                            uint4 _uv4_198 = *reinterpret_cast<const uint4*>(inp_words + (src_89_1 * 4) + 0);
+                            vec_90[0 + 0] = _uv4_198.x;
+                            vec_90[0 + 1] = _uv4_198.y;
+                            vec_90[0 + 2] = _uv4_198.z;
+                            vec_90[0 + 3] = _uv4_198.w;
                         }
                         unsigned int unit_107 = stripe_1 + (1440 + tid_0);
                         unsigned int clamped_107 = ((unit_107 < units) ? unit_107 : last_2);
@@ -3137,11 +3148,11 @@ kernel_cake_ulysses_a2a_0f6daa3f5ad400c9b220(__nv_bfloat16* __restrict__ inp, __
                         unsigned int dst_92 = (quotient_114 + (batch_92 * 7 + rank) * sequences) * block_units + remainder_114;
                         unsigned int vec_91[4];
                         {
-                            uint4 _uv4_198 = *reinterpret_cast<const uint4*>(inp_words + (src_90 * 4) + 0);
-                            vec_91[0 + 0] = _uv4_198.x;
-                            vec_91[0 + 1] = _uv4_198.y;
-                            vec_91[0 + 2] = _uv4_198.z;
-                            vec_91[0 + 3] = _uv4_198.w;
+                            uint4 _uv4_199 = *reinterpret_cast<const uint4*>(inp_words + (src_90 * 4) + 0);
+                            vec_91[0 + 0] = _uv4_199.x;
+                            vec_91[0 + 1] = _uv4_199.y;
+                            vec_91[0 + 2] = _uv4_199.z;
+                            vec_91[0 + 3] = _uv4_199.w;
                         }
                         unsigned int unit_108 = stripe_1 + (1920 + tid_0);
                         unsigned int clamped_108 = ((unit_108 < units) ? unit_108 : last_2);
@@ -3159,11 +3170,11 @@ kernel_cake_ulysses_a2a_0f6daa3f5ad400c9b220(__nv_bfloat16* __restrict__ inp, __
                         unsigned int dst_93 = (quotient_115 + (batch_93 * 7 + rank) * sequences) * block_units + remainder_115;
                         unsigned int vec_92[4];
                         {
-                            uint4 _uv4_199 = *reinterpret_cast<const uint4*>(inp_words + (src_91 * 4) + 0);
-                            vec_92[0 + 0] = _uv4_199.x;
-                            vec_92[0 + 1] = _uv4_199.y;
-                            vec_92[0 + 2] = _uv4_199.z;
-                            vec_92[0 + 3] = _uv4_199.w;
+                            uint4 _uv4_200 = *reinterpret_cast<const uint4*>(inp_words + (src_91 * 4) + 0);
+                            vec_92[0 + 0] = _uv4_200.x;
+                            vec_92[0 + 1] = _uv4_200.y;
+                            vec_92[0 + 2] = _uv4_200.z;
+                            vec_92[0 + 3] = _uv4_200.w;
                         }
                         unsigned int unit_109 = stripe_1 + (2400 + tid_0);
                         unsigned int clamped_109 = ((unit_109 < units) ? unit_109 : last_2);
@@ -3181,11 +3192,11 @@ kernel_cake_ulysses_a2a_0f6daa3f5ad400c9b220(__nv_bfloat16* __restrict__ inp, __
                         unsigned int dst_94 = (quotient_116 + (batch_94 * 7 + rank) * sequences) * block_units + remainder_116;
                         unsigned int vec_93[4];
                         {
-                            uint4 _uv4_200 = *reinterpret_cast<const uint4*>(inp_words + (src_92 * 4) + 0);
-                            vec_93[0 + 0] = _uv4_200.x;
-                            vec_93[0 + 1] = _uv4_200.y;
-                            vec_93[0 + 2] = _uv4_200.z;
-                            vec_93[0 + 3] = _uv4_200.w;
+                            uint4 _uv4_201 = *reinterpret_cast<const uint4*>(inp_words + (src_92 * 4) + 0);
+                            vec_93[0 + 0] = _uv4_201.x;
+                            vec_93[0 + 1] = _uv4_201.y;
+                            vec_93[0 + 2] = _uv4_201.z;
+                            vec_93[0 + 3] = _uv4_201.w;
                         }
                         unsigned int unit_110 = stripe_1 + (2880 + tid_0);
                         unsigned int clamped_110 = ((unit_110 < units) ? unit_110 : last_2);
@@ -3203,11 +3214,11 @@ kernel_cake_ulysses_a2a_0f6daa3f5ad400c9b220(__nv_bfloat16* __restrict__ inp, __
                         unsigned int dst_95 = (quotient_117 + (batch_95 * 7 + rank) * sequences) * block_units + remainder_117;
                         unsigned int vec_94[4];
                         {
-                            uint4 _uv4_201 = *reinterpret_cast<const uint4*>(inp_words + (src_93 * 4) + 0);
-                            vec_94[0 + 0] = _uv4_201.x;
-                            vec_94[0 + 1] = _uv4_201.y;
-                            vec_94[0 + 2] = _uv4_201.z;
-                            vec_94[0 + 3] = _uv4_201.w;
+                            uint4 _uv4_202 = *reinterpret_cast<const uint4*>(inp_words + (src_93 * 4) + 0);
+                            vec_94[0 + 0] = _uv4_202.x;
+                            vec_94[0 + 1] = _uv4_202.y;
+                            vec_94[0 + 2] = _uv4_202.z;
+                            vec_94[0 + 3] = _uv4_202.w;
                         }
                         unsigned int unit_111 = stripe_1 + (3360 + tid_0);
                         unsigned int clamped_111 = ((unit_111 < units) ? unit_111 : last_2);
@@ -3225,38 +3236,38 @@ kernel_cake_ulysses_a2a_0f6daa3f5ad400c9b220(__nv_bfloat16* __restrict__ inp, __
                         unsigned int dst_96 = (quotient_118 + (batch_96 * 7 + rank) * sequences) * block_units + remainder_118;
                         unsigned int vec_95[4];
                         {
-                            uint4 _uv4_202 = *reinterpret_cast<const uint4*>(inp_words + (src_94 * 4) + 0);
-                            vec_95[0 + 0] = _uv4_202.x;
-                            vec_95[0 + 1] = _uv4_202.y;
-                            vec_95[0 + 2] = _uv4_202.z;
-                            vec_95[0 + 3] = _uv4_202.w;
+                            uint4 _uv4_203 = *reinterpret_cast<const uint4*>(inp_words + (src_94 * 4) + 0);
+                            vec_95[0 + 0] = _uv4_203.x;
+                            vec_95[0 + 1] = _uv4_203.y;
+                            vec_95[0 + 2] = _uv4_203.z;
+                            vec_95[0 + 3] = _uv4_203.w;
                         }
                         if (unit_104 < units) {
                             {
-                                auto _gst_203 = peer_words + (dst_91 * 4);
-                                __builtin_assume(__isGlobal(_gst_203));
-                                reinterpret_cast<int4*>(_gst_203)[0] = reinterpret_cast<int4*>(vec_88)[0];
+                                auto _gst_204 = peer_words + (dst_91 * 4);
+                                __builtin_assume(__isGlobal(_gst_204));
+                                reinterpret_cast<int4*>(_gst_204)[0] = reinterpret_cast<int4*>(vec_88)[0];
                             }
                         }
                         if (unit_105 < units) {
                             {
-                                auto _gst_204 = peer_words + (dst_90_1 * 4);
-                                __builtin_assume(__isGlobal(_gst_204));
-                                reinterpret_cast<int4*>(_gst_204)[0] = reinterpret_cast<int4*>(vec_89)[0];
+                                auto _gst_205 = peer_words + (dst_90_1 * 4);
+                                __builtin_assume(__isGlobal(_gst_205));
+                                reinterpret_cast<int4*>(_gst_205)[0] = reinterpret_cast<int4*>(vec_89)[0];
                             }
                         }
                         if (unit_106 < units) {
                             {
-                                auto _gst_205 = peer_words + (dst_91_1 * 4);
-                                __builtin_assume(__isGlobal(_gst_205));
-                                reinterpret_cast<int4*>(_gst_205)[0] = reinterpret_cast<int4*>(vec_90)[0];
+                                auto _gst_206 = peer_words + (dst_91_1 * 4);
+                                __builtin_assume(__isGlobal(_gst_206));
+                                reinterpret_cast<int4*>(_gst_206)[0] = reinterpret_cast<int4*>(vec_90)[0];
                             }
                         }
                         if (unit_107 < units) {
                             {
-                                auto _gst_206 = peer_words + (dst_92 * 4);
-                                __builtin_assume(__isGlobal(_gst_206));
-                                reinterpret_cast<int4*>(_gst_206)[0] = reinterpret_cast<int4*>(vec_91)[0];
+                                auto _gst_207 = peer_words + (dst_92 * 4);
+                                __builtin_assume(__isGlobal(_gst_207));
+                                reinterpret_cast<int4*>(_gst_207)[0] = reinterpret_cast<int4*>(vec_91)[0];
                             }
                         }
                         unsigned int unit_112 = stripe_1 + (3840 + tid_0);
@@ -3275,11 +3286,11 @@ kernel_cake_ulysses_a2a_0f6daa3f5ad400c9b220(__nv_bfloat16* __restrict__ inp, __
                         unsigned int dst_97 = (quotient_119 + (batch_97 * 7 + rank) * sequences) * block_units + remainder_119;
                         unsigned int vec_96[4];
                         {
-                            uint4 _uv4_207 = *reinterpret_cast<const uint4*>(inp_words + (src_95 * 4) + 0);
-                            vec_96[0 + 0] = _uv4_207.x;
-                            vec_96[0 + 1] = _uv4_207.y;
-                            vec_96[0 + 2] = _uv4_207.z;
-                            vec_96[0 + 3] = _uv4_207.w;
+                            uint4 _uv4_208 = *reinterpret_cast<const uint4*>(inp_words + (src_95 * 4) + 0);
+                            vec_96[0 + 0] = _uv4_208.x;
+                            vec_96[0 + 1] = _uv4_208.y;
+                            vec_96[0 + 2] = _uv4_208.z;
+                            vec_96[0 + 3] = _uv4_208.w;
                         }
                         unsigned int unit_113 = stripe_1 + (4320 + tid_0);
                         unsigned int clamped_113 = ((unit_113 < units) ? unit_113 : last_2);
@@ -3297,11 +3308,11 @@ kernel_cake_ulysses_a2a_0f6daa3f5ad400c9b220(__nv_bfloat16* __restrict__ inp, __
                         unsigned int dst_98 = (quotient_120 + (batch_98 * 7 + rank) * sequences) * block_units + remainder_120;
                         unsigned int vec_97[4];
                         {
-                            uint4 _uv4_208 = *reinterpret_cast<const uint4*>(inp_words + (src_96 * 4) + 0);
-                            vec_97[0 + 0] = _uv4_208.x;
-                            vec_97[0 + 1] = _uv4_208.y;
-                            vec_97[0 + 2] = _uv4_208.z;
-                            vec_97[0 + 3] = _uv4_208.w;
+                            uint4 _uv4_209 = *reinterpret_cast<const uint4*>(inp_words + (src_96 * 4) + 0);
+                            vec_97[0 + 0] = _uv4_209.x;
+                            vec_97[0 + 1] = _uv4_209.y;
+                            vec_97[0 + 2] = _uv4_209.z;
+                            vec_97[0 + 3] = _uv4_209.w;
                         }
                         unsigned int unit_114 = stripe_1 + (4800 + tid_0);
                         unsigned int clamped_114 = ((unit_114 < units) ? unit_114 : last_2);
@@ -3319,11 +3330,11 @@ kernel_cake_ulysses_a2a_0f6daa3f5ad400c9b220(__nv_bfloat16* __restrict__ inp, __
                         unsigned int dst_99 = (quotient_121 + (batch_99 * 7 + rank) * sequences) * block_units + remainder_121;
                         unsigned int vec_98[4];
                         {
-                            uint4 _uv4_209 = *reinterpret_cast<const uint4*>(inp_words + (src_97 * 4) + 0);
-                            vec_98[0 + 0] = _uv4_209.x;
-                            vec_98[0 + 1] = _uv4_209.y;
-                            vec_98[0 + 2] = _uv4_209.z;
-                            vec_98[0 + 3] = _uv4_209.w;
+                            uint4 _uv4_210 = *reinterpret_cast<const uint4*>(inp_words + (src_97 * 4) + 0);
+                            vec_98[0 + 0] = _uv4_210.x;
+                            vec_98[0 + 1] = _uv4_210.y;
+                            vec_98[0 + 2] = _uv4_210.z;
+                            vec_98[0 + 3] = _uv4_210.w;
                         }
                         unsigned int unit_115 = stripe_1 + (5280 + tid_0);
                         unsigned int clamped_115 = ((unit_115 < units) ? unit_115 : last_2);
@@ -3341,38 +3352,38 @@ kernel_cake_ulysses_a2a_0f6daa3f5ad400c9b220(__nv_bfloat16* __restrict__ inp, __
                         unsigned int dst_100 = (quotient_122 + (batch_100 * 7 + rank) * sequences) * block_units + remainder_122;
                         unsigned int vec_99[4];
                         {
-                            uint4 _uv4_210 = *reinterpret_cast<const uint4*>(inp_words + (src_98 * 4) + 0);
-                            vec_99[0 + 0] = _uv4_210.x;
-                            vec_99[0 + 1] = _uv4_210.y;
-                            vec_99[0 + 2] = _uv4_210.z;
-                            vec_99[0 + 3] = _uv4_210.w;
+                            uint4 _uv4_211 = *reinterpret_cast<const uint4*>(inp_words + (src_98 * 4) + 0);
+                            vec_99[0 + 0] = _uv4_211.x;
+                            vec_99[0 + 1] = _uv4_211.y;
+                            vec_99[0 + 2] = _uv4_211.z;
+                            vec_99[0 + 3] = _uv4_211.w;
                         }
                         if (unit_108 < units) {
                             {
-                                auto _gst_211 = peer_words + (dst_93 * 4);
-                                __builtin_assume(__isGlobal(_gst_211));
-                                reinterpret_cast<int4*>(_gst_211)[0] = reinterpret_cast<int4*>(vec_92)[0];
+                                auto _gst_212 = peer_words + (dst_93 * 4);
+                                __builtin_assume(__isGlobal(_gst_212));
+                                reinterpret_cast<int4*>(_gst_212)[0] = reinterpret_cast<int4*>(vec_92)[0];
                             }
                         }
                         if (unit_109 < units) {
                             {
-                                auto _gst_212 = peer_words + (dst_94 * 4);
-                                __builtin_assume(__isGlobal(_gst_212));
-                                reinterpret_cast<int4*>(_gst_212)[0] = reinterpret_cast<int4*>(vec_93)[0];
+                                auto _gst_213 = peer_words + (dst_94 * 4);
+                                __builtin_assume(__isGlobal(_gst_213));
+                                reinterpret_cast<int4*>(_gst_213)[0] = reinterpret_cast<int4*>(vec_93)[0];
                             }
                         }
                         if (unit_110 < units) {
                             {
-                                auto _gst_213 = peer_words + (dst_95 * 4);
-                                __builtin_assume(__isGlobal(_gst_213));
-                                reinterpret_cast<int4*>(_gst_213)[0] = reinterpret_cast<int4*>(vec_94)[0];
+                                auto _gst_214 = peer_words + (dst_95 * 4);
+                                __builtin_assume(__isGlobal(_gst_214));
+                                reinterpret_cast<int4*>(_gst_214)[0] = reinterpret_cast<int4*>(vec_94)[0];
                             }
                         }
                         if (unit_111 < units) {
                             {
-                                auto _gst_214 = peer_words + (dst_96 * 4);
-                                __builtin_assume(__isGlobal(_gst_214));
-                                reinterpret_cast<int4*>(_gst_214)[0] = reinterpret_cast<int4*>(vec_95)[0];
+                                auto _gst_215 = peer_words + (dst_96 * 4);
+                                __builtin_assume(__isGlobal(_gst_215));
+                                reinterpret_cast<int4*>(_gst_215)[0] = reinterpret_cast<int4*>(vec_95)[0];
                             }
                         }
                         unsigned int unit_116 = stripe_1 + (5760 + tid_0);
@@ -3391,11 +3402,11 @@ kernel_cake_ulysses_a2a_0f6daa3f5ad400c9b220(__nv_bfloat16* __restrict__ inp, __
                         unsigned int dst_101 = (quotient_123 + (batch_101 * 7 + rank) * sequences) * block_units + remainder_123;
                         unsigned int vec_100[4];
                         {
-                            uint4 _uv4_215 = *reinterpret_cast<const uint4*>(inp_words + (src_99 * 4) + 0);
-                            vec_100[0 + 0] = _uv4_215.x;
-                            vec_100[0 + 1] = _uv4_215.y;
-                            vec_100[0 + 2] = _uv4_215.z;
-                            vec_100[0 + 3] = _uv4_215.w;
+                            uint4 _uv4_216 = *reinterpret_cast<const uint4*>(inp_words + (src_99 * 4) + 0);
+                            vec_100[0 + 0] = _uv4_216.x;
+                            vec_100[0 + 1] = _uv4_216.y;
+                            vec_100[0 + 2] = _uv4_216.z;
+                            vec_100[0 + 3] = _uv4_216.w;
                         }
                         unsigned int unit_117 = stripe_1 + (6240 + tid_0);
                         unsigned int clamped_117 = ((unit_117 < units) ? unit_117 : last_2);
@@ -3413,11 +3424,11 @@ kernel_cake_ulysses_a2a_0f6daa3f5ad400c9b220(__nv_bfloat16* __restrict__ inp, __
                         unsigned int dst_102 = (quotient_124 + (batch_102 * 7 + rank) * sequences) * block_units + remainder_124;
                         unsigned int vec_101[4];
                         {
-                            uint4 _uv4_216 = *reinterpret_cast<const uint4*>(inp_words + (src_100 * 4) + 0);
-                            vec_101[0 + 0] = _uv4_216.x;
-                            vec_101[0 + 1] = _uv4_216.y;
-                            vec_101[0 + 2] = _uv4_216.z;
-                            vec_101[0 + 3] = _uv4_216.w;
+                            uint4 _uv4_217 = *reinterpret_cast<const uint4*>(inp_words + (src_100 * 4) + 0);
+                            vec_101[0 + 0] = _uv4_217.x;
+                            vec_101[0 + 1] = _uv4_217.y;
+                            vec_101[0 + 2] = _uv4_217.z;
+                            vec_101[0 + 3] = _uv4_217.w;
                         }
                         unsigned int unit_118 = stripe_1 + (6720 + tid_0);
                         unsigned int clamped_118 = ((unit_118 < units) ? unit_118 : last_2);
@@ -3435,11 +3446,11 @@ kernel_cake_ulysses_a2a_0f6daa3f5ad400c9b220(__nv_bfloat16* __restrict__ inp, __
                         unsigned int dst_103 = (quotient_125 + (batch_103 * 7 + rank) * sequences) * block_units + remainder_125;
                         unsigned int vec_102[4];
                         {
-                            uint4 _uv4_217 = *reinterpret_cast<const uint4*>(inp_words + (src_101 * 4) + 0);
-                            vec_102[0 + 0] = _uv4_217.x;
-                            vec_102[0 + 1] = _uv4_217.y;
-                            vec_102[0 + 2] = _uv4_217.z;
-                            vec_102[0 + 3] = _uv4_217.w;
+                            uint4 _uv4_218 = *reinterpret_cast<const uint4*>(inp_words + (src_101 * 4) + 0);
+                            vec_102[0 + 0] = _uv4_218.x;
+                            vec_102[0 + 1] = _uv4_218.y;
+                            vec_102[0 + 2] = _uv4_218.z;
+                            vec_102[0 + 3] = _uv4_218.w;
                         }
                         unsigned int unit_119 = stripe_1 + (7200 + tid_0);
                         unsigned int clamped_119 = ((unit_119 < units) ? unit_119 : last_2);
@@ -3457,66 +3468,66 @@ kernel_cake_ulysses_a2a_0f6daa3f5ad400c9b220(__nv_bfloat16* __restrict__ inp, __
                         unsigned int dst_104 = (quotient_126 + (batch_104 * 7 + rank) * sequences) * block_units + remainder_126;
                         unsigned int vec_103[4];
                         {
-                            uint4 _uv4_218 = *reinterpret_cast<const uint4*>(inp_words + (src_102 * 4) + 0);
-                            vec_103[0 + 0] = _uv4_218.x;
-                            vec_103[0 + 1] = _uv4_218.y;
-                            vec_103[0 + 2] = _uv4_218.z;
-                            vec_103[0 + 3] = _uv4_218.w;
+                            uint4 _uv4_219 = *reinterpret_cast<const uint4*>(inp_words + (src_102 * 4) + 0);
+                            vec_103[0 + 0] = _uv4_219.x;
+                            vec_103[0 + 1] = _uv4_219.y;
+                            vec_103[0 + 2] = _uv4_219.z;
+                            vec_103[0 + 3] = _uv4_219.w;
                         }
                         if (unit_112 < units) {
                             {
-                                auto _gst_219 = peer_words + (dst_97 * 4);
-                                __builtin_assume(__isGlobal(_gst_219));
-                                reinterpret_cast<int4*>(_gst_219)[0] = reinterpret_cast<int4*>(vec_96)[0];
+                                auto _gst_220 = peer_words + (dst_97 * 4);
+                                __builtin_assume(__isGlobal(_gst_220));
+                                reinterpret_cast<int4*>(_gst_220)[0] = reinterpret_cast<int4*>(vec_96)[0];
                             }
                         }
                         if (unit_113 < units) {
                             {
-                                auto _gst_220 = peer_words + (dst_98 * 4);
-                                __builtin_assume(__isGlobal(_gst_220));
-                                reinterpret_cast<int4*>(_gst_220)[0] = reinterpret_cast<int4*>(vec_97)[0];
+                                auto _gst_221 = peer_words + (dst_98 * 4);
+                                __builtin_assume(__isGlobal(_gst_221));
+                                reinterpret_cast<int4*>(_gst_221)[0] = reinterpret_cast<int4*>(vec_97)[0];
                             }
                         }
                         if (unit_114 < units) {
                             {
-                                auto _gst_221 = peer_words + (dst_99 * 4);
-                                __builtin_assume(__isGlobal(_gst_221));
-                                reinterpret_cast<int4*>(_gst_221)[0] = reinterpret_cast<int4*>(vec_98)[0];
+                                auto _gst_222 = peer_words + (dst_99 * 4);
+                                __builtin_assume(__isGlobal(_gst_222));
+                                reinterpret_cast<int4*>(_gst_222)[0] = reinterpret_cast<int4*>(vec_98)[0];
                             }
                         }
                         if (unit_115 < units) {
                             {
-                                auto _gst_222 = peer_words + (dst_100 * 4);
-                                __builtin_assume(__isGlobal(_gst_222));
-                                reinterpret_cast<int4*>(_gst_222)[0] = reinterpret_cast<int4*>(vec_99)[0];
+                                auto _gst_223 = peer_words + (dst_100 * 4);
+                                __builtin_assume(__isGlobal(_gst_223));
+                                reinterpret_cast<int4*>(_gst_223)[0] = reinterpret_cast<int4*>(vec_99)[0];
                             }
                         }
                         if (unit_116 < units) {
                             {
-                                auto _gst_223 = peer_words + (dst_101 * 4);
-                                __builtin_assume(__isGlobal(_gst_223));
-                                reinterpret_cast<int4*>(_gst_223)[0] = reinterpret_cast<int4*>(vec_100)[0];
+                                auto _gst_224 = peer_words + (dst_101 * 4);
+                                __builtin_assume(__isGlobal(_gst_224));
+                                reinterpret_cast<int4*>(_gst_224)[0] = reinterpret_cast<int4*>(vec_100)[0];
                             }
                         }
                         if (unit_117 < units) {
                             {
-                                auto _gst_224 = peer_words + (dst_102 * 4);
-                                __builtin_assume(__isGlobal(_gst_224));
-                                reinterpret_cast<int4*>(_gst_224)[0] = reinterpret_cast<int4*>(vec_101)[0];
+                                auto _gst_225 = peer_words + (dst_102 * 4);
+                                __builtin_assume(__isGlobal(_gst_225));
+                                reinterpret_cast<int4*>(_gst_225)[0] = reinterpret_cast<int4*>(vec_101)[0];
                             }
                         }
                         if (unit_118 < units) {
                             {
-                                auto _gst_225 = peer_words + (dst_103 * 4);
-                                __builtin_assume(__isGlobal(_gst_225));
-                                reinterpret_cast<int4*>(_gst_225)[0] = reinterpret_cast<int4*>(vec_102)[0];
+                                auto _gst_226 = peer_words + (dst_103 * 4);
+                                __builtin_assume(__isGlobal(_gst_226));
+                                reinterpret_cast<int4*>(_gst_226)[0] = reinterpret_cast<int4*>(vec_102)[0];
                             }
                         }
                         if (unit_119 < units) {
                             {
-                                auto _gst_226 = peer_words + (dst_104 * 4);
-                                __builtin_assume(__isGlobal(_gst_226));
-                                reinterpret_cast<int4*>(_gst_226)[0] = reinterpret_cast<int4*>(vec_103)[0];
+                                auto _gst_227 = peer_words + (dst_104 * 4);
+                                __builtin_assume(__isGlobal(_gst_227));
+                                reinterpret_cast<int4*>(_gst_227)[0] = reinterpret_cast<int4*>(vec_103)[0];
                             }
                         }
                     } else {
@@ -3585,11 +3596,11 @@ kernel_cake_ulysses_a2a_0f6daa3f5ad400c9b220(__nv_bfloat16* __restrict__ inp, __
                             unsigned int dst_106 = (quotient_128 + (batch_106 * 7 + rank) * sequences) * block_units + remainder_128;
                             unsigned int vec_104[4];
                             {
-                                uint4 _uv4_227 = *reinterpret_cast<const uint4*>(inp_words + (src_104 * 4) + 0);
-                                vec_104[0 + 0] = _uv4_227.x;
-                                vec_104[0 + 1] = _uv4_227.y;
-                                vec_104[0 + 2] = _uv4_227.z;
-                                vec_104[0 + 3] = _uv4_227.w;
+                                uint4 _uv4_228 = *reinterpret_cast<const uint4*>(inp_words + (src_104 * 4) + 0);
+                                vec_104[0 + 0] = _uv4_228.x;
+                                vec_104[0 + 1] = _uv4_228.y;
+                                vec_104[0 + 2] = _uv4_228.z;
+                                vec_104[0 + 3] = _uv4_228.w;
                             }
                             unsigned int unit_121 = base_3 + 480;
                             unsigned int clamped_121 = ((unit_121 < chi_7) ? unit_121 : last_3);
@@ -3607,11 +3618,11 @@ kernel_cake_ulysses_a2a_0f6daa3f5ad400c9b220(__nv_bfloat16* __restrict__ inp, __
                             unsigned int dst_105_1 = (quotient_129 + (batch_105_1 * 7 + rank) * sequences) * block_units + remainder_129;
                             unsigned int vec_105[4];
                             {
-                                uint4 _uv4_228 = *reinterpret_cast<const uint4*>(inp_words + (src_103_1 * 4) + 0);
-                                vec_105[0 + 0] = _uv4_228.x;
-                                vec_105[0 + 1] = _uv4_228.y;
-                                vec_105[0 + 2] = _uv4_228.z;
-                                vec_105[0 + 3] = _uv4_228.w;
+                                uint4 _uv4_229 = *reinterpret_cast<const uint4*>(inp_words + (src_103_1 * 4) + 0);
+                                vec_105[0 + 0] = _uv4_229.x;
+                                vec_105[0 + 1] = _uv4_229.y;
+                                vec_105[0 + 2] = _uv4_229.z;
+                                vec_105[0 + 3] = _uv4_229.w;
                             }
                             unsigned int unit_122 = base_3 + 960;
                             unsigned int clamped_122 = ((unit_122 < chi_7) ? unit_122 : last_3);
@@ -3629,11 +3640,11 @@ kernel_cake_ulysses_a2a_0f6daa3f5ad400c9b220(__nv_bfloat16* __restrict__ inp, __
                             unsigned int dst_106_1 = (quotient_130 + (batch_106_1 * 7 + rank) * sequences) * block_units + remainder_130;
                             unsigned int vec_106[4];
                             {
-                                uint4 _uv4_229 = *reinterpret_cast<const uint4*>(inp_words + (src_104_1 * 4) + 0);
-                                vec_106[0 + 0] = _uv4_229.x;
-                                vec_106[0 + 1] = _uv4_229.y;
-                                vec_106[0 + 2] = _uv4_229.z;
-                                vec_106[0 + 3] = _uv4_229.w;
+                                uint4 _uv4_230 = *reinterpret_cast<const uint4*>(inp_words + (src_104_1 * 4) + 0);
+                                vec_106[0 + 0] = _uv4_230.x;
+                                vec_106[0 + 1] = _uv4_230.y;
+                                vec_106[0 + 2] = _uv4_230.z;
+                                vec_106[0 + 3] = _uv4_230.w;
                             }
                             unsigned int unit_123 = base_3 + 1440;
                             unsigned int clamped_123 = ((unit_123 < chi_7) ? unit_123 : last_3);
@@ -3651,11 +3662,11 @@ kernel_cake_ulysses_a2a_0f6daa3f5ad400c9b220(__nv_bfloat16* __restrict__ inp, __
                             unsigned int dst_107 = (quotient_131 + (batch_107 * 7 + rank) * sequences) * block_units + remainder_131;
                             unsigned int vec_107[4];
                             {
-                                uint4 _uv4_230 = *reinterpret_cast<const uint4*>(inp_words + (src_105 * 4) + 0);
-                                vec_107[0 + 0] = _uv4_230.x;
-                                vec_107[0 + 1] = _uv4_230.y;
-                                vec_107[0 + 2] = _uv4_230.z;
-                                vec_107[0 + 3] = _uv4_230.w;
+                                uint4 _uv4_231 = *reinterpret_cast<const uint4*>(inp_words + (src_105 * 4) + 0);
+                                vec_107[0 + 0] = _uv4_231.x;
+                                vec_107[0 + 1] = _uv4_231.y;
+                                vec_107[0 + 2] = _uv4_231.z;
+                                vec_107[0 + 3] = _uv4_231.w;
                             }
                             unsigned int unit_124 = base_3 + 1920;
                             unsigned int clamped_124 = ((unit_124 < chi_7) ? unit_124 : last_3);
@@ -3673,11 +3684,11 @@ kernel_cake_ulysses_a2a_0f6daa3f5ad400c9b220(__nv_bfloat16* __restrict__ inp, __
                             unsigned int dst_108 = (quotient_132 + (batch_108 * 7 + rank) * sequences) * block_units + remainder_132;
                             unsigned int vec_108[4];
                             {
-                                uint4 _uv4_231 = *reinterpret_cast<const uint4*>(inp_words + (src_106 * 4) + 0);
-                                vec_108[0 + 0] = _uv4_231.x;
-                                vec_108[0 + 1] = _uv4_231.y;
-                                vec_108[0 + 2] = _uv4_231.z;
-                                vec_108[0 + 3] = _uv4_231.w;
+                                uint4 _uv4_232 = *reinterpret_cast<const uint4*>(inp_words + (src_106 * 4) + 0);
+                                vec_108[0 + 0] = _uv4_232.x;
+                                vec_108[0 + 1] = _uv4_232.y;
+                                vec_108[0 + 2] = _uv4_232.z;
+                                vec_108[0 + 3] = _uv4_232.w;
                             }
                             unsigned int unit_125 = base_3 + 1920 + 480;
                             unsigned int clamped_125 = ((unit_125 < chi_7) ? unit_125 : last_3);
@@ -3695,11 +3706,11 @@ kernel_cake_ulysses_a2a_0f6daa3f5ad400c9b220(__nv_bfloat16* __restrict__ inp, __
                             unsigned int dst_109 = (quotient_133 + (batch_109 * 7 + rank) * sequences) * block_units + remainder_133;
                             unsigned int vec_109[4];
                             {
-                                uint4 _uv4_232 = *reinterpret_cast<const uint4*>(inp_words + (src_107 * 4) + 0);
-                                vec_109[0 + 0] = _uv4_232.x;
-                                vec_109[0 + 1] = _uv4_232.y;
-                                vec_109[0 + 2] = _uv4_232.z;
-                                vec_109[0 + 3] = _uv4_232.w;
+                                uint4 _uv4_233 = *reinterpret_cast<const uint4*>(inp_words + (src_107 * 4) + 0);
+                                vec_109[0 + 0] = _uv4_233.x;
+                                vec_109[0 + 1] = _uv4_233.y;
+                                vec_109[0 + 2] = _uv4_233.z;
+                                vec_109[0 + 3] = _uv4_233.w;
                             }
                             unsigned int unit_126 = base_3 + 1920 + 960;
                             unsigned int clamped_126 = ((unit_126 < chi_7) ? unit_126 : last_3);
@@ -3717,11 +3728,11 @@ kernel_cake_ulysses_a2a_0f6daa3f5ad400c9b220(__nv_bfloat16* __restrict__ inp, __
                             unsigned int dst_110 = (quotient_134 + (batch_110 * 7 + rank) * sequences) * block_units + remainder_134;
                             unsigned int vec_110[4];
                             {
-                                uint4 _uv4_233 = *reinterpret_cast<const uint4*>(inp_words + (src_108 * 4) + 0);
-                                vec_110[0 + 0] = _uv4_233.x;
-                                vec_110[0 + 1] = _uv4_233.y;
-                                vec_110[0 + 2] = _uv4_233.z;
-                                vec_110[0 + 3] = _uv4_233.w;
+                                uint4 _uv4_234 = *reinterpret_cast<const uint4*>(inp_words + (src_108 * 4) + 0);
+                                vec_110[0 + 0] = _uv4_234.x;
+                                vec_110[0 + 1] = _uv4_234.y;
+                                vec_110[0 + 2] = _uv4_234.z;
+                                vec_110[0 + 3] = _uv4_234.w;
                             }
                             unsigned int unit_127 = base_3 + 1920 + 1440;
                             unsigned int clamped_127 = ((unit_127 < chi_7) ? unit_127 : last_3);
@@ -3739,38 +3750,38 @@ kernel_cake_ulysses_a2a_0f6daa3f5ad400c9b220(__nv_bfloat16* __restrict__ inp, __
                             unsigned int dst_111 = (quotient_135 + (batch_111 * 7 + rank) * sequences) * block_units + remainder_135;
                             unsigned int vec_111[4];
                             {
-                                uint4 _uv4_234 = *reinterpret_cast<const uint4*>(inp_words + (src_109 * 4) + 0);
-                                vec_111[0 + 0] = _uv4_234.x;
-                                vec_111[0 + 1] = _uv4_234.y;
-                                vec_111[0 + 2] = _uv4_234.z;
-                                vec_111[0 + 3] = _uv4_234.w;
+                                uint4 _uv4_235 = *reinterpret_cast<const uint4*>(inp_words + (src_109 * 4) + 0);
+                                vec_111[0 + 0] = _uv4_235.x;
+                                vec_111[0 + 1] = _uv4_235.y;
+                                vec_111[0 + 2] = _uv4_235.z;
+                                vec_111[0 + 3] = _uv4_235.w;
                             }
                             if (unit_120 < chi_7) {
                                 {
-                                    auto _gst_235 = out_words + (dst_106 * 4);
-                                    __builtin_assume(__isGlobal(_gst_235));
-                                    reinterpret_cast<int4*>(_gst_235)[0] = reinterpret_cast<int4*>(vec_104)[0];
+                                    auto _gst_236 = out_words + (dst_106 * 4);
+                                    __builtin_assume(__isGlobal(_gst_236));
+                                    reinterpret_cast<int4*>(_gst_236)[0] = reinterpret_cast<int4*>(vec_104)[0];
                                 }
                             }
                             if (unit_121 < chi_7) {
                                 {
-                                    auto _gst_236 = out_words + (dst_105_1 * 4);
-                                    __builtin_assume(__isGlobal(_gst_236));
-                                    reinterpret_cast<int4*>(_gst_236)[0] = reinterpret_cast<int4*>(vec_105)[0];
+                                    auto _gst_237 = out_words + (dst_105_1 * 4);
+                                    __builtin_assume(__isGlobal(_gst_237));
+                                    reinterpret_cast<int4*>(_gst_237)[0] = reinterpret_cast<int4*>(vec_105)[0];
                                 }
                             }
                             if (unit_122 < chi_7) {
                                 {
-                                    auto _gst_237 = out_words + (dst_106_1 * 4);
-                                    __builtin_assume(__isGlobal(_gst_237));
-                                    reinterpret_cast<int4*>(_gst_237)[0] = reinterpret_cast<int4*>(vec_106)[0];
+                                    auto _gst_238 = out_words + (dst_106_1 * 4);
+                                    __builtin_assume(__isGlobal(_gst_238));
+                                    reinterpret_cast<int4*>(_gst_238)[0] = reinterpret_cast<int4*>(vec_106)[0];
                                 }
                             }
                             if (unit_123 < chi_7) {
                                 {
-                                    auto _gst_238 = out_words + (dst_107 * 4);
-                                    __builtin_assume(__isGlobal(_gst_238));
-                                    reinterpret_cast<int4*>(_gst_238)[0] = reinterpret_cast<int4*>(vec_107)[0];
+                                    auto _gst_239 = out_words + (dst_107 * 4);
+                                    __builtin_assume(__isGlobal(_gst_239));
+                                    reinterpret_cast<int4*>(_gst_239)[0] = reinterpret_cast<int4*>(vec_107)[0];
                                 }
                             }
                             unsigned int unit_128 = base_3 + 3840;
@@ -3789,11 +3800,11 @@ kernel_cake_ulysses_a2a_0f6daa3f5ad400c9b220(__nv_bfloat16* __restrict__ inp, __
                             unsigned int dst_112 = (quotient_136 + (batch_112 * 7 + rank) * sequences) * block_units + remainder_136;
                             unsigned int vec_112[4];
                             {
-                                uint4 _uv4_239 = *reinterpret_cast<const uint4*>(inp_words + (src_110 * 4) + 0);
-                                vec_112[0 + 0] = _uv4_239.x;
-                                vec_112[0 + 1] = _uv4_239.y;
-                                vec_112[0 + 2] = _uv4_239.z;
-                                vec_112[0 + 3] = _uv4_239.w;
+                                uint4 _uv4_240 = *reinterpret_cast<const uint4*>(inp_words + (src_110 * 4) + 0);
+                                vec_112[0 + 0] = _uv4_240.x;
+                                vec_112[0 + 1] = _uv4_240.y;
+                                vec_112[0 + 2] = _uv4_240.z;
+                                vec_112[0 + 3] = _uv4_240.w;
                             }
                             unsigned int unit_129 = base_3 + 3840 + 480;
                             unsigned int clamped_129 = ((unit_129 < chi_7) ? unit_129 : last_3);
@@ -3811,11 +3822,11 @@ kernel_cake_ulysses_a2a_0f6daa3f5ad400c9b220(__nv_bfloat16* __restrict__ inp, __
                             unsigned int dst_113 = (quotient_137 + (batch_113 * 7 + rank) * sequences) * block_units + remainder_137;
                             unsigned int vec_113[4];
                             {
-                                uint4 _uv4_240 = *reinterpret_cast<const uint4*>(inp_words + (src_111 * 4) + 0);
-                                vec_113[0 + 0] = _uv4_240.x;
-                                vec_113[0 + 1] = _uv4_240.y;
-                                vec_113[0 + 2] = _uv4_240.z;
-                                vec_113[0 + 3] = _uv4_240.w;
+                                uint4 _uv4_241 = *reinterpret_cast<const uint4*>(inp_words + (src_111 * 4) + 0);
+                                vec_113[0 + 0] = _uv4_241.x;
+                                vec_113[0 + 1] = _uv4_241.y;
+                                vec_113[0 + 2] = _uv4_241.z;
+                                vec_113[0 + 3] = _uv4_241.w;
                             }
                             unsigned int unit_130 = base_3 + 3840 + 960;
                             unsigned int clamped_130 = ((unit_130 < chi_7) ? unit_130 : last_3);
@@ -3833,11 +3844,11 @@ kernel_cake_ulysses_a2a_0f6daa3f5ad400c9b220(__nv_bfloat16* __restrict__ inp, __
                             unsigned int dst_114 = (quotient_138 + (batch_114 * 7 + rank) * sequences) * block_units + remainder_138;
                             unsigned int vec_114[4];
                             {
-                                uint4 _uv4_241 = *reinterpret_cast<const uint4*>(inp_words + (src_112 * 4) + 0);
-                                vec_114[0 + 0] = _uv4_241.x;
-                                vec_114[0 + 1] = _uv4_241.y;
-                                vec_114[0 + 2] = _uv4_241.z;
-                                vec_114[0 + 3] = _uv4_241.w;
+                                uint4 _uv4_242 = *reinterpret_cast<const uint4*>(inp_words + (src_112 * 4) + 0);
+                                vec_114[0 + 0] = _uv4_242.x;
+                                vec_114[0 + 1] = _uv4_242.y;
+                                vec_114[0 + 2] = _uv4_242.z;
+                                vec_114[0 + 3] = _uv4_242.w;
                             }
                             unsigned int unit_131 = base_3 + 3840 + 1440;
                             unsigned int clamped_131 = ((unit_131 < chi_7) ? unit_131 : last_3);
@@ -3855,38 +3866,38 @@ kernel_cake_ulysses_a2a_0f6daa3f5ad400c9b220(__nv_bfloat16* __restrict__ inp, __
                             unsigned int dst_115 = (quotient_139 + (batch_115 * 7 + rank) * sequences) * block_units + remainder_139;
                             unsigned int vec_115[4];
                             {
-                                uint4 _uv4_242 = *reinterpret_cast<const uint4*>(inp_words + (src_113 * 4) + 0);
-                                vec_115[0 + 0] = _uv4_242.x;
-                                vec_115[0 + 1] = _uv4_242.y;
-                                vec_115[0 + 2] = _uv4_242.z;
-                                vec_115[0 + 3] = _uv4_242.w;
+                                uint4 _uv4_243 = *reinterpret_cast<const uint4*>(inp_words + (src_113 * 4) + 0);
+                                vec_115[0 + 0] = _uv4_243.x;
+                                vec_115[0 + 1] = _uv4_243.y;
+                                vec_115[0 + 2] = _uv4_243.z;
+                                vec_115[0 + 3] = _uv4_243.w;
                             }
                             if (unit_124 < chi_7) {
                                 {
-                                    auto _gst_243 = out_words + (dst_108 * 4);
-                                    __builtin_assume(__isGlobal(_gst_243));
-                                    reinterpret_cast<int4*>(_gst_243)[0] = reinterpret_cast<int4*>(vec_108)[0];
+                                    auto _gst_244 = out_words + (dst_108 * 4);
+                                    __builtin_assume(__isGlobal(_gst_244));
+                                    reinterpret_cast<int4*>(_gst_244)[0] = reinterpret_cast<int4*>(vec_108)[0];
                                 }
                             }
                             if (unit_125 < chi_7) {
                                 {
-                                    auto _gst_244 = out_words + (dst_109 * 4);
-                                    __builtin_assume(__isGlobal(_gst_244));
-                                    reinterpret_cast<int4*>(_gst_244)[0] = reinterpret_cast<int4*>(vec_109)[0];
+                                    auto _gst_245 = out_words + (dst_109 * 4);
+                                    __builtin_assume(__isGlobal(_gst_245));
+                                    reinterpret_cast<int4*>(_gst_245)[0] = reinterpret_cast<int4*>(vec_109)[0];
                                 }
                             }
                             if (unit_126 < chi_7) {
                                 {
-                                    auto _gst_245 = out_words + (dst_110 * 4);
-                                    __builtin_assume(__isGlobal(_gst_245));
-                                    reinterpret_cast<int4*>(_gst_245)[0] = reinterpret_cast<int4*>(vec_110)[0];
+                                    auto _gst_246 = out_words + (dst_110 * 4);
+                                    __builtin_assume(__isGlobal(_gst_246));
+                                    reinterpret_cast<int4*>(_gst_246)[0] = reinterpret_cast<int4*>(vec_110)[0];
                                 }
                             }
                             if (unit_127 < chi_7) {
                                 {
-                                    auto _gst_246 = out_words + (dst_111 * 4);
-                                    __builtin_assume(__isGlobal(_gst_246));
-                                    reinterpret_cast<int4*>(_gst_246)[0] = reinterpret_cast<int4*>(vec_111)[0];
+                                    auto _gst_247 = out_words + (dst_111 * 4);
+                                    __builtin_assume(__isGlobal(_gst_247));
+                                    reinterpret_cast<int4*>(_gst_247)[0] = reinterpret_cast<int4*>(vec_111)[0];
                                 }
                             }
                             unsigned int unit_132 = base_3 + 5760;
@@ -3905,11 +3916,11 @@ kernel_cake_ulysses_a2a_0f6daa3f5ad400c9b220(__nv_bfloat16* __restrict__ inp, __
                             unsigned int dst_116 = (quotient_140 + (batch_116 * 7 + rank) * sequences) * block_units + remainder_140;
                             unsigned int vec_116[4];
                             {
-                                uint4 _uv4_247 = *reinterpret_cast<const uint4*>(inp_words + (src_114 * 4) + 0);
-                                vec_116[0 + 0] = _uv4_247.x;
-                                vec_116[0 + 1] = _uv4_247.y;
-                                vec_116[0 + 2] = _uv4_247.z;
-                                vec_116[0 + 3] = _uv4_247.w;
+                                uint4 _uv4_248 = *reinterpret_cast<const uint4*>(inp_words + (src_114 * 4) + 0);
+                                vec_116[0 + 0] = _uv4_248.x;
+                                vec_116[0 + 1] = _uv4_248.y;
+                                vec_116[0 + 2] = _uv4_248.z;
+                                vec_116[0 + 3] = _uv4_248.w;
                             }
                             unsigned int unit_133 = base_3 + 5760 + 480;
                             unsigned int clamped_133 = ((unit_133 < chi_7) ? unit_133 : last_3);
@@ -3927,11 +3938,11 @@ kernel_cake_ulysses_a2a_0f6daa3f5ad400c9b220(__nv_bfloat16* __restrict__ inp, __
                             unsigned int dst_117 = (quotient_141 + (batch_117 * 7 + rank) * sequences) * block_units + remainder_141;
                             unsigned int vec_117[4];
                             {
-                                uint4 _uv4_248 = *reinterpret_cast<const uint4*>(inp_words + (src_115 * 4) + 0);
-                                vec_117[0 + 0] = _uv4_248.x;
-                                vec_117[0 + 1] = _uv4_248.y;
-                                vec_117[0 + 2] = _uv4_248.z;
-                                vec_117[0 + 3] = _uv4_248.w;
+                                uint4 _uv4_249 = *reinterpret_cast<const uint4*>(inp_words + (src_115 * 4) + 0);
+                                vec_117[0 + 0] = _uv4_249.x;
+                                vec_117[0 + 1] = _uv4_249.y;
+                                vec_117[0 + 2] = _uv4_249.z;
+                                vec_117[0 + 3] = _uv4_249.w;
                             }
                             unsigned int unit_134 = base_3 + 5760 + 960;
                             unsigned int clamped_134 = ((unit_134 < chi_7) ? unit_134 : last_3);
@@ -3949,11 +3960,11 @@ kernel_cake_ulysses_a2a_0f6daa3f5ad400c9b220(__nv_bfloat16* __restrict__ inp, __
                             unsigned int dst_118 = (quotient_142 + (batch_118 * 7 + rank) * sequences) * block_units + remainder_142;
                             unsigned int vec_118[4];
                             {
-                                uint4 _uv4_249 = *reinterpret_cast<const uint4*>(inp_words + (src_116 * 4) + 0);
-                                vec_118[0 + 0] = _uv4_249.x;
-                                vec_118[0 + 1] = _uv4_249.y;
-                                vec_118[0 + 2] = _uv4_249.z;
-                                vec_118[0 + 3] = _uv4_249.w;
+                                uint4 _uv4_250 = *reinterpret_cast<const uint4*>(inp_words + (src_116 * 4) + 0);
+                                vec_118[0 + 0] = _uv4_250.x;
+                                vec_118[0 + 1] = _uv4_250.y;
+                                vec_118[0 + 2] = _uv4_250.z;
+                                vec_118[0 + 3] = _uv4_250.w;
                             }
                             unsigned int unit_135 = base_3 + 5760 + 1440;
                             unsigned int clamped_135 = ((unit_135 < chi_7) ? unit_135 : last_3);
@@ -3971,66 +3982,66 @@ kernel_cake_ulysses_a2a_0f6daa3f5ad400c9b220(__nv_bfloat16* __restrict__ inp, __
                             unsigned int dst_119 = (quotient_143 + (batch_119 * 7 + rank) * sequences) * block_units + remainder_143;
                             unsigned int vec_119[4];
                             {
-                                uint4 _uv4_250 = *reinterpret_cast<const uint4*>(inp_words + (src_117 * 4) + 0);
-                                vec_119[0 + 0] = _uv4_250.x;
-                                vec_119[0 + 1] = _uv4_250.y;
-                                vec_119[0 + 2] = _uv4_250.z;
-                                vec_119[0 + 3] = _uv4_250.w;
+                                uint4 _uv4_251 = *reinterpret_cast<const uint4*>(inp_words + (src_117 * 4) + 0);
+                                vec_119[0 + 0] = _uv4_251.x;
+                                vec_119[0 + 1] = _uv4_251.y;
+                                vec_119[0 + 2] = _uv4_251.z;
+                                vec_119[0 + 3] = _uv4_251.w;
                             }
                             if (unit_128 < chi_7) {
                                 {
-                                    auto _gst_251 = out_words + (dst_112 * 4);
-                                    __builtin_assume(__isGlobal(_gst_251));
-                                    reinterpret_cast<int4*>(_gst_251)[0] = reinterpret_cast<int4*>(vec_112)[0];
+                                    auto _gst_252 = out_words + (dst_112 * 4);
+                                    __builtin_assume(__isGlobal(_gst_252));
+                                    reinterpret_cast<int4*>(_gst_252)[0] = reinterpret_cast<int4*>(vec_112)[0];
                                 }
                             }
                             if (unit_129 < chi_7) {
                                 {
-                                    auto _gst_252 = out_words + (dst_113 * 4);
-                                    __builtin_assume(__isGlobal(_gst_252));
-                                    reinterpret_cast<int4*>(_gst_252)[0] = reinterpret_cast<int4*>(vec_113)[0];
+                                    auto _gst_253 = out_words + (dst_113 * 4);
+                                    __builtin_assume(__isGlobal(_gst_253));
+                                    reinterpret_cast<int4*>(_gst_253)[0] = reinterpret_cast<int4*>(vec_113)[0];
                                 }
                             }
                             if (unit_130 < chi_7) {
                                 {
-                                    auto _gst_253 = out_words + (dst_114 * 4);
-                                    __builtin_assume(__isGlobal(_gst_253));
-                                    reinterpret_cast<int4*>(_gst_253)[0] = reinterpret_cast<int4*>(vec_114)[0];
+                                    auto _gst_254 = out_words + (dst_114 * 4);
+                                    __builtin_assume(__isGlobal(_gst_254));
+                                    reinterpret_cast<int4*>(_gst_254)[0] = reinterpret_cast<int4*>(vec_114)[0];
                                 }
                             }
                             if (unit_131 < chi_7) {
                                 {
-                                    auto _gst_254 = out_words + (dst_115 * 4);
-                                    __builtin_assume(__isGlobal(_gst_254));
-                                    reinterpret_cast<int4*>(_gst_254)[0] = reinterpret_cast<int4*>(vec_115)[0];
+                                    auto _gst_255 = out_words + (dst_115 * 4);
+                                    __builtin_assume(__isGlobal(_gst_255));
+                                    reinterpret_cast<int4*>(_gst_255)[0] = reinterpret_cast<int4*>(vec_115)[0];
                                 }
                             }
                             if (unit_132 < chi_7) {
                                 {
-                                    auto _gst_255 = out_words + (dst_116 * 4);
-                                    __builtin_assume(__isGlobal(_gst_255));
-                                    reinterpret_cast<int4*>(_gst_255)[0] = reinterpret_cast<int4*>(vec_116)[0];
+                                    auto _gst_256 = out_words + (dst_116 * 4);
+                                    __builtin_assume(__isGlobal(_gst_256));
+                                    reinterpret_cast<int4*>(_gst_256)[0] = reinterpret_cast<int4*>(vec_116)[0];
                                 }
                             }
                             if (unit_133 < chi_7) {
                                 {
-                                    auto _gst_256 = out_words + (dst_117 * 4);
-                                    __builtin_assume(__isGlobal(_gst_256));
-                                    reinterpret_cast<int4*>(_gst_256)[0] = reinterpret_cast<int4*>(vec_117)[0];
+                                    auto _gst_257 = out_words + (dst_117 * 4);
+                                    __builtin_assume(__isGlobal(_gst_257));
+                                    reinterpret_cast<int4*>(_gst_257)[0] = reinterpret_cast<int4*>(vec_117)[0];
                                 }
                             }
                             if (unit_134 < chi_7) {
                                 {
-                                    auto _gst_257 = out_words + (dst_118 * 4);
-                                    __builtin_assume(__isGlobal(_gst_257));
-                                    reinterpret_cast<int4*>(_gst_257)[0] = reinterpret_cast<int4*>(vec_118)[0];
+                                    auto _gst_258 = out_words + (dst_118 * 4);
+                                    __builtin_assume(__isGlobal(_gst_258));
+                                    reinterpret_cast<int4*>(_gst_258)[0] = reinterpret_cast<int4*>(vec_118)[0];
                                 }
                             }
                             if (unit_135 < chi_7) {
                                 {
-                                    auto _gst_258 = out_words + (dst_119 * 4);
-                                    __builtin_assume(__isGlobal(_gst_258));
-                                    reinterpret_cast<int4*>(_gst_258)[0] = reinterpret_cast<int4*>(vec_119)[0];
+                                    auto _gst_259 = out_words + (dst_119 * 4);
+                                    __builtin_assume(__isGlobal(_gst_259));
+                                    reinterpret_cast<int4*>(_gst_259)[0] = reinterpret_cast<int4*>(vec_119)[0];
                                 }
                             }
                         }
@@ -4065,8 +4076,9 @@ kernel_cake_ulysses_a2a_0f6daa3f5ad400c9b220(__nv_bfloat16* __restrict__ inp, __
             asm volatile("st.release.sys.global.u32 [%0], %1;" :: "l"(landed), "r"(epoch) : "memory");
             asm volatile("fence.acq_rel.sys;" ::: "memory");
         }
-    } else {
-        unsigned int zone_epoch = 0;
+    }
+    if (warp_1 >= 1) {
+        unsigned int zone_hit = 0;
         if (tid_0 == 480) {
             {
             unsigned int _acquire_observed;
@@ -4076,18 +4088,18 @@ kernel_cake_ulysses_a2a_0f6daa3f5ad400c9b220(__nv_bfloat16* __restrict__ inp, __
             }
             uint32_t _relaxed_ld_2;
             asm volatile("ld.relaxed.sys.u32 %0, [%1];" : "=r"(_relaxed_ld_2) : "l"(signals_self + (1024 + bid_1)) : "memory");
-            zone_epoch = _relaxed_ld_2;
+            if (_relaxed_ld_2 == epoch) {
+                zone_hit = 1;
+            }
         }
-        __syncwarp();
-        unsigned int _shfl_sync_259 = __shfl_sync(0xFFFFFFFF, zone_epoch, 0);
-        zone_epoch = _shfl_sync_259;
-        if (zone_epoch == epoch) {
-            unsigned int zone_lane = tid_0 - 480;
+        uint32_t copied;
+        asm volatile("{\n\t.reg .pred p, q;\n\tsetp.ne.u32 p, %1, 0;\n\tbarrier.red.or.pred q, 7, 480, p;\n\tselp.u32 %0, 1, 0, q;\n\t}" : "=r"(copied) : "r"((uint32_t)(zone_hit != 0)) : "memory");
+        if (copied != 0) {
+            unsigned int zone_lane = tid_0 - 32;
             unsigned int zone_sender = (rank + 7 - other) % 8;
             unsigned int zone_block = block_len / 8;
             unsigned int zone_units = rows * zone_block;
             unsigned int zone_magic = (unsigned int)4294967295 / zone_block;
-            unsigned int zone_unit = sub * 7680 + zone_lane;
             unsigned int* zone_at = signals_self + (2048 + (zone_slot + zone_lane) * 4);
             unsigned int got_0[4];
             {
@@ -4109,39 +4121,13 @@ kernel_cake_ulysses_a2a_0f6daa3f5ad400c9b220(__nv_bfloat16* __restrict__ inp, __
                 uint32_t _uv4_261_2;
                 uint32_t _uv4_261_3;
                 asm volatile("ld.global.cg.v4.b32 {%0, %1, %2, %3}, [%4];"
-                    : "=r"(_uv4_261_0), "=r"(_uv4_261_1), "=r"(_uv4_261_2), "=r"(_uv4_261_3) : "l"((const void*)(zone_at + 128 + (0))) : "memory");
+                    : "=r"(_uv4_261_0), "=r"(_uv4_261_1), "=r"(_uv4_261_2), "=r"(_uv4_261_3) : "l"((const void*)(zone_at + 1920 + (0))) : "memory");
                 got_1[0 + 0] = _uv4_261_0;
                 got_1[0 + 1] = _uv4_261_1;
                 got_1[0 + 2] = _uv4_261_2;
                 got_1[0 + 3] = _uv4_261_3;
             }
-            unsigned int got_2[4];
-            {
-                uint32_t _uv4_262_0;
-                uint32_t _uv4_262_1;
-                uint32_t _uv4_262_2;
-                uint32_t _uv4_262_3;
-                asm volatile("ld.global.cg.v4.b32 {%0, %1, %2, %3}, [%4];"
-                    : "=r"(_uv4_262_0), "=r"(_uv4_262_1), "=r"(_uv4_262_2), "=r"(_uv4_262_3) : "l"((const void*)(zone_at + 256 + (0))) : "memory");
-                got_2[0 + 0] = _uv4_262_0;
-                got_2[0 + 1] = _uv4_262_1;
-                got_2[0 + 2] = _uv4_262_2;
-                got_2[0 + 3] = _uv4_262_3;
-            }
-            unsigned int got_3[4];
-            {
-                uint32_t _uv4_263_0;
-                uint32_t _uv4_263_1;
-                uint32_t _uv4_263_2;
-                uint32_t _uv4_263_3;
-                asm volatile("ld.global.cg.v4.b32 {%0, %1, %2, %3}, [%4];"
-                    : "=r"(_uv4_263_0), "=r"(_uv4_263_1), "=r"(_uv4_263_2), "=r"(_uv4_263_3) : "l"((const void*)(zone_at + 384 + (0))) : "memory");
-                got_3[0 + 0] = _uv4_263_0;
-                got_3[0 + 1] = _uv4_263_1;
-                got_3[0 + 2] = _uv4_263_2;
-                got_3[0 + 3] = _uv4_263_3;
-            }
-            unsigned int landing_unit_0 = zone_unit + 0;
+            unsigned int landing_unit_0 = sub * 7680 + zone_lane;
             if (landing_unit_0 < zone_units) {
                 unsigned int landing_row_0 = (unsigned int)((unsigned long long)landing_unit_0 * (unsigned long long)zone_magic >> 32);
                 unsigned int landing_col_0 = landing_unit_0 - landing_row_0 * zone_block;
@@ -4153,12 +4139,12 @@ kernel_cake_ulysses_a2a_0f6daa3f5ad400c9b220(__nv_bfloat16* __restrict__ inp, __
                 landing_batch_0 = landing_batch_0 + (unsigned int)(landing_seq_0 >= sequences);
                 unsigned int landing_dst_0 = (landing_row_0 + (landing_batch_0 * 7 + zone_sender) * sequences) * zone_block + landing_col_0;
                 {
-                    auto _gst_264 = out_words + (landing_dst_0 * 4);
-                    __builtin_assume(__isGlobal(_gst_264));
-                    reinterpret_cast<int4*>(_gst_264)[0] = reinterpret_cast<int4*>(got_0)[0];
+                    auto _gst_262 = out_words + (landing_dst_0 * 4);
+                    __builtin_assume(__isGlobal(_gst_262));
+                    reinterpret_cast<int4*>(_gst_262)[0] = reinterpret_cast<int4*>(got_0)[0];
                 }
             }
-            unsigned int landing_unit_1 = zone_unit + 32;
+            unsigned int landing_unit_1 = sub * 7680 + (480 + zone_lane);
             if (landing_unit_1 < zone_units) {
                 unsigned int landing_row_1 = (unsigned int)((unsigned long long)landing_unit_1 * (unsigned long long)zone_magic >> 32);
                 unsigned int landing_col_1 = landing_unit_1 - landing_row_1 * zone_block;
@@ -4170,373 +4156,9 @@ kernel_cake_ulysses_a2a_0f6daa3f5ad400c9b220(__nv_bfloat16* __restrict__ inp, __
                 landing_batch_1 = landing_batch_1 + (unsigned int)(landing_seq_1 >= sequences);
                 unsigned int landing_dst_1 = (landing_row_1 + (landing_batch_1 * 7 + zone_sender) * sequences) * zone_block + landing_col_1;
                 {
-                    auto _gst_265 = out_words + (landing_dst_1 * 4);
-                    __builtin_assume(__isGlobal(_gst_265));
-                    reinterpret_cast<int4*>(_gst_265)[0] = reinterpret_cast<int4*>(got_1)[0];
-                }
-            }
-            unsigned int landing_unit_2 = zone_unit + 64;
-            if (landing_unit_2 < zone_units) {
-                unsigned int landing_row_2 = (unsigned int)((unsigned long long)landing_unit_2 * (unsigned long long)zone_magic >> 32);
-                unsigned int landing_col_2 = landing_unit_2 - landing_row_2 * zone_block;
-                unsigned int landing_fix_2 = (unsigned int)(landing_col_2 >= zone_block);
-                landing_row_2 = landing_row_2 + landing_fix_2;
-                landing_col_2 = landing_col_2 - landing_fix_2 * zone_block;
-                unsigned int landing_batch_2 = (unsigned int)((unsigned long long)landing_row_2 * (unsigned long long)sequences_magic >> 32);
-                unsigned int landing_seq_2 = landing_row_2 - landing_batch_2 * sequences;
-                landing_batch_2 = landing_batch_2 + (unsigned int)(landing_seq_2 >= sequences);
-                unsigned int landing_dst_2 = (landing_row_2 + (landing_batch_2 * 7 + zone_sender) * sequences) * zone_block + landing_col_2;
-                {
-                    auto _gst_266 = out_words + (landing_dst_2 * 4);
-                    __builtin_assume(__isGlobal(_gst_266));
-                    reinterpret_cast<int4*>(_gst_266)[0] = reinterpret_cast<int4*>(got_2)[0];
-                }
-            }
-            unsigned int landing_unit_3 = zone_unit + 96;
-            if (landing_unit_3 < zone_units) {
-                unsigned int landing_row_3 = (unsigned int)((unsigned long long)landing_unit_3 * (unsigned long long)zone_magic >> 32);
-                unsigned int landing_col_3 = landing_unit_3 - landing_row_3 * zone_block;
-                unsigned int landing_fix_3 = (unsigned int)(landing_col_3 >= zone_block);
-                landing_row_3 = landing_row_3 + landing_fix_3;
-                landing_col_3 = landing_col_3 - landing_fix_3 * zone_block;
-                unsigned int landing_batch_3 = (unsigned int)((unsigned long long)landing_row_3 * (unsigned long long)sequences_magic >> 32);
-                unsigned int landing_seq_3 = landing_row_3 - landing_batch_3 * sequences;
-                landing_batch_3 = landing_batch_3 + (unsigned int)(landing_seq_3 >= sequences);
-                unsigned int landing_dst_3 = (landing_row_3 + (landing_batch_3 * 7 + zone_sender) * sequences) * zone_block + landing_col_3;
-                {
-                    auto _gst_267 = out_words + (landing_dst_3 * 4);
-                    __builtin_assume(__isGlobal(_gst_267));
-                    reinterpret_cast<int4*>(_gst_267)[0] = reinterpret_cast<int4*>(got_3)[0];
-                }
-            }
-            unsigned int got_4[4];
-            {
-                uint32_t _uv4_268_0;
-                uint32_t _uv4_268_1;
-                uint32_t _uv4_268_2;
-                uint32_t _uv4_268_3;
-                asm volatile("ld.global.cg.v4.b32 {%0, %1, %2, %3}, [%4];"
-                    : "=r"(_uv4_268_0), "=r"(_uv4_268_1), "=r"(_uv4_268_2), "=r"(_uv4_268_3) : "l"((const void*)(zone_at + 512 + (0))) : "memory");
-                got_4[0 + 0] = _uv4_268_0;
-                got_4[0 + 1] = _uv4_268_1;
-                got_4[0 + 2] = _uv4_268_2;
-                got_4[0 + 3] = _uv4_268_3;
-            }
-            unsigned int got_5[4];
-            {
-                uint32_t _uv4_269_0;
-                uint32_t _uv4_269_1;
-                uint32_t _uv4_269_2;
-                uint32_t _uv4_269_3;
-                asm volatile("ld.global.cg.v4.b32 {%0, %1, %2, %3}, [%4];"
-                    : "=r"(_uv4_269_0), "=r"(_uv4_269_1), "=r"(_uv4_269_2), "=r"(_uv4_269_3) : "l"((const void*)(zone_at + 640 + (0))) : "memory");
-                got_5[0 + 0] = _uv4_269_0;
-                got_5[0 + 1] = _uv4_269_1;
-                got_5[0 + 2] = _uv4_269_2;
-                got_5[0 + 3] = _uv4_269_3;
-            }
-            unsigned int got_6[4];
-            {
-                uint32_t _uv4_270_0;
-                uint32_t _uv4_270_1;
-                uint32_t _uv4_270_2;
-                uint32_t _uv4_270_3;
-                asm volatile("ld.global.cg.v4.b32 {%0, %1, %2, %3}, [%4];"
-                    : "=r"(_uv4_270_0), "=r"(_uv4_270_1), "=r"(_uv4_270_2), "=r"(_uv4_270_3) : "l"((const void*)(zone_at + 768 + (0))) : "memory");
-                got_6[0 + 0] = _uv4_270_0;
-                got_6[0 + 1] = _uv4_270_1;
-                got_6[0 + 2] = _uv4_270_2;
-                got_6[0 + 3] = _uv4_270_3;
-            }
-            unsigned int got_7[4];
-            {
-                uint32_t _uv4_271_0;
-                uint32_t _uv4_271_1;
-                uint32_t _uv4_271_2;
-                uint32_t _uv4_271_3;
-                asm volatile("ld.global.cg.v4.b32 {%0, %1, %2, %3}, [%4];"
-                    : "=r"(_uv4_271_0), "=r"(_uv4_271_1), "=r"(_uv4_271_2), "=r"(_uv4_271_3) : "l"((const void*)(zone_at + 896 + (0))) : "memory");
-                got_7[0 + 0] = _uv4_271_0;
-                got_7[0 + 1] = _uv4_271_1;
-                got_7[0 + 2] = _uv4_271_2;
-                got_7[0 + 3] = _uv4_271_3;
-            }
-            unsigned int landing_unit_4 = zone_unit + 128;
-            if (landing_unit_4 < zone_units) {
-                unsigned int landing_row_4 = (unsigned int)((unsigned long long)landing_unit_4 * (unsigned long long)zone_magic >> 32);
-                unsigned int landing_col_4 = landing_unit_4 - landing_row_4 * zone_block;
-                unsigned int landing_fix_4 = (unsigned int)(landing_col_4 >= zone_block);
-                landing_row_4 = landing_row_4 + landing_fix_4;
-                landing_col_4 = landing_col_4 - landing_fix_4 * zone_block;
-                unsigned int landing_batch_4 = (unsigned int)((unsigned long long)landing_row_4 * (unsigned long long)sequences_magic >> 32);
-                unsigned int landing_seq_4 = landing_row_4 - landing_batch_4 * sequences;
-                landing_batch_4 = landing_batch_4 + (unsigned int)(landing_seq_4 >= sequences);
-                unsigned int landing_dst_4 = (landing_row_4 + (landing_batch_4 * 7 + zone_sender) * sequences) * zone_block + landing_col_4;
-                {
-                    auto _gst_272 = out_words + (landing_dst_4 * 4);
-                    __builtin_assume(__isGlobal(_gst_272));
-                    reinterpret_cast<int4*>(_gst_272)[0] = reinterpret_cast<int4*>(got_4)[0];
-                }
-            }
-            unsigned int landing_unit_5 = zone_unit + 160;
-            if (landing_unit_5 < zone_units) {
-                unsigned int landing_row_5 = (unsigned int)((unsigned long long)landing_unit_5 * (unsigned long long)zone_magic >> 32);
-                unsigned int landing_col_5 = landing_unit_5 - landing_row_5 * zone_block;
-                unsigned int landing_fix_5 = (unsigned int)(landing_col_5 >= zone_block);
-                landing_row_5 = landing_row_5 + landing_fix_5;
-                landing_col_5 = landing_col_5 - landing_fix_5 * zone_block;
-                unsigned int landing_batch_5 = (unsigned int)((unsigned long long)landing_row_5 * (unsigned long long)sequences_magic >> 32);
-                unsigned int landing_seq_5 = landing_row_5 - landing_batch_5 * sequences;
-                landing_batch_5 = landing_batch_5 + (unsigned int)(landing_seq_5 >= sequences);
-                unsigned int landing_dst_5 = (landing_row_5 + (landing_batch_5 * 7 + zone_sender) * sequences) * zone_block + landing_col_5;
-                {
-                    auto _gst_273 = out_words + (landing_dst_5 * 4);
-                    __builtin_assume(__isGlobal(_gst_273));
-                    reinterpret_cast<int4*>(_gst_273)[0] = reinterpret_cast<int4*>(got_5)[0];
-                }
-            }
-            unsigned int landing_unit_6 = zone_unit + 192;
-            if (landing_unit_6 < zone_units) {
-                unsigned int landing_row_6 = (unsigned int)((unsigned long long)landing_unit_6 * (unsigned long long)zone_magic >> 32);
-                unsigned int landing_col_6 = landing_unit_6 - landing_row_6 * zone_block;
-                unsigned int landing_fix_6 = (unsigned int)(landing_col_6 >= zone_block);
-                landing_row_6 = landing_row_6 + landing_fix_6;
-                landing_col_6 = landing_col_6 - landing_fix_6 * zone_block;
-                unsigned int landing_batch_6 = (unsigned int)((unsigned long long)landing_row_6 * (unsigned long long)sequences_magic >> 32);
-                unsigned int landing_seq_6 = landing_row_6 - landing_batch_6 * sequences;
-                landing_batch_6 = landing_batch_6 + (unsigned int)(landing_seq_6 >= sequences);
-                unsigned int landing_dst_6 = (landing_row_6 + (landing_batch_6 * 7 + zone_sender) * sequences) * zone_block + landing_col_6;
-                {
-                    auto _gst_274 = out_words + (landing_dst_6 * 4);
-                    __builtin_assume(__isGlobal(_gst_274));
-                    reinterpret_cast<int4*>(_gst_274)[0] = reinterpret_cast<int4*>(got_6)[0];
-                }
-            }
-            unsigned int landing_unit_7 = zone_unit + 224;
-            if (landing_unit_7 < zone_units) {
-                unsigned int landing_row_7 = (unsigned int)((unsigned long long)landing_unit_7 * (unsigned long long)zone_magic >> 32);
-                unsigned int landing_col_7 = landing_unit_7 - landing_row_7 * zone_block;
-                unsigned int landing_fix_7 = (unsigned int)(landing_col_7 >= zone_block);
-                landing_row_7 = landing_row_7 + landing_fix_7;
-                landing_col_7 = landing_col_7 - landing_fix_7 * zone_block;
-                unsigned int landing_batch_7 = (unsigned int)((unsigned long long)landing_row_7 * (unsigned long long)sequences_magic >> 32);
-                unsigned int landing_seq_7 = landing_row_7 - landing_batch_7 * sequences;
-                landing_batch_7 = landing_batch_7 + (unsigned int)(landing_seq_7 >= sequences);
-                unsigned int landing_dst_7 = (landing_row_7 + (landing_batch_7 * 7 + zone_sender) * sequences) * zone_block + landing_col_7;
-                {
-                    auto _gst_275 = out_words + (landing_dst_7 * 4);
-                    __builtin_assume(__isGlobal(_gst_275));
-                    reinterpret_cast<int4*>(_gst_275)[0] = reinterpret_cast<int4*>(got_7)[0];
-                }
-            }
-            unsigned int got_8[4];
-            {
-                uint32_t _uv4_276_0;
-                uint32_t _uv4_276_1;
-                uint32_t _uv4_276_2;
-                uint32_t _uv4_276_3;
-                asm volatile("ld.global.cg.v4.b32 {%0, %1, %2, %3}, [%4];"
-                    : "=r"(_uv4_276_0), "=r"(_uv4_276_1), "=r"(_uv4_276_2), "=r"(_uv4_276_3) : "l"((const void*)(zone_at + 1024 + (0))) : "memory");
-                got_8[0 + 0] = _uv4_276_0;
-                got_8[0 + 1] = _uv4_276_1;
-                got_8[0 + 2] = _uv4_276_2;
-                got_8[0 + 3] = _uv4_276_3;
-            }
-            unsigned int got_9[4];
-            {
-                uint32_t _uv4_277_0;
-                uint32_t _uv4_277_1;
-                uint32_t _uv4_277_2;
-                uint32_t _uv4_277_3;
-                asm volatile("ld.global.cg.v4.b32 {%0, %1, %2, %3}, [%4];"
-                    : "=r"(_uv4_277_0), "=r"(_uv4_277_1), "=r"(_uv4_277_2), "=r"(_uv4_277_3) : "l"((const void*)(zone_at + 1152 + (0))) : "memory");
-                got_9[0 + 0] = _uv4_277_0;
-                got_9[0 + 1] = _uv4_277_1;
-                got_9[0 + 2] = _uv4_277_2;
-                got_9[0 + 3] = _uv4_277_3;
-            }
-            unsigned int got_10[4];
-            {
-                uint32_t _uv4_278_0;
-                uint32_t _uv4_278_1;
-                uint32_t _uv4_278_2;
-                uint32_t _uv4_278_3;
-                asm volatile("ld.global.cg.v4.b32 {%0, %1, %2, %3}, [%4];"
-                    : "=r"(_uv4_278_0), "=r"(_uv4_278_1), "=r"(_uv4_278_2), "=r"(_uv4_278_3) : "l"((const void*)(zone_at + 1280 + (0))) : "memory");
-                got_10[0 + 0] = _uv4_278_0;
-                got_10[0 + 1] = _uv4_278_1;
-                got_10[0 + 2] = _uv4_278_2;
-                got_10[0 + 3] = _uv4_278_3;
-            }
-            unsigned int got_11[4];
-            {
-                uint32_t _uv4_279_0;
-                uint32_t _uv4_279_1;
-                uint32_t _uv4_279_2;
-                uint32_t _uv4_279_3;
-                asm volatile("ld.global.cg.v4.b32 {%0, %1, %2, %3}, [%4];"
-                    : "=r"(_uv4_279_0), "=r"(_uv4_279_1), "=r"(_uv4_279_2), "=r"(_uv4_279_3) : "l"((const void*)(zone_at + 1408 + (0))) : "memory");
-                got_11[0 + 0] = _uv4_279_0;
-                got_11[0 + 1] = _uv4_279_1;
-                got_11[0 + 2] = _uv4_279_2;
-                got_11[0 + 3] = _uv4_279_3;
-            }
-            unsigned int landing_unit_8 = zone_unit + 256;
-            if (landing_unit_8 < zone_units) {
-                unsigned int landing_row_8 = (unsigned int)((unsigned long long)landing_unit_8 * (unsigned long long)zone_magic >> 32);
-                unsigned int landing_col_8 = landing_unit_8 - landing_row_8 * zone_block;
-                unsigned int landing_fix_8 = (unsigned int)(landing_col_8 >= zone_block);
-                landing_row_8 = landing_row_8 + landing_fix_8;
-                landing_col_8 = landing_col_8 - landing_fix_8 * zone_block;
-                unsigned int landing_batch_8 = (unsigned int)((unsigned long long)landing_row_8 * (unsigned long long)sequences_magic >> 32);
-                unsigned int landing_seq_8 = landing_row_8 - landing_batch_8 * sequences;
-                landing_batch_8 = landing_batch_8 + (unsigned int)(landing_seq_8 >= sequences);
-                unsigned int landing_dst_8 = (landing_row_8 + (landing_batch_8 * 7 + zone_sender) * sequences) * zone_block + landing_col_8;
-                {
-                    auto _gst_280 = out_words + (landing_dst_8 * 4);
-                    __builtin_assume(__isGlobal(_gst_280));
-                    reinterpret_cast<int4*>(_gst_280)[0] = reinterpret_cast<int4*>(got_8)[0];
-                }
-            }
-            unsigned int landing_unit_9 = zone_unit + 288;
-            if (landing_unit_9 < zone_units) {
-                unsigned int landing_row_9 = (unsigned int)((unsigned long long)landing_unit_9 * (unsigned long long)zone_magic >> 32);
-                unsigned int landing_col_9 = landing_unit_9 - landing_row_9 * zone_block;
-                unsigned int landing_fix_9 = (unsigned int)(landing_col_9 >= zone_block);
-                landing_row_9 = landing_row_9 + landing_fix_9;
-                landing_col_9 = landing_col_9 - landing_fix_9 * zone_block;
-                unsigned int landing_batch_9 = (unsigned int)((unsigned long long)landing_row_9 * (unsigned long long)sequences_magic >> 32);
-                unsigned int landing_seq_9 = landing_row_9 - landing_batch_9 * sequences;
-                landing_batch_9 = landing_batch_9 + (unsigned int)(landing_seq_9 >= sequences);
-                unsigned int landing_dst_9 = (landing_row_9 + (landing_batch_9 * 7 + zone_sender) * sequences) * zone_block + landing_col_9;
-                {
-                    auto _gst_281 = out_words + (landing_dst_9 * 4);
-                    __builtin_assume(__isGlobal(_gst_281));
-                    reinterpret_cast<int4*>(_gst_281)[0] = reinterpret_cast<int4*>(got_9)[0];
-                }
-            }
-            unsigned int landing_unit_10 = zone_unit + 320;
-            if (landing_unit_10 < zone_units) {
-                unsigned int landing_row_10 = (unsigned int)((unsigned long long)landing_unit_10 * (unsigned long long)zone_magic >> 32);
-                unsigned int landing_col_10 = landing_unit_10 - landing_row_10 * zone_block;
-                unsigned int landing_fix_10 = (unsigned int)(landing_col_10 >= zone_block);
-                landing_row_10 = landing_row_10 + landing_fix_10;
-                landing_col_10 = landing_col_10 - landing_fix_10 * zone_block;
-                unsigned int landing_batch_10 = (unsigned int)((unsigned long long)landing_row_10 * (unsigned long long)sequences_magic >> 32);
-                unsigned int landing_seq_10 = landing_row_10 - landing_batch_10 * sequences;
-                landing_batch_10 = landing_batch_10 + (unsigned int)(landing_seq_10 >= sequences);
-                unsigned int landing_dst_10 = (landing_row_10 + (landing_batch_10 * 7 + zone_sender) * sequences) * zone_block + landing_col_10;
-                {
-                    auto _gst_282 = out_words + (landing_dst_10 * 4);
-                    __builtin_assume(__isGlobal(_gst_282));
-                    reinterpret_cast<int4*>(_gst_282)[0] = reinterpret_cast<int4*>(got_10)[0];
-                }
-            }
-            unsigned int landing_unit_11 = zone_unit + 352;
-            if (landing_unit_11 < zone_units) {
-                unsigned int landing_row_11 = (unsigned int)((unsigned long long)landing_unit_11 * (unsigned long long)zone_magic >> 32);
-                unsigned int landing_col_11 = landing_unit_11 - landing_row_11 * zone_block;
-                unsigned int landing_fix_11 = (unsigned int)(landing_col_11 >= zone_block);
-                landing_row_11 = landing_row_11 + landing_fix_11;
-                landing_col_11 = landing_col_11 - landing_fix_11 * zone_block;
-                unsigned int landing_batch_11 = (unsigned int)((unsigned long long)landing_row_11 * (unsigned long long)sequences_magic >> 32);
-                unsigned int landing_seq_11 = landing_row_11 - landing_batch_11 * sequences;
-                landing_batch_11 = landing_batch_11 + (unsigned int)(landing_seq_11 >= sequences);
-                unsigned int landing_dst_11 = (landing_row_11 + (landing_batch_11 * 7 + zone_sender) * sequences) * zone_block + landing_col_11;
-                {
-                    auto _gst_283 = out_words + (landing_dst_11 * 4);
-                    __builtin_assume(__isGlobal(_gst_283));
-                    reinterpret_cast<int4*>(_gst_283)[0] = reinterpret_cast<int4*>(got_11)[0];
-                }
-            }
-            unsigned int got_12[4];
-            {
-                uint32_t _uv4_284_0;
-                uint32_t _uv4_284_1;
-                uint32_t _uv4_284_2;
-                uint32_t _uv4_284_3;
-                asm volatile("ld.global.cg.v4.b32 {%0, %1, %2, %3}, [%4];"
-                    : "=r"(_uv4_284_0), "=r"(_uv4_284_1), "=r"(_uv4_284_2), "=r"(_uv4_284_3) : "l"((const void*)(zone_at + 1536 + (0))) : "memory");
-                got_12[0 + 0] = _uv4_284_0;
-                got_12[0 + 1] = _uv4_284_1;
-                got_12[0 + 2] = _uv4_284_2;
-                got_12[0 + 3] = _uv4_284_3;
-            }
-            unsigned int got_13[4];
-            {
-                uint32_t _uv4_285_0;
-                uint32_t _uv4_285_1;
-                uint32_t _uv4_285_2;
-                uint32_t _uv4_285_3;
-                asm volatile("ld.global.cg.v4.b32 {%0, %1, %2, %3}, [%4];"
-                    : "=r"(_uv4_285_0), "=r"(_uv4_285_1), "=r"(_uv4_285_2), "=r"(_uv4_285_3) : "l"((const void*)(zone_at + 1664 + (0))) : "memory");
-                got_13[0 + 0] = _uv4_285_0;
-                got_13[0 + 1] = _uv4_285_1;
-                got_13[0 + 2] = _uv4_285_2;
-                got_13[0 + 3] = _uv4_285_3;
-            }
-            unsigned int got_14[4];
-            {
-                uint32_t _uv4_286_0;
-                uint32_t _uv4_286_1;
-                uint32_t _uv4_286_2;
-                uint32_t _uv4_286_3;
-                asm volatile("ld.global.cg.v4.b32 {%0, %1, %2, %3}, [%4];"
-                    : "=r"(_uv4_286_0), "=r"(_uv4_286_1), "=r"(_uv4_286_2), "=r"(_uv4_286_3) : "l"((const void*)(zone_at + 1792 + (0))) : "memory");
-                got_14[0 + 0] = _uv4_286_0;
-                got_14[0 + 1] = _uv4_286_1;
-                got_14[0 + 2] = _uv4_286_2;
-                got_14[0 + 3] = _uv4_286_3;
-            }
-            unsigned int landing_unit_12 = zone_unit + 384;
-            if (landing_unit_12 < zone_units) {
-                unsigned int landing_row_12 = (unsigned int)((unsigned long long)landing_unit_12 * (unsigned long long)zone_magic >> 32);
-                unsigned int landing_col_12 = landing_unit_12 - landing_row_12 * zone_block;
-                unsigned int landing_fix_12 = (unsigned int)(landing_col_12 >= zone_block);
-                landing_row_12 = landing_row_12 + landing_fix_12;
-                landing_col_12 = landing_col_12 - landing_fix_12 * zone_block;
-                unsigned int landing_batch_12 = (unsigned int)((unsigned long long)landing_row_12 * (unsigned long long)sequences_magic >> 32);
-                unsigned int landing_seq_12 = landing_row_12 - landing_batch_12 * sequences;
-                landing_batch_12 = landing_batch_12 + (unsigned int)(landing_seq_12 >= sequences);
-                unsigned int landing_dst_12 = (landing_row_12 + (landing_batch_12 * 7 + zone_sender) * sequences) * zone_block + landing_col_12;
-                {
-                    auto _gst_287 = out_words + (landing_dst_12 * 4);
-                    __builtin_assume(__isGlobal(_gst_287));
-                    reinterpret_cast<int4*>(_gst_287)[0] = reinterpret_cast<int4*>(got_12)[0];
-                }
-            }
-            unsigned int landing_unit_13 = zone_unit + 416;
-            if (landing_unit_13 < zone_units) {
-                unsigned int landing_row_13 = (unsigned int)((unsigned long long)landing_unit_13 * (unsigned long long)zone_magic >> 32);
-                unsigned int landing_col_13 = landing_unit_13 - landing_row_13 * zone_block;
-                unsigned int landing_fix_13 = (unsigned int)(landing_col_13 >= zone_block);
-                landing_row_13 = landing_row_13 + landing_fix_13;
-                landing_col_13 = landing_col_13 - landing_fix_13 * zone_block;
-                unsigned int landing_batch_13 = (unsigned int)((unsigned long long)landing_row_13 * (unsigned long long)sequences_magic >> 32);
-                unsigned int landing_seq_13 = landing_row_13 - landing_batch_13 * sequences;
-                landing_batch_13 = landing_batch_13 + (unsigned int)(landing_seq_13 >= sequences);
-                unsigned int landing_dst_13 = (landing_row_13 + (landing_batch_13 * 7 + zone_sender) * sequences) * zone_block + landing_col_13;
-                {
-                    auto _gst_288 = out_words + (landing_dst_13 * 4);
-                    __builtin_assume(__isGlobal(_gst_288));
-                    reinterpret_cast<int4*>(_gst_288)[0] = reinterpret_cast<int4*>(got_13)[0];
-                }
-            }
-            unsigned int landing_unit_14 = zone_unit + 448;
-            if (landing_unit_14 < zone_units) {
-                unsigned int landing_row_14 = (unsigned int)((unsigned long long)landing_unit_14 * (unsigned long long)zone_magic >> 32);
-                unsigned int landing_col_14 = landing_unit_14 - landing_row_14 * zone_block;
-                unsigned int landing_fix_14 = (unsigned int)(landing_col_14 >= zone_block);
-                landing_row_14 = landing_row_14 + landing_fix_14;
-                landing_col_14 = landing_col_14 - landing_fix_14 * zone_block;
-                unsigned int landing_batch_14 = (unsigned int)((unsigned long long)landing_row_14 * (unsigned long long)sequences_magic >> 32);
-                unsigned int landing_seq_14 = landing_row_14 - landing_batch_14 * sequences;
-                landing_batch_14 = landing_batch_14 + (unsigned int)(landing_seq_14 >= sequences);
-                unsigned int landing_dst_14 = (landing_row_14 + (landing_batch_14 * 7 + zone_sender) * sequences) * zone_block + landing_col_14;
-                {
-                    auto _gst_289 = out_words + (landing_dst_14 * 4);
-                    __builtin_assume(__isGlobal(_gst_289));
-                    reinterpret_cast<int4*>(_gst_289)[0] = reinterpret_cast<int4*>(got_14)[0];
+                    auto _gst_263 = out_words + (landing_dst_1 * 4);
+                    __builtin_assume(__isGlobal(_gst_263));
+                    reinterpret_cast<int4*>(_gst_263)[0] = reinterpret_cast<int4*>(got_1)[0];
                 }
             }
         }
