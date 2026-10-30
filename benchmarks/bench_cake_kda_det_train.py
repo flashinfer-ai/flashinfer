@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 Benchmark of the Cake packed KDA chunked training kernels
-(``flashinfer.experimental.cake_kda_train``) on three boundaries of a
+(``flashinfer.experimental.cake_kda_det_train``) on three boundaries of a
 training step, against flash-linear-attention's ``chunk_kda`` when it is
 installed:
 
@@ -32,8 +32,8 @@ of a boundary's kernels, in milliseconds, with tokens per second beside it.
 
 Example::
 
-    python benchmarks/bench_cake_kda_train.py --seqlen 16384 65536 --docs 3 --heads 4 64
-    python benchmarks/bench_cake_kda_train.py --seqlen 261393 --docs 4 --heads 4 --json out.json
+    python benchmarks/bench_cake_kda_det_train.py --seqlen 16384 65536 --docs 3 --heads 4 64
+    python benchmarks/bench_cake_kda_det_train.py --seqlen 261393 --docs 4 --heads 4 --json out.json
 """
 
 from __future__ import annotations
@@ -50,9 +50,9 @@ from torch.utils.checkpoint import checkpoint
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from flashinfer.experimental.cake_kda_train import cake_backend, cake_jit  # noqa: E402
+from flashinfer.experimental.cake_kda_det_train import cake_backend, cake_jit  # noqa: E402
 from flashinfer.testing import bench_gpu_time  # noqa: E402
-from tests.test_helpers.cake_kda_train_reference import make_inputs  # noqa: E402
+from tests.test_helpers.cake_kda_det_train_reference import make_inputs  # noqa: E402
 
 BOUNDARIES = ("fwd", "bwd", "ckpt")
 
@@ -81,23 +81,23 @@ def _time(fn: Callable[[], object]) -> float:
 
 
 def cake_boundaries(
-    inputs: dict, ws: cake_backend.KdaWorkspace
+    inputs: dict, ws: cake_backend.KdaDetWorkspace
 ) -> dict[str, Callable[[], None]]:
     q, k, v, g, beta, cu, dout = (
         inputs[n] for n in ("q", "k", "v", "g", "beta", "cu_seqlens", "dout")
     )
 
     def fwd() -> None:
-        cake_backend.chunk_kda_fwd(
+        cake_backend.chunk_kda_det_fwd(
             q, k, v, g, beta, cu, save_for_backward=True, workspace=ws
         )
 
-    _, saved = cake_backend.chunk_kda_fwd(
+    _, saved = cake_backend.chunk_kda_det_fwd(
         q, k, v, g, beta, cu, save_for_backward=True, workspace=ws
     )
 
     def bwd() -> None:
-        cake_backend.chunk_kda_bwd(
+        cake_backend.chunk_kda_det_bwd(
             q, k, v, g, beta, cu, dout, saved=saved, workspace=ws
         )
 
@@ -108,7 +108,7 @@ def cake_boundaries(
 
     def ckpt() -> None:
         o = checkpoint(
-            lambda *a: cake_backend.chunk_kda(*a, cu, workspace=ws),
+            lambda *a: cake_backend.chunk_kda_det(*a, cu, workspace=ws),
             *leaves,
             use_reentrant=False,
         )
@@ -171,7 +171,7 @@ def run_row(
 ) -> dict:
     lengths = split_docs(seqlen, docs)
     inputs = make_inputs(lengths, heads, device)
-    ws = cake_backend.KdaWorkspace.for_problem(seqlen, docs, heads, device)
+    ws = cake_backend.KdaDetWorkspace.for_problem(seqlen, docs, heads, device)
     ws.load()
     row = {
         "seqlen": seqlen,

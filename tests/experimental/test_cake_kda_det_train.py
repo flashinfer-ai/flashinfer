@@ -25,7 +25,7 @@ from pathlib import Path
 import pytest
 import torch
 
-from tests.test_helpers.cake_kda_train_reference import (
+from tests.test_helpers.cake_kda_det_train_reference import (
     GRAD_NAMES,
     elementwise_gate,
     error_metrics,
@@ -36,12 +36,12 @@ from tests.test_helpers.cake_package import cake_package
 
 # The backend suite names its package once, through the shared alias helper, and imports nothing else from
 # flashinfer: a build that vendors the package under another import path runs it unchanged after pointing the
-# ``PACKAGES`` entry at its own package.  The public entry points of ``flashinfer.kda_train`` are covered by
-# ``test_cake_kda_train_api.py``.
-cake_backend = cake_package("cake_kda_train", "cake_backend")
-cake_build = cake_package("cake_kda_train", "cake_build")
-cake_jit = cake_package("cake_kda_train", "cake_jit")
-cake_kcp_jit = cake_package("cake_kda_train", "cake_kcp_jit")
+# ``PACKAGES`` entry at its own package.  The public entry points of ``flashinfer.cake_kda_det_train`` are covered
+# by ``test_cake_kda_det_train_api.py``, the previous names by ``test_cake_kda_det_train_names.py``.
+cake_backend = cake_package("cake_kda_det_train", "cake_backend")
+cake_build = cake_package("cake_kda_det_train", "cake_build")
+cake_jit = cake_package("cake_kda_det_train", "cake_jit")
+cake_kcp_jit = cake_package("cake_kda_det_train", "cake_kcp_jit")
 PACKAGE_DIR = Path(cake_jit.__file__).resolve().parent
 
 ARCHES = tuple(cake_jit.ARCHES)
@@ -464,7 +464,7 @@ def test_registry_records_are_well_formed() -> None:
         assert [a for a in ARCHES if a in record["arches"]] == list(record["arches"])
         assert record["ffi_entry"] == "run", name
         assert record["kernel_symbol"] == f"kernel_{record['library']}", name
-        assert re.fullmatch(r"cake_kda_train_[0-9a-f]{20}", record["library"]), name
+        assert re.fullmatch(r"cake_kda_det_train_[0-9a-f]{20}", record["library"]), name
         launch = record["launch"]
         assert set(launch) >= {
             "block",
@@ -3090,7 +3090,7 @@ def test_tail_stages_bind_only_range_safe_operands() -> None:
 
 def test_manifest_is_well_formed(manifest: dict) -> None:
     assert manifest["schema"] == "cake-build/1"
-    assert manifest["package"] == "flashinfer.experimental.cake_kda_train"
+    assert manifest["package"] == "flashinfer.experimental.cake_kda_det_train"
     arch_flags = manifest["arch_flags"]
     assert set(ARCHES) <= set(arch_flags)
     libraries = manifest["libraries"]
