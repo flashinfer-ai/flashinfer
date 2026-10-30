@@ -281,14 +281,10 @@ def get_device_arch():
     return f"{major * 10 + minor}{suffix}"
 
 
-def is_rubin_arch() -> bool:
-    # Rubin (sm_107, cc 10.7) ships its own deep-gemm cubins in a separate
-    # artifact directory; every other arch uses the default DEEPGEMM path.
-    return get_device_arch() == "107a"
-
-
 def get_deepgemm_artifact_path() -> str:
-    return ArtifactPath.DEEPGEMM_RUBIN if is_rubin_arch() else ArtifactPath.DEEPGEMM
+    # A single deep-gemm publish now carries the cubins for every supported
+    # arch, Rubin (sm_107) included, so there is no per-arch artifact path.
+    return ArtifactPath.DEEPGEMM
 
 
 def hash_to_hex(s: str) -> str:
@@ -809,9 +805,6 @@ pytypes_to_ctypes = {
 }
 
 
-RUNTIME_CACHE = {}
-
-
 class SM100FP8GemmRuntime:
     def __init__(self, path: str, symbol: str) -> None:
         self.path = path
@@ -952,17 +945,27 @@ static void __instantiate_kernel() {{
         return cbd.cuLaunchKernelEx(config, kernel, (arg_values, arg_types), 0)
 
 
+RUNTIME_CACHE: Dict[str, SM100FP8GemmRuntime] = {}
+
+
+def _load_runtime(cubin_name: str) -> SM100FP8GemmRuntime:
+    # RUNTIME_CACHE is keyed by the KERNEL_MAP name (no ".cubin" suffix), so a
+    # cubin is fetched and its module loaded once per process.
+    if cubin_name in RUNTIME_CACHE:
+        return RUNTIME_CACHE[cubin_name]
+    symbol, sha256 = KERNEL_MAP[cubin_name]
+    file_name = cubin_name + ".cubin"
+    artifact_path = get_deepgemm_artifact_path()
+    get_artifact(artifact_path + "/" + file_name, sha256)
+    path = FLASHINFER_CUBIN_DIR / artifact_path / file_name
+    assert path.exists()
+    RUNTIME_CACHE[cubin_name] = SM100FP8GemmRuntime(str(path), symbol)
+    return RUNTIME_CACHE[cubin_name]
+
+
 def load_all():
     for cubin_name in KERNEL_MAP:
-        if cubin_name in RUNTIME_CACHE:
-            continue
-        symbol, sha256 = KERNEL_MAP[cubin_name]
-        cubin_name = cubin_name + ".cubin"
-        artifact_path = get_deepgemm_artifact_path()
-        get_artifact(artifact_path + "/" + cubin_name, sha256)
-        path = FLASHINFER_CUBIN_DIR / artifact_path / cubin_name
-        assert path.exists()
-        RUNTIME_CACHE[cubin_name] = SM100FP8GemmRuntime(str(path), symbol)
+        _load_runtime(cubin_name)
 
 
 def load(name: str, code: str) -> SM100FP8GemmRuntime:
@@ -970,16 +973,7 @@ def load(name: str, code: str) -> SM100FP8GemmRuntime:
     cubin_name = f"kernel.{name}.{hash_to_hex(signature)}"
     if cubin_name not in KERNEL_MAP:
         raise ValueError(f"cubin not registered: {cubin_name}")
-    if cubin_name in RUNTIME_CACHE:
-        return RUNTIME_CACHE[cubin_name]
-    symbol, sha256 = KERNEL_MAP[cubin_name]
-    cubin_name = cubin_name + ".cubin"
-    artifact_path = get_deepgemm_artifact_path()
-    get_artifact(artifact_path + "/" + cubin_name, sha256)
-    path = FLASHINFER_CUBIN_DIR / artifact_path / cubin_name
-    assert path.exists()
-    RUNTIME_CACHE[cubin_name] = SM100FP8GemmRuntime(str(path), symbol)
-    return RUNTIME_CACHE[cubin_name]
+    return _load_runtime(cubin_name)
 
 
 def m_grouped_fp8_gemm_nt_contiguous_static_kwargs_gen(
@@ -1613,23 +1607,15 @@ def m_grouped_fp8_gemm_nt_masked(
 
 class KernelMap:
     # Hash for kernel_map.json, updated when deepgemm cubins are republished.
-    # The Rubin (sm_107) cubins ship a separate kernel_map.json, so it has its
-    # own hash selected by arch in init_indices().
-    KERNEL_MAP_HASH = "f161e031826adb8c4f0d31ddbd2ed77e4909e4e43cdfc9728918162a62fcccfb"
-    KERNEL_MAP_HASH_RUBIN = (
-        "f8bf2b1bc943170559a9f18cfdcec2c30d84ba872d13f66dd52b9be3f3a36e27"
-    )
+    KERNEL_MAP_HASH = "f8bf2b1bc943170559a9f18cfdcec2c30d84ba872d13f66dd52b9be3f3a36e27"
 
     def __init__(self):
         self.indice = None
 
     def init_indices(self):
         artifact_path = get_deepgemm_artifact_path()
-        map_hash = (
-            self.KERNEL_MAP_HASH_RUBIN if is_rubin_arch() else self.KERNEL_MAP_HASH
-        )
         indice_path = artifact_path + "/" + "kernel_map.json"
-        assert get_artifact(indice_path, map_hash), (
+        assert get_artifact(indice_path, self.KERNEL_MAP_HASH), (
             "cubin kernel map file not found, nor downloaded with matched sha256"
         )
         path = FLASHINFER_CUBIN_DIR / indice_path

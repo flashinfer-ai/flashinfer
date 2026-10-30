@@ -16,7 +16,8 @@ from .attn_scores import (
     fp8_paged_mqa_logits,
     fp4_paged_mqa_logits,
     compute_paged_mqa_logits_schedule,
-    padded_context_len,
+    min_block_table_width,
+    padded_seq_len,
     precompile_paged_mqa_logits,
 )
 
@@ -24,6 +25,7 @@ __all__ = [
     "fp8_paged_mqa_logits",
     "fp4_paged_mqa_logits",
     "compute_paged_mqa_logits_schedule",
-    "padded_context_len",
+    "min_block_table_width",
+    "padded_seq_len",
     "precompile_paged_mqa_logits",
 ]

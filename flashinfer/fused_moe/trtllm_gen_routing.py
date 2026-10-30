@@ -33,7 +33,7 @@ from flashinfer.utils import (
 
 # The trtllm_gen_routing module is compiled for SM 10.x and 12.x only (same
 # gate as the fused_moe_trtllm_sm100 module the routing kernels ship in).
-_TRTLLM_GEN_ROUTING_SUPPORTED_CC = [100, 103, 120, 121]
+_TRTLLM_GEN_ROUTING_SUPPORTED_CC = [100, 103, 107, 120, 121]
 
 
 def _max_num_ctas_in_batch_dim(
@@ -71,6 +71,8 @@ class TrtllmGenRoutingResult(NamedTuple):
     remaining fields are the permutation/bookkeeping tensors the fused MoE
     kernels consume; entries beyond the actual padded count (see
     ``total_num_padded_tokens``) are undefined.
+    Within that count, unused ``permuted_idx_to_token_idx`` entries are -1
+    so downstream TMA gathers do not load activations for padded rows.
 
     In from-logits mode the routing kernels never emit expert ids directly —
     expert identity lives in the permuted layout. ``topk_ids`` is therefore

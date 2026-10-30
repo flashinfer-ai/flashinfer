@@ -29,6 +29,8 @@ import flashinfer.comm as comm
 from flashinfer.comm.pcie_ipc_policy import IpcLaunchConfig, IpcVariant
 from flashinfer.comm.pcie_ipc_topology import PCIE_IPC_PROFILES
 
+pytestmark = pytest.mark.node_exclusive
+
 # (world_size, hidden, batch, blocks, threads, variant)
 #
 # Between them these cases select every kernel the header can dispatch to.
@@ -829,7 +831,10 @@ def _tune_worker(world_size: int, rank: int, port: int, tmpdir: str) -> None:
             tune_batches=_TUNE_BATCHES,
         )
         before = {b: ws.supports(_tune_input(b, device)) for b in _TUNE_BATCHES}
-        ws.tune([_TUNE_HIDDEN], cache=path, warmup=2, repeat=5)
+        # Default sample counts, not the reduced ones: tune() refuses to write
+        # the file below them, and everything after this line reads it back.
+        # Affordable because these buckets are 12-48 KiB.
+        ws.tune([_TUNE_HIDDEN], cache=path)
 
         resolved = {}
         for batch in _TUNE_BATCHES:
@@ -1064,6 +1069,76 @@ def test_pcie_ipc_tune_gate_excludes_wrong_candidates(
     )
 
 
+def _small_max_blocks_tune_worker(
+    world_size: int, rank: int, port: int, tmpdir: str, max_blocks: int
+) -> None:
+    """A workspace with fewer blocks than the copy-engine depths still tunes."""
+    ws = None
+    group = None
+    try:
+        _init_process_group(world_size, rank, port)
+        group = dist.group.WORLD
+        device = torch.device(f"cuda:{rank}")
+        ws = comm.PcieIpcAllReduceWorkspace(
+            group=group,
+            max_numel=_TUNE_HIDDEN * 2,
+            dtype=torch.bfloat16,
+            max_blocks=max_blocks,
+            profile="rootcplx",
+            tune_batches=(1, 2),
+        )
+        launched = []
+        original = ws._launch
+
+        def recording(inp, out, config, *args, **kwargs):
+            launched.append(config)
+            return original(inp, out, config, *args, **kwargs)
+
+        ws._launch = recording
+        try:
+            ws.tune([_TUNE_HIDDEN], cache=_tune_cache_path(tmpdir), warmup=2, repeat=5)
+        finally:
+            ws._launch = original
+        # Not vacuous: copy-engine candidates are still searched.
+        copy_engine = (IpcVariant.COPY_ENGINE_RING, IpcVariant.COPY_ENGINE_ISLAND)
+        assert any(c.variant in copy_engine for c in launched), set(launched)
+        assert all(c.blocks <= max_blocks for c in launched), {
+            c for c in launched if c.blocks > max_blocks
+        }
+        for batch in (1, 2):
+            inp = _tune_input(batch, device)
+            config = ws.tuned_launch_config(inp)
+            assert config is not None, batch
+            ref = inp.clone()
+            dist.all_reduce(ref, group=group)
+            wrong = torch.tensor(
+                [int((ws.all_reduce(inp) != ref).sum().item())], device=device
+            )
+            dist.all_reduce(wrong, op=dist.ReduceOp.MAX, group=group)
+            assert int(wrong.item()) == 0, (batch, config)
+        dist.barrier(group=group)
+    finally:
+        if ws is not None:
+            ws.destroy()
+        if group is not None:
+            dist.destroy_process_group(group)
+
+
+# (8, 1) drops ring and island depths 2 and 4; (4, 3) drops depth 4 but keeps 2.
+@pytest.mark.parametrize("world_size,max_blocks", [(4, 3), (8, 1)])
+def test_pcie_ipc_tune_respects_a_small_max_blocks(
+    world_size: int, max_blocks: int, tmp_path
+) -> None:
+    if world_size > torch.cuda.device_count():
+        pytest.skip("not enough GPUs")
+    multi_process_parallel(
+        world_size,
+        _small_max_blocks_tune_worker,
+        (str(tmp_path), max_blocks),
+        timeout_s=600,
+    )
+
+
 def _untuned_warning_worker(world_size: int, rank: int, port: int, tmpdir: str) -> None:
     """The untuned warning fires once, and only when the machine is untuned.
 
@@ -1128,7 +1203,7 @@ def _untuned_warning_worker(world_size: int, rank: int, port: int, tmpdir: str) 
         assert not during, during
 
         # And silent afterwards, including on a shape tuning did not cover.
-        ws.tune([_TUNE_HIDDEN], cache=path, warmup=2, repeat=5)
+        ws.tune([_TUNE_HIDDEN], cache=path)
         after = _untuned_warnings(lambda: ws.all_reduce(_tune_input(4, device)))
         assert not after, after
 

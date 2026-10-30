@@ -185,7 +185,7 @@ inline size_t runFp4GemmImpl(void* D, void const* A, void const* B, void const* 
   }
 
   // Enable PDL — GDC flag (CUTLASS_ENABLE_GDC_FOR_SM100) is set at compile time
-  auto runStatus = gemm.run(args, workspace, stream, nullptr, /*enablePDL=*/true);
+  auto runStatus = gemm.run(stream, nullptr, /*enablePDL=*/true);
   if (runStatus != cutlass::Status::kSuccess) {
     throw std::runtime_error(std::string("[FP4 gemm Runner") + scheduler_name + "] " +
                              "Failed to run cutlass FP4 gemm on sm120/sm121. Error: " +

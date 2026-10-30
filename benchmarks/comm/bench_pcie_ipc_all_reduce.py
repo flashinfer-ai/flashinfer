@@ -166,6 +166,10 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--hidden", type=int, default=None)
     p.add_argument("--batches", type=str, default=None)
     p.add_argument("--dtype", choices=["bfloat16", "float16"], default="bfloat16")
+    # Lower these to look around at prefill sizes, where the default sample
+    # counts make a sweep drag; tune() then refuses to persist the result.
+    p.add_argument("--tune-warmup", type=int, default=None)
+    p.add_argument("--tune-repeat", type=int, default=None)
     p.add_argument("--json", type=str, default=None)
     p.add_argument(
         "--tune",
@@ -589,6 +593,11 @@ def main() -> None:
         group=group,
         max_numel=hidden * max(batches),
         dtype=dtype,
+        # Tune the batches this run actually sweeps. The default TUNE_BATCHES
+        # stops at 128; the bucket mapper floors, so without this a prefill
+        # sweep would replay a config measured at 128 rows on a payload three
+        # orders of magnitude larger and report it as "tuned".
+        tune_batches=batches,
         tune_cache=args.tune_cache,
     )
     # Recorded before tuning overwrites it: under --tune this shows what the
@@ -604,7 +613,12 @@ def main() -> None:
             print(f"tuning {len(batches)} batch buckets at hidden {hidden} ...")
         torch.cuda.synchronize()
         workspace.rebind_stream()
-        workspace.tune([hidden], dtype=dtype)
+        tune_kwargs = {}
+        if args.tune_warmup is not None:
+            tune_kwargs["warmup"] = args.tune_warmup
+        if args.tune_repeat is not None:
+            tune_kwargs["repeat"] = args.tune_repeat
+        workspace.tune([hidden], dtype=dtype, **tune_kwargs)
     if rank == 0:
         print(f"world_size={world_size} hidden={hidden} dtype={args.dtype}")
         print(f"profile={workspace.profile} ({workspace.profile_reason})")

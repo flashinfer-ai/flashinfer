@@ -29,16 +29,44 @@ _GDN_FUSED_DECODE_KERNEL_DIR = (
 )
 
 
-def gen_gdn_fused_decode_module() -> JitSpec:
-    """JIT spec for the persistent SM120 fused-GDN-decode CUDA kernel.
+def gen_gdn_fused_decode_module(
+    hidden: int,
+    n_ba: int,
+    qkv_dim: int,
+    h_q: int,
+    hv: int,
+    d: int,
+    conv_width: int,
+    conv_state_len: int,
+) -> JitSpec:
+    """JIT spec for one registered fused-GDN-decode layer geometry (SM120).
 
     Single translation unit, compiled with the ``sm120a`` flags (hence the
     CUDA >= 12.8 requirement the callers gate on).  The source lives next to
     its Python impl module under ``gdn_kernels/experimental/kernel/`` rather
     than in ``csrc/``: it is only ever built for this one op.
+
+    The layer geometry is a compile-time parameter of the translation unit
+    (the block shape and warp->row mapping do not depend on it, only the
+    sizes do), so it is passed as ``-D`` defines and folded into the module
+    name: one module per geometry, and a serving process runs one model,
+    hence one module.  The kernel stays B-dynamic -- batch size, the query
+    scale and the conv-state strides remain runtime parameters.
     """
+    geometry = {
+        "HIDDEN": hidden,
+        "N_BA": n_ba,
+        "QKV_DIM": qkv_dim,
+        "H_Q": h_q,
+        "HV": hv,
+        "D": d,
+        "CONV_WIDTH": conv_width,
+        "CONV_STATE_LEN": conv_state_len,
+    }
+    suffix = "_".join(f"{key.lower()}{value}" for key, value in geometry.items())
     return gen_jit_spec(
-        "gdn_fused_decode_sm120",
+        f"gdn_fused_decode_sm120_{suffix}",
         [_GDN_FUSED_DECODE_KERNEL_DIR / "gdn_fused_decode_sm120.cu"],
-        extra_cuda_cflags=sm120a_nvcc_flags,
+        extra_cuda_cflags=sm120a_nvcc_flags
+        + [f"-DFI_GDN_{key}={value}" for key, value in geometry.items()],
     )

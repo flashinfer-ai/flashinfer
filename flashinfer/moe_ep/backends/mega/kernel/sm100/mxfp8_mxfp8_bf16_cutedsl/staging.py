@@ -15,11 +15,12 @@ def _use_fused_stage() -> bool:
 
 
 def _mxfp8_data_dtype(kind: str) -> torch.dtype:
+    """Resolve activation dtype, using E4M3 for mixed MXFP4/MXFP8 weights."""
     # Backend talks only to the cutedsl_megamoe shim (never src/ directly); the
     # package import also bootstraps sys.path for the kernel packages.
-    from ......kernel_src.cutedsl_megamoe import kind_data_dtype
+    from ......kernel_src.sm100.cutedsl_megamoe import kind_data_dtype
 
-    return kind_data_dtype(kind)
+    return kind_data_dtype("mxfp8_e4m3" if kind == "mxfp4_mxfp8" else kind)
 
 
 def stage_mega_moe_inputs(
@@ -40,7 +41,7 @@ def stage_mega_moe_inputs(
     falls back to the original torch-composed staging below.
     """
     # Backend talks only to the cutedsl_megamoe shim (never src/ directly).
-    from ......kernel_src.cutedsl_megamoe import (
+    from ......kernel_src.sm100.cutedsl_megamoe import (
         Mxfp8BlockSize,
         ceil_div,
         fused_quant_stage,
@@ -63,9 +64,26 @@ def stage_mega_moe_inputs(
     if topk_weights.shape != topk_ids.shape:
         raise ValueError("topk_weights and topk_ids must have the same shape.")
 
-    if _use_fused_stage() and fused_quant_stage_supported(
-        hidden_states, quant_type="mxfp8"
+    mixed = kind == "mxfp4_mxfp8"
+    mixed_layout_supported = not mixed or (
+        hidden_states.is_cuda
+        and hidden_states.dtype == torch.bfloat16
+        and hidden_states.is_contiguous()
+        and topk_ids.shape[1] <= 128
+        and topk_ids.is_contiguous()
+        and topk_weights.is_contiguous()
+        and topk_ids.data_ptr() % 16 == 0
+        and topk_weights.data_ptr() % 16 == 0
+        and topk_weights.dtype in (torch.float16, torch.bfloat16, torch.float32)
+    )
+    if (
+        _use_fused_stage()
+        and mixed_layout_supported
+        and fused_quant_stage_supported(hidden_states, quant_type="mxfp8")
     ):
+        if mixed:
+            # Another staging path may have used this pooled workspace.
+            note_staged_tokens(topk_idx_out, x_fp8.shape[0])
         fused_quant_stage(
             hidden_states,
             topk_ids,
@@ -74,13 +92,19 @@ def stage_mega_moe_inputs(
             x_sf,
             topk_idx_out,
             topk_weights_out,
-            quant_type=kind,
+            quant_type="mxfp8_e4m3" if mixed else kind,
+            mxfp8_normal_scales=mixed,
         )
         return
 
     data_dtype = _mxfp8_data_dtype(kind)
     activation_fp32 = hidden_states.to(torch.float32)
-    q, sf = mxfp8_quantize_per_block_32(activation_fp32, data_dtype)
+    if mixed:
+        from ......kernel_src.sm100.next_cutedsl_megamoe import quantize_mxfp8_block32
+
+        q, sf = quantize_mxfp8_block32(activation_fp32, data_dtype)
+    else:
+        q, sf = mxfp8_quantize_per_block_32(activation_fp32, data_dtype)
 
     hidden_sf_cols = ceil_div(hidden, Mxfp8BlockSize)
     hidden_sf_cols_padded = round_up(hidden_sf_cols, 4)
@@ -94,7 +118,9 @@ def stage_mega_moe_inputs(
     x_sf[:num_tokens].zero_()
     x_sf[:num_tokens, :hidden_sf_cols].view(torch.uint8).copy_(sf.view(torch.uint8))
     topk_idx_out[:num_tokens].copy_(topk_ids)
-    topk_weights_out[:num_tokens].copy_(topk_weights)
+    topk_weights_out[:num_tokens].copy_(
+        topk_weights.masked_fill(topk_ids == -1, 0) if mixed else topk_weights
+    )
 
     capacity = x_fp8.shape[0]
     if num_tokens < capacity:
@@ -128,7 +154,7 @@ def validate_mxfp8_forward_inputs(
         return
 
     # Backend talks only to the cutedsl_megamoe shim (never src/ directly).
-    from ......kernel_src.cutedsl_megamoe import (
+    from ......kernel_src.sm100.cutedsl_megamoe import (
         Mxfp8BlockSize,
         Mxfp8ScaleDtype,
         ceil_div,
@@ -178,3 +204,72 @@ def validate_mxfp8_forward_inputs(
             f"scales.shape[1] ({scales.shape[1]}) must be >= {hidden_sf_cols} "
             f"for hidden={hidden}"
         )
+
+
+def validate_genphase_forward_inputs(
+    t, fleet_params, *, top_k, quantize_input, kind="mxfp8_e4m3"
+):
+    """GenPhase metadata checks; callers provide valid, unique expert routing."""
+    for name in ("fc1_alpha", "fc2_alpha", "fc1_norm_const"):
+        if getattr(t, name) is not None:
+            raise MoEEpConfigError(f"Blackwell GenPhase does not accept {name}.")
+    if t.topk_ids.ndim != 2 or t.topk_weights.ndim != 2:
+        raise MoEEpConfigError("GenPhase routing tensors must be 2D.")
+    validate_mxfp8_forward_inputs(
+        t.hidden_states,
+        t.topk_ids,
+        t.topk_weights,
+        fleet_params,
+        top_k=top_k,
+        quantize_input=quantize_input,
+        scales=t.scales,
+        kind=kind,
+    )
+    if quantize_input and t.hidden_states.dtype != torch.bfloat16:
+        raise MoEEpConfigError("GenPhase quantize_input=True requires BF16 inputs.")
+    if t.topk_ids.dtype not in (torch.int32, torch.int64):
+        raise MoEEpConfigError("GenPhase expert IDs must be int32 or int64.")
+    if t.topk_weights.dtype != torch.float32:
+        raise MoEEpConfigError("GenPhase top-k weights must be float32.")
+    device = torch.device("cuda", torch.cuda.current_device())
+    tensors = (t.hidden_states, t.topk_ids, t.topk_weights)
+    if not quantize_input:
+        tensors += (t.scales,)
+    if any(tensor.device != device for tensor in tensors):
+        raise MoEEpConfigError("GenPhase inputs must be on the current CUDA device.")
+
+
+def stage_genphase_inputs(t, workspace, *, quantize_input: bool) -> None:
+    """Stage the GenPhase int32 router and its padded linear SF rows."""
+    # Match the legacy SM100 input contract without per-step device scans:
+    # valid routes are unique IDs in [0, E) with finite scores; -1 is masked.
+    num_tokens = t.hidden_states.shape[0]
+    sf_cols = workspace.config.hidden // workspace.config.sf_vec_size
+    if quantize_input:
+        # Only the logical SF columns are staged. The padded columns were
+        # zeroed at allocation and are never written by either input path.
+        stage_mega_moe_inputs(
+            t.hidden_states,
+            t.topk_weights,
+            t.topk_ids,
+            workspace.x,
+            workspace.x_sf[:, :sf_cols],
+            workspace.topk_idx,
+            workspace.topk_weights,
+            kind=workspace.config.quant_kind,
+        )
+    else:
+        from ......kernel_src.sm100.cutedsl_megamoe import note_staged_tokens
+
+        workspace.x[:num_tokens].view(torch.uint8).copy_(
+            t.hidden_states.view(torch.uint8)
+        )
+        workspace.x_sf[:num_tokens, :sf_cols].view(torch.uint8).copy_(
+            t.scales[:, :sf_cols].view(torch.uint8)
+        )
+        workspace.topk_idx[:num_tokens].copy_(t.topk_ids)
+        workspace.topk_weights[:num_tokens].copy_(t.topk_weights)
+        workspace.topk_idx[num_tokens:].fill_(-1)
+        # A later fused stage may share this workspace with a different layer.
+        note_staged_tokens(workspace.topk_idx, num_tokens)
+    workspace.note_staged_tokens(num_tokens)

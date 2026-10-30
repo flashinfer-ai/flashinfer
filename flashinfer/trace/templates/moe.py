@@ -25,10 +25,10 @@ from ...tllm_enums import (
     DEFAULT_SWIGLU_ALPHA,
     DEFAULT_SWIGLU_BETA,
     DEFAULT_SWIGLU_LIMIT,
-    normalize_activation_type,
 )
 from ..template import Const, Scalar, Tensor, TraceTemplate, Var
 from ._init_helpers import fp8_block_quant_1d, fp8_block_quant_2d
+from .gemm import _unswizzle_batched_sf_128x4
 from .quantize import _fp4_quantize_reference
 
 # ---------------------------------------------------------------------------
@@ -168,6 +168,21 @@ sm90_mixed_gemm_weight_interleave_trace = TraceTemplate(
 # ---------------------------------------------------------------------------
 
 
+def _trtllm_unshuffle_weight(weight, gated):
+    """Restore MajorK rows shuffled for the TRTLLM 128-row epilogue."""
+    rows = torch.arange(weight.shape[1], device=weight.device)
+    shuffled_rows = rows // 32 * 32 + rows % 4 * 8 + rows % 32 // 4
+    weight = weight.float().index_select(1, shuffled_rows)
+    if gated:
+        experts, num_rows, hidden = weight.shape
+        weight = (
+            weight.reshape(experts, num_rows // 2, 2, hidden)
+            .transpose(1, 2)
+            .reshape(experts, num_rows, hidden)
+        )
+    return weight
+
+
 @torch.no_grad()
 def _fp8_moe_run_experts(
     hidden_states,
@@ -183,6 +198,9 @@ def _fp8_moe_run_experts(
     gemm1_alpha=None,
     gemm1_beta=None,
     gemm1_clamp_limit=None,
+    activation_type=3,
+    fp8_quantization_type=1,
+    use_shuffled_weight=False,
 ):
     """FP8 block-scale dequantization + SwiGLU + GEMM for all routing types.
 
@@ -200,25 +218,48 @@ def _fp8_moe_run_experts(
         )
     device = hidden_states.device
 
-    A_fp32 = hidden_states.to(torch.float32)
-    A_scale = hidden_states_scale.to(torch.float32)  # [H/128, T]
-    A_scale_TH = A_scale.permute(1, 0).contiguous()  # [T, H/128]
-    A_scale_expanded = (
-        A_scale_TH.unsqueeze(-1).repeat(1, 1, BLOCK).reshape(T, H).contiguous()
-    )
-    A = A_fp32 * A_scale_expanded
+    is_step = int(activation_type) == 7
+    if is_step:
+        if int(fp8_quantization_type) != 2:
+            raise ValueError("SwiGLUStep requires fused MXFP8 block scaling")
+        if gemm1_alpha is not None or gemm1_beta is not None:
+            raise ValueError("SwiGLUStep accepts gemm1_clamp_limit only")
+        # MXFP8 uses one UE8M0 scale per row and 32 values along K.
+        a_exp = hidden_states_scale.view(torch.uint8).reshape(T, H // 32)
+        a_scale = torch.exp2(a_exp.to(torch.float32) - 127.0)
+        A = hidden_states.float() * a_scale.repeat_interleave(32, dim=-1)
+        s1 = gemm1_weights_scale.view(torch.uint8)
+        s2 = gemm2_weights_scale.view(torch.uint8)
+        if use_shuffled_weight:
+            s1 = _unswizzle_batched_sf_128x4(s1, E_local, 2 * I, H // 32)
+            s2 = _unswizzle_batched_sf_128x4(s2, E_local, H, I // 32)
+        s1 = torch.exp2(s1.float() - 127.0)
+        s2 = torch.exp2(s2.float() - 127.0)
+        W13 = gemm1_weights.float() * s1.repeat_interleave(32, dim=-1)
+        W2 = gemm2_weights.float() * s2.repeat_interleave(32, dim=-1)
+        if use_shuffled_weight:
+            W13 = _trtllm_unshuffle_weight(W13, gated=True)
+            W2 = _trtllm_unshuffle_weight(W2, gated=False)
+    else:
+        A_fp32 = hidden_states.to(torch.float32)
+        A_scale = hidden_states_scale.to(torch.float32)  # [H/128, T]
+        A_scale_TH = A_scale.permute(1, 0).contiguous()  # [T, H/128]
+        A_scale_expanded = (
+            A_scale_TH.unsqueeze(-1).repeat(1, 1, BLOCK).reshape(T, H).contiguous()
+        )
+        A = A_fp32 * A_scale_expanded
 
-    W13_fp32 = gemm1_weights.to(torch.float32)
-    S13 = gemm1_weights_scale.to(torch.float32)
-    S13_expanded = torch.repeat_interleave(S13, BLOCK, dim=1)
-    S13_expanded = torch.repeat_interleave(S13_expanded, BLOCK, dim=2)
-    W13 = W13_fp32 * S13_expanded
+        W13_fp32 = gemm1_weights.to(torch.float32)
+        S13 = gemm1_weights_scale.to(torch.float32)
+        S13_expanded = torch.repeat_interleave(S13, BLOCK, dim=1)
+        S13_expanded = torch.repeat_interleave(S13_expanded, BLOCK, dim=2)
+        W13 = W13_fp32 * S13_expanded
 
-    W2_fp32 = gemm2_weights.to(torch.float32)
-    S2 = gemm2_weights_scale.to(torch.float32)
-    S2_expanded = torch.repeat_interleave(S2, BLOCK, dim=1)
-    S2_expanded = torch.repeat_interleave(S2_expanded, BLOCK, dim=2)
-    W2 = W2_fp32 * S2_expanded
+        W2_fp32 = gemm2_weights.to(torch.float32)
+        S2 = gemm2_weights_scale.to(torch.float32)
+        S2_expanded = torch.repeat_interleave(S2, BLOCK, dim=1)
+        S2_expanded = torch.repeat_interleave(S2_expanded, BLOCK, dim=2)
+        W2 = W2_fp32 * S2_expanded
 
     output = torch.zeros((T, H), dtype=torch.float32, device=device)
     local_start = int(local_expert_offset)
@@ -235,7 +276,12 @@ def _fp8_moe_run_experts(
         A_e = A.index_select(0, token_idx)
         G1 = A_e.matmul(W13[le].t())
         X1, X2 = G1[:, :I], G1[:, I:]
-        if gemm1_clamp_limit is not None:
+        if is_step:
+            limit = 7.0 if gemm1_clamp_limit is None else gemm1_clamp_limit[le]
+            activated = torch.clamp(X1, min=-limit, max=limit) * torch.clamp(
+                torch.nn.functional.silu(X2), max=limit
+            )
+        elif gemm1_clamp_limit is not None:
             limit = gemm1_clamp_limit[le].to(device=X1.device, dtype=torch.float32)
             X1 = torch.clamp(X1, min=-limit, max=limit)
             X2 = torch.clamp(X2, max=limit)
@@ -250,7 +296,9 @@ def _fp8_moe_run_experts(
             else gemm1_beta[le].to(device=X1.device, dtype=torch.float32)
         )
         silu_X2 = X2 * torch.sigmoid(alpha * X2)
-        O = (silu_X2 * (X1 + beta)).matmul(W2[le].t())
+        if not is_step:
+            activated = silu_X2 * (X1 + beta)
+        O = activated.matmul(W2[le].t())
         # per-expert contribution weight for each token
         w_tok = weights.index_select(0, token_idx)
         # find which slot in topk_idx[token_idx] corresponds to ge
@@ -286,6 +334,9 @@ def _trtllm_fp8_block_scale_moe_ds_routing_reference(
     gemm1_alpha=None,
     gemm1_beta=None,
     gemm1_clamp_limit=None,
+    activation_type=3,
+    fp8_quantization_type=1,
+    **_unused,
 ):
     """
     FP8 block-scale MoE with DeepSeek-V3 routing:
@@ -299,6 +350,9 @@ def _trtllm_fp8_block_scale_moe_ds_routing_reference(
     With ``S > 0``, append ids ``[E, E + S)`` at weight ``1.0``. Weight
     tensors contain ``E + S`` rows.
     """
+    routed_scaling_factor = (
+        1.0 if routed_scaling_factor is None else float(routed_scaling_factor)
+    )
     E_global = routing_logits.shape[1]
     T = routing_logits.shape[0]
     TOP_K = int(top_k)
@@ -364,15 +418,10 @@ def _trtllm_fp8_block_scale_moe_ds_routing_reference(
         gemm1_alpha=gemm1_alpha,
         gemm1_beta=gemm1_beta,
         gemm1_clamp_limit=gemm1_clamp_limit,
+        activation_type=activation_type,
+        fp8_quantization_type=fp8_quantization_type,
+        use_shuffled_weight=_unused.get("use_shuffled_weight", False),
     )
-
-
-# The rendered reference must run standalone (tests/trace exec it from the
-# committed JSON), so the module-level helper it calls has to be inlined ahead
-# of it. Without this the emitted source raises NameError on first call.
-_trtllm_fp8_block_scale_moe_ds_routing_reference._trace_reference_dependencies = (
-    _fp8_moe_run_experts,
-)
 
 
 @torch.no_grad()
@@ -392,11 +441,17 @@ def _trtllm_fp8_block_scale_moe_default_routing_reference(
     gemm1_alpha=None,
     gemm1_beta=None,
     gemm1_clamp_limit=None,
+    activation_type=3,
+    fp8_quantization_type=1,
+    **_unused,
 ):
     """
     FP8 block-scale MoE with Default routing: Softmax → TopK.
     routing_bias is added to logits before softmax when provided.
     """
+    routed_scaling_factor = (
+        1.0 if routed_scaling_factor is None else float(routed_scaling_factor)
+    )
     TOP_K = int(top_k)
     E_global = routing_logits.shape[1]
     logits = routing_logits.to(torch.float32)
@@ -419,6 +474,9 @@ def _trtllm_fp8_block_scale_moe_default_routing_reference(
         gemm1_alpha=gemm1_alpha,
         gemm1_beta=gemm1_beta,
         gemm1_clamp_limit=gemm1_clamp_limit,
+        activation_type=activation_type,
+        fp8_quantization_type=fp8_quantization_type,
+        use_shuffled_weight=_unused.get("use_shuffled_weight", False),
     )
 
 
@@ -439,12 +497,18 @@ def _trtllm_fp8_block_scale_moe_renormalize_routing_reference(
     gemm1_alpha=None,
     gemm1_beta=None,
     gemm1_clamp_limit=None,
+    activation_type=3,
+    fp8_quantization_type=1,
+    **_unused,
 ):
     """
     FP8 block-scale MoE with Renormalize routing: TopK → Softmax.
     TopK is applied on raw logits; weights are then derived by softmax
     over the selected logits.
     """
+    routed_scaling_factor = (
+        1.0 if routed_scaling_factor is None else float(routed_scaling_factor)
+    )
     TOP_K = int(top_k)
     E_global = routing_logits.shape[1]
     logits = routing_logits.to(torch.float32)
@@ -467,6 +531,9 @@ def _trtllm_fp8_block_scale_moe_renormalize_routing_reference(
         gemm1_alpha=gemm1_alpha,
         gemm1_beta=gemm1_beta,
         gemm1_clamp_limit=gemm1_clamp_limit,
+        activation_type=activation_type,
+        fp8_quantization_type=fp8_quantization_type,
+        use_shuffled_weight=_unused.get("use_shuffled_weight", False),
     )
 
 
@@ -487,6 +554,9 @@ def _trtllm_fp8_block_scale_moe_llama4_routing_reference(
     gemm1_alpha=None,
     gemm1_beta=None,
     gemm1_clamp_limit=None,
+    activation_type=3,
+    fp8_quantization_type=1,
+    **_unused,
 ):
     """
     FP8 block-scale MoE with Llama4 routing: Top1 → Sigmoid.
@@ -494,6 +564,9 @@ def _trtllm_fp8_block_scale_moe_llama4_routing_reference(
     By definition Llama4 routing uses top_k=1; the parameter is accepted for
     schema consistency with the other routing methods.
     """
+    routed_scaling_factor = (
+        1.0 if routed_scaling_factor is None else float(routed_scaling_factor)
+    )
     E_global = routing_logits.shape[1]
     logits = routing_logits.to(torch.float32)
     if routing_bias is not None:
@@ -515,6 +588,9 @@ def _trtllm_fp8_block_scale_moe_llama4_routing_reference(
         gemm1_alpha=gemm1_alpha,
         gemm1_beta=gemm1_beta,
         gemm1_clamp_limit=gemm1_clamp_limit,
+        activation_type=activation_type,
+        fp8_quantization_type=fp8_quantization_type,
+        use_shuffled_weight=_unused.get("use_shuffled_weight", False),
     )
 
 
@@ -535,11 +611,17 @@ def _trtllm_fp8_block_scale_moe_renormalize_naive_routing_reference(
     gemm1_alpha=None,
     gemm1_beta=None,
     gemm1_clamp_limit=None,
+    activation_type=3,
+    fp8_quantization_type=1,
+    **_unused,
 ):
     """
     FP8 block-scale MoE with RenormalizeNaive routing: Softmax → TopK → Renormalize.
     Same as Default but the selected weights are re-normalised to sum to 1.
     """
+    routed_scaling_factor = (
+        1.0 if routed_scaling_factor is None else float(routed_scaling_factor)
+    )
     TOP_K = int(top_k)
     E_global = routing_logits.shape[1]
     logits = routing_logits.to(torch.float32)
@@ -564,6 +646,9 @@ def _trtllm_fp8_block_scale_moe_renormalize_naive_routing_reference(
         gemm1_alpha=gemm1_alpha,
         gemm1_beta=gemm1_beta,
         gemm1_clamp_limit=gemm1_clamp_limit,
+        activation_type=activation_type,
+        fp8_quantization_type=fp8_quantization_type,
+        use_shuffled_weight=_unused.get("use_shuffled_weight", False),
     )
 
 
@@ -584,11 +669,17 @@ def _trtllm_fp8_block_scale_moe_topk_routing_reference(
     gemm1_alpha=None,
     gemm1_beta=None,
     gemm1_clamp_limit=None,
+    activation_type=3,
+    fp8_quantization_type=1,
+    **_unused,
 ):
     """
     FP8 block-scale MoE with TopK-only routing: TopK, uniform weights.
     No softmax or sigmoid; all selected experts receive equal weight.
     """
+    routed_scaling_factor = (
+        1.0 if routed_scaling_factor is None else float(routed_scaling_factor)
+    )
     TOP_K = int(top_k)
     E_global = routing_logits.shape[1]
     logits = routing_logits.to(torch.float32)
@@ -616,6 +707,9 @@ def _trtllm_fp8_block_scale_moe_topk_routing_reference(
         gemm1_alpha=gemm1_alpha,
         gemm1_beta=gemm1_beta,
         gemm1_clamp_limit=gemm1_clamp_limit,
+        activation_type=activation_type,
+        fp8_quantization_type=fp8_quantization_type,
+        use_shuffled_weight=_unused.get("use_shuffled_weight", False),
     )
 
 
@@ -1264,6 +1358,15 @@ def trtllm_fp8_block_scale_moe_trace_dispatch(**kwargs):
     DeepSeekV3 calls with shared experts use a separate template.
     """
     routing_method_type = int(kwargs.get("routing_method_type", 0))
+    if int(kwargs.get("activation_type", 3)) == 7:
+        if int(kwargs.get("fp8_quantization_type", 1)) != 2:
+            raise ValueError("SwiGLUStep requires fused MXFP8 block scaling")
+        if (
+            routing_method_type == 2
+            and int(kwargs.get("num_fused_shared_experts") or 0) > 0
+        ):
+            return trtllm_mxfp8_step_shared_experts_trace
+        return _STEP_MXFP8_TRACE_BY_ROUTING_TYPE.get(routing_method_type)
     if (
         routing_method_type == 2
         and int(kwargs.get("num_fused_shared_experts") or 0) > 0
@@ -1414,6 +1517,10 @@ def _fp4_moe_run_experts(
     gemm1_alpha=None,
     gemm1_beta=None,
     gemm1_clamp_limit=None,
+    output1_scale_scalar=None,
+    output1_scale_gate_scalar=None,
+    output2_scale_scalar=None,
+    per_token_scale=None,
     **_unused,
 ):
     """FP4 dequantize + gated activation + GEMM for all routing types.
@@ -1428,6 +1535,16 @@ def _fp4_moe_run_experts(
     is_mxfp4 = gemm1_weights_scale.dtype == torch.uint8
     device = gemm1_weights.device
 
+    if int(activation_type) == 7:
+        experts, rows, packed_hidden = gemm1_weights.shape
+        gemm1_weights_scale = _unswizzle_batched_sf_128x4(
+            gemm1_weights_scale, experts, rows, packed_hidden * 2 // 16
+        )
+        experts, rows, packed_intermediate = gemm2_weights.shape
+        gemm2_weights_scale = _unswizzle_batched_sf_128x4(
+            gemm2_weights_scale, experts, rows, packed_intermediate * 2 // 16
+        )
+
     # Dequantize both expert-weight tensors in one shot.
     W1 = _dequantize_fp4_tensor(
         gemm1_weights, gemm1_weights_scale, is_ue8m0_scales=is_mxfp4
@@ -1435,6 +1552,18 @@ def _fp4_moe_run_experts(
     W2 = _dequantize_fp4_tensor(
         gemm2_weights, gemm2_weights_scale, is_ue8m0_scales=is_mxfp4
     )  # [E_local, H, I]
+
+    if int(activation_type) == 7:
+        W1 = _trtllm_unshuffle_weight(W1, gated=True)
+        W2 = _trtllm_unshuffle_weight(W2, gated=False)
+        if gemm1_bias is not None:
+            gemm1_bias = _trtllm_unshuffle_weight(
+                gemm1_bias.unsqueeze(-1), True
+            ).squeeze(-1)
+        if gemm2_bias is not None:
+            gemm2_bias = _trtllm_unshuffle_weight(
+                gemm2_bias.unsqueeze(-1), False
+            ).squeeze(-1)
 
     E_local, gemm1_out_size, H = W1.shape
     I = gemm1_out_size // 2
@@ -1449,12 +1578,16 @@ def _fp4_moe_run_experts(
     output = torch.zeros((T, H), dtype=torch.float32, device=device)
     local_start = int(local_expert_offset)
     activation_type = int(activation_type)
-    swiglu, situ = 3, 10
-    if activation_type not in (swiglu, situ):
+    swiglu, step, situ = 3, 7, 10
+    if activation_type not in (swiglu, step, situ):
         raise ValueError(
-            "FP4 MoE trace reference supports activation_type 3 (SwiGLU) "
-            f"and 10 (SiTU), got {activation_type}"
+            "FP4 MoE trace reference supports activation_type 3 (SwiGLU), "
+            f"7 (SwiGLUStep), and 10 (SiTU), got {activation_type}"
         )
+    if activation_type == step and (is_mxfp4 or hidden_states.dtype != torch.uint8):
+        raise ValueError("FP4 SwiGLUStep requires NVFP4 activations and weights")
+    if activation_type == step and (gemm1_alpha is not None or gemm1_beta is not None):
+        raise ValueError("SwiGLUStep accepts gemm1_clamp_limit only")
     if activation_type == situ:
         for name, param in (
             ("gemm1_alpha", gemm1_alpha),
@@ -1484,11 +1617,28 @@ def _fp4_moe_run_experts(
         token_idx = torch.nonzero(sel_mask, as_tuple=False).squeeze(1)
         A_e = A.index_select(0, token_idx)  # [N, H]
         G1 = A_e.matmul(W1[le].t())  # [N, 2*I]
+        if activation_type == step and per_token_scale is not None:
+            G1 = G1 * per_token_scale.index_select(0, token_idx).reshape(-1, 1).float()
         if gemm1_bias is not None:
             G1 = G1 + gemm1_bias[le].to(torch.float32)
         # TRTLLM-Gen convention: x0 is linear/first; x1 is gate/second.
         x0, x1 = G1[:, :I], G1[:, I:]
-        if activation_type == situ:
+        if activation_type == step:
+            gate_scale = (
+                1.0
+                if output1_scale_gate_scalar is None
+                else output1_scale_gate_scalar[le]
+            )
+            up_scale = 1.0 if output1_scale_scalar is None else output1_scale_scalar[le]
+            raw_limit = (
+                7.0 / gate_scale if gemm1_clamp_limit is None else gemm1_clamp_limit[le]
+            )
+            up = torch.clamp(x0, min=-raw_limit, max=raw_limit) * up_scale
+            gate = torch.clamp(
+                torch.nn.functional.silu(x1 * gate_scale), max=raw_limit * gate_scale
+            )
+            activated = up * gate
+        elif activation_type == situ:
             alpha = (
                 torch.tensor(1.0, dtype=torch.float32, device=device)
                 if gemm1_alpha is None
@@ -1515,6 +1665,8 @@ def _fp4_moe_run_experts(
         O = activated.matmul(W2[le].t())  # [N, H]
         if gemm2_bias is not None:
             O = O + gemm2_bias[le].to(torch.float32)
+        if activation_type == step and output2_scale_scalar is not None:
+            O = O * output2_scale_scalar[le]
         # Fold per-token expert weight.
         w_tok = weights.index_select(0, token_idx)
         match = (topk_idx.index_select(0, token_idx) == ge).float()
@@ -1704,18 +1856,6 @@ def _trtllm_fp4_block_scale_moe_ds_routing_reference(
     )
 
 
-cast(
-    Any, _trtllm_fp4_block_scale_moe_ds_routing_reference
-)._trace_reference_dependencies = (
-    _unpack_fp4_e2m1,
-    _ue8m0_to_float32,
-    _decode_block_scales,
-    _dequantize_fp4_tensor,
-    _dequantize_fp4_hidden_states,
-    _fp4_moe_run_experts,
-)
-
-
 @torch.no_grad()
 def _trtllm_fp4_block_scale_moe_llama4_routing_reference(
     routing_logits,
@@ -1851,6 +1991,35 @@ def _trtllm_fp4_block_scale_moe_topk_routing_reference(
     )
 
 
+def _nvfp4_4over6_axis_value(kwargs: dict) -> int | None:
+    """Wire code of an explicit ``nvfp4_4over6=``; ``None`` when unset.
+
+    Unset is not resolved here: that would read the environment and make the
+    definition name depend on the process rather than on the call.
+    """
+    from flashinfer.quantization.nvfp4_quantization_utils import (  # noqa: PLC0415
+        _UNSET,
+        nvfp4_4over6_code,
+        resolve_nvfp4_4over6,
+    )
+
+    setting = kwargs.get("nvfp4_4over6", _UNSET)
+    if setting is _UNSET:
+        return None
+    return nvfp4_4over6_code(resolve_nvfp4_4over6(setting))
+
+
+def _nvfp4_4over6_axis() -> Const:
+    return Const(
+        description=(
+            "NVFP4 4over6 recipe as the nvfp4_4over6_code() wire code (0 = off); "
+            "absent when the call left nvfp4_4over6 unset."
+        ),
+        abbrev="r4o6",
+        extract=_nvfp4_4over6_axis_value,
+    )
+
+
 _FP4_STANDARD_AXES: dict[str, Var | Const] = {
     "seq_len": Var(description="Number of tokens."),
     "num_experts": Const(description="Total number of experts.", abbrev=""),
@@ -1882,9 +2051,16 @@ _FP4_STANDARD_AXES: dict[str, Var | Const] = {
     "activation_type": Const(
         description="Fused activation type; 10 selects SiTU.", abbrev="act"
     ),
+    "nvfp4_4over6": _nvfp4_4over6_axis(),
 }
 
 _FP4_STANDARD_INPUTS: dict[str, Tensor | Scalar] = {
+    "per_token_scale": Tensor(
+        ["seq_len"],
+        dtype="float32",
+        optional=True,
+        description="FC1 token dequantization scales applied before StepFun clipping.",
+    ),
     "routing_logits": Tensor(
         ["seq_len", "num_experts"],
         description="Routing logits for expert selection.",
@@ -2460,6 +2636,16 @@ def _moe_expert_param(value, expert_idx, default, device):
     return float(value)
 
 
+def _step_decode_precomputed_routing(topk_ids):
+    if isinstance(topk_ids, (tuple, list)):
+        ids, weights = topk_ids
+        return ids.to(torch.int64), weights.to(torch.float32)
+    packed = topk_ids.to(torch.int32)
+    ids = torch.bitwise_right_shift(packed, 16).to(torch.int64)
+    weights = packed.to(torch.int16).view(torch.bfloat16).to(torch.float32)
+    return ids, weights
+
+
 @torch.no_grad()
 def _moe_bf16_run_experts(
     hidden_states,
@@ -2472,28 +2658,32 @@ def _moe_bf16_run_experts(
     gemm1_alpha=None,
     gemm1_beta=None,
     gemm1_clamp_limit=None,
-    activation_type=ActivationType.Swiglu.value,
+    activation_type=3,
     situ_beta=None,
     situ_linear_beta=None,
+    use_shuffled_weight=True,
 ):
     """Un-quantized (bf16) MoE expert computation."""
-    activation_type = normalize_activation_type(activation_type)
+    # Keep enum values local so the serialized reference needs only PyTorch.
+    swiglu, swiglu_step, geglu_tanh, relu2 = 3, 7, 8, 6
+    activation_type = int(activation_type)
     if situ_beta is not None or situ_linear_beta is not None:
         from ...fused_moe.cute_dsl.moe_utils import (
             validate_cute_dsl_moe_situ_config,
         )
 
         validate_cute_dsl_moe_situ_config(activation_type, situ_beta, situ_linear_beta)
-    if activation_type not in (
-        ActivationType.Swiglu,
-        ActivationType.GegluTanh,
-        ActivationType.Relu2,
-    ):
+    if activation_type not in (swiglu, swiglu_step, geglu_tanh, relu2):
         raise ValueError(
             f"Unsupported activation_type {activation_type!r}; "
-            f"expected {ActivationType.Swiglu!r}, "
-            f"{ActivationType.GegluTanh!r}, or {ActivationType.Relu2!r}"
+            "expected 3 (SwiGLU), 7 (SwiGLUStep), 8 (GeGLUTanh), or 6 (ReLU2)"
         )
+    if activation_type == swiglu_step:
+        gemm1_weights = gemm1_weights.transpose(1, 2).flatten(2)
+        gemm2_weights = gemm2_weights.transpose(1, 2).flatten(2)
+        if use_shuffled_weight:
+            gemm1_weights = _trtllm_unshuffle_weight(gemm1_weights, gated=True)
+            gemm2_weights = _trtllm_unshuffle_weight(gemm2_weights, gated=False)
     T, H = hidden_states.shape
     E_local, gemm1_out, _ = gemm1_weights.shape
     I = gemm1_out // 2
@@ -2513,7 +2703,7 @@ def _moe_bf16_run_experts(
         token_idx = torch.nonzero(sel_mask, as_tuple=False).squeeze(1)
         A_e = A.index_select(0, token_idx)
         G1 = A_e.matmul(W1[le].t())
-        if activation_type == ActivationType.Relu2:
+        if activation_type == relu2:
             act = torch.relu(G1) ** 2
         else:
             X1, X2 = G1[:, :I], G1[:, I:]
@@ -2523,16 +2713,21 @@ def _moe_bf16_run_experts(
                 if situ_linear_beta is not None:
                     up = situ_linear_beta * torch.tanh(up / situ_linear_beta)
                 act = gate * up
-            elif activation_type == ActivationType.GegluTanh:
+            elif activation_type == geglu_tanh:
                 act = torch.nn.functional.gelu(X2, approximate="tanh") * X1
+            elif activation_type == swiglu_step:
+                if gemm1_alpha is not None or gemm1_beta is not None:
+                    raise ValueError("SwiGLUStep accepts gemm1_clamp_limit only")
+                limit = _moe_expert_param(gemm1_clamp_limit, le, 7.0, X1.device)
+                up = torch.clamp(X1, min=-limit, max=limit)
+                gate = torch.clamp(torch.nn.functional.silu(X2), max=limit)
+                act = gate * up
             else:
                 limit = _moe_expert_param(
-                    gemm1_clamp_limit, le, DEFAULT_SWIGLU_LIMIT, X1.device
+                    gemm1_clamp_limit, le, torch.finfo(torch.float32).max, X1.device
                 )
-                alpha = _moe_expert_param(
-                    gemm1_alpha, le, DEFAULT_SWIGLU_ALPHA, X2.device
-                )
-                beta = _moe_expert_param(gemm1_beta, le, DEFAULT_SWIGLU_BETA, X1.device)
+                alpha = _moe_expert_param(gemm1_alpha, le, 1.0, X2.device)
+                beta = _moe_expert_param(gemm1_beta, le, 0.0, X1.device)
                 up = torch.clamp(X1, min=-limit, max=limit)
                 gate = torch.clamp(X2, max=limit)
                 act = gate * torch.sigmoid(alpha * gate) * (up + beta)
@@ -2590,6 +2785,7 @@ def _trtllm_bf16_moe_reference(
     gemm1_alpha=None,
     gemm1_beta=None,
     gemm1_clamp_limit=None,
+    activation_type=3,
     **_unused,
 ):
     """Reference for TRT-LLM BF16 MoE (Default routing)."""
@@ -2607,6 +2803,8 @@ def _trtllm_bf16_moe_reference(
         gemm1_alpha=gemm1_alpha,
         gemm1_beta=gemm1_beta,
         gemm1_clamp_limit=gemm1_clamp_limit,
+        activation_type=activation_type,
+        use_shuffled_weight=_unused.get("use_shuffled_weight", True),
     )
 
 
@@ -2623,9 +2821,26 @@ def _trtllm_bf16_routed_moe_reference(
     gemm1_alpha=None,
     gemm1_beta=None,
     gemm1_clamp_limit=None,
+    activation_type=3,
     **_unused,
 ):
     """Reference for TRT-LLM BF16 MoE with precomputed topk_ids."""
+    if int(activation_type) == 7:
+        topk_idx, w_topk = _step_decode_precomputed_routing(topk_ids)
+        return _moe_bf16_run_experts(
+            hidden_states,
+            gemm1_weights,
+            gemm2_weights,
+            w_topk,
+            topk_idx,
+            local_expert_offset,
+            int(num_experts),
+            gemm1_alpha=gemm1_alpha,
+            gemm1_beta=gemm1_beta,
+            gemm1_clamp_limit=gemm1_clamp_limit,
+            activation_type=activation_type,
+            use_shuffled_weight=_unused.get("use_shuffled_weight", True),
+        )
     T = topk_ids.shape[0]
     scale = float(routed_scaling_factor or 1.0)
     # Uniform weight per selected expert (real routing scales not available).
@@ -2646,7 +2861,59 @@ def _trtllm_bf16_routed_moe_reference(
         gemm1_alpha=gemm1_alpha,
         gemm1_beta=gemm1_beta,
         gemm1_clamp_limit=gemm1_clamp_limit,
+        activation_type=activation_type,
+        use_shuffled_weight=_unused.get("use_shuffled_weight", True),
     )
+
+
+@torch.no_grad()
+def _trtllm_fp8_per_tensor_step_run_experts(
+    hidden_states,
+    gemm1_weights,
+    output1_scales_scalar,
+    output1_scales_gate_scalar,
+    gemm2_weights,
+    output2_scales_scalar,
+    weights,
+    topk_idx,
+    local_expert_offset,
+    num_experts,
+    gemm1_clamp_limit=None,
+):
+    """StepFun epilogue with raw accumulator limits and calibrated FP8 scales."""
+
+    activations = hidden_states.to(torch.float32)
+    w1 = _trtllm_unshuffle_weight(gemm1_weights, gated=True)
+    w2 = _trtllm_unshuffle_weight(gemm2_weights, gated=False)
+    intermediate = w1.shape[1] // 2
+    output = torch.zeros_like(activations)
+    for local_idx in range(w1.shape[0]):
+        global_idx = int(local_expert_offset) + local_idx
+        if global_idx < 0 or global_idx >= int(num_experts):
+            continue
+        matches = topk_idx == global_idx
+        token_idx = torch.nonzero(matches.any(dim=1), as_tuple=False).squeeze(1)
+        if token_idx.numel() == 0:
+            continue
+        gemm1_out = activations.index_select(0, token_idx).matmul(w1[local_idx].t())
+        raw_up, raw_gate = gemm1_out[:, :intermediate], gemm1_out[:, intermediate:]
+        gate_scale = output1_scales_gate_scalar[local_idx].to(torch.float32)
+        raw_limit = (
+            7.0 / gate_scale
+            if gemm1_clamp_limit is None
+            else gemm1_clamp_limit[local_idx].to(torch.float32)
+        )
+        up = torch.clamp(raw_up, min=-raw_limit, max=raw_limit)
+        gate = torch.clamp(
+            torch.nn.functional.silu(raw_gate * gate_scale),
+            max=raw_limit * gate_scale,
+        )
+        activated = up * output1_scales_scalar[local_idx].to(torch.float32) * gate
+        expert_out = activated.matmul(w2[local_idx].t())
+        expert_out = expert_out * output2_scales_scalar[local_idx].to(torch.float32)
+        selected_weights = (weights * matches).sum(dim=1).index_select(0, token_idx)
+        output.index_add_(0, token_idx, expert_out * selected_weights.unsqueeze(1))
+    return output.to(torch.bfloat16)
 
 
 @torch.no_grad()
@@ -2663,6 +2930,8 @@ def _trtllm_fp8_per_tensor_scale_moe_reference(
     top_k,
     local_expert_offset,
     routed_scaling_factor=None,
+    activation_type=3,
+    gemm1_clamp_limit=None,
     **_unused,
 ):
     """Reference for TRT-LLM FP8 per-tensor scale MoE. Dequantizes per-expert."""
@@ -2670,6 +2939,20 @@ def _trtllm_fp8_per_tensor_scale_moe_reference(
     w_topk, topk_idx = _default_routing_weights(
         routing_logits, routing_bias, top_k, routed_scaling_factor
     )
+    if int(activation_type) == 7:
+        return _trtllm_fp8_per_tensor_step_run_experts(
+            hidden_states,
+            gemm1_weights,
+            output1_scales_scalar,
+            output1_scales_gate_scalar,
+            gemm2_weights,
+            output2_scales_scalar,
+            w_topk,
+            topk_idx,
+            local_expert_offset,
+            num_experts,
+            gemm1_clamp_limit,
+        )
     # Per-expert dequant: each expert has its own scalar scale for FC1 gate,
     # FC1 up, and FC2. Scale broadcasts over the non-expert dims.
     W1 = gemm1_weights.to(torch.float32)
@@ -2703,12 +2986,28 @@ def _trtllm_fp8_per_tensor_scale_routed_moe_reference(
     output2_scales_scalar,
     num_experts,
     local_expert_offset,
+    activation_type=3,
+    gemm1_clamp_limit=None,
     **_unused,
 ):
     """Reference for routed TRT-LLM FP8 per-tensor scale MoE."""
     packed_topk = topk_ids.to(torch.int32)
     topk_idx = torch.bitwise_right_shift(packed_topk, 16).to(torch.int64)
     topk_weights = packed_topk.to(torch.int16).view(torch.bfloat16).to(torch.float32)
+    if int(activation_type) == 7:
+        return _trtllm_fp8_per_tensor_step_run_experts(
+            hidden_states,
+            gemm1_weights,
+            output1_scales_scalar,
+            output1_scales_gate_scalar,
+            gemm2_weights,
+            output2_scales_scalar,
+            topk_weights,
+            topk_idx,
+            local_expert_offset,
+            num_experts,
+            gemm1_clamp_limit,
+        )
 
     T, H = hidden_states.shape
     E_local = gemm1_weights.shape[0]
@@ -2741,6 +3040,33 @@ def _trtllm_fp8_per_tensor_scale_routed_moe_reference(
     return output.to(torch.bfloat16)
 
 
+cast(Any, _trtllm_bf16_moe_reference)._trace_reference_dependencies = (
+    _trtllm_unshuffle_weight,
+    _moe_expert_param,
+    _moe_bf16_run_experts,
+    _default_routing_weights,
+)
+cast(Any, _trtllm_bf16_routed_moe_reference)._trace_reference_dependencies = (
+    _trtllm_unshuffle_weight,
+    _moe_expert_param,
+    _moe_bf16_run_experts,
+    _step_decode_precomputed_routing,
+)
+cast(Any, _trtllm_fp8_per_tensor_scale_moe_reference)._trace_reference_dependencies = (
+    _trtllm_unshuffle_weight,
+    _moe_expert_param,
+    _moe_bf16_run_experts,
+    _default_routing_weights,
+    _trtllm_fp8_per_tensor_step_run_experts,
+)
+cast(
+    Any, _trtllm_fp8_per_tensor_scale_routed_moe_reference
+)._trace_reference_dependencies = (
+    _trtllm_unshuffle_weight,
+    _trtllm_fp8_per_tensor_step_run_experts,
+)
+
+
 @torch.no_grad()
 def _trtllm_fp8_block_scale_routed_moe_reference(
     topk_ids,
@@ -2757,6 +3083,8 @@ def _trtllm_fp8_block_scale_routed_moe_reference(
     gemm1_alpha=None,
     gemm1_beta=None,
     gemm1_clamp_limit=None,
+    activation_type=3,
+    fp8_quantization_type=1,
     **_unused,
 ):
     """Reference for TRT-LLM FP8 block-scale routed MoE (precomputed topk_ids).
@@ -2765,15 +3093,19 @@ def _trtllm_fp8_block_scale_routed_moe_reference(
     a uniform per-token weight tensor (real routing scales are not available
     from topk_ids alone).
     """
-    T = topk_ids.shape[0]
+    topk_idx = topk_ids
+    if int(activation_type) == 7:
+        topk_idx, w_topk = _step_decode_precomputed_routing(topk_ids)
+    T = topk_idx.shape[0]
     TOP_K = int(top_k)
     scale = float(routed_scaling_factor or 1.0)
-    w_topk = torch.full(
-        (T, TOP_K),
-        scale / TOP_K,
-        dtype=torch.float32,
-        device=hidden_states.device,
-    )
+    if int(activation_type) != 7:
+        w_topk = torch.full(
+            (T, TOP_K),
+            scale / TOP_K,
+            dtype=torch.float32,
+            device=hidden_states.device,
+        )
     return _fp8_moe_run_experts(
         hidden_states,
         hidden_states_scale,
@@ -2782,12 +3114,15 @@ def _trtllm_fp8_block_scale_routed_moe_reference(
         gemm2_weights,
         gemm2_weights_scale,
         w_topk,
-        topk_ids.to(torch.int64),
+        topk_idx.to(torch.int64),
         local_expert_offset,
         int(num_experts),
         gemm1_alpha=gemm1_alpha,
         gemm1_beta=gemm1_beta,
         gemm1_clamp_limit=gemm1_clamp_limit,
+        activation_type=activation_type,
+        fp8_quantization_type=fp8_quantization_type,
+        use_shuffled_weight=_unused.get("use_shuffled_weight", False),
     )
 
 
@@ -2810,18 +3145,22 @@ def _trtllm_fp4_block_scale_routed_moe_reference(
     gemm1_alpha=None,
     gemm1_beta=None,
     gemm1_clamp_limit=None,
-    **_unused,
+    **activation_kwargs,
 ):
     """Reference for TRT-LLM FP4 block-scale routed MoE (precomputed topk_ids)."""
-    T = topk_ids.shape[0]
+    topk_idx = topk_ids
+    if int(activation_type) == 7:
+        topk_idx, w_topk = _step_decode_precomputed_routing(topk_ids)
+    T = topk_idx.shape[0]
     TOP_K = int(top_k)
     scale = float(routed_scaling_factor or 1.0)
-    w_topk = torch.full(
-        (T, TOP_K),
-        scale / TOP_K,
-        dtype=torch.float32,
-        device=hidden_states.device,
-    )
+    if int(activation_type) != 7:
+        w_topk = torch.full(
+            (T, TOP_K),
+            scale / TOP_K,
+            dtype=torch.float32,
+            device=hidden_states.device,
+        )
     return _fp4_moe_run_experts(
         hidden_states,
         hidden_states_scale,
@@ -2832,13 +3171,14 @@ def _trtllm_fp4_block_scale_routed_moe_reference(
         gemm1_bias,
         gemm2_bias,
         w_topk,
-        topk_ids.to(torch.int64),
+        topk_idx.to(torch.int64),
         local_expert_offset,
         int(num_experts),
         activation_type=activation_type,
         gemm1_alpha=gemm1_alpha,
         gemm1_beta=gemm1_beta,
         gemm1_clamp_limit=gemm1_clamp_limit,
+        **activation_kwargs,
     )
 
 
@@ -2910,6 +3250,7 @@ cutlass_fused_moe_trace = TraceTemplate(
         "hidden_size": Const(abbrev="h"),
         "intermediate_size": Const(abbrev="i"),
         "top_k": Const(abbrev="topk"),
+        "nvfp4_4over6": _nvfp4_4over6_axis(),
     },
     inputs={
         "input": Tensor(
@@ -3212,7 +3553,10 @@ _TRTLLM_MOE_COMMON_OUTPUTS: dict[str, Tensor | Scalar] = {
     ),
 }
 
-_TRTLLM_BF16_SWIGLU_OA_INPUTS: dict[str, Tensor] = {
+_TRTLLM_BF16_SWIGLU_OA_INPUTS: dict[str, Tensor | Scalar] = {
+    "activation_type": Scalar(
+        "int32", optional=True, description="3=SwiGLU, 7=SwiGLUStep, 6=ReLU2."
+    ),
     "gemm1_alpha": Tensor(
         ["num_local_experts"],
         dtype="float32",
@@ -3229,7 +3573,7 @@ _TRTLLM_BF16_SWIGLU_OA_INPUTS: dict[str, Tensor] = {
         ["num_local_experts"],
         dtype="float32",
         optional=True,
-        description="Optional per-expert SwiGLU OA clamp limit.",
+        description="Optional per-expert SwiGLU OA or SwiGLUStep clamp limit.",
     ),
 }
 
@@ -3288,6 +3632,15 @@ trtllm_fp8_per_tensor_scale_moe_trace = TraceTemplate(
     axes=dict(_TRTLLM_MOE_COMMON_AXES),
     inputs={
         **_TRTLLM_MOE_COMMON_INPUTS,
+        "gemm1_clamp_limit": Tensor(
+            ["num_local_experts"],
+            dtype="float32",
+            optional=True,
+            description="Per-expert raw FC1 accumulator limits for SwiGLUStep.",
+        ),
+        "activation_type": Scalar(
+            "int32", optional=True, description="3=SwiGLU, 7=SwiGLUStep, 6=ReLU2."
+        ),
         "output1_scales_scalar": Tensor(
             ["num_local_experts"],
             dtype="float32",
@@ -3317,6 +3670,15 @@ trtllm_fp8_per_tensor_scale_routed_moe_trace = TraceTemplate(
     description="TRT-LLM FP8 per-tensor scale MoE with packed precomputed routing.",
     axes=dict(_TRTLLM_MOE_ROUTED_AXES),
     inputs={
+        "gemm1_clamp_limit": Tensor(
+            ["num_local_experts"],
+            dtype="float32",
+            optional=True,
+            description="Per-expert raw FC1 accumulator limits for SwiGLUStep.",
+        ),
+        "activation_type": Scalar(
+            "int32", optional=True, description="3=SwiGLU, 7=SwiGLUStep, 6=ReLU2."
+        ),
         "topk_ids": Tensor(
             ["seq_len", "top_k"],
             dtype="int32",
@@ -3454,8 +3816,15 @@ trtllm_fp4_block_scale_routed_moe_trace = TraceTemplate(
         "activation_type": Const(
             description="Fused activation type; 10 selects SiTU.", abbrev="act"
         ),
+        "nvfp4_4over6": _nvfp4_4over6_axis(),
     },
     inputs={
+        "gemm1_bias": _FP4_STANDARD_INPUTS["gemm1_bias"],
+        "gemm2_bias": _FP4_STANDARD_INPUTS["gemm2_bias"],
+        "output1_scale_scalar": _FP4_STANDARD_INPUTS["output1_scale_scalar"],
+        "output1_scale_gate_scalar": _FP4_STANDARD_INPUTS["output1_scale_gate_scalar"],
+        "output2_scale_scalar": _FP4_STANDARD_INPUTS["output2_scale_scalar"],
+        "per_token_scale": _FP4_STANDARD_INPUTS["per_token_scale"],
         "topk_ids": Tensor(
             ["seq_len", "top_k"], dtype="int32", description="Precomputed top-k."
         ),
@@ -3518,6 +3887,177 @@ trtllm_fp4_block_scale_routed_moe_trace = TraceTemplate(
     reference=_trtllm_fp4_block_scale_routed_moe_reference,
 )
 
+
+# StepFun siblings preserve the existing activation's definition filenames.
+def _make_step_moe_trace(
+    base: TraceTemplate, *, mxfp8: bool = False, bf16: bool = False
+) -> TraceTemplate:
+    axes = dict(base.axes)
+    axes["activation_type"] = Const(abbrev="act", value=7)
+    inputs = dict(base.inputs)
+    inputs["activation_type"] = Scalar("int32", description="7=SwiGLUStep.")
+    if bf16:
+        axes["num_hidden_blocks"] = Const(
+            abbrev="", description="hidden_size / block_k."
+        )
+        axes["num_intermediate_blocks"] = Const(
+            abbrev="", description="intermediate_size / block_k."
+        )
+        axes["block_k"] = Const(
+            abbrev="", description="BF16 values per BlockMajorK block."
+        )
+        inputs["intermediate_size"] = Scalar("int32")
+        inputs["gemm1_weights"] = Tensor(
+            ["num_local_experts", "num_hidden_blocks", "gemm1_out_size", "block_k"],
+            description="FC1 shuffled BlockMajorK weights.",
+        )
+        inputs["gemm2_weights"] = Tensor(
+            ["num_local_experts", "num_intermediate_blocks", "hidden_size", "block_k"],
+            description="FC2 shuffled BlockMajorK weights.",
+        )
+    if bf16 or mxfp8:
+        inputs["use_shuffled_weight"] = Scalar("bool", optional=True)
+    if mxfp8:
+        rows = "num_weight_rows" if "num_weight_rows" in axes else "num_local_experts"
+        axes.pop("num_gemm1_out_blocks", None)
+        axes["num_hidden_blocks"] = Const(abbrev="", description="hidden_size / 32.")
+        axes["num_intermediate_blocks"] = Const(
+            abbrev="", description="intermediate_size / 32."
+        )
+        inputs["fp8_quantization_type"] = Scalar("int32", description="2=MxFp8.")
+        inputs["hidden_states_scale"] = Tensor(
+            ["seq_len", "num_hidden_blocks"],
+            description="Linear UE8M0 activation scales over 32 values along K.",
+        )
+        inputs["gemm1_weights_scale"] = Tensor(
+            [rows, "gemm1_out_size", "num_hidden_blocks"],
+            description="UE8M0 FC1 weight scales over 32 values along K.",
+        )
+        inputs["gemm2_weights_scale"] = Tensor(
+            [rows, "hidden_size", "num_intermediate_blocks"],
+            description="UE8M0 FC2 weight scales over 32 values along K.",
+        )
+        inputs["gemm1_clamp_limit"] = Tensor(
+            [rows],
+            dtype="float32",
+            optional=True,
+            description="Per-expert physical StepFun limit; None uses 7.",
+        )
+    return TraceTemplate(
+        op_type=base.op_type,
+        axes=axes,
+        inputs=inputs,
+        outputs=dict(base.outputs),
+        name_prefix=f"{base.name_prefix}_swiglu_step",
+        reference=base.reference,
+        check=base.check,
+        constraints=list(base.constraints),
+        tags=list(base.tags),
+        description=f"{base.description} StepFun caps the gate after SiLU.",
+    )
+
+
+def _make_step_moe_trace_dispatch(base: TraceTemplate, step: TraceTemplate):
+    def dispatch(**kwargs):
+        return step if int(kwargs.get("activation_type", 3)) == 7 else base
+
+    dispatch.templates = [base, step]  # type: ignore[attr-defined]
+    return dispatch
+
+
+trtllm_bf16_moe_step_trace = _make_step_moe_trace(trtllm_bf16_moe_trace, bf16=True)
+trtllm_bf16_routed_moe_step_trace = _make_step_moe_trace(
+    trtllm_bf16_routed_moe_trace, bf16=True
+)
+trtllm_fp8_per_tensor_scale_moe_step_trace = _make_step_moe_trace(
+    trtllm_fp8_per_tensor_scale_moe_trace
+)
+trtllm_fp8_per_tensor_scale_routed_moe_step_trace = _make_step_moe_trace(
+    trtllm_fp8_per_tensor_scale_routed_moe_trace
+)
+
+trtllm_bf16_moe_trace_dispatch = _make_step_moe_trace_dispatch(
+    trtllm_bf16_moe_trace, trtllm_bf16_moe_step_trace
+)
+trtllm_bf16_routed_moe_trace_dispatch = _make_step_moe_trace_dispatch(
+    trtllm_bf16_routed_moe_trace, trtllm_bf16_routed_moe_step_trace
+)
+trtllm_fp8_per_tensor_scale_moe_trace_dispatch = _make_step_moe_trace_dispatch(
+    trtllm_fp8_per_tensor_scale_moe_trace, trtllm_fp8_per_tensor_scale_moe_step_trace
+)
+trtllm_fp8_per_tensor_scale_routed_moe_trace_dispatch = _make_step_moe_trace_dispatch(
+    trtllm_fp8_per_tensor_scale_routed_moe_trace,
+    trtllm_fp8_per_tensor_scale_routed_moe_step_trace,
+)
+trtllm_fp8_block_scale_routed_moe_step_trace = _make_step_moe_trace(
+    trtllm_fp8_block_scale_routed_moe_trace, mxfp8=True
+)
+trtllm_fp8_block_scale_routed_moe_trace_dispatch = _make_step_moe_trace_dispatch(
+    trtllm_fp8_block_scale_routed_moe_trace,
+    trtllm_fp8_block_scale_routed_moe_step_trace,
+)
+_STEP_MXFP8_TRACE_BY_ROUTING_TYPE = {
+    routing: _make_step_moe_trace(base, mxfp8=True)
+    for routing, base in _MOE_TRACE_BY_ROUTING_TYPE.items()
+}
+trtllm_mxfp8_step_shared_experts_trace = _make_step_moe_trace(
+    trtllm_fp8_block_scale_moe_ds_shared_experts_trace, mxfp8=True
+)
+trtllm_fp8_block_scale_moe_trace_dispatch.templates += [  # type: ignore[attr-defined]
+    *_STEP_MXFP8_TRACE_BY_ROUTING_TYPE.values(),
+    trtllm_mxfp8_step_shared_experts_trace,
+]
+
+for _fp8_reference in (
+    _trtllm_fp8_block_scale_moe_ds_routing_reference,
+    _trtllm_fp8_block_scale_moe_default_routing_reference,
+    _trtllm_fp8_block_scale_moe_renormalize_routing_reference,
+    _trtllm_fp8_block_scale_moe_llama4_routing_reference,
+    _trtllm_fp8_block_scale_moe_renormalize_naive_routing_reference,
+    _trtllm_fp8_block_scale_moe_topk_routing_reference,
+):
+    cast(Any, _fp8_reference)._trace_reference_dependencies = (
+        _unswizzle_batched_sf_128x4,
+        _trtllm_unshuffle_weight,
+        _fp8_moe_run_experts,
+    )
+cast(
+    Any, _trtllm_fp8_block_scale_routed_moe_reference
+)._trace_reference_dependencies = (
+    _step_decode_precomputed_routing,
+    _unswizzle_batched_sf_128x4,
+    _trtllm_unshuffle_weight,
+    _fp8_moe_run_experts,
+)
+_FP4_REFERENCE_DEPENDENCIES = (
+    _unswizzle_batched_sf_128x4,
+    _trtllm_unshuffle_weight,
+    _unpack_fp4_e2m1,
+    _ue8m0_to_float32,
+    _decode_block_scales,
+    _dequantize_fp4_tensor,
+    _dequantize_fp4_hidden_states,
+    _fp4_moe_run_experts,
+)
+for _fp4_reference in (
+    _trtllm_fp4_block_scale_moe_default_routing_reference,
+    _trtllm_fp4_block_scale_moe_renormalize_routing_reference,
+    _trtllm_fp4_block_scale_moe_ds_routing_reference,
+    _trtllm_fp4_block_scale_moe_llama4_routing_reference,
+    _trtllm_fp4_block_scale_moe_renormalize_naive_routing_reference,
+    _trtllm_fp4_block_scale_moe_topk_routing_reference,
+):
+    cast(
+        Any, _fp4_reference
+    )._trace_reference_dependencies = _FP4_REFERENCE_DEPENDENCIES
+cast(
+    Any, _trtllm_fp4_block_scale_routed_moe_reference
+)._trace_reference_dependencies = (
+    *_FP4_REFERENCE_DEPENDENCIES,
+    _step_decode_precomputed_routing,
+)
+
+
 # MxInt4 block-scale MoE
 trtllm_mxint4_block_scale_moe_trace = TraceTemplate(
     op_type="moe",
@@ -3572,15 +4112,15 @@ trtllm_mxint4_block_scale_moe_trace = TraceTemplate(
 
 
 # ---------------------------------------------------------------------------
-# CuteDSL MoE variants (precomputed routing, NvFP4 weights on SM100+)
+# CuteDSL MoE variants (precomputed routing, FP4 weights on SM100+)
 # ---------------------------------------------------------------------------
 
-cute_dsl_fused_moe_nvfp4_trace = TraceTemplate(
+cute_dsl_fused_moe_trace = TraceTemplate(
     op_type="moe",
-    name_prefix="cute_dsl_fused_moe_nvfp4",
+    name_prefix="cute_dsl_fused_moe",
     description=(
-        "CuteDSL NVFP4 fused MoE (SM100/SM103). Runs explicit W4A4 or W4A16 "
-        "compute with precomputed top-k routing and per-expert alpha scales."
+        "CuteDSL fused MoE on SM100, SM103, or SM107 (W4A8 excludes SM107). "
+        "Runs W4A4, W4A8, or W4A16 with precomputed top-k routing."
     ),
     axes={
         "num_tokens": Var(description="Total tokens across the batch."),
@@ -3590,18 +4130,26 @@ cute_dsl_fused_moe_nvfp4_trace = TraceTemplate(
         "hidden_size": Const(abbrev="h"),
         "intermediate_size": Var(description="MoE intermediate size (kwarg)."),
         "input_width": Var(
-            description="hidden_size // 2 for NVFP4 input or hidden_size for BF16."
+            description="hidden_size // 2 for W4A4 or hidden_size for W4A8/W4A16."
         ),
-        "num_packed_hidden": Var(description="hidden_size // 2 (NvFP4 packed)."),
+        "num_packed_hidden": Var(description="hidden_size // 2 (packed FP4)."),
         "num_packed_intermediate": Var(
-            description="intermediate_size // 2 (NvFP4 packed)."
+            description="intermediate_size // 2 (packed FP4)."
         ),
         "num_fp4_hidden_blocks": Var(
-            description="NvFP4 scale-factor count along hidden_size."
+            description="Scale-factor count along hidden_size (x_sf)."
         ),
-        "num_fp4_intermediate_blocks": Var(
-            description="NvFP4 scale-factor count along intermediate_size."
+        "sf_atom_m": Const(abbrev="", value=32, description="MMA SF atom rows."),
+        "sf_atom_m_inner": Const(
+            abbrev="", value=4, description="MMA SF atom inner-row count."
         ),
+        "sf_atom_k": Const(
+            abbrev="", value=4, description="MMA SF atom inner-K count."
+        ),
+        "w1_sf_m_tiles": Var(description="ceil(gemm1_out_size / 128)."),
+        "w1_sf_k_tiles": Var(description="ceil(hidden_size / 128)."),
+        "w2_sf_m_tiles": Var(description="ceil(hidden_size / 128)."),
+        "w2_sf_k_tiles": Var(description="ceil(intermediate_size / 128)."),
         "gemm1_out_size": Const(
             abbrev="",
             description=(
@@ -3609,16 +4157,17 @@ cute_dsl_fused_moe_nvfp4_trace = TraceTemplate(
                 "intermediate_size for non-gated ReLU^2."
             ),
         ),
+        "nvfp4_4over6": _nvfp4_4over6_axis(),
     },
     inputs={
         "x": Tensor(
             ["num_tokens", "input_width"],
-            description="Packed NVFP4 input for W4A4 or BF16 input for W4A16.",
+            description="Packed W4A4, MXFP8 W4A8, or BF16 W4A16 input.",
         ),
         "x_sf": Tensor(
             ["num_tokens", "num_fp4_hidden_blocks"],
             optional=True,
-            description="NVFP4 activation scales for W4A4; omitted for W4A16.",
+            description="Activation scales for W4A4/W4A8; omitted for W4A16.",
         ),
         "token_selected_experts": Tensor(
             ["num_tokens", "top_k"],
@@ -3632,11 +4181,21 @@ cute_dsl_fused_moe_nvfp4_trace = TraceTemplate(
         ),
         "w1_weight": Tensor(
             ["num_local_experts", "gemm1_out_size", "num_packed_hidden"],
-            description="FC1 weights, NvFP4-packed.",
+            description="Packed FP4 FC1 weights (float8_e4m3fn for mxfp8).",
         ),
         "w1_weight_sf": Tensor(
-            ["num_local_experts", "gemm1_out_size", "num_fp4_hidden_blocks"],
-            description="FC1 NvFP4 scales.",
+            [
+                "sf_atom_m",
+                "sf_atom_m_inner",
+                "w1_sf_m_tiles",
+                "sf_atom_k",
+                "w1_sf_k_tiles",
+                "num_local_experts",
+            ],
+            description=(
+                "FC1 weight scales in the 6D MMA layout emitted by "
+                "convert_sf_to_mma_layout."
+            ),
         ),
         "w1_alpha": Tensor(
             ["num_local_experts"],
@@ -3648,16 +4207,27 @@ cute_dsl_fused_moe_nvfp4_trace = TraceTemplate(
             dtype="float32",
             optional=True,
             description=(
-                "Global scale for W4A4 FC2 input quantization; omitted for W4A16."
+                "Global scale for W4A4 FC2 input quantization; omitted for "
+                "W4A8/W4A16/MXFP8."
             ),
         ),
         "w2_weight": Tensor(
             ["num_local_experts", "hidden_size", "num_packed_intermediate"],
-            description="FC2 weights, NvFP4-packed.",
+            description="Packed FP4 FC2 weights (float8_e4m3fn for mxfp8).",
         ),
         "w2_weight_sf": Tensor(
-            ["num_local_experts", "hidden_size", "num_fp4_intermediate_blocks"],
-            description="FC2 NvFP4 scales.",
+            [
+                "sf_atom_m",
+                "sf_atom_m_inner",
+                "w2_sf_m_tiles",
+                "sf_atom_k",
+                "w2_sf_k_tiles",
+                "num_local_experts",
+            ],
+            description=(
+                "FC2 weight scales in the 6D MMA layout emitted by "
+                "convert_sf_to_mma_layout."
+            ),
         ),
         "w2_alpha": Tensor(
             ["num_local_experts"],
@@ -3673,7 +4243,7 @@ cute_dsl_fused_moe_nvfp4_trace = TraceTemplate(
         "quant_mode": Scalar(
             "string",
             optional=True,
-            description="Compute mode: 'nvfp4'/'w4a4' or 'w4a16'.",
+            description="Compute mode: 'w4a4', 'w4a8', 'w4a16', or 'mxfp8'.",
         ),
         "num_experts": Scalar("int32", description="Total number of experts."),
         "top_k": Scalar("int32", description="Number of experts per token."),
@@ -3724,13 +4294,13 @@ cute_dsl_fused_moe_nvfp4_trace = TraceTemplate(
             description="MoE output.",
         ),
     },
-    tags=["status:experimental", "backend:cute-dsl", "quantization:nvfp4"],
+    tags=["status:experimental", "backend:cute-dsl", "quantization:block-scaled"],
 )
-cute_dsl_fused_moe_nvfp4_trace.axes["one"] = Var(
+cute_dsl_fused_moe_trace.axes["one"] = Var(
     description="Placeholder for shape [1] scalars."
 )
 
-_cute_dsl_wrapper_inputs = dict(cute_dsl_fused_moe_nvfp4_trace.inputs)
+_cute_dsl_wrapper_inputs = dict(cute_dsl_fused_moe_trace.inputs)
 # num_experts / top_k live on the wrapper instance (set in __init__), not on run().
 _cute_dsl_wrapper_inputs["num_experts"] = Scalar(
     "int32",
@@ -3778,7 +4348,7 @@ _cute_dsl_wrapper_inputs["situ_linear_beta"] = Scalar(
     description="Set at wrapper __init__, not passed to run().",
 )
 
-_cute_dsl_wrapper_axes = dict(cute_dsl_fused_moe_nvfp4_trace.axes)
+_cute_dsl_wrapper_axes = dict(cute_dsl_fused_moe_trace.axes)
 # num_experts / top_k are set at __init__ time — no tensor on run() has a
 # num_experts dim, so the axis must be a Var here.
 _cute_dsl_wrapper_axes["num_experts"] = Var(description="Total number of experts.")
@@ -3788,18 +4358,20 @@ cute_dsl_moe_wrapper_run_trace = TraceTemplate(
     op_type="moe",
     name_prefix="cute_dsl_moe_wrapper",
     description=(
-        "CuteDslMoEWrapper.run(): stateful version of cute_dsl_fused_moe_nvfp4 "
+        "CuteDslMoEWrapper.run(): stateful version of cute_dsl_fused_moe "
         "(same schema; wrapper persists autotuning state across calls)."
     ),
     axes=_cute_dsl_wrapper_axes,
     inputs=_cute_dsl_wrapper_inputs,
-    outputs=dict(cute_dsl_fused_moe_nvfp4_trace.outputs),
-    tags=cute_dsl_fused_moe_nvfp4_trace.tags,
+    outputs=dict(cute_dsl_fused_moe_trace.outputs),
+    tags=cute_dsl_fused_moe_trace.tags,
 )
 
 
 # ---------------------------------------------------------------------------
-# CuteDSL MoE, MXFP8 activations x MXFP4 weights (SM100+)
+# Deprecated dtype-specific CuteDSL MoE (MXFP8 x MXFP4 / W4A8).
+# Kept so the deprecated cute_dsl_fused_moe_mxfp8_mxfp4 entry points keep
+# their own fi_trace() schema until they are removed at release.
 # ---------------------------------------------------------------------------
 
 cute_dsl_fused_moe_mxfp8_mxfp4_trace = TraceTemplate(
@@ -3981,6 +4553,249 @@ cute_dsl_mxfp8_mxfp4_moe_wrapper_run_trace = TraceTemplate(
 
 
 # ---------------------------------------------------------------------------
+# AlphaMoE NVFP4 (SM100/SM103 aligned and routed compute)
+# ---------------------------------------------------------------------------
+
+alphamoe_nvfp4_aligned_moe_trace = TraceTemplate(
+    op_type="moe",
+    name_prefix="alphamoe_nvfp4_aligned_moe",
+    description=(
+        "AlphaMoE NVFP4 up projection, SwiGLU requantization, and down "
+        "projection over a caller-provided aligned routing plan. Mutates the "
+        "preallocated BF16 out accumulator in place."
+    ),
+    axes={
+        "num_tokens": Var(description="Number of input tokens."),
+        "top_k": Const(abbrev="topk", description="Routes per token."),
+        "num_experts": Const(abbrev="e", description="Number of experts."),
+        "hidden_size": Const(abbrev="h", description="Logical hidden size K."),
+        "gemm1_out_size": Const(
+            abbrev="n", description="Combined gate/up row count N."
+        ),
+        "block_m": Const(abbrev="bm", description="Aligned-plan block size."),
+        "num_packed_hidden": Const(abbrev=""),
+        "num_hidden_scale_blocks": Const(abbrev=""),
+        "num_packed_intermediate": Const(abbrev=""),
+        "num_intermediate_scale_blocks": Const(abbrev=""),
+        "sorted_token_capacity": Var(description="Aligned-plan entry capacity."),
+        "route_block_capacity": Var(description="Aligned-plan block capacity."),
+        "one": Const(abbrev="", description="One-element device extent."),
+        "w1_prepared_panels": Var(
+            description="Physical panels of the optional W1 scale panels."
+        ),
+        "w1_prepared_rows": Var(
+            description="Physical rows of the optional W1 scale panels."
+        ),
+        "w1_prepared_columns": Var(
+            description="Physical columns of the optional W1 scale panels."
+        ),
+        "w2_prepared_panels": Var(
+            description="Physical panels of the optional W2 scale panels."
+        ),
+        "w2_prepared_rows": Var(
+            description="Physical rows of the optional W2 scale panels."
+        ),
+        "w2_prepared_columns": Var(
+            description="Physical columns of the optional W2 scale panels."
+        ),
+    },
+    inputs={
+        "hidden_states": Tensor(
+            ["num_tokens", "num_packed_hidden"],
+            dtype="uint8",
+            description="Packed E2M1 activations (even logical value in low nibble).",
+        ),
+        "hidden_states_scale": Tensor(
+            ["num_tokens", "num_hidden_scale_blocks"],
+            dtype="float8_e4m3fn",
+            description="Linear E4M3 scales, one per 16 logical values.",
+        ),
+        "gemm1_weights": Tensor(
+            ["num_experts", "gemm1_out_size", "num_packed_hidden"],
+            dtype="uint8",
+            description="Packed E2M1 gate/up weights in conventional row order.",
+        ),
+        "gemm1_weights_scale": Tensor(
+            ["num_experts", "gemm1_out_size", "num_hidden_scale_blocks"],
+            dtype="float8_e4m3fn",
+            description="Linear per-16 E4M3 gate/up weight scales.",
+        ),
+        "gemm2_weights": Tensor(
+            ["num_experts", "hidden_size", "num_packed_intermediate"],
+            dtype="uint8",
+            description="Packed E2M1 down-projection weights.",
+        ),
+        "gemm2_weights_scale": Tensor(
+            ["num_experts", "hidden_size", "num_intermediate_scale_blocks"],
+            dtype="float8_e4m3fn",
+            description="Linear per-16 E4M3 down-projection weight scales.",
+        ),
+        "w1_scale_prepared": Tensor(
+            ["w1_prepared_panels", "w1_prepared_rows", "w1_prepared_columns"],
+            dtype="uint8",
+            optional=True,
+            description="Immutable W1 scale panels prepared before requests; native rows/columns are 16/128.",
+        ),
+        "w2_scale_prepared": Tensor(
+            ["w2_prepared_panels", "w2_prepared_rows", "w2_prepared_columns"],
+            dtype="uint8",
+            optional=True,
+            description="Immutable W2 scale panels prepared before requests; native rows/columns are 8/128.",
+        ),
+        "output1_scale_gate_scalar": Tensor(
+            ["num_experts"],
+            dtype="float32",
+            description="Per-expert gate scale applied before SiLU.",
+        ),
+        "output1_scale_scalar": Tensor(
+            ["num_experts"],
+            dtype="float32",
+            description=(
+                "Per-expert up-projection scale; static ModelOpt uses the "
+                "up global scale divided by the second-activation scale."
+            ),
+        ),
+        "output2_scale_scalar": Tensor(
+            ["num_experts"],
+            dtype="float32",
+            description=(
+                "Per-expert down-projection scale applied before route weighting."
+            ),
+        ),
+        "sorted_token_ids": Tensor(
+            ["sorted_token_capacity"],
+            dtype="int32",
+            description="Capacity-sized aligned-plan token/route positions.",
+        ),
+        "expert_ids": Tensor(
+            ["route_block_capacity"],
+            dtype="int32",
+            description="Expert id for each capacity-sized routing block.",
+        ),
+        "num_tokens_post_padded": Tensor(
+            ["one"],
+            dtype="int32",
+            description="Device-side valid aligned-plan extent.",
+        ),
+        "topk_weights": Tensor(
+            ["num_tokens", "top_k"],
+            dtype="float32",
+            description="Routing weight for each token/route pair.",
+        ),
+        "out": Tensor(
+            ["num_tokens", "hidden_size"],
+            dtype="bfloat16",
+            description="Caller-owned BF16 accumulator mutated in place.",
+        ),
+        "top_k": Scalar("int32", description="Routes per token."),
+        "block_m": Scalar("int32", description="Aligned-plan block size."),
+        "routed_scaling_factor": Scalar(
+            "float32", description="Additional routed contribution scale."
+        ),
+    },
+    outputs={
+        "out": Tensor(
+            ["num_tokens", "hidden_size"],
+            param="out",
+            dtype="bfloat16",
+            description="Updated caller-owned BF16 accumulator.",
+        )
+    },
+    constraints=[
+        "hidden_size == 2 * num_packed_hidden",
+        "hidden_size == 16 * num_hidden_scale_blocks",
+        "gemm1_out_size == 4 * num_packed_intermediate",
+        "gemm1_out_size == 32 * num_intermediate_scale_blocks",
+        "hidden_size >= 256 and hidden_size % 256 == 0",
+        "gemm1_out_size >= 256 and gemm1_out_size % 256 == 0",
+        "top_k <= num_experts",
+        "block_m >= 8 and block_m % 8 == 0",
+        "sorted_token_capacity >= route_block_capacity * block_m",
+        "one == 1",
+    ],
+    tags=[
+        "status:experimental",
+        "backend:alphamoe",
+        "quantization:nvfp4",
+        "routing:prealigned",
+    ],
+)
+
+
+alphamoe_nvfp4_routed_moe_trace = TraceTemplate(
+    op_type="moe",
+    name_prefix="alphamoe_nvfp4_routed_moe",
+    description=(
+        "AlphaMoE NVFP4 route alignment, FP32 accumulator seeding, gate/up, "
+        "SwiGLU requantization, down projection and weighted accumulation. "
+        "Updates the caller's routing workspace and BF16 output in place."
+    ),
+    axes=dict(
+        alphamoe_nvfp4_aligned_moe_trace.axes,
+        cumsum_capacity=Var(description="Caller-provided route prefix-sum capacity."),
+        w1_data_panels=Var(description="Physical panels of prepared W1 data."),
+        w1_data_rows=Var(description="Physical rows of prepared W1 data."),
+        w1_data_columns=Var(description="Physical columns of prepared W1 data."),
+        w1_gate_up_records=Var(
+            description="Adjacent gate/up records of W1 data and scales."
+        ),
+        w1_gate_up_data_rows=Var(description="Rows per adjacent data record, 256."),
+        w1_gate_up_scale_rows=Var(description="Rows per adjacent scale record, 32."),
+        w1_gate_up_columns=Var(description="Bytes per adjacent record row, 128."),
+    ),
+    inputs=dict(
+        alphamoe_nvfp4_aligned_moe_trace.inputs,
+        w1_data_prepared=Tensor(
+            ["w1_data_panels", "w1_data_rows", "w1_data_columns"],
+            dtype="uint8",
+            optional=True,
+            description="Immutable packed W1 panels prepared before requests; rows/columns are 128/128.",
+        ),
+        w1_gate_up_data_prepared=Tensor(
+            ["w1_gate_up_records", "w1_gate_up_data_rows", "w1_gate_up_columns"],
+            dtype="uint8",
+            optional=True,
+            description="Immutable adjacent gate/up data prepared before requests.",
+        ),
+        w1_gate_up_scale_prepared=Tensor(
+            ["w1_gate_up_records", "w1_gate_up_scale_rows", "w1_gate_up_columns"],
+            dtype="uint8",
+            optional=True,
+            description="Immutable adjacent gate/up scale panels prepared before requests.",
+        ),
+        topk_ids=Tensor(
+            ["num_tokens", "top_k"],
+            dtype="int32",
+            description="Expert IDs for each input token and route.",
+        ),
+        cumsum_buffer=Tensor(
+            ["cumsum_capacity"],
+            dtype="int32",
+            description="Caller-owned prefix-sum workspace updated during alignment.",
+        ),
+    ),
+    outputs=dict(
+        alphamoe_nvfp4_aligned_moe_trace.outputs,
+        sorted_token_ids=Tensor(
+            ["sorted_token_capacity"], param="sorted_token_ids", dtype="int32"
+        ),
+        expert_ids=Tensor(["route_block_capacity"], param="expert_ids", dtype="int32"),
+        num_tokens_post_padded=Tensor(
+            ["one"], param="num_tokens_post_padded", dtype="int32"
+        ),
+        cumsum_buffer=Tensor(["cumsum_capacity"], param="cumsum_buffer", dtype="int32"),
+    ),
+    constraints=list(alphamoe_nvfp4_aligned_moe_trace.constraints),
+    tags=[
+        "status:experimental",
+        "backend:alphamoe",
+        "quantization:nvfp4",
+        "routing:topk_ids",
+    ],
+)
+
+
+# ---------------------------------------------------------------------------
 # B12x MoE (SM120/SM121 CuTe-DSL, bf16 input + FP4 packed weights)
 # ---------------------------------------------------------------------------
 
@@ -4010,6 +4825,9 @@ b12x_fused_moe_trace = TraceTemplate(
         "input_global_scale_size": Var(
             description="1 (shared scale) or num_local_experts."
         ),
+        # Var because a Const axis sourced from this optional tensor would
+        # get no value when the map is absent.
+        "num_global_experts": Var(description="Equals num_experts."),
     },
     inputs={
         "x": Tensor(
@@ -4043,6 +4861,15 @@ b12x_fused_moe_trace = TraceTemplate(
         ),
         "num_experts": Scalar("int32", description="Total experts."),
         "top_k": Scalar("int32"),
+        "expert_map": Tensor(
+            ["num_global_experts"],
+            dtype="int32",
+            optional=True,
+            description=(
+                "Global-to-local expert map for expert parallelism (-1 for "
+                "non-local experts). Only with quant_mode='w4a16'."
+            ),
+        ),
         "w1_alpha": Tensor(
             ["num_local_experts"],
             dtype="float32",
@@ -4127,6 +4954,12 @@ _b12x_wrapper_inputs["num_experts"] = Scalar(
     optional=True,
     description="Set at wrapper __init__, not passed to run().",
 )
+_b12x_wrapper_inputs["expert_map"] = Tensor(
+    ["num_global_experts"],
+    dtype="int32",
+    optional=True,
+    description="Set at wrapper __init__, not passed to run().",
+)
 _b12x_wrapper_inputs["top_k"] = Scalar(
     "int32",
     optional=True,
@@ -4139,7 +4972,7 @@ _b12x_wrapper_axes["top_k"] = Var(description="Experts per token.")
 
 
 @torch.no_grad()
-def _cute_dsl_fused_moe_nvfp4_reference(
+def _cute_dsl_fused_moe_reference(
     x,
     x_sf,
     token_selected_experts,
@@ -4163,9 +4996,7 @@ def _cute_dsl_fused_moe_nvfp4_reference(
     per_token_scale=None,
     **_unused,
 ):
-    """Reference for CuteDSL NvFP4 fused MoE — bridges to the FP4
-    block-scale kernel with alpha scales folded into the dequantized
-    weights."""
+    """Reference for CuteDSL block-scaled MoE with alpha folded into weights."""
     E_local = w1_weight.shape[0]
     # Dequantize input and weights with alpha factors.
     quant_mode = quant_mode.lower()
@@ -4173,14 +5004,46 @@ def _cute_dsl_fused_moe_nvfp4_reference(
         if x_sf is None:
             raise ValueError("x_sf is required when quant_mode='w4a4'")
         hs_deq = _dequantize_fp4_tensor(x, x_sf, is_ue8m0_scales=False)
+    elif quant_mode in ("w4a8", "mxfp8"):
+        if x_sf is None:
+            raise ValueError(f"x_sf is required when quant_mode={quant_mode!r}")
+        hs_deq = _dequantize_fp4_hidden_states(x, x_sf, is_weights_mxfp4=True)
     elif quant_mode == "w4a16":
         if x_sf is not None:
             raise ValueError("x_sf must be None when quant_mode='w4a16'")
         hs_deq = x.to(torch.float32)
     else:
         raise ValueError(f"Unsupported quant_mode {quant_mode!r}")
-    W1 = _dequantize_fp4_tensor(w1_weight, w1_weight_sf, is_ue8m0_scales=False)
-    W2 = _dequantize_fp4_tensor(w2_weight, w2_weight_sf, is_ue8m0_scales=False)
+    is_mxfp4 = quant_mode == "w4a8"
+    is_mxfp8 = quant_mode == "mxfp8"
+    if is_mxfp4 or is_mxfp8:
+
+        def mma_scales_to_logical(scales, rows, columns):
+            groups = scales.shape[5]
+            return (
+                scales.permute(5, 2, 1, 0, 4, 3)
+                .contiguous()
+                .reshape(groups, -1, scales.shape[4] * 4)[:, :rows, : columns // 32]
+            )
+
+        # FP4 weights pack two values per byte; FP8 weights are unpacked.
+        k_per_byte = 2 if is_mxfp4 else 1
+        w1_weight_sf = mma_scales_to_logical(
+            w1_weight_sf, w1_weight.shape[1], w1_weight.shape[2] * k_per_byte
+        )
+        w2_weight_sf = mma_scales_to_logical(
+            w2_weight_sf, w2_weight.shape[1], w2_weight.shape[2] * k_per_byte
+        )
+    if is_mxfp8:
+        W1 = _dequantize_fp4_hidden_states(
+            w1_weight, w1_weight_sf, is_weights_mxfp4=True
+        )
+        W2 = _dequantize_fp4_hidden_states(
+            w2_weight, w2_weight_sf, is_weights_mxfp4=True
+        )
+    else:
+        W1 = _dequantize_fp4_tensor(w1_weight, w1_weight_sf, is_ue8m0_scales=is_mxfp4)
+        W2 = _dequantize_fp4_tensor(w2_weight, w2_weight_sf, is_ue8m0_scales=is_mxfp4)
     if per_token_scale is not None:
         hs_deq = hs_deq * per_token_scale.to(torch.float32).view(-1, 1)
     W1 = W1 * w1_alpha.to(torch.float32).view(E_local, 1, 1)
@@ -4281,6 +5144,7 @@ def _b12x_moe_run_experts(
     fc2_input_scale,
     quant_mode=None,
     source_format="modelopt",
+    expert_map=None,
 ):
     """B12x MoE expert computation with optional FP4 activation quantization."""
     quant_mode = _b12x_quant_mode(quant_mode, activation_precision)
@@ -4297,9 +5161,16 @@ def _b12x_moe_run_experts(
     W1 = gemm1_weights.to(torch.float32)
     W2 = gemm2_weights.to(torch.float32)
     output = torch.zeros((T, H), dtype=torch.float32, device=device)
-    local_start = int(local_expert_offset)
-    for le in range(E_local):
-        ge = local_start + le
+    if expert_map is not None:
+        expert_pairs = [
+            (le, ge) for ge, le in enumerate(expert_map.tolist()) if le >= 0
+        ]
+        if any(le >= E_local for le, _ in expert_pairs):
+            raise ValueError("expert_map local ids exceed the local expert count")
+    else:
+        local_start = int(local_expert_offset)
+        expert_pairs = [(le, local_start + le) for le in range(E_local)]
+    for le, ge in expert_pairs:
         if ge < 0 or ge >= E_global:
             continue
         sel_mask = (topk_idx == ge).any(dim=1)
@@ -4348,6 +5219,7 @@ def _b12x_fused_moe_reference(
     activation_precision="fp4",
     quant_mode=None,
     source_format="modelopt",
+    expert_map=None,
     **_unused,
 ):
     """Reference for B12x CuTe-DSL fused MoE (bf16 input, FP4 weights)."""
@@ -4370,11 +5242,12 @@ def _b12x_fused_moe_reference(
         fc2_input_scale=fc2_input_scale,
         quant_mode=quant_mode,
         source_format=source_format,
+        expert_map=expert_map,
     )
 
 
-cute_dsl_fused_moe_nvfp4_trace.reference = _cute_dsl_fused_moe_nvfp4_reference
-cute_dsl_moe_wrapper_run_trace.reference = _cute_dsl_fused_moe_nvfp4_reference
+cute_dsl_fused_moe_trace.reference = _cute_dsl_fused_moe_reference
+cute_dsl_moe_wrapper_run_trace.reference = _cute_dsl_fused_moe_reference
 b12x_fused_moe_trace.reference = _b12x_fused_moe_reference
 
 
@@ -4616,4 +5489,637 @@ trtllm_gen_routing_trace = TraceTemplate(
     constraints=["num_fused_shared_experts == 0"],
     tags=["status:verified", "moe", "moe:routing"],
     init=_trtllm_gen_routing_init,
+)
+
+
+# ---------------------------------------------------------------------------
+# SM90 (Hopper) CuTe-DSL unquantized fused MoE
+# ---------------------------------------------------------------------------
+
+cute_dsl_fused_moe_bf16_trace = TraceTemplate(
+    op_type="moe",
+    name_prefix="cute_dsl_fused_moe_bf16",
+    description=(
+        "SM90 (Hopper) CuTe-DSL unquantized (bf16/fp16) fused MoE: moe_sort "
+        "routing maps + gather-fused grouped GEMM1 with the activation in its "
+        "epilogue (SwiGLU/OAI/SiTU, GeGLU-tanh, or non-gated ReLU^2) "
+        "+ grouped GEMM2 with fused finalize. Pre-routed "
+        "(token_selected_experts + token_final_scales)."
+    ),
+    axes={
+        "num_tokens": Var(description="Total tokens across the batch."),
+        "hidden_size": Const(abbrev="h"),
+        "gemm1_out_size": Var(
+            description=(
+                "FC1 output rows: 2 * intermediate_size for gated activations, "
+                "intermediate_size for Relu2."
+            )
+        ),
+        "intermediate_size": Var(description="MoE intermediate size per rank."),
+        "num_local_experts": Const(abbrev="e"),
+        "top_k": Const(abbrev="topk"),
+    },
+    inputs={
+        "x": Tensor(
+            ["num_tokens", "hidden_size"],
+            description="Input activations (bfloat16 or float16).",
+        ),
+        "token_selected_experts": Tensor(
+            ["num_tokens", "top_k"],
+            dtype="int32",
+            description="Precomputed top-k GLOBAL expert ids per token.",
+        ),
+        "token_final_scales": Tensor(
+            ["num_tokens", "top_k"],
+            dtype="float32",
+            description="Precomputed per-token routing scales.",
+        ),
+        "w1_weight": Tensor(
+            ["num_local_experts", "gemm1_out_size", "hidden_size"],
+            description=(
+                "FC1 weights. Gated activations: up/gate interleaved at 32 "
+                "columns (reference repack: interleave_up_gate_sm90; frameworks "
+                "keep their own copy, the SM100 convention). Relu2: a plain "
+                "[E, I, hidden] projection."
+            ),
+        ),
+        "w2_weight": Tensor(
+            ["num_local_experts", "hidden_size", "intermediate_size"],
+            description="FC2 (down-projection) weights.",
+        ),
+        "num_experts": Scalar("int32", description="Total (global) expert count."),
+        "top_k": Scalar("int32", description="Experts per token."),
+        "num_local_experts": Scalar(
+            "int32", optional=True, description="Experts held by this rank (EP)."
+        ),
+        "local_expert_offset": Scalar(
+            "int32", optional=True, description="Global id of the first local expert."
+        ),
+        "activation_type": Scalar(
+            "int32",
+            optional=True,
+            description=(
+                "GEMM1 activation type: ActivationType.Swiglu for gated "
+                "SwiGLU/OAI/SiTU, ActivationType.GegluTanh for "
+                "tanh-approximate GeGLU, or ActivationType.Relu2 for "
+                "non-gated ReLU^2. Determines gemm1_out_size."
+            ),
+        ),
+        "swiglu_alpha": Scalar(
+            "float32", optional=True, description="SwiGLU sigmoid multiplier."
+        ),
+        "swiglu_beta": Scalar(
+            "float32", optional=True, description="SwiGLU up-projection bias."
+        ),
+        "swiglu_limit": Scalar(
+            "float32", optional=True, description="SwiGLU clamp limit."
+        ),
+        "situ_beta": Scalar(
+            "float32",
+            optional=True,
+            description="SiTU gate tanh-clamp beta; enables SiTU when set.",
+        ),
+        "situ_linear_beta": Scalar(
+            "float32",
+            optional=True,
+            description="Optional SiTU up-branch tanh-clamp beta.",
+        ),
+    },
+    outputs={
+        "output": Tensor(
+            ["num_tokens", "hidden_size"],
+            dtype_from="x",
+            description="MoE output.",
+        ),
+    },
+    tags=["status:experimental", "backend:cute-dsl", "moe:sm90"],
+)
+
+
+# ---------------------------------------------------------------------------
+# Two-way partitioned Prims-TS MoE
+# ---------------------------------------------------------------------------
+# Partitioned APIs consume two caller-owned prepared-weight shards rather than
+# one logical weight tensor.  Template dispatch keeps the physical MajorK and
+# BlockMajorK ranks, FP4 activation format, and partition strategy explicit so
+# distinct executable variants cannot overwrite one another's trace files.
+# The resources handle is deliberately omitted: streams and synchronization
+# events are execution context rather than benchmark inputs.
+
+_PRIMS_TS_PARTITION_STRATEGIES = ("tp_n_tp_n", "tp_n_tp_k")
+_PRIMS_TS_WEIGHT_LAYOUTS = {0: "major_k", 2: "block_major_k"}
+
+
+class _Nvfp4PartitionTraceTemplate(TraceTemplate):
+    """TraceTemplate whose logical H is twice packed NVFP4 activation storage."""
+
+    derived_axes = frozenset({"hidden_size"})
+
+    def _build_axis_extractors(self):
+        extractors = super()._build_axis_extractors()
+
+        def logical_hidden_size(kwargs):
+            hidden_states = kwargs.get("hidden_states")
+            if hidden_states is None or hidden_states.ndim < 2:
+                return None
+            return int(hidden_states.shape[1]) * 2
+
+        extractors["hidden_size"] = logical_hidden_size
+        return extractors
+
+
+def _partitioned_weight_axes(layout: str) -> dict[str, Const]:
+    common = {
+        "fc1_shard_rows": Const(
+            abbrev="", description="Physical prepared FC1 rows per partition."
+        ),
+        "fc2_shard_rows": Const(
+            abbrev="", description="Physical prepared FC2 rows per partition."
+        ),
+    }
+    if layout == "major_k":
+        return {
+            **common,
+            "fc1_storage_k": Const(
+                abbrev="", description="Physical prepared FC1 K storage."
+            ),
+            "fc2_storage_k": Const(
+                abbrev="", description="Physical prepared FC2 K storage."
+            ),
+        }
+    return {
+        **common,
+        "fc1_k_blocks": Const(abbrev="", description="Prepared FC1 K-block count."),
+        "fc1_block_elements": Const(
+            abbrev="", description="Prepared FC1 elements per K block."
+        ),
+        "fc2_k_blocks": Const(abbrev="", description="Prepared FC2 K-block count."),
+        "fc2_block_elements": Const(
+            abbrev="", description="Prepared FC2 elements per K block."
+        ),
+    }
+
+
+def _partitioned_weight_inputs(layout: str) -> dict[str, Tensor]:
+    if layout == "major_k":
+        fc1_shape = ["num_local_experts", "fc1_shard_rows", "fc1_storage_k"]
+        fc2_shape = ["num_local_experts", "fc2_shard_rows", "fc2_storage_k"]
+    else:
+        fc1_shape = [
+            "num_local_experts",
+            "fc1_k_blocks",
+            "fc1_shard_rows",
+            "fc1_block_elements",
+        ]
+        fc2_shape = [
+            "num_local_experts",
+            "fc2_k_blocks",
+            "fc2_shard_rows",
+            "fc2_block_elements",
+        ]
+    return {
+        f"gemm{fc}_weights_{partition}": Tensor(
+            fc1_shape if fc == 1 else fc2_shape,
+            param=f"gemm{fc}_weights",
+            tuple_idx=partition,
+            description=f"Prepared FC{fc} payload owned by partition {partition}.",
+        )
+        for fc in (1, 2)
+        for partition in (0, 1)
+    }
+
+
+def _partitioned_scale_shard_inputs(dtype: str) -> dict[str, Tensor]:
+    return {
+        f"gemm{fc}_weights_scale_{partition}": Tensor(
+            [f"fc{fc}_scale_storage"],
+            dtype=dtype,
+            param=f"gemm{fc}_weights_scale",
+            tuple_idx=partition,
+            description=(
+                f"Flattened prepared FC{fc} scale payload for partition {partition}."
+            ),
+        )
+        for fc in (1, 2)
+        for partition in (0, 1)
+    }
+
+
+def _partitioned_prefix(
+    base: str, strategy: str, layout: str, *, variant: str = ""
+) -> str:
+    # Preserve the concise names used by the checked-in MajorK TP-N/TP-K
+    # examples. Every other dispatch target receives an explicit suffix.
+    if strategy == "tp_n_tp_k" and layout == "major_k" and not variant:
+        return base
+    suffix = "_".join(part for part in (variant, strategy, layout) if part)
+    return f"{base}_{suffix}"
+
+
+def _make_partitioned_trace(
+    *,
+    kind: str,
+    strategy: str,
+    layout: str,
+    fp4_mode: str | None = None,
+) -> TraceTemplate:
+    base = f"prims_ts_{kind}_moe_partitioned"
+    variant = "" if fp4_mode in (None, "nvfp4") else fp4_mode
+    hidden_dims = (
+        ["seq_len", "hidden_storage_k"]
+        if fp4_mode == "nvfp4"
+        else ["seq_len", "hidden_size"]
+    )
+    axes: dict[str, Var | Const] = {
+        "seq_len": Var(description="Number of input tokens."),
+        "num_experts": Const(abbrev="", description="Total number of experts."),
+        "top_k": Const(abbrev="topk", description="Experts selected per token."),
+        "num_local_experts": Const(
+            abbrev="e", description="Experts resident on this rank."
+        ),
+        "hidden_size": Const(abbrev="h", description="Logical activation width."),
+        "intermediate_size": Const(abbrev="i", description="Logical FFN width."),
+        "partition_count": Const(
+            value=2,
+            abbrev="p",
+            description="Number of concurrent weight partitions.",
+        ),
+        **_partitioned_weight_axes(layout),
+    }
+    constraints = ["do_finalize == True"]
+    if fp4_mode == "nvfp4":
+        axes["hidden_storage_k"] = Const(
+            abbrev="", description="Packed NVFP4 activation bytes per token."
+        )
+        constraints.append("hidden_size == 2 * hidden_storage_k")
+    inputs: dict[str, Tensor | Scalar] = {
+        "routing_logits": Tensor(
+            ["seq_len", "num_experts"],
+            optional=True,
+            description="Optional routing logits; omitted for precomputed routing.",
+        ),
+        "routing_bias": Tensor(
+            ["num_experts"], optional=True, description="Optional routing bias."
+        ),
+        "topk_ids": Tensor(
+            ["seq_len", "top_k"],
+            dtype="int32",
+            optional=True,
+            description="Optional precomputed expert ids.",
+        ),
+        "hidden_states": Tensor(hidden_dims, description="Input hidden states."),
+        "num_experts": Scalar("int32", description="Total number of experts."),
+        "top_k": Scalar("int32", description="Experts selected per token."),
+        "n_group": Scalar("int32", optional=True, description="Expert routing groups."),
+        "topk_group": Scalar(
+            "int32", optional=True, description="Expert groups retained by routing."
+        ),
+        "intermediate_size": Scalar("int32", description="Logical FFN width."),
+        "local_expert_offset": Scalar(
+            "int32", description="First local expert in global expert space."
+        ),
+        "local_num_experts": Scalar(
+            "int32", description="Experts resident on this rank."
+        ),
+        "routed_scaling_factor": Scalar(
+            "float32", optional=True, description="Optional routing-weight scale."
+        ),
+        "routing_method_type": Scalar(
+            "int32", optional=True, description="RoutingMethodType value."
+        ),
+        "partition_strategy": Scalar(
+            "string", description="Two-way FC partition strategy."
+        ),
+        "weight_layout": Scalar("int32", optional=True),
+        "do_finalize": Scalar("bool", optional=True),
+        "enable_pdl": Scalar(
+            "bool",
+            optional=True,
+            description="Enable Programmatic Dependent Launch.",
+        ),
+        **_partitioned_weight_inputs(layout),
+    }
+    if kind in ("bf16", "fp8_block_scale", "fp4_block_scale"):
+        inputs.update(
+            {
+                "gemm1_alpha": Tensor(
+                    ["num_local_experts"],
+                    dtype="float32",
+                    optional=True,
+                    description="Optional per-expert SiTU or SwiGLU alpha.",
+                ),
+                "gemm1_beta": Tensor(
+                    ["num_local_experts"],
+                    dtype="float32",
+                    optional=True,
+                    description="Optional per-expert SiTU or SwiGLU beta.",
+                ),
+                "gemm1_clamp_limit": Tensor(
+                    ["num_local_experts"],
+                    dtype="float32",
+                    optional=True,
+                    description="Optional per-expert gated-activation clamp limit.",
+                ),
+            }
+        )
+    tags = [
+        "status:experimental",
+        "backend:prims-ts",
+        "partitioning:two-way",
+        f"partition-strategy:{strategy}",
+        f"weight-layout:{layout}",
+    ]
+    if kind == "bf16":
+        inputs["expert_weights"] = Tensor(
+            ["seq_len", "top_k"],
+            optional=True,
+            description="Optional precomputed routing weights.",
+        )
+        description = "Two-way partitioned Prims-TS BF16 MoE."
+    elif kind == "fp8_per_tensor_scale":
+        inputs["expert_weights"] = Tensor(
+            ["seq_len", "top_k"],
+            optional=True,
+            description="Optional precomputed routing weights.",
+        )
+        for name in (
+            "output1_scales_scalar",
+            "output1_scales_gate_scalar",
+            "output2_scales_scalar",
+        ):
+            inputs[name] = Tensor(
+                ["num_local_experts"], description="Per-expert output scale."
+            )
+        tags.append("quantization:float8_e4m3fn")
+        description = "Two-way partitioned Prims-TS FP8 per-tensor-scale MoE."
+    elif kind == "fp8_block_scale":
+        axes.update(
+            {
+                "hidden_scale_storage": Const(abbrev=""),
+                "fc1_scale_storage": Const(abbrev=""),
+                "fc2_scale_storage": Const(abbrev=""),
+            }
+        )
+        inputs["expert_weights"] = Tensor(
+            ["seq_len", "top_k"],
+            optional=True,
+            description="Optional precomputed routing weights.",
+        )
+        inputs["hidden_states_scale"] = Tensor(
+            ["hidden_scale_storage"],
+            dtype="uint8",
+            description="Prepared MXFP8 activation-scale payload.",
+        )
+        inputs.update(_partitioned_scale_shard_inputs("uint8"))
+        tags.append("quantization:mxfp8")
+        description = "Two-way partitioned Prims-TS MXFP8 block-scale MoE."
+    else:
+        assert kind == "fp4_block_scale" and fp4_mode is not None
+        # The prepared FP4 weight-scale ABI uses byte-backed E4M3 tensors for
+        # both NVFP4 (K/16) and MXFP4 (K/32) scale factors.
+        scale_dtype = "float8_e4m3fn"
+        axes.update(
+            {
+                "hidden_scale_storage": Var(
+                    description="Optional activation-scale storage extent."
+                ),
+                "fc1_scale_storage": Const(abbrev=""),
+                "fc2_scale_storage": Const(abbrev=""),
+            }
+        )
+        inputs["topk_weights"] = Tensor(
+            ["seq_len", "top_k"],
+            optional=True,
+            description="Optional precomputed routing weights.",
+        )
+        inputs["hidden_states_scale"] = Tensor(
+            ["hidden_scale_storage"],
+            dtype=scale_dtype,
+            optional=fp4_mode == "mxfp4_bf16",
+            description="Prepared activation-scale payload.",
+        )
+        inputs.update(_partitioned_scale_shard_inputs(scale_dtype))
+        for name in (
+            "output1_scale_scalar",
+            "output1_scale_gate_scalar",
+            "output2_scale_scalar",
+        ):
+            inputs[name] = Tensor(
+                ["num_local_experts"], description="Per-expert output scale."
+            )
+        tags.extend(["quantization:fp4-block-scale", f"activation-format:{fp4_mode}"])
+        description = f"Two-way partitioned Prims-TS {fp4_mode} FP4 MoE."
+
+    template_type = (
+        _Nvfp4PartitionTraceTemplate if fp4_mode == "nvfp4" else TraceTemplate
+    )
+    return template_type(
+        op_type="moe",
+        name_prefix=_partitioned_prefix(base, strategy, layout, variant=variant),
+        description=description,
+        axes=axes,
+        inputs=inputs,
+        outputs={
+            "output": Tensor(
+                ["seq_len", "hidden_size"],
+                dtype="bfloat16",
+                description="Finalized MoE output.",
+            )
+        },
+        constraints=constraints,
+        tags=tags,
+    )
+
+
+def _make_partitioned_trace_table(
+    kind: str, *, fp4_modes: tuple[str, ...] = ()
+) -> dict[tuple[str, str, str | None], TraceTemplate]:
+    modes: tuple[str | None, ...] = fp4_modes or (None,)
+    return {
+        (strategy, layout, mode): _make_partitioned_trace(
+            kind=kind,
+            strategy=strategy,
+            layout=layout,
+            fp4_mode=mode,
+        )
+        for strategy in _PRIMS_TS_PARTITION_STRATEGIES
+        for layout in _PRIMS_TS_WEIGHT_LAYOUTS.values()
+        for mode in modes
+    }
+
+
+_PRIMS_TS_BF16_PARTITION_TRACES = _make_partitioned_trace_table("bf16")
+_PRIMS_TS_FP4_PARTITION_TRACES = _make_partitioned_trace_table(
+    "fp4_block_scale",
+    fp4_modes=("nvfp4", "mxfp4_mxfp8", "mxfp4_bf16"),
+)
+_PRIMS_TS_FP8_PER_TENSOR_PARTITION_TRACES = _make_partitioned_trace_table(
+    "fp8_per_tensor_scale"
+)
+_PRIMS_TS_FP8_BLOCK_PARTITION_TRACES = _make_partitioned_trace_table("fp8_block_scale")
+
+# Stable names retained for direct imports and the checked-in representative
+# MajorK TP-N/TP-K examples.
+prims_ts_bf16_moe_partitioned_trace = _PRIMS_TS_BF16_PARTITION_TRACES[
+    ("tp_n_tp_k", "major_k", None)
+]
+prims_ts_fp4_block_scale_moe_partitioned_trace = _PRIMS_TS_FP4_PARTITION_TRACES[
+    ("tp_n_tp_k", "major_k", "nvfp4")
+]
+prims_ts_fp8_per_tensor_scale_moe_partitioned_trace = (
+    _PRIMS_TS_FP8_PER_TENSOR_PARTITION_TRACES[("tp_n_tp_k", "major_k", None)]
+)
+prims_ts_fp8_block_scale_moe_partitioned_trace = _PRIMS_TS_FP8_BLOCK_PARTITION_TRACES[
+    ("tp_n_tp_k", "major_k", None)
+]
+
+
+def _partition_trace_layout_and_strategy(kwargs):
+    if not kwargs.get("do_finalize", True):
+        return None
+    strategy = kwargs.get("partition_strategy")
+    layout = _PRIMS_TS_WEIGHT_LAYOUTS.get(int(kwargs.get("weight_layout", 0)))
+    if strategy not in _PRIMS_TS_PARTITION_STRATEGIES or layout is None:
+        return None
+    return strategy, layout
+
+
+def prims_ts_bf16_moe_partitioned_trace_dispatch(**kwargs):
+    resolved = _partition_trace_layout_and_strategy(kwargs)
+    return (
+        None if resolved is None else _PRIMS_TS_BF16_PARTITION_TRACES[(*resolved, None)]
+    )
+
+
+def prims_ts_fp4_block_scale_moe_partitioned_trace_dispatch(**kwargs):
+    resolved = _partition_trace_layout_and_strategy(kwargs)
+    hidden_states = kwargs.get("hidden_states")
+    if resolved is None or hidden_states is None:
+        return None
+    if hidden_states.dtype == torch.uint8:
+        mode = "nvfp4"
+    elif hidden_states.dtype == torch.float8_e4m3fn:
+        mode = "mxfp4_mxfp8"
+    elif hidden_states.dtype == torch.bfloat16:
+        mode = "mxfp4_bf16"
+    else:
+        return None
+    return _PRIMS_TS_FP4_PARTITION_TRACES[(*resolved, mode)]
+
+
+def prims_ts_fp8_per_tensor_scale_moe_partitioned_trace_dispatch(**kwargs):
+    resolved = _partition_trace_layout_and_strategy(kwargs)
+    return (
+        None
+        if resolved is None
+        else _PRIMS_TS_FP8_PER_TENSOR_PARTITION_TRACES[(*resolved, None)]
+    )
+
+
+def prims_ts_fp8_block_scale_moe_partitioned_trace_dispatch(**kwargs):
+    resolved = _partition_trace_layout_and_strategy(kwargs)
+    return (
+        None
+        if resolved is None
+        else _PRIMS_TS_FP8_BLOCK_PARTITION_TRACES[(*resolved, None)]
+    )
+
+
+prims_ts_bf16_moe_partitioned_trace_dispatch.templates = list(  # type: ignore[attr-defined]
+    _PRIMS_TS_BF16_PARTITION_TRACES.values()
+)
+prims_ts_fp4_block_scale_moe_partitioned_trace_dispatch.templates = list(  # type: ignore[attr-defined]
+    _PRIMS_TS_FP4_PARTITION_TRACES.values()
+)
+prims_ts_fp8_per_tensor_scale_moe_partitioned_trace_dispatch.templates = list(  # type: ignore[attr-defined]
+    _PRIMS_TS_FP8_PER_TENSOR_PARTITION_TRACES.values()
+)
+prims_ts_fp8_block_scale_moe_partitioned_trace_dispatch.templates = list(  # type: ignore[attr-defined]
+    _PRIMS_TS_FP8_BLOCK_PARTITION_TRACES.values()
+)
+
+
+def _alphamoe_fused_router_init(
+    *,
+    num_tokens: int,
+    max_route_blocks: int,
+    max_padded_pairs: int,
+    num_experts_plus_one: int,
+    one: int,
+    num_experts: int = 512,
+    top_k: int = 8,
+    block_m: int = 16,
+    has_shared_expert: bool = False,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build finite FP32 logits for the standalone AlphaMoE router API."""
+
+    del max_route_blocks, max_padded_pairs, num_experts_plus_one, one
+    torch.manual_seed(seed)
+    return {
+        "logits": torch.randn(
+            num_tokens, num_experts, dtype=torch.float32, device=device
+        ),
+        "top_k": int(top_k),
+        "block_m": int(block_m),
+        "has_shared_expert": bool(has_shared_expert),
+    }
+
+
+alphamoe_fused_router_trace = TraceTemplate(
+    op_type="moe_routing",
+    name_prefix="alphamoe_fused_router",
+    description=(
+        "AlphaMoE logits-to-plan frontend: top-k (exact-tie order unspecified), "
+        "selected-logit softmax, per-expert block padding, and expert-grouped "
+        "route scatter in one cooperative SM100/SM103 kernel."
+    ),
+    axes={
+        "num_tokens": Var(description="Number of routed tokens."),
+        "num_experts": Const(abbrev="e", description="Number of experts."),
+        "top_k": Const(abbrev="k", description="Routes per token."),
+        "block_m": Const(abbrev="bm", description="Per-expert plan alignment."),
+        "has_shared_expert": Const(
+            abbrev="shared", description="Whether the last expert is forced."
+        ),
+        "max_route_blocks": Var(description="Allocated route-block capacity."),
+        "max_padded_pairs": Var(description="Allocated padded-pair capacity."),
+        "num_experts_plus_one": Var(description="num_experts + 1."),
+        "one": Var(description="Singleton device-scalar extent."),
+    },
+    inputs={
+        "logits": Tensor(
+            ["num_tokens", "num_experts"],
+            dtype="float32",
+            description="Finite contiguous FP32 router logits.",
+        ),
+        "top_k": Scalar("int32"),
+        "block_m": Scalar("int32"),
+        "has_shared_expert": Scalar("bool"),
+    },
+    outputs={
+        "topk_weights": Tensor(["num_tokens", "top_k"], dtype="float32"),
+        "topk_ids": Tensor(["num_tokens", "top_k"], dtype="int32"),
+        "sorted_token_ids": Tensor(["max_padded_pairs"], dtype="int32"),
+        "expert_ids": Tensor(["max_route_blocks"], dtype="int32"),
+        "num_tokens_post_padded": Tensor(["one"], dtype="int32"),
+        "expert_counts": Tensor(["num_experts"], dtype="int32"),
+        "expert_offsets": Tensor(["num_experts_plus_one"], dtype="int32"),
+        "expert_scatter_offsets": Tensor(["num_experts"], dtype="int32"),
+    },
+    constraints=[
+        "num_tokens > 0",
+        "1 <= num_experts <= 512",
+        "1 <= top_k <= min(num_experts, 16)",
+        "1 <= block_m <= 16",
+        "not has_shared_expert or top_k >= 2",
+        "max_route_blocks == min(num_experts, num_tokens * top_k) + "
+        "(num_tokens * top_k - min(num_experts, num_tokens * top_k)) // block_m",
+        "max_padded_pairs == max_route_blocks * block_m",
+        "num_experts_plus_one == num_experts + 1",
+        "one == 1",
+    ],
+    tags=["status:experimental", "moe", "sm100", "sm103"],
+    init=_alphamoe_fused_router_init,
 )

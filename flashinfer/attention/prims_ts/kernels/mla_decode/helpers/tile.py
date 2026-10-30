@@ -23,9 +23,9 @@ from cutlass.experimental.task_scheduling.resources import StageInfo
 from .layout import _TASK_CACHE_SEQ_LEN_KV
 from .mask import MaskType, mask_visible_k_length
 from .query import (
-    groups_tokens_heads_q_row_state,
+    flat_query_row_state,
     query_batch_bounds,
-    runtime_query_group_has_rows,
+    runtime_flat_query_tile_has_rows,
 )
 from .stage import MlaStage
 from ..throughput_latency_1cta.config import MlaConfig
@@ -45,7 +45,7 @@ def local_kv_tile_idx(
         return Int32(inst_id)
     if cutlass.const_expr(section == MlaStage.Loop):
         base = stage_info.loop_offset * Int32(cfg.num_insts_kv)
-        if cutlass.const_expr(is_v):
+        if cutlass.const_expr(is_v or (cfg.serial_swap_reuse and inst_id == 1)):
             return base + Int32(inst_id)
         return base + Int32(cfg.num_insts_kv + inst_id)
     if cutlass.const_expr(cfg.total_kv_tiles <= cfg.num_insts_kv):
@@ -109,6 +109,8 @@ def runtime_split_pruning_is_profitable(configured_splits_kv: int) -> bool:
 def _runtime_configured_local_kv_tiles(cfg: MlaConfig, seq_len_kv):
     """Return the instruction-aligned local span for configured split capacity."""
 
+    if cutlass.const_expr(cfg.fixed_sparse_kv_tiles > 0):
+        return Int32(cfg.fixed_sparse_kv_tiles)
     total_kv_tiles = runtime_total_kv_tiles(cfg, seq_len_kv)
     num_insts_kv = Int32(cfg.num_insts_kv)
     tiles_per_group = Int32(cfg.num_ctas_per_seq_kv) * num_insts_kv
@@ -134,6 +136,16 @@ def runtime_num_ctas_kv(cfg: MlaConfig, seq_len_kv):
 @cute.jit
 def runtime_local_kv_tiles(cfg: MlaConfig, seq_len_kv):
     """Return the padded local KV tile count assigned to each KV CTA group."""
+    if cutlass.const_expr(cfg.fixed_sparse_kv_tiles > 0):
+        return Int32(cfg.fixed_sparse_kv_tiles)
+    if cutlass.const_expr(
+        cfg.sparse_direct and cfg.seq_len_kv <= 256 and cfg.num_ctas_per_seq_kv == 1
+    ):
+        # The short direct schedule executes its planned padded tiles. Every
+        # consumer must use that same domain: using the smaller live length
+        # here makes tail PV overwrite O with its final masked tile instead
+        # of accumulating into the earlier nonempty tile.
+        return Int32(cfg.local_kv_tiles(cfg.total_kv_tiles))
     if cutlass.const_expr(cfg.use_multi_ctas_kv != 1):
         return runtime_total_kv_tiles(cfg, seq_len_kv)
     return _runtime_configured_local_kv_tiles(cfg, seq_len_kv)
@@ -145,6 +157,19 @@ def runtime_base_seq_len_kv(cfg: MlaConfig, cache_seqs, batch_idx):
     if cutlass.const_expr(cache_seqs is None):
         return Int32(cfg.seq_len_kv)
     return Int32(cache_seqs[batch_idx])
+
+
+@cute.jit
+def runtime_request_publishes(cfg: MlaConfig, cache_seqs, batch_idx):
+    """Return whether a batch row publishes O / LSE (and split scratch).
+
+    An empty request (zero KV length) publishes nothing, which preserves its
+    output. D576 sparse rows keep their contract instead: a token whose
+    top-k length is zero still writes O = 0 and LSE = -inf.
+    """
+    if cutlass.const_expr(cfg.sparse_d576_reload):
+        return cutlass.Boolean(True)
+    return runtime_base_seq_len_kv(cfg, cache_seqs, batch_idx) > Int32(0)
 
 
 @cute.jit
@@ -181,18 +206,18 @@ def runtime_seq_len_kv_for_q(
     cta_idx_q,
     cu_seqlens_q=None,
 ):
-    """Return the KV domain shared by groups_tokens_heads_q rows in a CTA.
+    """Return the KV domain shared by flat query rows in a CTA.
 
-    The last effective row has the largest causal domain. Grouped causal
-    softmax applies the remaining row-specific mask; all other modes can use
+    The last physical row has the largest causal domain. Row-causal softmax
+    applies the remaining row-specific mask; all other modes can use
     this CTA-visible length with the ordinary dense tail predicate.
     """
     if cutlass.const_expr(cfg.mask_type == MaskType.DENSE.value):
         return runtime_base_seq_len_kv(cfg, cache_seqs, batch_idx)
-    _, _, logical_q_idx, _, _ = groups_tokens_heads_q_row_state(
-        Int32(cfg.num_heads_q - 1),
+    _, _, logical_q_idx, _, _ = flat_query_row_state(
+        Int32(cfg.tile_size_q - 1),
         cta_idx_q,
-        cfg.groups_tokens_heads_q_ratio,
+        cfg.tile_size_q,
         cfg.logical_num_heads_q,
         cfg.logical_seq_len_q,
         cu_seqlens_q,
@@ -218,9 +243,10 @@ def runtime_query_tile_is_active(
 
     query_is_active = cutlass.Boolean(True)
     if cutlass.const_expr(cu_seqlens_q is not None):
-        query_is_active = runtime_query_group_has_rows(
+        query_is_active = runtime_flat_query_tile_has_rows(
             cta_idx_q,
-            cfg.groups_tokens_heads_q_ratio,
+            cfg.tile_size_q,
+            cfg.logical_num_heads_q,
             cfg.logical_seq_len_q,
             cu_seqlens_q,
             batch_idx,
@@ -274,6 +300,9 @@ def runtime_work_tile_activity(
         cta_idx_q,
         cta_idx_kv,
     )
+    query_is_active = query_is_active & (
+        runtime_request_publishes(cfg, cache_seqs, batch_idx)
+    )
     return query_is_active, split_is_active
 
 
@@ -300,19 +329,19 @@ def runtime_work_tile_is_active(
 
 
 @cute.jit
-def runtime_seq_len_kv_for_effective_head(
+def runtime_seq_len_kv_for_query_row(
     cfg: MlaConfig,
     cache_seqs,
     batch_idx,
     cta_idx_q,
-    effective_head_idx,
+    row_in_tile,
     cu_seqlens_q=None,
 ):
-    """Return the KV length visible to one groups_tokens_heads_q row."""
-    _, _, logical_q_idx, _, _ = groups_tokens_heads_q_row_state(
-        effective_head_idx,
+    """Return the KV length visible to one physical flat-query row."""
+    _, _, logical_q_idx, _, _ = flat_query_row_state(
+        row_in_tile,
         cta_idx_q,
-        cfg.groups_tokens_heads_q_ratio,
+        cfg.tile_size_q,
         cfg.logical_num_heads_q,
         cfg.logical_seq_len_q,
         cu_seqlens_q,
@@ -344,10 +373,10 @@ def runtime_seq_len_kv_from_task_cache(
         batch_idx,
         cfg.logical_seq_len_q,
     )
-    _, _, logical_q_idx, _, _ = groups_tokens_heads_q_row_state(
-        Int32(cfg.num_heads_q - 1),
+    _, _, logical_q_idx, _, _ = flat_query_row_state(
+        Int32(cfg.tile_size_q - 1),
         cta_idx_q,
-        cfg.groups_tokens_heads_q_ratio,
+        cfg.tile_size_q,
         cfg.logical_num_heads_q,
         cfg.logical_seq_len_q,
         cu_seqlens_q,

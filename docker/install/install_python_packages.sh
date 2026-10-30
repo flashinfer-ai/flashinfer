@@ -37,14 +37,21 @@ CUDA_TAG="${PYTORCH_INDEX##*/}"  # nightly/cu134 -> cu134
 CUDA_MAJOR="${CUDA_TAG:2:2}"     # cu129 -> 12, cu134 -> 13
 CUDA_MINOR="${CUDA_TAG:4}"       # cu129 -> 9, cu134 -> 4
 PYTORCH_INDEX_URL="https://download.pytorch.org/whl/${PYTORCH_INDEX}"
-BUILD_DEPENDENCY_OUTPUT="$(
+CI_IMAGE_DEPENDENCY_OUTPUT="$(
   PYTHONPATH=/install python3 -c \
-    'import sys; from build_utils import get_build_dependency_requirements; print(*get_build_dependency_requirements(sys.argv[1]), sep="\n")' \
+    'import sys; from build_utils import get_ci_image_dependency_requirements; print(*get_ci_image_dependency_requirements(sys.argv[1]), sep="\n")' \
     "${CUDA_MAJOR}"
 )"
-BUILD_DEPENDENCIES=()
-if [[ -n "${BUILD_DEPENDENCY_OUTPUT}" ]]; then
-  mapfile -t BUILD_DEPENDENCIES <<< "${BUILD_DEPENDENCY_OUTPUT}"
+CI_IMAGE_DEPENDENCIES=()
+if [[ -n "${CI_IMAGE_DEPENDENCY_OUTPUT}" ]]; then
+  mapfile -t CI_IMAGE_DEPENDENCIES <<< "${CI_IMAGE_DEPENDENCY_OUTPUT}"
+fi
+CUDA_TILE_COMPILE_DEPENDENCIES=()
+if [[ "${CUDA_MAJOR}" == "13" ]] && (( 10#${CUDA_MINOR} < 4 )); then
+  mapfile -t CUDA_TILE_COMPILE_DEPENDENCIES < <(
+    PYTHONPATH=/install python3 -c \
+      'from build_utils import get_cuda_tile_compile_dependency_requirements; print(*get_cuda_tile_compile_dependency_requirements(), sep="\n")'
+  )
 fi
 
 # Install torch with specific CUDA version first, followed by others in requirements.txt, and then others.
@@ -66,7 +73,12 @@ export PIP_CONSTRAINT="$TORCH_CONSTRAINT"
 
 # Resolve the remaining direct dependencies once. Match cuda-python to the
 # image's CUDA major/minor; this also satisfies the matching nvshmem4py range.
-CUDA_PYTHON="cuda-python==${CUDA_MAJOR}.${CUDA_MINOR}"
+# CUDA 13.4 started at patch release 13.4.1, so there is no 13.4 distribution.
+if [[ "${CUDA_TAG}" == "cu134" ]]; then
+  CUDA_PYTHON="cuda-python==13.4.1"
+else
+  CUDA_PYTHON="cuda-python==${CUDA_MAJOR}.${CUDA_MINOR}"
+fi
 if [[ "${CUDA_TAG}" == cu13* ]]; then
   NVSHMEM4PY="nvshmem4py-cu13"
   CUDNN_PACKAGE="nvidia-cudnn-cu13"
@@ -85,7 +97,11 @@ pip3 install \
   responses pytest scipy build wheel \
   "${CUDA_PYTHON}" \
   "${NVSHMEM4PY}" \
-  "${BUILD_DEPENDENCIES[@]}"
+  "${CI_IMAGE_DEPENDENCIES[@]}"
+
+if (( ${#CUDA_TILE_COMPILE_DEPENDENCIES[@]} > 0 )); then
+  pip3 install --no-deps "${CUDA_TILE_COMPILE_DEPENDENCIES[@]}"
+fi
 
 # Torch 2.13's cu129/cu130 wheels exact-pin cuDNN 9.20, but current FlashInfer
 # uses cuDNN 9.21-9.24 APIs and 9.20 has a known incomplete sublibrary set.

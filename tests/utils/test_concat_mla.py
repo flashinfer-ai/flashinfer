@@ -9,12 +9,63 @@ import pytest
 import torch
 
 from flashinfer.concat_ops import concat_mla_k
+from flashinfer.jit.cpp_ext import is_cuda_version_at_least
 from flashinfer.utils import get_compute_capability
 
 NUM_LOCAL_HEADS = 128
 QK_NOPE_HEAD_DIM = 128
 QK_ROPE_HEAD_DIM = 64
 K_HEAD_DIM = QK_NOPE_HEAD_DIM + QK_ROPE_HEAD_DIM
+
+
+def _cake_case(
+    num_tokens: int,
+    dtype: torch.dtype,
+    input_layout: str = "contiguous",
+    padded_output: bool = False,
+):
+    dtype_name = str(dtype).removeprefix("torch.")
+    output_name = "padded" if padded_output else "contiguous"
+    return pytest.param(
+        num_tokens,
+        dtype,
+        input_layout,
+        padded_output,
+        id=f"t{num_tokens}-{dtype_name}-{input_layout}-{output_name}",
+    )
+
+
+_CAKE_DTYPES = (
+    torch.bfloat16,
+    torch.float16,
+    torch.float8_e4m3fn,
+    torch.float8_e5m2,
+)
+_CAKE_CONTRACT_CASES = [
+    *(
+        _cake_case(tokens, torch.bfloat16, "both_strided")
+        for tokens in (2048, 4096, 8192, 16384, 32768)
+    ),
+    *(
+        _cake_case(tokens, dtype)
+        for tokens in (1, 32, 1024, 8192)
+        for dtype in _CAKE_DTYPES
+    ),
+    *(_cake_case(0, dtype) for dtype in _CAKE_DTYPES[:3]),
+    _cake_case(2048, torch.bfloat16, "nope_strided"),
+    _cake_case(2048, torch.float8_e4m3fn, "nope_strided"),
+    _cake_case(2048, torch.bfloat16),
+    *(_cake_case(1, dtype, padded_output=True) for dtype in _CAKE_DTYPES),
+    _cake_case(2, torch.bfloat16, padded_output=True),
+    _cake_case(3, torch.float16),
+    _cake_case(4, torch.float8_e4m3fn),
+    _cake_case(5, torch.float8_e5m2, "both_strided", padded_output=True),
+    _cake_case(31, torch.bfloat16),
+    _cake_case(33, torch.float16),
+    _cake_case(1023, torch.float8_e4m3fn),
+    _cake_case(1025, torch.float8_e5m2),
+]
+assert len(_CAKE_CONTRACT_CASES) == 39
 
 
 def _reference_concat(k_nope: torch.Tensor, k_rope: torch.Tensor) -> torch.Tensor:
@@ -52,6 +103,84 @@ def _make_tensors(num_tokens: int, dtype: torch.dtype, device: str = "cuda"):
     )
     k = torch.empty(num_tokens, NUM_LOCAL_HEADS, K_HEAD_DIM, dtype=dtype, device=device)
     return k, k_nope, k_rope
+
+
+def _make_cake_tensors(
+    num_tokens: int,
+    dtype: torch.dtype,
+    input_layout: str,
+    padded_output: bool,
+):
+    if input_layout in ("nope_strided", "both_strided"):
+        k_nope_container = torch.randn(
+            num_tokens,
+            NUM_LOCAL_HEADS,
+            QK_NOPE_HEAD_DIM + 128,
+            device="cuda",
+            dtype=torch.bfloat16,
+        ).to(dtype)
+        k_nope = k_nope_container[..., :QK_NOPE_HEAD_DIM]
+    else:
+        k_nope = (
+            torch.randn(
+                num_tokens,
+                NUM_LOCAL_HEADS,
+                QK_NOPE_HEAD_DIM,
+                device="cuda",
+                dtype=torch.bfloat16,
+            )
+            .to(dtype)
+            .contiguous()
+        )
+    if input_layout == "both_strided":
+        k_rope_container = torch.randn(
+            num_tokens,
+            1,
+            128 + QK_ROPE_HEAD_DIM,
+            device="cuda",
+            dtype=torch.bfloat16,
+        ).to(dtype)
+        k_rope = k_rope_container[..., -QK_ROPE_HEAD_DIM:]
+    else:
+        k_rope = (
+            torch.randn(
+                num_tokens,
+                1,
+                QK_ROPE_HEAD_DIM,
+                device="cuda",
+                dtype=torch.bfloat16,
+            )
+            .to(dtype)
+            .contiguous()
+        )
+    if padded_output:
+        k_container = torch.empty(
+            num_tokens,
+            NUM_LOCAL_HEADS,
+            256,
+            dtype=dtype,
+            device="cuda",
+        )
+        k = k_container[..., :K_HEAD_DIM]
+    else:
+        k = torch.empty(
+            num_tokens,
+            NUM_LOCAL_HEADS,
+            K_HEAD_DIM,
+            dtype=dtype,
+            device="cuda",
+        )
+    return k, k_nope, k_rope
+
+
+def _require_cake_concat_mla_k() -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("Cake concat MLA K requires CUDA")
+    capability = get_compute_capability(torch.device("cuda"))
+    if capability not in ((10, 0), (10, 3), (10, 7)):
+        pytest.skip("Cake concat MLA K requires SM100, SM103 or SM107")
+    if capability == (10, 7) and not is_cuda_version_at_least("13.0"):
+        pytest.skip("Cake concat MLA K on SM107 requires CUDA 13.0 or newer")
 
 
 # ────────────────────────── Core correctness tests ──────────────────────────
@@ -185,6 +314,201 @@ def test_concat_mla_k_dtype_mismatch_raises():
     )
     with pytest.raises(RuntimeError):
         concat_mla_k(k, k_nope, k_rope)
+
+
+@pytest.mark.parametrize(
+    "num_tokens,dtype,input_layout,padded_output", _CAKE_CONTRACT_CASES
+)
+def test_cake_concat_mla_k_full_contract(
+    num_tokens: int,
+    dtype: torch.dtype,
+    input_layout: str,
+    padded_output: bool,
+):
+    """Run all 39 byte-exact SM100-family source-backend contract rows."""
+
+    _require_cake_concat_mla_k()
+    torch.manual_seed(17)
+    k, k_nope, k_rope = _make_cake_tensors(
+        num_tokens,
+        dtype,
+        input_layout,
+        padded_output,
+    )
+    k_object = k
+    k_metadata = (tuple(k.shape), tuple(k.stride()), k.storage_offset())
+    k_nope_snapshot = k_nope.clone()
+    k_rope_snapshot = k_rope.clone()
+    result = concat_mla_k(k, k_nope, k_rope, backend="cake")
+
+    expected = torch.empty_like(k)
+    expected[..., :QK_NOPE_HEAD_DIM] = k_nope_snapshot
+    expected[..., QK_NOPE_HEAD_DIM:] = k_rope_snapshot.expand(
+        num_tokens, NUM_LOCAL_HEADS, -1
+    )
+    assert result is None
+    assert k is k_object
+    assert (tuple(k.shape), tuple(k.stride()), k.storage_offset()) == k_metadata
+    assert torch.equal(
+        k.contiguous().view(torch.uint8), expected.contiguous().view(torch.uint8)
+    )
+    assert torch.equal(
+        k_nope.contiguous().view(torch.uint8),
+        k_nope_snapshot.contiguous().view(torch.uint8),
+    )
+    assert torch.equal(
+        k_rope.contiguous().view(torch.uint8),
+        k_rope_snapshot.contiguous().view(torch.uint8),
+    )
+
+
+@pytest.mark.parametrize("num_tokens", [1, 1024])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
+def test_cake_concat_mla_k_is_cuda_graph_safe(num_tokens: int, dtype: torch.dtype):
+    """Capture the Cake route once and replay it on fresh input bytes: byte-exact vs eager."""
+
+    _require_cake_concat_mla_k()
+    torch.manual_seed(23)
+    k, k_nope, k_rope = _make_cake_tensors(num_tokens, dtype, "contiguous", False)
+    concat_mla_k(
+        k, k_nope, k_rope, backend="cake"
+    )  # JIT load + warm-up outside the capture
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.stream(stream), torch.cuda.graph(graph, stream=stream):
+        concat_mla_k(k, k_nope, k_rope, backend="cake")
+    torch.cuda.current_stream().wait_stream(stream)
+    for seed in (29, 31):
+        torch.manual_seed(seed)
+        _, fresh_nope, fresh_rope = _make_cake_tensors(
+            num_tokens, dtype, "contiguous", False
+        )
+        k_nope.copy_(fresh_nope)
+        k_rope.copy_(fresh_rope)
+        k.fill_(0)
+        graph.replay()
+        torch.cuda.synchronize()
+        expected = torch.empty_like(k)
+        expected[..., :QK_NOPE_HEAD_DIM] = k_nope
+        expected[..., QK_NOPE_HEAD_DIM:] = k_rope.expand(
+            num_tokens, NUM_LOCAL_HEADS, -1
+        )
+        assert torch.equal(
+            k.contiguous().view(torch.uint8), expected.contiguous().view(torch.uint8)
+        )
+
+
+@pytest.mark.parametrize(
+    ("capability", "target"),
+    [((10, 0), "sm_100a"), ((10, 3), "sm_103a"), ((10, 7), "sm_107a")],
+)
+def test_cake_concat_mla_k_selects_the_exact_target(monkeypatch, capability, target):
+    from flashinfer import concat_ops
+
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _device: capability)
+    monkeypatch.setattr(
+        "flashinfer.jit.cpp_ext.is_cuda_version_at_least", lambda version: True
+    )
+
+    assert concat_ops.cake_concat_mla_k_target(torch.device("cuda")) == target
+
+
+def test_cake_concat_mla_k_sm_107a_needs_cuda_13(monkeypatch):
+    from flashinfer import concat_ops
+
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _device: (10, 7))
+    monkeypatch.setattr(
+        "flashinfer.jit.cpp_ext.is_cuda_version_at_least", lambda version: False
+    )
+    with pytest.raises(RuntimeError, match="CUDA 13.0"):
+        concat_ops.cake_concat_mla_k_target(torch.device("cuda"))
+
+
+def test_cake_concat_mla_k_programs_ship_their_targets():
+    from flashinfer.jit import cake_program
+    from flashinfer.jit.cake_concat_mla_k import ONE_CTA, PROGRAMS, SPLIT
+
+    assert PROGRAMS == (ONE_CTA, SPLIT)
+    assert ONE_CTA.targets == ("sm_100a", "sm_103a", "sm_107a")
+    assert SPLIT.targets == ("sm_107a",)
+    for program in PROGRAMS:
+        for target in program.targets:
+            flags = program.spec(target).extra_cuda_cflags
+            assert all(flag in flags for flag in cake_program.TARGET_FLAGS[target])
+    kernel_sources = {
+        program: next(
+            path for path in program.source_paths() if path.name.endswith("_kernel.cu")
+        )
+        for program in PROGRAMS
+    }
+    assert "gridDim.y" in kernel_sources[SPLIT].read_text()
+    assert "gridDim.y" not in kernel_sources[ONE_CTA].read_text()
+
+
+@pytest.mark.parametrize(
+    ("tokens", "element_bytes", "target", "expected"),
+    [
+        (1, 2, "sm_107a", 2),
+        (2, 1, "sm_107a", 2),
+        (2, 2, "sm_107a", 6),
+        (70, 2, "sm_107a", 6),
+        (71, 2, "sm_107a", 3),
+        (141, 2, "sm_107a", 3),
+        (142, 2, "sm_107a", 2),
+        (213, 2, "sm_107a", 1),
+        (4096, 2, "sm_107a", 1),
+        (0, 2, "sm_107a", 1),
+        (2, 2, "sm_103a", 1),
+        (2, 2, "sm_100a", 1),
+    ],
+)
+def test_cake_concat_mla_k_split_rule(tokens, element_bytes, target, expected):
+    from flashinfer import concat_ops
+
+    assert (
+        concat_ops.cake_concat_mla_k_split_ctas(tokens, element_bytes, target)
+        == expected
+    )
+    if tokens:
+        window = concat_ops.cake_concat_mla_k_tokens_per_cta(element_bytes)
+        assert concat_ops.cake_concat_mla_k_grid(tokens, element_bytes, target) == (
+            (tokens + window - 1) // window,
+            expected,
+            1,
+        )
+
+
+def test_cake_concat_mla_k_programs_are_selected_per_target():
+    from flashinfer import concat_ops
+    from flashinfer.jit.cake_concat_mla_k import ONE_CTA, SPLIT
+
+    assert concat_ops.cake_concat_mla_k_tokens_per_cta(1) == 2
+    assert concat_ops.cake_concat_mla_k_tokens_per_cta(2) == 1
+    with pytest.raises(ValueError):
+        concat_ops.cake_concat_mla_k_tokens_per_cta(4)
+    with pytest.raises(ValueError):
+        concat_ops.cake_concat_mla_k_split_ctas(2, 2, "sm100f")
+    assert concat_ops._cake_program("sm_100a", 1) is ONE_CTA
+    assert concat_ops._cake_program("sm_103a", 1) is ONE_CTA
+    # The split program serves only launches with grid_y > 1 on the split target.
+    assert concat_ops._cake_program("sm_107a", 1) is ONE_CTA
+    assert concat_ops._cake_program("sm_107a", 2) is SPLIT
+    assert concat_ops._cake_program("sm_107a", 6) is SPLIT
+
+
+def test_cake_concat_mla_k_rejects_unsupported_arch(monkeypatch):
+    _require_cake_concat_mla_k()
+    k, k_nope, k_rope = _make_cake_tensors(1, torch.bfloat16, "contiguous", False)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _device: (12, 0))
+    with pytest.raises(RuntimeError, match="requires compute capability 10.0"):
+        concat_mla_k(k, k_nope, k_rope, backend="cake")
+
+
+def test_concat_mla_k_rejects_unknown_backend():
+    k = torch.empty(0)
+    with pytest.raises(ValueError, match="unsupported concat_mla_k backend"):
+        concat_mla_k(k, k, k, backend="unknown")
 
 
 if __name__ == "__main__":

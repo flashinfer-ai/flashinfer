@@ -2,11 +2,11 @@
 # Shared helpers for building flashinfer-jit-cache wheels.
 # Sourced by:
 #   - scripts/build_flashinfer_jit_cache_whl.sh         (release/nightly)
+#   - scripts/build_jit_cache_provider_wheelhouse.sh    (provider experiment)
 #   - scripts/task_test_jit_cache_package_build_import.sh (PR tests)
+#   - scripts/run_with_test_sccache.sh                  (PR GPU test lanes)
 
-SCCACHE_VERSION="0.17.0"
-# The v0.17 client-side architecture remains opt-in while this change isolates
-# the version upgrade from a separate execution-mode change.
+SCCACHE_VERSION="0.18.0"
 
 # Compute MAX_JOBS and FLASHINFER_NVCC_THREADS from system memory/CPU,
 # clamping FLASHINFER_NVCC_THREADS to a sane range and budgeting per-job
@@ -76,9 +76,147 @@ compute_jit_cache_parallelism() {
   export MEM_PER_JOB=$mem_per_job
 }
 
-# Download and install sccache to /usr/local/bin/sccache, verifying the
-# upstream sha256 checksum.
-install_sccache() {
+# Verify that the selected compiler matches the CUDA matrix entry.
+#
+# Args:
+#   $1 - Expected CUDA major.minor version (e.g. "13.4").
+#   $2 - Optional nvcc executable (default: nvcc from PATH).
+validate_jit_cache_cuda_toolchain() {
+  local expected_cuda_version=$1
+  local nvcc_bin=${2:-nvcc}
+  local nvcc_cuda_version
+
+  nvcc_cuda_version=$(
+    "${nvcc_bin}" --version |
+      sed -n 's/.*release \([0-9][0-9]*\.[0-9][0-9]*\).*/\1/p' |
+      head -n1
+  )
+  if [ "${nvcc_cuda_version}" != "${expected_cuda_version}" ]; then
+    echo "ERROR: nvcc reports CUDA ${nvcc_cuda_version:-unknown}; expected ${expected_cuda_version}" >&2
+    return 1
+  fi
+  echo "nvcc CUDA version check passed: ${nvcc_cuda_version}"
+}
+
+# Install the matrix-selected PyTorch build environment and constrain every
+# later pip install, including the wheel's build requirements, to that exact
+# distribution.
+#
+# Args:
+#   $1 - Python executable used to invoke the build frontend.
+#   $2 - Expected CUDA major.minor version.
+#   $3 - PyTorch index label (e.g. "cu130" or "nightly/cu134").
+#
+# Exports: PIP_CONSTRAINT, PIP_BUILD_CONSTRAINT, PIP_EXTRA_INDEX_URL, and
+# PIP_PRE for nightly indexes.
+# Call cleanup_jit_cache_python_build from the caller's existing EXIT handler.
+setup_jit_cache_python_build() {
+  local python_bin=$1
+  local expected_cuda_version=$2
+  local pytorch_index=$3
+  local pytorch_index_url="https://download.pytorch.org/whl/${pytorch_index}"
+
+  # pip 26.2.1 fixed ProtocolError from truncated downloads bypassing its
+  # resume logic. Provider builds download CUDA wheels hundreds of MB in size,
+  # so use that fix and allow more connection/resume attempts by default.
+  export PIP_RETRIES="${PIP_RETRIES:-10}"
+  export PIP_RESUME_RETRIES="${PIP_RESUME_RETRIES:-10}"
+  export PIP_DEFAULT_TIMEOUT="${PIP_DEFAULT_TIMEOUT:-120}"
+  env -u PIP_CONSTRAINT -u PIP_BUILD_CONSTRAINT \
+    "${python_bin}" -m pip install --upgrade "pip>=26.2.1" build
+
+  if "${python_bin}" - "${expected_cuda_version}" <<'PY'
+import sys
+
+try:
+    import torch
+except ImportError:
+    raise SystemExit(1)
+
+raise SystemExit(0 if torch.version.cuda == sys.argv[1] else 1)
+PY
+  then
+    echo "Using preinstalled PyTorch for CUDA ${expected_cuda_version}"
+  else
+    local -a torch_install_args=(
+      --upgrade torch --index-url "${pytorch_index_url}"
+    )
+    if [[ "${pytorch_index}" == nightly/* ]]; then
+      torch_install_args=(--pre "${torch_install_args[@]}")
+    fi
+    "${python_bin}" -m pip install "${torch_install_args[@]}"
+  fi
+
+  "${python_bin}" - "${expected_cuda_version}" <<'PY'
+import importlib.metadata
+import sys
+import torch
+
+expected = sys.argv[1]
+if torch.version.cuda != expected:
+    raise SystemExit(
+        f"ERROR: PyTorch targets CUDA {torch.version.cuda}; expected CUDA {expected}"
+    )
+print(f"PyTorch CUDA version check passed: {torch.__version__} ({torch.version.cuda})")
+print(f"PyTorch distribution version: {importlib.metadata.version('torch')}")
+PY
+
+  if [[ -v PIP_CONSTRAINT ]]; then
+    JIT_CACHE_PREVIOUS_PIP_CONSTRAINT=${PIP_CONSTRAINT}
+    JIT_CACHE_RESTORE_PIP_CONSTRAINT=1
+  else
+    JIT_CACHE_PREVIOUS_PIP_CONSTRAINT=
+    JIT_CACHE_RESTORE_PIP_CONSTRAINT=0
+  fi
+  if [[ -v PIP_BUILD_CONSTRAINT ]]; then
+    JIT_CACHE_PREVIOUS_PIP_BUILD_CONSTRAINT=${PIP_BUILD_CONSTRAINT}
+    JIT_CACHE_RESTORE_PIP_BUILD_CONSTRAINT=1
+  else
+    JIT_CACHE_PREVIOUS_PIP_BUILD_CONSTRAINT=
+    JIT_CACHE_RESTORE_PIP_BUILD_CONSTRAINT=0
+  fi
+
+  JIT_CACHE_TORCH_CONSTRAINT=$(mktemp)
+  "${python_bin}" -c \
+    'import importlib.metadata as m; print("torch==" + m.version("torch"))' \
+    > "${JIT_CACHE_TORCH_CONSTRAINT}"
+  export PIP_CONSTRAINT="${JIT_CACHE_TORCH_CONSTRAINT}"
+  export PIP_BUILD_CONSTRAINT="${JIT_CACHE_TORCH_CONSTRAINT}"
+  case " ${PIP_EXTRA_INDEX_URL:-} " in
+    *" ${pytorch_index_url} "*) ;;
+    *)
+      export PIP_EXTRA_INDEX_URL="${PIP_EXTRA_INDEX_URL:+${PIP_EXTRA_INDEX_URL} }${pytorch_index_url}"
+      ;;
+  esac
+  if [[ "${pytorch_index}" == nightly/* ]]; then
+    export PIP_PRE=1
+  fi
+}
+
+cleanup_jit_cache_python_build() {
+  if [ -n "${JIT_CACHE_TORCH_CONSTRAINT:-}" ]; then
+    rm -f "${JIT_CACHE_TORCH_CONSTRAINT}"
+  fi
+  if [ "${JIT_CACHE_RESTORE_PIP_CONSTRAINT:-0}" = "1" ]; then
+    export PIP_CONSTRAINT="${JIT_CACHE_PREVIOUS_PIP_CONSTRAINT}"
+  else
+    unset PIP_CONSTRAINT
+  fi
+  if [ "${JIT_CACHE_RESTORE_PIP_BUILD_CONSTRAINT:-0}" = "1" ]; then
+    export PIP_BUILD_CONSTRAINT="${JIT_CACHE_PREVIOUS_PIP_BUILD_CONSTRAINT}"
+  else
+    unset PIP_BUILD_CONSTRAINT
+  fi
+  unset JIT_CACHE_TORCH_CONSTRAINT
+  unset JIT_CACHE_PREVIOUS_PIP_CONSTRAINT
+  unset JIT_CACHE_RESTORE_PIP_CONSTRAINT
+  unset JIT_CACHE_PREVIOUS_PIP_BUILD_CONSTRAINT
+  unset JIT_CACHE_RESTORE_PIP_BUILD_CONSTRAINT
+}
+
+# Download and install a released sccache binary to /usr/local/bin/sccache,
+# verifying the upstream sha256 checksum.
+install_released_sccache() {
   local sccache_version=$1
   local sccache_arch=$2
   local sccache_package="sccache-v${sccache_version}-${sccache_arch}-unknown-linux-musl"
@@ -86,6 +224,9 @@ install_sccache() {
   local sccache_url="https://github.com/mozilla/sccache/releases/download/v${sccache_version}/${sccache_archive}"
   local sccache_tmpdir
   local sccache_sha256
+  local sccache_install_started_at=${SECONDS}
+
+  echo "::group::Install sccache v${sccache_version} (${sccache_arch})"
 
   if ! command -v sha256sum >/dev/null 2>&1; then
     echo "ERROR: sha256sum is required to verify sccache downloads"
@@ -106,6 +247,29 @@ install_sccache() {
   mv "${sccache_tmpdir}/${sccache_package}/sccache" /usr/local/bin/
   rm -rf "${sccache_tmpdir}"
   chmod +x /usr/local/bin/sccache
+  echo "::endgroup::"
+  echo "sccache install duration: $((SECONDS - sccache_install_started_at)) seconds"
+}
+
+# Install the official sccache release. v0.18.0 is the first release that
+# includes the CUDA 13.3+ nvcc dry-run parser fix required for CUDA 13.4:
+# https://github.com/mozilla/sccache/pull/2722
+install_sccache() {
+  local sccache_version=$1
+  local sccache_arch=$2
+
+  case "${sccache_arch}" in
+    x86_64|aarch64)
+      ;;
+    *)
+      echo "ERROR: Unsupported sccache build architecture: ${sccache_arch}"
+      exit 1
+      ;;
+  esac
+
+  install_released_sccache "${sccache_version}" "${sccache_arch}"
+  export FLASHINFER_SCCACHE_INSTALL_SOURCE="github-release"
+  export FLASHINFER_SCCACHE_REVISION="v${sccache_version}"
 }
 
 # Install sccache (if missing), configure environment, and start the server.
@@ -123,26 +287,25 @@ setup_sccache() {
   local source_root=$2
   local sccache_arch
   sccache_arch=$(uname -m)
-  install_sccache "${SCCACHE_VERSION}" "${sccache_arch}"
+  if [ "$(sccache --version 2>/dev/null)" = "sccache ${SCCACHE_VERSION}" ]; then
+    # Already installed (e.g. by run_with_test_sccache.sh's fail-open probe).
+    export FLASHINFER_SCCACHE_INSTALL_SOURCE="${FLASHINFER_SCCACHE_INSTALL_SOURCE:-preinstalled}"
+    export FLASHINFER_SCCACHE_REVISION="${FLASHINFER_SCCACHE_REVISION:-v${SCCACHE_VERSION}}"
+  else
+    install_sccache "${SCCACHE_VERSION}" "${sccache_arch}"
+  fi
 
   export SCCACHE_REGION="${SCCACHE_REGION:-us-west-2}"
   export SCCACHE_BASEDIRS="${source_root}${SCCACHE_BASEDIRS:+:${SCCACHE_BASEDIRS}}"
   export SCCACHE_S3_KEY_PREFIX="${key_prefix}"
   export SCCACHE_IDLE_TIMEOUT=0
+  # Server-side mode is intentional. Client-side mode adds compiler probes for
+  # nvcc and reduced provider-build throughput in CI. The build watchdog scans
+  # /proc system-wide, including daemon-owned compilers, and docker --rm is the
+  # final containment boundary if the watchdog cannot signal one of them.
+  unset SCCACHE_CLIENT_SIDE
   export FLASHINFER_CXX_LAUNCHER="sccache"
-
-  # sccache v0.17 cannot parse CUDA 13.3+ nvcc dry-run output, which can leave
-  # fatbinary without its input cubins. Keep host C++ caching enabled, but run
-  # cu134 nvcc directly until a release includes the upstream fix:
-  # https://github.com/mozilla/sccache/pull/2722
-  case "${CUDA_VERSION:-}" in
-    13.4|134)
-      unset FLASHINFER_NVCC_LAUNCHER
-      ;;
-    *)
-      export FLASHINFER_NVCC_LAUNCHER="sccache"
-      ;;
-  esac
+  export FLASHINFER_NVCC_LAUNCHER="sccache"
 
   # Avoid leaking AWS credentials under set -x.
   local _sccache_xtrace=0
@@ -159,10 +322,14 @@ setup_sccache() {
   fi
   (( _sccache_xtrace )) && set -x
 
-  sccache --start-server
+  # Explicit return: a caller that guards setup_sccache with `if` runs it with
+  # errexit off, and must still see a failed startup.
+  sccache --start-server || return $?
   sccache --zero-stats
   export FLASHINFER_SCCACHE_ACTIVE=true
   echo "sccache version: $(sccache --version)"
+  echo "sccache install source: ${FLASHINFER_SCCACHE_INSTALL_SOURCE}"
+  echo "sccache revision: ${FLASHINFER_SCCACHE_REVISION}"
   echo "sccache bucket: ${SCCACHE_BUCKET}"
   echo "sccache region: ${SCCACHE_REGION}"
   echo "sccache prefix: ${SCCACHE_S3_KEY_PREFIX}"
@@ -177,6 +344,8 @@ setup_sccache() {
     {
       printf 'git_commit=%s\n' "${git_commit:-unknown}"
       printf 'sccache_version=%s\n' "$(sccache --version)"
+      printf 'sccache_install_source=%s\n' "${FLASHINFER_SCCACHE_INSTALL_SOURCE}"
+      printf 'sccache_revision=%s\n' "${FLASHINFER_SCCACHE_REVISION}"
       printf 'sccache_cache_mode=%s\n' "${FLASHINFER_SCCACHE_CACHE_MODE}"
       printf 'sccache_bucket=%s\n' "${SCCACHE_BUCKET}"
       printf 'sccache_region=%s\n' "${SCCACHE_REGION}"
@@ -187,6 +356,14 @@ setup_sccache() {
       printf 'cuda_version=%s\n' "${CUDA_VERSION:-unknown}"
       printf 'cuda_arch_list=%s\n' "${FLASHINFER_CUDA_ARCH_LIST:-unknown}"
     } > "${SCCACHE_STATS_DIR}/sccache-metadata.txt"
+  fi
+}
+
+run_sccache_control_command() {
+  if command -v timeout >/dev/null 2>&1; then
+    timeout --signal=TERM --kill-after=5s 30s sccache "$@"
+  else
+    sccache "$@"
   fi
 }
 
@@ -204,22 +381,23 @@ collect_sccache_stats() {
 
   if [ -n "${SCCACHE_STATS_DIR:-}" ]; then
     mkdir -p "${SCCACHE_STATS_DIR}"
-    if ! sccache --show-stats > "${SCCACHE_STATS_DIR}/sccache-stats.txt"; then
+    if ! run_sccache_control_command --show-stats \
+        > "${SCCACHE_STATS_DIR}/sccache-stats.txt"; then
       echo "WARNING: Failed to collect text sccache stats" >&2
     fi
-    if ! sccache --show-stats --stats-format=json \
+    if ! run_sccache_control_command --show-stats --stats-format=json \
         > "${SCCACHE_STATS_DIR}/sccache-stats.json"; then
       echo "WARNING: Failed to collect JSON sccache stats" >&2
     fi
-    if ! sccache --show-adv-stats --stats-format=json \
+    if ! run_sccache_control_command --show-adv-stats --stats-format=json \
         > "${SCCACHE_STATS_DIR}/sccache-advanced-stats.json"; then
       echo "WARNING: Failed to collect advanced JSON sccache stats" >&2
     fi
   else
     echo "::group::sccache stats"
-    sccache --show-stats || true
+    run_sccache_control_command --show-stats || true
     echo "::endgroup::"
   fi
-  sccache --stop-server >/dev/null 2>&1 || true
+  run_sccache_control_command --stop-server >/dev/null 2>&1 || true
   export FLASHINFER_SCCACHE_ACTIVE=false
 }

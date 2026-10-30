@@ -78,6 +78,10 @@ class ActivationType(IntEnum):
     Identity = 9
     Situ = 10
     InvalidType = 11
+    # CUTLASS-backend only. Keep these after InvalidType so existing activation
+    # values remain stable for the TRT-LLM backend.
+    ClampedRelu2 = 12
+    PowLU = 13
 
     # Eval-safe repr — see ``RoutingMethodType.__repr__``.
     def __repr__(self) -> str:
@@ -96,6 +100,7 @@ _GATED_ACTIVATION_TYPES = (
     ActivationType.SwigluStep,
     ActivationType.GegluTanh,
     ActivationType.Situ,
+    ActivationType.PowLU,
 )
 
 
@@ -107,6 +112,11 @@ DEFAULT_SWIGLU_LIMIT = torch.finfo(torch.float32).max
 # csrc/fused_moe/cutlass_backend/cutlass_fused_moe_kernels.cuh.
 DEFAULT_SITU_BETA = 4.0
 DEFAULT_SITU_LINEAR_BETA = 25.0
+
+# PowLU exponent numerator.
+# Must match the PowLUAdaptor default in
+# csrc/fused_moe/cutlass_backend/cutlass_fused_moe_kernels.cuh.
+DEFAULT_POWLU_M = 2.5
 
 
 def normalize_activation_type(
@@ -137,8 +147,8 @@ def is_gated_activation(activation_type: Union[int, ActivationType]) -> bool:
     -------
     bool
         ``True`` if ``activation_type`` belongs to the gated activation family
-        (``Swiglu``, ``Geglu``, ``SwigluBias``, ``SwigluStep``, ``GegluTanh``, ``Situ``);
-        ``False`` otherwise.
+        (``Swiglu``, ``Geglu``, ``SwigluBias``, ``SwigluStep``, ``GegluTanh``, ``Situ``,
+        ``PowLU``); ``False`` otherwise.
 
     Examples
     --------
@@ -242,8 +252,9 @@ class WeightLayout(IntEnum):
     MajorK = 0
     # M-major for A and N-major for B. [K, Mn]
     MajorMn = 1
-    # Layout is blocked along the K dimension. [K / blockK, Mn, blockK]
-    # where blockK is fixed at 128B
+    # Layout is blocked along the K dimension. [K / blockK, Mn, blockK].
+    # The physical block width is encoded by the prepared tensor (normally
+    # 128B, with 64B also supported by MXFP4 Prims-TS kernels).
     BlockMajorK = 2
 
 
@@ -265,3 +276,7 @@ class Fp8QuantizationType(IntEnum):
     DeepSeekFp8 = 1
     # MxFp8 x MxFp8
     MxFp8 = 2
+    # Per-tensor FP8
+    PerTensorFp8 = 3
+    # Per-channel FP8
+    PerChannelFp8 = 4

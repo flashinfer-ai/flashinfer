@@ -18,43 +18,62 @@ limitations under the License.
 
 Public API
 ----------
-:func:`top_k_varlen` — selects top-K per row of decode-step logits.
+:func:`top_k_varlen` — top-k column indices per row of ``logits``: in decode
+mode row ``i`` is one request's newest token scored against its ``seq_lens[i]``
+cached keys; in windowed (prefill) mode (``row_starts``) each row is one prompt
+token of a packed chunk scored over its request's key window.
 
 Backend choices
 ---------------
 ``"radix"``          — CuTe DSL single-pass multi-CTA radix top-K; native
-                       varlen support (no logit masking). Requires Blackwell
-                       (sm_100+) and nvidia-cutlass-dsl. No ``pre_idx`` needed.
-``"gvr"``            — GVR (Guess-Verify-Refine) load-balance kernel.
-                       Requires Blackwell (sm_100+), nvidia-cutlass-dsl, and a
-                       ``pre_idx`` hint from the previous decode step.
+                       varlen (no logit masking). SM100, SM103, SM107, SM110,
+                       SM120 and SM121 with nvidia-cutlass-dsl. ``pre_idx``
+                       accepted and ignored. Decode mode only.
+``"gvr"``            — GVR (Guess-Verify-Refine) load-balance kernel. SM100,
+                       SM103 or SM107 with nvidia-cutlass-dsl; requires a
+                       ``pre_idx`` hint from the previous decode step. Decode
+                       mode only.
+``"gvr_2"``          — self-sampling GVR V2 (sample-calibrated threshold
+                       ladders; TRT-LLM PR #17821 port). SM100, SM103 or
+                       SM107 with nvidia-cutlass-dsl; fp32 logits; ``pre_idx``
+                       optional (hint-free engines sample the identity
+                       positions when it is absent — exact either way, the
+                       hint only steers sampling). The only backend of
+                       windowed (prefill) mode (``row_starts``).
 ``"radix_cutlass"``  — masked-radix fallback; masks logits to ``seq_lens`` then
-                       calls the FlashInfer CUTLASS radix top-K.  Runs on any GPU.
-``"auto"``           — GVR (if pre_idx provided) > radix (Blackwell) >
-                       radix_cutlass (default).
+                       calls the FlashInfer CUTLASS radix top-K. Every GPU
+                       FlashInfer supports (SM75 and up).
+                       Decode mode only.
+``"radix_filter"``   — filtered-radix (coarse histogram → filter → on-chip
+                       refine); hint-free like ``"radix"``. SM100, SM103 or
+                       SM107 with nvidia-cutlass-dsl >= 4.8.
+                       ``pre_idx`` accepted and ignored. Decode mode only.
+``"auto"``           — runs the highest-ranked backend among those whose
+                       admission checks pass; the ranking is a static table on
+                       dtype, ``top_k``, ``num_cols``, request count and hint
+                       presence. Every backend is exact, so ``auto`` only
+                       affects speed; see "Backend selection" in
+                       ``top_k_varlen``.
 """
 
 import functools
-import importlib.util
 import math
+import sys
+import warnings
 from typing import Literal, Optional, Tuple
 
 import torch
 
 from ..api_logging import flashinfer_api
 from ..trace.templates.topk import top_k_varlen_trace
-from ..topk import get_topk_module
+from ..topk import _ROW_STATES_NBYTES, get_topk_module
 
-# Check for the Python CuTe DSL package without importing it (and without
-# importing cute_dsl/utils.py, which has top-level `import cutlass`).
-# This mirrors what is_cute_dsl_available() does internally.
-_CUTE_DSL_AVAILABLE = (
-    importlib.util.find_spec("cutlass") is not None
-    and importlib.util.find_spec("cutlass.cute") is not None
-)
+from ..cute_dsl.availability import is_cute_dsl_available
+
+_CUTE_DSL_AVAILABLE = is_cute_dsl_available()
 
 from ..utils import (
-    _get_cache_buf,
+    BackendSupportedError,
     backend_requirement,
     get_device_sm_count,
     get_shared_bytes_per_block_optin,
@@ -66,22 +85,91 @@ from ..utils import (
 # ---------------------------------------------------------------------------
 
 # All SM tiers FlashInfer ships kernels for.
-_ALL_CCS = [75, 80, 86, 89, 90, 100, 103, 110, 120, 121]
+_ALL_CCS = [75, 80, 86, 89, 90, 100, 103, 107, 110, 120, 121]
 
 # CuTe DSL radix backend: all Blackwell-plus tiers.
-_BLACKWELL_PLUS_CCS = [100, 103, 110, 120, 121]
+#
+# Rubin (SM107) runs the Blackwell CuTe-DSL kernels as-is: they use only
+# family-portable ops (block/warp scans, ``cute.arch.barrier``,
+# ``shuffle_sync_up``, ``warp_redux_sync``, griddepcontrol) with no
+# arch-specific ``tcgen05``/block-scaled MMA, so the DSL compiles them for
+# ``sm_107a`` natively. ``_cute_dsl_supports_arch`` below keeps a DSL that
+# predates the device from being selected.
+_BLACKWELL_PLUS_CCS = [100, 103, 107, 110, 120, 121]
 
-# GVR is B200-class only (SM100/103). The non-LB (cluster_size=1) GVR CuTe-DSL
-# kernel fails to build on sm_120a: libNVVM rejects the generated device IR
-# (verified on an RTX 5080), so consumer Blackwell (SM120/121) can't use GVR
-# even without load balancing. The LB path additionally needs cluster_size=4
-# programmatic multicast, which SM120/121's 1×1×1 cluster shape lacks. radix
+# GVR is B200-class only (SM100/103/107). The non-LB (cluster_size=1) GVR
+# CuTe-DSL kernel fails to build on sm_120a: libNVVM rejects the generated
+# device IR (verified on an RTX 5080), so consumer Blackwell (SM120/121) can't
+# use GVR even without load balancing. The LB path additionally needs
+# cluster_size=4 programmatic multicast, which SM120/121's 1×1×1 cluster shape
+# lacks. Rubin keeps both (datacentre cluster shape, same PTX surface). radix
 # serves SM110+.
-_GVR_CCS = [100, 103]
+_GVR_CCS = [100, 103, 107]
+
+# DKG filtered-radix backend (vendored CuTe-DSL kernel, see
+# kernels/filtered_topk_util.py). Upstream's own arch table
+# ``_LARGE_OCCUPANCY_MIN_BLOCKS_PER_MP`` covers sm_100/103/107/109. 109 is left
+# out here because the shipped CuTe DSL has no ``sm_109`` entry in
+# ``SMEM_CAPACITY_MAP``, so sizing raises before the kernel ever compiles.
+_RADIX_FILTER_CCS = [100, 103, 107]
 
 # ---------------------------------------------------------------------------
 # Backend requirement checkers
 # ---------------------------------------------------------------------------
+
+
+@functools.cache
+def _cute_dsl_supports_arch(major: int, minor: int) -> bool:
+    """Whether the installed CuTe DSL can target this compute capability.
+
+    The compute-capability lists above say which tiers FlashInfer *has* kernels
+    for; this says whether the *installed* DSL can emit code for the device. The
+    two differ on new silicon: a DSL release predating Rubin resolves ``sm_107a``
+    to a ``KeyError`` deep inside ``cute.compile``. Consulting this here makes
+    ``backend="auto"`` fall back to ``radix_cutlass`` instead of crashing, and
+    an explicit ``backend=`` request fail at dispatch with a clear error.
+
+    Note the introspection helper ``top_k_varlen.is_backend_supported`` does
+    NOT consult this (or any) runtime probe: it answers the *static* question
+    -- is the backend registered and does FlashInfer ship a kernel for this
+    compute capability -- from the registration dict and the CC lists alone.
+    Environment gates (installed-DSL arch support, the ``cutlass.memory``
+    requirement of ``radix_filter``) apply only at call time, through the
+    per-backend checkers. A True from ``is_backend_supported`` therefore does
+    not guarantee a call will be accepted in this environment. Mirrors
+    ``flashinfer.norm._cute_dsl_supports_arch``.
+    """
+    try:
+        from ..cute_dsl.utils import is_cute_dsl_arch_supported
+
+        return is_cute_dsl_arch_supported(major, minor)
+    except Exception:
+        # Never let the capability probe itself break top-k dispatch.
+        return True
+
+
+def _cute_dsl_ready(device: torch.device) -> bool:
+    """``True`` when the CuTe-DSL backends are usable on ``device``."""
+    if not _CUTE_DSL_AVAILABLE:
+        return False
+    major, minor = torch.cuda.get_device_capability(device)
+    return _cute_dsl_supports_arch(major, minor)
+
+
+def _decode_defaults(
+    next_n: Optional[int], compress_ratio: Optional[int]
+) -> Tuple[int, int]:
+    """Resolve the ``None`` sentinels of the two decode-mode arguments to ``1``.
+
+    Both default to ``None`` so that the API body can tell an explicit value
+    (refused in windowed (prefill) mode, where neither has a meaning) from an
+    omitted one. The checkers and the heuristic see the caller's raw
+    arguments, so they resolve the sentinels the same way before using them.
+    """
+    return (
+        1 if next_n is None else next_n,
+        1 if compress_ratio is None else compress_ratio,
+    )
 
 
 @supported_compute_capability(_ALL_CCS)
@@ -89,9 +177,15 @@ def _radix_cutlass_top_k_varlen_check(
     logits,
     seq_lens,
     top_k,
+    *,
+    row_starts=None,
+    max_window_len=None,
+    absolute_indices=False,
+    page_table=None,
+    page_size=None,
+    compress_ratio=None,
+    next_n=None,
     pre_idx=None,
-    compress_ratio=1,
-    next_n=1,
     return_values=False,
     out_indices=None,
     out_values=None,
@@ -99,8 +193,46 @@ def _radix_cutlass_top_k_varlen_check(
     load_balance=True,
     workspace=None,
 ):  # extra kwargs mirror the public signature; unused by the check
-    """Radix masked-fallback: runs on all supported SM tiers."""
-    return True
+    """Radix masked-fallback: runs on all supported SM tiers, on contiguous
+    logits (the CUDA launcher checks contiguity; gating here lets ``auto``
+    pick a backend that handles strided views instead)."""
+    if row_starts is not None or page_table is not None:
+        return False  # windowed (prefill) and paged modes are served by gvr_2 only
+    return logits.is_contiguous()
+
+
+def _hint_problem(pre_idx, logits, seq_lens, top_k) -> Optional[str]:
+    """Describe what is wrong with a caller-provided ``pre_idx``, or None.
+
+    The hint contract shared by the ``gvr`` and ``gvr_2`` kernels (both
+    compile it as a compact, 16-byte-aligned ``int32[batch, top_k]`` fake
+    tensor on the logits device): a hint that breaks it is treated as absent
+    by the checkers (so ``auto`` routes hint-free) and is dropped with a
+    RuntimeWarning by the API body. Any of these would otherwise surface as a
+    kernel-side RuntimeError or a DSL conversion error from the default path.
+    """
+    if not isinstance(pre_idx, torch.Tensor):
+        return f"not a tensor ({type(pre_idx).__name__})"
+    if logits.dim() != 2 or seq_lens.dim() != 1:
+        # the API body rejects these with a ValueError; the checkers (which
+        # run first) must not trip over them here
+        return "logits/seq_lens malformed (validated by the API body)"
+    if pre_idx.dim() != 2:
+        return f"expected a 2-D tensor, got {pre_idx.dim()}-D"
+    if pre_idx.dtype != torch.int32:
+        return f"expected int32, got {pre_idx.dtype}"
+    if not pre_idx.is_cuda or pre_idx.device != logits.device:
+        return f"expected a CUDA tensor on {logits.device}, got {pre_idx.device}"
+    expected = (seq_lens.shape[0], top_k)
+    if tuple(pre_idx.shape) != expected:
+        # run_varlen derives k from pre_idx.shape[1]; a mismatched width would
+        # silently select pre_idx.shape[1] elements instead of top_k.
+        return f"expected shape {expected} (one row per request), got {tuple(pre_idx.shape)}"
+    if not pre_idx.is_contiguous():
+        return "not contiguous"
+    if pre_idx.data_ptr() & 15:
+        return "base pointer not 16-byte aligned (shifted view)"
+    return None
 
 
 @supported_compute_capability(_GVR_CCS)
@@ -108,9 +240,15 @@ def _gvr_top_k_varlen_check(
     logits,
     seq_lens,
     top_k,
+    *,
+    row_starts=None,
+    max_window_len=None,
+    absolute_indices=False,
+    page_table=None,
+    page_size=None,
+    compress_ratio=None,
+    next_n=None,
     pre_idx=None,
-    compress_ratio=1,
-    next_n=1,
     return_values=False,
     out_indices=None,
     out_values=None,
@@ -123,13 +261,20 @@ def _gvr_top_k_varlen_check(
     Used by backend="auto" routing: returning False here causes the heuristic to
     fall back to radix or radix_cutlass rather than reaching GVR and crashing.
     """
-    if not (_CUTE_DSL_AVAILABLE and pre_idx is not None):
+    if row_starts is not None or page_table is not None:
+        return False  # windowed (prefill) and paged modes are served by gvr_2 only
+    if not (
+        _cute_dsl_ready(logits.device)
+        and pre_idx is not None
+        and _hint_problem(pre_idx, logits, seq_lens, top_k) is None
+    ):
         return False
     # GvrParams only has entries for top_k in {512, 1024, 2048}; other values
     # raise inside the kernel's __init__ during compilation.
     if top_k not in (512, 1024, 2048):
         return False
     # GvrTopKLBPrepareKernel asserts compress_ratio in (1, 4).
+    _, compress_ratio = _decode_defaults(next_n, compress_ratio)
     if compress_ratio not in (1, 4):
         return False
     # GVR uses 128-bit vectorized loads — each row must be 16-byte aligned.
@@ -144,14 +289,83 @@ def _gvr_top_k_varlen_check(
     return True
 
 
+@supported_compute_capability(_GVR_CCS)
+def _gvr2_top_k_varlen_check(
+    logits,
+    seq_lens,
+    top_k,
+    *,
+    row_starts=None,
+    max_window_len=None,
+    absolute_indices=False,
+    page_table=None,
+    page_size=None,
+    compress_ratio=None,
+    next_n=None,
+    pre_idx=None,
+    return_values=False,
+    out_indices=None,
+    out_values=None,
+    backend="auto",
+    load_balance=True,
+    workspace=None,
+):
+    """Return True only when the self-sampling GVR V2 port can run this config.
+
+    Mirrors the TRT-LLM ``run_varlen`` hard contract so backend="auto" (and an
+    explicit backend="gvr_2") never reaches a kernel-side RuntimeError.
+
+    ``pre_idx`` is NOT a requirement: the kernels use the hint only as a
+    sampling anchor, so the host runs the hint-free compiled engines (identity
+    sample, TRT-LLM #18410) when it is absent — or malformed, in which case the
+    API body discards it with a RuntimeWarning first.
+    """
+    # windowed (prefill) mode takes no pre_idx / next_n / compress_ratio: the
+    # API body refuses them with a ValueError before any launch, and admitting
+    # the call here is what lets ``auto`` report that error (not "no backend")
+    _, compress_ratio = _decode_defaults(next_n, compress_ratio)
+    if not _cute_dsl_ready(logits.device):
+        return False
+    # fp32 only: the upstream self-sampling kernels declare bf16/fp16 a
+    # follow-up (run_varlen raises on any other dtype).
+    if logits.dtype != torch.float32:
+        return False
+    # Validated K domain (matches the upstream dispatch tuning + dsa.py gate).
+    if top_k not in (512, 1024, 2048):
+        return False
+    if row_starts is None and compress_ratio not in (1, 4):
+        return False  # a decode-mode value; in windowed mode the body refuses any value
+    # float4 row loads: row stride must be a multiple of 4 and the base
+    # 16-byte aligned (fresh torch allocations always are; sliced views may
+    # not be). Wider-than-N row strides are accepted (paged arenas); rows that
+    # overlap (stride(0) < shape[1], e.g. an expand view) are not a layout the
+    # kernel can address — it derives the row pitch from stride(0).
+    if logits.dim() != 2 or logits.stride(1) != 1:
+        return False
+    if logits.shape[0] > 1 and logits.stride(0) < logits.shape[1]:
+        return False
+    npad = logits.stride(0) if logits.shape[0] > 1 else logits.shape[1]
+    if npad % 4 != 0:
+        return False
+    if logits.is_cuda and (logits.data_ptr() & 15):
+        return False
+    return True
+
+
 def _top_k_varlen_heuristic(
     suitable_backends,
     logits: torch.Tensor,
     seq_lens: torch.Tensor,
     top_k: int,
+    *,
+    row_starts=None,
+    max_window_len=None,
+    absolute_indices=False,
+    page_table=None,
+    page_size: Optional[int] = None,
+    compress_ratio: Optional[int] = None,
+    next_n: Optional[int] = None,
     pre_idx=None,
-    compress_ratio: int = 1,
-    next_n: int = 1,
     return_values: bool = False,
     out_indices=None,
     out_values=None,
@@ -159,13 +373,127 @@ def _top_k_varlen_heuristic(
     load_balance: bool = True,
     workspace=None,
 ):
-    """GVR (needs pre_idx) > radix (CuTe DSL, Blackwell) > radix_cutlass (all GPUs).
+    """Shape/dtype-aware ranking so auto tracks the measured per-config winner.
+
+    Grounded in a 500+-cell B200 sweep (uniform/mixed/short lengths,
+    K in {512, 1024, 2048}, B in [1, 256], N in [1K, 128K], fp32/bf16/fp16,
+    cr in {1, 4}, next_n in {1, 2}; see PR #4811). Decision rules, using only
+    capture-stable host facts (dtype, logits width N, request count B):
+
+    1. fp32: gvr_2 first, hinted or not — hinted it won 211/213 measured
+       cells (geomean 2.1-3.8x over every other backend) and ~1.00x vs its
+       TRT-LLM origin; HINT-FREE (identity-sample engines, TRT-LLM #18410;
+       measured on the earlier arange-anchor form) it stays within ~10% of the
+       hinted time on most cells and beats the best hint-free radix backend
+       by 1.5-5x on every measured cell (B100, K in {512, 1024, 2048}, N in
+       [4K, 512K], B in [1, 256], cr 1 and 4, uniform and mixed lengths)
+       except one: K >= 2048 with N <= 4096 at B == 1, where radix_filter is
+       ~1.3x faster (3.0 vs 3.9 us) — that cell is carved out, as is the
+       static all-rows-short case N <= K (identity answer; radix_filter
+       0.85 vs gvr_2 1.1 us), hinted or not.
+    2. gvr vs radix (when a hint is given but gvr_2 is unsuitable, and for
+       every bf16/fp16 hinted call): gvr only pays off when the batch is
+       large AND rows are long — B*N >= 2^22 (fp32) / 2^23 (bf16/fp16).
+       Below that radix wins by up to 2.8x; above it gvr wins by 1.03-1.76x.
+    3. radix vs radix_cutlass: the masked-CUTLASS fallback only wins the
+       fp32 big corner (N >= 65536 AND B*N >= 2^23, by up to 2.8x); radix
+       wins everywhere else, and always wins for bf16/fp16 (1.2-3.2x).
+
+    Refined by the auto-vs-oracle study (B100/B200 and Rubin; N 8K..1M,
+    K in {1024, 2048}, fp32/bf16, hinted and hint-free, uniform/mixed/short
+    lengths, CUDA-graph timing; PR #4811, section 7), which measured auto's
+    efficiency = best-of-all / auto per cell:
+
+    4. radix_filter is admitted ahead of radix/radix_cutlass where it was the
+       fastest hint-free backend on SM100 (hint-free fp32 efficiency
+       0.83 -> ~0.98, bf16 0.86 -> ~0.97):
+         fp32: N >= 32K, except the single-row case at N >= 512K (radix
+               wins there); and every N once B >= 256;
+         half: 32K <= N <= 128K for B <= 16; N >= 128K for B >= 64;
+               N <= 8K for B >= 256.
+       One rule for every arch: radix_filter's margins are larger on SM107,
+       so the SM100 crossover is conservative there.
+    5. gvr (V1) for half precision only when B >= 256 and 32K <= N <= 512K
+       (it beats radix/radix_filter there by 1.1-1.4x); the previous
+       B*N >= 2^23 rule picked it at B <= 64 for N >= 512K, where it loses
+       1.5-7x to radix. The fp32 gvr rule (B*N >= 2^22) is unchanged and
+       only matters when gvr_2 is unsuitable; radix_filter ranks ahead of
+       gvr there (1.2-3x faster in fp32).
+
+    Known static blind spot: batches whose rows are mostly FAR shorter than
+    N (detectable only by reading seq_lens contents — a D2H sync auto must
+    not pay) favor radix over gvr_2 at large N; callers in that regime
+    should pass backend="radix" explicitly.
 
     The full signature must be spelled out (not **kwargs) so that the decorator can
     call this function with positional args on the skip_check=True path without
     raising TypeError.  Mirrors the pattern used by _heuristic_func_mm_fp4.
+    Tolerates logits/seq_lens=None (hardware-independent unit tests) by
+    falling back to a static order.
     """
-    return [b for b in ("gvr", "radix", "radix_cutlass") if b in suitable_backends]
+    if logits is None or seq_lens is None or logits.dim() != 2 or seq_lens.dim() != 1:
+        # None / malformed tensors: static fallback order (no shape to justify
+        # radix_filter, so it stays out). Malformed shapes must fall through
+        # so the API's own validation asserts fire (the heuristic must never
+        # be the thing that rejects bad input).
+        order = ["gvr_2", "gvr", "radix", "radix_cutlass"]
+        return [b for b in order if b in suitable_backends]
+
+    fp32 = logits.dtype == torch.float32
+    n_cols = logits.shape[1]
+    batch = seq_lens.shape[0]
+    elems = batch * n_cols
+    if fp32:
+        rf_first = batch >= 256 or (n_cols >= 32768 and (batch > 1 or n_cols <= 131072))
+        gvr_first = elems >= (1 << 22)
+    else:
+        rf_first = (
+            (batch <= 16 and 32768 <= n_cols <= 131072)
+            or (batch >= 64 and n_cols >= 131072)
+            or (batch >= 256 and n_cols <= 8192)
+        )
+        gvr_first = batch >= 256 and 32768 <= n_cols <= 524288
+    cutlass_first = fp32 and n_cols >= 65536 and elems >= (1 << 23)
+    # the one measured cell where hint-free radix_filter beats gvr_2 (rule 1);
+    # hinted gvr_2 is still ahead there, so that carve-out is hint-free only.
+    # N <= top_k is static "every row is the identity answer": radix_filter
+    # emits it without reading logits, ~0.25 us under gvr_2's short-path
+    # launch (0.85 vs 1.1 us on B100 and B200, hinted or not; re-measured
+    # with the hint-free compiled engines, 2026-09).
+    hinted = (
+        pre_idx is not None and _hint_problem(pre_idx, logits, seq_lens, top_k) is None
+    )
+    all_short = n_cols <= top_k
+    gvr2_tiny_loss = all_short or (
+        (not hinted) and top_k >= 2048 and n_cols <= 4096 and batch == 1
+    )
+
+    order = [] if gvr2_tiny_loss else ["gvr_2"]
+    if fp32:
+        # radix_filter beats gvr in every measured fp32 cell (1.2-3x)
+        if rf_first:
+            order.append("radix_filter")
+        if gvr_first:
+            order.append("gvr")
+    else:
+        # in its half-precision window gvr edges radix_filter (B=256, 32K-512K)
+        if gvr_first:
+            order.append("gvr")
+        if rf_first:
+            order.append("radix_filter")
+    if cutlass_first:
+        order += ["radix_cutlass", "radix"]
+    else:
+        order += ["radix", "radix_cutlass"]
+    if "gvr" not in order:
+        # small-problem fallback rank: radix > gvr > radix_cutlass
+        order.insert(order.index("radix") + 1, "gvr")
+    if gvr2_tiny_loss:
+        # radix_filter (the cell's winner) first, gvr_2 right behind it
+        order = ["radix_filter", "gvr_2"] + [
+            b for b in order if b not in ("radix_filter", "gvr_2")
+        ]
+    return [b for b in order if b in suitable_backends]
 
 
 # ---------------------------------------------------------------------------
@@ -784,6 +1112,127 @@ def _run_gvr(
 
 
 # ---------------------------------------------------------------------------
+# Internal: gvr_2 (self-sampling GVR V2) backend implementation
+# ---------------------------------------------------------------------------
+
+
+def _run_gvr2(
+    logits: torch.Tensor,
+    pre_idx: Optional[torch.Tensor],
+    seq_lens: torch.Tensor,
+    top_k: int,
+    next_n: int,
+    compress_ratio: int,
+    return_output_values: bool,
+    out_indices: torch.Tensor,
+    out_values: Optional[torch.Tensor],
+    workspace: Optional[dict] = None,
+    row_starts: Optional[torch.Tensor] = None,
+    max_window_len: Optional[int] = None,
+    absolute_indices: bool = False,
+    page_table: Optional[torch.Tensor] = None,
+    page_size: int = 1,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """Self-sampling GVR V2: one launch for the whole batch via the per-row
+    in-kernel varlen engine (TRT-LLM ``run_varlen`` port). ``row_starts``
+    selects the windowed (prefill) engines (TRT-LLM #18702 port);
+    ``max_window_len`` (windowed only) is the caller's bound on the window
+    lengths, which lets the host pick a register-resident engine for the
+    launch; without it the streaming engine serves every row.
+
+    ``max_window_len`` is derived from the logits row width (in uncompressed
+    token space, hence ``* compress_ratio``), which is capture-stable — the
+    call performs NO host reads of device data and is CUDA-graph safe once
+    the launcher for this shape has been compiled (warm up before capture).
+    The kernel reads each request's ``seq_lens`` on device and re-derives its
+    sampling ladder per row, so no LJF sort or prepare kernel is needed.
+    ``pre_idx=None`` runs hint-free: distinct compiled engines with the hint
+    loads compiled out (the identity sample is the anchor; TRT-LLM #18410) —
+    exact, no host-side hint state, CUDA-graph safe once compiled by an eager
+    hint-free call at the geometry (hint mode is a warm-up dimension).
+    """
+    from .kernels import gvr2_topk_host
+
+    gvr2_topk_host.run_varlen(
+        logits,
+        pre_idx,
+        seq_lens,
+        out_indices,
+        next_n=next_n,
+        compress_ratio=compress_ratio,
+        values=out_values if return_output_values else None,
+        # windowed: None = unhinted (streaming engine), else the caller's
+        # window-length bound (clamped to the width); decode: the logits
+        # width in uncompressed token space
+        max_seq_len=(
+            (
+                min(int(max_window_len), logits.shape[1])
+                if max_window_len is not None
+                else None
+            )
+            if row_starts is not None
+            else logits.shape[1] * compress_ratio
+        ),
+        workspace=workspace.get("gvr2_workspace") if workspace else None,
+        top_k=top_k,
+        row_starts=row_starts,
+        absolute_indices=absolute_indices,
+        page_table=page_table,
+        page_size=page_size,
+    )
+    return out_indices, (out_values if return_output_values else None)
+
+
+def release_gvr2_resources(device=None) -> int:
+    """Release the ``gvr_2`` backend's lazily created per-device caches.
+
+    ``top_k_varlen(backend="gvr_2")`` keeps, per device, one default workspace
+    slab per raw CUDA stream handle it has run on (20,973,568 bytes each; as
+    many as there are distinct stream handles that ran an eager slab-using
+    launch). They are created by eager launches and live for the process. Returns 0
+    without importing the kernel modules if the ``gvr_2`` host was never
+    loaded in this process (nothing can be cached then). This call
+    synchronizes ``device`` (default: the current device; an int, a
+    ``torch.device`` or a device string — CUDA only, anything else raises
+    ``ValueError``), drops them all and returns the number of bytes released
+    to the torch caching allocator (``torch.cuda.empty_cache()`` returns that
+    memory to the driver).
+
+    The caller must be quiescent on ``device`` for the duration of the call:
+    no ``gvr_2`` call in flight or being issued from any thread, eager or
+    CUDA-graph replay — the same rule as ``torch.cuda.empty_cache()`` versus
+    live tensors. The launch hot paths do not take the cache locks, so a
+    launch issued concurrently could otherwise address a slab this call has
+    just released.
+
+    Any CUDA graph captured against a released slab would replay on
+    freed memory: release only when no such graph will be replayed again, and
+    re-capture after a fresh warm-up on the capturing stream (one eager
+    ``gvr_2`` launch that uses the streaming engine, or for windowed graphs
+    ``warmup_prefill``), the same rule as the first capture. Explicit
+    ``workspace=`` buffers passed by the caller are never touched.
+    """
+    if device is not None:  # same argument contract whether or not the host is loaded
+        dev = (
+            torch.device("cuda", device)
+            if isinstance(device, int)
+            else torch.device(device)
+        )
+        if dev.type != "cuda":
+            raise ValueError(
+                f"release_gvr2_resources: expected a CUDA device, got {dev!r}"
+            )
+    # The caches live in the gvr_2 host module; if it was never imported in
+    # this process no gvr_2 launch has happened and nothing can be cached.
+    # Looking it up in sys.modules (instead of importing it) keeps this a
+    # true no-op: nothing is loaded and no device is synchronized.
+    host = sys.modules.get(f"{__package__}.kernels.gvr2_topk_host")
+    if host is None:
+        return 0
+    return host.release_cached_resources(device)
+
+
+# ---------------------------------------------------------------------------
 # Internal: radix_cutlass (masked-radix CUTLASS) backend implementation
 # ---------------------------------------------------------------------------
 
@@ -811,16 +1260,17 @@ def _run_radix_cutlass(
         row_seq_lens = (row_seq_lens - next_n + row_offsets + 1) // compress_ratio
     else:
         row_seq_lens = seq_lens // compress_ratio
-    lengths = row_seq_lens.clamp(max=N).to(torch.int32)
+    # min=0: a padded / evicted request (seq_len < next_n - nn) gives a negative
+    # numerator; the kernel would reinterpret a negative length as unsigned.
+    lengths = row_seq_lens.clamp(min=0, max=N).to(torch.int32)
 
     # offsets=zeros: output indices are local column indices (0..N-1), no shift.
     offsets = torch.zeros(num_rows, dtype=torch.int32, device=logits.device)
 
-    row_states_buffer = _get_cache_buf(
-        f"radix_topk_row_states_{logits.device}",
-        1024 * 1024,
-        logits.device,
-        zero_init=True,
+    # Fresh zeroed state keeps concurrent calls disjoint and initializes the
+    # inter-CTA synchronization counters for every launch.
+    row_states_buffer = torch.zeros(
+        _ROW_STATES_NBYTES, dtype=torch.uint8, device=logits.device
     )
     # Write directly into out_indices — no second allocation or copy_ needed.
     get_topk_module().radix_topk_ragged_transform(
@@ -860,9 +1310,15 @@ def _radix_top_k_varlen_check(
     logits,
     seq_lens,
     top_k,
+    *,
+    row_starts=None,
+    max_window_len=None,
+    absolute_indices=False,
+    page_table=None,
+    page_size=None,
+    compress_ratio=None,
+    next_n=None,
     pre_idx=None,
-    compress_ratio=1,
-    next_n=1,
     return_values=False,
     out_indices=None,
     out_values=None,
@@ -870,8 +1326,14 @@ def _radix_top_k_varlen_check(
     load_balance=True,
     workspace=None,
 ):
-    """CuTe DSL multi-CTA radix: Blackwell only, no pre_idx required."""
-    return _CUTE_DSL_AVAILABLE
+    """CuTe DSL multi-CTA radix: Blackwell-plus only, no pre_idx required.
+    Overlapping row layouts (stride(0) < shape[1]) fail the kernel's stride
+    contract, so they are gated here and ``auto`` falls through."""
+    if row_starts is not None or page_table is not None:
+        return False  # windowed (prefill) and paged modes are served by gvr_2 only
+    if logits.dim() == 2 and logits.shape[0] > 1 and logits.stride(0) < logits.shape[1]:
+        return False
+    return _cute_dsl_ready(logits.device)
 
 
 def _run_radix(
@@ -917,33 +1379,13 @@ def _run_radix(
         num_sms,
     )
 
-    # row_states holds the global histograms + inter-CTA barrier counters used
-    # when ctas_per_group > 1. max_num_groups must equal the compile-time value
-    # (both = num_sms // ctas_per_group) so the buffer matches the grid.
-    #
-    # The buffer is allocated for the worst case (ctas_per_group=1 → num_sms
-    # groups) and sliced to the current max_num_groups. Fixing the allocation at
-    # num_sms means the shared, device-keyed buffer never has to grow between
-    # calls with different N/ctas_per_group (a grow would re-zero and churn), and
-    # matches TRT-LLM's `[num_sms, state_size]` allocation.
-    #
-    # zero_init=True: the multi-CTA path spins on _ARRIVAL_COUNTER, so the buffer
-    # MUST be zero before the first launch. The kernel self-resets the slots it
-    # touches at end-of-kernel, so steady state stays clean without re-zeroing —
-    # but a prior single-CTA call (which never writes row_states) could otherwise
-    # leave garbage a later multi-CTA call reads. Zeroing on the one-time
-    # allocation (outside any CUDA-graph capture) keeps both paths correct.
+    # Fresh zeroed state keeps concurrent calls disjoint and initializes the
+    # inter-CTA synchronization counters for every launch.
     max_num_groups = max(1, num_sms // ctas_per_group)
-    nbytes = max_num_groups * _RADIX_STATE_SIZE * 4  # int32 → 4 bytes each
-    row_states = (
-        _get_cache_buf(
-            f"radix_row_states_{logits.device}",
-            num_sms * _RADIX_STATE_SIZE * 4,  # worst case: ctas_per_group=1
-            logits.device,
-            zero_init=True,
-        )[:nbytes]
-        .view(torch.int32)
-        .view(max_num_groups, _RADIX_STATE_SIZE)
+    row_states = torch.zeros(
+        (max_num_groups, _RADIX_STATE_SIZE),
+        dtype=torch.int32,
+        device=logits.device,
     )
 
     compiled(
@@ -957,6 +1399,159 @@ def _run_radix(
 
 
 # ---------------------------------------------------------------------------
+# Internal: DKG filtered-radix (`radix_filter`) backend implementation
+# ---------------------------------------------------------------------------
+
+_RADIX_FILTER_DTYPES = (torch.float32, torch.float16, torch.bfloat16)
+
+
+@functools.cache
+def _radix_filter_kernel_dsl_ok() -> bool:
+    """Whether the installed CuTe DSL has the APIs the vendored kernel uses.
+
+    The vendored kernels require **nvidia-cutlass-dsl >= 4.8**. They use the
+    ``cutlass.memory`` namespace (``SmemAllocator``,
+    ``get_smem_capacity_in_bytes``); 4.7.x exposes those APIs under
+    ``cutlass.utils`` instead, lacks the sm_107 architecture/capacity
+    metadata the Rubin sizing needs, and predates the ``cutlass.block``
+    namespace the TMA path uses -- so a 4.7 "compatibility alias" would not
+    actually run these kernels, and this repo's minimum DSL pin is older
+    still. On such environments the kernel would raise ``AttributeError``
+    from inside ``cute.compile``. Unlike the arch probe above,
+    this one fails CLOSED: without the module the kernel definitely cannot run,
+    so reporting unsupported (clean fallback / clean dispatch error) is strictly
+    better than the deferred crash.
+    """
+    try:
+        import cutlass.memory  # noqa: F401, PLC0415
+
+        return hasattr(cutlass.memory, "SmemAllocator") and hasattr(
+            cutlass.memory, "get_smem_capacity_in_bytes"
+        )
+    except Exception:
+        return False
+
+
+@supported_compute_capability(_RADIX_FILTER_CCS)
+def _radix_filter_top_k_varlen_check(
+    logits,
+    seq_lens,
+    top_k,
+    *,
+    row_starts=None,
+    max_window_len=None,
+    absolute_indices=False,
+    page_table=None,
+    page_size=None,
+    compress_ratio=None,
+    next_n=None,
+    pre_idx=None,
+    return_values=False,
+    out_indices=None,
+    out_values=None,
+    backend="auto",
+    load_balance=True,
+    workspace=None,
+):
+    """Return True only when the vendored DKG kernel covers this configuration.
+
+    Upstream's decode wrapper has no ``compress_ratio`` parameter, so that is
+    a hard exclusion rather than a tuning knob -- returning False here makes
+    an explicit ``backend="radix_filter"`` call fail at backend validation
+    instead of failing deep inside the kernel constructor. A ``pre_idx`` is
+    accepted and ignored, exactly as ``radix`` and ``radix_cutlass`` treat it:
+    the hint is optional steering for the GVR family, never a correctness
+    input, so a hinted caller can use (or be routed by ``auto`` to) any
+    hint-free backend.
+    """
+    if row_starts is not None or page_table is not None:
+        return False  # windowed (prefill) and paged modes are served by gvr_2 only
+    if not _cute_dsl_ready(logits.device):
+        return False
+    if not _radix_filter_kernel_dsl_ok():
+        return False
+    # Vendored kernel bound: FilteredTopKKernelVarlen rejects top_k outside
+    # [1, 16384]; enforce it here so the failure is a backend-validation error.
+    if not 1 <= top_k <= 16384:
+        return False
+    if _decode_defaults(next_n, compress_ratio)[1] != 1:
+        return False
+    if logits.dtype not in _RADIX_FILTER_DTYPES:
+        return False
+    return True
+
+
+def _run_radix_filter(
+    logits: torch.Tensor,
+    seq_lens: torch.Tensor,
+    top_k: int,
+    next_n: int,
+    compress_ratio: int,
+    return_output_values: bool,
+    out_indices: torch.Tensor,
+    out_values: Optional[torch.Tensor],
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """DKG filtered-radix (coarse histogram -> filter -> refine) decode top-k.
+
+    The upstream wrapper's contract already matches this API: it takes the
+    ``(batch * next_n, N)`` logits and the ``(batch,)`` int32 ``seq_lens``, and
+    returns row-relative indices padded with ``-1``.
+
+    Integration boundary (vs. the fused sparse-attention interface): this
+    backend produces ROW-RELATIVE TOP-K INDICES ONLY. It does not fuse the
+    page-table translation, does not take ``row_starts`` /
+    ``page_table_row_starts`` / ``row_to_batch``, offers no deterministic
+    tie-breaking, and has no ``dsa_graph_safe`` mode -- all of which
+    :func:`flashinfer.top_k_page_table_transform` provides in one fused
+    launch. A consumer of that interface can substitute this backend for
+    ordinary decode only by adding a separate index-transform launch, and
+    cannot substitute it at all where ``row_starts``-based ragged/extend
+    semantics or deterministic ties are required. It allocates its own
+    outputs, so ``out_indices``/``out_values`` are filled by copy when the
+    caller supplied them.
+    """
+    from .kernels.filtered_topk_decode import (  # noqa: PLC0415
+        cute_dsl_radix_filter_topk_wrapper,
+    )
+
+    # The kernel ABI declares a symbolic leading stride (padded row views are
+    # zero-copy) but requires a unit inner stride and a 32-byte-aligned base
+    # for its vectorized loads; anything else previously failed late with an
+    # opaque FFI alignment error. Materialize only the genuinely unsupported
+    # layouts (rare: transposed/gathered views, or a base sliced off
+    # alignment -- torch allocations themselves are 256-byte aligned).
+    if logits.stride(-1) != 1 or (logits.data_ptr() % 32) != 0:
+        logits = logits.contiguous()
+        if (logits.data_ptr() % 32) != 0:
+            logits = logits.clone()
+
+    # Compile and launch under the input tensor's device: the persistent JIT
+    # cache tags artifacts by the CURRENT device's architecture, and the
+    # kernel launches on the current stream, so both must agree with where
+    # the data lives on a multi-GPU host.
+    with torch.cuda.device(logits.device):
+        # Caller-supplied buffers are threaded through to the kernel launch, so
+        # the kernel writes them directly: no per-call output allocation, no
+        # num_rows x top_k device copy, and CUDA-graph users keep stable
+        # destinations across replays.
+        idx, val = cute_dsl_radix_filter_topk_wrapper(
+            logits,
+            seq_lens,
+            top_k,
+            next_n,
+            return_val=return_output_values,
+            out_indices=out_indices,
+            out_values=out_values if return_output_values else None,
+        )
+
+    if out_indices is not None:
+        idx = out_indices  # same storage; preserve the caller's shape/object
+    if return_output_values and out_values is not None:
+        val = out_values
+    return idx, (val if return_output_values else None)
+
+
+# ---------------------------------------------------------------------------
 # Public API: top_k_varlen
 # ---------------------------------------------------------------------------
 
@@ -965,7 +1560,9 @@ def _run_radix(
     {
         "radix": _radix_top_k_varlen_check,
         "gvr": _gvr_top_k_varlen_check,
+        "gvr_2": _gvr2_top_k_varlen_check,
         "radix_cutlass": _radix_cutlass_top_k_varlen_check,
+        "radix_filter": _radix_filter_top_k_varlen_check,
     },
     heuristic_func=_top_k_varlen_heuristic,
 )
@@ -974,113 +1571,344 @@ def top_k_varlen(
     logits: torch.Tensor,
     seq_lens: torch.Tensor,
     top_k: int,
+    *,
+    row_starts: Optional[torch.Tensor] = None,
+    max_window_len: Optional[int] = None,
+    absolute_indices: bool = False,
+    page_table: Optional[torch.Tensor] = None,
+    page_size: Optional[int] = None,
+    compress_ratio: Optional[int] = None,
+    next_n: Optional[int] = None,
     pre_idx: Optional[torch.Tensor] = None,
-    compress_ratio: int = 1,
-    next_n: int = 1,
     return_values: bool = False,
     out_indices: Optional[torch.Tensor] = None,
     out_values: Optional[torch.Tensor] = None,
-    backend: Literal["radix", "gvr", "radix_cutlass", "auto"] = "auto",
+    backend: Literal[
+        "radix", "gvr", "gvr_2", "radix_cutlass", "radix_filter", "auto"
+    ] = "auto",
     load_balance: bool = True,
     workspace: Optional[dict] = None,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-    r"""Top-K selection over batched decode-step logits.
+    r"""Top-k selection per row over rows of different valid lengths.
 
-    Selects the top-``top_k`` elements from each row of ``logits``,
-    respecting per-request KV-cache lengths given by ``seq_lens``.
+    ``logits`` holds one row per query token and one score per key column;
+    ``num_cols`` is the width of that static buffer, the same for every row. In
+    decode mode (the default), each row is a request's newest token (one row
+    per request, or ``next_n`` rows with speculative tokens) and its valid
+    columns are the request's cached keys, which start at column ``0``: with
+    one row per request and no compression they are ``[0, seq_lens[i])``, and
+    the ``seq_lens`` entry below gives their count under ``next_n > 1`` or
+    ``compress_ratio > 1``. In windowed (prefill) mode (``row_starts`` given),
+    each row is one prompt token of a packed chunk and its valid columns are
+    its request's window ``[row_starts[r], row_starts[r] + seq_lens[r])``. The
+    result is the ``top_k`` indices of every row's valid columns, ``-1`` padded
+    where a row has fewer valid columns than ``top_k``, and with
+    ``return_values=True`` also the selected scores. In decode mode, an index
+    is the logits column, which is also the key's position in its request's
+    cache, or the key's physical KV slot when ``page_table`` is given. In
+    windowed (prefill) mode, an index is by default the position
+    inside the window: ``0`` is ``row_starts[r]``, the request's first key, so
+    a window position addresses the request's cache exactly like a decode
+    index. With ``absolute_indices=True`` an index is instead the logits column
+    ``row_starts[r] + position``, which addresses the chunk's packed key
+    sequence directly.
 
     Backend selection
     -----------------
-    ``backend="auto"`` (default) chooses GVR when available (Blackwell +
-    ``pre_idx`` supplied), else the CuTe DSL ``radix`` backend on Blackwell,
-    else the ``radix_cutlass`` masked fallback.  Force a specific backend with
-    ``backend="radix"``, ``backend="gvr"``, or ``backend="radix_cutlass"``.
+    ``backend="auto"`` (default) runs the highest-ranked backend among those
+    whose admission checks pass for the call. The checks cover dtype,
+    ``top_k``, layout and alignment, the mode arguments, the GPU and the
+    installed CuTe DSL. The ranking is a static table over dtype, ``top_k``,
+    ``num_cols``, request count and whether a valid hint (``pre_idx``) is given; it never
+    reads the contents of ``seq_lens``, which would cost a device
+    synchronization. Every backend returns the exact top-k set of each row
+    for finite and infinite scores (ties at the K-th value may be broken
+    differently), so ``auto`` only ever affects speed. The table is
+    maintained from measurements, revised between releases, and not part of
+    the contract. Force a backend with ``backend="radix"``, ``"gvr"``,
+    ``"gvr_2"``, ``"radix_filter"`` or ``"radix_cutlass"``.
+    ``top_k_varlen.is_backend_supported(name, compute_capability)`` tells
+    whether a backend exists for a GPU.
+
+    Windowed (prefill) mode
+    -----------------------
+    ``row_starts`` switches a call into windowed (prefill) mode.
+    ``max_window_len`` and ``absolute_indices`` apply only there (a decode
+    call refuses ``max_window_len`` and ``absolute_indices=True`` with
+    ``ValueError``); ``next_n``, ``compress_ratio`` and ``pre_idx`` belong to
+    decode mode (a windowed call refuses any value but ``None``, ``next_n=1``
+    and ``compress_ratio=1`` included, with ``ValueError``).
+
+    The mode exists for the DSA indexer's prefill layout, where two things
+    move a row's keys away from column 0: several requests share one packed
+    key axis, and chunked prefill or prefix caching puts a request's earlier
+    keys on that axis without rows. In decode every row is one request whose
+    keys start at column 0. In prefill the indexer scores one chunk of the
+    batch in a single grouped GEMM: the keys of every request, including the
+    prefix cached by earlier chunks, occupy consecutive column ranges of one
+    packed key axis, while only the chunk's new tokens have rows. A row's
+    valid keys therefore start at its request's column offset,
+    ``row_starts[r]``, and span the cached prefix plus the causal part of the
+    chunk, ``seq_lens[r]`` columns; cells outside that window belong to other
+    requests or to later tokens and are never read.
+    Toy chunk, request A (2 new tokens) and request B (1 cached token ``b0``,
+    3 new tokens), ``top_k=2``::
+
+                       col: 0   1  | 2   3   4   5       row_starts  seq_lens
+                            a0  a1 | b0  b1  b2  b3
+            row 0  a0     [ *   .  | .   .   .   .  ]       0           1
+            row 1  a1     [ *   *  | .   .   .   .  ]       0           2
+            row 2  b1     [ .   .  | *   *   .   .  ]       2           2
+            row 3  b2     [ .   .  | *   *   *   .  ]       2           3
+            row 4  b3     [ .   .  | *   *   *   *  ]       2           4
+
+    ``*`` marks a key inside the row's window, ``.`` a cell outside it
+    (garbage from the GEMM, never read as a candidate). ``row_starts`` says
+    where the row's request begins; ``seq_lens`` becomes the window length
+    (cached prefix + position + 1; the cached ``b0`` is a column, not a row).
+    Row 4 selecting ``b0`` and ``b2`` as its two top-k indices (``top_k=2``
+    here) is returned as the positions ``0`` and ``2`` inside B (the default:
+    a paged consumer maps them through B's page table) or as the columns ``2``
+    and ``4`` of ``logits`` (``absolute_indices=True``: the ragged consumer
+    reads the packed KV buffer by column). ``max_window_len`` (here 4, the
+    longest window) is only a bound the backend specializes on before the
+    launch and defaults to ``num_cols``; while every window stays within the bound,
+    it never changes which keys win.
+
+    Rules of the mode: a window shorter than ``top_k`` returns all its
+    positions; a window end past ``num_cols`` is clamped to ``num_cols``.
+    Under a captured graph the contents of ``row_starts`` and ``seq_lens``
+    may change between replays while every window stays within
+    ``max_window_len``. The backends that serve the mode, with their limits
+    and CUDA-graph warm-up rule, are listed under ``backend``.
 
     Parameters
     ----------
     logits : torch.Tensor
-        2-D float tensor of shape ``(num_rows, max_seq_len)``.
-        Supported dtypes: ``float32``, ``bfloat16``, ``float16``.
-        For the ``"gvr"`` backend the row width ``max_seq_len`` must be a
-        multiple of ``16 // itemsize`` (8 for fp16/bf16, 4 for fp32) so each
-        row is 16-byte aligned for GVR's 128-bit vectorized loads; a
-        ``ValueError`` is raised otherwise.  The ``"radix_cutlass"`` backend has no
-        such constraint.
+        2-D CUDA tensor of shape ``(num_rows, num_cols)`` in ``float32``,
+        ``bfloat16`` or ``float16``; the dtypes, layouts and alignments each
+        backend accepts are listed under ``backend``.
     seq_lens : torch.Tensor
-        1-D ``int32`` tensor of shape ``(num_rows // next_n,)`` with the
-        effective KV-cache length per request.  Logits at or beyond
-        ``seq_lens[i]`` are excluded from the search.
+        1-D ``int32`` tensor with one entry per request, shape
+        ``(num_rows // next_n,)``: each request's KV-cache length. Units: in
+        decode mode, KV tokens, before compression (the kernel divides by
+        ``compress_ratio``); in windowed (prefill) mode, columns of ``logits``,
+        after compression. Base case, ``next_n == 1`` and
+        ``compress_ratio == 1``: request ``i`` is row ``i`` and ranks its
+        first ``seq_lens[i]`` columns; columns at or beyond that count are not
+        candidates. With speculative decoding, ``next_n > 1``: request ``i``
+        owns rows ``i * next_n`` to ``i * next_n + next_n - 1``, and row ``t``
+        of the request (``t`` from ``0`` to ``next_n - 1``) ranks its first
+        ``seq_lens[i] - next_n + t + 1`` columns, so the last draft token sees
+        the whole cache and each earlier one sees one token less. With KV
+        compression, ``compress_ratio > 1``: every column stands for
+        ``compress_ratio`` KV tokens and the token count is divided by it
+        (floor). The general per-row count is therefore
+        ``max(0, (seq_lens[i] - next_n + t + 1) // compress_ratio)``.
+        ``seq_lens`` stays in tokens even with ``compress_ratio > 1``: the
+        kernel converts tokens to columns itself, so a value erroneously given in columns
+        would be converted twice and rank too few keys. A row with nothing to
+        rank (its count is zero, as for an empty padding slot) comes back as
+        ``-1`` in every slot. A row whose length is larger than the buffer is
+        wide (count above ``num_cols``) is ranked over the ``num_cols`` keys
+        the buffer holds; nothing is read beyond it. In windowed (prefill)
+        mode there is one entry per row and ``seq_lens[r]`` is the window
+        length of row ``r`` in columns, after compression (see ``row_starts``).
     top_k : int
-        Number of top elements per row.  GVR backend supports
-        ``{512, 1024, 2048}``; radix backend has no restriction.
-    pre_idx : torch.Tensor, optional
-        ``int32[num_rows // next_n, top_k]`` — top-K KV-cache indices
-        selected by **this same layer** at the **previous token's decode
-        step**.  GVR exploits the strong correlation between a layer's
-        attention pattern at step ``t`` and step ``t+1``; the kernel
-        internally applies a ``+1`` offset (DSv3.2) so the previous step's
-        indices land correctly in the current step's grown KV-cache space.
-        ``pre_idx[:, 0]`` must be the argmax index.
-        Required by the ``"gvr"`` backend; ignored by ``"radix_cutlass"``.
+        Number of top elements per row; the accepted values are
+        backend-specific (see ``backend``).
+    row_starts : torch.Tensor, optional
+        Windowed (prefill) mode only; passing it switches the mode on (see
+        "Windowed (prefill) mode" above). 1-D ``int32`` tensor, contiguous,
+        one entry per row: the column where row ``r``'s window begins, so row
+        ``r`` ranks ``logits[r, row_starts[r] : row_starts[r] + seq_lens[r]]``.
+        Starts must lie within the row; they are device data and are not
+        validated on the host. Default ``None``.
+    max_window_len : int, optional
+        Windowed (prefill) mode only: an upper bound on every window length
+        ``seq_lens[r]``, in columns; defaults to ``num_cols``. The bound is
+        consumed before the launch and fixed for a captured graph, so it must
+        hold at every replay. Pass the batch's longest window
+        (``seq_lens.max()``) when it is smaller than ``num_cols``; the tighter
+        the bound, the more the backend can specialize. A positive ``int``; a
+        value above ``num_cols`` counts as ``num_cols``. Refused with
+        ``ValueError`` without ``row_starts``.
+    absolute_indices : bool, optional
+        Windowed (prefill) mode only: write each hit as its column of
+        ``logits`` (``window-local index + row_starts[r]``) instead of the
+        window-local position; ``-1`` padding is unchanged. In the DSA prefill
+        layout the column axis is the chunk's packed key sequence, so this is
+        the flattened-KV position a ragged sparse-attention kernel consumes
+        directly; a paged consumer keeps the default and maps the local
+        position through its page table. ``True`` without ``row_starts``
+        raises ``ValueError``. Default ``False``.
+    page_table : torch.Tensor, optional
+        Decode mode only. The request's page map: an ``int32`` tensor,
+        contiguous, with one row per request and at least
+        ``ceil(num_cols / page_size)`` columns (one entry per page of the
+        request's cache, so every column of ``logits`` maps through it);
+        columns and ``page_size`` are in the units of ``logits``. When given,
+        each selected column ``c`` of request ``q`` is written as the physical
+        KV slot ``page_table[q, c // page_size] * page_size + c % page_size``
+        instead of the column; ``-1`` padding is unchanged. The backends that
+        serve it, and their limits, are listed under ``backend``. Default
+        ``None``.
+    page_size : int, optional
+        Columns per ``page_table`` entry, a power of two up to ``2**30``. Any
+        value but ``None`` without ``page_table`` raises ``ValueError``.
+        Default ``None``, meaning ``1``.
     compress_ratio : int, optional
-        KV-index compression factor (``1`` for DSv3.2, ``4`` for DSv4).
-        Default ``1``.
+        Decode mode only: KV-index compression factor (``1`` for DSv3.2, ``4``
+        for DSv4), every logit column standing for ``compress_ratio``
+        consecutive KV tokens. It converts the token lengths in ``seq_lens``
+        into per-row column counts, ``max(0, (seq_lens[i] - next_n + t + 1) //
+        compress_ratio)`` (see ``seq_lens``); only the kernel can do that
+        when one request length serves ``next_n`` rows. The accepted values
+        are backend-specific (see ``backend``). Any value but ``None`` with
+        ``row_starts`` raises ``ValueError``: windowed (prefill) mode has one
+        length per row and takes it in columns already, so there is nothing
+        to convert, and a compressed layer passes its windows in compressed
+        columns. Default ``None``, meaning ``1``.
     next_n : int, optional
-        Speculative-decode temporal stride.  Default ``1``.
+        Decode mode only: rows per request, the query tokens a request
+        contributes to the current step (``1`` without speculative decoding);
+        row ``r`` belongs to request ``r // next_n`` and the per-row column
+        counts are given under ``seq_lens``. Any value but ``None`` with
+        ``row_starts`` raises ``ValueError``: windowed (prefill) mode has one
+        length per row, so a request's extra tokens are plain rows with their
+        own windows. Default ``None``, meaning ``1``.
+    pre_idx : torch.Tensor, optional
+        Decode mode only: a hint of each request's top-k indices, a warm
+        start for the backends that take one (how each backend consumes or
+        ignores it is under ``backend``), as a contiguous, 16-byte-aligned
+        ``int32`` tensor of shape ``[seq_lens.shape[0], top_k]``, one row
+        per request. A hint that breaks this is discarded with a
+        ``RuntimeWarning`` and the call runs hint-free (an explicit backend
+        that requires one is refused). Any value but ``None`` with
+        ``row_starts`` raises ``ValueError``. Default ``None``.
     return_values : bool, optional
-        When ``True`` also return the selected logit values.
-        Default ``False``.
+        When ``True``, also return the selected logit values. Padded slots hold
+        a backend-specific value (see ``backend``); test ``indices >= 0``
+        rather than the value. Default ``False``.
     out_indices : torch.Tensor, optional
-        Pre-allocated ``int32[num_rows, top_k]`` output buffer.
+        Pre-allocated buffer for the indices: ``int32``, contiguous, 16-byte
+        aligned, of shape ``(num_rows, top_k)`` or flat with
+        ``num_rows * top_k`` elements. The result is written into it and
+        returned as a ``(num_rows, top_k)`` view of it. Default ``None``: a
+        new tensor is allocated.
     out_values : torch.Tensor, optional
-        Pre-allocated values buffer (same dtype as ``logits``).
-        Only used when ``return_values=True``.
-    backend : {"radix", "gvr", "radix_cutlass", "auto"}, optional
+        Pre-allocated buffer for the values, in the dtype of ``logits`` and
+        under the layout rules of ``out_indices``; used only with
+        ``return_values=True``. Default ``None``.
+    backend : {"radix", "gvr", "gvr_2", "radix_cutlass", "radix_filter", "auto"}, optional
         Backend to use.  Default ``"auto"``.
 
-        ``"radix"``         — CuTe DSL single-pass multi-CTA radix top-K
-                              (Blackwell sm_100+; native varlen, no ``pre_idx``,
-                              no logit masking).
-        ``"gvr"``           — GVR kernel (Blackwell sm_100+ only; requires
-                              ``pre_idx``). ``load_balance`` selects the LB vs
-                              single-CTA path.
-        ``"radix_cutlass"`` — Masked CUTLASS radix top-K (all GPUs, no
-                              ``pre_idx`` needed).
-        ``"auto"``          — GVR (if ``pre_idx`` supplied) > radix (Blackwell)
-                              > radix_cutlass.
+        ``"radix"``         — CuTe DSL radix top-K.
+                              SM100, SM103, SM107, SM110, SM120 and SM121 with
+                              an installed CuTe DSL. fp32, bf16 or fp16;
+                              contiguous ``logits``; no ``top_k`` limit; any
+                              ``compress_ratio``; ``pre_idx`` accepted and
+                              ignored; padded value slots are left unwritten.
+                              Decode mode only.
+        ``"gvr"``           — GVR (Guess-Verify-Refine) kernel.
+                              SM100, SM103 or SM107 with an installed CuTe DSL.
+                              fp32, bf16 or fp16; ``num_cols`` a multiple of
+                              ``16 // itemsize`` (8 for fp16/bf16, 4 for fp32);
+                              ``top_k`` in {512, 1024, 2048};
+                              ``compress_ratio`` 1 or 4. Requires a well-formed
+                              ``pre_idx``; its contents affect only the speed,
+                              never the result. ``load_balance=True`` balances
+                              rows of unequal length and caps the batch at 1024
+                              requests; ``False`` has no cap and is the better
+                              choice when all rows have similar lengths; both
+                              are CUDA-graph safe. Padded value slots hold
+                              ``-FLT_MAX`` converted to ``dtype``. Decode mode
+                              only.
+        ``"gvr_2"``         — Self-sampling GVR V2 kernel.
+                              SM100, SM103 or SM107 with an installed CuTe DSL.
+                              fp32 only; unit inner stride, row stride a
+                              multiple of 4 elements (for a single row, the
+                              width), 16-byte-aligned base, non-overlapping
+                              rows (a row stride wider than ``num_cols`` is
+                              fine); ``top_k`` in {512, 1024, 2048};
+                              ``compress_ratio`` 1 or 4; ``pre_idx`` optional,
+                              affecting only the speed; ``load_balance``
+                              ignored; padded value slots hold
+                              ``finfo(float32).min``; NaN ordering is
+                              implementation-specific. Decode mode, and the
+                              only backend of windowed (prefill) mode. CUDA
+                              graphs: a geometry must be compiled before it is
+                              captured. Warm up each decode geometry (row
+                              count, ``num_cols`` and row stride, ``top_k``,
+                              ``next_n``, ``compress_ratio``, hinted or not)
+                              with one eager call on the stream that will
+                              capture, and each windowed geometry (row count,
+                              ``top_k``, ``absolute_indices`` and the bound:
+                              ``max_window_len``, else ``num_cols``) with an
+                              eager call or
+                              ``flashinfer.topk_varlen.warmup_prefill`` on that
+                              stream; ``flashinfer.topk_varlen.prefill_ready``
+                              tells whether a windowed geometry would launch
+                              without compiling. The warm-up also creates the
+                              backend's workspace slab (21 MB per device and
+                              CUDA stream) that the graphs captured on that
+                              stream share, so those graphs must not be
+                              replayed concurrently with each other; graphs
+                              captured on different streams never share one. A
+                              capture whose geometry or slab is missing raises
+                              ``RuntimeError``. Slabs live for the process
+                              unless released with
+                              ``flashinfer.topk_varlen.release_gvr2_resources(device)``,
+                              which synchronizes the device, drops them and
+                              returns the bytes freed; graphs captured against
+                              them must then be re-captured after a fresh
+                              warm-up. A caller-provided ``"gvr2_workspace"``
+                              (see ``workspace``) replaces the slab. Paged
+                              output (``page_table``) is decode mode only,
+                              hint-free (no ``pre_idx``) and indices only (no
+                              ``return_values``); ``page_size`` is part of its
+                              warm-up key, so warm up each paged geometry with
+                              one eager paged call on the capturing stream.
+        ``"radix_cutlass"`` — Masked CUTLASS radix top-K.
+                              Every GPU FlashInfer supports (SM75 and up).
+                              fp32, bf16 or fp16; contiguous ``logits``; no
+                              ``top_k`` limit; any ``compress_ratio``;
+                              ``pre_idx`` accepted and ignored; padded value
+                              slots hold ``0``. Decode mode only.
+        ``"radix_filter"``  — Filtered-radix top-K.
+                              SM100, SM103 or SM107 with nvidia-cutlass-dsl >=
+                              4.8. fp32, bf16 or fp16; any layout (a non-unit
+                              inner stride or a base not 32-byte aligned costs
+                              a copy); ``1 <= top_k <= 16384``;
+                              ``compress_ratio == 1`` only; ``pre_idx``
+                              accepted and ignored; nondeterministic ties;
+                              padded value slots hold ``-inf``. Decode mode
+                              only.
+        ``"auto"``          — Automatic selection.
+                              Picks among the entries above as described
+                              under "Backend selection".
     load_balance : bool, optional
-        Selects the GVR kernel path (ignored by the radix backend).  Default
-        ``True``.
-
-        ``True`` (default) — two-kernel LB path (``GvrTopKLBPrepareKernel`` +
-                     ``GvrTopKLBKernel``): a prepare kernel classifies requests
-                     into long/short buckets, then the main kernel splits each
-                     long row across a CTA cluster and packs short rows.  Best
-                     for the ragged decode batches GVR targets.
-        ``False``  — single-kernel path (``GvrTopKKernel``): one CTA per row,
-                     no prepare step.  Faster when the batch has no length
-                     variance (all rows short, or all long).
-
-        Both settings are CUDA-graph safe (no host branch on device data).
+        ``"gvr"`` only: chooses between its two kernel paths (see
+        ``backend``). Every other backend ignores it. Default ``True``.
 
     workspace : dict, optional
-        Reusable workspace buffers for the GVR ``load_balance=True`` path.
-        When provided, the LB prepare and decode kernels read/write these
-        tensors instead of allocating fresh ones per call — useful in decode
-        loops where the same batch size is reused at every step.
+        Caller-provided scratch buffers, keyed by backend (the ``"gvr_2"``
+        slab's lifetime is under ``backend``):
 
-        Required keys (both ``int32`` on the same device as ``logits``):
+        * ``"gvr"`` with ``load_balance=True``: ``"gvr_order_row"``
+          (``int32[M]``, ``M`` the smallest power of 2 in ``[64, 1024]`` that
+          is ``>= seq_lens.shape[0]``) and ``"gvr_counters"`` (``int32[2]``);
+          without them the path allocates per call, which is safe for any
+          concurrency.
+        * ``"gvr_2"``: ``"gvr2_workspace"``, a tensor of at least
+          ``flashinfer.topk_varlen.kernels.gvr2_topk_host.workspace_bytes()``
+          = 20,973,568 bytes, zero-initialized before first use and 16-byte
+          aligned (a smaller or misaligned tensor raises ``RuntimeError``);
+          it replaces the backend's cached per-stream slab, for decode and
+          windowed calls alike.
 
-        * ``"gvr_order_row"``: shape ``(M,)`` where ``M`` is the smallest
-          power of 2 in ``[64, 1024]`` that is ``>= seq_lens.shape[0]``.
-        * ``"gvr_counters"``: shape ``(2,)``.
-
-        .. warning::
-            Do **not** share the same workspace dict across concurrent CUDA
-            streams — each stream must have its own workspace to avoid races
-            on the device tensors.  When ``workspace`` is ``None`` (default)
-            buffers are allocated locally and are safe for any concurrency.
-
+        A workspace dict must not be shared by launches that can overlap
+        (concurrent streams, or graphs replayed concurrently).
     Returns
     -------
     (indices, values) : Tuple[torch.Tensor, Optional[torch.Tensor]]
@@ -1091,47 +1919,344 @@ def top_k_varlen(
     Raises
     ------
     BackendSupportedError
-        If the requested backend is not supported on the current device or
-        the required inputs (e.g. ``pre_idx``) are missing.
+        If ``backend="auto"`` finds no backend whose checks pass for the call
+        (which backends serve each mode, and on which GPUs, is under
+        ``backend``), or an explicit backend is not registered for the device.
+        Admission runs before the argument checks below, so such a call raises
+        this error even when a ``ValueError`` condition also holds.
+        ``skip_check=True`` bypasses admission, not the argument checks, and
+        keeps two refusals that prevent a silently wrong launch: ``row_starts``
+        with a backend that does not serve windowed (prefill) mode, and an
+        explicit ``"gvr"`` without a hint.
+    ValueError
+        If ``logits`` / ``seq_lens`` / ``next_n`` violate the shape, dtype or
+        grouping contract; if an argument is used outside its mode
+        (``next_n``, ``compress_ratio`` or ``pre_idx`` with ``row_starts``;
+        ``max_window_len`` or ``absolute_indices=True`` without it); if
+        ``row_starts`` is not a contiguous 1-D ``int32`` tensor with one entry
+        per row, ``max_window_len`` not a positive ``int`` or
+        ``absolute_indices`` not a ``bool``; if ``page_table`` comes with
+        ``row_starts``, ``pre_idx`` or ``return_values``, is not a contiguous
+        2-D ``int32`` tensor with one row per request covering the buffer
+        width, or ``page_size`` is given without ``page_table`` or is not a
+        power of two up to ``2**30``; if an
+        ``out_indices`` /
+        ``out_values`` buffer is outside the contract above; or if an explicit
+        backend's checker rejects the problem (reported as "Problem size is
+        not supported").
+    RuntimeError
+        Under CUDA-graph capture, when a backend's launcher for the geometry
+        is not compiled yet or the capturing stream has no workspace slab
+        (the warm-up and slab rules are in that backend's entry under
+        ``backend``); or when a caller-passed ``workspace`` buffer fails its
+        size or alignment check.
+
+    Warns
+    -----
+    RuntimeWarning
+        ``pre_idx`` was malformed and has been discarded; the call ran
+        hint-free.
 
     Examples
     --------
+    Decode mode (the default): one row per request, ``seq_lens`` in KV
+    tokens, indices are logits columns.
+
     >>> import torch, flashinfer
-    >>> torch.manual_seed(42)
-    >>> B, N_max, top_k = 32, 8192, 1024
-    >>>
-    >>> # Step t: no prior indices; use radix to get the first top-K.
-    >>> # Each request has a different KV-cache length in [top_k+1, N_max-1].
-    >>> logits = torch.randn(B, N_max, dtype=torch.bfloat16, device="cuda")
-    >>> seq_lens_t = torch.randint(top_k + 1, N_max, (B,), dtype=torch.int32, device="cuda")
-    >>> indices_t, _ = flashinfer.top_k_varlen(logits, seq_lens_t, top_k, backend="radix_cutlass")
-    >>> # Reference check: every selected value must be >= the K-th largest.
-    >>> for i in range(B):
-    ...     s = seq_lens_t[i].item()
-    ...     kth = torch.topk(logits[i, :s].float(), top_k).values[-1]
-    ...     assert (logits[i, :s].float()[indices_t[i].long()] < kth - 1e-5).sum() == 0
-    >>>
-    >>> # Step t+1: one new token appended per request; seq_lens grows by 1.
-    >>> logits_t1 = torch.randn(B, N_max, dtype=torch.bfloat16, device="cuda")
-    >>> seq_lens_t1 = seq_lens_t + 1
-    >>> # Pass indices_t as pre_idx; GVR uses it to warm-start the threshold search.
-    >>> indices_t1, _ = flashinfer.top_k_varlen(logits_t1, seq_lens_t1, top_k, pre_idx=indices_t)
-    >>> for i in range(B):
-    ...     s = seq_lens_t1[i].item()
-    ...     kth = torch.topk(logits_t1[i, :s].float(), top_k).values[-1]
-    ...     assert (logits_t1[i, :s].float()[indices_t1[i].long()] < kth - 1e-5).sum() == 0
+    >>> _ = torch.manual_seed(42)
+    >>> B, N, top_k = 32, 8192, 1024
+    >>> logits = torch.randn(B, N, dtype=torch.float32, device="cuda")
+    >>> seq_lens = torch.randint(top_k + 1, N, (B,), dtype=torch.int32, device="cuda")
+    >>> indices, _ = flashinfer.top_k_varlen(logits, seq_lens, top_k)
+    >>> for i in range(B):  # every hit is >= the K-th largest valid score
+    ...     s = seq_lens[i].item()
+    ...     kth = torch.topk(logits[i, :s], top_k).values[-1]
+    ...     assert (logits[i, :s][indices[i].long()] < kth).sum() == 0
+    >>> # the next step may pass the previous result as a hint
+    >>> logits_next = torch.randn(B, N, dtype=torch.float32, device="cuda")
+    >>> indices_next, _ = flashinfer.top_k_varlen(logits_next, seq_lens + 1, top_k, pre_idx=indices)
+
+    Decode mode with speculative tokens and KV compression: ``next_n`` rows
+    per request (row ``r`` belongs to request ``r // next_n``), one column
+    per ``compress_ratio`` KV tokens; ``seq_lens`` stays in tokens and each
+    row's column count follows from it (see ``seq_lens``).
+
+    >>> next_n, compress_ratio = 2, 4
+    >>> logits_s = torch.randn(B * next_n, N, dtype=torch.float32, device="cuda")
+    >>> tokens = torch.randint((top_k + 1) * compress_ratio, N * compress_ratio, (B,), dtype=torch.int32, device="cuda")
+    >>> indices_s, _ = flashinfer.top_k_varlen(logits_s, tokens, top_k, next_n=next_n, compress_ratio=compress_ratio)
+    >>> for r in range(B * next_n):
+    ...     i, t = divmod(r, next_n)
+    ...     c = (tokens[i].item() - next_n + t + 1) // compress_ratio  # row r's valid columns
+    ...     kth = torch.topk(logits_s[r, :c], top_k).values[-1]
+    ...     assert (logits_s[r, :c][indices_s[r].long()] < kth).sum() == 0
+
+    Windowed (prefill) mode: one row per query token of a packed chunk, each
+    ranking its own window ``[row_starts[r], row_starts[r] + seq_lens[r])``
+    given in columns; ``next_n``, ``compress_ratio`` and ``pre_idx`` are not
+    passed (the backends that serve the mode are listed under ``backend``).
+
+    >>> # two requests of L keys each on one packed key axis of 2 * L columns;
+    >>> # a request's j-th token (0-based) ranks the request's first j + 1 keys
+    >>> R, L, top_k = 2, 2048, 512
+    >>> logits_p = torch.randn(R * L, R * L, dtype=torch.float32, device="cuda")
+    >>> row_starts = torch.tensor([q * L for q in range(R) for _ in range(L)], dtype=torch.int32, device="cuda")
+    >>> seq_lens_p = torch.tensor([j + 1 for _ in range(R) for j in range(L)], dtype=torch.int32, device="cuda")
+    >>> local, _ = flashinfer.top_k_varlen(logits_p, seq_lens_p, top_k, row_starts=row_starts, max_window_len=L)
+    >>> columns, _ = flashinfer.top_k_varlen(logits_p, seq_lens_p, top_k, row_starts=row_starts, max_window_len=L, absolute_indices=True)
+    >>> # the two frames address the same hits: window position + row_starts[r]
+    >>> # is the logits column (compared through the selected values: a row's
+    >>> # slot order is not fixed, and a tie at the K-th value may go either way)
+    >>> hit = local >= 0
+    >>> assert torch.equal(hit, columns >= 0)
+    >>> v_pos = logits_p.gather(1, torch.where(hit, local + row_starts[:, None], 0).long())
+    >>> v_col = logits_p.gather(1, torch.where(hit, columns, 0).long())
+    >>> assert torch.equal(v_pos.sort(dim=1).values, v_col.sort(dim=1).values)
+    >>> assert local[0].max() == 0 and (local[0] >= 0).sum() == 1  # a 1-key window: one hit, -1 padded
+    >>> r = R * L - 1  # the last token of request 1 ranks the request's whole window, columns [L, 2L)
+    >>> w = logits_p[r, L : 2 * L]
+    >>> assert (w[local[r].long()] < torch.topk(w, top_k).values[-1]).sum() == 0
 
     See Also
     --------
     flashinfer.top_k : General-purpose radix/clusters top-K (uniform lengths).
     """
-    assert logits.is_cuda and logits.dim() == 2, "logits must be a 2-D CUDA tensor"
-    assert seq_lens.is_cuda and seq_lens.dim() == 1 and seq_lens.dtype == torch.int32
+    # Real exceptions (not asserts) so every contract below also holds under
+    # `python -O`; the API body still runs under skip_check=True.
+    if not (isinstance(logits, torch.Tensor) and logits.is_cuda and logits.dim() == 2):
+        raise ValueError("logits must be a 2-D CUDA tensor")
+    if not (
+        isinstance(seq_lens, torch.Tensor)
+        and seq_lens.is_cuda
+        and seq_lens.dim() == 1
+        and seq_lens.dtype == torch.int32
+    ):
+        raise ValueError(
+            "seq_lens must be a 1-D int32 CUDA tensor"
+            + (f", got {seq_lens.dtype}" if isinstance(seq_lens, torch.Tensor) else "")
+        )
+    if row_starts is not None:
+        decode_only = [
+            name
+            for name, value in (
+                ("next_n", next_n),
+                ("compress_ratio", compress_ratio),
+                ("pre_idx", pre_idx),
+            )
+            if value is not None
+        ]
+        if decode_only:
+            raise ValueError(
+                f"{', '.join(decode_only)}: decode-mode argument(s) passed with "
+                "row_starts. Windowed (prefill) mode has one length per row, "
+                "already in columns, and takes no hint, so next_n, "
+                "compress_ratio and pre_idx have no meaning there; do not pass "
+                "them, not even at their decode defaults."
+            )
+    # next_n / compress_ratio default to None so that the refusal above can
+    # tell an explicit decode default from an omitted argument; from here on
+    # they are the decode-mode ints (None means 1)
+    next_n, compress_ratio = _decode_defaults(next_n, compress_ratio)
+    # Grouped-row ABI, shared by every backend: row r belongs to sequence
+    # r // next_n, so seq_lens must hold exactly one entry per group. Validated
+    # here (not in the per-backend checkers) because a violation is a silent
+    # device-side OOB read of seq_lens or a wrong grouping in every backend,
+    # and the API body still runs under skip_check=True. Real exceptions, not
+    # asserts: this must hold under `python -O` too.
+    if next_n < 1:
+        raise ValueError(f"next_n must be >= 1, got {next_n}")
+    if logits.shape[0] != seq_lens.shape[0] * next_n:
+        raise ValueError(
+            f"logits has {logits.shape[0]} rows but seq_lens has "
+            f"{seq_lens.shape[0]} entries with next_n={next_n}: expected "
+            f"seq_lens.shape[0] * next_n == logits.shape[0] "
+            f"(= {seq_lens.shape[0] * next_n}). Rows are grouped as "
+            f"row // next_n -> sequence; for per-row lengths pass next_n=1 "
+            f"with one seq_lens entry per row."
+        )
+    num_rows = logits.shape[0]
+    if row_starts is not None:
+        # windowed / prefill mode: validated here (every backend's checker
+        # already refused it except gvr_2's; the API body still runs under
+        # skip_check=True and a bad tensor is a device-side OOB read)
+        if not (
+            isinstance(row_starts, torch.Tensor)
+            and row_starts.is_cuda
+            and row_starts.device == logits.device
+            and row_starts.dim() == 1
+            and row_starts.dtype == torch.int32
+            and row_starts.is_contiguous()
+        ):
+            raise ValueError(
+                f"row_starts must be a contiguous 1-D int32 CUDA tensor on {logits.device}"
+            )
+        if row_starts.shape[0] != num_rows:
+            raise ValueError(
+                f"row_starts has {row_starts.shape[0]} entries, expected one per "
+                f"logits row ({num_rows})"
+            )
+        if max_window_len is not None and (
+            isinstance(max_window_len, bool)
+            or not isinstance(max_window_len, int)
+            or max_window_len < 1
+        ):
+            raise ValueError(
+                f"max_window_len must be a positive int (window-length bound), got {max_window_len!r}"
+            )
+        if not isinstance(absolute_indices, bool):
+            raise ValueError(
+                f"absolute_indices must be a bool, got {absolute_indices!r}"
+            )
+    elif absolute_indices:
+        raise ValueError(
+            "absolute_indices=True requires row_starts: it selects the index "
+            "frame of windowed (prefill) mode, and decode indices are already "
+            "columns of logits"
+        )
+    elif max_window_len is not None:
+        raise ValueError(
+            "max_window_len requires row_starts: it bounds the windows of "
+            "windowed (prefill) mode, and in decode every row starts at column "
+            "0 and num_cols already bounds it"
+        )
+    if page_table is None and page_size is not None:
+        raise ValueError(
+            "page_size requires page_table: it is the page granularity of that "
+            "table and has no meaning without it; do not pass it, not even 1"
+        )
+    if page_size is None:
+        page_size = 1  # the paged default, resolved before the checks below
+    if page_table is not None:
+        if not (
+            isinstance(page_table, torch.Tensor)
+            and page_table.is_cuda
+            and page_table.device == logits.device
+            and page_table.dim() == 2
+            and page_table.dtype == torch.int32
+            and page_table.is_contiguous()
+        ):
+            raise ValueError(
+                f"page_table must be a contiguous 2-D int32 CUDA tensor on {logits.device}"
+            )
+        if page_table.shape[0] * next_n != num_rows:
+            raise ValueError(
+                f"page_table has {page_table.shape[0]} rows, expected one per request "
+                f"({num_rows} rows / next_n={next_n} = {num_rows // next_n})"
+            )
+        if row_starts is not None:
+            raise ValueError(
+                "page_table (paged decode output) cannot be combined with row_starts"
+            )
+        if pre_idx is not None:
+            raise ValueError(
+                "page_table requires pre_idx=None (hint-free gvr_2 engines)"
+            )
+        if return_values:
+            raise ValueError("page_table cannot be combined with return_values")
+        if (
+            isinstance(page_size, bool)
+            or not isinstance(page_size, int)
+            or page_size < 1
+            or page_size > (1 << 30)
+            or page_size & (page_size - 1)
+        ):
+            raise ValueError(
+                f"page_size must be a power of two in [1, 2**30], got {page_size!r}"
+            )
+        need = (logits.shape[1] + page_size - 1) // page_size
+        if page_table.shape[1] < need:
+            raise ValueError(
+                f"page_table has {page_table.shape[1]} pages per request but the logits "
+                f"width {logits.shape[1]} needs {need} at page_size={page_size}"
+            )
+
+    # A malformed hint is discarded, loudly: the call runs hint-free (the
+    # checkers above already treated it as absent, so `auto` never selected a
+    # hint-consuming backend for it) instead of failing inside a kernel. An
+    # explicit backend="gvr"/"gvr_2" request with a malformed hint is refused
+    # by its checker when checks run, and by the guard after backend
+    # resolution below under skip_check=True.
+    if pre_idx is not None:
+        problem = _hint_problem(pre_idx, logits, seq_lens, top_k)
+        if problem is not None:
+            if backend in ("auto", "gvr_2"):
+                tail = (
+                    "Fix the caller: gvr_2 falls back to its hint-free engines "
+                    "(exact, but slower than with a real previous-step hint) and "
+                    "gvr cannot run at all without a well-formed hint."
+                )
+            else:
+                tail = (
+                    f"backend={backend!r} never consumes the hint; the result is "
+                    "unaffected, but fix the caller."
+                )
+            warnings.warn(
+                f"top_k_varlen: pre_idx is malformed ({problem}); the hint is "
+                f"DISCARDED and this call runs hint-free (int32[{seq_lens.shape[0]}, "
+                f"{top_k}] contiguous CUDA tensor on {logits.device} expected). {tail}",
+                RuntimeWarning,
+                stacklevel=2,  # attributed to the decorator wrapper; the text names the fix
+            )
+            pre_idx = None
+
+    # Caller-provided output buffers: every DSL backend writes a compact,
+    # 16-byte-aligned [num_rows, top_k] block. Accepted: exactly that shape,
+    # or any contiguous buffer holding exactly num_rows * top_k elements
+    # (e.g. a flat one), which is viewed to [num_rows, top_k] in place — same
+    # storage, no copy, stable CUDA-graph destination. Anything else is a
+    # contract violation here rather than a silent re-layout (the gvr_2 host
+    # used to pack a wider buffer at stride top_k) or a DSL conversion error.
+    def _check_out(name, buf, dt):
+        if not (
+            isinstance(buf, torch.Tensor)
+            and buf.is_cuda
+            and buf.device == logits.device
+        ):
+            raise ValueError(f"{name} must be a CUDA tensor on {logits.device}")
+        if buf.dtype != dt:
+            raise ValueError(f"{name} must have dtype {dt}, got {buf.dtype}")
+        if not buf.is_contiguous():
+            raise ValueError(f"{name} must be contiguous")
+        if buf.data_ptr() & 15:
+            raise ValueError(f"{name} must be 16-byte aligned (not a shifted view)")
+        if tuple(buf.shape) == (num_rows, top_k):
+            return buf
+        if buf.dim() != 1 or buf.numel() != num_rows * top_k:
+            # any other 2-D shape with the right element count (e.g. the
+            # transposed shape) would be a silent re-layout: refuse it
+            raise ValueError(
+                f"{name} must have shape ({num_rows}, {top_k}) or be a 1-D buffer "
+                f"of exactly {num_rows * top_k} elements, got {tuple(buf.shape)}"
+            )
+        return buf.view(num_rows, top_k)
+
+    if out_indices is not None:
+        out_indices = _check_out("out_indices", out_indices, torch.int32)
+    if return_values and out_values is not None:
+        out_values = _check_out("out_values", out_values, logits.dtype)
 
     if backend == "auto":
         backend = top_k_varlen.suitable_auto_backends[0]
+    if (row_starts is not None or page_table is not None) and backend != "gvr_2":
+        # reachable under skip_check=True only (every other checker refuses
+        # row_starts and page_table): refuse BEFORE dispatch -- a radix / gvr
+        # run would silently rank the row prefix [0, seq_len) instead of the
+        # window, or return raw columns where physical slots were requested
+        raise BackendSupportedError(
+            f"backend={backend!r} does not serve windowed (prefill) mode or "
+            "paged output, which row_starts and page_table select; use "
+            "backend='gvr_2' or 'auto'"
+        )
+    if pre_idx is None and backend == "gvr":
+        # reachable under skip_check=True (the checkers did not run) with a
+        # missing or just-discarded hint: refuse here instead of handing None
+        # to a kernel host (gvr_2 runs hint-free, see _run_gvr2)
+        raise BackendSupportedError(
+            f"backend={backend!r} requires a well-formed pre_idx hint "
+            f"(int32[{seq_lens.shape[0]}, {top_k}] contiguous CUDA tensor on "
+            f"{logits.device}); none is usable for this call"
+        )
 
-    num_rows = logits.shape[0]
     if out_indices is None:
         out_indices = torch.empty(
             (num_rows, top_k), dtype=torch.int32, device=logits.device
@@ -1180,8 +2305,37 @@ def top_k_varlen(
                 out_indices,
                 out_values,
             )
+    elif backend == "gvr_2":
+        out_i, out_v = _run_gvr2(
+            logits,
+            pre_idx,
+            seq_lens,
+            top_k,
+            next_n,
+            compress_ratio,
+            return_values,
+            out_indices,
+            out_values,
+            workspace=workspace,
+            row_starts=row_starts,
+            max_window_len=max_window_len,
+            absolute_indices=absolute_indices,
+            page_table=page_table,
+            page_size=page_size,
+        )
     elif backend == "radix_cutlass":
         out_i, out_v = _run_radix_cutlass(
+            logits,
+            seq_lens,
+            top_k,
+            next_n,
+            compress_ratio,
+            return_values,
+            out_indices,
+            out_values,
+        )
+    elif backend == "radix_filter":
+        out_i, out_v = _run_radix_filter(
             logits,
             seq_lens,
             top_k,
@@ -1194,7 +2348,7 @@ def top_k_varlen(
     else:
         raise ValueError(
             f"Unknown backend: {backend!r}. "
-            f"Expected 'radix', 'gvr', or 'radix_cutlass'."
+            f"Expected 'radix', 'gvr', 'gvr_2', 'radix_cutlass', or 'radix_filter'."
         )
 
     return out_i, out_v

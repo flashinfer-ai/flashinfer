@@ -9,40 +9,29 @@
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
-# Pin the preinstalled CUDA Python stack for every job-time pip install (same
-# guard as test_utils.sh; idempotent — whichever is sourced first wins). This
-# prevents a branch dependency sync from replacing torch, cuda-python, or the
-# cuDNN backend selected and validated when the image was built. The +cuXXX
-# torch local tag is stripped because PEP-517 build environments must be able
-# to resolve the constraint from PyPI, where local-version wheels do not exist.
+# Pin the preinstalled CUDA torch for every job-time pip install (same guard as
+# test_utils.sh; idempotent — whichever is sourced first wins). Branch
+# requirement synchronization below uses --no-deps to preserve the image's
+# validated cuda-python and cuDNN packages. Pinning those packages would contradict
+# torch's own exact dependency metadata. The +cuXXX local tag is stripped so
+# PEP-517 build environments can resolve the constraint from PyPI.
 if [ -z "${PIP_CONSTRAINT:-}" ]; then
-  if ! _cuda_stack_pins=$(python - <<'PY'
-import importlib.metadata as metadata
-import torch
-
-print("torch==" + torch.__version__.split("+")[0])
-for package in ("cuda-python", "nvidia-cudnn-cu12", "nvidia-cudnn-cu13"):
-    try:
-        print(f"{package}=={metadata.version(package)}")
-    except metadata.PackageNotFoundError:
-        pass
-PY
-  ); then
-    echo "ERROR: failed to inspect the image CUDA stack; refusing unpinned pip installs" >&2
+  if ! _torch_pin=$(python -c \
+    'import torch; print("torch==" + torch.__version__.split("+")[0])'); then
+    echo "ERROR: failed to inspect the image torch; refusing unpinned pip installs" >&2
     return 1
   fi
-  if [ -n "${_cuda_stack_pins}" ]; then
-    _constraint_file=$(mktemp /tmp/ci-cuda-stack-constraint.XXXXXX.txt)
-    printf '%s\n' "${_cuda_stack_pins}" > "${_constraint_file}"
+  if [ -n "${_torch_pin}" ]; then
+    _constraint_file=$(mktemp /tmp/ci-torch-constraint.XXXXXX.txt)
+    printf '%s\n' "${_torch_pin}" > "${_constraint_file}"
     export PIP_CONSTRAINT="${_constraint_file}"
-    echo "Pinning the image CUDA stack for job-time pip installs:"
-    printf '%s\n' "${_cuda_stack_pins}"
+    echo "Pinning image torch for job-time pip installs: ${_torch_pin}"
     unset _constraint_file
   else
-    echo "ERROR: image CUDA stack inspection returned no package constraints" >&2
+    echo "ERROR: image torch inspection returned no package constraint" >&2
     return 1
   fi
-  unset _cuda_stack_pins
+  unset _torch_pin
 fi
 
 # Install only what this branch moved past the image. Installing the full file
@@ -60,15 +49,19 @@ case "${_reqs_status}" in
     while IFS= read -r _req; do
       [ -n "${_req}" ] && _reqs_list+=("${_req}")
     done <<< "${_reqs_output}"
-    pip install "${_reqs_list[@]}"
+    pip install --no-deps "${_reqs_list[@]}"
     unset _reqs_list _req
     ;;
   *)
     echo "WARNING: requirement check failed; syncing the full requirements" >&2
-    pip install -r "${REPO_ROOT}/requirements.txt"
+    pip install --no-deps -r "${REPO_ROOT}/requirements.txt"
     ;;
 esac
 unset _reqs_output _reqs_status
+
+# The direct requirement sync above can update only the DSL metadata wheel.
+# Resolve its matching libraries before any CuTe DSL or quack import.
+bash "${SCRIPT_DIR}/install_cutlass_dsl.sh" || return 1
 
 # Install using only what the image carries; the check above covered the rest.
 # FLASHINFER_BUILD_NO_PIP keeps dropping isolation from activating the build
@@ -142,7 +135,7 @@ if [ -n "${CUTLASS_DSL_VERSION:-}" ]; then
   echo "Overriding nvidia-cutlass-dsl with: ${CUTLASS_DSL_PKG}"
   echo "========================================"
   # Clean uninstall old packages first (recommended by NVIDIA docs)
-  pip uninstall nvidia-cutlass-dsl nvidia-cutlass-dsl-libs-base nvidia-cutlass-dsl-libs-cu12 nvidia-cutlass-dsl-libs-cu13 -y 2>/dev/null || true
+  pip uninstall nvidia-cutlass-dsl nvidia-cutlass-dsl-libs-base nvidia-cutlass-dsl-libs-core nvidia-cutlass-dsl-libs-cu12 nvidia-cutlass-dsl-libs-cu13 -y 2>/dev/null || true
   pip install "${CUTLASS_DSL_PKG}"
   echo "nvidia-cutlass-dsl override complete."
   echo ""

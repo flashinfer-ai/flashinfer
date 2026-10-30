@@ -93,6 +93,9 @@ def _normalize_source_git_sha(value: Any) -> str | None:
 def source_git_sha_from_env() -> str | None:
     """Return the optional CI archive identity used to validate resume."""
 
+    # SOURCE_GIT_SHA is injected by callers that want plan and run jobs to prove
+    # they are using the same source archive. Local runs and older wrappers may
+    # omit it, so absence is treated as "no SHA guard available".
     return _normalize_source_git_sha(os.environ.get("SOURCE_GIT_SHA"))
 
 
@@ -243,7 +246,6 @@ def verify_manifest(
     selection: dict[str, Any],
     planning_options: dict[str, Any],
     pytest_command_prefix: tuple[str, ...] = (),
-    estimate_files: dict[str, str | None] | None = None,
     test_paths: Sequence[Path] | None = None,
 ) -> None:
     mismatches: list[str] = []
@@ -271,13 +273,14 @@ def verify_manifest(
             manifest.get("test_paths"),
             [str(path) for path in resolved_paths],
         )
-    if estimate_files is not None:
-        checks["estimate_files"] = (manifest.get("estimate_files"), estimate_files)
     for name, (saved, current) in checks.items():
         if saved != current:
             mismatches.append(f"{name}: saved={saved!r}, current={current!r}")
     saved_source_git_sha = _normalize_source_git_sha(manifest.get("source_git_sha"))
     current_source_git_sha = _normalize_source_git_sha(source_git_sha)
+    # The source SHA is an optional compatibility guard. When both sides provide
+    # it, a mismatch means the saved plan belongs to a different source state.
+    # When either side omits it, rely on the mandatory manifest fields above.
     if (
         saved_source_git_sha is not None
         and current_source_git_sha is not None

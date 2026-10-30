@@ -28,7 +28,7 @@ from ..helpers.ops import (
     vector_from_scalars,
 )
 from ..helpers.query import (
-    groups_tokens_heads_q_row_state,
+    flat_query_row_state,
     public_query_flat_row,
     split_o_element_offset,
 )
@@ -236,6 +236,35 @@ def run_gmem_reduction_kernel(
     cfg,
     num_reduction_ctas,
 ):
+    """Preserve inactive output and never consume stale split scratch."""
+    prims.griddepcontrol(kind=prims.GridDepAction.WAIT)
+    _, _, batch_idx = cute.arch.block_idx()
+    if cache_seqs[batch_idx] > Int32(0):
+        _run_active_gmem_reduction_kernel(
+            kernel,
+            output,
+            lse,
+            acc_output,
+            acc_lse,
+            cache_seqs,
+            cu_seqlens_q,
+            cfg,
+            num_reduction_ctas,
+        )
+
+
+@cute.jit
+def _run_active_gmem_reduction_kernel(
+    kernel,
+    output,
+    lse,
+    acc_output,
+    acc_lse,
+    cache_seqs,
+    cu_seqlens_q,
+    cfg,
+    num_reduction_ctas,
+):
     """Reduce split-KV partial O/LSE rows written by the 1CTA main kernel.
 
     Each reducer CTA owns either a full head row, a small group of Q rows, or a
@@ -246,13 +275,11 @@ def run_gmem_reduction_kernel(
     neutral partials, so the reducer retains configured, compile-time split
     geometry without consuming stale workspace from an earlier graph replay.
 
-    The grid and workspace remain in effective groups_tokens_heads_q
-    coordinates. Every reducer variant maps those coordinates to
-    fixed or compact-ragged public storage; padded tail rows may synchronize
-    and consume workspace slots but never publish O or LSE.
+    The grid and workspace remain in physical flat-query tile coordinates.
+    Every reducer variant maps those coordinates to fixed or compact-ragged
+    public storage; inactive tail rows may synchronize and consume workspace
+    slots but never publish O or LSE.
     """
-    # Pair with the dense kernel PDL signal before reading partials.
-    prims.griddepcontrol(kind=prims.GridDepAction.WAIT)
     q_idx, head_dim_tile_idx, batch_idx = cute.arch.block_idx()
     tidx, _, _ = cute.arch.thread_idx()
     warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
@@ -291,10 +318,10 @@ def run_gmem_reduction_kernel(
                 _,
                 _,
                 valid_output_row,
-            ) = groups_tokens_heads_q_row_state(
+            ) = flat_query_row_state(
                 head_idx,
                 cta_idx_q,
-                cfg.groups_tokens_heads_q_ratio,
+                cfg.tile_size_q,
                 cfg.logical_num_heads_q,
                 cfg.logical_seq_len_q,
                 cu_seqlens_q=cu_seqlens_q,
@@ -427,10 +454,10 @@ def run_gmem_reduction_kernel(
                 _,
                 _,
                 valid_output_row,
-            ) = groups_tokens_heads_q_row_state(
+            ) = flat_query_row_state(
                 global_head_idx,
                 q_idx,
-                cfg.groups_tokens_heads_q_ratio,
+                cfg.tile_size_q,
                 cfg.logical_num_heads_q,
                 cfg.logical_seq_len_q,
                 cu_seqlens_q=cu_seqlens_q,
@@ -518,10 +545,10 @@ def run_gmem_reduction_kernel(
             _,
             _,
             valid_output_row,
-        ) = groups_tokens_heads_q_row_state(
+        ) = flat_query_row_state(
             global_head_idx,
             q_idx,
-            cfg.groups_tokens_heads_q_ratio,
+            cfg.tile_size_q,
             cfg.logical_num_heads_q,
             cfg.logical_seq_len_q,
             cu_seqlens_q=cu_seqlens_q,
@@ -603,10 +630,10 @@ def run_gmem_reduction_kernel(
                 _,
                 _,
                 valid_output_row,
-            ) = groups_tokens_heads_q_row_state(
+            ) = flat_query_row_state(
                 head_idx,
                 row_q_idx,
-                cfg.groups_tokens_heads_q_ratio,
+                cfg.tile_size_q,
                 cfg.logical_num_heads_q,
                 cfg.logical_seq_len_q,
                 cu_seqlens_q=cu_seqlens_q,
@@ -680,10 +707,10 @@ def run_gmem_reduction_kernel(
             _,
             _,
             valid_output_row,
-        ) = groups_tokens_heads_q_row_state(
+        ) = flat_query_row_state(
             head_idx,
             q_idx,
-            cfg.groups_tokens_heads_q_ratio,
+            cfg.tile_size_q,
             cfg.logical_num_heads_q,
             cfg.logical_seq_len_q,
             cu_seqlens_q=cu_seqlens_q,
@@ -742,7 +769,7 @@ def run_gmem_reduction_kernel(
             )
         return
 
-    # Scalar fallback: one reducer coordinate owns one grouped row and one
+    # Scalar fallback: one reducer coordinate owns one flat query row and one
     # head-dimension band, then publishes only after logical-row validation.
     reduction_dim_tiles = ceil_div(cfg.head_dim_v, GMEM_REDUCTION_SCALAR_DIM_TILE)
     head_idx = head_dim_tile_idx // Int32(reduction_dim_tiles)
@@ -753,10 +780,10 @@ def run_gmem_reduction_kernel(
         _,
         _,
         valid_output_row,
-    ) = groups_tokens_heads_q_row_state(
+    ) = flat_query_row_state(
         head_idx,
         q_idx,
-        cfg.groups_tokens_heads_q_ratio,
+        cfg.tile_size_q,
         cfg.logical_num_heads_q,
         cfg.logical_seq_len_q,
         cu_seqlens_q=cu_seqlens_q,

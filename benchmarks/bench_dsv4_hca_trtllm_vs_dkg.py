@@ -450,6 +450,8 @@ def make_trtllm_runners(inputs: HcaInputs) -> BackendRunners:
             inputs.workspace,
             counters,
             inputs.sparse_indices,
+            inputs.sparse_indices,
+            False,
             inputs.seq_lens,
             inputs.sparse_topk_lens,
             softmax_scale,

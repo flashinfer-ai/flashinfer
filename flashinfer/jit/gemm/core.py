@@ -28,6 +28,7 @@ from ..core import (
     sm90a_nvcc_flags,
     sm100a_nvcc_flags,
     sm100f_nvcc_flags,
+    sm107a_nvcc_flags,
     current_compilation_context,
 )
 from ..cubin_loader import (
@@ -472,8 +473,6 @@ def gen_gemm_sm120_module_cutlass_mxfp8() -> JitSpec:
             (128, 32, 128),
             (128, 64, 128),
             (128, 128, 128),
-            (256, 128, 128),
-            (128, 256, 128),
         ]
         for cta_m, cta_n, cta_k in cta_m_n_k_list:
             for dtype in dtype_list:
@@ -717,20 +716,24 @@ def gen_gemm_sm120_module() -> JitSpec:
     )
 
 
+def _trtllm_gen_gemm_nvcc_flags(enable_rubin: bool) -> list[str]:
+    if enable_rubin:
+        return sm107a_nvcc_flags
+    # The runner has no device code of its own (kernels ship as cubins), so target
+    # the SM10x arch being built; an SM103 build must not embed an sm_100a image.
+    return current_compilation_context.get_nvcc_flags_list(
+        supported_major_versions=[10], map_sm107_to_100f=True
+    )
+
+
 def gen_trtllm_gen_gemm_module(enable_rubin: bool = False) -> JitSpec:
     # Fetch "flashinferMetaInfo.h" from the online kernel cache. This file
     # contains the `tllmGenGemmList` as the list of available kernels online.
     # It is included when compiling `trtllm_gemm_runner.cu`.
-    gemm_path = (
-        ArtifactPath.TRTLLM_GEN_GEMM_RUBIN
-        if enable_rubin
-        else ArtifactPath.TRTLLM_GEN_GEMM
-    )
-    gemm_checksum = (
-        CheckSumHash.TRTLLM_GEN_GEMM_RUBIN
-        if enable_rubin
-        else CheckSumHash.TRTLLM_GEN_GEMM
-    )
+    # One GEMM package serves both Blackwell and Rubin; only the compile flags
+    # and the module name still differ between the two variants.
+    gemm_path = ArtifactPath.TRTLLM_GEN_GEMM
+    gemm_checksum = CheckSumHash.TRTLLM_GEN_GEMM
     module_name = "trtllm_gemm_sm107" if enable_rubin else "trtllm_gemm"
     rubin_flags = ["-DTLLM_RUBIN_FEATURES"] if enable_rubin else []
     include_path = f"{gemm_path}/include"
@@ -777,7 +780,7 @@ def gen_trtllm_gen_gemm_module(enable_rubin: bool = False) -> JitSpec:
             "-DTLLM_ENABLE_CUDA",
             f'-DTLLM_GEN_GEMM_CUBIN_PATH=\\"{gemm_path}\\"',
         ]
-        + sm100a_nvcc_flags,
+        + _trtllm_gen_gemm_nvcc_flags(enable_rubin),
         extra_include_paths=[
             gen_root,
             jit_env.FLASHINFER_GEN_SRC_DIR,
@@ -908,16 +911,10 @@ def gen_gemm_sm90_module() -> JitSpec:
 
 
 def gen_trtllm_low_latency_gemm_module(enable_rubin: bool = False) -> JitSpec:
-    gemm_path = (
-        ArtifactPath.TRTLLM_GEN_GEMM_RUBIN
-        if enable_rubin
-        else ArtifactPath.TRTLLM_GEN_GEMM
-    )
-    gemm_checksum = (
-        CheckSumHash.TRTLLM_GEN_GEMM_RUBIN
-        if enable_rubin
-        else CheckSumHash.TRTLLM_GEN_GEMM
-    )
+    # One GEMM package serves both Blackwell and Rubin; only the compile flags
+    # and the module name still differ between the two variants.
+    gemm_path = ArtifactPath.TRTLLM_GEN_GEMM
+    gemm_checksum = CheckSumHash.TRTLLM_GEN_GEMM
     module_name = (
         "trtllm_low_latency_gemm_sm107" if enable_rubin else "trtllm_low_latency_gemm"
     )
@@ -966,7 +963,7 @@ def gen_trtllm_low_latency_gemm_module(enable_rubin: bool = False) -> JitSpec:
             "-DTLLM_ENABLE_CUDA",
             f'-DTLLM_GEN_GEMM_CUBIN_PATH=\\"{gemm_path}\\"',
         ]
-        + sm100a_nvcc_flags,
+        + _trtllm_gen_gemm_nvcc_flags(enable_rubin),
         extra_include_paths=[
             gen_root,
             jit_env.FLASHINFER_GEN_SRC_DIR,

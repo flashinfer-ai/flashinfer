@@ -36,6 +36,10 @@ bugs there. See [Kernel review](#kernel-review).
    flag perf claims without numbers. The PR title/description normally become the commit
    title/message on (squash) merge and are relied on when bisecting — hold them to that
    standard.
+7. **Triggering CI.** When you start CI on a PR, scope it to the test paths the change
+   touches: `@flashinfer-bot run tests/<dir-or-file> [tests/...]` (public) / `/bot run tests/<dir-or-file> [tests/...]` (internal), whitespace-separated paths
+   under `tests/`. A bare `run` starts the full suite, which is expensive; it needs a reason
+   (final pre-merge check of a cross-cutting change), not habit.
 
 **Out of scope:** backwards-compatibility / API-breakage auditing — delegated to a GitHub
 pre-merge check that QA puts in and maintains, not code review.
@@ -60,11 +64,14 @@ unsafe shape/alignment assumptions.
 ## Experimental APIs
 
 FlashInfer does not gate PRs by size. Some PRs may instead be submitted on **experimental**
-terms — a separate lifecycle, workflow management, and quality bar — declared via a tracked
-issue. Review such PRs against the experimental quality bar, not the durable-code bar.
+terms — a separate lifecycle, workflow management, and quality bar. An experimental PR is
+declared by the **Experimental Track** checkbox in the PR template (with a linked tracking
+issue) and the `experimental` label; the code itself is marked by placement under
+`flashinfer/experimental/` and/or `@flashinfer_experimental_api`. Review such PRs against the
+experimental quality bar, not the durable-code bar.
 
-<!-- TODO(@bkryu): declaration workflow (tracked issue), review quality bar for experimental
-code, and graduation / removal criteria. -->
+<!-- TODO(@bkryu): review quality bar for experimental code, and graduation / removal
+criteria (see flashinfer/experimental/README.md). -->
 
 ## Checklist
 
