@@ -108,6 +108,16 @@ def _frost_block():
     return GatedAttentionBlockFwd
 
 
+def _vendored_extend_select_budget_bytes() -> int:
+    """The select-window budget the vendored EXTEND stage lays its window plan out under: the ``gated_attention_block.api`` module
+    constant, read by the stage at its declaration -- so the value that module holds at prepare IS the budget a plan made in that prepare
+    was made under (a lowered tree constant shows up here as the plan's; this package's mirror in ``support`` is the tripwire's business).
+    Imported lazily and reached from the extend branch only: the vendored tree stays off the package-import path."""
+    from ..qwen_3_5_block._cudnn_frost.gated_attention_block import api as _vendored
+
+    return int(_vendored.QSA_EXTEND_SELECT_BUDGET_BYTES)
+
+
 def _rebrand(exc: BaseException) -> BaseException:
     """The Qwen 3.5 package's operand helpers name their package in every message; this package's name takes its place."""
     text = str(exc).replace("qwen_3_5_block:", f"{_PKG}:")
@@ -1328,15 +1338,15 @@ def prepare(
         sparse_sub_tiles_per_cta=getattr(blk, "sparse_sub_tiles_per_cta", None),
         # appended (the EXTEND step; the 4c8e24355 pin): the step-form knob as declared and as the tree resolved it, the indexer writers'
         # rounding convention, the select window plan (one window at the default budget below 2048 rows x a 128K-token reach), the budget
-        # the plan was made under, the exact-cap rule and the capture rule of this form
+        # the plan was made under -- read off the vendored module the window plan reads it from, as it stands at prepare, NOT this
+        # package's mirror (the tripwire holds the two equal; a lowered tree constant is reported as the plan's) --, the exact-cap rule
+        # and the capture rule of this form
         index_select_form=blk.index_select_form,
         index_select_form_resolved=blk.index_select_form_resolved,
         index_compress_rounding=geometry.index_compress_rounding,
         n_windows=n_windows,
         window_rows=int(getattr(ixd, "window_rows", 0)) if extend else 0,
-        select_budget_bytes=(
-            int(_support.INDEX_EXTEND_SELECT_BUDGET_BYTES) if extend else 0
-        ),
+        select_budget_bytes=(_vendored_extend_select_budget_bytes() if extend else 0),
         ring_cap_exact=extend,
         capture_warm_up_required=extend,
         # the vendored block's own capture-safe reading of its two projection stages after compile (True = the JIT-only route: no

@@ -64,18 +64,21 @@ def _plan(case, g, form="extend", **kw):
 
 def _run(plan, case, **kw):
     """One chunk through ``plan`` on the case's tensors (the per-token tables, the stack's ring slots); the selection into the case's
-    sentinel buffers.  Returns ``out``."""
+    sentinel buffers; ``kw`` overrides any run keyword (``out=``; ``seq_lens=`` in the device-value contract cell).  Returns ``out``."""
     case.reset_outputs()
+    args = dict(
+        case.extend_args(),
+        block_ids_out=case.block_ids_out,
+        block_lens_out=case.block_lens_out,
+    )
+    args.update(kw)
     out = plan.run(
         case.hidden_states,
         case.rope_cos,
         case.rope_sin,
         case.weights38,
         case.w_o,
-        **case.extend_args(),
-        block_ids_out=case.block_ids_out,
-        block_lens_out=case.block_lens_out,
-        **kw,
+        **args,
     )
     torch.cuda.synchronize()
     return out
@@ -606,6 +609,103 @@ def test_run_time_declines_are_typed_and_named():
     )
 
 
+def test_extend_device_value_contract_reports_short_and_over_sequences_beside_healthy_ones():
+    """The uniform-chunk contract the host never checks (device values; the README's ``seq_lens`` bullet and its Errors row):
+    ``seq_lens[b] in {0} u [T, max_pages x page_size]``.  One batch of four at ``T 32`` (128 rows, the bound) on the table at its natural
+    width (130 pages of 16: a 2080-token reach): a healthy sequence (321), a dead one, and -- in place of two healthy ones -- a LIVE sequence
+    SHORTER than the chunk (``seq_lens 20``: ``0 < 20 < T``) and one PAST the table's reach (``2085 > 130 x 16``), through ``plan.run`` (the
+    only entry a stack has).  Nothing is raised; the indexer stage's per-sequence report, read through the vendored stage's workspace views
+    as the cuDNN Frontend cell reads it, says ``n_keys`` / ``-1`` / ``-2`` / ``-3`` (``SEQREP_SHORT`` / ``SEQREP_OVER``: the README's literals);
+    ``out`` stays finite and the dead sequence exact; the short sequence's rows at negative positions count 0 visible blocks and its last row
+    ``20 // 4``; the over sequence's counts are its true positions' clamped at ``n_blocks_max``, every id it selects lies inside the table, its
+    piece's first position is the gather's clamp, and its chunk compress writes the blocks inside the table and reports the one past it
+    ``-2`` (the null page untouched); the HEALTHY sequence's rows -- ``out``, the list, the lengths --, its cache pages, its ring block and the
+    pools are BITWISE the run of the same batch at the contract-respecting lengths from the restored caches (the ladder's two-runs
+    comparison): a violating neighbour never reaches a healthy sequence."""
+    from flashinfer.experimental.qwen_3_5_block._cudnn_frost.gated_attention_block.kernels.qsa_kbar_gather import (
+        SEQREP_DEAD,
+        SEQREP_OVER,
+        SEQREP_SHORT,
+    )
+
+    assert (SEQREP_DEAD, SEQREP_SHORT, SEQREP_OVER) == (-1, -2, -3)
+    g = _geometry()
+    t = 32
+    case = Qsa38ExtendCase(g, (321, 0, 1000, 2071), t, page_size=16, seed=191, cap=4)
+    case.prime()
+    plan = _plan(case, g)
+    blk = plan._block
+    ix = blk._indexer_extend
+    nb_max = plan.declaration["n_blocks_max"]
+    reach = int(case.block_table.shape[1]) * 16
+    assert case.b * t == 128 and reach == 130 * 16 and nb_max == reach // 4
+    rows = lambda b: slice(b * t, (b + 1) * t)  # noqa: E731
+    # the contract-respecting run from the primed caches: the oracle holds; its healthy rows are the reference below
+    case.snapshot()
+    out_ref = _run(plan, case).clone()
+    ids_ref, lens_ref = case.block_ids_out.clone(), case.block_lens_out.clone()
+    cache_ref, ring_ref = (
+        bits(case.index_kv_cache).clone(),
+        bits(case.index_state_cache).clone(),
+    )
+    pools_ref = bits(case.kv_cache).clone()
+    _check_chunk(case, plan, out_ref, "contract: the served lengths")
+    rep = ix.views(plan._workspace, blk._ws)["seqrep"].tolist()
+    assert rep == [321 // 4, SEQREP_DEAD, 1000 // 4, 2071 // 4], rep
+    # the two violations beside them: sequence 2 shorter than the chunk, sequence 3 past the table's reach
+    short, over = 20, reach + 5
+    lens = torch.tensor([321, 0, short, over], dtype=torch.int32, device="cuda")
+    case.restore()
+    out = _run(plan, case, seq_lens=lens)  # nothing raised
+    v = ix.views(plan._workspace, blk._ws)
+    assert v["seqrep"].tolist() == [321 // 4, SEQREP_DEAD, SEQREP_SHORT, SEQREP_OVER], (
+        v["seqrep"].tolist()
+    )
+    assert torch.isfinite(out.float()).all(), (
+        "a violating sequence's rows must stay finite"
+    )
+    counts = v["counts"].view(case.b, t)
+    ids = case.block_ids_out.view(case.b, t, -1)
+    # the dead sequence exact beside the violations
+    assert (
+        bool((out[rows(1)] == 0).all())
+        and bool((ids[1] == -1).all())
+        and bool((counts[1] == 0).all())
+    )
+    # the short sequence: positions 20 - 32 + j -> the first 12 rows negative (0 visible blocks), the last row 20 // 4 complete blocks
+    assert (
+        bool((counts[2, : t - short] == 0).all()) and int(counts[2, -1]) == short // 4
+    ), counts[2].tolist()
+    # the over sequence: the true positions' counts clamped at n_blocks_max, every selected id inside the table, its piece's first position
+    # the gather's clamp (one window: one piece per sequence), the chunk compress writing the blocks inside the table and reporting -2 past it
+    pos = torch.arange(t, device="cuda") + (over - t)
+    assert torch.equal(
+        counts[3], torch.clamp((pos + 1) // 4, max=nb_max).to(torch.int32)
+    ), counts[3].tolist()
+    assert bool((ids[3][ids[3] >= 0] < nb_max).all())
+    assert ix.n_windows == 1
+    (piece,) = [p for p, (b, _r0, _rows) in enumerate(ix.pieces) if b == 3]
+    assert int(v["qpos"][piece]) == 4 * nb_max + 4 - 1 - t, (
+        "the over sequence's q_pos0 is not the clamp"
+    )
+    cs = v["cslot"][3].tolist()
+    assert sorted(x for x in cs if x >= 0) == list(range((over - t) // 4, nb_max)), cs
+    assert -2 in cs and all(x in (-1, -2) or 0 <= x < nb_max for x in cs), cs
+    assert (
+        torch.isnan(case.index_kv_cache[0].float()).all()
+        and torch.isnan(case.index_state_cache[0].float()).all()
+    ), "the null page / ring block moved"
+    # the healthy sequence: its rows, pages and ring block bitwise the contract-respecting run; the pools bitwise (slot-addressed writes)
+    assert torch.equal(out[rows(0)], out_ref[rows(0)]) and torch.equal(
+        ids[0], ids_ref.view(case.b, t, -1)[0]
+    )
+    assert torch.equal(case.block_lens_out[rows(0)], lens_ref[rows(0)])
+    pages0 = case.block_table[0, : len(case.pages[0])].long()
+    assert torch.equal(bits(case.index_kv_cache)[pages0], cache_ref[pages0])
+    assert torch.equal(bits(case.index_state_cache)[1], ring_ref[1])
+    assert torch.equal(bits(case.kv_cache), pools_ref)
+
+
 def test_capture_after_one_warm_up_replays_bitwise_and_takes_a_new_chunk():
     """CUDA-graph capture of the extend form AFTER one eager warm-up ON THE CAPTURE STREAM (the first run uploads the select window plan's
     constants): the capture under ``set_sync_debug_mode("error")`` launches nothing; the replay is BITWISE the eager run (``out``, the list,
@@ -788,7 +888,8 @@ def test_launch_census_by_kernel_name_matches_the_declaration():
     """The CUDA kernels one chunk launches (the profiler's names) at batch 4 x T 20 (80 rows): the pool-1 query compress and the CHUNK compress
     (``frost_qsa_compress`` x 2, one of them ``frost_qsa_compress_step``), the dense kbar gather, the canonical-order kernel, two cache writes
     (the K / V write and the ring arm), no paged scorer / decode top-k / fused prepare, no memset / memcpy; the count equals the declaration's
-    ``launches_per_execute``; a lowered select-window budget (two windows) adds exactly the scorer + top-k pair and computes the same bytes."""
+    ``launches_per_execute``; a lowered select-window budget (two windows) adds exactly the scorer + top-k pair and computes the same bytes,
+    and the two-window plan's declaration reports the lowered budget it was made under while the one-window plan's keeps the default."""
     from flashinfer.experimental.qwen_3_5_block._cudnn_frost.gated_attention_block import (
         api as vend,
     )
@@ -851,6 +952,10 @@ def test_launch_census_by_kernel_name_matches_the_declaration():
         and two.declaration["window_rows"] == 40
         and two.declaration["indexer_launches"] == 8
     )
+    # the declaration reports the budget the window plan was MADE under -- the vendored module constant as it stood at prepare, not this
+    # package's mirror: the lowered budget on the two-window plan, the default on the one-window plan
+    assert two.declaration["select_budget_bytes"] == 40 * n_blocks_max * 4
+    assert plan.declaration["select_budget_bytes"] == 512 << 20
     assert (
         two.declaration["launches_per_execute"]
         == plan.declaration["launches_per_execute"] + 2
