@@ -371,6 +371,15 @@ def _given_count_readback(device: torch.device) -> bool:
     return arch is not None and not toolchain_runs_hidden_count(arch)
 
 
+def _check_given_count(count: int, actual: int) -> None:
+    """``ValueError`` when the caller's valid-row count ``count`` differs from the ``actual`` labels ``>= 0`` (a
+    count read back: :func:`given_valid_rows`, :func:`_budget_valid_rows`)."""
+    if actual != count:
+        raise ValueError(
+            f"num_valid_rows={count} but the labels hold {actual} valid rows (labels >= 0)"
+        )
+
+
 def _assert_on_device(condition: torch.Tensor, message: str) -> None:
     try:
         torch._assert_async(condition, message)
@@ -411,11 +420,8 @@ def given_valid_rows(
     valid, pos, idx_full = compaction_index(labels, ar=ar)
     total = pos[T - 1]
     if check or _given_count_readback(device):
-        actual = int(total)  # the one synchronization of the checked path
-        if actual != count:
-            raise ValueError(
-                f"num_valid_rows={count} but the labels hold {actual} valid rows (labels >= 0)"
-            )
+        # the one synchronization of the checked path
+        _check_given_count(count, int(total))
     else:
         _assert_on_device(
             total == count,
@@ -2778,8 +2784,10 @@ def forward_loss(
     compacted call then plans on it without reading a count back -- the valid-row index is formed on the device and the
     count is checked there by one asynchronous assertion (:func:`given_valid_rows`; a wrong count ends the CUDA context
     with a device-side assertion) -- so the forward does not wait for the device; ``check_num_valid_rows=True`` reads
-    the count back instead and raises ``ValueError`` on a mismatch (one synchronization, for debugging).  ``None``: the
-    count is formed here (one synchronization per call; :func:`valid_rows`, the hidden valid-row count)."""
+    the count back instead and raises ``ValueError`` on a mismatch (one synchronization, for debugging).  An
+    uncompacted ``"budget"`` call sizes its budget on the count, checked only with ``check_num_valid_rows=True`` (one
+    readback, :func:`_budget_valid_rows`).  ``None``: the count is formed here (one synchronization per call;
+    :func:`valid_rows`, the hidden valid-row count)."""
     if backend not in BACKENDS:
         raise ValueError(f"backend must be one of {BACKENDS}")
     problem = validate_lm_head_inputs(
@@ -2891,7 +2899,9 @@ def forward_loss(
             buffer_rows=min(int(problem.chunk), rows),
             x_copy=problem.x_copy,
             dx_finalize=fused_dx,
-            budget_rows=_budget_valid_rows(labels, row_index, given, compact),
+            budget_rows=_budget_valid_rows(
+                labels, row_index, given, compact, check=check_num_valid_rows
+            ),
             tuning=tuning,
         )
         fuse = mplan.form == "fused"
@@ -3116,15 +3126,21 @@ def _budget_valid_rows(
     row_index: Optional[torch.Tensor],
     given: Optional[int],
     compact: bool,
+    *,
+    check: bool = False,
 ) -> int:
     """The valid rows ``T_v`` of a ``memory_mode="budget"`` call's budget (:func:`memory_plan`'s ``budget_rows``): the
     compacted rows (``row_index``; every row when a compacted call's count found none ignored), else the caller's
     ``num_valid_rows`` (``given``), else the labels ``>= 0`` counted on the host -- one synchronization, taken by an
     uncompacted call (``compact_rows=False``) without the caller's count: its chunk loop runs over every row, its budget
-    counts the logits of the valid rows only."""
+    counts the logits of the valid rows only.  ``check`` (``check_num_valid_rows``): an uncompacted call reads the
+    labels' count back and raises :func:`given_valid_rows`'s ``ValueError`` when the caller's count differs from it
+    (one synchronization; a compacted call's count is checked by :func:`given_valid_rows`)."""
     if row_index is not None:
         return int(row_index.numel())
     if given is not None:
+        if check and not compact:
+            _check_given_count(given, int((labels >= 0).sum()))
         return int(given)
     if compact:
         return int(labels.numel())
@@ -4416,10 +4432,12 @@ class ChunkedLmHeadLogprobFunction(torch.autograd.Function):
         ctx.gemm_tuning = tuning
         ctx.logprob_dz = dz_arm
         ctx.budget = budget
-        # ``"budget"``: the caller's count sizes the backward's budget of an uncompacted call
+        # ``"budget"``: the caller's count sizes the backward's budget of an uncompacted call (checked there with
+        # ``check_num_valid_rows``)
         ctx.num_valid_rows = (
             _given_count(num_valid_rows, int(labels.numel())) if budget else None
         )
+        ctx.check_num_valid_rows = bool(budget and check_num_valid_rows)
         return result.logp
 
     @staticmethod
@@ -4448,6 +4466,7 @@ class ChunkedLmHeadLogprobFunction(torch.autograd.Function):
                 logprob_dz=ctx.logprob_dz,
                 row_index=row_index,
                 num_valid_rows=ctx.num_valid_rows,
+                check_num_valid_rows=ctx.check_num_valid_rows,
             )
         else:
             dx, dw = backward_logprob(
@@ -4484,11 +4503,12 @@ def _backward_logprob_budget(
     fuse_dw_cast: bool,
     row_index: Optional[torch.Tensor],
     num_valid_rows: Optional[int] = None,
+    check_num_valid_rows: bool = False,
     **common,
 ) -> tuple[Optional[torch.Tensor], torch.Tensor]:
     """:func:`backward_logprob` (with ``dW``) in the form :func:`memory_plan` picks for ``memory_mode="budget"``
-    against the budget of the valid rows (``row_index``'s, else the caller's ``num_valid_rows``, else one host count of
-    an uncompacted call; :func:`_budget_valid_rows`):
+    against the budget of the valid rows (``row_index``'s, else the caller's ``num_valid_rows`` -- read back and checked
+    with ``check_num_valid_rows`` --, else one host count of an uncompacted call; :func:`_budget_valid_rows`):
     ``"fused"`` -- the fast form; ``"unfused"`` -- the chunk loop accumulates every row and the FP32 accumulator is
     cast after ``dX`` is written; ``"partial"`` / ``"recompute"`` -- the chunk loop accumulates the rows ``[0,
     dw_rows)`` (none for ``"recompute"``), their cast fills the top rows of ``dW`` and the other rows are recomputed in
@@ -4525,7 +4545,11 @@ def _backward_logprob_budget(
         x_copy=problem.x_copy,
         dx_finalize=_resolve_dx_finalize(common["dx_finalize"]),
         budget_rows=_budget_valid_rows(
-            labels, row_index, num_valid_rows, bool(common["compact_rows"])
+            labels,
+            row_index,
+            num_valid_rows,
+            bool(common["compact_rows"]),
+            check=check_num_valid_rows,
         ),
         tuning=common["gemm_tuning"],
     )
@@ -4702,8 +4726,10 @@ def chunked_lm_head_loss(
       checked on the device (an asynchronous assertion: a wrong count ends the
       CUDA context with a device-side assertion).  ``check_num_valid_rows=True``
       reads the count back instead and raises ``ValueError`` on a mismatch (one
-      synchronization; for debugging).  ``None``: the forward counts the valid
-      rows itself (one synchronization per call).
+      synchronization; for debugging).  An uncompacted ``"budget"`` call sizes
+      its budget on the count, checked only with ``check_num_valid_rows=True``
+      (one readback; the log-probability entry's in its backward).  ``None``:
+      the forward counts the valid rows itself (one synchronization per call).
 
     ``check_num_valid_rows=True`` without ``num_valid_rows`` is a
     ``ValueError``.

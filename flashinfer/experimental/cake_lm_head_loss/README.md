@@ -62,7 +62,9 @@ logp = chunked_lm_head_logprob(X, W, labels, chunk_size=4096)   # differentiable
   arbitrary downstream losses; its forward saves the FP32 row statistic `lse`
   and the valid-row index, and the backward recomputes each chunk's logits
   from the saved inputs (four GEMMs per chunk) without counting the rows again
-  (no host synchronization).
+  (no host synchronization; exception: a `memory_mode="budget"` call with
+  `compact_rows=False` and no caller's count counts its valid rows on the host
+  in the backward).
 * Valid-row compaction (`compact_rows`, a keyword of every eager and autograd
   entry point, default `True`; `prepare_lm_head_loss` takes it as a bool or the
   valid-row tensor, default `False`): when some labels are `-100` the chunk loop runs over the valid rows
@@ -283,8 +285,11 @@ logp = chunked_lm_head_logprob(X, W, labels, chunk_size=4096)   # differentiable
   CPU calls and every `sm_103a` call whose library CUDA 13.0 built (the calls
   that keep the host-count schedule, see the toolchain note).  The given-count
   call runs the host-count path's kernels on the same plan, so its outputs are
-  bitwise those of `num_valid_rows=None`.  The count is not derived from
-  `loss_div`.
+  bitwise those of `num_valid_rows=None`.  An uncompacted `"budget"` call
+  (`compact_rows=False`) sizes its budget on the count; only
+  `check_num_valid_rows=True` checks it there (one readback, `ValueError` on a
+  mismatch; the log-probability entry checks in its backward).  The count is
+  not derived from `loss_div`.
 * First call of a process (`chunked_lm_head_preload(device=None)`,
   `cake_backend_opt_in.preload`): loads every library of the device's architecture
   (a JIT build when the package ships no `aot/` library), creates the
