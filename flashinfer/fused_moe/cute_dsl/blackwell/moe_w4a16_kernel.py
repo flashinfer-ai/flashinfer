@@ -720,6 +720,13 @@ class Sm100W4A16GroupedGemmKernel:
         transform_group_idx: cutlass.Int32,
     ) -> tuple[pipeline.PipelineState, pipeline.PipelineState]:
         k_tile_cnt = cute.ceil_div(consumed_k, self.mma_tiler[2])
+        group_k = self.mma_tiler[2] // self.num_transform_warpgroups
+        tail_k = consumed_k % self.mma_tiler[2]
+        transform_k_tiles = k_tile_cnt
+        if cutlass.const_expr(0 < tail_k <= self.mma_tiler[2] - group_k):
+            transform_k_tiles = k_tile_cnt - cutlass.Int32(
+                transform_group_idx >= cute.ceil_div(tail_k, group_k)
+            )
         a_load2trans_consumer_state.reset_count()
         peek_load2trans_full_status = cutlass.Boolean(1)
         if a_load2trans_consumer_state.count < k_tile_cnt:
@@ -758,13 +765,8 @@ class Sm100W4A16GroupedGemmKernel:
             self._trace_transform_pop()
             self._trace_transform_push("transform_load_decode_nvfp4", _k_tile)
             transform_valid = True
-            group_k = self.mma_tiler[2] // self.num_transform_warpgroups
-            tail_k = consumed_k % self.mma_tiler[2]
             if cutlass.const_expr(0 < tail_k <= self.mma_tiler[2] - group_k):
-                transform_valid = (
-                    _k_tile * self.mma_tiler[2] + transform_group_idx * group_k
-                    < consumed_k
-                )
+                transform_valid = _k_tile < transform_k_tiles
             cur_a_load2trans_consumer_state = a_load2trans_consumer_state.clone()
             if transform_valid:
                 scale_stage_coord = (None,) * (cute.rank(tSsS_trans) - 1) + (
