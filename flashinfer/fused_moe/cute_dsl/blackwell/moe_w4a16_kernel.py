@@ -723,8 +723,10 @@ class Sm100W4A16GroupedGemmKernel:
         tArA_transform: cute.Tensor,
         tArA_transform_store: cute.Tensor,
         transform_tiler: cute.Layout,
-        k_tile_cnt: cutlass.Constexpr[int],
+        consumed_k: cutlass.Constexpr[int],
+        transform_group_idx: cutlass.Int32,
     ) -> tuple[pipeline.PipelineState, pipeline.PipelineState]:
+        k_tile_cnt = cute.ceil_div(consumed_k, self.mma_tiler[2])
         a_load2trans_consumer_state.reset_count()
         peek_load2trans_full_status = cutlass.Boolean(1)
         if a_load2trans_consumer_state.count < k_tile_cnt:
@@ -762,56 +764,69 @@ class Sm100W4A16GroupedGemmKernel:
             )
             self._trace_transform_pop()
             self._trace_transform_push("transform_load_decode_nvfp4", _k_tile)
-            scale_stage_coord = (None,) * (cute.rank(tSsS_trans) - 1) + (
-                a_load2trans_consumer_state.index,
-            )
-            tSsS_slice = tSsS_trans[scale_stage_coord]
-            tSsS_slice_filtered = cute.make_tensor(
-                tSsS_slice.iterator,
-                cute.filter_zeros(tSsS_slice.layout),
-            )
-            cute.autovec_copy(tSsS_slice_filtered, tSrS_copy)
+            transform_valid = True
+            group_k = self.mma_tiler[2] // self.num_transform_warpgroups
+            tail_k = consumed_k % self.mma_tiler[2]
+            if cutlass.const_expr(0 < tail_k <= self.mma_tiler[2] - group_k):
+                transform_valid = (
+                    _k_tile * self.mma_tiler[2] + transform_group_idx * group_k
+                    < consumed_k
+                )
             cur_a_load2trans_consumer_state = a_load2trans_consumer_state.clone()
-            for idx in cutlass.range_constexpr(cute.size(tArA_load, mode=[1])):
-                cute.autovec_copy(
-                    tAsA_input_slice[(None, idx)],
-                    tArA_load[(None, idx)],
+            if transform_valid:
+                scale_stage_coord = (None,) * (cute.rank(tSsS_trans) - 1) + (
+                    a_load2trans_consumer_state.index,
                 )
-                if cutlass.const_expr(idx == cute.size(tArA_load, mode=[1]) - 1):
-                    a_load2trans_consumer_state.advance()
-                    if a_load2trans_consumer_state.count < k_tile_cnt:
-                        peek_load2trans_full_status = (
-                            a_load2trans_pipeline.consumer_try_wait(
-                                a_load2trans_consumer_state
+                tSsS_slice = tSsS_trans[scale_stage_coord]
+                tSsS_slice_filtered = cute.make_tensor(
+                    tSsS_slice.iterator,
+                    cute.filter_zeros(tSsS_slice.layout),
+                )
+                cute.autovec_copy(tSsS_slice_filtered, tSrS_copy)
+                for idx in cutlass.range_constexpr(cute.size(tArA_load, mode=[1])):
+                    cute.autovec_copy(
+                        tAsA_input_slice[(None, idx)],
+                        tArA_load[(None, idx)],
+                    )
+                    if cutlass.const_expr(idx == cute.size(tArA_load, mode=[1]) - 1):
+                        a_load2trans_consumer_state.advance()
+                        if a_load2trans_consumer_state.count < k_tile_cnt:
+                            peek_load2trans_full_status = (
+                                a_load2trans_pipeline.consumer_try_wait(
+                                    a_load2trans_consumer_state
+                                )
                             )
-                        )
-                packed_fragment = cute.recast_tensor(
-                    tArA_load[(None, idx)], cutlass.Uint8
-                ).load()
-                scale_slice = tSrS_load[(None, idx)]
-                scale_slice_compact = cute.make_tensor(
-                    scale_slice.iterator,
-                    cute.filter_zeros(scale_slice.layout),
-                )
-                scale_fragment = cute.recast_tensor(
-                    scale_slice_compact, cutlass.Uint8
-                ).load()
-                tensor_transformed = decode_nvfp4_fragment_to_bf16(
-                    packed_fragment,
-                    scale_fragment,
-                )
-                tArA_transform_store[(None, idx)].store(tensor_transformed)
+                    packed_fragment = cute.recast_tensor(
+                        tArA_load[(None, idx)], cutlass.Uint8
+                    ).load()
+                    scale_slice = tSrS_load[(None, idx)]
+                    scale_slice_compact = cute.make_tensor(
+                        scale_slice.iterator,
+                        cute.filter_zeros(scale_slice.layout),
+                    )
+                    scale_fragment = cute.recast_tensor(
+                        scale_slice_compact, cutlass.Uint8
+                    ).load()
+                    tensor_transformed = decode_nvfp4_fragment_to_bf16(
+                        packed_fragment,
+                        scale_fragment,
+                    )
+                    tArA_transform_store[(None, idx)].store(tensor_transformed)
+            else:
+                # Only the final stage can have a wholly unused K group.
+                a_load2trans_consumer_state.advance()
             self._trace_transform_pop()
 
             self._trace_transform_push("transform_store_commit_bf16", _k_tile)
             a_transform_stage_coord = (None,) * (cute.rank(tAsA_transform) - 1) + (
                 trans2mma_producer_state.index,
             )
-            mixed_input_utils.store_transformed_a(
-                tArA_transform,
-                tAsA_transform[a_transform_stage_coord],
-                dst_copy_a,
-            )
+            if transform_valid:
+                mixed_input_utils.store_transformed_a(
+                    tArA_transform,
+                    tAsA_transform[a_transform_stage_coord],
+                    dst_copy_a,
+                )
             self._finish_transform_stage(
                 a_load2trans_pipeline,
                 trans2mma_pipeline,
@@ -2125,7 +2140,8 @@ class Sm100W4A16GroupedGemmKernel:
                     tArA_transform,
                     tArA_transform_store,
                     transform_tiler,
-                    k_tile_cnt,
+                    mA_mkl.shape[1],
+                    transform_group_idx,
                 )
                 # Advance to next tile
                 tile_info_pipeline.consumer_wait(tile_info_consumer_state)
