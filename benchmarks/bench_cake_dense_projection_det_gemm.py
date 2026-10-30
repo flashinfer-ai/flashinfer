@@ -16,7 +16,7 @@ limitations under the License.
 
 """Benchmark the experimental Cake dense projection GEMMs (SM100 / SM103 / SM107).
 
-Times the GLM-5.2 training GEMMs of ``flashinfer.experimental.dense_projection_gemm``
+Times the GLM-5.2 training GEMMs of ``flashinfer.experimental.dense_projection_det_gemm``
 paired against ``torch.matmul`` on the same strided views:
 
 * the 11 projection rows (``o_proj``, ``q_a``, ``q_b``, ``kv_a``, ``shared_gate_up``,
@@ -38,7 +38,7 @@ time of back-to-back calls on the host, not GPU time).
 
 Usage::
 
-    python benchmarks/bench_cake_dense_projection_gemm.py [--rows kv_a_fwd_bf16_t16231 ...]
+    python benchmarks/bench_cake_dense_projection_det_gemm.py [--rows kv_a_fwd_bf16_t16231 ...]
         [--ops fwd,dgrad,wgrad] [--T 16231,16172] [--f32-grads] [--no-mla] [--no-router]
         [--steps 20] [--accuracy] [--host-overhead] [--json out.json]
 """
@@ -55,7 +55,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from flashinfer.experimental.dense_projection_gemm import cake_backend  # noqa: E402
+from flashinfer.experimental.dense_projection_det_gemm import cake_backend  # noqa: E402
 from flashinfer.testing import bench_gpu_time  # noqa: E402
 
 # GLM-5.2 projection rows: label -> (K = in features, N = out features).
@@ -190,11 +190,15 @@ def make_inputs(spec, seed, device):
 def cake_arm(spec, inp):
     """The prepared Cake launch of the row (allocation-free replays)."""
     if spec["family"] == "router":
-        prepared = cake_backend.prepare_router_fp32_gemm(inp["A"], inp["B"], inp["out"])
+        prepared = cake_backend.prepare_router_fp32_det_gemm(
+            inp["A"], inp["B"], inp["out"]
+        )
     elif spec["family"] == "proj" and spec["op"] == "wgrad":
-        prepared = cake_backend.prepare_projection_wgrad(inp["G"], inp["X"], inp["out"])
+        prepared = cake_backend.prepare_projection_det_wgrad(
+            inp["G"], inp["X"], inp["out"]
+        )
     else:
-        prepared = cake_backend.prepare_dense_projection_gemm(
+        prepared = cake_backend.prepare_dense_projection_det_gemm(
             inp["A"], inp["B"], inp["out"]
         )
     return prepared
@@ -204,10 +208,12 @@ def eager_arm(spec, inp):
     """The convenience entry point of the row (the cached planned launch; ``out`` is passed, so a cache
     hit allocates nothing)."""
     if spec["family"] == "router":
-        return lambda: cake_backend.router_fp32_gemm(inp["A"], inp["B"], inp["out"])
+        return lambda: cake_backend.router_fp32_det_gemm(inp["A"], inp["B"], inp["out"])
     if spec["family"] == "proj" and spec["op"] == "wgrad":
-        return lambda: cake_backend.projection_wgrad(inp["G"], inp["X"], inp["out"])
-    return lambda: cake_backend.dense_projection_gemm(inp["A"], inp["B"], inp["out"])
+        return lambda: cake_backend.projection_det_wgrad(inp["G"], inp["X"], inp["out"])
+    return lambda: cake_backend.dense_projection_det_gemm(
+        inp["A"], inp["B"], inp["out"]
+    )
 
 
 def torch_arm(spec, inp):

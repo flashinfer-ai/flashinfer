@@ -200,7 +200,7 @@ KERNELS: dict[str, dict[str, str]] = {
 # fmt: on
 
 # Generated file list: the device / binding translation units of every registered
-# module live flat under ``csrc/cake_dense_projection_gemm/`` next to this file
+# module live flat under ``csrc/cake_dense_projection_det_gemm/`` next to this file
 # (one architecture-neutral pair per program, built for every architecture in
 # the record's ``arches``); ``build.json`` lists them per library entry.  They
 # are written by the Cake exporter together with the three registries above and
@@ -280,11 +280,15 @@ def library_name(name: str, arch: str) -> str:
 
 
 @functools.cache
-def load_cake_dense_projection_gemm_module(name: str, arch: str):
+def load_cake_dense_projection_det_gemm_module(name: str, arch: str):
     """Load (once per program and architecture) the generated program ``name`` for ``arch``: the
     prebuilt library under ``aot/`` when the package ships it, else FlashInfer's JIT build of its
     ``build.json`` entry."""
     return cake_build.load_library(library_name(name, arch))
+
+
+# The loader's former name (before the det rename), an alias of the same cached function.
+load_cake_dense_projection_gemm_module = load_cake_dense_projection_det_gemm_module
 
 
 def specs_for_arch(arch: str):
