@@ -28,6 +28,7 @@ def _buffers(capacity, hidden, topk, dtype):
 @pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
 @pytest.mark.parametrize("norm", [1.0, 0.3, 0.7, 2.0])
 def test_nvfp4_fused_staging_matches_torch(monkeypatch, dtype, norm):
+    """Check normalized NVFP4 bytes and validated routes against Torch staging."""
     from flashinfer.moe_ep.backends.mega.kernel.sm107.nvfp4_nvfp4_bf16_cutedsl.staging import (
         stage_mega_moe_inputs,
     )
@@ -48,7 +49,9 @@ def test_nvfp4_fused_staging_matches_torch(monkeypatch, dtype, norm):
         scores = torch.rand(live, topk, device="cuda")
         for enabled, out in (("0", expected), ("1", actual)):
             monkeypatch.setenv("FLASHINFER_MEGA_FUSED_STAGE", enabled)
-            stage_mega_moe_inputs(x, scores, ids, *out, input_norm_const=norm)
+            stage_mega_moe_inputs(
+                x, scores, ids, *out, input_norm_const=norm, num_experts=16
+            )
         torch.cuda.synchronize()
         if live:
             torch.testing.assert_close(
@@ -500,16 +503,21 @@ def test_mxfp8_fused_staging_keeps_scale_policies_separate(kind):
         assert torch.equal(ids_out, ids) and torch.equal(scores_out, scores)
 
 
-@pytest.mark.parametrize("kind", ["mxfp8_e4m3", "mxfp8_e5m2", "mxfp4_mxfp8"])
+@pytest.mark.parametrize("kind", ["nvfp4", "mxfp8_e4m3", "mxfp8_e5m2", "mxfp4_mxfp8"])
 @pytest.mark.parametrize("tail_fused", ["0", "1"])
 @pytest.mark.parametrize("capacity", [129, 4096])
-def test_mxfp8_staging_graph_masks_dirty_tail(monkeypatch, kind, tail_fused, capacity):
+def test_quantized_staging_graph_masks_dirty_tail(
+    monkeypatch, kind, tail_fused, capacity
+):
     """Replay varying live lengths and capacities without stale tails or recompiles."""
     import cutlass.cute as cute
 
     from flashinfer.moe_ep.backends.mega.kernel.sm107.mxfp8_mxfp8_bf16_cutedsl.staging import (
         _data_dtype,
-        stage_mega_moe_inputs,
+        stage_mega_moe_inputs as stage_mx,
+    )
+    from flashinfer.moe_ep.backends.mega.kernel.sm107.nvfp4_nvfp4_bf16_cutedsl.staging import (
+        stage_mega_moe_inputs as stage_nv,
     )
 
     monkeypatch.setenv("FLASHINFER_SM107_FUSED_TAIL_MASK", tail_fused)
@@ -520,21 +528,29 @@ def test_mxfp8_staging_graph_masks_dirty_tail(monkeypatch, kind, tail_fused, cap
     ids[::2, 0] = -1
     scores[::2, 0] = float("nan")
     out = (
-        torch.empty(capacity, hidden, device="cuda", dtype=_data_dtype(kind)),
-        torch.empty(capacity, hidden // 32, device="cuda", dtype=torch.float8_e8m0fnu),
-        torch.empty(capacity, topk, device="cuda", dtype=torch.int32),
-        torch.empty(capacity, topk, device="cuda"),
+        _buffers(capacity, hidden, topk, torch.int32)
+        if kind == "nvfp4"
+        else (
+            torch.empty(capacity, hidden, device="cuda", dtype=_data_dtype(kind)),
+            torch.empty(
+                capacity, hidden // 32, device="cuda", dtype=torch.float8_e8m0fnu
+            ),
+            torch.empty(capacity, topk, device="cuda", dtype=torch.int32),
+            torch.empty(capacity, topk, device="cuda"),
+        )
     )
 
     def stage(live, limit=capacity):
         """Stage a live prefix into the requested output capacity."""
-        stage_mega_moe_inputs(
+        stage_inputs = stage_nv if kind == "nvfp4" else stage_mx
+        kwargs = {} if kind == "nvfp4" else {"kind": kind}
+        stage_inputs(
             x[:live],
             scores[:live],
             ids[:live],
             *(t[:limit] for t in out),
-            kind=kind,
             num_experts=16,
+            **kwargs,
         )
 
     stage(8)
@@ -573,26 +589,35 @@ def test_mxfp8_staging_graph_masks_dirty_tail(monkeypatch, kind, tail_fused, cap
             graph.reset()
 
 
-def _invalid_staged_route(case):
+def _invalid_staged_route(case, kind):
     """Require eager or captured staging to trap a route corrupted after warmup."""
     # A device assertion invalidates the CUDA context, so each case needs its
     # own process. Values can also become invalid after CUDA graph capture.
     from flashinfer.moe_ep.backends.mega.kernel.sm107.mxfp8_mxfp8_bf16_cutedsl.staging import (
-        stage_mega_moe_inputs,
+        stage_mega_moe_inputs as stage_mx,
+    )
+    from flashinfer.moe_ep.backends.mega.kernel.sm107.nvfp4_nvfp4_bf16_cutedsl.staging import (
+        stage_mega_moe_inputs as stage_nv,
     )
 
     x = torch.randn(2, 128, device="cuda", dtype=torch.bfloat16)
     ids = torch.tensor([[0, 1], [-1, -1]], device="cuda", dtype=torch.int64)
     scores = torch.tensor([[0.5, 0.5], [float("nan"), float("inf")]], device="cuda")
     out = (
-        torch.empty(4, 128, device="cuda", dtype=torch.float8_e4m3fn),
-        torch.empty(4, 4, device="cuda", dtype=torch.float8_e8m0fnu),
-        torch.empty(4, 2, device="cuda", dtype=torch.int32),
-        torch.empty(4, 2, device="cuda"),
+        _buffers(4, 128, 2, torch.int32)
+        if kind == "nvfp4"
+        else (
+            torch.empty(4, 128, device="cuda", dtype=torch.float8_e4m3fn),
+            torch.empty(4, 4, device="cuda", dtype=torch.float8_e8m0fnu),
+            torch.empty(4, 2, device="cuda", dtype=torch.int32),
+            torch.empty(4, 2, device="cuda"),
+        )
     )
 
     def stage():
-        stage_mega_moe_inputs(x, scores, ids, *out, num_experts=8)
+        """Stage live values before checking mutated routes on graph replay."""
+        stage_inputs = stage_nv if kind == "nvfp4" else stage_mx
+        stage_inputs(x, scores, ids, *out, num_experts=8)
 
     stage()
     torch.cuda.synchronize()
@@ -631,7 +656,8 @@ def _invalid_staged_route(case):
 @pytest.mark.parametrize(
     "case", ["bounds", "negative", "int64_wrap", "duplicate", "nan", "inf"]
 )
-def test_fused_staging_rejects_invalid_routes(monkeypatch, case):
+@pytest.mark.parametrize("kind", ["nvfp4", "mxfp8_e4m3"])
+def test_fused_staging_rejects_invalid_routes(monkeypatch, case, kind):
     """Isolate each expected device assertion in a fresh spawned CUDA process."""
     import multiprocessing
 
@@ -639,7 +665,7 @@ def test_fused_staging_rejects_invalid_routes(monkeypatch, case):
     monkeypatch.setenv("FLASHINFER_SM107_MEGA_CHECK_ROUTES", "1")
     monkeypatch.setenv("FLASHINFER_SM107_FUSED_ROUTE_CHECK", "1")
     process = multiprocessing.get_context("spawn").Process(
-        target=_invalid_staged_route, args=(case,)
+        target=_invalid_staged_route, args=(case, kind)
     )
     process.start()
     try:

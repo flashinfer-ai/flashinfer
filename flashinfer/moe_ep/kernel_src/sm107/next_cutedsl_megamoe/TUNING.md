@@ -21,17 +21,71 @@ Use `--dtype mxfp4_mxfp8 --arch sm107` for mixed-format offline tuning, or
 MXFP8 activation staging and uses packed E2M1 weights with block-32 E8M0
 scales. Its tuning cache entries are separate from the MXFP8-weight entries.
 
-For contiguous BF16 inputs and top-k up to 32, MXFP8 staging checks route
+For contiguous BF16 inputs and top-k up to 32, NVFP4 and MXFP8 staging check route
 bounds, duplicate experts and finite unmasked scores in the quantization kernel.
 These checks remain active during graph replay. Unsupported layouts and
 prequantized inputs retain separate routing validation. Set
 `FLASHINFER_SM107_FUSED_ROUTE_CHECK=0` to use separate validation for diagnostics.
 
-MXFP8 staging also masks trailing routing rows in the quantization launch,
+NVFP4 and MXFP8 staging also mask trailing routing rows in the quantization launch,
 including when replaying graphs with different live row counts in a shared
 workspace. Empty inputs and tails exceeding 16 routing elements per live CTA
 thread retain a separate parallel fill. Set
 `FLASHINFER_SM107_FUSED_TAIL_MASK=0` to use the separate tail clear for diagnostics.
+
+NVFP4 backend defaults for `fc1_alpha`, `fc2_alpha`, and `fc1_norm_const`
+bind a workspace-owned read-only ones tensor instead of filling three tensors
+on every call. Explicit contiguous FP32 tensors are also bound directly; other
+layouts retain the copy path. The default tensor is separate from mutable
+workspace scalar storage so pooled layers and captured graphs cannot overwrite
+each other's default values. Valid strided FP32 vectors are accepted on the
+first invocation as well as after warmup; shape, device and positive-finite
+value checks still apply.
+
+## NVFP4 staging measurements (2026-10-29)
+
+Native EP8 on eight Rubin SM107 GPUs, H=4096, intermediate=2048, 256 experts,
+top-6, uniform routing, no shared experts, BF16 combine, early routing weights,
+gate/up clamp=10 and default scalar parameters. Clocks are not locked and
+knob-cache lookup is disabled. Route checks, fused-route-check eligibility,
+fused staging and fused-tail eligibility are all enabled. The pre-optimization
+MoE source at `c4ea1741afa2829f9bdcc716473f2f08e23d0bcb` matches the PR parent.
+The optimized NVFP4 implementation is the one recorded at `a568d2e8c`.
+
+Each full-forward value averages two runs, taking the maximum of the eight
+per-rank medians over five rounds of 40 CUDA Graph calls per run. Before and
+after runs alternate; there is no L2 flush or per-call barrier.
+
+| Live rows / capacity | Before full forward (µs) | After full forward (µs) | Latency reduction |
+| ---: | ---: | ---: | ---: |
+| 32 / 256 | 98.22 | 92.03 | 6.30% |
+| 192 / 256 | 104.39 | 95.78 | 8.25% |
+| 256 / 256 | 105.17 | 97.26 | 7.52% |
+
+At 192 live rows, full-forward launches drop from eleven to four on every
+rank. Compute-only timing remains approximately unchanged: 92.99 versus
+93.34 µs. Numerical oracles and graph/eager parity pass at all measured points.
+
+### Standalone-tail fallback
+
+A fresh comparison uses one live row and capacity 1024 at the same geometry,
+five rounds of 40 captured calls per revision. There are 6138 trailing route
+elements, exceeding the live CTA's 128 threads times the 16-elements/thread
+limit (2048), so the optimized path retains the standalone tail fill.
+
+| Scope | Before (µs) | After (µs) |
+| --- | ---: | ---: |
+| Input staging only | 13.06 | 8.18 |
+| Compute only | 51.90 | 52.26 |
+| Full forward | 59.81 | 54.72 |
+
+Profiles on every rank show staging decreasing from seven launches to two
+(quantization/checks plus the standalone fill), and full forward from ten to
+five; compute retains three launches. Full-forward latency decreases by
+8.51%. Stage captures preserve the quantized activation, scales and routes
+bitwise; full/compute calls match the sampled oracle and graph/eager outputs.
+The three timing scopes are captured independently and must not be added or
+subtracted to infer component costs under unlocked clocks.
 
 ## What the benchmark measures
 
