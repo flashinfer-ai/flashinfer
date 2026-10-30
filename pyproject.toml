@@ -164,7 +164,7 @@ exclude = [
 # Generated sources for the experimental exact-SM100a/SM103a/SM107a ragged BF16 MoE grouped GEMM backend.
 "flashinfer.experimental.cake_moe_grouped_det_gemm" = ["csrc/**", "build.json"]
 # Generated sources for the experimental exact-SM100a/SM107a dense projection GEMM backend.
-"flashinfer.experimental.dense_projection_gemm" = ["csrc/**", "build.json"]
+"flashinfer.experimental.dense_projection_det_gemm" = ["csrc/**", "build.json"]
 # Generated sources for the experimental exact-SM100a/SM103a StepFun fused-MoE backend (cake-build/1).
 "flashinfer.experimental.cake_stepfun_moe" = ["csrc/**", "build.json"]
 # Standalone cuDNN Frost Python sources and the native MoE adapter, compiled on first use.
