@@ -5827,6 +5827,8 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             and lead to a varied number of launched CTAs.
         disable_split_kv : bool,
             Whether to disable the split-kv for determinism in CUDA Graph, defaults to ``False``.
+            Setting this or ``fixed_split_size`` keeps ``backend="auto"`` on fa2 on Blackwell,
+            since the cuDNN and CUTLASS kernels do not honor either control.
         seq_lens: Optional[torch.Tensor]
             Only used by the cudnn backend. A 1D int32 tensor with the kv sequence length
             of each prompt, shape: ``[batch_size]``. Optional: cuDNN derives it from ``kv_indptr``.
@@ -6353,7 +6355,12 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 # take the first backend whose kernel serves this problem
                 # exactly; none eligible -> stay on FA2. Explicit backends are
                 # never rewritten.
-                elif self._backend == "fa2":
+                elif (
+                    self._backend == "fa2"
+                    # fa2's batch-invariance controls have no cuDNN/CUTLASS equivalent.
+                    and fixed_split_size == -1
+                    and not disable_split_kv
+                ):
                     upgraded = _blackwell_ragged_auto_upgrade(
                         self.device,
                         self._kv_layout,

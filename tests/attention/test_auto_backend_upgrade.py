@@ -260,6 +260,9 @@ def test_auto_upgrades_on_blackwell(h_qo, h_kv, d_qk, d_vo):
         ("sliding_window", {"window_left": 256}),
         # ... and no logits_soft_cap.
         ("logits_soft_cap", {"logits_soft_cap": 30.0}),
+        # fa2's batch-invariance controls: neither upgrade honors them.
+        ("disable_split_kv", {"disable_split_kv": True}),
+        ("fixed_split_size", {"fixed_split_size": 1024}),
     ],
 )
 def test_auto_declines_when_semantics_would_be_dropped(tag, plan_kwargs):
