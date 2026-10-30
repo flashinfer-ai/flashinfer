@@ -2204,7 +2204,7 @@ kernel_cake_gdn_det_train_531e1643b16a4eb35f00(__nv_bfloat16* __restrict__ qn, _
     asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
     #pragma unroll
     for (int nb4_0 = 0; nb4_0 < 4; nb4_0++) {
-        int kcol3_0 = n0 + (0 + nb4_0) * 8 + col_q;
+        int kcol3_0 = n0 + nb4_0 * 8 + col_q;
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&pair_a[0])) : "r"(s_kn_addr + (unsigned int)(kcol3_0 / 64 * 8192 + (row_a * 128 + kcol3_0 % 64 * 2 ^ (row_a * 128 + kcol3_0 % 64 * 2 >> 7 & 7) << 4))));
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&pair_b[0])) : "r"(s_kn_addr + (unsigned int)(kcol3_0 / 64 * 8192 + (row_b * 128 + kcol3_0 % 64 * 2 ^ (row_b * 128 + kcol3_0 % 64 * 2 >> 7 & 7) << 4))));
         float k_a0_0 = __uint_as_float(pair_a[0] << 16);
@@ -2226,7 +2226,7 @@ kernel_cake_gdn_det_train_531e1643b16a4eb35f00(__nv_bfloat16* __restrict__ qn, _
     }
     #pragma unroll
     for (int nb18_0 = 0; nb18_0 < 4; nb18_0++) {
-        int ch_0 = nh * 8 + 0 + nb18_0;
+        int ch_0 = nh * 8 + nb18_0;
         unsigned int off_a_0 = (unsigned int)(lr_a * 256 + ((ch_0 ^ lr_a & 7) << 4)) + (unsigned int)(col_q * 2);
         unsigned int off_b_0 = (unsigned int)(lr_b * 256 + ((ch_0 ^ lr_b & 7) << 4)) + (unsigned int)(col_q * 2);
         unsigned int _packed_2_0[1];
@@ -2372,7 +2372,7 @@ kernel_cake_gdn_det_train_531e1643b16a4eb35f00(__nv_bfloat16* __restrict__ qn, _
         "tcgen05.ld.sync.aligned.32x32b.x32.b32"
         " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
         : "=f"(f0[0]), "=f"(f0[1]), "=f"(f0[2]), "=f"(f0[3]), "=f"(f0[4]), "=f"(f0[5]), "=f"(f0[6]), "=f"(f0[7]), "=f"(f0[8]), "=f"(f0[9]), "=f"(f0[10]), "=f"(f0[11]), "=f"(f0[12]), "=f"(f0[13]), "=f"(f0[14]), "=f"(f0[15]), "=f"(f0[16]), "=f"(f0[17]), "=f"(f0[18]), "=f"(f0[19]), "=f"(f0[20]), "=f"(f0[21]), "=f"(f0[22]), "=f"(f0[23]), "=f"(f0[24]), "=f"(f0[25]), "=f"(f0[26]), "=f"(f0[27]), "=f"(f0[28]), "=f"(f0[29]), "=f"(f0[30]), "=f"(f0[31])
-        : "r"(taddr_1 + n0 + 0));
+        : "r"(taddr_1 + n0));
     asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
     #pragma unroll
     for (int _lp = 0; _lp < 16; _lp++) {
@@ -2381,7 +2381,7 @@ kernel_cake_gdn_det_train_531e1643b16a4eb35f00(__nv_bfloat16* __restrict__ qn, _
     }
     #pragma unroll
     for (int k_0 = 0; k_0 < 4; k_0++) {
-        unsigned int off_f_0 = (unsigned int)(lr_f * 256 + ((nh * 8 + 0 + k_0 ^ lr_f & 7) << 4));
+        unsigned int off_f_0 = (unsigned int)(lr_f * 256 + ((nh * 8 + k_0 ^ lr_f & 7) << 4));
         if (mine != 0) {
             asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(own_base + off_f_0), "r"(f0p[4 * k_0]), "r"(f0p[4 * k_0 + 1]), "r"(f0p[4 * k_0 + 2]), "r"(f0p[4 * k_0 + 3]) : "memory");
         } else {
