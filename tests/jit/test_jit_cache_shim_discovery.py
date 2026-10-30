@@ -25,6 +25,7 @@ from flashinfer.jit import env as jit_env
 
 
 def test_shim_api_requires_version_and_provider_hook():
+    """Only a module with both shim attributes is accepted."""
     assert not jit_env._is_jit_cache_shim(SimpleNamespace())
     assert not jit_env._is_jit_cache_shim(
         SimpleNamespace(__version__="0.7.2.post1+cu130")
@@ -58,6 +59,7 @@ def test_provider_only_namespace_is_ignored(monkeypatch, caplog):
 
 
 def test_has_flashinfer_jit_cache_matches_shim_api():
+    """The public predicate agrees with the shim API check when a shim is installed."""
     if not jit_env.has_flashinfer_jit_cache():
         pytest.skip("no flashinfer-jit-cache shim installed")
 
