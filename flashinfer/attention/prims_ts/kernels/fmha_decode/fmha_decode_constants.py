@@ -33,6 +33,10 @@ BYTES_PER_KIB = 1024
 # metadata and scratch) must fit it; TOTAL_SMEM_BUDGET_KIB sizes the Q and
 # K/V pipelines below it.
 SMEM_CAPACITY_KIB = 227
+# SM107's opt-in shared-memory mode and exclusive TMEM allocation. Ordinary
+# allocation sizes remain powers of two through 512 columns.
+SM107_SMEM_CAPACITY_KIB = 327
+SM107_TMEM_ALLOCATION_COLUMNS = 576
 
 # The M64N256 profile stages one 256-row K or V tile per shared-ring slot. A
 # 16-bit tile is 64 KiB, so three stages, the 16-KiB Q stage, the tail
@@ -148,7 +152,10 @@ WARP_THREADS = 32
 # TMEM column layout for staged SwapsMmaAb O. A TMEM row holds 256 columns, and
 # the tcgen05 descriptor encodes a 16-row jump in the high 16 bits.
 TMEM_COLUMNS_PER_ROW = 256
-TMEM_MAX_ALLOCATION_COLUMNS = 512
+# Non-exclusive allocations use powers of two through 512 columns. This ISA
+# limit is distinct from a profile's selected allocation budget and SM107's
+# exclusive 576-column allocation.
+TMEM_MAX_NON_EXCLUSIVE_COLUMNS = 512
 TMEM_ROW_STRIDE = 16 << 16
 
 # Number of scalar softmax/output values packed in one register for the

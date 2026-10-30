@@ -5458,6 +5458,67 @@ def test_attention_ts_context_supplied_out_stream_and_cuda_graph():
     _assert_context_correct(graph_out, second)
 
 
+@pytest.mark.arch_rubin
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize(
+    ("qkv_dtype", "head_dim", "mask_type", "packed"),
+    (
+        pytest.param(torch.bfloat16, 128, "causal", False, id="bf16-d128-fixed"),
+        pytest.param(_FP8, 128, "causal", True, id="fp8-d128-packed"),
+        pytest.param(torch.bfloat16, 256, "dense", True, id="bf16-d256-packed"),
+        pytest.param(_FP8, 256, "causal", False, id="fp8-d256-fixed"),
+    ),
+)
+def test_attention_ts_context_rubin_ring_graph_replay(
+    qkv_dtype, head_dim, mask_type, packed
+):
+    # Cover oversized rings and D256's sliced K/V cadence with partial tiles.
+    # Replaying changed inputs also checks that stage reuse drains correctly.
+    def make_case(seed):
+        case = _make_context_case(
+            q_lengths=(129, 257) if packed else (257, 257),
+            k_lengths=(1023, 1537) if packed else (1537, 1537),
+            num_qo_heads=8,
+            num_kv_heads=2,
+            head_dim=head_dim,
+            qkv_dtype=qkv_dtype,
+            packed=packed,
+            mask_type=mask_type,
+            output_scale=1.0,
+            seed=seed,
+        )
+        if qkv_dtype == _FP8:
+            # Unit-scale inputs keep E4M3 output rounding above the subnormal
+            # floor, where rounding alone exceeds the relative-error bound.
+            for tensor in (case.q, case.k, case.v):
+                tensor.copy_((tensor.float() * 8).to(_FP8))
+        return case
+
+    case = make_case(2026102601)
+    wrapper = BatchPrefillTSWrapper()
+    _plan_wrapper(wrapper, case)
+    output = _run_wrapper(wrapper, case)
+    _assert_context_correct(output, case)
+    graph = _capture_context_graph(
+        wrapper,
+        case.q,
+        case.k,
+        case.v,
+        output,
+        qo_indptr=case.qo_indptr,
+        kv_indptr=case.kv_indptr,
+    )
+    updated = make_case(2026102602)
+    for original, replacement in zip(
+        (case.q, case.k, case.v), (updated.q, updated.k, updated.v), strict=True
+    ):
+        original.copy_(replacement)
+    output.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+    _assert_context_correct(output, updated)
+
+
 # Non-absorbed MLA: separate compact Q/K=192, V/O=128.
 
 

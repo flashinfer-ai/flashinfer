@@ -66,14 +66,14 @@ from ..tensor_map import (
     create_tensor_map_tiled,
     create_tensor_map_tiled_from_view,
 )
-from .fmha_decode_config import FmhaDecodeConfig
+from .fmha_decode_config import FmhaDecodeConfig, round_tmem_columns
 from .fmha_decode_constants import (
     BYTES_PER_KIB,
     KV_KIND_K,
     KV_KIND_V,
     KV_TILE_256_REGISTER_REALLOCATION_MIN_TILES,
     MAX_KV_STAGE_SMEM_KIB,
-    SMEM_CAPACITY_KIB,
+    SM107_TMEM_ALLOCATION_COLUMNS,
 )
 from .fmha_decode_resources import (
     SmemBlockSparseKvMetadataResource,
@@ -1558,7 +1558,7 @@ def _build_decode_gen_schedule(
 
     # The static profile checks bound only the Q and K/V pipelines; check the
     # complete layout against the SM100-family SMEM capacity.
-    smem_capacity_bytes = SMEM_CAPACITY_KIB * BYTES_PER_KIB
+    smem_capacity_bytes = cfg.smem_capacity_kib * BYTES_PER_KIB
     smem_allocator, clc_response_alloc = allocate_smem()
     if (
         cfg.uses_q_token_kv_block_sparse_page_membership
@@ -2369,11 +2369,6 @@ def _build_decode_gen_schedule(
     )
 
 
-def _round_up_tmem_columns(num_columns: int) -> int:
-    """tcgen05_alloc requires a power-of-two column count in [32, 512]."""
-    return max(32, 1 << (num_columns - 1).bit_length())
-
-
 def _has_unmodeled_tmem_p_alias_protocol(cfg: FmhaDecodeConfig) -> bool:
     """Whether exhaustive TS checking would report a known false P/S race.
 
@@ -2470,28 +2465,26 @@ def _deallocate_decode_tmem(
     dealloc_barrier_id = 13
     if cutlass.const_expr(cfg.use_keeps_mma_ab):
         prims.barrier_cta_sync(dealloc_barrier_id)
-        if (
-            warp_idx >= cfg.correction_warp_idx
-            and warp_idx < cfg.correction_warp_idx + cfg.correction_num_warps
-        ):
-            tidx, _, _ = cute.arch.thread_idx()
-            correction_thread_idx = tidx - cfg.correction_warp_idx * warp_size
-            if correction_thread_idx < warp_size:
-                tmem_ptr = prims.make_tmem_ptr(tmem_ptr_i32.load(), cutlass.Int8)
-                prims.tcgen05_dealloc(tmem_ptr, tmem_alloc_cols)
-    else:
-        if (
-            warp_idx >= cfg.correction_warp_idx
-            and warp_idx < cfg.correction_warp_idx + cfg.correction_num_warps
-        ):
+    if (
+        warp_idx >= cfg.correction_warp_idx
+        and warp_idx < cfg.correction_warp_idx + cfg.correction_num_warps
+    ):
+        if cutlass.const_expr(not cfg.use_keeps_mma_ab):
             prims.barrier_cta_sync(
                 dealloc_barrier_id,
                 thread_count=cfg.correction_num_warps * warp_size,
             )
-            tidx, _, _ = cute.arch.thread_idx()
-            correction_thread_idx = tidx - cfg.correction_warp_idx * warp_size
-            if correction_thread_idx < warp_size:
-                tmem_ptr = prims.make_tmem_ptr(tmem_ptr_i32.load(), cutlass.Int8)
+        tidx, _, _ = cute.arch.thread_idx()
+        correction_thread_idx = tidx - cfg.correction_warp_idx * warp_size
+        if correction_thread_idx < warp_size:
+            tmem_ptr = prims.make_tmem_ptr(tmem_ptr_i32.load(), cutlass.Int8)
+            if cutlass.const_expr(tmem_alloc_cols == SM107_TMEM_ALLOCATION_COLUMNS):
+                prims.tcgen05_dealloc(
+                    tmem_ptr,
+                    tmem_alloc_cols,
+                    is_exclusive=True,
+                )
+            else:
                 prims.tcgen05_dealloc(tmem_ptr, tmem_alloc_cols)
 
 
@@ -2752,12 +2745,15 @@ def _run_decode_gen_active(
     smem_allocator.allocate()
 
     tmem_cols = tmem_allocator.total_tmem_columns
-    tmem_alloc_cols = _round_up_tmem_columns(tmem_cols)
+    tmem_alloc_cols = round_tmem_columns(tmem_cols, cfg.max_tmem_alloc_cols)
     tmem_ptr_alloc = smem_allocator.tmem_ptr_alloc
     assert tmem_ptr_alloc is not None
     tmem_ptr_i32 = smem_allocator.get(tmem_ptr_alloc)
     if warp_idx == init_warp:
-        prims.tcgen05_alloc(tmem_ptr_i32, Int32(tmem_alloc_cols))
+        if cutlass.const_expr(tmem_alloc_cols == SM107_TMEM_ALLOCATION_COLUMNS):
+            prims.tcgen05_alloc(tmem_ptr_i32, Int32(tmem_alloc_cols), is_exclusive=True)
+        else:
+            prims.tcgen05_alloc(tmem_ptr_i32, Int32(tmem_alloc_cols))
         prims.tcgen05_relinquish_alloc_permit()
     init_warp += 1
 

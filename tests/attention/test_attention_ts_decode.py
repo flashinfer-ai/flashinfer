@@ -631,6 +631,7 @@ def _fp8_decode_reference(
     num_insts_kv: int = _FP8_NUM_KV_INSTANCES,
     q_tokens_per_cta: int = 1,
     probability_scale: float = _FP8_PROBABILITY_SCALE,
+    tile_size_kv: int = _FP8_KV_TILE_SIZE,
 ) -> torch.Tensor:
     """Model the kernel's FP8-P operand and split/instance stream merge."""
 
@@ -727,10 +728,8 @@ def _fp8_decode_reference(
                 mask_type=mask_type,
                 window_left=window_left,
             )
-            first_token = group_begin // _FP8_KV_TILE_SIZE * _FP8_KV_TILE_SIZE
-            num_tiles = (
-                group_end - first_token + _FP8_KV_TILE_SIZE - 1
-            ) // _FP8_KV_TILE_SIZE
+            first_token = group_begin // tile_size_kv * tile_size_kv
+            num_tiles = (group_end - first_token + tile_size_kv - 1) // tile_size_kv
             scores = torch.einsum("hd,thd->ht", request_queries[query_idx], keys)
             tiles_per_group = splits_kv * num_insts_kv
             groups_per_split = (num_tiles + tiles_per_group - 1) // tiles_per_group
@@ -777,9 +776,9 @@ def _fp8_decode_reference(
 
             for stream_idx, tile_indices in enumerate(stream_tiles):
                 for tile_idx in tile_indices:
-                    tile_start = first_token + tile_idx * _FP8_KV_TILE_SIZE
+                    tile_start = first_token + tile_idx * tile_size_kv
                     tile_begin = max(tile_start, visible_begin)
-                    tile_end = min(tile_start + _FP8_KV_TILE_SIZE, visible_end)
+                    tile_end = min(tile_start + tile_size_kv, visible_end)
                     if tile_end <= tile_begin:
                         continue
                     tile_scores = scores[:, tile_begin:tile_end]
@@ -1605,6 +1604,7 @@ def _plan_case(
     qo_indptr: Optional[torch.Tensor] = None,
     max_seq_len_q: Optional[int] = None,
     dynamic_kv: bool = False,
+    split_kv: bool = True,
 ):
     wrapper = BatchDecodePagedTSWrapper(kv_layout="HND")
     seq_len_q = 1 if case.q.ndim == 3 else int(case.q.shape[1])
@@ -1630,6 +1630,7 @@ def _plan_case(
         mask_type=case.mask_type,
         window_left=case.window_left,
         seq_lens=None if dynamic_kv else seq_lens.cpu(),
+        split_kv=split_kv,
     )
     return wrapper
 
@@ -1707,6 +1708,7 @@ def _run_standalone(
     page_size: Optional[int] = None,
     storage_page_size: Optional[int] = None,
     validate: bool = True,
+    split_kv: bool = True,
 ):
     """Run the caller-workspace public entry point for wrapper parity."""
 
@@ -1732,6 +1734,7 @@ def _run_standalone(
             kv_layout="HND",
             storage_page_size=storage_page_size,
             device=case.q.device,
+            split_kv=split_kv,
         )
         workspace = torch.zeros(workspace_size, dtype=torch.int8, device=case.q.device)
     else:
@@ -1758,6 +1761,7 @@ def _run_standalone(
         kv_layout="HND",
         page_size=page_size,
         validate=validate,
+        split_kv=split_kv,
     )
     assert result is output
     return output
@@ -1805,6 +1809,7 @@ def _exercise_public_paths(
     exercise_all_paths: bool,
     qo_indptr: Optional[torch.Tensor] = None,
     max_seq_len_q: Optional[int] = None,
+    split_kv: bool = True,
 ):
     """Always check eager; reserve standalone/graph parity for anchor rows."""
 
@@ -1815,6 +1820,7 @@ def _exercise_public_paths(
             qo_indptr=qo_indptr,
             splits_kv=int(policy["splits_kv"]),
             num_insts_kv=int(policy["num_insts_kv"]),
+            tile_size_kv=int(policy["tile_size_kv"]),
             q_tokens_per_cta=(
                 int(policy["tile_size_q"])
                 // (case.q.shape[-2] // case.k_cache.shape[1])
@@ -1841,6 +1847,7 @@ def _exercise_public_paths(
         max_kv_len=max_kv_len,
         qo_indptr=qo_indptr,
         max_seq_len_q=max_seq_len_q,
+        split_kv=split_kv,
     )
     _assert_case_correct(standalone, case)
     torch.testing.assert_close(standalone, eager, rtol=0, atol=0)
@@ -1901,6 +1908,7 @@ def _with_reference(
     splits_kv: int = 1,
     num_insts_kv: int = _FP8_NUM_KV_INSTANCES,
     q_tokens_per_cta: int = 1,
+    tile_size_kv: int = _FP8_KV_TILE_SIZE,
 ):
     """Return a case whose oracle reflects its current mutable Q/K/V data."""
 
@@ -1923,6 +1931,7 @@ def _with_reference(
             splits_kv=splits_kv,
             num_insts_kv=num_insts_kv,
             q_tokens_per_cta=q_tokens_per_cta,
+            tile_size_kv=tile_size_kv,
         )
     else:
         reference = _decode_reference(
@@ -1970,6 +1979,7 @@ def _exercise_auto_case(
     max_seq_len_q: Optional[int] = None,
     exercise_all_paths: bool = False,
     dynamic_kv: bool = False,
+    split_kv: bool = True,
 ) -> dict[str, object]:
     """Plan automatically and validate one eager public-interface launch."""
 
@@ -1986,6 +1996,7 @@ def _exercise_auto_case(
         qo_indptr=qo_indptr,
         max_seq_len_q=max_seq_len_q,
         dynamic_kv=dynamic_kv,
+        split_kv=split_kv,
     )
     policy = dict(wrapper._policy)
     _assert_auto_policy(policy, {}, device=case.q.device)
@@ -1995,29 +2006,45 @@ def _exercise_auto_case(
         seq_lens,
         max_kv_len=max_kv_len,
         exercise_all_paths=exercise_all_paths,
+        split_kv=split_kv,
         qo_indptr=qo_indptr,
         max_seq_len_q=max_seq_len_q,
     )
     return policy
 
 
-def _exercise_explicit_profile_case(
+def exercise_explicit_decode_profile(
     monkeypatch: pytest.MonkeyPatch,
     case: _DecodeCase,
-    explicit_profile: dict[str, object],
+    explicit_profile: dict[str, object] | None = None,
     *,
     qo_indptr: Optional[torch.Tensor] = None,
     max_seq_len_q: Optional[int] = None,
+    config_args: dict[str, object] | None = None,
     exercise_all_paths: bool = False,
+    split_kv: bool = True,
 ) -> dict[str, object]:
-    """Run a public path with ``explicit_profile`` pinned over automatic selection."""
+    """Check numerical output with an explicit generator profile."""
 
     from flashinfer.attention.prims_ts import decode as decode_module
     from flashinfer.attention.prims_ts.kernels.fmha_decode import fmha_decode_config
 
     original_make_decode_config = fmha_decode_config.make_decode_config
 
-    def _make_explicit_config(*args, **kwargs):
+    explicit_profile = (
+        dict(explicit_profile)
+        if explicit_profile is not None
+        else {
+            "use_keeps_mma_ab": True,
+            "tile_size_q": 64,
+            "tile_size_kv": 256,
+            "groups_tokens_heads_q": True,
+        }
+    )
+    if config_args is not None:
+        explicit_profile.update(config_args)
+
+    def make_explicit_config(*args, **kwargs):
         source = kwargs.get("args")
         kwargs["args"] = (
             explicit_profile if source is None else (source, explicit_profile)
@@ -2027,7 +2054,7 @@ def _exercise_explicit_profile_case(
     monkeypatch.setattr(
         fmha_decode_config,
         "make_decode_config",
-        _make_explicit_config,
+        make_explicit_config,
     )
     decode_module._resolve_decode_launch_spec.cache_clear()
     decode_module._get_compiled_decode.cache_clear()
@@ -2037,31 +2064,11 @@ def _exercise_explicit_profile_case(
             qo_indptr=qo_indptr,
             max_seq_len_q=max_seq_len_q,
             exercise_all_paths=exercise_all_paths,
+            split_kv=split_kv,
         )
     finally:
         decode_module._resolve_decode_launch_spec.cache_clear()
         decode_module._get_compiled_decode.cache_clear()
-
-
-def _exercise_explicit_kv256_case(
-    monkeypatch: pytest.MonkeyPatch,
-    case: _DecodeCase,
-    *,
-    exercise_all_paths: bool = False,
-) -> dict[str, object]:
-    """Run a public path with the qualified logical KV256 profile pinned."""
-
-    return _exercise_explicit_profile_case(
-        monkeypatch,
-        case,
-        {
-            "use_keeps_mma_ab": True,
-            "tile_size_q": 64,
-            "tile_size_kv": 256,
-            "groups_tokens_heads_q": True,
-        },
-        exercise_all_paths=exercise_all_paths,
-    )
 
 
 @torch.no_grad()
@@ -3983,7 +3990,7 @@ def test_attention_ts_decode_streamed_p_fragments_follow_kv_tile(
 
 
 def test_attention_ts_decode_arch_config_args_follow_softmax_hardware() -> None:
-    """SM103 keeps exponentials on MUFU and takes score maxima from LDTM.STAT.
+    """SM103 and SM107 keep exponentials on MUFU when configured by device.
 
     SM103 doubles the MUFU ex2 rate, so FMA polynomials only add
     instructions there, and its TMEM loads can return the fragment maximum.
@@ -3995,6 +4002,12 @@ def test_attention_ts_decode_arch_config_args_follow_softmax_hardware() -> None:
     assert arch_args((10, 3)) == {
         "ex2_emulated_pairs": 0,
         "uses_ldtm_stat": tcgen05_compat.dsl_supports_ldtm_stat(),
+    }
+    assert arch_args((10, 7)) == {
+        "ex2_emulated_pairs": 0,
+        "uses_ldtm_stat": tcgen05_compat.ldtm_stat_supported((10, 7)),
+        "max_tmem_alloc_cols": 576,
+        "smem_capacity_kib": 327,
     }
     cfg = _make_contiguous_kv256_config(persistent=False)
     assert cfg.ex2_emulated_pairs == 6 and not cfg.uses_ldtm_stat
@@ -8145,7 +8158,7 @@ def test_attention_ts_decode_q64_kv256_split_launch(
         seed=20260805,
     )
 
-    policy = _exercise_explicit_kv256_case(monkeypatch, case)
+    policy = exercise_explicit_decode_profile(monkeypatch, case)
 
     assert policy["tile_size_kv"] == 256
     assert policy["use_split_kv"] is True
@@ -8227,7 +8240,7 @@ def test_attention_ts_decode_q64_kv256_boundaries(
         seed=20260804 + max(kv_lens),
     )
 
-    policy = _exercise_explicit_kv256_case(monkeypatch, case)
+    policy = exercise_explicit_decode_profile(monkeypatch, case)
 
     assert policy["tile_size_q"] == 64
     assert policy["tile_size_kv"] == 256
@@ -8321,7 +8334,7 @@ def test_attention_ts_decode_explicit_16bit_paged_keeps_q128(
     if q_lens is not None:
         case, qo_indptr = _pack_decode_case(case, q_lens)
 
-    policy = _exercise_explicit_profile_case(
+    policy = exercise_explicit_decode_profile(
         monkeypatch,
         case,
         _EXPLICIT_PAGED_16BIT_Q128_PROFILE,
@@ -8366,6 +8379,66 @@ def test_attention_ts_decode_16bit_paged_keeps_q128_automatic_scope(
     assert automatic.use_keeps_mma_ab
     assert automatic.tile_size_q == 128
     assert automatic.groups_tokens_heads_q
+
+
+@_REQUIRES_PRIMTS_GPU
+@pytest.mark.parametrize(
+    ("head_dim", "seq_len_q", "tile_size_q", "tile_size_kv", "q_stages"),
+    (
+        (128, 1, 16, 128, None),
+        (256, 1, 16, 128, None),
+        (128, 4, 64, 128, None),
+        (128, 8, 128, 128, None),
+        (256, 4, 64, 128, None),
+        (256, 8, 128, 128, None),
+        (128, 4, 64, 256, None),
+        (128, 4, 64, 128, 3),
+    ),
+)
+def test_attention_ts_decode_sm107_expanded_resources(
+    monkeypatch: pytest.MonkeyPatch,
+    head_dim: int,
+    seq_len_q: int,
+    tile_size_q: int,
+    tile_size_kv: int,
+    q_stages: int | None,
+):
+    """Check exclusive TMEM and deeper FP8 rings across ragged KV tails."""
+
+    if torch.cuda.get_device_capability() != (10, 7):
+        pytest.skip("Expanded resource profiles require SM107")
+    if not tcgen05_compat.dsl_supports_exclusive_tmem():
+        pytest.skip("Expanded resource profiles require native DSL support")
+
+    case = _make_decode_case(
+        kv_lens=(3073, 2637),
+        num_qo_heads=64,
+        num_kv_heads=4,
+        head_dim=head_dim,
+        seq_len_q=seq_len_q,
+        page_size=32,
+        qkv_dtype=_FP8,
+        output_dtype=_FP8,
+        cache_form="tuple",
+        mask_type="causal",
+        device="cuda",
+        seed=20261025,
+    )
+    config_args = {
+        **fmha_decode_config.arch_config_args(torch.cuda.get_device_capability()),
+        "use_keeps_mma_ab": tile_size_q >= 64,
+        "tile_size_q": tile_size_q,
+        "tile_size_kv": tile_size_kv,
+    }
+    if q_stages is not None:
+        config_args["q_stages"] = q_stages
+    exercise_explicit_decode_profile(
+        monkeypatch,
+        case,
+        config_args=config_args,
+        exercise_all_paths=True,
+        split_kv=False,
+    )
 
 
 @_REQUIRES_PRIMTS_GPU

@@ -16,6 +16,7 @@
 
 import functools
 import importlib.metadata
+import inspect
 
 import cutlass
 import cutlass.cute as cute
@@ -23,6 +24,15 @@ from cutlass import Float32, Int32
 from cutlass._mlir.dialects import arith as arith_dialect
 from cutlass.cutlass_dsl import dsl_user_op
 from cutlass.experimental import primitives as prims
+
+
+@functools.cache
+def dsl_supports_exclusive_tmem() -> bool:
+    """Both ends of Rubin's exclusive allocation contract must be available."""
+    return all(
+        "is_exclusive" in inspect.signature(operation).parameters
+        for operation in (prims.tcgen05_alloc, prims.tcgen05_dealloc)
+    )
 
 
 def _ld_32x32b_max_ptx(num: int) -> str:

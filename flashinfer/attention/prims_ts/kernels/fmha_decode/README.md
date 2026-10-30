@@ -150,7 +150,9 @@ supported. Rows may have padding between them; each row must be contiguous.
 
 | Feature | Support |
 | --- | --- |
-| GPU | SM100a/B200 (qualified); SM103a/B300 (architecture-gated, not yet signoff-qualified) |
+| GPU: SM100a/B200 | Qualified |
+| GPU: SM103a/B300 | Architecture-gated, not yet signoff-qualified |
+| GPU: SM107a/Rubin | Qualified for FP8 E4M3 Q/K/V/output, D128/D256 and Q1/Q4/Q8 on CUDA 13.4 with native DSL 4.8; other combinations are not fully qualified |
 | Head dimension | 64, 128, 192, or 256 |
 | Fixed Q length | Any positive integer representable by the metadata and tensor extents |
 | Packed Q | Positive per-request lengths no greater than a positive static maximum |
@@ -173,8 +175,9 @@ Prepared launches also accept BF16 output buffers. Both 16-bit output types
 share split/reduction eligibility, including cluster SMEM reduction and the
 standalone reducer; the existing shape and layout restrictions still apply.
 
-Current accuracy and performance signoff is on SM100a/B200. SM103a/B300 is
-admitted by the runtime architecture guard but remains to be qualified.
+Current accuracy and performance signoff covers SM100a/B200 and the SM107a/Rubin
+FP8 subset listed above. SM103a/B300 is admitted by the runtime architecture
+guard but remains to be qualified.
 
 The public paths require compact, 16-byte-aligned Q and output storage. Native
 K/V views have logical HND shape with unit head-dimension stride and positive,
@@ -252,6 +255,39 @@ evaluates three eighths of each fragment's exponentials (a quarter on KV256
 tiles) as FMA polynomials to offload MUFU. SM103, with twice the MUFU ex2 rate,
 keeps every exponential on MUFU, and its unmasked max pass takes fragment maxima
 (or Sage scale-group maxima) from LDTM.STAT instead of a register reduction.
+
+SM107 uses native EX2 and automatically selects its 576-column TMEM and
+327-KiB SMEM budgets through `arch_config_args(compute_capability)`, requiring
+CUDA 13.4 with native DSL 4.8 support. Explicit `max_tmem_alloc_cols` /
+`smem_capacity_kib` overrides remain tuning budgets, distinct from the
+512-column non-exclusive TMEM allocation limit. Lower 512-column/227-KiB
+budgets remain available for tuning ordinary placement, where larger profiles
+can be slower. Direct generator callers must select budgets for their compilation
+target; the expanded budgets require SM107. Memory placement is not a
+configuration or dispatch input.
+
+For homogeneous FP8 Q/K/V/output, SM107 selects the following long-KV,
+nonsplit pipeline defaults. KV depth counts raw K/V slots in total;
+staged one-instance Keeps uses eight slots per operand for depth sixteen.
+These paired defaults apply when both depths are unspecified. Setting either
+Q or KV depth retains the existing manual-profile inference for the other.
+
+| Physical kernel layout | Q depth | KV depth |
+| --- | ---: | ---: |
+| Small-Q Swaps, KV128 | 1 | 18 |
+| Staged one-instance Keeps, KV128 | 1 | 16 |
+| Q64 Keeps, KV128, exclusive TMEM | 1 | 18 |
+| Q64 Keeps, KV128, ordinary TMEM | 1 | 12 |
+| Q128 Keeps, KV128, exclusive TMEM | 2 | 12 |
+| Q128 Keeps, KV128, streamed TMEM-P | 2 | 8 |
+| Q64 Keeps, KV256 | 1 | 8 |
+
+The full-score Q128 profile uses additional Q overlap instead of maximizing
+KV depth. Exclusive TMEM allocation and release use matching qualifiers;
+Sage, sparse and split-KV profiles retain their existing defaults and required
+TMEM-P layouts. The builder checks the complete SMEM allocation. Each chosen
+resource/pipeline configuration has its own compiled specialization; batch
+remains a runtime input.
 
 Eligible nonsplit work that exceeds one resident SM wave uses CLC-persistent
 scheduling. A scheduler warp discovers each schedule token once and broadcasts it to

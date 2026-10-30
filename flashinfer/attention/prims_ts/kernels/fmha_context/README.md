@@ -77,6 +77,16 @@ on SM100a/B200. The 192/128 extension has been validated on SM103/GB300;
 its B200 performance remains to be measured. SM107 accuracy and performance
 have not been validated for this extension.
 
+On SM107 with native CUTLASS DSL 4.8 and CUDA 13.4, contiguous query-paired
+BF16 or E4M3 attention with matching output dtype and D128/D256 uses tuned
+K/V ring depths. `sm107_context_kv_stages` selects physical slots shared by
+K and V, including head-dimension slices; `context_smem_capacity_kib` supplies
+the target limit independently. Oversized SMEM is enabled by the native launch
+path when needed. Other layouts and the DSL 4.7 compatibility target retain
+the SM100 capacity-derived policy. Rubin qualification covers fixed and ragged
+numerics with graph replay; performance measurements cover fixed dense and
+causal prefill.
+
 A positive left window requires GQA with an even `Hq/Hkv` ratio greater than
 one. Causal attention requires `Sq <= Sk` for every active request at run time.
 Paged sliding-window loads ignore K/V pages wholly before the earliest visible

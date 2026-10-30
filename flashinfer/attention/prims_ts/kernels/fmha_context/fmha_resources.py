@@ -375,6 +375,9 @@ class FmhaConfig:
     num_qkv_instances: int = 2
 
     # Pipeline stages
+    # Target SMEM limit, not a request to fill it. Expanded budgets require
+    # native SM107 support; direct generator callers must select their target.
+    smem_capacity_kib: int = 227
     q_stage: int = 2
     kv_stage: int = 3
     # Hand the S0/S1 pacing token back before the exp2/P work on the fp8 P-in-SMEM path
