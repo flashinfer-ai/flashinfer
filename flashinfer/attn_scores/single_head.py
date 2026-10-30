@@ -234,6 +234,12 @@ def single_head_paged_mqa_threshold_select(
         raise ValueError(
             f"counters must be [rows, {COUNTERS}] and candidates [rows, slots, 2]"
         )
+    int32 = (row_ends, tile_requests, block_table, counters, candidates)
+    if any(t.dtype != torch.int32 for t in int32) or thresholds.dtype != torch.float32:
+        raise ValueError(
+            "row_ends, tile_requests, block_table, counters and candidates must be "
+            "int32, and thresholds float32"
+        )
     if max_context > PAGE * width:
         raise ValueError("The block table must cover the context capacity")
     if not 0 <= top_k < candidates.shape[1]:
