@@ -141,6 +141,12 @@ def make_weight_packs(torch, args, rank, world, device, nv_pack, mx_pack):
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--tokens", type=int, nargs="+", default=TOKENS)
+    parser.add_argument(
+        "--capacity",
+        type=int,
+        help="Layer capacity in tokens per rank (default: each --tokens value); "
+        "a larger capacity measures a partly filled layer",
+    )
     parser.add_argument("--hidden", type=int, default=7168)
     parser.add_argument("--intermediate", type=int, default=3072)
     parser.add_argument("--experts", type=int, default=384)
@@ -161,7 +167,12 @@ def parse_args():
     parser.add_argument("--nv-knobs-json", type=Path)
     parser.add_argument("--nv-reference-knobs-json", type=Path)
     parser.add_argument("--mx-knobs-json", type=Path)
-    parser.add_argument("--mx-compact", action="store_true")
+    parser.add_argument(
+        "--mx-compact",
+        action="store_true",
+        help="Force the MXFP4 compact pull buffer (default: the configuration's "
+        "default, which follows the MXFP4 tactic)",
+    )
     parser.add_argument(
         "--output", type=Path, default=Path("sm90_nvfp4_benchmark.json")
     )
@@ -170,6 +181,8 @@ def parse_args():
         parser.error("token counts, rounds, warmup and iters must be positive")
     if min(args.padding_us, args.cooldown_seconds) < 0:
         parser.error("padding and cooldown must be non-negative")
+    if args.capacity is not None and args.capacity < max(args.tokens):
+        parser.error("--capacity must be at least every --tokens value")
     return args
 
 
@@ -465,10 +478,10 @@ def main():
                             )
                         transformed, pack = prepared_nv[config.nvfp4_kperm], packs["nv"]
                     else:
-                        config = MXConfig(
-                            **common,
-                            **{"compact_pull_buffer": args.mx_compact, **override},
+                        forced = (
+                            {"compact_pull_buffer": True} if args.mx_compact else {}
                         )
+                        config = MXConfig(**common, **{**forced, **override})
                         transformed, pack = prepared_mx, packs["mx"]
                     layer = MoEEpLayer(
                         bootstrap=BootstrapConfig(
@@ -476,7 +489,7 @@ def main():
                         ),
                         fleet_params=FleetParams(
                             num_experts=args.experts,
-                            max_tokens_per_rank=tokens,
+                            max_tokens_per_rank=args.capacity or tokens,
                             token_hidden_size=args.hidden,
                             tuning_live_tokens=tokens,
                         ),
@@ -538,7 +551,11 @@ def main():
                         )
                     configurations[name] = configuration
                 rounds = []
-                bucket = {"rounds": rounds, "configuration": configurations}
+                bucket = {
+                    "rounds": rounds,
+                    "configuration": configurations,
+                    "capacity": args.capacity or tokens,
+                }
                 results["buckets"][str(tokens)] = bucket
                 for round_index in range(args.rounds):
                     order = [name for name, _ in cases]
