@@ -153,12 +153,16 @@ def _get_sm100_kernel(
     from .kernels.cute_dsl.w8a16_fp8_gemm_sm100 import Sm100W8A16Fp8GemmKernel
 
     mma_tiler, two_sm, cluster, a_in_smem = _SM100_TILES[algo]
+    # Bytes of weight each transform thread converts per step: a whole stage when K
+    # is one k-tile (no pipelining to overlap), 32 otherwise (as the W4A16 kernel).
+    transform_fragment_size = 128 if k == mma_tiler[2] else 32
     key = (
         algo,
         act_dtype,
         has_bias,
         swizzle_size,
         raster_along_m,
+        transform_fragment_size,
         max_active_clusters,
         enable_pdl,
     )
@@ -173,7 +177,7 @@ def _get_sm100_kernel(
         has_bias=has_bias,
         swizzle_size=swizzle_size,
         raster_along_m=raster_along_m,
-        transform_fragment_size=32,
+        transform_fragment_size=transform_fragment_size,
         enable_pdl=enable_pdl,
     )
     compiled = cute.compile(
