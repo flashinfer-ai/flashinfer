@@ -2401,6 +2401,9 @@ class _FP8PagedMQASelectiveTopKEngine:
         self._candidate_counts: torch.Tensor | None = None
         self._candidate_lengths: torch.Tensor | None = None
         self._repair_flags: torch.Tensor | None = None
+        self._repair_needed_device: torch.Tensor | None = None
+        self._repair_needed_host: torch.Tensor | None = None
+        self._repair_ready: torch.cuda.Event | None = None
         self._row_ends: torch.Tensor | None = None
         self._repair_starts: torch.Tensor | None = None
         self._repair_ends: torch.Tensor | None = None
@@ -2861,6 +2864,11 @@ class _FP8PagedMQASelectiveTopKEngine:
             self._rows, dtype=torch.int32, device=device
         )
         self._repair_flags = torch.zeros_like(self._candidate_lengths)
+        self._repair_needed_device = torch.empty((), dtype=torch.bool, device=device)
+        self._repair_needed_host = torch.empty((), dtype=torch.bool, pin_memory=True)
+        self._repair_ready = torch.cuda.Event()
+        # Materialize the event outside capture, with the rest of layer storage.
+        self._repair_ready.record(torch.cuda.current_stream(device))
         self._repair_thresholds = torch.empty_like(self._thresholds)
         self._repair_counts = torch.empty(
             (self._padded_rows, 1), dtype=torch.int32, device=device
@@ -3777,9 +3785,24 @@ class _FP8PagedMQASelectiveTopKEngine:
         weights: torch.Tensor,
         block_table: torch.Tensor,
     ) -> torch.Tensor:
-        """Capture both repair stages under one device-controlled IF."""
+        """Skip eager repair on the host; capture it under one device IF."""
         module = self._repair_if_module
-        if module is None or not torch.cuda.is_current_stream_capturing():
+        if not torch.cuda.is_current_stream_capturing():
+            assert self._repair_needed_device is not None
+            assert self._repair_needed_host is not None
+            assert self._repair_ready is not None
+            assert self._repair_flags is not None
+            torch.any(self._repair_flags, out=self._repair_needed_device)
+            self._repair_needed_host.copy_(
+                self._repair_needed_device, non_blocking=True
+            )
+            self._repair_ready.record(torch.cuda.current_stream(q.device))
+            self._repair_ready.synchronize()
+            if not bool(self._repair_needed_host):
+                assert self._selected is not None
+                return self._selected
+            return self._run_repair(q, kv_fused, weights, block_table)
+        if module is None:
             return self._run_repair(q, kv_fused, weights, block_table)
         assert self._repair_body_stream is not None
         assert self._repair_flags is not None
@@ -3834,9 +3857,9 @@ class _FP8PagedMQASelectiveTopKEngine:
         """Enqueue the complete selective path and return stable TopK indices.
 
         Sampling, thresholding, candidate publication/finalization, TopK, and
-        device-flagged exact repair all execute on the caller's current CUDA
-        stream. No public phase selection or host data-dependent branch is
-        involved.
+        exact repair execute on the caller's current CUDA stream. Eager runs
+        synchronize one repair-needed flag to the host and skip an empty repair
+        sequence. Caller capture records the device-controlled repair IF.
 
         Args:
             q: Query tensor matching the storage and layout supplied to
@@ -4512,7 +4535,9 @@ class FP8PagedMQATopKWrapper(_PublicWrapper):
         uint8 pool with the planned shape, strides, dtype and device, including
         page count. R must equal plan's supplied row extent. The final
         device query prefix may be below R; inactive/short-row suffixes are -1.
-        There is no host prefix-value read or synchronization on prepared pools.
+        There is no host prefix-value read. Eager selective runs synchronize
+        one repair-needed flag to the host and enqueue repair only when needed;
+        caller capture keeps repair device-controlled without a host read.
         Inputs stage into stable buffers; matching ``input_buffers()`` views
         skip copying. Optional out is contiguous int32[R,K], on the same device,
         and cannot overlap inputs or other plan storage. The returned tensor is

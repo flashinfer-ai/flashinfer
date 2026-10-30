@@ -7916,11 +7916,21 @@ def _case():
 
 
 @_requires_selective_sm100
-def test_owned_body_stream_survives_pool_wrap_replan_and_multiple_wrappers():
+def test_owned_body_stream_survives_pool_wrap_replan_and_multiple_wrappers(monkeypatch):
     inputs, fused, table = _case()
     q, _, _, weights, cu_q, cu_kv = inputs
     pooled = [torch.cuda.Stream(device=q.device) for _ in range(96)]
     wrappers = [SelectiveEngineCase() for _ in range(2)]
+    repair_calls = []
+    original_repair = sl._FP8PagedMQASelectiveTopKEngine._run_repair
+
+    def record_repair(engine, *args):
+        repair_calls.append(torch.cuda.is_current_stream_capturing())
+        return original_repair(engine, *args)
+
+    monkeypatch.setattr(
+        sl._FP8PagedMQASelectiveTopKEngine, "_run_repair", record_repair
+    )
     handles = []
     for length in (1024, 8192, 1024):
         cu_kv[-1] = length
@@ -7933,9 +7943,13 @@ def test_owned_body_stream_survives_pool_wrap_replan_and_multiple_wrappers():
             if length == 1024 and len(handles) < 2:
                 handles.append(body.cuda_stream)
             assert body.cuda_stream == handles[wrapper_index]
+            before = len(repair_calls)
             _check_selection(
                 wrapper.run(q, fused, weights, table), _oracle_rows(inputs), 512
             )
+            # No eager repair kernel is enqueued for the zero-repair steps,
+            # including the short step following a forced exact repair.
+            assert repair_calls[before:] == ([False] if length == 8192 else [])
             assert bool(wrapper._repair_flags.any()) == (length == 8192)
             for parent in (pooled[0], pooled[-1]):
                 graph = torch.cuda.CUDAGraph()

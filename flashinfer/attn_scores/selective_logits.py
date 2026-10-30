@@ -219,6 +219,9 @@ class FP8PagedMQATopKWrapper:
         an earlier eager run or explicit ``prepare_pool`` for the binding.
         Full requires an unhinted active plan when recording ``run`` inside
         caller capture; a ``host_length_hints`` plan is eager-only.
+        Selective eager execution synchronizes one repair-needed flag to the
+        host to skip empty repair. Caller capture uses a device conditional
+        repair node without a host read.
         """
         return _backend_call(self, "run", q, weights, kv_fused, out=out)
 
