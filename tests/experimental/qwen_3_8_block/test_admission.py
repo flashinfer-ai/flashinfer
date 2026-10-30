@@ -558,10 +558,10 @@ def test_probe_verdict_matches_the_vendored_declaration(over, q_len, page, serve
     from flashinfer.qwen_3_8_block import qwen_3_8_block_support
 
     g = _geometry(**over)
-    # the light gate of prepare (what runs before any vendored code)
+    # the light gate of prepare (what runs before any vendored code; the declaration below is made at batch 2)
     light_ok, why = True, None
     try:
-        impl._light_decode_gates(g, page, q_len, None, None)
+        impl._light_decode_gates(g, page, q_len, None, None, batch_size=2)
     except NotImplementedError as exc:
         light_ok, why = False, str(exc)
     # the vendored declaration on host tensors (outside the mocks: the vendored device probe short-circuits on a CPU host); the typed
@@ -695,21 +695,16 @@ def test_every_errors_table_key_is_a_decline_row_and_the_texts_are_the_envelope_
             token in sup.extend.declines[key]
             and sup.extend.declines[key] == env.declines[key]
         ), key
-    # the extend / prefill records = the decode table + ONE FlashInfer-side row: the launch-grid bound of one run at this pin
-    # (`indexer_extend_grid_rows`: 65,535 rows -- the vendored indexer's query compress launches with the run's row count as a CUDA
-    # grid dimension; not an envelope row, so not among DECLINE_KEYS, which the tripwire reads off the envelope); the previous pin's
-    # projection bound (`extend_proj_slab_rows` -- the band slab rides the JIT route at every row count) stays retired with its vocabulary
+    # ONE decline table for the three forms: the vendored rows + the FlashInfer-side launch-grid row of one run at this pin on EVERY
+    # record (`indexer_extend_grid_rows`: 65,535 rows -- the vendored indexer's query compress of the decode AND the extend step launches
+    # with the run's row count as a CUDA grid dimension; not an envelope row, so not among DECLINE_KEYS, which the tripwire reads off the
+    # envelope); the previous pin's projection bound (`extend_proj_slab_rows` -- the band slab rides the JIT route at every row count)
+    # stays retired with its vocabulary
     grid = support.EXTEND_GRID_ROWS_KEY
     assert grid == "indexer_extend_grid_rows" and grid not in support.DECLINE_KEYS
-    assert sup.extend.declines == sup.prefill.declines
-    assert (
-        grid in sup.extend.declines
-        and grid not in sup.decode.declines
-        and grid not in env.declines
-    )
-    assert {
-        k: v for k, v in sup.extend.declines.items() if k != grid
-    } == sup.decode.declines
+    assert sup.extend.declines == sup.prefill.declines == sup.decode.declines
+    assert grid in sup.decode.declines and grid not in env.declines
+    assert set(sup.decode.declines) == set(env.declines) | {grid}
     assert (
         sup.extend.declines[grid] == support.extend_rows_grid_text()
         and "65535" in sup.extend.declines[grid]
@@ -737,6 +732,46 @@ def test_every_errors_table_key_is_a_decline_row_and_the_texts_are_the_envelope_
         "N=7296" in shard.reason
         and "204-SM" in shard.reason
         and "small-M projection route" in shard.reason
+    )
+
+
+def test_decode_light_gate_declines_past_the_launch_grid_bound_the_vendored_declaration_admits():
+    """The decode grid cell of the launch-grid bound: batch 4096 x ``q_len`` 16 = 65,536 rows in ONE decode run -- the DECODE step's query
+    compress shares the extend step's launch (the run's row count as a CUDA grid dimension) -- is the light gate's typed decline
+    (``qwen_3_8_block (decode): ...`` naming the bound, the rows and the remedy), while the vendored declaration on host tensors admits the
+    shape (the bound is this entry's, not the tree's); 4095 x 16 passes the gate; the probe (capability mocked to Rubin) carries the row on
+    the decode record too, with the same text as the extend / prefill records."""
+    pytest.importorskip("cutlass")
+    from flashinfer.experimental.qwen_3_8_block import api as impl
+    from flashinfer.experimental.qwen_3_8_block import support
+    from flashinfer.qwen_3_8_block import qwen_3_8_block_support
+
+    g = _geometry()
+    impl._light_decode_gates(g, 16, 16, None, None, "auto", batch_size=4095)
+    with pytest.raises(NotImplementedError, match="65535") as info:
+        impl._light_decode_gates(g, 16, 16, None, None, "auto", batch_size=4096)
+    msg = str(info.value)
+    assert msg.startswith("qwen_3_8_block (decode):"), msg
+    assert (
+        "= 65536 rows" in msg
+        and "several decode steps" in msg
+        and "smaller batch" in msg
+    ), msg
+    blk = _declare(g, 16, 16, batch=4096)
+    blk._check_declaration()
+    assert not blk.indexer_extend and blk.index_select_form_resolved == "decode"
+    with _rubin():
+        sup = qwen_3_8_block_support(torch.device("cuda", 0), g)
+    if not sup.cutedsl_ok:
+        pytest.skip(
+            f"the installed CuTe DSL does not serve the block: {support.cutedsl_reason()}"
+        )
+    grid = support.EXTEND_GRID_ROWS_KEY
+    assert sup.served and grid in sup.decode.declines
+    assert (
+        sup.decode.declines[grid]
+        == sup.extend.declines[grid]
+        == support.extend_rows_grid_text()
     )
 
 
@@ -843,6 +878,18 @@ def test_declined_geometry_is_typed_before_any_vendored_code(monkeypatch):
             **common,
             **case.plan_args(),
         )
+    # the decode form past the launch-grid bound of one run (batch 4096 x q_len 16 = 65,536 rows): typed, named, before any vendored code
+    with pytest.raises(NotImplementedError, match="65535") as info:
+        prepare_qwen_3_8_block_bf16(
+            "decode",
+            page_size=16,
+            q_len_per_req=16,
+            **dict(common, batch_size=4096),
+            **case.plan_args(),
+        )
+    assert str(info.value).startswith(
+        "qwen_3_8_block (decode):"
+    ) and "= 65536 rows" in str(info.value)
     # the extend / prefill forms' light gates before any vendored code: the page sizes, the e4m3 pool (no projection rows bound: a chunk past
     # 128 rows is served through the band slab's large-M tile, test_extend.py's ladder), the launch-grid bound of one run
     past_grid = dict(common, batch_size=32)

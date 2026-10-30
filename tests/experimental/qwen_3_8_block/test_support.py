@@ -224,14 +224,12 @@ def test_support_probe_on_the_local_device():
         assert (
             "indexer_e4m3_cache" not in sup.decode.declines
         )  # the e4m3 cache is served (the FlashInfer-side row retired)
-        # the decode table plus ONE FlashInfer-side row on the extend / prefill records: the launch-grid bound of one run at this pin
-        # (`indexer_extend_grid_rows`, 65,535 rows); the previous pin's projection bound (`extend_proj_slab_rows`) stays retired
+        # ONE decline table for the three forms: the vendored rows + the FlashInfer-side launch-grid row of one run on EVERY record (the
+        # DECODE step's query compress shares the extend step's launch; `indexer_extend_grid_rows`, 65,535 rows per run); the previous
+        # pin's projection bound (`extend_proj_slab_rows`) stays retired
         grid = support.EXTEND_GRID_ROWS_KEY
-        assert sup.extend.declines == sup.prefill.declines
-        assert grid in sup.extend.declines and grid not in sup.decode.declines
-        assert {
-            k: v for k, v in sup.extend.declines.items() if k != grid
-        } == sup.decode.declines
+        assert sup.extend.declines == sup.prefill.declines == sup.decode.declines
+        assert grid in sup.decode.declines
         assert (
             "65535" in sup.extend.declines[grid]
             and "several uniform chunks" in sup.extend.declines[grid]
@@ -280,11 +278,11 @@ def test_mirrored_sparse_tile_vocabulary():
     )
     g = _flash_next()
     for form in support.SPARSE_TILE_FORMS:
-        api._light_decode_gates(g, 16, 1, None, None, form)
+        api._light_decode_gates(g, 16, 1, None, None, form, batch_size=1)
     with pytest.raises(ValueError, match="sparse_tile_form must be one of"):
-        api._light_decode_gates(g, 16, 1, None, None, "fast")
+        api._light_decode_gates(g, 16, 1, None, None, "fast", batch_size=1)
     with pytest.raises(ValueError, match="sparse_tile_form must be one of"):
-        api._light_decode_gates(g, 16, 1, None, None, None)
+        api._light_decode_gates(g, 16, 1, None, None, None, batch_size=1)
     with pytest.raises(ValueError, match="sparse_tile_form must be one of"):
         support.sparse_tile(
             torch.device("cpu"), g, batch_size=1, sparse_tile_form="fast"
@@ -323,27 +321,40 @@ def test_mirrored_extend_vocabulary():
     assert not hasattr(support, "extend_rows_reason") and not hasattr(
         support, "EXTEND_ROWS_KEY"
     )
-    # the one rows bound that remains: one extend / prefill run's rows (batch_size x q_len_per_req) at most 65,535 at this pin -- the
-    # vendored indexer's query compress launches with the run's row count as a CUDA grid dimension; a FlashInfer-side row, not an
-    # envelope row (the tripwire reads DECLINE_KEYS off the envelope, so the key is published beside them, never among them)
+    # the one rows bound that remains, on EVERY form: one run's rows (batch_size x q_len_per_req) at most 65,535 at this pin -- the
+    # vendored indexer's query compress (the decode step's and the extend step's share the launch) runs with the run's row count as a
+    # CUDA grid dimension; a FlashInfer-side row, not an envelope row (the tripwire reads DECLINE_KEYS off the envelope, so the key is
+    # published beside them, never among them)
     assert support.EXTEND_ROWS_GRID_MAX == 65535
     assert support.EXTEND_GRID_ROWS_KEY == "indexer_extend_grid_rows"
     assert support.EXTEND_GRID_ROWS_KEY not in support.DECLINE_KEYS
     assert support.extend_rows_grid_reason(g, "extend", 1, 65535) is None
     assert support.extend_rows_grid_reason(g, "extend", 65535, 1) is None
     assert support.extend_rows_grid_reason(g, "prefill", 32, 2047) is None
+    assert support.extend_rows_grid_reason(g, "decode", 4095, 16) is None
+    assert support.extend_rows_grid_reason(g, "decode", 65535, 1) is None
     for form, batch, q_len in (
         ("extend", 1, 65536),
         ("prefill", 32, 2048),
         ("extend", 65536, 1),
+        ("decode", 4096, 16),
+        ("decode", 65536, 1),
     ):
         why = support.extend_rows_grid_reason(g, form, batch, q_len)
         assert (
             why is not None and f"= {batch * q_len} rows" in why and "65535" in why
         ), why
-        assert (
-            form in why and "several uniform chunks" in why and "smaller batch" in why
-        ), why
+        remedy = (
+            "several decode steps" if form == "decode" else "several uniform chunks"
+        )
+        assert form in why and remedy in why and "smaller batch" in why, why
+    # the decode form's light gate applies the same row (the typed text with the decode prefix); 4095 x 16 = 65,520 rows pass
+    api._light_decode_gates(g, 16, 16, None, None, "auto", batch_size=4095)
+    with pytest.raises(NotImplementedError, match="65535") as info:
+        api._light_decode_gates(g, 16, 16, None, None, "auto", batch_size=4096)
+    assert str(info.value).startswith(
+        "qwen_3_8_block (decode):"
+    ) and "= 65536 rows" in str(info.value), str(info.value)
     # the probe's text of the row (no batch, no chunk): the bound and the remedy
     text = support.extend_rows_grid_text()
     assert (

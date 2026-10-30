@@ -30,9 +30,10 @@ values; stated in the README): ``seq_lens[b] in {0} u [T, max_pages x page_size]
 nothing written), a shorter live sequence reported ``-2`` and one past the table's reach ``-3`` in the plan's workspace, never raised;
 the ring INPUT contract (positions ``4 floor(P / 4) .. P - 1`` already in the ring: the stack's rule or the block's own previous chunk /
 step); mixed steps (decodes + prefills) = one decode plan and one extend plan per layer, run back to back; ragged chunks = several
-runs grouped by ``T``.  ONE run holds at most ``support.EXTEND_ROWS_GRID_MAX`` = 65,535 rows (``batch x T``) at this pin -- the vendored
-indexer's query compress launches with the run's row count as a CUDA grid dimension -- so a longer chunk at a batch is several runs; the
-light gate declines it typed, before any vendored code (the ``indexer_extend_grid_rows`` row of the probe's extend / prefill records).
+runs grouped by ``T``.  ONE run holds at most ``support.EXTEND_ROWS_GRID_MAX`` = 65,535 rows at this pin (``batch x T``; ``batch x q_len``
+on the decode form, whose step's query compress shares the launch) -- the vendored indexer's query compress launches with the run's row
+count as a CUDA grid dimension -- so a longer chunk at a batch is several runs and a wider decode step several steps or a smaller batch;
+the light gates decline it typed, before any vendored code (the ``indexer_extend_grid_rows`` row of every form record of the probe).
 
 The sparse core's BODY knob (``sparse_tile_form``, appended with the 7301fad21 pin; performance-only): ``"auto"`` (the default) lets
 the vendored tree pick the body -- on cc 10.7 the LEAN decode tile at ``batch x H_kv <= 4`` CTAs per chunk (the bound's unit since the
@@ -846,10 +847,14 @@ def _light_decode_gates(
     kv_cache_dtype,
     use_pdl,
     sparse_tile_form: str = SPARSE_TILE_FORM_AUTO,
+    *,
+    batch_size: int,
 ) -> None:
     """The decode form's typed declines that need no vendored code (the mirrored constants): the page sizes the paged scorer addresses,
-    the scorer's query-row envelope, the e4m3 pool, the sparse core's body vocabulary.  The vendored declaration repeats them with the
-    envelope's own texts."""
+    the scorer's query-row envelope, the launch-grid bound of one run (``batch_size x q_len <= EXTEND_ROWS_GRID_MAX`` = 65,535 at this pin:
+    the decode step's query compress shares the extend step's launch, the run's row count as a CUDA grid dimension --
+    :func:`support.extend_rows_grid_reason`, the same row and remedy as the extend forms'), the e4m3 pool, the sparse core's body
+    vocabulary.  The vendored declaration repeats the envelope rows with its own texts; the launch-grid row is this entry's."""
     if page_size not in PAGE_SIZES:
         raise NotImplementedError(
             f"{_PKG} (decode): the paged scorer splits a block id into its page and row by a shift, so page_size must be one of {PAGE_SIZES} "
@@ -862,6 +867,9 @@ def _light_decode_gates(
             f"the decode scorer's envelope ({INDEX_QUERY_ROWS_MAX}: four 16-row MMA tiles) -- at most q_len_per_req={geometry.decode_max_q_len} "
             "at this head count"
         )
+    grid = _support.extend_rows_grid_reason(geometry, "decode", batch_size, q_len)
+    if grid is not None:
+        raise NotImplementedError(f"{_PKG} (decode): {grid}")
     if kv_cache_dtype is not None and kv_cache_dtype not in (torch.bfloat16,):
         raise NotImplementedError(
             f"{_PKG} (decode): kv_cache_dtype={kv_cache_dtype}: the block-sparse decode step with the in-block indexer serves bf16 pools; the "
@@ -1051,7 +1059,13 @@ def prepare(
         )
     else:
         _light_decode_gates(
-            geometry, page_size, q, kv_cache_dtype, use_pdl, sparse_tile_form
+            geometry,
+            page_size,
+            q,
+            kv_cache_dtype,
+            use_pdl,
+            sparse_tile_form,
+            batch_size=batch_size,
         )
     pool_dtype = dtype if kv_cache_dtype is None else kv_cache_dtype
     _check_weights(weights, w_o, geometry, dtype, dev)
@@ -1482,7 +1496,9 @@ def workspace_size(
         )
         _check_extend_chunk_rows(form, q, int(max_pages), page_size)
     else:
-        _light_decode_gates(geometry, page_size, q, None, None, sparse_tile_form)
+        _light_decode_gates(
+            geometry, page_size, q, None, None, sparse_tile_form, batch_size=batch_size
+        )
     floor = INDEX_EXTEND_RING_ROWS_MIN if extend else q + INDEX_STATE_ROWS_EXTRA
     cap = int(ring_cap) if ring_cap is not None else floor
     if cap < floor:

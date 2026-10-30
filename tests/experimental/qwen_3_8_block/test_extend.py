@@ -626,7 +626,8 @@ def test_plan_time_decline_past_the_launch_grid_bound_is_typed_before_any_vendor
     launches with the run's row count as a CUDA grid dimension): batch 32 x ``T`` 2048 = 65,536 rows is the typed ``NotImplementedError``
     naming the bound, the rows and the remedy through the public entry -- at ``prepare`` and at the workspace query, on both forms -- BEFORE
     any vendored code (host only: nothing declared, nothing compiled, the block table sample never read); 65,535 rows pass the light gate.
-    The probe publishes the row (``indexer_extend_grid_rows``) on the extend / prefill records only and reports the bound."""
+    The probe publishes the row (``indexer_extend_grid_rows``) on every record (the decode step shares the launch; its own cell is in
+    the decode module) and reports the bound."""
     from flashinfer.experimental.qwen_3_8_block import api as impl
     from flashinfer.experimental.qwen_3_8_block import support
     from flashinfer.qwen_3_8_block import (
@@ -639,7 +640,7 @@ def test_plan_time_decline_past_the_launch_grid_bound_is_typed_before_any_vendor
     grid = support.EXTEND_GRID_ROWS_KEY
     assert sup.extend_rows_grid_max == support.EXTEND_ROWS_GRID_MAX == 65535
     assert grid in sup.extend.declines and grid in sup.prefill.declines
-    assert grid not in sup.decode.declines and "65535" in sup.extend.declines[grid]
+    assert grid in sup.decode.declines and "65535" in sup.extend.declines[grid]
     monkeypatch.setattr(
         impl,
         "_frost_block",
