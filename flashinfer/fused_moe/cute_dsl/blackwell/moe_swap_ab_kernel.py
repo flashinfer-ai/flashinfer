@@ -307,9 +307,10 @@ def _blockscaled_dynamic_mma(
         a_sf = builtin.unrealized_conversion_cast([i32], [sfa_atom.iterator.value])
         b_sf = builtin.unrealized_conversion_cast([i32], [sfb_atom.iterator.value])
         dst = builtin.unrealized_conversion_cast([i32], [acc_atom.iterator.value])
-        desc = cutlass.Int32(descriptor | ((1 << 31) if width == 96 else 0)) | n_bits
-        desc = desc | (((cutlass.Int32(a_sf) >> 30) & 3) << 29)
-        desc = desc | (((cutlass.Int32(b_sf) >> 30) & 3) << 4)
+        # Both scale tensors start on TMEM words; K selects the byte within one.
+        sf_id = (start // tiled_mma.op.sf_vec_size) % 4
+        desc = descriptor | ((1 << 31) if width == 96 else 0)
+        desc = cutlass.Int32(desc | (sf_id << 29) | (sf_id << 4)) | n_bits
         start += width
         accumulate = k_tile != 0 if inner_k == 0 else True
         with cute.arch.elect_one():
@@ -1240,7 +1241,7 @@ class Sm100BlockScaledMoeEpilogue:
                             channel_start + warp * 64,
                             route_start + group * tokens,
                         )
-                cute.arch.cp_async_bulk_commit_group()
+                    cute.arch.cp_async_bulk_commit_group()
             elif group * tokens < valid_tokens:
                 for sub in cutlass.range_constexpr(tokens // 32):
                     token_start = group * tokens + sub * 32

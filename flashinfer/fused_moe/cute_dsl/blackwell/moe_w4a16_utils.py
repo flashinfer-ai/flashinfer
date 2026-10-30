@@ -20,11 +20,12 @@ def e2m1x16_e4m3_to_bf16x16(
     packed_e2m1_lo: Uint32,
     packed_e2m1_hi: Uint32,
     e4m3_scale: Uint32,
+    byte_index: int,
     *,
     loc=None,
     ip=None,
 ) -> tuple[BFloat16, ...]:
-    """Decode one 16-value NVFP4 block to BF16.
+    """Decode one 16-value NVFP4 block using byte_index of the packed scale word.
 
     CUDA 13.2 adds direct E2M1/E4M3 to BF16 conversion forms. Earlier toolkits
     decode and multiply in FP16, then widen the exact NVFP4 product to BF16.
@@ -136,6 +137,7 @@ def e2m1x16_e4m3_to_bf16x16(
         }
         """
 
+    asm = asm.replace("0x4400", hex(0x4400 | (byte_index * 0x11)))
     result = llvm.inline_asm(
         llvm.StructType.get_literal([Uint32.mlir_type] * 8),
         [
@@ -230,16 +232,17 @@ def decode_nvfp4_fragment_to_bf16(
                     ip=ip,
                 )
             )
+            byte_index = 0
         else:
             scale_bits = Uint32(scale_words[scale_idx // 4])
-            if scale_idx % 4:
-                scale_bits = scale_bits >> Uint32((scale_idx % 4) * 8)
+            byte_index = scale_idx % 4
         output_values.extend(
             value.ir_value(loc=loc, ip=ip)
             for value in e2m1x16_e4m3_to_bf16x16(
                 Uint32(packed_words[2 * scale_idx]),
                 Uint32(packed_words[2 * scale_idx + 1]),
                 scale_bits,
+                byte_index,
                 loc=loc,
                 ip=ip,
             )
