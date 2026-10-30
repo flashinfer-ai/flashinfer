@@ -1661,6 +1661,83 @@ def _run_rank_ckpt(
         cake_kcp_plan.kcp_saved_bytes(ctx, H=H, checkpoint_keep="states", C=C)
         + 2 * int(ctx.halo.n_hist_rows) * C * 2
     )
+
+    # the same layer with cake_causal_conv1d_kcp_multi (the q / k / v convolutions in one call, one halo exchange
+    # per direction) and ONE handle for the convolutions and KDA: bitwise the three single calls, two halo
+    # collectives (and waits) fewer in every phase that exchanges halos, the same retained bytes
+    def layer_multi(xq, xk, xv, wq, wk, wv, g_, b_, w_, h):
+        T = xq.shape[0]
+        qq, kk, vv = conv_kcp.cake_causal_conv1d_kcp_multi(
+            (xq, xk, xv), (wq, wk, wv), ctx, recompute_handle=h
+        )
+        y = cake_kcp.chunk_kda_kcp(
+            l2(qq.view(T, H, 128)),
+            l2(kk.view(T, H, 128)),
+            vv.view(T, H, 128),
+            g_,
+            b_,
+            ctx,
+            workspace=ws,
+            recompute_handle=h,
+        )
+        l_outs.append(y.detach().clone())
+        return y * w_
+
+    def run_layer_multi(mode: str):
+        l_outs.clear()
+        lv = [
+            x.detach().clone().requires_grad_(True)
+            for x in (*xs, *wts, g, beta, torch.ones_like(dout))
+        ]
+        h = cake_kcp.KcpRecomputeHandle() if mode == "handle" else None
+        with _Counter() as cc:
+            if mode == "direct":
+                out = layer_multi(*lv, h)
+            else:
+                out = checkpoint(
+                    layer_multi,
+                    *lv,
+                    h,
+                    use_reentrant=False,
+                    context_fn=lambda: (contextlib.nullcontext(), cc.recompute_cm()),
+                )
+            cc.phase = "bwd"
+            out.backward(dout)
+        names = ("xq", "xk", "xv", "wq", "wk", "wv", "g", "beta", "w")
+        res = {
+            "out": out.detach(),
+            **{f"d{n}": t.grad for n, t in zip(names, lv, strict=True)},
+        }
+        flags[f"layer_multi_{mode}_out"] = len(l_outs) == (
+            1 if mode == "direct" else 2
+        ) and all(same(o, l_outs[0]) for o in l_outs[1:])
+        return res, cc.record(), (0 if h is None else h.nbytes()), h
+
+    lm_direct, counts["layer_multi_direct"], _, _ = run_layer_multi("direct")
+    lm_plain, counts["layer_multi_plain"], _, _ = run_layer_multi("plain")
+    lm_handle, counts["layer_multi_handle"], lm_nbytes, lm_h = run_layer_multi("handle")
+    lmd, lmp, lmh = (
+        counts["layer_multi_direct"],
+        counts["layer_multi_plain"],
+        counts["layer_multi_handle"],
+    )
+    ld = counts["layer_direct"]
+    flags["layer_multi_bitwise"] = (
+        eq(lm_direct, l_direct) and eq(lm_plain, l_direct) and eq(lm_handle, l_direct)
+    )
+    flags["layer_multi_counts"] = all(
+        lmd[t]["orig"] == ld[t]["orig"] - 2
+        and lmp[t]["orig"] == lp[t]["orig"] - 2
+        and lmp[t]["recompute"] == lp[t]["recompute"] - 2
+        and lmp[t]["bwd"] == lp[t]["bwd"] - 2
+        and lmh[t]["orig"] == lp[t]["orig"] - 2
+        and lmh[t]["recompute"] == 0
+        and lmh[t]["bwd"] == lp[t]["bwd"] - 2
+        for t in ("calls", "waits")
+    )
+    flags["layer_multi_nbytes"] = (
+        sorted(lm_h.entries) == ["conv", "kda"] and lm_nbytes == l_nbytes
+    )
     info["counts"] = counts
 
     flag_list = [None] * W
