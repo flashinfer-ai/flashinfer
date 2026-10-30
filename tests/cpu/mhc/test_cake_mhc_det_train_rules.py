@@ -171,8 +171,16 @@ LIBRARY_ARCHES = {
     "cake_mhc_det_train_bwd_slab__dynl": ("sm_100a",),
     "cake_mhc_det_train_bwd_slab__dynr": ("sm_100a", "sm_103a"),
     "cake_mhc_det_train_bwd_slab__xrsg": ("sm_100a", "sm_107a"),
-    "cake_mhc_det_train_bwd_token__ao15_rae8_tma_ntr": ("sm_100a", "sm_103a", "sm_107a"),
-    "cake_mhc_det_train_bwd_token__ao22_rae7_pd1_ntr": ("sm_100a", "sm_103a", "sm_107a"),
+    "cake_mhc_det_train_bwd_token__ao15_rae8_tma_ntr": (
+        "sm_100a",
+        "sm_103a",
+        "sm_107a",
+    ),
+    "cake_mhc_det_train_bwd_token__ao22_rae7_pd1_ntr": (
+        "sm_100a",
+        "sm_103a",
+        "sm_107a",
+    ),
     "cake_mhc_det_train_bwd_token__ao22_rae7_pd1_tma_ntr": ("sm_100a", "sm_107a"),
     "cake_mhc_det_train_bwd_token__ao22_rae7_rf3_pd1_l2l_ntr": ("sm_107a",),
     "cake_mhc_det_train_bwd_token__dot_ao8": ("sm_100a", "sm_103a"),
@@ -208,7 +216,9 @@ LIBRARY_ARCHES = {
 # Libraries launched under several records (one record per selection rule, in registry order).
 MULTI_RECORDS = {
     "cake_mhc_det_train_fn_split__tv128": ["cake_mhc_det_train_fn_split__tv128__t"],
-    "cake_mhc_det_train_fn_split__tv128_t128": ["cake_mhc_det_train_fn_split__tv128_t128__t"],
+    "cake_mhc_det_train_fn_split__tv128_t128": [
+        "cake_mhc_det_train_fn_split__tv128_t128__t"
+    ],
     "cake_mhc_det_train_fwd_map__nsx_st5_mb1": [
         "cake_mhc_det_train_fwd_map__nsx_st5_mb1",
         "cake_mhc_det_train_fwd_map__nsx_st5_mb1__a3",
@@ -2099,7 +2109,8 @@ def test_every_call_selects_one_record_per_dispatched_kernel(
         form = loader.k5_program(T, sm, arch)
         assert (
             len(selected) == 1
-            and only(selected, "cake_mhc_det_train_bwd_prepare") == K5_FORM_LIBRARY[form]
+            and only(selected, "cake_mhc_det_train_bwd_prepare")
+            == K5_FORM_LIBRARY[form]
         ), (arch, sm, T)
         rule5 = modules[selected[0]]["grid_rule"]
         want5 = -(-T // rule5["rows_per_cta"])
@@ -2131,7 +2142,9 @@ def test_pdl_only_where_the_kernel_waits_for_the_preceding_grid() -> None:
         name: (
             "runtime"
             if name in runtime
-            else not _is(name, "cake_mhc_det_train_fn_split", "cake_mhc_det_train_fwd_map")
+            else not _is(
+                name, "cake_mhc_det_train_fn_split", "cake_mhc_det_train_fwd_map"
+            )
         )
         for name in loader.MODULES
     }
@@ -2238,7 +2251,10 @@ def test_pdl_bands_of_record() -> None:
                     assert loader.enable_pdl(name, T, arch, path) == (
                         0 if off else 1
                     ), (name, arch, path, T)
-    assert loader.enable_pdl("cake_mhc_det_train_fn_split", 1024, "sm_103a", "forward") == 1
+    assert (
+        loader.enable_pdl("cake_mhc_det_train_fn_split", 1024, "sm_103a", "forward")
+        == 1
+    )
     with pytest.raises(ValueError, match="call path"):
         loader.enable_pdl("cake_mhc_det_train_fwd_collapse", 1024, "sm_103a", "other")
 
@@ -2429,7 +2445,9 @@ def test_launch_grids_follow_the_rules(
             assert len(bands) == 1, (arch, T, bands)
             _, at_most, per_sm = bands[0]
             assert row["k5_grid"] == min(-(-T // rows5), per_sm * sm), (arch, sm, T)
-            assert selected == f"cake_mhc_det_train_bwd_prepare__g{per_sm}sm_le{at_most}", (
+            assert (
+                selected == f"cake_mhc_det_train_bwd_prepare__g{per_sm}sm_le{at_most}"
+            ), (
                 arch,
                 T,
                 selected,

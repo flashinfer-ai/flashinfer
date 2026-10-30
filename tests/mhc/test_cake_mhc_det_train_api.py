@@ -93,9 +93,9 @@ def test_entry_points_document_every_keyword() -> None:
                     parameter.name,
                 )
     for name in ("rms_eps", "hc_eps", "sinkhorn_iters"):
-        parameter = inspect.signature(facade.cake_mhc_det_train_forward_prepare).parameters[
-            name
-        ]
+        parameter = inspect.signature(
+            facade.cake_mhc_det_train_forward_prepare
+        ).parameters[name]
         assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
 
 
@@ -149,8 +149,12 @@ def test_facade_entry_points_match_the_backend(T: int) -> None:
         stats,
     )
     Y = facade.cake_mhc_det_train_forward_finish(i["X"], i["B"], stats)
-    assert torch.equal(Y, backend.cake_mhc_det_train_forward_finish(i["X"], i["B"], stats))
-    dB, gstats = facade.cake_mhc_det_train_backward_prepare(i["dY"], i["B"], i["X"], stats)
+    assert torch.equal(
+        Y, backend.cake_mhc_det_train_forward_finish(i["X"], i["B"], stats)
+    )
+    dB, gstats = facade.cake_mhc_det_train_backward_prepare(
+        i["dY"], i["B"], i["X"], stats
+    )
     dB_b, gstats_b = backend.cake_mhc_det_train_backward_prepare(
         i["dY"], i["B"], i["X"], stats
     )

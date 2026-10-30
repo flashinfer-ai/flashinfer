@@ -197,9 +197,13 @@ def test_argument_checks() -> None:
             dY, dX=torch.empty((8, 4, 5120), dtype=BF16, device=_device())
         )
     with pytest.raises(ValueError, match="overlap"):
-        facade.cake_mhc_det_train_head_backward(X.view(-1)[: 8 * 4096].view(8, 4096), dX=X)
+        facade.cake_mhc_det_train_head_backward(
+            X.view(-1)[: 8 * 4096].view(8, 4096), dX=X
+        )
     with pytest.raises(ValueError, match="overlap"):
-        facade.cake_mhc_det_train_head_forward(X, out=X.view(-1)[: 8 * 4096].view(8, 4096))
+        facade.cake_mhc_det_train_head_forward(
+            X, out=X.view(-1)[: 8 * 4096].view(8, 4096)
+        )
 
 
 @pytest.mark.parametrize("hidden", HIDDEN)

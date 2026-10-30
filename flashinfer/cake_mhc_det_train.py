@@ -569,7 +569,9 @@ def cake_mhc_det_train_head_backward(
     The launch runs on the current torch stream of ``dY``'s device.
     """
 
-    return _head_backend.cake_mhc_det_train_head_backward(dY, dX=dX, accumulate=accumulate)
+    return _head_backend.cake_mhc_det_train_head_backward(
+        dY, dX=dX, accumulate=accumulate
+    )
 
 
 @flashinfer_api

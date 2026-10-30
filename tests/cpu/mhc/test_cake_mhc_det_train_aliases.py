@@ -32,7 +32,9 @@ def test_old_module_names_are_the_det_objects(old_module):
 def test_top_level_old_names_are_the_det_objects():
     facade = importlib.import_module("flashinfer.cake_mhc_det_train")
     old_names = [
-        name for name in dir(flashinfer) if "cake_mhc_train" in name or "CakeMHCTrain" in name
+        name
+        for name in dir(flashinfer)
+        if "cake_mhc_train" in name or "CakeMHCTrain" in name
     ]
     assert old_names
     for name in old_names:

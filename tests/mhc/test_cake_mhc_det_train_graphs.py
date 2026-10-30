@@ -135,7 +135,9 @@ def _direct_step(i: dict, wsf, wsb):
     X, fn, scale, base, W, dY = (i[k] for k in ("X", "fn", "scale", "base", "W", "dY"))
 
     def step() -> dict:
-        U, stats = pkg.cake_mhc_det_train_forward_prepare(X, fn, scale, base, workspace=wsf)
+        U, stats = pkg.cake_mhc_det_train_forward_prepare(
+            X, fn, scale, base, workspace=wsf
+        )
         B = U @ W
         Y = pkg.cake_mhc_det_train_forward_finish(X, B, stats)
         dB, gstats = pkg.cake_mhc_det_train_backward_prepare(dY, B, X, stats)

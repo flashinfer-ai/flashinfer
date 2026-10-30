@@ -2050,7 +2050,9 @@ def cake_mhc_det_train_finish(
     """
 
     if not isinstance(handle, _MHCTrainHandle):
-        raise TypeError("handle must be the handle returned by cake_mhc_det_train_prepare")
+        raise TypeError(
+            "handle must be the handle returned by cake_mhc_det_train_prepare"
+        )
     # The forward takes the edges off the handle: the handle then holds nothing of
     # the prepare node, and a checkpoint rerun of this call runs without them.
     edges, handle.edges = handle.edges, ()

@@ -1537,7 +1537,9 @@ def test_autograd_end_to_end(T: int, save_stats: bool) -> None:
     fn = i["fn"].clone().requires_grad_(True)
     scale = i["scale"].clone().requires_grad_(True)
     base = i["base"].clone().requires_grad_(True)
-    U, handle = pkg.cake_mhc_det_train_prepare(X, fn, scale, base, save_stats=save_stats)
+    U, handle = pkg.cake_mhc_det_train_prepare(
+        X, fn, scale, base, save_stats=save_stats
+    )
     U.retain_grad()
     B = (U.float() + i["B"].float()).to(
         BF16

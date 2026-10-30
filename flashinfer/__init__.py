@@ -311,9 +311,15 @@ from .cake_causal_conv1d_train import (
 from .cake_causal_conv1d_train import (
     cake_causal_conv1d_train_forward_workspace_bytes as cake_causal_conv1d_train_forward_workspace_bytes,
 )
-from .cake_mhc_det_train import CakeMHCDetTrainFinishFunction as CakeMHCDetTrainFinishFunction
-from .cake_mhc_det_train import CakeMHCDetTrainHeadFunction as CakeMHCDetTrainHeadFunction
-from .cake_mhc_det_train import CakeMHCDetTrainPrepareFunction as CakeMHCDetTrainPrepareFunction
+from .cake_mhc_det_train import (
+    CakeMHCDetTrainFinishFunction as CakeMHCDetTrainFinishFunction,
+)
+from .cake_mhc_det_train import (
+    CakeMHCDetTrainHeadFunction as CakeMHCDetTrainHeadFunction,
+)
+from .cake_mhc_det_train import (
+    CakeMHCDetTrainPrepareFunction as CakeMHCDetTrainPrepareFunction,
+)
 from .cake_mhc_det_train import (
     cake_mhc_det_train_backward_finish as cake_mhc_det_train_backward_finish,
 )
