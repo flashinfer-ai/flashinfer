@@ -351,6 +351,19 @@ def test_single_head_paged_mqa_threshold_select_rejects_bad_shapes() -> None:
         candidates=torch.zeros(128, 64, dtype=torch.int32, device="cuda"),
     )
     run = single_head_paged_mqa_threshold_select
+    # The kernel addresses the pairs of a row as int32, so int64 must not pass.
+    long_pairs = dict(outputs, candidates=outputs["candidates"].long())
+    with pytest.raises(ValueError, match="must be int32"):
+        run(
+            query,
+            key_cache,
+            ends,
+            requests,
+            table,
+            **long_pairs,
+            max_context=128,
+            top_k=8,
+        )
     for wrong in (bad, dict(outputs, candidates=bad["candidates"])):
         with pytest.raises(ValueError, match="counters must be"):
             run(
