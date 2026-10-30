@@ -45,6 +45,7 @@ from ..jit import (
 )
 from ..jit.cpp_ext import is_cuda_version_at_least
 from ..utils import (
+    _check_block_scale_quantization_support,
     backend_requirement,
     device_support_pdl,
     get_compute_capability,
@@ -1092,7 +1093,7 @@ def fp4_quantize(
     backend : str
         Backend to use for quantization:
 
-        - ``"cuda"``: stable CUDA kernel (default).
+        - ``"cuda"``: stable CUDA kernel on SM100+ (default).
         - ``"cute-dsl"``: CuTe-DSL kernel (SM100+, **experimental**).
           Supported combinations:
 
@@ -1142,6 +1143,9 @@ def fp4_quantize(
     """
     if sf_vec_size != 16 and sf_vec_size != 32:
         raise NotImplementedError("sf_vec_size can only be 16 or 32")
+
+    if backend in ("cuda", "cute-dsl"):
+        _check_block_scale_quantization_support(input.device, "fp4_quantize")
 
     # Resolve exactly once here; the backends below receive the resolved
     # recipe (``None`` = off). MXFP4 has no candidate search: it never reads
@@ -1608,7 +1612,7 @@ def nvfp4_quantize(
     backend : str
         Backend to use for quantization:
 
-        - ``"cuda"``: stable CUDA kernel (default).
+        - ``"cuda"``: stable CUDA kernel on SM100+ (default).
         - ``"cute-dsl"``: CuTe-DSL kernel (SM100+, **experimental**);
           supports all ``sfLayout`` values
           (``layout_128x4`` / ``layout_8x4`` / ``layout_linear``)
@@ -1662,6 +1666,11 @@ def nvfp4_quantize(
     ``nvfp4_4over6`` is explicit and ``a_global_sf`` is readable without a
     device synchronization.
     """
+    if backend in ("cuda", "cute-dsl"):
+        _check_block_scale_quantization_support(
+            torch.device("cuda", torch.cuda.current_device()), "nvfp4_quantize"
+        )
+
     nvfp4_4over6_config = resolve_nvfp4_4over6(nvfp4_4over6)
     nvfp4_4over6_is_explicit = nvfp4_4over6 is not _UNSET
     if per_token_activation:
@@ -1891,7 +1900,7 @@ def mxfp4_quantize(
     backend : str
         Backend to use for quantization:
 
-        - ``"cuda"``: stable CUDA kernel (default).
+        - ``"cuda"``: stable CUDA kernel on SM100+ (default).
         - ``"cute-dsl"``: CuTe-DSL kernel (SM100+, **experimental**).
     enable_pdl : bool, optional
         Whether to enable Programmatic Dependent Launch.  Only used when
@@ -1917,6 +1926,13 @@ def mxfp4_quantize(
     notice.  Use at your own risk for production workloads.
     """
     sfLayout = SfLayout(sfLayout)
+    if backend in ("cuda", "cute-dsl"):
+        device = (
+            torch.device("cuda", torch.cuda.current_device())
+            if backend == "cuda"
+            else a.device
+        )
+        _check_block_scale_quantization_support(device, "mxfp4_quantize")
     if backend == "cute-dsl":
         from ..cute_dsl import is_cute_dsl_available
 

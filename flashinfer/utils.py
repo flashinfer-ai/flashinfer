@@ -321,6 +321,16 @@ def get_compute_capability(device: torch.device) -> Tuple[int, int]:
     return properties.major, properties.minor
 
 
+def _check_block_scale_quantization_support(device: torch.device, op_name: str) -> None:
+    # The CUDA quantization kernels have no implementation below SM100.
+    if device.type == "cuda":
+        major, minor = get_compute_capability(device)
+        if major < 10:
+            raise RuntimeError(
+                f"{op_name} requires SM100 or newer; got SM{major}{minor}"
+            )
+
+
 # trtllm-gen ships the Fp16Softmax and Spcomp cubin variants for SM107 (Rubin) only - the
 # public FMHA packs contain zero of either for sm100a/sm100f/sm103a. Requesting one on another
 # architecture cannot be served, and without this check it surfaces late as a "Missing
