@@ -526,6 +526,22 @@ def test_single_head_paged_mqa_threshold_select_rejects_bad_shapes() -> None:
             max_context=128,
             top_k=8,
         )
+    long_ranges = dict(
+        outputs,
+        arrivals=torch.zeros(1, dtype=torch.int32, device="cuda"),
+        ranges=torch.zeros(2, 128, dtype=torch.int64, device="cuda"),
+    )
+    with pytest.raises(ValueError, match="both int32"):
+        run(
+            query,
+            key_cache,
+            ends,
+            requests,
+            table,
+            **long_ranges,
+            max_context=128,
+            top_k=8,
+        )
     for wrong in (bad, dict(outputs, candidates=bad["candidates"])):
         with pytest.raises(ValueError, match="counters must be"):
             run(

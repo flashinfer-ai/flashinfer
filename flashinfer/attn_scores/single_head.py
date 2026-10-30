@@ -307,9 +307,13 @@ def single_head_paged_mqa_threshold_select(
     if (arrivals is None) != (ranges is None):
         raise ValueError("The repair takes both arrivals and ranges")
     if ranges is not None and (
-        arrivals.shape[0] < tiles or ranges.shape != (2, tiles * TILE)
+        arrivals.shape[0] < tiles
+        or ranges.shape != (2, tiles * TILE)
+        or {arrivals.dtype, ranges.dtype} != {torch.int32}
     ):
-        raise ValueError("arrivals must hold a count per tile and ranges [2, rows]")
+        raise ValueError(
+            "arrivals must hold a count per tile and ranges [2, rows], both int32"
+        )
     if not 0 <= top_k < candidates.shape[1]:
         raise ValueError(
             "candidates must hold the top_k tie slots and at least one more"
