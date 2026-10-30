@@ -1915,6 +1915,29 @@ def test_top_p_renorm_probs(batch_size, vocab_size, p):
     )
 
 
+@pytest.mark.parametrize("vocab_size", [32000, 152064])
+def test_top_p_renorm_probs_deterministic_boundary(vocab_size):
+    """is_deterministic=True is bitwise reproducible when top_p lands on a cumulative-mass boundary."""
+    g = torch.Generator().manual_seed(1234)
+    logits = (torch.randn(64, vocab_size, generator=g) * 3.0).to("cuda:0")
+    probs = torch.softmax(logits, dim=-1)
+    cum = probs.double().sort(dim=-1, descending=True).values.cumsum(dim=-1)
+    cum = cum / cum[:, -1:]
+    targets = 0.5 + 0.45 * torch.rand(64, generator=g, dtype=torch.float64)
+    j = torch.searchsorted(cum, targets.unsqueeze(1).to("cuda:0"))
+    top_p = cum.gather(1, j).squeeze(1).float()
+
+    base = flashinfer.sampling.top_p_renorm_probs(probs, top_p, is_deterministic=True)
+    for _ in range(10):
+        again = flashinfer.sampling.top_p_renorm_probs(
+            probs, top_p, is_deterministic=True
+        )
+        assert torch.equal(again, base), "deterministic renorm differed across calls"
+
+    sums = base.sum(dim=-1)
+    torch.testing.assert_close(sums, torch.ones_like(sums), rtol=1e-3, atol=1e-3)
+
+
 @pytest.mark.parametrize("batch_size", [4, 99, 989])
 @pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
 def test_top_p_renorm_probs_per_request(batch_size, vocab_size):
@@ -2040,7 +2063,7 @@ def test_top_k_renorm_probs_custom_op(top_k_arr, is_deterministic, dtype):
 
 
 @pytest.mark.parametrize("batch_size", [1, 99, 989])
-@pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
+@pytest.mark.parametrize("vocab_size", [111, 32000, 128256, 152064])
 @pytest.mark.parametrize("k", [10, 500])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
 def test_top_k_renorm_probs_deterministic(batch_size, vocab_size, k, dtype):
