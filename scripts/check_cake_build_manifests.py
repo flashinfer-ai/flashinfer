@@ -253,12 +253,12 @@ def refs_generic(package_dir: Path, loader: str) -> set[str]:
     return generic_library_refs(module_literals(package_dir / loader))
 
 
-def refs_lm_head_loss(package_dir: Path, loader: str) -> set[str]:
+def refs_lm_head_det_loss(package_dir: Path, loader: str) -> set[str]:
     """Compact rows ``[unit, arg_plan, launch, grid_x, grid_y, grid_z]`` per stage of a per-architecture record;
-    the stage's library stem is ``cake_lm_head_loss_<unit>``."""
+    the stage's library stem is ``cake_lm_head_det_loss_<unit>``."""
     registry = module_literals(package_dir / loader)["_REGISTRY"]
     return {
-        f"cake_lm_head_loss_{row[0]}_{compact['arch']}"
+        f"cake_lm_head_det_loss_{row[0]}_{compact['arch']}"
         for compact in registry.values()
         for row in compact["stages"].values()
     }
@@ -419,10 +419,10 @@ PACKAGES: tuple[Package, ...] = (
         refs_moe_grouped_gemm,
     ),
     Package(
-        "flashinfer.experimental.cake_lm_head_loss",
-        "flashinfer/experimental/cake_lm_head_loss",
+        "flashinfer.experimental.cake_lm_head_det_loss",
+        "flashinfer/experimental/cake_lm_head_det_loss",
         "cake_jit.py",
-        refs_lm_head_loss,
+        refs_lm_head_det_loss,
     ),
     Package(
         "flashinfer.experimental.cake_mok_bf16",
