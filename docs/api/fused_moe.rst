@@ -735,6 +735,7 @@ match the corresponding ``trtllm_*`` APIs.
     prims_ts_bf16_routed_moe
     prims_ts_fp4_block_scale_moe
     prims_ts_fp4_block_scale_routed_moe
+    prims_ts_fp4_block_scale_routed_moe_precompile
     prims_ts_fp8_block_scale_moe
     prims_ts_fp8_block_scale_routed_moe
     prims_ts_fp8_per_tensor_scale_moe
@@ -762,6 +763,7 @@ These symbols are defined in the backend modules and re-exported from
 * :func:`flashinfer.fused_moe.backends.prims_ts.fp4_op.prims_ts_fp4_block_scale_moe`
 * :func:`flashinfer.fused_moe.backends.prims_ts.fp4_op.prims_ts_fp4_block_scale_moe_partitioned`
 * :func:`flashinfer.fused_moe.backends.prims_ts.fp4_op.prims_ts_fp4_block_scale_routed_moe`
+* :func:`flashinfer.fused_moe.backends.prims_ts.fp4_op.prims_ts_fp4_block_scale_routed_moe_precompile`
 * :func:`flashinfer.fused_moe.backends.prims_ts.fp8_op.prims_ts_fp8_block_scale_moe`
 * :func:`flashinfer.fused_moe.backends.prims_ts.fp8_op.prims_ts_fp8_block_scale_moe_partitioned`
 * :func:`flashinfer.fused_moe.backends.prims_ts.fp8_op.prims_ts_fp8_block_scale_routed_moe`
