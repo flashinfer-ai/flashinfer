@@ -1902,7 +1902,9 @@ class KcpSequence:
         self.log.clear()
 
 
-@dataclasses.dataclass(frozen=True, eq=False)
+_DEFAULT = object()  # KcpContext: argument omitted
+
+
 class KcpContext:
     """One rank's view of the partition: CPU ints / tuples plus small int32 device tables; built once, reused across
     layers; never reads a tensor's contents.
@@ -1918,7 +1920,13 @@ class KcpContext:
     ``tables``; ``NC`` real chunks, ``NC_max`` / ``NC_pad`` / ``R`` the existing plan's geometry.  ``halo`` is the
     convolution halo plan (its device tables in ``halo_tables``: ``hist_row_off``, ``tail_row_off``, ``head_row_off``
     int32, ``hist_index`` int64).  ``heads(HV)`` derives and caches the head-dependent plan (:class:`KcpHeadPlan`).
-    ``sequence`` is the debug collective counter."""
+    ``sequence`` is the debug collective counter.
+
+    A plain class, not a dataclass: input walks that recurse into dataclass fields (FSDP2's ``fully_shard``
+    pre-forward hook collects and replaces the grad-requiring tensors of a module's arguments that way) see one
+    leaf, so carrying a context through module inputs costs the same at any fragment or token count.  Otherwise it
+    behaves as the frozen dataclass it was: the same constructor, ``dataclasses.FrozenInstanceError`` on attribute
+    assignment, identity equality; ``_FIELDS`` lists the fields in constructor order."""
 
     partition: KcpPartition
     rank: int
@@ -1956,13 +1964,78 @@ class KcpContext:
     tables: dict[str, torch.Tensor]
     halo: KcpHaloPlan
     halo_tables: dict[str, torch.Tensor]
-    p_rule: str = P_RULE_DEFAULT  # plan rule: "row_cost_lpt" shipped ("row_cost" stays selectable); the per-rank rules via the test knob
-    sequence: KcpSequence = dataclasses.field(default_factory=KcpSequence, repr=False)
-    _head_plans: dict[int, KcpHeadPlan] = dataclasses.field(
-        default_factory=dict, repr=False
-    )
+    p_rule: str  # plan rule: "row_cost_lpt" shipped ("row_cost" stays selectable); the per-rank rules via the test knob
+    sequence: KcpSequence
+    _head_plans: dict[int, KcpHeadPlan]
     # GDN table bundles of ``cake_tables`` (built once per context at first use, device-resident, keyed by HV)
-    _caches: dict = dataclasses.field(default_factory=dict, repr=False)
+    _caches: dict
+
+    def __init__(
+        self,
+        partition,
+        rank,
+        world_size,
+        group,
+        device,
+        conv_kernel_size,
+        sm_count,
+        T_r,
+        n_frag,
+        cu_seqlens_local_cpu,
+        cu_seqlens_local,
+        frag_table,
+        in_slot,
+        out_slot,
+        n_in,
+        n_out,
+        N_in,
+        N_out,
+        n_in_by_rank,
+        n_out_by_rank,
+        in_slot_all,
+        out_slot_all,
+        chains,
+        n_d_max,
+        exchange_scheme,
+        NC,
+        NC_max,
+        NC_pad,
+        R,
+        chunk_bos,
+        chunk_len,
+        seq_chunk_start,
+        seq_order,
+        tables,
+        halo,
+        halo_tables,
+        p_rule=P_RULE_DEFAULT,
+        sequence=_DEFAULT,
+        _head_plans=_DEFAULT,
+        _caches=_DEFAULT,
+    ) -> None:
+        # the dataclass's default factories: a new object per context when the argument is omitted
+        sequence = KcpSequence() if sequence is _DEFAULT else sequence
+        _head_plans = {} if _head_plans is _DEFAULT else _head_plans
+        _caches = {} if _caches is _DEFAULT else _caches
+        values = dict(locals())
+        for name in self._FIELDS:
+            object.__setattr__(self, name, values[name])
+
+    # the constructor's parameters after ``self``; the repr shows those up to ``p_rule``
+    _FIELDS = __init__.__code__.co_varnames[1 : __init__.__code__.co_argcount]
+    _REPR_FIELDS = _FIELDS[: _FIELDS.index("p_rule") + 1]
+
+    def __setattr__(self, name: str, value) -> None:
+        raise dataclasses.FrozenInstanceError(f"cannot assign to field {name!r}")
+
+    def __delattr__(self, name: str) -> None:
+        raise dataclasses.FrozenInstanceError(f"cannot delete field {name!r}")
+
+    def __repr__(self) -> str:
+        fields = ", ".join(
+            f"{name}={getattr(self, name)!r}" for name in self._REPR_FIELDS
+        )
+        return f"{type(self).__qualname__}({fields})"
 
     @property
     def fragments(self) -> tuple[KcpFragment, ...]:

@@ -32,6 +32,7 @@ import dataclasses
 import glob
 import hashlib
 import importlib
+import itertools
 import json
 import math
 import os
@@ -160,10 +161,14 @@ def _plain(x):
     """Dataclass / tensor / tuple -> JSON-like plain values (tensors as lists with their dtype)."""
     if isinstance(x, torch.Tensor):
         return {"dtype": str(x.dtype), "shape": list(x.shape), "values": x.tolist()}
-    if hasattr(x, "__dataclass_fields__"):
+    # the contexts are plain classes listing their fields in ``_FIELDS``; the other plan objects are dataclasses
+    fields = getattr(type(x), "_FIELDS", None) or getattr(
+        x, "__dataclass_fields__", None
+    )
+    if fields is not None:
         return {
             f: _plain(getattr(x, f))
-            for f in x.__dataclass_fields__
+            for f in fields
             if not f.startswith("_") and f != "sequence"
         }
     if isinstance(x, dict):
@@ -479,6 +484,112 @@ def test_owner_table(HV, W) -> None:
         for i in range(W):
             assert ctxs[i].heads(HV).splits["c1_send"][r] == hp.splits["c1_recv"][i]
     _evidence("ownership", {**ot, "pass": True})
+
+
+@dataclasses.dataclass(frozen=True)
+class _BatchMeta:
+    """Per-batch metadata a model hands to every layer (the shape of the FSDP2 input-walk report)."""
+
+    cu_seqlens: torch.Tensor
+    kcp: object
+
+
+def _zigzag_fragments(lengths: list[int], W: int) -> list[list[tuple[int, int, int]]]:
+    """Every rank's ``(doc, offset, length)``: pieces ``r`` and ``2W - 1 - r`` of width ``ceil(L / 2W)``."""
+    frags: list[list[tuple[int, int, int]]] = [[] for _ in range(W)]
+    for doc, length in enumerate(lengths):
+        width = math.ceil(length / (2 * W))
+        cuts = [min(i * width, length) for i in range(2 * W)] + [length]
+        for r in range(W):
+            for i in (r, 2 * W - 1 - r):
+                frags[r].append((doc, cuts[i], cuts[i + 1] - cuts[i]))
+    return frags
+
+
+def test_context_is_a_leaf_for_input_walks(monkeypatch) -> None:
+    """A prepared context, CP or single-rank, is one leaf for the input walks that recurse into dataclass, dict,
+    list and tuple containers (FSDP2's ``fully_shard`` pre-forward hook collects and replaces the grad-requiring
+    tensors of a module's arguments that way): the walk visits as many nodes as with no context, at any fragment
+    or token count, and the replace pass returns the metadata object itself.  The context keeps the frozen
+    dataclass behaviour it had: the constructor, frozen attributes, identity equality, the repr."""
+    fsdp_utils = pytest.importorskip("torch.distributed.fsdp._common_utils")
+    if not hasattr(fsdp_utils, "_collect_grad_tensors"):
+        pytest.skip("this torch's FSDP has no recursive input walk")
+    visits = [0]
+    collect = fsdp_utils._collect_grad_tensors
+
+    def counting(output, out, _depth=0):
+        visits[0] += 1
+        return collect(output, out, _depth)
+
+    monkeypatch.setattr(fsdp_utils, "_collect_grad_tensors", counting)
+
+    def walk(meta) -> int:
+        visits[0] = 0
+        assert fsdp_utils.collect_grad_tensors(((meta,), {"meta": meta})) == ()
+        assert fsdp_utils.replace_grad_tensors(meta, iter(())) is meta
+        return visits[0]
+
+    cu = torch.tensor([0, 4000], dtype=torch.int64)
+    baseline = walk(_BatchMeta(cu, None))
+    assert walk(_BatchMeta(cu, (None, None))) > baseline  # the walk recurses
+    # the mixed-precision input cast (``MixedPrecisionPolicy(param_dtype=...)``) rebuilds the dataclasses it walks
+    apply_to_tensors = getattr(
+        importlib.import_module("torch.distributed.utils"), "_apply_to_tensors", None
+    )
+    for n_docs, W in ((2, 8), (64, 8), (64, 16)):
+        lengths = [4000] * n_docs
+        cu = torch.tensor([0, *itertools.accumulate(lengths)], dtype=torch.int64)
+        part = gp.kcp_partition(cu, W, fragments=_zigzag_fragments(lengths, W))
+        ctx = gp.build_kcp_context(part, None, 0, CPU, 4, sm_count=SM_COUNT)
+        ctx.prepare(1, 48)
+        single = gp.build_kcp_context(
+            gp.kcp_partition(cu, 1, "contiguous"), None, 0, CPU, 4, sm_count=SM_COUNT
+        )
+        single.prepare(1, 48 // W)
+        for c in (ctx, single):
+            assert not dataclasses.is_dataclass(c)
+            assert walk(_BatchMeta(cu, c)) == baseline, (n_docs, W)
+            if apply_to_tensors is not None:
+                assert apply_to_tensors(lambda t: t, _BatchMeta(cu, c)).kcp is c
+            nested = walk(_BatchMeta(cu, {"kcp": [None, (None,)]}))
+            assert walk(_BatchMeta(cu, {"kcp": [c, (c,)]})) == nested
+
+    # the frozen-dataclass behaviour, unchanged
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        ctx.rank = 1
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        del ctx.T_r
+    clone = gp.KcpContext(**{f: getattr(ctx, f) for f in gp.KcpContext._FIELDS})
+    assert clone != ctx and clone == clone and hash(clone) != hash(ctx)
+    assert all(getattr(clone, f) is getattr(ctx, f) for f in gp.KcpContext._FIELDS)
+    assert gp.KcpContext._FIELDS[-4:] == (
+        "p_rule",
+        "sequence",
+        "_head_plans",
+        "_caches",
+    )
+    fresh = gp.KcpContext(*(getattr(ctx, f) for f in gp.KcpContext._FIELDS[:-4]))
+    assert (
+        fresh.p_rule == gp.P_RULE_DEFAULT
+        and fresh._head_plans == {}
+        and fresh._caches == {}
+    )
+    assert (
+        isinstance(fresh.sequence, gp.KcpSequence)
+        and fresh.sequence is not ctx.sequence
+    )
+    assert (
+        gp.KcpContext(
+            *(getattr(ctx, f) for f in gp.KcpContext._FIELDS[:-3]), None
+        ).sequence
+        is None
+    )
+    text = repr(ctx)
+    assert (
+        text.startswith("KcpContext(partition=") and f"p_rule={ctx.p_rule!r})" in text
+    )
+    assert "sequence=" not in text and "_caches" not in text
 
 
 def test_prepare_tables_first_use() -> None:
