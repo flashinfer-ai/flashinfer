@@ -135,7 +135,7 @@ __device__ __forceinline__ unsigned int __as_u32(int v) {
 extern "C" {
 
 __global__ __launch_bounds__(224) void
-kernel_cake_kimi_k3_fused_router_27a24128e0b7468b7878(float* __restrict__ logits, float* __restrict__ bias, float* __restrict__ topk_weights, int* __restrict__ topk_ids, int* __restrict__ sorted_token_ids, int* __restrict__ expert_ids, int* __restrict__ num_tokens_post_padded, int* __restrict__ expert_counts, int* __restrict__ expert_offsets, int* __restrict__ expert_scatter_offsets, int M)
+kernel_cake_kimi_k3_fused_router_06f84a6acbd060adb410(float* __restrict__ logits, float* __restrict__ bias, float* __restrict__ topk_weights, int* __restrict__ topk_ids, int* __restrict__ sorted_token_ids, int* __restrict__ expert_ids, int* __restrict__ num_tokens_post_padded, int* __restrict__ expert_counts, int* __restrict__ expert_offsets, int* __restrict__ expert_scatter_offsets, int M)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -202,21 +202,31 @@ kernel_cake_kimi_k3_fused_router_27a24128e0b7468b7878(float* __restrict__ logits
     int expert_base = tid * ITEMS_PER_THREAD;
     float _vec_load_0[4];
     {
-        float4 _v4 = *reinterpret_cast<const float4*>(bias + expert_base);
-        _vec_load_0[0 + 0] = _v4.x;
-        _vec_load_0[0 + 1] = _v4.y;
-        _vec_load_0[0 + 2] = _v4.z;
-        _vec_load_0[0 + 3] = _v4.w;
+        unsigned _v4_0_0;
+        unsigned _v4_0_1;
+        unsigned _v4_0_2;
+        unsigned _v4_0_3;
+        asm volatile("ld.global.nc.v4.b32 {%0, %1, %2, %3}, [%4];"
+            : "=r"(_v4_0_0), "=r"(_v4_0_1), "=r"(_v4_0_2), "=r"(_v4_0_3) : "l"((const void*)(bias + (expert_base))) : "memory");
+        _vec_load_0[0 + 0] = __uint_as_float(_v4_0_0);
+        _vec_load_0[0 + 1] = __uint_as_float(_v4_0_1);
+        _vec_load_0[0 + 2] = __uint_as_float(_v4_0_2);
+        _vec_load_0[0 + 3] = __uint_as_float(_v4_0_3);
     }
     int token = bid;
     unsigned long long row_base = (unsigned long long)token * (unsigned long long)NUM_EXPERTS;
     float _vec_load_1[4];
     {
-        float4 _v4 = *reinterpret_cast<const float4*>(logits + row_base + (unsigned long long)expert_base);
-        _vec_load_1[0 + 0] = _v4.x;
-        _vec_load_1[0 + 1] = _v4.y;
-        _vec_load_1[0 + 2] = _v4.z;
-        _vec_load_1[0 + 3] = _v4.w;
+        unsigned _v4_1_0;
+        unsigned _v4_1_1;
+        unsigned _v4_1_2;
+        unsigned _v4_1_3;
+        asm volatile("ld.global.nc.v4.b32 {%0, %1, %2, %3}, [%4];"
+            : "=r"(_v4_1_0), "=r"(_v4_1_1), "=r"(_v4_1_2), "=r"(_v4_1_3) : "l"((const void*)(logits + (row_base + (unsigned long long)expert_base))) : "memory");
+        _vec_load_1[0 + 0] = __uint_as_float(_v4_1_0);
+        _vec_load_1[0 + 1] = __uint_as_float(_v4_1_1);
+        _vec_load_1[0 + 2] = __uint_as_float(_v4_1_2);
+        _vec_load_1[0 + 3] = __uint_as_float(_v4_1_3);
     }
     #pragma unroll 1
     for (int const_slot = tid; const_slot < TOP_K * BLOCK_M; const_slot += THREADS) {
@@ -304,6 +314,11 @@ kernel_cake_kimi_k3_fused_router_27a24128e0b7468b7878(float* __restrict__ logits
     int bound_part5 = ((bound_mine <= bound_values[20]) ? 1 : 0) + ((bound_mine <= bound_values[21]) ? 1 : 0) + ((bound_mine <= bound_values[22]) ? 1 : 0) + ((bound_mine <= bound_values[23]) ? 1 : 0);
     int bound_part6 = ((bound_mine <= bound_values[24]) ? 1 : 0) + ((bound_mine <= bound_values[25]) ? 1 : 0) + ((bound_mine <= bound_values[26]) ? 1 : 0) + ((bound_mine <= bound_values[27]) ? 1 : 0);
     int bound_at_least = bound_part0 + bound_part1 + (bound_part2 + bound_part3) + (bound_part4 + bound_part5 + bound_part6);
+    unsigned int cw_pre = (unsigned int)0;
+    if (warp == 0) {
+        unsigned int cw_word = bound_mine & 4294967232u | (unsigned int)(bound_at_least + 32);
+        cw_pre = cw_word;
+    }
     if (bound_at_least < 16) {
         bound_mine = (unsigned int)0;
     }
@@ -350,6 +365,35 @@ kernel_cake_kimi_k3_fused_router_27a24128e0b7468b7878(float* __restrict__ logits
     }
     __syncthreads();
     int cand_total = cand_counts[0] + cand_counts[1] + (cand_counts[2] + cand_counts[3]) + (cand_counts[4] + cand_counts[5] + cand_counts[6]);
+    if (warp != 0) {
+        int iz_zero[4];
+        iz_zero[0] = 0;
+        iz_zero[1] = 0;
+        iz_zero[2] = 0;
+        iz_zero[3] = 0;
+        int iz_t = tid - 32;
+        {
+            int4 _iv4 = make_int4(iz_zero[0 + 0], iz_zero[0 + 1], iz_zero[0 + 2], iz_zero[0 + 3]);
+            *reinterpret_cast<int4*>(expert_counts + iz_t * 4) = _iv4;
+        }
+        if (iz_t < 32) {
+            {
+                int4 _iv4 = make_int4(iz_zero[0 + 0], iz_zero[0 + 1], iz_zero[0 + 2], iz_zero[0 + 3]);
+                *reinterpret_cast<int4*>(expert_counts + (iz_t + 192) * 4) = _iv4;
+            }
+        } else {
+            {
+                int4 _iv4 = make_int4(iz_zero[0 + 0], iz_zero[0 + 1], iz_zero[0 + 2], iz_zero[0 + 3]);
+                *reinterpret_cast<int4*>(expert_scatter_offsets + (iz_t - 32) * 4) = _iv4;
+            }
+        }
+        if (iz_t < 64) {
+            {
+                int4 _iv4 = make_int4(iz_zero[0 + 0], iz_zero[0 + 1], iz_zero[0 + 2], iz_zero[0 + 3]);
+                *reinterpret_cast<int4*>(expert_scatter_offsets + (iz_t + 160) * 4) = _iv4;
+            }
+        }
+    }
     if (cand_total > 32) {
         int remaining = TOP_K;
         int active_total = NUM_EXPERTS;
@@ -611,219 +655,252 @@ kernel_cake_kimi_k3_fused_router_27a24128e0b7468b7878(float* __restrict__ logits
             my_id = cand_ids[my_slot];
             my_score = cand_scores[my_slot];
         }
-        rank_keys[lane] = my_key;
-        __syncwarp();
-        int rank_part0 = 0;
-        int rank_part1 = 0;
-        int rank_part2 = 0;
-        int rank_part3 = 0;
-        rank_part0 += ((my_key < rank_keys[0]) ? 1 : 0);
-        rank_part1 += ((my_key < rank_keys[1]) ? 1 : 0);
-        rank_part2 += ((my_key < rank_keys[2]) ? 1 : 0);
-        rank_part3 += ((my_key < rank_keys[3]) ? 1 : 0);
-        rank_part0 += ((my_key < rank_keys[4]) ? 1 : 0);
-        rank_part1 += ((my_key < rank_keys[5]) ? 1 : 0);
-        rank_part2 += ((my_key < rank_keys[6]) ? 1 : 0);
-        rank_part3 += ((my_key < rank_keys[7]) ? 1 : 0);
-        rank_part0 += ((my_key < rank_keys[8]) ? 1 : 0);
-        rank_part1 += ((my_key < rank_keys[9]) ? 1 : 0);
-        rank_part2 += ((my_key < rank_keys[10]) ? 1 : 0);
-        rank_part3 += ((my_key < rank_keys[11]) ? 1 : 0);
-        rank_part0 += ((my_key < rank_keys[12]) ? 1 : 0);
-        rank_part1 += ((my_key < rank_keys[13]) ? 1 : 0);
-        rank_part2 += ((my_key < rank_keys[14]) ? 1 : 0);
-        rank_part3 += ((my_key < rank_keys[15]) ? 1 : 0);
-        if (cand_total > 16) {
-            rank_part0 += ((my_key < rank_keys[16]) ? 1 : 0);
-            rank_part1 += ((my_key < rank_keys[17]) ? 1 : 0);
-            rank_part2 += ((my_key < rank_keys[18]) ? 1 : 0);
-            rank_part3 += ((my_key < rank_keys[19]) ? 1 : 0);
-            rank_part0 += ((my_key < rank_keys[20]) ? 1 : 0);
-            rank_part1 += ((my_key < rank_keys[21]) ? 1 : 0);
-            rank_part2 += ((my_key < rank_keys[22]) ? 1 : 0);
-            rank_part3 += ((my_key < rank_keys[23]) ? 1 : 0);
+        unsigned int cw_f = cw_pre & 63;
+        unsigned int cw_pv = (unsigned int)127;
+        if (cw_f >= (unsigned int)48) {
+            cw_pv = cw_f;
         }
-        if (cand_total > 24) {
-            rank_part0 += ((my_key < rank_keys[24]) ? 1 : 0);
-            rank_part1 += ((my_key < rank_keys[25]) ? 1 : 0);
-            rank_part2 += ((my_key < rank_keys[26]) ? 1 : 0);
-            rank_part3 += ((my_key < rank_keys[27]) ? 1 : 0);
-            rank_part0 += ((my_key < rank_keys[28]) ? 1 : 0);
-            rank_part1 += ((my_key < rank_keys[29]) ? 1 : 0);
-            rank_part2 += ((my_key < rank_keys[30]) ? 1 : 0);
-            rank_part3 += ((my_key < rank_keys[31]) ? 1 : 0);
+        unsigned int cw_p32;
+        asm volatile("redux.sync.min.u32 %0, %1, 0xffffffff;" : "=r"(cw_p32) : "r"(cw_pv));
+        unsigned int cw_tv = (unsigned int)0;
+        if (cw_f + (unsigned int)cand_total >= cw_p32 + (unsigned int)17) {
+            cw_tv = cw_pre | 63;
         }
-        int my_rank = rank_part0 + rank_part1 + (rank_part2 + rank_part3);
-        unsigned int rank_valid = 0;
-        if (cand_total > lane) {
-            rank_valid = (unsigned int)my_rank;
+        unsigned int cw_theta;
+        asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(cw_theta) : "r"(cw_tv));
+        unsigned int cw_valid = __ballot_sync(0xFFFFFFFF, cand_total > lane);
+        unsigned int _warp_vote_4 = __ballot_sync(0xFFFFFFFF, my_key > cw_theta);
+        unsigned int cw_c = cw_valid & _warp_vote_4;
+        unsigned int cw_alive = cw_valid & (cw_c ^ 4294967295u);
+        int cw_need = 16 - (int)(unsigned int)__popc(cw_c);
+        if (cw_need > 0) {
+            if (cw_need > 0) {
+                unsigned int cw_mine_0 = cw_alive >> (unsigned int)lane & 1;
+                unsigned int cw_ak_0 = (unsigned int)0;
+                if (cw_mine_0 != (unsigned int)0) {
+                    cw_ak_0 = my_key;
+                }
+                unsigned int cw_m_0;
+                asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(cw_m_0) : "r"(cw_ak_0));
+                unsigned int _warp_vote_5 = __ballot_sync(0xFFFFFFFF, my_key == cw_m_0);
+                unsigned int cw_eq_0 = cw_alive & _warp_vote_5;
+                unsigned int cw_pick_0 = cw_eq_0 & (cw_eq_0 ^ 4294967295u) + (unsigned int)1;
+                cw_c = cw_c | cw_pick_0;
+                cw_alive = cw_alive & (cw_pick_0 ^ 4294967295u);
+            }
+            if (cw_need > 1) {
+                unsigned int cw_mine_1 = cw_alive >> (unsigned int)lane & 1;
+                unsigned int cw_ak_1 = (unsigned int)0;
+                if (cw_mine_1 != (unsigned int)0) {
+                    cw_ak_1 = my_key;
+                }
+                unsigned int cw_m_1;
+                asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(cw_m_1) : "r"(cw_ak_1));
+                unsigned int _warp_vote_6 = __ballot_sync(0xFFFFFFFF, my_key == cw_m_1);
+                unsigned int cw_eq_1 = cw_alive & _warp_vote_6;
+                unsigned int cw_pick_1 = cw_eq_1 & (cw_eq_1 ^ 4294967295u) + (unsigned int)1;
+                cw_c = cw_c | cw_pick_1;
+                cw_alive = cw_alive & (cw_pick_1 ^ 4294967295u);
+            }
+            if (cw_need > 2) {
+                unsigned int cw_mine_2 = cw_alive >> (unsigned int)lane & 1;
+                unsigned int cw_ak_2 = (unsigned int)0;
+                if (cw_mine_2 != (unsigned int)0) {
+                    cw_ak_2 = my_key;
+                }
+                unsigned int cw_m_2;
+                asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(cw_m_2) : "r"(cw_ak_2));
+                unsigned int _warp_vote_7 = __ballot_sync(0xFFFFFFFF, my_key == cw_m_2);
+                unsigned int cw_eq_2 = cw_alive & _warp_vote_7;
+                unsigned int cw_pick_2 = cw_eq_2 & (cw_eq_2 ^ 4294967295u) + (unsigned int)1;
+                cw_c = cw_c | cw_pick_2;
+                cw_alive = cw_alive & (cw_pick_2 ^ 4294967295u);
+            }
+            if (cw_need > 3) {
+                unsigned int cw_mine_3 = cw_alive >> (unsigned int)lane & 1;
+                unsigned int cw_ak_3 = (unsigned int)0;
+                if (cw_mine_3 != (unsigned int)0) {
+                    cw_ak_3 = my_key;
+                }
+                unsigned int cw_m_3;
+                asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(cw_m_3) : "r"(cw_ak_3));
+                unsigned int _warp_vote_8 = __ballot_sync(0xFFFFFFFF, my_key == cw_m_3);
+                unsigned int cw_eq_3 = cw_alive & _warp_vote_8;
+                unsigned int cw_pick_3 = cw_eq_3 & (cw_eq_3 ^ 4294967295u) + (unsigned int)1;
+                cw_c = cw_c | cw_pick_3;
+                cw_alive = cw_alive & (cw_pick_3 ^ 4294967295u);
+            }
+            if (cw_need > 4) {
+                unsigned int cw_mine_4 = cw_alive >> (unsigned int)lane & 1;
+                unsigned int cw_ak_4 = (unsigned int)0;
+                if (cw_mine_4 != (unsigned int)0) {
+                    cw_ak_4 = my_key;
+                }
+                unsigned int cw_m_4;
+                asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(cw_m_4) : "r"(cw_ak_4));
+                unsigned int _warp_vote_9 = __ballot_sync(0xFFFFFFFF, my_key == cw_m_4);
+                unsigned int cw_eq_4 = cw_alive & _warp_vote_9;
+                unsigned int cw_pick_4 = cw_eq_4 & (cw_eq_4 ^ 4294967295u) + (unsigned int)1;
+                cw_c = cw_c | cw_pick_4;
+                cw_alive = cw_alive & (cw_pick_4 ^ 4294967295u);
+            }
+            if (cw_need > 5) {
+                unsigned int cw_mine_5 = cw_alive >> (unsigned int)lane & 1;
+                unsigned int cw_ak_5 = (unsigned int)0;
+                if (cw_mine_5 != (unsigned int)0) {
+                    cw_ak_5 = my_key;
+                }
+                unsigned int cw_m_5;
+                asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(cw_m_5) : "r"(cw_ak_5));
+                unsigned int _warp_vote_10 = __ballot_sync(0xFFFFFFFF, my_key == cw_m_5);
+                unsigned int cw_eq_5 = cw_alive & _warp_vote_10;
+                unsigned int cw_pick_5 = cw_eq_5 & (cw_eq_5 ^ 4294967295u) + (unsigned int)1;
+                cw_c = cw_c | cw_pick_5;
+                cw_alive = cw_alive & (cw_pick_5 ^ 4294967295u);
+            }
+            if (cw_need > 6) {
+                unsigned int cw_mine_6 = cw_alive >> (unsigned int)lane & 1;
+                unsigned int cw_ak_6 = (unsigned int)0;
+                if (cw_mine_6 != (unsigned int)0) {
+                    cw_ak_6 = my_key;
+                }
+                unsigned int cw_m_6;
+                asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(cw_m_6) : "r"(cw_ak_6));
+                unsigned int _warp_vote_11 = __ballot_sync(0xFFFFFFFF, my_key == cw_m_6);
+                unsigned int cw_eq_6 = cw_alive & _warp_vote_11;
+                unsigned int cw_pick_6 = cw_eq_6 & (cw_eq_6 ^ 4294967295u) + (unsigned int)1;
+                cw_c = cw_c | cw_pick_6;
+                cw_alive = cw_alive & (cw_pick_6 ^ 4294967295u);
+            }
+            if (cw_need > 7) {
+                unsigned int cw_mine_7 = cw_alive >> (unsigned int)lane & 1;
+                unsigned int cw_ak_7 = (unsigned int)0;
+                if (cw_mine_7 != (unsigned int)0) {
+                    cw_ak_7 = my_key;
+                }
+                unsigned int cw_m_7;
+                asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(cw_m_7) : "r"(cw_ak_7));
+                unsigned int _warp_vote_12 = __ballot_sync(0xFFFFFFFF, my_key == cw_m_7);
+                unsigned int cw_eq_7 = cw_alive & _warp_vote_12;
+                unsigned int cw_pick_7 = cw_eq_7 & (cw_eq_7 ^ 4294967295u) + (unsigned int)1;
+                cw_c = cw_c | cw_pick_7;
+                cw_alive = cw_alive & (cw_pick_7 ^ 4294967295u);
+            }
+            if (cw_need > 8) {
+                unsigned int cw_mine_8 = cw_alive >> (unsigned int)lane & 1;
+                unsigned int cw_ak_8 = (unsigned int)0;
+                if (cw_mine_8 != (unsigned int)0) {
+                    cw_ak_8 = my_key;
+                }
+                unsigned int cw_m_8;
+                asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(cw_m_8) : "r"(cw_ak_8));
+                unsigned int _warp_vote_13 = __ballot_sync(0xFFFFFFFF, my_key == cw_m_8);
+                unsigned int cw_eq_8 = cw_alive & _warp_vote_13;
+                unsigned int cw_pick_8 = cw_eq_8 & (cw_eq_8 ^ 4294967295u) + (unsigned int)1;
+                cw_c = cw_c | cw_pick_8;
+                cw_alive = cw_alive & (cw_pick_8 ^ 4294967295u);
+            }
+            if (cw_need > 9) {
+                unsigned int cw_mine_9 = cw_alive >> (unsigned int)lane & 1;
+                unsigned int cw_ak_9 = (unsigned int)0;
+                if (cw_mine_9 != (unsigned int)0) {
+                    cw_ak_9 = my_key;
+                }
+                unsigned int cw_m_9;
+                asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(cw_m_9) : "r"(cw_ak_9));
+                unsigned int _warp_vote_14 = __ballot_sync(0xFFFFFFFF, my_key == cw_m_9);
+                unsigned int cw_eq_9 = cw_alive & _warp_vote_14;
+                unsigned int cw_pick_9 = cw_eq_9 & (cw_eq_9 ^ 4294967295u) + (unsigned int)1;
+                cw_c = cw_c | cw_pick_9;
+                cw_alive = cw_alive & (cw_pick_9 ^ 4294967295u);
+            }
+            if (cw_need > 10) {
+                unsigned int cw_mine_10 = cw_alive >> (unsigned int)lane & 1;
+                unsigned int cw_ak_10 = (unsigned int)0;
+                if (cw_mine_10 != (unsigned int)0) {
+                    cw_ak_10 = my_key;
+                }
+                unsigned int cw_m_10;
+                asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(cw_m_10) : "r"(cw_ak_10));
+                unsigned int _warp_vote_15 = __ballot_sync(0xFFFFFFFF, my_key == cw_m_10);
+                unsigned int cw_eq_10 = cw_alive & _warp_vote_15;
+                unsigned int cw_pick_10 = cw_eq_10 & (cw_eq_10 ^ 4294967295u) + (unsigned int)1;
+                cw_c = cw_c | cw_pick_10;
+                cw_alive = cw_alive & (cw_pick_10 ^ 4294967295u);
+            }
+            if (cw_need > 11) {
+                unsigned int cw_mine_11 = cw_alive >> (unsigned int)lane & 1;
+                unsigned int cw_ak_11 = (unsigned int)0;
+                if (cw_mine_11 != (unsigned int)0) {
+                    cw_ak_11 = my_key;
+                }
+                unsigned int cw_m_11;
+                asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(cw_m_11) : "r"(cw_ak_11));
+                unsigned int _warp_vote_16 = __ballot_sync(0xFFFFFFFF, my_key == cw_m_11);
+                unsigned int cw_eq_11 = cw_alive & _warp_vote_16;
+                unsigned int cw_pick_11 = cw_eq_11 & (cw_eq_11 ^ 4294967295u) + (unsigned int)1;
+                cw_c = cw_c | cw_pick_11;
+                cw_alive = cw_alive & (cw_pick_11 ^ 4294967295u);
+            }
+            if (cw_need > 12) {
+                unsigned int cw_mine_12 = cw_alive >> (unsigned int)lane & 1;
+                unsigned int cw_ak_12 = (unsigned int)0;
+                if (cw_mine_12 != (unsigned int)0) {
+                    cw_ak_12 = my_key;
+                }
+                unsigned int cw_m_12;
+                asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(cw_m_12) : "r"(cw_ak_12));
+                unsigned int _warp_vote_17 = __ballot_sync(0xFFFFFFFF, my_key == cw_m_12);
+                unsigned int cw_eq_12 = cw_alive & _warp_vote_17;
+                unsigned int cw_pick_12 = cw_eq_12 & (cw_eq_12 ^ 4294967295u) + (unsigned int)1;
+                cw_c = cw_c | cw_pick_12;
+                cw_alive = cw_alive & (cw_pick_12 ^ 4294967295u);
+            }
+            if (cw_need > 13) {
+                unsigned int cw_mine_13 = cw_alive >> (unsigned int)lane & 1;
+                unsigned int cw_ak_13 = (unsigned int)0;
+                if (cw_mine_13 != (unsigned int)0) {
+                    cw_ak_13 = my_key;
+                }
+                unsigned int cw_m_13;
+                asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(cw_m_13) : "r"(cw_ak_13));
+                unsigned int _warp_vote_18 = __ballot_sync(0xFFFFFFFF, my_key == cw_m_13);
+                unsigned int cw_eq_13 = cw_alive & _warp_vote_18;
+                unsigned int cw_pick_13 = cw_eq_13 & (cw_eq_13 ^ 4294967295u) + (unsigned int)1;
+                cw_c = cw_c | cw_pick_13;
+                cw_alive = cw_alive & (cw_pick_13 ^ 4294967295u);
+            }
+            if (cw_need > 14) {
+                unsigned int cw_mine_14 = cw_alive >> (unsigned int)lane & 1;
+                unsigned int cw_ak_14 = (unsigned int)0;
+                if (cw_mine_14 != (unsigned int)0) {
+                    cw_ak_14 = my_key;
+                }
+                unsigned int cw_m_14;
+                asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(cw_m_14) : "r"(cw_ak_14));
+                unsigned int _warp_vote_19 = __ballot_sync(0xFFFFFFFF, my_key == cw_m_14);
+                unsigned int cw_eq_14 = cw_alive & _warp_vote_19;
+                unsigned int cw_pick_14 = cw_eq_14 & (cw_eq_14 ^ 4294967295u) + (unsigned int)1;
+                cw_c = cw_c | cw_pick_14;
+                cw_alive = cw_alive & (cw_pick_14 ^ 4294967295u);
+            }
+            if (cw_need > 15) {
+                unsigned int cw_mine_15 = cw_alive >> (unsigned int)lane & 1;
+                unsigned int cw_ak_15 = (unsigned int)0;
+                if (cw_mine_15 != (unsigned int)0) {
+                    cw_ak_15 = my_key;
+                }
+                unsigned int cw_m_15;
+                asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(cw_m_15) : "r"(cw_ak_15));
+                unsigned int _warp_vote_20 = __ballot_sync(0xFFFFFFFF, my_key == cw_m_15);
+                unsigned int cw_eq_15 = cw_alive & _warp_vote_20;
+                unsigned int cw_pick_15 = cw_eq_15 & (cw_eq_15 ^ 4294967295u) + (unsigned int)1;
+                cw_c = cw_c | cw_pick_15;
+                cw_alive = cw_alive & (cw_pick_15 ^ 4294967295u);
+            }
         }
-        unsigned int rank_sum;
-        asm volatile("redux.sync.add.u32 %0, %1, 0xffffffff;" : "=r"(rank_sum) : "r"(rank_valid));
-        if ((int)rank_sum != cand_total * (cand_total - 1) >> 1) {
-            if (rank_keys[0] == my_key) {
-                if (lane > 0) {
-                    my_rank += 1;
-                }
-            }
-            if (rank_keys[1] == my_key) {
-                if (lane > 1) {
-                    my_rank += 1;
-                }
-            }
-            if (rank_keys[2] == my_key) {
-                if (lane > 2) {
-                    my_rank += 1;
-                }
-            }
-            if (rank_keys[3] == my_key) {
-                if (lane > 3) {
-                    my_rank += 1;
-                }
-            }
-            if (rank_keys[4] == my_key) {
-                if (lane > 4) {
-                    my_rank += 1;
-                }
-            }
-            if (rank_keys[5] == my_key) {
-                if (lane > 5) {
-                    my_rank += 1;
-                }
-            }
-            if (rank_keys[6] == my_key) {
-                if (lane > 6) {
-                    my_rank += 1;
-                }
-            }
-            if (rank_keys[7] == my_key) {
-                if (lane > 7) {
-                    my_rank += 1;
-                }
-            }
-            if (rank_keys[8] == my_key) {
-                if (lane > 8) {
-                    my_rank += 1;
-                }
-            }
-            if (rank_keys[9] == my_key) {
-                if (lane > 9) {
-                    my_rank += 1;
-                }
-            }
-            if (rank_keys[10] == my_key) {
-                if (lane > 10) {
-                    my_rank += 1;
-                }
-            }
-            if (rank_keys[11] == my_key) {
-                if (lane > 11) {
-                    my_rank += 1;
-                }
-            }
-            if (rank_keys[12] == my_key) {
-                if (lane > 12) {
-                    my_rank += 1;
-                }
-            }
-            if (rank_keys[13] == my_key) {
-                if (lane > 13) {
-                    my_rank += 1;
-                }
-            }
-            if (rank_keys[14] == my_key) {
-                if (lane > 14) {
-                    my_rank += 1;
-                }
-            }
-            if (rank_keys[15] == my_key) {
-                if (lane > 15) {
-                    my_rank += 1;
-                }
-            }
-            if (rank_keys[16] == my_key) {
-                if (lane > 16) {
-                    my_rank += 1;
-                }
-            }
-            if (rank_keys[17] == my_key) {
-                if (lane > 17) {
-                    my_rank += 1;
-                }
-            }
-            if (rank_keys[18] == my_key) {
-                if (lane > 18) {
-                    my_rank += 1;
-                }
-            }
-            if (rank_keys[19] == my_key) {
-                if (lane > 19) {
-                    my_rank += 1;
-                }
-            }
-            if (rank_keys[20] == my_key) {
-                if (lane > 20) {
-                    my_rank += 1;
-                }
-            }
-            if (rank_keys[21] == my_key) {
-                if (lane > 21) {
-                    my_rank += 1;
-                }
-            }
-            if (rank_keys[22] == my_key) {
-                if (lane > 22) {
-                    my_rank += 1;
-                }
-            }
-            if (rank_keys[23] == my_key) {
-                if (lane > 23) {
-                    my_rank += 1;
-                }
-            }
-            if (rank_keys[24] == my_key) {
-                if (lane > 24) {
-                    my_rank += 1;
-                }
-            }
-            if (rank_keys[25] == my_key) {
-                if (lane > 25) {
-                    my_rank += 1;
-                }
-            }
-            if (rank_keys[26] == my_key) {
-                if (lane > 26) {
-                    my_rank += 1;
-                }
-            }
-            if (rank_keys[27] == my_key) {
-                if (lane > 27) {
-                    my_rank += 1;
-                }
-            }
-            if (rank_keys[28] == my_key) {
-                if (lane > 28) {
-                    my_rank += 1;
-                }
-            }
-            if (rank_keys[29] == my_key) {
-                if (lane > 29) {
-                    my_rank += 1;
-                }
-            }
-            if (rank_keys[30] == my_key) {
-                if (lane > 30) {
-                    my_rank += 1;
-                }
-            }
-            if (rank_keys[31] == my_key) {
-                if (lane > 31) {
-                    my_rank += 1;
-                }
-            }
-        }
-        unsigned int win_ballot = __ballot_sync(0xFFFFFFFF, my_rank < 16);
-        if (my_rank < 16) {
+        unsigned int win_ballot = cw_c;
+        if ((win_ballot >> (unsigned int)lane & (unsigned int)1) != (unsigned int)0) {
             int win_slot = (int)(unsigned int)__popc(win_ballot & lanemask_lt);
             if (win_slot < 16) {
                 winner_ids[win_slot] = my_id;
@@ -844,14 +921,18 @@ kernel_cake_kimi_k3_fused_router_27a24128e0b7468b7878(float* __restrict__ logits
         }
         int selected_id = winner_ids[tid];
         unsigned long long output_index = (unsigned long long)token * (unsigned long long)TOP_K + (unsigned long long)tid;
-        float _fdiv_4;
-        asm volatile("div.full.f32 %0, %1, %2;" : "=f"(_fdiv_4) : "f"(winner_scores[tid]), "f"(selected_norm));
-        topk_weights[output_index] = _fdiv_4;
+        float _fdiv_21;
+        asm volatile("div.full.f32 %0, %1, %2;" : "=f"(_fdiv_21) : "f"(winner_scores[tid]), "f"(selected_norm));
+        topk_weights[output_index] = _fdiv_21;
         topk_ids[output_index] = selected_id;
         expert_ids[tid] = selected_id;
     }
     __syncthreads();
     int plan_winner = winner_ids[lane & TOP_K - 1];
+    if (tid < TOP_K) {
+        expert_counts[plan_winner] = 1;
+        expert_scatter_offsets[plan_winner] = 1;
+    }
     int plan_rel = plan_winner - warp * (32 * ITEMS_PER_THREAD);
     unsigned int plan_below_warp = __ballot_sync(0xFFFFFFFF, plan_rel < 0);
     unsigned int plan_bit = (unsigned int)0;
@@ -886,14 +967,6 @@ kernel_cake_kimi_k3_fused_router_27a24128e0b7468b7878(float* __restrict__ logits
     plan_cnt[3] = plan_flag0_1_3;
     plan_off[3] = plan_running << BLOCK_SHIFT;
     plan_running += plan_flag0_1_3;
-    {
-        int4 _iv4 = make_int4(plan_cnt[0 + 0], plan_cnt[0 + 1], plan_cnt[0 + 2], plan_cnt[0 + 3]);
-        *reinterpret_cast<int4*>(expert_counts + expert_base) = _iv4;
-    }
-    {
-        int4 _iv4 = make_int4(plan_cnt[0 + 0], plan_cnt[0 + 1], plan_cnt[0 + 2], plan_cnt[0 + 3]);
-        *reinterpret_cast<int4*>(expert_scatter_offsets + expert_base) = _iv4;
-    }
     {
         int4 _iv4 = make_int4(plan_off[0 + 0], plan_off[0 + 1], plan_off[0 + 2], plan_off[0 + 3]);
         *reinterpret_cast<int4*>(expert_offsets + expert_base) = _iv4;
