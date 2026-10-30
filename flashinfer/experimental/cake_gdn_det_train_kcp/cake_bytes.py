@@ -78,7 +78,7 @@ with a successor in its document chain), ``N_in`` / ``N_out`` the group totals,
   ``forward`` / ``backward`` are the two lifetimes, the workspace their maximum.
   The local terms are the design's tape sizes; the kernels' own scratch is
   added when the programs exist (every term is listed by
-  :func:`gdn_kcp_workspace_layout` so the host can account for it).
+  :func:`gdn_det_workspace_layout_kcp` so the host can account for it).
 
 All sizes are exact integers of the shapes the host allocates (``R = 64
 NC_pad`` padded token rows, ``NC_pad`` the even chunk bound), not estimates.
@@ -281,7 +281,7 @@ def gdn_det_comm_bytes_kcp(
     }
 
 
-def gdn_kcp_saved_layout(
+def gdn_det_saved_layout_kcp(
     ctx: ContextDetKcp,
     *,
     H_qk: int,
@@ -352,9 +352,9 @@ def gdn_det_saved_bytes_kcp(
     C: int | None = None,
     P: int | None = None,
 ) -> int:
-    """Saved-set bytes of one layer on this rank (the sum of :func:`gdn_kcp_saved_layout`)."""
+    """Saved-set bytes of one layer on this rank (the sum of :func:`gdn_det_saved_layout_kcp`)."""
     return sum(
-        gdn_kcp_saved_layout(
+        gdn_det_saved_layout_kcp(
             ctx,
             H_qk=H_qk,
             HV=HV,
@@ -368,7 +368,7 @@ def gdn_det_saved_bytes_kcp(
     )
 
 
-def gdn_kcp_workspace_layout(
+def gdn_det_workspace_layout_kcp(
     ctx: ContextDetKcp,
     *,
     H_qk: int,
@@ -385,7 +385,7 @@ def gdn_kcp_workspace_layout(
 ) -> dict[str, int]:
     """The caller-held workspace of one rank, term by term (``fwd.*`` / ``bwd.*`` in bytes), with the lifetime
     maxima ``forward`` / ``backward`` and their maximum ``workspace`` (module docstring).  Saved-set tensors are
-    counted by :func:`gdn_kcp_saved_layout`, never here.
+    counted by :func:`gdn_det_saved_layout_kcp`, never here.
 
     The terms follow the arena's lifetimes (the host drops a buffer at its last reader, so a lifetime's figure is
     the most the workspace binds in it, not the sum of everything it ever binds):
@@ -430,7 +430,7 @@ def gdn_kcp_workspace_layout(
     staging = plane + (0 if (boundary_mode == "saved" and save_transfer) else plane)
     carry = (ctx.n_frag * (P - 1) * s) if P > 1 else 0
     # the forward tapes (#1 outputs + the #2 tape walk); in "light" they are workspace in the forward and, replayed,
-    # in the backward; in "full" they are saved-set bytes (gdn_kcp_saved_layout), not workspace
+    # in the backward; in "full" they are saved-set bytes (gdn_det_saved_layout_kcp), not workspace
     light_tapes = {
         "w": R * HV * ROW_BF16_128,
         "u": R * HV * ROW_BF16_128,
@@ -568,9 +568,9 @@ def gdn_det_workspace_bytes_kcp(
     group_reduce: str = "fused",
     reuse_recompute_tapes: bool | str | None = None,
 ) -> int:
-    """Caller-held workspace bytes of one rank (the ``workspace`` entry of :func:`gdn_kcp_workspace_layout`): the
+    """Caller-held workspace bytes of one rank (the ``workspace`` entry of :func:`gdn_det_workspace_layout_kcp`): the
     most the workspace binds in the forward or the backward of these options."""
-    return gdn_kcp_workspace_layout(
+    return gdn_det_workspace_layout_kcp(
         ctx,
         H_qk=H_qk,
         HV=HV,
@@ -599,9 +599,9 @@ __all__ = [
     "TAPE_NAME_OF",
     "gdn_det_comm_bytes_kcp",
     "gdn_det_saved_bytes_kcp",
-    "gdn_kcp_saved_layout",
+    "gdn_det_saved_layout_kcp",
     "gdn_det_workspace_bytes_kcp",
-    "gdn_kcp_workspace_layout",
+    "gdn_det_workspace_layout_kcp",
     "state_bytes",
 ]
 
@@ -609,3 +609,5 @@ __all__ = [
 gdn_kcp_comm_bytes = gdn_det_comm_bytes_kcp
 gdn_kcp_saved_bytes = gdn_det_saved_bytes_kcp
 gdn_kcp_workspace_bytes = gdn_det_workspace_bytes_kcp
+gdn_kcp_saved_layout = gdn_det_saved_layout_kcp
+gdn_kcp_workspace_layout = gdn_det_workspace_layout_kcp

@@ -374,7 +374,7 @@ class _PeakWorkspace:
     ids=["issue-2x6", "32k-16x48"],
 )
 def test_workspace_bytes_match_what_the_backward_binds(device, cu, heads) -> None:
-    """``gdn_kcp_workspace_layout`` is what a caller-held workspace binds (tolerance 0): the forward's tape-walk peak,
+    """``gdn_det_workspace_layout_kcp`` is what a caller-held workspace binds (tolerance 0): the forward's tape-walk peak,
     and the backward's phase maximum of each tape form -- the kept-tape form (the ten light tapes are the recompute's
     hand-off tensors, four of them re-adopted after #8) and the replay form (the ten light tapes are workspace)."""
     import gc
@@ -392,7 +392,7 @@ def test_workspace_bytes_match_what_the_backward_binds(device, cu, heads) -> Non
     leaves = [inputs[n].to(device).detach().requires_grad_(True) for n in OPERANDS]
     dout = inputs["dout"].to(device)
     for form in (True, False):
-        layout = gb.gdn_kcp_workspace_layout(
+        layout = gb.gdn_det_workspace_layout_kcp(
             ctx, H_qk=H, HV=HV, reuse_recompute_tapes=form
         )
         ws = _PeakWorkspace(kcp)

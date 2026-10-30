@@ -1157,7 +1157,7 @@ def test_byte_queries(W) -> None:
                         ctx, H_qk, HV, save_mode, boundary_mode, save_transfer, C_CONV
                     )
                     assert got == want, (r, save_mode, boundary_mode, save_transfer)
-                    layout = gb.gdn_kcp_saved_layout(
+                    layout = gb.gdn_det_saved_layout_kcp(
                         ctx,
                         H_qk=H_qk,
                         HV=HV,
@@ -1169,7 +1169,7 @@ def test_byte_queries(W) -> None:
                     assert sum(layout.values()) == got and all(
                         v >= 0 for v in layout.values()
                     )
-                    ws = gb.gdn_kcp_workspace_layout(
+                    ws = gb.gdn_det_workspace_layout_kcp(
                         ctx,
                         H_qk=H_qk,
                         HV=HV,
@@ -1211,7 +1211,7 @@ def test_byte_queries(W) -> None:
                         for p in ("exchange", "walk", "end")
                     )
                     kept_ws, replay_ws = (
-                        gb.gdn_kcp_workspace_layout(
+                        gb.gdn_det_workspace_layout_kcp(
                             ctx,
                             H_qk=H_qk,
                             HV=HV,
@@ -1265,7 +1265,7 @@ def test_byte_queries(W) -> None:
         assert full - light == ctx.NC_pad * HV * (32768 + 4) + ctx.R * HV * (
             3 * 256 + 2 * 128 + 3 * 4
         )  # h + gamma, v_new / w / u, Aqk / Akk, gcum / rowscale / qscale
-        host = gb.gdn_kcp_workspace_layout(
+        host = gb.gdn_det_workspace_layout_kcp(
             ctx, H_qk=H_qk, HV=HV, group_reduce="host", C=C_CONV
         )
         assert host["bwd.group_partials"] == 2 * ctx.T_r * HV * 128 * 4
@@ -2205,7 +2205,7 @@ def test_transpose_tiles_scratch_is_bitwise_the_temporary_form() -> None:
 
 
 def test_workspace_layout_counts_one_staging_plane_under_save_transfer() -> None:
-    """R2-L1 1a: ``gdn_kcp_workspace_layout`` counts the ``stage_m`` plane only when the call sizes it (replay
+    """R2-L1 1a: ``gdn_det_workspace_layout_kcp`` counts the ``stage_m`` plane only when the call sizes it (replay
     boundary or ``save_transfer=False``); under the shipped saved + ``save_transfer`` form the saved ``M_seg^T``
     stands in for it and the workspace holds ``stage_b`` alone (the ring pools are never workspace terms)."""
     cu = torch.tensor([0, 100, 740, 817, 1817, 1946], dtype=torch.int64)
@@ -2220,7 +2220,7 @@ def test_workspace_layout_counts_one_staging_plane_under_save_transfer() -> None
         ctx_row = gp.build_context_det_kcp(part, None, r, CPU, 4, sm_count=SM_COUNT)
         hp_row = ctx_row.heads(HV)
         assert hp_row.segments.p_rule == "row_cost_lpt" and hp_row.P == 1
-        one_row = gb.gdn_kcp_workspace_layout(ctx_row, H_qk=H_qk, HV=HV)
+        one_row = gb.gdn_det_workspace_layout_kcp(ctx_row, H_qk=H_qk, HV=HV)
         assert one_row["fwd.staging"] == one_row["bwd.staging"] == 0
     for r in range(2):
         ctx = gp.build_context_det_kcp(
@@ -2231,18 +2231,21 @@ def test_workspace_layout_counts_one_staging_plane_under_save_transfer() -> None
         )  # the layout's staging term uses the plan's own segment count
         plane = hp.NSEG * HV * gp.STATE_TILE_BYTES if hp.P > 1 else 0
         seen_segmented = seen_segmented or hp.P > 1
-        one = gb.gdn_kcp_workspace_layout(ctx, H_qk=H_qk, HV=HV)
-        two_a = gb.gdn_kcp_workspace_layout(
+        one = gb.gdn_det_workspace_layout_kcp(ctx, H_qk=H_qk, HV=HV)
+        two_a = gb.gdn_det_workspace_layout_kcp(
             ctx, H_qk=H_qk, HV=HV, boundary_mode="replay"
         )
-        two_b = gb.gdn_kcp_workspace_layout(ctx, H_qk=H_qk, HV=HV, save_transfer=False)
+        two_b = gb.gdn_det_workspace_layout_kcp(
+            ctx, H_qk=H_qk, HV=HV, save_transfer=False
+        )
         assert one["fwd.staging"] == one["bwd.staging"] == plane
         assert two_a["fwd.staging"] == two_a["bwd.staging"] == 2 * plane
         assert two_b["fwd.staging"] == two_b["bwd.staging"] == 2 * plane
         assert one["fwd.c1_recv"] == 0 and two_b["fwd.c1_recv"] > 0
         assert not any(k.endswith("ring_out") or k.endswith("ring_in") for k in one)
         assert (
-            gb.gdn_kcp_workspace_layout(ctx, H_qk=H_qk, HV=HV, P=1)["fwd.staging"] == 0
+            gb.gdn_det_workspace_layout_kcp(ctx, H_qk=H_qk, HV=HV, P=1)["fwd.staging"]
+            == 0
         )
     assert seen_segmented  # the row has a segmented rank: the plane term was exercised
 
@@ -3528,7 +3531,7 @@ def test_recompute_output_auto_resolves_on_every_cuda_build_of_the_release(
         _assert_same(res, direct, build)
 
 
-# --------------------------------------------------------------------------- issue #7074 (4): gdn_kcp_workspace_layout follows the arena's lifetimes
+# --------------------------------------------------------------------------- issue #7074 (4): gdn_det_workspace_layout_kcp follows the arena's lifetimes
 # What a caller-held workspace binds, per tape form: the forward's tape-walk peak and the backward's phase maximum.
 
 
@@ -3568,7 +3571,7 @@ class _PeakWorkspace:
 
 
 def test_workspace_layout_follows_the_arena_lifetimes() -> None:
-    """``gdn_kcp_workspace_layout`` is what a caller-held workspace binds: the forward's tape-walk peak, and the
+    """``gdn_det_workspace_layout_kcp`` is what a caller-held workspace binds: the forward's tape-walk peak, and the
     backward's phase maximum of the form -- the kept-tape form ends with the four re-adopted forward tapes beside the
     backward tapes (the ten kept tapes are hand-off tensors outside the workspace, ``bwd.kept_tapes``), the replay
     form holds the ten light tapes through the backward; both forms need the same transient bytes."""
@@ -3588,7 +3591,7 @@ def test_workspace_layout_follows_the_arena_lifetimes() -> None:
 
     layouts = {}
     for form in (True, False):
-        layout = gb.gdn_kcp_workspace_layout(
+        layout = gb.gdn_det_workspace_layout_kcp(
             ctx, H_qk=H_qk, HV=HV, reuse_recompute_tapes=form
         )
         layouts[form] = layout
@@ -3659,11 +3662,13 @@ def test_workspace_layout_follows_the_arena_lifetimes() -> None:
     )
     assert kept["forward"] == replay["forward"]
     # the keyword resolves through the package default, and the bytes query is the layout's maximum
-    default = gb.gdn_kcp_workspace_layout(ctx, H_qk=H_qk, HV=HV)
+    default = gb.gdn_det_workspace_layout_kcp(ctx, H_qk=H_qk, HV=HV)
     opt = _package("cake_options")
     assert default == layouts[opt.REUSE_RECOMPUTE_TAPES_DEFAULT is True]
     assert (
-        gb.gdn_kcp_workspace_layout(ctx, H_qk=H_qk, HV=HV, reuse_recompute_tapes="auto")
+        gb.gdn_det_workspace_layout_kcp(
+            ctx, H_qk=H_qk, HV=HV, reuse_recompute_tapes="auto"
+        )
         == replay
     )
     for form in (True, False):
@@ -3674,7 +3679,9 @@ def test_workspace_layout_follows_the_arena_lifetimes() -> None:
             == layouts[form]["workspace"]
         )
     with pytest.raises(ValueError, match="reuse_recompute_tapes must be"):
-        gb.gdn_kcp_workspace_layout(ctx, H_qk=H_qk, HV=HV, reuse_recompute_tapes="yes")
+        gb.gdn_det_workspace_layout_kcp(
+            ctx, H_qk=H_qk, HV=HV, reuse_recompute_tapes="yes"
+        )
 
 
 # --------------------------------------------------------------------------- issue #7074 (2): reuse_recompute_tapes="auto"

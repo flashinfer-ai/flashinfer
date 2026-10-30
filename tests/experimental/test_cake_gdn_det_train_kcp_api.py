@@ -464,7 +464,11 @@ def test_legacy_names_are_aliases_of_the_canonical_objects() -> None:
 
     pkg = importlib.import_module(PACKAGE)
     legacy_pkg = importlib.import_module("flashinfer.experimental.cake_gdn_train")
-    assert list(legacy_pkg.__all__) == list(pkg.__all__)
+    # star-import of the legacy package binds the canonical names and the pre-rename ones
+    assert set(legacy_pkg.__all__) == set(pkg.__all__) | set(LEGACY_PACKAGE_NAMES)
+    assert len(legacy_pkg.__all__) == len(set(legacy_pkg.__all__))
+    for old in LEGACY_PACKAGE_NAMES:
+        assert old in legacy_pkg.__all__, old
     for n in pkg.__all__:
         assert getattr(legacy_pkg, n) is getattr(pkg, n), n
     for old, new in LEGACY_PACKAGE_NAMES.items():
@@ -473,6 +477,8 @@ def test_legacy_names_are_aliases_of_the_canonical_objects() -> None:
         assert getattr(legacy_pkg, old) is getattr(pkg, new), old
     for sub in LEGACY_SUBMODULES:
         canonical = importlib.import_module(f"{PACKAGE}.{sub}")
+        # bound as an attribute by the legacy package's import, before any import of the legacy submodule path
+        assert getattr(legacy_pkg, sub) is canonical, sub
         assert (
             importlib.import_module(f"flashinfer.experimental.cake_gdn_train.{sub}")
             is canonical
@@ -486,6 +492,9 @@ def test_legacy_names_are_aliases_of_the_canonical_objects() -> None:
     assert plan.kcp_partition is plan.partition_det_kcp
     kcp = importlib.import_module(f"{PACKAGE}.cake_kcp")
     assert kcp.chunk_gdn_kcp is kcp.chunk_gdn_det_kcp
+    gb = importlib.import_module(f"{PACKAGE}.cake_bytes")
+    assert gb.gdn_kcp_saved_layout is gb.gdn_det_saved_layout_kcp
+    assert gb.gdn_kcp_workspace_layout is gb.gdn_det_workspace_layout_kcp
     assert kcp.KcpOptions is kcp.OptionsDetKcp is _mod("cake_options").KcpOptions
     assert pkg.ContextDetKcp.__qualname__ == "ContextDetKcp"
     assert pkg.chunk_gdn_det_kcp.__name__ == "chunk_gdn_det_kcp"
@@ -1188,10 +1197,10 @@ def test_workspace_holds_one_zeroed_ticket_slot_per_persistent_site() -> None:
     other.ensure(ctx, H_qk, HV, device="cpu", backward=True)
     assert other.ticket("fwd_o").data_ptr() != ws.ticket("fwd_o").data_ptr()
     # the public query counts every site's slot in both lifetimes
-    layout = gb.gdn_kcp_workspace_layout(ctx, H_qk=H_qk, HV=HV)
+    layout = gb.gdn_det_workspace_layout_kcp(ctx, H_qk=H_qk, HV=HV)
     assert layout["fwd.tickets"] == layout["bwd.tickets"] == gb.TICKET_BYTES
     assert (
-        gb.gdn_kcp_workspace_layout(ctx, H_qk=H_qk, HV=HV, backward=False)[
+        gb.gdn_det_workspace_layout_kcp(ctx, H_qk=H_qk, HV=HV, backward=False)[
             "fwd.tickets"
         ]
         == gb.TICKET_BYTES

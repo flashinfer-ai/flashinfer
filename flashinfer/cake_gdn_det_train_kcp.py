@@ -343,7 +343,7 @@ def chunk_gdn_det_kcp(
 def gdn_det_workspace_bytes_kcp(ctx: Any, *, H_qk: int, HV: int, **kw: Any) -> int:
     r"""Caller-held workspace bytes of one rank for ``(ctx, H_qk, HV)`` (exchange pools, staging, tapes): the most
     the workspace binds in the forward or the backward of the given options (``reuse_recompute_tapes`` as a keyword;
-    the per-phase terms are ``gdn_kcp_workspace_layout`` of the package)."""
+    the per-phase terms are ``gdn_det_workspace_layout_kcp`` of the package)."""
     return _pkg().gdn_det_workspace_bytes_kcp(ctx, H_qk=H_qk, HV=HV, **kw)
 
 

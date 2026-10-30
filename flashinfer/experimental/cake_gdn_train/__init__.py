@@ -21,7 +21,7 @@ limitations under the License.
 # submodule (``cake_kcp_plan``, ...) is the canonical submodule object itself.
 
 from ..cake_gdn_det_train_kcp import *  # noqa: F403
-from ..cake_gdn_det_train_kcp import __all__ as __all__
+from ..cake_gdn_det_train_kcp import __all__ as _canonical_all
 from ..cake_gdn_det_train_kcp import (  # noqa: F401 - compatibility aliases
     ChunkGDNKcpFunction,
     KcpCall,
@@ -41,3 +41,38 @@ from ..cake_gdn_det_train_kcp import (  # noqa: F401 - compatibility aliases
     gdn_kcp_workspace_bytes,
     kcp_partition,
 )
+
+# The submodules as attributes of this package, as before the rename (each import runs its alias shim).
+from . import (  # noqa: F401, E402
+    cake_backend,
+    cake_build,
+    cake_bytes,
+    cake_fake_backend,
+    cake_jit,
+    cake_kcp,
+    cake_kcp_plan,
+    cake_options,
+    cake_tables,
+)
+
+# The canonical names and the pre-rename names, so ``from ... import *`` binds both.
+__all__ = [
+    *_canonical_all,
+    "ChunkGDNKcpFunction",
+    "KcpCall",
+    "KcpContext",
+    "KcpFragment",
+    "KcpOptions",
+    "KcpPartition",
+    "KcpRecomputeHandle",
+    "KcpSaved",
+    "KcpWorkspace",
+    "build_kcp_context",
+    "chunk_gdn_kcp",
+    "chunk_gdn_kcp_bwd",
+    "chunk_gdn_kcp_fwd",
+    "gdn_kcp_comm_bytes",
+    "gdn_kcp_saved_bytes",
+    "gdn_kcp_workspace_bytes",
+    "kcp_partition",
+]

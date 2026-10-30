@@ -58,6 +58,7 @@
           - "flashinfer/jit/cake_fused_kda*"
           - "flashinfer/jit/cake_gdn*"
           - "flashinfer/cake_kda*"
+          - "flashinfer/cake_gdn_det_train_kcp.py"
           - "flashinfer/trace/templates/kda.py"
           - "csrc/kda/**"
           - "tests/kda/**"
