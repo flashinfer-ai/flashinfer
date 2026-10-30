@@ -15,7 +15,7 @@
       "type": "var",
       "description": "Exact number of planned MLA requests."
     },
-    "max_seq_len_q": {
+    "max_q_len": {
       "type": "const",
       "value": 4,
       "description": "Query-length capacity frozen by plan()."

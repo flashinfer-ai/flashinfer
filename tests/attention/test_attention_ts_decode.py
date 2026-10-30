@@ -1613,7 +1613,7 @@ def _plan_case(
     *,
     max_kv_len: int,
     qo_indptr: Optional[torch.Tensor] = None,
-    max_seq_len_q: Optional[int] = None,
+    max_q_len: Optional[int] = None,
     kv_scale_factors=None,
     dynamic_kv: bool = True,
 ):
@@ -1643,7 +1643,7 @@ def _plan_case(
         out_dtype=case.out_dtype,
         mask_type=case.mask_type,
         window_left=case.window_left,
-        max_seq_len_q=seq_len_q if max_seq_len_q is None else max_seq_len_q,
+        max_q_len=seq_len_q if max_q_len is None else max_q_len,
         seq_lens_kv=seq_lens_kv,
     )
 
@@ -1720,7 +1720,7 @@ def _run_standalone(
     *,
     max_kv_len: int,
     qo_indptr: Optional[torch.Tensor] = None,
-    max_seq_len_q: Optional[int] = None,
+    max_q_len: Optional[int] = None,
     out: Optional[torch.Tensor] = None,
     workspace_buffer: Optional[torch.Tensor] = None,
     block_table: Optional[torch.Tensor] = None,
@@ -1742,7 +1742,7 @@ def _run_standalone(
             max_kv_len,
             seq_len_q=seq_len_q,
             qo_indptr=qo_indptr,
-            max_seq_len_q=max_seq_len_q,
+            max_q_len=max_q_len,
             q_dtype=case.q.dtype,
             k_dtype=case.k_cache.dtype,
             v_dtype=case.v_cache.dtype,
@@ -1768,7 +1768,7 @@ def _run_standalone(
         max_kv_len=max_kv_len,
         seq_len_q=seq_len_q,
         qo_indptr=qo_indptr,
-        max_seq_len_q=max_seq_len_q,
+        max_q_len=max_q_len,
         softmax_scale=case.softmax_scale,
         output_scale=case.output_scale,
         out=output,
@@ -1824,7 +1824,7 @@ def _exercise_public_paths(
     max_kv_len: int,
     exercise_all_paths: bool,
     qo_indptr: Optional[torch.Tensor] = None,
-    max_seq_len_q: Optional[int] = None,
+    max_q_len: Optional[int] = None,
 ):
     """Always check eager; reserve standalone/graph parity for anchor rows."""
 
@@ -1862,7 +1862,7 @@ def _exercise_public_paths(
         seq_lens_kv,
         max_kv_len=max_kv_len,
         qo_indptr=qo_indptr,
-        max_seq_len_q=max_seq_len_q,
+        max_q_len=max_q_len,
     )
     _assert_case_correct(standalone, case)
     torch.testing.assert_close(standalone, eager, rtol=0, atol=0)
@@ -1989,7 +1989,7 @@ def _exercise_auto_case(
     case: _DecodeCase,
     *,
     qo_indptr: Optional[torch.Tensor] = None,
-    max_seq_len_q: Optional[int] = None,
+    max_q_len: Optional[int] = None,
     exercise_all_paths: bool = False,
     dynamic_kv: bool = True,
 ) -> dict[str, object]:
@@ -2006,7 +2006,7 @@ def _exercise_auto_case(
         case,
         max_kv_len=max_kv_len,
         qo_indptr=qo_indptr,
-        max_seq_len_q=max_seq_len_q,
+        max_q_len=max_q_len,
         dynamic_kv=dynamic_kv,
     )
     policy = dict(wrapper._policy)
@@ -2018,7 +2018,7 @@ def _exercise_auto_case(
         max_kv_len=max_kv_len,
         exercise_all_paths=exercise_all_paths,
         qo_indptr=qo_indptr,
-        max_seq_len_q=max_seq_len_q,
+        max_q_len=max_q_len,
     )
     return policy
 
@@ -2029,7 +2029,7 @@ def _exercise_explicit_profile_case(
     explicit_profile: dict[str, object],
     *,
     qo_indptr: Optional[torch.Tensor] = None,
-    max_seq_len_q: Optional[int] = None,
+    max_q_len: Optional[int] = None,
     exercise_all_paths: bool = False,
 ) -> dict[str, object]:
     """Run a public path with ``explicit_profile`` pinned over automatic selection."""
@@ -2057,7 +2057,7 @@ def _exercise_explicit_profile_case(
         return _exercise_auto_case(
             case,
             qo_indptr=qo_indptr,
-            max_seq_len_q=max_seq_len_q,
+            max_q_len=max_q_len,
             exercise_all_paths=exercise_all_paths,
         )
     finally:
@@ -2307,16 +2307,16 @@ def test_attention_ts_decode_public_query_geometry_guards() -> None:
     _validate_decode_query_head_extent(
         batch_size=int32_max,
         num_qo_heads=1,
-        max_seq_len_q=1,
+        max_q_len=1,
     )
     with pytest.raises(
         NotImplementedError,
-        match=r"batch_size \* max_seq_len_q \* num_qo_heads.*signed int32",
+        match=r"batch_size \* max_q_len \* num_qo_heads.*signed int32",
     ):
         _validate_decode_query_head_extent(
             batch_size=int32_max + 1,
             num_qo_heads=1,
-            max_seq_len_q=1,
+            max_q_len=1,
         )
 
     for supported_ratio in range(1, 129):
@@ -2476,6 +2476,7 @@ def test_attention_ts_decode_register_reallocation_follows_task_graph(
     """Register hand-off follows topology and amortized KV256 loop length."""
 
     config = FmhaDecodeConfig(
+        fixed_seqlen=True,
         tile_size_q=tile_size_q,
         tile_size_kv=tile_size_kv,
         use_keeps_mma_ab=use_keeps_mma_ab,
@@ -2670,7 +2671,7 @@ def test_attention_ts_decode_wrapper_has_compile_oriented_contract() -> None:
         "kv_scale_factors",
         "seq_len_q",
         "qo_indptr",
-        "max_seq_len_q",
+        "max_q_len",
         "mask_type",
         "window_left",
         "kv_layout",
@@ -2701,7 +2702,7 @@ def test_attention_ts_decode_wrapper_has_compile_oriented_contract() -> None:
         "head_dim",
         "page_size",
         "max_kv_len",
-        "max_seq_len_q",
+        "max_q_len",
         "packed_query",
         "q_dtype",
         "k_dtype",
@@ -2730,6 +2731,8 @@ def test_attention_ts_decode_wrapper_has_compile_oriented_contract() -> None:
         "qo_indptr",
         "softmax_scale",
         "output_scale",
+        "max_q_len",
+        "max_kv_len",
         "out",
         "lse",
         "return_lse",
@@ -2740,7 +2743,7 @@ def test_attention_ts_decode_wrapper_has_compile_oriented_contract() -> None:
     assert run_parameters["validate"].default is True
 
     assert _DecodePlanState.__dataclass_params__.frozen is True
-    assert {"batch_size", "max_kv_len", "max_seq_len_q", "seq_lens_kv"}.issubset(
+    assert {"batch_size", "max_kv_len", "max_q_len", "seq_lens_kv"}.issubset(
         inspect.signature(BatchDecodePagedTSWrapper.plan).parameters
     )
     request_fields = {"qo_indptr", "block_tables"}
@@ -2911,7 +2914,7 @@ def test_attention_ts_decode_bound_wrapper_trace_uses_plan_state():
         "dtype": "float16",
         "param": "out",
     }
-    assert defn["axes"]["max_seq_len_q"]["value"] == 3
+    assert defn["axes"]["max_q_len"]["value"] == 3
     assert defn["axes"]["max_kv_len"]["value"] == 64
     assert "mask:causal" in defn["tags"]
 
@@ -3002,6 +3005,7 @@ def _make_paged_window_crossing_config(*, page_size: int):
     return make_decode_config(
         headdim=128,
         args={
+            "fixed_seqlen": True,
             "use_keeps_mma_ab": True,
             "tile_size_q": 64,
             "groups_tokens_heads_q": False,
@@ -3539,7 +3543,7 @@ def test_attention_ts_decode_grouped_keeps_split_reduction(
             kv_tokens,
             seq_len_q=group_size,
             qo_indptr=None,
-            max_seq_len_q=None,
+            max_q_len=None,
             out=output,
             out_dtype=torch.bfloat16,
             mask_type="causal",
@@ -3740,7 +3744,7 @@ def test_attention_ts_decode_q4_keeps_kv128_d256_page_membership(
             kv_tokens,
             seq_len_q=4,
             qo_indptr=None,
-            max_seq_len_q=None,
+            max_q_len=None,
             out=output,
             out_dtype=torch.bfloat16,
             mask_type="causal",
@@ -4226,6 +4230,8 @@ def test_attention_ts_decode_kv256_register_launch_bound_is_amortized() -> None:
     cfg = _make_contiguous_kv256_config()
     assert _decode_min_blocks_per_mp(cfg, 31 * cfg.tile_size_kv) == 0
     assert _decode_min_blocks_per_mp(cfg, 31 * cfg.tile_size_kv + 1) == 1
+    # Runtime KV lengths cannot amortize, so they always keep the bound.
+    assert _decode_min_blocks_per_mp(cfg, None) == 1
 
 
 def test_attention_ts_decode_kv256_register_budget_matches_launch_bound() -> None:
@@ -4234,6 +4240,7 @@ def test_attention_ts_decode_kv256_register_budget_matches_launch_bound() -> Non
     cfg = make_decode_config(
         headdim=128,
         args={
+            "fixed_seqlen": True,
             "use_keeps_mma_ab": True,
             "tile_size_q": 64,
             "tile_size_kv": 256,
@@ -4975,6 +4982,8 @@ def test_attention_ts_decode_run_validate_false_skips_explicit_checks(
             "requested_splits": 1,
             "max_kv_len": 128,
             "packed_query": False,
+            "seq_len_q": 1,
+            "fixed_q_offsets": torch.arange(3, dtype=torch.int32),
             "workspace": object(),
             "compiled_main": object(),
             "compiled_reducer": None,
@@ -4983,7 +4992,7 @@ def test_attention_ts_decode_run_validate_false_skips_explicit_checks(
         },
     )()
     runtime = object()
-    runtime_seq_lens_kv = object()
+    runtime_seq_lens_kv = torch.tensor([127, 128], dtype=torch.int32)
     output = object()
 
     def fail_validation(*_args, **_kwargs):
@@ -5015,7 +5024,7 @@ def test_attention_ts_decode_run_validate_false_skips_explicit_checks(
 
     assert (
         wrapper.run(
-            object(),
+            torch.empty((2, 8, 128), dtype=torch.bfloat16),
             object(),
             runtime_seq_lens_kv,
             object(),
@@ -5293,7 +5302,7 @@ def test_attention_ts_decode_rejects_per_request_causal_q_longer_than_kv(
         torch.tensor([0, 5, 6], dtype=torch.int32, device=device) if packed_q else None
     )
     seq_len_q = 1 if packed_q else 8
-    max_seq_len_q = 5 if packed_q else None
+    max_q_len = 5 if packed_q else None
     q = torch.empty(
         (6, 8, 64) if packed_q else (2, 8, 8, 64),
         dtype=torch.float16,
@@ -5313,7 +5322,7 @@ def test_attention_ts_decode_rejects_per_request_causal_q_longer_than_kv(
         16,
         packed_query=packed_q,
         mask_type="causal",
-        max_seq_len_q=max_seq_len_q if packed_q else seq_len_q,
+        max_q_len=max_q_len if packed_q else seq_len_q,
     )
     with pytest.raises(ValueError, match=match):
         wrapper.run(q, kv_cache, seq_lens_kv, block_tables, qo_indptr=qo_indptr)
@@ -5325,7 +5334,7 @@ def test_attention_ts_decode_rejects_per_request_causal_q_longer_than_kv(
             seq_lens_kv,
             seq_len_q=seq_len_q,
             qo_indptr=qo_indptr,
-            max_seq_len_q=max_seq_len_q,
+            max_q_len=max_q_len,
             mask_type="causal",
         )
 
@@ -5483,6 +5492,7 @@ def test_attention_ts_decode_config_accepts_arbitrary_positive_q_length(
 
     cfg = make_decode_config(
         headdim=128,
+        args={"fixed_seqlen": True},
         seq_len_q=seq_len_q,
         seq_len_kv=257,
         batch_size=1,
@@ -5995,7 +6005,7 @@ def test_dense_split_control_graph_and_workspace(dtype, packed, split_kv):
         context,
         seq_len_q=sq,
         qo_indptr=offsets,
-        max_seq_len_q=sq if packed else None,
+        max_q_len=sq if packed else None,
         q_dtype=dtype,
         out_dtype=dtype,
         mask_type="causal",
@@ -6018,7 +6028,7 @@ def test_dense_split_control_graph_and_workspace(dtype, packed, split_kv):
         mask_type="causal",
         workspace_buffer=workspace,
         split_kv=split_kv,
-        max_seq_len_q=sq,
+        max_q_len=sq,
     )
     if not split_kv:
         assert not dict(wrapper._policy)["use_split_kv"]
@@ -7204,7 +7214,7 @@ def _check_window_grouped_graph_live_metadata(
         head_dim=head_dim,
         page_size=page_size,
         max_kv_len=1048576,
-        max_seq_len_q=seq_len_q,
+        max_q_len=seq_len_q,
         q_dtype=qkv_dtype,
         out_dtype=out_dtype,
         mask_type="causal",
@@ -7393,14 +7403,14 @@ def test_attention_ts_decode_static_fp8_d128_odd_kv_tail_is_finite(kv_len: int):
 def test_attention_ts_decode_standalone_graph_reloads_all_live_metadata():
     """Replay reloads Q offsets, lengths, and a padded fixed page table."""
 
-    max_seq_len_q = 8
+    max_q_len = 8
     max_kv_len = 257
     case = _make_decode_case(
         kv_lens=(65, max_kv_len),
         num_qo_heads=8,
         num_kv_heads=1,
         head_dim=128,
-        seq_len_q=max_seq_len_q,
+        seq_len_q=max_q_len,
         page_size=32,
         qkv_dtype=torch.bfloat16,
         out_dtype=torch.bfloat16,
@@ -7438,7 +7448,7 @@ def test_attention_ts_decode_standalone_graph_reloads_all_live_metadata():
         seq_lens_kv,
         max_kv_len=max_kv_len,
         qo_indptr=qo_indptr,
-        max_seq_len_q=max_seq_len_q,
+        max_q_len=max_q_len,
         block_table=block_table,
     )
     _assert_case_correct(eager, case)
@@ -7452,7 +7462,7 @@ def test_attention_ts_decode_standalone_graph_reloads_all_live_metadata():
         max_kv_len,
         seq_len_q=1,
         qo_indptr=qo_indptr,
-        max_seq_len_q=max_seq_len_q,
+        max_q_len=max_q_len,
         q_dtype=case.q.dtype,
         k_dtype=case.k_cache.dtype,
         out_dtype=case.out_dtype,
@@ -7469,7 +7479,7 @@ def test_attention_ts_decode_standalone_graph_reloads_all_live_metadata():
             seq_lens_kv,
             max_kv_len=max_kv_len,
             qo_indptr=qo_indptr,
-            max_seq_len_q=max_seq_len_q,
+            max_q_len=max_q_len,
             out=graph_out,
             workspace_buffer=workspace,
             block_table=block_table,
@@ -7547,17 +7557,72 @@ def test_attention_ts_speculative_mask_oracle_distinguishes_tail_visibility():
 
 
 @_REQUIRES_PRIMTS_GPU
+def test_attention_ts_decode_packed_launch_bounds():
+    """Safe buckets cover every packed Q row; an underestimate cannot launch."""
+    case = _make_decode_case(
+        kv_lens=(257, 129),
+        num_qo_heads=8,
+        num_kv_heads=8,
+        head_dim=128,
+        seq_len_q=4,
+        page_size=32,
+        qkv_dtype=torch.bfloat16,
+        out_dtype=torch.bfloat16,
+        cache_form="tuple",
+        mask_type="causal",
+        device="cuda",
+        seed=710646,
+    )
+    case, offsets = _pack_decode_case(case, (2, 3))
+    lengths = torch.tensor((257, 129), dtype=torch.int32, device="cuda")
+    wrapper = _plan_case(
+        case, max_kv_len=320, qo_indptr=offsets, max_q_len=4, dynamic_kv=True
+    )
+    out = torch.empty_like(case.q)
+
+    def run(**bounds):
+        return wrapper.run(
+            case.q,
+            case.paged_kv_cache,
+            lengths,
+            case.block_tables,
+            qo_indptr=offsets,
+            softmax_scale=case.softmax_scale,
+            output_scale=case.output_scale,
+            out=out,
+            **bounds,
+        )
+
+    for bounds in (
+        {},
+        dict(max_q_len=3, max_kv_len=257),
+        dict(max_q_len=4, max_kv_len=320),
+    ):
+        _assert_case_correct(run(**bounds), case)
+    for name, value, message in (
+        ("max_q_len", 2, "cover"),
+        ("max_kv_len", 256, "cover"),
+        ("max_q_len", 5, "capacity"),
+        ("max_kv_len", 321, "capacity"),
+    ):
+        out.fill_(float("nan"))
+        with pytest.raises(ValueError, match=f"{name}.*{message}"):
+            run(**{name: value})
+        assert out.isnan().all()
+
+
+@_REQUIRES_PRIMTS_GPU
 def test_attention_ts_decode_packed_q_sliding_window_public_parity():
     """Use cumulative Q lengths as the sole runtime ragged-Q definition."""
 
     q_lens = (1, 3, 8)
-    max_seq_len_q = max(q_lens)
+    max_q_len = max(q_lens)
     case = _make_decode_case(
         kv_lens=(4097, 3071, 2053),
         num_qo_heads=8,
         num_kv_heads=1,
         head_dim=64,
-        seq_len_q=max_seq_len_q,
+        seq_len_q=max_q_len,
         page_size=64,
         qkv_dtype=torch.bfloat16,
         out_dtype=torch.bfloat16,
@@ -7577,11 +7642,11 @@ def test_attention_ts_decode_packed_q_sliding_window_public_parity():
         case,
         max_kv_len=int(seq_lens_kv.max().item()),
         qo_indptr=qo_indptr,
-        max_seq_len_q=max_seq_len_q,
+        max_q_len=max_q_len,
     )
     policy = dict(wrapper._policy)
     assert policy["packed_query"] is True
-    assert policy["max_seq_len_q"] == max_seq_len_q
+    assert policy["max_q_len"] == max_q_len
     assert policy["window_left"] == 127
 
     eager = _exercise_public_paths(
@@ -7591,7 +7656,7 @@ def test_attention_ts_decode_packed_q_sliding_window_public_parity():
         max_kv_len=int(seq_lens_kv.max().item()),
         exercise_all_paths=True,
         qo_indptr=qo_indptr,
-        max_seq_len_q=max_seq_len_q,
+        max_q_len=max_q_len,
     )
     one_shot = batch_decode_with_paged_kv_cache(
         case.q,
@@ -7599,7 +7664,7 @@ def test_attention_ts_decode_packed_q_sliding_window_public_parity():
         case.block_tables,
         seq_lens_kv,
         qo_indptr=qo_indptr,
-        max_seq_len_q=max_seq_len_q,
+        max_q_len=max_q_len,
         mask_type=case.mask_type,
         window_left=case.window_left,
         softmax_scale=case.softmax_scale,
@@ -7619,13 +7684,13 @@ def test_attention_ts_decode_packed_q_sliding_window_clc_persistent():
     sm_count = torch.cuda.get_device_properties("cuda").multi_processor_count
     num_requests = 22 * -(-sm_count // 148)
     q_lens = tuple((3, 5, 7)[batch_idx % 3] for batch_idx in range(num_requests))
-    max_seq_len_q = max(q_lens)
+    max_q_len = max(q_lens)
     case = _make_decode_case(
         kv_lens=(257,) * len(q_lens),
         num_qo_heads=8,
         num_kv_heads=1,
         head_dim=64,
-        seq_len_q=max_seq_len_q,
+        seq_len_q=max_q_len,
         page_size=32,
         qkv_dtype=torch.bfloat16,
         out_dtype=torch.bfloat16,
@@ -7639,7 +7704,7 @@ def test_attention_ts_decode_packed_q_sliding_window_clc_persistent():
     policy = _exercise_auto_case(
         case,
         qo_indptr=qo_indptr,
-        max_seq_len_q=max_seq_len_q,
+        max_q_len=max_q_len,
     )
     assert policy["use_persistent_scheduler"] is True
     assert policy["use_split_kv"] is False
@@ -8106,7 +8171,7 @@ def test_attention_ts_decode_explicit_16bit_paged_keeps_q128(
         case,
         _EXPLICIT_PAGED_16BIT_Q128_PROFILE,
         qo_indptr=qo_indptr,
-        max_seq_len_q=None if q_lens is None else seq_len_q,
+        max_q_len=None if q_lens is None else seq_len_q,
     )
 
     assert policy["mma_variant"] == "keeps_mma_ab"
@@ -8153,16 +8218,16 @@ def test_attention_ts_decode_16bit_paged_keeps_q128_automatic_scope(
 def test_attention_ts_decode_reuses_compiled_topology_across_batch_sizes(
     packed_query: bool,
 ):
-    """One resolved paged-decode topology accepts different batch extents."""
+    """One topology accepts different batch, Q and KV extents."""
 
     wrappers = []
-    for batch_size in (2, 3):
+    for batch_size, q_length, kv_length in ((2, 3, 257), (3, 5, 273)):
         case = _make_decode_case(
-            kv_lens=(2049,) * batch_size,
-            num_qo_heads=16,
-            num_kv_heads=2,
+            kv_lens=(kv_length,) * batch_size,
+            num_qo_heads=4,
+            num_kv_heads=4,
             head_dim=128,
-            seq_len_q=2 if packed_query else 1,
+            seq_len_q=q_length,
             page_size=32,
             qkv_dtype=torch.bfloat16,
             out_dtype=torch.bfloat16,
@@ -8173,12 +8238,12 @@ def test_attention_ts_decode_reuses_compiled_topology_across_batch_sizes(
         )
         qo_indptr = None
         if packed_query:
-            case, qo_indptr = _pack_decode_case(case, (1,) * batch_size)
+            case, qo_indptr = _pack_decode_case(case, (q_length,) * batch_size)
         wrapper = _plan_case(
             case,
-            max_kv_len=2049,
+            max_kv_len=kv_length,
             qo_indptr=qo_indptr,
-            max_seq_len_q=1 if packed_query else None,
+            max_q_len=q_length if packed_query else None,
         )
         output = _run_case(wrapper, case, qo_indptr=qo_indptr)
         _assert_case_correct(output, case)
@@ -8351,7 +8416,7 @@ def test_attention_ts_decode_packed_fp8_q_mask_product(
 ):
     """Cross packed FP8 static Q bounds with dense and causal masks."""
 
-    max_seq_len_q = max(q_lens)
+    max_q_len = max(q_lens)
     case = _make_decode_case(
         device="cuda",
         **_case(
@@ -8360,9 +8425,9 @@ def test_attention_ts_decode_packed_fp8_q_mask_product(
             16,
             128,
             _FP8,
-            37000 + max_seq_len_q,
+            37000 + max_q_len,
             num_kv_heads=2,
-            seq_len_q=max_seq_len_q,
+            seq_len_q=max_q_len,
             mask_type=mask_type,
             out_dtype=out_dtype,
         ),
@@ -8372,10 +8437,10 @@ def test_attention_ts_decode_packed_fp8_q_mask_product(
     policy = _exercise_auto_case(
         case,
         qo_indptr=qo_indptr,
-        max_seq_len_q=max_seq_len_q,
+        max_q_len=max_q_len,
     )
     assert policy["packed_query"] is True
-    assert policy["max_seq_len_q"] == max_seq_len_q
+    assert policy["max_q_len"] == max_q_len
 
 
 @pytest.mark.parametrize(
@@ -9259,7 +9324,7 @@ def test_dense_encoded_eight_token_fragments(dtype):
         mask_type="causal",
         q_dtype=dtype,
         split_kv=False,
-        max_seq_len_q=sq,
+        max_q_len=sq,
     )
 
     def run():
@@ -9322,7 +9387,7 @@ def test_attention_ts_decode_replanned_sizes(dtype, packed_query, layout):
                 )
                 if packed_query
                 else None,
-                max_seq_len_q=sq,
+                max_q_len=sq,
                 q_dtype=dtype,
                 out_dtype=out_dtype,
                 kv_layout=layout,
@@ -9384,7 +9449,7 @@ def test_attention_ts_decode_replanned_sizes(dtype, packed_query, layout):
             out_dtype=out_dtype,
             packed_query=packed_query,
             batch_size=batch,
-            max_seq_len_q=sq,
+            max_q_len=sq,
             max_kv_len=sk,
             workspace_buffer=workspace,
         )
@@ -9518,7 +9583,7 @@ def test_attention_ts_decode_final_statistics(
         use_attention_sinks=True,
         batch_size=1,
         max_kv_len=nk,
-        max_seq_len_q=nq,
+        max_q_len=nq,
         packed_query=packed,
     )
     pages = case.block_tables[0, : (nk + page_size - 1) // page_size].long()
@@ -9685,4 +9750,32 @@ def test_attention_ts_decode_window_ignores_evicted_pages(dtype):
         dtype,
         kv_lengths=(1024, 1059),
         poison_evicted_pages=True,
+    )
+
+
+@_REQUIRES_PRIMTS_GPU
+@pytest.mark.parametrize("out_dtype", (torch.bfloat16, _FP8))
+def test_attention_ts_decode_fp8_speculative_runtime_reduction(out_dtype):
+    """Small runtime split grids preserve FP8-P accuracy and graph replay."""
+    case = _make_decode_case(
+        kv_lens=(16384,) * 8,
+        num_qo_heads=96,
+        num_kv_heads=8,
+        head_dim=128,
+        seq_len_q=8,
+        page_size=32,
+        qkv_dtype=_FP8,
+        out_dtype=out_dtype,
+        cache_form="tuple",
+        mask_type="causal",
+        device="cuda",
+        seed=710628,
+    )
+    wrapper = _plan_case(case, max_kv_len=16384)
+    _exercise_public_paths(
+        wrapper,
+        case,
+        case.seq_lens_kv,
+        max_kv_len=16384,
+        exercise_all_paths=True,
     )

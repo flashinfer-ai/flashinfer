@@ -127,7 +127,9 @@ class TmemCorrResource(DecodeGenResourceBase):
     # without Sage attention.
     sage_v_scales_ref: Constexpr[SageVScalesResource | None] = None
     seqlens_kv: cute.Pointer = None
-    max_seq_len_kv: Constexpr[int] = 0
+    max_seq_len_kv: Int32 = 0
+    # Launch bound in Q tokens; h_r separately carries partial-output row capacity.
+    max_q_len: Int32 = 1
     seq_len_q: Int32 = None
     q_token_offset: Int32 = None
     num_heads_kv: Int32 = None
@@ -390,20 +392,19 @@ class TmemCorrResource(DecodeGenResourceBase):
 
     @cute.jit
     def _multi_cta_counter_q_groups(self, h_r: Int32) -> Int32:
-        """Return the number of split-KV counter groups in the output tile."""
+        """Index counters by the launch Q bound, independent of partial-O capacity."""
         cfg = self.cfg
+        seq_len_q = self.max_q_len if not cfg.fixed_seqlen else Int32(cfg.max_seq_len_q)
         if cutlass.const_expr(cfg.groups_tokens_heads_q):
-            return Int32(
-                (cfg.max_seq_len_q + cfg.q_tokens_per_cta - 1) // cfg.q_tokens_per_cta
-            )
+            return Int32((seq_len_q + cfg.q_tokens_per_cta - 1) // cfg.q_tokens_per_cta)
         if cutlass.const_expr(
-            cfg.max_seq_len_q > 1
+            cfg.is_multi_token_q
             and not cfg.groups_tokens_heads_q
             and cfg.heads_q_per_kv != 0
         ):
             return Int32(
                 ((cfg.heads_q_per_kv + cfg.tile_size_q - 1) // cfg.tile_size_q)
-                * cfg.max_seq_len_q
+                * seq_len_q
             )
         return (h_r + Int32(cfg.tile_size_q - 1)) // Int32(cfg.tile_size_q)
 
@@ -3204,6 +3205,7 @@ class TmemCorrResource(DecodeGenResourceBase):
             and cfg.tile_size_q == 128
             and cfg.headdim == 128
             and cfg.num_insts_kv == 2
+            and cfg.fixed_seqlen
             and cfg.max_seq_len_q == 1
             and cfg.has_static_dense_full_kv_tiles
         ):
@@ -3274,32 +3276,42 @@ class TmemCorrResource(DecodeGenResourceBase):
                 base_addr1 = base_addr0
             partial_dst_col_offset = col_base * Int32(2)
             partial_norm_scale = self._split_partial_scale(reduced_sum_0)
-            regs_o_chunk = cutlass.Array(Int32, 4, space=cutlass.AddressSpace.rmem)
+            # Retain the narrow fallback for low-level pointers whose base
+            # does not satisfy the public workspace's 32-byte alignment.
+            partial_misalignment = self.partial_o_ptr.toint() & Int64(31)
+            store_sectors = valid_output_row & (partial_misalignment == Int64(0))
+            store_halves = valid_output_row & (partial_misalignment != Int64(0))
+            chunk_cols = min(16, output_pair_regs * 2)
+            regs_o_chunk = cutlass.Array(
+                Int32, chunk_cols // 2, space=cutlass.AddressSpace.rmem
+            )
             partial_o_row_base = self._gmem_partial_row_offset(
                 logical_kv_idx,
                 cta_idx_kv,
                 logical_output_row_idx,
             ) * Int64(cfg.headdim * 2)
-            for store_idx in cutlass.range_constexpr(output_pair_regs // 4):
-                chunk_col = store_idx * 8
+            for store_idx in cutlass.range_constexpr(
+                output_pair_regs * 2 // chunk_cols
+            ):
+                chunk_col = store_idx * chunk_cols
                 # Load O0/O1 from the tail TMEM slots, combine with
                 # max-correction scales, then store normalized 16-bit O for
                 # standalone reduction or unnormalized O for fused reduction.
                 o0_vals = _keeps_tcgen05_ld(
                     cfg,
                     prims.make_tmem_ptr(base_addr0 + Int32(chunk_col), Float32),
-                    num=8,
+                    num=chunk_cols,
                     offset=keeps_o_ldst_offset,
                 )
                 if cutlass.const_expr(cfg.num_insts_kv != 1):
                     o1_vals = _keeps_tcgen05_ld(
                         cfg,
                         prims.make_tmem_ptr(base_addr1 + Int32(chunk_col), Float32),
-                        num=8,
+                        num=chunk_cols,
                         offset=keeps_o_ldst_offset,
                     )
                 prims.tcgen05_wait(kind=prims.Tcgen05Wait.LOAD)
-                for chunk_idx in cutlass.range_constexpr(4):
+                for chunk_idx in cutlass.range_constexpr(chunk_cols // 2):
                     reg_base = chunk_idx * 2
                     if cutlass.const_expr(cfg.num_insts_kv == 1):
                         partial_pair = fmul2(
@@ -3343,15 +3355,25 @@ class TmemCorrResource(DecodeGenResourceBase):
                     self.partial_o_ptr.toint()
                     + partial_o_row_base
                     + Int64(partial_dst_col_offset)
-                    + Int64(store_idx * 16),
+                    + Int64(store_idx * chunk_cols * 2),
                     mem_space=1,
                     dtype=Int32,
                 )
-                if valid_output_row:
-                    partial_o_dst.store(
-                        regs_o_chunk.data_ptr().load(count=4, alignment=4),
-                        alignment=16,
-                    )
+                if cutlass.const_expr(chunk_cols == 16):
+                    if store_sectors:
+                        partial_o_dst.store(
+                            regs_o_chunk.data_ptr().load(count=8, alignment=4),
+                            alignment=32,
+                        )
+                    if store_halves:
+                        self._store_16bit_output_chunks(
+                            partial_o_dst, regs_o_chunk, chunk_cols
+                        )
+                else:
+                    if valid_output_row:
+                        self._store_16bit_output_chunks(
+                            partial_o_dst, regs_o_chunk, chunk_cols
+                        )
 
             if col_base == Int32(0) and valid_output_row:
                 # One state record per output row accompanies all partial-O

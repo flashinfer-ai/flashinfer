@@ -1188,7 +1188,7 @@ def _make_attention_ts_decode_trace(
                 optional=True,
             ),
             "seq_len_q": Scalar("int32", optional=True),
-            "max_seq_len_q": Scalar("int32", optional=True),
+            "max_q_len": Scalar("int32", optional=True),
             "mask_type": Scalar("string", optional=True),
             "window_left": Scalar("int32", optional=True),
             "kv_layout": Scalar("string", optional=True),
@@ -1228,7 +1228,7 @@ def _make_attention_ts_decode_trace(
             [
                 "len_qo_indptr == batch_size + 1",
                 "total_q == qo_indptr[-1].item()",
-                "max(qo_indptr[1:] - qo_indptr[:-1]) <= max_seq_len_q",
+                "max(qo_indptr[1:] - qo_indptr[:-1]) <= max_q_len",
             ]
         )
     elif q_mode == _Q_FIXED_MULTI:
@@ -1306,7 +1306,7 @@ def _make_prims_ts_decode_wrapper_trace(
     q_mode: str,
     mask_type: str,
     window_left: int,
-    max_seq_len_q: int,
+    max_q_len: int,
     max_kv_len: int,
     kv_prefix_mode: str,
     kv_lengths_mode: str,
@@ -1326,9 +1326,9 @@ def _make_prims_ts_decode_wrapper_trace(
     axes: dict[str, Var | Const] = {
         **q_axes,
         "split_kv_allowed": Const(abbrev="", value=int(split_kv)),
-        "max_seq_len_q": Const(
+        "max_q_len": Const(
             abbrev="maxq",
-            value=max_seq_len_q,
+            value=max_q_len,
             description="Query-length capacity frozen by plan().",
         ),
         "max_kv_len": Const(
@@ -1450,7 +1450,7 @@ def _make_prims_ts_decode_wrapper_trace(
             [
                 "len_qo_indptr == batch_size + 1",
                 "total_q == qo_indptr[-1].item()",
-                "max(qo_indptr[1:] - qo_indptr[:-1]) <= max_seq_len_q",
+                "max(qo_indptr[1:] - qo_indptr[:-1]) <= max_q_len",
             ]
             if q_mode == _Q_PACKED
             else []
@@ -1517,7 +1517,7 @@ _PRIMS_TS_DECODE_WRAPPER_TRACE_EXAMPLES = {
         q_mode=q_mode,
         mask_type="dense",
         window_left=-1,
-        max_seq_len_q=2 if q_mode == _Q_FIXED_MULTI else 1,
+        max_q_len=2 if q_mode == _Q_FIXED_MULTI else 1,
         max_kv_len=1,
         kv_prefix_mode="dynamic",
         kv_lengths_mode="dynamic",
@@ -1542,7 +1542,7 @@ def _get_prims_ts_decode_wrapper_trace(
     q_mode: str,
     mask_type: str,
     window_left: int,
-    max_seq_len_q: int,
+    max_q_len: int,
     max_kv_len: int,
     kv_prefix_mode: str,
     kv_lengths_mode: str,
@@ -1558,7 +1558,7 @@ def _get_prims_ts_decode_wrapper_trace(
         q_mode=q_mode,
         mask_type=mask_type,
         window_left=window_left,
-        max_seq_len_q=max_seq_len_q,
+        max_q_len=max_q_len,
         max_kv_len=max_kv_len,
         kv_prefix_mode=kv_prefix_mode,
         kv_lengths_mode=kv_lengths_mode,
@@ -1643,7 +1643,7 @@ def prims_ts_decode_wrapper_trace_dispatch(**kwargs):
         q_mode=q_mode,
         mask_type=str(state.mask_type),
         window_left=int(state.window_left),
-        max_seq_len_q=int(state.seq_len_q),
+        max_q_len=int(state.seq_len_q),
         max_kv_len=int(state.max_kv_len),
         kv_prefix_mode=str(state.kv_prefix_mode),
         kv_lengths_mode=str(state.kv_lengths_mode),
@@ -1710,7 +1710,7 @@ def _make_prims_ts_decode_mla_one_shot_trace(*, rank4_cache: bool, packed_query:
             "qo_indptr": Tensor(
                 ["len_qo_indptr"], dtype="int32", optional=not packed_query
             ),
-            "max_seq_len_q": Scalar("int32", optional=True),
+            "max_q_len": Scalar("int32", optional=True),
             "max_kv_len": Scalar("int32", optional=True),
             "workspace_buffer": Tensor(
                 ["workspace_size"], dtype="uint8", optional=True
@@ -1770,7 +1770,7 @@ def _make_prims_ts_decode_mla_wrapper_trace(
     rank4_cache: bool,
     packed_query: bool,
     mask_type: str,
-    max_seq_len_q: int,
+    max_q_len: int,
     max_kv_len: int,
     kv_lora_rank: int,
     qk_rope_head_dim: int,
@@ -1805,9 +1805,9 @@ def _make_prims_ts_decode_mla_wrapper_trace(
         )
     axes: dict[str, Var | Const] = {
         "batch_size": Var(description="Exact number of planned MLA requests."),
-        "max_seq_len_q": Const(
+        "max_q_len": Const(
             abbrev="maxq",
-            value=max_seq_len_q,
+            value=max_q_len,
             description="Query-length capacity frozen by plan().",
         ),
         "max_kv_len": Const(
@@ -1908,7 +1908,7 @@ def _make_prims_ts_decode_mla_wrapper_trace(
                 [
                     "len_qo_indptr == batch_size + 1",
                     "total_q == qo_indptr[-1].item()",
-                    "max(qo_indptr[1:] - qo_indptr[:-1]) <= max_seq_len_q",
+                    "max(qo_indptr[1:] - qo_indptr[:-1]) <= max_q_len",
                 ]
                 if packed_query
                 else ["seq_len_q >= 1"]
@@ -1932,7 +1932,7 @@ _PRIMS_TS_DECODE_MLA_WRAPPER_TRACE_EXAMPLES = {
         rank4_cache=rank4_cache,
         packed_query=packed_query,
         mask_type="causal",
-        max_seq_len_q=1,
+        max_q_len=1,
         max_kv_len=1,
         kv_lora_rank=512,
         qk_rope_head_dim=64,
@@ -1950,7 +1950,7 @@ def _get_prims_ts_decode_mla_wrapper_trace(
     rank4_cache: bool,
     packed_query: bool,
     mask_type: str,
-    max_seq_len_q: int,
+    max_q_len: int,
     max_kv_len: int,
     kv_lora_rank: int,
     qk_rope_head_dim: int,
@@ -1962,7 +1962,7 @@ def _get_prims_ts_decode_mla_wrapper_trace(
         rank4_cache=rank4_cache,
         packed_query=packed_query,
         mask_type=mask_type,
-        max_seq_len_q=max_seq_len_q,
+        max_q_len=max_q_len,
         max_kv_len=max_kv_len,
         kv_lora_rank=kv_lora_rank,
         qk_rope_head_dim=qk_rope_head_dim,
@@ -1999,7 +1999,7 @@ def prims_ts_decode_mla_wrapper_trace_dispatch(**kwargs):
         rank4_cache=isinstance(kv_cache, torch.Tensor) and kv_cache.ndim == 4,
         packed_query=packed_query,
         mask_type=str(state.mask_type),
-        max_seq_len_q=int(state.max_seq_len_q),
+        max_q_len=int(state.max_q_len),
         max_kv_len=int(state.max_kv_len),
         kv_lora_rank=int(state.kv_lora_rank),
         qk_rope_head_dim=int(state.qk_rope_head_dim),

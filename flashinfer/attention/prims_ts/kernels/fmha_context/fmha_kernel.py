@@ -917,6 +917,7 @@ def build_context_task_manager(
 
         # The load warp (1 warp = 32 threads) is the only consumer; signal-All
         # requires the consumer group to size match num_warps × warp_size.
+        # Connect the auxiliary page-ID producer to the load warp for num_stages slots.
         def make_page_offsets_pipeline_cfg(num_stages: int) -> PipelineConfig:
             return PipelineConfig.create_async_async_pipeline_cfg(
                 num_stages=num_stages,
@@ -1271,6 +1272,7 @@ def build_context_task_manager(
         cum_seqlen_q=cum_seqlen_q,
         cum_seqlen_k=cum_seqlen_k,
         seq_lens_kv=g_seq_lens_kv,
+        max_seq_len_kv=max_seq_len_kv,
         variable_window_token_starts=variable_window_token_starts,
         variable_window_token_ends=variable_window_token_ends,
         variable_window_cta_starts=variable_window_cta_starts,
@@ -1376,6 +1378,7 @@ def build_context_task_manager(
             cum_seqlen_q=cum_seqlen_q,
             cum_seqlen_k=cum_seqlen_k,
             seq_lens_kv=g_seq_lens_kv,
+            max_seq_len_kv=max_seq_len_kv,
             variable_window_token_starts=variable_window_token_starts,
             variable_window_token_ends=variable_window_token_ends,
             variable_window_cta_starts=variable_window_cta_starts,
@@ -3026,7 +3029,7 @@ class FmhaTs:
         two_cta_umma: bool = False,
         use_paged_kv: bool = False,
         num_tokens_per_page: int = 32,
-        max_kv_len: int = 1,
+        max_kv_len: int | None = 1,
         causal_single_kv_tile: bool = False,
         exhaustive_deadlock_race_check: bool | None = None,
         d_v: int | None = None,
@@ -3040,6 +3043,9 @@ class FmhaTs:
             is_causal=is_causal,
             window_size_left=window_size_left,
         )
+        # Load helpers before staged Sage copies enter GPU control flow.
+        importlib.import_module(f"{__package__}.helpers_paged")
+
         if causal_single_kv_tile and (not is_causal or head_paired):
             raise ValueError(
                 "causal_single_kv_tile requires query-paired causal attention"
@@ -3061,11 +3067,6 @@ class FmhaTs:
                 "variable-window masking is not supported for paged context"
             )
         validate_head_paired_head_ratio(head_paired=head_paired, h_r=h_r)
-        if use_paged_kv or sage_scale_layout is not None:
-            # Import before task bodies enter staged GPU control flow. The
-            # helper module imports FmhaConfig, so it cannot load in resources.
-            # Contiguous Sage also uses its tile-index helper for SMEM scales.
-            importlib.import_module(f"{__package__}.helpers_paged")
         if use_paged_kv:
             if num_tokens_per_page not in _SUPPORTED_CONTEXT_PAGE_SIZES:
                 raise ValueError(
@@ -3073,7 +3074,7 @@ class FmhaTs:
                     f"{_SUPPORTED_CONTEXT_PAGE_SIZES}; got "
                     f"{num_tokens_per_page}"
                 )
-            if max_kv_len < 1:
+            if max_kv_len is not None and max_kv_len < 1:
                 raise ValueError(
                     f"max_kv_len must be >= 1 for paged context, got {max_kv_len}"
                 )
@@ -3123,25 +3124,24 @@ class FmhaTs:
         cfg.vc_attention = vc_attention
         cfg.fp8_psmem_early_token = fp8_psmem_early_token
         self.cfg = cfg
+        self.runtime_dense_tail = False
         # Compact Q and staged O fit two resident query tiles plus the K/V
         # ring. Pairing overlaps the two softmax groups with MMA work.
         paired_mla = (d, d_v) == (192, 128) and not has_variable_window
         if d > 128 and not paired_mla:
             cfg.num_qkv_instances = 1
         cfg.use_paged_kv = use_paged_kv
-        single_instance_persistent = (
-            is_persistent and cfg.single_qkv_instance and not head_paired
-        )
-        # Paired Q2 and persistent D256 schedules route correction statistics
-        # through a compact SMEM ring and omit the per-K StatsDone
-        # serialization. This keeps the stats payload disjoint from the S/P
-        # TMEM columns while producer latency varies across storage layouts.
-        cfg.stats_via_smem = single_instance_persistent or (not cfg.single_qkv_instance)
+        # Keep correction statistics disjoint from the S/P TMEM columns for
+        # every scheduler. Non-persistent single-instance schedules can also
+        # overwrite aliased statistics before correction consumes them.
+        cfg.stats_via_smem = True
         cfg.fuse_epilogue_into_correction = cfg.single_qkv_instance
         cfg.num_tokens_per_page = num_tokens_per_page
         cfg.max_num_pages_per_seq_kv = (
-            max_kv_len + num_tokens_per_page - 1
-        ) // num_tokens_per_page
+            0
+            if max_kv_len is None
+            else (max_kv_len + num_tokens_per_page - 1) // num_tokens_per_page
+        )
         cfg.causal_single_kv_tile = causal_single_kv_tile
         # FP16/BF16 causal attention retains the default 192/96/32
         # softmax/correction/auxiliary split. Other topologies start from
@@ -3683,44 +3683,55 @@ class FmhaTs:
             else None
         )
 
-        self.kernel(
-            tma_q_desc,
-            tma_k_desc,
-            tma_v_desc,
-            tma_o_desc,
-            tma_mu_desc,
-            vc_q_scale,
-            vc_k_scale,
-            tile_sched_params,
-            scale_softmax_log2,
-            output_scale,
-            num_kv_tiles,
-            num_seq_tiles,
-            q_offset,
-            cum_seqlen_q,
-            cum_seqlen_k,
-            block_tables_iter,
-            block_table_row_stride,
-            seq_lens_kv_iter,
-            Int32(s_k),
-            variable_window_token_starts,
-            variable_window_token_ends,
-            variable_window_cta_starts,
-            Int32(s_q),
-            sage_scales_iter,
-            Int32(h_kv),
-            vc_repair_tiles,
-            self.is_persistent,
-            self.is_clc_dynamic,
-            lse_output,
-            attention_sinks,
-        ).launch(
-            grid=grid,
-            block=[block_size, 1, 1],
-            cluster=cfg.cluster_shape_mn + (1,),
-            stream=stream,
-            min_blocks_per_mp=1,
-        )
+        def launch_kernel(capacity: cutlass.Constexpr[int]):
+            self.kernel(
+                tma_q_desc,
+                tma_k_desc,
+                tma_v_desc,
+                tma_o_desc,
+                tma_mu_desc,
+                vc_q_scale,
+                vc_k_scale,
+                tile_sched_params,
+                scale_softmax_log2,
+                output_scale,
+                num_kv_tiles,
+                num_seq_tiles,
+                q_offset,
+                cum_seqlen_q,
+                cum_seqlen_k,
+                block_tables_iter,
+                block_table_row_stride,
+                seq_lens_kv_iter,
+                Int32(s_k),
+                variable_window_token_starts,
+                variable_window_token_ends,
+                variable_window_cta_starts,
+                Int32(s_q),
+                sage_scales_iter,
+                Int32(h_kv),
+                vc_repair_tiles,
+                self.is_persistent,
+                self.is_clc_dynamic,
+                lse_output,
+                attention_sinks,
+                dense_tail_capacity=capacity,
+            ).launch(
+                grid=grid,
+                block=[block_size, 1, 1],
+                cluster=cfg.cluster_shape_mn + (1,),
+                stream=stream,
+                min_blocks_per_mp=1,
+            )
+
+        if cutlass.const_expr(self.runtime_dense_tail):
+            tail_rows = (Int32(s_k) - Int32(1)) % Int32(cfg.kv_tile_n) + Int32(1)
+            if tail_rows <= Int32(4):
+                launch_kernel(4)
+            else:
+                launch_kernel(0)
+        else:
+            launch_kernel(0)
 
     # ---------------------------------------------------------------------------
     # Device kernel
@@ -3762,6 +3773,7 @@ class FmhaTs:
         is_clc_dynamic: cutlass.Constexpr[bool] = False,
         lse_output: cute.Tensor | None = None,
         attention_sinks: cute.Tensor | None = None,
+        dense_tail_capacity: cutlass.Constexpr[int] = 0,
     ) -> None:
         """Warp-specialised persistent FMHA TS kernel.
 
@@ -3780,6 +3792,11 @@ class FmhaTs:
         8. TMEM deallocation
         """
         cfg = self.cfg
+        if cutlass.const_expr(dense_tail_capacity > 0):
+            from copy import copy
+
+            cfg = copy(cfg)
+            cfg.fixed_dense_k_tail = dense_tail_capacity
         cfg.num_seq_tiles = num_seq_tiles
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
 

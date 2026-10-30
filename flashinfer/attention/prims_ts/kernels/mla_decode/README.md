@@ -72,7 +72,7 @@ synchronizes. Q quantization and query RoPE are caller-owned preparation.
 
 Fixed plans retain their B/Sq geometry. A sparse wrapper can serve a range of
 independent row counts with one profile: plan `batch_size=1`,
-`packed_query=True`, `max_seq_len_q=row_capacity`, then pass `[rows,H,D]` Q and
+`packed_query=True`, `max_q_len=row_capacity`, then pass `[rows,H,D]` Q and
 CUDA INT32 `qo_indptr=[0,rows]` with `rows <= row_capacity`. Choose capacity for
 the desired workload range; each graph retains its captured views and addresses.
 

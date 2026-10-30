@@ -247,7 +247,27 @@ def _runtime_active_splits_kv(
     )
     # Split ranges are instruction-group aligned. Only ranges intersecting the
     # valid K domain participate; remaining configured grid slots are padding.
+    if cutlass.const_expr(cfg.splits_kv == 2):
+        # The configured span covers at most two nonempty ranges. Comparisons
+        # recover their count without a divide by the runtime local span.
+        return Int32(total_kv_tiles > Int32(0)) + Int32(total_kv_tiles > local_kv_tiles)
     return (total_kv_tiles + local_kv_tiles - Int32(1)) // local_kv_tiles
+
+
+@cute.jit
+def runtime_split_kv_is_active(
+    cfg: FmhaDecodeConfig,
+    seq_len_kv: Int32,
+    seq_len_q: Int32,
+    q_token_base: Int32,
+    split_idx: Int32,
+) -> cutlass.Boolean:
+    """Test a split's first tile without dividing by its runtime local span."""
+    total_kv_tiles = _runtime_total_kv_tiles(cfg, seq_len_kv, seq_len_q, q_token_base)
+    local_kv_tiles = _runtime_configured_local_kv_tiles(
+        cfg, seq_len_kv, seq_len_q, q_token_base
+    )
+    return split_idx * local_kv_tiles < total_kv_tiles
 
 
 @cute.jit
@@ -444,7 +464,9 @@ def resolve_keeps_tile_context(
     if cutlass.const_expr(cfg.uses_uniform_causal_mask):
         element_mask_end_idx = seq_len_kv - seq_len_q + q_token_base + Int32(1)
 
-    use_runtime_kv_domain = seqlens_kv is not None or cfg.uses_runtime_q_kv_union
+    use_runtime_kv_domain = seqlens_kv is not None or (
+        not cfg.fixed_seqlen or cfg.uses_runtime_q_kv_union
+    )
     if cutlass.const_expr(local_tile_idx is None):
         local_tile_idx = _softmax_tile_idx(cfg, stage_info, inst_id)
     if cutlass.const_expr(not use_runtime_kv_domain):

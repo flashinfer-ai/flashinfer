@@ -61,7 +61,7 @@ output/workspace ownership, examples, limitations, and validation commands.
 `batch_decode_with_paged_kv_cache` and `batch_mla_decode_with_paged_kv_cache`
 support both convenience and explicit caller-workspace execution. Convenience calls validate inputs and allocate scratch when omitted. For allocation-free, synchronization-free
 steady-state launches, provide `workspace_buffer`, `max_kv_len`, `out`,
-and `validate=False`. Packed Q additionally requires `max_seq_len_q`
+and `validate=False`. Packed Q additionally requires `max_q_len`
 (FMHA also accepts its non-default `seq_len_q` alias).
 Both APIs size and allocate scratch only when it is omitted, then pass it to
 the same wrapper plan/run path. Trusted calls select the existing cached
@@ -79,6 +79,15 @@ and update metadata only between completed replays. Validation is enabled by
 default and reads metadata values on the host; `validate=False` transfers
 all shape, dtype, stride, capacity, active page-ID, packed-offset, and lifetime
 obligations to the caller. The required decode control resets are unchanged.
+
+Across context, paged context, decode and MLA wrapper `run()` calls, Q/KV
+launch bounds cover the live request lengths and must not exceed plan capacity.
+With `validate=True`, omitted bounds are inferred from metadata already read
+for validation, and supplied capacity buckets are accepted. Underestimated
+or over-capacity bounds are rejected before launch. With `validate=False`,
+bounds are trusted and omitted packed bounds use plan capacities; fixed tensor
+lengths come from their shapes. These launch operands do not specialize kernels.
+MLA exposes only the Q launch bound; its KV lengths remain device metadata.
 
 For example, given validated FMHA Q/cache/metadata and a correctly sized,
 zero-initialized `workspace`:
@@ -128,13 +137,13 @@ from flashinfer.attention.prims_ts import (
 device = torch.device("cuda:0")
 dtype = torch.bfloat16
 num_qo_heads, num_kv_heads, head_dim, page_size = 32, 4, 128, 32
-batch_size, max_seq_len_q, max_kv_len = 2, 2, 128
+batch_size, max_q_len, max_kv_len = 2, 2, 128
 
 # Query scratch for the same geometry and dtypes used by plan().
 qo_indptr = torch.tensor([0, 2, 3], dtype=torch.int32, device=device)
 workspace_bytes = get_prims_ts_batch_decode_workspace_size(
     batch_size, num_qo_heads, num_kv_heads, head_dim, page_size, max_kv_len,
-    max_seq_len_q=max_seq_len_q, q_dtype=dtype, kv_layout="NHD",
+    max_q_len=max_q_len, q_dtype=dtype, kv_layout="NHD",
     mask_type="causal", device=device,
     qo_indptr=qo_indptr,
 )
@@ -142,7 +151,7 @@ workspace = torch.empty(workspace_bytes, dtype=torch.uint8, device=device)
 wrapper = BatchDecodePagedTSWrapper("NHD")
 wrapper.plan(
     device, batch_size, num_qo_heads, num_kv_heads, head_dim, page_size, max_kv_len,
-    max_seq_len_q=max_seq_len_q, q_dtype=dtype, packed_query=True,
+    max_q_len=max_q_len, q_dtype=dtype, packed_query=True,
     mask_type="causal", workspace_buffer=workspace,
 )
 
@@ -674,7 +683,7 @@ wrappers = {}
 for demean in (True, False):
     wrappers[demean] = BatchPrefillTSWrapper()
     wrappers[demean].plan(
-        device="cuda", batch_size=1, max_seq_len_q=S, max_kv_len=S,
+        device="cuda", batch_size=1, max_q_len=S, max_kv_len=S,
         num_qo_heads=H, num_kv_heads=H, head_dim=128,
         q_dtype=torch.bfloat16, k_dtype=torch.bfloat16, v_dtype=torch.float8_e4m3fn,
         out_dtype=torch.bfloat16, vc_config=VCAttentionConfig(demean=demean),
@@ -689,7 +698,7 @@ wrappers8 = {}
 for demean in (True, False):
     wrappers8[demean] = BatchPrefillTSWrapper()
     wrappers8[demean].plan(
-        device="cuda", batch_size=1, max_seq_len_q=S, max_kv_len=S,
+        device="cuda", batch_size=1, max_q_len=S, max_kv_len=S,
         num_qo_heads=H, num_kv_heads=H, head_dim=128,
         q_dtype=torch.float8_e4m3fn, k_dtype=torch.float8_e4m3fn, v_dtype=torch.float8_e4m3fn,
         out_dtype=torch.bfloat16, vc_config=VCAttentionConfig(demean=demean),

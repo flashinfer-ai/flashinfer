@@ -1072,7 +1072,7 @@ def test_attention_ts_sq4_trace_dispatch_covers_all_public_decode_apis():
     mla_wrapper._plan_state = SimpleNamespace(
         packed_query=False,
         mask_type="causal",
-        max_seq_len_q=seq_len_q,
+        max_q_len=seq_len_q,
         max_kv_len=seq_len_k,
         kv_lora_rank=kv_lora_rank,
         qk_rope_head_dim=rope_dim,
@@ -1144,7 +1144,7 @@ def test_attention_ts_sq4_trace_dispatch_covers_all_public_decode_apis():
         assert definition["inputs"]["mask_type"]["optional"] is True
     for definition in (fmha_definitions[2], mla_definitions[2]):
         assert "mask_type" not in definition["inputs"]
-        assert "max_seq_len_q" not in definition["inputs"]
+        assert "max_q_len" not in definition["inputs"]
     assert "window_left" not in fmha_definitions[2]["inputs"]
 
 
@@ -1455,7 +1455,7 @@ def test_prims_ts_bound_wrapper_traces_require_every_per_run_metadata_tensor():
     mla_wrapper._plan_state = SimpleNamespace(
         packed_query=True,
         mask_type="causal",
-        max_seq_len_q=3,
+        max_q_len=3,
         max_kv_len=2 * page_size,
         kv_lora_rank=512,
         qk_rope_head_dim=64,
@@ -1551,8 +1551,7 @@ def test_prims_ts_bound_wrapper_trace_names_preserve_plan_identity():
         fmha_definitions
     )
     assert [
-        definition["axes"]["max_seq_len_q"]["value"]
-        for definition in fmha_definitions[:4]
+        definition["axes"]["max_q_len"]["value"] for definition in fmha_definitions[:4]
     ] == [3, 3, 8, 3]
     assert [
         definition["axes"]["max_kv_len"]["value"] for definition in fmha_definitions[:4]
@@ -1574,7 +1573,7 @@ def test_prims_ts_bound_wrapper_trace_names_preserve_plan_identity():
     mla_base = {
         "packed_query": True,
         "mask_type": "causal",
-        "max_seq_len_q": 3,
+        "max_q_len": 3,
         "max_kv_len": 2 * page_size,
         "kv_lora_rank": 512,
         "qk_rope_head_dim": 64,
@@ -1582,7 +1581,7 @@ def test_prims_ts_bound_wrapper_trace_names_preserve_plan_identity():
     mla_variants = (
         mla_base,
         {**mla_base, "mask_type": "dense"},
-        {**mla_base, "max_seq_len_q": 8},
+        {**mla_base, "max_q_len": 8},
         {**mla_base, "max_kv_len": 4 * page_size},
     )
     mla_wrapper = BatchMLADecodePagedTSWrapper()
@@ -1594,7 +1593,7 @@ def test_prims_ts_bound_wrapper_trace_names_preserve_plan_identity():
         mla_definitions
     )
     assert [
-        definition["axes"]["max_seq_len_q"]["value"] for definition in mla_definitions
+        definition["axes"]["max_q_len"]["value"] for definition in mla_definitions
     ] == [3, 3, 8, 3]
     assert [
         definition["axes"]["max_kv_len"]["value"] for definition in mla_definitions

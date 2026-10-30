@@ -62,6 +62,7 @@ from .fmha_decode_constants import (
 )
 from .fmha_decode_config import FmhaDecodeConfig
 from .fmha_decode_resources.helpers_common import (
+    UniformQueryOffsets,
     _attention_sink_head_stride,
     _local_head_from_q_output_row,
     _pack_float2_to_bf16,
@@ -111,7 +112,7 @@ def _reduction_q_group_idx(
     )
     if cutlass.const_expr(cfg.uses_nontrivial_grouped_q_layout):
         return token_idx // Int32(cfg.q_tokens_per_cta)
-    if cutlass.const_expr(cfg.max_seq_len_q > 1):
+    if cutlass.const_expr(cfg.is_multi_token_q):
         head_ctas_per_token = Int32(
             (cfg.heads_q_per_kv + cfg.tile_size_q - 1) // cfg.tile_size_q
         )
@@ -147,7 +148,7 @@ def _reduction_active_splits_kv(
 def _reduce_exact_splits_body(
     o_iter: cute.Pointer,
     g_seqlens_kv: cute.Pointer | DirectSparseMetadataView,
-    g_cu_seqlens_q: cute.Pointer,
+    g_cu_seqlens_q: cute.Pointer | UniformQueryOffsets,
     g_partial_o: cute.Pointer,
     g_partial_stats: cute.Pointer,
     g_attention_sinks: cute.Pointer,
@@ -321,7 +322,7 @@ def _reduce_exact_splits_body(
 def decode_gen_separate_reduction_kernel(
     o_iter: cute.Pointer,
     g_seqlens_kv: cute.Pointer | DirectSparseMetadataView,
-    g_cu_seqlens_q: cute.Pointer,
+    g_cu_seqlens_q: cute.Pointer | UniformQueryOffsets,
     g_partial_o: cute.Pointer,
     g_partial_stats: cute.Pointer,
     g_attention_sinks: cute.Pointer,
@@ -472,7 +473,7 @@ def _store_parallel_reduction_output(
 def decode_gen_parallel_separate_reduction_kernel(
     o_iter: cute.Pointer,
     g_seqlens_kv: cute.Pointer | DirectSparseMetadataView,
-    g_cu_seqlens_q: cute.Pointer,
+    g_cu_seqlens_q: cute.Pointer | UniformQueryOffsets,
     g_partial_o: cute.Pointer,
     g_partial_stats: cute.Pointer,
     g_attention_sinks: cute.Pointer,
@@ -481,6 +482,7 @@ def decode_gen_parallel_separate_reduction_kernel(
     static_full_split_prefix: cutlass.Constexpr[bool] = False,
     lse_ptr: cute.Pointer | None = None,
     requested_splits=None,
+    compact_schedule: cutlass.Constexpr[bool] = False,
 ) -> None:
     """Reduce split partials with a compact or clustered constexpr schedule.
 
@@ -493,7 +495,7 @@ def decode_gen_parallel_separate_reduction_kernel(
     two-level 4x4 merge, and G2/G4/G8 finalize through rank zero.
     """
 
-    if cutlass.const_expr(cfg.use_compact_parallel_reduction):
+    if cutlass.const_expr(cfg.use_compact_parallel_reduction or compact_schedule):
         _reduce_exact_splits_body(
             o_iter,
             g_seqlens_kv,
@@ -952,7 +954,7 @@ def fmha_decode_separate_reduction_launch(
     problem_shape: tuple[Int32, Int32, Int32, Int32, Int32],
     o_iter: cute.Pointer,
     seqlens_kv_iter: cute.Pointer | DirectSparseMetadataView,
-    cu_seqlens_q_iter: cute.Pointer,
+    cu_seqlens_q_iter: cute.Pointer | UniformQueryOffsets,
     partial_o_iter: cute.Pointer,
     partial_stats_iter: cute.Pointer,
     attention_sinks_iter: cute.Pointer,
@@ -963,6 +965,7 @@ def fmha_decode_separate_reduction_launch(
     static_full_split_prefix: cutlass.Constexpr[bool] = False,
     lse_ptr: cute.Pointer | None = None,
     requested_splits=None,
+    runtime_q_capacity_rows: Int32 = 0,
 ) -> None:
     """Launch the standalone reducer after the main split-KV decode kernel.
 
@@ -976,19 +979,21 @@ def fmha_decode_separate_reduction_launch(
     """
     b, h_q, h_k, _, _ = problem_shape
     h_r = h_q // h_k
-    q_output_rows = h_r
-    if cutlass.const_expr(cfg.max_seq_len_q > 1):
+    q_output_rows = runtime_q_capacity_rows if not cfg.fixed_seqlen else h_r
+    if cutlass.const_expr(cfg.fixed_seqlen and cfg.is_multi_token_q):
         q_output_rows = h_r * Int32(cfg.max_seq_len_q)
     bytes_per_slice = REDUCTION_BYTES_PER_SLICE
     grid_q_output_rows = q_output_rows
-    if cutlass.const_expr(cfg.max_seq_len_q > 1 and cfg.heads_q_per_kv != 0):
+    if cutlass.const_expr(
+        cfg.fixed_seqlen and cfg.is_multi_token_q and cfg.heads_q_per_kv != 0
+    ):
         # Grouped multi-token Q profiles lay rows out by the configured
         # heads-per-KV group instead of the launch-time h_q / h_k ratio.
         grid_q_output_rows = cfg.heads_q_per_kv * cfg.max_seq_len_q
     # The reference schedule uses 512-thread CTAs over contiguous 8 KiB slices.
     # Multiple CTAs cover wide dimensions or grouped SQ rows without changing
     # the producer workspace layout.
-    num_reduction_slices = max(
+    num_reduction_slices = cute.math.max(
         (
             grid_q_output_rows * cfg.headdim * PARTIAL_O_ELEMENT_BYTES
             + bytes_per_slice
@@ -1000,7 +1005,7 @@ def fmha_decode_separate_reduction_launch(
     if cutlass.const_expr(cfg.use_parallel_separate_reduction):
         cluster_size = cfg.parallel_reduction_cluster_size
         parallel_bytes_per_slice = cfg.parallel_reduction_bytes_per_slice
-        num_parallel_slices = max(
+        num_parallel_slices = cute.math.max(
             (
                 grid_q_output_rows * cfg.headdim * PARTIAL_O_ELEMENT_BYTES
                 + parallel_bytes_per_slice
@@ -1009,25 +1014,77 @@ def fmha_decode_separate_reduction_launch(
             // parallel_bytes_per_slice,
             1,
         )
-        decode_gen_parallel_separate_reduction_kernel(
-            o_iter,
-            seqlens_kv_iter,
-            cu_seqlens_q_iter,
-            partial_o_iter,
-            partial_stats_iter,
-            attention_sinks_iter,
-            q_output_rows,
-            cfg,
-            static_full_split_prefix,
-            lse_ptr=lse_ptr,
-            requested_splits=requested_splits,
-        ).launch(
-            grid=(num_parallel_slices * cluster_size, h_k, b),
-            block=[cfg.parallel_reduction_threads_per_cta, 1, 1],
-            cluster=[cluster_size, 1, 1],
-            stream=stream,
-            use_pdl=cfg.use_parallel_separate_reduction_pdl,
-        )
+        if cutlass.const_expr(
+            cfg.runtime_split_kv
+            and requested_splits is not None
+            and not cfg.use_compact_parallel_reduction
+        ):
+            # Capacity fixes scratch strides, not the useful reducer grid.
+            # S1-S4 retain the wide 8KiB schedule; the generic runtime reducer
+            # assigns four lanes per fragment and otherwise launches 4x as many
+            # 2KiB CTAs even when only two split partials were published.
+            # Both entry points share one cached module across runtime counts.
+            if requested_splits <= Int32(4):
+                decode_gen_parallel_separate_reduction_kernel(
+                    o_iter,
+                    seqlens_kv_iter,
+                    cu_seqlens_q_iter,
+                    partial_o_iter,
+                    partial_stats_iter,
+                    attention_sinks_iter,
+                    q_output_rows,
+                    cfg,
+                    static_full_split_prefix,
+                    lse_ptr=lse_ptr,
+                    requested_splits=requested_splits,
+                    compact_schedule=True,
+                ).launch(
+                    grid=(num_reduction_slices, h_k, b),
+                    block=[REDUCTION_THREADS_PER_CTA, 1, 1],
+                    cluster=[1, 1, 1],
+                    stream=stream,
+                    use_pdl=cfg.use_parallel_separate_reduction_pdl,
+                )
+            else:
+                decode_gen_parallel_separate_reduction_kernel(
+                    o_iter,
+                    seqlens_kv_iter,
+                    cu_seqlens_q_iter,
+                    partial_o_iter,
+                    partial_stats_iter,
+                    attention_sinks_iter,
+                    q_output_rows,
+                    cfg,
+                    static_full_split_prefix,
+                    lse_ptr=lse_ptr,
+                    requested_splits=requested_splits,
+                ).launch(
+                    grid=(num_parallel_slices * cluster_size, h_k, b),
+                    block=[cfg.parallel_reduction_threads_per_cta, 1, 1],
+                    cluster=[cluster_size, 1, 1],
+                    stream=stream,
+                    use_pdl=cfg.use_parallel_separate_reduction_pdl,
+                )
+        else:
+            decode_gen_parallel_separate_reduction_kernel(
+                o_iter,
+                seqlens_kv_iter,
+                cu_seqlens_q_iter,
+                partial_o_iter,
+                partial_stats_iter,
+                attention_sinks_iter,
+                q_output_rows,
+                cfg,
+                static_full_split_prefix,
+                lse_ptr=lse_ptr,
+                requested_splits=requested_splits,
+            ).launch(
+                grid=(num_parallel_slices * cluster_size, h_k, b),
+                block=[cfg.parallel_reduction_threads_per_cta, 1, 1],
+                cluster=[cluster_size, 1, 1],
+                stream=stream,
+                use_pdl=cfg.use_parallel_separate_reduction_pdl,
+            )
         return
     decode_gen_separate_reduction_kernel(
         o_iter,

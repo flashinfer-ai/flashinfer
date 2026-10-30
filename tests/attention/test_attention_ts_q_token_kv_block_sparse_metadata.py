@@ -205,7 +205,7 @@ def test_packed_fp8_query_allocation_boundary_graph(head_dim, group_size):
                 head_dim,
                 page_size,
                 32,
-                max_seq_len_q=group_size,
+                max_q_len=group_size,
                 packed_query=True,
                 q_dtype=query.dtype,
                 out_dtype=torch.float16,
@@ -419,7 +419,7 @@ def test_q_token_kv_block_sparse_group_size_defaults_to_one(api: object) -> None
     assert parameters["group_size"].kind is inspect.Parameter.KEYWORD_ONLY
     assert parameters["group_size"].default == 1
     assert "seq_len_q" not in parameters
-    assert "max_seq_len_q" not in parameters
+    assert "max_q_len" not in parameters
 
 
 def test_q_token_kv_block_sparse_default_routes_do_not_group_queries() -> None:
@@ -1965,7 +1965,7 @@ def _run_private_q_token_kv_block_sparse_decode(
         max_seq_len,
         seq_len_q=group_size,
         qo_indptr=None,
-        max_seq_len_q=None,
+        max_q_len=None,
         out=out,
         out_dtype=out.dtype,
         mask_type="causal",

@@ -523,7 +523,7 @@ def _plan_wrapper(wrapper: BatchPrefillTSWrapper, case: _ContextCase) -> None:
         output_scale=case.output_scale,
         out_dtype=case.out_dtype,
         batch_size=len(case.q_lengths),
-        max_seq_len_q=max(case.q_lengths),
+        max_q_len=max(case.q_lengths),
         max_kv_len=max(case.k_lengths),
     )
 
@@ -549,7 +549,7 @@ def _plan_paged_wrapper(
     wrapper: BatchPrefillPagedTSWrapper,
     case: _PagedContextCase,
     *,
-    max_seq_len_q: Optional[int] = None,
+    max_q_len: Optional[int] = None,
     max_kv_len: Optional[int] = None,
     extra_page_columns: int = 0,
     row_stride_multiplier: int = 1,
@@ -560,7 +560,7 @@ def _plan_paged_wrapper(
     """Compile a conservative paged plan and return its per-run metadata."""
 
     reference = case.reference
-    max_seq_len_q = max(reference.q_lengths) if max_seq_len_q is None else max_seq_len_q
+    max_q_len = max(reference.q_lengths) if max_q_len is None else max_q_len
     max_kv_len = max(reference.k_lengths) if max_kv_len is None else max_kv_len
     metadata = _make_native_paged_metadata(
         case,
@@ -585,7 +585,7 @@ def _plan_paged_wrapper(
         has_q_offset=has_q_offset,
         paged_v_tail_is_zero=paged_v_tail_is_zero,
         batch_size=len(reference.q_lengths),
-        max_seq_len_q=max_seq_len_q,
+        max_q_len=max_q_len,
         max_kv_len=max_kv_len,
     )
 
@@ -623,11 +623,35 @@ def _capture_context_graph(
     qo_indptr: Optional[torch.Tensor] = None,
     kv_indptr: Optional[torch.Tensor] = None,
 ) -> torch.cuda.CUDAGraph:
-    """Warm up and capture one wrapper run into caller-owned output."""
+    """Warm up and capture one wrapper run into caller-owned output.
 
+    A captured launch keeps the plan's capacity bounds so replays may
+    redistribute tokens across requests.
+    """
+
+    geometry = wrapper._plan_state.geometry
+
+    # Capture capacity-sized grids without reading device metadata on the host.
     def launch() -> torch.Tensor:
         if paged_metadata is None:
-            return wrapper.run(q, k, v, qo_indptr, kv_indptr, out=out, validate=False)
+            bounds = (
+                {}
+                if qo_indptr is None
+                else {
+                    "max_q_len": geometry.max_q_len,
+                    "max_kv_len": geometry.max_seq_len_k,
+                }
+            )
+            return wrapper.run(
+                q,
+                k,
+                v,
+                qo_indptr,
+                kv_indptr,
+                **bounds,
+                out=out,
+                validate=False,
+            )
         return wrapper.run(
             q,
             k,
@@ -635,6 +659,8 @@ def _capture_context_graph(
             paged_metadata.qo_indptr,
             paged_metadata.block_tables,
             paged_metadata.seq_lens_kv,
+            max_q_len=geometry.max_q_len,
+            max_kv_len=geometry.max_kv_len,
             out=out,
             validate=False,
         )
@@ -770,7 +796,7 @@ def test_attention_ts_context_paged_wrapper_exposes_compile_oriented_contract() 
         "self",
         "device",
         "batch_size",
-        "max_seq_len_q",
+        "max_q_len",
         "max_kv_len",
         "num_qo_heads",
         "num_kv_heads",
@@ -803,6 +829,8 @@ def test_attention_ts_context_paged_wrapper_exposes_compile_oriented_contract() 
         "qo_indptr",
         "block_tables",
         "seq_lens_kv",
+        "max_q_len",
+        "max_kv_len",
         "out",
         "lse",
         "return_lse",
@@ -846,7 +874,7 @@ def test_attention_ts_context_paged_plan_rejects_non_bool_zero_tail_contract(
             k_dtype=torch.float16,
             paged_v_tail_is_zero=invalid_value,
             batch_size=1,
-            max_seq_len_q=64,
+            max_q_len=64,
             max_kv_len=64,
         )
 
@@ -859,7 +887,7 @@ def test_attention_ts_context_contiguous_wrapper_exposes_compile_oriented_contra
         "self",
         "device",
         "batch_size",
-        "max_seq_len_q",
+        "max_q_len",
         "max_kv_len",
         "num_qo_heads",
         "num_kv_heads",
@@ -894,6 +922,8 @@ def test_attention_ts_context_contiguous_wrapper_exposes_compile_oriented_contra
         "variable_window_token_starts",
         "variable_window_token_ends",
         "variable_window_cta_starts",
+        "max_q_len",
+        "max_kv_len",
         "out",
         "lse",
         "return_lse",
@@ -1009,7 +1039,7 @@ def test_attention_ts_context_paged_one_shot_forwards_fixed_table_to_wrapper(
     geometry = SimpleNamespace(
         device=torch.device("cpu"),
         batch_size=2,
-        max_seq_len_q=8,
+        max_q_len=8,
         max_kv_len=65,
         page_size=32,
         num_qo_heads=4,
@@ -1068,6 +1098,8 @@ def test_attention_ts_context_paged_one_shot_forwards_fixed_table_to_wrapper(
     assert run_args[4] is block_tables
     assert run_args[5] is seq_lens_kv
     assert tuple(run_kwargs) == (
+        "max_q_len",
+        "max_kv_len",
         "out",
         "lse",
         "return_lse",
@@ -1127,7 +1159,7 @@ def test_attention_ts_context_paged_one_shot_validates_fixed_table(
     )
 
     assert geometry.max_kv_len == 65
-    assert geometry.max_seq_len_q == 2
+    assert geometry.max_q_len == 2
     assert geometry.batch_size == 2
 
 
@@ -1183,7 +1215,7 @@ def test_attention_ts_context_variable_window_validates_nondecreasing_ends(
         device=torch.device("cpu"),
         packed_query=False,
         batch_size=2,
-        max_seq_len_q=3,
+        max_q_len=3,
         max_seq_len_k=4,
     )
     # Starts may decrease; ends may reset at a batch boundary and may repeat.
@@ -1212,7 +1244,7 @@ def test_attention_ts_context_validates_precomputed_variable_window_cta_starts(
     geometry = SimpleNamespace(
         device=torch.device("cpu"),
         batch_size=2,
-        max_seq_len_q=257,
+        max_q_len=257,
         head_dim=128,
     )
     token_start_values = tuple(range(257)) + tuple(range(256, -1, -1))
@@ -1338,7 +1370,7 @@ def _validate_paged_metadata_on_cpu(
     geometry = SimpleNamespace(
         device=torch.device("cpu"),
         batch_size=2,
-        max_seq_len_q=64,
+        max_q_len=64,
         max_kv_len=max_kv_len,
         page_size=32,
         mask_type="causal",
@@ -2266,7 +2298,7 @@ def test_attention_ts_context_public_plan_rejects_unsupported_arch(monkeypatch):
             q_dtype=q.dtype,
             k_dtype=k.dtype,
             batch_size=1,
-            max_seq_len_q=8,
+            max_q_len=8,
             max_kv_len=8,
         )
 
@@ -2312,7 +2344,7 @@ def test_attention_ts_context_plan_rejects_critical_public_contracts(
         q_dtype=dtype,
         k_dtype=dtype,
         batch_size=1,
-        max_seq_len_q=8,
+        max_q_len=8,
         max_kv_len=8,
     )
 
@@ -2323,9 +2355,7 @@ def test_attention_ts_context_plan_rejects_critical_public_contracts(
         # The terminal Q offset must cover both packed query rows.
         qo_indptr = torch.tensor((0, 1), dtype=torch.int32, device=device)
         kv_indptr = torch.tensor((0, 2), dtype=torch.int32, device=device)
-        plan_kwargs.update(
-            batch_size=1, max_seq_len_q=2, max_kv_len=2, packed_query=True
-        )
+        plan_kwargs.update(batch_size=1, max_q_len=2, max_kv_len=2, packed_query=True)
     else:
         q = torch.empty((1, 8, num_qo_heads, head_dim), dtype=dtype, device=device)
         k = torch.empty((1, 8, num_kv_heads, head_dim), dtype=dtype, device=device)
@@ -2493,7 +2523,7 @@ def test_attention_ts_context_paged_plan_uses_conservative_dynamic_facts(
     common = dict(
         device="cuda:0",
         batch_size=2,
-        max_seq_len_q=64,
+        max_q_len=64,
         max_kv_len=128,
         num_qo_heads=4,
         num_kv_heads=4,
@@ -2689,7 +2719,7 @@ def test_attention_ts_context_paged_rejects_variable_window_before_compile(
             mask_type="variable_window",
             out_dtype=torch.float16,
             batch_size=1,
-            max_seq_len_q=1,
+            max_q_len=1,
             max_kv_len=1,
         )
 
@@ -2707,7 +2737,7 @@ def test_attention_ts_context_paged_plan_ignores_aggregate_kv_capacity(monkeypat
     geometry = context_module._resolve_paged_plan_geometry(
         device="cuda:0",
         batch_size=batch_size,
-        max_seq_len_q=1,
+        max_q_len=1,
         max_kv_len=65,
         num_qo_heads=4,
         num_kv_heads=4,
@@ -3141,13 +3171,13 @@ def test_attention_ts_context_variable_window_clamps_padded_q_rows(head_dim: int
 def test_attention_ts_context_reuses_compiled_topology_across_batch_sizes(
     packed_query: bool,
 ):
-    """One resolved context topology accepts different batch extents."""
+    """One resolved context topology accepts different batch, Q and KV extents."""
 
     wrappers = []
-    for batch_size in (3, 4):
+    for batch_size, q_length, kv_length in ((3, 33, 65), (4, 65, 129)):
         case = _make_context_case(
-            q_lengths=(33,) * batch_size,
-            k_lengths=(65,) * batch_size,
+            q_lengths=(q_length,) * batch_size,
+            k_lengths=(kv_length,) * batch_size,
             num_qo_heads=4,
             num_kv_heads=4,
             qkv_dtype=torch.float16,
@@ -4535,6 +4565,8 @@ def test_attention_ts_context_live_q_offsets_expand_causal_domain_on_graph_repla
             v,
             qo_indptr,
             reference.kv_indptr,
+            max_q_len=max(replay_q_lengths),
+            max_kv_len=max(k_lengths),
             out=direct_out,
         )
     else:
@@ -4545,6 +4577,8 @@ def test_attention_ts_context_live_q_offsets_expand_causal_domain_on_graph_repla
             paged_metadata.qo_indptr,
             paged_metadata.block_tables,
             paged_metadata.seq_lens_kv,
+            max_q_len=max(replay_q_lengths),
+            max_kv_len=max(k_lengths),
             out=direct_out,
         )
     graph_out.fill_(float("nan"))
@@ -4942,7 +4976,7 @@ def test_attention_ts_context_mla_prefill(
     wrapper.plan(
         device=q.device,
         batch_size=batch_size,
-        max_seq_len_q=max(q_lens) + replay_shift,
+        max_q_len=max(q_lens) + replay_shift,
         # Packed replays can reassign the first request's K rows to its peer.
         max_kv_len=sum(k_lens) if packed_query else max(k_lens),
         num_qo_heads=hq,
@@ -5134,7 +5168,7 @@ def test_attention_ts_context_variable_window_replanned_sizes():
             mask_type="variable_window",
             output_scale=0.75,
             batch_size=batch,
-            max_seq_len_q=sq,
+            max_q_len=sq,
             max_kv_len=sk,
         )
 
@@ -5239,7 +5273,7 @@ def test_attention_ts_context_final_statistics(dtype, dim, kind, mode):
         lse_mode=mode,
         use_attention_sinks=True,
         batch_size=2,
-        max_seq_len_q=129,
+        max_q_len=129,
         max_kv_len=257,
         **plan_options,
     )
@@ -5441,3 +5475,145 @@ def test_paged_swa_d192_full_head_stage(monkeypatch, qkv_dtype, out_dtype):
         _check_paged_head_paired_window(192, True, qkv_dtype, 777, 511, out_dtype)
     finally:
         context_module._get_compiled_paged_context.cache_clear()
+
+
+def live_bound(host_value: int, read_live) -> int:
+    """Return the launch bound, reading live metadata unless a graph is capturing.
+
+    Tests may rewrite offsets or lengths in place, so eager runs read the device
+    values. Capture cannot synchronize, so it keeps the host-known bound.
+    """
+
+    if torch.cuda.is_current_stream_capturing():
+        return host_value
+    return int(read_live())
+
+
+@_REQUIRES_CONTEXT_GPU
+@pytest.mark.parametrize("paged", (False, True), ids=("contiguous", "paged"))
+def test_attention_ts_context_packed_launch_bounds(paged):
+    """Omitted/exact/bucketed bounds agree; invalid bounds leave output untouched."""
+    common = dict(
+        q_lengths=(2, 3),
+        k_lengths=(129, 257),
+        num_qo_heads=4,
+        num_kv_heads=2,
+        head_dim=128,
+        mask_type="causal",
+        seed=710646,
+    )
+    if paged:
+        case = _make_paged_context_case(**common, qk_dtype=torch.bfloat16)
+        reference = case.reference
+        metadata = _make_native_paged_metadata(case, extra_page_columns=1)
+        inputs = (
+            reference.q,
+            case.k_cache,
+            case.v_cache,
+            metadata.qo_indptr,
+            metadata.block_tables,
+            metadata.seq_lens_kv,
+        )
+        wrapper = BatchPrefillPagedTSWrapper()
+        layout = dict(page_size=32)
+    else:
+        case = _make_context_case(**common, qkv_dtype=torch.bfloat16, packed_query=True)
+        reference = case
+        inputs = (case.q, case.k, case.v, case.qo_indptr, case.kv_indptr)
+        wrapper = BatchPrefillTSWrapper()
+        layout = dict(packed_query=True)
+    wrapper.plan(
+        device="cuda",
+        batch_size=2,
+        max_q_len=4,
+        max_kv_len=320,
+        num_qo_heads=4,
+        num_kv_heads=2,
+        head_dim=128,
+        q_dtype=torch.bfloat16,
+        k_dtype=torch.bfloat16,
+        mask_type="causal",
+        softmax_scale=reference.softmax_scale,
+        output_scale=reference.output_scale,
+        out_dtype=reference.out_dtype,
+        **layout,
+    )
+    out = torch.empty_like(reference.q)
+    for bounds in (
+        {},
+        dict(max_q_len=3, max_kv_len=257),
+        dict(max_q_len=4, max_kv_len=320),
+    ):
+        actual = wrapper.run(*inputs, out=out, **bounds)
+        _assert_context_correct(actual, reference)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        wrapper.run(*inputs, out=out, validate=False)
+    out.zero_()
+    graph.replay()
+    _assert_context_correct(out, reference)
+    for name, value, message in (
+        ("max_q_len", 2, "cover"),
+        ("max_kv_len", 256, "cover"),
+        ("max_q_len", 5, "capacity"),
+        ("max_kv_len", 321, "capacity"),
+    ):
+        out.fill_(float("nan"))
+        with pytest.raises(ValueError, match=f"{name}.*{message}"):
+            wrapper.run(*inputs, out=out, **{name: value})
+        assert out.isnan().all()
+
+
+@pytest.mark.arch_blackwell
+@_REQUIRES_CONTEXT_GPU
+@pytest.mark.parametrize(
+    (
+        "head_dim",
+        "qkv_dtype",
+        "mask_type",
+        "window_left",
+        "uniform_packed_lengths",
+    ),
+    (
+        (128, torch.float16, "dense", -1, False),
+        (192, torch.bfloat16, "causal", 511, False),
+        (192, _FP8, "causal", 511, False),
+        (128, torch.float16, "dense", -1, True),
+    ),
+)
+def test_attention_ts_paged_context_compile_reuse_across_batch_and_q_sizes(
+    head_dim: int,
+    qkv_dtype: torch.dtype,
+    mask_type: str,
+    window_left: int,
+    uniform_packed_lengths: bool,
+):
+    """Reuse runtime Q/KV bounds under both general and uniform contracts."""
+
+    wrappers = []
+    for batch_size, q_length, kv_length in ((3, 33, 513), (4, 129, 1025)):
+        case = _make_paged_context_case(
+            q_lengths=(q_length,) * batch_size,
+            k_lengths=(kv_length,) * batch_size,
+            num_qo_heads=16,
+            num_kv_heads=1,
+            head_dim=head_dim,
+            qk_dtype=qkv_dtype,
+            mask_type=mask_type,
+            window_left=window_left,
+            out_dtype=torch.bfloat16,
+            seed=2026071430 + batch_size,
+        )
+        wrapper = BatchPrefillPagedTSWrapper()
+        metadata = _plan_paged_wrapper(
+            wrapper, case, uniform_packed_lengths=uniform_packed_lengths
+        )
+        actual = _run_paged_wrapper(wrapper, case, metadata)
+        _assert_context_correct(actual, case.reference)
+        wrappers.append(wrapper)
+
+    first_state = wrappers[0]._plan_state
+    second_state = wrappers[1]._plan_state
+    assert first_state is not None
+    assert second_state is not None
+    assert first_state.compiled is second_state.compiled

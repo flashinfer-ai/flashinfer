@@ -50,7 +50,7 @@ PARALLEL_REDUCTION_HEAD_DIM = (
 def _parallel_reduction_row_state(
     tile_size_q: cutlass.Constexpr[int],
     num_heads: cutlass.Constexpr[int],
-    seq_len_q: cutlass.Constexpr[int],
+    seq_len_q: Int32,
     is_var_split_kv: cutlass.Constexpr[bool],
     cache_seqs,
     cu_seqlens_q,
@@ -98,7 +98,7 @@ def _parallel_reduction_row_state(
     query_is_valid = query_is_valid & (tile_k > Int32(0))
     tile_k = cute.math.max(tile_k, Int32(0))
     row_k = tile_k
-    if cutlass.const_expr(cfg.mask_type == MaskType.CAUSAL.value and seq_len_q > 1):
+    if cutlass.const_expr(cfg.mask_type == MaskType.CAUSAL.value):
         _, logical_seq_len_q = query_batch_bounds(
             cu_seqlens_q,
             batch_idx,
@@ -257,7 +257,7 @@ def accumulate_parallel_reduction_slot(
 @cute.jit
 def run_parallel_reduction_kernel(
     num_heads: cutlass.Constexpr[int],
-    seq_len_q: cutlass.Constexpr[int],
+    seq_len_q: Int32,
     is_var_split_kv: cutlass.Constexpr[bool],
     output,
     lse,
@@ -302,7 +302,9 @@ def run_parallel_reduction_kernel(
         # A sparse query is already one virtual request. The producer writes
         # neutral LSE for skipped splits, so the compiled slot count suffices;
         # live length loads and dynamic split division would repeat per head.
-        if cutlass.const_expr(seq_len_q != 1 or cu_seqlens_q is not None):
+        if cutlass.const_expr(
+            not isinstance(seq_len_q, int) or seq_len_q != 1 or cu_seqlens_q is not None
+        ):
             raise ValueError("final sparse reduction requires virtual query rows")
         logical_head_idx = query_tile_idx * Int32(cfg.mma_qk_tiler[0]) + row_in_tile
         logical_q_idx = Int32(0)

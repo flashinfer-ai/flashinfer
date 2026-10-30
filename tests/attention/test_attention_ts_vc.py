@@ -343,7 +343,7 @@ def _plan(
     arguments = dict(
         device=torch.device("cuda"),
         batch_size=batch_size,
-        max_seq_len_q=seq_len_q or seq_len,
+        max_q_len=seq_len_q or seq_len,
         max_kv_len=seq_len,
         num_qo_heads=num_heads,
         num_kv_heads=num_heads,

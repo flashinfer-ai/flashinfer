@@ -89,6 +89,15 @@ from .fmha_decode_constants import (
     WARP_THREADS,
 )
 
+LENGTH_DERIVED_FIELDS = (
+    "max_seq_len_q",
+    "total_kv_tiles",
+    "static_seq_len_kv",
+    "max_num_pages_per_seq_kv",
+    "static_num_skipped_kv_tiles",
+    "static_window_start_idx",
+)
+
 ConfigValue = int | float | bool | str | type | None
 _GroupedKeepsProfileKey = tuple[type, type, type, type, int, int, int, int]
 
@@ -658,6 +667,14 @@ class FmhaDecodeConfig:
     # Number of KV tiles in the launch (= ceil(seq_len_kv / tile_size_kv)).
     # Populated by the launcher once seq_len_kv is known.
     total_kv_tiles: int = 0
+    # Compile for the exact Q/KV lengths recorded in this config. By default the
+    # logical lengths are runtime launch operands and stay out of the compiled
+    # program and its cache identity (see ``compile_signature``).
+    fixed_seqlen: bool = False
+    # Whether a grouped sparse route carries a packed-membership table. Runtime Q
+    # lengths cannot imply it, and a single-token route keeps the lean layout, so
+    # the launch policy records it before the lengths leave the identity.
+    query_memberships: bool | None = None
     # Q rows placed on the small MMA N dimension. Shape-aware selection derives
     # this tile from the Q-heads-per-KV-head ratio and grouping policy.
     tile_size_q: int = 8
@@ -667,6 +684,8 @@ class FmhaDecodeConfig:
     # Select the packed Q/O ABI. Q and O are laid out as
     # [sum_q_tokens, num_heads_q, head_dim] and indexed by cu_seqlens_q.
     use_variable_seqlens_q: bool = False
+    # Derived from the affine metadata view; lengths themselves stay runtime.
+    uniform_query_offsets: bool = False
     # Select the private sparse-block route. This explicit discriminator keeps
     # ordinary storage-subpage callers on the generic paged-KV path. Grouped
     # sparse routes consume query membership from a separate packed-word table;
@@ -872,12 +891,23 @@ class FmhaDecodeConfig:
     @property
     def uses_q_token_kv_block_sparse_page_membership(self) -> bool:
         """Whether grouped sparse attention uses a packed-membership table."""
-        return self.uses_q_token_kv_block_sparse_page_route and self.max_seq_len_q > 1
+        return self.uses_q_token_kv_block_sparse_page_route and (
+            self.is_multi_token_q
+            if self.query_memberships is None
+            else self.query_memberships
+        )
+
+    @property
+    def is_multi_token_q(self) -> bool:
+        """Runtime Q domains retain general token indexing and masking."""
+        return not self.fixed_seqlen or self.max_seq_len_q > 1
 
     @property
     def grouped_q_rows(self) -> int:
         """Return logical query/head rows represented by one sparse-route group."""
-        return self.heads_q_per_kv * self.max_seq_len_q
+        return self.heads_q_per_kv * (
+            self.q_tokens_per_cta if not self.fixed_seqlen else self.max_seq_len_q
+        )
 
     @property
     def grouped_q_fits_tile(self) -> bool:
@@ -898,7 +928,12 @@ class FmhaDecodeConfig:
             and self.num_tokens_per_page in (4, 8, 16, 32, 64, 128)
             and self.groups_tokens_heads_q
             and self.use_q_token_kv_block_sparse_route
-            and 0 < self.max_seq_len_q <= Q_TOKEN_KV_BLOCK_SPARSE_PAGE_MEMBERSHIP_BITS
+            and (
+                not self.fixed_seqlen
+                or 0
+                < self.max_seq_len_q
+                <= Q_TOKEN_KV_BLOCK_SPARSE_PAGE_MEMBERSHIP_BITS
+            )
             and self.grouped_q_fits_tile
         )
 
@@ -908,7 +943,7 @@ class FmhaDecodeConfig:
         return (
             self.uses_q_token_kv_block_sparse_page_membership
             and self.use_keeps_mma_ab
-            and 2 <= self.max_seq_len_q <= 8
+            and (self.fixed_seqlen and 2 <= self.max_seq_len_q <= 8)
             and self.has_single_q_cta
             and self.num_tokens_per_page == 4
             and self.tile_size_kv == 128
@@ -924,11 +959,14 @@ class FmhaDecodeConfig:
             and self.use_paged_kv
             and self.uses_scattered_page_route
             and self.tile_size_kv == 128
+            and self.fixed_seqlen
             and not self.use_sliding_window_causal
             and self.static_local_kv_tiles
             <= Q_TOKEN_KV_BLOCK_SPARSE_HELD_LOCATOR_MAX_TILES
         )
 
+    # Select profiles whose task roles hand registers between producer and compute
+    # warps.
     @property
     def uses_task_register_reallocation(self) -> bool:
         if (
@@ -945,7 +983,11 @@ class FmhaDecodeConfig:
                 self.use_keeps_mma_ab
                 and self.tile_size_q == 64
                 and self.tile_size_kv == 256
-                and self.total_kv_tiles >= KV_TILE_256_REGISTER_REALLOCATION_MIN_TILES
+                and (
+                    not self.fixed_seqlen
+                    or self.total_kv_tiles
+                    >= KV_TILE_256_REGISTER_REALLOCATION_MIN_TILES
+                )
             )
         ):
             return True
@@ -1088,7 +1130,11 @@ class FmhaDecodeConfig:
     def q_tma_tokens_per_cta(self) -> int:
         """Q tokens copied by a box, excluding spare sparse-group slots."""
         if self.use_variable_seqlens_q and self.uses_q_token_kv_block_sparse_page_route:
-            return min(self.max_seq_len_q, self.q_tokens_per_cta)
+            return (
+                self.q_tokens_per_cta
+                if not self.fixed_seqlen
+                else min(self.max_seq_len_q, self.q_tokens_per_cta)
+            )
         return self.q_tokens_per_cta
 
     @property
@@ -1099,6 +1145,10 @@ class FmhaDecodeConfig:
         raw shape-less configs conservative so this scheduling predicate can
         never specialize geometry that has not been resolved yet.
         """
+        if not self.fixed_seqlen:
+            if hasattr(self, "runtime_q_ctas"):
+                return self.runtime_q_ctas
+            raise ValueError("runtime Q CTA count is a launch operand")
         if self.heads_q_per_kv <= 0 or self.max_seq_len_q <= 0:
             return max(self.max_seq_len_q, 1)
         q_geometry = make_q_tile_geometry(
@@ -1122,7 +1172,10 @@ class FmhaDecodeConfig:
     def has_single_q_cta(self) -> bool:
         """Whether every physical split maps to one logical Q CTA."""
         return (
-            self.heads_q_per_kv > 0 and self.max_seq_len_q > 0 and self.num_q_ctas == 1
+            self.fixed_seqlen
+            and self.heads_q_per_kv > 0
+            and self.max_seq_len_q > 0
+            and self.num_q_ctas == 1
         )
 
     @property
@@ -1870,6 +1923,12 @@ class FmhaDecodeConfig:
         block boundary.
         """
         num_summaries, tail_mass = self.proxy_summary_geometry
+        if not self.fixed_seqlen:
+            import cutlass.cute as cute
+
+            return num_summaries - 1, cute.math.log2(Float32(tail_mass)) - math.log2(
+                self.kv_block_size
+            )
         return num_summaries - 1, math.log2(tail_mass) - math.log2(self.kv_block_size)
 
     @property
@@ -1882,10 +1941,10 @@ class FmhaDecodeConfig:
         return (self.num_proxy_summaries + self.tile_size_kv - 1) // self.tile_size_kv
 
     @property
-    def proxy_static_tail_fragment(self) -> tuple[int, int]:
+    def proxy_tail_fragment(self) -> tuple[int, int]:
         """Return ``(spatial half, fragment)`` holding the ragged final summary.
 
-        Proxy groups are fixed, so the final summary sits at the compile-time
+        Proxy groups cover consecutive summaries, so the final summary sits at
         position ``tail_summary_idx % tile_size_kv`` of the last group. Only
         meaningful when ``proxy_tail_summary`` reports a non-zero shortfall.
         """
@@ -2312,13 +2371,24 @@ class FmhaDecodeConfig:
         The public planner can reuse one compiled topology across batch sizes.
         Keeping the complete static config in the cache key prevents a callable
         compiled for one scheduler, reduction, or tile layout from being reused
-        by another.
+        by another. Unless ``fixed_seqlen`` asks for exact lengths, every
+        length-derived field is dropped from the key: Q lengths come from packed
+        offsets and K/V lengths from metadata at launch.
         """
 
-        return tuple(
-            (config_field.name, getattr(self, config_field.name))
+        items = {
+            config_field.name: getattr(self, config_field.name)
             for config_field in fields(self)
-        )
+        }
+        if not self.fixed_seqlen:
+            policy = replace(self, fixed_seqlen=True)
+            for name in LENGTH_DERIVED_FIELDS:
+                del items[name]
+            items.update(
+                use_variable_seqlens_q=True,
+                query_memberships=policy.uses_q_token_kv_block_sparse_page_membership,
+            )
+        return tuple(items.items())
 
     @property
     def uses_prepared_score_keep_words(self) -> bool:
@@ -2364,7 +2434,7 @@ class FmhaDecodeConfig:
     @property
     def has_odd_kv_tail(self) -> bool:
         """Whether the K/V tile count leaves an unpaired tail instance."""
-        return (self.total_kv_tiles % self.num_insts_kv) != 0
+        return not self.fixed_seqlen or (self.total_kv_tiles % self.num_insts_kv) != 0
 
     @property
     def uses_uniform_causal_mask(self) -> bool:
@@ -2483,6 +2553,7 @@ class FmhaDecodeConfig:
             self.use_keeps_mma_ab
             and self.use_paged_kv
             and self.groups_tokens_heads_q
+            and self.fixed_seqlen
             and self.max_seq_len_q == 1
             and not self.use_variable_seqlens_q
             and self.q_manual_padding_rows == 0
@@ -2510,7 +2581,10 @@ class FmhaDecodeConfig:
             self.use_keeps_mma_ab
             and self.use_paged_kv
             and self.groups_tokens_heads_q
-            and not self.use_variable_seqlens_q
+            and (
+                not self.use_variable_seqlens_q
+                or (self.uniform_query_offsets and not self.use_sage_attention)
+            )
             and profile in _GROUPED_KEEPS_PAGED_FP8_PROFILES
             and self.supports_grouped_keeps
             and not (self.uses_staged_one_inst_tmem_p and self.tile_size_q == 64)
@@ -2520,7 +2594,8 @@ class FmhaDecodeConfig:
     def has_static_dense_full_kv_tiles(self) -> bool:
         """Whether static dense KV avoids masking and runtime tile remapping."""
         return (
-            not self.use_split_kv
+            self.fixed_seqlen
+            and not self.use_split_kv
             and not self.use_block_sparse
             and self.mask_type == DENSE
             and not self.use_sliding_window_causal
@@ -2580,15 +2655,24 @@ class FmhaDecodeConfig:
 
     @property
     def q_tiles_are_full(self) -> bool:
-        """Whether every launched Q CTA owns all of its MMA rows."""
-        if self.use_variable_seqlens_q:
+        """Whether every active Q CTA owns all of its MMA rows."""
+        # Empty/overlaunched Q tiles are discarded before the task graph.
+        # One-token tiles with complete head bands cannot have partial rows,
+        # even when request lengths are packed or change at runtime.
+        if (
+            self.heads_q_per_kv > 0
+            and self.q_tokens_per_cta == 1
+            and self.heads_q_per_kv % self.tile_size_q == 0
+        ):
+            return True
+        if self.use_variable_seqlens_q or not self.fixed_seqlen:
             return False
         if self.uses_nontrivial_grouped_q_layout:
             return (
                 self.q_manual_padding_rows == 0
                 and self.max_seq_len_q % self.q_tokens_per_cta == 0
             )
-        if self.max_seq_len_q > 1:
+        if self.is_multi_token_q:
             return self.heads_q_per_kv % self.tile_size_q == 0
         return self.heads_q_per_kv == self.tile_size_q
 
@@ -2596,8 +2680,8 @@ class FmhaDecodeConfig:
     def q_tiles_need_row_mask(self) -> bool:
         """Whether softmax must suppress inactive Q rows."""
         if self.use_variable_seqlens_q:
-            return True
-        if self.uses_nontrivial_grouped_q_layout or self.max_seq_len_q > 1:
+            return not self.q_tiles_are_full
+        if self.uses_nontrivial_grouped_q_layout or self.is_multi_token_q:
             return not self.q_tiles_are_full
         return False
 
@@ -2614,7 +2698,7 @@ class FmhaDecodeConfig:
         """Whether the causal/window KV union depends on the logical Q CTA."""
         return (
             self.mask_type == CAUSAL
-            and self.max_seq_len_q > 1
+            and self.is_multi_token_q
             and not self.has_single_q_cta
         )
 
@@ -2622,13 +2706,14 @@ class FmhaDecodeConfig:
     def uses_runtime_q_kv_union(self) -> bool:
         """Whether task/resource KV geometry must retain runtime Q metadata.
 
-        Multiple causal Q CTAs have distinct right bounds. A multi-token
-        sliding-window launch also retains the runtime path even when it fits
-        in one Q CTA, because the existing static window-prefix metadata is
-        specialized only for SQ1.
+        This is a geometry property, not the ``fixed_seqlen`` switch: it holds
+        even when every length is static. Multiple causal Q CTAs have distinct
+        right bounds. A multi-token sliding-window launch also retains the
+        runtime path even when it fits in one Q CTA, because the existing static
+        window-prefix metadata is specialized only for SQ1.
         """
         return self.uses_q_cta_sliding_union or (
-            self.use_sliding_window_causal and self.max_seq_len_q > 1
+            self.use_sliding_window_causal and self.is_multi_token_q
         )
 
     @property
@@ -2866,7 +2951,8 @@ class FmhaDecodeConfig:
         )
         q_rows = layout.q_rows
         assert q_rows.tokens_per_tile == self.q_tokens_per_cta
-        assert q_rows.tiles == self.num_q_ctas
+        if self.fixed_seqlen:
+            assert q_rows.tiles == self.num_q_ctas
         return layout
 
     def sage_k_groups_per_fragment(self, proxy: bool = False) -> int:
@@ -2995,6 +3081,7 @@ class FmhaDecodeConfig:
         ungrouped_q_layout = (
             not self.groups_tokens_heads_q
             and not self.use_variable_seqlens_q
+            and self.fixed_seqlen
             and self.max_seq_len_q == 1
         )
         grouped_q_layout = (
@@ -3208,7 +3295,7 @@ class FmhaDecodeConfig:
                     )
                 )
                 and not self.uses_q_token_kv_block_sparse_page_route
-                and not self.use_variable_seqlens_q
+                and (not self.use_variable_seqlens_q or not self.fixed_seqlen)
                 and not self.use_attention_sinks
                 and not self.use_cluster_smem_reduction
             )
@@ -3229,8 +3316,8 @@ class FmhaDecodeConfig:
             if paged_16bit_q128:
                 return direct and not self.use_persistent_scheduler
             return (
-                (self.max_seq_len_q > 1 or self.grouped_q_fits_tile)
-                and not self.use_variable_seqlens_q
+                (self.is_multi_token_q or self.grouped_q_fits_tile)
+                and (not self.use_variable_seqlens_q or not self.fixed_seqlen)
                 and self.mask_type in (DENSE, CAUSAL)
                 and (direct or self.has_valid_split_kv_fanout)
             )
@@ -3845,6 +3932,10 @@ def _make_static_decode_config(
     """
     cfg = FmhaDecodeConfig(headdim=headdim)
     explicit_fields = _apply_config_source(cfg, args)
+    # Policy selection uses the planned lengths; only the compiled program
+    # replaces them with runtime operands.
+    fixed_seqlen = cfg.fixed_seqlen
+    cfg.fixed_seqlen = True
     _apply_mask_type_config(
         cfg,
         source=args,
@@ -3856,6 +3947,7 @@ def _make_static_decode_config(
     _validate_mixed_kv_dtype_profile(cfg)
     _validate_kv256_static_config(cfg)
     _finalize_warp_roles(cfg)
+    cfg.fixed_seqlen = fixed_seqlen
     return cfg
 
 
@@ -5677,6 +5769,10 @@ def make_decode_config(
     validate_sliding_window_args(sliding_window_causal, attention_window_size)
     cfg = FmhaDecodeConfig(headdim=headdim)
     explicit_fields = _apply_config_source(cfg, args)
+    # Policy selection uses the planned lengths; only the compiled program
+    # replaces them with runtime operands.
+    fixed_seqlen = cfg.fixed_seqlen
+    cfg.fixed_seqlen = True
     if not split_kv and (cfg.use_split_kv or cfg.splits_kv > 1):
         raise ValueError("split_kv=False conflicts with an explicit split config")
     splits_kv, max_splits_kv = _resolve_explicit_split_controls(
@@ -5883,4 +5979,5 @@ def make_decode_config(
         num_heads_kv=num_heads_kv,
         split_kv_mode=split_kv_mode,
     )
+    cfg.fixed_seqlen = fixed_seqlen
     return cfg

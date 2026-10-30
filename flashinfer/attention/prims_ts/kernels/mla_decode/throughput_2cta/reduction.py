@@ -56,6 +56,7 @@ def run_reduction_kernel(
     max_splits: cutlass.Constexpr[int],
     rows_per_cta: cutlass.Constexpr[int],
     split_divisor=None,
+    runtime_seq_len_q=None,
 ):
     """Combine consecutive logical split rows in one reference-reducer CTA.
 
@@ -67,6 +68,7 @@ def run_reduction_kernel(
     inactive row groups; those groups still synchronize but never access the
     workspace or publish public output.
     """
+    seq_len_q = kernel.seq_len_q if runtime_seq_len_q is None else runtime_seq_len_q
     reduction_group_idx, _, batch_idx = cute.arch.block_idx()
     tidx, _, _ = cute.arch.thread_idx()
     row_in_cta = tidx // Int32(REDUCTION_THREADS_PER_ROW)
@@ -77,7 +79,7 @@ def run_reduction_kernel(
     lane_idx = row_thread_idx % Int32(cfg.threads_per_warp)
 
     physical_tile_rows = Int32(cfg.mma_qk_tiler[0])
-    logical_query_rows = Int32(kernel.num_heads * kernel.seq_len_q)
+    logical_query_rows = Int32(kernel.num_heads * seq_len_q)
     local_flat_query_row = reduction_group_idx * Int32(rows_per_cta) + row_in_cta
     row_is_valid = local_flat_query_row < logical_query_rows
     # Clamp the final CTA's inactive row groups before decomposing the physical
@@ -86,7 +88,9 @@ def run_reduction_kernel(
     safe_local_flat_query_row = cute.math.min(
         local_flat_query_row, logical_query_rows - Int32(1)
     )
-    if cutlass.const_expr(kernel.num_heads * kernel.seq_len_q <= cfg.mma_qk_tiler[0]):
+    if cutlass.const_expr(
+        kernel.fixed_seqlen and kernel.num_heads * seq_len_q <= cfg.mma_qk_tiler[0]
+    ):
         query_tile_idx = Int32(0)
         row_in_tile = safe_local_flat_query_row
     else:
@@ -110,7 +114,7 @@ def run_reduction_kernel(
             query_tile_idx,
             cfg.mma_qk_tiler[0],
             kernel.num_heads,
-            kernel.seq_len_q,
+            seq_len_q,
             cu_seqlens_q,
             batch_idx,
         )
@@ -118,7 +122,7 @@ def run_reduction_kernel(
     public_flat_query_row = storage_flat_query_row
     if cutlass.const_expr(cu_seqlens_q is None):
         public_flat_query_row = public_flat_query_row + batch_idx * Int32(
-            kernel.seq_len_q * kernel.num_heads
+            seq_len_q * kernel.num_heads
         )
 
     # The scalar split count remains the grid/workspace capacity. A variable-
@@ -141,19 +145,20 @@ def run_reduction_kernel(
     tile_k = cute.math.max(tile_k, Int32(0))
     row_k = tile_k
     if cutlass.const_expr(
-        cfg.mask_type == MaskType.CAUSAL.value and kernel.seq_len_q > 1
+        cfg.mask_type == MaskType.CAUSAL.value
+        and (not kernel.fixed_seqlen or seq_len_q > 1)
     ):
         _, logical_seq_len_q = query_batch_bounds(
             cu_seqlens_q,
             batch_idx,
-            kernel.seq_len_q,
+            seq_len_q,
         )
         _, _, tile_last_logical_q_idx, _, _ = flat_query_row_state(
             Int32(cfg.mma_qk_tiler[0] - 1),
             query_tile_idx,
             cfg.mma_qk_tiler[0],
             kernel.num_heads,
-            kernel.seq_len_q,
+            seq_len_q,
             cu_seqlens_q,
             batch_idx,
         )
