@@ -169,6 +169,7 @@ def tune_one(
             activation=args.activation,
             situ_beta=args.situ_beta,
             situ_linear_beta=args.situ_linear_beta,
+            apply_routing_weights_before_fc2=args.apply_routing_weights_before_fc2,
         )
         _stage_dummy_inputs(args, rank, symm_buffer, live_tokens, quant_kind)
         y = torch.empty(live_tokens, args.hidden, device="cuda", dtype=torch.bfloat16)
@@ -194,6 +195,9 @@ def tune_one(
                     situ_beta=args.situ_beta,
                     situ_linear_beta=args.situ_linear_beta,
                     gate_up_clamp=args.gate_up_clamp,
+                    apply_routing_weights_before_fc2=(
+                        args.apply_routing_weights_before_fc2
+                    ),
                 )
                 if rank == 0:
                     print(f"[moe_ep-tune] schedule sweep base ({src}): {base}")
