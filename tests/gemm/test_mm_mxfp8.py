@@ -591,6 +591,120 @@ def test_mm_mxfp8_cute_dsl_sm107(m, n, k, auto_tuning, monkeypatch):
         _assert_cosine_similarity(reference, out)
 
 
+def _run_mm_mxfp8_cutedsl_low_latency_quantize_pdl_cuda_graph(
+    m, n, k, dtype, *, dynamic_weight
+):
+    _skip_if_unsupported("cutedsl_low_latency")
+
+    generator = torch.Generator(device="cuda").manual_seed(0)
+    x = torch.randn((m, k), device="cuda", dtype=dtype, generator=generator)
+    weight = torch.randn((n, k), device="cuda", dtype=dtype, generator=generator)
+    out = torch.empty((m, n), device="cuda", dtype=dtype)
+    reference = torch.empty_like(out)
+    torch.cuda.synchronize()
+
+    def quantize(input, enable_pdl):
+        return mxfp8_quantize(
+            input,
+            backend="cute-dsl",
+            enable_pdl=enable_pdl,
+            sf_swizzle_layout=SfLayout.layout_128x4,
+        )
+
+    changing_input, static_input = (weight, x) if dynamic_weight else (x, weight)
+    static_q, static_sf = quantize(static_input, enable_pdl=False)
+    torch.cuda.synchronize()
+
+    def gemm(changing_q, changing_sf, destination, wait_for_weight):
+        if dynamic_weight:
+            x_q, x_sf = static_q, static_sf
+            weight_q, weight_sf = changing_q, changing_sf
+        else:
+            x_q, x_sf = changing_q, changing_sf
+            weight_q, weight_sf = static_q, static_sf
+        # Omit the keyword to exercise the public default separately from True.
+        options = (
+            {} if wait_for_weight is None else {"pdl_wait_for_weight": wait_for_weight}
+        )
+        return mm_mxfp8(
+            x_q,
+            weight_q.T,
+            x_sf,
+            weight_sf,
+            out=destination,
+            out_dtype=dtype,
+            backend="cutedsl_low_latency",
+            **options,
+        )
+
+    # Use the same tactic for both paths, independent of earlier autotuning.
+    with autotune(False, skip_ops={"mxfp8_gemm"}):
+        warmup_q, warmup_sf = quantize(changing_input, enable_pdl=True)
+        torch.cuda.synchronize()
+        # Compile the ready-weight path first to exercise separate cache entries.
+        gemm(warmup_q, warmup_sf, out, wait_for_weight=False)
+        torch.cuda.synchronize()
+
+        graphs = []
+        for wait_for_weight in (True,) if dynamic_weight else (None, True):
+            gemm(warmup_q, warmup_sf, out, wait_for_weight)
+            torch.cuda.synchronize()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                graph_q, graph_sf = quantize(changing_input, enable_pdl=True)
+                gemm(graph_q, graph_sf, out, wait_for_weight)
+            graphs.append((graph, graph_q, graph_sf, wait_for_weight))
+
+        for magnitude in (0.125, 1.0, 8.0, 0.5) * 2:
+            changing_input.normal_(generator=generator).mul_(magnitude)
+            # Isolate the quantizer-to-GEMM dependency from input preparation.
+            torch.cuda.synchronize()
+            reference_q, reference_sf = quantize(changing_input, enable_pdl=False)
+            torch.cuda.synchronize()
+
+            for graph, graph_q, graph_sf, wait_for_weight in graphs:
+                gemm(reference_q, reference_sf, reference, wait_for_weight)
+                torch.cuda.synchronize()
+
+                # Unwritten buffers must not retain a valid result from a prior replay.
+                graph_q.view(torch.uint8).zero_()
+                graph_sf.zero_()
+                out.fill_(float("nan"))
+                torch.cuda.synchronize()
+                graph.replay()
+                torch.cuda.synchronize()
+
+                assert torch.isfinite(out).all(), "Output contains NaN/Inf values"
+                for actual, expected in (
+                    (graph_q, reference_q),
+                    (graph_sf, reference_sf),
+                    (out, reference),
+                ):
+                    torch.testing.assert_close(
+                        actual.view(torch.uint8),
+                        expected.view(torch.uint8),
+                        rtol=0,
+                        atol=0,
+                    )
+
+
+@pytest.mark.parametrize("m,n,k", [(4, 6144, 1024), (4, 7168, 7168)])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_mm_mxfp8_cutedsl_low_latency_quantize_weight_pdl_cuda_graph(m, n, k, dtype):
+    """The opt-in wait protects this replay's quantized weights and scales."""
+    _run_mm_mxfp8_cutedsl_low_latency_quantize_pdl_cuda_graph(
+        m, n, k, dtype, dynamic_weight=True
+    )
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_mm_mxfp8_cutedsl_low_latency_quantize_activation_pdl_cuda_graph(dtype):
+    """Both weight policies wait for new activations with prequantized weights."""
+    _run_mm_mxfp8_cutedsl_low_latency_quantize_pdl_cuda_graph(
+        4, 6144, 1024, dtype, dynamic_weight=False
+    )
+
+
 def test_mm_mxfp8_cute_dsl_stale_split_k_tactic_falls_back():
     """A low-M cached tactic must not fail when reused for a larger M."""
     _skip_if_unsupported("cute-dsl")
