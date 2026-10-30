@@ -166,14 +166,16 @@
       "shape": [
         "rows"
       ],
-      "dtype": "float32"
+      "dtype": "float32",
+      "param": "thresholds"
     },
     "ranges": {
       "shape": [
         "range",
         "rows"
       ],
-      "dtype": "int32"
+      "dtype": "int32",
+      "param": "ranges"
     },
     "counters": {
       "shape": [

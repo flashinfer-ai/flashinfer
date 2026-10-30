@@ -725,8 +725,8 @@ single_head_paged_mqa_threshold_select_trace = TraceTemplate(
         "ranges": Tensor(["range", "rows"], optional=True),
     },
     outputs={
-        "thresholds": Tensor(["rows"], dtype="float32"),
-        "ranges": Tensor(["range", "rows"], dtype="int32"),
+        "thresholds": Tensor(["rows"], dtype="float32", param="thresholds"),
+        "ranges": Tensor(["range", "rows"], dtype="int32", param="ranges"),
         "counters": Tensor(["rows", "counters"], dtype="int32", param="counters"),
         "candidates": Tensor(
             ["rows", "slots", "pair"], dtype="int32", param="candidates"
@@ -812,7 +812,11 @@ gather_key_sample_trace = TraceTemplate(
         "sample_scales": Tensor(["requests", "capacity", "scales"], optional=True),
     },
     outputs={
-        "sample_keys": Tensor(["requests", "capacity", "dim"], dtype_from="key_cache")
+        "sample_keys": Tensor(
+            ["requests", "capacity", "dim"],
+            dtype_from="key_cache",
+            param="sample_keys",
+        )
     },
     tags=["arch:sm100", "arch:sm103"],
 )
@@ -837,8 +841,8 @@ thresholds_from_sample_trace = TraceTemplate(
         "counters": Tensor(["rows", "counters"]),
     },
     outputs={
-        "thresholds": Tensor(["rows"], dtype="float32"),
-        "counters": Tensor(["rows", "counters"], dtype="int32"),
+        "thresholds": Tensor(["rows"], dtype="float32", param="thresholds"),
+        "counters": Tensor(["rows", "counters"], dtype="int32", param="counters"),
     },
     tags=["arch:sm100", "arch:sm103"],
 )
