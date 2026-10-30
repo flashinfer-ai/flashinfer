@@ -29,8 +29,9 @@ form a call launches, by token count, SM count and architecture;
 grid per token count and architecture; ``fn_split_program`` the fn split's form per
 architecture and route (``want_t`` 0 = the forward operand layout, 1 = the
 transposed layout of the backward) with its launch grid ``fn_split_grid``, and ``bwd_slab_program`` the
-column-slab form per token count and architecture -- its token-count bands
-``BWD_SLAB_BANDS`` ahead of the per-architecture ``BWD_SLAB_PROGRAM``) as plain Python.  The same rules exist in
+column-slab form per token count, SM count and architecture -- its token-count bands
+``BWD_SLAB_BANDS`` ahead of the per-architecture ``BWD_SLAB_PROGRAM``, ``BWD_SLAB_FIT`` replacing a band's
+program by the K7 units and chunk count of the call) as plain Python.  The same rules exist in
 the kernels' own test harness; :data:`RULES_ROWS` is that harness's table of
 record -- one row per (token count, board) over the 28 token counts the
 contract names (the 16 correctness values and the 13 performance rows) and the
@@ -118,6 +119,7 @@ RUN_TIME_ITERS = {
 SLAB_LIBRARY = {
     "xrsg": "cake_mhc_train_bwd_slab__xrsg",
     "dynr": "cake_mhc_train_bwd_slab__dynr",
+    "dynl": "cake_mhc_train_bwd_slab__dynl",
 }
 REDUCE_LIBRARY = {
     "pt64": "cake_mhc_train_bwd_reduce__pt64",
@@ -166,6 +168,7 @@ LIBRARY_ARCHES = {
     "cake_mhc_train_bwd_reduce__wpu4": ("sm_107a",),
     "cake_mhc_train_bwd_reduce__wpu4_fadd": ("sm_100a", "sm_107a"),
     "cake_mhc_train_bwd_reduce__wpu4_spred": ("sm_100a",),
+    "cake_mhc_train_bwd_slab__dynl": ("sm_100a",),
     "cake_mhc_train_bwd_slab__dynr": ("sm_100a", "sm_103a"),
     "cake_mhc_train_bwd_slab__xrsg": ("sm_100a", "sm_107a"),
     "cake_mhc_train_bwd_token__ao15_rae8_tma_ntr": ("sm_100a", "sm_103a", "sm_107a"),
@@ -250,7 +253,7 @@ MULTI_RECORDS = {
         "cake_mhc_train_bwd_slab__xrsg__a7",
     ],
 }
-N_RECORDS, N_LIBRARIES = 59, 44
+N_RECORDS, N_LIBRARIES = 60, 45
 RECORD_SCALARS = {
     "cake_mhc_train_fn_split": {"want_t": 0},
     "cake_mhc_train_fn_split__tv128__t": {"want_t": 1},
@@ -300,9 +303,14 @@ TABLES = {
     },
     "BWD_SLAB_PROGRAM": {"sm_100a": "dynr", "sm_103a": "dynr", "sm_107a": "xrsg"},
     "BWD_SLAB_BANDS": {
-        "sm_100a": ((1024, 4096, "xrsg"),),
+        "sm_100a": ((1024, 4096, "dynl"),),
         "sm_103a": (),
         "sm_107a": (),
+    },
+    "BWD_SLAB_FIT": {
+        "sm_100a": ("dynl", "xrsg", (9, 19), ((7, 1536, 1792), (7, 1920, 2240))),
+        "sm_103a": None,
+        "sm_107a": None,
     },
     "BWD_REDUCE_PROGRAM": {
         "sm_100a": "s27_wcvt",
@@ -591,7 +599,7 @@ DISPATCH_EXPECTED = (
     (1793, 'sm_103a', 152, 8, 120, 'nsx_st5_mb1', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
     (1793, 'sm_107a', 208, 32, 480, 'nsx_g2_ol2l', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
     (1793, 'sm_107a', 216, 32, 480, 'nsx_g2_ol2l', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
-    (2049, 'sm_100a', 148, 8, 136, 'nsx_st5_mb1', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4_spred', 411),
+    (2049, 'sm_100a', 148, 8, 136, 'nsx_st5_mb1', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_tma_ntr', 'dynl', 'wpu4_spred', 411),
     (2049, 'sm_103a', 152, 8, 136, 'nsx_st5_mb1', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
     (2049, 'sm_107a', 208, 32, 544, 'nsx_g2_ol2l', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
     (2049, 'sm_107a', 216, 32, 544, 'nsx_g2_ol2l', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
@@ -607,7 +615,7 @@ DISPATCH_EXPECTED = (
     (2432, 'sm_103a', 152, 8, 152, 'nsx_st5_mb1', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
     (2432, 'sm_107a', 208, 32, 608, 'nsx_g2_ol2l', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
     (2432, 'sm_107a', 216, 32, 608, 'nsx_g2_ol2l', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
-    (2433, 'sm_100a', 148, 32, 640, 'ns96_g2_ol2l', 'qe_mb10_tree', 16, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4_fadd', 411),
+    (2433, 'sm_100a', 148, 32, 640, 'ns96_g2_ol2l', 'qe_mb10_tree', 16, 'ao22_rae7_pd1_tma_ntr', 'dynl', 'wpu4_fadd', 411),
     (2433, 'sm_103a', 152, 32, 640, 'nsx', 'qe_mb10_tree', 16, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
     (2433, 'sm_107a', 208, 8, 160, 'nsx_st5_mb1', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
     (2433, 'sm_107a', 216, 32, 640, 'nsx_g2_ol2l', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
@@ -631,15 +639,15 @@ DISPATCH_EXPECTED = (
     (3456, 'sm_103a', 152, 16, 432, 'nsx', 'qe_mb10_tree', 16, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
     (3456, 'sm_107a', 208, 32, 864, 'nsx_g2_ol2l', 'pfl2_qmt', 16, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
     (3456, 'sm_107a', 216, 8, 216, 'nsx_st5_mb1', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
-    (3457, 'sm_100a', 148, 8, 224, 'ns96_g2_ol2l', 'qe_mb10_tree', 16, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4_spred', 411),
+    (3457, 'sm_100a', 148, 8, 224, 'ns96_g2_ol2l', 'qe_mb10_tree', 16, 'ao22_rae7_pd1_tma_ntr', 'dynl', 'wpu4_spred', 411),
     (3457, 'sm_103a', 152, 16, 448, 'nsx', 'qe_mb10_tree', 16, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
     (3457, 'sm_107a', 208, 32, 896, 'nsx_g2_ol2l', 'pfl2_qmt', 16, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
     (3457, 'sm_107a', 216, 32, 896, 'nsx_g2_ol2l', 'pfl2_qmt', 16, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
-    (4095, 'sm_100a', 148, 8, 256, 'ns96_g2_ol2l', 'qe_mb10_tree', 16, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4_fadd', 411),
+    (4095, 'sm_100a', 148, 8, 256, 'ns96_g2_ol2l', 'qe_mb10_tree', 16, 'ao22_rae7_pd1_tma_ntr', 'dynl', 'wpu4_fadd', 411),
     (4095, 'sm_103a', 152, 8, 256, 'nsx_ct', 'qe_mb10_tree', 16, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
     (4095, 'sm_107a', 208, 32, 1024, 'nsx_g2_ol2l', 'pfl2_qmt', 16, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
     (4095, 'sm_107a', 216, 32, 1024, 'nsx_g2_ol2l', 'pfl2_qmt', 16, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
-    (4096, 'sm_100a', 148, 8, 256, 'ns96_g2_ol2l', 'qe_mb10_tree', 16, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4_fadd', 411),
+    (4096, 'sm_100a', 148, 8, 256, 'ns96_g2_ol2l', 'qe_mb10_tree', 16, 'ao22_rae7_pd1_tma_ntr', 'dynl', 'wpu4_fadd', 411),
     (4096, 'sm_103a', 152, 8, 256, 'nsx_ct', 'qe_mb10_tree', 16, 'ao22_rae7_pd1_ntr', 'dynr', 'pt32', 3099),
     (4096, 'sm_107a', 208, 32, 1024, 'nsx_g2_ol2l', 'pfl2_qmt', 16, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
     (4096, 'sm_107a', 216, 32, 1024, 'nsx_g2_ol2l', 'pfl2_qmt', 16, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
@@ -1024,11 +1032,11 @@ RULES_ROWS = (
     (1024, 152, 'sm_103a', 1024, True, 16, 128, 128, 2, 128, 128, 512, 128, 8, 64, 608, 2048, 512, 1024, 4784384, 6603008, 'b16', 'tv128', 256, 256, 'st16_w4_tree', 'nsx_st5_mb1', 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563, 't128', 'production'),
     (1024, 208, 'sm_107a', 1024, True, 16, 128, 128, 3, 192, 192, 384, 128, 8, 64, 832, 2048, 1024, 1024, 4784384, 8175872, 'b16', 'tv128_t128', 256, 512, 'st16_w4_tree', 'nsx_st5_mb1', 'ao22_rae7_rf3_pd1_l2l_ntr', 'xrsg', 's27_wcvt_spred', 411, 't128', 'r2'),
     (1024, 216, 'sm_107a', 1024, True, 16, 128, 128, 3, 192, 192, 384, 128, 8, 64, 864, 2048, 1024, 1024, 4784384, 8175872, 'b16', 'tv128_t128', 256, 512, 'st16_w4_tree', 'nsx_st5_mb1', 'ao22_rae7_rf3_pd1_l2l_ntr', 'xrsg', 's27_wcvt_spred', 411, 't128', 'r2'),
-    (2049, 148, 'sm_100a', 2176, True, 8, 136, 136, 11, 704, 148, 192, 257, 8, 129, 592, 4098, 1025, 2049, 4886784, 21107200, 'b16', 'tv128', 256, 256, 'qe_mb10_tree', 'nsx_st5_mb1', 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4_spred', 411, 't128', 'production'),
+    (2049, 148, 'sm_100a', 2176, True, 8, 136, 136, 11, 704, 148, 192, 257, 8, 129, 592, 4098, 1025, 2049, 4886784, 21107200, 'b16', 'tv128', 256, 256, 'qe_mb10_tree', 'nsx_st5_mb1', 'ao22_rae7_pd1_tma_ntr', 'dynl', 'wpu4_spred', 411, 't128', 'production'),
     (2049, 152, 'sm_103a', 2176, True, 8, 136, 136, 7, 448, 152, 320, 257, 8, 129, 608, 4098, 1025, 2049, 4886784, 14815744, 'b16', 'tv128', 256, 256, 'qe_mb10_tree', 'nsx_st5_mb1', 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563, 't128', 'production'),
     (2049, 208, 'sm_107a', 2176, True, 32, 544, 416, 3, 192, 192, 704, 257, 8, 129, 832, 4098, 2049, 2049, 10109184, 8524288, 'b16', 'tv128_t128', 256, 512, 'pfl2_qmt', 'nsx_g2_ol2l', 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411, 't128', 'r2'),
     (2049, 216, 'sm_107a', 2176, True, 32, 544, 432, 3, 192, 192, 704, 257, 8, 129, 864, 4098, 2049, 2049, 10109184, 8524288, 'b16', 'tv128_t128', 256, 512, 'pfl2_qmt', 'nsx_g2_ol2l', 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411, 't128', 'r2'),
-    (4096, 148, 'sm_100a', 4096, True, 8, 256, 256, 16, 1024, 148, 256, 296, 16, 256, 592, 8192, 2048, 4096, 6422784, 29529344, 'b16', 'tv128', 256, 256, 'qe_mb10_tree', 'ns96_g2_ol2l', 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4_fadd', 411, 't128', 'production'),
+    (4096, 148, 'sm_100a', 4096, True, 8, 256, 256, 16, 1024, 148, 256, 296, 16, 256, 592, 8192, 2048, 4096, 6422784, 29529344, 'b16', 'tv128', 256, 256, 'qe_mb10_tree', 'ns96_g2_ol2l', 'ao22_rae7_pd1_tma_ntr', 'dynl', 'wpu4_fadd', 411, 't128', 'production'),
     (4096, 152, 'sm_103a', 4096, True, 8, 256, 256, 16, 1024, 152, 256, 304, 16, 256, 608, 8192, 2048, 4096, 6422784, 29530368, 'b16', 'tv128', 256, 256, 'qe_mb10_tree', 'nsx_ct', 'ao22_rae7_pd1_ntr', 'dynr', 'pt32', 3099, 't128', 'production'),
     (4096, 208, 'sm_107a', 4096, True, 32, 1024, 416, 13, 832, 208, 320, 416, 16, 256, 832, 8192, 4096, 4096, 16253184, 24826112, 'b16', 'tv128_t128', 256, 512, 'pfl2_qmt', 'nsx_g2_ol2l', 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411, 't128', 'r2'),
     (4096, 216, 'sm_107a', 4096, True, 32, 1024, 432, 13, 832, 216, 320, 432, 16, 256, 864, 8192, 4096, 4096, 16253184, 24828160, 'b16', 'tv128_t128', 256, 512, 'pfl2_qmt', 'nsx_g2_ol2l', 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411, 't128', 'r2'),
@@ -1131,6 +1139,7 @@ LAUNCH_FACTS = {
     "cake_mhc_train_bwd_token__ao22_rae7_pd1_ntr__a7": ((256, 1, 1), 91136, 2),
     "cake_mhc_train_bwd_token__dot_ao8_l2l": ((256, 1, 1), 91136, 2),
     "cake_mhc_train_bwd_token__ao15_rae8_tma_ntr__a7": ((256, 1, 1), 91136, 2),
+    "cake_mhc_train_bwd_slab__dynl": ((384, 1, 1), 228480, 1),
     "cake_mhc_train_bwd_slab__dynr": ((384, 1, 1), 228480, 1),
     "cake_mhc_train_bwd_slab__xrsg": ((384, 1, 1), 232448, 1),
     "cake_mhc_train_bwd_slab__xrsg__a7": ((384, 1, 1), 232448, 1),
@@ -1192,6 +1201,7 @@ RECORD_ARCHES = {
     "cake_mhc_train_bwd_token__dot_ao8_l2l": ("sm_107a",),
     "cake_mhc_train_bwd_token__ao15_rae8_tma_ntr__a7": ("sm_107a",),
     "cake_mhc_train_bwd_token__rt64": ("sm_100a", "sm_103a", "sm_107a"),
+    "cake_mhc_train_bwd_slab__dynl": ("sm_100a",),
     "cake_mhc_train_bwd_slab__dynr": ("sm_100a", "sm_103a"),
     "cake_mhc_train_bwd_slab__xrsg": ("sm_100a",),
     "cake_mhc_train_bwd_slab__xrsg__a7": ("sm_107a",),
@@ -1569,7 +1579,8 @@ def test_dispatch_of_record_at_the_boundaries() -> None:
     )
     for table in (
         "PK_BANDS", "FN_SPLIT_PROGRAM", "FWD_MAP_BANDS", "FWD_MAP_FIT", "FWD_COEF_REGIMES", "BWD_TOKEN_PROGRAM",
-        "BWD_TOKEN_REGIMES", "BWD_SLAB_PROGRAM", "BWD_SLAB_BANDS", "BWD_REDUCE_PROGRAM", "BWD_REDUCE_REGIMES",
+        "BWD_TOKEN_REGIMES", "BWD_SLAB_PROGRAM", "BWD_SLAB_BANDS", "BWD_SLAB_FIT", "BWD_REDUCE_PROGRAM",
+        "BWD_REDUCE_REGIMES",
         "K5_GRID_BANDS", "K5_FORM_BANDS", "BWD_TOKEN_BANDS", "BWD_REDUCE_PARTS", "FWD_FINISH_PROGRAM", "PDL_OFF_BANDS",
         "FWD_MAP_CLAIM",
     ):  # fmt: skip
@@ -1598,13 +1609,19 @@ def test_dispatch_of_record_at_the_boundaries() -> None:
         assert SLAB_LIBRARY[loader.BWD_SLAB_PROGRAM[arch]] in LIBRARY_ARCHES
         for _above, _at_most, program in loader.BWD_SLAB_BANDS[arch]:
             assert SLAB_LIBRARY[program] in LIBRARY_ARCHES, (arch, program)
-    # the column-slab programs of record: xrsg on sm_100a for 1024 < T <= 4096 (its token-count band), the
-    # dynamic-schedule form (dynr) at the other token counts on sm_100a and at every token count on sm_103a,
-    # xrsg at every token count on sm_107a; on every SM count alike
+    # the column-slab programs of record: on sm_100a the late-claim form dynl for 1024 < T <= 4096 (its
+    # token-count band) but where BWD_SLAB_FIT keeps xrsg (the K7 units fit the SMs in one round, the chunk
+    # counts P = 9 and P = 19, the P = 7 runs 1537..1792 and 1921..2240), the dynamic-schedule form dynr at the
+    # other token counts on sm_100a and at every token count on sm_103a, xrsg at every token count on sm_107a
     assert loader.BWD_SLAB_BANDS == {
-        "sm_100a": ((1024, 4096, "xrsg"),),
+        "sm_100a": ((1024, 4096, "dynl"),),
         "sm_103a": (),
         "sm_107a": (),
+    }
+    assert loader.BWD_SLAB_FIT == {
+        "sm_100a": ("dynl", "xrsg", (9, 19), ((7, 1536, 1792), (7, 1920, 2240))),
+        "sm_103a": None,
+        "sm_107a": None,
     }
     assert loader.BWD_SLAB_PROGRAM == {
         "sm_100a": "dynr",
@@ -1613,11 +1630,24 @@ def test_dispatch_of_record_at_the_boundaries() -> None:
     }
     for T in (0, *DISPATCH_T):
         for sm in SM_COUNTS:
-            k7 = "xrsg" if 1024 < T <= 4096 else "dynr"
+            k7 = "dynr"
+            if 1024 < T <= 4096:
+                P, units = loader.k7_chunks(T, sm)[:2]
+                run = P == 7 and (1536 < T <= 1792 or 1920 < T <= 2240)
+                k7 = "xrsg" if units <= sm or P in (9, 19) or run else "dynl"
             slab = [loader.bwd_slab_program(T, sm, arch) for arch in ARCHES]
             assert slab == [k7, "dynr", "xrsg"], (T, sm)
-    assert [loader.bwd_slab_program(T, 148, "sm_100a") for T in (1, 1024, 1025, 4096, 4097, 8192, 65536)] == [
-        "dynr", "dynr", "xrsg", "xrsg", "dynr", "dynr", "dynr"
+    # the band's edges on 148 SMs (xrsg from 1025 to 2048 tokens, dynl from 2049: P = 11; 4096: P = 16) and the
+    # P = 7 / P = 19 rows of the 152-SM sm_100a board (dynl at 1216, 2560, 4032; xrsg at 1728, 2048, 3616)
+    assert [
+        loader.bwd_slab_program(T, 148, "sm_100a") for T in (1, 1024, 1025, 2048, 2049, 4096, 4097, 65536)
+    ] == [
+        "dynr", "dynr", "xrsg", "xrsg", "dynl", "dynl", "dynr", "dynr"
+    ]  # fmt: skip
+    assert [
+        loader.bwd_slab_program(T, 152, "sm_100a") for T in (1216, 1728, 2048, 2560, 3616, 4032)
+    ] == [
+        "dynl", "xrsg", "xrsg", "dynl", "xrsg", "dynl"
     ]  # fmt: skip
     with pytest.raises(KeyError):
         loader.k1_units(16263, 148, "sm_120a")
@@ -1676,6 +1706,7 @@ def test_registry_tables_are_literals() -> None:
         "BWD_TOKEN_REGIMES",
         "BWD_SLAB_PROGRAM",
         "BWD_SLAB_BANDS",
+        "BWD_SLAB_FIT",
         "BWD_REDUCE_PROGRAM",
         "BWD_REDUCE_REGIMES",
         "BWD_REDUCE_GRID",
