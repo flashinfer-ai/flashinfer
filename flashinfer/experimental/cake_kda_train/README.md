@@ -678,7 +678,11 @@ one, each pack's scratch table set (KiB scale; none at 64 heads).  No content
 crosses calls, so outputs, saved sets and gradients are bitwise those of one
 workspace per pack.  The workspace holds no context alive.  It records the
 stream of its last call; a call on another stream first waits for that
-stream's queued work on the device (one `wait_stream`, no host wait).
+stream's queued work on the device (one `wait_stream`, no host wait) and
+marks the workspace's storages as used on its own stream (`record_stream`),
+so a pool or arena that a later call replaces, or a dropped workspace, is
+reused by the caching allocator only after every stream that used it has
+run its queued work.  Calls on one stream do neither.
 `KcpWorkspace(ctx, H, allocate=False)` allocates nothing until its first call
 and sizes that call for the backward, so a first forward does not build a
 forward-only arena that the first backward replaces.
