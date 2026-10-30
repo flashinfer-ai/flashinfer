@@ -1313,6 +1313,7 @@ def _make_prims_ts_decode_wrapper_trace(
     plan_owns_seq_lens: bool,
     encoded_page_size: int = 0,
     split_kv: bool = True,
+    use_device_scales: bool = False,
 ):
     """Describe one plan-bound ``BatchDecodePagedTSWrapper.run`` call."""
 
@@ -1431,6 +1432,10 @@ def _make_prims_ts_decode_wrapper_trace(
             ),
         }
     )
+    if use_device_scales:
+        axes["scale_size"] = Const(value=1, description="Per-tensor attention scale.")
+        inputs["softmax_scale"] = Tensor(["scale_size"], dtype="float32")
+        inputs["output_scale"] = Tensor(["scale_size"], dtype="float32")
     constraints = [
         "head_dim in (64, 128, 256)",
         "page_size in (4, 8, 16, 32, 64, 128)",
@@ -1464,6 +1469,7 @@ def _make_prims_ts_decode_wrapper_trace(
         op_type="gqa_paged",
         name_prefix=(
             f"prims_ts_decode_wrapper_{cache_form}{page_suffix}{output_suffix}{q_suffix}_{mask_type}"
+            f"{'_device_scales' if use_device_scales else ''}"
             f"{'_plan_seq_lens' if plan_owns_seq_lens else ''}"
             f"{'_no_split' if not split_kv else ''}"
         ),
@@ -1549,6 +1555,7 @@ def _get_prims_ts_decode_wrapper_trace(
     plan_owns_seq_lens: bool,
     encoded_page_size: int = 0,
     split_kv: bool = True,
+    use_device_scales: bool = False,
 ) -> TraceTemplate:
     """Return one stable trace template for a frozen FMHA plan identity."""
 
@@ -1565,6 +1572,7 @@ def _get_prims_ts_decode_wrapper_trace(
         plan_owns_seq_lens=plan_owns_seq_lens,
         encoded_page_size=encoded_page_size,
         split_kv=split_kv,
+        use_device_scales=use_device_scales,
     )
 
 
@@ -1607,7 +1615,9 @@ def prims_ts_decode_wrapper_trace_dispatch(**kwargs):
             "Tracing BatchDecodePagedTSWrapper.run without plan-owned "
             "sequence lengths requires a per-run seq_lens_kv tensor"
         )
+    use_device_scales = bool(getattr(state, "use_device_scales", False))
     required_metadata = (
+        *(("softmax_scale", "output_scale") if use_device_scales else ()),
         "block_tables",
         *(("qo_indptr",) if bool(state.packed_query) else ()),
     )
@@ -1639,6 +1649,7 @@ def prims_ts_decode_wrapper_trace_dispatch(**kwargs):
     )
     return _get_prims_ts_decode_wrapper_trace(
         combined=combined,
+        use_device_scales=use_device_scales,
         out_dtype=out_dtype,
         q_mode=q_mode,
         mask_type=str(state.mask_type),

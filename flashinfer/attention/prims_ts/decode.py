@@ -151,6 +151,8 @@ class _DecodeCompileSpec:
     direct_q1_spec: Optional[_DirectQ1CompileSpec] = None
     runtime_kv_lengths: bool = False
 
+    use_device_scales: bool = False
+
 
 @dataclass(frozen=True)
 class _DecodeRuntime:
@@ -169,8 +171,8 @@ class _DecodeRuntime:
     v_page_stride: int
     v_head_stride: int
     v_token_stride: int
-    softmax_scale: float
-    output_scale: float
+    softmax_scale: float | torch.Tensor
+    output_scale: float | torch.Tensor
 
 
 @dataclass(frozen=True)
@@ -213,6 +215,8 @@ class _DecodePlanState:
     planned_seq_lens_kv_host: Optional[tuple[int, ...]] = None
     planned_seq_lens_kv_device: Optional[torch.Tensor] = None
     fixed_q_offsets: Optional[torch.Tensor] = None
+
+    use_device_scales: bool = False
 
 
 def _decode_policy_from_config(
@@ -1506,6 +1510,7 @@ def _make_decode_compile_spec(
     flat_native_kv_tma: bool = False,
     lse_mode: str = "none",
     runtime_kv_lengths: bool = False,
+    use_device_scales: bool = False,
     packed_query: Optional[bool] = None,
     kv_prefix_mode: Literal["dynamic", "planned_full"] = "dynamic",
     kv_lengths_mode: Literal["dynamic", "planned_uniform_max"] = "dynamic",
@@ -1561,6 +1566,7 @@ def _make_decode_compile_spec(
         kv_lengths_mode=kv_lengths_mode,
         direct_q1_spec=direct_q1_spec,
         runtime_kv_lengths=runtime_kv_lengths,
+        use_device_scales=use_device_scales,
     )
 
 
@@ -1570,6 +1576,7 @@ def _get_compiled_decode(
 ):
     """Compile and cache one batch-dynamic TS decode topology."""
 
+    use_device_scales = compile_spec.use_device_scales
     device_index = compile_spec.device_index
     num_qo_heads = compile_spec.num_qo_heads
     num_kv_heads = compile_spec.num_kv_heads
@@ -1651,8 +1658,8 @@ def _get_compiled_decode(
         v_page_stride: cutlass.Int64,
         v_head_stride: cutlass.Int64,
         v_token_stride: cutlass.Int64,
-        softmax_scale: cutlass.Float32,
-        output_scale: cutlass.Float32,
+        softmax_scale: cutlass.Float32 | cute.Tensor,
+        output_scale: cutlass.Float32 | cute.Tensor,
         requested_splits: cutlass.Int32,
         max_q_len: cutlass.Int32,
         direct_q1_inputs: tuple,
@@ -1739,8 +1746,8 @@ def _get_compiled_decode(
             partial_stats.iterator,
             split_kv_counter.iterator,
             attention_sinks.iterator,
-            softmax_scale,
-            output_scale,
+            softmax_scale.iterator if use_device_scales else softmax_scale,
+            output_scale.iterator if use_device_scales else output_scale,
             Int32(0),
             Int32(static_max_active_clusters),
             stream,
@@ -1785,8 +1792,6 @@ def _get_compiled_decode(
             partial_o: cute.Tensor,
             partial_stats: cute.Tensor,
             attention_sinks: cute.Tensor,
-            softmax_scale: cutlass.Float32,
-            output_scale: cutlass.Float32,
             requested_splits: cutlass.Int32,
             max_q_len: cutlass.Int32,
             direct_q1_inputs: tuple,
@@ -1840,8 +1845,6 @@ def _get_compiled_decode(
                 partial_o.iterator,
                 partial_stats.iterator,
                 attention_sinks.iterator,
-                softmax_scale,
-                output_scale,
                 stream,
                 static_cfg,
                 static_full_split_prefix,
@@ -2006,6 +2009,8 @@ def _get_compiled_decode(
             Int32(0),
         )
 
+    scale_fake = fake_compact(Float32, (1,), 4) if use_device_scales else Float32(1.0)
+
     with torch.cuda.device(device_index):
         compiled_main = build_and_load_attention_kernel(
             "decode",
@@ -2036,8 +2041,8 @@ def _get_compiled_decode(
                 Int64(1),
                 Int64(1),
                 Int64(1),
-                Float32(1.0),
-                Float32(1.0),
+                scale_fake,
+                scale_fake,
                 Int32(1),
                 Int32(0),
                 direct_q1_fake,
@@ -2070,8 +2075,6 @@ def _get_compiled_decode(
                     partial_o_fake,
                     partial_stats_fake,
                     attention_sinks_fake,
-                    Float32(1.0),
-                    Float32(1.0),
                     Int32(1),
                     Int32(0),
                     direct_q1_fake,
@@ -2229,10 +2232,11 @@ def _prepare_decode_runtime(
     k_dtype: torch.dtype,
     v_dtype: torch.dtype,
     out_dtype: torch.dtype,
-    softmax_scale: Optional[float],
-    output_scale: float,
+    softmax_scale: Optional[float | torch.Tensor],
+    output_scale: float | torch.Tensor,
     out: Optional[torch.Tensor],
     kv_layout: str = "HND",
+    use_device_scales: bool = False,
 ) -> _DecodeRuntime:
     """Validate runtime tensors and normalize zero-copy K/V views."""
 
@@ -2277,11 +2281,15 @@ def _prepare_decode_runtime(
         k_cache=k_cache,
         logical_head_dim=head_dim,
     )
-    effective_softmax_scale = _validate_scale(
-        1.0 / math.sqrt(head_dim) if softmax_scale is None else softmax_scale,
-        "softmax_scale",
-    )
-    effective_output_scale = _validate_scale(output_scale, "output_scale")
+    if use_device_scales:
+        effective_softmax_scale = softmax_scale
+        effective_output_scale = output_scale
+    else:
+        effective_softmax_scale = _validate_scale(
+            1.0 / math.sqrt(head_dim) if softmax_scale is None else softmax_scale,
+            "softmax_scale",
+        )
+        effective_output_scale = _validate_scale(output_scale, "output_scale")
     output_shape = _decode_output_shape(
         batch_size=batch_size,
         num_qo_heads=num_qo_heads,
@@ -2377,8 +2385,6 @@ def _launch_decode(
             workspace.partial_o,
             workspace.partial_stats,
             sinks,
-            runtime.softmax_scale,
-            runtime.output_scale,
             requested_splits,
             max_q_len,
             (),
@@ -2442,10 +2448,11 @@ def _prepare_decode_runtime_unchecked(
     kv_scale_factors: Optional[PagedKVScaleFactors],
     *,
     out_dtype: torch.dtype,
-    softmax_scale: Optional[float],
-    output_scale: float,
+    softmax_scale: Optional[float | torch.Tensor],
+    output_scale: float | torch.Tensor,
     out: Optional[torch.Tensor],
     kv_layout: str = "HND",
+    use_device_scales: bool = False,
 ) -> _DecodeRuntime:
     """Canonicalize one trusted run without invoking explicit validators."""
 
@@ -2483,11 +2490,15 @@ def _prepare_decode_runtime_unchecked(
         v_head_stride=int(v_cache.stride(1)),
         v_token_stride=int(v_cache.stride(2)),
         softmax_scale=(
-            1.0 / math.sqrt(int(q.shape[-1]))
-            if softmax_scale is None
-            else float(softmax_scale)
+            softmax_scale
+            if use_device_scales
+            else (
+                1.0 / math.sqrt(int(q.shape[-1]))
+                if softmax_scale is None
+                else float(softmax_scale)
+            )
         ),
-        output_scale=float(output_scale),
+        output_scale=output_scale if use_device_scales else float(output_scale),
     )
 
 
@@ -2785,8 +2796,6 @@ class PrimsTSBatchDecodePlan:
                 self._workspace.attention_sinks
                 if attention_sinks is None
                 else attention_sinks,
-                softmax_scale,
-                output_scale,
                 self._requested_splits,
                 self.q_capacity,
                 direct_inputs,
@@ -4018,6 +4027,7 @@ class BatchDecodePagedTSWrapper:
         split_kv: bool = True,
         validate: bool = True,
         initialize_workspace: bool = True,
+        use_device_scales: bool = False,
     ) -> None:
         """Select/cache a bounded paged-decode execution and bind reusable scratch.
 
@@ -4031,8 +4041,15 @@ class BatchDecodePagedTSWrapper:
         scratch may be passed without a size query. Planning initializes control
         storage unless initialize_workspace=False transfers that to the caller.
         Active split counts are automatic runtime operands for main/reduction
-        kernels; users never supply the count."""
+        kernels; users never supply the count.
 
+        ``use_device_scales=True`` compiles tensor scale arguments. Each run
+        must supply float32 CUDA tensors of shape ``(1,)`` for both scales;
+        values can change in place during CUDA graph replay.
+        """
+
+        if not isinstance(use_device_scales, bool):
+            raise TypeError("use_device_scales must be a bool")
         if packed_query and max_q_len is None:
             raise ValueError("packed Q requires max_q_len in plan()")
         if max_q_len is None:
@@ -4193,6 +4210,7 @@ class BatchDecodePagedTSWrapper:
             kv_prefix_mode=kv_prefix_mode,
             kv_lengths_mode=kv_lengths_mode,
             lse_mode=lse_mode,
+            use_device_scales=use_device_scales,
             runtime_kv_lengths=not fixed_uniform_kv
             and (cfg.runtime_split_kv or not cfg.use_split_kv),
         )
@@ -4239,6 +4257,7 @@ class BatchDecodePagedTSWrapper:
         )
 
         candidate = _DecodePlanState(
+            use_device_scales=use_device_scales,
             device=device,
             device_index=device_index,
             batch_size=batch_size,
@@ -4291,8 +4310,8 @@ class BatchDecodePagedTSWrapper:
         *,
         kv_scale_factors: Optional[PagedKVScaleFactors] = None,
         qo_indptr: Optional[torch.Tensor] = None,
-        softmax_scale: Optional[float] = None,
-        output_scale: float = 1.0,
+        softmax_scale: Optional[float | torch.Tensor] = None,
+        output_scale: float | torch.Tensor = 1.0,
         max_q_len: int | None = None,
         max_kv_len: int | None = None,
         out: Optional[torch.Tensor] = None,
@@ -4331,14 +4350,19 @@ class BatchDecodePagedTSWrapper:
         ``validate=True`` performs structural and value validation. It
         reads per-run metadata values back to the host.
         ``validate=False`` treats every run argument as a trusted binding,
-        performs no explicit wrapper validation, and remains free of metadata
+        skips metadata validation and remains free of metadata
         device-to-host synchronization. K/V view selection, scale forwarding,
         and optional output allocation are unavoidable in both modes.
 
         Supply seq_lens_kv on every run unless plan() owns its CUDA copy. Packed queries require qo_indptr; fixed Q
         rejects it under validation. Q/K/V dtypes, cache layout and model semantics
-        must match plan(). softmax_scale is the finite positive host effective QK scale
-        (default 1/sqrt(D)); output_scale is the host V/output scale (default 1).
+        must match plan(). softmax_scale is the effective QK scale in regular,
+        not log2, units (default 1/sqrt(D)); output_scale is the V/output scale
+        (default 1). Host-scale plans take floats. With use_device_scales=True,
+        both scales must be contiguous float32 CUDA tensors of shape (1,) on
+        the plan device. Values must be finite and positive; scale values are
+        never read back to the host. Scale argument types are checked in both
+        validation modes.
 
         Enabled attention_sinks requires compact CUDA FP32 [Hq] natural-log logits
         after QK scaling. Values must be finite or -inf and add zero V contribution;
@@ -4348,6 +4372,25 @@ class BatchDecodePagedTSWrapper:
             raise TypeError("validate must be a bool")
 
         state = self._require_plan_state()
+        if state.use_device_scales:
+            for name, scale in (
+                ("softmax_scale", softmax_scale),
+                ("output_scale", output_scale),
+            ):
+                if (
+                    not isinstance(scale, torch.Tensor)
+                    or scale.dtype != torch.float32
+                    or scale.device != state.device
+                    or scale.shape != (1,)
+                    or not scale.is_contiguous()
+                ):
+                    raise ValueError(
+                        f"{name} must be a float32 tensor of shape (1,) on {state.device}"
+                    )
+        elif isinstance(softmax_scale, torch.Tensor) or isinstance(
+            output_scale, torch.Tensor
+        ):
+            raise ValueError("device scales require plan(use_device_scales=True)")
         if state.planned_seq_lens_kv_device is not None:
             if seq_lens_kv is not None:
                 raise ValueError(
@@ -4408,6 +4451,7 @@ class BatchDecodePagedTSWrapper:
                 output_scale=output_scale,
                 out=out,
                 kv_layout=self._kv_layout,
+                use_device_scales=state.use_device_scales,
             )
             actual_q, actual_kv = _validate_decode_run_metadata_values(
                 runtime,
@@ -4438,6 +4482,7 @@ class BatchDecodePagedTSWrapper:
                 output_scale=output_scale,
                 out=out,
                 kv_layout=self._kv_layout,
+                use_device_scales=state.use_device_scales,
             )
 
         if max_q_len is None:
