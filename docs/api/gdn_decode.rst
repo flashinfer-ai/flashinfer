@@ -69,7 +69,9 @@ tracked-checkpoint contracts.
 
 Commit defaults to ``backend="auto"``. With normalized K and no tracking,
 T=8 uses tcgen05; T=6/7 uses tcgen05 when B>1 and ``layers * B * HV >= 256``.
-Other cases use SIMT. Explicit ``backend="tcgen05"`` supports T=4..8.
+Other cases, including every tracked commit, use SIMT. Explicit
+``backend="tcgen05"`` supports T=4..8 and, with tracking, writes the FP32
+snapshots in a SIMT pass before the TF32 fold.
 The heuristic uses tensor metadata, not device-resident accepted lengths;
 short accepted prefixes may favor ``backend="simt"``. SIMT also retains FP32
 contractions when checkpoint accuracy is preferred over tensor-core throughput.

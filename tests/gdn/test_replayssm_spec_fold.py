@@ -345,8 +345,9 @@ def test_replayssm_verify_commit_cycles(steps, normalize, track, tcgen):
         )
 
 
-def _commit_single(args, cache, accepts, backend, accept_paths=None):
+def _commit_single(args, cache, accepts, backend, accept_paths=None, track=None):
     """Commit one layer's window pool in place, as a [1, slots, ...] view."""
+    track_ids, track_steps = track if track is not None else (None, None)
     gated_delta_rule_replayssm_commit(
         args["initial_state"].unsqueeze(0),
         cache["replayssm_rawv"].unsqueeze(0),
@@ -356,6 +357,8 @@ def _commit_single(args, cache, accepts, backend, accept_paths=None):
         args["initial_state_indices"],
         accepts,
         accept_paths=accept_paths,
+        track_state_indices=track_ids,
+        track_steps=track_steps,
         backend=backend,
     )
 
@@ -508,8 +511,10 @@ def test_replayssm_commit_identity_path_is_bitwise_identical(batch, steps, backe
     torch.testing.assert_close(committed[0], committed[1], atol=0, rtol=0)
 
 
-@pytest.mark.parametrize("backend", ["auto", "simt"])
-def test_replayssm_commit_path_cuda_graph(backend):
+@pytest.mark.parametrize(
+    "backend,tracked", [("auto", False), ("simt", False), ("tcgen05", True)]
+)
+def test_replayssm_commit_path_cuda_graph(backend, tracked):
     args, cache = _inputs()
     output = torch.empty_like(args["v"])
     before = args["initial_state"].clone()
@@ -519,10 +524,16 @@ def test_replayssm_commit_path_cuda_graph(backend):
         device="cuda",
         dtype=torch.int32,
     )
+    track = None
+    if tracked:
+        track = (
+            torch.tensor([5, 6, 1, -1], device="cuda", dtype=torch.int32),
+            (accepts - 1).clamp_min(0),
+        )
 
     def cycle():
         gated_delta_rule_mtp(**args, output=output, cache_replayssm=True, **cache)
-        _commit_single(args, cache, accepts, backend, accept_paths=paths)
+        _commit_single(args, cache, accepts, backend, accept_paths=paths, track=track)
 
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
@@ -569,12 +580,13 @@ def test_replayssm_commit_path_validation(invalid, backend):
         gated_delta_rule_replayssm_commit(**args, accept_paths=paths, backend=backend)
 
 
+@pytest.mark.parametrize("bad_row,clamped_row", [(99, 3), (-5, 0)])
 @pytest.mark.parametrize("backend", ["simt", "tcgen05"])
-def test_replayssm_commit_path_clamps_out_of_range_rows(backend):
+def test_replayssm_commit_path_clamps_out_of_range_rows(backend, bad_row, clamped_row):
     """Row values are a caller contract; a bad row must stay in bounds."""
     args, cache = _inputs(batch=1, steps=4)
     accepts = torch.tensor([2], device="cuda", dtype=torch.int32)
-    clamped = torch.tensor([[0, 3, 0, 0]], device="cuda", dtype=torch.int32)
+    clamped = torch.tensor([[0, clamped_row, 0, 0]], device="cuda", dtype=torch.int32)
     _, expected_states, _, _ = _reference(args, rows=clamped)
     slot = args["initial_state_indices"].item()
     gated_delta_rule_mtp(**args, cache_replayssm=True, **cache)
@@ -583,7 +595,9 @@ def test_replayssm_commit_path_clamps_out_of_range_rows(backend):
         cache,
         accepts,
         backend,
-        accept_paths=torch.tensor([[0, 99, 0, 0]], device="cuda", dtype=torch.int32),
+        accept_paths=torch.tensor(
+            [[0, bad_row, 0, 0]], device="cuda", dtype=torch.int32
+        ),
     )
     torch.testing.assert_close(
         args["initial_state"][slot].double(),
@@ -876,26 +890,30 @@ def test_replayssm_rejects_other_architectures(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "steps,layers,batch,hv,backend,expected",
+    "steps,layers,batch,hv,backend,tracked,expected",
     [
-        (3, 4, 8, 32, "auto", "simt"),
-        (4, 4, 8, 32, "auto", "simt"),
-        (5, 4, 8, 32, "auto", "simt"),
-        (5, 1, 1, 8, "tcgen05", "tcgen05"),
-        (6, 1, 7, 32, "auto", "simt"),
-        (6, 1, 8, 32, "auto", "tcgen05"),
-        (6, 4, 2, 32, "auto", "tcgen05"),
-        (6, 4, 2, 8, "auto", "simt"),
-        (7, 1, 7, 32, "auto", "simt"),
-        (7, 1, 8, 32, "auto", "tcgen05"),
-        (7, 4, 1, 64, "auto", "simt"),
-        (7, 4, 8, 32, "simt", "simt"),
-        (8, 1, 1, 8, "auto", "tcgen05"),
-        (9, 4, 8, 32, "auto", "simt"),
+        (3, 4, 8, 32, "auto", False, ["simt"]),
+        (4, 4, 8, 32, "auto", False, ["simt"]),
+        (5, 4, 8, 32, "auto", False, ["simt"]),
+        (5, 1, 1, 8, "tcgen05", False, ["tcgen05"]),
+        (6, 1, 7, 32, "auto", False, ["simt"]),
+        (6, 1, 8, 32, "auto", False, ["tcgen05"]),
+        (6, 4, 2, 32, "auto", False, ["tcgen05"]),
+        (6, 4, 2, 8, "auto", False, ["simt"]),
+        (7, 1, 7, 32, "auto", False, ["simt"]),
+        (7, 1, 8, 32, "auto", False, ["tcgen05"]),
+        (7, 4, 1, 64, "auto", False, ["simt"]),
+        (7, 4, 8, 32, "simt", False, ["simt"]),
+        (8, 1, 1, 8, "auto", False, ["tcgen05"]),
+        (9, 4, 8, 32, "auto", False, ["simt"]),
+        (6, 4, 8, 32, "auto", True, ["simt"]),
+        (8, 1, 8, 32, "auto", True, ["simt"]),
+        (8, 4, 64, 32, "auto", True, ["simt"]),
+        (8, 1, 8, 32, "tcgen05", True, ["simt", "tcgen05"]),
     ],
 )
 def test_replayssm_commit_dispatch(
-    steps, layers, batch, hv, backend, expected, monkeypatch
+    steps, layers, batch, hv, backend, tracked, expected, monkeypatch
 ):
     from flashinfer.gdn_kernels import gdn_replayssm_spec_fold as simt
     from flashinfer.gdn_kernels import gdn_replayssm_spec_fold_tcgen as tcgen
@@ -908,6 +926,9 @@ def test_replayssm_commit_dispatch(
         num_v_heads=hv,
         seq_len=steps,
     )
+    if tracked:
+        args["track_state_indices"] = torch.full_like(args["state_indices"], -1)
+        args["track_steps"] = torch.zeros_like(args["accept_lens"])
     selected = []
     # Test dispatch independently of compilation and numerical checks above.
     monkeypatch.setattr(simt, "_CACHE", {})
@@ -922,4 +943,4 @@ def test_replayssm_commit_dispatch(
         lambda *args, **kwargs: selected.append("tcgen05"),
     )
     gated_delta_rule_replayssm_commit(**args, backend=backend)
-    assert selected == [expected]
+    assert selected == expected

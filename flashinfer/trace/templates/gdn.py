@@ -1337,15 +1337,16 @@ def _gdn_replayssm_commit_reference(
 ):
     """Direct recurrence over accepted tokens; mutates the checkpoint pool."""
     hv, h = rawv_cache.shape[2], rawk_cache.shape[2]
+    steps = rawv_cache.shape[3]
     for row, slot in enumerate(state_indices.tolist()):
         count = int(accept_lens[row])
         if slot <= null_block_id or count <= 0:
             continue
         state = checkpoint_state[:, slot].double()
         for position in range(count):
-            step = (
-                position if accept_paths is None else int(accept_paths[row, position])
-            )
+            step = position
+            if accept_paths is not None:
+                step = min(max(int(accept_paths[row, position]), 0), steps - 1)
             key = (
                 rawk_cache[:, slot, :, step].double().repeat_interleave(hv // h, dim=1)
             )

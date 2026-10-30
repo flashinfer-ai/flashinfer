@@ -94,8 +94,7 @@ def _gdn_replayssm_fold_kernel(
     n_commit = accept_lens[i_n]
     is_live = requested_slot > NULL_BLOCK_ID and n_commit > 0
     if cutlass.const_expr(TRACK_ONLY):
-        # Only rows with a live track slot and an in-range step have work, and
-        # they replay just up to that step; the live slot is left to the fold.
+        # Replay only to the tracked step; the live slot is left to the fold.
         track_step_early = track_steps[i_n]
         is_live = (
             is_live
@@ -545,8 +544,8 @@ def commit_gdn_replayssm_fold_all_layers(
     prefer_tcgen = max_cache_len == 8 or (
         max_cache_len in (6, 7) and B > 1 and num_layers * B * HV >= 256
     )
-    # The tracked snapshot pass is an extra launch; it pays off from B * HV ~ 256.
-    if has_track and B * HV < 256:
+    # The tracked snapshot pass costs more than the fold saves at common shapes.
+    if has_track:
         prefer_tcgen = False
 
     def run_simt(track_only: bool) -> None:
