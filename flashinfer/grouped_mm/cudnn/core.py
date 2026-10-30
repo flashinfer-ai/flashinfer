@@ -547,6 +547,26 @@ def _build_cudnn_moe_block_scale_grouped_gemm_graph(
     return graph, graph.get_workspace_size()
 
 
+def _mxfp8_engines_to_deselect(device: torch.device) -> tuple[str, ...]:
+    """Engines dropped from the MXFP8 grouped-GEMM plan list on one combination.
+
+    WORKAROUND(cudnn-frontend#2081): cuDNN 9.26's heuristic-best engine for this
+    graph ("eng0") reads the wrong token-scale rows for every group after the
+    first on compute capability 10.x parts under the CUDA 13.4 libraries; the
+    graph's other engine ("eng9") is correct, as is the same cuDNN under CUDA
+    13.0. Used by the MXFP8 runner and by the plan-count query, so ``tactic``
+    indices refer to the same plan list. Revert when cuDNN ships the fix.
+    """
+    cuda_version = tuple(int(x) for x in (torch.version.cuda or "0.0").split(".")[:2])
+    if (
+        torch.cuda.get_device_capability(device)[0] == 10
+        and cudnn.backend_version() >= 92600
+        and cuda_version >= (13, 4)
+    ):
+        return ("eng0",)
+    return ()
+
+
 def _cudnn_moe_block_scale_grouped_gemm_plan_count(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -607,6 +627,11 @@ def _cudnn_moe_block_scale_grouped_gemm_plan_count(
         _to_cudnn_dtype(out_dtype),
         block_size=block_size,
         policy=cudnn.build_plan_policy.ALL,
+        deselect_engines=(
+            _mxfp8_engines_to_deselect(a.device)
+            if a_descale.dtype == torch.uint8
+            else ()
+        ),
     )
     return graph.get_execution_plan_count()
 
@@ -663,20 +688,6 @@ def _run_cudnn_moe_block_scale_grouped_gemm_mxfp8(
         else cudnn.build_plan_policy.ALL
     )
 
-    # WORKAROUND(cudnn-frontend#2081): cuDNN 9.26's heuristic-best engine for this
-    # graph ("eng0") reads the wrong token-scale rows for every group after the
-    # first on compute capability 10.x parts under the CUDA 13.4 libraries; the
-    # graph's other engine ("eng9") is correct, as is the same cuDNN under CUDA
-    # 13.0. Drop eng0 on that combination only. Revert when cuDNN ships the fix.
-    deselect_engines: tuple[str, ...] = ()
-    cuda_version = tuple(int(x) for x in (torch.version.cuda or "0.0").split(".")[:2])
-    if (
-        torch.cuda.get_device_capability(a.device)[0] == 10
-        and cudnn.backend_version() >= 92600
-        and cuda_version >= (13, 4)
-    ):
-        deselect_engines = ("eng0",)
-
     graph, ws = _build_cudnn_moe_block_scale_grouped_gemm_graph(
         handle,
         token_3d.shape,
@@ -697,7 +708,7 @@ def _run_cudnn_moe_block_scale_grouped_gemm_mxfp8(
         out_cudnn_dtype,
         block_size=32,
         policy=policy,
-        deselect_engines=deselect_engines,
+        deselect_engines=_mxfp8_engines_to_deselect(a.device),
     )
 
     if out is None:
