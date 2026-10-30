@@ -586,6 +586,11 @@ dq, dk, dv, dbeta, dg = chunk_kda_kcp_bwd(q_local, k_local, v_local, g_local, be
                                           dout_local, saved=saved)
 ```
 
+The context is a plain frozen object, not a dataclass: the pre-forward hooks
+of FSDP2 (`fully_shard`) walk every dataclass, dict, list and tuple of a
+module's arguments, and see the context as one leaf. Per-layer metadata that
+carries it costs no walk time per fragment.
+
 CUDA-graph replay: the three KDA entry points -- `chunk_kda_kcp`,
 `chunk_kda_kcp_fwd` and `chunk_kda_kcp_bwd` -- take `graph="replay"`
 (default `"off"`, the eager path); the convolution halo takes `graph=` only
