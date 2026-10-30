@@ -1545,10 +1545,13 @@ class W4A16GemmKernel:
                 scales_expert_stride = Int32((self.size_n * self.size_k) // (32 * 16))
         else:
             scales_expert_stride = Int32((self.size_n * self.size_k) // (16 * 16))
-        # A pooled expert cache may make the flat packed bank larger than 2 Gi
-        # int32 elements. Keep weight-bank addressing 64-bit end-to-end; an
-        # Int32 expert offset silently wraps and makes cp.async read an invalid
-        # address even when the bank itself crossed the ABI as a raw pointer.
+        # A flat weight bank can exceed 2**31 int32 words (8 GiB packed). The
+        # host hands it over with a static layout, so its *size* never meets
+        # the DSL runtime's 32-bit dynamic-shape packing; the expert and tile
+        # *offsets* into it are a separate overflow. An Int32 expert offset
+        # wraps once expert_idx * words_per_expert passes INT32_MAX and
+        # cp.async reads an invalid address, so keep weight-bank addressing
+        # 64-bit end to end (see _stage_k_tile_async).
         b_expert_off = Int64((self.size_n * self.size_k) // (_PACK_FACTOR * 4)) * Int64(
             expert_idx
         )
@@ -4357,8 +4360,8 @@ class W4A16FusedMoeKernel:
     def __call__(
         self,
         a_bf16_ptr: cute.Pointer,
-        w13_flat_ptr: cute.Pointer,
-        w2_flat_ptr: cute.Pointer,
+        w13_i32_flat: cute.Tensor,
+        w2_i32_flat: cute.Tensor,
         fc1_bf16_flat: cute.Tensor,
         activated_bf16_flat: cute.Tensor,
         fc2_bf16_flat: cute.Tensor,
@@ -4382,40 +4385,6 @@ class W4A16FusedMoeKernel:
         a_bf16_flat = cute.make_tensor(
             a_bf16_ptr,
             layout=cute.make_layout((active_m * Int32(self.hidden_size),), stride=(1,)),
-        )
-        if cutlass.const_expr(self.weight_layout == "modelopt"):
-            w13_elements = self.num_experts * self.fc1_cols * (self.hidden_size // 2)
-            w2_elements = (
-                self.num_experts * self.hidden_size * (self.intermediate_size // 2)
-            )
-        elif cutlass.const_expr(self.weight_layout == "nf3_2p1"):
-            w13_elements = (
-                self.num_experts * (self.hidden_size // 16) * (self.fc1_cols // 2) * 3
-            )
-            w2_elements = (
-                self.num_experts
-                * (self.intermediate_size // 16)
-                * (self.hidden_size // 2)
-                * 3
-            )
-        else:
-            w13_elements = (
-                self.num_experts * (self.hidden_size // 16) * (self.fc1_cols // 16 * 32)
-            )
-            w2_elements = (
-                self.num_experts
-                * (self.intermediate_size // 16)
-                * (self.hidden_size // 16 * 32)
-            )
-        # A serving runtime may pool cache slots across layers, producing weight
-        # banks with more than INT32_MAX elements. Passing those banks through a
-        # dynamic DLPack memref overflows CuTe DSL's runtime shape descriptor.
-        # The kernel only needs aligned base addresses and compile-time lengths.
-        w13_i32_flat = cute.make_tensor(
-            w13_flat_ptr, layout=cute.make_layout((w13_elements,), stride=(1,))
-        )
-        w2_i32_flat = cute.make_tensor(
-            w2_flat_ptr, layout=cute.make_layout((w2_elements,), stride=(1,))
         )
         topk_weights_flat = cute.make_tensor(
             topk_weights_ptr,
@@ -5686,15 +5655,39 @@ def compile_w4a16_fused_moe(
     )
     a_fake = make_ptr(cutlass_dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
     if weight_layout == "modelopt":
-        w13_fake = make_ptr(cutlass.Uint8, 16, cute.AddressSpace.gmem, assumed_align=16)
-        w2_fake = make_ptr(cutlass.Uint8, 16, cute.AddressSpace.gmem, assumed_align=16)
+        w13_fake = cute.runtime.make_fake_compact_tensor(
+            cutlass.Uint8,
+            (num_experts * fc1_cols * (hidden_size // 2),),
+            assumed_align=16,
+        )
+        w2_fake = cute.runtime.make_fake_compact_tensor(
+            cutlass.Uint8,
+            (num_experts * hidden_size * (intermediate_size // 2),),
+            assumed_align=16,
+        )
     elif weight_layout == "nf3_2p1":
         # NF3: int32, 3 words per 32-code unit; (size_n // 2) units per K16 row.
-        w13_fake = make_ptr(cutlass.Int32, 16, cute.AddressSpace.gmem, assumed_align=16)
-        w2_fake = make_ptr(cutlass.Int32, 16, cute.AddressSpace.gmem, assumed_align=16)
+        w13_fake = cute.runtime.make_fake_compact_tensor(
+            cutlass.Int32,
+            (num_experts * (hidden_size // 16) * (fc1_cols // 2) * 3,),
+            assumed_align=16,
+        )
+        w2_fake = cute.runtime.make_fake_compact_tensor(
+            cutlass.Int32,
+            (num_experts * (intermediate_size // 16) * (hidden_size // 2) * 3,),
+            assumed_align=16,
+        )
     else:
-        w13_fake = make_ptr(cutlass.Int32, 16, cute.AddressSpace.gmem, assumed_align=16)
-        w2_fake = make_ptr(cutlass.Int32, 16, cute.AddressSpace.gmem, assumed_align=16)
+        w13_fake = cute.runtime.make_fake_compact_tensor(
+            cutlass.Int32,
+            (num_experts * (hidden_size // 16) * (fc1_cols // 16 * 32),),
+            assumed_align=16,
+        )
+        w2_fake = cute.runtime.make_fake_compact_tensor(
+            cutlass.Int32,
+            (num_experts * (intermediate_size // 16) * (hidden_size // 16 * 32),),
+            assumed_align=16,
+        )
     fc1_fake = cute.runtime.make_fake_compact_tensor(
         cutlass_dtype,
         (compile_routed_rows * fc1_cols,),
@@ -6095,18 +6088,8 @@ def _w4a16_fused_moe_launch_flat(
             cute.AddressSpace.gmem,
             assumed_align=16,
         ),
-        make_ptr(
-            cutlass.Uint8 if weight_layout == "modelopt" else cutlass.Int32,
-            w13_arg.data_ptr(),
-            cute.AddressSpace.gmem,
-            assumed_align=16,
-        ),
-        make_ptr(
-            cutlass.Uint8 if weight_layout == "modelopt" else cutlass.Int32,
-            w2_arg.data_ptr(),
-            cute.AddressSpace.gmem,
-            assumed_align=16,
-        ),
+        w13_arg,
+        w2_arg,
         fc1_out,
         activated,
         fc2_out,
