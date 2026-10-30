@@ -3499,7 +3499,7 @@ def test_fused_shared_experts_reject_llama4_routing():
         (trtllm_fp4_block_scale_moe, fp4_kwargs),
     ):
         # Llama4's top-1 kernel is the one router without shared-expert slots.
-        with pytest.raises(ValueError, match=r"not supported .* Llama4"):
+        with pytest.raises(ValueError, match=r"not supported .*Llama4"):
             op(
                 **op_kwargs,
                 **common_kwargs,
