@@ -428,10 +428,6 @@ def test_packed_pool_plan_facts_and_the_run_time_declines():
     out = plan.run(*w, **a)
     torch.cuda.synchronize()
     case.check_out(out, label="decode 27B packed pool (prepared plan)")
-    assert (
-        torch.equal(_bits(unified[..., :D]), _bits(case.kv_cache[:, 0])) is False
-        or True
-    )
     bf = torch.bfloat16
     with pytest.raises(
         ValueError,
