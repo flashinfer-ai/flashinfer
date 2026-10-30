@@ -415,7 +415,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "fixed", "ctas": [1, 1, 1]},
-        "kernel_symbol": "kernel_cake_kda_train_d7656e2b58b9bab49495",
+        "kernel_symbol": "kernel_cake_kda_det_train_d7656e2b58b9bab49495",
         "launch": {
             "block": (256, 1, 1),
             "cluster": (1, 1, 1),
@@ -453,7 +453,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "chunk_blocks", "per_cta": 256},
-        "kernel_symbol": "kernel_cake_kda_train_8d99ea1be1c1fef432a5",
+        "kernel_symbol": "kernel_cake_kda_det_train_8d99ea1be1c1fef432a5",
         "launch": {
             "block": (256, 1, 1),
             "cluster": (1, 1, 1),
@@ -500,7 +500,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "chunk_blocks", "per_cta": 256},
-        "kernel_symbol": "kernel_cake_kda_train_9f69ca35a631ae5e1b4c",
+        "kernel_symbol": "kernel_cake_kda_det_train_9f69ca35a631ae5e1b4c",
         "launch": {
             "block": (256, 1, 1),
             "cluster": (1, 1, 1),
@@ -547,7 +547,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "fixed", "ctas": [1, 1, 1]},
-        "kernel_symbol": "kernel_cake_kda_train_fd4c92787fcc18446b14",
+        "kernel_symbol": "kernel_cake_kda_det_train_fd4c92787fcc18446b14",
         "launch": {
             "block": (256, 1, 1),
             "cluster": (1, 1, 1),
@@ -605,7 +605,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "chunks", "x_factor": 1},
-        "kernel_symbol": "kernel_cake_kda_train_c9395e21a813579c4bfc",
+        "kernel_symbol": "kernel_cake_kda_det_train_c9395e21a813579c4bfc",
         "launch": {
             "block": (256, 1, 1),
             "cluster": (1, 1, 1),
@@ -686,7 +686,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "chunks", "x_factor": 1},
-        "kernel_symbol": "kernel_cake_kda_train_94c7d1cc6c908d53e8c1",
+        "kernel_symbol": "kernel_cake_kda_det_train_94c7d1cc6c908d53e8c1",
         "launch": {
             "block": (256, 1, 1),
             "cluster": (1, 1, 1),
@@ -755,7 +755,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "pair_items"},
-        "kernel_symbol": "kernel_cake_kda_train_3712054f19d4180caa28",
+        "kernel_symbol": "kernel_cake_kda_det_train_3712054f19d4180caa28",
         "launch": {
             "block": (448, 1, 1),
             "cluster": (1, 1, 1),
@@ -877,7 +877,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "pair_items"},
-        "kernel_symbol": "kernel_cake_kda_train_e60e7ca5d88192193e61",
+        "kernel_symbol": "kernel_cake_kda_det_train_e60e7ca5d88192193e61",
         "launch": {
             "block": (448, 1, 1),
             "cluster": (1, 1, 1),
@@ -998,7 +998,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "pair_items"},
-        "kernel_symbol": "kernel_cake_kda_train_e60e7ca5d88192193e61",
+        "kernel_symbol": "kernel_cake_kda_det_train_e60e7ca5d88192193e61",
         "launch": {
             "block": (448, 1, 1),
             "cluster": (1, 1, 1),
@@ -1101,7 +1101,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "pair_items"},
-        "kernel_symbol": "kernel_cake_kda_train_eac26fffb3df8780302c",
+        "kernel_symbol": "kernel_cake_kda_det_train_eac26fffb3df8780302c",
         "launch": {
             "block": (448, 1, 1),
             "cluster": (1, 1, 1),
@@ -1163,7 +1163,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "per_doc_head", "slices": 2},
-        "kernel_symbol": "kernel_cake_kda_train_5fcc76904e5e2dd891de",
+        "kernel_symbol": "kernel_cake_kda_det_train_5fcc76904e5e2dd891de",
         "launch": {
             "block": (320, 1, 1),
             "cluster": (1, 1, 1),
@@ -1251,7 +1251,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "per_doc_head", "slices": 2},
-        "kernel_symbol": "kernel_cake_kda_train_f011cd9add8f3c7c3eee",
+        "kernel_symbol": "kernel_cake_kda_det_train_f011cd9add8f3c7c3eee",
         "launch": {
             "block": (320, 1, 1),
             "cluster": (1, 1, 1),
@@ -1328,7 +1328,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "per_doc_head", "slices": 4},
-        "kernel_symbol": "kernel_cake_kda_train_4cce3cc5bc6210c95ce3",
+        "kernel_symbol": "kernel_cake_kda_det_train_4cce3cc5bc6210c95ce3",
         "launch": {
             "block": (320, 1, 1),
             "cluster": (1, 1, 1),
@@ -1404,7 +1404,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "per_doc_head", "slices": 4},
-        "kernel_symbol": "kernel_cake_kda_train_3f4b037a0a1f8dcc314b",
+        "kernel_symbol": "kernel_cake_kda_det_train_3f4b037a0a1f8dcc314b",
         "launch": {
             "block": (320, 1, 1),
             "cluster": (1, 1, 1),
@@ -1482,7 +1482,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "per_doc_head", "slices": 2},
-        "kernel_symbol": "kernel_cake_kda_train_a557058a8aeca49a6402",
+        "kernel_symbol": "kernel_cake_kda_det_train_a557058a8aeca49a6402",
         "launch": {
             "block": (384, 1, 1),
             "cluster": (1, 1, 1),
@@ -1560,7 +1560,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "per_doc_head", "slices": 2},
-        "kernel_symbol": "kernel_cake_kda_train_898a1eb972fbaf55789a",
+        "kernel_symbol": "kernel_cake_kda_det_train_898a1eb972fbaf55789a",
         "launch": {
             "block": (384, 1, 1),
             "cluster": (1, 1, 1),
@@ -1636,7 +1636,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "segments_heads", "passes": [2]},
-        "kernel_symbol": "kernel_cake_kda_train_0e5fa2fe9ae292c3e3aa",
+        "kernel_symbol": "kernel_cake_kda_det_train_0e5fa2fe9ae292c3e3aa",
         "launch": {
             "block": (320, 1, 1),
             "cluster": (1, 1, 1),
@@ -1691,7 +1691,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "per_doc_head", "slices": 2},
-        "kernel_symbol": "kernel_cake_kda_train_90153af20fdef34c6cb3",
+        "kernel_symbol": "kernel_cake_kda_det_train_90153af20fdef34c6cb3",
         "launch": {
             "block": (320, 1, 1),
             "cluster": (1, 1, 1),
@@ -1742,7 +1742,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "per_doc_head", "slices": 2},
-        "kernel_symbol": "kernel_cake_kda_train_612492edb453070b0d6a",
+        "kernel_symbol": "kernel_cake_kda_det_train_612492edb453070b0d6a",
         "launch": {
             "block": (320, 1, 1),
             "cluster": (1, 1, 1),
@@ -1793,7 +1793,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "per_doc_head", "slices": 4},
-        "kernel_symbol": "kernel_cake_kda_train_133d787e8f202007cd37",
+        "kernel_symbol": "kernel_cake_kda_det_train_133d787e8f202007cd37",
         "launch": {
             "block": (320, 1, 1),
             "cluster": (1, 1, 1),
@@ -1855,7 +1855,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "per_doc_head", "slices": 4},
-        "kernel_symbol": "kernel_cake_kda_train_827dd9ceb9a75ea0330c",
+        "kernel_symbol": "kernel_cake_kda_det_train_827dd9ceb9a75ea0330c",
         "launch": {
             "block": (320, 1, 1),
             "cluster": (1, 1, 1),
@@ -1922,7 +1922,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "per_doc_head", "slices": 2},
-        "kernel_symbol": "kernel_cake_kda_train_cab3e194b7e9e7557edf",
+        "kernel_symbol": "kernel_cake_kda_det_train_cab3e194b7e9e7557edf",
         "launch": {
             "block": (352, 1, 1),
             "cluster": (1, 1, 1),
@@ -1986,7 +1986,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "per_doc_head", "slices": 2},
-        "kernel_symbol": "kernel_cake_kda_train_b2e877c538b6ab7317e9",
+        "kernel_symbol": "kernel_cake_kda_det_train_b2e877c538b6ab7317e9",
         "launch": {
             "block": (352, 1, 1),
             "cluster": (1, 1, 1),
@@ -2043,7 +2043,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "docs_heads", "ctas_per_chain": 2},
-        "kernel_symbol": "kernel_cake_kda_train_184d5ccfffea932ff1d8",
+        "kernel_symbol": "kernel_cake_kda_det_train_184d5ccfffea932ff1d8",
         "launch": {
             "block": (576, 1, 1),
             "cluster": (1, 1, 1),
@@ -2127,7 +2127,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "docs_heads", "ctas_per_chain": 2},
-        "kernel_symbol": "kernel_cake_kda_train_0fb763e9a81e9066d776",
+        "kernel_symbol": "kernel_cake_kda_det_train_0fb763e9a81e9066d776",
         "launch": {
             "block": (608, 1, 1),
             "cluster": (1, 1, 1),
@@ -2198,7 +2198,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "carry_groups", "s_hops": 14},
-        "kernel_symbol": "kernel_cake_kda_train_e244f5d7d0e0569a62c1",
+        "kernel_symbol": "kernel_cake_kda_det_train_e244f5d7d0e0569a62c1",
         "launch": {
             "block": (608, 1, 1),
             "cluster": (1, 1, 1),
@@ -2300,7 +2300,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "segments_heads", "passes": [1]},
-        "kernel_symbol": "kernel_cake_kda_train_9931cdff5dfd86c687c7",
+        "kernel_symbol": "kernel_cake_kda_det_train_9931cdff5dfd86c687c7",
         "launch": {
             "block": (320, 1, 1),
             "cluster": (1, 1, 1),
@@ -2407,7 +2407,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "segments_heads", "passes": [1]},
-        "kernel_symbol": "kernel_cake_kda_train_8ab0929b8154c90b5eff",
+        "kernel_symbol": "kernel_cake_kda_det_train_8ab0929b8154c90b5eff",
         "launch": {
             "block": (320, 1, 1),
             "cluster": (1, 1, 1),
@@ -2512,7 +2512,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "segments_heads", "passes": [1]},
-        "kernel_symbol": "kernel_cake_kda_train_22812d87c26b53a1ba10",
+        "kernel_symbol": "kernel_cake_kda_det_train_22812d87c26b53a1ba10",
         "launch": {
             "block": (320, 1, 1),
             "cluster": (1, 1, 1),
@@ -2617,7 +2617,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "segments_heads", "passes": [1]},
-        "kernel_symbol": "kernel_cake_kda_train_7eca60b36e233943dae6",
+        "kernel_symbol": "kernel_cake_kda_det_train_7eca60b36e233943dae6",
         "launch": {
             "block": (320, 1, 1),
             "cluster": (1, 1, 1),
@@ -2722,7 +2722,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "segments_heads", "passes": [1]},
-        "kernel_symbol": "kernel_cake_kda_train_5f5a5b3715675e083823",
+        "kernel_symbol": "kernel_cake_kda_det_train_5f5a5b3715675e083823",
         "launch": {
             "block": (320, 1, 1),
             "cluster": (1, 1, 1),
@@ -2824,7 +2824,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "segments_heads", "passes": [1]},
-        "kernel_symbol": "kernel_cake_kda_train_945a87fa84a265fc9f94",
+        "kernel_symbol": "kernel_cake_kda_det_train_945a87fa84a265fc9f94",
         "launch": {
             "block": (448, 1, 1),
             "cluster": (1, 1, 1),
@@ -2891,7 +2891,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "segments_heads", "passes": [1]},
-        "kernel_symbol": "kernel_cake_kda_train_0e5fa2fe9ae292c3e3aa",
+        "kernel_symbol": "kernel_cake_kda_det_train_0e5fa2fe9ae292c3e3aa",
         "launch": {
             "block": (320, 1, 1),
             "cluster": (1, 1, 1),
@@ -2965,7 +2965,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "chunks", "x_factor": 1},
-        "kernel_symbol": "kernel_cake_kda_train_98e6ba1f97af72fa2e32",
+        "kernel_symbol": "kernel_cake_kda_det_train_98e6ba1f97af72fa2e32",
         "launch": {
             "block": (256, 1, 1),
             "cluster": (1, 1, 1),
@@ -3023,7 +3023,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "chunks", "x_factor": 1},
-        "kernel_symbol": "kernel_cake_kda_train_86df3294f866784ca973",
+        "kernel_symbol": "kernel_cake_kda_det_train_86df3294f866784ca973",
         "launch": {
             "block": (256, 1, 1),
             "cluster": (1, 1, 1),
@@ -3079,7 +3079,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "chunks", "x_factor": 1},
-        "kernel_symbol": "kernel_cake_kda_train_e1bf4eadfa51d1646ef7",
+        "kernel_symbol": "kernel_cake_kda_det_train_e1bf4eadfa51d1646ef7",
         "launch": {
             "block": (256, 1, 1),
             "cluster": (1, 1, 1),
@@ -3156,7 +3156,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "chunks", "x_factor": 1},
-        "kernel_symbol": "kernel_cake_kda_train_0e7c693f766175f4406c",
+        "kernel_symbol": "kernel_cake_kda_det_train_0e7c693f766175f4406c",
         "launch": {
             "block": (256, 1, 1),
             "cluster": (1, 1, 1),
@@ -3246,7 +3246,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "pair_items"},
-        "kernel_symbol": "kernel_cake_kda_train_706240be56d4e41df1a2",
+        "kernel_symbol": "kernel_cake_kda_det_train_706240be56d4e41df1a2",
         "launch": {
             "block": (192, 1, 1),
             "cluster": (1, 1, 1),
@@ -3293,7 +3293,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "pair_items"},
-        "kernel_symbol": "kernel_cake_kda_train_f92b256cccc2c9007554",
+        "kernel_symbol": "kernel_cake_kda_det_train_f92b256cccc2c9007554",
         "launch": {
             "block": (192, 1, 1),
             "cluster": (1, 1, 1),
@@ -3346,7 +3346,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "per_doc_head", "slices": 4},
-        "kernel_symbol": "kernel_cake_kda_train_8eb4e9b8a9eae4e077d3",
+        "kernel_symbol": "kernel_cake_kda_det_train_8eb4e9b8a9eae4e077d3",
         "launch": {
             "block": (192, 1, 1),
             "cluster": (1, 1, 1),
@@ -3403,7 +3403,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "per_doc_head", "slices": 4},
-        "kernel_symbol": "kernel_cake_kda_train_f1777a88a21b832b29ee",
+        "kernel_symbol": "kernel_cake_kda_det_train_f1777a88a21b832b29ee",
         "launch": {
             "block": (192, 1, 1),
             "cluster": (1, 1, 1),
@@ -3459,7 +3459,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "per_doc_head", "slices": 2},
-        "kernel_symbol": "kernel_cake_kda_train_d32455627b87ba0a1d87",
+        "kernel_symbol": "kernel_cake_kda_det_train_d32455627b87ba0a1d87",
         "launch": {
             "block": (192, 1, 1),
             "cluster": (1, 1, 1),
@@ -3526,7 +3526,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "per_doc_head", "slices": 2},
-        "kernel_symbol": "kernel_cake_kda_train_4734a5d4f63d815ec086",
+        "kernel_symbol": "kernel_cake_kda_det_train_4734a5d4f63d815ec086",
         "launch": {
             "block": (192, 1, 1),
             "cluster": (1, 1, 1),
@@ -3582,7 +3582,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "per_doc_head", "slices": 2},
-        "kernel_symbol": "kernel_cake_kda_train_22a2f04d41df18554b84",
+        "kernel_symbol": "kernel_cake_kda_det_train_22a2f04d41df18554b84",
         "launch": {
             "block": (192, 1, 1),
             "cluster": (1, 1, 1),
@@ -3642,7 +3642,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "per_doc_head", "slices": 2},
-        "kernel_symbol": "kernel_cake_kda_train_036e1c7e1dfc95a88aae",
+        "kernel_symbol": "kernel_cake_kda_det_train_036e1c7e1dfc95a88aae",
         "launch": {
             "block": (192, 1, 1),
             "cluster": (1, 1, 1),
@@ -3709,7 +3709,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "segments_heads", "passes": [1, 1]},
-        "kernel_symbol": "kernel_cake_kda_train_74e19f83f8d97e669d46",
+        "kernel_symbol": "kernel_cake_kda_det_train_74e19f83f8d97e669d46",
         "launch": {
             "block": (192, 1, 1),
             "cluster": (1, 1, 1),
@@ -3833,7 +3833,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "segments_heads", "passes": [1, 1]},
-        "kernel_symbol": "kernel_cake_kda_train_157990bf8c73b3dbc4fe",
+        "kernel_symbol": "kernel_cake_kda_det_train_157990bf8c73b3dbc4fe",
         "launch": {
             "block": (192, 1, 1),
             "cluster": (1, 1, 1),
@@ -3946,7 +3946,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "segments_heads", "passes": [1, 1]},
-        "kernel_symbol": "kernel_cake_kda_train_251cc1717dfc8e3ba24e",
+        "kernel_symbol": "kernel_cake_kda_det_train_251cc1717dfc8e3ba24e",
         "launch": {
             "block": (192, 1, 1),
             "cluster": (1, 1, 1),
@@ -4058,7 +4058,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "segments_heads", "passes": [1, 1]},
-        "kernel_symbol": "kernel_cake_kda_train_b4a1408642c39b6e6ccd",
+        "kernel_symbol": "kernel_cake_kda_det_train_b4a1408642c39b6e6ccd",
         "launch": {
             "block": (192, 1, 1),
             "cluster": (1, 1, 1),
@@ -4153,7 +4153,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "segments_heads", "passes": [1, 1]},
-        "kernel_symbol": "kernel_cake_kda_train_91d59405d9b349c0709c",
+        "kernel_symbol": "kernel_cake_kda_det_train_91d59405d9b349c0709c",
         "launch": {
             "block": (192, 1, 1),
             "cluster": (1, 1, 1),
@@ -4237,7 +4237,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "segments_heads", "passes": [1, 1]},
-        "kernel_symbol": "kernel_cake_kda_train_e0b6246cba153e5c917b",
+        "kernel_symbol": "kernel_cake_kda_det_train_e0b6246cba153e5c917b",
         "launch": {
             "block": (192, 1, 1),
             "cluster": (1, 1, 1),
@@ -4320,7 +4320,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "segments_heads", "passes": [1, 1]},
-        "kernel_symbol": "kernel_cake_kda_train_243fb0b23aea1b296ab6",
+        "kernel_symbol": "kernel_cake_kda_det_train_243fb0b23aea1b296ab6",
         "launch": {
             "block": (192, 1, 1),
             "cluster": (1, 1, 1),
@@ -4421,7 +4421,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "segments_heads", "passes": [1, 1]},
-        "kernel_symbol": "kernel_cake_kda_train_dec885b973bd44f88416",
+        "kernel_symbol": "kernel_cake_kda_det_train_dec885b973bd44f88416",
         "launch": {
             "block": (192, 1, 1),
             "cluster": (1, 1, 1),
@@ -4511,7 +4511,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "segments_heads", "passes": [1, 1]},
-        "kernel_symbol": "kernel_cake_kda_train_909a0aa57efb3f353972",
+        "kernel_symbol": "kernel_cake_kda_det_train_909a0aa57efb3f353972",
         "launch": {
             "block": (192, 1, 1),
             "cluster": (1, 1, 1),
@@ -4600,7 +4600,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "segments_heads", "passes": [2, 2]},
-        "kernel_symbol": "kernel_cake_kda_train_3f7ffe0b7421d90ad674",
+        "kernel_symbol": "kernel_cake_kda_det_train_3f7ffe0b7421d90ad674",
         "launch": {
             "block": (192, 1, 1),
             "cluster": (1, 1, 1),
@@ -4676,7 +4676,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "segments_heads", "passes": [2, 2]},
-        "kernel_symbol": "kernel_cake_kda_train_2247b401b29d959d8133",
+        "kernel_symbol": "kernel_cake_kda_det_train_2247b401b29d959d8133",
         "launch": {
             "block": (192, 1, 1),
             "cluster": (1, 1, 1),
@@ -4752,7 +4752,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "segments_heads", "passes": [2, 2]},
-        "kernel_symbol": "kernel_cake_kda_train_de4f911d8beaf8ac8d79",
+        "kernel_symbol": "kernel_cake_kda_det_train_de4f911d8beaf8ac8d79",
         "launch": {
             "block": (192, 1, 1),
             "cluster": (1, 1, 1),
@@ -4832,7 +4832,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "chunk_items"},
-        "kernel_symbol": "kernel_cake_kda_train_ac974e171d56fc3ce10b",
+        "kernel_symbol": "kernel_cake_kda_det_train_ac974e171d56fc3ce10b",
         "launch": {
             "block": (576, 1, 1),
             "cluster": (1, 1, 1),
@@ -4911,7 +4911,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "chunk_items"},
-        "kernel_symbol": "kernel_cake_kda_train_058a68a5b4d89c53be4b",
+        "kernel_symbol": "kernel_cake_kda_det_train_058a68a5b4d89c53be4b",
         "launch": {
             "block": (576, 1, 1),
             "cluster": (1, 1, 1),
@@ -4990,7 +4990,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "chunk_items"},
-        "kernel_symbol": "kernel_cake_kda_train_f6a70fb0288a508f2828",
+        "kernel_symbol": "kernel_cake_kda_det_train_f6a70fb0288a508f2828",
         "launch": {
             "block": (320, 1, 1),
             "cluster": (1, 1, 1),
@@ -5105,7 +5105,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "chunk_items"},
-        "kernel_symbol": "kernel_cake_kda_train_1f9c46f98f4290ee26df",
+        "kernel_symbol": "kernel_cake_kda_det_train_1f9c46f98f4290ee26df",
         "launch": {
             "block": (320, 1, 1),
             "cluster": (1, 1, 1),
@@ -5220,7 +5220,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "chunk_items"},
-        "kernel_symbol": "kernel_cake_kda_train_1a0df5d531918da7561e",
+        "kernel_symbol": "kernel_cake_kda_det_train_1a0df5d531918da7561e",
         "launch": {
             "block": (320, 1, 1),
             "cluster": (1, 1, 1),
@@ -5299,7 +5299,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "chunk_items"},
-        "kernel_symbol": "kernel_cake_kda_train_3b9b3f9a495f04bc83e4",
+        "kernel_symbol": "kernel_cake_kda_det_train_3b9b3f9a495f04bc83e4",
         "launch": {
             "block": (320, 1, 1),
             "cluster": (1, 1, 1),
@@ -5376,7 +5376,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "chunks", "x_factor": 1},
-        "kernel_symbol": "kernel_cake_kda_train_54786ffd01bd9b6bb416",
+        "kernel_symbol": "kernel_cake_kda_det_train_54786ffd01bd9b6bb416",
         "launch": {
             "block": (288, 1, 1),
             "cluster": (1, 1, 1),
@@ -5444,7 +5444,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "chunks", "x_factor": 1},
-        "kernel_symbol": "kernel_cake_kda_train_c27b09eb5f5881be2969",
+        "kernel_symbol": "kernel_cake_kda_det_train_c27b09eb5f5881be2969",
         "launch": {
             "block": (288, 1, 1),
             "cluster": (1, 1, 1),
@@ -5512,7 +5512,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "chunks", "x_factor": 1},
-        "kernel_symbol": "kernel_cake_kda_train_aa6b5c23c97e1cb9880a",
+        "kernel_symbol": "kernel_cake_kda_det_train_aa6b5c23c97e1cb9880a",
         "launch": {
             "block": (288, 1, 1),
             "cluster": (1, 1, 1),
@@ -5565,7 +5565,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "chunks", "x_factor": 1},
-        "kernel_symbol": "kernel_cake_kda_train_47a9c058e6d6c78c166d",
+        "kernel_symbol": "kernel_cake_kda_det_train_47a9c058e6d6c78c166d",
         "launch": {
             "block": (256, 1, 1),
             "cluster": (1, 1, 1),
