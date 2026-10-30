@@ -280,7 +280,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "kcp_segments_heads"},
-        "kernel_symbol": "kernel_cake_kda_train_7658fcc297c6fd906d53",
+        "kernel_symbol": "kernel_cake_kda_det_train_7658fcc297c6fd906d53_kcp",
         "launch": {
             "block": (192, 1, 1),
             "cluster": (1, 1, 1),
@@ -288,7 +288,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 115712,
             "use_pdl": False,
         },
-        "library": "cake_kda_train_7658fcc297c6fd906d53",
+        "library": "cake_kda_det_train_7658fcc297c6fd906d53_kcp",
         "logical": {
             "gk": "gk",
             "h0": "h0",
@@ -342,7 +342,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"ctas_per_head": 2, "kind": "kcp_segments_heads"},
-        "kernel_symbol": "kernel_cake_kda_train_5a20cd12bb62bb6f3ac5",
+        "kernel_symbol": "kernel_cake_kda_det_train_5a20cd12bb62bb6f3ac5_kcp",
         "launch": {
             "block": (192, 1, 1),
             "cluster": (1, 1, 1),
@@ -350,7 +350,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 91136,
             "use_pdl": False,
         },
-        "library": "cake_kda_train_5a20cd12bb62bb6f3ac5",
+        "library": "cake_kda_det_train_5a20cd12bb62bb6f3ac5_kcp",
         "logical": {
             "gk": "gk",
             "h0": "h0",
@@ -404,7 +404,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"ctas_per_head": 2, "kind": "kcp_segments_heads"},
-        "kernel_symbol": "kernel_cake_kda_train_6fac4410ba86c48541c4",
+        "kernel_symbol": "kernel_cake_kda_det_train_6fac4410ba86c48541c4_kcp",
         "launch": {
             "block": (192, 1, 1),
             "cluster": (1, 1, 1),
@@ -412,7 +412,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 115712,
             "use_pdl": False,
         },
-        "library": "cake_kda_train_6fac4410ba86c48541c4",
+        "library": "cake_kda_det_train_6fac4410ba86c48541c4_kcp",
         "logical": {
             "gk": "gk",
             "h0": "h0",
@@ -469,7 +469,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "kcp_segments_heads"},
-        "kernel_symbol": "kernel_cake_kda_train_1c66573e87150245374b",
+        "kernel_symbol": "kernel_cake_kda_det_train_1c66573e87150245374b_kcp",
         "launch": {
             "block": (192, 1, 1),
             "cluster": (1, 1, 1),
@@ -477,7 +477,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 115712,
             "use_pdl": False,
         },
-        "library": "cake_kda_train_1c66573e87150245374b",
+        "library": "cake_kda_det_train_1c66573e87150245374b_kcp",
         "logical": {
             "dh_tape": "dh",
             "dht": "dht",
@@ -537,7 +537,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"ctas_per_head": 2, "kind": "kcp_segments_heads"},
-        "kernel_symbol": "kernel_cake_kda_train_afe02fb600500ba3556f",
+        "kernel_symbol": "kernel_cake_kda_det_train_afe02fb600500ba3556f_kcp",
         "launch": {
             "block": (192, 1, 1),
             "cluster": (1, 1, 1),
@@ -545,7 +545,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 82944,
             "use_pdl": False,
         },
-        "library": "cake_kda_train_afe02fb600500ba3556f",
+        "library": "cake_kda_det_train_afe02fb600500ba3556f_kcp",
         "logical": {
             "dh_tape": "dh",
             "dht": "dht",
@@ -605,7 +605,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"ctas_per_head": 2, "kind": "kcp_segments_heads"},
-        "kernel_symbol": "kernel_cake_kda_train_32b1aa657b082f2f4cb7",
+        "kernel_symbol": "kernel_cake_kda_det_train_32b1aa657b082f2f4cb7_kcp",
         "launch": {
             "block": (192, 1, 1),
             "cluster": (1, 1, 1),
@@ -613,7 +613,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 107520,
             "use_pdl": False,
         },
-        "library": "cake_kda_train_32b1aa657b082f2f4cb7",
+        "library": "cake_kda_det_train_32b1aa657b082f2f4cb7_kcp",
         "logical": {
             "dh_tape": "dh",
             "dht": "dht",
@@ -668,7 +668,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "ffi_entry": "run",
         # Two CTAs per (segment, head): each walks one 64-column half of the state.
         "grid_rule": {"ctas_per_head": 2, "kind": "kcp_segments_heads"},
-        "kernel_symbol": "kernel_cake_kda_train_9a3f306bacf8c8a1547d",
+        "kernel_symbol": "kernel_cake_kda_det_train_9a3f306bacf8c8a1547d_kcp",
         "launch": {
             "block": (192, 1, 1),
             "cluster": (1, 1, 1),
@@ -676,7 +676,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 107520,
             "use_pdl": False,
         },
-        "library": "cake_kda_train_9a3f306bacf8c8a1547d",
+        "library": "cake_kda_det_train_9a3f306bacf8c8a1547d_kcp",
         "logical": {
             "gk": "gk",
             "init_mode": "init_mode",
@@ -724,7 +724,7 @@ MODULES: dict[str, dict[str, Any]] = {
         # One CTA per chain and block of ``cols_per_cta`` columns; the 8-column
         # build is the fastest of the three on 128-column state chains (GB300).
         "grid_rule": {"cols_per_cta": 8, "kind": "kcp_chains"},
-        "kernel_symbol": "kernel_cake_kda_train_c6958a0a4ed5cb55a9a1",
+        "kernel_symbol": "kernel_cake_kda_det_train_c6958a0a4ed5cb55a9a1_kcp",
         "launch": {
             "block": (128, 1, 1),
             "cluster": (1, 1, 1),
@@ -732,7 +732,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 37120,
             "use_pdl": False,
         },
-        "library": "cake_kda_train_c6958a0a4ed5cb55a9a1",
+        "library": "cake_kda_det_train_c6958a0a4ed5cb55a9a1_kcp",
         "logical": {
             "c": "c",
             "chain_start": "chain_start",
@@ -778,7 +778,7 @@ MODULES: dict[str, dict[str, Any]] = {
         # The 16-column build is the fastest of the three on 256-column map
         # chains (``X = [B | M]``; GB300).
         "grid_rule": {"cols_per_cta": 16, "kind": "kcp_chains"},
-        "kernel_symbol": "kernel_cake_kda_train_89f5ff59f03eb170e3bf",
+        "kernel_symbol": "kernel_cake_kda_det_train_89f5ff59f03eb170e3bf_kcp",
         "launch": {
             "block": (128, 1, 1),
             "cluster": (1, 1, 1),
@@ -786,7 +786,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 41216,
             "use_pdl": False,
         },
-        "library": "cake_kda_train_89f5ff59f03eb170e3bf",
+        "library": "cake_kda_det_train_89f5ff59f03eb170e3bf_kcp",
         "logical": {
             "c": "c",
             "chain_start": "chain_start",
@@ -827,7 +827,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"ctas_per_sm": 1, "kind": "kcp_sm_bounded"},
-        "kernel_symbol": "kernel_cake_kda_train_1214bfc28e50985bfa0c",
+        "kernel_symbol": "kernel_cake_kda_det_train_1214bfc28e50985bfa0c",
         "launch": {
             "block": (192, 1, 1),
             "cluster": (1, 1, 1),
@@ -835,7 +835,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 222208,
             "use_pdl": False,
         },
-        "library": "cake_kda_train_1214bfc28e50985bfa0c",
+        "library": "cake_kda_det_train_1214bfc28e50985bfa0c",
         "logical": {
             "aqk_tma": "aqk_int",
             "chunk_bos": "chunk_bos",
@@ -869,7 +869,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "kcp_pairs"},
-        "kernel_symbol": "kernel_cake_kda_train_f227dd21f1f3cb464b29",
+        "kernel_symbol": "kernel_cake_kda_det_train_f227dd21f1f3cb464b29",
         "launch": {
             "block": (192, 1, 1),
             "cluster": (1, 1, 1),
@@ -877,7 +877,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 99328,
             "use_pdl": False,
         },
-        "library": "cake_kda_train_f227dd21f1f3cb464b29",
+        "library": "cake_kda_det_train_f227dd21f1f3cb464b29",
         "logical": {
             "aqk_tma": "aqk_int",
             "dAqk": "dAqk",
@@ -932,7 +932,7 @@ TEST_MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "kcp_segments_heads"},
-        "kernel_symbol": "kernel_cake_kda_train_b1477ed31fad32a5c2c9",
+        "kernel_symbol": "kernel_cake_kda_det_train_b1477ed31fad32a5c2c9_kcp",
         "launch": {
             "block": (192, 1, 1),
             "cluster": (1, 1, 1),
@@ -940,7 +940,7 @@ TEST_MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 198656,
             "use_pdl": False,
         },
-        "library": "cake_kda_train_b1477ed31fad32a5c2c9",
+        "library": "cake_kda_det_train_b1477ed31fad32a5c2c9_kcp",
         "logical": {
             "gk": "gk",
             "init_mode": "init_mode",
@@ -989,7 +989,7 @@ TEST_MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "kcp_segments_heads"},
-        "kernel_symbol": "kernel_cake_kda_train_64ba2583f28f7d4c0102",
+        "kernel_symbol": "kernel_cake_kda_det_train_64ba2583f28f7d4c0102_kcp",
         "launch": {
             "block": (192, 1, 1),
             "cluster": (1, 1, 1),
@@ -997,7 +997,7 @@ TEST_MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 198656,
             "use_pdl": False,
         },
-        "library": "cake_kda_train_64ba2583f28f7d4c0102",
+        "library": "cake_kda_det_train_64ba2583f28f7d4c0102_kcp",
         "logical": {
             "gk": "gk",
             "init_mode": "init_mode",
@@ -1046,7 +1046,7 @@ TEST_MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "kcp_segments_heads"},
-        "kernel_symbol": "kernel_cake_kda_train_b1a95a8ee8110e47558e",
+        "kernel_symbol": "kernel_cake_kda_det_train_b1a95a8ee8110e47558e_kcp",
         "launch": {
             "block": (192, 1, 1),
             "cluster": (1, 1, 1),
@@ -1054,7 +1054,7 @@ TEST_MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 214016,
             "use_pdl": False,
         },
-        "library": "cake_kda_train_b1a95a8ee8110e47558e",
+        "library": "cake_kda_det_train_b1a95a8ee8110e47558e_kcp",
         "logical": {
             "gk": "gk",
             "init_mode": "init_mode",
@@ -1103,7 +1103,7 @@ TEST_MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "kcp_segments_heads"},
-        "kernel_symbol": "kernel_cake_kda_train_1ac972f0cb7cc7b13cf7",
+        "kernel_symbol": "kernel_cake_kda_det_train_1ac972f0cb7cc7b13cf7_kcp",
         "launch": {
             "block": (192, 1, 1),
             "cluster": (1, 1, 1),
@@ -1111,7 +1111,7 @@ TEST_MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 198656,
             "use_pdl": False,
         },
-        "library": "cake_kda_train_1ac972f0cb7cc7b13cf7",
+        "library": "cake_kda_det_train_1ac972f0cb7cc7b13cf7_kcp",
         "logical": {
             "gk": "gk",
             "init_mode": "init_mode",
@@ -1163,7 +1163,7 @@ TEST_MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "kcp_segments_heads"},
-        "kernel_symbol": "kernel_cake_kda_train_9cfe05bce78410f1304b",
+        "kernel_symbol": "kernel_cake_kda_det_train_9cfe05bce78410f1304b_kcp",
         "launch": {
             "block": (192, 1, 1),
             "cluster": (1, 1, 1),
@@ -1171,7 +1171,7 @@ TEST_MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 115712,
             "use_pdl": False,
         },
-        "library": "cake_kda_train_9cfe05bce78410f1304b",
+        "library": "cake_kda_det_train_9cfe05bce78410f1304b_kcp",
         "logical": {
             "gk": "gk",
             "h0": "h0",
@@ -1229,7 +1229,7 @@ TEST_MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "kcp_segments_heads"},
-        "kernel_symbol": "kernel_cake_kda_train_3808ea4d567b82ea21a4",
+        "kernel_symbol": "kernel_cake_kda_det_train_3808ea4d567b82ea21a4_kcp",
         "launch": {
             "block": (192, 1, 1),
             "cluster": (1, 1, 1),
@@ -1237,7 +1237,7 @@ TEST_MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 115712,
             "use_pdl": False,
         },
-        "library": "cake_kda_train_3808ea4d567b82ea21a4",
+        "library": "cake_kda_det_train_3808ea4d567b82ea21a4_kcp",
         "logical": {
             "dh_tape": "dh",
             "dht": "dht",
