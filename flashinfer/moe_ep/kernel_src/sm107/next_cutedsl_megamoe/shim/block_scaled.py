@@ -470,6 +470,7 @@ class Sm107BlockScaledSymmBuffer:
     """
 
     def __init__(self, config: Sm107BlockScaledMoeConfig) -> None:
+        """Allocate session buffers, including independent NVFP4 default scalars."""
         comm.ensure_not_capturing("SM107 mega workspace allocation")
         _require_sm107()
         _configure_dsl_arch()
@@ -922,6 +923,7 @@ class Sm107BlockScaledSymmBuffer:
         self.prepare(transformed_l1, transformed_l2)
 
     def destroy(self) -> None:
+        """Drain outstanding work and collectively release the session buffers."""
         if self._destroyed:
             return
         comm.ensure_not_capturing("SM107 mega workspace free")

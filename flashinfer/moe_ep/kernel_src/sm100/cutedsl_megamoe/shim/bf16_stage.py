@@ -4,6 +4,7 @@
 
 from dataclasses import dataclass
 from functools import cache
+from threading import local
 from typing import Any
 
 import torch
@@ -13,6 +14,7 @@ from .comm import ensure_not_capturing
 
 @cache
 def _kernel_class():
+    """Build the CuTeDSL stager lazily to keep CUDA imports out of discovery."""
     import cuda.bindings.driver as cuda
     import cutlass
     import cutlass.cute as cute
@@ -33,6 +35,7 @@ def _kernel_class():
             scores_out: cute.Tensor,
             stream: cuda.CUstream,
         ):
+            """Launch enough CTAs for both live activations and the routing tail."""
             # Extra CTAs cover large tails even for an empty live batch.
             route_blocks = (cutlass.Int64(ids_out.shape[0]) * self.topk + 127) // 128
             blocks = cutlass.max(cutlass.Int64(activation.shape[0]), route_blocks)
@@ -42,6 +45,7 @@ def _kernel_class():
 
         @cute.jit
         def _aligned(self, tensor: cute.Tensor):
+            """Expose the verified 16-byte alignment of an activation chunk."""
             ptr = tensor.iterator
             return cute.make_tensor(
                 cute.make_ptr(ptr.dtype, ptr.toint(), ptr.memspace, assumed_align=16),
@@ -58,6 +62,7 @@ def _kernel_class():
             ids_out: cute.Tensor,
             scores_out: cute.Tensor,
         ):
+            """Copy independent activation vectors and the full routing plane."""
             tid, _, _ = cute.arch.thread_idx()
             row, _, _ = cute.arch.block_idx()
             if row < activation.shape[0]:
@@ -95,14 +100,17 @@ def _kernel_class():
     return Bf16Stager
 
 
-@dataclass
-class _Stager:
+@dataclass(frozen=True)
+class _PreparedStager:
+    """One immutable binding owned by the calling host thread."""
+
+    signature: tuple
     compiled: Any
-    launch_key: tuple | None = None
-    arguments: tuple = ()
+    arguments: tuple
 
 
-_STAGERS: dict[tuple, _Stager] = {}
+_STAGERS: dict[tuple, Any] = {}
+_PREPARED = local()
 
 
 def fused_bf16_stage(
@@ -126,6 +134,20 @@ def fused_bf16_stage(
         topk_idx_out,
         topk_weights_out,
     )
+    # Tensor storage and layouts may change in place. Snapshot all runtime
+    # metadata once; an unchanged signature can reuse the prepared binding.
+    signature = tuple(
+        (t.data_ptr(), t.shape, t.stride(), t.dtype, t.device) for t in tensors
+    )
+    prepared = getattr(_PREPARED, "stager", None)
+    if prepared is not None and prepared.signature == signature:
+        import cuda.bindings.driver as cuda
+
+        prepared.compiled(
+            *prepared.arguments,
+            cuda.CUstream(torch.cuda.current_stream().cuda_stream),
+        )
+        return True
     if not all(t.ndim == 2 for t in tensors):
         return False
     live, hidden = hidden_states.shape
@@ -177,31 +199,28 @@ def fused_bf16_stage(
     key = (
         hidden_states.shape[1],
         topk_ids.shape[1],
-        tuple((t.device, t.dtype, tuple(t.stride())) for t in tensors),
+        tuple((item[4], item[3], item[2]) for item in signature),
     )
-    launch_key = tuple((t.data_ptr(), tuple(t.shape)) for t in tensors)
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-    stager = _STAGERS.get(key)
-    if stager is None or stager.launch_key != launch_key:
-        import cutlass.torch as cutlass_torch
+    compiled = _STAGERS.get(key)
+    import cutlass.torch as cutlass_torch
 
-        arguments = tuple(
-            cutlass_torch.from_dlpack(
-                t, assumed_align=16 if i in (0, 3) else 1
-            ).mark_layout_dynamic(leading_dim=1)
-            for i, t in enumerate(tensors)
+    arguments = tuple(
+        cutlass_torch.from_dlpack(
+            t, assumed_align=16 if i in (0, 3) else 1
+        ).mark_layout_dynamic(leading_dim=1)
+        for i, t in enumerate(tensors)
+    )
+    if compiled is None:
+        ensure_not_capturing("fused BF16 staging compilation")
+        compiled = cute.compile(
+            _kernel_class()(hidden_states.shape[1], topk_ids.shape[1]),
+            *arguments,
+            stream,
         )
-        if stager is None:
-            ensure_not_capturing("fused BF16 staging compilation")
-            stager = _Stager(
-                cute.compile(
-                    _kernel_class()(hidden_states.shape[1], topk_ids.shape[1]),
-                    *arguments,
-                    stream,
-                )
-            )
-            _STAGERS[key] = stager
-        stager.arguments = arguments
-        stager.launch_key = launch_key
-    stager.compiled(*stager.arguments, stream)
+        _STAGERS[key] = compiled
+    # Publish a single immutable object and retain this call's local arguments.
+    # Other host threads cannot replace its binding before the launch.
+    _PREPARED.stager = _PreparedStager(signature, compiled, arguments)
+    compiled(*arguments, stream)
     return True

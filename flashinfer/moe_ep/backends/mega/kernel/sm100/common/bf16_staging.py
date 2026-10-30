@@ -17,6 +17,7 @@ def stage_mega_moe_inputs(
     topk_idx_out: torch.Tensor,
     topk_weights_out: torch.Tensor,
 ) -> None:
+    """Stage live BF16 inputs and mask the full routing tail on every call."""
     if (
         hidden_states.is_cuda
         and os.environ.get("FLASHINFER_MEGA_FUSED_STAGE", "1") != "0"

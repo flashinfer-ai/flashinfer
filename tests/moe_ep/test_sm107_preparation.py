@@ -613,6 +613,7 @@ def _invalid_staged_route(case, kind):
     )
 
     def stage():
+        """Stage live values before checking mutated routes on graph replay."""
         stage_inputs = stage_nv if kind == "nvfp4" else stage_mx
         stage_inputs(x, scores, ids, *out, num_experts=8)
 

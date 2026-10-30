@@ -24,6 +24,12 @@ BF16 activation pointers. Unsupported layouts, overlapping planes and
 invocation masks the full routing tail, including empty batches; it does
 not infer tail validity from host live-token counts.
 
+Prepared staging bindings are immutable and private to each host thread;
+only compiled code is shared. Every call rechecks tensor pointers, shapes,
+strides, dtypes and devices before reusing a binding. This avoids repeating
+eligibility checks and descriptor preparation without allowing interleaved
+calls to replace each other's launch arguments.
+
 For BF16×BF16 with the separate terminal reducer, a contiguous, aligned
 caller output is bound directly to that reducer. Its live row count bounds
 the reduction, avoiding both padded-row reduction and the workspace-to-output
@@ -61,6 +67,39 @@ Numerical oracles and graph/eager parity pass at all measured points.
 Existing BF16/BF16×MXFP8 tests also passed at EP4 on SM107. This experiment
 did not qualify SM100/SM103 hardware. The remaining DeepGEMM gap is
 predominantly in the main compute kernel.
+
+### CPU submission follow-up (2026-10-29)
+
+Single-GPU SM107 staging-only measurements use H=4096, capacity=256,
+top-k=6, BF16 activations, int64 IDs and FP32 scores. CPU submission is
+the median of seven alternating rounds of 100 warmed calls, with CUDA
+synchronization after the timed submission interval. GPU intervals use
+40 staging calls per captured graph and 30 replays per round. Clocks are
+not locked. `copies` sets `FLASHINFER_MEGA_FUSED_STAGE=0`; `reviewed fused`
+is the implementation at `b5188e586`, and `prepared` uses thread-private
+bindings with runtime storage/layout checks.
+
+| Live rows | CPU copies (µs) | CPU reviewed fused (µs) | CPU prepared (µs) | GPU copies (µs) | GPU prepared (µs) |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 22.03 | 25.16 | 14.28 | 5.83 | 1.93 |
+| 32 | 21.91 | 24.96 | 14.03 | 5.84 | 1.97 |
+| 192 | 21.95 | 24.77 | 13.84 | 6.53 | 2.13 |
+| 256 | 15.13 | 24.06 | 13.29 | 5.76 | 2.15 |
+
+An EP8 full-forward comparison at the geometry above, intermediate=2048,
+256 experts and 192 live rows keeps direct output enabled on both sides
+and changes only staging. Five alternating batches of 20 eager calls give
+maximum per-rank median CPU submission of 202.43 µs for copies versus
+184.52 µs for prepared staging. Completed batch wall time, including the
+final CUDA synchronization, is approximately flat: 648.11 versus
+645.19 µs per call, with scheduling jitter in individual rounds. Full-call
+CUDA Graph intervals are 274.54 versus 270.90 µs. These scopes do not
+measure serving latency and are distinct from the full-PR table above.
+
+A forced two-thread interleaving with native GPU buffers reproduced the
+reviewed cache's pointer swap and passed with private bindings. Another
+400 concurrent calls and same-tensor storage/shape/stride changes passed
+staging equality checks.
 
 ## Microbenchmark results (2026-07-22, e2e_pipelined p50 µs)
 

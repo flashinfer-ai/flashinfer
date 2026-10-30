@@ -302,6 +302,7 @@ class MegaMoEBf16Frontend:
         num_tokens: Optional[int] = None,
         sync: bool = False,
     ) -> torch.Tensor:
+        """Launch with cached bindings that track the output's live layout."""
         n = inputs.activation.shape[0] if num_tokens is None else num_tokens
         self._validate(inputs, n)
         mega = self._ensure_compiled(inputs)
@@ -369,6 +370,7 @@ class MegaMoEBf16Frontend:
             return thunk
 
     def _validate(self, inputs: MegaMoEBf16Inputs, num_tokens: int) -> None:
+        """Check padded inputs and the admitted live-output row count."""
         c = self.config
         if not 0 <= num_tokens <= c.num_tokens_per_rank:
             raise ValueError(
@@ -557,6 +559,7 @@ def bf16_mega_moe(
     fast_math: bool = True,
     sync: bool = False,
 ) -> Optional[torch.Tensor]:
+    """Write caller output directly when eligible, or return a borrowed view."""
     del fast_math
     if symm_buffer._destroyed:
         raise RuntimeError("symm_buffer.destroy() was already called.")

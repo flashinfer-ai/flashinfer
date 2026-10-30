@@ -53,10 +53,10 @@ def test_nvfp4_default_scalars_survive_other_graphs(monkeypatch, prequantized):
     x_input, scales = quantize_nvfp4_block16(x) if prequantized else (x, None)
     ids = torch.arange(live * topk, device="cuda").reshape(live, topk)
     scores = torch.full((live, topk), 1 / topk, device="cuda")
-    captures, inputs = [], []
+    captures, inputs = {}, []
     names = ("fc1_alpha", "fc2_alpha", "fc1_norm_const")
     try:
-        for stride in (0, 1, 2):
+        for stride in (2, 1, 0):
             output = torch.empty_like(x)
             tensors = MoEEpTensors(x_input, ids, scores, scales=scales, output=output)
             if stride:
@@ -73,7 +73,7 @@ def test_nvfp4_default_scalars_survive_other_graphs(monkeypatch, prequantized):
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):
                 layer.forward(tensors)
-            captures.append((graph, output, expected))
+            captures[stride] = (graph, output, expected)
             inputs.append(tensors)
         # Copies from a strided override and unrelated buffer writes must not
         # change the scalar values baked into the default or bound graph.
@@ -86,7 +86,7 @@ def test_nvfp4_default_scalars_survive_other_graphs(monkeypatch, prequantized):
             error = (output.float() - expected.float()).norm() / expected.float().norm()
             assert error.item() < 0.02
     finally:
-        for graph, _, _ in captures:
+        for graph, _, _ in captures.values():
             graph.reset()
         layer.destroy()
 
