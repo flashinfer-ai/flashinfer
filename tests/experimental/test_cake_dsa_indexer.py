@@ -117,6 +117,8 @@ _COMMON = dict(
     sample_dispatch_tiny_tiles_max=128,
     sample_shift_permille=250,
     sample_shift_rule=None,
+    sample_class_rule=None,
+    lsf_programs=False,
     far_sample=0,
     check_period_max=32,
     check_period_knob_max=64,
@@ -1155,7 +1157,7 @@ def test_select_program_narrow_pair_policy():
         and c.sample_tiles_max == 8
         and c.key_bits == 13
     )
-    assert c.workspace_bytes == 148 * 6 * 8192 * 8 + 128
+    assert c.workspace_bytes == 148 * 6 * 8192 * 8 + cake_policy.TICKET_TAIL_BYTES
     # one causal 64k document: the CTA-pair three-warpgroup program
     c = _select(p, 65536, 65536)
     assert c.scan_key == "scan:pair_l6:u1:s0:f1" and c.pair and c.grid_ctas == 148
@@ -1172,7 +1174,10 @@ def test_select_program_narrow_pair_policy():
     )
     assert c.scan_key == "scan:split_narrow:u1:s0:f0" and c.merge_key == MERGE_KEY
     assert c.cand_cap_multiplier == 8 and c.cand_cap == 16384 and c.check_period == 32
-    assert c.workspace_bytes == (148 * 4 * 16384 + 64 * 9 * 2048) * 8 + 128
+    assert (
+        c.workspace_bytes
+        == (148 * 4 * 16384 + 64 * 9 * 2048) * 8 + cake_policy.TICKET_TAIL_BYTES
+    )
     assert (
         c.keys == ("scan:split_narrow:u1:s0:f0", "merge", "finalize:t256")
         and c.rank_window is None
@@ -1320,7 +1325,7 @@ def test_wide_first_precedence_and_pair_units_guard():
     c = _select(first, 131072, 131072)
     assert c.scan_key == "scan:wide:u1:s0:f1" and c.block_q == 8 and not c.pair
     assert c.grid_ctas == 148 and c.cand_cap == 16384
-    assert c.workspace_bytes == 148 * 8 * 16384 * 8 + 128
+    assert c.workspace_bytes == 148 * 8 * 16384 * 8 + cake_policy.TICKET_TAIL_BYTES
     # 64k causal document: 256 < 512 keeps the three-warpgroup pair (multiplier 4 x 2048 = 8192 slots, fit)
     assert _select(first, 65536, 65536).scan_key == "scan:pair_l6:u1:s0:f1"
     # 4096 tail queries over 128k keys: 1008 tiles but 512 / 148 = 3.46 rounds < 6 -- ineligible for wide, so the
@@ -1659,10 +1664,24 @@ def test_shipped_unit_rules_by_architecture():
                 == "scan:wide:u2:s0:f0"
             ), (grid, knobs)
             # 16k queries over two 135k-key segments: (270336 - 8192) / 2 / 128 = 1024.0 tiles, 13.5 rounds -> wide first
-            # at top_k 2048 (16384 slots) and 4096 (the 32768-slot ceiling)
+            # at top_k 2048 (16384 slots) and 4096 (the 32768-slot ceiling); two segments and no max_seqlen_k: the
+            # longest-first copy (:lsf), and the program without it once max_seqlen_k says the segments are equal
             for K in (2048, 4096):
                 assert (
                     _select(p103, 16384, 270336, S=2, K=K, grid=grid, **knobs).scan_key
+                    == "scan:wide:u2:s0:f0:lsf"
+                ), (grid, knobs, K)
+                assert (
+                    _select(
+                        p103,
+                        16384,
+                        270336,
+                        S=2,
+                        K=K,
+                        grid=grid,
+                        max_seqlen_k=135168,
+                        **knobs,
+                    ).scan_key
                     == "scan:wide:u2:s0:f0"
                 ), (grid, knobs, K)
             # 64k causal document: 256 tiles, below the floor -> the three-warpgroup pair as before
@@ -1689,7 +1708,7 @@ def test_shipped_unit_rules_by_architecture():
             ), (grid, knobs)
             assert (
                 _select(p100, 16384, 270336, S=2, grid=grid, **knobs).scan_key
-                == "scan:wide:u2:s0:f0"
+                == "scan:wide:u2:s0:f0:lsf"
             ), (grid, knobs)
             assert (
                 _select(p100, 4096, 65536, grid=grid, **knobs).scan_key
@@ -1722,13 +1741,18 @@ def test_shipped_sample_shift_rule_by_architecture():
     for grid in (152, 148):
         for knobs in ({}, {"sample_tiles_max": 0}):
             for T, Tkv, S in rows:
+                # sample_class_rule [8, 500] (sm_103a / sm_100a): a sampled call of two or more segments on a wide-unit
+                # program shifts 500 permille, ahead of sample_shift_rule; sm_107a carries no class rule
+                cls = 500 if S >= 2 and not knobs else None
                 for K, shift in ((2048, 250), (4096, 375)):
                     where = (grid, knobs, T, Tkv, S, K)
                     c = _select(p103, T, Tkv, S=S, K=K, grid=grid, **knobs)
-                    assert c.sample_shift_permille == shift, where
+                    assert c.sample_shift_permille == (cls or shift), where
                     for p in (p100, p107):
                         c = _select(p, T, Tkv, S=S, K=K, grid=grid, **knobs)
-                        assert c.sample_shift_permille == 250, where
+                        assert c.sample_shift_permille == (
+                            cls if cls and p is p100 else 250
+                        ), where
                     forced = dict(knobs, sample_shift_permille=-500)
                     c = _select(p103, T, Tkv, S=S, K=K, grid=grid, **forced)
                     assert c.sample_shift_permille == -500, where
@@ -2739,12 +2763,19 @@ def test_prepared_runner_graph_capture_and_replay():
     _judge_ok((captured[0].clone(), captured[1].clone()), ref.select_reference(inputs))
 
 
+# the first 16 int64 of the ticket tail: the ticket word and its padding; the rest of the tail holds the
+# longest-first segment order, which every :lsf scan launch writes at its prologue before reading it
+_TICKET_WORD_BYTES = 8 * 16
+
+
 def _assert_ticket_tail_zero(runner) -> None:
     """The ticket word reads 0 after every completed run (every completed scan launch leaves it 0; a
     backend-owned tail is zeroed once at prepare, a caller-owned one again before every run); None
-    on the architectures without a tail."""
+    on the architectures without a tail.  The segment order behind it is not checked: an :lsf launch
+    leaves it written."""
     if runner.ticket_tail is not None:
-        assert not runner.ticket_tail.any(), runner.ticket_tail[:8].tolist()
+        words = runner.ticket_tail[:_TICKET_WORD_BYTES]
+        assert not words.any(), words[:8].tolist()
 
 
 def _prepare(inputs: ref.IndexerInputs, **extra):
@@ -2836,7 +2867,7 @@ def test_caller_owned_workspace_shared_by_two_geometries_keeps_every_run_exact()
     bytes_a = _workspace_bytes(inputs_a, device)
     bytes_b = _workspace_bytes(inputs_b, device)
     # B's candidate region covers A's tail
-    assert bytes_b > bytes_a + 128, (bytes_a, bytes_b)
+    assert bytes_b > bytes_a + cake_policy.TICKET_TAIL_BYTES, (bytes_a, bytes_b)
     expected_a = _cloned(_run(inputs_a))  # exclusive, backend-owned workspaces
     expected_b = _cloned(_run(inputs_b))
     shared = torch.empty(bytes_b, dtype=torch.uint8, device=device)
@@ -2846,7 +2877,8 @@ def test_caller_owned_workspace_shared_by_two_geometries_keeps_every_run_exact()
     tail_a = runner_a.ticket_tail
     assert (
         tail_a.data_ptr() >= shared.data_ptr()
-        and tail_a.data_ptr() + 128 <= shared.data_ptr() + bytes_b - 128
+        and tail_a.data_ptr() + cake_policy.TICKET_TAIL_BYTES
+        <= shared.data_ptr() + bytes_b - cake_policy.TICKET_TAIL_BYTES
     )  # A's tail lies inside B's candidate region
     for step, (runner, expected) in enumerate(
         [(runner_a, expected_a), (runner_b, expected_b)] * 2
@@ -2949,7 +2981,7 @@ def test_workspace_bound_is_respected():
     assert (
         nbytes
         == (plan.grid_ctas * plan.block_q * plan.cand_cap + plan.staging_entries) * 8
-        + 128
+        + cake_policy.TICKET_TAIL_BYTES
     )
     workspace = torch.empty(nbytes, dtype=torch.uint8, device=device)
     indices = torch.empty(
@@ -3173,3 +3205,40 @@ def test_policy_is_validated_once_per_architecture(monkeypatch):
     for _ in range(2):
         with pytest.raises(NotImplementedError, match="5676"):
             policy_for("sm_90a")
+
+
+def test_lsf_copy_runs_on_packed_calls_of_unequal_key_segments():
+    """Lever LSF (#7549): the ticket architectures ship the longest-first segment order copy of every scan program
+    (key suffix ``:lsf``, a program of its own); the host runs it on packed calls whose key segments are not all equal
+    and the program without it on one-segment calls and on packed calls of equal key segments
+    (``num_keys == S x max_seqlen_k``)."""
+    if not cake_jit.PROGRAM_KEYS:
+        pytest.skip("placeholder registry")
+    for arch, keys in cake_jit.PROGRAM_KEYS.items():
+        scan = {k for k in keys if k.startswith("scan:")}
+        copies = {k for k in scan if k.endswith(":lsf")}
+        ticket = arch in cake_jit.TICKET_TAIL_ARCHES
+        assert copies == ({k + ":lsf" for k in scan - copies} if ticket else set()), (
+            arch
+        )
+        assert all(keys[k] != keys[k[: -len(":lsf")]] for k in copies), arch
+        assert policy_for(arch).lsf_programs == ticket, arch
+    p = policy_for("sm_100a")
+    one = _select(p, 65536, 65536)
+    assert not one.lsf and not one.scan_key.endswith(":lsf")
+    equal = _select(p, 8 * 32768, 8 * 32768, S=8, max_seqlen_k=32768)
+    assert not equal.lsf and not equal.scan_key.endswith(":lsf")
+    unequal = _select(p, 8 * 32768, 8 * 32768, S=8, max_seqlen_k=65536)
+    assert unequal.lsf and unequal.scan_key == equal.scan_key + ":lsf"
+    assert unequal.scan_key == (
+        scan_key(
+            unequal.physical_kind,
+            unequal.tile_unroll,
+            unequal.snake,
+            unequal.sample_fit,
+            True,
+        )
+    )
+    assert _select(p, 8 * 32768, 8 * 32768, S=8).lsf  # no bound: the host cannot tell
+    off = DispatchPolicy.from_record(dict(p.record(), lsf_programs=False))
+    assert not _select(off, 8 * 32768, 8 * 32768, S=8, max_seqlen_k=65536).lsf

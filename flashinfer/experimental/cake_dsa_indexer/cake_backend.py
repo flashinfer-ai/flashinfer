@@ -736,7 +736,7 @@ class DSAIndexerRunner:
     workspace: torch.Tensor = field(default=None, repr=False)
     workspace_bytes: int = 0
     grid: tuple[int, int, int] = (1, 1, 1)
-    # the workspace's 128-byte ticket tail on the ticket architectures (``TICKET_TAIL_ARCHES``;
+    # the workspace's ticket tail on the ticket architectures (``TICKET_TAIL_ARCHES``;
     # None on sm_107a).  Invariant: the ticket word reads 0 when a scan launches.  Every scan
     # launch that completes leaves the word at 0 (the kernel's end-of-launch reset, which
     # kernel-tests check as the output ``ticket_word`` on every ticket-drawing config).
@@ -1010,7 +1010,7 @@ def prepare_dsa_indexer_topk(
     elif num_queries > 0:
         _padded_outputs(num_queries, int(top_k), device, t["Indices"], t["Scores"])
     # on sm_100a / sm_103a the scan program draws every work unit from the workspace's
-    # 128-byte tail (behind the candidate buffers and the staging).  Zeroed here once; every
+    # ticket tail (behind the candidate buffers and the staging).  Zeroed here once; every
     # completed scan launch resets the word to 0.  Backend-owned workspace: that is the only
     # memset, a run adds none.  Caller-owned ``workspace_buffer``: the buffer may be written
     # between runs by others (another runner's candidate region, any kernel it is lent to),
