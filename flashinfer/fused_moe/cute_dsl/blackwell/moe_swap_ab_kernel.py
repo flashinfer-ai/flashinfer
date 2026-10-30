@@ -78,7 +78,7 @@ from ..common.kernel_utils import (
     tanh_f32,
     vectorized_atomic_add_fp32x2,
 )
-from .custom_pipeline import PipelineUmmaAsync, producer_tail_all_stages
+from .custom_pipeline import PipelineUmmaAsync
 from .utils import (
     griddepcontrol_launch_dependents,
     griddepcontrol_wait,
@@ -2914,7 +2914,7 @@ class Sm100BlockScaledGroupedGemmKernel:
                             release_gpu()
                     griddepcontrol_launch_dependents()
                 # A single tail protects storage shared by both independent producers.
-                producer_tail_all_stages(operand_pipe, producer)
+                operand_pipe.producer_tail(producer.clone())
             elif warp == self.activation_warp:
                 if cutlass.const_expr(not self.gather_input):
                     producer = pipeline.make_pipeline_state(

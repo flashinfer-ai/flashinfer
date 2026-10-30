@@ -46,7 +46,6 @@
 from dataclasses import dataclass
 from typing import Optional
 
-import cutlass
 import cutlass.cute as cute
 from cutlass.cutlass_dsl import Boolean, if_generate
 from cutlass.pipeline import (
@@ -58,15 +57,6 @@ from cutlass.pipeline import (
     agent_sync,
 )
 from cutlass.pipeline.helpers import MbarrierArray
-
-
-@cute.jit
-def producer_tail_all_stages(pipe: PipelineAsync, state: PipelineState):
-    """Drain every empty barrier after an operand producer's final work tile."""
-    # Slots below the next write index belong to the preceding phase.
-    for stage in cutlass.range_constexpr(pipe.num_stages):
-        phase = state.phase ^ cutlass.Int32(stage < state.index)
-        pipe.sync_object_empty.wait(stage, phase)
 
 
 def pipeline_init_wait(cta_layout_vmnk: Optional[cute.Layout] = None):

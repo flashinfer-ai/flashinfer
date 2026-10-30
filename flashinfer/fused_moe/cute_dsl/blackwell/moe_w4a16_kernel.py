@@ -59,7 +59,6 @@ from flashinfer.tllm_enums import (
 )
 
 from ..moe_utils import validate_cute_dsl_moe_situ_config
-from .custom_pipeline import producer_tail_all_stages
 from .moe_w4a16_utils import decode_nvfp4_fragment_to_bf16
 from .utils import (
     blk_reduce_bf16,
@@ -1815,9 +1814,7 @@ class Sm100W4A16GroupedGemmKernel:
                         )
                         tile_info_pipeline.consumer_release(tile_info_consumer_state)
                         tile_info_consumer_state.advance()
-                    producer_tail_all_stages(
-                        b_load2mma_pipeline, b_load2mma_producer_state
-                    )
+                    b_load2mma_pipeline.producer_tail(b_load2mma_producer_state)
 
             # Static weight and scale loads can run before the activation is ready.
             if warp_idx == self.weight_tma_warp_id:
@@ -1920,9 +1917,7 @@ class Sm100W4A16GroupedGemmKernel:
                     tile_info_pipeline.consumer_release(tile_info_consumer_state)
                     tile_info_consumer_state.advance()
 
-                producer_tail_all_stages(
-                    a_load2trans_pipeline, a_load2trans_producer_state
-                )
+                a_load2trans_pipeline.producer_tail(a_load2trans_producer_state)
 
             # Specialized MMA warp
             if warp_idx == self.mma_warp_id:
@@ -2140,7 +2135,7 @@ class Sm100W4A16GroupedGemmKernel:
                 tile_info_pipeline.consumer_release(tile_info_consumer_state)
                 tile_info_consumer_state.advance()
             # Wait a_transform buffer empty
-            producer_tail_all_stages(trans2mma_pipeline, trans2mma_producer_state)
+            trans2mma_pipeline.producer_tail(trans2mma_producer_state)
 
         # Specialized epilogue warps
         elif warp_idx < self.mma_warp_id:
@@ -2868,7 +2863,7 @@ class Sm100W4A16GroupedGemmKernel:
                     )
                     tile_info_pipeline.consumer_release(info_state)
                     info_state.advance()
-                producer_tail_all_stages(b_load2mma_pipeline, producer)
+                b_load2mma_pipeline.producer_tail(producer)
 
         if cutlass.const_expr(
             self.enable_pdl and not self.fuse_activation and self.use_fused_finalize
