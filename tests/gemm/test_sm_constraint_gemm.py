@@ -4,7 +4,7 @@ from tests.test_helpers.parametrize import pairwise_product_cases, parametrize_p
 
 import flashinfer
 import flashinfer.triton
-from flashinfer.utils import get_compute_capability
+from flashinfer.utils import get_compute_capability, get_shared_bytes_per_block_optin
 
 
 def torch_gemm(a, b, c, alpha, beta):
@@ -17,6 +17,26 @@ def torch_addmm(a, b, c, alpha=1.0, beta=0.0):
     # Transpose b to match torch_gemm's matmul(a, b.T)
     C = torch.addmm(c, a, b.T, beta=beta, alpha=alpha)
     return C
+
+
+def skip_unless_shared_memory_fits(kernel, dtype):
+    # Shared memory Triton requests for the kernels' fixed 128x128x64, 3-stage
+    # tiles, measured on RTX PRO 6000 (SM120) and DGX Spark (SM121) with the
+    # CUDA 13.0 CI image: 96 KiB for 16-bit operands on the two non-TMA kernels,
+    # 128 KiB (naive) and 144 KiB (persistent) for float32, and 128 KiB for the
+    # TMA kernel, which also stages its 128x128 C tile. Those GPUs allow 99 KiB
+    # per block, like SM86 and SM89, so only the first fits there; skip the rest
+    # instead of failing with OutOfResources.
+    if dtype == torch.float32:
+        needed = 144 * 1024 if kernel == "persistent" else 128 * 1024
+    else:
+        needed = 128 * 1024 if kernel == "descriptor_persistent" else 96 * 1024
+    available = get_shared_bytes_per_block_optin(torch.device("cuda"))
+    if available < needed:
+        pytest.skip(
+            f"{kernel} with {dtype} needs {needed // 1024} KiB of shared memory, "
+            f"the GPU allows {available} bytes per block"
+        )
 
 
 @parametrize_product(
@@ -166,6 +186,7 @@ def test_sm_constraint_gemm_beta_zero_does_not_read_c(kernel, alpha, dtype):
     # single read turns the whole result into NaN.
     if kernel == "descriptor_persistent" and dtype == torch.float32:
         pytest.skip("descriptor persistent does not support float32")
+    skip_unless_shared_memory_fits(kernel, dtype)
 
     M = N = K = 256
     a = torch.randn((M, K), device="cuda", dtype=torch.float16).to(dtype)
@@ -206,6 +227,7 @@ def test_sm_constraint_gemm_beta_nonzero_reads_c(kernel, dtype):
     # in. alpha = 0 zeroes the product, so the result must be exactly beta * c.
     if kernel == "descriptor_persistent" and dtype == torch.float32:
         pytest.skip("descriptor persistent does not support float32")
+    skip_unless_shared_memory_fits(kernel, dtype)
 
     M = N = K = 256
     a = torch.randn((M, K), device="cuda", dtype=torch.float16).to(dtype)
