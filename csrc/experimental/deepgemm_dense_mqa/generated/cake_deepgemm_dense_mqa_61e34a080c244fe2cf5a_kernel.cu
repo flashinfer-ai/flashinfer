@@ -411,12 +411,12 @@ kernel_cake_deepgemm_dense_mqa_61e34a080c244fe2cf5a(const __grid_constant__ CUte
                 unsigned int start_v_1 = ((ks0_1 < ks1_1) ? ks0_1 : ks1_1);
                 unsigned int end_v_1 = ((ke0_1 > ke1_1) ? ke0_1 : ke1_1);
                 unsigned int aligned_start_1 = start_v_1 / 4 * 4;
-                unsigned int kv_start_0 = aligned_start_1;
+                unsigned int kv_start_2 = aligned_start_1;
                 unsigned int kv_end_1 = end_v_1;
-                unsigned int kv_span_1 = kv_end_1 - kv_start_0;
-                unsigned int num_kv_blocks_1_1 = (kv_span_1 + 256 - 1) / 256;
-                kv_start_1 = kv_start_0;
-                num_kv_blocks_1 = num_kv_blocks_1_1;
+                unsigned int kv_span_1 = kv_end_1 - kv_start_2;
+                unsigned int num_kv_blocks_0 = (kv_span_1 + 256 - 1) / 256;
+                kv_start_1 = kv_start_2;
+                num_kv_blocks_1 = num_kv_blocks_0;
                 #pragma unroll 1
                 for (unsigned int kv_iter = 0; kv_iter < num_kv_blocks_1; kv_iter++) {
                     int kv_row = kv_start_1 + kv_iter * 256;
@@ -453,7 +453,7 @@ kernel_cake_deepgemm_dense_mqa_61e34a080c244fe2cf5a(const __grid_constant__ CUte
             for (unsigned int q_block_idx_2 = first_q_0_2; q_block_idx_2 < mma_num_blocks; q_block_idx_2 += SM_COUNT) {
                 unsigned int scheduled_kv_start_2 = 0;
                 unsigned int scheduled_num_splits_2 = 1;
-                unsigned int kv_start_2 = scheduled_kv_start_2;
+                unsigned int kv_start_3 = scheduled_kv_start_2;
                 unsigned int num_kv_blocks_2 = scheduled_num_splits_2;
                 mbarrier_wait(q_full_addr + (mma_q_stage) * 8, _phase_q_full);
                 num_kv_blocks_2 = ts_words[mma_q_stage * 2 + 1];
@@ -587,7 +587,7 @@ kernel_cake_deepgemm_dense_mqa_61e34a080c244fe2cf5a(const __grid_constant__ CUte
                 mbarrier_wait(q_full_addr + (math_q_stage) * 8, _phase_q_full_1);
                 unsigned int q_start_2 = q_block_idx_3 * 2;
                 unsigned int ts_math_slot = math_q_stage * 2;
-                unsigned int kv_start_3 = ts_words[ts_math_slot];
+                unsigned int kv_start_4 = ts_words[ts_math_slot];
                 unsigned int num_kv_blocks_3 = ts_words[ts_math_slot + 1];
                 unsigned int dense_start[2];
                 unsigned int dense_end[2];
@@ -623,18 +623,18 @@ kernel_cake_deepgemm_dense_mqa_61e34a080c244fe2cf5a(const __grid_constant__ CUte
                     mbarrier_arrive(kv_empty_addr + (math_kv_stage) * 8);
                     math_kv_stage += 1;
                     if (math_kv_stage == 5) { math_kv_stage = 0; _phase_kv_full_1 ^= 1; }
-                    int kv_pos = kv_start_3 + kv_iter_2 * 256 + (unsigned int)math_thread_idx;
-                    float _tmem_load_0[64];
+                    int kv_pos = kv_start_4 + kv_iter_2 * 256 + (unsigned int)math_thread_idx;
+                    float tmem_load[64];
                     asm volatile(
                         "tcgen05.ld.sync.aligned.32x32b.x32.b32"
                         " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
-                        : "=f"(_tmem_load_0[0]), "=f"(_tmem_load_0[1]), "=f"(_tmem_load_0[2]), "=f"(_tmem_load_0[3]), "=f"(_tmem_load_0[4]), "=f"(_tmem_load_0[5]), "=f"(_tmem_load_0[6]), "=f"(_tmem_load_0[7]), "=f"(_tmem_load_0[8]), "=f"(_tmem_load_0[9]), "=f"(_tmem_load_0[10]), "=f"(_tmem_load_0[11]), "=f"(_tmem_load_0[12]), "=f"(_tmem_load_0[13]), "=f"(_tmem_load_0[14]), "=f"(_tmem_load_0[15]), "=f"(_tmem_load_0[16]), "=f"(_tmem_load_0[17]), "=f"(_tmem_load_0[18]), "=f"(_tmem_load_0[19]), "=f"(_tmem_load_0[20]), "=f"(_tmem_load_0[21]), "=f"(_tmem_load_0[22]), "=f"(_tmem_load_0[23]), "=f"(_tmem_load_0[24]), "=f"(_tmem_load_0[25]), "=f"(_tmem_load_0[26]), "=f"(_tmem_load_0[27]), "=f"(_tmem_load_0[28]), "=f"(_tmem_load_0[29]), "=f"(_tmem_load_0[30]), "=f"(_tmem_load_0[31])
+                        : "=f"(tmem_load[0]), "=f"(tmem_load[1]), "=f"(tmem_load[2]), "=f"(tmem_load[3]), "=f"(tmem_load[4]), "=f"(tmem_load[5]), "=f"(tmem_load[6]), "=f"(tmem_load[7]), "=f"(tmem_load[8]), "=f"(tmem_load[9]), "=f"(tmem_load[10]), "=f"(tmem_load[11]), "=f"(tmem_load[12]), "=f"(tmem_load[13]), "=f"(tmem_load[14]), "=f"(tmem_load[15]), "=f"(tmem_load[16]), "=f"(tmem_load[17]), "=f"(tmem_load[18]), "=f"(tmem_load[19]), "=f"(tmem_load[20]), "=f"(tmem_load[21]), "=f"(tmem_load[22]), "=f"(tmem_load[23]), "=f"(tmem_load[24]), "=f"(tmem_load[25]), "=f"(tmem_load[26]), "=f"(tmem_load[27]), "=f"(tmem_load[28]), "=f"(tmem_load[29]), "=f"(tmem_load[30]), "=f"(tmem_load[31])
                         : "r"(taddr + math_tmem_stage * 128 + (unsigned int)(warp % 4 * 32 << 16)));
                     asm volatile("tcgen05.wait::ld.sync.aligned;");
                     asm volatile(
                         "tcgen05.ld.sync.aligned.32x32b.x32.b32"
                         " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
-                        : "=f"(_tmem_load_0[32]), "=f"(_tmem_load_0[33]), "=f"(_tmem_load_0[34]), "=f"(_tmem_load_0[35]), "=f"(_tmem_load_0[36]), "=f"(_tmem_load_0[37]), "=f"(_tmem_load_0[38]), "=f"(_tmem_load_0[39]), "=f"(_tmem_load_0[40]), "=f"(_tmem_load_0[41]), "=f"(_tmem_load_0[42]), "=f"(_tmem_load_0[43]), "=f"(_tmem_load_0[44]), "=f"(_tmem_load_0[45]), "=f"(_tmem_load_0[46]), "=f"(_tmem_load_0[47]), "=f"(_tmem_load_0[48]), "=f"(_tmem_load_0[49]), "=f"(_tmem_load_0[50]), "=f"(_tmem_load_0[51]), "=f"(_tmem_load_0[52]), "=f"(_tmem_load_0[53]), "=f"(_tmem_load_0[54]), "=f"(_tmem_load_0[55]), "=f"(_tmem_load_0[56]), "=f"(_tmem_load_0[57]), "=f"(_tmem_load_0[58]), "=f"(_tmem_load_0[59]), "=f"(_tmem_load_0[60]), "=f"(_tmem_load_0[61]), "=f"(_tmem_load_0[62]), "=f"(_tmem_load_0[63])
+                        : "=f"(tmem_load[32]), "=f"(tmem_load[33]), "=f"(tmem_load[34]), "=f"(tmem_load[35]), "=f"(tmem_load[36]), "=f"(tmem_load[37]), "=f"(tmem_load[38]), "=f"(tmem_load[39]), "=f"(tmem_load[40]), "=f"(tmem_load[41]), "=f"(tmem_load[42]), "=f"(tmem_load[43]), "=f"(tmem_load[44]), "=f"(tmem_load[45]), "=f"(tmem_load[46]), "=f"(tmem_load[47]), "=f"(tmem_load[48]), "=f"(tmem_load[49]), "=f"(tmem_load[50]), "=f"(tmem_load[51]), "=f"(tmem_load[52]), "=f"(tmem_load[53]), "=f"(tmem_load[54]), "=f"(tmem_load[55]), "=f"(tmem_load[56]), "=f"(tmem_load[57]), "=f"(tmem_load[58]), "=f"(tmem_load[59]), "=f"(tmem_load[60]), "=f"(tmem_load[61]), "=f"(tmem_load[62]), "=f"(tmem_load[63])
                         : "r"(taddr + math_tmem_stage * 128 + (unsigned int)(warp % 4 * 32 << 16) + 32));
                     asm volatile("tcgen05.wait::ld.sync.aligned;");
                     float2 sum0 = make_float2(0.0f, 0.0f);
@@ -647,14 +647,14 @@ kernel_cake_deepgemm_dense_mqa_61e34a080c244fe2cf5a(const __grid_constant__ CUte
                             "add.rn.f32x2 _pr, _pr, _pa;\n\t"
                             "mov.b64 _pb, {%3, %4};\n\t"
                             "fma.rn.f32x2 %0, _pr, _pb, %0;\n\t}"
-                            : "+l"(*(unsigned long long*)&sum0) : "f"(_tmem_load_0[j]), "f"(_tmem_load_0[j + 1]), "f"(weights_reg[j]), "f"(weights_reg[j + 1]));
+                            : "+l"(*(unsigned long long*)&sum0) : "f"(tmem_load[j]), "f"(tmem_load[j + 1]), "f"(weights_reg[j]), "f"(weights_reg[j + 1]));
                         asm("{\n\t.reg .f32 _ab0, _ab1;\n\t.reg .b64 _pr, _pa, _pb;\n\t"
                             "abs.f32 _ab0, %1;\n\tabs.f32 _ab1, %2;\n\t"
                             "mov.b64 _pr, {%1, %2};\n\tmov.b64 _pa, {_ab0, _ab1};\n\t"
                             "add.rn.f32x2 _pr, _pr, _pa;\n\t"
                             "mov.b64 _pb, {%3, %4};\n\t"
                             "fma.rn.f32x2 %0, _pr, _pb, %0;\n\t}"
-                            : "+l"(*(unsigned long long*)&sum1) : "f"(_tmem_load_0[j + 2]), "f"(_tmem_load_0[j + 3]), "f"(weights_reg[j + 2]), "f"(weights_reg[j + 3]));
+                            : "+l"(*(unsigned long long*)&sum1) : "f"(tmem_load[j + 2]), "f"(tmem_load[j + 3]), "f"(weights_reg[j + 2]), "f"(weights_reg[j + 3]));
                     }
                     float2 total = add_f32x2_noftz(sum0, sum1);
                     float relu_wsum = (total.x + total.y) * 0.5f;
@@ -672,23 +672,23 @@ kernel_cake_deepgemm_dense_mqa_61e34a080c244fe2cf5a(const __grid_constant__ CUte
                             }
                         }
                     }
-                    float _tmem_load_1[64];
+                    float tmem_load_1[64];
                     asm volatile(
                         "tcgen05.ld.sync.aligned.32x32b.x32.b32"
                         " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
-                        : "=f"(_tmem_load_1[0]), "=f"(_tmem_load_1[1]), "=f"(_tmem_load_1[2]), "=f"(_tmem_load_1[3]), "=f"(_tmem_load_1[4]), "=f"(_tmem_load_1[5]), "=f"(_tmem_load_1[6]), "=f"(_tmem_load_1[7]), "=f"(_tmem_load_1[8]), "=f"(_tmem_load_1[9]), "=f"(_tmem_load_1[10]), "=f"(_tmem_load_1[11]), "=f"(_tmem_load_1[12]), "=f"(_tmem_load_1[13]), "=f"(_tmem_load_1[14]), "=f"(_tmem_load_1[15]), "=f"(_tmem_load_1[16]), "=f"(_tmem_load_1[17]), "=f"(_tmem_load_1[18]), "=f"(_tmem_load_1[19]), "=f"(_tmem_load_1[20]), "=f"(_tmem_load_1[21]), "=f"(_tmem_load_1[22]), "=f"(_tmem_load_1[23]), "=f"(_tmem_load_1[24]), "=f"(_tmem_load_1[25]), "=f"(_tmem_load_1[26]), "=f"(_tmem_load_1[27]), "=f"(_tmem_load_1[28]), "=f"(_tmem_load_1[29]), "=f"(_tmem_load_1[30]), "=f"(_tmem_load_1[31])
+                        : "=f"(tmem_load_1[0]), "=f"(tmem_load_1[1]), "=f"(tmem_load_1[2]), "=f"(tmem_load_1[3]), "=f"(tmem_load_1[4]), "=f"(tmem_load_1[5]), "=f"(tmem_load_1[6]), "=f"(tmem_load_1[7]), "=f"(tmem_load_1[8]), "=f"(tmem_load_1[9]), "=f"(tmem_load_1[10]), "=f"(tmem_load_1[11]), "=f"(tmem_load_1[12]), "=f"(tmem_load_1[13]), "=f"(tmem_load_1[14]), "=f"(tmem_load_1[15]), "=f"(tmem_load_1[16]), "=f"(tmem_load_1[17]), "=f"(tmem_load_1[18]), "=f"(tmem_load_1[19]), "=f"(tmem_load_1[20]), "=f"(tmem_load_1[21]), "=f"(tmem_load_1[22]), "=f"(tmem_load_1[23]), "=f"(tmem_load_1[24]), "=f"(tmem_load_1[25]), "=f"(tmem_load_1[26]), "=f"(tmem_load_1[27]), "=f"(tmem_load_1[28]), "=f"(tmem_load_1[29]), "=f"(tmem_load_1[30]), "=f"(tmem_load_1[31])
                         : "r"(taddr + math_tmem_stage * 128 + 64 + (unsigned int)(warp % 4 * 32 << 16)));
                     asm volatile("tcgen05.wait::ld.sync.aligned;");
                     asm volatile(
                         "tcgen05.ld.sync.aligned.32x32b.x32.b32"
                         " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
-                        : "=f"(_tmem_load_1[32]), "=f"(_tmem_load_1[33]), "=f"(_tmem_load_1[34]), "=f"(_tmem_load_1[35]), "=f"(_tmem_load_1[36]), "=f"(_tmem_load_1[37]), "=f"(_tmem_load_1[38]), "=f"(_tmem_load_1[39]), "=f"(_tmem_load_1[40]), "=f"(_tmem_load_1[41]), "=f"(_tmem_load_1[42]), "=f"(_tmem_load_1[43]), "=f"(_tmem_load_1[44]), "=f"(_tmem_load_1[45]), "=f"(_tmem_load_1[46]), "=f"(_tmem_load_1[47]), "=f"(_tmem_load_1[48]), "=f"(_tmem_load_1[49]), "=f"(_tmem_load_1[50]), "=f"(_tmem_load_1[51]), "=f"(_tmem_load_1[52]), "=f"(_tmem_load_1[53]), "=f"(_tmem_load_1[54]), "=f"(_tmem_load_1[55]), "=f"(_tmem_load_1[56]), "=f"(_tmem_load_1[57]), "=f"(_tmem_load_1[58]), "=f"(_tmem_load_1[59]), "=f"(_tmem_load_1[60]), "=f"(_tmem_load_1[61]), "=f"(_tmem_load_1[62]), "=f"(_tmem_load_1[63])
+                        : "=f"(tmem_load_1[32]), "=f"(tmem_load_1[33]), "=f"(tmem_load_1[34]), "=f"(tmem_load_1[35]), "=f"(tmem_load_1[36]), "=f"(tmem_load_1[37]), "=f"(tmem_load_1[38]), "=f"(tmem_load_1[39]), "=f"(tmem_load_1[40]), "=f"(tmem_load_1[41]), "=f"(tmem_load_1[42]), "=f"(tmem_load_1[43]), "=f"(tmem_load_1[44]), "=f"(tmem_load_1[45]), "=f"(tmem_load_1[46]), "=f"(tmem_load_1[47]), "=f"(tmem_load_1[48]), "=f"(tmem_load_1[49]), "=f"(tmem_load_1[50]), "=f"(tmem_load_1[51]), "=f"(tmem_load_1[52]), "=f"(tmem_load_1[53]), "=f"(tmem_load_1[54]), "=f"(tmem_load_1[55]), "=f"(tmem_load_1[56]), "=f"(tmem_load_1[57]), "=f"(tmem_load_1[58]), "=f"(tmem_load_1[59]), "=f"(tmem_load_1[60]), "=f"(tmem_load_1[61]), "=f"(tmem_load_1[62]), "=f"(tmem_load_1[63])
                         : "r"(taddr + math_tmem_stage * 128 + 64 + (unsigned int)(warp % 4 * 32 << 16) + 32));
                     asm volatile("tcgen05.wait::ld.sync.aligned;");
                     asm volatile("tcgen05.fence::before_thread_sync;");
                     mbarrier_arrive(umma_empty_addr + (math_tmem_stage) * 8);
                     float2 sum0_0 = make_float2(0.0f, 0.0f);
-                    float2 sum1_1 = make_float2(0.0f, 0.0f);
+                    float2 sum1_0 = make_float2(0.0f, 0.0f);
                     #pragma unroll
                     for (int j_1 = 0; j_1 < 64; j_1 += 4) {
                         asm("{\n\t.reg .f32 _ab0, _ab1;\n\t.reg .b64 _pr, _pa, _pb;\n\t"
@@ -697,19 +697,19 @@ kernel_cake_deepgemm_dense_mqa_61e34a080c244fe2cf5a(const __grid_constant__ CUte
                             "add.rn.f32x2 _pr, _pr, _pa;\n\t"
                             "mov.b64 _pb, {%3, %4};\n\t"
                             "fma.rn.f32x2 %0, _pr, _pb, %0;\n\t}"
-                            : "+l"(*(unsigned long long*)&sum0_0) : "f"(_tmem_load_1[j_1]), "f"(_tmem_load_1[j_1 + 1]), "f"(weights_reg[64 + j_1]), "f"(weights_reg[64 + j_1 + 1]));
+                            : "+l"(*(unsigned long long*)&sum0_0) : "f"(tmem_load_1[j_1]), "f"(tmem_load_1[j_1 + 1]), "f"(weights_reg[64 + j_1]), "f"(weights_reg[64 + j_1 + 1]));
                         asm("{\n\t.reg .f32 _ab0, _ab1;\n\t.reg .b64 _pr, _pa, _pb;\n\t"
                             "abs.f32 _ab0, %1;\n\tabs.f32 _ab1, %2;\n\t"
                             "mov.b64 _pr, {%1, %2};\n\tmov.b64 _pa, {_ab0, _ab1};\n\t"
                             "add.rn.f32x2 _pr, _pr, _pa;\n\t"
                             "mov.b64 _pb, {%3, %4};\n\t"
                             "fma.rn.f32x2 %0, _pr, _pb, %0;\n\t}"
-                            : "+l"(*(unsigned long long*)&sum1_1) : "f"(_tmem_load_1[j_1 + 2]), "f"(_tmem_load_1[j_1 + 3]), "f"(weights_reg[64 + j_1 + 2]), "f"(weights_reg[64 + j_1 + 3]));
+                            : "+l"(*(unsigned long long*)&sum1_0) : "f"(tmem_load_1[j_1 + 2]), "f"(tmem_load_1[j_1 + 3]), "f"(weights_reg[64 + j_1 + 2]), "f"(weights_reg[64 + j_1 + 3]));
                     }
-                    float2 total_2 = add_f32x2_noftz(sum0_0, sum1_1);
-                    float relu_wsum_3 = (total_2.x + total_2.y) * 0.5f;
+                    float2 total_0 = add_f32x2_noftz(sum0_0, sum1_0);
+                    float relu_wsum_0 = (total_0.x + total_0.y) * 0.5f;
                     int q_row_4 = q_start_2 + 1;
-                    float in_range_result_5 = scale_kv * relu_wsum_3;
+                    float in_range_result_5 = scale_kv * relu_wsum_0;
                     {
                         float materialized_result_1 = in_range_result_5;
                         int q_rel_1 = (unsigned int)q_row_4 - q_start_2;

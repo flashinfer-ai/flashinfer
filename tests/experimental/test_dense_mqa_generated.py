@@ -1235,9 +1235,20 @@ def _bucket_window(window, queries, keys):
     return starts.to(torch.int32), ends.to(torch.int32)
 
 
+# Per route of the shipped catalog that carries a stage bucket: the query counts the bucket test runs on it. Each
+# count names that route at the route's smallest served K, at a bucket's ``kv_max`` and at ``kv_max + 1`` on every
+# architecture the route has a bucket on; a route with a bucket that this table does not list fails the test.
+_BUCKET_QUERIES = {
+    "fp8:h64:full:qle2048:kvsplit": (66, 128, 302, 1024),
+    "fp8:h64:partial:qle128:kvsplit": (3, 37, 63),
+}
+
+
 @pytest.mark.parametrize("window", ["full", "causal", "multiseq2"])
 @pytest.mark.parametrize("side", ["low", "kv_max", "kv_max+1"])
-@pytest.mark.parametrize("queries", [66, 128, 302, 1024])
+@pytest.mark.parametrize(
+    "queries", sorted({q for counts in _BUCKET_QUERIES.values() for q in counts})
+)
 def test_dense_stage_bucket_program_is_bitwise_to_the_default(
     queries, side, window, monkeypatch
 ):
@@ -1245,7 +1256,8 @@ def test_dense_stage_bucket_program_is_bitwise_to_the_default(
     catalog's plan launches the bucket's programs for ``K <= kv_max`` and the route's own above; the bucket's
     programs forced over every K and the route's own (the bucket removed) compute bitwise-identical in-window
     logits and ScheduleMeta words, each arm on caller-owned output and metadata poisoned differently, at the
-    route's smallest served K, at ``kv_max`` and at ``kv_max + 1``."""
+    route's smallest served K, at ``kv_max`` and at ``kv_max + 1`` -- on every route :data:`_BUCKET_QUERIES` lists
+    the query count for."""
     _skip_unless_exported()
     arch = _runtime.device_arch(torch.device("cuda"))
     shipped = _runtime._catalog()
@@ -1256,10 +1268,18 @@ def test_dense_stage_bucket_program_is_bitwise_to_the_default(
     ]
     if not pairs:
         pytest.skip(f"no stage bucket on {arch}")
+    assert {route for route, _entry in pairs} <= set(_BUCKET_QUERIES), pairs
+    listed = {route for route, _entry in pairs if queries in _BUCKET_QUERIES[route]}
+    if not listed:
+        pytest.skip(
+            f"Q = {queries} is listed for no route with a stage bucket on {arch}"
+        )
     sms = _runtime.device_facts(torch.cuda.current_device())[1]
     gate = shipped["policy"]["dense_kvsplit"]
-    checked = 0
+    checked = set()
     for route, entry in pairs:
+        if route not in listed:
+            continue
         record = shipped["routes"][route]
         heads, bq = int(record["num_heads"]), int(record["block_q"])
         bound = int(entry["kv_max"])
@@ -1270,8 +1290,8 @@ def test_dense_stage_bucket_program_is_bitwise_to_the_default(
             else gate["fullgrid_min_kv"]
         )
         keys = {"low": low, "kv_max": bound, "kv_max+1": bound + 1}[side]
-        if _runtime.served_route("fp8", queries, keys, heads, arch=arch) != route:
-            continue
+        served_route = _runtime.served_route("fp8", queries, keys, heads, arch=arch)
+        assert served_route == route, (route, queries, keys, served_route)
         assert record["clean_logits"] == "raw", route
         bucket = [program for _stage, program in entry["stages"]]
         default = [_runtime.stage_program(stage, arch) for stage in record["stages"]]
@@ -1340,8 +1360,8 @@ def test_dense_stage_bucket_program_is_bitwise_to_the_default(
         span = (3 * sms + 1) // 2 * 2
         assert torch.equal(forced_meta[: 3 * sms], plain_meta[: 3 * sms]), route
         assert torch.equal(forced_meta[span:], plain_meta[span:]), route
-        checked += 1
-    assert checked >= 1, (queries, side, window)
+        checked.add(route)
+    assert checked == listed, (queries, side, window, checked, listed)
 
 
 _LADDER = re.compile(
@@ -1529,6 +1549,7 @@ _CALL_KEYS = ("arg_plan", "compile_flags", "ffi_entry", "kind", "role", "standal
 _ROUTE_KEYS = ("num_heads", "block_q", "clean_logits", "kv_min", "kv_alignment")
 _BUCKET_ROUTE = "fp8:h64:full:qle2048:kvsplit"
 _BUCKET_TWIN = "fp8:h64:partial:qle2048:kvsplit"
+_SELF_BUCKET_ROUTE = "fp8:h64:partial:qle128:kvsplit"
 
 
 def test_dense_stage_buckets_split_a_route_by_kv_length(monkeypatch):
@@ -1541,6 +1562,12 @@ def test_dense_stage_buckets_split_a_route_by_kv_length(monkeypatch):
     route falls back to a route without buckets."""
     catalog = _runtime._catalog()
     routes, programs, arches = catalog["routes"], catalog["programs"], catalog["arches"]
+    staged = {
+        p
+        for rec in routes.values()
+        for stage in rec["stages"]
+        for p in _runtime.stage_programs(stage, arches).values()
+    }
     seen = 0
     for r, rec in routes.items():
         buckets = rec.get("stage_buckets")
@@ -1550,7 +1577,8 @@ def test_dense_stage_buckets_split_a_route_by_kv_length(monkeypatch):
                     assert _runtime.route_stages(rec, a, k) is rec["stages"], (r, a, k)
             continue
         seen += 1
-        assert r.endswith(":kvsplit") and ":full:" in r, r
+        assert r.endswith(":kvsplit") and (":full:" in r or ":partial:" in r), r
+        # a full-kind route's bucket names its partial-kind twin's program; a partial-kind route's, one of its own
         h = r.replace(":full:", ":partial:")
         assert h in routes, r
         assert all(rec[k] == routes[h][k] for k in _ROUTE_KEYS), r
@@ -1576,7 +1604,10 @@ def test_dense_stage_buckets_split_a_route_by_kv_length(monkeypatch):
                     default = _runtime.stage_program(rec["stages"][n], a)
                     twin_p = _runtime.stage_program(routes[h]["stages"][n], a)
                     assert isinstance(p, str), (r, a, p)
-                    assert p == twin_p, (r, a, p)
+                    if h != r:
+                        assert p == twin_p, (r, a, p)
+                    else:
+                        assert p not in staged, (r, a, p)
                     assert p != default and p in programs, (r, a, p)
                     assert a in programs[p]["arches"], (r, a, p)
                     assert all(
@@ -1621,6 +1652,30 @@ def test_dense_stage_buckets_split_a_route_by_kv_length(monkeypatch):
             assert selected == [default_100], (queries, keys)
     assert _runtime.program_names(_BUCKET_ROUTE, "sm_103a") == [default_103, twin]
     assert _runtime.program_names(_BUCKET_ROUTE, "sm_100a") == [default_100]
+
+    # the shipped partial-kind bucket: K <= 8192 of the qle128 KV-split route on sm_100a launches its own program
+    rec = routes[_SELF_BUCKET_ROUTE]
+    default_100 = _runtime.stage_program(rec["stages"][0], "sm_100a")
+    default_103 = _runtime.stage_program(rec["stages"][0], "sm_103a")
+    (own,) = [p for _s, p in rec["stage_buckets"]["sm_100a"][0]["stages"]]
+    assert rec["stage_buckets"] == {
+        "sm_100a": [{"kv_max": 8192, "stages": [["logits", own]]}]
+    }
+    for queries in (3, 37, 63):
+        for keys in (257, 4137, 8192, 8193, 131114):
+            for arch, expected in (
+                ("sm_100a", [own] if keys <= 8192 else [default_100]),
+                ("sm_103a", [default_103]),
+            ):
+                route = _runtime.served_route("fp8", queries, keys, 64, arch=arch)
+                assert route == _SELF_BUCKET_ROUTE, (queries, keys, arch, route)
+                selected = [
+                    _runtime.stage_program(stage, arch)
+                    for stage in _runtime.route_stages(rec, arch, keys)
+                ]
+                assert selected == expected, (queries, keys, arch)
+    assert _runtime.program_names(_SELF_BUCKET_ROUTE, "sm_100a") == [default_100, own]
+    assert _runtime.program_names(_SELF_BUCKET_ROUTE, "sm_103a") == [default_103]
 
     # a withheld route falls back to a grid-stride route, which carries no bucket
     withheld = copy.deepcopy(catalog)
