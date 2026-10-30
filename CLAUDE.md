@@ -246,8 +246,9 @@ or torchrun worker; launcher exit 1 alone is not evidence of an assertion failur
 All local worker ranks must finish, and at least one test must execute, to allow
 publication. A completed run with assertion failures remains eligible, while
 crashes, timeouts, and unfinished invocations do not. With the variable unset,
-reporting is disabled. The CPU suite above covers this contract without GPU
-dependencies.
+reporting is disabled. Missing JUnit output and file timeouts still fail the
+wrapper when reporting is disabled. The CPU suite above covers this contract
+without GPU dependencies.
 
 ### Skipping Tests Based on CUDA Architecture
 
