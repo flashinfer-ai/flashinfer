@@ -14,6 +14,9 @@
 
 from .attn_scores import (
     fp8_paged_mqa_logits,
+    fp8_ue8m0_paged_mqa_logits_decode,
+    fp8_ue8m0_paged_mqa_logits_prefill,
+    plan_fp8_ue8m0_paged_mqa_logits_prefill,
     fp4_paged_mqa_logits,
     compute_paged_mqa_logits_schedule,
     min_block_table_width,
@@ -23,6 +26,9 @@ from .attn_scores import (
 
 __all__ = [
     "fp8_paged_mqa_logits",
+    "fp8_ue8m0_paged_mqa_logits_decode",
+    "fp8_ue8m0_paged_mqa_logits_prefill",
+    "plan_fp8_ue8m0_paged_mqa_logits_prefill",
     "fp4_paged_mqa_logits",
     "compute_paged_mqa_logits_schedule",
     "min_block_table_width",
