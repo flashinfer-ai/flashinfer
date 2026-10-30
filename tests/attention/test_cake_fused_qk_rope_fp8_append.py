@@ -436,8 +436,8 @@ def test_prefill_chunks_cross_pages(heads, qk_norm_policy, quant_policy):
 @pytest.mark.parametrize("quant_policy", [1, 2])
 def test_long_prefill_of_few_requests(heads, quant_policy):
     """Prefill of four requests beyond four waves of row CTAs: the persistent
-    build on B300 and B200 (its CTAs stride over the request and row items),
-    another stage elsewhere; every stage writes the reference's bytes."""
+    build on B200, B300 and GB300 (its CTAs stride over the request and row
+    items), another stage elsewhere; every stage writes the reference's bytes."""
     _skip_unless_supported()
     hq, hkv = heads
     case = make_case(
@@ -465,9 +465,7 @@ def test_long_prefill_of_few_requests(heads, quant_policy):
         has_out_kv=False,
         quant_policy=quant_policy,
     )
-    persistent = arch == "sm_100a" or (
-        arch == "sm_103a" and num_sms != loader.STAGE_POLICY["constants"]["gb300_sms"]
-    )
+    persistent = arch in ("sm_100a", "sm_103a")
     assert (stage == "fp8_e4m3_min_blocks10_persistent1") == persistent, stage
     run_and_compare(case)
 
@@ -1306,8 +1304,10 @@ _POLICY_TABLE: dict[tuple[str, int, int, int, int, int, int, bool, int, bool], s
     ): "fp8_e4m3_min_blocks9_early_rt21_page_prefetch1_clear_tie1",
     ("sm_103a", 64, 8, 128, 8, 64, 152, True, 33, False): "fp8_e4m3_grid_order2",
     # B300 and B200 prefill of one to sixteen requests beyond four waves: the
-    # persistent build; GB300 keeps the clear-first order, and B300 / B200 keep
-    # ten CTAs per SM below four waves or above sixteen requests
+    # persistent build, and on GB300 when the requests average at least 64 rows;
+    # B300 / B200 keep ten CTAs per SM below four waves or above sixteen
+    # requests, GB300 the swapped order for shorter requests, fewer waves or
+    # more requests
     (
         "sm_103a",
         64,
@@ -1332,7 +1332,33 @@ _POLICY_TABLE: dict[tuple[str, int, int, int, int, int, int, bool, int, bool], s
         48,
         False,
     ): "fp8_e4m3_min_blocks10_persistent1",
-    ("sm_103a", 64, 8, 1024, 1, 64, 152, True, 48, False): "fp8_e4m3_grid_order3",
+    (
+        "sm_103a",
+        64,
+        8,
+        1024,
+        1,
+        64,
+        152,
+        True,
+        48,
+        False,
+    ): "fp8_e4m3_min_blocks10_persistent1",
+    (
+        "sm_103a",
+        8,
+        1,
+        8192,
+        16,
+        64,
+        152,
+        True,
+        48,
+        False,
+    ): "fp8_e4m3_min_blocks10_persistent1",
+    ("sm_103a", 64, 8, 768, 16, 64, 152, True, 48, False): "fp8_e4m3_grid_order2",
+    ("sm_103a", 64, 8, 580, 4, 64, 152, True, 48, False): "fp8_e4m3_grid_order2",
+    ("sm_103a", 64, 8, 960, 24, 64, 152, True, 48, False): "fp8_e4m3_grid_order2",
     (
         "sm_100a",
         64,
