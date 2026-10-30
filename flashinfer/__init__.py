@@ -159,6 +159,7 @@ _PRIMS_TS_LAZY_EXPORTS = frozenset(
         "prims_ts_fp4_block_scale_moe",
         "prims_ts_fp4_block_scale_moe_partitioned",
         "prims_ts_fp4_block_scale_routed_moe",
+        "prims_ts_fp4_block_scale_routed_moe_precompile",
         "prims_ts_fp8_block_scale_moe",
         "prims_ts_fp8_block_scale_moe_partitioned",
         "prims_ts_fp8_block_scale_routed_moe",
