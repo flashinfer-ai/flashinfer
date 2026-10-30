@@ -120,4 +120,23 @@ def convert_e4m3_fragment(
     return cute.TensorSSA(result_vector, (count,), mma_dtype)
 
 
-__all__ = ["convert_e4m3_fragment"]
+@dsl_user_op
+def global_timer_lo(tag: int, *, loc=None, ip=None) -> cutlass.Int32:
+    """Low 32 bits of ``%globaltimer`` (nanoseconds); debug-mode timelines only.
+    ``tag`` is unused by the asm: it makes every call site a distinct op (a no-argument
+    user op is reused across call sites, and a value then escapes its region)."""
+    val = llvm.inline_asm(
+        Uint32.mlir_type,
+        [],
+        "{ .reg .u64 t; mov.u64 t, %globaltimer; cvt.u32.u64 $0, t; }",
+        "=r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return cutlass.Int32(val)
+
+
+__all__ = ["convert_e4m3_fragment", "global_timer_lo"]

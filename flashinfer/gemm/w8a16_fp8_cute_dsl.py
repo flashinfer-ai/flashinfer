@@ -256,7 +256,7 @@ def w8a16_fp8_gemm_cute_dsl(
     """Blackwell W8A16 GEMM in CuTe-DSL.  ``algo`` as the C++ op's codes (0 = the
     dispatcher's choice); split-K and stream-K codes are not implemented yet and
     fall back to the plain 256x128 tile.  ``debug_buffer``: an Int32 tensor of at
-    least 16 * 4096 entries (pinned host memory to watch a hang) that the kernel's
+    least 32 * 4096 entries (pinned host memory to watch a hang) that the kernel's
     debug build writes its per-CTA progress into; None = the production build."""
     import cutlass
     import cutlass.cute as cute
