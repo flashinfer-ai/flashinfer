@@ -14,8 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 The CP = 1 local path of the Cake packed GDN training package
-(``flashinfer.gdn_train`` with a one-rank context) against the exact FP64
-reference of ``tests/test_helpers/cake_gdn_train_reference.py``.
+(``flashinfer.cake_gdn_det_train_kcp`` with a one-rank context) against the exact FP64
+reference of ``tests/test_helpers/cake_gdn_det_train_kcp_reference.py``.
 
 Covered here: the six outputs ``out, dq, dk, dv, dbeta, dg`` on ragged packs
 of the normal gate regime (natural-log gates down to the -42 class; zero
@@ -26,8 +26,8 @@ evidence), the six head pairs (16, 48), (8, 24), (4, 12),
 QKV strided view against the contiguous input, and the explicit forward /
 backward entries against autograd (output order ``dq, dk, dv, dbeta, dg``,
 saved-context against replay).  The multi-rank rows, the bitwise contracts and
-the runtime contracts live in ``test_cake_gdn_train_kcp_dist.py``; the CPU plan,
-table and byte-query tests in ``test_cake_gdn_train_kcp.py``.
+the runtime contracts live in ``test_cake_gdn_det_train_kcp_dist.py``; the CPU plan,
+table and byte-query tests in ``test_cake_gdn_det_train_kcp.py``.
 """
 
 from __future__ import annotations
@@ -35,7 +35,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from tests.test_helpers.cake_gdn_train_reference import (
+from tests.test_helpers.cake_gdn_det_train_kcp_reference import (
     BLOCK,
     D,
     GRAD_NAMES,
@@ -49,8 +49,8 @@ from tests.test_helpers.cake_gdn_train_reference import (
 )
 
 gdn_api = pytest.importorskip(
-    "flashinfer.gdn_train",
-    reason="the cake_gdn_train facade is not part of this tree",
+    "flashinfer.cake_gdn_det_train_kcp",
+    reason="the flashinfer.cake_gdn_det_train_kcp facade is not part of this tree",
 )
 
 # Accuracy gate, declared before the first run: every output elementwise within
@@ -135,8 +135,7 @@ def _device_or_skip() -> torch.device:
     if not torch.cuda.is_available():
         pytest.skip("CUDA device required")
     index = torch.cuda.current_device()
-    supported = getattr(gdn_api, "is_gdn_train_supported", None)
-    if supported is not None and not supported(index):
+    if not gdn_api.is_gdn_det_train_kcp_supported(index):
         pytest.skip("the package does not support this device")
     return torch.device("cuda", index)
 
@@ -148,16 +147,16 @@ def device() -> torch.device:
 
 def _local_context(cu: list[int], device: torch.device):
     """The one-rank context of the local path (the public entry names; group None = single process)."""
-    part = gdn_api.kcp_partition(
+    part = gdn_api.partition_det_kcp(
         torch.tensor(cu, dtype=torch.int64), 1, layout="contiguous"
     )
-    return gdn_api.build_kcp_context(part, None, 0, device)
+    return gdn_api.build_context_det_kcp(part, None, 0, device)
 
 
 def _run_fwd_bwd(inputs: dict, ctx, device: torch.device) -> dict:
     """Autograd forward + backward of the local path; the results keyed by tensor name (no batch axis)."""
     leaves = [inputs[n].to(device).detach().requires_grad_(True) for n in OPERANDS]
-    out = gdn_api.chunk_gdn_kcp(*leaves, ctx)
+    out = gdn_api.chunk_gdn_det_kcp(*leaves, ctx)
     grads = torch.autograd.grad(out, leaves, inputs["dout"].to(device))
     res = {"out": out.detach()[0]}
     res.update({n: gr.detach()[0] for n, gr in zip(GRAD_NAMES, grads, strict=True)})
@@ -260,8 +259,8 @@ def test_explicit_entries_match_autograd_and_keep_the_output_order(device) -> No
     ctx = _local_context(cu, device)
     ops = [inputs[n].to(device) for n in OPERANDS]
     dout = inputs["dout"].to(device)
-    out, saved = gdn_api.chunk_gdn_kcp_fwd(*ops, ctx, save_for_backward=True)
-    grads = gdn_api.chunk_gdn_kcp_bwd(*ops, ctx, dout, saved=saved)
+    out, saved = gdn_api.chunk_gdn_det_fwd_kcp(*ops, ctx, save_for_backward=True)
+    grads = gdn_api.chunk_gdn_det_bwd_kcp(*ops, ctx, dout, saved=saved)
     assert len(grads) == len(EXPLICIT_GRAD_ORDER)
     auto = _run_fwd_bwd(inputs, ctx, device)
     assert torch.equal(out[0], auto["out"])
@@ -270,7 +269,7 @@ def test_explicit_entries_match_autograd_and_keep_the_output_order(device) -> No
         assert torch.equal(t[0], auto[n]), (
             f"{n} differs between the explicit entry and autograd"
         )
-    replay = gdn_api.chunk_gdn_kcp_bwd(*ops, ctx, dout, saved=None)
+    replay = gdn_api.chunk_gdn_det_bwd_kcp(*ops, ctx, dout, saved=None)
     for n, t_saved, t_replay in zip(EXPLICIT_GRAD_ORDER, grads, replay, strict=True):
         assert torch.equal(t_saved, t_replay), (
             f"{n}: saved-context and replay backward differ"
@@ -287,21 +286,23 @@ ISSUE_CU = [
 
 
 def test_context_preparation_does_not_synchronize(device) -> None:
-    """``kcp_partition`` + ``build_kcp_context`` + ``prepare`` of a new layout make no synchronizing CUDA call (the
+    """``partition_det_kcp`` + ``build_context_det_kcp`` + ``prepare`` of a new layout make no synchronizing CUDA call (the
     tables travel in pinned, asynchronous copies), and every device table is bitwise the table built on the CPU."""
-    plan = pytest.importorskip("flashinfer.experimental.cake_gdn_train.cake_kcp_plan")
+    plan = pytest.importorskip(
+        "flashinfer.experimental.cake_gdn_det_train_kcp.cake_kcp_plan"
+    )
     torch.cuda.synchronize(device)
     torch.cuda.set_sync_debug_mode("error")
     try:
-        part = gdn_api.kcp_partition(
+        part = gdn_api.partition_det_kcp(
             torch.tensor(ISSUE_CU, dtype=torch.int64), 1, layout="contiguous"
         )
-        ctx = gdn_api.build_kcp_context(part, None, 0, device)
+        ctx = gdn_api.build_context_det_kcp(part, None, 0, device)
         prepared = ctx.prepare(2, 6)
     finally:
         torch.cuda.set_sync_debug_mode("default")
     torch.cuda.synchronize(device)
-    ref = plan.build_kcp_context(part, None, 0, "cpu", sm_count=ctx.sm_count)
+    ref = plan.build_context_det_kcp(part, None, 0, "cpu", sm_count=ctx.sm_count)
     ref_prepared = ref.prepare(2, 6)
     pairs = (
         [(f"tables.{k}", ctx.tables[k], ref.tables[k]) for k in ctx.tables]
@@ -333,10 +334,10 @@ def test_context_preparation_does_not_synchronize(device) -> None:
 
 
 class _PeakWorkspace:
-    """A ``KcpWorkspace`` recording the most bytes it binds (every allocation / release path)."""
+    """A ``WorkspaceDetKcp`` recording the most bytes it binds (every allocation / release path)."""
 
     def __new__(cls, kcp):
-        class Tracked(kcp.KcpWorkspace):
+        class Tracked(kcp.WorkspaceDetKcp):
             def __init__(self, *a, **k):
                 super().__init__(*a, **k)
                 self.peak = 0
@@ -380,8 +381,10 @@ def test_workspace_bytes_match_what_the_backward_binds(device, cu, heads) -> Non
 
     from torch.utils.checkpoint import checkpoint
 
-    kcp = pytest.importorskip("flashinfer.experimental.cake_gdn_train.cake_kcp")
-    gb = pytest.importorskip("flashinfer.experimental.cake_gdn_train.cake_bytes")
+    kcp = pytest.importorskip("flashinfer.experimental.cake_gdn_det_train_kcp.cake_kcp")
+    gb = pytest.importorskip(
+        "flashinfer.experimental.cake_gdn_det_train_kcp.cake_bytes"
+    )
     H, HV = heads
     inputs = make_inputs(cu, H, HV)
     ctx = _local_context(cu, device)
@@ -395,7 +398,7 @@ def test_workspace_bytes_match_what_the_backward_binds(device, cu, heads) -> Non
         ws = _PeakWorkspace(kcp)
 
         def fn(*a, _ws=ws, _form=form):
-            return gdn_api.chunk_gdn_kcp(
+            return gdn_api.chunk_gdn_det_kcp(
                 *a, ctx, workspace=_ws, reuse_recompute_tapes=_form
             )
 
@@ -411,7 +414,7 @@ def test_workspace_bytes_match_what_the_backward_binds(device, cu, heads) -> Non
             ws.bytes,
             layout["bwd.phase.end"],
         )
-        assert gdn_api.gdn_kcp_workspace_bytes(
+        assert gdn_api.gdn_det_workspace_bytes_kcp(
             ctx, H_qk=H, HV=HV, reuse_recompute_tapes=form
         ) == max(layout["forward"], layout["backward"])
         for lf in leaves:
@@ -436,7 +439,7 @@ def test_reuse_recompute_tapes_auto_follows_the_region_shape(
     (``holders_remain``); ``True`` always hands off (``always``), ``False`` never (``off``).  Every form is bitwise the
     direct autograd result, the registry is empty afterwards, and the ``"auto"`` backward -- the recompute forward,
     the frame proof over the autograd graph, the take -- makes no synchronizing CUDA call."""
-    kcp = pytest.importorskip("flashinfer.experimental.cake_gdn_train.cake_kcp")
+    kcp = pytest.importorskip("flashinfer.experimental.cake_gdn_det_train_kcp.cake_kcp")
     H, HV = 2, 6
     cu = [0, 1500, 4200, 6144]
     inputs = make_inputs(cu, H, HV)
@@ -471,7 +474,7 @@ def test_reuse_recompute_tapes_auto_follows_the_region_shape(
         from torch.utils.checkpoint import checkpoint
 
         def fn(*a):
-            out = gdn_api.chunk_gdn_kcp(
+            out = gdn_api.chunk_gdn_det_kcp(
                 *a, ctx, **({} if form is None else {"reuse_recompute_tapes": form})
             )
             return out if proj is None else proj(out)

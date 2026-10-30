@@ -35,13 +35,14 @@ import pytest
 
 from tests.test_helpers.cake_package import PACKAGES, cake_package
 
-PACKAGE = "cake_gdn_train"
+PACKAGE = "cake_gdn_det_train_kcp"
 cake_build = cake_package(PACKAGE, "cake_build")
 PACKAGE_DIR = Path(cake_build.__file__).parent
 PACKAGE_IMPORT = PACKAGES[PACKAGE]
 ARCHES = ("sm_100a", "sm_103a", "sm_107a")
 GRID = [["grid", "grid_x"], ["grid", "grid_y"], ["grid", "grid_z"]]
-PREFIX = "cake_gdn_train"
+PREFIX = "cake_gdn_det_train"
+KCP_SUFFIX = "_kcp"  # the context-parallel-only programs (``kcp_*``)
 _W = "sm100_sm103_sm107"
 
 # The nine programs of a step (the shipped records by program name: sixteen libraries) and the two test-only records.
@@ -59,37 +60,42 @@ SHIPPED_PROGRAMS = (
     "gate_epilogue",
 )
 TEST_RECORDS = ("kcp_transfer_walk_three_mma", "kcp_transfer_walk_plain_tf32")
-# The identity rule: ``cake_gdn_train_<20 hex of sha256("<kernel module>\\n<sorted JSON of the build keywords>")>``.
+# The identity rule: ``cake_gdn_det_train_<20 hex of sha256("<kernel module>\\n<sorted JSON of the build keywords>")>``,
+# followed by ``_kcp`` for the context-parallel-only programs (``kcp_*``: the state walks, the transfer walk and the
+# affine merge).  The merge keeps the digest of its current shared module path (the KDA package's merge records).
 # The build keywords are the contract of each record; a keyword spelled at its default names the same program as an
 # omitted one, so these pairs are frozen together with the kernels' build signatures.
 IDENTITIES = {
-    "fwd_prep": (f"tart.gdn_chunk_train_fwd_prep.{_W}.gdn_chunk_train_fwd_prep_v1", {}),
+    "fwd_prep": (
+        f"tart.gdn_chunk_train_fwd_prep.{_W}.gdn_chunk_det_train_fwd_prep_v1",
+        {},
+    ),
     "kcp_fwdh_offset": (
-        f"tart.gdn_chunk_kcp_fwd_h.{_W}.gdn_chunk_kcp_fwdh_v1",
+        f"tart.gdn_chunk_kcp_fwd_h.{_W}.gdn_chunk_det_fwdh_v1_kcp",
         {"program": "offset"},
     ),
     "kcp_fwdh_tape": (
-        f"tart.gdn_chunk_kcp_fwd_h.{_W}.gdn_chunk_kcp_fwdh_v1",
+        f"tart.gdn_chunk_kcp_fwd_h.{_W}.gdn_chunk_det_fwdh_v1_kcp",
         {"program": "tape"},
     ),
     "kcp_fwdh_offset_vh64": (
-        f"tart.gdn_chunk_kcp_fwd_h.{_W}.gdn_chunk_kcp_fwdh_v1",
+        f"tart.gdn_chunk_kcp_fwd_h.{_W}.gdn_chunk_det_fwdh_v1_kcp",
         {"program": "offset", "vh": 64},
     ),
     "kcp_fwdh_tape_vh64": (
-        f"tart.gdn_chunk_kcp_fwd_h.{_W}.gdn_chunk_kcp_fwdh_v1",
+        f"tart.gdn_chunk_kcp_fwd_h.{_W}.gdn_chunk_det_fwdh_v1_kcp",
         {"program": "tape", "vh": 64},
     ),
     "kcp_transfer_walk": (
-        f"tart.gdn_chunk_kcp_transfer_walk.{_W}.gdn_chunk_kcp_transfer_walk_v1",
+        f"tart.gdn_chunk_kcp_transfer_walk.{_W}.gdn_chunk_det_transfer_walk_v1_kcp",
         {"precision_mode": 0, "compute_warps": 8},
     ),
     "kcp_transfer_walk_three_mma": (
-        f"tart.gdn_chunk_kcp_transfer_walk.{_W}.gdn_chunk_kcp_transfer_walk_v1",
+        f"tart.gdn_chunk_kcp_transfer_walk.{_W}.gdn_chunk_det_transfer_walk_v1_kcp",
         {"precision_mode": 1},
     ),
     "kcp_transfer_walk_plain_tf32": (
-        f"tart.gdn_chunk_kcp_transfer_walk.{_W}.gdn_chunk_kcp_transfer_walk_v1",
+        f"tart.gdn_chunk_kcp_transfer_walk.{_W}.gdn_chunk_det_transfer_walk_v1_kcp",
         {"precision_mode": 2},
     ),
     "kcp_affine_merge_c8": (
@@ -100,30 +106,33 @@ IDENTITIES = {
         f"tart.kda_chunk_kcp_affine_merge.{_W}.kda_chunk_kcp_affine_merge_fp32_v1",
         {"cols_per_cta": 16},
     ),
-    "fwd_o": (f"tart.gdn_chunk_train_fwd_o.{_W}.gdn_chunk_train_fwd_o_v1", {}),
-    "bwd_prep": (f"tart.gdn_chunk_train_bwd_prep.{_W}.gdn_chunk_train_bwd_prep_v1", {}),
+    "fwd_o": (f"tart.gdn_chunk_train_fwd_o.{_W}.gdn_chunk_det_train_fwd_o_v1", {}),
+    "bwd_prep": (
+        f"tart.gdn_chunk_train_bwd_prep.{_W}.gdn_chunk_det_train_bwd_prep_v1",
+        {},
+    ),
     "kcp_dhu_offset": (
-        f"tart.gdn_chunk_kcp_dhu.{_W}.gdn_chunk_kcp_dhu_v1",
+        f"tart.gdn_chunk_kcp_dhu.{_W}.gdn_chunk_det_dhu_v1_kcp",
         {"program": "offset"},
     ),
     "kcp_dhu_tape": (
-        f"tart.gdn_chunk_kcp_dhu.{_W}.gdn_chunk_kcp_dhu_v1",
+        f"tart.gdn_chunk_kcp_dhu.{_W}.gdn_chunk_det_dhu_v1_kcp",
         {"program": "tape"},
     ),
     "kcp_dhu_offset_vh64": (
-        f"tart.gdn_chunk_kcp_dhu.{_W}.gdn_chunk_kcp_dhu_v1",
+        f"tart.gdn_chunk_kcp_dhu.{_W}.gdn_chunk_det_dhu_v1_kcp",
         {"program": "offset", "vh": 64},
     ),
     "kcp_dhu_tape_vh64": (
-        f"tart.gdn_chunk_kcp_dhu.{_W}.gdn_chunk_kcp_dhu_v1",
+        f"tart.gdn_chunk_kcp_dhu.{_W}.gdn_chunk_det_dhu_v1_kcp",
         {"program": "tape", "vh": 64},
     ),
     "bwd_dqkg": (
-        f"tart.gdn_chunk_train_bwd_dqkg_fused.{_W}.gdn_chunk_train_bwd_dqkg_v1",
+        f"tart.gdn_chunk_train_bwd_dqkg_fused.{_W}.gdn_chunk_det_train_bwd_dqkg_v1",
         {},
     ),
     "gate_epilogue": (
-        f"tart.gdn_chunk_train_gate_epilogue.{_W}.gdn_chunk_train_gate_epilogue_v1",
+        f"tart.gdn_chunk_train_gate_epilogue.{_W}.gdn_chunk_det_train_gate_epilogue_v1",
         {},
     ),
 }
@@ -288,7 +297,8 @@ def test_program_names_follow_the_identity_rule() -> None:
         digest = hashlib.sha256(
             f"{module}\n{json.dumps(kwargs, sort_keys=True)}".encode()
         ).hexdigest()
-        assert records[name]["library"] == f"{PREFIX}_{digest[:20]}", name
+        suffix = KCP_SUFFIX if records[name]["program"].startswith("kcp_") else ""
+        assert records[name]["library"] == f"{PREFIX}_{digest[:20]}{suffix}", name
     libraries = [record["library"] for record in records.values()]
     assert len(set(libraries)) == len(libraries), "every record is its own program"
     assert all(library.startswith(f"{PREFIX}_") for library in libraries)

@@ -11,7 +11,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 CPU tests of the public surface of the context-parallel packed GDN training route: the options validator
-(``cake_gdn_train.cake_options``), the keyword-only signatures, the facade ``flashinfer.gdn_train`` (the contract names),
+(``cake_gdn_det_train_kcp.cake_options``), the keyword-only signatures, the facade ``flashinfer.cake_gdn_det_train_kcp`` (the contract names),
 the package hygiene rules (no environment variable, no ``cake_kda_train`` import, the host module's import allow-list)
 and the host tables built on the CPU for the correctness rows' partitions.  No kernel runs here.
 """
@@ -27,7 +27,7 @@ import pathlib
 import pytest
 import torch
 
-PACKAGE = "flashinfer.experimental.cake_gdn_train"
+PACKAGE = "flashinfer.experimental.cake_gdn_det_train_kcp"
 
 
 def _mod(sub: str | None = None):
@@ -35,13 +35,13 @@ def _mod(sub: str | None = None):
     try:
         from tests.test_helpers.cake_package import cake_package
 
-        return cake_package("cake_gdn_train", sub)
+        return cake_package("cake_gdn_det_train_kcp", sub)
     except (ImportError, KeyError):
         return importlib.import_module(PACKAGE if sub is None else f"{PACKAGE}.{sub}")
 
 
 opt = _mod("cake_options")
-KcpOptions, make_options = opt.KcpOptions, opt.make_options
+OptionsDetKcp, make_options = opt.OptionsDetKcp, opt.make_options
 
 
 # ----------------------------------------------------------------------------------------------------------------
@@ -71,10 +71,10 @@ def test_options_defaults_are_the_shipped_behaviour() -> None:
 
 
 def test_every_option_field_is_keyword_only() -> None:
-    for f in dataclasses.fields(KcpOptions):
+    for f in dataclasses.fields(OptionsDetKcp):
         assert f.kw_only, f.name
     with pytest.raises(TypeError):
-        KcpOptions("ring")  # type: ignore[misc]
+        OptionsDetKcp("ring")  # type: ignore[misc]
 
 
 @pytest.mark.parametrize("mode", [1, 2, 3, -1, True, False, 1.0, "0"])
@@ -181,13 +181,13 @@ def test_reuse_recompute_tapes_defaults_to_auto_never_captured() -> None:
     assert make_options(graph="replay").reuse_recompute_tapes is False
     both = make_options(reuse_recompute_tapes=None, graph="replay")
     assert both.reuse_recompute_tapes is False
-    assert KcpOptions(graph="replay").reuse_recompute_tapes is False
+    assert OptionsDetKcp(graph="replay").reuse_recompute_tapes is False
     assert make_options(graph="replay").key() != make_options().key()
     on = make_options(reuse_recompute_tapes=True)
     off = make_options(reuse_recompute_tapes=False)
     assert on.reuse_recompute_tapes is True and off.reuse_recompute_tapes is False
     assert on.key() != off.key()
-    from_instance = make_options(KcpOptions(reuse_recompute_tapes=True))
+    from_instance = make_options(OptionsDetKcp(reuse_recompute_tapes=True))
     assert from_instance.reuse_recompute_tapes is True
     with pytest.raises(TypeError):
         make_options(reuse_recompute_tapes=1)
@@ -223,7 +223,8 @@ def test_recompute_output_is_a_two_value_keyword_switch_defaulting_to_auto() -> 
     assert make_options().recompute_output == "auto"
     assert make_options(recompute_output="always").recompute_output == "always"
     assert (
-        make_options(KcpOptions(recompute_output="always")).recompute_output == "always"
+        make_options(OptionsDetKcp(recompute_output="always")).recompute_output
+        == "always"
     )
     for bad in ("never", "", None, True, 1):
         with pytest.raises((ValueError, TypeError)):
@@ -289,7 +290,7 @@ def test_test_knobs_are_a_keyword_dict_with_known_keys() -> None:
 
 
 def test_options_from_instance_mapping_and_keywords_agree() -> None:
-    a = make_options(KcpOptions(save_mode="full"), boundary_mode="replay")
+    a = make_options(OptionsDetKcp(save_mode="full"), boundary_mode="replay")
     b = make_options({"save_mode": "full", "boundary_mode": "replay"})
     c = make_options(save_mode="full", boundary_mode="replay")
     assert a == b == c
@@ -315,14 +316,14 @@ def _after(sig: inspect.Signature, anchor: str) -> list[inspect.Parameter]:
 def test_entry_points_take_every_knob_keyword_only() -> None:
     kcp = _mod("cake_kcp")
     for fn, anchor in (
-        (kcp.chunk_gdn_kcp, "ctx"),
-        (kcp.chunk_gdn_kcp_fwd, "ctx"),
-        (kcp.chunk_gdn_kcp_bwd, "dout"),
+        (kcp.chunk_gdn_det_kcp, "ctx"),
+        (kcp.chunk_gdn_det_fwd_kcp, "ctx"),
+        (kcp.chunk_gdn_det_bwd_kcp, "dout"),
     ):
         sig = inspect.signature(fn)
         for p in _after(sig, anchor):
             assert p.kind in (p.KEYWORD_ONLY, p.VAR_KEYWORD), (fn.__name__, p.name)
-    sig = inspect.signature(kcp.chunk_gdn_kcp)
+    sig = inspect.signature(kcp.chunk_gdn_det_kcp)
     assert sig.parameters["save_mode"].default == "light"
     assert sig.parameters["boundary_mode"].default == "saved"
     assert sig.parameters["graph"].default == "off"
@@ -330,73 +331,164 @@ def test_entry_points_take_every_knob_keyword_only() -> None:
 
 
 def test_facade_exposes_the_contract_names_keyword_only() -> None:
-    gdn_train = importlib.import_module("flashinfer.gdn_train")
+    facade = importlib.import_module("flashinfer.cake_gdn_det_train_kcp")
     names = (
-        "kcp_partition",
-        "build_kcp_context",
-        "chunk_gdn_kcp",
-        "chunk_gdn_kcp_fwd",
-        "chunk_gdn_kcp_bwd",
-        "gdn_kcp_workspace_bytes",
-        "gdn_kcp_saved_bytes",
-        "gdn_kcp_comm_bytes",
-        "is_gdn_train_supported",
+        "partition_det_kcp",
+        "build_context_det_kcp",
+        "chunk_gdn_det_kcp",
+        "chunk_gdn_det_fwd_kcp",
+        "chunk_gdn_det_bwd_kcp",
+        "gdn_det_workspace_bytes_kcp",
+        "gdn_det_saved_bytes_kcp",
+        "gdn_det_comm_bytes_kcp",
+        "is_gdn_det_train_kcp_supported",
     )
     for n in names:
-        assert callable(getattr(gdn_train, n)), n
-        assert n in gdn_train.__all__
+        assert callable(getattr(facade, n)), n
+        assert n in facade.__all__
     # exactly the contract names plus the three public types; nothing else is public
-    types = ("KcpOptions", "KcpContext", "KcpPartition", "KcpRecomputeHandle")
-    assert set(gdn_train.__all__) == set(names) | set(types)
-    for n in ("DEFAULT_SCALE", "KcpSaved", "KcpWorkspace"):
-        assert n not in gdn_train.__all__
-    assert set(types) <= set(dir(gdn_train))
+    types = (
+        "OptionsDetKcp",
+        "ContextDetKcp",
+        "PartitionDetKcp",
+        "RecomputeHandleDetKcp",
+    )
+    assert set(facade.__all__) == set(names) | set(types)
+    for n in ("DEFAULT_SCALE", "SavedDetKcp", "WorkspaceDetKcp"):
+        assert n not in facade.__all__
+    assert set(types) <= set(dir(facade))
     for fn, anchor in (
-        (gdn_train.chunk_gdn_kcp, "ctx"),
-        (gdn_train.chunk_gdn_kcp_fwd, "ctx"),
-        (gdn_train.chunk_gdn_kcp_bwd, "dout"),
+        (facade.chunk_gdn_det_kcp, "ctx"),
+        (facade.chunk_gdn_det_fwd_kcp, "ctx"),
+        (facade.chunk_gdn_det_bwd_kcp, "dout"),
     ):
         for p in _after(inspect.signature(fn), anchor):
             assert p.kind in (p.KEYWORD_ONLY, p.VAR_KEYWORD), (fn.__name__, p.name)
     for fn in (
-        gdn_train.gdn_kcp_workspace_bytes,
-        gdn_train.gdn_kcp_saved_bytes,
-        gdn_train.gdn_kcp_comm_bytes,
+        facade.gdn_det_workspace_bytes_kcp,
+        facade.gdn_det_saved_bytes_kcp,
+        facade.gdn_det_comm_bytes_kcp,
     ):
         for p in _after(inspect.signature(fn), "ctx"):
             assert p.kind in (p.KEYWORD_ONLY, p.VAR_KEYWORD), (fn.__name__, p.name)
     assert (
-        getattr(gdn_train.chunk_gdn_kcp, "is_experimental", False) or True
+        getattr(facade.chunk_gdn_det_kcp, "is_experimental", False) or True
     )  # decorated as experimental (soft)
     pkg = _mod()
-    assert gdn_train.KcpOptions is pkg.KcpOptions
-    assert gdn_train.KcpContext is pkg.KcpContext
-    assert gdn_train.KcpPartition is pkg.KcpPartition
-    assert gdn_train.KcpRecomputeHandle is pkg.KcpRecomputeHandle
-    assert gdn_train.KcpSaved is pkg.KcpSaved
-    assert gdn_train.DEFAULT_SCALE == 128**-0.5 == pkg.SCALE
+    assert facade.OptionsDetKcp is pkg.OptionsDetKcp
+    assert facade.ContextDetKcp is pkg.ContextDetKcp
+    assert facade.PartitionDetKcp is pkg.PartitionDetKcp
+    assert facade.RecomputeHandleDetKcp is pkg.RecomputeHandleDetKcp
+    assert facade.SavedDetKcp is pkg.SavedDetKcp
+    assert facade.DEFAULT_SCALE == 128**-0.5 == pkg.SCALE
     with pytest.raises(AttributeError):
-        gdn_train.no_such_name  # noqa: B018
+        facade.no_such_name  # noqa: B018
 
 
 def test_package_init_re_exports_the_route() -> None:
     pkg = _mod()
     for n in (
-        "kcp_partition",
-        "build_kcp_context",
-        "chunk_gdn_kcp",
-        "chunk_gdn_kcp_fwd",
-        "chunk_gdn_kcp_bwd",
-        "gdn_kcp_comm_bytes",
-        "gdn_kcp_saved_bytes",
-        "gdn_kcp_workspace_bytes",
-        "KcpOptions",
-        "KcpContext",
-        "KcpSaved",
-        "KcpWorkspace",
+        "partition_det_kcp",
+        "build_context_det_kcp",
+        "chunk_gdn_det_kcp",
+        "chunk_gdn_det_fwd_kcp",
+        "chunk_gdn_det_bwd_kcp",
+        "gdn_det_comm_bytes_kcp",
+        "gdn_det_saved_bytes_kcp",
+        "gdn_det_workspace_bytes_kcp",
+        "OptionsDetKcp",
+        "ContextDetKcp",
+        "SavedDetKcp",
+        "WorkspaceDetKcp",
     ):
         assert hasattr(pkg, n), n
         assert n in pkg.__all__
+
+
+# The pre-rename names: legacy facade name -> canonical facade name, legacy package-only name -> canonical name,
+# and the legacy package's submodules.
+LEGACY_FACADE_NAMES = {
+    "kcp_partition": "partition_det_kcp",
+    "build_kcp_context": "build_context_det_kcp",
+    "chunk_gdn_kcp": "chunk_gdn_det_kcp",
+    "chunk_gdn_kcp_fwd": "chunk_gdn_det_fwd_kcp",
+    "chunk_gdn_kcp_bwd": "chunk_gdn_det_bwd_kcp",
+    "gdn_kcp_workspace_bytes": "gdn_det_workspace_bytes_kcp",
+    "gdn_kcp_saved_bytes": "gdn_det_saved_bytes_kcp",
+    "gdn_kcp_comm_bytes": "gdn_det_comm_bytes_kcp",
+    "is_gdn_train_supported": "is_gdn_det_train_kcp_supported",
+    "KcpOptions": "OptionsDetKcp",
+    "KcpContext": "ContextDetKcp",
+    "KcpPartition": "PartitionDetKcp",
+    "KcpRecomputeHandle": "RecomputeHandleDetKcp",
+    "KcpSaved": "SavedDetKcp",
+    "KcpWorkspace": "WorkspaceDetKcp",
+}
+LEGACY_PACKAGE_NAMES = {
+    **{
+        k: v
+        for k, v in LEGACY_FACADE_NAMES.items()
+        if k not in ("is_gdn_train_supported",)
+    },
+    "ChunkGDNKcpFunction": "ChunkGDNDetFunctionKcp",
+    "KcpCall": "CallDetKcp",
+    "KcpFragment": "FragmentDetKcp",
+}
+LEGACY_SUBMODULES = (
+    "cake_backend",
+    "cake_build",
+    "cake_bytes",
+    "cake_fake_backend",
+    "cake_jit",
+    "cake_kcp",
+    "cake_kcp_plan",
+    "cake_options",
+    "cake_tables",
+)
+
+
+def test_legacy_names_are_aliases_of_the_canonical_objects() -> None:
+    """``flashinfer.gdn_train`` and ``flashinfer.experimental.cake_gdn_train`` are compatibility paths: every legacy
+    name is the very object of its canonical name, and every legacy submodule is the canonical module object."""
+    facade = importlib.import_module("flashinfer.cake_gdn_det_train_kcp")
+    legacy = importlib.import_module("flashinfer.gdn_train")
+    assert set(legacy.__all__) == {
+        n for n in LEGACY_FACADE_NAMES if n not in ("KcpSaved", "KcpWorkspace")
+    }
+    for old, new in LEGACY_FACADE_NAMES.items():
+        assert getattr(legacy, old) is getattr(facade, new), old
+        assert old not in facade.__all__, old
+    assert legacy.DEFAULT_SCALE == facade.DEFAULT_SCALE
+    with pytest.raises(AttributeError):
+        legacy.no_such_name  # noqa: B018
+
+    pkg = importlib.import_module(PACKAGE)
+    legacy_pkg = importlib.import_module("flashinfer.experimental.cake_gdn_train")
+    assert list(legacy_pkg.__all__) == list(pkg.__all__)
+    for n in pkg.__all__:
+        assert getattr(legacy_pkg, n) is getattr(pkg, n), n
+    for old, new in LEGACY_PACKAGE_NAMES.items():
+        assert old not in pkg.__all__, old
+        assert getattr(pkg, old) is getattr(pkg, new), old
+        assert getattr(legacy_pkg, old) is getattr(pkg, new), old
+    for sub in LEGACY_SUBMODULES:
+        canonical = importlib.import_module(f"{PACKAGE}.{sub}")
+        assert (
+            importlib.import_module(f"flashinfer.experimental.cake_gdn_train.{sub}")
+            is canonical
+        ), sub
+    # the defining modules keep the old names as aliases too (``from <old path>.cake_kcp_plan import KcpContext``)
+    plan = importlib.import_module(
+        "flashinfer.experimental.cake_gdn_train.cake_kcp_plan"
+    )
+    assert plan.KcpContext is plan.ContextDetKcp is pkg.ContextDetKcp
+    assert plan.build_kcp_context is plan.build_context_det_kcp
+    assert plan.kcp_partition is plan.partition_det_kcp
+    kcp = importlib.import_module(f"{PACKAGE}.cake_kcp")
+    assert kcp.chunk_gdn_kcp is kcp.chunk_gdn_det_kcp
+    assert kcp.KcpOptions is kcp.OptionsDetKcp is _mod("cake_options").KcpOptions
+    assert pkg.ContextDetKcp.__qualname__ == "ContextDetKcp"
+    assert pkg.chunk_gdn_det_kcp.__name__ == "chunk_gdn_det_kcp"
 
 
 # ----------------------------------------------------------------------------------------------------------------
@@ -412,7 +504,7 @@ def _package_sources() -> list[pathlib.Path]:
 
 def _facade_source() -> pathlib.Path:
     return pathlib.Path(
-        importlib.import_module("flashinfer.gdn_train").__file__
+        importlib.import_module("flashinfer.cake_gdn_det_train_kcp").__file__
     ).resolve()
 
 
@@ -522,7 +614,9 @@ def test_program_vocabulary_is_the_design_list() -> None:
     )  # reused verbatim
     for name, module in kcp.TART_MODULE_OF.items():
         if name != "kcp_affine_merge":
-            assert module.startswith("gdn_chunk_"), (name, module)
+            # the deterministic family's stems; the context-parallel-only programs carry the ``_kcp`` suffix
+            assert module.startswith("gdn_chunk_det_"), (name, module)
+            assert module.endswith("_kcp") == name.startswith("kcp_"), (name, module)
     assert kcp.FWD_TAPES == (
         "w",
         "u",
@@ -735,8 +829,8 @@ def _partition(lengths, W, layout):
     if layout.startswith("ragged:"):
         t_r = [int(x) for x in layout.split(":")[1].split(",")]
         assert len(t_r) == W and sum(t_r) == cu[-1]
-        return plan.kcp_partition(cu, W, fragments=_ragged(cu, t_r)), cu
-    return plan.kcp_partition(cu, W, layout=layout), cu
+        return plan.partition_det_kcp(cu, W, fragments=_ragged(cu, t_r)), cu
+    return plan.partition_det_kcp(cu, W, layout=layout), cu
 
 
 @pytest.mark.parametrize(
@@ -753,8 +847,8 @@ def test_host_tables_build_on_the_cpu_for_every_rank(row) -> None:
     kcp, plan = _mod("cake_kcp"), _mod("cake_kcp_plan")
     part, cu = _partition(lengths, W, layout)
     for rank in range(W):
-        ctx = plan.build_kcp_context(part, None, rank, "cpu", sm_count=148)
-        ws = kcp.KcpWorkspace()
+        ctx = plan.build_context_det_kcp(part, None, rank, "cpu", sm_count=148)
+        ws = kcp.WorkspaceDetKcp()
         tb = ws.ensure(ctx, H_qk, HV, device="cpu", backward=True)
         nseg = ctx.n_frag * tb.P
         assert tb.H == HV and tb.P >= 1 and nseg == tb.NSEG
@@ -837,9 +931,9 @@ def test_host_tables_build_on_the_cpu_for_every_rank(row) -> None:
         ws.ensure(ctx, H_qk, HV, device="cpu", backward=True)
         assert ws.has("stage_b")
         # the launch tables are plan data cached on the context: a second (per-call) workspace reuses them
-        assert kcp.KcpWorkspace().tables(ctx, HV) is tb
+        assert kcp.WorkspaceDetKcp().tables(ctx, HV) is tb
         assert ("kcp_tables", HV, 1, None) in ctx._caches
-        ws2 = kcp.KcpWorkspace()
+        ws2 = kcp.WorkspaceDetKcp()
         ws2.ensure(ctx, H_qk, HV, device="cpu", backward=False)
         assert ws2.pool("eye") is ws.pool(
             "eye"
@@ -849,8 +943,8 @@ def test_host_tables_build_on_the_cpu_for_every_rank(row) -> None:
 def test_workspace_rejects_a_bad_head_pair_and_device_change() -> None:
     kcp, plan = _mod("cake_kcp"), _mod("cake_kcp_plan")
     part, _ = _partition((300, 200), 2, "contiguous")
-    ctx = plan.build_kcp_context(part, None, 0, "cpu", sm_count=148)
-    ws = kcp.KcpWorkspace()
+    ctx = plan.build_context_det_kcp(part, None, 0, "cpu", sm_count=148)
+    ws = kcp.WorkspaceDetKcp()
     with pytest.raises(ValueError):
         ws.ensure(ctx, 4, 6, device="cpu")
     ws.ensure(ctx, 2, 6, device="cpu")
@@ -861,16 +955,16 @@ def test_workspace_rejects_a_bad_head_pair_and_device_change() -> None:
 def test_exchange_scheme_ring_is_refused_beyond_two_hops() -> None:
     kcp, plan = _mod("cake_kcp"), _mod("cake_kcp_plan")
     part, _ = _partition((3000,), 4, "zigzag")  # one document over 8 pieces: 7 hops
-    ctx = plan.build_kcp_context(part, None, 0, "cpu", sm_count=148)
-    tb = kcp.KcpWorkspace().ensure(ctx, 4, 12, device="cpu")
+    ctx = plan.build_context_det_kcp(part, None, 0, "cpu", sm_count=148)
+    tb = kcp.WorkspaceDetKcp().ensure(ctx, 4, 12, device="cpu")
     with pytest.raises(ValueError):
         kcp._exchange_scheme(tb, make_options(exchange="ring", save_transfer=False))
     assert kcp._exchange_scheme(tb, make_options()) == "a2a"
     part2, _ = _partition(
         (100, 640, 77, 1000, 129), 2, "contiguous"
     )  # CP2 contiguous: at most 1 hop
-    ctx2 = plan.build_kcp_context(part2, None, 0, "cpu", sm_count=148)
-    tb2 = kcp.KcpWorkspace().ensure(ctx2, 2, 6, device="cpu")
+    ctx2 = plan.build_context_det_kcp(part2, None, 0, "cpu", sm_count=148)
+    tb2 = kcp.WorkspaceDetKcp().ensure(ctx2, 2, 6, device="cpu")
     assert (
         kcp._exchange_scheme(tb2, make_options(exchange="ring", save_transfer=False))
         == "ring"
@@ -881,7 +975,7 @@ def test_saved_set_round_trips_through_tensors_and_meta() -> None:
     kcp = _mod("cake_kcp")
     S_in = torch.zeros(4)
     tapes = tuple(torch.zeros(1) for _ in kcp.FWD_TAPES)
-    saved = kcp.KcpSaved(
+    saved = kcp.SavedDetKcp(
         version=kcp.KCP_SAVED_VERSION,
         S_in=S_in,
         c1_recv=None,
@@ -902,7 +996,9 @@ def test_saved_set_round_trips_through_tensors_and_meta() -> None:
         transfer_walk="tf32_hilo",
         ctx=None,
     )
-    back = kcp.KcpSaved.from_tensors(saved.tensors(), saved.flags(), saved.meta(), None)
+    back = kcp.SavedDetKcp.from_tensors(
+        saved.tensors(), saved.flags(), saved.meta(), None
+    )
     assert back == saved
     assert back.tape("h_tape") is tapes[kcp.FWD_TAPES.index("h_tape")]
     assert saved.bytes == 4 * 4 + 4 * len(kcp.FWD_TAPES)
@@ -910,7 +1006,7 @@ def test_saved_set_round_trips_through_tensors_and_meta() -> None:
     light = dataclasses.replace(saved, tapes=light_tapes, save_mode="light")
     assert light.flags() == (False, False, True)
     assert len(light.tensors()) == 1 + len(kcp.LIGHT_TAPES) == 1
-    back_light = kcp.KcpSaved.from_tensors(
+    back_light = kcp.SavedDetKcp.from_tensors(
         light.tensors(), light.flags(), light.meta(), None
     )
     assert back_light == light and back_light.tapes == ()
@@ -934,9 +1030,9 @@ def test_graph_entry_key_ignores_the_arena_and_the_capture_pins_its_signature() 
     and is captured again."""
     kcp, plan = _mod("cake_kcp"), _mod("cake_kcp_plan")
     part, _cu = _partition([100, 640, 77], 2, "contiguous")
-    ctx = plan.build_kcp_context(part, None, 0, "cpu", sm_count=148)
+    ctx = plan.build_context_det_kcp(part, None, 0, "cpu", sm_count=148)
     H_qk, HV = 2, 6
-    ws = kcp.KcpWorkspace()
+    ws = kcp.WorkspaceDetKcp()
     ws.ensure(ctx, H_qk, HV, device="cpu", backward=True)
     for name in kcp.FWD_TAPES:
         ws.tape(name)
@@ -960,7 +1056,7 @@ def test_graph_entry_key_ignores_the_arena_and_the_capture_pins_its_signature() 
     # another workspace, context or operand pointer is another key
     assert (
         kcp._graph_entry(
-            "fwd", ctx, kcp.KcpWorkspace(), backend, opts, None, ops, (True,)
+            "fwd", ctx, kcp.WorkspaceDetKcp(), backend, opts, None, ops, (True,)
         )
         is not e1
     )
@@ -1060,9 +1156,9 @@ def test_workspace_holds_one_zeroed_ticket_slot_per_persistent_site() -> None:
         assert kcp.PROGRAM_ARGS[site][-1] == "ticket"
     assert "ticket" in kcp.PROVISIONAL_ARGS
     part, _cu = _partition([100, 640, 77], 2, "contiguous")
-    ctx = plan.build_kcp_context(part, None, 0, "cpu", sm_count=148)
+    ctx = plan.build_context_det_kcp(part, None, 0, "cpu", sm_count=148)
     H_qk, HV = 2, 6
-    ws = kcp.KcpWorkspace()
+    ws = kcp.WorkspaceDetKcp()
     assert ws.ticket_bytes == 0 and ws.bytes == 0
     with pytest.raises(KeyError, match="ensure"):
         ws.ticket("fwd_o")
@@ -1088,7 +1184,7 @@ def test_workspace_holds_one_zeroed_ticket_slot_per_persistent_site() -> None:
     assert all(ws.ticket(s).data_ptr() == slots[s].data_ptr() for s in kcp.TICKET_SITES)
     sig = kcp._arena_sig(ws)
     assert sig[2] == (("tickets", ws._tickets.data_ptr(), 3 * 32),)
-    other = kcp.KcpWorkspace()
+    other = kcp.WorkspaceDetKcp()
     other.ensure(ctx, H_qk, HV, device="cpu", backward=True)
     assert other.ticket("fwd_o").data_ptr() != ws.ticket("fwd_o").data_ptr()
     # the public query counts every site's slot in both lifetimes

@@ -10,14 +10,14 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
-Multi-GPU rows of the context-parallel (KCP) packed GDN training route (``cake_gdn_train.cake_kcp``): ``W`` ranks over
+Multi-GPU rows of the context-parallel (KCP) packed GDN training route (``cake_gdn_det_train_kcp.cake_kcp``): ``W`` ranks over
 NCCL, each holding the fragments of one partition of a packed batch, compared with the exact FP64 per-document
 recurrence of the same operands and with one another.  Per row and rank the test checks
 
 * vs FP64 (rank 0, the outputs reassembled to the global order): ``out, dq, dk, dv`` as stored BF16, ``dg, dbeta`` FP32;
   the correctness rows (regime ``normal``) by the elementwise clause ``|cand - ref| <= 1e-2 + 1e-2 |ref|`` with zero
   mismatches on every tensor; the accuracy rows (regimes A1-A4) by the per-(row, CP, tensor) budgets of
-  ``cake_gdn_train_kcp_g1_budgets.json`` (rel-RMS <= budget and max-abs <= budget + one storage ulp of |ref| at the
+  ``cake_gdn_det_train_kcp_g1_budgets.json`` (rel-RMS <= budget and max-abs <= budget + one storage ulp of |ref| at the
   worst element, all six tensors; their elementwise counts are recorded as information); rel-RMS / max-abs recorded
   for every tensor;
 * bitwise (G3): repeat; saved == replay (``boundary_mode``); ``save_mode`` light == full; autograd == explicit;
@@ -27,7 +27,7 @@ recurrence of the same operands and with one another.  Per row and rank the test
 * semantics (G4): zero-gradient leak (``dout`` zero outside one document -> exactly zero gradients on the others) and
   independence (the other documents' operands replaced -> one document's outputs bitwise unchanged);
 * contracts (G10): #7039 retained bytes after a checkpointed forward (``graph="off"``), the exchange byte counts against
-  ``gdn_kcp_comm_bytes``, CUDA-graph capture of forward + backward (no steady-state D2H / sync), the #7038 side-stream
+  ``gdn_det_comm_bytes_kcp``, CUDA-graph capture of forward + backward (no steady-state D2H / sync), the #7038 side-stream
   ratio of the backward (asserted for the kernel backend; reported for the torch emulation).
 
 Two launch forms: ``torch.multiprocessing.spawn`` (``pytest`` on a node with >= ``W`` GPUs) and one process per Slurm
@@ -62,14 +62,14 @@ import torch.multiprocessing as mp
 
 from tests.test_helpers.kcp_collective_shims import CollectiveCounter, RecomputePhase
 
-PACKAGE = "flashinfer.experimental.cake_gdn_train"
+PACKAGE = "flashinfer.experimental.cake_gdn_det_train_kcp"
 
 
 def _mod(sub: str | None = None):
     try:
         from tests.test_helpers.cake_package import cake_package
 
-        return cake_package("cake_gdn_train", sub)
+        return cake_package("cake_gdn_det_train_kcp", sub)
     except (ImportError, KeyError):
         return importlib.import_module(PACKAGE if sub is None else f"{PACKAGE}.{sub}")
 
@@ -98,7 +98,7 @@ SIDE_STREAM_ITERS = 7
 def _reference():
     """The FP64 reference: the FlashInfer test helper once it ships, else the session harness on PYTHONPATH."""
     try:
-        from tests.test_helpers import cake_gdn_train_reference as ref  # type: ignore[attr-defined]
+        from tests.test_helpers import cake_gdn_det_train_kcp_reference as ref  # type: ignore[attr-defined]
 
         return ref
     except ImportError:
@@ -108,14 +108,16 @@ def _reference():
 def _inputs():
     """The seeded operand generator (``make_inputs(cu, H_qk, HV, *, regime, seed, token_range)``)."""
     try:
-        from tests.test_helpers import cake_gdn_train_inputs as gen  # type: ignore[attr-defined]
+        from tests.test_helpers import cake_gdn_det_train_kcp_inputs as gen  # type: ignore[attr-defined]
 
         return gen
     except ImportError:
         return importlib.import_module("gdn_inputs")
 
 
-BUDGETS_FILE = Path(__file__).resolve().parent / "cake_gdn_train_kcp_g1_budgets.json"
+BUDGETS_FILE = (
+    Path(__file__).resolve().parent / "cake_gdn_det_train_kcp_g1_budgets.json"
+)
 STORAGE = {
     "out": "bf16",
     "dq": "bf16",
@@ -320,12 +322,12 @@ def _partition(row: Row):
     if row.layout.startswith("ragged:"):
         t_r = [int(x) for x in row.layout.split(":")[1].split(",")]
         assert len(t_r) == row.W and sum(t_r) == cu[-1]
-        return plan.kcp_partition(cu, row.W, fragments=_ragged(cu, t_r)), cu
+        return plan.partition_det_kcp(cu, row.W, fragments=_ragged(cu, t_r)), cu
     if row.layout.startswith("explicit:"):
         make, lengths = EXPLICIT[row.layout.split(":")[1]]
         assert tuple(lengths) == tuple(row.lengths)
-        return plan.kcp_partition(cu, row.W, fragments=make()), cu
-    return plan.kcp_partition(cu, row.W, layout=row.layout), cu
+        return plan.partition_det_kcp(cu, row.W, fragments=make()), cu
+    return plan.partition_det_kcp(cu, row.W, layout=row.layout), cu
 
 
 def _programs_exported() -> bool:
@@ -572,7 +574,7 @@ def _live_blocks_since(mark: int, device, *, skip=()) -> list[dict]:
             if (
                 "/torch/" in fn
                 and "checkpoint" not in fn
-                and "cake_gdn_train" not in fn
+                and "cake_gdn_det_train_kcp" not in fn
             ):
                 continue
             frames.append(f"{fn.rsplit('/', 1)[-1]}:{f.get('line')} {f.get('name')}")
@@ -606,16 +608,16 @@ def _run_rank_fwd(
     crossing-in fragments' ``S_in`` against the FP64 cut states; nothing of the backward runs."""
     H_qk, HV = row.heads
     part, cu = _partition(row)
-    ctx = plan.build_kcp_context(part, group, rank, device)
+    ctx = plan.build_context_det_kcp(part, group, rank, device)
     total = cu[-1]
     ops = _local_inputs(row, part, cu, rank, device)
     q, k, v, g, beta = (ops[n] for n in ("q", "k", "v", "g", "beta"))
-    ws = kcp.KcpWorkspace()
+    ws = kcp.WorkspaceDetKcp()
     base = {"backend": backend}
     t_start = time.time()
 
     def fwd(qq=q, kk=k, vv=v, **opts):
-        return kcp.chunk_gdn_kcp_fwd(
+        return kcp.chunk_gdn_det_fwd_kcp(
             qq, kk, vv, g, beta, ctx, workspace=ws, **{**base, **opts}
         )
 
@@ -814,21 +816,21 @@ def _run_rank(
     """The body of one rank: every mode of the KCP forward / backward, gathered to rank 0 and compared there."""
     H_qk, HV = row.heads
     part, cu = _partition(row)
-    ctx = plan.build_kcp_context(part, group, rank, device)
+    ctx = plan.build_context_det_kcp(part, group, rank, device)
     total = cu[-1]
     ops = _local_inputs(row, part, cu, rank, device)
     q, k, v, g, beta, dout = (ops[n] for n in ("q", "k", "v", "g", "beta", "dout"))
-    ws = kcp.KcpWorkspace()
+    ws = kcp.WorkspaceDetKcp()
     base = {"backend": backend}
     t_start = time.time()
 
     def saved_pass(qq=q, kk=k, vv=v, gg=g, bb=beta, dd=dout, **opts) -> dict:
         o = {**base, **opts}
         fwd_opts = dict(o)
-        out, saved = kcp.chunk_gdn_kcp_fwd(
+        out, saved = kcp.chunk_gdn_det_fwd_kcp(
             qq, kk, vv, gg, bb, ctx, workspace=ws, **fwd_opts
         )
-        dq, dk, dv, dbeta, dg = kcp.chunk_gdn_kcp_bwd(
+        dq, dk, dv, dbeta, dg = kcp.chunk_gdn_det_bwd_kcp(
             qq, kk, vv, gg, bb, ctx, dd, saved=saved, workspace=ws, **o
         )
         return {
@@ -846,7 +848,7 @@ def _run_rank(
         o = {**base, **opts}
 
         def fn(*a):
-            return kcp.chunk_gdn_kcp(*a, ctx, workspace=workspace, **o)
+            return kcp.chunk_gdn_det_kcp(*a, ctx, workspace=workspace, **o)
 
         if ckpt:
             from torch.utils.checkpoint import checkpoint
@@ -968,7 +970,7 @@ def _run_rank(
         for k, v_ in {"put": n_auto, "take": n_auto, "miss": 0}.items()
     )
 
-    # issue #7818: a KcpRecomputeHandle carries this rank's incoming states S_in from the checkpointed forward to
+    # issue #7818: a RecomputeHandleDetKcp carries this rank's incoming states S_in from the checkpointed forward to
     # torch's recompute, which then issues no collective and waits on none (counted by phase through shims on
     # torch.distributed; the recompute phase is marked by the checkpoint's context_fn).  Out and the five gradients
     # are bitwise the plain checkpoint's (same options) and the direct pass's; the original forward and the backward
@@ -979,10 +981,10 @@ def _run_rank(
     def handle_pass(handle: bool, *, twice: bool = False, workspace=ws, **opts):
         leaves = [x.detach().clone().requires_grad_(True) for x in (q, k, v, g, beta)]
         o = {**base, "save_transfer": False, **opts}
-        hd = kcp.KcpRecomputeHandle() if handle else None
+        hd = kcp.RecomputeHandleDetKcp() if handle else None
 
         def fn(q_, k_, v_, g_, b_, h_):
-            return kcp.chunk_gdn_kcp(
+            return kcp.chunk_gdn_det_kcp(
                 q_, k_, v_, g_, b_, ctx, workspace=workspace, recompute_handle=h_, **o
             )
 
@@ -1052,7 +1054,7 @@ def _run_rank(
         and rec_h2["modes"] == ["capture", "replay", "replay"]
     )
     s_in_query = int(
-        kcp.gdn_kcp_saved_bytes(
+        kcp.gdn_det_saved_bytes_kcp(
             ctx,
             H_qk=H_qk,
             HV=HV,
@@ -1069,10 +1071,10 @@ def _run_rank(
     torch.cuda.synchronize(device)
     gc.collect()
     leaves_h = [x.detach().clone().requires_grad_(True) for x in (q, k, v, g, beta)]
-    hd_r = kcp.KcpRecomputeHandle()
+    hd_r = kcp.RecomputeHandleDetKcp()
 
     def fn_r(q_, k_, v_, g_, b_, h_):
-        return kcp.chunk_gdn_kcp(
+        return kcp.chunk_gdn_det_kcp(
             q_, k_, v_, g_, b_, ctx, recompute_handle=h_, save_transfer=False, **base
         )
 
@@ -1134,7 +1136,7 @@ def _run_rank(
     torch.cuda.synchronize(device)
     torch.cuda.set_sync_debug_mode("error")
     try:
-        fresh_ctx = plan.build_kcp_context(part, group, rank, device)
+        fresh_ctx = plan.build_context_det_kcp(part, group, rank, device)
         fresh_ctx.prepare(H_qk, HV)
         flags["prepare_no_sync"] = True
     except RuntimeError as exc:  # "called a synchronizing CUDA operation"
@@ -1161,7 +1163,7 @@ def _run_rank(
         leaves = [x.detach().clone().requires_grad_(True) for x in (q, k, v, g, beta)]
 
         def fn(*a, _wsp=wsp, _o=form_opts):
-            return kcp.chunk_gdn_kcp(*a, ctx, workspace=_wsp, **_o)
+            return kcp.chunk_gdn_det_kcp(*a, ctx, workspace=_wsp, **_o)
 
         from torch.utils.checkpoint import checkpoint
 
@@ -1241,9 +1243,9 @@ def _run_rank(
         sb: dict[str, int] = {"T_r": int(q.shape[0])}
         for mode in ("light", "full"):
             sb[f"{mode}_query"] = int(
-                kcp.gdn_kcp_saved_bytes(ctx, H_qk=H_qk, HV=HV, save_mode=mode)
+                kcp.gdn_det_saved_bytes_kcp(ctx, H_qk=H_qk, HV=HV, save_mode=mode)
             )
-            _, s_obj = kcp.chunk_gdn_kcp_fwd(
+            _, s_obj = kcp.chunk_gdn_det_fwd_kcp(
                 q, k, v, g, beta, ctx, workspace=ws, save_mode=mode, **base
             )
             sb[f"{mode}_actual"] = int(s_obj.bytes())
@@ -1265,13 +1267,13 @@ def _run_rank(
     moved["b1_dm"] = {"send": 4 * sum(s), "recv": 4 * sum(r)}
     info["moved_bytes"] = moved
     try:
-        query = kcp.gdn_kcp_comm_bytes(ctx, H_qk=H_qk, HV=HV, C=C_CONV)
+        query = kcp.gdn_det_comm_bytes_kcp(ctx, H_qk=H_qk, HV=HV, C=C_CONV)
         info["query_bytes"] = {
             c: query[c] for c in ("c1", "c2", "b1", "b2", "b1_design") if c in query
         }
         # save_transfer=False: "b1" = the plan's split tables (maps paired with the crossing-IN slots; what the
         # collective moves) must equal the b1_dm split sums; "b1_design" is the per-rank lower bound
-        query_dm = kcp.gdn_kcp_comm_bytes(
+        query_dm = kcp.gdn_det_comm_bytes_kcp(
             ctx, H_qk=H_qk, HV=HV, C=C_CONV, save_transfer=False
         )
         info["query_bytes_dm"] = {
@@ -1307,10 +1309,10 @@ def _run_rank(
         g_res = None
         events: list[list[str]] = []
         for _ in range(4):
-            out, saved = kcp.chunk_gdn_kcp_fwd(
+            out, saved = kcp.chunk_gdn_det_fwd_kcp(
                 q, k, v, g, beta, ctx, workspace=ws, graph="replay", **base
             )
-            grads = kcp.chunk_gdn_kcp_bwd(
+            grads = kcp.chunk_gdn_det_bwd_kcp(
                 q,
                 k,
                 v,
@@ -1359,7 +1361,7 @@ def _run_rank(
     flags["graph_capture"] = bool(graph_ok)
     # #7038: the backward's time with a resident one-thread kernel on a side stream, over its time alone
     ratio = _side_stream_ratio(
-        lambda: kcp.chunk_gdn_kcp_bwd(
+        lambda: kcp.chunk_gdn_det_bwd_kcp(
             q, k, v, g, beta, ctx, dout, saved=res["saved"], workspace=ws, **base
         ),
         device,
@@ -1844,7 +1846,7 @@ def test_public_api_cannot_select_test_programs() -> None:
     """The precision policy: the shipped record is ``precision_mode=0`` / ``transfer_walk="tf32_hilo"``;
     the test-only records (1 ``_three_mma``, 2 ``_plain_tf32``, ``"bf16x3"``) are refused unless ``test_knobs`` names
     the same value; nothing in the environment changes that (there is no environment hook)."""
-    from flashinfer.experimental.cake_gdn_train import cake_options
+    from flashinfer.experimental.cake_gdn_det_train_kcp import cake_options
 
     for mode in (1, 2):
         with pytest.raises(ValueError):
@@ -1958,7 +1960,7 @@ def _run_rank_conv(
     from flashinfer import cake_causal_conv1d_train as conv
 
     part, cu = _partition(row)
-    ctx = plan.build_kcp_context(part, group, rank, device)
+    ctx = plan.build_context_det_kcp(part, group, rank, device)
     total = cu[-1]
     gen = torch.Generator(device="cpu").manual_seed(43567)
     x_all = (torch.randn(total, CONV_C, generator=gen) * 0.5).to(torch.bfloat16)
@@ -2057,7 +2059,7 @@ def test_conv_halo_row(slurm) -> None:
 
 # ----------------------------------------------------------------------------------------------------------------
 # Whole-layer checkpoint rows (issue #7818): KCP convolution -> packed q | k | v views -> caller L2 norm of q, k ->
-# chunk_gdn_kcp, one checkpointed region per layer with one KcpRecomputeHandle.  Gated: out / dx / dweight / dg /
+# chunk_gdn_det_kcp, one checkpointed region per layer with one RecomputeHandleDetKcp.  Gated: out / dx / dweight / dg /
 # dbeta bitwise across the direct pass, the plain checkpoint and the handle checkpoint; the GDN part of the
 # recompute exchanges nothing (with a convolution that takes the handle the whole recompute exchanges nothing;
 # before that, exactly the convolution's own forward collectives remain, the whole-layer zero is reported as
@@ -2107,7 +2109,7 @@ def _run_rank_layer(
     H_qk, HV = row.heads
     C = (2 * H_qk + HV) * 128
     part, cu = _partition(row)
-    ctx = plan.build_kcp_context(part, group, rank, device)
+    ctx = plan.build_context_det_kcp(part, group, rank, device)
     total = cu[-1]
     gen = torch.Generator(device="cpu").manual_seed(78180)
     x_all = (torch.randn(total, C, generator=gen) * 0.5).to(torch.bfloat16)
@@ -2132,7 +2134,7 @@ def _run_rank_layer(
         q = _l2_normalize(qkv[:, :H_qk])
         k = _l2_normalize(qkv[:, H_qk : 2 * H_qk])
         v = qkv[:, 2 * H_qk :]
-        return kcp.chunk_gdn_kcp(
+        return kcp.chunk_gdn_det_kcp(
             q,
             k,
             v,
@@ -2151,7 +2153,7 @@ def _run_rank_layer(
             g.detach().clone().requires_grad_(True),
             beta.detach().clone().requires_grad_(True),
         ]
-        hd = kcp.KcpRecomputeHandle() if mode == "handle" else None
+        hd = kcp.RecomputeHandleDetKcp() if mode == "handle" else None
         from torch.utils.checkpoint import checkpoint
 
         with CollectiveCounter() as cc:
@@ -2248,7 +2250,7 @@ def _run_rank_layer(
 
 @pytest.mark.parametrize("row", LAYER_ROWS, ids=_row_id)
 def test_layer_checkpoint_rows(row: Row, slurm) -> None:
-    """#7818 whole-layer rows: KCP convolution + L2 norm + chunk_gdn_kcp in one checkpointed region with one
+    """#7818 whole-layer rows: KCP convolution + L2 norm + chunk_gdn_det_kcp in one checkpointed region with one
     recompute handle (see the block comment above).  Runs under Slurm with >= the row's ranks."""
     if slurm is None:
         pytest.skip("the layer rows run under Slurm")

@@ -15,7 +15,7 @@ limitations under the License.
 
 Seeded operands and the exact FP64 reference of the packed GDN (gated delta
 rule) training problem with grouped Q/K heads, a scalar natural-log gate and an
-FP32 ``beta``, shared by ``tests/experimental/test_cake_gdn_train*.py`` and the
+FP32 ``beta``, shared by ``tests/experimental/test_cake_gdn_det_train_kcp*.py`` and the
 kernel tests that cite this text as their oracle.
 
 Semantics (FLA ``naive_recurrent_gated_delta_rule`` convention): per token
