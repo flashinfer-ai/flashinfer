@@ -241,9 +241,9 @@ MODULES: dict[str, dict[str, Any]] = {
         "select": {
             "sm_100a": {"ctas_per_sm": 6, "window": 2.5},
             "sm_103a": {"ctas_per_sm": 6, "window": 2.5},
-            # PROVISIONAL: R200 runs 1024 threads per SM, so 3 CTAs of 288 threads; the window is a placeholder
-            # (>= 2048 / (3 x 216) keeps 4 x 4096 tokens at H = 8 on the plain prep) until the R200 calibration.
-            "sm_107a": {"ctas_per_sm": 3, "window": 3.2},
+            # R200 runs 1024 threads per SM: 3 CTAs of 288 threads.  Window 1.0 = no plain-prep band: prep_tma
+            # was faster in every swept cell up to 10,240 CTAs on R200.
+            "sm_107a": {"ctas_per_sm": 3, "window": 1.0},
         },
         "stage": "prep_tma",
     },
@@ -943,12 +943,11 @@ MODULES: dict[str, dict[str, Any]] = {
                 "t_lat": 2.204,
                 "t_unit": 1.599,
             },
-            # PROVISIONAL: the sm_103a constants until the R200 calibration.
             "sm_107a": {
-                "c_dvl": 1.85,
-                "t_full": 2.293,
-                "t_lat": 2.204,
-                "t_unit": 1.599,
+                "c_dvl": 1.696,
+                "t_full": 2.357,
+                "t_lat": 1.708,
+                "t_unit": 1.329,
             },
         },
         "stage": "dhu_tc2",

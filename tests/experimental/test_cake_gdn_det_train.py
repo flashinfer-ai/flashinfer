@@ -368,7 +368,7 @@ def test_scan_records_carry_the_planner_constants() -> None:
             and const["c_dvl"] > 0
         ), arch
         ctas_per_sm, window = cake_chain._prep_tma_constants(arch)
-        assert ctas_per_sm > 0 and window > 1, arch
+        assert ctas_per_sm > 0 and window >= 1, arch  # 1.0: no plain-prep band
 
 
 def test_manifest_covers_every_record_and_its_sources() -> None:
@@ -552,8 +552,7 @@ RULE_ROWS = (
 RULE_DEVICES = {
     "sm_100a": ((148, 232448, 10), 154.9),
     "sm_103a": ((152, 232448, 10), 141.9),
-    # PROVISIONAL: computed from the provisional sm_107a dhu_tc2 constants (cake_jit.py) until the R200 calibration.
-    "sm_107a": ((216, 232448, 10), 141.6),
+    "sm_107a": ((216, 232448, 10), 113.3),
 }
 # The rows whose adjoint plan the planner splits into segments on a device (the others run serial plans).
 SPLIT_ADJOINT_ROWS = {"sm_107a": ("r01", "r03", "r08")}
@@ -594,7 +593,6 @@ def test_two_stream_split_rule() -> None:
 STREAM_ROWS = {
     "sm_100a": {"r05": (7, 9), "r06": (6, 9), "r09": (7, 9)},
     "sm_103a": {"r05": (7, 9), "r06": (6, 9), "r09": (2, 14)},
-    # PROVISIONAL: at the provisional sm_107a constants until the R200 calibration.
     "sm_107a": {"r05": (3, 13), "r06": (2, 13), "r09": (3, 13)},
 }
 
@@ -665,7 +663,7 @@ def test_sequence_groups_partition_a_serial_table() -> None:
 
 # The prep dispatch window on each architecture's SM count (slots = ctas_per_sm x SMs, the record's select
 # constants): the plain prep inside (slots, window x slots], prep_tma outside; 4 x 4096 tokens at H = 8 (2048 CTAs)
-# lie inside on every architecture.
+# lie inside on every architecture with a band.  A window of 1.0 (sm_107a) has no band: prep_tma everywhere.
 @pytest.mark.parametrize("arch", sorted(RULE_DEVICES))
 def test_prep_rule(arch, monkeypatch) -> None:
     props, _r01 = RULE_DEVICES[arch]
@@ -674,6 +672,11 @@ def test_prep_rule(arch, monkeypatch) -> None:
     rule = cake_chain.use_prep_tma
     ctas_per_sm, window = cake_chain._prep_tma_constants(arch)
     slots = ctas_per_sm * props[0]
+    if window <= 1.0:
+        assert all(rule(n, 1, 0) for n in (1, slots, slots + 1, 4 * slots, 32 * slots))
+        assert rule(4 * 4096 // 64, 8, 0) and rule(16 * 4096 // 64, 8, 0)
+        assert rule(2, 2, 0)
+        return
     assert rule(slots, 1, 0) and not rule(slots + 1, 1, 0)
     assert not rule(int(window * slots), 1, 0) and rule(int(window * slots) + 1, 1, 0)
     assert not rule(4 * 4096 // 64, 8, 0)
