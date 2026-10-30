@@ -3232,7 +3232,7 @@
     },
     {
       "arch": "sm_100a",
-      "closure_sha256": "1edb14f222ffc7a6a4dd37367a4022c4a70782d948f8f38428b1919629b468b6",
+      "closure_sha256": "5dab473f8a240ca60dbd9d9986fa4d5fe803bab73286bab6a9736b203a46426d",
       "entry": "run",
       "gencode": "-gencode=arch=compute_100a,code=sm_100a",
       "min_cuda": "12.8",
@@ -3246,7 +3246,7 @@
       "path": "aot/cake_dsa_indexer_topk_d121d20b4ff827b4b6d2_sm_100a.so",
       "sha256": {
         "csrc/cake_dsa_indexer_topk/cake_dsa_indexer_topk_110194b650e766125f9f_binding.cu": "b2d9b87f675041fff8149a97879d32cfd7dd389b8a337aab3986ed2d0d319293",
-        "csrc/cake_dsa_indexer_topk/cake_dsa_indexer_topk_d121d20b4ff827b4b6d2_kernel.cu": "e696b0157e8de91a885cd5b22bd31732a83e9513891f1d18f67d50a3f13ff8db"
+        "csrc/cake_dsa_indexer_topk/cake_dsa_indexer_topk_d121d20b4ff827b4b6d2_kernel.cu": "ab54c97e0e7d75d1556ef0126b500200672f116fd7f6e2469c15361849304548"
       },
       "sources": [
         "csrc/cake_dsa_indexer_topk/cake_dsa_indexer_topk_d121d20b4ff827b4b6d2_kernel.cu",
@@ -3255,7 +3255,7 @@
     },
     {
       "arch": "sm_103a",
-      "closure_sha256": "b6e5b3a68e7f199b5c03bc40e332ec965caba610e07af879ebd344887d738f27",
+      "closure_sha256": "77427e6aaa7f896d3a8f218d6547239b4083919acdd00cb53d1a0353a45e8f2c",
       "entry": "run",
       "gencode": "-gencode=arch=compute_103a,code=sm_103a",
       "min_cuda": "12.9",
@@ -3269,7 +3269,7 @@
       "path": "aot/cake_dsa_indexer_topk_d121d20b4ff827b4b6d2_sm_103a.so",
       "sha256": {
         "csrc/cake_dsa_indexer_topk/cake_dsa_indexer_topk_110194b650e766125f9f_binding.cu": "b2d9b87f675041fff8149a97879d32cfd7dd389b8a337aab3986ed2d0d319293",
-        "csrc/cake_dsa_indexer_topk/cake_dsa_indexer_topk_d121d20b4ff827b4b6d2_kernel.cu": "e696b0157e8de91a885cd5b22bd31732a83e9513891f1d18f67d50a3f13ff8db"
+        "csrc/cake_dsa_indexer_topk/cake_dsa_indexer_topk_d121d20b4ff827b4b6d2_kernel.cu": "ab54c97e0e7d75d1556ef0126b500200672f116fd7f6e2469c15361849304548"
       },
       "sources": [
         "csrc/cake_dsa_indexer_topk/cake_dsa_indexer_topk_d121d20b4ff827b4b6d2_kernel.cu",
@@ -3637,7 +3637,7 @@
     },
     {
       "arch": "sm_100a",
-      "closure_sha256": "84c6d3ac54a3c76fb5aa4511b717017fc40de4c5b4088fb2b1e0c70ad99bf0c6",
+      "closure_sha256": "03add90be1da53326877fd10a10cb5e2ffcdd145cd2311858a97314d4a2a7363",
       "entry": "run",
       "gencode": "-gencode=arch=compute_100a,code=sm_100a",
       "min_cuda": "12.8",
@@ -3651,7 +3651,7 @@
       "path": "aot/cake_dsa_indexer_topk_ec8a5e9e791c7fee7261_sm_100a.so",
       "sha256": {
         "csrc/cake_dsa_indexer_topk/cake_dsa_indexer_topk_110194b650e766125f9f_binding.cu": "b2d9b87f675041fff8149a97879d32cfd7dd389b8a337aab3986ed2d0d319293",
-        "csrc/cake_dsa_indexer_topk/cake_dsa_indexer_topk_ec8a5e9e791c7fee7261_kernel.cu": "853bca351e7f8bac085175052a40aef6fe4e4031b4e8b32b0cccb87ac1e9a919"
+        "csrc/cake_dsa_indexer_topk/cake_dsa_indexer_topk_ec8a5e9e791c7fee7261_kernel.cu": "5591296225f538ee4105458dcb5b923781706285c42bfe1f6c5049151be22d73"
       },
       "sources": [
         "csrc/cake_dsa_indexer_topk/cake_dsa_indexer_topk_ec8a5e9e791c7fee7261_kernel.cu",
@@ -3660,7 +3660,7 @@
     },
     {
       "arch": "sm_103a",
-      "closure_sha256": "b8c9219e38a6c256ef5f495ca4d40a076a19c62b8f74272077845d23a37be26f",
+      "closure_sha256": "2d6f8d0dc072c05b1170c4e336324c4f078bcfa2f9b62d721784d83a1e3a65a0",
       "entry": "run",
       "gencode": "-gencode=arch=compute_103a,code=sm_103a",
       "min_cuda": "12.9",
@@ -3674,7 +3674,7 @@
       "path": "aot/cake_dsa_indexer_topk_ec8a5e9e791c7fee7261_sm_103a.so",
       "sha256": {
         "csrc/cake_dsa_indexer_topk/cake_dsa_indexer_topk_110194b650e766125f9f_binding.cu": "b2d9b87f675041fff8149a97879d32cfd7dd389b8a337aab3986ed2d0d319293",
-        "csrc/cake_dsa_indexer_topk/cake_dsa_indexer_topk_ec8a5e9e791c7fee7261_kernel.cu": "853bca351e7f8bac085175052a40aef6fe4e4031b4e8b32b0cccb87ac1e9a919"
+        "csrc/cake_dsa_indexer_topk/cake_dsa_indexer_topk_ec8a5e9e791c7fee7261_kernel.cu": "5591296225f538ee4105458dcb5b923781706285c42bfe1f6c5049151be22d73"
       },
       "sources": [
         "csrc/cake_dsa_indexer_topk/cake_dsa_indexer_topk_ec8a5e9e791c7fee7261_kernel.cu",
