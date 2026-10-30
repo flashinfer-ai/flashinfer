@@ -771,8 +771,8 @@ def test_mm_fp4_cutlass_sm120_disable_stream_k(m, monkeypatch):
     # return the same bits while the stream-K tactics do not, so the test checks both
     # halves: the offered set agrees, and the excluded set would not have. The second
     # half is checked from m = 16 up: at m = 1 the stream-K tactics differed on only
-    # 2 of 24 seeds on an RTX 5090 (and on none tried on a 36-SM RTX 5060 Ti; see the
-    # PR thread), so a control there would be the flaky half.
+    # 2 of 24 seeds on an RTX 5090 and 1 of 24 on a 36-SM RTX 5060 Ti (see the PR
+    # thread), so a control there would be the flaky half.
     from flashinfer.gemm import gemm_base
 
     if not is_sm12x_supported(torch.device("cuda")):
@@ -804,11 +804,18 @@ def test_mm_fp4_cutlass_sm120_disable_stream_k(m, monkeypatch):
     assert all(runner.validate_tactic([], t) for t in tactics + [-1])
 
     # Several seeds: whether a stream-K tactic rounds differently depends on the
-    # operands (on an RTX 5090, 2 of 24 seeds showed no difference at m = 16 and 1 of
-    # 24 at m = 128), so the equality half is checked on every seed and the negative
-    # control on any of them.
+    # operands (at m = 16, 2 of 24 seeds showed no difference on an RTX 5090 and 7 of
+    # 24 on a 36-SM RTX 5060 Ti; at m = 128, 1 of 24 on both), so the equality half is
+    # checked on every seed tried, and the negative control keeps drawing seeds until
+    # one shows a stream-K difference: four seeds always, then up to eight more only
+    # while none has differed, so a part where the first four happen to agree does
+    # not fail a healthy test.
     stream_k_differs = False
-    for seed in range(20261029, 20261029 + 4):
+    first_seed, min_seeds, max_seeds = 20261029, 4, 12
+    for i in range(max_seeds):
+        if i >= min_seeds and (m < 16 or stream_k_differs):
+            break
+        seed = first_seed + i
         operands = _nvfp4_operands_wide_range(m, n, k, seed)
         ref = run(operands, tactics[0])
         for t in tactics[1:]:
@@ -824,6 +831,6 @@ def test_mm_fp4_cutlass_sm120_disable_stream_k(m, monkeypatch):
     # data-parallel one and the assertion above would be empty.
     if m >= 16:
         assert stream_k_differs, (
-            "every stream-K tactic matched the data-parallel output on every seed; the "
-            "operands do not expose the summation order, so this test cannot fail"
+            f"every stream-K tactic matched the data-parallel output on all {max_seeds} "
+            "seeds; the operands do not expose the summation order, so this test cannot fail"
         )
