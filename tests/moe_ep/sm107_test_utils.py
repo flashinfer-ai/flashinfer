@@ -19,16 +19,17 @@ from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe import (
 def quantize(tensor, kind, norm=1.0):
     if tensor.numel() == 0:
         nvfp4 = kind == "nvfp4"
+        fp4 = kind in ("nvfp4", "mxfp4")
         dtype = (
             torch.uint8
-            if nvfp4
+            if fp4
             else torch.float8_e4m3fn
             if kind in ("mxfp8_e4m3", "mxfp4_mxfp8")
             else torch.float8_e5m2
         )
         return (
             torch.empty(
-                (*tensor.shape[:-1], tensor.shape[-1] // (2 if nvfp4 else 1)),
+                (*tensor.shape[:-1], tensor.shape[-1] // (2 if fp4 else 1)),
                 device=tensor.device,
                 dtype=dtype,
             ),
@@ -40,6 +41,8 @@ def quantize(tensor, kind, norm=1.0):
         )
     if kind == "nvfp4":
         return quantize_nvfp4_block16(tensor.float(), norm)
+    if kind == "mxfp4":
+        return quantize_mxfp4_block32(tensor.float())
     dtype = (
         torch.float8_e4m3fn
         if kind in ("mxfp8_e4m3", "mxfp4_mxfp8")
@@ -96,7 +99,7 @@ def canonical_reference(
     vec = 16 if kind == "nvfp4" else 32
 
     def dequant(data, scale, *, weight=False):
-        fp4 = kind == "nvfp4" or (weight and kind == "mxfp4_mxfp8")
+        fp4 = kind in ("nvfp4", "mxfp4") or (weight and kind == "mxfp4_mxfp8")
         values = unpack_fp4_to_f32(data) if fp4 else data.float()
         return values * scale_to_f32(scale).repeat_interleave(vec, dim=-1)
 
@@ -141,7 +144,7 @@ def assert_reference(actual, expected, kind):
         actual.float() - expected.float()
     ).norm() / expected.float().norm().clamp_min(1e-6)
     assert torch.isfinite(actual).all()
-    assert float(error) < (0.06 if kind == "nvfp4" else 0.02), float(error)
+    assert float(error) < (0.06 if kind in ("nvfp4", "mxfp4") else 0.02), float(error)
 
 
 def run_mxfp4_k3_geometry(rank, world):

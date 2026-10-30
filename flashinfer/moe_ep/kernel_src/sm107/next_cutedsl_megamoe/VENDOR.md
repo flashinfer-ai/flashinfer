@@ -51,7 +51,7 @@ export manifest/log and file hashes with the integration evidence.
 ## Scope of this drop
 
 The generic inference entry point is `RubinInferenceMegaMoE`
-(`BlockScaledSwapAbMegaMoeKernel`). FlashInfer's NVFP4, MXFP8 E4M3/E5M2, and MXFP4-weight/MXFP8-activation
+(`BlockScaledSwapAbMegaMoeKernel`). FlashInfer's NVFP4, MXFP4, MXFP8 E4M3/E5M2, and MXFP4-weight/MXFP8-activation
 backends expose SwiGLU and SiTU with BF16 output. BF16 combine supports separate
 and in-kernel reduction; `combine_dtype="nvfp4"` and `combine_dtype="mxfp8"`
 require separate reduction. They accept canonical prequantized weights; NVFP4
@@ -71,7 +71,7 @@ coverage. The shim rejects that combination before allocation or compilation,
 and `is_valid_sm107` excludes it from the geometry-specific tuning set. EP1
 phase-interleave and the inherited N128/N256 admission remain unchanged.
 Other N64 combinations remain rejected. Combine remains BF16.
-Tile K is 256 for NVFP4 activations and 128 for MXFP8 activations.
+Tile K is 256 for NVFP4/MXFP4 activations and 128 for MXFP8 activations.
 SiTU requires both beta parameters, matching the exported kernel.
 
 `combine_dtype="nvfp4"` selects the existing quantized FC2 return path.

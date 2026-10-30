@@ -58,6 +58,7 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
             "nvfp4",
             "mxfp8_e4m3",
             "mxfp8_e5m2",
+            "mxfp4",
             "mxfp4_mxfp8",
             "sm120_mxfp4_mxfp8",
             "sm90_fp8_e4m3",
@@ -361,7 +362,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         if family == "sm90" or (family == "sm107" and args.dtype.startswith("bf16")):
             print(f"--dtype {args.dtype} is unsupported on {family}", file=sys.stderr)
             return 2
-        if args.dtype == "mxfp4_mxfp8":
+        if args.dtype == "mxfp4":
+            if family != "sm107":
+                print("--dtype mxfp4 requires SM107", file=sys.stderr)
+                return 2
+            backend = "mxfp4_mxfp4_bf16_cutedsl"
+        elif args.dtype == "mxfp4_mxfp8":
             if family != "sm107" and not (
                 family == "sm100" and args.kernel_variant == "genphase"
             ):

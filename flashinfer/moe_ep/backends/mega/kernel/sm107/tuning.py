@@ -21,6 +21,8 @@ def _backend_module(quant_kind: str, name: str):
     backend = (
         "nvfp4_nvfp4_bf16_cutedsl"
         if quant_kind == "nvfp4"
+        else "mxfp4_mxfp4_bf16_cutedsl"
+        if quant_kind == "mxfp4"
         else "mxfp8_mxfp4_bf16_cutedsl"
         if quant_kind == "mxfp4_mxfp8"
         else "mxfp8_mxfp8_bf16_cutedsl"
@@ -41,7 +43,9 @@ def _dummy_transformed_weights(args, rank: int, world_size: int, quant_kind: str
     )
 
     weights_mod = _backend_module(quant_kind, "weights")
-    extra = {} if quant_kind in ("nvfp4", "mxfp4_mxfp8") else {"kind": quant_kind}
+    extra = (
+        {} if quant_kind in ("nvfp4", "mxfp4", "mxfp4_mxfp8") else {"kind": quant_kind}
+    )
 
     experts_per_rank = args.num_experts // world_size
     generator = torch.Generator(device="cuda").manual_seed(args.seed + 7 * rank)
