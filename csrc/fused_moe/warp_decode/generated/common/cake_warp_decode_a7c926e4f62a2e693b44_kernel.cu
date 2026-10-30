@@ -76,7 +76,7 @@ kernel_cake_warp_decode_a7c926e4f62a2e693b44(__nv_bfloat16* __restrict__ route_o
     float weights[4];
     int rows[4];
     if (feature < M && token < num_tokens) {
-        weights[0] = (float)route_weights[route_base + 0];
+        weights[0] = (float)route_weights[route_base];
         weights[1] = (float)route_weights[route_base + 1];
         weights[2] = (float)route_weights[route_base + 2];
         weights[3] = (float)route_weights[route_base + 3];
