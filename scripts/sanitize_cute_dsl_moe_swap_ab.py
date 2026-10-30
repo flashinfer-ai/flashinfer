@@ -40,6 +40,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import shutil
 import signal
 import subprocess
@@ -498,8 +499,19 @@ def _run_worker(args):
             assert not re.search(r"--opt-level(?:=|\s)", options), options
             options += " --opt-level 3 --keep-ptx"
             if args.tool == "memcheck" and name.startswith("Sm100"):
-                assert "--ptxas-options" not in options, options
-                options += " --ptxas-options='-g-tmem-access-check'"
+                compile_options = []
+                ptxas_options = []
+                option_iter = iter(shlex.split(options))
+                for option in option_iter:
+                    if option == "--ptxas-options":
+                        ptxas_options.append(next(option_iter))
+                    elif option.startswith("--ptxas-options="):
+                        ptxas_options.append(option.split("=", 1)[1])
+                    else:
+                        compile_options.append(option)
+                ptxas_options.append("-g-tmem-access-check")
+                compile_options.append("--ptxas-options=" + " ".join(ptxas_options))
+                options = shlex.join(compile_options)
             kwargs["options"] = options
         result = original_compile(program, *values, **kwargs)
         if instrument:
