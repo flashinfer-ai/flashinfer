@@ -97,12 +97,11 @@ def test_support_probe_on_cpu_never_raises_and_names_the_device():
         and sup.extend.reason == sup.reason
         and sup.extend.declines == {}
     )
-    assert (
-        sup.extend_rows_max
-        == 128
-        == support.EXTEND_ROWS_MAX
-        == support.DECODE_CAPTURE_ROWS_MAX
+    # no FlashInfer-side rows bound on the extend forms since the 6b21be0e0 pin (the previous pin's field / constants are retired)
+    assert not hasattr(sup, "extend_rows_max") and not hasattr(
+        support, "EXTEND_ROWS_MAX"
     )
+    assert support.DECODE_CAPTURE_ROWS_MAX == 128
     assert sup.page_sizes == (16, 32, 64, 128) and sup.kv_layouts == (
         "NHD",
         "HND",
@@ -223,12 +222,9 @@ def test_support_probe_on_the_local_device():
         assert (
             "indexer_e4m3_cache" not in sup.decode.declines
         )  # the e4m3 cache is served (the FlashInfer-side row retired)
-        # the FlashInfer-side rows bound of the extend / prefill forms: on their records, not the decode step's
-        assert (
-            support.EXTEND_ROWS_KEY in sup.extend.declines
-            and support.EXTEND_ROWS_KEY not in sup.decode.declines
-        )
-        assert "128 rows" in sup.extend.declines[support.EXTEND_ROWS_KEY]
+        # ONE decline table for the three forms: no FlashInfer-side rows bound on the extend / prefill records since the 6b21be0e0 pin
+        assert sup.extend.declines == sup.prefill.declines == sup.decode.declines
+        assert "extend_proj_slab_rows" not in sup.extend.declines
         # the e4m3 compressed-key cache: served on the device too
         assert qwen_3_8_block_support(
             torch.device("cuda", 0), _flash_next(index_cache_dtype=torch.float8_e4m3fn)
@@ -309,30 +305,24 @@ def test_mirrored_extend_vocabulary():
         "indexer_extend_chunk_rows",
     }
     g = _flash_next()
-    assert (
-        support.extend_rows_reason(g, "extend", 1, 128) is None
-        and support.extend_rows_reason(g, "extend", 2, 64) is None
+    # the rows bound of the previous pin is retired: no reason function, no rows argument on the light gates
+    assert not hasattr(support, "extend_rows_reason") and not hasattr(
+        support, "EXTEND_ROWS_KEY"
     )
-    r = support.extend_rows_reason(g, "extend", 1, 129)
-    assert r is not None and "129 rows" in r and "N=13952" in r and "128" in r
-    # the light gates of the extend forms: the rows bound, the page sizes, the pool dtype, the types -- before any vendored code
-    api._light_extend_gates(g, "extend", 16, 1, 128, None, None, None, "auto")
-    with pytest.raises(NotImplementedError, match="129 rows per run exceed 128"):
-        api._light_extend_gates(g, "extend", 16, 1, 129, None, None, None, "auto")
-    with pytest.raises(NotImplementedError, match="130 rows per run exceed 128"):
-        api._light_extend_gates(g, "prefill", 16, 2, 65, None, None, None, "auto")
+    # the light gates of the extend forms: the page sizes, the pool dtype, the types -- before any vendored code
+    api._light_extend_gates(g, "extend", 16, None, None, None, "auto")
     with pytest.raises(NotImplementedError, match="page_size must be one of"):
-        api._light_extend_gates(g, "extend", 48, 1, 16, None, None, None, "auto")
+        api._light_extend_gates(g, "extend", 48, None, None, None, "auto")
     with pytest.raises(NotImplementedError, match="e4m3 pool"):
         api._light_extend_gates(
-            g, "extend", 16, 1, 16, torch.float8_e4m3fn, None, None, "auto"
+            g, "extend", 16, torch.float8_e4m3fn, None, None, "auto"
         )
     with pytest.raises(TypeError, match="use_pdl"):
-        api._light_extend_gates(g, "extend", 16, 1, 16, None, 1, None, "auto")
+        api._light_extend_gates(g, "extend", 16, None, 1, None, "auto")
     with pytest.raises(TypeError, match="fuse_prepare"):
-        api._light_extend_gates(g, "extend", 16, 1, 16, None, None, 1, "auto")
+        api._light_extend_gates(g, "extend", 16, None, None, 1, "auto")
     with pytest.raises(ValueError, match="sparse_tile_form must be one of"):
-        api._light_extend_gates(g, "extend", 16, 1, 16, None, None, None, "fast")
+        api._light_extend_gates(g, "extend", 16, None, None, None, "fast")
     with pytest.raises(ValueError, match="exceed the block table's reach"):
         api._check_extend_chunk_rows("extend", 129, 8, 16)
     api._check_extend_chunk_rows("extend", 128, 8, 16)

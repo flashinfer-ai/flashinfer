@@ -90,20 +90,15 @@ INDEX_EXTEND_SELECT_BUDGET_BYTES = (
 )  # the select-window budget (bytes of fp32 logits scratch per scorer launch)
 INDEX_COMPRESS_ROUNDINGS: Tuple[str, ...] = ("single", "hf")
 INDEX_COMPRESS_ROUNDING_DEFAULT = "single"
-#: the capture-safe projection route: the band slab GEMM runs the 128-row swap-AB tile at ``batch x q_len <= 128`` rows (past it the
-#: graph route, which creates its handle eagerly and cannot live in a CUDA graph) -- the vendored ``kernels/proj_gemm.SMALL_M_MAX``
+#: the validated decode capture envelope: the band slab GEMM runs the small-M route's 128-row swap-AB tile at ``batch x q_len <= 128``
+#: rows -- the vendored ``kernels/proj_gemm.SMALL_M_MAX`` (re-read by the tripwire).  Past 128 rows the slab takes the GEMM engine's own
+#: baseline tile for its shape on the SAME JIT-only route since the 6b21be0e0 pin (the projection driver's large-M rule, re-read by the
+#: tripwire too: ``band_slab_jit_tile_past_small_m``), so no FlashInfer-side rows bound exists on any form -- the ``extend`` / ``prefill``
+#: forms take any ``batch x T`` the vendored block serves (the previous pin's ``EXTEND_ROWS_MAX`` / ``extend_proj_slab_rows`` row is retired).
 DECODE_CAPTURE_ROWS_MAX = 128
 #: the FlashInfer-side decline (not an envelope row): a tensor-parallel shard whose dense projection is off the capture-safe
 #: small-M route of the vendored projection GEMM on the device (the probe lists it under this key; ``prepare`` raises it typed)
 PROJ_SLAB_ROUTE_KEY = "proj_slab_route"
-#: the second FlashInfer-side decline row, on the ``extend`` / ``prefill`` forms: the rows one run may hold.  The 24 / 2 geometry's
-#: indexer-band slab (N 13952 = 109 x 128, off the 256-column grid) names a JIT tile on the vendored projection GEMM's small-M route
-#: at ``batch x q_len_per_req <= SMALL_M_MAX = 128`` rows only; past it the slab resolves to the cuDNN GRAPH route, which the
-#: vendored tree does not carry (no cuDNN library, no backend handle: the vendored subset's exclusion), so a wider chunk is a typed
-#: decline by name at plan time -- a longer prompt is several uniform chunks of at most 128 rows per batch.  ONE spelling with the
-#: capture-safe row bound (``DECODE_CAPTURE_ROWS_MAX`` = the vendored ``kernels/proj_gemm.SMALL_M_MAX``, re-read by the tripwire).
-EXTEND_ROWS_MAX = DECODE_CAPTURE_ROWS_MAX
-EXTEND_ROWS_KEY = "extend_proj_slab_rows"
 #: the compressed-key cache dtypes this entry serves on EVERY form (``Qwen38BlockGeometry.index_cache_dtype``; ``None`` = bf16): the
 #: vendored tree's e4m3 arms -- the compress kernels' e4m3 store (the prefill / extend writers and the decode step), the paged scorer's
 #: e4m3 read arm (decode), the extend step's gather + MXFP8 scorer arm -- are served since the 4c8e24355 pin (one cache, one chain: a
@@ -251,23 +246,6 @@ def proj_route_reason(
                 "at TP 1, or keep the serving stack's own attention for the shard"
             )
     return None
-
-
-def extend_rows_reason(
-    geometry, form: str, batch_size: int, q_len_per_req: int
-) -> Optional[str]:
-    """Why a ``[batch_size, q_len_per_req]`` chunk of the ``extend`` / ``prefill`` forms is not served, or None: the rows bound
-    :data:`EXTEND_ROWS_MAX` (the band slab's JIT-only projection route at this pin; device-free)."""
-    rows = int(batch_size) * int(q_len_per_req)
-    if rows <= EXTEND_ROWS_MAX:
-        return None
-    return (
-        f"batch_size x q_len_per_req = {batch_size} x {q_len_per_req} = {rows} rows per run exceed {EXTEND_ROWS_MAX}: the fused QKV + gate "
-        f"+ indexer-band slab (N={geometry.n_qkvg}, off the 256-column grid) names a JIT tile on the vendored projection GEMM's small-M route at "
-        f"{EXTEND_ROWS_MAX} rows at most, and past it the slab resolves to the cuDNN graph route, which the vendored tree does not carry (no cuDNN "
-        f"library) -- run the chunk as several uniform chunks of at most {EXTEND_ROWS_MAX} rows per batch (grouped by their length), or at a "
-        "smaller batch"
-    )
 
 
 @dataclass(frozen=True)
@@ -557,8 +535,6 @@ class Qwen38BlockSupport:
     index_extend_ring_rows_min: int = 0
     index_extend_select_budget_bytes: int = 0
     index_compress_roundings: Tuple[str, ...] = ()
-    #: ``batch x q_len_per_req`` rows one run of the extend / prefill forms may hold (the band slab's JIT-only route; a FlashInfer-side bound)
-    extend_rows_max: int = EXTEND_ROWS_MAX
 
     def form(self, name: str) -> Qwen38BlockFormSupport:
         if name not in ALL_FORMS:
@@ -704,15 +680,9 @@ def qwen_3_8_block_support(
             "decode", bool(table["served"]), table["reason"], table["declines"]
         )
     # the extend / prefill forms are the SAME vendored declaration form (the EXTEND step of the in-block indexer over the pools): served
-    # iff the decode envelope is, with the one decline table (the five indexer_extend_* rows among its keys) plus the FlashInfer-side
-    # rows bound of a run (the band slab's JIT-only projection route: EXTEND_ROWS_MAX rows per batch)
+    # iff the decode envelope is, with the ONE decline table (the five indexer_extend_* rows among its keys); no FlashInfer-side rows
+    # bound since the 6b21be0e0 pin (the band slab rides the JIT-only route at every row count: the tripwire re-reads the rule)
     extend_declines = dict(decode.declines)
-    if decode.declines:
-        extend_declines[EXTEND_ROWS_KEY] = (
-            f"batch_size x q_len_per_req > {EXTEND_ROWS_MAX} rows per run: the indexer-band slab (N={geometry.n_qkvg}, off the 256-column grid) "
-            f"names a JIT tile on the vendored projection GEMM's small-M route at {EXTEND_ROWS_MAX} rows at most; past it the slab resolves to "
-            "the cuDNN graph route, which the vendored tree does not carry -- several uniform chunks of at most that many rows per batch"
-        )
     prefill = Qwen38BlockFormSupport(
         "prefill", decode.served, decode.reason, extend_declines
     )
@@ -773,7 +743,10 @@ def check_vendored_rules() -> Dict[str, Any]:
     (``index_head_dims``, ``index_kv_heads``, ``index_block_sizes``, ``index_top_k_range``, ``index_query_rows_max``,
     ``index_state_rows_extra``, ``index_page_sizes``), the scorer's row rule as BEHAVIOUR (``validate_params`` over q_len 1 .. 20 at
     4 heads against ``decode_max_q_len``), the capture-safe row bound (``kernels.proj_gemm.SMALL_M_MAX``), the projection route's verdicts
-    (``small_m_tile_config``: the 24 / 2 slab on it, the shard slabs off it), the sparse core's body knob (the ``tile_form`` vocabulary,
+    (``small_m_tile_config``: the 24 / 2 slab on it, the shard slabs off it), the lift of the extend forms' rows bound as BEHAVIOUR (the
+    driver's ``_auto_tile_name`` names a JIT tile for the 24 / 2 slab PAST the small-M route -- 512 and 2048 rows at every served SM count,
+    the large-M rule of the 6b21be0e0 pin; a tree without it would put a chunk past 128 rows on the graph route the vendored root refuses),
+    the sparse core's body knob (the ``tile_form`` vocabulary,
     the two bodies' ``kernel_template`` names, the AUTO placement bound, its UNIT as the placement rule's reading over ``(batch, q_len)``
     cells -- CTAs per chunk, the step width outside the bound -- and the envelope's cc 10.7 reading: both bodies served, the lean rule
     consulted), the EXTEND step's rows (the ``index_select_form`` vocabulary, the ring floor -- ONE spelling with ``index_state_rows_extra``
@@ -820,6 +793,24 @@ def check_vendored_rules() -> Dict[str, Any]:
         "index_state_rows_extra": int(env.index_state_rows_extra),
         "index_page_sizes": tuple(int(x) for x in env.index_page_sizes),
         "decode_capture_rows_max": int(proj_gemm.SMALL_M_MAX),
+        # the extend forms' rows bound LIFTED (the 6b21be0e0 pin): the band slab (N 13952, K 2560) names a JIT tile past the small-M route
+        # through the driver's own resolver, at every served SM count -- the premise of serving any chunk length on the extend / prefill forms
+        "band_slab_jit_tile_past_small_m": tuple(
+            proj_gemm._auto_tile_name(
+                m,
+                g.n_qkvg,
+                g.d_model,
+                dtype=torch.bfloat16,
+                a_major="k",
+                b_major="k",
+                block_scale=False,
+                alpha=False,
+                sm_count=sm,
+            )
+            is not None
+            for m in (512, 2048)
+            for sm in (148, 204, 212)
+        ),
         # the sparse core's body knob (the lean decode tile): the vocabulary, the two bodies' kernel_template names, the AUTO placement
         # bound, its unit as the rule's own reading over (batch, q_len) cells (cc 10.7, the Flash-Next top_k, two KV heads), and the
         # envelope's reading of the cc 10.7 part (both bodies served, the AUTO pin consulting the lean rule there)
@@ -870,6 +861,7 @@ def check_vendored_rules() -> Dict[str, Any]:
         "index_state_rows_extra": INDEX_STATE_ROWS_EXTRA,
         "index_page_sizes": INDEX_PAGE_SIZES,
         "decode_capture_rows_max": DECODE_CAPTURE_ROWS_MAX,
+        "band_slab_jit_tile_past_small_m": (True,) * 6,
         "sparse_tile_forms": SPARSE_TILE_FORMS,
         "sparse_tile_names": (SPARSE_TILE_TCGEN05, SPARSE_TILE_LEAN),
         "sparse_tile_lean_max_units": SPARSE_TILE_LEAN_MAX_UNITS,

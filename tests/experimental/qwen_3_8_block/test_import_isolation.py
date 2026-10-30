@@ -87,7 +87,8 @@ assert not mods, mods
 assert support.INDEX_HEAD_DIM == 128 and support.INDEX_QUERY_ROWS_MAX == 64 and support.INDEX_STATE_ROWS_EXTRA == 3
 assert support.INDEX_TOP_K_RANGE == (4, 512, 4) and support.PAGE_SIZES == (16, 32, 64, 128) and support.DECODE_CAPTURE_ROWS_MAX == 128
 assert support.FORMS == ("prefill", "extend", "decode") and support.INDEX_EXTEND_RING_ROWS_MIN == 3 and support.INDEX_COMPRESS_ROUNDINGS == ("single", "hf")
-assert support.INDEX_SELECT_FORMS == ("auto", "decode", "extend") and support.INDEX_EXTEND_SELECT_BUDGET_BYTES == 512 << 20 and support.EXTEND_ROWS_MAX == 128
+assert support.INDEX_SELECT_FORMS == ("auto", "decode", "extend") and support.INDEX_EXTEND_SELECT_BUDGET_BYTES == 512 << 20
+assert not hasattr(support, "EXTEND_ROWS_MAX") and not hasattr(support, "EXTEND_ROWS_KEY")  # the 128-row bound of the previous pin is retired
 print("OK")
 """
     )
@@ -128,6 +129,18 @@ e = Fwd(mk(1, 128, DM), *w[:3], mk(1, 128, ROPE), mk(1, 128, ROPE), w[3], mk(1, 
         index_select_form="extend")
 assert e.indexer_extend and e.index_select_form_resolved == "extend" and e.fuse_prepare is False and e._indexer_extend.n_windows == 1
 assert e._cache_write.index_ring and e._cache_write.index_ring_cap == 4 and e._indexer_extend.launches_per_execute() == 6
+# the same form PAST 128 rows (the 6b21be0e0 pin): the band slab resolves the GEMM engine's own baseline tile through the driver's large-M
+# rule on the host (no device: the catalog's CPU fallback SM count), so the slab stage is flagged capture-safe at declaration -- the
+# JIT-only route, never the graph route the vendored root refuses
+kc40, vc40 = torch.zeros(40, HKV, P, D, dtype=DT), torch.zeros(40, HKV, P, D, dtype=DT)
+e5 = Fwd(mk(1, 512, DM), *w[:3], mk(1, 512, ROPE), mk(1, 512, ROPE), w[3], mk(1, 512, DM), g, paged_kv_page_size=P, kv_source="paged",
+         sample_k_cache=kc40, sample_v_cache=vc40, sample_block_table=torch.zeros(1, 40, dtype=torch.int32), fuse_norm_rope=False, fuse_gate=True,
+         sample_index_kv_cache=torch.zeros(40, P // 4, 1, DI, dtype=DT), sample_index_state_cache=torch.zeros(2, 4, 1, DI, dtype=DT),
+         sample_index_state_block_table=torch.zeros(1, 1, dtype=torch.int32), index_state_slot_mapping_present=True, rope_position_tables_only=False,
+         index_select_form="extend")
+assert e5.indexer_extend and e5._proj.m == 512 and e5._proj.resolves_a_jit_tile() is True and e5._proj.capture_safe is True and e5._out_proj.capture_safe is True
+from flashinfer.experimental.qwen_3_5_block._cudnn_frost.gated_attention_block.kernels.proj_gemm import large_m_tile_config, small_m_tile_config
+assert small_m_tile_config(512, g.n_qkvg, DM, dtype=DT) is None and large_m_tile_config(512, g.n_qkvg, DM, dtype=DT) is not None
 env = Fwd.serving_envelope(g, DT, torch.device("cpu"), device_cc=(10, 7))
 d = env.decode
 assert d.index_select_forms == support.INDEX_SELECT_FORMS and d.index_extend_ring_rows_min == support.INDEX_EXTEND_RING_ROWS_MIN
