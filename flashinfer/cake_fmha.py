@@ -400,166 +400,178 @@ _CONTEXT_PROGRAMS: dict[tuple[str, str], tuple[str, int | None, bool]] = {
     ),
     # The FP8 runtime-size programs: the m-block count is a launch argument.
     ("context_fp8", "RUNTIME_PACK8"): (
-        "cake_fmha_context_fp8_d3b2c5fd94e8f560864e",
+        "cake_fmha_context_fp8_8cd3ded18158fc5ae281",
         None,
         False,
     ),
     ("context_fp8", "RUNTIME_PACK4"): (
-        "cake_fmha_context_fp8_d11c6f225efe76b29d99",
+        "cake_fmha_context_fp8_b6eed48edac789a57ffd",
         None,
         False,
     ),
     ("context_fp8", "RUNTIME_PACK2"): (
-        "cake_fmha_context_fp8_922e982c210fb18a9cd8",
+        "cake_fmha_context_fp8_ebffd1cb5bf0b3ec86c7",
         None,
         False,
     ),
     ("context_fp8", "RUNTIME_PACK1"): (
-        "cake_fmha_context_fp8_bf79e546564cb529a650",
+        "cake_fmha_context_fp8_c678c1bfe0695d0217f3",
         None,
         False,
     ),
     ("context_fp8", "RUNTIME_PACK8_PAGE64"): (
-        "cake_fmha_context_fp8_c617124c1dc667eced14",
+        "cake_fmha_context_fp8_1efb60135327d438feb2",
         None,
         False,
     ),
     ("context_fp8", "RUNTIME_PACK4_PAGE64"): (
-        "cake_fmha_context_fp8_67ded606256f2dbc29cf",
+        "cake_fmha_context_fp8_140f0ba5b3e9586e084f",
         None,
         False,
     ),
     ("context_fp8", "RUNTIME_PACK2_PAGE64"): (
-        "cake_fmha_context_fp8_efa3c990ddbded7e30c1",
+        "cake_fmha_context_fp8_fa4ffc06a12409f0f7ae",
         None,
         False,
     ),
     ("context_fp8", "RUNTIME_PACK1_PAGE64"): (
-        "cake_fmha_context_fp8_c3c1952b0d5adb9ceff3",
+        "cake_fmha_context_fp8_863ff233d455150998f6",
         None,
         False,
     ),
     # The sm103a runtime-size programs: the same schedules with a 4-stage
     # K/V ring and each stage's P tile in the other stage's S columns.
     ("context_fp8", "RUNTIME_PACK8_PX"): (
-        "cake_fmha_context_fp8_f5f4f0477b7355ea49aa",
+        "cake_fmha_context_fp8_d876c1030506ff5d9655",
         None,
         False,
     ),
     ("context_fp8", "RUNTIME_PACK4_PX"): (
-        "cake_fmha_context_fp8_44a395d5bdfbdb97ee60",
+        "cake_fmha_context_fp8_8871340f95e50ec01f9f",
         None,
         False,
     ),
     ("context_fp8", "RUNTIME_PACK2_PX"): (
-        "cake_fmha_context_fp8_a99be36278f1e5d18f8d",
+        "cake_fmha_context_fp8_de159d7010cb697be4a1",
         None,
         False,
     ),
     ("context_fp8", "RUNTIME_PACK1_PX"): (
-        "cake_fmha_context_fp8_eae0511881e362ffc582",
+        "cake_fmha_context_fp8_2dade61a9d1412810382",
         None,
         False,
     ),
     ("context_fp8", "RUNTIME_PACK8_PAGE64_PX"): (
-        "cake_fmha_context_fp8_748c0c9e6ada1f018f9d",
+        "cake_fmha_context_fp8_20dd6b5412a917f5e9e2",
         None,
         False,
     ),
     ("context_fp8", "RUNTIME_PACK4_PAGE64_PX"): (
-        "cake_fmha_context_fp8_fcb32e2d1b4093984320",
+        "cake_fmha_context_fp8_e3473380d99065214e6e",
         None,
         False,
     ),
     ("context_fp8", "RUNTIME_PACK2_PAGE64_PX"): (
-        "cake_fmha_context_fp8_82debe692de1baf9c207",
+        "cake_fmha_context_fp8_8ca24f992b6e9d15171b",
         None,
         False,
     ),
     ("context_fp8", "RUNTIME_PACK1_PAGE64_PX"): (
-        "cake_fmha_context_fp8_1c2e852a19f3b2b19d2b",
+        "cake_fmha_context_fp8_c839dbe3811179fc89fa",
         None,
         False,
     ),
     # The one-stage FP8 runtime-size programs: the same schedules with one
     # 128-row query stage per tile (an m-block of 128 / pack_g query tokens).
     ("context_fp8", "RUNTIME_PACK8_Q1"): (
-        "cake_fmha_context_fp8_f681db469a848459f224",
+        "cake_fmha_context_fp8_8fb12c0b5545c8c829b8",
         None,
         False,
     ),
     ("context_fp8", "RUNTIME_PACK4_Q1"): (
-        "cake_fmha_context_fp8_b7dcfbdacbecc093692d",
+        "cake_fmha_context_fp8_74be69270b3dbab411c2",
         None,
         False,
     ),
     ("context_fp8", "RUNTIME_PACK2_Q1"): (
-        "cake_fmha_context_fp8_bd6fc47806824d1c070e",
+        "cake_fmha_context_fp8_7b57d84fc038783bb7f6",
         None,
         False,
     ),
     ("context_fp8", "RUNTIME_PACK1_Q1"): (
-        "cake_fmha_context_fp8_0c2cbb608777b46cf890",
+        "cake_fmha_context_fp8_a6345fdaae8253e1ca8c",
         None,
         False,
     ),
     ("context_fp8", "RUNTIME_PACK8_PAGE64_Q1"): (
-        "cake_fmha_context_fp8_51366a2f7759481ba225",
+        "cake_fmha_context_fp8_a3c695c0a7e5cceb1cd6",
         None,
         False,
     ),
     ("context_fp8", "RUNTIME_PACK4_PAGE64_Q1"): (
-        "cake_fmha_context_fp8_659d365cc519f17145a9",
+        "cake_fmha_context_fp8_79b89b32f9fa054ff1e6",
         None,
         False,
     ),
     ("context_fp8", "RUNTIME_PACK2_PAGE64_Q1"): (
-        "cake_fmha_context_fp8_fbcfd6d640bedc993798",
+        "cake_fmha_context_fp8_ff413ab9c9730a6d57eb",
         None,
         False,
     ),
     ("context_fp8", "RUNTIME_PACK1_PAGE64_Q1"): (
-        "cake_fmha_context_fp8_e1ac044d4082c31ebe27",
+        "cake_fmha_context_fp8_07051c2d4d7173396759",
         None,
         False,
     ),
     ("context_fp8", "RUNTIME_PACK8_PX_Q1"): (
-        "cake_fmha_context_fp8_4f34c8c6d58c0b96c60e",
+        "cake_fmha_context_fp8_9f092ab962d59eecbc31",
         None,
         False,
     ),
     ("context_fp8", "RUNTIME_PACK4_PX_Q1"): (
-        "cake_fmha_context_fp8_2313db68d6003f9159d3",
+        "cake_fmha_context_fp8_db14fca362e3e3a84742",
         None,
         False,
     ),
     ("context_fp8", "RUNTIME_PACK2_PX_Q1"): (
-        "cake_fmha_context_fp8_2f67edac2abdb7a9bee9",
+        "cake_fmha_context_fp8_ca1b853b471fd2e05bdd",
         None,
         False,
     ),
     ("context_fp8", "RUNTIME_PACK1_PX_Q1"): (
-        "cake_fmha_context_fp8_4959ded18999626f39eb",
+        "cake_fmha_context_fp8_f1232bb28ddc7108ca82",
         None,
         False,
     ),
     ("context_fp8", "RUNTIME_PACK8_PAGE64_PX_Q1"): (
-        "cake_fmha_context_fp8_1d47fdfe426734591b0f",
+        "cake_fmha_context_fp8_67da0f645063c53d9dd6",
         None,
         False,
     ),
     ("context_fp8", "RUNTIME_PACK4_PAGE64_PX_Q1"): (
-        "cake_fmha_context_fp8_0a0656db8e220f88ff4d",
+        "cake_fmha_context_fp8_08960f96467fb1f1c2d1",
         None,
         False,
     ),
     ("context_fp8", "RUNTIME_PACK2_PAGE64_PX_Q1"): (
-        "cake_fmha_context_fp8_7a18734297cb8a01346a",
+        "cake_fmha_context_fp8_09137ca667679fca068b",
         None,
         False,
     ),
     ("context_fp8", "RUNTIME_PACK1_PAGE64_PX_Q1"): (
-        "cake_fmha_context_fp8_46a6a321da75ece12aa6",
+        "cake_fmha_context_fp8_84fda886cb7464ecb623",
+        None,
+        False,
+    ),
+    # The sm100a one-stage page-64 programs of packs 2 and 1 without the
+    # short-KV chain (_CONTEXT_FP8_MULTI_WAVE_ROUTES).
+    ("context_fp8", "RUNTIME_PACK2_PAGE64_Q1_MW"): (
+        "cake_fmha_context_fp8_a75b8a782142524bc162",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK1_PAGE64_Q1_MW"): (
+        "cake_fmha_context_fp8_1485f1c56ec9188ae449",
         None,
         False,
     ),
@@ -702,10 +714,28 @@ _CONTEXT_FP8_ONE_STAGE_ROUTES: dict[str, dict[tuple[int, int | None], str]] = {
     target: {key: name + "_Q1" for key, name in routes.items()}
     for target, routes in _CONTEXT_FP8_RUNTIME_ROUTES.items()
 }
+# Per target, the page-64 one-stage programs whose short-KV chain (the entry
+# L2 warm-up of the static first tile and the partial block's single masking
+# pass) a launch of more tiles over few KV blocks leaves: the program a launch
+# of more than the tiles the entry names over at most its keys takes instead,
+# the same schedule, arithmetic and arguments without the chain.  The chain
+# gains in launches of few tiles and over longer caches, and ran slower in the
+# launches of packs 1 and 2 of more tiles over few KV blocks (timed B200: 32
+# query tokens, heads 32/16 and 32/32, 128 .. 4096 tiles over 128 .. 512 keys).
+_CONTEXT_FP8_MULTI_WAVE_ROUTES: dict[str, dict[str, tuple[str, int, int]]] = {
+    "sm100a": {
+        "RUNTIME_PACK2_PAGE64_Q1": ("RUNTIME_PACK2_PAGE64_Q1_MW", 64, 384),
+        "RUNTIME_PACK1_PAGE64_Q1": ("RUNTIME_PACK1_PAGE64_Q1_MW", 64, 384),
+    },
+}
 _CONTEXT_FP8_ONE_STAGE_PROGRAMS = frozenset(
     name
     for routes in _CONTEXT_FP8_ONE_STAGE_ROUTES.values()
     for name in routes.values()
+) | frozenset(
+    name
+    for routes in _CONTEXT_FP8_MULTI_WAVE_ROUTES.values()
+    for name, _, _ in routes.values()
 )
 # Units of one split tile at most (the kernel's MAX_SPLITS), and the FP32
 # partial bytes of one split unit: O of both 128-row stages, then the row max
@@ -5564,6 +5594,17 @@ def select_cake_fmha_context_route(
                 num_m_blocks = (max_q_len + tok_per_stage - 1) // tok_per_stage
                 total_bh = batch_size * (num_q_heads // pack_g)
                 l2_swizzle = 8 if total_bh % 8 == 0 else 1
+        # A launch of a one-stage program the target names a multi-wave entry
+        # for, of more tiles than the entry's over at most its keys: the
+        # entry's program (:data:`_CONTEXT_FP8_MULTI_WAVE_ROUTES`).
+        multi_wave = _CONTEXT_FP8_MULTI_WAVE_ROUTES.get(target, {}).get(program)
+        if (
+            component == "context_fp8"
+            and multi_wave is not None
+            and batch_size * (num_q_heads // pack_g) * num_m_blocks > multi_wave[1]
+            and max_kv_len <= multi_wave[2]
+        ):
+            program = multi_wave[0]
     return CakeFmhaContextRoute(
         target=target,
         component=component,

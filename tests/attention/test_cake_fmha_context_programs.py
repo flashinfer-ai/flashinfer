@@ -34,6 +34,7 @@ served it.
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import importlib
 import math
 from types import SimpleNamespace
@@ -145,6 +146,13 @@ _ONE_STAGE_PACK = {
     for routes in cake_api._CONTEXT_FP8_ONE_STAGE_ROUTES.values()
     for (pack, _), identifier in routes.items()
 }
+# the one-stage programs without the short-KV chain: the pack of the program
+# a multi-wave launch leaves
+_ONE_STAGE_PACK |= {
+    identifier: _ONE_STAGE_PACK[chained]
+    for routes in cake_api._CONTEXT_FP8_MULTI_WAVE_ROUTES.values()
+    for chained, (identifier, _, _) in routes.items()
+}
 
 
 def _device_scale_program(program):
@@ -182,6 +190,11 @@ def test_cake_fmha_context_program_table_matches_the_generated_loaders() -> None
                 )
     for target, short in cake_api._CONTEXT_FP8_SHORT_KV_ROUTES.items():
         for identifier, _ in short.values():
+            served.setdefault(("context_fp8", identifier), set()).add(
+                _TARGET_ARCH[target]
+            )
+    for target, multi_wave in cake_api._CONTEXT_FP8_MULTI_WAVE_ROUTES.items():
+        for identifier, _, _ in multi_wave.values():
             served.setdefault(("context_fp8", identifier), set()).add(
                 _TARGET_ARCH[target]
             )
@@ -1294,7 +1307,8 @@ def test_cake_fmha_context_fp8_split_route_without_a_runtime_pack_plan(
 def test_cake_fmha_context_fp8_one_stage_routes_mirror_the_runtime_routes() -> None:
     """Every runtime-size program has the one-stage program of its pack and
     page size on the same targets (the same schedule and P placement with one
-    query stage per tile), and no other one-stage program exists."""
+    query stage per tile); the only other one-stage programs are the
+    multi-wave builds of those programs without the short-KV chain."""
 
     runtime = cake_api._CONTEXT_FP8_RUNTIME_ROUTES
     assert set(cake_api._CONTEXT_FP8_ONE_STAGE_ROUTES) == set(runtime)
@@ -1304,6 +1318,54 @@ def test_cake_fmha_context_fp8_one_stage_routes_mirror_the_runtime_routes() -> N
         }
     assert frozenset(_ONE_STAGE_PACK) == cake_api._CONTEXT_FP8_ONE_STAGE_PROGRAMS
     assert not cake_api._CONTEXT_FP8_ONE_STAGE_PROGRAMS & set(_RUNTIME_PACK)
+
+
+def test_cake_fmha_context_fp8_multi_wave_routes(monkeypatch) -> None:
+    """sm100a: a launch of the page-64 one-stage program of pack 2 or 1 of
+    more than 64 tiles over at most 384 keys takes the same build without the
+    short-KV chain (the ``_MW`` program: the same schedule, arithmetic and
+    arguments, the same pack and m-blocks), for host and device scales; any
+    other launch keeps the route it takes without the multi-wave table.
+    16 requests of 32 query tokens over 128 keys, heads 32/16 and 32/32, take
+    it.  sm103a names no such launch."""
+
+    routes = cake_api._CONTEXT_FP8_MULTI_WAVE_ROUTES
+    assert set(routes) == {"sm100a"}
+    for chained, (identifier, tiles, keys) in routes["sm100a"].items():
+        assert identifier == f"{chained}_MW" and (tiles, keys) == (64, 384)
+        assert chained in cake_api._CONTEXT_FP8_ONE_STAGE_ROUTES["sm100a"].values()
+        assert chained.endswith("_PAGE64_Q1") and _ONE_STAGE_PACK[chained] in (1, 2)
+        assert (
+            cake_api._CONTEXT_PROGRAMS[("context_fp8", identifier)][1:]
+            == cake_api._CONTEXT_PROGRAMS[("context_fp8", chained)][1:]
+        )
+    monkeypatch.setattr(cake_api, "_cake_fmha_target", lambda device: "sm100a")
+    monkeypatch.setattr(cake_api, "_context_split_sm_count", lambda device: 148)
+    meta = torch.device("meta")
+    moved = set()
+    for batch in (1, 2, 3, 4, 8, 16, 32):
+        for kv in (128, 256, 384, 385, 512):
+            for hkv in (32, 16, 8):
+                row = ("context_fp8", batch, 32, kv, 32, hkv, 64, True, None)
+                for device_scales in (False, True):
+                    kwargs = _context_kwargs(
+                        row, device_scales=device_scales, device="meta"
+                    )
+                    with monkeypatch.context() as patch:
+                        patch.setattr(cake_api, "_CONTEXT_FP8_MULTI_WAVE_ROUTES", {})
+                        kept = cake_api.select_cake_fmha_context_route(meta, **kwargs)
+                    route = cake_api.select_cake_fmha_context_route(meta, **kwargs)
+                    entry = routes["sm100a"].get(kept.program)
+                    if (
+                        entry is not None
+                        and batch * (32 // kept.pack_g) * kept.num_m_blocks > 64
+                        and kv <= 384
+                    ):
+                        assert route == dataclasses.replace(kept, program=entry[0])
+                        moved.add((batch, kv, hkv))
+                    else:
+                        assert route == kept, (row, route, kept)
+    assert {(16, 128, 16), (16, 128, 32)} <= moved, moved
 
 
 def test_cake_fmha_context_fp8_tile_blocks_of_one_stage_programs() -> None:
