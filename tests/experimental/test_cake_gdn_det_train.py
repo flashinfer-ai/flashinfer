@@ -56,7 +56,8 @@ from tests.test_helpers.cake_package import cake_package
 cake_backend = cake_package("cake_gdn_det_train", "cake_backend")
 cake_chain = cake_package("cake_gdn_det_train", "cake_chain")
 cake_jit = cake_package("cake_gdn_det_train", "cake_jit")
-chunk_gated_delta_rule = cake_package("cake_gdn_det_train").chunk_gated_delta_rule
+cake_gdn_det_train = cake_package("cake_gdn_det_train")
+chunk_gated_delta_rule_det = cake_gdn_det_train.chunk_gated_delta_rule_det
 
 PACKAGE_DIR = Path(cake_jit.__file__).resolve().parent
 ARCHES = tuple(cake_jit.ARCHES)
@@ -158,7 +159,7 @@ def _run(inputs, seq_lens, *, route="host", initial_state=None, output_final_sta
         kwargs["cu_seqlens_cpu"] = (
             torch.tensor(cu, dtype=torch.int64) if route == "host" else None
         )
-    o, final = chunk_gated_delta_rule(
+    o, final = chunk_gated_delta_rule_det(
         leaves["q"],
         leaves["k"],
         leaves["v"],
@@ -311,6 +312,20 @@ FUSED_TAIL_STAGES = (
     "tail_g2",
     "tail_g2_bf16",
 )  # two-CTA clusters: the two value heads of a key head
+
+
+def test_former_names_are_aliases_of_the_det_names() -> None:
+    pairs = (
+        ("chunk_gated_delta_rule", "chunk_gated_delta_rule_det"),
+        ("ChunkGatedDeltaRuleFunction", "ChunkGatedDeltaRuleDetFunction"),
+        ("gdn_chunk_forward", "gdn_chunk_det_forward"),
+        ("gdn_chunk_backward", "gdn_chunk_det_backward"),
+    )
+    for former, det in pairs:
+        for module in (cake_gdn_det_train, cake_chain):
+            assert getattr(module, former) is getattr(module, det)
+            assert former in module.__all__ and det in module.__all__
+        assert getattr(cake_chain, det).__name__ == det
 
 
 def test_registry_records_are_well_formed() -> None:
@@ -1124,7 +1139,7 @@ def test_two_streams_under_cuda_graph_capture(device, monkeypatch) -> None:
     def step():
         for leaf in leaves.values():
             leaf.grad = None
-        o, _ = chunk_gated_delta_rule(leaves["q"], leaves["k"], leaves["v"], leaves["g"], leaves["beta"],
+        o, _ = chunk_gated_delta_rule_det(leaves["q"], leaves["k"], leaves["v"], leaves["g"], leaves["beta"],
                                       scale=1.0 / math.sqrt(HEAD_DIM), cu_seqlens=cu_seqlens,
                                       cu_seqlens_cpu=cu_seqlens_cpu, use_qk_l2norm_in_kernel=True, streams=2,
                                       **STREAM_PINS)  # fmt: skip
@@ -1215,7 +1230,7 @@ def test_launches_run_on_the_callers_stream(streams, device, monkeypatch) -> Non
         torch.cuda._sleep(200_000_000)
         with torch.no_grad():
             leaves["q"].copy_(new["q"])
-        o, _ = chunk_gated_delta_rule(leaves["q"], leaves["k"], leaves["v"], leaves["g"], leaves["beta"],
+        o, _ = chunk_gated_delta_rule_det(leaves["q"], leaves["k"], leaves["v"], leaves["g"], leaves["beta"],
                                       scale=1.0 / math.sqrt(HEAD_DIM),
                                       cu_seqlens=torch.tensor(cu, dtype=torch.int64, device=device),
                                       cu_seqlens_cpu=torch.tensor(cu, dtype=torch.int64), use_qk_l2norm_in_kernel=True,
@@ -1312,17 +1327,17 @@ def test_equal_length_batch_matches_the_packed_layout(preps, device) -> None:
 def test_rejects_unsupported_inputs(device) -> None:
     inputs = _inputs((64,), (1, 2), torch.float32, device)
     with pytest.raises(NotImplementedError):
-        chunk_gated_delta_rule(
+        chunk_gated_delta_rule_det(
             inputs["q"].half(), inputs["k"], inputs["v"], inputs["g"], inputs["beta"]
         )
     cu = torch.tensor([0, 64], dtype=torch.int64, device=device)
     two = {name: torch.cat([t, t], 0) for name, t in inputs.items()}
     with pytest.raises(ValueError):
-        chunk_gated_delta_rule(
+        chunk_gated_delta_rule_det(
             two["q"], two["k"], two["v"], two["g"], two["beta"], cu_seqlens=cu
         )
     with pytest.raises(ValueError):
-        chunk_gated_delta_rule(
+        chunk_gated_delta_rule_det(
             inputs["q"], inputs["k"], inputs["v"], inputs["g"], inputs["beta"],
             segment_chunks=-1,
         )  # fmt: skip
@@ -1427,7 +1442,7 @@ _INVALID_MESSAGES = {
 
 def _call_rejected(call) -> ValueError:
     with pytest.raises(ValueError) as error:
-        chunk_gated_delta_rule(
+        chunk_gated_delta_rule_det(
             call["q"], call["k"], call["v"], call["g"], call["beta"], initial_state=call["initial_state"],
             output_final_state=True, cu_seqlens=call["cu_seqlens"], cu_seqlens_cpu=call["cu_seqlens_cpu"],
             use_qk_l2norm_in_kernel=True,
@@ -1444,7 +1459,7 @@ def test_rejects_invalid_inputs_before_any_launch(case, device, monkeypatch) -> 
     assert str(_call_rejected(call)) == _INVALID_MESSAGES[case]
     assert stages == [], stages
     # the unmodified call is accepted
-    o, final = chunk_gated_delta_rule(
+    o, final = chunk_gated_delta_rule_det(
         base["q"], base["k"], base["v"], base["g"], base["beta"], initial_state=base["initial_state"],
         output_final_state=True, cu_seqlens=base["cu_seqlens"], cu_seqlens_cpu=base["cu_seqlens_cpu"],
         use_qk_l2norm_in_kernel=True,
@@ -1479,7 +1494,7 @@ def test_device_route_does_not_synchronize(device) -> None:
             n: inputs[n].detach().clone().requires_grad_(True)
             for n in ("q", "k", "v", "g", "beta")
         }
-        o, final = chunk_gated_delta_rule(
+        o, final = chunk_gated_delta_rule_det(
             leaves["q"], leaves["k"], leaves["v"], leaves["g"], leaves["beta"], initial_state=h0,
             output_final_state=True, cu_seqlens=cu, use_qk_l2norm_in_kernel=True,
         )  # fmt: skip

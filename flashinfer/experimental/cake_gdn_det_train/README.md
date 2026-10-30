@@ -24,9 +24,9 @@ Import the entry point explicitly; nothing in `flashinfer` imports this
 package.
 
 ```python
-from flashinfer.experimental.cake_gdn_det_train import chunk_gated_delta_rule
+from flashinfer.experimental.cake_gdn_det_train import chunk_gated_delta_rule_det
 
-o, final_state = chunk_gated_delta_rule(
+o, final_state = chunk_gated_delta_rule_det(
     q, k, v, g, beta,                    # [B, T, H, 128] / [B, T, HV, 128] bf16; g, beta [B, T, HV]
     scale=None,                          # 1 / sqrt(128) when None
     initial_state=None,                  # [N, HV, 128, 128] fp32 or None
@@ -36,6 +36,10 @@ o, final_state = chunk_gated_delta_rule(
     use_qk_l2norm_in_kernel=True,
 )
 ```
+
+The former names `chunk_gated_delta_rule`, `ChunkGatedDeltaRuleFunction`,
+`gdn_chunk_forward` and `gdn_chunk_backward` stay importable as aliases of
+the `_det` names.
 
 Without `cu_seqlens` the `B` sequences have length `T` each.  `g` is
 computed in FP32; `beta` is FP32 or BF16 and its gradient comes back in its
