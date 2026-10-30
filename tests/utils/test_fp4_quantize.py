@@ -1053,6 +1053,62 @@ def test_nvfp4_quantize_te_reference(
     torch.testing.assert_close(scale_out, expected_scale, rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("shape", [(128, 64), (1024, 512)])
+@pytest.mark.parametrize("scale_offset", [-1, 0, 1], ids=["below", "midpoint", "above"])
+@pytest.mark.parametrize("device", CUDA_DEVICES)
+@torch.inference_mode()
+def test_nvfp4_quantize_zero_scale_boundary(
+    dtype: torch.dtype,
+    shape: tuple[int, int],
+    scale_offset: int,
+    device: str,
+    set_nvfp4_quant_env,
+) -> None:
+    """Preserve the E4M3 zero midpoint in ordinary and TMA quantization paths."""
+    if not _is_fp4_supported(torch.device(device)):
+        pytest.skip("Nvfp4 Requires compute capability >= 10 and CUDA >= 12.8")
+    set_nvfp4_quant_env(disable_quant_fast_math=False)
+
+    m, n = shape
+    x = torch.tensor([6.0, -6.0, 0.0, -0.0], dtype=dtype, device=device).repeat(
+        m, n // 4
+    )
+    # With block AMAX 6, the pre-conversion scale equals global_scale. E4M3
+    # rounds 2**-10 to even zero; its next FP32 neighbor must remain nonzero.
+    global_scale = torch.tensor([2**-10], dtype=torch.float32, device=device)
+    if scale_offset:
+        global_scale = torch.nextafter(
+            global_scale, torch.full_like(global_scale, scale_offset * torch.inf)
+        )
+    q_ref, scale_ref = ref_fp4_quant(x, global_scale, 16)
+    scale_ref = scale_ref.to(torch.float8_e4m3fn)
+    torch.testing.assert_close(
+        scale_ref.view(torch.uint8),
+        torch.full_like(scale_ref, int(scale_offset > 0), dtype=torch.uint8),
+        rtol=0,
+        atol=0,
+    )
+    expected_q = pack_fp4_values(q_ref)
+    expected_scale = _te_ref_scale_bytes_for_layout(scale_ref, SfLayout.layout_128x4)
+
+    quantized, scales = nvfp4_quantize(
+        x, global_scale, backend="cuda", nvfp4_4over6=None
+    )
+    torch.testing.assert_close(quantized, expected_q, rtol=0, atol=0)
+    torch.testing.assert_close(scales, expected_scale, rtol=0, atol=0)
+
+    batched_quantized, batched_scales = nvfp4_batched_quantize(
+        x.unsqueeze(0).repeat(2, 1, 1), global_scale, nvfp4_4over6=None
+    )
+    torch.testing.assert_close(
+        batched_quantized, expected_q.unsqueeze(0).repeat(2, 1, 1), rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        batched_scales, expected_scale.reshape(1, -1).repeat(2, 1), rtol=0, atol=0
+    )
+
+
 @pytest.mark.parametrize("backend", NVFP4_BACKENDS)
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("shape", NVFP4_SHAPES)
