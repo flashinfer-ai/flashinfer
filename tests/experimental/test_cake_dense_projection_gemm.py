@@ -3060,10 +3060,11 @@ def test_round33_rules_plan_like_the_cake_launcher(T):
     # round 33 left 109 keys (51 sm_100a, 58 sm_107a; six inserted, none removed); the shapes tranche adds 79 sm_100a and
     # 86 sm_103a keys and re-values seven round-33 sm_100a keys (MEASURED_SHAPE_ROWS); the whole-tile tile resolve
     # adds one sm_103a key (the kv_a input gradient, test_mg_rules_plan_the_whole_tile_programs); the N = 128 weight
-    # gradients of the 4096 / 5120 / 8192 rows add six sm_107a keys (test_sm107a_n128_wgrad_rules_plan)
-    assert len(ROW_RULES) == 109 + 79 + 86 + 1 + 6
+    # gradients of the 4096 / 5120 / 8192 rows add six sm_107a keys (test_sm107a_n128_wgrad_rules_plan); the thin and
+    # 512 / 1024 BF16 projection rows add 26 sm_107a keys
+    assert len(ROW_RULES) == 109 + 79 + 86 + 1 + 6 + 26
     assert sum(k[0] == "sm_100a" for k in ROW_RULES) == 51 + 79
-    assert sum(k[0] == "sm_107a" for k in ROW_RULES) == 58 + 6
+    assert sum(k[0] == "sm_107a" for k in ROW_RULES) == 58 + 6 + 26
     assert sum(k[0] == "sm_103a" for k in ROW_RULES) == 86 + 1
     assert ARCH_RULE_DEFAULTS == {
         "sm_107a": {"pro": 7},
