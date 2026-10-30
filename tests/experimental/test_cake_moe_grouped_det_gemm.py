@@ -24,17 +24,17 @@ from tests.test_helpers.cake_package import cake_package
 # Backend suite: the package is named once, through ``cake_package``; nothing else
 # of flashinfer is imported here.  The tests of the stable flashinfer entry point
 # ``flashinfer.grouped_mm.grouped_mm_bf16(..., backend="cake")`` live in
-# ``test_cake_moe_grouped_gemm_api.py``.
-pkg = cake_package("cake_moe_grouped_gemm")
-cb = cake_package("cake_moe_grouped_gemm", "cake_backend")
-cake_jit = cake_package("cake_moe_grouped_gemm", "cake_jit")
-grouped_gemm_dgrad = pkg.grouped_gemm_dgrad
-grouped_gemm_fwd = pkg.grouped_gemm_fwd
-grouped_gemm_wgrad = pkg.grouped_gemm_wgrad
+# ``test_cake_moe_grouped_det_gemm_api.py``.
+pkg = cake_package("cake_moe_grouped_det_gemm")
+cb = cake_package("cake_moe_grouped_det_gemm", "cake_backend")
+cake_jit = cake_package("cake_moe_grouped_det_gemm", "cake_jit")
+grouped_det_gemm_dgrad = pkg.grouped_det_gemm_dgrad
+grouped_det_gemm_fwd = pkg.grouped_det_gemm_fwd
+grouped_det_gemm_wgrad = pkg.grouped_det_gemm_wgrad
 SUPPORTED_COMPUTE_CAPABILITIES = cb.SUPPORTED_COMPUTE_CAPABILITIES
-prepare_grouped_gemm_dgrad = cb.prepare_grouped_gemm_dgrad
-prepare_grouped_gemm_fwd = cb.prepare_grouped_gemm_fwd
-prepare_grouped_gemm_wgrad = cb.prepare_grouped_gemm_wgrad
+prepare_grouped_det_gemm_dgrad = cb.prepare_grouped_det_gemm_dgrad
+prepare_grouped_det_gemm_fwd = cb.prepare_grouped_det_gemm_fwd
+prepare_grouped_det_gemm_wgrad = cb.prepare_grouped_det_gemm_wgrad
 HOST_PLAN_CONSTANTS = cake_jit.HOST_PLAN_CONSTANTS
 PROGRAMS = cake_jit.PROGRAMS
 ROUTES = cake_jit.ROUTES
@@ -659,7 +659,7 @@ def test_workspace_arguments_of_the_argument_plans():
 def test_fwd_matches_reference(sizes, n, k):
     device = _require_program("fwd")
     x, w, _g, offs = _inputs(sizes, n, k, device)
-    out = grouped_gemm_fwd(x, w, offs)
+    out = grouped_det_gemm_fwd(x, w, offs)
     assert out.shape == (sum(sizes), n)
     _assert_bf16_close(out, _reference("fwd", x, w, sizes))
 
@@ -670,7 +670,7 @@ def test_fwd_matches_reference(sizes, n, k):
 def test_dgrad_matches_reference(sizes, n, k):
     device = _require_program("dgrad")
     _x, w, g, offs = _inputs(sizes, n, k, device)
-    out = grouped_gemm_dgrad(g, w, offs)
+    out = grouped_det_gemm_dgrad(g, w, offs)
     assert out.shape == (sum(sizes), k)
     _assert_bf16_close(out, _reference("dgrad", g, w, sizes))
 
@@ -682,7 +682,7 @@ def test_dgrad_matches_reference(sizes, n, k):
 def test_wgrad_matches_reference(sizes, n, k, out_dtype):
     device = _require_program("wgrad", out_dtype)
     x, _w, g, offs = _inputs(sizes, n, k, device)
-    launch = prepare_grouped_gemm_wgrad(g, x, offs, out_dtype=out_dtype)
+    launch = prepare_grouped_det_gemm_wgrad(g, x, offs, out_dtype=out_dtype)
     out = launch.launch()
     assert out.shape == (len(sizes), n, k) and out.dtype == out_dtype
     ref = _reference("wgrad", g, x, sizes)
@@ -711,7 +711,7 @@ def test_wgrad_long_reduction_selects_a_valid_tile(out_dtype):
     device = _require_program("wgrad", out_dtype)
     n, k = 512 if out_dtype == torch.bfloat16 else 256, 1024
     x, _w, g, offs = _inputs(LONG_E3, n, k, device, seed=3)
-    launch = prepare_grouped_gemm_wgrad(g, x, offs, out_dtype=out_dtype)
+    launch = prepare_grouped_det_gemm_wgrad(g, x, offs, out_dtype=out_dtype)
     assert launch.plan["tile_k"] in (256, 512) and k % launch.plan["tile_k"] == 0
     out = launch.launch()
     ref = _reference("wgrad", g, x, LONG_E3)
@@ -730,7 +730,7 @@ def test_wgrad_short_groups_never_include_the_next_group(out_dtype):
     device = _require_program("wgrad", out_dtype)
     n, k = 512, 3072
     x, _w, g, offs = _inputs(SMALL_E512, n, k, device, seed=6)
-    launch = prepare_grouped_gemm_wgrad(g, x, offs, out_dtype=out_dtype)
+    launch = prepare_grouped_det_gemm_wgrad(g, x, offs, out_dtype=out_dtype)
     ref = torch.stack(
         [g[s:t].float().T @ x[s:t].float() for s, t in _bounds(SMALL_E512)]
     )
@@ -754,7 +754,7 @@ def test_prepared_launch_reuses_buffers_without_allocation():
     out = torch.full(
         (sum(RAGGED_E6), 1024), float("nan"), dtype=torch.bfloat16, device=device
     )
-    launch = prepare_grouped_gemm_fwd(x, w, offs, out=out)
+    launch = prepare_grouped_det_gemm_fwd(x, w, offs, out=out)
     assert launch.launch() is out
     torch.cuda.synchronize()
     before = torch.cuda.memory_stats(device)
@@ -777,10 +777,10 @@ def _workspace_kinds(launch):
 def _prepare_row_op(op, sizes, n, k, device, out=None):
     x, w, g, offs = _inputs(sizes, n, k, device)
     if op == "fwd":
-        return prepare_grouped_gemm_fwd(x, w, offs, out=out), _reference(
+        return prepare_grouped_det_gemm_fwd(x, w, offs, out=out), _reference(
             "fwd", x, w, sizes
         )
-    return prepare_grouped_gemm_dgrad(g, w, offs, out=out), _reference(
+    return prepare_grouped_det_gemm_dgrad(g, w, offs, out=out), _reference(
         "dgrad", g, w, sizes
     )
 
@@ -824,7 +824,7 @@ def test_wgrad_wave_sync_route_and_rest_state(out_dtype, monkeypatch):
     arch = SUPPORTED_COMPUTE_CAPABILITIES[torch.cuda.get_device_capability(device)]
     n, k = 256, int(c["wave_sync_min_k"])
     x, _w, g, offs = _inputs(RAGGED_E4, n, k, device, seed=7)
-    launch = prepare_grouped_gemm_wgrad(g, x, offs, out_dtype=out_dtype)
+    launch = prepare_grouped_det_gemm_wgrad(g, x, offs, out_dtype=out_dtype)
     tile_k = launch.plan["tile_k"]
     wave = arch in c["wave_sync_archs"][tile_k] and cake_jit.stage_served(
         launch.record_name, "main_wave", arch
@@ -847,12 +847,12 @@ def test_wgrad_wave_sync_route_and_rest_state(out_dtype, monkeypatch):
         assert counters.numel() == int(c["wave_sync_words"])
         assert _u32_words(counters) == [0] * int(c["wave_sync_words"])
     # Below the threshold (or with the wave build switched off) the plain build runs.
-    short = prepare_grouped_gemm_wgrad(
+    short = prepare_grouped_det_gemm_wgrad(
         g, x[:, : k // 2].contiguous(), offs, out_dtype=out_dtype
     )
     assert short.stages[0] == "main" and short.plan["wave_mode"] == 0
     monkeypatch.setitem(HOST_PLAN_CONSTANTS, "wave_sync_min_k", 1 << 30)
-    plain = prepare_grouped_gemm_wgrad(g, x, offs, out_dtype=out_dtype)
+    plain = prepare_grouped_det_gemm_wgrad(g, x, offs, out_dtype=out_dtype)
     assert plain.stages[0] == "main" and plain.plan["wave_mode"] == 0
     assert plain.plan["tile_k"] == launch.plan["tile_k"]
     torch.cuda.synchronize()
@@ -1198,7 +1198,7 @@ def test_wgrad_k512_halves_gives_the_drain_build_bits(out_dtype, wave, monkeypat
     arch = SUPPORTED_COMPUTE_CAPABILITIES[torch.cuda.get_device_capability(device)]
     n, k = 256, (int(c["wave_sync_min_k"]) if wave else 1024)
     x, _w, g, offs = _inputs(K512_E2, n, k, device, seed=10)
-    launch = prepare_grouped_gemm_wgrad(g, x, offs, out_dtype=out_dtype)
+    launch = prepare_grouped_det_gemm_wgrad(g, x, offs, out_dtype=out_dtype)
     if launch.plan["tile_k"] != 512:
         assert arch not in c["k512_archs"]
         pytest.skip(f"the weight gradient takes no 512-wide k tile on {arch}")
@@ -1226,7 +1226,7 @@ def test_wgrad_k512_halves_gives_the_drain_build_bits(out_dtype, wave, monkeypat
     if not halves:
         pytest.skip(f"no half-release twin on {arch}")
     monkeypatch.setitem(HOST_PLAN_CONSTANTS, "k512_release_archs", [])
-    drain = prepare_grouped_gemm_wgrad(g, x, offs, out_dtype=out_dtype)
+    drain = prepare_grouped_det_gemm_wgrad(g, x, offs, out_dtype=out_dtype)
     assert drain.stages[0] == base and drain.plan["tile_k"] == 512
     assert drain.plan["wave_mode"] == launch.plan["wave_mode"]
     torch.cuda.synchronize()
@@ -1251,7 +1251,7 @@ def test_wgrad_k256_tail_gives_the_k256_tile_bits(out_dtype, monkeypatch):
     n, k = 4096, int(c["k256_tail_max_k"])
     assert sum(sizes) // len(sizes) >= int(c["k256_tail_min_rows"])
     x, _w, g, offs = _inputs(sizes, n, k, device, seed=11)
-    launch = prepare_grouped_gemm_wgrad(g, x, offs, out_dtype=out_dtype)
+    launch = prepare_grouped_det_gemm_wgrad(g, x, offs, out_dtype=out_dtype)
     if arch not in c["k256_tail_archs"]:
         assert launch.stages[0] != "main_halves_k256t"
         pytest.skip(f"no k256-tail weight-gradient build on {arch}")
@@ -1273,7 +1273,7 @@ def test_wgrad_k256_tail_gives_the_k256_tile_bits(out_dtype, monkeypatch):
     else:
         assert ((outs[0] - ref).norm() / ref.norm()).item() <= FP32_REL_L2
     monkeypatch.setitem(HOST_PLAN_CONSTANTS, "k512_archs", [])
-    k256 = prepare_grouped_gemm_wgrad(g, x, offs, out_dtype=out_dtype)
+    k256 = prepare_grouped_det_gemm_wgrad(g, x, offs, out_dtype=out_dtype)
     assert k256.plan["tile_k"] == cb.K256_TAIL_TILE_K and k256.stages[0] == "main"
     keys = ("clusters", "num_tail", "tail_splits", "raster_rows")
     if any(k256.plan[key] != plan[key] for key in keys):
@@ -1344,7 +1344,7 @@ def test_cuda_graph_replay(op, monkeypatch):
         device = _require_program("wgrad", torch.bfloat16)
         k = int(HOST_PLAN_CONSTANTS["wave_sync_min_k"])
         x, _w, g, offs = _inputs(RAGGED_E4, 256, k, device, seed=8)
-        launch = prepare_grouped_gemm_wgrad(g, x, offs)
+        launch = prepare_grouped_det_gemm_wgrad(g, x, offs)
         ref = _reference("wgrad", g, x, RAGGED_E4)
     side = torch.cuda.Stream(device)
     side.wait_stream(torch.cuda.current_stream(device))
@@ -1386,7 +1386,7 @@ def test_prepared_launches_allocate_nothing_after_the_first(op, monkeypatch):
         device = _require_program("wgrad", torch.bfloat16)
         k = int(HOST_PLAN_CONSTANTS["wave_sync_min_k"])
         x, _w, g, offs = _inputs(RAGGED_E4, 256, k, device, seed=9)
-        launch = prepare_grouped_gemm_wgrad(g, x, offs)
+        launch = prepare_grouped_det_gemm_wgrad(g, x, offs)
         ref = _reference("wgrad", g, x, RAGGED_E4)
     launch.launch()
     torch.cuda.synchronize()
@@ -1407,7 +1407,7 @@ def test_prepared_launch_follows_new_offsets():
     device = _require_program("dgrad")
     first, second = [300, 0, 1, 700], [1, 500, 250, 250]
     _x, w, g, offs = _inputs(first, 256, 512, device)
-    launch = prepare_grouped_gemm_dgrad(g, w, offs)
+    launch = prepare_grouped_det_gemm_dgrad(g, w, offs)
     _assert_bf16_close(launch.launch(), _reference("dgrad", g, w, first))
     offs.copy_(_offs(second, device))
     _assert_bf16_close(launch.launch(), _reference("dgrad", g, w, second))
@@ -1421,13 +1421,13 @@ def test_padded_outputs_leave_the_padding_untouched():
     padded = torch.full(
         (sum_m, n + 64), float("nan"), dtype=torch.bfloat16, device=device
     )
-    out = grouped_gemm_fwd(x, w, offs, out=padded[:, :n])
+    out = grouped_det_gemm_fwd(x, w, offs, out=padded[:, :n])
     _assert_bf16_close(out, _reference("fwd", x, w, RAGGED_E4))
     assert torch.isnan(padded[:, n:]).all()
     padded = torch.full(
         (len(RAGGED_E4), n, k + 32), float("nan"), dtype=torch.bfloat16, device=device
     )
-    out = grouped_gemm_wgrad(g, x, offs, out=padded[:, :, :k])
+    out = grouped_det_gemm_wgrad(g, x, offs, out=padded[:, :, :k])
     _assert_bf16_close(out, _reference("wgrad", g, x, RAGGED_E4))
     assert torch.isnan(padded[:, :, k:]).all()
 
@@ -1437,18 +1437,18 @@ def test_empty_batch():
     device = _require_program("wgrad", torch.float32)
     x, w, g, offs = _inputs([0, 0], 256, 256, device)
     y = torch.full((0, 256), 0.0, dtype=torch.bfloat16, device=device)
-    assert grouped_gemm_fwd(x, w, offs, out=y).shape == (0, 256)
+    assert grouped_det_gemm_fwd(x, w, offs, out=y).shape == (0, 256)
     dw = torch.full((2, 256, 256), float("nan"), dtype=torch.float32, device=device)
-    assert torch.equal(grouped_gemm_wgrad(g, x, offs, out=dw), torch.zeros_like(dw))
+    assert torch.equal(grouped_det_gemm_wgrad(g, x, offs, out=dw), torch.zeros_like(dw))
 
 
 def test_rejects_misaligned_shapes():
     device = _require_program("fwd")
     x, w, _g, offs = _inputs(RAGGED_E4, 384, 256, device)  # N % 256 != 0
     with pytest.raises(ValueError):
-        prepare_grouped_gemm_fwd(x, w, offs)
+        prepare_grouped_det_gemm_fwd(x, w, offs)
     with pytest.raises(ValueError):
-        prepare_grouped_gemm_fwd(x, w, offs.to(torch.int64))
+        prepare_grouped_det_gemm_fwd(x, w, offs.to(torch.int64))
 
 
 # ---------------------------------------------------------------------------
@@ -1467,28 +1467,30 @@ def test_m_indptr_form_matches_offs_form():
     device = _require_program("wgrad", torch.bfloat16)
     x, w, g, offs = _inputs(RAGGED_E6, 512, 256, device)
     m_indptr = _m_indptr(RAGGED_E6, device)
-    assert torch.equal(grouped_gemm_fwd(x, w, m_indptr), grouped_gemm_fwd(x, w, offs))
     assert torch.equal(
-        grouped_gemm_dgrad(g, w, m_indptr), grouped_gemm_dgrad(g, w, offs)
+        grouped_det_gemm_fwd(x, w, m_indptr), grouped_det_gemm_fwd(x, w, offs)
     )
     assert torch.equal(
-        grouped_gemm_wgrad(g, x, m_indptr, num_groups=len(RAGGED_E6)),
-        grouped_gemm_wgrad(g, x, offs),
+        grouped_det_gemm_dgrad(g, w, m_indptr), grouped_det_gemm_dgrad(g, w, offs)
+    )
+    assert torch.equal(
+        grouped_det_gemm_wgrad(g, x, m_indptr, num_groups=len(RAGGED_E6)),
+        grouped_det_gemm_wgrad(g, x, offs),
     )
     with pytest.raises(ValueError):  # neither E nor E + 1 entries
-        grouped_gemm_wgrad(g, x, m_indptr[:-2], num_groups=len(RAGGED_E6))
+        grouped_det_gemm_wgrad(g, x, m_indptr[:-2], num_groups=len(RAGGED_E6))
 
 
 def test_autograd_wrapper_matches_reference_and_is_deterministic():
     device = _require_program("fwd")
     device = _require_program("dgrad")
     device = _require_program("wgrad", torch.bfloat16)
-    cake_grouped_mm = pkg.cake_grouped_mm
+    cake_grouped_det_mm = pkg.cake_grouped_det_mm
 
     x, w, g, offs = _inputs(RAGGED_E6, 512, 256, device)
     x = x.clone().requires_grad_(True)
     w = w.clone().requires_grad_(True)
-    y = cake_grouped_mm(x, w, offs)
+    y = cake_grouped_det_mm(x, w, offs)
     assert y.shape == (sum(RAGGED_E6), 512) and y.dtype == torch.bfloat16
     _assert_bf16_close(y.detach(), _reference("fwd", x.detach(), w.detach(), RAGGED_E6))
     y.backward(g)
@@ -1504,8 +1506,10 @@ def test_autograd_wrapper_matches_reference_and_is_deterministic():
     x.grad = None
     w.grad = None
     # Same gradients from the m_indptr form; bitwise reproducible.
-    cake_grouped_mm(x, w, _m_indptr(RAGGED_E6, device), deterministic=True).backward(g)
+    cake_grouped_det_mm(
+        x, w, _m_indptr(RAGGED_E6, device), deterministic=True
+    ).backward(g)
     torch.cuda.synchronize()
     assert torch.equal(x.grad, dx) and torch.equal(w.grad, dw)
     with pytest.raises(ValueError):
-        cake_grouped_mm(x.float(), w, offs)
+        cake_grouped_det_mm(x.float(), w, offs)

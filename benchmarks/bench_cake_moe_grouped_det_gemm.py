@@ -24,7 +24,7 @@ with a cold L2 between iterations.
 
 Usage::
 
-    python benchmarks/bench_cake_moe_grouped_gemm.py [--ops fwd,wgrad] [--rows e4_m112576] [--cupti] [--json out.json]
+    python benchmarks/bench_cake_moe_grouped_det_gemm.py [--ops fwd,wgrad] [--rows e4_m112576] [--cupti] [--json out.json]
 """
 
 import argparse
@@ -33,11 +33,11 @@ import math
 
 import torch
 
-from flashinfer.experimental.cake_moe_grouped_gemm import cake_backend as cb
-from flashinfer.experimental.cake_moe_grouped_gemm.cake_backend import (
-    prepare_grouped_gemm_dgrad,
-    prepare_grouped_gemm_fwd,
-    prepare_grouped_gemm_wgrad,
+from flashinfer.experimental.cake_moe_grouped_det_gemm import cake_backend as cb
+from flashinfer.experimental.cake_moe_grouped_det_gemm.cake_backend import (
+    prepare_grouped_det_gemm_dgrad,
+    prepare_grouped_det_gemm_fwd,
+    prepare_grouped_det_gemm_wgrad,
 )
 from flashinfer.testing import bench_gpu_time
 
@@ -128,11 +128,11 @@ def _bounds(sizes):
 def cake_arm(row, t):
     op = row["op"]
     if op == "fwd":
-        launch = prepare_grouped_gemm_fwd(t["x"], t["w"], t["offs"], out=t["out"])
+        launch = prepare_grouped_det_gemm_fwd(t["x"], t["w"], t["offs"], out=t["out"])
     elif op == "dgrad":
-        launch = prepare_grouped_gemm_dgrad(t["g"], t["w"], t["offs"], out=t["out"])
+        launch = prepare_grouped_det_gemm_dgrad(t["g"], t["w"], t["offs"], out=t["out"])
     else:
-        launch = prepare_grouped_gemm_wgrad(t["g"], t["x"], t["offs"], out=t["out"])
+        launch = prepare_grouped_det_gemm_wgrad(t["g"], t["x"], t["offs"], out=t["out"])
     return launch.launch, f"{launch.record_name} plan={launch.plan}"
 
 
