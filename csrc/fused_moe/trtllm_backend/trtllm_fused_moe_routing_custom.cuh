@@ -60,6 +60,28 @@ void launchHistogramKernel(Data const& data, int numBlocksHistogram, uint32_t nu
 void launchOffsetsKernel(Data const& data, int numBlocksOffsets, uint32_t numThreadsHist,
                          void* stream);
 
+// Fused shared experts: the scores-to-TopK kernels write each token's routed TopK at packed
+// slots [0, mTopK) of a row of mTopK + mNumFusedSharedExperts entries, and append the shared
+// experts as {1.0, mNumExperts + i} at slots [mTopK, mTopK + mNumFusedSharedExperts), the same
+// layout the grouped DeepSeek kernel produces. run() then hands the packed rows to the post-TopK
+// pipeline with the expert and TopK counts widened to cover the shared experts.
+template <typename KernelParams>
+__device__ __forceinline__ int64_t packedTopKRowOffset(KernelParams const& params,
+                                                       int64_t tokenIdx) {
+  return tokenIdx * int64_t{params.mTopK + params.mNumFusedSharedExperts};
+}
+
+template <typename KernelParams>
+__device__ __forceinline__ void writeFusedSharedExpertSlots(KernelParams const& params,
+                                                            int64_t tokenIdx, int32_t laneIdx) {
+  using OutputT = typename KernelParams::OutputT;
+  if (laneIdx < params.mNumFusedSharedExperts) {
+    params.mPtrTopKPacked[packedTopKRowOffset(params, tokenIdx) + params.mTopK + laneIdx] =
+        PackedScoreIdx<OutputT>{static_cast<OutputT>(1.0F),
+                                static_cast<int16_t>(params.mNumExperts + laneIdx)};
+  }
+}
+
 #if defined(FLASHINFER_ROUTING_CUSTOM_BLOCK_GROUP)
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -1052,14 +1074,14 @@ __global__ void __launch_bounds__(
     if (laneIdx < params.mTopK) {
       PackedScoreIdx<OutputT> packedScore{static_cast<OutputT>(laneTopKScore),
                                           static_cast<int16_t>(laneTopKExpertIdx)};
-      params.mPtrTopKPacked[tokenIdx * params.mTopK + laneIdx] = packedScore;
-      // Routing replay: record selected expert IDs. Layout: [num_tokens, topK]
-      // -- same indexing as mPtrTopKPacked.
+      params.mPtrTopKPacked[packedTopKRowOffset(params, tokenIdx) + laneIdx] = packedScore;
+      // Routing replay: record selected expert IDs. Layout: [num_tokens, topK], routed-only.
       if (params.mPtrRoutingReplayOut != nullptr) {
         params.mPtrRoutingReplayOut[tokenIdx * params.mTopK + laneIdx] =
             static_cast<int16_t>(laneTopKExpertIdx);
       }
     }
+    writeFusedSharedExpertSlots(params, tokenIdx, laneIdx);
   }
 
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
@@ -1318,12 +1340,13 @@ __global__ void __launch_bounds__(kBlockScoresKernelBlockDim)
       if (laneIdx < params.mTopK) {
         PackedScoreIdx<OutputT> packedScore{static_cast<OutputT>(laneTopKScore),
                                             static_cast<int16_t>(laneTopKExpertIdx)};
-        int64_t const outputIdx = int64_t{tokenIdx} * int64_t{params.mTopK} + laneIdx;
-        params.mPtrTopKPacked[outputIdx] = packedScore;
+        params.mPtrTopKPacked[packedTopKRowOffset(params, tokenIdx) + laneIdx] = packedScore;
         if (params.mPtrRoutingReplayOut != nullptr) {
-          params.mPtrRoutingReplayOut[outputIdx] = static_cast<int16_t>(laneTopKExpertIdx);
+          params.mPtrRoutingReplayOut[int64_t{tokenIdx} * int64_t{params.mTopK} + laneIdx] =
+              static_cast<int16_t>(laneTopKExpertIdx);
         }
       }
+      writeFusedSharedExpertSlots(params, tokenIdx, laneIdx);
 
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
       if (params.mUsePdl) {
@@ -1362,14 +1385,14 @@ __global__ void __launch_bounds__(kBlockScoresKernelBlockDim)
       int32_t const expertIdx = topExperts[laneIdx];
       PackedScoreIdx<OutputT> packedScore{static_cast<OutputT>(topScores[laneIdx]),
                                           static_cast<int16_t>(expertIdx)};
-      params.mPtrTopKPacked[int64_t{tokenIdx} * int64_t{params.mTopK} + laneIdx] = packedScore;
-      // Routing replay: record selected expert IDs. Layout: [num_tokens, topK]
-      // -- same indexing as mPtrTopKPacked.
+      params.mPtrTopKPacked[packedTopKRowOffset(params, tokenIdx) + laneIdx] = packedScore;
+      // Routing replay: record selected expert IDs. Layout: [num_tokens, topK], routed-only.
       if (params.mPtrRoutingReplayOut != nullptr) {
         params.mPtrRoutingReplayOut[int64_t{tokenIdx} * int64_t{params.mTopK} + laneIdx] =
             static_cast<int16_t>(expertIdx);
       }
     }
+    writeFusedSharedExpertSlots(params, tokenIdx, laneIdx);
 
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     if (params.mUsePdl) {
@@ -1522,6 +1545,54 @@ void launchOffsetsKernel(Data const& data, int numBlocksOffsets, uint32_t numThr
 //
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+// Fused shared experts always take the split path. The fused block, dyn-block and cluster
+// kernels keep TopK and permutation in one kernel with a routed-only TopK stride, so a
+// scores-to-TopK kernel writes widened packed rows (routed TopK followed by the shared experts,
+// see writeFusedSharedExpertSlots) and the post-TopK pipeline permutes routed and shared experts
+// together over (mNumExperts + S, mTopK + S), as for grouped DeepSeek routing. Precomputed TopK
+// inputs already carry the shared experts in rows of mTopK + S entries.
+void runWithFusedSharedExperts(Data const& data, void* stream) {
+  int32_t const numShared = data.mNumFusedSharedExperts;
+  TVM_FFI_ICHECK_LE(numShared, static_cast<int32_t>(WarpSize))
+      << "Number of fused shared experts (" << numShared << ") must be at most the warp size.";
+  TVM_FFI_ICHECK_LE(data.mNumExperts + numShared, static_cast<int32_t>(MaxSupportedExperts))
+      << "Routing kernel expects total experts (routed + fused shared) <= " << MaxSupportedExperts
+      << ", got " << data.mNumExperts + numShared << ".";
+  TVM_FFI_ICHECK_LE(data.mTopK + numShared, static_cast<int32_t>(MaxSupportedTopExperts))
+      << "Routing kernel expects topK + fused shared experts <= " << MaxSupportedTopExperts
+      << ", got " << data.mTopK + numShared << ".";
+
+  bool const hasPrecomputedTopK =
+      data.mPtrTopKIds != nullptr || (data.mPtrTopKPacked != nullptr && data.mPtrScores == nullptr);
+  if (!hasPrecomputedTopK) {
+    TVM_FFI_ICHECK(data.mPtrTopKPacked != nullptr)
+        << "Fused shared experts require `mPtrTopKPacked` (the scores-to-TopK kernel writes "
+           "the widened TopK rows into it).";
+    // Same block-per-token vs warp-per-token choice as the large-batch path of run().
+    bool const useBlockScores =
+        queryPolicySupportsBlockPerToken(data) &&
+        (data.mNumTokens <= 1024 || data.mNumExperts >= NumExperts1024Experts);
+    uint32_t const numThreadsHist =
+        std::min(1024u, static_cast<uint32_t>(getMaxNumExperts(data.mNumExperts)));
+    bool const launched = useBlockScores ? launchBlockScoresKernel(data, stream)
+                                         : launchHistogramScoresKernel(data, /*maxNumBlocks=*/1024,
+                                                                       numThreadsHist, stream);
+    FLASHINFER_CHECK(launched,
+                     "routingCustom::run: no compiled score-to-topK tier covers numExperts=",
+                     data.mNumExperts, " topK=", data.mTopK,
+                     " for the active routing policy (fused shared experts; see preceding "
+                     "warning). Add a matching Tier<E, K> to (Histogram)PolicyTraits in "
+                     "RoutingCustomPolicy.cuh.");
+  }
+
+  Data widened = data;
+  widened.mPtrScores = nullptr;
+  widened.mNumExperts += numShared;
+  widened.mTopK += numShared;
+  widened.mNumLocalExperts += numShared;
+  runPostTopKPipeline(widened, stream);
+}
+
 void run(Data const& data, void* stream) {
   TVM_FFI_ICHECK(data.mPtrTopKPacked != nullptr || data.mPtrScores != nullptr ||
                  data.mPtrTopKIds != nullptr)
@@ -1529,6 +1600,16 @@ void run(Data const& data, void* stream) {
   TVM_FFI_ICHECK_LE(data.mTopK, data.mNumExperts)
       << "Routing kernel expects topK (" << data.mTopK << ") to be <= numExperts ("
       << data.mNumExperts << ").";
+
+  if (data.mNumFusedSharedExperts > 0) {
+    if (data.mPtrTopKIds != nullptr) {
+      TVM_FFI_ICHECK(data.mPtrTopKWeights != nullptr)
+          << "When mPtrTopKIds is provided, mPtrTopKWeights must also be provided for "
+             "custom routing.";
+    }
+    runWithFusedSharedExperts(data, stream);
+    return;
+  }
 
   // When topK is already computed (mPtrTopKIds or mPtrTopKPacked without scores),
   // delegate to the shared post-topK pipeline which handles all path selection

@@ -3324,13 +3324,133 @@ def test_fp4_block_scale_moe_pinned_4over6_requires_per_token_nvfp4():
         trtllm_fp4_block_scale_moe(**kwargs, nvfp4_4over6=NVFP44Over6Config())
 
 
-def test_fused_shared_experts_reject_non_deepseek_routing():
-    """Fused shared experts must reject non-DeepSeekV3 routing.
+def _fused_shared_routing_config(routing_method_type, num_experts, top_k, **kwargs):
+    return {
+        "num_experts": num_experts,
+        "top_k": top_k,
+        "padding": 8,
+        "n_groups": None,
+        "top_k_groups": None,
+        "routed_scaling": None,
+        "has_routing_bias": False,
+        "routing_method_type": routing_method_type,
+        "compatible_moe_impls": [FP4Moe, FP8BlockScaleMoe],
+        "compatible_intermediate_size": [512],
+        "compatible_activation_types": [ActivationType.Swiglu],
+        "enable_autotune": False,
+        **kwargs,
+    }
 
-    Only the DeepSeekV3 routing branch implements the fused shared-expert
-    slots (the C++ runner rejects every other method). This guard is a cheap
-    host-side check, so this test does not require a GPU. Routing replay with
-    fused shared experts is covered by the GPU tests in
+
+@pytest.mark.parametrize("num_tokens", [8, 768])
+@pytest.mark.parametrize("hidden_size", [1024])
+@pytest.mark.parametrize("intermediate_size", [512])
+@pytest.mark.parametrize(
+    "moe_impl",
+    [
+        pytest.param(
+            FP8BlockScaleMoe(fp8_quantization_type=QuantMode.FP8_BLOCK_SCALE_MXFP8),
+            id="FP8_Block_MxFp8",
+        ),
+        pytest.param(
+            FP8BlockScaleMoe(fp8_quantization_type=QuantMode.FP8_BLOCK_SCALE_DEEPSEEK),
+            id="FP8_Block_DeepSeek",
+        ),
+        pytest.param(FP4Moe(quant_mode=QuantMode.FP4_NVFP4_NVFP4), id="NvFP4xNvFP4"),
+    ],
+)
+@pytest.mark.parametrize(
+    "routing_config",
+    [
+        # MiniMax-M3 geometry: 128 experts, top-4, sigmoid + bias routing.
+        pytest.param(
+            _fused_shared_routing_config(
+                RoutingMethodType.MiniMax2,
+                128,
+                4,
+                has_routing_bias=True,
+                num_fused_shared_experts=1,
+            ),
+            id="MiniMax2_128e_shared_1",
+        ),
+        pytest.param(
+            _fused_shared_routing_config(
+                RoutingMethodType.MiniMax2,
+                256,
+                6,
+                has_routing_bias=True,
+                num_fused_shared_experts=2,
+            ),
+            id="MiniMax2_256e_shared_2",
+        ),
+        pytest.param(
+            _fused_shared_routing_config(
+                RoutingMethodType.Renormalize, 128, 8, num_fused_shared_experts=1
+            ),
+            id="Renormalize_128e_shared_1",
+        ),
+        # n_group = 1 runs the routingCustom no-groups path, not the grouped kernel.
+        pytest.param(
+            _fused_shared_routing_config(
+                RoutingMethodType.DeepSeekV3,
+                256,
+                8,
+                n_groups=1,
+                top_k_groups=1,
+                routed_scaling=2.5,
+                has_routing_bias=True,
+                num_fused_shared_experts=1,
+            ),
+            id="DSv3_no_groups_shared_1",
+        ),
+    ],
+)
+@pytest.mark.parametrize(
+    "weight_processing",
+    [
+        pytest.param(
+            {
+                "use_shuffled_weight": True,
+                "layout": WeightLayout.MajorK,
+                "compatible_moe_impls": [FP4Moe, FP8BlockScaleMoe],
+                "compatible_gemm_backends": [MoeGemmBackend.TRTLLM],
+            },
+            id="Shuffled_MajorK",
+        ),
+    ],
+)
+def test_fused_shared_experts_custom_routing(
+    num_tokens,
+    hidden_size,
+    intermediate_size,
+    moe_impl,
+    routing_config,
+    weight_processing,
+    moe_gemm_backend,
+    cache_permute_indices,
+):
+    """Fused shared experts with the routingCustom methods (issue #7810)."""
+    run_moe_test(
+        num_tokens,
+        hidden_size,
+        intermediate_size,
+        moe_impl,
+        routing_config,
+        weight_processing,
+        ActivationType.Swiglu,
+        cache_permute_indices,
+        torch.float32,
+        moe_gemm_backend=moe_gemm_backend,
+    )
+
+
+def test_fused_shared_experts_reject_llama4_routing():
+    """Fused shared experts must reject Llama4 routing.
+
+    Every routing kernel except Llama4's top-1 kernel appends the fused
+    shared-expert slots (the C++ runner rejects Llama4 too). This guard is a
+    cheap host-side check, so this test does not require a GPU. Routing replay
+    with fused shared experts is covered by the GPU tests in
     ``test_trtllm_gen_routed_fused_moe.py``.
     """
     num_experts = 4
@@ -3378,14 +3498,13 @@ def test_fused_shared_experts_reject_non_deepseek_routing():
         (trtllm_fp8_block_scale_moe, fp8_kwargs),
         (trtllm_fp4_block_scale_moe, fp4_kwargs),
     ):
-        # Only DeepSeekV3 routing implements the fused shared-expert slots.
-        for method in (RoutingMethodType.MiniMax2, RoutingMethodType.Renormalize):
-            with pytest.raises(ValueError, match=r"only supported .* DeepSeekV3"):
-                op(
-                    **op_kwargs,
-                    **common_kwargs,
-                    routing_method_type=method.value,
-                )
+        # Llama4's top-1 kernel is the one router without shared-expert slots.
+        with pytest.raises(ValueError, match=r"not supported .* Llama4"):
+            op(
+                **op_kwargs,
+                **common_kwargs,
+                routing_method_type=RoutingMethodType.Llama4.value,
+            )
 
 
 def test_routing_replay_out_rejects_undersized_dim0():
