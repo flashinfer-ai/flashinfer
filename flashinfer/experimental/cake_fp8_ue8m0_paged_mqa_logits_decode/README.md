@@ -1,6 +1,6 @@
 # Cake FP8 paged MQA decode logits over UE8M0-scaled keys (SM103, SM107)
 
-Owner: @jdebache · Tracking issue: Mistral Large 4 · Status: experimental, JIT-only
+Owner: @jdebache · Tracking issue: [#8019](https://github.com/flashinfer-ai/flashinfer/issues/8019) · Status: experimental, JIT-only
 
 Experimental backend of `flashinfer.attn_scores.fp8_ue8m0_paged_mqa_logits_decode`:
 the DSA indexer decode logits over an FP8 paged key cache whose per-token
