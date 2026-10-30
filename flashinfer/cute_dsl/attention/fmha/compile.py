@@ -17,6 +17,7 @@
 ``compile_cute_dsl_fmha_kernel`` / ``compile_cute_dsl_fmha_blockscaled_kernel``
 ``cute.compile`` (and cache) the trtllm ``BlackwellFusedMultiHead[BlockScaled]AttentionForward``
 classes with symbolic batch/seqlen dims, returning a TVM-FFI-callable kernel handle.
+PDL is a runtime launch flag and is excluded from compiler cache keys.
 """
 
 import functools
@@ -77,7 +78,6 @@ def compile_cute_dsl_fmha_kernel(
     with_lse: bool,
     enable_sink: bool,
     enable_skip_softmax: bool,
-    use_pdl: bool,
     device: torch.device,
     has_window_left: bool = False,
     has_window_right=None,
@@ -95,7 +95,7 @@ def compile_cute_dsl_fmha_kernel(
     size.  ``has_window_right=None`` derives presence from ``is_causal``
     (causal is a right bound with runtime value 0).
     """
-    from .fmha import BlackwellFusedMultiHeadAttentionForward
+    from .sm100.fmha import BlackwellFusedMultiHeadAttentionForward
 
     if has_window_right is None:
         has_window_right = is_causal
@@ -204,7 +204,7 @@ def compile_cute_dsl_fmha_kernel(
         None,
         None,
         stream_fake,
-        use_pdl,
+        True,  # Runtime PDL placeholder; not a specialization axis.
         None,
         None,
         None,
@@ -230,13 +230,14 @@ def compile_cute_dsl_fmha_blockscaled_kernel(
     is_causal: bool,
     with_lse: bool,
     enable_skip_softmax: bool,
-    use_pdl: bool,
     device: torch.device,
     has_window_left: bool = False,
     has_window_right=None,
 ):
     """Compile (and cache) the trtllm block-scaled FMHA kernel (batched, non-varlen)."""
-    from .fmha_blockscaled import BlackwellFusedMultiHeadBlockScaledAttentionForward
+    from .sm100.fmha_blockscaled import (
+        BlackwellFusedMultiHeadBlockScaledAttentionForward,
+    )
 
     if has_window_right is None:
         has_window_right = is_causal
@@ -351,6 +352,6 @@ def compile_cute_dsl_fmha_blockscaled_kernel(
         None,
         None,
         stream_fake,
-        use_pdl,
+        True,  # Runtime PDL placeholder; not a specialization axis.
         options="--enable-tvm-ffi --opt-level 2",
     )
