@@ -932,9 +932,14 @@ folded N64 tile. A scale-ring default is tiled on its lockstep (sf0) core:
 the two-slot ring needs four AB stages, which N72/N80 tiles do not fit.
 H7168/I3072/E384/EP4 NV tuning thus grows from 60 to 62 candidates above
 256 tokens. There the sf0 N72 tiling measured 0.89x the scale-ring default
-at 1024 tokens, N72 0.62x and 0.92x the NV default at 1152 and 2048 tokens,
-and N80 0.87x at 1280 tokens. The tail-pair candidates are still derived
-from the legacy table.
+at 1024 tokens and 0.92x the NV default at 2048 tokens. The NV reference
+defaults without the scale ring (every bucket but 512 and 1024 tokens) take
+the same row rule as MXFP4. Against their N64 tiles that measured 0.61x at
+1152 tokens (N72), 0.87x at 1280 (N80), 0.75x at 2304 (N72), 0.94x at 2560
+(N80), 0.87x at 4608 (N72), 0.95x at 5120 (N80), and 0.98x, 0.94x and 0.94x
+at 8192, 16384 and 32768 tokens (N80); capacities with equal tile counts,
+such as 2048 and 4096 tokens, keep N64. The tail-pair candidates are still
+derived from the legacy table.
 
 Online `knobs="auto"` and offline `flashinfer.moe_ep.tune` use the same
 `hopper_mxfp4_candidates` list. The default public scorer takes

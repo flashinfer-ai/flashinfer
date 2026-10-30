@@ -12,6 +12,7 @@ from typing import Any
 from .nvfp4_policy import split_nvfp4_conversion_tactic, validate_nvfp4_kperm
 from .mxfp4_optimization import (
     _row_tile_variants,
+    _row_tiled,
     hopper_mxfp4_candidates,
     normalize_mxfp4_optimization_tactic,
     resolve_mxfp4_tactic_optimizations,
@@ -200,8 +201,13 @@ def hopper_nvfp4_default_profile(
     ):
         return None
     profile = NVFP4_DEFAULT_TACTICS_BY_TOKENS[_default_bucket(max_tokens)]
+    tactic = profile["requested_tactic"]
+    if not tactic.get("nvfp4_sf_stages"):
+        # As for MXFP4: the token-tile width with the fewest tiles for the
+        # balanced rows per expert (the scale ring fits only N64 tiles).
+        tactic = _row_tiled(tactic, max_tokens * num_topk * world_size, num_experts)
     return dict(
-        requested_tactic=normalize_hopper_nvfp4_tactic(profile["requested_tactic"]),
+        requested_tactic=normalize_hopper_nvfp4_tactic(tactic),
         requested_config=dict(profile["requested_config"]),
     )
 
