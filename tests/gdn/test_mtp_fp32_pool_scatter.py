@@ -13,9 +13,11 @@ exercises and the small contiguous pools of the existing tests do not:
 - **pools of different sizes with identical per-slot strides** across one
   process (a small profiling pool followed by the full serving pool) — the
   JIT cache must not reuse a kernel compiled for another pool shape;
-- **large pools**: the flat slot index times the 65,536-byte fp32 slot row
-  overflows Int32 at flat index >= 32,768 (slot ~2,731 at HV=12), so offsets
-  must be computed in Int64.
+- **large pools**: the flat slot index times the 16,384-element fp32 slot row
+  overflows Int32 at flat index >= 131,072 (slot >= 10,923 at HV=12), so slot
+  offsets must be computed in Int64. The same wrap applies to the dense
+  ``intermediate_states_buffer`` cache tiles (flat index
+  ``i * cache_steps * HV``, e.g. T=8, HV=32, B >= 513).
 
 Geometry mirrors a TP-sharded Qwen3.5-class GDN layer: H=4, HV=12, K=V=128,
 T=4.
@@ -174,18 +176,23 @@ def test_fp32_fla_scatter_pool_size_change_same_strides(batch_size: int):
             reference = out_c
 
 
-@pytest.mark.parametrize("batch_size", [8])
-def test_fp32_fla_scatter_large_pool_int64_offsets(batch_size: int):
+# B=8 keeps the inline kernel in range at HV=12; B=16 exercises the
+# warp-specialized kernel.
+@pytest.mark.parametrize("strided", [False, True])
+@pytest.mark.parametrize("batch_size", [8, 16])
+def test_fp32_fla_scatter_large_pool_int64_offsets(batch_size: int, strided: bool):
     """Relocation invariance on a pool past the Int32 offset-overflow
     threshold: the same problem placed at bottom-of-pool and at top-of-pool
-    slots must produce identical outputs and states. With Int32 offset
-    arithmetic the top-of-pool placement reads/writes through wrapped
-    addresses (silent corruption or an illegal memory access)."""
+    slots must produce identical outputs and states. The element offset wraps
+    Int32 from flat index 131,072 (slot >= 10,923 at HV=12); 12,288 slots put
+    the top-of-pool placement (flat up to 147,455) past it, so with Int32
+    offset arithmetic it reads/writes through wrapped addresses (silent
+    corruption or an illegal memory access)."""
     _skip_if_not_sm90_or_later()
     device = torch.device("cuda")
     B = batch_size
-    slots = 8192  # flat index up to 98,303 >> the 32,768 Int32 threshold
-    need = slots * HV * V * K * 4 * 1.1
+    slots = 12288
+    need = slots * (HV * V * K + (SLOT_PAD if strided else 0)) * 4 * 1.1
     free, _ = torch.cuda.mem_get_info()
     if free < need:
         pytest.skip(f"needs ~{need / 2**30:.1f} GiB free device memory")
@@ -197,7 +204,7 @@ def test_fp32_fla_scatter_large_pool_int64_offsets(batch_size: int):
     high = torch.arange(slots - n, slots, dtype=torch.int32, device=device)
     seed_states = torch.randn(B, HV, V, K, dtype=torch.float32, device=device)
 
-    pool = _make_pool(slots, False, device)
+    pool = _make_pool(slots, strided, device)
     results = []
     for idx in (low, high):
         read_idx = idx[:B].contiguous()
@@ -210,9 +217,78 @@ def test_fp32_fla_scatter_large_pool_int64_offsets(batch_size: int):
     torch.testing.assert_close(results[1][1], results[0][1], atol=0, rtol=0)
 
 
+def test_fp32_intermediate_buffer_large_batch_int64_offsets():
+    """The dense ``intermediate_states_buffer`` cache tiles share the Int32
+    wrap: the buffer's flat index ``i * cache_steps * HV`` exceeds 131,072
+    at T=8, HV=32 from B >= 513. Scatter mode and buffer mode compute the
+    same per-token states, so ``buffer[i, t]`` must equal
+    ``pool[ssm_state_indices[i, t]]`` for every (i, t) and the outputs must
+    match; with Int32 buffer offsets the tail of the batch writes through
+    wrapped addresses."""
+    _skip_if_not_sm90_or_later()
+    device = torch.device("cuda")
+    B, T8, HV32, H8 = 528, 8, 32, 8
+    pool_slots = B * (T8 + 1) + 1
+    need = (B * T8 * HV32 + pool_slots * HV32) * V * K * 4 * 1.2
+    free, _ = torch.cuda.mem_get_info()
+    if free < need:
+        pytest.skip(f"needs ~{need / 2**30:.1f} GiB free device memory")
+    seed = int(os.environ.get("SEED", "0")) + 3
+
+    torch.manual_seed(seed)
+    inputs = dict(
+        q=torch.randn(B, T8, H8, K, dtype=torch.bfloat16, device=device),
+        k=torch.randn(B, T8, H8, K, dtype=torch.bfloat16, device=device),
+        v=torch.randn(B, T8, HV32, V, dtype=torch.bfloat16, device=device),
+        a=(torch.randn(B, T8, HV32, device=device) * 0.5).to(torch.bfloat16),
+        b=torch.randn(B, T8, HV32, device=device).to(torch.bfloat16),
+        A_log=(torch.rand(HV32, dtype=torch.float32, device=device) * 3.0 + 0.1).log(),
+        dt_bias=(torch.randn(HV32, device=device) * 0.5).to(torch.bfloat16),
+        scale=1.0 / math.sqrt(K),
+        use_qk_l2norm=True,
+        initial_state_indices=torch.arange(1, B + 1, dtype=torch.int32, device=device),
+    )
+    pool = torch.zeros(pool_slots, HV32, V, K, dtype=torch.float32, device=device)
+    pool.normal_(0, 0.5)
+    pool_scatter = pool.clone()
+    scat_idx = (
+        torch.arange(B + 1, B + 1 + B * T8, dtype=torch.int32, device=device)
+        .reshape(B, T8)
+        .contiguous()
+    )
+
+    out_scatter = torch.zeros(B, T8, HV32, V, dtype=torch.bfloat16, device=device)
+    gated_delta_rule_mtp(
+        initial_state=pool_scatter,
+        ssm_state_indices=scat_idx,
+        output=out_scatter,
+        disable_state_update=False,
+        **inputs,
+    )
+    torch.cuda.synchronize()
+
+    buffer = torch.zeros(B, T8, HV32, V, K, dtype=torch.float32, device=device)
+    out_buffer = torch.zeros(B, T8, HV32, V, dtype=torch.bfloat16, device=device)
+    gated_delta_rule_mtp(
+        initial_state=pool,
+        intermediate_states_buffer=buffer,
+        output=out_buffer,
+        disable_state_update=False,
+        **inputs,
+    )
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(out_buffer, out_scatter, atol=0, rtol=0)
+    flat_pool = pool_scatter[scat_idx.reshape(-1).long()].reshape(B, T8, HV32, V, K)
+    torch.testing.assert_close(buffer, flat_pool, atol=0, rtol=0)
+
+
 if __name__ == "__main__":
     test_fp32_fla_scatter_strided_pool_matches_contiguous(2)
     test_fp32_fla_scatter_strided_pool_matches_contiguous(16)
     test_fp32_fla_scatter_pool_size_change_same_strides(16)
-    test_fp32_fla_scatter_large_pool_int64_offsets(8)
+    for b in (8, 16):
+        for st in (False, True):
+            test_fp32_fla_scatter_large_pool_int64_offsets(b, st)
+    test_fp32_intermediate_buffer_large_batch_int64_offsets()
     print("all pool-scatter tests passed")
