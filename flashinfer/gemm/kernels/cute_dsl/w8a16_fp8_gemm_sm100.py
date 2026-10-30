@@ -230,12 +230,12 @@ class Sm100W8A16Fp8GemmKernel:
         blocks_per_transform_group = (
             num_transform_blocks // self.num_transform_warpgroups
         )
-        transform_group_tiler = [None] * 5
-        transform_group_tiler[split_mode] = blocks_per_transform_group
-        transform_group_tiler = tuple(transform_group_tiler)
-        transform_group_coord = [None] * 5
-        transform_group_coord[split_mode] = (None, transform_group_idx)
-        transform_group_coord = tuple(transform_group_coord)
+        transform_group_tiler = tuple(
+            blocks_per_transform_group if i == split_mode else None for i in range(5)
+        )
+        transform_group_coord = tuple(
+            (None, transform_group_idx) if i == split_mode else None for i in range(5)
+        )
         tAsA_input = cute.logical_divide(tAsA_input, transform_group_tiler)[
             transform_group_coord
         ]
@@ -457,14 +457,9 @@ class Sm100W8A16Fp8GemmKernel:
             self.b_dtype, smem_layout_b_per_stage
         ) * cute.size(tiled_mma.thr_id.shape)
 
-        self.tile_sched_params, grid = self._compute_grid(
-            c,
-            self.cta_tile_shape_mnk,
-            self.cluster_shape_mn,
-            max_active_clusters,
-            self.swizzle_size,
-            self.raster_along_m,
-        )
+        # Persistent grid: one CTA per SM slot (max_active_clusters clusters); the
+        # scheduler warp walks the tile grid itself.
+        grid = (self.cluster_shape_mn[0], self.cluster_shape_mn[1], max_active_clusters)
 
         epi_smem_layout = cute.slice_(self.c_smem_layout_staged, (None, None, 0))
         tma_atom_c, tma_tensor_c = cpasync.make_tiled_tma_atom(
@@ -529,7 +524,6 @@ class Sm100W8A16Fp8GemmKernel:
             self.smem_layout_b,
             self.c_smem_layout_staged,
             self.epi_tile,
-            self.tile_sched_params,
         ).launch(
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
@@ -560,7 +554,6 @@ class Sm100W8A16Fp8GemmKernel:
         b_smem_layout: cute.ComposedLayout,
         c_smem_layout_staged: cute.ComposedLayout,
         epi_tile: cute.Tile,
-        tile_sched_params: utils.PersistentTileSchedulerParams,
     ):
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         tidx, _, _ = cute.arch.thread_idx()
@@ -773,36 +766,67 @@ class Sm100W8A16Fp8GemmKernel:
             act_tiles = cutlass.Int32(
                 cute.ceil_div(act_rows, self.cta_tile_shape_mnk[1])
             )
-            tile_sched = utils.StaticPersistentRuntimeTileScheduler.create(
-                tile_sched_params,
-                (bidx, bidy, bidz),
-                cute.arch.grid_dim(),
-                inner_mode=0 if self.raster_along_m else 1,
+            weight_rows_s = cutlass.Int32(cute.size(tensor_c.shape[0]))
+            weight_tiles = cutlass.Int32(
+                cute.ceil_div(weight_rows_s, self.cta_tile_shape_mnk[0])
             )
-            work_tile = tile_sched.initial_work_tile_info()
+            # The cluster-tile grid: `major` is the fast raster axis (M = weight tiles
+            # along M, or N = activation tiles along N), as CUTLASS's sm100 scheduler
+            # lays its grid out after possibly_transpose_grid.  Every cluster walks the
+            # linear cluster-tile index from its own id in steps of the launched
+            # cluster count; a cluster tile maps to (major, minor), the L2 group
+            # remap of swizzle_and_rasterize (groups of swizzle_size clusters along
+            # the major axis, residual tiles not remapped), then to (m, n).
+            clusters_m = (
+                weight_tiles + self.cluster_shape_mn[0] - 1
+            ) // self.cluster_shape_mn[0]
+            clusters_n = (
+                act_tiles + self.cluster_shape_mn[1] - 1
+            ) // self.cluster_shape_mn[1]
+            if cutlass.const_expr(self.raster_along_m):
+                major_clusters = clusters_m
+                minor_clusters = clusters_n
+            else:
+                major_clusters = clusters_n
+                minor_clusters = clusters_m
+            total_clusters = clusters_m * clusters_n
+            _, _, num_persistent = cute.arch.grid_dim()
+            lin = cutlass.Int32(bidz)
+            swizzle = self.swizzle_size
+            if cutlass.const_expr(swizzle > 1):
+                major_groups = major_clusters // swizzle
+                minor_groups = minor_clusters // swizzle
+                first_residual_major = major_groups * swizzle
+                first_residual_minor = minor_groups * swizzle
             not_last_tile = cutlass.Boolean(1)
             dbg_tiles = cutlass.Int32(0)
             while not_last_tile:
-                cluster_tile_coord_mnl = work_tile.tile_idx
+                has_work = lin < total_clusters
+                major = lin % major_clusters
+                minor = lin // major_clusters
+                if cutlass.const_expr(swizzle > 1):
+                    if major < first_residual_major and minor < first_residual_minor:
+                        major_div = major // swizzle
+                        major_mod = major % swizzle
+                        minor_div = minor // swizzle
+                        minor_mod = minor % swizzle
+                        major = major_div + major_groups * minor_mod
+                        minor = major_mod + minor_div * swizzle
+                if cutlass.const_expr(self.raster_along_m):
+                    cluster_m = major
+                    cluster_n = minor
+                else:
+                    cluster_m = minor
+                    cluster_n = major
                 cta_tile_coord_m = (
-                    cluster_tile_coord_mnl[0] * self.cluster_shape_mn[0]
+                    cluster_m * self.cluster_shape_mn[0]
                     + block_in_cluster_coord_vmnk[1] * cute.size(tiled_mma.thr_id.shape)
                     + block_in_cluster_coord_vmnk[0]
                 )
                 act_tile_idx = (
-                    cluster_tile_coord_mnl[1] * self.cluster_shape_mn[1]
+                    cluster_n * self.cluster_shape_mn[1]
                     + block_in_cluster_coord_vmnk[2]
                 )
-                # The runtime scheduler leaves its outer mode unbounded, so the
-                # finite extent of the outer mode ends the walk.
-                has_work = work_tile.is_valid_tile
-                if cutlass.const_expr(self.raster_along_m):
-                    has_work = has_work and (act_tile_idx < act_tiles)
-                else:
-                    has_work = has_work and (
-                        cluster_tile_coord_mnl[0]
-                        < tile_sched_params.problem_layout_ncluster_mnl.shape[0]
-                    )
                 is_dense_tile = has_work and (act_tile_idx < act_tiles)
                 if is_dense_tile or not has_work:
                     if cutlass.const_expr(self.debug):
@@ -832,8 +856,7 @@ class Sm100W8A16Fp8GemmKernel:
                     tile_info_pipeline.producer_commit(tile_info_producer_state)
                     tile_info_producer_state.advance()
                 if has_work:
-                    tile_sched.advance_to_next_work()
-                    work_tile = tile_sched.get_current_work()
+                    lin += num_persistent
                 else:
                     not_last_tile = cutlass.Boolean(0)
             tile_info_pipeline.producer_tail(tile_info_producer_state)
@@ -1533,32 +1556,3 @@ class Sm100W8A16Fp8GemmKernel:
             num_tmem_acc_cols,
             num_tmem_a_cols,
         )
-
-    @staticmethod
-    def _compute_grid(
-        c: cute.Tensor,
-        cta_tile_shape_mnk: tuple[int, int, int],
-        cluster_shape_mn: tuple[int, int],
-        max_active_clusters: cutlass.Constexpr,
-        swizzle_size: int,
-        raster_along_m: bool,
-    ) -> tuple[utils.PersistentTileSchedulerParams, tuple[int, int, int]]:
-        """Persistent scheduler over the CTA tiles of C.
-
-        ``swizzle_size`` (the C++ kernel's L2 tile group, max_swizzle_size) is not
-        applied yet: StaticPersistentRuntimeTileScheduler ignores the params'
-        swizzled layout for the M raster and its termination test breaks on it for
-        the N raster, so the grouped walk has to be done by the scheduler warp from
-        the linear tile index.  Until then every variant walks the plain raster.
-        """
-        del swizzle_size
-        c_shape = cute.slice_(cta_tile_shape_mnk, (None, None, 0))
-        gc = cute.zipped_divide(c, tiler=c_shape)
-        num_ctas_mnl = gc[(0, (None, None, None))].shape
-        tile_sched_params = utils.PersistentTileSchedulerParams(
-            num_ctas_mnl,
-            (*cluster_shape_mn, 1),
-            raster_along_m=raster_along_m,
-        )
-        grid = (cluster_shape_mn[0], cluster_shape_mn[1], max_active_clusters)
-        return tile_sched_params, grid

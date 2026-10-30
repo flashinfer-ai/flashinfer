@@ -62,3 +62,15 @@ Until then the C++ stays as-is and the DSL kernel lives beside it.
   Blackwell node all night). Open: the L2 tile group (PickSwizzle) must be done by the
   scheduler warp, the DSL runtime scheduler cannot take a swizzled layout; algo 3
   (A in smem) needs its own compile check; split-K / stream-K not started.
+- Fri 30 Oct 2026 (afternoon): first light on GB200 (gb-nvl-059-compute01, aarch64 venv
+  `w8a16-aarch64-venv` + nvidia-cutlass-dsl 4.8.1, DSL CUDA 12.9 so the ALU e4m3 path).
+  Hang on every CTA's second tile traced with the debug build to the tile_info consume
+  helper: a PipelineState passed into a @cute.jit helper is rebuilt on entry, so its
+  in-place advance() was lost (213d75789 returns it). Single-tile and multi-tile shapes
+  pass for the 1SM tile; full matrix over the five tiles running.
+- Fri 30 Oct 2026 (evening): all five Blackwell plain tiles correct, bias on and off,
+  partial tiles included; max error identical to the C++ op, bitwise equal on the
+  largest shape.  Scheduler warp now walks the tile grid itself with CUTLASS's sm100
+  swizzle remap (L2 group from PickSwizzle, raster heuristic), replacing the library
+  runtime scheduler.  First bench comparison on GB200 next; then split-K, stream-K
+  decision, Hopper.
