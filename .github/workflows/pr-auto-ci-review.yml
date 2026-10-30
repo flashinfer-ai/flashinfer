@@ -27,4 +27,5 @@ jobs:
       && github.event.pull_request.base.ref == 'main'
     runs-on: ubuntu-latest
     steps:
-      - run: echo "Approval on PR #${{ github.event.pull_request.number }}; pr-auto-ci.yml will pick this up via workflow_run"
+      - run: |
+          echo "Approval on PR #${{ github.event.pull_request.number }}; pr-auto-ci.yml will pick this up via workflow_run"
