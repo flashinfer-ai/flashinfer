@@ -817,6 +817,30 @@ nesting level -- a mismatch hangs or corrupts data, and no rank checks the
 others.  The phase comes from `torch._C._current_graph_task_id()`; a torch
 without it refuses the handle.
 
+One halo exchange for a layer's q / k / v convolutions:
+`cake_causal_conv1d_kcp_multi((xq, xk, xv), (wq, wk, wv), ctx)` returns the
+three outputs bitwise equal to three `cake_causal_conv1d_kcp` calls (outputs,
+`dx` and `dweight`), but its forward and its backward each issue one halo
+collective instead of three: the history rows of the three tensors travel side
+by side in one `all_to_all_single` and are copied out after the wait, and each
+tensor then runs its own kernels. With `recompute_handle=h` one handle serves
+the call (its `"conv"` entry holds the three history pools) and may also carry
+the layer's `"kda"` entry, so the checkpointed layer above needs one handle:
+
+```python
+def layer(xq, xk, xv, g, beta, h):
+    q, k, v = cake_causal_conv1d_kcp_multi((xq, xk, xv), (wq, wk, wv), ctx, recompute_handle=h)
+    ...
+    return chunk_kda_kcp(q, k, v, g, beta, ctx, recompute_handle=h)
+
+out = torch.utils.checkpoint.checkpoint(layer, xq, xk, xv, g, beta, KcpRecomputeHandle(),
+                                        use_reentrant=False)
+```
+
+Per layer the halo collectives drop from 3 / 3 / 3 (original forward /
+recompute / backward, without handles) or 3 / 0 / 3 (with handles) to 1 / 1 / 1
+or 1 / 0 / 1.
+
 The segment plan splits every fragment into `P` segments: above the 256-chunk
 chain cap the equal-segment wave rule on ranks with at most three fragments,
 below it on one-fragment ranks the
