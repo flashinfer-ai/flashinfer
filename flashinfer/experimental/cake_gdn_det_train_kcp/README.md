@@ -242,9 +242,10 @@ gdn_det_comm_bytes_kcp(ctx, *, H_qk, HV, C) -> {rank: {c1_send, c1_recv, c2_recv
 gdn_det_saved_bytes_kcp(ctx, *, H_qk, HV, save_mode, save_transfer=True, P=None) -> per rank (the table above)
 gdn_det_workspace_bytes_kcp(ctx, *, H_qk, HV, P=None, reuse_recompute_tapes=None) -> per rank: the most the caller-held
     workspace binds in the forward (the tape walk: pools + the eight live tapes) or the backward (its phases: the
-    exchange, the adjoint tape walk, the end state); under the kept-tape backward (the default) the ten forward
-    tapes are the recompute forward's hand-off tensors outside the workspace (`gdn_det_workspace_layout_kcp` lists them
-    as `bwd.kept_tapes` and the total as `backward_transient`), under the replay form they are workspace again
+    exchange, the adjoint tape walk, the end state); the default (`None`, i.e. `"auto"`) reports the replay form, the
+    bound of both forms, in which the ten forward tapes are workspace; `reuse_recompute_tapes=True` gives the kept-tape
+    figure, in which they are the recompute forward's hand-off tensors outside the workspace
+    (`gdn_det_workspace_layout_kcp` lists them as `bwd.kept_tapes` and the total as `backward_transient`)
 ```
 
 `H_qk` enters the halo and strided-view terms; the exchange terms depend on

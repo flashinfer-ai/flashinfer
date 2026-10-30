@@ -108,11 +108,10 @@ def _reference():
 def _inputs():
     """The seeded operand generator (``make_inputs(cu, H_qk, HV, *, regime, seed, token_range)``)."""
     try:
-        from tests.test_helpers import cake_gdn_det_train_kcp_inputs as gen  # type: ignore[attr-defined]
-
-        return gen
-    except ImportError:
-        return importlib.import_module("gdn_inputs")
+        from tests.test_helpers import cake_gdn_det_train_kcp_inputs as gen
+    except ImportError as exc:
+        pytest.skip(f"the seeded GDN KCP inputs helper is unavailable: {exc}")
+    return gen
 
 
 BUDGETS_FILE = (
