@@ -61,8 +61,9 @@ the forward scan fused with the output (`fwd_ho`).  The prep stages the Q/K
 tiles by TMA with one CTA per (chunk, key head) (`prep_tma`), except where that
 grid needs a second, short wave: with `slots = 6 x SMs` and
 `CTAs = chunks x H`, the plain prep runs for `slots < CTAs <= 2.5 x slots`
-(`sm_100a`, `sm_103a`; on `sm_107a` `prep_tma` runs for every grid), and for Q
-or K not 16-byte aligned.  Both preps give the same bits.  A long sequence can be
+(`sm_100a`, `sm_103a`; `sm_107a` has no plain-prep band and runs `prep_tma`
+for every grid), and
+for Q or K not 16-byte aligned.  Both preps give the same bits.  A long sequence can be
 split into segments: a pre-scan and a stitch then give every segment its start
 state.  The backward runs the adjoint scan, either `dv_local` plus a register
 scan or, on a serial plan, the tcgen05 scan with `dv_local` fused (`dhu_tc2`),

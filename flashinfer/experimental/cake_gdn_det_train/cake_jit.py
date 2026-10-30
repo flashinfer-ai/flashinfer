@@ -241,8 +241,9 @@ MODULES: dict[str, dict[str, Any]] = {
         "select": {
             "sm_100a": {"ctas_per_sm": 6, "window": 2.5},
             "sm_103a": {"ctas_per_sm": 6, "window": 2.5},
-            # R200 runs 1024 threads per SM: 3 CTAs of 288 threads.  Window 1.0 = no plain-prep band: prep_tma
-            # was faster in every swept cell up to 10,240 CTAs on R200.
+            # R200 runs 1024 threads per SM: 3 CTAs of 288 threads.  Window 1.0 = no plain-prep band: over
+            # 128-16,384 CTAs prep_tma was faster in every cell but two with BF16 beta, a tie at 10,240 CTAs
+            # and a 1.6 % loss at 12,288 CTAs (19 x slots, beyond any band).
             "sm_107a": {"ctas_per_sm": 3, "window": 1.0},
         },
         "stage": "prep_tma",

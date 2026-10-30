@@ -368,7 +368,10 @@ def test_scan_records_carry_the_planner_constants() -> None:
             and const["c_dvl"] > 0
         ), arch
         ctas_per_sm, window = cake_chain._prep_tma_constants(arch)
-        assert ctas_per_sm > 0 and window >= 1, arch  # 1.0: no plain-prep band
+        if arch == "sm_107a":  # window 1.0: no plain-prep band
+            assert ctas_per_sm > 0 and window == 1.0, arch
+            continue
+        assert ctas_per_sm > 0 and window > 1, arch
 
 
 def test_manifest_covers_every_record_and_its_sources() -> None:
@@ -663,7 +666,7 @@ def test_sequence_groups_partition_a_serial_table() -> None:
 
 # The prep dispatch window on each architecture's SM count (slots = ctas_per_sm x SMs, the record's select
 # constants): the plain prep inside (slots, window x slots], prep_tma outside; 4 x 4096 tokens at H = 8 (2048 CTAs)
-# lie inside on every architecture with a band.  A window of 1.0 (sm_107a) has no band: prep_tma everywhere.
+# lie inside on sm_100a and sm_103a.  sm_107a has window 1.0, no band: prep_tma for every grid.
 @pytest.mark.parametrize("arch", sorted(RULE_DEVICES))
 def test_prep_rule(arch, monkeypatch) -> None:
     props, _r01 = RULE_DEVICES[arch]
@@ -672,7 +675,8 @@ def test_prep_rule(arch, monkeypatch) -> None:
     rule = cake_chain.use_prep_tma
     ctas_per_sm, window = cake_chain._prep_tma_constants(arch)
     slots = ctas_per_sm * props[0]
-    if window <= 1.0:
+    if arch == "sm_107a":
+        assert window == 1.0
         assert all(rule(n, 1, 0) for n in (1, slots, slots + 1, 4 * slots, 32 * slots))
         assert rule(4 * 4096 // 64, 8, 0) and rule(16 * 4096 // 64, 8, 0)
         assert rule(2, 2, 0)
