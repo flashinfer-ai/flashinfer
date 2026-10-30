@@ -79,11 +79,11 @@ from ..common.kernel_utils import (
     vectorized_atomic_add_fp32x2,
 )
 from .custom_pipeline import PipelineUmmaAsync, producer_tail_all_stages
-from .inline_ptx import tma_gather4 as _blockscaled_tma_gather4
 from .utils import (
     griddepcontrol_launch_dependents,
     griddepcontrol_wait,
     release_gpu,
+    tma_gather4 as _blockscaled_tma_gather4,
 )
 
 

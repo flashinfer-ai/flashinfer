@@ -60,7 +60,6 @@ from flashinfer.tllm_enums import (
 
 from ..moe_utils import validate_cute_dsl_moe_situ_config
 from .custom_pipeline import producer_tail_all_stages
-from .inline_ptx import tma_gather4
 from .moe_w4a16_utils import decode_nvfp4_fragment_to_bf16
 from .utils import (
     blk_reduce_bf16,
@@ -69,6 +68,7 @@ from .utils import (
     griddepcontrol_launch_dependents,
     griddepcontrol_wait,
     release_gpu,
+    tma_gather4,
 )
 
 

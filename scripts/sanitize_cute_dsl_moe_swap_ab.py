@@ -65,7 +65,6 @@ _OWNED_MODULES = {
     "Sm100W4A16GroupedGemmKernel": (
         "flashinfer.fused_moe.cute_dsl.blackwell.moe_w4a16_kernel"
     ),
-    "PrepareRouted": "flashinfer.fused_moe.cute_dsl.blackwell.moe_swap_ab_prepare",
     "_MoeFinalizeKernel": "flashinfer.fused_moe.cute_dsl.blackwell.moe_finalize",
     "NVFP4QuantizePerTokenKernel": "flashinfer.quantization.kernels.nvfp4_quantize",
 }
@@ -94,7 +93,7 @@ def _owned_kernels(quant_mode, per_token):
         gemm = "Sm100BlockScaledGroupedGemmKernel"
     else:
         raise ValueError(f"Unsupported quantization mode: {quant_mode}")
-    kernels = (gemm, "PrepareRouted", "_MoeFinalizeKernel")
+    kernels = (gemm, "_MoeFinalizeKernel")
     if quant_mode == "w4a4" and per_token:
         kernels += ("NVFP4QuantizePerTokenKernel",)
     return kernels
