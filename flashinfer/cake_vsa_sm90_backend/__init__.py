@@ -492,6 +492,9 @@ class CakeVsaSm90Plan:
                 # the Sage-FP8 route keeps the group-major split order (its split
                 # rows measured slower head-major); the BF16 route takes the default
                 split_tile_order="group" if self.fp8 else None,
+                # the Sage-FP8 route's grouped-query ragged pair plans join the queue
+                # earlier (FP8_POOL_RAGGED_PAIR_MIN_TILES)
+                fp8=self.fp8,
             )
             self.mode = plan["mode"]
             self.repair_split = bool(plan["repair_split"])
