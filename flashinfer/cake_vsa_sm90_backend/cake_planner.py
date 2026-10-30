@@ -256,6 +256,17 @@ QUEUE_VF_SHORT_MIN_CTA_LOOP_ITERS = 1000
 # must agree.
 PIN_VF_MIN_TILE_POS = 24
 PIN_VF_MIN_CTA_LOOP_ITERS = 40
+# Sage-FP8 grouped-query pair plans whose static route selects the second
+# position-selected static program (``attention_fp8_gqa_pin_vf``) take the queue
+# instead -- the shared-transposer queue program ``attention_fp8_gqa_xs_queue`` --
+# with the same tiles (re-planned on the legacy assignment, as the queue rules above).
+# Measured on H100 (paired, cold L2, 3 x 256 and 9 x 256 in two processes each):
+# h8-m4096-n4096-k64 at g = 4 (256 head-pair tiles of 32..33 positions, 2 per CTA)
+# 1.0266 .. 1.0268 x and at g = 8 1.0242 .. 1.0256 x (2.24 .. 2.48 us per launch of
+# 95.0 us) against the second position-selected static program it ran before.
+# The BF16 route and MHA plans never select pin_vf.  False disables.  Mirrors the
+# kernel-tests reference planner (``FP8_PIN_VF_PAIR_QUEUE``); the two must agree.
+FP8_PIN_VF_PAIR_QUEUE = True
 # Tile ORDER of static UNIFORM plans before the
 # list schedule.  The queue kernel balances its pooled tiles at run time and ragged plans
 # are already list-scheduled costliest first, so both keep the legacy order; the mode and
@@ -1565,9 +1576,47 @@ def plan_vsa_sm90(
 
     ``fp8`` (the Sage-FP8 route): grouped-query ragged pair plans whose heads
     hold the queue window take the queue from ``FP8_POOL_RAGGED_PAIR_MIN_TILES``
-    tiles per CTA.  The BF16 route (the default) and MHA plans keep the
-    thresholds above.
+    tiles per CTA, and grouped-query pair plans whose static route selects
+    ``attention_fp8_gqa_pin_vf`` take the queue (``FP8_PIN_VF_PAIR_QUEUE``).  The
+    BF16 route (the default) and MHA plans keep the thresholds above.
     """
+
+    def plan_with(force_queue: bool) -> dict[str, Any]:
+        return _plan_vsa_sm90(
+            block_mask,
+            sms=sms,
+            mode=mode,
+            gqa=gqa,
+            split_tile_order=split_tile_order,
+            repair_split=repair_split,
+            fp8=fp8,
+            force_queue=force_queue,
+        )
+
+    plan = plan_with(False)
+    if (
+        fp8
+        and FP8_PIN_VF_PAIR_QUEUE
+        and plan["mode"] == "pair"
+        and fp8_gqa_pin_vf(plan)
+    ):
+        plan = plan_with(True)
+    return plan
+
+
+def _plan_vsa_sm90(
+    block_mask: torch.Tensor,
+    *,
+    sms: int,
+    mode: Optional[str],
+    gqa: int,
+    split_tile_order: Optional[str],
+    repair_split: Union[bool, str],
+    fp8: bool,
+    force_queue: bool = False,
+) -> dict[str, Any]:
+    """The plan of :func:`plan_vsa_sm90`; ``force_queue`` takes the queue whatever
+    the tile-count thresholds decide."""
     gqa = gqa_group(gqa)
     if block_mask.dtype != torch.bool or block_mask.ndim != 3:
         raise ValueError("block_mask must be a boolean [H, MB, NB] tensor")
@@ -1736,6 +1785,7 @@ def plan_vsa_sm90(
             and min_tiles >= POOL_SMALL_MIN_TILES
             and max(lens) <= POOL_SMALL_TILE_POS
         )
+    queue = queue or force_queue
     # Compact static program (COMPACT_MAX_TILE_POS / COMPACT_MIN_TILES).
     compact = bool(
         not queue
