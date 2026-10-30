@@ -79,7 +79,7 @@ def _destroy_default_handles() -> None:
 atexit.register(_destroy_default_handles)
 
 
-_PYTHON_ONLY_BOOL_ATTRS = frozenset({"attn_scale_prefolded"})
+_PYTHON_ONLY_BOOL_ATTRS = frozenset({"attn_scale_prefolded", "adaptive"})
 
 
 def _python_only_attr_is_set(attr: str, value) -> bool:
@@ -2877,7 +2877,7 @@ class pygraph:
                     if n:
                         kw[lp] = [tensor_map[node.inputs[f"{lp}_{i}"].uid] for i in range(n)]
                 for ak in spec.get("attrs", ()):
-                    if ak in node.params:
+                    if ak in node.params and ak not in spec.get("python_only_attrs", ()):
                         kw[ak] = node.params[ak]
                 result = getattr(graph, method)(**kw)
                 cpp_outs = list(result) if isinstance(result, (list, tuple)) else [result]
@@ -3123,6 +3123,21 @@ def _block_quant_scale_dims(node):
     return d
 
 
+def _adaptive_norm_stats(node):
+    dims = node.inputs["input"].dim
+    scale = node.inputs.get("scale")
+    if len(dims) == 3 and scale is not None and tuple(scale.dim) in ((dims[0], 1, dims[2]), (1, dims[1], dims[2])):
+        return [*dims[:-1], 1]
+    # Preserve legacy AdaLN inference for other normalization shapes.
+    return _norm_stats_like(1)(node)
+
+
+def _rmsnorm_stats(node):
+    if node.params.get("adaptive", False):
+        return _adaptive_norm_stats(node)
+    return _norm_stats_like(0)(node)
+
+
 def _norm_stats_like(first_axis):  # the C++ node's rule: input dims, 1 wherever scale is not 1 (from first_axis on)
     def infer(node):
         d = node.inputs["input"].dim if "input" in node.inputs else None
@@ -3166,15 +3181,17 @@ _STRUCTURED_OPS = {
     "rmsnorm": dict(
         node_type=NodeType.RMSNORM,
         inputs=("input", "scale", "bias", "epsilon"),
-        attrs=("norm_forward_phase",),
+        attrs=("norm_forward_phase", "adaptive"),
+        python_only_attrs=("adaptive",),
         outputs=("Y", "inv_var"),
         maybe={"inv_var": _training_phase},
-        infer={"Y": _like("input"), "inv_var": _norm_stats_like(0)},
+        infer={"Y": _like("input"), "inv_var": _rmsnorm_stats},
     ),
     "rmsnorm_backward": dict(
         node_type=NodeType.RMSNORM_BWD,
         inputs=("grad", "input", "scale", "inv_variance"),
-        attrs=("has_dbias",),
+        attrs=("has_dbias", "adaptive"),
+        python_only_attrs=("adaptive",),
         outputs=("DX", "DScale", "DBias"),
         # classic rmsnorm_backward names its outputs ::Dscale/::Dbias (mixed
         # case), unlike the other norm backwards (::DSCALE/::DBIAS)
@@ -3183,6 +3200,7 @@ _STRUCTURED_OPS = {
         infer=_NORM_BWD_INFER,
     ),
     "layernorm": dict(
+        adaptive_op="adalayernorm",
         node_type=NodeType.LAYERNORM,
         inputs=("input", "scale", "bias", "epsilon"),
         attrs=("norm_forward_phase",),
@@ -3192,6 +3210,7 @@ _STRUCTURED_OPS = {
         reinfer=("mean", "inv_var"),
     ),
     "layernorm_backward": dict(
+        adaptive_op="adalayernorm_backward",
         node_type=NodeType.LAYERNORM_BWD,
         inputs=("grad", "input", "scale", "mean", "inv_variance"),
         outputs=("DX", "DScale", "DBias"),
@@ -3215,7 +3234,8 @@ _STRUCTURED_OPS = {
     "instancenorm": dict(
         node_type=NodeType.INSTANCENORM,
         inputs=("input", "scale", "bias", "epsilon"),
-        attrs=("norm_forward_phase",),
+        attrs=("norm_forward_phase", "adaptive"),
+        python_only_attrs=("adaptive",),
         outputs=("Y", "mean", "inv_var"),
         maybe=_NORM_FWD_MAYBE,
         infer={"Y": _like("input"), "mean": _stats_like("input", (0, 1)), "inv_var": _stats_like("input", (0, 1))},
@@ -3223,6 +3243,8 @@ _STRUCTURED_OPS = {
     "instancenorm_backward": dict(
         node_type=NodeType.INSTANCENORM_BWD,
         inputs=("grad", "input", "scale", "mean", "inv_variance"),
+        attrs=("adaptive",),
+        python_only_attrs=("adaptive",),
         outputs=("DX", "DScale", "DBias"),
         infer=_NORM_BWD_INFER,
     ),
@@ -3834,6 +3856,24 @@ def _install_structured_builders() -> None:
         maybe = spec.get("maybe", {})
 
         def builder(self, *args, name: str = "", compute_data_type: Any = None, out_dims: Any = None, **kwargs):
+            # Canonicalize the LayerNorm convenience spelling to the existing
+            # AdaLN node so backend lowering and serialized graphs stay shared.
+            adaptive_op = spec.get("adaptive_op")
+            if adaptive_op is not None:
+                adaptive = kwargs.pop("adaptive", False)
+                if not isinstance(adaptive, bool):
+                    raise TypeError(f"{op}(): adaptive must be a bool")
+                if adaptive:
+                    outputs = getattr(self, adaptive_op)(*args, name=name, compute_data_type=compute_data_type, out_dims=out_dims, **kwargs)
+                    if op == "layernorm":
+                        # Pin per-token statistics: legacy backend inference
+                        # can otherwise normalize the batch axis in sequence-first layouts.
+                        node = self._nodes[-1]
+                        dims = _adaptive_norm_stats(node)
+                        for port in ("mean", "inv_var"):
+                            if port in node.outputs and dims and not (isinstance(out_dims, dict) and port in out_dims):
+                                node.outputs[port].set_dim(dims).set_stride(_row_major_stride(dims))
+                    return outputs
             name_ = self._get_name(op, name)
             node = Node(name_, spec["node_type"], compute_data_type or self._context.compute_data_type)
             # classic positional order: tensor ports first, then attrs
@@ -3865,6 +3905,8 @@ def _install_structured_builders() -> None:
             for ak in attr_kws:
                 v = kwargs.pop(ak, None)
                 if v is not None:
+                    if ak == "adaptive" and not isinstance(v, bool):
+                        raise TypeError(f"{op}(): adaptive must be a bool")
                     node.params[ak] = v
             if kwargs:
                 raise TypeError(f"{op}() got unexpected arguments {sorted(kwargs)}; tensor ports are {input_ports}, attrs are {attr_kws}")
@@ -3899,6 +3941,8 @@ def _install_structured_builders() -> None:
         builder.__name__ = op
         builder.__qualname__ = f"pygraph.{op}"
         builder.__doc__ = f"{op}({', '.join(input_ports)}) -> ({', '.join(spec['outputs'])})."
+        if spec.get("adaptive_op") or "adaptive" in attr_kws:
+            builder.__doc__ += " adaptive=False; True uses per-sample affine parameters and parameter gradients."
         return builder
 
     for op, spec in _STRUCTURED_OPS.items():

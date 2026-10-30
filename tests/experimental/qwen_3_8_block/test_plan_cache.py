@@ -1,7 +1,7 @@
 # Copyright (c) 2026 by FlashInfer team.
 # SPDX-License-Identifier: Apache-2.0
-"""CPU: the plan LRU behind the functional decode entry -- its KEY (buckets differing only in the list form, the prepare fusion, the sparse core's body knob, the
-ring-slots arm, the table arm, the ring's capacity or the indexer cache dtype are DIFFERENT plans; the same bucket with another
+"""CPU: the plan LRU behind the functional decode entry -- its KEY (buckets differing only in the form, the list form, the prepare fusion, the sparse core's body knob, the
+ring-slots arm, the table arm, the ring's capacity, the indexer cache dtype or the indexer writers' rounding convention are DIFFERENT plans; the same bucket with another
 side-cache STRIDE is the SAME plan: the kernels bind those strides symbolically) and the Qwen 3.5 ownership contract (an eager-only plan
 freed at eviction, a captured one retained and revived, a cold bucket under capture refused typed).  The real LRU, lookup and plan
 dataclass run; compilation (``prepare``) and the capture query are replaced, so this runs on any host without a GPU or the DSL."""
@@ -106,11 +106,13 @@ def _side(cap=8, pages=3, strided=False):
     return icache, ring
 
 
-def _bucket(api, batch_size, *, geometry=None, cap=8, strided=False, **kw):
+def _bucket(
+    api, batch_size, *, geometry=None, cap=8, strided=False, form="decode", **kw
+):
     kv = torch.zeros(3, 2, 16, 2, 256, dtype=torch.bfloat16)
     icache, ring = _side(cap=cap, strided=strided)
     return api.cached_plan(
-        "decode",
+        form,
         geometry=geometry or _geometry(),
         device=torch.device("cuda", 0),
         weights=None,
@@ -160,6 +162,12 @@ def test_the_key_separates_the_forms_knobs_and_cache_forms_but_not_the_side_cach
             api, 1, sparse_tile_form="tcgen05"
         ),  # the sparse core's body knob: two bodies are two compiled plans
         _bucket(api, 1, sparse_tile_form="lean"),
+        # the 4c8e24355 re-vendor: an EXTEND bucket (the form is the key's first field; the flags read the form's defaults) and the
+        # indexer writers' rounding convention (a frozen geometry field) are their own plans
+        _bucket(api, 1, form="extend", q_len_per_req=20, cap=4),
+        _bucket(api, 1, form="prefill", q_len_per_req=20, cap=4),
+        _bucket(api, 1, geometry=_geometry(index_compress_rounding="hf")),
+        _bucket(api, 1, geometry=_geometry(index_cache_dtype=torch.float8_e4m3fn)),
     ]
     assert all(p is not base for p in distinct) and len(
         {id(p) for p in distinct}
@@ -172,6 +180,12 @@ def test_the_key_separates_the_forms_knobs_and_cache_forms_but_not_the_side_cach
     assert _bucket(api, 1, sparse_tile_form="auto") is base, (
         "sparse_tile_form='auto' is the default spelled out: the same plan"
     )
+    assert _bucket(api, 1, rope_position_tables_only=None, ring_slots=None) is base, (
+        "None on the two contract flags reads the decode form's defaults: the same plan"
+    )
+    assert (
+        _bucket(api, 1, geometry=_geometry(index_compress_rounding="single")) is base
+    ), "index_compress_rounding='single' is the default spelled out: the same plan"
 
 
 def test_an_eager_plan_is_freed_when_the_lru_evicts_it(lru):

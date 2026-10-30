@@ -151,9 +151,9 @@ def test_version_probe_and_vendored_manifest_digests():
     # the origin is the cuDNN Frontend repository the pin is reproducible from (vendor.py's ORIGIN; the root NOTICE names it)
     assert src.origin == "https://github.com/NVIDIA/cudnn-frontend", src.origin
     assert (
-        src.commit.startswith("977757763")
+        src.commit.startswith("4c8e24355")
         and src.version == "1.33.0"
-        and src.files == 118
+        and src.files == 160
     )
     assert (
         src.validated_cutedsl == "4.8.0"
