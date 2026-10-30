@@ -1467,9 +1467,13 @@ class Sm100W8A16Fp8GemmKernel:
         epilogue of one tile overlaps the mainloop of the next), one otherwise.  With
         A in TMEM the transform stages take the TMEM columns the accumulators leave.
         """
-        acc_shape = tiled_mma.partition_shape_C(mma_tiler_mnk[:2])
-        tCtAcc_stage1 = tiled_mma.make_fragment_C(cute.append(acc_shape, 1))
-        num_tmem_acc_col_per_stage = utils.get_num_tmem_alloc_cols(tCtAcc_stage1, True)
+        # One accumulator stage is the CTA tile's 128 lanes x N fp32 columns.  Counted
+        # exactly, not rounded up to a power of two as the TMEM *allocation* is: the
+        # 160- and 192-wide tiles would otherwise be charged 256 columns a stage and
+        # fall back to a single stage, exposing the whole epilogue after every tile
+        # (GB200: 2sm256x160 84 us vs 71 us for the C++, which keeps two stages).
+        assert cta_tile_shape_mnk[0] == 128, "the accumulator spans all 128 TMEM lanes"
+        num_tmem_acc_col_per_stage = cta_tile_shape_mnk[1]
         sm100_tmem_columns = cute.arch.get_max_tmem_alloc_cols("sm_100")
         accumulator_stage_count = sm100_tmem_columns // num_tmem_acc_col_per_stage
         if transform_a_source == tcgen05.OperandSource.TMEM:

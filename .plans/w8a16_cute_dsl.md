@@ -96,3 +96,14 @@ Until then the C++ stays as-is and the DSL kernel lives beside it.
   4096 +6%; attn.out 8192 the DSL is 4% ahead.  Note: `CUTE_DSL_DISABLE_FILE_CACHING=1`
   in the run scripts (the DSL keeps a compile cache under $TMPDIR keyed on the entry
   function; kept off while the kernel source changes often).
+- Fri 30 Oct 2026, late: the 160/192-tile gap was one accumulator stage.  The DSL
+  sized an accumulator stage with the TMEM *allocation* helper, which rounds columns
+  up to a power of two (160 -> 256), so those tiles got a single stage and the epilogue
+  ran exposed after every tile (ncu: smem pipe 69% busy vs 82% in the C++).  Counting
+  the exact N columns gives two stages (320 or 384 columns plus 3 or 2 TMEM A stages =
+  512, as the C++).  GB200 table after the fix (C++ / DSL us, gap): und.q 25.4/25.8
+  +1.6%, 72.7/74.2 +2.1%, 127.8/128.3 +0.4%; und.kv 15.5/17.5 +12.9%, 21.9/23.1 +5.5%,
+  28.3/28.3; gen.qkv 30.2/31.5 +4.3%, 86.7/87.4 +0.8%, 164.1/165.4 +0.8%; attn.out
+  25.8/27.5 +6.6%, 72.4/72.4, 130.4/125.4 -3.8%; gate_up 61.0/61.8 +1.3%, 196.4/197.0,
+  383.7/384.6; mlp.down 62.2/63.9 +2.7%, 202.7/202.8, 371.3/371.8.  Left: the M=1024
+  rows (+1.3..6.6%) and the two split-K rows (+5.5%, +12.9%).
