@@ -2674,5 +2674,28 @@ def test_nvfp4_quantize_pdl_waits_for_global_scale(dtype, shape):
     torch.testing.assert_close(fp4, expected_fp4, rtol=0, atol=0)
 
 
+
+@pytest.mark.parametrize(
+    "quantize",
+    [
+        lambda x, gs: fp4_quantize(x, gs),
+        lambda x, gs: fp4_quantize(x, gs, backend="cute-dsl"),
+        lambda x, gs: fp4_quantize(x, None, 32, True),
+        lambda x, gs: nvfp4_quantize(x, gs),
+        lambda x, gs: nvfp4_quantize(x, gs, backend="cute-dsl"),
+        lambda x, gs: nvfp4_quantize(x, gs, per_token_activation=True),
+        lambda x, gs: mxfp4_quantize(x),
+        lambda x, gs: mxfp4_quantize(x, backend="cute-dsl"),
+    ],
+)
+def test_fp4_quantize_rejects_pre_sm100(quantize):
+    if torch.cuda.get_device_capability()[0] >= 10:
+        pytest.skip("needs a pre-SM100 GPU")
+    x = torch.randn(128, 64, dtype=torch.bfloat16, device="cuda")
+    gs = torch.tensor([1.0], device="cuda")
+    with pytest.raises(ValueError, match="requires SM100 or newer"):
+        quantize(x, gs)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

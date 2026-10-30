@@ -86,6 +86,14 @@ NVFP4_QUANT_ENV_VARS = (
 _FP8_TO_FP4_INPUT_DTYPES = (torch.float8_e4m3fn,)
 
 
+def _require_sm100_fp4_quantize(device: torch.device, op: str) -> None:
+    if device.type != "cuda":
+        return
+    major, minor = get_compute_capability(device)
+    if major < 10:
+        raise ValueError(f"{op} requires SM100 or newer, got SM{major}{minor}")
+
+
 def _check_per_token_global_scale(
     scale_inv: float, nvfp4_4over6_config: Optional[NVFP44Over6Config]
 ) -> None:
@@ -1174,6 +1182,7 @@ def fp4_quantize(
     if global_scale is not None:
         global_scale = global_scale.to(device=input.device, dtype=torch.float32)
 
+    _require_sm100_fp4_quantize(input.device, "fp4_quantize")
     if backend == "cute-dsl":
         return _fp4_quantize_cute_dsl(
             input,
@@ -1693,6 +1702,7 @@ def nvfp4_quantize(
                 if expanded_idx_to_permuted_idx is not None
                 else None
             )
+            _require_sm100_fp4_quantize(a_cuda.device, "nvfp4_quantize")
             major, minor = get_compute_capability(a_cuda.device)
             device_arch = f"{major * 10 + minor}"
             a_fp4, a_sf, per_token_scale = get_fp4_quantization_module(
@@ -1821,6 +1831,7 @@ def nvfp4_quantize(
             raise ValueError(
                 f"CuTe-DSL backend only supports sf_vec_size=16, got {sf_vec_size}"
             )
+        _require_sm100_fp4_quantize(a.device, "nvfp4_quantize")
         from .kernels.nvfp4_quantize import (
             SF_LAYOUT_128x4,
             SF_LAYOUT_8x4,
@@ -1925,6 +1936,7 @@ def mxfp4_quantize(
                 "CuTe-DSL backend requested but CuTe-DSL is not available. "
                 "Please install the required dependencies."
             )
+        _require_sm100_fp4_quantize(a.device, "mxfp4_quantize")
         from .kernels.mxfp4_quantize import (
             SF_LAYOUT_128x4,
             SF_LAYOUT_8x4,
