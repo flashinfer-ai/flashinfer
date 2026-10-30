@@ -6,8 +6,12 @@ the indexer band's raw keys of every position from the oracle's own projection, 
 compress kernel into the paged compressed-key cache (page 0 the null page, NaN everywhere unwritten), the raw-key ring primed with the
 last ``cap`` raw keys below the step, the position tables over the table's whole reach -- and the TWO-STAGE oracle: (1) the selection
 (the counts rule, the canonical list form, the SET == the fp64 top-k of the kernel's own operands up to ties at the k-th boundary), (2)
-the attention of every row over the KERNEL's list (the visible mask), then the gate and the out projection.  Opt-in on top of the Qwen
-3.5 case: the 3.5 tests are untouched."""
+the attention of every row over the KERNEL's list (the visible mask), then the gate and the out projection -- ``out`` gated by the
+block suites' bf16 OUTPUT bound (``qwen_3_8_block_bounds``: per element and by cosine).  Opt-in on top of the Qwen 3.5 case: the 3.5
+tests are untouched.  :class:`Qsa38ExtendCase` is the same state read as ONE CHUNK of the extend / prefill forms (the last ``T`` tokens
+of every sequence behind its prefix; the stack's ring slots for the last ``cap`` tokens; the cache and ring checks over the whole
+stream).  The compressed-key cache is built in the geometry's ``index_cache_dtype`` and the from-scratch compress under the geometry's
+``index_compress_rounding``, so a case on an e4m3 or an ``"hf"`` geometry is the oracle of that chain."""
 
 from __future__ import annotations
 
@@ -18,16 +22,16 @@ import torch
 
 from tests.test_helpers.qwen_3_5_block_cases import NULL_PAGE, OUT_COS, PagedCase
 from tests.test_helpers.qwen_3_5_block_reference import build_rope_tables, cosine
+from tests.test_helpers.qwen_3_8_block_bounds import assert_output_close
 
-ATOL_O = 2e-2  # the block suite's bar on the gated O against the fp32 oracle fed the kernel's list (never widened here)
 TIE_TOL = 1e-4  # the scorer suite's tie window at the k-th boundary (fp32 logits of O(1) vs the fp64 reference)
 SENT_I32 = -7
 __all__ = [
-    "ATOL_O",
     "NULL_PAGE",
     "OUT_COS",
     "SENT_I32",
     "TIE_TOL",
+    "Qsa38ExtendCase",
     "Qsa38PagedCase",
     "attend",
     "bits",
@@ -40,8 +44,12 @@ __all__ = [
 
 
 def bits(x: torch.Tensor) -> torch.Tensor:
-    """The bit pattern of a bf16 tensor (an int16 view): a bitwise comparison that treats NaN as a value."""
-    return x.contiguous().view(torch.int16) if x.dtype == torch.bfloat16 else x
+    """The bit pattern of a bf16 (int16 view) or e4m3 (uint8 view) tensor: a bitwise comparison that treats NaN as a value."""
+    if x.dtype == torch.bfloat16:
+        return x.contiguous().view(torch.int16)
+    if x.dtype == torch.float8_e4m3fn:
+        return x.contiguous().view(torch.uint8)
+    return x
 
 
 def ring_cap_for(q_len: int, block_size: int = 4) -> int:
@@ -277,6 +285,10 @@ class Qsa38PagedCase(PagedCase):
         dev = self.device
         self.cap = int(cap) if cap is not None else ring_cap_for(self.q_len, bs)
         self.rows_per_page = page_size // bs
+        # the compressed-key cache's dtype and the indexer writers' rounding convention: the geometry's (an e4m3 / "hf" case is the oracle of
+        # that chain: the from-scratch compress below is compiled with both)
+        self.cache_dtype = g.resolved_index_cache_dtype
+        self.rounding = g.index_compress_rounding
         # the band's raw key head of every position: the oracle's own projection, one rounding
         self.w_band_k = w38.w_qkvg[g.n_qkvg_dense + h_i * d_i :]  # [d_i, d_model]
         self.k_raw_full: Dict[int, torch.Tensor] = {}
@@ -302,7 +314,7 @@ class Qsa38PagedCase(PagedCase):
         self.index_kv_cache = torch.full(
             (self.num_pages, self.rows_per_page, 1, d_i),
             float("nan"),
-            dtype=dtype,
+            dtype=self.cache_dtype,
             device=dev,
         )
         self.index_state_cache = torch.full(
@@ -319,12 +331,14 @@ class Qsa38PagedCase(PagedCase):
                 continue
             self.index_state_block_table[b, 0] = b + 1
             pos0 = L - self.q_len
+            # the ring INPUT contract: the last cap positions below the step / chunk (the straddling block's rows among them)
             for p in range(max(0, pos0 - self.cap), pos0):
                 self.index_state_cache[b + 1, p % self.cap, 0] = self.k_raw_full[b][p]
             for j in range(self.q_len):
-                ring_slots[b * self.q_len + j] = (b + 1) * self.cap + (
-                    pos0 + j
-                ) % self.cap
+                if self._ring_slot_written(pos0 + j, L):
+                    ring_slots[b * self.q_len + j] = (b + 1) * self.cap + (
+                        pos0 + j
+                    ) % self.cap
         self.ring_slots = ring_slots
         self.block_ids_out = torch.full(
             (self.b * self.q_len, top_k), SENT_I32, dtype=torch.int32, device=dev
@@ -336,7 +350,12 @@ class Qsa38PagedCase(PagedCase):
         self._compress = {}
         self.prefix_bits = (bits(self.kv_cache).clone(),)
 
-    # -- the vendored compress kernel (the one-rounding chain the block's own arms compute) ----------------------------------------
+    def _ring_slot_written(self, pos: int, kv_len: int) -> bool:
+        """Whether the stack hands a ring WRITE slot for the row at ``pos`` of a sequence of ``kv_len`` tokens: every step row on the decode
+        form (the step writes each of its rows)."""
+        return True
+
+    # -- the vendored compress kernel (the chain the block's own arms compute, under the geometry's cache dtype and rounding) -----------
     def compress(
         self,
         k_raw: torch.Tensor,
@@ -345,7 +364,8 @@ class Qsa38PagedCase(PagedCase):
         pool: Optional[int] = None,
     ) -> torch.Tensor:
         """The vendored prefill compress over ``k_raw [B', S, d_i]`` at ``pool`` (the block size by default) with the position tables
-        ``cos / sin [1, S_pos, rope_dim]`` -> ``[B', floor(S / pool), d_i]``; ``pool=1`` with the query norm = the indexer queries."""
+        ``cos / sin [1, S_pos, rope_dim]`` -> ``[B', floor(S / pool), d_i]`` in the geometry's CACHE dtype (the e4m3 store arm on an e4m3
+        geometry) under the geometry's ``index_compress_rounding``; ``pool=1`` with the query norm = the indexer queries."""
         from flashinfer.experimental.qwen_3_5_block import api as _api
         from flashinfer.experimental.qwen_3_5_block._cudnn_frost.gated_attention_block.kernels.qsa_compress import (
             compile_qsa_compress,
@@ -363,12 +383,14 @@ class Qsa38PagedCase(PagedCase):
                 pool=pool,
                 has_seq_lens=False,
                 table_dtype=self.dtype,
+                out_dtype=self.cache_dtype,
+                rounding=self.rounding,
             )
         k_raw = k_raw.contiguous()
         out = torch.full(
             (int(k_raw.shape[0]), int(k_raw.shape[1]) // pool, g.index_head_dim),
             float("nan"),
-            dtype=self.dtype,
+            dtype=self.cache_dtype,
             device=self.device,
         )
         w = (
@@ -585,8 +607,9 @@ class Qsa38PagedCase(PagedCase):
         label: str = "out",
         min_cos: float = OUT_COS,
     ) -> float:
-        """``out`` ``[t, d_model]`` against the fp32 oracle fed the KERNEL's list: finite, padded entries exactly 0, cosine over the live rows
-        above the budget."""
+        """``out`` ``[t, d_model]`` against the fp32 oracle fed the KERNEL's list: finite, padded entries exactly 0, and over the live rows
+        the block suites' bf16 OUTPUT bound (``qwen_3_8_block_bounds.assert_output_close``: per element ``|d| <= 2^-7 max|ref| + 2^-6 |ref|``
+        AND cosine ``>= min_cos``; the worst element printed as a fraction of the bound beside ``max|d|``)."""
         out = out.reshape(self.b * self.q_len, self.geometry38.d_model)
         ref, _ = self.oracle_from_list(ids)
         live = (
@@ -605,7 +628,12 @@ class Qsa38PagedCase(PagedCase):
         print(
             f"[{label}] vs the oracle fed the kernel's list: cos {c:.6f} max|diff| {md:.3e}"
         )
-        assert c > min_cos, f"{label}: cos {c} <= {min_cos}"
+        assert_output_close(
+            out[live],
+            ref[live],
+            f"[{label}] the gated out vs the oracle",
+            cos_min=min_cos,
+        )
         return c
 
     def check_state(self, raw_keys: torch.Tensor, *, label: str = "state") -> int:
@@ -692,3 +720,99 @@ class Qsa38PagedCase(PagedCase):
         what the block's own GEMM emits up to its rounding; the ring rows are compared with the BLOCK's band through the workspace, this is
         the reference a from-scratch chain uses."""
         return (self.hidden_states.float() @ self.w_band_k.float().t()).to(self.dtype)
+
+
+class Qsa38ExtendCase(Qsa38PagedCase):
+    """The same state as ONE CHUNK of the extend / prefill forms: every live sequence's last ``q_len = T`` tokens are the chunk, the
+    ``kv_lens[b] - T`` tokens before them its cached prefix (``P = 0`` on a prefill chunk; ``kv_lens[b] = 0`` a dead entry), the pools
+    and the compressed-key cache primed with the prefix (``prime()``: the prefix blocks ``j < floor(P / 4)`` through the vendored compress
+    under the geometry's cache dtype and rounding), the ring primed with the last ``cap`` positions below the chunk (the form's ring INPUT
+    contract), the stack's ring slots for the sequence's LAST ``cap`` tokens and ``-1`` elsewhere (``ring_slots``), the per-token
+    ``rope_cos`` / ``rope_sin`` of the chunk's rows, ``seq_lens`` = the lengths AFTER the chunk.  ``check_selection`` /
+    ``check_out_from_list`` are the two oracle stages (inherited: the rows' positions are the chunk's); ``check_state`` reads the whole
+    STREAM: every complete block bitwise the from-scratch compress of the prefix's raw band + the chunk's slab rows, the ring = the
+    sequence's last ``cap`` positions."""
+
+    def __init__(self, geometry, kv_lens, q_len, *, cap: int = 4, **kw):
+        super().__init__(geometry, kv_lens, q_len, cap=cap, **kw)
+
+    def _ring_slot_written(self, pos: int, kv_len: int) -> bool:
+        """The extend forms' ring arm writes the sequence's LAST ``cap`` tokens (the stack's circular buffer): a slot iff ``pos + cap >= kv_len``."""
+        return pos + self.cap >= kv_len
+
+    def extend_args(self) -> Dict[str, torch.Tensor]:
+        """The ``run`` keywords of the extend / prefill forms: the decode ones with the stack's ring slots (REQUIRED on these forms)."""
+        return self.decode_args(ring_slots=True)
+
+    def stream_raw(self, b: int, raw_keys: torch.Tensor) -> torch.Tensor:
+        """The sequence's raw-key STREAM after the chunk ``[L, d_i]``: the prefix from the oracle's band (what primed the cache and the ring),
+        the chunk's rows from the block's own slab (``raw_keys [t, d_i]``, the band projection the block computed)."""
+        L = self.kv_lens[b]
+        pos0 = L - self.q_len
+        raw = raw_keys.view(self.b, self.q_len, -1)[b]
+        return torch.cat([self.k_raw_full[b][: max(pos0, 0)], raw[max(-pos0, 0) :]], 0)
+
+    def check_state(self, raw_keys: torch.Tensor, *, label: str = "state") -> int:
+        """After one chunk: EVERY complete block of the stream BITWISE the from-scratch compress of the stream's raw keys (the primed prefix
+        untouched, the chunk's blocks -- the straddling one included -- written), the incomplete tail block's row unwritten, the ring = the
+        sequence's last ``cap`` positions bitwise the stream's raw band (every other slot untouched), the null page / ring block untouched,
+        the pools' chunk rows within the 3.5 budget.  Returns the number of blocks the chunk completed."""
+        bs = self.block_size
+        completed = 0
+        cos_t, sin_t = self.position_tables
+        for b, L in enumerate(self.kv_lens):
+            if L == 0:
+                continue
+            pos0 = L - self.q_len
+            stream = self.stream_raw(b, raw_keys)
+            nb = L // bs
+            if nb:
+                kb = self.compress(stream[None, : nb * bs], cos_t, sin_t)[0]
+                j = torch.arange(nb, device=self.device)
+                rows = self.index_kv_cache[
+                    self.block_table[b, j // self.rows_per_page].long(),
+                    j % self.rows_per_page,
+                    0,
+                ]
+                assert torch.equal(bits(rows), bits(kb)), (
+                    f"{label}: sequence {b}: the cache's {nb} complete blocks are not the from-scratch compress of the stream"
+                )
+            if L % bs and nb < int(self.block_table.shape[1]) * self.rows_per_page:
+                tail = self.index_kv_cache[
+                    int(self.block_table[b, nb // self.rows_per_page]),
+                    nb % self.rows_per_page,
+                    0,
+                ]
+                assert torch.isnan(tail.float()).all(), (
+                    f"{label}: sequence {b}: the incomplete tail block's row was written"
+                )
+            completed += max(0, nb - max(pos0, 0) // bs)
+            ring_b = self.index_state_cache[b + 1, :, 0]
+            for slot in range(self.cap):
+                cands = [
+                    p for p in range(max(0, L - self.cap), L) if p % self.cap == slot
+                ]
+                if not cands:
+                    assert torch.isnan(ring_b[slot].float()).all(), (
+                        f"{label}: sequence {b}: ring slot {slot} written without a position"
+                    )
+                    continue
+                p_last = max(cands)
+                assert torch.equal(bits(ring_b[slot]), bits(stream[p_last])), (
+                    f"{label}: sequence {b}: ring slot {slot} is not position {p_last}'s raw key"
+                )
+        assert (
+            torch.isnan(self.index_state_cache[0].float()).all()
+            and torch.isnan(self.index_kv_cache[NULL_PAGE].float()).all()
+        ), f"{label}: the null ring block / page 0 moved"
+        self.check_written_rows(label=label)
+        return completed
+
+    def snapshot(self) -> None:
+        """The side caches before a run: a second run is bitwise only with them restored (the chunk's ring write overwrites slots the
+        straddling block reads)."""
+        self._snap = (self.index_kv_cache.clone(), self.index_state_cache.clone())
+
+    def restore(self) -> None:
+        self.index_kv_cache.copy_(self._snap[0])
+        self.index_state_cache.copy_(self._snap[1])
