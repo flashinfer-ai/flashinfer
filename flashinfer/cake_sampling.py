@@ -302,12 +302,14 @@ def _stage1_variants(smem_limit: Optional[int] = None) -> list[tuple[int, int, b
     opt in to 99 KB, so the larger register-resident variants are not candidates there.  The
     compact-list twins (``compact_list``, launch_flags bit 13) are not variants of their own: their
     (cluster, ept) are those of the full-list streams they double, which do not fit a 12.x opt-in.
-    Nor is the lean-scan twin (``lean``, launch_flags bit 14) of the (4, 16) resident it doubles."""
+    Nor is the lean-scan twin (``lean``, launch_flags bit 14) of the (4, 16) resident it doubles, nor an L2-prefetch
+    twin (``l2_prefetch``, launch_flags bit 16) of the stream it doubles."""
     return [
         (v["cluster"], v["ept"], bool(v["stream"]))
         for v in load_manifest()["stage1"]
         if not v.get("compact_list", False)
         and not v.get("lean", False)
+        and not v.get("l2_prefetch", False)
         and (smem_limit is None or int(v["dynamic_smem_bytes"]) <= smem_limit)
     ]
 
@@ -463,10 +465,15 @@ def _stage1_has_fused_tail(cluster: int, ept: int, stream: bool) -> bool:
     """Whether the frozen variant is built with the fused stage-2/3 tail (manifest ``fused_tail``).
 
     The (8, 48) resident is a large-k pick and ships without the tail (inlining it cost that variant
-    2-7 % of stage-1 time on Blackwell / Rubin), so a launch that lands there takes two kernels.  The no-tail and
-    lean-scan twins (manifest ``no_tail`` / ``lean``) are forms of a fused-tail variant and do not decide it."""
+    2-7 % of stage-1 time on Blackwell / Rubin), so a launch that lands there takes two kernels.  The no-tail,
+    lean-scan and L2-prefetch twins (manifest ``no_tail`` / ``lean`` / ``l2_prefetch``) are forms of a fused-tail
+    variant and do not decide it."""
     for v in load_manifest()["stage1"]:
-        if v.get("no_tail", False) or v.get("lean", False):
+        if (
+            v.get("no_tail", False)
+            or v.get("lean", False)
+            or v.get("l2_prefetch", False)
+        ):
             continue
         if (v["cluster"], v["ept"], bool(v["stream"])) == (cluster, ept, stream):
             return bool(v["fused_tail"])
@@ -972,6 +979,11 @@ _FLAG_COMPACT_LIST = 8192
 # whose candidate-list scan keeps no trailing barrier; every output is bit-identical.  Only ``_lean_twin_flag`` takes
 # it, on the cells of ``_LEAN_TWIN_CELLS_BY_DEVICE``.
 _FLAG_LEAN = 16384
+# Stage-1 launch_flags bit 16: the L2-prefetch form (`_pf` twin) of the cluster-1 ept-16 speculative-sample slab-tail
+# stream and of the cluster-1 ept-32 speculative-sample stream with the fused two-warp tail, which warms L2 with the rest
+# of the CTA's row while the chain before its filter pass runs; every output is bit-identical.  Only
+# ``_l2_prefetch_plan`` takes it, on the cells of ``_L2_PREFETCH_TWINS_BY_DEVICE``.
+_FLAG_L2_PREFETCH = 65536
 # The build-selection bits a no-tail twin shares with the build it doubles (manifest key per bit).
 _NO_TAIL_SHARED_BITS = (
     (_FLAG_COARSE_SAMPLE, "coarse_sample"),
@@ -2247,6 +2259,17 @@ _STAGE1_PICK_K_RANGE_BY_DEVICE: dict[
 }
 
 
+def _stage1_pick_vocab_bin(vocab: int) -> Optional[int]:
+    """The ``_STAGE1_PICK_VOCABS`` bin serving ``vocab``: the measured vocab V with max(3 V / 4, previous V) < vocab
+    <= V, else None."""
+    lower = 0
+    for v in _STAGE1_PICK_VOCABS:
+        if max(lower, 3 * v // 4) < vocab <= v:
+            return v
+        lower = v
+    return None
+
+
 def _measured_stage1_pick(
     capability: tuple[int, int],
     sm_count: int,
@@ -2264,13 +2287,7 @@ def _measured_stage1_pick(
     picks = _STAGE1_PICKS_BY_DEVICE.get(device)
     if not picks or not 1 <= batch <= 128:
         return None
-    lower = 0
-    vbin = None
-    for v in _STAGE1_PICK_VOCABS:
-        if max(lower, 3 * v // 4) < vocab <= v:
-            vbin = v
-            break
-        lower = v
+    vbin = _stage1_pick_vocab_bin(vocab)
     if vbin is None:
         return None
     bbin = 1 << (int(batch) - 1).bit_length()
@@ -2466,6 +2483,106 @@ def _compact_launch_plan(
     )
 
 
+# Round 22: one-launch plans that take an L2-prefetch twin (launch_flags bit 16), per device (capability, SM count):
+# (vocab bin, batch bin) as ``_STAGE1_PICKS_BY_DEVICE`` -> (the stage-1 build, the plan's launch_flags without bit 16,
+# the (smallest, largest) top-k served).  The twin issues L2 prefetches of the rest of the CTA's row while the chain
+# before its filter pass runs (one CTA per row: a serial chain that leaves DRAM idle), and writes every output of the
+# build it doubles.  B200 (148 SMs): 65-128 rows of the V = 32768 bin run the (1, 16) stream's speculative-sample
+# slab-tail build with the fused two-warp tail and its twin, which prefetches each warp's slice of the row after the
+# sampled pass, in place of the cost model's (1, 32) coarse-sample stream; the (1, 16) build alone was not faster there
+# on every top-k.  H100 (132 SMs): 65-128 rows of the V = 262144 bin keep the (1, 32) stream's speculative-sample build
+# with the fused two-warp tail and take its twin, which prefetches chunks 2 and 3 of each warp after chunk 0's sampled
+# histogram.  A listed call whose plan with that build is not one launch with exactly these flags keeps its plan, and
+# so does every other device; ``top_k_probs_to_slab`` never takes a twin.
+_L2_PREFETCH_TWINS_BY_DEVICE: dict[
+    tuple[int, int, int],
+    dict[tuple[int, int], tuple[tuple[int, int, bool], int, tuple[int, int]]],
+] = {
+    # H100 SXM
+    (9, 0, 132): {
+        (262144, 128): ((1, 32, True), _FLAG_FUSE_TAIL | _FLAG_SPEC_SAMPLE, (1, 64)),
+    },
+    # B200
+    (10, 0, 148): {
+        (32768, 128): (
+            (1, 16, True),
+            _FLAG_FUSE_TAIL | _FLAG_SPEC_SAMPLE | _FLAG_SLAB_TAIL,
+            (1, 64),
+        ),
+    },
+}
+
+
+@functools.cache
+def _stage1_has_l2_prefetch(
+    cluster: int, ept: int, stream: bool, build_flags: int
+) -> bool:
+    """Whether the frozen module ships the L2-prefetch twin (a manifest entry with ``l2_prefetch``) of the fused-tail
+    stream build whose sample and slab-tail bits ``build_flags`` names: the kernel taken by launch_flags bit 16.  Every
+    output is bit-identical to the build it doubles."""
+    return any(
+        (v["cluster"], v["ept"], bool(v["stream"])) == (cluster, ept, stream)
+        and v.get("l2_prefetch", False)
+        and v["fused_tail"]
+        and bool(v["coarse_sample"]) == bool(build_flags & _FLAG_COARSE_SAMPLE)
+        and bool(v["spec_sample"]) == bool(build_flags & _FLAG_SPEC_SAMPLE)
+        and bool(v["slab_tail"]) == bool(build_flags & _FLAG_SLAB_TAIL)
+        for v in load_manifest()["stage1"]
+    )
+
+
+def _l2_prefetch_twin(
+    capability: tuple[int, int],
+    sm_count: int,
+    batch: int,
+    vocab: int,
+    top_k_max: int,
+) -> Optional[tuple[tuple[int, int, bool], int]]:
+    """The ``_L2_PREFETCH_TWINS_BY_DEVICE`` entry for this call, (stage-1 build, launch_flags without bit 16), when the
+    device (``capability``, ``sm_count``) lists its vocab and batch bins, ``top_k_max`` lies in the entry's range and
+    the frozen module ships the twin; else None."""
+    twins = _L2_PREFETCH_TWINS_BY_DEVICE.get(
+        (int(capability[0]), int(capability[1]), int(sm_count))
+    )
+    if not twins or not 1 <= batch <= 128:
+        return None
+    vbin = _stage1_pick_vocab_bin(vocab)
+    entry = twins.get((vbin, 1 << (int(batch) - 1).bit_length())) if vbin else None
+    if entry is None:
+        return None
+    build, flags, (least, most) = entry
+    if not least <= int(top_k_max) <= most or not _stage1_has_l2_prefetch(
+        *build, flags
+    ):
+        return None
+    return build, flags
+
+
+def _l2_prefetch_plan(
+    device_index: int, batch: int, vocab: int, top_k_max: int
+) -> Optional[_LaunchPlan]:
+    """The launch plan of an L2-prefetch twin (``_L2_PREFETCH_TWINS_BY_DEVICE``) for this call, or None: the plan with
+    the listed stage-1 build and launch_flags bit 16 when that plan is one launch with exactly the listed flags."""
+    twin = _l2_prefetch_twin(
+        _device_capability(device_index),
+        _sm_count(device_index),
+        batch,
+        vocab,
+        top_k_max,
+    )
+    if twin is None:
+        return None
+    build, flags = twin
+    plan = _launch_plan_of(device_index, batch, vocab, top_k_max, build)
+    if (
+        (plan.cluster, plan.ept, plan.stream) != build
+        or not plan.one_launch
+        or plan.launch_flags != flags
+    ):
+        return None
+    return plan._replace(launch_flags=plan.launch_flags | _FLAG_L2_PREFETCH)
+
+
 @functools.lru_cache(maxsize=8192)
 def _launch_plan(
     device_index: int, batch: int, vocab: int, top_k_max: int
@@ -2473,7 +2590,23 @@ def _launch_plan(
     """The dispatch of ``top_k_top_p_sampling_from_probs`` for ``batch`` rows of ``vocab`` entries with largest
     top-k ``top_k_max`` on device ``device_index``: a pure function of these four values and the frozen bundle, so
     it is computed once per distinct call shape (the route check and the launch share it).  Raises ``ValueError``
-    when no frozen stage-1 variant covers ``vocab``."""
+    when no frozen stage-1 variant covers ``vocab``.  A call ``_L2_PREFETCH_TWINS_BY_DEVICE`` lists takes the
+    L2-prefetch twin's plan (``_l2_prefetch_plan``), every other call the plan of ``_launch_plan_of``."""
+    twin = _l2_prefetch_plan(device_index, batch, vocab, top_k_max)
+    if twin is not None:
+        return twin
+    return _launch_plan_of(device_index, batch, vocab, top_k_max)
+
+
+def _launch_plan_of(
+    device_index: int,
+    batch: int,
+    vocab: int,
+    top_k_max: int,
+    stage1: Optional[tuple[int, int, bool]] = None,
+) -> _LaunchPlan:
+    """The launch plan of ``_launch_plan`` without the L2-prefetch twins; ``stage1`` replaces the measured pick and
+    the cost model's choice of the stage-1 variant (an L2-prefetch twin's build)."""
     compact = _compact_launch_plan(device_index, batch, vocab, top_k_max)
     if compact is not None:
         return compact
@@ -2499,7 +2632,8 @@ def _launch_plan(
             sm_count,
             vocab,
             smem_limit,
-            _measured_stage1_pick(
+            stage1
+            or _measured_stage1_pick(
                 capability, sm_count, batch, vocab, top_k_max, smem_limit
             )
             or _choose_stage1_resolved(

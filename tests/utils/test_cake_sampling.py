@@ -87,9 +87,10 @@ def _device_streams() -> bool:
 
 
 def _stage1_builds(man) -> list:
-    """The manifest's stage-1 rows without the no-tail twins (``no_tail``), the compact-list twins (``compact_list``)
-    and the lean-scan twin (``lean``), which ``test_no_tail_twins_match_their_fused_tail_builds``,
-    ``test_compact_list_twins_sample_as_the_pipeline`` and ``test_lean_twin_matches_its_parent_build`` check on their
+    """The manifest's stage-1 rows without the no-tail twins (``no_tail``), the compact-list twins (``compact_list``),
+    the lean-scan twin (``lean``) and the L2-prefetch twins (``l2_prefetch``), which
+    ``test_no_tail_twins_match_their_fused_tail_builds``, ``test_compact_list_twins_sample_as_the_pipeline``,
+    ``test_lean_twin_matches_its_parent_build`` and ``test_l2_prefetch_twins_match_their_parent_builds`` check on their
     own."""
     return [
         v
@@ -97,6 +98,7 @@ def _stage1_builds(man) -> list:
         if not v.get("no_tail", False)
         and not v.get("compact_list", False)
         and not v.get("lean", False)
+        and not v.get("l2_prefetch", False)
     ]
 
 
@@ -5871,7 +5873,10 @@ def test_compact_list_twins_sample_as_the_pipeline():
             or v["leader_push"]
         )
     lean = [v for v in man["stage1"] if v.get("lean", False)]
-    assert len(cs._stage1_variants()) == len(man["stage1"]) - len(compact) - len(lean)
+    prefetch = [v for v in man["stage1"] if v.get("l2_prefetch", False)]
+    assert len(cs._stage1_variants()) == len(man["stage1"]) - len(compact) - len(
+        lean
+    ) - len(prefetch)
     assert not any(stream for _, _, stream in cs._stage1_variants(101376))
     for sm_count, vocab, batch, k in itertools.product(
         (84, 170, 188), (32768, 128256, 151936), (1, 17, 64, 128), (10, 1000)
@@ -6526,6 +6531,7 @@ def test_lean_twin_is_no_stage1_variant_of_its_own():
             v
             for v in man["stage1"]
             if not v.get("compact_list", False)
+            and not v.get("l2_prefetch", False)
             and (limit is None or int(v["dynamic_smem_bytes"]) <= limit)
         ]
         variants = cs._stage1_variants(limit)
@@ -6541,8 +6547,8 @@ def test_lean_twin_is_no_stage1_variant_of_its_own():
     )
     entries = [e.split(", ") for e in re.findall(r"X\(([^)]*)\)", table)]
     assert [e[0] for e in entries] == [v["symbol"] for v in man["stage1"]]
-    assert all(len(e) == 18 for e in entries)
-    assert [e[-1] for e in entries] == [
+    assert all(len(e) == 19 for e in entries)
+    assert [e[-2] for e in entries] == [
         "1" if v["lean"] else "0" for v in man["stage1"]
     ]
 
@@ -6891,6 +6897,525 @@ def test_lean_twin_refusals():
                 probs,
                 cnt,
                 1000,
+                1,
+                vals,
+                idxs,
+                cnt,
+                c,
+                e,
+                st,
+                probs,
+                0.9,
+                1,
+                out,
+                rn,
+                7,
+                1,
+                1,
+                flags,
+                torch.cuda.current_stream().cuda_stream,
+            )
+
+
+# ------------------------------------------------------------------------------- round 22: the L2-prefetch twins
+
+# Round 22: the one-launch plans of 65-128 rows of the V = 32768 bin on B200 (148 SMs) take the (1, 16) stream's
+# speculative-sample slab-tail build with the fused two-warp tail and its L2-prefetch twin, and those of the V = 262144
+# bin on H100 (132 SMs) the L2-prefetch twin of the (1, 32) stream's speculative-sample build (launch_flags bit 16).
+_R22_PF_FLAGS = {
+    "B200": cs._FLAG_FUSE_TAIL | cs._FLAG_SPEC_SAMPLE | cs._FLAG_SLAB_TAIL,
+    "H100": cs._FLAG_FUSE_TAIL | cs._FLAG_SPEC_SAMPLE,
+}
+_R22_PF_RULES = {
+    "B200": ((10, 0, 148), (32768, 128), (1, 16, True)),
+    "H100": ((9, 0, 132), (262144, 128), (1, 32, True)),
+}
+# (device, vocab, batch, top-k) -> (plan without the rule, plan with it) of the open owner rows the rule moves.
+_R22_PF_OWNER_CHANGES = {
+    ("B200", 32768, 128, 50): ("1_32_1 f145 1L", "1_16_1 f65729 1L"),
+    ("H100", 262144, 128, 10): ("1_32_1 f65 1L", "1_32_1 f65601 1L"),
+    ("H100", 262144, 128, 50): ("1_32_1 f65 1L", "1_32_1 f65601 1L"),
+}
+
+
+def test_l2_prefetch_twins_are_no_stage1_variants_of_their_own():
+    """Round 22: each L2-prefetch twin (``l2_prefetch``, the symbol suffixed ``_pf``) doubles a cluster-1 stream build
+    with the fused two-warp tail and the same launch resources; launch_flags bit 16 selects it.  It is no stage-1 variant
+    of its own (the cost model never ranks it), it does not decide whether its stream carries the fused tail, the
+    binding source gives every stage-1 row its l2_prefetch column, and bit 16 is no other launch flag's bit."""
+    import re
+
+    man = load_manifest()
+    twins = [v for v in man["stage1"] if v.get("l2_prefetch", False)]
+    assert [v["symbol"] for v in twins] == [
+        "kernel_cake_radix_topk_c1_e16s_sp_lb_pf",
+        "kernel_cake_radix_topk_c1_e32s_sp_pf",
+    ]
+    builds = {v["symbol"]: v for v in man["stage1"]}
+    assert all("l2_prefetch" in v for v in man["stage1"])
+    for twin, flags in zip(
+        twins, (_R22_PF_FLAGS["B200"], _R22_PF_FLAGS["H100"]), strict=True
+    ):
+        parent = builds[twin["symbol"][: -len("_pf")]]
+        shared = {key for key in twin if key not in ("symbol", "l2_prefetch")}
+        assert shared == {key for key in parent if key not in ("symbol", "l2_prefetch")}
+        assert all(twin[key] == parent[key] for key in shared)
+        assert not parent["l2_prefetch"]
+        key = (twin["cluster"], twin["ept"], bool(twin["stream"]))
+        assert twin["fused_tail"] and twin["stream"] and twin["cluster"] == 1
+        assert not (twin["fused_block_tail"] or twin["no_tail"] or twin["compact_list"])
+        assert cs._stage1_has_l2_prefetch(*key, flags)
+        assert not cs._stage1_has_l2_prefetch(*key, flags ^ cs._FLAG_COARSE_SAMPLE)
+        assert cs._stage1_has_fused_tail(*key)
+    others = {(v["cluster"], v["ept"], bool(v["stream"])) for v in man["stage1"]}
+    assert not any(
+        cs._stage1_has_l2_prefetch(*key, flags)
+        for key in others - {(1, 16, True), (1, 32, True)}
+        for flags in _R22_PF_FLAGS.values()
+    )
+    for limit in (None, _FULL_SMEM_OPTIN, 101376):
+        rows = [
+            v
+            for v in man["stage1"]
+            if not v.get("compact_list", False)
+            and not v.get("lean", False)
+            and (limit is None or int(v["dynamic_smem_bytes"]) <= limit)
+        ]
+        assert cs._stage1_variants(limit) == [
+            (v["cluster"], v["ept"], bool(v["stream"]))
+            for v in rows
+            if not v["l2_prefetch"]
+        ]
+    source = cake_sampling_jit._binding_source(man)
+    table = next(
+        line
+        for line in source.splitlines()
+        if line.startswith("#define CAKE_SAMPLING_STAGE1_TABLE(X)")
+    )
+    entries = [e.split(", ") for e in re.findall(r"X\(([^)]*)\)", table)]
+    assert [e[0] for e in entries] == [v["symbol"] for v in man["stage1"]]
+    assert [e[-1] for e in entries] == [
+        "1" if v["l2_prefetch"] else "0" for v in man["stage1"]
+    ]
+    flags = {
+        name: value
+        for name, value in vars(cs).items()
+        if name.startswith("_FLAG_") and isinstance(value, int)
+    }
+    assert cs._FLAG_L2_PREFETCH == 1 << 16
+    assert all(value > 0 and value & (value - 1) == 0 for value in flags.values())
+    assert len(set(flags.values())) == len(flags)
+    binding = (
+        cake_sampling_jit._get_csrc_dir() / "cake_sampling_binding.cuh"
+    ).read_text()
+    constants = dict(
+        re.findall(r"constexpr\s+int64_t\s+(kFlag\w+)\s*=\s*(\d+)\s*;", binding)
+    )
+    assert constants["kFlagL2Prefetch"] == str(cs._FLAG_L2_PREFETCH)
+    assert len(set(constants.values())) == len(constants)
+
+
+def test_l2_prefetch_twin_cells_change_only_their_cells(monkeypatch):
+    """The round-22 rule (``_L2_PREFETCH_TWINS_BY_DEVICE``) changes the launch plans of the owner cells on the emulated
+    devices only on B200 and H100 and there on the open owner rows of ``_R22_PF_OWNER_CHANGES``, against the plans
+    without it.  On a wide grid (vocab on both sides of each bin, batch on both sides of 64 and 128, top-k on both sides
+    of each range) a changed plan lies in a listed (device, vocab bin, batch bin, top-k range) and is the listed build in
+    one launch with exactly the listed flags and bit 16; every other device keeps every plan, and
+    ``top_k_probs_to_slab`` never takes a twin.  CUDA is reported present, as on the emulated devices, so no GPU is
+    needed."""
+    listed = {
+        device: {key: (build, _R22_PF_FLAGS[name], (1, 64))}
+        for name, (device, key, build) in _R22_PF_RULES.items()
+    }
+    assert listed == cs._L2_PREFETCH_TWINS_BY_DEVICE
+    emulated = {
+        **_PLAN_DEVICES,
+        "B300": ((10, 3), 148, _FULL_SMEM_OPTIN),
+        "H100 PCIe": ((9, 0), 114, _FULL_SMEM_OPTIN),
+    }
+
+    def without_rule(cells=_PLAN_CELLS):
+        with monkeypatch.context() as m:
+            m.setattr(cs, "_L2_PREFETCH_TWINS_BY_DEVICE", {})
+            return _emulated_launch_plans(m, emulated, cells, cuda=True)
+
+    new = _emulated_launch_plans(monkeypatch, emulated, cuda=True)
+    old = without_rule()
+    changed = {
+        cell: (_plan_text(old[cell]), _plan_text(plan))
+        for cell, plan in new.items()
+        if plan != old[cell]
+    }
+    assert {
+        cell: changed[cell] for cell in _R22_PF_OWNER_CHANGES if cell in changed
+    } == _R22_PF_OWNER_CHANGES
+    assert {cell[0] for cell in changed} <= {"B200", "H100"}
+    cells = tuple(
+        itertools.product(
+            (
+                24576,
+                24577,
+                30000,
+                32767,
+                32768,
+                32769,
+                196608,
+                196609,
+                262143,
+                262144,
+                262145,
+            ),
+            (33, 64, 65, 96, 128, 129),
+            (1, 10, 20, 21, 32, 49, 50, 63, 64, 65, 1000),
+        )
+    )
+    new = _emulated_launch_plans(monkeypatch, emulated, cells, cuda=True)
+    old = without_rule(cells)
+    moved = {"B200": 0, "H100": 0}
+    for cell, plan in new.items():
+        name, vocab, batch, k = cell
+        if plan == old[cell]:
+            continue
+        assert name in _R22_PF_RULES, cell
+        _, (vbin, bbin), build = _R22_PF_RULES[name]
+        assert vbin * 3 // 4 < vocab <= vbin and bbin // 2 < batch <= bbin, cell
+        assert 1 <= k <= 64, cell
+        assert (plan.cluster, plan.ept, plan.stream) == build and plan.one_launch, cell
+        assert plan.launch_flags == _R22_PF_FLAGS[name] | cs._FLAG_L2_PREFETCH, cell
+        moved[name] += 1
+    assert moved["B200"] > 0 and moved["H100"] > 0
+    devices = {
+        1 << 16: ((10, 0), 148, _FULL_SMEM_OPTIN),
+        (1 << 16) + 1: ((9, 0), 132, _FULL_SMEM_OPTIN),
+    }
+    with monkeypatch.context() as m:
+        m.setattr(torch.cuda, "is_available", lambda: True)
+        m.setattr(cs, "_device_capability", lambda index: devices[index][0])
+        m.setattr(cs, "_sm_count", lambda index: devices[index][1])
+        m.setattr(cs, "_smem_optin", lambda index: devices[index][2])
+        for name in (
+            "_block_tail_enabled",
+            "_row_span_diet_capability",
+            "_stream_prepass_flag",
+            "_stage23_variant_flags",
+        ):
+            m.setattr(cs, name, inspect.unwrap(getattr(cs, name)))
+        slab_plan = inspect.unwrap(cs._slab_plan)
+        for index, (vocab, batch) in itertools.product(
+            devices, ((32768, 128), (32768, 65), (262144, 128), (262144, 96))
+        ):
+            for k in (1, 10, 50, 64):
+                assert not slab_plan(index, batch, vocab, k)[3] & cs._FLAG_L2_PREFETCH
+
+
+def _pf_pair(
+    module, probs, k, p, cluster, ept, flags, emit_renorm, seed=0x22, offset=7
+):
+    """Outputs of the stream build (``cluster``, ``ept``) launched with ``flags`` (the parent, fused two-warp tail) and
+    with ``flags`` | bit 16 (its L2-prefetch twin).  Every buffer starts poisoned (``_poisoned``); returns two tuples of
+    int32 views of (vals, idxs, count, samples, renorm)."""
+    batch = probs.shape[0]
+    p_args = (probs, float(p), 1) if isinstance(p, (int, float)) else (p, 0.0, 2)
+    stream = torch.cuda.current_stream().cuda_stream
+    runs = []
+    for f in (flags, flags | cs._FLAG_L2_PREFETCH):
+        vals = _poisoned(batch, SLAB, dtype=torch.float32)
+        idxs = _poisoned(batch, SLAB, dtype=torch.int32)
+        cnt = _poisoned(batch, dtype=torch.int32)
+        out = _poisoned(batch, dtype=torch.int32)
+        rn = _poisoned(batch, SLAB, dtype=torch.float32)
+        k_args = (cnt, int(k), 1) if isinstance(k, int) else (k, 0, 2)
+        module.radix_topk(
+            probs,
+            k_args[0],
+            k_args[1],
+            k_args[2],
+            vals,
+            idxs,
+            cnt,
+            cluster,
+            ept,
+            1,
+            p_args[0],
+            p_args[1],
+            p_args[2],
+            out,
+            rn,
+            seed,
+            offset,
+            emit_renorm,
+            f,
+            stream,
+        )
+        torch.cuda.synchronize()
+        runs.append(
+            tuple(t.view(torch.int32).clone() for t in (vals, idxs, cnt, out, rn))
+        )
+    return runs
+
+
+def _shifted(probs, offset):
+    """``probs`` copied into a buffer ``offset`` float32 words past its allocation start."""
+    batch, vocab = probs.shape
+    out = torch.empty(batch * vocab + offset, device="cuda")[offset:].view(batch, vocab)
+    out.copy_(probs)
+    return out
+
+
+def test_l2_prefetch_twins_match_their_parent_builds(monkeypatch):
+    """Round 22: each L2-prefetch twin's outputs are byte for byte those of the stream build it doubles (fused two-warp
+    tail): the slab (values, indices, count), the samples and the renormalized weights, with scalar and per-row top-k /
+    top-p, emit_renorm 0 and 1, on the adversarial rows of ``_lean_rows`` and from poisoned buffers, also with the rows
+    shifted off the allocation start (a 16-byte-aligned shift, and unaligned row starts over a vocabulary of no multiple
+    of 4 words, where no bulk prefetch is issued), and the twin's output is the reference's.  Through the public entry
+    point with a caller's workspace (with and without ``renorm_out``) and under CUDA graph replay, a launch the rule
+    moves to the twin writes the same bytes as the plan without the rule; on a device ``_L2_PREFETCH_TWINS_BY_DEVICE``
+    lists, every tested cell's plan is the twin before the bytes are compared, so the comparison cannot pass on a plan
+    that never takes it.  A device whose shared-memory opt-in does not fit the streams skips the forced launches."""
+    _require_supported_device()
+    module = load_cake_sampling_module()
+    man = load_manifest()
+    optin = torch.cuda.get_device_properties(
+        torch.cuda.current_device()
+    ).shared_memory_per_block_optin
+    twins = [v for v in man["stage1"] if v.get("l2_prefetch", False)]
+    assert len(twins) == 2
+    for twin, vocab, flags in zip(
+        twins,
+        (32768, 262144),
+        (_R22_PF_FLAGS["B200"], _R22_PF_FLAGS["H100"]),
+        strict=True,
+    ):
+        if int(twin["dynamic_smem_bytes"]) > optin:
+            continue
+        cluster, ept = twin["cluster"], twin["ept"]
+        cases = (
+            (128 if vocab == 32768 else 8, 50, 0.9, 2201, vocab, 0),
+            (72, 64, 1e-6, 2202, vocab - 1, 0),
+            (8, 1, 0.5, 2203, vocab, 4),
+            (8, 21, 1.0, 2204, vocab - 1, 1),
+            (7, 10, 0.9, 2205, vocab - 3, 3),
+        )
+        for batch, k, p, seed, v, shift in cases:
+            probs = _lean_rows(batch, v, seed)
+            if shift:
+                probs = _shifted(probs, shift)
+            pn = probs.cpu().numpy()
+            k_row = torch.tensor(
+                [1 + (r * 13) % k for r in range(batch)],
+                device="cuda",
+                dtype=torch.int32,
+            )
+            p_row = torch.linspace(0.05, 1.0, batch, device="cuda", dtype=torch.float32)
+            for kk, pp in ((k, p), (k_row, p_row)):
+                for emit in (1, 0):
+                    where = (
+                        twin["symbol"],
+                        batch,
+                        v,
+                        shift,
+                        "row" if not isinstance(kk, int) else kk,
+                        emit,
+                    )
+                    parent, got = _pf_pair(
+                        module, probs, kk, pp, cluster, ept, flags, emit
+                    )
+                    for name, a, b in zip(
+                        ("vals", "idxs", "count", "samples", "renorm"),
+                        parent,
+                        got,
+                        strict=True,
+                    ):
+                        assert torch.equal(a, b), (*where, name)
+                    if emit:
+                        vals, idxs, cnt, out, rn = (t.cpu().numpy() for t in got)
+                        run = Run(
+                            out, rn.view(np.float32), vals.view(np.float32), idxs, cnt
+                        )
+                        _check(
+                            run,
+                            pn,
+                            kk if isinstance(kk, int) else kk.cpu().numpy(),
+                            pp if isinstance(pp, (int, float)) else pp.cpu().numpy(),
+                            0x22,
+                            7,
+                        )
+    # the public entry point with a caller's workspace: the rule on this device's cells against the plan without it
+    device = torch.cuda.current_device()
+    here = (*cs._device_capability(device), cs._sm_count(device))
+    listed_here = cs._L2_PREFETCH_TWINS_BY_DEVICE.get(here, {})
+    for (vbin, bbin), (build, flags, _) in (
+        ((32768, 128), ((1, 16, True), _R22_PF_FLAGS["B200"], None)),
+        ((262144, 128), ((1, 32, True), _R22_PF_FLAGS["H100"], None)),
+    ):
+        if (
+            int(
+                next(v for v in twins if (v["cluster"], v["ept"]) == build[:2])[
+                    "dynamic_smem_bytes"
+                ]
+            )
+            > optin
+        ):
+            continue
+        table = {here: {(vbin, bbin): (build, flags, (1, 64))}}
+        for batch, k, seed in (
+            (bbin, 50, 2211),
+            (bbin // 2 + 1, 64, 2212),
+            (bbin - 32, 10, 2213),
+        ):
+            probs = _lean_rows(batch, vbin, seed)
+            plans = []
+            for rule in ({}, table):
+                with monkeypatch.context() as m:
+                    m.setattr(cs, "_L2_PREFETCH_TWINS_BY_DEVICE", rule)
+                    _clear_plan_caches()
+                    plans.append(cs._launch_plan(device, batch, vbin, k))
+            _clear_plan_caches()
+            plan0, plan1 = plans
+            if (vbin, bbin) in listed_here:
+                # a device the table lists takes the twin on every tested cell of its bin
+                assert plan1.launch_flags & cs._FLAG_L2_PREFETCH, (batch, k, plan1)
+                assert cs._launch_plan(device, batch, vbin, k) == plan1
+            if plan1.launch_flags & cs._FLAG_L2_PREFETCH:
+                assert (
+                    plan1.cluster,
+                    plan1.ept,
+                    plan1.stream,
+                ) == build and plan1.one_launch
+                assert plan1.launch_flags == flags | cs._FLAG_L2_PREFETCH
+            else:
+                assert plan1 == plan0, (batch, k, plan0, plan1)
+            _clear_plan_caches()
+            k_row = torch.tensor(
+                [k - (r * 7) % k for r in range(batch)],
+                device="cuda",
+                dtype=torch.int32,
+            )
+            p_row = torch.linspace(0.2, 1.0, batch, device="cuda", dtype=torch.float32)
+            for kk, pp in ((k, 0.9), (k_row, p_row)):
+                for with_renorm in (False, True):
+                    results = []
+                    for rule in ({}, table):
+                        ws = (
+                            _poisoned(batch, SLAB, dtype=torch.float32),
+                            _poisoned(batch, SLAB, dtype=torch.int32),
+                            _poisoned(batch, dtype=torch.int32),
+                        )
+                        out = _poisoned(batch, dtype=torch.int32)
+                        rn = _poisoned(batch, SLAB, dtype=torch.float32)
+                        with monkeypatch.context() as m:
+                            m.setattr(cs, "_L2_PREFETCH_TWINS_BY_DEVICE", rule)
+                            _clear_plan_caches()
+                            top_k_top_p_sampling_from_probs(
+                                probs,
+                                kk,
+                                pp,
+                                top_k_max=k,
+                                philox_seed=0x2222,
+                                philox_offset=11,
+                                out=out,
+                                renorm_out=rn if with_renorm else None,
+                                workspace=ws,
+                            )
+                            torch.cuda.synchronize()
+                        results.append(
+                            tuple(t.view(torch.int32).clone() for t in (*ws, out, rn))
+                        )
+                    _clear_plan_caches()
+                    for name, a, b in zip(
+                        ("vals", "idxs", "count", "samples", "renorm"),
+                        *results,
+                        strict=True,
+                    ):
+                        assert torch.equal(a, b), (batch, k, with_renorm, name)
+            # CUDA graph replay of the twin's plan against the eager launch without the rule
+            eager = _poisoned(batch, dtype=torch.int32)
+            with monkeypatch.context() as m:
+                m.setattr(cs, "_L2_PREFETCH_TWINS_BY_DEVICE", {})
+                _clear_plan_caches()
+                top_k_top_p_sampling_from_probs(
+                    probs,
+                    k,
+                    0.9,
+                    top_k_max=k,
+                    philox_seed=0x2223,
+                    philox_offset=3,
+                    out=eager,
+                )
+                torch.cuda.synchronize()
+            with monkeypatch.context() as m:
+                m.setattr(cs, "_L2_PREFETCH_TWINS_BY_DEVICE", table)
+                _clear_plan_caches()
+                out = _poisoned(batch, dtype=torch.int32)
+                ws = _ws(batch)
+                s = torch.cuda.Stream()
+                s.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(s):
+                    top_k_top_p_sampling_from_probs(
+                        probs,
+                        k,
+                        0.9,
+                        top_k_max=k,
+                        philox_seed=0x2223,
+                        philox_offset=3,
+                        out=out,
+                        workspace=ws,
+                    )
+                torch.cuda.synchronize()
+                g = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(g, stream=s):
+                    top_k_top_p_sampling_from_probs(
+                        probs,
+                        k,
+                        0.9,
+                        top_k_max=k,
+                        philox_seed=0x2223,
+                        philox_offset=3,
+                        out=out,
+                        workspace=ws,
+                    )
+                for _ in range(2):
+                    out.view(torch.int32).fill_(0x7FBADBAD)
+                    g.replay()
+                    torch.cuda.synchronize()
+                    assert torch.equal(out, eager), (batch, k, "graph")
+            _clear_plan_caches()
+    _clear_plan_caches()
+
+
+def test_l2_prefetch_twin_refusals():
+    """The module rejects launch_flags bit 16 on a register-resident variant, and finds no build for it on a stream
+    build that ships no L2-prefetch twin (another stream, the slab tail on the (1, 32) stream, no fused tail)."""
+    _require_supported_device()
+    module = load_cake_sampling_module()
+    man = load_manifest()
+    probs = _probs(2, 32768)
+    resident = next(
+        (v["cluster"], v["ept"]) for v in _stage1_builds(man) if not v["stream"]
+    )
+    pf = cs._FLAG_L2_PREFETCH
+    for (c, e, st), flags, message in (
+        ((*resident, 0), pf | cs._FLAG_FUSE_TAIL, "launch_flags bit 16"),
+        ((4, 16, 1), pf | cs._FLAG_FUSE_TAIL, "launch_flags bit 16"),
+        (
+            (1, 32, 1),
+            pf | cs._FLAG_FUSE_TAIL | cs._FLAG_SPEC_SAMPLE | cs._FLAG_SLAB_TAIL,
+            "launch_flags bit 16",
+        ),
+        (
+            (1, 16, 1),
+            pf | cs._FLAG_SPEC_SAMPLE | cs._FLAG_NO_TAIL,
+            "launch_flags bit 16",
+        ),
+    ):
+        vals, idxs, cnt = _ws(2)
+        out = torch.empty(2, device="cuda", dtype=torch.int32)
+        rn = torch.empty(2, SLAB, device="cuda")
+        with pytest.raises(Exception, match=message):
+            module.radix_topk(
+                probs,
+                cnt,
+                50,
                 1,
                 vals,
                 idxs,
