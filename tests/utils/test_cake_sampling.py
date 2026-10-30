@@ -6919,20 +6919,18 @@ def test_lean_twin_refusals():
 
 # ------------------------------------------------------------------------------- round 22: the L2-prefetch twins
 
-# Round 22: the one-launch plans of 65-128 rows of the V = 32768 bin on B200 (148 SMs) take the (1, 16) stream's
-# speculative-sample slab-tail build with the fused two-warp tail and its L2-prefetch twin, and those of the V = 262144
-# bin on H100 (132 SMs) the L2-prefetch twin of the (1, 32) stream's speculative-sample build (launch_flags bit 16).
+# Round 22: the one-launch plans of 65-128 rows of the V = 262144 bin on H100 (132 SMs) take the L2-prefetch twin of the
+# (1, 32) stream's speculative-sample build (launch_flags bit 16).  The twin of the (1, 16) stream's speculative-sample
+# slab-tail build ships too (its forced launches are tested), but no device's table lists it.
 _R22_PF_FLAGS = {
     "B200": cs._FLAG_FUSE_TAIL | cs._FLAG_SPEC_SAMPLE | cs._FLAG_SLAB_TAIL,
     "H100": cs._FLAG_FUSE_TAIL | cs._FLAG_SPEC_SAMPLE,
 }
 _R22_PF_RULES = {
-    "B200": ((10, 0, 148), (32768, 128), (1, 16, True)),
     "H100": ((9, 0, 132), (262144, 128), (1, 32, True)),
 }
 # (device, vocab, batch, top-k) -> (plan without the rule, plan with it) of the open owner rows the rule moves.
 _R22_PF_OWNER_CHANGES = {
-    ("B200", 32768, 128, 50): ("1_32_1 f145 1L", "1_16_1 f65729 1L"),
     ("H100", 262144, 128, 10): ("1_32_1 f65 1L", "1_32_1 f65601 1L"),
     ("H100", 262144, 128, 50): ("1_32_1 f65 1L", "1_32_1 f65601 1L"),
 }
@@ -7017,12 +7015,12 @@ def test_l2_prefetch_twins_are_no_stage1_variants_of_their_own():
 
 def test_l2_prefetch_twin_cells_change_only_their_cells(monkeypatch):
     """The round-22 rule (``_L2_PREFETCH_TWINS_BY_DEVICE``) changes the launch plans of the owner cells on the emulated
-    devices only on B200 and H100 and there on the open owner rows of ``_R22_PF_OWNER_CHANGES``, against the plans
-    without it.  On a wide grid (vocab on both sides of each bin, batch on both sides of 64 and 128, top-k on both sides
-    of each range) a changed plan lies in a listed (device, vocab bin, batch bin, top-k range) and is the listed build in
-    one launch with exactly the listed flags and bit 16; every other device keeps every plan, and
-    ``top_k_probs_to_slab`` never takes a twin.  CUDA is reported present, as on the emulated devices, so no GPU is
-    needed."""
+    devices only on those of ``_R22_PF_RULES`` (H100, not B200) and there on the open owner rows of
+    ``_R22_PF_OWNER_CHANGES``, against the plans without it.  On a wide grid (vocab on both sides of each bin, batch on
+    both sides of 64 and 128, top-k on both sides of each range) a changed plan lies in a listed (device, vocab bin,
+    batch bin, top-k range) and is the listed build in one launch with exactly the listed flags and bit 16; every other
+    device keeps every plan, and ``top_k_probs_to_slab`` never takes a twin.  CUDA is reported present, as on the
+    emulated devices, so no GPU is needed."""
     listed = {
         device: {key: (build, _R22_PF_FLAGS[name], (1, 64))}
         for name, (device, key, build) in _R22_PF_RULES.items()
@@ -7049,7 +7047,7 @@ def test_l2_prefetch_twin_cells_change_only_their_cells(monkeypatch):
     assert {
         cell: changed[cell] for cell in _R22_PF_OWNER_CHANGES if cell in changed
     } == _R22_PF_OWNER_CHANGES
-    assert {cell[0] for cell in changed} <= {"B200", "H100"}
+    assert {cell[0] for cell in changed} <= set(_R22_PF_RULES)
     cells = tuple(
         itertools.product(
             (
@@ -7071,7 +7069,7 @@ def test_l2_prefetch_twin_cells_change_only_their_cells(monkeypatch):
     )
     new = _emulated_launch_plans(monkeypatch, emulated, cells, cuda=True)
     old = without_rule(cells)
-    moved = {"B200": 0, "H100": 0}
+    moved = dict.fromkeys(_R22_PF_RULES, 0)
     for cell, plan in new.items():
         name, vocab, batch, k = cell
         if plan == old[cell]:
@@ -7083,7 +7081,7 @@ def test_l2_prefetch_twin_cells_change_only_their_cells(monkeypatch):
         assert (plan.cluster, plan.ept, plan.stream) == build and plan.one_launch, cell
         assert plan.launch_flags == _R22_PF_FLAGS[name] | cs._FLAG_L2_PREFETCH, cell
         moved[name] += 1
-    assert moved["B200"] > 0 and moved["H100"] > 0
+    assert all(moved.values()), moved
     devices = {
         1 << 16: ((10, 0), 148, _FULL_SMEM_OPTIN),
         (1 << 16) + 1: ((9, 0), 132, _FULL_SMEM_OPTIN),

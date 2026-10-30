@@ -2487,13 +2487,13 @@ def _compact_launch_plan(
 # (vocab bin, batch bin) as ``_STAGE1_PICKS_BY_DEVICE`` -> (the stage-1 build, the plan's launch_flags without bit 16,
 # the (smallest, largest) top-k served).  The twin issues L2 prefetches of the rest of the CTA's row while the chain
 # before its filter pass runs (one CTA per row: a serial chain that leaves DRAM idle), and writes every output of the
-# build it doubles.  B200 (148 SMs): 65-128 rows of the V = 32768 bin run the (1, 16) stream's speculative-sample
-# slab-tail build with the fused two-warp tail and its twin, which prefetches each warp's slice of the row after the
-# sampled pass, in place of the cost model's (1, 32) coarse-sample stream; the (1, 16) build alone was not faster there
-# on every top-k.  H100 (132 SMs): 65-128 rows of the V = 262144 bin keep the (1, 32) stream's speculative-sample build
+# build it doubles.  H100 (132 SMs): 65-128 rows of the V = 262144 bin keep the (1, 32) stream's speculative-sample build
 # with the fused two-warp tail and take its twin, which prefetches chunks 2 and 3 of each warp after chunk 0's sampled
-# histogram.  A listed call whose plan with that build is not one launch with exactly these flags keeps its plan, and
-# so does every other device; ``top_k_probs_to_slab`` never takes a twin.
+# histogram.  B200 lists no twin: the twin of the (1, 16) stream's speculative-sample slab-tail build is faster than the
+# (1, 32) coarse-sample stream on 65-128 rows of the V = 32768 bin with randomly distributed probabilities, but rows
+# whose mass sits in one narrow index band send that build to its slow path (about 3.5 times the (1, 32) stream).  A
+# listed call whose plan with that build is not one launch with exactly these flags keeps its plan, and so does every
+# other device; ``top_k_probs_to_slab`` never takes a twin.
 _L2_PREFETCH_TWINS_BY_DEVICE: dict[
     tuple[int, int, int],
     dict[tuple[int, int], tuple[tuple[int, int, bool], int, tuple[int, int]]],
@@ -2501,14 +2501,6 @@ _L2_PREFETCH_TWINS_BY_DEVICE: dict[
     # H100 SXM
     (9, 0, 132): {
         (262144, 128): ((1, 32, True), _FLAG_FUSE_TAIL | _FLAG_SPEC_SAMPLE, (1, 64)),
-    },
-    # B200
-    (10, 0, 148): {
-        (32768, 128): (
-            (1, 16, True),
-            _FLAG_FUSE_TAIL | _FLAG_SPEC_SAMPLE | _FLAG_SLAB_TAIL,
-            (1, 64),
-        ),
     },
 }
 
