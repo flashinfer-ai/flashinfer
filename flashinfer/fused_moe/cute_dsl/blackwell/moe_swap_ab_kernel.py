@@ -2775,7 +2775,7 @@ class Sm100BlockScaledGroupedGemmKernel:
         # Keep each warpgroup's register budget scoped to its role until the join.
         if warp < 4:
             if cutlass.const_expr(self.gather_input):
-                cute.arch.setmaxregister_decrease(120)
+                cute.arch.setmaxregister_decrease(128)
             if warp == self.schedule_warp:
                 if cutlass.const_expr(self.use_clc_scheduler):
                     sched = utils.ClcDynamicPersistentTileScheduler.create(
@@ -3304,7 +3304,7 @@ class Sm100BlockScaledGroupedGemmKernel:
                     )
         elif warp < 8:
             if cutlass.const_expr(self.gather_input):
-                cute.arch.setmaxregister_increase(256)
+                cute.arch.setmaxregister_increase(248)
             # Normalization is invariant across experts and scheduled tiles.
             norm = cutlass.Float32(1.0)
             if cutlass.const_expr(norm_const is not None):
