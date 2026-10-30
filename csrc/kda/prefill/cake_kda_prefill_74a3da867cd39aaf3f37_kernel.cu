@@ -436,7 +436,7 @@ __device__ __forceinline__ unsigned int __as_u32(int v) {
 extern "C" {
 
 __global__ __launch_bounds__(1024) void
-kernel_cake_kda_prefill_c42e1f8ab020fd33eb50(__nv_bfloat16* __restrict__ q, const __grid_constant__ CUtensorMap q_tma, __nv_bfloat16* __restrict__ k, const __grid_constant__ CUtensorMap k_tma, __nv_bfloat16* __restrict__ v, const __grid_constant__ CUtensorMap v_tma, __nv_bfloat16* __restrict__ g, const __grid_constant__ CUtensorMap g_tma, __nv_bfloat16* __restrict__ beta, const __grid_constant__ CUtensorMap beta_tma, float* __restrict__ A_log, float* __restrict__ dt_bias, long long* __restrict__ cu_seqlens, int* __restrict__ seq_order, __nv_bfloat16* __restrict__ initial_state, __nv_bfloat16* __restrict__ out, const __grid_constant__ CUtensorMap out_tma, __nv_bfloat16* __restrict__ final_state, int num_heads, int use_initial_state, int store_final_state, float scale, float lower_bound, unsigned long long state_indices_addr, unsigned long long state_checkpoints_addr, unsigned long long checkpoint_cu_starts_addr, long long beta_token_stride, long long state_slot_stride, int use_state_indices, int checkpoint_every_n_tokens, long long* __restrict__ cu_chunk_offsets, __nv_bfloat16* __restrict__ chunk_state, unsigned int* __restrict__ state_checkpoint_needed, __nv_bfloat16* __restrict__ tape_qd, __nv_bfloat16* __restrict__ tape_kd, __nv_bfloat16* __restrict__ tape_kr, __nv_bfloat16* __restrict__ tape_j, float* __restrict__ tape_restore_factor, __nv_bfloat16* __restrict__ tape_e, __nv_bfloat16* __restrict__ tape_x, __nv_bfloat16* __restrict__ tape_r, float* __restrict__ norm_inv_out, __nv_bfloat16* __restrict__ decay_out, float* __restrict__ beta_active_out, float* __restrict__ initial_state_f32, unsigned int* __restrict__ zero_workspace, int zero_words, int num_sequences, const __grid_constant__ CUtensorMap state_checkpoints_tma, float* __restrict__ final_state_f32, long long g_token_stride, long long q_stride_m3, long long k_stride_m3, long long v_stride_m3)
+kernel_cake_kda_prefill_74a3da867cd39aaf3f37(__nv_bfloat16* __restrict__ q, const __grid_constant__ CUtensorMap q_tma, __nv_bfloat16* __restrict__ k, const __grid_constant__ CUtensorMap k_tma, __nv_bfloat16* __restrict__ v, const __grid_constant__ CUtensorMap v_tma, __nv_bfloat16* __restrict__ g, const __grid_constant__ CUtensorMap g_tma, __nv_bfloat16* __restrict__ beta, const __grid_constant__ CUtensorMap beta_tma, float* __restrict__ A_log, float* __restrict__ dt_bias, long long* __restrict__ cu_seqlens, int* __restrict__ seq_order, __nv_bfloat16* __restrict__ initial_state, __nv_bfloat16* __restrict__ out, const __grid_constant__ CUtensorMap out_tma, __nv_bfloat16* __restrict__ final_state, int num_heads, int use_initial_state, int store_final_state, float scale, float lower_bound, unsigned long long state_indices_addr, unsigned long long state_checkpoints_addr, unsigned long long checkpoint_cu_starts_addr, long long beta_token_stride, long long state_slot_stride, int use_state_indices, int checkpoint_every_n_tokens, long long* __restrict__ cu_chunk_offsets, __nv_bfloat16* __restrict__ chunk_state, unsigned int* __restrict__ state_checkpoint_needed, __nv_bfloat16* __restrict__ tape_qd, __nv_bfloat16* __restrict__ tape_kd, __nv_bfloat16* __restrict__ tape_kr, __nv_bfloat16* __restrict__ tape_j, float* __restrict__ tape_restore_factor, __nv_bfloat16* __restrict__ tape_e, __nv_bfloat16* __restrict__ tape_x, __nv_bfloat16* __restrict__ tape_r, float* __restrict__ norm_inv_out, __nv_bfloat16* __restrict__ decay_out, float* __restrict__ beta_active_out, float* __restrict__ initial_state_f32, unsigned int* __restrict__ zero_workspace, int zero_words, int num_sequences, const __grid_constant__ CUtensorMap state_checkpoints_tma, float* __restrict__ final_state_f32, long long g_token_stride, long long q_stride_m3, long long k_stride_m3, long long v_stride_m3)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -1632,6 +1632,9 @@ kernel_cake_kda_prefill_c42e1f8ab020fd33eb50(__nv_bfloat16* __restrict__ q, cons
             #pragma unroll 1
             for (int task_pos_3 = bin_begin_3; task_pos_3 < bin_end_3; task_pos_3++) {
                 int binned_task_idx_3 = seq_order[task_pos_3];
+                int task_seq_len = 0;
+                int task_prep_instance = 0;
+                int task_prep_local_warp = 0;
                 int split_compute_start_3 = 0;
                 int seq_idx_3 = binned_task_idx_3 / num_heads;
                 int head_idx_3 = binned_task_idx_3 % num_heads;
@@ -1645,6 +1648,9 @@ kernel_cake_kda_prefill_c42e1f8ab020fd33eb50(__nv_bfloat16* __restrict__ q, cons
                 int warp_id_in_role_3 = warp - 12;
                 int prep_local_warp = warp_id_in_role_3 - prep_instance * 4;
                 int prep_tid = prep_local_warp * 32 + lane;
+                task_seq_len = seq_len_3;
+                task_prep_instance = prep_instance;
+                task_prep_local_warp = prep_local_warp;
                 int prep_start = (prep_instance - bin_chunk_base_3 % 5 + 5) % 5;
                 int num_prep_iters = (num_chunks_0_3 + 5 - 1 - prep_start) / 5;
                 int gate_rate_stage_f32 = prep_instance * 10496;
@@ -3218,6 +3224,21 @@ kernel_cake_kda_prefill_c42e1f8ab020fd33eb50(__nv_bfloat16* __restrict__ q, cons
                     prep_ordinal += 5;
                 }
                 bin_chunk_base_3 += num_chunks_0_3;
+                if (task_pos_3 + 1 < bin_end_3 && task_prep_instance == (bin_chunk_base_3 + 4) % 5 && task_prep_local_warp == 0 && use_initial_state != 0 && task_seq_len <= 256) {
+                    if (elect_sync()) {
+                        int ahead_task_idx = seq_order[task_pos_3 + 1];
+                        int ahead_seq_idx = ahead_task_idx / num_heads;
+                        int ahead_state_slot = ahead_seq_idx;
+                        if (use_state_indices != 0) {
+                            ahead_state_slot = reinterpret_cast<int*>(state_indices_addr)[ahead_seq_idx];
+                        }
+                        long long ahead_initial_state = (long long)ahead_state_slot * state_slot_stride + (long long)(ahead_task_idx % num_heads) * 128 * 128;
+                        #pragma unroll
+                        for (int state_quarter = 0; state_quarter < 4; state_quarter++) {
+                            asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" :: "l"(initial_state_f32 + (ahead_initial_state + (long long)(state_quarter * 4096))), "r"((uint32_t)(16384)) : "memory");
+                        }
+                    }
+                }
             }
         }
     }
