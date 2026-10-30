@@ -25,6 +25,11 @@ SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=scripts/jit_cache_build_common.sh
 source "${SCRIPT_DIR}/jit_cache_build_common.sh"
 
+run_uncached() {
+    unset FLASHINFER_CXX_LAUNCHER FLASHINFER_NVCC_LAUNCHER
+    exec "$@"
+}
+
 echo "========================================"
 echo "Setting up sccache for JIT test compiles"
 echo "========================================"
@@ -45,7 +50,7 @@ if [ "$(sccache --version 2>/dev/null)" != "sccache ${SCCACHE_VERSION}" ]; then
     if [ "${install_status}" -ne 0 ] ||
         [ "$(sccache --version 2>/dev/null)" != "sccache ${SCCACHE_VERSION}" ]; then
         echo "::warning::sccache install failed; running without the compiler cache"
-        exec "$@"
+        run_uncached "$@"
     fi
 fi
 
@@ -57,7 +62,7 @@ CUDA_TAG=$(
 ) || CUDA_TAG=""
 if [ -z "${CUDA_TAG}" ]; then
     echo "::warning::could not read the CUDA version from ${NVCC_BIN}; running without the compiler cache"
-    exec "$@"
+    run_uncached "$@"
 fi
 
 # JIT sources are generated under the workspace cache, outside the checkout.
@@ -70,11 +75,9 @@ export SCCACHE_BASEDIRS="${JIT_CACHE_ROOT}${SCCACHE_BASEDIRS:+:${SCCACHE_BASEDIR
 export SCCACHE_BUCKET="${SCCACHE_BUCKET:-flashinfer-build-cache}"
 # Same prefix as the AOT lanes, which build in this toolchain image.
 if ! setup_sccache "cuda${CUDA_TAG}-$(uname -m)" "$(pwd -P)"; then
-    # sccache checks the S3 backend at startup; an outage or denied access
-    # must not fail the lane.
-    echo "::warning::sccache startup failed; running without the compiler cache"
-    unset FLASHINFER_CXX_LAUNCHER FLASHINFER_NVCC_LAUNCHER
-    exec "$@"
+    # An S3 outage or failed control command must not fail the lane.
+    echo "::warning::sccache setup failed; running without the compiler cache"
+    run_uncached "$@"
 fi
 
 # Not exec: stats must be collected after the lane exits, from this shell.

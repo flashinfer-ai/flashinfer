@@ -286,6 +286,7 @@ setup_sccache() {
   local key_prefix=$1
   local source_root=$2
   local sccache_arch
+  local zero_stats_status
   sccache_arch=$(uname -m)
   if [ "$(sccache --version 2>/dev/null)" = "sccache ${SCCACHE_VERSION}" ]; then
     # Already installed (e.g. by run_with_test_sccache.sh's fail-open probe).
@@ -322,10 +323,14 @@ setup_sccache() {
   fi
   (( _sccache_xtrace )) && set -x
 
-  # Explicit return: a caller that guards setup_sccache with `if` runs it with
-  # errexit off, and must still see a failed startup.
+  # Explicit returns: a caller that guards setup_sccache with `if` runs it with
+  # errexit off, and must still see failed control commands.
   sccache --start-server || return $?
-  sccache --zero-stats
+  sccache --zero-stats || {
+    zero_stats_status=$?
+    run_sccache_control_command --stop-server >/dev/null 2>&1 || true
+    return "${zero_stats_status}"
+  }
   export FLASHINFER_SCCACHE_ACTIVE=true
   echo "sccache version: $(sccache --version)"
   echo "sccache install source: ${FLASHINFER_SCCACHE_INSTALL_SOURCE}"
