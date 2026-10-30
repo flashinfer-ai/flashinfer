@@ -58,3 +58,7 @@ Until then the C++ stays as-is and the DSL kernel lives beside it.
 ## Status log
 
 - Thu 29 Oct 2026: survey done, worktree created, plan written. Starting step 1.
+- Fri 30 Oct 2026: Blackwell draft committed (0c7e5e166), reviewed, not yet run (no
+  Blackwell node all night). Open: the L2 tile group (PickSwizzle) must be done by the
+  scheduler warp, the DSL runtime scheduler cannot take a swizzled layout; algo 3
+  (A in smem) needs its own compile check; split-K / stream-K not started.

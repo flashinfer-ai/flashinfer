@@ -212,10 +212,30 @@ def w8a16_fp8_gemm_cute_dsl(
         raise ValueError(f"weight must be float8_e4m3fn, got {weight.dtype}")
     if get_compute_capability(act.device)[0] != 10:
         raise RuntimeError("the CuTe-DSL W8A16 kernel is Blackwell-only for now")
+    if act.dim() != 2 or weight.dim() != 2 or weight.shape[1] != act.shape[1]:
+        raise ValueError(
+            f"act [M, K] and weight [N, K] must share K, got {tuple(act.shape)} and "
+            f"{tuple(weight.shape)}"
+        )
     m, k = act.shape
     n = weight.shape[0]
     if out is None:
         out = torch.empty((m, n), dtype=act.dtype, device=act.device)
+    if out.shape != (m, n) or out.dtype != act.dtype:
+        raise ValueError(f"out must be [{m}, {n}] {act.dtype}")
+    if weight_scale.dtype != torch.float32 or weight_scale.numel() != 1:
+        raise ValueError("weight_scale must be one fp32 value")
+    if bias is not None and (bias.dtype != act.dtype or bias.numel() != n):
+        raise ValueError(f"bias must be [{n}] {act.dtype}")
+    for name, t in (("act", act), ("weight", weight), ("out", out), ("bias", bias)):
+        if t is not None and not t.is_contiguous():
+            raise ValueError(f"{name} must be contiguous")
+    # TMA needs 16-byte rows: 16 fp8 weights, 8 16-bit activations / outputs.
+    if k % 16 != 0 or n % 8 != 0:
+        raise ValueError(f"K must be a multiple of 16 and N of 8, got K={k}, N={n}")
+    for name, t in (("act", act), ("weight", weight), ("out", out)):
+        if t.data_ptr() % 16:
+            raise ValueError(f"{name} must be 16-byte aligned")
     num_sms = get_device_sm_count(act.device)
     if algo == 0:
         algo = sm100_pick_algo(m, n, k, num_sms)

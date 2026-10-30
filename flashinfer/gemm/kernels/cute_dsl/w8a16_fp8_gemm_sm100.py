@@ -1205,12 +1205,15 @@ class Sm100W8A16Fp8GemmKernel:
                             acc_pipeline.consumer_release(acc_consumer_state)
                         acc_consumer_state.advance()
                     m_thr_slice = m_thr_offset[(None, None, None, subtile_idx)]
-                    # scale * acc (+ bias) in fp32, per element.
-                    for i in cutlass.range(cute.size(tTR_rAcc), unroll_full=True):
-                        value = scale_val * tTR_rAcc[i]
-                        if cutlass.const_expr(self.has_bias):
-                            value = value + sBias[m_thr_slice[(i)][0]]
-                        tTR_rAcc[i] = value
+                    # scale * acc (+ bias[row]) in fp32: vectorized without the bias,
+                    # per element (the row comes from the identity partition) with it.
+                    if cutlass.const_expr(self.has_bias):
+                        for i in cutlass.range(cute.size(tTR_rAcc), unroll_full=True):
+                            tTR_rAcc[i] = (
+                                scale_val * tTR_rAcc[i] + sBias[m_thr_slice[(i)][0]]
+                            )
+                    else:
+                        tTR_rAcc.store(scale_val * tTR_rAcc.load())
 
                     if work_tile.distance_to_boundary >= self.cta_tile_shape_mnk[1]:
                         acc_vec = tiled_copy_r2s.retile(tTR_rAcc).load()
@@ -1435,15 +1438,21 @@ class Sm100W8A16Fp8GemmKernel:
         swizzle_size: int,
         raster_along_m: bool,
     ) -> tuple[utils.PersistentTileSchedulerParams, tuple[int, int, int]]:
-        """Persistent scheduler over the CTA tiles of C, grouped `swizzle_size`
-        clusters along the fast raster axis (the C++ kernel's max_swizzle_size)."""
+        """Persistent scheduler over the CTA tiles of C.
+
+        ``swizzle_size`` (the C++ kernel's L2 tile group, max_swizzle_size) is not
+        applied yet: StaticPersistentRuntimeTileScheduler ignores the params'
+        swizzled layout for the M raster and its termination test breaks on it for
+        the N raster, so the grouped walk has to be done by the scheduler warp from
+        the linear tile index.  Until then every variant walks the plain raster.
+        """
+        del swizzle_size
         c_shape = cute.slice_(cta_tile_shape_mnk, (None, None, 0))
         gc = cute.zipped_divide(c, tiler=c_shape)
         num_ctas_mnl = gc[(0, (None, None, None))].shape
         tile_sched_params = utils.PersistentTileSchedulerParams(
             num_ctas_mnl,
             (*cluster_shape_mn, 1),
-            swizzle_size=swizzle_size,
             raster_along_m=raster_along_m,
         )
         grid = (cluster_shape_mn[0], cluster_shape_mn[1], max_active_clusters)
