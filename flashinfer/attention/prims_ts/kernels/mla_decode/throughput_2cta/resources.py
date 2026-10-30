@@ -56,6 +56,7 @@ from cutlass.experimental.task_scheduling.resources import (
 )
 from cutlass.experimental.task_scheduling.resources import consumer_work, producer_work
 from cutlass.experimental.task_scheduling.enums import WorkAttr
+from ..helpers.math import final_lse
 from ...mask import kv_tile_needs_right_mask
 from ...tensor_map import transform_ragged_coords
 
@@ -572,6 +573,9 @@ class MlaWorkQueue(WorkQueue):
                 k_tile_total,
                 split_kv_cap,
                 split_kv_idx,
+                split_divisor=params.split_kv_fdd
+                if self.static_split_kv is None and not self.is_var_split_kv
+                else None,
             )
         return MlaTsWorkTileInfo(
             tile_idx,
@@ -2426,7 +2430,7 @@ class TmemSResource(HighThroughputMlaResource):
     smem_q_rope: Any = None
     smem_p: Any = None  # SMEM P array
     smem_exchange: Any = None  # SMEM array for cross-warp max exchange
-    softmax_scale_log2: Any = None  # softmax_scale * log2(e)
+    scale_softmax_log2: Any = None  # softmax_scale * log2(e)
     page_offsets: Any = None
     cache_seqs: Any = None  # per-batch valid K length
     cu_seqlens_q: Any = None  # cumulative compact-Q offsets, or None for fixed Q
@@ -3188,7 +3192,7 @@ class TmemSResource(HighThroughputMlaResource):
             # path below. The first tile (row_max_prev == -inf) yields an
             # infinite or NaN increase and never freezes. Compare in log2 units with
             # the threshold as an immediate: the scale is already live here.
-            max_increase_log2 = (row_max_new - row_max_prev) * self.softmax_scale_log2
+            max_increase_log2 = (row_max_new - row_max_prev) * self.scale_softmax_log2
             if max_increase_log2 <= Float32(cfg.softmax_rescale_threshold_log2):
                 row_max_new = row_max_prev
         row_has_values = row_max_new != neg_inf
@@ -3200,13 +3204,13 @@ class TmemSResource(HighThroughputMlaResource):
         correction_factor = Float32(1)
         if max_changed:
             correction_factor = cute.math.exp2(
-                (safe_row_max_prev - safe_row_max_new) * self.softmax_scale_log2,
+                (safe_row_max_prev - safe_row_max_new) * self.scale_softmax_log2,
                 fastmath=True,
             )
         no_correction = Int32(not max_changed)
 
-        fma_b = self.softmax_scale_log2
-        fma_c = Float32(0) - safe_row_max_new * self.softmax_scale_log2
+        fma_b = self.scale_softmax_log2
+        fma_c = Float32(0) - safe_row_max_new * self.scale_softmax_log2
         if cutlass.const_expr(cfg.is_fp8_qkv()):
             # Use the same selected FP8 probability scale as output and LSE:
             # 448 with exact maxima, 448 * 2**-T with a rescale threshold T.
@@ -4013,11 +4017,11 @@ class GmemOResource(HighThroughputMlaResource):
     tmem_corr_ref: Any = None  # Reference to TmemCorrResource for correction data
     output_scale: Any = None
     page_offsets: Any = None
-    atten_sinks: Any = None
+    attention_sinks: Any = None
     output_quant: cutlass.Constexpr = None
     output_quant_args: Any = None
     lse_in_natural_log: cutlass.Constexpr[bool] = False
-    softmax_scale_log2: Any = None
+    scale_softmax_log2: Any = None
     smem_exchange: Any = None  # SMEM for row_sum exchange (as Int32 base addr)
     split_kv: Any = None
     cu_seqlens_q: Any = None
@@ -4051,7 +4055,7 @@ class GmemOResource(HighThroughputMlaResource):
         only to O, after denominator/sink normalization; it must not change LSE."""
         safe_sum = row_sum if row_sum > Float32(0) else Float32(1)
         scale = self.output_scale * cute.math.rcp(safe_sum, approx=True)
-        if cutlass.const_expr(self.atten_sinks is not None):
+        if cutlass.const_expr(self.attention_sinks is not None):
             head = (
                 Int32(blk_coord[1]) * self.cfg.mma_qk_tiler[0]
                 + Int32(blk_coord[0])
@@ -4068,10 +4072,10 @@ class GmemOResource(HighThroughputMlaResource):
                 _, head, _, _, _ = self._query_row_state(
                     row, Int32(blk_coord[1]), Int32(blk_coord[2])
                 )
-            sink = Float32(self.atten_sinks[head])
+            sink = Float32(self.attention_sinks[head])
             scale = Float32(0)
             if row_sum > Float32(0) and sink != Float32(Float32.inf):
-                max_log2 = row_max * self.softmax_scale_log2
+                max_log2 = row_max * self.scale_softmax_log2
                 sink_log2 = sink * Float32(LOG2_E)
                 norm_max = cute.math.max(max_log2, sink_log2)
                 rescale = cute.math.exp2(max_log2 - norm_max, fastmath=True)
@@ -4463,7 +4467,7 @@ class GmemOResource(HighThroughputMlaResource):
             lse_row_sum = lse_row_sum * fp8_p_scale_rcp(cfg)
         lse = (
             cute.math.log2(lse_row_sum, fastmath=True)
-            + self.softmax_scale_log2 * row_max
+            + self.scale_softmax_log2 * row_max
             if row_has_values
             else Float32(-Float32.inf)
         )
@@ -4519,7 +4523,7 @@ class GmemOResource(HighThroughputMlaResource):
                             + Int64(logical_lse_q_idx) * Int64(logical_num_heads_q)
                             + Int64(batch_idx) * Int64(logical_num_heads_q) * Int64(S_q)
                         )
-                    lse_base_ptr.store(lse)
+                    lse_base_ptr.store(final_lse(lse, cfg.lse_base_on_e))
 
         prims.tcgen05_wait(kind=prims.Tcgen05Wait.LOAD)
         cute.arch.fence_view_async_tmem_load()
@@ -4744,7 +4748,7 @@ class GmemOResource(HighThroughputMlaResource):
                 lse_row_sum = lse_row_sum * fp8_p_scale_rcp(cfg)
             lse = (
                 cute.math.log2(lse_row_sum, fastmath=True)
-                + self.softmax_scale_log2 * row_max
+                + self.scale_softmax_log2 * row_max
                 if row_has_values
                 else Float32(-Float32.inf)
             )
@@ -4799,7 +4803,7 @@ class GmemOResource(HighThroughputMlaResource):
                                 * Int64(logical_num_heads_q)
                                 * Int64(S_q)
                             )
-                        lse_base_ptr.store(lse)
+                        lse_base_ptr.store(final_lse(lse, cfg.lse_base_on_e))
 
         prims.tcgen05_wait(kind=prims.Tcgen05Wait.LOAD)
         cute.arch.fence_view_async_tmem_load()
