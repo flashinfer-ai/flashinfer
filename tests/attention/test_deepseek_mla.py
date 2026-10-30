@@ -1675,16 +1675,6 @@ def test_fp8_kv_requires_scales():
         )
 
 
-if __name__ == "__main__":
-    test_batch_mla_varlen_page_attention(
-        1, 65, 65, 65, 1, 128, True, 64, "fa2", torch.half
-    )
-    # test_batch_mla_varlen_page_attention(
-    #     155, 1024, 8, 128, 128, 16, False, 1, "fa3", torch.half
-    # )
-    # test_batch_mla_page_attention(1, 1024, 128, 128, False, 1, "fa2", True, torch.half)
-
-
 def test_batch_mla_work_list_exceeding_plan_capacity():
     """MLAPlan sizes its per-work arrays from an upper bound on the work list.
     When that bound was a hardcoded 16384 with no check, a batch producing more
@@ -1727,20 +1717,68 @@ def test_batch_mla_work_list_exceeding_plan_capacity():
     workspace = torch.empty(256 * 1024 * 1024, dtype=torch.int8, device=device)
     wrapper = flashinfer.mla.BatchMLAPagedAttentionWrapper(workspace, backend="fa2")
     wrapper.plan(
-        qo_indptr,
-        kv_indptr,
-        kv_indices,
-        kv_len_arr,
-        num_heads,
-        HEAD_DIM_CKV,
-        HEAD_DIM_KPE,
-        page_size,
+        metadata=flashinfer.mla.MLAPlanMetadata.csr(
+            qo_indptr, kv_indptr, kv_indices, kv_len_arr
+        ),
+        num_heads=num_heads,
+        head_dim_ckv=HEAD_DIM_CKV,
+        head_dim_kpe=HEAD_DIM_KPE,
+        page_size=page_size,
         causal=False,
         sm_scale=1.0 / math.sqrt(HEAD_DIM_CKV + HEAD_DIM_KPE),
         q_data_type=torch.bfloat16,
         kv_data_type=torch.bfloat16,
+        query_layout="split",
+        kv_cache_layout="split",
     )
-    o = wrapper.run(q_nope.contiguous(), q_pe.contiguous(), ckv, kpe)
+    o = wrapper.run(query=(q_nope.contiguous(), q_pe.contiguous()), kv_cache=(ckv, kpe))
 
     torch.testing.assert_close(o, o[0].unsqueeze(0).expand_as(o), rtol=0, atol=0)
     clear_cuda_cache(device)
+
+
+def test_batch_mla_plan_declines_work_list_beyond_int_workspace():
+    """Past the 8 MiB int workspace, FA MLA declines the plan up front instead
+    of failing inside MLAPlan's allocator, so auto mode can pick another backend."""
+    from flashinfer.mla._batch_mla._backends._capabilities import (
+        _BackendPlanUnsupportedError,
+    )
+
+    device = torch.device("cuda:0")
+    # One work per request at this shape, so 240000 requests need about 8.6 MB.
+    batch_size, kv_len, num_heads = 240000, 4, 16
+    qo_indptr = torch.arange(0, batch_size + 1, device=device, dtype=torch.int32)
+    kv_indptr = qo_indptr * kv_len
+    kv_indices = torch.arange(kv_len, device=device, dtype=torch.int32).repeat(
+        batch_size
+    )
+    kv_len_arr = torch.full((batch_size,), kv_len, device=device, dtype=torch.int32)
+
+    workspace = torch.empty(256 * 1024 * 1024, dtype=torch.int8, device=device)
+    wrapper = flashinfer.mla.BatchMLAPagedAttentionWrapper(workspace, backend="fa2")
+    with pytest.raises(_BackendPlanUnsupportedError, match="int workspace"):
+        wrapper.plan(
+            metadata=flashinfer.mla.MLAPlanMetadata.csr(
+                qo_indptr, kv_indptr, kv_indices, kv_len_arr
+            ),
+            num_heads=num_heads,
+            head_dim_ckv=HEAD_DIM_CKV,
+            head_dim_kpe=HEAD_DIM_KPE,
+            page_size=1,
+            causal=False,
+            sm_scale=1.0 / math.sqrt(HEAD_DIM_CKV + HEAD_DIM_KPE),
+            q_data_type=torch.bfloat16,
+            kv_data_type=torch.bfloat16,
+            query_layout="split",
+            kv_cache_layout="split",
+        )
+
+
+if __name__ == "__main__":
+    test_batch_mla_varlen_page_attention(
+        1, 65, 65, 65, 1, 128, True, 64, "fa2", torch.half
+    )
+    # test_batch_mla_varlen_page_attention(
+    #     155, 1024, 8, 128, 128, 16, False, 1, "fa3", torch.half
+    # )
+    # test_batch_mla_page_attention(1, 1024, 128, 128, False, 1, "fa2", True, torch.half)
