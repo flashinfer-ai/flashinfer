@@ -61,7 +61,7 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 extern "C" {
 
 __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS) void
-kernel_cake_tp_moe_finalize_rmsnorm_6d4722f3bbbeb033a812(__nv_bfloat16* __restrict__ gemm2, int row_stride, int rows, int* __restrict__ idx, unsigned int* __restrict__ expert_weights, int weights_fp32, __nv_bfloat16* __restrict__ norm_weight, __nv_bfloat16* __restrict__ output, int n_tok, int max_ctas, float eps, float gain_center, int mode, int rank, long long* __restrict__ peer_table, unsigned long long c_mcast, int* __restrict__ ctl)
+kernel_cake_tp_moe_finalize_rmsnorm_34510c71aae549e2f720(__nv_bfloat16* __restrict__ gemm2, int row_stride, int rows, int* __restrict__ idx, unsigned int* __restrict__ expert_weights, int weights_fp32, __nv_bfloat16* __restrict__ norm_weight, __nv_bfloat16* __restrict__ output, int n_tok, int max_ctas, float eps, float gain_center, int mode, int rank, long long* __restrict__ peer_table, unsigned long long c_mcast, int* __restrict__ ctl)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -98,38 +98,38 @@ kernel_cake_tp_moe_finalize_rmsnorm_6d4722f3bbbeb033a812(__nv_bfloat16* __restri
     long long bcast_gen_elems = (long long)max_ctas * 4096;
     long long bcast_cta = (long long)b * 4096 + col64;
     long long rank64 = (long long)rank;
-    long long push_addr_0 = peer_table[0];
-    long long push_addr_1 = peer_table[1];
-    long long push_addr_2 = peer_table[2];
-    long long push_addr_3 = peer_table[3];
-    long long push_addr_4 = peer_table[4];
-    long long push_addr_5 = peer_table[5];
-    long long push_addr_6 = peer_table[6];
-    long long push_addr_7 = peer_table[7];
-    __nv_bfloat16* push_peers_0 = reinterpret_cast<__nv_bfloat16*>(push_addr_0);
-    __nv_bfloat16* push_peers_1 = reinterpret_cast<__nv_bfloat16*>(push_addr_1);
-    __nv_bfloat16* push_peers_2 = reinterpret_cast<__nv_bfloat16*>(push_addr_2);
-    __nv_bfloat16* push_peers_3 = reinterpret_cast<__nv_bfloat16*>(push_addr_3);
-    __nv_bfloat16* push_peers_4 = reinterpret_cast<__nv_bfloat16*>(push_addr_4);
-    __nv_bfloat16* push_peers_5 = reinterpret_cast<__nv_bfloat16*>(push_addr_5);
-    __nv_bfloat16* push_peers_6 = reinterpret_cast<__nv_bfloat16*>(push_addr_6);
-    __nv_bfloat16* push_peers_7 = reinterpret_cast<__nv_bfloat16*>(push_addr_7);
-    long long bcast_addr_0 = peer_table[8];
-    long long bcast_addr_1 = peer_table[9];
-    long long bcast_addr_2 = peer_table[10];
-    long long bcast_addr_3 = peer_table[11];
-    long long bcast_addr_4 = peer_table[12];
-    long long bcast_addr_5 = peer_table[13];
-    long long bcast_addr_6 = peer_table[14];
-    long long bcast_addr_7 = peer_table[15];
-    __nv_bfloat16* bcast_peers_0 = reinterpret_cast<__nv_bfloat16*>(bcast_addr_0);
-    __nv_bfloat16* bcast_peers_1 = reinterpret_cast<__nv_bfloat16*>(bcast_addr_1);
-    __nv_bfloat16* bcast_peers_2 = reinterpret_cast<__nv_bfloat16*>(bcast_addr_2);
-    __nv_bfloat16* bcast_peers_3 = reinterpret_cast<__nv_bfloat16*>(bcast_addr_3);
-    __nv_bfloat16* bcast_peers_4 = reinterpret_cast<__nv_bfloat16*>(bcast_addr_4);
-    __nv_bfloat16* bcast_peers_5 = reinterpret_cast<__nv_bfloat16*>(bcast_addr_5);
-    __nv_bfloat16* bcast_peers_6 = reinterpret_cast<__nv_bfloat16*>(bcast_addr_6);
-    __nv_bfloat16* bcast_peers_7 = reinterpret_cast<__nv_bfloat16*>(bcast_addr_7);
+    long long pa_0 = peer_table[0];
+    long long pa_1 = peer_table[1];
+    long long pa_2 = peer_table[2];
+    long long pa_3 = peer_table[3];
+    long long pa_4 = peer_table[4];
+    long long pa_5 = peer_table[5];
+    long long pa_6 = peer_table[6];
+    long long pa_7 = peer_table[7];
+    __nv_bfloat16* pp_0 = reinterpret_cast<__nv_bfloat16*>(pa_0);
+    __nv_bfloat16* pp_1 = reinterpret_cast<__nv_bfloat16*>(pa_1);
+    __nv_bfloat16* pp_2 = reinterpret_cast<__nv_bfloat16*>(pa_2);
+    __nv_bfloat16* pp_3 = reinterpret_cast<__nv_bfloat16*>(pa_3);
+    __nv_bfloat16* pp_4 = reinterpret_cast<__nv_bfloat16*>(pa_4);
+    __nv_bfloat16* pp_5 = reinterpret_cast<__nv_bfloat16*>(pa_5);
+    __nv_bfloat16* pp_6 = reinterpret_cast<__nv_bfloat16*>(pa_6);
+    __nv_bfloat16* pp_7 = reinterpret_cast<__nv_bfloat16*>(pa_7);
+    long long ba_0 = peer_table[8];
+    long long ba_1 = peer_table[9];
+    long long ba_2 = peer_table[10];
+    long long ba_3 = peer_table[11];
+    long long ba_4 = peer_table[12];
+    long long ba_5 = peer_table[13];
+    long long ba_6 = peer_table[14];
+    long long ba_7 = peer_table[15];
+    __nv_bfloat16* bp_0 = reinterpret_cast<__nv_bfloat16*>(ba_0);
+    __nv_bfloat16* bp_1 = reinterpret_cast<__nv_bfloat16*>(ba_1);
+    __nv_bfloat16* bp_2 = reinterpret_cast<__nv_bfloat16*>(ba_2);
+    __nv_bfloat16* bp_3 = reinterpret_cast<__nv_bfloat16*>(ba_3);
+    __nv_bfloat16* bp_4 = reinterpret_cast<__nv_bfloat16*>(ba_4);
+    __nv_bfloat16* bp_5 = reinterpret_cast<__nv_bfloat16*>(ba_5);
+    __nv_bfloat16* bp_6 = reinterpret_cast<__nv_bfloat16*>(ba_6);
+    __nv_bfloat16* bp_7 = reinterpret_cast<__nv_bfloat16*>(ba_7);
     long long push_local_addr = peer_table[rank];
     __nv_bfloat16* push_local = reinterpret_cast<__nv_bfloat16*>(push_local_addr);
     long long bcast_local_addr = peer_table[8 + rank];
@@ -237,85 +237,85 @@ kernel_cake_tp_moe_finalize_rmsnorm_6d4722f3bbbeb033a812(__nv_bfloat16* __restri
                     packets[0 + 3] = _uv4_3.w;
                 }
             }
-            int ridx1 = idx8[1];
-            if (ridx1 >= 0 && ridx1 < rows) {
+            int ridx1_0 = idx8[1];
+            if (ridx1_0 >= 0 && ridx1_0 < rows) {
                 {
-                    uint4 _uv4_4 = *reinterpret_cast<const uint4*>(gemm2 + ((long long)ridx1 * (long long)row_stride + col64) + 0);
+                    uint4 _uv4_4 = *reinterpret_cast<const uint4*>(gemm2 + ((long long)ridx1_0 * (long long)row_stride + col64) + 0);
                     packets[4 + 0] = _uv4_4.x;
                     packets[4 + 1] = _uv4_4.y;
                     packets[4 + 2] = _uv4_4.z;
                     packets[4 + 3] = _uv4_4.w;
                 }
             }
-            int ridx2 = idx8[2];
-            if (ridx2 >= 0 && ridx2 < rows) {
+            int ridx1_1 = idx8[2];
+            if (ridx1_1 >= 0 && ridx1_1 < rows) {
                 {
-                    uint4 _uv4_5 = *reinterpret_cast<const uint4*>(gemm2 + ((long long)ridx2 * (long long)row_stride + col64) + 0);
+                    uint4 _uv4_5 = *reinterpret_cast<const uint4*>(gemm2 + ((long long)ridx1_1 * (long long)row_stride + col64) + 0);
                     packets[8 + 0] = _uv4_5.x;
                     packets[8 + 1] = _uv4_5.y;
                     packets[8 + 2] = _uv4_5.z;
                     packets[8 + 3] = _uv4_5.w;
                 }
             }
-            int ridx3 = idx8[3];
-            if (ridx3 >= 0 && ridx3 < rows) {
+            int ridx1_2 = idx8[3];
+            if (ridx1_2 >= 0 && ridx1_2 < rows) {
                 {
-                    uint4 _uv4_6 = *reinterpret_cast<const uint4*>(gemm2 + ((long long)ridx3 * (long long)row_stride + col64) + 0);
+                    uint4 _uv4_6 = *reinterpret_cast<const uint4*>(gemm2 + ((long long)ridx1_2 * (long long)row_stride + col64) + 0);
                     packets[12 + 0] = _uv4_6.x;
                     packets[12 + 1] = _uv4_6.y;
                     packets[12 + 2] = _uv4_6.z;
                     packets[12 + 3] = _uv4_6.w;
                 }
             }
-            int ridx4 = idx8[4];
-            if (ridx4 >= 0 && ridx4 < rows) {
+            int ridx1_3 = idx8[4];
+            if (ridx1_3 >= 0 && ridx1_3 < rows) {
                 {
-                    uint4 _uv4_7 = *reinterpret_cast<const uint4*>(gemm2 + ((long long)ridx4 * (long long)row_stride + col64) + 0);
+                    uint4 _uv4_7 = *reinterpret_cast<const uint4*>(gemm2 + ((long long)ridx1_3 * (long long)row_stride + col64) + 0);
                     packets[16 + 0] = _uv4_7.x;
                     packets[16 + 1] = _uv4_7.y;
                     packets[16 + 2] = _uv4_7.z;
                     packets[16 + 3] = _uv4_7.w;
                 }
             }
-            int ridx5 = idx8[5];
-            if (ridx5 >= 0 && ridx5 < rows) {
+            int ridx1_4 = idx8[5];
+            if (ridx1_4 >= 0 && ridx1_4 < rows) {
                 {
-                    uint4 _uv4_8 = *reinterpret_cast<const uint4*>(gemm2 + ((long long)ridx5 * (long long)row_stride + col64) + 0);
+                    uint4 _uv4_8 = *reinterpret_cast<const uint4*>(gemm2 + ((long long)ridx1_4 * (long long)row_stride + col64) + 0);
                     packets[20 + 0] = _uv4_8.x;
                     packets[20 + 1] = _uv4_8.y;
                     packets[20 + 2] = _uv4_8.z;
                     packets[20 + 3] = _uv4_8.w;
                 }
             }
-            int ridx6 = idx8[6];
-            if (ridx6 >= 0 && ridx6 < rows) {
+            int ridx1_5 = idx8[6];
+            if (ridx1_5 >= 0 && ridx1_5 < rows) {
                 {
-                    uint4 _uv4_9 = *reinterpret_cast<const uint4*>(gemm2 + ((long long)ridx6 * (long long)row_stride + col64) + 0);
+                    uint4 _uv4_9 = *reinterpret_cast<const uint4*>(gemm2 + ((long long)ridx1_5 * (long long)row_stride + col64) + 0);
                     packets[24 + 0] = _uv4_9.x;
                     packets[24 + 1] = _uv4_9.y;
                     packets[24 + 2] = _uv4_9.z;
                     packets[24 + 3] = _uv4_9.w;
                 }
             }
-            int ridx7 = idx8[7];
-            if (ridx7 >= 0 && ridx7 < rows) {
+            int ridx1_6 = idx8[7];
+            if (ridx1_6 >= 0 && ridx1_6 < rows) {
                 {
-                    uint4 _uv4_10 = *reinterpret_cast<const uint4*>(gemm2 + ((long long)ridx7 * (long long)row_stride + col64) + 0);
+                    uint4 _uv4_10 = *reinterpret_cast<const uint4*>(gemm2 + ((long long)ridx1_6 * (long long)row_stride + col64) + 0);
                     packets[28 + 0] = _uv4_10.x;
                     packets[28 + 1] = _uv4_10.y;
                     packets[28 + 2] = _uv4_10.z;
                     packets[28 + 3] = _uv4_10.w;
                 }
             }
-            unsigned int raw0[4];
-            raw0[0] = packets[0];
-            raw0[1] = packets[1];
-            raw0[2] = packets[2];
-            raw0[3] = packets[3];
+            unsigned int raw0_1_0[4];
+            raw0_1_0[0] = packets[0];
+            raw0_1_0[1] = packets[1];
+            raw0_1_0[2] = packets[2];
+            raw0_1_0[3] = packets[3];
             uint32_t _packed16_sanitize_0[4];
             #pragma unroll
             for (int _p16s_word = 0; _p16s_word < 4; ++_p16s_word) {
-                uint32_t _p16s_carrier_11 = static_cast<uint32_t>(raw0[_p16s_word]);
+                uint32_t _p16s_carrier_11 = static_cast<uint32_t>(raw0_1_0[_p16s_word]);
                 uint32_t _p16s_lo_11 = _p16s_carrier_11 & 0x0000ffffu;
                 uint32_t _p16s_hi_11 = (_p16s_carrier_11 >> 16) & 0x0000ffffu;
                 if (_p16s_lo_11 == 0x00008000u) _p16s_lo_11 = 0u;
@@ -323,38 +323,38 @@ kernel_cake_tp_moe_finalize_rmsnorm_6d4722f3bbbeb033a812(__nv_bfloat16* __restri
                 _packed16_sanitize_0[_p16s_word] = _p16s_lo_11 | (_p16s_hi_11 << 16);
             }
             if (owner == 0) {
-                asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(push_peers_0 + dst), "r"((_packed16_sanitize_0)[0]), "r"((_packed16_sanitize_0)[1]), "r"((_packed16_sanitize_0)[2]), "r"((_packed16_sanitize_0)[3]) : "memory");
+                asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(pp_0 + dst), "r"((_packed16_sanitize_0)[0]), "r"((_packed16_sanitize_0)[1]), "r"((_packed16_sanitize_0)[2]), "r"((_packed16_sanitize_0)[3]) : "memory");
             }
             if (owner == 1) {
-                asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(push_peers_1 + dst), "r"((_packed16_sanitize_0)[0]), "r"((_packed16_sanitize_0)[1]), "r"((_packed16_sanitize_0)[2]), "r"((_packed16_sanitize_0)[3]) : "memory");
+                asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(pp_1 + dst), "r"((_packed16_sanitize_0)[0]), "r"((_packed16_sanitize_0)[1]), "r"((_packed16_sanitize_0)[2]), "r"((_packed16_sanitize_0)[3]) : "memory");
             }
             if (owner == 2) {
-                asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(push_peers_2 + dst), "r"((_packed16_sanitize_0)[0]), "r"((_packed16_sanitize_0)[1]), "r"((_packed16_sanitize_0)[2]), "r"((_packed16_sanitize_0)[3]) : "memory");
+                asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(pp_2 + dst), "r"((_packed16_sanitize_0)[0]), "r"((_packed16_sanitize_0)[1]), "r"((_packed16_sanitize_0)[2]), "r"((_packed16_sanitize_0)[3]) : "memory");
             }
             if (owner == 3) {
-                asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(push_peers_3 + dst), "r"((_packed16_sanitize_0)[0]), "r"((_packed16_sanitize_0)[1]), "r"((_packed16_sanitize_0)[2]), "r"((_packed16_sanitize_0)[3]) : "memory");
+                asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(pp_3 + dst), "r"((_packed16_sanitize_0)[0]), "r"((_packed16_sanitize_0)[1]), "r"((_packed16_sanitize_0)[2]), "r"((_packed16_sanitize_0)[3]) : "memory");
             }
             if (owner == 4) {
-                asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(push_peers_4 + dst), "r"((_packed16_sanitize_0)[0]), "r"((_packed16_sanitize_0)[1]), "r"((_packed16_sanitize_0)[2]), "r"((_packed16_sanitize_0)[3]) : "memory");
+                asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(pp_4 + dst), "r"((_packed16_sanitize_0)[0]), "r"((_packed16_sanitize_0)[1]), "r"((_packed16_sanitize_0)[2]), "r"((_packed16_sanitize_0)[3]) : "memory");
             }
             if (owner == 5) {
-                asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(push_peers_5 + dst), "r"((_packed16_sanitize_0)[0]), "r"((_packed16_sanitize_0)[1]), "r"((_packed16_sanitize_0)[2]), "r"((_packed16_sanitize_0)[3]) : "memory");
+                asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(pp_5 + dst), "r"((_packed16_sanitize_0)[0]), "r"((_packed16_sanitize_0)[1]), "r"((_packed16_sanitize_0)[2]), "r"((_packed16_sanitize_0)[3]) : "memory");
             }
             if (owner == 6) {
-                asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(push_peers_6 + dst), "r"((_packed16_sanitize_0)[0]), "r"((_packed16_sanitize_0)[1]), "r"((_packed16_sanitize_0)[2]), "r"((_packed16_sanitize_0)[3]) : "memory");
+                asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(pp_6 + dst), "r"((_packed16_sanitize_0)[0]), "r"((_packed16_sanitize_0)[1]), "r"((_packed16_sanitize_0)[2]), "r"((_packed16_sanitize_0)[3]) : "memory");
             }
             if (owner == 7) {
-                asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(push_peers_7 + dst), "r"((_packed16_sanitize_0)[0]), "r"((_packed16_sanitize_0)[1]), "r"((_packed16_sanitize_0)[2]), "r"((_packed16_sanitize_0)[3]) : "memory");
+                asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(pp_7 + dst), "r"((_packed16_sanitize_0)[0]), "r"((_packed16_sanitize_0)[1]), "r"((_packed16_sanitize_0)[2]), "r"((_packed16_sanitize_0)[3]) : "memory");
             }
-            unsigned int raw1[4];
-            raw1[0] = packets[4];
-            raw1[1] = packets[5];
-            raw1[2] = packets[6];
-            raw1[3] = packets[7];
+            unsigned int raw0_1_1[4];
+            raw0_1_1[0] = packets[4];
+            raw0_1_1[1] = packets[5];
+            raw0_1_1[2] = packets[6];
+            raw0_1_1[3] = packets[7];
             uint32_t _packed16_sanitize_1[4];
             #pragma unroll
             for (int _p16s_word = 0; _p16s_word < 4; ++_p16s_word) {
-                uint32_t _p16s_carrier_12 = static_cast<uint32_t>(raw1[_p16s_word]);
+                uint32_t _p16s_carrier_12 = static_cast<uint32_t>(raw0_1_1[_p16s_word]);
                 uint32_t _p16s_lo_12 = _p16s_carrier_12 & 0x0000ffffu;
                 uint32_t _p16s_hi_12 = (_p16s_carrier_12 >> 16) & 0x0000ffffu;
                 if (_p16s_lo_12 == 0x00008000u) _p16s_lo_12 = 0u;
@@ -362,38 +362,38 @@ kernel_cake_tp_moe_finalize_rmsnorm_6d4722f3bbbeb033a812(__nv_bfloat16* __restri
                 _packed16_sanitize_1[_p16s_word] = _p16s_lo_12 | (_p16s_hi_12 << 16);
             }
             if (owner == 0) {
-                asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(push_peers_0 + (dst + 32768)), "r"((_packed16_sanitize_1)[0]), "r"((_packed16_sanitize_1)[1]), "r"((_packed16_sanitize_1)[2]), "r"((_packed16_sanitize_1)[3]) : "memory");
+                asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(pp_0 + (dst + 32768)), "r"((_packed16_sanitize_1)[0]), "r"((_packed16_sanitize_1)[1]), "r"((_packed16_sanitize_1)[2]), "r"((_packed16_sanitize_1)[3]) : "memory");
             }
             if (owner == 1) {
-                asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(push_peers_1 + (dst + 32768)), "r"((_packed16_sanitize_1)[0]), "r"((_packed16_sanitize_1)[1]), "r"((_packed16_sanitize_1)[2]), "r"((_packed16_sanitize_1)[3]) : "memory");
+                asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(pp_1 + (dst + 32768)), "r"((_packed16_sanitize_1)[0]), "r"((_packed16_sanitize_1)[1]), "r"((_packed16_sanitize_1)[2]), "r"((_packed16_sanitize_1)[3]) : "memory");
             }
             if (owner == 2) {
-                asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(push_peers_2 + (dst + 32768)), "r"((_packed16_sanitize_1)[0]), "r"((_packed16_sanitize_1)[1]), "r"((_packed16_sanitize_1)[2]), "r"((_packed16_sanitize_1)[3]) : "memory");
+                asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(pp_2 + (dst + 32768)), "r"((_packed16_sanitize_1)[0]), "r"((_packed16_sanitize_1)[1]), "r"((_packed16_sanitize_1)[2]), "r"((_packed16_sanitize_1)[3]) : "memory");
             }
             if (owner == 3) {
-                asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(push_peers_3 + (dst + 32768)), "r"((_packed16_sanitize_1)[0]), "r"((_packed16_sanitize_1)[1]), "r"((_packed16_sanitize_1)[2]), "r"((_packed16_sanitize_1)[3]) : "memory");
+                asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(pp_3 + (dst + 32768)), "r"((_packed16_sanitize_1)[0]), "r"((_packed16_sanitize_1)[1]), "r"((_packed16_sanitize_1)[2]), "r"((_packed16_sanitize_1)[3]) : "memory");
             }
             if (owner == 4) {
-                asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(push_peers_4 + (dst + 32768)), "r"((_packed16_sanitize_1)[0]), "r"((_packed16_sanitize_1)[1]), "r"((_packed16_sanitize_1)[2]), "r"((_packed16_sanitize_1)[3]) : "memory");
+                asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(pp_4 + (dst + 32768)), "r"((_packed16_sanitize_1)[0]), "r"((_packed16_sanitize_1)[1]), "r"((_packed16_sanitize_1)[2]), "r"((_packed16_sanitize_1)[3]) : "memory");
             }
             if (owner == 5) {
-                asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(push_peers_5 + (dst + 32768)), "r"((_packed16_sanitize_1)[0]), "r"((_packed16_sanitize_1)[1]), "r"((_packed16_sanitize_1)[2]), "r"((_packed16_sanitize_1)[3]) : "memory");
+                asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(pp_5 + (dst + 32768)), "r"((_packed16_sanitize_1)[0]), "r"((_packed16_sanitize_1)[1]), "r"((_packed16_sanitize_1)[2]), "r"((_packed16_sanitize_1)[3]) : "memory");
             }
             if (owner == 6) {
-                asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(push_peers_6 + (dst + 32768)), "r"((_packed16_sanitize_1)[0]), "r"((_packed16_sanitize_1)[1]), "r"((_packed16_sanitize_1)[2]), "r"((_packed16_sanitize_1)[3]) : "memory");
+                asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(pp_6 + (dst + 32768)), "r"((_packed16_sanitize_1)[0]), "r"((_packed16_sanitize_1)[1]), "r"((_packed16_sanitize_1)[2]), "r"((_packed16_sanitize_1)[3]) : "memory");
             }
             if (owner == 7) {
-                asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(push_peers_7 + (dst + 32768)), "r"((_packed16_sanitize_1)[0]), "r"((_packed16_sanitize_1)[1]), "r"((_packed16_sanitize_1)[2]), "r"((_packed16_sanitize_1)[3]) : "memory");
+                asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(pp_7 + (dst + 32768)), "r"((_packed16_sanitize_1)[0]), "r"((_packed16_sanitize_1)[1]), "r"((_packed16_sanitize_1)[2]), "r"((_packed16_sanitize_1)[3]) : "memory");
             }
-            unsigned int raw2[4];
-            raw2[0] = packets[8];
-            raw2[1] = packets[9];
-            raw2[2] = packets[10];
-            raw2[3] = packets[11];
+            unsigned int raw0_1_2[4];
+            raw0_1_2[0] = packets[8];
+            raw0_1_2[1] = packets[9];
+            raw0_1_2[2] = packets[10];
+            raw0_1_2[3] = packets[11];
             uint32_t _packed16_sanitize_2[4];
             #pragma unroll
             for (int _p16s_word = 0; _p16s_word < 4; ++_p16s_word) {
-                uint32_t _p16s_carrier_13 = static_cast<uint32_t>(raw2[_p16s_word]);
+                uint32_t _p16s_carrier_13 = static_cast<uint32_t>(raw0_1_2[_p16s_word]);
                 uint32_t _p16s_lo_13 = _p16s_carrier_13 & 0x0000ffffu;
                 uint32_t _p16s_hi_13 = (_p16s_carrier_13 >> 16) & 0x0000ffffu;
                 if (_p16s_lo_13 == 0x00008000u) _p16s_lo_13 = 0u;
@@ -401,38 +401,38 @@ kernel_cake_tp_moe_finalize_rmsnorm_6d4722f3bbbeb033a812(__nv_bfloat16* __restri
                 _packed16_sanitize_2[_p16s_word] = _p16s_lo_13 | (_p16s_hi_13 << 16);
             }
             if (owner == 0) {
-                asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(push_peers_0 + (dst + 65536)), "r"((_packed16_sanitize_2)[0]), "r"((_packed16_sanitize_2)[1]), "r"((_packed16_sanitize_2)[2]), "r"((_packed16_sanitize_2)[3]) : "memory");
+                asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(pp_0 + (dst + 65536)), "r"((_packed16_sanitize_2)[0]), "r"((_packed16_sanitize_2)[1]), "r"((_packed16_sanitize_2)[2]), "r"((_packed16_sanitize_2)[3]) : "memory");
             }
             if (owner == 1) {
-                asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(push_peers_1 + (dst + 65536)), "r"((_packed16_sanitize_2)[0]), "r"((_packed16_sanitize_2)[1]), "r"((_packed16_sanitize_2)[2]), "r"((_packed16_sanitize_2)[3]) : "memory");
+                asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(pp_1 + (dst + 65536)), "r"((_packed16_sanitize_2)[0]), "r"((_packed16_sanitize_2)[1]), "r"((_packed16_sanitize_2)[2]), "r"((_packed16_sanitize_2)[3]) : "memory");
             }
             if (owner == 2) {
-                asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(push_peers_2 + (dst + 65536)), "r"((_packed16_sanitize_2)[0]), "r"((_packed16_sanitize_2)[1]), "r"((_packed16_sanitize_2)[2]), "r"((_packed16_sanitize_2)[3]) : "memory");
+                asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(pp_2 + (dst + 65536)), "r"((_packed16_sanitize_2)[0]), "r"((_packed16_sanitize_2)[1]), "r"((_packed16_sanitize_2)[2]), "r"((_packed16_sanitize_2)[3]) : "memory");
             }
             if (owner == 3) {
-                asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(push_peers_3 + (dst + 65536)), "r"((_packed16_sanitize_2)[0]), "r"((_packed16_sanitize_2)[1]), "r"((_packed16_sanitize_2)[2]), "r"((_packed16_sanitize_2)[3]) : "memory");
+                asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(pp_3 + (dst + 65536)), "r"((_packed16_sanitize_2)[0]), "r"((_packed16_sanitize_2)[1]), "r"((_packed16_sanitize_2)[2]), "r"((_packed16_sanitize_2)[3]) : "memory");
             }
             if (owner == 4) {
-                asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(push_peers_4 + (dst + 65536)), "r"((_packed16_sanitize_2)[0]), "r"((_packed16_sanitize_2)[1]), "r"((_packed16_sanitize_2)[2]), "r"((_packed16_sanitize_2)[3]) : "memory");
+                asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(pp_4 + (dst + 65536)), "r"((_packed16_sanitize_2)[0]), "r"((_packed16_sanitize_2)[1]), "r"((_packed16_sanitize_2)[2]), "r"((_packed16_sanitize_2)[3]) : "memory");
             }
             if (owner == 5) {
-                asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(push_peers_5 + (dst + 65536)), "r"((_packed16_sanitize_2)[0]), "r"((_packed16_sanitize_2)[1]), "r"((_packed16_sanitize_2)[2]), "r"((_packed16_sanitize_2)[3]) : "memory");
+                asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(pp_5 + (dst + 65536)), "r"((_packed16_sanitize_2)[0]), "r"((_packed16_sanitize_2)[1]), "r"((_packed16_sanitize_2)[2]), "r"((_packed16_sanitize_2)[3]) : "memory");
             }
             if (owner == 6) {
-                asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(push_peers_6 + (dst + 65536)), "r"((_packed16_sanitize_2)[0]), "r"((_packed16_sanitize_2)[1]), "r"((_packed16_sanitize_2)[2]), "r"((_packed16_sanitize_2)[3]) : "memory");
+                asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(pp_6 + (dst + 65536)), "r"((_packed16_sanitize_2)[0]), "r"((_packed16_sanitize_2)[1]), "r"((_packed16_sanitize_2)[2]), "r"((_packed16_sanitize_2)[3]) : "memory");
             }
             if (owner == 7) {
-                asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(push_peers_7 + (dst + 65536)), "r"((_packed16_sanitize_2)[0]), "r"((_packed16_sanitize_2)[1]), "r"((_packed16_sanitize_2)[2]), "r"((_packed16_sanitize_2)[3]) : "memory");
+                asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(pp_7 + (dst + 65536)), "r"((_packed16_sanitize_2)[0]), "r"((_packed16_sanitize_2)[1]), "r"((_packed16_sanitize_2)[2]), "r"((_packed16_sanitize_2)[3]) : "memory");
             }
-            unsigned int raw3[4];
-            raw3[0] = packets[12];
-            raw3[1] = packets[13];
-            raw3[2] = packets[14];
-            raw3[3] = packets[15];
+            unsigned int raw0_1_3[4];
+            raw0_1_3[0] = packets[12];
+            raw0_1_3[1] = packets[13];
+            raw0_1_3[2] = packets[14];
+            raw0_1_3[3] = packets[15];
             uint32_t _packed16_sanitize_3[4];
             #pragma unroll
             for (int _p16s_word = 0; _p16s_word < 4; ++_p16s_word) {
-                uint32_t _p16s_carrier_14 = static_cast<uint32_t>(raw3[_p16s_word]);
+                uint32_t _p16s_carrier_14 = static_cast<uint32_t>(raw0_1_3[_p16s_word]);
                 uint32_t _p16s_lo_14 = _p16s_carrier_14 & 0x0000ffffu;
                 uint32_t _p16s_hi_14 = (_p16s_carrier_14 >> 16) & 0x0000ffffu;
                 if (_p16s_lo_14 == 0x00008000u) _p16s_lo_14 = 0u;
@@ -440,38 +440,38 @@ kernel_cake_tp_moe_finalize_rmsnorm_6d4722f3bbbeb033a812(__nv_bfloat16* __restri
                 _packed16_sanitize_3[_p16s_word] = _p16s_lo_14 | (_p16s_hi_14 << 16);
             }
             if (owner == 0) {
-                asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(push_peers_0 + (dst + 98304)), "r"((_packed16_sanitize_3)[0]), "r"((_packed16_sanitize_3)[1]), "r"((_packed16_sanitize_3)[2]), "r"((_packed16_sanitize_3)[3]) : "memory");
+                asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(pp_0 + (dst + 98304)), "r"((_packed16_sanitize_3)[0]), "r"((_packed16_sanitize_3)[1]), "r"((_packed16_sanitize_3)[2]), "r"((_packed16_sanitize_3)[3]) : "memory");
             }
             if (owner == 1) {
-                asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(push_peers_1 + (dst + 98304)), "r"((_packed16_sanitize_3)[0]), "r"((_packed16_sanitize_3)[1]), "r"((_packed16_sanitize_3)[2]), "r"((_packed16_sanitize_3)[3]) : "memory");
+                asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(pp_1 + (dst + 98304)), "r"((_packed16_sanitize_3)[0]), "r"((_packed16_sanitize_3)[1]), "r"((_packed16_sanitize_3)[2]), "r"((_packed16_sanitize_3)[3]) : "memory");
             }
             if (owner == 2) {
-                asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(push_peers_2 + (dst + 98304)), "r"((_packed16_sanitize_3)[0]), "r"((_packed16_sanitize_3)[1]), "r"((_packed16_sanitize_3)[2]), "r"((_packed16_sanitize_3)[3]) : "memory");
+                asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(pp_2 + (dst + 98304)), "r"((_packed16_sanitize_3)[0]), "r"((_packed16_sanitize_3)[1]), "r"((_packed16_sanitize_3)[2]), "r"((_packed16_sanitize_3)[3]) : "memory");
             }
             if (owner == 3) {
-                asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(push_peers_3 + (dst + 98304)), "r"((_packed16_sanitize_3)[0]), "r"((_packed16_sanitize_3)[1]), "r"((_packed16_sanitize_3)[2]), "r"((_packed16_sanitize_3)[3]) : "memory");
+                asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(pp_3 + (dst + 98304)), "r"((_packed16_sanitize_3)[0]), "r"((_packed16_sanitize_3)[1]), "r"((_packed16_sanitize_3)[2]), "r"((_packed16_sanitize_3)[3]) : "memory");
             }
             if (owner == 4) {
-                asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(push_peers_4 + (dst + 98304)), "r"((_packed16_sanitize_3)[0]), "r"((_packed16_sanitize_3)[1]), "r"((_packed16_sanitize_3)[2]), "r"((_packed16_sanitize_3)[3]) : "memory");
+                asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(pp_4 + (dst + 98304)), "r"((_packed16_sanitize_3)[0]), "r"((_packed16_sanitize_3)[1]), "r"((_packed16_sanitize_3)[2]), "r"((_packed16_sanitize_3)[3]) : "memory");
             }
             if (owner == 5) {
-                asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(push_peers_5 + (dst + 98304)), "r"((_packed16_sanitize_3)[0]), "r"((_packed16_sanitize_3)[1]), "r"((_packed16_sanitize_3)[2]), "r"((_packed16_sanitize_3)[3]) : "memory");
+                asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(pp_5 + (dst + 98304)), "r"((_packed16_sanitize_3)[0]), "r"((_packed16_sanitize_3)[1]), "r"((_packed16_sanitize_3)[2]), "r"((_packed16_sanitize_3)[3]) : "memory");
             }
             if (owner == 6) {
-                asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(push_peers_6 + (dst + 98304)), "r"((_packed16_sanitize_3)[0]), "r"((_packed16_sanitize_3)[1]), "r"((_packed16_sanitize_3)[2]), "r"((_packed16_sanitize_3)[3]) : "memory");
+                asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(pp_6 + (dst + 98304)), "r"((_packed16_sanitize_3)[0]), "r"((_packed16_sanitize_3)[1]), "r"((_packed16_sanitize_3)[2]), "r"((_packed16_sanitize_3)[3]) : "memory");
             }
             if (owner == 7) {
-                asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(push_peers_7 + (dst + 98304)), "r"((_packed16_sanitize_3)[0]), "r"((_packed16_sanitize_3)[1]), "r"((_packed16_sanitize_3)[2]), "r"((_packed16_sanitize_3)[3]) : "memory");
+                asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(pp_7 + (dst + 98304)), "r"((_packed16_sanitize_3)[0]), "r"((_packed16_sanitize_3)[1]), "r"((_packed16_sanitize_3)[2]), "r"((_packed16_sanitize_3)[3]) : "memory");
             }
-            unsigned int raw4[4];
-            raw4[0] = packets[16];
-            raw4[1] = packets[17];
-            raw4[2] = packets[18];
-            raw4[3] = packets[19];
+            unsigned int raw0_1_4[4];
+            raw0_1_4[0] = packets[16];
+            raw0_1_4[1] = packets[17];
+            raw0_1_4[2] = packets[18];
+            raw0_1_4[3] = packets[19];
             uint32_t _packed16_sanitize_4[4];
             #pragma unroll
             for (int _p16s_word = 0; _p16s_word < 4; ++_p16s_word) {
-                uint32_t _p16s_carrier_15 = static_cast<uint32_t>(raw4[_p16s_word]);
+                uint32_t _p16s_carrier_15 = static_cast<uint32_t>(raw0_1_4[_p16s_word]);
                 uint32_t _p16s_lo_15 = _p16s_carrier_15 & 0x0000ffffu;
                 uint32_t _p16s_hi_15 = (_p16s_carrier_15 >> 16) & 0x0000ffffu;
                 if (_p16s_lo_15 == 0x00008000u) _p16s_lo_15 = 0u;
@@ -479,38 +479,38 @@ kernel_cake_tp_moe_finalize_rmsnorm_6d4722f3bbbeb033a812(__nv_bfloat16* __restri
                 _packed16_sanitize_4[_p16s_word] = _p16s_lo_15 | (_p16s_hi_15 << 16);
             }
             if (owner == 0) {
-                asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(push_peers_0 + (dst + 131072)), "r"((_packed16_sanitize_4)[0]), "r"((_packed16_sanitize_4)[1]), "r"((_packed16_sanitize_4)[2]), "r"((_packed16_sanitize_4)[3]) : "memory");
+                asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(pp_0 + (dst + 131072)), "r"((_packed16_sanitize_4)[0]), "r"((_packed16_sanitize_4)[1]), "r"((_packed16_sanitize_4)[2]), "r"((_packed16_sanitize_4)[3]) : "memory");
             }
             if (owner == 1) {
-                asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(push_peers_1 + (dst + 131072)), "r"((_packed16_sanitize_4)[0]), "r"((_packed16_sanitize_4)[1]), "r"((_packed16_sanitize_4)[2]), "r"((_packed16_sanitize_4)[3]) : "memory");
+                asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(pp_1 + (dst + 131072)), "r"((_packed16_sanitize_4)[0]), "r"((_packed16_sanitize_4)[1]), "r"((_packed16_sanitize_4)[2]), "r"((_packed16_sanitize_4)[3]) : "memory");
             }
             if (owner == 2) {
-                asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(push_peers_2 + (dst + 131072)), "r"((_packed16_sanitize_4)[0]), "r"((_packed16_sanitize_4)[1]), "r"((_packed16_sanitize_4)[2]), "r"((_packed16_sanitize_4)[3]) : "memory");
+                asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(pp_2 + (dst + 131072)), "r"((_packed16_sanitize_4)[0]), "r"((_packed16_sanitize_4)[1]), "r"((_packed16_sanitize_4)[2]), "r"((_packed16_sanitize_4)[3]) : "memory");
             }
             if (owner == 3) {
-                asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(push_peers_3 + (dst + 131072)), "r"((_packed16_sanitize_4)[0]), "r"((_packed16_sanitize_4)[1]), "r"((_packed16_sanitize_4)[2]), "r"((_packed16_sanitize_4)[3]) : "memory");
+                asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(pp_3 + (dst + 131072)), "r"((_packed16_sanitize_4)[0]), "r"((_packed16_sanitize_4)[1]), "r"((_packed16_sanitize_4)[2]), "r"((_packed16_sanitize_4)[3]) : "memory");
             }
             if (owner == 4) {
-                asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(push_peers_4 + (dst + 131072)), "r"((_packed16_sanitize_4)[0]), "r"((_packed16_sanitize_4)[1]), "r"((_packed16_sanitize_4)[2]), "r"((_packed16_sanitize_4)[3]) : "memory");
+                asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(pp_4 + (dst + 131072)), "r"((_packed16_sanitize_4)[0]), "r"((_packed16_sanitize_4)[1]), "r"((_packed16_sanitize_4)[2]), "r"((_packed16_sanitize_4)[3]) : "memory");
             }
             if (owner == 5) {
-                asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(push_peers_5 + (dst + 131072)), "r"((_packed16_sanitize_4)[0]), "r"((_packed16_sanitize_4)[1]), "r"((_packed16_sanitize_4)[2]), "r"((_packed16_sanitize_4)[3]) : "memory");
+                asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(pp_5 + (dst + 131072)), "r"((_packed16_sanitize_4)[0]), "r"((_packed16_sanitize_4)[1]), "r"((_packed16_sanitize_4)[2]), "r"((_packed16_sanitize_4)[3]) : "memory");
             }
             if (owner == 6) {
-                asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(push_peers_6 + (dst + 131072)), "r"((_packed16_sanitize_4)[0]), "r"((_packed16_sanitize_4)[1]), "r"((_packed16_sanitize_4)[2]), "r"((_packed16_sanitize_4)[3]) : "memory");
+                asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(pp_6 + (dst + 131072)), "r"((_packed16_sanitize_4)[0]), "r"((_packed16_sanitize_4)[1]), "r"((_packed16_sanitize_4)[2]), "r"((_packed16_sanitize_4)[3]) : "memory");
             }
             if (owner == 7) {
-                asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(push_peers_7 + (dst + 131072)), "r"((_packed16_sanitize_4)[0]), "r"((_packed16_sanitize_4)[1]), "r"((_packed16_sanitize_4)[2]), "r"((_packed16_sanitize_4)[3]) : "memory");
+                asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(pp_7 + (dst + 131072)), "r"((_packed16_sanitize_4)[0]), "r"((_packed16_sanitize_4)[1]), "r"((_packed16_sanitize_4)[2]), "r"((_packed16_sanitize_4)[3]) : "memory");
             }
-            unsigned int raw5[4];
-            raw5[0] = packets[20];
-            raw5[1] = packets[21];
-            raw5[2] = packets[22];
-            raw5[3] = packets[23];
+            unsigned int raw0_1_5[4];
+            raw0_1_5[0] = packets[20];
+            raw0_1_5[1] = packets[21];
+            raw0_1_5[2] = packets[22];
+            raw0_1_5[3] = packets[23];
             uint32_t _packed16_sanitize_5[4];
             #pragma unroll
             for (int _p16s_word = 0; _p16s_word < 4; ++_p16s_word) {
-                uint32_t _p16s_carrier_16 = static_cast<uint32_t>(raw5[_p16s_word]);
+                uint32_t _p16s_carrier_16 = static_cast<uint32_t>(raw0_1_5[_p16s_word]);
                 uint32_t _p16s_lo_16 = _p16s_carrier_16 & 0x0000ffffu;
                 uint32_t _p16s_hi_16 = (_p16s_carrier_16 >> 16) & 0x0000ffffu;
                 if (_p16s_lo_16 == 0x00008000u) _p16s_lo_16 = 0u;
@@ -518,38 +518,38 @@ kernel_cake_tp_moe_finalize_rmsnorm_6d4722f3bbbeb033a812(__nv_bfloat16* __restri
                 _packed16_sanitize_5[_p16s_word] = _p16s_lo_16 | (_p16s_hi_16 << 16);
             }
             if (owner == 0) {
-                asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(push_peers_0 + (dst + 163840)), "r"((_packed16_sanitize_5)[0]), "r"((_packed16_sanitize_5)[1]), "r"((_packed16_sanitize_5)[2]), "r"((_packed16_sanitize_5)[3]) : "memory");
+                asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(pp_0 + (dst + 163840)), "r"((_packed16_sanitize_5)[0]), "r"((_packed16_sanitize_5)[1]), "r"((_packed16_sanitize_5)[2]), "r"((_packed16_sanitize_5)[3]) : "memory");
             }
             if (owner == 1) {
-                asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(push_peers_1 + (dst + 163840)), "r"((_packed16_sanitize_5)[0]), "r"((_packed16_sanitize_5)[1]), "r"((_packed16_sanitize_5)[2]), "r"((_packed16_sanitize_5)[3]) : "memory");
+                asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(pp_1 + (dst + 163840)), "r"((_packed16_sanitize_5)[0]), "r"((_packed16_sanitize_5)[1]), "r"((_packed16_sanitize_5)[2]), "r"((_packed16_sanitize_5)[3]) : "memory");
             }
             if (owner == 2) {
-                asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(push_peers_2 + (dst + 163840)), "r"((_packed16_sanitize_5)[0]), "r"((_packed16_sanitize_5)[1]), "r"((_packed16_sanitize_5)[2]), "r"((_packed16_sanitize_5)[3]) : "memory");
+                asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(pp_2 + (dst + 163840)), "r"((_packed16_sanitize_5)[0]), "r"((_packed16_sanitize_5)[1]), "r"((_packed16_sanitize_5)[2]), "r"((_packed16_sanitize_5)[3]) : "memory");
             }
             if (owner == 3) {
-                asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(push_peers_3 + (dst + 163840)), "r"((_packed16_sanitize_5)[0]), "r"((_packed16_sanitize_5)[1]), "r"((_packed16_sanitize_5)[2]), "r"((_packed16_sanitize_5)[3]) : "memory");
+                asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(pp_3 + (dst + 163840)), "r"((_packed16_sanitize_5)[0]), "r"((_packed16_sanitize_5)[1]), "r"((_packed16_sanitize_5)[2]), "r"((_packed16_sanitize_5)[3]) : "memory");
             }
             if (owner == 4) {
-                asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(push_peers_4 + (dst + 163840)), "r"((_packed16_sanitize_5)[0]), "r"((_packed16_sanitize_5)[1]), "r"((_packed16_sanitize_5)[2]), "r"((_packed16_sanitize_5)[3]) : "memory");
+                asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(pp_4 + (dst + 163840)), "r"((_packed16_sanitize_5)[0]), "r"((_packed16_sanitize_5)[1]), "r"((_packed16_sanitize_5)[2]), "r"((_packed16_sanitize_5)[3]) : "memory");
             }
             if (owner == 5) {
-                asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(push_peers_5 + (dst + 163840)), "r"((_packed16_sanitize_5)[0]), "r"((_packed16_sanitize_5)[1]), "r"((_packed16_sanitize_5)[2]), "r"((_packed16_sanitize_5)[3]) : "memory");
+                asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(pp_5 + (dst + 163840)), "r"((_packed16_sanitize_5)[0]), "r"((_packed16_sanitize_5)[1]), "r"((_packed16_sanitize_5)[2]), "r"((_packed16_sanitize_5)[3]) : "memory");
             }
             if (owner == 6) {
-                asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(push_peers_6 + (dst + 163840)), "r"((_packed16_sanitize_5)[0]), "r"((_packed16_sanitize_5)[1]), "r"((_packed16_sanitize_5)[2]), "r"((_packed16_sanitize_5)[3]) : "memory");
+                asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(pp_6 + (dst + 163840)), "r"((_packed16_sanitize_5)[0]), "r"((_packed16_sanitize_5)[1]), "r"((_packed16_sanitize_5)[2]), "r"((_packed16_sanitize_5)[3]) : "memory");
             }
             if (owner == 7) {
-                asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(push_peers_7 + (dst + 163840)), "r"((_packed16_sanitize_5)[0]), "r"((_packed16_sanitize_5)[1]), "r"((_packed16_sanitize_5)[2]), "r"((_packed16_sanitize_5)[3]) : "memory");
+                asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(pp_7 + (dst + 163840)), "r"((_packed16_sanitize_5)[0]), "r"((_packed16_sanitize_5)[1]), "r"((_packed16_sanitize_5)[2]), "r"((_packed16_sanitize_5)[3]) : "memory");
             }
-            unsigned int raw6[4];
-            raw6[0] = packets[24];
-            raw6[1] = packets[25];
-            raw6[2] = packets[26];
-            raw6[3] = packets[27];
+            unsigned int raw0_1_6[4];
+            raw0_1_6[0] = packets[24];
+            raw0_1_6[1] = packets[25];
+            raw0_1_6[2] = packets[26];
+            raw0_1_6[3] = packets[27];
             uint32_t _packed16_sanitize_6[4];
             #pragma unroll
             for (int _p16s_word = 0; _p16s_word < 4; ++_p16s_word) {
-                uint32_t _p16s_carrier_17 = static_cast<uint32_t>(raw6[_p16s_word]);
+                uint32_t _p16s_carrier_17 = static_cast<uint32_t>(raw0_1_6[_p16s_word]);
                 uint32_t _p16s_lo_17 = _p16s_carrier_17 & 0x0000ffffu;
                 uint32_t _p16s_hi_17 = (_p16s_carrier_17 >> 16) & 0x0000ffffu;
                 if (_p16s_lo_17 == 0x00008000u) _p16s_lo_17 = 0u;
@@ -557,38 +557,38 @@ kernel_cake_tp_moe_finalize_rmsnorm_6d4722f3bbbeb033a812(__nv_bfloat16* __restri
                 _packed16_sanitize_6[_p16s_word] = _p16s_lo_17 | (_p16s_hi_17 << 16);
             }
             if (owner == 0) {
-                asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(push_peers_0 + (dst + 196608)), "r"((_packed16_sanitize_6)[0]), "r"((_packed16_sanitize_6)[1]), "r"((_packed16_sanitize_6)[2]), "r"((_packed16_sanitize_6)[3]) : "memory");
+                asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(pp_0 + (dst + 196608)), "r"((_packed16_sanitize_6)[0]), "r"((_packed16_sanitize_6)[1]), "r"((_packed16_sanitize_6)[2]), "r"((_packed16_sanitize_6)[3]) : "memory");
             }
             if (owner == 1) {
-                asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(push_peers_1 + (dst + 196608)), "r"((_packed16_sanitize_6)[0]), "r"((_packed16_sanitize_6)[1]), "r"((_packed16_sanitize_6)[2]), "r"((_packed16_sanitize_6)[3]) : "memory");
+                asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(pp_1 + (dst + 196608)), "r"((_packed16_sanitize_6)[0]), "r"((_packed16_sanitize_6)[1]), "r"((_packed16_sanitize_6)[2]), "r"((_packed16_sanitize_6)[3]) : "memory");
             }
             if (owner == 2) {
-                asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(push_peers_2 + (dst + 196608)), "r"((_packed16_sanitize_6)[0]), "r"((_packed16_sanitize_6)[1]), "r"((_packed16_sanitize_6)[2]), "r"((_packed16_sanitize_6)[3]) : "memory");
+                asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(pp_2 + (dst + 196608)), "r"((_packed16_sanitize_6)[0]), "r"((_packed16_sanitize_6)[1]), "r"((_packed16_sanitize_6)[2]), "r"((_packed16_sanitize_6)[3]) : "memory");
             }
             if (owner == 3) {
-                asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(push_peers_3 + (dst + 196608)), "r"((_packed16_sanitize_6)[0]), "r"((_packed16_sanitize_6)[1]), "r"((_packed16_sanitize_6)[2]), "r"((_packed16_sanitize_6)[3]) : "memory");
+                asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(pp_3 + (dst + 196608)), "r"((_packed16_sanitize_6)[0]), "r"((_packed16_sanitize_6)[1]), "r"((_packed16_sanitize_6)[2]), "r"((_packed16_sanitize_6)[3]) : "memory");
             }
             if (owner == 4) {
-                asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(push_peers_4 + (dst + 196608)), "r"((_packed16_sanitize_6)[0]), "r"((_packed16_sanitize_6)[1]), "r"((_packed16_sanitize_6)[2]), "r"((_packed16_sanitize_6)[3]) : "memory");
+                asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(pp_4 + (dst + 196608)), "r"((_packed16_sanitize_6)[0]), "r"((_packed16_sanitize_6)[1]), "r"((_packed16_sanitize_6)[2]), "r"((_packed16_sanitize_6)[3]) : "memory");
             }
             if (owner == 5) {
-                asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(push_peers_5 + (dst + 196608)), "r"((_packed16_sanitize_6)[0]), "r"((_packed16_sanitize_6)[1]), "r"((_packed16_sanitize_6)[2]), "r"((_packed16_sanitize_6)[3]) : "memory");
+                asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(pp_5 + (dst + 196608)), "r"((_packed16_sanitize_6)[0]), "r"((_packed16_sanitize_6)[1]), "r"((_packed16_sanitize_6)[2]), "r"((_packed16_sanitize_6)[3]) : "memory");
             }
             if (owner == 6) {
-                asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(push_peers_6 + (dst + 196608)), "r"((_packed16_sanitize_6)[0]), "r"((_packed16_sanitize_6)[1]), "r"((_packed16_sanitize_6)[2]), "r"((_packed16_sanitize_6)[3]) : "memory");
+                asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(pp_6 + (dst + 196608)), "r"((_packed16_sanitize_6)[0]), "r"((_packed16_sanitize_6)[1]), "r"((_packed16_sanitize_6)[2]), "r"((_packed16_sanitize_6)[3]) : "memory");
             }
             if (owner == 7) {
-                asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(push_peers_7 + (dst + 196608)), "r"((_packed16_sanitize_6)[0]), "r"((_packed16_sanitize_6)[1]), "r"((_packed16_sanitize_6)[2]), "r"((_packed16_sanitize_6)[3]) : "memory");
+                asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(pp_7 + (dst + 196608)), "r"((_packed16_sanitize_6)[0]), "r"((_packed16_sanitize_6)[1]), "r"((_packed16_sanitize_6)[2]), "r"((_packed16_sanitize_6)[3]) : "memory");
             }
-            unsigned int raw7[4];
-            raw7[0] = packets[28];
-            raw7[1] = packets[29];
-            raw7[2] = packets[30];
-            raw7[3] = packets[31];
+            unsigned int raw0_1_7[4];
+            raw0_1_7[0] = packets[28];
+            raw0_1_7[1] = packets[29];
+            raw0_1_7[2] = packets[30];
+            raw0_1_7[3] = packets[31];
             uint32_t _packed16_sanitize_7[4];
             #pragma unroll
             for (int _p16s_word = 0; _p16s_word < 4; ++_p16s_word) {
-                uint32_t _p16s_carrier_18 = static_cast<uint32_t>(raw7[_p16s_word]);
+                uint32_t _p16s_carrier_18 = static_cast<uint32_t>(raw0_1_7[_p16s_word]);
                 uint32_t _p16s_lo_18 = _p16s_carrier_18 & 0x0000ffffu;
                 uint32_t _p16s_hi_18 = (_p16s_carrier_18 >> 16) & 0x0000ffffu;
                 if (_p16s_lo_18 == 0x00008000u) _p16s_lo_18 = 0u;
@@ -596,28 +596,28 @@ kernel_cake_tp_moe_finalize_rmsnorm_6d4722f3bbbeb033a812(__nv_bfloat16* __restri
                 _packed16_sanitize_7[_p16s_word] = _p16s_lo_18 | (_p16s_hi_18 << 16);
             }
             if (owner == 0) {
-                asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(push_peers_0 + (dst + 229376)), "r"((_packed16_sanitize_7)[0]), "r"((_packed16_sanitize_7)[1]), "r"((_packed16_sanitize_7)[2]), "r"((_packed16_sanitize_7)[3]) : "memory");
+                asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(pp_0 + (dst + 229376)), "r"((_packed16_sanitize_7)[0]), "r"((_packed16_sanitize_7)[1]), "r"((_packed16_sanitize_7)[2]), "r"((_packed16_sanitize_7)[3]) : "memory");
             }
             if (owner == 1) {
-                asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(push_peers_1 + (dst + 229376)), "r"((_packed16_sanitize_7)[0]), "r"((_packed16_sanitize_7)[1]), "r"((_packed16_sanitize_7)[2]), "r"((_packed16_sanitize_7)[3]) : "memory");
+                asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(pp_1 + (dst + 229376)), "r"((_packed16_sanitize_7)[0]), "r"((_packed16_sanitize_7)[1]), "r"((_packed16_sanitize_7)[2]), "r"((_packed16_sanitize_7)[3]) : "memory");
             }
             if (owner == 2) {
-                asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(push_peers_2 + (dst + 229376)), "r"((_packed16_sanitize_7)[0]), "r"((_packed16_sanitize_7)[1]), "r"((_packed16_sanitize_7)[2]), "r"((_packed16_sanitize_7)[3]) : "memory");
+                asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(pp_2 + (dst + 229376)), "r"((_packed16_sanitize_7)[0]), "r"((_packed16_sanitize_7)[1]), "r"((_packed16_sanitize_7)[2]), "r"((_packed16_sanitize_7)[3]) : "memory");
             }
             if (owner == 3) {
-                asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(push_peers_3 + (dst + 229376)), "r"((_packed16_sanitize_7)[0]), "r"((_packed16_sanitize_7)[1]), "r"((_packed16_sanitize_7)[2]), "r"((_packed16_sanitize_7)[3]) : "memory");
+                asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(pp_3 + (dst + 229376)), "r"((_packed16_sanitize_7)[0]), "r"((_packed16_sanitize_7)[1]), "r"((_packed16_sanitize_7)[2]), "r"((_packed16_sanitize_7)[3]) : "memory");
             }
             if (owner == 4) {
-                asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(push_peers_4 + (dst + 229376)), "r"((_packed16_sanitize_7)[0]), "r"((_packed16_sanitize_7)[1]), "r"((_packed16_sanitize_7)[2]), "r"((_packed16_sanitize_7)[3]) : "memory");
+                asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(pp_4 + (dst + 229376)), "r"((_packed16_sanitize_7)[0]), "r"((_packed16_sanitize_7)[1]), "r"((_packed16_sanitize_7)[2]), "r"((_packed16_sanitize_7)[3]) : "memory");
             }
             if (owner == 5) {
-                asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(push_peers_5 + (dst + 229376)), "r"((_packed16_sanitize_7)[0]), "r"((_packed16_sanitize_7)[1]), "r"((_packed16_sanitize_7)[2]), "r"((_packed16_sanitize_7)[3]) : "memory");
+                asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(pp_5 + (dst + 229376)), "r"((_packed16_sanitize_7)[0]), "r"((_packed16_sanitize_7)[1]), "r"((_packed16_sanitize_7)[2]), "r"((_packed16_sanitize_7)[3]) : "memory");
             }
             if (owner == 6) {
-                asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(push_peers_6 + (dst + 229376)), "r"((_packed16_sanitize_7)[0]), "r"((_packed16_sanitize_7)[1]), "r"((_packed16_sanitize_7)[2]), "r"((_packed16_sanitize_7)[3]) : "memory");
+                asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(pp_6 + (dst + 229376)), "r"((_packed16_sanitize_7)[0]), "r"((_packed16_sanitize_7)[1]), "r"((_packed16_sanitize_7)[2]), "r"((_packed16_sanitize_7)[3]) : "memory");
             }
             if (owner == 7) {
-                asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(push_peers_7 + (dst + 229376)), "r"((_packed16_sanitize_7)[0]), "r"((_packed16_sanitize_7)[1]), "r"((_packed16_sanitize_7)[2]), "r"((_packed16_sanitize_7)[3]) : "memory");
+                asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(pp_7 + (dst + 229376)), "r"((_packed16_sanitize_7)[0]), "r"((_packed16_sanitize_7)[1]), "r"((_packed16_sanitize_7)[2]), "r"((_packed16_sanitize_7)[3]) : "memory");
             }
         }
         int jr = step - 2;
@@ -865,17 +865,17 @@ kernel_cake_tp_moe_finalize_rmsnorm_6d4722f3bbbeb033a812(__nv_bfloat16* __restri
             s8_0[5] = s8_0[5] + _unpack_bf16_9[5];
             s8_0[6] = s8_0[6] + _unpack_bf16_9[6];
             s8_0[7] = s8_0[7] + _unpack_bf16_9[7];
-            unsigned int s8_0_bf16[4];
+            unsigned int s8_bf16_0[4];
             #pragma unroll
             for (int _lp = 0; _lp < 4; _lp++) {
                 __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(s8_0[_lp*2 + 0], s8_0[_lp*2+1 + 0]));
-                s8_0_bf16[_lp] = *(uint32_t*)&_bf2;
+                s8_bf16_0[_lp] = *(uint32_t*)&_bf2;
             }
-            rw[0] = s8_0_bf16[0];
-            rw[1] = s8_0_bf16[1];
-            rw[2] = s8_0_bf16[2];
-            rw[3] = s8_0_bf16[3];
-            float _unpack_bf16_10[8];
+            rw[0] = s8_bf16_0[0];
+            rw[1] = s8_bf16_0[1];
+            rw[2] = s8_bf16_0[2];
+            rw[3] = s8_bf16_0[3];
+            float _unpack_bf16_y_0[8];
             #pragma unroll
             for (int _pair = 0; _pair < 4; _pair++) {
                 asm volatile(
@@ -883,27 +883,27 @@ kernel_cake_tp_moe_finalize_rmsnorm_6d4722f3bbbeb033a812(__nv_bfloat16* __restri
                     "shl.b32 %0, %2, 16;\n\t"
                     "and.b32 %1, %2, 0xffff0000;\n\t"
                     "}\n"
-                    : "=f"((&_unpack_bf16_10[_pair * 2])[0]), "=f"((&_unpack_bf16_10[_pair * 2])[1])
-                    : "r"(s8_0_bf16[_pair]));
+                    : "=f"((&_unpack_bf16_y_0[_pair * 2])[0]), "=f"((&_unpack_bf16_y_0[_pair * 2])[1])
+                    : "r"(s8_bf16_0[_pair]));
             }
-            float ssq0 = 0.0f;
-            float y0_0 = ((mode != 0) ? _unpack_bf16_10[0] * gw8[0] : _unpack_bf16_10[0]);
-            ssq0 = __fmaf_rn(y0_0, y0_0, ssq0);
-            float y0_1 = ((mode != 0) ? _unpack_bf16_10[1] * gw8[1] : _unpack_bf16_10[1]);
-            ssq0 = __fmaf_rn(y0_1, y0_1, ssq0);
-            float y0_2 = ((mode != 0) ? _unpack_bf16_10[2] * gw8[2] : _unpack_bf16_10[2]);
-            ssq0 = __fmaf_rn(y0_2, y0_2, ssq0);
-            float y0_3 = ((mode != 0) ? _unpack_bf16_10[3] * gw8[3] : _unpack_bf16_10[3]);
-            ssq0 = __fmaf_rn(y0_3, y0_3, ssq0);
-            float y0_4 = ((mode != 0) ? _unpack_bf16_10[4] * gw8[4] : _unpack_bf16_10[4]);
-            ssq0 = __fmaf_rn(y0_4, y0_4, ssq0);
-            float y0_5 = ((mode != 0) ? _unpack_bf16_10[5] * gw8[5] : _unpack_bf16_10[5]);
-            ssq0 = __fmaf_rn(y0_5, y0_5, ssq0);
-            float y0_6 = ((mode != 0) ? _unpack_bf16_10[6] * gw8[6] : _unpack_bf16_10[6]);
-            ssq0 = __fmaf_rn(y0_6, y0_6, ssq0);
-            float y0_7 = ((mode != 0) ? _unpack_bf16_10[7] * gw8[7] : _unpack_bf16_10[7]);
-            ssq0 = __fmaf_rn(y0_7, y0_7, ssq0);
-            ssq8[0] = ssq0;
+            float ssq_0 = 0.0f;
+            float y_0 = ((mode != 0) ? _unpack_bf16_y_0[0] * gw8[0] : _unpack_bf16_y_0[0]);
+            ssq_0 = __fmaf_rn(y_0, y_0, ssq_0);
+            float y_1 = ((mode != 0) ? _unpack_bf16_y_0[1] * gw8[1] : _unpack_bf16_y_0[1]);
+            ssq_0 = __fmaf_rn(y_1, y_1, ssq_0);
+            float y_2 = ((mode != 0) ? _unpack_bf16_y_0[2] * gw8[2] : _unpack_bf16_y_0[2]);
+            ssq_0 = __fmaf_rn(y_2, y_2, ssq_0);
+            float y_3 = ((mode != 0) ? _unpack_bf16_y_0[3] * gw8[3] : _unpack_bf16_y_0[3]);
+            ssq_0 = __fmaf_rn(y_3, y_3, ssq_0);
+            float y_4 = ((mode != 0) ? _unpack_bf16_y_0[4] * gw8[4] : _unpack_bf16_y_0[4]);
+            ssq_0 = __fmaf_rn(y_4, y_4, ssq_0);
+            float y_5 = ((mode != 0) ? _unpack_bf16_y_0[5] * gw8[5] : _unpack_bf16_y_0[5]);
+            ssq_0 = __fmaf_rn(y_5, y_5, ssq_0);
+            float y_6 = ((mode != 0) ? _unpack_bf16_y_0[6] * gw8[6] : _unpack_bf16_y_0[6]);
+            ssq_0 = __fmaf_rn(y_6, y_6, ssq_0);
+            float y_7 = ((mode != 0) ? _unpack_bf16_y_0[7] * gw8[7] : _unpack_bf16_y_0[7]);
+            ssq_0 = __fmaf_rn(y_7, y_7, ssq_0);
+            ssq8[0] = ssq_0;
             {
                 auto _gst_22 = push_local + src;
                 __builtin_assume(__isGlobal(_gst_22));
@@ -973,6 +973,25 @@ kernel_cake_tp_moe_finalize_rmsnorm_6d4722f3bbbeb033a812(__nv_bfloat16* __restri
                 (((_sysv_poll_group_1[30] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll_group_1[30] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll_group_1[31] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll_group_1[31] >> 16) & 0xffffu) == 0x8000u)
             );
             float s8_1[8];
+            float _unpack_bf16_10[8];
+            #pragma unroll
+            for (int _pair = 0; _pair < 4; _pair++) {
+                asm volatile(
+                    "{\n\t"
+                    "shl.b32 %0, %2, 16;\n\t"
+                    "and.b32 %1, %2, 0xffff0000;\n\t"
+                    "}\n"
+                    : "=f"((&_unpack_bf16_10[_pair * 2])[0]), "=f"((&_unpack_bf16_10[_pair * 2])[1])
+                    : "r"(_sysv_poll_group_1[_pair]));
+            }
+            s8_1[0] = _unpack_bf16_10[0];
+            s8_1[1] = _unpack_bf16_10[1];
+            s8_1[2] = _unpack_bf16_10[2];
+            s8_1[3] = _unpack_bf16_10[3];
+            s8_1[4] = _unpack_bf16_10[4];
+            s8_1[5] = _unpack_bf16_10[5];
+            s8_1[6] = _unpack_bf16_10[6];
+            s8_1[7] = _unpack_bf16_10[7];
             float _unpack_bf16_11[8];
             #pragma unroll
             for (int _pair = 0; _pair < 4; _pair++) {
@@ -982,16 +1001,16 @@ kernel_cake_tp_moe_finalize_rmsnorm_6d4722f3bbbeb033a812(__nv_bfloat16* __restri
                     "and.b32 %1, %2, 0xffff0000;\n\t"
                     "}\n"
                     : "=f"((&_unpack_bf16_11[_pair * 2])[0]), "=f"((&_unpack_bf16_11[_pair * 2])[1])
-                    : "r"(_sysv_poll_group_1[_pair]));
+                    : "r"(_sysv_poll_group_1[4 + _pair]));
             }
-            s8_1[0] = _unpack_bf16_11[0];
-            s8_1[1] = _unpack_bf16_11[1];
-            s8_1[2] = _unpack_bf16_11[2];
-            s8_1[3] = _unpack_bf16_11[3];
-            s8_1[4] = _unpack_bf16_11[4];
-            s8_1[5] = _unpack_bf16_11[5];
-            s8_1[6] = _unpack_bf16_11[6];
-            s8_1[7] = _unpack_bf16_11[7];
+            s8_1[0] = s8_1[0] + _unpack_bf16_11[0];
+            s8_1[1] = s8_1[1] + _unpack_bf16_11[1];
+            s8_1[2] = s8_1[2] + _unpack_bf16_11[2];
+            s8_1[3] = s8_1[3] + _unpack_bf16_11[3];
+            s8_1[4] = s8_1[4] + _unpack_bf16_11[4];
+            s8_1[5] = s8_1[5] + _unpack_bf16_11[5];
+            s8_1[6] = s8_1[6] + _unpack_bf16_11[6];
+            s8_1[7] = s8_1[7] + _unpack_bf16_11[7];
             float _unpack_bf16_12[8];
             #pragma unroll
             for (int _pair = 0; _pair < 4; _pair++) {
@@ -1001,7 +1020,7 @@ kernel_cake_tp_moe_finalize_rmsnorm_6d4722f3bbbeb033a812(__nv_bfloat16* __restri
                     "and.b32 %1, %2, 0xffff0000;\n\t"
                     "}\n"
                     : "=f"((&_unpack_bf16_12[_pair * 2])[0]), "=f"((&_unpack_bf16_12[_pair * 2])[1])
-                    : "r"(_sysv_poll_group_1[4 + _pair]));
+                    : "r"(_sysv_poll_group_1[8 + _pair]));
             }
             s8_1[0] = s8_1[0] + _unpack_bf16_12[0];
             s8_1[1] = s8_1[1] + _unpack_bf16_12[1];
@@ -1020,7 +1039,7 @@ kernel_cake_tp_moe_finalize_rmsnorm_6d4722f3bbbeb033a812(__nv_bfloat16* __restri
                     "and.b32 %1, %2, 0xffff0000;\n\t"
                     "}\n"
                     : "=f"((&_unpack_bf16_13[_pair * 2])[0]), "=f"((&_unpack_bf16_13[_pair * 2])[1])
-                    : "r"(_sysv_poll_group_1[8 + _pair]));
+                    : "r"(_sysv_poll_group_1[12 + _pair]));
             }
             s8_1[0] = s8_1[0] + _unpack_bf16_13[0];
             s8_1[1] = s8_1[1] + _unpack_bf16_13[1];
@@ -1039,7 +1058,7 @@ kernel_cake_tp_moe_finalize_rmsnorm_6d4722f3bbbeb033a812(__nv_bfloat16* __restri
                     "and.b32 %1, %2, 0xffff0000;\n\t"
                     "}\n"
                     : "=f"((&_unpack_bf16_14[_pair * 2])[0]), "=f"((&_unpack_bf16_14[_pair * 2])[1])
-                    : "r"(_sysv_poll_group_1[12 + _pair]));
+                    : "r"(_sysv_poll_group_1[16 + _pair]));
             }
             s8_1[0] = s8_1[0] + _unpack_bf16_14[0];
             s8_1[1] = s8_1[1] + _unpack_bf16_14[1];
@@ -1058,7 +1077,7 @@ kernel_cake_tp_moe_finalize_rmsnorm_6d4722f3bbbeb033a812(__nv_bfloat16* __restri
                     "and.b32 %1, %2, 0xffff0000;\n\t"
                     "}\n"
                     : "=f"((&_unpack_bf16_15[_pair * 2])[0]), "=f"((&_unpack_bf16_15[_pair * 2])[1])
-                    : "r"(_sysv_poll_group_1[16 + _pair]));
+                    : "r"(_sysv_poll_group_1[20 + _pair]));
             }
             s8_1[0] = s8_1[0] + _unpack_bf16_15[0];
             s8_1[1] = s8_1[1] + _unpack_bf16_15[1];
@@ -1077,7 +1096,7 @@ kernel_cake_tp_moe_finalize_rmsnorm_6d4722f3bbbeb033a812(__nv_bfloat16* __restri
                     "and.b32 %1, %2, 0xffff0000;\n\t"
                     "}\n"
                     : "=f"((&_unpack_bf16_16[_pair * 2])[0]), "=f"((&_unpack_bf16_16[_pair * 2])[1])
-                    : "r"(_sysv_poll_group_1[20 + _pair]));
+                    : "r"(_sysv_poll_group_1[24 + _pair]));
             }
             s8_1[0] = s8_1[0] + _unpack_bf16_16[0];
             s8_1[1] = s8_1[1] + _unpack_bf16_16[1];
@@ -1096,7 +1115,7 @@ kernel_cake_tp_moe_finalize_rmsnorm_6d4722f3bbbeb033a812(__nv_bfloat16* __restri
                     "and.b32 %1, %2, 0xffff0000;\n\t"
                     "}\n"
                     : "=f"((&_unpack_bf16_17[_pair * 2])[0]), "=f"((&_unpack_bf16_17[_pair * 2])[1])
-                    : "r"(_sysv_poll_group_1[24 + _pair]));
+                    : "r"(_sysv_poll_group_1[28 + _pair]));
             }
             s8_1[0] = s8_1[0] + _unpack_bf16_17[0];
             s8_1[1] = s8_1[1] + _unpack_bf16_17[1];
@@ -1106,36 +1125,17 @@ kernel_cake_tp_moe_finalize_rmsnorm_6d4722f3bbbeb033a812(__nv_bfloat16* __restri
             s8_1[5] = s8_1[5] + _unpack_bf16_17[5];
             s8_1[6] = s8_1[6] + _unpack_bf16_17[6];
             s8_1[7] = s8_1[7] + _unpack_bf16_17[7];
-            float _unpack_bf16_18[8];
-            #pragma unroll
-            for (int _pair = 0; _pair < 4; _pair++) {
-                asm volatile(
-                    "{\n\t"
-                    "shl.b32 %0, %2, 16;\n\t"
-                    "and.b32 %1, %2, 0xffff0000;\n\t"
-                    "}\n"
-                    : "=f"((&_unpack_bf16_18[_pair * 2])[0]), "=f"((&_unpack_bf16_18[_pair * 2])[1])
-                    : "r"(_sysv_poll_group_1[28 + _pair]));
-            }
-            s8_1[0] = s8_1[0] + _unpack_bf16_18[0];
-            s8_1[1] = s8_1[1] + _unpack_bf16_18[1];
-            s8_1[2] = s8_1[2] + _unpack_bf16_18[2];
-            s8_1[3] = s8_1[3] + _unpack_bf16_18[3];
-            s8_1[4] = s8_1[4] + _unpack_bf16_18[4];
-            s8_1[5] = s8_1[5] + _unpack_bf16_18[5];
-            s8_1[6] = s8_1[6] + _unpack_bf16_18[6];
-            s8_1[7] = s8_1[7] + _unpack_bf16_18[7];
-            unsigned int s8_1_bf16[4];
+            unsigned int s8_bf16_1[4];
             #pragma unroll
             for (int _lp = 0; _lp < 4; _lp++) {
                 __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(s8_1[_lp*2 + 0], s8_1[_lp*2+1 + 0]));
-                s8_1_bf16[_lp] = *(uint32_t*)&_bf2;
+                s8_bf16_1[_lp] = *(uint32_t*)&_bf2;
             }
-            rw[4] = s8_1_bf16[0];
-            rw[5] = s8_1_bf16[1];
-            rw[6] = s8_1_bf16[2];
-            rw[7] = s8_1_bf16[3];
-            float _unpack_bf16_19[8];
+            rw[4] = s8_bf16_1[0];
+            rw[5] = s8_bf16_1[1];
+            rw[6] = s8_bf16_1[2];
+            rw[7] = s8_bf16_1[3];
+            float _unpack_bf16_y_1[8];
             #pragma unroll
             for (int _pair = 0; _pair < 4; _pair++) {
                 asm volatile(
@@ -1143,27 +1143,27 @@ kernel_cake_tp_moe_finalize_rmsnorm_6d4722f3bbbeb033a812(__nv_bfloat16* __restri
                     "shl.b32 %0, %2, 16;\n\t"
                     "and.b32 %1, %2, 0xffff0000;\n\t"
                     "}\n"
-                    : "=f"((&_unpack_bf16_19[_pair * 2])[0]), "=f"((&_unpack_bf16_19[_pair * 2])[1])
-                    : "r"(s8_1_bf16[_pair]));
+                    : "=f"((&_unpack_bf16_y_1[_pair * 2])[0]), "=f"((&_unpack_bf16_y_1[_pair * 2])[1])
+                    : "r"(s8_bf16_1[_pair]));
             }
-            float ssq1 = 0.0f;
-            float y1_0 = ((mode != 0) ? _unpack_bf16_19[0] * gw8[0] : _unpack_bf16_19[0]);
-            ssq1 = __fmaf_rn(y1_0, y1_0, ssq1);
-            float y1_1 = ((mode != 0) ? _unpack_bf16_19[1] * gw8[1] : _unpack_bf16_19[1]);
-            ssq1 = __fmaf_rn(y1_1, y1_1, ssq1);
-            float y1_2 = ((mode != 0) ? _unpack_bf16_19[2] * gw8[2] : _unpack_bf16_19[2]);
-            ssq1 = __fmaf_rn(y1_2, y1_2, ssq1);
-            float y1_3 = ((mode != 0) ? _unpack_bf16_19[3] * gw8[3] : _unpack_bf16_19[3]);
-            ssq1 = __fmaf_rn(y1_3, y1_3, ssq1);
-            float y1_4 = ((mode != 0) ? _unpack_bf16_19[4] * gw8[4] : _unpack_bf16_19[4]);
-            ssq1 = __fmaf_rn(y1_4, y1_4, ssq1);
-            float y1_5 = ((mode != 0) ? _unpack_bf16_19[5] * gw8[5] : _unpack_bf16_19[5]);
-            ssq1 = __fmaf_rn(y1_5, y1_5, ssq1);
-            float y1_6 = ((mode != 0) ? _unpack_bf16_19[6] * gw8[6] : _unpack_bf16_19[6]);
-            ssq1 = __fmaf_rn(y1_6, y1_6, ssq1);
-            float y1_7 = ((mode != 0) ? _unpack_bf16_19[7] * gw8[7] : _unpack_bf16_19[7]);
-            ssq1 = __fmaf_rn(y1_7, y1_7, ssq1);
-            ssq8[1] = ssq1;
+            float ssq_1 = 0.0f;
+            float y_8 = ((mode != 0) ? _unpack_bf16_y_1[0] * gw8[0] : _unpack_bf16_y_1[0]);
+            ssq_1 = __fmaf_rn(y_8, y_8, ssq_1);
+            float y_9 = ((mode != 0) ? _unpack_bf16_y_1[1] * gw8[1] : _unpack_bf16_y_1[1]);
+            ssq_1 = __fmaf_rn(y_9, y_9, ssq_1);
+            float y_10 = ((mode != 0) ? _unpack_bf16_y_1[2] * gw8[2] : _unpack_bf16_y_1[2]);
+            ssq_1 = __fmaf_rn(y_10, y_10, ssq_1);
+            float y_11 = ((mode != 0) ? _unpack_bf16_y_1[3] * gw8[3] : _unpack_bf16_y_1[3]);
+            ssq_1 = __fmaf_rn(y_11, y_11, ssq_1);
+            float y_12 = ((mode != 0) ? _unpack_bf16_y_1[4] * gw8[4] : _unpack_bf16_y_1[4]);
+            ssq_1 = __fmaf_rn(y_12, y_12, ssq_1);
+            float y_13 = ((mode != 0) ? _unpack_bf16_y_1[5] * gw8[5] : _unpack_bf16_y_1[5]);
+            ssq_1 = __fmaf_rn(y_13, y_13, ssq_1);
+            float y_14 = ((mode != 0) ? _unpack_bf16_y_1[6] * gw8[6] : _unpack_bf16_y_1[6]);
+            ssq_1 = __fmaf_rn(y_14, y_14, ssq_1);
+            float y_15 = ((mode != 0) ? _unpack_bf16_y_1[7] * gw8[7] : _unpack_bf16_y_1[7]);
+            ssq_1 = __fmaf_rn(y_15, y_15, ssq_1);
+            ssq8[1] = ssq_1;
             {
                 auto _gst_30 = push_local + (src + 32768);
                 __builtin_assume(__isGlobal(_gst_30));
@@ -1233,6 +1233,44 @@ kernel_cake_tp_moe_finalize_rmsnorm_6d4722f3bbbeb033a812(__nv_bfloat16* __restri
                 (((_sysv_poll_group_2[30] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll_group_2[30] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll_group_2[31] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll_group_2[31] >> 16) & 0xffffu) == 0x8000u)
             );
             float s8_2[8];
+            float _unpack_bf16_18[8];
+            #pragma unroll
+            for (int _pair = 0; _pair < 4; _pair++) {
+                asm volatile(
+                    "{\n\t"
+                    "shl.b32 %0, %2, 16;\n\t"
+                    "and.b32 %1, %2, 0xffff0000;\n\t"
+                    "}\n"
+                    : "=f"((&_unpack_bf16_18[_pair * 2])[0]), "=f"((&_unpack_bf16_18[_pair * 2])[1])
+                    : "r"(_sysv_poll_group_2[_pair]));
+            }
+            s8_2[0] = _unpack_bf16_18[0];
+            s8_2[1] = _unpack_bf16_18[1];
+            s8_2[2] = _unpack_bf16_18[2];
+            s8_2[3] = _unpack_bf16_18[3];
+            s8_2[4] = _unpack_bf16_18[4];
+            s8_2[5] = _unpack_bf16_18[5];
+            s8_2[6] = _unpack_bf16_18[6];
+            s8_2[7] = _unpack_bf16_18[7];
+            float _unpack_bf16_19[8];
+            #pragma unroll
+            for (int _pair = 0; _pair < 4; _pair++) {
+                asm volatile(
+                    "{\n\t"
+                    "shl.b32 %0, %2, 16;\n\t"
+                    "and.b32 %1, %2, 0xffff0000;\n\t"
+                    "}\n"
+                    : "=f"((&_unpack_bf16_19[_pair * 2])[0]), "=f"((&_unpack_bf16_19[_pair * 2])[1])
+                    : "r"(_sysv_poll_group_2[4 + _pair]));
+            }
+            s8_2[0] = s8_2[0] + _unpack_bf16_19[0];
+            s8_2[1] = s8_2[1] + _unpack_bf16_19[1];
+            s8_2[2] = s8_2[2] + _unpack_bf16_19[2];
+            s8_2[3] = s8_2[3] + _unpack_bf16_19[3];
+            s8_2[4] = s8_2[4] + _unpack_bf16_19[4];
+            s8_2[5] = s8_2[5] + _unpack_bf16_19[5];
+            s8_2[6] = s8_2[6] + _unpack_bf16_19[6];
+            s8_2[7] = s8_2[7] + _unpack_bf16_19[7];
             float _unpack_bf16_20[8];
             #pragma unroll
             for (int _pair = 0; _pair < 4; _pair++) {
@@ -1242,16 +1280,16 @@ kernel_cake_tp_moe_finalize_rmsnorm_6d4722f3bbbeb033a812(__nv_bfloat16* __restri
                     "and.b32 %1, %2, 0xffff0000;\n\t"
                     "}\n"
                     : "=f"((&_unpack_bf16_20[_pair * 2])[0]), "=f"((&_unpack_bf16_20[_pair * 2])[1])
-                    : "r"(_sysv_poll_group_2[_pair]));
+                    : "r"(_sysv_poll_group_2[8 + _pair]));
             }
-            s8_2[0] = _unpack_bf16_20[0];
-            s8_2[1] = _unpack_bf16_20[1];
-            s8_2[2] = _unpack_bf16_20[2];
-            s8_2[3] = _unpack_bf16_20[3];
-            s8_2[4] = _unpack_bf16_20[4];
-            s8_2[5] = _unpack_bf16_20[5];
-            s8_2[6] = _unpack_bf16_20[6];
-            s8_2[7] = _unpack_bf16_20[7];
+            s8_2[0] = s8_2[0] + _unpack_bf16_20[0];
+            s8_2[1] = s8_2[1] + _unpack_bf16_20[1];
+            s8_2[2] = s8_2[2] + _unpack_bf16_20[2];
+            s8_2[3] = s8_2[3] + _unpack_bf16_20[3];
+            s8_2[4] = s8_2[4] + _unpack_bf16_20[4];
+            s8_2[5] = s8_2[5] + _unpack_bf16_20[5];
+            s8_2[6] = s8_2[6] + _unpack_bf16_20[6];
+            s8_2[7] = s8_2[7] + _unpack_bf16_20[7];
             float _unpack_bf16_21[8];
             #pragma unroll
             for (int _pair = 0; _pair < 4; _pair++) {
@@ -1261,7 +1299,7 @@ kernel_cake_tp_moe_finalize_rmsnorm_6d4722f3bbbeb033a812(__nv_bfloat16* __restri
                     "and.b32 %1, %2, 0xffff0000;\n\t"
                     "}\n"
                     : "=f"((&_unpack_bf16_21[_pair * 2])[0]), "=f"((&_unpack_bf16_21[_pair * 2])[1])
-                    : "r"(_sysv_poll_group_2[4 + _pair]));
+                    : "r"(_sysv_poll_group_2[12 + _pair]));
             }
             s8_2[0] = s8_2[0] + _unpack_bf16_21[0];
             s8_2[1] = s8_2[1] + _unpack_bf16_21[1];
@@ -1280,7 +1318,7 @@ kernel_cake_tp_moe_finalize_rmsnorm_6d4722f3bbbeb033a812(__nv_bfloat16* __restri
                     "and.b32 %1, %2, 0xffff0000;\n\t"
                     "}\n"
                     : "=f"((&_unpack_bf16_22[_pair * 2])[0]), "=f"((&_unpack_bf16_22[_pair * 2])[1])
-                    : "r"(_sysv_poll_group_2[8 + _pair]));
+                    : "r"(_sysv_poll_group_2[16 + _pair]));
             }
             s8_2[0] = s8_2[0] + _unpack_bf16_22[0];
             s8_2[1] = s8_2[1] + _unpack_bf16_22[1];
@@ -1299,7 +1337,7 @@ kernel_cake_tp_moe_finalize_rmsnorm_6d4722f3bbbeb033a812(__nv_bfloat16* __restri
                     "and.b32 %1, %2, 0xffff0000;\n\t"
                     "}\n"
                     : "=f"((&_unpack_bf16_23[_pair * 2])[0]), "=f"((&_unpack_bf16_23[_pair * 2])[1])
-                    : "r"(_sysv_poll_group_2[12 + _pair]));
+                    : "r"(_sysv_poll_group_2[20 + _pair]));
             }
             s8_2[0] = s8_2[0] + _unpack_bf16_23[0];
             s8_2[1] = s8_2[1] + _unpack_bf16_23[1];
@@ -1318,7 +1356,7 @@ kernel_cake_tp_moe_finalize_rmsnorm_6d4722f3bbbeb033a812(__nv_bfloat16* __restri
                     "and.b32 %1, %2, 0xffff0000;\n\t"
                     "}\n"
                     : "=f"((&_unpack_bf16_24[_pair * 2])[0]), "=f"((&_unpack_bf16_24[_pair * 2])[1])
-                    : "r"(_sysv_poll_group_2[16 + _pair]));
+                    : "r"(_sysv_poll_group_2[24 + _pair]));
             }
             s8_2[0] = s8_2[0] + _unpack_bf16_24[0];
             s8_2[1] = s8_2[1] + _unpack_bf16_24[1];
@@ -1337,7 +1375,7 @@ kernel_cake_tp_moe_finalize_rmsnorm_6d4722f3bbbeb033a812(__nv_bfloat16* __restri
                     "and.b32 %1, %2, 0xffff0000;\n\t"
                     "}\n"
                     : "=f"((&_unpack_bf16_25[_pair * 2])[0]), "=f"((&_unpack_bf16_25[_pair * 2])[1])
-                    : "r"(_sysv_poll_group_2[20 + _pair]));
+                    : "r"(_sysv_poll_group_2[28 + _pair]));
             }
             s8_2[0] = s8_2[0] + _unpack_bf16_25[0];
             s8_2[1] = s8_2[1] + _unpack_bf16_25[1];
@@ -1347,55 +1385,17 @@ kernel_cake_tp_moe_finalize_rmsnorm_6d4722f3bbbeb033a812(__nv_bfloat16* __restri
             s8_2[5] = s8_2[5] + _unpack_bf16_25[5];
             s8_2[6] = s8_2[6] + _unpack_bf16_25[6];
             s8_2[7] = s8_2[7] + _unpack_bf16_25[7];
-            float _unpack_bf16_26[8];
-            #pragma unroll
-            for (int _pair = 0; _pair < 4; _pair++) {
-                asm volatile(
-                    "{\n\t"
-                    "shl.b32 %0, %2, 16;\n\t"
-                    "and.b32 %1, %2, 0xffff0000;\n\t"
-                    "}\n"
-                    : "=f"((&_unpack_bf16_26[_pair * 2])[0]), "=f"((&_unpack_bf16_26[_pair * 2])[1])
-                    : "r"(_sysv_poll_group_2[24 + _pair]));
-            }
-            s8_2[0] = s8_2[0] + _unpack_bf16_26[0];
-            s8_2[1] = s8_2[1] + _unpack_bf16_26[1];
-            s8_2[2] = s8_2[2] + _unpack_bf16_26[2];
-            s8_2[3] = s8_2[3] + _unpack_bf16_26[3];
-            s8_2[4] = s8_2[4] + _unpack_bf16_26[4];
-            s8_2[5] = s8_2[5] + _unpack_bf16_26[5];
-            s8_2[6] = s8_2[6] + _unpack_bf16_26[6];
-            s8_2[7] = s8_2[7] + _unpack_bf16_26[7];
-            float _unpack_bf16_27[8];
-            #pragma unroll
-            for (int _pair = 0; _pair < 4; _pair++) {
-                asm volatile(
-                    "{\n\t"
-                    "shl.b32 %0, %2, 16;\n\t"
-                    "and.b32 %1, %2, 0xffff0000;\n\t"
-                    "}\n"
-                    : "=f"((&_unpack_bf16_27[_pair * 2])[0]), "=f"((&_unpack_bf16_27[_pair * 2])[1])
-                    : "r"(_sysv_poll_group_2[28 + _pair]));
-            }
-            s8_2[0] = s8_2[0] + _unpack_bf16_27[0];
-            s8_2[1] = s8_2[1] + _unpack_bf16_27[1];
-            s8_2[2] = s8_2[2] + _unpack_bf16_27[2];
-            s8_2[3] = s8_2[3] + _unpack_bf16_27[3];
-            s8_2[4] = s8_2[4] + _unpack_bf16_27[4];
-            s8_2[5] = s8_2[5] + _unpack_bf16_27[5];
-            s8_2[6] = s8_2[6] + _unpack_bf16_27[6];
-            s8_2[7] = s8_2[7] + _unpack_bf16_27[7];
-            unsigned int s8_2_bf16[4];
+            unsigned int s8_bf16_2[4];
             #pragma unroll
             for (int _lp = 0; _lp < 4; _lp++) {
                 __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(s8_2[_lp*2 + 0], s8_2[_lp*2+1 + 0]));
-                s8_2_bf16[_lp] = *(uint32_t*)&_bf2;
+                s8_bf16_2[_lp] = *(uint32_t*)&_bf2;
             }
-            rw[8] = s8_2_bf16[0];
-            rw[9] = s8_2_bf16[1];
-            rw[10] = s8_2_bf16[2];
-            rw[11] = s8_2_bf16[3];
-            float _unpack_bf16_28[8];
+            rw[8] = s8_bf16_2[0];
+            rw[9] = s8_bf16_2[1];
+            rw[10] = s8_bf16_2[2];
+            rw[11] = s8_bf16_2[3];
+            float _unpack_bf16_y_2[8];
             #pragma unroll
             for (int _pair = 0; _pair < 4; _pair++) {
                 asm volatile(
@@ -1403,27 +1403,27 @@ kernel_cake_tp_moe_finalize_rmsnorm_6d4722f3bbbeb033a812(__nv_bfloat16* __restri
                     "shl.b32 %0, %2, 16;\n\t"
                     "and.b32 %1, %2, 0xffff0000;\n\t"
                     "}\n"
-                    : "=f"((&_unpack_bf16_28[_pair * 2])[0]), "=f"((&_unpack_bf16_28[_pair * 2])[1])
-                    : "r"(s8_2_bf16[_pair]));
+                    : "=f"((&_unpack_bf16_y_2[_pair * 2])[0]), "=f"((&_unpack_bf16_y_2[_pair * 2])[1])
+                    : "r"(s8_bf16_2[_pair]));
             }
-            float ssq2 = 0.0f;
-            float y2_0 = ((mode != 0) ? _unpack_bf16_28[0] * gw8[0] : _unpack_bf16_28[0]);
-            ssq2 = __fmaf_rn(y2_0, y2_0, ssq2);
-            float y2_1 = ((mode != 0) ? _unpack_bf16_28[1] * gw8[1] : _unpack_bf16_28[1]);
-            ssq2 = __fmaf_rn(y2_1, y2_1, ssq2);
-            float y2_2 = ((mode != 0) ? _unpack_bf16_28[2] * gw8[2] : _unpack_bf16_28[2]);
-            ssq2 = __fmaf_rn(y2_2, y2_2, ssq2);
-            float y2_3 = ((mode != 0) ? _unpack_bf16_28[3] * gw8[3] : _unpack_bf16_28[3]);
-            ssq2 = __fmaf_rn(y2_3, y2_3, ssq2);
-            float y2_4 = ((mode != 0) ? _unpack_bf16_28[4] * gw8[4] : _unpack_bf16_28[4]);
-            ssq2 = __fmaf_rn(y2_4, y2_4, ssq2);
-            float y2_5 = ((mode != 0) ? _unpack_bf16_28[5] * gw8[5] : _unpack_bf16_28[5]);
-            ssq2 = __fmaf_rn(y2_5, y2_5, ssq2);
-            float y2_6 = ((mode != 0) ? _unpack_bf16_28[6] * gw8[6] : _unpack_bf16_28[6]);
-            ssq2 = __fmaf_rn(y2_6, y2_6, ssq2);
-            float y2_7 = ((mode != 0) ? _unpack_bf16_28[7] * gw8[7] : _unpack_bf16_28[7]);
-            ssq2 = __fmaf_rn(y2_7, y2_7, ssq2);
-            ssq8[2] = ssq2;
+            float ssq_2 = 0.0f;
+            float y_16 = ((mode != 0) ? _unpack_bf16_y_2[0] * gw8[0] : _unpack_bf16_y_2[0]);
+            ssq_2 = __fmaf_rn(y_16, y_16, ssq_2);
+            float y_17 = ((mode != 0) ? _unpack_bf16_y_2[1] * gw8[1] : _unpack_bf16_y_2[1]);
+            ssq_2 = __fmaf_rn(y_17, y_17, ssq_2);
+            float y_18 = ((mode != 0) ? _unpack_bf16_y_2[2] * gw8[2] : _unpack_bf16_y_2[2]);
+            ssq_2 = __fmaf_rn(y_18, y_18, ssq_2);
+            float y_19 = ((mode != 0) ? _unpack_bf16_y_2[3] * gw8[3] : _unpack_bf16_y_2[3]);
+            ssq_2 = __fmaf_rn(y_19, y_19, ssq_2);
+            float y_20 = ((mode != 0) ? _unpack_bf16_y_2[4] * gw8[4] : _unpack_bf16_y_2[4]);
+            ssq_2 = __fmaf_rn(y_20, y_20, ssq_2);
+            float y_21 = ((mode != 0) ? _unpack_bf16_y_2[5] * gw8[5] : _unpack_bf16_y_2[5]);
+            ssq_2 = __fmaf_rn(y_21, y_21, ssq_2);
+            float y_22 = ((mode != 0) ? _unpack_bf16_y_2[6] * gw8[6] : _unpack_bf16_y_2[6]);
+            ssq_2 = __fmaf_rn(y_22, y_22, ssq_2);
+            float y_23 = ((mode != 0) ? _unpack_bf16_y_2[7] * gw8[7] : _unpack_bf16_y_2[7]);
+            ssq_2 = __fmaf_rn(y_23, y_23, ssq_2);
+            ssq8[2] = ssq_2;
             {
                 auto _gst_38 = push_local + (src + 65536);
                 __builtin_assume(__isGlobal(_gst_38));
@@ -1493,6 +1493,63 @@ kernel_cake_tp_moe_finalize_rmsnorm_6d4722f3bbbeb033a812(__nv_bfloat16* __restri
                 (((_sysv_poll_group_3[30] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll_group_3[30] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll_group_3[31] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll_group_3[31] >> 16) & 0xffffu) == 0x8000u)
             );
             float s8_3[8];
+            float _unpack_bf16_26[8];
+            #pragma unroll
+            for (int _pair = 0; _pair < 4; _pair++) {
+                asm volatile(
+                    "{\n\t"
+                    "shl.b32 %0, %2, 16;\n\t"
+                    "and.b32 %1, %2, 0xffff0000;\n\t"
+                    "}\n"
+                    : "=f"((&_unpack_bf16_26[_pair * 2])[0]), "=f"((&_unpack_bf16_26[_pair * 2])[1])
+                    : "r"(_sysv_poll_group_3[_pair]));
+            }
+            s8_3[0] = _unpack_bf16_26[0];
+            s8_3[1] = _unpack_bf16_26[1];
+            s8_3[2] = _unpack_bf16_26[2];
+            s8_3[3] = _unpack_bf16_26[3];
+            s8_3[4] = _unpack_bf16_26[4];
+            s8_3[5] = _unpack_bf16_26[5];
+            s8_3[6] = _unpack_bf16_26[6];
+            s8_3[7] = _unpack_bf16_26[7];
+            float _unpack_bf16_27[8];
+            #pragma unroll
+            for (int _pair = 0; _pair < 4; _pair++) {
+                asm volatile(
+                    "{\n\t"
+                    "shl.b32 %0, %2, 16;\n\t"
+                    "and.b32 %1, %2, 0xffff0000;\n\t"
+                    "}\n"
+                    : "=f"((&_unpack_bf16_27[_pair * 2])[0]), "=f"((&_unpack_bf16_27[_pair * 2])[1])
+                    : "r"(_sysv_poll_group_3[4 + _pair]));
+            }
+            s8_3[0] = s8_3[0] + _unpack_bf16_27[0];
+            s8_3[1] = s8_3[1] + _unpack_bf16_27[1];
+            s8_3[2] = s8_3[2] + _unpack_bf16_27[2];
+            s8_3[3] = s8_3[3] + _unpack_bf16_27[3];
+            s8_3[4] = s8_3[4] + _unpack_bf16_27[4];
+            s8_3[5] = s8_3[5] + _unpack_bf16_27[5];
+            s8_3[6] = s8_3[6] + _unpack_bf16_27[6];
+            s8_3[7] = s8_3[7] + _unpack_bf16_27[7];
+            float _unpack_bf16_28[8];
+            #pragma unroll
+            for (int _pair = 0; _pair < 4; _pair++) {
+                asm volatile(
+                    "{\n\t"
+                    "shl.b32 %0, %2, 16;\n\t"
+                    "and.b32 %1, %2, 0xffff0000;\n\t"
+                    "}\n"
+                    : "=f"((&_unpack_bf16_28[_pair * 2])[0]), "=f"((&_unpack_bf16_28[_pair * 2])[1])
+                    : "r"(_sysv_poll_group_3[8 + _pair]));
+            }
+            s8_3[0] = s8_3[0] + _unpack_bf16_28[0];
+            s8_3[1] = s8_3[1] + _unpack_bf16_28[1];
+            s8_3[2] = s8_3[2] + _unpack_bf16_28[2];
+            s8_3[3] = s8_3[3] + _unpack_bf16_28[3];
+            s8_3[4] = s8_3[4] + _unpack_bf16_28[4];
+            s8_3[5] = s8_3[5] + _unpack_bf16_28[5];
+            s8_3[6] = s8_3[6] + _unpack_bf16_28[6];
+            s8_3[7] = s8_3[7] + _unpack_bf16_28[7];
             float _unpack_bf16_29[8];
             #pragma unroll
             for (int _pair = 0; _pair < 4; _pair++) {
@@ -1502,16 +1559,16 @@ kernel_cake_tp_moe_finalize_rmsnorm_6d4722f3bbbeb033a812(__nv_bfloat16* __restri
                     "and.b32 %1, %2, 0xffff0000;\n\t"
                     "}\n"
                     : "=f"((&_unpack_bf16_29[_pair * 2])[0]), "=f"((&_unpack_bf16_29[_pair * 2])[1])
-                    : "r"(_sysv_poll_group_3[_pair]));
+                    : "r"(_sysv_poll_group_3[12 + _pair]));
             }
-            s8_3[0] = _unpack_bf16_29[0];
-            s8_3[1] = _unpack_bf16_29[1];
-            s8_3[2] = _unpack_bf16_29[2];
-            s8_3[3] = _unpack_bf16_29[3];
-            s8_3[4] = _unpack_bf16_29[4];
-            s8_3[5] = _unpack_bf16_29[5];
-            s8_3[6] = _unpack_bf16_29[6];
-            s8_3[7] = _unpack_bf16_29[7];
+            s8_3[0] = s8_3[0] + _unpack_bf16_29[0];
+            s8_3[1] = s8_3[1] + _unpack_bf16_29[1];
+            s8_3[2] = s8_3[2] + _unpack_bf16_29[2];
+            s8_3[3] = s8_3[3] + _unpack_bf16_29[3];
+            s8_3[4] = s8_3[4] + _unpack_bf16_29[4];
+            s8_3[5] = s8_3[5] + _unpack_bf16_29[5];
+            s8_3[6] = s8_3[6] + _unpack_bf16_29[6];
+            s8_3[7] = s8_3[7] + _unpack_bf16_29[7];
             float _unpack_bf16_30[8];
             #pragma unroll
             for (int _pair = 0; _pair < 4; _pair++) {
@@ -1521,7 +1578,7 @@ kernel_cake_tp_moe_finalize_rmsnorm_6d4722f3bbbeb033a812(__nv_bfloat16* __restri
                     "and.b32 %1, %2, 0xffff0000;\n\t"
                     "}\n"
                     : "=f"((&_unpack_bf16_30[_pair * 2])[0]), "=f"((&_unpack_bf16_30[_pair * 2])[1])
-                    : "r"(_sysv_poll_group_3[4 + _pair]));
+                    : "r"(_sysv_poll_group_3[16 + _pair]));
             }
             s8_3[0] = s8_3[0] + _unpack_bf16_30[0];
             s8_3[1] = s8_3[1] + _unpack_bf16_30[1];
@@ -1540,7 +1597,7 @@ kernel_cake_tp_moe_finalize_rmsnorm_6d4722f3bbbeb033a812(__nv_bfloat16* __restri
                     "and.b32 %1, %2, 0xffff0000;\n\t"
                     "}\n"
                     : "=f"((&_unpack_bf16_31[_pair * 2])[0]), "=f"((&_unpack_bf16_31[_pair * 2])[1])
-                    : "r"(_sysv_poll_group_3[8 + _pair]));
+                    : "r"(_sysv_poll_group_3[20 + _pair]));
             }
             s8_3[0] = s8_3[0] + _unpack_bf16_31[0];
             s8_3[1] = s8_3[1] + _unpack_bf16_31[1];
@@ -1559,7 +1616,7 @@ kernel_cake_tp_moe_finalize_rmsnorm_6d4722f3bbbeb033a812(__nv_bfloat16* __restri
                     "and.b32 %1, %2, 0xffff0000;\n\t"
                     "}\n"
                     : "=f"((&_unpack_bf16_32[_pair * 2])[0]), "=f"((&_unpack_bf16_32[_pair * 2])[1])
-                    : "r"(_sysv_poll_group_3[12 + _pair]));
+                    : "r"(_sysv_poll_group_3[24 + _pair]));
             }
             s8_3[0] = s8_3[0] + _unpack_bf16_32[0];
             s8_3[1] = s8_3[1] + _unpack_bf16_32[1];
@@ -1578,7 +1635,7 @@ kernel_cake_tp_moe_finalize_rmsnorm_6d4722f3bbbeb033a812(__nv_bfloat16* __restri
                     "and.b32 %1, %2, 0xffff0000;\n\t"
                     "}\n"
                     : "=f"((&_unpack_bf16_33[_pair * 2])[0]), "=f"((&_unpack_bf16_33[_pair * 2])[1])
-                    : "r"(_sysv_poll_group_3[16 + _pair]));
+                    : "r"(_sysv_poll_group_3[28 + _pair]));
             }
             s8_3[0] = s8_3[0] + _unpack_bf16_33[0];
             s8_3[1] = s8_3[1] + _unpack_bf16_33[1];
@@ -1588,74 +1645,17 @@ kernel_cake_tp_moe_finalize_rmsnorm_6d4722f3bbbeb033a812(__nv_bfloat16* __restri
             s8_3[5] = s8_3[5] + _unpack_bf16_33[5];
             s8_3[6] = s8_3[6] + _unpack_bf16_33[6];
             s8_3[7] = s8_3[7] + _unpack_bf16_33[7];
-            float _unpack_bf16_34[8];
-            #pragma unroll
-            for (int _pair = 0; _pair < 4; _pair++) {
-                asm volatile(
-                    "{\n\t"
-                    "shl.b32 %0, %2, 16;\n\t"
-                    "and.b32 %1, %2, 0xffff0000;\n\t"
-                    "}\n"
-                    : "=f"((&_unpack_bf16_34[_pair * 2])[0]), "=f"((&_unpack_bf16_34[_pair * 2])[1])
-                    : "r"(_sysv_poll_group_3[20 + _pair]));
-            }
-            s8_3[0] = s8_3[0] + _unpack_bf16_34[0];
-            s8_3[1] = s8_3[1] + _unpack_bf16_34[1];
-            s8_3[2] = s8_3[2] + _unpack_bf16_34[2];
-            s8_3[3] = s8_3[3] + _unpack_bf16_34[3];
-            s8_3[4] = s8_3[4] + _unpack_bf16_34[4];
-            s8_3[5] = s8_3[5] + _unpack_bf16_34[5];
-            s8_3[6] = s8_3[6] + _unpack_bf16_34[6];
-            s8_3[7] = s8_3[7] + _unpack_bf16_34[7];
-            float _unpack_bf16_35[8];
-            #pragma unroll
-            for (int _pair = 0; _pair < 4; _pair++) {
-                asm volatile(
-                    "{\n\t"
-                    "shl.b32 %0, %2, 16;\n\t"
-                    "and.b32 %1, %2, 0xffff0000;\n\t"
-                    "}\n"
-                    : "=f"((&_unpack_bf16_35[_pair * 2])[0]), "=f"((&_unpack_bf16_35[_pair * 2])[1])
-                    : "r"(_sysv_poll_group_3[24 + _pair]));
-            }
-            s8_3[0] = s8_3[0] + _unpack_bf16_35[0];
-            s8_3[1] = s8_3[1] + _unpack_bf16_35[1];
-            s8_3[2] = s8_3[2] + _unpack_bf16_35[2];
-            s8_3[3] = s8_3[3] + _unpack_bf16_35[3];
-            s8_3[4] = s8_3[4] + _unpack_bf16_35[4];
-            s8_3[5] = s8_3[5] + _unpack_bf16_35[5];
-            s8_3[6] = s8_3[6] + _unpack_bf16_35[6];
-            s8_3[7] = s8_3[7] + _unpack_bf16_35[7];
-            float _unpack_bf16_36[8];
-            #pragma unroll
-            for (int _pair = 0; _pair < 4; _pair++) {
-                asm volatile(
-                    "{\n\t"
-                    "shl.b32 %0, %2, 16;\n\t"
-                    "and.b32 %1, %2, 0xffff0000;\n\t"
-                    "}\n"
-                    : "=f"((&_unpack_bf16_36[_pair * 2])[0]), "=f"((&_unpack_bf16_36[_pair * 2])[1])
-                    : "r"(_sysv_poll_group_3[28 + _pair]));
-            }
-            s8_3[0] = s8_3[0] + _unpack_bf16_36[0];
-            s8_3[1] = s8_3[1] + _unpack_bf16_36[1];
-            s8_3[2] = s8_3[2] + _unpack_bf16_36[2];
-            s8_3[3] = s8_3[3] + _unpack_bf16_36[3];
-            s8_3[4] = s8_3[4] + _unpack_bf16_36[4];
-            s8_3[5] = s8_3[5] + _unpack_bf16_36[5];
-            s8_3[6] = s8_3[6] + _unpack_bf16_36[6];
-            s8_3[7] = s8_3[7] + _unpack_bf16_36[7];
-            unsigned int s8_3_bf16[4];
+            unsigned int s8_bf16_3[4];
             #pragma unroll
             for (int _lp = 0; _lp < 4; _lp++) {
                 __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(s8_3[_lp*2 + 0], s8_3[_lp*2+1 + 0]));
-                s8_3_bf16[_lp] = *(uint32_t*)&_bf2;
+                s8_bf16_3[_lp] = *(uint32_t*)&_bf2;
             }
-            rw[12] = s8_3_bf16[0];
-            rw[13] = s8_3_bf16[1];
-            rw[14] = s8_3_bf16[2];
-            rw[15] = s8_3_bf16[3];
-            float _unpack_bf16_37[8];
+            rw[12] = s8_bf16_3[0];
+            rw[13] = s8_bf16_3[1];
+            rw[14] = s8_bf16_3[2];
+            rw[15] = s8_bf16_3[3];
+            float _unpack_bf16_y_3[8];
             #pragma unroll
             for (int _pair = 0; _pair < 4; _pair++) {
                 asm volatile(
@@ -1663,27 +1663,27 @@ kernel_cake_tp_moe_finalize_rmsnorm_6d4722f3bbbeb033a812(__nv_bfloat16* __restri
                     "shl.b32 %0, %2, 16;\n\t"
                     "and.b32 %1, %2, 0xffff0000;\n\t"
                     "}\n"
-                    : "=f"((&_unpack_bf16_37[_pair * 2])[0]), "=f"((&_unpack_bf16_37[_pair * 2])[1])
-                    : "r"(s8_3_bf16[_pair]));
+                    : "=f"((&_unpack_bf16_y_3[_pair * 2])[0]), "=f"((&_unpack_bf16_y_3[_pair * 2])[1])
+                    : "r"(s8_bf16_3[_pair]));
             }
-            float ssq3 = 0.0f;
-            float y3_0 = ((mode != 0) ? _unpack_bf16_37[0] * gw8[0] : _unpack_bf16_37[0]);
-            ssq3 = __fmaf_rn(y3_0, y3_0, ssq3);
-            float y3_1 = ((mode != 0) ? _unpack_bf16_37[1] * gw8[1] : _unpack_bf16_37[1]);
-            ssq3 = __fmaf_rn(y3_1, y3_1, ssq3);
-            float y3_2 = ((mode != 0) ? _unpack_bf16_37[2] * gw8[2] : _unpack_bf16_37[2]);
-            ssq3 = __fmaf_rn(y3_2, y3_2, ssq3);
-            float y3_3 = ((mode != 0) ? _unpack_bf16_37[3] * gw8[3] : _unpack_bf16_37[3]);
-            ssq3 = __fmaf_rn(y3_3, y3_3, ssq3);
-            float y3_4 = ((mode != 0) ? _unpack_bf16_37[4] * gw8[4] : _unpack_bf16_37[4]);
-            ssq3 = __fmaf_rn(y3_4, y3_4, ssq3);
-            float y3_5 = ((mode != 0) ? _unpack_bf16_37[5] * gw8[5] : _unpack_bf16_37[5]);
-            ssq3 = __fmaf_rn(y3_5, y3_5, ssq3);
-            float y3_6 = ((mode != 0) ? _unpack_bf16_37[6] * gw8[6] : _unpack_bf16_37[6]);
-            ssq3 = __fmaf_rn(y3_6, y3_6, ssq3);
-            float y3_7 = ((mode != 0) ? _unpack_bf16_37[7] * gw8[7] : _unpack_bf16_37[7]);
-            ssq3 = __fmaf_rn(y3_7, y3_7, ssq3);
-            ssq8[3] = ssq3;
+            float ssq_3 = 0.0f;
+            float y_24 = ((mode != 0) ? _unpack_bf16_y_3[0] * gw8[0] : _unpack_bf16_y_3[0]);
+            ssq_3 = __fmaf_rn(y_24, y_24, ssq_3);
+            float y_25 = ((mode != 0) ? _unpack_bf16_y_3[1] * gw8[1] : _unpack_bf16_y_3[1]);
+            ssq_3 = __fmaf_rn(y_25, y_25, ssq_3);
+            float y_26 = ((mode != 0) ? _unpack_bf16_y_3[2] * gw8[2] : _unpack_bf16_y_3[2]);
+            ssq_3 = __fmaf_rn(y_26, y_26, ssq_3);
+            float y_27 = ((mode != 0) ? _unpack_bf16_y_3[3] * gw8[3] : _unpack_bf16_y_3[3]);
+            ssq_3 = __fmaf_rn(y_27, y_27, ssq_3);
+            float y_28 = ((mode != 0) ? _unpack_bf16_y_3[4] * gw8[4] : _unpack_bf16_y_3[4]);
+            ssq_3 = __fmaf_rn(y_28, y_28, ssq_3);
+            float y_29 = ((mode != 0) ? _unpack_bf16_y_3[5] * gw8[5] : _unpack_bf16_y_3[5]);
+            ssq_3 = __fmaf_rn(y_29, y_29, ssq_3);
+            float y_30 = ((mode != 0) ? _unpack_bf16_y_3[6] * gw8[6] : _unpack_bf16_y_3[6]);
+            ssq_3 = __fmaf_rn(y_30, y_30, ssq_3);
+            float y_31 = ((mode != 0) ? _unpack_bf16_y_3[7] * gw8[7] : _unpack_bf16_y_3[7]);
+            ssq_3 = __fmaf_rn(y_31, y_31, ssq_3);
+            ssq8[3] = ssq_3;
             {
                 auto _gst_46 = push_local + (src + 98304);
                 __builtin_assume(__isGlobal(_gst_46));
@@ -1753,6 +1753,82 @@ kernel_cake_tp_moe_finalize_rmsnorm_6d4722f3bbbeb033a812(__nv_bfloat16* __restri
                 (((_sysv_poll_group_4[30] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll_group_4[30] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll_group_4[31] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll_group_4[31] >> 16) & 0xffffu) == 0x8000u)
             );
             float s8_4[8];
+            float _unpack_bf16_34[8];
+            #pragma unroll
+            for (int _pair = 0; _pair < 4; _pair++) {
+                asm volatile(
+                    "{\n\t"
+                    "shl.b32 %0, %2, 16;\n\t"
+                    "and.b32 %1, %2, 0xffff0000;\n\t"
+                    "}\n"
+                    : "=f"((&_unpack_bf16_34[_pair * 2])[0]), "=f"((&_unpack_bf16_34[_pair * 2])[1])
+                    : "r"(_sysv_poll_group_4[_pair]));
+            }
+            s8_4[0] = _unpack_bf16_34[0];
+            s8_4[1] = _unpack_bf16_34[1];
+            s8_4[2] = _unpack_bf16_34[2];
+            s8_4[3] = _unpack_bf16_34[3];
+            s8_4[4] = _unpack_bf16_34[4];
+            s8_4[5] = _unpack_bf16_34[5];
+            s8_4[6] = _unpack_bf16_34[6];
+            s8_4[7] = _unpack_bf16_34[7];
+            float _unpack_bf16_35[8];
+            #pragma unroll
+            for (int _pair = 0; _pair < 4; _pair++) {
+                asm volatile(
+                    "{\n\t"
+                    "shl.b32 %0, %2, 16;\n\t"
+                    "and.b32 %1, %2, 0xffff0000;\n\t"
+                    "}\n"
+                    : "=f"((&_unpack_bf16_35[_pair * 2])[0]), "=f"((&_unpack_bf16_35[_pair * 2])[1])
+                    : "r"(_sysv_poll_group_4[4 + _pair]));
+            }
+            s8_4[0] = s8_4[0] + _unpack_bf16_35[0];
+            s8_4[1] = s8_4[1] + _unpack_bf16_35[1];
+            s8_4[2] = s8_4[2] + _unpack_bf16_35[2];
+            s8_4[3] = s8_4[3] + _unpack_bf16_35[3];
+            s8_4[4] = s8_4[4] + _unpack_bf16_35[4];
+            s8_4[5] = s8_4[5] + _unpack_bf16_35[5];
+            s8_4[6] = s8_4[6] + _unpack_bf16_35[6];
+            s8_4[7] = s8_4[7] + _unpack_bf16_35[7];
+            float _unpack_bf16_36[8];
+            #pragma unroll
+            for (int _pair = 0; _pair < 4; _pair++) {
+                asm volatile(
+                    "{\n\t"
+                    "shl.b32 %0, %2, 16;\n\t"
+                    "and.b32 %1, %2, 0xffff0000;\n\t"
+                    "}\n"
+                    : "=f"((&_unpack_bf16_36[_pair * 2])[0]), "=f"((&_unpack_bf16_36[_pair * 2])[1])
+                    : "r"(_sysv_poll_group_4[8 + _pair]));
+            }
+            s8_4[0] = s8_4[0] + _unpack_bf16_36[0];
+            s8_4[1] = s8_4[1] + _unpack_bf16_36[1];
+            s8_4[2] = s8_4[2] + _unpack_bf16_36[2];
+            s8_4[3] = s8_4[3] + _unpack_bf16_36[3];
+            s8_4[4] = s8_4[4] + _unpack_bf16_36[4];
+            s8_4[5] = s8_4[5] + _unpack_bf16_36[5];
+            s8_4[6] = s8_4[6] + _unpack_bf16_36[6];
+            s8_4[7] = s8_4[7] + _unpack_bf16_36[7];
+            float _unpack_bf16_37[8];
+            #pragma unroll
+            for (int _pair = 0; _pair < 4; _pair++) {
+                asm volatile(
+                    "{\n\t"
+                    "shl.b32 %0, %2, 16;\n\t"
+                    "and.b32 %1, %2, 0xffff0000;\n\t"
+                    "}\n"
+                    : "=f"((&_unpack_bf16_37[_pair * 2])[0]), "=f"((&_unpack_bf16_37[_pair * 2])[1])
+                    : "r"(_sysv_poll_group_4[12 + _pair]));
+            }
+            s8_4[0] = s8_4[0] + _unpack_bf16_37[0];
+            s8_4[1] = s8_4[1] + _unpack_bf16_37[1];
+            s8_4[2] = s8_4[2] + _unpack_bf16_37[2];
+            s8_4[3] = s8_4[3] + _unpack_bf16_37[3];
+            s8_4[4] = s8_4[4] + _unpack_bf16_37[4];
+            s8_4[5] = s8_4[5] + _unpack_bf16_37[5];
+            s8_4[6] = s8_4[6] + _unpack_bf16_37[6];
+            s8_4[7] = s8_4[7] + _unpack_bf16_37[7];
             float _unpack_bf16_38[8];
             #pragma unroll
             for (int _pair = 0; _pair < 4; _pair++) {
@@ -1762,16 +1838,16 @@ kernel_cake_tp_moe_finalize_rmsnorm_6d4722f3bbbeb033a812(__nv_bfloat16* __restri
                     "and.b32 %1, %2, 0xffff0000;\n\t"
                     "}\n"
                     : "=f"((&_unpack_bf16_38[_pair * 2])[0]), "=f"((&_unpack_bf16_38[_pair * 2])[1])
-                    : "r"(_sysv_poll_group_4[_pair]));
+                    : "r"(_sysv_poll_group_4[16 + _pair]));
             }
-            s8_4[0] = _unpack_bf16_38[0];
-            s8_4[1] = _unpack_bf16_38[1];
-            s8_4[2] = _unpack_bf16_38[2];
-            s8_4[3] = _unpack_bf16_38[3];
-            s8_4[4] = _unpack_bf16_38[4];
-            s8_4[5] = _unpack_bf16_38[5];
-            s8_4[6] = _unpack_bf16_38[6];
-            s8_4[7] = _unpack_bf16_38[7];
+            s8_4[0] = s8_4[0] + _unpack_bf16_38[0];
+            s8_4[1] = s8_4[1] + _unpack_bf16_38[1];
+            s8_4[2] = s8_4[2] + _unpack_bf16_38[2];
+            s8_4[3] = s8_4[3] + _unpack_bf16_38[3];
+            s8_4[4] = s8_4[4] + _unpack_bf16_38[4];
+            s8_4[5] = s8_4[5] + _unpack_bf16_38[5];
+            s8_4[6] = s8_4[6] + _unpack_bf16_38[6];
+            s8_4[7] = s8_4[7] + _unpack_bf16_38[7];
             float _unpack_bf16_39[8];
             #pragma unroll
             for (int _pair = 0; _pair < 4; _pair++) {
@@ -1781,7 +1857,7 @@ kernel_cake_tp_moe_finalize_rmsnorm_6d4722f3bbbeb033a812(__nv_bfloat16* __restri
                     "and.b32 %1, %2, 0xffff0000;\n\t"
                     "}\n"
                     : "=f"((&_unpack_bf16_39[_pair * 2])[0]), "=f"((&_unpack_bf16_39[_pair * 2])[1])
-                    : "r"(_sysv_poll_group_4[4 + _pair]));
+                    : "r"(_sysv_poll_group_4[20 + _pair]));
             }
             s8_4[0] = s8_4[0] + _unpack_bf16_39[0];
             s8_4[1] = s8_4[1] + _unpack_bf16_39[1];
@@ -1800,7 +1876,7 @@ kernel_cake_tp_moe_finalize_rmsnorm_6d4722f3bbbeb033a812(__nv_bfloat16* __restri
                     "and.b32 %1, %2, 0xffff0000;\n\t"
                     "}\n"
                     : "=f"((&_unpack_bf16_40[_pair * 2])[0]), "=f"((&_unpack_bf16_40[_pair * 2])[1])
-                    : "r"(_sysv_poll_group_4[8 + _pair]));
+                    : "r"(_sysv_poll_group_4[24 + _pair]));
             }
             s8_4[0] = s8_4[0] + _unpack_bf16_40[0];
             s8_4[1] = s8_4[1] + _unpack_bf16_40[1];
@@ -1819,7 +1895,7 @@ kernel_cake_tp_moe_finalize_rmsnorm_6d4722f3bbbeb033a812(__nv_bfloat16* __restri
                     "and.b32 %1, %2, 0xffff0000;\n\t"
                     "}\n"
                     : "=f"((&_unpack_bf16_41[_pair * 2])[0]), "=f"((&_unpack_bf16_41[_pair * 2])[1])
-                    : "r"(_sysv_poll_group_4[12 + _pair]));
+                    : "r"(_sysv_poll_group_4[28 + _pair]));
             }
             s8_4[0] = s8_4[0] + _unpack_bf16_41[0];
             s8_4[1] = s8_4[1] + _unpack_bf16_41[1];
@@ -1829,93 +1905,17 @@ kernel_cake_tp_moe_finalize_rmsnorm_6d4722f3bbbeb033a812(__nv_bfloat16* __restri
             s8_4[5] = s8_4[5] + _unpack_bf16_41[5];
             s8_4[6] = s8_4[6] + _unpack_bf16_41[6];
             s8_4[7] = s8_4[7] + _unpack_bf16_41[7];
-            float _unpack_bf16_42[8];
-            #pragma unroll
-            for (int _pair = 0; _pair < 4; _pair++) {
-                asm volatile(
-                    "{\n\t"
-                    "shl.b32 %0, %2, 16;\n\t"
-                    "and.b32 %1, %2, 0xffff0000;\n\t"
-                    "}\n"
-                    : "=f"((&_unpack_bf16_42[_pair * 2])[0]), "=f"((&_unpack_bf16_42[_pair * 2])[1])
-                    : "r"(_sysv_poll_group_4[16 + _pair]));
-            }
-            s8_4[0] = s8_4[0] + _unpack_bf16_42[0];
-            s8_4[1] = s8_4[1] + _unpack_bf16_42[1];
-            s8_4[2] = s8_4[2] + _unpack_bf16_42[2];
-            s8_4[3] = s8_4[3] + _unpack_bf16_42[3];
-            s8_4[4] = s8_4[4] + _unpack_bf16_42[4];
-            s8_4[5] = s8_4[5] + _unpack_bf16_42[5];
-            s8_4[6] = s8_4[6] + _unpack_bf16_42[6];
-            s8_4[7] = s8_4[7] + _unpack_bf16_42[7];
-            float _unpack_bf16_43[8];
-            #pragma unroll
-            for (int _pair = 0; _pair < 4; _pair++) {
-                asm volatile(
-                    "{\n\t"
-                    "shl.b32 %0, %2, 16;\n\t"
-                    "and.b32 %1, %2, 0xffff0000;\n\t"
-                    "}\n"
-                    : "=f"((&_unpack_bf16_43[_pair * 2])[0]), "=f"((&_unpack_bf16_43[_pair * 2])[1])
-                    : "r"(_sysv_poll_group_4[20 + _pair]));
-            }
-            s8_4[0] = s8_4[0] + _unpack_bf16_43[0];
-            s8_4[1] = s8_4[1] + _unpack_bf16_43[1];
-            s8_4[2] = s8_4[2] + _unpack_bf16_43[2];
-            s8_4[3] = s8_4[3] + _unpack_bf16_43[3];
-            s8_4[4] = s8_4[4] + _unpack_bf16_43[4];
-            s8_4[5] = s8_4[5] + _unpack_bf16_43[5];
-            s8_4[6] = s8_4[6] + _unpack_bf16_43[6];
-            s8_4[7] = s8_4[7] + _unpack_bf16_43[7];
-            float _unpack_bf16_44[8];
-            #pragma unroll
-            for (int _pair = 0; _pair < 4; _pair++) {
-                asm volatile(
-                    "{\n\t"
-                    "shl.b32 %0, %2, 16;\n\t"
-                    "and.b32 %1, %2, 0xffff0000;\n\t"
-                    "}\n"
-                    : "=f"((&_unpack_bf16_44[_pair * 2])[0]), "=f"((&_unpack_bf16_44[_pair * 2])[1])
-                    : "r"(_sysv_poll_group_4[24 + _pair]));
-            }
-            s8_4[0] = s8_4[0] + _unpack_bf16_44[0];
-            s8_4[1] = s8_4[1] + _unpack_bf16_44[1];
-            s8_4[2] = s8_4[2] + _unpack_bf16_44[2];
-            s8_4[3] = s8_4[3] + _unpack_bf16_44[3];
-            s8_4[4] = s8_4[4] + _unpack_bf16_44[4];
-            s8_4[5] = s8_4[5] + _unpack_bf16_44[5];
-            s8_4[6] = s8_4[6] + _unpack_bf16_44[6];
-            s8_4[7] = s8_4[7] + _unpack_bf16_44[7];
-            float _unpack_bf16_45[8];
-            #pragma unroll
-            for (int _pair = 0; _pair < 4; _pair++) {
-                asm volatile(
-                    "{\n\t"
-                    "shl.b32 %0, %2, 16;\n\t"
-                    "and.b32 %1, %2, 0xffff0000;\n\t"
-                    "}\n"
-                    : "=f"((&_unpack_bf16_45[_pair * 2])[0]), "=f"((&_unpack_bf16_45[_pair * 2])[1])
-                    : "r"(_sysv_poll_group_4[28 + _pair]));
-            }
-            s8_4[0] = s8_4[0] + _unpack_bf16_45[0];
-            s8_4[1] = s8_4[1] + _unpack_bf16_45[1];
-            s8_4[2] = s8_4[2] + _unpack_bf16_45[2];
-            s8_4[3] = s8_4[3] + _unpack_bf16_45[3];
-            s8_4[4] = s8_4[4] + _unpack_bf16_45[4];
-            s8_4[5] = s8_4[5] + _unpack_bf16_45[5];
-            s8_4[6] = s8_4[6] + _unpack_bf16_45[6];
-            s8_4[7] = s8_4[7] + _unpack_bf16_45[7];
-            unsigned int s8_4_bf16[4];
+            unsigned int s8_bf16_4[4];
             #pragma unroll
             for (int _lp = 0; _lp < 4; _lp++) {
                 __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(s8_4[_lp*2 + 0], s8_4[_lp*2+1 + 0]));
-                s8_4_bf16[_lp] = *(uint32_t*)&_bf2;
+                s8_bf16_4[_lp] = *(uint32_t*)&_bf2;
             }
-            rw[16] = s8_4_bf16[0];
-            rw[17] = s8_4_bf16[1];
-            rw[18] = s8_4_bf16[2];
-            rw[19] = s8_4_bf16[3];
-            float _unpack_bf16_46[8];
+            rw[16] = s8_bf16_4[0];
+            rw[17] = s8_bf16_4[1];
+            rw[18] = s8_bf16_4[2];
+            rw[19] = s8_bf16_4[3];
+            float _unpack_bf16_y_4[8];
             #pragma unroll
             for (int _pair = 0; _pair < 4; _pair++) {
                 asm volatile(
@@ -1923,27 +1923,27 @@ kernel_cake_tp_moe_finalize_rmsnorm_6d4722f3bbbeb033a812(__nv_bfloat16* __restri
                     "shl.b32 %0, %2, 16;\n\t"
                     "and.b32 %1, %2, 0xffff0000;\n\t"
                     "}\n"
-                    : "=f"((&_unpack_bf16_46[_pair * 2])[0]), "=f"((&_unpack_bf16_46[_pair * 2])[1])
-                    : "r"(s8_4_bf16[_pair]));
+                    : "=f"((&_unpack_bf16_y_4[_pair * 2])[0]), "=f"((&_unpack_bf16_y_4[_pair * 2])[1])
+                    : "r"(s8_bf16_4[_pair]));
             }
-            float ssq4 = 0.0f;
-            float y4_0 = ((mode != 0) ? _unpack_bf16_46[0] * gw8[0] : _unpack_bf16_46[0]);
-            ssq4 = __fmaf_rn(y4_0, y4_0, ssq4);
-            float y4_1 = ((mode != 0) ? _unpack_bf16_46[1] * gw8[1] : _unpack_bf16_46[1]);
-            ssq4 = __fmaf_rn(y4_1, y4_1, ssq4);
-            float y4_2 = ((mode != 0) ? _unpack_bf16_46[2] * gw8[2] : _unpack_bf16_46[2]);
-            ssq4 = __fmaf_rn(y4_2, y4_2, ssq4);
-            float y4_3 = ((mode != 0) ? _unpack_bf16_46[3] * gw8[3] : _unpack_bf16_46[3]);
-            ssq4 = __fmaf_rn(y4_3, y4_3, ssq4);
-            float y4_4 = ((mode != 0) ? _unpack_bf16_46[4] * gw8[4] : _unpack_bf16_46[4]);
-            ssq4 = __fmaf_rn(y4_4, y4_4, ssq4);
-            float y4_5 = ((mode != 0) ? _unpack_bf16_46[5] * gw8[5] : _unpack_bf16_46[5]);
-            ssq4 = __fmaf_rn(y4_5, y4_5, ssq4);
-            float y4_6 = ((mode != 0) ? _unpack_bf16_46[6] * gw8[6] : _unpack_bf16_46[6]);
-            ssq4 = __fmaf_rn(y4_6, y4_6, ssq4);
-            float y4_7 = ((mode != 0) ? _unpack_bf16_46[7] * gw8[7] : _unpack_bf16_46[7]);
-            ssq4 = __fmaf_rn(y4_7, y4_7, ssq4);
-            ssq8[4] = ssq4;
+            float ssq_4 = 0.0f;
+            float y_32 = ((mode != 0) ? _unpack_bf16_y_4[0] * gw8[0] : _unpack_bf16_y_4[0]);
+            ssq_4 = __fmaf_rn(y_32, y_32, ssq_4);
+            float y_33 = ((mode != 0) ? _unpack_bf16_y_4[1] * gw8[1] : _unpack_bf16_y_4[1]);
+            ssq_4 = __fmaf_rn(y_33, y_33, ssq_4);
+            float y_34 = ((mode != 0) ? _unpack_bf16_y_4[2] * gw8[2] : _unpack_bf16_y_4[2]);
+            ssq_4 = __fmaf_rn(y_34, y_34, ssq_4);
+            float y_35 = ((mode != 0) ? _unpack_bf16_y_4[3] * gw8[3] : _unpack_bf16_y_4[3]);
+            ssq_4 = __fmaf_rn(y_35, y_35, ssq_4);
+            float y_36 = ((mode != 0) ? _unpack_bf16_y_4[4] * gw8[4] : _unpack_bf16_y_4[4]);
+            ssq_4 = __fmaf_rn(y_36, y_36, ssq_4);
+            float y_37 = ((mode != 0) ? _unpack_bf16_y_4[5] * gw8[5] : _unpack_bf16_y_4[5]);
+            ssq_4 = __fmaf_rn(y_37, y_37, ssq_4);
+            float y_38 = ((mode != 0) ? _unpack_bf16_y_4[6] * gw8[6] : _unpack_bf16_y_4[6]);
+            ssq_4 = __fmaf_rn(y_38, y_38, ssq_4);
+            float y_39 = ((mode != 0) ? _unpack_bf16_y_4[7] * gw8[7] : _unpack_bf16_y_4[7]);
+            ssq_4 = __fmaf_rn(y_39, y_39, ssq_4);
+            ssq8[4] = ssq_4;
             {
                 auto _gst_54 = push_local + (src + 131072);
                 __builtin_assume(__isGlobal(_gst_54));
@@ -2013,6 +2013,101 @@ kernel_cake_tp_moe_finalize_rmsnorm_6d4722f3bbbeb033a812(__nv_bfloat16* __restri
                 (((_sysv_poll_group_5[30] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll_group_5[30] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll_group_5[31] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll_group_5[31] >> 16) & 0xffffu) == 0x8000u)
             );
             float s8_5[8];
+            float _unpack_bf16_42[8];
+            #pragma unroll
+            for (int _pair = 0; _pair < 4; _pair++) {
+                asm volatile(
+                    "{\n\t"
+                    "shl.b32 %0, %2, 16;\n\t"
+                    "and.b32 %1, %2, 0xffff0000;\n\t"
+                    "}\n"
+                    : "=f"((&_unpack_bf16_42[_pair * 2])[0]), "=f"((&_unpack_bf16_42[_pair * 2])[1])
+                    : "r"(_sysv_poll_group_5[_pair]));
+            }
+            s8_5[0] = _unpack_bf16_42[0];
+            s8_5[1] = _unpack_bf16_42[1];
+            s8_5[2] = _unpack_bf16_42[2];
+            s8_5[3] = _unpack_bf16_42[3];
+            s8_5[4] = _unpack_bf16_42[4];
+            s8_5[5] = _unpack_bf16_42[5];
+            s8_5[6] = _unpack_bf16_42[6];
+            s8_5[7] = _unpack_bf16_42[7];
+            float _unpack_bf16_43[8];
+            #pragma unroll
+            for (int _pair = 0; _pair < 4; _pair++) {
+                asm volatile(
+                    "{\n\t"
+                    "shl.b32 %0, %2, 16;\n\t"
+                    "and.b32 %1, %2, 0xffff0000;\n\t"
+                    "}\n"
+                    : "=f"((&_unpack_bf16_43[_pair * 2])[0]), "=f"((&_unpack_bf16_43[_pair * 2])[1])
+                    : "r"(_sysv_poll_group_5[4 + _pair]));
+            }
+            s8_5[0] = s8_5[0] + _unpack_bf16_43[0];
+            s8_5[1] = s8_5[1] + _unpack_bf16_43[1];
+            s8_5[2] = s8_5[2] + _unpack_bf16_43[2];
+            s8_5[3] = s8_5[3] + _unpack_bf16_43[3];
+            s8_5[4] = s8_5[4] + _unpack_bf16_43[4];
+            s8_5[5] = s8_5[5] + _unpack_bf16_43[5];
+            s8_5[6] = s8_5[6] + _unpack_bf16_43[6];
+            s8_5[7] = s8_5[7] + _unpack_bf16_43[7];
+            float _unpack_bf16_44[8];
+            #pragma unroll
+            for (int _pair = 0; _pair < 4; _pair++) {
+                asm volatile(
+                    "{\n\t"
+                    "shl.b32 %0, %2, 16;\n\t"
+                    "and.b32 %1, %2, 0xffff0000;\n\t"
+                    "}\n"
+                    : "=f"((&_unpack_bf16_44[_pair * 2])[0]), "=f"((&_unpack_bf16_44[_pair * 2])[1])
+                    : "r"(_sysv_poll_group_5[8 + _pair]));
+            }
+            s8_5[0] = s8_5[0] + _unpack_bf16_44[0];
+            s8_5[1] = s8_5[1] + _unpack_bf16_44[1];
+            s8_5[2] = s8_5[2] + _unpack_bf16_44[2];
+            s8_5[3] = s8_5[3] + _unpack_bf16_44[3];
+            s8_5[4] = s8_5[4] + _unpack_bf16_44[4];
+            s8_5[5] = s8_5[5] + _unpack_bf16_44[5];
+            s8_5[6] = s8_5[6] + _unpack_bf16_44[6];
+            s8_5[7] = s8_5[7] + _unpack_bf16_44[7];
+            float _unpack_bf16_45[8];
+            #pragma unroll
+            for (int _pair = 0; _pair < 4; _pair++) {
+                asm volatile(
+                    "{\n\t"
+                    "shl.b32 %0, %2, 16;\n\t"
+                    "and.b32 %1, %2, 0xffff0000;\n\t"
+                    "}\n"
+                    : "=f"((&_unpack_bf16_45[_pair * 2])[0]), "=f"((&_unpack_bf16_45[_pair * 2])[1])
+                    : "r"(_sysv_poll_group_5[12 + _pair]));
+            }
+            s8_5[0] = s8_5[0] + _unpack_bf16_45[0];
+            s8_5[1] = s8_5[1] + _unpack_bf16_45[1];
+            s8_5[2] = s8_5[2] + _unpack_bf16_45[2];
+            s8_5[3] = s8_5[3] + _unpack_bf16_45[3];
+            s8_5[4] = s8_5[4] + _unpack_bf16_45[4];
+            s8_5[5] = s8_5[5] + _unpack_bf16_45[5];
+            s8_5[6] = s8_5[6] + _unpack_bf16_45[6];
+            s8_5[7] = s8_5[7] + _unpack_bf16_45[7];
+            float _unpack_bf16_46[8];
+            #pragma unroll
+            for (int _pair = 0; _pair < 4; _pair++) {
+                asm volatile(
+                    "{\n\t"
+                    "shl.b32 %0, %2, 16;\n\t"
+                    "and.b32 %1, %2, 0xffff0000;\n\t"
+                    "}\n"
+                    : "=f"((&_unpack_bf16_46[_pair * 2])[0]), "=f"((&_unpack_bf16_46[_pair * 2])[1])
+                    : "r"(_sysv_poll_group_5[16 + _pair]));
+            }
+            s8_5[0] = s8_5[0] + _unpack_bf16_46[0];
+            s8_5[1] = s8_5[1] + _unpack_bf16_46[1];
+            s8_5[2] = s8_5[2] + _unpack_bf16_46[2];
+            s8_5[3] = s8_5[3] + _unpack_bf16_46[3];
+            s8_5[4] = s8_5[4] + _unpack_bf16_46[4];
+            s8_5[5] = s8_5[5] + _unpack_bf16_46[5];
+            s8_5[6] = s8_5[6] + _unpack_bf16_46[6];
+            s8_5[7] = s8_5[7] + _unpack_bf16_46[7];
             float _unpack_bf16_47[8];
             #pragma unroll
             for (int _pair = 0; _pair < 4; _pair++) {
@@ -2022,16 +2117,16 @@ kernel_cake_tp_moe_finalize_rmsnorm_6d4722f3bbbeb033a812(__nv_bfloat16* __restri
                     "and.b32 %1, %2, 0xffff0000;\n\t"
                     "}\n"
                     : "=f"((&_unpack_bf16_47[_pair * 2])[0]), "=f"((&_unpack_bf16_47[_pair * 2])[1])
-                    : "r"(_sysv_poll_group_5[_pair]));
+                    : "r"(_sysv_poll_group_5[20 + _pair]));
             }
-            s8_5[0] = _unpack_bf16_47[0];
-            s8_5[1] = _unpack_bf16_47[1];
-            s8_5[2] = _unpack_bf16_47[2];
-            s8_5[3] = _unpack_bf16_47[3];
-            s8_5[4] = _unpack_bf16_47[4];
-            s8_5[5] = _unpack_bf16_47[5];
-            s8_5[6] = _unpack_bf16_47[6];
-            s8_5[7] = _unpack_bf16_47[7];
+            s8_5[0] = s8_5[0] + _unpack_bf16_47[0];
+            s8_5[1] = s8_5[1] + _unpack_bf16_47[1];
+            s8_5[2] = s8_5[2] + _unpack_bf16_47[2];
+            s8_5[3] = s8_5[3] + _unpack_bf16_47[3];
+            s8_5[4] = s8_5[4] + _unpack_bf16_47[4];
+            s8_5[5] = s8_5[5] + _unpack_bf16_47[5];
+            s8_5[6] = s8_5[6] + _unpack_bf16_47[6];
+            s8_5[7] = s8_5[7] + _unpack_bf16_47[7];
             float _unpack_bf16_48[8];
             #pragma unroll
             for (int _pair = 0; _pair < 4; _pair++) {
@@ -2041,7 +2136,7 @@ kernel_cake_tp_moe_finalize_rmsnorm_6d4722f3bbbeb033a812(__nv_bfloat16* __restri
                     "and.b32 %1, %2, 0xffff0000;\n\t"
                     "}\n"
                     : "=f"((&_unpack_bf16_48[_pair * 2])[0]), "=f"((&_unpack_bf16_48[_pair * 2])[1])
-                    : "r"(_sysv_poll_group_5[4 + _pair]));
+                    : "r"(_sysv_poll_group_5[24 + _pair]));
             }
             s8_5[0] = s8_5[0] + _unpack_bf16_48[0];
             s8_5[1] = s8_5[1] + _unpack_bf16_48[1];
@@ -2060,7 +2155,7 @@ kernel_cake_tp_moe_finalize_rmsnorm_6d4722f3bbbeb033a812(__nv_bfloat16* __restri
                     "and.b32 %1, %2, 0xffff0000;\n\t"
                     "}\n"
                     : "=f"((&_unpack_bf16_49[_pair * 2])[0]), "=f"((&_unpack_bf16_49[_pair * 2])[1])
-                    : "r"(_sysv_poll_group_5[8 + _pair]));
+                    : "r"(_sysv_poll_group_5[28 + _pair]));
             }
             s8_5[0] = s8_5[0] + _unpack_bf16_49[0];
             s8_5[1] = s8_5[1] + _unpack_bf16_49[1];
@@ -2070,112 +2165,17 @@ kernel_cake_tp_moe_finalize_rmsnorm_6d4722f3bbbeb033a812(__nv_bfloat16* __restri
             s8_5[5] = s8_5[5] + _unpack_bf16_49[5];
             s8_5[6] = s8_5[6] + _unpack_bf16_49[6];
             s8_5[7] = s8_5[7] + _unpack_bf16_49[7];
-            float _unpack_bf16_50[8];
-            #pragma unroll
-            for (int _pair = 0; _pair < 4; _pair++) {
-                asm volatile(
-                    "{\n\t"
-                    "shl.b32 %0, %2, 16;\n\t"
-                    "and.b32 %1, %2, 0xffff0000;\n\t"
-                    "}\n"
-                    : "=f"((&_unpack_bf16_50[_pair * 2])[0]), "=f"((&_unpack_bf16_50[_pair * 2])[1])
-                    : "r"(_sysv_poll_group_5[12 + _pair]));
-            }
-            s8_5[0] = s8_5[0] + _unpack_bf16_50[0];
-            s8_5[1] = s8_5[1] + _unpack_bf16_50[1];
-            s8_5[2] = s8_5[2] + _unpack_bf16_50[2];
-            s8_5[3] = s8_5[3] + _unpack_bf16_50[3];
-            s8_5[4] = s8_5[4] + _unpack_bf16_50[4];
-            s8_5[5] = s8_5[5] + _unpack_bf16_50[5];
-            s8_5[6] = s8_5[6] + _unpack_bf16_50[6];
-            s8_5[7] = s8_5[7] + _unpack_bf16_50[7];
-            float _unpack_bf16_51[8];
-            #pragma unroll
-            for (int _pair = 0; _pair < 4; _pair++) {
-                asm volatile(
-                    "{\n\t"
-                    "shl.b32 %0, %2, 16;\n\t"
-                    "and.b32 %1, %2, 0xffff0000;\n\t"
-                    "}\n"
-                    : "=f"((&_unpack_bf16_51[_pair * 2])[0]), "=f"((&_unpack_bf16_51[_pair * 2])[1])
-                    : "r"(_sysv_poll_group_5[16 + _pair]));
-            }
-            s8_5[0] = s8_5[0] + _unpack_bf16_51[0];
-            s8_5[1] = s8_5[1] + _unpack_bf16_51[1];
-            s8_5[2] = s8_5[2] + _unpack_bf16_51[2];
-            s8_5[3] = s8_5[3] + _unpack_bf16_51[3];
-            s8_5[4] = s8_5[4] + _unpack_bf16_51[4];
-            s8_5[5] = s8_5[5] + _unpack_bf16_51[5];
-            s8_5[6] = s8_5[6] + _unpack_bf16_51[6];
-            s8_5[7] = s8_5[7] + _unpack_bf16_51[7];
-            float _unpack_bf16_52[8];
-            #pragma unroll
-            for (int _pair = 0; _pair < 4; _pair++) {
-                asm volatile(
-                    "{\n\t"
-                    "shl.b32 %0, %2, 16;\n\t"
-                    "and.b32 %1, %2, 0xffff0000;\n\t"
-                    "}\n"
-                    : "=f"((&_unpack_bf16_52[_pair * 2])[0]), "=f"((&_unpack_bf16_52[_pair * 2])[1])
-                    : "r"(_sysv_poll_group_5[20 + _pair]));
-            }
-            s8_5[0] = s8_5[0] + _unpack_bf16_52[0];
-            s8_5[1] = s8_5[1] + _unpack_bf16_52[1];
-            s8_5[2] = s8_5[2] + _unpack_bf16_52[2];
-            s8_5[3] = s8_5[3] + _unpack_bf16_52[3];
-            s8_5[4] = s8_5[4] + _unpack_bf16_52[4];
-            s8_5[5] = s8_5[5] + _unpack_bf16_52[5];
-            s8_5[6] = s8_5[6] + _unpack_bf16_52[6];
-            s8_5[7] = s8_5[7] + _unpack_bf16_52[7];
-            float _unpack_bf16_53[8];
-            #pragma unroll
-            for (int _pair = 0; _pair < 4; _pair++) {
-                asm volatile(
-                    "{\n\t"
-                    "shl.b32 %0, %2, 16;\n\t"
-                    "and.b32 %1, %2, 0xffff0000;\n\t"
-                    "}\n"
-                    : "=f"((&_unpack_bf16_53[_pair * 2])[0]), "=f"((&_unpack_bf16_53[_pair * 2])[1])
-                    : "r"(_sysv_poll_group_5[24 + _pair]));
-            }
-            s8_5[0] = s8_5[0] + _unpack_bf16_53[0];
-            s8_5[1] = s8_5[1] + _unpack_bf16_53[1];
-            s8_5[2] = s8_5[2] + _unpack_bf16_53[2];
-            s8_5[3] = s8_5[3] + _unpack_bf16_53[3];
-            s8_5[4] = s8_5[4] + _unpack_bf16_53[4];
-            s8_5[5] = s8_5[5] + _unpack_bf16_53[5];
-            s8_5[6] = s8_5[6] + _unpack_bf16_53[6];
-            s8_5[7] = s8_5[7] + _unpack_bf16_53[7];
-            float _unpack_bf16_54[8];
-            #pragma unroll
-            for (int _pair = 0; _pair < 4; _pair++) {
-                asm volatile(
-                    "{\n\t"
-                    "shl.b32 %0, %2, 16;\n\t"
-                    "and.b32 %1, %2, 0xffff0000;\n\t"
-                    "}\n"
-                    : "=f"((&_unpack_bf16_54[_pair * 2])[0]), "=f"((&_unpack_bf16_54[_pair * 2])[1])
-                    : "r"(_sysv_poll_group_5[28 + _pair]));
-            }
-            s8_5[0] = s8_5[0] + _unpack_bf16_54[0];
-            s8_5[1] = s8_5[1] + _unpack_bf16_54[1];
-            s8_5[2] = s8_5[2] + _unpack_bf16_54[2];
-            s8_5[3] = s8_5[3] + _unpack_bf16_54[3];
-            s8_5[4] = s8_5[4] + _unpack_bf16_54[4];
-            s8_5[5] = s8_5[5] + _unpack_bf16_54[5];
-            s8_5[6] = s8_5[6] + _unpack_bf16_54[6];
-            s8_5[7] = s8_5[7] + _unpack_bf16_54[7];
-            unsigned int s8_5_bf16[4];
+            unsigned int s8_bf16_5[4];
             #pragma unroll
             for (int _lp = 0; _lp < 4; _lp++) {
                 __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(s8_5[_lp*2 + 0], s8_5[_lp*2+1 + 0]));
-                s8_5_bf16[_lp] = *(uint32_t*)&_bf2;
+                s8_bf16_5[_lp] = *(uint32_t*)&_bf2;
             }
-            rw[20] = s8_5_bf16[0];
-            rw[21] = s8_5_bf16[1];
-            rw[22] = s8_5_bf16[2];
-            rw[23] = s8_5_bf16[3];
-            float _unpack_bf16_55[8];
+            rw[20] = s8_bf16_5[0];
+            rw[21] = s8_bf16_5[1];
+            rw[22] = s8_bf16_5[2];
+            rw[23] = s8_bf16_5[3];
+            float _unpack_bf16_y_5[8];
             #pragma unroll
             for (int _pair = 0; _pair < 4; _pair++) {
                 asm volatile(
@@ -2183,27 +2183,27 @@ kernel_cake_tp_moe_finalize_rmsnorm_6d4722f3bbbeb033a812(__nv_bfloat16* __restri
                     "shl.b32 %0, %2, 16;\n\t"
                     "and.b32 %1, %2, 0xffff0000;\n\t"
                     "}\n"
-                    : "=f"((&_unpack_bf16_55[_pair * 2])[0]), "=f"((&_unpack_bf16_55[_pair * 2])[1])
-                    : "r"(s8_5_bf16[_pair]));
+                    : "=f"((&_unpack_bf16_y_5[_pair * 2])[0]), "=f"((&_unpack_bf16_y_5[_pair * 2])[1])
+                    : "r"(s8_bf16_5[_pair]));
             }
-            float ssq5 = 0.0f;
-            float y5_0 = ((mode != 0) ? _unpack_bf16_55[0] * gw8[0] : _unpack_bf16_55[0]);
-            ssq5 = __fmaf_rn(y5_0, y5_0, ssq5);
-            float y5_1 = ((mode != 0) ? _unpack_bf16_55[1] * gw8[1] : _unpack_bf16_55[1]);
-            ssq5 = __fmaf_rn(y5_1, y5_1, ssq5);
-            float y5_2 = ((mode != 0) ? _unpack_bf16_55[2] * gw8[2] : _unpack_bf16_55[2]);
-            ssq5 = __fmaf_rn(y5_2, y5_2, ssq5);
-            float y5_3 = ((mode != 0) ? _unpack_bf16_55[3] * gw8[3] : _unpack_bf16_55[3]);
-            ssq5 = __fmaf_rn(y5_3, y5_3, ssq5);
-            float y5_4 = ((mode != 0) ? _unpack_bf16_55[4] * gw8[4] : _unpack_bf16_55[4]);
-            ssq5 = __fmaf_rn(y5_4, y5_4, ssq5);
-            float y5_5 = ((mode != 0) ? _unpack_bf16_55[5] * gw8[5] : _unpack_bf16_55[5]);
-            ssq5 = __fmaf_rn(y5_5, y5_5, ssq5);
-            float y5_6 = ((mode != 0) ? _unpack_bf16_55[6] * gw8[6] : _unpack_bf16_55[6]);
-            ssq5 = __fmaf_rn(y5_6, y5_6, ssq5);
-            float y5_7 = ((mode != 0) ? _unpack_bf16_55[7] * gw8[7] : _unpack_bf16_55[7]);
-            ssq5 = __fmaf_rn(y5_7, y5_7, ssq5);
-            ssq8[5] = ssq5;
+            float ssq_5 = 0.0f;
+            float y_40 = ((mode != 0) ? _unpack_bf16_y_5[0] * gw8[0] : _unpack_bf16_y_5[0]);
+            ssq_5 = __fmaf_rn(y_40, y_40, ssq_5);
+            float y_41 = ((mode != 0) ? _unpack_bf16_y_5[1] * gw8[1] : _unpack_bf16_y_5[1]);
+            ssq_5 = __fmaf_rn(y_41, y_41, ssq_5);
+            float y_42 = ((mode != 0) ? _unpack_bf16_y_5[2] * gw8[2] : _unpack_bf16_y_5[2]);
+            ssq_5 = __fmaf_rn(y_42, y_42, ssq_5);
+            float y_43 = ((mode != 0) ? _unpack_bf16_y_5[3] * gw8[3] : _unpack_bf16_y_5[3]);
+            ssq_5 = __fmaf_rn(y_43, y_43, ssq_5);
+            float y_44 = ((mode != 0) ? _unpack_bf16_y_5[4] * gw8[4] : _unpack_bf16_y_5[4]);
+            ssq_5 = __fmaf_rn(y_44, y_44, ssq_5);
+            float y_45 = ((mode != 0) ? _unpack_bf16_y_5[5] * gw8[5] : _unpack_bf16_y_5[5]);
+            ssq_5 = __fmaf_rn(y_45, y_45, ssq_5);
+            float y_46 = ((mode != 0) ? _unpack_bf16_y_5[6] * gw8[6] : _unpack_bf16_y_5[6]);
+            ssq_5 = __fmaf_rn(y_46, y_46, ssq_5);
+            float y_47 = ((mode != 0) ? _unpack_bf16_y_5[7] * gw8[7] : _unpack_bf16_y_5[7]);
+            ssq_5 = __fmaf_rn(y_47, y_47, ssq_5);
+            ssq8[5] = ssq_5;
             {
                 auto _gst_62 = push_local + (src + 163840);
                 __builtin_assume(__isGlobal(_gst_62));
@@ -2273,6 +2273,120 @@ kernel_cake_tp_moe_finalize_rmsnorm_6d4722f3bbbeb033a812(__nv_bfloat16* __restri
                 (((_sysv_poll_group_6[30] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll_group_6[30] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll_group_6[31] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll_group_6[31] >> 16) & 0xffffu) == 0x8000u)
             );
             float s8_6[8];
+            float _unpack_bf16_50[8];
+            #pragma unroll
+            for (int _pair = 0; _pair < 4; _pair++) {
+                asm volatile(
+                    "{\n\t"
+                    "shl.b32 %0, %2, 16;\n\t"
+                    "and.b32 %1, %2, 0xffff0000;\n\t"
+                    "}\n"
+                    : "=f"((&_unpack_bf16_50[_pair * 2])[0]), "=f"((&_unpack_bf16_50[_pair * 2])[1])
+                    : "r"(_sysv_poll_group_6[_pair]));
+            }
+            s8_6[0] = _unpack_bf16_50[0];
+            s8_6[1] = _unpack_bf16_50[1];
+            s8_6[2] = _unpack_bf16_50[2];
+            s8_6[3] = _unpack_bf16_50[3];
+            s8_6[4] = _unpack_bf16_50[4];
+            s8_6[5] = _unpack_bf16_50[5];
+            s8_6[6] = _unpack_bf16_50[6];
+            s8_6[7] = _unpack_bf16_50[7];
+            float _unpack_bf16_51[8];
+            #pragma unroll
+            for (int _pair = 0; _pair < 4; _pair++) {
+                asm volatile(
+                    "{\n\t"
+                    "shl.b32 %0, %2, 16;\n\t"
+                    "and.b32 %1, %2, 0xffff0000;\n\t"
+                    "}\n"
+                    : "=f"((&_unpack_bf16_51[_pair * 2])[0]), "=f"((&_unpack_bf16_51[_pair * 2])[1])
+                    : "r"(_sysv_poll_group_6[4 + _pair]));
+            }
+            s8_6[0] = s8_6[0] + _unpack_bf16_51[0];
+            s8_6[1] = s8_6[1] + _unpack_bf16_51[1];
+            s8_6[2] = s8_6[2] + _unpack_bf16_51[2];
+            s8_6[3] = s8_6[3] + _unpack_bf16_51[3];
+            s8_6[4] = s8_6[4] + _unpack_bf16_51[4];
+            s8_6[5] = s8_6[5] + _unpack_bf16_51[5];
+            s8_6[6] = s8_6[6] + _unpack_bf16_51[6];
+            s8_6[7] = s8_6[7] + _unpack_bf16_51[7];
+            float _unpack_bf16_52[8];
+            #pragma unroll
+            for (int _pair = 0; _pair < 4; _pair++) {
+                asm volatile(
+                    "{\n\t"
+                    "shl.b32 %0, %2, 16;\n\t"
+                    "and.b32 %1, %2, 0xffff0000;\n\t"
+                    "}\n"
+                    : "=f"((&_unpack_bf16_52[_pair * 2])[0]), "=f"((&_unpack_bf16_52[_pair * 2])[1])
+                    : "r"(_sysv_poll_group_6[8 + _pair]));
+            }
+            s8_6[0] = s8_6[0] + _unpack_bf16_52[0];
+            s8_6[1] = s8_6[1] + _unpack_bf16_52[1];
+            s8_6[2] = s8_6[2] + _unpack_bf16_52[2];
+            s8_6[3] = s8_6[3] + _unpack_bf16_52[3];
+            s8_6[4] = s8_6[4] + _unpack_bf16_52[4];
+            s8_6[5] = s8_6[5] + _unpack_bf16_52[5];
+            s8_6[6] = s8_6[6] + _unpack_bf16_52[6];
+            s8_6[7] = s8_6[7] + _unpack_bf16_52[7];
+            float _unpack_bf16_53[8];
+            #pragma unroll
+            for (int _pair = 0; _pair < 4; _pair++) {
+                asm volatile(
+                    "{\n\t"
+                    "shl.b32 %0, %2, 16;\n\t"
+                    "and.b32 %1, %2, 0xffff0000;\n\t"
+                    "}\n"
+                    : "=f"((&_unpack_bf16_53[_pair * 2])[0]), "=f"((&_unpack_bf16_53[_pair * 2])[1])
+                    : "r"(_sysv_poll_group_6[12 + _pair]));
+            }
+            s8_6[0] = s8_6[0] + _unpack_bf16_53[0];
+            s8_6[1] = s8_6[1] + _unpack_bf16_53[1];
+            s8_6[2] = s8_6[2] + _unpack_bf16_53[2];
+            s8_6[3] = s8_6[3] + _unpack_bf16_53[3];
+            s8_6[4] = s8_6[4] + _unpack_bf16_53[4];
+            s8_6[5] = s8_6[5] + _unpack_bf16_53[5];
+            s8_6[6] = s8_6[6] + _unpack_bf16_53[6];
+            s8_6[7] = s8_6[7] + _unpack_bf16_53[7];
+            float _unpack_bf16_54[8];
+            #pragma unroll
+            for (int _pair = 0; _pair < 4; _pair++) {
+                asm volatile(
+                    "{\n\t"
+                    "shl.b32 %0, %2, 16;\n\t"
+                    "and.b32 %1, %2, 0xffff0000;\n\t"
+                    "}\n"
+                    : "=f"((&_unpack_bf16_54[_pair * 2])[0]), "=f"((&_unpack_bf16_54[_pair * 2])[1])
+                    : "r"(_sysv_poll_group_6[16 + _pair]));
+            }
+            s8_6[0] = s8_6[0] + _unpack_bf16_54[0];
+            s8_6[1] = s8_6[1] + _unpack_bf16_54[1];
+            s8_6[2] = s8_6[2] + _unpack_bf16_54[2];
+            s8_6[3] = s8_6[3] + _unpack_bf16_54[3];
+            s8_6[4] = s8_6[4] + _unpack_bf16_54[4];
+            s8_6[5] = s8_6[5] + _unpack_bf16_54[5];
+            s8_6[6] = s8_6[6] + _unpack_bf16_54[6];
+            s8_6[7] = s8_6[7] + _unpack_bf16_54[7];
+            float _unpack_bf16_55[8];
+            #pragma unroll
+            for (int _pair = 0; _pair < 4; _pair++) {
+                asm volatile(
+                    "{\n\t"
+                    "shl.b32 %0, %2, 16;\n\t"
+                    "and.b32 %1, %2, 0xffff0000;\n\t"
+                    "}\n"
+                    : "=f"((&_unpack_bf16_55[_pair * 2])[0]), "=f"((&_unpack_bf16_55[_pair * 2])[1])
+                    : "r"(_sysv_poll_group_6[20 + _pair]));
+            }
+            s8_6[0] = s8_6[0] + _unpack_bf16_55[0];
+            s8_6[1] = s8_6[1] + _unpack_bf16_55[1];
+            s8_6[2] = s8_6[2] + _unpack_bf16_55[2];
+            s8_6[3] = s8_6[3] + _unpack_bf16_55[3];
+            s8_6[4] = s8_6[4] + _unpack_bf16_55[4];
+            s8_6[5] = s8_6[5] + _unpack_bf16_55[5];
+            s8_6[6] = s8_6[6] + _unpack_bf16_55[6];
+            s8_6[7] = s8_6[7] + _unpack_bf16_55[7];
             float _unpack_bf16_56[8];
             #pragma unroll
             for (int _pair = 0; _pair < 4; _pair++) {
@@ -2282,16 +2396,16 @@ kernel_cake_tp_moe_finalize_rmsnorm_6d4722f3bbbeb033a812(__nv_bfloat16* __restri
                     "and.b32 %1, %2, 0xffff0000;\n\t"
                     "}\n"
                     : "=f"((&_unpack_bf16_56[_pair * 2])[0]), "=f"((&_unpack_bf16_56[_pair * 2])[1])
-                    : "r"(_sysv_poll_group_6[_pair]));
+                    : "r"(_sysv_poll_group_6[24 + _pair]));
             }
-            s8_6[0] = _unpack_bf16_56[0];
-            s8_6[1] = _unpack_bf16_56[1];
-            s8_6[2] = _unpack_bf16_56[2];
-            s8_6[3] = _unpack_bf16_56[3];
-            s8_6[4] = _unpack_bf16_56[4];
-            s8_6[5] = _unpack_bf16_56[5];
-            s8_6[6] = _unpack_bf16_56[6];
-            s8_6[7] = _unpack_bf16_56[7];
+            s8_6[0] = s8_6[0] + _unpack_bf16_56[0];
+            s8_6[1] = s8_6[1] + _unpack_bf16_56[1];
+            s8_6[2] = s8_6[2] + _unpack_bf16_56[2];
+            s8_6[3] = s8_6[3] + _unpack_bf16_56[3];
+            s8_6[4] = s8_6[4] + _unpack_bf16_56[4];
+            s8_6[5] = s8_6[5] + _unpack_bf16_56[5];
+            s8_6[6] = s8_6[6] + _unpack_bf16_56[6];
+            s8_6[7] = s8_6[7] + _unpack_bf16_56[7];
             float _unpack_bf16_57[8];
             #pragma unroll
             for (int _pair = 0; _pair < 4; _pair++) {
@@ -2301,7 +2415,7 @@ kernel_cake_tp_moe_finalize_rmsnorm_6d4722f3bbbeb033a812(__nv_bfloat16* __restri
                     "and.b32 %1, %2, 0xffff0000;\n\t"
                     "}\n"
                     : "=f"((&_unpack_bf16_57[_pair * 2])[0]), "=f"((&_unpack_bf16_57[_pair * 2])[1])
-                    : "r"(_sysv_poll_group_6[4 + _pair]));
+                    : "r"(_sysv_poll_group_6[28 + _pair]));
             }
             s8_6[0] = s8_6[0] + _unpack_bf16_57[0];
             s8_6[1] = s8_6[1] + _unpack_bf16_57[1];
@@ -2311,131 +2425,17 @@ kernel_cake_tp_moe_finalize_rmsnorm_6d4722f3bbbeb033a812(__nv_bfloat16* __restri
             s8_6[5] = s8_6[5] + _unpack_bf16_57[5];
             s8_6[6] = s8_6[6] + _unpack_bf16_57[6];
             s8_6[7] = s8_6[7] + _unpack_bf16_57[7];
-            float _unpack_bf16_58[8];
-            #pragma unroll
-            for (int _pair = 0; _pair < 4; _pair++) {
-                asm volatile(
-                    "{\n\t"
-                    "shl.b32 %0, %2, 16;\n\t"
-                    "and.b32 %1, %2, 0xffff0000;\n\t"
-                    "}\n"
-                    : "=f"((&_unpack_bf16_58[_pair * 2])[0]), "=f"((&_unpack_bf16_58[_pair * 2])[1])
-                    : "r"(_sysv_poll_group_6[8 + _pair]));
-            }
-            s8_6[0] = s8_6[0] + _unpack_bf16_58[0];
-            s8_6[1] = s8_6[1] + _unpack_bf16_58[1];
-            s8_6[2] = s8_6[2] + _unpack_bf16_58[2];
-            s8_6[3] = s8_6[3] + _unpack_bf16_58[3];
-            s8_6[4] = s8_6[4] + _unpack_bf16_58[4];
-            s8_6[5] = s8_6[5] + _unpack_bf16_58[5];
-            s8_6[6] = s8_6[6] + _unpack_bf16_58[6];
-            s8_6[7] = s8_6[7] + _unpack_bf16_58[7];
-            float _unpack_bf16_59[8];
-            #pragma unroll
-            for (int _pair = 0; _pair < 4; _pair++) {
-                asm volatile(
-                    "{\n\t"
-                    "shl.b32 %0, %2, 16;\n\t"
-                    "and.b32 %1, %2, 0xffff0000;\n\t"
-                    "}\n"
-                    : "=f"((&_unpack_bf16_59[_pair * 2])[0]), "=f"((&_unpack_bf16_59[_pair * 2])[1])
-                    : "r"(_sysv_poll_group_6[12 + _pair]));
-            }
-            s8_6[0] = s8_6[0] + _unpack_bf16_59[0];
-            s8_6[1] = s8_6[1] + _unpack_bf16_59[1];
-            s8_6[2] = s8_6[2] + _unpack_bf16_59[2];
-            s8_6[3] = s8_6[3] + _unpack_bf16_59[3];
-            s8_6[4] = s8_6[4] + _unpack_bf16_59[4];
-            s8_6[5] = s8_6[5] + _unpack_bf16_59[5];
-            s8_6[6] = s8_6[6] + _unpack_bf16_59[6];
-            s8_6[7] = s8_6[7] + _unpack_bf16_59[7];
-            float _unpack_bf16_60[8];
-            #pragma unroll
-            for (int _pair = 0; _pair < 4; _pair++) {
-                asm volatile(
-                    "{\n\t"
-                    "shl.b32 %0, %2, 16;\n\t"
-                    "and.b32 %1, %2, 0xffff0000;\n\t"
-                    "}\n"
-                    : "=f"((&_unpack_bf16_60[_pair * 2])[0]), "=f"((&_unpack_bf16_60[_pair * 2])[1])
-                    : "r"(_sysv_poll_group_6[16 + _pair]));
-            }
-            s8_6[0] = s8_6[0] + _unpack_bf16_60[0];
-            s8_6[1] = s8_6[1] + _unpack_bf16_60[1];
-            s8_6[2] = s8_6[2] + _unpack_bf16_60[2];
-            s8_6[3] = s8_6[3] + _unpack_bf16_60[3];
-            s8_6[4] = s8_6[4] + _unpack_bf16_60[4];
-            s8_6[5] = s8_6[5] + _unpack_bf16_60[5];
-            s8_6[6] = s8_6[6] + _unpack_bf16_60[6];
-            s8_6[7] = s8_6[7] + _unpack_bf16_60[7];
-            float _unpack_bf16_61[8];
-            #pragma unroll
-            for (int _pair = 0; _pair < 4; _pair++) {
-                asm volatile(
-                    "{\n\t"
-                    "shl.b32 %0, %2, 16;\n\t"
-                    "and.b32 %1, %2, 0xffff0000;\n\t"
-                    "}\n"
-                    : "=f"((&_unpack_bf16_61[_pair * 2])[0]), "=f"((&_unpack_bf16_61[_pair * 2])[1])
-                    : "r"(_sysv_poll_group_6[20 + _pair]));
-            }
-            s8_6[0] = s8_6[0] + _unpack_bf16_61[0];
-            s8_6[1] = s8_6[1] + _unpack_bf16_61[1];
-            s8_6[2] = s8_6[2] + _unpack_bf16_61[2];
-            s8_6[3] = s8_6[3] + _unpack_bf16_61[3];
-            s8_6[4] = s8_6[4] + _unpack_bf16_61[4];
-            s8_6[5] = s8_6[5] + _unpack_bf16_61[5];
-            s8_6[6] = s8_6[6] + _unpack_bf16_61[6];
-            s8_6[7] = s8_6[7] + _unpack_bf16_61[7];
-            float _unpack_bf16_62[8];
-            #pragma unroll
-            for (int _pair = 0; _pair < 4; _pair++) {
-                asm volatile(
-                    "{\n\t"
-                    "shl.b32 %0, %2, 16;\n\t"
-                    "and.b32 %1, %2, 0xffff0000;\n\t"
-                    "}\n"
-                    : "=f"((&_unpack_bf16_62[_pair * 2])[0]), "=f"((&_unpack_bf16_62[_pair * 2])[1])
-                    : "r"(_sysv_poll_group_6[24 + _pair]));
-            }
-            s8_6[0] = s8_6[0] + _unpack_bf16_62[0];
-            s8_6[1] = s8_6[1] + _unpack_bf16_62[1];
-            s8_6[2] = s8_6[2] + _unpack_bf16_62[2];
-            s8_6[3] = s8_6[3] + _unpack_bf16_62[3];
-            s8_6[4] = s8_6[4] + _unpack_bf16_62[4];
-            s8_6[5] = s8_6[5] + _unpack_bf16_62[5];
-            s8_6[6] = s8_6[6] + _unpack_bf16_62[6];
-            s8_6[7] = s8_6[7] + _unpack_bf16_62[7];
-            float _unpack_bf16_63[8];
-            #pragma unroll
-            for (int _pair = 0; _pair < 4; _pair++) {
-                asm volatile(
-                    "{\n\t"
-                    "shl.b32 %0, %2, 16;\n\t"
-                    "and.b32 %1, %2, 0xffff0000;\n\t"
-                    "}\n"
-                    : "=f"((&_unpack_bf16_63[_pair * 2])[0]), "=f"((&_unpack_bf16_63[_pair * 2])[1])
-                    : "r"(_sysv_poll_group_6[28 + _pair]));
-            }
-            s8_6[0] = s8_6[0] + _unpack_bf16_63[0];
-            s8_6[1] = s8_6[1] + _unpack_bf16_63[1];
-            s8_6[2] = s8_6[2] + _unpack_bf16_63[2];
-            s8_6[3] = s8_6[3] + _unpack_bf16_63[3];
-            s8_6[4] = s8_6[4] + _unpack_bf16_63[4];
-            s8_6[5] = s8_6[5] + _unpack_bf16_63[5];
-            s8_6[6] = s8_6[6] + _unpack_bf16_63[6];
-            s8_6[7] = s8_6[7] + _unpack_bf16_63[7];
-            unsigned int s8_6_bf16[4];
+            unsigned int s8_bf16_6[4];
             #pragma unroll
             for (int _lp = 0; _lp < 4; _lp++) {
                 __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(s8_6[_lp*2 + 0], s8_6[_lp*2+1 + 0]));
-                s8_6_bf16[_lp] = *(uint32_t*)&_bf2;
+                s8_bf16_6[_lp] = *(uint32_t*)&_bf2;
             }
-            rw[24] = s8_6_bf16[0];
-            rw[25] = s8_6_bf16[1];
-            rw[26] = s8_6_bf16[2];
-            rw[27] = s8_6_bf16[3];
-            float _unpack_bf16_64[8];
+            rw[24] = s8_bf16_6[0];
+            rw[25] = s8_bf16_6[1];
+            rw[26] = s8_bf16_6[2];
+            rw[27] = s8_bf16_6[3];
+            float _unpack_bf16_y_6[8];
             #pragma unroll
             for (int _pair = 0; _pair < 4; _pair++) {
                 asm volatile(
@@ -2443,27 +2443,27 @@ kernel_cake_tp_moe_finalize_rmsnorm_6d4722f3bbbeb033a812(__nv_bfloat16* __restri
                     "shl.b32 %0, %2, 16;\n\t"
                     "and.b32 %1, %2, 0xffff0000;\n\t"
                     "}\n"
-                    : "=f"((&_unpack_bf16_64[_pair * 2])[0]), "=f"((&_unpack_bf16_64[_pair * 2])[1])
-                    : "r"(s8_6_bf16[_pair]));
+                    : "=f"((&_unpack_bf16_y_6[_pair * 2])[0]), "=f"((&_unpack_bf16_y_6[_pair * 2])[1])
+                    : "r"(s8_bf16_6[_pair]));
             }
-            float ssq6 = 0.0f;
-            float y6_0 = ((mode != 0) ? _unpack_bf16_64[0] * gw8[0] : _unpack_bf16_64[0]);
-            ssq6 = __fmaf_rn(y6_0, y6_0, ssq6);
-            float y6_1 = ((mode != 0) ? _unpack_bf16_64[1] * gw8[1] : _unpack_bf16_64[1]);
-            ssq6 = __fmaf_rn(y6_1, y6_1, ssq6);
-            float y6_2 = ((mode != 0) ? _unpack_bf16_64[2] * gw8[2] : _unpack_bf16_64[2]);
-            ssq6 = __fmaf_rn(y6_2, y6_2, ssq6);
-            float y6_3 = ((mode != 0) ? _unpack_bf16_64[3] * gw8[3] : _unpack_bf16_64[3]);
-            ssq6 = __fmaf_rn(y6_3, y6_3, ssq6);
-            float y6_4 = ((mode != 0) ? _unpack_bf16_64[4] * gw8[4] : _unpack_bf16_64[4]);
-            ssq6 = __fmaf_rn(y6_4, y6_4, ssq6);
-            float y6_5 = ((mode != 0) ? _unpack_bf16_64[5] * gw8[5] : _unpack_bf16_64[5]);
-            ssq6 = __fmaf_rn(y6_5, y6_5, ssq6);
-            float y6_6 = ((mode != 0) ? _unpack_bf16_64[6] * gw8[6] : _unpack_bf16_64[6]);
-            ssq6 = __fmaf_rn(y6_6, y6_6, ssq6);
-            float y6_7 = ((mode != 0) ? _unpack_bf16_64[7] * gw8[7] : _unpack_bf16_64[7]);
-            ssq6 = __fmaf_rn(y6_7, y6_7, ssq6);
-            ssq8[6] = ssq6;
+            float ssq_6 = 0.0f;
+            float y_48 = ((mode != 0) ? _unpack_bf16_y_6[0] * gw8[0] : _unpack_bf16_y_6[0]);
+            ssq_6 = __fmaf_rn(y_48, y_48, ssq_6);
+            float y_49 = ((mode != 0) ? _unpack_bf16_y_6[1] * gw8[1] : _unpack_bf16_y_6[1]);
+            ssq_6 = __fmaf_rn(y_49, y_49, ssq_6);
+            float y_50 = ((mode != 0) ? _unpack_bf16_y_6[2] * gw8[2] : _unpack_bf16_y_6[2]);
+            ssq_6 = __fmaf_rn(y_50, y_50, ssq_6);
+            float y_51 = ((mode != 0) ? _unpack_bf16_y_6[3] * gw8[3] : _unpack_bf16_y_6[3]);
+            ssq_6 = __fmaf_rn(y_51, y_51, ssq_6);
+            float y_52 = ((mode != 0) ? _unpack_bf16_y_6[4] * gw8[4] : _unpack_bf16_y_6[4]);
+            ssq_6 = __fmaf_rn(y_52, y_52, ssq_6);
+            float y_53 = ((mode != 0) ? _unpack_bf16_y_6[5] * gw8[5] : _unpack_bf16_y_6[5]);
+            ssq_6 = __fmaf_rn(y_53, y_53, ssq_6);
+            float y_54 = ((mode != 0) ? _unpack_bf16_y_6[6] * gw8[6] : _unpack_bf16_y_6[6]);
+            ssq_6 = __fmaf_rn(y_54, y_54, ssq_6);
+            float y_55 = ((mode != 0) ? _unpack_bf16_y_6[7] * gw8[7] : _unpack_bf16_y_6[7]);
+            ssq_6 = __fmaf_rn(y_55, y_55, ssq_6);
+            ssq8[6] = ssq_6;
             {
                 auto _gst_70 = push_local + (src + 196608);
                 __builtin_assume(__isGlobal(_gst_70));
@@ -2533,6 +2533,139 @@ kernel_cake_tp_moe_finalize_rmsnorm_6d4722f3bbbeb033a812(__nv_bfloat16* __restri
                 (((_sysv_poll_group_7[30] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll_group_7[30] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll_group_7[31] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll_group_7[31] >> 16) & 0xffffu) == 0x8000u)
             );
             float s8_7[8];
+            float _unpack_bf16_58[8];
+            #pragma unroll
+            for (int _pair = 0; _pair < 4; _pair++) {
+                asm volatile(
+                    "{\n\t"
+                    "shl.b32 %0, %2, 16;\n\t"
+                    "and.b32 %1, %2, 0xffff0000;\n\t"
+                    "}\n"
+                    : "=f"((&_unpack_bf16_58[_pair * 2])[0]), "=f"((&_unpack_bf16_58[_pair * 2])[1])
+                    : "r"(_sysv_poll_group_7[_pair]));
+            }
+            s8_7[0] = _unpack_bf16_58[0];
+            s8_7[1] = _unpack_bf16_58[1];
+            s8_7[2] = _unpack_bf16_58[2];
+            s8_7[3] = _unpack_bf16_58[3];
+            s8_7[4] = _unpack_bf16_58[4];
+            s8_7[5] = _unpack_bf16_58[5];
+            s8_7[6] = _unpack_bf16_58[6];
+            s8_7[7] = _unpack_bf16_58[7];
+            float _unpack_bf16_59[8];
+            #pragma unroll
+            for (int _pair = 0; _pair < 4; _pair++) {
+                asm volatile(
+                    "{\n\t"
+                    "shl.b32 %0, %2, 16;\n\t"
+                    "and.b32 %1, %2, 0xffff0000;\n\t"
+                    "}\n"
+                    : "=f"((&_unpack_bf16_59[_pair * 2])[0]), "=f"((&_unpack_bf16_59[_pair * 2])[1])
+                    : "r"(_sysv_poll_group_7[4 + _pair]));
+            }
+            s8_7[0] = s8_7[0] + _unpack_bf16_59[0];
+            s8_7[1] = s8_7[1] + _unpack_bf16_59[1];
+            s8_7[2] = s8_7[2] + _unpack_bf16_59[2];
+            s8_7[3] = s8_7[3] + _unpack_bf16_59[3];
+            s8_7[4] = s8_7[4] + _unpack_bf16_59[4];
+            s8_7[5] = s8_7[5] + _unpack_bf16_59[5];
+            s8_7[6] = s8_7[6] + _unpack_bf16_59[6];
+            s8_7[7] = s8_7[7] + _unpack_bf16_59[7];
+            float _unpack_bf16_60[8];
+            #pragma unroll
+            for (int _pair = 0; _pair < 4; _pair++) {
+                asm volatile(
+                    "{\n\t"
+                    "shl.b32 %0, %2, 16;\n\t"
+                    "and.b32 %1, %2, 0xffff0000;\n\t"
+                    "}\n"
+                    : "=f"((&_unpack_bf16_60[_pair * 2])[0]), "=f"((&_unpack_bf16_60[_pair * 2])[1])
+                    : "r"(_sysv_poll_group_7[8 + _pair]));
+            }
+            s8_7[0] = s8_7[0] + _unpack_bf16_60[0];
+            s8_7[1] = s8_7[1] + _unpack_bf16_60[1];
+            s8_7[2] = s8_7[2] + _unpack_bf16_60[2];
+            s8_7[3] = s8_7[3] + _unpack_bf16_60[3];
+            s8_7[4] = s8_7[4] + _unpack_bf16_60[4];
+            s8_7[5] = s8_7[5] + _unpack_bf16_60[5];
+            s8_7[6] = s8_7[6] + _unpack_bf16_60[6];
+            s8_7[7] = s8_7[7] + _unpack_bf16_60[7];
+            float _unpack_bf16_61[8];
+            #pragma unroll
+            for (int _pair = 0; _pair < 4; _pair++) {
+                asm volatile(
+                    "{\n\t"
+                    "shl.b32 %0, %2, 16;\n\t"
+                    "and.b32 %1, %2, 0xffff0000;\n\t"
+                    "}\n"
+                    : "=f"((&_unpack_bf16_61[_pair * 2])[0]), "=f"((&_unpack_bf16_61[_pair * 2])[1])
+                    : "r"(_sysv_poll_group_7[12 + _pair]));
+            }
+            s8_7[0] = s8_7[0] + _unpack_bf16_61[0];
+            s8_7[1] = s8_7[1] + _unpack_bf16_61[1];
+            s8_7[2] = s8_7[2] + _unpack_bf16_61[2];
+            s8_7[3] = s8_7[3] + _unpack_bf16_61[3];
+            s8_7[4] = s8_7[4] + _unpack_bf16_61[4];
+            s8_7[5] = s8_7[5] + _unpack_bf16_61[5];
+            s8_7[6] = s8_7[6] + _unpack_bf16_61[6];
+            s8_7[7] = s8_7[7] + _unpack_bf16_61[7];
+            float _unpack_bf16_62[8];
+            #pragma unroll
+            for (int _pair = 0; _pair < 4; _pair++) {
+                asm volatile(
+                    "{\n\t"
+                    "shl.b32 %0, %2, 16;\n\t"
+                    "and.b32 %1, %2, 0xffff0000;\n\t"
+                    "}\n"
+                    : "=f"((&_unpack_bf16_62[_pair * 2])[0]), "=f"((&_unpack_bf16_62[_pair * 2])[1])
+                    : "r"(_sysv_poll_group_7[16 + _pair]));
+            }
+            s8_7[0] = s8_7[0] + _unpack_bf16_62[0];
+            s8_7[1] = s8_7[1] + _unpack_bf16_62[1];
+            s8_7[2] = s8_7[2] + _unpack_bf16_62[2];
+            s8_7[3] = s8_7[3] + _unpack_bf16_62[3];
+            s8_7[4] = s8_7[4] + _unpack_bf16_62[4];
+            s8_7[5] = s8_7[5] + _unpack_bf16_62[5];
+            s8_7[6] = s8_7[6] + _unpack_bf16_62[6];
+            s8_7[7] = s8_7[7] + _unpack_bf16_62[7];
+            float _unpack_bf16_63[8];
+            #pragma unroll
+            for (int _pair = 0; _pair < 4; _pair++) {
+                asm volatile(
+                    "{\n\t"
+                    "shl.b32 %0, %2, 16;\n\t"
+                    "and.b32 %1, %2, 0xffff0000;\n\t"
+                    "}\n"
+                    : "=f"((&_unpack_bf16_63[_pair * 2])[0]), "=f"((&_unpack_bf16_63[_pair * 2])[1])
+                    : "r"(_sysv_poll_group_7[20 + _pair]));
+            }
+            s8_7[0] = s8_7[0] + _unpack_bf16_63[0];
+            s8_7[1] = s8_7[1] + _unpack_bf16_63[1];
+            s8_7[2] = s8_7[2] + _unpack_bf16_63[2];
+            s8_7[3] = s8_7[3] + _unpack_bf16_63[3];
+            s8_7[4] = s8_7[4] + _unpack_bf16_63[4];
+            s8_7[5] = s8_7[5] + _unpack_bf16_63[5];
+            s8_7[6] = s8_7[6] + _unpack_bf16_63[6];
+            s8_7[7] = s8_7[7] + _unpack_bf16_63[7];
+            float _unpack_bf16_64[8];
+            #pragma unroll
+            for (int _pair = 0; _pair < 4; _pair++) {
+                asm volatile(
+                    "{\n\t"
+                    "shl.b32 %0, %2, 16;\n\t"
+                    "and.b32 %1, %2, 0xffff0000;\n\t"
+                    "}\n"
+                    : "=f"((&_unpack_bf16_64[_pair * 2])[0]), "=f"((&_unpack_bf16_64[_pair * 2])[1])
+                    : "r"(_sysv_poll_group_7[24 + _pair]));
+            }
+            s8_7[0] = s8_7[0] + _unpack_bf16_64[0];
+            s8_7[1] = s8_7[1] + _unpack_bf16_64[1];
+            s8_7[2] = s8_7[2] + _unpack_bf16_64[2];
+            s8_7[3] = s8_7[3] + _unpack_bf16_64[3];
+            s8_7[4] = s8_7[4] + _unpack_bf16_64[4];
+            s8_7[5] = s8_7[5] + _unpack_bf16_64[5];
+            s8_7[6] = s8_7[6] + _unpack_bf16_64[6];
+            s8_7[7] = s8_7[7] + _unpack_bf16_64[7];
             float _unpack_bf16_65[8];
             #pragma unroll
             for (int _pair = 0; _pair < 4; _pair++) {
@@ -2542,160 +2675,27 @@ kernel_cake_tp_moe_finalize_rmsnorm_6d4722f3bbbeb033a812(__nv_bfloat16* __restri
                     "and.b32 %1, %2, 0xffff0000;\n\t"
                     "}\n"
                     : "=f"((&_unpack_bf16_65[_pair * 2])[0]), "=f"((&_unpack_bf16_65[_pair * 2])[1])
-                    : "r"(_sysv_poll_group_7[_pair]));
-            }
-            s8_7[0] = _unpack_bf16_65[0];
-            s8_7[1] = _unpack_bf16_65[1];
-            s8_7[2] = _unpack_bf16_65[2];
-            s8_7[3] = _unpack_bf16_65[3];
-            s8_7[4] = _unpack_bf16_65[4];
-            s8_7[5] = _unpack_bf16_65[5];
-            s8_7[6] = _unpack_bf16_65[6];
-            s8_7[7] = _unpack_bf16_65[7];
-            float _unpack_bf16_66[8];
-            #pragma unroll
-            for (int _pair = 0; _pair < 4; _pair++) {
-                asm volatile(
-                    "{\n\t"
-                    "shl.b32 %0, %2, 16;\n\t"
-                    "and.b32 %1, %2, 0xffff0000;\n\t"
-                    "}\n"
-                    : "=f"((&_unpack_bf16_66[_pair * 2])[0]), "=f"((&_unpack_bf16_66[_pair * 2])[1])
-                    : "r"(_sysv_poll_group_7[4 + _pair]));
-            }
-            s8_7[0] = s8_7[0] + _unpack_bf16_66[0];
-            s8_7[1] = s8_7[1] + _unpack_bf16_66[1];
-            s8_7[2] = s8_7[2] + _unpack_bf16_66[2];
-            s8_7[3] = s8_7[3] + _unpack_bf16_66[3];
-            s8_7[4] = s8_7[4] + _unpack_bf16_66[4];
-            s8_7[5] = s8_7[5] + _unpack_bf16_66[5];
-            s8_7[6] = s8_7[6] + _unpack_bf16_66[6];
-            s8_7[7] = s8_7[7] + _unpack_bf16_66[7];
-            float _unpack_bf16_67[8];
-            #pragma unroll
-            for (int _pair = 0; _pair < 4; _pair++) {
-                asm volatile(
-                    "{\n\t"
-                    "shl.b32 %0, %2, 16;\n\t"
-                    "and.b32 %1, %2, 0xffff0000;\n\t"
-                    "}\n"
-                    : "=f"((&_unpack_bf16_67[_pair * 2])[0]), "=f"((&_unpack_bf16_67[_pair * 2])[1])
-                    : "r"(_sysv_poll_group_7[8 + _pair]));
-            }
-            s8_7[0] = s8_7[0] + _unpack_bf16_67[0];
-            s8_7[1] = s8_7[1] + _unpack_bf16_67[1];
-            s8_7[2] = s8_7[2] + _unpack_bf16_67[2];
-            s8_7[3] = s8_7[3] + _unpack_bf16_67[3];
-            s8_7[4] = s8_7[4] + _unpack_bf16_67[4];
-            s8_7[5] = s8_7[5] + _unpack_bf16_67[5];
-            s8_7[6] = s8_7[6] + _unpack_bf16_67[6];
-            s8_7[7] = s8_7[7] + _unpack_bf16_67[7];
-            float _unpack_bf16_68[8];
-            #pragma unroll
-            for (int _pair = 0; _pair < 4; _pair++) {
-                asm volatile(
-                    "{\n\t"
-                    "shl.b32 %0, %2, 16;\n\t"
-                    "and.b32 %1, %2, 0xffff0000;\n\t"
-                    "}\n"
-                    : "=f"((&_unpack_bf16_68[_pair * 2])[0]), "=f"((&_unpack_bf16_68[_pair * 2])[1])
-                    : "r"(_sysv_poll_group_7[12 + _pair]));
-            }
-            s8_7[0] = s8_7[0] + _unpack_bf16_68[0];
-            s8_7[1] = s8_7[1] + _unpack_bf16_68[1];
-            s8_7[2] = s8_7[2] + _unpack_bf16_68[2];
-            s8_7[3] = s8_7[3] + _unpack_bf16_68[3];
-            s8_7[4] = s8_7[4] + _unpack_bf16_68[4];
-            s8_7[5] = s8_7[5] + _unpack_bf16_68[5];
-            s8_7[6] = s8_7[6] + _unpack_bf16_68[6];
-            s8_7[7] = s8_7[7] + _unpack_bf16_68[7];
-            float _unpack_bf16_69[8];
-            #pragma unroll
-            for (int _pair = 0; _pair < 4; _pair++) {
-                asm volatile(
-                    "{\n\t"
-                    "shl.b32 %0, %2, 16;\n\t"
-                    "and.b32 %1, %2, 0xffff0000;\n\t"
-                    "}\n"
-                    : "=f"((&_unpack_bf16_69[_pair * 2])[0]), "=f"((&_unpack_bf16_69[_pair * 2])[1])
-                    : "r"(_sysv_poll_group_7[16 + _pair]));
-            }
-            s8_7[0] = s8_7[0] + _unpack_bf16_69[0];
-            s8_7[1] = s8_7[1] + _unpack_bf16_69[1];
-            s8_7[2] = s8_7[2] + _unpack_bf16_69[2];
-            s8_7[3] = s8_7[3] + _unpack_bf16_69[3];
-            s8_7[4] = s8_7[4] + _unpack_bf16_69[4];
-            s8_7[5] = s8_7[5] + _unpack_bf16_69[5];
-            s8_7[6] = s8_7[6] + _unpack_bf16_69[6];
-            s8_7[7] = s8_7[7] + _unpack_bf16_69[7];
-            float _unpack_bf16_70[8];
-            #pragma unroll
-            for (int _pair = 0; _pair < 4; _pair++) {
-                asm volatile(
-                    "{\n\t"
-                    "shl.b32 %0, %2, 16;\n\t"
-                    "and.b32 %1, %2, 0xffff0000;\n\t"
-                    "}\n"
-                    : "=f"((&_unpack_bf16_70[_pair * 2])[0]), "=f"((&_unpack_bf16_70[_pair * 2])[1])
-                    : "r"(_sysv_poll_group_7[20 + _pair]));
-            }
-            s8_7[0] = s8_7[0] + _unpack_bf16_70[0];
-            s8_7[1] = s8_7[1] + _unpack_bf16_70[1];
-            s8_7[2] = s8_7[2] + _unpack_bf16_70[2];
-            s8_7[3] = s8_7[3] + _unpack_bf16_70[3];
-            s8_7[4] = s8_7[4] + _unpack_bf16_70[4];
-            s8_7[5] = s8_7[5] + _unpack_bf16_70[5];
-            s8_7[6] = s8_7[6] + _unpack_bf16_70[6];
-            s8_7[7] = s8_7[7] + _unpack_bf16_70[7];
-            float _unpack_bf16_71[8];
-            #pragma unroll
-            for (int _pair = 0; _pair < 4; _pair++) {
-                asm volatile(
-                    "{\n\t"
-                    "shl.b32 %0, %2, 16;\n\t"
-                    "and.b32 %1, %2, 0xffff0000;\n\t"
-                    "}\n"
-                    : "=f"((&_unpack_bf16_71[_pair * 2])[0]), "=f"((&_unpack_bf16_71[_pair * 2])[1])
-                    : "r"(_sysv_poll_group_7[24 + _pair]));
-            }
-            s8_7[0] = s8_7[0] + _unpack_bf16_71[0];
-            s8_7[1] = s8_7[1] + _unpack_bf16_71[1];
-            s8_7[2] = s8_7[2] + _unpack_bf16_71[2];
-            s8_7[3] = s8_7[3] + _unpack_bf16_71[3];
-            s8_7[4] = s8_7[4] + _unpack_bf16_71[4];
-            s8_7[5] = s8_7[5] + _unpack_bf16_71[5];
-            s8_7[6] = s8_7[6] + _unpack_bf16_71[6];
-            s8_7[7] = s8_7[7] + _unpack_bf16_71[7];
-            float _unpack_bf16_72[8];
-            #pragma unroll
-            for (int _pair = 0; _pair < 4; _pair++) {
-                asm volatile(
-                    "{\n\t"
-                    "shl.b32 %0, %2, 16;\n\t"
-                    "and.b32 %1, %2, 0xffff0000;\n\t"
-                    "}\n"
-                    : "=f"((&_unpack_bf16_72[_pair * 2])[0]), "=f"((&_unpack_bf16_72[_pair * 2])[1])
                     : "r"(_sysv_poll_group_7[28 + _pair]));
             }
-            s8_7[0] = s8_7[0] + _unpack_bf16_72[0];
-            s8_7[1] = s8_7[1] + _unpack_bf16_72[1];
-            s8_7[2] = s8_7[2] + _unpack_bf16_72[2];
-            s8_7[3] = s8_7[3] + _unpack_bf16_72[3];
-            s8_7[4] = s8_7[4] + _unpack_bf16_72[4];
-            s8_7[5] = s8_7[5] + _unpack_bf16_72[5];
-            s8_7[6] = s8_7[6] + _unpack_bf16_72[6];
-            s8_7[7] = s8_7[7] + _unpack_bf16_72[7];
-            unsigned int s8_7_bf16[4];
+            s8_7[0] = s8_7[0] + _unpack_bf16_65[0];
+            s8_7[1] = s8_7[1] + _unpack_bf16_65[1];
+            s8_7[2] = s8_7[2] + _unpack_bf16_65[2];
+            s8_7[3] = s8_7[3] + _unpack_bf16_65[3];
+            s8_7[4] = s8_7[4] + _unpack_bf16_65[4];
+            s8_7[5] = s8_7[5] + _unpack_bf16_65[5];
+            s8_7[6] = s8_7[6] + _unpack_bf16_65[6];
+            s8_7[7] = s8_7[7] + _unpack_bf16_65[7];
+            unsigned int s8_bf16_7[4];
             #pragma unroll
             for (int _lp = 0; _lp < 4; _lp++) {
                 __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(s8_7[_lp*2 + 0], s8_7[_lp*2+1 + 0]));
-                s8_7_bf16[_lp] = *(uint32_t*)&_bf2;
+                s8_bf16_7[_lp] = *(uint32_t*)&_bf2;
             }
-            rw[28] = s8_7_bf16[0];
-            rw[29] = s8_7_bf16[1];
-            rw[30] = s8_7_bf16[2];
-            rw[31] = s8_7_bf16[3];
-            float _unpack_bf16_73[8];
+            rw[28] = s8_bf16_7[0];
+            rw[29] = s8_bf16_7[1];
+            rw[30] = s8_bf16_7[2];
+            rw[31] = s8_bf16_7[3];
+            float _unpack_bf16_y_7[8];
             #pragma unroll
             for (int _pair = 0; _pair < 4; _pair++) {
                 asm volatile(
@@ -2703,27 +2703,27 @@ kernel_cake_tp_moe_finalize_rmsnorm_6d4722f3bbbeb033a812(__nv_bfloat16* __restri
                     "shl.b32 %0, %2, 16;\n\t"
                     "and.b32 %1, %2, 0xffff0000;\n\t"
                     "}\n"
-                    : "=f"((&_unpack_bf16_73[_pair * 2])[0]), "=f"((&_unpack_bf16_73[_pair * 2])[1])
-                    : "r"(s8_7_bf16[_pair]));
+                    : "=f"((&_unpack_bf16_y_7[_pair * 2])[0]), "=f"((&_unpack_bf16_y_7[_pair * 2])[1])
+                    : "r"(s8_bf16_7[_pair]));
             }
-            float ssq7 = 0.0f;
-            float y7_0 = ((mode != 0) ? _unpack_bf16_73[0] * gw8[0] : _unpack_bf16_73[0]);
-            ssq7 = __fmaf_rn(y7_0, y7_0, ssq7);
-            float y7_1 = ((mode != 0) ? _unpack_bf16_73[1] * gw8[1] : _unpack_bf16_73[1]);
-            ssq7 = __fmaf_rn(y7_1, y7_1, ssq7);
-            float y7_2 = ((mode != 0) ? _unpack_bf16_73[2] * gw8[2] : _unpack_bf16_73[2]);
-            ssq7 = __fmaf_rn(y7_2, y7_2, ssq7);
-            float y7_3 = ((mode != 0) ? _unpack_bf16_73[3] * gw8[3] : _unpack_bf16_73[3]);
-            ssq7 = __fmaf_rn(y7_3, y7_3, ssq7);
-            float y7_4 = ((mode != 0) ? _unpack_bf16_73[4] * gw8[4] : _unpack_bf16_73[4]);
-            ssq7 = __fmaf_rn(y7_4, y7_4, ssq7);
-            float y7_5 = ((mode != 0) ? _unpack_bf16_73[5] * gw8[5] : _unpack_bf16_73[5]);
-            ssq7 = __fmaf_rn(y7_5, y7_5, ssq7);
-            float y7_6 = ((mode != 0) ? _unpack_bf16_73[6] * gw8[6] : _unpack_bf16_73[6]);
-            ssq7 = __fmaf_rn(y7_6, y7_6, ssq7);
-            float y7_7 = ((mode != 0) ? _unpack_bf16_73[7] * gw8[7] : _unpack_bf16_73[7]);
-            ssq7 = __fmaf_rn(y7_7, y7_7, ssq7);
-            ssq8[7] = ssq7;
+            float ssq_7 = 0.0f;
+            float y_56 = ((mode != 0) ? _unpack_bf16_y_7[0] * gw8[0] : _unpack_bf16_y_7[0]);
+            ssq_7 = __fmaf_rn(y_56, y_56, ssq_7);
+            float y_57 = ((mode != 0) ? _unpack_bf16_y_7[1] * gw8[1] : _unpack_bf16_y_7[1]);
+            ssq_7 = __fmaf_rn(y_57, y_57, ssq_7);
+            float y_58 = ((mode != 0) ? _unpack_bf16_y_7[2] * gw8[2] : _unpack_bf16_y_7[2]);
+            ssq_7 = __fmaf_rn(y_58, y_58, ssq_7);
+            float y_59 = ((mode != 0) ? _unpack_bf16_y_7[3] * gw8[3] : _unpack_bf16_y_7[3]);
+            ssq_7 = __fmaf_rn(y_59, y_59, ssq_7);
+            float y_60 = ((mode != 0) ? _unpack_bf16_y_7[4] * gw8[4] : _unpack_bf16_y_7[4]);
+            ssq_7 = __fmaf_rn(y_60, y_60, ssq_7);
+            float y_61 = ((mode != 0) ? _unpack_bf16_y_7[5] * gw8[5] : _unpack_bf16_y_7[5]);
+            ssq_7 = __fmaf_rn(y_61, y_61, ssq_7);
+            float y_62 = ((mode != 0) ? _unpack_bf16_y_7[6] * gw8[6] : _unpack_bf16_y_7[6]);
+            ssq_7 = __fmaf_rn(y_62, y_62, ssq_7);
+            float y_63 = ((mode != 0) ? _unpack_bf16_y_7[7] * gw8[7] : _unpack_bf16_y_7[7]);
+            ssq_7 = __fmaf_rn(y_63, y_63, ssq_7);
+            ssq8[7] = ssq_7;
             {
                 auto _gst_78 = push_local + (src + 229376);
                 __builtin_assume(__isGlobal(_gst_78));
@@ -2830,26 +2830,26 @@ kernel_cake_tp_moe_finalize_rmsnorm_6d4722f3bbbeb033a812(__nv_bfloat16* __restri
             acc8[5] = 0.0f;
             acc8[6] = 0.0f;
             acc8[7] = 0.0f;
-            float tot0 = warp_tab[parity];
-            tot0 = tot0 + warp_tab[parity + 8];
-            tot0 = tot0 + warp_tab[parity + 16];
-            tot0 = tot0 + warp_tab[parity + 24];
-            tot0 = tot0 + warp_tab[parity + 32];
-            tot0 = tot0 + warp_tab[parity + 40];
-            tot0 = tot0 + warp_tab[parity + 48];
-            tot0 = tot0 + warp_tab[parity + 56];
-            tot0 = tot0 + warp_tab[parity + 64];
-            tot0 = tot0 + warp_tab[parity + 72];
-            tot0 = tot0 + warp_tab[parity + 80];
-            tot0 = tot0 + warp_tab[parity + 88];
-            tot0 = tot0 + warp_tab[parity + 96];
-            tot0 = tot0 + warp_tab[parity + 104];
-            tot0 = tot0 + warp_tab[parity + 112];
-            tot0 = tot0 + warp_tab[parity + 120];
+            float tot_0 = warp_tab[parity];
+            tot_0 = tot_0 + warp_tab[parity + 8];
+            tot_0 = tot_0 + warp_tab[parity + 16];
+            tot_0 = tot_0 + warp_tab[parity + 24];
+            tot_0 = tot_0 + warp_tab[parity + 32];
+            tot_0 = tot_0 + warp_tab[parity + 40];
+            tot_0 = tot_0 + warp_tab[parity + 48];
+            tot_0 = tot_0 + warp_tab[parity + 56];
+            tot_0 = tot_0 + warp_tab[parity + 64];
+            tot_0 = tot_0 + warp_tab[parity + 72];
+            tot_0 = tot_0 + warp_tab[parity + 80];
+            tot_0 = tot_0 + warp_tab[parity + 88];
+            tot_0 = tot_0 + warp_tab[parity + 96];
+            tot_0 = tot_0 + warp_tab[parity + 104];
+            tot_0 = tot_0 + warp_tab[parity + 112];
+            tot_0 = tot_0 + warp_tab[parity + 120];
             float _sqrt_86;
-            asm volatile("sqrt.rn.f32 %0, %1;" : "=f"(_sqrt_86) : "f"(__fmaf_rn(tot0, 0.00024414062f, eps)));
-            float rs0 = __frcp_rn(_sqrt_86);
-            float _unpack_bf16_74[8];
+            asm volatile("sqrt.rn.f32 %0, %1;" : "=f"(_sqrt_86) : "f"(__fmaf_rn(tot_0, 0.00024414062f, eps)));
+            float rs_0 = __frcp_rn(_sqrt_86);
+            float _unpack_bf16_66[8];
             #pragma unroll
             for (int _pair = 0; _pair < 4; _pair++) {
                 asm volatile(
@@ -2857,61 +2857,61 @@ kernel_cake_tp_moe_finalize_rmsnorm_6d4722f3bbbeb033a812(__nv_bfloat16* __restri
                     "shl.b32 %0, %2, 16;\n\t"
                     "and.b32 %1, %2, 0xffff0000;\n\t"
                     "}\n"
-                    : "=f"((&_unpack_bf16_74[_pair * 2])[0]), "=f"((&_unpack_bf16_74[_pair * 2])[1])
+                    : "=f"((&_unpack_bf16_66[_pair * 2])[0]), "=f"((&_unpack_bf16_66[_pair * 2])[1])
                     : "r"(rw[_pair]));
             }
-            float yn0_0 = ((mode != 0) ? _unpack_bf16_74[0] * gw8[0] : _unpack_bf16_74[0]);
-            float o0_0 = yn0_0 * rs0;
-            float o2_0_0 = ((mode != 0) ? o0_0 : o0_0 * gw8[0]);
-            acc8[0] = __fmaf_rn(o2_0_0, w8[0], acc8[0]);
-            float yn0_1 = ((mode != 0) ? _unpack_bf16_74[1] * gw8[1] : _unpack_bf16_74[1]);
-            float o0_1 = yn0_1 * rs0;
-            float o2_0_1 = ((mode != 0) ? o0_1 : o0_1 * gw8[1]);
-            acc8[1] = __fmaf_rn(o2_0_1, w8[0], acc8[1]);
-            float yn0_2 = ((mode != 0) ? _unpack_bf16_74[2] * gw8[2] : _unpack_bf16_74[2]);
-            float o0_2 = yn0_2 * rs0;
-            float o2_0_2 = ((mode != 0) ? o0_2 : o0_2 * gw8[2]);
-            acc8[2] = __fmaf_rn(o2_0_2, w8[0], acc8[2]);
-            float yn0_3 = ((mode != 0) ? _unpack_bf16_74[3] * gw8[3] : _unpack_bf16_74[3]);
-            float o0_3 = yn0_3 * rs0;
-            float o2_0_3 = ((mode != 0) ? o0_3 : o0_3 * gw8[3]);
-            acc8[3] = __fmaf_rn(o2_0_3, w8[0], acc8[3]);
-            float yn0_4 = ((mode != 0) ? _unpack_bf16_74[4] * gw8[4] : _unpack_bf16_74[4]);
-            float o0_4 = yn0_4 * rs0;
-            float o2_0_4 = ((mode != 0) ? o0_4 : o0_4 * gw8[4]);
-            acc8[4] = __fmaf_rn(o2_0_4, w8[0], acc8[4]);
-            float yn0_5 = ((mode != 0) ? _unpack_bf16_74[5] * gw8[5] : _unpack_bf16_74[5]);
-            float o0_5 = yn0_5 * rs0;
-            float o2_0_5 = ((mode != 0) ? o0_5 : o0_5 * gw8[5]);
-            acc8[5] = __fmaf_rn(o2_0_5, w8[0], acc8[5]);
-            float yn0_6 = ((mode != 0) ? _unpack_bf16_74[6] * gw8[6] : _unpack_bf16_74[6]);
-            float o0_6 = yn0_6 * rs0;
-            float o2_0_6 = ((mode != 0) ? o0_6 : o0_6 * gw8[6]);
-            acc8[6] = __fmaf_rn(o2_0_6, w8[0], acc8[6]);
-            float yn0_7 = ((mode != 0) ? _unpack_bf16_74[7] * gw8[7] : _unpack_bf16_74[7]);
-            float o0_7 = yn0_7 * rs0;
-            float o2_0_7 = ((mode != 0) ? o0_7 : o0_7 * gw8[7]);
-            acc8[7] = __fmaf_rn(o2_0_7, w8[0], acc8[7]);
-            float tot1 = warp_tab[parity + 1];
-            tot1 = tot1 + warp_tab[parity + 8 + 1];
-            tot1 = tot1 + warp_tab[parity + 16 + 1];
-            tot1 = tot1 + warp_tab[parity + 24 + 1];
-            tot1 = tot1 + warp_tab[parity + 32 + 1];
-            tot1 = tot1 + warp_tab[parity + 40 + 1];
-            tot1 = tot1 + warp_tab[parity + 48 + 1];
-            tot1 = tot1 + warp_tab[parity + 56 + 1];
-            tot1 = tot1 + warp_tab[parity + 64 + 1];
-            tot1 = tot1 + warp_tab[parity + 72 + 1];
-            tot1 = tot1 + warp_tab[parity + 80 + 1];
-            tot1 = tot1 + warp_tab[parity + 88 + 1];
-            tot1 = tot1 + warp_tab[parity + 96 + 1];
-            tot1 = tot1 + warp_tab[parity + 104 + 1];
-            tot1 = tot1 + warp_tab[parity + 112 + 1];
-            tot1 = tot1 + warp_tab[parity + 120 + 1];
+            float yn_0 = ((mode != 0) ? _unpack_bf16_66[0] * gw8[0] : _unpack_bf16_66[0]);
+            float o_0 = yn_0 * rs_0;
+            float o2_8_0 = ((mode != 0) ? o_0 : o_0 * gw8[0]);
+            acc8[0] = __fmaf_rn(o2_8_0, w8[0], acc8[0]);
+            float yn_1 = ((mode != 0) ? _unpack_bf16_66[1] * gw8[1] : _unpack_bf16_66[1]);
+            float o_1 = yn_1 * rs_0;
+            float o2_8_1 = ((mode != 0) ? o_1 : o_1 * gw8[1]);
+            acc8[1] = __fmaf_rn(o2_8_1, w8[0], acc8[1]);
+            float yn_2 = ((mode != 0) ? _unpack_bf16_66[2] * gw8[2] : _unpack_bf16_66[2]);
+            float o_2 = yn_2 * rs_0;
+            float o2_8_2 = ((mode != 0) ? o_2 : o_2 * gw8[2]);
+            acc8[2] = __fmaf_rn(o2_8_2, w8[0], acc8[2]);
+            float yn_3 = ((mode != 0) ? _unpack_bf16_66[3] * gw8[3] : _unpack_bf16_66[3]);
+            float o_3 = yn_3 * rs_0;
+            float o2_8_3 = ((mode != 0) ? o_3 : o_3 * gw8[3]);
+            acc8[3] = __fmaf_rn(o2_8_3, w8[0], acc8[3]);
+            float yn_4 = ((mode != 0) ? _unpack_bf16_66[4] * gw8[4] : _unpack_bf16_66[4]);
+            float o_4 = yn_4 * rs_0;
+            float o2_8_4 = ((mode != 0) ? o_4 : o_4 * gw8[4]);
+            acc8[4] = __fmaf_rn(o2_8_4, w8[0], acc8[4]);
+            float yn_5 = ((mode != 0) ? _unpack_bf16_66[5] * gw8[5] : _unpack_bf16_66[5]);
+            float o_5 = yn_5 * rs_0;
+            float o2_8_5 = ((mode != 0) ? o_5 : o_5 * gw8[5]);
+            acc8[5] = __fmaf_rn(o2_8_5, w8[0], acc8[5]);
+            float yn_6 = ((mode != 0) ? _unpack_bf16_66[6] * gw8[6] : _unpack_bf16_66[6]);
+            float o_6 = yn_6 * rs_0;
+            float o2_8_6 = ((mode != 0) ? o_6 : o_6 * gw8[6]);
+            acc8[6] = __fmaf_rn(o2_8_6, w8[0], acc8[6]);
+            float yn_7 = ((mode != 0) ? _unpack_bf16_66[7] * gw8[7] : _unpack_bf16_66[7]);
+            float o_7 = yn_7 * rs_0;
+            float o2_8_7 = ((mode != 0) ? o_7 : o_7 * gw8[7]);
+            acc8[7] = __fmaf_rn(o2_8_7, w8[0], acc8[7]);
+            float tot_1 = warp_tab[parity + 1];
+            tot_1 = tot_1 + warp_tab[parity + 8 + 1];
+            tot_1 = tot_1 + warp_tab[parity + 16 + 1];
+            tot_1 = tot_1 + warp_tab[parity + 24 + 1];
+            tot_1 = tot_1 + warp_tab[parity + 32 + 1];
+            tot_1 = tot_1 + warp_tab[parity + 40 + 1];
+            tot_1 = tot_1 + warp_tab[parity + 48 + 1];
+            tot_1 = tot_1 + warp_tab[parity + 56 + 1];
+            tot_1 = tot_1 + warp_tab[parity + 64 + 1];
+            tot_1 = tot_1 + warp_tab[parity + 72 + 1];
+            tot_1 = tot_1 + warp_tab[parity + 80 + 1];
+            tot_1 = tot_1 + warp_tab[parity + 88 + 1];
+            tot_1 = tot_1 + warp_tab[parity + 96 + 1];
+            tot_1 = tot_1 + warp_tab[parity + 104 + 1];
+            tot_1 = tot_1 + warp_tab[parity + 112 + 1];
+            tot_1 = tot_1 + warp_tab[parity + 120 + 1];
             float _sqrt_87;
-            asm volatile("sqrt.rn.f32 %0, %1;" : "=f"(_sqrt_87) : "f"(__fmaf_rn(tot1, 0.00024414062f, eps)));
-            float rs1 = __frcp_rn(_sqrt_87);
-            float _unpack_bf16_75[8];
+            asm volatile("sqrt.rn.f32 %0, %1;" : "=f"(_sqrt_87) : "f"(__fmaf_rn(tot_1, 0.00024414062f, eps)));
+            float rs_1 = __frcp_rn(_sqrt_87);
+            float _unpack_bf16_67[8];
             #pragma unroll
             for (int _pair = 0; _pair < 4; _pair++) {
                 asm volatile(
@@ -2919,61 +2919,61 @@ kernel_cake_tp_moe_finalize_rmsnorm_6d4722f3bbbeb033a812(__nv_bfloat16* __restri
                     "shl.b32 %0, %2, 16;\n\t"
                     "and.b32 %1, %2, 0xffff0000;\n\t"
                     "}\n"
-                    : "=f"((&_unpack_bf16_75[_pair * 2])[0]), "=f"((&_unpack_bf16_75[_pair * 2])[1])
+                    : "=f"((&_unpack_bf16_67[_pair * 2])[0]), "=f"((&_unpack_bf16_67[_pair * 2])[1])
                     : "r"(rw[4 + _pair]));
             }
-            float yn1_0 = ((mode != 0) ? _unpack_bf16_75[0] * gw8[0] : _unpack_bf16_75[0]);
-            float o1_0 = yn1_0 * rs1;
-            float o2_1_0 = ((mode != 0) ? o1_0 : o1_0 * gw8[0]);
-            acc8[0] = __fmaf_rn(o2_1_0, w8[1], acc8[0]);
-            float yn1_1 = ((mode != 0) ? _unpack_bf16_75[1] * gw8[1] : _unpack_bf16_75[1]);
-            float o1_1 = yn1_1 * rs1;
-            float o2_1_1 = ((mode != 0) ? o1_1 : o1_1 * gw8[1]);
-            acc8[1] = __fmaf_rn(o2_1_1, w8[1], acc8[1]);
-            float yn1_2 = ((mode != 0) ? _unpack_bf16_75[2] * gw8[2] : _unpack_bf16_75[2]);
-            float o1_2 = yn1_2 * rs1;
-            float o2_1_2 = ((mode != 0) ? o1_2 : o1_2 * gw8[2]);
-            acc8[2] = __fmaf_rn(o2_1_2, w8[1], acc8[2]);
-            float yn1_3 = ((mode != 0) ? _unpack_bf16_75[3] * gw8[3] : _unpack_bf16_75[3]);
-            float o1_3 = yn1_3 * rs1;
-            float o2_1_3 = ((mode != 0) ? o1_3 : o1_3 * gw8[3]);
-            acc8[3] = __fmaf_rn(o2_1_3, w8[1], acc8[3]);
-            float yn1_4 = ((mode != 0) ? _unpack_bf16_75[4] * gw8[4] : _unpack_bf16_75[4]);
-            float o1_4 = yn1_4 * rs1;
-            float o2_1_4 = ((mode != 0) ? o1_4 : o1_4 * gw8[4]);
-            acc8[4] = __fmaf_rn(o2_1_4, w8[1], acc8[4]);
-            float yn1_5 = ((mode != 0) ? _unpack_bf16_75[5] * gw8[5] : _unpack_bf16_75[5]);
-            float o1_5 = yn1_5 * rs1;
-            float o2_1_5 = ((mode != 0) ? o1_5 : o1_5 * gw8[5]);
-            acc8[5] = __fmaf_rn(o2_1_5, w8[1], acc8[5]);
-            float yn1_6 = ((mode != 0) ? _unpack_bf16_75[6] * gw8[6] : _unpack_bf16_75[6]);
-            float o1_6 = yn1_6 * rs1;
-            float o2_1_6 = ((mode != 0) ? o1_6 : o1_6 * gw8[6]);
-            acc8[6] = __fmaf_rn(o2_1_6, w8[1], acc8[6]);
-            float yn1_7 = ((mode != 0) ? _unpack_bf16_75[7] * gw8[7] : _unpack_bf16_75[7]);
-            float o1_7 = yn1_7 * rs1;
-            float o2_1_7 = ((mode != 0) ? o1_7 : o1_7 * gw8[7]);
-            acc8[7] = __fmaf_rn(o2_1_7, w8[1], acc8[7]);
-            float tot2 = warp_tab[parity + 2];
-            tot2 = tot2 + warp_tab[parity + 8 + 2];
-            tot2 = tot2 + warp_tab[parity + 16 + 2];
-            tot2 = tot2 + warp_tab[parity + 24 + 2];
-            tot2 = tot2 + warp_tab[parity + 32 + 2];
-            tot2 = tot2 + warp_tab[parity + 40 + 2];
-            tot2 = tot2 + warp_tab[parity + 48 + 2];
-            tot2 = tot2 + warp_tab[parity + 56 + 2];
-            tot2 = tot2 + warp_tab[parity + 64 + 2];
-            tot2 = tot2 + warp_tab[parity + 72 + 2];
-            tot2 = tot2 + warp_tab[parity + 80 + 2];
-            tot2 = tot2 + warp_tab[parity + 88 + 2];
-            tot2 = tot2 + warp_tab[parity + 96 + 2];
-            tot2 = tot2 + warp_tab[parity + 104 + 2];
-            tot2 = tot2 + warp_tab[parity + 112 + 2];
-            tot2 = tot2 + warp_tab[parity + 120 + 2];
+            float yn_8 = ((mode != 0) ? _unpack_bf16_67[0] * gw8[0] : _unpack_bf16_67[0]);
+            float o_8 = yn_8 * rs_1;
+            float o2_8_8 = ((mode != 0) ? o_8 : o_8 * gw8[0]);
+            acc8[0] = __fmaf_rn(o2_8_8, w8[1], acc8[0]);
+            float yn_9 = ((mode != 0) ? _unpack_bf16_67[1] * gw8[1] : _unpack_bf16_67[1]);
+            float o_9 = yn_9 * rs_1;
+            float o2_8_9 = ((mode != 0) ? o_9 : o_9 * gw8[1]);
+            acc8[1] = __fmaf_rn(o2_8_9, w8[1], acc8[1]);
+            float yn_10 = ((mode != 0) ? _unpack_bf16_67[2] * gw8[2] : _unpack_bf16_67[2]);
+            float o_10 = yn_10 * rs_1;
+            float o2_8_10 = ((mode != 0) ? o_10 : o_10 * gw8[2]);
+            acc8[2] = __fmaf_rn(o2_8_10, w8[1], acc8[2]);
+            float yn_11 = ((mode != 0) ? _unpack_bf16_67[3] * gw8[3] : _unpack_bf16_67[3]);
+            float o_11 = yn_11 * rs_1;
+            float o2_8_11 = ((mode != 0) ? o_11 : o_11 * gw8[3]);
+            acc8[3] = __fmaf_rn(o2_8_11, w8[1], acc8[3]);
+            float yn_12 = ((mode != 0) ? _unpack_bf16_67[4] * gw8[4] : _unpack_bf16_67[4]);
+            float o_12 = yn_12 * rs_1;
+            float o2_8_12 = ((mode != 0) ? o_12 : o_12 * gw8[4]);
+            acc8[4] = __fmaf_rn(o2_8_12, w8[1], acc8[4]);
+            float yn_13 = ((mode != 0) ? _unpack_bf16_67[5] * gw8[5] : _unpack_bf16_67[5]);
+            float o_13 = yn_13 * rs_1;
+            float o2_8_13 = ((mode != 0) ? o_13 : o_13 * gw8[5]);
+            acc8[5] = __fmaf_rn(o2_8_13, w8[1], acc8[5]);
+            float yn_14 = ((mode != 0) ? _unpack_bf16_67[6] * gw8[6] : _unpack_bf16_67[6]);
+            float o_14 = yn_14 * rs_1;
+            float o2_8_14 = ((mode != 0) ? o_14 : o_14 * gw8[6]);
+            acc8[6] = __fmaf_rn(o2_8_14, w8[1], acc8[6]);
+            float yn_15 = ((mode != 0) ? _unpack_bf16_67[7] * gw8[7] : _unpack_bf16_67[7]);
+            float o_15 = yn_15 * rs_1;
+            float o2_8_15 = ((mode != 0) ? o_15 : o_15 * gw8[7]);
+            acc8[7] = __fmaf_rn(o2_8_15, w8[1], acc8[7]);
+            float tot_2 = warp_tab[parity + 2];
+            tot_2 = tot_2 + warp_tab[parity + 8 + 2];
+            tot_2 = tot_2 + warp_tab[parity + 16 + 2];
+            tot_2 = tot_2 + warp_tab[parity + 24 + 2];
+            tot_2 = tot_2 + warp_tab[parity + 32 + 2];
+            tot_2 = tot_2 + warp_tab[parity + 40 + 2];
+            tot_2 = tot_2 + warp_tab[parity + 48 + 2];
+            tot_2 = tot_2 + warp_tab[parity + 56 + 2];
+            tot_2 = tot_2 + warp_tab[parity + 64 + 2];
+            tot_2 = tot_2 + warp_tab[parity + 72 + 2];
+            tot_2 = tot_2 + warp_tab[parity + 80 + 2];
+            tot_2 = tot_2 + warp_tab[parity + 88 + 2];
+            tot_2 = tot_2 + warp_tab[parity + 96 + 2];
+            tot_2 = tot_2 + warp_tab[parity + 104 + 2];
+            tot_2 = tot_2 + warp_tab[parity + 112 + 2];
+            tot_2 = tot_2 + warp_tab[parity + 120 + 2];
             float _sqrt_88;
-            asm volatile("sqrt.rn.f32 %0, %1;" : "=f"(_sqrt_88) : "f"(__fmaf_rn(tot2, 0.00024414062f, eps)));
-            float rs2 = __frcp_rn(_sqrt_88);
-            float _unpack_bf16_76[8];
+            asm volatile("sqrt.rn.f32 %0, %1;" : "=f"(_sqrt_88) : "f"(__fmaf_rn(tot_2, 0.00024414062f, eps)));
+            float rs_2 = __frcp_rn(_sqrt_88);
+            float _unpack_bf16_68[8];
             #pragma unroll
             for (int _pair = 0; _pair < 4; _pair++) {
                 asm volatile(
@@ -2981,61 +2981,61 @@ kernel_cake_tp_moe_finalize_rmsnorm_6d4722f3bbbeb033a812(__nv_bfloat16* __restri
                     "shl.b32 %0, %2, 16;\n\t"
                     "and.b32 %1, %2, 0xffff0000;\n\t"
                     "}\n"
-                    : "=f"((&_unpack_bf16_76[_pair * 2])[0]), "=f"((&_unpack_bf16_76[_pair * 2])[1])
+                    : "=f"((&_unpack_bf16_68[_pair * 2])[0]), "=f"((&_unpack_bf16_68[_pair * 2])[1])
                     : "r"(rw[8 + _pair]));
             }
-            float yn2_0 = ((mode != 0) ? _unpack_bf16_76[0] * gw8[0] : _unpack_bf16_76[0]);
-            float o2_0 = yn2_0 * rs2;
-            float o2_2_0 = ((mode != 0) ? o2_0 : o2_0 * gw8[0]);
-            acc8[0] = __fmaf_rn(o2_2_0, w8[2], acc8[0]);
-            float yn2_1 = ((mode != 0) ? _unpack_bf16_76[1] * gw8[1] : _unpack_bf16_76[1]);
-            float o2_1 = yn2_1 * rs2;
-            float o2_2_1 = ((mode != 0) ? o2_1 : o2_1 * gw8[1]);
-            acc8[1] = __fmaf_rn(o2_2_1, w8[2], acc8[1]);
-            float yn2_2 = ((mode != 0) ? _unpack_bf16_76[2] * gw8[2] : _unpack_bf16_76[2]);
-            float o2_2 = yn2_2 * rs2;
-            float o2_2_2 = ((mode != 0) ? o2_2 : o2_2 * gw8[2]);
-            acc8[2] = __fmaf_rn(o2_2_2, w8[2], acc8[2]);
-            float yn2_3 = ((mode != 0) ? _unpack_bf16_76[3] * gw8[3] : _unpack_bf16_76[3]);
-            float o2_3 = yn2_3 * rs2;
-            float o2_2_3 = ((mode != 0) ? o2_3 : o2_3 * gw8[3]);
-            acc8[3] = __fmaf_rn(o2_2_3, w8[2], acc8[3]);
-            float yn2_4 = ((mode != 0) ? _unpack_bf16_76[4] * gw8[4] : _unpack_bf16_76[4]);
-            float o2_4 = yn2_4 * rs2;
-            float o2_2_4 = ((mode != 0) ? o2_4 : o2_4 * gw8[4]);
-            acc8[4] = __fmaf_rn(o2_2_4, w8[2], acc8[4]);
-            float yn2_5 = ((mode != 0) ? _unpack_bf16_76[5] * gw8[5] : _unpack_bf16_76[5]);
-            float o2_5 = yn2_5 * rs2;
-            float o2_2_5 = ((mode != 0) ? o2_5 : o2_5 * gw8[5]);
-            acc8[5] = __fmaf_rn(o2_2_5, w8[2], acc8[5]);
-            float yn2_6 = ((mode != 0) ? _unpack_bf16_76[6] * gw8[6] : _unpack_bf16_76[6]);
-            float o2_6 = yn2_6 * rs2;
-            float o2_2_6 = ((mode != 0) ? o2_6 : o2_6 * gw8[6]);
-            acc8[6] = __fmaf_rn(o2_2_6, w8[2], acc8[6]);
-            float yn2_7 = ((mode != 0) ? _unpack_bf16_76[7] * gw8[7] : _unpack_bf16_76[7]);
-            float o2_7 = yn2_7 * rs2;
-            float o2_2_7 = ((mode != 0) ? o2_7 : o2_7 * gw8[7]);
-            acc8[7] = __fmaf_rn(o2_2_7, w8[2], acc8[7]);
-            float tot3 = warp_tab[parity + 3];
-            tot3 = tot3 + warp_tab[parity + 8 + 3];
-            tot3 = tot3 + warp_tab[parity + 16 + 3];
-            tot3 = tot3 + warp_tab[parity + 24 + 3];
-            tot3 = tot3 + warp_tab[parity + 32 + 3];
-            tot3 = tot3 + warp_tab[parity + 40 + 3];
-            tot3 = tot3 + warp_tab[parity + 48 + 3];
-            tot3 = tot3 + warp_tab[parity + 56 + 3];
-            tot3 = tot3 + warp_tab[parity + 64 + 3];
-            tot3 = tot3 + warp_tab[parity + 72 + 3];
-            tot3 = tot3 + warp_tab[parity + 80 + 3];
-            tot3 = tot3 + warp_tab[parity + 88 + 3];
-            tot3 = tot3 + warp_tab[parity + 96 + 3];
-            tot3 = tot3 + warp_tab[parity + 104 + 3];
-            tot3 = tot3 + warp_tab[parity + 112 + 3];
-            tot3 = tot3 + warp_tab[parity + 120 + 3];
+            float yn_16 = ((mode != 0) ? _unpack_bf16_68[0] * gw8[0] : _unpack_bf16_68[0]);
+            float o_16 = yn_16 * rs_2;
+            float o2_8_16 = ((mode != 0) ? o_16 : o_16 * gw8[0]);
+            acc8[0] = __fmaf_rn(o2_8_16, w8[2], acc8[0]);
+            float yn_17 = ((mode != 0) ? _unpack_bf16_68[1] * gw8[1] : _unpack_bf16_68[1]);
+            float o_17 = yn_17 * rs_2;
+            float o2_8_17 = ((mode != 0) ? o_17 : o_17 * gw8[1]);
+            acc8[1] = __fmaf_rn(o2_8_17, w8[2], acc8[1]);
+            float yn_18 = ((mode != 0) ? _unpack_bf16_68[2] * gw8[2] : _unpack_bf16_68[2]);
+            float o_18 = yn_18 * rs_2;
+            float o2_8_18 = ((mode != 0) ? o_18 : o_18 * gw8[2]);
+            acc8[2] = __fmaf_rn(o2_8_18, w8[2], acc8[2]);
+            float yn_19 = ((mode != 0) ? _unpack_bf16_68[3] * gw8[3] : _unpack_bf16_68[3]);
+            float o_19 = yn_19 * rs_2;
+            float o2_8_19 = ((mode != 0) ? o_19 : o_19 * gw8[3]);
+            acc8[3] = __fmaf_rn(o2_8_19, w8[2], acc8[3]);
+            float yn_20 = ((mode != 0) ? _unpack_bf16_68[4] * gw8[4] : _unpack_bf16_68[4]);
+            float o_20 = yn_20 * rs_2;
+            float o2_8_20 = ((mode != 0) ? o_20 : o_20 * gw8[4]);
+            acc8[4] = __fmaf_rn(o2_8_20, w8[2], acc8[4]);
+            float yn_21 = ((mode != 0) ? _unpack_bf16_68[5] * gw8[5] : _unpack_bf16_68[5]);
+            float o_21 = yn_21 * rs_2;
+            float o2_8_21 = ((mode != 0) ? o_21 : o_21 * gw8[5]);
+            acc8[5] = __fmaf_rn(o2_8_21, w8[2], acc8[5]);
+            float yn_22 = ((mode != 0) ? _unpack_bf16_68[6] * gw8[6] : _unpack_bf16_68[6]);
+            float o_22 = yn_22 * rs_2;
+            float o2_8_22 = ((mode != 0) ? o_22 : o_22 * gw8[6]);
+            acc8[6] = __fmaf_rn(o2_8_22, w8[2], acc8[6]);
+            float yn_23 = ((mode != 0) ? _unpack_bf16_68[7] * gw8[7] : _unpack_bf16_68[7]);
+            float o_23 = yn_23 * rs_2;
+            float o2_8_23 = ((mode != 0) ? o_23 : o_23 * gw8[7]);
+            acc8[7] = __fmaf_rn(o2_8_23, w8[2], acc8[7]);
+            float tot_3 = warp_tab[parity + 3];
+            tot_3 = tot_3 + warp_tab[parity + 8 + 3];
+            tot_3 = tot_3 + warp_tab[parity + 16 + 3];
+            tot_3 = tot_3 + warp_tab[parity + 24 + 3];
+            tot_3 = tot_3 + warp_tab[parity + 32 + 3];
+            tot_3 = tot_3 + warp_tab[parity + 40 + 3];
+            tot_3 = tot_3 + warp_tab[parity + 48 + 3];
+            tot_3 = tot_3 + warp_tab[parity + 56 + 3];
+            tot_3 = tot_3 + warp_tab[parity + 64 + 3];
+            tot_3 = tot_3 + warp_tab[parity + 72 + 3];
+            tot_3 = tot_3 + warp_tab[parity + 80 + 3];
+            tot_3 = tot_3 + warp_tab[parity + 88 + 3];
+            tot_3 = tot_3 + warp_tab[parity + 96 + 3];
+            tot_3 = tot_3 + warp_tab[parity + 104 + 3];
+            tot_3 = tot_3 + warp_tab[parity + 112 + 3];
+            tot_3 = tot_3 + warp_tab[parity + 120 + 3];
             float _sqrt_89;
-            asm volatile("sqrt.rn.f32 %0, %1;" : "=f"(_sqrt_89) : "f"(__fmaf_rn(tot3, 0.00024414062f, eps)));
-            float rs3 = __frcp_rn(_sqrt_89);
-            float _unpack_bf16_77[8];
+            asm volatile("sqrt.rn.f32 %0, %1;" : "=f"(_sqrt_89) : "f"(__fmaf_rn(tot_3, 0.00024414062f, eps)));
+            float rs_3 = __frcp_rn(_sqrt_89);
+            float _unpack_bf16_69[8];
             #pragma unroll
             for (int _pair = 0; _pair < 4; _pair++) {
                 asm volatile(
@@ -3043,61 +3043,61 @@ kernel_cake_tp_moe_finalize_rmsnorm_6d4722f3bbbeb033a812(__nv_bfloat16* __restri
                     "shl.b32 %0, %2, 16;\n\t"
                     "and.b32 %1, %2, 0xffff0000;\n\t"
                     "}\n"
-                    : "=f"((&_unpack_bf16_77[_pair * 2])[0]), "=f"((&_unpack_bf16_77[_pair * 2])[1])
+                    : "=f"((&_unpack_bf16_69[_pair * 2])[0]), "=f"((&_unpack_bf16_69[_pair * 2])[1])
                     : "r"(rw[12 + _pair]));
             }
-            float yn3_0 = ((mode != 0) ? _unpack_bf16_77[0] * gw8[0] : _unpack_bf16_77[0]);
-            float o3_0 = yn3_0 * rs3;
-            float o2_3_0 = ((mode != 0) ? o3_0 : o3_0 * gw8[0]);
-            acc8[0] = __fmaf_rn(o2_3_0, w8[3], acc8[0]);
-            float yn3_1 = ((mode != 0) ? _unpack_bf16_77[1] * gw8[1] : _unpack_bf16_77[1]);
-            float o3_1 = yn3_1 * rs3;
-            float o2_3_1 = ((mode != 0) ? o3_1 : o3_1 * gw8[1]);
-            acc8[1] = __fmaf_rn(o2_3_1, w8[3], acc8[1]);
-            float yn3_2 = ((mode != 0) ? _unpack_bf16_77[2] * gw8[2] : _unpack_bf16_77[2]);
-            float o3_2 = yn3_2 * rs3;
-            float o2_3_2 = ((mode != 0) ? o3_2 : o3_2 * gw8[2]);
-            acc8[2] = __fmaf_rn(o2_3_2, w8[3], acc8[2]);
-            float yn3_3 = ((mode != 0) ? _unpack_bf16_77[3] * gw8[3] : _unpack_bf16_77[3]);
-            float o3_3 = yn3_3 * rs3;
-            float o2_3_3 = ((mode != 0) ? o3_3 : o3_3 * gw8[3]);
-            acc8[3] = __fmaf_rn(o2_3_3, w8[3], acc8[3]);
-            float yn3_4 = ((mode != 0) ? _unpack_bf16_77[4] * gw8[4] : _unpack_bf16_77[4]);
-            float o3_4 = yn3_4 * rs3;
-            float o2_3_4 = ((mode != 0) ? o3_4 : o3_4 * gw8[4]);
-            acc8[4] = __fmaf_rn(o2_3_4, w8[3], acc8[4]);
-            float yn3_5 = ((mode != 0) ? _unpack_bf16_77[5] * gw8[5] : _unpack_bf16_77[5]);
-            float o3_5 = yn3_5 * rs3;
-            float o2_3_5 = ((mode != 0) ? o3_5 : o3_5 * gw8[5]);
-            acc8[5] = __fmaf_rn(o2_3_5, w8[3], acc8[5]);
-            float yn3_6 = ((mode != 0) ? _unpack_bf16_77[6] * gw8[6] : _unpack_bf16_77[6]);
-            float o3_6 = yn3_6 * rs3;
-            float o2_3_6 = ((mode != 0) ? o3_6 : o3_6 * gw8[6]);
-            acc8[6] = __fmaf_rn(o2_3_6, w8[3], acc8[6]);
-            float yn3_7 = ((mode != 0) ? _unpack_bf16_77[7] * gw8[7] : _unpack_bf16_77[7]);
-            float o3_7 = yn3_7 * rs3;
-            float o2_3_7 = ((mode != 0) ? o3_7 : o3_7 * gw8[7]);
-            acc8[7] = __fmaf_rn(o2_3_7, w8[3], acc8[7]);
-            float tot4 = warp_tab[parity + 4];
-            tot4 = tot4 + warp_tab[parity + 8 + 4];
-            tot4 = tot4 + warp_tab[parity + 16 + 4];
-            tot4 = tot4 + warp_tab[parity + 24 + 4];
-            tot4 = tot4 + warp_tab[parity + 32 + 4];
-            tot4 = tot4 + warp_tab[parity + 40 + 4];
-            tot4 = tot4 + warp_tab[parity + 48 + 4];
-            tot4 = tot4 + warp_tab[parity + 56 + 4];
-            tot4 = tot4 + warp_tab[parity + 64 + 4];
-            tot4 = tot4 + warp_tab[parity + 72 + 4];
-            tot4 = tot4 + warp_tab[parity + 80 + 4];
-            tot4 = tot4 + warp_tab[parity + 88 + 4];
-            tot4 = tot4 + warp_tab[parity + 96 + 4];
-            tot4 = tot4 + warp_tab[parity + 104 + 4];
-            tot4 = tot4 + warp_tab[parity + 112 + 4];
-            tot4 = tot4 + warp_tab[parity + 120 + 4];
+            float yn_24 = ((mode != 0) ? _unpack_bf16_69[0] * gw8[0] : _unpack_bf16_69[0]);
+            float o_24 = yn_24 * rs_3;
+            float o2_8_24 = ((mode != 0) ? o_24 : o_24 * gw8[0]);
+            acc8[0] = __fmaf_rn(o2_8_24, w8[3], acc8[0]);
+            float yn_25 = ((mode != 0) ? _unpack_bf16_69[1] * gw8[1] : _unpack_bf16_69[1]);
+            float o_25 = yn_25 * rs_3;
+            float o2_8_25 = ((mode != 0) ? o_25 : o_25 * gw8[1]);
+            acc8[1] = __fmaf_rn(o2_8_25, w8[3], acc8[1]);
+            float yn_26 = ((mode != 0) ? _unpack_bf16_69[2] * gw8[2] : _unpack_bf16_69[2]);
+            float o_26 = yn_26 * rs_3;
+            float o2_8_26 = ((mode != 0) ? o_26 : o_26 * gw8[2]);
+            acc8[2] = __fmaf_rn(o2_8_26, w8[3], acc8[2]);
+            float yn_27 = ((mode != 0) ? _unpack_bf16_69[3] * gw8[3] : _unpack_bf16_69[3]);
+            float o_27 = yn_27 * rs_3;
+            float o2_8_27 = ((mode != 0) ? o_27 : o_27 * gw8[3]);
+            acc8[3] = __fmaf_rn(o2_8_27, w8[3], acc8[3]);
+            float yn_28 = ((mode != 0) ? _unpack_bf16_69[4] * gw8[4] : _unpack_bf16_69[4]);
+            float o_28 = yn_28 * rs_3;
+            float o2_8_28 = ((mode != 0) ? o_28 : o_28 * gw8[4]);
+            acc8[4] = __fmaf_rn(o2_8_28, w8[3], acc8[4]);
+            float yn_29 = ((mode != 0) ? _unpack_bf16_69[5] * gw8[5] : _unpack_bf16_69[5]);
+            float o_29 = yn_29 * rs_3;
+            float o2_8_29 = ((mode != 0) ? o_29 : o_29 * gw8[5]);
+            acc8[5] = __fmaf_rn(o2_8_29, w8[3], acc8[5]);
+            float yn_30 = ((mode != 0) ? _unpack_bf16_69[6] * gw8[6] : _unpack_bf16_69[6]);
+            float o_30 = yn_30 * rs_3;
+            float o2_8_30 = ((mode != 0) ? o_30 : o_30 * gw8[6]);
+            acc8[6] = __fmaf_rn(o2_8_30, w8[3], acc8[6]);
+            float yn_31 = ((mode != 0) ? _unpack_bf16_69[7] * gw8[7] : _unpack_bf16_69[7]);
+            float o_31 = yn_31 * rs_3;
+            float o2_8_31 = ((mode != 0) ? o_31 : o_31 * gw8[7]);
+            acc8[7] = __fmaf_rn(o2_8_31, w8[3], acc8[7]);
+            float tot_4 = warp_tab[parity + 4];
+            tot_4 = tot_4 + warp_tab[parity + 8 + 4];
+            tot_4 = tot_4 + warp_tab[parity + 16 + 4];
+            tot_4 = tot_4 + warp_tab[parity + 24 + 4];
+            tot_4 = tot_4 + warp_tab[parity + 32 + 4];
+            tot_4 = tot_4 + warp_tab[parity + 40 + 4];
+            tot_4 = tot_4 + warp_tab[parity + 48 + 4];
+            tot_4 = tot_4 + warp_tab[parity + 56 + 4];
+            tot_4 = tot_4 + warp_tab[parity + 64 + 4];
+            tot_4 = tot_4 + warp_tab[parity + 72 + 4];
+            tot_4 = tot_4 + warp_tab[parity + 80 + 4];
+            tot_4 = tot_4 + warp_tab[parity + 88 + 4];
+            tot_4 = tot_4 + warp_tab[parity + 96 + 4];
+            tot_4 = tot_4 + warp_tab[parity + 104 + 4];
+            tot_4 = tot_4 + warp_tab[parity + 112 + 4];
+            tot_4 = tot_4 + warp_tab[parity + 120 + 4];
             float _sqrt_90;
-            asm volatile("sqrt.rn.f32 %0, %1;" : "=f"(_sqrt_90) : "f"(__fmaf_rn(tot4, 0.00024414062f, eps)));
-            float rs4 = __frcp_rn(_sqrt_90);
-            float _unpack_bf16_78[8];
+            asm volatile("sqrt.rn.f32 %0, %1;" : "=f"(_sqrt_90) : "f"(__fmaf_rn(tot_4, 0.00024414062f, eps)));
+            float rs_4 = __frcp_rn(_sqrt_90);
+            float _unpack_bf16_70[8];
             #pragma unroll
             for (int _pair = 0; _pair < 4; _pair++) {
                 asm volatile(
@@ -3105,61 +3105,61 @@ kernel_cake_tp_moe_finalize_rmsnorm_6d4722f3bbbeb033a812(__nv_bfloat16* __restri
                     "shl.b32 %0, %2, 16;\n\t"
                     "and.b32 %1, %2, 0xffff0000;\n\t"
                     "}\n"
-                    : "=f"((&_unpack_bf16_78[_pair * 2])[0]), "=f"((&_unpack_bf16_78[_pair * 2])[1])
+                    : "=f"((&_unpack_bf16_70[_pair * 2])[0]), "=f"((&_unpack_bf16_70[_pair * 2])[1])
                     : "r"(rw[16 + _pair]));
             }
-            float yn4_0 = ((mode != 0) ? _unpack_bf16_78[0] * gw8[0] : _unpack_bf16_78[0]);
-            float o4_0 = yn4_0 * rs4;
-            float o2_4_0 = ((mode != 0) ? o4_0 : o4_0 * gw8[0]);
-            acc8[0] = __fmaf_rn(o2_4_0, w8[4], acc8[0]);
-            float yn4_1 = ((mode != 0) ? _unpack_bf16_78[1] * gw8[1] : _unpack_bf16_78[1]);
-            float o4_1 = yn4_1 * rs4;
-            float o2_4_1 = ((mode != 0) ? o4_1 : o4_1 * gw8[1]);
-            acc8[1] = __fmaf_rn(o2_4_1, w8[4], acc8[1]);
-            float yn4_2 = ((mode != 0) ? _unpack_bf16_78[2] * gw8[2] : _unpack_bf16_78[2]);
-            float o4_2 = yn4_2 * rs4;
-            float o2_4_2 = ((mode != 0) ? o4_2 : o4_2 * gw8[2]);
-            acc8[2] = __fmaf_rn(o2_4_2, w8[4], acc8[2]);
-            float yn4_3 = ((mode != 0) ? _unpack_bf16_78[3] * gw8[3] : _unpack_bf16_78[3]);
-            float o4_3 = yn4_3 * rs4;
-            float o2_4_3 = ((mode != 0) ? o4_3 : o4_3 * gw8[3]);
-            acc8[3] = __fmaf_rn(o2_4_3, w8[4], acc8[3]);
-            float yn4_4 = ((mode != 0) ? _unpack_bf16_78[4] * gw8[4] : _unpack_bf16_78[4]);
-            float o4_4 = yn4_4 * rs4;
-            float o2_4_4 = ((mode != 0) ? o4_4 : o4_4 * gw8[4]);
-            acc8[4] = __fmaf_rn(o2_4_4, w8[4], acc8[4]);
-            float yn4_5 = ((mode != 0) ? _unpack_bf16_78[5] * gw8[5] : _unpack_bf16_78[5]);
-            float o4_5 = yn4_5 * rs4;
-            float o2_4_5 = ((mode != 0) ? o4_5 : o4_5 * gw8[5]);
-            acc8[5] = __fmaf_rn(o2_4_5, w8[4], acc8[5]);
-            float yn4_6 = ((mode != 0) ? _unpack_bf16_78[6] * gw8[6] : _unpack_bf16_78[6]);
-            float o4_6 = yn4_6 * rs4;
-            float o2_4_6 = ((mode != 0) ? o4_6 : o4_6 * gw8[6]);
-            acc8[6] = __fmaf_rn(o2_4_6, w8[4], acc8[6]);
-            float yn4_7 = ((mode != 0) ? _unpack_bf16_78[7] * gw8[7] : _unpack_bf16_78[7]);
-            float o4_7 = yn4_7 * rs4;
-            float o2_4_7 = ((mode != 0) ? o4_7 : o4_7 * gw8[7]);
-            acc8[7] = __fmaf_rn(o2_4_7, w8[4], acc8[7]);
-            float tot5 = warp_tab[parity + 5];
-            tot5 = tot5 + warp_tab[parity + 8 + 5];
-            tot5 = tot5 + warp_tab[parity + 16 + 5];
-            tot5 = tot5 + warp_tab[parity + 24 + 5];
-            tot5 = tot5 + warp_tab[parity + 32 + 5];
-            tot5 = tot5 + warp_tab[parity + 40 + 5];
-            tot5 = tot5 + warp_tab[parity + 48 + 5];
-            tot5 = tot5 + warp_tab[parity + 56 + 5];
-            tot5 = tot5 + warp_tab[parity + 64 + 5];
-            tot5 = tot5 + warp_tab[parity + 72 + 5];
-            tot5 = tot5 + warp_tab[parity + 80 + 5];
-            tot5 = tot5 + warp_tab[parity + 88 + 5];
-            tot5 = tot5 + warp_tab[parity + 96 + 5];
-            tot5 = tot5 + warp_tab[parity + 104 + 5];
-            tot5 = tot5 + warp_tab[parity + 112 + 5];
-            tot5 = tot5 + warp_tab[parity + 120 + 5];
+            float yn_32 = ((mode != 0) ? _unpack_bf16_70[0] * gw8[0] : _unpack_bf16_70[0]);
+            float o_32 = yn_32 * rs_4;
+            float o2_8_32 = ((mode != 0) ? o_32 : o_32 * gw8[0]);
+            acc8[0] = __fmaf_rn(o2_8_32, w8[4], acc8[0]);
+            float yn_33 = ((mode != 0) ? _unpack_bf16_70[1] * gw8[1] : _unpack_bf16_70[1]);
+            float o_33 = yn_33 * rs_4;
+            float o2_8_33 = ((mode != 0) ? o_33 : o_33 * gw8[1]);
+            acc8[1] = __fmaf_rn(o2_8_33, w8[4], acc8[1]);
+            float yn_34 = ((mode != 0) ? _unpack_bf16_70[2] * gw8[2] : _unpack_bf16_70[2]);
+            float o_34 = yn_34 * rs_4;
+            float o2_8_34 = ((mode != 0) ? o_34 : o_34 * gw8[2]);
+            acc8[2] = __fmaf_rn(o2_8_34, w8[4], acc8[2]);
+            float yn_35 = ((mode != 0) ? _unpack_bf16_70[3] * gw8[3] : _unpack_bf16_70[3]);
+            float o_35 = yn_35 * rs_4;
+            float o2_8_35 = ((mode != 0) ? o_35 : o_35 * gw8[3]);
+            acc8[3] = __fmaf_rn(o2_8_35, w8[4], acc8[3]);
+            float yn_36 = ((mode != 0) ? _unpack_bf16_70[4] * gw8[4] : _unpack_bf16_70[4]);
+            float o_36 = yn_36 * rs_4;
+            float o2_8_36 = ((mode != 0) ? o_36 : o_36 * gw8[4]);
+            acc8[4] = __fmaf_rn(o2_8_36, w8[4], acc8[4]);
+            float yn_37 = ((mode != 0) ? _unpack_bf16_70[5] * gw8[5] : _unpack_bf16_70[5]);
+            float o_37 = yn_37 * rs_4;
+            float o2_8_37 = ((mode != 0) ? o_37 : o_37 * gw8[5]);
+            acc8[5] = __fmaf_rn(o2_8_37, w8[4], acc8[5]);
+            float yn_38 = ((mode != 0) ? _unpack_bf16_70[6] * gw8[6] : _unpack_bf16_70[6]);
+            float o_38 = yn_38 * rs_4;
+            float o2_8_38 = ((mode != 0) ? o_38 : o_38 * gw8[6]);
+            acc8[6] = __fmaf_rn(o2_8_38, w8[4], acc8[6]);
+            float yn_39 = ((mode != 0) ? _unpack_bf16_70[7] * gw8[7] : _unpack_bf16_70[7]);
+            float o_39 = yn_39 * rs_4;
+            float o2_8_39 = ((mode != 0) ? o_39 : o_39 * gw8[7]);
+            acc8[7] = __fmaf_rn(o2_8_39, w8[4], acc8[7]);
+            float tot_5 = warp_tab[parity + 5];
+            tot_5 = tot_5 + warp_tab[parity + 8 + 5];
+            tot_5 = tot_5 + warp_tab[parity + 16 + 5];
+            tot_5 = tot_5 + warp_tab[parity + 24 + 5];
+            tot_5 = tot_5 + warp_tab[parity + 32 + 5];
+            tot_5 = tot_5 + warp_tab[parity + 40 + 5];
+            tot_5 = tot_5 + warp_tab[parity + 48 + 5];
+            tot_5 = tot_5 + warp_tab[parity + 56 + 5];
+            tot_5 = tot_5 + warp_tab[parity + 64 + 5];
+            tot_5 = tot_5 + warp_tab[parity + 72 + 5];
+            tot_5 = tot_5 + warp_tab[parity + 80 + 5];
+            tot_5 = tot_5 + warp_tab[parity + 88 + 5];
+            tot_5 = tot_5 + warp_tab[parity + 96 + 5];
+            tot_5 = tot_5 + warp_tab[parity + 104 + 5];
+            tot_5 = tot_5 + warp_tab[parity + 112 + 5];
+            tot_5 = tot_5 + warp_tab[parity + 120 + 5];
             float _sqrt_91;
-            asm volatile("sqrt.rn.f32 %0, %1;" : "=f"(_sqrt_91) : "f"(__fmaf_rn(tot5, 0.00024414062f, eps)));
-            float rs5 = __frcp_rn(_sqrt_91);
-            float _unpack_bf16_79[8];
+            asm volatile("sqrt.rn.f32 %0, %1;" : "=f"(_sqrt_91) : "f"(__fmaf_rn(tot_5, 0.00024414062f, eps)));
+            float rs_5 = __frcp_rn(_sqrt_91);
+            float _unpack_bf16_71[8];
             #pragma unroll
             for (int _pair = 0; _pair < 4; _pair++) {
                 asm volatile(
@@ -3167,61 +3167,61 @@ kernel_cake_tp_moe_finalize_rmsnorm_6d4722f3bbbeb033a812(__nv_bfloat16* __restri
                     "shl.b32 %0, %2, 16;\n\t"
                     "and.b32 %1, %2, 0xffff0000;\n\t"
                     "}\n"
-                    : "=f"((&_unpack_bf16_79[_pair * 2])[0]), "=f"((&_unpack_bf16_79[_pair * 2])[1])
+                    : "=f"((&_unpack_bf16_71[_pair * 2])[0]), "=f"((&_unpack_bf16_71[_pair * 2])[1])
                     : "r"(rw[20 + _pair]));
             }
-            float yn5_0 = ((mode != 0) ? _unpack_bf16_79[0] * gw8[0] : _unpack_bf16_79[0]);
-            float o5_0 = yn5_0 * rs5;
-            float o2_5_0 = ((mode != 0) ? o5_0 : o5_0 * gw8[0]);
-            acc8[0] = __fmaf_rn(o2_5_0, w8[5], acc8[0]);
-            float yn5_1 = ((mode != 0) ? _unpack_bf16_79[1] * gw8[1] : _unpack_bf16_79[1]);
-            float o5_1 = yn5_1 * rs5;
-            float o2_5_1 = ((mode != 0) ? o5_1 : o5_1 * gw8[1]);
-            acc8[1] = __fmaf_rn(o2_5_1, w8[5], acc8[1]);
-            float yn5_2 = ((mode != 0) ? _unpack_bf16_79[2] * gw8[2] : _unpack_bf16_79[2]);
-            float o5_2 = yn5_2 * rs5;
-            float o2_5_2 = ((mode != 0) ? o5_2 : o5_2 * gw8[2]);
-            acc8[2] = __fmaf_rn(o2_5_2, w8[5], acc8[2]);
-            float yn5_3 = ((mode != 0) ? _unpack_bf16_79[3] * gw8[3] : _unpack_bf16_79[3]);
-            float o5_3 = yn5_3 * rs5;
-            float o2_5_3 = ((mode != 0) ? o5_3 : o5_3 * gw8[3]);
-            acc8[3] = __fmaf_rn(o2_5_3, w8[5], acc8[3]);
-            float yn5_4 = ((mode != 0) ? _unpack_bf16_79[4] * gw8[4] : _unpack_bf16_79[4]);
-            float o5_4 = yn5_4 * rs5;
-            float o2_5_4 = ((mode != 0) ? o5_4 : o5_4 * gw8[4]);
-            acc8[4] = __fmaf_rn(o2_5_4, w8[5], acc8[4]);
-            float yn5_5 = ((mode != 0) ? _unpack_bf16_79[5] * gw8[5] : _unpack_bf16_79[5]);
-            float o5_5 = yn5_5 * rs5;
-            float o2_5_5 = ((mode != 0) ? o5_5 : o5_5 * gw8[5]);
-            acc8[5] = __fmaf_rn(o2_5_5, w8[5], acc8[5]);
-            float yn5_6 = ((mode != 0) ? _unpack_bf16_79[6] * gw8[6] : _unpack_bf16_79[6]);
-            float o5_6 = yn5_6 * rs5;
-            float o2_5_6 = ((mode != 0) ? o5_6 : o5_6 * gw8[6]);
-            acc8[6] = __fmaf_rn(o2_5_6, w8[5], acc8[6]);
-            float yn5_7 = ((mode != 0) ? _unpack_bf16_79[7] * gw8[7] : _unpack_bf16_79[7]);
-            float o5_7 = yn5_7 * rs5;
-            float o2_5_7 = ((mode != 0) ? o5_7 : o5_7 * gw8[7]);
-            acc8[7] = __fmaf_rn(o2_5_7, w8[5], acc8[7]);
-            float tot6 = warp_tab[parity + 6];
-            tot6 = tot6 + warp_tab[parity + 8 + 6];
-            tot6 = tot6 + warp_tab[parity + 16 + 6];
-            tot6 = tot6 + warp_tab[parity + 24 + 6];
-            tot6 = tot6 + warp_tab[parity + 32 + 6];
-            tot6 = tot6 + warp_tab[parity + 40 + 6];
-            tot6 = tot6 + warp_tab[parity + 48 + 6];
-            tot6 = tot6 + warp_tab[parity + 56 + 6];
-            tot6 = tot6 + warp_tab[parity + 64 + 6];
-            tot6 = tot6 + warp_tab[parity + 72 + 6];
-            tot6 = tot6 + warp_tab[parity + 80 + 6];
-            tot6 = tot6 + warp_tab[parity + 88 + 6];
-            tot6 = tot6 + warp_tab[parity + 96 + 6];
-            tot6 = tot6 + warp_tab[parity + 104 + 6];
-            tot6 = tot6 + warp_tab[parity + 112 + 6];
-            tot6 = tot6 + warp_tab[parity + 120 + 6];
+            float yn_40 = ((mode != 0) ? _unpack_bf16_71[0] * gw8[0] : _unpack_bf16_71[0]);
+            float o_40 = yn_40 * rs_5;
+            float o2_8_40 = ((mode != 0) ? o_40 : o_40 * gw8[0]);
+            acc8[0] = __fmaf_rn(o2_8_40, w8[5], acc8[0]);
+            float yn_41 = ((mode != 0) ? _unpack_bf16_71[1] * gw8[1] : _unpack_bf16_71[1]);
+            float o_41 = yn_41 * rs_5;
+            float o2_8_41 = ((mode != 0) ? o_41 : o_41 * gw8[1]);
+            acc8[1] = __fmaf_rn(o2_8_41, w8[5], acc8[1]);
+            float yn_42 = ((mode != 0) ? _unpack_bf16_71[2] * gw8[2] : _unpack_bf16_71[2]);
+            float o_42 = yn_42 * rs_5;
+            float o2_8_42 = ((mode != 0) ? o_42 : o_42 * gw8[2]);
+            acc8[2] = __fmaf_rn(o2_8_42, w8[5], acc8[2]);
+            float yn_43 = ((mode != 0) ? _unpack_bf16_71[3] * gw8[3] : _unpack_bf16_71[3]);
+            float o_43 = yn_43 * rs_5;
+            float o2_8_43 = ((mode != 0) ? o_43 : o_43 * gw8[3]);
+            acc8[3] = __fmaf_rn(o2_8_43, w8[5], acc8[3]);
+            float yn_44 = ((mode != 0) ? _unpack_bf16_71[4] * gw8[4] : _unpack_bf16_71[4]);
+            float o_44 = yn_44 * rs_5;
+            float o2_8_44 = ((mode != 0) ? o_44 : o_44 * gw8[4]);
+            acc8[4] = __fmaf_rn(o2_8_44, w8[5], acc8[4]);
+            float yn_45 = ((mode != 0) ? _unpack_bf16_71[5] * gw8[5] : _unpack_bf16_71[5]);
+            float o_45 = yn_45 * rs_5;
+            float o2_8_45 = ((mode != 0) ? o_45 : o_45 * gw8[5]);
+            acc8[5] = __fmaf_rn(o2_8_45, w8[5], acc8[5]);
+            float yn_46 = ((mode != 0) ? _unpack_bf16_71[6] * gw8[6] : _unpack_bf16_71[6]);
+            float o_46 = yn_46 * rs_5;
+            float o2_8_46 = ((mode != 0) ? o_46 : o_46 * gw8[6]);
+            acc8[6] = __fmaf_rn(o2_8_46, w8[5], acc8[6]);
+            float yn_47 = ((mode != 0) ? _unpack_bf16_71[7] * gw8[7] : _unpack_bf16_71[7]);
+            float o_47 = yn_47 * rs_5;
+            float o2_8_47 = ((mode != 0) ? o_47 : o_47 * gw8[7]);
+            acc8[7] = __fmaf_rn(o2_8_47, w8[5], acc8[7]);
+            float tot_6 = warp_tab[parity + 6];
+            tot_6 = tot_6 + warp_tab[parity + 8 + 6];
+            tot_6 = tot_6 + warp_tab[parity + 16 + 6];
+            tot_6 = tot_6 + warp_tab[parity + 24 + 6];
+            tot_6 = tot_6 + warp_tab[parity + 32 + 6];
+            tot_6 = tot_6 + warp_tab[parity + 40 + 6];
+            tot_6 = tot_6 + warp_tab[parity + 48 + 6];
+            tot_6 = tot_6 + warp_tab[parity + 56 + 6];
+            tot_6 = tot_6 + warp_tab[parity + 64 + 6];
+            tot_6 = tot_6 + warp_tab[parity + 72 + 6];
+            tot_6 = tot_6 + warp_tab[parity + 80 + 6];
+            tot_6 = tot_6 + warp_tab[parity + 88 + 6];
+            tot_6 = tot_6 + warp_tab[parity + 96 + 6];
+            tot_6 = tot_6 + warp_tab[parity + 104 + 6];
+            tot_6 = tot_6 + warp_tab[parity + 112 + 6];
+            tot_6 = tot_6 + warp_tab[parity + 120 + 6];
             float _sqrt_92;
-            asm volatile("sqrt.rn.f32 %0, %1;" : "=f"(_sqrt_92) : "f"(__fmaf_rn(tot6, 0.00024414062f, eps)));
-            float rs6 = __frcp_rn(_sqrt_92);
-            float _unpack_bf16_80[8];
+            asm volatile("sqrt.rn.f32 %0, %1;" : "=f"(_sqrt_92) : "f"(__fmaf_rn(tot_6, 0.00024414062f, eps)));
+            float rs_6 = __frcp_rn(_sqrt_92);
+            float _unpack_bf16_72[8];
             #pragma unroll
             for (int _pair = 0; _pair < 4; _pair++) {
                 asm volatile(
@@ -3229,61 +3229,61 @@ kernel_cake_tp_moe_finalize_rmsnorm_6d4722f3bbbeb033a812(__nv_bfloat16* __restri
                     "shl.b32 %0, %2, 16;\n\t"
                     "and.b32 %1, %2, 0xffff0000;\n\t"
                     "}\n"
-                    : "=f"((&_unpack_bf16_80[_pair * 2])[0]), "=f"((&_unpack_bf16_80[_pair * 2])[1])
+                    : "=f"((&_unpack_bf16_72[_pair * 2])[0]), "=f"((&_unpack_bf16_72[_pair * 2])[1])
                     : "r"(rw[24 + _pair]));
             }
-            float yn6_0 = ((mode != 0) ? _unpack_bf16_80[0] * gw8[0] : _unpack_bf16_80[0]);
-            float o6_0 = yn6_0 * rs6;
-            float o2_6_0 = ((mode != 0) ? o6_0 : o6_0 * gw8[0]);
-            acc8[0] = __fmaf_rn(o2_6_0, w8[6], acc8[0]);
-            float yn6_1 = ((mode != 0) ? _unpack_bf16_80[1] * gw8[1] : _unpack_bf16_80[1]);
-            float o6_1 = yn6_1 * rs6;
-            float o2_6_1 = ((mode != 0) ? o6_1 : o6_1 * gw8[1]);
-            acc8[1] = __fmaf_rn(o2_6_1, w8[6], acc8[1]);
-            float yn6_2 = ((mode != 0) ? _unpack_bf16_80[2] * gw8[2] : _unpack_bf16_80[2]);
-            float o6_2 = yn6_2 * rs6;
-            float o2_6_2 = ((mode != 0) ? o6_2 : o6_2 * gw8[2]);
-            acc8[2] = __fmaf_rn(o2_6_2, w8[6], acc8[2]);
-            float yn6_3 = ((mode != 0) ? _unpack_bf16_80[3] * gw8[3] : _unpack_bf16_80[3]);
-            float o6_3 = yn6_3 * rs6;
-            float o2_6_3 = ((mode != 0) ? o6_3 : o6_3 * gw8[3]);
-            acc8[3] = __fmaf_rn(o2_6_3, w8[6], acc8[3]);
-            float yn6_4 = ((mode != 0) ? _unpack_bf16_80[4] * gw8[4] : _unpack_bf16_80[4]);
-            float o6_4 = yn6_4 * rs6;
-            float o2_6_4 = ((mode != 0) ? o6_4 : o6_4 * gw8[4]);
-            acc8[4] = __fmaf_rn(o2_6_4, w8[6], acc8[4]);
-            float yn6_5 = ((mode != 0) ? _unpack_bf16_80[5] * gw8[5] : _unpack_bf16_80[5]);
-            float o6_5 = yn6_5 * rs6;
-            float o2_6_5 = ((mode != 0) ? o6_5 : o6_5 * gw8[5]);
-            acc8[5] = __fmaf_rn(o2_6_5, w8[6], acc8[5]);
-            float yn6_6 = ((mode != 0) ? _unpack_bf16_80[6] * gw8[6] : _unpack_bf16_80[6]);
-            float o6_6 = yn6_6 * rs6;
-            float o2_6_6 = ((mode != 0) ? o6_6 : o6_6 * gw8[6]);
-            acc8[6] = __fmaf_rn(o2_6_6, w8[6], acc8[6]);
-            float yn6_7 = ((mode != 0) ? _unpack_bf16_80[7] * gw8[7] : _unpack_bf16_80[7]);
-            float o6_7 = yn6_7 * rs6;
-            float o2_6_7 = ((mode != 0) ? o6_7 : o6_7 * gw8[7]);
-            acc8[7] = __fmaf_rn(o2_6_7, w8[6], acc8[7]);
-            float tot7 = warp_tab[parity + 7];
-            tot7 = tot7 + warp_tab[parity + 8 + 7];
-            tot7 = tot7 + warp_tab[parity + 16 + 7];
-            tot7 = tot7 + warp_tab[parity + 24 + 7];
-            tot7 = tot7 + warp_tab[parity + 32 + 7];
-            tot7 = tot7 + warp_tab[parity + 40 + 7];
-            tot7 = tot7 + warp_tab[parity + 48 + 7];
-            tot7 = tot7 + warp_tab[parity + 56 + 7];
-            tot7 = tot7 + warp_tab[parity + 64 + 7];
-            tot7 = tot7 + warp_tab[parity + 72 + 7];
-            tot7 = tot7 + warp_tab[parity + 80 + 7];
-            tot7 = tot7 + warp_tab[parity + 88 + 7];
-            tot7 = tot7 + warp_tab[parity + 96 + 7];
-            tot7 = tot7 + warp_tab[parity + 104 + 7];
-            tot7 = tot7 + warp_tab[parity + 112 + 7];
-            tot7 = tot7 + warp_tab[parity + 120 + 7];
+            float yn_48 = ((mode != 0) ? _unpack_bf16_72[0] * gw8[0] : _unpack_bf16_72[0]);
+            float o_48 = yn_48 * rs_6;
+            float o2_8_48 = ((mode != 0) ? o_48 : o_48 * gw8[0]);
+            acc8[0] = __fmaf_rn(o2_8_48, w8[6], acc8[0]);
+            float yn_49 = ((mode != 0) ? _unpack_bf16_72[1] * gw8[1] : _unpack_bf16_72[1]);
+            float o_49 = yn_49 * rs_6;
+            float o2_8_49 = ((mode != 0) ? o_49 : o_49 * gw8[1]);
+            acc8[1] = __fmaf_rn(o2_8_49, w8[6], acc8[1]);
+            float yn_50 = ((mode != 0) ? _unpack_bf16_72[2] * gw8[2] : _unpack_bf16_72[2]);
+            float o_50 = yn_50 * rs_6;
+            float o2_8_50 = ((mode != 0) ? o_50 : o_50 * gw8[2]);
+            acc8[2] = __fmaf_rn(o2_8_50, w8[6], acc8[2]);
+            float yn_51 = ((mode != 0) ? _unpack_bf16_72[3] * gw8[3] : _unpack_bf16_72[3]);
+            float o_51 = yn_51 * rs_6;
+            float o2_8_51 = ((mode != 0) ? o_51 : o_51 * gw8[3]);
+            acc8[3] = __fmaf_rn(o2_8_51, w8[6], acc8[3]);
+            float yn_52 = ((mode != 0) ? _unpack_bf16_72[4] * gw8[4] : _unpack_bf16_72[4]);
+            float o_52 = yn_52 * rs_6;
+            float o2_8_52 = ((mode != 0) ? o_52 : o_52 * gw8[4]);
+            acc8[4] = __fmaf_rn(o2_8_52, w8[6], acc8[4]);
+            float yn_53 = ((mode != 0) ? _unpack_bf16_72[5] * gw8[5] : _unpack_bf16_72[5]);
+            float o_53 = yn_53 * rs_6;
+            float o2_8_53 = ((mode != 0) ? o_53 : o_53 * gw8[5]);
+            acc8[5] = __fmaf_rn(o2_8_53, w8[6], acc8[5]);
+            float yn_54 = ((mode != 0) ? _unpack_bf16_72[6] * gw8[6] : _unpack_bf16_72[6]);
+            float o_54 = yn_54 * rs_6;
+            float o2_8_54 = ((mode != 0) ? o_54 : o_54 * gw8[6]);
+            acc8[6] = __fmaf_rn(o2_8_54, w8[6], acc8[6]);
+            float yn_55 = ((mode != 0) ? _unpack_bf16_72[7] * gw8[7] : _unpack_bf16_72[7]);
+            float o_55 = yn_55 * rs_6;
+            float o2_8_55 = ((mode != 0) ? o_55 : o_55 * gw8[7]);
+            acc8[7] = __fmaf_rn(o2_8_55, w8[6], acc8[7]);
+            float tot_7 = warp_tab[parity + 7];
+            tot_7 = tot_7 + warp_tab[parity + 8 + 7];
+            tot_7 = tot_7 + warp_tab[parity + 16 + 7];
+            tot_7 = tot_7 + warp_tab[parity + 24 + 7];
+            tot_7 = tot_7 + warp_tab[parity + 32 + 7];
+            tot_7 = tot_7 + warp_tab[parity + 40 + 7];
+            tot_7 = tot_7 + warp_tab[parity + 48 + 7];
+            tot_7 = tot_7 + warp_tab[parity + 56 + 7];
+            tot_7 = tot_7 + warp_tab[parity + 64 + 7];
+            tot_7 = tot_7 + warp_tab[parity + 72 + 7];
+            tot_7 = tot_7 + warp_tab[parity + 80 + 7];
+            tot_7 = tot_7 + warp_tab[parity + 88 + 7];
+            tot_7 = tot_7 + warp_tab[parity + 96 + 7];
+            tot_7 = tot_7 + warp_tab[parity + 104 + 7];
+            tot_7 = tot_7 + warp_tab[parity + 112 + 7];
+            tot_7 = tot_7 + warp_tab[parity + 120 + 7];
             float _sqrt_93;
-            asm volatile("sqrt.rn.f32 %0, %1;" : "=f"(_sqrt_93) : "f"(__fmaf_rn(tot7, 0.00024414062f, eps)));
-            float rs7 = __frcp_rn(_sqrt_93);
-            float _unpack_bf16_81[8];
+            asm volatile("sqrt.rn.f32 %0, %1;" : "=f"(_sqrt_93) : "f"(__fmaf_rn(tot_7, 0.00024414062f, eps)));
+            float rs_7 = __frcp_rn(_sqrt_93);
+            float _unpack_bf16_73[8];
             #pragma unroll
             for (int _pair = 0; _pair < 4; _pair++) {
                 asm volatile(
@@ -3291,41 +3291,41 @@ kernel_cake_tp_moe_finalize_rmsnorm_6d4722f3bbbeb033a812(__nv_bfloat16* __restri
                     "shl.b32 %0, %2, 16;\n\t"
                     "and.b32 %1, %2, 0xffff0000;\n\t"
                     "}\n"
-                    : "=f"((&_unpack_bf16_81[_pair * 2])[0]), "=f"((&_unpack_bf16_81[_pair * 2])[1])
+                    : "=f"((&_unpack_bf16_73[_pair * 2])[0]), "=f"((&_unpack_bf16_73[_pair * 2])[1])
                     : "r"(rw[28 + _pair]));
             }
-            float yn7_0 = ((mode != 0) ? _unpack_bf16_81[0] * gw8[0] : _unpack_bf16_81[0]);
-            float o7_0 = yn7_0 * rs7;
-            float o2_7_0 = ((mode != 0) ? o7_0 : o7_0 * gw8[0]);
-            acc8[0] = __fmaf_rn(o2_7_0, w8[7], acc8[0]);
-            float yn7_1 = ((mode != 0) ? _unpack_bf16_81[1] * gw8[1] : _unpack_bf16_81[1]);
-            float o7_1 = yn7_1 * rs7;
-            float o2_7_1 = ((mode != 0) ? o7_1 : o7_1 * gw8[1]);
-            acc8[1] = __fmaf_rn(o2_7_1, w8[7], acc8[1]);
-            float yn7_2 = ((mode != 0) ? _unpack_bf16_81[2] * gw8[2] : _unpack_bf16_81[2]);
-            float o7_2 = yn7_2 * rs7;
-            float o2_7_2 = ((mode != 0) ? o7_2 : o7_2 * gw8[2]);
-            acc8[2] = __fmaf_rn(o2_7_2, w8[7], acc8[2]);
-            float yn7_3 = ((mode != 0) ? _unpack_bf16_81[3] * gw8[3] : _unpack_bf16_81[3]);
-            float o7_3 = yn7_3 * rs7;
-            float o2_7_3 = ((mode != 0) ? o7_3 : o7_3 * gw8[3]);
-            acc8[3] = __fmaf_rn(o2_7_3, w8[7], acc8[3]);
-            float yn7_4 = ((mode != 0) ? _unpack_bf16_81[4] * gw8[4] : _unpack_bf16_81[4]);
-            float o7_4 = yn7_4 * rs7;
-            float o2_7_4 = ((mode != 0) ? o7_4 : o7_4 * gw8[4]);
-            acc8[4] = __fmaf_rn(o2_7_4, w8[7], acc8[4]);
-            float yn7_5 = ((mode != 0) ? _unpack_bf16_81[5] * gw8[5] : _unpack_bf16_81[5]);
-            float o7_5 = yn7_5 * rs7;
-            float o2_7_5 = ((mode != 0) ? o7_5 : o7_5 * gw8[5]);
-            acc8[5] = __fmaf_rn(o2_7_5, w8[7], acc8[5]);
-            float yn7_6 = ((mode != 0) ? _unpack_bf16_81[6] * gw8[6] : _unpack_bf16_81[6]);
-            float o7_6 = yn7_6 * rs7;
-            float o2_7_6 = ((mode != 0) ? o7_6 : o7_6 * gw8[6]);
-            acc8[6] = __fmaf_rn(o2_7_6, w8[7], acc8[6]);
-            float yn7_7 = ((mode != 0) ? _unpack_bf16_81[7] * gw8[7] : _unpack_bf16_81[7]);
-            float o7_7 = yn7_7 * rs7;
-            float o2_7_7 = ((mode != 0) ? o7_7 : o7_7 * gw8[7]);
-            acc8[7] = __fmaf_rn(o2_7_7, w8[7], acc8[7]);
+            float yn_56 = ((mode != 0) ? _unpack_bf16_73[0] * gw8[0] : _unpack_bf16_73[0]);
+            float o_56 = yn_56 * rs_7;
+            float o2_8_56 = ((mode != 0) ? o_56 : o_56 * gw8[0]);
+            acc8[0] = __fmaf_rn(o2_8_56, w8[7], acc8[0]);
+            float yn_57 = ((mode != 0) ? _unpack_bf16_73[1] * gw8[1] : _unpack_bf16_73[1]);
+            float o_57 = yn_57 * rs_7;
+            float o2_8_57 = ((mode != 0) ? o_57 : o_57 * gw8[1]);
+            acc8[1] = __fmaf_rn(o2_8_57, w8[7], acc8[1]);
+            float yn_58 = ((mode != 0) ? _unpack_bf16_73[2] * gw8[2] : _unpack_bf16_73[2]);
+            float o_58 = yn_58 * rs_7;
+            float o2_8_58 = ((mode != 0) ? o_58 : o_58 * gw8[2]);
+            acc8[2] = __fmaf_rn(o2_8_58, w8[7], acc8[2]);
+            float yn_59 = ((mode != 0) ? _unpack_bf16_73[3] * gw8[3] : _unpack_bf16_73[3]);
+            float o_59 = yn_59 * rs_7;
+            float o2_8_59 = ((mode != 0) ? o_59 : o_59 * gw8[3]);
+            acc8[3] = __fmaf_rn(o2_8_59, w8[7], acc8[3]);
+            float yn_60 = ((mode != 0) ? _unpack_bf16_73[4] * gw8[4] : _unpack_bf16_73[4]);
+            float o_60 = yn_60 * rs_7;
+            float o2_8_60 = ((mode != 0) ? o_60 : o_60 * gw8[4]);
+            acc8[4] = __fmaf_rn(o2_8_60, w8[7], acc8[4]);
+            float yn_61 = ((mode != 0) ? _unpack_bf16_73[5] * gw8[5] : _unpack_bf16_73[5]);
+            float o_61 = yn_61 * rs_7;
+            float o2_8_61 = ((mode != 0) ? o_61 : o_61 * gw8[5]);
+            acc8[5] = __fmaf_rn(o2_8_61, w8[7], acc8[5]);
+            float yn_62 = ((mode != 0) ? _unpack_bf16_73[6] * gw8[6] : _unpack_bf16_73[6]);
+            float o_62 = yn_62 * rs_7;
+            float o2_8_62 = ((mode != 0) ? o_62 : o_62 * gw8[6]);
+            acc8[6] = __fmaf_rn(o2_8_62, w8[7], acc8[6]);
+            float yn_63 = ((mode != 0) ? _unpack_bf16_73[7] * gw8[7] : _unpack_bf16_73[7]);
+            float o_63 = yn_63 * rs_7;
+            float o2_8_63 = ((mode != 0) ? o_63 : o_63 * gw8[7]);
+            acc8[7] = __fmaf_rn(o2_8_63, w8[7], acc8[7]);
             unsigned int acc8_bf16[4];
             #pragma unroll
             for (int _lp = 0; _lp < 4; _lp++) {
