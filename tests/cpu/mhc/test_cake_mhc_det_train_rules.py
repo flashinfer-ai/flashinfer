@@ -97,10 +97,13 @@ MAP_LIBRARY = {
     "nsx_st5_mb1": "cake_mhc_det_train_fwd_map__nsx_st5_mb1",
     "nsx_g2_ol2l": "cake_mhc_det_train_fwd_map__nsx_g2_ol2l",
     "ns96_g2_ol2l": "cake_mhc_det_train_fwd_map__ns96_g2_ol2l",
+    "ns96_g2_ol2l_ct": "cake_mhc_det_train_fwd_map__ns96_g2_ol2l_ct",
     "nsx_ct": "cake_mhc_det_train_fwd_map__nsx_ct",
     "tk_nsx_g2_ol2l_ct": "cake_mhc_det_train_fwd_map__tk_nsx_g2_ol2l_ct",
     # nsx's ticket form is not exported: where the rule names it (no SM count of record) its __tk record runs nsx
     "tk_nsx_ct": "cake_mhc_det_train_fwd_map__nsx",
+    # likewise ns96_g2_ol2l's ticket form (sm_100a): its __tk record runs ns96_g2_ol2l
+    "tk_ns96_g2_ol2l_ct": "cake_mhc_det_train_fwd_map__ns96_g2_ol2l",
 }
 COEF_LIBRARY = {
     "qe_mb10": "cake_mhc_det_train_fwd_coef__qe_mb10",
@@ -221,6 +224,7 @@ LIBRARY_ARCHES = {
     "cake_mhc_det_train_fwd_finish__r2": ("sm_107a",),
     "cake_mhc_det_train_fwd_map": ("sm_107a",),
     "cake_mhc_det_train_fwd_map__ns96_g2_ol2l": ("sm_100a",),
+    "cake_mhc_det_train_fwd_map__ns96_g2_ol2l_ct": ("sm_100a",),
     "cake_mhc_det_train_fwd_map__nsx": ("sm_103a",),
     "cake_mhc_det_train_fwd_map__nsx_ct": ("sm_103a",),
     "cake_mhc_det_train_fwd_map__nsx_g2_ol2l": ("sm_100a", "sm_103a", "sm_107a"),
@@ -241,6 +245,10 @@ MULTI_RECORDS = {
     "cake_mhc_det_train_fwd_map__nsx": [
         "cake_mhc_det_train_fwd_map__nsx",
         "cake_mhc_det_train_fwd_map__nsx__tk",
+    ],
+    "cake_mhc_det_train_fwd_map__ns96_g2_ol2l": [
+        "cake_mhc_det_train_fwd_map__ns96_g2_ol2l",
+        "cake_mhc_det_train_fwd_map__ns96_g2_ol2l__tk",
     ],
     "cake_mhc_det_train_fwd_map__nsx_g2_ol2l": [
         "cake_mhc_det_train_fwd_map__nsx_g2_ol2l",
@@ -277,7 +285,7 @@ MULTI_RECORDS = {
         "cake_mhc_det_train_bwd_slab__xrsg__a7",
     ],
 }
-N_RECORDS, N_LIBRARIES = 60, 45
+N_RECORDS, N_LIBRARIES = 62, 46
 RECORD_SCALARS = {
     "cake_mhc_det_train_fn_split": {"want_t": 0},
     "cake_mhc_det_train_fn_split__tv128__t": {"want_t": 1},
@@ -305,7 +313,7 @@ TABLES = {
     },
     "FWD_MAP_CLAIM": {
         "sm_100a": (
-            ("ns96_g2_ol2l", "tk_ns96_g2_ol2l_ct", None),
+            ("ns96_g2_ol2l", "tk_ns96_g2_ol2l_ct", "ns96_g2_ol2l_ct"),
             ("nsx_g2_ol2l", "tk_nsx_g2_ol2l_ct", None),
         ),
         "sm_103a": (
@@ -332,7 +340,18 @@ TABLES = {
         "sm_107a": (),
     },
     "BWD_SLAB_FIT": {
-        "sm_100a": ("dynl", "xrsg", (9, 19), ((7, 1536, 1792), (7, 1920, 2240))),
+        "sm_100a": (
+            "dynl",
+            "xrsg",
+            (),
+            (
+                (7, 1536, 1792),
+                (9, 2176, 2304),
+                (7, 1920, 2240),
+                (19, 2304, 2432),
+                (19, 3584, 3648),
+            ),
+        ),
         "sm_103a": None,
         "sm_107a": None,
     },
@@ -603,15 +622,15 @@ DISPATCH_EXPECTED = (
     (1664, 'sm_103a', 152, 32, 416, 'nsx', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
     (1664, 'sm_107a', 208, 16, 208, 'nsx_st5_mb1', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
     (1664, 'sm_107a', 216, 16, 208, 'nsx_st5_mb1', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
-    (1665, 'sm_100a', 148, 8, 112, 'nsx_st5_mb1', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4_spred', 411),
+    (1665, 'sm_100a', 148, 8, 112, 'nsx_st5_mb1', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_tma_ntr', 'dynl', 'wpu4_spred', 411),
     (1665, 'sm_103a', 152, 32, 448, 'nsx', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
     (1665, 'sm_107a', 208, 32, 448, 'nsx_g2_ol2l', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
     (1665, 'sm_107a', 216, 32, 448, 'nsx_g2_ol2l', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
-    (1720, 'sm_100a', 148, 8, 112, 'nsx_st5_mb1', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4_spred', 411),
+    (1720, 'sm_100a', 148, 8, 112, 'nsx_st5_mb1', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_tma_ntr', 'dynl', 'wpu4_spred', 411),
     (1720, 'sm_103a', 152, 32, 448, 'nsx', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
     (1720, 'sm_107a', 208, 32, 448, 'nsx_g2_ol2l', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
     (1720, 'sm_107a', 216, 32, 448, 'nsx_g2_ol2l', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
-    (1721, 'sm_100a', 148, 8, 112, 'nsx_st5_mb1', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4_spred', 411),
+    (1721, 'sm_100a', 148, 8, 112, 'nsx_st5_mb1', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_tma_ntr', 'dynl', 'wpu4_spred', 411),
     (1721, 'sm_103a', 152, 32, 448, 'nsx', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
     (1721, 'sm_107a', 208, 32, 448, 'nsx_g2_ol2l', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
     (1721, 'sm_107a', 216, 32, 448, 'nsx_g2_ol2l', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
@@ -651,27 +670,27 @@ DISPATCH_EXPECTED = (
     (2561, 'sm_103a', 152, 32, 672, 'nsx', 'qe_mb10_tree', 16, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
     (2561, 'sm_107a', 208, 8, 168, 'nsx_st5_mb1', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
     (2561, 'sm_107a', 216, 8, 168, 'nsx_st5_mb1', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
-    (3328, 'sm_100a', 148, 16, 416, 'ns96_g2_ol2l', 'st16_lp2_as_el_qd', 16, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4_spred', 411),
+    (3328, 'sm_100a', 148, 16, 416, 'ns96_g2_ol2l', 'st16_lp2_as_el_qd', 16, 'ao22_rae7_pd1_tma_ntr', 'dynl', 'wpu4_spred', 411),
     (3328, 'sm_103a', 152, 16, 416, 'nsx', 'qe_mb10_tree', 16, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
     (3328, 'sm_107a', 208, 8, 208, 'nsx_st5_mb1', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
     (3328, 'sm_107a', 216, 8, 208, 'nsx_st5_mb1', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
-    (3329, 'sm_100a', 148, 16, 432, 'ns96_g2_ol2l', 'st16_lp2_as_el_qd', 16, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4_spred', 411),
+    (3329, 'sm_100a', 148, 16, 432, 'ns96_g2_ol2l', 'st16_lp2_as_el_qd', 16, 'ao22_rae7_pd1_tma_ntr', 'dynl', 'wpu4_spred', 411),
     (3329, 'sm_103a', 152, 16, 432, 'nsx', 'qe_mb10_tree', 16, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
     (3329, 'sm_107a', 208, 32, 864, 'nsx_g2_ol2l', 'pfl2_qmt', 16, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
     (3329, 'sm_107a', 216, 8, 216, 'nsx_st5_mb1', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
-    (3456, 'sm_100a', 148, 16, 432, 'ns96_g2_ol2l', 'st16_lp2_as_el_qd', 16, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4_spred', 411),
+    (3456, 'sm_100a', 148, 16, 432, 'ns96_g2_ol2l', 'st16_lp2_as_el_qd', 16, 'ao22_rae7_pd1_tma_ntr', 'dynl', 'wpu4_spred', 411),
     (3456, 'sm_103a', 152, 16, 432, 'nsx', 'qe_mb10_tree', 16, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
     (3456, 'sm_107a', 208, 32, 864, 'nsx_g2_ol2l', 'pfl2_qmt', 16, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
     (3456, 'sm_107a', 216, 8, 216, 'nsx_st5_mb1', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
-    (3457, 'sm_100a', 148, 8, 224, 'ns96_g2_ol2l', 'qe_mb10_tree', 16, 'ao22_rae7_pd1_tma_ntr', 'dynl', 'wpu4_spred', 411),
+    (3457, 'sm_100a', 148, 8, 224, 'ns96_g2_ol2l_ct', 'qe_mb10_tree', 16, 'ao22_rae7_pd1_tma_ntr', 'dynl', 'wpu4_spred', 411),
     (3457, 'sm_103a', 152, 16, 448, 'nsx', 'qe_mb10_tree', 16, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
     (3457, 'sm_107a', 208, 32, 896, 'nsx_g2_ol2l', 'pfl2_qmt', 16, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
     (3457, 'sm_107a', 216, 32, 896, 'nsx_g2_ol2l', 'pfl2_qmt', 16, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
-    (4095, 'sm_100a', 148, 8, 256, 'ns96_g2_ol2l', 'qe_mb10_tree', 16, 'ao22_rae7_pd1_tma_ntr', 'dynl', 'wpu4_fadd', 411),
+    (4095, 'sm_100a', 148, 8, 256, 'ns96_g2_ol2l_ct', 'qe_mb10_tree', 16, 'ao22_rae7_pd1_tma_ntr', 'dynl', 'wpu4_fadd', 411),
     (4095, 'sm_103a', 152, 8, 256, 'nsx_ct', 'qe_mb10_tree', 16, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
     (4095, 'sm_107a', 208, 32, 1024, 'nsx_g2_ol2l', 'pfl2_qmt', 16, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
     (4095, 'sm_107a', 216, 32, 1024, 'nsx_g2_ol2l', 'pfl2_qmt', 16, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
-    (4096, 'sm_100a', 148, 8, 256, 'ns96_g2_ol2l', 'qe_mb10_tree', 16, 'ao22_rae7_pd1_tma_ntr', 'dynl', 'wpu4_fadd', 411),
+    (4096, 'sm_100a', 148, 8, 256, 'ns96_g2_ol2l_ct', 'qe_mb10_tree', 16, 'ao22_rae7_pd1_tma_ntr', 'dynl', 'wpu4_fadd', 411),
     (4096, 'sm_103a', 152, 8, 256, 'nsx_ct', 'qe_mb10_tree', 16, 'ao22_rae7_pd1_ntr', 'dynr', 'pt32', 3099),
     (4096, 'sm_107a', 208, 32, 1024, 'nsx_g2_ol2l', 'pfl2_qmt', 16, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
     (4096, 'sm_107a', 216, 32, 1024, 'nsx_g2_ol2l', 'pfl2_qmt', 16, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
@@ -1060,7 +1079,7 @@ RULES_ROWS = (
     (2049, 152, 'sm_103a', 2176, True, 8, 136, 136, 7, 448, 152, 320, 257, 8, 129, 608, 4098, 1025, 2049, 4886784, 14815744, 'b16', 'tv128', 256, 256, 'qe_mb10_tree', 'nsx_st5_mb1', 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563, 't128', 'production'),
     (2049, 208, 'sm_107a', 2176, True, 32, 544, 416, 3, 192, 192, 704, 257, 8, 129, 832, 4098, 2049, 2049, 10109184, 8524288, 'b16', 'tv128_t128', 256, 512, 'pfl2_qmt', 'nsx_g2_ol2l', 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411, 't128', 'r2'),
     (2049, 216, 'sm_107a', 2176, True, 32, 544, 432, 3, 192, 192, 704, 257, 8, 129, 864, 4098, 2049, 2049, 10109184, 8524288, 'b16', 'tv128_t128', 256, 512, 'pfl2_qmt', 'nsx_g2_ol2l', 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411, 't128', 'r2'),
-    (4096, 148, 'sm_100a', 4096, True, 8, 256, 256, 16, 1024, 148, 256, 296, 16, 256, 592, 8192, 2048, 4096, 6422784, 29529344, 'b16', 'tv128', 256, 256, 'qe_mb10_tree', 'ns96_g2_ol2l', 'ao22_rae7_pd1_tma_ntr', 'dynl', 'wpu4_fadd', 411, 't128', 'production'),
+    (4096, 148, 'sm_100a', 4096, True, 8, 256, 256, 16, 1024, 148, 256, 296, 16, 256, 592, 8192, 2048, 4096, 6422784, 29529344, 'b16', 'tv128', 256, 256, 'qe_mb10_tree', 'ns96_g2_ol2l_ct', 'ao22_rae7_pd1_tma_ntr', 'dynl', 'wpu4_fadd', 411, 't128', 'production'),
     (4096, 152, 'sm_103a', 4096, True, 8, 256, 256, 16, 1024, 152, 256, 304, 16, 256, 608, 8192, 2048, 4096, 6422784, 29530368, 'b16', 'tv128', 256, 256, 'qe_mb10_tree', 'nsx_ct', 'ao22_rae7_pd1_ntr', 'dynr', 'pt32', 3099, 't128', 'production'),
     (4096, 208, 'sm_107a', 4096, True, 32, 1024, 416, 13, 832, 208, 320, 416, 16, 256, 832, 8192, 4096, 4096, 16253184, 24826112, 'b16', 'tv128_t128', 256, 512, 'pfl2_qmt', 'nsx_g2_ol2l', 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411, 't128', 'r2'),
     (4096, 216, 'sm_107a', 4096, True, 32, 1024, 432, 13, 832, 216, 320, 432, 16, 256, 864, 8192, 4096, 4096, 16253184, 24828160, 'b16', 'tv128_t128', 256, 512, 'pfl2_qmt', 'nsx_g2_ol2l', 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411, 't128', 'r2'),
@@ -1125,6 +1144,8 @@ LAUNCH_FACTS = {
     "cake_mhc_det_train_fwd_map__tk_nsx_g2_ol2l_ct": ((192, 1, 1), 114944, 2),
     "cake_mhc_det_train_fwd_map__nsx_st5_mb1__a3": ((192, 1, 1), 144384, 1),
     "cake_mhc_det_train_fwd_map__ns96_g2_ol2l": ((192, 1, 1), 115712, 2),
+    "cake_mhc_det_train_fwd_map__ns96_g2_ol2l__tk": ((192, 1, 1), 115712, 2),
+    "cake_mhc_det_train_fwd_map__ns96_g2_ol2l_ct": ((192, 1, 1), 114816, 2),
     "cake_mhc_det_train_fwd_map__nsx_g2_ol2l__a3": ((192, 1, 1), 115712, 2),
     "cake_mhc_det_train_fwd_map__nsx_st5_mb1__a7": ((192, 1, 1), 144384, 1),
     "cake_mhc_det_train_fwd_map__nsx_g2_ol2l__a7": ((192, 1, 1), 115712, 2),
@@ -1187,6 +1208,8 @@ RECORD_ARCHES = {
     "cake_mhc_det_train_fwd_map__tk_nsx_g2_ol2l_ct": ("sm_100a", "sm_103a"),
     "cake_mhc_det_train_fwd_map__nsx_st5_mb1__a3": ("sm_100a",),
     "cake_mhc_det_train_fwd_map__ns96_g2_ol2l": ("sm_100a",),
+    "cake_mhc_det_train_fwd_map__ns96_g2_ol2l__tk": ("sm_100a",),
+    "cake_mhc_det_train_fwd_map__ns96_g2_ol2l_ct": ("sm_100a",),
     "cake_mhc_det_train_fwd_map__nsx_g2_ol2l__a3": ("sm_100a",),
     "cake_mhc_det_train_fwd_map__nsx_st5_mb1__a7": ("sm_107a",),
     "cake_mhc_det_train_fwd_map__nsx_g2_ol2l__a7": ("sm_107a",),
@@ -1547,7 +1570,7 @@ def test_dispatch_of_record_at_the_boundaries() -> None:
     assert loader.fwd_map_program(16263, 152, "sm_103a") == "tk_nsx_g2_ol2l_ct"
     assert loader.fwd_map_program(16263, 148, "sm_100a") == "nsx_g2_ol2l"
     assert loader.fwd_map_program(32768, 148, "sm_100a") == "tk_nsx_g2_ol2l_ct"
-    assert loader.fwd_map_program(4096, 148, "sm_100a") == "ns96_g2_ol2l"
+    assert loader.fwd_map_program(4096, 148, "sm_100a") == "ns96_g2_ol2l_ct"
     assert loader.K5_GRID_BANDS == {
         "sm_100a": ((0, 1024, 2),),
         "sm_103a": ((0, 4096, 2),),
@@ -1640,16 +1663,28 @@ def test_dispatch_of_record_at_the_boundaries() -> None:
         for _above, _at_most, program in loader.BWD_SLAB_BANDS[arch]:
             assert SLAB_LIBRARY[program] in LIBRARY_ARCHES, (arch, program)
     # the column-slab programs of record: on sm_100a the late-claim form dynl for 1024 < T <= 4096 (its
-    # token-count band) but where BWD_SLAB_FIT keeps xrsg (the K7 units fit the SMs in one round, the chunk
-    # counts P = 9 and P = 19, the P = 7 runs 1537..1792 and 1921..2240), the dynamic-schedule form dynr at the
-    # other token counts on sm_100a and at every token count on sm_103a, xrsg at every token count on sm_107a
+    # token-count band) but where BWD_SLAB_FIT keeps xrsg (the K7 units fit the SMs in one round, the runs
+    # P = 7 1537..1792 and 1921..2240, P = 9 2177..2304, P = 19 2305..2432 and 3585..3648), the dynamic-schedule
+    # form dynr at the other token counts on sm_100a and at every token count on sm_103a, xrsg at every token count
+    # on sm_107a
     assert loader.BWD_SLAB_BANDS == {
         "sm_100a": ((1024, 4096, "dynl"),),
         "sm_103a": (),
         "sm_107a": (),
     }
     assert loader.BWD_SLAB_FIT == {
-        "sm_100a": ("dynl", "xrsg", (9, 19), ((7, 1536, 1792), (7, 1920, 2240))),
+        "sm_100a": (
+            "dynl",
+            "xrsg",
+            (),
+            (
+                (7, 1536, 1792),
+                (9, 2176, 2304),
+                (7, 1920, 2240),
+                (19, 2304, 2432),
+                (19, 3584, 3648),
+            ),
+        ),
         "sm_103a": None,
         "sm_107a": None,
     }
@@ -1663,8 +1698,13 @@ def test_dispatch_of_record_at_the_boundaries() -> None:
             k7 = "dynr"
             if 1024 < T <= 4096:
                 P, units = loader.k7_chunks(T, sm)[:2]
-                run = P == 7 and (1536 < T <= 1792 or 1920 < T <= 2240)
-                k7 = "xrsg" if units <= sm or P in (9, 19) or run else "dynl"
+                run = (
+                    (P == 7 and (1536 < T <= 1792 or 1920 < T <= 2240))
+                    or (P == 9 and 2176 < T <= 2304)
+                    or (P == 19 and 2304 < T <= 2432)
+                    or (P == 19 and 3584 < T <= 3648)
+                )
+                k7 = "xrsg" if units <= sm or run else "dynl"
             slab = [loader.bwd_slab_program(T, sm, arch) for arch in ARCHES]
             assert slab == [k7, "dynr", "xrsg"], (T, sm)
     # the band's edges on 148 SMs (xrsg from 1025 to 2048 tokens, dynl from 2049: P = 11; 4096: P = 16) and the
