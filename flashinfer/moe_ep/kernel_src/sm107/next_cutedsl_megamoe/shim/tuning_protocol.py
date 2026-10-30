@@ -42,6 +42,33 @@ def _json(value):
     return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
 
 
+def _publish_record(context, record):
+    """Publish a fixed-variant winner on the designated writer rank."""
+    key = hashlib.sha256(
+        _json(
+            {
+                k: v
+                for k, v in record.items()
+                if k
+                not in (
+                    "knobs",
+                    "p50_us",
+                    "source",
+                    "tuned_at",
+                    "measurement_policy",
+                    "profiling_policy",
+                )
+            }
+        ).encode()
+    ).hexdigest()
+    context.publish(key, record)
+    if context.disk_cache_enabled:
+        try:
+            knob_cache.write_record(record)
+        except Exception as exc:
+            logger.warning(f"[Autotuner]: Cannot write MegaMoE cache file: {exc}")
+
+
 class RubinTuningProtocol:
     """Collective candidate selection with managed cache compatibility."""
 
@@ -208,6 +235,22 @@ class RubinTuningProtocol:
             **query,
         )
 
+    def _lookup_cached(self, query, contract, context, measurement):
+        if context.force_tune or context.skipped:
+            return None
+        record = self._lookup(
+            list(context.records().values()), query, contract, context, measurement
+        )
+        if record is None and context.disk_cache_enabled:
+            path = knob_cache.knob_cache_path()
+            try:
+                entries = [] if path is None else knob_cache._load_entries(path)
+            except Exception as exc:
+                logger.warning(f"[Autotuner]: Cannot read MegaMoE cache file: {exc}")
+                entries = []
+            record = self._lookup(entries, query, contract, context, measurement)
+        return record
+
     def run(self, context: TuningContext) -> TuningResult:
         import torch
         import torch.distributed as dist
@@ -307,21 +350,7 @@ class RubinTuningProtocol:
             raise ValueError(
                 "EP ranks disagree on the Rubin tuning implementation or device"
             )
-        record = None
-        if not context.force_tune:
-            record = self._lookup(
-                list(context.records().values()), query, contract, context, measurement
-            )
-            if record is None and context.disk_cache_enabled:
-                path = knob_cache.knob_cache_path()
-                try:
-                    entries = [] if path is None else knob_cache._load_entries(path)
-                except Exception as exc:
-                    logger.warning(
-                        f"[Autotuner]: Cannot read MegaMoE cache file: {exc}"
-                    )
-                    entries = []
-                record = self._lookup(entries, query, contract, context, measurement)
+        record = self._lookup_cached(query, contract, context, measurement)
         cache_hit = record is not None
         if record is None:
             if not context.tuning_enabled:
@@ -390,32 +419,7 @@ class RubinTuningProtocol:
         if cfg.rank == 0:
             try:
                 record = {**record, "protocol_contract": contract}
-                key = hashlib.sha256(
-                    _json(
-                        {
-                            k: v
-                            for k, v in record.items()
-                            if k
-                            not in (
-                                "knobs",
-                                "p50_us",
-                                "source",
-                                "tuned_at",
-                                "measurement_policy",
-                                "profiling_policy",
-                            )
-                        }
-                    ).encode()
-                ).hexdigest()
-                context.publish(key, record)
-                # File consumers must see winners selected from either cache.
-                if context.disk_cache_enabled:
-                    try:
-                        knob_cache.write_record(record)
-                    except Exception as exc:
-                        logger.warning(
-                            f"[Autotuner]: Cannot write MegaMoE cache file: {exc}"
-                        )
+                _publish_record(context, record)
             except Exception as exc:
                 error = f"{type(exc).__name__}: {exc}"
         errors = self._gather(error)

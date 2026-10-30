@@ -321,9 +321,9 @@ or file access and raises before a successful automatic search or after layer
 destruction. `warmup()` continues to return `None`.
 
 On Rubin, `kernel_variant="auto"` together with `knobs="auto"` selects between
-inference and GenPhase. An enabled `autotune_v2()` warmup measures every knob
-candidate including input staging, compute and output handling, then selects the
-best of each variant's winners. Both levels use the same timing boundary.
+inference and GenPhase. An enabled `autotune_v2()` warmup selects each variant's
+knobs, then compares the winners. Candidate measurements
+include input staging, compute and output handling at both levels.
 The same numerical settings apply to both variants;
 GenPhase is excluded when its capacity or combine requirements are not met.
 Explicit inference or GenPhase with `knobs="auto"` uses the same complete-forward
@@ -333,10 +333,19 @@ BF16 inputs. Output copies are measured when the selected path requires them. In
 checks are outside measurement. Match the deployment's input and output layouts
 when reusing automatic results; kernel-only records do not satisfy this objective.
 
-Variant selection has its own managed-cache entry containing the variant and
-knobs. Selecting a result also writes its knobs and execution contract to the
-MegaMoE compatibility file when persistence is enabled. Fixed-variant tuning
-retains compatible-capacity lookup in both stores. A variant-selection replay
+Each variant's winning knobs are stored in its fixed-variant managed-cache
+records and the MegaMoE compatibility file when persistence is enabled. The
+overall selection has a separate managed entry containing the variant and knobs,
+matched to the workspace capacity, per-rank live-token counts, eligible variants
+and execution contract. On an overall miss, tuning reuses compatible fixed-variant
+records, including token-bucket fallbacks, and searches missing variants. Cached
+partial-batch records stay within their workspace capacity; full-capacity records
+can supply knobs for another capacity, following fixed-variant lookup. Cached
+knobs are checked and timed at the current workload before comparing variants;
+a rejected cached choice triggers a fresh search within that variant. Reused
+records retain their original workload and score. An explicit fresh search
+bypasses both levels. Skipping fixed-variant tuning compares heuristic knobs
+without publishing fixed-variant managed records. A variant-selection replay
 miss uses the inference heuristic and leaves selection pending. Low-level tuning
 of already-staged workspaces remains available for kernel measurements.
 

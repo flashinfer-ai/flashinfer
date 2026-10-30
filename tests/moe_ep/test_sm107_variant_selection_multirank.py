@@ -1,5 +1,7 @@
 """Rubin variant selection on real inputs, persisted reuse and captured storage."""
 
+import dataclasses
+
 import pytest
 import torch
 import torch.distributed as dist
@@ -39,6 +41,7 @@ from tests.moe_ep import test_moe_ep_sm107_block_scaled_mega_multirank as proble
             "late-situ-empty",
             "inference-only",
             "native-skipped",
+            "inner-reuse",
         )
     ],
 )
@@ -91,6 +94,8 @@ def test_variant_search_replay_and_handoff(
         num_experts=problem.NUM_EXPERTS,
         max_tokens_per_rank=1025
         if scenario == "inference-only"
+        else problem.NUM_TOKENS
+        if scenario == "inner-reuse"
         else problem.MAX_TOKENS,
         token_hidden_size=problem.HIDDEN,
     )
@@ -127,12 +132,13 @@ def test_variant_search_replay_and_handoff(
     layers = [layer]
     graph = None
     calls = []
+    reusing_inner = False
     sweep = native._sweep_sm107_block_scaled_mega_moe
 
     def counted(*args, **kwargs):
         calls.append(args[3].config.kernel_variant)
         assert kwargs["make_trial"] is not None
-        if scenario == "native-skipped":
+        if scenario == "native-skipped" or reusing_inner:
             assert len(kwargs["candidates"]) == 1
         return sweep(*args, **kwargs)
 
@@ -219,6 +225,54 @@ def test_variant_search_replay_and_handoff(
         assert all(value == choices for value in values)
         if rank == 0:
             assert records
+        if scenario == "inner-reuse":
+            inner = tuner.get_protocol_records(NATIVE_NAMESPACE)
+            if rank == 0:
+                assert {r["kernel_variant"] for r in inner.values()} == {
+                    "inference",
+                    "genphase",
+                }
+            larger = moe_ep.MoEEpLayer(
+                bootstrap,
+                dataclasses.replace(
+                    fleet, max_tokens_per_rank=2 * fleet.max_tokens_per_rank
+                ),
+                local_pack,
+                backend=moe_ep.MegaConfig(
+                    megakernel=cfg,
+                    transformed_weights=transformed,
+                    quantize_input=not prequantized,
+                ),
+            )
+            layers.append(larger)
+            with autotune_v2(mode="replay", **context_options):
+                larger.warmup(tensors)
+                assert_reference(larger.forward(tensors), expected, kind)
+            assert calls == expected_calls
+            reusing_inner = True
+            with autotune_v2(**context_options):
+                larger.warmup(tensors)
+            assert calls == expected_calls * 2
+            assert_reference(larger.forward(tensors), expected, kind)
+            if rank == 0:
+                assert tuner.get_protocol_records(NATIVE_NAMESPACE) == inner
+            for variant in ("inference", "genphase"):
+                pinned = moe_ep.MoEEpLayer(
+                    bootstrap,
+                    fleet,
+                    local_pack,
+                    backend=moe_ep.MegaConfig(
+                        megakernel=dataclasses.replace(cfg, kernel_variant=variant),
+                        transformed_weights=transformed,
+                        quantize_input=not prequantized,
+                    ),
+                )
+                layers.append(pinned)
+                with autotune_v2(mode="replay", **context_options):
+                    pinned.warmup(tensors)
+                    assert pinned.get_tuned_config().kernel_variant == variant
+                    assert_reference(pinned.forward(tensors), expected, kind)
+            assert calls == expected_calls * 2
         graph.reset()
         graph = None
         torch.cuda.synchronize()

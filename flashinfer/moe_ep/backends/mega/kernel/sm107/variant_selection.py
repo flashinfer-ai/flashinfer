@@ -356,7 +356,7 @@ class _VariantProtocol:
             "timing_boundary": "complete_forward_candidates",
             "variants": variants,
             "allow_nondeterministic": self.backend._config.in_kernel_fc2_reduce,
-            "native_skipped": _cache_identity(context)[1],
+            "native_skipped": _cache_identity(context)[1] and not context.force_tune,
             "capacity": owner.fleet.max_tokens_per_rank,
             "inputs": self.backend._gather(self.tensors.num_tokens),
             "measurement_policy": context.measurement_policy.manifest_fields()
@@ -420,10 +420,18 @@ class _VariantProtocol:
 
     def run(self, context: TuningContext):
         from .....core.tuning_measurement import measurement_settings
+        from .....kernel_src.sm107.next_cutedsl_megamoe.shim.tuning_protocol import (
+            NAMESPACE as NATIVE_NAMESPACE,
+            RubinTuningProtocol,
+            _publish_record,
+        )
 
         backend, owner = self.backend, self.owner
         state = owner._tuning_state
         measurement = measurement_settings(context)
+        native_context = context.tuner.protocol_context(
+            NATIVE_NAMESPACE, force_tune=context.force_tune
+        )
         controls = (
             context.tuning_enabled,
             context.force_tune,
@@ -469,6 +477,7 @@ class _VariantProtocol:
                 None,
             )
         cache_hit = record is not None
+        inner_records = []
         if record is None and not context.tuning_enabled:
             if state.winner is not None:
                 replacement = backend._allocate_workspace(owner.fleet)
@@ -487,9 +496,6 @@ class _VariantProtocol:
                 NoPassingCandidate,
                 _sweep_sm107_block_scaled_mega_moe,
                 sm107_candidates,
-            )
-            from .....kernel_src.sm107.next_cutedsl_megamoe.shim.tuning_protocol import (
-                RubinTuningProtocol,
             )
 
             candidates = []
@@ -520,44 +526,64 @@ class _VariantProtocol:
                         and workspace.config.combine_dtype == "bf16",
                     )
                 )
-                try:
-                    knobs, score, _ = _sweep_sm107_block_scaled_mega_moe(
-                        self.output,
-                        self.weights[0],
-                        self.weights[1],
-                        workspace,
-                        num_tokens=self.tensors.num_tokens,
-                        candidates=knobs_to_try,
-                        process_group=group,
-                        measurement=measurement,
-                        make_trial=execution.make_trial,
-                    )
-                except NoPassingCandidate:
-                    kernel.destroy(workspace)
-                    continue
                 protocol = RubinTuningProtocol(
                     self.output,
                     self.weights[0],
                     self.weights[1],
                     workspace,
                     num_tokens=self.tensors.num_tokens,
+                    candidates=knobs_to_try,
                     allow_nondeterministic=backend._config.in_kernel_fc2_reduce,
                     process_group=group,
                     make_trial=execution.make_trial,
                     execution_contract=execution.contract(),
                 )
                 query = protocol._query(live_tokens)
-                knob_record = knob_cache.make_record(
-                    knobs, **query, p50_us=score, source="autotune-complete-forward"
+                native_contract = protocol._contract()
+                knob_record = protocol._lookup_cached(
+                    query, native_contract, native_context, measurement
                 )
-                knob_record["timing_boundary"] = "complete_forward"
-                knob_record["protocol_contract"] = protocol._contract()
-                knob_record["measurement_policy"] = (
-                    context.measurement_policy.manifest_fields()
-                    if context.measurement_policy
-                    else {}
-                )
-                knob_record["profiling_policy"] = measurement
+                candidate_sets = [knobs_to_try]
+                if knob_record is not None:
+                    # Recheck and time cached knobs at this workload. A bucket
+                    # fallback's old score cannot select the overall winner.
+                    candidate_sets.insert(
+                        0, [knob_cache._knobs_from_json(knob_record["knobs"])]
+                    )
+                for choices in candidate_sets:
+                    try:
+                        knobs, score, _ = _sweep_sm107_block_scaled_mega_moe(
+                            self.output,
+                            self.weights[0],
+                            self.weights[1],
+                            workspace,
+                            num_tokens=self.tensors.num_tokens,
+                            candidates=choices,
+                            process_group=group,
+                            measurement=measurement,
+                            make_trial=execution.make_trial,
+                        )
+                        break
+                    except NoPassingCandidate:
+                        knob_record = None
+                else:
+                    kernel.destroy(workspace)
+                    continue
+                if knob_record is None:
+                    knob_record = knob_cache.make_record(
+                        knobs, **query, p50_us=score, source="autotune-complete-forward"
+                    )
+                    knob_record["timing_boundary"] = "complete_forward"
+                    knob_record["protocol_contract"] = native_contract
+                    knob_record["measurement_policy"] = (
+                        context.measurement_policy.manifest_fields()
+                        if context.measurement_policy
+                        else {}
+                    )
+                    knob_record["profiling_policy"] = measurement
+                # Preserve a reused record's original capacity, live count and
+                # score; measuring one cached choice is not a new knob search.
+                inner_records.append(knob_record)
                 candidates.append(
                     {
                         "variant": variant,
@@ -585,8 +611,15 @@ class _VariantProtocol:
         error = None
         if backend.ep_rank == 0:
             try:
+                if not native_context.skipped:
+                    for inner_record in inner_records:
+                        _publish_record(native_context, inner_record)
                 context.publish(key, record)
-                if context.disk_cache_enabled and record.get("knob_record") is not None:
+                if (
+                    (cache_hit or native_context.skipped)
+                    and context.disk_cache_enabled
+                    and record.get("knob_record") is not None
+                ):
                     from flashinfer.jit.core import logger
 
                     try:

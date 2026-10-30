@@ -369,29 +369,12 @@ def test_install_prepares_independent_storage_before_releasing_previous(
     assert protocol.owner.workspace is raw
 
 
-@pytest.mark.parametrize(
-    "variant,output_view,failure",
-    [
-        (variant, view, None)
-        for variant in (None, "inference", "genphase")
-        for view in (False, True)
-    ]
-    + [
-        (None, False, "inference"),
-        (None, False, "genphase"),
-        (None, False, "all"),
-        (None, False, "launch"),
-        ("inference", False, "inference"),
-    ],
-)
-def test_full_forward_sweep_selects_across_all_knobs(
-    protocol, monkeypatch, output_view, variant, failure
-):
+@pytest.fixture
+def forward_sweep(protocol, monkeypatch):
     from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe.shim import (
         autotune as native,
         correctness,
         tuning_measurement,
-        tuning_protocol,
     )
 
     protocol, contract = protocol
@@ -405,19 +388,34 @@ def test_full_forward_sweep_selects_across_all_knobs(
     measured = []
     events = []
     buffers = []
-    output = torch.empty(4, 1024)[:, ::2]
-    protocol.output = output if output_view else None
+    state = SimpleNamespace(
+        protocol=protocol,
+        contract=contract,
+        grid=grid,
+        measured=measured,
+        buffers=buffers,
+        failure=None,
+        rejected=set(),
+        scores={
+            ("inference", 1): 9,
+            ("inference", 2): 6,
+            ("genphase", 1): 8,
+            ("genphase", 2): 3,
+            ("genphase", 4): 7,
+        },
+    )
 
     class Buffer:
         _build_kernel = staticmethod(lambda cfg: None)
 
         def __init__(self, cfg):
             self.config, self.device = cfg, torch.device("cpu")
-            self.x = torch.zeros(4, 512)
-            self.x_sf = torch.zeros(4, 16)
-            self.topk_idx = torch.zeros(4, 3, dtype=torch.int32)
-            self.topk_weights = torch.ones(4, 3)
-            self.output_activation = torch.zeros(4, 512)
+            live = protocol.tensors.num_tokens
+            self.x = torch.zeros(live, 512)
+            self.x_sf = torch.zeros(live, 16)
+            self.topk_idx = torch.zeros(live, 3, dtype=torch.int32)
+            self.topk_weights = torch.ones(live, 3)
+            self.output_activation = torch.zeros(live, 512)
             self.prepared = False
             self.destroyed = False
             self._tuning_state = AutoTuningState()
@@ -451,20 +449,34 @@ def test_full_forward_sweep_selects_across_all_knobs(
             self._ep_bootstrap = bootstrap
 
         def _allocate_workspace(self, fleet):
-            return Buffer(self.cfg)
+            return Buffer(self._resolved_config(fleet))
+
+        def _resolved_config(self, fleet):
+            return dataclasses.replace(
+                self.cfg, max_tokens_per_rank=fleet.max_tokens_per_rank
+            )
 
         def stage_inputs(self, tensors, workspace, *, quantize_input):
             events.append("stage")
             workspace.note_staged_tokens(tensors.num_tokens)
 
         def compute(self, workspace, weights, *, output):
-            assert self.cfg == workspace.config
+            assert (
+                dataclasses.replace(
+                    self.cfg, max_tokens_per_rank=workspace.config.max_tokens_per_rank
+                )
+                == workspace.config
+            )
             assert workspace.prepared
             assert events[-1] == "stage"
-            if failure == "launch":
+            if state.failure == "launch":
                 raise RuntimeError("candidate launch failed")
             events.append("compute")
-            rejected = failure in (self.cfg.kernel_variant, "all")
+            rejected = (
+                state.failure in (self.cfg.kernel_variant, "all")
+                or (self.cfg.kernel_variant, self.cfg.epi_flag_batches[0])
+                in state.rejected
+            )
             workspace.output_activation.fill_(0 if rejected else 1)
             if output is not None:
                 output.copy_(workspace.output_activation)
@@ -475,20 +487,13 @@ def test_full_forward_sweep_selects_across_all_knobs(
 
     def measure(trial, weights, repeats, settings, group):
         trial.launch(*weights)
-        expected_events = ["stage", "compute"] + (["copy"] if output_view else [])
+        expected_events = ["stage", "compute"] + (
+            ["copy"] if protocol.output is not None else []
+        )
         assert events[-len(expected_events) :] == expected_events
         key = (trial.config.kernel_variant, trial.config.epi_flag_batches[0])
         measured.append(key)
-        # GenPhase's second candidate wins the full-forward objective. A cached
-        # kernel-only winner for its first candidate must not narrow the sweep.
-        return [
-            {
-                ("inference", 1): 9,
-                ("inference", 2): 6,
-                ("genphase", 1): 8,
-                ("genphase", 2): 3,
-            }[key]
-        ] * repeats
+        return [state.scores[key]] * repeats
 
     monkeypatch.setattr(backend, "_backend", Kernel)
     monkeypatch.setattr(block_scaled, "Sm107BlockScaledSymmBuffer", Buffer)
@@ -505,6 +510,38 @@ def test_full_forward_sweep_selects_across_all_knobs(
     monkeypatch.setattr(
         torch, "tensor", lambda *a, **kw: tensor(*a, **{**kw, "device": "cpu"})
     )
+    protocol.owner.kernel = Kernel("inference")
+    return state
+
+
+@pytest.mark.parametrize(
+    "variant,output_view,failure",
+    [
+        (variant, view, None)
+        for variant in (None, "inference", "genphase")
+        for view in (False, True)
+    ]
+    + [
+        (None, False, "inference"),
+        (None, False, "genphase"),
+        (None, False, "all"),
+        (None, False, "launch"),
+        ("inference", False, "inference"),
+    ],
+)
+def test_full_forward_sweep_selects_across_all_knobs(
+    forward_sweep, output_view, variant, failure
+):
+    from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe.shim import (
+        autotune as native,
+        tuning_protocol,
+    )
+
+    protocol, contract = forward_sweep.protocol, forward_sweep.contract
+    backend, grid = protocol.backend, forward_sweep.grid
+    measured, buffers = forward_sweep.measured, forward_sweep.buffers
+    forward_sweep.failure = failure
+    protocol.output = torch.empty(4, 1024)[:, ::2] if output_view else None
     with autotune_v2(persistent_cache=False):
         native_context = AutoTuner.get().protocol_context(tuning_protocol.NAMESPACE)
         cached = {"knobs": grid[0], "p50_us": 1}
@@ -529,7 +566,14 @@ def test_full_forward_sweep_selects_across_all_knobs(
                 )
                 assert result["knobs"] == grid[1]
                 assert result["knob_record"]["timing_boundary"] == "complete_forward"
-            assert dict(native_context.records()) == previous
+            records = native_context.records()
+            assert records["kernel-only"] == previous["kernel-only"]
+            winners = [v for k, v in records.items() if k != "kernel-only"]
+            passing = [
+                v for v in contract["variants"] if failure not in (v, "all", "launch")
+            ]
+            assert {v["kernel_variant"] for v in winners} == set(passing)
+            assert all(tuple(v["knobs"]["epi_flag_batches"]) == (2, 4) for v in winners)
         else:
             from flashinfer.moe_ep.backends.mega.kernel.sm107.forward_tuning import (
                 ForwardExecution,
@@ -563,3 +607,184 @@ def test_full_forward_sweep_selects_across_all_knobs(
         assert all(buffer.destroyed for buffer in buffers)
     else:
         assert not any(buffer.destroyed for buffer in buffers)
+
+
+def _fixed_forward_tune(protocol, variant, candidates):
+    from flashinfer.moe_ep.backends.mega.kernel.sm107.forward_tuning import (
+        ForwardExecution,
+    )
+
+    kernel = protocol.backend._backend(variant)
+    workspace = kernel._allocate_workspace(protocol.owner.fleet)
+    kernel.stage_inputs(protocol.tensors, workspace, quantize_input=True)
+    execution = ForwardExecution(
+        kernel,
+        protocol.tensors,
+        quantize_input=protocol.owner.quantize_input,
+        output=protocol.output,
+    )
+    knobs = execution.tune(None, None, workspace, candidates=candidates)
+    workspace.destroy()
+    return knobs
+
+
+@pytest.mark.parametrize("seed,live", [("outer", 128), ("fixed", 128), ("outer", 4)])
+def test_persisted_inner_winners_reused_at_new_capacity(
+    forward_sweep, monkeypatch, seed, live
+):
+    from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe.shim.tuning_protocol import (
+        NAMESPACE,
+    )
+
+    state, tuner = forward_sweep, AutoTuner.get()
+    protocol = state.protocol
+    monkeypatch.delattr(protocol, "_contract")
+    protocol.tensors = moe_ep.MoEEpTensors(
+        torch.empty(live, 512),
+        torch.empty(live, 3, dtype=torch.int32),
+        torch.empty(live, 3),
+    )
+    with autotune_v2():
+        if seed == "outer":
+            result = tuner.choose_with_protocol(selection.NAMESPACE, protocol)
+            assert result["variant"] == "genphase"
+        else:
+            for variant in ("inference", "genphase"):
+                assert (
+                    _fixed_forward_tune(protocol, variant, state.grid) == state.grid[1]
+                )
+        records = tuner.get_protocol_records(NAMESPACE)
+        assert len(records) == 2
+        assert {r["kernel_variant"] for r in records.values()} == {
+            "inference",
+            "genphase",
+        }
+        assert len(knob_cache._load_entries(knob_cache.knob_cache_path())) == 2
+
+    # Reload only the managed files. The compatibility file cannot hide a miss.
+    monkeypatch.setenv("FLASHINFER_MOE_EP_KNOB_CACHE", "off")
+    tuner.clear_cache()
+    tuner._managed_cache = None
+    tuner._managed_stores.clear()
+    state.measured.clear()
+    with autotune_v2(mode="replay"):
+        for variant in ("inference", "genphase"):
+            assert _fixed_forward_tune(protocol, variant, state.grid) == state.grid[1]
+    assert not state.measured
+
+    protocol.owner.fleet = dataclasses.replace(
+        protocol.owner.fleet, max_tokens_per_rank=256
+    )
+    protocol.owner._tuning_state = AutoTuningState()
+    protocol.owner.workspace.config = dataclasses.replace(
+        protocol.owner.workspace.config, max_tokens_per_rank=256
+    )
+    with autotune_v2(mode="replay"):
+        assert tuner.choose_with_protocol(selection.NAMESPACE, protocol) is None
+    assert not state.measured
+
+    # Old scores favor GenPhase; the current complete forwards favor inference.
+    state.scores[("inference", 2)] = 1
+    with autotune_v2():
+        result = tuner.choose_with_protocol(selection.NAMESPACE, protocol)
+        assert result["variant"] == "inference"
+        assert result["contract"]["capacity"] == 256
+        assert result["p50_us"] == 1
+        if live == 128:
+            assert result["knob_record"]["max_tokens"] == 128
+            assert result["knob_record"]["p50_us"] == 6
+            assert tuner.get_protocol_records(NAMESPACE) == records
+        else:
+            assert result["knob_record"]["max_tokens"] == 256
+            assert len(tuner.get_protocol_records(NAMESPACE)) == 4
+    flags = (2,) if live == 128 else (1, 2)
+    assert state.measured == [(v, f) for v in ("inference", "genphase") for f in flags]
+    state.measured.clear()
+    with autotune_v2(mode="replay"):
+        assert (
+            tuner.choose_with_protocol(selection.NAMESPACE, protocol)["variant"]
+            == "inference"
+        )
+    assert not state.measured
+    # A separately updated inner winner must not be overwritten by outer replay.
+    with autotune_v2():
+        context = tuner.protocol_context(NAMESPACE)
+        key, updated = next(
+            (k, r) for k, r in context.records().items() if r == result["knob_record"]
+        )
+        updated["knobs"] = {"epi_flag_batches": [1, 4]}
+        context.publish(key, updated)
+    with autotune_v2(mode="replay"):
+        tuner.choose_with_protocol(selection.NAMESPACE, protocol)
+        assert tuner.get_protocol_record(NAMESPACE, key) == updated
+    assert not state.measured
+    assert all(buffer.destroyed for buffer in state.buffers)
+
+
+@pytest.mark.parametrize(
+    "mode", ["rejected", "force", "force-skipped", "kernel-only", "skip"]
+)
+def test_inner_reuse_respects_rejection_and_tuning_controls(
+    forward_sweep, monkeypatch, mode
+):
+    from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe.shim import (
+        autotune as native,
+        tuning_protocol,
+    )
+
+    state, tuner = forward_sweep, AutoTuner.get()
+    protocol = state.protocol
+    monkeypatch.delattr(protocol, "_contract")
+    protocol.tensors = moe_ep.MoEEpTensors(
+        torch.empty(128, 512),
+        torch.empty(128, 3, dtype=torch.int32),
+        torch.empty(128, 3),
+    )
+    with autotune_v2(persistent_cache=False):
+        tuner.choose_with_protocol(selection.NAMESPACE, protocol)
+        records = tuner.get_protocol_records(tuning_protocol.NAMESPACE)
+    protocol.owner.fleet = dataclasses.replace(
+        protocol.owner.fleet, max_tokens_per_rank=256
+    )
+    protocol.owner._tuning_state = AutoTuningState()
+    protocol.owner.workspace.config = dataclasses.replace(
+        protocol.owner.workspace.config, max_tokens_per_rank=256
+    )
+    if mode == "rejected":
+        state.rejected.add(("inference", 2))
+    elif mode == "kernel-only":
+        with autotune_v2(persistent_cache=False):
+            context = tuner.protocol_context(tuning_protocol.NAMESPACE)
+            for key, record in records.items():
+                record["timing_boundary"] = "kernel"
+                context.publish(key, record)
+    calls = []
+    sweep = native._sweep_sm107_block_scaled_mega_moe
+
+    def counted(*args, **kwargs):
+        calls.append((args[3].config.kernel_variant, len(kwargs["candidates"])))
+        return sweep(*args, **kwargs)
+
+    monkeypatch.setattr(native, "_sweep_sm107_block_scaled_mega_moe", counted)
+    with autotune_v2(
+        persistent_cache=False,
+        skip_ops={tuning_protocol.NAMESPACE}
+        if mode in ("skip", "force-skipped")
+        else None,
+    ):
+        tuner.choose_with_protocol(
+            selection.NAMESPACE, protocol, force_tune=mode.startswith("force")
+        )
+        current = tuner.get_protocol_records(tuning_protocol.NAMESPACE)
+    if mode == "rejected":
+        assert calls == [("inference", 1), ("inference", 2), ("genphase", 1)]
+        new_records = [r for r in current.values() if r["max_tokens"] == 256]
+        assert len(new_records) == 1
+        assert new_records[0]["kernel_variant"] == "inference"
+        assert tuple(new_records[0]["knobs"]["epi_flag_batches"]) == (1, 4)
+    elif mode == "skip":
+        assert calls == [("inference", 1), ("genphase", 1)]
+        assert current == records
+    else:
+        assert calls == [("inference", 2), ("genphase", 2)]
+    assert all(buffer.destroyed for buffer in state.buffers)
