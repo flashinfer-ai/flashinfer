@@ -15,7 +15,7 @@ limitations under the License.
 """
 
 # Experimental Cake backend: deterministic GDN (Gated DeltaNet) chunked
-# training (head dimension 128, chunk 64) on SM100 / SM103, with FLA's
+# training (head dimension 128, chunk 64) on SM100 / SM103 / SM107, with FLA's
 # ``chunk_gated_delta_rule`` signature and no context parallelism.  The
 # public entry point is ``chunk_gated_delta_rule``; the chunk and segment
 # tables, the scan planner, the launch order and the autograd chain live in

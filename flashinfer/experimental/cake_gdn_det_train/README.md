@@ -1,4 +1,4 @@
-# Cake deterministic GDN chunked training backend (SM100 / SM103)
+# Cake deterministic GDN chunked training backend (SM100 / SM103 / SM107)
 
 Experimental backend for the forward and backward of packed GDN (scalar-gated
 DeltaNet) layers in training: head dimension 128, chunk 64, grouped Q/K heads
@@ -10,8 +10,9 @@ side stream; the groups write disjoint outputs, so this holds with one or two
 streams.
 
 Both the API and the backend are experimental: no compatibility guarantee.
-SM100 (B200 / GB200) and SM103 (B300 / GB300) are the supported
-architectures; another device raises `RuntimeError`.  The feature does not
+SM100 (B200 / GB200), SM103 (B300 / GB300) and SM107 (R200) are the supported
+architectures; another device raises `RuntimeError`.  The SM107 libraries need
+CUDA 13.4 or newer.  The feature does not
 participate in automatic backend selection, autotuning or trace-apply.  Its
 libraries are loaded prebuilt from `aot/` when a builder compiled them and
 JIT-built by FlashInfer from the sources and flags `build.json` records
@@ -59,7 +60,9 @@ The forward runs the prep (Q/K L2 norm, gate cumsum), the tcgen05 WY stage and
 the forward scan fused with the output (`fwd_ho`).  The prep stages the Q/K
 tiles by TMA with one CTA per (chunk, key head) (`prep_tma`), except where that
 grid needs a second, short wave: with `slots = 6 x SMs` and
-`CTAs = chunks x H`, the plain prep runs for `slots < CTAs <= 2.5 x slots`, and
+`CTAs = chunks x H`, the plain prep runs for `slots < CTAs <= 2.5 x slots`
+(`sm_100a`, `sm_103a`; `sm_107a` has no plain-prep band and runs `prep_tma`
+for every grid), and
 for Q or K not 16-byte aligned.  Both preps give the same bits.  A long sequence can be
 split into segments: a pre-scan and a stitch then give every segment its start
 state.  The backward runs the adjoint scan, either `dv_local` plus a register
@@ -115,4 +118,4 @@ captured in a CUDA graph (warm it up first, like any captured call).
 
 - Head dimension 128 and chunk 64 only; `q`, `k`, `v` BF16.
 - No context parallelism and no cross-rank state passing.
-- `sm_100a` and `sm_103a` only.
+- `sm_100a`, `sm_103a` and `sm_107a` only (`sm_107a` with CUDA 13.4 or newer).
