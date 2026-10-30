@@ -18,13 +18,13 @@
 //
 // The JIT compiles this translation unit once per kernel together with the
 // kernel's own translation unit (``kernels/<name>.cu``) and selects the kernel
-// through four preprocessor definitions:
-//
-//   CAKE_UNION_KERNEL      the extern "C" kernel symbol
-//   CAKE_UNION_DTYPE       __half or __nv_bfloat16
-//   CAKE_UNION_WORLD_SIZE  2, 4 or 8 (ranks of the collective)
-//   CAKE_UNION_BLOCK       threads per CTA (224 or 896)
-//   CAKE_UNION_CLUSTER     CTAs per cluster (4 or 1)
+// through these preprocessor definitions:
+//   CAKE_UNION_KERNEL        the extern "C" kernel symbol
+//   CAKE_UNION_DTYPE         __half or __nv_bfloat16
+//   CAKE_UNION_WORLD_SIZE    2, 4 or 8 (ranks of the collective)
+//   CAKE_UNION_BLOCK         threads per CTA (224 or 896, 256 with a role warp)
+//   CAKE_UNION_CLUSTER       CTAs per cluster (4 or 1)
+//   CAKE_UNION_ROLE_THREADS  threads per CTA beside the token's (unset: 0)
 //
 // PDL and the cooperative launch are runtime flags.  The kernels read every
 // workspace address from the device pointer table (``workspace_tensor``); the
@@ -54,8 +54,8 @@
 #if CAKE_UNION_WORLD_SIZE != 2 && CAKE_UNION_WORLD_SIZE != 4 && CAKE_UNION_WORLD_SIZE != 8
 #error "CAKE_UNION_WORLD_SIZE must be 2, 4 or 8"
 #endif
-#if CAKE_UNION_BLOCK * CAKE_UNION_CLUSTER != 896
-#error "CAKE_UNION_BLOCK x CAKE_UNION_CLUSTER must cover one 7168-wide token (896 threads)"
+#if (CAKE_UNION_BLOCK - CAKE_UNION_ROLE_THREADS) * CAKE_UNION_CLUSTER != 896
+#error "(CAKE_UNION_BLOCK - CAKE_UNION_ROLE_THREADS) x CAKE_UNION_CLUSTER must be 896 threads"
 #endif
 
 namespace {
