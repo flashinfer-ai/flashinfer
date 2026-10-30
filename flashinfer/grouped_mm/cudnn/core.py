@@ -442,6 +442,7 @@ def _build_cudnn_moe_block_scale_grouped_gemm_graph(
     output_cudnn_dtype,
     block_size,
     policy=None,
+    deselect_engines=(),
 ):
     if policy is None:
         policy = cudnn.build_plan_policy.HEURISTICS_CHOICE
@@ -538,6 +539,8 @@ def _build_cudnn_moe_block_scale_grouped_gemm_graph(
     graph.validate()
     graph.build_operation_graph()
     graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+    if deselect_engines:
+        graph.deselect_engines(list(deselect_engines))
     graph.check_support()
     graph.build_plans(policy)
 
@@ -660,6 +663,20 @@ def _run_cudnn_moe_block_scale_grouped_gemm_mxfp8(
         else cudnn.build_plan_policy.ALL
     )
 
+    # WORKAROUND(cudnn-frontend#2081): cuDNN 9.26's heuristic-best engine for this
+    # graph ("eng0") reads the wrong token-scale rows for every group after the
+    # first on compute capability 10.x parts under the CUDA 13.4 libraries; the
+    # graph's other engine ("eng9") is correct, as is the same cuDNN under CUDA
+    # 13.0. Drop eng0 on that combination only. Revert when cuDNN ships the fix.
+    deselect_engines = ()
+    cuda_version = tuple(int(x) for x in (torch.version.cuda or "0.0").split(".")[:2])
+    if (
+        torch.cuda.get_device_capability(a.device)[0] == 10
+        and cudnn.backend_version() >= 92600
+        and cuda_version >= (13, 4)
+    ):
+        deselect_engines = ("eng0",)
+
     graph, ws = _build_cudnn_moe_block_scale_grouped_gemm_graph(
         handle,
         token_3d.shape,
@@ -680,6 +697,7 @@ def _run_cudnn_moe_block_scale_grouped_gemm_mxfp8(
         out_cudnn_dtype,
         block_size=32,
         policy=policy,
+        deselect_engines=deselect_engines,
     )
 
     if out is None:

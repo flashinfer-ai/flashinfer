@@ -207,6 +207,50 @@ class TestGroupedMmMxfp8:
             )
 
     @requires_cudnn_moe_block_scale
+    @pytest.mark.parametrize("seg_lens", [[64, 64], [16, 48, 64]])
+    def test_token_scale_rows_read_per_group(self, seg_lens):
+        """Each output row uses its own token scale, also for groups after the first.
+
+        A = 1 and B = 1 with unit weight scales, and token row i carries one e8m0
+        scale 2^(e_i - 127) in all its k-blocks, so out[i] / k must equal that
+        scale exactly; a kernel that reads another row's scale (as cuDNN 9.26's
+        heuristic-best SM100 engine does under CUDA 13.4 for groups after the
+        first) fails here even though cosine-similarity tests stay near 0.96.
+        """
+        cum_m = sum(seg_lens)
+        assert cum_m == 128, "one 128-row scale block keeps the layout simple"
+        k, n = 512, 256
+        kb = k // 32
+        m_indptr = torch.tensor(
+            [0, *torch.tensor(seg_lens).cumsum(0).tolist()],
+            dtype=torch.int32,
+            device="cuda",
+        )
+        a = torch.ones(cum_m, k, device="cuda").to(torch.float8_e4m3fn)
+        b = torch.ones(len(seg_lens), n, k, device="cuda").to(torch.float8_e4m3fn)
+        b_scale = torch.full((len(seg_lens), n, kb), 127, dtype=torch.uint8, device="cuda")
+        # token scales in the F8_128x4 layout the quantizer produces: row r of the
+        # block, k-block kk sits at byte (kk // 4) * 512 + (r % 32) * 16 + (r // 32) * 4 + kk % 4
+        exps = [60 + i for i in range(cum_m)]  # 128 distinct e8m0 exponents, 2^-67 .. 2^60; k * scale stays finite
+        flat = torch.empty(cum_m * kb, dtype=torch.uint8)
+        for r in range(cum_m):
+            for kk in range(kb):
+                flat[(kk // 4) * 512 + (r % 32) * 16 + (r // 32) * 4 + kk % 4] = exps[r]
+        a_scale = flat.cuda().view(cum_m, kb)
+
+        out = grouped_mm_mxfp8(a, b, a_scale, b_scale, m_indptr, out_dtype=torch.float32)
+
+        got = out[:, 0] / k
+        want = torch.tensor([2.0 ** (e - 127) for e in exps], device="cuda")
+        assert torch.isfinite(out).all()
+        assert (out.max(dim=1).values == out.min(dim=1).values).all(), "a row must use one scale for every column"
+        wrong = (got != want).nonzero().flatten().tolist()
+        assert not wrong, (
+            f"{len(wrong)} of {cum_m} rows read another row's token scale; first wrong rows {wrong[:8]} "
+            f"(segments {seg_lens})"
+        )
+
+    @requires_cudnn_moe_block_scale
     def test_single_expert(self):
         """Degenerate case: only one expert (equivalent to dense mm)."""
         torch.manual_seed(2)
