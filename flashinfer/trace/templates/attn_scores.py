@@ -677,6 +677,8 @@ single_head_paged_mqa_logits_trace = TraceTemplate(
         "requests": Tensor(["groups"]),
         "scores": Tensor(["rows", "max_context"]),
     },
-    outputs={"scores": Tensor(["rows", "max_context"], dtype="float32")},
+    outputs={
+        "scores": Tensor(["rows", "max_context"], dtype="float32", param="scores")
+    },
     tags=["arch:sm100", "arch:sm103"],
 )
