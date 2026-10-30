@@ -50,6 +50,37 @@ def test_sm90_predicate_is_false_for_a_host_tensor():
     assert is_sm90a_device(torch.device("cpu")) is False
 
 
+def test_cute_dsl_cu12_flavor_gate_reads_the_loaded_library(monkeypatch):
+    """The #7915 gate keys on the file name of the compiler library the CuTe
+    DSL bound as ``cutlass._mlir._mlir_libs._cutlass_ir`` -- the only record of
+    the flavor its loader picked (the cu129 CI image installs both flavors, so
+    the installed wheels say nothing). Host-only: no DSL is needed."""
+    import sys
+    import types
+
+    from flashinfer.msa_ops import _sm90_dispatch as d
+
+    monkeypatch.setitem(sys.modules, "cutlass", types.ModuleType("cutlass"))
+    for name, expected in (
+        ("_cutlass_ir.cu12.cpython-310-x86_64-linux-gnu.so", True),
+        ("_cutlass_ir.cu13.cpython-310-x86_64-linux-gnu.so", False),
+        ("_cutlass_ir.cu12.cp310-win_amd64.pyd", True),
+    ):
+        module = types.ModuleType("_cutlass_ir")
+        module.__file__ = f"/site-packages/nvidia_cutlass_dsl/_mlir_libs/{name}"
+        monkeypatch.setitem(sys.modules, d._CUTLASS_IR_MODULE, module)
+        assert d._cute_dsl_native_library() == name
+        assert d._cute_dsl_cu12_flavor_loaded() is expected
+    # Nothing bound (the DSL did not load a flavor): not cu12.
+    monkeypatch.delitem(sys.modules, d._CUTLASS_IR_MODULE, raising=False)
+    assert d._cute_dsl_native_library() == ""
+    assert d._cute_dsl_cu12_flavor_loaded() is False
+    # ``import cutlass`` itself failing (DSL not installed): not cu12 either;
+    # the CuTe schedules then fail with their own ImportError.
+    monkeypatch.setitem(sys.modules, "cutlass", None)
+    assert d._cute_dsl_cu12_flavor_loaded() is False
+
+
 # ---------------------------------------------------------------------------
 # helpers
 # ---------------------------------------------------------------------------
@@ -1187,6 +1218,29 @@ def sm90_regression_backend(request, monkeypatch):
     return request.param
 
 
+def _skip_if_cu12_refuses_single_token_prefill(hq, hkv, max_pages):
+    """Skip an arm that ``sparse_prefill_sm90`` would route to the one-token-per-CTA
+    CuTe schedule while the CuTe DSL runs on its cu12 build: the dispatcher
+    refuses that schedule there instead of compiling it, because the compile
+    segfaults inside the DSL (#7915). The schedule is reached only above the
+    union bound and without a Cake program (the fixture's cute arm turns the
+    Cake routes off; more than 4096 pages has none in either arm)."""
+    from flashinfer.msa_ops import _sm90_dispatch, cake_hopper_sm90
+
+    if max_pages <= _sm90_dispatch._MPG_UNION_MAX:
+        return
+    if cake_hopper_sm90.prefill_route_available(
+        num_q_heads=hq, num_kv_heads=hkv, max_pages=max_pages
+    ):
+        return
+    if _sm90_dispatch._cute_dsl_cu12_flavor_loaded():
+        pytest.skip(
+            "flashinfer-ai/flashinfer#7915: cute.compile of the one-token-per-CTA "
+            "schedule segfaults in the cu12 build of nvidia-cutlass-dsl "
+            f"({_sm90_dispatch._cute_dsl_native_library()})"
+        )
+
+
 def _ref_attn_rows(q, kv, idx, page_table, seqused_k, scale, rows, qpos_of):
     """Dense fp32 reference for selected query rows, vectorised per KV head.
 
@@ -1228,9 +1282,15 @@ def _ref_attn_rows(q, kv, idx, page_table, seqused_k, scale, rows, qpos_of):
 @sm90_only
 @pytest.mark.parametrize("max_k_tiles", [16, 1024])
 def test_sparse_prefill_runs_both_backends(sm90_regression_backend, max_k_tiles):
-    """Exercise the union backend (mpg <= 800) and the single-token one above it."""
+    """Exercise the union backend (mpg <= 800) and the single-token one above it.
+
+    The single-token CuTe arm skips where the CuTe DSL loaded the cu12 build of
+    its compiler library: compiling that schedule segfaults inside the DSL
+    (#7915) and would take the rest of this file down with it.
+    """
     torch.manual_seed(max_k_tiles)
     batch, qlen, hq, hkv = 1, 256, 8, 1
+    _skip_if_cu12_refuses_single_token_prefill(hq, hkv, max_k_tiles)
     npages = max_k_tiles * batch
     base = (torch.randn(npages, hkv, BLK_KV, 2 * HEAD_DIM, device="cuda") / 4).to(
         torch.float8_e4m3fn
@@ -1315,6 +1375,7 @@ def test_sparse_prefill_fp32_accuracy(
     hkv = 1
     seq = prefix_pages * BLK_KV + qlen
     width = -(-seq // BLK_KV)
+    _skip_if_cu12_refuses_single_token_prefill(hq, hkv, width)
     npages = batch * width + 4
     page_table = (
         torch.randperm(npages, device="cuda")[: batch * width]
@@ -1842,6 +1903,59 @@ def test_single_token_prefill_rejects_unsupported_gqa(monkeypatch):
             causal=True,
             softmax_scale=1.0 / math.sqrt(HEAD_DIM),
         )
+
+
+@sm90_only
+@pytest.mark.parametrize("max_k_tiles", [16, 1024])
+def test_cu12_dsl_gate_refuses_only_the_single_token_schedule(monkeypatch, max_k_tiles):
+    """With the CuTe DSL reported on its cu12 library (#7915) and no Cake
+    program, the single-token schedule (mpg > 800) raises before anything is
+    compiled, while the union schedule below the bound still runs. The library
+    name is forced, so this holds on either flavor."""
+    from flashinfer.msa_ops import _sm90_dispatch, cake_hopper_sm90
+
+    monkeypatch.setattr(
+        cake_hopper_sm90, "prefill_route_available", lambda **kwargs: False
+    )
+    monkeypatch.setattr(
+        _sm90_dispatch,
+        "_cute_dsl_native_library",
+        lambda: "_cutlass_ir.cu12.cpython-310-x86_64-linux-gnu.so",
+    )
+    torch.manual_seed(max_k_tiles)
+    qlen, hq, hkv = 64, 8, 1
+    base = (torch.randn(max_k_tiles, hkv, BLK_KV, 2 * HEAD_DIM, device="cuda") / 4).to(
+        torch.float8_e4m3fn
+    )
+    k, v = base[..., :HEAD_DIM], base[..., HEAD_DIM:]
+    q = (torch.randn(qlen, hq, HEAD_DIM, device="cuda") / 4).to(torch.bfloat16)
+    idx = (
+        torch.rand(hkv, qlen, max_k_tiles, device="cuda")
+        .argsort(dim=-1)[..., :TOPK]
+        .sort(dim=-1)
+        .values.to(torch.int32)
+        .contiguous()
+    )
+    cu_q = torch.tensor([0, qlen], dtype=torch.int32, device="cuda")
+    page_table = torch.arange(max_k_tiles, dtype=torch.int32, device="cuda").view(
+        1, max_k_tiles
+    )
+    seqused_k = torch.full(
+        (1,), max_k_tiles * BLK_KV - 13, dtype=torch.int32, device="cuda"
+    )
+    kwargs = dict(
+        page_table=page_table,
+        seqused_k=seqused_k,
+        causal=True,
+        softmax_scale=1.0 / math.sqrt(HEAD_DIM),
+    )
+    if max_k_tiles > _sm90_dispatch._MPG_UNION_MAX:
+        with pytest.raises(RuntimeError, match="cu12 build of nvidia-cutlass-dsl"):
+            msa_sparse_attention(q, k, v, idx, cu_q, **kwargs)
+    else:
+        out = msa_sparse_attention(q, k, v, idx, cu_q, **kwargs)
+        assert out.shape == q.shape
+        assert torch.isfinite(out.float()).all()
 
 
 @sm90_only

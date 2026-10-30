@@ -31,9 +31,15 @@ index cache with a one-head page stride and select no KV head, so an fp8
 index cache with several heads raises in both regimes instead of scoring the
 wrong pages. Both proxy-score prefill backends support f32 accumulation by
 default and explicit f16 accumulation through ``use_fp32_acc=False``.
+
+Under the cu12 build of the CuTe DSL's compiler library the one-token-per-CTA
+sparse-prefill schedule is refused instead of compiled (#7915, see
+``_cute_dsl_cu12_flavor_loaded``); the other CuTe DSL kernels are unaffected.
 """
 
 import functools
+import os
+import sys
 from typing import Iterable, Optional
 
 import torch
@@ -581,6 +587,47 @@ def _cute_prefill_preferred(q, k, v, page_table) -> bool:
     return True
 
 
+# The CuTe DSL binds whichever native build of its MLIR compiler library it
+# loaded (``_cutlass_ir.cu12.*.so`` or ``_cutlass_ir.cu13.*.so``, both shipped
+# by nvidia-cutlass-dsl >= 4.8) under this module name;
+# ``cutlass/_mlir/_mlir_libs/__init__.py`` picks the newest one the CUDA driver
+# accepts, with no override knob.
+_CUTLASS_IR_MODULE = "cutlass._mlir._mlir_libs._cutlass_ir"
+
+
+def _cute_dsl_native_library() -> str:
+    """File name of the compiler library the CuTe DSL loaded (``""`` if none).
+
+    Importing ``cutlass`` is what binds the flavor; a DSL that cannot be
+    imported reports ``""`` and fails later with its own ImportError.
+    """
+    try:
+        import cutlass  # noqa: F401
+    except Exception:
+        return ""
+    module = sys.modules.get(_CUTLASS_IR_MODULE)
+    return os.path.basename(getattr(module, "__file__", None) or "")
+
+
+def _cute_dsl_cu12_flavor_loaded() -> bool:
+    """Whether the CuTe DSL runs on the cu12 build of its compiler library.
+
+    flashinfer-ai/flashinfer#7915: ``cute.compile`` of the one-token-per-CTA
+    sparse-prefill schedule (``cute_dsl/sparse_prefill_single_sm90.py``)
+    segfaults inside that build of nvidia-cutlass-dsl 4.7.0 and 4.8.1 -- a
+    null-object read on the main thread, 13 frames deep in the stripped
+    library, byte-identical before and after #7887 -- while the cu13 build
+    compiles the same source and the whole SM90 file passes. Every CUDA 12
+    torch install on a driver below CUDA 13 (R580) loads cu12; the cu129 H100
+    nightly lane (driver 535) is one. Reproducer: the cu129 CI image,
+    ``pip uninstall -y nvidia-cutlass-dsl-libs-cu13``, then
+    ``pytest tests/msa_ops/test_msa_sm90.py -k "sparse_prefill_runs_both_backends and cute-1024"``.
+    Until the DSL ships a fixed cu12 library, ``sparse_prefill_sm90`` refuses
+    that schedule under cu12 and the test arms that reach it skip.
+    """
+    return ".cu12." in _cute_dsl_native_library()
+
+
 def sparse_prefill_sm90(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -651,6 +698,19 @@ def sparse_prefill_sm90(
                 f"SM90 MSA single-token prefill (page_table width "
                 f"{int(page_table.shape[1])} > {_MPG_UNION_MAX}) supports "
                 f"Hq/Hkv of 8 or 16, got {g}"
+            )
+        if _cute_dsl_cu12_flavor_loaded():
+            # Raising here is the whole protection: compiling the schedule
+            # would kill the process (#7915, see _cute_dsl_cu12_flavor_loaded).
+            raise RuntimeError(
+                f"SM90 MSA single-token prefill (page_table width "
+                f"{int(page_table.shape[1])} > {_MPG_UNION_MAX}, no Cake program "
+                f"for this call) is refused on the cu12 build of "
+                f"nvidia-cutlass-dsl ({_cute_dsl_native_library()}): compiling "
+                f"it segfaults inside the DSL (flashinfer-ai/flashinfer#7915). "
+                f"Run on a CUDA 13 driver (R580+) with nvidia-cutlass-dsl[cu13] "
+                f"so the DSL loads its cu13 library, or keep page_table within "
+                f"the Cake programs' bounds."
             )
         from .cute_dsl.sparse_prefill_single_sm90 import run as _prefill
     else:
