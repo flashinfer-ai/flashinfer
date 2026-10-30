@@ -694,19 +694,10 @@ class Sm100BlockScaledMoeEpilogue:
 
     @cute.jit
     def _absmax(self, values):
-        maxima = cute.make_rmem_tensor((16,), cutlass.Float32)
+        result = cutlass.Float32(0.0)
         for i in cutlass.range_constexpr(16):
-            maxima[i] = cute.arch.fmax(values[i], -values[i])
-        for stage in cutlass.range_constexpr(2):
-            width = cute.ceil_div(16, 3**stage)
-            for i in cutlass.range_constexpr(cute.ceil_div(width, 3)):
-                maximum = maxima[3 * i]
-                for j in cutlass.range_constexpr(1, min(3, width - 3 * i)):
-                    maximum = cute.arch.fmax(maximum, maxima[3 * i + j])
-                maxima[i] = maximum
-        return cute.arch.fmax(
-            cutlass.Float32(0.0), cute.arch.fmax(maxima[0], maxima[1])
-        )
+            result = cute.arch.fmax(result, cute.arch.fmax(values[i], -values[i]))
+        return result
 
     @cute.jit
     def _gated_sf32_absmax(self, values, scratch_ptr, warp, lane):
