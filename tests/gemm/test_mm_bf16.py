@@ -10,6 +10,7 @@ import torch
 import torch.nn.functional as F
 
 from flashinfer import autotune, mm_bf16
+from flashinfer.autotune_cache import MeasurementPolicy, ReplayCoverage, autotune_v2
 from flashinfer.autotuner import AutoTuner
 from flashinfer.gemm.gemm_base import CUDNN_AVAILABLE
 from flashinfer.gemm import is_cuda_tile_available
@@ -212,21 +213,96 @@ def test_mm_bf16_pdl_none_tunes_both_pdl_variants(
     torch.manual_seed(0)
     a = torch.randn(4, 1024, device="cuda", dtype=torch.bfloat16)
     w = torch.randn(2048, 1024, device="cuda", dtype=torch.bfloat16)
-    mm_bf16(a, w.T, backend=backend)
+    mm_bf16(a, w.T, pdl=None, backend=backend)
     with autotune(True, tuning_buckets=[4], skip_ops={"bf16_gemm"}):
-        mm_bf16(a, w.T, backend=backend)
+        mm_bf16(a, w.T, pdl=None, backend=backend)
     assert launched == [False, False] and not profiled
     with autotune(True, tuning_buckets=[4]):
-        mm_bf16(a, w.T, backend=backend)
+        mm_bf16(a, w.T, pdl=None, backend=backend)
     assert profiled == {(None, False), (None, True)}
 
     launched.clear()
-    out = mm_bf16(a, w.T, backend=backend)
+    out = mm_bf16(a, w.T, pdl=None, backend=backend)
+    mm_bf16(a, w.T, backend=backend)
     mm_bf16(a, w.T, pdl=False, backend=backend)
     mm_bf16(a, w.T, pdl=True, backend=backend)
-    assert launched == [pdl_wins, False, True]
+    assert launched == [pdl_wins, False, False, True]
     reference = (a.float() @ w.float().T).to(torch.bfloat16)
     torch.testing.assert_close(out, reference, rtol=2e-2, atol=5e-2)
+
+
+@pytest.mark.parametrize("backend", ["tinygemm", "tgv"])
+@pytest.mark.parametrize("pdl_wins", [False, True])
+def test_mm_bf16_pdl_v2_managed_reload_and_capture(
+    monkeypatch, tmp_path, backend, pdl_wins
+):
+    """PDL winners survive managed reload and graph capture with real launches."""
+    capability = get_compute_capability(torch.device("cuda"))
+    if not mm_bf16.is_backend_supported(backend, capability[0] * 10 + capability[1]):
+        pytest.skip(f"{backend} is not supported on this GPU.")
+
+    from flashinfer.gemm import gemm_base
+
+    profiled, launched = set(), []
+    if backend == "tinygemm":
+        module = gemm_base.get_tinygemm2_module()
+        name, pdl_index = "tinygemm2_nobias_op", 3
+        factory = gemm_base._tinygemm_bf16_gemm_runner
+    else:
+        from flashinfer.gemm.kernels import tgv_gemm_cute_ext as module
+
+        name, pdl_index = "run_tgv_cute_ext", 4
+        factory = gemm_base._tgv_gemm_runner
+    launch = getattr(module, name)
+
+    def record_launch(*args):
+        launched.append(args[pdl_index])
+        return launch(*args)
+
+    def profile(self, runner, inputs, tactic, *args, **kwargs):
+        profiled.add(runner.auto_pdl)
+        return 1.0 if runner.auto_pdl == pdl_wins else 2.0
+
+    monkeypatch.setattr(module, name, record_launch)
+    monkeypatch.setattr(AutoTuner, "_instance", AutoTuner())
+    monkeypatch.setattr(AutoTuner, "_profile_single_kernel", profile)
+    torch.manual_seed(0)
+    a = torch.randn(4, 1024, device="cuda", dtype=torch.bfloat16)
+    w = torch.randn(2048, 1024, device="cuda", dtype=torch.bfloat16)
+    options = dict(
+        cache_root=tmp_path,
+        cache_scope="context",
+        measurement_policy=MeasurementPolicy(execution_mode="cuda_graph"),
+        tuning_buckets=(4,),
+    )
+    with autotune_v2(mode="tune", **options):
+        mm_bf16(a, w.T, pdl=None, backend=backend)
+    assert profiled == {False, True}
+
+    # Drop both tuner and runner identities: the winner must come from disk.
+    monkeypatch.setattr(AutoTuner, "_instance", AutoTuner())
+    factory.cache_clear()
+    profiled.clear()
+    launched.clear()
+    report = ReplayCoverage()
+    with autotune_v2(
+        mode="replay", strict_replay=True, replay_report=report, **options
+    ):
+        mm_bf16(a, w.T, pdl=None, backend=backend)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            out = mm_bf16(a, w.T, pdl=None, backend=backend)
+    assert not profiled
+    assert launched == [pdl_wins, pdl_wins]
+    assert (report.hits, report.misses) == (2, 0)
+    assert report.records[0]["source"] == "managed"
+    a.mul_(0.5)
+    graph.replay()
+    reference = (a.float() @ w.float().T).to(torch.bfloat16)
+    torch.testing.assert_close(out, reference, rtol=2e-2, atol=5e-2)
+    # Leaving graph scope preserves the default non-PDL behavior.
+    mm_bf16(a, w.T, backend=backend)
+    assert launched[-1] is False
 
 
 def test_mm_bf16_pdl_variant_cache_keys():

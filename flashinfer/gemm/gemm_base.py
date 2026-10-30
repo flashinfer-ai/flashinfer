@@ -728,7 +728,7 @@ def mm_bf16(
     a: torch.Tensor,
     b: torch.Tensor,
     bias: Optional[torch.Tensor] = None,
-    pdl: Optional[bool] = None,
+    pdl: Optional[bool] = False,
     out: Optional[torch.Tensor] = None,
     out_dtype: torch.dtype = torch.bfloat16,
     backend: Literal[
@@ -767,7 +767,8 @@ def mm_bf16(
         ``"bf16_gemm_pdl_auto"``, while ``skip_ops={"bf16_gemm"}`` still
         skips such calls. PDL kernels may read ``b`` and ``bias`` before
         waiting for the preceding kernel, so pass ``pdl=False`` if a kernel
-        that may still be running writes them. Defaults to ``None``.
+        that may still be running writes them. Defaults to ``False`` so
+        autotuning cannot silently enable this input-dependency assumption.
 
     out: Optional[torch.Tensor]
         Out tensor, shape (m, n), bf16, fp16, or fp32. FP16 and FP32 output are enabled
