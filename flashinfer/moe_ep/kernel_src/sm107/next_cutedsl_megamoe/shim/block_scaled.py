@@ -10,7 +10,7 @@ two-entry-point mega contract:
   FC2 + combine compute entry, with SwiGLU or SiTU
 
 The kernel is generic over the drop's ``QuantKind``; this shim wires up the
-``nvfp4``, ``mxfp8_e4m3``, ``mxfp8_e5m2``, and ``mxfp4_mxfp8`` kinds.
+``nvfp4``, ``mxfp4``, ``mxfp8_e4m3``, ``mxfp8_e5m2``, and ``mxfp4_mxfp8`` kinds.
 The mixed kind uses packed FP4 weights and E4M3 activations, both with
 E8M0 scales per 32 values.
 
@@ -41,7 +41,7 @@ from .tuning_state import AutoTuningState
 if TYPE_CHECKING:
     from flashinfer.moe_ep.tensors import MoEEpTensors
 
-Sm107QuantKind = Literal["nvfp4", "mxfp8_e4m3", "mxfp8_e5m2", "mxfp4_mxfp8"]
+Sm107QuantKind = Literal["nvfp4", "mxfp4", "mxfp8_e4m3", "mxfp8_e5m2", "mxfp4_mxfp8"]
 Sm107TokenBackMode = Literal["epi_warps", "standalone_warps", "reuse_dispatch_warps"]
 Sm107WorkIdMode = Literal["grid_stride", "atomic_counter"]
 Sm107ScheduleMode = Literal["grouped", "phase_interleave"]
@@ -51,6 +51,7 @@ Sm107ScheduleMode = Literal["grouped", "phase_interleave"]
 # kinds have 64 (128 in 2x mode) — see quant_def.QuantKind.instruction_k.
 _KIND_TABLE: dict = {
     "nvfp4": (None, torch.float8_e4m3fn, Nvfp4BlockSize, 128),
+    "mxfp4": (None, torch.float8_e8m0fnu, Mxfp8BlockSize, 128),
     "mxfp8_e4m3": (torch.float8_e4m3fn, torch.float8_e8m0fnu, Mxfp8BlockSize, 64),
     "mxfp8_e5m2": (torch.float8_e5m2, torch.float8_e8m0fnu, Mxfp8BlockSize, 64),
     "mxfp4_mxfp8": (torch.float8_e4m3fn, torch.float8_e8m0fnu, Mxfp8BlockSize, 64),
@@ -238,8 +239,10 @@ class Sm107BlockScaledMoeConfig:
                 f"{max(2 * vec, 32)} (gate/up interleave + SF blocks) for "
                 f"{self.quant_kind}."
             )
-        if self.quant_kind == "mxfp4_mxfp8" and self.intermediate % 128:
-            raise ValueError("mxfp4_mxfp8 intermediate must be a multiple of 128.")
+        if self.quant_kind in ("mxfp4", "mxfp4_mxfp8") and self.intermediate % 128:
+            raise ValueError(
+                f"{self.quant_kind} intermediate must be a multiple of 128."
+            )
         tiler = self.resolved_mma_tiler_mnk
         instruction_k = self.instruction_k
         if len(tiler) != 3:
@@ -455,7 +458,7 @@ class Sm107BlockScaledMoeConfig:
 
     @property
     def torch_weight_data_dtype(self) -> torch.dtype:
-        if self.quant_kind in ("nvfp4", "mxfp4_mxfp8"):
+        if self.quant_kind in ("nvfp4", "mxfp4", "mxfp4_mxfp8"):
             return _fp4_storage_dtype()
         return self.torch_act_data_dtype
 
@@ -489,7 +492,7 @@ class Sm107BlockScaledSymmBuffer:
         # Staging tensors. Activation / SF / scores are pulled by peer dispatch
         # warps, so they live on the symmetric heap; the routing indices are a
         # local (16B-aligned) int32 tensor read by this rank's router only.
-        if cfg.quant_kind == "nvfp4":
+        if cfg.quant_kind in ("nvfp4", "mxfp4"):
             self.x = comm.sym_zeros((tokens, cfg.hidden // 2), cfg.torch_act_data_dtype)
         else:
             self.x = comm.sym_zeros((tokens, cfg.hidden), cfg.torch_act_data_dtype)
@@ -1030,7 +1033,7 @@ def _expected_weight_shapes(
     experts = cfg.experts_per_rank
     fc1_out = 2 * cfg.intermediate
     vec = cfg.sf_vec_size
-    if cfg.quant_kind in ("nvfp4", "mxfp4_mxfp8"):
+    if cfg.quant_kind in ("nvfp4", "mxfp4", "mxfp4_mxfp8"):
         fc1_shape = (experts, cfg.hidden // 2, fc1_out)
         fc2_shape = (experts, cfg.intermediate // 2, cfg.hidden)
     else:

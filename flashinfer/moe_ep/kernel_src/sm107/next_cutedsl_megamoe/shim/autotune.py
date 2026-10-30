@@ -80,7 +80,7 @@ def sm107_candidates(
     sweep them with :func:`sm107_schedule_candidates` instead.  An ikr winner
     makes the output accumulation order nondeterministic; it stays opt-in.
     """
-    tile_k = 256 if quant_kind == "nvfp4" else 128
+    tile_k = 256 if quant_kind in ("nvfp4", "mxfp4") else 128
     launches = (
         # (cluster, fallback, schedule_policy, work_id_mode)
         ((2, 1), None, ("grouped", None), "grid_stride"),
@@ -270,7 +270,7 @@ def _sweep_sm107_block_scaled_mega_moe(
         num_tokens,
         process_group=process_group,
     )
-    tolerance = 0.06 if cfg.quant_kind == "nvfp4" else 0.02
+    tolerance = 0.06 if cfg.quant_kind in ("nvfp4", "mxfp4") else 0.02
     scores = []
     errors = []
     for knobs in candidates:
