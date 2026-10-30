@@ -365,11 +365,7 @@ def _visible_kv_bounds(
 
 @torch.no_grad()
 def _context_reference(case: _ContextCase) -> torch.Tensor:
-    """Independent FP32 MHA/GQA oracle for fixed and packed context inputs.
-
-    ``case.sinks`` adds one value-free column per head to every softmax row,
-    as the dense reference of attention sinks.
-    """
+    """Independent FP32 MHA/GQA oracle for fixed and packed context inputs."""
 
     outputs = []
     for batch_idx, (q_length, k_length) in enumerate(

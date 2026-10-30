@@ -6082,7 +6082,7 @@ class TmemStatsResource(MemoryResource):
     # sink logit in the log2 domain, cached by the per-tile correction setup.
     sinks: cute.Pointer | None = field(init=False, default=None)
     q_half: Constexpr[int] = field(init=False, default=0)
-    sink_log2_cached: Float32 | None = field(init=False, default=None)
+    sink_log2: Float32 | None = field(init=False, default=None)
 
     _alloc: Constexpr[Optional[TmemAllocation]] = field(init=False, default=None)
     _smem_alloc: Constexpr[Optional[SmemAllocation]] = field(init=False, default=None)
@@ -6110,7 +6110,7 @@ class TmemStatsResource(MemoryResource):
         self.output_scale = output_scale
         self.sinks = sinks
         self.q_half = q_half
-        self.sink_log2_cached = Float32(0.0)
+        self.sink_log2 = Float32(0.0)
         self._alloc = TmemAllocation(f"tmem_vec_{tmem_vec_offset}", cfg.tmem_stats_cols)
         self._smem_alloc = None
         if cfg.stats_via_smem:
@@ -6186,7 +6186,7 @@ class TmemStatsResource(MemoryResource):
         """
         self.tmem_vec_addr_cached = Int32(0)
         self.tmem_ptr_vec_cached = prims.make_tmem_ptr(Int32(0), cutlass.Int8)
-        self.sink_log2_cached = Float32(0.0)
+        self.sink_log2 = Float32(0.0)
         _ = stage_info
 
     @producer_work(work_attrs=WorkAttr.AUXILIARY)
@@ -6272,7 +6272,7 @@ class TmemStatsResource(MemoryResource):
             head_coord * self.cfg.work_tile_q_heads
             + self.q_half * self.cfg.peer_q_head_stride
         )
-        self.sink_log2_cached = Float32(self.sinks[head_idx]) * Float32(_LOG2_E)
+        self.sink_log2 = Float32(self.sinks[head_idx]) * Float32(_LOG2_E)
 
     @consumer_work(work_attrs=WorkAttr.AUXILIARY)
     @cute.jit
@@ -6296,9 +6296,7 @@ class TmemStatsResource(MemoryResource):
         """
         p_scale = Float32(self.cfg.pv_p_scale)
         mass = (
-            cute.math.exp2(
-                self.sink_log2_cached - row_max * scale_softmax_log2, fastmath=True
-            )
+            cute.math.exp2(self.sink_log2 - row_max * scale_softmax_log2, fastmath=True)
             * p_scale
         )
         if row_max == Float32(-Float32.inf):
