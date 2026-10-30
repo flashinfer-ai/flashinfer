@@ -142,11 +142,12 @@ def _result(num_tokens, out, do_finalize):
         return out[0]
     gemm2_out, expert_weights, expanded_idx_to_permuted_idx = out[:3]
     idx = expanded_idx_to_permuted_idx.long().view(num_tokens, TOP_K)
-    # Invalid slots (-1) gather row 0, which may be uninitialized; zero them explicitly.
-    rows = torch.where(
-        (idx >= 0).view(num_tokens, TOP_K, 1), gemm2_out.float()[idx.clamp(min=0)], 0.0
+    # Padded slots (-1) may hold uninitialized FC2 rows and expert weights (NaN * 0 is NaN);
+    # zero their products explicitly.
+    rows = gemm2_out.float()[idx.clamp(min=0)] * expert_weights.float().view(
+        num_tokens, TOP_K, 1
     )
-    return (rows * expert_weights.float().view(num_tokens, TOP_K, 1)).sum(dim=1)
+    return torch.where((idx >= 0).view(num_tokens, TOP_K, 1), rows, 0.0).sum(dim=1)
 
 
 @pytest.mark.parametrize("packed", [True, False], ids=["packed", "unpacked_fp32"])
