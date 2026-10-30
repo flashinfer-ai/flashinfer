@@ -123,8 +123,51 @@ def test_pip_install_cmd_requires_pip_or_uv(monkeypatch):
 
     monkeypatch.setattr(main, "find_spec", lambda _name: None)
 
-    with pytest.raises(click.ClickException, match="Neither pip nor uv"):
+    message = None
+    try:
         main._get_pip_install_cmd()
+    except click.ClickException as e:
+        message = e.message
+    assert message is not None
+    assert "Neither pip nor uv" in message
+
+
+@pytest.mark.parametrize(
+    "stdout,stderr,suffix",
+    [
+        ("out text", "err text", ":\nerr text"),
+        ("out text", "", ":\nout text"),
+        ("", "", "."),
+    ],
+)
+def test_get_available_jit_cache_provider_tags_failure_output(
+    monkeypatch, stdout, stderr, suffix
+):
+    import click
+
+    import flashinfer.__main__ as main
+
+    monkeypatch.setattr(main, "which", lambda _name: "/tools/uv")
+    monkeypatch.setattr(main, "find_spec", lambda _name: None)
+    monkeypatch.setattr(
+        main.subprocess,
+        "run",
+        lambda cmd, **_kwargs: subprocess.CompletedProcess(cmd, 2, stdout, stderr),
+    )
+
+    message = None
+    try:
+        main._get_available_jit_cache_provider_tags(
+            "flashinfer-jit-cache==0.4.1+cu134",
+            "0.4.1+cu134",
+            "https://example.invalid/cu134",
+            nightly=False,
+        )
+    except click.ClickException as e:
+        message = e.message
+    assert message is not None
+    assert "/tools/uv exited with 2" in message
+    assert message.endswith(suffix)
 
 
 @pytest.mark.parametrize(
@@ -157,9 +200,10 @@ def test_installer_commands_use_uv_without_pip(monkeypatch, args):
 
     _test_cmd_helper(args)
 
+    uv_prefix = ["/tools/uv", "pip", "install", "--python", sys.executable]
     assert recorded
-    for cmd in recorded:
-        assert cmd[:5] == ["/tools/uv", "pip", "install", "--python", sys.executable]
+    assert all(cmd[:5] == uv_prefix for cmd in recorded)
+    assert any("--target" in cmd for cmd in recorded) == ("--sm" in args)
 
 
 def test_pip_install_cmd_does_not_import_pip(monkeypatch, tmp_path):
