@@ -308,6 +308,16 @@ def _prepare_moe_quant_mode_inputs(
             },
             {},
         )
+    elif quant_mode in ("w4a8", "mxfp8"):
+        return (
+            {
+                "x": tensors["x"],
+                "x_sf": tensors["x_sf"],
+                "fc2_input_scale": None,
+                "per_token_scale": None,
+            },
+            {},
+        )
     else:
         raise ValueError(f"Unsupported test quant_mode {quant_mode!r}")
 
@@ -332,7 +342,7 @@ def _compute_moe_quant_mode_reference(tensors, quant_mode, swap_ab=False, **kwar
             swap_ab=swap_ab,
             **{key: kwargs[key] for key in reference_keys if key in kwargs},
         )
-    elif quant_mode == "w4a4":
+    elif quant_mode in ("w4a4", "w4a8", "mxfp8"):
         if swap_ab:
             # Use the packed operands consumed by the kernel, not the
             # factory's original, unquantized *_bf16 weights.
@@ -353,20 +363,32 @@ def _compute_moe_quant_mode_reference(tensors, quant_mode, swap_ab=False, **kwar
                 )
             }
             inputs.update({key: kwargs[key] for key in reference_keys if key in kwargs})
-            return cute_dsl_moe_reference(
-                **inputs,
-                swap_ab=True,
-                per_token_scale=tensors["x_per_token_scale"],
-                nvfp4_4over6_config=(
-                    resolve_nvfp4_4over6()
-                    if tensors["x_per_token_scale"] is not None
-                    else None
-                ),
-                disable_fp4_quant_fast_math=env_flag_enabled(
-                    "FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH"
-                ),
-            )
-        return compute_reference_moe_fp4(**kwargs)
+            if quant_mode == "w4a4":
+                reference_config = dict(
+                    per_token_scale=tensors["x_per_token_scale"],
+                    nvfp4_4over6_config=(
+                        resolve_nvfp4_4over6()
+                        if tensors["x_per_token_scale"] is not None
+                        else None
+                    ),
+                    disable_fp4_quant_fast_math=env_flag_enabled(
+                        "FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH"
+                    ),
+                )
+            elif quant_mode == "w4a8":
+                reference_config = dict(
+                    a_dtype="float8_e4m3fn", b_dtype="float4_e2m1fn", sf_vec_size=32
+                )
+            elif quant_mode == "mxfp8":
+                reference_config = dict(
+                    a_dtype="float8_e4m3fn", b_dtype="float8_e4m3fn", sf_vec_size=32
+                )
+            else:
+                raise ValueError(f"Unsupported test quant_mode {quant_mode!r}")
+            return cute_dsl_moe_reference(**inputs, swap_ab=True, **reference_config)
+        if quant_mode == "w4a4":
+            return compute_reference_moe_fp4(**kwargs)
+        raise ValueError("MXFP accuracy cases require swap_ab")
     else:
         raise ValueError(f"Unsupported test quant_mode {quant_mode!r}")
 
@@ -374,14 +396,16 @@ def _compute_moe_quant_mode_reference(tensors, quant_mode, swap_ab=False, **kwar
 def _assert_moe_quant_mode_reference(actual, expected, quant_mode, swap_ab=False):
     if quant_mode == "w4a16":
         assert_w4a16_bits(actual, expected)
-    elif quant_mode == "w4a4":
+    elif quant_mode in ("w4a4", "w4a8", "mxfp8"):
         if swap_ab:
             assert_cute_dsl_moe_bits(actual, expected)
-        else:
+        elif quant_mode == "w4a4":
             passed, percent_within, atol = check_accuracy(actual, expected)
             assert passed, (
                 f"Only {percent_within * 100:.2f}% within tolerance (atol={atol:.4f})"
             )
+        else:
+            raise ValueError("MXFP accuracy cases require swap_ab")
     else:
         raise ValueError(f"Unsupported test quant_mode {quant_mode!r}")
 
@@ -457,10 +481,21 @@ def test_situ_changes_autotuner_cache_key(quant_mode: str):
 
 
 @cute_dsl_available
-@pytest.mark.parametrize("k", [128, 256, 384, 512])
+@pytest.mark.parametrize(
+    "swap_ab,k,tile_size",
+    [
+        pytest.param(False, k, tile_m, id=f"legacy-k{k}-m{tile_m}")
+        for k in (128, 256, 384, 512)
+        for tile_m in (128, 256)
+    ]
+    + [
+        pytest.param(True, k, tile_n, id=f"swap-ab-k{k}-n{tile_n}")
+        for k in (64, 128, 192, 256, 384, 512)
+        for tile_n in (16, 32, 64, 128, 256)
+    ],
+)
 @pytest.mark.parametrize("num_tokens", [1, 17])
-@pytest.mark.parametrize("tile_m", [128, 256])
-def test_gather_gemm_k_tail(k, num_tokens, tile_m):
+def test_gather_gemm_k_tail(swap_ab, k, num_tokens, tile_size):
     if not torch.cuda.is_available() or get_compute_capability(
         torch.device("cuda")
     ) not in (
@@ -469,9 +504,20 @@ def test_gather_gemm_k_tail(k, num_tokens, tile_m):
     ):
         pytest.skip("Requires Blackwell SM100 or SM103")
 
-    from flashinfer.fused_moe.cute_dsl.blockscaled_contiguous_gather_grouped_gemm_act_fusion import (
-        blockscaled_contiguous_gather_grouped_gemm_act_fusion,
-    )
+    if swap_ab:
+        from flashinfer.fused_moe.cute_dsl.blackwell.moe_swap_ab import (
+            launch_gather_gemm,
+        )
+
+        mma_tiler_mn = (128, tile_size)
+        cluster_shape_mn = (1, 1)
+    else:
+        from flashinfer.fused_moe.cute_dsl.blockscaled_contiguous_gather_grouped_gemm_act_fusion import (
+            blockscaled_contiguous_gather_grouped_gemm_act_fusion as launch_gather_gemm,
+        )
+
+        mma_tiler_mn = (tile_size, 128)
+        cluster_shape_mn = (tile_size // 128, 1)
 
     device = "cuda"
     n = 256
@@ -492,32 +538,35 @@ def test_gather_gemm_k_tail(k, num_tokens, tile_m):
     b_scale = torch.full(
         (32, 4, n // 128, 4, k // 64, 1), 0x38, dtype=torch.uint8, device=device
     )
-    mapping = torch.full((tile_m,), -1, dtype=torch.int32, device=device)
+    num_tiles = (num_tokens + tile_size - 1) // tile_size
+    mapping = torch.full((num_tiles * tile_size,), -1, dtype=torch.int32, device=device)
     mapping[:num_tokens] = torch.arange(num_tokens - 1, -1, -1, device=device)
 
-    output, _ = blockscaled_contiguous_gather_grouped_gemm_act_fusion(
+    output, _ = launch_gather_gemm(
         a=a,
         b=b,
         a_scale=a_scale,
         b_scale=b_scale,
         alpha=torch.full((1,), 1.0 / k, device=device),
-        tile_idx_to_expert_idx=torch.zeros(1, dtype=torch.int32, device=device),
-        tile_idx_to_mn_limit=torch.tensor(
-            [num_tokens], dtype=torch.int32, device=device
+        tile_idx_to_expert_idx=torch.zeros(num_tiles, dtype=torch.int32, device=device),
+        tile_idx_to_mn_limit=torch.full(
+            (num_tiles,), num_tokens, dtype=torch.int32, device=device
         ),
         token_id_mapping=mapping,
-        num_non_exiting_tiles=torch.ones(1, dtype=torch.int32, device=device),
+        num_non_exiting_tiles=torch.tensor(
+            [num_tiles], dtype=torch.int32, device=device
+        ),
         topk=1,
         c_dtype="bfloat16",
-        mma_tiler_mn=(tile_m, 128),
-        cluster_shape_mn=(tile_m // 128, 1),
+        mma_tiler_mn=mma_tiler_mn,
+        cluster_shape_mn=cluster_shape_mn,
         enable_pdl=False,
     )
     # Both projections are dot(ones, ones) / K = 1, hence SwiGLU = sigmoid(1).
     expected = torch.full_like(
         output[:num_tokens], torch.sigmoid(torch.tensor(1.0)).item()
     )
-    torch.testing.assert_close(output[:num_tokens], expected, rtol=0, atol=0)
+    assert_cute_dsl_moe_bits(output[:num_tokens], expected)
 
 
 @cute_dsl_available
@@ -2197,33 +2246,94 @@ class TestCuteDslFusedMoeFunctional:
         )
 
     @pytest.mark.parametrize(
-        "quant_mode,activation_type,num_tokens,top_k,hidden_size,intermediate_size,num_experts,use_per_token_activation",
+        "quant_mode,activation_type,num_tokens,top_k,hidden_size,intermediate_size,num_experts,use_per_token_activation,swap_ab,tactic,situ_beta,situ_linear_beta",
         [
             pytest.param(
                 "w4a4",
-                ActivationType.Swiglu,
-                128,
-                1,
-                256,
-                512,
-                256,
-                False,
-                id="swiglu-per-tensor",
-            ),
+                activation_type,
+                num_tokens,
+                top_k,
+                hidden_size,
+                intermediate_size,
+                num_experts,
+                use_per_token_activation,
+                swap_ab,
+                None,
+                None,
+                None,
+                id=f"{name}-swap-ab-{swap_ab}",
+            )
+            for swap_ab in (False, True)
+            for name, activation_type, num_tokens, top_k, hidden_size, intermediate_size, num_experts, use_per_token_activation in (
+                (
+                    "swiglu-per-tensor",
+                    ActivationType.Swiglu,
+                    128,
+                    1,
+                    256,
+                    512,
+                    256,
+                    False,
+                ),
+                (
+                    "relu2-per-token",
+                    ActivationType.Relu2,
+                    515,
+                    8,
+                    1024,
+                    2048,
+                    384,
+                    True,
+                ),
+            )
+        ]
+        + [
             pytest.param(
-                "w4a4",
-                ActivationType.Relu2,
-                515,
-                8,
-                1024,
-                2048,
-                384,
+                quant_mode,
+                ActivationType.Swiglu,
+                17,
+                2,
+                256,
+                128,
+                2,
+                False,
                 True,
-                id="relu2-per-token",
-            ),
+                tactic,
+                situ_beta,
+                situ_linear_beta,
+                id=f"{quant_mode}-{activation}-{tile}",
+                marks=mxfp8_required,
+            )
+            for quant_mode in ("w4a8", "mxfp8")
+            for activation, situ_beta, situ_linear_beta in (
+                ("swiglu", None, None),
+                ("situ-gate", 1.75, None),
+                ("situ-gate-and-up", 0.8, 1.5),
+            )
+            for tile, tactic in (
+                (
+                    "n16",
+                    (
+                        16,
+                        ((128, 16), (1, 1), False),
+                        ((128, 16), (1, 1), False),
+                        (None, None),
+                        True,
+                    ),
+                ),
+                (
+                    "n128-two-cta",
+                    (
+                        128,
+                        ((256, 128), (2, 1), False),
+                        ((256, 128), (2, 1), False),
+                        (None, None),
+                        True,
+                    ),
+                ),
+            )
         ],
     )
-    @pytest.mark.parametrize("swap_ab", [False, True])
     def test_deterministic_finalize_numerical_accuracy(
         self,
         quant_mode: str,
@@ -2235,6 +2345,9 @@ class TestCuteDslFusedMoeFunctional:
         num_experts: int,
         use_per_token_activation: bool,
         swap_ab: bool,
+        tactic,
+        situ_beta,
+        situ_linear_beta,
     ):
         if swap_ab and is_sm107():
             pytest.skip("swap_ab requires Blackwell SM100 or SM103")
@@ -2249,6 +2362,9 @@ class TestCuteDslFusedMoeFunctional:
             use_per_token_activation,
             use_fused_finalize=False,
             swap_ab=swap_ab,
+            tactic=tactic,
+            situ_beta=situ_beta,
+            situ_linear_beta=situ_linear_beta,
         )
 
     @pytest.mark.parametrize(
@@ -2320,28 +2436,99 @@ class TestCuteDslFusedMoeFunctional:
         use_per_token_activation: bool,
         use_fused_finalize: bool,
         swap_ab: bool = False,
+        tactic=None,
+        situ_beta=None,
+        situ_linear_beta=None,
     ):
         from flashinfer import cute_dsl_fused_moe
 
         _, gated = normalize_cute_dsl_moe_activation_type(activation_type)
         num_local_experts = num_experts
 
-        tensors = create_moe_tensors(
-            num_tokens=num_tokens,
-            hidden_size=hidden_size,
-            intermediate_size=intermediate_size,
-            num_experts=num_experts,
-            num_local_experts=num_local_experts,
-            top_k=top_k,
-            gated=gated,
-            swap_ab=swap_ab,
-            use_per_token_activation=use_per_token_activation,
-        )
+        if quant_mode in ("w4a4", "w4a16"):
+            tensors = create_moe_tensors(
+                num_tokens=num_tokens,
+                hidden_size=hidden_size,
+                intermediate_size=intermediate_size,
+                num_experts=num_experts,
+                num_local_experts=num_local_experts,
+                top_k=top_k,
+                gated=gated,
+                swap_ab=swap_ab,
+                use_per_token_activation=use_per_token_activation,
+            )
+        elif quant_mode in ("w4a8", "mxfp8"):
+            from flashinfer import mxfp8_quantize
+            from flashinfer.fused_moe import (
+                CuteDslConfig,
+                QuantConfig,
+                QuantFormat,
+                ReLU2,
+                SwiGLU,
+            )
+
+            torch.manual_seed(42)
+            device = torch.device("cuda")
+            x_bf16 = (
+                torch.randn(
+                    num_tokens, hidden_size, dtype=torch.bfloat16, device=device
+                )
+                / 2
+            )
+            x, x_sf = mxfp8_quantize(
+                x_bf16, is_sf_swizzled_layout=False, alignment=128, backend="cuda"
+            )
+            if quant_mode == "w4a8":
+                weight_format = QuantFormat.MXFP4
+            elif quant_mode == "mxfp8":
+                weight_format = QuantFormat.MXFP8
+            else:
+                raise ValueError(f"Unsupported test quant_mode {quant_mode!r}")
+            weights = CuteDslConfig.prepare_weights(
+                torch.randn(
+                    num_experts,
+                    (2 if gated else 1) * intermediate_size,
+                    hidden_size,
+                    device=device,
+                    dtype=torch.bfloat16,
+                )
+                / 4,
+                torch.randn(
+                    num_experts,
+                    hidden_size,
+                    intermediate_size,
+                    device=device,
+                    dtype=torch.bfloat16,
+                )
+                / 4,
+                quant=QuantConfig(weight_format, QuantFormat.MXFP8),
+                activation=SwiGLU() if gated else ReLU2(),
+                swap_ab=swap_ab,
+                num_local_experts=num_local_experts,
+                hidden_size=hidden_size,
+                intermediate_size=intermediate_size,
+            )
+            tensors = dict(
+                x=x,
+                x_sf=x_sf.view(torch.uint8).reshape(num_tokens, hidden_size // 32),
+                fc2_input_scale=None,
+                token_selected_experts=torch.arange(
+                    top_k, device=device, dtype=torch.int32
+                )
+                .expand(num_tokens, top_k)
+                .contiguous(),
+                token_final_scales=torch.full(
+                    (num_tokens, top_k), 1 / top_k, dtype=torch.float32, device=device
+                ),
+                **weights,
+            )
+        else:
+            raise ValueError(f"Unsupported test quant_mode {quant_mode!r}")
         api_inputs, reference_inputs = _prepare_moe_quant_mode_inputs(
             tensors, quant_mode
         )
 
-        result = cute_dsl_fused_moe(
+        inputs = dict(
             token_selected_experts=tensors["token_selected_experts"],
             token_final_scales=tensors["token_final_scales"],
             w1_weight=tensors["w1_weight"],
@@ -2350,6 +2537,9 @@ class TestCuteDslFusedMoeFunctional:
             w2_weight=tensors["w2_weight"],
             w2_weight_sf=tensors["w2_weight_sf"],
             w2_alpha=tensors["w2_alpha"],
+            **api_inputs,
+        )
+        config = dict(
             num_experts=num_experts,
             top_k=top_k,
             num_local_experts=num_local_experts,
@@ -2357,8 +2547,10 @@ class TestCuteDslFusedMoeFunctional:
             use_fused_finalize=use_fused_finalize,
             quant_mode=quant_mode,
             swap_ab=swap_ab,
-            **api_inputs,
+            situ_beta=situ_beta,
+            situ_linear_beta=situ_linear_beta,
         )
+        result = cute_dsl_fused_moe(**inputs, **config, tactic=tactic)
 
         assert result.shape == (num_tokens, hidden_size)
         assert result.dtype == torch.bfloat16
@@ -2377,10 +2569,35 @@ class TestCuteDslFusedMoeFunctional:
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
             activation_type=activation_type,
+            situ_beta=situ_beta,
+            situ_linear_beta=situ_linear_beta,
             **reference_inputs,
         )
 
         _assert_moe_quant_mode_reference(result, ref_output, quant_mode, swap_ab)
+
+        if quant_mode in ("w4a8", "mxfp8"):
+            from flashinfer import CuteDslMoEWrapper
+
+            wrapper = CuteDslMoEWrapper(
+                **config,
+                hidden_size=hidden_size,
+                intermediate_size=intermediate_size,
+                use_cuda_graph=True,
+            )
+            wrapped = wrapper.run(**inputs, tactic=tactic)
+            _assert_moe_quant_mode_reference(wrapped, ref_output, quant_mode, swap_ab)
+            if situ_beta is not None:
+                swiglu_reference = _compute_moe_quant_mode_reference(
+                    tensors, quant_mode, swap_ab=swap_ab
+                )
+                assert not torch.equal(ref_output, swiglu_reference)
+
+            invalid = dict(inputs, w1_weight=inputs["w1_weight"].to(torch.bfloat16))
+            with pytest.raises(TypeError, match="GEMM1 and GEMM2 weights"):
+                wrapper.run(**invalid, tactic=tactic)
+            with pytest.raises(TypeError, match="GEMM1 and GEMM2 weights"):
+                cute_dsl_fused_moe(**invalid, **config, tactic=tactic)
 
     @pytest.mark.parametrize(
         "quant_mode,use_per_token_activation", _MOE_QUANT_MODE_CASES
@@ -5483,188 +5700,3 @@ def test_cute_dsl_pinned_recipe_matches_env(
         assert not torch.equal(env_on[leg], env_off[leg])
         assert torch.equal(pinned_under_env_off[leg], env_on[leg])
         assert torch.equal(none_under_env_on[leg], env_off[leg])
-
-
-@cute_dsl_available
-@pytest.mark.parametrize("k", [64, 128, 192, 256, 384, 512])
-@pytest.mark.parametrize("num_tokens", [1, 17])
-@pytest.mark.parametrize("tile_n", [16, 32, 64, 128, 256])
-def test_swap_ab_gemm_k_tail(k, num_tokens, tile_n):
-    if not torch.cuda.is_available() or get_compute_capability(
-        torch.device("cuda")
-    ) not in (
-        (10, 0),
-        (10, 3),
-    ):
-        pytest.skip("Requires Blackwell SM100 or SM103")
-
-    from flashinfer.fused_moe.cute_dsl.blackwell.moe_swap_ab import (
-        launch_gather_gemm,
-    )
-
-    device = "cuda"
-    n = 256
-    # Two FP4 ones per byte. An extra row keeps the old kernel's tail reads
-    # inside allocated storage, so a failure cannot poison the CUDA context.
-    a_storage = torch.full(
-        (num_tokens + 1, k // 2), 0x22, dtype=torch.uint8, device=device
-    )
-    a = a_storage[:num_tokens]
-    # E4M3 1.0 = 0x38; 0x7f is NaN. Reading the extra scale row must not
-    # contaminate the last real row, even though the weight K tail is zero.
-    scale_storage = torch.full(
-        (num_tokens + 1, k // 16), 0x7F, dtype=torch.uint8, device=device
-    )
-    a_scale = scale_storage[:num_tokens]
-    a_scale.fill_(0x38)
-    b = torch.full((1, n, k // 2), 0x22, dtype=torch.uint8, device=device)
-    b_scale = torch.full(
-        (32, 4, n // 128, 4, k // 64, 1), 0x38, dtype=torch.uint8, device=device
-    )
-    num_tiles = (num_tokens + tile_n - 1) // tile_n
-    mapping = torch.full((num_tiles * tile_n,), -1, dtype=torch.int32, device=device)
-    mapping[:num_tokens] = torch.arange(num_tokens - 1, -1, -1, device=device)
-
-    output, _ = launch_gather_gemm(
-        a=a,
-        b=b,
-        a_scale=a_scale,
-        b_scale=b_scale,
-        alpha=torch.full((1,), 1.0 / k, device=device),
-        tile_idx_to_expert_idx=torch.zeros(num_tiles, dtype=torch.int32, device=device),
-        tile_idx_to_mn_limit=torch.full(
-            (num_tiles,), num_tokens, dtype=torch.int32, device=device
-        ),
-        token_id_mapping=mapping,
-        num_non_exiting_tiles=torch.tensor(
-            [num_tiles], dtype=torch.int32, device=device
-        ),
-        topk=1,
-        c_dtype="bfloat16",
-        mma_tiler_mn=(128, tile_n),
-        cluster_shape_mn=(1, 1),
-        enable_pdl=False,
-    )
-    # Both projections are dot(ones, ones) / K = 1, hence SwiGLU = sigmoid(1).
-    expected = torch.full_like(
-        output[:num_tokens], torch.sigmoid(torch.tensor(1.0)).item()
-    )
-    assert_cute_dsl_moe_bits(output[:num_tokens], expected)
-
-
-@cute_dsl_available
-@mxfp8_required
-@pytest.mark.parametrize("quant_mode", ["w4a8", "mxfp8"])
-@pytest.mark.parametrize(
-    "situ_beta,situ_linear_beta",
-    [(None, None), (1.75, None), (0.8, 1.5)],
-    ids=["swiglu", "situ-gate", "situ-gate-and-up"],
-)
-@pytest.mark.parametrize(
-    "tactic",
-    [
-        (
-            16,
-            ((128, 16), (1, 1), False),
-            ((128, 16), (1, 1), False),
-            (None, None),
-            True,
-        ),
-        (
-            128,
-            ((256, 128), (2, 1), False),
-            ((256, 128), (2, 1), False),
-            (None, None),
-            True,
-        ),
-    ],
-    ids=["n16", "n128-two-cta"],
-)
-def test_mxfp_unfused_public_apis(quant_mode, tactic, situ_beta, situ_linear_beta):
-    from flashinfer import CuteDslMoEWrapper, cute_dsl_fused_moe, mxfp8_quantize
-    from flashinfer.fused_moe import CuteDslConfig, QuantConfig, QuantFormat
-
-    torch.manual_seed(42)
-    device = torch.device("cuda")
-    tokens, hidden, intermediate, experts, top_k = 17, 256, 128, 2, 2
-    x_bf16 = torch.randn(tokens, hidden, dtype=torch.bfloat16, device=device) / 2
-    x, x_sf = mxfp8_quantize(
-        x_bf16, is_sf_swizzled_layout=False, alignment=128, backend="cuda"
-    )
-    x_sf = x_sf.view(torch.uint8).reshape(tokens, hidden // 32)
-    if quant_mode == "w4a8":
-        weight_format = QuantFormat.MXFP4
-        reference_weight_dtype = "float4_e2m1fn"
-    elif quant_mode == "mxfp8":
-        weight_format = QuantFormat.MXFP8
-        reference_weight_dtype = "float8_e4m3fn"
-    else:
-        raise ValueError(quant_mode)
-    weights = CuteDslConfig.prepare_weights(
-        torch.randn(
-            experts, 2 * intermediate, hidden, device=device, dtype=torch.bfloat16
-        )
-        / 4,
-        torch.randn(experts, hidden, intermediate, device=device, dtype=torch.bfloat16)
-        / 4,
-        quant=QuantConfig(weight_format, QuantFormat.MXFP8),
-        swap_ab=True,
-        num_local_experts=experts,
-        hidden_size=hidden,
-        intermediate_size=intermediate,
-    )
-    inputs = dict(
-        x=x,
-        x_sf=x_sf,
-        token_selected_experts=torch.arange(experts, device=device, dtype=torch.int32)
-        .expand(tokens, top_k)
-        .contiguous(),
-        token_final_scales=torch.full(
-            (tokens, top_k), 1 / top_k, dtype=torch.float32, device=device
-        ),
-        fc2_input_scale=None,
-        **weights,
-    )
-    config = dict(
-        num_experts=experts,
-        top_k=top_k,
-        quant_mode=quant_mode,
-        swap_ab=True,
-        use_fused_finalize=False,
-        situ_beta=situ_beta,
-        situ_linear_beta=situ_linear_beta,
-    )
-    functional = cute_dsl_fused_moe(**inputs, **config, tactic=tactic)
-    wrapper = CuteDslMoEWrapper(
-        **config,
-        hidden_size=hidden,
-        intermediate_size=intermediate,
-        use_cuda_graph=True,
-    )
-    actual = wrapper.run(**inputs, tactic=tactic)
-    reference_kwargs = dict(
-        a_dtype="float8_e4m3fn",
-        b_dtype=reference_weight_dtype,
-        sf_vec_size=32,
-        situ_beta=situ_beta,
-        situ_linear_beta=situ_linear_beta,
-        swap_ab=True,
-    )
-    reference = cute_dsl_moe_reference(**inputs, **reference_kwargs)
-    assert_cute_dsl_moe_bits(functional, reference)
-    assert_cute_dsl_moe_bits(actual, reference)
-
-    if situ_beta is not None:
-        swiglu_reference = cute_dsl_moe_reference(
-            **inputs,
-            **dict(reference_kwargs, situ_beta=None, situ_linear_beta=None),
-        )
-        situ_error = torch.mean(torch.abs(actual.float() - reference.float()))
-        swiglu_error = torch.mean(torch.abs(actual.float() - swiglu_reference.float()))
-        assert situ_error < swiglu_error
-
-    invalid = dict(inputs, w1_weight=inputs["w1_weight"].to(torch.bfloat16))
-    with pytest.raises(TypeError, match="GEMM1 and GEMM2 weights"):
-        wrapper.run(**invalid, tactic=tactic)
-    with pytest.raises(TypeError, match="GEMM1 and GEMM2 weights"):
-        cute_dsl_fused_moe(**invalid, **config, tactic=tactic)
