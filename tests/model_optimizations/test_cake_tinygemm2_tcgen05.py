@@ -146,7 +146,7 @@ SM100_FAMILY_ROUTES = [
     (8, 2864, 4096, False, None),
     (2, 2048, 3072, False, None),
     (7, 4112, 2056, False, None),
-    (8, 4096, 6208, False, None),
+    (8, 3072, 6152, False, None),
     (4, 2880, 2880, True, None),
     (8, 4096, 4096, True, None),
     # PACKED with a bias on 9 to 16 rows: from 2880 output features and K 2112
@@ -273,8 +273,7 @@ SM100_NARROW_ROUTES = [
 # multiple of 64 and PACKED_BOX8 on the others; PACKED_M64_N8 in its three other
 # windows (corners and inside points).  The shapes just past each edge, off a
 # multiple of 64 where a window needs one, on 9 rows or with a bias go to the next
-# window or keep their kernels; 8 rows at 3584 to 4608 output features from an input
-# of 6152 keep the reference, and the other 8-row shapes outside the 8192 and 12288
+# window or keep their kernels; the other 8-row shapes outside the 8192 and 12288
 # windows keep their kernels or go to the last windows, listed below.
 SM100_BOX8_M64_N8_ROUTES = [
     (1, 4480, 2048, False, "PACKED_BOX8"),
@@ -290,8 +289,8 @@ SM100_BOX8_M64_N8_ROUTES = [
     (3, 4096, 6144, False, "PACKED"),
     (3, 3568, 7168, False, "PACKED_M64_N8"),
     (3, 3584, 8256, False, None),
-    (8, 4096, 7168, False, None),
-    (8, 4608, 8192, False, None),
+    (8, 4096, 7168, False, "PACKED_BOX8"),
+    (8, 4608, 8192, False, "PACKED_BOX8"),
     (8, 8192, 2048, False, "PACKED_M64_N8"),
     (8, 8192, 8192, False, "PACKED_M64_N8"),
     (1, 8192, 2112, False, "PACKED_M64_N8"),
@@ -316,7 +315,7 @@ SM100_BOX8_M64_N8_ROUTES = [
     (2, 7680, 8256, False, None),
     (5, 6992, 7168, False, None),
     (8, 4480, 2048, False, "PACKED_M64_N8"),
-    (8, 4608, 6152, False, None),
+    (8, 4608, 6152, False, "PACKED_BOX8"),
     (8, 10000, 3000, False, None),
     (8, 8208, 4104, False, None),
     (8, 16384, 6152, False, None),
@@ -339,10 +338,10 @@ SM100_BOX8_M64_N8_ROUTES = [
 # PACKED_M64_N8 on 8 rows at inputs that are a multiple of 64 (4480 to 7167 output
 # features at inputs of 2048 to 4352 and 5632 to 6144, 7168 to 16384 at 2048 to 6144,
 # 7168 to 9216 above 6152 up to 8192), PACKED on 9 to 16 rows from 4224 output
-# features, PACKED_BOX8 at 4112 to 4464, and PACKED_M64_N8 and PACKED_BOX8 in the
-# windows past those.  Corners, inside points and inputs that are not a multiple of 64;
-# the shapes just past an edge, on other row counts or with a bias go to another window
-# or keep their kernels.
+# features, PACKED_BOX8 at 4112 to 4464, and PACKED_M64_N8, PACKED_BOX8 and PACKED in
+# the windows past those.  Corners, inside points and inputs that are not a multiple of
+# 64; the shapes just past an edge, on other row counts or with a bias go to another
+# window or keep their kernels.
 SM100_LAST_WINDOWS_ROUTES = [
     # 8 rows at 4480 to 7167 output features, inputs of 2048 to 4352 and 5632 to 6144
     (8, 4480, 2112, False, "PACKED_M64_N8"),
@@ -385,7 +384,6 @@ SM100_LAST_WINDOWS_ROUTES = [
     (16, 16384, 12288, False, "PACKED"),
     (12, 8192, 6152, False, "PACKED"),
     (16, 10240, 3080, False, "PACKED"),
-    (9, 4208, 4096, False, None),
     (16, 16400, 4096, False, None),
     (9, 6144, 12296, False, None),
     (9, 6144, 2040, False, None),
@@ -399,7 +397,6 @@ SM100_LAST_WINDOWS_ROUTES = [
     (7, 4464, 6144, False, "PACKED_BOX8"),
     (4, 4288, 4096, False, "PACKED_BOX8"),
     (4, 4288, 4104, False, None),
-    (8, 4464, 6152, False, None),
     (8, 4096, 5120, False, "PACKED"),
     (9, 4288, 4096, False, "PACKED"),
     (8, 4288, 4104, True, None),
@@ -407,7 +404,6 @@ SM100_LAST_WINDOWS_ROUTES = [
     (1, 9216, 2048, False, "PACKED_M64_N8"),
     (7, 16384, 4096, False, "PACKED_M64_N8"),
     (4, 12288, 3072, False, "PACKED_M64_N8"),
-    (1, 9200, 2048, False, None),
     (7, 16400, 4096, False, None),
     (4, 12288, 4160, False, None),
     (4, 12288, 3080, False, None),
@@ -477,6 +473,58 @@ SM100_LAST_WINDOWS_ROUTES = [
     (8, 14336, 6152, False, None),
     (8, 14336, 2040, False, None),
     (8, 14336, 4104, True, None),
+    # 8 rows at 4480 to 4608 output features and inputs of 2048 to 8192 that the
+    # PACKED_M64_N8 windows above do not take
+    (8, 4480, 2056, False, "PACKED_BOX8"),
+    (8, 4608, 2056, False, "PACKED_BOX8"),
+    (8, 4480, 8192, False, "PACKED_BOX8"),
+    (8, 4544, 4800, False, "PACKED_BOX8"),
+    (8, 4544, 4104, False, "PACKED_BOX8"),
+    (8, 4496, 7688, False, "PACKED_BOX8"),
+    (8, 4592, 6144, False, "PACKED_M64_N8"),
+    (8, 4624, 7168, False, None),
+    (8, 4480, 8200, False, None),
+    (8, 4480, 2040, False, None),
+    (9, 4544, 4800, False, "PACKED"),
+    (7, 4544, 4800, False, "PACKED_BOX8"),
+    (8, 4544, 4800, True, None),
+    # 8 rows at 3584 to 4479 output features and inputs of 6152 to 8192
+    (8, 3584, 6152, False, "PACKED_BOX8"),
+    (8, 4464, 8192, False, "PACKED_BOX8"),
+    (8, 3584, 8192, False, "PACKED_BOX8"),
+    (8, 4464, 6152, False, "PACKED_BOX8"),
+    (8, 3840, 7176, False, "PACKED_BOX8"),
+    (8, 4224, 6400, False, "PACKED_BOX8"),
+    (8, 3568, 7176, False, None),
+    (8, 4096, 8200, False, None),
+    (8, 4096, 6144, False, "PACKED"),
+    (9, 4096, 7168, False, None),
+    (7, 4096, 7168, False, "PACKED_BOX8"),
+    (8, 4096, 7168, True, None),
+    # 1 to 7 rows at 8193 to 9215 output features and inputs of 2048 to 4096 that are
+    # a multiple of 64
+    (1, 8208, 2048, False, "PACKED_M64_N8"),
+    (7, 9200, 4096, False, "PACKED_M64_N8"),
+    (1, 9200, 2048, False, "PACKED_M64_N8"),
+    (7, 8208, 4096, False, "PACKED_M64_N8"),
+    (4, 8704, 3072, False, "PACKED_M64_N8"),
+    (4, 8704, 3080, False, None),
+    (4, 8704, 4160, False, None),
+    (4, 8704, 2040, False, None),
+    (8, 8704, 3072, False, "PACKED_M64_N8"),
+    (4, 8704, 3072, True, None),
+    # PACKED on 9 to 16 rows at 4097 to 4223 output features and inputs of 2048 to 12288
+    (9, 4112, 2048, False, "PACKED"),
+    (16, 4208, 12288, False, "PACKED"),
+    (16, 4112, 12288, False, "PACKED"),
+    (9, 4208, 4096, False, "PACKED"),
+    (12, 4160, 7176, False, "PACKED"),
+    (9, 4096, 8192, False, None),
+    (9, 4160, 12296, False, None),
+    (16, 4160, 2040, False, None),
+    (17, 4160, 4096, False, None),
+    (8, 4160, 4096, False, "PACKED_BOX8"),
+    (12, 4160, 4096, True, None),
 ]
 # sm_103a, rows without a bias from 3584 output features: PACKED_BOX8 on 8 rows at
 # 4480 to 4608 output features and inputs of 2048 to 12288; at 8192 output features
