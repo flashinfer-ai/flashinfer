@@ -175,6 +175,17 @@ POOL_RAGGED_MIN_TILES = 28
 # per head but 12..15 per CTA) -1.1 %.
 POOL_RAGGED_LONG_HEAD_MIN_TILES = 18
 POOL_RAGGED_LONG_HEAD_WINDOWS = 4
+# Sage-FP8 grouped-query ragged pair plans with long heads (the same window rule) join the
+# queue -- the shared-transposer queue program -- from this many tiles per CTA.  The two
+# thresholds above were measured on MHA plans; on the Sage-FP8 grouped-query route the
+# shared-transposer queue program is faster than the static programs at this tile count.
+# Measured on H100 (paired, cold L2, 3 x 256 and 9 x 256 in two processes each):
+# h8-m32768-n32768-k64 ragged at g = 4 (2048 head-pair tiles, 14..16 per CTA) 1.0385 ..
+# 1.0389 x and at g = 8 (15..16 per CTA) 1.0417 .. 1.0423 x (14.0 .. 15.7 us per launch)
+# against the position-selected static program it ran before.  The BF16 route keeps the
+# thresholds above: forcing its ragged pair queue plan of h12-m32768-k64 at g = 4 static
+# measured 0.9994 x.
+FP8_POOL_RAGGED_PAIR_MIN_TILES = 14
 POOL_SMALL_MIN_TILES = (
     7  # ... or this many tiles of at most POOL_SMALL_TILE_POS positions
 )
@@ -1498,6 +1509,7 @@ def plan_vsa_sm90(
     gqa: int = 1,
     split_tile_order: Optional[str] = None,
     repair_split: Union[bool, str] = GQA_REPAIR_SPLIT,
+    fp8: bool = False,
 ) -> dict[str, Any]:
     """Turn a boolean ``[H, MB, NB]`` block mask into the kernel's per-CTA plan.
 
@@ -1550,6 +1562,11 @@ def plan_vsa_sm90(
     ``False`` keeps the mode-1 replay everywhere, ``True`` re-pairs every
     split plan.  ``"repair_split"`` reports whether the plan holds re-paired
     tiles, ``"repair_rule"`` the setting.
+
+    ``fp8`` (the Sage-FP8 route): grouped-query ragged pair plans whose heads
+    hold the queue window take the queue from ``FP8_POOL_RAGGED_PAIR_MIN_TILES``
+    tiles per CTA.  The BF16 route (the default) and MHA plans keep the
+    thresholds above.
     """
     gqa = gqa_group(gqa)
     if block_mask.dtype != torch.bool or block_mask.ndim != 3:
@@ -1707,6 +1724,12 @@ def plan_vsa_sm90(
             min_tiles >= POOL_RAGGED_LONG_HEAD_MIN_TILES
             and len(infos) >= POOL_RAGGED_LONG_HEAD_WINDOWS * h_kv * g
         )
+        # Sage-FP8 grouped-query pair plans join from FP8_POOL_RAGGED_PAIR_MIN_TILES.
+        if fp8 and gqa > 1 and mode == "pair" and not queue:
+            queue = (
+                min_tiles >= FP8_POOL_RAGGED_PAIR_MIN_TILES
+                and len(infos) >= POOL_RAGGED_LONG_HEAD_WINDOWS * h_kv * g
+            )
     else:
         queue = min_tiles >= POOL_MIN_TILES or (
             POOL_SMALL_TILE_POS > 0

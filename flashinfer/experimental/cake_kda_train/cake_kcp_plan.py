@@ -105,7 +105,7 @@ import bisect
 import dataclasses
 import operator
 import weakref
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 import torch
@@ -1836,7 +1836,10 @@ class KcpSequence:
         self.log.clear()
 
 
-@dataclasses.dataclass(frozen=True, eq=False)
+# KcpContext: argument omitted (the former default_factory fields)
+_DEFAULT: Any = object()
+
+
 class KcpContext:
     """One rank's view of the partition: CPU ints / tuples plus small int32 device tables; built once, reused across
     layers; never reads a tensor's contents.
@@ -1852,7 +1855,66 @@ class KcpContext:
     ``tables``; ``NC`` real chunks, ``NC_max`` / ``NC_pad`` / ``R`` the existing plan's geometry.  ``halo`` is the
     convolution halo plan (its device tables in ``halo_tables``: ``hist_row_off``, ``tail_row_off``, ``head_row_off``
     int32, ``hist_index`` int64).  ``heads(H)`` derives and caches the head-dependent plan (:class:`KcpHeadPlan`).
-    ``sequence`` is the debug collective counter."""
+    ``sequence`` is the debug collective counter.
+
+    A plain frozen class, not a dataclass: the input walks of FSDP2's ``fully_shard`` hooks descend into every
+    dataclass, dict, list and tuple of a module's arguments, so a dataclass context carried in per-layer metadata
+    was walked fragment by fragment on every call (flashinfer-ai/flashinfer#7914); this class is one leaf there.
+    It keeps the former dataclass's keyword constructor (:attr:`_FIELDS` in order), repr, identity equality and
+    ``dataclasses.FrozenInstanceError`` on attribute assignment."""
+
+    # the constructor's fields in the former dataclass order; the repr shows every field but ``sequence`` and the
+    # private "_" caches (_REPR_FIELDS), which the constructor creates empty when omitted
+    _FIELDS: tuple[str, ...] = (
+        "partition",
+        "rank",
+        "world_size",
+        "group",
+        "device",
+        "conv_kernel_size",
+        "sm_count",
+        "T_r",
+        "n_frag",
+        "cu_seqlens_local_cpu",
+        "cu_seqlens_local",
+        "frag_rows",
+        "in_slot",
+        "out_slot",
+        "n_in",
+        "n_out",
+        "N_in",
+        "N_out",
+        "n_in_by_rank",
+        "n_out_by_rank",
+        "in_slot_all",
+        "out_slot_all",
+        "chains",
+        "n_d_max",
+        "exchange_scheme",
+        "NC",
+        "NC_max",
+        "NC_pad",
+        "R",
+        "chunk_bos",
+        "chunk_len",
+        "seq_chunk_start",
+        "seq_order",
+        "tables",
+        "halo",
+        "halo_tables",
+        "p_rule",
+        "sequence",
+        "upload",
+        "table_cache",
+        "_head_plans",
+        "_table_sets",
+        "_uploads",
+        "_waited",
+        "_lazy",
+    )
+    _REPR_FIELDS: tuple[str, ...] = tuple(
+        f for f in _FIELDS if f != "sequence" and not f.startswith("_")
+    )
 
     partition: KcpPartition
     rank: int
@@ -1890,25 +1952,87 @@ class KcpContext:
     tables: dict[str, torch.Tensor]
     halo: KcpHaloPlan
     halo_tables: dict[str, torch.Tensor]
-    p_rule: str = P_RULE_DEFAULT  # plan rule: "wave_fill1_p1tie" shipped; "wave_fill1" (previous) / "wave" / "occ" / "wave_fill" via the test knob
-    sequence: KcpSequence = dataclasses.field(default_factory=KcpSequence, repr=False)
-    upload: str = UPLOAD_DEFAULT  # test knob: "async" (shipped) | "blocking" (the previous pageable copies)
-    table_cache: str = TABLE_CACHE_DEFAULT  # test knob: "context" (shipped) | "workspace" (the previous cache)
-    _head_plans: dict[int, KcpHeadPlan] = dataclasses.field(
-        default_factory=dict, repr=False
-    )
+    p_rule: str  # plan rule: "wave_fill1_p1tie" shipped; "wave_fill1" (previous) / "wave" / "occ" / "wave_fill" via the test knob
+    sequence: KcpSequence
+    # test knob: "async" (shipped) | "blocking" (the previous pageable copies)
+    upload: str
+    # test knob: "context" (shipped) | "workspace" (the previous cache)
+    table_cache: str
+    _head_plans: dict[int, KcpHeadPlan]
     # the launch table sets of cake_kcp (``_Tables`` per (H, fused_walks, walk_geometry)): shared by every workspace
     # (and by workspace=None calls); they hold this context only weakly
-    _table_sets: dict = dataclasses.field(default_factory=dict, repr=False)
-    _uploads: list = dataclasses.field(
-        default_factory=list, repr=False
-    )  # KcpUpload records, in issue order
-    _waited: dict = dataclasses.field(
-        default_factory=dict, repr=False
-    )  # stream handle -> number of records ordered on it
-    _lazy: dict = dataclasses.field(
-        default_factory=dict, repr=False
-    )  # tables uploaded on first read (frag_table)
+    _table_sets: dict
+    _uploads: list  # KcpUpload records, in issue order
+    _waited: dict  # stream handle -> number of records ordered on it
+    _lazy: dict  # tables uploaded on first read (frag_table)
+
+    def __init__(
+        self,
+        partition: KcpPartition,
+        rank: int,
+        world_size: int,
+        group: object,
+        device: torch.device,
+        conv_kernel_size: int,
+        sm_count: int,
+        T_r: int,
+        n_frag: int,
+        cu_seqlens_local_cpu: tuple[int, ...],
+        cu_seqlens_local: torch.Tensor,
+        frag_rows: tuple[tuple[int, int, int, int], ...],
+        in_slot: tuple[int, ...],
+        out_slot: tuple[int, ...],
+        n_in: int,
+        n_out: int,
+        N_in: int,
+        N_out: int,
+        n_in_by_rank: tuple[int, ...],
+        n_out_by_rank: tuple[int, ...],
+        in_slot_all: tuple[tuple[int, ...], ...],
+        out_slot_all: tuple[tuple[int, ...], ...],
+        chains: tuple[tuple[tuple[int, int], ...], ...],
+        n_d_max: int,
+        exchange_scheme: str,
+        NC: int,
+        NC_max: int,
+        NC_pad: int,
+        R: int,
+        chunk_bos: tuple[int, ...],
+        chunk_len: tuple[int, ...],
+        seq_chunk_start: tuple[int, ...],
+        seq_order: tuple[int, ...],
+        tables: dict[str, torch.Tensor],
+        halo: KcpHaloPlan,
+        halo_tables: dict[str, torch.Tensor],
+        p_rule: str = P_RULE_DEFAULT,
+        sequence: KcpSequence = _DEFAULT,
+        upload: str = UPLOAD_DEFAULT,
+        table_cache: str = TABLE_CACHE_DEFAULT,
+        _head_plans: dict[int, KcpHeadPlan] = _DEFAULT,
+        _table_sets: dict = _DEFAULT,
+        _uploads: list = _DEFAULT,
+        _waited: dict = _DEFAULT,
+        _lazy: dict = _DEFAULT,
+    ) -> None:
+        sequence = KcpSequence() if sequence is _DEFAULT else sequence
+        _head_plans = {} if _head_plans is _DEFAULT else _head_plans
+        _table_sets = {} if _table_sets is _DEFAULT else _table_sets
+        _uploads = [] if _uploads is _DEFAULT else _uploads
+        _waited = {} if _waited is _DEFAULT else _waited
+        _lazy = {} if _lazy is _DEFAULT else _lazy
+        values = dict(locals())
+        for name in self._FIELDS:
+            object.__setattr__(self, name, values[name])
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        raise dataclasses.FrozenInstanceError(f"cannot assign to field {name!r}")
+
+    def __delattr__(self, name: str) -> None:
+        raise dataclasses.FrozenInstanceError(f"cannot delete field {name!r}")
+
+    def __repr__(self) -> str:
+        fields = ", ".join(f"{f}={getattr(self, f)!r}" for f in self._REPR_FIELDS)
+        return f"{type(self).__qualname__}({fields})"
 
     @property
     def fragments(self) -> tuple[KcpFragment, ...]:
@@ -2605,18 +2729,29 @@ def kcp_arena_layout(
     need = {
         name: numel[name] * 4 for name in FWD_POOLS + (BWD_POOLS if backward else ())
     }
-    shared = {name for pair in SHARED_POOLS for name in pair}
-    # the forward-only pools no forward with a saved set reads: left to a forward without one
-    deferred = (
-        ()
-        if backward
-        else tuple(
-            name
-            for name in FWD_LAZY_POOLS
-            if save_transfer or name not in FWD_TRANSFER_POOLS
-        )
+    out = {f"pool.{name}": v for name, v in need.items()}
+    out["ring"] = sum(need[name] for name in LAZY_POOLS)
+    out["lazy"] = sum(need[name] for name in _deferred_pools(backward, save_transfer))
+    out["arena"] = _pools_arena(need, backward=backward, save_transfer=save_transfer)
+    return out
+
+
+def _deferred_pools(backward: bool, save_transfer: bool) -> tuple[str, ...]:
+    """The forward-only pools no forward with a saved set reads: left to a forward without one."""
+    if backward:
+        return ()
+    return tuple(
+        name
+        for name in FWD_LAZY_POOLS
+        if save_transfer or name not in FWD_TRANSFER_POOLS
     )
-    lazy = LAZY_POOLS + deferred
+
+
+def _pools_arena(need: dict[str, int], *, backward: bool, save_transfer: bool) -> int:
+    """The bytes a workspace allocates for the pool needs ``need`` (bytes by pool name): every pool once, each
+    :data:`SHARED_POOLS` pair as one storage of the larger need, the lazily allocated pools not at all."""
+    shared = {name for pair in SHARED_POOLS for name in pair}
+    lazy = LAZY_POOLS + _deferred_pools(backward, save_transfer)
     arena = sum(
         v for name, v in need.items() if name not in shared and name not in lazy
     )
@@ -2624,11 +2759,7 @@ def kcp_arena_layout(
         max((need[name] for name in pair if name in need), default=0)
         for pair in SHARED_POOLS
     )
-    out = {f"pool.{name}": v for name, v in need.items()}
-    out["ring"] = sum(need[name] for name in LAZY_POOLS)
-    out["lazy"] = sum(need[name] for name in deferred)
-    out["arena"] = arena
-    return out
+    return arena
 
 
 # The paths of the existing backend's plan the KCP's local stages take their records from: the forward without a
@@ -2668,7 +2799,7 @@ def local_scratch_table_bytes(plan) -> int:
 
 
 def kcp_workspace_bytes(
-    ctx: KcpContext,
+    ctx: KcpContext | Sequence[KcpContext],
     *,
     H: int = 64,
     save_mode: str = "light",
@@ -2685,44 +2816,66 @@ def kcp_workspace_bytes(
     set (the training forward) under ``save_transfer`` -- pass the forward's value: without it such a forward also
     allocates the :data:`FWD_TRANSFER_POOLS` -- and ``kcp_arena_layout(..., save_transfer=save_transfer)["lazy"]``
     more once a forward without one has read the rest of the :data:`FWD_LAZY_POOLS`.  The ring exchange's hop pools
-    (``["ring"]``) are not counted; its forward-only workspace holds no c1 receive pool (``["pool.c1_recv"]``)."""
+    (``["ring"]``) are not counted; its forward-only workspace holds no c1 receive pool (``["pool.c1_recv"]``).
+
+    A sequence of contexts gives the bytes of one workspace that serves all of them (``KcpWorkspace.reserve``):
+    each pool at its largest need over the contexts (each :data:`SHARED_POOLS` pair one storage of the larger), the
+    largest local arena, and the scratch table set of every distinct ``(T_r, n_frag)`` that has one (zero at
+    ``H = 64``; KiB scale where present).  The bytes of a list of one context are those of the context."""
     _check_save_mode(save_mode)
-    local = 0
-    if ctx.T_r > 0:
+    ctxs = list(ctx) if isinstance(ctx, (list, tuple)) else [ctx]
+    if not ctxs:
+        raise ValueError("kcp_workspace_bytes: no context given")
+    arena = 0
+    scratch: dict[tuple[int, int], int] = {}
+    for c in ctxs:
+        if c.T_r <= 0:
+            continue
         from . import (
             cake_backend,
         )  # the existing backend's arena rule; imported here so the metadata module stays torch-only
 
-        local = int(
-            cake_backend.workspace_bytes(
-                ctx.T_r,
-                ctx.n_frag,
-                int(H),
-                backward=backward,
-                save_mode=save_mode,
-                sm_count=ctx.sm_count,
-                fwd_layout=local_fwd_layout(backward, save_mode),
-            )
+        arena = max(
+            arena,
+            int(
+                cake_backend.workspace_bytes(
+                    c.T_r,
+                    c.n_frag,
+                    int(H),
+                    backward=backward,
+                    save_mode=save_mode,
+                    sm_count=c.sm_count,
+                    fwd_layout=local_fwd_layout(backward, save_mode),
+                )
+            ),
         )
         # the scratch table set where the intra record writes one (the rule is architecture-independent; the
         # buffer size follows the same segment-count convention as the arena bytes above)
-        if intra_writes_tables(
-            cake_backend.plan(ctx.T_r, ctx.n_frag, int(H), ctx.sm_count)
-        ):
-            local += int(
-                cake_backend.tables_bytes(
-                    ctx.T_r, ctx.n_frag, int(H), sm_count=ctx.sm_count
-                )
+        if intra_writes_tables(cake_backend.plan(c.T_r, c.n_frag, int(H), c.sm_count)):
+            scratch[(int(c.T_r), int(c.n_frag))] = int(
+                cake_backend.tables_bytes(c.T_r, c.n_frag, int(H), sm_count=c.sm_count)
             )
-    arena = kcp_arena_layout(
-        ctx,
-        H=H,
-        save_mode=save_mode,
-        backward=backward,
-        save_transfer=save_transfer,
-        C=C,
-    )
-    return local + arena["arena"]
+    layouts = [
+        kcp_arena_layout(
+            c,
+            H=H,
+            save_mode=save_mode,
+            backward=backward,
+            save_transfer=save_transfer,
+            C=C,
+        )
+        for c in ctxs
+    ]
+    if len(layouts) == 1:
+        pools = layouts[0]["arena"]
+    else:  # each pool at its largest need, by the rule of kcp_arena_layout
+        need = {
+            key[len("pool.") :]: max(lay[key] for lay in layouts)
+            for key in layouts[0]
+            if key.startswith("pool.")
+        }
+        pools = _pools_arena(need, backward=backward, save_transfer=save_transfer)
+    return arena + sum(scratch.values()) + pools
 
 
 # ----------------------------------------------------------------------------------------------------------------

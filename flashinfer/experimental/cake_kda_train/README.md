@@ -586,6 +586,11 @@ dq, dk, dv, dbeta, dg = chunk_kda_kcp_bwd(q_local, k_local, v_local, g_local, be
                                           dout_local, saved=saved)
 ```
 
+The context is a plain frozen object, not a dataclass: the pre-forward hooks
+of FSDP2 (`fully_shard`) walk every dataclass, dict, list and tuple of a
+module's arguments, and see the context as one leaf. Per-layer metadata that
+carries it costs no walk time per fragment.
+
 CUDA-graph replay: the three KDA entry points -- `chunk_kda_kcp`,
 `chunk_kda_kcp_fwd` and `chunk_kda_kcp_bwd` -- take `graph="replay"`
 (default `"off"`, the eager path); the convolution halo takes `graph=` only
@@ -657,6 +662,26 @@ save_transfer=...)["lazy"]` bytes more).  Under `exchange="ring"` such a
 workspace never allocates the c1 receive pool.  The first backward on such a
 workspace releases its forward arena before it allocates the backward one;
 outputs, saved sets and gradients are bitwise those of a backward workspace.
+
+One workspace serves every prepared pack of a rank whose calls run in stream
+order, so the workspace memory does not grow with the number of prepared
+packs: its pools hold the largest need of the packs and its local arena the
+largest layout, and a smaller pack runs on a view of that arena under its own
+plan.  `ws.reserve([ctx_a, ctx_b, ...], H)` sizes it for a list of contexts
+before the first call (host work and allocations only; `ring=True` also
+sizes the ring exchange's hop pools); the calls of those
+packs then allocate nothing, keep every pointer (so graph keys stay valid) and
+never re-size it -- a forward never turns a backward arena into a forward-only
+one.  `kcp_workspace_bytes([ctx_a, ctx_b, ...], H=H)` is its size: each pool at
+its largest need, the largest local arena and, where the intra record writes
+one, each pack's scratch table set (KiB scale; none at 64 heads).  No content
+crosses calls, so outputs, saved sets and gradients are bitwise those of one
+workspace per pack.  The workspace holds no context alive.  It records the
+stream of its last call; a call on another stream first waits for that
+stream's queued work on the device (one `wait_stream`, no host wait).
+`KcpWorkspace(ctx, H, allocate=False)` allocates nothing until its first call
+and sizes that call for the backward, so a first forward does not build a
+forward-only arena that the first backward replaces.
 
 Saved set of a rank (`KcpSaved`, `boundary_mode="saved"`): the fresh `S_in`
 (the initial states of its fragments), with `save_transfer` the owner's c1

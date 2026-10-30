@@ -30,7 +30,7 @@
       "value": 1,
       "description": "One for a causal plan and zero for a dense plan."
     },
-    "num_heads": {
+    "num_qo_heads": {
       "type": "const",
       "value": 128
     },
@@ -73,11 +73,11 @@
   "constraints": [
     "head_dim_qk == 576",
     "kv_lora_rank == 512",
-    "page_size in (16, 32, 64, 128)",
+    "page_size in (4, 8, 16, 32, 64, 128)",
     "block_tables.shape[0] == batch_size",
     "max_pages_per_seq * page_size >= max_kv_len",
-    "min(seq_lens) >= 1",
-    "max(seq_lens) <= max_kv_len",
+    "min(seq_lens_kv) >= 1",
+    "max(seq_lens_kv) <= max_kv_len",
     "seq_len_q >= 1"
   ],
   "inputs": {
@@ -85,7 +85,7 @@
       "shape": [
         "batch_size",
         "seq_len_q",
-        "num_heads",
+        "num_qo_heads",
         "head_dim_qk"
       ],
       "dtype": "bfloat16"
@@ -106,7 +106,7 @@
       "dtype": "int32",
       "description": "Required physical page table supplied to run()."
     },
-    "seq_lens": {
+    "seq_lens_kv": {
       "shape": [
         "batch_size"
       ],
@@ -121,12 +121,12 @@
       "optional": true,
       "description": "Cumulative Q offsets required by a packed-Q run."
     },
-    "bmm1_scale": {
+    "softmax_scale": {
       "shape": null,
       "dtype": "float32",
       "optional": true
     },
-    "bmm2_scale": {
+    "output_scale": {
       "shape": null,
       "dtype": "float32",
       "optional": true
@@ -143,7 +143,7 @@
       "shape": [
         "batch_size",
         "seq_len_q",
-        "num_heads",
+        "num_qo_heads",
         "kv_lora_rank"
       ],
       "dtype": "bfloat16",

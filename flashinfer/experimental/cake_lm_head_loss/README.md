@@ -64,7 +64,8 @@ logp = chunked_lm_head_logprob(X, W, labels, chunk_size=4096)   # differentiable
   from the saved inputs (four GEMMs per chunk) without counting the rows again
   (no host synchronization; exception: a `memory_mode="budget"` call with
   `compact_rows=False` and no caller's count counts its valid rows on the host
-  in the backward).
+  in the backward; a caller's count checked with `check_num_valid_rows=True` is
+  read back in the forward, never in the backward).
 * Valid-row compaction (`compact_rows`, a keyword of every eager and autograd
   entry point, default `True`; `prepare_lm_head_loss` takes it as a bool or the
   valid-row tensor, default `False`): when some labels are `-100` the chunk loop runs over the valid rows
@@ -285,11 +286,14 @@ logp = chunked_lm_head_logprob(X, W, labels, chunk_size=4096)   # differentiable
   CPU calls and every `sm_103a` call whose library CUDA 13.0 built (the calls
   that keep the host-count schedule, see the toolchain note).  The given-count
   call runs the host-count path's kernels on the same plan, so its outputs are
-  bitwise those of `num_valid_rows=None`.  An uncompacted `"budget"` call
-  (`compact_rows=False`) sizes its budget on the count; only
-  `check_num_valid_rows=True` checks it there (one readback, `ValueError` on a
-  mismatch; the log-probability entry checks in its backward).  The count is
-  not derived from `loss_div`.
+  bitwise those of `num_valid_rows=None`.  An uncompacted call
+  (`compact_rows=False`) forms no index from the count (an uncompacted
+  `"budget"` call sizes its budget on it); there only
+  `check_num_valid_rows=True` checks it, by reading the labels' count back.
+  So with `check_num_valid_rows=True` every call that takes the count checks
+  it once (the autograd entries in their forward) and raises the same
+  `ValueError` on a mismatch, whatever `compact_rows`, `memory_mode` or the
+  inputs that need a gradient.  The count is not derived from `loss_div`.
 * First call of a process (`chunked_lm_head_preload(device=None)`,
   `cake_backend_opt_in.preload`): loads every library of the device's architecture
   (a JIT build when the package ships no `aot/` library), creates the

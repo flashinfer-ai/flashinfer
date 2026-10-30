@@ -14,6 +14,7 @@ import multiprocessing
 import os
 from pathlib import Path
 import sys
+import threading
 from unittest.mock import patch
 
 
@@ -67,6 +68,10 @@ def precompile_case(case):
                 built += 1
         return spec.load()
 
+    # Bound optional warmup even when a CUDA wait cannot raise a Python error.
+    timer = threading.Timer(300, lambda: os._exit(124))
+    timer.daemon = True
+    timer.start()
     try:
         module = load_test_module(path)
         with patch.object(JitSpecCuteDsl, "build_and_load", build_and_load):
@@ -79,6 +84,8 @@ def precompile_case(case):
         # Prebuilding is optional. The unmodified parent test owns the real
         # result, including pytest's BaseException-derived assertion outcomes.
         return built, f"{function_name}: {type(error).__name__}: {error}"
+    finally:
+        timer.cancel()
     return built, None
 
 
