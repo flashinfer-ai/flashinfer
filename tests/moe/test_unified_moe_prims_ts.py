@@ -751,6 +751,19 @@ class TestPrimsTsUnifiedGpu:
         )
         assert torch.equal(fp32_out, prims_out)
 
+        # Without zero rows, the rows of tokens without a local expert keep what
+        # the output buffer held, and every other row is the same.
+        buffer = torch.full_like(prims_out, float("nan"))
+        kept = prims_layer(
+            dataclasses.replace(
+                act, output=buffer, zero_rows_without_local_expert=False
+            ),
+            prims_weights,
+        )
+        assert kept.data_ptr() == buffer.data_ptr()
+        assert torch.isnan(kept[no_local]).all()
+        assert torch.equal(kept[~no_local], prims_out[~no_local])
+
     def test_mxfp4_mxfp8_fused_finalize_two_cta_fc2_past_hidden(self, monkeypatch):
         """A two-CTA FC2 tile that ends past the hidden size.
 
