@@ -58,6 +58,8 @@ import csv
 import numpy as np
 import os
 import torch
+import warnings
+from pathlib import Path
 from typing import Dict, List, Tuple
 
 from flashinfer import SfLayout
@@ -88,24 +90,6 @@ def _sf_layout_flags(sf_layout: SfLayout) -> Tuple[bool, bool]:
 
 # Constants for NVFP4
 NVFP4_SF_VEC_SIZE = 16
-TIMING_CSV_COLUMNS = (
-    "m",
-    "k",
-    "dtype",
-    "layout",
-    "backend",
-    "mode",
-    "seed",
-    "dry_run_iters",
-    "num_iters",
-    "use_cuda_graph",
-    "cold_l2_cache",
-    "requested_timer",
-    "sample_index",
-    "time_ms",
-    *NVFP4_QUANT_ENV_VARS,
-    "TRTLLM_DISABLE_FP4_QUANT_FAST_MATH",
-)
 
 
 def get_cc():
@@ -116,7 +100,7 @@ def get_cc():
 
 def _run_nvfp4_quantize(
     x: torch.Tensor,
-    global_sf: torch.Tensor,
+    global_sf: torch.Tensor | float,
     sf_layout: SfLayout,
     backend: str,
     per_token_activation: bool,
@@ -310,6 +294,9 @@ def bench_nvfp4_quantize(
         per_token_activation=per_token_activation,
         nvfp4_4over6_config=nvfp4_4over6_config,
     )
+    if per_token_activation and backend == "cuda":
+        # This API takes a host scalar; avoid a device .item() during capture.
+        global_sf = float(global_sf.item())
 
     def run_kernel():
         _run_nvfp4_quantize(x, global_sf, sf_layout, backend, per_token_activation)
@@ -317,14 +304,22 @@ def bench_nvfp4_quantize(
     # Warmup, including any JIT compilation before timing starts.
     run_kernel()
 
-    times = bench_gpu_time(
-        fn=run_kernel,
-        enable_cupti=True,
-        dry_run_iters=dry_run_iters,
-        repeat_iters=repeat_iters,
-        cold_l2_cache=True,
-        use_cuda_graph=use_cuda_graph,
-    )
+    with warnings.catch_warnings():
+        if use_cuda_graph:
+            # The event fallback cannot flush L2 between replays of this closure.
+            warnings.filterwarnings(
+                "error",
+                message=r"(?s).*Falling back to CUDA events for benchmarking\.",
+                category=UserWarning,
+            )
+        times = bench_gpu_time(
+            fn=run_kernel,
+            enable_cupti=True,
+            dry_run_iters=dry_run_iters,
+            repeat_iters=repeat_iters,
+            cold_l2_cache=True,
+            use_cuda_graph=use_cuda_graph,
+        )
 
     if csv_output is not None:
         metadata = {
@@ -341,13 +336,17 @@ def bench_nvfp4_quantize(
             "num_iters": repeat_iters,
             "use_cuda_graph": use_cuda_graph,
             "cold_l2_cache": True,
-            # bench_gpu_time warns and falls back if CUPTI is unavailable.
+            # Eager timing can fall back to events, which also flush L2.
             "requested_timer": "cupti",
         }
         for name in (*NVFP4_QUANT_ENV_VARS, "TRTLLM_DISABLE_FP4_QUANT_FAST_MATH"):
             metadata[name] = os.environ.get(name, "<unset>")
         with open(csv_output, "a", newline="") as output:
-            writer = csv.DictWriter(output, fieldnames=TIMING_CSV_COLUMNS)
+            writer = csv.DictWriter(
+                output, fieldnames=(*metadata, "sample_index", "time_ms")
+            )
+            if output.tell() == 0:
+                writer.writeheader()
             writer.writerows(
                 dict(metadata, sample_index=index, time_ms=float(time_ms))
                 for index, time_ms in enumerate(times, start=1)
@@ -803,7 +802,7 @@ def main():
     parser.add_argument(
         "--cuda-graph",
         action="store_true",
-        help="Capture and replay each call in a CUDA graph.",
+        help="Capture and replay each call in a CUDA graph (requires CUPTI >= 13).",
     )
     parser.add_argument(
         "--seed",
@@ -922,8 +921,7 @@ def main():
         "csv_output": args.csv_output,
     }
     if args.csv_output is not None:
-        with open(args.csv_output, "w", newline="") as output:
-            csv.DictWriter(output, fieldnames=TIMING_CSV_COLUMNS).writeheader()
+        Path(args.csv_output).write_text("")
     print(
         "Mode: "
         + mode_label(
@@ -961,26 +959,27 @@ def main():
             print_bandwidth_summary_table(
                 m_values, k_values, bandwidth, f"{layout_name} layout"
             )
-            if not args.no_heatmap:
-                create_bandwidth_heatmap(
-                    m_values,
-                    k_values,
-                    bandwidth,
-                    "NVFP4 Quantization Bandwidth (CuTe-DSL) - "
-                    f"{layout_name} - {args.dtype} - "
-                    + mode_label(
-                        per_token_activation=args.per_token_activation,
-                        nvfp4_4over6_config=nvfp4_4over6_config,
-                    ),
-                    f"{args.output_prefix}_bandwidth_{layout_name}_{args.dtype}_"
-                    + mode_label(
-                        per_token_activation=args.per_token_activation,
-                        nvfp4_4over6_config=nvfp4_4over6_config,
-                    )
-                    .replace(", ", "_")
-                    .replace("-", "_")
-                    + ".png",
+            if args.no_heatmap:
+                continue
+            create_bandwidth_heatmap(
+                m_values,
+                k_values,
+                bandwidth,
+                "NVFP4 Quantization Bandwidth (CuTe-DSL) - "
+                f"{layout_name} - {args.dtype} - "
+                + mode_label(
+                    per_token_activation=args.per_token_activation,
+                    nvfp4_4over6_config=nvfp4_4over6_config,
+                ),
+                f"{args.output_prefix}_bandwidth_{layout_name}_{args.dtype}_"
+                + mode_label(
+                    per_token_activation=args.per_token_activation,
+                    nvfp4_4over6_config=nvfp4_4over6_config,
                 )
+                .replace(", ", "_")
+                .replace("-", "_")
+                + ".png",
+            )
     else:
         # Speedup comparison mode: CUDA vs CuTe-DSL
         print(f"Layouts: {selected_layouts}")
@@ -1007,27 +1006,28 @@ def main():
                 cute_dsl_times,
                 f"{layout_name} layout",
             )
-            if not args.no_heatmap:
-                create_heatmap(
-                    m_values,
-                    k_values,
-                    cuda_times,
-                    cute_dsl_times,
-                    "NVFP4 Quantization Speedup (CuTe-DSL vs CUDA) - "
-                    f"{layout_name} - {args.dtype} - "
-                    + mode_label(
-                        per_token_activation=args.per_token_activation,
-                        nvfp4_4over6_config=nvfp4_4over6_config,
-                    ),
-                    f"{args.output_prefix}_comparison_{layout_name}_{args.dtype}_"
-                    + mode_label(
-                        per_token_activation=args.per_token_activation,
-                        nvfp4_4over6_config=nvfp4_4over6_config,
-                    )
-                    .replace(", ", "_")
-                    .replace("-", "_")
-                    + ".png",
+            if args.no_heatmap:
+                continue
+            create_heatmap(
+                m_values,
+                k_values,
+                cuda_times,
+                cute_dsl_times,
+                "NVFP4 Quantization Speedup (CuTe-DSL vs CUDA) - "
+                f"{layout_name} - {args.dtype} - "
+                + mode_label(
+                    per_token_activation=args.per_token_activation,
+                    nvfp4_4over6_config=nvfp4_4over6_config,
+                ),
+                f"{args.output_prefix}_comparison_{layout_name}_{args.dtype}_"
+                + mode_label(
+                    per_token_activation=args.per_token_activation,
+                    nvfp4_4over6_config=nvfp4_4over6_config,
                 )
+                .replace(", ", "_")
+                .replace("-", "_")
+                + ".png",
+            )
 
     print("\n" + "=" * 80)
     print("BENCHMARK COMPLETE")
