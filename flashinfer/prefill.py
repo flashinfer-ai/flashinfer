@@ -4601,7 +4601,18 @@ class BatchPrefillWithPagedKVCacheWrapper:
         q : torch.Tensor
             The query tensor, shape: ``[qo_indptr[-1], num_qo_heads, head_dim]``
         paged_kv_cache : Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
-            The paged KV cache. See Notes for the supported storage layouts.
+            The paged KV-Cache stored as a tuple of tensors or a single tensor:
+
+            * a tuple ``(k_cache, v_cache)`` of 4-D tensors, each with shape:
+              ``[max_num_pages, page_size, num_kv_heads, head_dim]`` if :attr:`kv_layout` is ``NHD``,
+              and ``[max_num_pages, num_kv_heads, page_size, head_dim]`` if :attr:`kv_layout` is ``HND``.
+
+            * a single 5-D tensor with shape:
+              ``[max_num_pages, 2, page_size, num_kv_heads, head_dim]`` if
+              :attr:`kv_layout` is ``NHD``, and
+              ``[max_num_pages, 2, num_kv_heads, page_size, head_dim]`` if
+              :attr:`kv_layout` is ``HND``. Where ``paged_kv_cache[:, 0]`` is the key-cache and
+              ``paged_kv_cache[:, 1]`` is the value-cache.
 
         *args
             Additional arguments for custom kernels.
@@ -4642,7 +4653,33 @@ class BatchPrefillWithPagedKVCacheWrapper:
             ``sinks[head_idx]`` is appended to each row of the softmax denominator.
             Shape: ``[num_qo_heads]``, dtype ``float32``.
         kv_cache_sf : Optional[Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]]
-            Per-block scale factors for NVFP4 KV cache. See Notes for layouts.
+            Per-block scale factors for NVFP4 KV cache. Accepts the same formats as
+            ``paged_kv_cache``:
+
+            * a tuple ``(k_scales, v_scales)`` of 4-D tensors, each with shape:
+              ``[num_pages, page_size, num_kv_heads, head_dim // 16]`` if :attr:`kv_layout` is ``NHD``,
+              and ``[num_pages, num_kv_heads, page_size, head_dim // 16]`` if :attr:`kv_layout` is ``HND``.
+            * a single 5-D tensor with shape:
+              ``[num_pages, 2, page_size, num_kv_heads, head_dim // 16]`` if :attr:`kv_layout` is ``NHD``,
+              and ``[num_pages, 2, num_kv_heads, page_size, head_dim // 16]`` if :attr:`kv_layout` is ``HND``,
+              where dim 1 holds k (index 0) and v (index 1) scales.
+
+            Both tensors have dtype ``torch.float8_e4m3fn``. ``k_scales`` uses a linear
+            (row-major) layout, while ``v_scales`` must use TRT-LLM's 4-token interleaved
+            layout within each ``[page_size, head_dim // 16]`` tile if backend is `trtllm-gen`. Use
+            :func:`flashinfer.fp4_quantization.nvfp4_quantize_paged_kv_cache` to produce
+            correctly formatted scale factors.
+
+            For the trtllm-gen backend with ``NHD`` layout, scale tensors are transposed
+            to HND internally (incurring a copy). Use ``HND`` for better performance.
+            Currently, NVFP4 KV supports `fa2` and `trtllm-gen` backend.
+
+            With ``use_token_head_sf=True`` (plan time), ``kv_cache_sf`` must be a
+            ``(k_sf, v_sf)`` tuple of ``float32`` tensors mirroring the KV layout
+            minus ``head_dim``: ``[num_pages, page_size, num_kv_heads]`` if
+            :attr:`kv_layout` is ``NHD``, and ``[num_pages, num_kv_heads, page_size]``
+            if ``HND``. The tensors may be non-contiguous views (e.g. sliced out of
+            an inline slot layout).
         use_fp16_softmax : Optional[bool]
             trtllm-gen backend only. Select the ``…Fp16Softmax…`` cubin variant
             (FP16 softmax accumulator). Currently only shipped for BF16 Q/KV/O context
@@ -4662,67 +4699,13 @@ class BatchPrefillWithPagedKVCacheWrapper:
         Returns
         -------
         Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
-            The attention output, or ``(output, lse)`` when
-            :attr:`return_lse` is ``True``. See Notes for shapes.
+            If :attr:`return_lse` is ``False``, the attention output, shape: ``[qo_indptr[-1], num_qo_heads, head_dim]``.
+            If :attr:`return_lse` is ``True``, a tuple of two tensors:
 
-        Notes
-        -----
-        **Paged KV-cache layouts**
-
-        * A tuple ``(k_cache, v_cache)`` of 4-D tensors, each with shape
-          ``[max_num_pages, page_size, num_kv_heads, head_dim]`` if
-          :attr:`kv_layout` is ``NHD``, and
-          ``[max_num_pages, num_kv_heads, page_size, head_dim]`` if
-          :attr:`kv_layout` is ``HND``.
-        * A single 5-D tensor with shape
-          ``[max_num_pages, 2, page_size, num_kv_heads, head_dim]`` if
-          :attr:`kv_layout` is ``NHD``, and
-          ``[max_num_pages, 2, num_kv_heads, page_size, head_dim]`` if
-          :attr:`kv_layout` is ``HND``. ``paged_kv_cache[:, 0]`` is the key
-          cache and ``paged_kv_cache[:, 1]`` is the value cache.
-
-        **NVFP4 scale-factor layouts**
-
-        * A tuple ``(k_scales, v_scales)`` of 4-D tensors, each with shape
-          ``[num_pages, page_size, num_kv_heads, head_dim // 16]`` if
-          :attr:`kv_layout` is ``NHD``, and
-          ``[num_pages, num_kv_heads, page_size, head_dim // 16]`` if
-          :attr:`kv_layout` is ``HND``.
-        * A single 5-D tensor with shape
-          ``[num_pages, 2, page_size, num_kv_heads, head_dim // 16]`` if
-          :attr:`kv_layout` is ``NHD``, and
-          ``[num_pages, 2, num_kv_heads, page_size, head_dim // 16]`` if
-          :attr:`kv_layout` is ``HND``. Index 0 of the size-2 axis holds K
-          scales and index 1 holds V scales.
-
-        Both scale tensors have dtype ``torch.float8_e4m3fn``. ``k_scales`` uses
-        a linear (row-major) layout, while ``v_scales`` must use TRT-LLM's
-        4-token interleaved layout within each
-        ``[page_size, head_dim // 16]`` tile for the ``trtllm-gen`` backend.
-        Use :func:`flashinfer.fp4_quantization.nvfp4_quantize_paged_kv_cache` to
-        produce correctly formatted scale factors.
-
-        For the ``trtllm-gen`` backend with ``NHD`` layout, scale tensors are
-        transposed to ``HND`` internally, incurring a copy. Use ``HND`` for
-        better performance. NVFP4 KV currently supports the ``fa2`` and
-        ``trtllm-gen`` backends.
-
-        With ``use_token_head_sf=True`` (plan time), ``kv_cache_sf`` must be a
-        ``(k_sf, v_sf)`` tuple of ``float32`` tensors mirroring the KV layout
-        minus ``head_dim``: ``[num_pages, page_size, num_kv_heads]`` if
-        :attr:`kv_layout` is ``NHD``, and
-        ``[num_pages, num_kv_heads, page_size]`` if ``HND``. The tensors may be
-        non-contiguous views (for example, sliced out of an inline slot layout).
-
-        **Return shapes**
-
-        * If :attr:`return_lse` is ``False``, the attention output has shape
-          ``[qo_indptr[-1], num_qo_heads, head_dim]``.
-        * If :attr:`return_lse` is ``True``, ``output`` has shape
-          ``[qo_indptr[-1], num_qo_heads, head_dim]``. ``lse`` has shape
-          ``[qo_indptr[-1], num_qo_heads]`` for ``lse_layout="NH"`` (the
-          default), or ``[num_qo_heads, qo_indptr[-1]]`` for
-          ``lse_layout="HN"``, in the base selected by :attr:`lse_base`.
+            * The attention output, shape: ``[qo_indptr[-1], num_qo_heads, head_dim]``.
+            * The logsumexp of attention output, shape: ``[qo_indptr[-1], num_qo_heads]``
+              (``lse_layout="NH"``, default) or ``[num_qo_heads, qo_indptr[-1]]``
+              (``"HN"``), in the base selected by :attr:`lse_base`.
         """
         if enable_pdl is None:
             enable_pdl = device_support_pdl(q.device)
@@ -6766,41 +6749,30 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             Whether to enable Programmatic Dependent Launch (PDL). See https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/programmatic-dependent-launch.html
             Only effective on backends and devices that support PDL.
         kv_cache_sf : Optional[Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]]
-            Per-block scale factors for NVFP4 KV input. See Notes for layouts.
+            Per-block scale factors for NVFP4 KV input.  Accepts either a single
+            packed scale tensor or a ``(k_scales, v_scales)`` tuple matching the
+            structure expected by the chosen backend.  When ``None`` (default), the
+            kernel runs without NVFP4 KV scaling.  See
+            :func:`flashinfer.fp4_quantization.nvfp4_quantize` for layout details.
+
+            With ``use_token_head_sf=True`` (plan time), ``kv_cache_sf`` must be a
+            ``(k_sf, v_sf)`` tuple of ``float32`` tensors mirroring the KV layout
+            minus ``head_dim``: ``[total_tokens, num_kv_heads]`` if
+            :attr:`kv_layout` is ``NHD``, and ``[num_kv_heads, total_tokens]`` if
+            ``HND``. The scale strides must mirror the KV strides divided by
+            ``head_dim`` (the kernel derives the scale strides from the KV strides,
+            as the NVFP4 path does); inline-slot views are supported by the paged
+            path only.
         Returns
         -------
         Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
-            The attention output, or ``(output, lse)`` when
-            :attr:`return_lse` is ``True``. See Notes for shapes.
+            If :attr:`return_lse` is ``False``, the attention output, shape: ``[qo_indptr[-1], num_qo_heads, head_dim_vo]``.
+            If :attr:`return_lse` is ``True``, a tuple of two tensors:
 
-        Notes
-        -----
-        **NVFP4 scale-factor layouts**
-
-        ``kv_cache_sf`` accepts either a single packed scale tensor or a
-        ``(k_scales, v_scales)`` tuple matching the structure expected by the
-        chosen backend. When ``None`` (default), the kernel runs without NVFP4
-        KV scaling. See :func:`flashinfer.fp4_quantization.nvfp4_quantize` for
-        layout details.
-
-        With ``use_token_head_sf=True`` (plan time), ``kv_cache_sf`` must be a
-        ``(k_sf, v_sf)`` tuple of ``float32`` tensors mirroring the KV layout
-        minus ``head_dim``: ``[total_tokens, num_kv_heads]`` if
-        :attr:`kv_layout` is ``NHD``, and ``[num_kv_heads, total_tokens]`` if
-        ``HND``. The scale strides must mirror the KV strides divided by
-        ``head_dim`` (the kernel derives the scale strides from the KV strides,
-        as the NVFP4 path does); inline-slot views are supported by the paged
-        path only.
-
-        **Return shapes**
-
-        * If :attr:`return_lse` is ``False``, the attention output has shape
-          ``[qo_indptr[-1], num_qo_heads, head_dim_vo]``.
-        * If :attr:`return_lse` is ``True``, ``output`` has shape
-          ``[qo_indptr[-1], num_qo_heads, head_dim_vo]``. ``lse`` has shape
-          ``[qo_indptr[-1], num_qo_heads]`` for ``lse_layout="NH"`` (the
-          default), or ``[num_qo_heads, qo_indptr[-1]]`` for
-          ``lse_layout="HN"``, in the base selected by :attr:`lse_base`.
+            * The attention output, shape: ``[qo_indptr[-1], num_qo_heads, head_dim_vo]``.
+            * The logsumexp of attention output, shape: ``[qo_indptr[-1], num_qo_heads]``
+              (``lse_layout="NH"``, default) or ``[num_qo_heads, qo_indptr[-1]]``
+              (``"HN"``), in the base selected by :attr:`lse_base`.
         """
         if enable_pdl is None:
             enable_pdl = device_support_pdl(q.device)

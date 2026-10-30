@@ -1,6 +1,7 @@
 from typing import Any, List
 
 import flashinfer  # noqa: F401
+from docutils import nodes
 
 # import tlcpack_sphinx_addon
 # Configuration file for the Sphinx documentation builder.
@@ -84,3 +85,34 @@ html_theme_options = {
     "light_logo": "FlashInfer-white-background.png",
     "dark_logo": "FlashInfer-black-background.png",
 }
+
+
+def _unwrap_nested_docfield_blocks(_app: Any, doctree: nodes.document) -> None:
+    """Keep lists and paragraphs out of Sphinx's doc-field paragraphs."""
+    block_types = (nodes.paragraph, nodes.bullet_list, nodes.enumerated_list)
+
+    for paragraph in list(doctree.findall(nodes.paragraph)):
+        for _first_block, child in enumerate(paragraph.children):
+            if isinstance(child, block_types):
+                break
+        else:
+            continue
+
+        ancestor = paragraph.parent
+        while ancestor is not None and not isinstance(ancestor, nodes.field_body):
+            ancestor = ancestor.parent
+        if ancestor is None:
+            continue
+
+        prefix = paragraph.children[:_first_block]
+        replacement = paragraph.children[_first_block:]
+        if isinstance(replacement[0], nodes.paragraph):
+            for node in reversed(prefix):
+                replacement[0].insert(0, node)
+        elif prefix:
+            replacement.insert(0, nodes.paragraph("", "", *prefix))
+        paragraph.replace_self(replacement)
+
+
+def setup(app: Any) -> None:
+    app.connect("doctree-read", _unwrap_nested_docfield_blocks)
