@@ -1676,9 +1676,9 @@ def _top_k_first_fast_path(
     Selects the top-k entries with the parallel radix/cluster top-k kernel, then runs
     top-p sampling over only those k entries. ``sorted=True`` gives an identical,
     deterministic ordering for both logits and probs inputs, so the two entry points
-    reduce to the same ``probs_k`` and stay sample-aligned. Expanding indexed rows here
-    also keeps the exact-k boundary-tie behavior independent of whether ``indices`` is
-    provided.
+    reduce to the same ``probs_k`` and stay sample-aligned. Passing ``indices`` through
+    the compact sampling step also keeps the exact-k boundary-tie behavior independent
+    of whether ``indices`` is provided, without expanding the compact rows.
 
     A ``top_k`` tensor selects ``top_k_max`` sorted entries, so masking each row past
     its own k leaves exactly its top-k.
@@ -1708,19 +1708,10 @@ def _top_k_first_fast_path(
         # renormalizing the k retained probabilities == top_k_renorm over the full vocab.
         probs_k = values / values.sum(dim=-1, keepdim=True)
 
-    output_dtype = torch.int32
-    if indices is not None:
-        output_dtype = indices.dtype
-        row_indices = indices.long()
-        probs_k = probs_k.index_select(0, row_indices)
-        gathered_indices = gathered_indices.index_select(0, row_indices)
-        if isinstance(top_p, torch.Tensor):
-            top_p = top_p.index_select(0, row_indices)
-
     result = top_p_sampling_from_probs(
         probs_k,
         top_p,
-        None,
+        indices,
         deterministic,
         check_nan=check_nan,
         generator=generator,
@@ -1730,10 +1721,13 @@ def _top_k_first_fast_path(
     )
 
     def _map(local):
-        return (
-            gathered_indices.gather(1, local.view(-1, 1).long())
-            .squeeze(1)
-            .to(output_dtype)
+        rows = (
+            torch.arange(local.size(0), device=local.device)
+            if indices is None
+            else indices.long()
+        )
+        return gathered_indices[rows, local.long()].to(
+            torch.int32 if indices is None else indices.dtype
         )
 
     if return_valid:
@@ -1825,7 +1819,7 @@ def top_k_top_p_sampling_from_logits(
         incremented based on the number of random values consumed by the operation.
     top_k_max: Optional[int]
         Unchecked upper bound on a ``top_k`` tensor; keep it tight. Used only with
-        ``"top_k_first"``, no ``indices``, ``top_k_max <= 256`` and ``num_classes >= 65536``,
+        ``"top_k_first"``, ``top_k_max <= 256`` and ``num_classes >= 65536``,
         where rows above it (including "no top-k" rows) sample with ``top_k = top_k_max``.
         Otherwise ignored. Default is ``None``.
 
@@ -2006,7 +2000,7 @@ def top_k_top_p_sampling_from_probs(
         after the renormalization step.  Defaults to ``False``.
     top_k_max: Optional[int]
         Unchecked upper bound on a ``top_k`` tensor; keep it tight. Used only with
-        ``"top_k_first"``, no ``indices``, ``top_k_max <= 256`` and ``num_classes >= 65536``,
+        ``"top_k_first"``, ``top_k_max <= 256`` and ``num_classes >= 65536``,
         where rows above it (including "no top-k" rows) sample with ``top_k = top_k_max``.
         Otherwise ignored. Default is ``None``.
 

@@ -1712,20 +1712,84 @@ def test_top_k_top_p_sampling_per_row_k_with_top_k_max_freq(k, from_logits):
         flashinfer.sampling.top_k_renorm_probs(probs, k), p
     )[0]
 
-    # The fast path rejects `indices`, so repeat the row instead.
-    x = logits.expand(num_rows, -1).contiguous()
-    top_k = torch.full((num_rows,), k, dtype=torch.int32, device="cuda:0")
+    # Reuse the unique source row through the indexed fast path.
+    x = logits
+    top_k = torch.tensor([k], dtype=torch.int32, device="cuda:0")
+    indices = torch.zeros(num_rows, dtype=torch.int32, device="cuda:0")
     generator = torch.Generator("cuda:0").manual_seed(0)
     counter = torch.zeros(vocab_size, dtype=torch.int32, device="cuda:0")
     for _ in range(num_iters):
         samples = _top_k_top_p_sample(
-            x, top_k, p, from_logits, top_k_max=256, generator=generator
+            x,
+            top_k,
+            p,
+            from_logits,
+            indices=indices,
+            top_k_max=256,
+            generator=generator,
         )
         counter.scatter_add_(0, samples.long(), torch.ones_like(samples))
     freq = counter.float() / (num_rows * num_iters)
     assert torch.all(ref[freq > 0] > 0)
     similarity = torch.cosine_similarity(freq, ref, dim=0)
     assert similarity > 0.99, f"similarity: {similarity}"
+
+
+@pytest.mark.parametrize("from_logits", [False, True])
+def test_top_k_first_indexed_fast_path_matches_expanded_call(from_logits):
+    vocab_size = 65536
+    logits = torch.full((2, vocab_size), -float("inf"), device="cuda:0")
+    # Both rows have a tie at the exact-k boundary.
+    logits[0, :3] = torch.tensor([0.0, 0.0, -1.0], device="cuda:0")
+    logits[1, :4] = torch.tensor([2.0, 1.0, 1.0, 0.0], device="cuda:0")
+    top_k = torch.tensor([1, 2], dtype=torch.int32, device="cuda:0")
+    top_p = torch.tensor([1.0, 0.75], device="cuda:0")
+    indices = torch.tensor([0, 1, 1, 0] * 16, dtype=torch.int64, device="cuda:0")
+
+    indexed = _top_k_top_p_sample(
+        logits,
+        top_k,
+        top_p,
+        from_logits,
+        indices=indices,
+        top_k_max=2,
+        seed=20261031,
+        offset=17,
+    )
+    expanded = _top_k_top_p_sample(
+        logits.index_select(0, indices),
+        top_k.index_select(0, indices),
+        top_p.index_select(0, indices),
+        from_logits,
+        top_k_max=2,
+        seed=20261031,
+        offset=17,
+    )
+
+    assert indexed.dtype == torch.int64
+    torch.testing.assert_close(indexed, expanded.to(torch.int64), rtol=0, atol=0)
+    # Exact top-k retains only one of row 0's tied maxima.
+    assert torch.unique(indexed[indices == 0]).numel() == 1
+
+
+@pytest.mark.parametrize("from_logits", [False, True])
+def test_top_k_first_indexed_fast_path_validates_top_p_length(from_logits):
+    logits = torch.zeros((2, 65536), device="cuda:0")
+    top_k = torch.tensor([1, 2], dtype=torch.int32, device="cuda:0")
+    indices = torch.tensor([0, 1, 0, 1], dtype=torch.int32, device="cuda:0")
+    output_sized_top_p = torch.full((indices.numel(),), 0.9, device="cuda:0")
+
+    with pytest.raises(
+        ValueError, match="Sampling parameter tensor batch size mismatch"
+    ):
+        _top_k_top_p_sample(
+            logits,
+            top_k,
+            output_sized_top_p,
+            from_logits,
+            indices=indices,
+            top_k_max=2,
+        )
 
 
 @pytest.mark.parametrize("batch_size", [1, 99, 989])
