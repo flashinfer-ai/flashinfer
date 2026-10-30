@@ -722,8 +722,10 @@ single_head_paged_mqa_threshold_select_trace = TraceTemplate(
         "key_scales": Tensor(["pages", "page_size", "scales"], optional=True),
     },
     outputs={
-        "counters": Tensor(["rows", "counters"], dtype="int32"),
-        "candidates": Tensor(["rows", "slots", "pair"], dtype="int32"),
+        "counters": Tensor(["rows", "counters"], dtype="int32", param="counters"),
+        "candidates": Tensor(
+            ["rows", "slots", "pair"], dtype="int32", param="candidates"
+        ),
     },
     constraints=["rows == 128 * tiles"],
     tags=["arch:sm100", "arch:sm103"],
