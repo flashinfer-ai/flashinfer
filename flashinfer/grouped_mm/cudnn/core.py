@@ -399,7 +399,7 @@ def _segment_token_descale_per_group(
     segment_scale_128x4_per_group_kernel[grid](
         src,
         dst,
-        m_indptr.to(torch.int32),
+        m_indptr.to(dtype=torch.int32).contiguous(),
         num_groups,
         rows,
         num_col_words=col_words,
@@ -557,14 +557,38 @@ def _mxfp8_engines_to_deselect(device: torch.device) -> tuple[str, ...]:
     13.0. Used by the MXFP8 runner and by the plan-count query, so ``tactic``
     indices refer to the same plan list. Revert when cuDNN ships the fix.
     """
-    cuda_version = tuple(int(x) for x in (torch.version.cuda or "0.0").split(".")[:2])
     if (
         torch.cuda.get_device_capability(device)[0] == 10
         and cudnn.backend_version() >= 92600
-        and cuda_version >= (13, 4)
+        and _loaded_cuda_runtime_version() >= (13, 4)
     ):
         return ("eng0",)
     return ()
+
+
+def _loaded_cuda_runtime_version() -> tuple[int, int]:
+    """(major, minor) of the CUDA runtime library loaded in this process.
+
+    Asked of the library itself (``cudaRuntimeGetVersion`` through ctypes on the
+    ``libcudart`` torch has already loaded), since ``torch.version.cuda`` is the
+    build version and the pip CUDA libraries can be newer. Falls back to
+    ``torch.version.cuda`` when the library cannot be queried.
+    """
+    major_str = (torch.version.cuda or "0").split(".")[0]
+    try:
+        import ctypes
+
+        lib = ctypes.CDLL(f"libcudart.so.{major_str}")
+        version = ctypes.c_int()
+        if lib.cudaRuntimeGetVersion(ctypes.byref(version)) == 0 and version.value > 0:
+            return version.value // 1000, (version.value % 1000) // 10
+    except OSError:
+        pass
+    parts = (torch.version.cuda or "0.0").split(".")
+    try:
+        return int(parts[0]), int(parts[1]) if len(parts) > 1 else 0
+    except ValueError:
+        return (0, 0)
 
 
 def _cudnn_moe_block_scale_grouped_gemm_plan_count(
@@ -589,6 +613,7 @@ def _cudnn_moe_block_scale_grouped_gemm_plan_count(
     """
     token_3d = a.unsqueeze(0)
     weight_3d = b.transpose(1, 2)
+    a_descale = a_descale.contiguous()
     token_descale_3d = a_descale.unsqueeze(0)
     weight_descale_3d = b_descale.transpose(1, 2)
     fto = m_indptr[:-1].reshape(-1, 1, 1).contiguous()
@@ -663,6 +688,7 @@ def _run_cudnn_moe_block_scale_grouped_gemm_mxfp8(
     _, n, _ = b.shape
 
     token_3d = a.unsqueeze(0)
+    a_descale = a_descale.contiguous()
     token_descale_3d = a_descale.unsqueeze(0)
     # The graph declares the logical token scales; the kernel reads the per-group
     # padded blob (see _segment_token_descale_per_group), so that is what runs.
@@ -776,6 +802,7 @@ def _run_cudnn_moe_block_scale_grouped_gemm_fp4(
     _, n, _ = b.shape
 
     token_3d = a.unsqueeze(0)
+    a_descale = a_descale.contiguous()
     token_descale_3d = a_descale.unsqueeze(0)
     # The graph declares the logical token scales; the kernel reads the per-group
     # padded blob (see _segment_token_descale_per_group), so that is what runs.
