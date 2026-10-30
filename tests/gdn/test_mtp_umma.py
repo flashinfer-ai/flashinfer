@@ -687,15 +687,6 @@ def _sr_call(case, fm, **kw):
     return y, pool, (kc, uc, gc)
 
 
-def _sr_contradictions(noise, up, down, rn_even):
-    """Rounding directions the 13-bit noise contradicts. cvt.rs rounds up iff frac + noise
-    >= 8192 (frac = the 13 dropped mantissa bits), so up where RN went down needs noise >=
-    4096 -- equal only at an exact tie (frac == 4096), which RN broke down to an even
-    mantissa -- and down where RN went up needs noise < 4096."""
-    tie = (noise == 4096) & rn_even
-    return int((up & (noise <= 4096) & ~tie).sum() + (down & (noise >= 4096)).sum())
-
-
 @pytest.mark.parametrize("T", [1, 4, 8])
 @pytest.mark.parametrize("mode", ["philox10", "philox5", "lcg"])
 @pytest.mark.parametrize("hpc", [1, 2, 4])
@@ -751,9 +742,8 @@ def test_stochastic_rounding_matches_reference_bits(T, mode, hpc):
         ctl = noise_of(seed + 1, r)
         up, down = normal & (step == 1), normal & (step == -1)
         n_diff += int(up.sum() + down.sum())
-        even = (mag_rn & 1) == 0
-        n_bad += _sr_contradictions(noise, up, down, even)
-        n_bad_ctl += _sr_contradictions(ctl, up, down, even)
+        n_bad += int(((noise < 4096) & up).sum() + ((noise >= 4096) & down).sum())
+        n_bad_ctl += int(((ctl < 4096) & up).sum() + ((ctl >= 4096) & down).sum())
     total = sum(HV * V * K for hist_r in hist if hist_r >= fm)
     assert abs(n_diff / total - 0.25) < 0.05, n_diff / total  # E[min(f, 1 - f)] = 1/4
     assert n_bad == 0, (

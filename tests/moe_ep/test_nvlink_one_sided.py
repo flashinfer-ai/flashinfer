@@ -126,7 +126,9 @@ class Case:
     synchronization between rounds.
 
     ``backend`` names the moe_ep communication backend. ``mode`` maps to
-    ``NVLinkOneSidedConfig.cft``: auto (None), fence (False) or cft (True);
+    ``NVLinkOneSidedConfig.cft``: auto (None), fence (False) or cft (True),
+    each with ``lamport=False``; ``lamport`` is ``lamport=True, cft=False``
+    (Lamport steps up to its default token limit, fence steps above it).
     Cake has no CFT transport and only runs ``auto``. ``payload_in_workspace`` writes the expert output into the
     combine input region before combine. ``fp8_combine`` sends combine payloads
     as FP8. ``graph`` captures the whole round sequence in one CUDA graph and
@@ -135,7 +137,7 @@ class Case:
 
     model: ModelShape
     rounds: tuple[Round, ...]
-    mode: Literal["auto", "fence", "cft"] = "auto"
+    mode: Literal["auto", "fence", "cft", "lamport"] = "auto"
     payload_in_workspace: bool = False
     fp8_combine: bool = False
     graph: bool = False
@@ -286,8 +288,12 @@ def _cpu(tensor: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
 # ----------------------------------------------------------------------------
 
 
+def _transport(cft, lamport) -> str:
+    return "lamport" if lamport else "cft" if cft else "fence"
+
+
 class _RecordingModule:
-    """Forwards to the kernel module and records each launch's CFT flag."""
+    """Forwards to the kernel module and records each launch's transport."""
 
     def __init__(self, module, launches: list) -> None:
         self._module = module
@@ -297,11 +303,11 @@ class _RecordingModule:
         return getattr(self._module, name)
 
     def moe_a2a_dispatch(self, *args):
-        self._launches.append(("dispatch", bool(args[10])))
+        self._launches.append(("dispatch", _transport(args[10], args[13])))
         return self._module.moe_a2a_dispatch(*args)
 
     def moe_a2a_combine(self, *args):
-        self._launches.append(("combine", bool(args[11])))
+        self._launches.append(("combine", _transport(args[11], args[17])))
         return self._module.moe_a2a_combine(*args)
 
 
@@ -349,7 +355,11 @@ def _run_case(case: Case, rank: int) -> dict:
     )
     if one_sided:
         config = NVLinkOneSidedConfig(
-            cft={"auto": None, "fence": False, "cft": True}[case.mode],
+            cft={"auto": None, "fence": False, "cft": True, "lamport": False}[
+                case.mode
+            ],
+            # Lamport against the fence transport: test_nvlink_one_sided_lamport.py.
+            lamport=case.mode == "lamport",
             timeout_sec=30,
             **options,
         )
@@ -360,9 +370,11 @@ def _run_case(case: Case, rank: int) -> dict:
         BootstrapConfig(world_size=case.ep_size, rank=rank), params, config
     )
     try:
-        cft_enabled = one_sided and comm.cft_enabled
+        cft_enabled = one_sided and comm._cft_enabled
         if case.mode == "cft" and not cft_enabled:
             return {"skip": "CFT counted writes are unavailable on this platform"}
+        if case.mode == "lamport" and not comm.lamport_enabled:
+            return {"skip": "the Lamport transport is unavailable here"}
         launches: list = []
         combine_offsets: list = []
         if one_sided:
@@ -386,7 +398,7 @@ def _run_case(case: Case, rank: int) -> dict:
                     slots,
                     weights,
                     hidden_states_scale=sf,
-                    max_tokens_per_rank=maximum,
+                    runtime_max_tokens_per_rank=maximum,
                     eplb_local_stats=stats,
                 )
                 combine_offsets.append(comm._round["combine_offset"])
@@ -449,6 +461,7 @@ def _run_case(case: Case, rank: int) -> dict:
             ],
             "launches": launches,
             "cft_enabled": cft_enabled,
+            "lamport_max_tokens": comm.lamport_max_tokens if one_sided else 0,
         }
         dist.barrier()
         return result
@@ -503,9 +516,10 @@ def _run(case: Case) -> list[dict]:
 
 
 def _verify_dispatch(
-    case: Case, results: list[dict], receiver: int, index: int
+    case: Case, results: list[dict], receiver: int, index: int, lamport: bool
 ) -> None:
-    """Received rows, payload bytes, routing and padding against the inputs."""
+    """Received rows, payload bytes, routing and padding against the inputs;
+    a Lamport step's row of token ``t`` from a source is its row ``t``."""
     payload, sf, slots, weights = results[receiver]["outputs"][index]["dispatch"]
     maximum = max(case.rounds[index].tokens)
     payload = payload.view(case.ep_size, maximum, -1)
@@ -528,6 +542,8 @@ def _verify_dispatch(
         order = observed_ids.argsort()
         exact = dict(rtol=0, atol=0)
         torch.testing.assert_close(observed_ids[order], expected_ids, **exact)
+        if lamport:
+            torch.testing.assert_close(torch.where(valid)[0], observed_ids, **exact)
         torch.testing.assert_close(
             slots[source, ~valid], torch.full_like(slots[source, ~valid], -1)
         )
@@ -587,9 +603,14 @@ def _assert_results(case: Case, results: list[dict]) -> None:
         expected_launches = []
         for i, spec in enumerate(case.rounds):
             payload, sf, slots, weights = result["inputs"][i]
+            lamport = (
+                case.mode == "lamport"
+                and not case.eplb
+                and max(spec.tokens) <= result["lamport_max_tokens"]
+            )
             _verify_combine(case, results, rank, i)
             if result["outputs"][i]["dispatch"] is not None:
-                _verify_dispatch(case, results, rank, i)
+                _verify_dispatch(case, results, rank, i, lamport)
             requested = (
                 result["cft_enabled"]
                 and case.mode != "fence"
@@ -611,7 +632,10 @@ def _assert_results(case: Case, results: list[dict]) -> None:
                 % CFT_ALIGNMENT_BYTES
                 == 0
             )
-            expected_launches += [("dispatch", dispatch_cft), ("combine", combine_cft)]
+            expected_launches += [
+                ("dispatch", _transport(dispatch_cft, lamport)),
+                ("combine", _transport(combine_cft, lamport)),
+            ]
             if case.eplb:
                 expected = torch.stack(
                     [
@@ -648,6 +672,17 @@ _ROUND_SEQUENCE = (
     Round((129, 1, 0, 0), Routing.SPREAD, 0),
 )
 
+_MODEL_EP_SIZES = (
+    (MODELS["gpt_oss"], 4),
+    (MODELS["deepseek_v3"], 8),
+    (MODELS["deepseek_r1_nvfp4"], 8),
+    (MODELS["qwen3_5_397b_a17b"], 8),
+    (MODELS["deepseek_v4_flash"], 4),
+    (MODELS["deepseek_v4_pro"], 8),
+    (MODELS["kimi_k3"], 8),
+    (MODELS["deepseek_v41_flash_dspark"], 4),
+)
+
 CASES = [
     # Model shapes, equal token counts on every rank.
     *[
@@ -658,31 +693,40 @@ CASES = [
             ),
             id=f"model-{model.name}-ep{ep_size}-tokens{num_tokens}",
         )
-        for model, ep_size in (
-            (MODELS["gpt_oss"], 4),
-            (MODELS["deepseek_v3"], 8),
-            (MODELS["deepseek_r1_nvfp4"], 8),
-            (MODELS["qwen3_5_397b_a17b"], 8),
-            (MODELS["deepseek_v4_flash"], 4),
-            (MODELS["deepseek_v4_pro"], 8),
-            (MODELS["kimi_k3"], 8),
-            (MODELS["deepseek_v41_flash_dspark"], 4),
-        )
+        for model, ep_size in _MODEL_EP_SIZES
         for num_tokens in (1, 128, 1024)
     ],
-    # BF16/FP8 combine with external or workspace-resident expert output.
+    # The Lamport transport at the model shapes it carries (hidden_size a
+    # multiple of 256), in steps within its default token limit.
+    *[
+        pytest.param(
+            Case(
+                model=model,
+                rounds=(Round((num_tokens,) * ep_size, Routing.SPREAD, -1),),
+                mode="lamport",
+            ),
+            id=f"model-{model.name}-ep{ep_size}-tokens{num_tokens}-lamport",
+        )
+        for model, ep_size in _MODEL_EP_SIZES
+        if model.hidden_size % 256 == 0
+        for num_tokens in (1, 128)
+    ],
+    # BF16/FP8 combine with external or workspace-resident expert output (the
+    # Lamport transport combines BF16 only).
     *[
         pytest.param(
             Case(
                 model=MODELS["deepseek_v3"],
                 rounds=(Round((9, 5), Routing.SPREAD, -1),),
+                mode=mode,
                 payload_in_workspace=payload_in_workspace,
                 fp8_combine=fp8_combine,
             ),
             id=f"combine-{'fp8' if fp8_combine else 'bf16'}-"
-            f"{'workspace' if payload_in_workspace else 'external'}",
+            f"{'workspace' if payload_in_workspace else 'external'}"
+            f"{'-lamport' if mode == 'lamport' else ''}",
         )
-        for fp8_combine in (False, True)
+        for mode, fp8_combine in (("auto", False), ("auto", True), ("lamport", False))
         for payload_in_workspace in (False, True)
     ],
     *[
@@ -704,6 +748,9 @@ CASES = [
             ("auto", True, True),
             ("cft", True, True),
             ("fence", True, True),
+            ("lamport", False, True),
+            ("lamport", False, False),
+            ("lamport", True, True),
         )
     ],
     # Rank-distinct EPLB statistics, including a rank with no input tokens.

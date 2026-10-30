@@ -145,9 +145,6 @@ kernel_cake_stepfun_moe_dc6b51f2c1bbc6ed7dfa(const __grid_constant__ CUtensorMap
 
     // Kernel post-init ops
     const int tmem_accum = taddr;
-
-    // ---- Ordered hardware-WG register redistribution ----
-    // Dec phase frees registers before any WG attempts inc.
     if (warp >= 4 && warp <= 11) {
         asm volatile("setmaxnreg.dec.sync.aligned.u32 48;");
     }

@@ -72,7 +72,7 @@ LARGER_CAPACITY = 4096  # the odd-row cases run under this capacity
 # and bv0_rows() adds the grid-derived tier that selects the bv-0 two-shot
 # schedule (no fixed row count does so on every shipped grid). The fused norm
 # adds the 4096-row tier, which runs its residual-prefetch programs (18 to 28
-# rows per CTA on 148 to 212 SMs).
+# rows per CTA on 148 or 160 SMs).
 ROWS = {
     ("allreduce", 2): (3, 6, 1024, 16384),
     ("allreduce", 4): (4, 8, 44, 1024, 16384),
@@ -213,7 +213,8 @@ def _check_workspace(
     device: torch.device,
     capacity: int,
 ) -> None:
-    """World size, rank, grid == SM count, table entries, control words, capacity and target of a fresh workspace."""
+    """World size, rank, grid (the SM count within the programs' grid bound), table entries, control words,
+    capacity and target of a fresh workspace."""
     window = WINDOWS[f"{family}/{world_size}/{input_format}"]
     assert workspace.family == family
     assert workspace.input_format == input_format
@@ -221,19 +222,21 @@ def _check_workspace(
     assert workspace.rank == rank
     assert workspace.capacity == capacity
     assert workspace.device == device
-    assert workspace.grid == _sm_count(device)
+    # Every program keeps one four-word call-state slot per CTA in the control window, so the programs
+    # bound the grid on every path (one-shot, two-shot and fused norm) and the window provisions the bound.
+    bound = loader.grid_max(workspace.programs)
+    assert workspace.grid == min(_sm_count(device), bound)
+    assert 1 <= workspace.grid <= bound
     assert workspace.table.dtype == torch.int64
     assert workspace.table.numel() == len(window["table"]) * world_size
     assert all(int(pointer) != 0 for pointer in workspace.table.tolist())
     assert workspace.ctrl.dtype in (torch.int32, torch.uint32)
-    assert workspace.ctrl.numel() == window["ctrl_words"]
+    assert workspace.ctrl.numel() == window["ctrl_words"] == 4 * bound
     assert int(torch.count_nonzero(workspace.ctrl).item()) == 0
     assert workspace.target == loader.target_arch(device.index)
     assert workspace.target in ("sm_100a", "sm_103a", "sm_107a")
     capability = torch.cuda.get_device_capability(device)
     assert loader.supported_capability(capability) == tuple(capability)
-    if family == "allreduce" and world_size == 2:
-        assert workspace.grid <= LIMITS["tp2_oneshot_grid_max"]
     if world_size == 4:
         assert capacity <= LIMITS["tp4_cap_max"]
         for rows in (*ROWS[("allreduce", 4)], bv0_rows(workspace.grid)):

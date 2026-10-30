@@ -21,11 +21,12 @@ The experimental entry points ``flashinfer.chunked_lm_head.chunked_lm_head_loss`
 marking, accept ``backend="cake"`` only and own FlashInfer's A/B environment variables
 ``FLASHINFER_CAKE_LM_HEAD_LOSS_*`` -- a switch keyword left at ``None`` falls back to its
 variable and the resolved value is passed down; the two binding-cache variables are
-applied when the module is imported.  The tests here cover that wrapper: the marking,
-each variable's fallback and parsing, the import-time cache configuration and, on a
-supported device, the pass-down through the public entry.  The backend tests live in
-``test_cake_lm_head_loss.py``, which imports the package only through
-``tests.test_helpers.cake_package`` and reads no environment variable.
+read when the module is imported and applied when it first reaches the backend.  The
+tests here cover that wrapper: the marking, each variable's fallback and parsing, the
+cache configuration and, on a supported device, the pass-down through the public
+entry.  The backend tests live in ``test_cake_lm_head_loss.py``, which imports the
+package only through ``tests.test_helpers.cake_package`` and reads no environment
+variable.
 """
 
 import importlib
@@ -117,6 +118,93 @@ def test_public_api_switch_keywords():
     named = {v for k, v in vars(public).items() if k.endswith("_ENV")}
     assert named == set(ENV_OF.values()) | set(CACHE_ENVS)
     assert all(v.startswith("FLASHINFER_CAKE_LM_HEAD_LOSS_") for v in named)
+
+
+def test_public_api_memory_and_count_keywords(monkeypatch):
+    """Both public entries take ``memory_mode`` (default ``None``, no environment variable), ``num_valid_rows``
+    (``None``) and ``check_num_valid_rows`` (``False``) as keyword-only arguments and document them; a call with
+    ``memory_mode`` or ``num_valid_rows`` passes all three to the opt-in backend module unchanged, a call with neither
+    calls the default backend entry without them; ``chunked_lm_head_preload`` is experimental and needs a CUDA
+    device."""
+    _clear(monkeypatch)
+    for fn in (chunked_lm_head_loss, chunked_lm_head_logprob):
+        params = inspect.signature(fn).parameters
+        for name, default in (
+            ("memory_mode", None),
+            ("num_valid_rows", None),
+            ("check_num_valid_rows", False),
+        ):
+            assert params[name].kind is inspect.Parameter.KEYWORD_ONLY, (
+                fn.__name__,
+                name,
+            )
+            assert params[name].default is default, (fn.__name__, name)
+            assert name in fn.__doc__, (fn.__name__, name)
+    seen = {}
+
+    def spy(name):
+        def call(*args, **kw):
+            seen[name] = kw
+            return torch.zeros(())
+
+        return call
+
+    backend, opt_in = public._cake_backend(), public._cake_backend_opt_in()
+    for module, tag in ((backend, "default"), (opt_in, "opt_in")):
+        monkeypatch.setattr(module, "chunked_lm_head_loss", spy(f"{tag}_loss"))
+        monkeypatch.setattr(module, "chunked_lm_head_logprob", spy(f"{tag}_logprob"))
+    X, W, labels = _host_call()
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", ExperimentalWarning)
+        chunked_lm_head_loss(
+            X,
+            W,
+            labels,
+            loss_div=1.0,
+            memory_mode="budget",
+            num_valid_rows=3,
+            check_num_valid_rows=True,
+        )
+        chunked_lm_head_logprob(X, W, labels, num_valid_rows=3)
+        chunked_lm_head_loss(X, W, labels, loss_div=1.0)
+        chunked_lm_head_logprob(X, W, labels)
+    # either keyword: the opt-in module, every keyword passed unchanged
+    assert seen["opt_in_loss"]["memory_mode"] == "budget"
+    assert seen["opt_in_loss"]["num_valid_rows"] == 3
+    assert seen["opt_in_loss"]["check_num_valid_rows"] is True
+    assert seen["opt_in_logprob"]["memory_mode"] is None
+    assert seen["opt_in_logprob"]["num_valid_rows"] == 3
+    assert seen["opt_in_logprob"]["check_num_valid_rows"] is False
+    # neither: the default backend entry, called as without the keywords
+    for name in ("default_loss", "default_logprob"):
+        assert (
+            not {"memory_mode", "num_valid_rows", "check_num_valid_rows"}
+            & seen[name].keys()
+        ), name
+    # check_num_valid_rows=True without a count: ValueError before either backend entry runs
+    seen.clear()
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", ExperimentalWarning)
+        for fn, kw in (
+            (chunked_lm_head_loss, dict(loss_div=1.0)),
+            (chunked_lm_head_logprob, {}),
+        ):
+            for mode in (None, "fast", "budget"):
+                with pytest.raises(ValueError, match="needs num_valid_rows"):
+                    fn(
+                        X,
+                        W,
+                        labels,
+                        memory_mode=mode,
+                        check_num_valid_rows=True,
+                        **kw,
+                    )
+    assert not seen, seen
+    assert public.chunked_lm_head_preload.is_experimental is True
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", ExperimentalWarning)
+        with pytest.raises(ValueError, match="CUDA device"):
+            public.chunked_lm_head_preload("cpu")
 
 
 def test_compact_rows_default_env(monkeypatch):
@@ -260,15 +348,17 @@ def test_gemm_tuning_default_env(monkeypatch):
 
 
 def test_binding_cache_capacity_from_environment(monkeypatch):
-    """The two binding-cache variables are applied when ``flashinfer.chunked_lm_head`` is imported (here: reloaded)
-    through ``BindingCache.configure`` on the backend's live cache: unset -> enabled, 64 bindings; a positive integer
-    sets the capacity; ``..._BINDING_CACHE=0`` disables it; anything but a positive integer is a ``ValueError`` at
-    import that leaves the cache as it was.  The backend itself never reads them."""
+    """The two binding-cache variables are read when ``flashinfer.chunked_lm_head`` is imported (here: reloaded) and
+    applied through ``BindingCache.configure`` on the backend's live cache when the reloaded module first reaches
+    the backend (``_cake_backend()``, the first call of either entry point): unset -> enabled, 64 bindings; a
+    positive integer sets the capacity; ``..._BINDING_CACHE=0`` disables it; anything but a positive integer is a
+    ``ValueError`` at import that leaves the cache as it was.  The backend itself never reads them."""
     cache = cake_backend.BINDING_CACHE
     was = (cache.enabled, cache.capacity)
     try:
         _clear(monkeypatch)
         importlib.reload(public)
+        public._cake_backend()
         # configured in place, never replaced
         assert cake_backend.BINDING_CACHE is cache
         assert cache.enabled and cache.capacity == 64
@@ -276,27 +366,33 @@ def test_binding_cache_capacity_from_environment(monkeypatch):
         monkeypatch.setenv(public.BINDING_CACHE_CAPACITY_ENV, "5")
         assert BindingCache().capacity == 64  # the backend does not read the variable
         importlib.reload(public)
+        assert cache.capacity == 64  # read at import, applied on first use
+        public._cake_backend()
         assert cache.capacity == 5 and cache.enabled
         monkeypatch.setenv(public.BINDING_CACHE_CAPACITY_ENV, " ")
         importlib.reload(public)
+        public._cake_backend()
         assert cache.capacity == 64
         monkeypatch.setenv(public.BINDING_CACHE_ENV, "0")
         importlib.reload(public)
+        public._cake_backend()
         assert not cache.enabled and len(cache) == 0 and cache.capacity == 64
         monkeypatch.setenv(public.BINDING_CACHE_ENV, "1")
         monkeypatch.setenv(public.BINDING_CACHE_CAPACITY_ENV, "3")
         importlib.reload(public)
+        public._cake_backend()
         assert cache.enabled and cache.capacity == 3
         assert public._binding_cache_settings() == dict(enabled=True, capacity=3)
         for bad in ("0", "-1", "many", "2.5"):
             monkeypatch.setenv(public.BINDING_CACHE_CAPACITY_ENV, bad)
             with pytest.raises(ValueError, match="positive integer"):
                 importlib.reload(public)
-            # a failed import changes nothing
+            # a failed import reads nothing to apply: the cache is as it was
             assert cache.enabled and cache.capacity == 3
     finally:
         monkeypatch.undo()
         importlib.reload(public)  # the process's real environment again
+        public._cake_backend()
         cache.configure(enabled=was[0], capacity=was[1])
 
 
@@ -305,6 +401,13 @@ def test_binding_cache_capacity_from_environment(monkeypatch):
 # ---------------------------------------------------------------------------
 
 CUDA = torch.device("cuda")
+
+
+def _bits(t: torch.Tensor) -> torch.Tensor:
+    """The bit pattern of a float tensor as integers (bf16 -> int16, fp32 -> int32): equality of these views is
+    bit-level equality (``torch.equal`` on floats equates +0 and -0)."""
+    t = t.detach().reshape(-1).contiguous()
+    return t.view({torch.bfloat16: torch.int16, torch.float32: torch.int32}[t.dtype])
 
 
 def _require_program():
@@ -324,8 +427,9 @@ def test_device_env_switches_reach_the_backend(monkeypatch):
     """Through the public entry on the generated program: ``FLASHINFER_CAKE_LM_HEAD_LOSS_DW_STREAM=0`` moves the
     per-chunk weight-gradient accumulates back to the caller's stream (one stream entered instead of two on a
     three-chunk call) and ``FLASHINFER_CAKE_LM_HEAD_LOSS_FUSE_DW_CAST=0`` binds the accumulate + flat cast instead of
-    the fused cast GEMM; an explicit keyword wins over the variable; ``loss`` / ``logp`` / ``dX`` / ``dW`` are bitwise
-    the same under every setting."""
+    the fused cast GEMM (its TMA-store form where :func:`dw_cast_tma_rule` routes the short last chunk); an explicit
+    keyword wins over the variable; ``loss`` / ``logp`` / ``dX`` / ``dW`` are bitwise (integer views) the same under
+    every setting."""
     _require_program()
     _clear(monkeypatch)
     inp = make_inputs(
@@ -347,6 +451,7 @@ def test_device_env_switches_reach_the_backend(monkeypatch):
 
     monkeypatch.setattr(cake_backend, "_ffi_stream_context", spy_stream)
     monkeypatch.setattr(cake_backend, "_bind_all", spy_bind_all)
+    public._cake_backend()  # the first use applies the import-time cache settings: before the patch
     monkeypatch.setattr(
         cake_backend.BINDING_CACHE, "enabled", False
     )  # every call binds, so the bound stages show the switch
@@ -373,8 +478,16 @@ def test_device_env_switches_reach_the_backend(monkeypatch):
         out = dict(loss=loss.detach(), logp=logp, dX=X.grad, dW=W.grad)
         return out, len(set(streams)), list(bound)
 
+    # the fused cast's form on the deferred last chunk (73 rows): the TMA store where dw_cast_tma_rule routes it
+    _, record = cake_backend.record_for(CUDA)
+    cast = (
+        "gemm_dw_cast_bf16_tma"
+        if cake_backend.dw_cast_tma_rule(3, 8265 - 2 * 4096, record["arch"])
+        else "gemm_dw_cast_bf16"
+    )
+    casts = {"gemm_dw_cast_bf16", "gemm_dw_cast_bf16_tma"}
     base, base_streams, base_bound = run()
-    assert base_streams == 2 and "gemm_dw_cast_bf16" in base_bound  # the defaults
+    assert base_streams == 2 and casts & set(base_bound) == {cast}  # the defaults
     monkeypatch.setenv(public.DW_STREAM_ENV, "0")
     off, off_streams, _ = run()
     assert off_streams == 1
@@ -383,10 +496,10 @@ def test_device_env_switches_reach_the_backend(monkeypatch):
     monkeypatch.delenv(public.DW_STREAM_ENV)
     monkeypatch.setenv(public.FUSE_DW_CAST_ENV, "0")
     unfused, _, unfused_bound = run()
-    assert "gemm_dw_cast_bf16" not in unfused_bound
+    assert not casts & set(unfused_bound)
     assert "gemm_dw_acc" in unfused_bound and "scale_cast_bf16" in unfused_bound
     fused, _, fused_bound = run(fuse_dw_cast=True)  # the keyword wins over the variable
-    assert "gemm_dw_cast_bf16" in fused_bound
+    assert casts & set(fused_bound) == {cast}
     for name, res in (("off", off), ("on", on), ("unfused", unfused), ("fused", fused)):
         for key in ("loss", "logp", "dX", "dW"):
-            assert torch.equal(res[key], base[key]), (name, key)
+            assert torch.equal(_bits(res[key]), _bits(base[key])), (name, key)

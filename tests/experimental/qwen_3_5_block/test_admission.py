@@ -19,12 +19,15 @@ import torch
 from tests.test_helpers.qwen_3_5_block_cases import PagedCase
 
 FORMS = ("prefill", "extend", "decode")
-# (d_model, num_qo_heads, num_kv_heads, rope_dim): the two Qwen3.5 shards, both served rope_dims, several GQA groups (16, 12,
-# 8, 4, 3, 1 = MHA), the smallest projection tile, and the rope_dim values each stage-(1) rendering declines
+# (d_model, num_qo_heads, num_kv_heads, rope_dim): the two Qwen3.5 shards, the Qwen3.8-27B dense attention layer (24 / 4 at 5120,
+# group 6), both served rope_dims, several GQA groups (16, 12, 8, 6, 4, 3, 1 = MHA), the smallest projection tile, and the
+# rope_dim values each stage-(1) rendering declines
 GRID = [
     (2560, 24, 2, 64),
     (4096, 32, 2, 64),
     (4096, 32, 2, 128),
+    (5120, 24, 4, 64),
+    (5120, 24, 4, 128),
     (512, 4, 1, 128),
     (512, 8, 1, 64),
     (768, 6, 2, 64),
@@ -172,7 +175,7 @@ def _stage_checks_pass(blk):
 
 
 @pytest.mark.parametrize(
-    "num_qo_heads, num_kv_heads", [(32, 2), (24, 2), (8, 1), (6, 2), (4, 4)]
+    "num_qo_heads, num_kv_heads", [(32, 2), (24, 2), (24, 4), (8, 1), (6, 2), (4, 4)]
 )
 def test_rope_gate_is_the_vendored_stage_rules(num_qo_heads, num_kv_heads):
     """Every even rope_dim up to the head dim: the gate admits it exactly when BOTH stage-(1) renderings' real checks do -- the
@@ -231,6 +234,17 @@ def test_vendored_rule_tripwire_passes_and_fires_on_a_drift():
     assert facts["head_dim"] == 256 and facts["rope_subtile_pair"] == 64
     assert facts["rope_access_elems"] == 8 and facts["rope_row_lanes"] == 32
     assert facts["decode_max_rows"] == 32 and facts["page_sizes"] == (16, 32, 64, 128)
+    # the pool layout vocabulary: the tree's SERVING_POOL_LAYOUTS (hnd / nhd / unified) and KV_LAYOUTS spell the same three
+    assert facts["pool_layouts"] == ("hnd", "nhd", "unified")
+    keep_layouts = support.KV_LAYOUTS
+    try:
+        support.KV_LAYOUTS = ("NHD", "HND")
+        support.check_vendored_rules.cache_clear()
+        with pytest.raises(RuntimeError, match="pool_layouts"):
+            support.check_vendored_rules()
+    finally:
+        support.KV_LAYOUTS = keep_layouts
+        support.check_vendored_rules.cache_clear()
     keep = support._ROPE_SUBTILE_PAIR
     try:
         support._ROPE_SUBTILE_PAIR = 32

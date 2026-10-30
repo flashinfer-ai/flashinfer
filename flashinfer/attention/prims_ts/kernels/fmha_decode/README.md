@@ -1,5 +1,10 @@
 # Task-Scheduled FMHA Decode
 
+Plans select cached kernel policies and compile/load kernels using explicit
+batch size and Q/KV bounds. Live request metadata belongs to `run()`.
+The [shared planning contract](../../README.md#reusable-plans) describes
+workspace sizing, standalone queries, cache reuse and CUDA graph lifetime.
+
 This directory contains the CuTe DSL task-scheduled (TS) FMHA kernel used by
 FlashInfer's experimental paged decode APIs on NVIDIA Blackwell GPUs. It
 supports token-at-a-time decode, small fixed speculative-query batches, and
@@ -11,6 +16,19 @@ and packed-Q plans may use direct, persistent, or split-KV execution according
 to the caller's split permission. Sliding-window plans remain nonsplit, but
 may use direct or CLC-persistent execution. There is no public scheduler or
 tuning knob and no fallback to another attention backend.
+
+Fixed multi-query paged plans compare legal Swaps Q8/Q16/Q32 and Keeps Q64/Q128 candidates across page sizes 4, 8, 16, 32, 64, and 128. Each candidate passes the shared profile validator; eligibility does not imply every dtype, MMA orientation, or reducer supports every combination. Sliding-window scoring uses the visible union, bounded by `window_size + Q - 1`, instead of the model context capacity. Partial final query groups remain candidates: the cost model uses the ceil-divided Q grid and complete per-CTA cost. Q1, packed variable-Q, and explicitly pinned choices retain their existing selection paths. Windowed split-KV remains disabled.
+
+D192 Keeps retains 128-wide SMEM stages while issuing PV N128+N64 into 192 logical O columns. Swaps keeps its padded PV computation and transposed output staging; output stores mask channels beyond D192. `smem_q_head_dim` expresses the 128-byte TMA fragment alignment: 192 elements for FP16/BF16, 256 for FP8. It does not widen the public Q tensor.
+
+Fixed-Q D192 Keeps supports contiguous and paged K/V, dense/causal masks, direct/CLC scheduling, and the shared GMEM split reducer. FP16/BF16 uses 128- or 192-wide head stages; FP8 E4M3 uses 128-wide stages and FP16/BF16/E4M3 output, subject to the reducer's dtype contract. Automatic windows retain 128-wide staging. Sparse D192 Keeps has its own profile validator and staging policy.
+
+The remaining dense D192 Keeps exclusions have different causes:
+
+- Cluster-SMEM reduction has no Keeps implementation; use the GMEM reducer.
+- Packed variable-Q and attention sinks have not been qualified for the one-instance staged D192 recipe, including its partial-row and sink-statistics handling. Their existing legal Swaps routes remain available; this is a qualification boundary rather than a Tensor Core dimension limitation.
+- Windowed split-KV has not been qualified in the shared scheduler/reduction policy; visible windows use direct or CLC execution.
+- Full-192 FP8 staging requires a different TMA fragment layout and validation. FP8 currently uses the validated 128-wide physical stages.
 
 For eligible nonsplit grids with more than one resident wave, cluster launch
 control (CLC) assigns work to resident CTAs. Underfilled fixed- or packed-Q grids may
@@ -84,45 +102,23 @@ Import these entry points from `flashinfer.attention.prims_ts`:
 
 | API | Use |
 | --- | --- |
-| `BatchDecodePagedTSWrapper` | Reusable static `plan()` with plan- or run-owned K/V lengths. |
+| `BatchDecodePagedTSWrapper` | Reusable eager `plan()` with explicit problem bounds and optional owned K/V lengths. |
 | `batch_decode_with_paged_kv_cache` | One-shot interface with optional caller scratch, explicit bounds, and trusted capture-safe execution. |
 | `get_prims_ts_batch_decode_workspace_size` | Size caller-owned scratch for the standalone launch. |
 | `prepare_prims_ts_batch_decode_with_kv_cache` | Validate and compile a standalone launch once for a lightweight graph-safe `run()`. |
 
-Trace a planned stateful wrapper with `flashinfer.fi_trace(wrapper.run, ...)`.
-The unbound `wrapper.run.fi_trace(...)` form is rejected because it cannot
-carry the wrapper's plan-owned query mode, output dtype, and length ownership.
-Pass the same length argument as `run()`: a CUDA tensor for a run-owned plan or
-`None` for a plan-owned vector. Trace names and tags distinguish the two
-lifecycles even when both compiled K/V modes are dynamic.
+Trace a warmed stateful wrapper with `flashinfer.fi_trace(wrapper.run, ...)`.
+The bound state supplies the selected query mode and output dtype. Trace
+extensions for the new capabilities are deferred.
 
-Prefer the reusable wrapper when static attention geometry and capacity are
-used repeatedly.
-`plan()` receives the device, exact batch and head geometry, page size, static
-Q and K/V bounds, dtypes, mask, and window. It compiles the specialization and
-either binds an optional caller-owned workspace or allocates private scratch;
-it also copies optional host `seq_lens` into plan-owned CUDA storage. Every
-`run()` supplies the current query, cache, and a fixed row-strided page table,
-plus query offsets for packed Q. Exactly one lifecycle owns K/V lengths:
+`plan()` takes model configuration, exact batch size, Q/KV bounds and optional
+scratch. It selects cached policy, obtains compiled kernels and binds resources.
+Every `run()` supplies query/cache, page tables and packed-Q offsets when needed.
+Live K/V lengths come from each run unless `plan(seq_lens_kv=...)` owns a CUDA copy.
+Fixed Q length is exact; packed Q lengths stay within planned `max_q_len`.
+Validation is enabled by default and may synchronize metadata to the host.
 
-- If `plan()` receives a host list or CPU tensor, every `run()` must pass
-  `seq_lens=None` and uses the plan-owned CUDA copy.
-- If `plan()` receives `seq_lens=None`, every `run()` must pass a CUDA
-  `seq_lens` tensor. The compiled K/V-prefix and K/V-length modes are dynamic.
-
-Supplying lengths to both calls or neither call is rejected regardless of
-`validate`. Plan-owned lengths may prove that every row is exactly
-`max_kv_len` or that the full configured split-CTA fanout is active for every
-batch/Q group. They are frozen until the next successful `plan()` call; omit
-plan-time `seq_lens` when lengths must change between runs or graph replays.
-Validation is enabled by default. `validate=False` skips explicit wrapper
-checks and host metadata reads for a previously validated steady state or CUDA
-Graph launch; the caller then owns every remaining value, bounds, aliasing, and
-lifetime precondition.
-Sliding-window plans retain dynamic K/V-length handling because leading-tile
-skips change the effective domain; persistent Q-dependent causal plans do the
-same while recycling the task graph. This kernel mode is independent of
-whether the plan or run owns the length vector.
+All profiles accept nonpositive **per-run** K/V lengths as inactive requests. Their page-table rows and Q/K/V data are not read. Caller-owned output stays untouched; newly allocated output for inactive rows is unspecified. Direct CTAs skip data work, persistent workers advance their queues, and reducers skip stale partials while retaining synchronization and PDL progress. Lengths can change from empty to live between graph replays. A length and table row are still required for every planned request; inactive table entries may be invalid. Plan-owned CPU lengths may also mark inactive requests and are canonicalized to zero, but remain immutable for the plan lifetime.
 
 ## Dense page tables only
 
@@ -135,15 +131,15 @@ supported. Rows may have padding between them; each row must be contiguous.
 
 | Feature | Support |
 | --- | --- |
-| GPU | SM100a/B200 (qualified); SM103a/B300 (architecture-gated, not yet signoff-qualified) |
-| Head dimension | 64, 128, or 256 |
+| GPU | SM100a/B200 and SM103/GB300; see the shared validation scope |
+| Head dimension | 64, 128, 192, or 256 |
 | Fixed Q length | Any positive integer representable by the metadata and tensor extents |
 | Packed Q | Positive per-request lengths no greater than a positive static maximum |
-| Head mapping | MHA/GQA; `Hq` must be divisible by `Hkv`, with `1 <= Hq/Hkv <= 128`. Qualified fixed-Q FP8 D64/D128/D256 page-32 profiles use grouped Swaps Q8/Q16/Q32 through ratio 32, Keeps Q64 through ratio 64, and Keeps Q128 through ratio 128. |
+| Head mapping | MHA/GQA; `Hq` must be divisible by `Hkv`, with `1 <= Hq/Hkv <= 128`. Qualified fixed-Q FP8 D64/D128/D256 paged profiles use grouped Swaps Q8/Q16/Q32 through ratio 32, Keeps Q64 through ratio 64, and Keeps Q128 through ratio 128. |
 | Q/K dtype | Matching `torch.float16`, `torch.bfloat16`, or `torch.float8_e4m3fn` |
-| V dtype | Equal to Q/K, or `torch.float8_e4m3fn` with `torch.bfloat16` Q/K (`v_data_type`; defaults to `k_data_type`) |
+| V dtype | Equal to Q/K, or `torch.float8_e4m3fn` with `torch.bfloat16` Q/K (`v_dtype`; defaults to `k_dtype`) |
 | Output dtype | `torch.float16` for `torch.float16` input; `torch.bfloat16` for `torch.bfloat16` input; `torch.float16`, `torch.bfloat16`, or `torch.float8_e4m3fn` for `torch.float8_e4m3fn` input |
-| K/V layout | HND paged cache, combined or separate K/V tensors; a V dtype that differs from K requires separate tensors |
+| K/V layout | HND or NHD paged cache, combined or separate K/V tensors; a V dtype that differs from K requires separate tensors |
 | Page size | 4, 8, 16, 32, 64, or 128 tokens; a logical fragment must divide the physical cache page |
 | Maximum K/V length | `2,147,483,392` (`INT32_MAX - 255`), reserving the padded endpoint of a 256-token K/V tile |
 | Mask | Dense or bottom-right causal |
@@ -152,25 +148,27 @@ supported. Rows may have padding between them; each row must be contiguous.
 | Accumulation | FP32 QK/PV and softmax state |
 
 FP8-E4M3 Q with FP8-E4M3 or NVFP4 K/V can write BF16 directly. Set
-`o_data_type=torch.bfloat16` when planning a wrapper, or
+`out_dtype=torch.bfloat16` when planning a wrapper, or
 `out_dtype=torch.bfloat16` for one-shot execution and workspace sizing.
 Prepared launches also accept BF16 output buffers. Both 16-bit output types
 share split/reduction eligibility, including cluster SMEM reduction and the
 standalone reducer; the existing shape and layout restrictions still apply.
 
-Current accuracy and performance signoff is on SM100a/B200. SM103a/B300 is
-admitted by the runtime architecture guard but remains to be qualified.
+See the shared [validation scope](../../README.md#validation-scope) for the
+measured hardware and DSL versions.
 
-The public paths require compact, 16-byte-aligned Q and output storage. K/V
-pages must have compact HND inner strides; a padded outer page stride is
-allowed when pages do not overlap and both the tensor base and outer stride
-are 16-byte aligned. All query, cache, metadata, output, and workspace tensors
+The public paths require compact, 16-byte-aligned Q and output storage. Native
+K/V views have logical HND shape with unit head-dimension stride and positive,
+non-overlapping page/head/token strides aligned to 16 bytes. This includes
+NHD physical storage and separate slices of interleaved K/V content. All query,
+cache, metadata, output, and workspace tensors
 must be on one CUDA device. Metadata uses 4-byte-aligned CUDA `torch.int32`;
 the page table is contiguous within each row but may have padding between
 rows. A caller-provided `out` must not overlap Q, K/V page
 storage, run-time metadata, or caller-owned workspace. This is an unchecked
-caller precondition in both validation modes. The API returns O only; LSE
-and split-KV statistics are internal scratch.
+caller precondition in both validation modes. The default API returns O;
+plans with LSE enabled can also return final FP32 LSE. Intermediate split-KV
+statistics remain internal scratch.
 
 The fixed table controls logical-to-physical lookup only. Native TMA tensor
 maps still span the complete physical page pool and use each cache tensor's
@@ -184,37 +182,45 @@ have padded storage.
 - Packed Q/O: `[total_q, Hq, D]`, with contiguous `int32[B + 1]`
   `qo_indptr`. Offsets start at zero, increase strictly, and end at
   `total_q`.
-- The planned fixed-capacity Q/head extent, `B * max_seq_len_q * Hq`, must fit
+- The execution Q/head extent, `B * max_q_len * Hq`, must fit
   in signed `int32`. This also bounds every packed `total_q * Hq` extent.
 - Combined K/V cache: `[num_pages, 2, Hkv, page_size, D]`.
 - Separate K/V cache: a `(K, V)` tuple whose members are
   `[num_pages, Hkv, page_size, D]`. This is the only form that can carry a
   `torch.float8_e4m3fn` V next to `torch.bfloat16` K.
 - Wrapper, standalone, and one-shot metadata use contiguous logical K/V
-  lengths plus `block_tables[B, C]`. Wrapper lengths are either copied into
-  plan-owned CUDA storage or supplied to each run; the other APIs always take
-  them at launch. The table has unit inner stride and a
+  lengths plus `block_tables[B, C]`. Every launch supplies live lengths. The table has unit inner stride and a
   non-overlapping row stride of at least `C`; padding between rows is
   supported. Packed runs additionally supply contiguous `qo_indptr[B + 1]`.
   The one-shot argument is named `seq_lens_kv`; wrapper and standalone entry
-  points use `seq_lens`. The standalone launch also takes a static
-  `max_seq_len` upper bound. The one-shot helper reads request metadata to
-  derive its plan bounds and therefore is not CUDA-graph-capturable; reusable
-  graph paths plan the wrapper before capture.
+  points use `seq_lens_kv`. The standalone launch also takes a static
+  `max_kv_len` upper bound. A convenience call may read metadata and allocate
+  scratch. The unified one-shot API also supports trusted capture-safe calls
+  with caller workspace, `out`, explicit `max_kv_len`, and `validate=False`;
+  packed Q additionally requires `max_q_len`. Warm the selected execution
+  before capture and supply `lse` when LSE is enabled. See the shared planning
+  contract for workspace initialization and lifetime rules.
 
 For every request `b`, the fixed table must satisfy
-`ceil(seq_lens[b] / page_size) <= C`. Only that active row prefix must contain
+`ceil(seq_lens_kv[b] / page_size) <= C`. Only that active row prefix must contain
 valid physical page IDs; inactive tail entries are never read.
 Query offsets start at zero, increase strictly, end at the packed Q extent,
-and have every delta no larger than the planned `max_seq_len_q`. Causal
+and have every delta no larger than the planned `max_q_len`. Causal
 attention additionally requires each fixed or packed per-request Q length to
 be no greater than the corresponding K/V length.
 
 For request `b`, bottom-right causal row `i` can see through
 `seq_len_k[b] - seq_len_q[b] + i`. A causal left window further retains the
-current key and at most `window_left` preceding keys. `bmm1_scale` defaults to
-`1 / sqrt(D)` and `bmm2_scale` defaults to 1; supplied scales must be finite,
+current key and at most `window_left` preceding keys. Pages wholly before the
+earliest visible key in a query group are not loaded, so recycled storage outside
+the window cannot introduce NaNs into PV. The first partially visible page is
+retained. `softmax_scale` defaults to
+`1 / sqrt(D)` and `output_scale` defaults to 1; supplied scales must be finite,
 positive Python scalars representable as positive `float32` values.
+
+D64 NVFP4 K/V with page size 16 remains unsupported because its native staging
+produces a misaligned access. Other transformed profiles use the normal
+page-size and staging checks.
 
 ## Dataflow and source map
 
@@ -226,12 +232,13 @@ Q + paged K/V
     -> direct O, or split-KV partials -> reduction -> O
 ```
 
-Profiles that stream score fragments (KV256 tiles, block-sparse routes and
-8-bit Q128/KV128) choose their softmax arithmetic per architecture. SM100
-evaluates a quarter of each fragment's exponentials as FMA polynomials to
-offload MUFU. SM103, with twice the MUFU ex2 rate, keeps every exponential on
-MUFU, and its unmasked max pass takes fragment maxima (or Sage scale-group
-maxima) from LDTM.STAT instead of a register reduction.
+Profiles that stream score fragments (KV256 tiles, block-sparse routes, and
+dense Q128/KV128 tiles with 16-bit K and V) choose their softmax arithmetic per
+architecture; dense 8-bit Q128/KV128 tiles stage P in SMEM instead. SM100
+evaluates three eighths of each fragment's exponentials (a quarter on KV256
+tiles) as FMA polynomials to offload MUFU. SM103, with twice the MUFU ex2 rate,
+keeps every exponential on MUFU, and its unmasked max pass takes fragment maxima
+(or Sage scale-group maxima) from LDTM.STAT instead of a register reduction.
 
 Eligible nonsplit work that exceeds one resident SM wave uses CLC-persistent
 scheduling. A scheduler warp discovers each schedule token once and broadcasts it to
@@ -240,12 +247,9 @@ K/V sequence when the caller permits it with `split_kv=True`. False disables
 splitting independently of Q layout. Automatic sliding-window splitting
 remains unqualified; nonsplit work uses the same CLC/direct selection.
 
-Fixed-table page IDs and packed-Q offsets are per-run bindings and are loaded
-on every run and graph replay. K/V lengths come from exactly one source. A
-plan-owned vector has stable storage and values until replan and may enable
-full-prefix or uniform-maximum specialization. A run-owned vector may change
-between completed launches without recompiling; CUDA Graph replay additionally
-requires its captured address and shape to remain stable.
+Fixed-table page IDs, packed-Q offsets and K/V lengths are per-run bindings.
+Their values may change between completed launches; graph replay retains
+captured addresses and shapes.
 
 | Source | Responsibility |
 | --- | --- |
@@ -257,7 +261,7 @@ requires its captured address and shape to remain stable.
 | [`reduction.py`](reduction.py) | Separate split-KV reduction |
 | [`block_sparse_prepare.py`](block_sparse_prepare.py) | Prepare of a block-sparse plan's compact route records from BSR or bitmask inputs |
 | [`block_sparse_inspect.py`](block_sparse_inspect.py) | One-shot validation of canonical BSR and live paged metadata |
-| [`sage_prepare.py`](sage_prepare.py) | Gather of a Sage plan's scales into the buffer the attention kernel reads |
+| [`../../sage/`](../../sage/) | Sage attention shared with the context kernel: recipe and scale validation, the names of the K transport and score scaling, the prepared-scale layout and its prepare kernel, index math, INT32 scores |
 
 ## Example
 
@@ -287,51 +291,27 @@ kv = torch.randn(
 block_tables = torch.arange(num_pages, device=device, dtype=torch.int32).view(
     B, pages_per_request
 )
-max_seq_len = pages_per_request * page_size
-seq_lens = torch.full((B,), max_seq_len, device=device, dtype=torch.int32)
+max_kv_len = pages_per_request * page_size
+seq_lens_kv = torch.full((B,), max_kv_len, device=device, dtype=torch.int32)
 
 wrapper = BatchDecodePagedTSWrapper(kv_layout="HND")
-wrapper.plan(
-    q.device,
-    B,
-    Hq,
-    Hkv,
-    D,
-    page_size,
-    max_seq_len,
-    max_seq_len_q=1,
-    packed_query=False,
-    q_data_type=q.dtype,
-    k_data_type=kv.dtype,
-    v_data_type=kv.dtype,
-    o_data_type=q.dtype,
-    mask_type="causal",
-    # Optional fixed lengths enable a plan-owned specialization.
-    seq_lens=[max_seq_len] * B,
-)
-out = wrapper.run(q, kv, None, block_tables)
+wrapper.plan(q.device, batch_size=B, max_q_len=1, max_kv_len=max_kv_len, num_qo_heads=Hq, num_kv_heads=Hkv, head_dim=D, page_size=page_size, packed_query=False, q_dtype=q.dtype, k_dtype=kv.dtype, v_dtype=kv.dtype, out_dtype=q.dtype, mask_type='causal')
+out = wrapper.run(q, kv, seq_lens_kv, block_tables)
 assert out.shape == q.shape
 
 # The standalone API uses caller-owned scratch and explicit K/V lengths.
 workspace_bytes = get_prims_ts_batch_decode_workspace_size(
-    B,
-    Hq,
-    Hkv,
-    D,
-    page_size,
-    max_seq_len,
-    q_dtype=q.dtype,
-    mask_type="causal",
-    device=q.device,
+    batch_size=B, num_qo_heads=Hq, num_kv_heads=Hkv, head_dim=D,
+    page_size=page_size, max_kv_len=max_kv_len, q_dtype=q.dtype, device=q.device,
 )
 workspace = torch.zeros(workspace_bytes, device=device, dtype=torch.int8)
 standalone_out = batch_decode_with_paged_kv_cache(
     q,
     kv,
     block_tables,
-    seq_lens,
+    seq_lens_kv,
     workspace_buffer=workspace,
-    max_kv_len=max_seq_len,
+    max_kv_len=max_kv_len,
     mask_type="causal",
 )
 assert standalone_out.shape == q.shape
@@ -345,27 +325,25 @@ and workspaces for concurrent execution. Caller-owned scratch must remain alive
 and must not overlap Q, K/V cache, metadata, or output storage.
 
 With default `validate=True`, each wrapper run checks the fixed table, effective
-K/V lengths, packed offsets when present, tensors, and output. Plan-owned
-lengths and their specialization predicates were validated by `plan()` and are
-not revalidated against a second length vector. Once the caller has established
+K/V lengths, packed offsets when present, tensors, and output. When the plan
+owns sequence lengths, pass `None` for the run's length argument. Once the caller has established
 the remaining conditions, `validate=False` avoids explicit checks and host
 metadata reads. Invalid run-owned lengths, page IDs, or offsets in that mode
 may cause incorrect results or out-of-bounds access. Storage overlap is
 unsupported and unchecked in both modes. Do not mutate
 run-owned metadata concurrently with a launch or replay that reads it.
 
-For the standalone workflow, call
-`get_prims_ts_batch_decode_workspace_size()` with the same shape, Q/K/V and
-output dtype, mask,
-window, and Q-layout arguments as the launch. Allocate at least that many
-bytes as a contiguous, 32-byte-aligned CUDA `torch.int8` or `torch.uint8`
-tensor. Zero it before first use and re-zero it whenever any workspace-layout
-input, including batch size, changes because the internal workspace section
-offsets can move even when the compiled callable is reused. Do not share it
+For the standalone workflow, query scratch with batch size, Q/KV bounds, head geometry, page
+size, device and split capability. Allocate contiguous, 32-byte-aligned CUDA
+`torch.int8` or `torch.uint8` scratch and zero it before its first trusted
+standalone launch and whenever workspace-layout inputs change. Wrappers
+initialize control storage by default; `initialize_workspace=False` transfers
+that responsibility to the caller. Tensor-bound prepared plans also require
+reinitialization before sharing scratch with a different prepared layout. Do not share it
 between concurrent launches or captured graphs. It must not overlap Q, K/V
 cache, metadata, or output storage. The standalone hot path trusts
-`block_tables`, `seq_lens`, and
-packed-Q values: keep lengths positive and within their static bounds, keep
+`block_tables`, `seq_lens_kv`, and
+packed-Q values: keep positive lengths within their static bounds; nonpositive per-run lengths mark inactive requests, keep
 enough table columns for every request, and keep all active page IDs valid.
 Sequence lengths, page IDs, and packed-Q offsets may change between
 completed launches or graph replays while preserving those contracts and
@@ -377,21 +355,23 @@ out-of-bounds access.
 For CUDA graph capture, call `plan()` and perform one default-validating
 `run()` first. Capture subsequent calls with `validate=False`, retain all
 run-owned metadata and workspace storage at stable addresses, and pass a
-preallocated compact, 16-byte-aligned `out` tensor. A successful replan changes
-plan-owned length storage and requires graph recapture.
+preallocated compact, 16-byte-aligned `out` tensor. Replanning invalidates captured graphs and requires recapture.
 
 ## Limitations
 
-- Only HND paged K/V is supported; contiguous K/V and NHD caches are outside
-  this API.
-- Attention sinks and custom masks are not exposed.
-- Q and K must share one dtype; the only mixed combination is
-  `torch.bfloat16` Q/K with `torch.float8_e4m3fn` V.
+- HND and NHD paged K/V are supported; contiguous K/V is outside this API.
+  NHD separate caches use `[num_pages, page_size, Hkv, D]`; combined caches
+  use `[num_pages, 2, page_size, Hkv, D]`. Select `kv_layout="NHD"` in the
+  wrapper, convenience API, or prepared-plan API. Caches are
+  addressed without repacking and reuse the HND compiled callable. NVFP4
+  `kv_scale_factors` retain their documented canonical HND layout independently
+  of the packed K/V data layout.
+- Custom masks are not exposed.
 - Sage attention (8-bit Q/K of one dtype with `torch.float8_e4m3fn` V and
   dequantization scales) runs only through `BlockSparseTSWrapper` and
   `block_sparse_attention`; see
   [Sage attention](../../README.md#sage-attention).
-- Effective K/V lengths must be positive and no greater than the static plan
+- Positive K/V lengths must be no greater than the static plan
   bound.
 - Packed offsets are run-time wrapper inputs. Default wrapper validation checks
   them; `validate=False` and the standalone hot path trust them to preserve a
@@ -407,3 +387,21 @@ split-KV, and resource-safety coverage lives in:
 pytest -q tests/attention/test_attention_ts_decode.py
 pytest -q tests/trace/test_fi_trace_template_consistency.py
 ```
+
+
+### Final softmax statistics
+
+See the shared [LSE, FP8 scaling and sink contract](../../README.md#final-statistics-and-sink-semantics).
+
+
+### Runtime split-KV policy
+
+See the shared [runtime split-KV policy](../../README.md#runtime-split-kv-policy).
+
+Dense FMHA prepares two page-ID schedules together. If the host KV bound and
+runtime count guarantee that the complete instruction-aligned CTA span fits in
+32 page IDs, one CTA-relative window is retained through K and V. Longer spans
+use the staged pipeline. The selection stays inside the compiled launcher, so
+switching counts or crossing this span bound requires no additional JIT. The
+window origin follows the CTA, including splits that start inside an aligned
+32-ID region. Scratch-buffer sizing and ownership do not depend on this choice.

@@ -1247,16 +1247,27 @@ kernel_cake_fmha_context_fp8_hd256(CakeFmhaTensorMap const* Q, CakeFmhaTensorMap
                     unsigned int l2_mod = tile_idx % l2section;
                     m_block = l2_mod / (unsigned int)l2_swizzle;
                     bh = section * (unsigned int)l2_swizzle + l2_mod % (unsigned int)l2_swizzle;
+                    if (section >= (unsigned int)total_bh / (unsigned int)l2_swizzle) {
+                        // The last section when total_bh is not a multiple of l2_swizzle: its units in turn, every
+                        // m-block of a unit in turn, as the generated programs order it (the swizzled form names
+                        // units past total_bh there and leaves tiles of the section's units out).
+                        m_block = l2_mod % (unsigned int)NUM_M_BLOCKS;
+                        bh = section * (unsigned int)l2_swizzle + l2_mod / (unsigned int)NUM_M_BLOCKS;
+                    }
                     m_block = (unsigned int)(NUM_M_BLOCKS - 1) - m_block;
                 }
                 int seqlen_kv_bh = seq_lens_kv[bh];
                 int seqlen_q_bh = seq_lens_q[bh];
-                unsigned int num_n_blocks = (seqlen_kv_bh + BLOCK_N - 1) / BLOCK_N;
+                // The block count is 0 for a request without keys, and for a causal tile whose rows see no key
+                // with max_n exactly 0 (q - kv = (m_block + 1) * BLOCK_M). Such a tile runs one block, all
+                // masked, over the staged K/V (zeros past the request's keys): with none, the MMA warp waits
+                // for a K/V stage that the load warp never fills. Every role adds the block alike.
+                unsigned int num_n_blocks = (seqlen_kv_bh + BLOCK_N - 1) / BLOCK_N + (seqlen_kv_bh == 0 ? 1u : 0u);
                 {
                     int causal_shift = seqlen_kv_bh - seqlen_q_bh;
                     unsigned int max_n = (m_block + 1) * (unsigned int)BLOCK_M + (unsigned int)causal_shift;
                     if (max_n < (unsigned int)seqlen_kv_bh) {
-                        num_n_blocks = (max_n + (unsigned int)BLOCK_N - 1) / (unsigned int)BLOCK_N;
+                        num_n_blocks = (max_n + (unsigned int)BLOCK_N - 1) / (unsigned int)BLOCK_N + (max_n == 0u ? 1u : 0u);
                     }
                 }
                 int causal_row;
@@ -2873,16 +2884,20 @@ kernel_cake_fmha_context_fp8_hd256(CakeFmhaTensorMap const* Q, CakeFmhaTensorMap
                     unsigned int l2_mod_1 = tile_idx_1 % l2section_1;
                     m_block_1 = l2_mod_1 / (unsigned int)l2_swizzle_1;
                     bh_1 = section_1 * (unsigned int)l2_swizzle_1 + l2_mod_1 % (unsigned int)l2_swizzle_1;
+                    if (section_1 >= (unsigned int)total_bh / (unsigned int)l2_swizzle_1) {
+                        m_block_1 = l2_mod_1 % (unsigned int)NUM_M_BLOCKS;
+                        bh_1 = section_1 * (unsigned int)l2_swizzle_1 + l2_mod_1 / (unsigned int)NUM_M_BLOCKS;
+                    }
                     m_block_1 = (unsigned int)(NUM_M_BLOCKS - 1) - m_block_1;
                 }
                 int seqlen_kv_bh_1 = seq_lens_kv[bh_1];
                 int seqlen_q_bh_1 = seq_lens_q[bh_1];
-                unsigned int num_n_blocks_1 = (seqlen_kv_bh_1 + BLOCK_N - 1) / BLOCK_N;
+                unsigned int num_n_blocks_1 = (seqlen_kv_bh_1 + BLOCK_N - 1) / BLOCK_N + (seqlen_kv_bh_1 == 0 ? 1u : 0u);
                 {
                     int causal_shift_2 = seqlen_kv_bh_1 - seqlen_q_bh_1;
                     unsigned int max_n_1 = (m_block_1 + 1) * (unsigned int)BLOCK_M + (unsigned int)causal_shift_2;
                     if (max_n_1 < (unsigned int)seqlen_kv_bh_1) {
-                        num_n_blocks_1 = (max_n_1 + (unsigned int)BLOCK_N - 1) / (unsigned int)BLOCK_N;
+                        num_n_blocks_1 = (max_n_1 + (unsigned int)BLOCK_N - 1) / (unsigned int)BLOCK_N + (max_n_1 == 0u ? 1u : 0u);
                     }
                 }
                 int off_q = (unsigned int)cu_seq_lens_q[bh_1] + m_block_1 * (unsigned int)BLOCK_M;
@@ -3024,16 +3039,20 @@ kernel_cake_fmha_context_fp8_hd256(CakeFmhaTensorMap const* Q, CakeFmhaTensorMap
                     unsigned int l2_mod_2 = tile_idx_2 % l2section_2;
                     m_block_2 = l2_mod_2 / (unsigned int)l2_swizzle_2;
                     bh_2 = section_2 * (unsigned int)l2_swizzle_2 + l2_mod_2 % (unsigned int)l2_swizzle_2;
+                    if (section_2 >= (unsigned int)total_bh / (unsigned int)l2_swizzle_2) {
+                        m_block_2 = l2_mod_2 % (unsigned int)NUM_M_BLOCKS;
+                        bh_2 = section_2 * (unsigned int)l2_swizzle_2 + l2_mod_2 / (unsigned int)NUM_M_BLOCKS;
+                    }
                     m_block_2 = (unsigned int)(NUM_M_BLOCKS - 1) - m_block_2;
                 }
                 int seqlen_kv_bh_2 = seq_lens_kv[bh_2];
                 int seqlen_q_bh_2 = seq_lens_q[bh_2];
-                unsigned int num_n_blocks_2 = (seqlen_kv_bh_2 + BLOCK_N - 1) / BLOCK_N;
+                unsigned int num_n_blocks_2 = (seqlen_kv_bh_2 + BLOCK_N - 1) / BLOCK_N + (seqlen_kv_bh_2 == 0 ? 1u : 0u);
                 {
                     int causal_shift_3 = seqlen_kv_bh_2 - seqlen_q_bh_2;
                     unsigned int max_n_2 = (m_block_2 + 1) * (unsigned int)BLOCK_M + (unsigned int)causal_shift_3;
                     if (max_n_2 < (unsigned int)seqlen_kv_bh_2) {
-                        num_n_blocks_2 = (max_n_2 + (unsigned int)BLOCK_N - 1) / (unsigned int)BLOCK_N;
+                        num_n_blocks_2 = (max_n_2 + (unsigned int)BLOCK_N - 1) / (unsigned int)BLOCK_N + (max_n_2 == 0u ? 1u : 0u);
                     }
                 }
                 mbarrier_wait(q_full_addr, _phase_q_full_0);
@@ -3361,16 +3380,20 @@ kernel_cake_fmha_context_fp8_hd256(CakeFmhaTensorMap const* Q, CakeFmhaTensorMap
                     unsigned int l2_mod_3 = tile_idx_3 % l2section_3;
                     m_block_3 = l2_mod_3 / (unsigned int)l2_swizzle_3;
                     bh_3 = section_3 * (unsigned int)l2_swizzle_3 + l2_mod_3 % (unsigned int)l2_swizzle_3;
+                    if (section_3 >= (unsigned int)total_bh / (unsigned int)l2_swizzle_3) {
+                        m_block_3 = l2_mod_3 % (unsigned int)NUM_M_BLOCKS;
+                        bh_3 = section_3 * (unsigned int)l2_swizzle_3 + l2_mod_3 / (unsigned int)NUM_M_BLOCKS;
+                    }
                     m_block_3 = (unsigned int)(NUM_M_BLOCKS - 1) - m_block_3;
                 }
                 int seqlen_kv_bh_3 = seq_lens_kv[bh_3];
                 int seqlen_q_bh_3 = seq_lens_q[bh_3];
-                unsigned int num_n_blocks_3 = (seqlen_kv_bh_3 + BLOCK_N - 1) / BLOCK_N;
+                unsigned int num_n_blocks_3 = (seqlen_kv_bh_3 + BLOCK_N - 1) / BLOCK_N + (seqlen_kv_bh_3 == 0 ? 1u : 0u);
                 {
                     int causal_shift_4 = seqlen_kv_bh_3 - seqlen_q_bh_3;
                     unsigned int max_n_3 = (m_block_3 + 1) * (unsigned int)BLOCK_M + (unsigned int)causal_shift_4;
                     if (max_n_3 < (unsigned int)seqlen_kv_bh_3) {
-                        num_n_blocks_3 = (max_n_3 + (unsigned int)BLOCK_N - 1) / (unsigned int)BLOCK_N;
+                        num_n_blocks_3 = (max_n_3 + (unsigned int)BLOCK_N - 1) / (unsigned int)BLOCK_N + (max_n_3 == 0u ? 1u : 0u);
                     }
                 }
                 unsigned int kv_bh = bh_3 / (unsigned int)HEADS_PER_GROUP;
@@ -3446,16 +3469,20 @@ kernel_cake_fmha_context_fp8_hd256(CakeFmhaTensorMap const* Q, CakeFmhaTensorMap
                     unsigned int l2_mod_4 = tile_idx_4 % l2section_4;
                     m_block_4 = l2_mod_4 / (unsigned int)l2_swizzle_4;
                     bh_4 = section_4 * (unsigned int)l2_swizzle_4 + l2_mod_4 % (unsigned int)l2_swizzle_4;
+                    if (section_4 >= (unsigned int)total_bh / (unsigned int)l2_swizzle_4) {
+                        m_block_4 = l2_mod_4 % (unsigned int)NUM_M_BLOCKS;
+                        bh_4 = section_4 * (unsigned int)l2_swizzle_4 + l2_mod_4 / (unsigned int)NUM_M_BLOCKS;
+                    }
                     m_block_4 = (unsigned int)(NUM_M_BLOCKS - 1) - m_block_4;
                 }
                 int seqlen_kv_bh_4 = seq_lens_kv[bh_4];
                 int seqlen_q_bh_4 = seq_lens_q[bh_4];
-                unsigned int num_n_blocks_4 = (seqlen_kv_bh_4 + BLOCK_N - 1) / BLOCK_N;
+                unsigned int num_n_blocks_4 = (seqlen_kv_bh_4 + BLOCK_N - 1) / BLOCK_N + (seqlen_kv_bh_4 == 0 ? 1u : 0u);
                 {
                     int causal_shift_5 = seqlen_kv_bh_4 - seqlen_q_bh_4;
                     unsigned int max_n_4 = (m_block_4 + 1) * (unsigned int)BLOCK_M + (unsigned int)causal_shift_5;
                     if (max_n_4 < (unsigned int)seqlen_kv_bh_4) {
-                        num_n_blocks_4 = (max_n_4 + (unsigned int)BLOCK_N - 1) / (unsigned int)BLOCK_N;
+                        num_n_blocks_4 = (max_n_4 + (unsigned int)BLOCK_N - 1) / (unsigned int)BLOCK_N + (max_n_4 == 0u ? 1u : 0u);
                     }
                 }
                 int off_q_1 = (unsigned int)cu_seq_lens_q[bh_4] + m_block_4 * (unsigned int)BLOCK_M;
@@ -3526,6 +3553,8 @@ kernel_cake_fmha_context_fp8_hd256(CakeFmhaTensorMap const* Q, CakeFmhaTensorMap
     }
 
     // Cleanup
+    asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+    asm volatile("tcgen05.fence::before_thread_sync;" ::: "memory");
     __syncthreads(); // barrier before TMEM dealloc
 
     if (warp == 0) {

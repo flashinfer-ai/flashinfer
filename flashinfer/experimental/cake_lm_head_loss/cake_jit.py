@@ -17,7 +17,7 @@ limitations under the License.
 from __future__ import annotations
 
 import functools
-from typing import Any, Optional
+from typing import Any
 
 from . import cake_build
 
@@ -51,10 +51,12 @@ from . import cake_build
 # ``cake_lm_head_loss_<unit>`` (one architecture-neutral translation unit per
 # kernel, shared by the records of every architecture; the per-architecture
 # lowering sits under ``__CUDA_ARCH__`` guards) whose ``build.json`` entry
-# ``cake_lm_head_loss_<unit>_<arch>`` lists ``csrc/cake_lm_head_loss/
-# cake_lm_head_loss_<unit>_kernel.cu`` and the launch stub ``..._launch.cu``
-# that binds the shared launcher under ``csrc/cake_lm_head_loss/shim/`` to the
-# kernel.  Do not edit by hand.
+# ``cake_lm_head_loss_<unit>_<arch>`` lists the kernel translation unit that
+# defines the stage's symbol -- the unit's own ``csrc/cake_lm_head_loss/
+# cake_lm_head_loss_<unit>_kernel.cu``, or a sibling form's file with this
+# unit's kernel symbol named through a compile definition -- and the launch
+# stub ``..._launch.cu`` that binds the shared launcher under
+# ``csrc/cake_lm_head_loss/shim/`` to the kernel.  Do not edit by hand.
 # --- generated registry (written by the Cake export; do not edit) ---
 _ARG_PLANS: dict[str, list[list[str]]] = {
     "gather_rows_bf16": [
@@ -86,6 +88,78 @@ _ARG_PLANS: dict[str, list[list[str]]] = {
         ["parameter", "k_slice_iters"],
         ["parameter", "group_m"],
         ["parameter", "group_n"],
+        ["grid", "grid_x"],
+        ["grid", "grid_y"],
+        ["grid", "grid_z"],
+    ],
+    "gemm_logits_dz": [
+        ["tma_buffer", "A"],
+        ["tma_buffer", "B"],
+        ["buffer", "C"],
+        ["buffer", "STATS_OUT"],
+        ["parameter", "M"],
+        ["parameter", "m_tiles"],
+        ["parameter", "k_iters"],
+        ["parameter", "first_chunk"],
+        ["buffer", "WS"],
+        ["parameter", "ws_slab"],
+        ["parameter", "ldc"],
+        ["parameter", "k_slices"],
+        ["parameter", "k_slice_iters"],
+        ["parameter", "group_m"],
+        ["parameter", "group_n"],
+        ["buffer", "labels"],
+        ["buffer", "lse"],
+        ["buffer", "dlogp"],
+        ["parameter", "row0"],
+        ["parameter", "d_off"],
+        ["grid", "grid_x"],
+        ["grid", "grid_y"],
+        ["grid", "grid_z"],
+    ],
+    "gemm_logits_dz_tma": [
+        ["tma_buffer", "A"],
+        ["tma_buffer", "B"],
+        ["tma_buffer", "C"],
+        ["buffer", "STATS_OUT"],
+        ["parameter", "M"],
+        ["parameter", "m_tiles"],
+        ["parameter", "k_iters"],
+        ["parameter", "first_chunk"],
+        ["buffer", "WS"],
+        ["parameter", "ws_slab"],
+        ["parameter", "ldc"],
+        ["parameter", "k_slices"],
+        ["parameter", "k_slice_iters"],
+        ["parameter", "group_m"],
+        ["parameter", "group_n"],
+        ["buffer", "labels"],
+        ["buffer", "lse"],
+        ["buffer", "dlogp"],
+        ["parameter", "row0"],
+        ["parameter", "d_off"],
+        ["grid", "grid_x"],
+        ["grid", "grid_y"],
+        ["grid", "grid_z"],
+    ],
+    "gemm_logits_lbl": [
+        ["tma_buffer", "A"],
+        ["tma_buffer", "B"],
+        ["buffer", "C"],
+        ["buffer", "STATS_OUT"],
+        ["parameter", "M"],
+        ["parameter", "m_tiles"],
+        ["parameter", "k_iters"],
+        ["parameter", "first_chunk"],
+        ["buffer", "WS"],
+        ["parameter", "ws_slab"],
+        ["parameter", "ldc"],
+        ["parameter", "k_slices"],
+        ["parameter", "k_slice_iters"],
+        ["parameter", "group_m"],
+        ["parameter", "group_n"],
+        ["buffer", "labels"],
+        ["parameter", "row0"],
         ["grid", "grid_x"],
         ["grid", "grid_y"],
         ["grid", "grid_z"],
@@ -176,6 +250,26 @@ _ARG_PLANS: dict[str, list[list[str]]] = {
         ["grid", "grid_y"],
         ["grid", "grid_z"],
     ],
+    "gemm_dx_ptr": [
+        ["tma_buffer", "A"],
+        ["tma_buffer", "B"],
+        ["buffer", "C"],
+        ["buffer", "STATS_OUT"],
+        ["parameter", "M"],
+        ["parameter", "m_tiles"],
+        ["parameter", "k_iters"],
+        ["parameter", "first_chunk"],
+        ["buffer", "WS"],
+        ["parameter", "ws_slab"],
+        ["parameter", "ldc"],
+        ["parameter", "k_slices"],
+        ["parameter", "k_slice_iters"],
+        ["parameter", "group_m"],
+        ["parameter", "group_n"],
+        ["grid", "grid_x"],
+        ["grid", "grid_y"],
+        ["grid", "grid_z"],
+    ],
     "slab_sum": [
         ["buffer", "dx"],
         ["buffer", "ws"],
@@ -207,11 +301,158 @@ _ARG_PLANS: dict[str, list[list[str]]] = {
         ["grid", "grid_y"],
         ["grid", "grid_z"],
     ],
+    "support_check": [
+        ["buffer", "ids"],
+        ["buffer", "offsets"],
+        ["buffer", "labels"],
+        ["buffer", "word"],
+        ["buffer", "lpos"],
+        ["buffer", "offsets32"],
+        ["buffer", "ids32"],
+        ["parameter", "T"],
+        ["parameter", "M"],
+        ["parameter", "V"],
+        ["parameter", "k_cap"],
+        ["parameter", "has_labels"],
+        ["grid", "grid_x"],
+        ["grid", "grid_y"],
+        ["grid", "grid_z"],
+    ],
+    "support_row_finalize": [
+        ["buffer", "z"],
+        ["buffer", "tau"],
+        ["buffer", "offsets"],
+        ["buffer", "lpos"],
+        ["buffer", "teacher"],
+        ["buffer", "lse"],
+        ["buffer", "packed"],
+        ["buffer", "selected"],
+        ["buffer", "kl"],
+        ["parameter", "T"],
+        ["parameter", "M"],
+        ["parameter", "outputs"],
+        ["grid", "grid_x"],
+        ["grid", "grid_y"],
+        ["grid", "grid_z"],
+    ],
+    "support_row_grad": [
+        ["buffer", "z"],
+        ["buffer", "tau"],
+        ["buffer", "lse"],
+        ["buffer", "offsets"],
+        ["buffer", "lpos"],
+        ["buffer", "teacher"],
+        ["buffer", "g"],
+        ["buffer", "d"],
+        ["buffer", "e"],
+        ["buffer", "dz"],
+        ["parameter", "T"],
+        ["parameter", "M"],
+        ["parameter", "upstreams"],
+        ["grid", "grid_x"],
+        ["grid", "grid_y"],
+        ["grid", "grid_z"],
+    ],
+    "support_gather_bf16": [
+        ["buffer", "zblk"],
+        ["buffer", "ids"],
+        ["buffer", "offsets"],
+        ["buffer", "z"],
+        ["parameter", "t0"],
+        ["parameter", "rows"],
+        ["parameter", "v0"],
+        ["parameter", "vb"],
+        ["parameter", "ldc"],
+        ["parameter", "M"],
+        ["parameter", "V"],
+        ["grid", "grid_x"],
+        ["grid", "grid_y"],
+        ["grid", "grid_z"],
+    ],
+    "support_scatter_dz_bf16": [
+        ["buffer", "dz"],
+        ["buffer", "ids"],
+        ["buffer", "offsets"],
+        ["buffer", "dzblk"],
+        ["parameter", "t0"],
+        ["parameter", "rows"],
+        ["parameter", "v0"],
+        ["parameter", "vb"],
+        ["parameter", "ldc"],
+        ["parameter", "M"],
+        ["parameter", "V"],
+        ["grid", "grid_x"],
+        ["grid", "grid_y"],
+        ["grid", "grid_z"],
+    ],
+    "support_logits_gather_gemm": [
+        ["tma_buffer", "W"],
+        ["tma_buffer", "X"],
+        ["buffer", "z"],
+        ["buffer", "ids"],
+        ["buffer", "offsets"],
+        ["parameter", "M"],
+        ["parameter", "T"],
+        ["parameter", "V"],
+        ["parameter", "H"],
+        ["grid", "grid_x"],
+        ["grid", "grid_y"],
+        ["grid", "grid_z"],
+    ],
+    "support_sga_dx": [
+        ["buffer", "rows"],
+        ["buffer", "scale"],
+        ["buffer", "ids"],
+        ["buffer", "offsets"],
+        ["buffer", "out"],
+        ["parameter", "ld_rows"],
+        ["parameter", "H"],
+        ["parameter", "V"],
+        ["parameter", "M"],
+        ["parameter", "T"],
+        ["parameter", "min_pairs"],
+        ["grid", "grid_x"],
+        ["grid", "grid_y"],
+        ["grid", "grid_z"],
+    ],
+    "support_sga_dw": [
+        ["buffer", "rows"],
+        ["buffer", "scale"],
+        ["buffer", "keys"],
+        ["buffer", "offsets"],
+        ["buffer", "out"],
+        ["buffer", "partial"],
+        ["parameter", "ld_rows"],
+        ["parameter", "H"],
+        ["parameter", "V"],
+        ["parameter", "M"],
+        ["parameter", "T"],
+        ["parameter", "n_keys"],
+        ["parameter", "split"],
+        ["parameter", "span"],
+        ["grid", "grid_x"],
+        ["grid", "grid_y"],
+        ["grid", "grid_z"],
+    ],
+    "support_sga_combine": [
+        ["buffer", "keys"],
+        ["buffer", "partial"],
+        ["buffer", "out"],
+        ["parameter", "H"],
+        ["parameter", "V"],
+        ["parameter", "n_keys"],
+        ["parameter", "split"],
+        ["parameter", "span"],
+        ["grid", "grid_x"],
+        ["grid", "grid_y"],
+        ["grid", "grid_z"],
+    ],
 }
 _LAUNCHES: dict[str, dict[str, list[int]]] = {
     "b256_c1": {"block": [256, 1, 1], "cluster": [1, 1, 1]},
     "b224_c2": {"block": [224, 1, 1], "cluster": [2, 1, 1]},
     "b128_c1": {"block": [128, 1, 1], "cluster": [1, 1, 1]},
+    "b320_c1": {"block": [320, 1, 1], "cluster": [1, 1, 1]},
 }
 _REGISTRY: dict[str, dict[str, Any]] = {
     "cake_lm_head_loss_sm_100a": {
@@ -280,6 +521,22 @@ _REGISTRY: dict[str, dict[str, Any]] = {
                 1,
                 1,
             ],
+            "gemm_logits_dz": [
+                "3e8994e4b91b37742b15",
+                "gemm_logits_dz",
+                "b224_c2",
+                "max(1, m_tiles//2*(ldc//256))*2",
+                1,
+                1,
+            ],
+            "gemm_logits_lbl": [
+                "2989154c4cd16d281c69",
+                "gemm_logits_lbl",
+                "b224_c2",
+                "max(1, m_tiles//2*(ldc//256))*2",
+                1,
+                1,
+            ],
             "row_finalize": [
                 "61ea8de378a85bd5c55c",
                 "row_finalize",
@@ -298,7 +555,7 @@ _REGISTRY: dict[str, dict[str, Any]] = {
                 1,
             ],
             "gemm_dx": [
-                "962c476faea73269ee31",
+                "1f06a34c8f3bae873636",
                 "gemm_dx",
                 "b224_c2",
                 "max(1, m_tiles//2*(ldc//512))*2",
@@ -306,7 +563,7 @@ _REGISTRY: dict[str, dict[str, Any]] = {
                 1,
             ],
             "gemm_dx_s": [
-                "ab2405f84e01186198a2",
+                "141dcacc1798fc65e775",
                 "gemm_dx_2",
                 "b224_c2",
                 "max(1, m_tiles//2*(ldc//512)*k_slices)*2",
@@ -330,7 +587,7 @@ _REGISTRY: dict[str, dict[str, Any]] = {
                 1,
             ],
             "gemm_dx_st3": [
-                "d25c462221a5bc5ee763",
+                "1f06a34c8f3bae873636",
                 "gemm_dx",
                 "b224_c2",
                 "max(1, m_tiles//2*(ldc//512))*2",
@@ -338,10 +595,42 @@ _REGISTRY: dict[str, dict[str, Any]] = {
                 1,
             ],
             "gemm_dx_s_st3": [
-                "148ac7a6958d17343647",
+                "141dcacc1798fc65e775",
                 "gemm_dx_2",
                 "b224_c2",
                 "max(1, m_tiles//2*(ldc//512)*k_slices)*2",
+                1,
+                1,
+            ],
+            "gemm_dx_split": [
+                "050b6664af7d3db672c8",
+                "gemm_dx",
+                "b224_c2",
+                "max(1, m_tiles//2*(ldc//512)+dx_split)*2",
+                1,
+                1,
+            ],
+            "gemm_dx_s_split": [
+                "41dc3440772b5c8154dc",
+                "gemm_dx_2",
+                "b224_c2",
+                "max(1, m_tiles//2*(ldc//512)*k_slices+dx_split)*2",
+                1,
+                1,
+            ],
+            "gemm_dx_st3_split": [
+                "050b6664af7d3db672c8",
+                "gemm_dx",
+                "b224_c2",
+                "max(1, m_tiles//2*(ldc//512)+dx_split)*2",
+                1,
+                1,
+            ],
+            "gemm_dx_s_st3_split": [
+                "41dc3440772b5c8154dc",
+                "gemm_dx_2",
+                "b224_c2",
+                "max(1, m_tiles//2*(ldc//512)*k_slices+dx_split)*2",
                 1,
                 1,
             ],
@@ -372,6 +661,14 @@ _REGISTRY: dict[str, dict[str, Any]] = {
             "gemm_dw_cast_bf16": [
                 "0a540692be2ea00ec27a",
                 "gemm_logits",
+                "b224_c2",
+                "max(1, m_tiles//2*(ldc//512))*4",
+                1,
+                1,
+            ],
+            "gemm_dw_cast_bf16_tma": [
+                "a4e720ef5ddf1d96c230",
+                "gemm_dx_2",
                 "b224_c2",
                 "max(1, m_tiles//2*(ldc//512))*4",
                 1,
@@ -415,6 +712,118 @@ _REGISTRY: dict[str, dict[str, Any]] = {
                 "b256_c1",
                 "max(1, min(num_rows*row_vecs/2048, num_rows, 65535))",
                 1,
+                1,
+            ],
+            "support_check_ids_i32_off_i32": [
+                "1ff075b1aad76876eace",
+                "support_check",
+                "b256_c1",
+                "min(T/8, sms*4)",
+                1,
+                1,
+            ],
+            "support_check_ids_i32_off_i64": [
+                "345e2c9c6a13a13c99e9",
+                "support_check",
+                "b256_c1",
+                "min(T/8, sms*4)",
+                1,
+                1,
+            ],
+            "support_check_ids_i64_off_i32": [
+                "412aa4df26fa3d57c8f0",
+                "support_check",
+                "b256_c1",
+                "min(T/8, sms*4)",
+                1,
+                1,
+            ],
+            "support_check_ids_i64_off_i64": [
+                "9c5b66d17ed24eee09e4",
+                "support_check",
+                "b256_c1",
+                "min(T/8, sms*4)",
+                1,
+                1,
+            ],
+            "support_row_finalize": [
+                "728732e30943f09310a4",
+                "support_row_finalize",
+                "b256_c1",
+                "min(T/8, sms*8)",
+                1,
+                1,
+            ],
+            "support_row_grad": [
+                "07366b930f44e3768b7e",
+                "support_row_grad",
+                "b256_c1",
+                "min(T/8, sms*8)",
+                1,
+                1,
+            ],
+            "support_gather_bf16": [
+                "50957fd20852b04eae09",
+                "support_gather_bf16",
+                "b256_c1",
+                "min(rows/8, sms*8)",
+                1,
+                1,
+            ],
+            "support_scatter_dz_bf16": [
+                "0de747890c741ecc10c9",
+                "support_scatter_dz_bf16",
+                "b256_c1",
+                "min(rows, sms*8)",
+                1,
+                1,
+            ],
+            "support_logits_gather_gemm": [
+                "2d208100e3449732f3fc",
+                "support_logits_gather_gemm",
+                "b320_c1",
+                "min(M/128, sms)",
+                1,
+                1,
+            ],
+            "support_sga_dx": [
+                "c304f237a4508b1d32b8",
+                "support_sga_dx",
+                "b128_c1",
+                "T",
+                "H/1024",
+                1,
+            ],
+            "support_sga_dw": [
+                "c9dbb1bda1359978bdcc",
+                "support_sga_dw",
+                "b128_c1",
+                "n_keys/span",
+                "H/1024",
+                1,
+            ],
+            "support_sga_dw_f32_add": [
+                "b049b326b5e905f4807f",
+                "support_sga_dw",
+                "b128_c1",
+                "n_keys/span",
+                "H/1024",
+                1,
+            ],
+            "support_sga_combine": [
+                "7d065096a4d043d032d1",
+                "support_sga_combine",
+                "b128_c1",
+                "n_keys/span",
+                "H/1024",
+                1,
+            ],
+            "support_sga_combine_f32_add": [
+                "97d4fd402664cfd39557",
+                "support_sga_combine",
+                "b128_c1",
+                "n_keys/span",
+                "H/1024",
                 1,
             ],
         },
@@ -485,6 +894,22 @@ _REGISTRY: dict[str, dict[str, Any]] = {
                 1,
                 1,
             ],
+            "gemm_logits_dz": [
+                "aa0003a3f2f72697433f",
+                "gemm_logits_dz_tma",
+                "b224_c2",
+                "max(1, m_tiles//2*(ldc//256))*2",
+                1,
+                1,
+            ],
+            "gemm_logits_lbl": [
+                "197d71d87dcbcdcbc4f0",
+                "gemm_logits_lbl",
+                "b224_c2",
+                "max(1, m_tiles//2*(ldc//256))*2",
+                1,
+                1,
+            ],
             "row_finalize": [
                 "61ea8de378a85bd5c55c",
                 "row_finalize",
@@ -550,6 +975,54 @@ _REGISTRY: dict[str, dict[str, Any]] = {
                 1,
                 1,
             ],
+            "gemm_dx_split": [
+                "09dfba14325f4953a545",
+                "gemm_dx",
+                "b224_c2",
+                "max(1, m_tiles//2*(ldc//512)+dx_split)*2",
+                1,
+                1,
+            ],
+            "gemm_dx_s_split": [
+                "6815b8226eff7fe9fad9",
+                "gemm_dx_2",
+                "b224_c2",
+                "max(1, m_tiles//2*(ldc//512)*k_slices+dx_split)*2",
+                1,
+                1,
+            ],
+            "gemm_dx_st3_split": [
+                "5367830a1ad573b55718",
+                "gemm_dx",
+                "b224_c2",
+                "max(1, m_tiles//2*(ldc//512)+dx_split)*2",
+                1,
+                1,
+            ],
+            "gemm_dx_s_st3_split": [
+                "2340232406f6512ce76f",
+                "gemm_dx_2",
+                "b224_c2",
+                "max(1, m_tiles//2*(ldc//512)*k_slices+dx_split)*2",
+                1,
+                1,
+            ],
+            "gemm_dx_swab": [
+                "4a810e56687675c6c875",
+                "gemm_dx_ptr",
+                "b224_c2",
+                "max(1, ldc//256*(M/512))*2",
+                1,
+                1,
+            ],
+            "gemm_dx_s_swab": [
+                "69d867c2e601acd39856",
+                "gemm_dx_ptr",
+                "b224_c2",
+                "max(1, ldc//256*(M/512)*k_slices)*2",
+                1,
+                1,
+            ],
             "slab_sum": [
                 "dc45b3bd617f038cbddb",
                 "slab_sum",
@@ -577,6 +1050,14 @@ _REGISTRY: dict[str, dict[str, Any]] = {
             "gemm_dw_cast_bf16": [
                 "0a540692be2ea00ec27a",
                 "gemm_logits",
+                "b224_c2",
+                "max(1, m_tiles//2*(ldc//512))*4",
+                1,
+                1,
+            ],
+            "gemm_dw_cast_bf16_tma": [
+                "a4e720ef5ddf1d96c230",
+                "gemm_dx_2",
                 "b224_c2",
                 "max(1, m_tiles//2*(ldc//512))*4",
                 1,
@@ -620,6 +1101,118 @@ _REGISTRY: dict[str, dict[str, Any]] = {
                 "b256_c1",
                 "max(1, min(num_rows*row_vecs/2048, num_rows, 65535))",
                 1,
+                1,
+            ],
+            "support_check_ids_i32_off_i32": [
+                "1ff075b1aad76876eace",
+                "support_check",
+                "b256_c1",
+                "min(T/8, sms*4)",
+                1,
+                1,
+            ],
+            "support_check_ids_i32_off_i64": [
+                "345e2c9c6a13a13c99e9",
+                "support_check",
+                "b256_c1",
+                "min(T/8, sms*4)",
+                1,
+                1,
+            ],
+            "support_check_ids_i64_off_i32": [
+                "412aa4df26fa3d57c8f0",
+                "support_check",
+                "b256_c1",
+                "min(T/8, sms*4)",
+                1,
+                1,
+            ],
+            "support_check_ids_i64_off_i64": [
+                "9c5b66d17ed24eee09e4",
+                "support_check",
+                "b256_c1",
+                "min(T/8, sms*4)",
+                1,
+                1,
+            ],
+            "support_row_finalize": [
+                "728732e30943f09310a4",
+                "support_row_finalize",
+                "b256_c1",
+                "min(T/8, sms*8)",
+                1,
+                1,
+            ],
+            "support_row_grad": [
+                "07366b930f44e3768b7e",
+                "support_row_grad",
+                "b256_c1",
+                "min(T/8, sms*8)",
+                1,
+                1,
+            ],
+            "support_gather_bf16": [
+                "50957fd20852b04eae09",
+                "support_gather_bf16",
+                "b256_c1",
+                "min(rows/8, sms*8)",
+                1,
+                1,
+            ],
+            "support_scatter_dz_bf16": [
+                "0de747890c741ecc10c9",
+                "support_scatter_dz_bf16",
+                "b256_c1",
+                "min(rows, sms*8)",
+                1,
+                1,
+            ],
+            "support_logits_gather_gemm": [
+                "2d208100e3449732f3fc",
+                "support_logits_gather_gemm",
+                "b320_c1",
+                "min(M/128, sms)",
+                1,
+                1,
+            ],
+            "support_sga_dx": [
+                "c304f237a4508b1d32b8",
+                "support_sga_dx",
+                "b128_c1",
+                "T",
+                "H/1024",
+                1,
+            ],
+            "support_sga_dw": [
+                "c9dbb1bda1359978bdcc",
+                "support_sga_dw",
+                "b128_c1",
+                "n_keys/span",
+                "H/1024",
+                1,
+            ],
+            "support_sga_dw_f32_add": [
+                "b049b326b5e905f4807f",
+                "support_sga_dw",
+                "b128_c1",
+                "n_keys/span",
+                "H/1024",
+                1,
+            ],
+            "support_sga_combine": [
+                "7d065096a4d043d032d1",
+                "support_sga_combine",
+                "b128_c1",
+                "n_keys/span",
+                "H/1024",
+                1,
+            ],
+            "support_sga_combine_f32_add": [
+                "97d4fd402664cfd39557",
+                "support_sga_combine",
+                "b128_c1",
+                "n_keys/span",
+                "H/1024",
                 1,
             ],
         },
@@ -699,6 +1292,13 @@ MODULES: dict[str, dict[str, Any]] = _expand_registry(_REGISTRY, _ARG_PLANS, _LA
 #                          partials of the bf16-rounded logits.
 # ``gemm_logits_nostats``  the same GEMM without the statistics (the
 #                          recompute of the log-probability backward).
+# ``gemm_logits_dz``       the log-probability backward's recompute with the row
+#                          gradient in its epilogue: dz_c = bf16(dlogp_t *
+#                          (1[v = y_t] - exp(z - lse_t))) in place of z_c
+#                          (bitwise ``gemm_logits_nostats`` + ``row_grad``).
+# ``gemm_logits_lbl``      the log-probability forward's logits GEMM: the
+#                          statistics plus z_c at the label column alone (the
+#                          one element ``row_finalize`` reads).
 # ``row_finalize``         merges the partials into ``lse`` (every row),
 #                          gathers the selected logit, writes ``logp`` (0 on
 #                          ignored rows) and, per objective, the per-row
@@ -744,6 +1344,8 @@ STAGES = (
     "gemm_logits_mcnt",
     "gemm_logits_nostats",
     "gemm_logits_nostats_mcnt",
+    "gemm_logits_dz",
+    "gemm_logits_lbl",
     "row_finalize",
     "loss_reduce",
     "row_grad",
@@ -753,10 +1355,17 @@ STAGES = (
     "gemm_dx_s_tn256",
     "gemm_dx_st3",
     "gemm_dx_s_st3",
+    "gemm_dx_split",
+    "gemm_dx_s_split",
+    "gemm_dx_st3_split",
+    "gemm_dx_s_st3_split",
+    "gemm_dx_swab",
+    "gemm_dx_s_swab",
     "slab_sum",
     "gemm_dw_acc",
     "gemm_dw_acc_gn",
     "gemm_dw_cast_bf16",
+    "gemm_dw_cast_bf16_tma",
     "gemm_dw_cast_f32",
     "gemm_dw_cast_f32_gn",
     "scale_cast_bf16",
@@ -769,8 +1378,14 @@ STAGES = (
 # (``cake_backend.stage_variant``): ``_mcnt`` the device-count form of the
 # logits GEMMs (the hidden valid-row count path's chunk 0), ``_s`` the K-sliced
 # dX GEMM (2 .. 4 K-slice work items per output tile), ``_tn256`` the narrow
-# tile and ``_st3`` the 3-deep operand ring of the dX GEMM, ``_gn`` the 2-D
-# blocked raster of the weight-gradient accumulate / fp32 fused cast.  The
+# tile and ``_st3`` the 3-deep operand ring of the dX GEMM, ``_split`` the wide
+# dX tile whose last wave's trailing items run as 256-wide half items (the grid
+# carries the split count), ``_swab`` the wide dX tile with swapped operands
+# (dX^T = W^T dz^T: the chunk's tokens on the MMA's N, C stored per thread),
+# ``_tma`` the TMA-epilogue form of a GEMM's stores (the bf16 fused weight-
+# gradient cast of a multi-chunk call's last chunk reads the old FP32 sum and
+# stores the bf16 tile as TMA sub-tiles: the same per-element arithmetic),
+# ``_gn`` the 2-D blocked raster of the weight-gradient accumulate / fp32 fused cast.  The
 # call geometry (``H`` / ``V``) and the rules' numeric outputs -- the slice
 # count, the raster height ``group_m``, the block width ``group_n`` -- are
 # launch scalars of these kernels (``cake_backend.gemm_scalars``), so one
@@ -786,6 +1401,8 @@ BASE_STAGES = (
     "gather_rows_bf16",
     "gemm_logits",
     "gemm_logits_nostats",
+    "gemm_logits_dz",
+    "gemm_logits_lbl",
     "row_finalize",
     "loss_reduce",
     "row_grad",
@@ -811,6 +1428,7 @@ ROW_STAGES = (
 )
 
 
+@functools.cache
 def toolchain_runs_hidden_count(arch: str) -> bool:
     """Does the hidden valid-row count (``cake_backend.hidden_count_eligible``) run on ``arch`` with the CUDA
     toolkit that built (or will build) this package's libraries?
@@ -829,66 +1447,29 @@ def toolchain_runs_hidden_count(arch: str) -> bool:
 
     The toolkit version is :func:`cake_build.record_cuda_version`: the version that built the prebuilt
     libraries (``aot/build_info.json``) when the package ships them, else the local toolkit of the JIT path.
+    Neither changes while the package is loaded, so the answer is computed once per architecture and process
+    (the check reads the library manifest and stats every library file: milliseconds per call on a network
+    file system, paid by every call of three chunks or more before its first launch).
     """
     if arch != "sm_103a":
         return True
     return tuple(cake_build.record_cuda_version(arch)) != (13, 0)
 
 
-PRIMARY_RECORD = "cake_lm_head_loss_{arch}"  # the architecture's record (geometry-free: H / V are launch scalars)
-
-
-def record_geometry(record: dict[str, Any]) -> tuple[Optional[int], Optional[int]]:
-    """``(hidden, vocab)`` a record's GEMM instances are specialized to (``None`` = any multiple)."""
-    geometry = record.get("geometry", {})
-    hidden, vocab = geometry.get("hidden"), geometry.get("vocab")
-    return (
-        None if hidden is None else int(hidden),
-        None if vocab is None else int(vocab),
-    )
-
-
-def select_module(
-    arch: str, hidden: Optional[int] = None, vocab: Optional[int] = None
-) -> str:
-    """Return the registered module name for ``arch`` -- the record specialized to the
-    ``(hidden, vocab)`` geometry when given (a record pinned to neither accepts any), else
-    the sole record of the architecture or its default-geometry record ``PRIMARY_RECORD``."""
+def select_module(arch: str) -> str:
+    """Return the registered module name for ``arch``: the architecture's sole record (the kernels take ``H`` / ``V``
+    as launch scalars, so one record serves every admissible geometry)."""
     names = [name for name, record in MODULES.items() if record["arch"] == arch]
     if not names:
         raise NotImplementedError(
             f"The generated chunked LM-head + loss program for {arch} is not "
             "registered in this checkout yet (see flashinfer-ai/flashinfer#5680)"
         )
-    if hidden is None and vocab is None:
-        if len(names) == 1:
-            return names[0]
-        primary = PRIMARY_RECORD.format(arch=arch)
-        if primary in names:
-            return primary
+    if len(names) > 1:
         raise NotImplementedError(
-            f"{arch} registers more than one chunked LM-head program and no default-geometry "
-            f"record {primary!r}: {names}; select by hidden= / vocab="
+            f"{arch} registers more than one chunked LM-head program: {names}"
         )
-
-    def matches(record):
-        pinned_h, pinned_v = record_geometry(record)
-        return (pinned_h is None or hidden is None or pinned_h == int(hidden)) and (
-            pinned_v is None or vocab is None or pinned_v == int(vocab)
-        )
-
-    found = [name for name in names if matches(MODULES[name])]
-    if len(found) > 1:
-        raise NotImplementedError(
-            f"{arch} registers more than one chunked LM-head program for H = {hidden}, V = {vocab}: {found}"
-        )
-    if not found:
-        registered = sorted(record_geometry(MODULES[name]) for name in names)
-        raise ValueError(
-            f"the registered chunked LM-head programs for {arch} are specialized to (H, V) in {registered}, "
-            f"got H = {hidden}, V = {vocab}"
-        )
-    return found[0]
+    return names[0]
 
 
 def registered_stages(name: str) -> tuple[str, ...]:

@@ -9674,6 +9674,10 @@ def kernel_cake_mxfp8_megamoe_ep16_fused(
                 ) < cutlass.Uint32(((launch_epoch + 1) * num_bids)):
                     pass
         prims.barrier_cta_sync(12, thread_count=384)
+        # Dispatch staged the claimed row indices in shared memory at the start of raw_smem stage 0 (generic-proxy
+        # stores and loads, ordered before this point by the CTA barriers); this fence orders them before the TMA
+        # (async proxy) writes of that stage below.
+        cute.arch.fence_proxy("async.shared", space="cta")
         a_stage[0] = cutlass.Uint32(0)
         scale_stage[0] = cutlass.Uint32(0)
         _phase_a_free[0] = cutlass.Uint32(1)
@@ -11101,6 +11105,9 @@ def kernel_cake_mxfp8_megamoe_ep16_fused(
                 ) < cutlass.Uint32(((launch_epoch + 1) * num_bids)):
                     pass
         prims.barrier_cta_sync(12, thread_count=384)
+        # Dispatch stored the activation rows through the generic proxy; the dispatch_done grid barrier orders them
+        # before this point, and this fence orders them before the TMA (async proxy) loads of activation_bf16.
+        cute.arch.fence_proxy("async.global")
         b_stage_1[0] = cutlass.Uint32(0)
         _phase_b_free[0] = cutlass.Uint32(1)
         for phase_3 in cutlass.range_constexpr(0, 2, 1):
@@ -11156,6 +11163,9 @@ def kernel_cake_mxfp8_megamoe_ep16_fused(
                                 scope=prims.MemScope.GPU,
                             ) < cutlass.Uint32(80):
                                 pass
+                    # The FC1 epilogue stored these fc1_workspace_bf16 rows through the generic proxy before its fc1_done
+                    # release; this fence orders them before the TMA (async proxy) loads below.
+                    cute.arch.fence_proxy("async.global")
                 num_k_tiles_2 = cutlass.Int32((24 if (phase_3 == 0) else 40))
                 for iter_k_2 in cutlass.range(
                     cutlass.Int32(0),

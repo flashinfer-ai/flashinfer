@@ -57,6 +57,13 @@
 #define THREADS 512
 #define LAUNCH_MIN_BLOCKS 1
 
+
+__device__ __forceinline__ float mul_f32_rn_noftz(float a, float b) {
+    float r;
+    asm("mul.rn.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b));
+    return r;
+}
+
 extern "C" {
 
 __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS) __cluster_dims__(2,1,1) void
@@ -232,9 +239,6 @@ kernel_cake_stepfun_moe_3a5388a6a052318613bd(const __grid_constant__ CUtensorMap
     const int tmem_accum = taddr;
     const int tmem_sfa = taddr + 64;
     const int tmem_sfb = taddr + 224;
-
-    // ---- Ordered hardware-WG register redistribution ----
-    // Dec phase frees registers before any WG attempts inc.
     if (warp >= 8 && warp <= 15) {
         asm volatile("setmaxnreg.dec.sync.aligned.u32 48;");
     }
@@ -245,6 +249,7 @@ kernel_cake_stepfun_moe_3a5388a6a052318613bd(const __grid_constant__ CUtensorMap
         { // epilogue_main
             asm volatile("griddepcontrol.wait;" ::: "memory");
             int tile_count = num_non_exiting_ctas[0];
+            unsigned int lane_base = (unsigned int)((tid & 96) << 16);
             const int warp_0 = warp;
             const int lane_1 = lane;
             unsigned int acc_stage = 0;
@@ -273,32 +278,24 @@ kernel_cake_stepfun_moe_3a5388a6a052318613bd(const __grid_constant__ CUtensorMap
                             "tcgen05.ld.sync.aligned.16x256b.x4.b32"
                             " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15}, [%16];"
                             : "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[0])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[1])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[2])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[3])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[4])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[5])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[6])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[7])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[8])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[9])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[10])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[11])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[12])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[13])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[14])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[15]))
-                            : "r"(taddr + acc_offset));
+                            : "r"(taddr + lane_base + acc_offset));
                         asm volatile("tcgen05.wait::ld.sync.aligned;");
                         float _tmem_load_1[16];
                         asm volatile(
                             "tcgen05.ld.sync.aligned.16x256b.x4.b32"
                             " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15}, [%16];"
                             : "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[1])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[2])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[3])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[4])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[5])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[6])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[7])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[8])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[9])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[10])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[11])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[12])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[13])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[14])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_1[15]))
-                            : "r"(taddr + 1048576 + acc_offset));
+                            : "r"(taddr + lane_base + 1048576 + acc_offset));
                         asm volatile("tcgen05.wait::ld.sync.aligned;");
                         asm volatile("cp.async.bulk.wait_group.read 0;");
                         asm volatile("tcgen05.fence::before_thread_sync;");
                         asm volatile("barrier.sync 7, 128;" ::: "memory");
                         for (int token_group = 0; token_group < 4; token_group++) {
                             int token = base_token + token_group * 8;
-                            float _mul_0;
-                            asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_0) : "f"(_tmem_load_0[token_group * 4]), "f"(sc));
-                            converted[0] = _mul_0;
-                            float _mul_1;
-                            asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_1) : "f"(_tmem_load_0[token_group * 4 + 2]), "f"(sc));
-                            converted[1] = _mul_1;
-                            float _mul_2;
-                            asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_2) : "f"(_tmem_load_1[token_group * 4]), "f"(sc));
-                            converted[2] = _mul_2;
-                            float _mul_3;
-                            asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_3) : "f"(_tmem_load_1[token_group * 4 + 2]), "f"(sc));
-                            converted[3] = _mul_3;
+                            converted[0] = mul_f32_rn_noftz(_tmem_load_0[token_group * 4], sc);
+                            converted[1] = mul_f32_rn_noftz(_tmem_load_0[token_group * 4 + 2], sc);
+                            converted[2] = mul_f32_rn_noftz(_tmem_load_1[token_group * 4], sc);
+                            converted[3] = mul_f32_rn_noftz(_tmem_load_1[token_group * 4 + 2], sc);
                             #pragma unroll
                             for (int _lp = 0; _lp < 2; _lp++) {
                                 __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
@@ -312,18 +309,10 @@ kernel_cake_stepfun_moe_3a5388a6a052318613bd(const __grid_constant__ CUtensorMap
                                 epi_staging_u64[(2048 + token * 64 + (base_feature - 64 ^ swizzle_feature)) / 4] = packed_word;
                             }
                             int token_0 = base_token + token_group * 8 + 1;
-                            float _mul_4;
-                            asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_4) : "f"(_tmem_load_0[token_group * 4 + 1]), "f"(sc));
-                            converted[0] = _mul_4;
-                            float _mul_5;
-                            asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_5) : "f"(_tmem_load_0[token_group * 4 + 1 + 2]), "f"(sc));
-                            converted[1] = _mul_5;
-                            float _mul_6;
-                            asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_6) : "f"(_tmem_load_1[token_group * 4 + 1]), "f"(sc));
-                            converted[2] = _mul_6;
-                            float _mul_7;
-                            asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_7) : "f"(_tmem_load_1[token_group * 4 + 1 + 2]), "f"(sc));
-                            converted[3] = _mul_7;
+                            converted[0] = mul_f32_rn_noftz(_tmem_load_0[token_group * 4 + 1], sc);
+                            converted[1] = mul_f32_rn_noftz(_tmem_load_0[token_group * 4 + 1 + 2], sc);
+                            converted[2] = mul_f32_rn_noftz(_tmem_load_1[token_group * 4 + 1], sc);
+                            converted[3] = mul_f32_rn_noftz(_tmem_load_1[token_group * 4 + 1 + 2], sc);
                             #pragma unroll
                             for (int _lp = 0; _lp < 2; _lp++) {
                                 __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(converted[_lp*2 + 0], converted[_lp*2+1 + 0]));
@@ -427,6 +416,7 @@ kernel_cake_stepfun_moe_3a5388a6a052318613bd(const __grid_constant__ CUtensorMap
             unsigned int m_tile_1 = blockIdx.x;
             unsigned int n_tile_1 = blockIdx.y;
             const int lane_0 = lane;
+            unsigned int sfb_lane_base = (unsigned int)((tid & 96) << 16);
             unsigned int words[1];
             unsigned int _phase_sfb_full = 0;
             unsigned int _phase_k_done = 1;
@@ -449,7 +439,7 @@ kernel_cake_stepfun_moe_3a5388a6a052318613bd(const __grid_constant__ CUtensorMap
                             asm volatile(
                                 "tcgen05.st.sync.aligned.32x32b.x1.b32"
                                 " [%0], {%1};"
-                                :: "r"(taddr + 224 + stage * 16), "r"(words[0]));
+                                :: "r"(taddr + sfb_lane_base + 224 + stage * 16), "r"(words[0]));
                             words[0] = 0;
                             int row_w_0 = lane_0;
                             if (row_w_0 < 32) {
@@ -458,7 +448,7 @@ kernel_cake_stepfun_moe_3a5388a6a052318613bd(const __grid_constant__ CUtensorMap
                             asm volatile(
                                 "tcgen05.st.sync.aligned.32x32b.x1.b32"
                                 " [%0], {%1};"
-                                :: "r"(taddr + 224 + stage * 16 + 2), "r"(words[0]));
+                                :: "r"(taddr + sfb_lane_base + 224 + stage * 16 + 2), "r"(words[0]));
                             words[0] = 0;
                             int row_w_1 = lane_0;
                             if (row_w_1 < 32) {
@@ -467,7 +457,7 @@ kernel_cake_stepfun_moe_3a5388a6a052318613bd(const __grid_constant__ CUtensorMap
                             asm volatile(
                                 "tcgen05.st.sync.aligned.32x32b.x1.b32"
                                 " [%0], {%1};"
-                                :: "r"(taddr + 224 + stage * 16 + 4), "r"(words[0]));
+                                :: "r"(taddr + sfb_lane_base + 224 + stage * 16 + 4), "r"(words[0]));
                             words[0] = 0;
                             int row_w_2 = lane_0;
                             if (row_w_2 < 32) {
@@ -476,7 +466,7 @@ kernel_cake_stepfun_moe_3a5388a6a052318613bd(const __grid_constant__ CUtensorMap
                             asm volatile(
                                 "tcgen05.st.sync.aligned.32x32b.x1.b32"
                                 " [%0], {%1};"
-                                :: "r"(taddr + 224 + stage * 16 + 6), "r"(words[0]));
+                                :: "r"(taddr + sfb_lane_base + 224 + stage * 16 + 6), "r"(words[0]));
                             words[0] = 0;
                             int row_w_3 = lane_0;
                             if (row_w_3 < 32) {
@@ -485,7 +475,7 @@ kernel_cake_stepfun_moe_3a5388a6a052318613bd(const __grid_constant__ CUtensorMap
                             asm volatile(
                                 "tcgen05.st.sync.aligned.32x32b.x1.b32"
                                 " [%0], {%1};"
-                                :: "r"(taddr + 224 + stage * 16 + 8), "r"(words[0]));
+                                :: "r"(taddr + sfb_lane_base + 224 + stage * 16 + 8), "r"(words[0]));
                             words[0] = 0;
                             int row_w_4 = lane_0;
                             if (row_w_4 < 32) {
@@ -494,7 +484,7 @@ kernel_cake_stepfun_moe_3a5388a6a052318613bd(const __grid_constant__ CUtensorMap
                             asm volatile(
                                 "tcgen05.st.sync.aligned.32x32b.x1.b32"
                                 " [%0], {%1};"
-                                :: "r"(taddr + 224 + stage * 16 + 10), "r"(words[0]));
+                                :: "r"(taddr + sfb_lane_base + 224 + stage * 16 + 10), "r"(words[0]));
                             words[0] = 0;
                             int row_w_5 = lane_0;
                             if (row_w_5 < 32) {
@@ -503,7 +493,7 @@ kernel_cake_stepfun_moe_3a5388a6a052318613bd(const __grid_constant__ CUtensorMap
                             asm volatile(
                                 "tcgen05.st.sync.aligned.32x32b.x1.b32"
                                 " [%0], {%1};"
-                                :: "r"(taddr + 224 + stage * 16 + 12), "r"(words[0]));
+                                :: "r"(taddr + sfb_lane_base + 224 + stage * 16 + 12), "r"(words[0]));
                             words[0] = 0;
                             int row_w_6 = lane_0;
                             if (row_w_6 < 32) {
@@ -512,7 +502,7 @@ kernel_cake_stepfun_moe_3a5388a6a052318613bd(const __grid_constant__ CUtensorMap
                             asm volatile(
                                 "tcgen05.st.sync.aligned.32x32b.x1.b32"
                                 " [%0], {%1};"
-                                :: "r"(taddr + 224 + stage * 16 + 14), "r"(words[0]));
+                                :: "r"(taddr + sfb_lane_base + 224 + stage * 16 + 14), "r"(words[0]));
                             asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
                             asm volatile("tcgen05.fence::before_thread_sync;");
                             asm volatile("barrier.sync 4, 128;" ::: "memory");
@@ -1014,87 +1004,94 @@ kernel_cake_stepfun_moe_3a5388a6a052318613bd(const __grid_constant__ CUtensorMap
                                 mbarrier_wait(sfa_full_addr + (stage_5) * 8, _phase_sfa_full);
                                 mbarrier_wait(k_done_addr + (stage_5) * 8, _phase_k_done_3);
                                 asm volatile("tcgen05.fence::after_thread_sync;");
-                                if (elect_sync()) {
-                                    #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
-                                    #error "Tcgen05Cp requires Blackwell tcgen05.cp support"
-                                    #endif
-                                    {
-                                        uint64_t _tcgen05_cp_desc_0 = ((((uint64_t)(smem_sfa_addr + stage_5 * 4096)) & 0x3FFFFULL) >> 4ULL) | (((((uint64_t)(0)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(128)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (0ULL << 61ULL);
-                                        asm volatile(
-                                            "tcgen05.cp.cta_group::2.32x128b.warpx4 [%0], %1;"
-                                            :: "r"((uint32_t)((unsigned int)tmem_sfa + stage_5 * 32)), "l"(_tcgen05_cp_desc_0)
-                                            : "memory");
-                                    }
-                                    #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
-                                    #error "Tcgen05Cp requires Blackwell tcgen05.cp support"
-                                    #endif
-                                    {
-                                        uint64_t _tcgen05_cp_desc_1 = ((((uint64_t)(smem_sfa_addr + stage_5 * 4096 + 512)) & 0x3FFFFULL) >> 4ULL) | (((((uint64_t)(0)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(128)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (0ULL << 61ULL);
-                                        asm volatile(
-                                            "tcgen05.cp.cta_group::2.32x128b.warpx4 [%0], %1;"
-                                            :: "r"((uint32_t)((unsigned int)tmem_sfa + (stage_5 * 32 + 4))), "l"(_tcgen05_cp_desc_1)
-                                            : "memory");
-                                    }
-                                    #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
-                                    #error "Tcgen05Cp requires Blackwell tcgen05.cp support"
-                                    #endif
-                                    {
-                                        uint64_t _tcgen05_cp_desc_2 = ((((uint64_t)(smem_sfa_addr + stage_5 * 4096 + 1024)) & 0x3FFFFULL) >> 4ULL) | (((((uint64_t)(0)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(128)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (0ULL << 61ULL);
-                                        asm volatile(
-                                            "tcgen05.cp.cta_group::2.32x128b.warpx4 [%0], %1;"
-                                            :: "r"((uint32_t)((unsigned int)tmem_sfa + (stage_5 * 32 + 8))), "l"(_tcgen05_cp_desc_2)
-                                            : "memory");
-                                    }
-                                    #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
-                                    #error "Tcgen05Cp requires Blackwell tcgen05.cp support"
-                                    #endif
-                                    {
-                                        uint64_t _tcgen05_cp_desc_3 = ((((uint64_t)(smem_sfa_addr + stage_5 * 4096 + 1536)) & 0x3FFFFULL) >> 4ULL) | (((((uint64_t)(0)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(128)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (0ULL << 61ULL);
-                                        asm volatile(
-                                            "tcgen05.cp.cta_group::2.32x128b.warpx4 [%0], %1;"
-                                            :: "r"((uint32_t)((unsigned int)tmem_sfa + (stage_5 * 32 + 12))), "l"(_tcgen05_cp_desc_3)
-                                            : "memory");
-                                    }
-                                    #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
-                                    #error "Tcgen05Cp requires Blackwell tcgen05.cp support"
-                                    #endif
-                                    {
-                                        uint64_t _tcgen05_cp_desc_4 = ((((uint64_t)(smem_sfa_addr + stage_5 * 4096 + 2048)) & 0x3FFFFULL) >> 4ULL) | (((((uint64_t)(0)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(128)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (0ULL << 61ULL);
-                                        asm volatile(
-                                            "tcgen05.cp.cta_group::2.32x128b.warpx4 [%0], %1;"
-                                            :: "r"((uint32_t)((unsigned int)tmem_sfa + (stage_5 * 32 + 16))), "l"(_tcgen05_cp_desc_4)
-                                            : "memory");
-                                    }
-                                    #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
-                                    #error "Tcgen05Cp requires Blackwell tcgen05.cp support"
-                                    #endif
-                                    {
-                                        uint64_t _tcgen05_cp_desc_5 = ((((uint64_t)(smem_sfa_addr + stage_5 * 4096 + 2560)) & 0x3FFFFULL) >> 4ULL) | (((((uint64_t)(0)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(128)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (0ULL << 61ULL);
-                                        asm volatile(
-                                            "tcgen05.cp.cta_group::2.32x128b.warpx4 [%0], %1;"
-                                            :: "r"((uint32_t)((unsigned int)tmem_sfa + (stage_5 * 32 + 20))), "l"(_tcgen05_cp_desc_5)
-                                            : "memory");
-                                    }
-                                    #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
-                                    #error "Tcgen05Cp requires Blackwell tcgen05.cp support"
-                                    #endif
-                                    {
-                                        uint64_t _tcgen05_cp_desc_6 = ((((uint64_t)(smem_sfa_addr + stage_5 * 4096 + 3072)) & 0x3FFFFULL) >> 4ULL) | (((((uint64_t)(0)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(128)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (0ULL << 61ULL);
-                                        asm volatile(
-                                            "tcgen05.cp.cta_group::2.32x128b.warpx4 [%0], %1;"
-                                            :: "r"((uint32_t)((unsigned int)tmem_sfa + (stage_5 * 32 + 24))), "l"(_tcgen05_cp_desc_6)
-                                            : "memory");
-                                    }
-                                    #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
-                                    #error "Tcgen05Cp requires Blackwell tcgen05.cp support"
-                                    #endif
-                                    {
-                                        uint64_t _tcgen05_cp_desc_7 = ((((uint64_t)(smem_sfa_addr + stage_5 * 4096 + 3584)) & 0x3FFFFULL) >> 4ULL) | (((((uint64_t)(0)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(128)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (0ULL << 61ULL);
-                                        asm volatile(
-                                            "tcgen05.cp.cta_group::2.32x128b.warpx4 [%0], %1;"
-                                            :: "r"((uint32_t)((unsigned int)tmem_sfa + (stage_5 * 32 + 28))), "l"(_tcgen05_cp_desc_7)
-                                            : "memory");
-                                    }
+                                uint32_t _elected_0 = elect_sync();
+                                #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
+                                #error "Tcgen05Cp requires Blackwell tcgen05.cp support"
+                                #endif
+                                {
+                                    uint64_t _tcgen05_cp_desc_1 = ((((uint64_t)(smem_sfa_addr + stage_5 * 4096)) & 0x3FFFFULL) >> 4ULL) | (((((uint64_t)(0)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(128)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (0ULL << 61ULL);
+                                    asm volatile(
+                                        "{\n\t.reg .pred leader;\n\tsetp.ne.b32 leader, %2, 0;\n\t"
+                                        "@leader tcgen05.cp.cta_group::2.32x128b.warpx4 [%0], %1;\n\t}\n"
+                                        :: "r"((uint32_t)((unsigned int)tmem_sfa + stage_5 * 32)), "l"(_tcgen05_cp_desc_1), "r"(_elected_0)
+                                        : "memory");
+                                }
+                                #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
+                                #error "Tcgen05Cp requires Blackwell tcgen05.cp support"
+                                #endif
+                                {
+                                    uint64_t _tcgen05_cp_desc_2 = ((((uint64_t)(smem_sfa_addr + stage_5 * 4096 + 512)) & 0x3FFFFULL) >> 4ULL) | (((((uint64_t)(0)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(128)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (0ULL << 61ULL);
+                                    asm volatile(
+                                        "{\n\t.reg .pred leader;\n\tsetp.ne.b32 leader, %2, 0;\n\t"
+                                        "@leader tcgen05.cp.cta_group::2.32x128b.warpx4 [%0], %1;\n\t}\n"
+                                        :: "r"((uint32_t)((unsigned int)tmem_sfa + (stage_5 * 32 + 4))), "l"(_tcgen05_cp_desc_2), "r"(_elected_0)
+                                        : "memory");
+                                }
+                                #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
+                                #error "Tcgen05Cp requires Blackwell tcgen05.cp support"
+                                #endif
+                                {
+                                    uint64_t _tcgen05_cp_desc_3 = ((((uint64_t)(smem_sfa_addr + stage_5 * 4096 + 1024)) & 0x3FFFFULL) >> 4ULL) | (((((uint64_t)(0)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(128)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (0ULL << 61ULL);
+                                    asm volatile(
+                                        "{\n\t.reg .pred leader;\n\tsetp.ne.b32 leader, %2, 0;\n\t"
+                                        "@leader tcgen05.cp.cta_group::2.32x128b.warpx4 [%0], %1;\n\t}\n"
+                                        :: "r"((uint32_t)((unsigned int)tmem_sfa + (stage_5 * 32 + 8))), "l"(_tcgen05_cp_desc_3), "r"(_elected_0)
+                                        : "memory");
+                                }
+                                #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
+                                #error "Tcgen05Cp requires Blackwell tcgen05.cp support"
+                                #endif
+                                {
+                                    uint64_t _tcgen05_cp_desc_4 = ((((uint64_t)(smem_sfa_addr + stage_5 * 4096 + 1536)) & 0x3FFFFULL) >> 4ULL) | (((((uint64_t)(0)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(128)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (0ULL << 61ULL);
+                                    asm volatile(
+                                        "{\n\t.reg .pred leader;\n\tsetp.ne.b32 leader, %2, 0;\n\t"
+                                        "@leader tcgen05.cp.cta_group::2.32x128b.warpx4 [%0], %1;\n\t}\n"
+                                        :: "r"((uint32_t)((unsigned int)tmem_sfa + (stage_5 * 32 + 12))), "l"(_tcgen05_cp_desc_4), "r"(_elected_0)
+                                        : "memory");
+                                }
+                                #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
+                                #error "Tcgen05Cp requires Blackwell tcgen05.cp support"
+                                #endif
+                                {
+                                    uint64_t _tcgen05_cp_desc_5 = ((((uint64_t)(smem_sfa_addr + stage_5 * 4096 + 2048)) & 0x3FFFFULL) >> 4ULL) | (((((uint64_t)(0)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(128)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (0ULL << 61ULL);
+                                    asm volatile(
+                                        "{\n\t.reg .pred leader;\n\tsetp.ne.b32 leader, %2, 0;\n\t"
+                                        "@leader tcgen05.cp.cta_group::2.32x128b.warpx4 [%0], %1;\n\t}\n"
+                                        :: "r"((uint32_t)((unsigned int)tmem_sfa + (stage_5 * 32 + 16))), "l"(_tcgen05_cp_desc_5), "r"(_elected_0)
+                                        : "memory");
+                                }
+                                #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
+                                #error "Tcgen05Cp requires Blackwell tcgen05.cp support"
+                                #endif
+                                {
+                                    uint64_t _tcgen05_cp_desc_6 = ((((uint64_t)(smem_sfa_addr + stage_5 * 4096 + 2560)) & 0x3FFFFULL) >> 4ULL) | (((((uint64_t)(0)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(128)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (0ULL << 61ULL);
+                                    asm volatile(
+                                        "{\n\t.reg .pred leader;\n\tsetp.ne.b32 leader, %2, 0;\n\t"
+                                        "@leader tcgen05.cp.cta_group::2.32x128b.warpx4 [%0], %1;\n\t}\n"
+                                        :: "r"((uint32_t)((unsigned int)tmem_sfa + (stage_5 * 32 + 20))), "l"(_tcgen05_cp_desc_6), "r"(_elected_0)
+                                        : "memory");
+                                }
+                                #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
+                                #error "Tcgen05Cp requires Blackwell tcgen05.cp support"
+                                #endif
+                                {
+                                    uint64_t _tcgen05_cp_desc_7 = ((((uint64_t)(smem_sfa_addr + stage_5 * 4096 + 3072)) & 0x3FFFFULL) >> 4ULL) | (((((uint64_t)(0)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(128)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (0ULL << 61ULL);
+                                    asm volatile(
+                                        "{\n\t.reg .pred leader;\n\tsetp.ne.b32 leader, %2, 0;\n\t"
+                                        "@leader tcgen05.cp.cta_group::2.32x128b.warpx4 [%0], %1;\n\t}\n"
+                                        :: "r"((uint32_t)((unsigned int)tmem_sfa + (stage_5 * 32 + 24))), "l"(_tcgen05_cp_desc_7), "r"(_elected_0)
+                                        : "memory");
+                                }
+                                #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
+                                #error "Tcgen05Cp requires Blackwell tcgen05.cp support"
+                                #endif
+                                {
+                                    uint64_t _tcgen05_cp_desc_8 = ((((uint64_t)(smem_sfa_addr + stage_5 * 4096 + 3584)) & 0x3FFFFULL) >> 4ULL) | (((((uint64_t)(0)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(128)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (0ULL << 61ULL);
+                                    asm volatile(
+                                        "{\n\t.reg .pred leader;\n\tsetp.ne.b32 leader, %2, 0;\n\t"
+                                        "@leader tcgen05.cp.cta_group::2.32x128b.warpx4 [%0], %1;\n\t}\n"
+                                        :: "r"((uint32_t)((unsigned int)tmem_sfa + (stage_5 * 32 + 28))), "l"(_tcgen05_cp_desc_8), "r"(_elected_0)
+                                        : "memory");
                                 }
                                 asm volatile("tcgen05.fence::before_thread_sync;");
                                 mbarrier_arrive(tmem_sfa_full_addr + (stage_5) * 8);
