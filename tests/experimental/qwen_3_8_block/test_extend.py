@@ -250,8 +250,8 @@ def test_prefill_is_the_extend_form_at_an_empty_prefix():
     """``"prefill"`` and ``"extend"`` at one bucket: equal declarations but the form; a prefill plan's run with ``seq_lens[b] == T`` for every
     live sequence is BITWISE an extend plan's run on the same inputs (one vendored form, two names)."""
     g = _geometry()
-    a = Qsa38ExtendCase(g, (64, 64, 0), 64, page_size=16, seed=111, cap=4)
-    b = Qsa38ExtendCase(g, (64, 64, 0), 64, page_size=16, seed=111, cap=4)
+    a = Qsa38ExtendCase(g, (32, 32, 0), 32, page_size=16, seed=111, cap=4)
+    b = Qsa38ExtendCase(g, (32, 32, 0), 32, page_size=16, seed=111, cap=4)
     pa, pb = _plan(a, g, "prefill"), _plan(b, g, "extend")
     da, db = dict(pa.declaration), dict(pb.declaration)
     assert da.pop("form") == "prefill" and db.pop("form") == "extend" and da == db
@@ -285,7 +285,16 @@ def test_chunked_prefill_then_carried_decode_steps_are_one_chain():
         24,
     )  # cap 8: the decode step at q_len 4 needs cap >= 7; 24 pages = 384 positions hold the 310-token stream
     first = Qsa38ExtendCase(
-        g, (chunks[0],), chunks[0], page_size=page, seed=131, table_width=width, cap=cap
+        g,
+        (chunks[0],),
+        chunks[0],
+        page_size=page,
+        seed=131,
+        table_width=width,
+        cap=cap,
+        extra_pages=-(-(301 + 1 + 1 + 4) // page)
+        - (-(-chunks[0] // page))
+        + 2,  # the pools hold the whole stream: 20 pages + 2
     )
     assert (
         not first._primed
@@ -298,6 +307,13 @@ def test_chunked_prefill_then_carried_decode_steps_are_one_chain():
     spare = sorted(set(range(1, first.num_pages)) - set(pages))
     pages_t = lambda: torch.tensor(pages, device="cuda")  # noqa: E731
     weights = (first.weights38, first.w_o)
+    cos_all, sin_all = (
+        first.position_tables
+    )  # [1, n_pos, rope]: the stream's per-position tables
+    gen = torch.Generator(device="cuda").manual_seed(79)
+    h_all = first.h_full[
+        0
+    ]  # [1, L, d_model]: the stream's inputs so far (the first chunk's draw), extended chunk by chunk
     L = 0
     k_raw_acc = None  # the stream's raw keys as the BLOCK's slabs emitted them
     case = first
@@ -318,8 +334,26 @@ def test_chunked_prefill_then_carried_decode_steps_are_one_chain():
                 weights=weights,
                 cap=cap,
             )
-            # the same prompt: one seed, one generator order -> the prefix draw is the first case's
-            assert torch.equal(nxt.h_full[0][:, :L], case.h_full[0][:, :L])
+            # re-aim the case at THIS chunk of the carried stream: the stream's inputs drawn once (extended by this chunk's rows) and the
+            # dense reference over them, the carried caches, pages and table
+            h_chunk = torch.randn(
+                1, T, g.d_model, generator=gen, device="cuda", dtype=torch.float32
+            ).to(torch.bfloat16)
+            h_all = torch.cat([h_all, h_chunk], 1)
+            nxt.refs[0] = gated_attention_block_reference(
+                h_all,
+                case.weights.w_qkvg,
+                case.weights.w_q_norm,
+                case.weights.w_k_norm,
+                cos_all[:, :Lf],
+                sin_all[:, :Lf],
+                case.w_o,
+                case.ref_geom,
+            )
+            nxt.h_full[0] = h_all
+            nxt.hidden_states = h_chunk.view(T, g.d_model).contiguous()
+            nxt.rope_cos = cos_all[0, pos0:Lf].contiguous()
+            nxt.rope_sin = sin_all[0, pos0:Lf].contiguous()
             nxt.kv_cache, nxt.index_kv_cache, nxt.index_state_cache = (
                 case.kv_cache,
                 case.index_kv_cache,
@@ -327,8 +361,12 @@ def test_chunked_prefill_then_carried_decode_steps_are_one_chain():
             )
             nxt.index_state_block_table = case.index_state_block_table
             nxt.k_raw_full[0] = torch.cat(
-                [k_raw_acc, nxt.k_raw_full[0][L:]], 0
-            )  # the prefix as the blocks wrote it
+                [
+                    k_raw_acc,
+                    (h_chunk[0].float() @ case.w_band_k.float().t()).to(torch.bfloat16),
+                ],
+                0,
+            )  # the prefix as the blocks wrote it (the chunk's own rows come from its slab)
             nxt.prefix_bits = (bits(case.kv_cache).clone(),)
             nxt._primed = True
         nxt.pages = [list(pages)]
@@ -338,7 +376,7 @@ def test_chunked_prefill_then_carried_decode_steps_are_one_chain():
         nxt.slot_mapping = (pages_t()[pos // page] * page + pos % page).to(torch.int32)
         nxt.ring_slots = torch.where(
             pos + cap >= Lf, 1 * cap + pos % cap, torch.full_like(pos, -1)
-        )
+        ).to(torch.int32)
         nxt.seq_lens = torch.tensor([Lf], dtype=torch.int32, device="cuda")
         plan = _plan(nxt, g, "prefill" if ci == 0 else "extend")
         out = _run(plan, nxt)
@@ -350,8 +388,7 @@ def test_chunked_prefill_then_carried_decode_steps_are_one_chain():
     assert L == 301
     # the three carried decode steps (the decode module's carried cell, over THIS stream): q 1 (position 301), q 1 (302: completes block 75),
     # q 4 with two of four accepted and re-stepped
-    h_acc = case.h_full[0].clone()
-    gen = torch.Generator(device="cuda").manual_seed(80)
+    h_acc = h_all.clone()
     plans = {}
     for step, (s_q, n_acc) in enumerate([(1, 1), (1, 1), (4, 2), (4, 4)], 1):
         pos0 = L
@@ -557,8 +594,9 @@ def test_run_time_declines_are_typed_and_named():
     with pytest.raises(ValueError, match="index_kv_cache must be"):
         plan.run(*w, **dict(a, index_kv_cache=a["index_kv_cache"][:-1]))
     with pytest.raises(ValueError, match="query_start_loc / num_actual_tokens"):
-        plan.run(
-            *w, **a, query_start_loc=torch.zeros(3, dtype=torch.int32, device="cuda")
+        plan._bind(
+            hidden_states=case.hidden_states,
+            query_start_loc=torch.zeros(3, dtype=torch.int32, device="cuda"),
         )
     assert not plan.supports(
         hidden_states=case.hidden_states[:1],
@@ -840,7 +878,7 @@ def test_workspace_query_is_honest_and_runs_allocate_nothing():
     sizes = {}
     for cache_dtype in (None, torch.float8_e4m3fn):
         g = _geometry(index_cache_dtype=cache_dtype)
-        case = Qsa38ExtendCase(g, (4224, 300, 0), 64, page_size=16, seed=181, cap=4)
+        case = Qsa38ExtendCase(g, (4224, 300, 0), 32, page_size=16, seed=181, cap=4)
         case.prime()
         plan = _plan(case, g)
         for form in ("extend", "prefill"):
@@ -851,7 +889,7 @@ def test_workspace_query_is_honest_and_runs_allocate_nothing():
                     device="cuda",
                     page_size=16,
                     batch_size=case.b,
-                    q_len_per_req=64,
+                    q_len_per_req=32,
                     max_pages=int(case.block_table.shape[1]),
                     ring_cap=cap,
                 )

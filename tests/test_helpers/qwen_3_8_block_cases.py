@@ -735,6 +735,8 @@ class Qsa38ExtendCase(Qsa38PagedCase):
 
     def __init__(self, geometry, kv_lens, q_len, *, cap: int = 4, **kw):
         super().__init__(geometry, kv_lens, q_len, cap=cap, **kw)
+        # the stack's ring slots in the slot mapping's dtype already (the run binds them as given: no cast kernel on the execute path)
+        self.ring_slots = self.ring_slots.to(self.slot_mapping.dtype)
 
     def _ring_slot_written(self, pos: int, kv_len: int) -> bool:
         """The extend forms' ring arm writes the sequence's LAST ``cap`` tokens (the stack's circular buffer): a slot iff ``pos + cap >= kv_len``."""
