@@ -713,6 +713,7 @@ def build_context_task_manager(
     g_seq_lens_kv: cute.Pointer | None = None,
     max_seq_len_kv: int | Int32 | None = None,
     sage_scales: cute.Pointer | None = None,
+    sinks: cute.Pointer | None = None,
     num_kv_heads: int | Int32 = 0,
     num_kv_tiles: int | Int32,
     q_offset: int | Int32,
@@ -740,6 +741,10 @@ def build_context_task_manager(
     (``cfg.sage_scale_layout``), whose sequences are strided by
     ``num_kv_heads``; the softmax groups and the correction warps read it in
     place.
+
+    ``sinks`` is the FP32 ``[Hq]`` attention-sink logit buffer of a kernel with
+    ``cfg.use_attention_sinks``; the correction warps read the logit of their
+    work tile's head once per tile.
 
     ``scale_softmax_log2`` and ``output_scale`` are optional one-element
     float32 device tensors. Resource setup loads element 0 once before the K/V
@@ -1296,6 +1301,8 @@ def build_context_task_manager(
         tmem_vec_offset=cfg.tmem_vec0_offset,
         scale_softmax_log2=scale_softmax_log2,
         output_scale=output_scale,
+        sinks=sinks,
+        q_half=0,
         name="tmem_vec0",
     )
     smem_o_0 = SmemOResource(
@@ -1389,6 +1396,8 @@ def build_context_task_manager(
             tmem_vec_offset=cfg.tmem_vec1_offset,
             scale_softmax_log2=scale_softmax_log2,
             output_scale=output_scale,
+            sinks=sinks,
+            q_half=1,
             name="tmem_vec1",
         )
         smem_o_1 = SmemOResource(
@@ -2790,6 +2799,7 @@ def build_fmha_task_manager(
     vc_k_scale: cute.Tensor | None = None,
     vc_repair_tiles: int = 0,
     sage_scales: cute.Pointer | None = None,
+    sinks: cute.Pointer | None = None,
     num_kv_heads: int | Int32 = 0,
     is_persistent: bool = True,
     is_clc_dynamic: bool = False,
@@ -2884,6 +2894,7 @@ def build_fmha_task_manager(
         scale_softmax_log2=scale_softmax_log2,
         output_scale=output_scale,
         sage_scales=sage_scales,
+        sinks=sinks,
         num_kv_heads=num_kv_heads,
         g_block_tables=g_block_tables,
         block_table_row_stride=block_table_row_stride,
@@ -3315,6 +3326,7 @@ class FmhaTs:
         vc_k_scale: cute.Tensor | None = None,
         vc_repair_tiles: int = 0,
         sage_scales: cute.Tensor | None = None,
+        sinks: cute.Tensor | None = None,
     ) -> None:
         """Set up TMA descriptors, compute grid, and launch the kernel.
 
@@ -3330,9 +3342,22 @@ class FmhaTs:
         ``[1.0]`` for FP16 output. FP8 callers may fold Q/K/V and output
         quantization scales into these runtime tensors. ``sage_scales`` is a
         Sage plan's prepared FP32 scale buffer (``cfg.sage_scale_layout``).
+        ``sinks`` is the FP32 ``[Hq]`` attention-sink logit tensor (post-scale
+        logits), required by, and only by, a kernel with
+        ``cfg.use_attention_sinks``.
         """
         if cutlass.const_expr(self.cfg.use_sage_attention != (sage_scales is not None)):
             raise ValueError("sage_scales is required by, and only by, a Sage kernel")
+        if cutlass.const_expr(self.cfg.use_attention_sinks != (sinks is not None)):
+            raise ValueError("sinks is required by, and only by, a sink kernel")
+        if cutlass.const_expr(
+            self.cfg.use_attention_sinks
+            and (self.cfg.vc_attention is not None or self.cfg.use_sage_attention)
+        ):
+            # Both keep the row max in units the sink term does not follow.
+            raise ValueError(
+                "attention sinks are not supported with VC-Attention or Sage"
+            )
         cfg = self.cfg
         if cutlass.const_expr(
             cfg.use_paged_kv
@@ -3660,6 +3685,7 @@ class FmhaTs:
             if cutlass.const_expr(sage_scales is not None)
             else None
         )
+        sinks_iter = sinks.iterator if cutlass.const_expr(sinks is not None) else None
 
         self.kernel(
             tma_q_desc,
@@ -3686,6 +3712,7 @@ class FmhaTs:
             variable_window_cta_starts,
             Int32(s_q),
             sage_scales_iter,
+            sinks_iter,
             Int32(h_kv),
             vc_repair_tiles,
             self.is_persistent,
@@ -3732,6 +3759,7 @@ class FmhaTs:
         variable_window_cta_starts: cute.Tensor | None,
         variable_window_q_stride: Int32,
         sage_scales: cute.Pointer | None,
+        sinks: cute.Pointer | None,
         num_kv_heads: Int32,
         vc_repair_tiles: cutlass.Constexpr[int] = 0,
         is_persistent: cutlass.Constexpr[bool] = True,
@@ -3803,6 +3831,7 @@ class FmhaTs:
             scale_softmax_log2=scale_softmax_log2,
             output_scale=output_scale,
             sage_scales=sage_scales,
+            sinks=sinks,
             num_kv_heads=num_kv_heads,
             q_offset=q_offset,
             tma_mu_desc=tma_mu_desc.get_ptr() if cfg.vc_restores_means else None,

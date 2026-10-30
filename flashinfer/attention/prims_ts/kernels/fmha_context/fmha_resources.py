@@ -92,6 +92,7 @@ from cutlass.experimental.task_scheduling.resources import consumer_work, produc
 
 
 _SUPPORTED_CONTEXT_PAGE_SIZES = (16, 32, 64, 128)
+_LOG2_E = math.log2(math.e)
 from cutlass.pipeline import PipelineAsync, PipelineState
 from cutlass.cutlass_dsl import Boolean, Constexpr, dsl_user_op, if_generate
 
@@ -500,6 +501,11 @@ class FmhaConfig:
     # tiles the shared K/V ring keeps in flight, so the ring never throttles
     # the K loads.
     sage_k_scale_stages: int = 4
+    # Attention sinks: a per-Q-head FP32 logit joins each row's softmax
+    # denominator without contributing a value. The correction warps add its
+    # mass to the final row sum (``TmemStatsResource``); the kernel takes the
+    # ``sinks`` tensor only when this is set.
+    use_attention_sinks: bool = False
 
     # Variable sequence length mode stores Q/K/V/O as flattened
     # [sum_seqlen, head, dim] tensors and uses cum_seqlen_* for per-batch
@@ -6071,6 +6077,12 @@ class TmemStatsResource(MemoryResource):
     # Precomputed per-warp TMEM vec address (once, before persistent loop).
     tmem_vec_addr_cached: TmemAddr | None = field(init=False, default=None)
     tmem_ptr_vec_cached: TmemPtr | None = field(init=False, default=None)
+    # Attention sinks: the FP32 [Hq] logits, the Q half this stats vector
+    # serves (it picks the head of a paired work tile) and the work tile's
+    # sink logit in the log2 domain, cached by the per-tile correction setup.
+    sinks: cute.Pointer | None = field(init=False, default=None)
+    q_half: Constexpr[int] = field(init=False, default=0)
+    sink_log2_cached: Float32 | None = field(init=False, default=None)
 
     _alloc: Constexpr[Optional[TmemAllocation]] = field(init=False, default=None)
     _smem_alloc: Constexpr[Optional[SmemAllocation]] = field(init=False, default=None)
@@ -6086,6 +6098,8 @@ class TmemStatsResource(MemoryResource):
         tmem_vec_offset: int,
         scale_softmax_log2: cute.Tensor | None = None,
         output_scale: cute.Tensor | None = None,
+        sinks: cute.Pointer | None = None,
+        q_half: int = 0,
         **kwargs: Any,
     ) -> None:
         """Bind the correction-stat TMEM vector offset and allocation."""
@@ -6094,6 +6108,9 @@ class TmemStatsResource(MemoryResource):
         self.tmem_vec_offset = tmem_vec_offset
         self.scale_softmax_log2 = scale_softmax_log2
         self.output_scale = output_scale
+        self.sinks = sinks
+        self.q_half = q_half
+        self.sink_log2_cached = Float32(0.0)
         self._alloc = TmemAllocation(f"tmem_vec_{tmem_vec_offset}", cfg.tmem_stats_cols)
         self._smem_alloc = None
         if cfg.stats_via_smem:
@@ -6169,6 +6186,7 @@ class TmemStatsResource(MemoryResource):
         """
         self.tmem_vec_addr_cached = Int32(0)
         self.tmem_ptr_vec_cached = prims.make_tmem_ptr(Int32(0), cutlass.Int8)
+        self.sink_log2_cached = Float32(0.0)
         _ = stage_info
 
     @producer_work(work_attrs=WorkAttr.AUXILIARY)
@@ -6237,10 +6255,55 @@ class TmemStatsResource(MemoryResource):
     def init_store_work_tile_state(self, stage_info: StageInfo) -> None:
         self._init_work_tile_state(stage_info)
 
+    @cute.jit
+    def _load_attention_sink(self, stage_info: StageInfo) -> None:
+        """Cache the work tile's sink logit in the log2 domain.
+
+        Every row of one Q/O stage belongs to a single head: the work tile's
+        head, plus the peer offset of the second stage of a head-paired tile.
+        The load is a warp broadcast, issued with the rest of the per-tile
+        setup so its latency stays off the epilogue's critical path.
+        """
+        assert self.sinks is not None
+        _, head_coord, _ = _resolve_work_tile_coords(
+            self.cfg, stage_info.work_tile.tile_idx
+        )
+        head_idx = (
+            head_coord * self.cfg.work_tile_q_heads
+            + self.q_half * self.cfg.peer_q_head_stride
+        )
+        self.sink_log2_cached = Float32(self.sinks[head_idx]) * Float32(_LOG2_E)
+
     @consumer_work(work_attrs=WorkAttr.AUXILIARY)
     @cute.jit
     def init_read_work_tile_state(self, stage_info: StageInfo) -> None:
         self._init_work_tile_state(stage_info)
+        if cutlass.const_expr(self.cfg.use_attention_sinks):
+            self._load_attention_sink(stage_info)
+
+    @cute.jit
+    def _attention_sink_mass(
+        self, scale_softmax_log2: SoftmaxScalar, row_max: SoftmaxScalar
+    ) -> Float32:
+        """Return the sink's share of the row sum, in the units of P.
+
+        P is ``exp2(scale_softmax_log2 * (s - row_max))`` times the PV-side P
+        scale. The sink logit is a post-scale logit, so it enters as
+        ``exp2(sink * log2(e) - scale_softmax_log2 * row_max)`` times that same
+        P scale, as in the decode kernels. A row without a finite maximum has
+        no score for the sink to compete with, so the sink takes all the
+        mass and the row's output is zero, as in the dense reference.
+        """
+        p_scale = Float32(self.cfg.pv_p_scale)
+        mass = (
+            cute.math.exp2(
+                self.sink_log2_cached - row_max * scale_softmax_log2, fastmath=True
+            )
+            * p_scale
+        )
+        if row_max == Float32(-Float32.inf):
+            mass = p_scale
+        return mass
 
     @cute.jit
     def _stage_col_offset(self, stage_info: StageInfo) -> Int32 | int:
@@ -6374,6 +6437,12 @@ class TmemStatsResource(MemoryResource):
         else:
             vec_row_sum = vec_rmem[0]
             vec_old_max = vec_new_max
+        if cutlass.const_expr(final_stats and self.cfg.use_attention_sinks):
+            # The final record's row max is the one the row sum is relative to,
+            # including a max frozen by lazy correction.
+            vec_row_sum = vec_row_sum + self._attention_sink_mass(
+                scale_softmax_log2, vec_new_max
+            )
         _ = stage_info
         return vec_old_max, vec_new_max, vec_row_sum, scale
 

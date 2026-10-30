@@ -79,6 +79,8 @@ class _ContextCase:
     sm_scale: float
     output_scale: float
     output_dtype: torch.dtype
+    # Per-head attention sink logits ([Hq], post-scale), or None without sinks.
+    sinks: Optional[torch.Tensor] = None
 
     @property
     def packed(self) -> bool:
@@ -363,7 +365,11 @@ def _visible_kv_bounds(
 
 @torch.no_grad()
 def _context_reference(case: _ContextCase) -> torch.Tensor:
-    """Independent FP32 MHA/GQA oracle for fixed and packed context inputs."""
+    """Independent FP32 MHA/GQA oracle for fixed and packed context inputs.
+
+    ``case.sinks`` adds one value-free column per head to every softmax row,
+    as the dense reference of attention sinks.
+    """
 
     outputs = []
     for batch_idx, (q_length, k_length) in enumerate(
@@ -391,7 +397,14 @@ def _context_reference(case: _ContextCase) -> torch.Tensor:
                 window_left=case.window_left,
             )
             scores = torch.einsum("hd,khd->hk", q[query_idx], k[begin:end])
-            probabilities = torch.softmax(scores * case.sm_scale, dim=-1)
+            logits = scores * case.sm_scale
+            if case.sinks is None:
+                probabilities = torch.softmax(logits, dim=-1)
+            else:
+                probabilities = torch.softmax(
+                    torch.cat([logits, case.sinks.float().unsqueeze(-1)], dim=-1),
+                    dim=-1,
+                )[:, :-1]
             request_output.append(
                 torch.einsum("hk,khd->hd", probabilities, v[begin:end])
                 * case.output_scale
@@ -519,6 +532,7 @@ def _plan_wrapper(wrapper: BatchPrefillTSWrapper, case: _ContextCase) -> None:
         sm_scale=case.sm_scale,
         output_scale=case.output_scale,
         out_dtype=case.output_dtype,
+        has_sinks=case.sinks is not None,
     )
 
 
@@ -535,6 +549,7 @@ def _run_wrapper(
         case.v,
         case.qo_indptr,
         case.kv_indptr,
+        sinks=case.sinks,
         **kwargs,
     )
 
@@ -581,6 +596,7 @@ def _plan_paged_wrapper(
         uniform_packed_lengths=uniform_packed_lengths,
         has_q_offset=has_q_offset,
         paged_v_tail_is_zero=paged_v_tail_is_zero,
+        has_sinks=reference.sinks is not None,
     )
     return metadata
 
@@ -602,6 +618,7 @@ def _run_paged_wrapper(
         metadata.seq_lens_kv,
         out=out,
         validate=validate,
+        sinks=case.reference.sinks,
     )
 
 
@@ -662,6 +679,7 @@ def _run_one_shot(case: _ContextCase, *, out: Optional[torch.Tensor] = None):
         output_scale=case.output_scale,
         out_dtype=case.output_dtype,
         out=out,
+        sinks=case.sinks,
     )
 
 
@@ -788,6 +806,7 @@ def test_attention_ts_context_paged_wrapper_exposes_compile_oriented_contract() 
         "uniform_packed_lengths",
         "has_q_offset",
         "paged_v_tail_is_zero",
+        "has_sinks",
     )
     assert all(
         parameter.kind is inspect.Parameter.KEYWORD_ONLY
@@ -805,10 +824,13 @@ def test_attention_ts_context_paged_wrapper_exposes_compile_oriented_contract() 
         "out",
         "scale_softmax_log2",
         "output_scale",
+        "sinks",
         "validate",
     )
     assert run_parameters["validate"].kind is inspect.Parameter.KEYWORD_ONLY
     assert run_parameters["validate"].default is True
+    assert plan_parameters["has_sinks"].default is False
+    assert run_parameters["sinks"].default is None
     assert plan_parameters["uniform_packed_lengths"].default is False
     assert plan_parameters["has_q_offset"].default is True
     assert plan_parameters["paged_v_tail_is_zero"].default is False
@@ -872,6 +894,7 @@ def test_attention_ts_context_contiguous_wrapper_exposes_compile_oriented_contra
         "output_scale",
         "vc_config",
         "sage",
+        "has_sinks",
     )
     assert all(
         parameter.kind is inspect.Parameter.KEYWORD_ONLY
@@ -893,8 +916,11 @@ def test_attention_ts_context_contiguous_wrapper_exposes_compile_oriented_contra
         "output_scale",
         "vc",
         "sage",
+        "sinks",
         "validate",
     )
+    assert plan_parameters["has_sinks"].default is False
+    assert run_parameters["sinks"].default is None
     assert plan_parameters["head_dim_vo"].default is None
     assert plan_parameters["sage"].default is None
     assert run_parameters["sage"].default is None
@@ -928,6 +954,7 @@ def test_attention_ts_context_paged_one_shot_exposes_fixed_table_contract() -> N
         "output_scale": 1.0,
         "out_dtype": None,
         "out": None,
+        "sinks": None,
     }
 
     assert tuple(parameters) == (*required_parameters, *keyword_only_defaults)
@@ -1053,8 +1080,9 @@ def test_attention_ts_context_paged_one_shot_forwards_fixed_table_to_wrapper(
     assert run_args[3] is qo_indptr
     assert run_args[4] is block_tables
     assert run_args[5] is seq_lens_kv
-    assert tuple(run_kwargs) == ("out",)
+    assert tuple(run_kwargs) == ("out", "sinks")
     assert run_kwargs["out"] is out
+    assert run_kwargs["sinks"] is None
 
 
 def _enable_paged_one_shot_cpu_validation(monkeypatch) -> None:
@@ -1442,7 +1470,9 @@ def test_attention_ts_context_rejects_cta_starts_for_non_variable_mask() -> None
     empty_i32 = torch.empty(1, dtype=torch.int32)
     wrapper = BatchPrefillTSWrapper()
     wrapper._plan_state = context_module._ContextPlanState(
-        geometry=SimpleNamespace(packed=False, mask_type="dense", vc=None),
+        geometry=SimpleNamespace(
+            packed=False, mask_type="dense", vc=None, use_attention_sinks=False
+        ),
         scale_softmax_log2=torch.empty(1),
         output_scale=torch.empty(1),
         empty_i32=empty_i32,
@@ -1776,6 +1806,7 @@ def test_attention_ts_context_paged_run_validate_false_bypasses_validators(
             output_dtype=out.dtype,
             uniform_packed_lengths=True,
             has_q_offset=False,
+            use_attention_sinks=False,
         ),
         scale_softmax_log2=torch.empty(1),
         output_scale=torch.empty(1),
@@ -1830,7 +1861,9 @@ def test_attention_ts_context_paged_run_rejects_invalid_runtime_scale_values(
     wrapper = BatchPrefillPagedTSWrapper()
     wrapper._plan_state = context_module._PagedContextPlanState(
         geometry=SimpleNamespace(
-            device=torch.device("cpu"), output_dtype=torch.float32
+            device=torch.device("cpu"),
+            output_dtype=torch.float32,
+            use_attention_sinks=False,
         ),
         scale_softmax_log2=torch.tensor((0.25,), dtype=torch.float32),
         output_scale=torch.tensor((0.5,), dtype=torch.float32),
@@ -1876,7 +1909,9 @@ def test_attention_ts_context_paged_run_forwards_valid_scales(
     wrapper = BatchPrefillPagedTSWrapper()
     wrapper._plan_state = context_module._PagedContextPlanState(
         geometry=SimpleNamespace(
-            device=torch.device("cpu"), output_dtype=torch.float32
+            device=torch.device("cpu"),
+            output_dtype=torch.float32,
+            use_attention_sinks=False,
         ),
         scale_softmax_log2=plan_scale_softmax_log2,
         output_scale=plan_output_scale,
@@ -1915,6 +1950,7 @@ def test_attention_ts_context_paged_run_forwards_valid_scales(
         qo_indptr,
         block_tables,
         seq_lens_kv,
+        None,  # sinks
     )
     assert all(
         actual is expected
@@ -1942,7 +1978,9 @@ def test_attention_ts_context_paged_run_rejects_non_bool_validate() -> None:
     wrapper = BatchPrefillPagedTSWrapper()
     wrapper._plan_state = context_module._PagedContextPlanState(
         geometry=SimpleNamespace(
-            device=torch.device("cpu"), output_dtype=torch.float32
+            device=torch.device("cpu"),
+            output_dtype=torch.float32,
+            use_attention_sinks=False,
         ),
         scale_softmax_log2=torch.empty(1),
         output_scale=torch.empty(1),
@@ -5733,3 +5771,395 @@ def test_paged_swa_d192_full_head_stage(monkeypatch, qkv_dtype, output_dtype):
         _check_paged_head_paired_window(192, True, qkv_dtype, 777, 511, output_dtype)
     finally:
         context_module._get_compiled_paged_context.cache_clear()
+
+
+# ---------------------------------------------------------------------------
+# Attention sinks
+# ---------------------------------------------------------------------------
+
+
+def _make_sinks(num_heads: int, *, seed: int, center: float = 4.0) -> torch.Tensor:
+    """Per-head sink logits around the log-sum-exp of a few hundred keys.
+
+    Centered near the scores' log-sum-exp so the sink takes a large and
+    head-dependent share of the denominator: a head swapped for another, or a
+    sink dropped from the sum, changes the output well beyond the tolerance.
+    """
+
+    generator = torch.Generator(device="cuda").manual_seed(seed)
+    return center + 3.0 * torch.randn(
+        num_heads, generator=generator, device="cuda", dtype=torch.float32
+    )
+
+
+def _with_sinks(case: _ContextCase, *, seed: int) -> _ContextCase:
+    """Return ``case`` with sinks and scores that reach their logit range."""
+
+    # Without larger scores a sink of this size would leave the softmax alone.
+    case = replace(case, q=(case.q.float() * 4.0).to(case.q.dtype))
+    sinks = _make_sinks(int(case.q.shape[-2]), seed=seed)
+    case = replace(case, sinks=sinks)
+    # A sink that barely moves the output would not tell a head swapped for
+    # another, or a sink dropped from the sum.
+    base = _context_reference(replace(case, sinks=None))
+    effect = torch.linalg.vector_norm(_context_reference(case) - base)
+    assert float(effect / torch.linalg.vector_norm(base)) > 0.05
+    return case
+
+
+_SINK_CASES = (
+    pytest.param(
+        dict(
+            q_lengths=(300, 300),
+            k_lengths=(300, 300),
+            num_qo_heads=4,
+            num_kv_heads=4,
+            qkv_dtype=torch.bfloat16,
+            packed=False,
+            mask_type="dense",
+        ),
+        id="fixed-dense-mha-bf16",
+    ),
+    pytest.param(
+        dict(
+            q_lengths=(512,),
+            k_lengths=(512,),
+            num_qo_heads=8,
+            num_kv_heads=2,
+            qkv_dtype=torch.bfloat16,
+            packed=False,
+            mask_type="causal",
+        ),
+        id="fixed-causal-gqa4-bf16",
+    ),
+    pytest.param(
+        dict(
+            q_lengths=(130, 257, 64),
+            k_lengths=(200, 300, 64),
+            num_qo_heads=6,
+            num_kv_heads=2,
+            qkv_dtype=torch.float16,
+            packed=True,
+            mask_type="causal",
+        ),
+        id="packed-causal-offset-gqa3-fp16",
+    ),
+    pytest.param(
+        dict(
+            q_lengths=(333, 200),
+            k_lengths=(333, 450),
+            num_qo_heads=4,
+            num_kv_heads=2,
+            qkv_dtype=torch.bfloat16,
+            packed=True,
+            mask_type="dense",
+        ),
+        id="packed-dense-gqa2-bf16",
+    ),
+    pytest.param(
+        dict(
+            q_lengths=(400, 700),
+            k_lengths=(400, 700),
+            num_qo_heads=4,
+            num_kv_heads=2,
+            qkv_dtype=torch.bfloat16,
+            packed=True,
+            mask_type="causal",
+            window_left=96,
+        ),
+        id="packed-window-head-paired-bf16",
+    ),
+    pytest.param(
+        dict(
+            q_lengths=(384,),
+            k_lengths=(384,),
+            num_qo_heads=4,
+            num_kv_heads=4,
+            qkv_dtype=torch.bfloat16,
+            packed=False,
+            mask_type="causal",
+            head_dim=256,
+        ),
+        id="fixed-causal-d256-bf16",
+    ),
+    pytest.param(
+        dict(
+            q_lengths=(300, 300),
+            k_lengths=(300, 300),
+            num_qo_heads=4,
+            num_kv_heads=4,
+            qkv_dtype=torch.bfloat16,
+            packed=False,
+            mask_type="dense",
+            pv_dtype=_FP8,
+        ),
+        id="fixed-dense-pv-fp8",
+    ),
+    pytest.param(
+        dict(
+            q_lengths=(257, 130),
+            k_lengths=(257, 300),
+            num_qo_heads=4,
+            num_kv_heads=2,
+            qkv_dtype=torch.bfloat16,
+            packed=True,
+            mask_type="causal",
+            pv_dtype=_FP8,
+        ),
+        id="packed-causal-pv-fp8",
+    ),
+)
+
+
+def _make_sink_case(spec: dict, *, seed: int) -> _ContextCase:
+    """Build the case of one ``_SINK_CASES`` entry, with sinks."""
+
+    spec = dict(spec)
+    pv_dtype = spec.pop("pv_dtype", None)
+    case = _make_context_case(
+        output_dtype=torch.bfloat16 if pv_dtype is _FP8 else None,
+        output_scale=1.0,
+        device="cuda",
+        seed=seed,
+        **spec,
+    )
+    if pv_dtype is _FP8:
+        case = replace(case, v=case.v.to(_FP8))
+    return _with_sinks(case, seed=seed + 1)
+
+
+@pytest.mark.parametrize("spec", _SINK_CASES)
+@pytest.mark.arch_blackwell
+@_REQUIRES_CONTEXT_GPU
+def test_attention_ts_context_sinks_match_reference(spec):
+    """Sinks join each row's denominator per head, for every kernel flavor.
+
+    Covers the single and the head-paired work tile (windowed GQA maps its two
+    stages to adjacent heads), packed offsets, the PV-FP8 P scale and D256.
+    """
+
+    case = _make_sink_case(spec, seed=2026102901)
+    wrapper = BatchPrefillTSWrapper()
+    _plan_wrapper(wrapper, case)
+    _assert_context_correct(_run_wrapper(wrapper, case), case)
+
+
+@pytest.mark.parametrize("two_cta", (False, True), ids=("single-cta", "two-cta"))
+@pytest.mark.arch_blackwell
+@_REQUIRES_CONTEXT_GPU
+def test_attention_ts_context_sinks_two_cta(monkeypatch, two_cta):
+    """Both CTAs of a cluster read the sink of the head they share."""
+
+    monkeypatch.setattr(
+        context_module, "_default_two_cta_umma", lambda device_index, qk_bits: two_cta
+    )
+    case = _make_sink_case(
+        dict(
+            q_lengths=(1100, 1100),
+            k_lengths=(1100, 1100),
+            num_qo_heads=4,
+            num_kv_heads=2,
+            qkv_dtype=torch.bfloat16,
+            packed=False,
+            mask_type="dense",
+        ),
+        seed=2026102903,
+    )
+    wrapper = BatchPrefillTSWrapper()
+    _plan_wrapper(wrapper, case)
+    assert wrapper._plan_state is not None
+    if two_cta:
+        assert dict(wrapper._plan_state.policy)["scheduler"] == "nonpersistent"
+    _assert_context_correct(_run_wrapper(wrapper, case), case)
+
+
+@pytest.mark.arch_blackwell
+@_REQUIRES_CONTEXT_GPU
+def test_attention_ts_context_sinks_extreme_logits():
+    """A dominant, an absent and a -inf sink leave finite, correct rows."""
+
+    case = _make_sink_case(
+        dict(
+            q_lengths=(256,),
+            k_lengths=(256,),
+            num_qo_heads=4,
+            num_kv_heads=4,
+            qkv_dtype=torch.bfloat16,
+            packed=False,
+            mask_type="causal",
+        ),
+        seed=2026102905,
+    )
+    case = replace(
+        case, sinks=torch.tensor([60.0, -60.0, -float("inf"), 0.0], device="cuda")
+    )
+    wrapper = BatchPrefillTSWrapper()
+    _plan_wrapper(wrapper, case)
+    actual = _run_wrapper(wrapper, case)
+    _assert_context_correct(actual, case)
+    # Head 0's sink outweighs every key by e^50 or more, so its rows vanish.
+    assert float(actual[..., 0, :].abs().max()) < 1e-4
+    # Head 2's -inf sink is no sink at all.
+    torch.testing.assert_close(
+        actual[..., 2, :].float(),
+        _context_reference(replace(case, sinks=None))[..., 2, :],
+        rtol=2e-2,
+        atol=1e-2,
+    )
+
+
+@pytest.mark.parametrize(
+    "spec",
+    (
+        dict(
+            q_lengths=(130, 257),
+            k_lengths=(200, 300),
+            num_qo_heads=4,
+            num_kv_heads=2,
+            qk_dtype=torch.bfloat16,
+            mask_type="causal",
+            page_size=64,
+        ),
+        dict(
+            q_lengths=(200, 90),
+            k_lengths=(200, 300),
+            num_qo_heads=4,
+            num_kv_heads=2,
+            qk_dtype=torch.bfloat16,
+            mask_type="causal",
+            window_left=64,
+            page_size=32,
+        ),
+        dict(
+            q_lengths=(256,),
+            k_lengths=(256,),
+            num_qo_heads=4,
+            num_kv_heads=4,
+            qk_dtype=torch.bfloat16,
+            v_dtype=_FP8,
+            mask_type="dense",
+            page_size=32,
+            output_dtype=torch.bfloat16,
+        ),
+    ),
+    ids=("causal-gqa2", "window-head-paired", "pv-fp8"),
+)
+@pytest.mark.arch_blackwell
+@_REQUIRES_CONTEXT_GPU
+def test_attention_ts_context_paged_sinks_match_reference(spec):
+    """The paged kernel applies the same per-head sinks."""
+
+    case = _make_paged_context_case(
+        head_dim=128, output_scale=1.0, seed=2026102906, **spec
+    )
+    case = replace(case, reference=_with_sinks(case.reference, seed=2026102907))
+    wrapper = BatchPrefillPagedTSWrapper()
+    metadata = _plan_paged_wrapper(wrapper, case)
+    actual = _run_paged_wrapper(wrapper, case, metadata)
+    _assert_context_correct(actual, case.reference)
+
+
+@pytest.mark.arch_blackwell
+@_REQUIRES_CONTEXT_GPU
+def test_attention_ts_context_one_shot_sinks_match_wrapper():
+    """The one-shot entry points forward ``sinks`` to a sink plan."""
+
+    case = _make_sink_case(_SINK_CASES[1].values[0], seed=2026102908)
+    _assert_context_correct(_run_one_shot(case), case)
+
+    paged = _make_paged_context_case(
+        q_lengths=(130, 257),
+        k_lengths=(200, 300),
+        num_qo_heads=4,
+        num_kv_heads=2,
+        head_dim=128,
+        qk_dtype=torch.bfloat16,
+        mask_type="causal",
+        page_size=64,
+        output_scale=1.0,
+        seed=2026102910,
+    )
+    reference = _with_sinks(paged.reference, seed=2026102911)
+    metadata = _make_native_paged_metadata(paged)
+    actual = batch_prefill_with_paged_kv_cache(
+        reference.q,
+        paged.k_cache,
+        paged.v_cache,
+        paged.qo_indptr,
+        metadata.block_tables,
+        metadata.seq_lens_kv,
+        page_size=64,
+        mask_type="causal",
+        sinks=reference.sinks,
+    )
+    _assert_context_correct(actual, reference)
+
+
+@pytest.mark.arch_blackwell
+@_REQUIRES_CONTEXT_GPU
+def test_attention_ts_context_sinks_replay_reads_live_values():
+    """A captured launch reads the sink buffer at replay, not at capture."""
+
+    case = _make_sink_case(_SINK_CASES[0].values[0], seed=2026102912)
+    wrapper = BatchPrefillTSWrapper()
+    _plan_wrapper(wrapper, case)
+    out = torch.empty_like(case.q)
+    wrapper.run(case.q, case.k, case.v, out=out, sinks=case.sinks, validate=False)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        wrapper.run(case.q, case.k, case.v, out=out, sinks=case.sinks, validate=False)
+    for seed in (2026102914, 2026102915):
+        case.sinks.copy_(_make_sinks(int(case.sinks.numel()), seed=seed))
+        graph.replay()
+        torch.cuda.synchronize()
+        _assert_context_correct(out, case)
+
+
+@pytest.mark.arch_blackwell
+@_REQUIRES_CONTEXT_GPU
+def test_attention_ts_context_sinks_contract():
+    """Sink presence follows the plan; the sink tensor is validated."""
+
+    case = _make_sink_case(_SINK_CASES[0].values[0], seed=2026102916)
+    sinks = case.sinks
+
+    plain = BatchPrefillTSWrapper()
+    _plan_wrapper(plain, replace(case, sinks=None))
+    with pytest.raises(ValueError, match="has_sinks"):
+        _run_wrapper(plain, case)
+
+    wrapper = BatchPrefillTSWrapper()
+    _plan_wrapper(wrapper, case)
+    with pytest.raises(ValueError, match="has_sinks"):
+        _run_wrapper(wrapper, replace(case, sinks=None))
+    with pytest.raises(TypeError, match="float32"):
+        _run_wrapper(wrapper, replace(case, sinks=sinks.to(torch.bfloat16)))
+    with pytest.raises(ValueError, match="shape"):
+        _run_wrapper(wrapper, replace(case, sinks=sinks[:3]))
+    with pytest.raises(ValueError, match="NaN"):
+        _run_wrapper(wrapper, replace(case, sinks=torch.full_like(sinks, float("nan"))))
+    with pytest.raises(ValueError, match="contiguous|compact"):
+        _run_wrapper(
+            wrapper, replace(case, sinks=torch.stack([sinks, sinks], -1)[:, 0])
+        )
+
+
+def test_attention_ts_context_sinks_reject_vc_and_sage():
+    """Both keep their row max in units the sink term does not follow."""
+
+    with pytest.raises(NotImplementedError, match="sinks"):
+        BatchPrefillTSWrapper().plan(
+            device="cuda",
+            batch_size=1,
+            max_seq_len_q=128,
+            max_kv_len=128,
+            num_qo_heads=4,
+            num_kv_heads=4,
+            head_dim=128,
+            q_dtype=torch.bfloat16,
+            k_dtype=torch.bfloat16,
+            v_dtype=_FP8,
+            vc_config=context_module.VCAttentionConfig(),
+            has_sinks=True,
+        )

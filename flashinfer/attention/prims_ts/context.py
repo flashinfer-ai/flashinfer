@@ -171,6 +171,8 @@ class _ContextPlanGeometry:
     # The plan's Sage recipe, part of the compile identity; ``None`` without
     # Sage attention.
     sage: SageAttentionConfig | None = None
+    # Whether every run supplies per-head attention sink logits.
+    use_attention_sinks: bool = False
 
 
 @dataclass(frozen=True)
@@ -214,6 +216,8 @@ class _PagedContextPlanGeometry:
     has_q_offset: bool
     paged_v_tail_is_zero: bool
     packed_dense_k_mask: bool
+    # Whether every run supplies per-head attention sink logits.
+    use_attention_sinks: bool = False
 
 
 @dataclass(frozen=True)
@@ -270,6 +274,7 @@ class _ContextCompileSpec:
     vc: Optional[VCAttentionConfig] = None
     # A Sage plan's prepared scale layout; the kernel reads the scales.
     sage_scale_layout: _SageScaleLayout | None = None
+    use_attention_sinks: bool = False
 
 
 @dataclass(frozen=True)
@@ -294,6 +299,7 @@ class _PagedContextCompileSpec:
     paged_v_tail_is_zero: bool
     packed_dense_k_mask: bool
     scheduler: _ContextScheduler
+    use_attention_sinks: bool = False
 
 
 def _make_context_kernel(
@@ -1911,6 +1917,7 @@ def _context_compile_spec(geometry: _ContextPlanGeometry) -> _ContextCompileSpec
         sage_scale_layout=(
             _context_sage_layout(geometry) if geometry.sage is not None else None
         ),
+        use_attention_sinks=geometry.use_attention_sinks,
     )
 
 
@@ -1937,6 +1944,7 @@ def _paged_context_compile_spec(
         paged_v_tail_is_zero=geometry.paged_v_tail_is_zero,
         packed_dense_k_mask=geometry.packed_dense_k_mask,
         scheduler=_resolve_paged_context_scheduler(geometry),
+        use_attention_sinks=geometry.use_attention_sinks,
     )
 
 
@@ -2024,6 +2032,7 @@ def _get_compiled_context(
         )
     fmha.cfg.has_varlen = packed
     fmha.cfg.has_uniform_varlen = uniform_packed_lengths
+    fmha.cfg.use_attention_sinks = compile_spec.use_attention_sinks
     if vc_qk8:
         # The QK8 scale tables are addressed with the fixed plan lengths, the K/V
         # rows including the repair tiles.
@@ -2062,6 +2071,7 @@ def _get_compiled_context(
         vc_q_scale: cute.Tensor | None,
         vc_k_scale: cute.Tensor | None,
         sage_scales: cute.Tensor | None,
+        sinks: cute.Tensor | None,
         stream: cuda_drv.CUstream,
         static_max_active_clusters: cutlass.Constexpr[int],
         static_packed: cutlass.Constexpr[bool],
@@ -2092,6 +2102,7 @@ def _get_compiled_context(
                 vc_q_scale=vc_q_scale,
                 vc_k_scale=vc_k_scale,
                 vc_repair_tiles=static_vc_repair_tiles,
+                sinks=sinks,
             )
         else:
             fmha(
@@ -2111,6 +2122,7 @@ def _get_compiled_context(
                 vc_k_scale=vc_k_scale,
                 vc_repair_tiles=static_vc_repair_tiles,
                 sage_scales=sage_scales,
+                sinks=sinks,
             )
 
     def fake_compact(dtype, shape, assumed_align):
@@ -2216,6 +2228,12 @@ def _get_compiled_context(
         if sage_scale_layout is not None
         else None
     )
+    # The per-head sink logits, one FP32 per query head.
+    sinks_fake = (
+        fake_compact(cutlass.Float32, (num_qo_heads,), 4)
+        if compile_spec.use_attention_sinks
+        else None
+    )
     stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
 
     # Task objects carry loop-local state through generated control flow, so
@@ -2238,6 +2256,7 @@ def _get_compiled_context(
             vc_q_scale_fake,
             vc_k_scale_fake,
             sage_scales_fake,
+            sinks_fake,
             stream_fake,
             max_active_clusters,
             packed,
@@ -2333,6 +2352,7 @@ def _get_compiled_paged_context(
     )
     fmha.cfg.has_varlen = True
     fmha.cfg.has_uniform_varlen = uniform_packed_lengths
+    fmha.cfg.use_attention_sinks = compile_spec.use_attention_sinks
     if uniform_packed_lengths:
         fmha.cfg.uniform_seq_len_q = max_seq_len_q
         fmha.cfg.uniform_seq_len_k = max_kv_len
@@ -2359,6 +2379,7 @@ def _get_compiled_paged_context(
         qo_indptr: cute.Tensor,
         block_tables: cute.Tensor,
         seq_lens_kv: cute.Tensor,
+        sinks: cute.Tensor | None,
         stream: cuda_drv.CUstream,
         static_max_active_clusters: cutlass.Constexpr[int],
         static_max_seq_len_q: cutlass.Constexpr[int],
@@ -2378,6 +2399,7 @@ def _get_compiled_paged_context(
             max_seqlen_k=cutlass.Int32(static_max_kv_len),
             block_tables=block_tables,
             seq_lens_kv=seq_lens_kv,
+            sinks=sinks,
         )
 
     def fake_compact(dtype, shape, assumed_align):
@@ -2423,6 +2445,11 @@ def _get_compiled_paged_context(
         assumed_align=4,
     )
     seq_lens_fake = fake_compact(cutlass.Int32, (batch_size,), 4)
+    sinks_fake = (
+        fake_compact(cutlass.Float32, (num_qo_heads,), 4)
+        if compile_spec.use_attention_sinks
+        else None
+    )
     stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
 
     def compile_kernel():
@@ -2437,6 +2464,7 @@ def _get_compiled_paged_context(
             qo_indptr_fake,
             block_tables_fake,
             seq_lens_fake,
+            sinks_fake,
             stream_fake,
             max_active_clusters,
             max_seq_len_q,
@@ -2767,6 +2795,29 @@ def _validate_runtime_scale_tensor(
     _validate_scale(scale.item(), name)
 
 
+def _validate_runtime_sinks(
+    sinks: torch.Tensor,
+    *,
+    num_qo_heads: int,
+    device: torch.device,
+) -> None:
+    """Validate the per-head attention sink logits of one run."""
+
+    _validate_tensor(sinks, "sinks")
+    if sinks.device != device:
+        raise ValueError(f"sinks must be on {device}, got {sinks.device}")
+    if sinks.dtype != torch.float32:
+        raise TypeError("sinks must have dtype torch.float32")
+    if tuple(sinks.shape) != (num_qo_heads,):
+        raise ValueError(
+            f"sinks must have shape [{num_qo_heads}], got {tuple(sinks.shape)}"
+        )
+    _validate_compact(sinks, "sinks", "[Hq]")
+    _validate_alignment(sinks, "sinks", 4)
+    if torch.isnan(sinks).any().item():
+        raise ValueError("sinks must not contain NaN")
+
+
 def _prepare_out(
     out: Optional[torch.Tensor],
     *,
@@ -2848,6 +2899,7 @@ class BatchPrefillTSWrapper:
         output_scale: float = 1.0,
         vc_config: Optional[VCAttentionConfig] = None,
         sage: Optional[SageAttentionConfig] = None,
+        has_sinks: bool = False,
     ) -> None:
         """Compile one reusable specialization from explicit static geometry.
 
@@ -2919,8 +2971,18 @@ class BatchPrefillTSWrapper:
             head-dim-128 plan with ``float8_e4m3fn`` Q/K, or ``int8`` Q/K on
             SM100a, ``float8_e4m3fn`` V and a 16-bit output. Every ``run``
             then supplies the scales as ``SageAttentionParams``.
+        has_sinks : bool
+            Whether every :meth:`run` supplies per-head attention sink logits
+            (``sinks=``). Each head's sink joins the softmax denominator of all
+            its rows without contributing a value, so the output is scaled by
+            ``1 / (1 + exp(sink - lse))`` against a sink-free run. Not
+            supported together with ``vc_config`` or ``sage``.
         """
 
+        if has_sinks and (vc_config is not None or sage is not None):
+            raise NotImplementedError(
+                "attention sinks are not supported with VC-Attention or Sage"
+            )
         if out_dtype is not None:
             resolved_out_dtype = out_dtype
         elif sage is not None:
@@ -2958,7 +3020,7 @@ class BatchPrefillTSWrapper:
                 "vc_config requires a dense contiguous fixed-length plan; VC-Attention "
                 "has no packed, causal or variable-window kernel"
             )
-        geometry = replace(geometry, vc=vc_config)
+        geometry = replace(geometry, vc=vc_config, use_attention_sinks=bool(has_sinks))
         if sm_scale is None:
             sm_scale = 1.0 / math.sqrt(geometry.head_dim)
         sm_scale = _validate_scale(sm_scale, "sm_scale")
@@ -3059,6 +3121,7 @@ class BatchPrefillTSWrapper:
         output_scale: Optional[torch.Tensor] = None,
         vc: Optional[VCAttentionParams] = None,
         sage: Optional[SageAttentionParams] = None,
+        sinks: Optional[torch.Tensor] = None,
         validate: bool = True,
     ) -> torch.Tensor:
         """Launch the compiled specialization with per-request tensors.
@@ -3097,6 +3160,13 @@ class BatchPrefillTSWrapper:
             and, when the recipe sets ``v_mean``, ``v_mean``); required by a
             Sage plan and rejected by any other. The prepare that gathers them
             into the plan's buffer runs on the current stream ahead of attention.
+        sinks : torch.Tensor, optional
+            Per-head attention sink logits, contiguous CUDA ``float32`` of shape
+            ``[num_qo_heads]``. Required by a plan with ``has_sinks=True`` and
+            rejected by any other. Like the softmax scale, a sink is a logit
+            after scaling: ``sm_scale`` does not multiply it. Caller-owned, it
+            must stay alive until the launch completes, including graph
+            replays. ``validate=True`` also rejects NaN, which synchronizes.
         validate : bool
             Validate tensor structure and metadata values. Disable only when
             the caller guarantees these contracts. Output must not overlap
@@ -3162,6 +3232,15 @@ class BatchPrefillTSWrapper:
                 geometry,
                 qo_indptr=qo_indptr,
                 kv_indptr=kv_indptr,
+            )
+        if (sinks is not None) != geometry.use_attention_sinks:
+            raise ValueError(
+                "sinks=... is required by a plan with has_sinks=True and "
+                "rejected by a plan without it"
+            )
+        if sinks is not None and validate:
+            _validate_runtime_sinks(
+                sinks, num_qo_heads=geometry.num_qo_heads, device=geometry.device
             )
         if (sage is None) != (state.sage is None):
             raise ValueError(
@@ -3275,6 +3354,7 @@ class BatchPrefillTSWrapper:
             vc_q_scale,
             vc_k_scale,
             runtime_sage_scales,
+            sinks,
         )
         return out
 
@@ -3344,6 +3424,7 @@ class BatchPrefillPagedTSWrapper:
         uniform_packed_lengths: bool = False,
         has_q_offset: bool = True,
         paged_v_tail_is_zero: bool = False,
+        has_sinks: bool = False,
     ) -> None:
         """Compile one reusable specialization from explicit static geometry.
 
@@ -3418,6 +3499,10 @@ class BatchPrefillPagedTSWrapper:
             Whether unused rows in every active final V-cache page are
             guaranteed to contain zero. Setting this to ``True`` compiles out
             the consumer-side V-tail clear. Defaults to ``False``.
+        has_sinks : bool
+            Whether every :meth:`run` supplies per-head attention sink logits
+            (``sinks=``); see :meth:`BatchPrefillTSWrapper.plan`. Defaults to
+            ``False``.
         """
 
         resolved_out_dtype = q_dtype if out_dtype is None else out_dtype
@@ -3445,6 +3530,7 @@ class BatchPrefillPagedTSWrapper:
             has_q_offset=has_q_offset,
             paged_v_tail_is_zero=paged_v_tail_is_zero,
         )
+        geometry = replace(geometry, use_attention_sinks=bool(has_sinks))
         if sm_scale is None:
             sm_scale = 1.0 / math.sqrt(geometry.head_dim)
         sm_scale = _validate_scale(sm_scale, "sm_scale")
@@ -3486,6 +3572,7 @@ class BatchPrefillPagedTSWrapper:
         out: Optional[torch.Tensor] = None,
         scale_softmax_log2: Optional[torch.Tensor] = None,
         output_scale: Optional[torch.Tensor] = None,
+        sinks: Optional[torch.Tensor] = None,
         validate: bool = True,
     ) -> torch.Tensor:
         """Launch the compiled specialization with per-run request metadata.
@@ -3541,6 +3628,10 @@ class BatchPrefillPagedTSWrapper:
         output_scale : torch.Tensor, optional
             Per-run one-element float32 output scale. Defaults to the scale
             retained by the plan.
+        sinks : torch.Tensor, optional
+            Per-head attention sink logits, contiguous CUDA ``float32`` of shape
+            ``[num_qo_heads]``; required by a plan with ``has_sinks=True`` and
+            rejected by any other. See :meth:`BatchPrefillTSWrapper.run`.
         validate : bool
             Run explicit storage, shape, dtype, device, scale, output, and
             metadata-value validators. Disable only when the caller guarantees
@@ -3560,6 +3651,15 @@ class BatchPrefillPagedTSWrapper:
         if not isinstance(validate, bool):
             raise TypeError("validate must be a bool")
         geometry = state.geometry
+        if (sinks is not None) != geometry.use_attention_sinks:
+            raise ValueError(
+                "sinks=... is required by a plan with has_sinks=True and "
+                "rejected by a plan without it"
+            )
+        if sinks is not None and validate:
+            _validate_runtime_sinks(
+                sinks, num_qo_heads=geometry.num_qo_heads, device=geometry.device
+            )
         if validate:
             _validate_paged_runtime_inputs(q, k_cache, v_cache, geometry)
             _validate_paged_runtime_metadata(
@@ -3601,6 +3701,7 @@ class BatchPrefillPagedTSWrapper:
             qo_indptr,
             block_tables,
             seq_lens_kv,
+            sinks,
         )
         return out
 
@@ -3623,6 +3724,7 @@ def batch_prefill(
     out: Optional[torch.Tensor] = None,
     vc: Optional[VCAttentionParams] = None,
     vc_config: Optional[VCAttentionConfig] = None,
+    sinks: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Run one-shot fixed or packed-ragged task-scheduled context attention.
 
@@ -3662,6 +3764,9 @@ def batch_prefill(
         otherwise the query dtype.
     out : torch.Tensor, optional
         Caller-owned output tensor.
+    sinks : torch.Tensor, optional
+        Per-head attention sink logits, contiguous CUDA ``float32`` of shape
+        ``[num_qo_heads]``; see :meth:`BatchPrefillTSWrapper.run`.
 
     Returns
     -------
@@ -3726,6 +3831,7 @@ def batch_prefill(
         sm_scale=sm_scale,
         output_scale=output_scale,
         vc_config=vc_config,
+        has_sinks=sinks is not None,
     )
     return wrapper.run(
         q,
@@ -3737,6 +3843,7 @@ def batch_prefill(
         variable_window_token_ends=variable_window_token_ends,
         out=out,
         vc=vc,
+        sinks=sinks,
     )
 
 
@@ -3757,6 +3864,7 @@ def batch_prefill_with_paged_kv_cache(
     output_scale: float = 1.0,
     out_dtype: Optional[torch.dtype] = None,
     out: Optional[torch.Tensor] = None,
+    sinks: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Run one-shot packed-Q context attention over separate HND page pools.
 
@@ -3804,6 +3912,9 @@ def batch_prefill_with_paged_kv_cache(
         otherwise the query dtype.
     out : torch.Tensor, optional
         Caller-owned output tensor.
+    sinks : torch.Tensor, optional
+        Per-head attention sink logits, contiguous CUDA ``float32`` of shape
+        ``[num_qo_heads]``; see :meth:`BatchPrefillTSWrapper.run`.
 
     Returns
     -------
@@ -3857,6 +3968,7 @@ def batch_prefill_with_paged_kv_cache(
         uniform_packed_lengths=geometry.uniform_packed_lengths,
         has_q_offset=geometry.has_q_offset,
         paged_v_tail_is_zero=geometry.paged_v_tail_is_zero,
+        has_sinks=sinks is not None,
     )
     return wrapper.run(
         q,
@@ -3866,6 +3978,7 @@ def batch_prefill_with_paged_kv_cache(
         block_tables,
         seq_lens_kv,
         out=out,
+        sinks=sinks,
     )
 
 

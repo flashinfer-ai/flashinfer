@@ -398,7 +398,13 @@ runtime tensors alive until every graph using that plan is destroyed.
   value to enable it.
 - Positive windows are restricted to even-ratio GQA because the kernel pairs
   query heads that share a K/V head.
-- Attention sinks and custom masks are not exposed. Q and K must share one
+- Attention sinks (`has_sinks=True` in `plan`,
+  FP32 `sinks[Hq]` in `run`) are supported on the contiguous and paged plans,
+  except together with VC-Attention or Sage. Each head's logit is a post-scale
+  logit that joins the softmax denominator of all its rows without a value: the
+  correction warps add `exp2(sink * log2(e) - scale_softmax_log2 * row_max)`,
+  times the PV-side P scale, to the final row sum.
+- Custom masks are not exposed. Q and K must share one
   dtype; the mixed combinations are `torch.bfloat16` Q/K with
   `torch.float8_e4m3fn` V, and a Sage plan's `torch.int8` Q/K with
   `torch.float8_e4m3fn` V.
