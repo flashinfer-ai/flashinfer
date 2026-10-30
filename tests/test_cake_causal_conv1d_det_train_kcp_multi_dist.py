@@ -13,8 +13,8 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
-Multi-GPU rows of ``cake_causal_conv1d_kcp_multi`` (FlashInfer issue #7815): the q / k / v convolutions of a layer
-with one halo exchange per direction, against one ``cake_causal_conv1d_kcp`` call per tensor.  ``W`` ranks over NCCL,
+Multi-GPU rows of ``cake_causal_conv1d_det_multi_kcp`` (FlashInfer issue #7815): the q / k / v convolutions of a layer
+with one halo exchange per direction, against one ``cake_causal_conv1d_det_kcp`` call per tensor.  ``W`` ranks over NCCL,
 each holding the fragments of one partition of a packed batch (contiguous, zigzag, per-document zigzag, ragged tables
 with a zero-token rank, one-token fragments and a fragment that reads its history from three predecessor ranks).  Per
 row and rank:
@@ -28,7 +28,7 @@ row and rank:
 - the multi handle retains exactly the n history pools (``nbytes`` and the allocator's bytes after the forward);
 - ``graph="replay"`` of the multi forward / backward is bitwise the eager single calls on every call.
 
-Launch forms as ``test_cake_causal_conv1d_train_kcp_dist.py``: ``torch.multiprocessing`` (``pytest``: skipped when
+Launch forms as ``test_cake_causal_conv1d_det_train_kcp_dist.py``: ``torch.multiprocessing`` (``pytest``: skipped when
 fewer than ``W`` CUDA devices are visible) and one process per Slurm task (``SLURM_NTASKS == W``; the rendezvous from
 ``MASTER_ADDR`` / ``MASTER_PORT``; rows of another ``W`` are skipped under a multi-task step).
 """
@@ -46,7 +46,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from tests.test_cake_causal_conv1d_train_kcp_dist import (
+from tests.test_cake_causal_conv1d_det_train_kcp_dist import (
     _free_port,
     _local,
     _partition,
@@ -148,8 +148,9 @@ def _report(W: int, row, flags: dict, info: dict, result_dir, rank: int, tag: st
 def _run_rank(rank: int, W: int, row, port: int, result_dir, local_id: int) -> dict:
     from torch.utils.checkpoint import checkpoint
 
-    from flashinfer import cake_causal_conv1d_train as conv
-    from flashinfer.cake_causal_conv1d_train_backend import kcp as conv_kcp
+    from flashinfer import cake_causal_conv1d_det_train as conv
+    from flashinfer import cake_causal_conv1d_det_train_kcp as kcp_api
+    from flashinfer.cake_causal_conv1d_det_train_backend import kcp as conv_kcp
 
     Cs = row[3]
     n = len(Cs)
@@ -165,11 +166,11 @@ def _run_rank(rank: int, W: int, row, port: int, result_dir, local_id: int) -> d
         def fn(*args):
             a_x, a_w, a_h = args[:n], args[n : 2 * n], args[2 * n :]
             if multi:
-                return conv.cake_causal_conv1d_kcp_multi(
+                return kcp_api.cake_causal_conv1d_det_multi_kcp(
                     a_x, a_w, c, recompute_handle=a_h[0]
                 )
             return tuple(
-                conv.cake_causal_conv1d_kcp(x, w, c, recompute_handle=h)
+                kcp_api.cake_causal_conv1d_det_kcp(x, w, c, recompute_handle=h)
                 for x, w, h in zip(a_x, a_w, a_h, strict=True)
             )
 
@@ -198,7 +199,7 @@ def _run_rank(rank: int, W: int, row, port: int, result_dir, local_id: int) -> d
 
                 def outer(*args):
                     hh = (
-                        [conv_kcp.KcpRecomputeHandle()]
+                        [conv_kcp.RecomputeHandleDetKcp()]
                         if mode == "nested_in"
                         else list(args[2 * n :])
                     )
@@ -233,19 +234,23 @@ def _run_rank(rank: int, W: int, row, port: int, result_dir, local_id: int) -> d
     info: dict[str, object] = {"n_hist_rows": n_hist, "T_r": int(xs[0].shape[0])}
     s_direct, cs_direct = run(False, "direct")
     s_plain, cs_plain = run(False, "ckpt")
-    s_hds = [conv_kcp.KcpRecomputeHandle() for _ in range(n)]
+    s_hds = [conv_kcp.RecomputeHandleDetKcp() for _ in range(n)]
     s_handle, cs_handle = run(False, "ckpt", s_hds)
     m_direct, cm_direct = run(True, "direct")
     m_plain, cm_plain = run(True, "ckpt")
-    m_hd = conv_kcp.KcpRecomputeHandle()
+    m_hd = conv_kcp.RecomputeHandleDetKcp()
     m_handle, cm_handle = run(True, "ckpt", [m_hd])
     m_plain_re, cm_plain_re = run(True, "ckpt", reentrant=True)
     m_handle_re, cm_handle_re = run(
-        True, "ckpt", [conv_kcp.KcpRecomputeHandle()], reentrant=True
+        True, "ckpt", [conv_kcp.RecomputeHandleDetKcp()], reentrant=True
     )
-    m_twice, cm_twice = run(True, "ckpt", [conv_kcp.KcpRecomputeHandle()], twice=True)
-    m_nest_out, cm_nest_out = run(True, "nested_out", [conv_kcp.KcpRecomputeHandle()])
-    m_nest_in, cm_nest_in = run(True, "nested_in", [conv_kcp.KcpRecomputeHandle()])
+    m_twice, cm_twice = run(
+        True, "ckpt", [conv_kcp.RecomputeHandleDetKcp()], twice=True
+    )
+    m_nest_out, cm_nest_out = run(
+        True, "nested_out", [conv_kcp.RecomputeHandleDetKcp()]
+    )
+    m_nest_in, cm_nest_in = run(True, "nested_in", [conv_kcp.RecomputeHandleDetKcp()])
     info["counts"] = {
         "single_direct": cs_direct,
         "single_plain": cs_plain,
@@ -268,7 +273,7 @@ def _run_rank(rank: int, W: int, row, port: int, result_dir, local_id: int) -> d
                 part,
                 rank,
                 cu,
-                conv.cake_causal_conv1d(xs_all[i].to(device), ws[i], cu_dev),
+                conv.cake_causal_conv1d_det(xs_all[i].to(device), ws[i], cu_dev),
             ),
         )
         for i in range(n)
@@ -317,7 +322,7 @@ def _run_rank(rank: int, W: int, row, port: int, result_dir, local_id: int) -> d
     )
     # retained bytes after a checkpointed forward: the n history pools with a handle, 0 without
     retained = {}
-    for name, h in (("plain", None), ("handle", conv_kcp.KcpRecomputeHandle())):
+    for name, h in (("plain", None), ("handle", conv_kcp.RecomputeHandleDetKcp())):
         xl, wl = leaves()
         torch.cuda.synchronize(device)
         gc.collect()
@@ -338,7 +343,7 @@ def _run_rank(rank: int, W: int, row, port: int, result_dir, local_id: int) -> d
     gctx = gplan.build_kcp_context(gpart, dist.group.WORLD, rank, device)
     g_single, cg_single = run(False, "direct", c=gctx)
     g_multi, cg_multi = run(True, "direct", c=gctx)
-    g_handle, cg_handle = run(True, "ckpt", [conv_kcp.KcpRecomputeHandle()], c=gctx)
+    g_handle, cg_handle = run(True, "ckpt", [conv_kcp.RecomputeHandleDetKcp()], c=gctx)
     info["counts"]["gdn_ctx"] = {
         "single_direct": cg_single,
         "multi_direct": cg_multi,
@@ -361,22 +366,22 @@ def _run_rank_graph(
 ) -> dict:
     """``graph="replay"`` of the multi forward / backward: eager, capture, replay -- bitwise the eager single calls on
     every call; a rank without tokens is never captured (it joins each collective eagerly)."""
-    from flashinfer.cake_causal_conv1d_train_backend import kcp as conv_kcp
+    from flashinfer.cake_causal_conv1d_det_train_backend import kcp as conv_kcp
 
     device, part, cu, ctx, xs_all, xs, ws, dys = _setup(rank, W, row, port, local_id)
     ref = []
     for x, w, dy in zip(xs, ws, dys, strict=True):
-        y, hist = conv_kcp.cake_causal_conv1d_kcp_forward(x, w, ctx)
-        dx, dw = conv_kcp.cake_causal_conv1d_kcp_backward(x, w, ctx, dy, hist)
+        y, hist = conv_kcp.cake_causal_conv1d_det_forward_kcp(x, w, ctx)
+        dx, dw = conv_kcp.cake_causal_conv1d_det_backward_kcp(x, w, ctx, dy, hist)
         ref.append((y, hist, dx, dw))
     events, ok = [], True
     try:
         for _ in range(4):
-            ys, hists = conv_kcp.cake_causal_conv1d_kcp_multi_forward(
+            ys, hists = conv_kcp.cake_causal_conv1d_det_multi_forward_kcp(
                 xs, ws, ctx, graph="replay"
             )
             events.append(conv_kcp.LAST_CALL["fwd_multi"]["graph_event"])
-            dxs, dws = conv_kcp.cake_causal_conv1d_kcp_multi_backward(
+            dxs, dws = conv_kcp.cake_causal_conv1d_det_multi_backward_kcp(
                 xs, ws, ctx, dys, hists, graph="replay"
             )
             events.append(conv_kcp.LAST_CALL["bwd_multi"]["graph_event"])
@@ -440,7 +445,7 @@ def _launch(row, graph: bool) -> None:
         assert report["pass"], report
         return
     if not _supported():
-        pytest.skip("cake_causal_conv1d_train needs a supported CUDA device")
+        pytest.skip("cake_causal_conv1d_det_train needs a supported CUDA device")
     if torch.cuda.device_count() < W:
         pytest.skip(f"{W} CUDA devices required, {torch.cuda.device_count()} visible")
     with tempfile.TemporaryDirectory(prefix="cake_conv_kcp_multi_dist_") as tmp:

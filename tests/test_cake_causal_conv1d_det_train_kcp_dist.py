@@ -13,7 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
-Multi-GPU rows of ``cake_causal_conv1d_kcp`` under ``torch.utils.checkpoint`` with and without a recompute handle
+Multi-GPU rows of ``cake_causal_conv1d_det_kcp`` under ``torch.utils.checkpoint`` with and without a recompute handle
 (FlashInfer issues #7815 / #7818): ``W`` ranks over NCCL, each holding the fragments of one partition of a packed
 batch (contiguous, zigzag, per-document zigzag, ragged tables with a zero-token rank, one-token fragments and a
 fragment that reads its history from three predecessor ranks).  Per row and rank:
@@ -203,8 +203,9 @@ def _run_rank(
 ) -> dict:
     from torch.utils.checkpoint import checkpoint
 
-    from flashinfer import cake_causal_conv1d_train as conv
-    from flashinfer.cake_causal_conv1d_train_backend import kcp as conv_kcp
+    from flashinfer import cake_causal_conv1d_det_train as conv
+    from flashinfer import cake_causal_conv1d_det_train_kcp as kcp_api
+    from flashinfer.cake_causal_conv1d_det_train_backend import kcp as conv_kcp
     from flashinfer.experimental.cake_kda_train import cake_kcp_plan as plan
 
     lengths, _w, layout, C = row
@@ -233,7 +234,7 @@ def _run_rank(
         ), w.detach().clone().requires_grad_(True)
 
     def fn(x_, w_, h_):
-        return conv.cake_causal_conv1d_kcp(x_, w_, ctx, recompute_handle=h_)
+        return kcp_api.cake_causal_conv1d_det_kcp(x_, w_, ctx, recompute_handle=h_)
 
     def run(mode: str, handle=None, *, twice: bool = False, reentrant: bool = False):
         """mode: direct | ckpt | nested_out (handle outside both regions) | nested_in (handle made in the outer)."""
@@ -259,7 +260,7 @@ def _run_rank(
                 def outer(x_, w_, h_):
                     # the product with ones saves a tensor of the outer region (so the outer recompute runs) and
                     # changes no bit of y or of its gradient
-                    hh = conv_kcp.KcpRecomputeHandle() if mode == "nested_in" else h_
+                    hh = conv_kcp.RecomputeHandleDetKcp() if mode == "nested_in" else h_
                     yi = checkpoint(fn, x_, w_, hh, use_reentrant=False)
                     return yi * torch.ones_like(yi)
 
@@ -300,10 +301,10 @@ def _run_rank(
     info: dict[str, object] = {"n_hist_rows": n_hist, "T_r": int(x.shape[0])}
     direct, c_direct = run("direct")
     plain, c_plain = run("ckpt")
-    hd = conv_kcp.KcpRecomputeHandle()
+    hd = conv_kcp.RecomputeHandleDetKcp()
     withh, c_h = run("ckpt", hd)
     plain_re, c_plain_re = run("ckpt", reentrant=True)
-    hd_re = conv_kcp.KcpRecomputeHandle()
+    hd_re = conv_kcp.RecomputeHandleDetKcp()
     withh_re, c_h_re = run("ckpt", hd_re, reentrant=True)
     info["counts"] = {
         "direct": c_direct,
@@ -314,7 +315,7 @@ def _run_rank(
     }
     # anchor: y is the single-rank zero-history convolution of the whole pack on this rank's tokens
     cu_dev = torch.tensor(cu, dtype=torch.int32, device=device)
-    y_single = conv.cake_causal_conv1d(x_all.to(device), w, cu_dev)
+    y_single = conv.cake_causal_conv1d_det(x_all.to(device), w, cu_dev)
     flags["y_eq_single_rank"] = same(direct["y"], _local(part, rank, cu, y_single))
     flags["plain_eq_direct"] = eq(plain, direct)
     flags["handle_eq_plain"] = eq(withh, plain)
@@ -340,7 +341,7 @@ def _run_rank(
         and hd.entries["conv"]["hist"].shape == (n_hist, C)
     )
     # retain_graph: the entry is replayed again, no collective; exactly twice the gradients
-    hd2 = conv_kcp.KcpRecomputeHandle()
+    hd2 = conv_kcp.RecomputeHandleDetKcp()
     twice, c_twice = run("ckpt", hd2, twice=True)
     info["counts"]["handle_twice"] = c_twice
     flags["twice_accumulates"] = (
@@ -349,8 +350,8 @@ def _run_rank(
         and c_twice["calls"] == {"orig": 1, "recompute": 0, "bwd": 2}
     )
     # nested checkpoints
-    nest_out, c_nest_out = run("nested_out", conv_kcp.KcpRecomputeHandle())
-    nest_in, c_nest_in = run("nested_in", conv_kcp.KcpRecomputeHandle())
+    nest_out, c_nest_out = run("nested_out", conv_kcp.RecomputeHandleDetKcp())
+    nest_in, c_nest_in = run("nested_in", conv_kcp.RecomputeHandleDetKcp())
     info["counts"]["nested_out"], info["counts"]["nested_in"] = c_nest_out, c_nest_in
     flags["nested_out_bitwise"] = eq(nest_out, direct)
     flags["nested_in_bitwise"] = eq(nest_in, direct)
@@ -369,7 +370,7 @@ def _run_rank(
     }
     # retained bytes after a checkpointed forward (after the warm-up above): the history pool with a handle, 0 without
     retained = {}
-    for name, h in (("plain", None), ("handle", conv_kcp.KcpRecomputeHandle())):
+    for name, h in (("plain", None), ("handle", conv_kcp.RecomputeHandleDetKcp())):
         xl, wl = leaves()
         torch.cuda.synchronize(device)
         gc.collect()
@@ -423,11 +424,11 @@ def _free_port() -> int:
 def _supported() -> bool:
     if not torch.cuda.is_available():
         return False
-    from flashinfer.cake_causal_conv1d_train import (
-        is_cake_causal_conv1d_train_supported,
+    from flashinfer.cake_causal_conv1d_det_train import (
+        is_cake_causal_conv1d_det_train_supported,
     )
 
-    return is_cake_causal_conv1d_train_supported(torch.device("cuda"))
+    return is_cake_causal_conv1d_det_train_supported(torch.device("cuda"))
 
 
 @pytest.mark.parametrize("row", ROWS, ids=_row_id)
@@ -451,7 +452,7 @@ def test_recompute_handle_rows(row) -> None:
         assert report["pass"], report
         return
     if not _supported():
-        pytest.skip("cake_causal_conv1d_train needs a supported CUDA device")
+        pytest.skip("cake_causal_conv1d_det_train needs a supported CUDA device")
     if torch.cuda.device_count() < W:
         pytest.skip(f"{W} CUDA devices required, {torch.cuda.device_count()} visible")
     with tempfile.TemporaryDirectory(prefix="cake_conv_kcp_dist_") as tmp:

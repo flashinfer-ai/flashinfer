@@ -28,9 +28,9 @@ import pytest
 
 from tests.test_helpers.cake_package import cake_package
 
-cake_build = cake_package("cake_causal_conv1d_train", "cake_build")
-cake_jit = cake_package("cake_causal_conv1d_train", "cake_jit")
-kcp_jit = cake_package("cake_causal_conv1d_train", "kcp_jit")
+cake_build = cake_package("cake_causal_conv1d_det_train", "cake_build")
+cake_jit = cake_package("cake_causal_conv1d_det_train", "cake_jit")
+kcp_jit = cake_package("cake_causal_conv1d_det_train", "kcp_jit")
 
 PACKAGE_DIR = Path(cake_build.__file__).parent
 ARCHES = ("sm_100a", "sm_103a", "sm_107a")
@@ -70,7 +70,7 @@ HEAD_PLAN = [
 
 # program name -> (module, build keywords, arches, role, plan, ctas_per_sm)
 PROGRAMS = {
-    "cake_causal_conv1d_train_675940a7a4fc0dba4b53": (
+    "cake_causal_conv1d_det_train_675940a7a4fc0dba4b53_kcp": (
         FWD,
         {},
         ARCHES,
@@ -78,7 +78,7 @@ PROGRAMS = {
         FWD_PLAN,
         4,
     ),
-    "cake_causal_conv1d_train_5288d132a5cc927ae729": (
+    "cake_causal_conv1d_det_train_5288d132a5cc927ae729_kcp": (
         BWD,
         {"vec": 8, "copy": "tma2d"},
         ("sm_100a", "sm_103a"),
@@ -86,7 +86,7 @@ PROGRAMS = {
         BWD_TMA_PLAN,
         3,
     ),
-    "cake_causal_conv1d_train_6ea6d5fc9e7fa3f2d039": (
+    "cake_causal_conv1d_det_train_6ea6d5fc9e7fa3f2d039_kcp": (
         BWD,
         {"vec": 8, "min_blocks": 2},
         ("sm_107a",),
@@ -94,7 +94,7 @@ PROGRAMS = {
         BWD_PLAN,
         2,
     ),
-    "cake_causal_conv1d_train_7485529a1755e5bd3036": (
+    "cake_causal_conv1d_det_train_7485529a1755e5bd3036_kcp": (
         BWD,
         {"vec": 8, "copy": "tma2d", "stage_tokens": 8, "min_blocks": 2},
         ARCHES,
@@ -102,7 +102,7 @@ PROGRAMS = {
         BWD_TMA_PLAN,
         2,
     ),
-    "cake_causal_conv1d_train_17cd42fb05079bbbf840": (
+    "cake_causal_conv1d_det_train_17cd42fb05079bbbf840_kcp": (
         HEAD,
         {},
         ARCHES,
@@ -119,7 +119,7 @@ def _identity(module: str, kwargs: dict) -> str:
     digest = hashlib.sha256(
         json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
-    return f"cake_causal_conv1d_train_{digest[:20]}"
+    return f"cake_causal_conv1d_det_train_{digest[:20]}_kcp"
 
 
 @pytest.mark.cpu_only
@@ -171,16 +171,18 @@ def test_routes_and_selection() -> None:
     for arch in ARCHES:
         routes = kcp_jit.ROUTES[arch]
         assert set(routes) == set(kcp_jit.KINDS)
-        assert routes["kcp_fwd"] == ["cake_causal_conv1d_train_675940a7a4fc0dba4b53"]
+        assert routes["kcp_fwd"] == [
+            "cake_causal_conv1d_det_train_675940a7a4fc0dba4b53_kcp"
+        ]
         assert routes["kcp_bwd_head"] == [
-            "cake_causal_conv1d_train_17cd42fb05079bbbf840"
+            "cake_causal_conv1d_det_train_17cd42fb05079bbbf840_kcp"
         ]
         fallback = (
-            "cake_causal_conv1d_train_6ea6d5fc9e7fa3f2d039"
+            "cake_causal_conv1d_det_train_6ea6d5fc9e7fa3f2d039_kcp"
             if arch == "sm_107a"
-            else "cake_causal_conv1d_train_5288d132a5cc927ae729"
+            else "cake_causal_conv1d_det_train_5288d132a5cc927ae729_kcp"
         )
-        big = "cake_causal_conv1d_train_7485529a1755e5bd3036"
+        big = "cake_causal_conv1d_det_train_7485529a1755e5bd3036_kcp"
         assert routes["kcp_bwd"] == [fallback, big]
         assert kcp_jit.route_modules(arch, "kcp_bwd") == (fallback, big)
         assert kcp_jit.select_rule(kcp_jit.MODULES[big]) == {
@@ -197,7 +199,7 @@ def test_routes_and_selection() -> None:
             routes["kcp_fwd"][0],
         )
         assert kcp_jit.workspace_record(arch)["role"] == "kcp_bwd"
-    head = kcp_jit.MODULES["cake_causal_conv1d_train_17cd42fb05079bbbf840"]
+    head = kcp_jit.MODULES["cake_causal_conv1d_det_train_17cd42fb05079bbbf840_kcp"]
     assert kcp_jit.head_grid(head, n_frag=3, C=4096) == (3 * 4, 1, 1)
     assert kcp_jit.head_grid(head, n_frag=0, C=4096) == (1, 1, 1)
 

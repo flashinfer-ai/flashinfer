@@ -26,7 +26,7 @@ import types
 import pytest
 import torch
 
-from flashinfer.cake_causal_conv1d_train_backend import kcp as conv_kcp
+from flashinfer.cake_causal_conv1d_det_train_backend import kcp as conv_kcp
 
 
 @pytest.mark.cpu_only
@@ -174,9 +174,9 @@ def test_graph_public_keyword_mode_and_key(monkeypatch) -> None:
     w = torch.empty(16, 4, dtype=torch.float32)
     ctx = types.SimpleNamespace(T_r=8, n_frag=1, world_size=1)
     for call in (  # validated on the caller's frame, before any device work
-        lambda: conv_kcp.cake_causal_conv1d_kcp(x, w, ctx, graph="capture"),
-        lambda: conv_kcp.cake_causal_conv1d_kcp_forward(x, w, ctx, graph="capture"),
-        lambda: conv_kcp.cake_causal_conv1d_kcp_backward(
+        lambda: conv_kcp.cake_causal_conv1d_det_kcp(x, w, ctx, graph="capture"),
+        lambda: conv_kcp.cake_causal_conv1d_det_forward_kcp(x, w, ctx, graph="capture"),
+        lambda: conv_kcp.cake_causal_conv1d_det_backward_kcp(
             x, w, ctx, x, x, graph="capture"
         ),
     ):
@@ -271,8 +271,8 @@ def test_host_trim_ffi_device_and_cpu_refusal(monkeypatch) -> None:
 
 @pytest.mark.cpu_only
 def test_recompute_handle_object() -> None:
-    h = conv_kcp.KcpRecomputeHandle()
-    assert conv_kcp.KcpRecomputeHandle.__slots__ == ("entries",)
+    h = conv_kcp.RecomputeHandleDetKcp()
+    assert conv_kcp.RecomputeHandleDetKcp.__slots__ == ("entries",)
     assert h.entries == {} and h.nbytes() == 0
     with pytest.raises(AttributeError):
         h.other = 1
@@ -283,7 +283,7 @@ def test_recompute_handle_object() -> None:
     h.clear()
     assert h.entries == {} and h.nbytes() == 0
     assert conv_kcp.HANDLE_KEY == "conv"
-    assert {"KcpRecomputeHandle", "HANDLE_KEY"} <= set(conv_kcp.__all__)
+    assert {"RecomputeHandleDetKcp", "HANDLE_KEY"} <= set(conv_kcp.__all__)
 
 
 @pytest.mark.cpu_only
@@ -301,18 +301,18 @@ def test_recompute_handle_phase_and_entry_rules() -> None:
         @staticmethod
         def backward(fctx, g):
             seen["in_backward"] = conv_kcp._kcp_in_backward()
-            seen["empty"] = conv_kcp._handle_lookup(conv_kcp.KcpRecomputeHandle())
+            seen["empty"] = conv_kcp._handle_lookup(conv_kcp.RecomputeHandleDetKcp())
             seen["entry"] = conv_kcp._handle_lookup(full)
             return g
 
-    full = conv_kcp.KcpRecomputeHandle()
+    full = conv_kcp.RecomputeHandleDetKcp()
     full.entries["conv"] = {"hist": torch.zeros(1, 8, dtype=torch.bfloat16)}
     t = torch.zeros(4, requires_grad=True)
     Probe.apply(t).sum().backward()
     assert seen["in_backward"] is True
     assert seen["empty"] is None
     assert seen["entry"] is full.entries["conv"] and "conv" in full.entries
-    assert conv_kcp._handle_lookup(conv_kcp.KcpRecomputeHandle()) is None
+    assert conv_kcp._handle_lookup(conv_kcp.RecomputeHandleDetKcp()) is None
     with pytest.raises(RuntimeError, match="micro-step"):
         conv_kcp._handle_lookup(full)
     with pytest.raises(TypeError, match="entries"):
@@ -326,7 +326,7 @@ def test_recompute_handle_needs_the_graph_task_binding(monkeypatch) -> None:
     monkeypatch.setattr(conv_kcp, "_GRAPH_TASK_ID_BINDING", None)
     monkeypatch.setattr(conv_kcp, "_GRAPH_TASK_ID_USABLE", None)
     with pytest.raises(RuntimeError, match="_current_graph_task_id"):
-        conv_kcp._handle_lookup(conv_kcp.KcpRecomputeHandle())
+        conv_kcp._handle_lookup(conv_kcp.RecomputeHandleDetKcp())
     with pytest.raises(RuntimeError, match="_current_graph_task_id"):
         conv_kcp._kcp_in_backward()
 
@@ -362,24 +362,28 @@ def test_recompute_handle_hist_validation() -> None:
 
 @pytest.mark.cpu_only
 def test_facade_reexports_the_handle_lazily() -> None:
-    """``flashinfer.cake_causal_conv1d_train.KcpRecomputeHandle`` is the backend's class; importing the facade does not
-    import the KCP host modules (``kcp`` imports torch.distributed; ``kcp_jit``) -- checked in a fresh interpreter;
-    the facade's KCP entry carries the keyword-only ``recompute_handle=None``."""
+    """``flashinfer.cake_causal_conv1d_det_train_kcp.RecomputeHandleDetKcp`` is the backend's class; importing the KCP
+    facade (or the det facade, which keeps the previous KCP names) does not import the KCP host modules (``kcp`` imports
+    torch.distributed; ``kcp_jit``) -- checked in a fresh interpreter; the facade's KCP entry carries the keyword-only
+    ``recompute_handle=None``, and the previous names are the same objects."""
     import subprocess
     import sys
 
     code = (
         "import inspect, sys\n"
-        "import flashinfer.cake_causal_conv1d_train as f\n"
-        "kcp = 'flashinfer.cake_causal_conv1d_train_backend.kcp'\n"
-        "jit = 'flashinfer.cake_causal_conv1d_train_backend.kcp_jit'\n"
+        "import flashinfer.cake_causal_conv1d_det_train_kcp as f\n"
+        "import flashinfer.cake_causal_conv1d_det_train as d\n"
+        "kcp = 'flashinfer.cake_causal_conv1d_det_train_backend.kcp'\n"
+        "jit = 'flashinfer.cake_causal_conv1d_det_train_backend.kcp_jit'\n"
         "assert kcp not in sys.modules and jit not in sys.modules, sorted(m for m in sys.modules if 'kcp' in m)\n"
-        "p = inspect.signature(f.cake_causal_conv1d_kcp).parameters['recompute_handle']\n"
+        "p = inspect.signature(f.cake_causal_conv1d_det_kcp).parameters['recompute_handle']\n"
         "assert p.kind is inspect.Parameter.KEYWORD_ONLY and p.default is None\n"
+        "assert d.cake_causal_conv1d_kcp is f.cake_causal_conv1d_det_kcp\n"
         "assert kcp not in sys.modules\n"
-        "from flashinfer.cake_causal_conv1d_train import KcpRecomputeHandle\n"
-        "from flashinfer.cake_causal_conv1d_train_backend.kcp import KcpRecomputeHandle as B\n"
-        "assert KcpRecomputeHandle is B and 'KcpRecomputeHandle' in f.__all__\n"
+        "from flashinfer.cake_causal_conv1d_det_train_kcp import RecomputeHandleDetKcp\n"
+        "from flashinfer.cake_causal_conv1d_det_train_backend.kcp import RecomputeHandleDetKcp as B\n"
+        "from flashinfer.cake_causal_conv1d_det_train_backend.kcp import KcpRecomputeHandle as C\n"
+        "assert RecomputeHandleDetKcp is B is C is d.KcpRecomputeHandle and 'RecomputeHandleDetKcp' in f.__all__\n"
         "print('FACADE_IMPORT_OK')\n"
     )
     r = subprocess.run(

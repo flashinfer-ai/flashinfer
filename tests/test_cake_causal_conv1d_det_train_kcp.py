@@ -13,7 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
-Single-GPU tests of ``cake_causal_conv1d_kcp`` (FlashInfer issue #6919): one process, world size 1, no process
+Single-GPU tests of ``cake_causal_conv1d_det_kcp`` (FlashInfer issue #6919): one process, world size 1, no process
 group.  The rank holds every fragment of a partitioned problem (the halo exchange of one rank is the identity), so
 the history rows, the backward's head rows and the tail fold all run through the host flow.  Criteria:
 
@@ -41,15 +41,15 @@ import types
 import pytest
 import torch
 
-from flashinfer.cake_causal_conv1d_train import (
-    cake_causal_conv1d_train_backward,
-    cake_causal_conv1d_train_forward,
-    is_cake_causal_conv1d_train_supported,
+from flashinfer.cake_causal_conv1d_det_train import (
+    cake_causal_conv1d_det_train_backward,
+    cake_causal_conv1d_det_train_forward,
+    is_cake_causal_conv1d_det_train_supported,
 )
-from flashinfer.cake_causal_conv1d_train_backend.kcp import (
-    cake_causal_conv1d_kcp,
-    cake_causal_conv1d_kcp_backward,
-    cake_causal_conv1d_kcp_forward,
+from flashinfer.cake_causal_conv1d_det_train_backend.kcp import (
+    cake_causal_conv1d_det_kcp,
+    cake_causal_conv1d_det_backward_kcp,
+    cake_causal_conv1d_det_forward_kcp,
 )
 
 WIDTH = 4
@@ -63,8 +63,8 @@ NOCP_ATOL, NOCP_RTOL = 1e-2, 1e-2
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available()
-    or not is_cake_causal_conv1d_train_supported(torch.device("cuda")),
-    reason="cake_causal_conv1d_train needs a supported CUDA device (SM100 / SM103 / SM107)",
+    or not is_cake_causal_conv1d_det_train_supported(torch.device("cuda")),
+    reason="cake_causal_conv1d_det_train needs a supported CUDA device (SM100 / SM103 / SM107)",
 )
 
 # Rows: (document lengths, fragment lengths over the packed sequence); each fragment is cut at document
@@ -344,8 +344,8 @@ def _bits(t):
 def test_forward_matches_unpartitioned_bitwise(name, lens, cuts, C):
     device = torch.device("cuda")
     p = _problem(lens, cuts, C, device)
-    y_local, hist = cake_causal_conv1d_kcp_forward(p.x_local, p.w, p.ctx)
-    y_global = cake_causal_conv1d_train_forward(p.x, p.w, p.cu)
+    y_local, hist = cake_causal_conv1d_det_forward_kcp(p.x_local, p.w, p.ctx)
+    y_global = cake_causal_conv1d_det_train_forward(p.x, p.w, p.cu)
     torch.cuda.synchronize()
     assert hist.shape[0] == max(1, p.ctx.halo.n_hist_rows)
     assert not y_local.isnan().any()
@@ -366,8 +366,8 @@ def test_backward_matches_reference_and_folds_tails_bitwise(
 ):
     device = torch.device("cuda")
     p = _problem(lens, cuts, C, device)
-    _, hist = cake_causal_conv1d_kcp_forward(p.x_local, p.w, p.ctx)
-    dx_local, dw_local = cake_causal_conv1d_kcp_backward(
+    _, hist = cake_causal_conv1d_det_forward_kcp(p.x_local, p.w, p.ctx)
+    dx_local, dw_local = cake_causal_conv1d_det_backward_kcp(
         p.x_local, p.w, p.ctx, p.dy_local, hist
     )
     torch.cuda.synchronize()
@@ -382,7 +382,7 @@ def test_backward_matches_reference_and_folds_tails_bitwise(
     )
     # (b) dx against the shipped zero-history backward (policy A) on the unpartitioned documents: the elementwise
     # clause for a context-parallel result against the no-CP kernel; the measured difference is recorded.
-    dx_nocp, _ = cake_causal_conv1d_train_backward(p.x, p.w, p.cu, p.dy)
+    dx_nocp, _ = cake_causal_conv1d_det_train_backward(p.x, p.w, p.cu, p.dy)
     stats = _assert_within(
         dx_local,
         dx_nocp[p.l2g],
@@ -395,8 +395,8 @@ def test_backward_matches_reference_and_folds_tails_bitwise(
     # (c) The unpartitioned problem through the same host flow (one fragment per document, no halo rows): the fold
     # of the received dpre rows reproduces its dx bit for bit.
     whole = _problem(lens, tuple(lens), C, device)
-    _, hist_w = cake_causal_conv1d_kcp_forward(whole.x_local, whole.w, whole.ctx)
-    dx_whole, _ = cake_causal_conv1d_kcp_backward(
+    _, hist_w = cake_causal_conv1d_det_forward_kcp(whole.x_local, whole.w, whole.ctx)
+    dx_whole, _ = cake_causal_conv1d_det_backward_kcp(
         whole.x_local, whole.w, whole.ctx, whole.dy_local, hist_w
     )
     torch.cuda.synchronize()
@@ -414,11 +414,11 @@ def test_autograd_function_and_repeat_are_bitwise(name, lens, cuts, C, record_pr
     for _ in range(2):
         x = p.x_local.clone().requires_grad_(True)
         w = p.w.clone().requires_grad_(True)
-        y = cake_causal_conv1d_kcp(x, w, p.ctx)
+        y = cake_causal_conv1d_det_kcp(x, w, p.ctx)
         y.backward(p.dy_local)
         runs.append((y.detach(), x.grad, w.grad))
-    y_direct, hist = cake_causal_conv1d_kcp_forward(p.x_local, p.w, p.ctx)
-    dx_direct, dw_direct = cake_causal_conv1d_kcp_backward(
+    y_direct, hist = cake_causal_conv1d_det_forward_kcp(p.x_local, p.w, p.ctx)
+    dx_direct, dw_direct = cake_causal_conv1d_det_backward_kcp(
         p.x_local, p.w, p.ctx, p.dy_local, hist
     )
     torch.cuda.synchronize()
@@ -441,7 +441,7 @@ def test_autograd_function_and_repeat_are_bitwise(name, lens, cuts, C, record_pr
     _assert_within(dw1, dw_ref, atol=DW_ATOL, rtol=DW_RTOL, label="dw vs FP64 oracle")
     # (b) dx against the shipped zero-history backward (policy A) on the unpartitioned documents under the no-CP
     # clause; the two policies' difference is recorded for the report (it is not a bitwise relation).
-    dx_nocp, _ = cake_causal_conv1d_train_backward(p.x, p.w, p.cu, p.dy)
+    dx_nocp, _ = cake_causal_conv1d_det_train_backward(p.x, p.w, p.cu, p.dy)
     stats = _assert_within(
         dx1, dx_nocp[p.l2g], atol=NOCP_ATOL, rtol=NOCP_RTOL, label="dx vs no-CP kernel"
     )
@@ -455,8 +455,8 @@ def test_empty_rank_returns_empty_outputs():
     ctx, S, _, _ = _context((0,), (0,), device)
     x = torch.empty(0, C, dtype=torch.bfloat16, device=device)
     w = torch.randn(C, WIDTH, device=device)
-    y, hist = cake_causal_conv1d_kcp_forward(x, w, ctx)
-    dx, dw = cake_causal_conv1d_kcp_backward(x, w, ctx, torch.empty_like(x), hist)
+    y, hist = cake_causal_conv1d_det_forward_kcp(x, w, ctx)
+    dx, dw = cake_causal_conv1d_det_backward_kcp(x, w, ctx, torch.empty_like(x), hist)
     assert y.shape == (0, C) and dx.shape == (0, C)
     assert torch.equal(dw, torch.zeros_like(dw))
 
@@ -465,7 +465,7 @@ def test_rejects_mismatched_context():
     device = torch.device("cuda")
     p = _problem((5000, 1003), (1, 2, 4997, 1003), 512, device)
     with pytest.raises(ValueError):
-        cake_causal_conv1d_kcp_forward(p.x_local[:-1].contiguous(), p.w, p.ctx)
+        cake_causal_conv1d_det_forward_kcp(p.x_local[:-1].contiguous(), p.w, p.ctx)
 
 
 def test_kcp_keeps_fp32_taps_and_no_bias():
@@ -475,9 +475,9 @@ def test_kcp_keeps_fp32_taps_and_no_bias():
     device = torch.device("cuda")
     p = _problem((5000, 1003), (1, 2, 4997, 1003), 512, device)
     with pytest.raises(ValueError, match="weight must be torch.float32"):
-        cake_causal_conv1d_kcp_forward(p.x_local, p.w.to(torch.bfloat16), p.ctx)
+        cake_causal_conv1d_det_forward_kcp(p.x_local, p.w.to(torch.bfloat16), p.ctx)
     with pytest.raises(ValueError, match="weight must be torch.float32"):
-        cake_causal_conv1d_kcp_backward(
+        cake_causal_conv1d_det_backward_kcp(
             p.x_local,
             p.w.to(torch.bfloat16),
             p.ctx,
@@ -486,9 +486,9 @@ def test_kcp_keeps_fp32_taps_and_no_bias():
         )
     bias = torch.zeros(p.C, device=device)
     with pytest.raises(TypeError):
-        cake_causal_conv1d_kcp_forward(p.x_local, p.w, p.ctx, bias=bias)
+        cake_causal_conv1d_det_forward_kcp(p.x_local, p.w, p.ctx, bias=bias)
     with pytest.raises(TypeError):
-        cake_causal_conv1d_kcp(p.x_local, p.w, p.ctx, bias)
+        cake_causal_conv1d_det_kcp(p.x_local, p.w, p.ctx, bias)
 
 
 def test_kcp_plans_with_the_legacy_tile_rule(monkeypatch):
@@ -496,8 +496,8 @@ def test_kcp_plans_with_the_legacy_tile_rule(monkeypatch):
     n_ch_tiles) = (128, 1, 2)`` (the training routes tile it as (32, 4, 5)), and the forward's ``y`` stays
     bitwise the unpartitioned forward's."""
 
-    from flashinfer.cake_causal_conv1d_train_backend import cake_jit
-    from flashinfer.cake_causal_conv1d_train_backend import kcp as conv_kcp
+    from flashinfer.cake_causal_conv1d_det_train_backend import cake_jit
+    from flashinfer.cake_causal_conv1d_det_train_backend import kcp as conv_kcp
 
     geometry = {"threads": 128, "vec": 8}
     legacy = cake_jit.plan(5000, 1280, 2, geometry=geometry, legacy=True)
@@ -514,10 +514,12 @@ def test_kcp_plans_with_the_legacy_tile_rule(monkeypatch):
     monkeypatch.setattr(conv_kcp, "plan", recording_plan)
     device = torch.device("cuda")
     p = _problem((5000, 1003), (1, 2, 4997, 1003), 1280, device)
-    y, hist = cake_causal_conv1d_kcp_forward(p.x_local, p.w, p.ctx)
-    dx, dw = cake_causal_conv1d_kcp_backward(p.x_local, p.w, p.ctx, p.dy_local, hist)
+    y, hist = cake_causal_conv1d_det_forward_kcp(p.x_local, p.w, p.ctx)
+    dx, dw = cake_causal_conv1d_det_backward_kcp(
+        p.x_local, p.w, p.ctx, p.dy_local, hist
+    )
     assert len(calls) == 2 and all(call.get("legacy") is True for call in calls), calls
-    y_full = cake_causal_conv1d_train_forward(p.x, p.w, p.cu)
+    y_full = cake_causal_conv1d_det_train_forward(p.x, p.w, p.cu)
     assert torch.equal(y, y_full[p.l2g])
     assert torch.isfinite(dw).all() and dx.shape == p.x_local.shape
 
@@ -529,14 +531,14 @@ def test_graph_replay_knob_is_bitwise(monkeypatch, form) -> None:
     the second is captured and replayed once, later calls replay the graph; ``y`` / ``hist`` / ``dx`` / ``dweight``
     are bitwise the knob-off results on every call.  The backward's key holds the forward's ``hist`` pointer, so
     its capture follows the forward's by one call.  Another input pointer is another key (eager, still bitwise)."""
-    from flashinfer.cake_causal_conv1d_train_backend import kcp as conv_kcp
+    from flashinfer.cake_causal_conv1d_det_train_backend import kcp as conv_kcp
 
     device = torch.device("cuda")
     p = _problem((5000, 1003), (1, 2, 4997, 1003), 512, device)
     x, w, ctx = p.x_local, p.w, p.ctx
     dy = torch.randn(x.shape, device=device).to(torch.bfloat16)
-    y0, hist0 = cake_causal_conv1d_kcp_forward(x, w, ctx)
-    dx0, dw0 = cake_causal_conv1d_kcp_backward(x, w, ctx, dy, hist0)
+    y0, hist0 = cake_causal_conv1d_det_forward_kcp(x, w, ctx)
+    dx0, dw0 = cake_causal_conv1d_det_backward_kcp(x, w, ctx, dy, hist0)
     kw = {}
     if form == "knob":
         monkeypatch.setenv(conv_kcp.TEST_KNOBS_ENV, "1")
@@ -546,10 +548,10 @@ def test_graph_replay_knob_is_bitwise(monkeypatch, form) -> None:
     try:
         events = []
         for _ in range(4):
-            y, hist = cake_causal_conv1d_kcp_forward(x, w, ctx, **kw)
+            y, hist = cake_causal_conv1d_det_forward_kcp(x, w, ctx, **kw)
             events.append(conv_kcp.LAST_CALL["fwd"]["graph_event"])
             assert torch.equal(y, y0) and torch.equal(hist, hist0)
-            dx, dw = cake_causal_conv1d_kcp_backward(x, w, ctx, dy, hist, **kw)
+            dx, dw = cake_causal_conv1d_det_backward_kcp(x, w, ctx, dy, hist, **kw)
             events.append(conv_kcp.LAST_CALL["bwd"]["graph_event"])
             assert torch.equal(dx, dx0) and torch.equal(dw, dw0)
         assert events == [
@@ -563,14 +565,14 @@ def test_graph_replay_knob_is_bitwise(monkeypatch, form) -> None:
             "replay",
         ], events
         assert conv_kcp.GRAPH_STATS["fallback"] == 0
-        y, hist = cake_causal_conv1d_kcp_forward(x.clone(), w, ctx, **kw)
+        y, hist = cake_causal_conv1d_det_forward_kcp(x.clone(), w, ctx, **kw)
         assert conv_kcp.LAST_CALL["fwd"]["graph_event"] == "eager"
         assert torch.equal(y, y0) and torch.equal(hist, hist0)
         if (
             form == "keyword"
         ):  # the autograd entry carries the keyword to the forward and to the backward
             xg = x.clone().requires_grad_(True)
-            y = conv_kcp.cake_causal_conv1d_kcp(xg, w, ctx, graph="replay")
+            y = conv_kcp.cake_causal_conv1d_det_kcp(xg, w, ctx, graph="replay")
             assert conv_kcp.LAST_CALL["fwd"]["graph"] == "replay"
             assert torch.equal(y.detach(), y0)
             y.backward(dy)
@@ -579,7 +581,7 @@ def test_graph_replay_knob_is_bitwise(monkeypatch, form) -> None:
     finally:
         conv_kcp._set_test_knobs(None)
         conv_kcp._GRAPHS.clear()
-    y, hist = cake_causal_conv1d_kcp_forward(x, w, ctx)
+    y, hist = cake_causal_conv1d_det_forward_kcp(x, w, ctx)
     assert torch.equal(y, y0) and torch.equal(hist, hist0)
 
 
@@ -587,7 +589,7 @@ def test_graph_replay_knob_is_bitwise(monkeypatch, form) -> None:
 # Recompute handle (issues #7815 / #7818): torch's checkpoint recompute binds the history pool the original forward
 # stored instead of gathering and exchanging it again.  One rank here (the exchange of one rank is the identity, so
 # the module's ``_exchange`` calls are counted instead of collectives: one in the original forward, one in the
-# backward, none in a recompute with a handle); the NCCL rows are in test_cake_causal_conv1d_train_kcp_dist.py.
+# backward, none in a recompute with a handle); the NCCL rows are in test_cake_causal_conv1d_det_train_kcp_dist.py.
 
 
 class _ExchangeCounter:
@@ -626,19 +628,19 @@ class _ExchangeCounter:
 
 
 def _ckpt_run(p, *, handle=None, reentrant=False, ckpt=True, counter=None, twice=False):
-    """``y`` / ``dx`` / ``dweight`` of ``cake_causal_conv1d_kcp`` (the facade) on the problem ``p``, directly or under a
+    """``y`` / ``dx`` / ``dweight`` of ``cake_causal_conv1d_det_kcp`` (the facade) on the problem ``p``, directly or under a
     checkpoint, with ``recompute_handle=handle``."""
     import contextlib
 
     from torch.utils.checkpoint import checkpoint
 
-    from flashinfer import cake_causal_conv1d_train as facade
+    from flashinfer import cake_causal_conv1d_det_train_kcp as facade
 
     x = p.x_local.clone().requires_grad_(True)
     w = p.w.clone().requires_grad_(True)
 
     def fn(x_, w_, h_):
-        return facade.cake_causal_conv1d_kcp(x_, w_, p.ctx, recompute_handle=h_)
+        return facade.cake_causal_conv1d_det_kcp(x_, w_, p.ctx, recompute_handle=h_)
 
     if not ckpt:
         y = fn(x, w, handle)
@@ -675,12 +677,12 @@ def test_recompute_handle_is_bitwise_and_exchange_free(
     ``y`` / ``dx`` / ``dweight`` are bitwise the plain checkpoint's, the direct pass's and the explicit
     forward / backward calls' (``recompute_handle=None`` is the unchanged path); the handle holds exactly the
     history pool, the saved set's own tensor."""
-    from flashinfer.cake_causal_conv1d_train_backend import kcp as conv_kcp
+    from flashinfer.cake_causal_conv1d_det_train_backend import kcp as conv_kcp
 
     device = torch.device("cuda")
     p = _problem(lens, cuts, C, device)
-    y_e, hist_e = cake_causal_conv1d_kcp_forward(p.x_local, p.w, p.ctx)
-    dx_e, dw_e = cake_causal_conv1d_kcp_backward(
+    y_e, hist_e = cake_causal_conv1d_det_forward_kcp(p.x_local, p.w, p.ctx)
+    dx_e, dw_e = cake_causal_conv1d_det_backward_kcp(
         p.x_local, p.w, p.ctx, p.dy_local, hist_e
     )
     explicit = {"y": y_e, "dx": dx_e, "dw": dw_e}
@@ -688,7 +690,7 @@ def test_recompute_handle_is_bitwise_and_exchange_free(
     plain_cc = _ExchangeCounter(monkeypatch, conv_kcp)
     plain = _ckpt_run(p, reentrant=reentrant, counter=plain_cc)
     monkeypatch.undo()
-    handle = conv_kcp.KcpRecomputeHandle()
+    handle = conv_kcp.RecomputeHandleDetKcp()
     cc = _ExchangeCounter(monkeypatch, conv_kcp)
     conv_kcp.LAST_CALL.pop("recompute_handle", None)
     got = _ckpt_run(p, handle=handle, reentrant=reentrant, counter=cc)
@@ -726,14 +728,16 @@ def test_recompute_handle_retain_graph_and_nested_checkpoints(monkeypatch) -> No
 
     from torch.utils.checkpoint import checkpoint
 
-    from flashinfer import cake_causal_conv1d_train as facade
-    from flashinfer.cake_causal_conv1d_train_backend import kcp as conv_kcp
+    from flashinfer import cake_causal_conv1d_det_train_kcp as facade
+    from flashinfer.cake_causal_conv1d_det_train_backend import kcp as conv_kcp
 
     device = torch.device("cuda")
     p = _problem((5000, 1003), (1, 2, 4997, 1003), 512, device)
     direct = _ckpt_run(p, ckpt=False)
     cc = _ExchangeCounter(monkeypatch, conv_kcp)
-    twice = _ckpt_run(p, handle=conv_kcp.KcpRecomputeHandle(), counter=cc, twice=True)
+    twice = _ckpt_run(
+        p, handle=conv_kcp.RecomputeHandleDetKcp(), counter=cc, twice=True
+    )
     assert cc.table() == {"orig": 1, "recompute": 0, "bwd": 2}
     assert torch.equal(_bits(twice["dx"]), _bits(direct["dx"] + direct["dx"]))
     assert torch.equal(_bits(twice["dw"]), _bits(direct["dw"] + direct["dw"]))
@@ -745,10 +749,10 @@ def test_recompute_handle_retain_graph_and_nested_checkpoints(monkeypatch) -> No
         w = p.w.clone().requires_grad_(True)
 
         def inner(x_, w_, h_):
-            return facade.cake_causal_conv1d_kcp(x_, w_, p.ctx, recompute_handle=h_)
+            return facade.cake_causal_conv1d_det_kcp(x_, w_, p.ctx, recompute_handle=h_)
 
         def outer(x_, w_, h_):
-            hh = conv_kcp.KcpRecomputeHandle() if inside else h_
+            hh = conv_kcp.RecomputeHandleDetKcp() if inside else h_
             yi = checkpoint(inner, x_, w_, hh, use_reentrant=False)
             return yi * torch.ones_like(
                 yi
@@ -758,7 +762,7 @@ def test_recompute_handle_retain_graph_and_nested_checkpoints(monkeypatch) -> No
             outer,
             x,
             w,
-            conv_kcp.KcpRecomputeHandle(),
+            conv_kcp.RecomputeHandleDetKcp(),
             use_reentrant=False,
             context_fn=lambda: (contextlib.nullcontext(), counter.recompute_cm()),
         )
@@ -782,55 +786,63 @@ def test_recompute_handle_misuse_raises() -> None:
     lost its entry before the recompute makes it an original forward again (exchanges, still bitwise)."""
     from torch.utils.checkpoint import checkpoint
 
-    from flashinfer import cake_causal_conv1d_train as facade
-    from flashinfer.cake_causal_conv1d_train_backend import kcp as conv_kcp
+    from flashinfer import cake_causal_conv1d_det_train_kcp as facade
+    from flashinfer.cake_causal_conv1d_det_train_backend import kcp as conv_kcp
 
     device = torch.device("cuda")
     p = _problem((5000, 1003), (1, 2, 4997, 1003), 512, device)
-    handle = conv_kcp.KcpRecomputeHandle()
-    facade.cake_causal_conv1d_kcp(p.x_local, p.w, p.ctx, recompute_handle=handle)
+    handle = conv_kcp.RecomputeHandleDetKcp()
+    facade.cake_causal_conv1d_det_kcp(p.x_local, p.w, p.ctx, recompute_handle=handle)
     assert conv_kcp.LAST_CALL["recompute_handle"] == {"fwd": "capture"}
     with pytest.raises(RuntimeError, match="per call and micro-step"):
-        facade.cake_causal_conv1d_kcp(p.x_local, p.w, p.ctx, recompute_handle=handle)
+        facade.cake_causal_conv1d_det_kcp(
+            p.x_local, p.w, p.ctx, recompute_handle=handle
+        )
     with pytest.raises(ValueError, match="graph='off'"):
-        conv_kcp.cake_causal_conv1d_kcp(
+        conv_kcp.cake_causal_conv1d_det_kcp(
             p.x_local,
             p.w,
             p.ctx,
             graph="replay",
-            recompute_handle=conv_kcp.KcpRecomputeHandle(),
+            recompute_handle=conv_kcp.RecomputeHandleDetKcp(),
         )
     with pytest.raises(TypeError, match="entries"):
-        facade.cake_causal_conv1d_kcp(p.x_local, p.w, p.ctx, recompute_handle=object())
+        facade.cake_causal_conv1d_det_kcp(
+            p.x_local, p.w, p.ctx, recompute_handle=object()
+        )
     graph = torch.cuda.CUDAGraph()
     with pytest.raises(ValueError, match="capture"), torch.cuda.graph(graph):
-        conv_kcp.cake_causal_conv1d_kcp(
-            p.x_local, p.w, p.ctx, recompute_handle=conv_kcp.KcpRecomputeHandle()
+        conv_kcp.cake_causal_conv1d_det_kcp(
+            p.x_local, p.w, p.ctx, recompute_handle=conv_kcp.RecomputeHandleDetKcp()
         )
     del graph
     # the public autograd Function refuses like the wrapper (graph keyword, capture, no entries dict)
-    fresh = conv_kcp.KcpRecomputeHandle()
+    fresh = conv_kcp.RecomputeHandleDetKcp()
     with pytest.raises(ValueError, match="graph='off'"):
-        conv_kcp.CakeCausalConv1dKcpFunction.apply(
+        conv_kcp.CakeCausalConv1dDetFunctionKcp.apply(
             p.x_local, p.w, p.ctx, "replay", fresh
         )
     with pytest.raises(TypeError, match="entries"):
-        conv_kcp.CakeCausalConv1dKcpFunction.apply(
+        conv_kcp.CakeCausalConv1dDetFunctionKcp.apply(
             p.x_local, p.w, p.ctx, None, object()
         )
     graph = torch.cuda.CUDAGraph()
     with pytest.raises(ValueError, match="capture"), torch.cuda.graph(graph):
-        conv_kcp.CakeCausalConv1dKcpFunction.apply(p.x_local, p.w, p.ctx, None, fresh)
+        conv_kcp.CakeCausalConv1dDetFunctionKcp.apply(
+            p.x_local, p.w, p.ctx, None, fresh
+        )
     del graph
     assert not fresh.entries, "a refused call stored an entry"
     # a recompute whose entry belongs to another context / problem raises inside the backward
     other = _problem((5000, 1003), (1, 2, 4997, 1003), 512, device)
     for tamper in ("ctx", "key"):
-        h = conv_kcp.KcpRecomputeHandle()
+        h = conv_kcp.RecomputeHandleDetKcp()
         x = p.x_local.clone().requires_grad_(True)
 
         def fn(x_, h_):
-            return facade.cake_causal_conv1d_kcp(x_, p.w, p.ctx, recompute_handle=h_)
+            return facade.cake_causal_conv1d_det_kcp(
+                x_, p.w, p.ctx, recompute_handle=h_
+            )
 
         y = checkpoint(fn, x, h, use_reentrant=False)
         if tamper == "ctx":
@@ -841,11 +853,11 @@ def test_recompute_handle_misuse_raises() -> None:
             y.backward(p.dy_local)
     # the entry dropped before the recompute: the recompute is an original forward (exchanges and stores)
     direct = _ckpt_run(p, ckpt=False)
-    h = conv_kcp.KcpRecomputeHandle()
+    h = conv_kcp.RecomputeHandleDetKcp()
     x = p.x_local.clone().requires_grad_(True)
     w = p.w.clone().requires_grad_(True)
     y = checkpoint(
-        lambda x_, w_, h_: facade.cake_causal_conv1d_kcp(
+        lambda x_, w_, h_: facade.cake_causal_conv1d_det_kcp(
             x_, w_, p.ctx, recompute_handle=h_
         ),
         x,
@@ -861,21 +873,21 @@ def test_recompute_handle_misuse_raises() -> None:
 
 
 def test_recompute_handle_knob_graph_is_refused(monkeypatch) -> None:
-    from flashinfer.cake_causal_conv1d_train_backend import kcp as conv_kcp
+    from flashinfer.cake_causal_conv1d_det_train_backend import kcp as conv_kcp
 
     device = torch.device("cuda")
     p = _problem((65,), (64, 1), 256, device)
     monkeypatch.setenv(conv_kcp.TEST_KNOBS_ENV, "1")
     conv_kcp._set_test_knobs({"graph": "replay"})
-    handle = conv_kcp.KcpRecomputeHandle()
+    handle = conv_kcp.RecomputeHandleDetKcp()
     try:
         with pytest.raises(ValueError, match="graph='off'"):
-            conv_kcp.cake_causal_conv1d_kcp(
+            conv_kcp.cake_causal_conv1d_det_kcp(
                 p.x_local, p.w, p.ctx, recompute_handle=handle
             )
         # the public autograd Function refuses the knob too
         with pytest.raises(ValueError, match="graph='off'"):
-            conv_kcp.CakeCausalConv1dKcpFunction.apply(
+            conv_kcp.CakeCausalConv1dDetFunctionKcp.apply(
                 p.x_local, p.w, p.ctx, None, handle
             )
     finally:
@@ -888,7 +900,7 @@ def test_recompute_handle_knob_graph_is_refused(monkeypatch) -> None:
 def test_recompute_handle_both_host_paths(monkeypatch, host_trim) -> None:
     """The replay binds the stored pool on the trimmed and on the previous host path alike: bitwise, and no exchange
     in the recompute (the plain checkpoint, the positive control, exchanges once there)."""
-    from flashinfer.cake_causal_conv1d_train_backend import kcp as conv_kcp
+    from flashinfer.cake_causal_conv1d_det_train_backend import kcp as conv_kcp
 
     device = torch.device("cuda")
     p = _problem((1, 2, 3, 57), (3, 30, 30), 384, device)
@@ -902,7 +914,7 @@ def test_recompute_handle_both_host_paths(monkeypatch, host_trim) -> None:
         # the next counter wraps the module's own exchange, not the first counter
         monkeypatch.setattr(conv_kcp, "_exchange", exchange)
         cc = _ExchangeCounter(monkeypatch, conv_kcp)
-        got = _ckpt_run(p, handle=conv_kcp.KcpRecomputeHandle(), counter=cc)
+        got = _ckpt_run(p, handle=conv_kcp.RecomputeHandleDetKcp(), counter=cc)
         assert conv_kcp.LAST_CALL["recompute_handle"] == {"fwd": "replay"}
     finally:
         conv_kcp._set_test_knobs(None)

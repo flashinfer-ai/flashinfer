@@ -43,11 +43,27 @@ stream.
     :toctree: ../generated
 
     cake_causal_conv1d_det
-    cake_causal_conv1d_kcp
-    cake_causal_conv1d_kcp_multi
-    KcpRecomputeHandle
     cake_causal_conv1d_det_train_forward
     cake_causal_conv1d_det_train_backward
     cake_causal_conv1d_det_train_backward_workspace_bytes
     cake_causal_conv1d_det_train_backward_workspace
     CakeCausalConv1dDetFunction
+
+Context-parallel training causal conv1d (Cake)
+----------------------------------------------
+
+The context-parallel (KCP) route of the same convolution: every rank convolves
+its fragments of the packed batch, and the first tokens of a fragment that
+continues a document read the history rows of the preceding fragment through
+the halo collective of the KDA step's context.  ``flashinfer.cake_causal_conv1d_det_train``
+keeps the previous names ``cake_causal_conv1d_kcp``, ``cake_causal_conv1d_kcp_multi``
+and ``KcpRecomputeHandle`` as aliases of the same objects.
+
+.. currentmodule:: flashinfer.cake_causal_conv1d_det_train_kcp
+
+.. autosummary::
+    :toctree: ../generated
+
+    cake_causal_conv1d_det_kcp
+    cake_causal_conv1d_det_multi_kcp
+    RecomputeHandleDetKcp
