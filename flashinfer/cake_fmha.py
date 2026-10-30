@@ -4375,6 +4375,46 @@ def _context_fp8_runtime_serves(
     )
 
 
+# Targets whose power-limited launches (the calls :func:`_context_fp8_runtime_serves`
+# keeps on the JIT module for the board power limit) run the one-stage program
+# of the JIT pack where one query stage holds every query token: the JIT
+# module's tiles then hold an empty second stage, whose products and softmax
+# run at full cost; the one-stage program runs the same arithmetic per query
+# row without them.
+_CONTEXT_FP8_POWER_ONE_STAGE_TARGETS = frozenset({"sm100a"})
+
+
+def _context_fp8_power_one_stage(
+    target: str,
+    batch_size: int,
+    max_q_len: int,
+    max_kv_len: int,
+    num_q_heads: int,
+    num_kv_heads: int,
+    pack_g: int,
+) -> bool:
+    """Whether a causal FP8 call without LSE or sink that no exact route
+    serves, kept on the JIT module by the power limit, runs the one-stage
+    program of the JIT pack ``pack_g`` (a shipped pack whose 128-row stage
+    holds every query token) instead.  Every query row meets the same KV blocks in the same order as
+    in the JIT module's tile of two stages."""
+
+    return (
+        target in _CONTEXT_FP8_POWER_ONE_STAGE_TARGETS
+        and _context_fp8_runtime_pack(pack_g) == pack_g
+        and max_q_len <= 128 // pack_g
+        and not _context_fp8_runtime_serves(
+            target,
+            batch_size,
+            max_q_len,
+            max_kv_len,
+            num_q_heads,
+            num_kv_heads,
+            pack_g,
+        )
+    )
+
+
 # The split planner's cost model per target, in microseconds: the launch's
 # fixed cost, one KV block of a unit, the fixed cost of a unit, the partial
 # store of a split unit, the merge of a tile of k units (MERGE0 + MERGE1 x k)
@@ -5498,6 +5538,31 @@ def select_cake_fmha_context_route(
                 tok_per_stage = 128 // one_stage_pack
                 num_m_blocks = (max_q_len + tok_per_stage - 1) // tok_per_stage
                 total_bh = batch_size * (num_q_heads // one_stage_pack)
+                l2_swizzle = 8 if total_bh % 8 == 0 else 1
+        # An FP8 call the power limit keeps on the JIT module whose query
+        # tokens fit one stage of the JIT pack: the one-stage program of that
+        # pack and the page size (:func:`_context_fp8_power_one_stage`).
+        if (
+            program is None
+            and component == "context_fp8"
+            and one_stage
+            and _context_fp8_power_one_stage(
+                target,
+                batch_size,
+                max_q_len,
+                max_kv_len,
+                num_q_heads,
+                num_kv_heads,
+                pack_g,
+            )
+        ):
+            program = one_stage.get((pack_g, page_size)) or one_stage.get(
+                (pack_g, None)
+            )
+            if program is not None:
+                tok_per_stage = 128 // pack_g
+                num_m_blocks = (max_q_len + tok_per_stage - 1) // tok_per_stage
+                total_bh = batch_size * (num_q_heads // pack_g)
                 l2_swizzle = 8 if total_bh % 8 == 0 else 1
     return CakeFmhaContextRoute(
         target=target,

@@ -451,7 +451,9 @@ def test_cake_fmha_context_widened_classes_route_to_the_row_program(
         ("bf16_b4_q511_k2047", {"max_kv_len": 2048}),
         ("bf16_b4_q511_k2047", {"kv_layout": "NHD"}),
         ("bf16_b4_q257_k1024_page1024", {"max_q_len": 256}),
-        ("fp8_b256_q32_k1024", {"num_kv_heads": 8}),
+        # sm100a, 256 x 8 (request, KV head) streams: the power limit keeps the
+        # JIT module where the query tokens need two stages of its pack
+        ("fp8_b256_q32_k1024", {"num_kv_heads": 8, "max_q_len": 33}),
     ],
 )
 def test_cake_fmha_context_routes_outside_the_programs_keep_the_jit_module(
@@ -701,7 +703,21 @@ def test_cake_fmha_context_fp8_runtime_route(
         assert pack_g % pack == 0 and pack in (1, 2, 4, 8)
         assert route.program == f"RUNTIME_PACK{pack}{_RUNTIME_SUFFIX[target]}"
         assert route.pack_g == pack
+    elif (
+        max_q <= 128 // pack_g and cake_api._context_fp8_runtime_pack(pack_g) == pack_g
+    ):
+        # the power limit keeps the JIT module, whose tiles would hold an empty
+        # second stage: the one-stage program of the JIT pack (sm100a)
+        assert target in cake_api._CONTEXT_FP8_POWER_ONE_STAGE_TARGETS
+        assert cake_api._context_fp8_power_one_stage(
+            target, batch, max_q, max_kv, num_q_heads, num_kv_heads, pack_g
+        )
+        assert route.program == f"RUNTIME_PACK{pack_g}{_RUNTIME_SUFFIX[target]}_Q1"
+        assert route.pack_g == pack_g and route.num_m_blocks == 1
     else:
+        assert not cake_api._context_fp8_power_one_stage(
+            target, batch, max_q, max_kv, num_q_heads, num_kv_heads, pack_g
+        )
         assert route.program is None and route.pack_g == pack_g
 
 
@@ -3838,3 +3854,140 @@ def test_cake_context_one_stage_route_on_the_device(served_programs) -> None:
     route = cake_api.select_cake_fmha_context_route(device, **kwargs)
     assert route.program == f"RUNTIME_PACK1{_RUNTIME_SUFFIX[target]}_Q1", route
     assert (route.pack_g, route.num_m_blocks) == (1, 1)
+
+
+# (q_lens, kv_lens, heads, page_size, shared page table, JIT pack): calls the
+# power limit keeps on the JIT module whose query tokens fit one stage of the
+# JIT pack.
+_POWER_ONE_STAGE_CASES = [
+    # the B256 heads 32/32 rows' form at a small batch, ragged
+    ((32, 32, 17), (2048, 640, 300), (32, 32), 64, True, 1),
+    # few query tokens, separate K / V tables, fewer keys than a block
+    ((4, 1, 3), (1024, 129, 64), (32, 32), 64, False, 1),
+    # 128 query tokens: the whole stage
+    ((128, 100), (1024, 700), (32, 32), 16, True, 1),
+    ((64, 33), (900, 512), (32, 16), 64, True, 2),
+    ((32, 0, 20), (2048, 0, 200), (32, 8), 16, True, 4),
+    ((16, 9), (1024, 300), (32, 4), 16, True, 8),
+]
+
+
+@_GPU
+@pytest.mark.parametrize(
+    ("q_lens", "kv_lens", "heads", "page_size", "shared", "pack"),
+    _POWER_ONE_STAGE_CASES,
+    ids=[
+        f"b{len(c[0])}_q{max(c[0])}_k{max(c[1])}_h{c[2][0]}x{c[2][1]}_p{c[3]}_g{c[5]}"
+        for c in _POWER_ONE_STAGE_CASES
+    ],
+)
+def test_cake_context_power_one_stage_programs_match_the_jit_module_bitwise(
+    monkeypatch, served_programs, q_lens, kv_lens, heads, page_size, shared, pack
+) -> None:
+    """A call the power limit keeps on the JIT module (the predicate set to
+    keep it, the target's power one-stage route on) takes the one-stage
+    program of the JIT pack, whose output bytes are the JIT module's (every
+    query row meets the same KV blocks in the same order), within the FP8
+    contract tolerance of an FP32 reference, the same run to run and for
+    device scales; the ticket reads zero after each launch."""
+
+    device = torch.device("cuda")
+    target = cake_api._cake_fmha_target(device)
+    suffix = "_PAGE64" if page_size == 64 else ""
+    batch = len(q_lens)
+    hq, hkv = heads
+    max_q, max_kv = max(q_lens), max(kv_lens)
+    assert cake_api._context_pack_g(max_q, max_kv, hq, hkv) == pack
+    assert cake_api._context_fp8_runtime_pack(pack) == pack and max_q <= 128 // pack
+    monkeypatch.setattr(cake_api, "_context_fp8_runtime_serves", lambda *args: False)
+    monkeypatch.setattr(
+        cake_api, "_CONTEXT_FP8_POWER_ONE_STAGE_TARGETS", frozenset({target})
+    )
+    generator = torch.Generator(device="cpu").manual_seed(20261030 + max_kv)
+    pages = (max_kv + page_size - 1) // page_size
+    total_pages = 2 * batch * pages
+    query = torch.randn((sum(q_lens), hq, 128), generator=generator).to(
+        device=device, dtype=torch.float8_e4m3fn
+    )
+    key = torch.randn((total_pages, hkv, page_size, 128), generator=generator).to(
+        device=device, dtype=torch.float8_e4m3fn
+    )
+    value = torch.randn((total_pages, hkv, page_size, 128), generator=generator).to(
+        device=device, dtype=torch.float8_e4m3fn
+    )
+    order = torch.randperm(total_pages, generator=generator).to(torch.int32)
+    tables_k = order[: batch * pages].view(batch, pages).to(device)
+    tables_v = (
+        tables_k if shared else order[batch * pages :].view(batch, pages).to(device)
+    )
+    block_tables = tables_k if shared else torch.stack((tables_k, tables_v), dim=1)
+    seq_lens = torch.tensor(kv_lens, dtype=torch.int32, device=device)
+    cum_q = torch.cat(
+        (torch.zeros(1, dtype=torch.int32), torch.tensor(q_lens).cumsum(0).int())
+    ).to(device)
+    cum_kv = torch.cat(
+        (torch.zeros(1, dtype=torch.int32), torch.tensor(kv_lens).cumsum(0).int())
+    ).to(device)
+    workspace = torch.zeros(128 * 1024 * 1024, dtype=torch.uint8, device=device)
+    counter = torch.zeros(
+        get_trtllm_gen_multi_ctas_kv_counter_bytes(
+            batch, hq, get_device_sm_count(device)
+        ),
+        dtype=torch.uint8,
+        device=device,
+    )
+
+    bmm1, bmm2 = _QUANT_SCALES
+
+    def run(device_scales=False):
+        scales = (bmm1, bmm2)
+        if device_scales:
+            scales = tuple(
+                torch.tensor(scale, dtype=torch.float32, device=device)
+                for scale in scales
+            )
+        out = torch.full_like(query, float("nan"))
+        prefill.trtllm_batch_context_with_kv_cache(
+            query,
+            (key, value),
+            workspace,
+            block_tables,
+            seq_lens,
+            max_q,
+            max_kv,
+            *scales,
+            batch,
+            cum_q,
+            cum_kv,
+            out=out,
+            kv_layout="HND",
+            uses_shared_paged_kv_idx=shared,
+            multi_ctas_kv_counter_buffer=counter,
+            backend="cake",
+        )
+        torch.cuda.synchronize()
+        assert not counter.any()
+        return out
+
+    one_stage = f"RUNTIME_PACK{pack}{suffix}{_RUNTIME_SUFFIX[target]}_Q1"
+    out = run()
+    assert served_programs[-1] == one_stage
+    again = run()
+    device_out = run(device_scales=True)
+    assert served_programs[-2:] == [one_stage, one_stage]
+    assert torch.equal(_bits(again), _bits(out))
+    assert torch.equal(_bits(device_out), _bits(out))
+    expected = (
+        _reference_context(
+            query, key, value, tables_k, tables_v, q_lens, kv_lens, scale=bmm1
+        )
+        * bmm2
+    )
+    torch.testing.assert_close(out.float(), expected, atol=0.1, rtol=0.1)
+    monkeypatch.setattr(cake_api, "_CONTEXT_FP8_POWER_ONE_STAGE_TARGETS", frozenset())
+    served = len(served_programs)
+    jit_out = run()
+    assert len(served_programs) == served
+    assert torch.equal(_bits(jit_out), _bits(out)), (
+        f"max abs difference {(jit_out.float() - out.float()).abs().max().item()}"
+    )
