@@ -6272,26 +6272,178 @@ def test_memory_plan_budgets_the_valid_rows():
 
 def test_budget_valid_rows_checks_an_uncompacted_count():
     """The valid rows of a budget call's budget (:func:`_budget_valid_rows`): the compacted rows, else the caller's
-    count, else the labels counted on the host.  ``check=True`` (``check_num_valid_rows``) reads an uncompacted call's
-    labels back and raises the compacted path's ``ValueError`` on a wrong caller's count; without it, and on a
-    compacted call (whose count :func:`given_valid_rows` checks), the caller's count is taken as given."""
+    count (taken as given: the forward checked it with ``check_num_valid_rows``), else the labels counted on the host.
+    The check of an uncompacted call's count (:func:`_check_count_on_host`) reads the labels back and raises the
+    compacted path's ``ValueError`` on a wrong caller's count."""
     inp = _host_inputs(37)
     labels, n = inp.labels.cpu(), int(inp.valid.sum())
     assert 0 < n < inp.T
     rows = opt_in._budget_valid_rows
     assert rows(labels, None, None, False) == n
     assert rows(labels, None, None, True) == inp.T
-    assert rows(labels, inp.valid.nonzero().reshape(-1), n, True, check=True) == n
-    for check in (False, True):
-        assert rows(labels, None, n, False, check=check) == n
+    assert rows(labels, inp.valid.nonzero().reshape(-1), n, True) == n
+    assert rows(labels, None, n, False) == n
+    opt_in._check_count_on_host(labels, n)
     for wrong in (n - 1, n + 1):
-        with pytest.raises(
-            ValueError,
-            match=f"num_valid_rows={wrong} but the labels hold {n} valid rows",
-        ):
-            rows(labels, None, wrong, False, check=True)
+        with _wrong_count(wrong, n):
+            opt_in._check_count_on_host(labels, wrong)
         assert rows(labels, None, wrong, False) == wrong
-        assert rows(labels, None, wrong, True, check=True) == wrong
+        assert rows(labels, None, wrong, True) == wrong
+
+
+def _wrong_count(wrong: int, actual: int):
+    """``pytest.raises`` of the ``ValueError`` of a checked wrong ``num_valid_rows`` (:func:`_check_given_count`)."""
+    return pytest.raises(
+        ValueError,
+        match=re.escape(
+            f"num_valid_rows={wrong} but the labels hold {actual} valid rows (labels >= 0)"
+        ),
+    )
+
+
+def _record_count_checks(monkeypatch) -> list:
+    """Record every check of a caller's ``num_valid_rows`` against the labels' count read back -- each goes through
+    :func:`_check_given_count` (the compacted path's :func:`given_valid_rows`, :func:`_check_count_on_host`):
+    ``(count, actual)`` pairs."""
+    checks: list = []
+    check = opt_in._check_given_count
+
+    def recording(count, actual):
+        checks.append((count, actual))
+        return check(count, actual)
+
+    monkeypatch.setattr(opt_in, "_check_given_count", recording)
+    return checks
+
+
+_TRAINABLE = ((True, True), (True, False), (False, True), (False, False))
+
+
+def _eager_forward(inp, C, entry, *, need_dx=True, need_dw=True, **kw):
+    """The eager forward of ``entry`` (:func:`forward_loss` / :func:`forward_logprob`; ``kw`` passed through)."""
+    if entry == "loss":
+        return opt_in.forward_loss(
+            inp.X,
+            inp.W,
+            inp.labels,
+            objective=inp.objective,
+            loss_div=inp.loss_div if inp.objective == "ce" else None,
+            infer_logp=inp.infer_logp,
+            loss_weights=inp.loss_weights,
+            chunk_size=C,
+            need_dx=need_dx,
+            need_dw=need_dw,
+            **kw,
+        )
+    return opt_in.forward_logprob(inp.X, inp.W, inp.labels, chunk_size=C, **kw)
+
+
+def _assert_count_checked_on_every_path(inp, C, entry, checks, *, backend, modes):
+    """``check_num_valid_rows=True`` on every path of ``entry`` -- compacted or not, each memory mode of ``modes``,
+    every set of trainable inputs (a frozen ``W`` or ``X``, none), the autograd entry, the eager forward and the eager
+    log-probability backward (on the forward's index and recounting) --: a wrong count (``R - 1``, ``R + 1``) raises
+    the compacted path's ``ValueError`` after exactly one check, the right count is checked once and gives the counted
+    call's bits.  Without the flag an uncompacted call checks nothing (its count is not used to index), a compacted
+    one only where the given count always takes its checked form (:func:`_given_count_readback`)."""
+    R = int(inp.valid.sum())
+    assert 0 < R < inp.T
+    readback = int(opt_in._given_count_readback(inp.labels.device))
+    keys = ("loss", "logp", "dX", "dW") if entry == "loss" else ("logp", "dX", "dW")
+
+    def checked(case, call, *args, **kw):
+        """``call(*args, **kw)`` with each count (``R - 1``, ``R + 1``, ``R``) checked: one check per call, the
+        wrong counts raise; returns the right count's result."""
+        out = None
+        for n in (R - 1, R + 1, R):
+            checks.clear()
+            if n == R:
+                out = call(*args, num_valid_rows=n, check_num_valid_rows=True, **kw)
+            else:
+                with _wrong_count(n, R):
+                    call(*args, num_valid_rows=n, check_num_valid_rows=True, **kw)
+            assert checks == [(n, R)], (case, n, checks)
+        return out
+
+    for compact in (None, False):
+        unchecked_reads = readback if compact is None else 0
+        for train_x, train_w in _TRAINABLE:
+            kw = dict(
+                entry=entry,
+                backend=backend,
+                compact_rows=compact,
+                train_x=train_x,
+                train_w=train_w,
+            )
+            counted = _run(inp, C, **kw)
+            for mode in modes:
+                case = ("autograd", compact, mode, train_x, train_w)
+                given = checked(case, _run, inp, C, memory_mode=mode, **kw)
+                _assert_same_bits(counted, given, keys=keys)
+                checks.clear()
+                given = _run(inp, C, memory_mode=mode, num_valid_rows=R, **kw)
+                assert len(checks) == unchecked_reads, (case, checks)
+                _assert_same_bits(counted, given, keys=keys)
+        for need_dx, need_dw in _TRAINABLE if entry == "loss" else _TRAINABLE[:1]:
+            for mode in modes if entry == "loss" else (None,):
+                checked(
+                    ("eager forward", compact, mode, need_dx, need_dw),
+                    _eager_forward,
+                    inp,
+                    C,
+                    entry,
+                    need_dx=need_dx,
+                    need_dw=need_dw,
+                    backend=backend,
+                    compact_rows=compact,
+                    **(dict(memory_mode=mode) if entry == "loss" else {}),
+                )
+        if entry == "loss":
+            continue
+        fwd = _eager_forward(
+            inp, C, entry, backend=backend, compact_rows=compact, num_valid_rows=R
+        )
+        for need_dx, need_dw in _TRAINABLE:
+            for recount in (False, True):
+                bkw = dict(
+                    chunk_size=C,
+                    need_dx=need_dx,
+                    need_dw=need_dw,
+                    backend=backend,
+                    compact_rows=compact,
+                )
+                if not recount:
+                    bkw["row_index"] = fwd.row_index
+                case = ("eager backward", compact, recount, need_dx, need_dw)
+                args = (inp.X, inp.W, inp.labels, fwd.lse, inp.dlogp)
+                checked(case, opt_in.backward_logprob, *args, **bkw)
+                checks.clear()
+                opt_in.backward_logprob(*args, num_valid_rows=R, **bkw)
+                reads = unchecked_reads if (recount and (need_dx or need_dw)) else 0
+                assert len(checks) == reads, (case, checks)
+
+
+@pytest.mark.parametrize("entry", ["loss", "logprob"])
+def test_check_num_valid_rows_checks_every_path(monkeypatch, entry):
+    """``check_num_valid_rows=True`` checks the caller's ``num_valid_rows`` once on every path of the reference backend
+    (:func:`_assert_count_checked_on_every_path`; memory modes ``None`` and ``"fast"``, the opt-in fast form), and an
+    unchecked wrong count of an uncompacted call (not used there) is neither checked nor read back."""
+    checks = _record_count_checks(monkeypatch)
+    inp = _host_inputs(37)
+    _assert_count_checked_on_every_path(
+        inp, 16, entry, checks, backend="reference", modes=(None, "fast")
+    )
+    R = int(inp.valid.sum())
+    for mode in (None, "fast"):
+        checks.clear()
+        _run(
+            inp,
+            16,
+            entry=entry,
+            compact_rows=False,
+            memory_mode=mode,
+            num_valid_rows=R + 1,
+        )
+        assert not checks, (mode, checks)
 
 
 def test_budget_plan_keys():
@@ -8287,8 +8439,8 @@ def test_device_budget_uncompacted_checks_the_callers_count(
 ):
     """An uncompacted budget call (``compact_rows=False``, a third of the labels ignored, T 16384) sizes its budget on
     the caller's ``num_valid_rows``: ``check_num_valid_rows=True`` reads the labels' count back and raises the
-    compacted path's ``ValueError`` on a wrong count (the loss entry in its forward, the log-probability entry in its
-    backward) before planning; the right count plans once, fits and gives the uncompacted fast step's bits."""
+    compacted path's ``ValueError`` on a wrong count (both entries in their forward) before planning; the right count
+    plans once, fits and gives the uncompacted fast step's bits."""
     _require_program(entry=entry)
     _require_recompute()
     plans = _record_budget_plans(monkeypatch)
@@ -8313,6 +8465,61 @@ def test_device_budget_uncompacted_checks_the_callers_count(
     _assert_same_bits(fast, result, keys=keys)
     assert len(plans) == 1 and plans[0].fits and plans[0].budget_bytes < head, plans
     assert peak <= head, (peak, head, plans)
+
+
+@pytest.mark.parametrize("entry", ["loss", "logprob"])
+def test_device_check_num_valid_rows_checks_every_path(glm_weight, monkeypatch, entry):
+    """``check_num_valid_rows=True`` checks the caller's ``num_valid_rows`` once on every path of the generated program
+    (:func:`_assert_count_checked_on_every_path`; memory modes ``None``, ``"fast"`` and ``"budget"`` -- with a frozen
+    ``W`` the budget call takes the fast form --; a third of the labels ignored).  Without the flag the forward of a
+    remembered binding with the right count checks nothing and runs without a host synchronization (PyTorch's sync
+    debug mode ``"error"``) on every path whose given count is not always read back."""
+    _require_program(entry=entry)
+    checks = _record_count_checks(monkeypatch)
+    T = 1500
+    inp = make_inputs(
+        T, seed=SEED + 7916 + T, device=CUDA, W=glm_weight, ignore_frac=0.33
+    )
+    modes = (None, "fast", "budget")
+    _assert_count_checked_on_every_path(
+        inp, 4096, entry, checks, backend="cake", modes=modes
+    )
+    R = int(inp.valid.sum())
+    compacts = (False,) if opt_in._given_count_readback(CUDA) else (None, False)
+    for compact in compacts:
+        for mode in modes:
+            for train_x, train_w in _TRAINABLE:
+                X = inp.X.detach().requires_grad_(train_x)
+                W = inp.W.detach().requires_grad_(train_w)
+                kw = dict(
+                    chunk_size=4096,
+                    backend="cake",
+                    compact_rows=compact,
+                    memory_mode=mode,
+                    num_valid_rows=R,
+                )
+                torch.cuda.synchronize()
+                checks.clear()
+                torch.cuda.set_sync_debug_mode("error")
+                try:
+                    if entry == "loss":
+                        opt_in.chunked_lm_head_loss(
+                            X,
+                            W,
+                            inp.labels,
+                            objective=inp.objective,
+                            loss_div=inp.loss_div if inp.objective == "ce" else None,
+                            infer_logp=inp.infer_logp,
+                            loss_weights=inp.loss_weights,
+                            return_logp=True,
+                            **kw,
+                        )
+                    else:
+                        opt_in.chunked_lm_head_logprob(X, W, inp.labels, **kw)
+                finally:
+                    torch.cuda.set_sync_debug_mode("default")
+                torch.cuda.synchronize()
+                assert not checks, (compact, mode, train_x, train_w, checks)
 
 
 @pytest.mark.parametrize("memory_mode", ["fast", "budget"])
