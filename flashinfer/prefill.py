@@ -2522,6 +2522,8 @@ def _fa2_metadata_to_host(wrapper, qo_indptr, kv_indptr, last_page_len):
     ):
         host.copy_(device, non_blocking=True)
     torch.cuda.current_stream(wrapper.device).synchronize()
+    # These views are consumed synchronously by CPU planning, never used as
+    # pending H2D sources, so the next plan can safely refresh the same storage.
     return buffers
 
 

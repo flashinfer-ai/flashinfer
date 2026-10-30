@@ -98,7 +98,15 @@ def main():
         run()
     torch.cuda.synchronize()
     torch.testing.assert_close(out.cpu().float(), reference, rtol=1e-2, atol=1e-2)
-    torch.testing.assert_close(lse.cpu(), reference_lse, rtol=1e-2, atol=1e-2)
+    validation = [
+        dict(
+            stage="warmup",
+            max_output_abs_error=(out.cpu().float() - reference).abs().max().item(),
+            max_lse_abs_error=(lse.cpu() - reference_lse).abs().max().item(),
+        )
+    ]
+    # LSE is FP32; relative tolerance would hide dropping a 16-token page.
+    torch.testing.assert_close(lse.cpu(), reference_lse, rtol=0, atol=1e-3)
     rows = []
     for runs in args.runs_per_plan:
         # A single-run warmup does not stabilize the longer run loops. Warm
@@ -134,7 +142,15 @@ def main():
             )
         )
     torch.testing.assert_close(out.cpu().float(), reference, rtol=1e-2, atol=1e-2)
-    torch.testing.assert_close(lse.cpu(), reference_lse, rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(lse.cpu(), reference_lse, rtol=0, atol=1e-3)
+
+    validation.append(
+        dict(
+            stage="after_timing",
+            max_output_abs_error=(out.cpu().float() - reference).abs().max().item(),
+            max_lse_abs_error=(lse.cpu() - reference_lse).abs().max().item(),
+        )
+    )
 
     def tensor_sha(t):
         """Hash logical tensor bytes for paired input/reference/result audits."""
@@ -161,6 +177,7 @@ def main():
         ),
         output_sha256=dict(output=tensor_sha(out), lse=tensor_sha(lse)),
         independent_reference_passed=True,
+        validation=validation,
         flashinfer_path=flashinfer.__file__,
         prefill_sha256=hashlib.sha256(
             Path(flashinfer.prefill.__file__).read_bytes()
@@ -184,6 +201,7 @@ def main():
             {
                 "batch": batch,
                 "dtype": args.dtype,
+                "max_lse_abs_error": max(x["max_lse_abs_error"] for x in validation),
                 "rows": [
                     {"runs": x["runs_per_plan"], "us": x["median_us"]} for x in rows
                 ],
