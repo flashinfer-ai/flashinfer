@@ -1405,6 +1405,96 @@ def test_cake_sparse_weight_gradient_modes(case, dw):
     assert_same(res, run_support(inp, outputs, **kw))
 
 
+@pytest.mark.parametrize(
+    "dw", [("global", None), ("global", 16), ("chunked", None), ("chunked", 16)]
+)
+def test_cake_sparse_weight_gradient_drops_out_of_range_ids(dw):
+    """The sparse dW pass called without the validation stage (the case of device assertions compiled out): a pair
+    whose int32 id is negative or ``>= V`` adds nothing and no row outside ``[0, V)`` is written (guard rows on both
+    sides stay zero); every other row has the bits of the same call with those pairs moved to an unused id and a
+    zero upstream, and matches the FP64 sum."""
+    _require_cake()
+    mode, split = dw
+    T, H, V = 96, 512, 1000
+    gen = torch.Generator().manual_seed(SEED)
+    counts = torch.randint(0, 9, (T,), generator=gen)
+    counts[:4] = 1  # K_t < 2: inactive rows, whose pairs take the sentinel key
+    off = torch.zeros(T + 1, dtype=torch.int32)
+    off[1:] = torch.cumsum(counts, 0)
+    M = int(off[-1])
+    # every in-range id below V - 1: row V - 1 receives no pair
+    ids = torch.randint(0, V - 1, (M,), generator=gen, dtype=torch.int32)
+    X = torch.randn(T, H, generator=gen).to(torch.bfloat16)
+    dz = torch.randn(M, generator=gen).to(torch.bfloat16)
+    bad = torch.arange(3, M, 7)
+    out_of_range = torch.tensor([-1, V, V + 17, -(2**31)], dtype=torch.int32)
+    bad_ids = ids.clone()
+    bad_ids[bad] = out_of_range[torch.arange(bad.numel()) % 4]
+    ref_ids, ref_dz = ids.clone(), dz.clone()
+    ref_ids[bad], ref_dz[bad] = V - 1, 0.0  # in range, sorted after every other id
+
+    cx = cake_support._cake_context(CUDA)
+    problem = cake_support.SupportProblem(
+        num_rows=T,
+        hidden=H,
+        vocab=V,
+        num_pairs=M,
+        k_cap=8,
+        chunk=32,
+        has_labels=False,
+        has_teacher=False,
+    )
+    plan = cake_support.make_support_plan(
+        problem,
+        cx.arch,
+        cx.geometry,
+        cake_support._resolve_knobs("sparse", mode, None, split),
+    )
+    assert plan.dw_mode == mode and (mode == "global") == (plan.dw_pairs == M)
+    off32 = off.to(CUDA)
+    rows, ld = cake_support._rows_operand(X.to(CUDA))
+    active = cake_support._row_active(off32, None, False)
+
+    def sparse_dw(ids_rows, scale):
+        dtype = torch.bfloat16 if mode == "global" else torch.float32
+        guarded = torch.zeros((V + 2, H), dtype=dtype, device=CUDA)
+        for p0 in range(0, M, plan.dw_pairs):
+            cake_support._sga_dw_range(
+                cx,
+                plan,
+                problem,
+                rows,
+                ld,
+                ids_rows.to(CUDA),
+                off32,
+                scale.to(CUDA),
+                active,
+                guarded[1 : V + 1],
+                "bf16" if mode == "global" else "f32_add",
+                p0,
+                min(M, p0 + plan.dw_pairs),
+            )
+        torch.cuda.synchronize()
+        return guarded.cpu()
+
+    got, ref = sparse_dw(bad_ids, dz), sparse_dw(ref_ids, ref_dz)
+    bits = torch.int16 if mode == "global" else torch.int32
+    assert not got[0].view(bits).any() and not got[V + 1].view(bits).any()
+    assert not got[V].view(bits).any()  # row V - 1: no pair
+    assert torch.equal(got[1:V].view(bits), ref[1:V].view(bits))
+    keep = (counts >= 2).repeat_interleave(counts)
+    keep[bad] = False
+    expect = torch.zeros(V, H, dtype=torch.float64)
+    row_of = torch.arange(T).repeat_interleave(counts)
+    expect.index_add_(
+        0,
+        ids[keep].long(),
+        dz[keep].double()[:, None] * X[row_of[keep]].double(),
+    )
+    assert expect.abs().sum() > 0
+    torch.testing.assert_close(got[1 : V + 1].double(), expect, rtol=1e-2, atol=2e-2)
+
+
 @pytest.mark.parametrize("form", ["sparse", "dense vb256"])
 def test_cake_temperature_forms_bitwise(form):
     _require_cake()
