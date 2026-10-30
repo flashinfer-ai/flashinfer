@@ -530,12 +530,8 @@ def _select_request_tiling(
 
 
 def _h64_candidate_variant_serves(page_size: int) -> bool:
-    """Whether the H64 candidate variant publishes a single-pool schedule.
-
-    The variant reads one page per compute tile, so smaller pages keep the
-    pooled layout.
-    """
-    return page_size == _COMPUTE_BLOCK_KV
+    """Whether the H64 candidate variant supports the physical page size."""
+    return page_size in (32, 64, 128)
 
 
 def _h4_pooled_candidate_serves(
@@ -2001,14 +1997,14 @@ def _fp8_mqa_selective_logits(
         mode == _SelectiveLogitsMode.CANDIDATE
         and (prepared.num_heads, prepared.head_dim) == (64, 128)
         and prepared.query_tile == 4
-        and prepared.page_size == _COMPUTE_BLOCK_KV
+        and _h64_candidate_variant_serves(prepared.page_size)
         and prepared.split_kv == 1
         and required_words == 1 + _candidate_count_segments(prepared.split_kv)
         and sample_page_indices is None
     ):
         raise ValueError(
             "the H64 candidate variant requires an H64 D128 Q4 split-1 CANDIDATE "
-            "launch with 128-token pages and four count segments"
+            "launch with 32/64/128-token pages and four count segments"
         )
     key: Tuple[Any, ...] = (
         capability[0] * 10 + capability[1],
@@ -2058,6 +2054,7 @@ def _fp8_mqa_selective_logits(
                 num_sms=prepared.num_sms,
                 capacity=capacity,
                 math_mode=prepared.math_mode,
+                phys_block_kv=prepared.page_size,
             ),
             *args,
             stream,

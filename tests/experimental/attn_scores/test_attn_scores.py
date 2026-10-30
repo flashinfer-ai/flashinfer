@@ -5594,14 +5594,31 @@ def test_h64_candidate_variant_rejects_active_rows_after_cached_launch():
 
 
 @_requires_selective_sm100
-def test_h64_candidate_variant_requires_128_token_pages():
-    """Smaller pages keep the pooled layout and its exact selection."""
-    inputs = list(_inputs(q_rows=37, kv_rows=16384, num_heads=64))
+@pytest.mark.parametrize("page_size", [32, 64, 128])
+@pytest.mark.parametrize("math_mode", ["relu_strict", "relu_fast"])
+def test_h64_candidate_variant_page_sizes_and_partial_tail(
+    page_size, math_mode, ieee_matmul
+):
+    """Subpage assembly, scale addressing and map replay agree with FP32."""
+    inputs = list(_inputs(q_rows=37, kv_rows=16387, num_heads=64))
     q, kv, _scale, weights, _, _ = inputs
     inputs[4] = torch.tensor([0, 37], device="cuda", dtype=torch.int32)
     inputs[5] = torch.tensor([0, kv.shape[0]], device="cuda", dtype=torch.int32)
-    fused, table = _paged_inputs(tuple(inputs), block_size=64)
-    engine = SelectiveEngineCase(math_mode="relu_strict")
+    fused, natural_table = _paged_inputs(tuple(inputs), block_size=page_size)
+    table = torch.full(
+        (1, natural_table.shape[1] + 4),
+        fused.shape[0] + 17,
+        device=q.device,
+        dtype=torch.int32,
+    )
+    live_pages = (kv.shape[0] + page_size - 1) // page_size
+    table[:, :live_pages].copy_(natural_table[:, :live_pages])
+    raw = fused.flatten(1)
+    last_page = int(natural_table[0, live_pages - 1])
+    raw[last_page, : page_size * 128].view(page_size, 128)[
+        kv.shape[0] % page_size :
+    ].fill_(0x7F)
+    engine = SelectiveEngineCase(math_mode=math_mode)
     engine.plan(
         q,
         fused,
@@ -5614,10 +5631,27 @@ def test_h64_candidate_variant_requires_128_token_pages():
         head_dim=128,
         num_sms=2,
     )
-    assert not engine._candidate_schedule.h64_candidate
+    assert engine._candidate_schedule.h64_candidate
     selected = engine.run(q, fused, weights, table)
     torch.cuda.synchronize()
     _check_selection(selected, _oracle_rows(inputs), 512)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        selected = engine.run(q, fused, weights, table)
+    for ties in (False, True):
+        if ties:
+            weights.zero_()
+        else:
+            table[:, :2].copy_(table[:, :2].flip(1))
+            weights.mul_(0.75)
+        graph.replay()
+        torch.cuda.synchronize()
+        expected = _paged_step_oracle(q, weights, fused, table, [0, 37], [kv.shape[0]])
+        _check_selection(selected, expected, 512)
+        if ties:
+            assert engine._repair_flags.all()
+            assert engine._second_repair_flags.all()
+        assert engine._exact_error.item() == 0
 
 
 @_requires_selective_sm100

@@ -2501,12 +2501,12 @@ class FP8MQASelectiveH64CandidateKernel(FP8MQASelectiveLogitsKernel):
     KV-scale policy, so they match the general layout bit for bit in both math
     modes. Tiles, page-table rows and exact row bounds come from the prepared
     ``tile_meta``/``context_lens``. KV and its FP32 scales are read in place from
-    the fused paged pool, one page per KV compute tile.
+    the fused paged pool, combining physical pages into each 128-key compute tile.
 
     Construction, validation and the call ABI are the general kernel's
     four-segment warp-striped CANDIDATE topology (``split_kv`` 1,
     ``count_segment_span`` of one warp); only the launch and warp roles differ.
-    Requires pages of exactly one compute tile.
+    Physical pages may contain 32, 64 or 128 keys.
     """
 
     # 640 threads leave at most 102 registers per thread.
@@ -2518,11 +2518,12 @@ class FP8MQASelectiveH64CandidateKernel(FP8MQASelectiveLogitsKernel):
         num_sms: int,
         capacity: int,
         math_mode: str = "relu_strict",
+        phys_block_kv: int = _COMPUTE_BLOCK_KV,
     ):
         super().__init__(
             num_heads=64,
             head_dim=128,
-            phys_block_kv=_COMPUTE_BLOCK_KV,
+            phys_block_kv=phys_block_kv,
             num_sms=num_sms,
             mode=_SelectiveLogitsMode.CANDIDATE,
             capacity=capacity,
@@ -2563,29 +2564,29 @@ class FP8MQASelectiveH64CandidateKernel(FP8MQASelectiveLogitsKernel):
         kv_fp8 = cute.recast_tensor(kv_fused, cutlass.Float8E4M3FN)
         b = cute.recast_tensor(b, cutlass.Float8E4M3FN)
         page_stride = kv_fused.layout.stride[0]
-        # Each fused page holds one compute tile of K rows, then their FP32 scales.
+        # Each physical page holds its K rows, then their FP32 scales.
         a = cute.make_tensor(
             kv_fp8.iterator,
             cute.make_layout(
-                (self.block_kv, self.head_dim, num_phys_blocks),
+                (self.phys_block_kv, self.head_dim, num_phys_blocks),
                 stride=(self.head_dim, 1, page_stride),
             ),
         )
         fused_pages = cute.make_tensor(
             kv_fp8.iterator,
             cute.make_layout(
-                (self.block_kv * (self.head_dim + 4), num_phys_blocks),
+                (self.phys_block_kv * (self.head_dim + 4), num_phys_blocks),
                 stride=(1, page_stride),
             ),
         )
         scale_bytes = cute.domain_offset(
-            (self.block_kv * self.head_dim, 0), fused_pages
+            (self.phys_block_kv * self.head_dim, 0), fused_pages
         )
         scales = cute.recast_tensor(
             cute.make_tensor(
                 scale_bytes.iterator,
                 cute.make_layout(
-                    (self.block_kv * 4, num_phys_blocks), stride=(1, page_stride)
+                    (self.phys_block_kv * 4, num_phys_blocks), stride=(1, page_stride)
                 ),
             ),
             cutlass.Float32,
@@ -2603,12 +2604,12 @@ class FP8MQASelectiveH64CandidateKernel(FP8MQASelectiveLogitsKernel):
                     a.element_type,
                     self.num_kv_stages,
                 ),
-                (self.block_kv, self.head_dim),
+                (self.phys_block_kv, self.head_dim),
             ),
             mode=[0, 1, 3],
         )
         tma_atom_a, tma_tensor_a = cpasync.make_tiled_tma_atom(
-            tma_load_op, a, a_tma_view[0], (self.block_kv, self.head_dim)
+            tma_load_op, a, a_tma_view[0], (self.phys_block_kv, self.head_dim)
         )
         b_smem_layout = cute.slice_(self.b_smem_layout_staged, (None, None, None, 0))
         tma_atom_b, tma_tensor_b = cute.nvgpu.make_tiled_tma_atom_B(
@@ -2684,7 +2685,7 @@ class FP8MQASelectiveH64CandidateKernel(FP8MQASelectiveLogitsKernel):
         row_end,
         threshold,
         cursor,
-        segment_rows,
+        row_logits_addr,
         span,
         w_cache,
         tCtAcc_base,
@@ -2699,7 +2700,10 @@ class FP8MQASelectiveH64CandidateKernel(FP8MQASelectiveLogitsKernel):
         kv_pos = kv_idx * self.block_kv + m_coord
         ready = umma_pipeline.consumer_try_wait(umma_state)
         # The scale load overlaps the remaining MMA latency.
-        scale = mScales[(m_coord, page)]
+        scale_row = m_coord
+        if cutlass.const_expr(self.phys_block_kv < self.block_kv):
+            scale_row = m_coord % self.phys_block_kv
+        scale = mScales[(scale_row, page)]
         if cutlass.const_expr(self.math_mode == "relu_fast"):
             scale = scale * cutlass.Float32(0.5)
         umma_pipeline.consumer_wait(umma_state, ready)
@@ -2743,11 +2747,16 @@ class FP8MQASelectiveH64CandidateKernel(FP8MQASelectiveLogitsKernel):
         if mask != 0:
             lane_mask = (cutlass.Uint32(1) << cute.arch.lane_idx()) - 1
             slot = cursor + cutlass.Int32(cute.arch.popc(mask & lane_mask))
-            if hit & (slot < span):
-                packed = (
-                    cutlass.Uint64(cutlass.Uint32(fp32_to_i32_bits(score))) << 32
-                ) | cutlass.Uint64(cutlass.Uint32(kv_pos))
-                segment_rows[slot] = cutlass.Int64(packed)
+            packed = (
+                cutlass.Uint64(cutlass.Uint32(fp32_to_i32_bits(score))) << 32
+            ) | cutlass.Uint64(cutlass.Uint32(kv_pos))
+            # A plain conditional store diverged with 64- versus 128-key pages.
+            # Keep the same predicated flat-row address contract for every page.
+            store_global_u64_if(
+                hit & (slot < span),
+                row_logits_addr + cutlass.Int64(slot) * 8,
+                packed,
+            )
             cursor = cursor + cutlass.Int32(cute.arch.popc(mask))
         return cursor, umma_state
 
@@ -2866,7 +2875,7 @@ class FP8MQASelectiveH64CandidateKernel(FP8MQASelectiveLogitsKernel):
             cute.make_tensor(sKV.iterator, a_tma_view.outer),
             cute.group_modes(
                 cute.local_tile(
-                    mA, (self.block_kv, self.head_dim), coord=(None, None, None)
+                    mA, (self.phys_block_kv, self.head_dim), coord=(None, None, None)
                 ),
                 0,
                 2,
@@ -2921,6 +2930,10 @@ class FP8MQASelectiveH64CandidateKernel(FP8MQASelectiveLogitsKernel):
         # Descending tiles reach a long causal request's longest rows first.
         # Every role walks the same tile sequence and per-tile KV extent.
         first_tile = num_tiles - 1 - bidz
+        pages_per_tile = cutlass.const_expr(self.block_kv // self.phys_block_kv)
+        # Physical pages shape only K/scale addressing; the math/publish loop
+        # below keeps a fixed compute-tile unroll, independent of this cache.
+        cache_tiles = cutlass.const_expr(_H64_CANDIDATE_PAGE_CACHE // pages_per_tile)
         if is_tma_warp:
             q_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer, self.num_q_stages
@@ -2957,27 +2970,31 @@ class FP8MQASelectiveH64CandidateKernel(FP8MQASelectiveLogitsKernel):
                 num_kv = (mContextLens[tile] + self.block_kv - 1) // self.block_kv
                 chunk_base = cutlass.Int32(0)
                 while chunk_base < num_kv:
-                    # Lanes past the table read its last column, which no live
-                    # tile uses.
-                    page_cache = mBlockTable[
-                        (
-                            page_row,
-                            min(chunk_base + cute.arch.lane_idx(), last_column),
+                    column = chunk_base * pages_per_tile + cute.arch.lane_idx()
+                    if cutlass.const_expr(pages_per_tile > 1):
+                        # A partial compute tile still issues a full tile's TMA
+                        # bytes. Repeat a live page for its predicated tail.
+                        column = min(
+                            column,
+                            (mContextLens[tile] - 1) // self.phys_block_kv,
                         )
-                    ]
+                    page_cache = mBlockTable[(page_row, min(column, last_column))]
                     for chunk_slot in cutlass.range(
-                        min(num_kv - chunk_base, _H64_CANDIDATE_PAGE_CACHE), unroll=1
+                        min(num_kv - chunk_base, cache_tiles), unroll=1
                     ):
-                        page = cute.arch.shuffle_sync(page_cache, chunk_slot)
                         kv_pipeline.producer_acquire(kv_state)
-                        cute.copy(
-                            tma_atom_a,
-                            tAgA[(None, 0, 0, page)],
-                            tAsA[(None, 0, kv_state.index)],
-                            tma_bar_ptr=kv_pipeline.producer_get_barrier(kv_state),
-                        )
+                        for subpage in cutlass.range_constexpr(pages_per_tile):
+                            page = cute.arch.shuffle_sync(
+                                page_cache, chunk_slot * pages_per_tile + subpage
+                            )
+                            cute.copy(
+                                tma_atom_a,
+                                tAgA[(None, 0, 0, page)],
+                                tAsA[(None, subpage, kv_state.index)],
+                                tma_bar_ptr=kv_pipeline.producer_get_barrier(kv_state),
+                            )
                         kv_state.advance()
-                    chunk_base = chunk_base + _H64_CANDIDATE_PAGE_CACHE
+                    chunk_base = chunk_base + cache_tiles
                 tile = tile - grid
         elif is_umma_warp:
             sync_warp_roles(1, self.tmem_retrieve_threads)
@@ -3034,6 +3051,9 @@ class FP8MQASelectiveH64CandidateKernel(FP8MQASelectiveLogitsKernel):
             thr_copy = tiled_copy.get_slice(local_tidx)
             tTR_cC = thr_copy.partition_D(cute.make_identity_tensor(epi_sub_mn))
             m_coord = tTR_cC[0][0]
+            # Each warp caches the page for its 32 adjacent logical keys.
+            math_page_offset = m_coord // self.phys_block_kv
+            math_cache_tiles = cutlass.const_expr(_H64_CANDIDATE_PAGE_CACHE)
             tTR_rAcc = cute.make_rmem_tensor_like(tTR_cC, self.acc_dtype)
             w_cache = cute.make_rmem_tensor((self.num_heads,), cutlass.Float32)
             span = self.capacity // _H64_CANDIDATE_SEGMENTS
@@ -3056,30 +3076,33 @@ class FP8MQASelectiveH64CandidateKernel(FP8MQASelectiveLogitsKernel):
                 threshold = cutlass.Float32(float("inf"))
                 if active:
                     threshold = i32_bits_to_fp32(mPolicyValues[row])
-                segment_rows = cute.make_tensor(
-                    mLogits.iterator
-                    + cutlass.Int64(row) * mLogits.layout.stride[0]
-                    + segment * span,
-                    cute.make_layout(span),
+                row_logits_addr = make_warp_uniform_i64(
+                    mLogits.iterator.toint()
+                    + (
+                        cutlass.Int64(row) * mLogits.layout.stride[0]
+                        + cutlass.Int64(segment) * span
+                    )
+                    * 8
                 )
                 page_row = mTileMeta[(tile, 1)]
                 num_kv = (mContextLens[tile] + self.block_kv - 1) // self.block_kv
                 cursor = cutlass.Int32(0)
                 chunk_base = cutlass.Int32(0)
                 while chunk_base < num_kv:
-                    page_cache = mBlockTable[
-                        (
-                            page_row,
-                            min(chunk_base + cute.arch.lane_idx(), last_column),
+                    column = (
+                        chunk_base + cute.arch.lane_idx()
+                    ) * pages_per_tile + math_page_offset
+                    if cutlass.const_expr(pages_per_tile > 1):
+                        column = min(
+                            column,
+                            (mContextLens[tile] - 1) // self.phys_block_kv,
                         )
-                    ]
-                    chunk = min(num_kv - chunk_base, _H64_CANDIDATE_PAGE_CACHE)
-                    if chunk == _H64_CANDIDATE_PAGE_CACHE:
+                    page_cache = mBlockTable[(page_row, min(column, last_column))]
+                    chunk = min(num_kv - chunk_base, math_cache_tiles)
+                    if chunk == math_cache_tiles:
                         # A static unroll overlaps later tiles' scale loads and
                         # TMEM reads.
-                        for chunk_slot in cutlass.range_constexpr(
-                            _H64_CANDIDATE_PAGE_CACHE
-                        ):
+                        for chunk_slot in cutlass.range_constexpr(math_cache_tiles):
                             cursor, umma_state = self._score_kv_tile(
                                 chunk_base + chunk_slot,
                                 cute.arch.shuffle_sync(page_cache, chunk_slot),
@@ -3090,7 +3113,7 @@ class FP8MQASelectiveH64CandidateKernel(FP8MQASelectiveLogitsKernel):
                                 row_end,
                                 threshold,
                                 cursor,
-                                segment_rows,
+                                row_logits_addr,
                                 span,
                                 w_cache,
                                 tCtAcc_base,
@@ -3113,7 +3136,7 @@ class FP8MQASelectiveH64CandidateKernel(FP8MQASelectiveLogitsKernel):
                                 row_end,
                                 threshold,
                                 cursor,
-                                segment_rows,
+                                row_logits_addr,
                                 span,
                                 w_cache,
                                 tCtAcc_base,
@@ -3124,7 +3147,7 @@ class FP8MQASelectiveH64CandidateKernel(FP8MQASelectiveLogitsKernel):
                                 umma_pipeline,
                                 umma_state,
                             )
-                    chunk_base = chunk_base + _H64_CANDIDATE_PAGE_CACHE
+                    chunk_base = chunk_base + math_cache_tiles
                 if active & (cute.arch.lane_idx() == 0):
                     # A raw count above span is an overflow; PackedTopK flags it.
                     mIndexCounts[(row, segment + 1)] = cursor
