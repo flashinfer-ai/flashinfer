@@ -89,12 +89,16 @@ def test_support_probe_on_cpu_never_raises_and_names_the_device():
     )
     assert (
         sup.page_sizes == (16, 32, 64, 128)
-        and sup.kv_layouts == ("NHD", "HND")
+        and sup.kv_layouts == ("NHD", "HND", "UNIFIED")
         and sup.decode_max_q_len == 4
         and sup.decode_max_rows == 32
     )
     assert sup.dtypes == (torch.bfloat16,) and sup.cutedsl_required == "4.8.0"
     assert sup.rope_dims == (64, 128)
+    # the packed K|V pool's spelling (appended): one tensor shape per layout, the UNIFIED row the vendored tree's unified layout
+    assert set(sup.kv_layout_shapes) == set(sup.kv_layouts)
+    assert sup.kv_layout_shapes["UNIFIED"] == "[num_pages, H_kv, page_size, 2 x D]"
+    assert sup.kv_layout_shapes["NHD"] == "[num_pages, 2, page_size, H_kv, D]"
     assert (
         "bfloat16"
         in qwen_3_5_block_support(torch.device("cpu"), g, dtype=torch.float16).reason

@@ -27,6 +27,8 @@ from . import support as _support
 from .support import (
     DECODE_MAX_ROWS,
     FORMS,
+    KV_LAYOUT_SHAPES,
+    KV_LAYOUT_UNIFIED,
     PAGE_SIZE_ALIGN,
     PAGE_SIZES,
     Qwen35BlockGeometry,
@@ -46,6 +48,7 @@ __all__ = [
     "decode",
     "extend",
     "kv_views",
+    "kv_views_unified",
     "prefill",
     "prepare",
 ]
@@ -295,7 +298,7 @@ def _check_weights(
     return weights
 
 
-# --------------------------------------------------------------------------- the paged KV cache: FlashInfer layouts -> the block's views
+# --------------------------------------------------------------------------- the paged KV cache: FlashInfer layouts + the packed K|V pool -> the block's views
 
 
 class KvGeometry(Protocol):
@@ -309,6 +312,68 @@ class KvGeometry(Protocol):
     def head_dim(self) -> int: ...
 
 
+def kv_views_unified(
+    kv_cache: torch.Tensor,
+    *,
+    geometry: KvGeometry,
+    page_size: int,
+    dtype: torch.dtype,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """The block's ``[num_pages, num_kv_heads, page_size, head_dim]`` K and V views of a serving stack's packed K|V pool -- strides only, no copy.
+
+    ``kv_cache`` is the ONE ``[num_pages, H_kv, page_size, 2 x D]`` tensor a stack keeps per layer, K in columns ``[0, D)`` and V in
+    ``[D, 2D)`` of every row (the 24 / 4 model family's bf16 cache ``[pages, 4, 16 or 32, 512]``; the vendored tree's ``unified`` pool
+    layout): the two views are ``kv_cache[..., :D]`` and ``kv_cache[..., D:]`` -- on a contiguous pool both with strides
+    ``(H_kv x page_size x 2D, page_size x 2D, 2D, 1)``, the V base ``D`` elements past the K base -- and any strides the stack chose bind
+    as long as ``D`` is contiguous and every other stride a 16-byte multiple.  Typed ``ValueError`` naming the operand on any other form
+    (a 5-D ``[num_pages, 2, ...]`` buffer or a ``(k, v)`` pair under this spelling among them, each pointed at the spelling it binds
+    under); the pool contract the kernels bind is checked here and again by the vendored block."""
+    spelled = KV_LAYOUT_SHAPES[KV_LAYOUT_UNIFIED]
+    if isinstance(kv_cache, (tuple, list)):
+        raise ValueError(
+            f"qwen_3_5_block: a UNIFIED kv_cache is ONE {spelled} tensor (K at [..., :D], V at [..., D:]), not a (k_cache, v_cache) pair; "
+            "a pair of pools binds under kv_layout='NHD' / 'HND'"
+        )
+    kv = _tensor(kv_cache, "kv_cache")
+    h, p, d = geometry.num_kv_heads, int(page_size), geometry.head_dim
+    if kv.dim() != 4 or tuple(int(s) for s in kv.shape[1:]) != (h, p, 2 * d):
+        hint = (
+            "; a 5-D [num_pages, 2, ...] buffer binds under kv_layout='NHD' / 'HND'"
+            if kv.dim() == 5
+            else ""
+        )
+        raise ValueError(
+            f"qwen_3_5_block: a UNIFIED kv_cache is {spelled} = [*, {h}, {p}, {2 * d}] (K at [..., :{d}], V at [..., {d}:]), got shape "
+            f"{tuple(kv.shape)}{hint}"
+        )
+    if kv.device.type != "cuda":
+        raise ValueError(
+            f"qwen_3_5_block: kv_cache must be a CUDA tensor, got {kv.device}"
+        )
+    if kv.dtype != dtype:
+        raise ValueError(
+            f"qwen_3_5_block: kv_cache must be {dtype} (the activation dtype: the pools hold bf16 K / V), got {kv.dtype}"
+        )
+    views = []
+    for name, view in (("kv_cache (K)", kv[..., :d]), ("kv_cache (V)", kv[..., d:])):
+        if view.stride(3) != 1:
+            raise ValueError(
+                f"qwen_3_5_block: {name}: the head dim must be contiguous, got strides {tuple(kv.stride())}"
+            )
+        es = view.element_size()
+        for ax in range(3):
+            if (int(view.stride(ax)) * es) % _ALIGN_BYTES:
+                raise ValueError(
+                    f"qwen_3_5_block: {name}: every stride but the head dim's must be a 16-byte multiple, got strides {tuple(kv.stride())} ({es}-byte elements)"
+                )
+        if view.data_ptr() % _ALIGN_BYTES:
+            raise ValueError(
+                f"qwen_3_5_block: {name} must be 16-byte aligned, got data_ptr {view.data_ptr():#x}"
+            )
+        views.append(view)
+    return views[0], views[1]
+
+
 def kv_views(
     kv_cache: KvCache,
     kv_layout: str,
@@ -317,16 +382,21 @@ def kv_views(
     page_size: int,
     dtype: torch.dtype,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """The block's ``[num_pages, num_kv_heads, page_size, head_dim]`` K and V views of a FlashInfer paged cache -- strides only, no copy.
+    """The block's ``[num_pages, num_kv_heads, page_size, head_dim]`` K and V views of a serving stack's paged cache -- strides only, no copy.
 
     ``kv_cache`` is FlashInfer's 5-D ``[num_pages, 2, page_size, H_kv, D]`` (``kv_layout="NHD"``) or ``[num_pages, 2, H_kv, page_size, D]``
-    (``"HND"``) buffer, or a ``(k_cache, v_cache)`` pair of 4-D tensors in the same layouts.  Typed ``ValueError`` naming the operand on
-    any other form; the pool contract the kernels bind (``D`` contiguous, every other stride a 16-byte multiple, a 16-byte-aligned base)
-    is checked here and again by the vendored block."""
+    (``"HND"``) buffer, a ``(k_cache, v_cache)`` pair of 4-D tensors in the same layouts, or -- ``kv_layout="UNIFIED"`` -- the stack's
+    packed K|V pool, ONE ``[num_pages, H_kv, page_size, 2 x D]`` tensor bound as its two halves (:func:`kv_views_unified`).  Typed
+    ``ValueError`` naming the operand on any other form; the pool contract the kernels bind (``D`` contiguous, every other stride a
+    16-byte multiple, a 16-byte-aligned base) is checked here and again by the vendored block."""
     layout = str(kv_layout).upper()
+    if layout == KV_LAYOUT_UNIFIED:
+        return kv_views_unified(
+            kv_cache, geometry=geometry, page_size=page_size, dtype=dtype
+        )
     if layout not in ("NHD", "HND"):
         raise ValueError(
-            f"qwen_3_5_block: kv_layout must be 'NHD' or 'HND', got {kv_layout!r}"
+            f"qwen_3_5_block: kv_layout must be 'NHD', 'HND' or 'UNIFIED', got {kv_layout!r}"
         )
     if isinstance(kv_cache, (tuple, list)):
         if len(kv_cache) != 2:
@@ -1417,8 +1487,21 @@ def decode(
 def _page_size_of(
     kv_cache: KvCache, kv_layout: str, geometry: Qwen35BlockGeometry
 ) -> int:
-    """The page size a FlashInfer cache buffer carries in its shape (the functional entry points read it there)."""
+    """The page size a cache buffer carries in its shape (the functional entry points read it there): the 5-D buffer's / the pair's
+    page axis under NHD / HND, the packed pool's second axis under UNIFIED."""
     layout = str(kv_layout).upper()
+    if layout == KV_LAYOUT_UNIFIED:
+        spelled = KV_LAYOUT_SHAPES[KV_LAYOUT_UNIFIED]
+        if isinstance(kv_cache, (tuple, list)):
+            raise ValueError(
+                f"qwen_3_5_block: a UNIFIED kv_cache is ONE {spelled} tensor, not a (k_cache, v_cache) pair"
+            )
+        u = _tensor(kv_cache, "kv_cache")
+        if u.dim() != 4:
+            raise ValueError(
+                f"qwen_3_5_block: a UNIFIED kv_cache is {spelled}, got shape {tuple(u.shape)}"
+            )
+        return int(u.shape[2])
     t = (
         kv_cache[0]
         if isinstance(kv_cache, (tuple, list))
