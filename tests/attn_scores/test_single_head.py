@@ -168,6 +168,16 @@ def test_quantize_write_index_k_nvfp4_matches_reference(tokens: int) -> None:
 
 
 @torch.inference_mode()
+def test_quantize_write_index_k_nvfp4_rejects_fewer_scale_pages() -> None:
+    key = torch.zeros(1, 128, dtype=torch.bfloat16, device="cuda")
+    slots = torch.zeros(1, dtype=torch.int64, device="cuda")
+    key_cache = torch.zeros(4, 64, 64, dtype=torch.uint8, device="cuda")
+    key_scales = torch.zeros(3, 64, 8, dtype=torch.float8_e4m3fn, device="cuda")
+    with pytest.raises(ValueError, match="key_scales must be"):
+        quantize_write_index_k_nvfp4(key, slots, key_cache, key_scales)
+
+
+@torch.inference_mode()
 def test_single_head_paged_mqa_logits_rejects_bad_shapes() -> None:
     query = torch.zeros(4, 128, dtype=torch.bfloat16, device="cuda")
     key_cache = torch.zeros(4, 64, 128, dtype=torch.bfloat16, device="cuda")

@@ -197,9 +197,13 @@ def quantize_write_index_k_nvfp4(
         raise ValueError(
             f"Keys must be [tokens, {DIM}] and the cache [pages, {PAGE}, {PACKED_DIM}]"
         )
-    if key_scales.shape[1:] != (PAGE, SCALES_PER_KEY) or slots.shape[0] < key.shape[0]:
+    if (
+        key_scales.shape != (key_cache.shape[0], PAGE, SCALES_PER_KEY)
+        or slots.shape[0] < key.shape[0]
+    ):
         raise ValueError(
-            f"key_scales must be [pages, {PAGE}, {SCALES_PER_KEY}], with a slot per key"
+            f"key_scales must be [pages, {PAGE}, {SCALES_PER_KEY}] for the pages of "
+            "key_cache, with a slot per key"
         )
     if key.shape[0]:
         launch(
