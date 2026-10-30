@@ -73,6 +73,23 @@ def moe_topk_ids_init(num_experts: int, *, packed: bool = True):
     return _init
 
 
+def _routes_are_concentrated(
+    route_rows: torch.Tensor, num_experts: int, packed: bool
+) -> bool:
+    """Return whether ``route_rows`` reach far fewer experts than balanced routes.
+
+    Balanced routing of ``T`` rows to ``k`` distinct experts each reaches
+    ``E * (1 - (1 - k / E) ** T)`` of the ``E`` experts on average, while a
+    warm-up batch of identical tokens reaches only ``k``. Half the balanced
+    expectation separates the two; real traffic, even when skewed toward hot
+    experts, spreads a batch over most experts.
+    """
+    expert_ids = route_rows >> 16 if packed else route_rows
+    num_rows, top_k = route_rows.shape
+    expected = num_experts * (1.0 - (1.0 - min(top_k / num_experts, 1.0)) ** num_rows)
+    return 2 * torch.unique(expert_ids).numel() < expected
+
+
 def make_repeating_tensor_initializer(
     source: torch.Tensor,
     *,
@@ -86,6 +103,12 @@ def make_repeating_tensor_initializer(
     turn a one-token route into a pathological all-tokens-to-four-experts
     workload. When ``num_experts`` is provided, expanded profiles instead use
     the deterministic realistic sampler shared by all backends.
+
+    The sampler also replaces a source that is itself concentrated, such as a
+    framework's warm-up batch of identical dummy tokens: every row then routes
+    to the same ``top_k`` experts, each of which receives ``num_experts / top_k``
+    times its balanced share of rows, and the tactic selected for that workload
+    is cached for real traffic in the same bucket.
     """
     if source.ndim < 1 or source.numel() == 0:
         raise ValueError("source must be a non-empty tensor")
@@ -103,7 +126,13 @@ def make_repeating_tensor_initializer(
         target_rows = math.prod(shapes[:-1])
         if target_rows == 0:
             return torch.empty(shapes, dtype=dtype, device=device)
-        if num_experts is not None and target_rows > source_rows.shape[0]:
+        # Initializers run only when the autotuner profiles, which it refuses to
+        # do under CUDA graph capture, so the check's host read-back is safe.
+        # The source may be a reused buffer; check its current rows.
+        if num_experts is not None and (
+            target_rows > source_rows.shape[0]
+            or _routes_are_concentrated(source_rows, num_experts, packed)
+        ):
             return moe_topk_ids_init(num_experts, packed=packed)(shapes, dtype, device)
         repeats = (target_rows + source_rows.shape[0] - 1) // source_rows.shape[0]
         return (

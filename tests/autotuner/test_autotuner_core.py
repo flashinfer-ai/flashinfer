@@ -130,6 +130,43 @@ def test_repeating_tensor_initializer_resamples_expanded_route_profiles():
     assert torch.all(torch.sort(expanded_ids, dim=1).values.diff(dim=1) != 0)
 
 
+@pytest.mark.parametrize("packed", [True, False])
+def test_repeating_tensor_initializer_resamples_concentrated_route_sources(packed):
+    # A warm-up batch of identical dummy tokens routes every row to the same
+    # experts; profiles must not inherit that load, even when no larger.
+    expert_ids = torch.tensor([[3, 9, 17, 40, 41, 77, 100, 127]] * 640)
+    expert_ids = expert_ids.to(torch.int32)
+    if packed:
+        weight_bits = torch.ones((640, 8), dtype=torch.bfloat16).view(torch.int16)
+        source = (expert_ids << 16) | weight_bits.to(torch.int32)
+    else:
+        source = expert_ids
+    initializer = make_repeating_tensor_initializer(
+        source, num_experts=128, packed=packed
+    )
+    sampler = moe_topk_ids_init(128, packed=packed)
+
+    for rows in (4, 64, 512, 640):
+        actual = initializer((rows, 8), torch.int32, torch.device("cpu"))
+        expected = sampler((rows, 8), torch.int32, torch.device("cpu"))
+        assert torch.equal(actual, expected)
+        actual_ids = actual >> 16 if packed else actual
+        assert torch.unique(actual_ids).numel() > 8
+
+
+def test_repeating_tensor_initializer_preserves_skewed_route_sources():
+    # Real traffic is skewed toward hot experts but still reaches most of them.
+    expert_ids = torch.arange(640 * 8, dtype=torch.int32).reshape(640, 8) % 128
+    expert_ids[:, 0] = 0
+    initializer = make_repeating_tensor_initializer(
+        expert_ids, num_experts=128, packed=False
+    )
+
+    for rows in (2, 64, 512, 640):
+        actual = initializer((rows, 8), torch.int32, torch.device("cpu"))
+        assert torch.equal(actual, expert_ids[:rows])
+
+
 def test_find_nearest_profile_passthrough_without_specs():
     """No dynamic/constraint specs should keep shape values unchanged."""
     shapes = (torch.Size([3, 5]), torch.Size([7, 11, 13]))
