@@ -73,7 +73,7 @@ launch grid :func:`k4_grid_of_record`), and the token-owner band
 ``BWD_TOKEN_BANDS`` (sm_107a) / reduction refinement ``BWD_REDUCE_PARTS``
 (sm_100a, sm_107a) are read by the rules themselves. The backward prepare's
 CTA form is :func:`k5_program` ``(T, SM count, architecture)``
-(``K5_FORM_BANDS``: the 128-thread one-token form ``__t128`` on sm_100a ``1024 < T <= 8192``, sm_103a ``T <= 8192``, sm_107a ``T <= 8192``,
+(``K5_FORM_BANDS``: the 128-thread one-token form ``__t128`` on sm_100a ``1024 < T <= 8192``, sm_103a ``T <= 8192``, sm_107a ``T <= 65536``,
 the 256-thread two-token record elsewhere) and its launch grid :func:`k5_grid`:
 the form's one-trip grid, or the record's persistent 2-CTAs-per-SM grid inside a
 band of ``K5_GRID_BANDS`` (sm_100a ``T <= 1024``) -- the band
@@ -1900,7 +1900,6 @@ MODULES: dict[str, dict[str, Any]] = {
     "cake_mhc_train_bwd_prepare__t128": {
         "arches": [
             "sm_103a",
-            "sm_107a",
         ],
         "arg_plan": [
             ["buffer", "dy"],
@@ -2006,11 +2005,64 @@ MODULES: dict[str, dict[str, Any]] = {
         },
         "workspace_rule": None,
     },
+    "cake_mhc_train_bwd_prepare__t128__a7": {
+        "arches": [
+            "sm_107a",
+        ],
+        "arg_plan": [
+            ["buffer", "dy"],
+            ["buffer", "b"],
+            ["buffer", "x"],
+            ["buffer", "stats"],
+            ["buffer", "db"],
+            ["buffer", "gstats"],
+            ["parameter", "T"],
+            ["launch", "enable_pdl"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "col_split": 1,
+            "grid_limit": 0,
+            "grid_per_sm": 0,
+            "kind": "rows_per_cta",
+            "rows_per_cta": 1,
+        },
+        "hidden": 4096,
+        "kernel": "cake_mhc_train_bwd_prepare__t128",
+        "kernel_symbol": "kernel_cake_mhc_train_bwd_prepare__t128",
+        "launch": {
+            "block": (128, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 640,
+            "persistent_ctas_per_sm": 1,
+            "use_pdl": "runtime",
+        },
+        "library": "cake_mhc_train_bwd_prepare__t128",
+        "logical": {
+            "T": "rows",
+            "b": "b",
+            "db": "db",
+            "dy": "dy",
+            "gstats": "gstats",
+            "stats": "stats",
+            "x": "x",
+        },
+        "role": "bwd_prepare",
+        "select_rule": {
+            "above": 0,
+            "at_most": 65536,
+            "kind": "rows_between",
+        },
+        "workspace_rule": None,
+    },
     "cake_mhc_train_bwd_prepare__gt8192": {
         "arches": [
             "sm_100a",
             "sm_103a",
-            "sm_107a",
         ],
         "arg_plan": [
             ["buffer", "dy"],
@@ -2057,6 +2109,60 @@ MODULES: dict[str, dict[str, Any]] = {
         "role": "bwd_prepare",
         "select_rule": {
             "above": 8192,
+            "at_most": None,
+            "kind": "rows_between",
+        },
+        "workspace_rule": None,
+    },
+    "cake_mhc_train_bwd_prepare__gt65536": {
+        "arches": [
+            "sm_107a",
+        ],
+        "arg_plan": [
+            ["buffer", "dy"],
+            ["buffer", "b"],
+            ["buffer", "x"],
+            ["buffer", "stats"],
+            ["buffer", "db"],
+            ["buffer", "gstats"],
+            ["parameter", "T"],
+            ["launch", "enable_pdl"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "col_split": 1,
+            "grid_limit": 0,
+            "grid_per_sm": 0,
+            "kind": "rows_per_cta",
+            "rows_per_cta": 2,
+        },
+        "hidden": 4096,
+        "kernel": "cake_mhc_train_bwd_prepare",
+        "kernel_symbol": "kernel_cake_mhc_train_bwd_prepare",
+        "launch": {
+            "block": (256, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 1280,
+            "persistent_ctas_per_sm": 1,
+            "use_pdl": "runtime",
+        },
+        "library": "cake_mhc_train_bwd_prepare",
+        "logical": {
+            "T": "rows",
+            "b": "b",
+            "db": "db",
+            "dy": "dy",
+            "gstats": "gstats",
+            "stats": "stats",
+            "x": "x",
+        },
+        "role": "bwd_prepare",
+        "select_rule": {
+            "above": 65536,
             "at_most": None,
             "kind": "rows_between",
         },
@@ -3589,8 +3695,8 @@ ROUTES: dict[str, dict[str, list[str]]] = {
             "cake_mhc_train_bwd_reduce__wpu4_fadd",
         ],
         "bwd_prepare_h4096": [
-            "cake_mhc_train_bwd_prepare__t128",
-            "cake_mhc_train_bwd_prepare__gt8192",
+            "cake_mhc_train_bwd_prepare__t128__a7",
+            "cake_mhc_train_bwd_prepare__gt65536",
         ],
         "fwd_finish_h4096": [
             "cake_mhc_train_fwd_finish__r2",
@@ -4175,13 +4281,13 @@ K5_GRID_BANDS = {"sm_100a": ((0, 1024, 2),), "sm_103a": ((0, 4096, 2),), "sm_107
 # rows_per_cta 1, min_blocks 4: the record's 128-thread token group, so the per-token tree and the bits are the
 # record's) on the one-trip grid T; outside every band the 256-thread two-token record ("production": ceil(T / 2) CTAs,
 # or the persistent grid of a K5_GRID_BANDS band). On sm_100a the t128 form for 1024 < T <= 8192; on sm_103a the t128
-# form to 8192 tokens; on sm_107a the t128 form to 8192 tokens (the form's one-trip grid is faster than the record's
+# form to 8192 tokens; on sm_107a the t128 form to 65536 tokens (the form's one-trip grid is faster than the record's
 # grid of record at the rows of record inside the band; the persistent 4 x SMs t128 grid ties the one-trip grid at 1024
 # tokens and loses above it, so the form has no persistent band).
 K5_FORM_BANDS = {
     "sm_100a": ((1024, 8192, "t128"),),
     "sm_103a": ((0, 8192, "t128"),),
-    "sm_107a": ((0, 8192, "t128"),),
+    "sm_107a": ((0, 65536, "t128"),),
 }
 K5_FORM_ROWS = {
     "production": 2,
