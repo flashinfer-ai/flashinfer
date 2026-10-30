@@ -15,7 +15,10 @@
 import pytest
 import torch
 
-from flashinfer.quantization.kernels import nvfp4_kv_materialize_fp8
+from flashinfer.quantization.kernels import (
+    NVFP4KVMaterializer,
+    nvfp4_kv_materialize_fp8,
+)
 from flashinfer.utils import get_compute_capability
 
 
@@ -174,6 +177,32 @@ def test_nvfp4_kv_materialize_fp8_matches_reference(
         num_pages=num_pages,
     )
     torch.cuda.synchronize()
+
+    # NVFP4KVMaterializer.run launches the same kernel without per-call checks.
+    run_out = torch.zeros(out_shape, dtype=torch.float8_e4m3fn, device="cuda")
+    run_tables = torch.zeros((batch_size, max_pages), dtype=torch.int32, device="cuda")
+    NVFP4KVMaterializer(
+        num_heads,
+        page_size,
+        head_dim,
+        uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
+    ).run(
+        k_cache,
+        v_cache,
+        k_sf,
+        v_sf,
+        block_tables,
+        seq_lens,
+        torch.tensor(page_starts, dtype=torch.int32, device="cuda"),
+        out=run_out,
+        fp8_block_tables=run_tables,
+    )
+    torch.cuda.synchronize()
+    assert torch.equal(run_tables, fp8_tables)
+    written = torch.unique(torch.cat((fp8_tables.flatten(), fp8_tables.new_zeros(1))))
+    assert torch.equal(
+        run_out[written].view(torch.uint8), kv_fp8[written].view(torch.uint8)
+    )
 
     assert tuple(kv_fp8.shape) == out_shape
     if out is not None:
