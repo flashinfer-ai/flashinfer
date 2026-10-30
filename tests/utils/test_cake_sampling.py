@@ -1174,12 +1174,60 @@ def test_measured_stage1_picks_are_frozen_variants_of_their_bins():
     for batch, vocab in ((64, 32768), (129, 32768), (1, 24576), (1, 32769)):
         assert cs._measured_stage1_pick(cap, sms, batch, vocab, 50, limit) is None
     # round 15 (lever L-PK2): the (2, 16) stream at top-k 10 only -- B200 V = 32768 B = 64 up to its cap 20, H100
-    # V = 32768 B = 32 up to its cap 10; the top-k-up-to-64 class there keeps the cost model's pick
+    # V = 32768 B = 32 up to its cap 10; the top-k-up-to-64 class there keeps the cost model's pick (on B200 above
+    # round 20's top-k range)
     b200, h100 = ((10, 0), 148), ((9, 0), 132)
-    for k, want in ((10, (2, 16, True)), (20, (2, 16, True)), (21, None), (50, None)):
+    for k, want in ((10, (2, 16, True)), (20, (2, 16, True)), (51, None), (64, None)):
         assert cs._measured_stage1_pick(*b200, 64, 32768, k, _FULL_SMEM_OPTIN) == want
     for k, want in ((10, (2, 16, True)), (11, None), (50, None)):
         assert cs._measured_stage1_pick(*h100, 32, 32768, k, _FULL_SMEM_OPTIN) == want
+    # round 20: B200 V = 32768 with 33-64 rows runs the (1, 16) stream for a top-k from 21 to 50 only; 65-128 rows keep
+    # the cost model's pick at every top-k
+    stream16 = (1, 16, True)
+    for batch, picks in (
+        (33, ((2, 16, True), stream16)),
+        (64, ((2, 16, True), stream16)),
+        (65, (None, None)),
+        (128, (None, None)),
+    ):
+        for vocab in (24577, 32768):
+            for k, want in (
+                (1, picks[0]),
+                (20, picks[0]),
+                (21, picks[1]),
+                (50, picks[1]),
+                (51, None),
+                (64, None),
+            ):
+                got = cs._measured_stage1_pick(*b200, batch, vocab, k, _FULL_SMEM_OPTIN)
+                assert got == want, (batch, vocab, k)
+    for (major, minor, sms), ranges in cs._STAGE1_PICK_K_RANGE_BY_DEVICE.items():
+        picks = cs._STAGE1_PICKS_BY_DEVICE[major, minor, sms]
+        for (vbin, bbin, kclass), (lo, hi) in ranges.items():
+            assert (lo <= hi) and kclass in (False, True)
+            for k in (lo, hi):
+                got = cs._measured_stage1_pick(
+                    (major, minor), sms, bbin, vbin, k, _FULL_SMEM_OPTIN
+                )
+                assert got == picks[vbin, bbin, kclass], (
+                    major,
+                    minor,
+                    sms,
+                    vbin,
+                    bbin,
+                    k,
+                )
+            got = cs._measured_stage1_pick(
+                (major, minor), sms, bbin, vbin, hi + 1, _FULL_SMEM_OPTIN
+            )
+            assert got != picks[vbin, bbin, kclass], (
+                major,
+                minor,
+                sms,
+                vbin,
+                bbin,
+                hi + 1,
+            )
 
 
 def test_measured_large_k_picks_keep_their_measured_launch_form():
@@ -1302,6 +1350,23 @@ _R15_ADDED_PICKS = {
         (262144, 64, True): (2, 16, True),
     },
 }
+# Round 20's measured stage-1 picks (B200 V = 32768 with 33-64 rows, top-k 21-50 by ``_STAGE1_PICK_K_RANGE_BY_DEVICE``),
+# left out to recompute the plans without them.
+_R20_ADDED_PICKS = {
+    (10, 0, 148): {(32768, 64, False): (1, 16, True)},
+}
+
+
+def _stage1_picks_without(added) -> dict:
+    """``_STAGE1_PICKS_BY_DEVICE`` without the ``added`` entries (each present with its listed pick)."""
+    picks = {}
+    for device, table in cs._STAGE1_PICKS_BY_DEVICE.items():
+        drop = added.get(device, {})
+        assert all(table.get(key) == pick for key, pick in drop.items()), device
+        picks[device] = {key: pick for key, pick in table.items() if key not in drop}
+    return picks
+
+
 # (device, vocab, batch, top-k) -> (round-14 plan, round-15 plan) of every owner cell whose plan round 15 changes.
 _R15_PLAN_CHANGES = {
     # LP-BT 3a: the cluster-8 k = 1000 rows above V = 128256 take the leader-push chain instead of the whole-CTA tail
@@ -1399,10 +1464,13 @@ def test_round15_host_levers_change_only_their_cells(monkeypatch):
     CTA-local-select top-k class only (top-k 10 changes, top-k 50 keeps its plan).  R200 and RTX PRO 6000 keep every
     plan.  Both sides leave out round 17's leader-push whole-CTA tail (``_LEADER_PUSH_BLOCK_TAIL_CELLS``), its
     cluster-1 / cluster-2 whole-CTA-tail cells (``_C12_BLOCK_TAIL_CELLS`` beyond row A) and its compact-list picks
-    (``_COMPACT_PICKS_BY_DEVICE``)."""
+    (``_COMPACT_PICKS_BY_DEVICE``), and round 20's B200 picks (``_R20_ADDED_PICKS``)."""
     if not torch.cuda.is_available():
         # without CUDA every k > 64 launch plans the two-launch chain
         pytest.skip("CUDA required")
+    monkeypatch.setattr(
+        cs, "_STAGE1_PICKS_BY_DEVICE", _stage1_picks_without(_R20_ADDED_PICKS)
+    )
     monkeypatch.setattr(cs, "_LEADER_PUSH_BLOCK_TAIL_CELLS", {})
     monkeypatch.setattr(cs, "_C12_BLOCK_TAIL_CELLS", _R15_C12_BLOCK_TAIL_CELLS)
     monkeypatch.setattr(cs, "_COMPACT_PICKS_BY_DEVICE", {})
@@ -1427,6 +1495,49 @@ def test_round15_host_levers_change_only_their_cells(monkeypatch):
     # the cluster-8 V = 128256 k = 1000 cells keep the whole-CTA tail where they ran it (H100's measured picks)
     for batch in (1, 2, 4, 8):
         assert new["H100", 128256, batch, 1000] == "8_16_1 f8 1L"
+
+
+# A grid around round 20's B200 picks: both sides of the V = 32768 bin's edges, of the 33-64 / 65-128 batch bins and
+# of the top-k bounds (CTA-local-select cap 20, range end 50, fused-tail cap 64).
+_R20_CELLS = tuple(
+    itertools.product(
+        (24576, 24577, 28672, 32768, 32769),
+        (32, 33, 48, 64, 65, 96, 128, 129),
+        (1, 10, 20, 21, 32, 33, 49, 50, 51, 63, 64, 65, 1000),
+    )
+)
+
+
+def test_round20_b200_picks_change_only_their_cells(monkeypatch):
+    """Round 20's B200 pick (``_R20_ADDED_PICKS`` with its ``_STAGE1_PICK_K_RANGE_BY_DEVICE`` range) changes the launch
+    plan only at V = 24577-32768, 33-64 rows and top-k 21-50 on B200, each such launch to the (1, 16) stream; a top-k
+    above 50 or up to 20, 65-128 rows, the neighbouring vocab bins and every other device keep their plans.  Of the owner
+    cells, exactly V = 32768 B = 64 top-k 50 changes."""
+    cells = tuple(dict.fromkeys(_R20_CELLS + _PLAN_CELLS))
+    new = _emulated_launch_plans(monkeypatch, cells=cells, cuda=True)
+    with monkeypatch.context() as m:
+        m.setattr(
+            cs, "_STAGE1_PICKS_BY_DEVICE", _stage1_picks_without(_R20_ADDED_PICKS)
+        )
+        old = _emulated_launch_plans(m, cells=cells, cuda=True)
+
+    def stage1(plan):
+        return None if plan is None else (plan.cluster, plan.ept, plan.stream)
+
+    ruled = {
+        cell
+        for cell in new
+        if cell[0] == "B200"
+        and 24576 < cell[1] <= 32768
+        and 32 < cell[2] <= 64
+        and 20 < cell[3] <= 50
+    }
+    assert ruled and all(stage1(new[cell]) == (1, 16, True) for cell in ruled)
+    changed = {cell for cell in new if new[cell] != old[cell]}
+    assert changed == {cell for cell in ruled if stage1(old[cell]) != (1, 16, True)}
+    assert sorted(cell[1:] for cell in changed if cell[1:] in _PLAN_CELLS) == [
+        (32768, 64, 50)
+    ]
 
 
 # Round 16 (``_SM12X_RESIDENTS_BY_DEVICE``: the (8, 40) resident on RTX PRO 6000 with 188 SMs): (device, vocab, batch,
@@ -1852,14 +1963,22 @@ def test_round18_r200_rules_change_only_their_cells(monkeypatch):
     plan."""
     assert sorted(cs._INT_TAIL_DEVICES) == [(10, 7, 212)]
     picks = {(32768, b): k for b, k in _R18_PICK_MIN_K.items()}
-    assert {(10, 7, 212): picks} == cs._C1_BLOCK_TAIL_PICKS_BY_DEVICE
+    assert picks == cs._C1_BLOCK_TAIL_PICKS_BY_DEVICE[(10, 7, 212)]
     chain_forms = {(32768, b): 3 for b in _R18_CHAIN_BATCHES}
     assert {(10, 7, 212): chain_forms} == cs._CHAIN_CELL_FORMS_BY_DEVICE
 
     def without_rules(cells=_PLAN_CELLS, emulated=None):
         with monkeypatch.context() as m:
             m.setattr(cs, "_INT_TAIL_DEVICES", frozenset())
-            m.setattr(cs, "_C1_BLOCK_TAIL_PICKS_BY_DEVICE", {})
+            m.setattr(
+                cs,
+                "_C1_BLOCK_TAIL_PICKS_BY_DEVICE",
+                {
+                    device: table
+                    for device, table in cs._C1_BLOCK_TAIL_PICKS_BY_DEVICE.items()
+                    if device != (10, 7, 212)
+                },
+            )
             m.setattr(cs, "_CHAIN_CELL_FORMS_BY_DEVICE", {})
             return _emulated_launch_plans(m, emulated, cells)
 
@@ -1922,6 +2041,80 @@ def test_round18_r200_rules_change_only_their_cells(monkeypatch):
     # pick rows: batch 8 / 16 at k 800, 1000, 1024; batch 32 at k 769, 799, 800, 1000, 1024; then the batch 1, 2 and 4
     # chain rows and row A at k 769, 799, 800, 1000, 1024
     assert moved == 3 + 3 + 5 + 3 * 5 + 5
+
+
+# Round 20 (GB300, 152 SMs): ``_C1_BLOCK_TAIL_PICKS_BY_DEVICE`` moves the V = 151936 rows at batch 128 from top-k
+# ``_R20_PICK_MIN_K`` from the cost model's (1, 32) stream two-launch chain (its no-tail twin, bit 12) to that stream's
+# one launch with the integer-tested whole-CTA tail (bits 3 + 6 + 11, `c1_e32s_bt_sp_tia`).  B300 (148 SMs) keeps it.
+_R20_PICK_MIN_K = 769
+_R20_PLAN_CHANGES = {
+    ("GB300", 151936, 128, 1000): ("1_32_1 f4100 2L", "1_32_1 f2120 1L"),
+}
+
+
+def test_round20_gb300_rule_changes_only_its_cells(monkeypatch):
+    """The round-20 GB300 rule (the V = 151936 batch 128 cell of ``_C1_BLOCK_TAIL_PICKS_BY_DEVICE`` for the 152-SM
+    compute capability 10.3 device) changes the launch plans of the owner cells on the emulated devices exactly on the
+    cells of ``_R20_PLAN_CHANGES``, against the plans without it.  On a wide grid (vocab on both sides of 151936, batch
+    64-129, top-k on both sides of the whole-CTA tail's range) it changes only GB300 rows of V = 151936 and batch 128
+    with ``_R20_PICK_MIN_K`` <= top-k <= fused_block_tail_kcap, into the (1, 32) stream's one launch with bits 3 + 6 +
+    11 and the same stage-2/3 slab and form; a 10.3 device with 148 SMs (B300) and every other device keep every
+    plan.  CUDA is reported present, as on the emulated devices, so no GPU is needed."""
+    assert cs._C1_BLOCK_TAIL_PICKS_BY_DEVICE[(10, 3, 152)] == {
+        (151936, 128): _R20_PICK_MIN_K
+    }
+    emulated = {**_PLAN_DEVICES, "B300": ((10, 3), 148, _FULL_SMEM_OPTIN)}
+
+    def without_rule(cells=_PLAN_CELLS):
+        with monkeypatch.context() as m:
+            m.setattr(
+                cs,
+                "_C1_BLOCK_TAIL_PICKS_BY_DEVICE",
+                {
+                    device: table
+                    for device, table in cs._C1_BLOCK_TAIL_PICKS_BY_DEVICE.items()
+                    if device != (10, 3, 152)
+                },
+            )
+            return _emulated_launch_plans(m, emulated, cells, cuda=True)
+
+    new = _emulated_launch_plans(monkeypatch, emulated, cuda=True)
+    old = without_rule()
+    changed = {
+        cell: (_plan_text(old[cell]), _plan_text(plan))
+        for cell, plan in new.items()
+        if plan != old[cell]
+    }
+    assert changed == _R20_PLAN_CHANGES
+    cells = tuple(
+        itertools.product(
+            (128256, 140000, 151935, 151936, 151937, 262144),
+            (64, 65, 127, 128, 129),
+            (64, 65, 768, 769, 800, 1000, 1024),
+        )
+    )
+    new = _emulated_launch_plans(monkeypatch, emulated, cells, cuda=True)
+    old = without_rule(cells)
+    kcap = cs._fused_block_tail_kcap()
+    moved = 0
+    for cell, plan in new.items():
+        name, vocab, batch, k = cell
+        before = old[cell]
+        if (
+            name == "GB300"
+            and (vocab, batch) == (151936, 128)
+            and _R20_PICK_MIN_K <= k <= kcap
+        ):
+            assert _plan_text(plan) == "1_32_1 f2120 1L", cell
+            assert (plan.threads, plan.items, plan.stage23_flags) == (
+                before.threads,
+                before.items,
+                before.stage23_flags,
+            ), cell
+            moved += 1
+        else:
+            assert plan == before, cell
+    assert moved == 4  # top-k 769, 800, 1000, 1024
 
 
 def test_multi_wave_chain_changes_only_its_cells(monkeypatch):
@@ -3453,7 +3646,8 @@ def test_spec_block_tail_matches_two_launch_form(monkeypatch):
         assert cs._c12_block_tail(128, 262144, kcap + 1, cc, sms) is None
         assert cs._c12_block_tail(128, 262144, None, cc, sms) is None
         assert cs._c12_block_tail(64, 262144, 1000, cc, sms) is None
-        assert cs._c12_block_tail(128, 151936, 1000, cc, sms) is None
+        if (cc, sms) != ((10, 3), 152):  # round 20: GB300's pick cell (below)
+            assert cs._c12_block_tail(128, 151936, 1000, cc, sms) is None
         assert cs._c12_block_tail(128, 262144, 1000, cc, 114) is None  # two waves
         assert cs._c12_block_tail(128, 262144, 1000, cc, sms, 99 * 1024) is None
         assert cs._c12_block_tail(128, 262144 + 1, 1000, cc, sms) is None
@@ -3473,6 +3667,15 @@ def test_spec_block_tail_matches_two_launch_form(monkeypatch):
         assert cs._c12_block_tail(batch, 32768, 1000, (10, 7), 208) is None
         for cc in ((10, 0), (10, 3)):
             assert cs._c12_block_tail(batch, 32768, 1000, cc, 212) is None
+    # round 20: GB300 (152 SMs) V = 151936 batch 128 from top_k_max _R20_PICK_MIN_K, by device only (B300's 148 SMs
+    # and every other device keep the chain)
+    for k in (_R20_PICK_MIN_K, 1000, kcap):
+        assert cs._c12_block_tail(128, 151936, k, (10, 3), 152) == row_a
+    assert cs._c12_block_tail(128, 151936, _R20_PICK_MIN_K - 1, (10, 3), 152) is None
+    assert cs._c12_block_tail(128, 151936, kcap + 1, (10, 3), 152) is None
+    assert cs._c12_block_tail(128, 151936, 1000, (10, 3), 148) is None
+    assert cs._c12_block_tail(64, 151936, 1000, (10, 3), 152) is None
+    assert cs._c12_block_tail(128, 151936, 1000, (10, 3), 152, 99 * 1024) is None
     for batch in (1, 2, 4, 3, 64):
         assert cs._c12_block_tail(batch, 32768, 1000, (10, 7), 212) is None
     assert cs._int_tail_flag(1, 32, True, fused_flags, (10, 3)) == cs._FLAG_INT_TAIL
@@ -3546,11 +3749,12 @@ def test_spec_block_tail_matches_two_launch_form(monkeypatch):
 
 def test_c1_block_tail_picks_match_two_launch_forms(monkeypatch):
     """Round 18: a ``_C1_BLOCK_TAIL_PICKS_BY_DEVICE`` cell of this device (the 212-SM R200's V = 32768 rows at batch 8,
-    16 and 32, from the cell's smallest top_k_max up to 1024) runs the (1, 32) stream's one launch with the whole-CTA
-    tail (bits 3 + 6, and bit 11 on an ``_INT_TAIL_DEVICES`` device).  Its outputs are bitwise identical to the (1, 32)
-    stream's two-launch form, and its samples, counts and per-index values / renorm weights to the two-launch chain the
-    host runs without the rule (the cost model's stage 1), on adversarial rows, per-row k and per-row p.  Skipped on
-    other devices."""
+    16 and 32, and from round 20 the 152-SM GB300's V = 151936 row at batch 128, from the cell's smallest top_k_max up
+    to 1024) runs the (1, 32) stream's one launch with the whole-CTA tail (bits 3 + 6, and bit 11 where
+    ``_int_tail_flag`` sets it: an ``_INT_TAIL_CAPABILITIES`` capability or ``_INT_TAIL_DEVICES`` device).  Its outputs
+    are bitwise identical to the (1, 32) stream's two-launch form, and its samples, counts and per-index values / renorm
+    weights to the two-launch chain the host runs without the rule (the cost model's stage 1), on adversarial rows,
+    per-row k and per-row p.  Skipped on other devices."""
     _require_supported_device()
     device = torch.cuda.current_device()
     capability = cs._device_capability(device)

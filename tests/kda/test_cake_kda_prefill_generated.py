@@ -19,7 +19,14 @@ window maps, which the chain composite launches instead of the map pass, and
 two value halves as a 2-CTA cluster, which long launches take instead, and
 ``_RENDERED_WORK_BIN_TURN_ROUTES`` the work-binned programs that also turn a
 bin's state over in the background, which work-binned launches of short tasks
-take instead of the work-binned program.
+take instead of the work-binned program, and
+``_RENDERED_M64_OWNER_HELPER_ROUTES`` the M64 value-split programs whose helper
+CTAs prepare a task's chunks for its two value-half owners, which long
+cooperative launches take instead of the pair-share or routed program, and
+``_RENDERED_WORK_BIN_MIX_ROUTES`` the bin-mix builds of the turnover programs,
+which turnover launches whose bin table the bin-mix rule admits take
+cooperatively instead of the turnover program on the ``WORK_BIN_MIX_ARCHES``
+parts.
 
 The CPU checks hold both tables to the units, to the shipped argument plans and
 to the factory lookup. The GPU checks run the prepared BF16 prefill on the
@@ -31,7 +38,10 @@ program and against the selection without work bins; hold a work-binned launch
 of short tasks to the turnover build (bit for bit the work-binned launch, with
 and without checkpoint rows, on both sides of the part's chunk limit); replay
 the routed launch from a CUDA graph (a turnover launch among the rows); and
-rebind it through a plan-cache hit.
+rebind it through a plan-cache hit.  An admitted bin-mix launch matches its
+turnover launch bit for bit, a bin-mix launch the driver refuses runs the
+turnover build instead, and on another part the same launches keep the
+turnover build.
 
 A program that takes tensor maps encodes them once per preparation into a host
 buffer (``("workspace", "tensor_maps")`` in its plan); the checks hold every
@@ -189,6 +199,32 @@ def test_routes_point_shipped_modules_at_generated_programs():
             assert program in registry._RENDERED_MODULES, (arch, program)
             assert arch in registry._RENDERED_MODULES[program]["arches"]
             routed.add(program)
+    assert set(registry._RENDERED_M64_OWNER_HELPER_ROUTES) == set(registry.ARCHES)
+    for arch, modules in registry._RENDERED_M64_OWNER_HELPER_ROUTES.items():
+        for module, program in modules.items():
+            # Every other launch of the module keeps its pair-share or routed
+            # program.
+            assert module in registry._RENDERED_PAIR_SHARE_ROUTES[arch], (arch, module)
+            assert program != registry._RENDERED_PAIR_SHARE_ROUTES[arch][module]
+            assert program != registry._RENDERED_ROUTES[arch][module]
+            assert program in registry._RENDERED_MODULES, (arch, program)
+            assert arch in registry._RENDERED_MODULES[program]["arches"]
+            routed.add(program)
+    assert set(registry._RENDERED_WORK_BIN_MIX_ROUTES) == set(registry.ARCHES)
+    for arch, modules in registry._RENDERED_WORK_BIN_MIX_ROUTES.items():
+        # A bin-mix build ships only where the runtime launches it.
+        assert not modules or arch in runtime.WORK_BIN_MIX_ARCHES, arch
+        for module, program in modules.items():
+            # Every turnover launch the bin-mix rule does not admit keeps the
+            # module's turnover program.
+            assert module in registry._RENDERED_WORK_BIN_TURN_ROUTES[arch], (
+                arch,
+                module,
+            )
+            assert program != registry._RENDERED_WORK_BIN_TURN_ROUTES[arch][module]
+            assert program in registry._RENDERED_MODULES, (arch, program)
+            assert arch in registry._RENDERED_MODULES[program]["arches"]
+            routed.add(program)
     assert routed == set(GENERATED)
 
 
@@ -234,6 +270,8 @@ def test_generated_plans_bind_from_the_shipped_plans():
             *registry._RENDERED_MAP_FOLD_ROUTES[arch].items(),
             *registry._RENDERED_PAIR_SHARE_ROUTES[arch].items(),
             *registry._RENDERED_WORK_BIN_TURN_ROUTES[arch].items(),
+            *registry._RENDERED_M64_OWNER_HELPER_ROUTES[arch].items(),
+            *registry._RENDERED_WORK_BIN_MIX_ROUTES[arch].items(),
         ]
         for module, program in routes:
             shipped = {
@@ -1023,6 +1061,8 @@ def unrouted(monkeypatch):
             "_RENDERED_MAP_FOLD_ROUTES",
             "_RENDERED_PAIR_SHARE_ROUTES",
             "_RENDERED_WORK_BIN_TURN_ROUTES",
+            "_RENDERED_M64_OWNER_HELPER_ROUTES",
+            "_RENDERED_WORK_BIN_MIX_ROUTES",
         ):
             monkeypatch.setattr(registry, table, {arch: {} for arch in registry.ARCHES})
 
@@ -1051,10 +1091,12 @@ def test_serving_rows_match_the_fp32_reference(
 
     # Work bins only change which CTA runs a task: without them the launch takes
     # the module's one-task-per-CTA program and matches bit for bit.  The
-    # turnover programs are built with work bins too (and a launch takes one
-    # only where the module has a work-binned program).
-    work_bin_programs = set(registry._RENDERED_WORK_BIN_ROUTES[arch].values()) | set(
-        registry._RENDERED_WORK_BIN_TURN_ROUTES[arch].values()
+    # turnover and bin-mix programs are built with work bins too (and a launch
+    # takes one only where the module has a work-binned program).
+    work_bin_programs = (
+        set(registry._RENDERED_WORK_BIN_ROUTES[arch].values())
+        | set(registry._RENDERED_WORK_BIN_TURN_ROUTES[arch].values())
+        | set(registry._RENDERED_WORK_BIN_MIX_ROUTES[arch].values())
     )
     if loaded & work_bin_programs:
         with monkeypatch.context() as patch:
@@ -1067,14 +1109,15 @@ def test_serving_rows_match_the_fp32_reference(
             assert not _modules(one_task_per_cta.prepared) & work_bin_programs
             _assert_bitwise(one_task_per_cta.run(), routed_result, "one task per CTA")
         # Nor does the selection without work bins (where it takes the H12
-        # early-pack body, the binned launch takes the binned N32 body).
+        # early-pack body, the binned launch takes the binned N32 body): every
+        # rule that asks for bins is off.
         with monkeypatch.context() as patch:
-            patch.setattr(
-                runtime, "_use_direct_work_bins", lambda *args, **kwargs: False
-            )
-            patch.setattr(
-                runtime, "_use_turnover_work_bins", lambda *args, **kwargs: False
-            )
+            for rule in (
+                "_use_direct_work_bins",
+                "_use_turnover_work_bins",
+                "_use_bounded_work_bins",
+            ):
+                patch.setattr(runtime, rule, lambda *args, **kwargs: False)
             unbinned = _Call(d, lower_bound)
             assert not _modules(unbinned.prepared) & work_bin_programs
             _assert_bitwise(unbinned.run(), routed_result, "selection without bins")
@@ -1297,8 +1340,11 @@ def _assert_turnover_schedule(turn, plain, expect):
 
 # Work-binned short launches on a 148-SM sm_100a and a 152-SM sm_103a part
 # (``test_turnover_rows_take_the_route_on_both_parts``).
+# Turnover launches the bin-mix rule does not admit (those take the bin-mix
+# build: BIN_MIX_ROWS): 16 x 32 tokens at 12 heads pairs a two-chunk bin with
+# a one-chunk bin, d = 1 gives g = 0, so the launch keeps the turnover build.
 TURNOVER_ROWS = [
-    pytest.param([64] * 16, 12, id="bs16x64-h12"),
+    pytest.param([32] * 16, 12, id="bs16x32-h12"),
     pytest.param([64] * 64, 16, id="bs64x64-h16"),
     pytest.param([17, 64, 65, 127, 128, 200, 255, 96] * 4, 12, id="mixed32-h12"),
     pytest.param([1, 33, 64, 96] * 12, 16, id="short-mixed-h16"),
@@ -1312,7 +1358,14 @@ def _assert_route(route, prepared):
     arch = registry.device_arch()
     schedule = str(prepared.schedule)
     loaded = _modules(prepared)
-    if route == "pair-share":
+    owner_helper = set(registry._RENDERED_M64_OWNER_HELPER_ROUTES[arch].values())
+    if route == "m64-owner-helper" and not owner_helper:
+        route = "pair-share"  # a loader without the build keeps the pair-share one
+    if route == "m64-owner-helper":
+        assert schedule.startswith("fused_m64_independent_dvsplit"), schedule
+        assert schedule.endswith("_owner2helper"), schedule
+        assert loaded & owner_helper
+    elif route == "pair-share":
         assert schedule.startswith("fused_m64_independent_dvsplit"), schedule
         assert schedule.endswith("_pair_share"), schedule
         assert loaded & set(registry._RENDERED_PAIR_SHARE_ROUTES[arch].values())
@@ -1350,6 +1403,140 @@ def test_turnover_launch_is_bitwise_the_work_binned_launch(
     _assert_bitwise(got, want, "turnover vs work-binned")
     _assert_bitwise(turn.run(), want, "turnover after the work-binned launch")
     _assert_bitwise(plain.run(), got, "work-binned repeat")
+
+
+# Unbounded work-binned short launches whose turnover bin table the bin-mix
+# rule admits on a 148-SM sm_100a and a 152-SM sm_103a part: bins of one and
+# two tasks, every two-task bin paired with a one-task bin it gives chunks to.
+# They take the bin-mix build on the WORK_BIN_MIX_ARCHES parts and keep the
+# turnover build on the others.
+BIN_MIX_ROWS = [
+    pytest.param([64] * 16, 12, id="bs16x64-h12"),
+    pytest.param([128] * 16, 12, id="bs16x128-h12"),
+    pytest.param([256] * 16, 12, id="bs16x256-h12"),
+    pytest.param([256, 224, 192, 160] * 4, 12, id="mixed16-h12"),
+]
+
+
+def _bin_mix_programs():
+    arch = registry.device_arch()
+    if arch not in runtime.WORK_BIN_MIX_ARCHES:
+        pytest.skip(
+            f"{arch} launches keep the turnover build "
+            "(test_bin_mix_rows_keep_the_turnover_build_elsewhere)"
+        )
+    programs = set(registry._RENDERED_WORK_BIN_MIX_ROUTES[arch].values())
+    assert programs, f"the loader names no bin-mix build on {arch}"
+    return programs
+
+
+def _without_bin_mix(patch):
+    patch.setattr(
+        registry,
+        "_RENDERED_WORK_BIN_MIX_ROUTES",
+        {arch: {} for arch in registry.ARCHES},
+    )
+
+
+@requires_blackwell
+@pytest.mark.parametrize("rows", [True, False], ids=["rows", "no-rows"])
+@pytest.mark.parametrize("lengths,heads", BIN_MIX_ROWS)
+def test_bin_mix_launch_is_bitwise_the_turnover_launch(
+    lengths, heads, rows, monkeypatch
+):
+    """A turnover launch whose bin table the bin-mix rule admits takes the
+    bin-mix build: a one-task bin prepares the last chunks of its paired
+    two-task bin after its own task and hands them over through the ring.  Its
+    schedule is the turnover launch's with ``_bin_mix`` added, and that one the
+    work-binned launch's with ``_turnover`` added.  Bit for bit the turnover
+    launch and the work-binned launch, with and without checkpoint rows,
+    launch after launch (the owners leave every ready word zero), in either
+    order."""
+    mix = _bin_mix_programs()
+    d = _inputs(lengths, heads)
+    mixed = _Call(d, None, rows=rows)
+    schedule = str(mixed.prepared.schedule)
+    assert schedule.endswith("_turnover_bin_mix"), schedule
+    assert _modules(mixed.prepared) & mix
+    with monkeypatch.context() as patch:
+        _without_bin_mix(patch)
+        turned = _Call(d, None, rows=rows)
+    with monkeypatch.context() as patch:
+        _without_turnover(patch)
+        plain = _Call(d, None, rows=rows)
+    assert str(turned.prepared.schedule) + "_bin_mix" == schedule
+    _assert_turnover_schedule(turned, plain, True)
+    assert not _modules(turned.prepared) & mix
+    assert not _modules(plain.prepared) & mix
+    got = mixed.run()
+    want = turned.run()
+    _assert_bitwise(got, want, "bin-mix vs turnover")
+    _assert_bitwise(got, plain.run(), "bin-mix vs work-binned")
+    _assert_bitwise(mixed.run(), want, "bin-mix after the other launches")
+    _assert_bitwise(turned.run(), got, "turnover repeat")
+
+
+@requires_blackwell
+@pytest.mark.parametrize("rows", [True, False], ids=["rows", "no-rows"])
+@pytest.mark.parametrize("lengths,heads", BIN_MIX_ROWS)
+def test_bin_mix_rows_keep_the_turnover_build_elsewhere(
+    lengths, heads, rows, monkeypatch
+):
+    """On a part outside ``WORK_BIN_MIX_ARCHES`` a turnover launch whose bin
+    table the bin-mix rule admits keeps the turnover build: no bin-mix
+    program, the work-binned launch's schedule with ``_turnover`` added, and
+    bit for bit the work-binned launch."""
+    arch = registry.device_arch()
+    if arch in runtime.WORK_BIN_MIX_ARCHES:
+        pytest.skip(
+            f"{arch} takes the bin-mix build "
+            "(test_bin_mix_launch_is_bitwise_the_turnover_launch)"
+        )
+    d = _inputs(lengths, heads)
+    turned = _Call(d, None, rows=rows)
+    assert str(turned.prepared.schedule).endswith("_turnover"), str(
+        turned.prepared.schedule
+    )
+    assert not _modules(turned.prepared) & set(
+        registry._RENDERED_WORK_BIN_MIX_ROUTES[arch].values()
+    )
+    with monkeypatch.context() as patch:
+        _without_turnover(patch)
+        plain = _Call(d, None, rows=rows)
+    _assert_turnover_schedule(turned, plain, True)
+    got = turned.run()
+    _assert_bitwise(got, plain.run(), "turnover vs work-binned")
+    _assert_bitwise(turned.run(), got, "turnover repeat")
+
+
+@requires_blackwell
+def test_refused_bin_mix_launch_runs_its_turnover_build(monkeypatch):
+    """A cooperative grid the device cannot hold (the work-bin table built for
+    twice the part's SMs, one bin per CTA): the driver refuses the bin-mix
+    launch, the plan switches for good to its turnover build with that build's
+    own bindings and matches it bit for bit, and later CUDA work is
+    unaffected."""
+    mix = _bin_mix_programs()
+    lengths, heads = [128] * 32, 12
+    sm_count = 2 * _sm_count()
+    monkeypatch.setattr(runtime, "_device_sm_count", lambda device: sm_count)
+    d = _inputs(lengths, heads)
+    refused = _Call(d, None)
+    schedule = str(refused.prepared.schedule)
+    assert schedule.endswith("_turnover_bin_mix"), schedule
+    assert _modules(refused.prepared) & mix
+    result = refused.run()
+    assert not _modules(refused.prepared) & mix
+    probe = torch.zeros(1024, device="cuda")
+    probe.add_(1)
+    torch.cuda.synchronize()
+    assert float(probe.sum()) == 1024.0
+    _assert_bitwise(refused.run(), result, "fallback repeat")
+    with monkeypatch.context() as patch:
+        _without_bin_mix(patch)
+        turned = _Call(d, None)
+    assert str(turned.prepared.schedule) == schedule.removesuffix("_bin_mix")
+    _assert_bitwise(result, turned.run(), "refused bin-mix vs its turnover build")
 
 
 def _bounded_turnover_expected(lengths, heads):
@@ -1707,9 +1894,10 @@ def test_turnover_bins_keep_one_task_per_cta_without_a_turnover_build(
     lengths, heads, monkeypatch
 ):
     """A bounded launch never asks for turnover bins (its module's turnover
-    build takes work-binned launches only), and a loader without the turn table
-    has no turnover build: the launch keeps the one-task-per-CTA program, the
-    same programs and schedule as without the rule, bit for bit."""
+    build takes strict work-binned launches only; the bounded rule may give it
+    plain bins instead), and a loader without the turn table has no turnover
+    build: the launch keeps the programs, bin tables and schedule it takes
+    without the turnover-bin rule, bit for bit."""
     for lower_bound, drop_turn in ((-5.0, False), (None, True)):
         d = _inputs(lengths, heads)
         with monkeypatch.context() as patch:
@@ -1730,7 +1918,8 @@ def test_turnover_bins_keep_one_task_per_cta_without_a_turnover_build(
 # Bounded launches the strict test keeps one task per CTA where, on both parts,
 # the turnover-bin rule holds (``_use_turnover_work_bins``), the bounded
 # predicate holds on the strict table (``_bounded_turnover_route``) and the
-# module has a turnover build: only the gate keeps them on one task per CTA.
+# module has a turnover build: the gate keeps them off the turnover bins, and
+# the bounded rule (``_use_bounded_work_bins``) gives them plain bins.
 BOUNDED_ONE_TASK_ROWS = [
     pytest.param([256] * 2 + [128] * 12, 16, id="2x256+12x128-h16"),
     pytest.param([256] * 3 + [128] * 14, 12, id="3x256+14x128-h12"),
@@ -1738,14 +1927,27 @@ BOUNDED_ONE_TASK_ROWS = [
 ]
 
 
+def _bounded_bin_table(lengths, heads, sm_count):
+    """The bin table of a launch the bounded rule bins (its task cost)."""
+    return runtime._make_direct_work_bins(
+        tuple(lengths),
+        num_heads=heads,
+        worker_count=sm_count,
+        chunk_tokens=runtime.BF16_M128_CHUNK,
+        task_cost=runtime.BF16_BOUNDED_WORK_BIN_TASK_COST,
+    )[0]
+
+
 @requires_blackwell
 @pytest.mark.parametrize("lengths,heads", BOUNDED_ONE_TASK_ROWS)
 def test_bounded_launches_never_take_turnover_bins(lengths, heads, monkeypatch):
-    """A bounded launch the strict test keeps one task per CTA takes no work
-    bins, although on this part the turnover-bin rule admits it, the bounded
-    predicate holds on its strict bin table and its module has a turnover
-    build: no turnover program and no bin table, the same programs and
-    schedule as with the turnover-bin rule off, bit for bit."""
+    """A bounded launch the strict test keeps one task per CTA never takes the
+    turnover bins or the turnover build, although on this part the
+    turnover-bin rule admits it, the bounded predicate holds on its strict bin
+    table and its module has a turnover build: it takes the plain work-binned
+    program with the bounded rule's table, the same programs, table and
+    schedule as with the turnover-bin rule off, and bit for bit the
+    one-task-per-CTA launch it takes with the bounded rule off."""
     sm = torch.cuda.get_device_properties(
         torch.cuda.current_device()
     ).multi_processor_count
@@ -1764,6 +1966,7 @@ def test_bounded_launches_never_take_turnover_bins(lengths, heads, monkeypatch):
         gpu_arch=arch,
         sm_count=sm,
     )
+    assert runtime._use_bounded_work_bins(seq_lens, num_heads=heads, sm_count=sm)
     builds = []
     original = runtime.FlashKDABlackwellBF16FusedLaunch._build_body
 
@@ -1796,15 +1999,80 @@ def test_bounded_launches_never_take_turnover_bins(lengths, heads, monkeypatch):
     with monkeypatch.context() as patch:
         patch.setattr(runtime, "_use_turnover_work_bins", lambda *args, **kwargs: False)
         plain = _Call(d, -5.0)
+    with monkeypatch.context() as patch:
+        patch.setattr(runtime, "_use_bounded_work_bins", lambda *args, **kwargs: False)
+        one_task = _Call(d, -5.0)
+    work_bin_programs = set(registry._RENDERED_WORK_BIN_ROUTES[arch].values())
     assert str(ruled.prepared.schedule) == str(plain.prepared.schedule)
     assert _modules(ruled.prepared) == _modules(plain.prepared)
+    assert _modules(ruled.prepared) & work_bin_programs
     assert not _modules(ruled.prepared) & _turn_programs()
     assert "_turnover" not in str(ruled.prepared.schedule)
-    assert _work_bin_tables(ruled.prepared) == _work_bin_tables(plain.prepared) == []
+    assert (
+        _work_bin_tables(ruled.prepared)
+        == _work_bin_tables(plain.prepared)
+        == [_bounded_bin_table(lengths, heads, sm)]
+    )
+    assert not _modules(one_task.prepared) & (work_bin_programs | _turn_programs())
+    assert _work_bin_tables(one_task.prepared) == []
     got = ruled.run()
-    want = plain.run()
-    _assert_bitwise(got, want, "bounded one task per CTA vs the rule off")
-    _assert_bitwise(plain.run(), got, "rule off repeat")
+    want = one_task.run()
+    _assert_bitwise(got, want, "bounded plain bins vs one task per CTA")
+    _assert_bitwise(plain.run(), got, "turnover-bin rule off")
+    _assert_bitwise(one_task.run(), got, "one task per CTA repeat")
+
+
+# Short bounded N32 launches the strict bin test keeps one task per CTA that
+# take plain work bins (``_use_bounded_work_bins``) on both parts: the mixed
+# H16 row and a long-and-short H16 row.
+BOUNDED_BIN_ROWS = [
+    pytest.param([17, 64, 65, 127, 128, 200, 255, 96] * 2, 16, id="mixed-h16"),
+    pytest.param([256] * 8 + [128] * 2, 16, id="8x256+2x128-h16"),
+]
+
+
+@requires_blackwell
+@pytest.mark.parametrize("rows", [True, False], ids=["rows", "no-rows"])
+@pytest.mark.parametrize("lengths,heads", BOUNDED_BIN_ROWS)
+def test_bounded_bins_launch_is_bitwise_the_one_task_per_cta_launch(
+    lengths, heads, rows, monkeypatch
+):
+    """A short bounded launch the strict test keeps one task per CTA takes its
+    module's plain work-binned program with bins charged the bounded task cost,
+    never the turnover build; bit for bit the one-task-per-CTA launch it
+    replaces, with and without checkpoint rows, free memory and outputs
+    poisoned before every launch, in either order."""
+    sm_count = torch.cuda.get_device_properties(
+        torch.cuda.current_device()
+    ).multi_processor_count
+    seq_lens = tuple(lengths)
+    assert not runtime._use_direct_work_bins(
+        seq_lens,
+        num_heads=heads,
+        sm_count=sm_count,
+        chunk_tokens=runtime.BF16_M128_CHUNK,
+    )
+    assert runtime._use_bounded_work_bins(seq_lens, num_heads=heads, sm_count=sm_count)
+    d = _inputs(lengths, heads)
+    binned = _Call(d, -5.0, rows=rows)
+    with monkeypatch.context() as patch:
+        patch.setattr(runtime, "_use_bounded_work_bins", lambda *args, **kwargs: False)
+        direct = _Call(d, -5.0, rows=rows)
+    arch = registry.device_arch()
+    work_bin_programs = set(registry._RENDERED_WORK_BIN_ROUTES[arch].values())
+    assert _modules(binned.prepared) & work_bin_programs
+    assert not _modules(binned.prepared) & _turn_programs()
+    assert "_turnover" not in str(binned.prepared.schedule)
+    assert not _modules(direct.prepared) & (_turn_programs() | work_bin_programs)
+    assert _work_bin_tables(binned.prepared) == [
+        _bounded_bin_table(lengths, heads, sm_count)
+    ]
+    assert _work_bin_tables(direct.prepared) == []
+    got = binned.run()
+    want = direct.run()
+    _assert_bitwise(got, want, "bounded plain bins vs one task per CTA")
+    _assert_bitwise(binned.run(), want, "bounded plain bins after one task per CTA")
+    _assert_bitwise(direct.run(), got, "one task per CTA repeat")
 
 
 @requires_blackwell
@@ -1842,11 +2110,12 @@ def test_bounded_and_long_launches_keep_their_build(lower_bound, monkeypatch):
         _assert_bitwise(turn.run(), plain.run(), f"{lengths[:2]} h{heads}")
 
 
-# The fourth field names the launch a row is there for: the last three rows hold
-# the launches that differ most from the others in a graph (the 2-CTA cluster
-# launch of the pair-share program, the cooperative launch of the pooled
-# owner/helper program, and the chain composite whose main body writes the
-# window maps, no map pass).  The last field: whether the launch takes a
+# The fourth field names the launch a row is there for: the last four rows hold
+# the launches that differ most from the others in a graph (the cooperative
+# launch of the M64 owner/helper program, the 2-CTA cluster launch of the
+# pair-share program, the cooperative launch of the pooled owner/helper
+# program, and the chain composite whose main body writes the window maps, no
+# map pass).  The last field: whether the launch takes a
 # turnover build (work-binned unbounded N32 launches of short tasks on both
 # parts; None: the part's bounded predicate decides; the mixed H12 row is not
 # work binned, its longest task alone sets the makespan).
@@ -1859,7 +2128,15 @@ GRAPH_ROWS = [
     pytest.param([8128, 64, 8128, 64], 16, None, None, False, id="long-short-h16"),
     pytest.param([64] * 16, 12, None, None, True, id="bs16x64-h12-turnover"),
     pytest.param(
-        [8192] * 2, 16, -5.0, "pair-share", False, id="2x8192-h16-lb5-pair-share"
+        [8192] * 2, 16, -5.0, "m64-owner-helper", False, id="2x8192-h16-lb5-m64oh"
+    ),
+    pytest.param(
+        [8128, 64] * 2,
+        16,
+        -5.0,
+        "pair-share",
+        False,
+        id="2x(8128+64)-h16-lb5-pair-share",
     ),
     pytest.param([4096] * 4, 16, None, "pool", False, id="4x4096-h16-pool"),
     pytest.param([8192], 12, -5.0, "map-fold", False, id="8192-h12-lb5-map-fold"),
@@ -2134,9 +2411,11 @@ def test_pair_share_is_bitwise_the_routed_m64_program(
     for bit, the routed M64 program (the loader without pair-share builds):
     output, final states and checkpoint rows, with and without state indices,
     initial states and checkpoint rows; each arm has its own copy of the
-    initial pool."""
+    initial pool.  The owner/helper rule is held off: it would take the rows
+    of up to 36 tasks whose sequences all reach its length."""
     arch = registry.device_arch()
     pair_share = set(registry._RENDERED_PAIR_SHARE_ROUTES[arch].values())
+    _m64_owner_helper_rule(monkeypatch, 0, 0)
     d = _inputs(lengths, heads)
 
     shared = _Call(_own_pool(d), -5.0, **state)
@@ -2219,7 +2498,9 @@ def test_pair_share_threshold_of_the_part(lengths, heads, expected, monkeypatch)
     (dense FP32 states, checkpoint rows) lands on: the exact schedule of the
     routed or of the pair-share program.  Where the build is taken it equals
     the routed program bit for bit, and a device that holds one 2-CTA cluster
-    fewer than the launch has tasks keeps the routed program."""
+    fewer than the launch has tasks keeps the routed program.  The owner/helper
+    rule is held off (it would take the launches of up to 36 tasks)."""
+    _m64_owner_helper_rule(monkeypatch, 0, 0)
     part = (registry.device_arch(), _sm_count())
     if part not in PAIR_SHARE_PARTS:
         pytest.skip(
@@ -2251,6 +2532,123 @@ def test_pair_share_threshold_of_the_part(lengths, heads, expected, monkeypatch)
     monkeypatch.setattr(runtime, "_m64_pair_cluster_capacity", lambda _: tasks)
     at_capacity = _Call(_own_pool(d), -5.0, indexed=False)
     assert str(at_capacity.prepared.schedule) == schedule
+
+
+# The M64 owner/helper build: long M64 value-split launches (dense FP32
+# states) whose owner and helper CTAs the device holds at once.  Rule rows
+# that take exactly the launch's task count (``_m64_owner_helper_rule``) stand
+# in for the measured rule.
+M64_OWNER_HELPER_ROWS = [
+    pytest.param([8192], 6, id="8192-h6"),
+    pytest.param([1024], 16, id="1024-h16"),
+    pytest.param([4096] * 2, 16, id="2x4096-h16"),
+    pytest.param([8192, 17], 12, id="8192+17-h12"),
+    pytest.param([3000, 13384], 16, id="3000+13384-h16"),
+]
+M64_OWNER_HELPER_STATES = [
+    pytest.param(dict(), id="dense-state"),
+    pytest.param(dict(initial=False), id="zero-initial-state"),
+    pytest.param(dict(rows=False), id="dense-state-no-rows"),
+]
+
+
+def _m64_owner_helper_rule(monkeypatch, tasks, helpers):
+    """Rule rows of both parts that take launches of ``tasks`` tasks with
+    ``helpers`` helpers per task (no rows for 0)."""
+    rows = ((tasks, 1, helpers),) if helpers else ()
+    monkeypatch.setattr(runtime, "M64_OWNER_HELPER_MIN_SEQ_LEN", rows)
+    monkeypatch.setattr(runtime, "M64_OWNER_HELPER_MIN_SEQ_LEN_GB300", rows)
+
+
+def _m64_owner_helper_programs():
+    arch = registry.device_arch()
+    programs = set(registry._RENDERED_M64_OWNER_HELPER_ROUTES[arch].values())
+    if not programs:
+        pytest.skip(f"the loader names no M64 owner/helper build on {arch}")
+    return programs
+
+
+@requires_blackwell
+@pytest.mark.parametrize("helpers", [2, 3])
+@pytest.mark.parametrize("state", M64_OWNER_HELPER_STATES)
+@pytest.mark.parametrize("lengths,heads", M64_OWNER_HELPER_ROWS)
+def test_m64_owner_helper_is_bitwise_the_pair_share_and_routed_programs(
+    lengths, heads, state, helpers, monkeypatch
+):
+    """A long M64 value-split launch that takes the owner/helper build equals,
+    bit for bit, the program it replaces (pair-share where that rule takes the
+    launch, else routed) and the routed program: output, final states and
+    checkpoint rows, launch after launch (the program leaves its words zero),
+    with and without initial states and checkpoint rows."""
+    owner_helper = _m64_owner_helper_programs()
+    tasks = len(lengths) * heads
+    device = torch.device("cuda", torch.cuda.current_device())
+    capacity = runtime._probe_m64_cooperative_capacity(device)
+    assert capacity, "the cooperative capacity probe failed"
+    if tasks * (2 + helpers) > capacity:
+        pytest.skip(f"{capacity} resident CTAs for {tasks} x (2 + {helpers})")
+    d = _inputs(lengths, heads)
+    _m64_owner_helper_rule(monkeypatch, tasks, helpers)
+    taken = _Call(_own_pool(d), -5.0, indexed=False, **state)
+    schedule = str(taken.prepared.schedule)
+    suffix = f"_owner{helpers}helper"
+    assert schedule.startswith("fused_m64_independent_dvsplit_fp32_state"), schedule
+    assert schedule.endswith(suffix), schedule
+    assert _modules(taken.prepared) & owner_helper
+    result = taken.run()
+    _assert_bitwise(taken.run(), result, "owner/helper repeat")
+
+    monkeypatch.undo()
+    _m64_owner_helper_rule(monkeypatch, tasks, 0)
+    base = schedule.removesuffix(suffix)
+    kept = _Call(_own_pool(d), -5.0, indexed=False, **state)
+    assert str(kept.prepared.schedule) in (base, base + "_pair_share")
+    assert not _modules(kept.prepared) & owner_helper
+    _assert_bitwise(result, kept.run(), "owner/helper vs the program it replaces")
+    monkeypatch.setattr(
+        registry,
+        "_RENDERED_PAIR_SHARE_ROUTES",
+        {name: {} for name in registry.ARCHES},
+    )
+    routed = _Call(_own_pool(d), -5.0, indexed=False, **state)
+    assert str(routed.prepared.schedule) == base
+    _assert_bitwise(result, routed.run(), "owner/helper vs routed M64")
+
+
+@requires_blackwell
+def test_refused_m64_owner_helper_launch_runs_its_fallback(monkeypatch):
+    """A cooperative grid the device cannot hold (the capacity probe
+    overridden): the driver refuses the owner/helper launch, the plan switches
+    for good to the pair-share or routed program it would otherwise take and
+    matches that program bit for bit, and later CUDA work is unaffected."""
+    owner_helper = _m64_owner_helper_programs()
+    lengths, heads = [4096] * 6, 12
+    tasks = len(lengths) * heads
+    assert tasks * 4 > _sm_count()
+    d = _inputs(lengths, heads)
+    monkeypatch.setattr(runtime, "_m64_cooperative_capacity", lambda device: 1 << 20)
+    _m64_owner_helper_rule(monkeypatch, tasks, 2)
+    refused = _Call(_own_pool(d), -5.0, indexed=False)
+    schedule = str(refused.prepared.schedule)
+    assert schedule.endswith("_owner2helper"), schedule
+    assert _modules(refused.prepared) & owner_helper
+    result = refused.run()
+    assert not _modules(refused.prepared) & owner_helper
+    probe = torch.zeros(1024, device="cuda")
+    probe.add_(1)
+    torch.cuda.synchronize()
+    assert float(probe.sum()) == 1024.0
+    _assert_bitwise(refused.run(), result, "fallback repeat")
+
+    monkeypatch.undo()
+    _m64_owner_helper_rule(monkeypatch, tasks, 0)
+    kept = _Call(_own_pool(d), -5.0, indexed=False)
+    assert not _modules(kept.prepared) & owner_helper
+    assert str(kept.prepared.schedule) in (
+        schedule.removesuffix("_owner2helper"),
+        schedule.removesuffix("_owner2helper") + "_pair_share",
+    )
+    _assert_bitwise(result, kept.run(), "refused owner/helper vs its fallback")
 
 
 CHAIN_ROWS = [

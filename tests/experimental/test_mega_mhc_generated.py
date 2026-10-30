@@ -5,6 +5,7 @@ import gc
 import pytest
 import torch
 from flashinfer.experimental.deepgemm_mega_mhc import mega_mhc as _runtime
+from flashinfer.jit import env as jit_env
 from flashinfer.mega_mhc import prepare_mega_mhc
 
 EXPORTED_TOKENS = (1, 64, 65, 200, 1025, 4096)
@@ -1549,6 +1550,28 @@ def test_h4096_quant_routes_select_their_programs():
         names = [name for _kind, name in _runtime.record_arg_plan(record)]
         assert names[-3:] == ["grid_x", "grid_y", "grid_z"]
         assert set(QUANT_OUTPUTS[layout]) < set(names)
+
+
+def test_launch_records_match_their_bindings():
+    """A program's launch record says which launch attributes its binding sets:
+    the hidden-4096 programs launch cooperatively with programmatic dependent
+    launch (each kernel waits on griddepcontrol.wait before reading the previous
+    kernel's outputs), so regenerating a binding or a record alone fails here."""
+    checked = 0
+    for name, record in _runtime.PROGRAMS.items():
+        launch = record.get("launch")
+        if launch is None:
+            continue
+        (binding,) = [p for p in record["sources"] if p.endswith("_binding.cu")]
+        text = (jit_env.FLASHINFER_CSRC_DIR / binding.removeprefix("csrc/")).read_text()
+        assert ("cudaLaunchAttributeCooperative" in text) == launch["cooperative"], name
+        assert ("cudaLaunchAttributeProgrammaticStreamSerialization" in text) == launch[
+            "use_pdl"
+        ], name
+        if record["hidden"] == 4096:
+            assert launch["cooperative"] and launch["use_pdl"], name
+        checked += 1
+    assert checked > 0
 
 
 def test_h4096_every_program_ships_for_every_listed_architecture():

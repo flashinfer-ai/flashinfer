@@ -1159,7 +1159,7 @@ def chunk_gated_delta_rule(
     use_cp: Literal["auto"] | bool = "auto",
     state_indices: Optional[torch.Tensor] = None,
     _cp_chunk_len: Optional[int] = None,
-    backend: Literal["auto", "flashinfer", "cake_gdn", "cudnn"] = "auto",
+    backend: Literal["auto", "flashinfer", "cake_gdn", "cudnn", "sm120_cute"] = "auto",
     max_seqlen: Optional[int] = None,
     *,
     gate_domain: Literal["linear", "log"] = "linear",
@@ -1306,7 +1306,7 @@ def chunk_gated_delta_rule(
         Internal context-parallel chunk-length override used for testing and
         tuning. ``None`` lets the CP backend select the length automatically;
         an explicit value must be a multiple of 64.
-    backend : {"auto", "flashinfer", "cake_gdn", "cudnn"}
+    backend : {"auto", "flashinfer", "cake_gdn", "cudnn", "sm120_cute"}
         ``auto`` uses the native SM90/SM100/SM120 kernels and context-parallel
         routing, and may select cuDNN for measured SM100 raw-gate inference
         workloads. Automatic cuDNN selection requires both gate-fusion flags,
@@ -1385,7 +1385,9 @@ def chunk_gated_delta_rule(
         same values (vLLM's ``query_start_loc_cpu``, the prefix sums of
         SGLang's ``extend_seq_lens_cpu``). Used by ``backend="cake_gdn"``
         without CP, and on SM8x by the ``use_cp="auto"`` and V32 rules, which
-        need the exact longest sequence and keep the fused path without it. When given, the Cake
+        need the exact longest sequence and keep the fused path without it.
+        It is also required by the explicit experimental ``sm120_cute`` route.
+        When given, the Cake
         route validates it on the host (non-decreasing, first entry ``0``,
         last entry ``total_seq_len``; a mismatch raises before any launch),
         takes the exact longest sequence as the bound for variant selection,
@@ -1467,6 +1469,12 @@ def chunk_gated_delta_rule(
 
     Notes
     -----
+    - ``backend="sm120_cute"`` explicitly selects the experimental RTX 6000D
+      SM120 D=128 CuTe implementation. Fast calls require native finite FP32
+      log gates (``gate_domain="log"``), FP32 beta/state and matching immutable
+      ``cu_seqlens_cpu`` metadata. Unsupported calls, including checkpoints,
+      state pools, linear/raw gates and low-precision state, use FlashInfer's
+      official implementation. Stable automatic dispatch never selects it.
     - Supports GQA (``num_q_heads > num_k_heads = num_v_heads``) and GVA
       (``num_v_heads > num_q_heads = num_k_heads``).
     - The final state layout is ``[N, H, V, K]``.
@@ -1485,8 +1493,40 @@ def chunk_gated_delta_rule(
       ``cu_seqlens_cpu`` gives a longest sequence of at least 8192 tokens and
       ``num_seqs * max(num_q_heads, num_v_heads)`` is at most 16.
     """
-    if backend not in ("auto", "flashinfer", "cake_gdn", "cudnn"):
+    if backend not in ("auto", "flashinfer", "cake_gdn", "cudnn", "sm120_cute"):
         raise ValueError(f"unsupported GDN backend: {backend!r}")
+    if backend == "sm120_cute":
+        from .api_logging import warn_experimental_backend_once
+        from .experimental.gdn_sm120_cute import run
+
+        warn_experimental_backend_once("chunk_gated_delta_rule", "sm120_cute")
+        return run(
+            q,
+            k,
+            v,
+            g=g,
+            beta=beta,
+            scale=scale,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            cu_seqlens=cu_seqlens,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            output=output,
+            output_state=output_state,
+            state_checkpoints=state_checkpoints,
+            checkpoint_cu_starts=checkpoint_cu_starts,
+            checkpoint_every_n_tokens=checkpoint_every_n_tokens,
+            use_cp=use_cp,
+            state_indices=state_indices,
+            _cp_chunk_len=_cp_chunk_len,
+            max_seqlen=max_seqlen,
+            gate_domain=gate_domain,
+            use_gate_in_kernel=use_gate_in_kernel,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            beta_is_logit=beta_is_logit,
+            cu_seqlens_cpu=cu_seqlens_cpu,
+        )
     if backend != "cudnn" and (
         gate_domain != "linear"
         or use_gate_in_kernel

@@ -31,7 +31,8 @@ A record is one *stage*: a build of the kernel with one set of knobs (the
 launch bound, the scan rounds of the request lookup, the early request guess,
 the page-row prefetch, the fold of the clearing work into the row CTAs, the
 dispatch order of the grid axes, the KV heads per clearing CTA, the width of
-its zero stores and whether it reads its request length after the vote); the
+its zero stores, whether it reads its request length after the vote and
+whether its CTAs stay resident and stride over the work items); the
 head configuration, the quantization policy
 (dynamic per-token scale or the static ``q_scale_inv``), the norm policy,
 prefill versus decode and the caller-owned K/V route are launch parameters.
@@ -41,7 +42,9 @@ the architecture, the SM count and the problem (``STAGE_POLICY``, mirrored by
 :func:`launch_grid`: one CTA per
 (packed row, KV group) plus one per (request, KV head) for the last-page
 zero-fill and the request's ``split_k_flag``, or one per (row, KV group)
-alone for a ``fold`` build.
+alone for a ``fold`` build; a ``persistent`` build launches ``min_blocks``
+CTAs per SM per KV head (at most one per item) on the x axis, each striding
+over the request and row items of its KV head.
 
 The program name ``cake_fused_qk_rope_fp8_append_<20 hex>`` is the first
 twenty hex digits of the SHA-256 of the compact JSON ``{"build": <build
@@ -120,6 +123,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "clear_heads_per_cta": 1,
             "zero_store_width": 128,
             "clear_tie": False,
+            "persistent": False,
         },
         "kernel": "cake_fused_qk_rope_fp8_append_ddc461f6feaaa3960c3c",
         "kernel_symbol": "kernel_cake_fused_qk_rope_fp8_append_ddc461f6feaaa3960c3c",
@@ -226,6 +230,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "clear_heads_per_cta": 1,
             "zero_store_width": 128,
             "clear_tie": True,
+            "persistent": False,
         },
         "kernel": "cake_fused_qk_rope_fp8_append_1c960609dcf4891544ae",
         "kernel_symbol": "kernel_cake_fused_qk_rope_fp8_append_1c960609dcf4891544ae",
@@ -331,6 +336,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "clear_heads_per_cta": 1,
             "zero_store_width": 128,
             "clear_tie": False,
+            "persistent": False,
         },
         "kernel": "cake_fused_qk_rope_fp8_append_4bf37605f76680f21880",
         "kernel_symbol": "kernel_cake_fused_qk_rope_fp8_append_4bf37605f76680f21880",
@@ -434,6 +440,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "clear_heads_per_cta": 1,
             "zero_store_width": 128,
             "clear_tie": True,
+            "persistent": False,
         },
         "kernel": "cake_fused_qk_rope_fp8_append_ff22734cc105d1f0f779",
         "kernel_symbol": "kernel_cake_fused_qk_rope_fp8_append_ff22734cc105d1f0f779",
@@ -540,6 +547,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "clear_heads_per_cta": 1,
             "zero_store_width": 128,
             "clear_tie": True,
+            "persistent": False,
         },
         "kernel": "cake_fused_qk_rope_fp8_append_dc08ab78468329e60f27",
         "kernel_symbol": "kernel_cake_fused_qk_rope_fp8_append_dc08ab78468329e60f27",
@@ -645,6 +653,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "clear_heads_per_cta": 1,
             "zero_store_width": 128,
             "clear_tie": False,
+            "persistent": False,
         },
         "kernel": "cake_fused_qk_rope_fp8_append_c0f0b47d168812a2c23f",
         "kernel_symbol": "kernel_cake_fused_qk_rope_fp8_append_c0f0b47d168812a2c23f",
@@ -749,6 +758,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "clear_heads_per_cta": 1,
             "zero_store_width": 128,
             "clear_tie": False,
+            "persistent": False,
         },
         "kernel": "cake_fused_qk_rope_fp8_append_343d43791fe5ef7ca3fe",
         "kernel_symbol": "kernel_cake_fused_qk_rope_fp8_append_343d43791fe5ef7ca3fe",
@@ -853,6 +863,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "clear_heads_per_cta": 1,
             "zero_store_width": 128,
             "clear_tie": True,
+            "persistent": False,
         },
         "kernel": "cake_fused_qk_rope_fp8_append_9a2e2447dc736f790b38",
         "kernel_symbol": "kernel_cake_fused_qk_rope_fp8_append_9a2e2447dc736f790b38",
@@ -958,6 +969,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "clear_heads_per_cta": 1,
             "zero_store_width": 128,
             "clear_tie": True,
+            "persistent": False,
         },
         "kernel": "cake_fused_qk_rope_fp8_append_1479818c8e3a9ce444c7",
         "kernel_symbol": "kernel_cake_fused_qk_rope_fp8_append_1479818c8e3a9ce444c7",
@@ -1061,6 +1073,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "clear_heads_per_cta": 2,
             "zero_store_width": 256,
             "clear_tie": False,
+            "persistent": False,
         },
         "kernel": "cake_fused_qk_rope_fp8_append_d2029163a92958e54025",
         "kernel_symbol": "kernel_cake_fused_qk_rope_fp8_append_d2029163a92958e54025",
@@ -1165,6 +1178,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "clear_heads_per_cta": 1,
             "zero_store_width": 256,
             "clear_tie": False,
+            "persistent": False,
         },
         "kernel": "cake_fused_qk_rope_fp8_append_79aed55694e2358f81b9",
         "kernel_symbol": "kernel_cake_fused_qk_rope_fp8_append_79aed55694e2358f81b9",
@@ -1215,6 +1229,110 @@ MODULES: dict[str, dict[str, Any]] = {
         "stage": "fp8_e4m3_grid_order3_zero_store_width256",
         "workspace_rule": None,
     },
+    "fp8_e4m3_min_blocks10_persistent1": {
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+        ],
+        "arg_plan": [
+            ["buffer", "qkv"],
+            ["buffer", "cos_sin"],
+            ["buffer", "seq_lens"],
+            ["buffer", "q_indptr"],
+            ["buffer", "page_indices"],
+            ["buffer", "q_norm_weight"],
+            ["buffer", "k_norm_weight"],
+            ["buffer", "k_scale"],
+            ["buffer", "v_scale"],
+            ["buffer", "q_scale_inv"],
+            ["buffer", "out_q"],
+            ["buffer", "key_cache"],
+            ["buffer", "value_cache"],
+            ["buffer", "out_k"],
+            ["buffer", "out_v"],
+            ["buffer", "q_scale"],
+            ["buffer", "split_k_flag"],
+            ["parameter", "num_rows"],
+            ["parameter", "num_requests"],
+            ["parameter", "num_q_heads"],
+            ["parameter", "num_kv_heads"],
+            ["parameter", "page_size"],
+            ["parameter", "max_pages_per_request"],
+            ["parameter", "max_seqlen"],
+            ["parameter", "max_seqlen_aligned"],
+            ["parameter", "quant_policy"],
+            ["parameter", "norm_policy"],
+            ["parameter", "is_prefill"],
+            ["parameter", "has_out_kv"],
+            ["parameter", "upper_max"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "persistent_items_by_kv_heads",
+        },
+        "knobs": {
+            "min_blocks": 10,
+            "scan_rounds": 1,
+            "early_rt2": False,
+            "page_prefetch": False,
+            "kv_groups_per_cta": 1,
+            "fold": False,
+            "grid_order": 0,
+            "clear_heads_per_cta": 1,
+            "zero_store_width": 128,
+            "clear_tie": False,
+            "persistent": True,
+        },
+        "kernel": "cake_fused_qk_rope_fp8_append_bc6c52ab41114c98fa85",
+        "kernel_symbol": "kernel_cake_fused_qk_rope_fp8_append_bc6c52ab41114c98fa85",
+        # B300 and B200 prefill of one to sixteen requests beyond four waves:
+        # ten resident CTAs per SM stride over the request and row items.
+        "launch": {
+            "block": (96, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 0,
+            "use_pdl": False,
+        },
+        "library": "cake_fused_qk_rope_fp8_append_bc6c52ab41114c98fa85",
+        "logical": {
+            "cos_sin": "cos_sin",
+            "has_out_kv": "has_out_kv",
+            "is_prefill": "is_prefill",
+            "k_norm_weight": "k_norm_weight",
+            "k_scale": "k_scale",
+            "key_cache": "key_cache",
+            "max_pages_per_request": "max_pages_per_request",
+            "max_seqlen": "max_seqlen",
+            "max_seqlen_aligned": "max_seqlen_aligned",
+            "norm_policy": "norm_policy",
+            "num_kv_heads": "num_kv_heads",
+            "num_q_heads": "num_q_heads",
+            "num_requests": "num_requests",
+            "num_rows": "num_rows",
+            "out_k": "out_k",
+            "out_q": "out_q",
+            "out_v": "out_v",
+            "page_indices": "page_indices",
+            "page_size": "page_size",
+            "q_indptr": "q_indptr",
+            "q_norm_weight": "q_norm_weight",
+            "q_scale": "q_scale",
+            "q_scale_inv": "q_scale_inv",
+            "qkv": "qkv",
+            "quant_policy": "quant_policy",
+            "seq_lens": "seq_lens",
+            "split_k_flag": "split_k_flag",
+            "upper_max": "upper_max",
+            "v_scale": "v_scale",
+            "value_cache": "value_cache",
+        },
+        "stage": "fp8_e4m3_min_blocks10_persistent1",
+        "workspace_rule": None,
+    },
 }
 
 # One verified build per architecture: H100 / H200 (``sm_90a``), B200
@@ -1249,6 +1367,7 @@ KNOB_KEYS = (
     "clear_heads_per_cta",
     "zero_store_width",
     "clear_tie",
+    "persistent",
 )
 # The Cake stage policy: the per-card constants and the rule of this round
 # (``version`` is the policy table's).  ``policy_knobs`` is the executable form.
@@ -1266,6 +1385,8 @@ STAGE_POLICY: dict[str, Any] = {
         "gb300_sms": 152,
         "u2z_ctas": (16, 128),
         "b300_er2pp9_min_ctas": 512,
+        "persistent_max_requests": 16,
+        "persistent_min_waves": 4.0,
     },
     "rule": (
         "num_requests == 0 -> the default build (every card: the early_rt2 "
@@ -1295,17 +1416,21 @@ STAGE_POLICY: dict[str, Any] = {
         "decode and Hkv == 1 and prefetch_ok and (num_rows + num_requests) * "
         "Hkv >= b300_er2pp9_min_ctas and waves <= fold_waves[1] -> er2pp9; "
         "is_prefill and Hkv >= fold_min_kv_heads and num_requests >= "
-        "swap_min_requests and waves <= 1 and order_ok -> grid_order=2; then the "
+        "swap_min_requests and waves <= 1 and order_ok -> grid_order=2; "
+        "is_prefill and 1 <= num_requests <= persistent_max_requests and waves > "
+        "persistent_min_waves -> min_blocks=10, persistent; then the "
         "shared table. b200 first: is_prefill and Hkv >= fold_min_kv_heads and "
         "num_requests >= swap_min_requests and waves <= 1 and order_ok -> "
         "grid_order=2; u2z_class and not prefetch_ok -> grid_order=3, "
-        "zero_store_width=256; then the shared table. shared (b200 / b300): "
+        "zero_store_width=256; is_prefill and 1 <= num_requests <= "
+        "persistent_max_requests and waves > persistent_min_waves -> "
+        "min_blocks=10, persistent; then the shared table. shared (b200 / b300): "
         "decode and waves > fold_waves[1] -> s3 from scan_rounds3_min_requests "
         "requests else the default build; prefill and waves > 1 -> min_blocks=10; "
         "prefetch_ok and (decode or Hkv == 1) -> early_rt2, page_prefetch, "
         "clear_tie; else the default build"
     ),
-    "version": "round3-v11-2026-10-28",
+    "version": "round3-v13-2026-10-29",
 }
 # Logical argument names the public API binds; every module record maps its
 # kernel parameter names onto this vocabulary (``record["logical"]``).
@@ -1506,6 +1631,14 @@ def policy_knobs(
             and order_ok
         ):
             return {"grid_order": 2}
+        if (
+            prefill
+            and requests <= int(constants["persistent_max_requests"])
+            and waves > constants["persistent_min_waves"]
+        ):
+            # Prefill of a few requests beyond four waves: ten resident CTAs per
+            # SM stride over the items instead of one CTA per item.
+            return {"min_blocks": 10, "persistent": True}
     if which == "b200":
         # Round two: one-wave (64, 8) prefill of two requests or more takes the
         # swapped order (the B300 rule); the single-KV-head decode rows of the
@@ -1522,6 +1655,14 @@ def policy_knobs(
             return {"grid_order": 2}
         if u2z_class and not prefetch_ok:
             return {"grid_order": 3, "zero_store_width": 256}
+        if (
+            prefill
+            and requests <= int(constants["persistent_max_requests"])
+            and waves > constants["persistent_min_waves"]
+        ):
+            # Prefill of a few requests beyond four waves: the persistent
+            # build (round three).
+            return {"min_blocks": 10, "persistent": True}
     if decode and waves > high:
         if requests >= int(constants["scan_rounds3_min_requests"]):
             return {"scan_rounds": 3, "clear_tie": True}
@@ -1584,7 +1725,12 @@ def stage_for(
 
 
 def launch_grid(
-    record: dict[str, Any], *, num_rows: int, num_requests: int, num_kv_heads: int
+    record: dict[str, Any],
+    *,
+    num_rows: int,
+    num_requests: int,
+    num_kv_heads: int,
+    num_sms: int | None = None,
 ) -> tuple[int, int, int]:
     """Launch grid of one stage for one problem under its grid rule.
 
@@ -1594,11 +1740,24 @@ def launch_grid(
     ``(num_rows, num_kv_heads // kv_groups_per_cta, 1)``; the ``kv_heads_by_*``
     rules (``grid_order`` 1 / 2) put the KV group axis first.  An ``early_rt2``
     build requires a request (its launcher refuses ``num_requests == 0``).
+    ``persistent_items_by_kv_heads`` (a ``persistent`` build, 1 to 96 requests):
+    ``(min(num_rows + num_requests, max(1, min_blocks * num_sms //
+    num_kv_heads)) * num_kv_heads, 1, 1)`` on a device with ``num_sms`` SMs.
     """
 
     knobs = record["knobs"]
     kind = record["grid_rule"]["kind"]
     rows, requests, kv_heads = int(num_rows), int(num_requests), int(num_kv_heads)
+    if kind == "persistent_items_by_kv_heads":
+        if num_sms is None:
+            raise ValueError("a persistent build needs the device's SM count")
+        if not 1 <= requests <= 96 or rows + requests >= 2**31 or kv_heads < 1:
+            raise ValueError(
+                "a persistent build serves 1 to 96 requests, fewer than 2**31 rows "
+                "plus requests and at least one KV head"
+            )
+        per_head = max(1, int(knobs["min_blocks"]) * int(num_sms) // kv_heads)
+        return (min(rows + requests, per_head) * kv_heads, 1, 1)
     groups = int(knobs["kv_groups_per_cta"])
     if kv_heads % groups:
         raise ValueError(
@@ -1694,6 +1853,7 @@ def run_module(name: str, values: dict[str, Any], *, device_index: int) -> None:
         num_rows=int(values["num_rows"]),
         num_requests=int(values["num_requests"]),
         num_kv_heads=int(values["num_kv_heads"]),
+        num_sms=sm_count(device_index),
     )
     grid_values = {"grid_x": grid[0], "grid_y": grid[1], "grid_z": grid[2]}
     args = []

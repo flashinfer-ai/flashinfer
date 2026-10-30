@@ -56,12 +56,16 @@ logp = chunked_lm_head_logprob(X, W, labels, chunk_size=4096)   # differentiable
   Gradients are produced only for inputs that require them (a frozen `X` or
   `W` skips its GEMM); the upstream scalar gradient is applied once, in the
   cast.  The saved FP32 accumulators are re-scaled, never mutated, so a
-  retained graph may run the backward repeatedly.
+  retained graph may run the backward repeatedly (see "Saved-state release"
+  below for a `memory_mode="budget"` backward that frees the graph).
 * `chunked_lm_head_logprob` returns the differentiable `logp [T]` for
   arbitrary downstream losses; its forward saves the FP32 row statistic `lse`
   and the valid-row index, and the backward recomputes each chunk's logits
   from the saved inputs (four GEMMs per chunk) without counting the rows again
-  (no host synchronization).
+  (no host synchronization; exception: a `memory_mode="budget"` call with
+  `compact_rows=False` and no caller's count counts its valid rows on the host
+  in the backward; a caller's count checked with `check_num_valid_rows=True` is
+  read back in the forward, never in the backward).
 * Valid-row compaction (`compact_rows`, a keyword of every eager and autograd
   entry point, default `True`; `prepare_lm_head_loss` takes it as a bool or the
   valid-row tensor, default `False`): when some labels are `-100` the chunk loop runs over the valid rows
@@ -196,6 +200,108 @@ logp = chunked_lm_head_logprob(X, W, labels, chunk_size=4096)   # differentiable
   an empty `logp` and zero gradients without binding or launching.
   `cake_backend.memory_report` reports the peak temporary bytes separately
   from the weights, the outputs and the FP32 accumulators.
+* Opt-in forms (`cake_backend_opt_in.py`): a call that passes `memory_mode`
+  or `num_valid_rows` (below) runs the planner, binding, forward, backward and
+  autograd functions of `cake_backend_opt_in.py`, which reuse the kernels,
+  launch helpers and per-device state of `cake_backend.py` and keep their
+  own binding cache (`cake_backend_opt_in.BINDING_CACHE`, same settings).  A
+  call with neither keyword runs `cake_backend.py`'s entry unchanged, with
+  its buffer lifetimes; the public entries of `flashinfer.chunked_lm_head`
+  run their argument checks first (`check_num_valid_rows`, which needs a
+  count: `ValueError` without one; then `memory_mode` and `num_valid_rows`
+  against `None`).  An explicit `memory_mode="fast"` without a count first
+  goes through the dispatch of `cake_backend_opt_in.py` (a few more Python
+  calls per call) and then runs the same `cake_backend.py` entry.
+  Every output is bitwise the same in both.  The opt-in forms also change
+  buffer lifetimes, below.
+* Saved-state release (`memory_mode="budget"` only): a backward of
+  `chunked_lm_head_loss` that
+  frees the graph (no `retain_graph` / `create_graph`) drops the forward's
+  FP32 `dX` accumulator as soon as `dX` is written -- before the weight
+  gradient's buffers exist -- and the rest of the saved state when it ends,
+  instead of when PyTorch frees the graph after the backward returns.  The
+  backward reads `retain_graph` from PyTorch's current graph task through a
+  private API (`torch._C._autograd._get_current_graph_task_keep_graph`); when
+  that API is missing or cannot answer, nothing is released early (the
+  previous lifetime).  A second backward through a freed graph raises
+  PyTorch's "backward through the graph a second time" error;
+  `retain_graph=True` keeps everything and the backward stays repeatable.
+  Without `"budget"` the saved state lives until the graph is freed.  In
+  every opt-in form `backward_logprob` drops its runner (the chunk workspace)
+  before the `dX` output is allocated.  Lifetimes only: every output is
+  bitwise the same.
+* Memory budget (`memory_mode`, keyword of `chunked_lm_head_loss` /
+  `chunked_lm_head_logprob`, default `None`, the `"fast"` form; `"budget"`
+  is opt-in, `cake` backend and BF16 `dW` only).  The fast form keeps the FP32 `[V, H]`
+  weight-gradient accumulator next to the chunk buffers, so its step peak
+  (forward through backward, outputs included) is above that of a head that
+  materializes the BF16 logits of the valid rows, `B = 2 * T_v * V + 2 * V *
+  H + 2 * T * H` bytes.  `"budget"` picks, per call, the fastest exact
+  weight-gradient form whose predicted peak stays within `B` less a 2 % margin
+  (`cake_backend_opt_in.memory_plan`, which returns the form and both byte counts;
+  `ForwardResult.memory_plan` carries it): `"fused"` (the fast form),
+  `"unfused"` (every chunk accumulated, one flat cast after `dX` is written),
+  `"partial"` (the chunk loop accumulates the vocabulary rows `[0, dw_rows)`
+  only) or `"recompute"` (none).  The last two recompute the other rows of
+  `dW` in the backward, one vocabulary block at a time: per block and chunk the
+  logits GEMM's `dz` arm (`gemm_logits_dz`) on `W[v0:v1]` recomputes the
+  block's `dz` from the saved row statistic `lse` and per-row gradient scale
+  `d` (labels shifted into the block), the weight-gradient accumulate GEMM adds
+  `dz_c^T @ X_c` and the last chunk runs the fused scale + cast GEMM into
+  `dW[v0:v1]`.  Every element of `dW` sees the same FP32 operations in the same
+  order as in the fast form, so `loss`, `logp`, `dX` and `dW` are bitwise the
+  fast form's; the recompute forms run up to one more logits GEMM per chunk,
+  so they are slower.  The loss entry saves `X` and `W` for the recompute (an
+  in-place write between the forward and the backward raises PyTorch's
+  saved-tensor version error); the log-probability entry plans its backward
+  only.  `T_v` counts the valid rows also when `compact_rows=False` (the
+  chunk loop then runs over all `T` rows, the budget still covers the logits
+  of the valid rows only).  Without a caller's count, a `"budget"` call counts
+  its valid rows on the host and ignores `hidden_count`: the hidden valid-row
+  count would allocate a whole chunk's buffers before the count is known,
+  which can exceed `B` when fewer rows than a chunk are valid.  The bound
+  assumes a backward that frees the graph and PyTorch's caching allocator in
+  its default configuration (`PYTORCH_CUDA_ALLOC_CONF` unset).  A call for
+  which no form fits runs the form with the smallest predicted peak, which
+  can exceed `B`.  The margin is measured on GB200, GB300 and B200 (other
+  allocator settings are not measured): every measured `"budget"` step peak
+  of a call whose plan fits, single calls and repeated calls that miss or
+  hit the binding cache, at the issue's shapes and at small heads, stayed
+  within `B`; the highest reached 0.9794 `B`.  No environment variable
+  selects it.
+* Caller's valid-row count (`num_valid_rows`, keyword of
+  `chunked_lm_head_loss` / `chunked_lm_head_logprob` and of the
+  `cake_backend_opt_in` eager entry points, default `None`): the number of labels
+  `>= 0` as a host integer (a Python or NumPy integer or a CPU scalar tensor;
+  a CUDA tensor is rejected because reading it would wait for the device).
+  A compacted forward then plans its chunks on that count without reading a
+  count back: it forms the valid-row index on the device
+  (`cake_backend_opt_in.given_valid_rows`: `labels >= 0` -> int32 `cumsum` ->
+  `searchsorted`, whose first `num_valid_rows` slots are the ascending valid
+  rows) and queues one `torch._assert_async(scan[T - 1] == num_valid_rows)`
+  ahead of every kernel that reads the index.  A wrong count therefore stops
+  the stream with a device-side assertion, which ends the CUDA context.
+  `check_num_valid_rows=True` reads the count back instead and raises
+  `ValueError` on a mismatch (one synchronization, for debugging); so do
+  CPU calls and every `sm_103a` call whose library CUDA 13.0 built (the calls
+  that keep the host-count schedule, see the toolchain note).  The given-count
+  call runs the host-count path's kernels on the same plan, so its outputs are
+  bitwise those of `num_valid_rows=None`.  An uncompacted call
+  (`compact_rows=False`) forms no index from the count (an uncompacted
+  `"budget"` call sizes its budget on it); there only
+  `check_num_valid_rows=True` checks it, by reading the labels' count back.
+  So with `check_num_valid_rows=True` every call that takes the count checks
+  it once (the autograd entries in their forward) and raises the same
+  `ValueError` on a mismatch, whatever `compact_rows`, `memory_mode` or the
+  inputs that need a gradient.  The count is not derived from `loss_div`.
+* First call of a process (`chunked_lm_head_preload(device=None)`,
+  `cake_backend_opt_in.preload`): loads every library of the device's architecture
+  (a JIT build when the package ships no `aot/` library), creates the
+  per-device side stream (the process's first `torch.cuda.Stream`), the count
+  cells and constants, launches the PyTorch operators of the valid-row count
+  paths once and synchronizes.  It does not launch the package's kernels:
+  under the driver's lazy module loading (`CUDA_MODULE_LOADING=LAZY`, the
+  default) each kernel form still loads at its first launch.
 * `deterministic=True` only: fixed sequential chunk order, bitwise
   reproducible `loss`, `logp`, `dX` and `dW` run to run.
 
@@ -210,6 +316,13 @@ the remembered argument plans with freshly allocated outputs and per-call
 scratch (`cake_backend.BINDING_CACHE`).  A remembered binding pins no caller
 tensor and holds no problem-sized scratch: the chunk workspace, the FP32
 accumulators and the outputs come from the caching allocator on every call.
+In the opt-in forms a call that misses the cache -- with compaction, every
+call whose valid-row count or `loss_div` is new, so usually every training
+batch -- binds on
+buffers that share one allocation of the largest of them (the binding is
+built from their addresses and never launches on them), so its peak stays
+close to that of a call that hits the cache instead of adding up every
+buffer the binding needs.
 The cache keeps up to 64 bindings (`cake_backend.BINDING_CACHE_DEFAULT_CAPACITY`)
 and evicts the least recently used one;
 `cake_backend.BINDING_CACHE.configure(enabled=..., capacity=...)` changes both
@@ -218,6 +331,89 @@ drops the remembered bindings).  `backend="reference"` on the `cake_backend`
 entry points runs the same chunk loop with PyTorch operators at the same
 rounding boundaries on any device (the host-layer tests use it); the public API
 accepts `backend="cake"` only.
+
+## Candidate-support entry points (`cake_support.py`)
+
+```python
+from flashinfer.chunked_lm_head import (
+    chunked_lm_head_support_kl,
+    chunked_lm_head_support_logprob,
+)
+
+logp = chunked_lm_head_support_logprob(X, W, ids, offsets, k_cap=k_cap)          # packed [M] FP32
+sel = chunked_lm_head_support_logprob(X, W, ids, offsets, labels, k_cap=k_cap)   # selected [T] FP32
+kl, logp = chunked_lm_head_support_kl(X, W, ids, offsets, teacher_logprobs, k_cap=k_cap,
+                                      temperature=tau, return_logprobs=True)
+```
+
+* A ragged candidate support per token (sampling-mask replay, restricted-support
+  self-distillation): row `t` normalizes `z = X @ W^T` over its candidates
+  `ids[offsets[t]:offsets[t + 1]]` only.  `ids [M]` and `offsets [T + 1]` are
+  int32 or int64; ids are unique inside a row, in any order, and repeat freely
+  across rows; `K_t <= k_cap` (a recorded support is never trimmed).  Limits:
+  `H` and `V` multiples of 256, `V <= 1572864` (the validation stage's
+  shared-memory bitmap), `M <= 2^31 - 2^16`.
+* Numerics: the BF16 logits at the support (FP32 accumulation, one rounding),
+  then FP32 `q = RN(z / tau_t)`, an exact row maximum, the row sums in a fixed
+  32-lane order, precise `expf` / `logf`, no fast math.  Rows of one candidate
+  or none give `logp = 0` and `KL = 0` (selects).  `KL_t = sum_j Q_j (lq_j -
+  logp_j)` over the entries with `Q_j = exp(lq_j) > 0` of a detached FP32
+  teacher aligned with `ids`.  Gradients flow to `X` and `W` only (BF16 `dz` at
+  the support, FP32 accumulation, one cast each); the temperature (a positive
+  number or an FP32 `[T]` tensor, the same rules as `chunked_lm_head_logprob`,
+  checked on every row) is a constant.
+* Validation: one kernel forms an int64 error word over the offsets, the cap,
+  the id range, repeated ids and the labels (`-100` ignored; any other label
+  must be one of the row's candidates; a label on an empty row is an error).
+  `check_inputs=False` queues an asynchronous device assertion (no
+  synchronization; a violation ends the CUDA context, like an out-of-range
+  PyTorch index); `check_inputs=True` reads the word back once and raises
+  `ValueError` naming the rule and the row.  Every later kernel clamps the
+  indices it reads, and the sparse `dW` pass drops a pair whose id is outside
+  `[0, V)`, so it stays in bounds for any input.
+* Passes: the logits at the support, the forward row stage, the backward row
+  stage (`dz [M]`), `dX` and `dW`.  Each of the logits, `dX` and `dW` passes has
+  a sparse form (work proportional to `M`: a gather GEMM over tiles of 128
+  pairs; one CTA per token adding its pairs' `W` rows; the sorted unique keys
+  `(id << 32) | pair` and one owner per id adding its pairs' `X` rows, a long
+  segment cut into parts summed in part order) and a dense form (the shipped
+  logits / dX / weight-gradient GEMMs per token chunk and vocabulary block on
+  `W[v0:v1]` views, plus a gather / scatter at the support; `H` a multiple of
+  512 for dX / dW).  A host rule on `M / T` picks the form per pass
+  (`cake_support.SUPPORT_DENSE_MIN_MEAN_K`, constants calibrated per
+  architecture); no
+  synchronization.  The sparse `dW` is stored directly in BF16 up to `2^23`
+  pairs; above that pair ranges accumulate in an FP32 `[V, H]` sum.
+* Memory: no `[T, V]` or `[chunk, V]` tensor in the sparse form; the packed
+  state is `O(M)` (BF16 `z` and `dz`, int32 copies of int64 indices) and
+  `O(T)`; `cake_support.support_memory_report(T, H, V, M, ...)` gives the device
+  bytes of a step by bucket, with the measured `torch.sort` bytes per key
+  (`SORT_BYTES_PER_KEY`) and the split of a long `dW` segment chosen to keep its
+  FP32 partial rows within 128 MiB (table below).
+* Determinism: one owner and one order per sum, no atomics on values; reruns
+  are bitwise equal.  The bits of `dX` / `dW` depend on the pass form,
+  `chunk_size`, the dense vocabulary block and the sparse split (fixed
+  functions of the sizes).  `backend="reference"` on the `cake_support`
+  entry points runs every stage with PyTorch operators at the same rounding
+  boundaries (a development aid that materializes `[chunk, V]` blocks).
+
+Device bytes of one step from `support_memory_report` at `T = 16384`,
+`H = 6144`, `V = 154880` (packed log-probabilities and KL, int64 indices;
+MB = 10^6 bytes).  Each workspace column counts every temporary of its phase
+at once, so it is an upper bound.
+
+| pass forms, pairs `M` | packed state + outputs | forward workspace | backward workspace | FP32 `dW` sum | BF16 `dX` + `dW` |
+|---|---|---|---|---|---|
+| sparse, `2^20` | 11 | 0 | 166 | 0 | 2104 |
+| sparse, `2^23` (the largest BF16-stored `dW`) | 84 | 0 | 623 | 0 | 2104 |
+| sparse, `2^24` (`dW` in ranges of `2^22` pairs) | 168 | 0 | 387 | 3806 | 2104 |
+| dense, `2^23`, `chunk_size` 4096 | 84 | 128 | 346 | 3806 | 2104 |
+| dense, `2^23`, `chunk_size` 16384 | 84 | 512 | 1334 | 0 | 2104 |
+
+The sparse backward workspace is `dz` (2 B per pair), 60.25 B per pair of
+the `dW` pair range (pair and row indices, keys, sort) and at most 128 MiB
+of FP32 partial rows; it does not depend on `V`.  The dense workspace is `dz`
+plus blocks of `chunk_size` rows and at most 16384 vocabulary columns.
 
 ## Switches and environment variables
 
@@ -237,7 +433,9 @@ value is passed down; the two binding-cache variables are read when that
 module is imported and applied through `BINDING_CACHE.configure` when it first
 reaches the backend.  A build that vendors the package without the wrapper
 sees the backend defaults.  The wrapper leaves `logprob_dz` / `logprob_lbl`
-at their backend defaults (no variable).
+at their backend defaults (no variable) and passes `memory_mode` (no
+variable either) and the non-switch keywords `num_valid_rows` /
+`check_num_valid_rows` through unchanged.
 
 | Keyword (backend default) | Variable read by `flashinfer.chunked_lm_head` | Parsing |
 | --- | --- | --- |
@@ -463,6 +661,10 @@ workspace; the logits GEMM's output descriptor covers the chunk's rows only.
   through FlashInfer (`gen_jit_spec`, sources digest-verified first);
   `cake_jit.specs_for_arch(arch)` lists the JIT specs of an architecture for
   `flashinfer.jit.build_jit_specs`.
+* `cake_support.py` -- the candidate-support entry points: their host checks,
+  the shared temperature resolver's use, the plan of the pass forms, the
+  launches of the support kernels and of the shipped GEMMs (dense form), the
+  memory report, the reference engine and the autograd `Function`.
 * `cake_backend.py` -- validation, chunk plans, workspace layout, memory
   accounting, argument-plan binding, the prepared runner, the torch reference
   path, the autograd `Function`s and the eager entry points.
@@ -490,8 +692,14 @@ The registry holds one record per architecture (`sm_100a`, `sm_103a`),
 `cake_lm_head_loss_<arch>`, geometry-free (`H` / `V` and the rules' outputs are
 launch scalars: every `H` a multiple of 512 and `V` a multiple of 256 runs on
 it), with the sixteen base stages above plus the sixteen structural forms the
-rules can reach (`abi = lm_head_loss_v1`), exported from the kernel snapshot
-named in the pull request.
+rules can reach (`abi = lm_head_loss_v1`) and the fourteen candidate-support
+programs (`cake_support.SUPPORT_STAGES`: the validation stage per index width,
+the two row stages, the gather and scatter of the dense form, the support
+logits gather GEMM and the segment gather-accumulate dX / dW / combine kernels
+in their BF16 and FP32-accumulate modes), exported from the kernel snapshot
+named in the pull request.  `tests/experimental/test_cake_lm_head_support.py`
+tests the candidate-support entries (host rules and the reference backend on
+any device, the cake backend on a registered device).
 
 Tests: `tests/experimental/test_cake_lm_head_loss.py` and the public-API suite
 `tests/experimental/test_cake_lm_head_loss_api.py` (the host-layer tests
@@ -503,19 +711,57 @@ the package imports with `flashinfer` blocked and raises its host-side errors;
 copy's libraries on a GPU node).  Benchmark:
 `benchmarks/bench_cake_lm_head_loss.py`.
 
-Toolchain note: on CUDA 13.0 (nvcc 13.0.x) the `sm_103a` programs are built
+Toolchain note: the package needs CUDA 12.9 or newer.  Every `build.json`
+entry has `min_cuda` 12.9 (`common.requires.cuda_toolkit.min` is 12.9), and
+the loader refuses an older toolkit: `cake_build.jit_spec` raises and the JIT
+spec lists leave the entry out.  CUDA 12.8's ptxas cannot build the 256-bit
+global loads and stores (`ld.global.v8.b32` / `st.global.v8.b32`) of eight
+`sm_100a` programs, the logits GEMM among them ("Illegal vector size: 8");
+`sm_103a` needs 12.9 by its architecture floor.
+
+The `sm_100a` 2-CTA GEMM producer loops (logits, dX and dW) have two orders,
+and the toolkit that compiles them selects one.  Built by nvcc 12.9 or 13.0,
+they issue each stage's `mbarrier.arrive.expect_tx` on the stage's full
+barrier before the stage's TMA loads, the order CUTLASS's producer acquire
+uses.  Built by any other toolkit, they keep the earlier order (the arrive
+after the loads), so other toolkits keep the previously shipped machine code.
+Each such kernel source defines `CAKE_ARRIVE_FIRST` once from `__CUDA_ARCH__`
+and `__CUDACC_VER_MAJOR__` / `__CUDACC_VER_MINOR__`.  The arrive counts and
+transaction bytes of every phase are the same in both orders, so the outputs
+are bitwise the same.
+
+With the earlier order, the `sm_100a` programs built by CUDA 12.9.86 and
+13.0.88 faulted intermittently on GB200 with `cudaErrorIllegalInstruction`
+at a 2-CTA TMA load of the dW and dX GEMMs (in the dW faults examined, the
+second B-operand load, with legal operands): 35 and 64 runs of a 132-run
+test set, and 20 and 155 runs of a 624-run soak.  The builds of CUDA
+13.1.115, 13.2.86, 13.3.73 and 13.4.92 had no fault in that 132-run set,
+and no B200 run faulted; the cause is not established.  With the arrive
+first, the `sm_100a` builds of CUDA 12.9.86 and 13.0.88 each ran 850 test
+runs and a 1872-run soak on GB200 without a fault.  B200 and GB200 run the
+same `sm_100a` code, so B200 builds of CUDA 12.9 and 13.0 also compile the
+arrive-first order.  On B200 with CUDA 13.0.88, over 37 shapes in two
+timing states, the geometric-mean time ratio of the two orders is 0.99987
+(CI95 0.99955 to 1.00022) and 1.00022 (0.99970 to 1.00076); no
+shape was slower at the family-wise level, and two shape-states were
+nominally slower by 0.45 % and 0.56 % in kernel time.  CUDA 12.9 was
+not timed.  The `sm_103a` programs keep the earlier order at every toolkit,
+so their machine code is unchanged; on GB300 their builds of CUDA 12.9,
+13.0, 13.3 and 13.4 ran without a fault.
+
+On CUDA 13.0 (nvcc 13.0.x) the `sm_103a` programs are built
 with `-Xptxas -O0` (build data: every `sm_103a` entry of `build.json` carries
 `{"cuda": "==13.0", "flags": ["-Xptxas", "-O0"]}` under `nvcc_flags_if`; the
 JIT path applies it when the local toolkit matches, a prebuilt `aot/` built by
-that toolkit already carries it).  That toolchain's
-ptxas mis-schedules their 2-CTA TMA producer loops: at -O3 (and -O2, which
-emits the same code), with a short K loop (`chunk_size <= 1024`) the dW
+that toolkit already carries it).  In earlier testing that toolkit's code of
+their 2-CTA TMA producer loops faulted: at -O3 (and -O2, which emits the same
+code), with a short K loop (`chunk_size <= 1024`) the dW
 accumulate GEMM's second B-operand TMA load is rejected by the TMA unit with
 `cudaErrorIllegalInstruction` although every operand is legal; at -O1 the
 structural-form programs' dW cast GEMM (the last chunk's `dz_c^T @ X_c`) faults
 the same way on every call whose last chunk is partial (`T % chunk_size != 0`).
-The -O0 code and the code of CUDA 12.9, 13.3 and 13.4 are correct.  With the
-earlier -O1 code the hidden
+The -O0 code and the code of CUDA 12.9, 13.3 and 13.4 ran without the fault.
+With the earlier -O1 code the hidden
 valid-row count's schedule (the compaction index, chunk 0's row gather and
 device-count logits GEMM queued before the count is read back) still reaches a
 `cudaErrorIllegalInstruction` from the dW accumulate GEMM at its shortest K
@@ -527,4 +773,4 @@ version from `cake_build.record_cuda_version` -- the prebuilt libraries'
 `aot/build_info.json`, else the local toolkit; the same kernels per row,
 bitwise the same outputs).  Every other architecture / toolchain pair builds at the default
 optimization level and runs the hidden count.  Both are mitigations of the
-observed ptxas 13.0 fault, not a root-cause fix.
+observed CUDA 13.0 fault, not a root-cause fix.

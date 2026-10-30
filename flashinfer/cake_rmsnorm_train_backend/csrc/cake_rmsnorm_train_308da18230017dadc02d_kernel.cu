@@ -188,28 +188,28 @@ kernel_cake_rmsnorm_train_308da18230017dadc02d(__nv_bfloat16* __restrict__ x, __
                     hsum[2 * k] = _cvt_f32_0.x;
                     hsum[2 * k + 1] = _cvt_f32_0.y;
                 }
-                unsigned int _packed_0[4];
+                unsigned int packed_1[4];
                 #pragma unroll
                 for (int _lp = 0; _lp < 1; _lp++) {
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(hsum[_lp*2 + 0], hsum[_lp*2+1 + 0]));
-                    _packed_0[_lp] = *(uint32_t*)&_bf2;
+                    packed_1[_lp] = *(uint32_t*)&_bf2;
                 }
                 #pragma unroll
                 for (int _lp = 0; _lp < 1; _lp++) {
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(hsum[_lp*2 + 2], hsum[_lp*2+1 + 2]));
-                    _packed_0[_lp + 1] = *(uint32_t*)&_bf2;
+                    packed_1[_lp + 1] = *(uint32_t*)&_bf2;
                 }
                 #pragma unroll
                 for (int _lp = 0; _lp < 1; _lp++) {
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(hsum[_lp*2 + 4], hsum[_lp*2+1 + 4]));
-                    _packed_0[_lp + 2] = *(uint32_t*)&_bf2;
+                    packed_1[_lp + 2] = *(uint32_t*)&_bf2;
                 }
                 #pragma unroll
                 for (int _lp = 0; _lp < 1; _lp++) {
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(hsum[_lp*2 + 6], hsum[_lp*2+1 + 6]));
-                    _packed_0[_lp + 3] = *(uint32_t*)&_bf2;
+                    packed_1[_lp + 3] = *(uint32_t*)&_bf2;
                 }
-                reinterpret_cast<int4*>(h_new + (obase + (long long)(gtid * 8 + v_1 * (GROUP_THREADS * 8))))[0] = reinterpret_cast<int4*>(_packed_0)[0];
+                reinterpret_cast<int4*>(h_new + (obase + (long long)(gtid * 8 + v_1 * (GROUP_THREADS * 8))))[0] = reinterpret_cast<int4*>(packed_1)[0];
             }
         }
         float _warp_reduce_4 = sum_sq;
@@ -256,28 +256,28 @@ kernel_cake_rmsnorm_train_308da18230017dadc02d(__nv_bfloat16* __restrict__ x, __
                     out[2 * k_2] = _cvt_f32_1.x * rstd * _cvt_f32_2.x;
                     out[2 * k_2 + 1] = _cvt_f32_1.y * rstd * _cvt_f32_2.y;
                 }
-                unsigned int _packed_1[4];
+                unsigned int packed_1_1[4];
                 #pragma unroll
                 for (int _lp = 0; _lp < 1; _lp++) {
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(out[_lp*2 + 0], out[_lp*2+1 + 0]));
-                    _packed_1[_lp] = *(uint32_t*)&_bf2;
+                    packed_1_1[_lp] = *(uint32_t*)&_bf2;
                 }
                 #pragma unroll
                 for (int _lp = 0; _lp < 1; _lp++) {
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(out[_lp*2 + 2], out[_lp*2+1 + 2]));
-                    _packed_1[_lp + 1] = *(uint32_t*)&_bf2;
+                    packed_1_1[_lp + 1] = *(uint32_t*)&_bf2;
                 }
                 #pragma unroll
                 for (int _lp = 0; _lp < 1; _lp++) {
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(out[_lp*2 + 4], out[_lp*2+1 + 4]));
-                    _packed_1[_lp + 2] = *(uint32_t*)&_bf2;
+                    packed_1_1[_lp + 2] = *(uint32_t*)&_bf2;
                 }
                 #pragma unroll
                 for (int _lp = 0; _lp < 1; _lp++) {
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(out[_lp*2 + 6], out[_lp*2+1 + 6]));
-                    _packed_1[_lp + 3] = *(uint32_t*)&_bf2;
+                    packed_1_1[_lp + 3] = *(uint32_t*)&_bf2;
                 }
-                reinterpret_cast<int4*>(y + (obase + (long long)(gtid * 8 + v_2 * (GROUP_THREADS * 8))))[0] = reinterpret_cast<int4*>(_packed_1)[0];
+                reinterpret_cast<int4*>(y + (obase + (long long)(gtid * 8 + v_2 * (GROUP_THREADS * 8))))[0] = reinterpret_cast<int4*>(packed_1_1)[0];
             }
         }
     }

@@ -695,8 +695,8 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                                 mbarrier_wait(tma_full_addr + (mma_tma_stage) * 8, _phase_tma_full);
                                 asm volatile("tcgen05.fence::after_thread_sync;");
                                 int init_flagt = ((iter_k_mt == 0) ? 1 : 0);
-                                int _mma_a_lo_2 = ((((smem_a_addr) >> 4) & 0x3FFF) | 0x2000000) + (mma_tma_stage) * 3072;
-                                int _mma_b_lo_2 = ((((smem_b0_addr) >> 4) & 0x3FFF) | 0x2000000) + (mma_tma_stage) * 3072;
+                                int _mma_a_lo_0_1 = ((((smem_a_addr) >> 4) & 0x3FFF) | 0x2000000) + (mma_tma_stage) * 3072;
+                                int _mma_b_lo_0_1 = ((((smem_b0_addr) >> 4) & 0x3FFF) | 0x2000000) + (mma_tma_stage) * 3072;
                                 asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -730,9 +730,9 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "@leader tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
                     "}\n"
-                    :: "r"(_mma_a_lo_2), "r"(_mma_b_lo_2), "r"(tmem_accum), "r"(((init_flagt) ? 0 : 1)) : "memory");
-                                int _mma_a_lo_3 = ((((smem_a_addr) >> 4) & 0x3FFF) | 0x2000000) + (mma_tma_stage) * 3072;
-                                int _mma_b_lo_3 = ((((smem_b1_addr) >> 4) & 0x3FFF) | 0x2000000) + (mma_tma_stage) * 3072;
+                    :: "r"(_mma_a_lo_0_1), "r"(_mma_b_lo_0_1), "r"(tmem_accum), "r"(((init_flagt) ? 0 : 1)) : "memory");
+                                int _mma_a_lo_1_1 = ((((smem_a_addr) >> 4) & 0x3FFF) | 0x2000000) + (mma_tma_stage) * 3072;
+                                int _mma_b_lo_1_1 = ((((smem_b1_addr) >> 4) & 0x3FFF) | 0x2000000) + (mma_tma_stage) * 3072;
                                 asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -766,7 +766,7 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "@leader tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
                     "}\n"
-                    :: "r"(_mma_a_lo_3), "r"(_mma_b_lo_3), "r"((tmem_accum + (256))), "r"(((init_flagt) ? 0 : 1)) : "memory");
+                    :: "r"(_mma_a_lo_1_1), "r"(_mma_b_lo_1_1), "r"((tmem_accum + (256))), "r"(((init_flagt) ? 0 : 1)) : "memory");
                                 elect_commit_cg2_multicast(mma_done_addr + (mma_tma_stage) * 8, (uint16_t)(3));
                                 mma_tma_stage += 1;
                                 if (mma_tma_stage == 4) { mma_tma_stage = 0; _phase_tma_full ^= 1; }
@@ -964,46 +964,46 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                                     float4 _v4 = make_float4(_tmem_load_1[0 + 0], _tmem_load_1[0 + 1], _tmem_load_1[0 + 2], _tmem_load_1[0 + 3]);
                                     *reinterpret_cast<float4*>((C + ((int)e_uet * stride_e + row_nt * ldc + col0t + n_chunkt * EPI_CHUNK)) + 0) = _v4;
 #else
-                                unsigned int _packed_1[8];
+                                unsigned int _packed_0_1[8];
                                 #pragma unroll
                                 for (int _lp = 0; _lp < 1; _lp++) {
                                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_tmem_load_1[_lp*2 + 0], _tmem_load_1[_lp*2+1 + 0]));
-                                    _packed_1[_lp] = *(uint32_t*)&_bf2;
+                                    _packed_0_1[_lp] = *(uint32_t*)&_bf2;
                                 }
                                 #pragma unroll
                                 for (int _lp = 0; _lp < 1; _lp++) {
                                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_tmem_load_1[_lp*2 + 2], _tmem_load_1[_lp*2+1 + 2]));
-                                    _packed_1[_lp + 1] = *(uint32_t*)&_bf2;
+                                    _packed_0_1[_lp + 1] = *(uint32_t*)&_bf2;
                                 }
                                 #pragma unroll
                                 for (int _lp = 0; _lp < 1; _lp++) {
                                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_tmem_load_1[_lp*2 + 4], _tmem_load_1[_lp*2+1 + 4]));
-                                    _packed_1[_lp + 2] = *(uint32_t*)&_bf2;
+                                    _packed_0_1[_lp + 2] = *(uint32_t*)&_bf2;
                                 }
                                 #pragma unroll
                                 for (int _lp = 0; _lp < 1; _lp++) {
                                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_tmem_load_1[_lp*2 + 6], _tmem_load_1[_lp*2+1 + 6]));
-                                    _packed_1[_lp + 3] = *(uint32_t*)&_bf2;
+                                    _packed_0_1[_lp + 3] = *(uint32_t*)&_bf2;
                                 }
                                 #pragma unroll
                                 for (int _lp = 0; _lp < 1; _lp++) {
                                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_tmem_load_1[_lp*2 + 8], _tmem_load_1[_lp*2+1 + 8]));
-                                    _packed_1[_lp + 4] = *(uint32_t*)&_bf2;
+                                    _packed_0_1[_lp + 4] = *(uint32_t*)&_bf2;
                                 }
                                 #pragma unroll
                                 for (int _lp = 0; _lp < 1; _lp++) {
                                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_tmem_load_1[_lp*2 + 10], _tmem_load_1[_lp*2+1 + 10]));
-                                    _packed_1[_lp + 5] = *(uint32_t*)&_bf2;
+                                    _packed_0_1[_lp + 5] = *(uint32_t*)&_bf2;
                                 }
                                 #pragma unroll
                                 for (int _lp = 0; _lp < 1; _lp++) {
                                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_tmem_load_1[_lp*2 + 12], _tmem_load_1[_lp*2+1 + 12]));
-                                    _packed_1[_lp + 6] = *(uint32_t*)&_bf2;
+                                    _packed_0_1[_lp + 6] = *(uint32_t*)&_bf2;
                                 }
                                 #pragma unroll
                                 for (int _lp = 0; _lp < 1; _lp++) {
                                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_tmem_load_1[_lp*2 + 14], _tmem_load_1[_lp*2+1 + 14]));
-                                    _packed_1[_lp + 7] = *(uint32_t*)&_bf2;
+                                    _packed_0_1[_lp + 7] = *(uint32_t*)&_bf2;
 #endif  // CAKE_WGRAD_OUT
                                 }
                                 {
@@ -1019,7 +1019,7 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                                     float4 _v4 = make_float4(_tmem_load_1[12 + 0], _tmem_load_1[12 + 1], _tmem_load_1[12 + 2], _tmem_load_1[12 + 3]);
                                     *reinterpret_cast<float4*>((C + ((int)e_uet * stride_e + row_nt * ldc + col0t + n_chunkt * EPI_CHUNK + 12)) + 0) = _v4;
 #else
-                                    const unsigned* _raw_stv8_1 = reinterpret_cast<const unsigned*>(_packed_1);
+                                    const unsigned* _raw_stv8_1 = reinterpret_cast<const unsigned*>(_packed_0_1);
                                     asm volatile(
                                         "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
                                         :: "l"((void*)(C + ((int)e_uet * stride_e + row_nt * ldc + col0t + n_chunkt * EPI_CHUNK))), "r"(_raw_stv8_1[0]), "r"(_raw_stv8_1[1]), "r"(_raw_stv8_1[2]), "r"(_raw_stv8_1[3]), "r"(_raw_stv8_1[4]), "r"(_raw_stv8_1[5]), "r"(_raw_stv8_1[6]), "r"(_raw_stv8_1[7]) : "memory");

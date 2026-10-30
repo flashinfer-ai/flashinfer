@@ -228,6 +228,8 @@ inline size_t Align(size_t value) {
 
 struct WorkspaceView {
   int32_t route_count, route_tiles, route_extent, workfeed_ctas;
+  // The device's SM count (EnsureDeviceReady), set by the launch and PrepareWorkspace; 0 in a size-only view.
+  int32_t sm_count;
   int32_t *route_map, *tile_expert, *tile_mn_limit, *route_slots;
   int32_t *num_non_exiting_ctas, *fc1_work_counter, *fc2_work_counter;
   uint8_t *intermediate, *intermediate_scale;
@@ -351,11 +353,29 @@ inline int32_t Fc1LaunchGridN(const warp_decode::Shape& shape,
                               const WorkspaceView& ws) {
   if (schedule.route_layout == warp_decode::RouteLayout::kDirect) return ws.route_extent;
   const int32_t grid_m = Fc1GridM(shape, schedule);
-  return std::min(ws.route_tiles, std::max(1, ws.workfeed_ctas / grid_m));
+  // Fused route-pack FC1 pool by row: a smaller pool balances the FC1 workfeed rounds and leaves SMs to the
+  // programmatically launched FC2.
+  int32_t pool = ws.workfeed_ctas;
+  if (schedule.route_packer == warp_decode::RoutePacker::kFusedFc1) {
+    if (shape.hidden_size == 4096 && shape.intermediate_size == 512 && shape.num_experts == 512 &&
+        shape.local_num_experts == 512 && shape.top_k == 10 && shape.num_tokens == 2)
+      pool = std::min<int32_t>(96, pool);  // h4096_e512_i512_k10 T2
+    if (shape.hidden_size == 3072 && shape.intermediate_size == 384 && shape.num_experts == 256 &&
+        shape.local_num_experts == 256 && shape.top_k == 8 && shape.num_tokens == 7)
+      pool = std::min<int32_t>(112, pool);  // h3072_e256_i384_k8 T7
+  }
+  return std::min(ws.route_tiles, std::max(1, pool / grid_m));
 }
 inline int32_t Fc2LaunchGridN(const warp_decode::Shape& shape,
                               const warp_decode::Schedule& schedule,
                               const WorkspaceView& ws) {
+  // h3072_e256_i384_k8 T1 runs its 24 x 6 pool FC2 program on grid_m x 5 CTAs.
+  if (shape.hidden_size == 3072 && shape.intermediate_size == 384 && shape.num_experts == 256 &&
+      shape.local_num_experts == 256 && shape.top_k == 8 && shape.num_tokens == 1 &&
+      schedule.route_layout == warp_decode::RouteLayout::kGpuPacked &&
+      schedule.route_packer == warp_decode::RoutePacker::kFusedFc1 &&
+      schedule.fc2 == warp_decode::Fc2Schedule::kRouteParallelK256)
+    return std::min(ws.route_tiles, 5);
   if (schedule.route_layout == warp_decode::RouteLayout::kDirect ||
       (warp_decode::kTarget == warp_decode::Target::kSm100a &&
        schedule.fc2 == warp_decode::Fc2Schedule::kRouteParallelK256 &&
@@ -369,10 +389,17 @@ inline int32_t Fc2LaunchGridN(const warp_decode::Shape& shape,
     return ws.route_extent;
   return std::min(ws.route_tiles, std::max(1, ws.workfeed_ctas / Fc2GridM(shape)));
 }
+// The fused route-pack K256 FC2 of h3072_e256_i384_k8 T7 runs the linear-grid program on one CTA per SM, at most
+// 152 (the SM count it was measured on): its 24 x 6 pool leaves the last FC2 items to too few CTAs.
+inline bool LinearK256Fc2AllSms(const warp_decode::Shape& shape) {
+  return shape.hidden_size == 3072 && shape.intermediate_size == 384 && shape.num_experts == 256 &&
+         shape.local_num_experts == 256 && shape.top_k == 8 && shape.num_tokens == 7;
+}
 // The linear-grid K256 FC2 launches one 1-D grid of CTAs, each starting at the work item of its block index:
 // every item of the route tiles up to the device workfeed's pool, which need not be a multiple of grid_m.
 inline int32_t Fc2LinearCtas(const warp_decode::Shape& shape, const WorkspaceView& ws) {
-  return std::max(1, std::min(Fc2GridM(shape) * ws.route_tiles, ws.workfeed_ctas));
+  return std::max(1, std::min(Fc2GridM(shape) * ws.route_tiles,
+                              LinearK256Fc2AllSms(shape) ? std::min<int32_t>(152, ws.sm_count) : ws.workfeed_ctas));
 }
 // The fused route-pack K256 FC2 rows of the contract's LinearK256Fc2: the program choice and the workfeed
 // counter PrepareWorkspace arms both read it.
@@ -380,7 +407,7 @@ inline bool LinearK256Fc2(const warp_decode::Shape& shape, const warp_decode::Sc
   return schedule.route_layout == warp_decode::RouteLayout::kGpuPacked &&
          schedule.route_packer == warp_decode::RoutePacker::kFusedFc1 &&
          schedule.fc2 == warp_decode::Fc2Schedule::kRouteParallelK256 &&
-         warp_decode::LinearK256Fc2(warp_decode::kTarget, shape);
+         (warp_decode::LinearK256Fc2(warp_decode::kTarget, shape) || LinearK256Fc2AllSms(shape));
 }
 inline int32_t* TileExpert(const warp_decode::Invocation& inv,
                            const warp_decode::Schedule& schedule,
@@ -420,6 +447,14 @@ inline std::array<DeviceState, 64>& DeviceStates() {
   return states;
 }
 inline std::mutex& DeviceMutex() { static std::mutex mutex; return mutex; }
+// The SM count EnsureDeviceReady recorded for the current device; 0 when that device is not ready.
+inline int32_t ReadySmCount() {
+  int device = -1;
+  if (cudaGetDevice(&device) != cudaSuccess || device < 0 || device >= 64) return 0;
+  std::lock_guard<std::mutex> lock(DeviceMutex());
+  const auto& state = DeviceStates()[device];
+  return state.ready ? state.sm_count : 0;
+}
 // Finalize placement. The finalize kernels use no shared memory, but a finalize CTA cannot share an SM with a
 // 512-thread FC2 CTA, which holds the whole register file. The block scheduler therefore packs a small finalize grid
 // onto the first SMs that FC2 frees, as many CTAs per SM as fit. Reserving P bytes of dynamic shared memory per
@@ -5708,6 +5743,9 @@ inline warp_decode::ManifestStatus PrepareWorkspace(const warp_decode::Invocatio
   detail::WorkspaceView ws{};
   if (!detail::ResolveWorkspace(inv.shape, schedule, inv.workspace, &ws))
     return detail::Invalid("PrepareWorkspace layout");
+  // The linear-grid FC2 workfeed counter starts at the launch's CTA count, which reads the SM count.
+  ws.sm_count = detail::ReadySmCount();
+  if (ws.sm_count <= 0) return detail::Invalid("PrepareWorkspace device not ready");
   std::vector<float> clamp(inv.shape.local_num_experts, FLT_MAX);
   std::vector<float> alpha(inv.shape.local_num_experts, 1.0f);
   std::vector<float> beta(inv.shape.local_num_experts, 0.0f);
@@ -5883,6 +5921,7 @@ inline void ForEachLaunch(const warp_decode::Invocation& inv,
      const auto& state = detail::DeviceStates()[device];
      if (!state.ready) return;
      sm_count = state.sm_count;
+     ws.sm_count = state.sm_count;
      finalize_placement = state.finalize_placement;
      // A zero schedule limit represents the source's device-sized workfeed.
      if (schedule.route_layout == warp_decode::RouteLayout::kGpuPacked && ws.workfeed_ctas == 0)
@@ -6126,7 +6165,7 @@ inline void ForEachLaunch(const warp_decode::Invocation& inv,
       && ((!silu && !situ && inv.shape.hidden_size == 4096 && inv.shape.intermediate_size == 1536
               && inv.shape.num_experts == 128 && inv.shape.top_k == 8
               && (inv.shape.num_tokens == 1 || inv.shape.num_tokens == 2 || inv.shape.num_tokens == 4
-                  || inv.shape.num_tokens == 5 || inv.shape.num_tokens == 7))
+                  || inv.shape.num_tokens == 5 || inv.shape.num_tokens == 7 || inv.shape.num_tokens == 9))
           || (!silu && !situ && inv.shape.hidden_size == 2048 && inv.shape.intermediate_size == 768
               && inv.shape.num_experts == 128 && inv.shape.top_k == 8
               && ((inv.shape.num_tokens >= 2 && inv.shape.num_tokens <= 6)
@@ -6487,6 +6526,8 @@ inline size_t Align(size_t value) {
 
 struct WorkspaceView {
   int32_t route_count, route_tiles, route_extent, workfeed_ctas;
+  // The device's SM count (EnsureDeviceReady), set by the launch and PrepareWorkspace; 0 in a size-only view.
+  int32_t sm_count;
   int32_t *route_map, *tile_expert, *tile_mn_limit, *route_slots;
   int32_t *num_non_exiting_ctas, *fc1_work_counter, *fc2_work_counter;
   uint8_t *intermediate, *intermediate_scale;
@@ -6610,11 +6651,41 @@ inline int32_t Fc1LaunchGridN(const warp_decode::Shape& shape,
                               const WorkspaceView& ws) {
   if (schedule.route_layout == warp_decode::RouteLayout::kDirect) return ws.route_extent;
   const int32_t grid_m = Fc1GridM(shape, schedule);
-  return std::min(ws.route_tiles, std::max(1, ws.workfeed_ctas / grid_m));
+  // Fused route-pack FC1 pool by row: a smaller pool balances the FC1 workfeed rounds and leaves SMs to the
+  // programmatically launched FC2.
+  int32_t pool = ws.workfeed_ctas;
+  if (schedule.route_packer == warp_decode::RoutePacker::kFusedFc1) {
+    if (shape.hidden_size == 3072 && shape.intermediate_size == 384 && shape.num_experts == 256 &&
+        shape.local_num_experts == 256 && shape.top_k == 8 && shape.num_tokens == 3)
+      pool = std::min<int32_t>(80, pool);  // h3072_e256_i384_k8 T3
+    if (shape.hidden_size == 3072 && shape.intermediate_size == 384 && shape.num_experts == 256 &&
+        shape.local_num_experts == 256 && shape.top_k == 8 && shape.num_tokens == 4)
+      pool = std::min<int32_t>(96, pool);  // h3072_e256_i384_k8 T4
+    if (shape.hidden_size == 3072 && shape.intermediate_size == 768 && shape.num_experts == 256 &&
+        shape.local_num_experts == 256 && shape.top_k == 8 && shape.num_tokens == 2)
+      pool = std::min<int32_t>(96, pool);  // h3072_e256_i768_k8 T2
+    if (shape.hidden_size == 4096 && shape.intermediate_size == 256 && shape.num_experts == 512 &&
+        shape.local_num_experts == 512 && shape.top_k == 10 && shape.num_tokens == 4)
+      pool = std::min<int32_t>(80, pool);  // h4096_e512_i256_k10 T4
+    if (shape.hidden_size == 4096 && shape.intermediate_size == 512 && shape.num_experts == 512 &&
+        shape.local_num_experts == 512 && shape.top_k == 10 && shape.num_tokens == 2)
+      pool = std::min<int32_t>(96, pool);  // h4096_e512_i512_k10 T2
+    if (shape.hidden_size == 4096 && shape.intermediate_size == 512 && shape.num_experts == 512 &&
+        shape.local_num_experts == 512 && shape.top_k == 10 && shape.num_tokens == 4)
+      pool = std::min<int32_t>(128, pool);  // h4096_e512_i512_k10 T4
+  }
+  return std::min(ws.route_tiles, std::max(1, pool / grid_m));
 }
 inline int32_t Fc2LaunchGridN(const warp_decode::Shape& shape,
                               const warp_decode::Schedule& schedule,
                               const WorkspaceView& ws) {
+  // h3072_e256_i384_k8 T1 runs its 24 x 6 pool FC2 program on grid_m x 5 CTAs.
+  if (shape.hidden_size == 3072 && shape.intermediate_size == 384 && shape.num_experts == 256 &&
+      shape.local_num_experts == 256 && shape.top_k == 8 && shape.num_tokens == 1 &&
+      schedule.route_layout == warp_decode::RouteLayout::kGpuPacked &&
+      schedule.route_packer == warp_decode::RoutePacker::kFusedFc1 &&
+      schedule.fc2 == warp_decode::Fc2Schedule::kRouteParallelK256)
+    return std::min(ws.route_tiles, 5);
   if (schedule.route_layout == warp_decode::RouteLayout::kDirect ||
       (warp_decode::kTarget == warp_decode::Target::kSm100a &&
        schedule.fc2 == warp_decode::Fc2Schedule::kRouteParallelK256 &&
@@ -6628,10 +6699,17 @@ inline int32_t Fc2LaunchGridN(const warp_decode::Shape& shape,
     return ws.route_extent;
   return std::min(ws.route_tiles, std::max(1, ws.workfeed_ctas / Fc2GridM(shape)));
 }
+// The fused route-pack K256 FC2 of h3072_e256_i384_k8 T7 runs the linear-grid program on one CTA per SM, at most
+// 152 (the SM count it was measured on): its 24 x 6 pool leaves the last FC2 items to too few CTAs.
+inline bool LinearK256Fc2AllSms(const warp_decode::Shape& shape) {
+  return shape.hidden_size == 3072 && shape.intermediate_size == 384 && shape.num_experts == 256 &&
+         shape.local_num_experts == 256 && shape.top_k == 8 && shape.num_tokens == 7;
+}
 // The linear-grid K256 FC2 launches one 1-D grid of CTAs, each starting at the work item of its block index:
 // every item of the route tiles up to the device workfeed's pool, which need not be a multiple of grid_m.
 inline int32_t Fc2LinearCtas(const warp_decode::Shape& shape, const WorkspaceView& ws) {
-  return std::max(1, std::min(Fc2GridM(shape) * ws.route_tiles, ws.workfeed_ctas));
+  return std::max(1, std::min(Fc2GridM(shape) * ws.route_tiles,
+                              LinearK256Fc2AllSms(shape) ? std::min<int32_t>(152, ws.sm_count) : ws.workfeed_ctas));
 }
 // The fused route-pack K256 FC2 rows of the contract's LinearK256Fc2: the program choice and the workfeed
 // counter PrepareWorkspace arms both read it.
@@ -6639,7 +6717,7 @@ inline bool LinearK256Fc2(const warp_decode::Shape& shape, const warp_decode::Sc
   return schedule.route_layout == warp_decode::RouteLayout::kGpuPacked &&
          schedule.route_packer == warp_decode::RoutePacker::kFusedFc1 &&
          schedule.fc2 == warp_decode::Fc2Schedule::kRouteParallelK256 &&
-         warp_decode::LinearK256Fc2(warp_decode::kTarget, shape);
+         (warp_decode::LinearK256Fc2(warp_decode::kTarget, shape) || LinearK256Fc2AllSms(shape));
 }
 inline int32_t* TileExpert(const warp_decode::Invocation& inv,
                            const warp_decode::Schedule& schedule,
@@ -6679,6 +6757,14 @@ inline std::array<DeviceState, 64>& DeviceStates() {
   return states;
 }
 inline std::mutex& DeviceMutex() { static std::mutex mutex; return mutex; }
+// The SM count EnsureDeviceReady recorded for the current device; 0 when that device is not ready.
+inline int32_t ReadySmCount() {
+  int device = -1;
+  if (cudaGetDevice(&device) != cudaSuccess || device < 0 || device >= 64) return 0;
+  std::lock_guard<std::mutex> lock(DeviceMutex());
+  const auto& state = DeviceStates()[device];
+  return state.ready ? state.sm_count : 0;
+}
 // Finalize placement. The finalize kernels use no shared memory, but a finalize CTA cannot share an SM with a
 // 512-thread FC2 CTA, which holds the whole register file. The block scheduler therefore packs a small finalize grid
 // onto the first SMs that FC2 frees, as many CTAs per SM as fit. Reserving P bytes of dynamic shared memory per
@@ -12057,6 +12143,9 @@ inline warp_decode::ManifestStatus PrepareWorkspace(const warp_decode::Invocatio
   detail::WorkspaceView ws{};
   if (!detail::ResolveWorkspace(inv.shape, schedule, inv.workspace, &ws))
     return detail::Invalid("PrepareWorkspace layout");
+  // The linear-grid FC2 workfeed counter starts at the launch's CTA count, which reads the SM count.
+  ws.sm_count = detail::ReadySmCount();
+  if (ws.sm_count <= 0) return detail::Invalid("PrepareWorkspace device not ready");
   std::vector<float> clamp(inv.shape.local_num_experts, FLT_MAX);
   std::vector<float> alpha(inv.shape.local_num_experts, 1.0f);
   std::vector<float> beta(inv.shape.local_num_experts, 0.0f);
@@ -12223,6 +12312,7 @@ inline void ForEachLaunch(const warp_decode::Invocation& inv,
      const auto& state = detail::DeviceStates()[device];
      if (!state.ready) return;
      sm_count = state.sm_count;
+     ws.sm_count = state.sm_count;
      finalize_placement = state.finalize_placement;
      // A zero schedule limit represents the source's device-sized workfeed.
      if (schedule.route_layout == warp_decode::RouteLayout::kGpuPacked && ws.workfeed_ctas == 0)

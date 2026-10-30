@@ -3032,6 +3032,15 @@ class FrostLowLatencyConfig:
     NVFP4 weights/inputs use shared FMA with H divisible by 512, I by 128,
     and top-k at most 32. It retains BF16 activation/expert rounding and
     separate FP32 multiply/add combine; the 4over6 recipe is not supported.
+
+    With MXFP8 activations and MXFP8/MXFP4 weights, or NVFP4 activations and
+    NVFP4 weights, expert IDs outside ``[0, num_experts)`` mark unrouted slots.
+    For these format pairs, finalization ignores those slots, including their
+    scores, and raw output writes zero rows with the usual identity route
+    mapping. Raw routing scores are returned unchanged apart from packed BF16
+    rounding; a downstream reducer must also exclude unrouted slots before
+    multiplying scores that may be NaN or Inf. Other format pairs require
+    expert IDs in ``[0, num_experts)``.
     """
 
     max_num_tokens: int = 2
@@ -3630,7 +3639,10 @@ class MoEActivationPack:
     # Prims-TS, and CuteDSL via moe_sort) skip every id outside this rank's
     # [local_expert_offset, local_expert_offset + local_num_experts), negative
     # ids included. b12x treats a negative id as an unrouted slot (e.g.
-    # CUDA-graph padding); other backends define no behavior for negative ids.
+    # CUDA-graph padding). frost_low_latency accepts IDs outside [0, num_experts)
+    # as unrouted for its MXFP8 and NVFP4 activation paths; see
+    # FrostLowLatencyConfig for exact format pairs and finalized/raw semantics.
+    # Other backends define no behavior for negative IDs.
     topk_ids: Optional[Tensor] = None  # [M, top_k] int32 (expert indices)
     # [M, top_k] routing weights: float32 for PackedPrecomputed; bfloat16 or
     # float32 for TRTLLM UnpackedPrecomputed.

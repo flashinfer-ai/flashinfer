@@ -28,10 +28,12 @@ without it), ``GDN_EVIDENCE_DIR`` (JSONL evidence records), the FP64 reference `
 from __future__ import annotations
 
 import ast
+import collections.abc
 import dataclasses
 import glob
 import hashlib
 import importlib
+import itertools
 import json
 import math
 import os
@@ -160,13 +162,19 @@ def _plain(x):
     """Dataclass / tensor / tuple -> JSON-like plain values (tensors as lists with their dtype)."""
     if isinstance(x, torch.Tensor):
         return {"dtype": str(x.dtype), "shape": list(x.shape), "values": x.tolist()}
-    if hasattr(x, "__dataclass_fields__"):
+    # the contexts are plain classes listing their fields in ``_FIELDS``; the other plan objects are dataclasses
+    fields = getattr(type(x), "_FIELDS", None) or getattr(
+        x, "__dataclass_fields__", None
+    )
+    if fields is not None:
         return {
             f: _plain(getattr(x, f))
-            for f in x.__dataclass_fields__
+            for f in fields
             if not f.startswith("_") and f != "sequence"
         }
-    if isinstance(x, dict):
+    if isinstance(
+        x, collections.abc.Mapping
+    ):  # dicts and the KDA module's lazily uploaded table mapping
         return {str(k): _plain(v) for k, v in x.items()}
     if isinstance(x, (list, tuple)):
         return [_plain(v) for v in x]
@@ -187,6 +195,11 @@ def _context_record(ctx, HV: int) -> dict:
     rec = _plain(ctx)
     rec.pop("partition", None)
     rec.pop("group", None)
+    # the KDA module keeps the fragment table as host rows plus a lazily uploaded property and records its upload
+    # knobs; compare the table itself on both sides
+    for name in ("frag_rows", "upload", "table_cache"):
+        rec.pop(name, None)
+    rec["frag_table"] = _plain(ctx.frag_table)
     rec["device"] = str(ctx.device)
     rec["heads"] = _plain(ctx.heads(HV))
     rec["describe"] = ctx.describe(HV)
@@ -479,6 +492,112 @@ def test_owner_table(HV, W) -> None:
         for i in range(W):
             assert ctxs[i].heads(HV).splits["c1_send"][r] == hp.splits["c1_recv"][i]
     _evidence("ownership", {**ot, "pass": True})
+
+
+@dataclasses.dataclass(frozen=True)
+class _BatchMeta:
+    """Per-batch metadata a model hands to every layer (the shape of the FSDP2 input-walk report)."""
+
+    cu_seqlens: torch.Tensor
+    kcp: object
+
+
+def _zigzag_fragments(lengths: list[int], W: int) -> list[list[tuple[int, int, int]]]:
+    """Every rank's ``(doc, offset, length)``: pieces ``r`` and ``2W - 1 - r`` of width ``ceil(L / 2W)``."""
+    frags: list[list[tuple[int, int, int]]] = [[] for _ in range(W)]
+    for doc, length in enumerate(lengths):
+        width = math.ceil(length / (2 * W))
+        cuts = [min(i * width, length) for i in range(2 * W)] + [length]
+        for r in range(W):
+            for i in (r, 2 * W - 1 - r):
+                frags[r].append((doc, cuts[i], cuts[i + 1] - cuts[i]))
+    return frags
+
+
+def test_context_is_a_leaf_for_input_walks(monkeypatch) -> None:
+    """A prepared context, CP or single-rank, is one leaf for the input walks that recurse into dataclass, dict,
+    list and tuple containers (FSDP2's ``fully_shard`` pre-forward hook collects and replaces the grad-requiring
+    tensors of a module's arguments that way): the walk visits as many nodes as with no context, at any fragment
+    or token count, and the replace pass returns the metadata object itself.  The context keeps the frozen
+    dataclass behaviour it had: the constructor, frozen attributes, identity equality, the repr."""
+    fsdp_utils = pytest.importorskip("torch.distributed.fsdp._common_utils")
+    if not hasattr(fsdp_utils, "_collect_grad_tensors"):
+        pytest.skip("this torch's FSDP has no recursive input walk")
+    visits = [0]
+    collect = fsdp_utils._collect_grad_tensors
+
+    def counting(output, out, _depth=0):
+        visits[0] += 1
+        return collect(output, out, _depth)
+
+    monkeypatch.setattr(fsdp_utils, "_collect_grad_tensors", counting)
+
+    def walk(meta) -> int:
+        visits[0] = 0
+        assert fsdp_utils.collect_grad_tensors(((meta,), {"meta": meta})) == ()
+        assert fsdp_utils.replace_grad_tensors(meta, iter(())) is meta
+        return visits[0]
+
+    cu = torch.tensor([0, 4000], dtype=torch.int64)
+    baseline = walk(_BatchMeta(cu, None))
+    assert walk(_BatchMeta(cu, (None, None))) > baseline  # the walk recurses
+    # the mixed-precision input cast (``MixedPrecisionPolicy(param_dtype=...)``) rebuilds the dataclasses it walks
+    apply_to_tensors = getattr(
+        importlib.import_module("torch.distributed.utils"), "_apply_to_tensors", None
+    )
+    for n_docs, W in ((2, 8), (64, 8), (64, 16)):
+        lengths = [4000] * n_docs
+        cu = torch.tensor([0, *itertools.accumulate(lengths)], dtype=torch.int64)
+        part = gp.kcp_partition(cu, W, fragments=_zigzag_fragments(lengths, W))
+        ctx = gp.build_kcp_context(part, None, 0, CPU, 4, sm_count=SM_COUNT)
+        ctx.prepare(1, 48)
+        single = gp.build_kcp_context(
+            gp.kcp_partition(cu, 1, "contiguous"), None, 0, CPU, 4, sm_count=SM_COUNT
+        )
+        single.prepare(1, 48 // W)
+        for c in (ctx, single):
+            assert not dataclasses.is_dataclass(c)
+            assert walk(_BatchMeta(cu, c)) == baseline, (n_docs, W)
+            if apply_to_tensors is not None:
+                assert apply_to_tensors(lambda t: t, _BatchMeta(cu, c)).kcp is c
+            nested = walk(_BatchMeta(cu, {"kcp": [None, (None,)]}))
+            assert walk(_BatchMeta(cu, {"kcp": [c, (c,)]})) == nested
+
+    # the frozen-dataclass behaviour, unchanged
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        ctx.rank = 1
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        del ctx.T_r
+    clone = gp.KcpContext(**{f: getattr(ctx, f) for f in gp.KcpContext._FIELDS})
+    assert clone != ctx and clone == clone and hash(clone) != hash(ctx)
+    assert all(getattr(clone, f) is getattr(ctx, f) for f in gp.KcpContext._FIELDS)
+    assert gp.KcpContext._FIELDS[-4:] == (
+        "p_rule",
+        "sequence",
+        "_head_plans",
+        "_caches",
+    )
+    fresh = gp.KcpContext(*(getattr(ctx, f) for f in gp.KcpContext._FIELDS[:-4]))
+    assert (
+        fresh.p_rule == gp.P_RULE_DEFAULT
+        and fresh._head_plans == {}
+        and fresh._caches == {}
+    )
+    assert (
+        isinstance(fresh.sequence, gp.KcpSequence)
+        and fresh.sequence is not ctx.sequence
+    )
+    assert (
+        gp.KcpContext(
+            *(getattr(ctx, f) for f in gp.KcpContext._FIELDS[:-3]), None
+        ).sequence
+        is None
+    )
+    text = repr(ctx)
+    assert (
+        text.startswith("KcpContext(partition=") and f"p_rule={ctx.p_rule!r})" in text
+    )
+    assert "sequence=" not in text and "_caches" not in text
 
 
 def test_prepare_tables_first_use() -> None:
@@ -3646,3 +3765,140 @@ def test_reuse_recompute_tapes_auto_is_an_option_value() -> None:
     for bad in ("yes", 1, 0, "AUTO"):
         with pytest.raises(TypeError, match="must be a bool or 'auto'"):
             opt.KcpOptions(reuse_recompute_tapes=bad).check()
+
+
+# ----------------------------------------------------------------------------------------------------------------
+# Recompute handle (issue #7818): the checkpoint recompute reads the original forward's incoming states from the
+# handle instead of exchanging them again.  These CPU rows run one rank (no crossing fragment, ``S_in`` empty): they
+# check the code path -- the capture / replay decision, the local carries at ``P > 1``, bitwise equality, retention
+# and misuse; the multi-GPU rows (test_cake_gdn_train_kcp_dist.py) check the exchange count and the retained bytes.
+
+
+def _handle_autograd(
+    kcp, ctx, ops, *, handle, twice: bool = False, **opts
+) -> tuple[dict[str, torch.Tensor], list]:
+    """One ``chunk_gdn_kcp`` layer under a non-reentrant checkpoint with ``recompute_handle=handle`` (``None``: the
+    plain checkpoint); returns out + gradients and the ``recompute_handle`` mode of the original forward and of the
+    recompute of every backward (read from ``LAST_CALL`` after each: torch's early stop ends the recompute inside the
+    node's ``apply``, after the forward recorded itself)."""
+    leaves = [
+        ops[n].detach().clone().requires_grad_(True)
+        for n in ("q", "k", "v", "g", "beta")
+    ]
+    o = {"backend": "fake", "save_transfer": False, **opts}
+
+    def fn(q, k, v, g, beta, h):
+        return kcp.chunk_gdn_kcp(q, k, v, g, beta, ctx, recompute_handle=h, **o)
+
+    from torch.utils.checkpoint import checkpoint
+
+    out = checkpoint(fn, *leaves, handle, use_reentrant=False)
+    modes = [kcp.LAST_CALL["fwd"]["recompute_handle"]]
+    out.backward(ops["dout"], retain_graph=twice)
+    modes.append(kcp.LAST_CALL["fwd"]["recompute_handle"])
+    if twice:
+        out.backward(ops["dout"])
+        modes.append(kcp.LAST_CALL["fwd"]["recompute_handle"])
+    return {
+        "out": out.detach(),
+        **{n: lf.grad for n, lf in zip(CKPT_GRADS, leaves, strict=True)},
+    }, modes
+
+
+@pytest.mark.parametrize("segments", [1, 2])
+@pytest.mark.parametrize("reuse", [True, False, "auto"])
+def test_recompute_handle_is_bitwise_the_checkpoint_and_the_direct_pass(
+    segments, reuse
+) -> None:
+    """The original forward stores ``S_in`` ("capture"), torch's recompute reads it ("replay"): out and the five
+    gradients are bitwise the plain checkpoint's and the direct pass's at the same options, at ``P = 1`` and
+    ``P = 2`` (the carries rebuilt locally), with and without the kept tapes."""
+    kcp, ctx, ops = _ckpt_setup()
+    base = dict(segments=segments, reuse_recompute_tapes=reuse)
+    direct = _ckpt_autograd(kcp, ctx, ops, ckpt=False, save_transfer=False, **base)
+    plain, plain_modes = _handle_autograd(kcp, ctx, ops, handle=None, **base)
+    handle = kcp.KcpRecomputeHandle()
+    got, modes = _handle_autograd(kcp, ctx, ops, handle=handle, **base)
+    _assert_same(plain, direct, "plain checkpoint vs direct")
+    _assert_same(got, direct, "handle checkpoint vs direct")
+    assert plain_modes == [None, None], plain_modes
+    assert modes == ["capture", "replay"], modes
+    assert kcp.HANDLE_KEY in handle.entries
+    assert kcp.kept_registry_size() == 0
+
+
+def test_recompute_handle_retains_exactly_s_in_and_survives_a_second_backward() -> None:
+    """The entry is the saved set's own ``S_in`` (no copy; ``nbytes`` is its size and the light byte query without
+    the transfer and the convolution rows); ``retain_graph`` + a second backward reuses it and accumulates exactly
+    twice the gradient."""
+    kcp, ctx, ops = _ckpt_setup()
+    H_qk, HV = ops["q"].shape[-2], ops["v"].shape[-2]
+    handle = kcp.KcpRecomputeHandle()
+    once, _ = _handle_autograd(kcp, ctx, ops, handle=kcp.KcpRecomputeHandle())
+    twice, modes = _handle_autograd(kcp, ctx, ops, handle=handle, twice=True)
+    assert modes == ["capture", "replay", "replay"], modes
+    for n in CKPT_GRADS:
+        assert torch.equal(twice[n], once[n] + once[n]), n
+    s_in = handle.entries[kcp.HANDLE_KEY]["S_in"]
+    assert handle.nbytes() == s_in.numel() * s_in.element_size()
+    assert handle.nbytes() == kcp.gdn_kcp_saved_bytes(
+        ctx, H_qk=H_qk, HV=HV, save_mode="light", save_transfer=False, with_conv=False
+    )
+    handle.clear()
+    assert handle.nbytes() == 0 and not handle.entries
+
+
+def test_recompute_handle_entry_rules() -> None:
+    """A forward outside the backward that finds an entry raises (a handle reused across micro-steps); a recompute
+    whose handle lost its entry is an original forward again (it captures; the result is unchanged);
+    ``save_transfer=True`` (keyword or options dict), ``boundary_mode="replay"``, ``graph="replay"`` and
+    ``debug_sequence`` are refused; an object without an ``entries`` dict is refused."""
+    kcp, ctx, ops = _ckpt_setup()
+    q, k, v, g, beta = (ops[n] for n in ("q", "k", "v", "g", "beta"))
+    handle = kcp.KcpRecomputeHandle()
+    kcp.chunk_gdn_kcp(q, k, v, g, beta, ctx, backend="fake", recompute_handle=handle)
+    assert kcp.LAST_CALL["fwd"]["recompute_handle"] == "capture"
+    with pytest.raises(RuntimeError, match="new KcpRecomputeHandle per micro-step"):
+        kcp.chunk_gdn_kcp(
+            q, k, v, g, beta, ctx, backend="fake", recompute_handle=handle
+        )
+    leaves = [x.detach().clone().requires_grad_(True) for x in (q, k, v, g, beta)]
+    h2 = kcp.KcpRecomputeHandle()
+    from torch.utils.checkpoint import checkpoint
+
+    def fn(*a):
+        return kcp.chunk_gdn_kcp(
+            *a[:5], ctx, backend="fake", save_transfer=False, recompute_handle=a[5]
+        )
+
+    out = checkpoint(fn, *leaves, h2, use_reentrant=False)
+    h2.clear()
+    out.backward(ops["dout"])
+    assert kcp.LAST_CALL["fwd"]["recompute_handle"] == "capture"
+    assert kcp.HANDLE_KEY in h2.entries
+    ref = _ckpt_autograd(kcp, ctx, ops, ckpt=False, save_transfer=False)
+    for n, lf in zip(CKPT_GRADS, leaves, strict=True):
+        assert torch.equal(lf.grad, ref[n]), n
+    for bad in (
+        {"save_transfer": True},
+        {"options": {"save_transfer": True}},
+        {"boundary_mode": "replay"},
+        {"graph": "replay", "workspace": kcp.KcpWorkspace()},
+        {"test_knobs": {"debug_sequence": True}},
+    ):
+        with pytest.raises(ValueError):
+            kcp.chunk_gdn_kcp(
+                q,
+                k,
+                v,
+                g,
+                beta,
+                ctx,
+                backend="fake",
+                recompute_handle=kcp.KcpRecomputeHandle(),
+                **bad,
+            )
+    with pytest.raises(TypeError, match="entries"):
+        kcp.chunk_gdn_kcp(
+            q, k, v, g, beta, ctx, backend="fake", recompute_handle=object()
+        )

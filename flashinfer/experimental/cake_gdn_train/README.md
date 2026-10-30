@@ -26,7 +26,7 @@ variable.
 ```python
 from flashinfer.gdn_train import (
     kcp_partition, build_kcp_context, KcpPartition, KcpContext, KcpOptions,
-    chunk_gdn_kcp, chunk_gdn_kcp_fwd, chunk_gdn_kcp_bwd,
+    KcpRecomputeHandle, chunk_gdn_kcp, chunk_gdn_kcp_fwd, chunk_gdn_kcp_bwd,
     gdn_kcp_workspace_bytes, gdn_kcp_saved_bytes, gdn_kcp_comm_bytes,
     is_gdn_train_supported,
 )
@@ -42,7 +42,7 @@ dq, dk, dv, dbeta, dg = chunk_gdn_kcp_bwd(q, k, v, g, beta, ctx, dout)          
 ws = gdn_kcp_workspace_bytes(ctx, H_qk=16, HV=48)                                      # per rank, pure CPU
 ```
 
-These twelve names are the whole public surface (`flashinfer/gdn_train.py`
+These thirteen names are the whole public surface (`flashinfer/gdn_train.py`
 and this package's `__init__.py` export exactly them).  Every switch is a
 keyword argument of the public call (`KcpOptions` fields); no module-level
 global and no environment variable selects anything.
@@ -162,6 +162,38 @@ Two replays exist, and they differ:
   minimum-memory option.
 
 Both replays give bitwise the gradients of the saved-set backward.
+
+A **recompute handle** removes the exchange from the checkpoint replay.  Pass
+a `KcpRecomputeHandle` to the checkpointed function and to `chunk_gdn_kcp`:
+
+```python
+def layer(x, handle):
+    ...                                   # convolution, split, gates
+    return chunk_gdn_kcp(q, k, v, g, beta, ctx, recompute_handle=handle)
+
+y = torch.utils.checkpoint.checkpoint(layer, x, KcpRecomputeHandle(), use_reentrant=False)
+```
+
+The original forward exchanges as always and stores this rank's incoming
+states `S_in` (the saved set's own tensor) in the handle.  Torch's recompute
+inside `.backward()` reads them back and runs the light replay's launches
+(chunk preparation, at `P > 1` the local segment walks and carry merges, the
+tape walk from `S_in`, then the output program): no collective, no summary
+walk over the crossing-out fragments, no owner merge.  The gradients
+are bitwise those of the same checkpoint without a handle; the backward still
+exchanges.  The handle retains `S_in` --
+`gdn_kcp_saved_bytes(ctx, ..., save_mode="light", save_transfer=False,
+with_conv=False)` -- until the checkpoint frame that holds it is freed.
+Create one handle per layer and micro-step, outside the outermost checkpoint
+region (a handle created inside a region is empty again in that region's
+recompute, which then exchanges as usual).  The handle needs
+`boundary_mode="saved"` and `graph="off"` and implies `save_transfer=False`.
+A forward outside the backward that finds an entry raises (a handle reused
+across micro-steps).  Other operations keep their own boundary rows in a
+handle under their own key (the convolution's halo rows under `"conv"`).  A
+handle holds one entry per key: it serves one GDN call and at most one
+convolution call; a layer with separate Q / K / V convolutions uses one handle
+per convolution call, and the GDN call shares one of them.
 
 ```
 gdn_kcp_comm_bytes(ctx, *, H_qk, HV, C) -> {rank: {c1_send, c1_recv, c2_recv, b1_send, b2_recv, halo_fwd, halo_bwd}}

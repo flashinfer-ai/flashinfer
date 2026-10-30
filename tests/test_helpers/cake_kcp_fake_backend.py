@@ -1,24 +1,38 @@
-"""FP64 fake backend of the context-parallel (KCP) route of the Cake packed KDA training backend.
+"""
+Copyright (c) 2026 by FlashInfer team.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+  http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+
+FP64 fake backend of the context-parallel (KCP) route of the Cake packed KDA training backend.
 
 It emulates ``W`` ranks in ONE CPU process on the real :mod:`cake_kcp_plan` tables: every rank's exchange buffers
 are plain FP64 tensors laid out exactly as the device buffers (``KcpHeadPlan`` tile tables and chain offsets), the
 collectives are dictionary ``all_to_all_single`` over the published split sizes, and the per-fragment compute is the
-FP64 token recurrence of the step-0 reference (``reference_kcp.recur_interval`` /
-``recur_interval_adjoint``).  The launch sequence follows FINAL_DESIGN §3.5 (forward: offset + transfer summaries ->
-c1 -> owner chain prefix -> c2 -> local forward from ``S_in``) and §6.5 (backward: adjoint offsets ``d_f`` [+ re-sent
-maps] -> b1 -> owner reverse chain -> b2 -> local adjoint from ``dS_out``) at fragment granularity (``P = 1``
-semantics: fragment = segment).  Saved mode reuses the forward's ``S_in`` (and the owner's c1 receive tensor with
+FP64 token recurrence of the reference (``cake_kda_kcp_reference.recur_interval`` /
+``recur_interval_adjoint``).  It follows the forward launch sequence (offset + transfer summaries -> c1 -> owner
+chain prefix -> c2 -> local forward from ``S_in``) and the backward one (adjoint offsets ``d_f`` [+ re-sent maps] ->
+b1 -> owner reverse chain -> b2 -> local adjoint from ``dS_out``) at fragment granularity (``P = 1`` semantics:
+fragment = segment).  Saved mode reuses the forward's ``S_in`` (and the owner's c1 receive tensor with
 ``save_transfer=True``); replay mode re-runs the forward exchange.  Everything is deterministic FP64, so saved and
 replay are bitwise equal and both agree with the unpartitioned per-document FP64 reference to rounding (~1e-12).
 
 The transfer map of a fragment is the final state of the recurrence started from the identity with ``v = 0``
 (the recurrence is affine in the state; its linear part does not depend on ``v``), one FP64 recurrence per
-crossing-out fragment and no cancellation; ``_transfer_matches_lane_p`` checks it against lane P's basis-vector
-``transfer`` helper on a short interval.
+crossing-out fragment and no cancellation; ``_transfer_matches_basis_transfer`` checks it against the reference's
+basis-vector ``transfer`` helper on a short interval.
 
-Inputs come from the reference harness (``kcp_shapes`` rows, ``kcp_inputs`` operands) and lane P's
-``reference_kcp`` (``$W/harness``, ``$W/lanes/P`` on ``PYTHONPATH``); they are imported lazily so that this module
-imports without them.
+Inputs come from the reference harness (``cake_kda_kcp_shapes`` rows, ``cake_kda_kcp_inputs`` operands) and the
+FP64 reference ``cake_kda_kcp_reference``, all in ``tests/test_helpers``.
 """
 
 from __future__ import annotations
@@ -28,6 +42,9 @@ import time
 
 import torch
 
+from tests.test_helpers import cake_kda_kcp_inputs as kcp_inputs
+from tests.test_helpers import cake_kda_kcp_reference as rk
+from tests.test_helpers import cake_kda_kcp_shapes as kcp_shapes
 from tests.test_helpers.cake_package import cake_package
 
 kp = cake_package("cake_kda_train", "cake_kcp_plan")
@@ -38,19 +55,6 @@ TILE, SUMMARY_TILE, TILE_B, TILE_M = kp.TILE, kp.SUMMARY_TILE, kp.TILE_B, kp.TIL
 TILE_D = kp.TILE_D
 GRAD_NAMES = ("dq", "dk", "dv", "dg", "dbeta")
 OPERANDS = ("q", "k", "v", "g", "beta", "dout")
-
-
-def _harness():
-    import kcp_inputs  # noqa: PLC0415  (the reference harness, on PYTHONPATH in the lane environment)
-    import kcp_shapes  # noqa: PLC0415
-
-    return kcp_shapes, kcp_inputs
-
-
-def _reference():
-    import reference_kcp  # noqa: PLC0415  (lane P's FP64 helpers, on PYTHONPATH in the lane environment)
-
-    return reference_kcp
 
 
 def _log(progress, msg: str) -> None:
@@ -143,7 +147,6 @@ def build_ranks(
     ``layout``: ``"C"`` / ``"Z"`` / ``"D"`` (harness letters) or a :mod:`cake_kcp_plan` layout name; ``"R"`` takes the
     harness ragged table of ``row`` (``fragments`` overrides).  Layout D uses the harness jitter (``kcp_shapes.doc_cuts_D``)
     as the caller's cut points unless ``cut_points`` is given explicitly (``None`` = the module default)."""
-    kcp_shapes, kcp_inputs = _harness()
     H = int(row.h)
     all_docs = list(range(len(row.lengths)))
     docs = all_docs if docs is None else [int(d) for d in docs]
@@ -231,7 +234,7 @@ def build_ranks(
 
 
 # ----------------------------------------------------------------------------------------------------------------
-# Per-fragment compute (lane P's FP64 helpers)
+# Per-fragment compute (the FP64 reference helpers)
 
 
 def fragment_offset_and_transfer(
@@ -239,7 +242,6 @@ def fragment_offset_and_transfer(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """``(B_f, M_f)`` of one fragment: ``B_f`` = the final state from zero (the offset), ``M_f`` = the final state from
     the identity with ``v = 0`` (the linear part); both ``[H, 128, 128]`` FP64 with ``S_out = M_f @ S_in + B_f`` per head."""
-    rk = _reference()
     zero = torch.zeros(H, D, D, dtype=F64)
     eye = torch.eye(D, dtype=F64).expand(H, D, D).contiguous()
     with torch.no_grad():
@@ -252,9 +254,8 @@ def fragment_offset_and_transfer(
     return B, M
 
 
-def _transfer_matches_lane_p(ops: dict[str, torch.Tensor], H: int) -> float:
-    """max |M (identity, v = 0) - M (lane P's basis-vector transfer)| on one short interval (a unit check)."""
-    rk = _reference()
+def _transfer_matches_basis_transfer(ops: dict[str, torch.Tensor], H: int) -> float:
+    """max |M (identity, v = 0) - M (the reference's basis-vector transfer)| on one short interval (a unit check)."""
     _B, M = fragment_offset_and_transfer(ops, H)
     M_ref, _B_ref = rk.transfer(
         torch.zeros(H, D, D, dtype=F64),
@@ -268,7 +269,7 @@ def _transfer_matches_lane_p(ops: dict[str, torch.Tensor], H: int) -> float:
 
 
 # ----------------------------------------------------------------------------------------------------------------
-# Forward (§3.5) and backward (§6.5) at fragment granularity
+# Forward and backward at fragment granularity
 
 
 @dataclasses.dataclass
@@ -289,7 +290,6 @@ def fake_forward(
     progress=None,
 ):
     """Returns ``(out per rank or None, FakeSaved)``.  ``log`` collects the collective issue order."""
-    rk = _reference()
     H = ranks.H
     plans = [c.heads(H) for c in ranks.ctxs]
     maps: dict = {}
@@ -394,7 +394,6 @@ def fake_backward(
     ``mode="saved"`` uses the forward's ``S_in`` (and the owner's c1 tensor when ``save_transfer``), ``"replay"``
     re-runs the forward exchange first.  ``checks`` reports the max difference between the owner-chain ``dS_in`` of
     every crossing-in fragment and the local adjoint's ``dS0`` (an internal consistency figure)."""
-    rk = _reference()
     W, H = ranks.W, ranks.H
     plans = [c.heads(H) for c in ranks.ctxs]
     if mode == "replay":
@@ -594,21 +593,9 @@ def metrics(cand: torch.Tensor, ref: torch.Tensor) -> dict[str, float]:
     }
 
 
-def load_or_compute_reference(
-    row, ref_dir: str | None, progress=None
-) -> dict[str, torch.Tensor]:
-    """Lane P's cached FP64 reference of the whole pack (``<ref_dir>/<row>.pt`` when complete) or a fresh
-    ``reference_pack`` on the CPU (the same helpers, deterministic).  Returns ``out, dq, dk, dv, dg, dbeta`` FP64 CPU."""
-    rk = _reference()
-    if ref_dir:
-        ref = rk.load_reference(ref_dir, row.name)
-        if ref is not None:
-            meta = ref.pop("_meta")
-            _log(
-                progress,
-                f"{row.name}: cached reference {meta.get('path')} ({meta.get('bytes')} B, sha256 {meta.get('sha256')})",
-            )
-            return {k: v.to(F64) for k, v in ref.items()}
+def compute_reference(row, progress=None) -> dict[str, torch.Tensor]:
+    """The FP64 reference of the whole pack: ``reference_pack`` on the CPU (deterministic).  Returns
+    ``out, dq, dk, dv, dg, dbeta`` FP64 CPU."""
     t0 = time.time()
     out, grads = rk.reference_pack(row, torch.device("cpu"), progress=progress)
     _log(
@@ -712,11 +699,11 @@ __all__ = [
     "all_to_all",
     "build_ranks",
     "compare_to_reference",
+    "compute_reference",
     "fake_backward",
     "fake_forward",
     "fragment_offset_and_transfer",
     "gather_global",
-    "load_or_compute_reference",
     "metrics",
     "replay_equals_saved",
     "run_fake",

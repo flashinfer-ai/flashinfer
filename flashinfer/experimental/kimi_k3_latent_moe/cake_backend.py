@@ -362,6 +362,7 @@ def decode_front_plan(
         up_prefetch=False,
         sb_norm=False,
         partial_prefetch=False,
+        sb_split=False,
         tiles=tiles,
     )
 
@@ -373,24 +374,75 @@ def decode_tail_plan(
     tp: int,
     num_partials: int = 1,
     sm_count: int = SM_COUNT,
+    arch: str = "sm_100a",
 ) -> dict[str, Any]:
-    """Instance configuration of ``tail_decode_fused`` (port of ``_tail_plan`` with the production defaults); the
-    few-token multi-partial rows of ``TAIL_SB_NORM_ROUTES`` take the global-y instance of their N_PAD with the
-    resident-B arithmetic (``sb_norm``), and the cells of ``TAIL_PARTIAL_PREFETCH_ROUTES`` the instance the table
-    names with the routed partials prefetched into L2 (``partial_prefetch``)."""
+    """Instance configuration of ``tail_decode_fused`` that the route of ``num_tokens`` tokens and ``num_partials``
+    routed partials at ``tp`` takes on an ``arch`` device of ``sm_count`` SMs: the cells of ``TAIL_SB_SPLIT_ROUTES``
+    for that part take the global-y instance of the table's N_PAD with the resident-B arithmetic, the routed partials
+    prefetched and each row split over the epilogue warps (``sb_split``), the few-token multi-partial rows of
+    ``TAIL_SB_NORM_ROUTES`` the global-y instance of their N_PAD with the resident-B arithmetic (``sb_norm``), the
+    cells of ``TAIL_PARTIAL_PREFETCH_ROUTES`` the instance the table names with the routed partials prefetched into L2
+    (``partial_prefetch``), the cells of ``TAIL_SPLIT_FIN_ROUTES`` the split-finalize instance of one routed partial at
+    the table's N_PAD, and every other row its own instance (``decode_tail_instance_plan``)."""
+    split_n_pad = tail_sb_split_n_pad(num_tokens, tp, num_partials, arch, sm_count)
+    if split_n_pad:
+        plan = decode_tail_instance_plan(
+            split_n_pad, i_local, tp, num_partials, sm_count
+        )
+        if plan["smem_b1"] or plan["split_fin"]:
+            raise AssertionError(
+                f"tp{tp} N_PAD {split_n_pad} P={num_partials}: not a global-y instance"
+            )
+        plan["sb_norm"] = True
+        plan["partial_prefetch"] = True
+        plan["sb_split"] = True
+        return plan
     sb_norm_n_pad = tail_sb_norm_n_pad(num_tokens, tp, num_partials)
     prefetch = tail_partial_prefetch(num_tokens, tp, num_partials)
     if prefetch is not None:
         sb_norm_n_pad = TAIL_SB_NORM_ROUTES[int(tp)][0] if prefetch else 0
     if sb_norm_n_pad:
-        plan = decode_tail_plan(sb_norm_n_pad, i_local, tp, num_partials, sm_count)
-        if plan["smem_b1"] or plan["split_fin"] or plan["partial_prefetch"]:
+        plan = decode_tail_instance_plan(
+            sb_norm_n_pad, i_local, tp, num_partials, sm_count
+        )
+        if plan["smem_b1"] or plan["split_fin"]:
             raise AssertionError(
                 f"tp{tp} N_PAD {sb_norm_n_pad} P={num_partials}: not a global-y instance"
             )
         plan["sb_norm"] = True
         plan["partial_prefetch"] = prefetch is not None
         return plan
+    if prefetch is not None:
+        plan = decode_tail_instance_plan(
+            num_tokens, i_local, tp, num_partials, sm_count
+        )
+        if not plan["smem_b1"] or plan["rows_smem"]:
+            raise AssertionError(
+                f"tp{tp} T={num_tokens} P={num_partials}: not a resident-B instance without staged rows"
+            )
+        plan["partial_prefetch"] = True
+        return plan
+    split_fin_n_pad = tail_split_fin_n_pad(num_tokens, tp, num_partials)
+    if split_fin_n_pad:
+        plan = decode_tail_instance_plan(split_fin_n_pad, i_local, tp, 1, sm_count)
+        if plan["smem_b1"] or not plan["split_fin"]:
+            raise AssertionError(
+                f"tp{tp} N_PAD {split_fin_n_pad}: not a split-finalize instance"
+            )
+        return plan
+    return decode_tail_instance_plan(num_tokens, i_local, tp, num_partials, sm_count)
+
+
+def decode_tail_instance_plan(
+    num_tokens: int,
+    i_local: int,
+    tp: int,
+    num_partials: int = 1,
+    sm_count: int = SM_COUNT,
+) -> dict[str, Any]:
+    """Instance configuration of ``tail_decode_fused`` for ``num_tokens`` tokens and ``num_partials`` routed partials
+    without the route tables (port of ``_tail_plan`` with the production defaults); a route table names an instance
+    by the N_PAD it plans for, i.e. this plan at ``num_tokens = N_PAD``."""
     n_pad = n_pad_for(num_tokens)
     tiles = HIDDEN // BLOCK_ROWS
     k_up = LATENT // tp
@@ -457,10 +509,6 @@ def decode_tail_plan(
             if use_rows
             else (SMEM_B1_MIN_STAGES if use_bn else 2),
         )
-    if prefetch is not None and not (use_bn and not use_rows):
-        raise AssertionError(
-            f"tp{tp} T={num_tokens} P={num_partials}: not a resident-B instance without staged rows"
-        )
     # The global-y protocol's levers (the resident-B instances normalise in smem and take neither).
     early_arrive = split_fin and not use_bn and tp == TAIL_EARLY_ARRIVE_TP
     up_prefetch = (
@@ -507,7 +555,8 @@ def decode_tail_plan(
         early_arrive=bool(early_arrive),
         up_prefetch=bool(up_prefetch),
         sb_norm=False,
-        partial_prefetch=prefetch is not None,
+        partial_prefetch=False,
+        sb_split=False,
         tiles=tiles,
         k1=k1,
         k2=k2,
@@ -532,8 +581,9 @@ FRONT_L2_PROMOTION_MAX_N_PAD = 64
 # combine, the epilogue math and the output stores are split over the pair and each landing zone holds half the partial
 # (one more ring stage for the TP8 tail at N_PAD 128).  Every value is still rank 0's partial plus rank 1's, so the
 # outputs are bitwise those of the single-finisher instance.  The cluster-pair instances take it: the TP8 front from
-# N_PAD 16 and the fused-norm tails of one routed partial from N_PAD 32 (P >= 2 keeps the single finisher; at N_PAD 16
-# the tails measured within run-to-run noise of the single finisher).
+# N_PAD 16 and the fused-norm tails of one routed partial from N_PAD 32 (the tail instances of P >= 2 keep the single
+# finisher, ``TAIL_SPLIT_FIN_ROUTES`` routes the multi-partial cells where the one-partial instance is faster to it; at
+# N_PAD 16 the tails measured within run-to-run noise of the single finisher).
 SPLIT_FIN_MIN_N_PAD = 16
 TAIL_SPLIT_FIN_MIN_N_PAD = 32
 # With it, the TP1 tail's epilogue warp 0 arrives on the fused norm's grid counter as soon as the CTA's normalised rows
@@ -563,7 +613,8 @@ TAIL_SB_NORM_ROUTES: dict[int, tuple[int, dict[int, int]]] = {
 
 def split_fin_route(stage: str, n_pad: int, num_partials: int = 1) -> bool:
     """Whether the decode instance of ``stage`` at ``n_pad`` (and, for the tail, ``num_partials`` routed partials)
-    takes the split finalize when it runs as cluster pairs."""
+    takes the split finalize when it runs as cluster pairs (the tail's own instance; ``TAIL_SPLIT_FIN_ROUTES`` sends
+    multi-partial cells to the instance of one partial)."""
     if stage != "tail":
         return int(n_pad) >= SPLIT_FIN_MIN_N_PAD
     return int(n_pad) >= TAIL_SPLIT_FIN_MIN_N_PAD and int(num_partials) == 1
@@ -575,6 +626,52 @@ def tail_sb_norm_n_pad(num_tokens: int, tp: int, num_partials: int) -> int:
     n_pad, min_partials = TAIL_SB_NORM_ROUTES.get(int(tp), (0, {}))
     least = min_partials.get(int(num_tokens))
     return n_pad if least is not None and int(num_partials) >= least else 0
+
+
+# Split rows (``sb_split``, symbol suffix ``_sbs``): the global-y instance with the resident-B arithmetic and the routed
+# partials prefetched (``_sbn_ppf``) normalises each row in the one warp that owns it, one dependent HBM round trip
+# per routed partial.  With ``sb_split`` the four epilogue warps of a CTA share its row: each sums, rounds and stores a
+# quarter of the row's 16-byte chunks, loading four routed partials per round trip, and warp 0 forms the sum of squares
+# over the staged bf16 sums in the ``_sbn_ppf`` instance's order, so ``y`` and ``out`` are bitwise those of that
+# instance (and so of the resident-B instance) for every input.  ``TAIL_SB_SPLIT_ROUTES`` maps a TP to the N_PAD of
+# that instance and, per part (SM count, architecture), per token count the fewest partials it serves there: the cells
+# where it measured faster than the route without it on that part (paired CUDA-graph timing, cold L2, both passes
+# beyond the A/A band), all of them cells whose route without it takes the resident-B arithmetic.  The TP1 rows serve
+# sm_103a parts only, the rows of 3 tokens on the 152-SM part from 9 partials.
+TAIL_SB_SPLIT_ROUTES: dict[int, tuple[int, dict[tuple[int, str], dict[int, int]]]] = {
+    1: (
+        32,
+        {
+            (148, "sm_103a"): {t: 8 for t in range(1, 9)},
+            (152, "sm_103a"): {t: 9 if t == 3 else 8 for t in range(1, 9)},
+        },
+    ),
+    8: (
+        8,
+        {
+            (sm_count, arch): {t: 3 for t in range(1, 5)}
+            for sm_count in QUALIFIED_SM_COUNTS
+            for arch in ("sm_100a", "sm_103a")
+        },
+    ),
+}
+
+
+def tail_sb_split_n_pad(
+    num_tokens: int,
+    tp: int,
+    num_partials: int,
+    arch: str = "sm_100a",
+    sm_count: int = SM_COUNT,
+) -> int:
+    """N_PAD of the global-y instance with the split rows that serves the decode tail of ``num_tokens`` tokens and
+    ``num_partials`` routed partials at ``tp`` on an ``arch`` device of ``sm_count`` SMs (``TAIL_SB_SPLIT_ROUTES``),
+    or 0 for none."""
+    n_pad, parts = TAIL_SB_SPLIT_ROUTES.get(int(tp), (0, {}))
+    least = parts.get((int(sm_count), str(arch)), {}).get(int(num_tokens))
+    if least is None:
+        return 0
+    return n_pad if int(num_partials) >= least else 0
 
 
 # Routed-partial L2 prefetch (``partial_prefetch``, symbol suffix ``_ppf``).  The resident-B tail instance and the
@@ -621,6 +718,52 @@ def tail_partial_prefetch(
     return None
 
 
+# Split finalize for the multi-partial decode tails (``TAIL_SPLIT_FIN_ROUTES``).  The split-finalize instance of one
+# routed partial at N_PAD ``n`` (``decode_tail_instance_plan(n, ...)``: ``_sf``, with ``_ea`` on the TP1 tail and
+# ``_upf`` on the TP8 tail at N_PAD 32 / 64) serves every token count up to ``n`` and every partial count: both are
+# launch arguments, it sums the routed partials in the order of the row's own instance and its finalize only splits
+# the rank 0 + rank 1 sum over the pair, so its outputs are bitwise those of the row's own instance.
+# ``TAIL_SPLIT_FIN_ROUTES`` maps a TP to token ranges ``(first, last, cells)`` and each range to the partial ranges
+# ``(first, last, n_pad)`` that take the instance at ``n_pad`` (``last`` ``None``: from ``first`` up, as
+# ``TAIL_PARTIAL_PREFETCH_ROUTES``): the cells where it measured faster than the row's own instance on B200, B300,
+# GB200 and GB300 in both passes (paired CUDA-graph timing, cold L2, ABBA groups, by more than the largest of the A/A
+# band, 0.1 us and 0.192 us, the largest spread measured between two timings of one program; 9, 12, 16, 17, 24, 32,
+# 33, 48, 64, 65, 96 and 128 tokens, 1 to 8 and 16 partials, one partial up to 32 tokens), less 9 and 16 tokens of 2
+# partials (a validation run did not time them faster by more than that threshold).  A token count between two
+# measured ones takes an instance measured faster at both, more than 8 partials one measured faster at 8 and at 16.
+# From 17 tokens the row of one partial already takes the split-finalize instance of its own N_PAD; the TP1 tail of 9
+# to 16 tokens has none of its own (N_PAD 16).
+_SplitFinCells = tuple[tuple[int, int, tuple[tuple[int, Optional[int], int], ...]], ...]
+TAIL_SPLIT_FIN_ROUTES: dict[int, _SplitFinCells] = {
+    1: (
+        (9, 11, ((1, 1, 32), (6, None, 32))),
+        (12, 12, ((1, 2, 32), (6, None, 32))),
+        (13, 16, ((1, 1, 32), (6, None, 32))),
+        (17, 23, ((2, 2, 32),)),
+        (24, 32, ((1, 3, 64), (8, None, 64))),
+        (33, 64, ((2, None, 64),)),
+        (65, 128, ((2, None, 128),)),
+    ),
+    8: (
+        (33, 64, ((2, None, 64),)),
+        (65, 128, ((2, None, 128),)),
+    ),
+}
+
+
+def tail_split_fin_n_pad(num_tokens: int, tp: int, num_partials: int) -> int:
+    """N_PAD of the split-finalize instance of one routed partial that serves the decode tail of ``num_tokens`` tokens
+    and ``num_partials`` routed partials at ``tp`` (``TAIL_SPLIT_FIN_ROUTES``), or 0 for the row's own instance."""
+    for first_tokens, last_tokens, cells in TAIL_SPLIT_FIN_ROUTES.get(int(tp), ()):
+        if first_tokens <= int(num_tokens) <= last_tokens:
+            for first, last, n_pad in cells:
+                if first <= int(num_partials) and (
+                    last is None or int(num_partials) <= last
+                ):
+                    return n_pad
+    return 0
+
+
 def decode_symbol(plan: dict[str, Any]) -> str:
     """Kernel symbol of one decode instance (``build_decode_gemm_ir`` naming rule)."""
     fused = bool(plan["fused"])
@@ -642,6 +785,7 @@ def decode_symbol(plan: dict[str, Any]) -> str:
         f"{'_sf' if plan.get('split_fin') else ''}{'_ea' if plan.get('early_arrive') else ''}"
         f"{'_upf' if plan.get('up_prefetch') else ''}{'_sbn' if plan.get('sb_norm') else ''}"
         f"{'_ppf' if plan.get('partial_prefetch') else ''}"
+        f"{'_sbs' if plan.get('sb_split') else ''}"
     )
 
 
@@ -844,16 +988,49 @@ FRONT_N224_I_LOCAL = SHARED_INTERMEDIATE
 FRONT_N224_MAX_T = 512
 FRONT_N224_SM_COUNT = 152
 FRONT_N224_BLOCK_N = 224
+# The TP8 rows of more than 256 and at most 512 tokens (two pair rows, evict_first weights) run the same 224-wide pair
+# tile on the parts where it measured faster: 4 router + 16 latent + 7 shared tiles (the last one 96 columns wide) give
+# 27 per pair row, 54 items at two pair rows, one wave of the resident clusters on 148 and 152 SMs, where the 256-wide
+# tile runs 48 larger items.  Whole tiles, the 256-wide tile's K order and accumulation: the outputs are bit-identical.
+# Parts are (SM count, architecture); a part not listed keeps the 256-wide tile.
+FRONT_N224_TP8_I_LOCAL = SHARED_INTERMEDIATE // 8
+FRONT_N224_TP8_MIN_T = 257
+FRONT_N224_TP8_PARTS = frozenset(
+    {(148, "sm_100a"), (148, "sm_103a"), (152, "sm_100a"), (152, "sm_103a")}
+)
+# Further rows of the 224-wide pair tile by (shared-intermediate width, SM count, architecture): inclusive token ranges
+# where it measured faster than the route without it.  On sm_103a 152-SM parts (GB300): the TP1 rows of 513-768 tokens
+# (three pair rows of 75 tiles, 225 whole evict_first tiles) and the TP8 rows of 1793-2048 tokens (eight pair rows of
+# 27 tiles, 216 whole evict_first tiles, in place of the fold form).  Whole tiles, the 256-wide tile's K order and
+# accumulation: the outputs are bit-identical.
+FRONT_N224_ROWS_BY_PART: dict[tuple[int, int, str], tuple[tuple[int, int], ...]] = {
+    (SHARED_INTERMEDIATE, 152, "sm_103a"): ((513, 768),),
+    (SHARED_INTERMEDIATE // 8, 152, "sm_103a"): ((1793, 2048),),
+}
 
 
-def front_block_n(M: int, i_local: int, sm_count: int = SM_COUNT) -> int:
-    """Pair-tile width of the prefill front GEMM instance for ``M`` tokens of one rank on a ``sm_count``-SM device."""
+def front_block_n(
+    M: int, i_local: int, sm_count: int = SM_COUNT, arch: str = "sm_100a"
+) -> int:
+    """Pair-tile width of the prefill front GEMM instance for ``M`` tokens of one rank on an ``arch`` device of
+    ``sm_count`` SMs."""
     if (
         int(i_local) == FRONT_N224_I_LOCAL
         and DECODE_MAX_T < int(M) <= FRONT_N224_MAX_T
         and int(sm_count) == FRONT_N224_SM_COUNT
     ):
         return FRONT_N224_BLOCK_N
+    if (
+        int(i_local) == FRONT_N224_TP8_I_LOCAL
+        and FRONT_N224_TP8_MIN_T <= int(M) <= FRONT_N224_MAX_T
+        and (int(sm_count), str(arch)) in FRONT_N224_TP8_PARTS
+    ):
+        return FRONT_N224_BLOCK_N
+    for first, last in FRONT_N224_ROWS_BY_PART.get(
+        (int(i_local), int(sm_count), str(arch)), ()
+    ):
+        if first <= int(M) <= last:
+            return FRONT_N224_BLOCK_N
     return FRONT_BLOCK_N
 
 
@@ -864,11 +1041,12 @@ def front_block_n(M: int, i_local: int, sm_count: int = SM_COUNT) -> int:
 # ``(0 + P0) + P1``, so the outputs are bitwise those of ``front_split_plan``.  Its CTAs wait for words other CTAs
 # release, so it launches cooperatively: every CTA of its grid resident at once.  Taken on the parts where it measured
 # faster: the TP8 rows of 16 row tiles (T = 1793-2048) with G = 8 on 152-SM parts (GB200 and GB300) and on sm_100a
-# 148-SM parts (B200), and the TP8 rows of 8 row tiles (T = 769-1024) with G = 4 on sm_103a 152-SM parts (GB300);
-# ``m_tiles_for`` rounds the row-tile count up to an even count.  sm_103a 148-SM parts (B300) keep the trailing-wave
-# plan on every row.  The plan travels in the stream-K arguments: ``num_items`` = clusters, ``full_items`` = G,
-# ``sk_ipc`` = lanes, ``sk_total`` = flattened K iterations and ``sk_max_seg`` = 2 * t0 + fold_all, t0 the
-# trailing-wave plan's whole tiles.
+# 148-SM parts (B200), and the TP8 rows of 8 row tiles (T = 769-1024) with G = 4 on 152-SM parts (GB200 and GB300)
+# in its form with a table of lane bounds (``FRONT_FOLD_TABLE_LANE_ROWS_BY_PART``); ``m_tiles_for`` rounds the row-tile
+# count up to an even count.  sm_103a 148-SM parts (B300) keep the trailing-wave plan on every row, and the GB300 rows
+# of 16 row tiles take the 224-wide tile (``FRONT_N224_ROWS_BY_PART``), which never folds.  The plan travels in the
+# stream-K arguments: ``num_items`` = clusters, ``full_items`` = G, ``sk_ipc`` = lanes, ``sk_total`` = flattened K
+# iterations and ``sk_max_seg`` = 2 * t0 + fold_all, t0 the trailing-wave plan's whole tiles.
 FRONT_FOLD_I_LOCAL = SHARED_INTERMEDIATE // 8  # TP8 only
 #: Pair rows per lane (G) by (row tiles, architecture, SM count): the fold form serves these parts only.
 FRONT_FOLD_LANE_ROWS_BY_PART = {
@@ -877,6 +1055,20 @@ FRONT_FOLD_LANE_ROWS_BY_PART = {
     (16, "sm_103a", 152): 8,
     (8, "sm_103a", 152): 4,
 }
+# The fold form with a table of lane bounds (``fold_table``, key suffix ``foldtab``): on the plan of 8 row tiles on
+# 152 SMs (G = 4, 19 lanes, 24 x 112 flattened K iterations) the lanes that end in three or four parts finish last;
+# its program takes that plan's lane bounds from a table that moves iterations from those lanes to the lanes of two
+# parts.  Every lane stays one to one and a half units long and keeps the split tiles' two K runs, so the outputs are
+# bitwise those of the even split (and of ``front_split_plan``).  Pair rows per lane (G) by (row tiles, architecture,
+# SM count) where it measured faster than the route without it: the TP8 rows of 8 row tiles (T = 769-1024) on 152-SM
+# parts, sm_100a (GB200; otherwise the trailing-wave plan) and sm_103a (GB300; otherwise the even split of the fold
+# form).  A part listed here takes the table over ``FRONT_FOLD_LANE_ROWS_BY_PART``.
+FRONT_FOLD_TABLE_LANE_ROWS_BY_PART = {
+    (8, "sm_100a", 152): 4,
+    (8, "sm_103a", 152): 4,
+}
+#: The plan (G, lanes, flattened K iterations) the table's lane bounds are written for.
+FRONT_FOLD_TABLE_PLAN = (4, 19, 24 * FRONT_NUM_K_ITERS)
 
 
 def front_fold_plan(
@@ -888,12 +1080,20 @@ def front_fold_plan(
     iterations split evenly over the lanes.  ``sk_max_seg`` selects the mode: ``2 * t0`` keeps the split tiles of
     ``front_split_plan`` (``t0`` its whole tiles; every tile when it splits none), plus one when a lane is shorter
     than a unit (``fold_all``).  The workspace holds two ``128 x 256`` FP32 slots and two self-resetting counters
-    per CTA (``ws_slots``).  Keys as ``front_split_plan`` plus ``fold`` and ``ws_slots``.
+    per CTA (``ws_slots``).  On the parts of ``FRONT_FOLD_TABLE_LANE_ROWS_BY_PART`` the lanes take the table's bounds
+    (``fold_table``; only ``FRONT_FOLD_TABLE_PLAN``).  Keys as ``front_split_plan`` plus ``fold``, ``fold_table`` and
+    ``ws_slots``.
     """
     m_tiles, i_local, sm_count = int(m_tiles), int(i_local), int(sm_count)
     if i_local != FRONT_FOLD_I_LOCAL:
         return None
-    lane_rows = FRONT_FOLD_LANE_ROWS_BY_PART.get((m_tiles, str(arch), sm_count))
+    part = (m_tiles, str(arch), sm_count)
+    fold_table = part in FRONT_FOLD_TABLE_LANE_ROWS_BY_PART
+    lane_rows = (
+        FRONT_FOLD_TABLE_LANE_ROWS_BY_PART[part]
+        if fold_table
+        else FRONT_FOLD_LANE_ROWS_BY_PART.get(part)
+    )
     if lane_rows is None:
         return None
     pair_rows = m_tiles // CTA_GROUP
@@ -914,6 +1114,8 @@ def front_fold_plan(
         if fold_all and 2 * total < lanes * FRONT_NUM_K_ITERS:
             return None
         max_seg = 2 * pair_rows * n_tiles + int(fold_all)
+    if fold_table and (lane_rows, lanes, total) != FRONT_FOLD_TABLE_PLAN:
+        return None
     clusters = lanes * lane_rows
     return {
         "num_items": clusters,
@@ -923,6 +1125,7 @@ def front_fold_plan(
         "sk_total": total,
         "sk_tiles": 0,
         "fold": True,
+        "fold_table": fold_table,
         "ws_slots": 2 * clusters * CTA_GROUP,
     }
 
@@ -932,14 +1135,16 @@ def front_kernel_key(
     evict_first: bool = False,
     block_n: int = FRONT_BLOCK_N,
     fold: bool = False,
+    fold_table: bool = False,
 ) -> str:
-    """``front:i<I_local>[e1][n224|fold]``: the ``e1`` suffix names the ``evict_first`` weight-policy instance,
-    ``n224`` the 224-wide pair tile and ``fold`` the fold-form program."""
+    """``front:i<I_local>[e1][n224|fold[tab]]``: the ``e1`` suffix names the ``evict_first`` weight-policy instance,
+    ``n224`` the 224-wide pair tile, ``fold`` the fold-form program and ``foldtab`` its form with the table of lane
+    bounds."""
     return (
         f"front:i{int(i_local)}"
         + ("e1" if evict_first else "")
         + ("" if block_n == FRONT_BLOCK_N else f"n{int(block_n)}")
-        + ("fold" if fold else "")
+        + (("foldtab" if fold_table else "fold") if fold else "")
     )
 
 
@@ -958,7 +1163,7 @@ def prefill_front_plan(
     every one of its clusters resident and keeps the trailing-wave plan below that (``None``: the qualified parts'
     count, which holds every fold plan)."""
     m_tiles = m_tiles_for(M)
-    block_n = front_block_n(M, i_local, sm_count)
+    block_n = front_block_n(M, i_local, sm_count, arch)
     n_tiles = front_n_tiles(i_local, block_n)
     cluster_tiles = (m_tiles // CTA_GROUP) * n_tiles
     fold = (
@@ -972,7 +1177,12 @@ def prefill_front_plan(
         # The fold programs stream the weights evict_first.
         sk, evict_first = fold, True
     else:
-        sk = dict(front_split_plan(cluster_tiles, sm_count), fold=False, ws_slots=0)
+        sk = dict(
+            front_split_plan(cluster_tiles, sm_count),
+            fold=False,
+            fold_table=False,
+            ws_slots=0,
+        )
         evict_first = bool(front_evict_first(m_tiles, i_local, sm_count))
     if block_n != FRONT_BLOCK_N and (sk["sk_max_seg"] != 1 or not evict_first):
         raise AssertionError(
@@ -994,7 +1204,11 @@ def prefill_front_plan(
 def prefill_front_kernel_key(plan: dict[str, Any]) -> str:
     """The logical kernel key of a ``prefill_front_plan``."""
     return front_kernel_key(
-        plan["i_local"], plan["evict_first"], plan["block_n"], plan["fold"]
+        plan["i_local"],
+        plan["evict_first"],
+        plan["block_n"],
+        plan["fold"],
+        plan["fold_table"],
     )
 
 
@@ -1005,7 +1219,8 @@ def norm_kernel_key(early_trigger: bool, packed: bool = False) -> str:
 
 # Ring depth of the prefill tail GEMM per row (Cake round-6 lever ledger, mirrored from
 # ``kimi_k3_latent_moe_tail.tail_gemm_config_for``): 6 stages for the TP1 rows at
-# T <= 256 (+1.0..+1.2 % in five paired samples on B200 and B300), 7 everywhere else.
+# T <= 256 (+1.0..+1.2 % in five paired samples on B200 and B300), 7 everywhere else (the 148-SM TP1 rows of more than
+# 128 tokens take the 224-wide tile at 7, ``TAIL_N224_*``).
 TAIL_NUM_STAGES = 7
 TAIL_RING6_TP = 1
 TAIL_RING6_MAX_T = 256
@@ -1045,6 +1260,14 @@ TAIL_N192_MAX_T = 512
 TAIL_N192_SM_COUNT = 152
 TAIL_N192_STAGES = 8
 TAIL_N192_BLOCK_N = 192
+# On 148-SM parts (B200 / B300) the TP1 rows of more than 128 and at most 256 tokens (one pair row) run the 224-wide
+# pair tile (32 column tiles) at the default ring, in place of the six-stage 256-wide tile, with the lean split-K
+# finisher and the owner-only norm loads (``tail_gemm:tp1e1f1n224t1``).  The same K order and accumulation as the
+# 256-wide tile, so ``out`` is bit-identical.
+TAIL_N224_TP = 1
+TAIL_N224_MAX_T = 256
+TAIL_N224_SM_COUNT = 148
+TAIL_N224_BLOCK_N = 224
 
 
 # TP1 prefill rows from ``tail_wide_min_tokens(sm_count)`` tokens run the 256 x 512 pair tile (a 4-stage ring,
@@ -1074,6 +1297,12 @@ def tail_gemm_config(
         and int(sm_count) == TAIL_N192_SM_COUNT
     ):
         return TAIL_N192_STAGES, TAIL_N192_BLOCK_N, TAIL_FINAL_TS
+    if (
+        int(tp) == TAIL_N224_TP
+        and DECODE_MAX_T < int(M) <= TAIL_N224_MAX_T
+        and int(sm_count) == TAIL_N224_SM_COUNT
+    ):
+        return TAIL_NUM_STAGES, TAIL_N224_BLOCK_N, TAIL_FINAL_TS
     if int(tp) == TAIL_RING6_TP and int(M) <= TAIL_RING6_MAX_T:
         return TAIL_RING6_STAGES, BLOCK_N, TAIL_FINAL_TS
     if int(tp) == TAIL_WIDE_TP and int(M) >= tail_wide_min_tokens(sm_count):
@@ -1209,6 +1438,35 @@ def use_resident_fused_norm(
     )
 
 
+# The TP8 rows of one routed partial of more than 256 tokens, up to a per-part bound, fuse the norm on the claimed
+# resident grid as the long TP1 rows do: the 256-wide tile at the default ring, 56 pair items at two pair rows (one wave
+# of the resident clusters on 148 and 152 SMs), whose epilogue warps normalise every latent row in place of the norm
+# launch.  The tile, K order and accumulation are those of the TP8 chain's 256-wide GEMM and the rows are normalised by
+# the norm launch's statements, so ``y`` and ``out`` are bit-identical.  Bounds by (SM count, architecture) where the
+# claimed launch measured faster, alone and behind the front GEMM; a part not listed keeps the norm launch.
+TAIL_TP8_CLAIMED_TP = 8
+TAIL_TP8_CLAIMED_MIN_T = 257
+TAIL_TP8_CLAIMED_MAX_T_BY_PART = {
+    (148, "sm_100a"): 300,
+    (148, "sm_103a"): 257,
+    (152, "sm_100a"): 384,
+    (152, "sm_103a"): 257,
+}
+
+
+def use_tp8_claimed_fused_norm(
+    M: int, tp: int, sm_count: int, arch: str, num_partials: int
+) -> bool:
+    """The TP8 rows of one routed partial that fuse the norm on the claimed resident grid."""
+    return (
+        int(tp) == TAIL_TP8_CLAIMED_TP
+        and int(num_partials) == 1
+        and TAIL_TP8_CLAIMED_MIN_T
+        <= int(M)
+        <= TAIL_TP8_CLAIMED_MAX_T_BY_PART.get((int(sm_count), str(arch)), 0)
+    )
+
+
 def resident_grid(num_items: int, sm_count: int) -> int:
     """CTAs of the claimed launch: one CTA pair per resident cluster, at most one per item.  Every CTA of the claimed
     instances allocates all 512 TMEM columns and more than half of the SM's shared memory, so one CTA runs per SM and
@@ -1243,15 +1501,23 @@ def use_packed_norm(M: int, tp: int, num_partials: int) -> bool:
 
 @_cached_plan
 def prefill_tail_plan(
-    M: int, tp: int, sm_count: int = SM_COUNT, num_partials: int = 1
+    M: int,
+    tp: int,
+    sm_count: int = SM_COUNT,
+    num_partials: int = 1,
+    arch: str = "sm_100a",
 ) -> dict[str, Any]:
     """Host plan of the prefill tail chain (norm launch + persistent GEMM) for ``M`` tokens and ``num_partials``
-    routed partials (the norm instance depends on it)."""
+    routed partials (the norm instance depends on it) on an ``arch`` device of ``sm_count`` SMs."""
     k_up = k_up_for_tp(tp)
     i_local = i_local_for_tp(tp)
     norm_grid = (M + NORM_ROWS_PER_CTA - 1) // NORM_ROWS_PER_CTA
     m_tiles = m_tiles_for(M)
-    num_stages, block_n, final_ts = tail_gemm_config(M, tp, sm_count)
+    tp8_claimed = use_tp8_claimed_fused_norm(M, tp, sm_count, arch, num_partials)
+    if tp8_claimed:
+        num_stages, block_n, final_ts = TAIL_NUM_STAGES, BLOCK_N, TAIL_FINAL_TS
+    else:
+        num_stages, block_n, final_ts = tail_gemm_config(M, tp, sm_count)
     n_tiles = (HIDDEN + block_n - 1) // block_n
     cluster_tiles = (m_tiles // CTA_GROUP) * n_tiles
     num_k = (k_up + i_local) // BLOCK_K
@@ -1259,7 +1525,9 @@ def prefill_tail_plan(
     gemm_grid = sk["num_items"] * CTA_GROUP
     early = norm_early_trigger(gemm_grid, norm_grid, sm_count)
     single_fused = use_fused_norm(M, gemm_grid, sm_count, i_local // BLOCK_K)
-    claim_items = use_resident_fused_norm(M, gemm_grid, sm_count, i_local // BLOCK_K)
+    claim_items = tp8_claimed or use_resident_fused_norm(
+        M, gemm_grid, sm_count, i_local // BLOCK_K
+    )
     launch_grid = resident_grid(sk["num_items"], sm_count) if claim_items else gemm_grid
     return dict(
         M=M,
@@ -1328,11 +1596,11 @@ def route_kernel_keys(
             return (
                 decode_kernel_key(
                     decode_tail_plan(
-                        num_tokens, i_local, tp, int(num_partials), sm_count
+                        num_tokens, i_local, tp, int(num_partials), sm_count, arch
                     )
                 ),
             )
-        plan = prefill_tail_plan(num_tokens, tp, sm_count, int(num_partials))
+        plan = prefill_tail_plan(num_tokens, tp, sm_count, int(num_partials), arch)
         gemm = tail_gemm_kernel_key(
             tp,
             plan["weights_evict_first"],
@@ -2323,7 +2591,7 @@ def _prepare_tail(
     plan: dict[str, Any]
     with torch.cuda.device(index):
         if T <= DECODE_MAX_T:
-            plan = decode_tail_plan(T, i_local, tp, P, sm_count)
+            plan = decode_tail_plan(T, i_local, tp, P, sm_count, arch)
             key = decode_kernel_key(plan)
             _, counters = _control_words(index, 0, DECODE_COUNTER_WORDS, lane=lane)
             f32_dummy, tl = _read_never(index)
@@ -2356,7 +2624,7 @@ def _prepare_tail(
             )
             route = "decode"
         else:
-            plan = prefill_tail_plan(T, tp, sm_count, P)
+            plan = prefill_tail_plan(T, tp, sm_count, P, arch)
             counters, norm_counter = _control_words(
                 index, _arrival_counter_words(plan), NORM_COUNTER_WORDS, lane=lane
             )
@@ -2496,6 +2764,7 @@ __all__ = [
     "decode_front_plan",
     "decode_kernel_key",
     "decode_symbol",
+    "decode_tail_instance_plan",
     "decode_tail_plan",
     "front_kernel_key",
     "generated_program_available",
@@ -2516,10 +2785,13 @@ __all__ = [
     "tail_gemm_kernel_key",
     "tail_partial_prefetch",
     "tail_sb_norm_n_pad",
+    "tail_sb_split_n_pad",
+    "tail_split_fin_n_pad",
     "tail_wide_min_tokens",
     "use_fused_norm",
     "use_packed_norm",
     "use_resident_fused_norm",
+    "use_tp8_claimed_fused_norm",
     "resident_grid",
     "fused_norm_fits",
     "FUSED_MIN_K2_ITERS",

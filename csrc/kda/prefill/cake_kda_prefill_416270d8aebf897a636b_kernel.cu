@@ -1419,7 +1419,7 @@ kernel_cake_kda_prefill_416270d8aebf897a636b(__nv_bfloat16* __restrict__ q, cons
                     #pragma unroll 1
                     for (int turn_init_it = 0; turn_init_it < 32; turn_init_it++) {
                         asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16, %2;"
-                            :: "r"((smem_v18_addr_1 + (unsigned int)((turn_init_lrow + turn_init_it * 4) * 128 + turn_init_lcol * 4 ^ ((turn_init_lrow + turn_init_it * 4) * 128 + turn_init_lcol * 4 >> 7 & 7) << 4))), "l"(initial_state_f32 + (turn_init_base + (long long)(turn_init_lrow + turn_init_it * 4) * 128 + (long long)((turn_init_half * 2 + 0) * 32) + (long long)turn_init_lcol)), "r"((use_initial_state != 0) ? 16 : 0));
+                            :: "r"((smem_v18_addr_1 + (unsigned int)((turn_init_lrow + turn_init_it * 4) * 128 + turn_init_lcol * 4 ^ ((turn_init_lrow + turn_init_it * 4) * 128 + turn_init_lcol * 4 >> 7 & 7) << 4))), "l"(initial_state_f32 + (turn_init_base + (long long)(turn_init_lrow + turn_init_it * 4) * 128 + (long long)(turn_init_half * 2 * 32) + (long long)turn_init_lcol)), "r"((use_initial_state != 0) ? 16 : 0));
                         asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16, %2;"
                             :: "r"((smem_v18_addr_2 + (unsigned int)((turn_init_lrow + turn_init_it * 4) * 128 + turn_init_lcol * 4 ^ ((turn_init_lrow + turn_init_it * 4) * 128 + turn_init_lcol * 4 >> 7 & 7) << 4))), "l"(initial_state_f32 + (turn_init_base + (long long)(turn_init_lrow + turn_init_it * 4) * 128 + (long long)((turn_init_half * 2 + 1) * 32) + (long long)turn_init_lcol)), "r"((use_initial_state != 0) ? 16 : 0));
                     }
@@ -1433,10 +1433,10 @@ kernel_cake_kda_prefill_416270d8aebf897a636b(__nv_bfloat16* __restrict__ q, cons
                         #error "Tcgen05Cp requires Blackwell tcgen05.cp support"
                         #endif
                         {
-                            uint64_t _tcgen05_cp_desc_0 = ((((uint64_t)(smem_v18_addr_1 + 0)) & 0x3FFFFULL) >> 4ULL) | (((((uint64_t)(16)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(1024)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (2ULL << 61ULL);
+                            uint64_t _tcgen05_cp_desc_0 = ((((uint64_t)(smem_v18_addr_1)) & 0x3FFFFULL) >> 4ULL) | (((((uint64_t)(16)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(1024)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (2ULL << 61ULL);
                             asm volatile(
                                 "tcgen05.cp.cta_group::1.128x256b [%0], %1;"
-                                :: "r"((uint32_t)(taddr + (unsigned int)(turn_init_set + 64 + (turn_init_half * 2 + 0) * 32 + 0))), "l"(_tcgen05_cp_desc_0)
+                                :: "r"((uint32_t)(taddr + (unsigned int)(turn_init_set + 64 + turn_init_half * 2 * 32))), "l"(_tcgen05_cp_desc_0)
                                 : "memory");
                         }
                         #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
@@ -1446,7 +1446,7 @@ kernel_cake_kda_prefill_416270d8aebf897a636b(__nv_bfloat16* __restrict__ q, cons
                             uint64_t _tcgen05_cp_desc_1 = ((((uint64_t)(smem_v18_addr_1 + 32)) & 0x3FFFFULL) >> 4ULL) | (((((uint64_t)(16)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(1024)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (2ULL << 61ULL);
                             asm volatile(
                                 "tcgen05.cp.cta_group::1.128x256b [%0], %1;"
-                                :: "r"((uint32_t)(taddr + (unsigned int)(turn_init_set + 64 + (turn_init_half * 2 + 0) * 32 + 8))), "l"(_tcgen05_cp_desc_1)
+                                :: "r"((uint32_t)(taddr + (unsigned int)(turn_init_set + 64 + turn_init_half * 2 * 32 + 8))), "l"(_tcgen05_cp_desc_1)
                                 : "memory");
                         }
                         #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
@@ -1456,7 +1456,7 @@ kernel_cake_kda_prefill_416270d8aebf897a636b(__nv_bfloat16* __restrict__ q, cons
                             uint64_t _tcgen05_cp_desc_2 = ((((uint64_t)(smem_v18_addr_1 + 64)) & 0x3FFFFULL) >> 4ULL) | (((((uint64_t)(16)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(1024)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (2ULL << 61ULL);
                             asm volatile(
                                 "tcgen05.cp.cta_group::1.128x256b [%0], %1;"
-                                :: "r"((uint32_t)(taddr + (unsigned int)(turn_init_set + 64 + (turn_init_half * 2 + 0) * 32 + 16))), "l"(_tcgen05_cp_desc_2)
+                                :: "r"((uint32_t)(taddr + (unsigned int)(turn_init_set + 64 + turn_init_half * 2 * 32 + 16))), "l"(_tcgen05_cp_desc_2)
                                 : "memory");
                         }
                         #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
@@ -1466,17 +1466,17 @@ kernel_cake_kda_prefill_416270d8aebf897a636b(__nv_bfloat16* __restrict__ q, cons
                             uint64_t _tcgen05_cp_desc_3 = ((((uint64_t)(smem_v18_addr_1 + 96)) & 0x3FFFFULL) >> 4ULL) | (((((uint64_t)(16)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(1024)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (2ULL << 61ULL);
                             asm volatile(
                                 "tcgen05.cp.cta_group::1.128x256b [%0], %1;"
-                                :: "r"((uint32_t)(taddr + (unsigned int)(turn_init_set + 64 + (turn_init_half * 2 + 0) * 32 + 24))), "l"(_tcgen05_cp_desc_3)
+                                :: "r"((uint32_t)(taddr + (unsigned int)(turn_init_set + 64 + turn_init_half * 2 * 32 + 24))), "l"(_tcgen05_cp_desc_3)
                                 : "memory");
                         }
                         #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
                         #error "Tcgen05Cp requires Blackwell tcgen05.cp support"
                         #endif
                         {
-                            uint64_t _tcgen05_cp_desc_4 = ((((uint64_t)(smem_v18_addr_2 + 0)) & 0x3FFFFULL) >> 4ULL) | (((((uint64_t)(16)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(1024)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (2ULL << 61ULL);
+                            uint64_t _tcgen05_cp_desc_4 = ((((uint64_t)(smem_v18_addr_2)) & 0x3FFFFULL) >> 4ULL) | (((((uint64_t)(16)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(1024)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (2ULL << 61ULL);
                             asm volatile(
                                 "tcgen05.cp.cta_group::1.128x256b [%0], %1;"
-                                :: "r"((uint32_t)(taddr + (unsigned int)(turn_init_set + 64 + (turn_init_half * 2 + 1) * 32 + 0))), "l"(_tcgen05_cp_desc_4)
+                                :: "r"((uint32_t)(taddr + (unsigned int)(turn_init_set + 64 + (turn_init_half * 2 + 1) * 32))), "l"(_tcgen05_cp_desc_4)
                                 : "memory");
                         }
                         #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
@@ -1520,7 +1520,7 @@ kernel_cake_kda_prefill_416270d8aebf897a636b(__nv_bfloat16* __restrict__ q, cons
                             float turn_row0_words_0[8];
                             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                                 : "=r"(*reinterpret_cast<uint32_t*>(&turn_row0_words_0[0])), "=r"(*reinterpret_cast<uint32_t*>(&turn_row0_words_0[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&turn_row0_words_0[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&turn_row0_words_0[(0) + 3]))
-                                : "r"((smem_v18_addr_1 + (unsigned int)((turn_row0_row + turn_row0_it * 8) * 128 + (turn_row0_col + 0) * 4 ^ ((turn_row0_row + turn_row0_it * 8) * 128 + (turn_row0_col + 0) * 4 >> 7 & 7) << 4))));
+                                : "r"((smem_v18_addr_1 + (unsigned int)((turn_row0_row + turn_row0_it * 8) * 128 + turn_row0_col * 4 ^ ((turn_row0_row + turn_row0_it * 8) * 128 + turn_row0_col * 4 >> 7 & 7) << 4))));
                             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                                 : "=r"(*reinterpret_cast<uint32_t*>(&turn_row0_words_0[4])), "=r"(*reinterpret_cast<uint32_t*>(&turn_row0_words_0[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&turn_row0_words_0[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&turn_row0_words_0[(4) + 3]))
                                 : "r"((smem_v18_addr_1 + (unsigned int)((turn_row0_row + turn_row0_it * 8) * 128 + (turn_row0_col + 4) * 4 ^ ((turn_row0_row + turn_row0_it * 8) * 128 + (turn_row0_col + 4) * 4 >> 7 & 7) << 4))));
@@ -1530,11 +1530,11 @@ kernel_cake_kda_prefill_416270d8aebf897a636b(__nv_bfloat16* __restrict__ q, cons
                                 __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(turn_row0_words_0[_lp*2 + 0], turn_row0_words_0[_lp*2+1 + 0]));
                                 turn_row0_packed_0[_lp] = *(uint32_t*)&_bf2;
                             }
-                            reinterpret_cast<int4*>(reinterpret_cast<__nv_bfloat16*>(state_checkpoints_addr) + ((long long)turn_init_outer * 16384 + (long long)(turn_row0_row + turn_row0_it * 8) * 128 + (long long)((turn_init_half * 2 + 0) * 32 + turn_row0_col)))[0] = reinterpret_cast<int4*>(turn_row0_packed_0)[0];
+                            reinterpret_cast<int4*>(reinterpret_cast<__nv_bfloat16*>(state_checkpoints_addr) + ((long long)turn_init_outer * 16384 + (long long)(turn_row0_row + turn_row0_it * 8) * 128 + (long long)(turn_init_half * 2 * 32 + turn_row0_col)))[0] = reinterpret_cast<int4*>(turn_row0_packed_0)[0];
                             float turn_row0_words_1[8];
                             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                                 : "=r"(*reinterpret_cast<uint32_t*>(&turn_row0_words_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&turn_row0_words_1[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&turn_row0_words_1[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&turn_row0_words_1[(0) + 3]))
-                                : "r"((smem_v18_addr_2 + (unsigned int)((turn_row0_row + turn_row0_it * 8) * 128 + (turn_row0_col + 0) * 4 ^ ((turn_row0_row + turn_row0_it * 8) * 128 + (turn_row0_col + 0) * 4 >> 7 & 7) << 4))));
+                                : "r"((smem_v18_addr_2 + (unsigned int)((turn_row0_row + turn_row0_it * 8) * 128 + turn_row0_col * 4 ^ ((turn_row0_row + turn_row0_it * 8) * 128 + turn_row0_col * 4 >> 7 & 7) << 4))));
                             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                                 : "=r"(*reinterpret_cast<uint32_t*>(&turn_row0_words_1[4])), "=r"(*reinterpret_cast<uint32_t*>(&turn_row0_words_1[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&turn_row0_words_1[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&turn_row0_words_1[(4) + 3]))
                                 : "r"((smem_v18_addr_2 + (unsigned int)((turn_row0_row + turn_row0_it * 8) * 128 + (turn_row0_col + 4) * 4 ^ ((turn_row0_row + turn_row0_it * 8) * 128 + (turn_row0_col + 4) * 4 >> 7 & 7) << 4))));

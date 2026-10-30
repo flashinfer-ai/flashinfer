@@ -40,6 +40,16 @@ twin of its wide tile that loads G and stores dX with the L2 evict-first policy
 (``main_wide_ef``) when the groups average at least
 ``dgrad_evict_first_min_rows`` rows (``sum_m // E``) and dX has at least
 ``dgrad_evict_first_min_k`` columns (``K``).  On the architectures of
+``dgrad_wide_ts33_archs`` the data gradient launches the twin of its wide tile
+that splits three head and three tail k steps of an item around the release
+of the accumulator's halves instead of four and three (``main_wide_ts33``)
+when the groups average at least the architecture's
+``dgrad_wide_ts33_min_rows`` rows and dX has at least
+``dgrad_wide_ts33_min_k`` columns; on those of ``fwd_wide_ts33_archs`` the
+forward pass launches its twin when its reduction ``K`` is at most
+``fwd_wide_ts33_max_k`` and the groups average at most
+``fwd_wide_ts33_max_rows`` rows.  On the
+architectures of
 ``fwd_lwh_ef_archs`` the forward pass launches the twin of its wide tile that
 releases the last wave of tiles in halves and stores Y with the L2 evict-first
 policy (``main_wide_ef``) when its reduction ``K`` (the columns of x) is at most
@@ -64,7 +74,27 @@ plain stage where the route serves no such stage on the architecture.
 Stream workspaces.  The forward and data-gradient programs take a scheduler
 workspace (``sched``: ``sched_words`` u32 words whose first three rest at
 ``sched_rest``) and the split of their clusters over the two claim queues
-(``c0 = clusters // 2``, ``c1 = clusters - c0``); the weight-gradient wave
+(``c0 = clusters // 2``, ``c1 = clusters - c0``).  A cluster claims first from
+the queue of the locality domain (die) whose memory homes the probe chunk of
+``sched`` (the 4 KB chunk at the first 8 KB boundary 128 bytes past it): queue
+0 when it is nearer than the next 4 KB chunk, else queue 1, and which die homes
+a chunk of default memory depends on its physical page.  On the architectures
+of ``domain_split_archs``, a launch of an op in ``domain_split_ops`` (the data
+gradient) whose group weight has at most ``domain_split_max_weight_elems``
+elements (``N * K``: the down projection of an MoE layer) splits the queues by
+the SM pairs nearer each chunk of its own ``sched`` instead
+(``plan["queue_split"] == "probed"``); the forward keeps the even split.  The
+first such launch on a kept workspace enqueues its probe on the stream (five
+rounds of one CTA per SM timing an add-zero atomic on a line of each chunk; an
+SM pair takes the chunk most of its rounds found nearer) and copies the pair
+counts to pinned host memory behind an event; a later launch passes them once
+the event has completed.  Nothing waits for the probe: until it completes, and
+where it cannot run (its kernel is compiled once per compute capability at
+preparation with ``tvm_ffi.cpp.load_inline``, which needs a CUDA compiler) or
+does not see every SM and both domains, a launch passes the even split.  The
+split only divides the tiles between the queues; every tile is still computed
+once with its k steps in order, so the output bits do not depend on it.  The
+weight-gradient wave
 programs take two wave counters (``wave_sync``, resting at zero) and their wave
 mode.  Every launch leaves a workspace at its rest state (the kernels re-arm it
 at the end), so one buffer serves every launch of one CUDA stream: the buffers
@@ -74,8 +104,9 @@ streams (launches on one stream are ordered, so a buffer is never live in two
 launches at once).  A launch captured into a CUDA graph, or issued for a
 device other than the current one, takes buffers of its own at their rest
 state, set at the launch (a capture records that set with the launch and
-allocates the buffers from the graph's pool).  The static sm_107a forward and
-data-gradient programs take ``sched``, ``c0`` and ``c1`` and ignore them.
+allocates the buffers from the graph's pool) and the even split.  The static
+sm_107a forward and data-gradient programs take ``sched``, ``c0`` and ``c1`` and
+ignore them.
 """
 
 from __future__ import annotations
@@ -301,9 +332,13 @@ def plan_fwd_dgrad(
     sm_count: int,
     tile_n: Optional[int] = None,
     constants: Optional[dict[str, Any]] = None,
+    arch: Optional[str] = None,
 ) -> dict[str, Any]:
     """Launch plan of ``fwd`` / ``dgrad``: one persistent launch over output tiles ``tile_n``
-    columns wide (``block_n`` by default)."""
+    columns wide (``block_n`` by default).  ``c0`` / ``c1`` are the even split of the
+    clusters over the claim queues; ``queue_split`` is ``"probed"`` where a launch of
+    ``op`` on ``arch`` passes the probed split of its scheduler workspace instead
+    (module docstring), else ``"even"``."""
     c = constants or host_plan_constants()
     cols = n if op == "fwd" else k
     tile_n = int(c["block_n"]) if tile_n is None else int(tile_n)
@@ -318,11 +353,17 @@ def plan_fwd_dgrad(
     grid_x = persistent_grid(sm_count, tiles, cta_group=cta_group)
     clusters = grid_x // cta_group
     c0 = clusters // 2
+    probed = (
+        op in c["domain_split_ops"]
+        and arch in c["domain_split_archs"]
+        and n * k <= int(c["domain_split_max_weight_elems"])
+    )
     return dict(
         grid=[grid_x, 1, 1],
         clusters=clusters,
         c0=c0,
         c1=clusters - c0,
+        queue_split="probed" if probed else "even",
         launches=1,
         tile_n=tile_n,
         tile_k=None,
@@ -440,6 +481,54 @@ def dgrad_evict_first(
     )
 
 
+def dgrad_wide_ts33(
+    k: int,
+    arch: str,
+    sum_m: int,
+    num_groups: int,
+    constants: Optional[dict[str, Any]] = None,
+) -> bool:
+    """Whether the data gradient's wide tile takes its twin with three head and three
+    tail k steps around the release of the accumulator's halves (``main_wide_ts33``).
+
+    ``k`` is the dgrad ``K``, the columns of ``dX`` (``w.shape[2]``).  The twin serves
+    the gate/up projection's data gradient over few groups: the groups average at least
+    the architecture's ``dgrad_wide_ts33_min_rows`` rows (``sum_m // num_groups``) and
+    ``K >= dgrad_wide_ts33_min_k``, on the architectures of ``dgrad_wide_ts33_archs``.
+    Every element accumulates its k steps in the same order, so the twin gives the bits
+    of ``main_wide``."""
+    c = constants or host_plan_constants()
+    return (
+        arch in c["dgrad_wide_ts33_archs"]
+        and k >= int(c["dgrad_wide_ts33_min_k"])
+        and sum_m // max(num_groups, 1) >= int(c["dgrad_wide_ts33_min_rows"][arch])
+    )
+
+
+def fwd_wide_ts33(
+    k: int,
+    arch: str,
+    sum_m: int,
+    num_groups: int,
+    constants: Optional[dict[str, Any]] = None,
+) -> bool:
+    """Whether the forward pass's wide tile takes its twin with three head and three
+    tail k steps around the release of the accumulator's halves (``main_wide_ts33``).
+
+    ``k`` is the forward ``K``, the reduction dimension (``w.shape[2]``).  On the
+    architectures of ``fwd_wide_ts33_archs`` the twin serves the short reductions of
+    the down projection over many groups (``K <= fwd_wide_ts33_max_k`` and at most
+    ``fwd_wide_ts33_max_rows`` rows per group, ``sum_m // num_groups``).  It gives
+    the bits of ``main_wide``."""
+    c = constants or host_plan_constants()
+    rows = sum_m // max(num_groups, 1)
+    return (
+        arch in c["fwd_wide_ts33_archs"]
+        and k <= int(c["fwd_wide_ts33_max_k"])
+        and rows <= int(c["fwd_wide_ts33_max_rows"])
+    )
+
+
 def fwd_lwh_ef(
     k: int,
     arch: str,
@@ -499,7 +588,9 @@ def select_row_stage(
     tile (``fwd_dgrad_tile_n``) where the route serves it on ``arch``, else ``main`` with
     ``block_n``; a data gradient takes ``main_wide_ef`` in place of ``main_wide`` where
     ``dgrad_evict_first`` holds, and a forward pass where ``fwd_lwh_ef`` holds, when the
-    route serves that stage on ``arch``."""
+    route serves that stage on ``arch``; else ``main_wide_ts33`` where
+    ``dgrad_wide_ts33`` (a data gradient) or ``fwd_wide_ts33`` (a forward pass) holds
+    and the route serves it on ``arch``."""
     c = constants or host_plan_constants()
     tile_n = fwd_dgrad_tile_n(op, n, k, arch, c)
     if tile_n != int(c["block_n"]) and stage_served(name, "main_wide", arch):
@@ -508,6 +599,11 @@ def select_row_stage(
             or (op == "fwd" and fwd_lwh_ef(k, arch, c))
         ) and stage_served(name, "main_wide_ef", arch):
             return "main_wide_ef", tile_n
+        if (
+            (op == "dgrad" and dgrad_wide_ts33(k, arch, sum_m, num_groups, c))
+            or (op == "fwd" and fwd_wide_ts33(k, arch, sum_m, num_groups, c))
+        ) and stage_served(name, "main_wide_ts33", arch):
+            return "main_wide_ts33", tile_n
         return "main_wide", tile_n
     return "main", int(c["block_n"])
 
@@ -601,13 +697,20 @@ def _rest_workspace(kind: str, device: torch.device) -> torch.Tensor:
     )
 
 
+def _keeps_workspaces(device_index: int) -> bool:
+    """Whether a launch for device ``device_index`` on the current stream takes the kept
+    stream workspaces: a capture records no buffer the host keeps, and the capture state
+    is readable for the current device's stream only, so a launch for another device
+    takes buffers of its own too."""
+    return device_index == _current_device() and not _current_stream_capturing()
+
+
 def _launch_workspace(
-    kind: str, device: torch.device, device_index: int
+    kind: str, device: torch.device, device_index: int, kept: bool
 ) -> torch.Tensor:
-    """The ``kind`` workspace of a launch on the current stream of ``device`` (module docstring)."""
-    if device_index != _current_device() or _current_stream_capturing():
-        # A capture records no buffer the host keeps; the capture state is readable for the
-        # current device's stream only, so a launch for another device takes this path too.
+    """The ``kind`` workspace of a launch on the current stream of ``device`` (module docstring);
+    ``kept`` is ``_keeps_workspaces(device_index)``."""
+    if not kept:
         return _rest_workspace(kind, device)
     key = (kind, device_index, _current_raw_stream(device_index))
     buffer = _stream_workspaces.get(key)
@@ -633,6 +736,172 @@ def stream_workspace(
     return _stream_workspaces.get((kind, index, handle))
 
 
+# Probed queue split (module docstring).  Per (device index, data pointer) of a kept
+# scheduler workspace: the probe in flight, then the (c0, c1) it measured, or None where
+# it could not run or did not see every SM and both domains.  Kept workspaces live as long
+# as the process, so a data pointer never names two of them.
+_queue_splits: dict[tuple[int, int], Any] = {}
+_QUEUE_PROBE_ROUNDS = 5
+_QUEUE_PROBE_SMS = 1024  # %smid values the probe records
+_QUEUE_PROBE_SOURCE = r"""
+// One 32-thread CTA per SM (the launch asks for an SM's whole shared memory): lane 0
+// times an add-zero atomic on a line of the 4 KB chunk at the first 8 KB boundary 128 B
+// past sched (the programs' probe chunk) and on the same line of the next chunk, the
+// minimum of two rounds each, and stores both under its %smid.
+__global__ void __launch_bounds__(32, 1) cake_queue_probe_kernel(unsigned* sched, long long* lat) {
+  extern __shared__ unsigned cell[];
+  unsigned smid, s = (unsigned)__cvta_generic_to_shared(cell);
+  asm volatile("mov.u32 %0, %%smid;" : "=r"(smid));
+  if (threadIdx.x != 0 || smid >= 1024) return;
+  unsigned long long base = (unsigned long long)sched;
+  unsigned word = (unsigned)((((base + 8319ull) & ~8191ull) - base) >> 2) + (smid / 2u) % 32u * 32u;
+  long long lat_a = 0x7fffffffffffffffll, lat_b = 0x7fffffffffffffffll;
+  for (int round = 0; round < 2; ++round) {
+    long long t0, t1, t2;
+    unsigned v;
+    asm volatile("mov.u64 %0, %%clock64;" : "=l"(t0) : : "memory");
+    asm volatile("atom.global.add.u32 %0, [%1], 0;" : "=r"(v) : "l"(sched + word) : "memory");
+    asm volatile("st.volatile.shared.u32 [%2], %1; mov.u64 %0, %%clock64;"
+                 : "=l"(t1) : "r"(v), "r"(s) : "memory");
+    asm volatile("atom.global.add.u32 %0, [%1], 0;" : "=r"(v) : "l"(sched + word + 1024) : "memory");
+    asm volatile("st.volatile.shared.u32 [%2], %1; mov.u64 %0, %%clock64;"
+                 : "=l"(t2) : "r"(v), "r"(s) : "memory");
+    lat_a = t1 - t0 < lat_a ? t1 - t0 : lat_a;
+    lat_b = t2 - t1 < lat_b ? t2 - t1 : lat_b;
+  }
+  lat[2 * smid] = lat_a;
+  lat[2 * smid + 1] = lat_b;
+}
+
+void cake_queue_probe(tvm::ffi::TensorView sched, tvm::ffi::TensorView lat, int64_t ctas,
+                      int64_t smem) {
+  cudaStream_t stream = static_cast<cudaStream_t>(
+      TVMFFIEnvGetStream(sched.device().device_type, sched.device().device_id));
+  TVM_FFI_ICHECK(cudaFuncSetAttribute(cake_queue_probe_kernel,
+                                      cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                      static_cast<int>(smem)) == cudaSuccess);
+  cake_queue_probe_kernel<<<static_cast<unsigned>(ctas), 32, static_cast<size_t>(smem),
+                            stream>>>(static_cast<unsigned*>(sched.data_ptr()),
+                                      static_cast<long long*>(lat.data_ptr()));
+  TVM_FFI_ICHECK(cudaGetLastError() == cudaSuccess);
+}
+"""
+_UNPROBED = object()
+
+
+@functools.cache
+def _queue_probe_module(capability: tuple[int, int]) -> Optional[Any]:
+    """The queue probe built for compute capability ``capability`` (``tvm_ffi.cpp.load_inline``,
+    nvcc), or None when it cannot be built here."""
+    try:
+        import tvm_ffi.cpp
+
+        major, minor = capability
+        return tvm_ffi.cpp.load_inline(
+            name=f"cake_moe_queue_probe_sm{major}{minor}",
+            cuda_sources=_QUEUE_PROBE_SOURCE,
+            functions=["cake_queue_probe"],
+            extra_cuda_cflags=[
+                f"-gencode=arch=compute_{major}{minor},code=sm_{major}{minor}"
+            ],
+        )
+    except Exception:  # noqa: BLE001 - no CUDA compiler here: the even split serves
+        return None
+
+
+@dataclass(frozen=True)
+class _QueueProbe:
+    """A queue probe in flight: ``counts`` (pinned host memory) holds the SM pairs nearer
+    the probe chunk, the pairs nearer the next chunk and the SMs seen once ``done`` has
+    completed."""
+
+    counts: torch.Tensor
+    done: torch.cuda.Event
+    sms: int
+
+    def split(self) -> Optional[tuple[int, int]]:
+        near_a, near_b, seen = (int(v) for v in self.counts.tolist())
+        if seen != self.sms or min(near_a, near_b) == 0:
+            return None
+        return near_a, near_b
+
+
+def _start_queue_probe(sched: torch.Tensor, index: int) -> Optional[_QueueProbe]:
+    """Enqueue the probe of the kept scheduler workspace ``sched`` of device ``index`` on
+    the current stream (module docstring); None when it cannot run."""
+    module = _queue_probe_module(torch.cuda.get_device_capability(index))
+    sms = sm_count(sched.device)
+    if module is None or sms > _QUEUE_PROBE_SMS:
+        return None
+    smem = int(torch.cuda.get_device_properties(index).shared_memory_per_block_optin)
+    try:
+        lat = torch.full(
+            (_QUEUE_PROBE_ROUNDS, 2 * _QUEUE_PROBE_SMS),
+            -1,
+            dtype=torch.int64,
+            device=sched.device,
+        )
+        for row in lat:
+            module.cake_queue_probe(sched, row, sms, smem)
+        near, far = lat[:, 0::2], lat[:, 1::2]
+        seen = (near >= 0).all(0)
+        # Rounds in which the next chunk was nearer, per SM pair (2i, 2i + 1: one die),
+        # over its seen members; a pair takes the next chunk's queue when most did.
+        votes = ((far < near) & seen).sum(0).view(-1, 2).sum(1)
+        members = seen.view(-1, 2).sum(1)
+        queue_1 = 2 * votes > _QUEUE_PROBE_ROUNDS * members
+        counts = torch.empty(3, dtype=torch.int64, pin_memory=True)
+        counts.copy_(
+            torch.stack(
+                (
+                    ((members > 0) & ~queue_1).sum(),
+                    ((members > 0) & queue_1).sum(),
+                    seen.sum(),
+                )
+            ),
+            non_blocking=True,
+        )
+        done = torch.cuda.Event()
+        done.record()
+    except Exception:  # noqa: BLE001 - the even split serves when the probe cannot run
+        return None
+    return _QueueProbe(counts=counts, done=done, sms=sms)
+
+
+def _probed_queue_split(sched: torch.Tensor, index: int) -> Optional[tuple[int, int]]:
+    """``(c0, c1)`` of a launch on the kept scheduler workspace ``sched`` of device
+    ``index``: the probed pair counts once its probe has completed, else None (the even
+    split).  The first call for ``sched`` enqueues its probe; none waits for it."""
+    key = (index, sched.data_ptr())
+    state: Any = _queue_splits.get(key, _UNPROBED)
+    if state is _UNPROBED:
+        with _STREAM_WORKSPACES_LOCK:
+            if key not in _queue_splits:
+                _queue_splits[key] = _start_queue_probe(sched, index)
+        return None
+    if isinstance(state, _QueueProbe):
+        if not state.done.query():
+            return None
+        state = _queue_splits[key] = state.split()
+    return state
+
+
+def stream_queue_split(
+    device: torch.device, stream: Optional[torch.cuda.Stream] = None
+) -> Optional[tuple[int, int]]:
+    """The probed ``(c0, c1)`` that launches on ``stream`` (the current stream of
+    ``device`` by default) pass where ``plan["queue_split"]`` is ``"probed"``, or ``None``
+    while they pass the even split: before a probed launch on that stream, while its
+    probe runs, or where the probe could not run (module docstring)."""
+    sched = stream_workspace("sched", device, stream)
+    if sched is None:
+        return None
+    state = _queue_splits.get((_device_index(device), sched.data_ptr()))
+    if isinstance(state, _QueueProbe):
+        return state.split() if state.done.query() else None
+    return state
+
+
 @dataclass(frozen=True)
 class _Launch:
     entry: Callable[..., Any] = field(repr=False)
@@ -640,6 +909,9 @@ class _Launch:
     # (argument position, workspace kind) of the stream workspaces the program
     # takes; their placeholders in ``arguments`` are filled per launch.
     workspace_slots: tuple[tuple[int, str], ...] = ()
+    # (sched, c0, c1) argument positions of a launch that passes the probed queue
+    # split of its kept scheduler workspace (module docstring), else empty.
+    split_slots: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -657,7 +929,8 @@ class GroupedGemmLaunch:
     ``plan`` records the host decisions (grid, queue split, k tile, tail
     split, raster, wave mode, launch count); ``stages`` names the bound stages
     of the route in launch order.  The scheduler and wave workspaces are the
-    current stream's (module docstring), resolved at every launch.
+    current stream's (module docstring), resolved at every launch, as is the
+    probed queue split where ``plan["queue_split"]`` is ``"probed"``.
     """
 
     op: str
@@ -680,10 +953,16 @@ class GroupedGemmLaunch:
                 arguments: tuple | list[Any] = item.arguments
                 if item.workspace_slots:
                     bound = list(item.arguments)
+                    kept = _keeps_workspaces(self.device_index)
                     for position, kind in item.workspace_slots:
                         bound[position] = _launch_workspace(
-                            kind, self.out.device, self.device_index
+                            kind, self.out.device, self.device_index, kept
                         )
+                    if item.split_slots and kept:
+                        sched, c0, c1 = item.split_slots
+                        split = _probed_queue_split(bound[sched], self.device_index)
+                        if split is not None:
+                            bound[c0], bound[c1] = split
                     arguments = bound
                 item.entry(*arguments)
         return self.out
@@ -753,10 +1032,14 @@ def _aligned_bytes(nbytes: int, device: torch.device, what: str) -> torch.Tensor
     return ws
 
 
-def _bind(name: str, stage: str, kwargs: dict[str, Any], arch: str) -> _Launch:
+def _bind(
+    name: str, stage: str, kwargs: dict[str, Any], arch: str, *, split: bool = False
+) -> _Launch:
     """Order ``kwargs`` by the generated argument plan of ``stage`` of route ``name`` on ``arch`` and load
     its entry (the binding encodes the operands' TMA descriptors by value at every launch).  A buffer the
-    plan names after a stream workspace kind is left to ``GroupedGemmLaunch.launch``."""
+    plan names after a stream workspace kind is left to ``GroupedGemmLaunch.launch``; with ``split`` so
+    are ``c0`` / ``c1``, which a launch replaces by the probed split of its ``sched`` once known, and the
+    queue probe is built here."""
     binding = stage_binding(name, stage, arch)
     program = PROGRAMS[binding["program"]]
     grid = dict(zip(("grid_x", "grid_y", "grid_z"), kwargs["grid"], strict=True))
@@ -776,10 +1059,16 @@ def _bind(name: str, stage: str, kwargs: dict[str, Any], arch: str) -> _Launch:
                 f"expects argument {arg!r} ({kind}); the host binding provides {sorted(kwargs)}"
             )
     module = load_module(binding["program"], arch, binding["specializations"])
+    split_slots: tuple[int, ...] = ()
+    if split:
+        names = [arg for _kind, arg in program["arg_plan"]]
+        split_slots = (names.index("sched"), names.index("c0"), names.index("c1"))
+        _queue_probe_module(torch.cuda.get_device_capability(kwargs["A"].device))
     return _Launch(
         entry=getattr(module, program["ffi_entry"]),
         arguments=tuple(arguments),
         workspace_slots=tuple(slots),
+        split_slots=split_slots,
     )
 
 
@@ -882,6 +1171,7 @@ def _prepare_row_op(
         sm_count=sm_count(device),
         tile_n=tile_n,
         constants=c,
+        arch=arch,
     )
     if sum_m == 0:
         return _finish(op, name, plan, out, (), [], [])
@@ -899,9 +1189,8 @@ def _prepare_row_op(
         c1=plan["c1"],
         grid=plan["grid"],
     )
-    return _finish(
-        op, name, plan, out, (stage,), [_bind(name, stage, kwargs, arch)], []
-    )
+    launch = _bind(name, stage, kwargs, arch, split=plan["queue_split"] == "probed")
+    return _finish(op, name, plan, out, (stage,), [launch], [])
 
 
 def prepare_grouped_gemm_fwd(
@@ -915,7 +1204,8 @@ def prepare_grouped_gemm_fwd(
     ``x``: ``[sum_m, K]`` bf16; ``w``: ``[E, N, K]`` bf16; ``offs``: int32
     ``[E]`` device end offsets; ``N % 256 == 0``, ``K % 64 == 0`` (the
     512-column tile when ``N % 512 == 0`` on the architectures of
-    ``wide_fwd_archs``).  ``out`` may be row-padded (any row stride, unit column
+    ``wide_fwd_archs``, its 3 / 3 head / tail twin where ``fwd_wide_ts33`` holds).
+    ``out`` may be row-padded (any row stride, unit column
     stride).
     """
     return _prepare_row_op("fwd", x, w, offs, out)
@@ -933,7 +1223,8 @@ def prepare_grouped_gemm_dgrad(
     ``[E]`` device end offsets; ``K % 256 == 0``, ``N % 64 == 0`` (the
     512-column tile when ``K % 512 == 0`` on the architectures of
     ``wide_dgrad_archs``, its L2 evict-first twin where ``dgrad_evict_first``
-    holds for ``K``, ``sum_m`` and ``E``).
+    holds for ``K``, ``sum_m`` and ``E``, its 3 / 3 head / tail twin where
+    ``dgrad_wide_ts33`` holds).
     """
     return _prepare_row_op("dgrad", g, w, offs, out)
 

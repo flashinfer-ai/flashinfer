@@ -204,8 +204,8 @@ kernel_cake_rmsnorm_train_bde56bd5a68c493f07a2(__nv_bfloat16* __restrict__ x, __
             for (int first = bid * 8; first < T; first += num_bids * 8) {
                 int row = first + rg;
                 int slot = k % 4;
-                int parity = k / 4 & 1;
-                mbarrier_wait(full_addr + (slot) * 8, parity);
+                int _parity_full = (int)((unsigned int)k / 4 % 2);
+                mbarrier_wait(full_addr + (slot) * 8, _parity_full);
                 int xaddr = ring_c + slot * 32768 + rg * 4096 + g0 * 32;
                 #pragma unroll
                 for (int c_1 = 0; c_1 < 2; c_1++) {
@@ -351,10 +351,10 @@ kernel_cake_rmsnorm_train_bde56bd5a68c493f07a2(__nv_bfloat16* __restrict__ x, __
             #pragma unroll 1
             for (int first_p = bid * 8; first_p < T; first_p += num_bids * 8) {
                 int slot_p = k_p % 4;
-                int parity_p = k_p / 4 & 1;
                 int rows_k = ((T - first_p) < (8) ? (T - first_p) : (8));
                 int sbase = ring_p + slot_p * 32768;
-                mbarrier_wait(empty_addr + (slot_p) * 8, parity_p);
+                int _parity_empty = (int)((unsigned int)k_p / 4 % 2);
+                mbarrier_wait(empty_addr + (slot_p) * 8, _parity_empty);
                 if (lane_p == 0) {
                     mbarrier_arrive_expect_tx(full_addr + (slot_p) * 8, rows_k * 4096);
                 }

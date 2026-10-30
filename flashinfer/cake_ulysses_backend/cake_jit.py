@@ -43,7 +43,12 @@ only an output every rank allocated together and exchanged over CUDA IPC
 (``UlyssesCommunicator.allocate_output``).  The two kernels keep their epochs
 and flags in disjoint words of that allocation (the staged kernel one epoch
 word for the launch, the direct kernel one per CTA), so one communicator may
-alternate them call by call.
+alternate them call by call.  The world-8 bf16 direct scatter and gather
+programs also keep a zone in the allocation's tail, from word 1024: a stream
+whose destination has not yet entered the launch stores its first units
+there, and the destination copies them into its output.  The two programs
+share the zone on one communicator (a CTA serves the same destination in
+both and both advance its epoch); no other program touches those words.
 
 Each kernel takes the caller's input and output, two by-value peer tables of
 exactly :data:`PEER_TABLE_CAPACITY` device addresses (entry ``r`` is rank
@@ -2255,8 +2260,11 @@ MODES = (0, 1)
 # rest zero); the kernel reads entries ``0 .. world_size - 1``.
 PEER_TABLE_CAPACITY = 8
 # Every rank's symmetric signal allocation: ``uint32`` words the kernels use
-# for their flags and epochs; zeroed once at communicator creation.
-SIGNAL_WORDS = 864
+# for their flags and epochs (words 0 .. 863) and the zone of the world-8
+# bf16 direct scatter and gather programs (words 1024 on: one epoch tag per
+# CTA, then from word 2048 148 CTAs x 2 parities x 2 slots of 480 16-byte
+# units); zeroed once at communicator creation.
+SIGNAL_WORDS = 1138688
 SIGNAL_BYTES = 4 * SIGNAL_WORDS
 # The kernels take the shape scalars and the rank as 32-bit integers.
 INT32_MAX = 2**31 - 1

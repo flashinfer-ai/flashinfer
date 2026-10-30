@@ -10,6 +10,7 @@ import contextlib
 import datetime
 import gc
 import importlib
+import math
 import multiprocessing as std_mp
 import os
 import queue as queue_mod
@@ -1117,6 +1118,10 @@ def test_ctor_forced_nvlink_fails_before_ipc_jit(gloo_pg, monkeypatch):
         # (cuda:256 == cuda:0); the raw string/int must be validated first
         (dict(max_bytes=2048, dtype=torch.float16, device="cuda:256"), "device count"),
         (dict(max_bytes=2048, dtype=torch.float16, device=256), "device count"),
+        (
+            dict(max_bytes=2048, dtype=torch.float16, nvlink_kernel="unknown"),
+            "nvlink_kernel",
+        ),
     ],
 )
 def test_ctor_invalid_config(gloo_pg, monkeypatch, kwargs, match):
@@ -1600,6 +1605,106 @@ def _destination_passing_body(rank, world_size, group, backend):
 
     comm.close()
     return ("ok", backend)
+
+
+def _portable_kernel_body(rank, world_size, group, _unused):
+    shape = (1, 11, 24, 34)
+    comm = UlyssesCommunicator(
+        group,
+        max_bytes=math.prod(shape) * torch.bfloat16.itemsize,
+        dtype=torch.bfloat16,
+        backend="nvlink",
+        nvlink_kernel="portable",
+    )
+    try:
+        assert comm.nvlink_kernel == "portable"
+        torch.manual_seed(100 + rank)
+        x = torch.randn(shape, dtype=torch.bfloat16, device="cuda")
+        out = comm.scatter_heads(x)
+        ref = _ref_scatter_heads(x, world_size, rank, group)
+        torch.cuda.synchronize()
+        assert torch.equal(out, ref)
+        gathered = comm.gather_heads(out)
+        torch.cuda.synchronize()
+        assert torch.equal(gathered, x)
+    finally:
+        comm.close()
+    return ("ok", "portable")
+
+
+def _mixed_alignment_body(rank, world_size, group, _unused):
+    shape = (1, 11, 24, 16)
+    dtype = torch.bfloat16
+
+    def tensor_with_offset(tensor_shape, offset):
+        count = math.prod(tensor_shape)
+        return (
+            torch.empty(count + offset, dtype=dtype, device="cuda")
+            .narrow(0, offset, count)
+            .view(tensor_shape)
+        )
+
+    comm = UlyssesCommunicator(
+        group,
+        max_bytes=math.prod(shape) * dtype.itemsize,
+        dtype=dtype,
+        backend="nvlink",
+        nvlink_kernel="portable",
+    )
+    try:
+        assert comm.nvlink_kernel == "portable"
+        for iteration in range(4):
+            # Rank 0 has a two-byte offset for scatter input, while rank 1
+            # has one for gather output. Both still share the same protocol.
+            x = tensor_with_offset(shape, int(rank == 0))
+            torch.manual_seed(100 + rank + iteration)
+            x.copy_(torch.randn(shape, dtype=dtype, device="cuda"))
+            scattered = comm.scatter_heads(x)
+            scatter_ref = _ref_scatter_heads(x, world_size, rank, group)
+            assert torch.equal(scattered, scatter_ref)
+
+            y_shape = (
+                shape[0],
+                shape[1] * world_size,
+                shape[2] // world_size,
+                shape[3],
+            )
+            y = torch.randn(y_shape, dtype=dtype, device="cuda")
+            gathered = tensor_with_offset(shape, int(rank == 1))
+            comm.gather_heads(y, out=gathered)
+            gather_ref = _ref_gather_heads(y, world_size, rank, group)
+            assert torch.equal(gathered, gather_ref)
+    finally:
+        comm.close()
+    return ("ok", "mixed alignment")
+
+
+def _mixed_capacity_body(rank, world_size, group, shape):
+    ulysses_mod = importlib.import_module("flashinfer.comm.ulysses")
+    module = ulysses_mod.get_ulysses_a2a_module()
+    original_query = module.ulysses_a2a_safe_blocks
+    module.ulysses_a2a_safe_blocks = lambda *_args: 16 if rank == 0 else 32
+    try:
+        comm = UlyssesCommunicator(
+            group,
+            max_bytes=math.prod(shape) * torch.bfloat16.itemsize,
+            dtype=torch.bfloat16,
+            backend="nvlink",
+            nvlink_kernel="portable",
+        )
+        try:
+            assert comm._portable_max_blocks == 16
+            x = torch.randn(shape, dtype=torch.bfloat16, device="cuda")
+            scattered = comm.scatter_heads(x)
+            assert torch.equal(
+                scattered, _ref_scatter_heads(x, world_size, rank, group)
+            )
+            assert torch.equal(comm.gather_heads(scattered), x)
+        finally:
+            comm.close()
+    finally:
+        module.ulysses_a2a_safe_blocks = original_query
+    return ("ok", "mixed capacity")
 
 
 def _head_chunk_body(rank, world_size, group, arg):
@@ -2271,7 +2376,8 @@ def _init_fault_body(rank, world_size, group, arg):
         def bad_init(*a, **k):
             raise RuntimeError("injected init failure")
 
-        ulysses_mod.init_ulysses_a2a = bad_init
+        # Inject at the configured initializer used by the communicator.
+        ulysses_mod._init_ulysses_a2a_configured = bad_init
     elif fault == "jit" and rank == 0:
         # rank-local stage-J failure: nothing may be allocated anywhere
         vllm_ar_mod = importlib.import_module("flashinfer.comm.vllm_ar")
@@ -2607,15 +2713,24 @@ def _lifecycle_nvlink_body(rank, world_size, group, scenario):
 
 
 def _config_fault_body(rank, world_size, group, kind):
+    kernel = "auto"
     if kind == "invalid_one_rank":
         max_bytes = -1 if rank == 0 else 2048
         expect = "invalid UlyssesCommunicator config"
+    elif kind == "kernel_mismatch":
+        max_bytes = 2048
+        kernel = "auto" if rank == 0 else "portable"
+        expect = "inconsistent UlyssesCommunicator config"
     else:  # inconsistent
         max_bytes = 2048 if rank == 0 else 4096
         expect = "inconsistent UlyssesCommunicator config"
     try:
         UlyssesCommunicator(
-            group, max_bytes=max_bytes, dtype=torch.float16, backend="nccl"
+            group,
+            max_bytes=max_bytes,
+            dtype=torch.float16,
+            backend="nccl",
+            nvlink_kernel=kernel,
         )
         raise AssertionError("constructor must reject the config")
     except ValueError as e:
@@ -2778,6 +2893,19 @@ def _run_multi_rank(body_name, world_size, arg, timeout=300, allow_skip=False):
 def test_correctness_forced_nvlink(world_size):
     # forced NVLink: skips (not silently passes via NCCL) on non-NVLink boxes
     _run_multi_rank("_correctness_body", world_size, "nvlink", allow_skip=True)
+
+
+def test_forced_portable_nvlink_kernel():
+    _run_multi_rank("_portable_kernel_body", 2, None, allow_skip=True)
+
+
+def test_portable_nvlink_mixed_rank_alignment():
+    _run_multi_rank("_mixed_alignment_body", 2, None, allow_skip=True)
+
+
+@pytest.mark.parametrize("shape", [(1, 11, 24, 16), (1, 19, 6, 7)])
+def test_portable_nvlink_mixed_rank_capacity(shape):
+    _run_multi_rank("_mixed_capacity_body", 2, shape, allow_skip=True)
 
 
 @pytest.mark.parametrize("world_size", [2, 3])
@@ -3370,7 +3498,9 @@ def test_gloo_group_rejected_before_ipc(backend):
     _run_multi_rank("_gloo_group_body", 2, backend)
 
 
-@pytest.mark.parametrize("kind", ["invalid_one_rank", "inconsistent"])
+@pytest.mark.parametrize(
+    "kind", ["invalid_one_rank", "inconsistent", "kernel_mismatch"]
+)
 def test_config_fault_collective_safe(kind):
     _run_multi_rank("_config_fault_body", 2, kind)
 

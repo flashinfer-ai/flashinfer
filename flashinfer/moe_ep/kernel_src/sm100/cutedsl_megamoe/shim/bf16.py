@@ -302,6 +302,7 @@ class MegaMoEBf16Frontend:
         num_tokens: Optional[int] = None,
         sync: bool = False,
     ) -> torch.Tensor:
+        """Launch with cached bindings that track the output's live layout."""
         n = inputs.activation.shape[0] if num_tokens is None else num_tokens
         self._validate(inputs, n)
         mega = self._ensure_compiled(inputs)
@@ -312,6 +313,8 @@ class MegaMoEBf16Frontend:
             inputs.fc1_weight.data_ptr(),
             inputs.fc2_weight.data_ptr(),
             inputs.output_activation.data_ptr(),
+            tuple(inputs.output_activation.shape),
+            tuple(inputs.output_activation.stride()),
             torch.cuda.current_stream().cuda_stream,
         )
         if mega.launch_key != key:
@@ -367,6 +370,7 @@ class MegaMoEBf16Frontend:
             return thunk
 
     def _validate(self, inputs: MegaMoEBf16Inputs, num_tokens: int) -> None:
+        """Check padded inputs and the admitted live-output row count."""
         c = self.config
         if not 0 <= num_tokens <= c.num_tokens_per_rank:
             raise ValueError(
@@ -406,9 +410,14 @@ class MegaMoEBf16Frontend:
             or inputs.fc2_weight.dtype != torch.bfloat16
         ):
             raise ValueError("BF16 MegaMoE weights must be bfloat16.")
-        if not inputs.output_activation.is_cuda or inputs.output_activation.shape != (
-            c.num_tokens_per_rank,
-            c.hidden,
+        output_rows = {c.num_tokens_per_rank}
+        if not c.in_kernel_fc2_reduce and not c.use_custom_finalize:
+            output_rows.add(num_tokens)
+        if (
+            not inputs.output_activation.is_cuda
+            or inputs.output_activation.ndim != 2
+            or inputs.output_activation.shape[0] not in output_rows
+            or inputs.output_activation.shape[1] != c.hidden
         ):
             raise ValueError("output_activation has an invalid shape.")
         if inputs.output_activation.dtype != torch.bfloat16:
@@ -550,6 +559,7 @@ def bf16_mega_moe(
     fast_math: bool = True,
     sync: bool = False,
 ) -> Optional[torch.Tensor]:
+    """Write caller output directly when eligible, or return a borrowed view."""
     del fast_math
     if symm_buffer._destroyed:
         raise RuntimeError("symm_buffer.destroy() was already called.")
@@ -563,6 +573,19 @@ def bf16_mega_moe(
     )
     if clamp is not None:
         symm_buffer._frontend.set_gate_up_clamp(clamp)
+    config = symm_buffer._frontend.config
+    # Form A's terminal reducer bounds its stores by the output's row count.
+    # Form B atomically writes a full-capacity symmetric target on peer GPUs,
+    # so it must retain the owned workspace and the final copy.
+    direct_output = (
+        y is not None
+        and n > 0
+        and not config.in_kernel_fc2_reduce
+        and not config.use_custom_finalize
+        and y.device == symm_buffer.output_activation.device
+        and y.is_contiguous()
+        and y.data_ptr() % 16 == 0
+    )
     result = symm_buffer._frontend.run(
         MegaMoEBf16Inputs(
             symm_buffer.x,
@@ -570,13 +593,13 @@ def bf16_mega_moe(
             symm_buffer.topk_weights,
             transformed_l1[0],
             transformed_l2[0],
-            symm_buffer.output_activation,
+            y if direct_output else symm_buffer.output_activation,
         ),
         num_tokens=n,
         sync=False,
     )
     out = result
-    if y is not None:
+    if y is not None and not direct_output:
         y.copy_(out)
 
     if sync and not torch.cuda.is_current_stream_capturing():

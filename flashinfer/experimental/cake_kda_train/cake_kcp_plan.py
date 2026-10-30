@@ -101,7 +101,12 @@ Exchange layouts (one ``all_to_all_single`` per direction; ``s`` = one FP32
 
 from __future__ import annotations
 
+import bisect
 import dataclasses
+import operator
+import weakref
+from collections.abc import Mapping, Sequence
+from typing import Any
 
 import torch
 import torch.distributed as dist
@@ -218,6 +223,154 @@ def _ceil_div(a: int, b: int) -> int:
 
 def _round_up(n: int, m: int) -> int:
     return _ceil_div(n, m) * m
+
+
+# ----------------------------------------------------------------------------------------------------------------
+# Host-built integer tables on the device without a synchronizing call
+
+# Test knobs of build_kcp_context (after enable_test_knobs(), for the A/B record and the negative control of the
+# host-synchronization tests): ``upload="blocking"`` = the previous per-table ``torch.tensor(values, device=)`` copies
+# (pageable; each synchronizes the stream), eager at preparation as before; ``table_cache="workspace"`` = the previous
+# per-workspace table-set cache (keyed by the context) instead of the context's own.
+UPLOADS = ("async", "blocking")
+UPLOAD_DEFAULT = "async"
+TABLE_CACHES = ("context", "workspace")
+TABLE_CACHE_DEFAULT = "context"
+
+
+def _stream_capturing(s) -> bool:
+    """Whether the CUDA stream ``s`` captures a graph (the state of ``s`` itself, not of the current stream)."""
+    with torch.cuda.device(s.device), torch.cuda.stream(s):
+        return torch.cuda.is_current_stream_capturing()
+
+
+@dataclasses.dataclass(eq=False)
+class KcpUpload:
+    """One asynchronous upload: the device ``blob`` its tables view, the ``stream`` that ran the copy and the ``ready``
+    event recorded after it (:meth:`KcpContext.wait_ready`)."""
+
+    blob: Any
+    stream: Any
+    ready: Any
+
+
+def _upload_blocking(
+    specs: dict[str, tuple], device: torch.device
+) -> dict[str, torch.Tensor]:
+    """The previous path of the ``upload="blocking"`` knob: one pageable ``torch.tensor(values, device=)`` per table."""
+    out = {}
+    for name, (values, dtype, shape) in specs.items():
+        t = torch.tensor(list(values), dtype=dtype, device=device)
+        out[name] = t if shape is None else t.reshape(shape)
+    return out
+
+
+def _upload_tables(
+    specs: dict[str, tuple], device, *, stream=None
+) -> tuple[dict[str, torch.Tensor], KcpUpload | None]:
+    """Device copies of integer tables built on the host (``name -> (values, dtype, shape)``; ``values`` a flat or
+    nested sequence of ints, ``shape`` ``None`` = the sequence's own shape) without a synchronizing CUDA call.
+
+    ``torch.tensor(values, device=cuda)`` copies from pageable memory and synchronizes the stream once per table, so a
+    table built behind queued device work waits for that work.  Here every table is laid out at a 256-byte boundary
+    (:data:`ALIGN`) of one pinned ``uint8`` staging buffer, and one ``copy_(non_blocking=True)`` on ``stream``
+    (default: the current stream of ``device``) moves them into one device blob; the host caching allocator records
+    the copy on the staging block, so the block is reused only after the copy has run.  An event recorded after the
+    copy is returned with the blob in a :class:`KcpUpload`.  Each table is a contiguous view of the blob with the dtype,
+    shape and values of ``torch.tensor(values, dtype)``.  On a non-CUDA device the tables are plain tensors and no
+    record is returned.  Under CUDA-graph capture this raises ``RuntimeError``: a captured copy would re-read a host
+    buffer the graph does not own (the same rule as GDN's ``upload_tables``, whose code this follows)."""
+    device = torch.device(device)
+    items: list[tuple[str, torch.Tensor, tuple[int, ...]]] = []
+    for name, (values, dtype, shape) in specs.items():
+        cpu = torch.tensor(list(values), dtype=dtype)
+        shape = tuple(cpu.shape) if shape is None else tuple(int(x) for x in shape)
+        flat = cpu.reshape(-1)
+        numel = 1
+        for x in shape:
+            numel *= x
+        if flat.numel() != numel:
+            raise ValueError(
+                f"_upload_tables: table {name!r} holds {flat.numel()} values, shape {shape} needs {numel}"
+            )
+        items.append((name, flat, shape))
+    if device.type != "cuda":
+        return {name: flat.view(shape).to(device) for name, flat, shape in items}, None
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError(
+            "_upload_tables: a table upload under CUDA-graph capture would re-read host memory the graph does not own; "
+            "run the first call of a context eagerly (graph='replay' does) or prepare it before the capture"
+        )
+    offsets, total = [], 0
+    for _name, flat, _shape in items:
+        offsets.append(total)
+        total += _round_up(flat.numel() * flat.element_size(), ALIGN)
+    s = torch.cuda.current_stream(device) if stream is None else stream
+    with torch.cuda.device(device), torch.cuda.stream(s):
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "_upload_tables: the upload stream is capturing a CUDA graph"
+            )
+        staging = torch.zeros(
+            (total,), dtype=torch.uint8, pin_memory=True
+        )  # the alignment padding is defined, never read
+        for (_name, flat, _shape), off in zip(items, offsets, strict=True):
+            n = flat.numel() * flat.element_size()
+            if n:
+                staging[off : off + n].copy_(flat.view(torch.uint8))
+        blob = torch.empty((total,), dtype=torch.uint8, device=device)
+        blob.copy_(
+            staging, non_blocking=True
+        )  # cudaMemcpyAsync from pinned memory; the staging block is held until the copy has run
+        ready = torch.cuda.Event()
+        ready.record(s)
+    out = {}
+    for (name, flat, shape), off in zip(items, offsets, strict=True):
+        n = flat.numel() * flat.element_size()
+        out[name] = blob[off : off + n].view(flat.dtype).view(shape)
+    return out, KcpUpload(blob=blob, stream=s, ready=ready)
+
+
+class _LazyTables(Mapping):
+    """``KcpHeadPlan.device_tables``: the head plan's device tables, uploaded together (one asynchronous copy through
+    the context) when one of them is first read.  The shipped launch path reads none of them (it uploads its own
+    walk / index / chain tables per table set), so a byte query or a prepared head plan does no device work."""
+
+    def __init__(self, ctx: Any, specs: dict[str, tuple], device: torch.device) -> None:
+        self._specs = specs
+        self._device = device
+        self._tables: dict[str, torch.Tensor] | None = None
+        self._ctx: Any
+        try:
+            self._ctx = weakref.ref(ctx)
+        except TypeError:  # a context type without weak references
+            self._ctx = lambda c=ctx: c
+
+    def _materialize(self) -> dict[str, torch.Tensor]:
+        if self._tables is None:
+            ctx = self._ctx()
+            up = getattr(ctx, "upload_tables", None)
+            self._tables = (
+                up(self._specs, self._device)
+                if up is not None
+                else _upload_tables(self._specs, self._device)[0]
+            )
+        return self._tables
+
+    def __getitem__(self, name: str) -> torch.Tensor:
+        if name not in self._specs:
+            raise KeyError(name)
+        return self._materialize()[name]
+
+    def __iter__(self):
+        return iter(self._specs)
+
+    def __len__(self) -> int:
+        return len(self._specs)
+
+    @property
+    def uploaded(self) -> bool:
+        return self._tables is not None
 
 
 # ----------------------------------------------------------------------------------------------------------------
@@ -1044,11 +1197,16 @@ def _halo_sources(part: KcpPartition, halo: int):
                 chains.setdefault(f.doc, []).append(f)
     for lst in chains.values():
         lst.sort(key=lambda f: f.off)
+    # per document the sorted fragment offsets: the owner of token t is the last fragment starting at or before t
+    # (the non-empty fragments of a document tile it, so a bisect replaces the O(chain) scan)
+    starts = {doc: [g.off for g in lst] for doc, lst in chains.items()}
 
     def owner(doc: int, t: int) -> KcpFragment:
-        for g in chains[doc]:
-            if g.off <= t < g.end:
-                return g
+        lst = chains.get(doc)
+        if lst:
+            i = bisect.bisect_right(starts[doc], t) - 1
+            if i >= 0 and t < lst[i].end:
+                return lst[i]
         raise ValueError(f"halo plan: document {doc} token {t} has no owning fragment")
 
     hist: dict[tuple[int, int], tuple] = {}
@@ -1214,7 +1372,9 @@ class KcpHeadPlan:
     (``dS_out`` of the predecessor in the b2 send buffer).  ``hg_stride[table]`` is the element stride between
     consecutive heads of each offset table (``SUMMARY_TILE`` in the pair buffers, ``TILE`` in the planes).  Every
     offset is ``-1`` or a non-negative multiple of 4 floats (checked here, before any launch).
-    ``device_tables`` holds the int32 / int64 device copies of the tables the kernels read."""
+    ``device_tables`` maps the tables' names to their int32 / int64 device copies, uploaded together (one asynchronous
+    copy) when one of them is first read: the shipped launch path uploads its own per-table-set copies, so building a
+    head plan (``ctx.heads(H)``, the byte queries) is host work only."""
 
     H: int
     Hg: int
@@ -1260,7 +1420,7 @@ class KcpHeadPlan:
     adj_m_off_b1: tuple[int, ...]
     adj_m_off_c1: tuple[int, ...]
     adj_out_off: tuple[int, ...]
-    device_tables: dict[str, torch.Tensor]
+    device_tables: Mapping[str, torch.Tensor]
 
     @property
     def P(self) -> int:
@@ -1567,49 +1727,44 @@ def _build_head_plan(ctx: KcpContext, H: int) -> KcpHeadPlan:
     dev = ctx.device
     i32, i64 = torch.int32, torch.int64
 
-    def t(values, dtype=i32):
-        return torch.tensor(list(values), dtype=dtype, device=dev)
+    def tiles(rows) -> tuple:
+        return ([list(x) for x in rows], i32, (len(rows), H))
 
-    device_tables = {
-        "seg_chunk_start": t(seg_table),
-        "h0_index": t(h0_index),
-        "carry_index": t(carry_index),
-        "dht_index": t(dht_index),
-        "dcarry_index": t(dcarry_index),
-        "out_index": t(out_index),
-        "walk_seg_offset": t(walk_offset),
-        "walk_seg_tape": t(walk_tape),
-        "out_tile": torch.tensor(
-            [list(x) for x in out_tile], dtype=i32, device=dev
-        ).reshape(len(out_tile), H),
-        "h0_tile": torch.tensor(
-            [list(x) for x in h0_tile], dtype=i32, device=dev
-        ).reshape(len(h0_tile), H),
-        "dht_tile": torch.tensor(
-            [list(x) for x in dht_tile], dtype=i32, device=dev
-        ).reshape(len(dht_tile), H),
-        "b1_d_tile_d": torch.tensor(
-            [list(x) for x in b1_d_tile_d], dtype=i32, device=dev
-        ).reshape(len(b1_d_tile_d), H),
-        "b1_d_tile_dm": torch.tensor(
-            [list(x) for x in b1_d_tile_dm], dtype=i32, device=dev
-        ).reshape(len(b1_d_tile_dm), H),
-        "b1_m_tile_dm": torch.tensor(
-            [list(x) for x in b1_m_tile_dm], dtype=i32, device=dev
-        ).reshape(len(b1_m_tile_dm), H),
-        "fwd_chain_start": t(fwd_start),
-        "fwd_chain_doc": t(fwd_doc),
-        "fwd_m_off": t(fwd_m, i64),
-        "fwd_b_off": t(fwd_b, i64),
-        "fwd_out_off": t(fwd_out, i64),
-        "adj_chain_start": t(adj_start),
-        "adj_chain_doc": t(adj_doc),
-        "adj_d_off_d": t(adj_dd, i64),
-        "adj_d_off_dm": t(adj_ddm, i64),
-        "adj_m_off_b1": t(adj_mb1, i64),
-        "adj_m_off_c1": t(adj_mc1, i64),
-        "adj_out_off": t(adj_out, i64),
+    specs: dict[str, tuple] = {
+        "seg_chunk_start": (seg_table, i32, None),
+        "h0_index": (h0_index, i32, None),
+        "carry_index": (carry_index, i32, None),
+        "dht_index": (dht_index, i32, None),
+        "dcarry_index": (dcarry_index, i32, None),
+        "out_index": (out_index, i32, None),
+        "walk_seg_offset": (walk_offset, i32, None),
+        "walk_seg_tape": (walk_tape, i32, None),
+        "out_tile": tiles(out_tile),
+        "h0_tile": tiles(h0_tile),
+        "dht_tile": tiles(dht_tile),
+        "b1_d_tile_d": tiles(b1_d_tile_d),
+        "b1_d_tile_dm": tiles(b1_d_tile_dm),
+        "b1_m_tile_dm": tiles(b1_m_tile_dm),
+        "fwd_chain_start": (fwd_start, i32, None),
+        "fwd_chain_doc": (fwd_doc, i32, None),
+        "fwd_m_off": (fwd_m, i64, None),
+        "fwd_b_off": (fwd_b, i64, None),
+        "fwd_out_off": (fwd_out, i64, None),
+        "adj_chain_start": (adj_start, i32, None),
+        "adj_chain_doc": (adj_doc, i32, None),
+        "adj_d_off_d": (adj_dd, i64, None),
+        "adj_d_off_dm": (adj_ddm, i64, None),
+        "adj_m_off_b1": (adj_mb1, i64, None),
+        "adj_m_off_c1": (adj_mc1, i64, None),
+        "adj_out_off": (adj_out, i64, None),
     }
+    # host-only by default: the tables are uploaded (one asynchronous copy) when one is first read; the upload="blocking"
+    # knob keeps the previous eager per-table copies
+    device_tables: Mapping[str, torch.Tensor] = (
+        _upload_blocking(specs, dev)
+        if getattr(ctx, "upload", UPLOAD_DEFAULT) == "blocking"
+        else _LazyTables(ctx, specs, dev)
+    )
     return KcpHeadPlan(
         H=H,
         Hg=Hg,
@@ -1681,14 +1836,17 @@ class KcpSequence:
         self.log.clear()
 
 
-@dataclasses.dataclass(frozen=True, eq=False)
+# KcpContext: argument omitted (the former default_factory fields)
+_DEFAULT: Any = object()
+
+
 class KcpContext:
     """One rank's view of the partition: CPU ints / tuples plus small int32 device tables; built once, reused across
     layers; never reads a tensor's contents.
 
     Local problem: ``T_r`` tokens in ``n_frag`` local sequences (``cu_seqlens_local`` int32 device ``[n_frag + 1]``,
-    ``frag_table`` int32 device ``[n_frag, 4]`` = ``(doc, off, len, flags)`` with ``FLAG_CROSSING_IN`` /
-    ``FLAG_CROSSING_OUT`` / ``FLAG_CONTINUING``).  Crossing lists: ``in_slot[slot]`` / ``out_slot[slot]`` (``-1``
+    ``frag_rows`` = ``(doc, off, len, flags)`` per fragment with ``FLAG_CROSSING_IN`` / ``FLAG_CROSSING_OUT`` /
+    ``FLAG_CONTINUING``, as int32 device ``[n_frag, 4]`` in ``frag_table`` on first read).  Crossing lists: ``in_slot[slot]`` / ``out_slot[slot]`` (``-1``
     when not crossing) number the rank's crossing-in / crossing-out fragments in local order (``n_in`` / ``n_out``;
     ``N_in`` / ``N_out`` are the group totals; ``*_by_rank`` and ``*_all`` the per-rank counts / tables every owner
     needs).  ``chains[doc]`` are the ``(rank, slot)`` of each document's non-empty fragments in order.  Tables of the
@@ -1697,7 +1855,66 @@ class KcpContext:
     ``tables``; ``NC`` real chunks, ``NC_max`` / ``NC_pad`` / ``R`` the existing plan's geometry.  ``halo`` is the
     convolution halo plan (its device tables in ``halo_tables``: ``hist_row_off``, ``tail_row_off``, ``head_row_off``
     int32, ``hist_index`` int64).  ``heads(H)`` derives and caches the head-dependent plan (:class:`KcpHeadPlan`).
-    ``sequence`` is the debug collective counter."""
+    ``sequence`` is the debug collective counter.
+
+    A plain frozen class, not a dataclass: the input walks of FSDP2's ``fully_shard`` hooks descend into every
+    dataclass, dict, list and tuple of a module's arguments, so a dataclass context carried in per-layer metadata
+    was walked fragment by fragment on every call (flashinfer-ai/flashinfer#7914); this class is one leaf there.
+    It keeps the former dataclass's keyword constructor (:attr:`_FIELDS` in order), repr, identity equality and
+    ``dataclasses.FrozenInstanceError`` on attribute assignment."""
+
+    # the constructor's fields in the former dataclass order; the repr shows every field but ``sequence`` and the
+    # private "_" caches (_REPR_FIELDS), which the constructor creates empty when omitted
+    _FIELDS: tuple[str, ...] = (
+        "partition",
+        "rank",
+        "world_size",
+        "group",
+        "device",
+        "conv_kernel_size",
+        "sm_count",
+        "T_r",
+        "n_frag",
+        "cu_seqlens_local_cpu",
+        "cu_seqlens_local",
+        "frag_rows",
+        "in_slot",
+        "out_slot",
+        "n_in",
+        "n_out",
+        "N_in",
+        "N_out",
+        "n_in_by_rank",
+        "n_out_by_rank",
+        "in_slot_all",
+        "out_slot_all",
+        "chains",
+        "n_d_max",
+        "exchange_scheme",
+        "NC",
+        "NC_max",
+        "NC_pad",
+        "R",
+        "chunk_bos",
+        "chunk_len",
+        "seq_chunk_start",
+        "seq_order",
+        "tables",
+        "halo",
+        "halo_tables",
+        "p_rule",
+        "sequence",
+        "upload",
+        "table_cache",
+        "_head_plans",
+        "_table_sets",
+        "_uploads",
+        "_waited",
+        "_lazy",
+    )
+    _REPR_FIELDS: tuple[str, ...] = tuple(
+        f for f in _FIELDS if f != "sequence" and not f.startswith("_")
+    )
 
     partition: KcpPartition
     rank: int
@@ -1710,7 +1927,7 @@ class KcpContext:
     n_frag: int
     cu_seqlens_local_cpu: tuple[int, ...]
     cu_seqlens_local: torch.Tensor
-    frag_table: torch.Tensor
+    frag_rows: tuple[tuple[int, int, int, int], ...]
     in_slot: tuple[int, ...]
     out_slot: tuple[int, ...]
     n_in: int
@@ -1735,15 +1952,152 @@ class KcpContext:
     tables: dict[str, torch.Tensor]
     halo: KcpHaloPlan
     halo_tables: dict[str, torch.Tensor]
-    p_rule: str = P_RULE_DEFAULT  # plan rule: "wave_fill1_p1tie" shipped; "wave_fill1" (previous) / "wave" / "occ" / "wave_fill" via the test knob
-    sequence: KcpSequence = dataclasses.field(default_factory=KcpSequence, repr=False)
-    _head_plans: dict[int, KcpHeadPlan] = dataclasses.field(
-        default_factory=dict, repr=False
-    )
+    p_rule: str  # plan rule: "wave_fill1_p1tie" shipped; "wave_fill1" (previous) / "wave" / "occ" / "wave_fill" via the test knob
+    sequence: KcpSequence
+    # test knob: "async" (shipped) | "blocking" (the previous pageable copies)
+    upload: str
+    # test knob: "context" (shipped) | "workspace" (the previous cache)
+    table_cache: str
+    _head_plans: dict[int, KcpHeadPlan]
+    # the launch table sets of cake_kcp (``_Tables`` per (H, fused_walks, walk_geometry)): shared by every workspace
+    # (and by workspace=None calls); they hold this context only weakly
+    _table_sets: dict
+    _uploads: list  # KcpUpload records, in issue order
+    _waited: dict  # stream handle -> number of records ordered on it
+    _lazy: dict  # tables uploaded on first read (frag_table)
+
+    def __init__(
+        self,
+        partition: KcpPartition,
+        rank: int,
+        world_size: int,
+        group: object,
+        device: torch.device,
+        conv_kernel_size: int,
+        sm_count: int,
+        T_r: int,
+        n_frag: int,
+        cu_seqlens_local_cpu: tuple[int, ...],
+        cu_seqlens_local: torch.Tensor,
+        frag_rows: tuple[tuple[int, int, int, int], ...],
+        in_slot: tuple[int, ...],
+        out_slot: tuple[int, ...],
+        n_in: int,
+        n_out: int,
+        N_in: int,
+        N_out: int,
+        n_in_by_rank: tuple[int, ...],
+        n_out_by_rank: tuple[int, ...],
+        in_slot_all: tuple[tuple[int, ...], ...],
+        out_slot_all: tuple[tuple[int, ...], ...],
+        chains: tuple[tuple[tuple[int, int], ...], ...],
+        n_d_max: int,
+        exchange_scheme: str,
+        NC: int,
+        NC_max: int,
+        NC_pad: int,
+        R: int,
+        chunk_bos: tuple[int, ...],
+        chunk_len: tuple[int, ...],
+        seq_chunk_start: tuple[int, ...],
+        seq_order: tuple[int, ...],
+        tables: dict[str, torch.Tensor],
+        halo: KcpHaloPlan,
+        halo_tables: dict[str, torch.Tensor],
+        p_rule: str = P_RULE_DEFAULT,
+        sequence: KcpSequence = _DEFAULT,
+        upload: str = UPLOAD_DEFAULT,
+        table_cache: str = TABLE_CACHE_DEFAULT,
+        _head_plans: dict[int, KcpHeadPlan] = _DEFAULT,
+        _table_sets: dict = _DEFAULT,
+        _uploads: list = _DEFAULT,
+        _waited: dict = _DEFAULT,
+        _lazy: dict = _DEFAULT,
+    ) -> None:
+        sequence = KcpSequence() if sequence is _DEFAULT else sequence
+        _head_plans = {} if _head_plans is _DEFAULT else _head_plans
+        _table_sets = {} if _table_sets is _DEFAULT else _table_sets
+        _uploads = [] if _uploads is _DEFAULT else _uploads
+        _waited = {} if _waited is _DEFAULT else _waited
+        _lazy = {} if _lazy is _DEFAULT else _lazy
+        values = dict(locals())
+        for name in self._FIELDS:
+            object.__setattr__(self, name, values[name])
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        raise dataclasses.FrozenInstanceError(f"cannot assign to field {name!r}")
+
+    def __delattr__(self, name: str) -> None:
+        raise dataclasses.FrozenInstanceError(f"cannot delete field {name!r}")
+
+    def __repr__(self) -> str:
+        fields = ", ".join(f"{f}={getattr(self, f)!r}" for f in self._REPR_FIELDS)
+        return f"{type(self).__qualname__}({fields})"
 
     @property
     def fragments(self) -> tuple[KcpFragment, ...]:
         return self.partition.fragments[self.rank]
+
+    @property
+    def frag_table(self) -> torch.Tensor:
+        """int32 ``[n_frag, 4]`` ``(doc, off, len, flags)`` on the context's device, uploaded at its first read (no
+        kernel reads it)."""
+        t = self._lazy.get("frag_table")
+        if t is None:
+            t = self._lazy["frag_table"] = self.upload_tables(
+                {
+                    "frag_table": (
+                        [list(r) for r in self.frag_rows],
+                        torch.int32,
+                        (self.n_frag, 4),
+                    )
+                }
+            )["frag_table"]
+        return t
+
+    def upload_tables(
+        self, specs: dict[str, tuple], device=None, *, stream=None, record: bool = True
+    ) -> dict[str, torch.Tensor]:
+        """Device copies of host-built tables of this context (``name -> (values, dtype, shape)``, see
+        :func:`_upload_tables`): one pinned non-blocking copy on ``stream`` (default: the current stream), recorded
+        for :meth:`wait_ready` (``record``: tables that live as long as the context -- its own, its head plans', its
+        table sets'; the record holds the blob); under the ``upload="blocking"`` test knob the previous per-table
+        pageable copies."""
+        device = self.device if device is None else torch.device(device)
+        if self.upload == "blocking":
+            return _upload_blocking(specs, device)
+        out, rec = _upload_tables(specs, device, stream=stream)
+        if rec is not None and record:
+            self._uploads.append(rec)
+        return out
+
+    @property
+    def ready(self):
+        """The CUDA event recorded after the context's own tables were copied (``None`` on a non-CUDA device or under
+        the ``upload="blocking"`` knob)."""
+        return self._uploads[0].ready if self._uploads else None
+
+    def wait_ready(self, stream=None) -> None:
+        """Order every upload of this context before the later work of ``stream`` (default: the current stream of
+        the context's device), without blocking the host: once per (upload, stream), ``stream.wait_event`` on the
+        upload's event plus ``record_stream`` of its blob for an upload made on another stream; nothing for an upload
+        made on ``stream`` itself (stream order covers it) and nothing while ``stream`` captures a CUDA graph (the capture
+        state of ``stream`` itself, not of the current stream).  The KDA and conv halo entry points call it on every
+        call; a caller that prepares a context on another stream calls it before handing the context's tables to work
+        of its own."""
+        n = len(self._uploads)
+        if not n:
+            return
+        s = torch.cuda.current_stream(self.device) if stream is None else stream
+        key = s.cuda_stream
+        i = self._waited.get(key, 0)
+        if i >= n or _stream_capturing(s):
+            return
+        for rec in self._uploads[i:n]:
+            if rec.stream.cuda_stream != key:
+                s.wait_event(rec.ready)
+                rec.blob.record_stream(s)
+        self._waited[key] = n
 
     @property
     def ring_eligible(self) -> bool:
@@ -1842,6 +2196,8 @@ def build_kcp_context(
     conv_kernel_size: int = 4,
     *,
     sm_count: int | None = None,
+    heads=None,
+    stream=None,
     _kcp_test_knobs: dict | None = None,
 ) -> KcpContext:
     """The :class:`KcpContext` of ``rank`` (the KCP contract §3.1).
@@ -1858,7 +2214,17 @@ def build_kcp_context(
     ``"wave_fill1"`` = the previous rule (the fill without the tie line), ``"wave"`` = the equal-segment wave rule
     above the chain cap alone, ``"occ"`` = the occupancy rule, ``"wave_fill"`` = the unadopted fill on every rank with
     at most three fragments, kept for the A/B record); the
-    public API never selects a rule other than the default.
+    public API never selects a rule other than the default.  The knobs ``upload="blocking"`` / ``table_cache="workspace"``
+    keep the previous pageable per-table copies / the per-workspace table-set cache (A/B record, negative control).
+
+    Host synchronization: the context's device tables (``tables``, ``halo_tables``, ``cu_seqlens_local``) are copied
+    in ONE pinned non-blocking copy on ``stream`` (default: the current stream of ``device``), so the host never waits
+    for device work queued before it -- a pack can be prepared while the previous one runs.  ``heads`` (an int or a
+    sequence of ints) also derives the head plans of those head counts here (host work only; their device tables are
+    uploaded only when read).  The tables are valid for work enqueued on ``stream`` after this call; for another
+    stream ``S`` call ``ctx.wait_ready(S)`` (the KDA and conv halo entry points call ``ctx.wait_ready()`` on their
+    current stream themselves).  A thread other than the one that runs the pack must pass ``stream`` (the current
+    stream is per thread).  Not under CUDA-graph capture (``RuntimeError``).
     """
     if not isinstance(part, KcpPartition):
         raise TypeError(
@@ -1890,7 +2256,39 @@ def build_kcp_context(
     sm_count = int(sm_count)
     if sm_count < 1:
         raise ValueError(f"build_kcp_context: sm_count must be >= 1, got {sm_count}")
-    p_rule = validate_test_knobs(_kcp_test_knobs)["p_rule"]
+    knobs = _kcp_test_knobs
+    upload, table_cache = UPLOAD_DEFAULT, TABLE_CACHE_DEFAULT
+    if isinstance(knobs, dict) and ("upload" in knobs or "table_cache" in knobs):
+        if not test_knobs_enabled():
+            raise ValueError(
+                f"_kcp_test_knobs is a private test hook: it is accepted only after {ENABLE_TEST_KNOBS}"
+            )
+        knobs = dict(knobs)
+        upload = str(knobs.pop("upload", UPLOAD_DEFAULT))
+        table_cache = str(knobs.pop("table_cache", TABLE_CACHE_DEFAULT))
+        if upload not in UPLOADS:
+            raise ValueError(
+                f"_kcp_test_knobs: upload must be one of {UPLOADS}, got {upload!r}"
+            )
+        if table_cache not in TABLE_CACHES:
+            raise ValueError(
+                f"_kcp_test_knobs: table_cache must be one of {TABLE_CACHES}, got {table_cache!r}"
+            )
+        if table_cache == "workspace" and upload != "blocking":
+            # the previous per-workspace table sets are not recorded on the context: their asynchronous copies
+            # would be unordered for a later call on another stream
+            raise ValueError(
+                "_kcp_test_knobs: table_cache='workspace' (the previous path) needs upload='blocking'"
+            )
+    p_rule = validate_test_knobs(knobs)["p_rule"]
+    head_counts: tuple[int, ...]
+    if heads is None:
+        head_counts = ()
+    else:
+        try:  # an int-like scalar (int, numpy / 0-d torch integer)
+            head_counts = (operator.index(heads),)
+        except TypeError:
+            head_counts = tuple(int(h) for h in heads)
     mine = part.fragments[rank]
     n_frag = len(mine)
     if n_frag > MAX_FRAGS:
@@ -1925,38 +2323,49 @@ def build_kcp_context(
     tables_cpu = chunk_tables(local_cu)
     nc_max, nc_pad, rows = chunk_geometry(T_r, n_frag)
     i32 = torch.int32
-    tables = {
-        name: torch.tensor(list(values), dtype=i32, device=device)
-        for name, values in tables_cpu.items()
-    }
     flags = [
         (FLAG_CROSSING_IN if f.crossing_in else 0)
         | (FLAG_CROSSING_OUT if f.crossing_out else 0)
         | (FLAG_CONTINUING if (f.length > 0 and f.off > 0) else 0)
         for f in mine
     ]
-    frag_rows = [
-        [f.doc, f.off, f.length, fl] for f, fl in zip(mine, flags, strict=True)
-    ]
-    frag_table = torch.tensor(frag_rows, dtype=i32, device=device).reshape(n_frag, 4)
+    frag_rows = tuple(
+        (f.doc, f.off, f.length, fl) for f, fl in zip(mine, flags, strict=True)
+    )
     halo_plan = _halo_plan(part, rank, halo, local_cu)
-    halo_tables = {
-        "hist_row_off": torch.tensor(
-            [list(r) for r in halo_plan.hist_row_off], dtype=i32, device=device
-        ).reshape(n_frag, halo),
-        "tail_row_off": torch.tensor(
-            [list(r) for r in halo_plan.tail_row_off], dtype=i32, device=device
-        ).reshape(n_frag, halo),
-        "head_row_off": torch.tensor(
-            [[list(c) for c in r] for r in halo_plan.head_row_off],
-            dtype=i32,
-            device=device,
-        ).reshape(n_frag, halo, halo),
-        "hist_index": torch.tensor(
-            list(halo_plan.hist_index), dtype=torch.int64, device=device
-        ),
+    # the tables the token-side stages and the conv halo read: one upload (the frag_table has no reader: on first read)
+    specs: dict[str, tuple] = {
+        name: (values, i32, None) for name, values in tables_cpu.items()
     }
-    return KcpContext(
+    specs.update(
+        hist_row_off=(
+            [list(r) for r in halo_plan.hist_row_off],
+            i32,
+            (n_frag, halo),
+        ),
+        tail_row_off=(
+            [list(r) for r in halo_plan.tail_row_off],
+            i32,
+            (n_frag, halo),
+        ),
+        head_row_off=(
+            [[list(c) for c in r] for r in halo_plan.head_row_off],
+            i32,
+            (n_frag, halo, halo),
+        ),
+        hist_index=(list(halo_plan.hist_index), torch.int64, None),
+        cu_seqlens_local=(list(local_cu), i32, None),
+    )
+    if upload == "blocking":
+        dev_tables, rec = _upload_blocking(specs, device), None
+    else:
+        dev_tables, rec = _upload_tables(specs, device, stream=stream)
+    tables = {name: dev_tables[name] for name in tables_cpu}
+    halo_tables = {
+        name: dev_tables[name]
+        for name in ("hist_row_off", "tail_row_off", "head_row_off", "hist_index")
+    }
+    ctx = KcpContext(
         partition=part,
         rank=rank,
         world_size=W,
@@ -1968,8 +2377,8 @@ def build_kcp_context(
         T_r=T_r,
         n_frag=n_frag,
         cu_seqlens_local_cpu=local_cu,
-        cu_seqlens_local=torch.tensor(list(local_cu), dtype=i32, device=device),
-        frag_table=frag_table,
+        cu_seqlens_local=dev_tables["cu_seqlens_local"],
+        frag_rows=frag_rows,
         in_slot=in_slot_all[rank],
         out_slot=out_slot_all[rank],
         n_in=n_in_by[rank],
@@ -1994,7 +2403,16 @@ def build_kcp_context(
         tables=tables,
         halo=halo_plan,
         halo_tables=halo_tables,
+        upload=upload,
+        table_cache=table_cache,
     )
+    if rec is not None:
+        ctx._uploads.append(rec)
+    if upload == "blocking":  # the previous path: every table at preparation
+        ctx.frag_table  # noqa: B018
+    for H in head_counts:
+        ctx.heads(H)
+    return ctx
 
 
 # ----------------------------------------------------------------------------------------------------------------
@@ -2006,15 +2424,43 @@ def _check_save_mode(save_mode: str) -> None:
         raise ValueError(f"save_mode must be 'light' or 'tape', got {save_mode!r}")
 
 
+# What a checkpoint recompute handle keeps of one KDA call (``cake_kcp.chunk_kda_kcp(..., recompute_handle=,
+# checkpoint_keep=)``): ``"states"`` (the default) the incoming states ``S_in`` -- the call runs with
+# ``save_transfer=False`` --, ``"transfer"`` also the owner's c1 receive tensor (``save_transfer=True``).
+CHECKPOINT_KEEPS = ("states", "transfer")
+
+
+def _check_checkpoint_keep(
+    checkpoint_keep: str | None, save_transfer: bool | None
+) -> bool:
+    """The ``save_transfer`` a byte query reads: ``None`` -> ``SAVE_TRANSFER_DEFAULT`` without a tier; a tier fixes it
+    (``"states"`` -> ``False``, ``"transfer"`` -> ``True``) and an explicit value that contradicts it raises, as the
+    entry point does."""
+    if checkpoint_keep is None:
+        return SAVE_TRANSFER_DEFAULT if save_transfer is None else bool(save_transfer)
+    if checkpoint_keep not in CHECKPOINT_KEEPS:
+        raise ValueError(
+            f"checkpoint_keep must be None or one of {CHECKPOINT_KEEPS}, got {checkpoint_keep!r}"
+        )
+    transfer = checkpoint_keep == "transfer"
+    if save_transfer is not None and bool(save_transfer) != transfer:
+        raise ValueError(
+            f"checkpoint_keep={checkpoint_keep!r} runs the call with save_transfer={transfer}; "
+            f"save_transfer={save_transfer!r} contradicts it"
+        )
+    return transfer
+
+
 def kcp_saved_bytes(
     ctx: KcpContext,
     *,
     H: int = 64,
     save_mode: str = "light",
-    save_transfer: bool = SAVE_TRANSFER_DEFAULT,
+    save_transfer: bool | None = None,
     with_conv: bool = True,
     C: int = 8192,
     saved_carry: bool = True,
+    checkpoint_keep: str | None = None,
 ) -> int:
     """Saved-set bytes of one layer on this rank (the KCP contract §3.2 ``kcp_saved_bytes(ctx, ...)``)::
 
@@ -2038,10 +2484,32 @@ def kcp_saved_bytes(
     The retained ``S_in`` and c1 tensors are the padded receive buffers (``s`` -> ``n_owners Hg`` tiles,
     ``Hg_r`` -> ``Hg_pad_r``); identical to the formula for ``H = 64``, and the padding is reported by
     ``kcp_comm_bytes(...)["padding"]``.  ``M_seg`` stays the dense copy of §9 (``NSEG s``).
-    """
+
+    ``checkpoint_keep`` (``None`` = the saved set above): the bytes a checkpoint recompute handle retains for this
+    layer while its backward is pending -- the tensors the handle's ``"kda"`` entry holds (exactly
+    ``handle.nbytes()`` of a handle that served this call alone) plus, with ``with_conv``, one convolution's
+    history pool (its ``"conv"`` entry)::
+
+    n_in * s_pad                                               # S_in: "states" and "transfer"
+    + ["transfer"] * N_out * 2 * s * Hg_r / H                  # the owner's whole c1 receive tensor
+    + [with_conv] * n_hist_rows * C * 2                        # one convolution's hist pool (BF16)
+
+    The tier fixes ``save_transfer`` (``False`` / ``True``; ``None``, the default, is ``SAVE_TRANSFER_DEFAULT``
+    without a tier; an explicit value that contradicts the tier raises ``ValueError``, as the entry point does);
+    ``save_mode`` and ``saved_carry`` are not read.  The saved set itself is released by the checkpoint as before
+    (#7039)."""
     _check_save_mode(save_mode)
+    save_transfer = _check_checkpoint_keep(checkpoint_keep, save_transfer)
     H, C = int(H), int(C)
     hp = ctx.heads(H)
+    if checkpoint_keep is not None:
+        numel = kcp_pool_numel(ctx, H=H)
+        kept = numel["S_in"] * 4
+        if checkpoint_keep == "transfer":
+            kept += numel["c1_recv"] * 4
+        if with_conv:
+            kept += ctx.halo.n_hist_rows * C * 2
+        return kept
     s = H * STATE_TILE_BYTES
     s_pad = hp.n_owners * hp.Hg * STATE_TILE_BYTES  # = s without padding
     total = tables_bytes(ctx.NC_pad, ctx.n_frag, hp.NSEG)
@@ -2064,8 +2532,9 @@ def kcp_comm_bytes(
     *,
     H: int = 64,
     C: int = 8192,
-    save_transfer: bool = SAVE_TRANSFER_DEFAULT,
+    save_transfer: bool | None = None,
     boundary_mode: str = "saved",
+    checkpoint_keep: str | None = None,
 ) -> dict:
     """Bytes this rank moves per collective and per boundary (the KCP contract §3.2 ``kcp_comm_bytes(ctx)``; ``send`` / ``recv``
     per collective, totals ``B1`` = forward (c1, c2, halo_fwd), ``B2`` = backward from the saved context (b1 with
@@ -2075,10 +2544,23 @@ def kcp_comm_bytes(
     ``bwd_adjoint_bytes`` of the harness ``kcp_shapes.comm_bytes`` (plus the padding when ``H % Hg != 0``).
     ``padding`` reports the padding bytes contained in c1 / c2 / b1 / b2 (``send`` / ``recv``), their ``B1`` /
     ``B2`` sums, the padding retained inside the saved ``S_in`` (``s_in_saved``), the ``padded_owner`` and the
-    ``pad_tiles_per_slot``; all zero for the production ``H = 64``."""
+    ``pad_tiles_per_slot``; all zero for the production ``H = 64``.
+
+    ``checkpoint_keep`` (``"states"`` | ``"transfer"``; ``None`` = the table above): the traffic of a checkpointed
+    step with a recompute handle of that tier.  The tier fixes ``save_transfer`` (``False`` / ``True``; an explicit
+    value that contradicts it raises ``ValueError``, as the entry point does; ``None``, the default, is
+    ``SAVE_TRANSFER_DEFAULT`` without a tier), so ``B2`` (``b1`` in the ``dm`` form under ``"states"``) is the
+    backward's traffic; the recompute moves nothing (``recompute``: no c1 / c2, and no ``halo_fwd`` when the
+    convolution carries its own handle), so the step moves ``B1 + B2`` instead of the ``B1 + B1 + B2`` of a
+    checkpoint without a handle; the table also reports ``checkpoint_keep``."""
     if boundary_mode not in ("saved", "replay"):
         raise ValueError(
             f"boundary_mode must be 'saved' or 'replay', got {boundary_mode!r}"
+        )
+    save_transfer = _check_checkpoint_keep(checkpoint_keep, save_transfer)
+    if checkpoint_keep is not None and boundary_mode != "saved":
+        raise ValueError(
+            "checkpoint_keep describes a saved-mode call: it needs boundary_mode='saved'"
         )
     H, C = int(H), int(C)
     hp = ctx.heads(H)
@@ -2128,7 +2610,7 @@ def kcp_comm_bytes(
     }
     padding["B1"] = total(padding["c1"], padding["c2"])
     padding["B2"] = total(padding["b1"], padding["b2"])
-    return {
+    table = {
         **coll,
         "b1_replay": b1_replay,
         "padding": padding,
@@ -2148,6 +2630,10 @@ def kcp_comm_bytes(
         "save_transfer": bool(save_transfer),
         "boundary_mode": boundary_mode,
     }
+    if checkpoint_keep is not None:
+        table["checkpoint_keep"] = checkpoint_keep
+        table["recompute"] = {"send": 0, "recv": 0}
+    return table
 
 
 # The pools of a rank's KCP workspace (``cake_kcp.KcpWorkspace``) that share one storage: each backward send pool
@@ -2158,6 +2644,16 @@ SHARED_POOLS = (("c1_send", "b1_send"), ("c2_send", "b2_send"))
 # Pools a workspace allocates on first use only: the ring exchange's hop buffers (``exchange="ring"``), which the
 # a2a exchange never reads.
 LAZY_POOLS = ("ring_out", "ring_in")
+# Pools a forward-only workspace (``backward=False``) allocates on first use only: the c1 receive pool and, at
+# ``P > 1``, the staging plane of the transfers and the carry plane.  A forward without a saved set reads all three;
+# a forward with one writes a fresh saved carry plane in place of ``carry`` and, under ``save_transfer``, fresh
+# saved-set tensors in place of the :data:`FWD_TRANSFER_POOLS` (without it, and under the ring exchange, it reads
+# them: the a2a exchange receives c1 into ``c1_recv``, the ring exchange receives no c1 tensor); a backward
+# workspace sizes them up front.
+FWD_LAZY_POOLS = ("c1_recv", "stage_m", "carry")
+# The :data:`FWD_LAZY_POOLS` that ``save_transfer`` replaces with fresh saved-set tensors (the c1 receive tensor,
+# ``M_seg``).
+FWD_TRANSFER_POOLS = ("c1_recv", "stage_m")
 # The pools a workspace sizes for a forward (``backward=False``) and the ones a backward workspace adds.
 FWD_POOLS = (
     "c1_send",
@@ -2217,28 +2713,53 @@ def kcp_arena_layout(
     ``pool.<name>``: the bytes each pool of a forward (``backward=False``) or a backward workspace needs
     (:func:`kcp_pool_numel`, 4 B per element); ``arena``: the bytes the workspace allocates -- every pool once, each
     :data:`SHARED_POOLS` pair as one storage of the larger need, the :data:`LAZY_POOLS` not at all (``ring``: the bytes
-    a call with ``exchange="ring"`` adds on first use).  The saved set (``S_in``, the c1 receive tensor kept with
-    ``save_transfer``, ``M_seg``, the forward's saved copy of the carry plane; :func:`kcp_saved_bytes`; the ``carry``
-    pool the backward's adjoint carries use is a workspace pool) and the convolution route's halo rows
-    (per-call tensors; their traffic: :func:`kcp_comm_bytes` ``halo_fwd`` / ``halo_bwd``) are never workspace pools,
-    so ``save_transfer`` and ``C`` leave the workspace unchanged."""
+    a call with ``exchange="ring"`` adds on first use) and, in a forward workspace, the :data:`FWD_LAZY_POOLS` a
+    forward with a saved set leaves unread not at all either: all three under ``save_transfer``, ``carry`` alone
+    without it (the a2a forward then reads the :data:`FWD_TRANSFER_POOLS`), so ``arena`` is the workspace after its
+    forwards with a saved set (``lazy``: the bytes the first forward without a saved set adds; zero in a backward
+    workspace, which counts every pool in ``arena``).  The ring exchange receives no c1 tensor: its forward workspace
+    holds ``pool.c1_recv`` bytes fewer than the ``save_transfer=False`` ``arena`` (the option resolves to ``False``
+    there) and ``ring`` more.  The saved set (``S_in``, the c1 receive tensor kept with ``save_transfer``, ``M_seg``, the forward's saved
+    copy of the carry plane; :func:`kcp_saved_bytes`; the ``carry`` pool the backward's adjoint carries use is a
+    workspace pool) and the convolution route's halo rows (per-call tensors; their traffic: :func:`kcp_comm_bytes`
+    ``halo_fwd`` / ``halo_bwd``) are never workspace pools, so ``C`` leaves the workspace unchanged, and so does
+    ``save_transfer`` a backward workspace."""
     _check_save_mode(save_mode)
     numel = kcp_pool_numel(ctx, H=H)
     need = {
         name: numel[name] * 4 for name in FWD_POOLS + (BWD_POOLS if backward else ())
     }
+    out = {f"pool.{name}": v for name, v in need.items()}
+    out["ring"] = sum(need[name] for name in LAZY_POOLS)
+    out["lazy"] = sum(need[name] for name in _deferred_pools(backward, save_transfer))
+    out["arena"] = _pools_arena(need, backward=backward, save_transfer=save_transfer)
+    return out
+
+
+def _deferred_pools(backward: bool, save_transfer: bool) -> tuple[str, ...]:
+    """The forward-only pools no forward with a saved set reads: left to a forward without one."""
+    if backward:
+        return ()
+    return tuple(
+        name
+        for name in FWD_LAZY_POOLS
+        if save_transfer or name not in FWD_TRANSFER_POOLS
+    )
+
+
+def _pools_arena(need: dict[str, int], *, backward: bool, save_transfer: bool) -> int:
+    """The bytes a workspace allocates for the pool needs ``need`` (bytes by pool name): every pool once, each
+    :data:`SHARED_POOLS` pair as one storage of the larger need, the lazily allocated pools not at all."""
     shared = {name for pair in SHARED_POOLS for name in pair}
+    lazy = LAZY_POOLS + _deferred_pools(backward, save_transfer)
     arena = sum(
-        v for name, v in need.items() if name not in shared and name not in LAZY_POOLS
+        v for name, v in need.items() if name not in shared and name not in lazy
     )
     arena += sum(
         max((need[name] for name in pair if name in need), default=0)
         for pair in SHARED_POOLS
     )
-    out = {f"pool.{name}": v for name, v in need.items()}
-    out["ring"] = sum(need[name] for name in LAZY_POOLS)
-    out["arena"] = arena
-    return out
+    return arena
 
 
 # The paths of the existing backend's plan the KCP's local stages take their records from: the forward without a
@@ -2247,6 +2768,16 @@ def kcp_arena_layout(
 # the KCP's ``dav`` read; its WY and fused-gradient records read the recomputed internal rows).
 LOCAL_PATH_FWD = "fwd_nosave"
 LOCAL_PATH_BWD = "replay"
+# The layout of a forward-only local arena: the KCP route's own forward layout (``cake_backend.FWD_KCP_SLOTS``; no
+# state blocks, the internal Akk rows under the h tape), which the existing backend's forward layout contains.
+LOCAL_LAYOUT_FWD_ONLY = "fwd_kcp"
+
+
+def local_fwd_layout(backward: bool, save_mode: str = "light") -> str:
+    """The forward layout (``cake_backend.KdaWorkspace`` ``fwd_layout``) of a rank's local arena:
+    :data:`LOCAL_LAYOUT_FWD_ONLY` for a forward-only light workspace, else ``"fwd"`` (a backward workspace keeps the
+    existing backend's layouts, so a forward on it runs on that arena's ``fwd`` views)."""
+    return LOCAL_LAYOUT_FWD_ONLY if not backward and save_mode == "light" else "fwd"
 
 
 def intra_writes_tables(plan, path: str = LOCAL_PATH_FWD) -> bool:
@@ -2268,7 +2799,7 @@ def local_scratch_table_bytes(plan) -> int:
 
 
 def kcp_workspace_bytes(
-    ctx: KcpContext,
+    ctx: KcpContext | Sequence[KcpContext],
     *,
     H: int = 64,
     save_mode: str = "light",
@@ -2277,45 +2808,74 @@ def kcp_workspace_bytes(
     C: int = 8192,
 ) -> int:
     """Caller-held workspace bytes of one rank: the existing backend's local arena for ``(T_r, n_frag, H)``
-    (``kda_train_workspace_bytes``; zero on a rank without tokens) with the intra record's scratch table set where
-    it writes one (:func:`local_scratch_table_bytes`), plus the KCP arena of transient buffers
-    (:func:`kcp_arena_layout`; CONSISTENCY-6, SPEC-4: saved-set tensors are counted by :func:`kcp_saved_bytes`)."""
+    (``kda_train_workspace_bytes``; zero on a rank without tokens; a forward-only light workspace,
+    ``backward=False``, takes the KCP forward layout :data:`LOCAL_LAYOUT_FWD_ONLY`, 2432 B per internal token-head)
+    with the intra record's scratch table set where it writes one (:func:`local_scratch_table_bytes`), plus the KCP
+    arena of transient buffers (:func:`kcp_arena_layout`; CONSISTENCY-6, SPEC-4: saved-set tensors are counted by
+    :func:`kcp_saved_bytes`).  A forward-only workspace has two states: these bytes after its forwards with a saved
+    set (the training forward) under ``save_transfer`` -- pass the forward's value: without it such a forward also
+    allocates the :data:`FWD_TRANSFER_POOLS` -- and ``kcp_arena_layout(..., save_transfer=save_transfer)["lazy"]``
+    more once a forward without one has read the rest of the :data:`FWD_LAZY_POOLS`.  The ring exchange's hop pools
+    (``["ring"]``) are not counted; its forward-only workspace holds no c1 receive pool (``["pool.c1_recv"]``).
+
+    A sequence of contexts gives the bytes of one workspace that serves all of them (``KcpWorkspace.reserve``):
+    each pool at its largest need over the contexts (each :data:`SHARED_POOLS` pair one storage of the larger), the
+    largest local arena, and the scratch table set of every distinct ``(T_r, n_frag)`` that has one (zero at
+    ``H = 64``; KiB scale where present).  The bytes of a list of one context are those of the context."""
     _check_save_mode(save_mode)
-    local = 0
-    if ctx.T_r > 0:
+    ctxs = list(ctx) if isinstance(ctx, (list, tuple)) else [ctx]
+    if not ctxs:
+        raise ValueError("kcp_workspace_bytes: no context given")
+    arena = 0
+    scratch: dict[tuple[int, int], int] = {}
+    for c in ctxs:
+        if c.T_r <= 0:
+            continue
         from . import (
             cake_backend,
         )  # the existing backend's arena rule; imported here so the metadata module stays torch-only
 
-        local = int(
-            cake_backend.workspace_bytes(
-                ctx.T_r,
-                ctx.n_frag,
-                int(H),
-                backward=backward,
-                save_mode=save_mode,
-                sm_count=ctx.sm_count,
-            )
+        arena = max(
+            arena,
+            int(
+                cake_backend.workspace_bytes(
+                    c.T_r,
+                    c.n_frag,
+                    int(H),
+                    backward=backward,
+                    save_mode=save_mode,
+                    sm_count=c.sm_count,
+                    fwd_layout=local_fwd_layout(backward, save_mode),
+                )
+            ),
         )
         # the scratch table set where the intra record writes one (the rule is architecture-independent; the
         # buffer size follows the same segment-count convention as the arena bytes above)
-        if intra_writes_tables(
-            cake_backend.plan(ctx.T_r, ctx.n_frag, int(H), ctx.sm_count)
-        ):
-            local += int(
-                cake_backend.tables_bytes(
-                    ctx.T_r, ctx.n_frag, int(H), sm_count=ctx.sm_count
-                )
+        if intra_writes_tables(cake_backend.plan(c.T_r, c.n_frag, int(H), c.sm_count)):
+            scratch[(int(c.T_r), int(c.n_frag))] = int(
+                cake_backend.tables_bytes(c.T_r, c.n_frag, int(H), sm_count=c.sm_count)
             )
-    arena = kcp_arena_layout(
-        ctx,
-        H=H,
-        save_mode=save_mode,
-        backward=backward,
-        save_transfer=save_transfer,
-        C=C,
-    )
-    return local + arena["arena"]
+    layouts = [
+        kcp_arena_layout(
+            c,
+            H=H,
+            save_mode=save_mode,
+            backward=backward,
+            save_transfer=save_transfer,
+            C=C,
+        )
+        for c in ctxs
+    ]
+    if len(layouts) == 1:
+        pools = layouts[0]["arena"]
+    else:  # each pool at its largest need, by the rule of kcp_arena_layout
+        need = {
+            key[len("pool.") :]: max(lay[key] for lay in layouts)
+            for key in layouts[0]
+            if key.startswith("pool.")
+        }
+        pools = _pools_arena(need, backward=backward, save_transfer=save_transfer)
+    return arena + sum(scratch.values()) + pools
 
 
 # ----------------------------------------------------------------------------------------------------------------
@@ -2394,6 +2954,8 @@ __all__ = [
     "SAVE_TRANSFER_DEFAULT",
     "SHARED_POOLS",
     "LAZY_POOLS",
+    "FWD_LAZY_POOLS",
+    "FWD_TRANSFER_POOLS",
     "FWD_POOLS",
     "BWD_POOLS",
     "STATE_TILE_BYTES",

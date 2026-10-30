@@ -59,6 +59,7 @@ GRID_RULES = (
     "rows_by_kv_heads",
     "kv_heads_by_rows",
     "kv_heads_by_rows_plus_requests",
+    "persistent_items_by_kv_heads",
 )
 FOLD_GRID_RULES = ("rows_by_kv_heads", "kv_heads_by_rows")
 
@@ -428,6 +429,46 @@ def test_prefill_chunks_cross_pages(heads, qk_norm_policy, quant_policy):
         quant_policy=quant_policy,
         seed=71,
     )
+    run_and_compare(case)
+
+
+@pytest.mark.parametrize("heads", [(8, 1), (64, 8)])
+@pytest.mark.parametrize("quant_policy", [1, 2])
+def test_long_prefill_of_few_requests(heads, quant_policy):
+    """Prefill of four requests beyond four waves of row CTAs: the persistent
+    build on B300 and B200 (its CTAs stride over the request and row items),
+    another stage elsewhere; every stage writes the reference's bytes."""
+    _skip_unless_supported()
+    hq, hkv = heads
+    case = make_case(
+        q_lens=[5400 if hkv == 1 else 700, 0, 37, 129],
+        ctx_lens=[64, 3, 0, 1000],
+        num_q_heads=hq,
+        num_kv_heads=hkv,
+        page_size=64,
+        qk_norm_policy=2,
+        quant_policy=quant_policy,
+        seed=1031 + hkv,
+    )
+    arch = _arch()
+    num_sms = loader.sm_count(_device().index)
+    stage = loader.stage_for(
+        hq,
+        hkv,
+        arch=arch,
+        num_rows=int(case["qkv"].shape[0]),
+        num_requests=4,
+        page_size=64,
+        num_sms=num_sms,
+        is_prefill=True,
+        max_pages_per_request=int(case["page_indices"].shape[1]),
+        has_out_kv=False,
+        quant_policy=quant_policy,
+    )
+    persistent = arch == "sm_100a" or (
+        arch == "sm_103a" and num_sms != loader.STAGE_POLICY["constants"]["gb300_sms"]
+    )
+    assert (stage == "fp8_e4m3_min_blocks10_persistent1") == persistent, stage
     run_and_compare(case)
 
 
@@ -956,6 +997,30 @@ def test_default_launch_plan_is_the_default_builds_grid():
     assert pkg.launch_plan(1, 1, 1) == {"grid": (2, 1, 1)}
 
 
+def test_persistent_grid_is_bounded_by_the_resident_ctas():
+    """The persistent build launches ``min_blocks`` CTAs per SM per KV head, at
+    most one per item, on the x axis; it needs the SM count and 1 to 96
+    requests."""
+    record = loader.MODULES["fp8_e4m3_min_blocks10_persistent1"]
+    assert record["grid_rule"]["kind"] == "persistent_items_by_kv_heads"
+    assert record["knobs"]["min_blocks"] == 10 and record["knobs"]["persistent"]
+
+    def grid(**problem):
+        base = {"num_rows": 1024, "num_requests": 1, "num_kv_heads": 8}
+        return loader.launch_grid(record, **{**base, **problem})
+
+    assert grid(num_sms=148) == (1480, 1, 1)
+    assert grid(num_rows=100, num_requests=4, num_sms=148) == (832, 1, 1)
+    assert grid(num_rows=8192, num_requests=16, num_kv_heads=1, num_sms=148) == (
+        1480,
+        1,
+        1,
+    )
+    for bad in ({}, {"num_requests": 0}, {"num_requests": 97}):
+        with pytest.raises(ValueError):
+            grid(**{"num_sms": None if not bad else 148, **bad})
+
+
 # ----------------------------------------------------------------------------------------------
 # Stage policy (CPU): the host mirrors the Cake policy and must only select shipped builds.
 # ``_POLICY_TABLE`` pins the policy's choice at representative problems (rows change when the
@@ -1240,6 +1305,51 @@ _POLICY_TABLE: dict[tuple[str, int, int, int, int, int, int, bool, int, bool], s
         False,
     ): "fp8_e4m3_min_blocks9_early_rt21_page_prefetch1_clear_tie1",
     ("sm_103a", 64, 8, 128, 8, 64, 152, True, 33, False): "fp8_e4m3_grid_order2",
+    # B300 and B200 prefill of one to sixteen requests beyond four waves: the
+    # persistent build; GB300 keeps the clear-first order, and B300 / B200 keep
+    # ten CTAs per SM below four waves or above sixteen requests
+    (
+        "sm_103a",
+        64,
+        8,
+        1024,
+        1,
+        64,
+        148,
+        True,
+        48,
+        False,
+    ): "fp8_e4m3_min_blocks10_persistent1",
+    (
+        "sm_103a",
+        8,
+        1,
+        8192,
+        16,
+        64,
+        148,
+        True,
+        48,
+        False,
+    ): "fp8_e4m3_min_blocks10_persistent1",
+    ("sm_103a", 64, 8, 1024, 1, 64, 152, True, 48, False): "fp8_e4m3_grid_order3",
+    (
+        "sm_100a",
+        64,
+        8,
+        1024,
+        1,
+        64,
+        148,
+        True,
+        48,
+        False,
+    ): "fp8_e4m3_min_blocks10_persistent1",
+    ("sm_100a", 64, 8, 508, 4, 64, 148, True, 48, False): "fp8_e4m3_min_blocks10",
+    ("sm_100a", 64, 8, 384, 4, 64, 148, True, 48, False): "fp8_e4m3_min_blocks10",
+    ("sm_100a", 64, 8, 960, 24, 64, 148, True, 48, False): "fp8_e4m3_min_blocks10",
+    ("sm_103a", 64, 8, 580, 4, 64, 148, True, 48, False): "fp8_e4m3_min_blocks10",
+    ("sm_103a", 64, 8, 960, 24, 64, 148, True, 48, False): "fp8_e4m3_min_blocks10",
 }
 
 
@@ -1298,6 +1408,7 @@ def test_stage_policy_only_selects_shipped_builds(arch):
                                         num_rows=rows,
                                         num_requests=reqs,
                                         num_kv_heads=hkv,
+                                        num_sms=sms,
                                     )
 
 

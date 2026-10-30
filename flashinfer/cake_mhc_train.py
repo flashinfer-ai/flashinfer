@@ -76,6 +76,15 @@ Usage::
     # caller-owned workspaces (zero-initialized; the kernels leave them reusable)
     ws_f = cake_mhc_train_forward_workspace(T, X.device)
     ws_b = cake_mhc_train_backward_workspace(T, X.device)
+
+The model's head, the stream mean ``Y = mean_i X[:, i, :]`` of the last
+layer's four streams, has its own kernels (hidden 4096, 5120 and 7168; 4096
+on SM107), bit for bit torch's BF16 ``X.mean(dim=1)`` and its gradient::
+
+    Y = cake_mhc_train_head_forward(X)                    # BF16 [T, H] from [T, 4, H]
+    dX = cake_mhc_train_head_backward(dY)                 # dX[:, i] = BF16(dY / 4)
+    cake_mhc_train_head_backward(dY, dX=dX, accumulate=True)   # dX += BF16(dY / 4)
+    Y = cake_mhc_train_head(X)                            # autograd
 """
 
 from __future__ import annotations
@@ -85,6 +94,7 @@ from typing import Optional
 import torch
 
 from . import cake_mhc_train_backend as _backend
+from . import cake_mhc_train_head_backend as _head_backend
 from .api_logging import flashinfer_api
 from .cake_mhc_train_backend import (  # noqa: F401
     ARCHES,
@@ -98,6 +108,10 @@ from .cake_mhc_train_backend import (  # noqa: F401
     cake_mhc_train_reset_workspace,
     is_cake_mhc_train_supported,
     route_key,
+)
+from .cake_mhc_train_head_backend import (  # noqa: F401
+    CakeMHCTrainHeadFunction,
+    is_cake_mhc_train_head_supported,
 )
 
 # The stable entry points are real ``def``s here (public-API tooling reads the
@@ -486,10 +500,104 @@ def cake_mhc_train_finish(X: torch.Tensor, B: torch.Tensor, handle) -> torch.Ten
     return _backend.cake_mhc_train_finish(X, B, handle)
 
 
+@flashinfer_api
+def cake_mhc_train_head_forward(
+    X: torch.Tensor, *, out: Optional[torch.Tensor] = None
+) -> torch.Tensor:
+    r"""The model's head: the mean of the four residual streams, ``Y = mean_i X[:, i, :]``.
+
+    ``Y[t, d] = BF16(((X[t, 0, d] + X[t, 1, d]) + X[t, 2, d] + X[t, 3, d]) * 0.25)``
+    with the sum in FP32 from zero in stream order and one rounding: bit for
+    bit torch's ``X.mean(dim=1)`` of a BF16 ``X``, signed zeros and the NaN
+    encoding included.
+
+    Parameters
+    ----------
+    X : torch.Tensor
+        BF16 ``[T, 4, H]`` contiguous residual streams, ``H`` in 4096, 5120 or
+        7168 (:func:`is_cake_mhc_train_head_supported`), 32-byte aligned.  ``T``
+        is a runtime scalar; ``T == 0`` returns an empty ``Y`` without
+        launching.
+    out : torch.Tensor, optional
+        Preallocated BF16 ``[T, H]`` contiguous ``Y`` (default ``None``: a new
+        tensor); it must not overlap ``X``.
+
+    Returns
+    -------
+    BF16 ``Y`` of shape ``[T, H]``.
+
+    The launch runs on the current torch stream of ``X``'s device and
+    allocates nothing beyond the default ``out``, so it can be captured in a
+    CUDA graph once its program is loaded (one eager call first).
+    """
+
+    return _head_backend.cake_mhc_train_head_forward(X, out=out)
+
+
+@flashinfer_api
+def cake_mhc_train_head_backward(
+    dY: torch.Tensor,
+    *,
+    dX: Optional[torch.Tensor] = None,
+    accumulate: bool = False,
+) -> torch.Tensor:
+    r"""Gradient of the head: ``dX[t, i, d] = BF16(dY[t, d] * 0.25)`` for each of the four streams.
+
+    Bit for bit torch's ``MeanBackward`` of ``X.mean(dim=1)`` (the quarter is
+    exact unless it is subnormal, and then rounds once).  With
+    ``accumulate=True`` the kernel adds instead,
+    ``dX[t, i, d] = BF16(dX[t, i, d] + BF16(dY[t, d] * 0.25))``, bit for bit
+    torch's BF16 ``dX.add_(...)`` of that gradient (autograd's accumulation
+    into an existing ``X.grad``).
+
+    Parameters
+    ----------
+    dY : torch.Tensor
+        BF16 ``[T, H]`` contiguous gradient of ``Y``, ``H`` in 4096, 5120 or
+        7168, 32-byte aligned; ``T == 0`` launches nothing.
+    dX : torch.Tensor, optional
+        BF16 ``[T, 4, H]`` contiguous gradient of ``X`` to write (default
+        ``None``: a new tensor) or, with ``accumulate=True``, to add into (then
+        required); it must not overlap ``dY``.
+    accumulate : bool
+        Add into ``dX`` instead of overwriting it (default ``False``).
+
+    Returns
+    -------
+    BF16 ``dX`` of shape ``[T, 4, H]`` (the caller's tensor when given).
+
+    The launch runs on the current torch stream of ``dY``'s device.
+    """
+
+    return _head_backend.cake_mhc_train_head_backward(dY, dX=dX, accumulate=accumulate)
+
+
+@flashinfer_api
+def cake_mhc_train_head(X: torch.Tensor) -> torch.Tensor:
+    """Autograd-enabled :func:`cake_mhc_train_head_forward`: ``Y = mean_i X[:, i, :]``.
+
+    Parameters
+    ----------
+    X : torch.Tensor
+        BF16 ``[T, 4, H]`` contiguous residual streams (may require
+        gradients), ``H`` in 4096, 5120 or 7168.
+
+    Returns
+    -------
+    BF16 ``Y`` of shape ``[T, H]``.  Its backward is
+    :func:`cake_mhc_train_head_backward` (bit for bit torch's gradient of
+    ``X.mean(dim=1)``); the node saves no tensor, so an activation checkpoint
+    around it keeps nothing alive and its backward needs no recomputation.
+    """
+
+    return _head_backend.cake_mhc_train_head(X)
+
+
 __all__ = [
     "ARCHES",
     "SUPPORTED_COMPUTE_CAPABILITIES",
     "CakeMHCTrainFinishFunction",
+    "CakeMHCTrainHeadFunction",
     "CakeMHCTrainPrepareFunction",
     "cake_mhc_train_backward_finish",
     "cake_mhc_train_backward_prepare",
@@ -501,8 +609,12 @@ __all__ = [
     "cake_mhc_train_forward_stats",
     "cake_mhc_train_forward_workspace",
     "cake_mhc_train_forward_workspace_bytes",
+    "cake_mhc_train_head",
+    "cake_mhc_train_head_backward",
+    "cake_mhc_train_head_forward",
     "cake_mhc_train_prepare",
     "cake_mhc_train_reset_workspace",
+    "is_cake_mhc_train_head_supported",
     "is_cake_mhc_train_supported",
     "route_key",
 ]

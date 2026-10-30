@@ -113,11 +113,15 @@ Usage::
     # history rows of the preceding fragments exchanged through the KCP context
     # (FP32 taps, no bias)
     y_local = cake_causal_conv1d_kcp(x_local, weight, ctx)
+
+    # a layer's q / k / v convolutions with one halo exchange per direction
+    # (bitwise three single calls)
+    q, k, v = cake_causal_conv1d_kcp_multi((xq, xk, xv), (wq, wk, wv), ctx)
 """
 
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any, Optional, Sequence
 
 import torch
 
@@ -324,7 +328,11 @@ def cake_causal_conv1d(
 
 @flashinfer_api
 def cake_causal_conv1d_kcp(
-    x_local: torch.Tensor, weight: torch.Tensor, ctx: Any
+    x_local: torch.Tensor,
+    weight: torch.Tensor,
+    ctx: Any,
+    *,
+    recompute_handle: Optional[Any] = None,
 ) -> torch.Tensor:
     """Autograd-enabled context-parallel packed width-4 depthwise causal convolution + SiLU of this rank's fragments.
 
@@ -342,6 +350,20 @@ def cake_causal_conv1d_kcp(
         FP32 ``[C, 4]`` contiguous taps.
     ctx : KcpContext
         From ``flashinfer.kda_train.build_kcp_context`` (the same context the KDA step of the rank uses).
+    recompute_handle : KcpRecomputeHandle, optional
+        Keyword-only, default ``None`` (unchanged behavior).  A handle (any object with an ``entries`` dict, such as
+        ``flashinfer.cake_causal_conv1d_train.KcpRecomputeHandle``) makes the checkpoint recompute of
+        this call run without the forward halo exchange: the original forward exchanges as always and stores its
+        history rows (the saved set's own tensor, key ``"conv"``) in the handle; torch's recompute of the forward
+        inside the backward reads them back, so ``y`` and the gradients are bitwise those of the same checkpoint
+        without a handle.  The backward still exchanges.  Create one handle per convolution call and micro-step,
+        outside the outermost checkpoint region, and pass it as an argument of the checkpointed function.  A
+        forward outside the backward that finds an entry raises (a handle reused across micro-steps).  The forward
+        halo exchange is a collective: every rank of ``ctx.group`` passes a handle for the same call or none, created
+        at the same checkpoint nesting level.  A mismatch pairs one rank's recompute exchange with another rank's
+        backward exchange and hangs or corrupts data; no check is made.  Never share one handle between two
+        convolution calls (also not in nested regions), and never ``clear()`` or reuse a handle while a backward
+        that needs it is pending.
 
     Returns
     -------
@@ -352,15 +374,78 @@ def cake_causal_conv1d_kcp(
 
     from .cake_causal_conv1d_train_backend import kcp as _kcp
 
-    return _kcp.cake_causal_conv1d_kcp(x_local, weight, ctx)
+    return _kcp.cake_causal_conv1d_kcp(
+        x_local, weight, ctx, recompute_handle=recompute_handle
+    )
+
+
+@flashinfer_api
+def cake_causal_conv1d_kcp_multi(
+    xs: Sequence[torch.Tensor],
+    weights: Sequence[torch.Tensor],
+    ctx: Any,
+    *,
+    recompute_handle: Optional[Any] = None,
+) -> tuple[torch.Tensor, ...]:
+    """Autograd-enabled context-parallel convolutions of several tensors of one layer (for example its q, k and v)
+    with one halo exchange per direction.
+
+    The result is bitwise ``tuple(cake_causal_conv1d_kcp(x, w, ctx) for x, w in zip(xs, weights))``: outputs and
+    every gradient, ``dweight`` included (each tensor keeps its own kernels and fixed-order reduction).  The forward
+    issues one halo collective instead of one per tensor (the history rows of all tensors travel side by side and are
+    copied out after the wait), and so does the backward, so a layer has fewer global synchronization points.
+
+    Parameters
+    ----------
+    xs : sequence of torch.Tensor
+        ``n >= 1`` BF16 ``[S_local, C_i]`` or ``[1, S_local, C_i]`` contiguous packed activations of this rank's
+        fragments, in the partition's order; each ``C_i`` is a multiple of 8 (they may differ).
+    weights : sequence of torch.Tensor
+        FP32 ``[C_i, 4]`` contiguous taps, one per tensor.
+    ctx : KcpContext
+        As in :func:`cake_causal_conv1d_kcp`.  Every rank of the group calls this function once per layer, in the
+        same order, with the same tensor count and channel counts.  The ranks are not compared (that would cost a
+        collective): a different count, channel count or order hangs the exchange or silently corrupts the history
+        rows, as a mismatch of the single entry's per-rank contract does.
+    recompute_handle : KcpRecomputeHandle, optional
+        Keyword-only, default ``None`` (unchanged behavior).  One handle for the whole call: the original forward
+        stores the ``n`` history pools under ``"conv"`` and torch's recompute inside the backward reads them back,
+        so the recompute issues no collective; the backward still exchanges once.  The rules of
+        :func:`cake_causal_conv1d_kcp` apply (one handle per call and micro-step, created outside the outermost
+        checkpoint region; every rank passes one or none).  The same handle may carry the layer's ``"kda"`` entry;
+        its ``"conv"`` entry serves one multi call or one single call, never both.
+
+    Returns
+    -------
+    tuple of torch.Tensor
+        The ``n`` BF16 outputs, each of its input's shape.
+    """
+
+    from .cake_causal_conv1d_train_backend import kcp as _kcp
+
+    return _kcp.cake_causal_conv1d_kcp_multi(
+        xs, weights, ctx, recompute_handle=recompute_handle
+    )
+
+
+def __getattr__(name: str) -> Any:
+    # ``KcpRecomputeHandle`` (the KCP route's checkpoint recompute handle) resolves on first access, so importing the
+    # facade does not import the KCP host module (torch.distributed, the KCP loader), like the entry point above.
+    if name == "KcpRecomputeHandle":
+        from .cake_causal_conv1d_train_backend.kcp import KcpRecomputeHandle
+
+        return KcpRecomputeHandle
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 __all__ = [
     "ARCHES",
     "SUPPORTED_COMPUTE_CAPABILITIES",
     "CakeCausalConv1dFunction",
+    "KcpRecomputeHandle",  # noqa: F822 - resolved by __getattr__
     "cake_causal_conv1d",
     "cake_causal_conv1d_kcp",
+    "cake_causal_conv1d_kcp_multi",
     "cake_causal_conv1d_train_backward",
     "cake_causal_conv1d_train_backward_workspace",
     "cake_causal_conv1d_train_backward_workspace_bytes",

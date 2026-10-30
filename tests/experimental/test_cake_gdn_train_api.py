@@ -346,7 +346,7 @@ def test_facade_exposes_the_contract_names_keyword_only() -> None:
         assert callable(getattr(gdn_train, n)), n
         assert n in gdn_train.__all__
     # exactly the contract names plus the three public types; nothing else is public
-    types = ("KcpOptions", "KcpContext", "KcpPartition")
+    types = ("KcpOptions", "KcpContext", "KcpPartition", "KcpRecomputeHandle")
     assert set(gdn_train.__all__) == set(names) | set(types)
     for n in ("DEFAULT_SCALE", "KcpSaved", "KcpWorkspace"):
         assert n not in gdn_train.__all__
@@ -372,6 +372,7 @@ def test_facade_exposes_the_contract_names_keyword_only() -> None:
     assert gdn_train.KcpOptions is pkg.KcpOptions
     assert gdn_train.KcpContext is pkg.KcpContext
     assert gdn_train.KcpPartition is pkg.KcpPartition
+    assert gdn_train.KcpRecomputeHandle is pkg.KcpRecomputeHandle
     assert gdn_train.KcpSaved is pkg.KcpSaved
     assert gdn_train.DEFAULT_SCALE == 128**-0.5 == pkg.SCALE
     with pytest.raises(AttributeError):

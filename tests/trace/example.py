@@ -48,6 +48,7 @@ gdn_prefill_gates_q4_k4_v8_d128.json
 gdn_prefill_paged_q4_k4_v8_d128_ps64.json
 gdn2_prefill_qk4_v8_d128.json
 gdp_prefill_n2_qk4_v8_d128.json
+group_union_masks_top_k2048.json
 recurrent_kda_q8_v16_d128.json
 packed_kda_decode_h12_d128.json
 fused_kda_decode_h12_d128.json
@@ -140,6 +141,7 @@ rmsnorm_quant_h7168.json
 silu_and_mul_h16384.json
 silu_and_mul_mxfp8_experts_quantize_k8192.json
 silu_and_mul_nvfp4_quantize_k16384.json
+token_sparse_kv_indices_top_k2048_lists2.json
 top_k_sampling_v128256.json
 top_k_top_p_sampling_v128256.json
 top_k_top_p_sampling_v151936.json
@@ -171,6 +173,7 @@ MSA (msa_*) files require SM120/SM121 (consumer Blackwell) GPUs.
 dsv41_fp4_quantize_*_sparse_mla_cache_*.json and dsv41_fp8_quantize_*_sparse_mla_cache_*.json
 are only generated on SM120/SM121 GPUs.
 trtllm_batch_decode_block_sparse_h16_kv2_d128_ps16.json requires SM100/SM103 GPUs.
+trtllm_batch_decode_token_sparse_h16_kv1_d256_ps1_topk512.json requires SM100/SM103 GPUs.
 trtllm_gen_routing_e256_k8_t8.json requires SM100/SM103/SM120/SM121 GPUs.
 top_k_varlen_n4096_k512.json (windowed prefill mode, gvr_2) requires SM100/SM103/SM107 GPUs.
 """
@@ -2788,30 +2791,33 @@ for _pts_semantic_PS in (32, 4):
         )
 
         _pts_wrapper = _PrimTSDecodeWrapper(kv_layout="HND")
-        _pts_wrapper.plan(
-            _pts_q.device,
-            _pts_B,
-            _pts_Hq,
-            _pts_Hkv,
-            _pts_D,
-            _pts_semantic_PS,
-            _pts_SK,
-            max_seq_len_q=_pts_SQ,
-            packed_query=False,
-            q_data_type=_pts_q.dtype,
-            k_data_type=_pts_k.dtype,
-            v_data_type=_pts_v.dtype,
-            o_data_type=torch.bfloat16,
-            mask_type="causal",
-            workspace_buffer=_pts_workspace,
-            storage_page_size=_pts_PS,
-        )
-        _pts_wrapper.run(
-            _pts_q,
-            _pts_cache,
-            _pts_seq_lens,
-            _pts_block_tables,
-        )
+        for _pts_plan_seq_lens in (None, [_pts_SK] * _pts_B):
+            _pts_wrapper.plan(
+                _pts_q.device,
+                _pts_B,
+                _pts_Hq,
+                _pts_Hkv,
+                _pts_D,
+                _pts_semantic_PS,
+                _pts_SK,
+                max_q_len=_pts_SQ,
+                packed_query=False,
+                q_dtype=_pts_q.dtype,
+                k_dtype=_pts_k.dtype,
+                v_dtype=_pts_v.dtype,
+                out_dtype=torch.bfloat16,
+                mask_type="causal",
+                workspace_buffer=_pts_workspace,
+                storage_page_size=_pts_PS,
+                seq_lens_kv=_pts_plan_seq_lens,
+            )
+            _pts_wrapper.run(
+                _pts_q,
+                _pts_cache,
+                None if _pts_plan_seq_lens is not None else _pts_seq_lens,
+                _pts_block_tables,
+            )
+
 
 # PrimTS MLA decode: the same causal SQ4 contract through all three public
 # surfaces (SM100/SM103 only).
@@ -2869,7 +2875,7 @@ with contextlib.suppress(Exception):
         _pmla_KPE,
         _pmla_PS,
         _pmla_SK,
-        max_seq_len_q=_pmla_SQ,
+        max_q_len=_pmla_SQ,
         q_dtype=_pmla_q.dtype,
         kv_dtype=_pmla_cache.dtype,
         out_dtype=torch.bfloat16,
@@ -2886,7 +2892,7 @@ with contextlib.suppress(Exception):
         max_kv_len=_pmla_SK,
         kv_lora_rank=_pmla_CKV,
         qk_rope_head_dim=_pmla_KPE,
-        max_seq_len_q=_pmla_SQ,
+        max_q_len=_pmla_SQ,
         mask_type="causal",
     )
 
@@ -2899,11 +2905,11 @@ with contextlib.suppress(Exception):
         _pmla_KPE,
         _pmla_PS,
         _pmla_SK,
-        max_seq_len_q=_pmla_SQ,
+        max_q_len=_pmla_SQ,
         packed_query=False,
-        q_data_type=_pmla_q.dtype,
-        kv_data_type=_pmla_cache.dtype,
-        o_data_type=torch.bfloat16,
+        q_dtype=_pmla_q.dtype,
+        kv_dtype=_pmla_cache.dtype,
+        out_dtype=torch.bfloat16,
         mask_type="causal",
         workspace_buffer=_pmla_workspace,
     )
@@ -2933,6 +2939,20 @@ with contextlib.suppress(Exception):
         device=device,
     )
     trtllm_batch_decode_with_kv_cache(**_tbs_inputs)
+
+# trtllm_batch_decode_with_kv_cache with token-sparse attention (each query
+# token attends to its own K and V slot lists; SM100/103 only).
+with contextlib.suppress(Exception):
+    from flashinfer.decode import trtllm_batch_decode_with_kv_cache
+    from flashinfer.trace.templates.attention import (
+        _trtllm_batch_decode_token_sparse_init,
+    )
+
+    trtllm_batch_decode_with_kv_cache(
+        **_trtllm_batch_decode_token_sparse_init(
+            num_tokens=4, num_heads=16, head_dim=256, sparse_top_k=512, device=device
+        )
+    )
 
 # concat_mla_k (DeepSeek MLA K concat, fixed shape per docstring).
 with contextlib.suppress(Exception):
@@ -3438,3 +3458,29 @@ try:
 finally:
     if _ulysses_owns_process_group:
         dist.destroy_process_group()
+
+# ── Token-sparse attention inputs: K/V slot lists, group unions and masks ─────
+from flashinfer.token_sparse import group_union_masks, token_sparse_kv_indices
+
+token_sparse_kv_indices.fi_trace(
+    save_dir=SAVE_DIR,
+    positions=torch.empty(4, 2048, dtype=torch.int32),
+    requests=torch.zeros(4, dtype=torch.int32),
+    block_table=torch.empty(2, 64, dtype=torch.int32),
+    block_tables=torch.empty(8, 2, 2048, dtype=torch.int32),
+    seq_lens=torch.empty(8, dtype=torch.int32),
+    requests_per_token=2,
+)
+
+group_union_masks.fi_trace(
+    save_dir=SAVE_DIR,
+    positions=torch.empty(8, 2048, dtype=torch.int32),
+    query_rows=torch.arange(8, dtype=torch.int32),
+    group_unions=torch.arange(2, dtype=torch.int32),
+    requests=torch.zeros(2, dtype=torch.int32),
+    block_table=torch.empty(1, 256, dtype=torch.int32),
+    union=torch.empty(2, 8192, dtype=torch.int32),
+    union_sizes=torch.empty(2, dtype=torch.int32),
+    mask=torch.empty(8, 256, dtype=torch.int32),
+    num_keys=16384,
+)
