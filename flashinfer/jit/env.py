@@ -39,16 +39,34 @@ from ..version import __version__ as flashinfer_version
 logger = logging.getLogger("flashinfer.jit")
 
 
+def _is_jit_cache_shim(module: Any) -> bool:
+    """Whether *module* provides the shim API, not merely a ``providers/`` directory.
+
+    A provider wheel installs ``flashinfer_jit_cache/providers/<arch>`` without the shim's
+    top-level ``__init__.py``, and an uninstall can leave that directory behind. Both still
+    import as a namespace package, so a presence check alone cannot tell them apart from a
+    real shim.
+    """
+    return hasattr(module, "__version__") and callable(
+        getattr(module, "get_jit_cache_providers", None)
+    )
+
+
 def has_flashinfer_jit_cache() -> bool:
     """
-    Check if flashinfer_jit_cache module is available.
+    Check if a usable flashinfer_jit_cache shim is available.
 
     Returns:
-        True if flashinfer_jit_cache exists, False otherwise
+        True if the shim is importable and exposes its API, False otherwise
     """
     import importlib.util
 
-    return importlib.util.find_spec("flashinfer_jit_cache") is not None
+    if importlib.util.find_spec("flashinfer_jit_cache") is None:
+        return False
+
+    import flashinfer_jit_cache
+
+    return _is_jit_cache_shim(flashinfer_jit_cache)
 
 
 def has_flashinfer_cubin() -> bool:
@@ -189,17 +207,31 @@ def _check_jit_cache_provider_version(
 
 def _get_aot_providers() -> Tuple[AOTProvider, ...]:
     """Discover compatible AOT provider packages through the installed shim."""
-    if not has_flashinfer_jit_cache():
+    import importlib.util
+
+    if importlib.util.find_spec("flashinfer_jit_cache") is None:
         return ()
 
     import flashinfer_jit_cache
 
+    if not _is_jit_cache_shim(flashinfer_jit_cache):
+        # Do not raise: a residual namespace package (provider-only install, or the
+        # directory left behind by `pip uninstall`) must not break `import flashinfer`.
+        logger.warning(
+            "Ignoring flashinfer_jit_cache: the package resolves but has no __version__ "
+            "or get_jit_cache_providers(), so only a provider wheel or an uninstall "
+            "leftover is installed. AOT kernels are disabled and kernels will be "
+            "JIT-compiled; install the flashinfer-jit-cache shim or run "
+            "`flashinfer download-kernels`."
+        )
+        return ()
+
+    shim_version = flashinfer_jit_cache.__version__
+
     # NOTE: like a mismatched flashinfer-cubin, a mismatched shim is ignored so
     # that `flashinfer download-kernels` can still import FlashInfer to replace it.
     try:
-        _check_jit_cache_version(
-            "flashinfer-jit-cache", flashinfer_jit_cache.__version__
-        )
+        _check_jit_cache_version("flashinfer-jit-cache", shim_version)
     except RuntimeError as error:
         logger.warning(
             "Ignoring incompatible flashinfer-jit-cache package (kernels will be "
@@ -213,7 +245,7 @@ def _get_aot_providers() -> Tuple[AOTProvider, ...]:
             _check_jit_cache_provider_version(
                 provider.distribution,
                 provider.version,
-                flashinfer_jit_cache.__version__,
+                shim_version,
             )
         except RuntimeError as error:
             logger.warning(
