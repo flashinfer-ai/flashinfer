@@ -11,8 +11,10 @@ vendored from cuDNN Frontend.  The vendored tree is the Qwen 3.5 package's (``fl
 one drop, one manifest, one re-vendor command; this package adds nothing under it).  Nothing here imports the DSL, the kernels or
 torch at package-import time: the lightweight ``support`` module answers the dispatch question, ``api`` builds and runs plans on
 first use.  The three forms are one vendored declaration form and are served together (``support.FORMS == ("prefill", "extend",
-"decode")`` on a served device); the extend forms take a chunk of any length up to the block table's reach, at any batch (the band slab's
-projection rides the JIT route at every row count since the cuDNN Frontend 6b21be0e0 pin).
+"decode")`` on a served device); the extend forms take a chunk of any length up to the block table's reach, at any batch, up to 65,535
+rows per run at this pin (the band slab's projection rides the JIT route at every row count since the cuDNN Frontend 6b21be0e0 pin; the
+vendored indexer's query compress launches with the run's row count as a CUDA grid dimension, so a run past that count is a typed decline
+-- ``support.EXTEND_ROWS_GRID_MAX`` -- until the compressor's grid is flattened upstream and re-vendored).
 """
 
 __all__ = ["api", "support", "weights", "rope"]

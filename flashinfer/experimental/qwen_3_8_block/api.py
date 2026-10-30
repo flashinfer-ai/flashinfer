@@ -30,7 +30,9 @@ values; stated in the README): ``seq_lens[b] in {0} u [T, max_pages x page_size]
 nothing written), a shorter live sequence reported ``-2`` and one past the table's reach ``-3`` in the plan's workspace, never raised;
 the ring INPUT contract (positions ``4 floor(P / 4) .. P - 1`` already in the ring: the stack's rule or the block's own previous chunk /
 step); mixed steps (decodes + prefills) = one decode plan and one extend plan per layer, run back to back; ragged chunks = several
-runs grouped by ``T``.
+runs grouped by ``T``.  ONE run holds at most ``support.EXTEND_ROWS_GRID_MAX`` = 65,535 rows (``batch x T``) at this pin -- the vendored
+indexer's query compress launches with the run's row count as a CUDA grid dimension -- so a longer chunk at a batch is several runs; the
+light gate declines it typed, before any vendored code (the ``indexer_extend_grid_rows`` row of the probe's extend / prefill records).
 
 The sparse core's BODY knob (``sparse_tile_form``, appended with the 7301fad21 pin; performance-only): ``"auto"`` (the default) lets
 the vendored tree pick the body -- on cc 10.7 the LEAN decode tile at ``batch x H_kv <= 4`` CTAs per chunk (the bound's unit since the
@@ -887,20 +889,29 @@ def _light_extend_gates(
     use_pdl,
     fuse_prepare,
     sparse_tile_form: str = SPARSE_TILE_FORM_AUTO,
+    *,
+    batch_size: int,
+    q_len_per_req: int,
 ) -> None:
     """The extend / prefill forms' typed declines that need no vendored code: the page sizes the paged indexer addresses (both steps read
     the compressed-key cache by a shift), the e4m3 pool (the vendored ``indexer_e4m3_pool`` row applies to both steps), the types of
     ``use_pdl`` / ``fuse_prepare`` (an explicit ``fuse_prepare=True`` reaches the vendored declaration, which declines it by name:
     ``indexer_extend_fuse_prepare``), the sparse core's body vocabulary.  The decode scorer's query-row envelope (``INDEX_QUERY_ROWS_MAX``)
     is the DECODE form's row and does not apply: the EXTEND step serves any ``q_len_per_req`` up to the block table's reach (checked in
-    :func:`prepare` once the table's width is known) at any batch -- no rows bound since the 6b21be0e0 pin, where the band slab's projection
-    takes the GEMM engine's own baseline tile past 128 rows on the same JIT-only route (the previous pin's ``extend_proj_slab_rows`` decline
-    is retired).  The vendored declaration repeats every envelope row with its own text."""
+    :func:`prepare` once the table's width is known) at any batch -- no projection rows bound since the 6b21be0e0 pin, where the band slab's
+    projection takes the GEMM engine's own baseline tile past 128 rows on the same JIT-only route (the previous pin's
+    ``extend_proj_slab_rows`` decline is retired); the ONE rows bound that remains is the launch-grid bound of one run
+    (``batch_size x q_len_per_req <= EXTEND_ROWS_GRID_MAX`` = 65,535 at this pin: the vendored indexer's query compress launches with the
+    run's row count as a CUDA grid dimension), raised here typed and named (:func:`support.extend_rows_grid_reason`) before any vendored
+    code.  The vendored declaration repeats every envelope row with its own text."""
     if page_size not in PAGE_SIZES:
         raise NotImplementedError(
             f"{_PKG} ({form}): the paged indexer splits a block id into its page and row by a shift, so page_size must be one of {PAGE_SIZES} "
             f"(a power-of-two count of {geometry.block_size}-token compressed rows per page); got page_size={page_size}"
         )
+    grid = _support.extend_rows_grid_reason(geometry, form, batch_size, q_len_per_req)
+    if grid is not None:
+        raise NotImplementedError(f"{_PKG} ({form}): {grid}")
     if kv_cache_dtype is not None and kv_cache_dtype not in (torch.bfloat16,):
         raise NotImplementedError(
             f"{_PKG} ({form}): kv_cache_dtype={kv_cache_dtype}: the in-block indexer's steps over the pools serve bf16 pools; the e4m3 pool "
@@ -1025,7 +1036,8 @@ def prepare(
         )
     if extend:
         # the EXTEND step's own light gates: the decode scorer's query-row envelope does not apply (any chunk up to the table's reach,
-        # checked below once the table's width is known); the ring floor is cap >= 3 (checked on the sample below)
+        # checked below once the table's width is known, within ONE run's launch-grid bound of 65,535 rows at this pin, checked here); the
+        # ring floor is cap >= 3 (checked on the sample below)
         _light_extend_gates(
             geometry,
             form,
@@ -1034,6 +1046,8 @@ def prepare(
             use_pdl,
             fuse_prepare,
             sparse_tile_form,
+            batch_size=batch_size,
+            q_len_per_req=q,
         )
     else:
         _light_decode_gates(
@@ -1463,6 +1477,8 @@ def workspace_size(
             None,
             fuse_prepare,
             sparse_tile_form,
+            batch_size=batch_size,
+            q_len_per_req=q,
         )
         _check_extend_chunk_rows(form, q, int(max_pages), page_size)
     else:

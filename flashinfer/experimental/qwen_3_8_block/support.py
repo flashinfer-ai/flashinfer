@@ -14,7 +14,9 @@ ONE geometry gate, :meth:`Qwen38BlockGeometry.unsupported_reason`, serves both c
 :func:`require_served`) -- so a geometry the probe advertises is one the forms' declaration admits, and a geometry it declines is
 a typed ``NotImplementedError`` at plan time before any vendored declaration is built (the geometry gate itself runs before any
 vendored import; the projection-route gate after it, :func:`proj_route_reason`, asks the vendored tile rule's host arithmetic and
-declines the TP 2 / TP 4 shards).
+declines the TP 2 / TP 4 shards).  One FlashInfer-side rows bound remains on the ``extend`` / ``prefill`` forms at this pin -- the
+launch-grid bound of ONE run, :data:`EXTEND_ROWS_GRID_MAX` rows (:func:`extend_rows_grid_reason`): the vendored indexer's query compress
+launches with the run's row count as a CUDA grid dimension, so a longer run is declined typed before any vendored code.
 """
 
 from __future__ import annotations
@@ -93,9 +95,21 @@ INDEX_COMPRESS_ROUNDING_DEFAULT = "single"
 #: the validated decode capture envelope: the band slab GEMM runs the small-M route's 128-row swap-AB tile at ``batch x q_len <= 128``
 #: rows -- the vendored ``kernels/proj_gemm.SMALL_M_MAX`` (re-read by the tripwire).  Past 128 rows the slab takes the GEMM engine's own
 #: baseline tile for its shape on the SAME JIT-only route since the 6b21be0e0 pin (the projection driver's large-M rule, re-read by the
-#: tripwire too: ``band_slab_jit_tile_past_small_m``), so no FlashInfer-side rows bound exists on any form -- the ``extend`` / ``prefill``
-#: forms take any ``batch x T`` the vendored block serves (the previous pin's ``EXTEND_ROWS_MAX`` / ``extend_proj_slab_rows`` row is retired).
+#: tripwire too: ``band_slab_jit_tile_past_small_m``), so no FlashInfer-side PROJECTION rows bound exists on any form -- the ``extend`` /
+#: ``prefill`` forms take any ``batch x T`` the vendored block serves up to the launch-grid bound below (the previous pin's
+#: ``EXTEND_ROWS_MAX`` / ``extend_proj_slab_rows`` row is retired).
 DECODE_CAPTURE_ROWS_MAX = 128
+#: the FlashInfer-side bound of ONE ``extend`` / ``prefill`` run's rows (``batch_size x q_len_per_req``) at this pin: the vendored indexer's
+#: query compress (the EXTEND step's execute in ``gated_attention_block/api.py`` -> ``kernels/qsa_compress.run_qsa_compress`` over the
+#: ``[rows, index_heads, index_head_dim]`` view of the band) launches with the run's ROW COUNT as the grid's y dimension (one grid row per
+#: query token, the heads along x), and CUDA caps a grid's y at 65,535 -- a run of more rows would pass every other gate and fail at launch.
+#: Not a projection fact (the band slab names a tile at every row count) and not an envelope row (never among :data:`DECLINE_KEYS`, which
+#: the tripwire reads off the envelope): the compressor's grid is flattened in cuDNN Frontend first, then a re-vendor lifts this bound.
+#: The remedy is the chunk form's own -- several uniform chunks of at most this many rows per run, or a smaller batch.
+EXTEND_ROWS_GRID_MAX = 65535
+#: the FlashInfer-side decline row of that bound: published under the ``extend`` / ``prefill`` records' ``declines`` beside the vendored
+#: rows (:func:`extend_rows_grid_text`); ``api.prepare`` raises it typed, with the run's numbers, before any vendored code
+EXTEND_GRID_ROWS_KEY = "indexer_extend_grid_rows"
 #: the FlashInfer-side decline (not an envelope row): a tensor-parallel shard whose dense projection is off the capture-safe
 #: small-M route of the vendored projection GEMM on the device (the probe lists it under this key; ``prepare`` raises it typed)
 PROJ_SLAB_ROUTE_KEY = "proj_slab_route"
@@ -246,6 +260,44 @@ def proj_route_reason(
                 "at TP 1, or keep the serving stack's own attention for the shard"
             )
     return None
+
+
+def extend_rows_grid_text() -> str:
+    """The probe's text of the :data:`EXTEND_GRID_ROWS_KEY` row (no batch, no chunk): the bound and the remedy."""
+    return (
+        f"one extend / prefill run holds at most {EXTEND_ROWS_GRID_MAX} rows (batch_size x q_len_per_req) at this pin: the vendored "
+        "indexer's query compress launches with the run's row count as a CUDA grid dimension, which CUDA caps at "
+        f"{EXTEND_ROWS_GRID_MAX} -- run a longer chunk as several uniform chunks of at most that many rows per run (runs grouped by "
+        "their length), or a smaller batch"
+    )
+
+
+def extend_rows_grid_reason(
+    geometry, form: str, batch_size: int, q_len_per_req: int
+) -> Optional[str]:
+    """Why one ``form`` run of ``batch_size x q_len_per_req`` rows is past the compressor's launch-grid bound at this pin, or None.
+
+    The vendored indexer's query compress launches a run with its row count as the grid's y dimension (one grid row per query token, the
+    geometry's ``index_heads`` along x), which CUDA caps at :data:`EXTEND_ROWS_GRID_MAX` = 65,535 -- so a run of more rows would pass every
+    other gate and fail at launch.  The text names the bound, the rows and the remedy (several uniform chunks of at most that many rows
+    per run at this batch, or a smaller batch).  Device-free and free of vendored imports: a light gate (``api.prepare`` raises it typed
+    before any vendored code; the probe publishes the row's generic text, :func:`extend_rows_grid_text`)."""
+    rows = int(batch_size) * int(q_len_per_req)
+    if rows <= EXTEND_ROWS_GRID_MAX:
+        return None
+    per_seq = EXTEND_ROWS_GRID_MAX // int(batch_size)
+    return (
+        f"batch_size={batch_size} x q_len_per_req={q_len_per_req} = {rows} rows in one {form} run exceed {EXTEND_ROWS_GRID_MAX} (the "
+        f"{EXTEND_GRID_ROWS_KEY} row: at this pin the vendored indexer's query compress launches with the run's row count as a CUDA grid "
+        f"dimension -- one grid row per query token, the {int(geometry.index_heads)} indexer heads along the other --, which CUDA caps at "
+        f"{EXTEND_ROWS_GRID_MAX}) -- run it as several uniform chunks of at most {EXTEND_ROWS_GRID_MAX} rows per run "
+        + (
+            f"(q_len_per_req <= {per_seq} at this batch)"
+            if per_seq >= 1
+            else "(this batch alone exceeds the bound)"
+        )
+        + ", or a smaller batch"
+    )
 
 
 @dataclass(frozen=True)
@@ -535,6 +587,10 @@ class Qwen38BlockSupport:
     index_extend_ring_rows_min: int = 0
     index_extend_select_budget_bytes: int = 0
     index_compress_roundings: Tuple[str, ...] = ()
+    # appended (this pin's one FlashInfer-side rows bound): the rows ONE extend / prefill run may hold (``batch_size x q_len_per_req``) --
+    # the vendored indexer's query compress launches with the run's row count as a CUDA grid dimension (``EXTEND_ROWS_GRID_MAX``; the
+    # ``indexer_extend_grid_rows`` row of the extend / prefill records); lifted by a re-vendor once the compressor's grid is flattened
+    extend_rows_grid_max: int = EXTEND_ROWS_GRID_MAX
 
     def form(self, name: str) -> Qwen38BlockFormSupport:
         if name not in ALL_FORMS:
@@ -680,9 +736,13 @@ def qwen_3_8_block_support(
             "decode", bool(table["served"]), table["reason"], table["declines"]
         )
     # the extend / prefill forms are the SAME vendored declaration form (the EXTEND step of the in-block indexer over the pools): served
-    # iff the decode envelope is, with the ONE decline table (the five indexer_extend_* rows among its keys); no FlashInfer-side rows
-    # bound since the 6b21be0e0 pin (the band slab rides the JIT-only route at every row count: the tripwire re-reads the rule)
+    # iff the decode envelope is, with its decline table (the five indexer_extend_* rows among its keys) plus ONE FlashInfer-side row where
+    # the tree was read -- the launch-grid bound of one run at this pin (EXTEND_GRID_ROWS_KEY: 65,535 rows; a per-run fact, never the
+    # verdict).  No projection rows bound since the 6b21be0e0 pin (the band slab rides the JIT-only route at every row count: the tripwire
+    # re-reads the rule)
     extend_declines = dict(decode.declines)
+    if "index_sources" in table:
+        extend_declines[EXTEND_GRID_ROWS_KEY] = extend_rows_grid_text()
     prefill = Qwen38BlockFormSupport(
         "prefill", decode.served, decode.reason, extend_declines
     )

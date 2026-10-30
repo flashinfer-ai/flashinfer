@@ -22,7 +22,9 @@ PAST 128 ROWS (the cuDNN Frontend 6b21be0e0 re-vendor: the indexer band's slab t
 JIT-only route, so the 128-row bound of the previous pin is retired): the ladder's ``T 512`` prefill chunk, ``T 2048`` prefill chunk (the
 real prefill chunk), ``T 512`` behind a 2048-token prefix, batch 4 x ``T 512`` with a dead entry, the e4m3 cache at ``T 512`` -- each
 against the same two-stage oracle, the cache rows bitwise, two runs bitwise, the slab stage's tile the large-M rule's name and both
-projections capture-safe; capture after one warm-up at ``T 512``; the launch census at ``T 512``."""
+projections capture-safe; capture after one warm-up at ``T 512``; the launch census at ``T 512``.  ONE run holds at most 65,535 rows at
+this pin (the vendored indexer's query compress launches with the run's row count as a CUDA grid dimension): batch 32 x ``T 2048`` is the
+typed decline through the public entry -- at ``prepare`` and at the workspace query, on both forms -- before any vendored code (host only)."""
 
 import pytest
 import torch
@@ -544,8 +546,9 @@ def test_plan_time_declines_are_typed_and_named(monkeypatch):
     """The extend / prefill forms' typed declines at plan time: the light gates BEFORE any vendored code (a page off the powers of two, the
     e4m3 pool, the body vocabulary, the chunk bound), then the vendored rows raised with the envelope's own text
     (``indexer_extend_ring_slots`` / ``indexer_extend_rope_tables_only`` / ``indexer_extend_fuse_prepare`` on an explicit flag; the ring
-    floor ``cap >= 3`` -- a cap-2 ring --; ``use_pdl=True`` under the indexer).  No rows bound since the 6b21be0e0 pin: 129 rows at batch 1
-    and 130 at batch 2 pass the light gates, and the vendored resolver names the large-M tile for the band slab there."""
+    floor ``cap >= 3`` -- a cap-2 ring --; ``use_pdl=True`` under the indexer).  No projection rows bound since the 6b21be0e0 pin: 129 rows at
+    batch 1 and 130 at batch 2 pass the light gates, and the vendored resolver names the large-M tile for the band slab there (the
+    launch-grid bound of one run is the next cell's)."""
     from flashinfer.experimental.qwen_3_8_block import api as impl
     from flashinfer.qwen_3_8_block import qwen_3_8_block_support
 
@@ -599,8 +602,8 @@ def test_plan_time_declines_are_typed_and_named(monkeypatch):
 
     for form in ("extend", "prefill"):
         impl._light_extend_gates(
-            g, form, 16, None, None, None, "auto"
-        )  # no rows argument, no rows bound
+            g, form, 16, None, None, None, "auto", batch_size=1, q_len_per_req=130
+        )  # no projection rows bound (the launch-grid bound of one run: the next cell)
         for rows in (129, 130, 512, 2048):
             assert (
                 large_m_tile_config(rows, g.n_qkvg, g.d_model, dtype=torch.bfloat16)
@@ -614,6 +617,65 @@ def test_plan_time_declines_are_typed_and_named(monkeypatch):
             _plan(case, g, form, sparse_tile_form="fast")
         with pytest.raises(TypeError, match="ring_slots must be None"):
             _plan(case, g, form, ring_slots=1)
+
+
+def test_plan_time_decline_past_the_launch_grid_bound_is_typed_before_any_vendored_code(
+    monkeypatch,
+):
+    """ONE extend / prefill run holds at most ``EXTEND_ROWS_GRID_MAX`` = 65,535 rows at this pin (the vendored indexer's query compress
+    launches with the run's row count as a CUDA grid dimension): batch 32 x ``T`` 2048 = 65,536 rows is the typed ``NotImplementedError``
+    naming the bound, the rows and the remedy through the public entry -- at ``prepare`` and at the workspace query, on both forms -- BEFORE
+    any vendored code (host only: nothing declared, nothing compiled, the block table sample never read); 65,535 rows pass the light gate.
+    The probe publishes the row (``indexer_extend_grid_rows``) on the extend / prefill records only and reports the bound."""
+    from flashinfer.experimental.qwen_3_8_block import api as impl
+    from flashinfer.experimental.qwen_3_8_block import support
+    from flashinfer.qwen_3_8_block import (
+        qwen_3_8_block_support,
+        qwen_3_8_block_workspace_size,
+    )
+
+    g = _geometry()
+    sup = qwen_3_8_block_support(torch.device("cuda", 0), g)
+    grid = support.EXTEND_GRID_ROWS_KEY
+    assert sup.extend_rows_grid_max == support.EXTEND_ROWS_GRID_MAX == 65535
+    assert grid in sup.extend.declines and grid in sup.prefill.declines
+    assert grid not in sup.decode.declines and "65535" in sup.extend.declines[grid]
+    monkeypatch.setattr(
+        impl,
+        "_frost_block",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("the vendored tree was reached past the launch-grid bound")
+        ),
+    )
+    case = Qsa38ExtendCase(g, (300,), 16, page_size=16, seed=143, cap=4)
+    for form in ("extend", "prefill"):
+        with pytest.raises(NotImplementedError, match="65535") as info:
+            _plan(case, g, form, batch_size=32, q_len_per_req=2048)
+        msg = str(info.value)
+        assert msg.startswith(f"qwen_3_8_block ({form}):"), msg
+        assert (
+            "= 65536 rows" in msg
+            and "several uniform chunks" in msg
+            and "smaller batch" in msg
+        ), msg
+        with pytest.raises(NotImplementedError, match="65535") as info:
+            qwen_3_8_block_workspace_size(
+                form,
+                geometry=g,
+                device="cuda",
+                page_size=16,
+                batch_size=32,
+                q_len_per_req=2048,
+                max_pages=128,
+            )
+        assert str(info.value).startswith(f"qwen_3_8_block ({form}):"), str(info.value)
+        # the bound met with equality passes the light gate on both axes (the chunk bound against the table's reach speaks later)
+        impl._light_extend_gates(
+            g, form, 16, None, None, None, "auto", batch_size=1, q_len_per_req=65535
+        )
+        impl._light_extend_gates(
+            g, form, 16, None, None, None, "auto", batch_size=65535, q_len_per_req=1
+        )
 
 
 def test_run_time_declines_are_typed_and_named():
