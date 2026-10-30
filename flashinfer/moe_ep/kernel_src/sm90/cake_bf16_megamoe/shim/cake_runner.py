@@ -79,6 +79,7 @@ __all__ = [
     "PER_ROUTE_PUBLISH_PDL_ENV",
     "PREFIX_FORM_ENV",
     "FUSED_DISPATCH_MAX_TOKENS_ENV",
+    "GRID_DISPATCH_MIN_TOKENS_DEFAULTS",
     "GRID_DISPATCH_MIN_TOKENS_ENV",
     "PUBLISH_FORM_ENV",
     "Sm90CakeBf16MoERunner",
@@ -110,11 +111,15 @@ FUSED_DISPATCH_MAX_ROUTES_LIMIT = 4096
 # co-resident blocks (count + reserve + store_publish, plus the round opening
 # and the receiver prefix at the fused_begin level) vs. the vendored kernels.
 # Rounds with T >= the bound (runner ``grid_dispatch_min_tokens`` or this
-# environment variable; default GRID_DISPATCH_MIN_TOKENS, the rounds above the
-# default fused-dispatch bound) take it, ahead of the fused small-T path; 0
-# disables it.  Bit-identical outputs; interoperates with peers on any setting.
+# environment variable; default GRID_DISPATCH_MIN_TOKENS_DEFAULTS for the EP size,
+# else GRID_DISPATCH_MIN_TOKENS, the rounds above the default fused-dispatch bound)
+# take it, ahead of the fused small-T path; 0 disables it.  Bit-identical outputs;
+# interoperates with peers on any setting.
 GRID_DISPATCH_MIN_TOKENS_ENV = "FLASHINFER_SM90_CAKE_BF16_GRID_DISPATCH_MIN_TOKENS"
 GRID_DISPATCH_MIN_TOKENS = FUSED_DISPATCH_MAX_TOKENS + 1
+# EP size -> default bound where the grid dispatch was measured faster than the
+# fused small-T path at that round size on H100 (EP 8: rounds of 512 local tokens).
+GRID_DISPATCH_MIN_TOKENS_DEFAULTS: dict[int, int] = {8: 512}
 _GRID_DISPATCH_MAX_SMEM_INTS = (
     12 * 1024
 )  # 2 * E * ep + 1 + 2 * ep ints of dynamic smem (48 KB)
@@ -269,9 +274,11 @@ def _fused_dispatch_max_tokens_default() -> int:
     return FUSED_DISPATCH_MAX_TOKENS if raw is None else int(raw.strip())
 
 
-def _grid_dispatch_min_tokens_default() -> int:
+def _grid_dispatch_min_tokens_default(ep: int) -> int:
     raw = os.environ.get(GRID_DISPATCH_MIN_TOKENS_ENV)
-    return GRID_DISPATCH_MIN_TOKENS if raw is None else int(raw.strip())
+    if raw is not None:
+        return int(raw.strip())
+    return GRID_DISPATCH_MIN_TOKENS_DEFAULTS.get(ep, GRID_DISPATCH_MIN_TOKENS)
 
 
 def _pdl_mask(value: bool | int | str) -> int:
@@ -585,7 +592,7 @@ class Sm90CakeBf16MoERunner:
             )
         self._fused_dispatch_max_tokens = max_tokens
         grid_min = (
-            _grid_dispatch_min_tokens_default()
+            _grid_dispatch_min_tokens_default(pipe.ep)
             if grid_dispatch_min_tokens is None
             else int(grid_dispatch_min_tokens)
         )
