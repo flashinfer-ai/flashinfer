@@ -1,16 +1,35 @@
 # Copyright (c) 2026 by FlashInfer team.
 # SPDX-License-Identifier: Apache-2.0
-"""The adapter: FlashInfer arguments -> the vendored cuDNN Frontend block's DECODE declaration with the in-block indexer; plans,
-workspaces and the decode form's run.
+"""The adapter: FlashInfer arguments -> the vendored cuDNN Frontend block's declaration with the in-block indexer over the pools
+(the DECODE step, or the EXTEND step behind the ``extend`` / ``prefill`` forms); plans, workspaces and the forms' run.
 
-A :class:`Qwen38BlockPlan` is one compiled declaration of the vendored ``GatedAttentionBlockFwd`` for one shape bucket (the batch,
-the query rows per sequence, the page size and the pools' layout, the block table's row stride, the side caches' FORM -- the
+A :class:`Qwen38BlockPlan` is one compiled declaration of the vendored ``GatedAttentionBlockFwd`` for one shape bucket (the form, the
+batch, the query rows per sequence, the page size and the pools' layout, the block table's row stride, the side caches' FORM -- the
 compressed-key cache's rows per page, the ring's capacity --, the input-contract flags, the knobs); ``prepare`` builds it outside
-CUDA-graph capture (it JIT-compiles the kernels and sizes the workspace), ``run`` launches it -- the FIRST ``run`` after ``prepare``
-may already be captured (no plan constant, no allocation, no host read on the execute path).  The functional entry point keeps a
-small LRU of plans keyed on exactly the facts a plan compiles in (the Qwen 3.5 package's rules: a plan a CUDA graph was captured
-over outlives its eviction and is released by ``clear_plan_cache`` only).  The vendored tree is the Qwen 3.5 package's
-(``..qwen_3_5_block._cudnn_frost``) and so are the cache roots (``configure_vendored_tree``) and the operand helpers.
+CUDA-graph capture (it JIT-compiles the kernels and sizes the workspace), ``run`` launches it -- on the DECODE form the FIRST ``run``
+after ``prepare`` may already be captured (no plan constant, no allocation, no host read on the execute path); on the EXTEND forms a
+capture takes the run AFTER one eager warm-up on the capture stream (the first run uploads the select window plan's constants and, past
+128 rows, creates the band GEMM's graph-route handle).  The functional entry point keeps a small LRU of plans keyed on exactly the facts
+a plan compiles in (the Qwen 3.5 package's rules: a plan a CUDA graph was captured over outlives its eviction and is released by
+``clear_plan_cache`` only).  The vendored tree is the Qwen 3.5 package's (``..qwen_3_5_block._cudnn_frost``) and so are the cache roots
+(``configure_vendored_tree``) and the operand helpers.
+
+The EXTEND step (``form="extend"`` / ``"prefill"``; the 4c8e24355 pin): a UNIFORM ``[batch, T]`` chunk of every sequence behind a cached
+prefix of ``P = seq_lens[b] - T`` tokens (``prefill`` = the same vendored form run at ``P = 0`` for every live sequence -- one form, two
+names); the block selects for the chunk's rows over the prefix's compressed keys plus the chunk's own complete blocks and WRITES the
+serving caches: the chunk's K / V rows into the pools, its complete 4-token blocks into the paged compressed-key cache and its last
+``cap`` raw keys into the ring (so a decode step reads what a chunk wrote, under ONE rounding convention,
+``Qwen38BlockGeometry.index_compress_rounding``).  The vendored declaration is pinned ``index_select_form="extend"`` (its ``"auto"`` rule
+would build the DECODE step for a chunk of up to 16 rows and apply the decode ring rule ``cap >= T + 3``, which vLLM's cap 4 fails
+at ``T`` 2 .. 16), and the form REQUIRES the stack's ring slots (``ring_slots=True``: ``run(index_state_slot_mapping=)`` names the ring
+rows of the sequence's last ``cap`` tokens, ``-1`` elsewhere) and the per-token tables (``rope_position_tables_only=False``: ``rope_cos`` /
+``rope_sin`` at ``run``); ``None`` on those two flags reads the form's default.  The ring floor is ``cap >= 3`` (vLLM's 4 satisfies it)
+and a run binds a ring of exactly the planned cap (the cache-write ring arm compiled it in).  Contracts the host cannot verify (device
+values; stated in the README): ``seq_lens[b] in {0} u [T, max_pages x page_size]`` -- ``0`` a dead / padding sequence (exact: ``out`` 0,
+nothing written), a shorter live sequence reported ``-2`` and one past the table's reach ``-3`` in the plan's workspace, never raised;
+the ring INPUT contract (positions ``4 floor(P / 4) .. P - 1`` already in the ring: the stack's rule or the block's own previous chunk /
+step); mixed steps (decodes + prefills) = one decode plan and one extend plan per layer, run back to back; ragged chunks = several
+runs grouped by ``T``.
 
 The sparse core's BODY knob (``sparse_tile_form``, appended with the 7301fad21 pin; performance-only): ``"auto"`` (the default) lets
 the vendored tree pick the body -- on cc 10.7 the LEAN decode tile at ``batch x H_kv <= 4`` CTAs per chunk (the bound's unit since the
@@ -44,8 +63,12 @@ from ..qwen_3_5_block.api import (
 from . import support as _support
 from .support import (
     DECODE_CAPTURE_ROWS_MAX,
+    EXTEND_FORMS,
     FORMS,
+    INDEX_EXTEND_RING_ROWS_MIN,
     INDEX_QUERY_ROWS_MAX,
+    INDEX_SELECT_FORM_AUTO,
+    INDEX_SELECT_FORM_EXTEND,
     INDEX_STATE_ROWS_EXTRA,
     PAGE_SIZE_ALIGN,
     PAGE_SIZES,
@@ -204,14 +227,23 @@ def _check_index_kv_cache(
 
 
 def _check_index_state_cache(
-    x, q_len: int, geometry: Qwen38BlockGeometry, dtype, device, *, ring_slots: bool
+    x,
+    q_len: int,
+    geometry: Qwen38BlockGeometry,
+    dtype,
+    device,
+    *,
+    ring_slots: bool,
+    extend: bool = False,
 ) -> torch.Tensor:
-    """The raw-key ring ``[num_ring_blocks >= 1, cap, 1, index_head_dim]`` with ``cap >= q_len + 3`` (a completing block pools the three
-    positions below the step while the step writes ``q_len`` rows), the plan's dtype and device, a 16-byte base; its blocks contiguous
-    under the ring-slots arm (the stack's flat slots ``block x cap + pos % cap`` address it so)."""
+    """The raw-key ring ``[num_ring_blocks >= 1, cap, 1, index_head_dim]`` with the ring rule PER FORM -- ``cap >= q_len + 3`` on the decode
+    step (a completing block pools the three positions below the step while the step writes ``q_len`` rows), ``cap >= 3`` on the EXTEND
+    step (``extend``, appended: the chunk compress reads at most the three positions below the chunk, the tail write lands after it) --,
+    the plan's dtype and device, a 16-byte base; its blocks contiguous under the ring-slots arm (the stack's flat slots ``block x cap +
+    pos % cap`` address it so)."""
     x = _tensor(x, "index_state_cache")
     _on(x, device, "index_state_cache")
-    need = q_len + INDEX_STATE_ROWS_EXTRA
+    need = INDEX_EXTEND_RING_ROWS_MIN if extend else q_len + INDEX_STATE_ROWS_EXTRA
     if (
         x.dim() != 4
         or int(x.shape[0]) < 1
@@ -223,6 +255,13 @@ def _check_index_state_cache(
             f"block of a padded entry), got {tuple(x.shape)}"
         )
     if int(x.shape[1]) < need:
+        if extend:
+            raise ValueError(
+                f"{_PKG}: index_state_cache holds cap={int(x.shape[1])} rows per block; the EXTEND step needs at least block_size - 1 = {need} ring "
+                f"rows per block (the chunk compress reads the straddling block's up to {need} positions below the chunk; the decode rule "
+                f"cap >= q_len_per_req + {INDEX_STATE_ROWS_EXTRA} does not apply) -- the vendored indexer_extend_ring_rows row; a serving stack's ring of "
+                f"one {geometry.block_size}-token group satisfies it"
+            )
         raise ValueError(
             f"{_PKG}: index_state_cache holds cap={int(x.shape[1])} rows per block; the raw-key ring needs at least q_len_per_req + "
             f"{INDEX_STATE_ROWS_EXTRA} = {need} rows per block (a completing block pools the {INDEX_STATE_ROWS_EXTRA} positions below the step while "
@@ -296,6 +335,30 @@ def _check_position_tables(
         _check_aligned(t, name)
         out.append(t)
     return out[0], out[1]
+
+
+def _resolve_contract_flags(
+    form: str, rope_position_tables_only, ring_slots
+) -> Tuple[bool, bool]:
+    """The two input-contract flags per form: ``None`` = the form's default -- the DECODE form's position-table arm (``True``) and derived
+    ring rows (``False``); the EXTEND forms (``extend`` / ``prefill``) REQUIRE the per-token tables (``False``) and the stack's ring slots
+    (``True``), so ``None`` reads those.  An explicit value is kept: on the extend forms an explicit ``True`` / ``False`` reaches the vendored
+    declaration, which declines it by name (``indexer_extend_rope_tables_only`` / ``indexer_extend_ring_slots``) -- one spelling, never
+    re-worded here.  Any other type is a ``TypeError``."""
+    extend = form in EXTEND_FORMS
+    if rope_position_tables_only is None:
+        rope_position_tables_only = not extend
+    if ring_slots is None:
+        ring_slots = extend
+    for nm, val in (
+        ("rope_position_tables_only", rope_position_tables_only),
+        ("ring_slots", ring_slots),
+    ):
+        if not isinstance(val, bool):
+            raise TypeError(
+                f"{_PKG}: {nm} must be None (the form's default) or a bool, got {type(val).__name__}"
+            )
+    return rope_position_tables_only, ring_slots
 
 
 # --------------------------------------------------------------------------- the paged KV cache: FlashInfer layouts + the unified row -> the block's views
@@ -396,8 +459,9 @@ def _page_size_of(kv_cache: KvCache, kv_layout: str, geometry) -> int:
 
 @dataclass(eq=False)
 class Qwen38BlockPlan:
-    """One compiled declaration of the block for one decode shape bucket; see the module docstring.  Built by :func:`prepare`.
-    The Qwen 3.5 plan's fields first, the decode indexer's appended."""
+    """One compiled declaration of the block for one shape bucket (a decode step, or a uniform chunk on the ``extend`` / ``prefill``
+    forms); see the module docstring.  Built by :func:`prepare`.  The Qwen 3.5 plan's fields first, the decode indexer's appended, then
+    the EXTEND step's."""
 
     form: str
     geometry: Qwen38BlockGeometry
@@ -438,6 +502,14 @@ class Qwen38BlockPlan:
     # kernel_template (support.SPARSE_TILE_LEAN / SPARSE_TILE_TCGEN05), pinned by the vendored block against the kernel that compiled
     sparse_tile_form: Optional[str] = None
     sparse_tile: Optional[str] = None
+    # appended (the EXTEND step; the 4c8e24355 pin): the vendored step-form knob this plan declared ("extend" on the extend / prefill forms,
+    # "auto" on decode), the indexer writers' rounding convention (the geometry's), whether a run must bind a ring of EXACTLY `ring_cap` rows
+    # (the extend forms: the cache-write ring arm compiled the declared cap in) and whether a CUDA-graph capture needs one eager warm-up on
+    # the capture stream first (the extend forms: the first run uploads the select window plan's constants)
+    index_select_form: str = INDEX_SELECT_FORM_AUTO
+    index_compress_rounding: str = "single"
+    ring_cap_exact: bool = False
+    capture_warm_up_required: bool = False
 
     @property
     def num_tokens(self) -> int:
@@ -542,7 +614,8 @@ class Qwen38BlockPlan:
         bound: Dict[str, Any] = {}
         if query_start_loc is not None or num_actual_tokens is not None:
             raise ValueError(
-                f"{_PKG}: the decode form takes no query_start_loc / num_actual_tokens (a uniform [batch, {s}] step)"
+                f"{_PKG}: the {self.form} form takes no query_start_loc / num_actual_tokens (a uniform [batch, {s}] "
+                f"{'chunk: ragged chunks are several runs grouped by their length' if self.form in EXTEND_FORMS else 'step'})"
             )
         if k_scale is not None or v_scale is not None:
             raise ValueError(
@@ -598,8 +671,21 @@ class Qwen38BlockPlan:
             )
         if index_state_cache is not None:
             bound["index_state_cache"] = _check_index_state_cache(
-                index_state_cache, s, g, dt, dev, ring_slots=self.ring_slots
+                index_state_cache,
+                s,
+                g,
+                dt,
+                dev,
+                ring_slots=self.ring_slots,
+                extend=self.form in EXTEND_FORMS,
             )
+            cap = int(bound["index_state_cache"].shape[1])
+            if self.ring_cap_exact and cap != self.ring_cap:
+                raise ValueError(
+                    f"{_PKG}: index_state_cache holds cap={cap} rows per ring block, but this {self.form} plan was prepared on a ring of cap="
+                    f"{self.ring_cap}: the extend step's cache-write ring arm compiled the planned cap in, so a run binds a ring of exactly that "
+                    "capacity (the decode form binds any ring meeting its rule) -- prepare the plan on the ring the runs will bind"
+                )
         if index_state_block_table is not None:
             bound["index_state_block_table"] = _check_index_state_block_table(
                 index_state_block_table, b, dev
@@ -673,9 +759,11 @@ class Qwen38BlockPlan:
         block_lens_out: Optional[torch.Tensor] = None,
         position_tables: Optional[PositionTables] = None,
     ) -> torch.Tensor:
-        """Launch the plan on the current CUDA stream (capturable from the FIRST run; see the README's capture rules).  Returns ``out``.
-        ``position_tables`` binds that ``(cos_pos, sin_pos)`` pair for THIS run (checked against the plan: the form, the reach, the
-        dtype, the device); ``None`` binds the pair the plan was prepared with."""
+        """Launch the plan on the current CUDA stream (the decode form capturable from the FIRST run; the extend / prefill forms after ONE
+        eager warm-up on the capture stream -- see the README's capture rules).  Returns ``out``.  ``position_tables`` binds that
+        ``(cos_pos, sin_pos)`` pair for THIS run (checked against the plan: the form, the reach, the dtype, the device); ``None`` binds the
+        pair the plan was prepared with.  On the extend / prefill forms ``seq_lens`` are the lengths AFTER the chunk, ``rope_cos`` /
+        ``rope_sin`` and ``index_state_slot_mapping`` are required (the form's contract) and the ring's cap must equal the plan's."""
         g, dev, dt = self.geometry, self.device, self.dtype
         if not self._captured and _capturing():
             self._captured = True  # a graph bakes this plan's workspace: the plan LRU must not free it at eviction
@@ -780,6 +868,68 @@ def _light_decode_gates(
         )
 
 
+def _light_extend_gates(
+    geometry: Qwen38BlockGeometry,
+    form: str,
+    page_size: int,
+    batch_size: int,
+    q_len: int,
+    kv_cache_dtype,
+    use_pdl,
+    fuse_prepare,
+    sparse_tile_form: str = SPARSE_TILE_FORM_AUTO,
+) -> None:
+    """The extend / prefill forms' typed declines that need no vendored code: the page sizes the paged indexer addresses (both steps read
+    the compressed-key cache by a shift), the FlashInfer-side rows bound of one run (``batch_size x q_len_per_req <= EXTEND_ROWS_MAX``: the
+    band slab's JIT-only projection route at this pin -- past it the slab takes the cuDNN graph route the vendored tree does not carry),
+    the e4m3 pool (the vendored ``indexer_e4m3_pool`` row applies to both steps), the types of ``use_pdl`` / ``fuse_prepare`` (an explicit
+    ``fuse_prepare=True`` reaches the vendored declaration, which declines it by name: ``indexer_extend_fuse_prepare``), the sparse core's
+    body vocabulary.  The decode scorer's query-row envelope (``INDEX_QUERY_ROWS_MAX``) is the DECODE form's row and does not apply: the
+    EXTEND step serves any ``q_len_per_req`` up to the block table's reach (checked in :func:`prepare` once the table's width is known) and
+    the rows bound.  The vendored declaration repeats every envelope row with its own text."""
+    if page_size not in PAGE_SIZES:
+        raise NotImplementedError(
+            f"{_PKG} ({form}): the paged indexer splits a block id into its page and row by a shift, so page_size must be one of {PAGE_SIZES} "
+            f"(a power-of-two count of {geometry.block_size}-token compressed rows per page); got page_size={page_size}"
+        )
+    rows = _support.extend_rows_reason(geometry, form, batch_size, q_len)
+    if rows is not None:
+        raise NotImplementedError(f"{_PKG} ({rows}")
+    if kv_cache_dtype is not None and kv_cache_dtype not in (torch.bfloat16,):
+        raise NotImplementedError(
+            f"{_PKG} ({form}): kv_cache_dtype={kv_cache_dtype}: the in-block indexer's steps over the pools serve bf16 pools; the e4m3 pool "
+            "waits for the sparse core's in-kernel dequant arm (a later cuDNN Frontend PR) -- declare kv_cache_dtype=None"
+        )
+    if use_pdl is not None and not isinstance(use_pdl, bool):
+        raise TypeError(
+            f"{_PKG}: use_pdl must be None (the vendored default) or a bool, got {type(use_pdl).__name__}"
+        )
+    if fuse_prepare is not None and not isinstance(fuse_prepare, bool):
+        raise TypeError(
+            f"{_PKG}: fuse_prepare must be None (the vendored default) or a bool, got {type(fuse_prepare).__name__}"
+        )
+    if (
+        not isinstance(sparse_tile_form, str)
+        or sparse_tile_form not in SPARSE_TILE_FORMS
+    ):
+        raise ValueError(
+            f"{_PKG}: sparse_tile_form must be one of {SPARSE_TILE_FORMS} ('auto' = the vendored placement rule: the lean decode tile on cc 10.7 "
+            f"at batch x H_kv <= 4 CTAs per chunk where the body admits the step, the tcgen05 core elsewhere; 'lean' / 'tcgen05' explicit), got {sparse_tile_form!r}"
+        )
+
+
+def _check_extend_chunk_rows(form: str, q_len: int, pages: int, page_size: int) -> None:
+    """The EXTEND step's chunk bound: ``q_len_per_req <= max_pages x page_size`` (a chunk longer than the table's reach has rows no sequence
+    of the declared table can hold; the vendored ``indexer_extend_chunk_rows`` row, a ``ValueError`` as there, naming both numbers)."""
+    reach = int(pages) * int(page_size)
+    if int(q_len) > reach:
+        raise ValueError(
+            f"{_PKG} ({form}): q_len_per_req={q_len} rows per sequence exceed the block table's reach max_pages x page_size = {pages} x {page_size} "
+            f"= {reach} tokens (the vendored indexer_extend_chunk_rows row: a chunk longer than the table's reach has rows no sequence of the "
+            "declared table can hold) -- plan with a wider block table or a shorter chunk"
+        )
+
+
 def prepare(
     form: str,
     *,
@@ -803,18 +953,21 @@ def prepare(
     index_state_cache: Optional[torch.Tensor] = None,
     index_state_block_table: Optional[torch.Tensor] = None,
     position_tables: Optional[PositionTables] = None,
-    rope_position_tables_only: bool = True,
-    ring_slots: bool = False,
+    rope_position_tables_only: Optional[bool] = None,
+    ring_slots: Optional[bool] = None,
     fuse_prepare: Optional[bool] = None,
     use_pdl: Optional[bool] = None,
     kv_cache_dtype: Optional[torch.dtype] = None,
     _declaration_overrides: Optional[Dict[str, Any]] = None,
     sparse_tile_form: str = SPARSE_TILE_FORM_AUTO,
 ) -> Qwen38BlockPlan:
-    """Declare, check and compile the block for one decode shape bucket; see :func:`flashinfer.qwen_3_8_block.prepare_qwen_3_8_block_bf16`.
+    """Declare, check and compile the block for one shape bucket of ``form`` (``"decode"``: a step of ``q_len_per_req`` rows; ``"extend"`` /
+    ``"prefill"``: a uniform chunk of ``q_len_per_req`` rows behind a cached prefix -- one vendored form, two names); see
+    :func:`flashinfer.qwen_3_8_block.prepare_qwen_3_8_block_bf16`.
 
-    ``_declaration_overrides`` is a test hook, not part of the API: extra keywords for the vendored declaration; the public entry points
-    never pass it."""
+    ``rope_position_tables_only`` / ``ring_slots`` ``None`` read the form's default (decode: ``True`` / ``False``; extend / prefill: the
+    REQUIRED ``False`` / ``True``).  ``_declaration_overrides`` is a test hook, not part of the API: extra keywords for the vendored
+    declaration; the public entry points never pass it."""
     if form not in _support.ALL_FORMS:
         raise ValueError(
             f"{_PKG}: form must be one of {_support.ALL_FORMS}, got {form!r}"
@@ -848,12 +1001,10 @@ def prepare(
     q = q_len_per_req
     if isinstance(q, bool) or not isinstance(q, int) or q <= 0:
         raise ValueError(f"{_PKG}: q_len_per_req must be a positive int, got {q!r}")
-    for nm, val in (
-        ("rope_position_tables_only", rope_position_tables_only),
-        ("ring_slots", ring_slots),
-    ):
-        if not isinstance(val, bool):
-            raise TypeError(f"{_PKG}: {nm} must be a bool, got {type(val).__name__}")
+    extend = form in EXTEND_FORMS
+    rope_position_tables_only, ring_slots = _resolve_contract_flags(
+        form, rope_position_tables_only, ring_slots
+    )
     if fuse_prepare is not None and not isinstance(fuse_prepare, bool):
         raise TypeError(
             f"{_PKG}: fuse_prepare must be None (the vendored measured default) or a bool, got {type(fuse_prepare).__name__}"
@@ -866,9 +1017,24 @@ def prepare(
         raise ValueError(
             f"{_PKG}: decode_split_kv must be None or an int >= 1, got {decode_split_kv!r}"
         )
-    _light_decode_gates(
-        geometry, page_size, q, kv_cache_dtype, use_pdl, sparse_tile_form
-    )
+    if extend:
+        # the EXTEND step's own light gates: the decode scorer's query-row envelope does not apply (any chunk up to the table's reach,
+        # checked below once the table's width is known); the ring floor is cap >= 3 (checked on the sample below)
+        _light_extend_gates(
+            geometry,
+            form,
+            page_size,
+            batch_size,
+            q,
+            kv_cache_dtype,
+            use_pdl,
+            fuse_prepare,
+            sparse_tile_form,
+        )
+    else:
+        _light_decode_gates(
+            geometry, page_size, q, kv_cache_dtype, use_pdl, sparse_tile_form
+        )
     pool_dtype = dtype if kv_cache_dtype is None else kv_cache_dtype
     _check_weights(weights, w_o, geometry, dtype, dev)
     k, v = kv_views(
@@ -920,18 +1086,39 @@ def prepare(
         raise ValueError(
             f"{_PKG}: max_seq_len must be an int in [1, max_pages * page_size = {pages * page_size}], got {max_seq_len!r}"
         )
+    if extend:
+        _check_extend_chunk_rows(
+            form, q, pages, page_size
+        )  # the chunk bound against the table's reach (the vendored indexer_extend_chunk_rows row)
+        if max_seq_len is not None and q > max_seq_len:
+            raise ValueError(
+                f"{_PKG} ({form}): q_len_per_req={q} rows per sequence exceed max_seq_len={max_seq_len} (the vendored indexer_extend_chunk_rows row: "
+                "the chunk's rows never exceed the declared KV bound) -- raise max_seq_len or shorten the chunk"
+            )
     # the side caches (REQUIRED) and the ring block table (a zeros sample when None: form only)
+    ring_floor = (
+        f"cap >= {INDEX_EXTEND_RING_ROWS_MIN}"
+        if extend
+        else f"cap >= q_len_per_req + {INDEX_STATE_ROWS_EXTRA}"
+    )
     if index_kv_cache is None or index_state_cache is None:
         raise ValueError(
-            f"{_PKG}: the decode form needs index_kv_cache (the paged compressed-key cache [num_pages, page_size / {geometry.block_size}, 1, "
-            f"{geometry.index_head_dim}] on the main block table) and index_state_cache (the raw-key ring [num_ring_blocks, cap >= q_len_per_req + "
-            f"{INDEX_STATE_ROWS_EXTRA}, 1, {geometry.index_head_dim}]) at prepare: their form compiles in"
+            f"{_PKG}: the {form} form needs index_kv_cache (the paged compressed-key cache [num_pages, page_size / {geometry.block_size}, 1, "
+            f"{geometry.index_head_dim}] on the main block table) and index_state_cache (the raw-key ring [num_ring_blocks, {ring_floor}, 1, "
+            f"{geometry.index_head_dim}]) at prepare: their form compiles in"
         )
+    cache_dtype = geometry.resolved_index_cache_dtype
     icache = _check_index_kv_cache(
-        index_kv_cache, num_pages, page_size, geometry, dtype, dev
+        index_kv_cache, num_pages, page_size, geometry, cache_dtype, dev
     )
     ring = _check_index_state_cache(
-        index_state_cache, q, geometry, dtype, dev, ring_slots=ring_slots
+        index_state_cache,
+        q,
+        geometry,
+        dtype,
+        dev,
+        ring_slots=ring_slots,
+        extend=extend,
     )
     if index_state_block_table is not None:
         # the documented sample is [>= batch_size, 1]: a wider stack table's leading rows (the block_table sample's rule above); the
@@ -944,9 +1131,9 @@ def prepare(
         ring_table = torch.zeros(batch_size, 1, dtype=torch.int32, device=dev)
     if position_tables is None:
         raise ValueError(
-            f"{_PKG}: the decode form needs position_tables = (cos_pos, sin_pos) at prepare (qwen_3_8_block_rope_position_tables(cos_sin_cache, "
-            f"num_positions >= max_pages x page_size = {pages * page_size})): the block rotates the completing block's compressed key at the block "
-            "START, up to three positions below the step, which per-token rows do not hold"
+            f"{_PKG}: the {form} form needs position_tables = (cos_pos, sin_pos) at prepare (qwen_3_8_block_rope_position_tables(cos_sin_cache, "
+            f"num_positions >= max_pages x page_size = {pages * page_size})): the block rotates a completed block's compressed key at the block "
+            f"START, up to three positions below the {'chunk' if extend else 'step'}, which per-token rows do not hold"
         )
     cos_pos, sin_pos = _check_position_tables(
         position_tables, geometry, pages * page_size, dtype, dev
@@ -997,19 +1184,26 @@ def prepare(
         index_state_slot_mapping_present=ring_slots,
         rope_position_tables_only=rope_position_tables_only,
         sparse_tile_form=sparse_tile_form,
+        # the step form of the indexer over the pools: PINNED "extend" on the extend / prefill forms (the vendored "auto" rule would build
+        # the DECODE step for a chunk of <= 16 rows and apply its ring rule cap >= T + 3, which a serving stack's cap 4 fails at T 2 .. 16);
+        # "auto" on the decode form, which the light gate above confines to the decode step
+        index_select_form=INDEX_SELECT_FORM_EXTEND
+        if extend
+        else INDEX_SELECT_FORM_AUTO,
         **knobs,
     )
-    # The projection GEMMs on the capture-safe JIT route by construction (the band slab's 128-row tile at batch x q_len <= 128); the
-    # hook reaches into the vendored block -- a re-vendor that renames these attributes must fail here, loudly, not drop the route.
+    # The hook reaches into the vendored block -- a re-vendor that renames these attributes must fail here, loudly, not drop the route.
+    stage_attr = "_indexer_extend" if extend else "_indexer_decode"
     missing = [
         a
         for a in (
             "_proj",
             "_out_proj",
             "_stages",
-            "_indexer_decode",
+            stage_attr,
             "sparse_tile_form",
             "sparse_tile",
+            "index_select_form_resolved",
         )
         if not hasattr(blk, a)
     ]
@@ -1018,9 +1212,21 @@ def prepare(
             f"{_PKG}: the vendored GatedAttentionBlockFwd no longer carries {missing}; the adapter's capture-safe hook (api.prepare) must be "
             "updated with the re-vendored tree"
         )
-    for st in (blk._proj, blk._out_proj):
-        if st is not None:
-            st.capture_safe = True
+    ixd = getattr(blk, stage_attr)
+    if ixd is None or blk.index_select_form_resolved != (
+        INDEX_SELECT_FORM_EXTEND if extend else "decode"
+    ):
+        raise RuntimeError(
+            f"{_PKG}: the vendored block resolved index_select_form {blk.index_select_form_resolved!r} on the {form} form (expected "
+            f"{'extend' if extend else 'decode'}); the adapter's form routing (api.prepare) must be updated with the re-vendored tree"
+        )
+    if not extend:
+        # The projection GEMMs on the capture-safe JIT route by construction (the band slab's 128-row tile at batch x q_len <= 128).  On the
+        # extend forms the band slab leaves the small-M route past 128 rows (the graph route, where the forced flag would be the driver's
+        # typed decline at compile): the vendored block flags each paged projection stage itself at compile from its own (M, N, K).
+        for st in (blk._proj, blk._out_proj):
+            if st is not None:
+                st.capture_safe = True
     blk.check_support()
     blk.compile()
     size = int(blk.get_workspace_size())
@@ -1040,7 +1246,6 @@ def prepare(
         owned = None
     else:
         owned = torch.zeros(size, dtype=torch.uint8, device=dev)
-    ixd = blk._indexer_decode
     out_proj_tile = getattr(
         getattr(blk._out_proj, "_plan", None), "tile_config_name", None
     )
@@ -1048,17 +1253,21 @@ def prepare(
     split = int(getattr(blk, "decode_split_kv", decode_split_kv or 1) or 1)
     fused = bool(blk.fuse_prepare)
     # the launch count of one execute by the stage list: the slab GEMM, the prepare (one launch fused; norm + RoPE and the write-through
-    # unfused), the indexer stage's own launches (2 fused / 4 unfused), the sparse tile (+ the combine under a split), the out projection
-    # (+ its split-K reducer where the small-row tile splits K); the profiler census is the pin, this is the statement
+    # unfused -- on the extend forms the write-through is TWO launches: the K / V write and the RING arm that lands the chunk's last cap
+    # raw keys), the indexer stage's own launches (decode: 2 fused / 4 unfused; extend: 4 + 2 per select window), the sparse tile (+ the
+    # combine under a split), the out projection (+ its split-K reducer where the small-row tile splits K); the profiler census is the
+    # pin, this is the statement
     launches = (
         1
         + (1 if fused else 2)
+        + (1 if extend else 0)
         + int(ixd.launches_per_execute())
         + 1
         + (1 if split > 1 else 0)
         + 1
         + (1 if (out_proj_tile and "splitK" in str(out_proj_tile)) else 0)
     )
+    n_windows = int(getattr(ixd, "n_windows", 0)) if extend else 0
     declaration = dict(
         form=form,
         page_size=page_size,
@@ -1091,7 +1300,7 @@ def prepare(
         workspace_size=size,
         # appended: the decode indexer's readbacks
         index_list_form=getattr(blk, "qsa_list_form", None),
-        index_cache_dtype=dtype,
+        index_cache_dtype=cache_dtype,
         kv_cache_dtype=pool_dtype,
         fuse_prepare=fused,
         fuse_prepare_requested=getattr(blk, "fuse_prepare_requested", fuse_prepare),
@@ -1099,7 +1308,11 @@ def prepare(
         rope_position_tables_only=rope_position_tables_only,
         ring_cap=int(ring.shape[1]),
         n_blocks_max=int(ixd.n_blocks_max),
-        topk_knobs=tuple(ixd.topk_knobs) if ixd.topk_knobs is not None else None,
+        topk_knobs=(
+            tuple(ixd.topk_knobs)
+            if getattr(ixd, "topk_knobs", None) is not None
+            else None
+        ),
         indexer_launches=int(ixd.launches_per_execute()),
         launches_per_execute=launches,
         capture_rows_max=DECODE_CAPTURE_ROWS_MAX,
@@ -1113,6 +1326,23 @@ def prepare(
         sparse_tile_form=getattr(blk, "sparse_tile_form", None),
         sparse_tile=getattr(blk, "sparse_tile", None),
         sparse_sub_tiles_per_cta=getattr(blk, "sparse_sub_tiles_per_cta", None),
+        # appended (the EXTEND step; the 4c8e24355 pin): the step-form knob as declared and as the tree resolved it, the indexer writers'
+        # rounding convention, the select window plan (one window at the default budget below 2048 rows x a 128K-token reach), the budget
+        # the plan was made under, the exact-cap rule and the capture rule of this form
+        index_select_form=blk.index_select_form,
+        index_select_form_resolved=blk.index_select_form_resolved,
+        index_compress_rounding=geometry.index_compress_rounding,
+        n_windows=n_windows,
+        window_rows=int(getattr(ixd, "window_rows", 0)) if extend else 0,
+        select_budget_bytes=(
+            int(_support.INDEX_EXTEND_SELECT_BUDGET_BYTES) if extend else 0
+        ),
+        ring_cap_exact=extend,
+        capture_warm_up_required=extend,
+        # the vendored block's own capture-safe reading of its two projection stages after compile (True = the JIT-only route: no
+        # backend plan, no cuDNN handle; the decode form forces it, the extend forms read it off the tile resolver under the rows bound)
+        proj_capture_safe=bool(getattr(blk._proj, "capture_safe", False)),
+        out_proj_capture_safe=bool(getattr(blk._out_proj, "capture_safe", False)),
     )
     return Qwen38BlockPlan(
         form=form,
@@ -1135,7 +1365,7 @@ def prepare(
         _k_strides=tuple(int(x) for x in k.stride()),
         _v_strides=tuple(int(x) for x in v.stride()),
         _workspace=owned,
-        index_cache_dtype=dtype,
+        index_cache_dtype=cache_dtype,
         ring_cap=int(ring.shape[1]),
         ring_slots=ring_slots,
         rope_position_tables_only=rope_position_tables_only,
@@ -1145,6 +1375,10 @@ def prepare(
         _position_tables=(cos_pos, sin_pos),
         sparse_tile_form=getattr(blk, "sparse_tile_form", None),
         sparse_tile=getattr(blk, "sparse_tile", None),
+        index_select_form=blk.index_select_form,
+        index_compress_rounding=geometry.index_compress_rounding,
+        ring_cap_exact=extend,
+        capture_warm_up_required=extend,
     )
 
 
@@ -1167,11 +1401,14 @@ def workspace_size(
     workspace with at init (before its memory profiling run, when the caches do not exist yet): the vendored block is declared on
     stand-in samples of the bucket's FORM (one page, a zeros table of ``max_pages`` columns, a ring of ``ring_cap`` rows), checked,
     COMPILED (the carve includes the projection engines' scratch, which is the compiled plan's; the kernels come from the in-process
-    memo or the compiled-plan cache after the first process) and its workspace carve read.  The carve depends on the bucket
-    (``batch_size x q_len_per_req`` rows, ``max_pages x page_size / block_size`` compressed rows, the split), never on the caches' page
-    count or strides, so the number equals the compiled plan's (``test_decode.py`` pins it).  ``sparse_tile_form`` (appended) must be the
-    plan's: the carve is the BODY's (the lean tile's split writes a wider partial slab than the core's).  Same typed declines as
-    :func:`prepare`."""
+    memo or the compiled-plan cache after the first process) and its workspace carve read.  The carve depends on the bucket (the form,
+    ``batch_size x q_len_per_req`` rows, ``max_pages x page_size / block_size`` compressed rows, the split), never on the caches' page
+    count or strides, so the number equals the compiled plan's (``test_decode.py`` / ``test_extend.py`` pin it).  ``sparse_tile_form``
+    (appended) must be the plan's: the carve is the BODY's (the lean tile's split writes a wider partial slab than the core's).  On the
+    ``extend`` / ``prefill`` forms the carve holds the EXTEND step's slots too (the dense kbar ``[batch, max_pages x page_size / 4, 128]``
+    and the select window's fp32 scratch -- up to 256 MiB behind a 128K-token table), so the serving idiom sizes the ONE shared workspace at
+    the maximum of this query over every ``(form, batch_size, q_len_per_req)`` bucket; ``ring_cap`` defaults to the form's floor (the
+    carve does not depend on it).  Same typed declines as :func:`prepare`."""
     if form not in _support.ALL_FORMS:
         raise ValueError(
             f"{_PKG}: form must be one of {_support.ALL_FORMS}, got {form!r}"
@@ -1201,27 +1438,52 @@ def workspace_size(
         raise ValueError(
             f"{_PKG}: max_pages must be a positive int (the block table's columns), got {max_pages!r}"
         )
-    _light_decode_gates(geometry, page_size, q, None, None, sparse_tile_form)
-    cap = int(ring_cap) if ring_cap is not None else q + INDEX_STATE_ROWS_EXTRA
-    if cap < q + INDEX_STATE_ROWS_EXTRA:
+    extend = form in EXTEND_FORMS
+    if extend:
+        _light_extend_gates(
+            geometry,
+            form,
+            page_size,
+            batch_size,
+            q,
+            None,
+            None,
+            fuse_prepare,
+            sparse_tile_form,
+        )
+        _check_extend_chunk_rows(form, q, int(max_pages), page_size)
+    else:
+        _light_decode_gates(geometry, page_size, q, None, None, sparse_tile_form)
+    floor = INDEX_EXTEND_RING_ROWS_MIN if extend else q + INDEX_STATE_ROWS_EXTRA
+    cap = int(ring_cap) if ring_cap is not None else floor
+    if cap < floor:
         raise ValueError(
-            f"{_PKG}: ring_cap={cap} is below q_len_per_req + {INDEX_STATE_ROWS_EXTRA} = {q + INDEX_STATE_ROWS_EXTRA}"
+            f"{_PKG}: ring_cap={cap} is below "
+            + (
+                f"the extend step's floor {INDEX_EXTEND_RING_ROWS_MIN} (cap >= block_size - 1)"
+                if extend
+                else f"q_len_per_req + {INDEX_STATE_ROWS_EXTRA} = {floor}"
+            )
         )
     g = geometry.frost()
     dm, d, h_kv = geometry.d_model, geometry.head_dim, geometry.num_kv_heads
+    rope = geometry.rope_dim
     Fwd = _frost_block()
     _support.check_vendored_rules()
 
-    def mk(*shape):
-        return torch.empty(*shape, dtype=dtype, device=dev)
+    def mk(*shape, dt=dtype):
+        return torch.empty(*shape, dtype=dt, device=dev)
 
+    tables = (
+        (mk(batch_size, q, rope), mk(batch_size, q, rope)) if extend else (None, None)
+    )
     blk = Fwd(
         mk(batch_size, q, dm),
         mk(geometry.n_qkvg, dm),
         mk(d) if geometry.qk_norm else None,
         mk(d) if geometry.qk_norm else None,
-        None,
-        None,
+        tables[0],
+        tables[1],
         mk(dm, geometry.num_qo_heads * d),
         mk(batch_size, q, dm),
         g,
@@ -1237,18 +1499,27 @@ def workspace_size(
         fuse_norm_rope=False,
         fuse_gate=True,
         sample_index_kv_cache=mk(
-            1, page_size // geometry.block_size, 1, geometry.index_head_dim
+            1,
+            page_size // geometry.block_size,
+            1,
+            geometry.index_head_dim,
+            dt=geometry.resolved_index_cache_dtype,
         ),
         sample_index_state_cache=mk(1, cap, 1, geometry.index_head_dim),
         sample_index_state_block_table=torch.zeros(
             batch_size, 1, dtype=torch.int32, device=dev
         ),
-        rope_position_tables_only=True,
+        index_state_slot_mapping_present=extend,
+        rope_position_tables_only=not extend,
         sparse_tile_form=sparse_tile_form,
+        index_select_form=INDEX_SELECT_FORM_EXTEND
+        if extend
+        else INDEX_SELECT_FORM_AUTO,
     )
-    for st in (blk._proj, blk._out_proj):
-        if st is not None:
-            st.capture_safe = True
+    if not extend:  # the extend forms: the vendored block flags each paged projection stage itself (api.prepare's note)
+        for st in (blk._proj, blk._out_proj):
+            if st is not None:
+                st.capture_safe = True
     blk.check_support()
     blk.compile()
     return int(blk.get_workspace_size())
@@ -1332,6 +1603,9 @@ def cached_plan(
     )
     bt = kw.get("block_table")
     icache, ring = kw.get("index_kv_cache"), kw.get("index_state_cache")
+    tables_only, slots_arm = _resolve_contract_flags(
+        form, kw.get("rope_position_tables_only"), kw.get("ring_slots")
+    )
     key = (
         form,
         geometry,
@@ -1355,8 +1629,8 @@ def cached_plan(
         None
         if not isinstance(ring, torch.Tensor)
         else (tuple(int(x) for x in ring.shape), ring.dtype),
-        bool(kw.get("ring_slots", False)),
-        bool(kw.get("rope_position_tables_only", True)),
+        slots_arm,
+        tables_only,
         kw.get("fuse_prepare"),
         kw.get("use_pdl"),
         pool_dtype,
