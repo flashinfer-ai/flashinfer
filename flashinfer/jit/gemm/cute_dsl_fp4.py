@@ -16,7 +16,6 @@ limitations under the License.
 
 """FP4 configuration/spec generation for the CuTe-DSL AOT builder."""
 
-from itertools import product
 import torch
 from ..cute_dsl_aot import CuteDslAOTOperation
 
@@ -24,11 +23,11 @@ MM_FP4_AOT_ARCHS = frozenset({"sm100a", "sm103a", "sm107a"})
 
 
 def mm_fp4_aot_configs(arch: str) -> dict[str, tuple]:
-    """Enumerate vLLM's FP4 API modes across the full autotuning tactic space.
+    """Enumerate BF16 FP4 exports across the full autotuning tactic space.
 
     vLLM v0.32.0 uses scalar alpha and the default enabled PDL with both
-    FP4 formats and output dtypes. Other API modes remain available through
-    runtime JIT.
+    FP4 formats. Package BF16 output to limit wheel size; FP16 and other
+    API modes remain available through runtime JIT.
 
     Shapes and occupancy are runtime arguments. Three aligned representative
     shapes expose the full tactic space: narrow-N SM100 tactics require at
@@ -51,7 +50,8 @@ def mm_fp4_aot_configs(arch: str) -> dict[str, tuple]:
     _get_mm_fp4_kernel_classes(sm_version, require_native=True)
 
     configs: dict[str, tuple] = {}
-    for use_nvfp4, dtype in product((True, False), (torch.float16, torch.bfloat16)):
+    dtype = torch.bfloat16
+    for use_nvfp4 in (True, False):
         sf_vec_size = 16 if use_nvfp4 else 32
         tactics = set()
         for m, n in ((32, 8192), (8192, 32), (8192, 8192)):

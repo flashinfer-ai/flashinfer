@@ -28,11 +28,11 @@ MM_MXFP8_AOT_ARCHS = frozenset({"sm100a", "sm103a", "sm107a"})
 
 
 def mm_mxfp8_aot_configs(arch: str) -> dict[str, tuple]:
-    """Cover vLLM's MXFP8 dtypes with persistent and cluster split-K tactics.
+    """Cover BF16 MXFP8 with persistent and cluster split-K tactics.
 
     The public mm_mxfp8 API enables PDL for SM100-family runners; native
-    Rubin has a separate non-PDL interface. Both output dtypes are used by
-    vLLM v0.32.0.
+    Rubin has a separate non-PDL interface. Package BF16 output to limit
+    wheel size; FP16 remains available through runtime JIT.
     """
     if arch not in MM_MXFP8_AOT_ARCHS:
         return {}
@@ -48,53 +48,50 @@ def mm_mxfp8_aot_configs(arch: str) -> dict[str, tuple]:
     from ...gemm.kernels.utils import _get_sm107_mxfp8_tactics
 
     configs: dict[str, tuple] = {}
-    for dtype in (torch.float16, torch.bfloat16):
-        c_dtype = torch_to_cutlass_dtype(dtype)
-        tactics: set[tuple] = set()
-        # K=8192 enables both prefetch settings without a device query. The
-        # low-M/N representatives expose every narrow-tile specialization.
-        for m, n in (
-            (8, 8192),
-            (8192, 8),
-            (16, 8192),
-            (8192, 16),
-            (32, 8192),
-            (8192, 32),
-            (8192, 8192),
-        ):
-            tactics.update(
-                (*tactic, 1)
-                for tactic in _get_sm100_block_scaled_tactics(
-                    m,
-                    n,
-                    8192,
-                    cutlass.Float8E4M3FN,
-                    cutlass.Float8E8M0FNU,
-                    32,
-                    c_dtype,
-                    None,
-                )
+    dtype = torch.bfloat16
+    c_dtype = torch_to_cutlass_dtype(dtype)
+    tactics: set[tuple] = set()
+    # K=8192 enables both prefetch settings without a device query. The
+    # low-M/N representatives expose every narrow-tile specialization.
+    for m, n in (
+        (8, 8192),
+        (8192, 8),
+        (16, 8192),
+        (8192, 16),
+        (32, 8192),
+        (8192, 32),
+        (8192, 8192),
+    ):
+        tactics.update(
+            (*tactic, 1)
+            for tactic in _get_sm100_block_scaled_tactics(
+                m,
+                n,
+                8192,
+                cutlass.Float8E4M3FN,
+                cutlass.Float8E8M0FNU,
+                32,
+                c_dtype,
+                None,
             )
-        for m in (8, 16, 32):
-            for slices in SplitK.SUPPORTED_SPLIT_K_SLICES:
-                if SplitK.is_valid_tactic(m, 8192, cutlass.Float8E4M3FN, slices):
-                    tactics.add(
-                        (SplitK.mma_tiler_mn_for_m(m), (1, 1), True, False, slices)
-                    )
-        keys = [
-            _mm_mxfp8_cache_key(tactic, True, dtype)
-            for tactic in sorted(tactics, key=repr)
-        ]
-        if arch == "sm107a":
-            keys.extend(
-                _mm_mxfp8_cache_key(tactic, False, dtype, native_sm107=True)
-                for tactic in _get_sm107_mxfp8_tactics(8192, 8192, 8192, c_dtype)
-            )
-        for key in keys:
-            name = _blockscaled_kernel_disk_name(key, 1, None)
-            if name in configs and configs[name] != key:
-                raise RuntimeError(f"MXFP8 specialization name collision: {name}")
-            configs[name] = key
+        )
+    for m in (8, 16, 32):
+        for slices in SplitK.SUPPORTED_SPLIT_K_SLICES:
+            if SplitK.is_valid_tactic(m, 8192, cutlass.Float8E4M3FN, slices):
+                tactics.add((SplitK.mma_tiler_mn_for_m(m), (1, 1), True, False, slices))
+    keys = [
+        _mm_mxfp8_cache_key(tactic, True, dtype) for tactic in sorted(tactics, key=repr)
+    ]
+    if arch == "sm107a":
+        keys.extend(
+            _mm_mxfp8_cache_key(tactic, False, dtype, native_sm107=True)
+            for tactic in _get_sm107_mxfp8_tactics(8192, 8192, 8192, c_dtype)
+        )
+    for key in keys:
+        name = _blockscaled_kernel_disk_name(key, 1, None)
+        if name in configs and configs[name] != key:
+            raise RuntimeError(f"MXFP8 specialization name collision: {name}")
+        configs[name] = key
     return dict(sorted(configs.items()))
 
 
