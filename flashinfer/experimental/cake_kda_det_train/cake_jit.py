@@ -423,7 +423,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 1152,
             "use_pdl": False,
         },
-        "library": "cake_kda_train_d7656e2b58b9bab49495",
+        "library": "cake_kda_det_train_d7656e2b58b9bab49495",
         "logical": {
             "chunk_bos": "chunk_bos",
             "chunk_len": "chunk_len",
@@ -461,7 +461,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 1152,
             "use_pdl": False,
         },
-        "library": "cake_kda_train_8d99ea1be1c1fef432a5",
+        "library": "cake_kda_det_train_8d99ea1be1c1fef432a5",
         "logical": {
             "chunk_bos": "chunk_bos",
             "chunk_len": "chunk_len",
@@ -508,7 +508,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 5376,
             "use_pdl": False,
         },
-        "library": "cake_kda_train_9f69ca35a631ae5e1b4c",
+        "library": "cake_kda_det_train_9f69ca35a631ae5e1b4c",
         "logical": {
             "chunk_bos": "chunk_bos",
             "chunk_len": "chunk_len",
@@ -555,7 +555,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 3200,
             "use_pdl": False,
         },
-        "library": "cake_kda_train_fd4c92787fcc18446b14",
+        "library": "cake_kda_det_train_fd4c92787fcc18446b14",
         "logical": {
             "num_seqs": "num_seqs",
             "proportional": "proportional",
@@ -613,7 +613,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 76160,
             "use_pdl": False,
         },
-        "library": "cake_kda_train_c9395e21a813579c4bfc",
+        "library": "cake_kda_det_train_c9395e21a813579c4bfc",
         "logical": {
             "akk_ext": "akk_ext",
             "akk_int": "akk_int",
@@ -694,7 +694,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 76160,
             "use_pdl": False,
         },
-        "library": "cake_kda_train_94c7d1cc6c908d53e8c1",
+        "library": "cake_kda_det_train_94c7d1cc6c908d53e8c1",
         "logical": {
             "akk_ext": "akk_ext",
             "akk_int": "akk_int",
@@ -763,7 +763,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 197760,
             "use_pdl": False,
         },
-        "library": "cake_kda_train_3712054f19d4180caa28",
+        "library": "cake_kda_det_train_3712054f19d4180caa28",
         "logical": {
             "akk_tma": "akk_int",
             "beta": "beta",
@@ -885,7 +885,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 197760,
             "use_pdl": False,
         },
-        "library": "cake_kda_train_e60e7ca5d88192193e61",
+        "library": "cake_kda_det_train_e60e7ca5d88192193e61",
         "logical": {
             "akk_tma": "akk_ext",
             "beta": "beta",
@@ -1006,7 +1006,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 197760,
             "use_pdl": False,
         },
-        "library": "cake_kda_train_e60e7ca5d88192193e61",
+        "library": "cake_kda_det_train_e60e7ca5d88192193e61",
         "logical": {
             "akk_tma": "akk_src",
             "beta": "beta",
@@ -1109,7 +1109,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 197760,
             "use_pdl": False,
         },
-        "library": "cake_kda_train_eac26fffb3df8780302c",
+        "library": "cake_kda_det_train_eac26fffb3df8780302c",
         "logical": {
             "akk_tma": "akk_int",
             "beta": "beta",
@@ -1171,7 +1171,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 115712,
             "use_pdl": False,
         },
-        "library": "cake_kda_train_5fcc76904e5e2dd891de",
+        "library": "cake_kda_det_train_5fcc76904e5e2dd891de",
         "logical": {
             "aqk_tma": "aqk_int",
             "chunk_bos": "chunk_bos",
@@ -1259,7 +1259,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 115712,
             "use_pdl": False,
         },
-        "library": "cake_kda_train_f011cd9add8f3c7c3eee",
+        "library": "cake_kda_det_train_f011cd9add8f3c7c3eee",
         "logical": {
             "aqk_tma": "aqk_ext",
             "chunk_bos": "chunk_bos",
@@ -1336,7 +1336,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 103424,
             "use_pdl": False,
         },
-        "library": "cake_kda_train_4cce3cc5bc6210c95ce3",
+        "library": "cake_kda_det_train_4cce3cc5bc6210c95ce3",
         "logical": {
             "aqk_tma": "aqk_int",
             "chunk_bos": "chunk_bos",
@@ -1412,7 +1412,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 103424,
             "use_pdl": False,
         },
-        "library": "cake_kda_train_3f4b037a0a1f8dcc314b",
+        "library": "cake_kda_det_train_3f4b037a0a1f8dcc314b",
         "logical": {
             "aqk_tma": "aqk_ext",
             "chunk_bos": "chunk_bos",
@@ -1490,7 +1490,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 181248,
             "use_pdl": False,
         },
-        "library": "cake_kda_train_a557058a8aeca49a6402",
+        "library": "cake_kda_det_train_a557058a8aeca49a6402",
         "logical": {
             "akk_tma": "akk_int",
             "aqk_tma": "aqk_int",
@@ -1568,7 +1568,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 181248,
             "use_pdl": False,
         },
-        "library": "cake_kda_train_898a1eb972fbaf55789a",
+        "library": "cake_kda_det_train_898a1eb972fbaf55789a",
         "logical": {
             "akk_tma": "akk_ext",
             "aqk_tma": "aqk_ext",
@@ -1644,7 +1644,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 115712,
             "use_pdl": False,
         },
-        "library": "cake_kda_train_0e5fa2fe9ae292c3e3aa",
+        "library": "cake_kda_det_train_0e5fa2fe9ae292c3e3aa",
         "logical": {
             "eye": "eye",
             "gk": "gk",
@@ -1699,7 +1699,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 91136,
             "use_pdl": False,
         },
-        "library": "cake_kda_train_90153af20fdef34c6cb3",
+        "library": "cake_kda_det_train_90153af20fdef34c6cb3",
         "logical": {
             "gk": "gk",
             "h_out": "h",
@@ -1750,7 +1750,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 91136,
             "use_pdl": False,
         },
-        "library": "cake_kda_train_612492edb453070b0d6a",
+        "library": "cake_kda_det_train_612492edb453070b0d6a",
         "logical": {
             "gk": "gk",
             "h_out": "h",
@@ -1801,7 +1801,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 78848,
             "use_pdl": False,
         },
-        "library": "cake_kda_train_133d787e8f202007cd37",
+        "library": "cake_kda_det_train_133d787e8f202007cd37",
         "logical": {
             "gk": "gk",
             "h_out": "h",
@@ -1863,7 +1863,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 78848,
             "use_pdl": False,
         },
-        "library": "cake_kda_train_827dd9ceb9a75ea0330c",
+        "library": "cake_kda_det_train_827dd9ceb9a75ea0330c",
         "logical": {
             "gk": "gk",
             "h_out": "h",
@@ -1930,7 +1930,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 107520,
             "use_pdl": False,
         },
-        "library": "cake_kda_train_cab3e194b7e9e7557edf",
+        "library": "cake_kda_det_train_cab3e194b7e9e7557edf",
         "logical": {
             "akk_tma": "akk_src",
             "beta": "beta",
@@ -1994,7 +1994,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 107520,
             "use_pdl": False,
         },
-        "library": "cake_kda_train_b2e877c538b6ab7317e9",
+        "library": "cake_kda_det_train_b2e877c538b6ab7317e9",
         "logical": {
             "akk_tma": "akk_int",
             "beta": "beta",
@@ -2051,7 +2051,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 197632,
             "use_pdl": False,
         },
-        "library": "cake_kda_train_184d5ccfffea932ff1d8",
+        "library": "cake_kda_det_train_184d5ccfffea932ff1d8",
         "logical": {
             "b": "carry_b",
             "chain_seg_start": "seg_table",
@@ -2135,7 +2135,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 197632,
             "use_pdl": False,
         },
-        "library": "cake_kda_train_0fb763e9a81e9066d776",
+        "library": "cake_kda_det_train_0fb763e9a81e9066d776",
         "logical": {
             "b": "carry_b",
             "chain_seg_start": "seg_table",
@@ -2206,7 +2206,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 197632,
             "use_pdl": False,
         },
-        "library": "cake_kda_train_e244f5d7d0e0569a62c1",
+        "library": "cake_kda_det_train_e244f5d7d0e0569a62c1",
         "logical": {
             "b": "carry_b",
             "chain_seg_start": "seg_table",
@@ -2308,7 +2308,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 140288,
             "use_pdl": False,
         },
-        "library": "cake_kda_train_9931cdff5dfd86c687c7",
+        "library": "cake_kda_det_train_9931cdff5dfd86c687c7",
         "logical": {
             "aqk_tma": "aqk_int",
             "chunk_bos": "chunk_bos",
@@ -2415,7 +2415,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 140288,
             "use_pdl": True,
         },
-        "library": "cake_kda_train_8ab0929b8154c90b5eff",
+        "library": "cake_kda_det_train_8ab0929b8154c90b5eff",
         "logical": {
             "aqk_tma": "aqk_int",
             "chunk_bos": "chunk_bos",
@@ -2520,7 +2520,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 140288,
             "use_pdl": True,
         },
-        "library": "cake_kda_train_22812d87c26b53a1ba10",
+        "library": "cake_kda_det_train_22812d87c26b53a1ba10",
         "logical": {
             "aqk_tma": "aqk_int",
             "chunk_bos": "chunk_bos",
@@ -2625,7 +2625,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 140288,
             "use_pdl": True,
         },
-        "library": "cake_kda_train_7eca60b36e233943dae6",
+        "library": "cake_kda_det_train_7eca60b36e233943dae6",
         "logical": {
             "aqk_tma": "aqk_ext",
             "chunk_bos": "chunk_bos",
@@ -2730,7 +2730,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 140288,
             "use_pdl": True,
         },
-        "library": "cake_kda_train_5f5a5b3715675e083823",
+        "library": "cake_kda_det_train_5f5a5b3715675e083823",
         "logical": {
             "aqk_tma": "aqk_ext",
             "chunk_bos": "chunk_bos",
@@ -2832,7 +2832,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 173056,
             "use_pdl": False,
         },
-        "library": "cake_kda_train_945a87fa84a265fc9f94",
+        "library": "cake_kda_det_train_945a87fa84a265fc9f94",
         "logical": {
             "akk_tma": "akk_src",
             "beta": "beta",
@@ -2899,7 +2899,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 115712,
             "use_pdl": False,
         },
-        "library": "cake_kda_train_0e5fa2fe9ae292c3e3aa",
+        "library": "cake_kda_det_train_0e5fa2fe9ae292c3e3aa",
         "logical": {
             "eye": "eye",
             "gk": "gk",
@@ -2973,7 +2973,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 36864,
             "use_pdl": False,
         },
-        "library": "cake_kda_train_98e6ba1f97af72fa2e32",
+        "library": "cake_kda_det_train_98e6ba1f97af72fa2e32",
         "logical": {
             "beta": "beta",
             "beta_int": "beta_int",
@@ -3031,7 +3031,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 36864,
             "use_pdl": False,
         },
-        "library": "cake_kda_train_86df3294f866784ca973",
+        "library": "cake_kda_det_train_86df3294f866784ca973",
         "logical": {
             "beta": "beta",
             "beta_int": "beta_int",
@@ -3087,7 +3087,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 36864,
             "use_pdl": False,
         },
-        "library": "cake_kda_train_e1bf4eadfa51d1646ef7",
+        "library": "cake_kda_det_train_e1bf4eadfa51d1646ef7",
         "logical": {
             "beta": "beta",
             "beta_int": "beta_int",
@@ -3164,7 +3164,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 36864,
             "use_pdl": False,
         },
-        "library": "cake_kda_train_0e7c693f766175f4406c",
+        "library": "cake_kda_det_train_0e7c693f766175f4406c",
         "logical": {
             "beta": "beta",
             "beta_int": "beta_int",
@@ -3254,7 +3254,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 132224,
             "use_pdl": False,
         },
-        "library": "cake_kda_train_706240be56d4e41df1a2",
+        "library": "cake_kda_det_train_706240be56d4e41df1a2",
         "logical": {
             "chunk_bos": "chunk_bos",
             "chunk_len": "chunk_len",
@@ -3301,7 +3301,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 132224,
             "use_pdl": False,
         },
-        "library": "cake_kda_train_f92b256cccc2c9007554",
+        "library": "cake_kda_det_train_f92b256cccc2c9007554",
         "logical": {
             "chunk_bos": "chunk_bos",
             "chunk_len": "chunk_len",
@@ -3354,7 +3354,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 99328,
             "use_pdl": False,
         },
-        "library": "cake_kda_train_8eb4e9b8a9eae4e077d3",
+        "library": "cake_kda_det_train_8eb4e9b8a9eae4e077d3",
         "logical": {
             "aqk_tma": "aqk_src",
             "chunk_bos": "chunk_bos",
@@ -3411,7 +3411,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 99328,
             "use_pdl": False,
         },
-        "library": "cake_kda_train_f1777a88a21b832b29ee",
+        "library": "cake_kda_det_train_f1777a88a21b832b29ee",
         "logical": {
             "aqk_tma": "aqk_int",
             "dh_out": "dh",
@@ -3467,7 +3467,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 107520,
             "use_pdl": False,
         },
-        "library": "cake_kda_train_d32455627b87ba0a1d87",
+        "library": "cake_kda_det_train_d32455627b87ba0a1d87",
         "logical": {
             "aqk_tma": "aqk_src",
             "chunk_bos": "chunk_bos",
@@ -3534,7 +3534,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 107520,
             "use_pdl": False,
         },
-        "library": "cake_kda_train_4734a5d4f63d815ec086",
+        "library": "cake_kda_det_train_4734a5d4f63d815ec086",
         "logical": {
             "aqk_tma": "aqk_int",
             "dh_out": "dh",
@@ -3590,7 +3590,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 107520,
             "use_pdl": False,
         },
-        "library": "cake_kda_train_22a2f04d41df18554b84",
+        "library": "cake_kda_det_train_22a2f04d41df18554b84",
         "logical": {
             "aqk_tma": "aqk_src",
             "chunk_bos": "chunk_bos",
@@ -3650,7 +3650,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 107520,
             "use_pdl": False,
         },
-        "library": "cake_kda_train_036e1c7e1dfc95a88aae",
+        "library": "cake_kda_det_train_036e1c7e1dfc95a88aae",
         "logical": {
             "aqk_tma": "aqk_int",
             "dh_out": "dh",
@@ -3717,7 +3717,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 115712,
             "use_pdl": False,
         },
-        "library": "cake_kda_train_74e19f83f8d97e669d46",
+        "library": "cake_kda_det_train_74e19f83f8d97e669d46",
         "logical": {
             "aqk_tma": "aqk_src",
             "chunk_bos": "chunk_bos",
@@ -3841,7 +3841,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 115712,
             "use_pdl": False,
         },
-        "library": "cake_kda_train_157990bf8c73b3dbc4fe",
+        "library": "cake_kda_det_train_157990bf8c73b3dbc4fe",
         "logical": {
             "aqk_tma": "aqk_src",
             "chunk_bos": "chunk_bos",
@@ -3954,7 +3954,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 115712,
             "use_pdl": False,
         },
-        "library": "cake_kda_train_251cc1717dfc8e3ba24e",
+        "library": "cake_kda_det_train_251cc1717dfc8e3ba24e",
         "logical": {
             "aqk_tma": "aqk_int",
             "chunk_bos": "chunk_bos",
@@ -4066,7 +4066,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 115712,
             "use_pdl": False,
         },
-        "library": "cake_kda_train_b4a1408642c39b6e6ccd",
+        "library": "cake_kda_det_train_b4a1408642c39b6e6ccd",
         "logical": {
             "aqk_tma": "aqk_src",
             "chunk_bos": "chunk_bos",
@@ -4161,7 +4161,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 115712,
             "use_pdl": False,
         },
-        "library": "cake_kda_train_91d59405d9b349c0709c",
+        "library": "cake_kda_det_train_91d59405d9b349c0709c",
         "logical": {
             "aqk_tma": "aqk_src",
             "chunk_bos": "chunk_bos",
@@ -4245,7 +4245,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 115712,
             "use_pdl": False,
         },
-        "library": "cake_kda_train_e0b6246cba153e5c917b",
+        "library": "cake_kda_det_train_e0b6246cba153e5c917b",
         "logical": {
             "aqk_tma": "aqk_int",
             "chunk_bos": "chunk_bos",
@@ -4328,7 +4328,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 115712,
             "use_pdl": False,
         },
-        "library": "cake_kda_train_243fb0b23aea1b296ab6",
+        "library": "cake_kda_det_train_243fb0b23aea1b296ab6",
         "logical": {
             "aqk_tma": "aqk_src",
             "chunk_bos": "chunk_bos",
@@ -4429,7 +4429,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 115712,
             "use_pdl": False,
         },
-        "library": "cake_kda_train_dec885b973bd44f88416",
+        "library": "cake_kda_det_train_dec885b973bd44f88416",
         "logical": {
             "aqk_tma": "aqk_src",
             "chunk_bos": "chunk_bos",
@@ -4519,7 +4519,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 115712,
             "use_pdl": False,
         },
-        "library": "cake_kda_train_909a0aa57efb3f353972",
+        "library": "cake_kda_det_train_909a0aa57efb3f353972",
         "logical": {
             "aqk_tma": "aqk_int",
             "chunk_bos": "chunk_bos",
@@ -4608,7 +4608,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 107520,
             "use_pdl": False,
         },
-        "library": "cake_kda_train_3f7ffe0b7421d90ad674",
+        "library": "cake_kda_det_train_3f7ffe0b7421d90ad674",
         "logical": {
             "aqk_tma": "aqk_src",
             "chunk_bos": "chunk_bos",
@@ -4684,7 +4684,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 107520,
             "use_pdl": False,
         },
-        "library": "cake_kda_train_2247b401b29d959d8133",
+        "library": "cake_kda_det_train_2247b401b29d959d8133",
         "logical": {
             "aqk_tma": "aqk_src",
             "chunk_bos": "chunk_bos",
@@ -4760,7 +4760,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 107520,
             "use_pdl": False,
         },
-        "library": "cake_kda_train_de4f911d8beaf8ac8d79",
+        "library": "cake_kda_det_train_de4f911d8beaf8ac8d79",
         "logical": {
             "aqk_tma": "aqk_int",
             "chunk_bos": "chunk_bos",
@@ -4840,7 +4840,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 224384,
             "use_pdl": False,
         },
-        "library": "cake_kda_train_ac974e171d56fc3ce10b",
+        "library": "cake_kda_det_train_ac974e171d56fc3ce10b",
         "logical": {
             "akk_tma": "akk_src",
             "beta": "beta_int",
@@ -4919,7 +4919,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 224384,
             "use_pdl": False,
         },
-        "library": "cake_kda_train_058a68a5b4d89c53be4b",
+        "library": "cake_kda_det_train_058a68a5b4d89c53be4b",
         "logical": {
             "akk_tma": "akk_int",
             "beta": "beta_int",
@@ -4998,7 +4998,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 224384,
             "use_pdl": False,
         },
-        "library": "cake_kda_train_f6a70fb0288a508f2828",
+        "library": "cake_kda_det_train_f6a70fb0288a508f2828",
         "logical": {
             "akk_tma": "akk_src",
             "beta": "beta_int",
@@ -5113,7 +5113,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 224384,
             "use_pdl": False,
         },
-        "library": "cake_kda_train_1f9c46f98f4290ee26df",
+        "library": "cake_kda_det_train_1f9c46f98f4290ee26df",
         "logical": {
             "akk_tma": "akk_int",
             "beta": "beta_int",
@@ -5228,7 +5228,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 224384,
             "use_pdl": False,
         },
-        "library": "cake_kda_train_1a0df5d531918da7561e",
+        "library": "cake_kda_det_train_1a0df5d531918da7561e",
         "logical": {
             "akk_tma": "akk_src",
             "beta": "beta_int",
@@ -5307,7 +5307,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 224384,
             "use_pdl": False,
         },
-        "library": "cake_kda_train_3b9b3f9a495f04bc83e4",
+        "library": "cake_kda_det_train_3b9b3f9a495f04bc83e4",
         "logical": {
             "akk_tma": "akk_int",
             "beta": "beta_int",
@@ -5384,7 +5384,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 115200,
             "use_pdl": False,
         },
-        "library": "cake_kda_train_54786ffd01bd9b6bb416",
+        "library": "cake_kda_det_train_54786ffd01bd9b6bb416",
         "logical": {
             "beta": "beta_int",
             "chunk_bos": "chunk_bos",
@@ -5452,7 +5452,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 115200,
             "use_pdl": False,
         },
-        "library": "cake_kda_train_c27b09eb5f5881be2969",
+        "library": "cake_kda_det_train_c27b09eb5f5881be2969",
         "logical": {
             "beta": "beta_int",
             "chunk_bos": "chunk_bos",
@@ -5520,7 +5520,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 115200,
             "use_pdl": False,
         },
-        "library": "cake_kda_train_aa6b5c23c97e1cb9880a",
+        "library": "cake_kda_det_train_aa6b5c23c97e1cb9880a",
         "logical": {
             "beta": "beta_int",
             "chunk_bos": "chunk_bos",
@@ -5573,7 +5573,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 4096,
             "use_pdl": False,
         },
-        "library": "cake_kda_train_47a9c058e6d6c78c166d",
+        "library": "cake_kda_det_train_47a9c058e6d6c78c166d",
         "logical": {
             "chunk_bos": "chunk_bos",
             "chunk_len": "chunk_len",

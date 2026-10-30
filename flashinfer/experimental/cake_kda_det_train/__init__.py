@@ -17,9 +17,12 @@ limitations under the License.
 # Experimental Cake backend: packed KDA (Kimi Delta Attention) chunked
 # training forward and backward in the GLM-5.3-Flash geometry (head dimension
 # 128, chunk 64, per-document zero initial state) on SM100 / SM103 / SM107.
-# The public entry points are ``flashinfer.kda_train.chunk_kda_fwd``,
-# ``chunk_kda_bwd`` and ``chunk_kda``; the host plan, workspace, launch
-# sequences, autograd Function, registry and generated sources live here.
+# The public entry points are ``flashinfer.cake_kda_det_train.chunk_kda_det_fwd``,
+# ``chunk_kda_det_bwd`` and ``chunk_kda_det``; the host plan, workspace, launch
+# sequences, autograd Function, registry and generated sources live here.  The
+# names before the det rename (``ChunkKDAFunction``, ``KdaChunkSaved``,
+# ``KdaWorkspace``, ``chunk_kda``, ``chunk_kda_bwd``, ``chunk_kda_fwd``) are
+# bound to the same objects and are not in ``__all__``.
 
 from .cake_backend import (
     SAVE_MODES,
@@ -27,13 +30,13 @@ from .cake_backend import (
     SAVED_VERSION_TAPE,
     SCALE,
     SEG_SAVE_MIN_TOKENS_PER_SEG,
-    ChunkKDAFunction,
-    KdaChunkSaved,
-    KdaWorkspace,
+    ChunkKDADetFunction,
+    KdaDetChunkSaved,
+    KdaDetWorkspace,
     Plan,
-    chunk_kda,
-    chunk_kda_bwd,
-    chunk_kda_fwd,
+    chunk_kda_det,
+    chunk_kda_det_bwd,
+    chunk_kda_det_fwd,
     is_supported,
     memory_report,
     output_bytes,
@@ -44,6 +47,14 @@ from .cake_backend import (
 )
 from .cake_jit import ARCH_BY_CAPABILITY, ARCHES
 
+# The names before the det rename, the same objects (not in ``__all__``).
+ChunkKDAFunction = ChunkKDADetFunction
+KdaChunkSaved = KdaDetChunkSaved
+KdaWorkspace = KdaDetWorkspace
+chunk_kda = chunk_kda_det
+chunk_kda_bwd = chunk_kda_det_bwd
+chunk_kda_fwd = chunk_kda_det_fwd
+
 __all__ = [
     "ARCHES",
     "ARCH_BY_CAPABILITY",
@@ -52,13 +63,13 @@ __all__ = [
     "SAVED_VERSION_TAPE",
     "SCALE",
     "SEG_SAVE_MIN_TOKENS_PER_SEG",
-    "ChunkKDAFunction",
-    "KdaChunkSaved",
-    "KdaWorkspace",
+    "ChunkKDADetFunction",
+    "KdaDetChunkSaved",
+    "KdaDetWorkspace",
     "Plan",
-    "chunk_kda",
-    "chunk_kda_bwd",
-    "chunk_kda_fwd",
+    "chunk_kda_det",
+    "chunk_kda_det_bwd",
+    "chunk_kda_det_fwd",
     "is_supported",
     "memory_report",
     "output_bytes",

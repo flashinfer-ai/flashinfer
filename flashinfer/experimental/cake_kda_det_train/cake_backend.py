@@ -92,7 +92,7 @@ host rule accepts, the two-level carry ``seg_carry_v8`` forms the groups of
 segments in parallel), pass 2 walks again
 from the carried states and writes the tapes.
 
-Memory.  A :class:`KdaWorkspace` is one arena holding only the internal
+Memory.  A :class:`KdaDetWorkspace` is one arena holding only the internal
 intermediates; buffers with disjoint lifetimes within one call share a slot
 (:data:`FWD_SLOTS` / :data:`BWD_SLOTS` are the lifetime tables; the saved-set
 paths use the backward layouts without the ``akk_int`` buffer, the replay the
@@ -163,11 +163,11 @@ ALIGN = 256  # every arena sub-buffer and table starts on a 256 B boundary (TMA 
 # The arena layouts: the forward's, the backward's of the saved-set paths (``bwd``) and of the checkpoint replay
 # (``replay``, which keeps the internal ``akk_int`` rows), each in its light and tape form.
 MODES = ("fwd", "fwd_tape", "bwd", "bwd_tape", "replay", "replay_tape")
-# The lower-memory arena option (:class:`KdaArena`, ``lean``): the saved-set paths' backward layouts without the
+# The lower-memory arena option (:class:`KdaDetArena`, ``lean``): the saved-set paths' backward layouts without the
 # replay-only buffers, with the tail stages split into ``tail_passes`` chunk ranges (per-pass buffers sized for one
 # range).  Not in :data:`MODES`: a lean workspace serves no replay.
 LEAN_MODES = ("bwd_lean", "bwd_tape_lean")
-# The forward layouts a forward-only workspace (``backward=False``) can be sized for (:class:`KdaWorkspace`
+# The forward layouts a forward-only workspace (``backward=False``) can be sized for (:class:`KdaDetWorkspace`
 # ``fwd_layout``): the forward's own and the context-parallel route's (``fwd_kcp``, :data:`FWD_KCP_SLOTS`; light
 # only, not in :data:`MODES`: this module's forward never runs on it).
 FWD_LAYOUTS = ("fwd", "fwd_kcp")
@@ -203,12 +203,12 @@ Launcher = Callable[..., None]
 
 
 @dataclasses.dataclass(frozen=True)
-class KdaArena:
-    """The lower-memory arena option of a :class:`KdaWorkspace`; off by default (``KdaArena()`` is today's arena and
+class KdaDetArena:
+    """The lower-memory arena option of a :class:`KdaDetWorkspace`; off by default (``KdaDetArena()`` is today's arena and
     launch list).
 
     ``lean`` sizes a backward workspace for the saved-set paths only (layouts ``bwd_lean`` / ``bwd_tape_lean``: no
-    replay layout, no internal ``dout`` copy), so the workspace serves no checkpoint replay (``chunk_kda_bwd`` with
+    replay layout, no internal ``dout`` copy), so the workspace serves no checkpoint replay (``chunk_kda_det_bwd`` with
     ``saved=None``; ``torch.utils.checkpoint`` never replays: the node's backward reads the recomputed saved set)
     and no row that dispatches the separate ``dav`` program (H 9-15, outside the contract's head counts).
     ``tail_passes = B`` (which implies ``lean``) runs the three chunk-parallel tail stages of the backward (the
@@ -233,7 +233,7 @@ class KdaArena:
     ``ceil(NC_pad / b)`` chunks instead of ``ceil(NC_pad / B)``, at the same bits.
     The option refuses the rows whose block table gives the documents proportional segment counts (at most four
     (document, head) chains on the segmented route).  The longest document bounds the arena from below
-    (:func:`memory_report` with ``doc_lengths``); :func:`arena_for_budget` / :meth:`KdaWorkspace.for_budget` search
+    (:func:`memory_report` with ``doc_lengths``); :func:`arena_for_budget` / :meth:`KdaDetWorkspace.for_budget` search
     the options for a byte budget.
     """
 
@@ -249,7 +249,7 @@ class KdaArena:
             or self.tail_passes < 1
         ):
             raise ValueError(
-                f"KdaArena: tail_passes must be an int >= 1, got {self.tail_passes!r}"
+                f"KdaDetArena: tail_passes must be an int >= 1, got {self.tail_passes!r}"
             )
         for name in ("batch_tokens", "max_docs_per_batch"):
             value = getattr(self, name)
@@ -257,11 +257,11 @@ class KdaArena:
                 isinstance(value, bool) or not isinstance(value, int) or value < 1
             ):
                 raise ValueError(
-                    f"KdaArena: {name} must be None or an int >= 1, got {value!r}"
+                    f"KdaDetArena: {name} must be None or an int >= 1, got {value!r}"
                 )
         if self.max_docs_per_batch is not None and self.batch_tokens is None:
             raise ValueError(
-                "KdaArena: max_docs_per_batch bounds the document groups of batch_tokens; pass batch_tokens too "
+                "KdaDetArena: max_docs_per_batch bounds the document groups of batch_tokens; pass batch_tokens too "
                 "(S, or any budget at or above the longest document, bounds the groups by their document count "
                 "alone)"
             )
@@ -281,7 +281,7 @@ class KdaArena:
             return base
         if base.startswith("replay"):
             raise ValueError(
-                "a lean workspace (KdaArena(lean=True)) serves no checkpoint replay (chunk_kda_bwd with "
+                "a lean workspace (KdaDetArena(lean=True)) serves no checkpoint replay (chunk_kda_det_bwd with "
                 "saved=None): pass the saved set, or allocate the workspace with lean=False"
             )
         return base + "_lean"
@@ -332,7 +332,7 @@ def _check_problem(
 
 @dataclasses.dataclass(frozen=True)
 class Batch:
-    """One document group of the batched arena option (:class:`KdaArena`, ``batch_tokens``; :meth:`Plan.batches`):
+    """One document group of the batched arena option (:class:`KdaDetArena`, ``batch_tokens``; :meth:`Plan.batches`):
     the documents ``[d0, d1)`` of the pack (``N = d1 - d0`` of them, zero-length ones included; ``S`` tokens),
     ``c0`` the group's first chunk in the whole problem's layout (the real chunks of the documents before it),
     ``NC_pad`` the chunk bound of the group's own geometry (:func:`_geometry` of ``(S, N)``: its tables, grids and
@@ -547,7 +547,7 @@ class Plan:
         """The arena regions of ``mode`` (:data:`MODES`): ``"fwd"`` / ``"bwd"`` (``save_mode="light"``; the saved-set
         paths) / ``"replay"`` (the checkpoint replay, which keeps the internal ``akk_int`` rows), and their
         ``*_tape`` forms (``save_mode="tape"``: ``h`` and ``v_new`` live in the saved set); the lean layouts
-        (:data:`LEAN_MODES`, :class:`KdaArena`) take their ``tail_passes``."""
+        (:data:`LEAN_MODES`, :class:`KdaDetArena`) take their ``tail_passes``."""
         return _layout(
             self.R, self.H, self.NC_pad, self.NSEG, mode, tail_passes, self.gate_fused
         )
@@ -557,7 +557,7 @@ class Plan:
             self.R, self.H, self.NC_pad, self.NSEG, mode, tail_passes, self.gate_fused
         )
 
-    def check_arena(self, arena: KdaArena, *, backward: bool = True) -> None:
+    def check_arena(self, arena: KdaDetArena, *, backward: bool = True) -> None:
         """``ValueError`` when ``arena`` cannot serve this plan: a lean arena on a backward row that dispatches the
         separate ``dav`` program (H 9-15; the lean layouts keep no ``dv1`` and no whole-sequence ``dAqk``), a
         batched arena on a row whose block table gives the documents proportional segment counts (at most
@@ -573,12 +573,12 @@ class Plan:
             )
         ):
             raise ValueError(
-                f"KdaArena(lean=True) does not serve H={self.H}: the backward of this row launches the separate "
+                f"KdaDetArena(lean=True) does not serve H={self.H}: the backward of this row launches the separate "
                 "dA / dv program (dav); the lean layouts serve the contract's head counts 1, 2, 4, 8, 16, 32, 64"
             )
         if arena.batched and self.proportional:
             raise ValueError(
-                f"KdaArena(batch_tokens=...) does not serve num_docs={self.N}, H={self.H}: with at most "
+                f"KdaDetArena(batch_tokens=...) does not serve num_docs={self.N}, H={self.H}: with at most "
                 f"{cake_jit.SEGMENTS['prop_max_chains']} (document, head) chains the segmented route's block table "
                 "gives the documents proportional segment counts, which a group of fewer documents would change; "
                 "the batched option serves the rows above that chain count and the serial route"
@@ -589,16 +589,16 @@ class Plan:
         *,
         backward: bool = True,
         save_mode: str = "light",
-        arena: KdaArena | None = None,
+        arena: KdaDetArena | None = None,
         doc_lengths: Sequence[int] | None = None,
         fwd_layout: str = "fwd",
     ) -> int:
-        """The arena a :class:`KdaWorkspace` of this plan allocates: the larger of the saved-set and the replay
+        """The arena a :class:`KdaDetWorkspace` of this plan allocates: the larger of the saved-set and the replay
         layouts for a backward workspace (both paths run in it), the forward layout otherwise (``fwd_layout``,
         :data:`FWD_LAYOUTS`); under a lean ``arena`` the lean layout of its ``tail_passes`` (the saved-set paths
         only); under a batched ``arena`` the largest group's layout, over the groups of ``doc_lengths`` when given,
         else over the bound of every group of ``batch_tokens`` tokens (:meth:`batch_bound`)."""
-        arena = KdaArena() if arena is None else arena
+        arena = KdaDetArena() if arena is None else arena
         self.check_arena(arena, backward=backward)
         if not arena.batched:
             return _arena_bytes(
@@ -640,7 +640,7 @@ class Plan:
         none negative, summing to ``S``); ``ValueError`` otherwise, or when they are missing."""
         if doc_lengths is None:
             raise ValueError(
-                "doc_lengths: the batched arena option (KdaArena(batch_tokens=...)) needs the documents' token "
+                "doc_lengths: the batched arena option (KdaDetArena(batch_tokens=...)) needs the documents' token "
                 "counts as host integers (one per document in cu_seqlens order, summing to S): the host reads no "
                 "tensor, so cu_seqlens cannot supply them"
             )
@@ -657,7 +657,7 @@ class Plan:
         return lengths
 
     def batches(
-        self, arena: KdaArena, doc_lengths: Sequence[int] | None
+        self, arena: KdaDetArena, doc_lengths: Sequence[int] | None
     ) -> tuple[Batch, ...]:
         """The document groups (:class:`Batch`) of this problem under a batched ``arena`` (:func:`doc_batches` of
         ``doc_lengths``, with every group's first chunk and chunk bounds)."""
@@ -680,7 +680,7 @@ class Plan:
         """The segment count of one group: ``P`` per document on the segmented route, none on the serial one."""
         return batch.N * self.P if self.recur == "seg" else 0
 
-    def batch_bound(self, arena: KdaArena) -> tuple[int, int, int]:
+    def batch_bound(self, arena: KdaDetArena) -> tuple[int, int, int]:
         """``(NC_pad, R, NSEG)`` at or above every group's under ``arena`` for any ``doc_lengths``: the chunk bound
         of ``batch_tokens`` tokens in all the documents (a group has at most the budget's tokens and at most every
         document), capped at the whole problem's, and the whole problem's segment count."""
@@ -770,7 +770,7 @@ def plan(S: int, num_docs: int, H: int, sm_count: int, arch: str | None = None) 
 
     ``arch`` selects the architecture's records and, on the few-chain segmented rows, its segment count
     (:func:`cake_jit.segment_plan`; ``None``: the current CUDA device's architecture, so the plan serves a
-    :class:`KdaWorkspace` on that device; without an exported device at hand the first exported architecture; the
+    :class:`KdaDetWorkspace` on that device; without an exported device at hand the first exported architecture; the
     byte queries below take an ``arch`` of their own).  ``ValueError`` when a scalar is below one, ``num_docs``
     exceeds :data:`MAX_DOCS` (the depth of the layout table's document search) or an int32 offset of the kernels
     would overflow: ``H * 128 * 64`` per chunk, ``R * H * 64`` over the padded rows of the ``[R, H, 64]``
@@ -914,8 +914,8 @@ def arena_for_budget(
     backward: bool = True,
     save_mode: str = "light",
     doc_lengths: Sequence[int] | None = None,
-) -> KdaArena:
-    """The first arena option (:class:`KdaArena`) whose arena fits ``arena_budget_bytes`` on plan ``p``: the
+) -> KdaDetArena:
+    """The first arena option (:class:`KdaDetArena`) whose arena fits ``arena_budget_bytes`` on plan ``p``: the
     default, ``lean=True``, two tail passes, four, then four passes over document groups of ``batch_tokens``
     tokens, halving from half the pack down to the longest document and last one document per group
     (``doc_lengths`` required from the batched steps on: the floor is the longest document, and a smaller budget
@@ -925,7 +925,7 @@ def arena_for_budget(
     budget = int(arena_budget_bytes)
     smallest: int | None = None
 
-    def fits(option: KdaArena) -> bool | None:
+    def fits(option: KdaDetArena) -> bool | None:
         nonlocal smallest
         try:
             nbytes = p.arena_bytes(
@@ -941,10 +941,10 @@ def arena_for_budget(
 
     lean_ok = False
     for option in (
-        KdaArena(),
-        KdaArena(lean=True),
-        KdaArena(lean=True, tail_passes=2),
-        KdaArena(lean=True, tail_passes=4),
+        KdaDetArena(),
+        KdaDetArena(lean=True),
+        KdaDetArena(lean=True, tail_passes=2),
+        KdaDetArena(lean=True, tail_passes=4),
     ):
         verdict = fits(option)
         lean_ok = lean_ok or (option.lean and verdict is not None)
@@ -959,7 +959,7 @@ def arena_for_budget(
     tokens = max(longest, p.S // 2)
     passes = 4 if lean_ok else 1
     while True:
-        option = KdaArena(lean=lean_ok, tail_passes=passes, batch_tokens=tokens)
+        option = KdaDetArena(lean=lean_ok, tail_passes=passes, batch_tokens=tokens)
         verdict = fits(option)
         if verdict:
             return option
@@ -971,7 +971,7 @@ def arena_for_budget(
         if tokens <= longest:
             break
         tokens = max(longest, tokens // 2)
-    option = KdaArena(
+    option = KdaDetArena(
         lean=lean_ok, tail_passes=passes, batch_tokens=longest, max_docs_per_batch=1
     )
     if fits(option):
@@ -1472,15 +1472,15 @@ def _arena_bytes(
     *,
     backward: bool,
     save_mode: str,
-    arena: KdaArena | None = None,
+    arena: KdaDetArena | None = None,
     gate_fused: bool = False,
     fwd_layout: str = "fwd",
 ) -> int:
-    """The arena a :class:`KdaWorkspace` of the problem allocates: the larger of the saved-set and the replay
+    """The arena a :class:`KdaDetWorkspace` of the problem allocates: the larger of the saved-set and the replay
     layouts for a backward workspace (both paths run in it), the forward layout otherwise (``fwd_layout``, one of
     :data:`FWD_LAYOUTS`: ``"fwd_kcp"`` sizes a forward-only light arena of the whole problem for the
     context-parallel route); the ``*_tape`` layouts under ``save_mode="tape"``; under a lean ``arena``
-    (:class:`KdaArena`) the lean layout of its ``tail_passes`` alone (a lean workspace serves no replay);
+    (:class:`KdaDetArena`) the lean layout of its ``tail_passes`` alone (a lean workspace serves no replay);
     ``gate_fused`` drops the gate epilogue's buffers."""
     tape = save_mode == "tape"
     if fwd_layout not in FWD_LAYOUTS:
@@ -1519,13 +1519,13 @@ def workspace_bytes(
     save_mode: str = "light",
     sm_count: int | None = None,
     arch: str | None = None,
-    arena: KdaArena | None = None,
+    arena: KdaDetArena | None = None,
     doc_lengths: Sequence[int] | None = None,
     fwd_layout: str = "fwd",
 ) -> int:
-    """Arena bytes a :class:`KdaWorkspace` of the problem allocates (``backward=False``: the forward's layout only,
+    """Arena bytes a :class:`KdaDetWorkspace` of the problem allocates (``backward=False``: the forward's layout only,
     ``fwd_layout`` of :data:`FWD_LAYOUTS`; a backward workspace takes the larger of the saved-set paths' layout and
-    the replay's; ``save_mode`` selects the tape layouts; ``arena`` the lower-memory option, :class:`KdaArena`,
+    the replay's; ``save_mode`` selects the tape layouts; ``arena`` the lower-memory option, :class:`KdaDetArena`,
     whose batched form sizes the arena for the groups of ``doc_lengths`` when given, else for the bound of every
     group).  A function of the host scalars
     and, through the segmented route's segment count, of
@@ -1718,13 +1718,13 @@ def memory_report(
     *,
     sm_count: int | None = None,
     arch: str | None = None,
-    arena: KdaArena | None = None,
+    arena: KdaDetArena | None = None,
     doc_lengths: Sequence[int] | None = None,
 ) -> dict[str, Any]:
     """Bytes one problem needs beyond its inputs: the arena (forward-only and full, with the saved-set paths' and
     the replay's backward layouts apart), the saved set, the outputs and the totals of the three boundaries (arena
     + the per-call tensors live at the peak).  ``sm_count`` and ``arch`` (:func:`_arch_sms`: the current device's
-    when ``None``) select the segmented route's segment count.  ``arena`` (:class:`KdaArena`) adds the configured
+    when ``None``) select the segmented route's segment count.  ``arena`` (:class:`KdaDetArena`) adds the configured
     arenas (``arena_bwd_configured`` / ``arena_fwd_configured``; the default's stays ``arena_bwd``), the floor of
     the lean layouts (``arena_floor``: 2820 B per internal token-head plus three state blocks) and recomputes the
     totals with the configured backward arena (the replay total keeps the default's: a lean workspace serves no
@@ -1742,7 +1742,7 @@ def memory_report(
     tape = save_mode == "tape"
     arch, sms = _arch_sms(sm_count, arch)
     S, num_docs, H = int(S), int(num_docs), int(H)
-    arena = KdaArena() if arena is None else arena
+    arena = KdaDetArena() if arena is None else arena
     p = (
         plan(S, num_docs, H, sms, arch)
         if (arena.lean or arena.batched or doc_lengths is not None)
@@ -1856,7 +1856,7 @@ def memory_report(
         "arena_bwd": arena_bwd,
         "arena_bwd_layout_saved_path": arena_saved,
         "arena_bwd_layout_replay_path": arena_replay,
-        # the lower-memory arena option (KdaArena): off -> the configured arenas equal the defaults
+        # the lower-memory arena option (KdaDetArena): off -> the configured arenas equal the defaults
         "lean": arena.lean,
         "tail_passes": arena.tail_passes,
         "batch_tokens": arena.batch_tokens,
@@ -1901,7 +1901,7 @@ def _alloc(
 
 
 @dataclasses.dataclass(frozen=True)
-class KdaChunkSaved:
+class KdaDetChunkSaved:
     """The forward's saved set.
 
     Version 4 (``save_mode="light"``, the default): ``Aqk`` / ``Akk`` BF16 ``[S, H, 64]`` on the token rows (row
@@ -1978,7 +1978,7 @@ def _group_tail_passes(
     p: Plan,
     batch: Batch,
     nc_pad: int,
-    arena: KdaArena,
+    arena: KdaDetArena,
     *,
     nbytes: int,
     save_mode: str,
@@ -1986,7 +1986,7 @@ def _group_tail_passes(
     """The tail passes of one document group's backward at chunk bound ``nc_pad`` under the batched ``arena`` in an
     arena of ``nbytes``: the fewest, up to the option's ``tail_passes``, whose lean layouts at the group's geometry
     fit those bytes (the layouts the workspace's backward takes: ``bwd_tape_lean`` on a tape-mode workspace, also
-    ``bwd_lean`` on a light one), else the option's (:meth:`KdaWorkspace.views` checks that one).  The arena is
+    ``bwd_lean`` on a light one), else the option's (:meth:`KdaDetWorkspace.views` checks that one).  The arena is
     sized for the largest group at the option's passes, so a smaller group runs its tail in fewer passes; the
     split only partitions the tail's chunk ranges, so every pass count gives the same gradients bit for bit."""
     if arena.tail_passes == 1:
@@ -2005,7 +2005,7 @@ def _group_tail_passes(
 
 @dataclasses.dataclass(frozen=True, eq=False)
 class _Packing:
-    """One ``doc_lengths`` of a batched workspace (:meth:`KdaWorkspace.batches`), derived on the host from the
+    """One ``doc_lengths`` of a batched workspace (:meth:`KdaDetWorkspace.batches`), derived on the host from the
     lengths alone: the document groups (:meth:`Plan.batches`); on the segmented route, per group, where its state
     blocks are one run of the whole problem's the first of them (``blocks``; a group's tables rank its documents by
     the whole problem's rule, so its chains keep their relative order), else ``None`` and the group's block
@@ -2067,7 +2067,7 @@ class _Packing:
 
 def _host_packing(
     p: Plan,
-    arena: KdaArena,
+    arena: KdaDetArena,
     lengths: tuple[int, ...],
     *,
     nbytes: int,
@@ -2111,10 +2111,10 @@ def _host_packing(
     )
 
 
-class KdaWorkspace:
+class KdaDetWorkspace:
     """One arena of internal-layout intermediates for one problem shape, allocated once and reused by every call.
 
-    :func:`chunk_kda_fwd` / :func:`chunk_kda_bwd` allocate only their outputs (and the saved set with its tables).
+    :func:`chunk_kda_det_fwd` / :func:`chunk_kda_det_bwd` allocate only their outputs (and the saved set with its tables).
     ``backward=False`` sizes the arena for the forward only; a backward workspace is sized for the larger of the
     saved-set paths' layout and the replay's (both run in it).  ``save_mode`` is the default of the calls on this
     workspace and sizes the arena for the tape layouts.  ``views(mode)`` are the buffer views of one layout on
@@ -2123,7 +2123,7 @@ class KdaWorkspace:
     not initialized: every element a launch reads is written earlier in the same call (the layout note), so its
     content at allocation never reaches a result; ``zero_init=True`` fills it with zeros for diagnostics (an
     arena of 2.5 GiB takes about 0.35 ms per fill).  ``launcher`` replaces ``cake_jit.run_module`` for
-    diagnostics only.  ``arena`` (:class:`KdaArena`, off by default; kept as :attr:`arena_option`, the attribute
+    diagnostics only.  ``arena`` (:class:`KdaDetArena`, off by default; kept as :attr:`arena_option`, the attribute
     ``arena`` being the uint8 arena tensor) selects the lower-memory arena option: the lean backward layouts (no
     replay on this workspace), the tail split into ``tail_passes`` passes and the document groups of
     ``batch_tokens``; under a batched option ``doc_lengths`` (the documents' token counts) sizes the arena for the
@@ -2144,15 +2144,15 @@ class KdaWorkspace:
         zero_init: bool = False,
         save_mode: str = "light",
         launcher: Launcher | None = None,
-        arena: KdaArena | None = None,
+        arena: KdaDetArena | None = None,
         doc_lengths: Sequence[int] | None = None,
         fwd_layout: str = "fwd",
     ) -> None:
         if save_mode not in SAVE_MODES:
             raise ValueError(
-                f"KdaWorkspace: save_mode must be one of {SAVE_MODES}, got {save_mode!r}"
+                f"KdaDetWorkspace: save_mode must be one of {SAVE_MODES}, got {save_mode!r}"
             )
-        self.arena_option = KdaArena() if arena is None else arena
+        self.arena_option = KdaDetArena() if arena is None else arena
         plan.check_arena(self.arena_option, backward=backward)
         self.doc_lengths = (
             None if doc_lengths is None else plan.check_doc_lengths(doc_lengths)
@@ -2163,7 +2163,7 @@ class KdaWorkspace:
         self.arch = cake_jit.device_arch(self.device_index)
         if plan.arch != self.arch:
             raise ValueError(
-                f"KdaWorkspace: the plan selects the records of {plan.arch}, the device is {self.arch}"
+                f"KdaDetWorkspace: the plan selects the records of {plan.arch}, the device is {self.arch}"
             )
         self.backward = backward
         self.save_mode = save_mode
@@ -2193,7 +2193,7 @@ class KdaWorkspace:
         # the batched option's views of this arena per group geometry, and per doc_lengths its groups with their
         # host-derived state blocks and tail counts and the device copy of those integers (None until a call needs
         # it); the doc_lengths a CUDA-graph capture used, whose entries the cache keeps for the workspace's lifetime
-        self._batch_views: dict[tuple[int, int, int], KdaWorkspace] = {}
+        self._batch_views: dict[tuple[int, int, int], KdaDetWorkspace] = {}
         self._doc_cache: dict[tuple[int, ...], _Packing] = {}
         self._doc_graphs: set[tuple[int, ...]] = set()
 
@@ -2208,7 +2208,7 @@ class KdaWorkspace:
             need = self.plan.workspace_bytes(mode, tail)
             if need > self.bytes:
                 raise ValueError(
-                    f"KdaWorkspace: layout {mode!r} of the plan (S={self.plan.S}, num_docs={self.plan.N}) needs "
+                    f"KdaDetWorkspace: layout {mode!r} of the plan (S={self.plan.S}, num_docs={self.plan.N}) needs "
                     f"{need} B, the arena has {self.bytes} B (allocated for backward={self.backward}, "
                     f"save_mode={self.save_mode!r}, arena={self.arena_option}, doc_lengths={self.doc_lengths})"
                 )
@@ -2284,10 +2284,10 @@ class KdaWorkspace:
         backward: bool = True,
         save_mode: str = "light",
         launcher: Launcher | None = None,
-        arena: KdaArena | None = None,
+        arena: KdaDetArena | None = None,
         doc_lengths: Sequence[int] | None = None,
         fwd_layout: str = "fwd",
-    ) -> KdaWorkspace:
+    ) -> KdaDetWorkspace:
         """A workspace for ``S`` tokens in ``num_docs`` documents with ``H`` heads on ``device``."""
         index = _device_index(torch.device(device))
         return cls(
@@ -2314,7 +2314,7 @@ class KdaWorkspace:
         backward: bool = True,
         save_mode: str = "light",
         launcher: Launcher | None = None,
-    ) -> KdaWorkspace:
+    ) -> KdaDetWorkspace:
         """A workspace of the first arena option whose arena fits ``arena_budget_bytes`` (:func:`arena_for_budget`:
         the default, lean, two tail passes, four, then four passes over document groups halving from half the pack
         down to one document per group, which needs ``doc_lengths``); ``ValueError`` when none fits."""
@@ -2337,12 +2337,12 @@ class KdaWorkspace:
             doc_lengths=doc_lengths,
         )
 
-    def _view(self, plan: Plan) -> KdaWorkspace:
+    def _view(self, plan: Plan) -> KdaDetWorkspace:
         """A view of this arena under ``plan``: the same bytes, ``eye`` / ``flags`` and epoch counter (the overlap
         pair's release flags live in the eye, stamped with the launch's epoch: views sharing the flags must share
         the counter, or a later launch's pass 2 could pass its wait on a flag an earlier one left), with a view
         cache of its own."""
-        other = KdaWorkspace.__new__(KdaWorkspace)
+        other = KdaDetWorkspace.__new__(KdaDetWorkspace)
         other.__dict__.update(self.__dict__)
         other.plan = plan
         other._views_cache = {}
@@ -2351,7 +2351,7 @@ class KdaWorkspace:
         other._doc_graphs = set()
         return other
 
-    def with_plan(self, plan: Plan) -> KdaWorkspace:
+    def with_plan(self, plan: Plan) -> KdaDetWorkspace:
         """A workspace sharing this arena under another plan of the same ``(S, num_docs, H)`` problem (its layouts
         must fit the arena when used)."""
         if (plan.S, plan.N, plan.H) != (self.plan.S, self.plan.N, self.plan.H):
@@ -2360,7 +2360,7 @@ class KdaWorkspace:
             )
         return self._view(plan)
 
-    def batch_view(self, batch: Batch, *, tape: bool = False) -> KdaWorkspace:
+    def batch_view(self, batch: Batch, *, tape: bool = False) -> KdaDetWorkspace:
         """The view of this arena under the plan of one document group (:meth:`Plan.batch_plan`; ``tape`` selects
         the geometry of the group's views of a whole-problem tape), cached per group geometry: the group's layouts
         on the same bytes (they must fit: :meth:`views` checks), the shared ``eye`` / ``flags`` and epoch counter,
@@ -2416,7 +2416,7 @@ class KdaWorkspace:
         if entry.words_dev is None:
             if capturing:
                 raise RuntimeError(
-                    "KdaWorkspace: a batched arena under CUDA-graph capture needs the device copy of these "
+                    "KdaDetWorkspace: a batched arena under CUDA-graph capture needs the device copy of these "
                     "doc_lengths made before the capture: pass a caller-owned workspace and run it once with "
                     "these doc_lengths outside the capture"
                 )
@@ -2489,7 +2489,7 @@ class KdaWorkspace:
 # stream take a workspace of their own, so no two queued calls share an eye.
 _ENTRY_KEYS = 64
 _ENTRY_PER_KEY = 2
-_entry_pool: collections.OrderedDict[tuple[Any, ...], list[KdaWorkspace]] = (
+_entry_pool: collections.OrderedDict[tuple[Any, ...], list[KdaDetWorkspace]] = (
     collections.OrderedDict()
 )
 _entry_lock = threading.Lock()
@@ -2503,14 +2503,14 @@ def _entry_acquire(
     *,
     backward: bool,
     save_mode: str,
-    arena: KdaArena | None,
+    arena: KdaDetArena | None,
     doc_lengths: Sequence[int] | None,
-) -> tuple[KdaWorkspace, tuple[Any, ...] | None]:
+) -> tuple[KdaDetWorkspace, tuple[Any, ...] | None]:
     """The workspace of one call without a workspace argument, with its arena storage allocated, and its pool key
     (``None``: a workspace of this call alone, under CUDA-graph capture, whose device allocations belong to the
-    graph; a batched arena is refused there, :meth:`KdaWorkspace.batches`)."""
+    graph; a batched arena is refused there, :meth:`KdaDetWorkspace.batches`)."""
     if torch.cuda.is_current_stream_capturing():
-        ws = KdaWorkspace.for_problem(
+        ws = KdaDetWorkspace.for_problem(
             S,
             N,
             H,
@@ -2522,7 +2522,7 @@ def _entry_acquire(
         )
         return ws, None
     index = _device_index(device)
-    option = KdaArena() if arena is None else arena
+    option = KdaDetArena() if arena is None else arena
     lengths = (
         tuple(int(x) for x in doc_lengths)
         if option.batched and doc_lengths is not None
@@ -2543,7 +2543,7 @@ def _entry_acquire(
         free = _entry_pool.get(key)
         ws = free.pop() if free else None
     if ws is None:
-        ws = KdaWorkspace.for_problem(
+        ws = KdaDetWorkspace.for_problem(
             S,
             N,
             H,
@@ -2561,7 +2561,7 @@ def _entry_acquire(
     return ws, key
 
 
-def _entry_release(ws: KdaWorkspace, key: tuple[Any, ...] | None) -> None:
+def _entry_release(ws: KdaDetWorkspace, key: tuple[Any, ...] | None) -> None:
     """Free the device memory of a call's workspace (arena storage, eye, the device copies of doc_lengths and of
     what derives from them: the caching allocator takes them back on the call's stream, as when a per-call tensor
     dies) and keep the rest for the next call with the same key."""
@@ -2583,7 +2583,7 @@ def _entry_release(ws: KdaWorkspace, key: tuple[Any, ...] | None) -> None:
 
 @contextlib.contextmanager
 def _workspace(
-    workspace: KdaWorkspace | None,
+    workspace: KdaDetWorkspace | None,
     S: int,
     N: int,
     H: int,
@@ -2591,9 +2591,9 @@ def _workspace(
     *,
     backward: bool,
     save_mode: str | None = None,
-    arena: KdaArena | None = None,
+    arena: KdaDetArena | None = None,
     doc_lengths: Sequence[int] | None = None,
-) -> Iterator[KdaWorkspace]:
+) -> Iterator[KdaDetWorkspace]:
     """The workspace of one call: the caller's (checked against the problem) or, without one, the call's own,
     whose device memory lives for the call alone (:func:`_entry_acquire`)."""
     if workspace is None:
@@ -2705,7 +2705,7 @@ def _ranked(x: torch.Tensor, batched: bool) -> torch.Tensor:
 
 
 def _values(
-    ws: KdaWorkspace,
+    ws: KdaDetWorkspace,
     views: types.SimpleNamespace,
     tables: tuple[torch.Tensor, ...],
     **extra: Any,
@@ -2735,7 +2735,7 @@ def _values(
 
 
 def _tables(
-    ws: KdaWorkspace, cu_seqlens: torch.Tensor, path: str
+    ws: KdaDetWorkspace, cu_seqlens: torch.Tensor, path: str
 ) -> tuple[torch.Tensor, ...]:
     """A fresh table buffer (pad entries are written as zeros): the four table views and, on the segmented route,
     the block table ``seg_table`` (``[NSEG + 2 * num_docs + 1]``: the chains' first segments in the layout table's
@@ -2764,7 +2764,7 @@ def _tables(
     return tables
 
 
-def _check_tables(saved: KdaChunkSaved, ws: KdaWorkspace) -> None:
+def _check_tables(saved: KdaDetChunkSaved, ws: KdaDetWorkspace) -> None:
     p = ws.plan
     layout = p.table_layout()
     if saved.tables is None or len(saved.tables) != len(layout):
@@ -2781,12 +2781,12 @@ def _assert_doc_lengths(cu_seqlens: torch.Tensor, lengths: torch.Tensor) -> None
     before a group's tables could be written past the geometry the host derived.  Three tiny kernels per call."""
     torch._assert_async(
         (cu_seqlens[1:] - cu_seqlens[:-1]).eq(lengths).all(),
-        "cake_kda_train: doc_lengths do not match cu_seqlens",
+        "cake_kda_det_train: doc_lengths do not match cu_seqlens",
     )
 
 
 def _fwd_intra(
-    ws: KdaWorkspace,
+    ws: KdaDetWorkspace,
     values: dict[str, Any],
     *,
     path: str,
@@ -2814,7 +2814,7 @@ def _fwd_intra(
 
 
 def _forward_recurrence(
-    ws: KdaWorkspace,
+    ws: KdaDetWorkspace,
     values: dict[str, Any],
     *,
     path: str,
@@ -2883,7 +2883,7 @@ def _forward_recurrence(
 
 
 def _adjoint_recurrence(
-    ws: KdaWorkspace,
+    ws: KdaDetWorkspace,
     views: types.SimpleNamespace,
     values: dict[str, Any],
     *,
@@ -2922,14 +2922,14 @@ def _adjoint_recurrence(
     )
 
 
-def _two_level(ws: KdaWorkspace, path: str) -> bool:
+def _two_level(ws: KdaDetWorkspace, path: str) -> bool:
     """Whether ``path``'s carry record is the two-level carry (its grid rule is ``carry_groups``)."""
     name = ws.plan.record("seg_carry", path)
     return cake_jit.MODULES[name]["grid_rule"]["kind"] == "carry_groups"
 
 
 def _two_level_operands(
-    ws: KdaWorkspace, path: str, carry_out: torch.Tensor
+    ws: KdaDetWorkspace, path: str, carry_out: torch.Tensor
 ) -> dict[str, Any]:
     """The two-level carry's operands beyond the chain carry's: the carried states viewed as ``[NSEG * H, 128,
     128]`` tiles (the groups' products ride in them), the plan's segment group size, the release flags under a
@@ -2958,7 +2958,7 @@ def _tail_ranges(NC_pad: int, passes: int) -> tuple[tuple[int, int], ...]:
 
 
 def _tail_passes(
-    ws: KdaWorkspace,
+    ws: KdaDetWorkspace,
     views: types.SimpleNamespace,
     values: dict[str, Any],
     tables: tuple[torch.Tensor, ...],
@@ -3049,7 +3049,7 @@ def _saved_rows(
 
 
 def _forward_launches(
-    ws: KdaWorkspace,
+    ws: KdaDetWorkspace,
     views: types.SimpleNamespace,
     cu_seqlens: torch.Tensor,
     tables: tuple[torch.Tensor, ...],
@@ -3114,7 +3114,7 @@ def _forward_launches(
     )
 
 
-def chunk_kda_fwd(
+def chunk_kda_det_fwd(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -3124,11 +3124,11 @@ def chunk_kda_fwd(
     *,
     scale: float = SCALE,
     save_for_backward: bool = True,
-    workspace: KdaWorkspace | None = None,
+    workspace: KdaDetWorkspace | None = None,
     save_mode: str | None = None,
-    arena: KdaArena | None = None,
+    arena: KdaDetArena | None = None,
     doc_lengths: Sequence[int] | None = None,
-) -> tuple[torch.Tensor, KdaChunkSaved | None]:
+) -> tuple[torch.Tensor, KdaDetChunkSaved | None]:
     """The forward: ``out`` BF16 like ``v`` (a fresh tensor) and the saved set (``None`` without
     ``save_for_backward``; fresh ``Aqk`` / ``Akk`` and tables and, with ``save_mode="light"`` (version 4), the
     fold's fresh ``qg``, on the segmented route when ``S >= 384 * NSEG`` the fresh segment-boundary states ``hseg``
@@ -3149,11 +3149,11 @@ def chunk_kda_fwd(
     program and 32-column recurrence (``wy_fwd_rows``, ``fwdh_o_v2_rows``) read those rows and the intra program writes
     no internal copies (``write_int = 0``, :meth:`Plan.internal_rows`); every other forward keeps the internal-row
     programs and the copies.  The ``h`` / ``v_new`` tapes are written only in tape mode.  ``workspace``
-    (:class:`KdaWorkspace`, the forward layout at least)
+    (:class:`KdaDetWorkspace`, the forward layout at least)
     is reused; without one the call allocates its arena and frees it on return (the plan and the layout views of
     a repeated problem are reused, so the host cost is close to a caller-owned workspace's: the call adds the
     arena's allocation and the eye's rebuild).  ``save_mode=None`` takes the workspace's
-    default.  ``arena`` (:class:`KdaArena`) is the lower-memory arena option: the forward's layout is the same
+    default.  ``arena`` (:class:`KdaDetArena`) is the lower-memory arena option: the forward's layout is the same
     under every option (``None`` takes the workspace's; a differing option on a given workspace is refused).
 
     Under a batched option (``batch_tokens``) the call takes ``doc_lengths`` (the documents' token counts, host
@@ -3165,7 +3165,7 @@ def chunk_kda_fwd(
     saved set carries them, as always), and the groups' saved states go into the whole problem's by chain rank
     (ranked on the host from ``doc_lengths`` by the tables' rule): where a group's blocks are one run of them, the
     carry writes its carried states straight into the saved ``hseg`` and its offsets / transfers are contiguous
-    copies; otherwise they are scattered by index.  The outputs are bitwise the whole problem's (:class:`KdaArena`
+    copies; otherwise they are scattered by index.  The outputs are bitwise the whole problem's (:class:`KdaDetArena`
     on the sign of exact zeros).
     """
     q, k, v, g, beta, S, N, H, batched = _operands(q, k, v, g, beta, cu_seqlens)
@@ -3197,7 +3197,7 @@ def chunk_kda_fwd(
 
 
 def _forward(
-    ws: KdaWorkspace,
+    ws: KdaDetWorkspace,
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -3209,15 +3209,15 @@ def _forward(
     save_for_backward: bool,
     save_mode: str | None,
     doc_lengths: Sequence[int] | None,
-) -> tuple[torch.Tensor, KdaChunkSaved | None]:
-    """:func:`chunk_kda_fwd` on the call's workspace, the operands without their batch axis: ``out`` ``[S, H, 128]``
+) -> tuple[torch.Tensor, KdaDetChunkSaved | None]:
+    """:func:`chunk_kda_det_fwd` on the call's workspace, the operands without their batch axis: ``out`` ``[S, H, 128]``
     and the saved set."""
     p = ws.plan
     S, N, H = p.S, p.N, p.H
     save_mode = ws.save_mode if save_mode is None else save_mode
     if save_mode not in SAVE_MODES:
         raise ValueError(
-            f"chunk_kda_fwd: save_mode must be one of {SAVE_MODES}, got {save_mode!r}"
+            f"chunk_kda_det_fwd: save_mode must be one of {SAVE_MODES}, got {save_mode!r}"
         )
     tape = save_mode == "tape" and save_for_backward
     # A tape-mode workspace sizes its arena for the tape layouts (h / v_new outside the arena), so a call on it
@@ -3370,7 +3370,7 @@ def _forward(
     saved = None
     if save_for_backward:
         if tape:
-            saved = KdaChunkSaved(
+            saved = KdaDetChunkSaved(
                 SAVED_VERSION_TAPE,
                 aqk_ext,
                 akk_ext,
@@ -3384,7 +3384,7 @@ def _forward(
                 seg_m=seg_m,
             )
         else:
-            saved = KdaChunkSaved(
+            saved = KdaDetChunkSaved(
                 SAVED_VERSION,
                 aqk_ext,
                 akk_ext,
@@ -3403,7 +3403,7 @@ def _forward(
 
 
 def _backward_launches(
-    ws: KdaWorkspace,
+    ws: KdaDetWorkspace,
     views: types.SimpleNamespace,
     cu_seqlens: torch.Tensor,
     tables: tuple[torch.Tensor, ...],
@@ -3523,7 +3523,7 @@ def _backward_launches(
         _tail_passes(ws, b, values, tables, path=path, h=h, nc_vec=nc_vec)
 
 
-def chunk_kda_bwd(
+def chunk_kda_det_bwd(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -3532,10 +3532,10 @@ def chunk_kda_bwd(
     cu_seqlens: torch.Tensor,
     dout: torch.Tensor,
     *,
-    saved: KdaChunkSaved | None = None,
+    saved: KdaDetChunkSaved | None = None,
     scale: float = SCALE,
-    workspace: KdaWorkspace | None = None,
-    arena: KdaArena | None = None,
+    workspace: KdaDetWorkspace | None = None,
+    arena: KdaDetArena | None = None,
     doc_lengths: Sequence[int] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """The backward: fresh ``(dq, dk, dv, dbeta, dg)`` ranked like the inputs.
@@ -3552,10 +3552,10 @@ def chunk_kda_bwd(
     [intra], [WY], [the recurrence recompute], [dA / dv], the
     adjoint recurrence, the fused dq / dk / dg, GLM intra and [the gate epilogue], where the bracketed ones depend
     on the path and the row (``Plan.launch_count(path)``; the tables are rebuilt when the saved set carries
-    none).  The backward writes nothing into the saved set.  ``workspace`` (:class:`KdaWorkspace` with the
+    none).  The backward writes nothing into the saved set.  ``workspace`` (:class:`KdaDetWorkspace` with the
     backward layout) is reused; without one the call allocates its arena and frees it on return, as the forward
     does.  ``arena``
-    (:class:`KdaArena`): the lower-memory option of that per-call workspace (``None`` takes a given workspace's
+    (:class:`KdaDetArena`): the lower-memory option of that per-call workspace (``None`` takes a given workspace's
     option; a differing one is refused); a lean per-call arena is sized for the saved set's version (the tape
     layouts for a version-2 set).  A lean workspace serves no replay (``saved=None``): the lean layouts and the
     tail split (``tail_passes``: steps 6-8 once per chunk range, :func:`_tail_passes`) are the saved-set paths'.
@@ -3570,7 +3570,7 @@ def chunk_kda_bwd(
     recomputed in its view (``light``, ``replay``: the replay runs group by group on a workspace that is not lean),
     and on a lean workspace its tail in the fewest passes, up to the option's, whose layout fits the arena
     (:func:`_group_tail_passes`) with their chunk counts from the host.  The gradients are bitwise the whole
-    problem's (:class:`KdaArena` on the sign of exact zeros).
+    problem's (:class:`KdaDetArena` on the sign of exact zeros).
     """
     q, k, v, g, beta, S, N, H, batched = _operands(q, k, v, g, beta, cu_seqlens)
     dout = _squeeze_batch(dout, "dout", 3)
@@ -3578,11 +3578,11 @@ def chunk_kda_bwd(
     option = (
         arena
         if arena is not None
-        else (KdaArena() if workspace is None else workspace.arena_option)
+        else (KdaDetArena() if workspace is None else workspace.arena_option)
     )
     if saved is None and option.lean:
         raise ValueError(
-            "chunk_kda_bwd: a lean arena (KdaArena(lean=True"
+            "chunk_kda_det_bwd: a lean arena (KdaDetArena(lean=True"
             + (", batch_tokens=...)" if option.batched else ")")
             + ") serves no checkpoint replay (saved=None): pass the saved set, or run the replay on a workspace "
             "with lean=False"
@@ -3623,7 +3623,7 @@ def chunk_kda_bwd(
 
 
 def _backward(
-    ws: KdaWorkspace,
+    ws: KdaDetWorkspace,
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -3632,11 +3632,11 @@ def _backward(
     cu_seqlens: torch.Tensor,
     dout: torch.Tensor,
     *,
-    saved: KdaChunkSaved | None,
+    saved: KdaDetChunkSaved | None,
     scale: float,
     doc_lengths: Sequence[int] | None,
 ) -> tuple[torch.Tensor, ...]:
-    """:func:`chunk_kda_bwd` on the call's workspace, the operands without their batch axis: ``(dq, dk, dv, dbeta,
+    """:func:`chunk_kda_det_bwd` on the call's workspace, the operands without their batch axis: ``(dq, dk, dv, dbeta,
     dg)``."""
     p = ws.plan
     S, N, H = p.S, p.N, p.H
@@ -3866,7 +3866,7 @@ def _backward(
 # autograd
 
 
-# The per-version extra saved tensors ChunkKDAFunction hands to autograd, in this order (absent ones are dropped
+# The per-version extra saved tensors ChunkKDADetFunction hands to autograd, in this order (absent ones are dropped
 # and the presence mask travels in the context: the version-4 fields are optional independently -- qg where the
 # light prep writes none, the states under the size rule, w / u on their rows).
 _EXTRA_FIELDS = {
@@ -3876,7 +3876,7 @@ _EXTRA_FIELDS = {
 
 
 def _saved_extra(
-    saved: KdaChunkSaved,
+    saved: KdaDetChunkSaved,
 ) -> tuple[tuple[torch.Tensor, ...], tuple[str, ...]]:
     """The present extra tensors of ``saved`` and their field names, in :data:`_EXTRA_FIELDS` order."""
     pairs = [
@@ -3887,13 +3887,13 @@ def _saved_extra(
     return tuple(t for _name, t in pairs), tuple(name for name, _t in pairs)
 
 
-class ChunkKDAFunction(torch.autograd.Function):
-    """:func:`chunk_kda` as an autograd node: the forward saves the inputs and the saved set, the backward runs
-    :func:`chunk_kda_bwd` from them.  Under ``torch.utils.checkpoint`` (``use_reentrant=False``) the forward is
+class ChunkKDADetFunction(torch.autograd.Function):
+    """:func:`chunk_kda_det` as an autograd node: the forward saves the inputs and the saved set, the backward runs
+    :func:`chunk_kda_det_bwd` from them.  Under ``torch.utils.checkpoint`` (``use_reentrant=False``) the forward is
     re-run in the backward and the saved set recomputed; no special casing.  The node keeps nothing but the saved
     tensors alive: the caller's workspace is held through a weak reference, so a workspace the caller dropped
     after the forward (a per-call one, or any workspace of a checkpointed forward whose frame is gone) is freed,
-    and the backward then allocates its own (:func:`chunk_kda_bwd` without ``workspace``)."""
+    and the backward then allocates its own (:func:`chunk_kda_det_bwd` without ``workspace``)."""
 
     @staticmethod
     def forward(
@@ -3910,7 +3910,7 @@ class ChunkKDAFunction(torch.autograd.Function):
         arena,
         doc_lengths,
     ):
-        out, saved = chunk_kda_fwd(
+        out, saved = chunk_kda_det_fwd(
             q,
             k,
             v,
@@ -3941,7 +3941,7 @@ class ChunkKDAFunction(torch.autograd.Function):
         # a weak reference: the node must not keep a per-call arena alive until the backward (under activation
         # checkpointing that would be one arena per layer)
         ctx.workspace_ref = None if workspace is None else weakref.ref(workspace)
-        # the arena option of the backward's own workspace when the caller's is gone (KdaArena holds ints only)
+        # the arena option of the backward's own workspace when the caller's is gone (KdaDetArena holds ints only)
         ctx.arena = (
             arena
             if arena is not None
@@ -3959,7 +3959,7 @@ class ChunkKDAFunction(torch.autograd.Function):
     def backward(ctx, dout):
         q, k, v, g, beta, cu_seqlens, Aqk, Akk, *rest = ctx.saved_tensors
         tables, extra = tuple(rest[: ctx.n_tables]), rest[ctx.n_tables :]
-        saved = KdaChunkSaved(
+        saved = KdaDetChunkSaved(
             ctx.version,
             Aqk,
             Akk,
@@ -3973,7 +3973,7 @@ class ChunkKDAFunction(torch.autograd.Function):
                 dout.contiguous()
             )  # autograd may hand over an expanded or permuted gradient
         workspace = None if ctx.workspace_ref is None else ctx.workspace_ref()
-        dq, dk, dv, dbeta, dg = chunk_kda_bwd(
+        dq, dk, dv, dbeta, dg = chunk_kda_det_bwd(
             q,
             k,
             v,
@@ -3990,7 +3990,7 @@ class ChunkKDAFunction(torch.autograd.Function):
         return dq, dk, dv, dg, dbeta, None, None, None, None, None, None
 
 
-def chunk_kda(
+def chunk_kda_det(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -3999,9 +3999,9 @@ def chunk_kda(
     cu_seqlens: torch.Tensor,
     *,
     scale: float = SCALE,
-    workspace: KdaWorkspace | None = None,
+    workspace: KdaDetWorkspace | None = None,
     save_mode: str | None = None,
-    arena: KdaArena | None = None,
+    arena: KdaDetArena | None = None,
     doc_lengths: Sequence[int] | None = None,
 ) -> torch.Tensor:
     """The autograd entry: ``out`` with gradients to ``q, k, v, g, beta``.
@@ -4014,12 +4014,12 @@ def chunk_kda(
     call is close to a caller-owned workspace's (the call adds the arena's allocation and the eye's rebuild), and
     no option (``arena``, ``doc_lengths``) makes the host wait for the device.  After a forward under ``torch.utils.checkpoint``
     (``use_reentrant=False``) the node keeps no arena and no saved tensor alive.  ``save_mode`` (``None``: the
-    workspace's default, ``"light"`` without one) selects the saved set's version.  ``arena`` (:class:`KdaArena`,
+    workspace's default, ``"light"`` without one) selects the saved set's version.  ``arena`` (:class:`KdaDetArena`,
     ``None``: the workspace's option, off without one) is the lower-memory arena option; the node records it, so
     the backward's own workspace (a per-call or checkpointed forward) takes the same option.  ``doc_lengths``
     (the documents' token counts, host integers) is required under a batched option and recorded by the node.
     """
-    return ChunkKDAFunction.apply(
+    return ChunkKDADetFunction.apply(
         q, k, v, g, beta, cu_seqlens, scale, workspace, save_mode, arena, doc_lengths
     )
 
@@ -4039,6 +4039,16 @@ def is_supported(device: torch.device | str | int | None = None) -> bool:
         is not None
     )
 
+
+# The names before the det rename, bound to the same objects (not in ``__all__``): the KCP modules and existing
+# callers keep working, ``isinstance`` holds across the two spellings.
+ChunkKDAFunction = ChunkKDADetFunction
+KdaArena = KdaDetArena
+KdaChunkSaved = KdaDetChunkSaved
+KdaWorkspace = KdaDetWorkspace
+chunk_kda = chunk_kda_det
+chunk_kda_bwd = chunk_kda_det_bwd
+chunk_kda_fwd = chunk_kda_det_fwd
 
 __all__ = [
     "ALIGN",
@@ -4062,16 +4072,16 @@ __all__ = [
     "SEG_SAVE_MIN_TOKENS_PER_SEG",
     "SLOTS",
     "TABLE_NAMES",
-    "ChunkKDAFunction",
-    "KdaArena",
-    "KdaChunkSaved",
-    "KdaWorkspace",
+    "ChunkKDADetFunction",
+    "KdaDetArena",
+    "KdaDetChunkSaved",
+    "KdaDetWorkspace",
     "Launcher",
     "Plan",
     "Region",
-    "chunk_kda",
-    "chunk_kda_bwd",
-    "chunk_kda_fwd",
+    "chunk_kda_det",
+    "chunk_kda_det_bwd",
+    "chunk_kda_det_fwd",
     "is_supported",
     "lifetime_table",
     "memory_report",
