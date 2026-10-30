@@ -41,8 +41,8 @@ Cake VSA
 Token-Sparse Attention Inputs
 -----------------------------
 
-Build the cache-slot lists consumed by token-sparse attention kernels, and the
-grouped key unions and masks consumed by masked dense attention kernels.
+Build cache-slot lists for token-sparse attention.
+Build grouped key unions and masks for masked dense attention.
 
 .. currentmodule:: flashinfer.token_sparse
 
