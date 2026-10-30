@@ -1161,6 +1161,38 @@ def _inputs(
     return q, kv, scale, weights, cu_q, cu_kv
 
 
+def _expected_sample_count(end, top_k):
+    if end > 32 * top_k:
+        return min(end, 3840)
+    count = 256
+    while count * top_k < 32 * end:
+        count *= 2
+    return min(end, 3840, count)
+
+
+def _expected_sample_rank(end, count, top_k, grouped=True):
+    if end == 0:
+        return 0
+    rank = math.ceil(min(4096, max(512, 4 * top_k)) * count / end)
+    if grouped and count < 3840:
+        mean = top_k * count / end
+        rank = max(rank, int(mean + 4.5 * math.sqrt(mean)) + 1)
+    return max(1, min(count, rank))
+
+
+def _expected_sample_positions(end, count, group, device):
+    position = torch.arange(count, device=device, dtype=torch.int64)
+    if count == 3840:
+        return position * (end - 1) // (count - 1)
+    hashed = (position + group * 0x9E3779B9 + 0x243F6A88) & 0xFFFFFFFF
+    hashed = ((hashed ^ (hashed >> 16)) * 0x85EBCA6B) & 0xFFFFFFFF
+    hashed = ((hashed ^ (hashed >> 13)) * 0xC2B2AE35) & 0xFFFFFFFF
+    hashed ^= hashed >> 16
+    begin = position * end // max(count, 1)
+    finish = (position + 1) * end // max(count, 1)
+    return begin + ((hashed * (finish - begin).clamp_min(1)) >> 32)
+
+
 def _request_inputs(q_lengths, kv_lengths, heads=8, head_dim=128):
     """Fresh raw owners and explicit request prefixes; no wrapper or graph state."""
     q, kv, scales, weights, _, _ = _inputs(
@@ -4982,20 +5014,17 @@ def test_capacity_sparse_sample_ragged_score_oracle(
                 first_end = (
                     lengths[request] * ratio - (end - begin) + first - begin + 1
                 ) // ratio
-                count = min(first_end, 3840)
-                rank = min(count, math.ceil(2048 * count / first_end))
+                count = _expected_sample_count(first_end, 512)
+                rank = _expected_sample_rank(first_end, count, 512)
                 last = min(first + group, end)
                 assert counts[first:last] == [count] * (last - first)
                 assert ranks[first:last] == [rank] * (last - first)
-                positions = torch.div(
-                    torch.arange(count, device=q.device, dtype=torch.int64)
-                    * (first_end - 1),
-                    max(count - 1, 1),
-                    rounding_mode="floor",
+                positions = _expected_sample_positions(
+                    first_end, count, (first - begin) // group, q.device
                 )
                 assert positions.unique().numel() == count
                 assert int(positions[-1]) <= first_end - 1
-                if first_end <= 3840:
+                if first_end == count:
                     torch.testing.assert_close(
                         positions, torch.arange(first_end, device=q.device)
                     )
@@ -5032,6 +5061,159 @@ def test_capacity_sparse_sample_ragged_score_oracle(
         table.copy_(table.roll(1, dims=1))
         graph.replay()
         check(lengths)
+
+
+@_requires_selective_sm100
+def test_context_scaled_sample_eager_hints_and_device_replay(monkeypatch):
+    inputs = list(_request_inputs([256], [65536], heads=64))
+    q, _, _, weights, qo, kv = inputs
+    fused, original_table = _paged_inputs(tuple(inputs), block_size=64)
+    table = torch.zeros((1, 2560), device=q.device, dtype=torch.int32)
+    table[:, : original_table.shape[1]].copy_(original_table)
+    wrapper = FP8PagedMQATopKWrapper(
+        strategy="selective",
+        num_heads=64,
+        page_size=64,
+        top_k=2048,
+        max_context_length=163840,
+        max_chunk_size=256,
+        max_batch_size=1,
+        kv_layout=fused,
+    )
+    wrapper.plan(qo, kv, table)
+    wrapper.prepare_pool(fused)
+    sample_calls = []
+    score = sl._fp8_mqa_selective_logits
+
+    def record_score(*args, **kwargs):
+        if kwargs.get("mode") == sl._SelectiveLogitsMode.SAMPLE:
+            sample_calls.append(True)
+        return score(*args, **kwargs)
+
+    monkeypatch.setattr(sl, "_fp8_mqa_selective_logits", record_score)
+    for length, count in ((2304, 256), (4096, 256), (8192, 256), (65536, 1024)):
+        kv[1].fill_(length)
+        for hints in (
+            None,
+            (
+                torch.tensor([0, 256], dtype=torch.int32),
+                torch.tensor([length], dtype=torch.int32),
+            ),
+        ):
+            wrapper.plan(qo, kv, table, host_length_hints=hints)
+            sample_calls.clear()
+            selected = wrapper.run(q, weights, fused)
+            _check_selection(selected, _oracle_rows(inputs), 2048)
+            assert bool(sample_calls) == (hints is None or length > 6144)
+            if length == 2304:
+                assert wrapper._capacity_plan._engine._repair_flags.count_nonzero() == 0
+            assert wrapper._capacity_plan._engine._sample_ends.unique().tolist() == [
+                count
+            ]
+    output = torch.empty((256, 2048), device=q.device, dtype=torch.int32)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        wrapper.plan(qo, kv, table)
+        wrapper.run(q, weights, fused, out=output)
+    for length, count in ((8192, 256), (65536, 1024)):
+        # Device writes only: no new H2D metadata or host-derived sample count.
+        kv[1].fill_(length)
+        output.fill_(-2)
+        graph.replay()
+        _check_selection(output, _oracle_rows(inputs), 2048)
+        assert wrapper._capacity_plan._engine._sample_ends.unique().tolist() == [count]
+        assert wrapper.error.item() == wrapper.repair_error.item() == 0
+
+    # A small eager bound must invalidate, not turn a larger real step into
+    # an unchecked all-key bypass.
+    kv[1].fill_(8192)
+    wrapper.plan(
+        qo,
+        kv,
+        table,
+        host_length_hints=(
+            torch.tensor([0, 256], dtype=torch.int32),
+            torch.tensor([4096], dtype=torch.int32),
+        ),
+    )
+    assert (wrapper.run(q, weights, fused) == -1).all()
+    assert wrapper.error.item() != 0
+    wrapper.plan(qo, kv, table)
+    _check_selection(wrapper.run(q, weights, fused), _oracle_rows(inputs), 2048)
+
+
+@_requires_selective_sm100
+@pytest.mark.parametrize("q_rows", [1, 129])
+@pytest.mark.parametrize("top_k,heads,ratio", [(2048, 64, 1), (512, 8, 4)])
+def test_context_scaled_sample_expected_hit_floor(
+    q_rows, top_k, heads, ratio, ieee_matmul
+):
+    physical_keys = 32 * top_k + 1 + (q_rows - 1) // ratio
+    inputs = _request_inputs([q_rows], [physical_keys], heads=heads)
+    q, keys, scales, weights, qo, _ = inputs
+    kv = torch.tensor(
+        [0, ratio * (32 * top_k + 1) + q_rows - 1],
+        device=q.device,
+        dtype=torch.int32,
+    )
+    fused, original_table = _paged_inputs(inputs)
+    table = torch.zeros((1, 64 * top_k // 128), device=q.device, dtype=torch.int32)
+    table[:, : original_table.shape[1]].copy_(original_table)
+    wrapper = FP8PagedMQATopKWrapper(
+        strategy="selective",
+        num_heads=heads,
+        page_size=128,
+        top_k=top_k,
+        compression_ratio=ratio,
+        max_context_length=64 * top_k * ratio,
+        max_chunk_size=q_rows,
+        max_batch_size=1,
+        kv_layout=fused,
+    )
+    wrapper.plan(qo, kv, table)
+    wrapper.prepare_pool(fused)
+    output = torch.empty((q_rows, top_k), device=q.device, dtype=torch.int32)
+
+    def run_eager():
+        wrapper.plan(qo, kv, table)
+        wrapper.run(q, weights, fused, out=output)
+
+    run_eager()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run_eager()
+    group = sl._select_sparse_sample_group_rows(
+        wrapper._capacity_plan._engine._sample_prepared.query_tile
+    )
+    for first_end, expected in (
+        (4 * top_k, 256),
+        (8 * top_k, 256),
+        (16 * top_k, 512),
+        (16 * top_k + 1, 1024),
+        (32 * top_k, 1024),
+        (32 * top_k + 1, 3840),
+    ):
+        # Move only device metadata; the captured plan must recompute counts.
+        kv[1].fill_(ratio * first_end + q_rows - 1)
+        for refresh in (run_eager, graph.replay):
+            output.fill_(-2)
+            refresh()
+            counts = wrapper._capacity_plan._engine._sample_ends[:q_rows].cpu()
+            assert counts[0].item() == expected
+            for first in range(0, q_rows, group):
+                count = counts[first].item()
+                end = first_end + first // ratio
+                assert (counts[first : first + group] == count).all()
+                assert count * top_k >= 32 * end
+                assert count <= min(end, 3840)
+            if ratio == 4:
+                _check_compressed_wrapper(
+                    output, (q, fused, weights, qo, kv, table), top_k
+                )
+            else:
+                reference = _oracle_rows((q, keys, scales, weights, qo, kv))
+                _check_selection(output, reference, top_k)
+            assert wrapper.error.item() == wrapper.repair_error.item() == 0
 
 
 def _sample_ladder_reference(samples, valid, ranks, ends, top_k, segments):
@@ -5077,9 +5259,8 @@ def _sample_ladder_reference(samples, valid, ranks, ends, top_k, segments):
                 lower >= top_k and mean + 3 * math.sqrt(max(mean, 1)) < 6144 // segments
             )
 
-        refine = (
-            count > 0 and int(ends[row]) >= top_k and not any(map(fits, coarse_hits))
-        )
+        needs_threshold = int(ends[row]) > min(6144, top_k + 256)
+        refine = count > 0 and needs_threshold and not any(map(fits, coarse_hits))
         if not refine:
             expected_ladder[row] = torch.stack(coarse_values)
             expected_populations[row] = torch.tensor(coarse_hits, device=device)
@@ -5094,7 +5275,7 @@ def _sample_ladder_reference(samples, valid, ranks, ends, top_k, segments):
             if lower >= top_k and bank_upper < 6144 // segments:
                 chosen = rung
         expected_thresholds[row] = float("-inf")
-        if count and ends[row] >= top_k:
+        if count and needs_threshold:
             expected_thresholds[row] = expected_ladder[row, chosen]
             expected_bins[row] = bins[chosen]
 
@@ -8428,11 +8609,12 @@ def _check_rank_bounds(wrapper, top_k):
             for begin, last in zip(qo[:-1], qo[1:], strict=True)
             for row in range(begin, last)
         ]
-        assert valid == [min(end, 3840) for end in ends]
+        assert valid == [_expected_sample_count(end, top_k) for end in ends]
     # Independent expected population targets for K512 and K2048.
-    target = {512: 2048, 2048: 4096}[top_k]
     expected = [
-        max(1, min(count, math.ceil(target * count / end)))
+        _expected_sample_rank(
+            end, count, top_k, wrapper._sample_sparse_metadata is not None
+        )
         for count, end in zip(valid, ends, strict=True)
     ]
     assert wrapper._sample_ranks.cpu().tolist() == expected

@@ -73,6 +73,7 @@ from cutlass.cutlass_dsl import dsl_user_op
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 
 from ....attn_scores._fp8_mqa_constants import _COMPUTE_BLOCK_KV
+from .selective_sample_policy import stratified_sample_position
 from ....attn_scores._math_policy import _validate_math_mode
 from ....attn_scores.kernels.fp8_paged_mqa_logits import _FP8MQAEngineMixin
 from ....cute_dsl.attention.dsa.gather4_utils import _CopyBulkTensor2DGather4G2SOp
@@ -3243,8 +3244,13 @@ class FP8MQASparseGather4SampleKernel(FP8MQASelectiveLogitsKernel):
     def _sample_position(self, indices, sample_group, position):
         if cutlass.const_expr(self.sparse_sample_on_the_fly):
             # The group's causal range and common count are request-local.
-            extent, denominator, limit = sample_group
-            return sparse_sample_position(position, extent, denominator, limit)
+            extent, denominator, limit, seed = sample_group
+            logical = sparse_sample_position(position, extent, denominator, limit)
+            if denominator + 1 < self.capacity:
+                logical = stratified_sample_position(
+                    position, extent + 1, denominator + 1, seed, min(limit, extent)
+                )
+            return logical
         else:
             # Oracle-only stored positions validate the production on-the-fly
             # mapping without changing its scoring pipeline.
@@ -3305,6 +3311,7 @@ class FP8MQASparseGather4SampleKernel(FP8MQASelectiveLogitsKernel):
                     max(row_ends[first] - 1, 0),
                     max(valid_counts[first] - 1, 1),
                     max(physical_kv[request + 1] - physical_kv[request] - 1, 0),
+                    (first - qo[request]) // self.sparse_sample_group_rows,
                 )
             kv_pipeline.producer_acquire(state)
             self._copy_sparse_sample_tile(

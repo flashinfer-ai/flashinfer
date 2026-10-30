@@ -366,7 +366,7 @@ class _CapacityStepInputs:
             )
         )
         self._sample_kernel = SelectiveCapacitySampleMetadataKernel(
-            self.capacity.page_size, _candidate_target(top_k)
+            self.capacity.page_size, _candidate_target(top_k), top_k=top_k
         )
         self._sample_compiled = None
 
@@ -377,6 +377,7 @@ class _CapacityStepInputs:
                 self._sample_kernel.page_size,
                 self._sample_kernel.target_candidates,
                 group_rows,
+                top_k=self._sample_kernel.top_k,
             )
             self._sample_compiled = None
             if refresh:
@@ -489,6 +490,7 @@ class _CapacitySelectiveTopKPlan:
         self._protected_ranges: tuple[tuple[int, int], ...] = ()
         self._engine: _FP8PagedMQASelectiveTopKEngine | None = None
         self._step_prepared = False
+        self._eager_skip_sampling = False
         self._state = _CapacityStepInputs(capacity, device=device, num_pages=num_pages)
         self._state.prepare_sampling(self.top_k)
         self._selected = torch.full(
@@ -796,8 +798,14 @@ class _CapacitySelectiveTopKPlan:
             num_query_rows = self._capacity.max_chunk_size
         from .host_length_hints import _validate_host_length_hints
 
-        _validate_host_length_hints(
+        validated_hints = _validate_host_length_hints(
             host_length_hints, qo_indptr.numel() - 1, self._capacity, num_query_rows
+        )
+        from ._selective_contract import _CANDIDATE_CAPACITY
+
+        self._eager_skip_sampling = validated_hints is not None and (
+            max(validated_hints[1], default=0) // self._capacity.compression_ratio
+            <= _CANDIDATE_CAPACITY
         )
         with torch.cuda.device(self._state.device):
             capturing = torch.cuda.is_current_stream_capturing()
@@ -873,6 +881,7 @@ class _CapacitySelectiveTopKPlan:
             self._state.block_table,
             _candidate_counts_precleared=True,
             _sampling_policy_initialized=not engine._needs_sampling,
+            _skip_sampling=self._eager_skip_sampling and not capturing,
         )
         self._repair_error.bitwise_or_(engine._exact_error)
         self._check_caller_capture(capturing, "layer repair-status merge")

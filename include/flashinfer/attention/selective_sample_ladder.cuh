@@ -73,6 +73,9 @@ static __global__ void SelectiveSampleLadder(const float* samples, int64_t sampl
   __shared__ int fine_histogram[3][32];
   __shared__ uint32_t fine_floors[3][32];
   const int tid = threadIdx.x, row = blockIdx.x, count = valid[row];
+  // Near K, retaining the complete small row is cheaper than repairing a
+  // sample that missed its minimum. This also covers shared query-group tails.
+  const bool needs_threshold = ends[row] > min(capacity, top_k + 256);
   for (int bin = tid; bin < kBins; bin += kThreads) histogram[bin] = 0;
   if (tid < 96) {
     fine_histogram[tid / 32][tid % 32] = 0;
@@ -112,7 +115,7 @@ static __global__ void SelectiveSampleLadder(const float* samples, int64_t sampl
   // one coarse rung already passes the existing population/bank confidence
   // checks. This gate uses samples, never oracle score or repair information.
   if (tid == 0) {
-    refine_row = count > 0 && ends[row] >= top_k;
+    refine_row = count > 0 && needs_threshold;
 #pragma unroll
     for (int rung = 0; rung < 3; ++rung) {
       const float hits = populations[row * 3 + rung];
@@ -175,7 +178,7 @@ static __global__ void SelectiveSampleLadder(const float* samples, int64_t sampl
       const float bank_upper = fmaf(3.f, sqrtf(fmaxf(bank_mean, 1.f)), bank_mean);
       if (lower >= top_k && bank_upper < capacity / count_segments) chosen = rung;
     }
-    const bool eligible = count > 0 && ends[row] >= top_k;
+    const bool eligible = count > 0 && needs_threshold;
     thresholds[row] = eligible ? ladder[row * 3 + chosen] : -CUDART_INF_F;
     selected_bins[row] = eligible ? chosen_bins[chosen] : kBins - 1;
   }

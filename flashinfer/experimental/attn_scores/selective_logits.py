@@ -342,6 +342,7 @@ def _shared_engine_source_token() -> str:
     for name, path in (
         ("fp8_paged_mqa_logits.py", core_dir / "kernels/fp8_paged_mqa_logits.py"),
         ("_fp8_mqa_selective.py", kernel_dir / "_fp8_mqa_selective.py"),
+        ("selective_sample_policy.py", kernel_dir / "selective_sample_policy.py"),
         ("../_math_policy.py", core_dir / "_math_policy.py"),
         ("../_selective_contract.py", kernel_dir.parent / "_selective_contract.py"),
         ("../_fp8_mqa_constants.py", core_dir / "_fp8_mqa_constants.py"),
@@ -3828,6 +3829,7 @@ class _FP8PagedMQASelectiveTopKEngine:
         *,
         _candidate_counts_precleared: bool = False,
         _sampling_policy_initialized: bool = False,
+        _skip_sampling: bool = False,
     ) -> torch.Tensor:
         """Enqueue the complete selective path and return stable TopK indices.
 
@@ -3930,7 +3932,7 @@ class _FP8PagedMQASelectiveTopKEngine:
         stream = _current_stream(q.device)
         capturing = torch.cuda.is_current_stream_capturing()
         capture_stream = torch.cuda.current_stream(q.device) if capturing else None
-        if self._needs_sampling:
+        if self._needs_sampling and not _skip_sampling:
             # The direct sampler writes every eligible score. Threshold kernels
             # read only _sample_ends, so the unused suffix needs no per-run clear.
             _fp8_mqa_selective_logits(
@@ -3964,7 +3966,7 @@ class _FP8PagedMQASelectiveTopKEngine:
             sample_threshold_compiled(*sample_threshold_args, stream)
             if capturing:
                 _check_capture_status(capture_stream, "sample threshold ladder")
-        elif not _sampling_policy_initialized:
+        elif not _sampling_policy_initialized or _skip_sampling:
             self._thresholds.fill_(float("-inf"))
             self._sample_ladder.fill_(float("-inf"))
             self._selected_bins.fill_(_SAMPLE_HISTOGRAM_BINS - 1)

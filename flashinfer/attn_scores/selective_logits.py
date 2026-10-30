@@ -184,8 +184,9 @@ class FP8PagedMQATopKWrapper:
         selects eager full stripes without packing. These contiguous CPU
         int32/int64 tensors give an exact query prefix and conservative KV
         length bounds. Hints are checked against device inputs and rejected
-        during capture before CUDA work. Selective validates them
-        but ignores their sizing information. Hinted plans also refresh the
+        during capture before CUDA work. Selective can bypass sampling eagerly
+        when the validated physical bound fits the nonsampling capacity;
+        otherwise its sample work follows device lengths. Hinted plans also refresh the
         capacity metadata used by existing caller graphs.
         A host-side planning error invalidates the step; publish a valid plan
         before calling ``run`` again.

@@ -20,6 +20,7 @@ from cutlass._mlir.dialects import llvm
 from cutlass.utils.smem_allocator import SmemAllocator
 
 from .._selective_contract import _SAMPLE_HISTOGRAM_BINS
+from .selective_sample_policy import selective_sample_count
 
 _KV_PAIR_TOKENS = 256
 # Request-count bound for the shared tile prefix of the explicit schedule.
@@ -581,8 +582,8 @@ class SelectiveCapacitySampleMetadataKernel:
     Empty/inactive rows get count/rank 0. All outputs are rewritten each launch.
 
     With group_rows > 0, request-local groups share the first causal end and
-    score min(end, sample_capacity) uniformly spaced keys. Every row uses that
-    same count and rank; a short group's keys are enumerated exactly. Page
+    score a device-chosen context-scaled stratified sample. Every row uses that
+    same count and rank; ranges shorter than the budget are enumerated exactly. Page
     coordinates are consumed only with group_rows == 0 by whole-page SAMPLE;
     grouped sparse SAMPLE computes individual key positions directly.
 
@@ -591,10 +592,11 @@ class SelectiveCapacitySampleMetadataKernel:
     index columns of the original page table, not physical KV page IDs.
     """
 
-    def __init__(self, page_size, target_candidates, group_rows=0):
+    def __init__(self, page_size, target_candidates, group_rows=0, top_k=2048):
         self.page_size = page_size
         self.target_candidates = target_candidates
         self.group_rows = group_rows
+        self.top_k = top_k
 
     @cute.jit
     def __call__(
@@ -662,7 +664,9 @@ class SelectiveCapacitySampleMetadataKernel:
                     # Every query in the group must score the same positions,
                     # including exact enumeration when that range is short.
                     end = row_ends[first]
-                    count = min(end, page_indices.shape[1] * self.page_size)
+                    count = selective_sample_count(
+                        end, self.top_k, page_indices.shape[1] * self.page_size
+                    )
                 else:
                     length = physical_kv[owner + 1] - physical_kv[owner]
                     pages = cutlass.Int32(
@@ -693,6 +697,17 @@ class SelectiveCapacitySampleMetadataKernel:
                         1,
                         min(count, cute.ceil_div(self.target_candidates * count, end)),
                     )
+                    if cutlass.const_expr(self.group_rows > 0):
+                        if count < page_indices.shape[1] * self.page_size:
+                            # A sample near K needs an absolute uncertainty
+                            # margin, not only a fixed multiple of its mean.
+                            mean = cutlass.Float32(
+                                self.top_k * count
+                            ) / cutlass.Float32(end)
+                            conservative = (
+                                cutlass.Int32(mean + 4.5 * cute.math.sqrt(mean)) + 1
+                            )
+                            rank = min(count, max(rank, conservative))
             sample_ends[item] = count
             sample_ranks[item] = rank
 
