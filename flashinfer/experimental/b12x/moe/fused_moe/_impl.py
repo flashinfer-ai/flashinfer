@@ -823,6 +823,7 @@ class TPMoEPlan:
     max_tokens_per_launch: int
     dynamic_physical_tiles: int | None = None
     dynamic_task_capacity: int | None = None
+    w4a8_n64_repacked: bool = False
 
     @property
     def deterministic_output(self) -> bool:
@@ -2568,6 +2569,7 @@ def _w4a8_mx_micro_supported(
     weight_E: int,
     activation: str,
     source_format: str,
+    n64_repacked: bool = False,
 ) -> bool:
     source_format = _canonical_moe_policy_source_format(source_format)
     if source_format == "b12x_trellis":
@@ -2582,7 +2584,7 @@ def _w4a8_mx_micro_supported(
                 weight_E=weight_E,
             )
         )
-    if source_format == "fp4_e8m0_k32" and n % 128 == 64:
+    if source_format == "fp4_e8m0_k32" and (n % 128 == 64 or n64_repacked):
         return bool(
             1 <= num_tokens <= _MICRO_MAX_TOKENS
             and k % 256 == 0
@@ -2610,6 +2612,14 @@ def _w4a8_mx_micro_preferred(
         weight_E=query.num_experts,
         activation=query.activation,
         source_format=query.source_format,
+        n64_repacked=bool(query.controls.get("w4a8_n64_repacked", False)),
+    ):
+        return False
+    # Keep grouped routing beyond N128's existing tiny decode range.
+    if (
+        query.source_format == "fp4_e8m0_k32"
+        and query.intermediate_size % 128 == 0
+        and query.num_tokens > 4
     ):
         return False
     capability = (
@@ -2640,6 +2650,7 @@ def _policy_micro_supported(query: MoeDecodeQuery) -> bool:
             weight_E=query.num_experts,
             activation=query.activation,
             source_format=query.source_format,
+            n64_repacked=bool(query.controls.get("w4a8_n64_repacked", False)),
         )
     return _band_runs_direct_micro(
         num_tokens=query.num_tokens,
@@ -2658,6 +2669,8 @@ def _heuristic_dynamic_route_mode(
     *,
     planned_tile_m: int,
 ) -> str:
+    if query.controls.get("w4a8_n64_repacked", False):
+        return "grouped"
     dynamic_n = _dynamic_kernel_intermediate_size(
         query.intermediate_size,
         query.quant_mode,
@@ -2868,6 +2881,11 @@ def _heuristic_moe_decode_config(
                 device,
                 planned_tile_m=dynamic_tile_m,
             )
+    if query.controls.get("w4a8_n64_repacked", False) and dynamic_tile_m == 32:
+        dynamic_tile_m = 16
+        dynamic_route_mode = _heuristic_dynamic_route_mode(
+            query, device, planned_tile_m=dynamic_tile_m
+        )
     return MoeDecodeConfig(
         backend=backend,
         route_planner="internal",
@@ -3326,6 +3344,7 @@ def _plan_core_workspace(
     dynamic_route_mode: str | None = None,
     nvfp4_materialize_intermediate: bool = False,
     source_format: str = "modelopt_nvfp4",
+    w4a8_n64_repacked: bool = False,
     w13_layout: str = "w13",
     w4a16_weight_layout: str | None = None,
     w4a16_scale_format: str | None = None,
@@ -3848,7 +3867,7 @@ def _plan_core_workspace(
                     direct_micro_tokens * num_topk * (n // 2)
                     + direct_micro_tokens * num_topk * (n // 128) * 257,
                 )
-            if source_format == "fp4_e8m0_k32" and n % 128 == 64:
+            if source_format == "fp4_e8m0_k32" and (n % 128 == 64 or w4a8_n64_repacked):
                 from b12x.moe._shared.kernels.w4a8_compact_micro import (
                     micro_scratch_nbytes,
                 )
@@ -6676,6 +6695,7 @@ def plan_b12x_fp4_moe_weights(
     nvfp4_inline_scales: bool = False,
     w4a16_compressed_scales: bool = False,
     w4a8_csf_inline: bool = False,
+    w4a8_n64_repacked: bool = False,
     w13_layout: str = "w13",
     w4a16_layout: PreparedWeightLayout | str | None = None,
     trellis_bits: int | None = None,
@@ -6724,6 +6744,7 @@ def plan_b12x_fp4_moe_weights(
         nvfp4_inline_scales=bool(nvfp4_inline_scales),
         w4a16_compressed_scales=bool(w4a16_compressed_scales),
         w4a8_csf_inline=bool(w4a8_csf_inline),
+        w4a8_n64_repacked=bool(w4a8_n64_repacked),
     )
 
 
@@ -6975,7 +6996,7 @@ def prepare_b12x_fp4_moe_weights(
             params_dtype=params_dtype,
             source_format=plan.source_format,
             w13_layout=plan.w13_layout,
-            n64_repack=plan.intermediate_size % 128 == 64,
+            n64_repack=plan.intermediate_size % 128 == 64 or plan.w4a8_n64_repacked,
         )
         representation = _PreparedWeightRepresentation(
             quant_mode="w4a8_mx",
@@ -7601,7 +7622,7 @@ def plan_tp_moe_execution(
         implementation == "micro"
         and quant_mode == "w4a8_mx"
         and source_format == "fp4_e8m0_k32"
-        and n % 128 == 64
+        and (n % 128 == 64 or weight_plan.w4a8_n64_repacked)
     )
     if compact_w4a8_micro:
         if apply_router_weight_on_input:
@@ -7643,6 +7664,11 @@ def plan_tp_moe_execution(
         dynamic_physical_tiles=dynamic_physical_tiles,
         dynamic_task_capacity=dynamic_task_capacity,
         decode_config=decode_config,
+        w4a8_n64_repacked=bool(
+            quant_mode == "w4a8_mx"
+            and source_format == "fp4_e8m0_k32"
+            and (n % 128 == 64 or weight_plan.w4a8_n64_repacked)
+        ),
     )
 
 
@@ -7686,7 +7712,7 @@ def _validate_workspace(
     if (
         plan.implementation == "micro"
         and plan.quant_mode == "w4a8_mx"
-        and plan.n % 128 == 64
+        and plan.w4a8_n64_repacked
     ):
         from b12x.moe._shared.kernels.w4a8_compact_micro import (
             micro_scratch_nbytes,
@@ -8355,6 +8381,7 @@ def plan_tp_moe_arena_layout(
             dynamic_tile_n=plan.execution.tile_n,
             dynamic_route_mode=plan.decode_config.dynamic_route_mode,
             nvfp4_materialize_intermediate=plan.decode_config.nvfp4_materialize_intermediate,
+            w4a8_n64_repacked=plan.w4a8_n64_repacked,
             source_format=source_format,
             w13_layout=w13_layout,
             w4a16_weight_layout=w4a16_weight_layout,
@@ -9041,6 +9068,7 @@ def plan_tp_moe_scratch(
         dynamic_tile_n=launch_plan.execution.tile_n,
         dynamic_route_mode=launch_plan.decode_config.dynamic_route_mode,
         nvfp4_materialize_intermediate=launch_plan.decode_config.nvfp4_materialize_intermediate,
+        w4a8_n64_repacked=launch_plan.w4a8_n64_repacked,
         source_format=caps.source_format,
         w13_layout=caps.w13_layout,
         w4a16_weight_layout=caps.w4a16_weight_layout,
@@ -9639,6 +9667,7 @@ def materialize_tp_moe_arena_workspaces(
             dynamic_tile_n=plan.execution.tile_n,
             dynamic_route_mode=plan.decode_config.dynamic_route_mode,
             nvfp4_materialize_intermediate=plan.decode_config.nvfp4_materialize_intermediate,
+            w4a8_n64_repacked=plan.w4a8_n64_repacked,
             source_format=source_format,
             w13_layout=w13_layout,
             w4a16_weight_layout=w4a16_weight_layout,

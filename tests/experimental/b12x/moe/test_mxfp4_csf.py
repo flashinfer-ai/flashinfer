@@ -1,8 +1,9 @@
 """MXFP4-CSF preserves native W4A8 expert math and serialized scale scratch."""
 
+from dataclasses import replace
+
 import pytest
 import torch
-
 from b12x.moe import fused_moe as moe
 from b12x.preparation import PreparationSession, PreparedCall
 from ..conftest import require_b12x
@@ -12,7 +13,10 @@ from ..quantization.test_mxfp4_csf import fixture
 @pytest.mark.parametrize("tokens", [1, 17, 33, 128])
 @pytest.mark.parametrize("h,n", [(512, 192), (5120, 576), (512, 256)])
 @pytest.mark.parametrize("raw", [False, True])
-def test_native_expert_output_and_shared_scratch_poisoned_replay(tokens, h, n, raw):
+def test_native_expert_output_and_shared_scratch_poisoned_replay(
+    tokens, h, n, raw, monkeypatch
+):
+    monkeypatch.setenv("B12X_W4A8_CSF_INLINE", "0")
     device = require_b12x()
     e, topk = 8, 2
     first, s13 = fixture(2 * n, h // 32, finite_scales=True)
@@ -165,8 +169,8 @@ def test_native_expert_output_and_shared_scratch_poisoned_replay(tokens, h, n, r
 def _csf_planes(rows, columns, *, experts, seed):
     """CSF planes with sparse exceptions in most native tiles and dense rows
     whose tiles exceed the inline records (raw tiles)."""
-    import numpy as np
 
+    import numpy as np
     from b12x._lib.quant.x4t_scales import make_x4t_scale_batch
 
     device = require_b12x()
@@ -220,6 +224,11 @@ def _prepare_arms(h, n, layout, monkeypatch, *, experts=8, seed=0):
             num_experts=experts, hidden_size=h, intermediate_size=n
         ),
     )
+    # Compare all three scale representations using the same N64 GEMM layout.
+    weight_plan = replace(
+        weight_plan,
+        _impl=replace(weight_plan._impl, w4a8_n64_repacked=True),
+    )
     native = moe.prepare_weights(
         plan=weight_plan,
         weights=moe.PackedWeights(
@@ -264,11 +273,8 @@ def _assert_bitwise(expected, actual):
     "h,n,tokens",
     [
         (h, n, tokens)
-        for h, n in ((5120, 576), (1024, 320), (512, 256))
+        for h, n in ((5120, 576), (1024, 320), (512, 256), (4096, 1024))
         for tokens in (1, 8, 17, 64, 512)
-        # Deterministic N128 decode at 8 tokens plans direct routing, which
-        # that reduction contract does not support (independent of CSF).
-        if not (n % 128 == 0 and tokens == 8)
     ],
 )
 def test_inline_scales_match_native_and_expansion_under_poisoned_replay(
@@ -277,23 +283,20 @@ def test_inline_scales_match_native_and_expansion_under_poisoned_replay(
     """Inline reads equal native scales and per-call expansion bit for bit.
 
     The shared expansion scratch is poisoned with NaN E8M0 bytes before every
-    replay; inline launches never read or write it. N % 128 == 0 keeps the
-    per-call expansion (no inline storage).
+    replay; inline launches never read or write it.
     """
     device = require_b12x()
     e, topk = 8, 2
     (native, expanded, inline), scratch = _prepare_arms(h, n, layout, monkeypatch)
-    compact = n % 128 == 64
     assert expanded._impl.mxfp4_csf is not None
     assert expanded._impl.mxfp4_csf_inline is None
     assert not expanded.plan._impl.w4a8_csf_inline
-    assert inline.plan._impl.w4a8_csf_inline == compact
-    assert (inline._impl.mxfp4_csf_inline is not None) == compact
-    assert (inline._impl.mxfp4_csf is None) == compact
-    if compact:
-        # Canonical scale storage stays the caller's scratch; launches read
-        # the inline planes instead.
-        assert inline._impl.w1_blockscale.data_ptr() == scratch[1][0].data_ptr()
+    assert inline.plan._impl.w4a8_csf_inline
+    assert inline._impl.mxfp4_csf_inline is not None
+    assert inline._impl.mxfp4_csf is None
+    # Canonical scale storage stays the caller's scratch; launches read
+    # the inline planes instead.
+    assert inline._impl.w1_blockscale.data_ptr() == scratch[1][0].data_ptr()
     arms = (native, expanded, inline)
     plans = [
         moe.plan_execution(
@@ -379,11 +382,9 @@ def test_inline_scales_match_native_and_expansion_under_poisoned_replay(
             )
             _assert_bitwise(outputs[0], outputs[1])
             _assert_bitwise(outputs[0], outputs[2])
-            if compact:
-                assert all(
-                    bool((buffer.view(torch.uint8) == 0xFF).all())
-                    for buffer in scratch[1]
-                )
+            assert all(
+                bool((buffer.view(torch.uint8) == 0xFF).all()) for buffer in scratch[1]
+            )
         for graph in graphs:
             graph.reset()
 
