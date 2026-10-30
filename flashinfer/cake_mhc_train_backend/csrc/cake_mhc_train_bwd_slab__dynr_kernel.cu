@@ -405,9 +405,9 @@ kernel_cake_mhc_train_bwd_slab__dynr(const __grid_constant__ CUtensorMap X, cons
             // tk_full: 2 barriers, init_count=1
             mbarrier_init(smem + 96, 1);
             mbarrier_init(smem + 104, 1);
-            // tk_empty: 2 barriers, init_count=9
-            mbarrier_init(smem + 112, 9);
-            mbarrier_init(smem + 120, 9);
+            // tk_empty: 2 barriers, init_count=288
+            mbarrier_init(smem + 112, 288);
+            mbarrier_init(smem + 120, 288);
             // --- pipeline 'acc_pipe' ---
             // acc_full: 2 barriers, init_count=1
             mbarrier_init(smem + 128, 1);
@@ -475,6 +475,9 @@ kernel_cake_mhc_train_bwd_slab__dynr(const __grid_constant__ CUtensorMap X, cons
                 int tcl = 0;
                 #pragma unroll 1
                 for (int j = 0; j < n_mine; j++) {
+                    if (drawn > (unsigned int)n_units) {
+                        drawn = (unsigned int)n_units;
+                    }
                     mbarrier_wait(tk_empty_addr + (lk_stage) * 8, _phase_tk_empty);
                     asm volatile("st.shared.b32 [%0], %1;" :: "r"(tkv_addr + lk_stage * 4), "r"(drawn) : "memory");
                     mbarrier_arrive(tk_full_addr + (lk_stage) * 8);
@@ -635,9 +638,7 @@ kernel_cake_mhc_train_bwd_slab__dynr(const __grid_constant__ CUtensorMap X, cons
                 int u_1 = (int)tku[0];
                 asm volatile("tcgen05.fence::before_thread_sync;");
                 __syncwarp();
-                if (elect_sync()) {
-                    mbarrier_arrive(tk_empty_addr + (mk_stage) * 8);
-                }
+                mbarrier_arrive(tk_empty_addr + (mk_stage) * 8);
                 mk_stage += 1;
                 if (mk_stage == 2) { mk_stage = 0; _phase_tk_full ^= 1; }
                 if (u_1 >= n_units_1) {
@@ -1149,9 +1150,7 @@ kernel_cake_mhc_train_bwd_slab__dynr(const __grid_constant__ CUtensorMap X, cons
                 asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&tku_1[0])) : "r"(tkv_addr + ek_stage * 4) : "memory");
                 int u_2 = (int)tku_1[0];
                 __syncwarp();
-                if (elect_sync()) {
-                    mbarrier_arrive(tk_empty_addr + (ek_stage) * 8);
-                }
+                mbarrier_arrive(tk_empty_addr + (ek_stage) * 8);
                 ek_stage += 1;
                 if (ek_stage == 2) { ek_stage = 0; _phase_tk_full_1 ^= 1; }
                 if (u_2 >= n_units_2) {
