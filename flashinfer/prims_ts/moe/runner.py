@@ -1234,7 +1234,7 @@ class PrimsTsMxfp4Mxfp8MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
             moe_inputs.hidden_states_scale,
             num_tokens=num_tokens,
             hidden_size=self.hidden_size,
-        )
+        ).view(torch.float8_e4m3fn)
 
     def get_valid_tactics(
         self,
