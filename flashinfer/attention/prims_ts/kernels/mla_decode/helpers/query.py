@@ -159,9 +159,13 @@ def flat_query_row_state(
     local_flat_query_row = Int32(query_tile_idx) * Int32(tile_size_q) + Int32(
         row_in_tile
     )
-    if cutlass.const_expr(tile_size_q % logical_num_heads_q == 0):
-        # Whole head groups fit each tile. Factor their constant ratio before
-        # introducing the runtime tile index, preserving cheap row-local math.
+    if cutlass.const_expr(
+        not isinstance(logical_seq_len_q, int)
+        and tile_size_q % logical_num_heads_q == 0
+    ):
+        # Runtime Q benefits from factoring the tile/head ratio. Static Q keeps
+        # the shared flat-coordinate quotient/remainder to limit live values
+        # in the fused RoPE/quantization epilogue.
         row_q_idx = Int32(row_in_tile) // Int32(logical_num_heads_q)
         logical_q_idx = (
             Int32(query_tile_idx) * Int32(tile_size_q // logical_num_heads_q)
