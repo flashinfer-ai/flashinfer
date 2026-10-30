@@ -1451,6 +1451,24 @@ def _family_backends(quant_family):
         raise ValueError(f"Unsupported quantization family: {quant_family}")
 
 
+def _resolve_output_format(output_format, backends, quant_family):
+    if output_format is None:
+        if backends is None:
+            output_format = "table"
+        else:
+            output_format = "csv"
+    elif output_format not in ("table", "csv", "both"):
+        raise ValueError("output_format must be 'table', 'csv', or 'both'")
+    if output_format in ("table", "both"):
+        outside_family = set(backends or ()) - set(_family_backends(quant_family))
+        if outside_family:
+            raise ValueError(
+                f"The {quant_family} table does not include: {', '.join(sorted(outside_family))}; "
+                "select the matching --quant-family or use --output-format csv"
+            )
+    return output_format
+
+
 def run_benchmark(
     token_counts,
     warmup=10,
@@ -1474,6 +1492,7 @@ def run_benchmark(
     distributions=("uniform",),
     autotune_cache=None,
     quant_family="nvfp4",
+    output_format=None,
 ):
     """
     Unified benchmark for the selected MoE model and precision family.
@@ -1512,11 +1531,15 @@ def run_benchmark(
         profile_iters: Number of cold-L2 graph replays to capture.
         profile_backend: Backend to run when profile_cuda is enabled.
         quant_family: Default backend set and table, ``nvfp4`` or ``mxfp``.
-            Explicit ``backends`` overrides the set and retains CSV output.
+            Explicit ``backends`` overrides the set.
+        output_format: ``table``, ``csv``, or ``both``. Defaults to CSV with
+            explicit ``backends``, otherwise table. Table output requires
+            backends from the selected quantization family.
 
     Returns:
         List of BenchResult objects
     """
+    output_format = _resolve_output_format(output_format, backends, quant_family)
     if ep_config is None:
         ep_config = CFG.default_ep
     if tp_config < 1 or BASE_INTERMEDIATE_SIZE % tp_config != 0:
@@ -1560,21 +1583,21 @@ def run_benchmark(
             quant_family=quant_family,
         )
         results.extend(row)
-        rows_and_histograms.append((row, histogram_record))
+        rows_and_histograms.append((n, row, histogram_record))
         # Each row rebuilds full-model weights; release cached allocations so
         # measurements do not depend on the token-count scan order.
         gc.collect()
         torch.cuda.empty_cache()
 
-    if verbose and backends is not None:
+    if verbose and output_format in ("csv", "both"):
         print("backend,tokens,latency_ms,tflops")
-        for row, _ in rows_and_histograms:
+        for _, row, _ in rows_and_histograms:
             for result in row:
                 print(
                     f"{result.backend},{result.tokens},{result.latency_ms:.6f},"
                     f"{result.tflops:.6f}"
                 )
-    elif verbose:
+    if verbose and output_format in ("table", "both"):
         _print_header(
             ep_config,
             tp_config,
@@ -1587,13 +1610,12 @@ def run_benchmark(
             quant_family=quant_family,
             swap_ab=swap_ab,
         )
-        for row, histogram_record in rows_and_histograms:
+        for n, row, histogram_record in rows_and_histograms:
             _print_row(
                 row,
                 histogram_record,
+                n,
                 quant_family=quant_family,
-                swap_ab=swap_ab,
-                use_fused_finalize=use_fused_finalize,
             )
         _print_footer(quant_family=quant_family)
 
@@ -1942,21 +1964,14 @@ def _print_header(
 def _print_row(
     results,
     histogram_record,
+    tokens,
     quant_family="nvfp4",
-    swap_ab=False,
-    use_fused_finalize=True,
 ):
     """Print a single row of benchmark results."""
     # Extract values by backend
     rows = {result.backend: result for result in results}
     _, backends, baselines, winner_width, _ = _table_layout(quant_family)
-    for key, _, _ in backends:
-        if (
-            key not in rows
-            and _backend_skip_reason(key, swap_ab, use_fused_finalize) is None
-        ):
-            raise ValueError(f"Missing result for supported backend: {key}")
-    fields = [f"{results[0].tokens:>6}"]
+    fields = [f"{tokens:>6}"]
     for key, _, width in backends:
         if key in rows:
             latency = f"{rows[key].latency_ms:>7.3f} {rows[key].tflops:>7.1f}"
@@ -1978,19 +1993,25 @@ def _print_row(
     # Find winner
     if winner_width:
         available = [entry for entry in backends if entry[0] in rows]
-        _, winner, _ = min(available, key=lambda entry: rows[entry[0]].latency_ms)
+        if available:
+            _, winner, _ = min(available, key=lambda entry: rows[entry[0]].latency_ms)
+        else:
+            winner = "N/A"
         fields.append(f"{winner:^{winner_width}}")
-    stats = (
-        f"{histogram_record['min_count']:>3}/"
-        f"{histogram_record['max_count']:>3}/"
-        f"{histogram_record['median_count']:>7.2f}"
-    )
-    fields.extend(
-        (
-            f"{histogram_record['active_local_experts']:>7}",
-            f"{stats:>15}",
+    if histogram_record:
+        stats = (
+            f"{histogram_record['min_count']:>3}/"
+            f"{histogram_record['max_count']:>3}/"
+            f"{histogram_record['median_count']:>7.2f}"
         )
-    )
+        fields.extend(
+            (
+                f"{histogram_record['active_local_experts']:>7}",
+                f"{stats:>15}",
+            )
+        )
+    else:
+        fields.extend((f"{'N/A':>7}", f"{'N/A':>15}"))
     print(" | ".join(fields))
 
 
@@ -2082,7 +2103,12 @@ def main():
     parser.add_argument(
         "--backends",
         type=str,
-        help="Override the family with a comma-separated subset of cutedsl,cute-dsl-per-token,cutlass,trtllm-nvfp4,trtllm-per-token,trtllm-bf16,cute-dsl-mxfp8,cute-dsl-w4a8,trtllm-mxfp8,trtllm-mxfp4; prints CSV.",
+        help="Override the family with a comma-separated subset of cutedsl,cute-dsl-per-token,cutlass,trtllm-nvfp4,trtllm-per-token,trtllm-bf16,cute-dsl-mxfp8,cute-dsl-w4a8,trtllm-mxfp8,trtllm-mxfp4; defaults to CSV output.",
+    )
+    parser.add_argument(
+        "--output-format",
+        choices=("table", "csv", "both"),
+        help="Result format (default: CSV with --backends, otherwise table). Tables use --quant-family columns; unselected or unsupported backends show N/A.",
     )
     parser.add_argument(
         "--distributions",
@@ -2215,6 +2241,12 @@ def main():
         )
         if unknown:
             parser.error(f"unknown --backends value(s): {', '.join(unknown)}")
+    try:
+        output_format = _resolve_output_format(
+            args.output_format, backends, args.quant_family
+        )
+    except ValueError as error:
+        parser.error(str(error))
     distributions = tuple(
         item.strip()
         for item in (args.distributions or "uniform").split(",")
@@ -2340,6 +2372,7 @@ def main():
         distributions=distributions,
         autotune_cache=args.cache,
         quant_family=args.quant_family,
+        output_format=output_format,
     )
 
     return 0
