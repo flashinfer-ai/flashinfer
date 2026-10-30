@@ -11,6 +11,8 @@ arrival counters rearm themselves), CUDA graph replay with changed inputs on a
 side stream, and the schedule invariants (CPU-only).
 """
 
+import functools
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -33,6 +35,8 @@ TOKEN_COUNTS = (
     65,
     100,
     128,
+    200,
+    256,
     400,
     512,
     777,
@@ -94,8 +98,12 @@ def test_schedule_invariants(num_sms, deterministic):
                     + heuristics.SMEM_RESERVED_BYTES
                 )
                 if config.cooperative_gate:
-                    assert config.block_tokens <= config.num_logical_ctas
-                    smem += heuristics.exchange_bytes(num_experts)
+                    slots = heuristics.cooperative_slots(
+                        config.block_tokens, config.num_logical_ctas
+                    )
+                    assert slots <= heuristics.MAX_COOPERATIVE_TOKENS
+                    assert config.num_stages >= heuristics.MIN_COOPERATIVE_STAGES
+                    smem += slots * heuristics.exchange_bytes(num_experts)
                 assert smem <= heuristics.SMEM_CAPACITY_BYTES
                 assert (
                     config.num_expert_groups * heuristics.EXPERTS_PER_CTA >= num_experts
@@ -262,6 +270,7 @@ def _run_case(
     ep_rank=3,
     replicas=2,
     seed=0,
+    config=None,
 ):
     x, weight, bias = _make_inputs(num_tokens, hidden, num_experts, seed=seed)
     if not with_bias:
@@ -279,7 +288,12 @@ def _run_case(
         image_bias = torch.randn(num_experts, dtype=torch.float32, device="cuda")
         image_token_mask = torch.rand(num_tokens, device="cuda") < 0.5
     logical = torch.empty((num_tokens, num_topk), dtype=torch.int64, device="cuda")
-    plan = prepare_mega_gate(
+    prepare = prepare_mega_gate
+    if config is not None:  # a forced schedule, for paths the heuristic picks elsewhere
+        from flashinfer.experimental.sm12x_mega_gate.mega_gate import MegaGateSm12xPlan
+
+        prepare = functools.partial(MegaGateSm12xPlan, _config=config)
+    plan = prepare(
         x,
         weight,
         num_topk,
@@ -327,6 +341,22 @@ def test_replica_counts(num_tokens, ep_rank):
     _run_case(
         num_tokens, 5120, 384, 6, num_shared=1, ep_rank=ep_rank, replicas=7, seed=2
     )
+
+
+@pytest.mark.parametrize(
+    "block_tokens,num_split_k,num_tokens",
+    [(16, 8, 300), (32, 8, 600), (64, 8, 900), (64, 4, 700)],
+)
+def test_cooperative_gate_over_several_blocks(block_tokens, num_split_k, num_tokens):
+    """Cooperative gates of 1-3 tokens per CTA (and a per-token gate) whose CTAs rank
+    several blocks: the exchange is reused block after block."""
+    _skip_unless_sm120()
+    config = heuristics.make_config(block_tokens, num_split_k, 384)
+    assert config.cooperative_gate == (block_tokens <= 3 * config.num_logical_ctas)
+    plan = _run_case(
+        num_tokens, **PRODUCTION, num_shared=1, with_mask=True, config=config
+    )
+    assert plan.route["num_worker_groups"] < config.num_token_blocks(num_tokens)
 
 
 @pytest.mark.parametrize("num_tokens", TOKEN_COUNTS)

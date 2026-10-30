@@ -52,14 +52,47 @@ MAX_TOKENS_PER_CTA_FOR_4_GATE_WARPS = 4
 (measured 1.03x-1.09x at 512-2048 tokens, 0.97x-0.99x below on a 110-SM board)."""
 
 
+MAX_COOPERATIVE_TOKENS = 3
+"""Up to this many tokens per CTA and block, every gate warp ranks them (cooperative gate):
+a (token, 128-expert wave) item per warp instead of a whole token per warp."""
+MIN_COOPERATIVE_STAGES = 3
+"""The cooperative gate's exchange takes shared memory from the pipeline; keep this many
+stages or fall back to one warp per token."""
+
+
+def cooperative_slots(block_tokens: int, num_logical_ctas: int) -> int:
+    """Tokens of a block a CTA ranks (at most)."""
+    return ceil_div(block_tokens, num_logical_ctas)
+
+
+def is_cooperative(block_tokens: int, num_logical_ctas: int, num_groups: int) -> bool:
+    """Whether a schedule runs the cooperative gate: few tokens per CTA, 4 MMA warps (8
+    gate warps next to 8 MMA warps would spill), and enough stages left by the exchange."""
+    slots = cooperative_slots(block_tokens, num_logical_ctas)
+    return (
+        select_mma_warps_n(block_tokens) == 1
+        and slots <= MAX_COOPERATIVE_TOKENS
+        and max_stages(
+            block_tokens, slots * exchange_bytes(num_groups * EXPERTS_PER_CTA)
+        )
+        >= MIN_COOPERATIVE_STAGES
+    )
+
+
 def select_gate_warps(
-    block_tokens: int, num_logical_ctas: int, mma_warps_n: int = 1
+    block_tokens: int,
+    num_logical_ctas: int,
+    mma_warps_n: int = 1,
+    cooperative: bool = False,
 ) -> int:
     # With 8 MMA warps, 8 gate warps would cap a thread at 120 registers and spill the
     # mainloop (measured 2.5x slower at 128-token blocks).
     if mma_warps_n > 1:
         return 4
     tokens_per_cta = ceil_div(block_tokens, num_logical_ctas)
+    if cooperative:
+        # Warp 0 polls; one token's waves (3 for 384 experts) take warps 1-3.
+        return 4 if tokens_per_cta == 1 else 8
     return 4 if tokens_per_cta <= MAX_TOKENS_PER_CTA_FOR_4_GATE_WARPS else 8
 
 
@@ -78,8 +111,9 @@ WIDE_BLOCK_TOKENS = (96, 128)
 
 # Cost model of one CTA's critical path, in microseconds, fitted (non-negative least
 # squares, relative error) on the schedules measured within 15% of the best of their token
-# count (16-128 token blocks, every split, 1-16384 tokens) on the 110-SM RTX PRO 5000:
-# 0.9% slower than the measured best on average, 7.3% at worst (320 tokens, the block rule).
+# count (16-128 token blocks, every split, 1-16384 tokens) on the 110-SM RTX PRO 5000.
+# With the cooperative gate of up to 3 tokens per CTA: 0.7% slower than the measured best
+# on average over 26 token counts, 3.9% at worst (320 tokens, the block rule).
 COST_PER_TILE_ROW = 0.0017247
 """Per K block and staged tile row (weight rows + token rows): the load side."""
 COST_PER_MMA_TOKEN = 0.0040045
@@ -95,7 +129,7 @@ COST_PER_TAIL_TOKEN = 2.7365
 COST_PER_TAIL_TOKEN_SPLIT = 0.19731
 """Per split-K partial such a tail token reduces."""
 COST_PER_COOPERATIVE_TAIL = 2.0183
-"""The last block's token when every gate warp of the CTA ranks it."""
+"""The last block's tokens when every gate warp of the CTA ranks them."""
 COST_PER_COOPERATIVE_TAIL_SPLIT = 0.15841
 """Per split-K partial it reduces."""
 
@@ -139,9 +173,9 @@ class MegaGateConfig:
     mma_warps_n: int = 1
     """MMA warps along the tokens (4 along the experts); see ``select_mma_warps_n``."""
     cooperative_gate: bool = False
-    """At most one token per CTA and block (block tokens <= L): every gate warp ranks it
-    (the split-K loads and transcendentals of a wave per warp), instead of one warp per
-    token."""
+    """At most ``MAX_COOPERATIVE_TOKENS`` tokens per CTA and block: every gate warp ranks
+    them (the split-K loads and transcendentals of one token's 128-expert wave per item),
+    instead of one warp per token."""
 
     @property
     def num_logical_ctas(self) -> int:
@@ -198,7 +232,8 @@ def estimated_us(
         * block_tokens
         + (COST_PER_WAVE + COST_PER_WAVE_TOKEN * block_tokens) * num_waves
     )
-    if block_tokens <= num_logical_ctas:  # cooperative gate
+    if is_cooperative(block_tokens, num_logical_ctas, num_groups):
+        # Up to 3 tokens per CTA, 8 gate warps rank them in about the time 4 take for one.
         return (
             cost + COST_PER_COOPERATIVE_TAIL + COST_PER_COOPERATIVE_TAIL_SPLIT * split
         )
@@ -258,19 +293,23 @@ def make_config(
 ) -> MegaGateConfig:
     """The schedule of a block size and split-K: gate warps, gate mode and stage count."""
     num_groups = align(num_experts, EXPERTS_PER_CTA) // EXPERTS_PER_CTA
-    cooperative = block_tokens <= num_groups * num_split_k
+    num_logical_ctas = num_groups * num_split_k
+    cooperative = is_cooperative(block_tokens, num_logical_ctas, num_groups)
     mma_warps_n = select_mma_warps_n(block_tokens)
+    exchange = (
+        cooperative_slots(block_tokens, num_logical_ctas) * exchange_bytes(num_experts)
+        if cooperative
+        else 0
+    )
     # The pipeline runs across the token blocks of a worker group, so the stage
     # count is bounded by shared memory only.
     return MegaGateConfig(
         block_tokens=block_tokens,
         num_split_k=num_split_k,
         num_expert_groups=num_groups,
-        num_stages=max_stages(
-            block_tokens, exchange_bytes(num_experts) if cooperative else 0
-        ),
+        num_stages=max_stages(block_tokens, exchange),
         num_gate_warps=select_gate_warps(
-            block_tokens, num_groups * num_split_k, mma_warps_n
+            block_tokens, num_logical_ctas, mma_warps_n, cooperative
         ),
         mma_warps_n=mma_warps_n,
         cooperative_gate=cooperative,
