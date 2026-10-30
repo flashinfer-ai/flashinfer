@@ -217,7 +217,7 @@ is filtered: FlashInfer's `ExperimentalWarning` is this API's single opt-in sign
 ## Where the kernels come from
 
 The backend is a subset of the cuDNN Frontend Python package vendored byte-faithfully under `_cudnn_frost/`
-(160 files: the block's forward and its serving launches -- the fused norm + RoPE projection fork and the lowered small-M decode
+(161 files: the block's forward and its serving launches -- the fused norm + RoPE projection fork and the lowered small-M decode
 chain's norm + RoPE pass and cache write --, the FROST SDPA adapter with its configuration tables (the shared d128-family table and the
 two backward configuration tables the forward configs import at module level: geometry and validators, no backward kernel) and its
 SM107 prefill / decode tiles and SM100 split combine, the FROST GEMM compiler and its kernel templates, the `tile_dsl` helpers, and --
@@ -233,7 +233,7 @@ does not carry -- the `gemm` package's lazy exports and the sm120 arch family; P
 one-device check ahead of its upstream landing, is retired now that the pinned commit carries it; all listed in
 `_cudnn_frost/VENDOR.md`; per-file digests in `_cudnn_frost/VENDOR_MANIFEST.json`).
 Pinned revision: cuDNN Frontend
-`4c8e24355` on its `develop` branch (1.33.0: everything of the previous pins `977757763` / `7301fad21` / `f2aa360e5` / `d8b0a7ed5` / `b4664a2d4` -- the Rubin decode levers, the
+`6b21be0e0` on its `develop` branch (1.33.0: everything of the previous pins `4c8e24355` / `977757763` / `7301fad21` / `f2aa360e5` / `d8b0a7ed5` / `b4664a2d4` -- the Rubin decode levers, the
 independent K / V paged-pool layouts, the split-prefix scheduling of paged packed attention, the decode step's measured defaults on cc 10.7
 (programmatic dependent launch on the decode tile's routes, the paged write-through folded into the norm + RoPE launch below 128 rows), the
 in-block QSA indexer's DECODE step over the pools that the Qwen 3.8 sibling binds: the indexer band on the small-M projection route, the
@@ -254,7 +254,7 @@ and `977757763` (the native SM107 FP8 D192 / D256 forms and split sinks, the nat
 prepared THD host's ordered binding and physical origins: none of them on this package's routes -- the extension's three new binder
 capability flags they bring, the quantized split sink and the native D576 packed forms, read False in the shim and are declined by name
 through this package's Python binder) and the FROST GEMM compiler's MoE-side change (qualified bulk reductions in the combine; the kernel
-templates of the closure byte-identical); and, at this pin (`4c8e24355`), the in-block indexer's EXTEND step over the pools that the Qwen 3.8
+templates of the closure byte-identical); at the `4c8e24355` pin, the in-block indexer's EXTEND step over the pools that the Qwen 3.8
 sibling binds as its `extend` / `prefill` forms (the chunk compress with the ring read-only, the dense kbar gather and the canonical-order
 kernel -- the two files `gated_attention_block/kernels/qsa_kbar_gather.py` / `qsa_canonical_list.py` this pin adds --, the compact-logits
 scorer + fused radix top-k of the `deepseek_sparse_attention/` subtree it scores through -- 38 files this pin adds, vendored by the import
@@ -265,13 +265,17 @@ tree, not exposed by either package), the SDPA stack's `develop` changes between
 pools, the ragged Q lengths of the padded decode leg, the non-paged d128 split origins and the per-role origin caps: none of them on these
 packages' routes -- the extension's five new binder capability flags they bring read False in the shim and are declined by name through
 this package's Python binder, whose vendored reference frame implementation moved with them) and two SDPA host modules the changed
-adapters now import (`sdpa/layout.py`, `sdpa/native_sm80.py`).
+adapters then imported (`sdpa/layout.py`, `sdpa/native_sm80.py`); and, at this pin (`6b21be0e0`), the projection GEMM driver's large-M
+rule (the indexer-band slab of the Qwen 3.8 sibling takes the GEMM engine's own baseline tile for its shape past 128 rows on the same
+JIT-only route, capture-safe and flag-free -- the sibling's `extend` / `prefill` forms at any chunk length; the rule reads the planner
+envelope the tile catalog now publishes, so the graph-route planner stays out of the closure), the GEMM engine's operand-transpose
+normalization with its layout helper `gemm/frost/layouts.py` (the one file this pin adds: a module-level dependency of the engine's graph
+analyzer and recipe), the SDPA stack's 32-bit offset widening (its graph validator; the sm120 backward kernels it touched are not vendored)
+and a docstring note on the measured cost of the fused store's staged rounding mode (`sdpa/fwd/sparse_gqa_sm107.py`).
 The dense forms of this package are unchanged by the re-vendor (their files are byte-identical to the previous pin's except the block's
-`api.py` and package `__init__`, the engine manifest / ids / heuristics, the FROST buffers and device helpers, two `tile_dsl` helpers
-(`pointwise.py`: the rope pair helpers; `thd.py`), the SDPA adapter's configuration / heuristics / engine tables and its sparse adapter and
-rules module, the prepared-plan host and the THD split host, the THD-origins module, the sm100 prefill tile and split combine, the SDPA
-graph analyzer, the backward configuration tables and the GEMM compiler with its sm100 templates and helpers, which carry the changes
-above -- 50 changed files in all; the sm107 kernels and the other `tile_dsl` helpers are byte-identical).
+`api.py` and its projection GEMM driver, the graph IR and its GEMM validator, the GEMM engine's compiler / dtypes / graph analyzer / recipe
+/ tile catalog, and the sparse adapter's docstring -- 10 changed files in all, none of them a kernel; every kernel, `tile_dsl` helper and
+template is byte-identical to the previous pin's).
 `qwen_3_5_block_support(...).source` reports the pin at runtime. The deployed process never imports the
 `cudnn` package nor the cuDNN library: the one native piece of that route, the SDPA launch binder, is served in Python
 (`_sdpa_binder.py`, built on cuDNN Frontend's own retired Python binder implementation vendored from its test tree). The

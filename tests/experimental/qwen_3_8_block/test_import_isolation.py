@@ -62,7 +62,7 @@ assert q.Qwen38BlockWrapper.is_experimental is True and q.Qwen38BlockWrapper.pla
 import torch
 g = q.Qwen38BlockGeometry(d_model=2560, num_qo_heads=24, num_kv_heads=2)
 sup = q.qwen_3_8_block_support(torch.device("cpu"), g)
-assert sup.served is False and sup.source.commit.startswith("4c8e24355")
+assert sup.served is False and sup.source.commit.startswith("6b21be0e0")
 # the probe on a CPU host reads no vendored tree and imports no kernel module (FlashInfer's own cute_dsl availability probe may load the
 # DSL's Python frontend: the Qwen 3.5 package's rule, not this package's)
 assert not any(k.startswith("flashinfer.experimental.qwen_3_5_block._cudnn_frost") for k in sys.modules), "the probe on CPU reads no vendored tree"
@@ -154,8 +154,9 @@ print("OK")
 def test_the_closure_modules_the_decode_route_added_import_without_cudnn():
     """Every module the 3.8 routes added to the shared vendored tree (the block-sparse core and its lean second body, the paged indexer
     kernels and their DSL-free hosts; since the 4c8e24355 pin the extend step's two kernels and the DSA indexer scorer + top-k subtree it
-    scores through) imports with the ``cudnn`` package blocked and no GPU; the lazily imported paths outside the closure (the e4m3 pool's
-    upcast arm, the DSA subtree's backward packages) are named and stay out."""
+    scores through; since the 6b21be0e0 pin the GEMM engine's layout helper) imports with the ``cudnn`` package blocked and no GPU; the
+    lazily imported paths outside the closure (the e4m3 pool's upcast arm, the DSA subtree's backward packages, the GEMM graph-route planner
+    the projection driver's large-M rule does NOT import) are named and stay out."""
     pytest.importorskip("cutlass")
     out = _run_isolated(
         _BLOCK_CUDNN
@@ -174,8 +175,11 @@ added = ("sdpa.fwd.sparse_gqa_sm107", "sdpa.fwd.kernels.sm107.sparse_d256_f16", 
          "gated_attention_block.kernels.qsa_kbar_gather", "gated_attention_block.kernels.qsa_canonical_list",
          "deepseek_sparse_attention", "deepseek_sparse_attention.indexer_forward", "deepseek_sparse_attention.indexer_forward._support",
          "deepseek_sparse_attention.indexer_top_k", "deepseek_sparse_attention.utils.runtime", "deepseek_sparse_attention.score_recompute",
-         # two SDPA host modules the changed adapters import at this pin
-         "sdpa.layout", "sdpa.native_sm80")
+         # two SDPA host modules the changed adapters import since the 4c8e24355 pin
+         "sdpa.layout", "sdpa.native_sm80",
+         # the 6b21be0e0 pin: the GEMM engine's layout helper (a module-level dependency of its graph analyzer and recipe) and the tile
+         # catalog that now publishes the planner envelope the projection driver's large-M rule reads (the band slab past 128 rows)
+         "gemm.frost.layouts", "gemm.frost.tile_config", "gated_attention_block.kernels.proj_gemm")
 failed, declined = [], []
 for name in added:
     try:
@@ -192,7 +196,7 @@ m = importlib.import_module(root + "sdpa.fwd.sparse_gqa_sm107")
 # the bare `import cudnn` of this module was rewritten to the vendored root: its data_type enum is the shim's
 assert m.cudnn.__name__ == root[:-1] and m.cudnn.data_type.BFLOAT16 == 10, (m.cudnn.__name__,)
 for absent in ("gated_attention_block.kernels.qsa_kv_upcast", "deepseek_sparse_attention.indexer_backward", "deepseek_sparse_attention.sparse_attention_backward",
-               "deepseek_sparse_attention.sparse_attention_forward", "deepseek_sparse_attention.training"):
+               "deepseek_sparse_attention.sparse_attention_forward", "deepseek_sparse_attention.training", "gemm.frost.planning"):
     try:
         importlib.import_module(root + absent)
     except ModuleNotFoundError:

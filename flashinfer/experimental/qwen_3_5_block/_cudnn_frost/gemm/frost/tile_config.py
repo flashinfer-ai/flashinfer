@@ -783,6 +783,30 @@ def _cluster_score(M: int, N: int, cta_m: int, cta_n: int, cta_group: int, cgrp_
     return quant * (launched / (waves * sm_count))
 
 
+# The shape envelope of the engine's device-aware planner (`planning.py`): a cost profile claims a GEMM -- and may then rank a strategy
+# other than the baseline pick `select_config` makes for it -- only with M and N inside PLANNER_MN_BOUNDS, K inside PLANNER_K_BOUNDS and
+# the batch at most PLANNER_MAX_BATCH (`planning.CostProfile`'s defaults read these three; a profile that needs other bounds declares
+# them, and the planner's own test pins every profile inside this envelope).  Outside it the baseline pick IS the plan on every part: a
+# shape-only fact a host-side resolver reads HERE, without importing the planner module -- the gated attention block's projection driver
+# names the engine's pick directly for its slabs there, and a JIT-only deployment of that driver carries this catalog, not the planner.
+# Inclusive bounds.
+PLANNER_MN_BOUNDS: tuple[int, int] = (32, 4096)
+PLANNER_K_BOUNDS: tuple[int, int] = (1024, 16384)
+PLANNER_MAX_BATCH: int = 8
+
+
+def planner_may_claim(M: int, N: int, K: int, batch: int = 1) -> bool:
+    """Whether a cost profile of the engine's planner could claim a ``[batch, M, K] x [batch, K, N]`` GEMM at all: the shape lies inside the
+    planner envelope above.  The widest reading -- a profile also needs its part, its dtype key and an eligible graph -- so False means the
+    baseline pick is the plan everywhere, and True only that the planner MAY rank another strategy."""
+    return (
+        PLANNER_MN_BOUNDS[0] <= M <= PLANNER_MN_BOUNDS[1]
+        and PLANNER_MN_BOUNDS[0] <= N <= PLANNER_MN_BOUNDS[1]
+        and PLANNER_K_BOUNDS[0] <= K <= PLANNER_K_BOUNDS[1]
+        and batch <= PLANNER_MAX_BATCH
+    )
+
+
 def select_config(
     M: int,
     N: int,

@@ -326,8 +326,8 @@ environment", for the full table.
 
 ## Where the kernels come from
 
-The backend is the Qwen 3.5 package's vendored cuDNN Frontend subset (`../qwen_3_5_block/_cudnn_frost/`, 160 files at the pinned commit
-`4c8e24355` of the cuDNN Frontend `develop` branch -- the block's forward with the in-block indexer's decode AND extend steps, the
+The backend is the Qwen 3.5 package's vendored cuDNN Frontend subset (`../qwen_3_5_block/_cudnn_frost/`, 161 files at the pinned commit
+`6b21be0e0` of the cuDNN Frontend `develop` branch -- the block's forward with the in-block indexer's decode AND extend steps, the
 block-sparse d256 core with its two bodies (the tcgen05 core and the lean decode tile, plus the visible-set helper they share), its paged
 indexer kernels (the fused prepare, the compress step, the paged scorer, the decode top-k, the dense kbar gather, the canonical-order
 kernel) and their DSL-free hosts (the `QSA` selection package), the `deepseek_sparse_attention` indexer scorer + top-k subtree the extend
@@ -343,8 +343,11 @@ schedule's split rule, the chain's programmatic-dependent-launch sites (served o
 every form), the LEAN decode tile of the sparse core behind the `sparse_tile_form` knob with its measured AUTO default on cc 10.7 (the bound
 counts the lean grid's own unit, `batch x H_kv <= 4` CTAs per chunk at every served step width; for this entry the batch 1 and 2 decode
 steps at `q_len_per_req 1`), the staged rounding mode of the fused split-combine store, the batch-1 gate-layout declaration fix and the
-FP8-projection mode of the dense serving forms (declared by the tree, not exposed here). `qwen_3_8_block_support(...).source` reports the
-pin at runtime (the same record as the Qwen 3.5 package's). The deployed process never imports the `cudnn` package nor the cuDNN library.
+FP8-projection mode of the dense serving forms (declared by the tree, not exposed here), and -- the `6b21be0e0` pin -- the projection GEMM
+driver's large-M rule: the indexer-band slab (N 13952 = 109 x 128, off the 256-column grid) takes the GEMM engine's own baseline tile for
+its shape past 128 rows on the same JIT-only route (capture-safe, no cuDNN handle; the rule reads the planner envelope the tile catalog
+publishes, so the graph-route planner stays out of the vendored tree), which is what lets the `extend` / `prefill` forms serve a chunk of
+any length. `qwen_3_8_block_support(...).source` reports the pin at runtime (the same record as the Qwen 3.5 package's). The deployed process never imports the `cudnn` package nor the cuDNN library.
 Re-vendoring: `../qwen_3_5_block/_vendoring/` (its README is the recipe; the tracer's `decode_qsa` and `extend_qsa` forms declare this
 package's routes: the lean kernel module is loaded by path on the batch-1 decode route and the extend step's kernels and the scorer
 subtree are imported on the extend route only, so the closure needs their traces).

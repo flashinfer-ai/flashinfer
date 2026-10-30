@@ -353,6 +353,6 @@ def test_version_probe_is_the_qwen_3_5_tree():
 
     a, b = s38.source(), s35.source()
     assert Qwen38BlockSource is type(b) and a == b
-    assert a.commit.startswith("4c8e24355") and a.version == "1.33.0" and a.files == 160
+    assert a.commit.startswith("6b21be0e0") and a.version == "1.33.0" and a.files == 161
     assert a.validated_cutedsl == "4.8.0" and a.validated_compute_capability == "10.7"
     assert qwen_3_8_block_support.is_experimental is True
