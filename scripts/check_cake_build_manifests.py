@@ -264,7 +264,7 @@ def refs_lm_head_loss(package_dir: Path, loader: str) -> set[str]:
     }
 
 
-def refs_moe_grouped_gemm(package_dir: Path, loader: str) -> set[str]:
+def refs_moe_grouped_det_gemm(package_dir: Path, loader: str) -> set[str]:
     """Route stages bind a program and its compile-line specializations; the build is
     ``<library><tag>_<arch>`` for every architecture the route and the program share."""
     literals = module_literals(package_dir / loader)
@@ -413,10 +413,10 @@ PACKAGES: tuple[Package, ...] = (
         refs_shipped_modules,
     ),
     Package(
-        "flashinfer.experimental.cake_moe_grouped_gemm",
-        "flashinfer/experimental/cake_moe_grouped_gemm",
+        "flashinfer.experimental.cake_moe_grouped_det_gemm",
+        "flashinfer/experimental/cake_moe_grouped_det_gemm",
         "cake_jit.py",
-        refs_moe_grouped_gemm,
+        refs_moe_grouped_det_gemm,
     ),
     Package(
         "flashinfer.experimental.cake_lm_head_loss",
