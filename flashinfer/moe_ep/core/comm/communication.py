@@ -165,6 +165,10 @@ class MoEEpCommunication(ABC):
     # Whether a dispatch/combine pair may be recorded into a CUDA graph (after
     # an eager warmup with the same shapes).
     supports_cuda_graph: ClassVar[bool] = True
+    # Whether combine reads only the expert-output rows whose received token
+    # has an expert on this rank, so the expert computation may leave the
+    # other rows unwritten.
+    combine_reads_only_local_expert_rows: ClassVar[bool] = False
 
     def __init__(
         self,

@@ -124,16 +124,16 @@ def test_optional_second_input_finalize(num_tokens, top_k, use_expert_weights):
         False,
     )
 
-    module.trtllm_moe_run_finalize(input0 + input1, expected, *common, None)
-    module.trtllm_moe_run_finalize(input0, actual, *common, input1)
+    module.trtllm_moe_run_finalize(input0 + input1, expected, *common, None, True)
+    module.trtllm_moe_run_finalize(input0, actual, *common, input1, True)
 
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
     without_second_input = torch.empty_like(expected)
     with_zero_second_input = torch.empty_like(expected)
-    module.trtllm_moe_run_finalize(input0, without_second_input, *common, None)
+    module.trtllm_moe_run_finalize(input0, without_second_input, *common, None, True)
     module.trtllm_moe_run_finalize(
-        input0, with_zero_second_input, *common, torch.zeros_like(input0)
+        input0, with_zero_second_input, *common, torch.zeros_like(input0), True
     )
 
     assert torch.equal(without_second_input, with_zero_second_input)
@@ -177,7 +177,9 @@ def test_finalize_uses_gemm2_padded_hidden_stride(
         else None
     )
 
-    _finalize_module().trtllm_moe_run_finalize(gemm2_output, output, *common, second)
+    _finalize_module().trtllm_moe_run_finalize(
+        gemm2_output, output, *common, second, True
+    )
 
     combined = gemm2_output.float()
     if second is not None:
@@ -311,7 +313,9 @@ def test_finalize_validates_primary_and_metadata_tensors(mutate, error):
     gemm2_output, output, common = mutate(gemm2_output, output, common)
 
     with pytest.raises(Exception, match=error):
-        _finalize_module().trtllm_moe_run_finalize(gemm2_output, output, *common, None)
+        _finalize_module().trtllm_moe_run_finalize(
+            gemm2_output, output, *common, None, True
+        )
 
 
 @pytest.mark.parametrize(
@@ -340,7 +344,7 @@ def test_finalize_validates_second_input(make_second, error):
 
     with pytest.raises(Exception, match=error):
         _finalize_module().trtllm_moe_run_finalize(
-            gemm2_output, output, *common, make_second(gemm2_output)
+            gemm2_output, output, *common, make_second(gemm2_output), True
         )
 
 
@@ -353,10 +357,10 @@ def test_finalize_accepts_flat_expert_weights():
     flat_output = torch.empty_like(output)
 
     _finalize_module().trtllm_moe_run_finalize(
-        gemm2_output, output, expert_weights, *common[1:], None
+        gemm2_output, output, expert_weights, *common[1:], None, True
     )
     _finalize_module().trtllm_moe_run_finalize(
-        gemm2_output, flat_output, expert_weights.reshape(-1), *common[1:], None
+        gemm2_output, flat_output, expert_weights.reshape(-1), *common[1:], None, True
     )
 
     assert torch.equal(flat_output, output)
@@ -367,7 +371,7 @@ def test_finalize_zero_tokens_is_noop():
     gemm2_output, output, common = _make_finalize_case(num_tokens=0)
 
     _finalize_module().trtllm_moe_run_finalize(
-        gemm2_output, output, *common, torch.zeros_like(gemm2_output)
+        gemm2_output, output, *common, torch.zeros_like(gemm2_output), True
     )
     torch.cuda.synchronize()
 
@@ -386,7 +390,9 @@ def test_finalize_unaligned_large_grid_uses_scalar_fallback():
     )
     second = torch.randn_like(gemm2_output)
 
-    _finalize_module().trtllm_moe_run_finalize(gemm2_output, output, *common, second)
+    _finalize_module().trtllm_moe_run_finalize(
+        gemm2_output, output, *common, second, True
+    )
     expected = (
         (gemm2_output.float() + second.float())[:, :hidden_size]
         .reshape(num_tokens, top_k, hidden_size)
@@ -394,3 +400,124 @@ def test_finalize_unaligned_large_grid_uses_scalar_fallback():
         .to(torch.bfloat16)
     )
     torch.testing.assert_close(output, expected, rtol=0, atol=0)
+
+
+def _routes_with_and_without_local_experts(num_tokens, top_k, device):
+    """Expanded-to-permuted rows: every third token has no local expert, the
+    next one local expert and the one after it every other slot local."""
+    expanded = torch.arange(num_tokens * top_k, device=device, dtype=torch.int32)
+    expanded = expanded.reshape(num_tokens, top_k)
+    expanded[0::3] = -1
+    expanded[1::3, 1:] = -1
+    expanded[2::3, 1::2] = -1
+    return expanded
+
+
+@pytest.mark.parametrize(
+    ("num_tokens", "top_k", "use_second_input"),
+    [
+        pytest.param(4, 2, False, id="scalar"),
+        pytest.param(4, 8, False, id="small-batch"),
+        pytest.param(1200, 2, False, id="warp-per-token"),
+        pytest.param(1200, 2, True, id="vec-load"),
+    ],
+)
+def test_finalize_leaves_rows_without_local_expert_unwritten(
+    num_tokens, top_k, use_second_input
+):
+    _require_finalize_runtime()
+
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    hidden_size = 256
+    shape = (num_tokens * top_k, hidden_size)
+    gemm2_output = torch.randint(-4, 5, shape, device=device, dtype=torch.int32).to(
+        torch.bfloat16
+    )
+    second = (
+        torch.randint(-4, 5, shape, device=device, dtype=torch.int32).to(torch.bfloat16)
+        if use_second_input
+        else None
+    )
+    expanded = _routes_with_and_without_local_experts(num_tokens, top_k, device)
+    no_local = (expanded == -1).all(dim=1)
+    expert_weights = torch.randint(
+        -2, 3, (num_tokens, top_k), device=device, dtype=torch.int32
+    ).to(torch.bfloat16)
+    common = (
+        expert_weights,
+        expanded.reshape(-1),
+        torch.tensor([shape[0]], device=device, dtype=torch.int32),
+        num_tokens,
+        1,
+        top_k,
+        hidden_size,
+        True,
+        False,
+        second,
+    )
+    zeroed = torch.full((num_tokens, hidden_size), float("nan"), device=device).to(
+        torch.bfloat16
+    )
+    kept = zeroed.clone()
+
+    _finalize_module().trtllm_moe_run_finalize(gemm2_output, zeroed, *common, True)
+    _finalize_module().trtllm_moe_run_finalize(gemm2_output, kept, *common, False)
+
+    assert torch.equal(zeroed[no_local], torch.zeros_like(zeroed[no_local]))
+    assert torch.isnan(kept[no_local]).all()
+    assert torch.equal(kept[~no_local], zeroed[~no_local])
+
+
+def test_multi_expert_finalize_leaves_rows_without_local_expert_unwritten():
+    """After an FC2 epilogue stored the single-expert tokens (here the
+    prefilled rows), the finalize reduces the multi-expert tokens and writes
+    the zero rows only when asked to."""
+    _require_finalize_runtime()
+
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    num_tokens, top_k, hidden_size = 1200, 4, 256
+    shape = (num_tokens * top_k, hidden_size)
+    gemm2_output = torch.randint(-4, 5, shape, device=device, dtype=torch.int32).to(
+        torch.bfloat16
+    )
+    expanded = _routes_with_and_without_local_experts(num_tokens, top_k, device)
+    num_local = (expanded != -1).sum(dim=1)
+    expert_weights = torch.randint(
+        -2, 3, (num_tokens, top_k), device=device, dtype=torch.int32
+    ).to(torch.bfloat16)
+    common = (
+        expert_weights,
+        expanded.reshape(-1),
+        torch.tensor([shape[0]], device=device, dtype=torch.int32),
+        num_tokens,
+        1,
+        top_k,
+        hidden_size,
+        True,
+    )
+    zeroed = torch.full((num_tokens, hidden_size), float("nan"), device=device).to(
+        torch.bfloat16
+    )
+    kept = zeroed.clone()
+
+    module = _finalize_module()
+    module.trtllm_moe_run_finalize_multi_expert_tokens(
+        gemm2_output, zeroed, *common, True
+    )
+    module.trtllm_moe_run_finalize_multi_expert_tokens(
+        gemm2_output, kept, *common, False
+    )
+
+    rows = expanded.clamp(min=0).long()
+    weights = expert_weights.float() * (expanded != -1)
+    expected = (weights.unsqueeze(-1) * gemm2_output.float()[rows]).sum(1)
+    multi = num_local > 1
+    torch.testing.assert_close(
+        zeroed[multi], expected[multi].to(torch.bfloat16), rtol=0, atol=0
+    )
+    assert torch.isnan(zeroed[num_local == 1]).all()
+    assert torch.equal(zeroed[num_local == 0], torch.zeros_like(zeroed[num_local == 0]))
+    assert torch.isnan(kept[num_local <= 1]).all()
+    assert torch.equal(kept[multi], zeroed[multi])
