@@ -20,9 +20,10 @@ backend package and the ``flashinfer`` top level) every compatibility name is th
 same object as its det name and stays out of ``__all__``.  The module
 ``flashinfer.cake_causal_conv1d_train`` is the facade's module object, and the
 submodules of ``flashinfer.cake_causal_conv1d_train_backend`` are the det
-package's module objects.  Importing either facade or either package loads no KCP
-host module under either name (checked in fresh interpreters by module file, not
-by name).
+package's module objects.  Both old module paths are also attributes of the
+``flashinfer`` package after a plain ``import flashinfer``.  Importing either facade
+or either package, or reaching it as such an attribute, loads no KCP host module
+under either name (checked in fresh interpreters by module file, not by name).
 """
 
 from __future__ import annotations
@@ -140,8 +141,30 @@ def test_old_package_forwards_to_the_det_package() -> None:
     assert files == sorted(["__init__.py", *(f"{m}.py" for m in SUBMODULES)])
 
 
+# The old module paths reached as attributes of ``flashinfer`` with no explicit import.
+_ATTRIBUTE_ACCESS = """
+import sys
+
+import flashinfer
+
+old_facade = flashinfer.{old_facade}
+assert old_facade is flashinfer.{new_facade} is sys.modules["flashinfer.{new_facade}"]
+old_package = flashinfer.{old_package}
+assert old_package is sys.modules["flashinfer.{old_package}"]
+new_package = flashinfer.{new_package}
+assert old_package.{old_name} is new_package.{new_name}
+"""
+
 # Every import form of the facade and the package, each in a fresh interpreter.
 IMPORTS = {
+    "flashinfer_attributes": _ATTRIBUTE_ACCESS.format(
+        old_facade=OLD_FACADE.rpartition(".")[2],
+        new_facade=NEW_FACADE.rpartition(".")[2],
+        old_package=OLD_PACKAGE.rpartition(".")[2],
+        new_package=NEW_PACKAGE.rpartition(".")[2],
+        old_name=PAIRS[2][0],
+        new_name=PAIRS[2][1],
+    ),
     "flashinfer": "import flashinfer",
     "old_facade": f"import {OLD_FACADE}",
     "new_facade": f"import {NEW_FACADE}",

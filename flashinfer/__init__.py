@@ -171,7 +171,16 @@ _PRIMS_TS_LAZY_EXPORTS = frozenset(
 )
 
 
+# Compatibility module paths of the causal conv1d facade and its backend package; each
+# resolves on first attribute access and loads no KCP host module.
+_COMPAT_SUBMODULES = frozenset(
+    {"cake_causal_conv1d_train", "cake_causal_conv1d_train_backend"}
+)
+
+
 def __getattr__(name: str):
+    if name in _COMPAT_SUBMODULES:
+        return importlib.import_module(f"{__name__}.{name}")
     if name not in _PRIMS_TS_LAZY_EXPORTS:
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
     from . import fused_moe as _fused_moe
