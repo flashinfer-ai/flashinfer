@@ -39,7 +39,9 @@ producer warp through a multi-stage mbarrier pipeline and `ldmatrix`
   (token, 128-expert wave) item goes to one gate warp (its split-K loads and
   transcendentals), is posted sorted to shared memory, and a selector warp per
   token merges the waves; this takes 4 gate warps for one token and 8 for more,
-  and the exchange costs a pipeline stage at 48- and 64-token blocks.
+  and the exchange costs a pipeline stage at 48- and 64-token blocks. With wide
+  blocks a CTA ranks up to 43 tokens of a block on 4 gate warps: the MMA warps
+  join them on the CTA's last block, whose gate work nothing else overlaps.
 - **Score barrier.** One 128 B line per token block in `score_barriers`: an
   arrival counter (`red.release.gpu` by the MMA warps, `ld.acquire.gpu` polls by
   one gate lane) and a waiter counter. Every CTA that waited counts itself after
@@ -66,9 +68,9 @@ producer warp through a multi-stage mbarrier pipeline and `ldmatrix`
   tokens rounded up to 16 and clamped to 16..64; above, a 96- or 128-token block
   (each weight tile then serves more tokens: 5-11% faster from 768 tokens). The
   split-K, and above 512 tokens the block, minimize a cost model of one CTA's
-  critical path fitted on the near-best measured schedules of the 110-SM board
-  (0.7% slower than the measured best on average over 26 token counts, 3.9% at
-  worst at 320 tokens, from the block rule).
+  critical path, with separate coefficients for wide blocks, fitted on measured
+  schedules of the 110-SM board (0.5% slower than the measured best on average
+  over 21 token counts, 3.9% at worst at 320 tokens, from the block rule).
 
 Compared to the SM100 programs this backend also accepts other hidden sizes
 (multiples of 64), 1..1024 experts, top-k up to 32 slots, no bias, token masks

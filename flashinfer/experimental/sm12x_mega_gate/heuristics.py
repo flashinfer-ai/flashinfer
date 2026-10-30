@@ -96,6 +96,16 @@ def select_gate_warps(
     return 4 if tokens_per_cta <= MAX_TOKENS_PER_CTA_FOR_4_GATE_WARPS else 8
 
 
+def mma_warps_rank(
+    block_tokens: int, num_logical_ctas: int, cooperative: bool, num_gate_warps: int
+) -> bool:
+    """Whether the MMA warps rank tokens of the CTA's last block with the gate warps:
+    without a cooperative gate, when a CTA ranks more tokens of a block than it has gate
+    warps (wide blocks). Nothing overlaps that block's gate work, and the MMA warps have
+    nothing left to do."""
+    return not cooperative and ceil_div(block_tokens, num_logical_ctas) > num_gate_warps
+
+
 def select_mma_warps_n(block_tokens: int) -> int:
     """MMA warps along the tokens: 1 up to 64 block tokens, else 2 (each warp keeps a 32x64
     accumulator tile; at 64 tokens, 2 measured 0.93x-1.02x of 1)."""
@@ -117,9 +127,7 @@ WIDE_BLOCK_TOKENS = (96, 128)
 COST_PER_TILE_ROW = 0.0017247
 """Per K block and staged tile row (weight rows + token rows): the load side."""
 COST_PER_MMA_TOKEN = 0.0040045
-"""Per K block and token of the block: the tensor-core side (4x1 MMA warps)."""
-COST_PER_WIDE_MMA_TOKEN = 0.0040944
-"""The same with 4x2 MMA warps (blocks above 64 tokens)."""
+"""Per K block and token of the block: the tensor-core side."""
 COST_PER_WAVE = 1.6644
 """Per token block a worker group runs: arrival and pipeline turnaround."""
 COST_PER_WAVE_TOKEN = 0.016512
@@ -132,6 +140,16 @@ COST_PER_COOPERATIVE_TAIL = 2.0183
 """The last block's tokens when every gate warp of the CTA ranks them."""
 COST_PER_COOPERATIVE_TAIL_SPLIT = 0.15841
 """Per split-K partial it reduces."""
+
+# The same model for 96- and 128-token blocks (4x2 MMA warps, the MMA warps ranking tokens
+# of the last block with the gate warps), fitted on every such schedule measured above 512
+# tokens: 0.4% slower than the measured best on average over 9 token counts, 3.1% at worst.
+WIDE_COST_PER_TILE_ROW = 0.00125
+WIDE_COST_PER_MMA_TOKEN = 0.004839
+WIDE_COST_PER_WAVE = 0.7434
+WIDE_COST_PER_WAVE_TOKEN = 0.02818
+WIDE_COST_PER_TAIL_TOKEN = 1.48
+WIDE_COST_PER_TAIL_TOKEN_SPLIT = 0.9614
 
 
 def ceil_div(a: int, b: int) -> int:
@@ -225,11 +243,26 @@ def estimated_us(
     num_waves = ceil_div(ceil_div(num_tokens, block_tokens), num_worker_groups)
     k_blocks = num_waves * (num_k_blocks // split)
     mma_warps_n = select_mma_warps_n(block_tokens)
+    if mma_warps_n > 1:
+        gate_warps = select_gate_warps(block_tokens, num_logical_ctas, mma_warps_n)
+        rank_warps = gate_warps + (
+            4 * mma_warps_n
+            if mma_warps_rank(block_tokens, num_logical_ctas, False, gate_warps)
+            else 0
+        )
+        tail_tokens = ceil_div(
+            min(block_tokens, num_tokens), num_logical_ctas * rank_warps
+        )
+        return (
+            WIDE_COST_PER_TILE_ROW * k_blocks * (EXPERTS_PER_CTA + block_tokens)
+            + WIDE_COST_PER_MMA_TOKEN * k_blocks * block_tokens
+            + (WIDE_COST_PER_WAVE + WIDE_COST_PER_WAVE_TOKEN * block_tokens) * num_waves
+            + tail_tokens
+            * (WIDE_COST_PER_TAIL_TOKEN + WIDE_COST_PER_TAIL_TOKEN_SPLIT * split)
+        )
     cost = (
         COST_PER_TILE_ROW * k_blocks * (EXPERTS_PER_CTA + block_tokens)
-        + (COST_PER_MMA_TOKEN if mma_warps_n == 1 else COST_PER_WIDE_MMA_TOKEN)
-        * k_blocks
-        * block_tokens
+        + COST_PER_MMA_TOKEN * k_blocks * block_tokens
         + (COST_PER_WAVE + COST_PER_WAVE_TOKEN * block_tokens) * num_waves
     )
     if is_cooperative(block_tokens, num_logical_ctas, num_groups):
