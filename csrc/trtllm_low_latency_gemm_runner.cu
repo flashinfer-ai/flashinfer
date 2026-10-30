@@ -85,7 +85,8 @@ gemm::gemm::GemmData createGemmData(int64_t m, int64_t n, int64_t k) {
 /**
  * Very rough heuristic for selecting a kernel. Prefer using auto-tuning.
  */
-int64_t select_kernel(int32_t m, int32_t n, int32_t k, const gemm::gemm::GemmInterface& interface) {
+int64_t select_kernel(int32_t m, int32_t n, int32_t k,
+                      const gemm::gemm::GemmInterface& gemm_interface) {
   static constexpr const char* KERNEL_MMAN_8_TILEK_128 =
       "gemm_Bfloat16_E4m3E4m3_Fp32_t128x8x128_s7_et128x8_m128x8x32_c1x1x1_rM_BN_"
       "transOut_schedS_sm100f";
@@ -122,8 +123,8 @@ int64_t select_kernel(int32_t m, int32_t n, int32_t k, const gemm::gemm::GemmInt
     kernel_name = KERNEL_MMAN_64_TILEK_128;
   }
 
-  auto const& configs = interface.getGemmConfigs();
-  size_t const num_configs = interface.getNumGemmConfigs();
+  auto const& configs = gemm_interface.getGemmConfigs();
+  size_t const num_configs = gemm_interface.getNumGemmConfigs();
 
   for (size_t i = 0; i < num_configs; ++i) {
     if (std::string(configs[i].mFunctionName) == kernel_name) {

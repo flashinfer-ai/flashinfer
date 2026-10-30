@@ -47,6 +47,9 @@ from flashinfer.diffusion_ops import (
     prepare_minimax_h3_fc1_weight_fp8,
     prepare_minimax_h3_fc1_weight_nvfp4,
 )
+from flashinfer.diffusion_ops import (
+    cake_minimax_h3_sm120_quant_fc1_swiglu as fc1_swiglu_sm120,
+)
 from flashinfer.diffusion_ops.cake_minimax_h3_sm120_quant_fc1_swiglu import (
     E2M1_MAX,
     E4M3_MAX,
@@ -646,6 +649,37 @@ def test_minimax_h3_sm120_fc1_swiglu_invalid_index_rows_are_zero(
     )
     out, _stats = run_fp8_case(rows, model, prepared_fp8, device, idx=idx)
     assert (out[:3] == 0).all()
+
+
+@requires_sm120
+@pytest.mark.parametrize("table_rows,index", [(8, 8), (10, 9)])
+def test_minimax_h3_sm120_fc1_swiglu_rejects_adaln_tables_without_nine_rows(
+    model, prepared_fp8, device, monkeypatch, table_rows, index
+):
+    """The norm/AdaLN kernels index a fixed 9-row table: with 8 rows, index 8 would read past
+    the table; with 10 rows, index 9 would silently zero the activation.  The wrapper and the
+    host both reject any other row count before the launch."""
+    rows = 8
+    x, _idx = make_inputs(rows, device)
+    idx = torch.full((rows,), index, dtype=torch.int32, device=device)
+    table = torch.zeros(
+        (table_rows, MINIMAX_H3_HIDDEN), dtype=torch.bfloat16, device=device
+    )
+    args = (
+        x,
+        model["x_norm_weight"],
+        table,
+        table,
+        idx,
+        prepared_fp8["w_q"],
+        prepared_fp8["w_scale"],
+    )
+    with pytest.raises(ValueError, match="adaln_scale"):
+        minimax_h3_fc1_swiglu_fp8(*args)
+    # The host check backs the Python validation: skip the latter to reach it.
+    monkeypatch.setattr(fc1_swiglu_sm120, "_check_common", lambda *_: (rows, device))
+    with pytest.raises(ValueError, match="exactly 9 rows"):
+        minimax_h3_fc1_swiglu_fp8(*args)
 
 
 @requires_sm120

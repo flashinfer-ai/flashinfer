@@ -95,6 +95,15 @@ class AllReduceFusionPattern:
     kARResidualRMSNormDynamicFP8Quant = 10
     # Dynamic per-token FP8 quantization variant that also materializes norm output
     kARResidualRMSNormOutDynamicFP8Quant = 11
+    # MoE finalize + all-reduce + residual add + RMS norm + static per-tensor FP8
+    # quantization. MNNVL CuTe DSL only; the C++ trtllm_allreduce_fusion kernels
+    # do not define this value.
+    kMoEFinalizeARResidualRMSNormFP8Quant = 12
+    # All-reduce followed by residual add, RMS norm and MXFP8 quantization
+    # (E4M3 data, one UE8M0 scale per 32 elements, swizzled 128x4 or linear scales)
+    kARResidualRMSNormMXFP8Quant = 13
+    # Same as kARResidualRMSNormMXFP8Quant, with norm output
+    kARResidualRMSNormOutMXFP8Quant = 14
 
 
 class QuantizationSFLayout:
@@ -1233,7 +1242,9 @@ def trtllm_moe_finalize_allreduce_fusion(
         residual_in.numel() * residual_in.element_size() * world_size
     )
 
-    # Note: only one-shot is supported for moe allreduce fusion.
+    # The Lamport buffer must hold the one-shot layout (world_size copies of the token
+    # output). The trtllm backend is one-shot only; the cake backend's two-shot programs
+    # (world sizes 4 and 8) use a smaller part of the same buffer.
     if required_lamport_comm_size > MAX_COMM_SIZE:
         raise ValueError(
             f"required_lamport_comm_size {required_lamport_comm_size} is greater than MAX_COMM_SIZE {MAX_COMM_SIZE}. Cannot use oneshot in this case."

@@ -54,11 +54,11 @@ uses the communicator's `exchange_chunks` interface: `[P, chunk_bytes]` becomes
 `[1, 1, P, chunk_bytes]` through a zero-copy view, with destination-major send
 and source-major receive ordering. The current `nccl` and `nvlink` backends
 both use NCCL for chunks; `workspace.transport` exposes that choice. Ordinary
-scatter/gather retains its NCCL or fused NVLink route. `allocate_output`
-provides ordinary PyTorch receive storage; no PCIe registration is introduced.
-The constructor's `max_bytes`, chunk exchange and output allocation follow
-the API proposed in PR #4876, without adding that PR's PCIe/RDMA implementation.
-Only chunk exchange supports overriding the communicator dtype, including
+scatter/gather retains its NCCL or fused NVLink route. For these chunk calls,
+`allocate_output` provides ordinary PyTorch receive storage. The prepared Lowp
+API collectively rejects the experimental `pcie` backend; ordinary PCIe calls
+retain their own output-registration and dtype contracts. On NCCL/NVLink, only
+chunk exchange supports overriding the communicator dtype, including
 `torch.uint8`; dtype selection never performs quantization or conversion.
 All operations are serialized on the current stream. There is no ordinary
 floating `scatter_qkv` mode, automatic workspace cache or Sage package dependency.

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Callable
+
 import torch
 
 from ......core.validation.common import MoEEpConfigError
@@ -142,6 +144,7 @@ def stage_mega_moe_inputs(
     quantize_input: bool,
     scales: torch.Tensor | None = None,
     safe_quantization: bool = False,
+    write_payload: Callable[[torch.Tensor, torch.Tensor], None] | None = None,
 ) -> None:
     """Stage E4M3 tokens and one-per-token scales into symmetric buffers.
 
@@ -152,6 +155,9 @@ def stage_mega_moe_inputs(
 
     Safe tiny-value quantization is enabled only by the fused Mega backend.
     The default retains the legacy quantization arithmetic and input contract.
+    ``write_payload(dst, src)`` replaces the plain uint8 payload copy for
+    kernel layouts that reorder the hidden dimension (``dst`` is the
+    contiguous ``[T, H]`` workspace slice, ``src`` the natural-order payload).
     """
     _validate_stage_targets(
         hidden_states,
@@ -188,7 +194,11 @@ def stage_mega_moe_inputs(
         quantized = hidden_states
         logical_scale = scales.contiguous()
 
-    x_fp8[:num_tokens].view(torch.uint8).copy_(quantized.contiguous().view(torch.uint8))
+    payload = quantized.contiguous().view(torch.uint8)
+    if write_payload is None:
+        x_fp8[:num_tokens].view(torch.uint8).copy_(payload)
+    else:
+        write_payload(x_fp8[:num_tokens].view(torch.uint8), payload)
     x_sf[:num_tokens].copy_(_pack_per_token_scale_for_dispatch(logical_scale))
     topk_idx_out[:num_tokens].copy_(topk_ids)
     topk_weights_out[:num_tokens].copy_(topk_weights)

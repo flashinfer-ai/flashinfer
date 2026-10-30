@@ -16,54 +16,33 @@ limitations under the License.
 
 # torch.autograd wrapper of the ragged BF16 MoE grouped GEMM: the forward
 # projection ``Y = X @ W[e].T`` with the activation gradient ``dX = G @ W[e]``
-# and the weight gradient ``dW[e] = G[e].T @ X[e]`` in ``backward``.  The
-# three generated programs are also registered as FlashInfer custom ops with
-# fake (meta) implementations so tracing tools see their output shapes.
+# and the weight gradient ``dW[e] = G[e].T @ X[e]`` in ``backward``.
+# ``CakeGroupedMm`` calls the three generated programs as plain functions; no
+# torch custom op is registered.
 
 from __future__ import annotations
 
 import torch
 
-from ...api_logging import flashinfer_experimental_api
-from ...utils import register_custom_op, register_fake_op
 from .cake_backend import (
     prepare_grouped_gemm_dgrad,
     prepare_grouped_gemm_fwd,
     prepare_grouped_gemm_wgrad,
 )
 
-_OP_PREFIX = "flashinfer::cake_moe_grouped_gemm_"
 
-
-@register_custom_op(_OP_PREFIX + "fwd", mutates_args=("out",))
 def _fwd_op(
     x: torch.Tensor, w: torch.Tensor, offs: torch.Tensor, out: torch.Tensor
 ) -> None:
     prepare_grouped_gemm_fwd(x, w, offs, out=out).launch()
 
 
-@register_fake_op(_OP_PREFIX + "fwd")
-def _fwd_fake(
-    x: torch.Tensor, w: torch.Tensor, offs: torch.Tensor, out: torch.Tensor
-) -> None:
-    pass
-
-
-@register_custom_op(_OP_PREFIX + "dgrad", mutates_args=("out",))
 def _dgrad_op(
     g: torch.Tensor, w: torch.Tensor, offs: torch.Tensor, out: torch.Tensor
 ) -> None:
     prepare_grouped_gemm_dgrad(g, w, offs, out=out).launch()
 
 
-@register_fake_op(_OP_PREFIX + "dgrad")
-def _dgrad_fake(
-    g: torch.Tensor, w: torch.Tensor, offs: torch.Tensor, out: torch.Tensor
-) -> None:
-    pass
-
-
-@register_custom_op(_OP_PREFIX + "wgrad", mutates_args=("out",))
 def _wgrad_op(
     g: torch.Tensor,
     x: torch.Tensor,
@@ -72,17 +51,6 @@ def _wgrad_op(
     num_groups: int,
 ) -> None:
     prepare_grouped_gemm_wgrad(g, x, offs, out=out, num_groups=num_groups).launch()
-
-
-@register_fake_op(_OP_PREFIX + "wgrad")
-def _wgrad_fake(
-    g: torch.Tensor,
-    x: torch.Tensor,
-    offs: torch.Tensor,
-    out: torch.Tensor,
-    num_groups: int,
-) -> None:
-    pass
 
 
 def _bf16_rows(t: torch.Tensor) -> torch.Tensor:
@@ -136,7 +104,6 @@ class CakeGroupedMm(torch.autograd.Function):
         return dx, dw, None, None
 
 
-@flashinfer_experimental_api(feature="cake_moe_grouped_gemm.cake_grouped_mm")
 def cake_grouped_mm(
     x: torch.Tensor,
     w: torch.Tensor,

@@ -6,13 +6,11 @@ import torch.distributed as dist
 
 from flashinfer.comm import UlyssesCommunicator
 from tests.comm.test_ulysses_communicator import (
-    _forbid_ipc_and_jit,
     _run_multi_rank,
-    gloo_pg as _gloo_pg,
     requires_cuda,
 )
 
-gloo_pg = _gloo_pg
+from tests.test_helpers.ulysses import forbid_ipc_and_jit
 
 
 def _exchange_body(rank, world, group, backend):
@@ -67,7 +65,7 @@ def test_exchange_chunks_matches_independent_oracle(world_size, backend):
 
 @requires_cuda
 def test_exchange_chunks_single_rank_identity_and_destination(gloo_pg, monkeypatch):
-    _forbid_ipc_and_jit(monkeypatch)
+    forbid_ipc_and_jit(monkeypatch)
     with UlyssesCommunicator(
         gloo_pg, max_bytes=32, dtype=torch.bfloat16, backend="nccl"
     ) as comm:
@@ -75,7 +73,8 @@ def test_exchange_chunks_single_rank_identity_and_destination(gloo_pg, monkeypat
             x = torch.arange(8, device="cuda").to(dtype).view(1, 1, 1, 8)
             kwargs = {} if dtype == comm.dtype else {"dtype": dtype}
             assert comm.exchange_chunks(x, **kwargs) is x
-            assert comm.exchange_chunks(x, out=x, **kwargs) is x
+            with pytest.raises(ValueError, match="overlap"):
+                comm.exchange_chunks(x, out=x, **kwargs)
             output = comm.allocate_output(x, "exchange_chunks", **kwargs)
             assert output.dtype == dtype and output.shape == x.shape
             assert comm.exchange_chunks(x, out=output, **kwargs) is output
@@ -88,7 +87,7 @@ def test_exchange_chunks_single_rank_identity_and_destination(gloo_pg, monkeypat
 
 @requires_cuda
 def test_exchange_chunks_validation(gloo_pg, monkeypatch):
-    _forbid_ipc_and_jit(monkeypatch)
+    forbid_ipc_and_jit(monkeypatch)
     with UlyssesCommunicator(
         gloo_pg, max_bytes=8, dtype=torch.bfloat16, backend="nccl"
     ) as comm:
@@ -137,7 +136,7 @@ def test_exchange_chunks_validation(gloo_pg, monkeypatch):
 
 @requires_cuda
 def test_exchange_chunks_uses_bytes_for_capacity(gloo_pg, monkeypatch):
-    _forbid_ipc_and_jit(monkeypatch)
+    forbid_ipc_and_jit(monkeypatch)
     # Odd capacities are useful for raw bytes and need not be divisible by the
     # communicator's default floating item size.
     with UlyssesCommunicator(

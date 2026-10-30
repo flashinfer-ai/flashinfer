@@ -17,75 +17,133 @@ limitations under the License.
 from __future__ import annotations
 
 import functools
-from pathlib import Path
 from typing import Any, Optional
 
-from ...jit import env as jit_env
-from ...jit.core import (
-    current_compilation_context,
-    gen_jit_spec,
-    refresh_current_compilation_context,
-    sm100a_nvcc_flags,
-    sm103a_nvcc_flags,
-    sm107a_nvcc_flags,
-)
+from . import cake_build
 
-# Registry of the generated ragged grouped GEMM programs (filled verbatim by the
-# Cake generated-program export; do not edit the literals by hand).
+# Registry of the generated ragged grouped GEMM programs.  ``PROGRAMS`` and
+# ``ROUTES`` are written by the Cake generated-program export; the host plan
+# constants and the functions below are this package's.
 #
 # ``PROGRAMS``: one record per physical program -- one kernel source plus its
 # host binding, shared by every architecture in ``arches`` (genuine
 # per-architecture lowering differences live inside the source under exact
-# ``__CUDA_ARCH__`` regions) -- with its compile flags, FFI entry, argument
-# plan, launch shape and per-architecture closure identity.  A program is
-# JIT-compiled once per (architecture, compile-line specialization).
+# ``__CUDA_ARCH__`` regions) -- with its architecture-free ``library`` stem, FFI
+# entry, argument plan and launch shape.  What to compile (the translation
+# units, the compile flags, the per-architecture closure digest) is recorded in
+# ``build.json`` (see ``cake_build``), whose entry for a program is
+# ``<library>[<specialization tag>]_<arch>``; a program is built once per
+# (architecture, compile-line specialization), prebuilt under ``aot/`` or by
+# FlashInfer's JIT.
 #
 # ``ROUTES``: one record per public route -- ``fwd``, ``dgrad`` and
-# ``wgrad_{bf16,f32}_k{256,512}`` -- naming its architectures, host plan and
+# ``wgrad_{bf16,f32}_k{256,512}`` -- naming its architectures and
 # ordered stages.  Each stage binds a program and the compile-line
 # specializations the loader defines for it (the weight-gradient tail-reduce
 # program takes the k width of the partials it sums, ``WGRAD_TILE``, from the
-# route's tile instead of carrying one source per tile).
+# route's tile instead of carrying one source per tile; the weight-gradient
+# programs take their output element width, ``WGRAD_OUT`` = 16 for bf16 or 32
+# for fp32, from the route's output dtype instead of carrying one source per
+# output dtype).  A stage serves the architectures its program is built for
+# among the route's: a route may name two stages of one name whose programs
+# serve disjoint architectures (the forward and data-gradient ``main`` and
+# ``main_wide`` stages: the domain-scheduled program on sm_100a / sm_103a, the
+# static program on sm_107a, whose data-gradient ``main_wide`` program keeps
+# each G tile in the tensor core's A collector for both 256-column halves of
+# the output tile; the 512-wide k tile's weight-gradient ``main`` stage: one
+# build on sm_100a / sm_103a, another on sm_107a), so a stage is looked up per
+# architecture (``stage_binding``).  The host chooses among the stages a route
+# serves by ``HOST_PLAN_CONSTANTS``: the forward and data-gradient
+# ``main_wide`` stage is the program with the 512-column output tile
+# (``wide_block_n``), launched on the architectures of ``wide_fwd_archs`` /
+# ``wide_dgrad_archs`` when the output columns are a multiple of it; the
+# data-gradient ``main_wide_ef`` stage is its twin that loads G and stores dX
+# with the L2 evict-first policy, so the group's weights stay resident in L2,
+# launched in its place on the architectures of ``dgrad_evict_first_archs``
+# when the groups average at least ``dgrad_evict_first_min_rows`` rows and the
+# output has at least ``dgrad_evict_first_min_k`` columns; the forward
+# ``main_wide_ef`` stage is its twin that releases the last wave of tiles in
+# halves and stores Y with the L2 evict-first policy, launched in its place on
+# the architectures of ``fwd_lwh_ef_archs`` when the reduction K is at most
+# ``fwd_lwh_ef_max_k`` (the down projection); both ``main_wide_ef`` programs
+# split two head and two tail k steps of an item around the release of the
+# accumulator's halves instead of four and three; the data-gradient
+# ``main_wide_ts33`` stage is the twin of ``main_wide`` that splits three head
+# and three tail k steps there, launched in its place on the architectures of
+# ``dgrad_wide_ts33_archs`` when the groups average at least the architecture's
+# ``dgrad_wide_ts33_min_rows`` rows and the output has at least
+# ``dgrad_wide_ts33_min_k`` columns, and the forward ``main_wide_ts33`` stage on
+# the architectures of ``fwd_wide_ts33_archs`` when the reduction K is at most
+# ``fwd_wide_ts33_max_k`` with at most ``fwd_wide_ts33_max_rows`` rows per
+# group; the weight gradient
+# takes the 512-wide k tile on the architectures of ``k512_archs`` when the
+# groups average at least the architecture's ``k512_min_rows_per_group`` rows;
+# the weight-gradient ``main_wave`` stage is the main program with wave
+# synchronisation, launched from ``wave_sync_min_k`` on the architectures
+# ``wave_sync_archs`` lists for the k tile, with the architecture's
+# ``wave_sync_mode``; the 512-wide k tile's ``main_halves`` and
+# ``main_wave_halves`` stages are the twins of ``main`` and ``main_wave`` that
+# release the accumulator in two halves, launched on the architectures of
+# ``k512_release_archs``; its ``main_halves_k256t`` stage is the twin of
+# ``main_halves`` that runs the tiles left after the full waves as 256-column
+# half tiles, whose split tail the tail-reduce stage of the 256-wide k tile's
+# route sums, launched in its place on the architectures of
+# ``k256_tail_archs`` when K is at most ``k256_tail_max_k`` and the groups
+# average at least ``k256_tail_min_rows`` rows.  On the architectures of
+# ``domain_split_archs`` a launch of an op in ``domain_split_ops`` (the data
+# gradient) whose weight has at most ``domain_split_max_weight_elems`` elements
+# per group (``N * K``, the down projection) splits its tile queues by the
+# probed SM pairs of each locality domain instead of evenly (``cake_backend``,
+# stream workspaces).
 PROGRAMS: dict[str, dict[str, Any]] = {
-    "cake_moe_grouped_gemm_05498a17b6c266797a62": {
-        "kernel": "kernel_cake_moe_grouped_gemm_05498a17b6c266797a62",
-        "sources": [
-            "cake_moe_grouped_gemm/cake_moe_grouped_gemm_05498a17b6c266797a62_kernel.cu",
-            "cake_moe_grouped_gemm/cake_moe_grouped_gemm_05498a17b6c266797a62_binding.cu",
-        ],
-        "compile_flags": [],
+    "cake_moe_grouped_gemm_05258dbe307cb47d829e": {
+        "library": "cake_moe_grouped_gemm_05258dbe307cb47d829e",
         "ffi_entry": "run",
         "arg_plan": [
-            ["buffer", "partials"],
+            ["tma_buffer", "A"],
+            ["tma_buffer", "B"],
             ["buffer", "C"],
             ["buffer", "offs"],
             ["parameter", "num_groups"],
+            ["parameter", "sum_m"],
             ["parameter", "N"],
             ["parameter", "K"],
             ["parameter", "ldc"],
-            ["parameter", "stride_e"],
-            ["parameter", "num_clusters"],
-            ["parameter", "tail_splits"],
-            ["parameter", "raster_rows"],
+            ["buffer", "sched"],
+            ["parameter", "c0"],
+            ["parameter", "c1"],
             ["grid", "grid_x"],
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "launch": {"block": [256, 1, 1], "cluster": [1, 1, 1]},
-        "arches": ["sm_100a", "sm_103a", "sm_107a"],
-        "closure_sha256": {
-            "sm_100a": "abbfa115c214e49b89626e627d72e3afa13014359b48220d92f5fd857a043344",
-            "sm_103a": "52d1a8e2658ba012514bc589f462c077ee228b0fbf0a262db4b9d7b6a550a623",
-            "sm_107a": "e4c396a0d972a4f789792e789a99cf8471b1252984c162a480c8230aa5e1ed46",
-        },
+        "launch": {"block": [320, 1, 1], "cluster": [2, 1, 1]},
+        "arches": ["sm_107a"],
+    },
+    "cake_moe_grouped_gemm_0669888e0651eb5ac046": {
+        "library": "cake_moe_grouped_gemm_0669888e0651eb5ac046",
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["tma_buffer", "A"],
+            ["tma_buffer", "B"],
+            ["buffer", "C"],
+            ["buffer", "offs"],
+            ["parameter", "num_groups"],
+            ["parameter", "sum_m"],
+            ["parameter", "N"],
+            ["parameter", "K"],
+            ["parameter", "ldc"],
+            ["buffer", "sched"],
+            ["parameter", "c0"],
+            ["parameter", "c1"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "launch": {"block": [320, 1, 1], "cluster": [2, 1, 1]},
+        "arches": ["sm_100a", "sm_103a"],
     },
     "cake_moe_grouped_gemm_1edcad995dcc790600cb": {
-        "kernel": "kernel_cake_moe_grouped_gemm_1edcad995dcc790600cb",
-        "sources": [
-            "cake_moe_grouped_gemm/cake_moe_grouped_gemm_1edcad995dcc790600cb_kernel.cu",
-            "cake_moe_grouped_gemm/cake_moe_grouped_gemm_1edcad995dcc790600cb_binding.cu",
-        ],
-        "compile_flags": [],
+        "library": "cake_moe_grouped_gemm_1edcad995dcc790600cb",
         "ffi_entry": "run",
         "arg_plan": [
             ["tma_buffer", "A"],
@@ -97,25 +155,18 @@ PROGRAMS: dict[str, dict[str, Any]] = {
             ["parameter", "N"],
             ["parameter", "K"],
             ["parameter", "ldc"],
+            ["buffer", "sched"],
+            ["parameter", "c0"],
+            ["parameter", "c1"],
             ["grid", "grid_x"],
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
         "launch": {"block": [192, 1, 1], "cluster": [2, 1, 1]},
-        "arches": ["sm_100a", "sm_103a", "sm_107a"],
-        "closure_sha256": {
-            "sm_100a": "fa648c04b22543a51dc0304904b2e26c6a0353c02581e9762493d14dd8343ac0",
-            "sm_103a": "ebc610dea0a23724755fd2a7c06bf1b8016c855c1343ad984334f70c31ff39e0",
-            "sm_107a": "b510f7c4acaa0c9ab610d4c71ef639637f667bb15c743f64147cc87140b09979",
-        },
+        "arches": ["sm_107a"],
     },
     "cake_moe_grouped_gemm_276cec1f1d2c8ba1e4cb": {
-        "kernel": "kernel_cake_moe_grouped_gemm_276cec1f1d2c8ba1e4cb",
-        "sources": [
-            "cake_moe_grouped_gemm/cake_moe_grouped_gemm_276cec1f1d2c8ba1e4cb_kernel.cu",
-            "cake_moe_grouped_gemm/cake_moe_grouped_gemm_276cec1f1d2c8ba1e4cb_binding.cu",
-        ],
-        "compile_flags": [],
+        "library": "cake_moe_grouped_gemm_276cec1f1d2c8ba1e4cb",
         "ffi_entry": "run",
         "arg_plan": [
             ["tma_buffer", "A"],
@@ -127,25 +178,66 @@ PROGRAMS: dict[str, dict[str, Any]] = {
             ["parameter", "N"],
             ["parameter", "K"],
             ["parameter", "ldc"],
+            ["buffer", "sched"],
+            ["parameter", "c0"],
+            ["parameter", "c1"],
             ["grid", "grid_x"],
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
         "launch": {"block": [192, 1, 1], "cluster": [2, 1, 1]},
-        "arches": ["sm_100a", "sm_103a", "sm_107a"],
-        "closure_sha256": {
-            "sm_100a": "abf84e571383ff0278d803512b2d92ae1bad287ebb351a0fdf3db5237db27409",
-            "sm_103a": "4d7ef5c662fdc78fbda315ab684cd737dfcfd94ce3b2668cd141efcd7b0b865a",
-            "sm_107a": "ef3292e9e48676eb3f26bbbd3d20c385f462aec2bf1932a24f9caf11112f7d84",
-        },
+        "arches": ["sm_107a"],
+    },
+    "cake_moe_grouped_gemm_48618dc5e84c3e3d522c": {
+        "library": "cake_moe_grouped_gemm_48618dc5e84c3e3d522c",
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["tma_buffer", "A"],
+            ["tma_buffer", "B"],
+            ["buffer", "C"],
+            ["buffer", "offs"],
+            ["parameter", "num_groups"],
+            ["parameter", "sum_m"],
+            ["parameter", "N"],
+            ["parameter", "K"],
+            ["parameter", "ldc"],
+            ["buffer", "sched"],
+            ["parameter", "c0"],
+            ["parameter", "c1"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "launch": {"block": [320, 1, 1], "cluster": [2, 1, 1]},
+        "arches": ["sm_103a"],
+    },
+    "cake_moe_grouped_gemm_4af5480da78305cbf114": {
+        "library": "cake_moe_grouped_gemm_4af5480da78305cbf114",
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["tma_buffer", "A"],
+            ["tma_buffer", "B"],
+            ["buffer", "C"],
+            ["buffer", "offs"],
+            ["buffer", "tensormap_workspace"],
+            ["buffer", "partials"],
+            ["parameter", "tail_splits"],
+            ["parameter", "raster_rows"],
+            ["parameter", "num_groups"],
+            ["parameter", "sum_m"],
+            ["parameter", "N"],
+            ["parameter", "K"],
+            ["parameter", "ldc"],
+            ["parameter", "stride_e"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "launch": {"block": [320, 1, 1], "cluster": [2, 1, 1]},
+        "arches": ["sm_100a", "sm_103a"],
     },
     "cake_moe_grouped_gemm_611af0ca12365b0e7c3b": {
-        "kernel": "kernel_cake_moe_grouped_gemm_611af0ca12365b0e7c3b",
-        "sources": [
-            "cake_moe_grouped_gemm/cake_moe_grouped_gemm_611af0ca12365b0e7c3b_kernel.cu",
-            "cake_moe_grouped_gemm/cake_moe_grouped_gemm_611af0ca12365b0e7c3b_binding.cu",
-        ],
-        "compile_flags": [],
+        "library": "cake_moe_grouped_gemm_611af0ca12365b0e7c3b",
         "ffi_entry": "run",
         "arg_plan": [
             ["tma_buffer", "A"],
@@ -168,18 +260,9 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         ],
         "launch": {"block": [192, 1, 1], "cluster": [2, 1, 1]},
         "arches": ["sm_100a", "sm_103a"],
-        "closure_sha256": {
-            "sm_100a": "32976c1b3ec7553b54342b7af147cd38b8afb26451c8de2dbb50a3b4e47e43aa",
-            "sm_103a": "1ab5c07494fd3b057f3f83bd838187ff30f0c06bd36e352e4f3344ea425773d1",
-        },
     },
-    "cake_moe_grouped_gemm_7ac85aef90878e42ea02": {
-        "kernel": "kernel_cake_moe_grouped_gemm_7ac85aef90878e42ea02",
-        "sources": [
-            "cake_moe_grouped_gemm/cake_moe_grouped_gemm_7ac85aef90878e42ea02_kernel.cu",
-            "cake_moe_grouped_gemm/cake_moe_grouped_gemm_7ac85aef90878e42ea02_binding.cu",
-        ],
-        "compile_flags": [],
+    "cake_moe_grouped_gemm_611f42e92c0a16307151": {
+        "library": "cake_moe_grouped_gemm_611f42e92c0a16307151",
         "ffi_entry": "run",
         "arg_plan": [
             ["tma_buffer", "A"],
@@ -201,20 +284,231 @@ PROGRAMS: dict[str, dict[str, Any]] = {
             ["grid", "grid_z"],
         ],
         "launch": {"block": [192, 1, 1], "cluster": [2, 1, 1]},
+        "arches": ["sm_107a"],
+    },
+    "cake_moe_grouped_gemm_91100899e34d05c9b2bb": {
+        "library": "cake_moe_grouped_gemm_91100899e34d05c9b2bb",
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["tma_buffer", "A"],
+            ["tma_buffer", "B"],
+            ["buffer", "C"],
+            ["buffer", "offs"],
+            ["parameter", "num_groups"],
+            ["parameter", "sum_m"],
+            ["parameter", "N"],
+            ["parameter", "K"],
+            ["parameter", "ldc"],
+            ["buffer", "sched"],
+            ["parameter", "c0"],
+            ["parameter", "c1"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "launch": {"block": [320, 1, 1], "cluster": [2, 1, 1]},
+        "arches": ["sm_107a"],
+    },
+    "cake_moe_grouped_gemm_9140b3452aadfce554d6": {
+        "library": "cake_moe_grouped_gemm_9140b3452aadfce554d6",
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["tma_buffer", "A"],
+            ["tma_buffer", "B"],
+            ["buffer", "C"],
+            ["buffer", "offs"],
+            ["buffer", "tensormap_workspace"],
+            ["buffer", "partials"],
+            ["parameter", "tail_splits"],
+            ["parameter", "raster_rows"],
+            ["parameter", "num_groups"],
+            ["parameter", "sum_m"],
+            ["parameter", "N"],
+            ["parameter", "K"],
+            ["parameter", "ldc"],
+            ["parameter", "stride_e"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "launch": {"block": [320, 1, 1], "cluster": [2, 1, 1]},
+        "arches": ["sm_107a"],
+    },
+    "cake_moe_grouped_gemm_920598481c6dfe1ac044": {
+        "library": "cake_moe_grouped_gemm_920598481c6dfe1ac044",
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["tma_buffer", "A"],
+            ["tma_buffer", "B"],
+            ["buffer", "C"],
+            ["buffer", "offs"],
+            ["parameter", "num_groups"],
+            ["parameter", "sum_m"],
+            ["parameter", "N"],
+            ["parameter", "K"],
+            ["parameter", "ldc"],
+            ["buffer", "sched"],
+            ["parameter", "c0"],
+            ["parameter", "c1"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "launch": {"block": [320, 1, 1], "cluster": [2, 1, 1]},
+        "arches": ["sm_107a"],
+    },
+    "cake_moe_grouped_gemm_96f299e996aea2331023": {
+        "library": "cake_moe_grouped_gemm_96f299e996aea2331023",
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["tma_buffer", "A"],
+            ["tma_buffer", "B"],
+            ["buffer", "C"],
+            ["buffer", "offs"],
+            ["buffer", "tensormap_workspace"],
+            ["buffer", "partials"],
+            ["parameter", "tail_splits"],
+            ["parameter", "raster_rows"],
+            ["parameter", "num_groups"],
+            ["parameter", "sum_m"],
+            ["parameter", "N"],
+            ["parameter", "K"],
+            ["parameter", "ldc"],
+            ["parameter", "stride_e"],
+            ["buffer", "wave_sync"],
+            ["parameter", "wave_mode"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "launch": {"block": [320, 1, 1], "cluster": [2, 1, 1]},
+        "arches": ["sm_100a", "sm_103a"],
+    },
+    "cake_moe_grouped_gemm_9cd96cdceb35c7ac936e": {
+        "library": "cake_moe_grouped_gemm_9cd96cdceb35c7ac936e",
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["tma_buffer", "A"],
+            ["tma_buffer", "B"],
+            ["buffer", "C"],
+            ["buffer", "offs"],
+            ["buffer", "tensormap_workspace"],
+            ["buffer", "partials"],
+            ["parameter", "tail_splits"],
+            ["parameter", "raster_rows"],
+            ["parameter", "num_groups"],
+            ["parameter", "sum_m"],
+            ["parameter", "N"],
+            ["parameter", "K"],
+            ["parameter", "ldc"],
+            ["parameter", "stride_e"],
+            ["buffer", "wave_sync"],
+            ["parameter", "wave_mode"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "launch": {"block": [192, 1, 1], "cluster": [2, 1, 1]},
         "arches": ["sm_100a", "sm_103a", "sm_107a"],
-        "closure_sha256": {
-            "sm_100a": "e01f627a13dbd064cf6093a4f4170dad8dfd1960b3360fe01c6109328e0ce670",
-            "sm_103a": "8c67bddc052f52d4786d02f3ca081c52c65228c06c1ee2c3bf1ef25e24d1724a",
-            "sm_107a": "983458d66e864b545e87e4a869d20b65561a2028907c12e5a19b13734f2d5add",
-        },
+    },
+    "cake_moe_grouped_gemm_a30ea3df10b8ee9976f2": {
+        "library": "cake_moe_grouped_gemm_a30ea3df10b8ee9976f2",
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["tma_buffer", "A"],
+            ["tma_buffer", "B"],
+            ["buffer", "C"],
+            ["buffer", "offs"],
+            ["buffer", "tensormap_workspace"],
+            ["buffer", "partials"],
+            ["parameter", "tail_splits"],
+            ["parameter", "raster_rows"],
+            ["parameter", "num_groups"],
+            ["parameter", "sum_m"],
+            ["parameter", "N"],
+            ["parameter", "K"],
+            ["parameter", "ldc"],
+            ["parameter", "stride_e"],
+            ["buffer", "wave_sync"],
+            ["parameter", "wave_mode"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "launch": {"block": [192, 1, 1], "cluster": [2, 1, 1]},
+        "arches": ["sm_100a", "sm_103a"],
+    },
+    "cake_moe_grouped_gemm_aafe5d56af3c36f3b143": {
+        "library": "cake_moe_grouped_gemm_aafe5d56af3c36f3b143",
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["tma_buffer", "A"],
+            ["tma_buffer", "B"],
+            ["buffer", "C"],
+            ["buffer", "offs"],
+            ["parameter", "num_groups"],
+            ["parameter", "sum_m"],
+            ["parameter", "N"],
+            ["parameter", "K"],
+            ["parameter", "ldc"],
+            ["buffer", "sched"],
+            ["parameter", "c0"],
+            ["parameter", "c1"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "launch": {"block": [192, 1, 1], "cluster": [2, 1, 1]},
+        "arches": ["sm_100a", "sm_103a"],
+    },
+    "cake_moe_grouped_gemm_ab84c164aef14d967ac3": {
+        "library": "cake_moe_grouped_gemm_ab84c164aef14d967ac3",
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["tma_buffer", "A"],
+            ["tma_buffer", "B"],
+            ["buffer", "C"],
+            ["buffer", "offs"],
+            ["parameter", "num_groups"],
+            ["parameter", "sum_m"],
+            ["parameter", "N"],
+            ["parameter", "K"],
+            ["parameter", "ldc"],
+            ["buffer", "sched"],
+            ["parameter", "c0"],
+            ["parameter", "c1"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "launch": {"block": [320, 1, 1], "cluster": [2, 1, 1]},
+        "arches": ["sm_100a", "sm_103a"],
+    },
+    "cake_moe_grouped_gemm_bb31cf89a1f6335a7baa": {
+        "library": "cake_moe_grouped_gemm_bb31cf89a1f6335a7baa",
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["tma_buffer", "A"],
+            ["tma_buffer", "B"],
+            ["buffer", "C"],
+            ["buffer", "offs"],
+            ["parameter", "num_groups"],
+            ["parameter", "sum_m"],
+            ["parameter", "N"],
+            ["parameter", "K"],
+            ["parameter", "ldc"],
+            ["buffer", "sched"],
+            ["parameter", "c0"],
+            ["parameter", "c1"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "launch": {"block": [192, 1, 1], "cluster": [2, 1, 1]},
+        "arches": ["sm_100a", "sm_103a"],
     },
     "cake_moe_grouped_gemm_bc774d802e4f0b3ac27c": {
-        "kernel": "kernel_cake_moe_grouped_gemm_bc774d802e4f0b3ac27c",
-        "sources": [
-            "cake_moe_grouped_gemm/cake_moe_grouped_gemm_bc774d802e4f0b3ac27c_kernel.cu",
-            "cake_moe_grouped_gemm/cake_moe_grouped_gemm_bc774d802e4f0b3ac27c_binding.cu",
-        ],
-        "compile_flags": [],
+        "library": "cake_moe_grouped_gemm_bc774d802e4f0b3ac27c",
         "ffi_entry": "run",
         "arg_plan": [
             ["buffer", "partials"],
@@ -234,53 +528,55 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         ],
         "launch": {"block": [256, 1, 1], "cluster": [1, 1, 1]},
         "arches": ["sm_100a", "sm_103a", "sm_107a"],
-        "closure_sha256": {
-            "sm_100a": "2b4f8b7d1972d2b3d9bd22216efe03d676afc7181d9bda2e03d97259db3956c9",
-            "sm_103a": "d8fab5232bb4e5a4552cf1e9c1cf7d65ca7fe19a77152cece9f24eb6d4ebf6a8",
-            "sm_107a": "b417bf2fe46c7dbe5da3bf6966f7c0d04ca4685cbcfa7a48c695e236f479b7de",
-        },
     },
-    "cake_moe_grouped_gemm_d77aff0f30a2661aecc8": {
-        "kernel": "kernel_cake_moe_grouped_gemm_d77aff0f30a2661aecc8",
-        "sources": [
-            "cake_moe_grouped_gemm/cake_moe_grouped_gemm_d77aff0f30a2661aecc8_kernel.cu",
-            "cake_moe_grouped_gemm/cake_moe_grouped_gemm_d77aff0f30a2661aecc8_binding.cu",
-        ],
-        "compile_flags": [],
+    "cake_moe_grouped_gemm_ccb57e5ab20e09ac2f93": {
+        "library": "cake_moe_grouped_gemm_ccb57e5ab20e09ac2f93",
         "ffi_entry": "run",
         "arg_plan": [
             ["tma_buffer", "A"],
             ["tma_buffer", "B"],
             ["buffer", "C"],
             ["buffer", "offs"],
-            ["buffer", "tensormap_workspace"],
-            ["buffer", "partials"],
-            ["parameter", "tail_splits"],
-            ["parameter", "raster_rows"],
             ["parameter", "num_groups"],
             ["parameter", "sum_m"],
             ["parameter", "N"],
             ["parameter", "K"],
             ["parameter", "ldc"],
-            ["parameter", "stride_e"],
+            ["buffer", "sched"],
+            ["parameter", "c0"],
+            ["parameter", "c1"],
             ["grid", "grid_x"],
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "launch": {"block": [192, 1, 1], "cluster": [2, 1, 1]},
-        "arches": ["sm_100a", "sm_103a"],
-        "closure_sha256": {
-            "sm_100a": "453cc5721078de16900f4397c98ec54764bbd85f4e06890695235963c64769de",
-            "sm_103a": "5a44ba4f92678f880e07068a671444b36bd3fa27a55bb1e7f3d1510aa8531150",
-        },
+        "launch": {"block": [320, 1, 1], "cluster": [2, 1, 1]},
+        "arches": ["sm_107a"],
+    },
+    "cake_moe_grouped_gemm_e602865dfbb9ba1a20fc": {
+        "library": "cake_moe_grouped_gemm_e602865dfbb9ba1a20fc",
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["tma_buffer", "A"],
+            ["tma_buffer", "B"],
+            ["buffer", "C"],
+            ["buffer", "offs"],
+            ["parameter", "num_groups"],
+            ["parameter", "sum_m"],
+            ["parameter", "N"],
+            ["parameter", "K"],
+            ["parameter", "ldc"],
+            ["buffer", "sched"],
+            ["parameter", "c0"],
+            ["parameter", "c1"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "launch": {"block": [320, 1, 1], "cluster": [2, 1, 1]},
+        "arches": ["sm_103a"],
     },
     "cake_moe_grouped_gemm_ed9a74f36ba13a52183d": {
-        "kernel": "kernel_cake_moe_grouped_gemm_ed9a74f36ba13a52183d",
-        "sources": [
-            "cake_moe_grouped_gemm/cake_moe_grouped_gemm_ed9a74f36ba13a52183d_kernel.cu",
-            "cake_moe_grouped_gemm/cake_moe_grouped_gemm_ed9a74f36ba13a52183d_binding.cu",
-        ],
-        "compile_flags": [],
+        "library": "cake_moe_grouped_gemm_ed9a74f36ba13a52183d",
         "ffi_entry": "run",
         "arg_plan": [
             ["tma_buffer", "A"],
@@ -303,29 +599,65 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         ],
         "launch": {"block": [192, 1, 1], "cluster": [2, 1, 1]},
         "arches": ["sm_100a", "sm_103a", "sm_107a"],
-        "closure_sha256": {
-            "sm_100a": "97e5ebea1fdc233d118880f6d3b06859e0fb0f603a586c82a8766c3bfaf29b8d",
-            "sm_103a": "a9916dbefd98fa75c03cc5d696841ee122bba9b80b6bb08cd45b413d17fbde82",
-            "sm_107a": "67303368dde73148ab1746007f00b77fbf68e9df1edb95ad5a6387f227394e64",
-        },
+    },
+    "cake_moe_grouped_gemm_f6441c89bf898d4db030": {
+        "library": "cake_moe_grouped_gemm_f6441c89bf898d4db030",
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["tma_buffer", "A"],
+            ["tma_buffer", "B"],
+            ["buffer", "C"],
+            ["buffer", "offs"],
+            ["buffer", "tensormap_workspace"],
+            ["buffer", "partials"],
+            ["parameter", "tail_splits"],
+            ["parameter", "raster_rows"],
+            ["parameter", "num_groups"],
+            ["parameter", "sum_m"],
+            ["parameter", "N"],
+            ["parameter", "K"],
+            ["parameter", "ldc"],
+            ["parameter", "stride_e"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "launch": {"block": [320, 1, 1], "cluster": [2, 1, 1]},
+        "arches": ["sm_107a"],
     },
 }
 ROUTES: dict[str, dict[str, Any]] = {
     "cake_moe_grouped_gemm_dgrad": {
         "op": "dgrad",
-        "out_dtype": "bfloat16",
-        "tile_k": None,
-        "public_helper": "grouped_gemm_dgrad",
-        "host_plan": {
-            "alignment": "K % 256 == 0 and N % 64 == 0",
-            "cols": "K",
-            "grid": "persistent_grid(sm_count, max_cluster_tiles_upper_bound(sum_m, num_groups, cols))",
-            "launches": 1,
-        },
         "stages": [
             {
                 "name": "main",
+                "program": "cake_moe_grouped_gemm_bb31cf89a1f6335a7baa",
+                "specializations": {},
+            },
+            {
+                "name": "main",
                 "program": "cake_moe_grouped_gemm_1edcad995dcc790600cb",
+                "specializations": {},
+            },
+            {
+                "name": "main_wide",
+                "program": "cake_moe_grouped_gemm_ab84c164aef14d967ac3",
+                "specializations": {},
+            },
+            {
+                "name": "main_wide",
+                "program": "cake_moe_grouped_gemm_05258dbe307cb47d829e",
+                "specializations": {},
+            },
+            {
+                "name": "main_wide_ef",
+                "program": "cake_moe_grouped_gemm_ccb57e5ab20e09ac2f93",
+                "specializations": {},
+            },
+            {
+                "name": "main_wide_ts33",
+                "program": "cake_moe_grouped_gemm_48618dc5e84c3e3d522c",
                 "specializations": {},
             },
         ],
@@ -333,19 +665,35 @@ ROUTES: dict[str, dict[str, Any]] = {
     },
     "cake_moe_grouped_gemm_fwd": {
         "op": "fwd",
-        "out_dtype": "bfloat16",
-        "tile_k": None,
-        "public_helper": "grouped_gemm_fwd",
-        "host_plan": {
-            "alignment": "N % 256 == 0 and K % 64 == 0",
-            "cols": "N",
-            "grid": "persistent_grid(sm_count, max_cluster_tiles_upper_bound(sum_m, num_groups, cols))",
-            "launches": 1,
-        },
         "stages": [
             {
                 "name": "main",
+                "program": "cake_moe_grouped_gemm_aafe5d56af3c36f3b143",
+                "specializations": {},
+            },
+            {
+                "name": "main",
                 "program": "cake_moe_grouped_gemm_276cec1f1d2c8ba1e4cb",
+                "specializations": {},
+            },
+            {
+                "name": "main_wide",
+                "program": "cake_moe_grouped_gemm_0669888e0651eb5ac046",
+                "specializations": {},
+            },
+            {
+                "name": "main_wide",
+                "program": "cake_moe_grouped_gemm_91100899e34d05c9b2bb",
+                "specializations": {},
+            },
+            {
+                "name": "main_wide_ef",
+                "program": "cake_moe_grouped_gemm_920598481c6dfe1ac044",
+                "specializations": {},
+            },
+            {
+                "name": "main_wide_ts33",
+                "program": "cake_moe_grouped_gemm_e602865dfbb9ba1a20fc",
                 "specializations": {},
             },
         ],
@@ -353,25 +701,15 @@ ROUTES: dict[str, dict[str, Any]] = {
     },
     "cake_moe_grouped_gemm_wgrad_bf16_k256": {
         "op": "wgrad",
-        "out_dtype": "bfloat16",
-        "tile_k": 256,
-        "public_helper": "grouped_gemm_wgrad",
-        "host_plan": {
-            "alignment": "N % 256 == 0 and K % 256 == 0",
-            "clusters": "grid_x // 2",
-            "grid": "persistent_grid(sm_count, num_groups * (N // 256) * (K // tile_k))",
-            "launches": "1 + (tail_splits > 1)",
-            "num_tail": "(num_groups * (N // 256) * (K // tile_k)) % clusters",
-            "partials_bytes": "4 * 256 * tile_k * max(num_tail * tail_splits if tail_splits > 1 else 0, 1)",
-            "raster_rows": "wgrad_raster_rows(N // 256, K // tile_k, clusters, tile_k)",
-            "tail_reduce_grid": "wgrad_reduce_grid(num_tail, tile_k) when tail_splits > 1, else no tail_reduce launch",
-            "tail_splits": "wgrad_tail_plan(num_tail, clusters, sum_m, num_groups, tile_k) if num_tail else 1",
-            "tensormap_workspace_bytes": "grid_x * tmap_slots_per_cta * tmap_slot_bytes (uint8, 128-byte aligned)",
-        },
         "stages": [
             {
                 "name": "main",
                 "program": "cake_moe_grouped_gemm_ed9a74f36ba13a52183d",
+                "specializations": {},
+            },
+            {
+                "name": "main_wave",
+                "program": "cake_moe_grouped_gemm_9cd96cdceb35c7ac936e",
                 "specializations": {},
             },
             {
@@ -384,25 +722,40 @@ ROUTES: dict[str, dict[str, Any]] = {
     },
     "cake_moe_grouped_gemm_wgrad_bf16_k512": {
         "op": "wgrad",
-        "out_dtype": "bfloat16",
-        "tile_k": 512,
-        "public_helper": "grouped_gemm_wgrad",
-        "host_plan": {
-            "alignment": "N % 256 == 0 and K % 512 == 0",
-            "clusters": "grid_x // 2",
-            "grid": "persistent_grid(sm_count, num_groups * (N // 256) * (K // tile_k))",
-            "launches": "1 + (tail_splits > 1)",
-            "num_tail": "(num_groups * (N // 256) * (K // tile_k)) % clusters",
-            "partials_bytes": "4 * 256 * tile_k * max(num_tail * tail_splits if tail_splits > 1 else 0, 1)",
-            "raster_rows": "wgrad_raster_rows(N // 256, K // tile_k, clusters, tile_k)",
-            "tail_reduce_grid": "wgrad_reduce_grid(num_tail, tile_k) when tail_splits > 1, else no tail_reduce launch",
-            "tail_splits": "wgrad_tail_plan(num_tail, clusters, sum_m, num_groups, tile_k) if num_tail else 1",
-            "tensormap_workspace_bytes": "grid_x * tmap_slots_per_cta * tmap_slot_bytes (uint8, 128-byte aligned)",
-        },
         "stages": [
             {
                 "name": "main",
                 "program": "cake_moe_grouped_gemm_611af0ca12365b0e7c3b",
+                "specializations": {},
+            },
+            {
+                "name": "main",
+                "program": "cake_moe_grouped_gemm_611f42e92c0a16307151",
+                "specializations": {},
+            },
+            {
+                "name": "main_wave",
+                "program": "cake_moe_grouped_gemm_a30ea3df10b8ee9976f2",
+                "specializations": {},
+            },
+            {
+                "name": "main_halves",
+                "program": "cake_moe_grouped_gemm_9140b3452aadfce554d6",
+                "specializations": {},
+            },
+            {
+                "name": "main_halves",
+                "program": "cake_moe_grouped_gemm_4af5480da78305cbf114",
+                "specializations": {},
+            },
+            {
+                "name": "main_wave_halves",
+                "program": "cake_moe_grouped_gemm_96f299e996aea2331023",
+                "specializations": {},
+            },
+            {
+                "name": "main_halves_k256t",
+                "program": "cake_moe_grouped_gemm_f6441c89bf898d4db030",
                 "specializations": {},
             },
             {
@@ -411,82 +764,116 @@ ROUTES: dict[str, dict[str, Any]] = {
                 "specializations": {"WGRAD_TILE": 512},
             },
         ],
-        "arches": ["sm_100a", "sm_103a"],
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
     },
     "cake_moe_grouped_gemm_wgrad_f32_k256": {
         "op": "wgrad",
-        "out_dtype": "float32",
-        "tile_k": 256,
-        "public_helper": "grouped_gemm_wgrad",
-        "host_plan": {
-            "alignment": "N % 256 == 0 and K % 256 == 0",
-            "clusters": "grid_x // 2",
-            "grid": "persistent_grid(sm_count, num_groups * (N // 256) * (K // tile_k))",
-            "launches": "1 + (tail_splits > 1)",
-            "num_tail": "(num_groups * (N // 256) * (K // tile_k)) % clusters",
-            "partials_bytes": "4 * 256 * tile_k * max(num_tail * tail_splits if tail_splits > 1 else 0, 1)",
-            "raster_rows": "wgrad_raster_rows(N // 256, K // tile_k, clusters, tile_k)",
-            "tail_reduce_grid": "wgrad_reduce_grid(num_tail, tile_k) when tail_splits > 1, else no tail_reduce launch",
-            "tail_splits": "wgrad_tail_plan(num_tail, clusters, sum_m, num_groups, tile_k) if num_tail else 1",
-            "tensormap_workspace_bytes": "grid_x * tmap_slots_per_cta * tmap_slot_bytes (uint8, 128-byte aligned)",
-        },
         "stages": [
             {
                 "name": "main",
-                "program": "cake_moe_grouped_gemm_7ac85aef90878e42ea02",
-                "specializations": {},
+                "program": "cake_moe_grouped_gemm_ed9a74f36ba13a52183d",
+                "specializations": {"WGRAD_OUT": 32},
+            },
+            {
+                "name": "main_wave",
+                "program": "cake_moe_grouped_gemm_9cd96cdceb35c7ac936e",
+                "specializations": {"WGRAD_OUT": 32},
             },
             {
                 "name": "tail_reduce",
-                "program": "cake_moe_grouped_gemm_05498a17b6c266797a62",
-                "specializations": {"WGRAD_TILE": 256},
+                "program": "cake_moe_grouped_gemm_bc774d802e4f0b3ac27c",
+                "specializations": {"WGRAD_OUT": 32, "WGRAD_TILE": 256},
             },
         ],
         "arches": ["sm_100a", "sm_103a", "sm_107a"],
     },
     "cake_moe_grouped_gemm_wgrad_f32_k512": {
         "op": "wgrad",
-        "out_dtype": "float32",
-        "tile_k": 512,
-        "public_helper": "grouped_gemm_wgrad",
-        "host_plan": {
-            "alignment": "N % 256 == 0 and K % 512 == 0",
-            "clusters": "grid_x // 2",
-            "grid": "persistent_grid(sm_count, num_groups * (N // 256) * (K // tile_k))",
-            "launches": "1 + (tail_splits > 1)",
-            "num_tail": "(num_groups * (N // 256) * (K // tile_k)) % clusters",
-            "partials_bytes": "4 * 256 * tile_k * max(num_tail * tail_splits if tail_splits > 1 else 0, 1)",
-            "raster_rows": "wgrad_raster_rows(N // 256, K // tile_k, clusters, tile_k)",
-            "tail_reduce_grid": "wgrad_reduce_grid(num_tail, tile_k) when tail_splits > 1, else no tail_reduce launch",
-            "tail_splits": "wgrad_tail_plan(num_tail, clusters, sum_m, num_groups, tile_k) if num_tail else 1",
-            "tensormap_workspace_bytes": "grid_x * tmap_slots_per_cta * tmap_slot_bytes (uint8, 128-byte aligned)",
-        },
         "stages": [
             {
                 "name": "main",
-                "program": "cake_moe_grouped_gemm_d77aff0f30a2661aecc8",
-                "specializations": {},
+                "program": "cake_moe_grouped_gemm_611af0ca12365b0e7c3b",
+                "specializations": {"WGRAD_OUT": 32},
+            },
+            {
+                "name": "main",
+                "program": "cake_moe_grouped_gemm_611f42e92c0a16307151",
+                "specializations": {"WGRAD_OUT": 32},
+            },
+            {
+                "name": "main_wave",
+                "program": "cake_moe_grouped_gemm_a30ea3df10b8ee9976f2",
+                "specializations": {"WGRAD_OUT": 32},
+            },
+            {
+                "name": "main_halves",
+                "program": "cake_moe_grouped_gemm_9140b3452aadfce554d6",
+                "specializations": {"WGRAD_OUT": 32},
+            },
+            {
+                "name": "main_halves",
+                "program": "cake_moe_grouped_gemm_4af5480da78305cbf114",
+                "specializations": {"WGRAD_OUT": 32},
+            },
+            {
+                "name": "main_wave_halves",
+                "program": "cake_moe_grouped_gemm_96f299e996aea2331023",
+                "specializations": {"WGRAD_OUT": 32},
+            },
+            {
+                "name": "main_halves_k256t",
+                "program": "cake_moe_grouped_gemm_f6441c89bf898d4db030",
+                "specializations": {"WGRAD_OUT": 32},
             },
             {
                 "name": "tail_reduce",
-                "program": "cake_moe_grouped_gemm_05498a17b6c266797a62",
-                "specializations": {"WGRAD_TILE": 512},
+                "program": "cake_moe_grouped_gemm_bc774d802e4f0b3ac27c",
+                "specializations": {"WGRAD_OUT": 32, "WGRAD_TILE": 512},
             },
         ],
-        "arches": ["sm_100a", "sm_103a"],
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
     },
 }
 HOST_PLAN_CONSTANTS: dict[str, Any] = {
-    "block_m": 128,
     "block_n": 256,
+    "wide_block_n": 512,
+    "wide_fwd_archs": ["sm_100a", "sm_103a", "sm_107a"],
+    "wide_dgrad_archs": ["sm_100a", "sm_103a", "sm_107a"],
+    "dgrad_evict_first_archs": ["sm_107a"],
+    "dgrad_evict_first_min_rows": 16384,
+    "dgrad_evict_first_min_k": 4096,
+    "fwd_lwh_ef_archs": ["sm_107a"],
+    "fwd_lwh_ef_max_k": 2048,
+    "dgrad_wide_ts33_archs": ["sm_103a"],
+    "dgrad_wide_ts33_min_rows": {"sm_103a": 8192},
+    "dgrad_wide_ts33_min_k": 4096,
+    "fwd_wide_ts33_archs": ["sm_103a"],
+    "fwd_wide_ts33_max_k": 2048,
+    "fwd_wide_ts33_max_rows": 4096,
     "block_k": 64,
     "cta_group": 2,
     "cluster_m": 256,
     "epi_chunk": 16,
     "tmap_slot_bytes": 128,
-    "tmap_slots_per_cta": 2,
-    "k512_archs": ["sm_100a", "sm_103a"],
-    "k512_min_rows_per_group": 20480,
+    "tmap_slots_per_cta": 18,
+    "k512_archs": ["sm_100a", "sm_103a", "sm_107a"],
+    "k512_release_archs": ["sm_100a", "sm_103a", "sm_107a"],
+    "k256_tail_archs": ["sm_107a"],
+    "k256_tail_max_k": 2048,
+    "k256_tail_min_rows": 8192,
+    "k512_min_rows_per_group": {"sm_100a": 4096, "sm_103a": 4096, "sm_107a": 4096},
+    "wave_sync_min_k": 4096,
+    "wave_sync_archs": {
+        256: ["sm_100a", "sm_103a"],
+        512: ["sm_100a", "sm_103a"],
+    },
+    "wave_sync_mode": {"sm_100a": 2, "sm_103a": 2},
+    "wave_sync_words": 2,
+    "sched_words": 4224,
+    "sched_rest": [0, 2147483648, 0],
+    "domain_split_archs": ["sm_103a"],
+    "domain_split_ops": ["dgrad"],
+    "domain_split_max_weight_elems": 12582912,
     "wgrad_tail_split": 1,
     "tail_plan": {
         "max_splits": 16,
@@ -500,13 +887,6 @@ HOST_PLAN_CONSTANTS: dict[str, Any] = {
 
 ARCHES = ("sm_100a", "sm_103a", "sm_107a")
 OPS = ("fwd", "dgrad", "wgrad")
-# Exact-architecture payloads (tcgen05 / TMEM): one build per exact target with
-# FlashInfer's exact flag sets, never a family target.
-ARCH_NVCC_FLAGS = {
-    "sm_100a": sm100a_nvcc_flags,
-    "sm_103a": sm103a_nvcc_flags,
-    "sm_107a": sm107a_nvcc_flags,
-}
 
 
 def record_name(
@@ -526,12 +906,6 @@ def record_name(
             )
         base += f"_{'f32' if out_dtype == 'float32' else 'bf16'}_k{tile_k}"
     return base
-
-
-def registered_arches() -> tuple[str, ...]:
-    """Architectures with at least one registered route, in ``ARCHES`` order."""
-    present = {arch for route in ROUTES.values() for arch in route["arches"]}
-    return tuple(arch for arch in ARCHES if arch in present)
 
 
 def program_registered(
@@ -587,43 +961,20 @@ def select_module(
     return name
 
 
-def build_target_arches() -> frozenset[str]:
-    """Exact architectures FlashInfer builds for, restricted to ``ARCHES``.
-
-    Follows ``FLASHINFER_CUDA_ARCH_LIST`` when set and the visible devices
-    otherwise (``flashinfer.compilation_context.CompilationContext``); the
-    loader never probes ``nvcc`` or the device itself.
-    """
-    context = current_compilation_context
-    if not context.TARGET_CUDA_ARCHS:
-        context = refresh_current_compilation_context()
-    targets = {f"sm_{major}{minor}" for major, minor in context.TARGET_CUDA_ARCHS}
-    return frozenset(targets) & frozenset(ARCHES)
-
-
-def _header_dirs():
-    installed = [jit_env.FLASHINFER_CSRC_DIR, jit_env.FLASHINFER_INCLUDE_DIR]
-    if (installed[0] / "tvm_ffi_utils.h").is_file() and (
-        installed[1] / "flashinfer/layout.cuh"
-    ).is_file():
-        return installed
-    checkout = Path(__file__).resolve().parents[3]
-    source = [checkout / "csrc", checkout / "include"]
-    if (source[0] / "tvm_ffi_utils.h").is_file() and (
-        source[1] / "flashinfer/layout.cuh"
-    ).is_file():
-        return source
-    raise FileNotFoundError("FlashInfer binding headers were not found")
-
-
-def stage_binding(name: str, stage: str) -> dict[str, Any]:
-    """The ``{"name", "program", "specializations"}`` record of ``stage`` of route ``name``."""
+def stage_binding(name: str, stage: str, arch: str) -> dict[str, Any]:
+    """The ``{"name", "program", "specializations"}`` record of ``stage`` of route ``name`` on ``arch``."""
     route = ROUTES[name]
     for item in route["stages"]:
-        if item["name"] == stage:
+        if item["name"] == stage and arch in PROGRAMS[item["program"]]["arches"]:
             return item
-    raise KeyError(
-        f"route {name!r} has stages {[s['name'] for s in route['stages']]}, not {stage!r}"
+    raise KeyError(f"route {name!r} has no {stage!r} stage on {arch}")
+
+
+def stage_served(name: str, stage: str, arch: str) -> bool:
+    """True when route ``name`` has a ``stage`` stage whose program is built for ``arch``."""
+    return any(
+        item["name"] == stage and arch in PROGRAMS[item["program"]]["arches"]
+        for item in ROUTES[name]["stages"]
     )
 
 
@@ -633,52 +984,33 @@ def _specialization_items(
     return tuple(sorted(specializations.items()))
 
 
-@functools.cache
-def _gen_module(program: str, arch: str, specializations: tuple[tuple[str, Any], ...]):
+def specialization_tag(specializations: tuple[tuple[str, Any], ...]) -> str:
+    """Library-name suffix of a compile-line specialization set: ``_wgrad_tile256`` for
+    ``{"WGRAD_TILE": 256}``, empty for none.  ``build.json`` names a specialized build
+    ``<library><tag>_<arch>`` and carries its ``-D<KEY>=<value>`` defines in that entry's ``nvcc_flags``."""
+    return "".join(f"_{key.lower()}{value}" for key, value in specializations)
+
+
+def library_name(
+    program: str, arch: str, specializations: Optional[dict[str, Any]] = None
+) -> str:
+    """``build.json`` entry of ``program`` built for ``arch`` under ``specializations``."""
     record = PROGRAMS[program]
     if arch not in record["arches"]:
         raise ValueError(f"program {program!r} is not delivered for {arch}")
-    root = Path(__file__).resolve().parent / "csrc"
-    sources = [root / relative for relative in record["sources"]]
-    tag = "".join(f"_{key.lower()}{value}" for key, value in specializations)
-    return gen_jit_spec(
-        # The spec name carries the exact target, the compile-line specialization
-        # values and the sealed closure identity, so a changed closure or value
-        # never reuses a stale extension.
-        name=f"{program}_{arch}{tag}_" + record["closure_sha256"][arch][:20],
-        sources=sources,
-        extra_cuda_cflags=[
-            *ARCH_NVCC_FLAGS[arch],
-            *record["compile_flags"],
-            *[f"-D{key}={value}" for key, value in specializations],
-        ],
-        extra_ldflags=["-lcuda"],
-        extra_include_paths=[root, *[p.parent for p in sources], *_header_dirs()],
-        use_fast_math=False,
-    )
-
-
-def gen_module(
-    program: str, arch: str, specializations: Optional[dict[str, Any]] = None
-):
-    """JIT spec of one physical program for ``arch`` under ``specializations``."""
-    return _gen_module(program, arch, _specialization_items(specializations or {}))
+    tag = specialization_tag(_specialization_items(specializations or {}))
+    return f"{record['library']}{tag}_{arch}"
 
 
 @functools.cache
 def _load_module(program: str, arch: str, specializations: tuple[tuple[str, Any], ...]):
-    targets = build_target_arches()
-    if arch not in targets:
-        raise RuntimeError(
-            f"generated program {program!r} is requested for {arch}, which is not a "
-            f"FlashInfer build target (targets: {sorted(targets) or 'none'}); set "
-            "FLASHINFER_CUDA_ARCH_LIST to include it"
-        )
-    return _gen_module(program, arch, specializations).build_and_load()
+    return cake_build.load_library(library_name(program, arch, dict(specializations)))
 
 
 def load_module(
     program: str, arch: str, specializations: Optional[dict[str, Any]] = None
 ):
-    """Build (once per target and specialization) and load one physical program."""
+    """Load (once per program, exact target and specialization) one physical program: the prebuilt
+    library under ``aot/`` when the package ships it, else FlashInfer's JIT build of its ``build.json``
+    entry."""
     return _load_module(program, arch, _specialization_items(specializations or {}))

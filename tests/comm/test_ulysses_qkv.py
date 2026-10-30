@@ -471,33 +471,56 @@ def test_qkv_rejects_single_rank_without_changing_plain_identity():
     _run_multi_rank(_single_rank_body, 1, None)
 
 
-def _non_nccl_group_body(rank, world, group, _arg):
+def _non_nccl_group_body(rank, world, group, backend):
     metadata_group = dist.new_group(backend="gloo")
     try:
         x = torch.full((1, 4, world, 64), rank + 1, dtype=torch.bfloat16, device="cuda")
-        with UlyssesCommunicator(
-            metadata_group,
-            max_bytes=x.nbytes,
-            dtype=x.dtype,
-            backend="nvlink",
-        ) as comm:
-            with pytest.raises((ValueError, RuntimeError), match="NCCL|nccl"):
-                comm.prepare_qkv(x.shape)
-            output = comm.scatter_heads(x)
-            expected = torch.cat(
-                [torch.full_like(output[:, :4], i + 1) for i in range(world)], dim=1
+        with pytest.raises((ValueError, RuntimeError), match="NCCL|nccl"):
+            UlyssesCommunicator(
+                metadata_group,
+                max_bytes=x.nbytes,
+                dtype=x.dtype,
+                backend=backend,
             )
-            _assert_bytes(output, expected)
     finally:
         dist.destroy_process_group(metadata_group)
-    return "ok", "Gloo metadata does not enable NCCL QKV"
+    return "ok", f"Gloo-only groups are rejected before {backend} resources are armed"
 
 
-def test_qkv_rejects_group_without_nccl_but_retains_nvlink():
+@pytest.mark.parametrize("backend", ["nccl", "nvlink"])
+def test_qkv_rejects_group_without_nccl_at_construction(backend):
     _require_gpus(2)
-    _run_multi_rank(_non_nccl_group_body, 2, None, timeout=600, allow_skip=True)
+    _run_multi_rank(
+        _non_nccl_group_body,
+        2,
+        backend,
+        timeout=600,
+        allow_skip=backend == "nvlink",
+    )
 
 
 def test_qkv_workspace_cannot_be_constructed_directly():
     with pytest.raises(TypeError):
         UlyssesQKVWorkspace()
+
+
+def test_qkv_rejects_pcie_collectively_before_preparation(monkeypatch):
+    comm = object.__new__(UlyssesCommunicator)
+    comm._state = "open"
+    comm.backend = "pcie"
+    comm.rank = 0
+    comm.world_size = 2
+    outcomes = []
+
+    def gather(outcome):
+        outcomes.append(outcome)
+        return [outcome, outcome]
+
+    monkeypatch.setattr(comm, "_gather", gather)
+    try:
+        with pytest.raises(ValueError, match="nccl or nvlink"):
+            comm.prepare_qkv((1, 64, 2, 64))
+        assert len(outcomes) == 1
+        assert outcomes[0][0] == "err"
+    finally:
+        comm._state = "closed"

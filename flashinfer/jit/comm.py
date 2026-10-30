@@ -25,17 +25,19 @@ from .utils import write_if_different
 from . import env as jit_env
 import os
 import pathlib
+import sys
 import jinja2
 from itertools import product
 from typing import Any, Dict, List, Literal, Tuple
 
 
-def gen_comm_alltoall_module() -> JitSpec:
+def gen_nvlink_two_sided_alltoall_module() -> JitSpec:
+    """NVLink two-sided MoE all-to-all behind ``flashinfer.moe_ep.NVLinkTwoSidedAlltoAll``."""
     return gen_jit_spec(
-        "comm",
+        "nvlink_two_sided_alltoall",
         [
-            jit_env.FLASHINFER_CSRC_DIR / "trtllm_alltoall.cu",
-            jit_env.FLASHINFER_CSRC_DIR / "trtllm_alltoall_prepare.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "nvlink_two_sided_alltoall.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "nvlink_two_sided_prepare.cu",
         ],
     )
 
@@ -291,11 +293,12 @@ def gen_pcie_ipc_ag_rs_module() -> JitSpec:
 
 
 def gen_ulysses_a2a_module() -> JitSpec:
-    from .cake_ulysses import generated_ulysses_spec
+    """The portable NVLink Ulysses all-to-all (``csrc/ulysses_all_to_all.cu``).
 
-    generated = generated_ulysses_spec()
-    if generated is not None:
-        return generated
+    The exported Cake programs for SM100 / SM103 live in the self-contained
+    package ``flashinfer.cake_ulysses_backend`` and are loaded by its own
+    ``cake_build`` loader, not through this spec.
+    """
     return gen_jit_spec(
         "ulysses_a2a",
         [
@@ -341,45 +344,62 @@ def gen_ulysses_lowp_sm90_module() -> JitSpec:
     )
 
 
-MoeAlltoAllTarget = Literal["legacy", "sm100a", "sm103a"]
+def gen_ulysses_pcie_module() -> JitSpec:
+    """Build the optional single-node PCIe/mlx5 Ulysses transport.
 
-_MOE_ALLTOALL_GENERATED_SOURCE = {
-    "sm100a": "mnnvl_moe_alltoall_sm100.cu",
-    "sm103a": "mnnvl_moe_alltoall_sm103.cu",
+    Reached for ``backend="pcie"`` -- named explicitly, or chosen by ``auto``
+    behind the experimental opt-in -- and deliberately absent from
+    ``flashinfer/aot.py``, so nothing else ever needs rdma-core.
+
+    ``csrc/ulysses_pcie_transport.cuh`` is intentionally not in ``sources``
+    (a ``.cuh`` there would become its own translation unit); ninja's depfile
+    tracks it for rebuilds.
+    """
+    # The CI Conda environment provides rdma-core headers and libraries under
+    # sys.prefix rather than the system paths searched by nvcc and the linker.
+    rdma_prefix = pathlib.Path(sys.prefix)
+    rdma_include = rdma_prefix / "include"
+    rdma_lib = rdma_prefix / "lib"
+    return gen_jit_spec(
+        "ulysses_pcie",
+        [jit_env.FLASHINFER_CSRC_DIR / "ulysses_pcie.cu"],
+        extra_include_paths=[rdma_include]
+        if (rdma_include / "infiniband/mlx5dv.h").is_file()
+        else [],
+        extra_ldflags=([f"-L{rdma_lib}"] if (rdma_lib / "libmlx5.so").is_file() else [])
+        + ["-libverbs", "-lmlx5", "-lcuda"],
+    )
+
+
+CakeAlltoAllTarget = Literal["sm100a", "sm103a"]
+
+_CAKE_ALLTOALL_GENERATED_SOURCE = {
+    "sm100a": "cake_moe_alltoall_kernels.cu",
+    "sm103a": "cake_moe_alltoall_kernels.cu",
 }
-_MOE_ALLTOALL_NVCC_FLAGS = {
+_CAKE_ALLTOALL_NVCC_FLAGS = {
     "sm100a": sm100a_nvcc_flags,
     "sm103a": sm103a_nvcc_flags,
 }
 
 
-def gen_moe_alltoall_module(target: MoeAlltoAllTarget = "legacy") -> JitSpec:
-    communication_kernels = (
+def gen_cake_alltoall_module(target: CakeAlltoAllTarget) -> JitSpec:
+    """Cake MoE all-to-all of one architecture behind ``flashinfer.moe_ep.CakeAlltoAll``."""
+    if target not in _CAKE_ALLTOALL_GENERATED_SOURCE:
+        raise ValueError(f"unsupported Cake MoE all-to-all target: {target}")
+    module_name = f"cake_alltoall_{target}"
+    kernel_sources = [
+        jit_env.FLASHINFER_CSRC_DIR / "cake_moe_alltoall_dispatch.cu",
         jit_env.FLASHINFER_CSRC_DIR
-        / "nv_internal"
-        / "tensorrt_llm"
-        / "kernels"
-        / "communicationKernels"
-    )
-    if target == "legacy":
-        module_name = "mnnvl_moe_alltoall"
-        kernel_sources = [communication_kernels / "moeAlltoAllKernels.cu"]
-        arch_flags = []
-    elif target in _MOE_ALLTOALL_GENERATED_SOURCE:
-        module_name = f"mnnvl_moe_alltoall_{target}"
-        kernel_sources = [
-            communication_kernels / "moeAlltoAllFusedKernels.cu",
-            jit_env.FLASHINFER_CSRC_DIR
-            / "generated"
-            / _MOE_ALLTOALL_GENERATED_SOURCE[target],
-        ]
-        arch_flags = _MOE_ALLTOALL_NVCC_FLAGS[target]
-    else:
-        raise ValueError(f"unsupported MNNVL MoE all-to-all target: {target}")
+        / "generated"
+        / "moe_alltoall"
+        / _CAKE_ALLTOALL_GENERATED_SOURCE[target],
+    ]
+    arch_flags = _CAKE_ALLTOALL_NVCC_FLAGS[target]
     return gen_jit_spec(
         module_name,
         [
-            jit_env.FLASHINFER_CSRC_DIR / "trtllm_moe_alltoall.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "cake_moe_alltoall.cu",
             *kernel_sources,
             jit_env.FLASHINFER_CSRC_DIR
             / "nv_internal"
@@ -410,6 +430,43 @@ def gen_moe_alltoall_module(target: MoeAlltoAllTarget = "legacy") -> JitSpec:
             *arch_flags,
             "-DENABLE_BF16",
         ],
+    )
+
+
+def gen_nvlink_one_sided_alltoall_module() -> JitSpec:
+    """NVLink one-sided MoE all-to-all behind ``flashinfer.moe_ep.NVLinkOneSidedAlltoAll``.
+
+    Includes the CFT counted-write path, which is compiled in when the CUDA
+    toolkit provides the logical-endpoint API (13.4+) and resolved from the
+    driver at runtime, and the Lamport path for small steps.
+    """
+    nv_internal = jit_env.FLASHINFER_CSRC_DIR / "nv_internal"
+    common = nv_internal / "cpp" / "common"
+    # The kernels use no CUTLASS, so SM107 gets native sm_107a code instead of the
+    # sm100f fallback; the driver rejects that fallback for these kernels on SM107.
+    nvcc_flags = current_compilation_context.get_nvcc_flags_list()
+    return gen_jit_spec(
+        "nvlink_one_sided_alltoall",
+        [
+            jit_env.FLASHINFER_CSRC_DIR / "nvlink_one_sided_alltoall.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "nvlink_one_sided_lamport.cu",
+            nv_internal
+            / "tensorrt_llm"
+            / "kernels"
+            / "moe"
+            / "communication"
+            / "moeAlltoAllKernels.cu",
+            common / "envUtils.cpp",
+            common / "tllmException.cpp",
+            common / "logger.cpp",
+            common / "stringUtils.cpp",
+        ],
+        extra_include_paths=[
+            str(nv_internal),
+            str(nv_internal / "include"),
+        ],
+        extra_cuda_cflags=nvcc_flags + ["-DENABLE_BF16"],
+        extra_ldflags=["-lcuda"],
     )
 
 

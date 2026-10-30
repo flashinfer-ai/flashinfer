@@ -46,6 +46,7 @@ def _barrier():
 
 
 @pytest.mark.parametrize("early", [False, True])
+@pytest.mark.parametrize("caller_output", [False, True], ids=["workspace", "caller"])
 @pytest.mark.parametrize(
     "family,kind,cluster,capacity",
     [
@@ -58,16 +59,22 @@ def _barrier():
     ],
 )
 def test_sparse_to_dense_graph_multirank(
-    ep_runtime, family, kind, cluster, capacity, early
+    ep_runtime, family, kind, cluster, capacity, early, caller_output
 ):
+    """Exercise routing changes with workspace and caller outputs across ranks."""
     _check_sparse_to_dense_graph_multirank(
-        ep_runtime, family, kind, cluster, capacity, early
+        ep_runtime, family, kind, cluster, capacity, early, caller_output
     )
 
 
 def _check_sparse_to_dense_graph_multirank(
-    ep_runtime, family, kind, cluster, capacity, early
+    ep_runtime, family, kind, cluster, capacity, early, caller_output=False
 ):
+    """Check graph replay against the oracle after poisoning combine and output.
+
+    Empty, sparse, and rank-asymmetric routes must clear inactive rows and
+    preserve numerical accuracy through repeated replays with fixed bindings.
+    """
     rank, world = ep_runtime
     hidden, intermediate, experts = 512, 256, 16
     # DATA CTA count depends on capacity * topk, not token capacity alone.
@@ -88,7 +95,7 @@ def _check_sparse_to_dense_graph_multirank(
         kernel_variant=family,
         cluster_shape_mn=(cluster, 1),
         fc2_use_bulk=True,
-        apply_topk_at_fc1=early,
+        apply_routing_weights_before_fc2=early,
         reduce_topk_in_kernel=False,
     )
     if family == "genphase":
@@ -110,6 +117,19 @@ def _check_sparse_to_dense_graph_multirank(
         **knobs,
     )
     graph = torch.cuda.CUDAGraph()
+    output = (
+        torch.empty_like(ws.output_activation)
+        if caller_output
+        else ws.output_activation
+    )
+
+    def launch():
+        """Launch with the output binding selected for this multirank case."""
+        if caller_output:
+            pkg.sm107_block_scaled_mega_moe(output, *weights, ws, num_tokens=capacity)
+        else:
+            ws.launch(*weights)
+
     failures = []
     try:
         if family == "inference":
@@ -148,10 +168,10 @@ def _check_sparse_to_dense_graph_multirank(
         ws.topk_idx.copy_(base_ids)
         _barrier()
         for _ in range(3):
-            ws.launch(*weights)
+            launch()
         _barrier()
         with torch.cuda.graph(graph):
-            ws.launch(*weights)
+            launch()
         _barrier()
 
         states = ("dense129", "empty", "tail", "holes", "asymmetric", "restore")
@@ -185,19 +205,19 @@ def _check_sparse_to_dense_graph_multirank(
             assert rows.numel() == capacity
             _barrier()
             ws._pre_reduced_activation.view(torch.bfloat16).fill_(float("nan"))
-            ws.output_activation.fill_(float("nan"))
+            output.fill_(float("nan"))
             # Peers write the poisoned buffers. Finish poisoning on EVERY rank
             # before any peer starts, or the diagnostic itself introduces a race.
             _barrier()
             graph.replay()
             torch.cuda.synchronize()
-            first = ws.output_activation.clone()
+            first = output.clone()
             for _ in range(64):
                 graph.replay()
             torch.cuda.synchronize()
             inactive = ~((ids >= 0) & (ids < experts)).any(dim=1)
             stats = []
-            for actual in (first, ws.output_activation):
+            for actual in (first, output):
                 error = pkg.output_error(actual, rows, expected)
                 stats.extend(
                     (

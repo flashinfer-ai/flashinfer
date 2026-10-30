@@ -1,26 +1,27 @@
 {
   "name": "ulysses_exchange_chunks_ws1_c256",
-  "description": "Equal-length chunk all-to-all over an already-packed payload: chunk r goes to peer r and lands in slot rank there. No element conversion or layout permutation is performed. The reference models the world_size=1 identity; multi-rank correctness is tested under tests/comm/.",
+  "description": "Equal-length chunk all-to-all over an already-packed payload: chunk ``r`` goes to peer ``r`` and lands in slot ``rank`` there. Unlike the two head-axis transforms this one interleaves nothing, so it is the identity at world_size=1 by shape as well as by value. The reference models world_size=1; multi-rank correctness is exercised by tests/comm/.",
   "op_type": "comm",
   "tags": [
     "fi_api:flashinfer.comm.ulysses.UlyssesCommunicator.exchange_chunks",
+    "status:experimental",
     "stage:comm"
   ],
   "axes": {
     "batch_size": {
       "type": "const",
       "value": 1,
-      "description": "Pinned to 1."
+      "description": "Pinned to 1: one row per operand is what lets the transport address each peer's bytes contiguously."
     },
     "seq_len": {
       "type": "const",
       "value": 1,
-      "description": "Pinned to 1."
+      "description": "Pinned to 1, as above."
     },
     "chunk_count": {
       "type": "const",
       "value": 1,
-      "description": "One contiguous chunk per peer."
+      "description": "Chunks in the operand, one per peer, so equal to world_size by construction."
     },
     "world_size": {
       "type": "const",
@@ -34,11 +35,8 @@
     }
   },
   "constraints": [
-    "batch_size == 1",
-    "seq_len == 1",
     "world_size == 1",
-    "chunk_count == world_size",
-    "chunk > 0"
+    "chunk_count == world_size"
   ],
   "inputs": {
     "x": {

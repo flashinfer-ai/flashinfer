@@ -163,6 +163,28 @@ are outside the reset prefix. GenPhase's reset bound depends on both top-k and
 local expert count; large-prefix constructor checks must stay within its
 1024-token capacity limit. EP16 construction is a layout test, not EP16 execution.
 
+One more FlashInfer-owned kernel fix, pending upstream (the pinned commit and
+upstream `main` up to `413da003` have the same code):
+
+- `src/sources/kernel_src/schedulers/fc12_scheduler.py`,
+  `PhaseInterleavedFc12Scheduler._wait_for_fc1_prologue_claims`: the
+  phase-interleave scheduler no longer sets `fc1_exhausted` from its CTA-local
+  peek of the global FC1 work-ID counter. Every CTA of a cluster runs the claim
+  state machine itself and interprets the leader's broadcast work ID against
+  its own stream choice, so that state must only change on cluster-uniform
+  inputs. When the runtime FC1 stream is shorter than the static FC1 watermark
+  (tiny per-rank work, e.g. DP dummy batches), the last terminal FC1 claims of
+  other clusters can push the counter across the watermark between the peeks
+  of two CTAs of one cluster (late-starting clusters make this likely). The
+  CTAs then disagreed on `fc1_exhausted`, mapped the next broadcast ID to
+  different phases, and the cluster deadlocked (CTAs leaving the claim loop
+  while the leader keeps claiming, or 2-CTA MMA / multicast pairs on different
+  tiles): one rank 2 CTAs short of the tail grid sync, its peers waiting in
+  the NVLink drain barrier. The peek now only shortens this CTA's wait; FC1
+  exhaustion is learned from a claimed ID like any other stream end, at the
+  cost of at most one extra terminal FC1 claim per cluster. Re-apply this fix
+  when the drop is re-exported until upstream carries it.
+
 FlashInfer-owned `shim/block_scaled.py` admits the geometries listed above and
 omits BF16 masked-slot preclear only when the kernel advertises masked reduction.
 Quantized combine and in-kernel reduction retain their existing clearing rules.
@@ -170,7 +192,7 @@ This shim change is outside the exported payload. The local patch inventory
 above is separate from the historical upstream qualification evidence; run the
 registered strict single/multirank suites when updating or rebasing these patches.
 All remaining exported implementation files retain the pinned export, apart
-from the previously documented comment.
+from the previously documented comment and the scheduler fix above.
 
 ## Related trees
 

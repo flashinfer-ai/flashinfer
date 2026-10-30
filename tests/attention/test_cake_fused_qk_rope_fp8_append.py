@@ -1,35 +1,103 @@
-"""Correctness tests for the Cake fused QK RMSNorm + NeoX RoPE + FP8 quantize + paged KV append kernel.
-
-Every case is checked against an independent fp32 reference (per-head RMSNorm, NeoX RoPE,
-``amax / upper_max`` or static Q scale, ``x / scale`` K/V payloads, last-page tail clear,
-device-side ``q_indptr`` validation).  FP8 payloads are compared against the *unrounded*
-fp32 payload with ``atol = rtol = 0.1``; ``q_scale`` with ``rtol = 1e-5``; flags, cleared
-tails and every untouched byte bitwise.
 """
+Copyright (c) 2026 by FlashInfer team.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+  http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+
+Correctness tests for the Cake fused QK RMSNorm + NeoX RoPE + FP8 quantize +
+paged KV append kernel.
+
+Every case is checked against an independent fp32 reference (per-head RMSNorm,
+NeoX RoPE, ``amax / upper_max`` or static Q scale, ``x / scale`` K/V payloads,
+last-page tail clear, device-side ``q_indptr`` validation).  FP8 payloads are
+compared against the *unrounded* fp32 payload with ``atol = rtol = 0.1``;
+``q_scale`` with ``rtol = 1e-5``; flags, cleared tails and every untouched byte
+bitwise.
+
+This suite exercises the backend package alone: it names the package once,
+through ``tests.test_helpers.cake_package``, and imports nothing else from
+flashinfer, so a build that vendors the package under another import path
+runs it unchanged after pointing that table entry at its package.  The
+``flashinfer.cake_fused_qk_rope_fp8_append`` facade is covered by
+``test_cake_fused_qk_rope_fp8_append_api.py``.
+"""
+
+from __future__ import annotations
+
+import ast
+import re
+import sys
+from pathlib import Path
 
 import pytest
 import torch
 
-from flashinfer.cake_fused_qk_rope_fp8_append import (
-    cake_fused_qk_rmsnorm_rope_quantize_fp8_append_paged_kv_cache as fused_fp8,
-)
-from flashinfer.utils import get_compute_capability
+from tests.test_helpers.cake_package import cake_package
+
+pkg = cake_package("cake_fused_qk_rope_fp8_append")
+cake_build = cake_package("cake_fused_qk_rope_fp8_append", "cake_build")
+loader = cake_package("cake_fused_qk_rope_fp8_append", "cake_jit")
+fused_fp8 = pkg.cake_fused_qk_rmsnorm_rope_quantize_fp8_append_paged_kv_cache
 
 HEAD_DIM = 128
 FP8_MAX = 448.0
 AMAX_FLOOR = 1e-6
 EPS = 1e-6
 POISON_BYTE = 0xFF  # NaN in float8_e4m3fn: never produced by the kernel
+PACKAGE_DIR = Path(pkg.__file__).resolve().parent
+GRID_RULES = (
+    "rows_plus_requests_by_kv_heads",
+    "rows_by_kv_heads",
+    "kv_heads_by_rows",
+    "kv_heads_by_rows_plus_requests",
+    "persistent_items_by_kv_heads",
+)
+FOLD_GRID_RULES = ("rows_by_kv_heads", "kv_heads_by_rows")
+
+
+def _device() -> torch.device:
+    return torch.device("cuda:0")
+
+
+def _arch():
+    if not torch.cuda.is_available():
+        return None
+    return loader.arch_for_capability(torch.cuda.get_device_capability(_device()))
+
+
+def _supported() -> bool:
+    return _arch() is not None
 
 
 def _skip_unless_supported():
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required")
-    cc = get_compute_capability(torch.device("cuda:0"))
-    if cc not in ((9, 0), (10, 0), (10, 3)):
+    if _arch() is None:
         pytest.skip(
-            f"cake_fused_qk_rope_fp8_append has no cubin for compute capability {cc}"
+            "cake_fused_qk_rope_fp8_append ships no build for compute capability "
+            f"{torch.cuda.get_device_capability(_device())}"
         )
+
+
+@pytest.fixture(autouse=True, scope="module")
+def warmup_jit():
+    # Build the local architecture's libraries that have no prebuilt file before
+    # the first test, through the spec objects the package's loader itself builds
+    # on first use (``cake_build.load_library``); a prebuilt or already cached
+    # library loads without compiling.
+    if _supported():
+        for spec in loader.specs_for_arch(_arch()):
+            spec.build_and_load()
+    yield
 
 
 def rotary_cos_sin_table(
@@ -365,6 +433,46 @@ def test_prefill_chunks_cross_pages(heads, qk_norm_policy, quant_policy):
 
 
 @pytest.mark.parametrize("heads", [(8, 1), (64, 8)])
+@pytest.mark.parametrize("quant_policy", [1, 2])
+def test_long_prefill_of_few_requests(heads, quant_policy):
+    """Prefill of four requests beyond four waves of row CTAs: the persistent
+    build on B300 and B200 (its CTAs stride over the request and row items),
+    another stage elsewhere; every stage writes the reference's bytes."""
+    _skip_unless_supported()
+    hq, hkv = heads
+    case = make_case(
+        q_lens=[5400 if hkv == 1 else 700, 0, 37, 129],
+        ctx_lens=[64, 3, 0, 1000],
+        num_q_heads=hq,
+        num_kv_heads=hkv,
+        page_size=64,
+        qk_norm_policy=2,
+        quant_policy=quant_policy,
+        seed=1031 + hkv,
+    )
+    arch = _arch()
+    num_sms = loader.sm_count(_device().index)
+    stage = loader.stage_for(
+        hq,
+        hkv,
+        arch=arch,
+        num_rows=int(case["qkv"].shape[0]),
+        num_requests=4,
+        page_size=64,
+        num_sms=num_sms,
+        is_prefill=True,
+        max_pages_per_request=int(case["page_indices"].shape[1]),
+        has_out_kv=False,
+        quant_policy=quant_policy,
+    )
+    persistent = arch == "sm_100a" or (
+        arch == "sm_103a" and num_sms != loader.STAGE_POLICY["constants"]["gb300_sms"]
+    )
+    assert (stage == "fp8_e4m3_min_blocks10_persistent1") == persistent, stage
+    run_and_compare(case)
+
+
+@pytest.mark.parametrize("heads", [(8, 1), (64, 8)])
 @pytest.mark.parametrize("q_len", [127, 128, 129])
 def test_dynamic_prefill_scale_padding_boundary(heads, q_len):
     """``q_scale`` padding (``round_up(max_seqlen, 128)``) stays untouched at the boundary."""
@@ -449,6 +557,41 @@ def test_invalid_metadata_leaves_outputs_untouched(kind):
     assert bool(torch.isnan(bufs["q_scale"]).all())
 
 
+@pytest.mark.parametrize("heads", [(8, 1), (64, 8)])
+@pytest.mark.parametrize("is_prefill", [False, True])
+def test_empty_batch_with_rows_leaves_outputs_untouched(heads, is_prefill):
+    """No request (B = 0) with rows is a malformed table (q_indptr = [0]): the call
+    writes nothing and has no flag to set."""
+    _skip_unless_supported()
+    hq, hkv = heads
+    case = make_case(
+        q_lens=[1],
+        ctx_lens=[5],
+        num_q_heads=hq,
+        num_kv_heads=hkv,
+        page_size=16,
+        qk_norm_policy=2,
+        quant_policy=1,
+        seed=13,
+        is_prefill=is_prefill,
+    )
+    dev = case["qkv"].device
+    g = torch.Generator(device="cpu").manual_seed(14)
+    width = (hq + 2 * hkv) * HEAD_DIM
+    case.update(
+        qkv=torch.randn((8, width), generator=g).to(torch.bfloat16).to(dev),
+        seq_lens=torch.zeros(0, dtype=torch.int32, device=dev),
+        q_indptr=torch.zeros(1, dtype=torch.int32, device=dev),
+        page_indices=torch.zeros((0, 1), dtype=torch.int32, device=dev),
+        max_seqlen=8 if is_prefill else 0,
+    )
+    bufs, _ = launch(case)
+    assert tuple(bufs["flags"].shape) == (0, hkv)
+    for name in ("out_q", "key_cache", "value_cache"):
+        assert bool((bufs[name].view(torch.uint8) == POISON_BYTE).all()), name
+    assert bool(torch.isnan(bufs["q_scale"]).all())
+
+
 def test_cuda_graph_replay_matches_eager():
     _skip_unless_supported()
     case = make_case(
@@ -525,6 +668,124 @@ def test_cuda_graph_replay_matches_eager():
             )
 
 
+def test_repeated_launches_and_buffer_reuse_are_bitwise_identical():
+    """Three launches of one problem on fresh poisoned buffers write the same
+    bytes, and a launch into the already written caller-owned buffers writes
+    them again."""
+    _skip_unless_supported()
+    case = make_case(
+        q_lens=[1] * 8 + [16, 0, 3],
+        ctx_lens=[2048 + 5 * i for i in range(8)] + [2047, 5, 0],
+        num_q_heads=8,
+        num_kv_heads=1,
+        page_size=64,
+        qk_norm_policy=2,
+        quant_policy=1,
+        seed=898,
+        is_prefill=True,
+        max_seqlen=16,
+    )
+
+    def bytes_of(bufs):
+        return [
+            t.view(torch.uint8).clone()
+            if t.dtype == torch.float8_e4m3fn
+            else t.view(torch.int32).clone()
+            for t in (
+                bufs["out_q"],
+                bufs["q_scale"],
+                bufs["flags"],
+                bufs["key_cache"],
+                bufs["value_cache"],
+            )
+        ]
+
+    snapshots = []
+    for _ in range(3):
+        bufs, ret = launch(case)
+        assert ret[0] is bufs["out_q"]
+        snapshots.append(bytes_of(bufs))
+    for later in snapshots[1:]:
+        for got, want in zip(later, snapshots[0], strict=True):
+            assert torch.equal(got, want)
+    # reuse: launch again into the buffers of the last launch without re-poisoning
+    fused_fp8(
+        case["qkv"],
+        case["cos_sin"],
+        case["seq_lens"],
+        case["q_indptr"],
+        case["page_indices"],
+        (bufs["key_cache"], bufs["value_cache"]),
+        case["is_prefill"],
+        case["k_scale"],
+        case["v_scale"],
+        case["quant_policy"],
+        max_seqlen=case["max_seqlen"],
+        q_norm_weight=case["q_norm_weight"],
+        k_norm_weight=case["k_norm_weight"],
+        qk_norm_policy=case["qk_norm_policy"],
+        out_q=bufs["out_q"],
+        q_scale=bufs["q_scale"],
+        split_k_flag=bufs["flags"],
+    )
+    torch.cuda.synchronize()
+    for got, want in zip(bytes_of(bufs), snapshots[0], strict=True):
+        assert torch.equal(got, want)
+
+
+def test_changing_shapes_in_one_process_does_not_rebuild():
+    """Shapes the policy maps onto one stage share one loaded library: no
+    second build, no second load."""
+    _skip_unless_supported()
+    arch = _arch()
+    num_sms = loader.sm_count(_device().index)
+
+    def pages(requests: int, page_size: int) -> int:
+        return max(1, -(-(2048 + requests) // page_size))
+
+    def stage_of(requests: int, page_size: int) -> str:
+        return loader.stage_for(
+            8,
+            1,
+            arch=arch,
+            num_rows=requests,
+            num_requests=requests,
+            page_size=page_size,
+            num_sms=num_sms,
+            is_prefill=False,
+            max_pages_per_request=pages(requests, page_size),
+            has_out_kv=False,
+        )
+
+    def decode_case(requests: int, page_size: int, seed: int):
+        return make_case(
+            q_lens=[1] * requests,
+            ctx_lens=[2048 + i for i in range(requests)],
+            num_q_heads=8,
+            num_kv_heads=1,
+            page_size=page_size,
+            qk_norm_policy=2,
+            quant_policy=1,
+            seed=seed,
+            is_prefill=False,
+        )
+
+    base = stage_of(32, 64)
+    same_stage = [
+        (requests, page_size)
+        for requests, page_size in ((40, 64), (16, 64), (33, 64), (8, 64), (48, 128))
+        if stage_of(requests, page_size) == base
+    ]
+    assert same_stage, "the policy left no second decode shape on the B32 stage"
+    run_and_compare(decode_case(32, 64, 899))
+    misses = loader.load.cache_info().misses
+    for requests, page_size in same_stage:
+        run_and_compare(decode_case(requests, page_size, 900 + requests))
+    assert loader.load.cache_info().misses == misses, (
+        "a changed shape on the same stage loaded another library"
+    )
+
+
 def test_rejects_bad_arguments():
     _skip_unless_supported()
     case = make_case(
@@ -591,3 +852,621 @@ def test_rejects_bad_arguments():
     torch.cuda.synchronize()
     assert out_q.shape == (T, 8, HEAD_DIM) and q_scale.shape == (2, 8, 128)
     assert bool((flags == 0).all())
+
+
+# ----------------------------------------------------------------------------------------------
+# Registry and build manifest (CPU): every module record names its ``build.json`` library
+# and the host plan only; the binding's argument order is one contract for every stage.
+
+_ARG_NAMES = [
+    "qkv",
+    "cos_sin",
+    "seq_lens",
+    "q_indptr",
+    "page_indices",
+    "q_norm_weight",
+    "k_norm_weight",
+    "k_scale",
+    "v_scale",
+    "q_scale_inv",
+    "out_q",
+    "key_cache",
+    "value_cache",
+    "out_k",
+    "out_v",
+    "q_scale",
+    "split_k_flag",
+    "num_rows",
+    "num_requests",
+    "num_q_heads",
+    "num_kv_heads",
+    "page_size",
+    "max_pages_per_request",
+    "max_seqlen",
+    "max_seqlen_aligned",
+    "quant_policy",
+    "norm_policy",
+    "is_prefill",
+    "has_out_kv",
+    "upper_max",
+    "grid_x",
+    "grid_y",
+    "grid_z",
+]
+
+
+def test_every_stage_binds_the_public_argument_plan():
+    """The binding's argument order (seventeen buffers, thirteen scalars, the grid)
+    is the same for every stage; the host binds it through the record's
+    ``logical`` names."""
+    for name, record in loader.MODULES.items():
+        plan = record["arg_plan"]
+        assert [key for _kind, key in plan] == _ARG_NAMES, name
+        assert [kind for kind, _key in plan] == (
+            ["buffer"] * 17 + ["parameter"] * 13 + ["grid"] * 3
+        ), name
+
+
+def test_registry_records_reference_the_build_manifest():
+    """Every ``MODULES`` record names its ``build.json`` library and nothing to compile.
+
+    The manifest (schema ``cake-build/1``) carries exactly one entry per (library,
+    architecture) the registry references, each with the kernel and binding
+    sources under ``csrc/`` of this package, their digests and a closure digest;
+    the registry itself records the host plan only (stage, knobs, launch record,
+    grid rule and the kernel-parameter -> logical-argument map).
+    """
+
+    manifest = cake_build.manifest()
+    assert manifest["schema"] == "cake-build/1"
+    assert manifest["package"] == pkg.__name__
+    libraries = cake_build.libraries_by_name()
+    logical_names = set(loader.LOGICAL_TENSORS) | set(loader.LOGICAL_SCALARS)
+    referenced = set()
+    assert loader.STAGE in loader.MODULES
+    assert list(loader.MODULES[loader.STAGE]["arches"]) == list(loader.ARCHES)
+    assert (
+        loader.MODULES[loader.STAGE]["grid_rule"]["kind"]
+        == "rows_plus_requests_by_kv_heads"
+    )
+    for name, record in loader.MODULES.items():
+        assert record["stage"] == name
+        assert name.startswith(loader.STAGE), name
+        assert record["library"] == record["kernel"], name
+        assert record["kernel_symbol"] == f"kernel_{record['library']}", name
+        assert record["ffi_entry"] == "run", name
+        assert not {"sources", "source_sha256", "compile_flags", "cache_names"} & set(
+            record
+        ), name
+        assert set(record["knobs"]) == set(loader.KNOB_KEYS), name
+        assert tuple(record["launch"]["block"]) == (loader.THREADS, 1, 1), name
+        kind = record["grid_rule"]["kind"]
+        assert kind in GRID_RULES, name
+        assert bool(record["knobs"]["fold"]) == (kind in FOLD_GRID_RULES), name
+        assert {key for kind_, key in record["arg_plan"] if kind_ != "grid"} == set(
+            record["logical"]
+        ), name
+        assert {key for kind_, key in record["arg_plan"] if kind_ == "grid"} == {
+            "grid_x",
+            "grid_y",
+            "grid_z",
+        }, name
+        assert set(record["logical"].values()) <= logical_names, name
+        assert record["arches"], name
+        assert set(record["arches"]) <= set(loader.ARCHES), name
+        assert set(record["arches"]) <= set(manifest["arch_flags"]), name
+        for arch in record["arches"]:
+            library = loader.library_name(name, arch)
+            referenced.add(library)
+            entry = libraries[library]
+            assert entry["arch"] == arch
+            assert entry["entry"] == "run"
+            assert entry["sources"] == [
+                f"csrc/{record['library']}_kernel.cu",
+                f"csrc/{record['library']}_binding.cu",
+            ]
+            assert set(entry["sha256"]) == set(entry["sources"])
+            for source in entry["sources"]:
+                assert (PACKAGE_DIR / source).is_file(), source
+            assert re.fullmatch(r"[0-9a-f]{64}", entry["closure_sha256"])
+            assert not any("use_fast_math" in flag for flag in entry["nvcc_flags"])
+            assert "--prec-div=true" in entry["nvcc_flags"]
+    assert referenced == set(libraries)
+    assert (PACKAGE_DIR / "csrc" / "cake_ffi_checks.h").is_file()
+    for arch in loader.ARCHES:
+        shipped = {
+            name for name, record in loader.MODULES.items() if arch in record["arches"]
+        }
+        assert set(loader.stages_for(arch)) == shipped
+        assert loader.STAGE in shipped, arch
+
+
+def test_stage_policy_table_is_well_formed():
+    policy = loader.STAGE_POLICY
+    assert set(policy) == {"constants", "rule", "version"}
+    assert isinstance(policy["rule"], str) and isinstance(policy["version"], str)
+    assert {"ctas_per_sm", "fold_waves", "fold_min_kv_heads"} <= set(
+        policy["constants"]
+    )
+
+
+def test_default_launch_plan_is_the_default_builds_grid():
+    """The public ``launch_plan`` describes the default build: one CTA per (row,
+    kv head) plus one per (request, kv head)."""
+    assert pkg.launch_plan(40, 32, 8) == {"grid": (72, 8, 1)}
+    assert pkg.launch_plan(1, 1, 1) == {"grid": (2, 1, 1)}
+
+
+def test_persistent_grid_is_bounded_by_the_resident_ctas():
+    """The persistent build launches ``min_blocks`` CTAs per SM per KV head, at
+    most one per item, on the x axis; it needs the SM count and 1 to 96
+    requests."""
+    record = loader.MODULES["fp8_e4m3_min_blocks10_persistent1"]
+    assert record["grid_rule"]["kind"] == "persistent_items_by_kv_heads"
+    assert record["knobs"]["min_blocks"] == 10 and record["knobs"]["persistent"]
+
+    def grid(**problem):
+        base = {"num_rows": 1024, "num_requests": 1, "num_kv_heads": 8}
+        return loader.launch_grid(record, **{**base, **problem})
+
+    assert grid(num_sms=148) == (1480, 1, 1)
+    assert grid(num_rows=100, num_requests=4, num_sms=148) == (832, 1, 1)
+    assert grid(num_rows=8192, num_requests=16, num_kv_heads=1, num_sms=148) == (
+        1480,
+        1,
+        1,
+    )
+    for bad in ({}, {"num_requests": 0}, {"num_requests": 97}):
+        with pytest.raises(ValueError):
+            grid(**{"num_sms": None if not bad else 148, **bad})
+
+
+# ----------------------------------------------------------------------------------------------
+# Stage policy (CPU): the host mirrors the Cake policy and must only select shipped builds.
+# ``_POLICY_TABLE`` pins the policy's choice at representative problems (rows change when the
+# registry's policy changes; the structure does not); the scan covers the problem space.
+
+_POLICY_TABLE: dict[tuple[str, int, int, int, int, int, int, bool, int, bool], str] = {
+    # (arch, Hq, Hkv, num_rows, num_requests, page_size, num_sms, is_prefill,
+    #  max_pages_per_request, has_out_kv) -> stage
+    # no request (B = 0; with rows, a malformed table): the default build everywhere
+    ("sm_90a", 8, 1, 8, 0, 64, 132, False, 1, False): "fp8_e4m3",
+    ("sm_90a", 8, 1, 8, 0, 64, 132, True, 1, False): "fp8_e4m3",
+    ("sm_100a", 8, 1, 8, 0, 64, 148, False, 1, False): "fp8_e4m3",
+    ("sm_100a", 8, 1, 8, 0, 64, 148, True, 1, False): "fp8_e4m3",
+    ("sm_103a", 8, 1, 8, 0, 64, 148, False, 1, False): "fp8_e4m3",
+    ("sm_103a", 8, 1, 8, 0, 64, 148, True, 1, False): "fp8_e4m3",
+    ("sm_103a", 8, 1, 8, 0, 64, 152, False, 1, False): "fp8_e4m3",
+    ("sm_103a", 8, 1, 8, 0, 64, 152, True, 1, False): "fp8_e4m3",
+    # B300 single-KV-head decode from 512 CTAs: the nine-CTA prefetch
+    (
+        "sm_103a",
+        8,
+        1,
+        256,
+        256,
+        64,
+        148,
+        False,
+        33,
+        False,
+    ): "fp8_e4m3_min_blocks9_early_rt21_page_prefetch1_clear_tie1",
+    (
+        "sm_103a",
+        8,
+        1,
+        224,
+        224,
+        64,
+        148,
+        False,
+        33,
+        False,
+    ): "fp8_e4m3_early_rt21_page_prefetch1_clear_tie1",
+    (
+        "sm_100a",
+        8,
+        1,
+        256,
+        256,
+        64,
+        148,
+        False,
+        33,
+        False,
+    ): "fp8_e4m3_early_rt21_page_prefetch1_clear_tie1",
+    (
+        "sm_90a",
+        8,
+        1,
+        32,
+        32,
+        64,
+        132,
+        False,
+        33,
+        False,
+    ): "fp8_e4m3_scan_rounds3_clear_tie1",
+    (
+        "sm_90a",
+        64,
+        8,
+        32,
+        32,
+        64,
+        132,
+        False,
+        33,
+        False,
+    ): "fp8_e4m3_min_blocks9_early_rt21_page_prefetch1_grid_order2_clear_tie1",
+    (
+        "sm_90a",
+        8,
+        1,
+        128,
+        8,
+        64,
+        132,
+        True,
+        33,
+        False,
+    ): "fp8_e4m3_scan_rounds3_clear_tie1",
+    (
+        "sm_90a",
+        64,
+        8,
+        128,
+        8,
+        64,
+        132,
+        True,
+        33,
+        False,
+    ): "fp8_e4m3_scan_rounds3_clear_tie1",
+    (
+        "sm_90a",
+        64,
+        8,
+        256,
+        256,
+        64,
+        132,
+        False,
+        33,
+        False,
+    ): "fp8_e4m3_min_blocks9_early_rt21_page_prefetch1_clear_tie1",
+    (
+        "sm_90a",
+        8,
+        1,
+        1024,
+        1,
+        64,
+        132,
+        True,
+        48,
+        False,
+    ): "fp8_e4m3_scan_rounds3_clear_tie1",
+    (
+        "sm_90a",
+        8,
+        1,
+        32,
+        32,
+        16,
+        132,
+        False,
+        129,
+        False,
+    ): "fp8_e4m3_scan_rounds3_clear_tie1",
+    (
+        "sm_100a",
+        8,
+        1,
+        32,
+        32,
+        64,
+        148,
+        False,
+        33,
+        False,
+    ): "fp8_e4m3_early_rt21_page_prefetch1_clear_tie1",
+    (
+        "sm_100a",
+        64,
+        8,
+        32,
+        32,
+        64,
+        148,
+        False,
+        33,
+        False,
+    ): "fp8_e4m3_early_rt21_page_prefetch1_clear_tie1",
+    (
+        "sm_100a",
+        8,
+        1,
+        128,
+        8,
+        64,
+        148,
+        True,
+        33,
+        False,
+    ): "fp8_e4m3_early_rt21_page_prefetch1_clear_tie1",
+    ("sm_100a", 64, 8, 128, 8, 64, 148, True, 33, False): "fp8_e4m3_grid_order2",
+    (
+        "sm_100a",
+        64,
+        8,
+        256,
+        256,
+        64,
+        148,
+        False,
+        33,
+        False,
+    ): "fp8_e4m3_scan_rounds3_clear_tie1",
+    (
+        "sm_100a",
+        8,
+        1,
+        32,
+        32,
+        64,
+        148,
+        False,
+        33,
+        True,
+    ): "fp8_e4m3_grid_order3_zero_store_width256",
+    (
+        "sm_100a",
+        8,
+        1,
+        32,
+        32,
+        16,
+        148,
+        False,
+        129,
+        False,
+    ): "fp8_e4m3_grid_order3_zero_store_width256",
+    (
+        "sm_103a",
+        8,
+        1,
+        32,
+        32,
+        64,
+        148,
+        False,
+        33,
+        False,
+    ): "fp8_e4m3_early_rt21_page_prefetch1_clear_tie1",
+    (
+        "sm_103a",
+        64,
+        8,
+        32,
+        32,
+        64,
+        148,
+        False,
+        33,
+        False,
+    ): "fp8_e4m3_early_rt21_page_prefetch1_clear_tie1",
+    (
+        "sm_103a",
+        8,
+        1,
+        128,
+        8,
+        64,
+        148,
+        True,
+        33,
+        False,
+    ): "fp8_e4m3_early_rt21_page_prefetch1_clear_tie1",
+    (
+        "sm_103a",
+        8,
+        1,
+        32,
+        32,
+        64,
+        152,
+        False,
+        33,
+        False,
+    ): "fp8_e4m3_clear_heads_per_cta2_zero_store_width256",
+    (
+        "sm_103a",
+        64,
+        8,
+        32,
+        32,
+        64,
+        152,
+        False,
+        33,
+        False,
+    ): "fp8_e4m3_min_blocks9_early_rt21_page_prefetch1_clear_tie1",
+    (
+        "sm_103a",
+        8,
+        1,
+        128,
+        8,
+        64,
+        152,
+        True,
+        33,
+        False,
+    ): "fp8_e4m3_min_blocks9_early_rt21_page_prefetch1_clear_tie1",
+    ("sm_103a", 64, 8, 128, 8, 64, 152, True, 33, False): "fp8_e4m3_grid_order2",
+    # B300 and B200 prefill of one to sixteen requests beyond four waves: the
+    # persistent build; GB300 keeps the clear-first order, and B300 / B200 keep
+    # ten CTAs per SM below four waves or above sixteen requests
+    (
+        "sm_103a",
+        64,
+        8,
+        1024,
+        1,
+        64,
+        148,
+        True,
+        48,
+        False,
+    ): "fp8_e4m3_min_blocks10_persistent1",
+    (
+        "sm_103a",
+        8,
+        1,
+        8192,
+        16,
+        64,
+        148,
+        True,
+        48,
+        False,
+    ): "fp8_e4m3_min_blocks10_persistent1",
+    ("sm_103a", 64, 8, 1024, 1, 64, 152, True, 48, False): "fp8_e4m3_grid_order3",
+    (
+        "sm_100a",
+        64,
+        8,
+        1024,
+        1,
+        64,
+        148,
+        True,
+        48,
+        False,
+    ): "fp8_e4m3_min_blocks10_persistent1",
+    ("sm_100a", 64, 8, 508, 4, 64, 148, True, 48, False): "fp8_e4m3_min_blocks10",
+    ("sm_100a", 64, 8, 384, 4, 64, 148, True, 48, False): "fp8_e4m3_min_blocks10",
+    ("sm_100a", 64, 8, 960, 24, 64, 148, True, 48, False): "fp8_e4m3_min_blocks10",
+    ("sm_103a", 64, 8, 580, 4, 64, 148, True, 48, False): "fp8_e4m3_min_blocks10",
+    ("sm_103a", 64, 8, 960, 24, 64, 148, True, 48, False): "fp8_e4m3_min_blocks10",
+}
+
+
+def _stage(key):
+    arch, hq, hkv, rows, reqs, page, sms, prefill, pages, out_kv = key
+    return loader.stage_for(
+        hq,
+        hkv,
+        arch=arch,
+        num_rows=rows,
+        num_requests=reqs,
+        page_size=page,
+        num_sms=sms,
+        is_prefill=prefill,
+        max_pages_per_request=pages,
+        has_out_kv=out_kv,
+    )
+
+
+@pytest.mark.parametrize("key,expected", sorted(_POLICY_TABLE.items()))
+def test_stage_policy_table(key, expected):
+    stage = _stage(key)
+    assert stage == expected
+    assert stage in loader.stages_for(key[0])
+
+
+@pytest.mark.parametrize("arch", loader.ARCHES)
+def test_stage_policy_only_selects_shipped_builds(arch):
+    shipped = set(loader.stages_for(arch))
+    for hq, hkv in loader.SUPPORTED_HEADS:
+        for page in (4, 16, 64, 128):
+            for reqs in (0, 1, 4, 8, 32, 96, 97, 128, 256, 512):
+                # rows < reqs: requests without rows in this step
+                for rows in sorted({reqs, 1, 128, 1024, 4096}):
+                    for prefill in (False, True):
+                        for pages in (1, 33, 48, 129, 513):
+                            for out_kv in (False, True):
+                                for sms in (132, 148, 152):
+                                    key = (
+                                        arch,
+                                        hq,
+                                        hkv,
+                                        rows,
+                                        reqs,
+                                        page,
+                                        sms,
+                                        prefill,
+                                        pages,
+                                        out_kv,
+                                    )
+                                    stage = _stage(key)
+                                    assert stage in shipped, (key, stage)
+                                    # a stage's grid serves the problem it was selected for
+                                    loader.launch_grid(
+                                        loader.MODULES[stage],
+                                        num_rows=rows,
+                                        num_requests=reqs,
+                                        num_kv_heads=hkv,
+                                        num_sms=sms,
+                                    )
+
+
+def test_stage_policy_rejects_unsupported_heads():
+    with pytest.raises(ValueError):
+        _stage(("sm_100a", 16, 2, 1, 1, 64, 148, False, 1, False))
+
+
+# ----------------------------------------------------------------------------------------------
+# Package hygiene (CPU): the vendorable package imports itself, torch and tvm_ffi only at
+# module level and reads no environment variables.  Function-level lazy imports are the
+# documented exceptions: ``torch`` inside the registry's device helpers and FlashInfer's JIT
+# builder inside the byte-pinned ``cake_build.py`` JIT path (the shared-loader exception of
+# the Cake package form).
+
+
+def _module_level_imports(path: Path) -> set[str]:
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    names: set[str] = set()
+    for node in tree.body:
+        if isinstance(node, ast.Import):
+            names.update(alias.name.split(".")[0] for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            if node.level:
+                if node.module is None:
+                    names.update(f".{alias.name}" for alias in node.names)
+                else:
+                    names.add(f".{node.module.split('.')[0]}")
+            else:
+                assert node.module is not None
+                names.add(node.module.split(".")[0])
+    return names
+
+
+@pytest.mark.parametrize(
+    "filename,allowed",
+    [
+        (
+            "cake_jit.py",
+            {"__future__", "functools", "typing", "tvm_ffi", ".cake_build"},
+        ),
+        (
+            "__init__.py",
+            {"__future__", "functools", "typing", "math", "torch", ".cake_jit"},
+        ),
+    ],
+)
+def test_package_module_level_imports_are_whitelisted(filename, allowed):
+    assert _module_level_imports(PACKAGE_DIR / filename) <= allowed
+
+
+def test_cake_build_imports_only_the_standard_library():
+    names = _module_level_imports(PACKAGE_DIR / "cake_build.py")
+    assert names <= set(sys.stdlib_module_names) | {"__future__"}, names
+
+
+@pytest.mark.parametrize("filename", ["cake_jit.py", "__init__.py", "cake_build.py"])
+def test_package_reads_no_environment_variables(filename):
+    text = (PACKAGE_DIR / filename).read_text(encoding="utf-8")
+    assert "os.environ" not in text
+    assert "getenv" not in text

@@ -25,6 +25,78 @@ follow the standard SM100-family CuTe-DSL/Cake policy. SM120a uses a CuTe-DSL
 backend of its own. These prefill routes leave decode and speculative-decode
 dispatch unchanged.
 
+Automatic prefill policy on GB200 and GB300
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+For one packed sequence, BF16 activations, head dimension 128 and an existing
+BF16 or FP32 state, ``auto`` uses these coarse performance regions:
+
+* Few heads: 1--16 local heads; moderate: 17--64; wide: 65--96.
+* Short: 1K to below 4K tokens; medium: 4K to below 8K;
+  long: 8K through 64K. Here K means 1024.
+
+The policy prefers cuDNN when its measured GPU time is within 10% of the
+fastest valid backend, except wide-head BF16 calls on GB300, which prefer
+cuDNN despite its measured 14--15% overhead against Cake. This is an offline
+tuning target, not a runtime benchmark or a guarantee for unmeasured shapes.
+The measurements used 8, 12, 64 and 96 local heads on GB200/GB300 at
+FlashInfer ``fd14b3056d0c``.
+
+.. list-table:: Preferred backend
+   :header-rows: 1
+
+   * - Local heads / state
+     - Short
+     - Medium
+     - Long
+   * - 1--8 / BF16
+     - small-bh
+     - cuDNN
+     - cuDNN
+   * - 9--16 / BF16
+     - small-bh
+     - small-bh
+     - cuDNN
+   * - 1--16 / FP32
+     - cute-dsl
+     - cuDNN
+     - cuDNN
+   * - 17--64 / BF16
+     - small-bh
+     - small-bh
+     - small-bh
+   * - 17--64 / FP32
+     - cute-dsl-persistent
+     - cuDNN
+     - cuDNN [1]_
+   * - 65--96 / BF16, GB200
+     - cuDNN
+     - cuDNN
+     - cuDNN
+   * - 65--96 / BF16, GB300
+     - cuDNN
+     - cuDNN
+     - cuDNN
+   * - 65--96 / FP32
+     - cute-dsl-persistent
+     - cute-dsl-persistent
+     - cute-dsl-persistent
+
+.. [1] GB300 uses persistent for FP32 moderate-head calls from 8K to below
+   16K: cuDNN exceeded the 10% margin against PTX at the measured 8K point.
+   PTX remains explicit because it requires bounded state values.
+
+Numerical and layout eligibility checks still apply. Persistent selection
+requires heads divisible by eight and no more than the device SM count,
+so this single-sequence route never uses inter-CTA state handoffs. An
+unavailable cuDNN frontend falls back to a compatible native backend.
+Unbounded gates, state pools, checkpoints, strided Q/K, multiple sequences,
+and sizes outside these regions retain the existing policy. Auto-selected
+cuDNN leaves a supplied ``prefill_workspace`` unused and manages its own
+scratch buffers, including private storage during CUDA Graph capture.
+Native fallback uses the supplied workspace. Warm the selected backend with
+the same arguments and stream before capture.
+
 Input layout
 ~~~~~~~~~~~~
 
@@ -474,11 +546,11 @@ The frozen kernel uses restricted output and auxiliary storage. A preallocated
 ``output`` and checkpoint buffers must not overlap Q, K, V, G, beta, state,
 metadata, or descriptor storage.
 
-Eager calls without ``prefill_workspace`` use an internal serialized workspace
+Native eager calls without ``prefill_workspace`` use an internal serialized workspace
 for the current CUDA stream. This default workspace is eager-only and cannot
 be used during CUDA graph capture.
 
-CUDA graph capture requires a caller-owned
+Native CUDA graph capture requires a caller-owned
 ``RecurrentKDAPrefillWorkspace(device)`` and a preallocated ``output``. The
 workspace owns optional final-state scratch for calls without an initial
 state, beta padding, separate TMA descriptor blocks, and the small-BH compact
@@ -672,7 +744,7 @@ uses the source contract: relative L2 error at most 3%, with each element's
 error bounded by the larger of 0.5 times reference RMS and 5% of its magnitude.
 Short-sequence tests additionally compare with an independent FP64 recurrence.
 
-This backend is explicitly selected and requires SM100 or SM103 with
+This backend requires SM100 or SM103 with
 ``nvidia-cutlass-dsl>=4.7.0``. Its supported contract is:
 
 * contiguous, 16-byte-aligned BF16 Q/K/V/G ``[B,T,H,128]`` and beta
