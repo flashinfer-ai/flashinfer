@@ -46,6 +46,8 @@ GMEM_REDUCTION_WARPS_PER_CTA = 4
 # per thread, but caps a slice at four D-per-CTA rows so the four warps can
 # still compute one row's shared LSE state each.
 PARALLEL_GMEM_REDUCTION_THREADS = 128
+# Register budget for prefetching each thread's split partials (BF16 elements).
+_MAX_PREFETCH_PARTIAL_ELEMENTS = 32
 PARALLEL_GMEM_REDUCTION_ELEMENTS_PER_THREAD = 8
 PARALLEL_GMEM_REDUCTION_SWAPS_ELEMENTS_PER_SLICE = 128
 PARALLEL_GMEM_REDUCTION_ELEMENTS_PER_SLICE = (
@@ -241,6 +243,66 @@ def _run_parallel_gmem_reduction_g1_shared_stats(
     output_elements_per_thread = ceil_div(elements_per_slice, reducer_threads)
     slice_element_base = slice_idx * Int32(elements_per_slice)
 
+    thread_elem_offset = thread_idx * Int32(output_elements_per_thread)
+    flat_element = slice_element_base + thread_elem_offset
+    head_idx = flat_element // Int32(cfg.head_dim_per_cta_v)
+    dim_in_cta = flat_element - head_idx * Int32(cfg.head_dim_per_cta_v)
+    row_in_slice = (flat_element - slice_element_base) // Int32(cfg.head_dim_per_cta_v)
+    dim_idx = head_dim_cta_idx * Int32(cfg.head_dim_per_cta_v) + dim_in_cta
+    output_query_row_state = flat_query_row_state(
+        head_idx,
+        q_idx,
+        cfg.tile_size_q,
+        cfg.logical_num_heads_q,
+        cfg.logical_seq_len_q,
+        cu_seqlens_q=cu_seqlens_q,
+        batch_idx=batch_idx,
+    )
+    valid_output = (
+        thread_elem_offset < Int32(elements_per_slice)
+        and head_idx < Int32(cfg.num_heads_q)
+        and dim_idx < Int32(cfg.head_dim_v)
+        and output_query_row_state[4]
+    )
+    # Sparse finalization must publish even if the primary source is empty:
+    # the extra source may be live, and two empty sources produce zero output.
+    if cutlass.const_expr(not finalize_attention):
+        valid_output = valid_output & request_is_active
+    # Issue every split's partial-O loads before the statistics round trip so
+    # both global reads overlap. Invalid threads read the always-mapped first
+    # element; masked splits are still skipped at use, never multiplied. Only
+    # a fixed split count knows every slot at compile time.
+    prefetch_partials = cutlass.const_expr(
+        requested_splits is None
+        and cfg.num_ctas_per_seq_kv * output_elements_per_thread
+        <= _MAX_PREFETCH_PARTIAL_ELEMENTS
+    )
+    if cutlass.const_expr(prefetch_partials):
+        prefetch_row = _split_o_row_base_offset(
+            cfg, batch_idx, q_idx, head_idx, dim_idx
+        )
+        prefetch_ptr = acc_output.iterator.raw_ptr() + (
+            prefetch_row if valid_output else Int64(0)
+        )
+        prefetched = cutlass.Array(
+            acc_output.element_type,
+            cfg.num_ctas_per_seq_kv * output_elements_per_thread,
+            space=cutlass.AddressSpace.rmem,
+        )
+        for split_i in cutlass.range_constexpr(cfg.num_ctas_per_seq_kv):
+            split_ptr = prefetch_ptr + Int64(split_i * cfg.head_dim_v)
+            if cutlass.const_expr(output_elements_per_thread == 1):
+                prefetched[split_i] = split_ptr.load()
+            else:
+                values = split_ptr.load(
+                    count=output_elements_per_thread,
+                    alignment=output_elements_per_thread * cfg.partial_o_dtype_bytes,
+                )
+                for elem_i in cutlass.range_constexpr(output_elements_per_thread):
+                    prefetched[split_i * output_elements_per_thread + elem_i] = values[
+                        elem_i
+                    ]
+
     smem_scale = cutlass.Array(
         Float32,
         rows_per_slice * cfg.num_ctas_per_seq_kv,
@@ -353,31 +415,6 @@ def _run_parallel_gmem_reduction_g1_shared_stats(
         thread_count=reducer_threads,
     )
 
-    thread_elem_offset = thread_idx * Int32(output_elements_per_thread)
-    flat_element = slice_element_base + thread_elem_offset
-    head_idx = flat_element // Int32(cfg.head_dim_per_cta_v)
-    dim_in_cta = flat_element - head_idx * Int32(cfg.head_dim_per_cta_v)
-    row_in_slice = (flat_element - slice_element_base) // Int32(cfg.head_dim_per_cta_v)
-    dim_idx = head_dim_cta_idx * Int32(cfg.head_dim_per_cta_v) + dim_in_cta
-    output_query_row_state = flat_query_row_state(
-        head_idx,
-        q_idx,
-        cfg.tile_size_q,
-        cfg.logical_num_heads_q,
-        cfg.logical_seq_len_q,
-        cu_seqlens_q=cu_seqlens_q,
-        batch_idx=batch_idx,
-    )
-    valid_output = (
-        thread_elem_offset < Int32(elements_per_slice)
-        and head_idx < Int32(cfg.num_heads_q)
-        and dim_idx < Int32(cfg.head_dim_v)
-        and output_query_row_state[4]
-    )
-    # Sparse finalization must publish even if the primary source is empty:
-    # the extra source may be live, and two empty sources produce zero output.
-    if cutlass.const_expr(not finalize_attention):
-        valid_output = valid_output & request_is_active
     if valid_output:
         output_acc = cutlass.Array(
             Float32,
@@ -386,76 +423,101 @@ def _run_parallel_gmem_reduction_g1_shared_stats(
         )
         for elem_i in cutlass.range_constexpr(output_elements_per_thread):
             output_acc[elem_i] = Float32(0.0)
-        # Scratch strides remain static for the prepared capacity. Form the
-        # 64-bit row base once to avoid repeated address linearization.
-        # A full prefix keeps the unrolled path without one branch per slot;
-        # a shorter prefix uses a runtime loop and never reads padding.
-        acc_row_ptr = acc_output.iterator.raw_ptr() + _split_o_row_base_offset(
-            cfg,
-            batch_idx,
-            q_idx,
-            head_idx,
-            dim_idx,
-        )
-        # Pair FP32 channels while preserving each channel's split order.
-        unrolled_splits = (
-            cfg.num_ctas_per_seq_kv
-            if requested_splits is None
-            else GMEM_REDUCTION_WARP_LANES
-        )
-        if split_limit == Int32(unrolled_splits):
-            for split_i in cutlass.range_constexpr(unrolled_splits):
-                split_idx = Int32(split_i)
+        if cutlass.const_expr(prefetch_partials):
+            for split_i in cutlass.range_constexpr(cfg.num_ctas_per_seq_kv):
                 scale = Float32(
                     smem_scale[
-                        row_in_slice * Int32(cfg.num_ctas_per_seq_kv) + split_idx
+                        row_in_slice * Int32(cfg.num_ctas_per_seq_kv) + Int32(split_i)
                     ]
                 )
                 # Sparse inactive splits may leave their O partial untouched.
                 if not finalize_attention or scale > Float32(0):
-                    split_ptr = acc_row_ptr + Int64(split_i * cfg.head_dim_v)
+                    base = split_i * output_elements_per_thread
                     if cutlass.const_expr(output_elements_per_thread == 1):
-                        output_acc[0] += Float32(split_ptr.load()) * scale
+                        output_acc[0] += Float32(prefetched[base]) * scale
                     else:
-                        partial_o = split_ptr.load(
-                            count=output_elements_per_thread,
-                            alignment=output_elements_per_thread
-                            * cfg.partial_o_dtype_bytes,
-                        ).to(Float32)
                         for elem_i in cutlass.range_constexpr(
                             0, output_elements_per_thread, 2
                         ):
                             output_acc[elem_i], output_acc[elem_i + 1] = ffma2(
-                                (partial_o[elem_i], partial_o[elem_i + 1]),
+                                (
+                                    Float32(prefetched[base + elem_i]),
+                                    Float32(prefetched[base + elem_i + 1]),
+                                ),
                                 (scale, scale),
                                 (output_acc[elem_i], output_acc[elem_i + 1]),
                             )
         else:
-            for split_i in cutlass.range(split_limit, unroll=4):
-                split_idx = Int32(split_i)
-                scale = Float32(
-                    smem_scale[
-                        row_in_slice * Int32(cfg.num_ctas_per_seq_kv) + split_idx
-                    ]
-                )
-                if not finalize_attention or scale > Float32(0):
-                    split_ptr = acc_row_ptr + Int64(split_i) * Int64(cfg.head_dim_v)
-                    if cutlass.const_expr(output_elements_per_thread == 1):
-                        output_acc[0] += Float32(split_ptr.load()) * scale
-                    else:
-                        partial_o = split_ptr.load(
-                            count=output_elements_per_thread,
-                            alignment=output_elements_per_thread
-                            * cfg.partial_o_dtype_bytes,
-                        ).to(Float32)
-                        for elem_i in cutlass.range_constexpr(
-                            0, output_elements_per_thread, 2
-                        ):
-                            output_acc[elem_i], output_acc[elem_i + 1] = ffma2(
-                                (partial_o[elem_i], partial_o[elem_i + 1]),
-                                (scale, scale),
-                                (output_acc[elem_i], output_acc[elem_i + 1]),
-                            )
+            # Scratch strides remain static for the prepared capacity. Form the
+            # 64-bit row base once to avoid repeated address linearization.
+            # A full prefix keeps the unrolled path without one branch per slot;
+            # a shorter prefix uses a runtime loop and never reads padding.
+            acc_row_ptr = acc_output.iterator.raw_ptr() + _split_o_row_base_offset(
+                cfg,
+                batch_idx,
+                q_idx,
+                head_idx,
+                dim_idx,
+            )
+            # Pair FP32 channels while preserving each channel's split order.
+            unrolled_splits = (
+                cfg.num_ctas_per_seq_kv
+                if requested_splits is None
+                else GMEM_REDUCTION_WARP_LANES
+            )
+            if split_limit == Int32(unrolled_splits):
+                for split_i in cutlass.range_constexpr(unrolled_splits):
+                    split_idx = Int32(split_i)
+                    scale = Float32(
+                        smem_scale[
+                            row_in_slice * Int32(cfg.num_ctas_per_seq_kv) + split_idx
+                        ]
+                    )
+                    # Sparse inactive splits may leave their O partial untouched.
+                    if not finalize_attention or scale > Float32(0):
+                        split_ptr = acc_row_ptr + Int64(split_i * cfg.head_dim_v)
+                        if cutlass.const_expr(output_elements_per_thread == 1):
+                            output_acc[0] += Float32(split_ptr.load()) * scale
+                        else:
+                            partial_o = split_ptr.load(
+                                count=output_elements_per_thread,
+                                alignment=output_elements_per_thread
+                                * cfg.partial_o_dtype_bytes,
+                            ).to(Float32)
+                            for elem_i in cutlass.range_constexpr(
+                                0, output_elements_per_thread, 2
+                            ):
+                                output_acc[elem_i], output_acc[elem_i + 1] = ffma2(
+                                    (partial_o[elem_i], partial_o[elem_i + 1]),
+                                    (scale, scale),
+                                    (output_acc[elem_i], output_acc[elem_i + 1]),
+                                )
+            else:
+                for split_i in cutlass.range(split_limit, unroll=4):
+                    split_idx = Int32(split_i)
+                    scale = Float32(
+                        smem_scale[
+                            row_in_slice * Int32(cfg.num_ctas_per_seq_kv) + split_idx
+                        ]
+                    )
+                    if not finalize_attention or scale > Float32(0):
+                        split_ptr = acc_row_ptr + Int64(split_i) * Int64(cfg.head_dim_v)
+                        if cutlass.const_expr(output_elements_per_thread == 1):
+                            output_acc[0] += Float32(split_ptr.load()) * scale
+                        else:
+                            partial_o = split_ptr.load(
+                                count=output_elements_per_thread,
+                                alignment=output_elements_per_thread
+                                * cfg.partial_o_dtype_bytes,
+                            ).to(Float32)
+                            for elem_i in cutlass.range_constexpr(
+                                0, output_elements_per_thread, 2
+                            ):
+                                output_acc[elem_i], output_acc[elem_i + 1] = ffma2(
+                                    (partial_o[elem_i], partial_o[elem_i + 1]),
+                                    (scale, scale),
+                                    (output_acc[elem_i], output_acc[elem_i + 1]),
+                                )
 
         output_query_row = public_query_flat_row(
             cfg,
@@ -903,6 +965,9 @@ def run_parallel_gmem_reduction_kernel(
             "final attention output requires single-CTA reduction clusters"
         )
     prims.griddepcontrol(kind=prims.GridDepAction.WAIT)
+    # The next PDL launch may start its prologue now; it waits for this
+    # grid's completion before reading anything this reducer writes.
+    prims.griddepcontrol(kind=prims.GridDepAction.LAUNCH_DEPENDENTS)
 
     # Reuse the CTA's predicate across the statistics barrier instead of
     # reloading metadata. Sparse finalization can have a live extra source.

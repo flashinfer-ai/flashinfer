@@ -1853,6 +1853,8 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
         self.assume_valid_prefix = False
         self.direct_sparse_capacities = (0, 0)
         self.coalesce_keeps_output = False
+        self.use_pdl = False
+        self.pdl_entry_trigger_max_ctas = 0
 
         cfg = self._make_config()
         # Parallel standalone reduction requires a fixed split profile and a
@@ -2046,6 +2048,12 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
             )
         if self.coalesce_keeps_output:
             cfg = dataclass_replace(cfg, coalesce_keeps_output=True)
+        if self.use_pdl:
+            cfg = dataclass_replace(
+                cfg,
+                use_pdl=True,
+                pdl_entry_trigger_max_ctas=self.pdl_entry_trigger_max_ctas,
+            )
         if self.split_kv_capacity is not None and cfg.use_multi_ctas_kv == 1:
             cfg = dataclass_replace(cfg, num_ctas_per_seq_kv=self.split_kv_capacity)
         if not self.fixed_seqlen:
@@ -2557,7 +2565,7 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
             cluster=cluster_shape,
             stream=stream,
             min_blocks_per_mp=1,
-            use_pdl=acc_o is not None,
+            use_pdl=acc_o is not None or cfg.use_pdl,
         )
         if cutlass.const_expr(acc_o is not None):
             if cutlass.const_expr(
@@ -2685,9 +2693,20 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
     ):
         """Execute one flat-Q, batch, KV-split, and V head-dimension tile."""
         cfg = self.runtime_config(max_q_len)
-        if cutlass.const_expr(acc_o is not None):
-            # Match the PDL launch before reading live metadata or sparse scales.
+        if cutlass.const_expr(cfg.use_pdl or acc_o is not None):
+            # A PDL launch can start before the preceding grid completes, so
+            # every input read below (metadata, Q, KV, sinks) waits for it.
             prims.griddepcontrol(kind=prims.GridDepAction.WAIT)
+        if cutlass.const_expr(cfg.use_pdl and cfg.pdl_entry_trigger_max_ctas > 0):
+            # Dependents (the reducer, the next decode) wait for this whole
+            # grid before any read, so a small grid releases them now: their
+            # launch and prologue overlap it instead of following it.
+            pdl_thread_idx, _, _ = cute.arch.thread_idx()
+            grid_x, grid_y, grid_z = cute.arch.grid_dim()
+            if pdl_thread_idx == Int32(0) and grid_x * grid_y * grid_z <= Int32(
+                cfg.pdl_entry_trigger_max_ctas
+            ):
+                prims.griddepcontrol(kind=prims.GridDepAction.LAUNCH_DEPENDENTS)
 
         if cutlass.const_expr(cfg.sparse_direct):
             from ..helpers.sparse_indices import bind_sparse_kv_indices
@@ -2987,10 +3006,11 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
                 cfg.tmem_alloc_cols,
                 group=prims.CTAGroup.CTA_1,
             )
-        if cutlass.const_expr(acc_o is not None):
+        if cutlass.const_expr(acc_o is not None or cfg.use_pdl):
             # Every CTA in the producer grid must release the dependent
-            # reducer, including runtime-padded Q/split CTAs that skipped the
-            # task graph. One elected thread emits the convergent CTA signal.
+            # reducer or next PDL launch, including runtime-padded Q/split CTAs
+            # that skipped the task graph. One elected thread emits the
+            # convergent CTA signal.
             thread_idx, _, _ = cute.arch.thread_idx()
             if thread_idx == Int32(0):
                 prims.griddepcontrol(kind=prims.GridDepAction.LAUNCH_DEPENDENTS)
