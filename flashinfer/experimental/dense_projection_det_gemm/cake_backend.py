@@ -1077,7 +1077,7 @@ def instance_key(
 
 
 def instance_symbol(key: tuple) -> str:
-    """Kernel symbol / registry template of an instance key (``dense_proj_gemm_<a><b>_n<N>``
+    """Kernel symbol / registry template of an instance key (``dense_proj_det_gemm_<a><b>_n<N>``
     followed by ``_m256`` for tall tiles / ``_m64`` for the 64-row Layout-B family, ``_pf<n>`` for a
     prefetch distance, ``_h<a><b>`` for non-default (A, B) eviction hints (first letters, e.g.
     ``_hen`` = A evict_first / B none), ``_f32``, ``_v8`` for the 256-bit fp32 register stores, ``_t``,
@@ -1143,7 +1143,7 @@ def instance_symbol(key: tuple) -> str:
         "default": "d",
     }.get(store_hint, "")
     return (
-        "dense_proj_gemm_"
+        "dense_proj_det_gemm_"
         + ("n" if a_mn else "k")
         + ("n" if b_mn else "k")
         + f"_n{block_n}"
@@ -3091,7 +3091,7 @@ _W8_FIXED = (
     "sk_max_units",
     "sk_parts",
 )
-_TEMPLATE_PREFIX = "dense_proj_gemm_"
+_TEMPLATE_PREFIX = "dense_proj_det_gemm_"
 _HINT_OF_LETTER = {"e": "evict_first", "l": "evict_last", "n": "none"}
 _STORE_HINT_OF_LETTER = {
     "f": "evict_first",
@@ -4342,9 +4342,9 @@ def projection_det_wgrad(
 
 
 def router_symbol(a_mn: bool, b_mn: bool, out_t: bool) -> str:
-    """Kernel symbol / registry template of a router instance (``router_fp32_gemm_<a><b>[_t]``)."""
+    """Kernel symbol / registry template of a router instance (``router_fp32_det_gemm_<a><b>[_t]``)."""
     return (
-        "router_fp32_gemm_"
+        "router_fp32_det_gemm_"
         + ("n" if a_mn else "k")
         + ("n" if b_mn else "k")
         + ("_t" if out_t else "")
@@ -4460,9 +4460,7 @@ def plan_router_fp32_det_gemm(
     if lda % 4 != 0 or A_eff.data_ptr() % 16 != 0:
         raise ValueError("router_fp32_det_gemm: A rows must be 16-byte aligned")
     if B_eff.data_ptr() % 16 != 0:
-        raise ValueError(
-            "router_fp32_det_gemm: B must start at a 16-byte aligned address"
-        )
+        raise ValueError("router_fp32_det_gemm: B must start at a 16-byte aligned address")
     # the kernel's output view: [M_eff, N_eff] row-major, or [N_eff, M_eff] with the transposed store = out
     if out.stride(1) != 1 or out.stride(0) % 4 != 0 or N_eff % 8 != 0:
         raise ValueError(
@@ -4518,7 +4516,7 @@ def split_fp32_to_bf16x3_det_(
 # :func:`split_fp32_to_bf16x3_det_` otherwise -- the same bits either way for finite inputs (a NaN differs in its
 # payload: the program writes the canonical BF16 NaN).  Its launch is ``exe(src, parts, n)`` over
 # ``grid = ceil(n / SPLIT_BLOCK_ELEMS)`` blocks of 256 threads, 8 elements per thread.
-SPLIT_TEMPLATE = "split_fp32_bf16x3"
+SPLIT_TEMPLATE = "split_fp32_det_bf16x3"
 SPLIT_BLOCK_ELEMS = 2048
 _SPLIT_MAX_N = 2**31 - 1  # ``n`` is an int32 launch parameter
 

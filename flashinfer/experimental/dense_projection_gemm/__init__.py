@@ -23,9 +23,7 @@ import sys
 from flashinfer.experimental.dense_projection_det_gemm import *  # noqa: F401,F403
 
 for _name in ("cake_backend", "cake_jit", "cake_build"):
-    _module = importlib.import_module(
-        f"flashinfer.experimental.dense_projection_det_gemm.{_name}"
-    )
+    _module = importlib.import_module(f"flashinfer.experimental.dense_projection_det_gemm.{_name}")
     sys.modules[f"{__name__}.{_name}"] = _module
     globals()[_name] = _module
 del _name, _module
