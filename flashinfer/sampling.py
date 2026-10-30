@@ -1640,8 +1640,14 @@ def _top_k_first_fast_path_applicable(
     # deriving the bound from top_k.max() would add a host sync on every call.
     # Other tensor shapes fall back, which raises ValueError.
     select_k = top_k if isinstance(top_k, int) else top_k_max
+    valid_indices = indices is None or (
+        isinstance(indices, torch.Tensor)
+        and indices.ndim == 1
+        and indices.device == x.device
+        and indices.dtype in (torch.int32, torch.int64)
+    )
     return (
-        indices is None
+        valid_indices
         and (isinstance(top_k, int) or top_k.shape == (x.size(0),))
         and select_k is not None
         and 0 < select_k <= _TOP_K_FIRST_FAST_PATH_MAX_K
@@ -1654,6 +1660,7 @@ def _top_k_first_fast_path(
     x: torch.Tensor,
     top_k: Union[torch.Tensor, int],
     top_p: Union[torch.Tensor, float],
+    indices: Optional[torch.Tensor],
     *,
     top_k_max: Optional[int] = None,
     from_logits: bool,
@@ -1669,8 +1676,9 @@ def _top_k_first_fast_path(
     Selects the top-k entries with the parallel radix/cluster top-k kernel, then runs
     top-p sampling over only those k entries. ``sorted=True`` gives an identical,
     deterministic ordering for both logits and probs inputs, so the two entry points
-    reduce to the same ``probs_k`` and stay sample-aligned. This is distribution-equivalent
-    to the masked full-vocab path (validated TV ~0.01) but far cheaper at small batch.
+    reduce to the same ``probs_k`` and stay sample-aligned. Expanding indexed rows here
+    also keeps the exact-k boundary-tie behavior independent of whether ``indices`` is
+    provided.
 
     A ``top_k`` tensor selects ``top_k_max`` sorted entries, so masking each row past
     its own k leaves exactly its top-k.
@@ -1699,6 +1707,16 @@ def _top_k_first_fast_path(
     else:
         # renormalizing the k retained probabilities == top_k_renorm over the full vocab.
         probs_k = values / values.sum(dim=-1, keepdim=True)
+
+    output_dtype = torch.int32
+    if indices is not None:
+        output_dtype = indices.dtype
+        row_indices = indices.long()
+        probs_k = probs_k.index_select(0, row_indices)
+        gathered_indices = gathered_indices.index_select(0, row_indices)
+        if isinstance(top_p, torch.Tensor):
+            top_p = top_p.index_select(0, row_indices)
+
     result = top_p_sampling_from_probs(
         probs_k,
         top_p,
@@ -1715,7 +1733,7 @@ def _top_k_first_fast_path(
         return (
             gathered_indices.gather(1, local.view(-1, 1).long())
             .squeeze(1)
-            .to(torch.int32)
+            .to(output_dtype)
         )
 
     if return_valid:
@@ -1860,6 +1878,7 @@ def top_k_top_p_sampling_from_logits(
                 logits,
                 top_k,
                 top_p,
+                indices,
                 top_k_max=top_k_max,
                 from_logits=True,
                 deterministic=deterministic,
@@ -2039,6 +2058,7 @@ def top_k_top_p_sampling_from_probs(
                 probs,
                 top_k,
                 top_p,
+                indices,
                 top_k_max=top_k_max,
                 from_logits=False,
                 deterministic=deterministic,
