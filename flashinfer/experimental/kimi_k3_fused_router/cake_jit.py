@@ -95,8 +95,8 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 4352,
         },
         "closure_sha256": {
-            "sm_100a": "d38abd16d11d9e2778868d23f4093472f4cd06f854b9f174ef79c04b335050dd",
-            "sm_103a": "66a7b86d94c904ca00f3ea994542a4262c151739f19f0cd189ceb0b1d42cb6ad",
+            "sm_100a": "9a6a45bd1325755c8aa0900295e52dcec6c758239f35cbca2e6367923f76209d",
+            "sm_103a": "e102766796fceebc25512769c7871764778f2d6622c4f34063a2f7bc920a3863",
         },
         "kernel_symbol": "kernel_cake_kimi_k3_fused_router_27a24128e0b7468b7878",
     },
@@ -133,7 +133,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 20224,
         },
         "closure_sha256": {
-            "sm_103a": "2faf83f5ff3a77897d8bf43fadecfabf206fc18a152d7839c8b3d8445963f53d",
+            "sm_103a": "25f77f623cc22b0fedcbe87f853fe4b2ae221823509f95cfb8685db1244702ba",
         },
         "kernel_symbol": "kernel_cake_kimi_k3_fused_router_3cf5cafee3b503734ab4",
     },
@@ -170,7 +170,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 12288,
         },
         "closure_sha256": {
-            "sm_100a": "93a546e6ae67697edeec65f26811ca89bf514bafd90fac31eb7144a5a713367f",
+            "sm_100a": "4f6d8f206c81a32774cbfbc5a489ef61e51345808051c353ddf29427a5f0a34f",
         },
         "kernel_symbol": "kernel_cake_kimi_k3_fused_router_49a2f49970db28d2d0b3",
     },
@@ -207,9 +207,46 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 44032,
         },
         "closure_sha256": {
-            "sm_100a": "9dde02040f4eb25392c0efe707067c5fd11917164f9b857dafe5136abee83278",
+            "sm_100a": "c590c857d05cc62feba1334bf1a6920e38f76589d2b8e172083bc30c707f1de8",
         },
         "kernel_symbol": "kernel_cake_kimi_k3_fused_router_544948d65e43d405cb26",
+    },
+    "cake_kimi_k3_fused_router_55d217eef88b4aff9f1c": {
+        "arm": "LC2_CW",
+        "num_tokens": None,
+        "arches": ["sm_100a"],
+        "sources": [
+            "cake_kimi_k3_fused_router/cake_kimi_k3_fused_router_55d217eef88b4aff9f1c_kernel.cu",
+            "cake_kimi_k3_fused_router/cake_kimi_k3_fused_router_55d217eef88b4aff9f1c_binding.cu",
+        ],
+        "compile_flags": [],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["buffer", "logits"],
+            ["buffer", "bias"],
+            ["buffer", "topk_weights"],
+            ["buffer", "topk_ids"],
+            ["buffer", "sorted_token_ids"],
+            ["buffer", "expert_ids"],
+            ["buffer", "num_tokens_post_padded"],
+            ["buffer", "expert_counts"],
+            ["buffer", "expert_offsets"],
+            ["buffer", "expert_scatter_offsets"],
+            ["parameter", "M"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "launch": {
+            "block": [224, 1, 1],
+            "cluster": [2, 1, 1],
+            "cooperative": False,
+            "dynamic_smem_bytes": 20864,
+        },
+        "closure_sha256": {
+            "sm_100a": "0692dddf04ee4ee3e97b5e039d24ac03d822061e67447a19d524850b60b6c6b3",
+        },
+        "kernel_symbol": "kernel_cake_kimi_k3_fused_router_55d217eef88b4aff9f1c",
     },
     "cake_kimi_k3_fused_router_76a711ed994e53632512": {
         "arm": "LPC",
@@ -244,7 +281,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 44032,
         },
         "closure_sha256": {
-            "sm_100a": "ec1f4a23c3321b4b308b48e9888fac0a808eb0d14b4b1527e3145877a6cb4e17",
+            "sm_100a": "08f74b8b9ac2424a3f3840e8e1cdd9d4a9402c1b72dd951778c34662c7b9b3d5",
         },
         "kernel_symbol": "kernel_cake_kimi_k3_fused_router_76a711ed994e53632512",
     },
@@ -281,19 +318,57 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 52480,
         },
         "closure_sha256": {
-            "sm_100a": "c49c480ed188531b3d0885b64c03a57d4c39d6a7656619a7febb5bdf9cd29932",
-            "sm_103a": "582e0828b73d68cd45d3004b4286ecbf861dc5cee33487fd7078dfdd69d45d8d",
+            "sm_100a": "fcd223846d78989d4e41e58fe61a1268a39cffaa2f9f93f031a1e7c9a137dc0e",
+            "sm_103a": "1e4304b61b1a840a5a72ff01ea013d57840d5ce217b05c088c4ae75fcee72cc6",
         },
         "kernel_symbol": "kernel_cake_kimi_k3_fused_router_928282f63b3f103002d5",
         "kernel_declaration": 'extern "C" __global__ void kernel_cake_kimi_k3_fused_router_928282f63b3f103002d5(float* __restrict__ logits, float* __restrict__ bias, float* __restrict__ topk_weights, int* __restrict__ topk_ids, int* __restrict__ sorted_token_ids, int* __restrict__ expert_ids, int* __restrict__ num_tokens_post_padded, int* __restrict__ expert_counts, int* __restrict__ expert_offsets, int* __restrict__ expert_scatter_offsets, int M);',
     },
-    "cake_kimi_k3_fused_router_c7f56e5fdc79e10cd475": {
+    "cake_kimi_k3_fused_router_931b47f83cb304759ea0": {
+        "arm": "Q4S_E16",
+        "num_tokens": None,
+        "arches": ["sm_100a"],
+        "sources": [
+            "cake_kimi_k3_fused_router/cake_kimi_k3_fused_router_931b47f83cb304759ea0_kernel.cu",
+            "cake_kimi_k3_fused_router/cake_kimi_k3_fused_router_931b47f83cb304759ea0_binding.cu",
+        ],
+        "compile_flags": [],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["buffer", "logits"],
+            ["buffer", "bias"],
+            ["buffer", "topk_weights"],
+            ["buffer", "topk_ids"],
+            ["buffer", "sorted_token_ids"],
+            ["buffer", "expert_ids"],
+            ["buffer", "num_tokens_post_padded"],
+            ["buffer", "expert_counts"],
+            ["buffer", "expert_offsets"],
+            ["buffer", "expert_scatter_offsets"],
+            ["parameter", "M"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "launch": {
+            "block": [224, 1, 1],
+            "cluster": [4, 1, 1],
+            "cooperative": True,
+            "dynamic_smem_bytes": 54912,
+        },
+        "closure_sha256": {
+            "sm_100a": "db3fd3ff9a8e81c9c1a489d97165c5db5d428790f54b07f5dabcbb1f418407cb",
+        },
+        "kernel_symbol": "kernel_cake_kimi_k3_fused_router_931b47f83cb304759ea0",
+        "kernel_declaration": 'extern "C" __global__ void kernel_cake_kimi_k3_fused_router_931b47f83cb304759ea0(float* __restrict__ logits, float* __restrict__ bias, float* __restrict__ topk_weights, int* __restrict__ topk_ids, int* __restrict__ sorted_token_ids, int* __restrict__ expert_ids, int* __restrict__ num_tokens_post_padded, int* __restrict__ expert_counts, int* __restrict__ expert_offsets, int* __restrict__ expert_scatter_offsets, int M);',
+    },
+    "cake_kimi_k3_fused_router_a140805ed9d697427fbe": {
         "arm": "GW",
         "num_tokens": None,
         "arches": ["sm_100a"],
         "sources": [
-            "cake_kimi_k3_fused_router/cake_kimi_k3_fused_router_c7f56e5fdc79e10cd475_kernel.cu",
-            "cake_kimi_k3_fused_router/cake_kimi_k3_fused_router_c7f56e5fdc79e10cd475_binding.cu",
+            "cake_kimi_k3_fused_router/cake_kimi_k3_fused_router_a140805ed9d697427fbe_kernel.cu",
+            "cake_kimi_k3_fused_router/cake_kimi_k3_fused_router_a140805ed9d697427fbe_binding.cu",
         ],
         "compile_flags": [],
         "ffi_entry": "run",
@@ -320,18 +395,56 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 39424,
         },
         "closure_sha256": {
-            "sm_100a": "0db744005a03a7acf4f7c96e7237022c2ae795866cbb8564d88ab775b0af30c6",
+            "sm_100a": "3547f26b30924d929a04417331450707e31514e84acd59cb39b2c2fd029ca676",
         },
-        "kernel_symbol": "kernel_cake_kimi_k3_fused_router_c7f56e5fdc79e10cd475",
-        "kernel_declaration": 'extern "C" __global__ void kernel_cake_kimi_k3_fused_router_c7f56e5fdc79e10cd475(float* __restrict__ logits, float* __restrict__ bias, float* __restrict__ topk_weights, int* __restrict__ topk_ids, int* __restrict__ sorted_token_ids, int* __restrict__ expert_ids, int* __restrict__ num_tokens_post_padded, int* __restrict__ expert_counts, int* __restrict__ expert_offsets, int* __restrict__ expert_scatter_offsets, int M);',
+        "kernel_symbol": "kernel_cake_kimi_k3_fused_router_a140805ed9d697427fbe",
+        "kernel_declaration": 'extern "C" __global__ void kernel_cake_kimi_k3_fused_router_a140805ed9d697427fbe(float* __restrict__ logits, float* __restrict__ bias, float* __restrict__ topk_weights, int* __restrict__ topk_ids, int* __restrict__ sorted_token_ids, int* __restrict__ expert_ids, int* __restrict__ num_tokens_post_padded, int* __restrict__ expert_counts, int* __restrict__ expert_offsets, int* __restrict__ expert_scatter_offsets, int M);',
     },
-    "cake_kimi_k3_fused_router_e75d6bd1e0bd6c346f3e": {
-        "arm": "Q4SPW",
+    "cake_kimi_k3_fused_router_c89373c1750ff2694e0a": {
+        "arm": "Q4SB_LBW",
+        "num_tokens": None,
+        "arches": ["sm_100a"],
+        "sources": [
+            "cake_kimi_k3_fused_router/cake_kimi_k3_fused_router_c89373c1750ff2694e0a_kernel.cu",
+            "cake_kimi_k3_fused_router/cake_kimi_k3_fused_router_c89373c1750ff2694e0a_binding.cu",
+        ],
+        "compile_flags": [],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["buffer", "logits"],
+            ["buffer", "bias"],
+            ["buffer", "topk_weights"],
+            ["buffer", "topk_ids"],
+            ["buffer", "sorted_token_ids"],
+            ["buffer", "expert_ids"],
+            ["buffer", "num_tokens_post_padded"],
+            ["buffer", "expert_counts"],
+            ["buffer", "expert_offsets"],
+            ["buffer", "expert_scatter_offsets"],
+            ["parameter", "M"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "launch": {
+            "block": [224, 1, 1],
+            "cluster": [4, 1, 1],
+            "cooperative": True,
+            "dynamic_smem_bytes": 54784,
+        },
+        "closure_sha256": {
+            "sm_100a": "02d7e812281ff23c13dd366c94b42a5126992a15675932770894733749e3e5a9",
+        },
+        "kernel_symbol": "kernel_cake_kimi_k3_fused_router_c89373c1750ff2694e0a",
+        "kernel_declaration": 'extern "C" __global__ void kernel_cake_kimi_k3_fused_router_c89373c1750ff2694e0a(float* __restrict__ logits, float* __restrict__ bias, float* __restrict__ topk_weights, int* __restrict__ topk_ids, int* __restrict__ sorted_token_ids, int* __restrict__ expert_ids, int* __restrict__ num_tokens_post_padded, int* __restrict__ expert_counts, int* __restrict__ expert_offsets, int* __restrict__ expert_scatter_offsets, int M);',
+    },
+    "cake_kimi_k3_fused_router_cbfd3716ea36b0dff5eb": {
+        "arm": "Q4SP_LR",
         "num_tokens": None,
         "arches": ["sm_100a", "sm_103a"],
         "sources": [
-            "cake_kimi_k3_fused_router/cake_kimi_k3_fused_router_e75d6bd1e0bd6c346f3e_kernel.cu",
-            "cake_kimi_k3_fused_router/cake_kimi_k3_fused_router_e75d6bd1e0bd6c346f3e_binding.cu",
+            "cake_kimi_k3_fused_router/cake_kimi_k3_fused_router_cbfd3716ea36b0dff5eb_kernel.cu",
+            "cake_kimi_k3_fused_router/cake_kimi_k3_fused_router_cbfd3716ea36b0dff5eb_binding.cu",
         ],
         "compile_flags": [],
         "ffi_entry": "run",
@@ -358,11 +471,127 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 52480,
         },
         "closure_sha256": {
-            "sm_100a": "b952d28e5c222216dfeabe27cb67c8911c5da0f856a9b894f0c0733eb46c4645",
-            "sm_103a": "06edf1d54dae19bc4c1fcbce6fcaf6d99e49afdb56e14e117d855e651ee974b4",
+            "sm_100a": "a385b77008d3affb13659fabf828bc63d55413b949572efb523fe5ab86eaaa21",
+            "sm_103a": "ca4f8ffbf90919febb688183c8491c99f8a8a0a10b6d3906b04528fafb159795",
         },
-        "kernel_symbol": "kernel_cake_kimi_k3_fused_router_e75d6bd1e0bd6c346f3e",
-        "kernel_declaration": 'extern "C" __global__ void kernel_cake_kimi_k3_fused_router_e75d6bd1e0bd6c346f3e(float* __restrict__ logits, float* __restrict__ bias, float* __restrict__ topk_weights, int* __restrict__ topk_ids, int* __restrict__ sorted_token_ids, int* __restrict__ expert_ids, int* __restrict__ num_tokens_post_padded, int* __restrict__ expert_counts, int* __restrict__ expert_offsets, int* __restrict__ expert_scatter_offsets, int M);',
+        "kernel_symbol": "kernel_cake_kimi_k3_fused_router_cbfd3716ea36b0dff5eb",
+        "kernel_declaration": 'extern "C" __global__ void kernel_cake_kimi_k3_fused_router_cbfd3716ea36b0dff5eb(float* __restrict__ logits, float* __restrict__ bias, float* __restrict__ topk_weights, int* __restrict__ topk_ids, int* __restrict__ sorted_token_ids, int* __restrict__ expert_ids, int* __restrict__ num_tokens_post_padded, int* __restrict__ expert_counts, int* __restrict__ expert_offsets, int* __restrict__ expert_scatter_offsets, int M);',
+    },
+    "cake_kimi_k3_fused_router_dfea2e009bc99071b6f6": {
+        "arm": "LCG_LW",
+        "num_tokens": None,
+        "arches": ["sm_100a", "sm_103a"],
+        "sources": [
+            "cake_kimi_k3_fused_router/cake_kimi_k3_fused_router_dfea2e009bc99071b6f6_kernel.cu",
+            "cake_kimi_k3_fused_router/cake_kimi_k3_fused_router_dfea2e009bc99071b6f6_binding.cu",
+        ],
+        "compile_flags": [],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["buffer", "logits"],
+            ["buffer", "bias"],
+            ["buffer", "topk_weights"],
+            ["buffer", "topk_ids"],
+            ["buffer", "sorted_token_ids"],
+            ["buffer", "expert_ids"],
+            ["buffer", "num_tokens_post_padded"],
+            ["buffer", "expert_counts"],
+            ["buffer", "expert_offsets"],
+            ["buffer", "expert_scatter_offsets"],
+            ["parameter", "M"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "launch": {
+            "block": [448, 1, 1],
+            "cluster": [16, 1, 1],
+            "cooperative": False,
+            "dynamic_smem_bytes": 15616,
+        },
+        "closure_sha256": {
+            "sm_100a": "593d3206949d9f15f851c522b45a9b9fcc041a0310e9b07128114d6b13b34b95",
+            "sm_103a": "876d47c1a3c9ddc5863ff1ca526aae781a7ab02ea3e836b2736cfff76b958975",
+        },
+        "kernel_symbol": "kernel_cake_kimi_k3_fused_router_dfea2e009bc99071b6f6",
+        "kernel_declaration": 'extern "C" __global__ void kernel_cake_kimi_k3_fused_router_dfea2e009bc99071b6f6(float* __restrict__ logits, float* __restrict__ bias, float* __restrict__ topk_weights, int* __restrict__ topk_ids, int* __restrict__ sorted_token_ids, int* __restrict__ expert_ids, int* __restrict__ num_tokens_post_padded, int* __restrict__ expert_counts, int* __restrict__ expert_offsets, int* __restrict__ expert_scatter_offsets, int M);',
+    },
+    "cake_kimi_k3_fused_router_e8686a2a21d7b4710273": {
+        "arm": "Q4S",
+        "num_tokens": None,
+        "arches": ["sm_100a", "sm_103a"],
+        "sources": [
+            "cake_kimi_k3_fused_router/cake_kimi_k3_fused_router_e8686a2a21d7b4710273_kernel.cu",
+            "cake_kimi_k3_fused_router/cake_kimi_k3_fused_router_e8686a2a21d7b4710273_binding.cu",
+        ],
+        "compile_flags": [],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["buffer", "logits"],
+            ["buffer", "bias"],
+            ["buffer", "topk_weights"],
+            ["buffer", "topk_ids"],
+            ["buffer", "sorted_token_ids"],
+            ["buffer", "expert_ids"],
+            ["buffer", "num_tokens_post_padded"],
+            ["buffer", "expert_counts"],
+            ["buffer", "expert_offsets"],
+            ["buffer", "expert_scatter_offsets"],
+            ["parameter", "M"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "launch": {
+            "block": [224, 1, 1],
+            "cluster": [4, 1, 1],
+            "cooperative": True,
+            "dynamic_smem_bytes": 54784,
+        },
+        "closure_sha256": {
+            "sm_100a": "e3e4c36ba16ba6a47248fec638a9cd043922a2be0cfd5d681d881ff82537ca98",
+            "sm_103a": "d1ea1d2bbcb23786bffb752a17aa476981078991aa63e9835dc05d4495f496df",
+        },
+        "kernel_symbol": "kernel_cake_kimi_k3_fused_router_e8686a2a21d7b4710273",
+        "kernel_declaration": 'extern "C" __global__ void kernel_cake_kimi_k3_fused_router_e8686a2a21d7b4710273(float* __restrict__ logits, float* __restrict__ bias, float* __restrict__ topk_weights, int* __restrict__ topk_ids, int* __restrict__ sorted_token_ids, int* __restrict__ expert_ids, int* __restrict__ num_tokens_post_padded, int* __restrict__ expert_counts, int* __restrict__ expert_offsets, int* __restrict__ expert_scatter_offsets, int M);',
+    },
+    "cake_kimi_k3_fused_router_eee55555fba0d777d754": {
+        "arm": "LCG_LW_OWN",
+        "num_tokens": None,
+        "arches": ["sm_100a"],
+        "sources": [
+            "cake_kimi_k3_fused_router/cake_kimi_k3_fused_router_eee55555fba0d777d754_kernel.cu",
+            "cake_kimi_k3_fused_router/cake_kimi_k3_fused_router_eee55555fba0d777d754_binding.cu",
+        ],
+        "compile_flags": [],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["buffer", "logits"],
+            ["buffer", "bias"],
+            ["buffer", "topk_weights"],
+            ["buffer", "topk_ids"],
+            ["buffer", "sorted_token_ids"],
+            ["buffer", "expert_ids"],
+            ["buffer", "num_tokens_post_padded"],
+            ["buffer", "expert_counts"],
+            ["buffer", "expert_offsets"],
+            ["buffer", "expert_scatter_offsets"],
+            ["parameter", "M"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "launch": {
+            "block": [448, 1, 1],
+            "cluster": [16, 1, 1],
+            "cooperative": False,
+            "dynamic_smem_bytes": 15616,
+        },
+        "closure_sha256": {
+            "sm_100a": "bfbe19156877f1a31a06b363a564c84bc7ceba39efb1822ff1c138a995c56361",
+        },
+        "kernel_symbol": "kernel_cake_kimi_k3_fused_router_eee55555fba0d777d754",
+        "kernel_declaration": 'extern "C" __global__ void kernel_cake_kimi_k3_fused_router_eee55555fba0d777d754(float* __restrict__ logits, float* __restrict__ bias, float* __restrict__ topk_weights, int* __restrict__ topk_ids, int* __restrict__ sorted_token_ids, int* __restrict__ expert_ids, int* __restrict__ num_tokens_post_padded, int* __restrict__ expert_counts, int* __restrict__ expert_offsets, int* __restrict__ expert_scatter_offsets, int M);',
     },
     "cake_kimi_k3_fused_router_9701331ccf9b00bc5af8": {
         "arm": "LC",
@@ -397,8 +626,8 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 20864,
         },
         "closure_sha256": {
-            "sm_100a": "132a6617712169d06922de07ed1e271762a9824043886e85a272daa340607967",
-            "sm_103a": "6c9215781eb1269f2278873ae19524c11c00c7029e1e1269388963d29aa8933f",
+            "sm_100a": "cf29a497ab53ce6828c74fceac941f536763f4493f60480e5db59e3712684da0",
+            "sm_103a": "72d7283e0c4b7cf7d3c75416648db21df4867991c0199eea402d969f9479576f",
         },
         "kernel_symbol": "kernel_cake_kimi_k3_fused_router_9701331ccf9b00bc5af8",
     },
@@ -435,8 +664,8 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 20864,
         },
         "closure_sha256": {
-            "sm_100a": "baf2167dec00f26a8a6c909353af29bd06a1862e19e1647f81047fb96e2cea53",
-            "sm_103a": "427fe217a94e91ae7933f260adcc2d8777ccafb9857e01fccf340ef057aa4411",
+            "sm_100a": "19fc847b4bcadb82476558402985cc993bfc6ee0141fe4e28935a09969b31cd5",
+            "sm_103a": "bdde23f0a2cc4346fdcb344b70099cea9c84c10d44cc4438af91b734aebe88df",
         },
         "kernel_symbol": "kernel_cake_kimi_k3_fused_router_ad9f02f1f70dd3c957ee",
     },
@@ -473,8 +702,8 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 20864,
         },
         "closure_sha256": {
-            "sm_100a": "a483a5126da3ec68c0a92b13a3d3e4196b10bab688aba08ce61b9a5a61de2c74",
-            "sm_103a": "8814d8f83e448b21e4a17f602e37b9b6d35017898aa0829e4efe56edcdb5fa7d",
+            "sm_100a": "ee0f98db631e7e326d259474f0c5bb8726876e714635c9a34cc98685f6875c02",
+            "sm_103a": "b18c505c584885527833e7db70d1d5e3b7e855943b8beb1a7cb8a7a9c01ec068",
         },
         "kernel_symbol": "kernel_cake_kimi_k3_fused_router_aea2ff5129b7b6374e5a",
     },
@@ -511,7 +740,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 44032,
         },
         "closure_sha256": {
-            "sm_103a": "f667eae265da5a6e68d3bb657872b6f89514094adfd00d6c2cae238443504e12",
+            "sm_103a": "f4161686325845fdd0599a6720ad35c14e4485958e48f20b3a432061fd696083",
         },
         "kernel_symbol": "kernel_cake_kimi_k3_fused_router_dbbf369cba14eb162f2d",
     },
@@ -548,9 +777,47 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 44032,
         },
         "closure_sha256": {
-            "sm_103a": "37546e9afef7f24724ac37734fb47ba5d9c8fb3294fc96f956c35abc86cdfa6e",
+            "sm_103a": "023ff65f6b20235fa5116dc60ab5ab27455e01ab591c591ebeeae0b416116214",
         },
         "kernel_symbol": "kernel_cake_kimi_k3_fused_router_ed9f4ad5513af55af382",
+    },
+    "cake_kimi_k3_fused_router_0b365c12c38f335f62bc": {
+        "arm": "LC1_NC",
+        "num_tokens": None,
+        "arches": ["sm_100a", "sm_103a"],
+        "sources": [
+            "cake_kimi_k3_fused_router/cake_kimi_k3_fused_router_0b365c12c38f335f62bc_kernel.cu",
+            "cake_kimi_k3_fused_router/cake_kimi_k3_fused_router_0b365c12c38f335f62bc_binding.cu",
+        ],
+        "compile_flags": [],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["buffer", "logits"],
+            ["buffer", "bias"],
+            ["buffer", "topk_weights"],
+            ["buffer", "topk_ids"],
+            ["buffer", "sorted_token_ids"],
+            ["buffer", "expert_ids"],
+            ["buffer", "num_tokens_post_padded"],
+            ["buffer", "expert_counts"],
+            ["buffer", "expert_offsets"],
+            ["buffer", "expert_scatter_offsets"],
+            ["parameter", "M"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "launch": {
+            "block": [224, 1, 1],
+            "cluster": [1, 1, 1],
+            "cooperative": False,
+            "dynamic_smem_bytes": 4352,
+        },
+        "closure_sha256": {
+            "sm_100a": "24a04e26eb4086bad1a3d8da3ad2339d83e0e574010f09bb4f0a164475e86c63",
+            "sm_103a": "c78989c7c995fe5e02cc5c136a86d385f8ab6f2d27d11f608b0ad5caee4eb3a5",
+        },
+        "kernel_symbol": "kernel_cake_kimi_k3_fused_router_0b365c12c38f335f62bc",
     },
     "cake_kimi_k3_fused_router_006a7ad397982e4faa88": {
         "arm": "LC",
@@ -585,19 +852,57 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 20864,
         },
         "closure_sha256": {
-            "sm_100a": "c11932a5ad919ada9e46ca054275803fbe04270cd5c5db0b19491fde4a20487f",
-            "sm_103a": "bf48a2cdd6a8ad20a303c7071f6e5d87b21cdfa779a499d9d12a2fc08e2fcefb",
+            "sm_100a": "0f46f58b8e285dc128333f88cd25e1c60486a498d1f1add8279c2d26db9dab1c",
+            "sm_103a": "01d18cffa4accd66af93d32de33becb0aa377a0b8b59d40bc5281c4d8604e264",
         },
         "kernel_symbol": "kernel_cake_kimi_k3_fused_router_006a7ad397982e4faa88",
         "kernel_declaration": 'extern "C" __global__ void kernel_cake_kimi_k3_fused_router_006a7ad397982e4faa88(float* __restrict__ logits, float* __restrict__ bias, float* __restrict__ topk_weights, int* __restrict__ topk_ids, int* __restrict__ sorted_token_ids, int* __restrict__ expert_ids, int* __restrict__ num_tokens_post_padded, int* __restrict__ expert_counts, int* __restrict__ expert_offsets, int* __restrict__ expert_scatter_offsets, int M);',
     },
-    "cake_kimi_k3_fused_router_0b07dab512c544121f4e": {
+    "cake_kimi_k3_fused_router_0bc1c0ce923587bb3ad9": {
+        "arm": "Q4SP_PG",
+        "num_tokens": None,
+        "arches": ["sm_100a"],
+        "sources": [
+            "cake_kimi_k3_fused_router/cake_kimi_k3_fused_router_0bc1c0ce923587bb3ad9_kernel.cu",
+            "cake_kimi_k3_fused_router/cake_kimi_k3_fused_router_0bc1c0ce923587bb3ad9_binding.cu",
+        ],
+        "compile_flags": [],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["buffer", "logits"],
+            ["buffer", "bias"],
+            ["buffer", "topk_weights"],
+            ["buffer", "topk_ids"],
+            ["buffer", "sorted_token_ids"],
+            ["buffer", "expert_ids"],
+            ["buffer", "num_tokens_post_padded"],
+            ["buffer", "expert_counts"],
+            ["buffer", "expert_offsets"],
+            ["buffer", "expert_scatter_offsets"],
+            ["parameter", "M"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "launch": {
+            "block": [224, 1, 1],
+            "cluster": [4, 1, 1],
+            "cooperative": True,
+            "dynamic_smem_bytes": 52480,
+        },
+        "closure_sha256": {
+            "sm_100a": "05768b6618092a47726c40184d7f758cc0b901bdfb55e2f3e53da721798a64b7",
+        },
+        "kernel_symbol": "kernel_cake_kimi_k3_fused_router_0bc1c0ce923587bb3ad9",
+        "kernel_declaration": 'extern "C" __global__ void kernel_cake_kimi_k3_fused_router_0bc1c0ce923587bb3ad9(float* __restrict__ logits, float* __restrict__ bias, float* __restrict__ topk_weights, int* __restrict__ topk_ids, int* __restrict__ sorted_token_ids, int* __restrict__ expert_ids, int* __restrict__ num_tokens_post_padded, int* __restrict__ expert_counts, int* __restrict__ expert_offsets, int* __restrict__ expert_scatter_offsets, int M);',
+    },
+    "cake_kimi_k3_fused_router_24bb36fa531aa80ef560": {
         "arm": "GW",
         "num_tokens": None,
         "arches": ["sm_103a"],
         "sources": [
-            "cake_kimi_k3_fused_router/cake_kimi_k3_fused_router_0b07dab512c544121f4e_kernel.cu",
-            "cake_kimi_k3_fused_router/cake_kimi_k3_fused_router_0b07dab512c544121f4e_binding.cu",
+            "cake_kimi_k3_fused_router/cake_kimi_k3_fused_router_24bb36fa531aa80ef560_kernel.cu",
+            "cake_kimi_k3_fused_router/cake_kimi_k3_fused_router_24bb36fa531aa80ef560_binding.cu",
         ],
         "compile_flags": [],
         "ffi_entry": "run",
@@ -624,10 +929,126 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 39424,
         },
         "closure_sha256": {
-            "sm_103a": "a11f667ed36b850404598007a8a12d62f501dfd6ac6a7fd2c820ba077638eff8",
+            "sm_103a": "596396a1bf58270399731c8c31a44d8b77f25ec6061f8e28889caa64c03c4ee8",
         },
-        "kernel_symbol": "kernel_cake_kimi_k3_fused_router_0b07dab512c544121f4e",
-        "kernel_declaration": 'extern "C" __global__ void kernel_cake_kimi_k3_fused_router_0b07dab512c544121f4e(float* __restrict__ logits, float* __restrict__ bias, float* __restrict__ topk_weights, int* __restrict__ topk_ids, int* __restrict__ sorted_token_ids, int* __restrict__ expert_ids, int* __restrict__ num_tokens_post_padded, int* __restrict__ expert_counts, int* __restrict__ expert_offsets, int* __restrict__ expert_scatter_offsets, int M);',
+        "kernel_symbol": "kernel_cake_kimi_k3_fused_router_24bb36fa531aa80ef560",
+        "kernel_declaration": 'extern "C" __global__ void kernel_cake_kimi_k3_fused_router_24bb36fa531aa80ef560(float* __restrict__ logits, float* __restrict__ bias, float* __restrict__ topk_weights, int* __restrict__ topk_ids, int* __restrict__ sorted_token_ids, int* __restrict__ expert_ids, int* __restrict__ num_tokens_post_padded, int* __restrict__ expert_counts, int* __restrict__ expert_offsets, int* __restrict__ expert_scatter_offsets, int M);',
+    },
+    "cake_kimi_k3_fused_router_3c9ca003ed9fca78bdd1": {
+        "arm": "Q4S_E16",
+        "num_tokens": None,
+        "arches": ["sm_103a"],
+        "sources": [
+            "cake_kimi_k3_fused_router/cake_kimi_k3_fused_router_3c9ca003ed9fca78bdd1_kernel.cu",
+            "cake_kimi_k3_fused_router/cake_kimi_k3_fused_router_3c9ca003ed9fca78bdd1_binding.cu",
+        ],
+        "compile_flags": [],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["buffer", "logits"],
+            ["buffer", "bias"],
+            ["buffer", "topk_weights"],
+            ["buffer", "topk_ids"],
+            ["buffer", "sorted_token_ids"],
+            ["buffer", "expert_ids"],
+            ["buffer", "num_tokens_post_padded"],
+            ["buffer", "expert_counts"],
+            ["buffer", "expert_offsets"],
+            ["buffer", "expert_scatter_offsets"],
+            ["parameter", "M"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "launch": {
+            "block": [224, 1, 1],
+            "cluster": [4, 1, 1],
+            "cooperative": True,
+            "dynamic_smem_bytes": 54784,
+        },
+        "closure_sha256": {
+            "sm_103a": "f9f804f40b06bd13de014cff729d1d323788aec7b7e5bc0f976e30fbf5385ad4",
+        },
+        "kernel_symbol": "kernel_cake_kimi_k3_fused_router_3c9ca003ed9fca78bdd1",
+        "kernel_declaration": 'extern "C" __global__ void kernel_cake_kimi_k3_fused_router_3c9ca003ed9fca78bdd1(float* __restrict__ logits, float* __restrict__ bias, float* __restrict__ topk_weights, int* __restrict__ topk_ids, int* __restrict__ sorted_token_ids, int* __restrict__ expert_ids, int* __restrict__ num_tokens_post_padded, int* __restrict__ expert_counts, int* __restrict__ expert_offsets, int* __restrict__ expert_scatter_offsets, int M);',
+    },
+    "cake_kimi_k3_fused_router_5a55b899e30d5b57a88f": {
+        "arm": "Q4SPW_LR",
+        "num_tokens": None,
+        "arches": ["sm_100a", "sm_103a"],
+        "sources": [
+            "cake_kimi_k3_fused_router/cake_kimi_k3_fused_router_5a55b899e30d5b57a88f_kernel.cu",
+            "cake_kimi_k3_fused_router/cake_kimi_k3_fused_router_5a55b899e30d5b57a88f_binding.cu",
+        ],
+        "compile_flags": [],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["buffer", "logits"],
+            ["buffer", "bias"],
+            ["buffer", "topk_weights"],
+            ["buffer", "topk_ids"],
+            ["buffer", "sorted_token_ids"],
+            ["buffer", "expert_ids"],
+            ["buffer", "num_tokens_post_padded"],
+            ["buffer", "expert_counts"],
+            ["buffer", "expert_offsets"],
+            ["buffer", "expert_scatter_offsets"],
+            ["parameter", "M"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "launch": {
+            "block": [224, 1, 1],
+            "cluster": [4, 1, 1],
+            "cooperative": True,
+            "dynamic_smem_bytes": 52480,
+        },
+        "closure_sha256": {
+            "sm_100a": "28c6d70b337fcc85e052fa576ebd64010bee4f3742ea36f491db8b01e54ee87e",
+            "sm_103a": "011fd8a0c2a4a5de0fd2dd10c0eec9fc0cf94f8c720fc8698e66ec38d9ccd2d5",
+        },
+        "kernel_symbol": "kernel_cake_kimi_k3_fused_router_5a55b899e30d5b57a88f",
+        "kernel_declaration": 'extern "C" __global__ void kernel_cake_kimi_k3_fused_router_5a55b899e30d5b57a88f(float* __restrict__ logits, float* __restrict__ bias, float* __restrict__ topk_weights, int* __restrict__ topk_ids, int* __restrict__ sorted_token_ids, int* __restrict__ expert_ids, int* __restrict__ num_tokens_post_padded, int* __restrict__ expert_counts, int* __restrict__ expert_offsets, int* __restrict__ expert_scatter_offsets, int M);',
+    },
+    "cake_kimi_k3_fused_router_5fa5ab22671e592fcb3b": {
+        "arm": "Q4SB",
+        "num_tokens": None,
+        "arches": ["sm_100a", "sm_103a"],
+        "sources": [
+            "cake_kimi_k3_fused_router/cake_kimi_k3_fused_router_5fa5ab22671e592fcb3b_kernel.cu",
+            "cake_kimi_k3_fused_router/cake_kimi_k3_fused_router_5fa5ab22671e592fcb3b_binding.cu",
+        ],
+        "compile_flags": [],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["buffer", "logits"],
+            ["buffer", "bias"],
+            ["buffer", "topk_weights"],
+            ["buffer", "topk_ids"],
+            ["buffer", "sorted_token_ids"],
+            ["buffer", "expert_ids"],
+            ["buffer", "num_tokens_post_padded"],
+            ["buffer", "expert_counts"],
+            ["buffer", "expert_offsets"],
+            ["buffer", "expert_scatter_offsets"],
+            ["parameter", "M"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "launch": {
+            "block": [224, 1, 1],
+            "cluster": [4, 1, 1],
+            "cooperative": True,
+            "dynamic_smem_bytes": 54784,
+        },
+        "closure_sha256": {
+            "sm_100a": "6da4d6372e88d99a81cecaa623db705febce336c852abe209fc9e342531aecfe",
+            "sm_103a": "c641c54cf1dfc624fc3b3377e86be4e14d4e35b1e95a272bcee1ff604595cafd",
+        },
+        "kernel_symbol": "kernel_cake_kimi_k3_fused_router_5fa5ab22671e592fcb3b",
+        "kernel_declaration": 'extern "C" __global__ void kernel_cake_kimi_k3_fused_router_5fa5ab22671e592fcb3b(float* __restrict__ logits, float* __restrict__ bias, float* __restrict__ topk_weights, int* __restrict__ topk_ids, int* __restrict__ sorted_token_ids, int* __restrict__ expert_ids, int* __restrict__ num_tokens_post_padded, int* __restrict__ expert_counts, int* __restrict__ expert_offsets, int* __restrict__ expert_scatter_offsets, int M);',
     },
     "cake_kimi_k3_fused_router_6d1a3cbbec0fdd51dbf5": {
         "arm": "LCG",
@@ -662,82 +1083,57 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 15616,
         },
         "closure_sha256": {
-            "sm_100a": "e789bbf068d1a63a2b48dcaa9e6978b25e8debab47f30d2029cf5ef54898a2e1",
-            "sm_103a": "2b4706ae17e8c991ded03680edc1db04216738486a0d3eff499f8c66379e6e93",
+            "sm_100a": "b15c48fe69756f2fc358f03f7842e50344d8580d3d99a64729d4066747e94fa2",
+            "sm_103a": "2c37e66fe8aa2f923d516e2ef6f37ebbe0ed40bdf77244b95316c01daaacef24",
         },
         "kernel_symbol": "kernel_cake_kimi_k3_fused_router_6d1a3cbbec0fdd51dbf5",
         "kernel_declaration": 'extern "C" __global__ void kernel_cake_kimi_k3_fused_router_6d1a3cbbec0fdd51dbf5(float* __restrict__ logits, float* __restrict__ bias, float* __restrict__ topk_weights, int* __restrict__ topk_ids, int* __restrict__ sorted_token_ids, int* __restrict__ expert_ids, int* __restrict__ num_tokens_post_padded, int* __restrict__ expert_counts, int* __restrict__ expert_offsets, int* __restrict__ expert_scatter_offsets, int M);',
     },
-    "cake_kimi_k3_fused_router_fffa4c7c84f1ab7421f8": {
-        "arm": "Q4S",
-        "num_tokens": None,
-        "arches": ["sm_100a", "sm_103a"],
-        "sources": [
-            "cake_kimi_k3_fused_router/cake_kimi_k3_fused_router_fffa4c7c84f1ab7421f8_kernel.cu",
-            "cake_kimi_k3_fused_router/cake_kimi_k3_fused_router_fffa4c7c84f1ab7421f8_binding.cu",
-        ],
-        "compile_flags": [],
-        "ffi_entry": "run",
-        "arg_plan": [
-            ["buffer", "logits"],
-            ["buffer", "bias"],
-            ["buffer", "topk_weights"],
-            ["buffer", "topk_ids"],
-            ["buffer", "sorted_token_ids"],
-            ["buffer", "expert_ids"],
-            ["buffer", "num_tokens_post_padded"],
-            ["buffer", "expert_counts"],
-            ["buffer", "expert_offsets"],
-            ["buffer", "expert_scatter_offsets"],
-            ["parameter", "M"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "launch": {
-            "block": [224, 1, 1],
-            "cluster": [4, 1, 1],
-            "cooperative": True,
-            "dynamic_smem_bytes": 54784,
-        },
-        "closure_sha256": {
-            "sm_100a": "42d5350d820a7c2c898d189921635d623bbb9b824780541ad5b683294008827c",
-            "sm_103a": "b5a6389f81d0fc9d6ba350717d2fed3b72ca4aa338eb03c35032f343ee0f7ebd",
-        },
-        "kernel_symbol": "kernel_cake_kimi_k3_fused_router_fffa4c7c84f1ab7421f8",
-        "kernel_declaration": 'extern "C" __global__ void kernel_cake_kimi_k3_fused_router_fffa4c7c84f1ab7421f8(float* __restrict__ logits, float* __restrict__ bias, float* __restrict__ topk_weights, int* __restrict__ topk_ids, int* __restrict__ sorted_token_ids, int* __restrict__ expert_ids, int* __restrict__ num_tokens_post_padded, int* __restrict__ expert_counts, int* __restrict__ expert_offsets, int* __restrict__ expert_scatter_offsets, int M);',
-    },
 }
 ROUTES: dict[str, dict[str, str]] = {
     "sm_100a": {
-        "GW": "cake_kimi_k3_fused_router_c7f56e5fdc79e10cd475",
+        "GW": "cake_kimi_k3_fused_router_a140805ed9d697427fbe",
         "L": "cake_kimi_k3_fused_router_544948d65e43d405cb26",
+        "LC1_NC": "cake_kimi_k3_fused_router_0b365c12c38f335f62bc",
+        "LC2_CW": "cake_kimi_k3_fused_router_55d217eef88b4aff9f1c",
         "LC:1": "cake_kimi_k3_fused_router_27a24128e0b7468b7878",
         "LC:16": "cake_kimi_k3_fused_router_006a7ad397982e4faa88",
         "LC:2": "cake_kimi_k3_fused_router_aea2ff5129b7b6374e5a",
         "LC:4": "cake_kimi_k3_fused_router_9701331ccf9b00bc5af8",
         "LC:8": "cake_kimi_k3_fused_router_ad9f02f1f70dd3c957ee",
         "LCG": "cake_kimi_k3_fused_router_6d1a3cbbec0fdd51dbf5",
+        "LCG_LW": "cake_kimi_k3_fused_router_dfea2e009bc99071b6f6",
+        "LCG_LW_OWN": "cake_kimi_k3_fused_router_eee55555fba0d777d754",
         "LPC": "cake_kimi_k3_fused_router_76a711ed994e53632512",
         "M": "cake_kimi_k3_fused_router_49a2f49970db28d2d0b3",
-        "Q4S": "cake_kimi_k3_fused_router_fffa4c7c84f1ab7421f8",
+        "Q4S": "cake_kimi_k3_fused_router_e8686a2a21d7b4710273",
+        "Q4SB": "cake_kimi_k3_fused_router_5fa5ab22671e592fcb3b",
+        "Q4SB_LBW": "cake_kimi_k3_fused_router_c89373c1750ff2694e0a",
         "Q4SP": "cake_kimi_k3_fused_router_928282f63b3f103002d5",
-        "Q4SPW": "cake_kimi_k3_fused_router_e75d6bd1e0bd6c346f3e",
+        "Q4SPW_LR": "cake_kimi_k3_fused_router_5a55b899e30d5b57a88f",
+        "Q4SP_LR": "cake_kimi_k3_fused_router_cbfd3716ea36b0dff5eb",
+        "Q4SP_PG": "cake_kimi_k3_fused_router_0bc1c0ce923587bb3ad9",
+        "Q4S_E16": "cake_kimi_k3_fused_router_931b47f83cb304759ea0",
     },
     "sm_103a": {
-        "GW": "cake_kimi_k3_fused_router_0b07dab512c544121f4e",
+        "GW": "cake_kimi_k3_fused_router_24bb36fa531aa80ef560",
         "L": "cake_kimi_k3_fused_router_ed9f4ad5513af55af382",
+        "LC1_NC": "cake_kimi_k3_fused_router_0b365c12c38f335f62bc",
         "LC:1": "cake_kimi_k3_fused_router_27a24128e0b7468b7878",
         "LC:16": "cake_kimi_k3_fused_router_006a7ad397982e4faa88",
         "LC:2": "cake_kimi_k3_fused_router_aea2ff5129b7b6374e5a",
         "LC:4": "cake_kimi_k3_fused_router_9701331ccf9b00bc5af8",
         "LC:8": "cake_kimi_k3_fused_router_ad9f02f1f70dd3c957ee",
         "LCG": "cake_kimi_k3_fused_router_6d1a3cbbec0fdd51dbf5",
+        "LCG_LW": "cake_kimi_k3_fused_router_dfea2e009bc99071b6f6",
         "LP": "cake_kimi_k3_fused_router_dbbf369cba14eb162f2d",
         "M": "cake_kimi_k3_fused_router_3cf5cafee3b503734ab4",
-        "Q4S": "cake_kimi_k3_fused_router_fffa4c7c84f1ab7421f8",
+        "Q4S": "cake_kimi_k3_fused_router_e8686a2a21d7b4710273",
+        "Q4SB": "cake_kimi_k3_fused_router_5fa5ab22671e592fcb3b",
         "Q4SP": "cake_kimi_k3_fused_router_928282f63b3f103002d5",
-        "Q4SPW": "cake_kimi_k3_fused_router_e75d6bd1e0bd6c346f3e",
+        "Q4SPW_LR": "cake_kimi_k3_fused_router_5a55b899e30d5b57a88f",
+        "Q4SP_LR": "cake_kimi_k3_fused_router_cbfd3716ea36b0dff5eb",
+        "Q4S_E16": "cake_kimi_k3_fused_router_3c9ca003ed9fca78bdd1",
     },
 }
 
@@ -758,21 +1154,64 @@ BLOCK_M_VALUES = (8, 16)
 #   LC   : one cluster of num_tokens CTAs (a single CTA for one token, 2, 4, 8
 #          or 16 CTAs otherwise) exchanging selected ids through distributed
 #          shared memory; one kernel per row count, non-cooperative launch
+#   LC1_NC: the one-token LC kernel with its bias and logits loads in the
+#          read-only form (one token at block_m 16), same launch
+#   LC2_CW: the two-token LC kernel ranking its winners from a certified
+#          window (SM100, two tokens at block_m 8), same launch
 #   LCG  : one non-portable cluster of 16 CTAs of two row groups each, any
 #          num_tokens <= 32 (the 32-token cell: the counts up to 32 that are
 #          not an LC row count); non-cooperative launch
+#   LCG_LW: the LCG kernel waiting for its cluster after the row selection
+#          instead of at entry, same cluster / launch / token range
+#   LCG_LW_OWN: the LCG_LW kernel whose candidate floor comes from the owners
+#          of the published bounds, same cluster / launch / token range
+#          (SM100 at block_m 16: from 29 tokens)
 #   M    : one-join bitmap plan builder, 128 <= num_tokens <= 256 (SM100) /
 #          2048 (SM103); on SM103 the cooperative grid is launched with an
 #          explicit cluster of one CTA
 #   Q4S  : arm M's cp.async ID stream in 4-CTA clusters (cooperative cluster
-#          launch) at four CTAs per SM, 128 <= num_tokens <= 2048
+#          launch) at four CTAs per SM, 128 <= num_tokens <= 1024 (each owner
+#          CTA keeps its cluster's slice byte map)
+#   Q4S_E16: the Q4S kernel whose plan emit gives each lane 16 tokens instead
+#          of 32 (the 512-token cells), same cluster / launch bounds / grid
+#          rule
+#   Q4SB : the Q4S kernel with a register prefetch of the next row's logits,
+#          same cluster / launch bounds / grid rule
+#   Q4SB_LBW: the Q4SB kernel whose byte map spans a full map row, up to 1150
+#          tokens (SM100 at block_m 16), same cluster / launch bounds / grid
+#          rule
 #   Q4SP : the Q4S kernel with a register prefetch of the next row's logits,
 #          same cluster / launch bounds / grid rule
-#   Q4SPW: the Q4SP kernel selecting one row per warp (SM103), same cluster /
+#   Q4SP_PG: the Q4SP kernel skipping the emit word pass a batch of at most
+#          1024 tokens leaves without a bitmap word (SM100 at block_m 8), same
+#          cluster / launch bounds / grid rule
+#   Q4SP_LR: the Q4SP kernel whose owner CTAs rank the route pairs in their
+#          own shared memory, same cluster / launch bounds / grid rule
+#   Q4SPW_LR: the Q4SP_LR kernel selecting one row per warp, same cluster /
 #          launch bounds / grid rule
 #   GW   : two-join persistent warp-per-row kernel for the largest batches; a
 #          cooperative grid of 2-CTA clusters
-ARMS = ("L", "LP", "LPC", "LC", "LCG", "M", "Q4S", "Q4SP", "Q4SPW", "GW")
+ARMS = (
+    "L",
+    "LP",
+    "LPC",
+    "LC",
+    "LC1_NC",
+    "LC2_CW",
+    "LCG",
+    "LCG_LW",
+    "LCG_LW_OWN",
+    "M",
+    "Q4S",
+    "Q4S_E16",
+    "Q4SB",
+    "Q4SB_LBW",
+    "Q4SP",
+    "Q4SP_PG",
+    "Q4SP_LR",
+    "Q4SPW_LR",
+    "GW",
+)
 # Arms registered per row count (one kernel per num_tokens); every other arm
 # registers one program and serves all of its rows.
 PER_ROW_COUNT_ARMS = ("LC",)
@@ -836,11 +1275,12 @@ def _header_dirs():
 #
 # The generated binding launches the kernel (cooperative and cluster attributes
 # included) but exposes no occupancy query.  The persistent grids of the
-# 4-CTA-cluster arms (Q4S, Q4SP, Q4SPW) and of the CTA-pair arm GW must be
-# bounded by the number of co-resident clusters the driver admits (GPC
-# placement, not just CTAs per SM), and the 16-CTA non-portable clusters of the
-# sixteen-token kernel and of arm LCG need at least one.  For
-# exactly those programs the registry record carries the kernel declaration
+# 4-CTA-cluster arms (Q4S, Q4S_E16, Q4SB, Q4SP, Q4SP_PG, Q4SPW_LR) and of the
+# CTA-pair arm GW must be bounded by the number of co-resident clusters the
+# driver admits (GPC placement, not just CTAs per SM), and the 16-CTA
+# non-portable clusters of the sixteen-token kernel and of arms LCG and LCG_LW
+# need at least one.
+# For exactly those programs the registry record carries the kernel declaration
 # (``kernel_declaration``, taken from the generated source by the export), and
 # this package adds one translation unit that forwards it to
 # ``cudaOccupancyMaxActiveClusters`` with the one-cluster configuration the

@@ -130,17 +130,17 @@ kernel_cake_mhc_train_bwd_reduce__wpu4_fadd(float* __restrict__ dfn_part, float*
         }
         #pragma unroll 4
         for (int p = 0; p < n_parts; p++) {
-            float _vec_load_0[4];
+            float vec_load[4];
             {
                 float4 _v4 = *reinterpret_cast<const float4*>(dfn_part + ((long long)p * 393216 + e0) + 0);
-                _vec_load_0[0 + 0] = _v4.x;
-                _vec_load_0[0 + 1] = _v4.y;
-                _vec_load_0[0 + 2] = _v4.z;
-                _vec_load_0[0 + 3] = _v4.w;
+                vec_load[0 + 0] = _v4.x;
+                vec_load[0 + 1] = _v4.y;
+                vec_load[0 + 2] = _v4.z;
+                vec_load[0 + 3] = _v4.w;
             }
             #pragma unroll
             for (int k_1 = 0; k_1 < 4; k_1++) {
-                a[k_1] = a[k_1] + (double)_vec_load_0[k_1];
+                a[k_1] = a[k_1] + (double)vec_load[k_1];
             }
         }
         if (accumulate != 0) {

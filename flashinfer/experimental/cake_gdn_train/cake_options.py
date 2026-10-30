@@ -40,14 +40,24 @@ Public fields (defaults are the shipped behaviour)::
     group_reduce    "fused" | "host"        the FP32 reduction of the HV / H_qk value heads' dq / dk contributions inside
                                             the dqkg program, or FP32 partials reduced on the host in a fixed order
     graph           "off" | "replay"        keyed CUDA-graph capture / replay of a call
-    reuse_recompute_tapes  True | False     under torch.utils.checkpoint(use_reentrant=False) the light backward binds
-                                            the forward tapes of torch's recompute of the same backward pass instead
-                                            of running its own replay of #1 and the tape walk (the shipped default;
+    reuse_recompute_tapes  True | False | "auto"   under torch.utils.checkpoint(use_reentrant=False) the light
+                                            backward binds the forward tapes of torch's recompute of the same backward
+                                            pass instead of running its own replay of #1 and the tape walk.  "auto"
+                                            (the shipped default) = only when the GDN node is the last operation of
+                                            the checkpointed region that saves a tensor (the same frame proof as
+                                            recompute_output="auto"): then its backward is the region's first and the
+                                            kept tapes die before any other backward runs; with a later saver (an
+                                            output projection, an MLP) the kept tapes would live through those
+                                            operations' backward and raise the region's backward peak by the full
+                                            tape set (+2323 MiB on a 261,987-token (2, 6) region with a 768-wide
+                                            projection and MLP: 9251 vs 6927 MiB, step 21.3 vs 22.7 ms on one GB300),
+                                            so "auto" takes the replay form there; True = always; False = the replay
+                                            form.
                                             None = the default, which is False with graph="replay", the one mode that
-                                            excludes it; an explicit True with graph="replay" is refused; a forward
-                                            outside a backward pass, the direct autograd path and every other mode
-                                            are unchanged; one kept set is live at a time, so in a segment of several
-                                            layers only the last one skips the replay; False = the replay form)
+                                            excludes the kept tapes; an explicit True / "auto" with graph="replay" is
+                                            refused; a forward outside a backward pass, the direct autograd path and
+                                            every other mode are unchanged; one kept set is live at a time, so in a
+                                            segment of several layers only the last one skips the replay
     recompute_output  "auto" | "always"    under torch.utils.checkpoint(use_reentrant=False) torch re-runs the forward
                                             inside .backward() only to re-save its tensors and discards that run's
                                             return value; when this module's autograd node is the last saver of the
@@ -97,7 +107,10 @@ GROUP_REDUCES = ("fused", "host")
 GROUP_REDUCE_DEFAULT = "fused"
 GRAPH_MODES = ("off", "replay")
 GRAPH_DEFAULT = "off"
-REUSE_RECOMPUTE_TAPES_DEFAULT = True  # the checkpoint-aware light backward is the shipped default (False with graph="replay"; False = the replay form)
+REUSE_RECOMPUTE_TAPES = (True, False, "auto")
+# "auto" (the shipped default) = the checkpoint-aware light backward keeps the recompute's tapes only when the node
+# closes the checkpointed region; True = always; False = the replay form (the default with graph="replay")
+REUSE_RECOMPUTE_TAPES_DEFAULT: bool | str = "auto"
 RECOMPUTE_OUTPUTS = ("auto", "always")
 RECOMPUTE_OUTPUT_DEFAULT = "auto"  # the recompute's dead output program is skipped when torch's checkpoint frame proves it dead
 BACKENDS = ("kernels", "fake")
@@ -188,8 +201,8 @@ class KcpOptions:
     layout: str = LAYOUT_DEFAULT
     group_reduce: str = GROUP_REDUCE_DEFAULT
     graph: str = GRAPH_DEFAULT
-    # None = the shipped default, resolved in __post_init__ (True; False under graph="replay")
-    reuse_recompute_tapes: bool | None = None
+    # None = the shipped default, resolved in __post_init__ (REUSE_RECOMPUTE_TAPES_DEFAULT; False under graph="replay")
+    reuse_recompute_tapes: bool | str | None = None
     recompute_output: str = RECOMPUTE_OUTPUT_DEFAULT
     backend: str = BACKEND_DEFAULT
     segments: int | None = None
@@ -199,8 +212,8 @@ class KcpOptions:
         if self.reuse_recompute_tapes is None:
             # the shipped default: the kept-tape backward, except under CUDA-graph replay (a captured graph bakes the
             # arena addresses of its tapes while the kept tapes are fresh tensors), where the default is the replay form
-            self.reuse_recompute_tapes = bool(
-                REUSE_RECOMPUTE_TAPES_DEFAULT and self.graph == GRAPH_DEFAULT
+            self.reuse_recompute_tapes = (
+                REUSE_RECOMPUTE_TAPES_DEFAULT if self.graph == GRAPH_DEFAULT else False
             )
 
     def check(self) -> KcpOptions:
@@ -253,14 +266,18 @@ class KcpOptions:
             )
         if self.graph not in GRAPH_MODES:
             raise ValueError(f"graph must be one of {GRAPH_MODES}, got {self.graph!r}")
-        if not isinstance(self.reuse_recompute_tapes, bool):
+        if not (
+            isinstance(self.reuse_recompute_tapes, bool)
+            or self.reuse_recompute_tapes == "auto"
+        ):
             raise TypeError(
-                f"reuse_recompute_tapes must be a bool, got {type(self.reuse_recompute_tapes).__name__}"
+                f"reuse_recompute_tapes must be a bool or 'auto', got {self.reuse_recompute_tapes!r}"
             )
         if self.reuse_recompute_tapes and self.graph != "off":
             raise ValueError(
-                "reuse_recompute_tapes=True needs graph='off': a captured graph bakes the arena addresses of its "
-                "tapes, while the kept tapes are fresh tensors handed from the recompute forward to the backward"
+                f"reuse_recompute_tapes={self.reuse_recompute_tapes!r} needs graph='off': a captured graph bakes the "
+                "arena addresses of its tapes, while the kept tapes are fresh tensors handed from the recompute "
+                "forward to the backward"
             )
         if self.recompute_output not in RECOMPUTE_OUTPUTS:
             raise ValueError(

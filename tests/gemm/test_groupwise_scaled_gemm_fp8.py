@@ -1250,6 +1250,30 @@ def test_gemm_fp8_nt_groupwise_cutile_rejects_mn_scale_major():
         )
 
 
+def test_deepgemm_runtime_cache_hit(monkeypatch, tmp_path):
+    # load_all() and load() must share RUNTIME_CACHE keys, so the cubin is
+    # fetched and its runtime built once. Fake cubin; no GPU needed.
+    import flashinfer.deep_gemm as dg
+
+    name, code = "fake_gemm", "// code"
+    cubin_name = f"kernel.{name}.{dg.hash_to_hex(f'{name}$${code}')}"
+    (tmp_path / "deepgemm").mkdir()
+    (tmp_path / "deepgemm" / f"{cubin_name}.cubin").write_bytes(b"")
+    fetches = []
+    monkeypatch.setattr(dg, "KERNEL_MAP", {cubin_name: ("fake_symbol", "0" * 64)})
+    monkeypatch.setattr(dg, "RUNTIME_CACHE", {})
+    monkeypatch.setattr(dg, "FLASHINFER_CUBIN_DIR", tmp_path)
+    monkeypatch.setattr(dg, "get_deepgemm_artifact_path", lambda: "deepgemm")
+    monkeypatch.setattr(dg, "get_artifact", lambda path, sha: fetches.append(path))
+
+    dg.load_all()
+    first = dg.load(name, code)
+    second = dg.load(name, code)
+
+    assert first is second is dg.RUNTIME_CACHE[cubin_name]
+    assert len(fetches) == 1
+
+
 if __name__ == "__main__":
     test_fp8_blockscale_gemm(8192, 8192, 8192, "MN", torch.bfloat16)
     test_fp8_groupwise_gemm(8192, 8192, 8192, "K", backend="cutlass")

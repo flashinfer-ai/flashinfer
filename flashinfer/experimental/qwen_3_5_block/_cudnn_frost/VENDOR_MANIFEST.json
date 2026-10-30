@@ -1,10 +1,40 @@
 {
  "origin": "https://github.com/NVIDIA/cudnn-frontend",
- "commit": "d8b0a7ed56cd8e62bc1e05f367f339624f6dbb4e",
- "cudnn_frontend_version": "1.32.0",
+ "commit": "4c8e24355491545eef8b5d27b466114375f50757",
+ "cudnn_frontend_version": "1.33.0",
  "package": "flashinfer.experimental.qwen_3_5_block._cudnn_frost",
- "generated_at": "2026-10-20T19:38:37Z",
+ "generated_at": "2026-10-30T06:04:22Z",
  "files": [
+  {
+   "path": "QSA/__init__.py",
+   "source": "python/cudnn/QSA/__init__.py",
+   "source_sha256": "71c9dd229d27855d3f016146f0f4d42fd2aa8a39025a0d4fd8a42a04e5e350c6",
+   "vendored_sha256": "71c9dd229d27855d3f016146f0f4d42fd2aa8a39025a0d4fd8a42a04e5e350c6",
+   "license": "Apache-2.0",
+   "rewritten_imports": 0,
+   "patches": [],
+   "bytes": 238
+  },
+  {
+   "path": "QSA/selection.py",
+   "source": "python/cudnn/QSA/selection.py",
+   "source_sha256": "705a4de122a3bdf2d219e4680cc0ee7fecbb2c8c62fc5376c172d913b1c02b23",
+   "vendored_sha256": "cde0fb1fbfc998dc91b8d67b8b504c3bc7daaf2461da0894695b55616af738dc",
+   "license": "Apache-2.0",
+   "rewritten_imports": 10,
+   "patches": [],
+   "bytes": 42149
+  },
+  {
+   "path": "QSA/selection_paged.py",
+   "source": "python/cudnn/QSA/selection_paged.py",
+   "source_sha256": "241763283937d9f26d5459a96015277c16bda7ae54672079b8fec9b172e1ef41",
+   "vendored_sha256": "ecb5f5be675ce7b342a28cb974680ace62ce140737ae4663553e64d814cf27fb",
+   "license": "Apache-2.0",
+   "rewritten_imports": 5,
+   "patches": [],
+   "bytes": 32690
+  },
   {
    "path": "_cutlass_compat.py",
    "source": "python/cudnn/_cutlass_compat.py",
@@ -68,12 +98,12 @@
   {
    "path": "_pygraph.py",
    "source": "python/cudnn/_pygraph.py",
-   "source_sha256": "2c343ec91c302c7e99596742092f0cae41fc989e5b9189581578c67a6c8762e9",
-   "vendored_sha256": "08b9103c35b0821598be75c0bc7f74a2edd51d20e1e0ccf771fb22f18d91c17b",
+   "source_sha256": "6a60ab3d1f70e112d370ffc91367cfc0b129020e7585c620e671da02e004eada",
+   "vendored_sha256": "3b796f81c61ba55e4abc878785217af888f6b62d6be83d5ea95e29007380531f",
    "license": "Apache-2.0",
    "rewritten_imports": 14,
    "patches": [],
-   "bytes": 209276
+   "bytes": 214201
   },
   {
    "path": "_sdpa_tail.py",
@@ -96,14 +126,24 @@
    "bytes": 7656
   },
   {
+   "path": "_tupledict.py",
+   "source": "python/cudnn/_tupledict.py",
+   "source_sha256": "dfac1cdfb3214a599b0551661008474fecb5d927e0812f414c97a356c6ae019a",
+   "vendored_sha256": "dfac1cdfb3214a599b0551661008474fecb5d927e0812f414c97a356c6ae019a",
+   "license": "Apache-2.0",
+   "rewritten_imports": 0,
+   "patches": [],
+   "bytes": 2596
+  },
+  {
    "path": "api_base.py",
    "source": "python/cudnn/api_base.py",
-   "source_sha256": "6b138157b0d9af9dfd3191b7deeff4817db75daaa460c59a6ad831ac37896ddd",
-   "vendored_sha256": "a8eb25ea38b380e14134c828bccfcaac90670a39b5ea6973a92603fd174f32c3",
+   "source_sha256": "53301311f619f2643d577af416bc1590356465e0ccaf7533e870a7041c8b4def",
+   "vendored_sha256": "83c9c3f784551a65c93a2868f1ff3e2c2284bd9ccb3529e6ffbb3c2b5671ae64",
    "license": "Apache-2.0",
-   "rewritten_imports": 3,
+   "rewritten_imports": 4,
    "patches": [],
-   "bytes": 54379
+   "bytes": 53640
   },
   {
    "path": "datatypes.py",
@@ -116,6 +156,386 @@
     "P2"
    ],
    "bytes": 15563
+  },
+  {
+   "path": "deepseek_sparse_attention/__init__.py",
+   "source": "python/cudnn/deepseek_sparse_attention/__init__.py",
+   "source_sha256": "1692d147b9bc48788651565ea3c3edb1f4ba3495640056e28f096612b2f7d91e",
+   "vendored_sha256": "1692d147b9bc48788651565ea3c3edb1f4ba3495640056e28f096612b2f7d91e",
+   "license": "Apache-2.0",
+   "rewritten_imports": 0,
+   "patches": [],
+   "bytes": 3350
+  },
+  {
+   "path": "deepseek_sparse_attention/indexer_forward/__init__.py",
+   "source": "python/cudnn/deepseek_sparse_attention/indexer_forward/__init__.py",
+   "source_sha256": "22a6b0a41fed3ec445870f26b35031a2338f89d8763a31a82fd245aeb164449e",
+   "vendored_sha256": "22a6b0a41fed3ec445870f26b35031a2338f89d8763a31a82fd245aeb164449e",
+   "license": "Apache-2.0",
+   "rewritten_imports": 0,
+   "patches": [],
+   "bytes": 545
+  },
+  {
+   "path": "deepseek_sparse_attention/indexer_forward/_compressed_top_k_sm100.py",
+   "source": "python/cudnn/deepseek_sparse_attention/indexer_forward/_compressed_top_k_sm100.py",
+   "source_sha256": "bcb32d886e88bd813c2126724d4744801cd7cc1a7b5e76a860112b13029f5090",
+   "vendored_sha256": "49de40f8ba7b379002f3121162f0b6f061fae8729fad3436a2e5c24f0c58827c",
+   "license": "Apache-2.0",
+   "rewritten_imports": 6,
+   "patches": [],
+   "bytes": 74142
+  },
+  {
+   "path": "deepseek_sparse_attention/indexer_forward/_interface.py",
+   "source": "python/cudnn/deepseek_sparse_attention/indexer_forward/_interface.py",
+   "source_sha256": "1d02d519b55e79890499eb165351cd2a53e775e64ab6dc06382cd98f3e026cdd",
+   "vendored_sha256": "4a55f2f7e2125d85e5fc72e84497b3da89f039b235944733515045697e9dff49",
+   "license": "Apache-2.0",
+   "rewritten_imports": 5,
+   "patches": [],
+   "bytes": 34000
+  },
+  {
+   "path": "deepseek_sparse_attention/indexer_forward/_interface_sm90.py",
+   "source": "python/cudnn/deepseek_sparse_attention/indexer_forward/_interface_sm90.py",
+   "source_sha256": "171e34f138b03a2da1b4be188837a80cc2c7bf868fc8ef60086906b4fda7d62e",
+   "vendored_sha256": "470fc7917255b2d47baa2dd84c96182179d426b7ef319b214e123bd21bc60120",
+   "license": "Apache-2.0",
+   "rewritten_imports": 3,
+   "patches": [],
+   "bytes": 13084
+  },
+  {
+   "path": "deepseek_sparse_attention/indexer_forward/_support.py",
+   "source": "python/cudnn/deepseek_sparse_attention/indexer_forward/_support.py",
+   "source_sha256": "098eff0105ff7429dbd8b4586d95d40f4923919c09107670eda376381babcc5a",
+   "vendored_sha256": "098eff0105ff7429dbd8b4586d95d40f4923919c09107670eda376381babcc5a",
+   "license": "Apache-2.0",
+   "rewritten_imports": 0,
+   "patches": [],
+   "bytes": 8326
+  },
+  {
+   "path": "deepseek_sparse_attention/indexer_forward/api.py",
+   "source": "python/cudnn/deepseek_sparse_attention/indexer_forward/api.py",
+   "source_sha256": "52f5d43417cfb57d66674041b7a8d46901a0a928a2af6a72b8818899589262bc",
+   "vendored_sha256": "519c50dc015370a7c4aa0bff9283d8f4cb6d30dac875fa5254e5ae7605f27dd0",
+   "license": "Apache-2.0",
+   "rewritten_imports": 2,
+   "patches": [],
+   "bytes": 20140
+  },
+  {
+   "path": "deepseek_sparse_attention/indexer_forward/indexer_fwd_sm100.py",
+   "source": "python/cudnn/deepseek_sparse_attention/indexer_forward/indexer_fwd_sm100.py",
+   "source_sha256": "fd30dc9526b42ca671d7bd47d9bf52d7d0a71329a908f425d70b6b796e38e166",
+   "vendored_sha256": "fd30dc9526b42ca671d7bd47d9bf52d7d0a71329a908f425d70b6b796e38e166",
+   "license": "Apache-2.0",
+   "rewritten_imports": 0,
+   "patches": [],
+   "bytes": 367
+  },
+  {
+   "path": "deepseek_sparse_attention/indexer_forward/indexer_fwd_sm90.py",
+   "source": "python/cudnn/deepseek_sparse_attention/indexer_forward/indexer_fwd_sm90.py",
+   "source_sha256": "fec8935f0983da87cf06a61b9cfca6f4483eea527a2879eb2768c4e5c66f6312",
+   "vendored_sha256": "bf55b51348aec53ebd61d52cab58673a266f596b003e2da5bf5e0f5d99b77be0",
+   "license": "Apache-2.0",
+   "rewritten_imports": 6,
+   "patches": [],
+   "bytes": 61446
+  },
+  {
+   "path": "deepseek_sparse_attention/indexer_top_k/__init__.py",
+   "source": "python/cudnn/deepseek_sparse_attention/indexer_top_k/__init__.py",
+   "source_sha256": "92ca06aaa318881ca2e5005025e1fd4f5ef4d916df9c903e7b9d1dd1534f8d2d",
+   "vendored_sha256": "92ca06aaa318881ca2e5005025e1fd4f5ef4d916df9c903e7b9d1dd1534f8d2d",
+   "license": "Apache-2.0",
+   "rewritten_imports": 0,
+   "patches": [],
+   "bytes": 376
+  },
+  {
+   "path": "deepseek_sparse_attention/indexer_top_k/api.py",
+   "source": "python/cudnn/deepseek_sparse_attention/indexer_top_k/api.py",
+   "source_sha256": "23094df9b2a8475f456f747957f0f48835280608685da1aa1128ac71fd0e0177",
+   "vendored_sha256": "38d04a37436ad5541eb67122d9765d834f067067de3de3e9a67c0e1178ad6fab",
+   "license": "Apache-2.0",
+   "rewritten_imports": 4,
+   "patches": [],
+   "bytes": 21995
+  },
+  {
+   "path": "deepseek_sparse_attention/indexer_top_k/block_scan.py",
+   "source": "python/cudnn/deepseek_sparse_attention/indexer_top_k/block_scan.py",
+   "source_sha256": "880736adf88e65ee17c6dbf1dcb2ac35d09db2ed3cbb31e1083e7f39ff86164b",
+   "vendored_sha256": "68f0a1bb1fa3b6dc26fe5c342e5f9d52367b811de9ed8fba15705d6aa0cccbbe",
+   "license": "Apache-2.0",
+   "rewritten_imports": 1,
+   "patches": [],
+   "bytes": 5515
+  },
+  {
+   "path": "deepseek_sparse_attention/indexer_top_k/compactify.py",
+   "source": "python/cudnn/deepseek_sparse_attention/indexer_top_k/compactify.py",
+   "source_sha256": "620049b39baf0e44fa980ca12fec8089befff9ad5754e527ce1a7f9ee15a7393",
+   "vendored_sha256": "ff4dc9060da3396dea2148ca969af654352c9954ea8e539e2c72a4491bab491d",
+   "license": "Apache-2.0",
+   "rewritten_imports": 3,
+   "patches": [],
+   "bytes": 6166
+  },
+  {
+   "path": "deepseek_sparse_attention/indexer_top_k/compress_top_k_sm100.py",
+   "source": "python/cudnn/deepseek_sparse_attention/indexer_top_k/compress_top_k_sm100.py",
+   "source_sha256": "9b6f81b8b80ab2e92a780ba0f5f9e573ebf57543c2eb966c044198e5e0bb7da7",
+   "vendored_sha256": "fe931019bd4ceebabfd757975572e7f2fe05f0d4e9edf0985dddb551361e72cb",
+   "license": "Apache-2.0",
+   "rewritten_imports": 4,
+   "patches": [],
+   "bytes": 46952
+  },
+  {
+   "path": "deepseek_sparse_attention/indexer_top_k/indexer_top_k_varlen_util.py",
+   "source": "python/cudnn/deepseek_sparse_attention/indexer_top_k/indexer_top_k_varlen_util.py",
+   "source_sha256": "265333adb237bfaf18c8f757c634a87161e53af97ec81526e20cb3def844adf6",
+   "vendored_sha256": "265333adb237bfaf18c8f757c634a87161e53af97ec81526e20cb3def844adf6",
+   "license": "Apache-2.0",
+   "rewritten_imports": 0,
+   "patches": [],
+   "bytes": 68952
+  },
+  {
+   "path": "deepseek_sparse_attention/indexer_top_k/local_to_global_dsl.py",
+   "source": "python/cudnn/deepseek_sparse_attention/indexer_top_k/local_to_global_dsl.py",
+   "source_sha256": "4a4286cc3f672c504ca07ecebb0f0e614132e1ed1b41e54dd33fda98a9df4a06",
+   "vendored_sha256": "fc5b1b717831c158405e6d4e8396b86cbee7e229bf07e6eb346e3af4a3fd1e55",
+   "license": "Apache-2.0",
+   "rewritten_imports": 3,
+   "patches": [],
+   "bytes": 8717
+  },
+  {
+   "path": "deepseek_sparse_attention/score_recompute/__init__.py",
+   "source": "python/cudnn/deepseek_sparse_attention/score_recompute/__init__.py",
+   "source_sha256": "1ffa5a6d9da2ed78adb6def26c1b524554d66e6bf9c71f82a34857badef9377f",
+   "vendored_sha256": "1ffa5a6d9da2ed78adb6def26c1b524554d66e6bf9c71f82a34857badef9377f",
+   "license": "Apache-2.0",
+   "rewritten_imports": 0,
+   "patches": [],
+   "bytes": 774
+  },
+  {
+   "path": "deepseek_sparse_attention/score_recompute/_block_scaled.py",
+   "source": "python/cudnn/deepseek_sparse_attention/score_recompute/_block_scaled.py",
+   "source_sha256": "28dafa18d92b428863f897d9bcdd871c35911656f6c9f75949a9d113a98846e0",
+   "vendored_sha256": "b5a2a1f3b59aac0e2496dd12e7671dd9d2dda46e050d6c4774882deda7c2fad3",
+   "license": "Apache-2.0",
+   "rewritten_imports": 1,
+   "patches": [],
+   "bytes": 8435
+  },
+  {
+   "path": "deepseek_sparse_attention/score_recompute/_interface_sm100.py",
+   "source": "python/cudnn/deepseek_sparse_attention/score_recompute/_interface_sm100.py",
+   "source_sha256": "a75e421575109a0c9a30415737f6f6527aa6145496d17e07736cbab48b287491",
+   "vendored_sha256": "e7ae216f6b60fed481f4d0ccd117672f5a0ec3b53eee3b0b886835b70e6eb55e",
+   "license": "Apache-2.0",
+   "rewritten_imports": 3,
+   "patches": [],
+   "bytes": 66998
+  },
+  {
+   "path": "deepseek_sparse_attention/score_recompute/api.py",
+   "source": "python/cudnn/deepseek_sparse_attention/score_recompute/api.py",
+   "source_sha256": "9a19ed165ead879945c9acbf83a6f67567f8bc78d5d5bc6b716f391655ad5f25",
+   "vendored_sha256": "6017cedaacd5222fced2d254a086abc0d2691553126edc2dd7d8e70941512a5b",
+   "license": "Apache-2.0",
+   "rewritten_imports": 3,
+   "patches": [],
+   "bytes": 56006
+  },
+  {
+   "path": "deepseek_sparse_attention/score_recompute/dense_score_recompute_sm100.py",
+   "source": "python/cudnn/deepseek_sparse_attention/score_recompute/dense_score_recompute_sm100.py",
+   "source_sha256": "46623c17bc93caeadd4cd5f66a7147aabda18e1defe9a4b2328f735dc0d81e28",
+   "vendored_sha256": "baf4e57687ebd5e4f66175cff748dc1e1bd8183f03b4cc2d9c35087133bb5c5f",
+   "license": "Apache-2.0",
+   "rewritten_imports": 4,
+   "patches": [],
+   "bytes": 71248
+  },
+  {
+   "path": "deepseek_sparse_attention/score_recompute/dense_score_recompute_sm100_mxfp8.py",
+   "source": "python/cudnn/deepseek_sparse_attention/score_recompute/dense_score_recompute_sm100_mxfp8.py",
+   "source_sha256": "a0c62c2fd4236d7fa99b4905067b1aef9317f8f72a6cd0877a02e3073aa9ce64",
+   "vendored_sha256": "0371e28cd961d4ff6efce4b21ab21f13b2381bf4d31524757ab19009bf897126",
+   "license": "Apache-2.0",
+   "rewritten_imports": 4,
+   "patches": [],
+   "bytes": 87941
+  },
+  {
+   "path": "deepseek_sparse_attention/score_recompute/indexer_score_unified_sm100.py",
+   "source": "python/cudnn/deepseek_sparse_attention/score_recompute/indexer_score_unified_sm100.py",
+   "source_sha256": "0a4de1f913f2d5e5c30d66d069093b66919a488d2e976bb578729f0faa99a9be",
+   "vendored_sha256": "0a4de1f913f2d5e5c30d66d069093b66919a488d2e976bb578729f0faa99a9be",
+   "license": "Apache-2.0",
+   "rewritten_imports": 0,
+   "patches": [],
+   "bytes": 13747
+  },
+  {
+   "path": "deepseek_sparse_attention/score_recompute/indexer_score_unified_sm100_mxfp4.py",
+   "source": "python/cudnn/deepseek_sparse_attention/score_recompute/indexer_score_unified_sm100_mxfp4.py",
+   "source_sha256": "40beb10b62d86e65a831e2253e985ae0dd423644912b57a212d5a36180ed563c",
+   "vendored_sha256": "40beb10b62d86e65a831e2253e985ae0dd423644912b57a212d5a36180ed563c",
+   "license": "Apache-2.0",
+   "rewritten_imports": 0,
+   "patches": [],
+   "bytes": 1653
+  },
+  {
+   "path": "deepseek_sparse_attention/score_recompute/indexer_score_unified_sm100_mxfp8.py",
+   "source": "python/cudnn/deepseek_sparse_attention/score_recompute/indexer_score_unified_sm100_mxfp8.py",
+   "source_sha256": "f49c1aa27ec100a4212fa2af903ca57b6d923413574085549843e3c7ddc6de01",
+   "vendored_sha256": "d47867ef20e605c93a67012ce35cfd38702830f71a8aafd55557155d91f2b197",
+   "license": "Apache-2.0",
+   "rewritten_imports": 4,
+   "patches": [],
+   "bytes": 91504
+  },
+  {
+   "path": "deepseek_sparse_attention/score_recompute/sparse_score_recompute_sm100.py",
+   "source": "python/cudnn/deepseek_sparse_attention/score_recompute/sparse_score_recompute_sm100.py",
+   "source_sha256": "cb38758948c6670cb177553e9f0b77689e4947219d01e4524864f6f020c5995f",
+   "vendored_sha256": "de76d43376cfc5ab03968eece422b7d93be8c978ad51777c3912501e88654c90",
+   "license": "Apache-2.0",
+   "rewritten_imports": 3,
+   "patches": [],
+   "bytes": 76604
+  },
+  {
+   "path": "deepseek_sparse_attention/utils/__init__.py",
+   "source": "python/cudnn/deepseek_sparse_attention/utils/__init__.py",
+   "source_sha256": "a920e01a73d45f8cde03745f9c0e38b3b740a2efab1aa9e0d7385639b3ef53d6",
+   "vendored_sha256": "a920e01a73d45f8cde03745f9c0e38b3b740a2efab1aa9e0d7385639b3ef53d6",
+   "license": "Apache-2.0",
+   "rewritten_imports": 0,
+   "patches": [],
+   "bytes": 207
+  },
+  {
+   "path": "deepseek_sparse_attention/utils/compiler.py",
+   "source": "python/cudnn/deepseek_sparse_attention/utils/compiler.py",
+   "source_sha256": "550e47dcb028e8ef0fd7a2cf9d1742ae5de3e0391043156783fcd3828c971c54",
+   "vendored_sha256": "550e47dcb028e8ef0fd7a2cf9d1742ae5de3e0391043156783fcd3828c971c54",
+   "license": "Apache-2.0",
+   "rewritten_imports": 0,
+   "patches": [],
+   "bytes": 2951
+  },
+  {
+   "path": "deepseek_sparse_attention/utils/copy.py",
+   "source": "python/cudnn/deepseek_sparse_attention/utils/copy.py",
+   "source_sha256": "b11725634e694bcfd228e392374e991f832a4943811bbcc254142c0bcefc293e",
+   "vendored_sha256": "b11725634e694bcfd228e392374e991f832a4943811bbcc254142c0bcefc293e",
+   "license": "MIT",
+   "rewritten_imports": 0,
+   "patches": [],
+   "bytes": 3906
+  },
+  {
+   "path": "deepseek_sparse_attention/utils/runtime.py",
+   "source": "python/cudnn/deepseek_sparse_attention/utils/runtime.py",
+   "source_sha256": "56219b21b4828dac658f69ea20860e390830fc1f947a807775d614b89e463795",
+   "vendored_sha256": "ea835b68e87c255d7c715b063fa27d27f7268151bb99cd0578a6eec8eea01b7b",
+   "license": "Apache-2.0",
+   "rewritten_imports": 1,
+   "patches": [],
+   "bytes": 2916
+  },
+  {
+   "path": "deepseek_sparse_attention/utils/seqlen.py",
+   "source": "python/cudnn/deepseek_sparse_attention/utils/seqlen.py",
+   "source_sha256": "cd31683242ebf6fca384eb0ef54d97e5a8b05c927144f493d084d11521e79ffe",
+   "vendored_sha256": "cd31683242ebf6fca384eb0ef54d97e5a8b05c927144f493d084d11521e79ffe",
+   "license": "Apache-2.0",
+   "rewritten_imports": 0,
+   "patches": [],
+   "bytes": 4833
+  },
+  {
+   "path": "deepseek_sparse_attention/utils/sm100/__init__.py",
+   "source": "python/cudnn/deepseek_sparse_attention/utils/sm100/__init__.py",
+   "source_sha256": "5fefba2d30b3a73f58b84519f57f628a286f29f90edf314072e1d7e51d5fd676",
+   "vendored_sha256": "5fefba2d30b3a73f58b84519f57f628a286f29f90edf314072e1d7e51d5fd676",
+   "license": "Apache-2.0",
+   "rewritten_imports": 0,
+   "patches": [],
+   "bytes": 199
+  },
+  {
+   "path": "deepseek_sparse_attention/utils/sm100/gemm.py",
+   "source": "python/cudnn/deepseek_sparse_attention/utils/sm100/gemm.py",
+   "source_sha256": "95b08a93147f91c7e3f14db19f9d459da468d1dbe6596e2c98cde4a44da9f0a8",
+   "vendored_sha256": "c14b0096fb4e088d82649b1c069baf802880dcd9bff4e8196ff294901c7485c8",
+   "license": "Apache-2.0",
+   "rewritten_imports": 2,
+   "patches": [],
+   "bytes": 16109
+  },
+  {
+   "path": "deepseek_sparse_attention/utils/sm100/mma_desc.py",
+   "source": "python/cudnn/deepseek_sparse_attention/utils/sm100/mma_desc.py",
+   "source_sha256": "6605e3a1aeb846ddb3a709152e34e5792cd61190585621bbf1882468f757d379",
+   "vendored_sha256": "bfaf817f795078634ded157378e20fb859448a57b9cf549c4529062eeb0b9fe5",
+   "license": "Apache-2.0",
+   "rewritten_imports": 1,
+   "patches": [],
+   "bytes": 11654
+  },
+  {
+   "path": "deepseek_sparse_attention/utils/sm90/__init__.py",
+   "source": "python/cudnn/deepseek_sparse_attention/utils/sm90/__init__.py",
+   "source_sha256": "c7192915629146069a7263b802a2af75ac2c6f26d62893b198a9caa99f9726cc",
+   "vendored_sha256": "c7192915629146069a7263b802a2af75ac2c6f26d62893b198a9caa99f9726cc",
+   "license": "Apache-2.0",
+   "rewritten_imports": 0,
+   "patches": [],
+   "bytes": 198
+  },
+  {
+   "path": "deepseek_sparse_attention/utils/sm90/mma.py",
+   "source": "python/cudnn/deepseek_sparse_attention/utils/sm90/mma.py",
+   "source_sha256": "e5c2af2738f0a926947c9735dc7fd8a950e3e4995ac8fba01f016b3eb4645579",
+   "vendored_sha256": "5dc7f59bd63a2d5af35a55df4611f686365fac6eb05588f9d9924baa206b7883",
+   "license": "Apache-2.0 AND MIT",
+   "rewritten_imports": 1,
+   "patches": [],
+   "bytes": 5290
+  },
+  {
+   "path": "deepseek_sparse_attention/utils/sm90/primitives.py",
+   "source": "python/cudnn/deepseek_sparse_attention/utils/sm90/primitives.py",
+   "source_sha256": "7be84e29142623e01ba813cc66e9873fab2a20147ff3473af2fbd7c537210f0f",
+   "vendored_sha256": "7be84e29142623e01ba813cc66e9873fab2a20147ff3473af2fbd7c537210f0f",
+   "license": "MIT",
+   "rewritten_imports": 0,
+   "patches": [],
+   "bytes": 12490
+  },
+  {
+   "path": "deepseek_sparse_attention/utils/tensor_conversion.py",
+   "source": "python/cudnn/deepseek_sparse_attention/utils/tensor_conversion.py",
+   "source_sha256": "387a96bd9973bdc362ca17a552963620612297942f1289ce1b6561953ea24151",
+   "vendored_sha256": "387a96bd9973bdc362ca17a552963620612297942f1289ce1b6561953ea24151",
+   "license": "Apache-2.0",
+   "rewritten_imports": 0,
+   "patches": [],
+   "bytes": 1175
   },
   {
    "path": "engines/__init__.py",
@@ -140,34 +560,34 @@
   {
    "path": "engines/engine_ids.py",
    "source": "python/cudnn/engines/engine_ids.py",
-   "source_sha256": "b36b7c4274f28502117acc52d4fc9286ea5239ebf920022afe1c73103a9bc50b",
-   "vendored_sha256": "b36b7c4274f28502117acc52d4fc9286ea5239ebf920022afe1c73103a9bc50b",
+   "source_sha256": "071c96674def429c8d766b29bfa35c5ea90446696414a3e4f86a049ba123fca1",
+   "vendored_sha256": "071c96674def429c8d766b29bfa35c5ea90446696414a3e4f86a049ba123fca1",
    "license": "Apache-2.0",
    "rewritten_imports": 0,
    "patches": [],
-   "bytes": 3419
+   "bytes": 3695
   },
   {
    "path": "engines/heuristics.py",
    "source": "python/cudnn/engines/heuristics.py",
-   "source_sha256": "05d801d9ba91039aee9508fb98c3da89c11b8bfd54c4c005d770e8320ae390e5",
-   "vendored_sha256": "a9e8b1f89d29726d8fa93234321bcec31c09c35a3e4a11211c8d9d6b587822a1",
+   "source_sha256": "7ff4517472a064df99da62e667ed88ee12c6274f5fd122f9f77a4e989976a8db",
+   "vendored_sha256": "d22754f2621bc2babd584575c2243f339c1a931b8e095e4b1c779bccfabc0570",
    "license": "Apache-2.0",
    "rewritten_imports": 2,
    "patches": [],
-   "bytes": 10225
+   "bytes": 11330
   },
   {
    "path": "engines/manifest.py",
    "source": "python/cudnn/engines/manifest.py",
-   "source_sha256": "9506f11437e264fe1b3e726a6dbfbf9bc459d520d90b6aaa9411c5e258e87162",
-   "vendored_sha256": "01c32bf3c6ab9bb93cbe09a5938a072f5916361398e02c48b0822e211286a2e3",
+   "source_sha256": "a8ad9693e049884d9f904f856811add2c9fd7cd35bd38e6f55c051a6d0e359d7",
+   "vendored_sha256": "683de1f42b17faf3e717aa2fbb6a0071f46871cbbaf4a1cc91c075e1f0f55c26",
    "license": "Apache-2.0",
-   "rewritten_imports": 30,
+   "rewritten_imports": 32,
    "patches": [
     "P1"
    ],
-   "bytes": 21466
+   "bytes": 22021
   },
   {
    "path": "frost/__init__.py",
@@ -182,12 +602,12 @@
   {
    "path": "frost/buffers.py",
    "source": "python/cudnn/frost/buffers.py",
-   "source_sha256": "20dc1d21904e3d0434735dd7b4e7b212966382c1dd7dd5ea0702bc4a23966cad",
-   "vendored_sha256": "6abdcd02348aed33dbec73e385c858c336f28e28f8113aba82405a95c776230b",
+   "source_sha256": "d8d7b5f1ac360f6190d7c039edd574422454f8a386af622207043057b9f88ad6",
+   "vendored_sha256": "d8bc396cb12238e8294f4ebe67c49c0543bb857caa4fd18f1bef237c28053b65",
    "license": "Apache-2.0",
    "rewritten_imports": 1,
    "patches": [],
-   "bytes": 30775
+   "bytes": 30885
   },
   {
    "path": "frost/capture.py",
@@ -202,24 +622,24 @@
   {
    "path": "frost/compiled_cache.py",
    "source": "python/cudnn/frost/compiled_cache.py",
-   "source_sha256": "2bfd2a597b8b00bee4d6b00b3c7ddf9b0148a8136a2ba357e563f96b251570c2",
-   "vendored_sha256": "214abc106c390c4395f2423d43734ab497d2921f99177668b472d42b6824d022",
+   "source_sha256": "d450f143f84e64f6ffecf9270f43660699004a0c64def557bee5cfc1e6087aa8",
+   "vendored_sha256": "a5e61c038d3acb647402aaffa229f93d9738a59e5b688111803d47885b9d5851",
    "license": "Apache-2.0",
    "rewritten_imports": 4,
    "patches": [
     "P3"
    ],
-   "bytes": 32504
+   "bytes": 40513
   },
   {
    "path": "frost/device.py",
    "source": "python/cudnn/frost/device.py",
-   "source_sha256": "0e984253316f0a14d5f8977daf8c6e36c3b1c696e6bff41f3640f68601f65fc1",
-   "vendored_sha256": "f4521a19f39526f9669a78c383e43a6ce49d3ce17d2ccf6af9a9e4106f8440cc",
+   "source_sha256": "05b2a9fa3e0492d2d772456b92fc1a884dd8ac1612220f906d1d3dd73001f509",
+   "vendored_sha256": "839955a3130965089bd4886e1cb463cc3d9951b9c268003f36984a79fd754729",
    "license": "MIT",
    "rewritten_imports": 2,
    "patches": [],
-   "bytes": 6244
+   "bytes": 6777
   },
   {
    "path": "frost/occupancy.py",
@@ -266,12 +686,12 @@
   {
    "path": "frost/tile_dsl/constants.py",
    "source": "python/cudnn/frost/tile_dsl/constants.py",
-   "source_sha256": "148320fef6d9497ae0a189654af72a5a6629c7682ba13471a30097f700d3b8dd",
-   "vendored_sha256": "148320fef6d9497ae0a189654af72a5a6629c7682ba13471a30097f700d3b8dd",
+   "source_sha256": "35a536049f280a12f9eb1eeb1f7e1b0d89c1ca04cf58e429b296b1c384b23b34",
+   "vendored_sha256": "35a536049f280a12f9eb1eeb1f7e1b0d89c1ca04cf58e429b296b1c384b23b34",
    "license": "MIT",
    "rewritten_imports": 0,
    "patches": [],
-   "bytes": 1000
+   "bytes": 1912
   },
   {
    "path": "frost/tile_dsl/handles.py",
@@ -286,12 +706,12 @@
   {
    "path": "frost/tile_dsl/mask.py",
    "source": "python/cudnn/frost/tile_dsl/mask.py",
-   "source_sha256": "a1da90f9a141d76d55797573d6ea79af3316a9ecb56f66f6a17e583a611de52a",
-   "vendored_sha256": "a1da90f9a141d76d55797573d6ea79af3316a9ecb56f66f6a17e583a611de52a",
+   "source_sha256": "7dd7aa5d373e31ddff57f896e03df73b1177ce1fbb54e2cbb2615dc023aa9cd4",
+   "vendored_sha256": "7dd7aa5d373e31ddff57f896e03df73b1177ce1fbb54e2cbb2615dc023aa9cd4",
    "license": "MIT",
    "rewritten_imports": 0,
    "patches": [],
-   "bytes": 26839
+   "bytes": 28380
   },
   {
    "path": "frost/tile_dsl/mma.py",
@@ -306,12 +726,12 @@
   {
    "path": "frost/tile_dsl/pointwise.py",
    "source": "python/cudnn/frost/tile_dsl/pointwise.py",
-   "source_sha256": "dcfd2ca268f0ccd5d10bfe2a8e8647dd2fe61f90d078e1221926c6e868cbff29",
-   "vendored_sha256": "dcfd2ca268f0ccd5d10bfe2a8e8647dd2fe61f90d078e1221926c6e868cbff29",
+   "source_sha256": "49ef8ac6cbe2ab162289969560d8219b988ebe00d0729f5f8e83686f0f76a6b8",
+   "vendored_sha256": "49ef8ac6cbe2ab162289969560d8219b988ebe00d0729f5f8e83686f0f76a6b8",
    "license": "MIT",
    "rewritten_imports": 0,
    "patches": [],
-   "bytes": 69159
+   "bytes": 79608
   },
   {
    "path": "frost/tile_dsl/regtile.py",
@@ -366,22 +786,22 @@
   {
    "path": "frost/tile_dsl/thd.py",
    "source": "python/cudnn/frost/tile_dsl/thd.py",
-   "source_sha256": "5c5ab52a587312eae70e894fb6b1c6779a99539e8fa6afa45d6b739012c6adfe",
-   "vendored_sha256": "5c5ab52a587312eae70e894fb6b1c6779a99539e8fa6afa45d6b739012c6adfe",
+   "source_sha256": "6ac2b814f51f07c0e66639c0fefb9d3a78c77ec32ad99e781028bcf76f7bc449",
+   "vendored_sha256": "2b02e8a536d610ca24ae33d7894f69d068908d46916c32184154b7ab9fec23a8",
    "license": "MIT",
-   "rewritten_imports": 0,
+   "rewritten_imports": 1,
    "patches": [],
-   "bytes": 31816
+   "bytes": 39848
   },
   {
    "path": "frost/tile_dsl/tma.py",
    "source": "python/cudnn/frost/tile_dsl/tma.py",
-   "source_sha256": "eed7c12de34aff9dad7a286709d175b91c7d52c578cb923f1dd08f45d92c2776",
-   "vendored_sha256": "eed7c12de34aff9dad7a286709d175b91c7d52c578cb923f1dd08f45d92c2776",
+   "source_sha256": "46a5258835c29da309e6cb35fcd9bbd0c0c45ae4c648ff874e99a3bb83d01ec0",
+   "vendored_sha256": "46a5258835c29da309e6cb35fcd9bbd0c0c45ae4c648ff874e99a3bb83d01ec0",
    "license": "MIT",
    "rewritten_imports": 0,
    "patches": [],
-   "bytes": 35539
+   "bytes": 38719
   },
   {
    "path": "frost/tile_dsl/tmem.py",
@@ -406,46 +826,46 @@
   {
    "path": "gated_attention_block/__init__.py",
    "source": "python/cudnn/gated_attention_block/__init__.py",
-   "source_sha256": "8722a51b096715621e77bdcafdc5dbb1231353160c5dc9c3eedf38fa61fe073f",
-   "vendored_sha256": "6c96a44abbfce58e6092c0ec10ca05bd72b254bee4877aa1c683a52d1da9c1b4",
+   "source_sha256": "2b6d59e1ee23435064856a739d755f03d65b726a783a57d9a25fdf71a920255a",
+   "vendored_sha256": "61e36eabc6524deb46de87f543626f60c8406340ec7a13323194a0e7252b8a9f",
    "license": "Apache-2.0",
    "rewritten_imports": 0,
    "patches": [
     "P0"
    ],
-   "bytes": 1968
+   "bytes": 2884
   },
   {
    "path": "gated_attention_block/api.py",
    "source": "python/cudnn/gated_attention_block/api.py",
-   "source_sha256": "ef48a876820f977ef1ef43209f3ad94ee18a721ba094755acfa7d3f3bb3b854b",
-   "vendored_sha256": "870392fdbc33bfe4c7f2ffa6b032268914f4c05c506dc07bdb8aa92cfabb4bc9",
+   "source_sha256": "ff44f5216756f05c2e9f45fd7c7c66b6e79b7e9112dd3d41fa0a92a49222babc",
+   "vendored_sha256": "6a09ef932c15d15ecf205ce08f4545a77f99afff08c4f40b7fe3ce8320a68800",
    "license": "Apache-2.0",
-   "rewritten_imports": 26,
+   "rewritten_imports": 58,
    "patches": [
     "P3"
    ],
-   "bytes": 624561
+   "bytes": 968912
   },
   {
    "path": "gated_attention_block/cache_write_contract.py",
    "source": "python/cudnn/gated_attention_block/cache_write_contract.py",
-   "source_sha256": "873935262303f7cfffc5556b9af5ae89356c211c570af682267d4eee67214699",
-   "vendored_sha256": "873935262303f7cfffc5556b9af5ae89356c211c570af682267d4eee67214699",
+   "source_sha256": "cbba8b8a47fd5723fd4f8b092b816cd87737044d04197c077d462df9aec1059d",
+   "vendored_sha256": "cbba8b8a47fd5723fd4f8b092b816cd87737044d04197c077d462df9aec1059d",
    "license": "Apache-2.0",
    "rewritten_imports": 0,
    "patches": [],
-   "bytes": 3881
+   "bytes": 7936
   },
   {
    "path": "gated_attention_block/kernels/__init__.py",
    "source": "python/cudnn/gated_attention_block/kernels/__init__.py",
-   "source_sha256": "647e6e11188d8d4bfabce73dfe4edcfb4df28431b56f32db2aed8c76dcf9bce9",
-   "vendored_sha256": "647e6e11188d8d4bfabce73dfe4edcfb4df28431b56f32db2aed8c76dcf9bce9",
+   "source_sha256": "2eecb29e387750555d647b735310a3cb58913fe665b5066ebd77015bcdbccfc5",
+   "vendored_sha256": "2eecb29e387750555d647b735310a3cb58913fe665b5066ebd77015bcdbccfc5",
    "license": "Apache-2.0",
    "rewritten_imports": 0,
    "patches": [],
-   "bytes": 3665
+   "bytes": 8174
   },
   {
    "path": "gated_attention_block/kernels/cache_write.py",
@@ -470,12 +890,12 @@
   {
    "path": "gated_attention_block/kernels/proj_gemm.py",
    "source": "python/cudnn/gated_attention_block/kernels/proj_gemm.py",
-   "source_sha256": "a2b931295e045f77364192cface57b4ccf6a85eefb129dbb663f7f2ed63a151a",
-   "vendored_sha256": "e973f9f38bec5d8105a51ba42d4197e63b88eee75391e34f2d938c72f97d56d1",
+   "source_sha256": "a985f7b813b5113baf99e39d9678b67e7e1c65a7611baebe20b01bceb9a7b30b",
+   "vendored_sha256": "47292152a2cb998dabc9a50899f3c66a47c5979cdf25a8a2864cfe7a0479cddf",
    "license": "Apache-2.0",
    "rewritten_imports": 23,
    "patches": [],
-   "bytes": 169785
+   "bytes": 172039
   },
   {
    "path": "gated_attention_block/kernels/proj_gemm_norm_rope.py",
@@ -514,6 +934,68 @@
    "bytes": 128188
   },
   {
+   "path": "gated_attention_block/kernels/qsa_canonical_list.py",
+   "source": "python/cudnn/gated_attention_block/kernels/qsa_canonical_list.py",
+   "source_sha256": "e11323cc674a5598dce5c204fad6d252577ec78742f51d54595ddd6a0fbdd9de",
+   "vendored_sha256": "25855ed217af33599118108257fbc934881c3bc222904b2539eb4272b7d31279",
+   "license": "Apache-2.0",
+   "rewritten_imports": 5,
+   "patches": [],
+   "bytes": 25045
+  },
+  {
+   "path": "gated_attention_block/kernels/qsa_compress.py",
+   "source": "python/cudnn/gated_attention_block/kernels/qsa_compress.py",
+   "source_sha256": "13a84b91ba3857cdc080e5dff4b414f126ce6095798a8bd7494dcf47334ad127",
+   "vendored_sha256": "ba4cfcc495841d1d3bb6d6a5541d16358e62432f607a38e068a9e38096696f80",
+   "license": "Apache-2.0",
+   "rewritten_imports": 6,
+   "patches": [],
+   "bytes": 97928
+  },
+  {
+   "path": "gated_attention_block/kernels/qsa_kbar_gather.py",
+   "source": "python/cudnn/gated_attention_block/kernels/qsa_kbar_gather.py",
+   "source_sha256": "6e4145f7e7a9159386d78a6e720ee91725f83afc75b50e09276185fe6124df77",
+   "vendored_sha256": "a0792f86801ade76a6c0c1a2f6abbf044e58d5687faaffcf6799423c8d48beb6",
+   "license": "Apache-2.0",
+   "rewritten_imports": 6,
+   "patches": [],
+   "bytes": 31390
+  },
+  {
+   "path": "gated_attention_block/kernels/qsa_prepare.py",
+   "source": "python/cudnn/gated_attention_block/kernels/qsa_prepare.py",
+   "source_sha256": "458d03ef02c3c2f6f6e4a4d0aabe9f18a1f2fd3fc39a2e80207603adfbd6acc3",
+   "vendored_sha256": "6c23b86fa66f19f02b5ca16c5119bcfcbe6e9f32fc709526febb3764fe66c810",
+   "license": "Apache-2.0",
+   "rewritten_imports": 5,
+   "patches": [],
+   "bytes": 82645
+  },
+  {
+   "path": "gated_attention_block/kernels/qsa_score_paged.py",
+   "source": "python/cudnn/gated_attention_block/kernels/qsa_score_paged.py",
+   "source_sha256": "3444d482637ed2547458809c1c2c78966ef678cdbb7dfff005bf11d3a0f080b5",
+   "vendored_sha256": "789f448047365f344f2ce762d02940f837e11f168a72b9aaf3fcb67609fa3483",
+   "license": "Apache-2.0",
+   "rewritten_imports": 8,
+   "patches": [],
+   "bytes": 77633
+  },
+  {
+   "path": "gated_attention_block/kernels/qsa_topk_decode.py",
+   "source": "python/cudnn/gated_attention_block/kernels/qsa_topk_decode.py",
+   "source_sha256": "4a22915e0d397e1ae663210a61caa69c304ca58f9f7e4747527b0488c99cc039",
+   "vendored_sha256": "e885fd512e43f714d1bda6259cf0eed673fd881bcab857ff78eb964ac48bc069",
+   "license": "Apache-2.0",
+   "rewritten_imports": 6,
+   "patches": [
+    "P3"
+   ],
+   "bytes": 104737
+  },
+  {
    "path": "gated_attention_block/kernels/quantize.py",
    "source": "python/cudnn/gated_attention_block/kernels/quantize.py",
    "source_sha256": "fc8770e69941c3bd22d108f6b410e15a9f93638294cc8206aa98bf1afef45b9e",
@@ -534,6 +1016,16 @@
    "bytes": 105246
   },
   {
+   "path": "gated_attention_block/qsa_topk.py",
+   "source": "python/cudnn/gated_attention_block/qsa_topk.py",
+   "source_sha256": "460f19350a64bf798790702b4ce9193e5ff075988634c0e4869a5af2ff632c96",
+   "vendored_sha256": "90328eebb8edc8e274a51ef5d79f11fce7a2d65686f2e9e451d655f7727a830c",
+   "license": "Apache-2.0",
+   "rewritten_imports": 2,
+   "patches": [],
+   "bytes": 3567
+  },
+  {
    "path": "gemm/__init__.py",
    "source": "python/cudnn/gemm/__init__.py",
    "source_sha256": "8e2be8964988d64dd469ce85980d1553c6a79b3482f6469437f37b976751b621",
@@ -548,106 +1040,106 @@
   {
    "path": "gemm/frost/__init__.py",
    "source": "python/cudnn/gemm/frost/__init__.py",
-   "source_sha256": "6c45af3d84855a39f56ce00c99c83e91f5cd52028939cd7f646efa07a0501a64",
-   "vendored_sha256": "6c45af3d84855a39f56ce00c99c83e91f5cd52028939cd7f646efa07a0501a64",
+   "source_sha256": "754e1fb94d4750f21a86df10c4b51039e52ea20488c7398d36ba5e81a53786bd",
+   "vendored_sha256": "754e1fb94d4750f21a86df10c4b51039e52ea20488c7398d36ba5e81a53786bd",
    "license": "MIT",
    "rewritten_imports": 0,
    "patches": [],
-   "bytes": 544
+   "bytes": 302
   },
   {
    "path": "gemm/frost/arch_family.py",
    "source": "python/cudnn/gemm/frost/arch_family.py",
-   "source_sha256": "bfe209674efe025e8772684e3f48c9520a0970e26bd7115f665a5bbcc3cab5a2",
-   "vendored_sha256": "3c96d5ab0913b0b7dc026ef15fcba5ea77312622c51ee0520a2943aa3aac625f",
+   "source_sha256": "56cc4fdc10e47b23392816128e326f3f30f93e980fe9441f064e66d4145ddbbe",
+   "vendored_sha256": "25ded93adc250cac0b5f4cda410e7333b788067aae0a835f401cfd35c0189a66",
    "license": "MIT",
    "rewritten_imports": 1,
    "patches": [
     "P6"
    ],
-   "bytes": 4990
+   "bytes": 2627
   },
   {
    "path": "gemm/frost/compiler.py",
    "source": "python/cudnn/gemm/frost/compiler.py",
-   "source_sha256": "ffb1a3b83fb999d2bfd368a7d72854aca502fb8b4e8d8cb43466ff7e1025f2ce",
-   "vendored_sha256": "ffb1a3b83fb999d2bfd368a7d72854aca502fb8b4e8d8cb43466ff7e1025f2ce",
+   "source_sha256": "24e0e1e73db83304e6be61eab2b027804a852a4d083311ff82850970de38ce15",
+   "vendored_sha256": "f054dab1e2806ee5101b657e190e50e8374c39d5c4c591a37e6a530f4a8bec3c",
    "license": "MIT",
-   "rewritten_imports": 0,
+   "rewritten_imports": 3,
    "patches": [],
-   "bytes": 1528
+   "bytes": 87858
   },
   {
    "path": "gemm/frost/dtypes.py",
    "source": "python/cudnn/gemm/frost/dtypes.py",
-   "source_sha256": "b5b9303b05e1963ca979ae9a675052c2d6fd358375a1dc997d194dc0adf8e59b",
-   "vendored_sha256": "147630ec31a6da385fd422d36dfe971955035e9226c9c56a78093cd8b82fa98e",
+   "source_sha256": "5188062ed761ce719043d2a3f8def9592bf52bec327969a3ee374d4717f179f9",
+   "vendored_sha256": "ace67aed10377e5b08ab54d3ca51376101752212bca07cb038d8f12422f5e7df",
    "license": "MIT",
    "rewritten_imports": 1,
    "patches": [],
-   "bytes": 13652
+   "bytes": 8198
   },
   {
    "path": "gemm/frost/engine.py",
    "source": "python/cudnn/gemm/frost/engine.py",
-   "source_sha256": "8804aefd033b0419b3b300e2304922d04668bfdf0aceefec972e38967ec011fa",
-   "vendored_sha256": "7d5a79d7f47bb5805e75f5497cf98b72028c41027cd61fb318f46fbd52a7d639",
+   "source_sha256": "4cebb51cc79df5c1d750c39840aca508602d6d973d2885326e2c223c7642e88c",
+   "vendored_sha256": "4efa04aaaa71ea503b816f20a321e51bc2b3e8ff8cb8f52625c65a1311ab258f",
    "license": "Apache-2.0",
    "rewritten_imports": 5,
    "patches": [],
-   "bytes": 8026
+   "bytes": 5395
   },
   {
    "path": "gemm/frost/epilogue_codegen.py",
    "source": "python/cudnn/gemm/frost/epilogue_codegen.py",
-   "source_sha256": "1a8343be53beb144b079329d57c3da1289323d987e2d09a5c4c24d1528db2c4c",
-   "vendored_sha256": "1a8343be53beb144b079329d57c3da1289323d987e2d09a5c4c24d1528db2c4c",
+   "source_sha256": "32e4eb5b75335ecc6f067c40ce9cd41d4067230ea2e7e9c9352738986f8a21c9",
+   "vendored_sha256": "32e4eb5b75335ecc6f067c40ce9cd41d4067230ea2e7e9c9352738986f8a21c9",
    "license": "MIT",
    "rewritten_imports": 0,
    "patches": [],
-   "bytes": 903
+   "bytes": 54020
   },
   {
    "path": "gemm/frost/fusion_ir.py",
    "source": "python/cudnn/gemm/frost/fusion_ir.py",
-   "source_sha256": "c2ffbdd5364a9df96306a787195997c1917e46af118eac2fc05b04a3fedeaa16",
-   "vendored_sha256": "c2ffbdd5364a9df96306a787195997c1917e46af118eac2fc05b04a3fedeaa16",
+   "source_sha256": "822049951346fcbe925d19a7275f7dc352b54363db64e8501f0c2f74f41753ea",
+   "vendored_sha256": "822049951346fcbe925d19a7275f7dc352b54363db64e8501f0c2f74f41753ea",
    "license": "MIT",
    "rewritten_imports": 0,
    "patches": [],
-   "bytes": 50827
+   "bytes": 38991
   },
   {
    "path": "gemm/frost/graph_analyzer.py",
    "source": "python/cudnn/gemm/frost/graph_analyzer.py",
-   "source_sha256": "d92a46ce14c54ffe90a9ea73ea212e9297c52d750d2cc9280fc867a51a9b68b3",
-   "vendored_sha256": "2bb5e3dfe328c519ae9fbb9c6bd18ad9ee24801f9c226327b2e1bbd4bf519b5a",
+   "source_sha256": "6a2a223841a69c01ae1e93298f4766b3bee67d3d468298ed2630e72ec6d72ba2",
+   "vendored_sha256": "94b557895cb88a03034b496415d292c8ba574b6d986aafa34888f3b141c2aab3",
    "license": "MIT",
    "rewritten_imports": 1,
    "patches": [],
-   "bytes": 96634
+   "bytes": 81257
   },
   {
    "path": "gemm/frost/heuristics.py",
    "source": "python/cudnn/gemm/frost/heuristics.py",
-   "source_sha256": "4bd3820f772979d7aee31b40cbf0780cd6b0f629def8ddc3238b1431a841ee1a",
-   "vendored_sha256": "d4d8526839a61b7bea6276b314b29bf72b7dcedf116ed482d722775e3b5e05e5",
+   "source_sha256": "841d69a3d4cde2aff9b035d6326dc8d0ee8b6e2ee129b70bb20d8fdffa6de9f6",
+   "vendored_sha256": "8b64ed271754823c693374982899c884a13d2c4c3b9379c90ddfea8864f4a40a",
    "license": "Apache-2.0",
    "rewritten_imports": 1,
    "patches": [],
-   "bytes": 3133
+   "bytes": 2760
   },
   {
    "path": "gemm/frost/kernel_registry.py",
    "source": "python/cudnn/gemm/frost/kernel_registry.py",
-   "source_sha256": "89582406b4818d1028a1947d9e5b79c2c57b4a85a9fd40c409d006f80fe041aa",
-   "vendored_sha256": "31814ce788b9a6600bf4d39ba1730b19312938207567a7fbdd745c729fb7432e",
+   "source_sha256": "cb482661fe6ac4feb0e7d38009d689f752daf0569d9a65c87f6003ae826f4153",
+   "vendored_sha256": "0c91e1ccfabf7c3a66c7db626a86b4fb9ed356fedf702b8347aa0f02768d6738",
    "license": "MIT",
    "rewritten_imports": 0,
    "patches": [
     "P6"
    ],
-   "bytes": 49554
+   "bytes": 43614
   },
   {
    "path": "gemm/frost/kernel_templates/dynamic_scheduler_counter_initialization.py",
@@ -662,92 +1154,92 @@
   {
    "path": "gemm/frost/kernel_templates/split_k_reduction_epilogue_fusion.py",
    "source": "python/cudnn/gemm/frost/kernel_templates/split_k_reduction_epilogue_fusion.py",
-   "source_sha256": "9047b774fc18eac0c6a640e3191b01508af591422d910ba960227acda37a3670",
-   "vendored_sha256": "9047b774fc18eac0c6a640e3191b01508af591422d910ba960227acda37a3670",
+   "source_sha256": "23d751ecf5049ab6ca179867732bc9ea7d014b463a915e3eb30e8e5c67b0fda0",
+   "vendored_sha256": "23d751ecf5049ab6ca179867732bc9ea7d014b463a915e3eb30e8e5c67b0fda0",
    "license": "MIT",
    "rewritten_imports": 0,
    "patches": [],
-   "bytes": 5531
+   "bytes": 4099
   },
   {
    "path": "gemm/frost/knobs.py",
    "source": "python/cudnn/gemm/frost/knobs.py",
-   "source_sha256": "56f64c8b75fc816057b27d4307ea8180f5c5f37436cfa8cf5a70275ecd607365",
-   "vendored_sha256": "b567d50bb00fcdadeb5466fa75170fdc2330440e8f4876c29225b56e592b8fca",
+   "source_sha256": "cda53cd7a118128a01c2716225ab19cd704fc3ec8a887beaf982f507d3bedc42",
+   "vendored_sha256": "5bd7941addb7020aead620c36874d5e1f7556638498023810a883f6f9398607c",
    "license": "Apache-2.0",
    "rewritten_imports": 1,
    "patches": [],
-   "bytes": 7691
+   "bytes": 6688
   },
   {
    "path": "gemm/frost/recipe.py",
    "source": "python/cudnn/gemm/frost/recipe.py",
-   "source_sha256": "5e218191cdd7382f4168fdc785eca9870bfd47c8a1eded7bbed3bed802a64aa8",
-   "vendored_sha256": "581be4f9bcba8f7fbf0ab81a619e47bd4019a369cdf85a6d5d53c7f2a090332d",
+   "source_sha256": "223b751a3870c7d1893f15dd4d107820b7b6a44f017baf678944365e40a738fe",
+   "vendored_sha256": "2735976042cb9d8a2c1df79e0da72c0568eb7974e130fbd9659e9704b1846bb1",
    "license": "Apache-2.0",
    "rewritten_imports": 1,
    "patches": [],
-   "bytes": 28040
+   "bytes": 21866
   },
   {
    "path": "gemm/frost/sm100/__init__.py",
    "source": "python/cudnn/gemm/frost/sm100/__init__.py",
-   "source_sha256": "a4cb20b913e86c989a12135da7a51cf77fdf715d5da4d11ba6b70e16894f0b8b",
-   "vendored_sha256": "a4cb20b913e86c989a12135da7a51cf77fdf715d5da4d11ba6b70e16894f0b8b",
+   "source_sha256": "467ff58d4a53ee223b727e0cc55d15e7fe79b796763733b75d1babc607cbcf2d",
+   "vendored_sha256": "467ff58d4a53ee223b727e0cc55d15e7fe79b796763733b75d1babc607cbcf2d",
    "license": "MIT",
    "rewritten_imports": 0,
    "patches": [],
-   "bytes": 581
+   "bytes": 145
   },
   {
    "path": "gemm/frost/sm100/compiler.py",
    "source": "python/cudnn/gemm/frost/sm100/compiler.py",
-   "source_sha256": "15e0d8df2f878c88d5dba82b32f507560a47eceb1d430d58c8ec72c87fcaab10",
-   "vendored_sha256": "1b84776771905051585175ce41234fdc90719ac44230125b93df3eb918f1de94",
+   "source_sha256": "9718d7e4c6bb126f55b830a48f3bf65f276c885862b9257227b1185190216979",
+   "vendored_sha256": "b69494874e416f2aaabedd8e9a05a19192d14863e19c7be50a504d7dfb9f4ed7",
    "license": "MIT",
    "rewritten_imports": 9,
    "patches": [],
-   "bytes": 280228
+   "bytes": 144970
   },
   {
    "path": "gemm/frost/sm100/epilogue_codegen.py",
    "source": "python/cudnn/gemm/frost/sm100/epilogue_codegen.py",
-   "source_sha256": "26d22a4afff1270cecc5dbbc86109199e19bc997cb91500d09e33d4d8f5b9d53",
-   "vendored_sha256": "26d22a4afff1270cecc5dbbc86109199e19bc997cb91500d09e33d4d8f5b9d53",
+   "source_sha256": "5105f73ee8e1606c9766c16496ecddc399ead9039516c2074dc4ac7493a09903",
+   "vendored_sha256": "5105f73ee8e1606c9766c16496ecddc399ead9039516c2074dc4ac7493a09903",
    "license": "MIT",
    "rewritten_imports": 0,
    "patches": [],
-   "bytes": 86534
+   "bytes": 29474
   },
   {
    "path": "gemm/frost/sm100/kernel_templates/sm100_matmul.py",
    "source": "python/cudnn/gemm/frost/sm100/kernel_templates/sm100_matmul.py",
-   "source_sha256": "9aad7f400b8f00f6794c23e50c18330e8b45d83c0ac75f73c016f2836699b95c",
-   "vendored_sha256": "79ebb7531285da65ba86e751353646ef6a2baf2e86139a386f8a3679079d2b34",
+   "source_sha256": "4ccf2c6ccbcd41673c5602dc9062a7c364ad2cd970b3de640d752a9fc94ad335",
+   "vendored_sha256": "f4e5db2c75701cb9adccdf71f3131584a671b9b64530ea3171398a91f7c5cdee",
    "license": "MIT",
    "rewritten_imports": 3,
    "patches": [],
-   "bytes": 69742
+   "bytes": 66571
   },
   {
    "path": "gemm/frost/tile_config.py",
    "source": "python/cudnn/gemm/frost/tile_config.py",
-   "source_sha256": "aa2d560a1bc35cbf7a1cb3b5f1763b6b626a2a15eea6b07c828148df40f3b7a5",
-   "vendored_sha256": "35c0ab3dd97d9611f6bae4d991b50e4e94e2dbb6277ebf9b9b24d2bf334ea312",
+   "source_sha256": "c5ecdd4be0b354a75080bf8dcc63dd67c13a99b8078741b940ede341a993b199",
+   "vendored_sha256": "894be4095d3d86f72d38cdf95d28b6ca0e69a26250311b9a60d711cc8cac6001",
    "license": "MIT",
    "rewritten_imports": 7,
    "patches": [],
-   "bytes": 61233
+   "bytes": 43254
   },
   {
    "path": "gemm/frost/tile_helpers.py",
    "source": "python/cudnn/gemm/frost/tile_helpers.py",
-   "source_sha256": "5064a832461248d6f2b55e7ffaca48283dfd1debf8598c9231562c9213ddbf77",
-   "vendored_sha256": "5064a832461248d6f2b55e7ffaca48283dfd1debf8598c9231562c9213ddbf77",
+   "source_sha256": "b7ae7a3b9333e202c67aa6aa7c55985f26cad6f8a64fd2dd6cb3aeec652c4bed",
+   "vendored_sha256": "b7ae7a3b9333e202c67aa6aa7c55985f26cad6f8a64fd2dd6cb3aeec652c4bed",
    "license": "MIT",
    "rewritten_imports": 0,
    "patches": [],
-   "bytes": 16125
+   "bytes": 22334
   },
   {
    "path": "graph_types.py",
@@ -782,34 +1274,34 @@
   {
    "path": "sdpa/bwd/__init__.py",
    "source": "python/cudnn/sdpa/bwd/__init__.py",
-   "source_sha256": "f84b1a1eec4d5e856884381cbcdbf8a9eecb335d0649ad8d5729929dc1b1292d",
-   "vendored_sha256": "f84b1a1eec4d5e856884381cbcdbf8a9eecb335d0649ad8d5729929dc1b1292d",
+   "source_sha256": "9baf3e698854b37cf7f4f66a25a6b76498925f0b239bbd02ff3a5616ced7edbc",
+   "vendored_sha256": "9baf3e698854b37cf7f4f66a25a6b76498925f0b239bbd02ff3a5616ced7edbc",
    "license": "Apache-2.0",
    "rewritten_imports": 0,
    "patches": [],
-   "bytes": 2102
+   "bytes": 1936
   },
   {
    "path": "sdpa/bwd/config_sm100.py",
    "source": "python/cudnn/sdpa/bwd/config_sm100.py",
-   "source_sha256": "386a8b00e5fe049ffb5c39568ae93ef0a4a7c59243b81c20d96e3664941e00c8",
-   "vendored_sha256": "df6a9726d881823b42e30a2e102c2beda52b2007606255fe078b41a8d161d78e",
+   "source_sha256": "a59be899836cde4b37378db14ff3bcca035de4542d8b25a1ecf4c742070587ba",
+   "vendored_sha256": "a62984c3e197957c59ee0bfb067ac3ad783b8b813fde72e749882e65ebbba12c",
    "license": "MIT",
-   "rewritten_imports": 1,
+   "rewritten_imports": 2,
    "patches": [
     "P3"
    ],
-   "bytes": 79795
+   "bytes": 80510
   },
   {
    "path": "sdpa/bwd/config_sm107.py",
    "source": "python/cudnn/sdpa/bwd/config_sm107.py",
-   "source_sha256": "4af070630b87758b9dde39a1465d6556c99aec509a8f9a5981a01f9173937127",
-   "vendored_sha256": "20ffad189b8c0bf6522c08b0a9753d1c2a657610ba1d80376ea31c459c54b97a",
+   "source_sha256": "005ed277a69adb3610d369c75b9be450703338f7d15cc382829d8cd603b3ce1e",
+   "vendored_sha256": "da0cc4f6f1944719711c3b7022ff982d60d7d9b6f14605c0e08334252a2bd87f",
    "license": "MIT",
    "rewritten_imports": 2,
    "patches": [],
-   "bytes": 119872
+   "bytes": 121448
   },
   {
    "path": "sdpa/fwd/__init__.py",
@@ -824,58 +1316,56 @@
   {
    "path": "sdpa/fwd/api_dsl.py",
    "source": "python/cudnn/sdpa/fwd/api_dsl.py",
-   "source_sha256": "6e7a12355d16307f5864da766935ee8a1b7cea66bdfe9931fa5682b4f73e608d",
-   "vendored_sha256": "b8cce63f1ae33a244e52350ecbf3ededdc8d8373a36b2fb19d8a45b1b360cbba",
+   "source_sha256": "31d1e2e25d6f720f43f28f48efbf015851648690eeec9e3b6899b7fa9034c466",
+   "vendored_sha256": "1c0c2124cf6e5962e7ba96fa89957b58c62086823abf83beafaf46ef885187f1",
    "license": "Apache-2.0 AND MIT",
-   "rewritten_imports": 107,
-   "patches": [
-    "P3"
-   ],
-   "bytes": 411456
+   "rewritten_imports": 120,
+   "patches": [],
+   "bytes": 427277
   },
   {
    "path": "sdpa/fwd/config_d128_family.py",
    "source": "python/cudnn/sdpa/fwd/config_d128_family.py",
-   "source_sha256": "b067d555e5a589e66eeb76e2f6f268dc700fea969b935d726d8bcd56481c35f3",
-   "vendored_sha256": "e1ff447ab7ce7a10467beb302dbe24edc3527060349b1f3c0284110d657a43a6",
+   "source_sha256": "45bf8507da1b320c4be0b13558e048bdb8dc0b6c9015746de7d13f372304ac65",
+   "vendored_sha256": "8552055a198b60a529dd224590af9d42db25426c4f7bdafd5f754da49d69c6c3",
    "license": "MIT",
    "rewritten_imports": 2,
    "patches": [],
-   "bytes": 71373
+   "bytes": 71675
   },
   {
    "path": "sdpa/fwd/config_sm100.py",
    "source": "python/cudnn/sdpa/fwd/config_sm100.py",
-   "source_sha256": "1407bb555d3f29d983923c852e76f33bea427b0aa83c6c903c225497466898a2",
-   "vendored_sha256": "145e1ebfaf6e1562f7b8b12595c5bd999e595b8c70b79fb670bfab105d69bc43",
+   "source_sha256": "bb8088a1e517bdbac0b80427cc969491a64cd605c5aa56022fd8ef821e1bdd4b",
+   "vendored_sha256": "08e4323ae7d1779c435d6b59890e79ba88d1458ac1b6a1347ea1ac27e4175cda",
    "license": "MIT",
-   "rewritten_imports": 3,
+   "rewritten_imports": 4,
    "patches": [
     "P3"
    ],
-   "bytes": 218656
+   "bytes": 229167
   },
   {
    "path": "sdpa/fwd/config_sm107.py",
    "source": "python/cudnn/sdpa/fwd/config_sm107.py",
-   "source_sha256": "842052337e36909af50a0e0097d150be767bf496c4e39891af968792c7da0256",
-   "vendored_sha256": "c8dc6e6108ae93ac3f97e8c56fc71d6f9d0ee99a8fabe7191dc602695cb44e43",
+   "source_sha256": "e571a226bf5a0e9874d3cf6649443264404ec28bf7c3a90b97f6f35682d6c540",
+   "vendored_sha256": "1cf7072d674ced81e417991044113483e04757966ce01abdb643037b62c78dbf",
    "license": "MIT",
-   "rewritten_imports": 7,
+   "rewritten_imports": 8,
    "patches": [
     "P3"
    ],
-   "bytes": 252969
+   "bytes": 280445
   },
   {
    "path": "sdpa/fwd/config_sm120.py",
    "source": "python/cudnn/sdpa/fwd/config_sm120.py",
-   "source_sha256": "f65c48b15576853434ff85e65fc48e0e755686384ee734476edad2c4d2f93b61",
-   "vendored_sha256": "4cfa2a345225e5f59808fa9b48ba4fee71febd9de3bbfe1bbb9bcffb0f19e508",
+   "source_sha256": "579f8bc9beb000b7c87200d1bd4e8c4118f00538ed0d2e9be2779d67d9f4398a",
+   "vendored_sha256": "b7ca3379fc99f7c535f414b3df610df64b9e01f8348ccf4ad00dd0ecac7162a3",
    "license": "MIT",
    "rewritten_imports": 3,
    "patches": [],
-   "bytes": 13349
+   "bytes": 19367
   },
   {
    "path": "sdpa/fwd/config_sm80.py",
@@ -890,34 +1380,34 @@
   {
    "path": "sdpa/fwd/config_sm90.py",
    "source": "python/cudnn/sdpa/fwd/config_sm90.py",
-   "source_sha256": "02832d19ec996756a28b43505172bcadeab249ee1eb6d51fcece4b2baeef8a8f",
-   "vendored_sha256": "248edd032f0f55b966c3bcc696026c5001dcc27164368e5ffb795e29280b797a",
+   "source_sha256": "374d27f5713b33c19ff8b450765bbc1b81e4c173b5870e41b84972aceaef15de",
+   "vendored_sha256": "46a5edb37ec33f2af11c294b7f9c4a439555e41f18ffce4870084f540ea47b8c",
    "license": "MIT",
-   "rewritten_imports": 2,
+   "rewritten_imports": 4,
    "patches": [],
-   "bytes": 6239
+   "bytes": 8522
   },
   {
    "path": "sdpa/fwd/engines.py",
    "source": "python/cudnn/sdpa/fwd/engines.py",
-   "source_sha256": "85ed5eb23399a882e689e0f83a4ada4b4533088f76e2e4389b4f233c0ee64086",
-   "vendored_sha256": "c9da7d6c3fc98795a2f1dde8d2c5ff34e808cec853be23b8cb093a51fbb82369",
+   "source_sha256": "9745067a48053c86117091831287aae0c3080f139a81c75a1cec2fdde3f704ae",
+   "vendored_sha256": "0070da52911c796cc770e9e47bce577d967ea244be2877d7a1de850d65ee3f6e",
    "license": "MIT",
-   "rewritten_imports": 27,
+   "rewritten_imports": 31,
    "patches": [
     "P3"
    ],
-   "bytes": 227439
+   "bytes": 245360
   },
   {
    "path": "sdpa/fwd/heuristics.py",
    "source": "python/cudnn/sdpa/fwd/heuristics.py",
-   "source_sha256": "d1ef6f4115889616fd189381765cf2581bd1a464991a17ea8552d0e1397a2535",
-   "vendored_sha256": "505f928ea20b06cebacdf37c9a4f4024835138218388ffbaafb9d4761a146176",
+   "source_sha256": "6226b722ec4f24dbe9f52ddad05fc2786fc0c3b45dc7be8ac5b1f394ede46607",
+   "vendored_sha256": "1462c2703e1a13a8aa7816318f22c790a1c379b6ed237c4cde639710b535f864",
    "license": "Apache-2.0",
-   "rewritten_imports": 10,
+   "rewritten_imports": 12,
    "patches": [],
-   "bytes": 173677
+   "bytes": 191798
   },
   {
    "path": "sdpa/fwd/kernels/__init__.py",
@@ -932,12 +1422,12 @@
   {
    "path": "sdpa/fwd/kernels/_common_blackwell.py",
    "source": "python/cudnn/sdpa/fwd/kernels/_common_blackwell.py",
-   "source_sha256": "49c37fd0da51bbc458b2a42ada8fe7f2fe4f0332be305ddb7a957c89408aeb0b",
-   "vendored_sha256": "5ddb9cad5e0e466c1b2ed942a47e60fb9258f818287ee76450194c16443c6646",
+   "source_sha256": "8f1457db4a823a57feedef46c96a81f17c7e45151134695d58f6c90d15f4a2a5",
+   "vendored_sha256": "c5c7e222fced1dd53211d80d81a92db4020e20224c78f596e5b6977c1995e0ea",
    "license": "MIT",
-   "rewritten_imports": 8,
+   "rewritten_imports": 7,
    "patches": [],
-   "bytes": 101352
+   "bytes": 105525
   },
   {
    "path": "sdpa/fwd/kernels/_quantized.py",
@@ -952,12 +1442,12 @@
   {
    "path": "sdpa/fwd/kernels/_thd_split_host.py",
    "source": "python/cudnn/sdpa/fwd/kernels/_thd_split_host.py",
-   "source_sha256": "d2002b93154243954905e0b41b9e5b9db665bb0bab06ae12345306de34476308",
-   "vendored_sha256": "d261d1112f052c024f97e9d5f48a1921a39bcdfbc5e144cedb31dc9d34f1e465",
+   "source_sha256": "ffc7d170fe46f45ec05d66c6ba3041ae1dc6503c367f45289b125c99d69a7500",
+   "vendored_sha256": "40a6da1166a91d2cf473a603698f5dbfb715396f2733b52bd52502ebece08d7f",
    "license": "MIT",
    "rewritten_imports": 2,
    "patches": [],
-   "bytes": 6153
+   "bytes": 10016
   },
   {
    "path": "sdpa/fwd/kernels/sm100/__init__.py",
@@ -972,22 +1462,22 @@
   {
    "path": "sdpa/fwd/kernels/sm100/prefill_d256_f16.py",
    "source": "python/cudnn/sdpa/fwd/kernels/sm100/prefill_d256_f16.py",
-   "source_sha256": "764e34c1b32265b27a8495cdbd66a841463195370d9bda97f9d6d26819b3395a",
-   "vendored_sha256": "e513ff1a8d8de640a10c05c23cd75d4435d093530b6c8f449d3bf196b62f9220",
+   "source_sha256": "cd9d18f0ff4ecb72028c7a2164e7f86c9e75a62cc4107d1551b6f9b1204e26eb",
+   "vendored_sha256": "bf5e5866594e99096eb615b1ee54c14dfebca9e90361f68c234954543c48a22e",
    "license": "MIT",
-   "rewritten_imports": 16,
+   "rewritten_imports": 18,
    "patches": [],
-   "bytes": 118025
+   "bytes": 136378
   },
   {
    "path": "sdpa/fwd/kernels/sm100/split_combine.py",
    "source": "python/cudnn/sdpa/fwd/kernels/sm100/split_combine.py",
-   "source_sha256": "7eb370a32b64211719d042877fc8f348cf63588b90f52339ba19a60b0c9913cf",
-   "vendored_sha256": "26e9df3dc37229d5d09c60d483a070b3501a58ca4b621f8f30bcfd0c30c1d44d",
+   "source_sha256": "debd9b2161e28eda1425ab5e2fabb4800ab54d338130c28592c016c4b7383265",
+   "vendored_sha256": "eaef7645909e7c147578786dc8f2b50478c4e7f64f579837e9b7cb70744e4006",
    "license": "MIT",
-   "rewritten_imports": 7,
+   "rewritten_imports": 8,
    "patches": [],
-   "bytes": 158257
+   "bytes": 200034
   },
   {
    "path": "sdpa/fwd/kernels/sm107/__init__.py",
@@ -998,6 +1488,16 @@
    "rewritten_imports": 0,
    "patches": [],
    "bytes": 235
+  },
+  {
+   "path": "sdpa/fwd/kernels/sm107/_sparse_item_common.py",
+   "source": "python/cudnn/sdpa/fwd/kernels/sm107/_sparse_item_common.py",
+   "source_sha256": "fcf86a6d8730d04d1d038bf567eb804e72f3049823d3e2ddc61a3fcfcc3d0bfa",
+   "vendored_sha256": "fcf86a6d8730d04d1d038bf567eb804e72f3049823d3e2ddc61a3fcfcc3d0bfa",
+   "license": "MIT",
+   "rewritten_imports": 0,
+   "patches": [],
+   "bytes": 7538
   },
   {
    "path": "sdpa/fwd/kernels/sm107/decode_d256_f16.py",
@@ -1020,34 +1520,104 @@
    "bytes": 119077
   },
   {
+   "path": "sdpa/fwd/kernels/sm107/sparse_d256_f16.py",
+   "source": "python/cudnn/sdpa/fwd/kernels/sm107/sparse_d256_f16.py",
+   "source_sha256": "6ec6d5a3b4635750cb168092158dc0c1c898bbc9a01e24bbca05650faeb024e2",
+   "vendored_sha256": "6919d250d8030636397df2bd0698a239cf68b135ba40c65817f7b29504a1af64",
+   "license": "MIT",
+   "rewritten_imports": 14,
+   "patches": [],
+   "bytes": 160409
+  },
+  {
+   "path": "sdpa/fwd/kernels/sm107/sparse_lean_d256_f16.py",
+   "source": "python/cudnn/sdpa/fwd/kernels/sm107/sparse_lean_d256_f16.py",
+   "source_sha256": "0c3e5243aa8e2f0bf69d70458f7bf095d69de8d6c7d0abdfcf16b0f400c4ca60",
+   "vendored_sha256": "e8d0300825732b662171301da816f3eb3903a19ff62e87ec97369cb3ab973958",
+   "license": "MIT",
+   "rewritten_imports": 10,
+   "patches": [],
+   "bytes": 74430
+  },
+  {
    "path": "sdpa/fwd/kernels/thd_helpers.py",
    "source": "python/cudnn/sdpa/fwd/kernels/thd_helpers.py",
-   "source_sha256": "23c88df6adf1a30cbd0c9e5b3f55dda0ec962cde182407932f4ae563f4700289",
-   "vendored_sha256": "74ee01957f5dbb555d6b33bac626d439e376bed67d203a78253564a527edf882",
+   "source_sha256": "7213f82a08a343f6a6ca1988d4080931a426e8658cee105a5b3b2d4a22b6a819",
+   "vendored_sha256": "c59282368423f314e0bc2ddc7f74be188a4aeeb530dd42e7cb60b2862f7298dc",
+   "license": "MIT",
+   "rewritten_imports": 4,
+   "patches": [],
+   "bytes": 22049
+  },
+  {
+   "path": "sdpa/fwd/kernels/thd_origins.py",
+   "source": "python/cudnn/sdpa/fwd/kernels/thd_origins.py",
+   "source_sha256": "728c062e6c446e2ad6ba681ebc5b0ab5ced2806da8ad06c583e6585ee9be12a4",
+   "vendored_sha256": "d76f9436ce54e8c4c69d0f07914f8a7da28241fe31d7e293d09127cd38cec4d7",
    "license": "MIT",
    "rewritten_imports": 3,
    "patches": [],
-   "bytes": 17072
+   "bytes": 14389
   },
   {
    "path": "sdpa/fwd/prepared.py",
    "source": "python/cudnn/sdpa/fwd/prepared.py",
-   "source_sha256": "7974a282d151982460e0ea233b6eb422cf78644e113ab81ee2e907e40bcbc73e",
-   "vendored_sha256": "26c706369ca36a8c870c6f1fb2917c95c3486880559e46f47e3a961282e23a21",
+   "source_sha256": "39679b100ecddc5056d71c963e6b482af8ff377eaaec39f58ba30ccd7990db85",
+   "vendored_sha256": "2db9915c5e8761ad7bff97fe4322541121f8b73894ed922b820523bdc3e2bd61",
+   "license": "MIT",
+   "rewritten_imports": 21,
+   "patches": [],
+   "bytes": 99195
+  },
+  {
+   "path": "sdpa/fwd/sparse_gqa_sm107.py",
+   "source": "python/cudnn/sdpa/fwd/sparse_gqa_sm107.py",
+   "source_sha256": "ec7b6e3e0013cc6344e0dfddea78af13426bb1e3cddd882ec5aa641f3ecbc679",
+   "vendored_sha256": "c5fe777ed4a8f8194e1f6e84bb828497f45f5bf08ba3673bc27f9f307e5b67ff",
    "license": "MIT",
    "rewritten_imports": 20,
    "patches": [],
-   "bytes": 94607
+   "bytes": 107721
+  },
+  {
+   "path": "sdpa/fwd/sparse_tile_rules.py",
+   "source": "python/cudnn/sdpa/fwd/sparse_tile_rules.py",
+   "source_sha256": "33a08236826a53c9667f6cb2f0e89ff5b4384e198529a0be23793cf5f56bdd18",
+   "vendored_sha256": "33a08236826a53c9667f6cb2f0e89ff5b4384e198529a0be23793cf5f56bdd18",
+   "license": "Apache-2.0",
+   "rewritten_imports": 0,
+   "patches": [],
+   "bytes": 29458
   },
   {
    "path": "sdpa/graph_analyzer.py",
    "source": "python/cudnn/sdpa/graph_analyzer.py",
-   "source_sha256": "df3514c27f90ad22bd287c034225d44f1fabf98986131940b859951dfbdece01",
-   "vendored_sha256": "69bd5a56888f893449e1317c9dc22f4eae2ecdf115b152462ee124ed87ab2616",
+   "source_sha256": "b469eb98e5f7cc637e9368ae4edf8c37b97fea1c8786edc180b5ec0263ec0394",
+   "vendored_sha256": "4d2538b0171df32e8f6cd443e569faf5640ec618760f80efbb004df5ff005be4",
    "license": "MIT",
-   "rewritten_imports": 5,
+   "rewritten_imports": 6,
    "patches": [],
-   "bytes": 72132
+   "bytes": 70758
+  },
+  {
+   "path": "sdpa/layout.py",
+   "source": "python/cudnn/sdpa/layout.py",
+   "source_sha256": "9b8c76a0c024b3bdfefb37c8cf524f2252b40b70bb845f52f0146eb0bc45496e",
+   "vendored_sha256": "9b8c76a0c024b3bdfefb37c8cf524f2252b40b70bb845f52f0146eb0bc45496e",
+   "license": "MIT",
+   "rewritten_imports": 0,
+   "patches": [],
+   "bytes": 1410
+  },
+  {
+   "path": "sdpa/native_sm80.py",
+   "source": "python/cudnn/sdpa/native_sm80.py",
+   "source_sha256": "a5d788ae38a303cffad0043b19eeeccb99cb0274b1d0b2e34027e60cbdfd799e",
+   "vendored_sha256": "9a233663bbff8dcdff3f385874ceaa22fd02e22b99acfc9d73038aac067abae2",
+   "license": "Apache-2.0",
+   "rewritten_imports": 2,
+   "patches": [],
+   "bytes": 3655
   },
   {
    "path": "tensor_adapter.py",
@@ -1062,12 +1632,12 @@
   {
    "path": "sdpa/fwd/_binding_reference.py",
    "source": "test/python/sdpa/frost/sdpa_binding_reference.py",
-   "source_sha256": "58bf1c41ba20ca9cb26eba266d3eeb65577cede813c00f10c1b2b948f0cb5063",
-   "vendored_sha256": "aa58c9906aae2c7d9c546c2075253b6413ddd2002542abd12a468d588d4b0bbc",
+   "source_sha256": "1c5b31c2bb46148236a17287081fad32f8b51d0709145fc22d7ca5ec792d5e53",
+   "vendored_sha256": "dd3e062f67a896b5283395e9470fcee37da7b832901c22beb390d577c2cfdeea",
    "license": "MIT",
-   "rewritten_imports": 4,
+   "rewritten_imports": 6,
    "patches": [],
-   "bytes": 56410,
+   "bytes": 59628,
    "extra": "the retired Python frame implementation of the SDPA launch binder (bind_dense / bind_dense_split / bind_thd, the paged pools and tables, the split combine)"
   }
  ],
@@ -1082,115 +1652,172 @@
  "import_map": {
   "cudnn": "flashinfer.experimental.qwen_3_5_block._cudnn_frost",
   "cudnn._compiled_module": "flashinfer.experimental.qwen_3_5_block._cudnn_frost._compiled_module",
-  "cudnn.frost.tile_dsl.tmem": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.frost.tile_dsl.tmem",
-  "cudnn.gated_attention_block.kernels.proj_gemm": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.gated_attention_block.kernels.proj_gemm",
-  "cudnn.frost.tile_dsl.handles": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.frost.tile_dsl.handles",
-  "cudnn.engines.engine_ids": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.engines.engine_ids",
-  "cudnn.sdpa.fwd.kernels.sm100": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.fwd.kernels.sm100",
-  "cudnn.frost.tile_dsl.requirements": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.frost.tile_dsl.requirements",
-  "cudnn.sdpa.fwd.kernels.sm100.split_combine": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.fwd.kernels.sm100.split_combine",
-  "cudnn.sdpa.graph_analyzer": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.graph_analyzer",
-  "cudnn._torch_stream": "flashinfer.experimental.qwen_3_5_block._cudnn_frost._torch_stream",
-  "cudnn.gated_attention_block.api": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.gated_attention_block.api",
-  "cudnn.sdpa.fwd.kernels._quantized": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.fwd.kernels._quantized",
-  "cudnn.sdpa.fwd.prepared": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.fwd.prepared",
+  "cudnn.gated_attention_block.qsa_topk": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.gated_attention_block.qsa_topk",
+  "cudnn.datatypes": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.datatypes",
+  "cudnn.gemm.frost.sm100.kernel_templates.sm100_matmul": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.gemm.frost.sm100.kernel_templates.sm100_matmul",
   "cudnn.gemm.frost.tile_config": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.gemm.frost.tile_config",
-  "cudnn.gated_attention_block.kernels.cache_write": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.gated_attention_block.kernels.cache_write",
-  "cudnn._gemm_validate": "flashinfer.experimental.qwen_3_5_block._cudnn_frost._gemm_validate",
-  "cudnn.gemm": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.gemm",
-  "cudnn.graph_types": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.graph_types",
-  "cudnn.gated_attention_block.kernels.proj_gemm_norm_rope": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.gated_attention_block.kernels.proj_gemm_norm_rope",
-  "cudnn.gemm.frost.compiler": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.gemm.frost.compiler",
+  "cudnn.gated_attention_block.kernels": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.gated_attention_block.kernels",
+  "cudnn.engines.base": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.engines.base",
+  "cudnn.sdpa.layout": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.layout",
+  "cudnn.sdpa.graph_analyzer": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.graph_analyzer",
+  "cudnn._pygraph": "flashinfer.experimental.qwen_3_5_block._cudnn_frost._pygraph",
+  "cudnn.sdpa.fwd.engines": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.fwd.engines",
+  "cudnn.gemm.frost.kernel_templates.split_k_reduction_epilogue_fusion": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.gemm.frost.kernel_templates.split_k_reduction_epilogue_fusion",
+  "cudnn.deepseek_sparse_attention.score_recompute.indexer_score_unified_sm100_mxfp8": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.deepseek_sparse_attention.score_recompute.indexer_score_unified_sm100_mxfp8",
+  "cudnn.frost.tile_dsl.mask": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.frost.tile_dsl.mask",
+  "cudnn.deepseek_sparse_attention.indexer_forward": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.deepseek_sparse_attention.indexer_forward",
+  "cudnn.deepseek_sparse_attention.score_recompute._interface_sm100": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.deepseek_sparse_attention.score_recompute._interface_sm100",
+  "cudnn.frost.tile_dsl.barrier": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.frost.tile_dsl.barrier",
+  "cudnn.gated_attention_block.kernels.qsa_topk_decode": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.gated_attention_block.kernels.qsa_topk_decode",
+  "cudnn.sdpa.fwd.kernels._quantized": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.fwd.kernels._quantized",
+  "cudnn.gated_attention_block.kernels.quantize_mxfp8": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.gated_attention_block.kernels.quantize_mxfp8",
+  "cudnn.gemm.frost.heuristics": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.gemm.frost.heuristics",
+  "cudnn.sdpa.fwd.api_dsl": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.fwd.api_dsl",
+  "cudnn.deepseek_sparse_attention.indexer_forward.indexer_fwd_sm90": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.deepseek_sparse_attention.indexer_forward.indexer_fwd_sm90",
+  "cudnn.sdpa.bwd.config_sm100": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.bwd.config_sm100",
+  "cudnn.deepseek_sparse_attention.score_recompute._block_scaled": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.deepseek_sparse_attention.score_recompute._block_scaled",
+  "cudnn.sdpa.fwd.config_sm80": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.fwd.config_sm80",
+  "cudnn.frost.tile_dsl.tma": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.frost.tile_dsl.tma",
+  "cudnn.deepseek_sparse_attention.indexer_forward._interface": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.deepseek_sparse_attention.indexer_forward._interface",
   "cudnn.sdpa.fwd.config_d128_family": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.fwd.config_d128_family",
-  "cudnn.tensor_adapter": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.tensor_adapter",
+  "cudnn.sdpa.fwd.kernels.sm107.sparse_d256_f16": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.fwd.kernels.sm107.sparse_d256_f16",
+  "cudnn.frost.compiled_cache": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.frost.compiled_cache",
+  "cudnn.deepseek_sparse_attention.indexer_top_k.block_scan": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.deepseek_sparse_attention.indexer_top_k.block_scan",
+  "cudnn.deepseek_sparse_attention.score_recompute.dense_score_recompute_sm100": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.deepseek_sparse_attention.score_recompute.dense_score_recompute_sm100",
+  "cudnn.frost.tile_dsl.constants": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.frost.tile_dsl.constants",
+  "cudnn.sdpa.fwd.kernels.sm100.prefill_d256_f16": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.fwd.kernels.sm100.prefill_d256_f16",
+  "cudnn.deepseek_sparse_attention.indexer_top_k.compress_top_k_sm100": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.deepseek_sparse_attention.indexer_top_k.compress_top_k_sm100",
+  "cudnn.gated_attention_block.kernels.quantize": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.gated_attention_block.kernels.quantize",
+  "cudnn.sdpa.fwd.sparse_gqa_sm107": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.fwd.sparse_gqa_sm107",
+  "cudnn.deepseek_sparse_attention.score_recompute.dense_score_recompute_sm100_mxfp8": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.deepseek_sparse_attention.score_recompute.dense_score_recompute_sm100_mxfp8",
+  "cudnn.deepseek_sparse_attention.utils.runtime": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.deepseek_sparse_attention.utils.runtime",
+  "cudnn.deepseek_sparse_attention.indexer_top_k.compactify": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.deepseek_sparse_attention.indexer_top_k.compactify",
+  "cudnn.deepseek_sparse_attention.utils.sm90.mma": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.deepseek_sparse_attention.utils.sm90.mma",
+  "cudnn.deepseek_sparse_attention.utils.sm100": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.deepseek_sparse_attention.utils.sm100",
+  "cudnn.QSA.selection_paged": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.QSA.selection_paged",
+  "cudnn.deepseek_sparse_attention.utils.sm90": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.deepseek_sparse_attention.utils.sm90",
+  "cudnn.frost.buffers": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.frost.buffers",
+  "cudnn.sdpa.fwd.prepared": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.fwd.prepared",
+  "cudnn.gemm.frost.tile_helpers": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.gemm.frost.tile_helpers",
+  "cudnn.gemm.frost": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.gemm.frost",
+  "cudnn.deepseek_sparse_attention.score_recompute": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.deepseek_sparse_attention.score_recompute",
+  "cudnn._env": "flashinfer.experimental.qwen_3_5_block._cudnn_frost._env",
+  "cudnn._gemm_validate": "flashinfer.experimental.qwen_3_5_block._cudnn_frost._gemm_validate",
+  "cudnn.gated_attention_block.kernels.qsa_compress": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.gated_attention_block.kernels.qsa_compress",
+  "cudnn.gemm.frost.fusion_ir": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.gemm.frost.fusion_ir",
+  "cudnn.sdpa.fwd.kernels._common_blackwell": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.fwd.kernels._common_blackwell",
+  "cudnn._sdpa_tail": "flashinfer.experimental.qwen_3_5_block._cudnn_frost._sdpa_tail",
+  "cudnn.deepseek_sparse_attention.score_recompute.sparse_score_recompute_sm100": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.deepseek_sparse_attention.score_recompute.sparse_score_recompute_sm100",
   "cudnn.gemm.frost.engine": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.gemm.frost.engine",
   "cudnn.gemm.frost.epilogue_codegen": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.gemm.frost.epilogue_codegen",
-  "cudnn.sdpa.fwd.heuristics": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.fwd.heuristics",
-  "cudnn.sdpa.bwd": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.bwd",
-  "cudnn.frost.buffers": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.frost.buffers",
-  "cudnn.gated_attention_block.kernels.elementwise": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.gated_attention_block.kernels.elementwise",
-  "cudnn._sdpa_tail": "flashinfer.experimental.qwen_3_5_block._cudnn_frost._sdpa_tail",
-  "cudnn._cutlass_compat": "flashinfer.experimental.qwen_3_5_block._cudnn_frost._cutlass_compat",
-  "cudnn.frost.tile_dsl.regtile": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.frost.tile_dsl.regtile",
-  "cudnn.frost.workspace": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.frost.workspace",
-  "cudnn.sdpa.fwd.config_sm120": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.fwd.config_sm120",
-  "cudnn.gemm.frost.sm100": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.gemm.frost.sm100",
-  "cudnn.frost.tile_dsl.pointwise": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.frost.tile_dsl.pointwise",
+  "cudnn.deepseek_sparse_attention.utils.compiler": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.deepseek_sparse_attention.utils.compiler",
+  "cudnn.QSA": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.QSA",
+  "cudnn.frost.capture": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.frost.capture",
+  "cudnn.frost.tile_dsl.requirements": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.frost.tile_dsl.requirements",
+  "cudnn.deepseek_sparse_attention.utils.sm90.primitives": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.deepseek_sparse_attention.utils.sm90.primitives",
   "cudnn.gated_attention_block.cache_write_contract": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.gated_attention_block.cache_write_contract",
-  "cudnn.sdpa.fwd": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.fwd",
-  "cudnn.engines": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.engines",
-  "cudnn.frost.occupancy": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.frost.occupancy",
-  "cudnn.engines.base": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.engines.base",
-  "cudnn.datatypes": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.datatypes",
-  "cudnn.sdpa.fwd.kernels.thd_helpers": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.fwd.kernels.thd_helpers",
-  "cudnn.gated_attention_block.kernels.qk_norm_rope": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.gated_attention_block.kernels.qk_norm_rope",
-  "cudnn.sdpa.bwd.config_sm100": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.bwd.config_sm100",
+  "cudnn.nodes": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.nodes",
+  "cudnn.deepseek_sparse_attention.indexer_forward.api": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.deepseek_sparse_attention.indexer_forward.api",
+  "cudnn.deepseek_sparse_attention.utils.copy": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.deepseek_sparse_attention.utils.copy",
+  "cudnn.gemm.frost.recipe": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.gemm.frost.recipe",
+  "cudnn.sdpa.fwd.kernels.sm107": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.fwd.kernels.sm107",
+  "cudnn.deepseek_sparse_attention.indexer_forward._interface_sm90": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.deepseek_sparse_attention.indexer_forward._interface_sm90",
+  "cudnn.deepseek_sparse_attention.utils.sm100.mma_desc": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.deepseek_sparse_attention.utils.sm100.mma_desc",
+  "cudnn.gemm": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.gemm",
+  "cudnn.frost.tile_dsl.scheduler": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.frost.tile_dsl.scheduler",
+  "cudnn._device": "flashinfer.experimental.qwen_3_5_block._cudnn_frost._device",
+  "cudnn.gated_attention_block.kernels.proj_gemm": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.gated_attention_block.kernels.proj_gemm",
+  "cudnn.deepseek_sparse_attention.score_recompute.indexer_score_unified_sm100_mxfp4": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.deepseek_sparse_attention.score_recompute.indexer_score_unified_sm100_mxfp4",
+  "cudnn.sdpa.fwd.heuristics": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.fwd.heuristics",
+  "cudnn._torch_stream": "flashinfer.experimental.qwen_3_5_block._cudnn_frost._torch_stream",
+  "cudnn.gemm.frost.compiler": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.gemm.frost.compiler",
+  "cudnn.gated_attention_block.kernels.qsa_score_paged": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.gated_attention_block.kernels.qsa_score_paged",
+  "cudnn.deepseek_sparse_attention.indexer_top_k": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.deepseek_sparse_attention.indexer_top_k",
   "cudnn._handle": "flashinfer.experimental.qwen_3_5_block._cudnn_frost._handle",
-  "cudnn.sdpa.fwd.api_dsl": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.fwd.api_dsl",
-  "cudnn.frost.tile_dsl.mask": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.frost.tile_dsl.mask",
-  "cudnn.sdpa.fwd.kernels.sm100.prefill_d256_f16": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.fwd.kernels.sm100.prefill_d256_f16",
-  "cudnn.gemm.frost.fusion_ir": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.gemm.frost.fusion_ir",
-  "cudnn.sdpa": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa",
+  "cudnn.deepseek_sparse_attention.indexer_top_k.indexer_top_k_varlen_util": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.deepseek_sparse_attention.indexer_top_k.indexer_top_k_varlen_util",
+  "cudnn.gated_attention_block.kernels.qsa_prepare": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.gated_attention_block.kernels.qsa_prepare",
+  "cudnn.frost.workspace": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.frost.workspace",
+  "cudnn.deepseek_sparse_attention.indexer_top_k.api": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.deepseek_sparse_attention.indexer_top_k.api",
+  "cudnn.frost.tile_dsl": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.frost.tile_dsl",
+  "cudnn.sdpa.fwd.config_sm90": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.fwd.config_sm90",
   "cudnn.sdpa.fwd.kernels.sm107.prefill_d256_f16": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.fwd.kernels.sm107.prefill_d256_f16",
   "cudnn.gemm.frost.sm100.compiler": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.gemm.frost.sm100.compiler",
-  "cudnn.frost.compiled_cache": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.frost.compiled_cache",
-  "cudnn.frost.tile_dsl.mma": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.frost.tile_dsl.mma",
-  "cudnn.gemm.frost.heuristics": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.gemm.frost.heuristics",
-  "cudnn.gated_attention_block.kernels.quantize_mxfp8": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.gated_attention_block.kernels.quantize_mxfp8",
-  "cudnn.sdpa.fwd.config_sm107": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.fwd.config_sm107",
-  "cudnn.frost.tile_dsl.sf_layout": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.frost.tile_dsl.sf_layout",
-  "cudnn.frost": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.frost",
-  "cudnn.gemm.frost.arch_family": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.gemm.frost.arch_family",
-  "cudnn.gemm.frost.kernel_templates.dynamic_scheduler_counter_initialization": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.gemm.frost.kernel_templates.dynamic_scheduler_counter_initialization",
-  "cudnn.gated_attention_block.kernels": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.gated_attention_block.kernels",
-  "cudnn._device": "flashinfer.experimental.qwen_3_5_block._cudnn_frost._device",
-  "cudnn.gated_attention_block.kernels.qk_norm_rope_tma": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.gated_attention_block.kernels.qk_norm_rope_tma",
-  "cudnn.gemm.frost.kernel_templates.split_k_reduction_epilogue_fusion": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.gemm.frost.kernel_templates.split_k_reduction_epilogue_fusion",
-  "cudnn.gemm.frost.sm100.epilogue_codegen": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.gemm.frost.sm100.epilogue_codegen",
-  "cudnn.frost.tile_dsl.barrier": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.frost.tile_dsl.barrier",
-  "cudnn.sdpa.fwd.kernels": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.fwd.kernels",
-  "cudnn.sdpa.fwd.engines": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.fwd.engines",
-  "cudnn.gemm.frost.tile_helpers": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.gemm.frost.tile_helpers",
-  "cudnn.api_base": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.api_base",
   "cudnn.gemm.frost.kernel_registry": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.gemm.frost.kernel_registry",
-  "cudnn.sdpa.fwd.kernels.sm107": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.fwd.kernels.sm107",
-  "cudnn.sdpa.fwd.kernels.sm107.decode_d256_f16": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.fwd.kernels.sm107.decode_d256_f16",
-  "cudnn.sdpa.fwd.kernels._thd_split_host": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.fwd.kernels._thd_split_host",
-  "cudnn.frost.tile_dsl.thd": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.frost.tile_dsl.thd",
-  "cudnn.engines.manifest": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.engines.manifest",
-  "cudnn.gemm.frost.recipe": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.gemm.frost.recipe",
-  "cudnn.frost.tile_dsl.tma": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.frost.tile_dsl.tma",
-  "cudnn.gemm.frost.graph_analyzer": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.gemm.frost.graph_analyzer",
-  "cudnn.engines.heuristics": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.engines.heuristics",
-  "cudnn.gated_attention_block.kernels.quantize": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.gated_attention_block.kernels.quantize",
-  "cudnn.gated_attention_block": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.gated_attention_block",
-  "cudnn.frost.device": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.frost.device",
-  "cudnn.frost.tile_dsl": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.frost.tile_dsl",
-  "cudnn.gemm.frost.sm100.kernel_templates.sm100_matmul": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.gemm.frost.sm100.kernel_templates.sm100_matmul",
-  "cudnn.gemm.frost.dtypes": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.gemm.frost.dtypes",
-  "cudnn.sdpa.fwd.kernels._common_blackwell": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.fwd.kernels._common_blackwell",
-  "cudnn.sdpa.fwd.config_sm100": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.fwd.config_sm100",
-  "cudnn.nodes": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.nodes",
-  "cudnn.frost.tile_dsl.swizzle": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.frost.tile_dsl.swizzle",
-  "cudnn.frost.tile_dsl.scheduler": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.frost.tile_dsl.scheduler",
-  "cudnn.gemm.frost.knobs": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.gemm.frost.knobs",
-  "cudnn.sdpa.fwd.config_sm90": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.fwd.config_sm90",
-  "cudnn._env": "flashinfer.experimental.qwen_3_5_block._cudnn_frost._env",
-  "cudnn.sdpa.fwd.config_sm80": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.fwd.config_sm80",
+  "cudnn.gated_attention_block.kernels.cache_write": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.gated_attention_block.kernels.cache_write",
   "cudnn.frost.template_loader": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.frost.template_loader",
-  "cudnn.gemm.frost": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.gemm.frost",
-  "cudnn.frost.tile_dsl.constants": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.frost.tile_dsl.constants",
-  "cudnn.frost.capture": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.frost.capture",
-  "cudnn._pygraph": "flashinfer.experimental.qwen_3_5_block._cudnn_frost._pygraph",
+  "cudnn.sdpa.native_sm80": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.native_sm80",
+  "cudnn.sdpa.fwd.kernels.sm100.split_combine": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.fwd.kernels.sm100.split_combine",
+  "cudnn._experimental_warnings": "flashinfer.experimental.qwen_3_5_block._cudnn_frost._experimental_warnings",
+  "cudnn.frost.tile_dsl.mma": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.frost.tile_dsl.mma",
+  "cudnn.frost": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.frost",
+  "cudnn.deepseek_sparse_attention.utils.tensor_conversion": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.deepseek_sparse_attention.utils.tensor_conversion",
+  "cudnn.gemm.frost.dtypes": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.gemm.frost.dtypes",
+  "cudnn.sdpa.fwd.kernels.thd_origins": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.fwd.kernels.thd_origins",
+  "cudnn.deepseek_sparse_attention": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.deepseek_sparse_attention",
+  "cudnn.sdpa.fwd.kernels.sm107._sparse_item_common": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.fwd.kernels.sm107._sparse_item_common",
+  "cudnn.sdpa.fwd.kernels.sm100": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.fwd.kernels.sm100",
+  "cudnn.deepseek_sparse_attention.indexer_forward._support": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.deepseek_sparse_attention.indexer_forward._support",
+  "cudnn.sdpa.bwd": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.bwd",
+  "cudnn.sdpa.fwd.config_sm107": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.fwd.config_sm107",
+  "cudnn.gemm.frost.arch_family": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.gemm.frost.arch_family",
+  "cudnn.sdpa.fwd": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.fwd",
+  "cudnn.deepseek_sparse_attention.score_recompute.indexer_score_unified_sm100": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.deepseek_sparse_attention.score_recompute.indexer_score_unified_sm100",
+  "cudnn.engines.engine_ids": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.engines.engine_ids",
+  "cudnn.sdpa.fwd.kernels._thd_split_host": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.fwd.kernels._thd_split_host",
+  "cudnn.gated_attention_block.api": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.gated_attention_block.api",
+  "cudnn.gated_attention_block.kernels.qk_norm_rope_tma": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.gated_attention_block.kernels.qk_norm_rope_tma",
+  "cudnn.gemm.frost.sm100": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.gemm.frost.sm100",
+  "cudnn.frost.tile_dsl.tmem": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.frost.tile_dsl.tmem",
+  "cudnn.gemm.frost.sm100.epilogue_codegen": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.gemm.frost.sm100.epilogue_codegen",
+  "cudnn.frost.tile_dsl.thd": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.frost.tile_dsl.thd",
+  "cudnn.deepseek_sparse_attention.indexer_forward._compressed_top_k_sm100": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.deepseek_sparse_attention.indexer_forward._compressed_top_k_sm100",
+  "cudnn.frost.device": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.frost.device",
+  "cudnn.gated_attention_block.kernels.proj_gemm_norm_rope": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.gated_attention_block.kernels.proj_gemm_norm_rope",
+  "cudnn.engines": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.engines",
+  "cudnn.engines.manifest": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.engines.manifest",
+  "cudnn.sdpa.fwd.kernels.sm107.decode_d256_f16": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.fwd.kernels.sm107.decode_d256_f16",
+  "cudnn.gemm.frost.graph_analyzer": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.gemm.frost.graph_analyzer",
+  "cudnn.gated_attention_block.kernels.qsa_canonical_list": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.gated_attention_block.kernels.qsa_canonical_list",
+  "cudnn.sdpa.fwd.kernels.sm107.sparse_lean_d256_f16": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.fwd.kernels.sm107.sparse_lean_d256_f16",
+  "cudnn.deepseek_sparse_attention.utils": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.deepseek_sparse_attention.utils",
+  "cudnn.graph_types": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.graph_types",
+  "cudnn.QSA.selection": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.QSA.selection",
+  "cudnn.engines.heuristics": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.engines.heuristics",
+  "cudnn.frost.tile_dsl.swizzle": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.frost.tile_dsl.swizzle",
+  "cudnn.gated_attention_block.kernels.elementwise": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.gated_attention_block.kernels.elementwise",
+  "cudnn.frost.occupancy": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.frost.occupancy",
+  "cudnn.sdpa.fwd.kernels.thd_helpers": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.fwd.kernels.thd_helpers",
+  "cudnn.api_base": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.api_base",
+  "cudnn.sdpa.fwd.kernels": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.fwd.kernels",
+  "cudnn.deepseek_sparse_attention.indexer_top_k.local_to_global_dsl": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.deepseek_sparse_attention.indexer_top_k.local_to_global_dsl",
+  "cudnn.gated_attention_block.kernels.qk_norm_rope": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.gated_attention_block.kernels.qk_norm_rope",
+  "cudnn.deepseek_sparse_attention.utils.seqlen": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.deepseek_sparse_attention.utils.seqlen",
+  "cudnn.frost.tile_dsl.sf_layout": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.frost.tile_dsl.sf_layout",
+  "cudnn.gated_attention_block.kernels.qsa_kbar_gather": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.gated_attention_block.kernels.qsa_kbar_gather",
+  "cudnn.tensor_adapter": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.tensor_adapter",
+  "cudnn._cutlass_compat": "flashinfer.experimental.qwen_3_5_block._cudnn_frost._cutlass_compat",
+  "cudnn.gemm.frost.knobs": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.gemm.frost.knobs",
+  "cudnn.sdpa.fwd.config_sm120": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.fwd.config_sm120",
+  "cudnn.sdpa.fwd.config_sm100": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.fwd.config_sm100",
+  "cudnn.frost.tile_dsl.regtile": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.frost.tile_dsl.regtile",
+  "cudnn.sdpa.fwd.sparse_tile_rules": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.fwd.sparse_tile_rules",
+  "cudnn._tupledict": "flashinfer.experimental.qwen_3_5_block._cudnn_frost._tupledict",
+  "cudnn.gated_attention_block": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.gated_attention_block",
+  "cudnn.deepseek_sparse_attention.score_recompute.api": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.deepseek_sparse_attention.score_recompute.api",
+  "cudnn.gemm.frost.kernel_templates.dynamic_scheduler_counter_initialization": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.gemm.frost.kernel_templates.dynamic_scheduler_counter_initialization",
+  "cudnn.sdpa": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa",
+  "cudnn.deepseek_sparse_attention.utils.sm100.gemm": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.deepseek_sparse_attention.utils.sm100.gemm",
+  "cudnn.frost.tile_dsl.handles": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.frost.tile_dsl.handles",
   "cudnn.sdpa.bwd.config_sm107": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.bwd.config_sm107",
-  "cudnn._experimental_warnings": "flashinfer.experimental.qwen_3_5_block._cudnn_frost._experimental_warnings"
+  "cudnn.deepseek_sparse_attention.indexer_forward.indexer_fwd_sm100": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.deepseek_sparse_attention.indexer_forward.indexer_fwd_sm100",
+  "cudnn.frost.tile_dsl.pointwise": "flashinfer.experimental.qwen_3_5_block._cudnn_frost.frost.tile_dsl.pointwise"
  },
  "binder_module": "flashinfer.experimental.qwen_3_5_block._sdpa_binder",
  "counts": {
-  "rewritten_imports": 405,
-  "files_with_rewrites": 54,
-  "string_sites": 30,
-  "patches": 32
+  "rewritten_imports": 638,
+  "files_with_rewrites": 91,
+  "string_sites": 33,
+  "patches": 33
  },
  "dangling_imports": {
   "engines/manifest.py (string site)": [
@@ -1199,6 +1826,7 @@
    "cudnn.linear_attention",
    "cudnn.linear_attention.graph_analyzer",
    "cudnn.linear_attention.kda_heuristics",
+   "cudnn.norm.affine",
    "cudnn.norm.bprop.engine",
    "cudnn.norm.fprop.engine",
    "cudnn.norm.graph_analyzer",
@@ -1207,19 +1835,17 @@
    "cudnn.sdpa.fwd.backend_guard",
    "cudnn.sdpa.fwd.engine"
   ],
-  "gated_attention_block/api.py": [
-   "cudnn.sdpa.fwd.sparse_gqa_sm107"
-  ],
   "sdpa/fwd/api_dsl.py": [
    "cudnn.sdpa.bwd.kernels.thd_helpers",
    "cudnn.sdpa.fwd.kernels.sm80.prepared_host",
    "cudnn.sdpa.fwd.prepared_sm80",
-   "cudnn.sdpa.fwd.prepared_sm80_thd",
-   "cudnn.sdpa.fwd.prepared_staged_sm80",
-   "cudnn.sdpa.packed_copy_sm80"
+   "cudnn.sdpa.fwd.prepared_sm80_thd"
   ],
   "sdpa/fwd/engines.py": [
    "cudnn.sdpa.fwd.prepared_sm80"
+  ],
+  "sdpa/fwd/_binding_reference.py": [
+   "cudnn.sdpa.fwd.thd_origins"
   ]
  },
  "patches_applied": [
@@ -1304,6 +1930,14 @@
    "gated_attention_block/kernels/qk_norm_rope_tma.py"
   ],
   [
+   "P3",
+   "gated_attention_block/kernels/qsa_topk_decode.py"
+  ],
+  [
+   "P3",
+   "gated_attention_block/kernels/qsa_topk_decode.py"
+  ],
+  [
    "P5",
    "gemm/__init__.py"
   ],
@@ -1326,10 +1960,6 @@
   [
    "P3",
    "sdpa/bwd/config_sm100.py"
-  ],
-  [
-   "P3",
-   "sdpa/fwd/api_dsl.py"
   ],
   [
    "P3",

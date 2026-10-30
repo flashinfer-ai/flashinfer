@@ -61,9 +61,9 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define SMEM_SMEM_V1_OFF 17408
 #define SMEM_SMEM_V1_STAGE_BYTES 16384
 #define SMEM_SMEM_V1_STRIDE 49152
-#define SMEM_SMEM_V2_OFF 33792
-#define SMEM_SMEM_V2_STAGE_BYTES 16384
-#define SMEM_SMEM_V2_STRIDE 49152
+#define SMEM_SMEM_V1_0_OFF 33792
+#define SMEM_SMEM_V1_0_STAGE_BYTES 16384
+#define SMEM_SMEM_V1_0_STRIDE 49152
 #define SMEM_SMEM_EPI_OFF 148480
 #define SMEM_SMEM_EPI_STAGE_BYTES 16384
 #define SMEM_SMEM_EPI_STRIDE 16384
@@ -72,6 +72,11 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define SMEM_CLC_RESP_STRIDE 16
 #define SMEM_TOTAL 214144
 #define THREADS 224
+#if defined(__CUDACC_VER_MAJOR__) && (__CUDA_ARCH__ == 1000) && ((__CUDACC_VER_MAJOR__ == 12 && __CUDACC_VER_MINOR__ == 9) || (__CUDACC_VER_MAJOR__ == 13 && __CUDACC_VER_MINOR__ == 0))
+#define CAKE_ARRIVE_FIRST 1
+#else
+#define CAKE_ARRIVE_FIRST 0
+#endif
 
 #include <math_constants.h>
 
@@ -221,8 +226,8 @@ kernel_cake_lm_head_loss_1f06a34c8f3bae873636(const __grid_constant__ CUtensorMa
     const int smem_v0_addr = smem + 1024;
     __nv_bfloat16* smem_v1 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 17408);
     const int smem_v1_addr = smem + 17408;
-    __nv_bfloat16* smem_v2 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 33792);
-    const int smem_v2_addr = smem + 33792;
+    __nv_bfloat16* smem_v1_0 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 33792);
+    const int smem_v1_addr_0 = smem + 33792;
     float* smem_epi = reinterpret_cast<float*>(smem_raw + 148480);
     const int smem_epi_addr = smem + 148480;
     unsigned int* clc_resp = reinterpret_cast<unsigned int*>(smem_raw + 214016);
@@ -326,22 +331,30 @@ kernel_cake_lm_head_loss_1f06a34c8f3bae873636(const __grid_constant__ CUtensorMa
                     #pragma unroll 1
                     for (int ld_k = 0; ld_k < k_iters; ld_k++) {
                         mbarrier_wait(mma_done_addr + (load_stage) * 8, _phase_mma_done);
+#if CAKE_ARRIVE_FIRST
+                        asm volatile(
+                            "mbarrier.arrive.expect_tx.release.cta.shared::cluster.b64 _, [%0], %1;"
+                            :: "r"((tma_full_addr + (load_stage) * 8) & 0xFEFFFFFF), "r"((uint32_t)(49152)) : "memory");
+#endif
                         int ld_kk = ld_k_base + ld_k;
                         int ld_k0 = ld_k * 64;
                         tma_3d_gmem2smem_cta2(smem_v0_addr + load_stage * 49152, (&A), 0, ld_off_m, ld_k, ((tma_full_addr + (load_stage) * 8) & 0xFEFFFFFF));
                         tma_3d_gmem2smem_cta2(smem_v1_addr + load_stage * 49152, (&B), ld_off_n, ld_k0, 0, ((tma_full_addr + (load_stage) * 8) & 0xFEFFFFFF));
                         tma_3d_gmem2smem_cta2(smem_v1_addr + load_stage * 49152 + 8192, (&B), ld_off_n + 64, ld_k0, 0, ((tma_full_addr + (load_stage) * 8) & 0xFEFFFFFF));
-                        tma_3d_gmem2smem_cta2(smem_v2_addr + load_stage * 49152, (&B), ld_off_n + 256, ld_k0, 0, ((tma_full_addr + (load_stage) * 8) & 0xFEFFFFFF));
-                        tma_3d_gmem2smem_cta2(smem_v2_addr + load_stage * 49152 + 8192, (&B), ld_off_n + 320, ld_k0, 0, ((tma_full_addr + (load_stage) * 8) & 0xFEFFFFFF));
+                        tma_3d_gmem2smem_cta2(smem_v1_addr_0 + load_stage * 49152, (&B), ld_off_n + 256, ld_k0, 0, ((tma_full_addr + (load_stage) * 8) & 0xFEFFFFFF));
+                        tma_3d_gmem2smem_cta2(smem_v1_addr_0 + load_stage * 49152 + 8192, (&B), ld_off_n + 320, ld_k0, 0, ((tma_full_addr + (load_stage) * 8) & 0xFEFFFFFF));
+#if CAKE_ARRIVE_FIRST
+#else
                         asm volatile(
                             "mbarrier.arrive.expect_tx.release.cta.shared::cluster.b64 _, [%0], %1;"
                             :: "r"((tma_full_addr + (load_stage) * 8) & 0xFEFFFFFF), "r"((uint32_t)(49152)) : "memory");
+#endif
                         load_stage += 1;
                         if (load_stage == 3) { load_stage = 0; _phase_mma_done ^= 1; }
                     }
                 }
                 mbarrier_wait(clc_full_addr + (load_clc_stage) * 8, _phase_clc_full);
-                uint32_t _clc_valid_1 = 0;
+                uint32_t valid = 0;
                 asm volatile(
                     "{\n\t"
                     ".reg .pred p1;\n\t"
@@ -350,10 +363,10 @@ kernel_cake_lm_head_loss_1f06a34c8f3bae873636(const __grid_constant__ CUtensorMa
                     "clusterlaunchcontrol.query_cancel.is_canceled.pred.b128 p1, clc_r;\n\t"
                     "selp.u32 %0, 1, 0, p1;\n\t"
                     "}\n"
-                    : "=r"(_clc_valid_1)
+                    : "=r"(valid)
                     : "r"(clc_resp_addr + load_clc_stage * 16 + 0 * 16)
                     : "memory");
-                uint32_t _clc_ctaid_0 = 0;
+                uint32_t ctaid = 0;
                 asm volatile(
                     "{\n\t"
                     ".reg .pred p1;\n\t"
@@ -362,7 +375,7 @@ kernel_cake_lm_head_loss_1f06a34c8f3bae873636(const __grid_constant__ CUtensorMa
                     "clusterlaunchcontrol.query_cancel.is_canceled.pred.b128 p1, clc_r;\n\t"
                     "@p1 clusterlaunchcontrol.query_cancel.get_first_ctaid::x.b32.b128 %0, clc_r;\n\t"
                     "}\n"
-                    : "+r"(_clc_ctaid_0)
+                    : "+r"(ctaid)
                     : "r"(clc_resp_addr + load_clc_stage * 16 + 0 * 16)
                     : "memory");
                 asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
@@ -372,13 +385,13 @@ kernel_cake_lm_head_loss_1f06a34c8f3bae873636(const __grid_constant__ CUtensorMa
                     "mapa.shared::cluster.u32 remAddr32, %0, %1;\n\t"
                     "mbarrier.arrive.release.cta.shared::cluster.b64 _, [remAddr32];\n\t"
                     "}"
-                    :: "r"(clc_empty_addr + load_clc_stage * 8), "r"(0) : "memory");
+                    :: "r"(clc_empty_addr + (load_clc_stage) * 8), "r"(0) : "memory");
                 load_clc_stage += 1;
                 if (load_clc_stage == 2) { load_clc_stage = 0; _phase_clc_full ^= 1; }
-                if (_clc_valid_1 == 0) {
+                if (valid == 0) {
                     break;
                 }
-                ld_tile = _clc_ctaid_0 / 2;
+                ld_tile = ctaid / 2;
             }
             if (elect_sync()) {
                 #pragma unroll 1
@@ -453,7 +466,7 @@ kernel_cake_lm_head_loss_1f06a34c8f3bae873636(const __grid_constant__ CUtensorMa
                     "}\n"
                     :: "r"(_mma_a_lo_0), "r"(_mma_b_lo_0), "r"(tmem_accum), "r"(((init_flag) ? 0 : 1)) : "memory");
                             int _mma_a_lo_1 = (((smem_v0_addr) >> 4) & 0x3FFF) + (mma_tma_stage) * 3072;
-                            int _mma_b_lo_1 = ((((smem_v2_addr) >> 4) & 0x3FFF) | 0x2000000) + (mma_tma_stage) * 3072;
+                            int _mma_b_lo_1 = ((((smem_v1_addr_0) >> 4) & 0x3FFF) | 0x2000000) + (mma_tma_stage) * 3072;
                             asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -529,7 +542,7 @@ kernel_cake_lm_head_loss_1f06a34c8f3bae873636(const __grid_constant__ CUtensorMa
                     "mapa.shared::cluster.u32 remAddr32, %0, %1;\n\t"
                     "mbarrier.arrive.release.cta.shared::cluster.b64 _, [remAddr32];\n\t"
                     "}"
-                    :: "r"(clc_empty_addr + mma_clc_stage * 8), "r"(0) : "memory");
+                    :: "r"(clc_empty_addr + (mma_clc_stage) * 8), "r"(0) : "memory");
                 mma_clc_stage += 1;
                 if (mma_clc_stage == 2) { mma_clc_stage = 0; _phase_clc_full_1 ^= 1; }
                 if (_clc_valid_2 == 0) {
@@ -554,7 +567,7 @@ kernel_cake_lm_head_loss_1f06a34c8f3bae873636(const __grid_constant__ CUtensorMa
             #pragma unroll 1
             for (unsigned int _ep = 0; _ep < m_tiles / 2 * (ldc / 512) * k_slices; _ep++) {
                 mbarrier_wait(clc_full_addr + (epi_clc_stage) * 8, _phase_clc_full_2);
-                uint32_t _clc_valid_3 = 0;
+                uint32_t valid_1 = 0;
                 asm volatile(
                     "{\n\t"
                     ".reg .pred p1;\n\t"
@@ -563,10 +576,10 @@ kernel_cake_lm_head_loss_1f06a34c8f3bae873636(const __grid_constant__ CUtensorMa
                     "clusterlaunchcontrol.query_cancel.is_canceled.pred.b128 p1, clc_r;\n\t"
                     "selp.u32 %0, 1, 0, p1;\n\t"
                     "}\n"
-                    : "=r"(_clc_valid_3)
+                    : "=r"(valid_1)
                     : "r"(clc_resp_addr + epi_clc_stage * 16 + 0 * 16)
                     : "memory");
-                uint32_t _clc_ctaid_2 = 0;
+                uint32_t ctaid_1 = 0;
                 asm volatile(
                     "{\n\t"
                     ".reg .pred p1;\n\t"
@@ -575,7 +588,7 @@ kernel_cake_lm_head_loss_1f06a34c8f3bae873636(const __grid_constant__ CUtensorMa
                     "clusterlaunchcontrol.query_cancel.is_canceled.pred.b128 p1, clc_r;\n\t"
                     "@p1 clusterlaunchcontrol.query_cancel.get_first_ctaid::x.b32.b128 %0, clc_r;\n\t"
                     "}\n"
-                    : "+r"(_clc_ctaid_2)
+                    : "+r"(ctaid_1)
                     : "r"(clc_resp_addr + epi_clc_stage * 16 + 0 * 16)
                     : "memory");
                 asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
@@ -585,7 +598,7 @@ kernel_cake_lm_head_loss_1f06a34c8f3bae873636(const __grid_constant__ CUtensorMa
                     "mapa.shared::cluster.u32 remAddr32, %0, %1;\n\t"
                     "mbarrier.arrive.release.cta.shared::cluster.b64 _, [remAddr32];\n\t"
                     "}"
-                    :: "r"(clc_empty_addr + epi_clc_stage * 8), "r"(0) : "memory");
+                    :: "r"(clc_empty_addr + (epi_clc_stage) * 8), "r"(0) : "memory");
                 epi_clc_stage += 1;
                 if (epi_clc_stage == 2) { epi_clc_stage = 0; _phase_clc_full_2 ^= 1; }
                 int ep_item_i = ep_tile;
@@ -656,10 +669,10 @@ kernel_cake_lm_head_loss_1f06a34c8f3bae873636(const __grid_constant__ CUtensorMa
                     }
                     _phase_mainloop_done ^= 1;
                 }
-                if (_clc_valid_3 == 0) {
+                if (valid_1 == 0) {
                     break;
                 }
-                ep_tile = _clc_ctaid_2 / 2;
+                ep_tile = ctaid_1 / 2;
             }
             if (warp == 2) {
                 if (elect_sync()) {
@@ -691,7 +704,7 @@ kernel_cake_lm_head_loss_1f06a34c8f3bae873636(const __grid_constant__ CUtensorMa
                             "mapa.shared::cluster.u32 remAddr32, %0, %1;\n\t"
                             "mbarrier.arrive.expect_tx.release.cta.shared::cluster.b64 _, [remAddr32], %2;\n\t"
                             "}"
-                            :: "r"(clc_full_addr + sched_clc_stage * 8), "r"(lane), "r"((uint32_t)(16)) : "memory");
+                            :: "r"(clc_full_addr + (sched_clc_stage) * 8), "r"(lane), "r"((uint32_t)(16)) : "memory");
                     }
                     if (elect_sync()) {
                         asm volatile(
@@ -722,7 +735,7 @@ kernel_cake_lm_head_loss_1f06a34c8f3bae873636(const __grid_constant__ CUtensorMa
                         "mapa.shared::cluster.u32 remAddr32, %0, %1;\n\t"
                         "mbarrier.arrive.release.cta.shared::cluster.b64 _, [remAddr32];\n\t"
                         "}"
-                        :: "r"(clc_empty_addr + sched_clc_stage * 8), "r"(0) : "memory");
+                        :: "r"(clc_empty_addr + (sched_clc_stage) * 8), "r"(0) : "memory");
                     sched_clc_stage += 1;
                     if (sched_clc_stage == 2) { sched_clc_stage = 0; _phase_clc_empty ^= 1; _phase_clc_full_3 ^= 1; }
                     if (_clc_valid_0 == 0) {

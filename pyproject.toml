@@ -66,7 +66,12 @@ dependencies = { file = ["requirements.txt"] }
 [tool.setuptools.packages.find]
 where = [".", "flashinfer/experimental/b12x/_compat"]
 include = ["flashinfer*", "b12x"]
-exclude = ["flashinfer-jit-cache*", "flashinfer-cubin*", "flashinfer.experimental.b12x._compat*"]
+exclude = [
+  "flashinfer-jit-cache*",
+  "flashinfer-cubin*",
+  "flashinfer.experimental.b12x._compat*",
+  "flashinfer.prims_ts.moe.tools*",
+]
 
 [tool.setuptools.package-dir]
 "b12x" = "flashinfer/experimental/b12x/_compat/b12x"
@@ -90,10 +95,14 @@ exclude = ["flashinfer-jit-cache*", "flashinfer-cubin*", "flashinfer.experimenta
 "flashinfer.cake_vsa_sm90_backend" = ["csrc/**", "build.json"]
 "flashinfer.cake_gdp_backend" = ["csrc/**", "build.json"]
 "flashinfer.cake_mhc_train_backend" = ["csrc/**", "build.json"]
+"flashinfer.cake_mhc_train_head_backend" = ["csrc/**", "build.json"]
 "flashinfer.cake_gated_act_mxfp8_backend" = ["csrc/**", "build.json"]
+"flashinfer.cake_rmsnorm_silu_gate_train_backend" = ["csrc/**", "build.json"]
 "flashinfer.experimental.cake_dsa_train" = ["csrc/**", "build.json"]
 "flashinfer.experimental.cake_kda_train" = ["csrc/**", "build.json"]
 "flashinfer.experimental.cake_gdn_train" = ["csrc/**", "build.json", "build.test.json"]
+"flashinfer.experimental.cake_gdn_det_train" = ["csrc/**", "build.json"]
+"flashinfer.experimental.cake_gqa_train" = ["csrc/**", "build.json"]
 "flashinfer.experimental.cake_rubin_mla_nvfp4_decode" = ["csrc/**", "build.json"]
 "flashinfer.experimental.cake_lm_head_loss" = ["csrc/**", "build.json"]
 "flashinfer.experimental.cake_mok_bf16" = ["csrc/*.cu", "csrc/*/*.cu", "csrc/*.h", "sources.json", "build.json", "README.md"]
@@ -125,7 +134,10 @@ exclude = ["flashinfer-jit-cache*", "flashinfer-cubin*", "flashinfer.experimenta
 "flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe" = ["*.md"]
 "flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe" = ["*.md"]
 "flashinfer.moe_ep.kernel_src.sm100.next_cutedsl_megamoe" = ["*.md"]
-"flashinfer.prims_ts.moe" = ["prims_ts_moe_configs.json"]
+"flashinfer.prims_ts.moe" = [
+  "prims_ts_moe_configs.json",
+  "prims_ts_moe_configs_sm107.json",
+]
 # Capability surface of the NVFP4 MSA decode and prefill kernels, loaded at runtime via
 # importlib.resources.
 "flashinfer.msa_ops" = ["*.json"]
@@ -135,6 +147,15 @@ exclude = ["flashinfer-jit-cache*", "flashinfer-cubin*", "flashinfer.experimenta
 # Their in-package JIT kernel source, compiled on demand by
 # flashinfer/jit/gdn_fused_decode.py.
 "flashinfer.gdn_kernels.experimental.kernel" = ["*.cu"]
+# Experimental SM120 CuTe GDN prefill. include-package-data is false, so the
+# license, README, and autocp coefficients must be listed or a wheel omits them.
+"flashinfer.experimental.gdn_sm120_cute" = [
+  "README.md",
+  "LICENSE.FlashQLA",
+]
+"flashinfer.experimental.gdn_sm120_cute.autocp" = [
+  "coefs/*.csv",
+]
 # Generated sources for the experimental exact-SM103a MXFP8 MegaMoE backend.
 "flashinfer.experimental.cake_mxfp8_megamoe_ep16" = ["csrc/**"]
 # Generated programs, hand-written bindings and manifest of the experimental
@@ -155,10 +176,17 @@ exclude = ["flashinfer-jit-cache*", "flashinfer-cubin*", "flashinfer.experimenta
 # The Qwen 3.5 gated attention block: the feature README and the vendored cuDNN Frontend tree's provenance files.
 "flashinfer.experimental.qwen_3_5_block" = ["README.md"]
 "flashinfer.experimental.qwen_3_5_block._cudnn_frost" = ["VENDOR.md", "VENDOR_MANIFEST.json"]
+"flashinfer.experimental.qwen_3_8_block" = ["README.md"]
 # CUDA sources for the experimental SM80-SM90 QSA NVFP4 sparse paged attention, and the generated sources and
 # build manifest (build.json) of its Cake backend, the public entry's default route on SM80-SM90.
 "flashinfer.experimental.qsa_nvfp4" = ["csrc/**"]
 "flashinfer.experimental.cake_qsa_nvfp4" = ["csrc/**", "build.json"]
+# CUDA sources of the experimental fused MNNVL all-reduce + mHC post-map / pre-norm backend.
+"flashinfer.experimental.allreduce_mhc_post_prenorm" = ["csrc/**"]
+# CUDA sources of the experimental SM103 fused mHC post -> pre kernels, JIT-compiled on first use.
+"flashinfer.experimental.mhc_fused_post_pre" = ["csrc/**"]
+# CUDA source of the experimental SM100/SM103 mHC pre big-fuse + RMSNorm cluster kernel.
+"flashinfer.experimental.mhc_pre_big_fuse_with_norm" = ["csrc/**"]
 # Raw CUDA sources for the SM90 push-style FP8 mega-MoE drop, JIT-compiled at
 # runtime; registered so non-editable installs ship them (PR #4069).
 "flashinfer.moe_ep.kernel_src.sm90.push_style_megamoe" = [

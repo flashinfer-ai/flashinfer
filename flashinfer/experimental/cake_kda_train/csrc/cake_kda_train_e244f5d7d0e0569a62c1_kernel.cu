@@ -642,11 +642,11 @@ kernel_cake_kda_train_e244f5d7d0e0569a62c1(const __grid_constant__ CUtensorMap m
                         if (kind == 4) {
                             p_2 = (ngrp - 1) * gsize - n_b;
                         }
-                        int s_0_1 = seg0 + p_2;
+                        int s_1_1 = seg0 + p_2;
                         if (reverse == 1) {
-                            s_0_1 = seg0 + nseg - 1 - p_2;
+                            s_1_1 = seg0 + nseg - 1 - p_2;
                         }
-                        s_9 = s_0_1;
+                        s_9 = s_1_1;
                     }
                 }
                 if (s_9 >= 0) {
@@ -738,11 +738,11 @@ kernel_cake_kda_train_e244f5d7d0e0569a62c1(const __grid_constant__ CUtensorMap m
                         }
                     }
                     if (f_2 == 1) {
-                        int s_0_2 = seg0 + 3 * gsize;
+                        int s_2_1 = seg0 + 3 * gsize;
                         if (reverse == 1) {
-                            s_0_2 = seg0 + nseg - 1 - 3 * gsize;
+                            s_2_1 = seg0 + nseg - 1 - 3 * gsize;
                         }
-                        s_10 = s_0_2;
+                        s_10 = s_2_1;
                     } else {
                         int p_3 = 1;
                         if (kind == 2) {
@@ -757,11 +757,11 @@ kernel_cake_kda_train_e244f5d7d0e0569a62c1(const __grid_constant__ CUtensorMap m
                         if (kind == 4) {
                             p_3 = (ngrp - 1) * gsize + 1 - n_b;
                         }
-                        int s_0_3 = seg0 + p_3;
+                        int s_3_1 = seg0 + p_3;
                         if (reverse == 1) {
-                            s_0_3 = seg0 + nseg - 1 - p_3;
+                            s_3_1 = seg0 + nseg - 1 - p_3;
                         }
-                        s_10 = s_0_3;
+                        s_10 = s_3_1;
                     }
                 }
                 if (s_10 >= 0) {
@@ -881,11 +881,11 @@ kernel_cake_kda_train_e244f5d7d0e0569a62c1(const __grid_constant__ CUtensorMap m
                             }
                         }
                         if (f_4 == 1) {
-                            int s_0_4 = seg0 + (step_1 + 2 + 2) * gsize;
+                            int s_4_1 = seg0 + (step_1 + 2 + 2) * gsize;
                             if (reverse == 1) {
-                                s_0_4 = seg0 + nseg - 1 - (step_1 + 2 + 2) * gsize;
+                                s_4_1 = seg0 + nseg - 1 - (step_1 + 2 + 2) * gsize;
                             }
-                            s_11 = s_0_4;
+                            s_11 = s_4_1;
                         } else {
                             int p_4 = step_1 + 2;
                             if (kind == 2) {
@@ -900,11 +900,11 @@ kernel_cake_kda_train_e244f5d7d0e0569a62c1(const __grid_constant__ CUtensorMap m
                             if (kind == 4) {
                                 p_4 = (ngrp - 1) * gsize + (step_1 + 2) - n_b;
                             }
-                            int s_0_5 = seg0 + p_4;
+                            int s_5_1 = seg0 + p_4;
                             if (reverse == 1) {
-                                s_0_5 = seg0 + nseg - 1 - p_4;
+                                s_5_1 = seg0 + nseg - 1 - p_4;
                             }
-                            s_11 = s_0_5;
+                            s_11 = s_5_1;
                         }
                     }
                     if (s_11 >= 0) {
@@ -1024,11 +1024,11 @@ kernel_cake_kda_train_e244f5d7d0e0569a62c1(const __grid_constant__ CUtensorMap m
                     :: "r"(taddr + (unsigned int)row_base_1 + (unsigned int)((gsize + 1) % 3 * 128 + kcol_1)), "r"(*reinterpret_cast<const uint32_t*>(&bcol[0])), "r"(*reinterpret_cast<const uint32_t*>(&bcol[1])), "r"(*reinterpret_cast<const uint32_t*>(&bcol[2])), "r"(*reinterpret_cast<const uint32_t*>(&bcol[3])), "r"(*reinterpret_cast<const uint32_t*>(&bcol[4])), "r"(*reinterpret_cast<const uint32_t*>(&bcol[5])), "r"(*reinterpret_cast<const uint32_t*>(&bcol[6])), "r"(*reinterpret_cast<const uint32_t*>(&bcol[7])), "r"(*reinterpret_cast<const uint32_t*>(&bcol[8])), "r"(*reinterpret_cast<const uint32_t*>(&bcol[9])), "r"(*reinterpret_cast<const uint32_t*>(&bcol[10])), "r"(*reinterpret_cast<const uint32_t*>(&bcol[11])), "r"(*reinterpret_cast<const uint32_t*>(&bcol[12])), "r"(*reinterpret_cast<const uint32_t*>(&bcol[13])), "r"(*reinterpret_cast<const uint32_t*>(&bcol[14])), "r"(*reinterpret_cast<const uint32_t*>(&bcol[15])), "r"(*reinterpret_cast<const uint32_t*>(&bcol[16])), "r"(*reinterpret_cast<const uint32_t*>(&bcol[17])), "r"(*reinterpret_cast<const uint32_t*>(&bcol[18])), "r"(*reinterpret_cast<const uint32_t*>(&bcol[19])), "r"(*reinterpret_cast<const uint32_t*>(&bcol[20])), "r"(*reinterpret_cast<const uint32_t*>(&bcol[21])), "r"(*reinterpret_cast<const uint32_t*>(&bcol[22])), "r"(*reinterpret_cast<const uint32_t*>(&bcol[23])), "r"(*reinterpret_cast<const uint32_t*>(&bcol[24])), "r"(*reinterpret_cast<const uint32_t*>(&bcol[25])), "r"(*reinterpret_cast<const uint32_t*>(&bcol[26])), "r"(*reinterpret_cast<const uint32_t*>(&bcol[27])), "r"(*reinterpret_cast<const uint32_t*>(&bcol[28])), "r"(*reinterpret_cast<const uint32_t*>(&bcol[29])), "r"(*reinterpret_cast<const uint32_t*>(&bcol[30])), "r"(*reinterpret_cast<const uint32_t*>(&bcol[31])));
                 asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
                 asm volatile("tcgen05.fence::before_thread_sync;");
-                mbarrier_arrive(s_ready_addr + (gsize % 3) * 8);
+                mbarrier_arrive(s_ready_addr + ((int)((unsigned int)gsize % 3)) * 8);
                 if (steps > gsize + 1) {
-                    int s_0_6 = 0;
+                    int s_6_1 = 0;
                     if (kind == 3) {
-                        s_0_6 = -1;
+                        s_6_1 = -1;
                     } else {
                         int f_6 = 0;
                         if (kind == 4) {
@@ -1037,11 +1037,11 @@ kernel_cake_kda_train_e244f5d7d0e0569a62c1(const __grid_constant__ CUtensorMap m
                             }
                         }
                         if (f_6 == 1) {
-                            int s_1_1 = seg0 + (gsize + 1 + 2) * gsize;
+                            int s_7_1 = seg0 + (gsize + 1 + 2) * gsize;
                             if (reverse == 1) {
-                                s_1_1 = seg0 + nseg - 1 - (gsize + 1 + 2) * gsize;
+                                s_7_1 = seg0 + nseg - 1 - (gsize + 1 + 2) * gsize;
                             }
-                            s_0_6 = s_1_1;
+                            s_6_1 = s_7_1;
                         } else {
                             int p_5 = gsize + 1;
                             if (kind == 2) {
@@ -1056,14 +1056,14 @@ kernel_cake_kda_train_e244f5d7d0e0569a62c1(const __grid_constant__ CUtensorMap m
                             if (kind == 4) {
                                 p_5 = (ngrp - 1) * gsize + (gsize + 1) - n_b;
                             }
-                            int s_1_2 = seg0 + p_5;
+                            int s_8_1 = seg0 + p_5;
                             if (reverse == 1) {
-                                s_1_2 = seg0 + nseg - 1 - p_5;
+                                s_8_1 = seg0 + nseg - 1 - p_5;
                             }
-                            s_0_6 = s_1_2;
+                            s_6_1 = s_8_1;
                         }
                     }
-                    if (s_0_6 >= 0) {
+                    if (s_6_1 >= 0) {
                         int f_7 = 0;
                         if (kind == 4) {
                             if (n_b > gsize + 1) {
@@ -1082,7 +1082,7 @@ kernel_cake_kda_train_e244f5d7d0e0569a62c1(const __grid_constant__ CUtensorMap m
                             }
                             __syncwarp();
                             asm volatile("tcgen05.fence::after_thread_sync;");
-                            long long base_0 = ((long long)s_0_6 * (long long)num_heads + (long long)head) * 16384 + (long long)lane_v_1;
+                            long long base_0 = ((long long)s_6_1 * (long long)num_heads + (long long)head) * 16384 + (long long)lane_v_1;
                             #pragma unroll
                             for (int k_11 = 0; k_11 < 32; k_11++) {
                                 {
@@ -1090,11 +1090,11 @@ kernel_cake_kda_train_e244f5d7d0e0569a62c1(const __grid_constant__ CUtensorMap m
                                 }
                             }
                         } else {
-                            long long base_0_1 = ((long long)s_0_6 * (long long)num_heads + (long long)head) * 16384 + (long long)lane_v_1;
+                            long long base_1_1 = ((long long)s_6_1 * (long long)num_heads + (long long)head) * 16384 + (long long)lane_v_1;
                             #pragma unroll
                             for (int k_12 = 0; k_12 < 32; k_12++) {
                                 {
-                                    bcol[k_12] = *reinterpret_cast<const float*>(b + (base_0_1 + k_off_1 + (long long)(k_12 * 128)));
+                                    bcol[k_12] = *reinterpret_cast<const float*>(b + (base_1_1 + k_off_1 + (long long)(k_12 * 128)));
                                 }
                             }
                         }
@@ -1159,9 +1159,9 @@ kernel_cake_kda_train_e244f5d7d0e0569a62c1(const __grid_constant__ CUtensorMap m
                     asm volatile("tcgen05.fence::before_thread_sync;");
                     mbarrier_arrive(s_ready_addr + (nxt_stage2) * 8);
                     if (steps > step2 + 2) {
-                        int s_0_7 = 0;
+                        int s_9_1 = 0;
                         if (kind == 3) {
-                            s_0_7 = -1;
+                            s_9_1 = -1;
                         } else {
                             int f_8 = 0;
                             if (kind == 4) {
@@ -1170,11 +1170,11 @@ kernel_cake_kda_train_e244f5d7d0e0569a62c1(const __grid_constant__ CUtensorMap m
                                 }
                             }
                             if (f_8 == 1) {
-                                int s_1_3 = seg0 + (step2 + 2 + 2) * gsize;
+                                int s_10_1 = seg0 + (step2 + 2 + 2) * gsize;
                                 if (reverse == 1) {
-                                    s_1_3 = seg0 + nseg - 1 - (step2 + 2 + 2) * gsize;
+                                    s_10_1 = seg0 + nseg - 1 - (step2 + 2 + 2) * gsize;
                                 }
-                                s_0_7 = s_1_3;
+                                s_9_1 = s_10_1;
                             } else {
                                 int p_6 = step2 + 2;
                                 if (kind == 2) {
@@ -1189,14 +1189,14 @@ kernel_cake_kda_train_e244f5d7d0e0569a62c1(const __grid_constant__ CUtensorMap m
                                 if (kind == 4) {
                                     p_6 = (ngrp - 1) * gsize + (step2 + 2) - n_b;
                                 }
-                                int s_1_4 = seg0 + p_6;
+                                int s_11_1 = seg0 + p_6;
                                 if (reverse == 1) {
-                                    s_1_4 = seg0 + nseg - 1 - p_6;
+                                    s_11_1 = seg0 + nseg - 1 - p_6;
                                 }
-                                s_0_7 = s_1_4;
+                                s_9_1 = s_11_1;
                             }
                         }
-                        if (s_0_7 >= 0) {
+                        if (s_9_1 >= 0) {
                             int f_9 = 0;
                             if (kind == 4) {
                                 if (n_b > step2 + 2) {
@@ -1215,19 +1215,19 @@ kernel_cake_kda_train_e244f5d7d0e0569a62c1(const __grid_constant__ CUtensorMap m
                                 }
                                 __syncwarp();
                                 asm volatile("tcgen05.fence::after_thread_sync;");
-                                long long base_0_2 = ((long long)s_0_7 * (long long)num_heads + (long long)head) * 16384 + (long long)lane_v_1;
+                                long long base_2_1 = ((long long)s_9_1 * (long long)num_heads + (long long)head) * 16384 + (long long)lane_v_1;
                                 #pragma unroll
                                 for (int k_13 = 0; k_13 < 32; k_13++) {
                                     {
-                                        bcol[k_13] = *reinterpret_cast<const float*>(h_out + (base_0_2 + k_off_1 + (long long)(k_13 * 128)));
+                                        bcol[k_13] = *reinterpret_cast<const float*>(h_out + (base_2_1 + k_off_1 + (long long)(k_13 * 128)));
                                     }
                                 }
                             } else {
-                                long long base_0_3 = ((long long)s_0_7 * (long long)num_heads + (long long)head) * 16384 + (long long)lane_v_1;
+                                long long base_3_1 = ((long long)s_9_1 * (long long)num_heads + (long long)head) * 16384 + (long long)lane_v_1;
                                 #pragma unroll
                                 for (int k_14 = 0; k_14 < 32; k_14++) {
                                     {
-                                        bcol[k_14] = *reinterpret_cast<const float*>(b + (base_0_3 + k_off_1 + (long long)(k_14 * 128)));
+                                        bcol[k_14] = *reinterpret_cast<const float*>(b + (base_3_1 + k_off_1 + (long long)(k_14 * 128)));
                                     }
                                 }
                             }

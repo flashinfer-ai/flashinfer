@@ -121,10 +121,12 @@ set carries the WY representation's ``w`` / ``u`` too: the paired serial
 ``sm_107a`` above 32 (document, head) chains -- ``bwd_prep_g8_noqg_nokb`` (no
 ``kb`` write either; those rows launch no ``wy`` program on either light
 path; the serial rows' form is gated to the ``light`` path, as the serial
-route never saves the states).  The GLM intra program of ``sm_103a`` is
-``glm_intra_v14``, the gate epilogue fused into its drains; the
-``gate_epilogue`` stage is optional and launches on ``sm_100a`` / ``sm_107a``
-alone, after ``glm_intra``.
+route never saves the states).  The GLM intra programs of ``sm_103a`` and
+``sm_107a`` are ``glm_intra_v14`` and ``glm_intra_v18``, the gate epilogue
+fused into their drains (``glm_intra_v18`` is the same program with every
+named-barrier slot an immediate, so two of its CTAs share an SM on ``sm_107a``);
+the ``gate_epilogue`` stage is optional and launches on ``sm_100a`` alone,
+after ``glm_intra``.
 
 The derived leaves of a record (``kernel_symbol``, ``launch``, ``arg_plan``,
 ``logical``) are rewritten by the exporter from the rendered binding; the
@@ -176,9 +178,9 @@ PATHS = ("fwd", "fwd_nosave", "light", "light_states", "tape", "replay")
 # reads, after it otherwise), ``wy`` and the recurrence recompute where the path and the
 # row take them, ``dav`` where the fused gradient does not host it, the adjoint
 # recurrence (segmented: pass 1, ``seg_carry``, pass 2), the fused gradient,
-# the GLM intra program and, on ``sm_100a`` / ``sm_107a``, the gate epilogue
-# (``sm_103a`` launches ``glm_intra_v14``, which writes the gate gradients
-# itself).  A stage with several variants
+# the GLM intra program and, on ``sm_100a``, the gate epilogue (``sm_103a`` /
+# ``sm_107a`` launch ``glm_intra_v14`` / ``glm_intra_v18``, which write the gate
+# gradients themselves).  A stage with several variants
 # launches the record its ``select_rule`` admits; an optional stage launches
 # nothing when no record admits.  The WY representation is two stages:
 # ``wy_fwd`` (the forward's program, on the user's ``v`` / ``beta`` token rows;
@@ -752,16 +754,16 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_z"],
         ],
         "ffi_entry": "run",
-        "grid_rule": {"kind": "pairs_bounded", "ctas_per_sm": 1},
-        "kernel_symbol": "kernel_cake_kda_train_16034f9855aa6bf70440",
+        "grid_rule": {"kind": "pair_items"},
+        "kernel_symbol": "kernel_cake_kda_train_3712054f19d4180caa28",
         "launch": {
             "block": (448, 1, 1),
             "cluster": (1, 1, 1),
             "cooperative": False,
-            "dynamic_smem_bytes": 197632,
+            "dynamic_smem_bytes": 197760,
             "use_pdl": False,
         },
-        "library": "cake_kda_train_16034f9855aa6bf70440",
+        "library": "cake_kda_train_3712054f19d4180caa28",
         "logical": {
             "akk_tma": "akk_int",
             "beta": "beta",
@@ -874,16 +876,16 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_z"],
         ],
         "ffi_entry": "run",
-        "grid_rule": {"kind": "pairs_bounded", "ctas_per_sm": 1},
-        "kernel_symbol": "kernel_cake_kda_train_9f65ab7adc0a39a322ca",
+        "grid_rule": {"kind": "pair_items"},
+        "kernel_symbol": "kernel_cake_kda_train_e60e7ca5d88192193e61",
         "launch": {
             "block": (448, 1, 1),
             "cluster": (1, 1, 1),
             "cooperative": False,
-            "dynamic_smem_bytes": 197632,
+            "dynamic_smem_bytes": 197760,
             "use_pdl": False,
         },
-        "library": "cake_kda_train_9f65ab7adc0a39a322ca",
+        "library": "cake_kda_train_e60e7ca5d88192193e61",
         "logical": {
             "akk_tma": "akk_ext",
             "beta": "beta",
@@ -995,16 +997,16 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_z"],
         ],
         "ffi_entry": "run",
-        "grid_rule": {"kind": "pairs_bounded", "ctas_per_sm": 1},
-        "kernel_symbol": "kernel_cake_kda_train_9f65ab7adc0a39a322ca",
+        "grid_rule": {"kind": "pair_items"},
+        "kernel_symbol": "kernel_cake_kda_train_e60e7ca5d88192193e61",
         "launch": {
             "block": (448, 1, 1),
             "cluster": (1, 1, 1),
             "cooperative": False,
-            "dynamic_smem_bytes": 197632,
+            "dynamic_smem_bytes": 197760,
             "use_pdl": False,
         },
-        "library": "cake_kda_train_9f65ab7adc0a39a322ca",
+        "library": "cake_kda_train_e60e7ca5d88192193e61",
         "logical": {
             "akk_tma": "akk_src",
             "beta": "beta",
@@ -1098,16 +1100,16 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_z"],
         ],
         "ffi_entry": "run",
-        "grid_rule": {"kind": "pairs_bounded", "ctas_per_sm": 1},
-        "kernel_symbol": "kernel_cake_kda_train_18bd735cf970f8dfa1b4",
+        "grid_rule": {"kind": "pair_items"},
+        "kernel_symbol": "kernel_cake_kda_train_eac26fffb3df8780302c",
         "launch": {
             "block": (448, 1, 1),
             "cluster": (1, 1, 1),
             "cooperative": False,
-            "dynamic_smem_bytes": 197632,
+            "dynamic_smem_bytes": 197760,
             "use_pdl": False,
         },
-        "library": "cake_kda_train_18bd735cf970f8dfa1b4",
+        "library": "cake_kda_train_eac26fffb3df8780302c",
         "logical": {
             "akk_tma": "akk_int",
             "beta": "beta",
@@ -3243,16 +3245,16 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_z"],
         ],
         "ffi_entry": "run",
-        "grid_rule": {"kind": "pairs_bounded", "ctas_per_sm": 1},
-        "kernel_symbol": "kernel_cake_kda_train_021592c077b54de470a5",
+        "grid_rule": {"kind": "pair_items"},
+        "kernel_symbol": "kernel_cake_kda_train_706240be56d4e41df1a2",
         "launch": {
             "block": (192, 1, 1),
             "cluster": (1, 1, 1),
             "cooperative": False,
-            "dynamic_smem_bytes": 132096,
+            "dynamic_smem_bytes": 132224,
             "use_pdl": False,
         },
-        "library": "cake_kda_train_021592c077b54de470a5",
+        "library": "cake_kda_train_706240be56d4e41df1a2",
         "logical": {
             "chunk_bos": "chunk_bos",
             "chunk_len": "chunk_len",
@@ -3290,16 +3292,16 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_z"],
         ],
         "ffi_entry": "run",
-        "grid_rule": {"kind": "pairs_bounded", "ctas_per_sm": 1},
-        "kernel_symbol": "kernel_cake_kda_train_cace58c99e770d8a5a04",
+        "grid_rule": {"kind": "pair_items"},
+        "kernel_symbol": "kernel_cake_kda_train_f92b256cccc2c9007554",
         "launch": {
             "block": (192, 1, 1),
             "cluster": (1, 1, 1),
             "cooperative": False,
-            "dynamic_smem_bytes": 132096,
+            "dynamic_smem_bytes": 132224,
             "use_pdl": False,
         },
-        "library": "cake_kda_train_cace58c99e770d8a5a04",
+        "library": "cake_kda_train_f92b256cccc2c9007554",
         "logical": {
             "chunk_bos": "chunk_bos",
             "chunk_len": "chunk_len",
@@ -4829,8 +4831,8 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_z"],
         ],
         "ffi_entry": "run",
-        "grid_rule": {"kind": "sm_bounded", "ctas_per_sm": 1},
-        "kernel_symbol": "kernel_cake_kda_train_ecf750512be27b9043fa",
+        "grid_rule": {"kind": "chunk_items"},
+        "kernel_symbol": "kernel_cake_kda_train_ac974e171d56fc3ce10b",
         "launch": {
             "block": (576, 1, 1),
             "cluster": (1, 1, 1),
@@ -4838,7 +4840,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 224384,
             "use_pdl": False,
         },
-        "library": "cake_kda_train_ecf750512be27b9043fa",
+        "library": "cake_kda_train_ac974e171d56fc3ce10b",
         "logical": {
             "akk_tma": "akk_src",
             "beta": "beta_int",
@@ -4908,8 +4910,8 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_z"],
         ],
         "ffi_entry": "run",
-        "grid_rule": {"kind": "sm_bounded", "ctas_per_sm": 1},
-        "kernel_symbol": "kernel_cake_kda_train_6df24a76cec0e85a8c75",
+        "grid_rule": {"kind": "chunk_items"},
+        "kernel_symbol": "kernel_cake_kda_train_058a68a5b4d89c53be4b",
         "launch": {
             "block": (576, 1, 1),
             "cluster": (1, 1, 1),
@@ -4917,7 +4919,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 224384,
             "use_pdl": False,
         },
-        "library": "cake_kda_train_6df24a76cec0e85a8c75",
+        "library": "cake_kda_train_058a68a5b4d89c53be4b",
         "logical": {
             "akk_tma": "akk_int",
             "beta": "beta_int",
@@ -4987,8 +4989,8 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_z"],
         ],
         "ffi_entry": "run",
-        "grid_rule": {"kind": "sm_bounded", "ctas_per_sm": 1},
-        "kernel_symbol": "kernel_cake_kda_train_cfa2684db4d92e37448d",
+        "grid_rule": {"kind": "chunk_items"},
+        "kernel_symbol": "kernel_cake_kda_train_f6a70fb0288a508f2828",
         "launch": {
             "block": (320, 1, 1),
             "cluster": (1, 1, 1),
@@ -4996,7 +4998,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 224384,
             "use_pdl": False,
         },
-        "library": "cake_kda_train_cfa2684db4d92e37448d",
+        "library": "cake_kda_train_f6a70fb0288a508f2828",
         "logical": {
             "akk_tma": "akk_src",
             "beta": "beta_int",
@@ -5102,8 +5104,8 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_z"],
         ],
         "ffi_entry": "run",
-        "grid_rule": {"kind": "sm_bounded", "ctas_per_sm": 1},
-        "kernel_symbol": "kernel_cake_kda_train_d098004ffe4a23d58ff4",
+        "grid_rule": {"kind": "chunk_items"},
+        "kernel_symbol": "kernel_cake_kda_train_1f9c46f98f4290ee26df",
         "launch": {
             "block": (320, 1, 1),
             "cluster": (1, 1, 1),
@@ -5111,7 +5113,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 224384,
             "use_pdl": False,
         },
-        "library": "cake_kda_train_d098004ffe4a23d58ff4",
+        "library": "cake_kda_train_1f9c46f98f4290ee26df",
         "logical": {
             "akk_tma": "akk_int",
             "beta": "beta_int",
@@ -5217,8 +5219,8 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_z"],
         ],
         "ffi_entry": "run",
-        "grid_rule": {"kind": "sm_bounded", "ctas_per_sm": 1},
-        "kernel_symbol": "kernel_cake_kda_train_72ed2d17bb80595090a8",
+        "grid_rule": {"kind": "chunk_items"},
+        "kernel_symbol": "kernel_cake_kda_train_1a0df5d531918da7561e",
         "launch": {
             "block": (320, 1, 1),
             "cluster": (1, 1, 1),
@@ -5226,7 +5228,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 224384,
             "use_pdl": False,
         },
-        "library": "cake_kda_train_72ed2d17bb80595090a8",
+        "library": "cake_kda_train_1a0df5d531918da7561e",
         "logical": {
             "akk_tma": "akk_src",
             "beta": "beta_int",
@@ -5296,8 +5298,8 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_z"],
         ],
         "ffi_entry": "run",
-        "grid_rule": {"kind": "sm_bounded", "ctas_per_sm": 1},
-        "kernel_symbol": "kernel_cake_kda_train_f80ac356149d8d2c42e6",
+        "grid_rule": {"kind": "chunk_items"},
+        "kernel_symbol": "kernel_cake_kda_train_3b9b3f9a495f04bc83e4",
         "launch": {
             "block": (320, 1, 1),
             "cluster": (1, 1, 1),
@@ -5305,7 +5307,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 224384,
             "use_pdl": False,
         },
-        "library": "cake_kda_train_f80ac356149d8d2c42e6",
+        "library": "cake_kda_train_3b9b3f9a495f04bc83e4",
         "logical": {
             "akk_tma": "akk_int",
             "beta": "beta_int",
@@ -5344,7 +5346,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "variant": "int_davq_nohint",
     },
     "glm_intra": {
-        "arches": ["sm_100a", "sm_107a"],
+        "arches": ["sm_100a"],
         "arg_plan": [
             ["buffer", "dAqk"],
             ["buffer", "dAkk"],
@@ -5407,7 +5409,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "num_qk_heads": "num_heads",
             "q_e": "q",
         },
-        "select_rule": {"kind": "arch_in", "arches": ["sm_100a", "sm_107a"]},
+        "select_rule": {"kind": "arch_in", "arches": ["sm_100a"]},
         "stage": "glm_intra",
         "variant": None,
     },
@@ -5479,8 +5481,76 @@ MODULES: dict[str, dict[str, Any]] = {
         "stage": "glm_intra",
         "variant": "v14",
     },
+    "glm_intra_v18": {
+        "arches": ["sm_107a"],
+        "arg_plan": [
+            ["buffer", "dAqk"],
+            ["buffer", "dAkk"],
+            ["buffer", "gk"],
+            ["buffer", "k_e"],
+            ["buffer", "q_e"],
+            ["buffer", "dq_f_t"],
+            ["buffer", "dk_f_t"],
+            ["buffer", "dg_f_t"],
+            ["buffer", "beta"],
+            ["buffer", "dq_f"],
+            ["buffer", "dk_f"],
+            ["buffer", "dg_f"],
+            ["buffer", "db_f"],
+            ["buffer", "chunk_bos"],
+            ["buffer", "chunk_len"],
+            ["buffer", "dq_ext"],
+            ["buffer", "dk_ext"],
+            ["buffer", "dg_ext"],
+            ["buffer", "dbeta_ext"],
+            ["parameter", "num_heads"],
+            ["parameter", "num_qk_heads"],
+            ["parameter", "group"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {"kind": "chunks", "x_factor": 1},
+        "kernel_symbol": "kernel_cake_kda_train_aa6b5c23c97e1cb9880a",
+        "launch": {
+            "block": (288, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 115200,
+            "use_pdl": False,
+        },
+        "library": "cake_kda_train_aa6b5c23c97e1cb9880a",
+        "logical": {
+            "beta": "beta_int",
+            "chunk_bos": "chunk_bos",
+            "chunk_len": "chunk_len",
+            "dAkk": "dAkk",
+            "dAqk": "dAqk",
+            "db_f": "db_f",
+            "dbeta_ext": "dbeta",
+            "dg_ext": "dg",
+            "dg_f": "dg_f",
+            "dg_f_t": "dg_f",
+            "dk_ext": "dk",
+            "dk_f": "dk_f",
+            "dk_f_t": "dk_f",
+            "dq_ext": "dq",
+            "dq_f": "dq_f",
+            "dq_f_t": "dq_f",
+            "gk": "gk",
+            "group": "group",
+            "k_e": "k",
+            "num_heads": "num_heads",
+            "num_qk_heads": "num_heads",
+            "q_e": "q",
+        },
+        "select_rule": {"kind": "arch_in", "arches": ["sm_107a"]},
+        "stage": "glm_intra",
+        "variant": "v18",
+    },
     "gate_epilogue": {
-        "arches": ["sm_100a", "sm_107a"],
+        "arches": ["sm_100a"],
         "arg_plan": [
             ["buffer", "dg_in"],
             ["buffer", "db_in"],
@@ -5513,7 +5583,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dg_out": "dg",
             "num_heads": "num_heads",
         },
-        "select_rule": {"kind": "arch_in", "arches": ["sm_100a", "sm_107a"]},
+        "select_rule": {"kind": "arch_in", "arches": ["sm_100a"]},
         "stage": "gate_epilogue",
         "variant": None,
     },
@@ -5863,7 +5933,12 @@ def launch_grid(
     (the layout table's chunk-parallel program); ``pairs_bounded`` is
     the persistent pair grid ``min(num_chunks_pad / 2 * num_heads, ctas_per_sm *
     sm_count)``, at least one (the CTAs walk the (pair, head) items;
-    ``num_chunks_pad`` is even); ``per_doc_head``
+    ``num_chunks_pad`` is even); ``pair_items`` launches one CTA per (pair,
+    head) item, ``(num_chunks_pad / 2 * num_heads, 1, 1)``, and ``chunk_items``
+    one per (chunk, head) item, ``(num_chunks_pad * num_heads, 1, 1)``: the
+    CTAs that start take the items of the CTAs that have not started through
+    Cluster Launch Control, so a CTA another stream keeps from starting costs
+    its items' share of the SMs, never a second wave; ``per_doc_head``
     launches ``(num_seqs * num_heads * slices, 1, 1)`` (the recurrence over the
     chunk chain of one document and head, in ``slices`` value-column slices);
     ``sm_bounded`` is the persistent grid ``min(num_chunks_pad * num_heads,
@@ -5896,6 +5971,12 @@ def launch_grid(
             raise ValueError(f"record {name}: num_chunks_pad={nc} is not even")
         pairs = nc * CHUNK // PAIR_ROWS * h
         return (max(1, min(pairs, int(rule["ctas_per_sm"]) * int(sm_count))), 1, 1)
+    if kind == "pair_items":
+        if nc % 2:
+            raise ValueError(f"record {name}: num_chunks_pad={nc} is not even")
+        return (max(1, nc * CHUNK // PAIR_ROWS * h), 1, 1)
+    if kind == "chunk_items":
+        return (max(1, nc * h), 1, 1)
     if kind == "per_doc_head":
         return (n * h * int(rule["slices"]), 1, 1)
     if kind == "sm_bounded":

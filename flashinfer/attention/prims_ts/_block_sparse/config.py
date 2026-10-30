@@ -562,6 +562,8 @@ def _make_block_sparse_config(key: _BlockSparseCompileKey) -> "FmhaDecodeConfig"
         "groups_tokens_heads_q": True,
         "use_block_sparse": key.use_block_sparse,
         "softmax_rescale_threshold_log2": key.softmax_rescale_threshold_log2,
+        # Block-sparse and Sage plans compile for their exact lengths.
+        "fixed_seqlen": True,
     }
     if key.use_block_sparse:
         config_args.update(

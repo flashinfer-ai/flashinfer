@@ -36,9 +36,10 @@ from .kernel_helpers import (
 @deprecated_aliases(apply_topk_at_fc1="apply_routing_weights_before_fc2")
 @dataclasses.dataclass(frozen=True)
 class Sm100GenphaseMoeConfig(BlockScaledMoeConfig):
-    """MXFP8 E4M3, BF16 combine, grouped GenPhase on SM100/103.
+    """Block-scaled weights, BF16 combine, grouped GenPhase on SM100/103.
 
-    Defaults to N128/CGA4; N64/CGA2 and N64/CGA4 are explicit alternatives.
+    NVFP4 uses K256/N128/CGA4. MXFP8 E4M3/E5M2 and mixed MXFP4/MXFP8
+    use K128/N128/CGA4, with N64 alternatives for sparse expert batches.
     """
 
     kernel_variant: Literal["inference", "genphase"] = "genphase"
@@ -47,32 +48,44 @@ class Sm100GenphaseMoeConfig(BlockScaledMoeConfig):
 
     @property
     def instruction_k(self) -> int:
-        return 32
+        """Return the native block-scaled MMA K extent for the quantization kind."""
+        return 64 if self.quant_kind == "nvfp4" else 32
+
+    @property
+    def gather_tile_k(self) -> int:
+        """Pack each activation row into one 128-byte Gather4 swizzle atom."""
+        return 256 if self.quant_kind == "nvfp4" else 128
 
     @property
     def resolved_mma_tiler_mnk(self) -> tuple[int, int, int]:
-        return self.mma_tiler_mnk or (256, 128, 128)
+        """Use explicit geometry or the dtype's N128 Gather4 default."""
+        return self.mma_tiler_mnk or (256, 128, self.gather_tile_k)
+
+    @property
+    def admitted_geometries(self):
+        """Enumerate the dtype's supported Gather4 tile and cluster pairs."""
+        geometries = (((256, 128, self.gather_tile_k), (4, 1)),)
+        if self.quant_kind != "nvfp4":
+            geometries += (((256, 64, 128), (4, 1)),)
+        if self.quant_kind in ("mxfp8_e4m3", "mxfp8_e5m2"):
+            geometries += (((256, 64, 128), (2, 1)),)
+        return geometries
 
     def __post_init__(self) -> None:
+        """Restrict GenPhase to admitted Gather4 geometries and BF16 reduction."""
         super().__post_init__()
         geometry = (self.resolved_mma_tiler_mnk, self.cluster_shape_mn)
         if (
             self.kernel_variant != "genphase"
-            or self.quant_kind != "mxfp8_e4m3"
-            or geometry
-            not in (
-                ((256, 128, 128), (4, 1)),
-                ((256, 64, 128), (4, 1)),
-                ((256, 64, 128), (2, 1)),
-            )
+            or geometry not in self.admitted_geometries
             or self.schedule_policy[0] != "grouped"
             or self.reduce_topk_in_kernel
             or self.activation != "swiglu"
         ):
             raise ValueError(
-                "Blackwell GenPhase requires MXFP8 E4M3, SwiGLU, tile "
-                "(256, 128, 128) at cluster (4, 1), or (256, 64, 128) at "
-                "cluster (2, 1) or (4, 1), grouped scheduling and "
+                "Blackwell GenPhase requires SwiGLU, N128/CGA4 or an admitted "
+                "N64 geometry, K256 for NVFP4 or K128 for MXFP8 and mixed "
+                "MXFP4/MXFP8, grouped scheduling and "
                 "separate BF16 reduction."
             )
 
@@ -115,8 +128,8 @@ class Sm100GenphaseSymmBuffer(BlockScaledSymmBuffer):
     def retune(self, knobs) -> None:
         """Collectively replace kernel storage before capture, preserving I/O views.
 
-        Only performance knobs may change. The backend calls this once after
-        its explicit warmup sweep, on an unpooled workspace.
+        Only performance knobs may change. Automatic selection instead uses
+        ``install_tuned_knobs()`` to prepare the winner with its weights.
         """
         from . import comm
         from .tuning import is_valid_sm100_genphase_knobs

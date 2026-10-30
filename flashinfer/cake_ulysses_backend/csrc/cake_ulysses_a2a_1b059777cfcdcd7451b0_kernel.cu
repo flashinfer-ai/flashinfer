@@ -2956,6 +2956,7 @@ kernel_cake_ulysses_a2a_1b059777cfcdcd7451b0(__nv_bfloat16* __restrict__ inp, __
         if (tid_0 == 480) {
             if (bid_1 < 128) {
                 asm volatile("st.release.sys.global.u32 [%0], %1;" :: "l"(landed), "r"(epoch) : "memory");
+                asm volatile("fence.acq_rel.sys;" ::: "memory");
             }
         }
     }

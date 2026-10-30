@@ -41,6 +41,7 @@ Operands come from the seeded CPU generator (bitwise identical on every rank and
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import datetime as _dt
 import gc
@@ -58,6 +59,8 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+
+from tests.test_helpers.kcp_collective_shims import CollectiveCounter, RecomputePhase
 
 PACKAGE = "flashinfer.experimental.cake_gdn_train"
 
@@ -926,6 +929,173 @@ def _run_rank(
         kept_delta[k] == v_ for k, v_ in expect.items()
     )
 
+    # issue #7074 (2) + G10: the "auto" form (the shipped default) in a region the GDN node closes takes the kept
+    # path on a rank with tokens (the frame proof "dead"; a rank without tokens replays as before), is bitwise the
+    # direct result, and its checkpointed forward + backward -- the recompute forward, the frame proof over the
+    # autograd graph (structure only, never tensor contents), the kept-tape take -- make no synchronizing CUDA call
+    # (outside the kept-stats window above: the "auto" pass has its own accounting below)
+    AUTO = {"reuse_recompute_tapes": "auto"}
+    auto_stats0 = dict(kcp.KEPT_STATS)
+    torch.cuda.synchronize()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        res_auto_form = autograd_pass(True, **AUTO)
+        flags["auto_no_sync"] = True
+    except RuntimeError as exc:  # a synchronizing call in the "auto" pass
+        info["auto_no_sync_error"] = str(exc)[:200]
+        flags["auto_no_sync"] = False
+        res_auto_form = None
+    finally:
+        torch.cuda.set_sync_debug_mode("default")
+    if res_auto_form is None:
+        res_auto_form = autograd_pass(True, **AUTO)
+    info["auto_form"] = _kept_record(T_r_here)
+    info["auto_form"]["hand_off_reason"] = kcp.LAST_CALL["fwd"].get("hand_off_reason")
+    flags["auto_eq_direct"] = _eq(res_auto, res_auto_form)
+    # a rank with tokens hands off on the frame proof ("dead"); a rank without tokens has no tapes and switches the
+    # hand-off off before the "auto" decision, as every form does there (recorded "off", the replay form)
+    flags["auto_path_taken"] = bool(info["auto_form"]["path_ok"]) and (
+        info["auto_form"]["hand_off_reason"] == ("dead" if T_r_here > 0 else "off")
+        or not kcp.torch_release_verified()
+    )
+    auto_delta = {k: kcp.KEPT_STATS[k] - auto_stats0[k] for k in auto_stats0}
+    info["auto_stats_delta"] = auto_delta
+    # one hand-off on a rank with tokens (the proof "dead"); none without tokens or on an unverified release -- and no
+    # miss is counted for an "auto" forward that did not hand off
+    n_auto = 1 if (T_r_here > 0 and kcp.torch_release_verified()) else 0
+    flags["auto_registry_empty"] = kcp.kept_registry_size() == 0 and all(
+        auto_delta[k] == v_
+        for k, v_ in {"put": n_auto, "take": n_auto, "miss": 0}.items()
+    )
+
+    # issue #7818: a KcpRecomputeHandle carries this rank's incoming states S_in from the checkpointed forward to
+    # torch's recompute, which then issues no collective and waits on none (counted by phase through shims on
+    # torch.distributed; the recompute phase is marked by the checkpoint's context_fn).  Out and the five gradients
+    # are bitwise the plain checkpoint's (same options) and the direct pass's; the original forward and the backward
+    # exchange exactly as the plain checkpoint does (A4); a second backward reuses the entry; the handle retains
+    # exactly S_in (the light saved set without the transfer and the convolution rows).  The row's own plan P is
+    # used (a forced segment count is not valid on every rank of every row); info records it.  The plain
+    # checkpoint's per-phase counts are recorded as the reproduction of the issue.
+    def handle_pass(handle: bool, *, twice: bool = False, workspace=ws, **opts):
+        leaves = [x.detach().clone().requires_grad_(True) for x in (q, k, v, g, beta)]
+        o = {**base, "save_transfer": False, **opts}
+        hd = kcp.KcpRecomputeHandle() if handle else None
+
+        def fn(q_, k_, v_, g_, b_, h_):
+            return kcp.chunk_gdn_kcp(
+                q_, k_, v_, g_, b_, ctx, workspace=workspace, recompute_handle=h_, **o
+            )
+
+        from torch.utils.checkpoint import checkpoint
+
+        with CollectiveCounter() as cc:
+            rphase = RecomputePhase(cc)
+            out = checkpoint(
+                fn,
+                *leaves,
+                hd,
+                use_reentrant=False,
+                context_fn=lambda: (contextlib.nullcontext(), rphase),
+            )
+            # torch's early stop ends the recompute inside the node's apply, after the forward recorded itself
+            modes = [kcp.LAST_CALL["fwd"].get("recompute_handle")]
+            P_used = int(kcp.LAST_CALL["fwd"].get("P", 0) or 0)
+            cc.phase = "bwd"
+            out.backward(dout, retain_graph=twice)
+            modes.append(kcp.LAST_CALL["fwd"].get("recompute_handle"))
+            if twice:
+                out.backward(dout)
+                modes.append(kcp.LAST_CALL["fwd"].get("recompute_handle"))
+        rec = {
+            **cc.record(),
+            "modes": modes,
+            "P": P_used,
+            "handle_bytes": hd.nbytes() if hd is not None else 0,
+        }
+        return {
+            "out": out.detach(),
+            **{n: lf.grad for n, lf in zip(GRADS, leaves, strict=True)},
+        }, rec
+
+    handle_info: dict[str, object] = {}
+    res_plain, rec_plain = handle_pass(False)
+    res_h, rec_h = handle_pass(True)
+    handle_info["plain"], handle_info["handle"] = rec_plain, rec_h
+    flags["handle_eq_ckpt"] = _eq(res_plain, res_h)
+    flags["handle_eq_direct"] = _eq(res_auto, res_h)
+    flags["handle_recompute_no_comm"] = (
+        rec_h["calls"].get("recompute", 0) == 0
+        and rec_h["waits"].get("recompute", 0) == 0
+    )
+    flags["handle_orig_bwd_comm_unchanged"] = all(
+        rec_h[t].get(ph, 0) == rec_plain[t].get(ph, 0)
+        for t in ("calls", "waits")
+        for ph in ("orig", "bwd")
+    )
+    flags["handle_modes"] = rec_h["modes"] == ["capture", "replay"]
+    # the ring exchange (where the partition allows it): its recompute skips the hops as well
+    if W > 1 and int(ctx.n_d_max) - 1 <= kcp.RING_MAX_HOPS:
+        res_pr, rec_pr = handle_pass(False, exchange="ring")
+        res_hr, rec_hr = handle_pass(True, exchange="ring")
+        handle_info["ring"] = {"plain": rec_pr, "handle": rec_hr}
+        flags["handle_ring_eq_ckpt"] = _eq(res_pr, res_hr) and _eq(res_auto, res_hr)
+        flags["handle_ring_recompute_no_comm"] = (
+            rec_hr["calls"].get("recompute", 0) == 0
+            and rec_hr["waits"].get("recompute", 0) == 0
+            and rec_hr["modes"] == ["capture", "replay"]
+        )
+    res_h2, rec_h2 = handle_pass(True, twice=True)
+    handle_info["twice"] = rec_h2
+    flags["handle_twice_accumulates"] = (
+        all(torch.equal(res_h2[n], res_auto[n] + res_auto[n]) for n in GRADS)
+        and rec_h2["calls"].get("recompute", 0) == 0
+        and rec_h2["modes"] == ["capture", "replay", "replay"]
+    )
+    s_in_query = int(
+        kcp.gdn_kcp_saved_bytes(
+            ctx,
+            H_qk=H_qk,
+            HV=HV,
+            save_mode="light",
+            save_transfer=False,
+            with_conv=False,
+        )
+    )
+    handle_info["s_in_query_bytes"] = s_in_query
+    flags["handle_bytes_eq_query"] = rec_h["handle_bytes"] == s_in_query
+    # retained after the checkpointed forward (per-call workspace, after a warm-up of the same form): exactly the
+    # handle's S_in, where the plain checkpoint retains nothing (retained_zero below)
+    handle_pass(True, workspace=None)
+    torch.cuda.synchronize(device)
+    gc.collect()
+    leaves_h = [x.detach().clone().requires_grad_(True) for x in (q, k, v, g, beta)]
+    hd_r = kcp.KcpRecomputeHandle()
+
+    def fn_r(q_, k_, v_, g_, b_, h_):
+        return kcp.chunk_gdn_kcp(
+            q_, k_, v_, g_, b_, ctx, recompute_handle=h_, save_transfer=False, **base
+        )
+
+    from torch.utils.checkpoint import checkpoint as _checkpoint
+
+    before_h = _alloc_stats(device)
+    out_h = _checkpoint(fn_r, *leaves_h, hd_r, use_reentrant=False)
+    torch.cuda.synchronize(device)
+    after_h = _alloc_stats(device)
+    retained_h = int(
+        after_h["requested"]
+        - before_h["requested"]
+        - out_h.numel() * out_h.element_size()
+    )
+    handle_info["retained_bytes"] = retained_h
+    flags["handle_retained_eq_s_in"] = retained_h == hd_r.nbytes() == s_in_query
+    out_h.backward(dout)
+    del out_h, leaves_h, hd_r
+    # the reproduction of the issue: the plain checkpoint's recompute exchanges (W > 1 with a crossing fragment)
+    handle_info["plain_recompute_calls"] = rec_plain["calls"].get("recompute", 0)
+    handle_info["plain_recompute_waits"] = rec_plain["waits"].get("recompute", 0)
+    info["recompute_handle"] = handle_info
+
     def _ckpt_peak(**o) -> int:
         torch.cuda.synchronize(device)
         gc.collect()
@@ -958,6 +1128,22 @@ def _run_rank(
     flags["backward_twice_accumulates"] = all(
         torch.equal(res_twice[n], res_auto[n] + res_auto[n]) for n in GRADS
     )
+    # G10 (issue #7074): preparing a fresh context of this rank's layout -- the host plan, its table uploads and the
+    # per-key device tables -- makes no synchronizing CUDA call (pinned asynchronous copies), so a pipeline can prepare
+    # the next batch's metadata behind queued device work
+    torch.cuda.synchronize(device)
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        fresh_ctx = plan.build_kcp_context(part, group, rank, device)
+        fresh_ctx.prepare(H_qk, HV)
+        flags["prepare_no_sync"] = True
+    except RuntimeError as exc:  # "called a synchronizing CUDA operation"
+        info["prepare_no_sync_error"] = str(exc)[:200]
+        flags["prepare_no_sync"] = False
+    finally:
+        torch.cuda.set_sync_debug_mode("default")
+    del fresh_ctx
+    torch.cuda.synchronize(device)
     # #7039: retained bytes after a checkpointed forward (graph off), per-call and caller-held workspace forms.
     # the plan's per-key device tables are uploaded first (ctx.prepare + one warm-up call of the
     # same form) so they are not counted; graph="replay" keeps a static pool and is reported, not asserted.
@@ -1867,3 +2053,206 @@ def test_conv_halo_row(slurm) -> None:
     if not conv.is_cake_causal_conv1d_train_supported(slurm.device):
         pytest.skip("the conv package does not support this device")
     _slurm_row(C7_ROW, slurm, "conv", _run_rank_conv)
+
+
+# ----------------------------------------------------------------------------------------------------------------
+# Whole-layer checkpoint rows (issue #7818): KCP convolution -> packed q | k | v views -> caller L2 norm of q, k ->
+# chunk_gdn_kcp, one checkpointed region per layer with one KcpRecomputeHandle.  Gated: out / dx / dweight / dg /
+# dbeta bitwise across the direct pass, the plain checkpoint and the handle checkpoint; the GDN part of the
+# recompute exchanges nothing (with a convolution that takes the handle the whole recompute exchanges nothing;
+# before that, exactly the convolution's own forward collectives remain, the whole-layer zero is reported as
+# pending); the original forward and the backward exchange as in the plain checkpoint.  Runs under Slurm.
+
+LAYER_ROWS = [
+    Row("L4", (303, 200), (2, 6), 4, "explicit:c7", stage="layer"),
+    Row(
+        "L8",
+        (10240, 8192, 2085, 333),
+        (16, 48),
+        8,
+        "zigzag_per_document",
+        stage="layer",
+    ),
+    Row(
+        "L8r",
+        (10240, 8192, 2085, 333),
+        (16, 48),
+        8,
+        "ragged:5000,0,1,3000,2849,4000,3000,3000",
+        stage="layer",
+    ),
+]
+
+
+def _l2_normalize(x: torch.Tensor) -> torch.Tensor:
+    """The caller's per-head L2 norm of ``[T, H, 128]`` BF16 (FP32 math, one rounding): deterministic, so the
+    checkpoint recompute reproduces it bit for bit."""
+    xf = x.float()
+    return (xf / torch.sqrt((xf * xf).sum(-1, keepdim=True) + 1e-6)).to(torch.bfloat16)
+
+
+def _run_rank_layer(
+    rank: int,
+    W: int,
+    row: Row,
+    group,
+    device: torch.device,
+    result_dir: str | None,
+    backend: str,
+) -> dict:
+    import inspect
+
+    from flashinfer import cake_causal_conv1d_train as conv
+
+    H_qk, HV = row.heads
+    C = (2 * H_qk + HV) * 128
+    part, cu = _partition(row)
+    ctx = plan.build_kcp_context(part, group, rank, device)
+    total = cu[-1]
+    gen = torch.Generator(device="cpu").manual_seed(78180)
+    x_all = (torch.randn(total, C, generator=gen) * 0.5).to(torch.bfloat16)
+    w_all = (torch.randn(C, CONV_WIDTH, generator=gen) * 0.5).float()
+    pieces = [
+        torch.arange(cu[f.doc] + f.off, cu[f.doc] + f.off + f.length)
+        for f in part.fragments[rank]
+        if f.length
+    ]
+    l2g = torch.cat(pieces) if pieces else torch.zeros(0, dtype=torch.int64)
+    x_local = x_all[l2g].to(device)
+    ops = _local_inputs(row, part, cu, rank, device)
+    g, beta, dout = ops["g"], ops["beta"], ops["dout"]
+    conv_takes_handle = (
+        "recompute_handle" in inspect.signature(conv.cake_causal_conv1d_kcp).parameters
+    )
+
+    def layer(x, w, g_, b_, h):
+        ckw = {"recompute_handle": h} if (h is not None and conv_takes_handle) else {}
+        y = conv.cake_causal_conv1d_kcp(x, w, ctx, **ckw)
+        qkv = y.view(y.shape[0], 2 * H_qk + HV, 128)
+        q = _l2_normalize(qkv[:, :H_qk])
+        k = _l2_normalize(qkv[:, H_qk : 2 * H_qk])
+        v = qkv[:, 2 * H_qk :]
+        return kcp.chunk_gdn_kcp(
+            q,
+            k,
+            v,
+            g_,
+            b_,
+            ctx,
+            recompute_handle=h,
+            save_transfer=False,
+            backend=backend,
+        )
+
+    def run(mode: str):
+        leaves = [
+            x_local.detach().clone().requires_grad_(True),
+            w_all.to(device).requires_grad_(True),
+            g.detach().clone().requires_grad_(True),
+            beta.detach().clone().requires_grad_(True),
+        ]
+        hd = kcp.KcpRecomputeHandle() if mode == "handle" else None
+        from torch.utils.checkpoint import checkpoint
+
+        with CollectiveCounter() as cc:
+            if mode == "direct":
+                out = layer(*leaves, None)
+            else:
+                rphase = RecomputePhase(cc)
+                out = checkpoint(
+                    layer,
+                    *leaves,
+                    hd,
+                    use_reentrant=False,
+                    context_fn=lambda: (contextlib.nullcontext(), rphase),
+                )
+            cc.phase = "bwd"
+            out.backward(dout)
+        names = ("out", "dx", "dw", "dg", "dbeta")
+        tensors = [out.detach()] + [lf.grad for lf in leaves]
+        return dict(zip(names, tensors, strict=True)), {
+            **cc.record(),
+            "handle_bytes": hd.nbytes() if hd is not None else 0,
+            "handle_keys": sorted(hd.entries) if hd is not None else [],
+        }
+
+    # the convolution's own forward collectives (its halo exchange), for the pending whole-layer count
+    with CollectiveCounter() as cc_conv:
+        conv.cake_causal_conv1d_kcp(x_local, w_all.to(device), ctx)
+    conv_fwd = cc_conv.record()
+    t0 = time.time()
+    res_d, rec_d = run("direct")
+    res_p, rec_p = run("plain")
+    res_h, rec_h = run("handle")
+    eq = lambda a, b: all(torch.equal(a[n], b[n]) for n in a)  # noqa: E731
+    flags: dict[str, bool] = {
+        "layer_handle_eq_ckpt": eq(res_p, res_h),
+        "layer_handle_eq_direct": eq(res_d, res_h),
+        "layer_orig_bwd_comm_unchanged": all(
+            rec_h[t].get(ph, 0) == rec_p[t].get(ph, 0)
+            for t in ("calls", "waits")
+            for ph in ("orig", "bwd")
+        ),
+    }
+    rc_calls = rec_h["calls"].get("recompute", 0)
+    rc_waits = rec_h["waits"].get("recompute", 0)
+    if conv_takes_handle:
+        flags["layer_recompute_no_comm"] = rc_calls == 0 and rc_waits == 0
+    else:
+        # only the convolution's own halo exchange is left in the recompute: the GDN part exchanges nothing
+        flags["layer_gdn_recompute_no_comm"] = rc_calls == conv_fwd["calls"].get(
+            "orig", 0
+        ) and rc_waits == conv_fwd["waits"].get("orig", 0)
+    report = {
+        "row": dataclasses.asdict(row),
+        "rank": rank,
+        "world": W,
+        "backend": backend,
+        "mode": "layer",
+        "host": socket.gethostname(),
+        "device": str(device),
+        "device_name": torch.cuda.get_device_name(device),
+        "torch": torch.__version__,
+        "utc": _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "pass": all(flags.values()),
+        "flags": flags,
+        "gated": sorted(flags),
+        "reported": []
+        if conv_takes_handle
+        else ["layer_recompute_no_comm (pending: conv recompute_handle)"],
+        "info_by_rank": [
+            {
+                "rank": rank,
+                "T_r": int(x_local.shape[0]),
+                "conv_takes_handle": conv_takes_handle,
+                "conv_fwd_collectives": conv_fwd,
+                "direct": rec_d,
+                "plain": rec_p,
+                "handle": rec_h,
+                "plain_recompute_calls": rec_p["calls"].get("recompute", 0),
+                "handle_recompute_calls": rc_calls,
+                "handle_recompute_waits": rc_waits,
+            }
+        ],
+        "seconds": round(time.time() - t0, 2),
+        "C": C,
+    }
+    if result_dir:
+        os.makedirs(result_dir, exist_ok=True)
+        with open(
+            os.path.join(result_dir, f"{row.name}-layer-rank{rank}.json"), "w"
+        ) as fh:
+            json.dump(report, fh, indent=1, default=str)
+    return report
+
+
+@pytest.mark.parametrize("row", LAYER_ROWS, ids=_row_id)
+def test_layer_checkpoint_rows(row: Row, slurm) -> None:
+    """#7818 whole-layer rows: KCP convolution + L2 norm + chunk_gdn_kcp in one checkpointed region with one
+    recompute handle (see the block comment above).  Runs under Slurm with >= the row's ranks."""
+    if slurm is None:
+        pytest.skip("the layer rows run under Slurm")
+    conv = pytest.importorskip("flashinfer.cake_causal_conv1d_train")
+    if not conv.is_cake_causal_conv1d_train_supported(slurm.device):
+        pytest.skip("the conv package does not support this device")
+    _slurm_row(row, slurm, _backend_name(), _run_rank_layer)

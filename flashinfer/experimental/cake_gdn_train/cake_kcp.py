@@ -54,7 +54,10 @@ runs from it; ``bwd_dqkg`` (#8, the FP32 group reduction of the ``r`` value
 heads' ``dq`` / ``dk`` fused) and ``gate_epilogue`` (#9) finish the gradients.
 One compute stream; the collectives are asynchronous on the caller's process
 group and waited at their first consumer; the issue order is the same on
-every rank, so a checkpoint replay re-runs the same program order.
+every rank, so a checkpoint replay re-runs the same program order.  With a recompute handle
+(``recompute_handle``, :class:`KcpRecomputeHandle`) the original forward stores its ``S_in`` in the handle and torch's
+recompute of the forward reads it back: no collective, no summary walk over the crossing-out fragments, no owner
+merge -- the light replay's launches (at ``P > 1`` its local segment walks and carry merges).
 
 Saved set (``boundary_mode="saved"``): ``S_in`` (fresh), the owner's c1
 receive tensor (``save_transfer=True``), ``M_seg`` (``P > 1``) and, with
@@ -510,7 +513,8 @@ FWD_TAPES_ARENA_AFTER_FWD: tuple[str, ...] = tuple(
 
 
 # ----------------------------------------------------------------------------------------------------------------
-# Checkpoint-aware light backward (keyword ``reuse_recompute_tapes``; shipped default ``True``, ``False`` under graph="replay")
+# Checkpoint-aware light backward (keyword ``reuse_recompute_tapes``: ``True`` = the shipped default, ``False`` under
+# graph="replay"; ``"auto"`` = kept tapes only when the node closes the checkpointed region, see _fwd_body)
 #
 # ``torch.utils.checkpoint(use_reentrant=False)`` re-runs the checkpointed forward inside ``.backward()``: in the
 # unpack hook of the first saved tensor a backward node reads, synchronously, under the autograd engine's graph task
@@ -559,6 +563,119 @@ def _graph_task_id() -> int:
     return int(gid)
 
 
+def _kcp_in_backward() -> bool:
+    """Whether this thread runs inside the autograd engine's backward pass.  Torch's checkpoint recompute runs there
+    (``use_reentrant=True`` and ``False`` alike), an original forward does not.  The one place the recompute handle
+    reads the phase, so the detection can follow torch."""
+    return _graph_task_id() != -1
+
+
+class KcpRecomputeHandle:
+    """The boundary states of one checkpointed layer, carried from its original forward to torch's recompute of that
+    forward (``chunk_gdn_kcp(..., recompute_handle=handle)``), so the recompute runs without cross-rank
+    communication.
+
+    Create one handle per layer per micro-step (gradient accumulation: a new handle for every micro-step) and pass
+    it as an argument of the checkpointed function, so the recompute sees the same object::
+
+        def layer(x, handle):
+            ...  # conv, split, gates
+            return chunk_gdn_kcp(q, k, v, g, beta, ctx, recompute_handle=handle)
+
+        y = torch.utils.checkpoint.checkpoint(layer, x, KcpRecomputeHandle(), use_reentrant=False)
+
+    ``entries`` maps an operation key to that operation's boundary entry: ``"gdn"`` is this package's (the forward's
+    incoming states ``S_in``, the very tensor the saved set holds, no copy); other packages that accept a handle
+    with an ``entries`` dict (the causal convolution's halo rows, key ``"conv"``) use their own keys.  A handle
+    holds one entry per key: it serves one GDN call and at most one convolution call; a layer with several
+    convolution calls (separate Q / K / V convolutions) uses one handle per convolution call, and the GDN call
+    shares one of them.  A forward that finds no entry is an original forward: it exchanges as always and stores
+    its entry.  The recompute (inside the backward) finds the entry, checks it against the call and exchanges
+    nothing; the entry stays for a second backward (``retain_graph``).  A forward outside the backward that finds an
+    entry raises (a handle reused across micro-steps).  With nested checkpoint regions create the handles outside
+    the outermost region: a handle created inside a region is a new, empty one in that region's recompute, whose
+    forwards then exchange again (correct, but not communication-free).  The entries live as long as the handle --
+    with the checkpoint frame that holds it as an argument, until the graph is freed; :meth:`nbytes` is the retained
+    size (for GDN, ``gdn_kcp_saved_bytes(ctx, ..., save_mode="light", save_transfer=False, with_conv=False)``)."""
+
+    __slots__ = ("entries",)
+
+    def __init__(self) -> None:
+        self.entries: dict[str, dict[str, Any]] = {}
+
+    def clear(self) -> None:
+        """Drop every entry (the retained states go with the last reference)."""
+        self.entries.clear()
+
+    def nbytes(self) -> int:
+        """Bytes of the distinct tensors the entries hold."""
+        seen: dict[int, int] = {}
+        for entry in self.entries.values():
+            for t in entry.values():
+                for x in t if isinstance(t, (tuple, list)) else (t,):
+                    if isinstance(x, torch.Tensor):
+                        seen[id(x)] = x.numel() * x.element_size()
+        return sum(seen.values())
+
+
+HANDLE_KEY = "gdn"  # this package's entry in a recompute handle
+
+
+def _handle_key(
+    T_r,
+    H_qk,
+    HV,
+    n_frag,
+    P,
+    scale,
+    exchange,
+    precision_mode,
+    offset_class,
+    transfer_walk,
+) -> tuple:
+    """What a handle entry must match to stand in for the recompute's exchange: the problem and the programs."""
+    return (
+        T_r,
+        H_qk,
+        HV,
+        n_frag,
+        P,
+        scale,
+        exchange,
+        precision_mode,
+        offset_class,
+        transfer_walk,
+    )
+
+
+def _handle_lookup(handle: Any) -> dict[str, Any] | None:
+    """The handle's GDN entry when this forward is the recompute of the forward that stored it, ``None`` for an
+    original forward (no entry yet: it exchanges and stores one).  An entry found outside the backward is a handle
+    reused across micro-steps and raises; so does a torch without the phase binding.  A forward inside the backward
+    that finds no entry is an original forward too -- one that runs inside an outer checkpoint's recompute (nested
+    regions) -- and stores its entry as usual."""
+    entries = getattr(handle, "entries", None)
+    if not isinstance(entries, dict):
+        raise TypeError(
+            f"recompute_handle must carry an 'entries' dict (KcpRecomputeHandle), got {type(handle).__name__}"
+        )
+    in_backward = _kcp_in_backward()
+    if _GRAPH_TASK_ID_BINDING is None or _GRAPH_TASK_ID_USABLE is False:
+        raise RuntimeError(
+            "recompute_handle needs torch._C._current_graph_task_id to tell the recompute from the original forward; "
+            "this torch does not provide it"
+        )
+    entry = entries.get(HANDLE_KEY)
+    if entry is None:
+        return None
+    if not in_backward:
+        raise RuntimeError(
+            "recompute_handle: the handle already holds a 'gdn' entry outside the backward -- a handle serves one "
+            "layer of one micro-step; create a new KcpRecomputeHandle per micro-step"
+        )
+    return entry
+
+
 # ----------------------------------------------------------------------------------------------------------------
 # The recompute's dead output (keyword ``recompute_output``; shipped default ``"auto"``)
 #
@@ -576,8 +693,10 @@ def _graph_task_id() -> int:
 #      :func:`chunk_gdn_kcp` right before ``apply``: inside ``forward`` grad mode is always off).  Only then does
 #      autograd create the node and pack its saved tensors; a non-executable ``apply`` packs nothing, so the holders
 #      still waiting would be a later op's and the count below could match by coincidence;
-#   1. ``torch.__version__`` is one of :data:`RECOMPUTE_OUTPUT_TORCH_VERSIONS` (the frame read below is the verified
-#      torch's; one constant, no environment variable);
+#   1. the torch release (:func:`torch_release`: ``torch.__version__`` without its local ``+<build>`` tag, so
+#      ``2.14.1+cu130`` and ``2.14.1+cu132`` are one release) is one of :data:`RECOMPUTE_OUTPUT_TORCH_VERSIONS`
+#      (the frame read below is that release's ``torch/utils/checkpoint.py``, the same file in every CUDA build of
+#      the release; one constant, no environment variable);
 #   2. the top saved-tensors hook pair is a checkpoint-internal one (``_checkpoint_internal``) and its pack hook,
 #      unwrapped from ``torch._dynamo.disable``, is the recomputation hook: closure ``target_frame_ref`` (a weakref to
 #      the ``_CheckpointFrame``) and ``gid`` (the graph task id or ``GraphExecGroup`` torch keys the recompute on);
@@ -593,7 +712,23 @@ def _graph_task_id() -> int:
 # forward (:class:`ChunkGDNKcpFunction`, the one that saves exactly those tensors right after) may skip;
 # :func:`chunk_gdn_kcp_fwd` and a captured graph (``graph="replay"``) never do.  No tensor content is read.
 
-RECOMPUTE_OUTPUT_TORCH_VERSIONS: tuple[str, ...] = ("2.14.1+cu130",)
+# torch RELEASES the frame proof was verified on, compared through torch_release(): the local build tag is not part
+# of the identity (the proof reads torch/utils/checkpoint.py, the same file in every CUDA build of a release)
+RECOMPUTE_OUTPUT_TORCH_VERSIONS: tuple[str, ...] = ("2.14.1",)
+
+
+def torch_release(version: str | None = None) -> str:
+    """The release of a torch version string (default: the running torch): ``"2.14.1+cu132"`` -> ``"2.14.1"``.
+    The local ``+<build>`` tag is dropped; a pre-release tag (``2.15.0.dev20260901``) is kept -- that source is not
+    a release's."""
+    return str(torch.__version__ if version is None else version).split("+", 1)[0]
+
+
+def torch_release_verified(version: str | None = None) -> bool:
+    """Whether ``version`` (default: the running torch) is a release of :data:`RECOMPUTE_OUTPUT_TORCH_VERSIONS`."""
+    return torch_release(version) in RECOMPUTE_OUTPUT_TORCH_VERSIONS
+
+
 # q, k, v, g, beta: what ChunkGDNKcpFunction.forward saves besides the saved set
 _SAVED_OPERANDS = 5
 RECOMPUTE_OUTPUT_STATS: dict[str, int] = {
@@ -607,7 +742,7 @@ def _recompute_output_dead(n_saved: int) -> tuple[bool, str]:
     """Whether the forward running now is torch's non-reentrant checkpoint recompute of a region this node closes
     (its ``n_saved`` tensors fill the frame's remaining holders) -- then nothing reads the recompute's output.
     ``(dead, reason)``; every unreadable or unexpected state is ``(False, reason)``."""
-    if torch.__version__ not in RECOMPUTE_OUTPUT_TORCH_VERSIONS:
+    if not torch_release_verified():
         return False, "torch_version"
     try:
         top = torch._C._autograd._top_saved_tensors_default_hooks(False)
@@ -1923,7 +2058,8 @@ class _Tables:
         k = ("kcp", key, str(device), dtype, content)
         t = cache.get(k)
         if t is None:
-            t = torch.tensor(list(k[4]), dtype=dtype, device=device)
+            # one asynchronous pinned copy (no synchronizing call; cake_kcp_plan.upload_tables)
+            t = cake_kcp_plan.upload_tables({"t": (k[4], dtype, None)}, device)["t"]
             cache[k] = t
         return t
 
@@ -3006,6 +3142,12 @@ def _record(kind: str, call: KcpCall) -> None:
         "fwd_o_reason": call.scratch.get(
             "fwd_o_reason"
         ),  # forward: "always" | "dead" | "not_executable" | why the frame proof did not hold (the decision, recorded on every rank)
+        "hand_off_reason": call.scratch.get(
+            "hand_off_reason"
+        ),  # forward: "always" (True) | "off" | "not_executable" | the frame reason under "auto" ("dead" = kept)
+        "recompute_handle": call.scratch.get(
+            "recompute_handle"
+        ),  # forward: None | "capture" (stored S_in in the handle) | "replay" (S_in from the handle, no exchange)
     }
 
 
@@ -3415,13 +3557,21 @@ def _adj_tapes(call: KcpCall, *, dcarry: Indexed | None, wait_first: bool) -> No
 
 
 def _forward(
-    call: KcpCall, *, save: bool, replay: bool, hand_off: bool = False
+    call: KcpCall,
+    *,
+    save: bool,
+    replay: bool,
+    hand_off: bool = False,
+    s_in: torch.Tensor | None = None,
 ) -> None:
     """The forward sequence.  ``save``: the saved set is kept (fresh ``S_in``; with ``save_transfer`` also the c1
     receive tensor and ``M_seg``; with ``save_mode="full"`` fresh forward tapes); ``replay``: the forward of a
     replay-mode backward (no ``fwd_o``, nothing kept); ``hand_off``: the forward tapes go to the backward of this
     graph task (``reuse_recompute_tapes``): no tape is dropped and the tape walk takes the light replay's form
-    (:func:`_replay_tape_walk`).  ``schedule="wait_first"``: ``c1 -> wait -> fwd merge -> c2 ->
+    (:func:`_replay_tape_walk`).  ``s_in``: the recompute of a forward that stored its incoming states in a recompute
+    handle -- no collective, no summary walk over the crossing-out fragments, no merge of the owners: #1, at
+    ``P > 1`` the local segment walks and carry merges from ``S_in``, and the light replay's tape walk
+    (:func:`_replay_from_states`), the very launches of the light backward's replay.  ``schedule="wait_first"``: ``c1 -> wait -> fwd merge -> c2 ->
     wait -> carry merges -> tape walk(s)`` -- no merge or walk is issued while a collective is in flight; the merges
     read only ``c1_recv`` / the staging planes and the tapes read no collective buffer, so every published bit is the
     same under either schedule."""
@@ -3450,6 +3600,12 @@ def _forward(
         call.release_tapes(
             FWD_DEAD_AFTER_PREP, keep=saved_tapes(opts.save_mode) if keep else ()
         )
+    if s_in is not None:
+        call.bufs["S_in"] = s_in
+        _replay_from_states(call, have_m=False)
+        if call.opts.knob("record_states"):
+            call.scratch["states"] = {"S_in": gather_states(s_in, tb.s_in_tiles)}
+        return
     _summaries(call)
     # the c1 receive tensor and S_in (the c2 receive buffer) are first written by their collectives: allocated after
     # the summaries' walks (the forward's peak moment), not at the top of the sequence where they would sit unwritten
@@ -3531,15 +3687,22 @@ def _replay_tapes(call: KcpCall, saved: KcpSaved) -> None:
     """``save_mode="light"`` backward: #1 again and the #2 tape walk from the saved ``S_in`` (segment-start states
     from ``M_seg`` / the recomputed offsets with ``(P - 1)`` state-mode steps); no exchange, no transfer walk over the
     crossing-out fragments, no merge of the owners, no #5."""
-    tb = call.tb
     call.local("fwd_prep")
+    _replay_from_states(call, have_m=saved.M_seg is not None)
+
+
+def _replay_from_states(call: KcpCall, *, have_m: bool) -> None:
+    """The light replay after #1, once ``S_in`` is bound: at ``P > 1`` the carries again (``b_seg``, and ``M_seg^T``
+    unless ``have_m``, from zero; the carry merges from ``S_in``), then the tape walk(s).  Shared by the light
+    backward and the recompute of a forward whose states a recompute handle carries (no collective either way)."""
+    tb = call.tb
     if (
         tb.P > 1
     ):  # the forward carries again: b_seg (and M_seg^T unless saved) -> carries from 0 / S_in
         _offset_walk(
             call, tb.walk_all, call.indexed("stage_b", tb.seg_index, tb.stage_tiles)
         )
-        if saved.M_seg is None:
+        if not have_m:
             call.walk(
                 "kcp_transfer_walk",
                 tb.walk_all,
@@ -4069,8 +4232,11 @@ def _fwd_entry(
     hand_off: bool,
     autograd_node: bool = False,
     executable: bool = True,
+    boundary: dict[str, Any] | None = None,
+    handle_mode: str | None = None,
 ) -> tuple[torch.Tensor, KcpSaved | None]:
-    """:func:`chunk_gdn_kcp_fwd` with validated options.  ``hand_off``: the autograd Function's forward runs inside
+    """:func:`chunk_gdn_kcp_fwd` with validated options.  ``boundary``: the recompute handle's entry of this
+    layer (the recompute of a forward that stored it): ``S_in`` comes from it and nothing is exchanged.  ``hand_off``: the autograd Function's forward runs inside
     a graph task with ``reuse_recompute_tapes`` -- the light saved set then carries the forward tapes (``saved.kept``)
     for the backward of that task (never with a captured graph, a replay boundary, ``save_mode="full"`` or
     ``T_r = 0``).  ``autograd_node``: the caller is :class:`ChunkGDNKcpFunction` (the one forward whose recompute may
@@ -4136,18 +4302,68 @@ def _fwd_entry(
             if (save and opts.save_transfer)
             else (),
         )
+    s_in = None
+    if boundary is not None:
+        tb = call.tb
+        if boundary.get("ctx") is not call.ctx:
+            raise ValueError(
+                "recompute_handle: the 'gdn' entry belongs to another KcpContext"
+            )
+        if boundary.get("key") != _handle_key(
+            call.T_r,
+            call.H_qk,
+            call.HV,
+            tb.n_frag,
+            tb.P,
+            call.scale,
+            call.exchange,
+            call.precision_mode,
+            opts.offset_class,
+            opts.transfer_walk,
+        ):
+            raise ValueError(
+                "recompute_handle: the 'gdn' entry describes another problem or programs than this recompute"
+            )
+        s_in = boundary["S_in"]
+        _check(
+            s_in,
+            "recompute_handle S_in",
+            (tb.sizes["S_in"],),
+            call.state_dtype,
+            call.device,
+        )
+    call.scratch["recompute_handle"] = handle_mode
     out, saved = _fwd_body(
         call,
         save=save,
         hand_off=hand_off and call.T_r > 0,
         autograd_node=autograd_node,
         executable=executable,
+        s_in=s_in,
     )
     _record("fwd", call)
     if opts.graph != "off":
         _graph_eager("fwd", entry)
     call.backend.end_call(call)
     return _ranked(out, batched), saved
+
+
+def _saved_count(call: KcpCall, save: bool) -> int:
+    """What :class:`ChunkGDNKcpFunction` saves for this forward: the five operands and the saved set's tensors
+    (:meth:`KcpSaved.tensors`: ``S_in``; the c1 receive tensor under ``save_transfer``; ``M_seg`` under
+    ``save_transfer`` at ``P > 1``; the saved tapes of the ``save_mode`` when the rank holds tokens) -- known before
+    the forward runs, so the frame proof can decide a hand-off (``reuse_recompute_tapes="auto"``)."""
+    if not save:
+        return _SAVED_OPERANDS
+    opts, tb = call.opts, call.tb
+    n = (
+        1
+        + (1 if opts.save_transfer else 0)
+        + (1 if (opts.save_transfer and tb.P > 1) else 0)
+    )
+    if call.T_r > 0:
+        n += len(saved_tapes(opts.save_mode))
+    return _SAVED_OPERANDS + n
 
 
 def _fwd_body(
@@ -4157,6 +4373,7 @@ def _fwd_body(
     hand_off: bool = False,
     autograd_node: bool = False,
     executable: bool = True,
+    s_in: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, KcpSaved | None]:
     """The forward's allocations and launches (eagerly or inside a capture): the sequence, ``out`` and #5, the saved
     set.  ``hand_off``: the ten forward tapes (and the ``stage_m`` plane when the saved set carries no ``M_seg``)
@@ -4165,9 +4382,31 @@ def _fwd_body(
     checkpoint recompute whose output nothing reads (:func:`_recompute_output_dead`; ``out`` is allocated as ever,
     never written) -- only for an ``executable`` node (the one that packs the saved tensors the proof counts); a
     non-executable one launches with the static reason ``not_executable``."""
+    proof: dict[
+        int, tuple[bool, str]
+    ] = {}  # the checkpoint-frame proof, read once per saved count
+
+    def frame_proof(n_saved: int) -> tuple[bool, str]:
+        if n_saved not in proof:
+            proof[n_saved] = _recompute_output_dead(n_saved)
+        return proof[n_saved]
+
+    hand_off_reason = "always" if hand_off else "off"
+    if hand_off and call.opts.reuse_recompute_tapes == "auto":
+        # keep the tapes only when this node closes the checkpointed region (the frame proof of
+        # recompute_output="auto"): then its backward is the region's first and the kept tapes die before any other
+        # backward runs.  With a later saver in the region (an output projection, an MLP) the kept set would live
+        # through those operations' backward and raise the region's backward peak by the full tape set, so the
+        # replay form is taken there; every unreadable state (another torch release, early stop off, user hooks, a
+        # non-executable node) is the replay form as well.
+        if not (autograd_node and executable and call.opts.graph == "off"):
+            hand_off, hand_off_reason = False, "not_executable"
+        else:
+            hand_off, hand_off_reason = frame_proof(_saved_count(call, save))
+    call.scratch["hand_off_reason"] = hand_off_reason
     if hand_off:
         _kept_evict_all()  # one live entry: the previous set is freed before this forward materialises its own
-    _forward(call, save=save, replay=False, hand_off=hand_off)
+    _forward(call, save=save, replay=False, hand_off=hand_off, s_in=s_in)
     stage_m = None
     if hand_off and call.tb.P > 1 and not call.opts.save_transfer:
         # the transfer walk's M_seg^T plane: the backward's merges read it and no saved M_seg replaces it; the view
@@ -4195,7 +4434,7 @@ def _fwd_body(
             reason = "not_executable"
         else:
             # the Function saves the five operands and saved.tensors() right after this forward returns
-            dead, reason = _recompute_output_dead(
+            dead, reason = frame_proof(
                 _SAVED_OPERANDS + (len(saved.tensors()) if saved is not None else 0)
             )
             launch = not dead
@@ -4484,7 +4723,10 @@ class ChunkGDNKcpFunction(torch.autograd.Function):
     this node and pack its saved tensors at all; a non-executable node never skips."""
 
     @staticmethod
-    def forward(fctx, q, k, v, g, beta, ctx, scale, workspace, opts, executable):
+    def forward(
+        fctx, q, k, v, g, beta, ctx, scale, workspace, opts, executable, handle
+    ):
+        boundary = None if handle is None else _handle_lookup(handle)
         gid = _graph_task_id() if opts.reuse_recompute_tapes else -1
         out, saved = _fwd_entry(
             q,
@@ -4500,7 +4742,29 @@ class ChunkGDNKcpFunction(torch.autograd.Function):
             hand_off=gid != -1,
             autograd_node=True,
             executable=bool(executable),
+            boundary=boundary,
+            handle_mode=None
+            if handle is None
+            else ("capture" if boundary is None else "replay"),
         )
+        if handle is not None and boundary is None:
+            # the original forward: its incoming states (the saved set's own tensor) for the recompute
+            handle.entries[HANDLE_KEY] = {
+                "S_in": saved.S_in,
+                "ctx": ctx,
+                "key": _handle_key(
+                    saved.T_r,
+                    saved.H_qk,
+                    saved.HV,
+                    saved.n_frag,
+                    saved.P,
+                    saved.scale,
+                    saved.exchange,
+                    saved.precision_mode,
+                    saved.offset_class,
+                    saved.transfer_walk,
+                ),
+            }
         if saved is not None and saved.kept is not None:
             key = _kept_key(
                 gid, q, k, v, g, beta, saved.S_in, saved.T_r, saved.H_qk, saved.HV
@@ -4545,7 +4809,12 @@ class ChunkGDNKcpFunction(torch.autograd.Function):
                 key = _kept_key(
                     gid, q, k, v, g, beta, saved.S_in, saved.T_r, saved.H_qk, saved.HV
                 )
-                kept = _kept_take(key)
+                # under "auto" a forward that did not hand off leaves no entry by design: no miss is counted
+                kept = (
+                    _kept_take(key)
+                    if (opts.reuse_recompute_tapes is True or key in _KEPT)
+                    else None
+                )
             if kept is not None:
                 saved = dataclasses.replace(saved, kept=kept)
         if not dout.is_contiguous():
@@ -4563,7 +4832,7 @@ class ChunkGDNKcpFunction(torch.autograd.Function):
             workspace=workspace,
             options=opts,
         )
-        return dq, dk, dv, dg, dbeta, None, None, None, None, None
+        return dq, dk, dv, dg, dbeta, None, None, None, None, None, None
 
 
 def chunk_gdn_kcp(
@@ -4580,11 +4849,16 @@ def chunk_gdn_kcp(
     workspace: KcpWorkspace | None = None,
     graph: str = _opt.GRAPH_DEFAULT,
     options: KcpOptions | dict[str, Any] | None = None,
+    recompute_handle: Any = None,
     **knobs: Any,
 ) -> torch.Tensor:
     """The differentiable KCP forward: ``out`` like ``v``; gradients for ``q, k, v, g, beta``
     in the backward's order ``(dq, dk, dv, dbeta, dg)``.  With an ``options`` instance, the three literal keywords
-    override it only when they differ from their documented defaults."""
+    override it only when they differ from their documented defaults.  ``recompute_handle``
+    (:class:`KcpRecomputeHandle`): the checkpoint recompute of this forward exchanges nothing -- it reads the
+    incoming states the original forward stored in the handle; needs ``boundary_mode="saved"`` and ``graph="off"``,
+    implies ``save_transfer=False`` (a ``save_transfer=True`` keyword or ``options`` dict entry is refused; a
+    :class:`KcpOptions` instance's value is replaced by ``False``) and refuses ``debug_sequence``."""
     over: dict[str, Any] = {}
     for name, value, default in (
         ("save_mode", save_mode, _opt.SAVE_MODE_DEFAULT),
@@ -4593,14 +4867,33 @@ def chunk_gdn_kcp(
     ):
         if options is None or value != default:
             over[name] = value
+    if recompute_handle is not None and (
+        knobs.get("save_transfer") is True
+        or (isinstance(options, dict) and options.get("save_transfer") is True)
+    ):
+        raise ValueError(
+            "recompute_handle keeps the incoming states only: it needs save_transfer=False"
+        )
     opts = make_options(options, **over, **knobs)
+    if recompute_handle is not None:
+        if opts.boundary_mode != "saved" or opts.graph != "off":
+            raise ValueError(
+                "recompute_handle needs boundary_mode='saved' and graph='off', got "
+                f"boundary_mode={opts.boundary_mode!r}, graph={opts.graph!r}"
+            )
+        if opts.knob("debug_sequence"):
+            raise ValueError(
+                "recompute_handle refuses debug_sequence (it gathers the issue order across ranks)"
+            )
+        if opts.save_transfer:
+            opts = dataclasses.replace(opts, save_transfer=False)
     # autograd's own executability test for the node (grad mode and an operand requiring grad, flags only): read
     # here because inside Function.forward grad mode is always off
     executable = torch.is_grad_enabled() and any(
         t.requires_grad for t in (q, k, v, g, beta)
     )
     return ChunkGDNKcpFunction.apply(
-        q, k, v, g, beta, ctx, scale, workspace, opts, executable
+        q, k, v, g, beta, ctx, scale, workspace, opts, executable, recompute_handle
     )
 
 
@@ -4657,6 +4950,7 @@ __all__ = [
     "FWD_TAPES_ARENA_AFTER_FWD",
     "KEPT_STATS",
     "LIGHT_TAPES",
+    "HANDLE_KEY",
     "TAPE_ALIASES",
     "LOCAL_PROGRAMS",
     "OFFSET_CLASSES",
@@ -4685,6 +4979,7 @@ __all__ = [
     "Indexed",
     "KcpCall",
     "KcpOptions",
+    "KcpRecomputeHandle",
     "KcpSaved",
     "KcpWorkspace",
     "KernelBackend",
@@ -4709,4 +5004,6 @@ __all__ = [
     "tape_spec",
     "test_record",
     "tile_index",
+    "torch_release",
+    "torch_release_verified",
 ]

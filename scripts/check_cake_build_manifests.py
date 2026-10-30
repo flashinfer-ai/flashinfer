@@ -347,6 +347,12 @@ PACKAGES: tuple[Package, ...] = (
         refs_generic,
     ),
     Package(
+        "flashinfer.cake_rmsnorm_silu_gate_train_backend",
+        "flashinfer/cake_rmsnorm_silu_gate_train_backend",
+        "cake_jit.py",
+        refs_generic,
+    ),
+    Package(
         "flashinfer.cake_ulysses_backend",
         "flashinfer/cake_ulysses_backend",
         "cake_jit.py",
@@ -373,6 +379,12 @@ PACKAGES: tuple[Package, ...] = (
     Package(
         "flashinfer.cake_mhc_train_backend",
         "flashinfer/cake_mhc_train_backend",
+        "cake_jit.py",
+        refs_generic,
+    ),
+    Package(
+        "flashinfer.cake_mhc_train_head_backend",
+        "flashinfer/cake_mhc_train_head_backend",
         "cake_jit.py",
         refs_generic,
     ),
@@ -469,6 +481,18 @@ PACKAGES: tuple[Package, ...] = (
     Package(
         "flashinfer.experimental.sm110_xqa",
         "flashinfer/experimental/sm110_xqa",
+        "cake_jit.py",
+        refs_generic,
+    ),
+    Package(
+        "flashinfer.experimental.cake_gdn_det_train",
+        "flashinfer/experimental/cake_gdn_det_train",
+        "cake_jit.py",
+        refs_generic,
+    ),
+    Package(
+        "flashinfer.experimental.cake_gqa_train",
+        "flashinfer/experimental/cake_gqa_train",
         "cake_jit.py",
         refs_generic,
     ),

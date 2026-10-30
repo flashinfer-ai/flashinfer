@@ -96,6 +96,7 @@ _COMMON = dict(
     candidate_slack=128,
     cand_mult_rule=[384.0, 8],
     cand_cap_floor=8192,
+    cand_cap_floor_rule=None,
     candidate_multiplier_unsampled=4,
     cand_mult_rule_unsampled=[384.0, 8],
     cand_cap_floor_unsampled=8192,
@@ -116,6 +117,8 @@ _COMMON = dict(
     sample_dispatch_tiny_tiles_max=128,
     sample_shift_permille=250,
     sample_shift_rule=None,
+    sample_class_rule=None,
+    lsf_programs=False,
     far_sample=0,
     check_period_max=32,
     check_period_knob_max=64,
@@ -689,9 +692,30 @@ def test_policy_record_round_trip_and_validation():
         dict(sample_shift_rule=[4096.0, 500]),
         dict(sample_shift_rule=[4096, 500.0]),
         dict(sample_shift_rule=[True, 500]),
+        # the top_k-keyed capacity floor: [min top_k >= 1, floor slots >= 1] or None, the floor within the ceiling
+        dict(cand_cap_floor_rule=16384),
+        dict(cand_cap_floor_rule=[]),
+        dict(cand_cap_floor_rule=[1024]),
+        dict(cand_cap_floor_rule=[1024, 16384, 1]),
+        dict(cand_cap_floor_rule=[0, 16384]),
+        dict(cand_cap_floor_rule=[1024, 0]),
+        dict(cand_cap_floor_rule=[1024.0, 16384]),
+        dict(cand_cap_floor_rule=[1024, 16384.0]),
+        dict(cand_cap_floor_rule=[True, 16384]),
+        dict(cand_cap_floor_rule=[1024, 16384], cand_cap_ceiling=8192),
     ):
         with pytest.raises(ValueError):
             DispatchPolicy.from_record(dict(record, **bad))
+    ruled = DispatchPolicy.from_record(dict(record, cand_cap_floor_rule=[1024, 16384]))
+    assert ruled.cand_cap_floor_rule == [1024, 16384]
+    assert ruled.record()["cand_cap_floor_rule"] == [1024, 16384]
+    assert DispatchPolicy.from_record(ruled.record()) == ruled
+    assert (
+        DispatchPolicy.from_record(
+            dict(record, cand_cap_floor_rule=[1024, 16384], cand_cap_ceiling=16384)
+        ).cand_cap_ceiling
+        == 16384
+    )  # a ceiling at the rule's floor is well-formed
     first = DispatchPolicy.from_record(dict(record, wide_first_rule=[192.0]))
     assert first.wide_first_rule == [192.0]
     assert first.record()["wide_first_rule"] == [192.0]
@@ -740,6 +764,28 @@ def test_policy_capacity_period_and_finalize():
     assert raised.cand_cap_multiplier_for(65536, 65536, 1, 1, 2048) == 16
     assert raised.cand_cap_multiplier_for(65536, 65536, 1, 1, 2048, sampled=False) == 4
     assert raised.cand_cap_multiplier_for(65536, 65536, 1, 1, 256, sampled=False) == 32
+    # the top_k-keyed floor: 8192 slots below the rule's top_k, 16384 from it on; the unsampled floor and the long-unit
+    # multiplier untouched
+    ruled = DispatchPolicy.from_record(
+        dict(p.record(), cand_cap_floor_rule=[1024, 16384])
+    )
+    assert [ruled.cand_cap_floor_for(k) for k in (256, 512, 1023, 1024, 2048)] == [
+        8192, 8192, 8192, 16384, 16384,
+    ]  # fmt: skip
+    assert [
+        ruled.candidate_capacity(
+            k, ruled.cand_cap_multiplier_for(65536, 65536, 1, 1, k)
+        )
+        for k in (256, 512, 1024, 2048, 4096)
+    ] == [8192, 8192, 16384, 16384, 16384]
+    assert [
+        ruled.candidate_capacity(
+            k, ruled.cand_cap_multiplier_for(8192, 1048576, 1, 1, k)
+        )
+        for k in (256, 512, 2048, 4096)
+    ] == [8192, 8192, 16384, 32768]
+    assert ruled.cand_cap_multiplier_for(65536, 65536, 1, 1, 512, sampled=False) == 16
+    assert p.cand_cap_floor_for(2048) == 8192  # no rule: the plain floor on every top_k
     geometry = dict(
         num_queries=65536, num_keys=65536, num_segments=1, ratio=1, top_k=2048, grid=148
     )
@@ -1111,7 +1157,7 @@ def test_select_program_narrow_pair_policy():
         and c.sample_tiles_max == 8
         and c.key_bits == 13
     )
-    assert c.workspace_bytes == 148 * 6 * 8192 * 8
+    assert c.workspace_bytes == 148 * 6 * 8192 * 8 + cake_policy.TICKET_TAIL_BYTES
     # one causal 64k document: the CTA-pair three-warpgroup program
     c = _select(p, 65536, 65536)
     assert c.scan_key == "scan:pair_l6:u1:s0:f1" and c.pair and c.grid_ctas == 148
@@ -1128,7 +1174,10 @@ def test_select_program_narrow_pair_policy():
     )
     assert c.scan_key == "scan:split_narrow:u1:s0:f0" and c.merge_key == MERGE_KEY
     assert c.cand_cap_multiplier == 8 and c.cand_cap == 16384 and c.check_period == 32
-    assert c.workspace_bytes == (148 * 4 * 16384 + 64 * 9 * 2048) * 8
+    assert (
+        c.workspace_bytes
+        == (148 * 4 * 16384 + 64 * 9 * 2048) * 8 + cake_policy.TICKET_TAIL_BYTES
+    )
     assert (
         c.keys == ("scan:split_narrow:u1:s0:f0", "merge", "finalize:t256")
         and c.rank_window is None
@@ -1276,7 +1325,7 @@ def test_wide_first_precedence_and_pair_units_guard():
     c = _select(first, 131072, 131072)
     assert c.scan_key == "scan:wide:u1:s0:f1" and c.block_q == 8 and not c.pair
     assert c.grid_ctas == 148 and c.cand_cap == 16384
-    assert c.workspace_bytes == 148 * 8 * 16384 * 8
+    assert c.workspace_bytes == 148 * 8 * 16384 * 8 + cake_policy.TICKET_TAIL_BYTES
     # 64k causal document: 256 < 512 keeps the three-warpgroup pair (multiplier 4 x 2048 = 8192 slots, fit)
     assert _select(first, 65536, 65536).scan_key == "scan:pair_l6:u1:s0:f1"
     # 4096 tail queries over 128k keys: 1008 tiles but 512 / 148 = 3.46 rounds < 6 -- ineligible for wide, so the
@@ -1485,8 +1534,9 @@ def test_sample_fit_kinds_name_exactly_the_registered_sampled_fit_programs():
 
 def test_shipped_capacity_rules_by_architecture():
     """sm_103a: short units (under 384 mean tiles) take 16 x top_k slots up to the 32768-slot ceiling, long units keep
-    8 x top_k above the 16384-slot floor; sm_100a keeps 4 x top_k above the floor; the unsampled values (``sample_tiles_max=0``)
-    are the 8192-slot rule on both."""
+    8 x top_k above its 16384-slot floor, which applies on every top_k; sm_100a keeps 4 x top_k above its floor, which
+    is 16384 slots from top_k 1024 on (``cand_cap_floor_rule``) and 8192 below it, so its top_k 256 / 512 calls take
+    8192-slot buffers; the unsampled values (``sample_tiles_max=0``) are the 8192-slot rule on both."""
     short = dict(
         num_queries=65536, num_keys=65536, num_segments=1, ratio=1, grid=148
     )  # 256 mean tiles
@@ -1495,21 +1545,97 @@ def test_shipped_capacity_rules_by_architecture():
     )  # 1024 mean tiles
     p103, p100 = policy_for("sm_103a"), policy_for("sm_100a")
     caps = lambda p, g, **kw: [
-        select_program(p, top_k=k, **g, **kw).cand_cap for k in (256, 2048, 4096)
+        select_program(p, top_k=k, **g, **kw).cand_cap
+        for k in (256, 512, 1024, 2048, 4096)
     ]  # noqa: E731
-    assert caps(p103, short) == [16384, 32768, 32768]
-    assert caps(p103, long) == [16384, 16384, 32768]
-    assert caps(p100, short) == [16384, 16384, 16384]
-    assert caps(p100, long) == [16384, 16384, 32768]
+    assert caps(p103, short) == [16384, 16384, 16384, 32768, 32768]
+    assert caps(p103, long) == [16384, 16384, 16384, 16384, 32768]
+    assert caps(p100, short) == [8192, 8192, 16384, 16384, 16384]
+    assert caps(p100, long) == [8192, 8192, 16384, 16384, 32768]
     assert (
         caps(p103, short, sample_tiles_max=0)
         == caps(p100, short, sample_tiles_max=0)
-        == [8192, 8192, 16384]
+        == [8192, 8192, 8192, 8192, 16384]
     )
     assert (
         caps(p103, long, sample_tiles_max=0)
         == caps(p100, long, sample_tiles_max=0)
-        == [8192, 16384, 32768]
+        == [8192, 8192, 8192, 16384, 32768]
+    )
+    assert cake_jit.POLICY["sm_100a"]["cand_cap_floor"] == 8192
+    assert cake_jit.POLICY["sm_100a"]["cand_cap_floor_rule"] == [1024, 16384]
+    assert cake_jit.POLICY["sm_103a"]["cand_cap_floor"] == 16384
+    assert cake_jit.POLICY["sm_103a"]["cand_cap_floor_rule"] is None
+    assert cake_jit.POLICY["sm_107a"]["cand_cap_floor"] == 8192
+    assert cake_jit.POLICY["sm_107a"]["cand_cap_floor_rule"] is None
+
+
+def test_shipped_floor_rule_keeps_the_pooled_workspace_small():
+    """flashinfer-ai/flashinfer#7549 (minor): on sm_100a the ratio-4 pooled selection (top-512 pools over a 4-token pool
+    layout) of a packed batch, here the CP16 zigzag rank-0 geometry of the Z3cp row with its keys pooled 4:1, takes
+    8192-slot candidate buffers (57 MiB on 152 SMs with six queries per unit, the pre-16384-floor plan: check period 16),
+    where the 16384-slot floor on every top_k needed 114 MiB and check period 32; ``candidate_multiplier=32`` restores
+    that plan; a top_k 2048 call of the same geometry keeps the previous record's 16384 slots; ``dsa_indexer_workspace_size``
+    agrees.  sm_103a sets no rule: the same call keeps its 16384-slot buffers (114 MiB, check period 32), the plan of the
+    previous package there."""
+    pooled = dict(
+        num_queries=10624, num_keys=43824, num_segments=16, ratio=4, top_k=512
+    )
+    tail = cake_policy.TICKET_TAIL_BYTES
+    p = policy_for("sm_100a")
+    new = select_program(p, grid=152, **pooled)
+    assert new.kind == "l6" and new.block_q == 6 and new.grid_ctas == 152
+    assert (new.cand_cap, new.check_period) == (8192, 16)
+    assert new.workspace_bytes == 152 * 6 * 8192 * 8 + tail == 59768832 + tail
+    today = select_program(p, grid=152, candidate_multiplier=32, **pooled)
+    assert (today.cand_cap, today.check_period) == (16384, 32)
+    assert today.workspace_bytes == 152 * 6 * 16384 * 8 + tail == 119537664 + tail
+    assert (today.scan_key, today.finalize_key) == (new.scan_key, new.finalize_key)
+    previous = DispatchPolicy.from_record(
+        dict(p.record(), cand_cap_floor=16384, cand_cap_floor_rule=None)
+    )  # the record before the rule: the 16384-slot floor on every top_k
+    before = select_program(previous, grid=152, **pooled)
+    assert (before.cand_cap, before.check_period, before.workspace_bytes) == (
+        today.cand_cap, today.check_period, today.workspace_bytes,
+    )  # fmt: skip
+    large = dict(
+        pooled, top_k=2048
+    )  # above the rule's top_k: the previous record's plan
+    assert (
+        select_program(p, grid=152, **large).cand_cap
+        == select_program(previous, grid=152, **large).cand_cap
+        == 16384
+    )
+    assert (
+        dsa_indexer_workspace_size(
+            10624, 43824, 16, top_k=512, ratio=4, arch="sm_100a", num_sms=152
+        )
+        == new.workspace_bytes
+    )
+    assert (
+        dsa_indexer_workspace_size(
+            10624,
+            43824,
+            16,
+            top_k=512,
+            ratio=4,
+            arch="sm_100a",
+            num_sms=152,
+            candidate_multiplier=32,
+        )
+        == today.workspace_bytes
+    )
+    p103 = policy_for("sm_103a")
+    assert p103.cand_cap_floor_rule is None and p103.cand_cap_floor == 16384
+    kept = select_program(p103, grid=152, **pooled)
+    assert kept.kind == "l6" and kept.block_q == 6 and kept.grid_ctas == 152
+    assert (kept.cand_cap, kept.check_period) == (16384, 32)
+    assert kept.workspace_bytes == 152 * 6 * 16384 * 8 + tail == 119537664 + tail
+    assert (
+        dsa_indexer_workspace_size(
+            10624, 43824, 16, top_k=512, ratio=4, arch="sm_103a", num_sms=152
+        )
+        == kept.workspace_bytes
     )
 
 
@@ -1538,10 +1664,24 @@ def test_shipped_unit_rules_by_architecture():
                 == "scan:wide:u2:s0:f0"
             ), (grid, knobs)
             # 16k queries over two 135k-key segments: (270336 - 8192) / 2 / 128 = 1024.0 tiles, 13.5 rounds -> wide first
-            # at top_k 2048 (16384 slots) and 4096 (the 32768-slot ceiling)
+            # at top_k 2048 (16384 slots) and 4096 (the 32768-slot ceiling); two segments and no max_seqlen_k: the
+            # longest-first copy (:lsf), and the program without it once max_seqlen_k says the segments are equal
             for K in (2048, 4096):
                 assert (
                     _select(p103, 16384, 270336, S=2, K=K, grid=grid, **knobs).scan_key
+                    == "scan:wide:u2:s0:f0:lsf"
+                ), (grid, knobs, K)
+                assert (
+                    _select(
+                        p103,
+                        16384,
+                        270336,
+                        S=2,
+                        K=K,
+                        grid=grid,
+                        max_seqlen_k=135168,
+                        **knobs,
+                    ).scan_key
                     == "scan:wide:u2:s0:f0"
                 ), (grid, knobs, K)
             # 64k causal document: 256 tiles, below the floor -> the three-warpgroup pair as before
@@ -1568,7 +1708,7 @@ def test_shipped_unit_rules_by_architecture():
             ), (grid, knobs)
             assert (
                 _select(p100, 16384, 270336, S=2, grid=grid, **knobs).scan_key
-                == "scan:wide:u2:s0:f0"
+                == "scan:wide:u2:s0:f0:lsf"
             ), (grid, knobs)
             assert (
                 _select(p100, 4096, 65536, grid=grid, **knobs).scan_key
@@ -1601,13 +1741,18 @@ def test_shipped_sample_shift_rule_by_architecture():
     for grid in (152, 148):
         for knobs in ({}, {"sample_tiles_max": 0}):
             for T, Tkv, S in rows:
+                # sample_class_rule [8, 500] (sm_103a / sm_100a): a sampled call of two or more segments on a wide-unit
+                # program shifts 500 permille, ahead of sample_shift_rule; sm_107a carries no class rule
+                cls = 500 if S >= 2 and not knobs else None
                 for K, shift in ((2048, 250), (4096, 375)):
                     where = (grid, knobs, T, Tkv, S, K)
                     c = _select(p103, T, Tkv, S=S, K=K, grid=grid, **knobs)
-                    assert c.sample_shift_permille == shift, where
+                    assert c.sample_shift_permille == (cls or shift), where
                     for p in (p100, p107):
                         c = _select(p, T, Tkv, S=S, K=K, grid=grid, **knobs)
-                        assert c.sample_shift_permille == 250, where
+                        assert c.sample_shift_permille == (
+                            cls if cls and p is p100 else 250
+                        ), where
                     forced = dict(knobs, sample_shift_permille=-500)
                     c = _select(p103, T, Tkv, S=S, K=K, grid=grid, **forced)
                     assert c.sample_shift_permille == -500, where
@@ -2597,11 +2742,14 @@ def test_prepared_runner_graph_capture_and_replay():
         for _ in range(2):
             runner()
     torch.cuda.current_stream().wait_stream(side)
+    torch.cuda.synchronize()
+    _assert_ticket_tail_zero(runner)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         captured = runner()
     graph.replay()
     torch.cuda.synchronize()
+    _assert_ticket_tail_zero(runner)
     assert ref.same_bits(captured, eager)
     fresh = ref.make_random_inputs(
         [600, 400], [600, 12000], top_k=1024, seed=51, device="cuda"
@@ -2611,7 +2759,206 @@ def test_prepared_runner_graph_capture_and_replay():
     inputs.w.copy_(fresh.w)
     graph.replay()
     torch.cuda.synchronize()
+    _assert_ticket_tail_zero(runner)
     _judge_ok((captured[0].clone(), captured[1].clone()), ref.select_reference(inputs))
+
+
+# the first 16 int64 of the ticket tail: the ticket word and its padding; the rest of the tail holds the
+# longest-first segment order, which every :lsf scan launch writes at its prologue before reading it
+_TICKET_WORD_BYTES = 8 * 16
+
+
+def _assert_ticket_tail_zero(runner) -> None:
+    """The ticket word reads 0 after every completed run (every completed scan launch leaves it 0; a
+    backend-owned tail is zeroed once at prepare, a caller-owned one again before every run); None
+    on the architectures without a tail.  The segment order behind it is not checked: an :lsf launch
+    leaves it written."""
+    if runner.ticket_tail is not None:
+        words = runner.ticket_tail[:_TICKET_WORD_BYTES]
+        assert not words.any(), words[:8].tolist()
+
+
+def _prepare(inputs: ref.IndexerInputs, **extra):
+    return prepare_dsa_indexer_topk(
+        inputs.q,
+        inputs.k,
+        inputs.w,
+        inputs.cu_seqlens_q,
+        inputs.cu_seqlens_k,
+        **inputs.kwargs(),
+        **extra,
+    )
+
+
+def _cloned(out) -> tuple[torch.Tensor, torch.Tensor]:
+    return out[0].clone(), out[1].clone()
+
+
+def test_prepared_runner_ticket_tail_is_zero_at_prepare_after_runs_and_after_a_failed_launch():
+    """Backend-owned workspace: the tail is zeroed once at prepare, no memset in run(); a run that raised
+    while launching marks it dirty and the next run restores it."""
+    _require_program()
+    inputs = ref.make_random_inputs(
+        [600, 400], [600, 12000], top_k=1024, seed=52, device="cuda"
+    )
+    runner = _prepare(inputs)
+    if runner.ticket_tail is None:
+        pytest.skip("no ticket tail on this architecture")
+    assert not runner._tail_shared  # backend-owned: nothing else writes the tail
+    torch.cuda.synchronize()
+    _assert_ticket_tail_zero(runner)  # zeroed once, at prepare
+    expected = runner()
+    expected = (expected[0].clone(), expected[1].clone())
+    torch.cuda.synchronize()
+    # left at 0 by the scan, no memset in run() on this path
+    _assert_ticket_tail_zero(runner)
+    # a launch sequence that raises marks the tail dirty; the next run restores the word before it launches
+    launches = runner.launches
+
+    def failing() -> None:
+        raise RuntimeError("boom")
+
+    runner.launches = (failing,)
+    runner.ticket_tail.fill_(7)  # what an aborted launch could leave behind
+    with pytest.raises(RuntimeError, match="boom"):
+        runner()
+    assert runner._tail_dirty
+    runner.launches = launches
+    out = runner()
+    torch.cuda.synchronize()
+    assert not runner._tail_dirty
+    _assert_ticket_tail_zero(runner)
+    assert ref.same_bits(out, expected)
+
+
+def _workspace_bytes(inputs: ref.IndexerInputs, device: torch.device) -> int:
+    return dsa_indexer_workspace_size(
+        inputs.num_queries,
+        inputs.num_keys,
+        inputs.num_segments,
+        top_k=inputs.top_k,
+        ratio=inputs.ratio,
+        device=device,
+    )
+
+
+def _caller_owned_runner(inputs: ref.IndexerInputs, workspace: torch.Tensor):
+    """A runner on the caller-owned ``workspace`` (skips where the architecture has no ticket tail)."""
+    runner = _prepare(inputs, workspace_buffer=workspace)
+    if runner.ticket_tail is None:
+        pytest.skip("no ticket tail on this architecture")
+    assert runner._tail_shared
+    return runner
+
+
+def test_caller_owned_workspace_shared_by_two_geometries_keeps_every_run_exact():
+    """Two prepared runners of different geometries share one caller-owned buffer; the larger geometry's
+    candidate region covers the smaller one's ticket tail, so every run of B dirties A's tail.  Alternating
+    A, B, A, B: every run's bits equal the same geometry's exclusive-workspace run and the tail of the
+    runner that ran reads 0 afterwards."""
+    _require_program()
+    device = torch.device("cuda", torch.cuda.current_device())
+    inputs_a = ref.make_random_inputs(
+        [300, 200], [300, 6000], top_k=256, seed=70, device="cuda"
+    )
+    inputs_b = ref.make_random_inputs(
+        [900, 300], [900, 7000], top_k=2048, seed=71, device="cuda"
+    )
+    bytes_a = _workspace_bytes(inputs_a, device)
+    bytes_b = _workspace_bytes(inputs_b, device)
+    # B's candidate region covers A's tail
+    assert bytes_b > bytes_a + cake_policy.TICKET_TAIL_BYTES, (bytes_a, bytes_b)
+    expected_a = _cloned(_run(inputs_a))  # exclusive, backend-owned workspaces
+    expected_b = _cloned(_run(inputs_b))
+    shared = torch.empty(bytes_b, dtype=torch.uint8, device=device)
+    runner_a = _caller_owned_runner(inputs_a, shared)
+    runner_b = _caller_owned_runner(inputs_b, shared)
+    assert runner_a.workspace_bytes == bytes_a and runner_b.workspace_bytes == bytes_b
+    tail_a = runner_a.ticket_tail
+    assert (
+        tail_a.data_ptr() >= shared.data_ptr()
+        and tail_a.data_ptr() + cake_policy.TICKET_TAIL_BYTES
+        <= shared.data_ptr() + bytes_b - cake_policy.TICKET_TAIL_BYTES
+    )  # A's tail lies inside B's candidate region
+    for step, (runner, expected) in enumerate(
+        [(runner_a, expected_a), (runner_b, expected_b)] * 2
+    ):
+        out = runner()
+        torch.cuda.synchronize()
+        assert ref.same_bits(out, expected), step
+        _assert_ticket_tail_zero(runner)
+
+
+def test_caller_owned_workspace_tail_written_between_runs_is_restored_before_the_next_run():
+    """The direct hazard: on a caller-owned workspace another kernel writes the ticket word between two
+    runs of a cached runner; the next run zeroes it first and stays bit-exact, and the tail reads 0 after."""
+    _require_program()
+    device = torch.device("cuda", torch.cuda.current_device())
+    inputs = ref.make_random_inputs(
+        [600, 400], [600, 12000], top_k=1024, seed=72, device="cuda"
+    )
+    workspace = torch.empty(
+        _workspace_bytes(inputs, device), dtype=torch.uint8, device=device
+    )
+    runner = _caller_owned_runner(inputs, workspace)
+    torch.cuda.synchronize()
+    _assert_ticket_tail_zero(runner)  # zeroed at prepare as well
+    expected = _cloned(runner())
+    torch.cuda.synchronize()
+    _assert_ticket_tail_zero(runner)
+    _judge_ok(expected, ref.select_reference(inputs))
+    for fill in (7, 0xFF, 1):
+        # what another kernel could leave in a shared buffer; not a failed launch,
+        # so the shared flag alone drives the memset
+        runner.ticket_tail.fill_(fill)
+        assert not runner._tail_dirty
+        out = runner()
+        torch.cuda.synchronize()
+        assert ref.same_bits(out, expected), fill
+        _assert_ticket_tail_zero(runner)
+
+
+def test_caller_owned_workspace_graph_replay_restores_the_tail():
+    """A graph capturing a caller-owned runner carries the tail memset node: corrupting the tail between
+    replays leaves every replay bit-exact and the tail 0 afterwards."""
+    _require_program()
+    device = torch.device("cuda", torch.cuda.current_device())
+    inputs = ref.make_random_inputs(
+        [600, 400], [600, 12000], top_k=1024, seed=73, device="cuda"
+    )
+    workspace = torch.empty(
+        _workspace_bytes(inputs, device), dtype=torch.uint8, device=device
+    )
+    runner = _caller_owned_runner(inputs, workspace)
+    eager = _cloned(_run(inputs))
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        for _ in range(2):
+            runner()
+    torch.cuda.current_stream().wait_stream(side)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = runner()
+    for fill in (7, 0xFF):
+        runner.ticket_tail.fill_(fill)
+        torch.cuda.synchronize()
+        graph.replay()
+        torch.cuda.synchronize()
+        _assert_ticket_tail_zero(runner)
+        assert ref.same_bits(captured, eager), fill
+    fresh = ref.make_random_inputs(
+        [600, 400], [600, 12000], top_k=1024, seed=74, device="cuda"
+    )
+    inputs.q.copy_(fresh.q)
+    inputs.k.copy_(fresh.k)
+    inputs.w.copy_(fresh.w)
+    runner.ticket_tail.fill_(3)
+    graph.replay()
+    torch.cuda.synchronize()
+    _assert_ticket_tail_zero(runner)
+    _judge_ok(_cloned(captured), ref.select_reference(inputs))
 
 
 def test_workspace_bound_is_respected():
@@ -2634,6 +2981,7 @@ def test_workspace_bound_is_respected():
     assert (
         nbytes
         == (plan.grid_ctas * plan.block_q * plan.cand_cap + plan.staging_entries) * 8
+        + cake_policy.TICKET_TAIL_BYTES
     )
     workspace = torch.empty(nbytes, dtype=torch.uint8, device=device)
     indices = torch.empty(
@@ -2857,3 +3205,40 @@ def test_policy_is_validated_once_per_architecture(monkeypatch):
     for _ in range(2):
         with pytest.raises(NotImplementedError, match="5676"):
             policy_for("sm_90a")
+
+
+def test_lsf_copy_runs_on_packed_calls_of_unequal_key_segments():
+    """Lever LSF (#7549): the ticket architectures ship the longest-first segment order copy of every scan program
+    (key suffix ``:lsf``, a program of its own); the host runs it on packed calls whose key segments are not all equal
+    and the program without it on one-segment calls and on packed calls of equal key segments
+    (``num_keys == S x max_seqlen_k``)."""
+    if not cake_jit.PROGRAM_KEYS:
+        pytest.skip("placeholder registry")
+    for arch, keys in cake_jit.PROGRAM_KEYS.items():
+        scan = {k for k in keys if k.startswith("scan:")}
+        copies = {k for k in scan if k.endswith(":lsf")}
+        ticket = arch in cake_jit.TICKET_TAIL_ARCHES
+        assert copies == ({k + ":lsf" for k in scan - copies} if ticket else set()), (
+            arch
+        )
+        assert all(keys[k] != keys[k[: -len(":lsf")]] for k in copies), arch
+        assert policy_for(arch).lsf_programs == ticket, arch
+    p = policy_for("sm_100a")
+    one = _select(p, 65536, 65536)
+    assert not one.lsf and not one.scan_key.endswith(":lsf")
+    equal = _select(p, 8 * 32768, 8 * 32768, S=8, max_seqlen_k=32768)
+    assert not equal.lsf and not equal.scan_key.endswith(":lsf")
+    unequal = _select(p, 8 * 32768, 8 * 32768, S=8, max_seqlen_k=65536)
+    assert unequal.lsf and unequal.scan_key == equal.scan_key + ":lsf"
+    assert unequal.scan_key == (
+        scan_key(
+            unequal.physical_kind,
+            unequal.tile_unroll,
+            unequal.snake,
+            unequal.sample_fit,
+            True,
+        )
+    )
+    assert _select(p, 8 * 32768, 8 * 32768, S=8).lsf  # no bound: the host cannot tell
+    off = DispatchPolicy.from_record(dict(p.record(), lsf_programs=False))
+    assert not _select(off, 8 * 32768, 8 * 32768, S=8, max_seqlen_k=65536).lsf

@@ -99,6 +99,7 @@ assert os.path.realpath(pkg.__file__).startswith(
     os.path.realpath(PKG_ROOT) + os.sep
 ), pkg.__file__
 cb = importlib.import_module(PKG_NAME + ".cake_backend")
+opt_in = importlib.import_module(PKG_NAME + ".cake_backend_opt_in")
 cake_jit = importlib.import_module(PKG_NAME + ".cake_jit")
 cake_build = importlib.import_module(PKG_NAME + ".cake_build")
 for name in cake_build.__all__:
@@ -157,6 +158,14 @@ calls = [
     lambda: cb.backward_loss(f32(2, H), None, row_index=torch.tensor([0, 2])),
     # the output cast: the accumulator must be FP32
     lambda: cb.scale_cast(bf16(8), None, torch.float32),
+    # the opt-in autograd entry: memory_mode is "fast" or "budget"
+    lambda: opt_in.chunked_lm_head_loss(bf16(T, H), bf16(V, H), labels, loss_div=1.0, memory_mode="slow"),
+    # the opt-in loss forward: the caller's valid-row count lies in [0, T]
+    lambda: opt_in.forward_loss(bf16(T, H), bf16(V, H), labels, loss_div=1.0, num_valid_rows=T + 1),
+    # the budget rule: rows <= num_rows
+    lambda: opt_in.memory_plan("loss", num_rows=T, rows=T + 1, hidden=H, vocab=V, chunk=T),
+    # preload needs a CUDA device
+    lambda: opt_in.preload("cpu"),
 ]
 
 with warnings.catch_warnings(record=True) as rec:
@@ -186,7 +195,7 @@ def test_vendored_copy_imports_with_flashinfer_blocked(tmp_path):
     """A copy of the package under another top-level name imports in a ``python -I``
     subprocess with ``flashinfer`` blocked (meta-path finder plus
     ``sys.modules["flashinfer"] = None``), resolves the backend's public names and
-    the loader's ``__all__``, raises the host-side ``ValueError`` of six entry
+    the loader's ``__all__``, raises the host-side ``ValueError`` of ten entry
     points on CPU operands without emitting a warning of any kind, and loads no
     ``flashinfer`` module."""
     root = tmp_path / "site"

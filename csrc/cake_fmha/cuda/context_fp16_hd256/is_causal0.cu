@@ -1241,7 +1241,10 @@ kernel_cake_fmha_context_fp16_hd256(CakeFmhaTensorMap const* Q, CakeFmhaTensorMa
                     bh = tile_idx / (unsigned int)NUM_M_BLOCKS;
                 }
                 int seqlen_kv_bh = seq_lens_kv[bh];
-                unsigned int num_n_blocks = (seqlen_kv_bh + BLOCK_N - 1) / BLOCK_N;
+                // The block count is 0 for a request without keys. Such a tile runs one block, all masked, over
+                // the staged K/V (zeros past the request's keys): with none, the MMA warp waits for a K/V stage
+                // that the load warp never fills. Every role adds the block alike.
+                unsigned int num_n_blocks = (seqlen_kv_bh + BLOCK_N - 1) / BLOCK_N + (seqlen_kv_bh == 0 ? 1u : 0u);
                 int causal_row;
                 unsigned int num_masked_iters;
                 {
@@ -2107,7 +2110,7 @@ kernel_cake_fmha_context_fp16_hd256(CakeFmhaTensorMap const* Q, CakeFmhaTensorMa
                     bh_1 = tile_idx_1 / (unsigned int)NUM_M_BLOCKS;
                 }
                 int seqlen_kv_bh_1 = seq_lens_kv[bh_1];
-                unsigned int num_n_blocks_1 = (seqlen_kv_bh_1 + BLOCK_N - 1) / BLOCK_N;
+                unsigned int num_n_blocks_1 = (seqlen_kv_bh_1 + BLOCK_N - 1) / BLOCK_N + (seqlen_kv_bh_1 == 0 ? 1u : 0u);
                 int off_q = (unsigned int)cu_seq_lens_q[bh_1] + m_block_1 * (unsigned int)BLOCK_M;
                 int seqlen_q_bh = seq_lens_q[bh_1];
                 mbarrier_arrive(p_full_addr);
@@ -2240,7 +2243,7 @@ kernel_cake_fmha_context_fp16_hd256(CakeFmhaTensorMap const* Q, CakeFmhaTensorMa
                     bh_2 = tile_idx_2 / (unsigned int)NUM_M_BLOCKS;
                 }
                 int seqlen_kv_bh_2 = seq_lens_kv[bh_2];
-                unsigned int num_n_blocks_2 = (seqlen_kv_bh_2 + BLOCK_N - 1) / BLOCK_N;
+                unsigned int num_n_blocks_2 = (seqlen_kv_bh_2 + BLOCK_N - 1) / BLOCK_N + (seqlen_kv_bh_2 == 0 ? 1u : 0u);
                 mbarrier_wait(q_full_addr, _phase_q_full_0);
                 _phase_q_full_0 ^= 1;
                 mbarrier_wait(kv_full_addr + (mma_kv_stage) * 8, mma_kv_phase);
@@ -2772,7 +2775,7 @@ kernel_cake_fmha_context_fp16_hd256(CakeFmhaTensorMap const* Q, CakeFmhaTensorMa
                     bh_3 = tile_idx_3 / (unsigned int)NUM_M_BLOCKS;
                 }
                 int seqlen_kv_bh_3 = seq_lens_kv[bh_3];
-                unsigned int num_n_blocks_3 = (seqlen_kv_bh_3 + BLOCK_N - 1) / BLOCK_N;
+                unsigned int num_n_blocks_3 = (seqlen_kv_bh_3 + BLOCK_N - 1) / BLOCK_N + (seqlen_kv_bh_3 == 0 ? 1u : 0u);
                 unsigned int kv_bh = bh_3 / (unsigned int)HEADS_PER_GROUP;
                 int pt_base = kv_bh * (unsigned int)max_pages_per_seq;
                 #pragma unroll 1
@@ -2844,7 +2847,7 @@ kernel_cake_fmha_context_fp16_hd256(CakeFmhaTensorMap const* Q, CakeFmhaTensorMa
                     bh_4 = tile_idx_4 / (unsigned int)NUM_M_BLOCKS;
                 }
                 int seqlen_kv_bh_4 = seq_lens_kv[bh_4];
-                unsigned int num_n_blocks_4 = (seqlen_kv_bh_4 + BLOCK_N - 1) / BLOCK_N;
+                unsigned int num_n_blocks_4 = (seqlen_kv_bh_4 + BLOCK_N - 1) / BLOCK_N + (seqlen_kv_bh_4 == 0 ? 1u : 0u);
                 int off_q_1 = (unsigned int)cu_seq_lens_q[bh_4] + m_block_4 * (unsigned int)BLOCK_M;
                 mbarrier_wait(q_empty_addr, _phase_q_empty_0);
                 _phase_q_empty_0 ^= 1;
@@ -2945,6 +2948,8 @@ kernel_cake_fmha_context_fp16_hd256(CakeFmhaTensorMap const* Q, CakeFmhaTensorMa
     }
 
     // Cleanup
+    asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+    asm volatile("tcgen05.fence::before_thread_sync;" ::: "memory");
     __syncthreads(); // barrier before TMEM dealloc
 
     if (warp == 0) {

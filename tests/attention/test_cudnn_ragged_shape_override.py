@@ -859,7 +859,7 @@ def test_small_workspace_selection_reuse_and_capture(
             with monkeypatch.context() as m:
                 m.setattr(
                     prefill_module,
-                    "prepare_cudnn_batch_prefill",
+                    "_reuse_cudnn_prefill_preparation",
                     lambda *a, **kw: pytest.fail("warm run prepared again"),
                 )
                 capture = torch.cuda.CUDAGraph()
