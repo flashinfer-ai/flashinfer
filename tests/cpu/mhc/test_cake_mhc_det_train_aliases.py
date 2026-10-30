@@ -2,6 +2,7 @@
 old module name and API name is the same object as its ``cake_mhc_det_train`` name."""
 
 import importlib
+import types
 
 import pytest
 
@@ -34,7 +35,8 @@ def test_top_level_old_names_are_the_det_objects():
     old_names = [
         name
         for name in dir(flashinfer)
-        if "cake_mhc_train" in name or "CakeMHCTrain" in name
+        if ("cake_mhc_train" in name or "CakeMHCTrain" in name)
+        and not isinstance(getattr(flashinfer, name), types.ModuleType)
     ]
     assert old_names
     for name in old_names:
