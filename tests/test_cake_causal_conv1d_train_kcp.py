@@ -581,3 +581,331 @@ def test_graph_replay_knob_is_bitwise(monkeypatch, form) -> None:
         conv_kcp._GRAPHS.clear()
     y, hist = cake_causal_conv1d_kcp_forward(x, w, ctx)
     assert torch.equal(y, y0) and torch.equal(hist, hist0)
+
+
+# ----------------------------------------------------------------------------------------------------------------
+# Recompute handle (issues #7815 / #7818): torch's checkpoint recompute binds the history pool the original forward
+# stored instead of gathering and exchanging it again.  One rank here (the exchange of one rank is the identity, so
+# the module's ``_exchange`` calls are counted instead of collectives: one in the original forward, one in the
+# backward, none in a recompute with a handle); the NCCL rows are in test_cake_causal_conv1d_train_kcp_dist.py.
+
+
+class _ExchangeCounter:
+    """Counts ``kcp._exchange`` calls (the halo exchange of the forward and of the backward; nothing else) per
+    phase: ``orig``, ``recompute`` (set by the checkpoint's ``context_fn``, re-entered per recompute) and ``bwd``."""
+
+    def __init__(self, monkeypatch, conv_kcp) -> None:
+        self.phase = "orig"
+        self.calls: dict[str, int] = {}
+        self._stack: list[str] = []
+        original = conv_kcp._exchange
+
+        def counting(*a, **kw):
+            self.calls[self.phase] = self.calls.get(self.phase, 0) + 1
+            return original(*a, **kw)
+
+        monkeypatch.setattr(conv_kcp, "_exchange", counting)
+
+    def recompute_cm(self):
+        counter = self
+
+        class _Phase:
+            def __enter__(self):
+                counter._stack.append(counter.phase)
+                counter.phase = "recompute"
+                return self
+
+            def __exit__(self, *exc):
+                counter.phase = counter._stack.pop()
+                return False
+
+        return _Phase()
+
+    def table(self) -> dict[str, int]:
+        return {p: self.calls.get(p, 0) for p in ("orig", "recompute", "bwd")}
+
+
+def _ckpt_run(p, *, handle=None, reentrant=False, ckpt=True, counter=None, twice=False):
+    """``y`` / ``dx`` / ``dweight`` of ``cake_causal_conv1d_kcp`` (the facade) on the problem ``p``, directly or under a
+    checkpoint, with ``recompute_handle=handle``."""
+    import contextlib
+
+    from torch.utils.checkpoint import checkpoint
+
+    from flashinfer import cake_causal_conv1d_train as facade
+
+    x = p.x_local.clone().requires_grad_(True)
+    w = p.w.clone().requires_grad_(True)
+
+    def fn(x_, w_, h_):
+        return facade.cake_causal_conv1d_kcp(x_, w_, p.ctx, recompute_handle=h_)
+
+    if not ckpt:
+        y = fn(x, w, handle)
+    elif reentrant:
+        y = checkpoint(fn, x, w, handle, use_reentrant=True)
+    else:
+        cm = counter.recompute_cm if counter is not None else contextlib.nullcontext
+        y = checkpoint(
+            fn,
+            x,
+            w,
+            handle,
+            use_reentrant=False,
+            context_fn=lambda: (contextlib.nullcontext(), cm()),
+        )
+    if counter is not None:
+        counter.phase = "bwd"
+    y.backward(p.dy_local, retain_graph=twice)
+    if twice:
+        y.backward(p.dy_local)
+    return {"y": y.detach(), "dx": x.grad, "dw": w.grad}
+
+
+def _same(a, b) -> bool:
+    return all(torch.equal(_bits(a[n]), _bits(b[n])) for n in ("y", "dx", "dw"))
+
+
+@pytest.mark.parametrize("name,lens,cuts,C", ROWS, ids=[r[0] for r in ROWS])
+@pytest.mark.parametrize("reentrant", [False, True], ids=["nonreentrant", "reentrant"])
+def test_recompute_handle_is_bitwise_and_exchange_free(
+    monkeypatch, name, lens, cuts, C, reentrant
+) -> None:
+    """The original forward stores ``hist`` ("capture"), the recompute binds it ("replay") without an exchange;
+    ``y`` / ``dx`` / ``dweight`` are bitwise the plain checkpoint's, the direct pass's and the explicit
+    forward / backward calls' (``recompute_handle=None`` is the unchanged path); the handle holds exactly the
+    history pool, the saved set's own tensor."""
+    from flashinfer.cake_causal_conv1d_train_backend import kcp as conv_kcp
+
+    device = torch.device("cuda")
+    p = _problem(lens, cuts, C, device)
+    y_e, hist_e = cake_causal_conv1d_kcp_forward(p.x_local, p.w, p.ctx)
+    dx_e, dw_e = cake_causal_conv1d_kcp_backward(
+        p.x_local, p.w, p.ctx, p.dy_local, hist_e
+    )
+    explicit = {"y": y_e, "dx": dx_e, "dw": dw_e}
+    direct = _ckpt_run(p, ckpt=False)
+    plain_cc = _ExchangeCounter(monkeypatch, conv_kcp)
+    plain = _ckpt_run(p, reentrant=reentrant, counter=plain_cc)
+    monkeypatch.undo()
+    handle = conv_kcp.KcpRecomputeHandle()
+    cc = _ExchangeCounter(monkeypatch, conv_kcp)
+    conv_kcp.LAST_CALL.pop("recompute_handle", None)
+    got = _ckpt_run(p, handle=handle, reentrant=reentrant, counter=cc)
+    assert conv_kcp.LAST_CALL["recompute_handle"] == {"fwd": "replay"}
+    assert _same(direct, explicit), (
+        "recompute_handle=None differs from the explicit calls"
+    )
+    assert _same(plain, direct), "plain checkpoint differs from the direct pass"
+    assert _same(got, plain), (
+        "checkpoint with a handle differs from the plain checkpoint"
+    )
+    if (
+        reentrant
+    ):  # the recompute runs inside the backward without a context_fn: counted as "bwd"
+        assert plain_cc.table() == {"orig": 1, "recompute": 0, "bwd": 2}
+        assert cc.table() == {"orig": 1, "recompute": 0, "bwd": 1}
+    else:
+        assert plain_cc.table() == {"orig": 1, "recompute": 1, "bwd": 1}
+        assert cc.table() == {"orig": 1, "recompute": 0, "bwd": 1}
+    entry = handle.entries[conv_kcp.HANDLE_KEY]
+    hist = entry["hist"]
+    assert hist.dtype == torch.bfloat16 and hist.shape == hist_e.shape
+    assert torch.equal(hist, hist_e)
+    assert handle.nbytes() == hist.numel() * hist.element_size()
+    assert handle.nbytes() == int(p.ctx.halo.n_hist_rows) * C * 2
+    handle.clear()
+    assert handle.nbytes() == 0 and not handle.entries
+
+
+def test_recompute_handle_retain_graph_and_nested_checkpoints(monkeypatch) -> None:
+    """``retain_graph`` + a second backward replays the entry again (no exchange) and accumulates exactly twice;
+    nested checkpoints with the handle created outside both regions never exchange in a recompute; a handle created
+    inside the outer region is empty in the outer recompute, which then exchanges once -- still bitwise."""
+    import contextlib
+
+    from torch.utils.checkpoint import checkpoint
+
+    from flashinfer import cake_causal_conv1d_train as facade
+    from flashinfer.cake_causal_conv1d_train_backend import kcp as conv_kcp
+
+    device = torch.device("cuda")
+    p = _problem((5000, 1003), (1, 2, 4997, 1003), 512, device)
+    direct = _ckpt_run(p, ckpt=False)
+    cc = _ExchangeCounter(monkeypatch, conv_kcp)
+    twice = _ckpt_run(p, handle=conv_kcp.KcpRecomputeHandle(), counter=cc, twice=True)
+    assert cc.table() == {"orig": 1, "recompute": 0, "bwd": 2}
+    assert torch.equal(_bits(twice["dx"]), _bits(direct["dx"] + direct["dx"]))
+    assert torch.equal(_bits(twice["dw"]), _bits(direct["dw"] + direct["dw"]))
+    monkeypatch.undo()
+
+    def nested(inside: bool):
+        counter = _ExchangeCounter(monkeypatch, conv_kcp)
+        x = p.x_local.clone().requires_grad_(True)
+        w = p.w.clone().requires_grad_(True)
+
+        def inner(x_, w_, h_):
+            return facade.cake_causal_conv1d_kcp(x_, w_, p.ctx, recompute_handle=h_)
+
+        def outer(x_, w_, h_):
+            hh = conv_kcp.KcpRecomputeHandle() if inside else h_
+            yi = checkpoint(inner, x_, w_, hh, use_reentrant=False)
+            return yi * torch.ones_like(
+                yi
+            )  # saves a tensor of the outer region; no bit changes
+
+        y = checkpoint(
+            outer,
+            x,
+            w,
+            conv_kcp.KcpRecomputeHandle(),
+            use_reentrant=False,
+            context_fn=lambda: (contextlib.nullcontext(), counter.recompute_cm()),
+        )
+        counter.phase = "bwd"
+        y.backward(p.dy_local)
+        table = counter.table()
+        monkeypatch.undo()
+        return {"y": y.detach(), "dx": x.grad, "dw": w.grad}, table
+
+    out_res, out_table = nested(False)
+    in_res, in_table = nested(True)
+    assert _same(out_res, direct) and _same(in_res, direct)
+    assert out_table == {"orig": 1, "recompute": 0, "bwd": 1}, out_table
+    assert in_table == {"orig": 1, "recompute": 1, "bwd": 1}, in_table
+
+
+def test_recompute_handle_misuse_raises() -> None:
+    """A forward outside the backward that finds an entry raises (a handle reused across micro-steps or calls);
+    ``graph="replay"`` (keyword or knob) and a CUDA-graph capture are refused with a handle; an object without an
+    ``entries`` dict is refused; a recompute whose entry describes another context or problem raises; a handle that
+    lost its entry before the recompute makes it an original forward again (exchanges, still bitwise)."""
+    from torch.utils.checkpoint import checkpoint
+
+    from flashinfer import cake_causal_conv1d_train as facade
+    from flashinfer.cake_causal_conv1d_train_backend import kcp as conv_kcp
+
+    device = torch.device("cuda")
+    p = _problem((5000, 1003), (1, 2, 4997, 1003), 512, device)
+    handle = conv_kcp.KcpRecomputeHandle()
+    facade.cake_causal_conv1d_kcp(p.x_local, p.w, p.ctx, recompute_handle=handle)
+    assert conv_kcp.LAST_CALL["recompute_handle"] == {"fwd": "capture"}
+    with pytest.raises(RuntimeError, match="per call and micro-step"):
+        facade.cake_causal_conv1d_kcp(p.x_local, p.w, p.ctx, recompute_handle=handle)
+    with pytest.raises(ValueError, match="graph='off'"):
+        conv_kcp.cake_causal_conv1d_kcp(
+            p.x_local,
+            p.w,
+            p.ctx,
+            graph="replay",
+            recompute_handle=conv_kcp.KcpRecomputeHandle(),
+        )
+    with pytest.raises(TypeError, match="entries"):
+        facade.cake_causal_conv1d_kcp(p.x_local, p.w, p.ctx, recompute_handle=object())
+    graph = torch.cuda.CUDAGraph()
+    with pytest.raises(ValueError, match="capture"), torch.cuda.graph(graph):
+        conv_kcp.cake_causal_conv1d_kcp(
+            p.x_local, p.w, p.ctx, recompute_handle=conv_kcp.KcpRecomputeHandle()
+        )
+    del graph
+    # the public autograd Function refuses like the wrapper (graph keyword, capture, no entries dict)
+    fresh = conv_kcp.KcpRecomputeHandle()
+    with pytest.raises(ValueError, match="graph='off'"):
+        conv_kcp.CakeCausalConv1dKcpFunction.apply(
+            p.x_local, p.w, p.ctx, "replay", fresh
+        )
+    with pytest.raises(TypeError, match="entries"):
+        conv_kcp.CakeCausalConv1dKcpFunction.apply(
+            p.x_local, p.w, p.ctx, None, object()
+        )
+    graph = torch.cuda.CUDAGraph()
+    with pytest.raises(ValueError, match="capture"), torch.cuda.graph(graph):
+        conv_kcp.CakeCausalConv1dKcpFunction.apply(p.x_local, p.w, p.ctx, None, fresh)
+    del graph
+    assert not fresh.entries, "a refused call stored an entry"
+    # a recompute whose entry belongs to another context / problem raises inside the backward
+    other = _problem((5000, 1003), (1, 2, 4997, 1003), 512, device)
+    for tamper in ("ctx", "key"):
+        h = conv_kcp.KcpRecomputeHandle()
+        x = p.x_local.clone().requires_grad_(True)
+
+        def fn(x_, h_):
+            return facade.cake_causal_conv1d_kcp(x_, p.w, p.ctx, recompute_handle=h_)
+
+        y = checkpoint(fn, x, h, use_reentrant=False)
+        if tamper == "ctx":
+            h.entries["conv"]["ctx"] = other.ctx
+        else:
+            h.entries["conv"]["key"] = (1, 1)
+        with pytest.raises(ValueError, match="recompute_handle"):
+            y.backward(p.dy_local)
+    # the entry dropped before the recompute: the recompute is an original forward (exchanges and stores)
+    direct = _ckpt_run(p, ckpt=False)
+    h = conv_kcp.KcpRecomputeHandle()
+    x = p.x_local.clone().requires_grad_(True)
+    w = p.w.clone().requires_grad_(True)
+    y = checkpoint(
+        lambda x_, w_, h_: facade.cake_causal_conv1d_kcp(
+            x_, w_, p.ctx, recompute_handle=h_
+        ),
+        x,
+        w,
+        h,
+        use_reentrant=False,
+    )
+    h.clear()
+    y.backward(p.dy_local)
+    assert conv_kcp.LAST_CALL["recompute_handle"] == {"fwd": "capture"}
+    assert "conv" in h.entries
+    assert _same({"y": y.detach(), "dx": x.grad, "dw": w.grad}, direct)
+
+
+def test_recompute_handle_knob_graph_is_refused(monkeypatch) -> None:
+    from flashinfer.cake_causal_conv1d_train_backend import kcp as conv_kcp
+
+    device = torch.device("cuda")
+    p = _problem((65,), (64, 1), 256, device)
+    monkeypatch.setenv(conv_kcp.TEST_KNOBS_ENV, "1")
+    conv_kcp._set_test_knobs({"graph": "replay"})
+    handle = conv_kcp.KcpRecomputeHandle()
+    try:
+        with pytest.raises(ValueError, match="graph='off'"):
+            conv_kcp.cake_causal_conv1d_kcp(
+                p.x_local, p.w, p.ctx, recompute_handle=handle
+            )
+        # the public autograd Function refuses the knob too
+        with pytest.raises(ValueError, match="graph='off'"):
+            conv_kcp.CakeCausalConv1dKcpFunction.apply(
+                p.x_local, p.w, p.ctx, None, handle
+            )
+    finally:
+        conv_kcp._set_test_knobs(None)
+        conv_kcp._GRAPHS.clear()
+    assert not handle.entries, "a refused call stored an entry"
+
+
+@pytest.mark.parametrize("host_trim", [0, 1])
+def test_recompute_handle_both_host_paths(monkeypatch, host_trim) -> None:
+    """The replay binds the stored pool on the trimmed and on the previous host path alike: bitwise, and no exchange
+    in the recompute (the plain checkpoint, the positive control, exchanges once there)."""
+    from flashinfer.cake_causal_conv1d_train_backend import kcp as conv_kcp
+
+    device = torch.device("cuda")
+    p = _problem((1, 2, 3, 57), (3, 30, 30), 384, device)
+    monkeypatch.setenv(conv_kcp.TEST_KNOBS_ENV, "1")
+    conv_kcp._set_test_knobs({"host_trim": host_trim})
+    exchange = conv_kcp._exchange
+    try:
+        direct = _ckpt_run(p, ckpt=False)
+        plain_cc = _ExchangeCounter(monkeypatch, conv_kcp)
+        plain = _ckpt_run(p, counter=plain_cc)
+        # the next counter wraps the module's own exchange, not the first counter
+        monkeypatch.setattr(conv_kcp, "_exchange", exchange)
+        cc = _ExchangeCounter(monkeypatch, conv_kcp)
+        got = _ckpt_run(p, handle=conv_kcp.KcpRecomputeHandle(), counter=cc)
+        assert conv_kcp.LAST_CALL["recompute_handle"] == {"fwd": "replay"}
+    finally:
+        conv_kcp._set_test_knobs(None)
+    assert _same(plain, direct) and _same(got, direct)
+    assert plain_cc.table() == {"orig": 1, "recompute": 1, "bwd": 1}, plain_cc.table()
+    assert cc.table() == {"orig": 1, "recompute": 0, "bwd": 1}, cc.table()

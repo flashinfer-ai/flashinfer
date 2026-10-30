@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from .....weights import MoEWeightPack
+from .....weights import MoEWeightPack, PrequantizedMoEWeights
 
 if TYPE_CHECKING:
     from ......fused_moe.api import MoEConfig, MoEWeightPack as FusedMoEWeightPack
@@ -20,15 +20,33 @@ def materialize_fused_moe_weights(
     candidate needs its view even when it is not first in the search order.
     Repeated configurations of the same backend share one weight view.
     """
+    if isinstance(weights, PrequantizedMoEWeights):
+        raise NotImplementedError(
+            "The split fused_moe kernel prepares every backend's weights from "
+            "canonical BF16; PrequantizedMoEWeights are not supported"
+        )
+
     from ......fused_moe.api import (
         CuteDslConfig,
         MoEWeightPack as FusedMoEWeightPack,
+        PrimsTsConfig,
         QuantFormat,
         TrtllmBf16Config,
         TrtllmFp4Config,
+        TrtllmFp8BlockConfig,
     )
 
     quant = moe_config.quant
+    # FP8PerTensor needs calibrated global scales, which MoEWeightPack does
+    # not carry.
+    prims_ts_pairs = (
+        (QuantFormat.NVFP4, QuantFormat.NVFP4),
+        (QuantFormat.MXFP4, QuantFormat.MXFP8),
+        (QuantFormat.MXFP4, QuantFormat.BF16),
+        (QuantFormat.BF16, QuantFormat.BF16),
+        (QuantFormat.DeepSeekFp8, QuantFormat.DeepSeekFp8),
+        (QuantFormat.MXFP8, QuantFormat.MXFP8),
+    )
     experts = moe_config.experts
     routing = moe_config.routing
     num_local = experts.local_num_experts or routing.num_experts
@@ -74,6 +92,25 @@ def materialize_fused_moe_weights(
             pack.prepare_for("trtllm_fp4_routed", view)
             continue
 
+        if quant.pair == (
+            QuantFormat.DeepSeekFp8,
+            QuantFormat.DeepSeekFp8,
+        ) and isinstance(backend_cfg, TrtllmFp8BlockConfig):
+            if "trtllm_fp8_block" in pack.native_views:
+                continue
+            view = TrtllmFp8BlockConfig.prepare_weights(
+                weights.w13,
+                weights.w2,
+                quant=quant,
+                num_local_experts=num_local,
+                hidden_size=hidden,
+                intermediate_size=intermediate,
+                activation=moe_config.activation,
+                device=weights.w13.device,
+            )
+            pack.prepare_for("trtllm_fp8_block", view)
+            continue
+
         if quant.pair in (
             (QuantFormat.NVFP4, QuantFormat.NVFP4),
             (QuantFormat.MXFP4, QuantFormat.MXFP8),
@@ -92,6 +129,22 @@ def materialize_fused_moe_weights(
                 device=weights.w13.device,
             )
             pack.prepare_for("cute_dsl", view)
+            continue
+
+        if quant.pair in prims_ts_pairs and isinstance(backend_cfg, PrimsTsConfig):
+            if "prims_ts" in pack.native_views:
+                continue
+            view = PrimsTsConfig.prepare_weights(
+                weights.w13,
+                weights.w2,
+                quant=quant,
+                num_local_experts=num_local,
+                hidden_size=hidden,
+                intermediate_size=intermediate,
+                activation=moe_config.activation,
+                device=weights.w13.device,
+            )
+            pack.prepare_for("prims_ts", view)
 
     if pack.native_views:
         return pack

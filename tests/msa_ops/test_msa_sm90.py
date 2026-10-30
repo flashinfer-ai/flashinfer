@@ -1179,8 +1179,9 @@ def sm90_regression_backend(request, monkeypatch):
         ):
             monkeypatch.setattr(cake_hopper_sm90, route, lambda **kwargs: False)
     else:
-        # sparse prefill now prefers the CuTe schedules, so the Cake arm has to
-        # turn that preference off or this fixture would run CuTe on both arms.
+        # proxy-score decode and long-chunk sparse prefill prefer the CuTe
+        # schedules, so the Cake arm has to turn those preferences off or this
+        # fixture would run CuTe on both arms.
         for pref in ("_cute_prefill_preferred", "_cute_proxy_decode_preferred"):
             monkeypatch.setattr(_sm90_dispatch, pref, lambda *a, **k: False)
     return request.param
@@ -1279,6 +1280,93 @@ def test_sparse_prefill_runs_both_backends(sm90_regression_backend, max_k_tiles)
         lambda r: (0, prefix + r),
     )
     torch.testing.assert_close(out[rows].float(), ref, atol=3e-2, rtol=3e-2)
+
+
+@sm90_only
+@pytest.mark.parametrize("hq", [8, 16])
+@pytest.mark.parametrize(
+    "batch, qlen, prefix_pages",
+    [
+        (1, 2048, 256),  # union (CuTe arm), <= _MPG_UNION_MAX pages
+        (1, 2048, 1024),  # single-token, fp8 PV body
+        (1, 256, 4100),  # single-token, f16 PV body, > 4096 pages (no Cake)
+        (1, 2048, 4100),  # single-token, fp8 PV body, > 4096 pages
+        (20, 64, 4100),  # > 16 sequences and > 4096 pages
+        (1, 8192, 64),  # union, the CuTe-preferred long chunk
+    ],
+)
+@pytest.mark.parametrize("v_mode", ["random", "channel_mean"])
+def test_sparse_prefill_fp32_accuracy(
+    sm90_regression_backend, hq, batch, qlen, prefix_pages, v_mode
+):
+    """Relative L2 against an fp32 reference built from the fp8 cache bytes.
+
+    MiniMax-M3 geometry: one KV head, GQA 8 / 16, a chunk over a cached prefix,
+    every query selecting its own block plus 15 random older ones. Single fp8
+    operands for Q and P measured ~3e-2 here (and a register relabel of P in
+    the single-token fp8 body ~2) while the elementwise tolerances of the other
+    tests still passed; the bf16 output floor is ~1.7e-3.
+
+    ``channel_mean`` gives every key the same positive V row, so the exact
+    output is that row. Random V hides a one-signed accumulation bias: fp8
+    WGMMA chained across blocks into one accumulator returned it ~0.8% low.
+    """
+    torch.manual_seed(hq + batch + prefix_pages)
+    hkv = 1
+    seq = prefix_pages * BLK_KV + qlen
+    width = -(-seq // BLK_KV)
+    npages = batch * width + 4
+    page_table = (
+        torch.randperm(npages, device="cuda")[: batch * width]
+        .to(torch.int32)
+        .view(batch, width)
+    )
+    kv = (torch.randn(npages, hkv, BLK_KV, 2 * HEAD_DIM, device="cuda") * 0.5).to(
+        torch.float8_e4m3fn
+    )
+    if v_mode == "channel_mean":
+        kv[..., HEAD_DIM:] = (1.0 + 0.5 * torch.rand(HEAD_DIM, device="cuda")).to(
+            torch.float8_e4m3fn
+        )
+    k, v = kv[..., :HEAD_DIM], kv[..., HEAD_DIM:]
+    total_q = batch * qlen
+    q = torch.randn(total_q, hq, HEAD_DIM, device="cuda").to(torch.bfloat16)
+    cu_q = torch.arange(batch + 1, dtype=torch.int32, device="cuda") * qlen
+    seqused_k = torch.full((batch,), seq, dtype=torch.int32, device="cuda")
+    pos = torch.arange(seq - qlen, seq, device="cuda").repeat(batch)
+    own = pos // BLK_KV
+    # own block + 15 random older blocks, ascending
+    score = torch.rand(total_q, width, device="cuda")
+    score[torch.arange(width, device="cuda")[None, :] >= own[:, None]] = -1.0
+    older = score.topk(TOPK - 1, dim=-1).indices
+    idx = torch.cat([older, own[:, None]], dim=-1).sort(dim=-1).values
+    idx = idx.to(torch.int32)[None].expand(hkv, total_q, TOPK).contiguous()
+
+    scale = 1.0 / math.sqrt(HEAD_DIM)
+    out = msa_sparse_attention(
+        q,
+        k,
+        v,
+        idx,
+        cu_q,
+        page_table=page_table,
+        seqused_k=seqused_k,
+        causal=True,
+        softmax_scale=scale,
+    )
+    rows = torch.linspace(0, total_q - 1, 48).long().unique().tolist()
+    ref = _ref_attn_rows(
+        q,
+        kv,
+        idx,
+        page_table,
+        seqused_k,
+        scale,
+        rows,
+        lambda r: (r // qlen, seq - qlen + r % qlen),
+    )
+    err = (out[rows].float() - ref).norm() / ref.norm()
+    assert err < 3e-3, f"rel-L2 {err:.2e} vs fp32 reference"
 
 
 @sm90_only

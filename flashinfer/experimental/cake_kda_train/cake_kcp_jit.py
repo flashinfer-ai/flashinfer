@@ -80,8 +80,8 @@ lists, slot tables and chain tables to cached device copies, the pools to
 base-pointer views, the operand and tape tensors from the call's local stage
 values -- onto :func:`run_module`.
 
-Test-only record set (``build.test.json``, loaded only under the environment
-variable ``CAKE_KCP_TEST_KNOBS=1``): the TF32 hi/lo transfer walk
+Test-only record set (``build.test.json``, loaded only after
+:func:`cake_kcp_plan.enable_test_knobs`): the TF32 hi/lo transfer walk
 (``transfer_walk`` knob ``tf32_hilo``: the previous shipped program, one CTA
 per segment and head) with its static ``precision_mode`` forms 1 (the
 explicit three-MMA TF32x3 form of the bitwise unit test) and 2 (plain TF32, a
@@ -106,7 +106,6 @@ from __future__ import annotations
 import functools
 import hashlib
 import json
-import os
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -166,7 +165,6 @@ WALK_FORM_RULES = {
 WALK_FORM_FIT_STEP_RATIO = 0.9
 # Launches per form since import (evidence of the rule's choices).
 WALK_FORM_STATS = {"full": 0, "split": 0}
-TEST_KNOBS_ENV = "CAKE_KCP_TEST_KNOBS"
 TEST_MANIFEST = "build.test.json"
 
 # Logical argument names :func:`run_program` binds; every record maps its
@@ -1557,8 +1555,8 @@ _MANIFEST_SCHEMA = "cake-build/1"
 
 
 def test_knobs_enabled() -> bool:
-    """Whether the process opted into the test-only programs (``CAKE_KCP_TEST_KNOBS=1``)."""
-    return os.environ.get(TEST_KNOBS_ENV) == "1"
+    """Whether the process opted into the test-only programs (:func:`cake_kcp_plan.enable_test_knobs`)."""
+    return cake_kcp_plan.test_knobs_enabled()
 
 
 def test_record(
@@ -1604,15 +1602,24 @@ def test_walk_record(program: str, form: str) -> tuple[str, dict[str, Any]]:
     raise ValueError(f"no test-only record of {program!r} carries the knobs {wanted}")
 
 
-@functools.cache
-def test_manifest() -> dict[str, Any]:
-    """The parsed ``build.test.json`` (schema ``cake-build/1``, the test-only libraries), read on first use and
-    only under ``CAKE_KCP_TEST_KNOBS=1``: the shipped route never opens it."""
+def _require_test_knobs() -> None:
     if not test_knobs_enabled():
         raise RuntimeError(
-            f"the test-only KCP programs are loaded only with {TEST_KNOBS_ENV}=1 in the environment; the shipped "
+            f"the test-only KCP programs are loaded only after {cake_kcp_plan.ENABLE_TEST_KNOBS}; the shipped "
             "route (precision_mode 0) uses build.json alone"
         )
+
+
+def test_manifest() -> dict[str, Any]:
+    """The parsed ``build.test.json`` (schema ``cake-build/1``, the test-only libraries), read on first use and
+    only after :func:`cake_kcp_plan.enable_test_knobs`: the shipped route never opens it.  The opt-in is checked on
+    every call, the parse is cached (an opt-out after a load closes it again)."""
+    _require_test_knobs()
+    return _test_manifest()
+
+
+@functools.cache
+def _test_manifest() -> dict[str, Any]:
     try:
         text = _TEST_MANIFEST_PATH.read_text(encoding="utf-8")
     except FileNotFoundError as exc:
@@ -1687,10 +1694,16 @@ def test_jit_spec(library: str) -> Any:
     )
 
 
-@functools.cache
 def load_test(name: str, arch: str) -> Any:
     """The loaded tvm-ffi module of test-only record ``name`` (a key of ``TEST_MODULES``) built for ``arch``,
-    JIT-built from ``build.test.json`` (never prebuilt, never from ``build.json``)."""
+    JIT-built from ``build.test.json`` (never prebuilt, never from ``build.json``); the opt-in is checked on every
+    call, the loaded module is cached."""
+    _require_test_knobs()
+    return _load_test(name, arch)
+
+
+@functools.cache
+def _load_test(name: str, arch: str) -> Any:
     return test_jit_spec(test_library_name(name, arch)).build_and_load()
 
 
@@ -1759,19 +1772,35 @@ def _flat_pool(pool: Any, what: str) -> Any:
 
 
 def _pool_arguments(
-    ix: Any, *, what: str, H: int, nseg: int, device: str, trim: bool = False
+    ix: Any,
+    *,
+    what: str,
+    H: int,
+    nseg: int,
+    device: str,
+    trim: bool = False,
+    tb: Any = None,
 ) -> tuple[Any, Any, int, int, int | None]:
     """``(pool view, slot table, hg, n, tile_stride)`` of a compact pool as the kernels address it.
 
     ``ix`` is a ``cake_kcp.Indexed`` (pool, ``index[nseg]``, ``tiles[slot][h]``): its tile table is recovered into
     the two-integer form through ``Indexed.addressing`` and the pool view starts at its base tile.  ``None`` (or a
     non-pool value, the tape program's unused ``out``) is the absent pool: every slot ``-1`` over a dummy tile, with
-    no stride of its own.
+    no stride of its own (on the trimmed path with the shipped upload knobs the slot table is the table set's own
+    copy, ``tb.absent_index``).
     """
     if ix is None or not hasattr(ix, "addressing"):
+        # the table set's own copy on the shipped path; the previous path's knobs keep the process cache
+        absent = (
+            getattr(tb, "absent_index", None)
+            if trim and getattr(tb, "own_absent", False)
+            else None
+        )
         return (
             _dummy_tile(device),
-            _device_table((-1,) * nseg, "int32", device),
+            absent(device)
+            if absent is not None
+            else _device_table((-1,) * nseg, "int32", device),
             int(H),
             1,
             None,
@@ -1856,6 +1885,7 @@ def _walk(name: str, args: Mapping[str, Any], call: Any, device_index: int) -> N
             nseg=nseg,
             device=device,
             trim=trim,
+            tb=call.tb,
         )
         values.update(
             {key: pool, f"{key}_index": index, f"{key}_hg": hg, f"{key}_n": n}
@@ -1982,7 +2012,12 @@ def _merge(args: Mapping[str, Any], call: Any, device_index: int) -> None:
     if trim and hasattr(
         chains, "device_tables"
     ):  # the chain set's own cached device tables (same integers)
-        values.update(chains.device_tables(device))
+        values.update(
+            chains.device_tables(
+                device,
+                upload=getattr(getattr(call, "tb", None), "upload_specs", None),
+            )
+        )
     else:
         values.update(_chain_tables(chains, device))
     run_module(
@@ -2032,7 +2067,6 @@ __all__ = [
     "MODULES",
     "PRECISION_MODES",
     "PROGRAMS",
-    "TEST_KNOBS_ENV",
     "TEST_MANIFEST",
     "TEST_MODULES",
     "TILE",

@@ -196,6 +196,12 @@ with contextlib.suppress(ImportError):
         CuteDslBf16MoEWrapper as CuteDslBf16MoEWrapper,
     )
     from .gdn_prefill import chunk_gated_delta_rule as chunk_gated_delta_rule
+    from .gdn_paged import (
+        chunk_gated_delta_rule_paged as chunk_gated_delta_rule_paged,
+        gated_delta_rule_decode_paged as gated_delta_rule_decode_paged,
+        gdn_paged_decode_slots as gdn_paged_decode_slots,
+        gdn_paged_prefill_slots as gdn_paged_prefill_slots,
+    )
 from .gdn2_prefill import chunk_gated_delta_rule2 as chunk_gated_delta_rule2
 from .gdp_prefill import chunk_gated_delta_product as chunk_gated_delta_product
 
@@ -274,6 +280,21 @@ from .cake_rmsnorm_train import (
 from .cake_rmsnorm_train import (
     cake_rmsnorm_train_forward as cake_rmsnorm_train_forward,
 )
+from .cake_rmsnorm_silu_gate_train import (
+    CakeRMSNormSiLUGateFunction as CakeRMSNormSiLUGateFunction,
+)
+from .cake_rmsnorm_silu_gate_train import (
+    cake_rmsnorm_silu_gate as cake_rmsnorm_silu_gate,
+)
+from .cake_rmsnorm_silu_gate_train import (
+    cake_rmsnorm_silu_gate_train_backward as cake_rmsnorm_silu_gate_train_backward,
+)
+from .cake_rmsnorm_silu_gate_train import (
+    cake_rmsnorm_silu_gate_train_backward_workspace_bytes as cake_rmsnorm_silu_gate_train_backward_workspace_bytes,
+)
+from .cake_rmsnorm_silu_gate_train import (
+    cake_rmsnorm_silu_gate_train_forward as cake_rmsnorm_silu_gate_train_forward,
+)
 from .cake_causal_conv1d_train import (
     CakeCausalConv1dFunction as CakeCausalConv1dFunction,
 )
@@ -291,6 +312,7 @@ from .cake_causal_conv1d_train import (
     cake_causal_conv1d_train_forward_workspace_bytes as cake_causal_conv1d_train_forward_workspace_bytes,
 )
 from .cake_mhc_train import CakeMHCTrainFinishFunction as CakeMHCTrainFinishFunction
+from .cake_mhc_train import CakeMHCTrainHeadFunction as CakeMHCTrainHeadFunction
 from .cake_mhc_train import CakeMHCTrainPrepareFunction as CakeMHCTrainPrepareFunction
 from .cake_mhc_train import (
     cake_mhc_train_backward_finish as cake_mhc_train_backward_finish,
@@ -313,6 +335,13 @@ from .cake_mhc_train import (
 )
 from .cake_mhc_train import (
     cake_mhc_train_forward_workspace_bytes as cake_mhc_train_forward_workspace_bytes,
+)
+from .cake_mhc_train import cake_mhc_train_head as cake_mhc_train_head
+from .cake_mhc_train import (
+    cake_mhc_train_head_backward as cake_mhc_train_head_backward,
+)
+from .cake_mhc_train import (
+    cake_mhc_train_head_forward as cake_mhc_train_head_forward,
 )
 from .cake_mhc_train import cake_mhc_train_prepare as cake_mhc_train_prepare
 from .cake_gdp import (

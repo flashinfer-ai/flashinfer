@@ -120,6 +120,93 @@ def test_public_api_switch_keywords():
     assert all(v.startswith("FLASHINFER_CAKE_LM_HEAD_LOSS_") for v in named)
 
 
+def test_public_api_memory_and_count_keywords(monkeypatch):
+    """Both public entries take ``memory_mode`` (default ``None``, no environment variable), ``num_valid_rows``
+    (``None``) and ``check_num_valid_rows`` (``False``) as keyword-only arguments and document them; a call with
+    ``memory_mode`` or ``num_valid_rows`` passes all three to the opt-in backend module unchanged, a call with neither
+    calls the default backend entry without them; ``chunked_lm_head_preload`` is experimental and needs a CUDA
+    device."""
+    _clear(monkeypatch)
+    for fn in (chunked_lm_head_loss, chunked_lm_head_logprob):
+        params = inspect.signature(fn).parameters
+        for name, default in (
+            ("memory_mode", None),
+            ("num_valid_rows", None),
+            ("check_num_valid_rows", False),
+        ):
+            assert params[name].kind is inspect.Parameter.KEYWORD_ONLY, (
+                fn.__name__,
+                name,
+            )
+            assert params[name].default is default, (fn.__name__, name)
+            assert name in fn.__doc__, (fn.__name__, name)
+    seen = {}
+
+    def spy(name):
+        def call(*args, **kw):
+            seen[name] = kw
+            return torch.zeros(())
+
+        return call
+
+    backend, opt_in = public._cake_backend(), public._cake_backend_opt_in()
+    for module, tag in ((backend, "default"), (opt_in, "opt_in")):
+        monkeypatch.setattr(module, "chunked_lm_head_loss", spy(f"{tag}_loss"))
+        monkeypatch.setattr(module, "chunked_lm_head_logprob", spy(f"{tag}_logprob"))
+    X, W, labels = _host_call()
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", ExperimentalWarning)
+        chunked_lm_head_loss(
+            X,
+            W,
+            labels,
+            loss_div=1.0,
+            memory_mode="budget",
+            num_valid_rows=3,
+            check_num_valid_rows=True,
+        )
+        chunked_lm_head_logprob(X, W, labels, num_valid_rows=3)
+        chunked_lm_head_loss(X, W, labels, loss_div=1.0)
+        chunked_lm_head_logprob(X, W, labels)
+    # either keyword: the opt-in module, every keyword passed unchanged
+    assert seen["opt_in_loss"]["memory_mode"] == "budget"
+    assert seen["opt_in_loss"]["num_valid_rows"] == 3
+    assert seen["opt_in_loss"]["check_num_valid_rows"] is True
+    assert seen["opt_in_logprob"]["memory_mode"] is None
+    assert seen["opt_in_logprob"]["num_valid_rows"] == 3
+    assert seen["opt_in_logprob"]["check_num_valid_rows"] is False
+    # neither: the default backend entry, called as without the keywords
+    for name in ("default_loss", "default_logprob"):
+        assert (
+            not {"memory_mode", "num_valid_rows", "check_num_valid_rows"}
+            & seen[name].keys()
+        ), name
+    # check_num_valid_rows=True without a count: ValueError before either backend entry runs
+    seen.clear()
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", ExperimentalWarning)
+        for fn, kw in (
+            (chunked_lm_head_loss, dict(loss_div=1.0)),
+            (chunked_lm_head_logprob, {}),
+        ):
+            for mode in (None, "fast", "budget"):
+                with pytest.raises(ValueError, match="needs num_valid_rows"):
+                    fn(
+                        X,
+                        W,
+                        labels,
+                        memory_mode=mode,
+                        check_num_valid_rows=True,
+                        **kw,
+                    )
+    assert not seen, seen
+    assert public.chunked_lm_head_preload.is_experimental is True
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", ExperimentalWarning)
+        with pytest.raises(ValueError, match="CUDA device"):
+            public.chunked_lm_head_preload("cpu")
+
+
 def test_compact_rows_default_env(monkeypatch):
     _clear(monkeypatch)
     assert _knobs()["compact_rows"] is True  # unset: the backend's default

@@ -313,10 +313,10 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(KernelComponent):
                 self.cluster_shape_mn in ((2, 1), (4, 1))
                 and self.mma_tiler_mnk == (256, 64, 128)
                 and self.use_2cta_instrs
-                and (self.quant_kind == QuantKind.mxfp8_e4m3
+                and (self.quant_kind in (QuantKind.mxfp8_e4m3, QuantKind.mxfp8_e5m2)
                      or (self.quant_kind == QuantKind.mxfp4_mxfp8 and self.cluster_shape_mn == (4, 1)))
             ):
-                raise ValueError("GenPhase N64 requires MXFP8 E4M3 (or mixed FP4 at CGA4), tile (256, 64, 128), and cluster (2, 1) or (4, 1).")
+                raise ValueError("GenPhase N64 requires MXFP8 E4M3/E5M2 (or mixed FP4 at CGA4), tile (256, 64, 128), and cluster (2, 1) or (4, 1).")
         if self.mma_tiler_mnk[1] not in (64, 128, 256):
             raise ValueError("Blackwell Genphase MegaMoE supports tile N in (64, 128, 256).")
         if self.mma_tiler_mnk[2] % self.instruction_k != 0:

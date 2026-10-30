@@ -16,13 +16,16 @@ limitations under the License.
 
 from __future__ import annotations
 
+import atexit
 import contextlib
 import os
+import weakref
 from enum import Enum
 
 import torch
 
 from ...push_style_megamoe.shim.protocol import (
+    _CAPSULE_KEEPALIVE,
     Sm90PushCombine,
     Sm90PushPayload,
     Sm90PushPipe,
@@ -52,8 +55,14 @@ __all__ = [
     "COMBINE_WIRE_ENV",
     "COMPACT_FORM_ENV",
     "COPY_FORMS",
+    "DIRECT_PLACE_DEFAULTS",
+    "DIRECT_PLACE_ENV",
+    "DIRECT_PLACE_MIN_ROUTE_ELEMS",
+    "DIRECT_PLACE_MIN_TOKENS_ENV",
     "FC2_EARLY_MAX_TOKENS",
     "FC2_EARLY_MAX_TOKENS_ENV",
+    "FC2_EARLY_WINDOWS",
+    "FC2_EARLY_WINDOWS_ENV",
     "FUSED_BEGIN_ENV",
     "FUSED_COMBINE_TAIL_ENV",
     "FUSED_DISPATCH_ENV",
@@ -70,6 +79,7 @@ __all__ = [
     "PER_ROUTE_PUBLISH_PDL_ENV",
     "PREFIX_FORM_ENV",
     "FUSED_DISPATCH_MAX_TOKENS_ENV",
+    "GRID_DISPATCH_MIN_TOKENS_DEFAULTS",
     "GRID_DISPATCH_MIN_TOKENS_ENV",
     "PUBLISH_FORM_ENV",
     "Sm90CakeBf16MoERunner",
@@ -101,11 +111,15 @@ FUSED_DISPATCH_MAX_ROUTES_LIMIT = 4096
 # co-resident blocks (count + reserve + store_publish, plus the round opening
 # and the receiver prefix at the fused_begin level) vs. the vendored kernels.
 # Rounds with T >= the bound (runner ``grid_dispatch_min_tokens`` or this
-# environment variable; default GRID_DISPATCH_MIN_TOKENS, the rounds above the
-# default fused-dispatch bound) take it, ahead of the fused small-T path; 0
-# disables it.  Bit-identical outputs; interoperates with peers on any setting.
+# environment variable; default GRID_DISPATCH_MIN_TOKENS_DEFAULTS for the EP size,
+# else GRID_DISPATCH_MIN_TOKENS, the rounds above the default fused-dispatch bound)
+# take it, ahead of the fused small-T path; 0 disables it.  Bit-identical outputs;
+# interoperates with peers on any setting.
 GRID_DISPATCH_MIN_TOKENS_ENV = "FLASHINFER_SM90_CAKE_BF16_GRID_DISPATCH_MIN_TOKENS"
 GRID_DISPATCH_MIN_TOKENS = FUSED_DISPATCH_MAX_TOKENS + 1
+# EP size -> default bound where the grid dispatch was measured faster than the
+# fused small-T path at that round size on H100 (EP 8: rounds of 512 local tokens).
+GRID_DISPATCH_MIN_TOKENS_DEFAULTS: dict[int, int] = {8: 512}
 _GRID_DISPATCH_MAX_SMEM_INTS = (
     12 * 1024
 )  # 2 * E * ep + 1 + 2 * ep ints of dynamic smem (48 KB)
@@ -184,6 +198,23 @@ COPY_FORMS = (0, 1)
 # 0 disables it.  FC1 and FC2 are rank-local, so ranks may differ per round.
 FC2_EARLY_MAX_TOKENS_ENV = "FLASHINFER_SM90_CAKE_BF16_FC2_EARLY_MAX_TOKENS"
 FC2_EARLY_MAX_TOKENS = 128
+# FC2 early start above the decode window: rounds whose local token count lies in
+# the window (lo, hi] of the pipe's shape also run the early-start pair.  Keyed
+# by host-known values only: (hidden size, intermediate size, total experts,
+# top_k, EP size).  The windows hold the measured shapes and token ranges where
+# the early-start pair was faster than the regular pair on H100; other shapes and
+# rounds keep the decode window alone (there the early FC2 tiles slowed FC1 by
+# more than they saved, or made no difference; the (7168, 2048, 256, 8) shape has
+# no window at EP 2 because its gain there was below 0.3 % in the latest
+# measurement).  Same tiles, same bits.  0 disables the windows (the decode window
+# is unaffected).  Rank-local, so ranks may differ.
+FC2_EARLY_WINDOWS_ENV = "FLASHINFER_SM90_CAKE_BF16_FC2_EARLY_WINDOWS"
+FC2_EARLY_WINDOWS: dict[tuple[int, int, int, int, int], tuple[int, int]] = {
+    # (hidden, intermediate, total experts, top_k, ep): (lo, hi)
+    (7168, 2048, 256, 8, 8): (128, 4096),
+    (7168, 2048, 256, 8, 4): (128, 1024),
+    (7168, 3072, 384, 6, 8): (512, 1024),
+}
 # Receiver-side prefix inside the single-launch dispatches (fused_begin 2): 1
 # (default) = the small-round fused dispatch and the grid dispatch compute the
 # integer prefix sums over the E x ep (expert, source) keys with the whole block,
@@ -191,6 +222,38 @@ FC2_EARLY_MAX_TOKENS = 128
 # dispatch.  The 129..512-token fused dispatch walks the keys with one thread in
 # both settings.  Both forms write the same values, so ranks may differ.
 PREFIX_FORM_ENV = "FLASHINFER_SM90_CAKE_BF16_PREFIX_FORM"
+# Direct placement in grid-dispatch rounds: the activation matrix of every rank is a
+# symmetric (peer-writable) buffer; the sender stores the first route of a token to
+# a rank (its carrier) straight into that rank's matrix at the row the compact would
+# have copied it to, and the compact copies only the later routes of the token to
+# the same rank (from the carrier's row).  A round is direct only when every rank
+# dispatches it this way (decided on the device, the same on every rank); other
+# rounds use the inbox path.  Requested with 1 (``direct_place=True``; by default
+# on for the EP sizes in DIRECT_PLACE_DEFAULTS, off for the others); effective only
+# when every rank requests it and its pipe allows it (dedup dispatch, the grid
+# dispatch on, compact form 1, at most 1024 (expert, rank) keys, a token capacity of
+# at least both round bounds below), and then for grid-dispatch rounds with at least
+# DIRECT_PLACE_MIN_TOKENS_ENV (``direct_place_min_tokens``; default at the EP sizes
+# in DIRECT_PLACE_DEFAULTS the larger of the EP size's bound and the routed-element
+# floor below, else the grid-dispatch bound) local tokens.  A pipe that cannot use
+# it keeps the regular activation matrix.
+# Bit-identical outputs.
+DIRECT_PLACE_ENV = "FLASHINFER_SM90_CAKE_BF16_DIRECT_PLACE"
+DIRECT_PLACE_MIN_TOKENS_ENV = "FLASHINFER_SM90_CAKE_BF16_DIRECT_PLACE_MIN_TOKENS"
+# EP size -> smallest local token count of a direct round, for the EP sizes where
+# direct placement was measured faster than the inbox path on H100 (on by default
+# there).  Other EP sizes (EP 2: no measured gain) keep the inbox path unless
+# direct placement is requested.
+DIRECT_PLACE_DEFAULTS: dict[int, int] = {8: 513, 4: 513}
+# Routed-element floor of the default bound: a direct round adds a count exchange of
+# a fixed cost and saves compact copies in proportion to the round's routed
+# elements (local tokens * top_k * hidden).  On H100 the rounds with at least 44M
+# routed elements gained clearly and the round with 25M did not, so by default a
+# direct round needs ceil(DIRECT_PLACE_MIN_ROUTE_ELEMS / (top_k * hidden)) local
+# tokens (586 at hidden 7168 / top-k 8, 781 at 7168 / 6, 1366 at 4096 / 6).
+DIRECT_PLACE_MIN_ROUTE_ELEMS = 1 << 25
+_DIRECT_PLACE_MAX_KEYS = 1024  # E * ep: the pipelined compact's segment tables
+_DIRECT_PLACE_MAX_ROWS = 1 << 30  # the SlotMeta row field (bits 0..29)
 
 
 def _env_flag(name: str) -> bool:
@@ -211,9 +274,11 @@ def _fused_dispatch_max_tokens_default() -> int:
     return FUSED_DISPATCH_MAX_TOKENS if raw is None else int(raw.strip())
 
 
-def _grid_dispatch_min_tokens_default() -> int:
+def _grid_dispatch_min_tokens_default(ep: int) -> int:
     raw = os.environ.get(GRID_DISPATCH_MIN_TOKENS_ENV)
-    return GRID_DISPATCH_MIN_TOKENS if raw is None else int(raw.strip())
+    if raw is not None:
+        return int(raw.strip())
+    return GRID_DISPATCH_MIN_TOKENS_DEFAULTS.get(ep, GRID_DISPATCH_MIN_TOKENS)
 
 
 def _pdl_mask(value: bool | int | str) -> int:
@@ -283,6 +348,81 @@ def _fc2_early_max_tokens_default() -> int:
     return FC2_EARLY_MAX_TOKENS if raw is None else int(raw.strip())
 
 
+def _direct_place_default(ep: int) -> bool:
+    raw = os.environ.get(DIRECT_PLACE_ENV)
+    if raw is None:
+        return ep in DIRECT_PLACE_DEFAULTS
+    raw = raw.strip()
+    if raw not in ("0", "1"):
+        raise ValueError(f"{DIRECT_PLACE_ENV} must be 0 or 1, got {raw!r}")
+    return raw == "1"
+
+
+def _direct_place_min_tokens_default(ep: int, top_k: int, hidden: int) -> int:
+    raw = os.environ.get(DIRECT_PLACE_MIN_TOKENS_ENV)
+    if raw is not None:
+        return int(raw.strip())
+    if ep in DIRECT_PLACE_DEFAULTS:
+        floor = -(-DIRECT_PLACE_MIN_ROUTE_ELEMS // (top_k * hidden))  # ceil
+        return max(DIRECT_PLACE_DEFAULTS[ep], floor)
+    return GRID_DISPATCH_MIN_TOKENS
+
+
+def _align256(nbytes: int) -> int:
+    return (nbytes + 255) // 256 * 256
+
+
+# Symmetric a1 views carry C++ deleters that must not run during interpreter
+# finalization (see protocol.py): atexit drops them early, the buffer itself is left
+# to the process exit since a peer may still map it.
+_LIVE_RUNNERS: list = []
+
+
+def _drain_live_runners() -> None:
+    with contextlib.suppress(Exception):
+        torch.cuda.synchronize()
+    for ref in _LIVE_RUNNERS:
+        runner = ref()
+        if runner is not None:
+            runner._release_direct_views()
+    _LIVE_RUNNERS.clear()
+
+
+atexit.register(_drain_live_runners)
+
+
+def _fc2_early_windows_default() -> bool:
+    raw = os.environ.get(FC2_EARLY_WINDOWS_ENV, "1").strip().lower()
+    return raw not in ("0", "false", "off", "no", "")
+
+
+def fc2_early_window_for(
+    hidden_size: int, intermediate_size: int, num_experts: int, top_k: int, ep: int
+) -> tuple[int, int] | None:
+    """The FC2 early-start window (lo, hi] above the decode window for a pipe
+    shape (``num_experts`` = total experts over the EP group), or ``None``."""
+    return FC2_EARLY_WINDOWS.get(
+        (
+            int(hidden_size),
+            int(intermediate_size),
+            int(num_experts),
+            int(top_k),
+            int(ep),
+        )
+    )
+
+
+def fc2_early_round(
+    num_tokens: int, max_tokens: int, window: tuple[int, int] | None
+) -> bool:
+    """True when a round of ``num_tokens`` local tokens runs the FC2 early-start
+    pair: the decode window ``0 < T <= max_tokens`` or the shape window
+    ``lo < T <= hi``."""
+    if 0 < num_tokens <= max_tokens:
+        return True
+    return window is not None and window[0] < num_tokens <= window[1]
+
+
 def _combine_wire_default(token_capacity: int) -> str:
     """Default combine wire: the environment override when set, otherwise the
     per-shape default (``per_route`` when ``token_capacity`` is at or below
@@ -343,6 +483,19 @@ class Sm90CakeBf16MoERunner:
     default from ``FUSED_COMBINE_TAIL_ENV`` / ``FUSED_DISPATCH_ENV``) are
     bit-identical and a peer rank may use any of them.
 
+    Direct placement (``direct_place``; ``None`` = ``DIRECT_PLACE_ENV``, default
+    on for the EP sizes in ``DIRECT_PLACE_DEFAULTS``): grid-dispatch rounds store
+    each token's row for a rank straight into
+    that rank's activation matrix (a symmetric buffer), so the compact copies only
+    the later routes of a token to the same rank.  It is effective only when every
+    rank of the pipe requests it and can run it; a round is direct only when every
+    rank dispatches it through the grid dispatch with at least
+    ``direct_place_min_tokens`` tokens (``None`` = ``DIRECT_PLACE_MIN_TOKENS_ENV``,
+    default at the EP sizes in ``DIRECT_PLACE_DEFAULTS`` the larger of the listed
+    bound and ``ceil(DIRECT_PLACE_MIN_ROUTE_ELEMS / (top_k * hidden))``), otherwise
+    the round takes the inbox path.
+    Bit-identical outputs.
+
     Precision contract: bf16 operands into both GEMMs, fp32 accumulation, bf16
     intermediate, bf16 dispatch payload and combine wire, bf16 output.  No FP8
     anywhere.  The pipe must be configured with ``payload_dtype=BF16`` and
@@ -369,6 +522,9 @@ class Sm90CakeBf16MoERunner:
         per_route_publish_pdl: bool | None = None,
         fc2_early_max_tokens: int | None = None,
         prefix_form: int | None = None,
+        direct_place: bool | None = None,
+        direct_place_min_tokens: int | None = None,
+        fc2_early_windows: bool | None = None,
     ) -> None:
         self.pipe = pipe
         self._state = _RunnerState.IDLE
@@ -436,7 +592,7 @@ class Sm90CakeBf16MoERunner:
             )
         self._fused_dispatch_max_tokens = max_tokens
         grid_min = (
-            _grid_dispatch_min_tokens_default()
+            _grid_dispatch_min_tokens_default(pipe.ep)
             if grid_dispatch_min_tokens is None
             else int(grid_dispatch_min_tokens)
         )
@@ -461,8 +617,52 @@ class Sm90CakeBf16MoERunner:
                 f"fc2_early_max_tokens must be >= 0, got {fc2_early_max_tokens!r}"
             )
         self._fc2_early_max_tokens = early_max  # effective value fixed after the JIT
+        self._fc2_early_windows = (
+            _fc2_early_windows_default()
+            if fc2_early_windows is None
+            else bool(fc2_early_windows)
+        )
+        self._fc2_early_window: tuple[int, int] | None = None  # fixed after the JIT
         self._gemm_sched: torch.Tensor | None = None
         self._prefix_form = _form(prefix_form, PREFIX_FORM_ENV, "prefix_form")
+        if direct_place is None:
+            requested = _direct_place_default(pipe.ep)
+        elif direct_place in (0, 1):  # bool or 0 / 1
+            requested = bool(direct_place)
+        else:
+            raise ValueError(
+                f"direct_place must be a bool or None, got {direct_place!r}"
+            )
+        direct_min = (
+            _direct_place_min_tokens_default(pipe.ep, pipe.K, pipe.H)
+            if direct_place_min_tokens is None
+            else int(direct_place_min_tokens)
+        )
+        if direct_min < 0:
+            raise ValueError(
+                f"direct_place_min_tokens must be >= 0, got {direct_place_min_tokens!r}"
+            )
+        self._direct_min = direct_min
+        # this rank can run it; effective (self._direct) = every rank can (init handshake)
+        self._direct_local = (
+            requested
+            and pipe.config.dedup_dispatch
+            and self._grid_dispatch_min_tokens > 0
+            and self._compact_form == 1
+            and pipe.E * pipe.ep <= _DIRECT_PLACE_MAX_KEYS
+            and output_row_capacity(pipe.m_cap) < _DIRECT_PLACE_MAX_ROWS
+            # a pipe none of whose rounds can be placed directly keeps the regular a1
+            and pipe.token_capacity >= max(direct_min, self._grid_dispatch_min_tokens)
+        )
+        self._direct = False
+        # symmetric a1 + count all-gather area (direct placement)
+        self._a1_symm: object | None = None
+        self._a1_peers = 0
+        self._ag_offset = 0
+        self._ag_view: torch.Tensor | None = None
+        self._grid_a1base: torch.Tensor | None = None
+        self._staged_direct = False
+        self._last_round_direct = False
         self._per_route_publish_pdl = (
             _per_route_publish_pdl_default()
             if per_route_publish_pdl is None
@@ -525,6 +725,18 @@ class Sm90CakeBf16MoERunner:
             pipe._comm, pipe.rank, "cake-bf16-combine-wire", _wire_handshake
         )
 
+        # direct placement needs every rank: a rank that cannot run it disables it for
+        # the pipe (no error, ranks may request different switches)
+        direct_flags = _run_guarded_phase(
+            pipe._comm, pipe.rank, "cake-bf16-direct-place", lambda: self._direct_local
+        )
+        self._direct = all(direct_flags)
+        _run_guarded_phase(
+            pipe._comm, pipe.rank, "cake-bf16-direct-a1", self._init_direct_a1
+        )
+        if self._direct:
+            _LIVE_RUNNERS.append(weakref.ref(self))
+
         def _jit():
             self.compact_module = gen_sm90_cake_bf16_compact_module().build_and_load()
             if self._combine_wire in _PREREDUCED_WIRES:
@@ -556,13 +768,18 @@ class Sm90CakeBf16MoERunner:
                 else None
             )
             self.gemm = gemm if gemm is not None else create_grouped_gemm(clamp=clamp)
-            if not (
+            early_ok = (
                 pipe.E <= 1023  # the FC2 tile id carries the expert in 10 bits
                 and min(pipe.H, self.I) >= 256  # >= 4 k-stages per FC2 tile
                 and getattr(self.gemm, "supports_early_start", False)
-            ):
+            )
+            if not early_ok:
                 self._fc2_early_max_tokens = 0
-            if self._fc2_early_max_tokens > 0:
+            if early_ok and self._fc2_early_windows:
+                self._fc2_early_window = fc2_early_window_for(
+                    pipe.H, self.I, pipe.E * pipe.ep, pipe.K, pipe.ep
+                )
+            if self._fc2_early_max_tokens > 0 or self._fc2_early_window is not None:
                 # FC2 tile ticket, FC2 exit ticket, FC1 go word, FC1 CTA count, then one
                 # FC1 readiness counter per m-tile: zeroed once here and kept zeroed by
                 # FC2's last CTA every round (no per-round memset, graph-safe)
@@ -635,9 +852,35 @@ class Sm90CakeBf16MoERunner:
         return self._fc2_early_max_tokens
 
     @property
+    def fc2_early_windows(self) -> bool:
+        """True when the per-shape FC2 early-start windows are enabled."""
+        return self._fc2_early_windows
+
+    @property
+    def fc2_early_window(self) -> tuple[int, int] | None:
+        """This pipe's FC2 early-start window (lo, hi] above the decode window, or None."""
+        return self._fc2_early_window
+
+    @property
     def prefix_form(self) -> int:
         """Receiver prefix form of the single-launch dispatches (0 or 1; see ``PREFIX_FORM_ENV``)."""
         return self._prefix_form
+
+    @property
+    def direct_place(self) -> bool:
+        """True when grid-dispatch rounds may place carrier rows directly (every rank opted in)."""
+        return self._direct
+
+    @property
+    def direct_place_min_tokens(self) -> int:
+        """Smallest round (local tokens) that takes the direct-placement grid dispatch."""
+        return self._direct_min
+
+    def _direct_flag(self) -> int:
+        """Debug: 1 when the last round placed its rows directly on this rank, else 0 (syncs)."""
+        if not self._last_round_direct or self._grid_a1base is None:
+            return 0
+        return int(self._grid_a1base[-1].item())
 
     @property
     def fused_begin(self) -> int:
@@ -676,7 +919,13 @@ class Sm90CakeBf16MoERunner:
         H = pipe.H
         self.m_buf = output_row_capacity(pipe.m_cap)
         dv = pipe.device
-        self.a1 = torch.empty(self.m_buf, H, dtype=torch.bfloat16, device=dv)
+        # direct placement: a1 is the symmetric buffer of _init_direct_a1 (or, when a peer
+        # cannot run it, a regular tensor allocated there)
+        self.a1: torch.Tensor | None = (
+            None
+            if self._direct_local
+            else torch.empty(self.m_buf, H, dtype=torch.bfloat16, device=dv)
+        )
         self.meta = torch.empty(self.m_buf, 4, dtype=torch.int32, device=dv)
         self.row_expert = torch.empty(self.m_buf, dtype=torch.int32, device=dv)
         self.h2 = torch.empty(self.m_buf, self.I, dtype=torch.bfloat16, device=dv)
@@ -717,6 +966,63 @@ class Sm90CakeBf16MoERunner:
                 1, dtype=torch.int32, device=dv
             )
 
+    def _init_direct_a1(self) -> None:
+        """Guarded phase after the direct-placement handshake (every rank runs it)."""
+        pipe = self.pipe
+        if not self._direct:
+            if self.a1 is None:
+                self.a1 = torch.empty(
+                    self.m_buf, pipe.H, dtype=torch.bfloat16, device=pipe.device
+                )
+            return None
+        from ......comm import pack_strided_memory
+        from ......comm.mnnvl import SymmDeviceMemory
+
+        # [a1 rows | one flag per source | one per-key count row per source]
+        nkeys = pipe.E * pipe.ep
+        a1_bytes = self.m_buf * pipe.H * 2
+        self._ag_offset = _align256(a1_bytes)
+        ag_bytes = _align256(8 * pipe.ep) + pipe.ep * ((nkeys + 3) // 4 * 4) * 4
+        symm = SymmDeviceMemory(
+            buf_size=self._ag_offset + ag_bytes,
+            group_size=pipe.ep,
+            group_rank=pipe.rank,
+            device_idx=pipe.device_index,
+            comm_backend_for_handle_transfer=pipe._comm,
+            enable_multicast=False,
+            allocate_signal_pads=False,
+        )
+        self._a1_symm = symm
+        self._a1_peers = symm.get_buffer_ptrs_dev()
+        base = symm.get_unicast_ptr(pipe.rank)
+
+        def view(offset: int, nbytes: int, dtype: torch.dtype) -> torch.Tensor:
+            t = pack_strided_memory(
+                base + offset, nbytes, nbytes, 1, dtype, pipe.device_index
+            )
+            wrapper = getattr(t, "_capsule_wrapper", None)
+            if wrapper is not None:  # see protocol._CAPSULE_KEEPALIVE
+                _CAPSULE_KEEPALIVE.append(wrapper)
+            t = t.reshape(-1)
+            return (
+                t if t.dtype == dtype else t.view(dtype)
+            )  # dlpack labels bf16 as fp16
+
+        self.a1 = view(0, a1_bytes, torch.bfloat16).reshape(self.m_buf, pipe.H)
+        self._ag_view = view(self._ag_offset, ag_bytes, torch.uint8)
+        self._ag_view.zero_()  # tag 0 never matches a round (the first round's tag is 1)
+        self._grid_a1base = torch.zeros(
+            nkeys + 1, dtype=torch.int32, device=pipe.device
+        )
+        torch.cuda.synchronize(pipe.device)
+        return None
+
+    def _release_direct_views(self) -> None:
+        """Drop the dlpack views of the symmetric a1 (destroy / interpreter exit)."""
+        if self._a1_symm is not None:
+            self.a1 = None
+            self._ag_view = None
+
     def bind_weights(self, weights: Sm90CakeBf16Weights) -> None:
         """Swap the expert weights between rounds (same geometry, same device)."""
         self._require_usable()
@@ -747,6 +1053,7 @@ class Sm90CakeBf16MoERunner:
         if self._state in (_RunnerState.POISONED, _RunnerState.DESTROYED):
             return
         self._state = _RunnerState.POISONED
+        self._staged_direct = False
         self._staged_tokens = None
         self._staged_topk_ids = None
         self._staged_stream = None
@@ -766,6 +1073,10 @@ class Sm90CakeBf16MoERunner:
         if gemm is not None:
             with contextlib.suppress(Exception):
                 gemm.destroy()
+        if self._a1_symm is not None:  # quiesce, then drop the views before the buffer
+            torch.cuda.synchronize(self.pipe.device)
+            self._release_direct_views()
+            self._a1_symm = None
         self.pipe.destroy()
 
     # ---------------------------------------------------------------- rounds
@@ -882,6 +1193,7 @@ class Sm90CakeBf16MoERunner:
         nv = self.record_stages
         use_grid = self._use_grid_dispatch(num_tokens)
         use_fused = not use_grid and self._use_fused_dispatch(num_tokens)
+        direct = use_grid and self._direct and num_tokens >= self._direct_min
         level = (
             self._grid_begin if use_grid else (self._fused_begin if use_fused else 0)
         )
@@ -891,7 +1203,7 @@ class Sm90CakeBf16MoERunner:
             with _record_stage("dispatch", nv):
                 if use_grid:
                     pipe = self.pipe
-                    self.dispatch_grid_module.sm90_cake_dispatch_grid_bf16(
+                    grid_args = (
                         x,
                         topk_ids,
                         topk_weights,
@@ -918,6 +1230,17 @@ class Sm90CakeBf16MoERunner:
                         pipe.m_cap,
                         self._prefix_form,
                     )
+                    if direct:
+                        self.dispatch_grid_module.sm90_cake_dispatch_grid_direct_bf16(
+                            *grid_args,
+                            self._grid_a1base,
+                            self._a1_peers,
+                            self._ag_offset,
+                        )
+                    else:
+                        self.dispatch_grid_module.sm90_cake_dispatch_grid_bf16(
+                            *grid_args
+                        )
                 elif use_fused:
                     pipe = self.pipe
                     self.dispatch_module.sm90_cake_dispatch_fused_bf16(
@@ -946,6 +1269,8 @@ class Sm90CakeBf16MoERunner:
             self._poison()
             raise
         self._staged_tokens = num_tokens
+        self._staged_direct = direct
+        self._last_round_direct = direct
         self._staged_prefix_done = level == 2
         self._staged_topk_ids = topk_ids  # the fused tail skips masked (-1) slots
         self._staged_stream = stream
@@ -994,29 +1319,52 @@ class Sm90CakeBf16MoERunner:
                     with _record_stage("wait_prefix", nv):
                         pipe.proto_wait_prefix()
                 with _record_stage("compact_bf16", nv):
-                    self.compact_module.sm90_cake_compact_bf16(
-                        self.a1,
-                        self.meta,
-                        self.row_expert,
-                        *pipe._layout_args(),
-                        pipe._seg_src_base,
-                        pipe._seg_out_base,
-                        pipe._m_dev,
-                        pipe._next_row,
-                        self._grp_cnt,
-                        self._grp_rows,
-                        self._grp_list,
-                        self._n_groups,
-                        self._groups_per_src,
-                        pipe._round,
-                        1 if self._combine_wire in _PREREDUCED_WIRES else 0,
-                        self._pdl_flag(PDL_EDGE_COMPACT),
-                        self._compact_form,
-                    )
-                # FC2 early start in the decode window (rank-local: no cross-rank protocol)
+                    build_groups = 1 if self._combine_wire in _PREREDUCED_WIRES else 0
+                    if self._staged_direct:  # the carriers are in a1 already
+                        self.compact_module.sm90_cake_compact_direct_bf16(
+                            self.a1,
+                            self.meta,
+                            self.row_expert,
+                            *pipe._layout_args(),
+                            pipe._seg_src_base,
+                            pipe._seg_out_base,
+                            pipe._m_dev,
+                            self._grp_cnt,
+                            self._grp_rows,
+                            self._grp_list,
+                            self._n_groups,
+                            self._groups_per_src,
+                            pipe._round,
+                            build_groups,
+                            self._pdl_flag(PDL_EDGE_COMPACT),
+                        )
+                    else:
+                        self.compact_module.sm90_cake_compact_bf16(
+                            self.a1,
+                            self.meta,
+                            self.row_expert,
+                            *pipe._layout_args(),
+                            pipe._seg_src_base,
+                            pipe._seg_out_base,
+                            pipe._m_dev,
+                            pipe._next_row,
+                            self._grp_cnt,
+                            self._grp_rows,
+                            self._grp_list,
+                            self._n_groups,
+                            self._groups_per_src,
+                            pipe._round,
+                            build_groups,
+                            self._pdl_flag(PDL_EDGE_COMPACT),
+                            self._compact_form,
+                        )
+                # FC2 early start in the decode window or the shape's window above
+                # it (rank-local: no cross-rank protocol)
                 sched = (
                     self._gemm_sched
-                    if 0 < num_tokens <= self._fc2_early_max_tokens
+                    if fc2_early_round(
+                        num_tokens, self._fc2_early_max_tokens, self._fc2_early_window
+                    )
                     else None
                 )
                 with _record_stage("fc1", nv):
@@ -1134,6 +1482,7 @@ class Sm90CakeBf16MoERunner:
             raise
         self._state = _RunnerState.IDLE
         self._staged_tokens = None
+        self._staged_direct = False
         self._staged_prefix_done = False
         self._staged_topk_ids = None
         self._staged_stream = None

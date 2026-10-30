@@ -52,7 +52,12 @@ limitations under the License.
 # ``DECODE_TABLE_M_RANGES`` holds, per architecture and cell, in-bucket row
 # ranges ``(lo, hi, entry)`` whose rows take ``entry`` instead of the cell's
 # entry, where the fastest route changes inside one bucket; ``decode_table_m_ranges(arch)``
-# reads it.  Generated from the Cake measurement sweeps recorded in the source
+# reads it.  A row may name twins that only its launches into a TMA-store
+# output view take (``tstore_twins``, ``{selected kernel key: twin kernel
+# key}`` as in ``ROUTE_TWINS``), and a GEMM row whose ``gemm_bn`` ships the
+# TMA-store epilogue only the width of its staged-register view
+# (``gemm_rstaged_bn``); its other views keep the selected programs.
+# Generated from the Cake measurement sweeps recorded in the source
 # repository; do not edit by hand.
 
 from __future__ import annotations
@@ -503,7 +508,6 @@ DECODE_TABLE: dict[str, dict[str, Any]] = {
         "fused": True,
         "persist": True,
     },
-    "192,2,256": {"route": "gemm", "gemm_bn": 192, "gemm_bk": 128},
     "192,2,2048": {"route": "gemm", "gemm_bk": 128},
     "384,28,8": {
         "route": "decode",
@@ -907,6 +911,7 @@ DECODE_TABLE_OVERRIDES: dict[str, dict[str, dict[str, Any]]] = {
             "persist": True,
             "tstore": True,
         },
+        "192,2,256": {"route": "gemm", "gemm_bn": 192, "gemm_bk": 128},
         "192,2,512": {"route": "gemm", "gemm_bk": 128, "gemm_gs": 1},
         "192,2,1024": {
             "route": "gemm",
@@ -1029,13 +1034,12 @@ DECODE_TABLE_OVERRIDES: dict[str, dict[str, dict[str, Any]]] = {
         "5,28,2048": {"route": "gemm", "gemm_bn": 192, "gemm_bk": 128, "gemm_cs": 2},
         "12,1,512": {
             "route": "decode",
-            "tok": 64,
+            "tok": 32,
             "split": 1,
-            "fused": False,
-            "persist": False,
-            "qlanes": 16,
-            "stages": 2,
-            "qwarps": 8,
+            "fused": True,
+            "persist": True,
+            "resident": True,
+            "tstore": True,
         },
         "12,1,2048": {"route": "gemm", "gemm_bn": 192, "gemm_bk": 128, "gemm_gs": 1},
         "12,28,512": {
@@ -1272,6 +1276,7 @@ DECODE_TABLE_OVERRIDES: dict[str, dict[str, dict[str, Any]]] = {
             "tstore": True,
             "pw": 2,
         },
+        "192,2,256": {"route": "gemm", "gemm_bn": 192, "gemm_bk": 128, "gemm_gs": 1},
         "192,2,512": {"route": "gemm", "gemm_bk": 128},
         "192,2,1024": {"route": "gemm", "gemm_bn": 192, "gemm_bk": 128},
         "192,2,4096": {"route": "gemm", "gemm_bk": 128},
@@ -1322,6 +1327,18 @@ DECODE_TABLE_M_RANGES: dict[
         ),
     },
     "sm_103a": {
+        "96,28,512": (
+            (
+                497,
+                512,
+                {
+                    "route": "gemm",
+                    "gemm_bn": 352,
+                    "gemm_rstaged_bn": 384,
+                    "tstore_twins": {"quant:u4": "quant:u4_xef_qel"},
+                },
+            ),
+        ),
         "50,28,2048": (
             (
                 1537,
@@ -1557,6 +1574,9 @@ ROUTE_TWINS: dict[str, dict[str, dict[str, str]]] = {
         "96,1,2048": {
             "gemm_tstore_n192_k128_gs": "gemm_tstore_n192_k128_gs_gsb",
         },
+        "96,1,4096": {
+            "gemm_tstore_k128_s2_ts4": "gemm_tstore_k128_s2_ts4_tde_prg",
+        },
         "96,28,1": {
             "decode:t16_p4_fused": "decode:t16_p4_fused_wef",
         },
@@ -1681,6 +1701,7 @@ ROUTE_TWINS: dict[str, dict[str, dict[str, str]]] = {
         },
         "12,1,4096": {
             "quant:u1": "quant:u1_xef_qel",
+            "gemm_tstore_n192_k128_gs": "gemm_tstore_n192_k128_gs_ts3_tde_prg",
         },
         "12,28,64": {
             "decode:t32_p4_cs4_pf1": "decode:t32_p4_cs4_pf1_csrt",
@@ -1834,6 +1855,9 @@ ROUTE_TWINS: dict[str, dict[str, dict[str, str]]] = {
         "96,1,2048": {
             "gemm_tstore_n192_k128_gs": "gemm_tstore_n192_k128_gs_ts3_tde",
         },
+        "96,1,4096": {
+            "gemm_tstore_k128_s2_ts4": "gemm_tstore_k128_s2_ts4_tde_prg",
+        },
         "96,28,1": {
             "decode:t16_p4_fused_dpf": "decode:t16_p4_fused_dpf_wef",
         },
@@ -1870,6 +1894,9 @@ ROUTE_TWINS: dict[str, dict[str, dict[str, str]]] = {
         "144,6,256": {
             "quant:u1": "quant:u1_xef_qel",
             "gemm_tstore_k128": "gemm_tstore_k128_bef",
+        },
+        "192,2,256": {
+            "gemm_tstore_n192_k128_gs": "gemm_tstore_n192_k128_gs_ts3_tde_prg",
         },
         "384,28,1": {
             "decode:t16_p4_fused": "decode:t16_p4_fused_wef",

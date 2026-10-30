@@ -50,6 +50,8 @@ from ..jit.cute_dsl_core import build_and_load_cute_dsl_kernel
 from .cute_dsl_cache_naming import make_kernel_name
 from .device_target import gdn_compile_options, gdn_device_target, target_arch
 from .dtype_compat import as_bf16
+from . import _softplus
+from ._softplus import softplus_fp32
 
 
 def _mark_slot_dynamic(torch_t: torch.Tensor, *, assumed_align: int = 16):
@@ -311,13 +313,7 @@ def _mtp_precompute_replayssm_step(
     r_a = cutlass.Float32(a[i_n, i_t, i_hv])
     r_b = cutlass.Float32(b[i_n, i_t, i_hv])
     x = r_a + r_dt_bias
-    beta_x = softplus_beta * x
-    # Avoid evaluating exp on the linear softplus branch.
-    softplus_x = x
-    if beta_x <= softplus_threshold:
-        softplus_x = (cutlass.Float32(1.0) / softplus_beta) * cute.log(
-            cutlass.Float32(1.0) + cute.exp(beta_x, fastmath=True), fastmath=True
-        )
+    softplus_x = softplus_fp32(x, softplus_beta, softplus_threshold)
     r_g_value = -cute.exp(r_A_log, fastmath=True) * softplus_x
     r_beta = cutlass.Float32(1.0) / (
         cutlass.Float32(1.0) + cute.exp(-r_b, fastmath=True)
@@ -601,21 +597,7 @@ def gdn_verify_kernel_mtp(
                 r_b = cutlass.Float32(b[i_n, i_t, i_hv])
 
                 x = r_a + r_dt_bias
-                beta_x = softplus_beta * x
-
-                exp_beta_x = cute.exp(beta_x, fastmath=True)
-                softplus_val = (cutlass.Float32(1.0) / softplus_beta) * cute.log(
-                    cutlass.Float32(1.0) + exp_beta_x, fastmath=True
-                )
-                use_softplus = (
-                    cutlass.Float32(1.0)
-                    if beta_x <= softplus_threshold
-                    else cutlass.Float32(0.0)
-                )
-                softplus_x = (
-                    use_softplus * softplus_val
-                    + (cutlass.Float32(1.0) - use_softplus) * x
-                )
+                softplus_x = softplus_fp32(x, softplus_beta, softplus_threshold)
 
                 r_g_value = -cute.exp(r_A_log, fastmath=True) * softplus_x
                 r_beta = cutlass.Float32(1.0) / (
@@ -2054,14 +2036,7 @@ def gdn_verify_kernel_mtp_inline(
             r_a_val = cutlass.Float32(a[i_n, i_t, i_hv])
             r_b_val = cutlass.Float32(b[i_n, i_t, i_hv])
             x_val = r_a_val + r_dt_bias
-            beta_x_val = softplus_beta * x_val
-            # A masked 0 * exp(large_x) would still produce NaN.
-            sp_x = x_val
-            if beta_x_val <= softplus_threshold:
-                sp_x = (cutlass.Float32(1.0) / softplus_beta) * cute.log(
-                    cutlass.Float32(1.0) + cute.exp(beta_x_val, fastmath=True),
-                    fastmath=True,
-                )
+            sp_x = softplus_fp32(x_val, softplus_beta, softplus_threshold)
             r_g_value = -cute.exp(r_A_log, fastmath=True) * sp_x
             r_g_arr[i_t] = cute.exp(r_g_value, fastmath=True)
             r_beta_value = cutlass.Float32(1.0) / (
@@ -3268,7 +3243,7 @@ def run_mtp_decode(
                     cache_replayssm=cache_replayssm,
                     stream=stream,
                 ),
-                extra_key_files=(__file__,),
+                extra_key_files=(__file__, _softplus.__file__),
             )
         else:
             compiled = build_and_load_cute_dsl_kernel(
@@ -3320,7 +3295,7 @@ def run_mtp_decode(
                     cache_replayssm=cache_replayssm,
                     stream=stream,
                 ),
-                extra_key_files=(__file__,),
+                extra_key_files=(__file__, _softplus.__file__),
             )
         cache["compiled"] = compiled
     else:

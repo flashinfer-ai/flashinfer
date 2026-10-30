@@ -168,9 +168,10 @@ import contextlib
 import functools
 import math
 import re
+import struct
 from collections import OrderedDict
 from dataclasses import dataclass, field, replace
-from typing import Any, Callable, Optional, Union
+from typing import Any, Callable, NamedTuple, Optional, Union
 
 import torch
 
@@ -1998,6 +1999,13 @@ class Problem:
         return MODE_CE if self.objective == "ce" else MODE_POLICY
 
 
+def _assert_on_device(condition: torch.Tensor, message: str) -> None:
+    try:
+        torch._assert_async(condition, message)
+    except TypeError:  # a PyTorch without the message argument
+        torch._assert_async(condition)
+
+
 def _positive_scalar(value, name: str) -> float:
     if isinstance(value, torch.Tensor):
         if value.numel() != 1:
@@ -2013,6 +2021,147 @@ def _positive_scalar(value, name: str) -> float:
     if not math.isfinite(value) or value <= 0.0:
         raise ValueError(f"{name} must be a positive finite number, got {value!r}")
     return value
+
+
+class _Temperature(NamedTuple):
+    """A validated temperature (:func:`_resolve_temperature`): ``kind`` ``"scalar"`` with ``value`` the FP32 value as
+    a Python float, or ``"tensor"`` with ``value`` the caller's FP32 ``[T]`` tensor (contiguous).  Passed on as is by
+    a later :func:`_resolve_temperature` of the same call (no second check)."""
+
+    kind: str
+    value: Any
+
+
+# ``_resolve_temperature`` results: ``None`` (the default path, no temperature) or a :class:`_Temperature`.
+TemperatureForm = Optional[_Temperature]
+
+
+def _fp32(value: float) -> float:
+    """``value`` rounded once to FP32 (round to nearest even), as a Python float; ``OverflowError`` past FP32's
+    range."""
+    return struct.unpack("f", struct.pack("f", value))[0]
+
+
+def _resolve_temperature(
+    temperature, T: int, device: torch.device, *, check: bool = False
+) -> TemperatureForm:
+    """Validate the ``temperature`` keyword of the log-probability entry for a call of ``T`` rows on ``device`` and
+    return its form: ``None`` for the default path (no temperature, or a scalar whose FP32 value is exactly 1.0: the
+    call runs the path without a temperature, bitwise today's), ``_Temperature("scalar", s)`` (``s`` the FP32 value as
+    a Python float) or ``_Temperature("tensor", tau)`` (the per-token FP32 ``[T]`` tensor, made contiguous: a copy
+    keeps the bits).  An already resolved :class:`_Temperature` is returned as is (its tensor's shape and device are
+    checked again; its values are not).
+
+    * A Python ``int`` / ``float`` or a 0-dim CPU tensor: a positive finite number whose FP32 rounding is still
+      positive and finite (no underflow to 0, no overflow to inf); ``bool`` is rejected.  A 0-dim CUDA tensor is
+      rejected (reading it would synchronize).
+    * A 1-D tensor: ``float32``, shape ``(T,)``, on ``device``; any stride.  Every entry -- ignored rows included --
+      must be positive and finite.  On CUDA the values are checked by a device-side assertion queued before every
+      kernel that reads them (no host synchronization; like a wrong ``num_valid_rows``, a failing assertion ends the
+      CUDA context); ``check=True`` reads the check back once and raises ``ValueError`` instead.  CPU tensors are
+      checked on the host.
+    * A tensor with ``requires_grad=True`` is rejected: the temperature is not differentiable (pass
+      ``temperature.detach()``).
+    * Anything else is a ``ValueError``.
+    """
+    if temperature is None:
+        return None
+    if type(temperature) in (float, int) and temperature == 1:
+        return None  # the default value (``bool`` is not ``int`` here)
+    if isinstance(temperature, _Temperature):  # resolved earlier in the same call
+        if temperature.kind == "tensor" and (
+            tuple(temperature.value.shape) != (int(T),)
+            or temperature.value.device != device
+        ):
+            raise ValueError(
+                "the resolved temperature does not match the call's rows or device"
+            )
+        return temperature
+    if isinstance(temperature, torch.Tensor):
+        if temperature.requires_grad:
+            raise ValueError(
+                "temperature is not differentiable: pass temperature.detach() (a tensor with requires_grad=True was given)"
+            )
+        if temperature.ndim == 0:
+            if temperature.device.type != "cpu":
+                raise ValueError(
+                    "a scalar temperature must be a Python number or a CPU scalar: pass a Python number; reading a "
+                    f"{temperature.device.type} value would synchronize with the device"
+                )
+            value = _positive_scalar(temperature, "temperature")
+        elif temperature.ndim == 1:
+            if temperature.dtype != torch.float32:
+                raise ValueError(
+                    f"a per-token temperature must be a float32 tensor, got dtype {temperature.dtype}"
+                )
+            if int(temperature.shape[0]) != int(T):
+                raise ValueError(
+                    f"a per-token temperature must have shape ({int(T)},) (one value per row of X), got "
+                    f"{tuple(temperature.shape)}"
+                )
+            if temperature.device != device:
+                raise ValueError(
+                    f"a per-token temperature must be on X's device {device}, got {temperature.device}"
+                )
+            tau = temperature.contiguous()
+            if int(T) > 0:
+                # NaN fails ``> 0``, +inf fails ``< inf``
+                ok = (tau > 0) & (tau < math.inf)
+                if check or tau.device.type != "cuda":
+                    # the one synchronization of the checked path
+                    if not bool(ok.all()):
+                        raise ValueError(
+                            "temperature values must be positive and finite on every row (ignored rows included)"
+                        )
+                else:
+                    _assert_on_device(
+                        ok.all(),
+                        "temperature values must be positive and finite on every row (ignored rows included)",
+                    )
+            return _Temperature("tensor", tau)
+        else:
+            raise ValueError(
+                f"temperature must be a number or a float32 [T] tensor, got a tensor of shape {tuple(temperature.shape)}"
+            )
+    elif isinstance(temperature, bool) or not isinstance(temperature, (int, float)):
+        raise ValueError(
+            "temperature must be a positive number or a float32 [T] tensor, got "
+            f"{type(temperature).__name__}"
+        )
+    else:
+        try:
+            value = _positive_scalar(temperature, "temperature")
+        except OverflowError:  # an int past the float range
+            raise ValueError(
+                "temperature is not a positive finite FP32 number (an int too large for a float)"
+            ) from None
+    try:
+        s = _fp32(value)
+    except OverflowError:
+        s = math.inf
+    if not 0.0 < s < math.inf:
+        raise ValueError(
+            f"temperature {value!r} is not a positive finite FP32 number (it rounds to {s!r})"
+        )
+    return None if s == 1.0 else _Temperature("scalar", s)
+
+
+def _temperature_rows(
+    form: TemperatureForm,
+    row_index: Optional[torch.Tensor],
+    rows: int,
+    device: torch.device,
+) -> Optional[torch.Tensor]:
+    """The compact FP32 ``[rows]`` temperature the kernels read at ``row0 + r`` (``None`` for the default path): the
+    caller's ``[T]`` tensor itself when the chunk loop is not compacted, its ``index_select`` by ``row_index`` when it
+    is; ``torch.full`` of the FP32 value for a scalar (the same bits in every row, so a scalar ``s`` and
+    ``torch.full((T,), s)`` run the same kernels on the same operands)."""
+    if form is None:
+        return None
+    kind, value = form
+    if kind == "scalar":
+        return torch.full((int(rows),), value, dtype=torch.float32, device=device)
+    return value if row_index is None else value.index_select(0, row_index)
 
 
 def validate_lm_head_inputs(

@@ -74,6 +74,72 @@ def test_materializes_all_matching_candidates(monkeypatch, candidates, quant_pai
             assert preparer.call_args.kwargs["quant"] is cfg.quant
 
 
+def test_materializes_trtllm_fp8_block_view(monkeypatch):
+    import dataclasses
+    from unittest.mock import Mock
+
+    import torch
+
+    from flashinfer.fused_moe.api import (
+        BackendOptions,
+        QuantConfig,
+        QuantFormat,
+        TrtllmFp8BlockConfig,
+    )
+    from flashinfer.moe_ep import MoEWeightPack
+    from flashinfer.moe_ep.backends.split.kernel.fused_moe.weights import (
+        materialize_fused_moe_weights,
+    )
+
+    preparer = Mock(return_value={"weight": torch.tensor([0])})
+    monkeypatch.setattr(TrtllmFp8BlockConfig, "prepare_weights", preparer)
+    cfg = dataclasses.replace(
+        _nvfp4_moe_config(
+            num_experts=8, local_num_experts=2, offset=2, intermediate=128
+        ),
+        quant=QuantConfig(
+            weight=QuantFormat.DeepSeekFp8, activation=QuantFormat.DeepSeekFp8
+        ),
+        backend=BackendOptions(
+            candidates=(TrtllmFp8BlockConfig(), TrtllmFp8BlockConfig())
+        ),
+    )
+    weights = MoEWeightPack(
+        w13=torch.empty(2, 256, 256, dtype=torch.bfloat16),
+        w2=torch.empty(2, 256, 128, dtype=torch.bfloat16),
+    )
+    pack = materialize_fused_moe_weights(weights, cfg)
+    assert set(pack.native_views) == {"trtllm_fp8_block"}
+    assert pack.get_view("trtllm_fp8_block") is preparer.return_value
+    preparer.assert_called_once()
+    assert preparer.call_args.args[0] is weights.w13
+    assert preparer.call_args.args[1] is weights.w2
+    assert preparer.call_args.kwargs["num_local_experts"] == 2
+    assert preparer.call_args.kwargs["quant"] is cfg.quant
+
+
+def test_prequantized_weights_raise():
+    import torch
+
+    from flashinfer.moe_ep import MoEWeightPack, PrequantizedMoEWeights
+    from flashinfer.moe_ep.backends.split.kernel.fused_moe.weights import (
+        materialize_fused_moe_weights,
+    )
+
+    weights = MoEWeightPack(
+        w13=torch.empty(2, 256, 128, dtype=torch.uint8),
+        w2=torch.empty(2, 256, 64, dtype=torch.uint8),
+        w13_scale=torch.empty(2, 256, 16, dtype=torch.uint8),
+        w2_scale=torch.empty(2, 256, 8, dtype=torch.uint8),
+    )
+    assert isinstance(weights, PrequantizedMoEWeights)
+    cfg = _nvfp4_moe_config(
+        num_experts=8, local_num_experts=2, offset=2, intermediate=128
+    )
+    with pytest.raises(NotImplementedError, match="PrequantizedMoEWeights"):
+        materialize_fused_moe_weights(weights, cfg)
+
+
 def _bf16_moe_config(
     *,
     num_experts,

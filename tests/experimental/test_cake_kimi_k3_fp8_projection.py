@@ -126,7 +126,7 @@ GPU_ROWS = [
     ("tp1", "in_proj_qkvgfab", 256, 0),
     ("tp8", "kv_a", 16384, 0),
     # Round 8: the register-epilogue fallback of TMA-store cells on an 8-byte-aligned output
-    # stride (sm_100a 12,1,512; 96,28,64 on both architectures; no padded-stride contract row
+    # stride (12,1,512 and 96,28,64 on both architectures; no padded-stride contract row
     # lies in these buckets, so the export covers the fallback programs with correctness-only
     # coverage shapes). Where the cell is not a TMA-store cell the row is a plain
     # unaligned-stride decode row.
@@ -609,6 +609,107 @@ def _family_weight(tp, module, seed=2106):
     )
 
 
+def test_view_bn_range_keeps_its_staged_and_register_views(monkeypatch):
+    """Round 12 F (lever VIEW-BN): rows M 497..512 of the sm_103a 96,28,512 cell (tp1:q_proj; an in-bucket range,
+    ``DECODE_TABLE_M_RANGES``) take the 352-wide TMA-store program and, on that view only, the quantization launch's
+    ``_xef_qel`` twin (``tstore_twins``); their staged-register view (8-byte row stride) keeps the 384-wide staged-register
+    program (``gemm_rstaged_bn`` 384) and their register-epilogue view the 256-wide ``gemm`` program, both beside the plain
+    quantization program -- the cell's own programs, which its rows M 257..496 keep on every view.  The sm_100a cell keeps
+    its cell-wide twin and the 256-wide staged-register program.  The keys work the same on a whole cell, and a
+    ``gemm_rstaged_bn`` that names no program beside its row's ``gemm_bn`` is refused (also by ``required_kernel_keys``,
+    at build time).  The registry is stubbed."""
+    monkeypatch.setattr(cb, "route_available", lambda arch, keys: True)
+    monkeypatch.setattr(cb, "kernel_program", lambda arch, key: (key, ()))
+    q = _family_weight("tp1", "q_proj")
+    assert (q.n_tiles128, q.num_k_iters) == (96, 28)
+    table = decode_table("sm_103a")
+    assert table["96,28,512"] == {"route": "gemm", "gemm_bn": 384}
+    ((lo, hi, entry),) = cb.cell_m_ranges("sm_103a")["96,28,512"]
+    assert (lo, hi) == (497, 512)
+    assert entry["gemm_bn"] == 352 and cb.gemm_rstaged_block_n(entry) == 384
+    assert cb.entry_tstore_twins(entry) == {"quant:u4": "quant:u4_xef_qel"}
+    assert cb.gemm_rstaged_block_n(table["96,28,512"]) == 256
+    assert cb.gemm_rstaged_block_n(decode_table("sm_100a")["96,28,512"]) == 256
+    assert cb.entry_tstore_twins(decode_table("sm_100a")["96,28,512"]) == {}
+    staged = dict(gemm_tma_store=False, gemm_reg_staged=True)
+    register = dict(gemm_tma_store=False, gemm_reg_staged=False)
+
+    def views(M, arch):
+        return tuple(
+            cb.route_plan(q, M, arch, SM_COUNT, None, **view)
+            for view in ({}, staged, register)
+        )
+
+    def quant_of(M):
+        return cb.quant_kernel_key(cb.launch_quant_units(M, q.K // BLOCK, 0, SM_COUNT))
+
+    # the rows below cover both quantization widths of the bucket (the plain ``u2`` rows take no twin)
+    assert {quant_of(M) for M in (338, 339)} == {"quant:u2", "quant:u4"}
+    for M in (257, 300, 338, 339, 496, 497, 500, 511, 512):
+        quant = quant_of(M)
+        twin = quant + "_xef_qel" if quant == "quant:u4" else quant
+        tplan, splan, rplan = views(M, "sm_103a")
+        if M >= 497:
+            assert tplan.kernels == (twin, "gemm_tstore_n352_k128"), (M, tplan.kernels)
+            assert (tplan.gemm_bn, tplan.gemm_n_tiles, tplan.gemm_bk) == (352, 35, 128)
+        else:
+            assert tplan.kernels == (quant, "gemm_tstore_n384_k128"), (M, tplan.kernels)
+            assert (tplan.gemm_bn, tplan.gemm_n_tiles) == (384, 32)
+        assert splan.kernels == (quant, "gemm_rstaged_n384_k128"), (M, splan.kernels)
+        assert (splan.gemm_bn, splan.gemm_n_tiles, splan.gemm_bk) == (384, 32, 128)
+        assert rplan.kernels == (quant, "gemm") and rplan.gemm_bn == 256, rplan.kernels
+        assert [p.kernels for p in views(M, "sm_100a")] == [
+            (twin, "gemm_tstore_n352_k128"),
+            (twin, "gemm_rstaged"),
+            (twin, "gemm"),
+        ], M
+    # rows outside the range name no view twin: every view takes the cell's own twins
+    for M in (256, 496, 513, 1024):
+        assert cb.route_twin_keys(
+            ["quant:u4"], M, 96, 28, "sm_103a", tma_store=True
+        ) == cb.route_twin_keys(["quant:u4"], M, 96, 28, "sm_103a")
+    assert {"gemm_tstore_n352_k128", "quant:u4_xef_qel"} <= set(
+        cb.required_kernel_keys("sm_103a", SM_COUNT)
+    )
+    for bad in (
+        {"route": "gemm", "gemm_rstaged_bn": 384},
+        {"route": "gemm", "gemm_bn": 384, "gemm_rstaged_bn": 384},
+        {"route": "gemm", "gemm_bn": 224, "gemm_rstaged_bn": 384},
+        {"route": "gemm", "gemm_bn": 352, "gemm_rstaged_bn": 352},
+        {"route": "gemm", "gemm_bn": 352, "gemm_rstaged_bn": 256},
+    ):
+        with pytest.raises(ValueError, match="gemm_rstaged_bn"):
+            cb.gemm_rstaged_block_n(bad)
+    with pytest.raises(ValueError, match="tstore_twins"):
+        cb.entry_tstore_twins({"route": "gemm", "tstore_twins": ["quant:u4"]})
+    with monkeypatch.context() as mp:
+        mp.setattr(
+            cb,
+            "decode_table",
+            lambda arch: {
+                **table,
+                "96,28,512": {"route": "gemm", "gemm_bn": 384, "gemm_rstaged_bn": 384},
+            },
+        )
+        with pytest.raises(ValueError, match="gemm_rstaged_bn"):
+            cb.required_kernel_keys("sm_103a", SM_COUNT)
+    # the same keys on the whole cell (no range): every row of the bucket takes them
+    with monkeypatch.context() as mp:
+        mp.setattr(cb, "decode_table", lambda arch: {**table, "96,28,512": entry})
+        mp.setattr(cb, "decode_table_m_ranges", lambda arch: {})
+        cb.cell_m_ranges.cache_clear()
+        try:
+            for M in (257, 496):
+                tplan, splan, _ = views(M, "sm_103a")
+                assert tplan.kernels[-1] == "gemm_tstore_n352_k128", tplan.kernels
+                assert splan.kernels[-1] == "gemm_rstaged_n384_k128", splan.kernels
+            assert {"gemm_tstore_n352_k128", "quant:u4_xef_qel"} <= set(
+                cb.required_kernel_keys("sm_103a", SM_COUNT)
+            )
+        finally:
+            cb.cell_m_ranges.cache_clear()
+
+
 _RECORD_K128 = {"route": "gemm", "gemm_bk": 128}
 _RSKF = {"route": "gemm", "gemm_bk": 128, "gemm_skf": 1, "gemm_rstaged_skf": 1}
 _ARS = {"route": "gemm", "gemm_bk": 128, "gemm_gs": 1, "gemm_ars": 1}
@@ -663,7 +764,8 @@ def test_m_ranges_route_both_sides_of_each_edge(monkeypatch, arch):
     ``lo..hi`` take the range's entry, the cell's other rows keep the cell's entry.  sm_100a: tp8:in_proj_qkvgfab takes
     the staged-register fix-up stream-K program (lever RSKF) on M 1281..2048 and on the 4096 bucket outside 3329..3584, and
     tp1:kv_b takes the A-resident grid-stride program (lever ARS) on M 1281..2048.  sm_103a (round 12 E): RSKF on M
-    1537..2048, ARS on the 16384 bucket's M 4097..12288 and 16384.  Each row on both sides of each edge
+    1537..2048, ARS on the 16384 bucket's M 4097..12288 and 16384; round 12 F: VIEW-BN on 96,28,512 rows M 497..512
+    (``test_view_bn_range_keeps_its_staged_and_register_views``).  Each row on both sides of each edge
     resolves to its entry and launches that entry's program; with the batch-4 programs unregistered the rows fall back to
     the record's programs.  The registry is stubbed, so the host rules are checked whether or not this checkout registers
     the programs."""
@@ -680,6 +782,7 @@ def test_m_ranges_route_both_sides_of_each_edge(monkeypatch, arch):
         },
         "sm_103a": {
             "50,28,2048": ((1537, 2048),),
+            "96,28,512": ((497, 512),),
             "192,2,16384": ((4097, 12288), (16384, 16384)),
         },
     }[arch]
@@ -897,7 +1000,11 @@ def test_batch4_entry_rules_and_required_keys(monkeypatch):
     assert cb._cell_segments("sm_100a", "50,28,1", table["50,28,1"]) == (
         (table["50,28,1"], (1,)),
     )
-    assert set(cb.cell_m_ranges("sm_103a")) == {"50,28,2048", "192,2,16384"}
+    assert set(cb.cell_m_ranges("sm_103a")) == {
+        "50,28,2048",
+        "96,28,512",
+        "192,2,16384",
+    }
     assert cb.cell_m_ranges("sm_90a") == {}
     required = {arch: set(required_kernel_keys(arch, SM_COUNT)) for arch in ARCHES}
     assert required["sm_100a"] >= _BATCH4_KEYS
@@ -1400,7 +1507,8 @@ def test_decode_config_round6_continuation_rules(arch):
     # which has no TMA-store epilogue, so its ``tstore`` flag is 0 (27 / 28).  Round 10 (S1): the sm_103a 5,28,2048 cell
     # moved to the cluster split-K GEMM route (``gemm_cs`` 2), leaving the decode table (27 / 27).  Round 12: the sm_100a
     # 18,6,2048 cell (tp8:q_b:2048) left the GEMM route for the persistent decode with the TMA-store epilogue (28 / 27).
-    assert n_tstore == {"sm_100a": 28, "sm_103a": 27}[arch]
+    # The sm_103a 12,1,512 cell then took the shared 12,1,256 entry, a TMA-store decode route (28 / 28).
+    assert n_tstore == {"sm_100a": 28, "sm_103a": 28}[arch]
     # Round-6 next loop (lever PX-S): eight small fused buckets per architecture prefetch their BF16 token tile one stage
     # ahead of its TMA load (``pfx: 1`` -> the ``_px1`` program); a prefetch changes no data path and no launch argument.
     n_pfx = 0
@@ -1563,7 +1671,8 @@ def test_decode_config_round6_continuation_rules(arch):
     # ``gemm_bk`` 128 + ``gemm_gs`` 1) take the 224-wide tile (32 tiles of 224 = 7168 columns, no padded column; B200 kernel-level
     # paired 1.0903 / 1.0291, 8/8 rounds, bit-identical) and the sm_100a 96,28,512 cell (tp1 q_proj, N = 12288) the 352-wide
     # tile (35 tiles, the last one 320 columns wide instead of the 384-wide tile's 96 padded columns; 1.0273 8/8, bit-identical);
-    # both TMA-store only, sm_103a keeps its cells.
+    # both TMA-store only, sm_103a keeps its cells (round 12 F, lever VIEW-BN: its 96,28,512 rows M 497..512 take the 352-wide
+    # tile on their TMA-store view through ``DECODE_TABLE_M_RANGES``, the staged-register view keeping the 384-wide program).
     n224 = {k for k, e in narrow.items() if e["gemm_bn"] == 224}
     n352 = {k for k, e in narrow.items() if e["gemm_bn"] == 352}
     assert n224 == {"sm_100a": {"56,48,512", "56,6,512"}, "sm_103a": set()}[arch]
@@ -1653,13 +1762,12 @@ def test_decode_config_round6_continuation_rules(arch):
             for k in ("gemm_pf", "gemm_sk", "gemm_skf", "gemm_sks", "gemm_skp")
         )
         assert cb.gemm_n384_cell_conflicts(cell) == []
+    # the 512 bucket (M 257-512) is one cell; on sm_103a its rows M 497..512 take the 352-wide range (round 12 F)
+    assert cb.gemm_block_n(512, 96, 28, arch, 12288, 12288) == 352
     assert (
-        cb.gemm_block_n(512, 96, 28, arch, 12288, 12288)
+        cb.gemm_block_n(384, 96, 28, arch, 12288, 12288)
         == {"sm_100a": 352, "sm_103a": 384}[arch]
     )
-    assert cb.gemm_block_n(384, 96, 28, arch, 12288, 12288) == cb.gemm_block_n(
-        512, 96, 28, arch, 12288, 12288
-    )  # the 512 bucket (M 257-512) is one cell
     # the sm_103a fused_qkvg M 1024 cell is 192-wide since 33aeb5c35 (was 384)
     assert cb.gemm_block_n(1024, 48, 28, arch, 6144, 6144) == 192
     assert (
@@ -1835,7 +1943,8 @@ def test_decode_config_round6_continuation_rules(arch):
     # Round 12 batch 4 (lever ARS): the sm_100a 192,2,1024 / 192,2,4096 / 192,2,16384 cells (tp1:kv_b) launch the A-resident
     # form of the 256-wide ``_gs`` program (``gemm_ars`` 1 next to ``gemm_gs`` 1; the 192,2,2048 cell takes it for M > 1280 only,
     # through ``DECODE_TABLE_M_RANGES``).  Round 12 D: the sm_103a 96,1,512 cell (tp1:f_b:512) takes the 192-wide ``_gs`` form and
-    # its ``_ts3_tde_prg`` twin.
+    # its ``_ts3_tde_prg`` twin.  Round 12 F: so does the sm_103a 192,2,256 cell (tp1:kv_b:256), and the sm_103a 12,1,4096 cell
+    # (tp8:f_b:4096) launches the same twin of its ``_gs`` program.
     gs_rows = {k for k, e in decode_table(arch).items() if e.get("gemm_gs")}
     assert (
         gs_rows
@@ -1862,6 +1971,7 @@ def test_decode_config_round6_continuation_rules(arch):
                 "24,2,2048",
                 "12,1,2048",
                 "18,6,2048",
+                "192,2,256",
             },
         }[arch]
     )
@@ -1980,7 +2090,8 @@ def test_decode_config_round6_continuation_rules(arch):
     # the 384-wide programs the adopted cells launch: always the ``_k128`` TMA-store form on these 16-byte-aligned
     # column edges; the staged-register form only where the cell's bucket carries 8-byte-stride correctness rows
     assert "gemm_tstore_n384_k128" in required
-    # round 12: the 224- and 352-wide programs of the sm_100a cells, TMA store only (``gemm_bn_rstaged``)
+    # round 12: the 224- and 352-wide programs of the sm_100a cells (round 12 F: and of the sm_103a 96,28,512 rows M
+    # 497..512), TMA store only (``gemm_bn_rstaged``)
     assert {
         k for k in required if k.startswith(("gemm_tstore_n224", "gemm_tstore_n352"))
     } == {
@@ -1989,7 +2100,7 @@ def test_decode_config_round6_continuation_rules(arch):
             "gemm_tstore_n224_k128_gs",
             "gemm_tstore_n352_k128",
         },
-        "sm_103a": set(),
+        "sm_103a": {"gemm_tstore_n352_k128"},
     }[arch]
     assert not any(
         k.startswith(("gemm_rstaged_n224", "gemm_rstaged_n352")) for k in required
@@ -2401,7 +2512,8 @@ def test_route_twins_are_registered_hint_instances(arch):
     # 192-wide 128-K TMA-store GEMM program (cluster launch control or grid-stride) or the MMA-warp TMEM allocation
     # form ``_prg`` of a TMA-store GEMM program, or (round 12 E) the early-TMEM-free form ``_tde`` of the two-stage
     # four-slot four-tile-prefetch TMA-store GEMM program or both, ``_ts3_tde_prg``, of the 192-wide 128-K
-    # grid-stride program -- on the architecture
+    # grid-stride program, or (round 12 F) both, ``_tde_prg``, of the two-stage four-slot 128-K TMA-store GEMM
+    # program -- on the architecture
     # the twin was measured on; the twin is a required key, its program is registered for that architecture once
     # generated, and a quantization twin compiles at its plain key's width.
     required = set(required_kernel_keys(arch, SM_COUNT))
@@ -2427,6 +2539,7 @@ def test_route_twins_are_registered_hint_instances(arch):
                 or (suffix == "_prg" and key.startswith("gemm_tstore_"))
                 or (suffix == "_tde" and key == "gemm_tstore_s2_ts4_pf4")
                 or (suffix == "_ts3_tde_prg" and key == "gemm_tstore_n192_k128_gs")
+                or (suffix == "_tde_prg" and key == "gemm_tstore_k128_s2_ts4")
             ), (cell, key, twin)
             if sko:
                 assert int(cell.split(",")[2]) <= int(sko.group(1)), (cell, twin)
@@ -2608,21 +2721,29 @@ def test_projection_matches_reference(tp, module, M, stride_pad):
     )
     plan = runner.plan
     assert plan.route in ("decode", "gemm")
-    # The launched keys are the selected ones with the cell's route twins in place (``route_twin_keys``); the rest of the
-    # test checks the selected keys.
+    # The launched keys are the selected ones with the cell's route twins in place (``route_twin_keys``; round 12 F: on a
+    # TMA-store output view the row's ``tstore_twins`` too); the rest of the test checks the selected keys.
+    aligned = cb.gemm_tma_store_eligible(
+        _out.data_ptr(), _out.stride(0), _prepared.n_valid
+    )
+    view_twins = cb.entry_tstore_twins(
+        cb.decode_table_entry(M, _prepared.n_tiles128, _prepared.num_k_iters, plan.arch)
+    )
     twin_of = {
         twin: key
-        for pairs in route_twins(plan.arch).values()
+        for pairs in (*route_twins(plan.arch).values(), view_twins if aligned else {})
         for key, twin in pairs.items()
     }
     selected = [twin_of.get(k, k) for k in plan.kernels]
     assert tuple(plan.kernels) == cb.route_twin_keys(
-        selected, M, _prepared.n_tiles128, _prepared.num_k_iters, plan.arch
+        selected,
+        M,
+        _prepared.n_tiles128,
+        _prepared.num_k_iters,
+        plan.arch,
+        tma_store=aligned,
     )
     if plan.route == "gemm":
-        aligned = cb.gemm_tma_store_eligible(
-            _out.data_ptr(), _out.stride(0), _prepared.n_valid
-        )
         # Round 5: 8-byte-aligned (but not TMA-store-eligible) output rows take the staged register epilogue.
         staged = cb.gemm_reg_staged_eligible(
             aligned, cb._store_vec(_out.data_ptr(), _out.stride(0))

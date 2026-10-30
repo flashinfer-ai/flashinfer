@@ -96,7 +96,7 @@ from .cake_jit import (
     PROGRAM_KEYS,
     PROGRAMS,
     STAGES,
-    TICKET_TAIL_PROGRAMS,
+    TICKET_TAIL_ARCHES,
     TRACKING_ISSUE,
     load_program,
 )
@@ -736,9 +736,22 @@ class DSAIndexerRunner:
     workspace: torch.Tensor = field(default=None, repr=False)
     workspace_bytes: int = 0
     grid: tuple[int, int, int] = (1, 1, 1)
-    # the workspace's 128-byte ticket tail, zeroed before every run of a dynamic-ticket
-    # scan program (``TICKET_TAIL_PROGRAMS``); None for the other programs
+    # the workspace's ticket tail on the ticket architectures (``TICKET_TAIL_ARCHES``;
+    # None on sm_107a).  Invariant: the ticket word reads 0 when a scan launches.  Every scan
+    # launch that completes leaves the word at 0 (the kernel's end-of-launch reset, which
+    # kernel-tests check as the output ``ticket_word`` on every ticket-drawing config).
+    # Backend-owned workspace (no ``workspace_buffer`` passed to prepare): nothing else writes
+    # the tail, so it is zeroed once, when the runner is prepared; ``run()`` issues no memset
+    # and a CUDA graph capturing it carries none.  Caller-owned workspace (``_tail_shared``):
+    # the buffer may be written between two runs by another runner of a different geometry
+    # (its candidate region covers this tail) or by any other kernel the caller lends it to,
+    # so ``run()`` zeroes the tail before every launch sequence, on the current stream; a
+    # graph capturing it carries that memset node.  A ``run()`` that raised while launching
+    # may have left the word non-zero: it marks the tail dirty and the next ``run()`` zeroes
+    # it first.
     ticket_tail: Optional[torch.Tensor] = field(default=None, repr=False)
+    _tail_shared: bool = field(default=False, repr=False)
+    _tail_dirty: bool = field(default=False, repr=False)
 
     @property
     def indices(self) -> torch.Tensor:
@@ -762,12 +775,17 @@ class DSAIndexerRunner:
 
     def run(self) -> tuple[torch.Tensor, torch.Tensor]:
         with _ffi_stream_context(self.device_index):
-            if self.ticket_tail is not None:
-                # the ticket word must read 0 when the scan starts: one 128-byte memset on
-                # the stream (CUDA-graph capturable), only for the dynamic-ticket programs
+            if self.ticket_tail is not None and (self._tail_dirty or self._tail_shared):
+                # caller-owned workspace: others may have written the tail since the last run;
+                # or a previous run raised while launching.  Restore the ticket word before the scan.
                 self.ticket_tail.zero_()
-            for launch in self.launches:
-                launch()
+                self._tail_dirty = False
+            try:
+                for launch in self.launches:
+                    launch()
+            except BaseException:
+                self._tail_dirty = self.ticket_tail is not None
+                raise
         return self.tensors["Indices"], self.tensors["Scores"]
 
     __call__ = run
@@ -820,9 +838,13 @@ def prepare_dsa_indexer_topk(
     Missing outputs and the workspace are allocated here (the only allocations
     of the backend).  Pass ``workspace_buffer`` of at least
     :func:`dsa_indexer_workspace_size` bytes for the call's geometry (same
-    ``grid_ctas`` / ``candidate_multiplier``) to reuse storage across calls;
-    ``indices`` / ``scores`` may be caller-owned ``[T, top_k]`` int32 / float32
-    tensors.
+    ``grid_ctas`` / ``candidate_multiplier``) to reuse storage across calls.
+    A caller-owned buffer may be written by other runners or kernels between
+    two runs of the returned runner, so on the ticket architectures the runner
+    zeroes the buffer's ticket word before every run (one small memset on the
+    current stream, captured into a CUDA graph with the launches); the
+    backend-owned workspace is zeroed once, here.  ``indices`` / ``scores`` may
+    be caller-owned ``[T, top_k]`` int32 / float32 tensors.
 
     The keyword-only knobs ``grid_ctas`` (persistent CTA count; default: the SM
     count), ``candidate_multiplier`` (candidate buffer per query in multiples
@@ -907,6 +929,7 @@ def prepare_dsa_indexer_topk(
     if choice.merge_key is not None:
         programs["merge"] = program_for(arch, choice.merge_key)
     workspace_bytes = int(choice.workspace_bytes)
+    caller_owned_workspace = workspace_buffer is not None
     if workspace_buffer is None:
         workspace_buffer = torch.empty(
             workspace_bytes, dtype=torch.uint8, device=device
@@ -986,12 +1009,17 @@ def prepare_dsa_indexer_topk(
         stages.append(fin_role)
     elif num_queries > 0:
         _padded_outputs(num_queries, int(top_k), device, t["Indices"], t["Scores"])
-    # the dynamic-ticket programs read their next unit from the workspace's 128-byte
-    # tail (behind the candidate buffers and the staging); the runner zeroes it before
-    # every run.  Other programs: no tail view, nothing zeroed.
+    # on sm_100a / sm_103a the scan program draws every work unit from the workspace's
+    # ticket tail (behind the candidate buffers and the staging).  Zeroed here once; every
+    # completed scan launch resets the word to 0.  Backend-owned workspace: that is the only
+    # memset, a run adds none.  Caller-owned ``workspace_buffer``: the buffer may be written
+    # between runs by others (another runner's candidate region, any kernel it is lent to),
+    # so the runner zeroes the tail again before every run (see ``DSAIndexerRunner.ticket_tail``).
+    # sm_107a: no tail view, nothing zeroed.
     ticket_tail = None
-    if launches and arch in TICKET_TAIL_PROGRAMS.get(programs["scan"], ()):
+    if launches and arch in TICKET_TAIL_ARCHES:
         ticket_tail = flat[workspace_bytes - TICKET_TAIL_BYTES : workspace_bytes]
+        ticket_tail.zero_()
     return DSAIndexerRunner(
         arch=arch,
         abi=abi,
@@ -1006,6 +1034,7 @@ def prepare_dsa_indexer_topk(
         workspace_bytes=workspace_bytes,
         grid=grid,
         ticket_tail=ticket_tail,
+        _tail_shared=caller_owned_workspace and ticket_tail is not None,
     )
 
 

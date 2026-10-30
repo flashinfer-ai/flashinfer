@@ -27,6 +27,12 @@ class SplitKernelContext:
     fleet_params: "FleetParams"
     recv_topk_idx: Optional["torch.Tensor"] = None
     recv_topk_weights: Optional["torch.Tensor"] = None
+    # Id space of ``recv_topk_idx``. True: GLOBAL expert ids, as the
+    # MoEEpCommunication transports deliver them; picks outside this rank's
+    # local expert range (another rank's experts, ``invalid_expert_id``) are
+    # for the kernel to skip. False: ids local to this rank, with -1 for picks
+    # it does not own, as the Fleet/Handle transports deliver them.
+    recv_topk_idx_global: bool = False
     recv_count: Optional["torch.Tensor"] = None
     # Per-token scale factors of ``expert_tensors`` when the tokens were
     # quantized before dispatch (see SplitKernelBackend.dispatch_format), one
@@ -107,6 +113,11 @@ class SplitKernelBackend(ABC):
 
     @abstractmethod
     def compute(self, ctx: SplitKernelContext) -> "torch.Tensor": ...
+
+    def destroy(self) -> None:  # noqa: B027 - intentional no-op default
+        """Drop per-forward state, which may reference the transport's
+        receive buffers. The layer calls this before it destroys the
+        transport, whose buffers must not outlive it."""
 
 
 class MegaKernelBackend(ABC):

@@ -9888,7 +9888,20 @@
             "sm_103a": "cake_deepgemm_dense_mqa_ba46ef67d3b7ac822e84"
           }
         ]
-      ]
+      ],
+      "stage_buckets": {
+        "sm_103a": [
+          {
+            "kv_max": 8192,
+            "stages": [
+              [
+                "logits",
+                "cake_deepgemm_dense_mqa_7e6cf50843b200ed72f7"
+              ]
+            ]
+          }
+        ]
+      }
     },
     "fp8:h64:full:short": {
       "block_q": 2,

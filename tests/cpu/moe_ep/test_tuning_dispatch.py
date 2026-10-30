@@ -63,6 +63,30 @@ def test_tuner_dispatch(arch, dtype, backend, dispatched):
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize("dtype", ["nvfp4", "mxfp8_e4m3", "mxfp8_e5m2", "mxfp4_mxfp8"])
+@pytest.mark.parametrize("implementation", ["default", "next"])
+def test_blackwell_genphase_dtype_dispatch(dtype, implementation, dispatched):
+    assert (
+        tune.main(
+            [
+                *_GEOMETRY,
+                "--arch",
+                "sm100",
+                "--dtype",
+                dtype,
+                "--kernel-variant",
+                "genphase",
+                "--implementation",
+                implementation,
+                "--no-apply-routing-weights-before-fc2",
+            ]
+        )
+        == 17
+    )
+    assert dispatched == [".backends.mega.kernel.sm100.next_tuning"]
+
+
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "options",
     [
@@ -211,9 +235,11 @@ def test_genphase_reaches_sm107_tuner(dispatched):
 
 
 @pytest.mark.cpu_only
-@pytest.mark.parametrize("arch", ["sm90", "sm100"])
-def test_genphase_rejects_other_architectures(arch, dispatched):
-    dtype = "sm90_fp8_e4m3" if arch == "sm90" else "nvfp4"
+@pytest.mark.parametrize(
+    "arch,dtype",
+    [("sm90", "sm90_fp8_e4m3"), ("sm100", "bf16"), ("sm100", "bf16_mxfp8_e4m3")],
+)
+def test_genphase_rejects_unsupported_dtypes(arch, dtype, dispatched):
     assert (
         tune.main(
             [

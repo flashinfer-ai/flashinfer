@@ -54,18 +54,22 @@ FLAG_DIRECT_OUT = cake_backend.FLAG_DIRECT_OUT
 FLAG_SEED_SINK = cake_backend.FLAG_SEED_SINK
 HEAD_DIM = cake_backend.HEAD_DIM
 ITEM_FIELDS = cake_backend.ITEM_FIELDS
+LONG_DECODE_RECORDS = cake_backend.LONG_DECODE_RECORDS
 MAX_SPLITS = cake_backend.MAX_SPLITS
 PAGE_SIZE = cake_backend.PAGE_SIZE
 QK_AHEAD_RECORD = cake_backend.QK_AHEAD_RECORD
 REDUCE_GENERAL_RECORD = cake_backend.REDUCE_GENERAL_RECORD
 REDUCE_HEADS_PER_CTA = cake_backend.REDUCE_HEADS_PER_CTA
+REVERSED_PIECE_TARGETS = cake_backend.REVERSED_PIECE_TARGETS
 ROW_BYTES = cake_backend.ROW_BYTES
 ROWS_PER_CTA = cake_backend.ROWS_PER_CTA
 ROWS_PER_TILE = cake_backend.ROWS_PER_TILE
 SF_ROW_BYTES = cake_backend.SF_ROW_BYTES
 SF_VEC = cake_backend.SF_VEC
 SHORT_EPI_RECORD = cake_backend.SHORT_EPI_RECORD
+SHORT_EPI_SPEC_RECORD = cake_backend.SHORT_EPI_SPEC_RECORD
 SHORT_RECORD = cake_backend.SHORT_RECORD
+SHORT_SPEC_RECORD = cake_backend.SHORT_SPEC_RECORD
 V_HALVES = cake_backend.V_HALVES
 XV_RECORD = cake_backend.XV_RECORD
 build_work_plan = cake_backend.build_work_plan
@@ -92,6 +96,16 @@ FURTHER_RECORDS = {
         "decode",
         cake_jit.ARCHES,
         {"short_rows": True, "epi_warp": True},
+    ),
+    SHORT_SPEC_RECORD: (
+        "decode",
+        cake_jit.ARCHES,
+        {"short_rows": True, "spec_uh": True},
+    ),
+    SHORT_EPI_SPEC_RECORD: (
+        "decode",
+        cake_jit.ARCHES,
+        {"short_rows": True, "epi_warp": True, "spec_uh": True},
     ),
     REDUCE_GENERAL_RECORD: ("reduce", cake_jit.ARCHES, {"general_splits": True}),
 }
@@ -176,30 +190,38 @@ def reference(
     return O.to(torch.bfloat16), LSE
 
 
-def make_inputs(kv_lens, num_heads, *, q_len, enable_sink, device, seed=0):
-    """Deterministic NVFP4 paged decode inputs with a peaked softmax."""
-    gen = torch.Generator(device=device).manual_seed(seed)
+def make_inputs(
+    kv_lens, num_heads, *, q_len, enable_sink, device, seed=0, rng_device=None
+):
+    """Deterministic NVFP4 paged decode inputs with a peaked softmax.
+
+    ``rng_device="cpu"`` draws them on the host, so every GPU sees the same
+    inputs (a CUDA generator's stream depends on the device's SM count)."""
+    rng = rng_device or device
+    gen = torch.Generator(device=rng).manual_seed(seed)
     batch = len(kv_lens)
     pages_per_seq = [kv_pages(kv) for kv in kv_lens]
     total_pages = sum(pages_per_seq)
     max_pages = max(pages_per_seq)
     k_full = torch.randn(
-        (total_pages, PAGE_SIZE, HEAD_DIM), generator=gen, device=device
-    )
-    permutation = torch.randperm(total_pages, generator=gen, device=device).to(
-        torch.int32
+        (total_pages, PAGE_SIZE, HEAD_DIM), generator=gen, device=rng
+    ).to(device)
+    permutation = torch.randperm(total_pages, generator=gen, device=rng).to(
+        device=device, dtype=torch.int32
     )
     block_tables = torch.zeros((batch, max_pages), dtype=torch.int32, device=device)
     offset = 0
     for b, count in enumerate(pages_per_seq):
         block_tables[b, :count] = permutation[offset : offset + count]
         offset += count
-    q = torch.randn((batch * q_len, num_heads, HEAD_DIM), generator=gen, device=device)
+    q = torch.randn((batch * q_len, num_heads, HEAD_DIM), generator=gen, device=rng).to(
+        device
+    )
     for b in range(batch):
         for i in range(q_len):
             visible = kv_lens[b] - q_len + i + 1
             target = int(
-                torch.randint(0, visible, (1,), generator=gen, device=device).item()
+                torch.randint(0, visible, (1,), generator=gen, device=rng).item()
             )
             page = int(block_tables[b, target // PAGE_SIZE].item())
             q[b * q_len + i] += 0.2 * k_full[page, target % PAGE_SIZE]
@@ -207,7 +229,9 @@ def make_inputs(kv_lens, num_heads, *, q_len, enable_sink, device, seed=0):
     kv_cache, kv_scale = quantize_nvfp4(k_full)
     sinks = None
     if enable_sink:
-        sinks = torch.randn((num_heads,), generator=gen, device=device) * 0.5 + 1.0
+        sinks = (
+            torch.randn((num_heads,), generator=gen, device=rng).to(device) * 0.5 + 1.0
+        )
     seq_lens = torch.tensor(kv_lens, dtype=torch.int32, device=device)
     return dict(
         query=query,
@@ -484,6 +508,61 @@ def test_balanced_units_are_contiguous_in_request_major_order():
     )
 
 
+@pytest.mark.parametrize("kv_len", [8192, 131072])
+@pytest.mark.parametrize("num_sms", [148, 152])
+@pytest.mark.parametrize("arch", ["sm_100a", "sm_103a"])
+def test_long_row_balanced_plans_reverse_their_pieces_on_152_sm_devices(
+    arch, num_sms, kv_len
+):
+    forward = _bs32_plan(kv_len, num_sms)
+    plan = _bs32_plan(kv_len, num_sms, arch=arch)
+    record = select_decode_record(forward, arch)
+    assert plan.schedule == "balanced" and record in LONG_DECODE_RECORDS
+    assert select_decode_record(plan, arch) == record
+    reverse = (arch, num_sms // CLUSTER_PAIR) in REVERSED_PIECE_TARGETS
+    assert reverse == (num_sms == 152)
+    # The same units hold the same pieces; on a 152-SM SM100 or SM103 device
+    # every unit runs them in reverse request-major order, each piece's row
+    # pair kept in order. 148-SM plans keep the request-major order.
+    assert plan.unit_first == forward.unit_first
+    assert (plan.max_splits, plan.tiles_per_split) == (
+        forward.max_splits,
+        forward.tiles_per_split,
+    )
+    for a, b in zip(plan.unit_first, plan.unit_first[1:], strict=False):
+        pieces = [forward.items[i : i + V_HALVES] for i in range(a, b, V_HALVES)]
+        want = pieces[::-1] if reverse else pieces
+        assert plan.items[a:b] == tuple(item for piece in want for item in piece)
+    assert any(
+        b - a > V_HALVES
+        for a, b in zip(plan.unit_first, plan.unit_first[1:], strict=False)
+    )
+    check_pairs(plan)
+    uniform = _bs32_plan(kv_len, num_sms, schedule="uniform")
+    assert _bs32_plan(kv_len, num_sms, schedule="uniform", arch=arch) == uniform
+
+
+@pytest.mark.parametrize("num_sms", [148, 152])
+@pytest.mark.parametrize("arch", ["sm_100a", "sm_103a"])
+def test_short_row_balanced_plans_keep_the_request_major_order(arch, num_sms):
+    # Balanced from the 9000-key request; every unit holds a short range, some
+    # of them several pieces.
+    kv_lens = [300, 600, 900, 1200, 9000]
+    forward = build_work_plan(
+        kv_lens, num_heads=64, num_sms=num_sms, q_len=6, enable_sink=True
+    )
+    plan = build_work_plan(
+        kv_lens, num_heads=64, num_sms=num_sms, q_len=6, enable_sink=True, arch=arch
+    )
+    assert plan.schedule == "balanced"
+    assert select_decode_record(plan, arch) not in LONG_DECODE_RECORDS
+    assert any(
+        b - a > V_HALVES
+        for a, b in zip(plan.unit_first, plan.unit_first[1:], strict=False)
+    )
+    assert plan == forward
+
+
 def test_pair_invariant_holds_and_is_enforced():
     plan = build_work_plan(
         [1000, 8192, 5000], num_heads=8, num_sms=148, q_len=6, enable_sink=True
@@ -608,16 +687,37 @@ def xv_record(monkeypatch):
     return _register_further(monkeypatch, XV_RECORD)
 
 
+def _without_spec_records(monkeypatch):
+    """Drops the short-row records that load their unit's first item in the
+    kernel setup, so a test of the short-row rules sees the programs without."""
+    for name in (SHORT_SPEC_RECORD, SHORT_EPI_SPEC_RECORD):
+        monkeypatch.delitem(cake_jit.MODULES, name, raising=False)
+
+
 @pytest.fixture
 def short_record(monkeypatch):
-    """Registers the short-row decode record for both architectures."""
+    """Registers the short-row decode record for both architectures (without
+    the records of ``spec_records``)."""
+    _without_spec_records(monkeypatch)
     return _register_further(monkeypatch, SHORT_RECORD)
 
 
 @pytest.fixture
 def short_epi_record(monkeypatch):
-    """Registers the per-warp epilogue short-row record for both architectures."""
+    """Registers the per-warp epilogue short-row record for both architectures
+    (without the records of ``spec_records``)."""
+    _without_spec_records(monkeypatch)
     return _register_further(monkeypatch, SHORT_EPI_RECORD)
+
+
+@pytest.fixture
+def spec_records(monkeypatch, short_record, short_epi_record):
+    """Registers both short-row records and, beside them, the two that load
+    their unit's first item in the kernel setup."""
+    return {
+        name: _register_further(monkeypatch, name)
+        for name in (SHORT_SPEC_RECORD, SHORT_EPI_SPEC_RECORD)
+    }
 
 
 @pytest.fixture
@@ -1002,6 +1102,89 @@ def test_select_decode_record_short_epi_boundary_of_uniform_plans(
     want = SHORT_EPI_RECORD if tail_rows >= 32 else SHORT_RECORD
     for arch in cake_jit.ARCHES:
         assert select_decode_record(plan, arch) == want
+
+
+@pytest.mark.parametrize(
+    "num_heads,q_len,epi", [(64, 6, False), (64, 1, False), (8, 4, True), (8, 6, True)]
+)
+def test_select_decode_record_spec_uh_needs_one_item_pair_per_unit(
+    spec_records, num_heads, q_len, epi
+):
+    """The programs loading their unit's first item in the kernel setup run a
+    short plan whose every unit holds one item pair; a unit of several pairs
+    (or of none) keeps the program without that load."""
+    short, spec = (
+        (SHORT_EPI_RECORD, SHORT_EPI_SPEC_RECORD)
+        if epi
+        else (SHORT_RECORD, SHORT_SPEC_RECORD)
+    )
+    one = _hand_plan([8], [16], [1], q_len=q_len, num_heads=num_heads)
+    several = _hand_plan([8], [4, 4], q_len=q_len, num_heads=num_heads)
+    empty = _hand_plan([8], [], q_len=q_len, num_heads=num_heads)
+    assert select_decode_record(one, "sm_100a") == spec
+    assert select_decode_record(several, "sm_100a") == short
+    assert select_decode_record(empty, "sm_100a") == short
+    assert select_decode_record(one, "sm_103a") == spec
+    assert select_decode_record(several, "sm_103a") == short
+    # The short-row rule first: a long unit runs neither.
+    long = _hand_plan([8], [400], q_len=q_len, num_heads=num_heads)
+    assert select_decode_record(long, "sm_100a") not in (short, spec)
+
+
+def test_select_decode_record_spec_uh_needs_the_records(monkeypatch, spec_records):
+    one = _hand_plan([8], [8])
+    one_epi = _hand_plan([8], [8], q_len=4, num_heads=8)
+    assert select_decode_record(one, "sm_100a") == SHORT_SPEC_RECORD
+    assert select_decode_record(one_epi, "sm_100a") == SHORT_EPI_SPEC_RECORD
+    spec_records[SHORT_EPI_SPEC_RECORD]["arches"] = ["sm_103a"]
+    assert select_decode_record(one_epi, "sm_100a") == SHORT_EPI_RECORD
+    monkeypatch.delitem(cake_jit.MODULES, SHORT_SPEC_RECORD)
+    assert select_decode_record(one, "sm_100a") == SHORT_RECORD
+    # Only in place of the short-row records: without them the plan runs the decode.
+    spec_records[SHORT_EPI_SPEC_RECORD]["arches"] = list(cake_jit.ARCHES)
+    monkeypatch.delitem(cake_jit.MODULES, SHORT_RECORD)
+    assert select_decode_record(one_epi, "sm_103a") == "decode"
+
+
+SPEC_PAIRS_KV = [300, 600, 900, 1200, 9000]
+# Inputs of the item-pair rows, drawn on the host so every GPU sees the same
+# values (seed 15: the largest margin to the reference bound of the seeds tried).
+SPEC_PAIRS_INPUTS = {"seed": 15, "rng_device": "cpu"}
+
+
+@pytest.mark.parametrize("num_sms", [148, 152])
+@pytest.mark.parametrize("num_heads,q_len,epi", [(64, 6, False), (8, 4, True)])
+def test_select_decode_record_spec_uh_boundary_of_balanced_plans(
+    spec_records, num_sms, num_heads, q_len, epi
+):
+    """Four short requests beside a long one: the balanced partition joins the
+    end of one short request and the start of the next in one unit, so the
+    plan keeps the programs without the setup load; the uniform plan of the
+    same requests (one item pair per unit) runs them."""
+    short, spec = (
+        (SHORT_EPI_RECORD, SHORT_EPI_SPEC_RECORD)
+        if epi
+        else (SHORT_RECORD, SHORT_SPEC_RECORD)
+    )
+    kwargs = dict(num_heads=num_heads, num_sms=num_sms, q_len=q_len, enable_sink=True)
+    balanced = build_work_plan(SPEC_PAIRS_KV, **kwargs)
+    assert balanced.schedule == "balanced"
+    pairs = [
+        (last - first) // V_HALVES
+        for first, last in zip(
+            balanced.unit_first, balanced.unit_first[1:], strict=False
+        )
+    ]
+    assert min(pairs) == 1 and max(pairs) > 1
+    uniform = build_work_plan(
+        SPEC_PAIRS_KV, schedule="uniform", tiles_per_split=16, **kwargs
+    )
+    for arch in cake_jit.ARCHES:
+        limit = cake_backend.SHORT_MAX_UNIT_TILES[arch]
+        assert max(unit_tiles(balanced)) <= limit and max(unit_tiles(uniform)) <= limit
+        assert select_decode_record(balanced, arch) == short
+        want = spec if arch in FURTHER_RECORDS[spec][1] else short
+        assert select_decode_record(uniform, arch) == want
 
 
 def test_select_decode_record_short_needs_the_record_and_a_threshold(
@@ -1587,6 +1770,27 @@ def test_nvfp4_mla_decode(
     assert_plan_well_formed(
         decode.plan, kv_lens, q_len=q_len, num_heads=num_heads, enable_sink=enable_sink
     )
+    # The prepared plan holds the pieces of every unit in the order of
+    # ``build_work_plan`` for the device architecture: reversed for a long-row
+    # balanced plan on a target of ``REVERSED_PIECE_TARGETS``.
+    forward = build_work_plan(
+        kv_lens,
+        num_heads=num_heads,
+        num_sms=num_sms,
+        q_len=q_len,
+        enable_sink=enable_sink,
+        tiles_per_split=tiles_per_split,
+    )
+    record = select_decode_record(forward, decode.arch)
+    if decode.plan.schedule == "balanced" and record in LONG_DECODE_RECORDS:
+        reverse = (decode.arch, num_sms // CLUSTER_PAIR) in REVERSED_PIECE_TARGETS
+        first = decode.plan.unit_first
+        for a, b in zip(first, first[1:], strict=False):
+            pieces = [forward.items[i : i + V_HALVES] for i in range(a, b, V_HALVES)]
+            want = pieces[::-1] if reverse else pieces
+            assert decode.plan.items[a:b] == tuple(
+                item for piece in want for item in piece
+            )
     total_q = len(kv_lens) * q_len
     q_indptr = _q_indptr(len(kv_lens), q_len)
     torch.cuda.synchronize()  # the single table upload is asynchronous
@@ -1652,6 +1856,8 @@ def assert_programs_match_bitwise(
     enable_sink=True,
     schedule="auto",
     tiles_per_split=None,
+    seed=0,
+    rng_device=None,
 ):
     """The selector binds further record ``name`` for the problem, and the
     stage's own record and ``name`` run it to the same bits."""
@@ -1682,7 +1888,13 @@ def assert_programs_match_bitwise(
     if getattr(cake_backend, selector)(plan, arch) != name:
         pytest.skip(f"the selector keeps the {stage} program at {num_sms} SMs")
     inputs = make_inputs(
-        kv_lens, num_heads, q_len=q_len, enable_sink=enable_sink, device="cuda"
+        kv_lens,
+        num_heads,
+        q_len=q_len,
+        enable_sink=enable_sink,
+        device="cuda",
+        seed=seed,
+        rng_device=rng_device,
     )
     if tiles_per_split is None:
         nbytes = nvfp4_mla_decode_workspace_size(
@@ -1783,6 +1995,7 @@ def test_xv_decode_matches_the_decode_bitwise(monkeypatch, label, kv_lens):
         ("bs32_q6_kv4096", [4096] * 32, {}),
         ("bs23_q6_kv8448", [8448] * 23, {}),
         ("bs24_q6_kv8320", [8320] * 24, {}),
+        ("spec_pairs_h64_q6", SPEC_PAIRS_KV, SPEC_PAIRS_INPUTS),
     ],
 )
 def test_short_decode_matches_the_decode_bitwise(monkeypatch, label, kv_lens, options):
@@ -1798,6 +2011,11 @@ def test_short_decode_matches_the_decode_bitwise(monkeypatch, label, kv_lens, op
         ("h1_q32_tail32", EPI_BOUNDARY_KV, {"num_heads": 1, "q_len": 32, **SPLIT16}),
         ("h8_q4_tail32", EPI_BOUNDARY_KV, {"num_heads": 8, "q_len": 4, **SPLIT16}),
         ("h16_q6_tail32", [4096] * 8, {"num_heads": 16}),
+        (
+            "spec_pairs_h8_q4",
+            SPEC_PAIRS_KV,
+            {"num_heads": 8, "q_len": 4, **SPEC_PAIRS_INPUTS},
+        ),
     ],
 )
 def test_short_epi_decode_matches_the_decode_bitwise(
@@ -1806,6 +2024,52 @@ def test_short_epi_decode_matches_the_decode_bitwise(
     """Short plans whose requests end in a CTA of at least 32 valid query
     rows run the per-warp epilogue and the decode programs to the same bits."""
     assert_programs_match_bitwise(monkeypatch, SHORT_EPI_RECORD, kv_lens, **options)
+
+
+@pytest.mark.parametrize(
+    "label,kv_lens,options",
+    [
+        ("smoke_forced_two_splits", [256, 300], {"tiles_per_split": 2}),
+        ("no_sink_q1", [64, 65, 4096, 777], {"q_len": 1, "enable_sink": False}),
+        ("h1_q31_tail31", EPI_BOUNDARY_KV, {"num_heads": 1, "q_len": 31, **SPLIT16}),
+        ("h8_q3_tail24", EPI_BOUNDARY_KV, {"num_heads": 8, "q_len": 3, **SPLIT16}),
+        ("bs32_q6_kv4096", [4096] * 32, {}),
+        ("spec_pairs_h64_q6_uniform", SPEC_PAIRS_KV, {**SPLIT16, **SPEC_PAIRS_INPUTS}),
+    ],
+)
+def test_short_spec_decode_matches_the_decode_bitwise(
+    monkeypatch, label, kv_lens, options
+):
+    """Short plans of one item pair per unit run the short-row program that
+    loads its unit's first item in the kernel setup and the decode program to
+    the same bits."""
+    assert_programs_match_bitwise(monkeypatch, SHORT_SPEC_RECORD, kv_lens, **options)
+
+
+@pytest.mark.parametrize(
+    "label,kv_lens,options",
+    [
+        ("partial_pages_h8", [1000, 8192, 5000], {"num_heads": 8, **SPLIT16}),
+        ("h1_q32_tail32", EPI_BOUNDARY_KV, {"num_heads": 1, "q_len": 32, **SPLIT16}),
+        ("h8_q4_tail32", EPI_BOUNDARY_KV, {"num_heads": 8, "q_len": 4, **SPLIT16}),
+        ("h16_q6_tail32", [4096] * 8, {"num_heads": 16}),
+        (
+            "spec_pairs_h8_q4_uniform",
+            SPEC_PAIRS_KV,
+            {"num_heads": 8, "q_len": 4, **SPLIT16, **SPEC_PAIRS_INPUTS},
+        ),
+    ],
+)
+def test_short_epi_spec_decode_matches_the_decode_bitwise(
+    monkeypatch, label, kv_lens, options
+):
+    """Short plans of one item pair per unit whose requests end in a CTA of at
+    least 32 valid query rows run the per-warp epilogue program that loads its
+    unit's first item in the kernel setup and the decode program to the same
+    bits."""
+    assert_programs_match_bitwise(
+        monkeypatch, SHORT_EPI_SPEC_RECORD, kv_lens, **options
+    )
 
 
 @pytest.mark.parametrize(

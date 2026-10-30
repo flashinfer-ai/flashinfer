@@ -17,7 +17,7 @@ limitations under the License.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Optional, Sequence
 
 import torch
@@ -86,6 +86,14 @@ SHORT_MAX_UNIT_TILES = {"sm_100a": 32, "sm_103a": 64}  # pipeline tiles of every
 # ends in a CTA of at least ``SHORT_EPI_MIN_TAIL_ROWS`` valid query rows.
 SHORT_EPI_RECORD = "decode_short_epi_warp"
 SHORT_EPI_MIN_TAIL_ROWS = 32  # valid query rows of the last CTA of a request
+# The short-row programs that also load the fields of item ``2 * cluster`` in
+# the kernel setup, ahead of the cluster rendezvous, and start the load warp on
+# them when that item is the first of the unit. They run in place of
+# ``SHORT_RECORD`` and ``SHORT_EPI_RECORD`` when every unit holds one item
+# pair: item ``2 * cluster`` is then every unit's first, and it lies in the
+# table, which the setup load requires.
+SHORT_SPEC_RECORD = "decode_short_spec_uh"
+SHORT_EPI_SPEC_RECORD = "decode_short_epi_warp_spec_uh"
 # The SM103 decode with its row-pair max exchange gated by a vote on the
 # exchange barrier. Each piece pays a warm-up worth about ``XV_WARMUP_TILES``
 # tiles of the saving, so it pays off when every cluster streams at least
@@ -93,6 +101,17 @@ SHORT_EPI_MIN_TAIL_ROWS = 32  # valid query rows of the last CTA of a request
 XV_RECORD = "decode_xv"
 XV_WARMUP_TILES = 48  # pipeline tiles of every piece
 XV_MIN_STEADY_TILES = 307  # pipeline tiles of every unit past the warm-ups
+# The long-row decode programs. On an (architecture, cluster count) of
+# ``REVERSED_PIECE_TARGETS`` a balanced plan that one of them runs holds the
+# pieces of every unit in reverse order (``build_work_plan``): the head piece
+# of the unit's last sequence starts first, so the row tiles of one request
+# read most of their pages at the same time and the re-reads of a page stay in
+# L2. The cluster count is the one the plan requests, ``num_sms //
+# CLUSTER_PAIR``: 76 on a 152-SM device such as GB200 (SM100) or GB300
+# (SM103). The short-row programs stream too few tiles per unit for such
+# re-reads, and every other target keeps the request-major order.
+LONG_DECODE_RECORDS = frozenset({"decode", QK_AHEAD_RECORD, XV_RECORD})
+REVERSED_PIECE_TARGETS = frozenset({("sm_100a", 76), ("sm_103a", 76)})
 # Further combine program (``select_reduce_record``), giving the combine
 # program's outputs bit for bit: it reads the first pair of splits of a row
 # from its top loads, which pays off for rows of more than two splits.
@@ -479,6 +498,21 @@ def _balanced_plan(kv_lens, *, q_len, num_heads, num_units, enable_sink):
     )
 
 
+def _reverse_unit_pieces(plan: WorkPlan) -> WorkPlan:
+    """``plan`` with the pieces of every unit in reverse order.
+
+    Each piece keeps its row pair in order (``check_pairs``); the units, their
+    item multisets and every item's fields stay the same, so the programs
+    ``select_decode_record`` and ``select_reduce_record`` pick do too. Each
+    item is computed on its own, so the order changes no output bit.
+    """
+    items: list = []
+    for first, last in zip(plan.unit_first, plan.unit_first[1:], strict=False):
+        for start in range(last - V_HALVES, first - 1, -V_HALVES):
+            items.extend(plan.items[start : start + V_HALVES])
+    return replace(plan, items=tuple(items))
+
+
 def check_pairs(plan: WorkPlan) -> None:
     """Every unit holds consecutive row pairs (rows 0 and 1) of one piece.
 
@@ -510,6 +544,7 @@ def build_work_plan(
     enable_sink: bool = False,
     schedule: str = "auto",
     tiles_per_split: Optional[int] = None,
+    arch: Optional[str] = None,
 ) -> WorkPlan:
     """Build the host work plan for one batch.
 
@@ -517,7 +552,11 @@ def build_work_plan(
     CLUSTER_PAIR`` clusters when the longest request reaches
     ``BALANCED_MIN_KV`` tokens and the uniform split policy otherwise;
     ``"balanced"`` / ``"uniform"`` force one of them. ``tiles_per_split``
-    fixes the uniform split granularity (pipeline tiles per split).
+    fixes the uniform split granularity (pipeline tiles per split). With
+    ``(arch, num_sms // CLUSTER_PAIR)`` in ``REVERSED_PIECE_TARGETS``, a
+    balanced plan that a program of ``LONG_DECODE_RECORDS`` runs
+    (``select_decode_record``) holds the pieces of every unit in reverse order;
+    otherwise, and without ``arch``, the order is request-major.
     """
     kv_lens = [int(v) for v in kv_lens]
     if q_len < 1 or not kv_lens or min(kv_lens) < q_len:
@@ -548,6 +587,12 @@ def build_work_plan(
             f"work plan needs {plan.max_splits} KV splits; the combine kernel supports {MAX_SPLITS}"
         )
     check_pairs(plan)
+    if (
+        plan.schedule == "balanced"
+        and (arch, num_sms // CLUSTER_PAIR) in REVERSED_PIECE_TARGETS
+        and select_decode_record(plan, arch) in LONG_DECODE_RECORDS
+    ):
+        plan = _reverse_unit_pieces(plan)
     return plan
 
 
@@ -575,8 +620,10 @@ def select_decode_record(plan: WorkPlan, arch: str) -> str:
     and ``SHORT_EPI_RECORD`` (the short-row program with a per-warp epilogue
     store path) runs such a plan in its place when the last CTA of every
     request holds at least ``SHORT_EPI_MIN_TAIL_ROWS`` valid query rows;
-    every other plan runs ``"decode"``. The decode programs' outputs are
-    bitwise identical.
+    ``SHORT_SPEC_RECORD`` and ``SHORT_EPI_SPEC_RECORD`` (those two programs
+    loading the first item of their unit in the kernel setup) run in place of
+    either when every unit holds one item pair; every other plan runs
+    ``"decode"``. The decode programs' outputs are bitwise identical.
     """
     # One item per piece: both rows of a pair share the piece's tile range
     # (item fields 3 and 4: tile_start, tile_end).
@@ -606,8 +653,16 @@ def select_decode_record(plan: WorkPlan, arch: str) -> str:
         and all(sum(lens) <= limit for lens in units)
     ):
         tail_rows = (plan.q_len * plan.num_heads) % ROWS_PER_CTA
+        one_pair = all(
+            last - first == V_HALVES
+            for first, last in zip(plan.unit_first, plan.unit_first[1:], strict=False)
+        )
         if _delivered(SHORT_EPI_RECORD, arch) and tail_rows >= SHORT_EPI_MIN_TAIL_ROWS:
+            if one_pair and _delivered(SHORT_EPI_SPEC_RECORD, arch):
+                return SHORT_EPI_SPEC_RECORD
             return SHORT_EPI_RECORD
+        if one_pair and _delivered(SHORT_SPEC_RECORD, arch):
+            return SHORT_SPEC_RECORD
         return SHORT_RECORD
     return "decode"
 
@@ -1146,6 +1201,7 @@ def prepare_nvfp4_batch_decode_with_kv_cache_mla(
         enable_sink=sinks is not None,
         schedule=schedule,
         tiles_per_split=tiles_per_split,
+        arch=arch,
     )
     decode_record = select_decode_record(plan, arch)
     reduce_record = select_reduce_record(plan, arch)

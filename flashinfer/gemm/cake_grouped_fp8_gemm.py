@@ -80,7 +80,9 @@ DEEPK_C2_KG1_ROUTE = "deepk_c2_kg1_non_kg4_k_blocks"
 DEEPK_C2_SCALAR_OUTPUT_ROUTE = "deepk_c2_scalar_output"
 DEEPK_C2_KG1_DIRECT_STORE_ROUTE = "deepk_c2_kg1_direct_store_m32"
 # The KG1 program with 128 x 64 tiles: a KG1 launch of more than
-# DIRECT_STORE_MAX_ROWS rows whose 128 x 64 tiles fit in one wave (see _launch_plan).
+# DIRECT_STORE_MAX_ROWS rows whose 128 x 64 tiles fit in one wave, and an AB6
+# launch of more than DIRECT_STORE_MAX_ROWS rows that is a single 128 x 128 tile
+# at K = 512 (see _launch_plan).
 DEEPK_C2_KG1_N64_ROUTE = "deepk_c2_kg1_n64_k_blocks"
 DEEPK_C2_AB6_SCALE1_DIRECT_STORE_ROUTE = "deepk_c2_ab6_scale1_direct_store_m32"
 DEEPK_N256_ROUTE = "deepk_n256_ab4_three_panel_kg4"
@@ -93,6 +95,18 @@ DEEPK_CG2_AB7_BSCALE_PREFETCH_ROUTE = "deepk_cg2_ab7_bscale_prefetch_kg4"
 # cut on the device from m_indices.  Selected only from the layout that
 # ``validate_indices`` reads (see ``prepare_group_gemm_fp8_nt_groupwise_contiguous``).
 DEEPK_C2_KG1_EXPERT_ALIGNED_ROUTE = "deepk_c2_kg1_expert_aligned"
+# The KG1 program with 128 x 64 tiles that computes the expert runs of each
+# 128-row window in separate CTAs.  Selected only from the same layout, for an
+# expert-aligned launch whose CTAs fit in one wave (see _window_segment_plan).
+DEEPK_C2_KG1_WSEG_ROUTE = "deepk_c2_kg1_wseg"
+# The window-segment program's launch contract: its kernel requires
+# 1 <= M <= WSEG_MAX_M and WSEG_MIN_N <= N <= WSEG_MAX_N, which its host shim
+# checks and which keep its window-tile pairs ((M + 127) // 128) * (N // 64)
+# in [1, 2**30].  The route is taken only inside it
+# (_window_segment_launch_ok).
+WSEG_MAX_M = 1 << 24
+WSEG_MIN_N = 64
+WSEG_MAX_N = 1 << 19
 # The expert-aligned program keeps one tile-table entry per expert in shared memory.
 EXPERT_ALIGNED_MAX_GROUPS = 255
 # Block-scaled (packed UE8M0 scale) family.
@@ -782,7 +796,8 @@ def launch_plan(
     with the SM count.  A KG1 / AB6 launch of at most ``DIRECT_STORE_MAX_ROWS``
     rows on at most ``DIRECT_STORE_MAX_CTAS`` CTAs runs that route's
     direct-store program; a KG1 launch of more rows whose 128 x 64 tiles fit
-    in one wave runs the KG1 program with 128 x 64 tiles.
+    in one wave runs the KG1 program with 128 x 64 tiles, and so does an AB6
+    launch of more rows that is a single 128 x 128 tile at K = 512.
     """
     return _launch_plan(
         m,
@@ -858,6 +873,18 @@ def _launch_plan(
         n64_tiles = math.ceil(m / 128) * math.ceil(n / 64)
         if n64_tiles <= sm_count:
             route, grid = DEEPK_C2_KG1_N64_ROUTE, (n64_tiles, 1, 1)
+    elif (
+        route == DEEPK_C2_AB6_SCALE1_ROUTE
+        and m > DIRECT_STORE_MAX_ROWS
+        and math.ceil(m / 128) * math.ceil(n / 128) == 1
+        and k == 512
+    ):
+        # Both programs compute each output element with the same MMA chain, so
+        # the bytes are the same; two 128 x 64 tiles finish sooner than one tile.
+        route, grid = (
+            DEEPK_C2_KG1_N64_ROUTE,
+            (math.ceil(m / 128) * math.ceil(n / 64), 1, 1),
+        )
     return route, grid
 
 
@@ -922,19 +949,22 @@ def _validate_indices(
     layout_tile_m: Optional[int] = None,
     layout_tile_rows: int = 128,
     read_alignment: bool = False,
-) -> tuple[Optional[tuple[int, int, int, int]], Optional[bool]]:
+) -> tuple[Optional[tuple[int, int, int, int, int]], Optional[bool]]:
     """Check the routing contract (in range, sorted) with one device-to-host transfer.
 
     With ``allow_padding`` the value ``-1`` marks padding rows; the remaining
     entries must still be nondecreasing.  Returns ``(layout, aligned)``, both
     ``None`` unless asked for; the caller uses them only to choose a route.
     With ``layout_tile_m`` (no padding) the same transfer also reads
-    ``layout = (inner_starts, run_starts, expert_tiles, max_offset)``: the
+    ``layout = (inner_starts, run_starts, expert_tiles, max_offset,
+    window_runs)``: the
     number of expert runs starting at a row that is not a multiple of
     ``layout_tile_m`` (so a ``layout_tile_m``-row tile spans two experts), the
     number of expert runs starting after row 0, the number of
     ``layout_tile_rows``-row tiles when no tile spans two experts, and the
-    largest offset of such an inner start within its tile (0 without one).
+    largest offset of such an inner start within its tile (0 without one),
+    and the largest number of expert runs in one ``layout_tile_rows``-row
+    window (at least 1).
     With ``read_alignment`` (no padding) it also reads ``aligned``: whether
     every expert run starts on a multiple of 256 rows (see :func:`_route`).
     """
@@ -968,8 +998,18 @@ def _validate_indices(
             stats.append(run_starts.sum())
             stats.append(((rows - run_first) % layout_tile_rows == 0).sum() + 1)
             stats.append(torch.where(inner, offset, torch.zeros_like(offset)).max())
+            window_starts = run_starts & (rows % layout_tile_rows != 0)
+            per_window = torch.zeros(
+                math.ceil(indices.numel() / layout_tile_rows),
+                dtype=torch.int64,
+                device=indices.device,
+            )
+            per_window.index_add_(
+                0, rows // layout_tile_rows, window_starts.to(torch.int64)
+            )
+            stats.append(per_window.max() + 1)
         else:
-            stats += [zero, zero, zero + 1, zero]
+            stats += [zero, zero, zero + 1, zero, zero + 1]
     values = torch.stack(stats).tolist()
     lowest, highest, unsorted = values[:3]
     if lowest < (-1 if allow_padding else 0) or highest >= groups:
@@ -984,10 +1024,12 @@ def _validate_indices(
     aligned: Optional[bool] = None
     if read_alignment:
         aligned, extra = extra[0] == 0, extra[1:]
-    layout: Optional[tuple[int, int, int, int]] = None
+    layout: Optional[tuple[int, int, int, int, int]] = None
     if layout_tile_m is not None:
-        inner, starts, expert_tiles, max_offset = (int(v) for v in extra[:4])
-        layout = inner, starts, expert_tiles, max_offset
+        inner, starts, expert_tiles, max_offset, window_runs = (
+            int(v) for v in extra[:5]
+        )
+        layout = inner, starts, expert_tiles, max_offset, window_runs
     return layout, aligned
 
 
@@ -1081,6 +1123,44 @@ def _expert_aligned_plan(
     _, tile_n, _ = route_geometry(DEEPK_C2_KG1_EXPERT_ALIGNED_ROUTE)
     ctas = max(1, min(expert_tiles * math.ceil(n / tile_n), sm_count))
     return DEEPK_C2_KG1_EXPERT_ALIGNED_ROUTE, (ctas, 1, 1)
+
+
+def _window_segment_launch_ok(m: int, n: int, grid: tuple[int, int, int]) -> bool:
+    """Whether a window-segment launch of ``m`` x ``n`` rows and columns at
+    ``grid`` keeps the program's launch contract (see ``WSEG_MAX_M``); outside
+    it the host keeps the expert-aligned program."""
+    return (
+        1 <= m <= WSEG_MAX_M
+        and WSEG_MIN_N <= n <= WSEG_MAX_N
+        and grid[0] >= 1
+        and grid[1] == 1
+        and grid[2] == 1
+    )
+
+
+def _window_segment_plan(
+    arch: str, m: int, n: int, window_runs: int, *, sm_count: int
+) -> Optional[tuple[str, tuple[int, int, int]]]:
+    """``(route, grid)`` of the window-segment program for a layout whose
+    128-row windows hold at most ``window_runs`` expert runs, or ``None``
+    when its CTAs do not fit in one wave, the launch is outside the program's
+    contract (:func:`_window_segment_launch_ok`) or ``arch`` has no such
+    program.
+
+    The program gives each window ``window_runs`` CTAs per 128 x 64 column
+    tile, CTA ``j`` computing runs ``j, j + window_runs, ...`` of its window,
+    so here each CTA computes at most one run.  It reads the runs from
+    ``m_indices`` on the device at every launch: a later ``m_indices`` with
+    more runs per window stays correct, its CTAs computing several runs.
+    """
+    if not _route_registered(arch, DEEPK_C2_KG1_WSEG_ROUTE):
+        return None
+    tile_m, tile_n, _ = route_geometry(DEEPK_C2_KG1_WSEG_ROUTE)
+    ctas = math.ceil(m / tile_m) * window_runs * math.ceil(n / tile_n)
+    grid = (ctas, 1, 1)
+    if ctas > sm_count or not _window_segment_launch_ok(m, n, grid):
+        return None
+    return DEEPK_C2_KG1_WSEG_ROUTE, grid
 
 
 def _packed_scale_strides(
@@ -1503,10 +1583,16 @@ def prepare_group_gemm_fp8_nt_groupwise_contiguous(
         and at most 255 experts, when at least 90% of the runs start inside a
         tile of the shape's route and one starts at least half a tile in, the
         launch uses the expert-aligned program, whose tiles never span two
-        experts.  These choices affect speed only.  Every program computes the
-        same bits for any valid ``m_indices``, so indices that change after
-        preparation (rebound at ``launch`` or rewritten before a graph replay)
-        stay correct; only the chosen program may be slower for them.
+        experts.  Such a launch uses the window-segment program instead when
+        its CTAs (the 128-row windows x the most expert runs in one window x
+        the 64-column tiles) fit in one wave and the shape keeps its launch
+        contract (``1 <= M <= 2**24``, ``64 <= N <= 2**19``): each CTA
+        computes one expert run of a 128-row window, so one window may hold
+        several experts.  These choices affect speed only.  Every program
+        computes the same bits for any valid ``m_indices``, so indices that
+        change after preparation (rebound at ``launch`` or rewritten before a
+        graph replay) stay correct; only the chosen program may be slower for
+        them.
     fill_padding : bool
         Accept ``-1`` padding rows in ``m_indices`` (promotion family).  The
         prepared object owns an ``(M,)`` int32 plus ``(M,)`` int64 scratch and
@@ -1671,6 +1757,9 @@ def prepare_group_gemm_fp8_nt_groupwise_contiguous(
         and _expert_aligned_preferred(layout[0], layout[1], layout[3], layout_tile_m)
     ):
         route, grid = _expert_aligned_plan(n, layout[2], sm_count=sm_count)
+        window_plan = _window_segment_plan(arch, m, n, layout[4], sm_count=sm_count)
+        if window_plan is not None:
+            route, grid = window_plan
     module_name = select_module(arch, route)
     program = PROGRAMS[MODULES[module_name]["program"]]
     module = load_cake_grouped_fp8_gemm_module(module_name)

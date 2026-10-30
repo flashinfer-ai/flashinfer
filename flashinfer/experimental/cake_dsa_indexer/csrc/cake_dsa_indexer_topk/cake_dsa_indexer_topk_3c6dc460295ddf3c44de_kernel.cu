@@ -50,6 +50,9 @@
 #define SMEM_S_FAIL_OFF 207168
 #define SMEM_S_FAIL_STAGE_BYTES 32
 #define SMEM_S_FAIL_STRIDE 32
+#define SMEM_S_TK_OFF 221184
+#define SMEM_S_TK_STAGE_BYTES 16
+#define SMEM_S_TK_STRIDE 16
 #define SMEM_S_WSC_OFF 207232
 #define SMEM_S_WSC_STAGE_BYTES 512
 #define SMEM_S_WSC_STRIDE 512
@@ -59,16 +62,7 @@
 #define SMEM_S_REQ_OFF 220544
 #define SMEM_S_REQ_STAGE_BYTES 640
 #define SMEM_S_REQ_STRIDE 640
-#if TILE_UNROLL == 1
-#else
-#if __CUDA_ARCH__ == 1000
-#else
-#define SMEM_S_TK_OFF 207200
-#define SMEM_S_TK_STAGE_BYTES 8
-#define SMEM_S_TK_STRIDE 8
-#endif
-#endif
-#define SMEM_TOTAL 221184
+#define SMEM_TOTAL 221312
 #ifndef TILE_UNROLL
 #define TILE_UNROLL 2
 #endif
@@ -134,20 +128,14 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
     const int s_tau_addr = smem + 207040;
     int* s_fail = reinterpret_cast<int*>(smem_raw + 207168);
     const int s_fail_addr = smem + 207168;
+    int* s_tk = reinterpret_cast<int*>(smem_raw + 221184);
+    const int s_tk_addr = smem + 221184;
     float* s_wsc = reinterpret_cast<float*>(smem_raw + 207232);
     const int s_wsc_addr = smem + 207232;
     unsigned int* s_scores = reinterpret_cast<unsigned int*>(smem_raw + 208256);
     const int s_scores_addr = smem + 208256;
     int* s_req = reinterpret_cast<int*>(smem_raw + 220544);
     const int s_req_addr = smem + 220544;
-#if TILE_UNROLL == 1
-#else
-#if __CUDA_ARCH__ == 1000
-#else
-    int* s_tk = reinterpret_cast<int*>(smem_raw + 207200);
-    const int s_tk_addr = smem + 207200;
-#endif
-#endif
     if (warp == 8) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&Q))) : "memory"); }
     if (warp == 8) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&K))) : "memory"); }
     if (warp == 8) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&W))) : "memory"); }
@@ -227,6 +215,31 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
     // Kernel post-init ops
     const int tmem_tmem_acc = taddr;
     asm volatile("griddepcontrol.wait;" ::: "memory");
+    if (warp == 0) {
+        if (elect_sync()) {
+            int n_total_0 = 0;
+            #pragma unroll 1
+            for (int s_t = 0; s_t < num_segments; s_t++) {
+                int lq_t = cu_seqlens_q[s_t + 1] - cu_seqlens_q[s_t];
+                int nb_t = (lq_t + 8 - 1) / 8;
+                n_total_0 += nb_t;
+            }
+            int tk_limit_0 = n_total_0 + grid_ctas - 1;
+            s_tk[2] = tk_limit_0;
+            s_tk[3] = n_total_0;
+            long long tk_off_0 = (long long)grid_ctas * (long long)(8 * cand_cap);
+            if (n_total_0 <= grid_ctas) {
+                s_tk[0] = (int)bid;
+                s_tk[1] = n_total_0;
+            } else {
+                uint32_t _atomic_fetch_inc_0;
+                asm volatile("atom.acq_rel.gpu.global.inc.u32 %0, [%1], %2;"
+                    : "=r"(_atomic_fetch_inc_0) : "l"(reinterpret_cast<unsigned int*>(Cand + tk_off_0)), "r"(static_cast<uint32_t>((unsigned int)tk_limit_0)) : "memory");
+                s_tk[0] = (int)_atomic_fetch_inc_0;
+            }
+        }
+    }
+    __syncthreads();
 
     // ---- Role: load_q ----
     if (warp == 8) {
@@ -237,18 +250,14 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
             if (elect_sync()) {
                 int unit_base_q = 0;
                 unsigned int vphase_q = 0;
-#if TILE_UNROLL == 1
-#else
-#if __CUDA_ARCH__ == 1000
-#else
-                int tk_q = (int)bid;
-#endif
-#endif
+                int tk_q = s_tk[0];
+                int tkp_q = 1;
                 #pragma unroll 1
                 for (int seg = 0; seg < num_segments; seg++) {
                     int q0 = cu_seqlens_q[seg];
                     int lq = cu_seqlens_q[seg + 1] - q0;
                     int nb = (lq + 8 - 1) / 8;
+                    int cnt_q = nb;
 #if TILE_UNROLL == 1
 #else
 #if __CUDA_ARCH__ == 1000
@@ -274,48 +283,35 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
                     int tiles_e = (vis_e + 128 - 1) / 128;
                     int t_lo_q = tiles_e;
                     int q0_e_0 = cu_seqlens_q[seg];
-                    int lq_e_1 = cu_seqlens_q[seg + 1] - q0_e_0;
-                    int lk_e_2 = cu_seqlens_k[seg + 1] - cu_seqlens_k[seg];
-                    long long off_e_3 = 0;
+                    int lq_e_0 = cu_seqlens_q[seg + 1] - q0_e_0;
+                    int lk_e_0 = cu_seqlens_k[seg + 1] - cu_seqlens_k[seg];
+                    long long off_e_0 = 0;
                     if (has_offsets != 0) {
-                        off_e_3 = q_offsets[seg];
+                        off_e_0 = q_offsets[seg];
                     } else if (ratio == 1) {
-                        off_e_3 = (long long)lk_e_2 - (long long)lq_e_1;
+                        off_e_0 = (long long)lk_e_0 - (long long)lq_e_0;
                     }
-                    int last_e_4 = (((nb - 1) * 8 + 7) < (lq_e_1 - 1) ? ((nb - 1) * 8 + 7) : (lq_e_1 - 1));
-                    long long num_e_5 = off_e_3 + (long long)last_e_4 + 1;
-                    int vis_e_6 = 0;
-                    if (num_e_5 > 0) {
-                        long long quot_e_1 = num_e_5 / (long long)ratio;
-                        long long lk64_e_1 = (long long)lk_e_2;
+                    int last_e_0 = (((nb - 1) * 8 + 7) < (lq_e_0 - 1) ? ((nb - 1) * 8 + 7) : (lq_e_0 - 1));
+                    long long num_e_0 = off_e_0 + (long long)last_e_0 + 1;
+                    int vis_e_0 = 0;
+                    if (num_e_0 > 0) {
+                        long long quot_e_1 = num_e_0 / (long long)ratio;
+                        long long lk64_e_1 = (long long)lk_e_0;
                         long long bnd_e_1 = ((quot_e_1 < lk64_e_1) ? quot_e_1 : lk64_e_1);
-                        vis_e_6 = (int)bnd_e_1;
+                        vis_e_0 = (int)bnd_e_1;
                     }
-                    int tiles_e_7 = (vis_e_6 + 128 - 1) / 128;
-                    int t_hi_q = tiles_e_7;
+                    int tiles_e_0 = (vis_e_0 + 128 - 1) / 128;
+                    int t_hi_q = tiles_e_0;
                     int near_eq_q = ((t_hi_q * 4 <= t_lo_q * 5) ? 1 : 0);
 #endif
 #endif
                     #pragma unroll 1
-#if TILE_UNROLL == 1
-                    for (int rnd = unit_base_q / grid_ctas; rnd < (unit_base_q + nb - 1) / grid_ctas + 1; rnd++) {
-                        int bid_i = (int)bid;
-                        int pos_e = bid_i;
-                        int unit = rnd * grid_ctas + pos_e;
-#else
-#if __CUDA_ARCH__ == 1000
-                    for (int rnd = unit_base_q / grid_ctas; rnd < (unit_base_q + nb - 1) / grid_ctas + 1; rnd++) {
-                        int bid_i = (int)bid;
-                        int pos_e = bid_i;
-                        int unit = rnd * grid_ctas + pos_e;
-#else
-                    for (int rnd = 0; rnd < nb + 1; rnd++) {
+                    for (int rnd = 0; rnd < cnt_q + 1; rnd++) {
                         int unit = tk_q;
-                        if (unit >= unit_base_q + nb) {
+                        if (unit >= unit_base_q + cnt_q) {
                             break;
                         }
-#endif
-#endif
+                        tkp_q ^= 1;
                         int _min_0 = ((unit - unit_base_q) < (unit_base_q + nb - 1 - unit) ? (unit - unit_base_q) : (unit_base_q + nb - 1 - unit));
                         if (_min_0 >= 0) {
                             int blk = nb - 1 - (unit - unit_base_q);
@@ -346,13 +342,7 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
                                     f = f | s_fail[6];
                                     f = f | s_fail[7];
                                     int vword_q = f;
-#if TILE_UNROLL == 1
-#else
-#if __CUDA_ARCH__ == 1000
-#else
-                                    tk_q = s_tk[0];
-#endif
-#endif
+                                    tk_q = s_tk[tkp_q ^ 1];
                                     mbarrier_arrive(verdict_ack_addr);
                                     if (vword_q == 0) {
                                         break;
@@ -376,33 +366,29 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
             if (elect_sync()) {
                 int unit_base_k = 0;
                 unsigned int vphase_k = 0;
-#if TILE_UNROLL == 1
-#else
-#if __CUDA_ARCH__ == 1000
-#else
-                int tk_k = (int)bid;
-#endif
-#endif
+                int tk_k = s_tk[0];
+                int tkp_k = 1;
                 #pragma unroll 1
                 for (int seg_1 = 0; seg_1 < num_segments; seg_1++) {
                     int q0_1 = cu_seqlens_q[seg_1];
                     int lq_1 = cu_seqlens_q[seg_1 + 1] - q0_1;
                     int k0 = cu_seqlens_k[seg_1];
                     int nb_1 = (lq_1 + 8 - 1) / 8;
+                    int cnt_k = nb_1;
 #if TILE_UNROLL == 1
 #else
 #if __CUDA_ARCH__ == 1000
 #else
                     int q0_e_1 = cu_seqlens_q[seg_1];
-                    int lq_e_2 = cu_seqlens_q[seg_1 + 1] - q0_e_1;
+                    int lq_e_1 = cu_seqlens_q[seg_1 + 1] - q0_e_1;
                     int lk_e_1 = cu_seqlens_k[seg_1 + 1] - cu_seqlens_k[seg_1];
                     long long off_e_1 = 0;
                     if (has_offsets != 0) {
                         off_e_1 = q_offsets[seg_1];
                     } else if (ratio == 1) {
-                        off_e_1 = (long long)lk_e_1 - (long long)lq_e_2;
+                        off_e_1 = (long long)lk_e_1 - (long long)lq_e_1;
                     }
-                    int last_e_1 = ((7) < (lq_e_2 - 1) ? (7) : (lq_e_2 - 1));
+                    int last_e_1 = ((7) < (lq_e_1 - 1) ? (7) : (lq_e_1 - 1));
                     long long num_e_1 = off_e_1 + (long long)last_e_1 + 1;
                     int vis_e_1 = 0;
                     if (num_e_1 > 0) {
@@ -413,49 +399,36 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
                     }
                     int tiles_e_1 = (vis_e_1 + 128 - 1) / 128;
                     int t_lo_k = tiles_e_1;
-                    int q0_e_0_1 = cu_seqlens_q[seg_1];
-                    int lq_e_1_1 = cu_seqlens_q[seg_1 + 1] - q0_e_0_1;
-                    int lk_e_2_1 = cu_seqlens_k[seg_1 + 1] - cu_seqlens_k[seg_1];
-                    long long off_e_3_1 = 0;
+                    int q0_e_1_1 = cu_seqlens_q[seg_1];
+                    int lq_e_1_1 = cu_seqlens_q[seg_1 + 1] - q0_e_1_1;
+                    int lk_e_1_1 = cu_seqlens_k[seg_1 + 1] - cu_seqlens_k[seg_1];
+                    long long off_e_1_1 = 0;
                     if (has_offsets != 0) {
-                        off_e_3_1 = q_offsets[seg_1];
+                        off_e_1_1 = q_offsets[seg_1];
                     } else if (ratio == 1) {
-                        off_e_3_1 = (long long)lk_e_2_1 - (long long)lq_e_1_1;
+                        off_e_1_1 = (long long)lk_e_1_1 - (long long)lq_e_1_1;
                     }
-                    int last_e_4_1 = (((nb_1 - 1) * 8 + 7) < (lq_e_1_1 - 1) ? ((nb_1 - 1) * 8 + 7) : (lq_e_1_1 - 1));
-                    long long num_e_5_1 = off_e_3_1 + (long long)last_e_4_1 + 1;
-                    int vis_e_6_1 = 0;
-                    if (num_e_5_1 > 0) {
-                        long long quot_e_3 = num_e_5_1 / (long long)ratio;
-                        long long lk64_e_3 = (long long)lk_e_2_1;
+                    int last_e_1_1 = (((nb_1 - 1) * 8 + 7) < (lq_e_1_1 - 1) ? ((nb_1 - 1) * 8 + 7) : (lq_e_1_1 - 1));
+                    long long num_e_1_1 = off_e_1_1 + (long long)last_e_1_1 + 1;
+                    int vis_e_1_1 = 0;
+                    if (num_e_1_1 > 0) {
+                        long long quot_e_3 = num_e_1_1 / (long long)ratio;
+                        long long lk64_e_3 = (long long)lk_e_1_1;
                         long long bnd_e_3 = ((quot_e_3 < lk64_e_3) ? quot_e_3 : lk64_e_3);
-                        vis_e_6_1 = (int)bnd_e_3;
+                        vis_e_1_1 = (int)bnd_e_3;
                     }
-                    int tiles_e_7_1 = (vis_e_6_1 + 128 - 1) / 128;
-                    int t_hi_k = tiles_e_7_1;
+                    int tiles_e_1_1 = (vis_e_1_1 + 128 - 1) / 128;
+                    int t_hi_k = tiles_e_1_1;
                     int near_eq_k = ((t_hi_k * 4 <= t_lo_k * 5) ? 1 : 0);
 #endif
 #endif
                     #pragma unroll 1
-#if TILE_UNROLL == 1
-                    for (int rnd_1 = unit_base_k / grid_ctas; rnd_1 < (unit_base_k + nb_1 - 1) / grid_ctas + 1; rnd_1++) {
-                        int bid_i_1 = (int)bid;
-                        int pos_e_1 = bid_i_1;
-                        int unit_1 = rnd_1 * grid_ctas + pos_e_1;
-#else
-#if __CUDA_ARCH__ == 1000
-                    for (int rnd_1 = unit_base_k / grid_ctas; rnd_1 < (unit_base_k + nb_1 - 1) / grid_ctas + 1; rnd_1++) {
-                        int bid_i_1 = (int)bid;
-                        int pos_e_1 = bid_i_1;
-                        int unit_1 = rnd_1 * grid_ctas + pos_e_1;
-#else
-                    for (int rnd_1 = 0; rnd_1 < nb_1 + 1; rnd_1++) {
+                    for (int rnd_1 = 0; rnd_1 < cnt_k + 1; rnd_1++) {
                         int unit_1 = tk_k;
-                        if (unit_1 >= unit_base_k + nb_1) {
+                        if (unit_1 >= unit_base_k + cnt_k) {
                             break;
                         }
-#endif
-#endif
+                        tkp_k ^= 1;
                         int _min_0_1 = ((unit_1 - unit_base_k) < (unit_base_k + nb_1 - 1 - unit_1) ? (unit_1 - unit_base_k) : (unit_base_k + nb_1 - 1 - unit_1));
                         if (_min_0_1 >= 0) {
                             int blk_1 = nb_1 - 1 - (unit_1 - unit_base_k);
@@ -471,17 +444,17 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
 #endif
 #endif
                             int q0_0 = cu_seqlens_q[seg_1];
-                            int lq_1_1 = cu_seqlens_q[seg_1 + 1] - q0_0;
+                            int lq_0 = cu_seqlens_q[seg_1 + 1] - q0_0;
                             int lk = cu_seqlens_k[seg_1 + 1] - cu_seqlens_k[seg_1];
                             long long off = 0;
                             if (has_offsets != 0) {
                                 off = q_offsets[seg_1];
                             } else if (ratio == 1) {
-                                off = (long long)lk - (long long)lq_1_1;
+                                off = (long long)lk - (long long)lq_0;
                             }
-                            long long off_2 = off;
-                            int last_u = ((blk_1 * 8 + 7) < (lq_1_1 - 1) ? (blk_1 * 8 + 7) : (lq_1_1 - 1));
-                            long long num = off_2 + (long long)last_u + 1;
+                            long long off_1 = off;
+                            int last_u = ((blk_1 * 8 + 7) < (lq_0 - 1) ? (blk_1 * 8 + 7) : (lq_0 - 1));
+                            long long num = off_1 + (long long)last_u + 1;
                             int vis = 0;
                             if (num > 0) {
                                 long long quotient = num / (long long)ratio;
@@ -549,13 +522,7 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
                                     f_1 = f_1 | s_fail[6];
                                     f_1 = f_1 | s_fail[7];
                                     int vword_k = f_1;
-#if TILE_UNROLL == 1
-#else
-#if __CUDA_ARCH__ == 1000
-#else
-                                    tk_k = s_tk[0];
-#endif
-#endif
+                                    tk_k = s_tk[tkp_k ^ 1];
                                     mbarrier_arrive(verdict_ack_addr);
                                     if (vword_k == 0) {
                                         break;
@@ -577,13 +544,13 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
             unsigned int mma_tmem_stage = 0;
             int unit_base_m = 0;
             unsigned int vphase_m = 0;
-#if TILE_UNROLL == 1
-#else
-#if __CUDA_ARCH__ == 1000
-#else
-            int tk_m = (int)bid;
-#endif
-#endif
+            int tk_m = 0;
+            if (lane == 0) {
+                tk_m = s_tk[0];
+            }
+            int _shfl_sync_0 = __shfl_sync(0xFFFFFFFF, tk_m, 0);
+            tk_m = _shfl_sync_0;
+            int tkp_m = 1;
             unsigned int _phase_q_full = 0;
             unsigned int _phase_k_full = 0;
             unsigned int _phase_umma_empty = 1;
@@ -593,75 +560,63 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
                 int q0_2 = cu_seqlens_q[seg_2];
                 int lq_2 = cu_seqlens_q[seg_2 + 1] - q0_2;
                 int nb_2 = (lq_2 + 8 - 1) / 8;
+                int cnt_m = nb_2;
 #if TILE_UNROLL == 1
 #else
 #if __CUDA_ARCH__ == 1000
 #else
                 int q0_e_2 = cu_seqlens_q[seg_2];
-                int lq_e_3 = cu_seqlens_q[seg_2 + 1] - q0_e_2;
-                int lk_e_3 = cu_seqlens_k[seg_2 + 1] - cu_seqlens_k[seg_2];
+                int lq_e_2 = cu_seqlens_q[seg_2 + 1] - q0_e_2;
+                int lk_e_2 = cu_seqlens_k[seg_2 + 1] - cu_seqlens_k[seg_2];
                 long long off_e_2 = 0;
                 if (has_offsets != 0) {
                     off_e_2 = q_offsets[seg_2];
                 } else if (ratio == 1) {
-                    off_e_2 = (long long)lk_e_3 - (long long)lq_e_3;
+                    off_e_2 = (long long)lk_e_2 - (long long)lq_e_2;
                 }
-                int last_e_2 = ((7) < (lq_e_3 - 1) ? (7) : (lq_e_3 - 1));
+                int last_e_2 = ((7) < (lq_e_2 - 1) ? (7) : (lq_e_2 - 1));
                 long long num_e_2 = off_e_2 + (long long)last_e_2 + 1;
                 int vis_e_2 = 0;
                 if (num_e_2 > 0) {
                     long long quot_e_4 = num_e_2 / (long long)ratio;
-                    long long lk64_e_4 = (long long)lk_e_3;
+                    long long lk64_e_4 = (long long)lk_e_2;
                     long long bnd_e_4 = ((quot_e_4 < lk64_e_4) ? quot_e_4 : lk64_e_4);
                     vis_e_2 = (int)bnd_e_4;
                 }
                 int tiles_e_2 = (vis_e_2 + 128 - 1) / 128;
                 int t_lo_m = tiles_e_2;
-                int q0_e_0_2 = cu_seqlens_q[seg_2];
-                int lq_e_1_2 = cu_seqlens_q[seg_2 + 1] - q0_e_0_2;
-                int lk_e_2_2 = cu_seqlens_k[seg_2 + 1] - cu_seqlens_k[seg_2];
-                long long off_e_3_2 = 0;
+                int q0_e_2_1 = cu_seqlens_q[seg_2];
+                int lq_e_2_1 = cu_seqlens_q[seg_2 + 1] - q0_e_2_1;
+                int lk_e_2_1 = cu_seqlens_k[seg_2 + 1] - cu_seqlens_k[seg_2];
+                long long off_e_2_1 = 0;
                 if (has_offsets != 0) {
-                    off_e_3_2 = q_offsets[seg_2];
+                    off_e_2_1 = q_offsets[seg_2];
                 } else if (ratio == 1) {
-                    off_e_3_2 = (long long)lk_e_2_2 - (long long)lq_e_1_2;
+                    off_e_2_1 = (long long)lk_e_2_1 - (long long)lq_e_2_1;
                 }
-                int last_e_4_2 = (((nb_2 - 1) * 8 + 7) < (lq_e_1_2 - 1) ? ((nb_2 - 1) * 8 + 7) : (lq_e_1_2 - 1));
-                long long num_e_5_2 = off_e_3_2 + (long long)last_e_4_2 + 1;
-                int vis_e_6_2 = 0;
-                if (num_e_5_2 > 0) {
-                    long long quot_e_5 = num_e_5_2 / (long long)ratio;
-                    long long lk64_e_5 = (long long)lk_e_2_2;
+                int last_e_2_1 = (((nb_2 - 1) * 8 + 7) < (lq_e_2_1 - 1) ? ((nb_2 - 1) * 8 + 7) : (lq_e_2_1 - 1));
+                long long num_e_2_1 = off_e_2_1 + (long long)last_e_2_1 + 1;
+                int vis_e_2_1 = 0;
+                if (num_e_2_1 > 0) {
+                    long long quot_e_5 = num_e_2_1 / (long long)ratio;
+                    long long lk64_e_5 = (long long)lk_e_2_1;
                     long long bnd_e_5 = ((quot_e_5 < lk64_e_5) ? quot_e_5 : lk64_e_5);
-                    vis_e_6_2 = (int)bnd_e_5;
+                    vis_e_2_1 = (int)bnd_e_5;
                 }
-                int tiles_e_7_2 = (vis_e_6_2 + 128 - 1) / 128;
-                int t_hi_m = tiles_e_7_2;
+                int tiles_e_2_1 = (vis_e_2_1 + 128 - 1) / 128;
+                int t_hi_m = tiles_e_2_1;
                 int near_eq_m = ((t_hi_m * 4 <= t_lo_m * 5) ? 1 : 0);
 #endif
 #endif
                 #pragma unroll 1
-#if TILE_UNROLL == 1
-                for (int rnd_2 = unit_base_m / grid_ctas; rnd_2 < (unit_base_m + nb_2 - 1) / grid_ctas + 1; rnd_2++) {
-                    int bid_i_2 = (int)bid;
-                    int pos_e_2 = bid_i_2;
-                    int unit_2 = rnd_2 * grid_ctas + pos_e_2;
-#else
-#if __CUDA_ARCH__ == 1000
-                for (int rnd_2 = unit_base_m / grid_ctas; rnd_2 < (unit_base_m + nb_2 - 1) / grid_ctas + 1; rnd_2++) {
-                    int bid_i_2 = (int)bid;
-                    int pos_e_2 = bid_i_2;
-                    int unit_2 = rnd_2 * grid_ctas + pos_e_2;
-#else
-                for (int rnd_2 = 0; rnd_2 < nb_2 + 1; rnd_2++) {
+                for (int rnd_2 = 0; rnd_2 < cnt_m + 1; rnd_2++) {
                     int unit_2 = tk_m;
-                    if (unit_2 >= unit_base_m + nb_2) {
+                    if (unit_2 >= unit_base_m + cnt_m) {
                         break;
                     }
-#endif
-#endif
-                    int _min_0_2 = ((unit_2 - unit_base_m) < (unit_base_m + nb_2 - 1 - unit_2) ? (unit_2 - unit_base_m) : (unit_base_m + nb_2 - 1 - unit_2));
-                    if (_min_0_2 >= 0) {
+                    tkp_m ^= 1;
+                    int _min_1 = ((unit_2 - unit_base_m) < (unit_base_m + nb_2 - 1 - unit_2) ? (unit_2 - unit_base_m) : (unit_base_m + nb_2 - 1 - unit_2));
+                    if (_min_1 >= 0) {
                         int blk_2 = nb_2 - 1 - (unit_2 - unit_base_m);
 #if TILE_UNROLL == 1
 #else
@@ -674,18 +629,18 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
                         }
 #endif
 #endif
-                        int q0_0_1 = cu_seqlens_q[seg_2];
-                        int lq_1_2 = cu_seqlens_q[seg_2 + 1] - q0_0_1;
+                        int q0_1_1 = cu_seqlens_q[seg_2];
+                        int lq_2_1 = cu_seqlens_q[seg_2 + 1] - q0_1_1;
                         int lk_1 = cu_seqlens_k[seg_2 + 1] - cu_seqlens_k[seg_2];
-                        long long off_1 = 0;
+                        long long off_2 = 0;
                         if (has_offsets != 0) {
-                            off_1 = q_offsets[seg_2];
+                            off_2 = q_offsets[seg_2];
                         } else if (ratio == 1) {
-                            off_1 = (long long)lk_1 - (long long)lq_1_2;
+                            off_2 = (long long)lk_1 - (long long)lq_2_1;
                         }
-                        long long off_2_1 = off_1;
-                        int last_u_1 = ((blk_2 * 8 + 7) < (lq_1_2 - 1) ? (blk_2 * 8 + 7) : (lq_1_2 - 1));
-                        long long num_1 = off_2_1 + (long long)last_u_1 + 1;
+                        long long off_1_1 = off_2;
+                        int last_u_1 = ((blk_2 * 8 + 7) < (lq_2_1 - 1) ? (blk_2 * 8 + 7) : (lq_2_1 - 1));
+                        long long num_1 = off_1_1 + (long long)last_u_1 + 1;
                         int vis_1 = 0;
                         if (num_1 > 0) {
                             long long quotient_1 = num_1 / (long long)ratio;
@@ -705,8 +660,8 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
                                 if (elect_sync()) {
                                     mbarrier_wait(umma_empty_addr + (mma_tmem_stage) * 8, _phase_umma_empty);
                                     asm volatile("tcgen05.fence::after_thread_sync;");
-                                    int _smem_desc_lo_1 = (((smem_k_addr) >> 4) & 0x3FFF) + (mma_k_stage) * 2048;
-                                    int _smem_desc_lo_2 = (((smem_q_addr) >> 4) & 0x3FFF) + (0) * 4096;
+                                    int _smem_desc_lo_2 = (((smem_k_addr) >> 4) & 0x3FFF) + (mma_k_stage) * 2048;
+                                    int _smem_desc_lo_3 = (((smem_q_addr) >> 4) & 0x3FFF) + (0) * 4096;
                                     asm volatile(
                     "{\n\t"
                     ".reg .pred p0, p1;\n\t"
@@ -760,7 +715,7 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "}\n"
-                    :: "r"(_smem_desc_lo_1), "r"(_smem_desc_lo_2), "r"((tmem_tmem_acc + (mma_tmem_stage * 256))), "r"(0) : "memory");
+                    :: "r"(_smem_desc_lo_2), "r"(_smem_desc_lo_3), "r"((tmem_tmem_acc + (mma_tmem_stage * 256))), "r"(0) : "memory");
                                     tcgen05_commit(umma_full_addr + (mma_tmem_stage) * 8);
                                     tcgen05_commit(k_empty_addr + (mma_k_stage) * 8);
                                     mma_tmem_stage += 1;
@@ -777,42 +732,24 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
                                 mbarrier_wait(verdict_bar_addr, _phase_verdict_bar_2);
                                 _phase_verdict_bar_2 ^= 1;
                                 int vread_m = 0;
-#if TILE_UNROLL == 1
-#else
-#if __CUDA_ARCH__ == 1000
-#else
                                 int tread_m = 0;
-#endif
-#endif
                                 if (lane == 0) {
-                                    uint32_t _shared_weak_0;
-                                    asm volatile("ld.shared.b32 %0, [%1];" : "=r"(_shared_weak_0) : "r"(static_cast<uint32_t>(s_fail_addr)));
-                                    unsigned int f_2 = _shared_weak_0;
+                                    uint32_t shared_weak;
+                                    asm volatile("ld.shared.b32 %0, [%1];" : "=r"(shared_weak) : "r"(static_cast<uint32_t>(s_fail_addr)));
+                                    unsigned int f_2 = shared_weak;
                                     for (int fw = 1; fw < 8; fw++) {
-                                        uint32_t _shared_weak_1;
-                                        asm volatile("ld.shared.b32 %0, [%1];" : "=r"(_shared_weak_1) : "r"(static_cast<uint32_t>(s_fail_addr + (unsigned int)(4 * fw))));
-                                        f_2 = f_2 | _shared_weak_1;
+                                        uint32_t shared_weak_1;
+                                        asm volatile("ld.shared.b32 %0, [%1];" : "=r"(shared_weak_1) : "r"(static_cast<uint32_t>(s_fail_addr + (unsigned int)(4 * fw))));
+                                        f_2 = f_2 | shared_weak_1;
                                     }
                                     vread_m = (int)f_2;
-#if TILE_UNROLL == 1
-#else
-#if __CUDA_ARCH__ == 1000
-#else
-                                    uint32_t _shared_weak_2;
-                                    asm volatile("ld.shared.b32 %0, [%1];" : "=r"(_shared_weak_2) : "r"(static_cast<uint32_t>(s_tk_addr)));
-                                    tread_m = (int)_shared_weak_2;
-#endif
-#endif
+                                    uint32_t tk_word_m;
+                                    asm volatile("ld.shared.b32 %0, [%1];" : "=r"(tk_word_m) : "r"(static_cast<uint32_t>(s_tk_addr + (unsigned int)((tkp_m ^ 1) * 4))));
+                                    tread_m = (int)tk_word_m;
                                 }
                                 int vword_m = __shfl_sync(0xFFFFFFFF, vread_m, 0);
-#if TILE_UNROLL == 1
-#else
-#if __CUDA_ARCH__ == 1000
-#else
-                                int _shfl_sync_3 = __shfl_sync(0xFFFFFFFF, tread_m, 0);
-                                tk_m = _shfl_sync_3;
-#endif
-#endif
+                                int _shfl_sync_4 = __shfl_sync(0xFFFFFFFF, tread_m, 0);
+                                tk_m = _shfl_sync_4;
                                 if (lane == 0) {
                                     mbarrier_arrive(verdict_ack_addr);
                                 }
@@ -844,15 +781,7 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
             int pair = warp_in_wg / 2;
             int half = warp_in_wg % 2;
             int pair_bar = 4 + wg * 2 + pair;
-#if TILE_UNROLL == 1
-            int bid_i_3 = (int)bid;
-#else
-#if __CUDA_ARCH__ == 1000
-            int bid_i_3 = (int)bid;
-#else
             int bid_i = (int)bid;
-#endif
-#endif
             unsigned int one_u = 1;
             unsigned int lower_lanes = (one_u << (unsigned int)lane) - 1;
             int hist_base = (wg * 2 + pair) * 256;
@@ -866,13 +795,14 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
             unsigned int math_tmem_stage = 0;
             unsigned int math_tmem_phase = 0;
             int unit_base = 0;
-#if TILE_UNROLL == 1
-#else
-#if __CUDA_ARCH__ == 1000
-#else
-            int tk_u = bid_i;
-#endif
-#endif
+            int tk_u = 0;
+            if (lane == 0) {
+                tk_u = s_tk[0];
+            }
+            int _shfl_sync_0_1 = __shfl_sync(0xFFFFFFFF, tk_u, 0);
+            tk_u = _shfl_sync_0_1;
+            int tkp_u = 1;
+            int tk_in_u = 0;
             int verdict_unit = 0;
             int keep_cap = ((top_k + 64) < (cand_cap - 128 * check_period) ? (top_k + 64) : (cand_cap - 128 * check_period));
             int trigger_room = 128 * check_period;
@@ -886,50 +816,51 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
                 int lq_3 = cu_seqlens_q[seg_3 + 1] - q0_3;
                 int lk_2 = cu_seqlens_k[seg_3 + 1] - cu_seqlens_k[seg_3];
                 int nb_3 = (lq_3 + 8 - 1) / 8;
+                int cnt_u = nb_3;
 #if TILE_UNROLL == 1
 #else
 #if __CUDA_ARCH__ == 1000
 #else
                 int q0_e_3 = cu_seqlens_q[seg_3];
-                int lq_e_4 = cu_seqlens_q[seg_3 + 1] - q0_e_3;
-                int lk_e_4 = cu_seqlens_k[seg_3 + 1] - cu_seqlens_k[seg_3];
-                long long off_e_4 = 0;
+                int lq_e_3 = cu_seqlens_q[seg_3 + 1] - q0_e_3;
+                int lk_e_3 = cu_seqlens_k[seg_3 + 1] - cu_seqlens_k[seg_3];
+                long long off_e_3 = 0;
                 if (has_offsets != 0) {
-                    off_e_4 = q_offsets[seg_3];
+                    off_e_3 = q_offsets[seg_3];
                 } else if (ratio == 1) {
-                    off_e_4 = (long long)lk_e_4 - (long long)lq_e_4;
+                    off_e_3 = (long long)lk_e_3 - (long long)lq_e_3;
                 }
-                int last_e_3 = ((7) < (lq_e_4 - 1) ? (7) : (lq_e_4 - 1));
-                long long num_e_3 = off_e_4 + (long long)last_e_3 + 1;
+                int last_e_3 = ((7) < (lq_e_3 - 1) ? (7) : (lq_e_3 - 1));
+                long long num_e_3 = off_e_3 + (long long)last_e_3 + 1;
                 int vis_e_3 = 0;
                 if (num_e_3 > 0) {
                     long long quot_e_6 = num_e_3 / (long long)ratio;
-                    long long lk64_e_6 = (long long)lk_e_4;
+                    long long lk64_e_6 = (long long)lk_e_3;
                     long long bnd_e_6 = ((quot_e_6 < lk64_e_6) ? quot_e_6 : lk64_e_6);
                     vis_e_3 = (int)bnd_e_6;
                 }
                 int tiles_e_3 = (vis_e_3 + 128 - 1) / 128;
                 int t_lo_u = tiles_e_3;
-                int q0_e_0_3 = cu_seqlens_q[seg_3];
-                int lq_e_1_3 = cu_seqlens_q[seg_3 + 1] - q0_e_0_3;
-                int lk_e_2_3 = cu_seqlens_k[seg_3 + 1] - cu_seqlens_k[seg_3];
-                long long off_e_3_3 = 0;
+                int q0_e_3_1 = cu_seqlens_q[seg_3];
+                int lq_e_3_1 = cu_seqlens_q[seg_3 + 1] - q0_e_3_1;
+                int lk_e_3_1 = cu_seqlens_k[seg_3 + 1] - cu_seqlens_k[seg_3];
+                long long off_e_3_1 = 0;
                 if (has_offsets != 0) {
-                    off_e_3_3 = q_offsets[seg_3];
+                    off_e_3_1 = q_offsets[seg_3];
                 } else if (ratio == 1) {
-                    off_e_3_3 = (long long)lk_e_2_3 - (long long)lq_e_1_3;
+                    off_e_3_1 = (long long)lk_e_3_1 - (long long)lq_e_3_1;
                 }
-                int last_e_4_3 = (((nb_3 - 1) * 8 + 7) < (lq_e_1_3 - 1) ? ((nb_3 - 1) * 8 + 7) : (lq_e_1_3 - 1));
-                long long num_e_5_3 = off_e_3_3 + (long long)last_e_4_3 + 1;
-                int vis_e_6_3 = 0;
-                if (num_e_5_3 > 0) {
-                    long long quot_e_7 = num_e_5_3 / (long long)ratio;
-                    long long lk64_e_7 = (long long)lk_e_2_3;
+                int last_e_3_1 = (((nb_3 - 1) * 8 + 7) < (lq_e_3_1 - 1) ? ((nb_3 - 1) * 8 + 7) : (lq_e_3_1 - 1));
+                long long num_e_3_1 = off_e_3_1 + (long long)last_e_3_1 + 1;
+                int vis_e_3_1 = 0;
+                if (num_e_3_1 > 0) {
+                    long long quot_e_7 = num_e_3_1 / (long long)ratio;
+                    long long lk64_e_7 = (long long)lk_e_3_1;
                     long long bnd_e_7 = ((quot_e_7 < lk64_e_7) ? quot_e_7 : lk64_e_7);
-                    vis_e_6_3 = (int)bnd_e_7;
+                    vis_e_3_1 = (int)bnd_e_7;
                 }
-                int tiles_e_7_3 = (vis_e_6_3 + 128 - 1) / 128;
-                int t_hi_u = tiles_e_7_3;
+                int tiles_e_3_1 = (vis_e_3_1 + 128 - 1) / 128;
+                int t_hi_u = tiles_e_3_1;
                 int near_eq_u = ((t_hi_u * 4 <= t_lo_u * 5) ? 1 : 0);
 #endif
 #endif
@@ -939,37 +870,16 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
                 } else if (ratio == 1) {
                     off_3 = (long long)lk_2 - (long long)lq_3;
                 }
-#if TILE_UNROLL == 1
-                long long off_0 = off_3;
-#else
-#if __CUDA_ARCH__ == 1000
-                long long off_0 = off_3;
-#else
-                long long off_8 = off_3;
-#endif
-#endif
+                long long dst = off_3;
                 #pragma unroll 1
-#if TILE_UNROLL == 1
-                for (int rnd_3 = unit_base / grid_ctas; rnd_3 < (unit_base + nb_3 - 1) / grid_ctas + 1; rnd_3++) {
-                    int bid_i_0 = (int)bid;
-                    int pos_e_3 = bid_i_0;
-                    int unit_3 = rnd_3 * grid_ctas + pos_e_3;
-#else
-#if __CUDA_ARCH__ == 1000
-                for (int rnd_3 = unit_base / grid_ctas; rnd_3 < (unit_base + nb_3 - 1) / grid_ctas + 1; rnd_3++) {
-                    int bid_i_0 = (int)bid;
-                    int pos_e_3 = bid_i_0;
-                    int unit_3 = rnd_3 * grid_ctas + pos_e_3;
-#else
-                for (int rnd_3 = 0; rnd_3 < nb_3 + 1; rnd_3++) {
+                for (int rnd_3 = 0; rnd_3 < cnt_u + 1; rnd_3++) {
                     int unit_3 = tk_u;
-                    if (unit_3 >= unit_base + nb_3) {
+                    if (unit_3 >= unit_base + cnt_u) {
                         break;
                     }
-#endif
-#endif
-                    int _min_0_3 = ((unit_3 - unit_base) < (unit_base + nb_3 - 1 - unit_3) ? (unit_3 - unit_base) : (unit_base + nb_3 - 1 - unit_3));
-                    if (_min_0_3 >= 0) {
+                    tkp_u ^= 1;
+                    int _min_1_1 = ((unit_3 - unit_base) < (unit_base + nb_3 - 1 - unit_3) ? (unit_3 - unit_base) : (unit_base + nb_3 - 1 - unit_3));
+                    if (_min_1_1 >= 0) {
                         int blk_3 = nb_3 - 1 - (unit_3 - unit_base);
 #if TILE_UNROLL == 1
 #else
@@ -983,50 +893,42 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
 #endif
 #endif
                         int u_base = blk_3 * 8;
-                        int q0_0_2 = cu_seqlens_q[seg_3];
-                        int lq_1_3 = cu_seqlens_q[seg_3 + 1] - q0_0_2;
-                        int lk_2_1 = cu_seqlens_k[seg_3 + 1] - cu_seqlens_k[seg_3];
-                        long long off_3_1 = 0;
+                        int q0_2_1 = cu_seqlens_q[seg_3];
+                        int lq_3_1 = cu_seqlens_q[seg_3 + 1] - q0_2_1;
+                        int lk_0 = cu_seqlens_k[seg_3 + 1] - cu_seqlens_k[seg_3];
+                        long long off_1_2 = 0;
                         if (has_offsets != 0) {
-                            off_3_1 = q_offsets[seg_3];
+                            off_1_2 = q_offsets[seg_3];
                         } else if (ratio == 1) {
-                            off_3_1 = (long long)lk_2_1 - (long long)lq_1_3;
+                            off_1_2 = (long long)lk_0 - (long long)lq_3_1;
                         }
-                        long long off_4 = off_3_1;
-                        int last_u_2 = ((blk_3 * 8 + 7) < (lq_1_3 - 1) ? (blk_3 * 8 + 7) : (lq_1_3 - 1));
-                        long long num_2 = off_4 + (long long)last_u_2 + 1;
+                        long long off_1_0 = off_1_2;
+                        int last_u_2 = ((blk_3 * 8 + 7) < (lq_3_1 - 1) ? (blk_3 * 8 + 7) : (lq_3_1 - 1));
+                        long long num_2 = off_1_0 + (long long)last_u_2 + 1;
                         int vis_2 = 0;
                         if (num_2 > 0) {
                             long long quotient_2 = num_2 / (long long)ratio;
-                            long long lk64_2 = (long long)lk_2_1;
+                            long long lk64_2 = (long long)lk_0;
                             long long bounded_2 = ((quotient_2 < lk64_2) ? quotient_2 : lk64_2);
                             vis_2 = (int)bounded_2;
                         }
                         int v_max_2 = vis_2;
                         int n_tiles_2 = (v_max_2 + 128 - 1) / 128;
                         int n_tiles_5 = n_tiles_2;
-#if TILE_UNROLL == 1
-                        int buf_unit = (bid_i_3 * 8 + wg * 4) * cand_cap;
-#else
-#if __CUDA_ARCH__ == 1000
-                        int buf_unit = (bid_i_3 * 8 + wg * 4) * cand_cap;
-#else
                         int buf_unit = (bid_i * 8 + wg * 4) * cand_cap;
-#endif
-#endif
                         int buf_pairs[2];
                         int slot_pairs[2];
                         int valid_pairs[2];
                         buf_pairs[0] = buf_unit + pair * 2 * cand_cap;
                         slot_pairs[0] = wg * 4 + pair * 2;
-                        int u_qj = u_base + wg * 4 + pair * 2;
-                        int valid_j = ((u_qj < lq_3) ? 1 : 0);
-                        valid_pairs[0] = valid_j;
+                        int u_qj_1_0 = u_base + wg * 4 + pair * 2;
+                        int valid_j_1_0 = ((u_qj_1_0 < lq_3) ? 1 : 0);
+                        valid_pairs[0] = valid_j_1_0;
                         buf_pairs[1] = buf_unit + (pair * 2 + 1) * cand_cap;
                         slot_pairs[1] = wg * 4 + pair * 2 + 1;
-                        int u_qj_6 = u_base + wg * 4 + pair * 2 + 1;
-                        int valid_j_7 = ((u_qj_6 < lq_3) ? 1 : 0);
-                        valid_pairs[1] = valid_j_7;
+                        int u_qj_1_1 = u_base + wg * 4 + pair * 2 + 1;
+                        int valid_j_1_1 = ((u_qj_1_1 < lq_3) ? 1 : 0);
+                        valid_pairs[1] = valid_j_1_1;
                         int max_tiles_1 = ((sample_tiles_max) < (cand_cap / 128 - check_period) ? (sample_tiles_max) : (cand_cap / 128 - check_period));
                         int stride_1 = 1;
                         int n_sample_1 = 0;
@@ -1065,13 +967,13 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
                             while (ti0 < n_tiles_5) {
                                 int run_c = ((until_check + 1) < (n_tiles_5 - ti0) ? (until_check + 1) : (n_tiles_5 - ti0));
                                 if (n_s > ti0) {
-                                    int _min_1 = ((run_c) < (n_s - ti0) ? (run_c) : (n_s - ti0));
-                                    run_c = _min_1;
+                                    int _min_2 = ((run_c) < (n_s - ti0) ? (run_c) : (n_s - ti0));
+                                    run_c = _min_2;
                                 }
                                 int head_c = 0;
                                 if (pend != 0) {
-                                    int _min_2 = ((run_c) < (3) ? (run_c) : (3));
-                                    head_c = _min_2;
+                                    int _min_3 = ((run_c) < (3) ? (run_c) : (3));
+                                    head_c = _min_3;
                                 }
                                 #pragma unroll 1
                                 for (int ti_2 = ti0; ti_2 < ti0 + head_c; ti_2++) {
@@ -1081,20 +983,20 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
                                     asm volatile("tcgen05.fence::after_thread_sync;");
                                     unsigned int bits2[4];
                                     float weights_reg[64];
-                                    float _tmem_load_0[32];
-                                    tmem_ld_x16(&_tmem_load_0[0], taddr + math_tmem_stage * 256 + (unsigned int)(wg * 4 * 32) + (unsigned int)(warp_in_wg * 32 << 16));
-                                    tmem_ld_x16(&_tmem_load_0[16], taddr + math_tmem_stage * 256 + (unsigned int)(wg * 4 * 32) + (unsigned int)(warp_in_wg * 32 << 16) + 16);
-                                    float _tmem_load_1[32];
-                                    tmem_ld_x16(&_tmem_load_1[0], taddr + math_tmem_stage * 256 + (unsigned int)((wg * 4 + 1) * 32) + (unsigned int)(warp_in_wg * 32 << 16));
-                                    tmem_ld_x16(&_tmem_load_1[16], taddr + math_tmem_stage * 256 + (unsigned int)((wg * 4 + 1) * 32) + (unsigned int)(warp_in_wg * 32 << 16) + 16);
+                                    float tmem_load[32];
+                                    tmem_ld_x16(&tmem_load[0], taddr + math_tmem_stage * 256 + (unsigned int)(wg * 4 * 32) + (unsigned int)(warp_in_wg * 32 << 16));
+                                    tmem_ld_x16(&tmem_load[16], taddr + math_tmem_stage * 256 + (unsigned int)(wg * 4 * 32) + (unsigned int)(warp_in_wg * 32 << 16) + 16);
+                                    float tmem_load_0[32];
+                                    tmem_ld_x16(&tmem_load_0[0], taddr + math_tmem_stage * 256 + (unsigned int)((wg * 4 + 1) * 32) + (unsigned int)(warp_in_wg * 32 << 16));
+                                    tmem_ld_x16(&tmem_load_0[16], taddr + math_tmem_stage * 256 + (unsigned int)((wg * 4 + 1) * 32) + (unsigned int)(warp_in_wg * 32 << 16) + 16);
                                     asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
                                     float2 sum0 = make_float2(0.0f, 0.0f);
                                     float2 sum1 = make_float2(0.0f, 0.0f);
                                     #pragma unroll
                                     for (int j = 0; j < 32; j += 4) {
-                                        float2 doubled0 = add_f32x2_noftz(make_float2(_tmem_load_0[j], _tmem_load_0[j + 1]), make_float2(fabsf(_tmem_load_0[j]), fabsf(_tmem_load_0[j + 1])));
+                                        float2 doubled0 = add_f32x2_noftz(make_float2(tmem_load[j], tmem_load[j + 1]), make_float2(fabsf(tmem_load[j]), fabsf(tmem_load[j + 1])));
                                         sum0 = fma_f32x2_rn_noftz(doubled0, make_float2(weights_a[j], weights_a[j + 1]), sum0);
-                                        float2 doubled1 = add_f32x2_noftz(make_float2(_tmem_load_0[j + 2], _tmem_load_0[j + 3]), make_float2(fabsf(_tmem_load_0[j + 2]), fabsf(_tmem_load_0[j + 3])));
+                                        float2 doubled1 = add_f32x2_noftz(make_float2(tmem_load[j + 2], tmem_load[j + 3]), make_float2(fabsf(tmem_load[j + 2]), fabsf(tmem_load[j + 3])));
                                         sum1 = fma_f32x2_rn_noftz(doubled1, make_float2(weights_a[j + 2], weights_a[j + 3]), sum1);
                                     }
                                     float2 total = add_f32x2_noftz(sum0, sum1);
@@ -1103,27 +1005,27 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
                                     unsigned int bits_w = 0;
                                     bits_w = reinterpret_cast<unsigned int*>(&score_w)[0];
                                     bits2[0] = bits_w;
-                                    float _tmem_load_2[32];
-                                    tmem_ld_x16(&_tmem_load_2[0], taddr + math_tmem_stage * 256 + (unsigned int)((wg * 4 + 2) * 32) + (unsigned int)(warp_in_wg * 32 << 16));
-                                    tmem_ld_x16(&_tmem_load_2[16], taddr + math_tmem_stage * 256 + (unsigned int)((wg * 4 + 2) * 32) + (unsigned int)(warp_in_wg * 32 << 16) + 16);
-                                    float _tmem_load_3[32];
-                                    tmem_ld_x16(&_tmem_load_3[0], taddr + math_tmem_stage * 256 + (unsigned int)((wg * 4 + 3) * 32) + (unsigned int)(warp_in_wg * 32 << 16));
-                                    tmem_ld_x16(&_tmem_load_3[16], taddr + math_tmem_stage * 256 + (unsigned int)((wg * 4 + 3) * 32) + (unsigned int)(warp_in_wg * 32 << 16) + 16);
+                                    float tmem_load_1[32];
+                                    tmem_ld_x16(&tmem_load_1[0], taddr + math_tmem_stage * 256 + (unsigned int)((wg * 4 + 2) * 32) + (unsigned int)(warp_in_wg * 32 << 16));
+                                    tmem_ld_x16(&tmem_load_1[16], taddr + math_tmem_stage * 256 + (unsigned int)((wg * 4 + 2) * 32) + (unsigned int)(warp_in_wg * 32 << 16) + 16);
+                                    float tmem_load_2[32];
+                                    tmem_ld_x16(&tmem_load_2[0], taddr + math_tmem_stage * 256 + (unsigned int)((wg * 4 + 3) * 32) + (unsigned int)(warp_in_wg * 32 << 16));
+                                    tmem_ld_x16(&tmem_load_2[16], taddr + math_tmem_stage * 256 + (unsigned int)((wg * 4 + 3) * 32) + (unsigned int)(warp_in_wg * 32 << 16) + 16);
                                     float2 sum0_0 = make_float2(0.0f, 0.0f);
-                                    float2 sum1_1 = make_float2(0.0f, 0.0f);
+                                    float2 sum1_0 = make_float2(0.0f, 0.0f);
                                     #pragma unroll
                                     for (int j_1 = 0; j_1 < 32; j_1 += 4) {
-                                        float2 doubled0_1 = add_f32x2_noftz(make_float2(_tmem_load_1[j_1], _tmem_load_1[j_1 + 1]), make_float2(fabsf(_tmem_load_1[j_1]), fabsf(_tmem_load_1[j_1 + 1])));
+                                        float2 doubled0_1 = add_f32x2_noftz(make_float2(tmem_load_0[j_1], tmem_load_0[j_1 + 1]), make_float2(fabsf(tmem_load_0[j_1]), fabsf(tmem_load_0[j_1 + 1])));
                                         sum0_0 = fma_f32x2_rn_noftz(doubled0_1, make_float2(weights_a[32 + j_1], weights_a[32 + j_1 + 1]), sum0_0);
-                                        float2 doubled1_1 = add_f32x2_noftz(make_float2(_tmem_load_1[j_1 + 2], _tmem_load_1[j_1 + 3]), make_float2(fabsf(_tmem_load_1[j_1 + 2]), fabsf(_tmem_load_1[j_1 + 3])));
-                                        sum1_1 = fma_f32x2_rn_noftz(doubled1_1, make_float2(weights_a[32 + j_1 + 2], weights_a[32 + j_1 + 3]), sum1_1);
+                                        float2 doubled1_1 = add_f32x2_noftz(make_float2(tmem_load_0[j_1 + 2], tmem_load_0[j_1 + 3]), make_float2(fabsf(tmem_load_0[j_1 + 2]), fabsf(tmem_load_0[j_1 + 3])));
+                                        sum1_0 = fma_f32x2_rn_noftz(doubled1_1, make_float2(weights_a[32 + j_1 + 2], weights_a[32 + j_1 + 3]), sum1_0);
                                     }
-                                    float2 total_2 = add_f32x2_noftz(sum0_0, sum1_1);
-                                    float relu_wsum_3 = (total_2.x + total_2.y) * 0.5f;
-                                    float score_w_4 = relu_wsum_3;
-                                    unsigned int bits_w_5 = 0;
-                                    bits_w_5 = reinterpret_cast<unsigned int*>(&score_w_4)[0];
-                                    bits2[1] = bits_w_5;
+                                    float2 total_0 = add_f32x2_noftz(sum0_0, sum1_0);
+                                    float relu_wsum_0 = (total_0.x + total_0.y) * 0.5f;
+                                    float score_w_0 = relu_wsum_0;
+                                    unsigned int bits_w_0 = 0;
+                                    bits_w_0 = reinterpret_cast<unsigned int*>(&score_w_0)[0];
+                                    bits2[1] = bits_w_0;
                                     asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                                         : "=r"(*reinterpret_cast<uint32_t*>(&weights_reg[0])), "=r"(*reinterpret_cast<uint32_t*>(&weights_reg[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&weights_reg[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&weights_reg[(0) + 3]))
                                         : "r"(wsc_addr + 256));
@@ -1202,36 +1104,36 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
                                     uint32_t _mbar_token_0 = mbarrier_test_wait(umma_full_addr + (math_tmem_stage) * 8, _phase_umma_full);
                                     acc_tok = _mbar_token_0;
 #endif
-                                    float2 sum0_6 = make_float2(0.0f, 0.0f);
-                                    float2 sum1_7 = make_float2(0.0f, 0.0f);
+                                    float2 sum0_1 = make_float2(0.0f, 0.0f);
+                                    float2 sum1_1 = make_float2(0.0f, 0.0f);
                                     #pragma unroll
                                     for (int j_2 = 0; j_2 < 32; j_2 += 4) {
-                                        float2 doubled0_2 = add_f32x2_noftz(make_float2(_tmem_load_2[j_2], _tmem_load_2[j_2 + 1]), make_float2(fabsf(_tmem_load_2[j_2]), fabsf(_tmem_load_2[j_2 + 1])));
-                                        sum0_6 = fma_f32x2_rn_noftz(doubled0_2, make_float2(weights_reg[j_2], weights_reg[j_2 + 1]), sum0_6);
-                                        float2 doubled1_2 = add_f32x2_noftz(make_float2(_tmem_load_2[j_2 + 2], _tmem_load_2[j_2 + 3]), make_float2(fabsf(_tmem_load_2[j_2 + 2]), fabsf(_tmem_load_2[j_2 + 3])));
-                                        sum1_7 = fma_f32x2_rn_noftz(doubled1_2, make_float2(weights_reg[j_2 + 2], weights_reg[j_2 + 3]), sum1_7);
+                                        float2 doubled0_2 = add_f32x2_noftz(make_float2(tmem_load_1[j_2], tmem_load_1[j_2 + 1]), make_float2(fabsf(tmem_load_1[j_2]), fabsf(tmem_load_1[j_2 + 1])));
+                                        sum0_1 = fma_f32x2_rn_noftz(doubled0_2, make_float2(weights_reg[j_2], weights_reg[j_2 + 1]), sum0_1);
+                                        float2 doubled1_2 = add_f32x2_noftz(make_float2(tmem_load_1[j_2 + 2], tmem_load_1[j_2 + 3]), make_float2(fabsf(tmem_load_1[j_2 + 2]), fabsf(tmem_load_1[j_2 + 3])));
+                                        sum1_1 = fma_f32x2_rn_noftz(doubled1_2, make_float2(weights_reg[j_2 + 2], weights_reg[j_2 + 3]), sum1_1);
                                     }
-                                    float2 total_8 = add_f32x2_noftz(sum0_6, sum1_7);
-                                    float relu_wsum_9 = (total_8.x + total_8.y) * 0.5f;
-                                    float score_w_10 = relu_wsum_9;
-                                    unsigned int bits_w_11 = 0;
-                                    bits_w_11 = reinterpret_cast<unsigned int*>(&score_w_10)[0];
-                                    bits2[2] = bits_w_11;
-                                    float2 sum0_12 = make_float2(0.0f, 0.0f);
-                                    float2 sum1_13 = make_float2(0.0f, 0.0f);
+                                    float2 total_1 = add_f32x2_noftz(sum0_1, sum1_1);
+                                    float relu_wsum_1 = (total_1.x + total_1.y) * 0.5f;
+                                    float score_w_1 = relu_wsum_1;
+                                    unsigned int bits_w_1 = 0;
+                                    bits_w_1 = reinterpret_cast<unsigned int*>(&score_w_1)[0];
+                                    bits2[2] = bits_w_1;
+                                    float2 sum0_2 = make_float2(0.0f, 0.0f);
+                                    float2 sum1_2 = make_float2(0.0f, 0.0f);
                                     #pragma unroll
                                     for (int j_3 = 0; j_3 < 32; j_3 += 4) {
-                                        float2 doubled0_3 = add_f32x2_noftz(make_float2(_tmem_load_3[j_3], _tmem_load_3[j_3 + 1]), make_float2(fabsf(_tmem_load_3[j_3]), fabsf(_tmem_load_3[j_3 + 1])));
-                                        sum0_12 = fma_f32x2_rn_noftz(doubled0_3, make_float2(weights_reg[32 + j_3], weights_reg[32 + j_3 + 1]), sum0_12);
-                                        float2 doubled1_3 = add_f32x2_noftz(make_float2(_tmem_load_3[j_3 + 2], _tmem_load_3[j_3 + 3]), make_float2(fabsf(_tmem_load_3[j_3 + 2]), fabsf(_tmem_load_3[j_3 + 3])));
-                                        sum1_13 = fma_f32x2_rn_noftz(doubled1_3, make_float2(weights_reg[32 + j_3 + 2], weights_reg[32 + j_3 + 3]), sum1_13);
+                                        float2 doubled0_3 = add_f32x2_noftz(make_float2(tmem_load_2[j_3], tmem_load_2[j_3 + 1]), make_float2(fabsf(tmem_load_2[j_3]), fabsf(tmem_load_2[j_3 + 1])));
+                                        sum0_2 = fma_f32x2_rn_noftz(doubled0_3, make_float2(weights_reg[32 + j_3], weights_reg[32 + j_3 + 1]), sum0_2);
+                                        float2 doubled1_3 = add_f32x2_noftz(make_float2(tmem_load_2[j_3 + 2], tmem_load_2[j_3 + 3]), make_float2(fabsf(tmem_load_2[j_3 + 2]), fabsf(tmem_load_2[j_3 + 3])));
+                                        sum1_2 = fma_f32x2_rn_noftz(doubled1_3, make_float2(weights_reg[32 + j_3 + 2], weights_reg[32 + j_3 + 3]), sum1_2);
                                     }
-                                    float2 total_14 = add_f32x2_noftz(sum0_12, sum1_13);
-                                    float relu_wsum_15 = (total_14.x + total_14.y) * 0.5f;
-                                    float score_w_16 = relu_wsum_15;
-                                    unsigned int bits_w_17 = 0;
-                                    bits_w_17 = reinterpret_cast<unsigned int*>(&score_w_16)[0];
-                                    bits2[3] = bits_w_17;
+                                    float2 total_2 = add_f32x2_noftz(sum0_2, sum1_2);
+                                    float relu_wsum_2 = (total_2.x + total_2.y) * 0.5f;
+                                    float score_w_2 = relu_wsum_2;
+                                    unsigned int bits_w_2 = 0;
+                                    bits_w_2 = reinterpret_cast<unsigned int*>(&score_w_2)[0];
+                                    bits2[3] = bits_w_2;
                                     mbarrier_wait(scores_empty_addr + (math_sc) * 8, _phase_scores_empty);
                                     if ((pend >> 2 - (ti_2 - ti0) & 1) != 0) {
                                         mbarrier_wait(comp_req_addr + (fold_rq) * 8, _phase_comp_req);
@@ -1247,18 +1149,18 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
                                         need_any = need_any | s_req[rq_base + 25];
                                         need_any = need_any | s_req[rq_base + 30];
                                         need_any = need_any | s_req[rq_base + 35];
-                                        int rq_j = rq_base + slot_pairs[0] * 5;
-                                        int need_j = s_req[rq_j];
-                                        if (need_j != 0) {
-                                            int kw_j = s_req[rq_j + 1];
-                                            int km_j = s_req[rq_j + 2];
-                                            int sk_j = s_req[rq_j + 3];
-                                            int c_j = s_req[rq_j + 4];
+                                        int rq_j_1_0 = rq_base + slot_pairs[0] * 5;
+                                        int need_j_2_0 = s_req[rq_j_1_0];
+                                        if (need_j_2_0 != 0) {
+                                            int kw_j_1_0 = s_req[rq_j_1_0 + 1];
+                                            int km_j_1_0 = s_req[rq_j_1_0 + 2];
+                                            int sk_j_1_0 = s_req[rq_j_1_0 + 3];
+                                            int c_j_1_0 = s_req[rq_j_1_0 + 4];
 #if __CUDA_ARCH__ == 1000
 #else
-                                            int c_rank = c_j - sk_j;
+                                            int c_rank = c_j_1_0 - sk_j_1_0;
 #endif
-                                            int k_rem = kw_j;
+                                            int k_rem = kw_j_1_0;
                                             int kept_above = 0;
                                             unsigned long long prefix = 0;
                                             unsigned long long edge = 0;
@@ -1285,8 +1187,8 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
                                                         int idx_l = s_pro * 512 + half * 32 + lane_0 + 64 * u;
                                                         ring[s_pro * 8 + u] = 0;
 #if __CUDA_ARCH__ == 1000
-                                                        if (idx_l < c_j - sk_j) {
-                                                            ring[s_pro * 8 + u] = (unsigned long long)Cand[buf_pairs[0] + sk_j + idx_l];
+                                                        if (idx_l < c_j_1_0 - sk_j_1_0) {
+                                                            ring[s_pro * 8 + u] = (unsigned long long)Cand[buf_pairs[0] + sk_j_1_0 + idx_l];
 #else
                                                         if (idx_l < c_rank) {
                                                             ring[s_pro * 8 + u] = (unsigned long long)Cand[buf_pairs[0] + idx_l];
@@ -1295,7 +1197,7 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
                                                     }
                                                 }
 #if __CUDA_ARCH__ == 1000
-                                                int nbat = (c_j - sk_j + 512 - 1) / 512;
+                                                int nbat = (c_j_1_0 - sk_j_1_0 + 512 - 1) / 512;
 #else
                                                 int nbat = (c_rank + 512 - 1) / 512;
 #endif
@@ -1306,7 +1208,7 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
                                                         #pragma unroll
                                                         for (int u_1 = 0; u_1 < 8; u_1++) {
 #if __CUDA_ARCH__ == 1000
-                                                            int valid_p = (((g + s_st) * 512 + half * 32 + lane_0 + 64 * u_1 < c_j - sk_j) ? 1 : 0);
+                                                            int valid_p = (((g + s_st) * 512 + half * 32 + lane_0 + 64 * u_1 < c_j_1_0 - sk_j_1_0) ? 1 : 0);
 #else
                                                             int valid_p = ((c_rank > (g + s_st) * 512 + half * 32 + lane_0 + 64 * u_1) ? 1 : 0);
 #endif
@@ -1332,8 +1234,8 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
                                                             int idx_l_1 = (g + s_st + 1) * 512 + half * 32 + lane_0 + 64 * u_2;
                                                             ring[(s_st + 1) % 2 * 8 + u_2] = 0;
 #if __CUDA_ARCH__ == 1000
-                                                            if (idx_l_1 < c_j - sk_j) {
-                                                                ring[(s_st + 1) % 2 * 8 + u_2] = (unsigned long long)Cand[buf_pairs[0] + sk_j + idx_l_1];
+                                                            if (idx_l_1 < c_j_1_0 - sk_j_1_0) {
+                                                                ring[(s_st + 1) % 2 * 8 + u_2] = (unsigned long long)Cand[buf_pairs[0] + sk_j_1_0 + idx_l_1];
 #else
                                                             if (idx_l_1 < c_rank) {
                                                                 ring[(s_st + 1) % 2 * 8 + u_2] = (unsigned long long)Cand[buf_pairs[0] + idx_l_1];
@@ -1362,25 +1264,25 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
                                                 lane_bins[7] = s_hist[hist_base + lane_0 * 8 + 7];
                                                 lane_sum += lane_bins[7];
                                                 int suffix = lane_sum;
-                                                int above_part = __shfl_down_sync(0xFFFFFFFF, suffix, 1, 32);
+                                                int above_part_4_0 = __shfl_down_sync(0xFFFFFFFF, suffix, 1, 32);
                                                 if (lane_0 + 1 < 32) {
-                                                    suffix += above_part;
+                                                    suffix += above_part_4_0;
                                                 }
-                                                int above_part_0 = __shfl_down_sync(0xFFFFFFFF, suffix, 2, 32);
+                                                int above_part_4_1 = __shfl_down_sync(0xFFFFFFFF, suffix, 2, 32);
                                                 if (lane_0 + 2 < 32) {
-                                                    suffix += above_part_0;
+                                                    suffix += above_part_4_1;
                                                 }
-                                                int above_part_1 = __shfl_down_sync(0xFFFFFFFF, suffix, 4, 32);
+                                                int above_part_4_2 = __shfl_down_sync(0xFFFFFFFF, suffix, 4, 32);
                                                 if (lane_0 + 4 < 32) {
-                                                    suffix += above_part_1;
+                                                    suffix += above_part_4_2;
                                                 }
-                                                int above_part_2 = __shfl_down_sync(0xFFFFFFFF, suffix, 8, 32);
+                                                int above_part_4_3 = __shfl_down_sync(0xFFFFFFFF, suffix, 8, 32);
                                                 if (lane_0 + 8 < 32) {
-                                                    suffix += above_part_2;
+                                                    suffix += above_part_4_3;
                                                 }
-                                                int above_part_3 = __shfl_down_sync(0xFFFFFFFF, suffix, 16, 32);
+                                                int above_part_4_4 = __shfl_down_sync(0xFFFFFFFF, suffix, 16, 32);
                                                 if (lane_0 + 16 < 32) {
-                                                    suffix += above_part_3;
+                                                    suffix += above_part_4_4;
                                                 }
                                                 int excl = suffix - lane_sum;
                                                 int is_target = ((excl < k_rem && k_rem <= excl + lane_sum) ? 1 : 0);
@@ -1470,7 +1372,7 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
                                                 kept_above += above_cnt;
                                                 prefix = prefix << 8 | (unsigned long long)(unsigned int)(target_lane * 8 + digit_sel);
                                                 edge = prefix << (unsigned long long)shift;
-                                                if (km_j >= kept_above + bucket_cnt) {
+                                                if (km_j_1_0 >= kept_above + bucket_cnt) {
                                                     break;
                                                 }
                                             }
@@ -1478,19 +1380,19 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
                                             if (half == 0) {
                                                 int write_pos = 0;
                                                 #pragma unroll 1
-                                                for (int e0 = 0; e0 < c_j; e0 += 256) {
+                                                for (int e0 = 0; e0 < c_j_1_0; e0 += 256) {
                                                     unsigned long long ent[8];
                                                     #pragma unroll
                                                     for (int u_3 = 0; u_3 < 8; u_3++) {
                                                         ent[u_3] = 0;
-                                                        if (c_j > e0 + lane_0 + 32 * u_3) {
+                                                        if (c_j_1_0 > e0 + lane_0 + 32 * u_3) {
                                                             ent[u_3] = (unsigned long long)Cand[buf_pairs[0] + e0 + lane_0 + 32 * u_3];
                                                         }
                                                     }
                                                     #pragma unroll
                                                     for (int u_4 = 0; u_4 < 8; u_4++) {
                                                         int keep = 0;
-                                                        if (c_j > e0 + lane_0 + 32 * u_4) {
+                                                        if (c_j_1_0 > e0 + lane_0 + 32 * u_4) {
                                                             unsigned int bits_1 = (unsigned int)(ent[u_4] >> 32);
                                                             int kid_1 = (int)(unsigned int)(ent[u_4] & 4294967295);
                                                             unsigned int magnitude_1 = bits_1 & 2147483647;
@@ -1503,11 +1405,11 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
                                                             unsigned long long key_1 = key64_1;
                                                             keep = ((key_1 >= edge_0) ? 1 : 0);
                                                         }
-                                                        unsigned int _vote_0 = __ballot_sync(0xFFFFFFFF, keep != 0);
+                                                        unsigned int vote = __ballot_sync(0xFFFFFFFF, keep != 0);
                                                         if (keep != 0) {
-                                                            Cand[buf_pairs[0] + write_pos + (int)(unsigned int)__popc(_vote_0 & lower_lanes)] = (long long)ent[u_4];
+                                                            Cand[buf_pairs[0] + write_pos + (int)(unsigned int)__popc(vote & lower_lanes)] = (long long)ent[u_4];
                                                         }
-                                                        write_pos += (int)(unsigned int)__popc(_vote_0);
+                                                        write_pos += (int)(unsigned int)__popc(vote);
                                                     }
                                                 }
                                                 if (lane_0 == 0) {
@@ -1518,18 +1420,18 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
                                             }
                                             asm volatile("barrier.sync %0, 64;" :: "r"(pair_bar) : "memory");
                                         }
-                                        int rq_j_0 = rq_base + slot_pairs[1] * 5;
-                                        int need_j_1 = s_req[rq_j_0];
-                                        if (need_j_1 != 0) {
-                                            int kw_j_1 = s_req[rq_j_0 + 1];
-                                            int km_j_1 = s_req[rq_j_0 + 2];
-                                            int sk_j_1 = s_req[rq_j_0 + 3];
-                                            int c_j_1 = s_req[rq_j_0 + 4];
+                                        int rq_j_1_1 = rq_base + slot_pairs[1] * 5;
+                                        int need_j_2_1 = s_req[rq_j_1_1];
+                                        if (need_j_2_1 != 0) {
+                                            int kw_j_1_1 = s_req[rq_j_1_1 + 1];
+                                            int km_j_1_1 = s_req[rq_j_1_1 + 2];
+                                            int sk_j_1_1 = s_req[rq_j_1_1 + 3];
+                                            int c_j_1_1 = s_req[rq_j_1_1 + 4];
 #if __CUDA_ARCH__ == 1000
 #else
-                                            int c_rank_1 = c_j_1 - sk_j_1;
+                                            int c_rank_1 = c_j_1_1 - sk_j_1_1;
 #endif
-                                            int k_rem_1 = kw_j_1;
+                                            int k_rem_1 = kw_j_1_1;
                                             int kept_above_1 = 0;
                                             unsigned long long prefix_1 = 0;
                                             unsigned long long edge_1 = 0;
@@ -1556,8 +1458,8 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
                                                         int idx_l_2 = s_pro_1 * 512 + half * 32 + lane_0 + 64 * u_5;
                                                         ring_1[s_pro_1 * 8 + u_5] = 0;
 #if __CUDA_ARCH__ == 1000
-                                                        if (idx_l_2 < c_j_1 - sk_j_1) {
-                                                            ring_1[s_pro_1 * 8 + u_5] = (unsigned long long)Cand[buf_pairs[1] + sk_j_1 + idx_l_2];
+                                                        if (idx_l_2 < c_j_1_1 - sk_j_1_1) {
+                                                            ring_1[s_pro_1 * 8 + u_5] = (unsigned long long)Cand[buf_pairs[1] + sk_j_1_1 + idx_l_2];
 #else
                                                         if (idx_l_2 < c_rank_1) {
                                                             ring_1[s_pro_1 * 8 + u_5] = (unsigned long long)Cand[buf_pairs[1] + idx_l_2];
@@ -1566,7 +1468,7 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
                                                     }
                                                 }
 #if __CUDA_ARCH__ == 1000
-                                                int nbat_1 = (c_j_1 - sk_j_1 + 512 - 1) / 512;
+                                                int nbat_1 = (c_j_1_1 - sk_j_1_1 + 512 - 1) / 512;
 #else
                                                 int nbat_1 = (c_rank_1 + 512 - 1) / 512;
 #endif
@@ -1577,7 +1479,7 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
                                                         #pragma unroll
                                                         for (int u_6 = 0; u_6 < 8; u_6++) {
 #if __CUDA_ARCH__ == 1000
-                                                            int valid_p_1 = (((g_1 + s_st_1) * 512 + half * 32 + lane_0 + 64 * u_6 < c_j_1 - sk_j_1) ? 1 : 0);
+                                                            int valid_p_1 = (((g_1 + s_st_1) * 512 + half * 32 + lane_0 + 64 * u_6 < c_j_1_1 - sk_j_1_1) ? 1 : 0);
 #else
                                                             int valid_p_1 = ((c_rank_1 > (g_1 + s_st_1) * 512 + half * 32 + lane_0 + 64 * u_6) ? 1 : 0);
 #endif
@@ -1603,8 +1505,8 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
                                                             int idx_l_3 = (g_1 + s_st_1 + 1) * 512 + half * 32 + lane_0 + 64 * u_7;
                                                             ring_1[(s_st_1 + 1) % 2 * 8 + u_7] = 0;
 #if __CUDA_ARCH__ == 1000
-                                                            if (idx_l_3 < c_j_1 - sk_j_1) {
-                                                                ring_1[(s_st_1 + 1) % 2 * 8 + u_7] = (unsigned long long)Cand[buf_pairs[1] + sk_j_1 + idx_l_3];
+                                                            if (idx_l_3 < c_j_1_1 - sk_j_1_1) {
+                                                                ring_1[(s_st_1 + 1) % 2 * 8 + u_7] = (unsigned long long)Cand[buf_pairs[1] + sk_j_1_1 + idx_l_3];
 #else
                                                             if (idx_l_3 < c_rank_1) {
                                                                 ring_1[(s_st_1 + 1) % 2 * 8 + u_7] = (unsigned long long)Cand[buf_pairs[1] + idx_l_3];
@@ -1633,25 +1535,25 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
                                                 lane_bins_1[7] = s_hist[hist_base + lane_0 * 8 + 7];
                                                 lane_sum_1 += lane_bins_1[7];
                                                 int suffix_1 = lane_sum_1;
-                                                int above_part_4 = __shfl_down_sync(0xFFFFFFFF, suffix_1, 1, 32);
+                                                int above_part_4_5 = __shfl_down_sync(0xFFFFFFFF, suffix_1, 1, 32);
                                                 if (lane_0 + 1 < 32) {
-                                                    suffix_1 += above_part_4;
+                                                    suffix_1 += above_part_4_5;
                                                 }
-                                                int above_part_0_1 = __shfl_down_sync(0xFFFFFFFF, suffix_1, 2, 32);
+                                                int above_part_4_6 = __shfl_down_sync(0xFFFFFFFF, suffix_1, 2, 32);
                                                 if (lane_0 + 2 < 32) {
-                                                    suffix_1 += above_part_0_1;
+                                                    suffix_1 += above_part_4_6;
                                                 }
-                                                int above_part_1_1 = __shfl_down_sync(0xFFFFFFFF, suffix_1, 4, 32);
+                                                int above_part_4_7 = __shfl_down_sync(0xFFFFFFFF, suffix_1, 4, 32);
                                                 if (lane_0 + 4 < 32) {
-                                                    suffix_1 += above_part_1_1;
+                                                    suffix_1 += above_part_4_7;
                                                 }
-                                                int above_part_2_1 = __shfl_down_sync(0xFFFFFFFF, suffix_1, 8, 32);
+                                                int above_part_4_8 = __shfl_down_sync(0xFFFFFFFF, suffix_1, 8, 32);
                                                 if (lane_0 + 8 < 32) {
-                                                    suffix_1 += above_part_2_1;
+                                                    suffix_1 += above_part_4_8;
                                                 }
-                                                int above_part_3_1 = __shfl_down_sync(0xFFFFFFFF, suffix_1, 16, 32);
+                                                int above_part_4_9 = __shfl_down_sync(0xFFFFFFFF, suffix_1, 16, 32);
                                                 if (lane_0 + 16 < 32) {
-                                                    suffix_1 += above_part_3_1;
+                                                    suffix_1 += above_part_4_9;
                                                 }
                                                 int excl_1 = suffix_1 - lane_sum_1;
                                                 int is_target_1 = ((excl_1 < k_rem_1 && k_rem_1 <= excl_1 + lane_sum_1) ? 1 : 0);
@@ -1741,7 +1643,7 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
                                                 kept_above_1 += above_cnt_1;
                                                 prefix_1 = prefix_1 << 8 | (unsigned long long)(unsigned int)(target_lane_1 * 8 + digit_sel_1);
                                                 edge_1 = prefix_1 << (unsigned long long)shift_1;
-                                                if (km_j_1 >= kept_above_1 + bucket_cnt_1) {
+                                                if (km_j_1_1 >= kept_above_1 + bucket_cnt_1) {
                                                     break;
                                                 }
                                             }
@@ -1749,19 +1651,19 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
                                             if (half == 0) {
                                                 int write_pos_1 = 0;
                                                 #pragma unroll 1
-                                                for (int e0_1 = 0; e0_1 < c_j_1; e0_1 += 256) {
+                                                for (int e0_1 = 0; e0_1 < c_j_1_1; e0_1 += 256) {
                                                     unsigned long long ent_1[8];
                                                     #pragma unroll
                                                     for (int u_8 = 0; u_8 < 8; u_8++) {
                                                         ent_1[u_8] = 0;
-                                                        if (c_j_1 > e0_1 + lane_0 + 32 * u_8) {
+                                                        if (c_j_1_1 > e0_1 + lane_0 + 32 * u_8) {
                                                             ent_1[u_8] = (unsigned long long)Cand[buf_pairs[1] + e0_1 + lane_0 + 32 * u_8];
                                                         }
                                                     }
                                                     #pragma unroll
                                                     for (int u_9 = 0; u_9 < 8; u_9++) {
                                                         int keep_1 = 0;
-                                                        if (c_j_1 > e0_1 + lane_0 + 32 * u_9) {
+                                                        if (c_j_1_1 > e0_1 + lane_0 + 32 * u_9) {
                                                             unsigned int bits_3 = (unsigned int)(ent_1[u_9] >> 32);
                                                             int kid_3 = (int)(unsigned int)(ent_1[u_9] & 4294967295);
                                                             unsigned int magnitude_3 = bits_3 & 2147483647;
@@ -1774,11 +1676,11 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
                                                             unsigned long long key_3 = key64_3;
                                                             keep_1 = ((key_3 >= edge_0_1) ? 1 : 0);
                                                         }
-                                                        unsigned int _vote_1 = __ballot_sync(0xFFFFFFFF, keep_1 != 0);
+                                                        unsigned int vote_1 = __ballot_sync(0xFFFFFFFF, keep_1 != 0);
                                                         if (keep_1 != 0) {
-                                                            Cand[buf_pairs[1] + write_pos_1 + (int)(unsigned int)__popc(_vote_1 & lower_lanes)] = (long long)ent_1[u_9];
+                                                            Cand[buf_pairs[1] + write_pos_1 + (int)(unsigned int)__popc(vote_1 & lower_lanes)] = (long long)ent_1[u_9];
                                                         }
-                                                        write_pos_1 += (int)(unsigned int)__popc(_vote_1);
+                                                        write_pos_1 += (int)(unsigned int)__popc(vote_1);
                                                     }
                                                 }
                                                 if (lane_0 == 0) {
@@ -1819,49 +1721,49 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
                                     asm volatile("tcgen05.fence::after_thread_sync;");
                                     unsigned int bits2_1[4];
                                     float weights_reg_1[64];
-                                    float _tmem_load_4[32];
-                                    tmem_ld_x16(&_tmem_load_4[0], taddr + math_tmem_stage * 256 + (unsigned int)(wg * 4 * 32) + (unsigned int)(warp_in_wg * 32 << 16));
-                                    tmem_ld_x16(&_tmem_load_4[16], taddr + math_tmem_stage * 256 + (unsigned int)(wg * 4 * 32) + (unsigned int)(warp_in_wg * 32 << 16) + 16);
-                                    float _tmem_load_5[32];
-                                    tmem_ld_x16(&_tmem_load_5[0], taddr + math_tmem_stage * 256 + (unsigned int)((wg * 4 + 1) * 32) + (unsigned int)(warp_in_wg * 32 << 16));
-                                    tmem_ld_x16(&_tmem_load_5[16], taddr + math_tmem_stage * 256 + (unsigned int)((wg * 4 + 1) * 32) + (unsigned int)(warp_in_wg * 32 << 16) + 16);
+                                    float tmem_load_3[32];
+                                    tmem_ld_x16(&tmem_load_3[0], taddr + math_tmem_stage * 256 + (unsigned int)(wg * 4 * 32) + (unsigned int)(warp_in_wg * 32 << 16));
+                                    tmem_ld_x16(&tmem_load_3[16], taddr + math_tmem_stage * 256 + (unsigned int)(wg * 4 * 32) + (unsigned int)(warp_in_wg * 32 << 16) + 16);
+                                    float tmem_load_3_1[32];
+                                    tmem_ld_x16(&tmem_load_3_1[0], taddr + math_tmem_stage * 256 + (unsigned int)((wg * 4 + 1) * 32) + (unsigned int)(warp_in_wg * 32 << 16));
+                                    tmem_ld_x16(&tmem_load_3_1[16], taddr + math_tmem_stage * 256 + (unsigned int)((wg * 4 + 1) * 32) + (unsigned int)(warp_in_wg * 32 << 16) + 16);
                                     asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
-                                    float2 sum0_1 = make_float2(0.0f, 0.0f);
-                                    float2 sum1_2 = make_float2(0.0f, 0.0f);
+                                    float2 sum0_3 = make_float2(0.0f, 0.0f);
+                                    float2 sum1_3 = make_float2(0.0f, 0.0f);
                                     #pragma unroll
                                     for (int j_4 = 0; j_4 < 32; j_4 += 4) {
-                                        float2 doubled0_4 = add_f32x2_noftz(make_float2(_tmem_load_4[j_4], _tmem_load_4[j_4 + 1]), make_float2(fabsf(_tmem_load_4[j_4]), fabsf(_tmem_load_4[j_4 + 1])));
-                                        sum0_1 = fma_f32x2_rn_noftz(doubled0_4, make_float2(weights_a[j_4], weights_a[j_4 + 1]), sum0_1);
-                                        float2 doubled1_4 = add_f32x2_noftz(make_float2(_tmem_load_4[j_4 + 2], _tmem_load_4[j_4 + 3]), make_float2(fabsf(_tmem_load_4[j_4 + 2]), fabsf(_tmem_load_4[j_4 + 3])));
-                                        sum1_2 = fma_f32x2_rn_noftz(doubled1_4, make_float2(weights_a[j_4 + 2], weights_a[j_4 + 3]), sum1_2);
+                                        float2 doubled0_4 = add_f32x2_noftz(make_float2(tmem_load_3[j_4], tmem_load_3[j_4 + 1]), make_float2(fabsf(tmem_load_3[j_4]), fabsf(tmem_load_3[j_4 + 1])));
+                                        sum0_3 = fma_f32x2_rn_noftz(doubled0_4, make_float2(weights_a[j_4], weights_a[j_4 + 1]), sum0_3);
+                                        float2 doubled1_4 = add_f32x2_noftz(make_float2(tmem_load_3[j_4 + 2], tmem_load_3[j_4 + 3]), make_float2(fabsf(tmem_load_3[j_4 + 2]), fabsf(tmem_load_3[j_4 + 3])));
+                                        sum1_3 = fma_f32x2_rn_noftz(doubled1_4, make_float2(weights_a[j_4 + 2], weights_a[j_4 + 3]), sum1_3);
                                     }
-                                    float2 total_1 = add_f32x2_noftz(sum0_1, sum1_2);
-                                    float relu_wsum_1 = (total_1.x + total_1.y) * 0.5f;
-                                    float score_w_1 = relu_wsum_1;
-                                    unsigned int bits_w_1 = 0;
-                                    bits_w_1 = reinterpret_cast<unsigned int*>(&score_w_1)[0];
-                                    bits2_1[0] = bits_w_1;
-                                    float _tmem_load_6[32];
-                                    tmem_ld_x16(&_tmem_load_6[0], taddr + math_tmem_stage * 256 + (unsigned int)((wg * 4 + 2) * 32) + (unsigned int)(warp_in_wg * 32 << 16));
-                                    tmem_ld_x16(&_tmem_load_6[16], taddr + math_tmem_stage * 256 + (unsigned int)((wg * 4 + 2) * 32) + (unsigned int)(warp_in_wg * 32 << 16) + 16);
-                                    float _tmem_load_7[32];
-                                    tmem_ld_x16(&_tmem_load_7[0], taddr + math_tmem_stage * 256 + (unsigned int)((wg * 4 + 3) * 32) + (unsigned int)(warp_in_wg * 32 << 16));
-                                    tmem_ld_x16(&_tmem_load_7[16], taddr + math_tmem_stage * 256 + (unsigned int)((wg * 4 + 3) * 32) + (unsigned int)(warp_in_wg * 32 << 16) + 16);
-                                    float2 sum0_0_1 = make_float2(0.0f, 0.0f);
-                                    float2 sum1_1_1 = make_float2(0.0f, 0.0f);
+                                    float2 total_3 = add_f32x2_noftz(sum0_3, sum1_3);
+                                    float relu_wsum_3 = (total_3.x + total_3.y) * 0.5f;
+                                    float score_w_3 = relu_wsum_3;
+                                    unsigned int bits_w_3 = 0;
+                                    bits_w_3 = reinterpret_cast<unsigned int*>(&score_w_3)[0];
+                                    bits2_1[0] = bits_w_3;
+                                    float tmem_load_4[32];
+                                    tmem_ld_x16(&tmem_load_4[0], taddr + math_tmem_stage * 256 + (unsigned int)((wg * 4 + 2) * 32) + (unsigned int)(warp_in_wg * 32 << 16));
+                                    tmem_ld_x16(&tmem_load_4[16], taddr + math_tmem_stage * 256 + (unsigned int)((wg * 4 + 2) * 32) + (unsigned int)(warp_in_wg * 32 << 16) + 16);
+                                    float tmem_load_5[32];
+                                    tmem_ld_x16(&tmem_load_5[0], taddr + math_tmem_stage * 256 + (unsigned int)((wg * 4 + 3) * 32) + (unsigned int)(warp_in_wg * 32 << 16));
+                                    tmem_ld_x16(&tmem_load_5[16], taddr + math_tmem_stage * 256 + (unsigned int)((wg * 4 + 3) * 32) + (unsigned int)(warp_in_wg * 32 << 16) + 16);
+                                    float2 sum0_3_1 = make_float2(0.0f, 0.0f);
+                                    float2 sum1_3_1 = make_float2(0.0f, 0.0f);
                                     #pragma unroll
                                     for (int j_5 = 0; j_5 < 32; j_5 += 4) {
-                                        float2 doubled0_5 = add_f32x2_noftz(make_float2(_tmem_load_5[j_5], _tmem_load_5[j_5 + 1]), make_float2(fabsf(_tmem_load_5[j_5]), fabsf(_tmem_load_5[j_5 + 1])));
-                                        sum0_0_1 = fma_f32x2_rn_noftz(doubled0_5, make_float2(weights_a[32 + j_5], weights_a[32 + j_5 + 1]), sum0_0_1);
-                                        float2 doubled1_5 = add_f32x2_noftz(make_float2(_tmem_load_5[j_5 + 2], _tmem_load_5[j_5 + 3]), make_float2(fabsf(_tmem_load_5[j_5 + 2]), fabsf(_tmem_load_5[j_5 + 3])));
-                                        sum1_1_1 = fma_f32x2_rn_noftz(doubled1_5, make_float2(weights_a[32 + j_5 + 2], weights_a[32 + j_5 + 3]), sum1_1_1);
+                                        float2 doubled0_5 = add_f32x2_noftz(make_float2(tmem_load_3_1[j_5], tmem_load_3_1[j_5 + 1]), make_float2(fabsf(tmem_load_3_1[j_5]), fabsf(tmem_load_3_1[j_5 + 1])));
+                                        sum0_3_1 = fma_f32x2_rn_noftz(doubled0_5, make_float2(weights_a[32 + j_5], weights_a[32 + j_5 + 1]), sum0_3_1);
+                                        float2 doubled1_5 = add_f32x2_noftz(make_float2(tmem_load_3_1[j_5 + 2], tmem_load_3_1[j_5 + 3]), make_float2(fabsf(tmem_load_3_1[j_5 + 2]), fabsf(tmem_load_3_1[j_5 + 3])));
+                                        sum1_3_1 = fma_f32x2_rn_noftz(doubled1_5, make_float2(weights_a[32 + j_5 + 2], weights_a[32 + j_5 + 3]), sum1_3_1);
                                     }
-                                    float2 total_2_1 = add_f32x2_noftz(sum0_0_1, sum1_1_1);
-                                    float relu_wsum_3_1 = (total_2_1.x + total_2_1.y) * 0.5f;
-                                    float score_w_4_1 = relu_wsum_3_1;
-                                    unsigned int bits_w_5_1 = 0;
-                                    bits_w_5_1 = reinterpret_cast<unsigned int*>(&score_w_4_1)[0];
-                                    bits2_1[1] = bits_w_5_1;
+                                    float2 total_3_1 = add_f32x2_noftz(sum0_3_1, sum1_3_1);
+                                    float relu_wsum_3_1 = (total_3_1.x + total_3_1.y) * 0.5f;
+                                    float score_w_3_1 = relu_wsum_3_1;
+                                    unsigned int bits_w_3_1 = 0;
+                                    bits_w_3_1 = reinterpret_cast<unsigned int*>(&score_w_3_1)[0];
+                                    bits2_1[1] = bits_w_3_1;
                                     asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                                         : "=r"(*reinterpret_cast<uint32_t*>(&weights_reg_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&weights_reg_1[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&weights_reg_1[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&weights_reg_1[(0) + 3]))
                                         : "r"(wsc_addr + 256));
@@ -1940,36 +1842,36 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
                                     uint32_t _mbar_token_1 = mbarrier_test_wait(umma_full_addr + (math_tmem_stage) * 8, _phase_umma_full);
                                     acc_tok = _mbar_token_1;
 #endif
-                                    float2 sum0_6_1 = make_float2(0.0f, 0.0f);
-                                    float2 sum1_7_1 = make_float2(0.0f, 0.0f);
+                                    float2 sum0_4 = make_float2(0.0f, 0.0f);
+                                    float2 sum1_4 = make_float2(0.0f, 0.0f);
                                     #pragma unroll
                                     for (int j_6 = 0; j_6 < 32; j_6 += 4) {
-                                        float2 doubled0_6 = add_f32x2_noftz(make_float2(_tmem_load_6[j_6], _tmem_load_6[j_6 + 1]), make_float2(fabsf(_tmem_load_6[j_6]), fabsf(_tmem_load_6[j_6 + 1])));
-                                        sum0_6_1 = fma_f32x2_rn_noftz(doubled0_6, make_float2(weights_reg_1[j_6], weights_reg_1[j_6 + 1]), sum0_6_1);
-                                        float2 doubled1_6 = add_f32x2_noftz(make_float2(_tmem_load_6[j_6 + 2], _tmem_load_6[j_6 + 3]), make_float2(fabsf(_tmem_load_6[j_6 + 2]), fabsf(_tmem_load_6[j_6 + 3])));
-                                        sum1_7_1 = fma_f32x2_rn_noftz(doubled1_6, make_float2(weights_reg_1[j_6 + 2], weights_reg_1[j_6 + 3]), sum1_7_1);
+                                        float2 doubled0_6 = add_f32x2_noftz(make_float2(tmem_load_4[j_6], tmem_load_4[j_6 + 1]), make_float2(fabsf(tmem_load_4[j_6]), fabsf(tmem_load_4[j_6 + 1])));
+                                        sum0_4 = fma_f32x2_rn_noftz(doubled0_6, make_float2(weights_reg_1[j_6], weights_reg_1[j_6 + 1]), sum0_4);
+                                        float2 doubled1_6 = add_f32x2_noftz(make_float2(tmem_load_4[j_6 + 2], tmem_load_4[j_6 + 3]), make_float2(fabsf(tmem_load_4[j_6 + 2]), fabsf(tmem_load_4[j_6 + 3])));
+                                        sum1_4 = fma_f32x2_rn_noftz(doubled1_6, make_float2(weights_reg_1[j_6 + 2], weights_reg_1[j_6 + 3]), sum1_4);
                                     }
-                                    float2 total_8_1 = add_f32x2_noftz(sum0_6_1, sum1_7_1);
-                                    float relu_wsum_9_1 = (total_8_1.x + total_8_1.y) * 0.5f;
-                                    float score_w_10_1 = relu_wsum_9_1;
-                                    unsigned int bits_w_11_1 = 0;
-                                    bits_w_11_1 = reinterpret_cast<unsigned int*>(&score_w_10_1)[0];
-                                    bits2_1[2] = bits_w_11_1;
-                                    float2 sum0_12_1 = make_float2(0.0f, 0.0f);
-                                    float2 sum1_13_1 = make_float2(0.0f, 0.0f);
+                                    float2 total_4 = add_f32x2_noftz(sum0_4, sum1_4);
+                                    float relu_wsum_4 = (total_4.x + total_4.y) * 0.5f;
+                                    float score_w_4 = relu_wsum_4;
+                                    unsigned int bits_w_4 = 0;
+                                    bits_w_4 = reinterpret_cast<unsigned int*>(&score_w_4)[0];
+                                    bits2_1[2] = bits_w_4;
+                                    float2 sum0_5 = make_float2(0.0f, 0.0f);
+                                    float2 sum1_5 = make_float2(0.0f, 0.0f);
                                     #pragma unroll
                                     for (int j_7 = 0; j_7 < 32; j_7 += 4) {
-                                        float2 doubled0_7 = add_f32x2_noftz(make_float2(_tmem_load_7[j_7], _tmem_load_7[j_7 + 1]), make_float2(fabsf(_tmem_load_7[j_7]), fabsf(_tmem_load_7[j_7 + 1])));
-                                        sum0_12_1 = fma_f32x2_rn_noftz(doubled0_7, make_float2(weights_reg_1[32 + j_7], weights_reg_1[32 + j_7 + 1]), sum0_12_1);
-                                        float2 doubled1_7 = add_f32x2_noftz(make_float2(_tmem_load_7[j_7 + 2], _tmem_load_7[j_7 + 3]), make_float2(fabsf(_tmem_load_7[j_7 + 2]), fabsf(_tmem_load_7[j_7 + 3])));
-                                        sum1_13_1 = fma_f32x2_rn_noftz(doubled1_7, make_float2(weights_reg_1[32 + j_7 + 2], weights_reg_1[32 + j_7 + 3]), sum1_13_1);
+                                        float2 doubled0_7 = add_f32x2_noftz(make_float2(tmem_load_5[j_7], tmem_load_5[j_7 + 1]), make_float2(fabsf(tmem_load_5[j_7]), fabsf(tmem_load_5[j_7 + 1])));
+                                        sum0_5 = fma_f32x2_rn_noftz(doubled0_7, make_float2(weights_reg_1[32 + j_7], weights_reg_1[32 + j_7 + 1]), sum0_5);
+                                        float2 doubled1_7 = add_f32x2_noftz(make_float2(tmem_load_5[j_7 + 2], tmem_load_5[j_7 + 3]), make_float2(fabsf(tmem_load_5[j_7 + 2]), fabsf(tmem_load_5[j_7 + 3])));
+                                        sum1_5 = fma_f32x2_rn_noftz(doubled1_7, make_float2(weights_reg_1[32 + j_7 + 2], weights_reg_1[32 + j_7 + 3]), sum1_5);
                                     }
-                                    float2 total_14_1 = add_f32x2_noftz(sum0_12_1, sum1_13_1);
-                                    float relu_wsum_15_1 = (total_14_1.x + total_14_1.y) * 0.5f;
-                                    float score_w_16_1 = relu_wsum_15_1;
-                                    unsigned int bits_w_17_1 = 0;
-                                    bits_w_17_1 = reinterpret_cast<unsigned int*>(&score_w_16_1)[0];
-                                    bits2_1[3] = bits_w_17_1;
+                                    float2 total_5 = add_f32x2_noftz(sum0_5, sum1_5);
+                                    float relu_wsum_5 = (total_5.x + total_5.y) * 0.5f;
+                                    float score_w_5 = relu_wsum_5;
+                                    unsigned int bits_w_5 = 0;
+                                    bits_w_5 = reinterpret_cast<unsigned int*>(&score_w_5)[0];
+                                    bits2_1[3] = bits_w_5;
                                     mbarrier_wait(scores_empty_addr + (math_sc) * 8, _phase_scores_empty);
                                     asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((s_scores_addr + math_sc * 4096 + (unsigned int)((wg * 128 + local_thread_idx) * 16))), "r"(bits2_1[0]), "r"(bits2_1[1]), "r"(bits2_1[2]), "r"(bits2_1[3]) : "memory");
                                     mbarrier_arrive(scores_full_addr + (math_sc) * 8);
@@ -1994,8 +1896,8 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
                                 } else {
                                     until_check = until_check - run_c;
                                 }
-                                int _min_3 = ((run_c) < (3) ? (run_c) : (3));
-                                pend = (pend << _min_3 | check_c) & 7;
+                                int _min_4 = ((run_c) < (3) ? (run_c) : (3));
+                                pend = (pend << _min_4 | check_c) & 7;
                             }
                             asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                             mbarrier_arrive(q_empty_addr);
@@ -2017,18 +1919,18 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
                                         need_any_1 = need_any_1 | s_req[rq_base_1 + 25];
                                         need_any_1 = need_any_1 | s_req[rq_base_1 + 30];
                                         need_any_1 = need_any_1 | s_req[rq_base_1 + 35];
-                                        int rq_j_1 = rq_base_1 + slot_pairs[0] * 5;
-                                        int need_j_2 = s_req[rq_j_1];
-                                        if (need_j_2 != 0) {
-                                            int kw_j_2 = s_req[rq_j_1 + 1];
-                                            int km_j_2 = s_req[rq_j_1 + 2];
-                                            int sk_j_2 = s_req[rq_j_1 + 3];
-                                            int c_j_2 = s_req[rq_j_1 + 4];
+                                        int rq_j_1_2 = rq_base_1 + slot_pairs[0] * 5;
+                                        int need_j_2_2 = s_req[rq_j_1_2];
+                                        if (need_j_2_2 != 0) {
+                                            int kw_j_1_2 = s_req[rq_j_1_2 + 1];
+                                            int km_j_1_2 = s_req[rq_j_1_2 + 2];
+                                            int sk_j_1_2 = s_req[rq_j_1_2 + 3];
+                                            int c_j_1_2 = s_req[rq_j_1_2 + 4];
 #if __CUDA_ARCH__ == 1000
 #else
-                                            int c_rank_2 = c_j_2 - sk_j_2;
+                                            int c_rank_2 = c_j_1_2 - sk_j_1_2;
 #endif
-                                            int k_rem_2 = kw_j_2;
+                                            int k_rem_2 = kw_j_1_2;
                                             int kept_above_2 = 0;
                                             unsigned long long prefix_2 = 0;
                                             unsigned long long edge_2 = 0;
@@ -2055,8 +1957,8 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
                                                         int idx_l_4 = s_pro_2 * 512 + half * 32 + lane_0 + 64 * u_10;
                                                         ring_2[s_pro_2 * 8 + u_10] = 0;
 #if __CUDA_ARCH__ == 1000
-                                                        if (idx_l_4 < c_j_2 - sk_j_2) {
-                                                            ring_2[s_pro_2 * 8 + u_10] = (unsigned long long)Cand[buf_pairs[0] + sk_j_2 + idx_l_4];
+                                                        if (idx_l_4 < c_j_1_2 - sk_j_1_2) {
+                                                            ring_2[s_pro_2 * 8 + u_10] = (unsigned long long)Cand[buf_pairs[0] + sk_j_1_2 + idx_l_4];
 #else
                                                         if (idx_l_4 < c_rank_2) {
                                                             ring_2[s_pro_2 * 8 + u_10] = (unsigned long long)Cand[buf_pairs[0] + idx_l_4];
@@ -2065,7 +1967,7 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
                                                     }
                                                 }
 #if __CUDA_ARCH__ == 1000
-                                                int nbat_2 = (c_j_2 - sk_j_2 + 512 - 1) / 512;
+                                                int nbat_2 = (c_j_1_2 - sk_j_1_2 + 512 - 1) / 512;
 #else
                                                 int nbat_2 = (c_rank_2 + 512 - 1) / 512;
 #endif
@@ -2076,7 +1978,7 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
                                                         #pragma unroll
                                                         for (int u_11 = 0; u_11 < 8; u_11++) {
 #if __CUDA_ARCH__ == 1000
-                                                            int valid_p_2 = (((g_2 + s_st_2) * 512 + half * 32 + lane_0 + 64 * u_11 < c_j_2 - sk_j_2) ? 1 : 0);
+                                                            int valid_p_2 = (((g_2 + s_st_2) * 512 + half * 32 + lane_0 + 64 * u_11 < c_j_1_2 - sk_j_1_2) ? 1 : 0);
 #else
                                                             int valid_p_2 = ((c_rank_2 > (g_2 + s_st_2) * 512 + half * 32 + lane_0 + 64 * u_11) ? 1 : 0);
 #endif
@@ -2102,8 +2004,8 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
                                                             int idx_l_5 = (g_2 + s_st_2 + 1) * 512 + half * 32 + lane_0 + 64 * u_12;
                                                             ring_2[(s_st_2 + 1) % 2 * 8 + u_12] = 0;
 #if __CUDA_ARCH__ == 1000
-                                                            if (idx_l_5 < c_j_2 - sk_j_2) {
-                                                                ring_2[(s_st_2 + 1) % 2 * 8 + u_12] = (unsigned long long)Cand[buf_pairs[0] + sk_j_2 + idx_l_5];
+                                                            if (idx_l_5 < c_j_1_2 - sk_j_1_2) {
+                                                                ring_2[(s_st_2 + 1) % 2 * 8 + u_12] = (unsigned long long)Cand[buf_pairs[0] + sk_j_1_2 + idx_l_5];
 #else
                                                             if (idx_l_5 < c_rank_2) {
                                                                 ring_2[(s_st_2 + 1) % 2 * 8 + u_12] = (unsigned long long)Cand[buf_pairs[0] + idx_l_5];
@@ -2132,25 +2034,25 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
                                                 lane_bins_2[7] = s_hist[hist_base + lane_0 * 8 + 7];
                                                 lane_sum_2 += lane_bins_2[7];
                                                 int suffix_2 = lane_sum_2;
-                                                int above_part_5 = __shfl_down_sync(0xFFFFFFFF, suffix_2, 1, 32);
+                                                int above_part_4_10 = __shfl_down_sync(0xFFFFFFFF, suffix_2, 1, 32);
                                                 if (lane_0 + 1 < 32) {
-                                                    suffix_2 += above_part_5;
+                                                    suffix_2 += above_part_4_10;
                                                 }
-                                                int above_part_0_2 = __shfl_down_sync(0xFFFFFFFF, suffix_2, 2, 32);
+                                                int above_part_4_11 = __shfl_down_sync(0xFFFFFFFF, suffix_2, 2, 32);
                                                 if (lane_0 + 2 < 32) {
-                                                    suffix_2 += above_part_0_2;
+                                                    suffix_2 += above_part_4_11;
                                                 }
-                                                int above_part_1_2 = __shfl_down_sync(0xFFFFFFFF, suffix_2, 4, 32);
+                                                int above_part_4_12 = __shfl_down_sync(0xFFFFFFFF, suffix_2, 4, 32);
                                                 if (lane_0 + 4 < 32) {
-                                                    suffix_2 += above_part_1_2;
+                                                    suffix_2 += above_part_4_12;
                                                 }
-                                                int above_part_2_2 = __shfl_down_sync(0xFFFFFFFF, suffix_2, 8, 32);
+                                                int above_part_4_13 = __shfl_down_sync(0xFFFFFFFF, suffix_2, 8, 32);
                                                 if (lane_0 + 8 < 32) {
-                                                    suffix_2 += above_part_2_2;
+                                                    suffix_2 += above_part_4_13;
                                                 }
-                                                int above_part_3_2 = __shfl_down_sync(0xFFFFFFFF, suffix_2, 16, 32);
+                                                int above_part_4_14 = __shfl_down_sync(0xFFFFFFFF, suffix_2, 16, 32);
                                                 if (lane_0 + 16 < 32) {
-                                                    suffix_2 += above_part_3_2;
+                                                    suffix_2 += above_part_4_14;
                                                 }
                                                 int excl_2 = suffix_2 - lane_sum_2;
                                                 int is_target_2 = ((excl_2 < k_rem_2 && k_rem_2 <= excl_2 + lane_sum_2) ? 1 : 0);
@@ -2240,7 +2142,7 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
                                                 kept_above_2 += above_cnt_2;
                                                 prefix_2 = prefix_2 << 8 | (unsigned long long)(unsigned int)(target_lane_2 * 8 + digit_sel_2);
                                                 edge_2 = prefix_2 << (unsigned long long)shift_2;
-                                                if (km_j_2 >= kept_above_2 + bucket_cnt_2) {
+                                                if (km_j_1_2 >= kept_above_2 + bucket_cnt_2) {
                                                     break;
                                                 }
                                             }
@@ -2248,19 +2150,19 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
                                             if (half == 0) {
                                                 int write_pos_2 = 0;
                                                 #pragma unroll 1
-                                                for (int e0_2 = 0; e0_2 < c_j_2; e0_2 += 256) {
+                                                for (int e0_2 = 0; e0_2 < c_j_1_2; e0_2 += 256) {
                                                     unsigned long long ent_2[8];
                                                     #pragma unroll
                                                     for (int u_13 = 0; u_13 < 8; u_13++) {
                                                         ent_2[u_13] = 0;
-                                                        if (c_j_2 > e0_2 + lane_0 + 32 * u_13) {
+                                                        if (c_j_1_2 > e0_2 + lane_0 + 32 * u_13) {
                                                             ent_2[u_13] = (unsigned long long)Cand[buf_pairs[0] + e0_2 + lane_0 + 32 * u_13];
                                                         }
                                                     }
                                                     #pragma unroll
                                                     for (int u_14 = 0; u_14 < 8; u_14++) {
                                                         int keep_2 = 0;
-                                                        if (c_j_2 > e0_2 + lane_0 + 32 * u_14) {
+                                                        if (c_j_1_2 > e0_2 + lane_0 + 32 * u_14) {
                                                             unsigned int bits_5 = (unsigned int)(ent_2[u_14] >> 32);
                                                             int kid_5 = (int)(unsigned int)(ent_2[u_14] & 4294967295);
                                                             unsigned int magnitude_5 = bits_5 & 2147483647;
@@ -2273,11 +2175,11 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
                                                             unsigned long long key_5 = key64_5;
                                                             keep_2 = ((key_5 >= edge_0_2) ? 1 : 0);
                                                         }
-                                                        unsigned int _vote_2 = __ballot_sync(0xFFFFFFFF, keep_2 != 0);
+                                                        unsigned int vote_2 = __ballot_sync(0xFFFFFFFF, keep_2 != 0);
                                                         if (keep_2 != 0) {
-                                                            Cand[buf_pairs[0] + write_pos_2 + (int)(unsigned int)__popc(_vote_2 & lower_lanes)] = (long long)ent_2[u_14];
+                                                            Cand[buf_pairs[0] + write_pos_2 + (int)(unsigned int)__popc(vote_2 & lower_lanes)] = (long long)ent_2[u_14];
                                                         }
-                                                        write_pos_2 += (int)(unsigned int)__popc(_vote_2);
+                                                        write_pos_2 += (int)(unsigned int)__popc(vote_2);
                                                     }
                                                 }
                                                 if (lane_0 == 0) {
@@ -2288,18 +2190,18 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
                                             }
                                             asm volatile("barrier.sync %0, 64;" :: "r"(pair_bar) : "memory");
                                         }
-                                        int rq_j_0_1 = rq_base_1 + slot_pairs[1] * 5;
-                                        int need_j_1_1 = s_req[rq_j_0_1];
-                                        if (need_j_1_1 != 0) {
-                                            int kw_j_3 = s_req[rq_j_0_1 + 1];
-                                            int km_j_3 = s_req[rq_j_0_1 + 2];
-                                            int sk_j_3 = s_req[rq_j_0_1 + 3];
-                                            int c_j_3 = s_req[rq_j_0_1 + 4];
+                                        int rq_j_1_3 = rq_base_1 + slot_pairs[1] * 5;
+                                        int need_j_2_3 = s_req[rq_j_1_3];
+                                        if (need_j_2_3 != 0) {
+                                            int kw_j_1_3 = s_req[rq_j_1_3 + 1];
+                                            int km_j_1_3 = s_req[rq_j_1_3 + 2];
+                                            int sk_j_1_3 = s_req[rq_j_1_3 + 3];
+                                            int c_j_1_3 = s_req[rq_j_1_3 + 4];
 #if __CUDA_ARCH__ == 1000
 #else
-                                            int c_rank_3 = c_j_3 - sk_j_3;
+                                            int c_rank_3 = c_j_1_3 - sk_j_1_3;
 #endif
-                                            int k_rem_3 = kw_j_3;
+                                            int k_rem_3 = kw_j_1_3;
                                             int kept_above_3 = 0;
                                             unsigned long long prefix_3 = 0;
                                             unsigned long long edge_3 = 0;
@@ -2326,8 +2228,8 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
                                                         int idx_l_6 = s_pro_3 * 512 + half * 32 + lane_0 + 64 * u_15;
                                                         ring_3[s_pro_3 * 8 + u_15] = 0;
 #if __CUDA_ARCH__ == 1000
-                                                        if (idx_l_6 < c_j_3 - sk_j_3) {
-                                                            ring_3[s_pro_3 * 8 + u_15] = (unsigned long long)Cand[buf_pairs[1] + sk_j_3 + idx_l_6];
+                                                        if (idx_l_6 < c_j_1_3 - sk_j_1_3) {
+                                                            ring_3[s_pro_3 * 8 + u_15] = (unsigned long long)Cand[buf_pairs[1] + sk_j_1_3 + idx_l_6];
 #else
                                                         if (idx_l_6 < c_rank_3) {
                                                             ring_3[s_pro_3 * 8 + u_15] = (unsigned long long)Cand[buf_pairs[1] + idx_l_6];
@@ -2336,7 +2238,7 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
                                                     }
                                                 }
 #if __CUDA_ARCH__ == 1000
-                                                int nbat_3 = (c_j_3 - sk_j_3 + 512 - 1) / 512;
+                                                int nbat_3 = (c_j_1_3 - sk_j_1_3 + 512 - 1) / 512;
 #else
                                                 int nbat_3 = (c_rank_3 + 512 - 1) / 512;
 #endif
@@ -2347,7 +2249,7 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
                                                         #pragma unroll
                                                         for (int u_16 = 0; u_16 < 8; u_16++) {
 #if __CUDA_ARCH__ == 1000
-                                                            int valid_p_3 = (((g_3 + s_st_3) * 512 + half * 32 + lane_0 + 64 * u_16 < c_j_3 - sk_j_3) ? 1 : 0);
+                                                            int valid_p_3 = (((g_3 + s_st_3) * 512 + half * 32 + lane_0 + 64 * u_16 < c_j_1_3 - sk_j_1_3) ? 1 : 0);
 #else
                                                             int valid_p_3 = ((c_rank_3 > (g_3 + s_st_3) * 512 + half * 32 + lane_0 + 64 * u_16) ? 1 : 0);
 #endif
@@ -2373,8 +2275,8 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
                                                             int idx_l_7 = (g_3 + s_st_3 + 1) * 512 + half * 32 + lane_0 + 64 * u_17;
                                                             ring_3[(s_st_3 + 1) % 2 * 8 + u_17] = 0;
 #if __CUDA_ARCH__ == 1000
-                                                            if (idx_l_7 < c_j_3 - sk_j_3) {
-                                                                ring_3[(s_st_3 + 1) % 2 * 8 + u_17] = (unsigned long long)Cand[buf_pairs[1] + sk_j_3 + idx_l_7];
+                                                            if (idx_l_7 < c_j_1_3 - sk_j_1_3) {
+                                                                ring_3[(s_st_3 + 1) % 2 * 8 + u_17] = (unsigned long long)Cand[buf_pairs[1] + sk_j_1_3 + idx_l_7];
 #else
                                                             if (idx_l_7 < c_rank_3) {
                                                                 ring_3[(s_st_3 + 1) % 2 * 8 + u_17] = (unsigned long long)Cand[buf_pairs[1] + idx_l_7];
@@ -2403,25 +2305,25 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
                                                 lane_bins_3[7] = s_hist[hist_base + lane_0 * 8 + 7];
                                                 lane_sum_3 += lane_bins_3[7];
                                                 int suffix_3 = lane_sum_3;
-                                                int above_part_6 = __shfl_down_sync(0xFFFFFFFF, suffix_3, 1, 32);
+                                                int above_part_4_15 = __shfl_down_sync(0xFFFFFFFF, suffix_3, 1, 32);
                                                 if (lane_0 + 1 < 32) {
-                                                    suffix_3 += above_part_6;
+                                                    suffix_3 += above_part_4_15;
                                                 }
-                                                int above_part_0_3 = __shfl_down_sync(0xFFFFFFFF, suffix_3, 2, 32);
+                                                int above_part_4_16 = __shfl_down_sync(0xFFFFFFFF, suffix_3, 2, 32);
                                                 if (lane_0 + 2 < 32) {
-                                                    suffix_3 += above_part_0_3;
+                                                    suffix_3 += above_part_4_16;
                                                 }
-                                                int above_part_1_3 = __shfl_down_sync(0xFFFFFFFF, suffix_3, 4, 32);
+                                                int above_part_4_17 = __shfl_down_sync(0xFFFFFFFF, suffix_3, 4, 32);
                                                 if (lane_0 + 4 < 32) {
-                                                    suffix_3 += above_part_1_3;
+                                                    suffix_3 += above_part_4_17;
                                                 }
-                                                int above_part_2_3 = __shfl_down_sync(0xFFFFFFFF, suffix_3, 8, 32);
+                                                int above_part_4_18 = __shfl_down_sync(0xFFFFFFFF, suffix_3, 8, 32);
                                                 if (lane_0 + 8 < 32) {
-                                                    suffix_3 += above_part_2_3;
+                                                    suffix_3 += above_part_4_18;
                                                 }
-                                                int above_part_3_3 = __shfl_down_sync(0xFFFFFFFF, suffix_3, 16, 32);
+                                                int above_part_4_19 = __shfl_down_sync(0xFFFFFFFF, suffix_3, 16, 32);
                                                 if (lane_0 + 16 < 32) {
-                                                    suffix_3 += above_part_3_3;
+                                                    suffix_3 += above_part_4_19;
                                                 }
                                                 int excl_3 = suffix_3 - lane_sum_3;
                                                 int is_target_3 = ((excl_3 < k_rem_3 && k_rem_3 <= excl_3 + lane_sum_3) ? 1 : 0);
@@ -2511,7 +2413,7 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
                                                 kept_above_3 += above_cnt_3;
                                                 prefix_3 = prefix_3 << 8 | (unsigned long long)(unsigned int)(target_lane_3 * 8 + digit_sel_3);
                                                 edge_3 = prefix_3 << (unsigned long long)shift_3;
-                                                if (km_j_3 >= kept_above_3 + bucket_cnt_3) {
+                                                if (km_j_1_3 >= kept_above_3 + bucket_cnt_3) {
                                                     break;
                                                 }
                                             }
@@ -2519,19 +2421,19 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
                                             if (half == 0) {
                                                 int write_pos_3 = 0;
                                                 #pragma unroll 1
-                                                for (int e0_3 = 0; e0_3 < c_j_3; e0_3 += 256) {
+                                                for (int e0_3 = 0; e0_3 < c_j_1_3; e0_3 += 256) {
                                                     unsigned long long ent_3[8];
                                                     #pragma unroll
                                                     for (int u_18 = 0; u_18 < 8; u_18++) {
                                                         ent_3[u_18] = 0;
-                                                        if (c_j_3 > e0_3 + lane_0 + 32 * u_18) {
+                                                        if (c_j_1_3 > e0_3 + lane_0 + 32 * u_18) {
                                                             ent_3[u_18] = (unsigned long long)Cand[buf_pairs[1] + e0_3 + lane_0 + 32 * u_18];
                                                         }
                                                     }
                                                     #pragma unroll
                                                     for (int u_19 = 0; u_19 < 8; u_19++) {
                                                         int keep_3 = 0;
-                                                        if (c_j_3 > e0_3 + lane_0 + 32 * u_19) {
+                                                        if (c_j_1_3 > e0_3 + lane_0 + 32 * u_19) {
                                                             unsigned int bits_7 = (unsigned int)(ent_3[u_19] >> 32);
                                                             int kid_7 = (int)(unsigned int)(ent_3[u_19] & 4294967295);
                                                             unsigned int magnitude_7 = bits_7 & 2147483647;
@@ -2544,11 +2446,11 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
                                                             unsigned long long key_7 = key64_7;
                                                             keep_3 = ((key_7 >= edge_0_3) ? 1 : 0);
                                                         }
-                                                        unsigned int _vote_3 = __ballot_sync(0xFFFFFFFF, keep_3 != 0);
+                                                        unsigned int vote_3 = __ballot_sync(0xFFFFFFFF, keep_3 != 0);
                                                         if (keep_3 != 0) {
-                                                            Cand[buf_pairs[1] + write_pos_3 + (int)(unsigned int)__popc(_vote_3 & lower_lanes)] = (long long)ent_3[u_19];
+                                                            Cand[buf_pairs[1] + write_pos_3 + (int)(unsigned int)__popc(vote_3 & lower_lanes)] = (long long)ent_3[u_19];
                                                         }
-                                                        write_pos_3 += (int)(unsigned int)__popc(_vote_3);
+                                                        write_pos_3 += (int)(unsigned int)__popc(vote_3);
                                                     }
                                                 }
                                                 if (lane_0 == 0) {
@@ -2581,19 +2483,13 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
                                 f_3 = f_3 | s_fail[7];
                                 verdict = f_3;
                             }
-#if TILE_UNROLL == 1
-#else
-#if __CUDA_ARCH__ == 1000
-#else
-                            tk_u = s_tk[0];
-#endif
-#endif
+                            tk_u = s_tk[tkp_u ^ 1];
                             asm volatile("barrier.sync 8, 384;" ::: "memory");
                             if (verdict == 0) {
-                                int c_fin = c_finals[0];
-                                int n_sel_j = ((top_k) < (c_fin) ? (top_k) : (c_fin));
-                                unsigned long long edge_j = 0;
-                                if (c_fin > top_k) {
+                                int c_fin_1_0 = c_finals[0];
+                                int n_sel_j_2_0 = ((top_k) < (c_fin_1_0) ? (top_k) : (c_fin_1_0));
+                                unsigned long long edge_j_1_0 = 0;
+                                if (c_fin_1_0 > top_k) {
                                     int k_rem_4 = top_k;
                                     int kept_above_4 = 0;
                                     unsigned long long prefix_4 = 0;
@@ -2620,19 +2516,19 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
                                             for (int u_20 = 0; u_20 < 8; u_20++) {
                                                 int idx_l_8 = s_pro_4 * 512 + half * 32 + lane_0 + 64 * u_20;
                                                 ring_4[s_pro_4 * 8 + u_20] = 0;
-                                                if (idx_l_8 < c_fin) {
+                                                if (idx_l_8 < c_fin_1_0) {
                                                     ring_4[s_pro_4 * 8 + u_20] = (unsigned long long)Cand[buf_pairs[0] + idx_l_8];
                                                 }
                                             }
                                         }
-                                        int nbat_4 = (c_fin + 512 - 1) / 512;
+                                        int nbat_4 = (c_fin_1_0 + 512 - 1) / 512;
                                         #pragma unroll 1
                                         for (int g_4 = 0; g_4 < nbat_4; g_4 += 3) {
                                             #pragma unroll
                                             for (int s_st_4 = 0; s_st_4 < 3; s_st_4++) {
                                                 #pragma unroll
                                                 for (int u_21 = 0; u_21 < 8; u_21++) {
-                                                    int valid_p_4 = ((c_fin > (g_4 + s_st_4) * 512 + half * 32 + lane_0 + 64 * u_21) ? 1 : 0);
+                                                    int valid_p_4 = ((c_fin_1_0 > (g_4 + s_st_4) * 512 + half * 32 + lane_0 + 64 * u_21) ? 1 : 0);
                                                     unsigned int bits_8 = (unsigned int)(ring_4[s_st_4 * 8 + u_21] >> 32);
                                                     int kid_8 = (int)(unsigned int)(ring_4[s_st_4 * 8 + u_21] & 4294967295);
                                                     unsigned int magnitude_8 = bits_8 & 2147483647;
@@ -2654,7 +2550,7 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
                                                 for (int u_22 = 0; u_22 < 8; u_22++) {
                                                     int idx_l_9 = (g_4 + s_st_4 + 2) * 512 + half * 32 + lane_0 + 64 * u_22;
                                                     ring_4[(s_st_4 + 2) % 3 * 8 + u_22] = 0;
-                                                    if (idx_l_9 < c_fin) {
+                                                    if (idx_l_9 < c_fin_1_0) {
                                                         ring_4[(s_st_4 + 2) % 3 * 8 + u_22] = (unsigned long long)Cand[buf_pairs[0] + idx_l_9];
                                                     }
                                                 }
@@ -2680,25 +2576,25 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
                                         lane_bins_4[7] = s_hist[hist_base + lane_0 * 8 + 7];
                                         lane_sum_4 += lane_bins_4[7];
                                         int suffix_4 = lane_sum_4;
-                                        int above_part_7 = __shfl_down_sync(0xFFFFFFFF, suffix_4, 1, 32);
+                                        int above_part_4_20 = __shfl_down_sync(0xFFFFFFFF, suffix_4, 1, 32);
                                         if (lane_0 + 1 < 32) {
-                                            suffix_4 += above_part_7;
+                                            suffix_4 += above_part_4_20;
                                         }
-                                        int above_part_0_4 = __shfl_down_sync(0xFFFFFFFF, suffix_4, 2, 32);
+                                        int above_part_4_21 = __shfl_down_sync(0xFFFFFFFF, suffix_4, 2, 32);
                                         if (lane_0 + 2 < 32) {
-                                            suffix_4 += above_part_0_4;
+                                            suffix_4 += above_part_4_21;
                                         }
-                                        int above_part_1_4 = __shfl_down_sync(0xFFFFFFFF, suffix_4, 4, 32);
+                                        int above_part_4_22 = __shfl_down_sync(0xFFFFFFFF, suffix_4, 4, 32);
                                         if (lane_0 + 4 < 32) {
-                                            suffix_4 += above_part_1_4;
+                                            suffix_4 += above_part_4_22;
                                         }
-                                        int above_part_2_4 = __shfl_down_sync(0xFFFFFFFF, suffix_4, 8, 32);
+                                        int above_part_4_23 = __shfl_down_sync(0xFFFFFFFF, suffix_4, 8, 32);
                                         if (lane_0 + 8 < 32) {
-                                            suffix_4 += above_part_2_4;
+                                            suffix_4 += above_part_4_23;
                                         }
-                                        int above_part_3_4 = __shfl_down_sync(0xFFFFFFFF, suffix_4, 16, 32);
+                                        int above_part_4_24 = __shfl_down_sync(0xFFFFFFFF, suffix_4, 16, 32);
                                         if (lane_0 + 16 < 32) {
-                                            suffix_4 += above_part_3_4;
+                                            suffix_4 += above_part_4_24;
                                         }
                                         int excl_4 = suffix_4 - lane_sum_4;
                                         int is_target_4 = ((excl_4 < k_rem_4 && k_rem_4 <= excl_4 + lane_sum_4) ? 1 : 0);
@@ -2792,14 +2688,14 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
                                             break;
                                         }
                                     }
-                                    edge_j = edge_4;
+                                    edge_j_1_0 = edge_4;
                                 }
-                                int row_j = q0_3 + u_base + slot_pairs[0];
-                                long long row_base_j = (long long)row_j * (long long)top_k;
+                                int row_j_1_0 = q0_3 + u_base + slot_pairs[0];
+                                long long row_base_j_1_0 = (long long)row_j_1_0 * (long long)top_k;
                                 if (valid_pairs[0] != 0) {
-                                    int mid_w = (c_fin / 2 + 31) / 32 * 32;
-                                    if (mid_w > c_fin) {
-                                        mid_w = c_fin;
+                                    int mid_w = (c_fin_1_0 / 2 + 31) / 32 * 32;
+                                    if (mid_w > c_fin_1_0) {
+                                        mid_w = c_fin_1_0;
                                     }
                                     if (half == 0) {
                                         int front_w = 0;
@@ -2827,11 +2723,11 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
                                                     }
                                                     unsigned long long key64_9 = (unsigned long long)key32_9 << 32 | (unsigned long long)(unsigned int)kid_9;
                                                     unsigned long long key_9 = key64_9;
-                                                    keep_wf = ((key_9 >= edge_j) ? 1 : 0);
+                                                    keep_wf = ((key_9 >= edge_j_1_0) ? 1 : 0);
                                                 }
-                                                unsigned int _vote_4 = __ballot_sync(0xFFFFFFFF, keep_wf != 0);
+                                                unsigned int vote_4 = __ballot_sync(0xFFFFFFFF, keep_wf != 0);
                                                 if (keep_wf != 0) {
-                                                    long long slot_wf = row_base_j + (long long)(front_w + (int)(unsigned int)__popc(_vote_4 & lower_lanes));
+                                                    long long slot_wf = row_base_j_1_0 + (long long)(front_w + (int)(unsigned int)__popc(vote_4 & lower_lanes));
                                                     float score_wf = 0.0f;
                                                     unsigned int bits_10 = (unsigned int)(ent_wf[u_24] >> 32);
                                                     score_wf = reinterpret_cast<float*>(&bits_10)[0];
@@ -2839,25 +2735,25 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
                                                     Indices[slot_wf] = kid_10;
                                                     Scores[slot_wf] = score_wf;
                                                 }
-                                                front_w += (int)(unsigned int)__popc(_vote_4);
+                                                front_w += (int)(unsigned int)__popc(vote_4);
                                             }
                                         }
                                     } else {
                                         int back_w = 0;
                                         #pragma unroll 1
-                                        for (int e0_5 = mid_w; e0_5 < c_fin; e0_5 += 256) {
+                                        for (int e0_5 = mid_w; e0_5 < c_fin_1_0; e0_5 += 256) {
                                             unsigned long long ent_wb[8];
                                             #pragma unroll
                                             for (int u_25 = 0; u_25 < 8; u_25++) {
                                                 ent_wb[u_25] = 0;
-                                                if (c_fin > e0_5 + lane_0 + 32 * u_25) {
+                                                if (c_fin_1_0 > e0_5 + lane_0 + 32 * u_25) {
                                                     ent_wb[u_25] = (unsigned long long)Cand[buf_pairs[0] + e0_5 + lane_0 + 32 * u_25];
                                                 }
                                             }
                                             #pragma unroll
                                             for (int u_26 = 0; u_26 < 8; u_26++) {
                                                 int keep_wb = 0;
-                                                if (c_fin > e0_5 + lane_0 + 32 * u_26) {
+                                                if (c_fin_1_0 > e0_5 + lane_0 + 32 * u_26) {
                                                     unsigned int bits_11 = (unsigned int)(ent_wb[u_26] >> 32);
                                                     int kid_11 = (int)(unsigned int)(ent_wb[u_26] & 4294967295);
                                                     unsigned int magnitude_10 = bits_11 & 2147483647;
@@ -2868,11 +2764,11 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
                                                     }
                                                     unsigned long long key64_10 = (unsigned long long)key32_10 << 32 | (unsigned long long)(unsigned int)kid_11;
                                                     unsigned long long key_10 = key64_10;
-                                                    keep_wb = ((key_10 >= edge_j) ? 1 : 0);
+                                                    keep_wb = ((key_10 >= edge_j_1_0) ? 1 : 0);
                                                 }
-                                                unsigned int _vote_5 = __ballot_sync(0xFFFFFFFF, keep_wb != 0);
+                                                unsigned int vote_1_1 = __ballot_sync(0xFFFFFFFF, keep_wb != 0);
                                                 if (keep_wb != 0) {
-                                                    long long slot_wb = row_base_j + (long long)(n_sel_j - 1 - (back_w + (int)(unsigned int)__popc(_vote_5 & lower_lanes)));
+                                                    long long slot_wb = row_base_j_1_0 + (long long)(n_sel_j_2_0 - 1 - (back_w + (int)(unsigned int)__popc(vote_1_1 & lower_lanes)));
                                                     float score_wb = 0.0f;
                                                     unsigned int bits_12 = (unsigned int)(ent_wb[u_26] >> 32);
                                                     score_wb = reinterpret_cast<float*>(&bits_12)[0];
@@ -2880,21 +2776,21 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
                                                     Indices[slot_wb] = kid_12;
                                                     Scores[slot_wb] = score_wb;
                                                 }
-                                                back_w += (int)(unsigned int)__popc(_vote_5);
+                                                back_w += (int)(unsigned int)__popc(vote_1_1);
                                             }
                                         }
                                         #pragma unroll 1
-                                        for (int pad_w = n_sel_j + lane_0; pad_w < top_k; pad_w += 32) {
-                                            long long pad_slot_w = row_base_j + (long long)pad_w;
+                                        for (int pad_w = n_sel_j_2_0 + lane_0; pad_w < top_k; pad_w += 32) {
+                                            long long pad_slot_w = row_base_j_1_0 + (long long)pad_w;
                                             Indices[pad_slot_w] = -1;
                                             Scores[pad_slot_w] = -CUDART_INF_F;
                                         }
                                     }
                                 }
-                                int c_fin_0 = c_finals[1];
-                                int n_sel_j_1 = ((top_k) < (c_fin_0) ? (top_k) : (c_fin_0));
-                                unsigned long long edge_j_2 = 0;
-                                if (c_fin_0 > top_k) {
+                                int c_fin_1_1 = c_finals[1];
+                                int n_sel_j_2_1 = ((top_k) < (c_fin_1_1) ? (top_k) : (c_fin_1_1));
+                                unsigned long long edge_j_1_1 = 0;
+                                if (c_fin_1_1 > top_k) {
                                     int k_rem_5 = top_k;
                                     int kept_above_5 = 0;
                                     unsigned long long prefix_5 = 0;
@@ -2921,19 +2817,19 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
                                             for (int u_27 = 0; u_27 < 8; u_27++) {
                                                 int idx_l_10 = s_pro_5 * 512 + half * 32 + lane_0 + 64 * u_27;
                                                 ring_5[s_pro_5 * 8 + u_27] = 0;
-                                                if (idx_l_10 < c_fin_0) {
+                                                if (idx_l_10 < c_fin_1_1) {
                                                     ring_5[s_pro_5 * 8 + u_27] = (unsigned long long)Cand[buf_pairs[1] + idx_l_10];
                                                 }
                                             }
                                         }
-                                        int nbat_5 = (c_fin_0 + 512 - 1) / 512;
+                                        int nbat_5 = (c_fin_1_1 + 512 - 1) / 512;
                                         #pragma unroll 1
                                         for (int g_5 = 0; g_5 < nbat_5; g_5 += 3) {
                                             #pragma unroll
                                             for (int s_st_5 = 0; s_st_5 < 3; s_st_5++) {
                                                 #pragma unroll
                                                 for (int u_28 = 0; u_28 < 8; u_28++) {
-                                                    int valid_p_5 = ((c_fin_0 > (g_5 + s_st_5) * 512 + half * 32 + lane_0 + 64 * u_28) ? 1 : 0);
+                                                    int valid_p_5 = ((c_fin_1_1 > (g_5 + s_st_5) * 512 + half * 32 + lane_0 + 64 * u_28) ? 1 : 0);
                                                     unsigned int bits_13 = (unsigned int)(ring_5[s_st_5 * 8 + u_28] >> 32);
                                                     int kid_13 = (int)(unsigned int)(ring_5[s_st_5 * 8 + u_28] & 4294967295);
                                                     unsigned int magnitude_11 = bits_13 & 2147483647;
@@ -2955,7 +2851,7 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
                                                 for (int u_29 = 0; u_29 < 8; u_29++) {
                                                     int idx_l_11 = (g_5 + s_st_5 + 2) * 512 + half * 32 + lane_0 + 64 * u_29;
                                                     ring_5[(s_st_5 + 2) % 3 * 8 + u_29] = 0;
-                                                    if (idx_l_11 < c_fin_0) {
+                                                    if (idx_l_11 < c_fin_1_1) {
                                                         ring_5[(s_st_5 + 2) % 3 * 8 + u_29] = (unsigned long long)Cand[buf_pairs[1] + idx_l_11];
                                                     }
                                                 }
@@ -2981,25 +2877,25 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
                                         lane_bins_5[7] = s_hist[hist_base + lane_0 * 8 + 7];
                                         lane_sum_5 += lane_bins_5[7];
                                         int suffix_5 = lane_sum_5;
-                                        int above_part_8 = __shfl_down_sync(0xFFFFFFFF, suffix_5, 1, 32);
+                                        int above_part_4_25 = __shfl_down_sync(0xFFFFFFFF, suffix_5, 1, 32);
                                         if (lane_0 + 1 < 32) {
-                                            suffix_5 += above_part_8;
+                                            suffix_5 += above_part_4_25;
                                         }
-                                        int above_part_0_5 = __shfl_down_sync(0xFFFFFFFF, suffix_5, 2, 32);
+                                        int above_part_4_26 = __shfl_down_sync(0xFFFFFFFF, suffix_5, 2, 32);
                                         if (lane_0 + 2 < 32) {
-                                            suffix_5 += above_part_0_5;
+                                            suffix_5 += above_part_4_26;
                                         }
-                                        int above_part_1_5 = __shfl_down_sync(0xFFFFFFFF, suffix_5, 4, 32);
+                                        int above_part_4_27 = __shfl_down_sync(0xFFFFFFFF, suffix_5, 4, 32);
                                         if (lane_0 + 4 < 32) {
-                                            suffix_5 += above_part_1_5;
+                                            suffix_5 += above_part_4_27;
                                         }
-                                        int above_part_2_5 = __shfl_down_sync(0xFFFFFFFF, suffix_5, 8, 32);
+                                        int above_part_4_28 = __shfl_down_sync(0xFFFFFFFF, suffix_5, 8, 32);
                                         if (lane_0 + 8 < 32) {
-                                            suffix_5 += above_part_2_5;
+                                            suffix_5 += above_part_4_28;
                                         }
-                                        int above_part_3_5 = __shfl_down_sync(0xFFFFFFFF, suffix_5, 16, 32);
+                                        int above_part_4_29 = __shfl_down_sync(0xFFFFFFFF, suffix_5, 16, 32);
                                         if (lane_0 + 16 < 32) {
-                                            suffix_5 += above_part_3_5;
+                                            suffix_5 += above_part_4_29;
                                         }
                                         int excl_5 = suffix_5 - lane_sum_5;
                                         int is_target_5 = ((excl_5 < k_rem_5 && k_rem_5 <= excl_5 + lane_sum_5) ? 1 : 0);
@@ -3093,14 +2989,14 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
                                             break;
                                         }
                                     }
-                                    edge_j_2 = edge_5;
+                                    edge_j_1_1 = edge_5;
                                 }
-                                int row_j_3 = q0_3 + u_base + slot_pairs[1];
-                                long long row_base_j_4 = (long long)row_j_3 * (long long)top_k;
+                                int row_j_1_1 = q0_3 + u_base + slot_pairs[1];
+                                long long row_base_j_1_1 = (long long)row_j_1_1 * (long long)top_k;
                                 if (valid_pairs[1] != 0) {
-                                    int mid_w_1 = (c_fin_0 / 2 + 31) / 32 * 32;
-                                    if (mid_w_1 > c_fin_0) {
-                                        mid_w_1 = c_fin_0;
+                                    int mid_w_1 = (c_fin_1_1 / 2 + 31) / 32 * 32;
+                                    if (mid_w_1 > c_fin_1_1) {
+                                        mid_w_1 = c_fin_1_1;
                                     }
                                     if (half == 0) {
                                         int front_w_1 = 0;
@@ -3128,11 +3024,11 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
                                                     }
                                                     unsigned long long key64_12 = (unsigned long long)key32_12 << 32 | (unsigned long long)(unsigned int)kid_14;
                                                     unsigned long long key_12 = key64_12;
-                                                    keep_wf_1 = ((key_12 >= edge_j_2) ? 1 : 0);
+                                                    keep_wf_1 = ((key_12 >= edge_j_1_1) ? 1 : 0);
                                                 }
-                                                unsigned int _vote_6 = __ballot_sync(0xFFFFFFFF, keep_wf_1 != 0);
+                                                unsigned int vote_5 = __ballot_sync(0xFFFFFFFF, keep_wf_1 != 0);
                                                 if (keep_wf_1 != 0) {
-                                                    long long slot_wf_1 = row_base_j_4 + (long long)(front_w_1 + (int)(unsigned int)__popc(_vote_6 & lower_lanes));
+                                                    long long slot_wf_1 = row_base_j_1_1 + (long long)(front_w_1 + (int)(unsigned int)__popc(vote_5 & lower_lanes));
                                                     float score_wf_1 = 0.0f;
                                                     unsigned int bits_15 = (unsigned int)(ent_wf_1[u_31] >> 32);
                                                     score_wf_1 = reinterpret_cast<float*>(&bits_15)[0];
@@ -3140,25 +3036,25 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
                                                     Indices[slot_wf_1] = kid_15;
                                                     Scores[slot_wf_1] = score_wf_1;
                                                 }
-                                                front_w_1 += (int)(unsigned int)__popc(_vote_6);
+                                                front_w_1 += (int)(unsigned int)__popc(vote_5);
                                             }
                                         }
                                     } else {
                                         int back_w_1 = 0;
                                         #pragma unroll 1
-                                        for (int e0_7 = mid_w_1; e0_7 < c_fin_0; e0_7 += 256) {
+                                        for (int e0_7 = mid_w_1; e0_7 < c_fin_1_1; e0_7 += 256) {
                                             unsigned long long ent_wb_1[8];
                                             #pragma unroll
                                             for (int u_32 = 0; u_32 < 8; u_32++) {
                                                 ent_wb_1[u_32] = 0;
-                                                if (c_fin_0 > e0_7 + lane_0 + 32 * u_32) {
+                                                if (c_fin_1_1 > e0_7 + lane_0 + 32 * u_32) {
                                                     ent_wb_1[u_32] = (unsigned long long)Cand[buf_pairs[1] + e0_7 + lane_0 + 32 * u_32];
                                                 }
                                             }
                                             #pragma unroll
                                             for (int u_33 = 0; u_33 < 8; u_33++) {
                                                 int keep_wb_1 = 0;
-                                                if (c_fin_0 > e0_7 + lane_0 + 32 * u_33) {
+                                                if (c_fin_1_1 > e0_7 + lane_0 + 32 * u_33) {
                                                     unsigned int bits_16 = (unsigned int)(ent_wb_1[u_33] >> 32);
                                                     int kid_16 = (int)(unsigned int)(ent_wb_1[u_33] & 4294967295);
                                                     unsigned int magnitude_13 = bits_16 & 2147483647;
@@ -3169,11 +3065,11 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
                                                     }
                                                     unsigned long long key64_13 = (unsigned long long)key32_13 << 32 | (unsigned long long)(unsigned int)kid_16;
                                                     unsigned long long key_13 = key64_13;
-                                                    keep_wb_1 = ((key_13 >= edge_j_2) ? 1 : 0);
+                                                    keep_wb_1 = ((key_13 >= edge_j_1_1) ? 1 : 0);
                                                 }
-                                                unsigned int _vote_7 = __ballot_sync(0xFFFFFFFF, keep_wb_1 != 0);
+                                                unsigned int vote_1_2 = __ballot_sync(0xFFFFFFFF, keep_wb_1 != 0);
                                                 if (keep_wb_1 != 0) {
-                                                    long long slot_wb_1 = row_base_j_4 + (long long)(n_sel_j_1 - 1 - (back_w_1 + (int)(unsigned int)__popc(_vote_7 & lower_lanes)));
+                                                    long long slot_wb_1 = row_base_j_1_1 + (long long)(n_sel_j_2_1 - 1 - (back_w_1 + (int)(unsigned int)__popc(vote_1_2 & lower_lanes)));
                                                     float score_wb_1 = 0.0f;
                                                     unsigned int bits_17 = (unsigned int)(ent_wb_1[u_33] >> 32);
                                                     score_wb_1 = reinterpret_cast<float*>(&bits_17)[0];
@@ -3181,12 +3077,12 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
                                                     Indices[slot_wb_1] = kid_17;
                                                     Scores[slot_wb_1] = score_wb_1;
                                                 }
-                                                back_w_1 += (int)(unsigned int)__popc(_vote_7);
+                                                back_w_1 += (int)(unsigned int)__popc(vote_1_2);
                                             }
                                         }
                                         #pragma unroll 1
-                                        for (int pad_w_1 = n_sel_j_1 + lane_0; pad_w_1 < top_k; pad_w_1 += 32) {
-                                            long long pad_slot_w_1 = row_base_j_4 + (long long)pad_w_1;
+                                        for (int pad_w_1 = n_sel_j_2_1 + lane_0; pad_w_1 < top_k; pad_w_1 += 32) {
+                                            long long pad_slot_w_1 = row_base_j_1_1 + (long long)pad_w_1;
                                             Indices[pad_slot_w_1] = -1;
                                             Scores[pad_slot_w_1] = -CUDART_INF_F;
                                         }
@@ -3216,20 +3112,12 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
             int g_col = g_6 % 2 * 8;
             unsigned int gate_sc = 0;
             int bid_g = (int)bid;
-#if TILE_UNROLL == 1
-#else
-#if __CUDA_ARCH__ == 1000
-#else
-            int n_total_g = 0;
-            #pragma unroll 1
-            for (int s_t = 0; s_t < num_segments; s_t++) {
-                n_total_g += (cu_seqlens_q[s_t + 1] - cu_seqlens_q[s_t] + 7) / 8;
-            }
-            unsigned int tk_limit_g = (unsigned int)(n_total_g - 1);
-            int dyn_g = ((n_total_g > grid_ctas) ? 1 : 0);
-            int tk_g = bid_g;
-#endif
-#endif
+            unsigned int tk_limit_g = (unsigned int)s_tk[2];
+            int n_tot_g = s_tk[3];
+            int g_units_g = grid_ctas;
+            int tk_g = s_tk[0];
+            int tkp_g = 1;
+            asm volatile("barrier.sync 9, 128;" ::: "memory");
             unsigned int zero_u_g = 0;
             unsigned int sign_mask_g = 2147483648;
             unsigned int nan_floor_g = 2139095040;
@@ -3253,77 +3141,64 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
 #if __CUDA_ARCH__ == 1000
 #else
                 int q0_e_4 = cu_seqlens_q[seg_4];
-                int lq_e_5 = cu_seqlens_q[seg_4 + 1] - q0_e_4;
-                int lk_e_5 = cu_seqlens_k[seg_4 + 1] - cu_seqlens_k[seg_4];
-                long long off_e_5 = 0;
+                int lq_e_4 = cu_seqlens_q[seg_4 + 1] - q0_e_4;
+                int lk_e_4 = cu_seqlens_k[seg_4 + 1] - cu_seqlens_k[seg_4];
+                long long off_e_4 = 0;
                 if (has_offsets != 0) {
-                    off_e_5 = q_offsets[seg_4];
+                    off_e_4 = q_offsets[seg_4];
                 } else if (ratio == 1) {
-                    off_e_5 = (long long)lk_e_5 - (long long)lq_e_5;
+                    off_e_4 = (long long)lk_e_4 - (long long)lq_e_4;
                 }
-                int last_e_5 = ((7) < (lq_e_5 - 1) ? (7) : (lq_e_5 - 1));
-                long long num_e_4 = off_e_5 + (long long)last_e_5 + 1;
+                int last_e_4 = ((7) < (lq_e_4 - 1) ? (7) : (lq_e_4 - 1));
+                long long num_e_4 = off_e_4 + (long long)last_e_4 + 1;
                 int vis_e_4 = 0;
                 if (num_e_4 > 0) {
                     long long quot_e_8 = num_e_4 / (long long)ratio;
-                    long long lk64_e_8 = (long long)lk_e_5;
+                    long long lk64_e_8 = (long long)lk_e_4;
                     long long bnd_e_8 = ((quot_e_8 < lk64_e_8) ? quot_e_8 : lk64_e_8);
                     vis_e_4 = (int)bnd_e_8;
                 }
                 int tiles_e_4 = (vis_e_4 + 128 - 1) / 128;
                 int t_lo_g = tiles_e_4;
-                int q0_e_0_4 = cu_seqlens_q[seg_4];
-                int lq_e_1_4 = cu_seqlens_q[seg_4 + 1] - q0_e_0_4;
-                int lk_e_2_4 = cu_seqlens_k[seg_4 + 1] - cu_seqlens_k[seg_4];
-                long long off_e_3_4 = 0;
+                int q0_e_4_1 = cu_seqlens_q[seg_4];
+                int lq_e_4_1 = cu_seqlens_q[seg_4 + 1] - q0_e_4_1;
+                int lk_e_4_1 = cu_seqlens_k[seg_4 + 1] - cu_seqlens_k[seg_4];
+                long long off_e_4_1 = 0;
                 if (has_offsets != 0) {
-                    off_e_3_4 = q_offsets[seg_4];
+                    off_e_4_1 = q_offsets[seg_4];
                 } else if (ratio == 1) {
-                    off_e_3_4 = (long long)lk_e_2_4 - (long long)lq_e_1_4;
+                    off_e_4_1 = (long long)lk_e_4_1 - (long long)lq_e_4_1;
                 }
-                int last_e_4_4 = (((nb_g - 1) * 8 + 7) < (lq_e_1_4 - 1) ? ((nb_g - 1) * 8 + 7) : (lq_e_1_4 - 1));
-                long long num_e_5_4 = off_e_3_4 + (long long)last_e_4_4 + 1;
-                int vis_e_6_4 = 0;
-                if (num_e_5_4 > 0) {
-                    long long quot_e_9 = num_e_5_4 / (long long)ratio;
-                    long long lk64_e_9 = (long long)lk_e_2_4;
+                int last_e_4_1 = (((nb_g - 1) * 8 + 7) < (lq_e_4_1 - 1) ? ((nb_g - 1) * 8 + 7) : (lq_e_4_1 - 1));
+                long long num_e_4_1 = off_e_4_1 + (long long)last_e_4_1 + 1;
+                int vis_e_4_1 = 0;
+                if (num_e_4_1 > 0) {
+                    long long quot_e_9 = num_e_4_1 / (long long)ratio;
+                    long long lk64_e_9 = (long long)lk_e_4_1;
                     long long bnd_e_9 = ((quot_e_9 < lk64_e_9) ? quot_e_9 : lk64_e_9);
-                    vis_e_6_4 = (int)bnd_e_9;
+                    vis_e_4_1 = (int)bnd_e_9;
                 }
-                int tiles_e_7_4 = (vis_e_6_4 + 128 - 1) / 128;
-                int t_hi_g = tiles_e_7_4;
+                int tiles_e_4_1 = (vis_e_4_1 + 128 - 1) / 128;
+                int t_hi_g = tiles_e_4_1;
                 int near_eq_g = ((t_hi_g * 4 <= t_lo_g * 5) ? 1 : 0);
 #endif
 #endif
-                long long off_5 = 0;
+                long long off_4 = 0;
                 if (has_offsets != 0) {
-                    off_5 = q_offsets[seg_4];
+                    off_4 = q_offsets[seg_4];
                 } else if (ratio == 1) {
-                    off_5 = (long long)lk_g - (long long)lq_g;
+                    off_4 = (long long)lk_g - (long long)lq_g;
                 }
-                long long off_g = off_5;
+                long long off_g = off_4;
                 #pragma unroll 1
-#if TILE_UNROLL == 1
-                for (int rnd_4 = unit_base_g / grid_ctas; rnd_4 < (unit_base_g + nb_g - 1) / grid_ctas + 1; rnd_4++) {
-                    int bid_i_4 = (int)bid;
-                    int pos_e_4 = bid_i_4;
-                    int unit_4 = rnd_4 * grid_ctas + pos_e_4;
-#else
-#if __CUDA_ARCH__ == 1000
-                for (int rnd_4 = unit_base_g / grid_ctas; rnd_4 < (unit_base_g + nb_g - 1) / grid_ctas + 1; rnd_4++) {
-                    int bid_i_4 = (int)bid;
-                    int pos_e_4 = bid_i_4;
-                    int unit_4 = rnd_4 * grid_ctas + pos_e_4;
-#else
                 for (int rnd_4 = 0; rnd_4 < nb_g + 1; rnd_4++) {
                     int unit_4 = tk_g;
                     if (unit_4 >= unit_base_g + nb_g) {
                         break;
                     }
-#endif
-#endif
-                    int _min_0_4 = ((unit_4 - unit_base_g) < (unit_base_g + nb_g - 1 - unit_4) ? (unit_4 - unit_base_g) : (unit_base_g + nb_g - 1 - unit_4));
-                    if (_min_0_4 >= 0) {
+                    tkp_g ^= 1;
+                    int _min_0_2 = ((unit_4 - unit_base_g) < (unit_base_g + nb_g - 1 - unit_4) ? (unit_4 - unit_base_g) : (unit_base_g + nb_g - 1 - unit_4));
+                    if (_min_0_2 >= 0) {
                         int blk_4 = nb_g - 1 - (unit_4 - unit_base_g);
 #if TILE_UNROLL == 1
 #else
@@ -3340,47 +3215,15 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
                         int q0_4 = cu_seqlens_q[seg_4];
                         int lq_4 = cu_seqlens_q[seg_4 + 1] - q0_4;
                         int lk_3 = cu_seqlens_k[seg_4 + 1] - cu_seqlens_k[seg_4];
-#if TILE_UNROLL == 1
-                        long long off_0_1 = 0;
-#else
-#if __CUDA_ARCH__ == 1000
-                        long long off_0_1 = 0;
-#else
-                        long long off_0 = 0;
-#endif
-#endif
+                        long long off_2_1 = 0;
                         if (has_offsets != 0) {
-#if TILE_UNROLL == 1
-                            off_0_1 = q_offsets[seg_4];
-#else
-#if __CUDA_ARCH__ == 1000
-                            off_0_1 = q_offsets[seg_4];
-#else
-                            off_0 = q_offsets[seg_4];
-#endif
-#endif
+                            off_2_1 = q_offsets[seg_4];
                         } else if (ratio == 1) {
-#if TILE_UNROLL == 1
-                            off_0_1 = (long long)lk_3 - (long long)lq_4;
-#else
-#if __CUDA_ARCH__ == 1000
-                            off_0_1 = (long long)lk_3 - (long long)lq_4;
-#else
-                            off_0 = (long long)lk_3 - (long long)lq_4;
-#endif
-#endif
+                            off_2_1 = (long long)lk_3 - (long long)lq_4;
                         }
-#if TILE_UNROLL == 1
-                        long long off_1_1 = off_0_1;
-#else
-#if __CUDA_ARCH__ == 1000
-                        long long off_1_1 = off_0_1;
-#else
-                        long long off_1_1 = off_0;
-#endif
-#endif
+                        long long off_1_3 = off_2_1;
                         int last_u_3 = ((blk_4 * 8 + 7) < (lq_4 - 1) ? (blk_4 * 8 + 7) : (lq_4 - 1));
-                        long long num_3 = off_1_1 + (long long)last_u_3 + 1;
+                        long long num_3 = off_1_3 + (long long)last_u_3 + 1;
                         int vis_3 = 0;
                         if (num_3 > 0) {
                             long long quotient_3 = num_3 / (long long)ratio;
@@ -3406,20 +3249,20 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
                         int vis_g[2];
                         int buf_g[2];
                         int buf_unit_g = (bid_g * 8 + 2 * g_6) * cand_cap;
-                        int u_qj_1 = u_base_g + 2 * g_6;
-                        int valid_j_1 = ((u_qj_1 < lq_g) ? 1 : 0);
-                        valid_g[0] = valid_j_1;
+                        int u_qj = u_base_g + 2 * g_6;
+                        int valid_j = ((u_qj < lq_g) ? 1 : 0);
+                        valid_g[0] = valid_j;
                         int vis_j = 0;
-                        if (valid_j_1 != 0) {
-                            long long num_0 = off_g + (long long)u_qj_1 + 1;
-                            int vis_1_1 = 0;
+                        if (valid_j != 0) {
+                            long long num_0 = off_g + (long long)u_qj + 1;
+                            int vis_0 = 0;
                             if (num_0 > 0) {
                                 long long quotient_4 = num_0 / (long long)ratio;
                                 long long lk64_4 = (long long)lk_g;
                                 long long bounded_4 = ((quotient_4 < lk64_4) ? quotient_4 : lk64_4);
-                                vis_1_1 = (int)bounded_4;
+                                vis_0 = (int)bounded_4;
                             }
-                            vis_j = vis_1_1;
+                            vis_j = vis_0;
                         }
                         vis_g[0] = vis_j;
                         buf_g[0] = buf_unit_g;
@@ -3428,36 +3271,31 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
                         valid_g[1] = valid_j_4;
                         int vis_j_5 = 0;
                         if (valid_j_4 != 0) {
-                            long long num_0_1 = off_g + (long long)u_qj_3 + 1;
-                            int vis_1_2 = 0;
-                            if (num_0_1 > 0) {
-                                long long quotient_5 = num_0_1 / (long long)ratio;
+                            long long num_1_1 = off_g + (long long)u_qj_3 + 1;
+                            int vis_2_1 = 0;
+                            if (num_1_1 > 0) {
+                                long long quotient_5 = num_1_1 / (long long)ratio;
                                 long long lk64_5 = (long long)lk_g;
                                 long long bounded_5 = ((quotient_5 < lk64_5) ? quotient_5 : lk64_5);
-                                vis_1_2 = (int)bounded_5;
+                                vis_2_1 = (int)bounded_5;
                             }
-                            vis_j_5 = vis_1_2;
+                            vis_j_5 = vis_2_1;
                         }
                         vis_g[1] = vis_j_5;
                         buf_g[1] = buf_unit_g + cand_cap;
-#if TILE_UNROLL == 1
-#else
-#if __CUDA_ARCH__ == 1000
-#else
-                        int drawn_g = tk_g + grid_ctas;
-                        if (dyn_g != 0) {
-                            if (warp == 12) {
-                                if (lane == 0) {
+                        int drawn_g = 0;
+                        if (warp == 12) {
+                            if (lane == 0) {
+                                drawn_g = n_tot_g;
+                                if (n_tot_g > g_units_g) {
                                     uint32_t _atomic_fetch_inc_1;
                                     asm volatile("atom.acq_rel.gpu.global.inc.u32 %0, [%1], %2;"
                                         : "=r"(_atomic_fetch_inc_1) : "l"(reinterpret_cast<unsigned int*>(Cand + ((long long)grid_ctas * (long long)(8 * cand_cap)))), "r"(static_cast<uint32_t>(tk_limit_g)) : "memory");
-                                    drawn_g = grid_ctas + (int)_atomic_fetch_inc_1;
+                                    drawn_g = (int)_atomic_fetch_inc_1;
                                 }
                             }
                         }
                         int next_g = __shfl_sync(0xFFFFFFFF, drawn_g, 0);
-#endif
-#endif
                         #pragma unroll 1
                         for (int attempt_4 = 0; attempt_4 < 2; attempt_4++) {
                             int n_s_1 = n_sample_2;
@@ -3477,18 +3315,8 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
                             while (ti0_1 < n_tiles_2_1) {
                                 int run_c_1 = ((until_check_1 + 1) < (n_tiles_2_1 - ti0_1) ? (until_check_1 + 1) : (n_tiles_2_1 - ti0_1));
                                 if (n_s_1 > ti0_1) {
-#if TILE_UNROLL == 1
-                                    int _min_1_1 = ((run_c_1) < (n_s_1 - ti0_1) ? (run_c_1) : (n_s_1 - ti0_1));
-                                    run_c_1 = _min_1_1;
-#else
-#if __CUDA_ARCH__ == 1000
-                                    int _min_1_1 = ((run_c_1) < (n_s_1 - ti0_1) ? (run_c_1) : (n_s_1 - ti0_1));
-                                    run_c_1 = _min_1_1;
-#else
                                     int _min_2_1 = ((run_c_1) < (n_s_1 - ti0_1) ? (run_c_1) : (n_s_1 - ti0_1));
                                     run_c_1 = _min_2_1;
-#endif
-#endif
                                 }
                                 #pragma unroll 1
                                 for (int ti_4 = ti0_1; ti_4 < ti0_1 + run_c_1; ti_4++) {
@@ -3522,170 +3350,170 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
                                     mbarrier_arrive(scores_empty_addr + (gate_sc) * 8);
                                     gate_sc += 1;
                                     if (gate_sc == 3) { gate_sc = 0; _phase_scores_full ^= 1; }
-                                    int kid_c = tile_1 * 128 + lane_g;
-                                    unsigned int bits_c = bq[0];
-                                    unsigned int magnitude_14 = bits_c & 2147483647;
-                                    unsigned int m_14 = ((magnitude_14 != 0) ? bits_c : zero_u_g);
+                                    int kid_c_1_0 = tile_1 * 128 + lane_g;
+                                    unsigned int bits_c_1_0 = bq[0];
+                                    unsigned int magnitude_14 = bits_c_1_0 & 2147483647;
+                                    unsigned int m_14 = ((magnitude_14 != 0) ? bits_c_1_0 : zero_u_g);
                                     unsigned int key32_14 = (((m_14 & sign_mask_g) != 0) ? ~m_14 : m_14 | sign_mask_g);
                                     if (magnitude_14 > nan_floor_g) {
                                         key32_14 = zero_u_g;
                                     }
-                                    unsigned long long key64_14 = (unsigned long long)key32_14 << 32 | (unsigned long long)(unsigned int)kid_c;
-                                    unsigned long long key_c = key64_14;
-                                    int in_prefix_c = ((kid_c < vis_g[0]) ? 1 : 0);
-                                    int above_c = ((key_c >= tau_g[0]) ? 1 : 0);
-                                    int emit_c = valid_g[0] & in_prefix_c & above_c;
-                                    unsigned int _vote_8 = __ballot_sync(0xFFFFFFFF, emit_c != 0);
-                                    int emit_base_c = make_warp_uniform(buf_g[0] + cnt_g[0]);
-                                    if (emit_c != 0) {
-                                        int slot_c = emit_base_c + (int)(unsigned int)__popc(_vote_8 & lower_lanes_g);
-                                        unsigned long long entry = (unsigned long long)bits_c << 32 | (unsigned long long)(unsigned int)kid_c;
-                                        Cand[slot_c] = (long long)entry;
+                                    unsigned long long key64_14 = (unsigned long long)key32_14 << 32 | (unsigned long long)(unsigned int)kid_c_1_0;
+                                    unsigned long long key_c_1_0 = key64_14;
+                                    int in_prefix_c_1_0 = ((kid_c_1_0 < vis_g[0]) ? 1 : 0);
+                                    int above_c_1_0 = ((key_c_1_0 >= tau_g[0]) ? 1 : 0);
+                                    int emit_c_1_0 = valid_g[0] & in_prefix_c_1_0 & above_c_1_0;
+                                    unsigned int _vote_1 = __ballot_sync(0xFFFFFFFF, emit_c_1_0 != 0);
+                                    int emit_base_c_1_0 = make_warp_uniform(buf_g[0] + cnt_g[0]);
+                                    if (emit_c_1_0 != 0) {
+                                        int slot_c_1_0 = emit_base_c_1_0 + (int)(unsigned int)__popc(_vote_1 & lower_lanes_g);
+                                        unsigned long long entry = (unsigned long long)bits_c_1_0 << 32 | (unsigned long long)(unsigned int)kid_c_1_0;
+                                        Cand[slot_c_1_0] = (long long)entry;
                                     }
-                                    cnt_g[0] = cnt_g[0] + (int)(unsigned int)__popc(_vote_8);
-                                    unsigned int bits_c_0 = bq[1];
-                                    unsigned int magnitude_1_1 = bits_c_0 & 2147483647;
-                                    unsigned int m_2_1 = ((magnitude_1_1 != 0) ? bits_c_0 : zero_u_g);
-                                    unsigned int key32_3_1 = (((m_2_1 & sign_mask_g) != 0) ? ~m_2_1 : m_2_1 | sign_mask_g);
+                                    cnt_g[0] = cnt_g[0] + (int)(unsigned int)__popc(_vote_1);
+                                    unsigned int bits_c_1_1 = bq[1];
+                                    unsigned int magnitude_0 = bits_c_1_1 & 2147483647;
+                                    unsigned int m_0 = ((magnitude_0 != 0) ? bits_c_1_1 : zero_u_g);
+                                    unsigned int key32_0 = (((m_0 & sign_mask_g) != 0) ? ~m_0 : m_0 | sign_mask_g);
+                                    if (magnitude_0 > nan_floor_g) {
+                                        key32_0 = zero_u_g;
+                                    }
+                                    unsigned long long key64_0 = (unsigned long long)key32_0 << 32 | (unsigned long long)(unsigned int)kid_c_1_0;
+                                    unsigned long long key_c_1_1 = key64_0;
+                                    int in_prefix_c_1_1 = ((kid_c_1_0 < vis_g[1]) ? 1 : 0);
+                                    int above_c_1_1 = ((key_c_1_1 >= tau_g[1]) ? 1 : 0);
+                                    int emit_c_1_1 = valid_g[1] & in_prefix_c_1_1 & above_c_1_1;
+                                    unsigned int _vote_2 = __ballot_sync(0xFFFFFFFF, emit_c_1_1 != 0);
+                                    int emit_base_c_1_1 = make_warp_uniform(buf_g[1] + cnt_g[1]);
+                                    if (emit_c_1_1 != 0) {
+                                        int slot_c_1_1 = emit_base_c_1_1 + (int)(unsigned int)__popc(_vote_2 & lower_lanes_g);
+                                        unsigned long long entry_1 = (unsigned long long)bits_c_1_1 << 32 | (unsigned long long)(unsigned int)kid_c_1_0;
+                                        Cand[slot_c_1_1] = (long long)entry_1;
+                                    }
+                                    cnt_g[1] = cnt_g[1] + (int)(unsigned int)__popc(_vote_2);
+                                    int kid_c_1_1 = tile_1 * 128 + 32 + lane_g;
+                                    unsigned int bits_c_1_2 = bq[2];
+                                    unsigned int magnitude_1_1 = bits_c_1_2 & 2147483647;
+                                    unsigned int m_1_1 = ((magnitude_1_1 != 0) ? bits_c_1_2 : zero_u_g);
+                                    unsigned int key32_1_1 = (((m_1_1 & sign_mask_g) != 0) ? ~m_1_1 : m_1_1 | sign_mask_g);
                                     if (magnitude_1_1 > nan_floor_g) {
+                                        key32_1_1 = zero_u_g;
+                                    }
+                                    unsigned long long key64_1_1 = (unsigned long long)key32_1_1 << 32 | (unsigned long long)(unsigned int)kid_c_1_1;
+                                    unsigned long long key_c_1_2 = key64_1_1;
+                                    int in_prefix_c_1_2 = ((kid_c_1_1 < vis_g[0]) ? 1 : 0);
+                                    int above_c_1_2 = ((key_c_1_2 >= tau_g[0]) ? 1 : 0);
+                                    int emit_c_1_2 = valid_g[0] & in_prefix_c_1_2 & above_c_1_2;
+                                    unsigned int _vote_3 = __ballot_sync(0xFFFFFFFF, emit_c_1_2 != 0);
+                                    int emit_base_c_1_2 = make_warp_uniform(buf_g[0] + cnt_g[0]);
+                                    if (emit_c_1_2 != 0) {
+                                        int slot_c_1_2 = emit_base_c_1_2 + (int)(unsigned int)__popc(_vote_3 & lower_lanes_g);
+                                        unsigned long long entry_2 = (unsigned long long)bits_c_1_2 << 32 | (unsigned long long)(unsigned int)kid_c_1_1;
+                                        Cand[slot_c_1_2] = (long long)entry_2;
+                                    }
+                                    cnt_g[0] = cnt_g[0] + (int)(unsigned int)__popc(_vote_3);
+                                    unsigned int bits_c_1_3 = bq[3];
+                                    unsigned int magnitude_2_1 = bits_c_1_3 & 2147483647;
+                                    unsigned int m_2_1 = ((magnitude_2_1 != 0) ? bits_c_1_3 : zero_u_g);
+                                    unsigned int key32_2_1 = (((m_2_1 & sign_mask_g) != 0) ? ~m_2_1 : m_2_1 | sign_mask_g);
+                                    if (magnitude_2_1 > nan_floor_g) {
+                                        key32_2_1 = zero_u_g;
+                                    }
+                                    unsigned long long key64_2_1 = (unsigned long long)key32_2_1 << 32 | (unsigned long long)(unsigned int)kid_c_1_1;
+                                    unsigned long long key_c_1_3 = key64_2_1;
+                                    int in_prefix_c_1_3 = ((kid_c_1_1 < vis_g[1]) ? 1 : 0);
+                                    int above_c_1_3 = ((key_c_1_3 >= tau_g[1]) ? 1 : 0);
+                                    int emit_c_1_3 = valid_g[1] & in_prefix_c_1_3 & above_c_1_3;
+                                    unsigned int _vote_4 = __ballot_sync(0xFFFFFFFF, emit_c_1_3 != 0);
+                                    int emit_base_c_1_3 = make_warp_uniform(buf_g[1] + cnt_g[1]);
+                                    if (emit_c_1_3 != 0) {
+                                        int slot_c_1_3 = emit_base_c_1_3 + (int)(unsigned int)__popc(_vote_4 & lower_lanes_g);
+                                        unsigned long long entry_3 = (unsigned long long)bits_c_1_3 << 32 | (unsigned long long)(unsigned int)kid_c_1_1;
+                                        Cand[slot_c_1_3] = (long long)entry_3;
+                                    }
+                                    cnt_g[1] = cnt_g[1] + (int)(unsigned int)__popc(_vote_4);
+                                    int kid_c_1_2 = tile_1 * 128 + 64 + lane_g;
+                                    unsigned int bits_c_1_4 = bq[4];
+                                    unsigned int magnitude_3_1 = bits_c_1_4 & 2147483647;
+                                    unsigned int m_3_1 = ((magnitude_3_1 != 0) ? bits_c_1_4 : zero_u_g);
+                                    unsigned int key32_3_1 = (((m_3_1 & sign_mask_g) != 0) ? ~m_3_1 : m_3_1 | sign_mask_g);
+                                    if (magnitude_3_1 > nan_floor_g) {
                                         key32_3_1 = zero_u_g;
                                     }
-                                    unsigned long long key64_4_1 = (unsigned long long)key32_3_1 << 32 | (unsigned long long)(unsigned int)kid_c;
-                                    unsigned long long key_c_5 = key64_4_1;
-                                    int in_prefix_c_6 = ((kid_c < vis_g[1]) ? 1 : 0);
-                                    int above_c_7 = ((key_c_5 >= tau_g[1]) ? 1 : 0);
-                                    int emit_c_8 = valid_g[1] & in_prefix_c_6 & above_c_7;
-                                    unsigned int _vote_9 = __ballot_sync(0xFFFFFFFF, emit_c_8 != 0);
-                                    int emit_base_c_9 = make_warp_uniform(buf_g[1] + cnt_g[1]);
-                                    if (emit_c_8 != 0) {
-                                        int slot_c_1 = emit_base_c_9 + (int)(unsigned int)__popc(_vote_9 & lower_lanes_g);
-                                        unsigned long long entry_1 = (unsigned long long)bits_c_0 << 32 | (unsigned long long)(unsigned int)kid_c;
-                                        Cand[slot_c_1] = (long long)entry_1;
+                                    unsigned long long key64_3_1 = (unsigned long long)key32_3_1 << 32 | (unsigned long long)(unsigned int)kid_c_1_2;
+                                    unsigned long long key_c_1_4 = key64_3_1;
+                                    int in_prefix_c_1_4 = ((kid_c_1_2 < vis_g[0]) ? 1 : 0);
+                                    int above_c_1_4 = ((key_c_1_4 >= tau_g[0]) ? 1 : 0);
+                                    int emit_c_1_4 = valid_g[0] & in_prefix_c_1_4 & above_c_1_4;
+                                    unsigned int _vote_5 = __ballot_sync(0xFFFFFFFF, emit_c_1_4 != 0);
+                                    int emit_base_c_1_4 = make_warp_uniform(buf_g[0] + cnt_g[0]);
+                                    if (emit_c_1_4 != 0) {
+                                        int slot_c_1_4 = emit_base_c_1_4 + (int)(unsigned int)__popc(_vote_5 & lower_lanes_g);
+                                        unsigned long long entry_4 = (unsigned long long)bits_c_1_4 << 32 | (unsigned long long)(unsigned int)kid_c_1_2;
+                                        Cand[slot_c_1_4] = (long long)entry_4;
                                     }
-                                    cnt_g[1] = cnt_g[1] + (int)(unsigned int)__popc(_vote_9);
-                                    int kid_c_10 = tile_1 * 128 + 32 + lane_g;
-                                    unsigned int bits_c_11 = bq[2];
-                                    unsigned int magnitude_12_1 = bits_c_11 & 2147483647;
-                                    unsigned int m_13_1 = ((magnitude_12_1 != 0) ? bits_c_11 : zero_u_g);
-                                    unsigned int key32_14_1 = (((m_13_1 & sign_mask_g) != 0) ? ~m_13_1 : m_13_1 | sign_mask_g);
-                                    if (magnitude_12_1 > nan_floor_g) {
-                                        key32_14_1 = zero_u_g;
+                                    cnt_g[0] = cnt_g[0] + (int)(unsigned int)__popc(_vote_5);
+                                    unsigned int bits_c_1_5 = bq[5];
+                                    unsigned int magnitude_4_1 = bits_c_1_5 & 2147483647;
+                                    unsigned int m_4_1 = ((magnitude_4_1 != 0) ? bits_c_1_5 : zero_u_g);
+                                    unsigned int key32_4_1 = (((m_4_1 & sign_mask_g) != 0) ? ~m_4_1 : m_4_1 | sign_mask_g);
+                                    if (magnitude_4_1 > nan_floor_g) {
+                                        key32_4_1 = zero_u_g;
                                     }
-                                    unsigned long long key64_15 = (unsigned long long)key32_14_1 << 32 | (unsigned long long)(unsigned int)kid_c_10;
-                                    unsigned long long key_c_16 = key64_15;
-                                    int in_prefix_c_17 = ((kid_c_10 < vis_g[0]) ? 1 : 0);
-                                    int above_c_18 = ((key_c_16 >= tau_g[0]) ? 1 : 0);
-                                    int emit_c_19 = valid_g[0] & in_prefix_c_17 & above_c_18;
-                                    unsigned int _vote_10 = __ballot_sync(0xFFFFFFFF, emit_c_19 != 0);
-                                    int emit_base_c_20 = make_warp_uniform(buf_g[0] + cnt_g[0]);
-                                    if (emit_c_19 != 0) {
-                                        int slot_c_2 = emit_base_c_20 + (int)(unsigned int)__popc(_vote_10 & lower_lanes_g);
-                                        unsigned long long entry_2 = (unsigned long long)bits_c_11 << 32 | (unsigned long long)(unsigned int)kid_c_10;
-                                        Cand[slot_c_2] = (long long)entry_2;
+                                    unsigned long long key64_4_1 = (unsigned long long)key32_4_1 << 32 | (unsigned long long)(unsigned int)kid_c_1_2;
+                                    unsigned long long key_c_1_5 = key64_4_1;
+                                    int in_prefix_c_1_5 = ((kid_c_1_2 < vis_g[1]) ? 1 : 0);
+                                    int above_c_1_5 = ((key_c_1_5 >= tau_g[1]) ? 1 : 0);
+                                    int emit_c_1_5 = valid_g[1] & in_prefix_c_1_5 & above_c_1_5;
+                                    unsigned int _vote_6 = __ballot_sync(0xFFFFFFFF, emit_c_1_5 != 0);
+                                    int emit_base_c_1_5 = make_warp_uniform(buf_g[1] + cnt_g[1]);
+                                    if (emit_c_1_5 != 0) {
+                                        int slot_c_1_5 = emit_base_c_1_5 + (int)(unsigned int)__popc(_vote_6 & lower_lanes_g);
+                                        unsigned long long entry_5 = (unsigned long long)bits_c_1_5 << 32 | (unsigned long long)(unsigned int)kid_c_1_2;
+                                        Cand[slot_c_1_5] = (long long)entry_5;
                                     }
-                                    cnt_g[0] = cnt_g[0] + (int)(unsigned int)__popc(_vote_10);
-                                    unsigned int bits_c_21 = bq[3];
-                                    unsigned int magnitude_22 = bits_c_21 & 2147483647;
-                                    unsigned int m_23 = ((magnitude_22 != 0) ? bits_c_21 : zero_u_g);
-                                    unsigned int key32_24 = (((m_23 & sign_mask_g) != 0) ? ~m_23 : m_23 | sign_mask_g);
-                                    if (magnitude_22 > nan_floor_g) {
-                                        key32_24 = zero_u_g;
+                                    cnt_g[1] = cnt_g[1] + (int)(unsigned int)__popc(_vote_6);
+                                    int kid_c_1_3 = tile_1 * 128 + 96 + lane_g;
+                                    unsigned int bits_c_1_6 = bq[6];
+                                    unsigned int magnitude_5_1 = bits_c_1_6 & 2147483647;
+                                    unsigned int m_5_1 = ((magnitude_5_1 != 0) ? bits_c_1_6 : zero_u_g);
+                                    unsigned int key32_5_1 = (((m_5_1 & sign_mask_g) != 0) ? ~m_5_1 : m_5_1 | sign_mask_g);
+                                    if (magnitude_5_1 > nan_floor_g) {
+                                        key32_5_1 = zero_u_g;
                                     }
-                                    unsigned long long key64_25 = (unsigned long long)key32_24 << 32 | (unsigned long long)(unsigned int)kid_c_10;
-                                    unsigned long long key_c_26 = key64_25;
-                                    int in_prefix_c_27 = ((kid_c_10 < vis_g[1]) ? 1 : 0);
-                                    int above_c_28 = ((key_c_26 >= tau_g[1]) ? 1 : 0);
-                                    int emit_c_29 = valid_g[1] & in_prefix_c_27 & above_c_28;
-                                    unsigned int _vote_11 = __ballot_sync(0xFFFFFFFF, emit_c_29 != 0);
-                                    int emit_base_c_30 = make_warp_uniform(buf_g[1] + cnt_g[1]);
-                                    if (emit_c_29 != 0) {
-                                        int slot_c_3 = emit_base_c_30 + (int)(unsigned int)__popc(_vote_11 & lower_lanes_g);
-                                        unsigned long long entry_3 = (unsigned long long)bits_c_21 << 32 | (unsigned long long)(unsigned int)kid_c_10;
-                                        Cand[slot_c_3] = (long long)entry_3;
+                                    unsigned long long key64_5_1 = (unsigned long long)key32_5_1 << 32 | (unsigned long long)(unsigned int)kid_c_1_3;
+                                    unsigned long long key_c_1_6 = key64_5_1;
+                                    int in_prefix_c_1_6 = ((kid_c_1_3 < vis_g[0]) ? 1 : 0);
+                                    int above_c_1_6 = ((key_c_1_6 >= tau_g[0]) ? 1 : 0);
+                                    int emit_c_1_6 = valid_g[0] & in_prefix_c_1_6 & above_c_1_6;
+                                    unsigned int _vote_7 = __ballot_sync(0xFFFFFFFF, emit_c_1_6 != 0);
+                                    int emit_base_c_1_6 = make_warp_uniform(buf_g[0] + cnt_g[0]);
+                                    if (emit_c_1_6 != 0) {
+                                        int slot_c_1_6 = emit_base_c_1_6 + (int)(unsigned int)__popc(_vote_7 & lower_lanes_g);
+                                        unsigned long long entry_6 = (unsigned long long)bits_c_1_6 << 32 | (unsigned long long)(unsigned int)kid_c_1_3;
+                                        Cand[slot_c_1_6] = (long long)entry_6;
                                     }
-                                    cnt_g[1] = cnt_g[1] + (int)(unsigned int)__popc(_vote_11);
-                                    int kid_c_31 = tile_1 * 128 + 64 + lane_g;
-                                    unsigned int bits_c_32 = bq[4];
-                                    unsigned int magnitude_33 = bits_c_32 & 2147483647;
-                                    unsigned int m_34 = ((magnitude_33 != 0) ? bits_c_32 : zero_u_g);
-                                    unsigned int key32_35 = (((m_34 & sign_mask_g) != 0) ? ~m_34 : m_34 | sign_mask_g);
-                                    if (magnitude_33 > nan_floor_g) {
-                                        key32_35 = zero_u_g;
+                                    cnt_g[0] = cnt_g[0] + (int)(unsigned int)__popc(_vote_7);
+                                    unsigned int bits_c_1_7 = bq[7];
+                                    unsigned int magnitude_6_1 = bits_c_1_7 & 2147483647;
+                                    unsigned int m_6_1 = ((magnitude_6_1 != 0) ? bits_c_1_7 : zero_u_g);
+                                    unsigned int key32_6_1 = (((m_6_1 & sign_mask_g) != 0) ? ~m_6_1 : m_6_1 | sign_mask_g);
+                                    if (magnitude_6_1 > nan_floor_g) {
+                                        key32_6_1 = zero_u_g;
                                     }
-                                    unsigned long long key64_36 = (unsigned long long)key32_35 << 32 | (unsigned long long)(unsigned int)kid_c_31;
-                                    unsigned long long key_c_37 = key64_36;
-                                    int in_prefix_c_38 = ((kid_c_31 < vis_g[0]) ? 1 : 0);
-                                    int above_c_39 = ((key_c_37 >= tau_g[0]) ? 1 : 0);
-                                    int emit_c_40 = valid_g[0] & in_prefix_c_38 & above_c_39;
-                                    unsigned int _vote_12 = __ballot_sync(0xFFFFFFFF, emit_c_40 != 0);
-                                    int emit_base_c_41 = make_warp_uniform(buf_g[0] + cnt_g[0]);
-                                    if (emit_c_40 != 0) {
-                                        int slot_c_4 = emit_base_c_41 + (int)(unsigned int)__popc(_vote_12 & lower_lanes_g);
-                                        unsigned long long entry_4 = (unsigned long long)bits_c_32 << 32 | (unsigned long long)(unsigned int)kid_c_31;
-                                        Cand[slot_c_4] = (long long)entry_4;
+                                    unsigned long long key64_6_1 = (unsigned long long)key32_6_1 << 32 | (unsigned long long)(unsigned int)kid_c_1_3;
+                                    unsigned long long key_c_1_7 = key64_6_1;
+                                    int in_prefix_c_1_7 = ((kid_c_1_3 < vis_g[1]) ? 1 : 0);
+                                    int above_c_1_7 = ((key_c_1_7 >= tau_g[1]) ? 1 : 0);
+                                    int emit_c_1_7 = valid_g[1] & in_prefix_c_1_7 & above_c_1_7;
+                                    unsigned int _vote_8 = __ballot_sync(0xFFFFFFFF, emit_c_1_7 != 0);
+                                    int emit_base_c_1_7 = make_warp_uniform(buf_g[1] + cnt_g[1]);
+                                    if (emit_c_1_7 != 0) {
+                                        int slot_c_1_7 = emit_base_c_1_7 + (int)(unsigned int)__popc(_vote_8 & lower_lanes_g);
+                                        unsigned long long entry_7 = (unsigned long long)bits_c_1_7 << 32 | (unsigned long long)(unsigned int)kid_c_1_3;
+                                        Cand[slot_c_1_7] = (long long)entry_7;
                                     }
-                                    cnt_g[0] = cnt_g[0] + (int)(unsigned int)__popc(_vote_12);
-                                    unsigned int bits_c_42 = bq[5];
-                                    unsigned int magnitude_43 = bits_c_42 & 2147483647;
-                                    unsigned int m_44 = ((magnitude_43 != 0) ? bits_c_42 : zero_u_g);
-                                    unsigned int key32_45 = (((m_44 & sign_mask_g) != 0) ? ~m_44 : m_44 | sign_mask_g);
-                                    if (magnitude_43 > nan_floor_g) {
-                                        key32_45 = zero_u_g;
-                                    }
-                                    unsigned long long key64_46 = (unsigned long long)key32_45 << 32 | (unsigned long long)(unsigned int)kid_c_31;
-                                    unsigned long long key_c_47 = key64_46;
-                                    int in_prefix_c_48 = ((kid_c_31 < vis_g[1]) ? 1 : 0);
-                                    int above_c_49 = ((key_c_47 >= tau_g[1]) ? 1 : 0);
-                                    int emit_c_50 = valid_g[1] & in_prefix_c_48 & above_c_49;
-                                    unsigned int _vote_13 = __ballot_sync(0xFFFFFFFF, emit_c_50 != 0);
-                                    int emit_base_c_51 = make_warp_uniform(buf_g[1] + cnt_g[1]);
-                                    if (emit_c_50 != 0) {
-                                        int slot_c_5 = emit_base_c_51 + (int)(unsigned int)__popc(_vote_13 & lower_lanes_g);
-                                        unsigned long long entry_5 = (unsigned long long)bits_c_42 << 32 | (unsigned long long)(unsigned int)kid_c_31;
-                                        Cand[slot_c_5] = (long long)entry_5;
-                                    }
-                                    cnt_g[1] = cnt_g[1] + (int)(unsigned int)__popc(_vote_13);
-                                    int kid_c_52 = tile_1 * 128 + 96 + lane_g;
-                                    unsigned int bits_c_53 = bq[6];
-                                    unsigned int magnitude_54 = bits_c_53 & 2147483647;
-                                    unsigned int m_55 = ((magnitude_54 != 0) ? bits_c_53 : zero_u_g);
-                                    unsigned int key32_56 = (((m_55 & sign_mask_g) != 0) ? ~m_55 : m_55 | sign_mask_g);
-                                    if (magnitude_54 > nan_floor_g) {
-                                        key32_56 = zero_u_g;
-                                    }
-                                    unsigned long long key64_57 = (unsigned long long)key32_56 << 32 | (unsigned long long)(unsigned int)kid_c_52;
-                                    unsigned long long key_c_58 = key64_57;
-                                    int in_prefix_c_59 = ((kid_c_52 < vis_g[0]) ? 1 : 0);
-                                    int above_c_60 = ((key_c_58 >= tau_g[0]) ? 1 : 0);
-                                    int emit_c_61 = valid_g[0] & in_prefix_c_59 & above_c_60;
-                                    unsigned int _vote_14 = __ballot_sync(0xFFFFFFFF, emit_c_61 != 0);
-                                    int emit_base_c_62 = make_warp_uniform(buf_g[0] + cnt_g[0]);
-                                    if (emit_c_61 != 0) {
-                                        int slot_c_6 = emit_base_c_62 + (int)(unsigned int)__popc(_vote_14 & lower_lanes_g);
-                                        unsigned long long entry_6 = (unsigned long long)bits_c_53 << 32 | (unsigned long long)(unsigned int)kid_c_52;
-                                        Cand[slot_c_6] = (long long)entry_6;
-                                    }
-                                    cnt_g[0] = cnt_g[0] + (int)(unsigned int)__popc(_vote_14);
-                                    unsigned int bits_c_63 = bq[7];
-                                    unsigned int magnitude_64 = bits_c_63 & 2147483647;
-                                    unsigned int m_65 = ((magnitude_64 != 0) ? bits_c_63 : zero_u_g);
-                                    unsigned int key32_66 = (((m_65 & sign_mask_g) != 0) ? ~m_65 : m_65 | sign_mask_g);
-                                    if (magnitude_64 > nan_floor_g) {
-                                        key32_66 = zero_u_g;
-                                    }
-                                    unsigned long long key64_67 = (unsigned long long)key32_66 << 32 | (unsigned long long)(unsigned int)kid_c_52;
-                                    unsigned long long key_c_68 = key64_67;
-                                    int in_prefix_c_69 = ((kid_c_52 < vis_g[1]) ? 1 : 0);
-                                    int above_c_70 = ((key_c_68 >= tau_g[1]) ? 1 : 0);
-                                    int emit_c_71 = valid_g[1] & in_prefix_c_69 & above_c_70;
-                                    unsigned int _vote_15 = __ballot_sync(0xFFFFFFFF, emit_c_71 != 0);
-                                    int emit_base_c_72 = make_warp_uniform(buf_g[1] + cnt_g[1]);
-                                    if (emit_c_71 != 0) {
-                                        int slot_c_7 = emit_base_c_72 + (int)(unsigned int)__popc(_vote_15 & lower_lanes_g);
-                                        unsigned long long entry_7 = (unsigned long long)bits_c_63 << 32 | (unsigned long long)(unsigned int)kid_c_52;
-                                        Cand[slot_c_7] = (long long)entry_7;
-                                    }
-                                    cnt_g[1] = cnt_g[1] + (int)(unsigned int)__popc(_vote_15);
+                                    cnt_g[1] = cnt_g[1] + (int)(unsigned int)__popc(_vote_8);
                                 }
                                 ti0_1 = ti0_1 + run_c_1;
                                 int sample_c_1 = ((ti0_1 == n_s_1) ? 1 : 0);
@@ -3695,161 +3523,107 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
                                     int kw_l[2];
                                     int km_l[2];
                                     int sk_l[2];
-                                    int c_q = cnt_g[0];
-                                    int limit_q = ((tau_g[0] != 0) ? cand_cap : first_cap);
-                                    int need_q = ((limit_q < c_q + trigger_room_g) ? 1 : 0);
-                                    int kw_q = top_k;
-                                    int km_q = keep_cap_g;
-                                    int sk_q = 0;
-                                    if (need_q == 0) {
+                                    int c_q_1_0 = cnt_g[0];
+                                    int limit_q_2_0 = ((tau_g[0] != 0) ? cand_cap : first_cap);
+                                    int need_q_1_0 = ((limit_q_2_0 < c_q_1_0 + trigger_room_g) ? 1 : 0);
+                                    int kw_q_1_0 = top_k;
+                                    int km_q_1_0 = keep_cap_g;
+                                    int sk_q_1_0 = 0;
+                                    if (need_q_1_0 == 0) {
                                         if (sample_c_1 != 0) {
                                             if (valid_g[0] != 0) {
-#if TILE_UNROLL == 1
 #if __CUDA_ARCH__ == 1000
-                                                int _max_2 = ((vis_g[0] - (n_tiles_2_1 - 1) * 128) > (0) ? (vis_g[0] - (n_tiles_2_1 - 1) * 128) : (0));
-                                                int n_diag = ((_max_2) < (128) ? (_max_2) : (128));
-                                                int c_far = c_q - n_diag;
-                                                int v_far = vis_g[0] - n_diag;
+                                                int _max_3 = ((vis_g[0] - (n_tiles_2_1 - 1) * 128) > (0) ? (vis_g[0] - (n_tiles_2_1 - 1) * 128) : (0));
+                                                int n_diag_1_0 = ((_max_3) < (128) ? (_max_3) : (128));
+                                                int c_far_1_0 = c_q_1_0 - n_diag_1_0;
+                                                int v_far_1_0 = vis_g[0] - n_diag_1_0;
 #else
-                                                int t_near = (n_s_1 - 1) * stride_2;
-                                                int _max_2 = ((vis_g[0] - t_near * 128) > (0) ? (vis_g[0] - t_near * 128) : (0));
-                                                int n_near = ((_max_2) < (128) ? (_max_2) : (128));
-                                                int c_far = c_q - n_near;
-                                                int v_far = vis_g[0] - n_near;
+                                                int t_near_1_0 = (n_s_1 - 1) * stride_2;
+                                                int _max_3 = ((vis_g[0] - t_near_1_0 * 128) > (0) ? (vis_g[0] - t_near_1_0 * 128) : (0));
+                                                int n_near_1_0 = ((_max_3) < (128) ? (_max_3) : (128));
+                                                int c_far_1_0 = c_q_1_0 - n_near_1_0;
+                                                int v_far_1_0 = vis_g[0] - n_near_1_0;
 #endif
-#else
+                                                if (v_far_1_0 > 0) {
+                                                    int r_q_1_0 = (top_k * c_far_1_0 + v_far_1_0 - 1) / v_far_1_0;
+                                                    int r_shift_1_0 = r_q_1_0 + r_q_1_0 * sample_shift_permille / 1000 + 24;
+                                                    if (r_shift_1_0 < c_far_1_0) {
+                                                        need_q_1_0 = 1;
+                                                        kw_q_1_0 = r_shift_1_0;
+                                                        int _min_4_1 = ((r_shift_1_0 + 64) < (keep_cap_g) ? (r_shift_1_0 + 64) : (keep_cap_g));
+                                                        km_q_1_0 = _min_4_1;
 #if __CUDA_ARCH__ == 1000
-                                                int _max_2 = ((vis_g[0] - (n_tiles_2_1 - 1) * 128) > (0) ? (vis_g[0] - (n_tiles_2_1 - 1) * 128) : (0));
-                                                int n_diag = ((_max_2) < (128) ? (_max_2) : (128));
-                                                int c_far = c_q - n_diag;
-                                                int v_far = vis_g[0] - n_diag;
+                                                        sk_q_1_0 = n_diag_1_0;
 #else
-                                                int t_near = (n_s_1 - 1) * stride_2;
-                                                int _max_3 = ((vis_g[0] - t_near * 128) > (0) ? (vis_g[0] - t_near * 128) : (0));
-                                                int n_near = ((_max_3) < (128) ? (_max_3) : (128));
-                                                int c_far = c_q - n_near;
-                                                int v_far = vis_g[0] - n_near;
-#endif
-#endif
-                                                if (v_far > 0) {
-                                                    int r_q = (top_k * c_far + v_far - 1) / v_far;
-                                                    int r_shift = r_q + r_q * sample_shift_permille / 1000 + 24;
-                                                    if (r_shift < c_far) {
-                                                        need_q = 1;
-                                                        kw_q = r_shift;
-#if TILE_UNROLL == 1
-                                                        int _min_3_1 = ((r_shift + 64) < (keep_cap_g) ? (r_shift + 64) : (keep_cap_g));
-                                                        km_q = _min_3_1;
-#if __CUDA_ARCH__ == 1000
-                                                        sk_q = n_diag;
-#else
-                                                        sk_q = n_near;
-#endif
-#else
-#if __CUDA_ARCH__ == 1000
-                                                        int _min_3_1 = ((r_shift + 64) < (keep_cap_g) ? (r_shift + 64) : (keep_cap_g));
-                                                        km_q = _min_3_1;
-                                                        sk_q = n_diag;
-#else
-                                                        int _min_4 = ((r_shift + 64) < (keep_cap_g) ? (r_shift + 64) : (keep_cap_g));
-                                                        km_q = _min_4;
-                                                        sk_q = n_near;
-#endif
+                                                        sk_q_1_0 = n_near_1_0;
 #endif
                                                     }
                                                 }
                                             }
                                         }
                                     }
-                                    need_l[0] = need_q;
-                                    kw_l[0] = kw_q;
-                                    km_l[0] = km_q;
-                                    sk_l[0] = sk_q;
-                                    int c_q_0 = cnt_g[1];
-                                    int limit_q_1 = ((tau_g[1] != 0) ? cand_cap : first_cap);
-                                    int need_q_2 = ((limit_q_1 < c_q_0 + trigger_room_g) ? 1 : 0);
-                                    int kw_q_3 = top_k;
-                                    int km_q_4 = keep_cap_g;
-                                    int sk_q_5 = 0;
-                                    if (need_q_2 == 0) {
+                                    need_l[0] = need_q_1_0;
+                                    kw_l[0] = kw_q_1_0;
+                                    km_l[0] = km_q_1_0;
+                                    sk_l[0] = sk_q_1_0;
+                                    int c_q_1_1 = cnt_g[1];
+                                    int limit_q_2_1 = ((tau_g[1] != 0) ? cand_cap : first_cap);
+                                    int need_q_1_1 = ((limit_q_2_1 < c_q_1_1 + trigger_room_g) ? 1 : 0);
+                                    int kw_q_1_1 = top_k;
+                                    int km_q_1_1 = keep_cap_g;
+                                    int sk_q_1_1 = 0;
+                                    if (need_q_1_1 == 0) {
                                         if (sample_c_1 != 0) {
                                             if (valid_g[1] != 0) {
-#if TILE_UNROLL == 1
 #if __CUDA_ARCH__ == 1000
-                                                int _max_4 = ((vis_g[1] - (n_tiles_2_1 - 1) * 128) > (0) ? (vis_g[1] - (n_tiles_2_1 - 1) * 128) : (0));
-                                                int n_diag_1 = ((_max_4) < (128) ? (_max_4) : (128));
-                                                int c_far_1 = c_q_0 - n_diag_1;
-                                                int v_far_1 = vis_g[1] - n_diag_1;
+                                                int _max_5 = ((vis_g[1] - (n_tiles_2_1 - 1) * 128) > (0) ? (vis_g[1] - (n_tiles_2_1 - 1) * 128) : (0));
+                                                int n_diag_1_1 = ((_max_5) < (128) ? (_max_5) : (128));
+                                                int c_far_1_1 = c_q_1_1 - n_diag_1_1;
+                                                int v_far_1_1 = vis_g[1] - n_diag_1_1;
 #else
-                                                int t_near_1 = (n_s_1 - 1) * stride_2;
-                                                int _max_4 = ((vis_g[1] - t_near_1 * 128) > (0) ? (vis_g[1] - t_near_1 * 128) : (0));
-                                                int n_near_1 = ((_max_4) < (128) ? (_max_4) : (128));
-                                                int c_far_1 = c_q_0 - n_near_1;
-                                                int v_far_1 = vis_g[1] - n_near_1;
+                                                int t_near_1_1 = (n_s_1 - 1) * stride_2;
+                                                int _max_5 = ((vis_g[1] - t_near_1_1 * 128) > (0) ? (vis_g[1] - t_near_1_1 * 128) : (0));
+                                                int n_near_1_1 = ((_max_5) < (128) ? (_max_5) : (128));
+                                                int c_far_1_1 = c_q_1_1 - n_near_1_1;
+                                                int v_far_1_1 = vis_g[1] - n_near_1_1;
 #endif
-#else
+                                                if (v_far_1_1 > 0) {
+                                                    int r_q_1_1 = (top_k * c_far_1_1 + v_far_1_1 - 1) / v_far_1_1;
+                                                    int r_shift_1_1 = r_q_1_1 + r_q_1_1 * sample_shift_permille / 1000 + 24;
+                                                    if (r_shift_1_1 < c_far_1_1) {
+                                                        need_q_1_1 = 1;
+                                                        kw_q_1_1 = r_shift_1_1;
+                                                        int _min_6 = ((r_shift_1_1 + 64) < (keep_cap_g) ? (r_shift_1_1 + 64) : (keep_cap_g));
+                                                        km_q_1_1 = _min_6;
 #if __CUDA_ARCH__ == 1000
-                                                int _max_4 = ((vis_g[1] - (n_tiles_2_1 - 1) * 128) > (0) ? (vis_g[1] - (n_tiles_2_1 - 1) * 128) : (0));
-                                                int n_diag_1 = ((_max_4) < (128) ? (_max_4) : (128));
-                                                int c_far_1 = c_q_0 - n_diag_1;
-                                                int v_far_1 = vis_g[1] - n_diag_1;
+                                                        sk_q_1_1 = n_diag_1_1;
 #else
-                                                int t_near_1 = (n_s_1 - 1) * stride_2;
-                                                int _max_5 = ((vis_g[1] - t_near_1 * 128) > (0) ? (vis_g[1] - t_near_1 * 128) : (0));
-                                                int n_near_1 = ((_max_5) < (128) ? (_max_5) : (128));
-                                                int c_far_1 = c_q_0 - n_near_1;
-                                                int v_far_1 = vis_g[1] - n_near_1;
-#endif
-#endif
-                                                if (v_far_1 > 0) {
-                                                    int r_q_1 = (top_k * c_far_1 + v_far_1 - 1) / v_far_1;
-                                                    int r_shift_1 = r_q_1 + r_q_1 * sample_shift_permille / 1000 + 24;
-                                                    if (r_shift_1 < c_far_1) {
-                                                        need_q_2 = 1;
-                                                        kw_q_3 = r_shift_1;
-#if TILE_UNROLL == 1
-                                                        int _min_5 = ((r_shift_1 + 64) < (keep_cap_g) ? (r_shift_1 + 64) : (keep_cap_g));
-                                                        km_q_4 = _min_5;
-#if __CUDA_ARCH__ == 1000
-                                                        sk_q_5 = n_diag_1;
-#else
-                                                        sk_q_5 = n_near_1;
-#endif
-#else
-#if __CUDA_ARCH__ == 1000
-                                                        int _min_5 = ((r_shift_1 + 64) < (keep_cap_g) ? (r_shift_1 + 64) : (keep_cap_g));
-                                                        km_q_4 = _min_5;
-                                                        sk_q_5 = n_diag_1;
-#else
-                                                        int _min_6 = ((r_shift_1 + 64) < (keep_cap_g) ? (r_shift_1 + 64) : (keep_cap_g));
-                                                        km_q_4 = _min_6;
-                                                        sk_q_5 = n_near_1;
-#endif
+                                                        sk_q_1_1 = n_near_1_1;
 #endif
                                                     }
                                                 }
                                             }
                                         }
                                     }
-                                    need_l[1] = need_q_2;
-                                    kw_l[1] = kw_q_3;
-                                    km_l[1] = km_q_4;
-                                    sk_l[1] = sk_q_5;
+                                    need_l[1] = need_q_1_1;
+                                    kw_l[1] = kw_q_1_1;
+                                    km_l[1] = km_q_1_1;
+                                    sk_l[1] = sk_q_1_1;
                                     int rq_base_g = (int)gate_rq * 40;
                                     __syncwarp();
                                     if (lane == 0) {
-                                        int rq_gj = rq_base_g + 2 * g_6 * 5;
-                                        s_req[rq_gj] = need_l[0];
-                                        s_req[rq_gj + 1] = kw_l[0];
-                                        s_req[rq_gj + 2] = km_l[0];
-                                        s_req[rq_gj + 3] = sk_l[0];
-                                        s_req[rq_gj + 4] = cnt_g[0];
-                                        int rq_gj_0 = rq_base_g + (2 * g_6 + 1) * 5;
-                                        s_req[rq_gj_0] = need_l[1];
-                                        s_req[rq_gj_0 + 1] = kw_l[1];
-                                        s_req[rq_gj_0 + 2] = km_l[1];
-                                        s_req[rq_gj_0 + 3] = sk_l[1];
-                                        s_req[rq_gj_0 + 4] = cnt_g[1];
+                                        int rq_gj_1_0 = rq_base_g + 2 * g_6 * 5;
+                                        s_req[rq_gj_1_0] = need_l[0];
+                                        s_req[rq_gj_1_0 + 1] = kw_l[0];
+                                        s_req[rq_gj_1_0 + 2] = km_l[0];
+                                        s_req[rq_gj_1_0 + 3] = sk_l[0];
+                                        s_req[rq_gj_1_0 + 4] = cnt_g[0];
+                                        int rq_gj_1_1 = rq_base_g + (2 * g_6 + 1) * 5;
+                                        s_req[rq_gj_1_1] = need_l[1];
+                                        s_req[rq_gj_1_1 + 1] = kw_l[1];
+                                        s_req[rq_gj_1_1 + 2] = km_l[1];
+                                        s_req[rq_gj_1_1 + 3] = sk_l[1];
+                                        s_req[rq_gj_1_1 + 4] = cnt_g[1];
                                         mbarrier_arrive(comp_req_addr + (gate_rq) * 8);
                                     }
                                     gate_rq += 1;
@@ -3872,36 +3646,16 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
                                             unsigned int lo_g = (unsigned int)s_tau[2 * g_6 * 2];
                                             unsigned int hi_g = (unsigned int)s_tau[2 * g_6 * 2 + 1];
                                             unsigned long long tau_new_g = (unsigned long long)hi_g << 32 | (unsigned long long)lo_g;
-#if TILE_UNROLL == 1
-                                            unsigned long long _max_6 = ((tau_new_g) > (tau_g[0]) ? (tau_new_g) : (tau_g[0]));
-                                            tau_g[0] = _max_6;
-#else
-#if __CUDA_ARCH__ == 1000
-                                            unsigned long long _max_6 = ((tau_new_g) > (tau_g[0]) ? (tau_new_g) : (tau_g[0]));
-                                            tau_g[0] = _max_6;
-#else
                                             unsigned long long _max_7 = ((tau_new_g) > (tau_g[0]) ? (tau_new_g) : (tau_g[0]));
                                             tau_g[0] = _max_7;
-#endif
-#endif
                                         }
                                         if (need_l[1] != 0) {
                                             cnt_g[1] = s_count[2 * g_6 + 1];
                                             unsigned int lo_g_1 = (unsigned int)s_tau[(2 * g_6 + 1) * 2];
                                             unsigned int hi_g_1 = (unsigned int)s_tau[(2 * g_6 + 1) * 2 + 1];
                                             unsigned long long tau_new_g_1 = (unsigned long long)hi_g_1 << 32 | (unsigned long long)lo_g_1;
-#if TILE_UNROLL == 1
-                                            unsigned long long _max_7 = ((tau_new_g_1) > (tau_g[1]) ? (tau_new_g_1) : (tau_g[1]));
-                                            tau_g[1] = _max_7;
-#else
-#if __CUDA_ARCH__ == 1000
-                                            unsigned long long _max_7 = ((tau_new_g_1) > (tau_g[1]) ? (tau_new_g_1) : (tau_g[1]));
-                                            tau_g[1] = _max_7;
-#else
                                             unsigned long long _max_8 = ((tau_new_g_1) > (tau_g[1]) ? (tau_new_g_1) : (tau_g[1]));
                                             tau_g[1] = _max_8;
-#endif
-#endif
                                         }
                                     }
                                 } else {
@@ -3910,42 +3664,22 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
                             }
                             if (attempt_4 == 0) {
                                 int fails_g[2];
-                                int fail_j = 0;
+                                int fail_j_1_0 = 0;
                                 if (valid_g[0] != 0) {
-#if TILE_UNROLL == 1
-                                    int _min_8 = ((top_k) < (vis_g[0]) ? (top_k) : (vis_g[0]));
-                                    if (cnt_g[0] < _min_8) {
-#else
-#if __CUDA_ARCH__ == 1000
-                                    int _min_8 = ((top_k) < (vis_g[0]) ? (top_k) : (vis_g[0]));
-                                    if (cnt_g[0] < _min_8) {
-#else
                                     int _min_9 = ((top_k) < (vis_g[0]) ? (top_k) : (vis_g[0]));
                                     if (cnt_g[0] < _min_9) {
-#endif
-#endif
-                                        fail_j = 1;
+                                        fail_j_1_0 = 1;
                                     }
                                 }
-                                fails_g[0] = fail_j;
-                                int fail_j_0 = 0;
+                                fails_g[0] = fail_j_1_0;
+                                int fail_j_1_1 = 0;
                                 if (valid_g[1] != 0) {
-#if TILE_UNROLL == 1
-                                    int _min_9 = ((top_k) < (vis_g[1]) ? (top_k) : (vis_g[1]));
-                                    if (cnt_g[1] < _min_9) {
-#else
-#if __CUDA_ARCH__ == 1000
-                                    int _min_9 = ((top_k) < (vis_g[1]) ? (top_k) : (vis_g[1]));
-                                    if (cnt_g[1] < _min_9) {
-#else
                                     int _min_10 = ((top_k) < (vis_g[1]) ? (top_k) : (vis_g[1]));
                                     if (cnt_g[1] < _min_10) {
-#endif
-#endif
-                                        fail_j_0 = 1;
+                                        fail_j_1_1 = 1;
                                     }
                                 }
-                                fails_g[1] = fail_j_0;
+                                fails_g[1] = fail_j_1_1;
                                 mbarrier_wait(verdict_ack_addr, _phase_verdict_ack);
                                 _phase_verdict_ack ^= 1;
                                 if (elect_sync()) {
@@ -3953,15 +3687,9 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
                                     s_fail[2 * g_6] = fails_g[0];
                                     s_count[2 * g_6 + 1] = cnt_g[1];
                                     s_fail[2 * g_6 + 1] = fails_g[1];
-#if TILE_UNROLL == 1
-#else
-#if __CUDA_ARCH__ == 1000
-#else
                                     if (g_6 == 0) {
-                                        s_tk[0] = next_g;
+                                        s_tk[tkp_g ^ 1] = next_g;
                                     }
-#endif
-#endif
                                     mbarrier_arrive(verdict_bar_addr);
                                 }
                             } else {
@@ -3980,13 +3708,7 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant
                                 f_4 = f_4 | s_fail[7];
                                 verdict_g = f_4;
                             }
-#if TILE_UNROLL == 1
-#else
-#if __CUDA_ARCH__ == 1000
-#else
-                            tk_g = s_tk[0];
-#endif
-#endif
+                            tk_g = s_tk[tkp_g ^ 1];
                             asm volatile("barrier.sync 8, 384;" ::: "memory");
                             if (verdict_g == 0) {
                                 break;

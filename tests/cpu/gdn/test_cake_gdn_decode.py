@@ -24,7 +24,13 @@ from flashinfer.jit import cake_gdn as cake_gdn
 # The -D knobs a record passes when it shares its body with a schedule twin
 # (its kernel symbol and the constant its deleted clone body baked in); the
 # resolver key (``specializations``) does not carry them.
-_BODY_SHARING_DEFINES = {"CAKE_GDN_KERNEL_SYMBOL", "LAUNCH_MIN_BLOCKS", "T_STEPS"}
+_BODY_SHARING_DEFINES = {
+    "CAKE_GDN_KERNEL_SYMBOL",
+    "LAUNCH_MIN_BLOCKS",
+    "T_STEPS",
+    "CAKE_GDN_METADATA_I64",
+    "CAKE_GDN_FP8_X2",
+}
 
 
 def _prefill(**overrides):

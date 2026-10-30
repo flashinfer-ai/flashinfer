@@ -26,8 +26,8 @@ the same inputs, to bitwise idempotence, to stream-private workspaces and to its
 Concurrent use of the NVFP4 routes (several streams, CUDA graphs captured on one stream or with forked
 branches, two host threads on one stream, serialized launches) completes and reproduces every call's
 single-stream result bit for bit; each such test fails at a progress deadline instead of hanging.
-Every test needs an SM120 GPU (the JIT modules only build for compute capability 12.x) except the
-workspace estimators and the ``pv_mode`` validation.
+Numerical and concurrency tests require exact compute capability 12.0: the generated programs
+ship only sm_120a. Input validation and unsupported-device rejection remain covered on other GPUs.
 """
 
 import math
@@ -91,13 +91,33 @@ PV_MODES = ("fp4", "fp8")
 def _supported() -> bool:
     if not torch.cuda.is_available():
         return False
-    major, _minor = get_compute_capability(torch.device("cuda:0"))
-    return major == 12
+    return get_compute_capability(torch.device("cuda:0")) == (12, 0)
 
 
 requires_sm120 = pytest.mark.skipif(
-    not _supported(), reason="requires an SM120 (RTX 5090 / RTX PRO 6000 Blackwell) GPU"
+    not _supported(),
+    reason="generated programs require exact compute capability 12.0 (sm_120a)",
 )
+
+
+@pytest.mark.parametrize(
+    "cuda_available, capability, expected",
+    [
+        (False, (12, 0), False),
+        (True, (12, 0), True),
+        (True, (12, 1), False),
+        (True, (10, 0), False),
+    ],
+)
+def test_supported_requires_exact_sm120(
+    monkeypatch, cuda_available, capability, expected
+):
+    # The generated programs ship sm_120a only; Spark must not enter the numerical suite.
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: cuda_available)
+    monkeypatch.setitem(
+        _supported.__globals__, "get_compute_capability", lambda device: capability
+    )
+    assert _supported() is expected
 
 
 def synthetic_inputs(tokens: int, heads: int, seed: int, device: torch.device):
@@ -236,7 +256,23 @@ def test_minimax_h3_sm120_varlen_attention_nvfp4_custom_scale_and_empty_stream()
     )
 
 
-@requires_sm120
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("pv_mode", PV_MODES)
+def test_minimax_h3_sm120_varlen_attention_nvfp4_rejects_unsupported_device(
+    pv_mode,
+) -> None:
+    device = torch.device("cuda:0")
+    if get_compute_capability(device) == (12, 0):
+        pytest.skip("SM120 is supported; numerical tests cover this device")
+    q, k, v = synthetic_inputs(1, 1, seed=0, device=device)
+    cu = torch.tensor([0, 1], dtype=torch.int32, device=device)
+    with pytest.raises(RuntimeError, match=r"requires exact compute capability 12\.0"):
+        minimax_h3_sm120_varlen_attention_nvfp4(
+            q, k, v, cu, cu_seqlens_host=(0, 1), pv_mode=pv_mode
+        )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_minimax_h3_sm120_varlen_attention_nvfp4_rejects_bad_inputs() -> None:
     device = torch.device("cuda:0")
     q, k, v = synthetic_inputs(300, 4, seed=3, device=device)
@@ -508,6 +544,68 @@ def test_minimax_h3_sm120_varlen_attention_nvfp4_concurrent_streams_are_bitwise(
             assert torch.equal(out, want)
             out.zero_()
     assert _control_words_are_zero([(device.index, s.cuda_stream) for s in streams])
+
+
+# Plans of the fused pre-processing with a short attention-weighted mean segment, whose overlapped form takes a
+# width of the light table (``_OVERLAP_LIGHT_WIDTHS``): 1024 tokens (every SM count and route) and 2048 tokens (188
+# SMs, and the uncompensated route on 170 SMs; the compensated route on 170 SMs keeps the shipped width).  A longer
+# plan with a 1900-token mean segment takes the long light width on 170 SMs (``_OVERLAP_LONG_LIGHT_WIDTHS``) and
+# the long width on 188 SMs.
+LIGHT_CU_SEQLENS = [
+    (0, 1024, 2048, 3072, 4096),
+    (0, 2048, 4096),
+    tuple(range(0, 19001, 1900)),
+]
+
+
+@requires_sm120
+@pytest.mark.parametrize("cu_seqlens", LIGHT_CU_SEQLENS)
+@pytest.mark.parametrize("delta", [True, False])
+def test_minimax_h3_sm120_varlen_attention_nvfp4_light_overlap_widths_are_bitwise_sequential(
+    cu_seqlens, delta, monkeypatch
+) -> None:
+    """A plan whose overlap width follows its attention-weighted mean segment launches the grids of that width,
+    matches the separate launches bit for bit and leaves the zero-start words zero."""
+    device = torch.device("cuda:0")
+    sms = nvfp4_ops._sm_count(device.index)
+    if sms not in nvfp4_ops._OVERLAP_WIDTH:
+        pytest.skip(f"no overlap width on {sms} SMs")
+    monkeypatch.setattr(nvfp4_ops, "_NVFP4_LAUNCHES", OrderedDict())
+    fn = _route(delta)
+    cu = torch.tensor(cu_seqlens, dtype=torch.int32, device=device)
+    q, k, v = synthetic_inputs(
+        cu_seqlens[-1], MINIMAX_H3_NUM_HEADS, seed=23, device=device
+    )
+    plan = quant_ops._plan(cu_seqlens, MINIMAX_H3_NUM_HEADS, device)
+    expected = nvfp4_ops.minimax_h3_sm120_nvfp4_overlap_grids(
+        sms,
+        num_units=plan.num_units,
+        padded_tokens=plan.padded_tokens,
+        total_tokens=plan.total_tokens,
+        work=plan.work,
+        delta=delta,
+    )
+    if cu_seqlens[1] == 1024:
+        assert expected[2] > nvfp4_ops._OVERLAP_WIDTH[sms]
+    if plan.padded_tokens > nvfp4_ops._PREPROCESS_MAX_TOKENS:
+        long_width = nvfp4_ops._OVERLAP_WIDTH_LONG[sms]
+        assert expected[2] == (48 if sms == 170 else long_width)
+    owner = nvfp4_ops._owner(device.index, nvfp4_ops._current_stream(device.index))
+    launch = nvfp4_ops._nvfp4_launch(
+        plan, delta, owner, nvfp4_ops._nvfp4_target(device.index)
+    )
+    # (lead grid, tail slot, tail grid) of the overlapped form
+    assert launch.args[-3] >= 0
+    assert (launch.args[-4], launch.args[-2]) == (expected[0], expected[2])
+    overlapped = [fn(q, k, v, cu, cu_seqlens_host=cu_seqlens) for _call in range(2)]
+    _await((torch.cuda.current_stream(),), "overlapped calls")
+    assert _control_words_are_zero([owner])
+    monkeypatch.setattr(nvfp4_ops, "_OVERLAP_WIDTH", {})
+    monkeypatch.setattr(nvfp4_ops, "_NVFP4_LAUNCHES", OrderedDict())
+    sequential = fn(q, k, v, cu, cu_seqlens_host=cu_seqlens)
+    torch.cuda.synchronize()
+    for out in overlapped:
+        assert torch.equal(out, sequential)
 
 
 # The plan of the graph, host-thread and serialized-launch tests: the fused pre-processing (the overlapped form
@@ -794,3 +892,124 @@ def test_minimax_h3_sm120_varlen_attention_nvfp4_serialized_launches(
         pytest.fail("overlapped calls with serialized launches did not finish in 600 s")
     stderr_tail = result.stderr[-4000:]
     assert result.returncode == 0 and "SERIALIZED_OK" in result.stdout, stderr_tail
+
+
+@requires_sm120
+@pytest.mark.parametrize(
+    "cu_seqlens",
+    [
+        (0, 1100, 2100),
+        (0, 257, 4567, 4824),
+        (0, 4096),
+        (0, 8368, 16736, 25104, 33472),
+    ],
+)
+def test_minimax_h3_sm120_varlen_attention_nvfp4_nodelta_producer_builds_are_bitwise(
+    cu_seqlens, monkeypatch
+) -> None:
+    """The overlapped form's two producer builds, ``PREPROCESS_HEAD_MAJOR`` and ``PREPROCESS_HEAD_MAJOR_KA``
+    (a K item waits for its head's K sums in the worker's second warp), give bit-identical outputs of the
+    uncompensated route: each in turn produces for the lead and tail the host routes on this device (on 188
+    SMs the host's own producers are ``PREPROCESS_HEAD_MAJOR_KA``), two calls each, the first included."""
+    device = torch.device("cuda:0")
+    num_sms = nvfp4_ops._sm_count(0)
+    if num_sms not in nvfp4_ops._OVERLAP_WIDTH:
+        pytest.skip(f"no overlapped form on {num_sms} SMs")
+    q, k, v = synthetic_inputs(
+        cu_seqlens[-1], MINIMAX_H3_NUM_HEADS, seed=67, device=device
+    )
+    cu = torch.tensor(cu_seqlens, dtype=torch.int32, device=device)
+    host_programs = nvfp4_ops.minimax_h3_sm120_nvfp4_programs
+    producers = (nvfp4_ops.PREPROCESS_HEAD_MAJOR, nvfp4_ops.PREPROCESS_HEAD_MAJOR_KA)
+    outs, routed_producers = [], []
+    for producer in producers:
+
+        def programs(plan, sms, *, delta=True, _producer=producer):
+            routed = host_programs(plan, sms, delta=delta)
+            if routed[0] in producers:
+                routed_producers.append(routed[0])
+                return (_producer, *routed[1:])
+            return routed
+
+        monkeypatch.setattr(nvfp4_ops, "minimax_h3_sm120_nvfp4_programs", programs)
+        monkeypatch.setattr(nvfp4_ops, "_NVFP4_LAUNCHES", OrderedDict())
+        monkeypatch.setattr(nvfp4_ops, "_NVFP4_OVERLAP_LOADED", set())
+        first = minimax_h3_sm120_varlen_attention_nvfp4_nodelta(
+            q, k, v, cu, cu_seqlens_host=cu_seqlens
+        )
+        again = minimax_h3_sm120_varlen_attention_nvfp4_nodelta(
+            q, k, v, cu, cu_seqlens_host=cu_seqlens
+        )
+        torch.cuda.synchronize()
+        assert torch.equal(first, again)
+        outs.append(first)
+    assert len(routed_producers) >= 2, "the plan did not take the overlapped form"
+    if num_sms in nvfp4_ops._OVERLAP_WS_NODELTA_SMS:
+        assert all(p is nvfp4_ops.PREPROCESS_HEAD_MAJOR_KA for p in routed_producers)
+    else:
+        assert all(p is nvfp4_ops.PREPROCESS_HEAD_MAJOR for p in routed_producers)
+    assert torch.equal(outs[0], outs[1])
+
+
+@requires_sm120
+@pytest.mark.parametrize(
+    "cu_seqlens",
+    [
+        (0, 1100, 2100),
+        (0, 257, 4567, 4824),
+        (0, 4096),
+        (0, 8368, 16736, 25104, 33472),
+    ],
+)
+def test_minimax_h3_sm120_varlen_attention_nvfp4_sfsel_lead_tail_are_bitwise(
+    cu_seqlens, monkeypatch
+) -> None:
+    """The compensated overlapped form's two lead / tail builds, ``ATTENTION_LEAD`` / ``ATTENTION_TAIL`` and
+    ``ATTENTION_SFSEL_LEAD`` / ``ATTENTION_SFSEL_TAIL`` (each MMA selects its tile's B scale record), give
+    bit-identical outputs: each pair in turn runs as the lead and tail of the overlapped form the host routes on
+    this device (on 170 SMs the host's own pair is the second for a plan above the fused pre-processing, the
+    first for a plan of it), two calls each, the first included."""
+    device = torch.device("cuda:0")
+    num_sms = nvfp4_ops._sm_count(0)
+    if num_sms not in nvfp4_ops._OVERLAP_WIDTH:
+        pytest.skip(f"no overlapped form on {num_sms} SMs")
+    q, k, v = synthetic_inputs(
+        cu_seqlens[-1], MINIMAX_H3_NUM_HEADS, seed=71, device=device
+    )
+    cu = torch.tensor(cu_seqlens, dtype=torch.int32, device=device)
+    host_programs = nvfp4_ops.minimax_h3_sm120_nvfp4_programs
+    pairs = (
+        (nvfp4_ops.ATTENTION_LEAD, nvfp4_ops.ATTENTION_TAIL),
+        (nvfp4_ops.ATTENTION_SFSEL_LEAD, nvfp4_ops.ATTENTION_SFSEL_TAIL),
+    )
+    outs, routed_pairs = [], []
+    for pair in pairs:
+
+        def programs(plan, sms, *, delta=True, _pair=pair):
+            routed = host_programs(plan, sms, delta=delta)
+            if tuple(routed[1:]) in pairs:
+                routed_pairs.append(tuple(routed[1:]))
+                return (routed[0], *_pair)
+            return routed
+
+        monkeypatch.setattr(nvfp4_ops, "minimax_h3_sm120_nvfp4_programs", programs)
+        monkeypatch.setattr(nvfp4_ops, "_NVFP4_LAUNCHES", OrderedDict())
+        monkeypatch.setattr(nvfp4_ops, "_NVFP4_OVERLAP_LOADED", set())
+        first = minimax_h3_sm120_varlen_attention_nvfp4(
+            q, k, v, cu, cu_seqlens_host=cu_seqlens
+        )
+        again = minimax_h3_sm120_varlen_attention_nvfp4(
+            q, k, v, cu, cu_seqlens_host=cu_seqlens
+        )
+        torch.cuda.synchronize()
+        assert torch.equal(first, again)
+        outs.append(first)
+    assert len(routed_pairs) >= 2, "the plan did not take the overlapped form"
+    padded = -(-cu_seqlens[-1] // 128) * 128
+    fused = (
+        nvfp4_ops._PREPROCESS_MIN_TOKENS <= padded <= nvfp4_ops._PREPROCESS_MAX_TOKENS
+    )
+    sfsel = num_sms in nvfp4_ops._OVERLAP_SFSEL_SMS and not fused
+    expected = pairs[1] if sfsel else pairs[0]
+    assert all(p[0] is expected[0] and p[1] is expected[1] for p in routed_pairs)
+    assert torch.equal(outs[0], outs[1])

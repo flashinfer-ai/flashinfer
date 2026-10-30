@@ -269,11 +269,16 @@ kernel_cake_kimi_k3_fused_router_6d1a3cbbec0fdd51dbf5(float* __restrict__ logits
     int expert_base = group_tid * ITEMS_PER_THREAD;
     float _vec_load_0[4];
     {
-        float4 _v4 = *reinterpret_cast<const float4*>(bias + expert_base);
-        _vec_load_0[0 + 0] = _v4.x;
-        _vec_load_0[0 + 1] = _v4.y;
-        _vec_load_0[0 + 2] = _v4.z;
-        _vec_load_0[0 + 3] = _v4.w;
+        unsigned _v4_0_0;
+        unsigned _v4_0_1;
+        unsigned _v4_0_2;
+        unsigned _v4_0_3;
+        asm volatile("ld.global.nc.v4.b32 {%0, %1, %2, %3}, [%4];"
+            : "=r"(_v4_0_0), "=r"(_v4_0_1), "=r"(_v4_0_2), "=r"(_v4_0_3) : "l"((const void*)(bias + (expert_base))) : "memory");
+        _vec_load_0[0 + 0] = __uint_as_float(_v4_0_0);
+        _vec_load_0[0 + 1] = __uint_as_float(_v4_0_1);
+        _vec_load_0[0 + 2] = __uint_as_float(_v4_0_2);
+        _vec_load_0[0 + 3] = __uint_as_float(_v4_0_3);
     }
     int load_row = group_row;
     if (load_row >= M) {
@@ -281,11 +286,16 @@ kernel_cake_kimi_k3_fused_router_6d1a3cbbec0fdd51dbf5(float* __restrict__ logits
     }
     float _vec_load_1[4];
     {
-        float4 _v4 = *reinterpret_cast<const float4*>(logits + (unsigned long long)load_row * (unsigned long long)NUM_EXPERTS + (unsigned long long)expert_base);
-        _vec_load_1[0 + 0] = _v4.x;
-        _vec_load_1[0 + 1] = _v4.y;
-        _vec_load_1[0 + 2] = _v4.z;
-        _vec_load_1[0 + 3] = _v4.w;
+        unsigned _v4_1_0;
+        unsigned _v4_1_1;
+        unsigned _v4_1_2;
+        unsigned _v4_1_3;
+        asm volatile("ld.global.nc.v4.b32 {%0, %1, %2, %3}, [%4];"
+            : "=r"(_v4_1_0), "=r"(_v4_1_1), "=r"(_v4_1_2), "=r"(_v4_1_3) : "l"((const void*)(logits + ((unsigned long long)load_row * (unsigned long long)NUM_EXPERTS + (unsigned long long)expert_base))) : "memory");
+        _vec_load_1[0 + 0] = __uint_as_float(_v4_1_0);
+        _vec_load_1[0 + 1] = __uint_as_float(_v4_1_1);
+        _vec_load_1[0 + 2] = __uint_as_float(_v4_1_2);
+        _vec_load_1[0 + 3] = __uint_as_float(_v4_1_3);
     }
     if (warp == 0) {
         if (elect_sync()) {
@@ -349,36 +359,36 @@ kernel_cake_kimi_k3_fused_router_6d1a3cbbec0fdd51dbf5(float* __restrict__ logits
             }
         }
         unsigned int published = 0;
-        unsigned int warp_top0;
-        asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(warp_top0) : "r"(lane_bound));
+        unsigned int warp_top0_1_0;
+        asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(warp_top0_1_0) : "r"(lane_bound));
         if (lane == 0) {
-            published = warp_top0;
+            published = warp_top0_1_0;
         }
-        if (lane_bound == warp_top0) {
+        if (lane_bound == warp_top0_1_0) {
             lane_bound = (unsigned int)0;
         }
-        unsigned int warp_top1;
-        asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(warp_top1) : "r"(lane_bound));
+        unsigned int warp_top0_1_1;
+        asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(warp_top0_1_1) : "r"(lane_bound));
         if (lane == 1) {
-            published = warp_top1;
+            published = warp_top0_1_1;
         }
-        if (lane_bound == warp_top1) {
+        if (lane_bound == warp_top0_1_1) {
             lane_bound = (unsigned int)0;
         }
-        unsigned int warp_top2;
-        asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(warp_top2) : "r"(lane_bound));
+        unsigned int warp_top0_1_2;
+        asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(warp_top0_1_2) : "r"(lane_bound));
         if (lane == 2) {
-            published = warp_top2;
+            published = warp_top0_1_2;
         }
-        if (lane_bound == warp_top2) {
+        if (lane_bound == warp_top0_1_2) {
             lane_bound = (unsigned int)0;
         }
-        unsigned int warp_top3;
-        asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(warp_top3) : "r"(lane_bound));
+        unsigned int warp_top0_1_3;
+        asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(warp_top0_1_3) : "r"(lane_bound));
         if (lane == 3) {
-            published = warp_top3;
+            published = warp_top0_1_3;
         }
-        if (lane_bound == warp_top3) {
+        if (lane_bound == warp_top0_1_3) {
             lane_bound = (unsigned int)0;
         }
         if (lane < 4) {
@@ -417,24 +427,24 @@ kernel_cake_kimi_k3_fused_router_6d1a3cbbec0fdd51dbf5(float* __restrict__ logits
         }
         cand_slot += ((keys[0] >= cand_floor) ? 1 : 0);
         if (keys[1] >= cand_floor && cand_slot < 32) {
-            int cand_index1 = cand_region + cand_slot;
-            cand_keys[cand_index1] = keys[1];
-            cand_ids[cand_index1] = expert_base + 1;
-            cand_scores[cand_index1] = unbiased[1];
+            int cand_index_0 = cand_region + cand_slot;
+            cand_keys[cand_index_0] = keys[1];
+            cand_ids[cand_index_0] = expert_base + 1;
+            cand_scores[cand_index_0] = unbiased[1];
         }
         cand_slot += ((keys[1] >= cand_floor) ? 1 : 0);
         if (keys[2] >= cand_floor && cand_slot < 32) {
-            int cand_index2 = cand_region + cand_slot;
-            cand_keys[cand_index2] = keys[2];
-            cand_ids[cand_index2] = expert_base + 2;
-            cand_scores[cand_index2] = unbiased[2];
+            int cand_index_1 = cand_region + cand_slot;
+            cand_keys[cand_index_1] = keys[2];
+            cand_ids[cand_index_1] = expert_base + 2;
+            cand_scores[cand_index_1] = unbiased[2];
         }
         cand_slot += ((keys[2] >= cand_floor) ? 1 : 0);
         if (keys[3] >= cand_floor && cand_slot < 32) {
-            int cand_index3 = cand_region + cand_slot;
-            cand_keys[cand_index3] = keys[3];
-            cand_ids[cand_index3] = expert_base + 3;
-            cand_scores[cand_index3] = unbiased[3];
+            int cand_index_2 = cand_region + cand_slot;
+            cand_keys[cand_index_2] = keys[3];
+            cand_ids[cand_index_2] = expert_base + 3;
+            cand_scores[cand_index_2] = unbiased[3];
         }
         if (lane == 0) {
             cand_counts[sums_base + group_warp] = cand_warp;
@@ -1285,110 +1295,141 @@ kernel_cake_kimi_k3_fused_router_6d1a3cbbec0fdd51dbf5(float* __restrict__ logits
         }
     }
     #pragma unroll
-    for (int bit_slot = 0; bit_slot < 2; bit_slot++) {
+    for (int bit_slot = 0; bit_slot < 1; bit_slot++) {
         int bit_pair = bit_slot * 448 + tid;
+        unsigned int bit_value = (unsigned int)0;
+        int bit_index = lane;
         if (bit_pair < pair_bound) {
-            unsigned int bit_old = atomicAdd(&row_bits[gathered[bit_slot]], (unsigned int)1 << (unsigned int)(bit_pair >> 4));
-            int bit_level = (int)(unsigned int)__popc(bit_old);
-            if ((bit_level & BLOCK_MASK) == 0) {
-                atomicAdd(&level_masks[(bit_level >> BLOCK_SHIFT) * 28 + (gathered[bit_slot] >> 5)], (unsigned int)1 << (unsigned int)(gathered[bit_slot] & 31));
+            bit_value = (unsigned int)1 << (unsigned int)(bit_pair >> 4);
+            bit_index = gathered[bit_slot];
+        }
+        unsigned int bit_old = atomicAdd(&row_bits[bit_index], bit_value);
+        int bit_level = (int)(unsigned int)__popc(bit_old);
+        unsigned int level_value = (unsigned int)0;
+        int level_index = lane;
+        if (bit_pair < pair_bound && (bit_level & BLOCK_MASK) == 0) {
+            level_value = (unsigned int)1 << (unsigned int)(bit_index & 31);
+            level_index = (bit_level >> BLOCK_SHIFT) * 28 + (bit_index >> 5);
+        }
+        atomicAdd(&level_masks[level_index], level_value);
+    }
+    if (448 < pair_bound) {
+        #pragma unroll
+        for (int tail_slot = 1; tail_slot < 2; tail_slot++) {
+            int tail_pair = tail_slot * 448 + tid;
+            unsigned int tail_value = (unsigned int)0;
+            int tail_index = lane;
+            if (tail_pair < pair_bound) {
+                tail_value = (unsigned int)1 << (unsigned int)(tail_pair >> 4);
+                tail_index = gathered[tail_slot];
             }
+            unsigned int tail_old = atomicAdd(&row_bits[tail_index], tail_value);
+            int tail_level = (int)(unsigned int)__popc(tail_old);
+            unsigned int tail_level_value = (unsigned int)0;
+            int tail_level_index = lane;
+            if (tail_pair < pair_bound && (tail_level & BLOCK_MASK) == 0) {
+                tail_level_value = (unsigned int)1 << (unsigned int)(tail_index & 31);
+                tail_level_index = (tail_level >> BLOCK_SHIFT) * 28 + (tail_index >> 5);
+            }
+            atomicAdd(&level_masks[tail_level_index], tail_level_value);
         }
     }
     __syncthreads();
-    int emit_local = tid & 31;
-    int emit_slot = emit_local & TOP_K - 1;
-    int emit_sub = tid >> 5;
-    int emit_row = cta_rank + (emit_local >> 4) * 16;
-    int emit_src_row = emit_row;
-    if (emit_row >= M) {
-        emit_src_row = cta_rank;
-    }
-    int emit_expert = selected_ids[emit_src_row * TOP_K + emit_slot];
-    unsigned int emit_bits = row_bits[emit_expert];
-    unsigned int emit_below = ((unsigned int)1 << (unsigned int)emit_src_row) - (unsigned int)1;
-    int emit_rank = (int)(unsigned int)__popc(emit_bits & emit_below);
-    int emit_count = (int)(unsigned int)__popc(emit_bits);
-    unsigned int level_words[4];
-    int mask_lane_blocks = 0;
-    #pragma unroll
-    for (int level_load = 0; level_load < MASK_LEVELS; level_load++) {
-        level_words[level_load] = (unsigned int)0;
-        if (lane < 28) {
-            level_words[level_load] = level_masks[level_load * 28 + lane];
+    if (warp < 4) {
+        int emit_local = tid & 31;
+        int emit_slot = emit_local & TOP_K - 1;
+        int emit_sub = tid >> 5;
+        int emit_row = cta_rank + (emit_local >> 4) * 16;
+        int emit_src_row = emit_row;
+        if (emit_row >= M) {
+            emit_src_row = cta_rank;
         }
-        mask_lane_blocks += (int)(unsigned int)__popc(level_words[level_load]);
-    }
-    int mask_inclusive = mask_lane_blocks;
-    int mask_peer = __shfl_up_sync(0xFFFFFFFF, mask_inclusive, 1, 32);
-    if (lane >= 1) {
-        mask_inclusive += mask_peer;
-    }
-    int mask_peer_0 = __shfl_up_sync(0xFFFFFFFF, mask_inclusive, 2, 32);
-    if (lane >= 2) {
-        mask_inclusive += mask_peer_0;
-    }
-    int mask_peer_1 = __shfl_up_sync(0xFFFFFFFF, mask_inclusive, 4, 32);
-    if (lane >= 4) {
-        mask_inclusive += mask_peer_1;
-    }
-    int mask_peer_2 = __shfl_up_sync(0xFFFFFFFF, mask_inclusive, 8, 32);
-    if (lane >= 8) {
-        mask_inclusive += mask_peer_2;
-    }
-    int mask_peer_3 = __shfl_up_sync(0xFFFFFFFF, mask_inclusive, 16, 32);
-    if (lane >= 16) {
-        mask_inclusive += mask_peer_3;
-    }
-    int mask_exclusive = mask_inclusive - mask_lane_blocks;
-    int mask_total = __shfl_sync(0xFFFFFFFF, mask_inclusive, 31);
-    int emit_word = emit_expert >> 5;
-    unsigned int emit_low = ((unsigned int)1 << (unsigned int)(emit_expert & 31)) - (unsigned int)1;
-    int emit_blocks = __shfl_sync(0xFFFFFFFF, mask_exclusive, emit_word);
-    #pragma unroll
-    for (int level_emit = 0; level_emit < MASK_LEVELS; level_emit++) {
-        unsigned int _shfl_sync_69 = __shfl_sync(0xFFFFFFFF, level_words[level_emit], emit_word);
-        emit_blocks += (int)(unsigned int)__popc(_shfl_sync_69 & emit_low);
-    }
-    int emit_start = emit_blocks << BLOCK_SHIFT;
-    if (emit_row < M) {
-        if (emit_sub == 0) {
-            int emit_grouped = emit_start + emit_rank;
-            sorted_token_ids[emit_grouped] = emit_row * TOP_K + emit_slot;
-            if ((emit_rank & BLOCK_MASK) == 0) {
-                expert_ids[emit_grouped >> BLOCK_SHIFT] = emit_expert;
+        int emit_expert = selected_ids[emit_src_row * TOP_K + emit_slot];
+        unsigned int emit_bits = row_bits[emit_expert];
+        unsigned int emit_below = ((unsigned int)1 << (unsigned int)emit_src_row) - (unsigned int)1;
+        int emit_rank = (int)(unsigned int)__popc(emit_bits & emit_below);
+        int emit_count = (int)(unsigned int)__popc(emit_bits);
+        unsigned int level_words[4];
+        int mask_lane_blocks = 0;
+        #pragma unroll
+        for (int level_load = 0; level_load < MASK_LEVELS; level_load++) {
+            level_words[level_load] = (unsigned int)0;
+            if (lane < 28) {
+                level_words[level_load] = level_masks[level_load * 28 + lane];
+            }
+            mask_lane_blocks += (int)(unsigned int)__popc(level_words[level_load]);
+        }
+        int mask_inclusive = mask_lane_blocks;
+        int mask_peer_4_0 = __shfl_up_sync(0xFFFFFFFF, mask_inclusive, 1, 32);
+        if (lane >= 1) {
+            mask_inclusive += mask_peer_4_0;
+        }
+        int mask_peer_4_1 = __shfl_up_sync(0xFFFFFFFF, mask_inclusive, 2, 32);
+        if (lane >= 2) {
+            mask_inclusive += mask_peer_4_1;
+        }
+        int mask_peer_4_2 = __shfl_up_sync(0xFFFFFFFF, mask_inclusive, 4, 32);
+        if (lane >= 4) {
+            mask_inclusive += mask_peer_4_2;
+        }
+        int mask_peer_4_3 = __shfl_up_sync(0xFFFFFFFF, mask_inclusive, 8, 32);
+        if (lane >= 8) {
+            mask_inclusive += mask_peer_4_3;
+        }
+        int mask_peer_4_4 = __shfl_up_sync(0xFFFFFFFF, mask_inclusive, 16, 32);
+        if (lane >= 16) {
+            mask_inclusive += mask_peer_4_4;
+        }
+        int mask_exclusive = mask_inclusive - mask_lane_blocks;
+        int mask_total = __shfl_sync(0xFFFFFFFF, mask_inclusive, 31);
+        int emit_word = emit_expert >> 5;
+        unsigned int emit_low = ((unsigned int)1 << (unsigned int)(emit_expert & 31)) - (unsigned int)1;
+        int emit_blocks = __shfl_sync(0xFFFFFFFF, mask_exclusive, emit_word);
+        #pragma unroll
+        for (int level_emit = 0; level_emit < MASK_LEVELS; level_emit++) {
+            unsigned int _shfl_sync_69 = __shfl_sync(0xFFFFFFFF, level_words[level_emit], emit_word);
+            emit_blocks += (int)(unsigned int)__popc(_shfl_sync_69 & emit_low);
+        }
+        int emit_start = emit_blocks << BLOCK_SHIFT;
+        if (emit_row < M) {
+            if (emit_sub == 0) {
+                int emit_grouped = emit_start + emit_rank;
+                sorted_token_ids[emit_grouped] = emit_row * TOP_K + emit_slot;
+                if ((emit_rank & BLOCK_MASK) == 0) {
+                    expert_ids[emit_grouped >> BLOCK_SHIFT] = emit_expert;
+                }
+            }
+            if (emit_rank == 0) {
+                int emit_padded = emit_count + BLOCK_MASK & ~BLOCK_MASK;
+                #pragma unroll 1
+                for (int emit_pad = emit_count + emit_sub; emit_pad < emit_padded; emit_pad += 4) {
+                    sorted_token_ids[emit_start + emit_pad] = M * TOP_K;
+                }
             }
         }
-        if (emit_rank == 0) {
-            int emit_padded = emit_count + BLOCK_MASK & ~BLOCK_MASK;
-            #pragma unroll 1
-            for (int emit_pad = emit_count + emit_sub; emit_pad < emit_padded; emit_pad += 14) {
-                sorted_token_ids[emit_start + emit_pad] = M * TOP_K;
-            }
+        int slice_expert = cta_rank * 56;
+        if (tid < 56) {
+            slice_expert += tid;
         }
-    }
-    int slice_expert = cta_rank * 56;
-    if (tid < 56) {
-        slice_expert += tid;
-    }
-    int slice_word = slice_expert >> 5;
-    unsigned int slice_low = ((unsigned int)1 << (unsigned int)(slice_expert & 31)) - (unsigned int)1;
-    int slice_blocks = __shfl_sync(0xFFFFFFFF, mask_exclusive, slice_word);
-    #pragma unroll
-    for (int level_slice = 0; level_slice < MASK_LEVELS; level_slice++) {
-        unsigned int _shfl_sync_70 = __shfl_sync(0xFFFFFFFF, level_words[level_slice], slice_word);
-        slice_blocks += (int)(unsigned int)__popc(_shfl_sync_70 & slice_low);
-    }
-    if (tid < 56) {
-        int slice_count = (int)(unsigned int)__popc(row_bits[slice_expert]);
-        expert_counts[slice_expert] = slice_count;
-        expert_scatter_offsets[slice_expert] = slice_count;
-        expert_offsets[slice_expert] = slice_blocks << BLOCK_SHIFT;
-    }
-    if (cta_rank == 0) {
-        if (tid == 447) {
-            expert_offsets[NUM_EXPERTS] = mask_total << BLOCK_SHIFT;
-            num_tokens_post_padded[0] = mask_total << BLOCK_SHIFT;
+        int slice_word = slice_expert >> 5;
+        unsigned int slice_low = ((unsigned int)1 << (unsigned int)(slice_expert & 31)) - (unsigned int)1;
+        int slice_blocks = __shfl_sync(0xFFFFFFFF, mask_exclusive, slice_word);
+        #pragma unroll
+        for (int level_slice = 0; level_slice < MASK_LEVELS; level_slice++) {
+            unsigned int _shfl_sync_70 = __shfl_sync(0xFFFFFFFF, level_words[level_slice], slice_word);
+            slice_blocks += (int)(unsigned int)__popc(_shfl_sync_70 & slice_low);
+        }
+        if (tid < 56) {
+            int slice_count = (int)(unsigned int)__popc(row_bits[slice_expert]);
+            expert_counts[slice_expert] = slice_count;
+            expert_scatter_offsets[slice_expert] = slice_count;
+            expert_offsets[slice_expert] = slice_blocks << BLOCK_SHIFT;
+        }
+        if (cta_rank == 0) {
+            if (tid == 127) {
+                expert_offsets[NUM_EXPERTS] = mask_total << BLOCK_SHIFT;
+                num_tokens_post_padded[0] = mask_total << BLOCK_SHIFT;
+            }
         }
     }
 }

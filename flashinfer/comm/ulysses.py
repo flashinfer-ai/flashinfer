@@ -67,6 +67,8 @@ _PCIE_SUPPORTED_DTYPES = _SUPPORTED_DTYPES + (
     torch.float8_e5m2,
 )
 _PCIE_RDMA_TRANSPORTS = ("hybrid", "rdma")
+_ULYSSES_SIGNAL_SLOTS = 4
+_ULYSSES_MAX_BLOCKS = 144
 
 # Communicator lifecycle states. BROKEN permits only a coordinated close: a
 # PCIe transport error may leave QPs, CQs and registered buffers half-mutated.
@@ -270,7 +272,9 @@ class UlyssesCommunicator:
       still resolves and guards the CUDA device and performs CUDA-backed
       metadata collectives over ``group``). Supports any world size.
 
-    All ranks must request the same ``backend``. With ``world_size > 1`` the
+    ``nvlink_kernel="portable"`` forces the portable CUDA kernel on NVLink;
+    ``"cake"`` requires an available Cake export. All ranks must request the
+    same backend and NVLink kernel policy. With ``world_size > 1`` the
     NCCL and NVLink backends require ``group`` to support CUDA all-to-all (an
     NCCL process group); this is checked at construction before any resource
     is armed.
@@ -359,6 +363,10 @@ class UlyssesCommunicator:
         every call that does not name its own.
     backend : str
         ``"auto"`` | ``"nvlink"`` | ``"pcie"`` | ``"nccl"`` (see above).
+    nvlink_kernel : str
+        ``"auto"`` | ``"cake"`` | ``"portable"``; relevant when NVLink is used.
+        ``"portable"`` names the in-tree CUDA kernel's architecture coverage,
+        not a slow path: it uses the optimized vector mover when eligible.
     device : torch.device or str or int, optional
         CUDA device of this rank; normalized to an explicit index (bare
         ``"cuda"`` means the current device, an int is a CUDA ordinal).
@@ -380,6 +388,7 @@ class UlyssesCommunicator:
         max_bytes: int,
         dtype: torch.dtype,
         backend: str = "auto",
+        nvlink_kernel: str = "auto",
         device: Optional[Union[torch.device, str, int]] = None,
     ):
         r"""Construct a Ulysses communicator.
@@ -407,6 +416,11 @@ class UlyssesCommunicator:
             forces the NVLink backend and raises if unavailable. ``"pcie"``
             explicitly enables the experimental single-node 1/2/4/8-rank
             PCIe transport. ``"nccl"`` forces the NCCL path.
+        nvlink_kernel : str, default = "auto"
+            ``"auto"`` uses Cake when an export exists, otherwise portable.
+            ``"portable"`` forces the portable NVLink kernel; ``"cake"``
+            requires a Cake export. Portable includes the optimized vector
+            mover when eligible. All ranks must select the same value.
         device : Optional[Union[torch.device, str, int]], optional
             CUDA device bound to this rank. ``None`` uses the current CUDA
             device. Strings and integers are normalized to an explicit CUDA
@@ -421,6 +435,7 @@ class UlyssesCommunicator:
         # not armed) and the exported architecture it was bound for
         self._cake: Optional["cake_ulysses_backend.CakeUlyssesA2A"] = None
         self._cake_arch: Optional[str] = None
+        self._portable_max_blocks: Optional[int] = None
         # whether the Cake route also writes registered outputs directly, and
         # the registered outputs: this rank's base device pointer -> the CPU
         # int64 peer table of every rank's allocation of the same registration
@@ -465,12 +480,13 @@ class UlyssesCommunicator:
         # same error on every rank instead of hanging peers in a later gather.
         # Devices are validated per rank but may legitimately differ across
         # ranks (cuda:rank); only max_bytes and dtype must match.
-        config = self._encode_config(max_bytes, dtype, device, backend)
+        config = self._encode_config(max_bytes, dtype, device, backend, nvlink_kernel)
         configs = self._gather(config)
         self._validate_configs_jointly(configs)
 
         self.max_bytes = max_bytes
         self.dtype = dtype
+        self._nvlink_kernel_policy = nvlink_kernel
 
         # ---- backend selection: strictly before any IPC/JIT -----------------
         # topology_decision is what the probe concluded; decision is the
@@ -481,6 +497,10 @@ class UlyssesCommunicator:
         )
         self.decision: UlyssesBackendDecision = self.topology_decision
         self.backend = self.decision.backend
+        if nvlink_kernel == "cake" and self.backend != "nvlink":
+            raise ValueError(
+                "nvlink_kernel='cake' requires an available NVLink backend"
+            )
         self.fallback_reason = (
             self.decision.reason
             if self.backend == "nccl" and backend != "nccl"
@@ -505,7 +525,7 @@ class UlyssesCommunicator:
             if err is not None:
                 # all ranks cleaned up (verified group-wide by the staged
                 # cleanup) and hold the same joint error
-                if backend == "nvlink":
+                if backend == "nvlink" or nvlink_kernel == "cake":
                     raise RuntimeError(f"NVLink backend initialization failed: {err}")
                 self.backend = "nccl"
                 self.fallback_reason = f"nvlink init failed: {err}"
@@ -644,7 +664,9 @@ class UlyssesCommunicator:
             return torch.device("cuda", 0)
 
     @classmethod
-    def _encode_config(cls, max_bytes, dtype, device, backend) -> Tuple[str, ...]:
+    def _encode_config(
+        cls, max_bytes, dtype, device, backend, nvlink_kernel="auto"
+    ) -> Tuple[str, ...]:
         if type(max_bytes) is not int:  # bool is an int subclass: reject it too
             nbytes = f"<invalid type: {type(max_bytes).__name__}>"
         else:
@@ -668,11 +690,16 @@ class UlyssesCommunicator:
             dev = "cuda"
         else:
             dev = f"cuda:{index}"
-        return (nbytes, dt, dev, bk)
+        policy = (
+            nvlink_kernel
+            if type(nvlink_kernel) is str
+            else f"<invalid type: {type(nvlink_kernel).__name__}>"
+        )
+        return (nbytes, dt, dev, bk, policy)
 
     def _validate_configs_jointly(self, configs) -> None:
         problems = {}
-        for r, (nbytes, dt, dev, bk) in enumerate(configs):
+        for r, (nbytes, dt, dev, bk, policy) in enumerate(configs):
             # The whitelist comes from the GATHERED backend, never from a
             # local argument: every rank must compute the same verdict from
             # the same list, or one rank raises while its peers hang in the
@@ -692,15 +719,19 @@ class UlyssesCommunicator:
                 errs.append(f"dtype must be one of {supported}, got {dt}")
             if not dev.startswith("cuda"):
                 errs.append(f"device must be a CUDA device, got {dev}")
+            if policy not in ("auto", "cake", "portable"):
+                errs.append(
+                    f"nvlink_kernel must be auto, cake, or portable, got {policy}"
+                )
             if errs:
                 problems[r] = "; ".join(errs)
         if problems:
             raise ValueError(f"invalid UlyssesCommunicator config by rank: {problems}")
-        shared = {(nbytes, dt) for (nbytes, dt, _dev, _bk) in configs}
+        shared = {(nbytes, dt, policy) for (nbytes, dt, _dev, _bk, policy) in configs}
         if len(shared) > 1:
             raise ValueError(
                 f"inconsistent UlyssesCommunicator configs across ranks: "
-                f"(max_bytes, dtype) = {sorted(shared)}; all ranks must agree"
+                f"(max_bytes, dtype, nvlink_kernel) = {sorted(shared)}; all ranks must agree"
             )
 
     # ---- experimental PCIe/mlx5 backend ------------------------------------
@@ -1259,11 +1290,28 @@ class UlyssesCommunicator:
             from .vllm_ar import meta_size
 
             with torch.cuda.device(self.device):
-                get_ulysses_a2a_module()
-                sig_bytes = int(meta_size())
-                cake_arch = _cake_nvlink_route(
-                    self.device.index, self.dtype, self.world_size
+                module = get_ulysses_a2a_module()
+                sig_bytes = int(meta_size()) * _ULYSSES_SIGNAL_SLOTS
+                dtype_slot = {
+                    torch.float32: 0,
+                    torch.float16: 1,
+                    torch.bfloat16: 2,
+                }[self.dtype]
+                local_cap = min(
+                    _ULYSSES_MAX_BLOCKS,
+                    int(module.ulysses_a2a_safe_blocks(self.world_size, dtype_slot)),
                 )
+                cake_arch = (
+                    None
+                    if self._nvlink_kernel_policy == "portable"
+                    else _cake_nvlink_route(
+                        self.device.index, self.dtype, self.world_size
+                    )
+                )
+                if self._nvlink_kernel_policy == "cake" and cake_arch is None:
+                    raise RuntimeError(
+                        "Cake Ulysses kernel is unavailable on this device"
+                    )
                 cake_direct = False
                 if cake_arch is not None:
                     _cake_nvlink_warm(cake_arch, self.dtype, self.world_size)
@@ -1276,6 +1324,7 @@ class UlyssesCommunicator:
                 str(sig_bytes),
                 cake_arch or "",
                 "direct" if cake_direct else "",
+                str(local_cap),
             )
         except Exception as e:  # noqa: BLE001
             outcome = ("err", f"rank {self.rank} JIT/meta: {type(e).__name__}: {e}")
@@ -1293,6 +1342,9 @@ class UlyssesCommunicator:
                 f"{[(o[2] or 'portable') + (' + direct' if o[3] else '') for o in gathered_j]})"
             )
         self._cake_arch = cake_arch
+        # Every rank launches the same number of barrier-participating CTAs,
+        # including when the group contains GPUs with different capacities.
+        self._portable_max_blocks = min(int(o[4]) for o in gathered_j)
         self._cake_direct = cake_direct
 
         # stage A: allocate this rank's export buffers and IPC handles
@@ -1350,8 +1402,14 @@ class UlyssesCommunicator:
         # gather is a CUDA completion fence on its own.
         try:
             with torch.cuda.device(self.device):
-                self._fa = init_ulysses_a2a(
-                    out_ptrs, sig_ptrs, self.rank, self.world_size, True
+                self._fa = _init_ulysses_a2a_configured(
+                    out_ptrs,
+                    sig_ptrs,
+                    self.rank,
+                    self.world_size,
+                    True,
+                    signal_slots=_ULYSSES_SIGNAL_SLOTS,
+                    max_blocks=self._portable_max_blocks,
                 )
                 if self._cake_arch is not None:
                     # the package route: the same staging and signal
@@ -1655,6 +1713,7 @@ class UlyssesCommunicator:
         self._out_ptrs = None
         self._sig_ptrs = None
         self._cake_arch = None
+        self._portable_max_blocks = None
         self._cake_direct = False
         self._nvlink_outputs = {}
         self._nvlink_armed = False
@@ -2786,6 +2845,28 @@ def get_ulysses_a2a_module():
             out_ipc_ptrs, signal_ipc_ptrs, rank, world_size, full_nvlink
         )
 
+    @register_custom_op(
+        "flashinfer::init_ulysses_a2a_with_signal_slots", mutates_args=[]
+    )
+    def init_ulysses_a2a_with_signal_slots(
+        out_ipc_ptrs: List[int],
+        signal_ipc_ptrs: List[int],
+        rank: int,
+        world_size: int,
+        full_nvlink: bool,
+        signal_slots: int,
+        max_blocks: int,
+    ) -> int:
+        return module.init_ulysses_a2a_with_signal_slots(
+            out_ipc_ptrs,
+            signal_ipc_ptrs,
+            rank,
+            world_size,
+            full_nvlink,
+            signal_slots,
+            max_blocks,
+        )
+
     @register_custom_op("flashinfer::dispose_ulysses_a2a", mutates_args=[])
     def dispose_ulysses_a2a(fa: int) -> None:
         module.dispose_ulysses_a2a(fa)
@@ -2805,9 +2886,63 @@ def get_ulysses_a2a_module():
 
     return SimpleNamespace(
         init_ulysses_a2a=init_ulysses_a2a,
+        init_ulysses_a2a_with_signal_slots=init_ulysses_a2a_with_signal_slots,
+        ulysses_a2a_safe_blocks=module.ulysses_a2a_safe_blocks,
         dispose_ulysses_a2a=dispose_ulysses_a2a,
         ulysses_a2a=ulysses_a2a,
     )
+
+
+def _init_ulysses_a2a_configured(
+    out_ipc_ptrs: List[int],
+    signal_ipc_ptrs: List[int],
+    rank: int,
+    world_size: int,
+    full_nvlink: bool,
+    *,
+    signal_slots: int,
+    max_blocks: Optional[int],
+) -> int:
+    """Internal geometry-aware initializer used by the communicator."""
+    if world_size not in SUPPORTED_WORLD_SIZES:
+        raise ValueError(
+            f"ulysses a2a only supports world size in {SUPPORTED_WORLD_SIZES}, got {world_size}"
+        )
+    if not full_nvlink:
+        raise ValueError(
+            "full_nvlink=False is not supported: the fused kernel pushes over "
+            "all-pairs NVLink P2P and has no non-P2P path. Use "
+            "UlyssesCommunicator(backend='auto') for topology-aware NCCL "
+            "fallback instead."
+        )
+    if signal_slots not in (1, _ULYSSES_SIGNAL_SLOTS):
+        raise ValueError("signal_slots must be 1 or 4")
+    if signal_slots == 1 and max_blocks is not None:
+        raise ValueError("max_blocks requires signal_slots=4")
+    module = get_ulysses_a2a_module()
+    if signal_slots == 1:
+        fa = module.init_ulysses_a2a(
+            out_ipc_ptrs, signal_ipc_ptrs, rank, world_size, full_nvlink
+        )
+    else:
+        fa = module.init_ulysses_a2a_with_signal_slots(
+            out_ipc_ptrs,
+            signal_ipc_ptrs,
+            rank,
+            world_size,
+            full_nvlink,
+            signal_slots,
+            36 if max_blocks is None else max_blocks,
+        )
+    # The signal memset is asynchronous. Complete it before the caller's
+    # group-wide barrier, and release ownership if synchronization fails.
+    try:
+        torch.cuda.synchronize()
+    except Exception:
+        with contextlib.suppress(Exception):
+            module.dispose_ulysses_a2a(fa)
+        raise
+    return fa
 
 
 @flashinfer_api
@@ -2853,7 +2988,6 @@ def init_ulysses_a2a(
     full_nvlink : bool
         ``True`` when every pair of ranks is connected via NVLink. The push
         kernel requires all-pairs P2P access; callers must gate on this.
-
     Returns
     -------
     int
@@ -2870,31 +3004,15 @@ def init_ulysses_a2a(
     before the first all-to-all call — the barrier alone is not a CUDA
     completion fence, and the device sync alone is not group-wide.
     """
-    if world_size not in SUPPORTED_WORLD_SIZES:
-        raise ValueError(
-            f"ulysses a2a only supports world size in {SUPPORTED_WORLD_SIZES}, got {world_size}"
-        )
-    if not full_nvlink:
-        raise ValueError(
-            "full_nvlink=False is not supported: the fused kernel pushes over "
-            "all-pairs NVLink P2P and has no non-P2P path. Use "
-            "UlyssesCommunicator(backend='auto') for topology-aware NCCL "
-            "fallback instead."
-        )
-    module = get_ulysses_a2a_module()
-    fa = module.init_ulysses_a2a(
-        out_ipc_ptrs, signal_ipc_ptrs, rank, world_size, full_nvlink
+    return _init_ulysses_a2a_configured(
+        out_ipc_ptrs,
+        signal_ipc_ptrs,
+        rank,
+        world_size,
+        full_nvlink,
+        signal_slots=1,
+        max_blocks=None,
     )
-    # make the signal zeroing a real completion fence on this device
-    try:
-        torch.cuda.synchronize()
-    except Exception:
-        # the caller never receives fa on this path and could not dispose it:
-        # ownership stays here, so release the handle before re-raising
-        with contextlib.suppress(Exception):  # surface the sync error, not this
-            module.dispose_ulysses_a2a(fa)
-        raise
-    return fa
 
 
 @flashinfer_api

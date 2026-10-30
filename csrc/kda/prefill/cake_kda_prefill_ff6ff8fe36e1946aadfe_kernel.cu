@@ -43,23 +43,23 @@ static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 byte
 #define CAKE_INF CUDART_INF_F
 #define TMEM_NCOLS 256
 #define TMEM_TMEM_STATE_OFFSET 64
-#define TMEM_TMEM_STATE_DECAY0_OFFSET 64
-#define TMEM_TMEM_STATE_DECAY1_OFFSET 80
-#define TMEM_TMEM_STATE_DECAY2_OFFSET 96
-#define TMEM_TMEM_STATE_DECAY3_OFFSET 112
-#define TMEM_TMEM_STATE_DECAY4_OFFSET 128
-#define TMEM_TMEM_STATE_DECAY5_OFFSET 144
-#define TMEM_TMEM_STATE_DECAY6_OFFSET 160
-#define TMEM_TMEM_STATE_DECAY7_OFFSET 176
+#define TMEM_TMEM_STATE_DECAY_0_OFFSET 64
+#define TMEM_TMEM_STATE_DECAY_1_OFFSET 80
+#define TMEM_TMEM_STATE_DECAY_2_OFFSET 96
+#define TMEM_TMEM_STATE_DECAY_3_OFFSET 112
+#define TMEM_TMEM_STATE_DECAY_4_OFFSET 128
+#define TMEM_TMEM_STATE_DECAY_5_OFFSET 144
+#define TMEM_TMEM_STATE_DECAY_6_OFFSET 160
+#define TMEM_TMEM_STATE_DECAY_7_OFFSET 176
 #define TMEM_TMEM_STATE_INP_OFFSET 0
-#define TMEM_TMEM_STATE_INP_DECAY0_OFFSET 0
-#define TMEM_TMEM_STATE_INP_DECAY1_OFFSET 8
-#define TMEM_TMEM_STATE_INP_DECAY2_OFFSET 16
-#define TMEM_TMEM_STATE_INP_DECAY3_OFFSET 24
-#define TMEM_TMEM_STATE_INP_DECAY4_OFFSET 32
-#define TMEM_TMEM_STATE_INP_DECAY5_OFFSET 40
-#define TMEM_TMEM_STATE_INP_DECAY6_OFFSET 48
-#define TMEM_TMEM_STATE_INP_DECAY7_OFFSET 56
+#define TMEM_TMEM_STATE_INP_DECAY_0_OFFSET 0
+#define TMEM_TMEM_STATE_INP_DECAY_1_OFFSET 8
+#define TMEM_TMEM_STATE_INP_DECAY_2_OFFSET 16
+#define TMEM_TMEM_STATE_INP_DECAY_3_OFFSET 24
+#define TMEM_TMEM_STATE_INP_DECAY_4_OFFSET 32
+#define TMEM_TMEM_STATE_INP_DECAY_5_OFFSET 40
+#define TMEM_TMEM_STATE_INP_DECAY_6_OFFSET 48
+#define TMEM_TMEM_STATE_INP_DECAY_7_OFFSET 56
 #define TMEM_TMEM_U_ACC_OFFSET 224
 #define TMEM_TMEM_U2_INP_OFFSET 224
 #define TMEM_TMEM_U2_ACC_OFFSET 0
@@ -162,30 +162,30 @@ static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 byte
 #define SMEM_SMEM_STATE_DECAY_DIAG_RAW_OFF 1024
 #define SMEM_SMEM_STATE_DECAY_DIAG_RAW_STAGE_BYTES 4096
 #define SMEM_SMEM_STATE_DECAY_DIAG_RAW_STRIDE 4096
-#define SMEM_SMEM_STATE_DECAY_DIAG0_OFF 1024
-#define SMEM_SMEM_STATE_DECAY_DIAG0_STAGE_BYTES 512
-#define SMEM_SMEM_STATE_DECAY_DIAG0_STRIDE 512
-#define SMEM_SMEM_STATE_DECAY_DIAG1_OFF 1536
-#define SMEM_SMEM_STATE_DECAY_DIAG1_STAGE_BYTES 512
-#define SMEM_SMEM_STATE_DECAY_DIAG1_STRIDE 512
-#define SMEM_SMEM_STATE_DECAY_DIAG2_OFF 2048
-#define SMEM_SMEM_STATE_DECAY_DIAG2_STAGE_BYTES 512
-#define SMEM_SMEM_STATE_DECAY_DIAG2_STRIDE 512
-#define SMEM_SMEM_STATE_DECAY_DIAG3_OFF 2560
-#define SMEM_SMEM_STATE_DECAY_DIAG3_STAGE_BYTES 512
-#define SMEM_SMEM_STATE_DECAY_DIAG3_STRIDE 512
-#define SMEM_SMEM_STATE_DECAY_DIAG4_OFF 3072
-#define SMEM_SMEM_STATE_DECAY_DIAG4_STAGE_BYTES 512
-#define SMEM_SMEM_STATE_DECAY_DIAG4_STRIDE 512
-#define SMEM_SMEM_STATE_DECAY_DIAG5_OFF 3584
-#define SMEM_SMEM_STATE_DECAY_DIAG5_STAGE_BYTES 512
-#define SMEM_SMEM_STATE_DECAY_DIAG5_STRIDE 512
-#define SMEM_SMEM_STATE_DECAY_DIAG6_OFF 4096
-#define SMEM_SMEM_STATE_DECAY_DIAG6_STAGE_BYTES 512
-#define SMEM_SMEM_STATE_DECAY_DIAG6_STRIDE 512
-#define SMEM_SMEM_STATE_DECAY_DIAG7_OFF 4608
-#define SMEM_SMEM_STATE_DECAY_DIAG7_STAGE_BYTES 512
-#define SMEM_SMEM_STATE_DECAY_DIAG7_STRIDE 512
+#define SMEM_SMEM_STATE_DECAY_DIAG_0_OFF 1024
+#define SMEM_SMEM_STATE_DECAY_DIAG_0_STAGE_BYTES 512
+#define SMEM_SMEM_STATE_DECAY_DIAG_0_STRIDE 512
+#define SMEM_SMEM_STATE_DECAY_DIAG_1_OFF 1536
+#define SMEM_SMEM_STATE_DECAY_DIAG_1_STAGE_BYTES 512
+#define SMEM_SMEM_STATE_DECAY_DIAG_1_STRIDE 512
+#define SMEM_SMEM_STATE_DECAY_DIAG_2_OFF 2048
+#define SMEM_SMEM_STATE_DECAY_DIAG_2_STAGE_BYTES 512
+#define SMEM_SMEM_STATE_DECAY_DIAG_2_STRIDE 512
+#define SMEM_SMEM_STATE_DECAY_DIAG_3_OFF 2560
+#define SMEM_SMEM_STATE_DECAY_DIAG_3_STAGE_BYTES 512
+#define SMEM_SMEM_STATE_DECAY_DIAG_3_STRIDE 512
+#define SMEM_SMEM_STATE_DECAY_DIAG_4_OFF 3072
+#define SMEM_SMEM_STATE_DECAY_DIAG_4_STAGE_BYTES 512
+#define SMEM_SMEM_STATE_DECAY_DIAG_4_STRIDE 512
+#define SMEM_SMEM_STATE_DECAY_DIAG_5_OFF 3584
+#define SMEM_SMEM_STATE_DECAY_DIAG_5_STAGE_BYTES 512
+#define SMEM_SMEM_STATE_DECAY_DIAG_5_STRIDE 512
+#define SMEM_SMEM_STATE_DECAY_DIAG_6_OFF 4096
+#define SMEM_SMEM_STATE_DECAY_DIAG_6_STAGE_BYTES 512
+#define SMEM_SMEM_STATE_DECAY_DIAG_6_STRIDE 512
+#define SMEM_SMEM_STATE_DECAY_DIAG_7_OFF 4608
+#define SMEM_SMEM_STATE_DECAY_DIAG_7_STAGE_BYTES 512
+#define SMEM_SMEM_STATE_DECAY_DIAG_7_STRIDE 512
 #define SMEM_SMEM_V_ALL_OFF 32384
 #define SMEM_SMEM_V_ALL_STAGE_BYTES 8192
 #define SMEM_SMEM_V_ALL_STRIDE 41984
@@ -527,22 +527,22 @@ kernel_cake_kda_prefill_ff6ff8fe36e1946aadfe(__nv_bfloat16* __restrict__ q, cons
     const int smem_gate_bias_all_addr = smem + 218176;
     unsigned int* smem_state_decay_diag_raw = reinterpret_cast<unsigned int*>(smem_raw + 1024);
     const int smem_state_decay_diag_raw_addr = smem + 1024;
-    __nv_bfloat16* smem_state_decay_diag0 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 1024);
-    const int smem_state_decay_diag0_addr = smem + 1024;
-    __nv_bfloat16* smem_state_decay_diag1 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 1536);
-    const int smem_state_decay_diag1_addr = smem + 1536;
-    __nv_bfloat16* smem_state_decay_diag2 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 2048);
-    const int smem_state_decay_diag2_addr = smem + 2048;
-    __nv_bfloat16* smem_state_decay_diag3 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 2560);
-    const int smem_state_decay_diag3_addr = smem + 2560;
-    __nv_bfloat16* smem_state_decay_diag4 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 3072);
-    const int smem_state_decay_diag4_addr = smem + 3072;
-    __nv_bfloat16* smem_state_decay_diag5 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 3584);
-    const int smem_state_decay_diag5_addr = smem + 3584;
-    __nv_bfloat16* smem_state_decay_diag6 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 4096);
-    const int smem_state_decay_diag6_addr = smem + 4096;
-    __nv_bfloat16* smem_state_decay_diag7 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 4608);
-    const int smem_state_decay_diag7_addr = smem + 4608;
+    __nv_bfloat16* smem_state_decay_diag_0 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 1024);
+    const int smem_state_decay_diag_addr_0 = smem + 1024;
+    __nv_bfloat16* smem_state_decay_diag_1 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 1536);
+    const int smem_state_decay_diag_addr_1 = smem + 1536;
+    __nv_bfloat16* smem_state_decay_diag_2 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 2048);
+    const int smem_state_decay_diag_addr_2 = smem + 2048;
+    __nv_bfloat16* smem_state_decay_diag_3 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 2560);
+    const int smem_state_decay_diag_addr_3 = smem + 2560;
+    __nv_bfloat16* smem_state_decay_diag_4 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 3072);
+    const int smem_state_decay_diag_addr_4 = smem + 3072;
+    __nv_bfloat16* smem_state_decay_diag_5 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 3584);
+    const int smem_state_decay_diag_addr_5 = smem + 3584;
+    __nv_bfloat16* smem_state_decay_diag_6 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 4096);
+    const int smem_state_decay_diag_addr_6 = smem + 4096;
+    __nv_bfloat16* smem_state_decay_diag_7 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 4608);
+    const int smem_state_decay_diag_addr_7 = smem + 4608;
     __nv_bfloat16* smem_v_all = reinterpret_cast<__nv_bfloat16*>(smem_raw + 32384);
     const int smem_v_all_addr = smem + 32384;
     float* smem_gate_all = reinterpret_cast<float*>(smem_raw + 25600);
@@ -628,23 +628,23 @@ kernel_cake_kda_prefill_ff6ff8fe36e1946aadfe(__nv_bfloat16* __restrict__ q, cons
 
     // Kernel post-init ops
     const int tmem_tmem_state = taddr + 64;
-    const int tmem_tmem_state_decay0 = taddr + 64;
-    const int tmem_tmem_state_decay1 = taddr + 80;
-    const int tmem_tmem_state_decay2 = taddr + 96;
-    const int tmem_tmem_state_decay3 = taddr + 112;
-    const int tmem_tmem_state_decay4 = taddr + 128;
-    const int tmem_tmem_state_decay5 = taddr + 144;
-    const int tmem_tmem_state_decay6 = taddr + 160;
-    const int tmem_tmem_state_decay7 = taddr + 176;
+    const int tmem_tmem_state_decay_0 = taddr + 64;
+    const int tmem_tmem_state_decay_1 = taddr + 80;
+    const int tmem_tmem_state_decay_2 = taddr + 96;
+    const int tmem_tmem_state_decay_3 = taddr + 112;
+    const int tmem_tmem_state_decay_4 = taddr + 128;
+    const int tmem_tmem_state_decay_5 = taddr + 144;
+    const int tmem_tmem_state_decay_6 = taddr + 160;
+    const int tmem_tmem_state_decay_7 = taddr + 176;
     const int tmem_tmem_state_inp = taddr;
-    const int tmem_tmem_state_inp_decay0 = taddr;
-    const int tmem_tmem_state_inp_decay1 = taddr + 8;
-    const int tmem_tmem_state_inp_decay2 = taddr + 16;
-    const int tmem_tmem_state_inp_decay3 = taddr + 24;
-    const int tmem_tmem_state_inp_decay4 = taddr + 32;
-    const int tmem_tmem_state_inp_decay5 = taddr + 40;
-    const int tmem_tmem_state_inp_decay6 = taddr + 48;
-    const int tmem_tmem_state_inp_decay7 = taddr + 56;
+    const int tmem_tmem_state_inp_decay_0 = taddr;
+    const int tmem_tmem_state_inp_decay_1 = taddr + 8;
+    const int tmem_tmem_state_inp_decay_2 = taddr + 16;
+    const int tmem_tmem_state_inp_decay_3 = taddr + 24;
+    const int tmem_tmem_state_inp_decay_4 = taddr + 32;
+    const int tmem_tmem_state_inp_decay_5 = taddr + 40;
+    const int tmem_tmem_state_inp_decay_6 = taddr + 48;
+    const int tmem_tmem_state_inp_decay_7 = taddr + 56;
     const int tmem_tmem_u_acc = taddr + 224;
     const int tmem_tmem_u2_inp = taddr + 224;
     const int tmem_tmem_u2_acc = taddr;
@@ -865,19 +865,19 @@ kernel_cake_kda_prefill_ff6ff8fe36e1946aadfe(__nv_bfloat16* __restrict__ q, cons
                 int owned_chunk = chunk_global_local >= 0 && chunk_global_local < num_chunks;
                 int checkpoint_token_entering = chunk_idx * 32;
                 int checkpoint_entering = checkpoint_every_n_tokens != 0 && checkpoint_token_entering % checkpoint_every_n_tokens == 0;
-                float state_panel0[32];
-                float state_panel1[32];
-                float state_panel2[32];
-                float state_panel3[32];
-                unsigned int state_packed0[16];
-                unsigned int state_packed1[16];
-                unsigned int state_packed2[16];
-                unsigned int state_packed3[16];
+                float state_panel_0[32];
+                float state_panel_1[32];
+                float state_panel_2[32];
+                float state_panel_3[32];
+                unsigned int state_packed_0[16];
+                unsigned int state_packed_1[16];
+                unsigned int state_packed_2[16];
+                unsigned int state_packed_3[16];
                 int state_addr = taddr + 64 + (unsigned int)tmem_row_base;
                 asm volatile(
                     "tcgen05.ld.sync.aligned.32x32b.x32.b32"
                     " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
-                    : "=f"(state_panel0[0]), "=f"(state_panel0[1]), "=f"(state_panel0[2]), "=f"(state_panel0[3]), "=f"(state_panel0[4]), "=f"(state_panel0[5]), "=f"(state_panel0[6]), "=f"(state_panel0[7]), "=f"(state_panel0[8]), "=f"(state_panel0[9]), "=f"(state_panel0[10]), "=f"(state_panel0[11]), "=f"(state_panel0[12]), "=f"(state_panel0[13]), "=f"(state_panel0[14]), "=f"(state_panel0[15]), "=f"(state_panel0[16]), "=f"(state_panel0[17]), "=f"(state_panel0[18]), "=f"(state_panel0[19]), "=f"(state_panel0[20]), "=f"(state_panel0[21]), "=f"(state_panel0[22]), "=f"(state_panel0[23]), "=f"(state_panel0[24]), "=f"(state_panel0[25]), "=f"(state_panel0[26]), "=f"(state_panel0[27]), "=f"(state_panel0[28]), "=f"(state_panel0[29]), "=f"(state_panel0[30]), "=f"(state_panel0[31])
+                    : "=f"(state_panel_0[0]), "=f"(state_panel_0[1]), "=f"(state_panel_0[2]), "=f"(state_panel_0[3]), "=f"(state_panel_0[4]), "=f"(state_panel_0[5]), "=f"(state_panel_0[6]), "=f"(state_panel_0[7]), "=f"(state_panel_0[8]), "=f"(state_panel_0[9]), "=f"(state_panel_0[10]), "=f"(state_panel_0[11]), "=f"(state_panel_0[12]), "=f"(state_panel_0[13]), "=f"(state_panel_0[14]), "=f"(state_panel_0[15]), "=f"(state_panel_0[16]), "=f"(state_panel_0[17]), "=f"(state_panel_0[18]), "=f"(state_panel_0[19]), "=f"(state_panel_0[20]), "=f"(state_panel_0[21]), "=f"(state_panel_0[22]), "=f"(state_panel_0[23]), "=f"(state_panel_0[24]), "=f"(state_panel_0[25]), "=f"(state_panel_0[26]), "=f"(state_panel_0[27]), "=f"(state_panel_0[28]), "=f"(state_panel_0[29]), "=f"(state_panel_0[30]), "=f"(state_panel_0[31])
                     : "r"(state_addr));
                 asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
                 if (checkpoint_entering != 0 && chunk_idx != 0) {
@@ -886,42 +886,42 @@ kernel_cake_kda_prefill_ff6ff8fe36e1946aadfe(__nv_bfloat16* __restrict__ q, cons
                     unsigned int packed_2[8];
                     #pragma unroll
                     for (int _lp = 0; _lp < 1; _lp++) {
-                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_panel0[_lp*2 + 0], state_panel0[_lp*2+1 + 0]));
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_panel_0[_lp*2 + 0], state_panel_0[_lp*2+1 + 0]));
                         packed_2[_lp] = *(uint32_t*)&_bf2;
                     }
                     #pragma unroll
                     for (int _lp = 0; _lp < 1; _lp++) {
-                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_panel0[_lp*2 + 2], state_panel0[_lp*2+1 + 2]));
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_panel_0[_lp*2 + 2], state_panel_0[_lp*2+1 + 2]));
                         packed_2[_lp + 1] = *(uint32_t*)&_bf2;
                     }
                     #pragma unroll
                     for (int _lp = 0; _lp < 1; _lp++) {
-                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_panel0[_lp*2 + 4], state_panel0[_lp*2+1 + 4]));
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_panel_0[_lp*2 + 4], state_panel_0[_lp*2+1 + 4]));
                         packed_2[_lp + 2] = *(uint32_t*)&_bf2;
                     }
                     #pragma unroll
                     for (int _lp = 0; _lp < 1; _lp++) {
-                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_panel0[_lp*2 + 6], state_panel0[_lp*2+1 + 6]));
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_panel_0[_lp*2 + 6], state_panel_0[_lp*2+1 + 6]));
                         packed_2[_lp + 3] = *(uint32_t*)&_bf2;
                     }
                     #pragma unroll
                     for (int _lp = 0; _lp < 1; _lp++) {
-                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_panel0[_lp*2 + 8], state_panel0[_lp*2+1 + 8]));
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_panel_0[_lp*2 + 8], state_panel_0[_lp*2+1 + 8]));
                         packed_2[_lp + 4] = *(uint32_t*)&_bf2;
                     }
                     #pragma unroll
                     for (int _lp = 0; _lp < 1; _lp++) {
-                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_panel0[_lp*2 + 10], state_panel0[_lp*2+1 + 10]));
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_panel_0[_lp*2 + 10], state_panel_0[_lp*2+1 + 10]));
                         packed_2[_lp + 5] = *(uint32_t*)&_bf2;
                     }
                     #pragma unroll
                     for (int _lp = 0; _lp < 1; _lp++) {
-                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_panel0[_lp*2 + 12], state_panel0[_lp*2+1 + 12]));
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_panel_0[_lp*2 + 12], state_panel_0[_lp*2+1 + 12]));
                         packed_2[_lp + 6] = *(uint32_t*)&_bf2;
                     }
                     #pragma unroll
                     for (int _lp = 0; _lp < 1; _lp++) {
-                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_panel0[_lp*2 + 14], state_panel0[_lp*2+1 + 14]));
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_panel_0[_lp*2 + 14], state_panel_0[_lp*2+1 + 14]));
                         packed_2[_lp + 7] = *(uint32_t*)&_bf2;
                     }
                     reinterpret_cast<int4*>(reinterpret_cast<__nv_bfloat16*>(state_checkpoints_addr) + early_checkpoint_col)[0] = reinterpret_cast<int4*>(packed_2)[0];
@@ -929,42 +929,42 @@ kernel_cake_kda_prefill_ff6ff8fe36e1946aadfe(__nv_bfloat16* __restrict__ q, cons
                     unsigned int packed_1_1[8];
                     #pragma unroll
                     for (int _lp = 0; _lp < 1; _lp++) {
-                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_panel0[_lp*2 + 16], state_panel0[_lp*2+1 + 16]));
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_panel_0[_lp*2 + 16], state_panel_0[_lp*2+1 + 16]));
                         packed_1_1[_lp] = *(uint32_t*)&_bf2;
                     }
                     #pragma unroll
                     for (int _lp = 0; _lp < 1; _lp++) {
-                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_panel0[_lp*2 + 18], state_panel0[_lp*2+1 + 18]));
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_panel_0[_lp*2 + 18], state_panel_0[_lp*2+1 + 18]));
                         packed_1_1[_lp + 1] = *(uint32_t*)&_bf2;
                     }
                     #pragma unroll
                     for (int _lp = 0; _lp < 1; _lp++) {
-                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_panel0[_lp*2 + 20], state_panel0[_lp*2+1 + 20]));
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_panel_0[_lp*2 + 20], state_panel_0[_lp*2+1 + 20]));
                         packed_1_1[_lp + 2] = *(uint32_t*)&_bf2;
                     }
                     #pragma unroll
                     for (int _lp = 0; _lp < 1; _lp++) {
-                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_panel0[_lp*2 + 22], state_panel0[_lp*2+1 + 22]));
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_panel_0[_lp*2 + 22], state_panel_0[_lp*2+1 + 22]));
                         packed_1_1[_lp + 3] = *(uint32_t*)&_bf2;
                     }
                     #pragma unroll
                     for (int _lp = 0; _lp < 1; _lp++) {
-                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_panel0[_lp*2 + 24], state_panel0[_lp*2+1 + 24]));
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_panel_0[_lp*2 + 24], state_panel_0[_lp*2+1 + 24]));
                         packed_1_1[_lp + 4] = *(uint32_t*)&_bf2;
                     }
                     #pragma unroll
                     for (int _lp = 0; _lp < 1; _lp++) {
-                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_panel0[_lp*2 + 26], state_panel0[_lp*2+1 + 26]));
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_panel_0[_lp*2 + 26], state_panel_0[_lp*2+1 + 26]));
                         packed_1_1[_lp + 5] = *(uint32_t*)&_bf2;
                     }
                     #pragma unroll
                     for (int _lp = 0; _lp < 1; _lp++) {
-                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_panel0[_lp*2 + 28], state_panel0[_lp*2+1 + 28]));
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_panel_0[_lp*2 + 28], state_panel_0[_lp*2+1 + 28]));
                         packed_1_1[_lp + 6] = *(uint32_t*)&_bf2;
                     }
                     #pragma unroll
                     for (int _lp = 0; _lp < 1; _lp++) {
-                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_panel0[_lp*2 + 30], state_panel0[_lp*2+1 + 30]));
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_panel_0[_lp*2 + 30], state_panel_0[_lp*2+1 + 30]));
                         packed_1_1[_lp + 7] = *(uint32_t*)&_bf2;
                     }
                     reinterpret_cast<int4*>(reinterpret_cast<__nv_bfloat16*>(state_checkpoints_addr) + (early_checkpoint_col + 16))[0] = reinterpret_cast<int4*>(packed_1_1)[0];
@@ -972,18 +972,18 @@ kernel_cake_kda_prefill_ff6ff8fe36e1946aadfe(__nv_bfloat16* __restrict__ q, cons
                 }
                 #pragma unroll
                 for (int _lp = 0; _lp < 16; _lp++) {
-                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_panel0[_lp*2 + 0], state_panel0[_lp*2+1 + 0]));
-                    state_packed0[_lp] = *(uint32_t*)&_bf2;
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_panel_0[_lp*2 + 0], state_panel_0[_lp*2+1 + 0]));
+                    state_packed_0[_lp] = *(uint32_t*)&_bf2;
                 }
                 asm volatile(
                     "tcgen05.st.sync.aligned.32x32b.x16.b32"
                     " [%0], {%1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16};"
-                    :: "r"(taddr + (unsigned int)tmem_row_base), "r"(state_packed0[0]), "r"(state_packed0[1]), "r"(state_packed0[2]), "r"(state_packed0[3]), "r"(state_packed0[4]), "r"(state_packed0[5]), "r"(state_packed0[6]), "r"(state_packed0[7]), "r"(state_packed0[8]), "r"(state_packed0[9]), "r"(state_packed0[10]), "r"(state_packed0[11]), "r"(state_packed0[12]), "r"(state_packed0[13]), "r"(state_packed0[14]), "r"(state_packed0[15]));
+                    :: "r"(taddr + (unsigned int)tmem_row_base), "r"(state_packed_0[0]), "r"(state_packed_0[1]), "r"(state_packed_0[2]), "r"(state_packed_0[3]), "r"(state_packed_0[4]), "r"(state_packed_0[5]), "r"(state_packed_0[6]), "r"(state_packed_0[7]), "r"(state_packed_0[8]), "r"(state_packed_0[9]), "r"(state_packed_0[10]), "r"(state_packed_0[11]), "r"(state_packed_0[12]), "r"(state_packed_0[13]), "r"(state_packed_0[14]), "r"(state_packed_0[15]));
                 int state_addr_0 = taddr + 64 + (unsigned int)tmem_row_base + 32;
                 asm volatile(
                     "tcgen05.ld.sync.aligned.32x32b.x32.b32"
                     " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
-                    : "=f"(state_panel1[0]), "=f"(state_panel1[1]), "=f"(state_panel1[2]), "=f"(state_panel1[3]), "=f"(state_panel1[4]), "=f"(state_panel1[5]), "=f"(state_panel1[6]), "=f"(state_panel1[7]), "=f"(state_panel1[8]), "=f"(state_panel1[9]), "=f"(state_panel1[10]), "=f"(state_panel1[11]), "=f"(state_panel1[12]), "=f"(state_panel1[13]), "=f"(state_panel1[14]), "=f"(state_panel1[15]), "=f"(state_panel1[16]), "=f"(state_panel1[17]), "=f"(state_panel1[18]), "=f"(state_panel1[19]), "=f"(state_panel1[20]), "=f"(state_panel1[21]), "=f"(state_panel1[22]), "=f"(state_panel1[23]), "=f"(state_panel1[24]), "=f"(state_panel1[25]), "=f"(state_panel1[26]), "=f"(state_panel1[27]), "=f"(state_panel1[28]), "=f"(state_panel1[29]), "=f"(state_panel1[30]), "=f"(state_panel1[31])
+                    : "=f"(state_panel_1[0]), "=f"(state_panel_1[1]), "=f"(state_panel_1[2]), "=f"(state_panel_1[3]), "=f"(state_panel_1[4]), "=f"(state_panel_1[5]), "=f"(state_panel_1[6]), "=f"(state_panel_1[7]), "=f"(state_panel_1[8]), "=f"(state_panel_1[9]), "=f"(state_panel_1[10]), "=f"(state_panel_1[11]), "=f"(state_panel_1[12]), "=f"(state_panel_1[13]), "=f"(state_panel_1[14]), "=f"(state_panel_1[15]), "=f"(state_panel_1[16]), "=f"(state_panel_1[17]), "=f"(state_panel_1[18]), "=f"(state_panel_1[19]), "=f"(state_panel_1[20]), "=f"(state_panel_1[21]), "=f"(state_panel_1[22]), "=f"(state_panel_1[23]), "=f"(state_panel_1[24]), "=f"(state_panel_1[25]), "=f"(state_panel_1[26]), "=f"(state_panel_1[27]), "=f"(state_panel_1[28]), "=f"(state_panel_1[29]), "=f"(state_panel_1[30]), "=f"(state_panel_1[31])
                     : "r"(state_addr_0));
                 asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
                 if (checkpoint_entering != 0 && chunk_idx != 0) {
@@ -992,42 +992,42 @@ kernel_cake_kda_prefill_ff6ff8fe36e1946aadfe(__nv_bfloat16* __restrict__ q, cons
                     unsigned int packed_3[8];
                     #pragma unroll
                     for (int _lp = 0; _lp < 1; _lp++) {
-                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_panel1[_lp*2 + 0], state_panel1[_lp*2+1 + 0]));
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_panel_1[_lp*2 + 0], state_panel_1[_lp*2+1 + 0]));
                         packed_3[_lp] = *(uint32_t*)&_bf2;
                     }
                     #pragma unroll
                     for (int _lp = 0; _lp < 1; _lp++) {
-                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_panel1[_lp*2 + 2], state_panel1[_lp*2+1 + 2]));
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_panel_1[_lp*2 + 2], state_panel_1[_lp*2+1 + 2]));
                         packed_3[_lp + 1] = *(uint32_t*)&_bf2;
                     }
                     #pragma unroll
                     for (int _lp = 0; _lp < 1; _lp++) {
-                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_panel1[_lp*2 + 4], state_panel1[_lp*2+1 + 4]));
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_panel_1[_lp*2 + 4], state_panel_1[_lp*2+1 + 4]));
                         packed_3[_lp + 2] = *(uint32_t*)&_bf2;
                     }
                     #pragma unroll
                     for (int _lp = 0; _lp < 1; _lp++) {
-                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_panel1[_lp*2 + 6], state_panel1[_lp*2+1 + 6]));
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_panel_1[_lp*2 + 6], state_panel_1[_lp*2+1 + 6]));
                         packed_3[_lp + 3] = *(uint32_t*)&_bf2;
                     }
                     #pragma unroll
                     for (int _lp = 0; _lp < 1; _lp++) {
-                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_panel1[_lp*2 + 8], state_panel1[_lp*2+1 + 8]));
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_panel_1[_lp*2 + 8], state_panel_1[_lp*2+1 + 8]));
                         packed_3[_lp + 4] = *(uint32_t*)&_bf2;
                     }
                     #pragma unroll
                     for (int _lp = 0; _lp < 1; _lp++) {
-                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_panel1[_lp*2 + 10], state_panel1[_lp*2+1 + 10]));
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_panel_1[_lp*2 + 10], state_panel_1[_lp*2+1 + 10]));
                         packed_3[_lp + 5] = *(uint32_t*)&_bf2;
                     }
                     #pragma unroll
                     for (int _lp = 0; _lp < 1; _lp++) {
-                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_panel1[_lp*2 + 12], state_panel1[_lp*2+1 + 12]));
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_panel_1[_lp*2 + 12], state_panel_1[_lp*2+1 + 12]));
                         packed_3[_lp + 6] = *(uint32_t*)&_bf2;
                     }
                     #pragma unroll
                     for (int _lp = 0; _lp < 1; _lp++) {
-                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_panel1[_lp*2 + 14], state_panel1[_lp*2+1 + 14]));
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_panel_1[_lp*2 + 14], state_panel_1[_lp*2+1 + 14]));
                         packed_3[_lp + 7] = *(uint32_t*)&_bf2;
                     }
                     reinterpret_cast<int4*>(reinterpret_cast<__nv_bfloat16*>(state_checkpoints_addr) + early_checkpoint_col_1)[0] = reinterpret_cast<int4*>(packed_3)[0];
@@ -1035,42 +1035,42 @@ kernel_cake_kda_prefill_ff6ff8fe36e1946aadfe(__nv_bfloat16* __restrict__ q, cons
                     unsigned int packed_1_2[8];
                     #pragma unroll
                     for (int _lp = 0; _lp < 1; _lp++) {
-                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_panel1[_lp*2 + 16], state_panel1[_lp*2+1 + 16]));
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_panel_1[_lp*2 + 16], state_panel_1[_lp*2+1 + 16]));
                         packed_1_2[_lp] = *(uint32_t*)&_bf2;
                     }
                     #pragma unroll
                     for (int _lp = 0; _lp < 1; _lp++) {
-                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_panel1[_lp*2 + 18], state_panel1[_lp*2+1 + 18]));
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_panel_1[_lp*2 + 18], state_panel_1[_lp*2+1 + 18]));
                         packed_1_2[_lp + 1] = *(uint32_t*)&_bf2;
                     }
                     #pragma unroll
                     for (int _lp = 0; _lp < 1; _lp++) {
-                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_panel1[_lp*2 + 20], state_panel1[_lp*2+1 + 20]));
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_panel_1[_lp*2 + 20], state_panel_1[_lp*2+1 + 20]));
                         packed_1_2[_lp + 2] = *(uint32_t*)&_bf2;
                     }
                     #pragma unroll
                     for (int _lp = 0; _lp < 1; _lp++) {
-                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_panel1[_lp*2 + 22], state_panel1[_lp*2+1 + 22]));
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_panel_1[_lp*2 + 22], state_panel_1[_lp*2+1 + 22]));
                         packed_1_2[_lp + 3] = *(uint32_t*)&_bf2;
                     }
                     #pragma unroll
                     for (int _lp = 0; _lp < 1; _lp++) {
-                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_panel1[_lp*2 + 24], state_panel1[_lp*2+1 + 24]));
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_panel_1[_lp*2 + 24], state_panel_1[_lp*2+1 + 24]));
                         packed_1_2[_lp + 4] = *(uint32_t*)&_bf2;
                     }
                     #pragma unroll
                     for (int _lp = 0; _lp < 1; _lp++) {
-                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_panel1[_lp*2 + 26], state_panel1[_lp*2+1 + 26]));
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_panel_1[_lp*2 + 26], state_panel_1[_lp*2+1 + 26]));
                         packed_1_2[_lp + 5] = *(uint32_t*)&_bf2;
                     }
                     #pragma unroll
                     for (int _lp = 0; _lp < 1; _lp++) {
-                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_panel1[_lp*2 + 28], state_panel1[_lp*2+1 + 28]));
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_panel_1[_lp*2 + 28], state_panel_1[_lp*2+1 + 28]));
                         packed_1_2[_lp + 6] = *(uint32_t*)&_bf2;
                     }
                     #pragma unroll
                     for (int _lp = 0; _lp < 1; _lp++) {
-                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_panel1[_lp*2 + 30], state_panel1[_lp*2+1 + 30]));
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_panel_1[_lp*2 + 30], state_panel_1[_lp*2+1 + 30]));
                         packed_1_2[_lp + 7] = *(uint32_t*)&_bf2;
                     }
                     reinterpret_cast<int4*>(reinterpret_cast<__nv_bfloat16*>(state_checkpoints_addr) + (early_checkpoint_col_1 + 16))[0] = reinterpret_cast<int4*>(packed_1_2)[0];
@@ -1078,18 +1078,18 @@ kernel_cake_kda_prefill_ff6ff8fe36e1946aadfe(__nv_bfloat16* __restrict__ q, cons
                 }
                 #pragma unroll
                 for (int _lp = 0; _lp < 16; _lp++) {
-                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_panel1[_lp*2 + 0], state_panel1[_lp*2+1 + 0]));
-                    state_packed1[_lp] = *(uint32_t*)&_bf2;
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_panel_1[_lp*2 + 0], state_panel_1[_lp*2+1 + 0]));
+                    state_packed_1[_lp] = *(uint32_t*)&_bf2;
                 }
                 asm volatile(
                     "tcgen05.st.sync.aligned.32x32b.x16.b32"
                     " [%0], {%1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16};"
-                    :: "r"(taddr + (unsigned int)tmem_row_base + 16), "r"(state_packed1[0]), "r"(state_packed1[1]), "r"(state_packed1[2]), "r"(state_packed1[3]), "r"(state_packed1[4]), "r"(state_packed1[5]), "r"(state_packed1[6]), "r"(state_packed1[7]), "r"(state_packed1[8]), "r"(state_packed1[9]), "r"(state_packed1[10]), "r"(state_packed1[11]), "r"(state_packed1[12]), "r"(state_packed1[13]), "r"(state_packed1[14]), "r"(state_packed1[15]));
+                    :: "r"(taddr + (unsigned int)tmem_row_base + 16), "r"(state_packed_1[0]), "r"(state_packed_1[1]), "r"(state_packed_1[2]), "r"(state_packed_1[3]), "r"(state_packed_1[4]), "r"(state_packed_1[5]), "r"(state_packed_1[6]), "r"(state_packed_1[7]), "r"(state_packed_1[8]), "r"(state_packed_1[9]), "r"(state_packed_1[10]), "r"(state_packed_1[11]), "r"(state_packed_1[12]), "r"(state_packed_1[13]), "r"(state_packed_1[14]), "r"(state_packed_1[15]));
                 int state_addr_1 = taddr + 64 + (unsigned int)tmem_row_base + 64;
                 asm volatile(
                     "tcgen05.ld.sync.aligned.32x32b.x32.b32"
                     " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
-                    : "=f"(state_panel2[0]), "=f"(state_panel2[1]), "=f"(state_panel2[2]), "=f"(state_panel2[3]), "=f"(state_panel2[4]), "=f"(state_panel2[5]), "=f"(state_panel2[6]), "=f"(state_panel2[7]), "=f"(state_panel2[8]), "=f"(state_panel2[9]), "=f"(state_panel2[10]), "=f"(state_panel2[11]), "=f"(state_panel2[12]), "=f"(state_panel2[13]), "=f"(state_panel2[14]), "=f"(state_panel2[15]), "=f"(state_panel2[16]), "=f"(state_panel2[17]), "=f"(state_panel2[18]), "=f"(state_panel2[19]), "=f"(state_panel2[20]), "=f"(state_panel2[21]), "=f"(state_panel2[22]), "=f"(state_panel2[23]), "=f"(state_panel2[24]), "=f"(state_panel2[25]), "=f"(state_panel2[26]), "=f"(state_panel2[27]), "=f"(state_panel2[28]), "=f"(state_panel2[29]), "=f"(state_panel2[30]), "=f"(state_panel2[31])
+                    : "=f"(state_panel_2[0]), "=f"(state_panel_2[1]), "=f"(state_panel_2[2]), "=f"(state_panel_2[3]), "=f"(state_panel_2[4]), "=f"(state_panel_2[5]), "=f"(state_panel_2[6]), "=f"(state_panel_2[7]), "=f"(state_panel_2[8]), "=f"(state_panel_2[9]), "=f"(state_panel_2[10]), "=f"(state_panel_2[11]), "=f"(state_panel_2[12]), "=f"(state_panel_2[13]), "=f"(state_panel_2[14]), "=f"(state_panel_2[15]), "=f"(state_panel_2[16]), "=f"(state_panel_2[17]), "=f"(state_panel_2[18]), "=f"(state_panel_2[19]), "=f"(state_panel_2[20]), "=f"(state_panel_2[21]), "=f"(state_panel_2[22]), "=f"(state_panel_2[23]), "=f"(state_panel_2[24]), "=f"(state_panel_2[25]), "=f"(state_panel_2[26]), "=f"(state_panel_2[27]), "=f"(state_panel_2[28]), "=f"(state_panel_2[29]), "=f"(state_panel_2[30]), "=f"(state_panel_2[31])
                     : "r"(state_addr_1));
                 asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
                 if (checkpoint_entering != 0 && chunk_idx != 0) {
@@ -1098,42 +1098,42 @@ kernel_cake_kda_prefill_ff6ff8fe36e1946aadfe(__nv_bfloat16* __restrict__ q, cons
                     unsigned int packed_4[8];
                     #pragma unroll
                     for (int _lp = 0; _lp < 1; _lp++) {
-                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_panel2[_lp*2 + 0], state_panel2[_lp*2+1 + 0]));
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_panel_2[_lp*2 + 0], state_panel_2[_lp*2+1 + 0]));
                         packed_4[_lp] = *(uint32_t*)&_bf2;
                     }
                     #pragma unroll
                     for (int _lp = 0; _lp < 1; _lp++) {
-                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_panel2[_lp*2 + 2], state_panel2[_lp*2+1 + 2]));
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_panel_2[_lp*2 + 2], state_panel_2[_lp*2+1 + 2]));
                         packed_4[_lp + 1] = *(uint32_t*)&_bf2;
                     }
                     #pragma unroll
                     for (int _lp = 0; _lp < 1; _lp++) {
-                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_panel2[_lp*2 + 4], state_panel2[_lp*2+1 + 4]));
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_panel_2[_lp*2 + 4], state_panel_2[_lp*2+1 + 4]));
                         packed_4[_lp + 2] = *(uint32_t*)&_bf2;
                     }
                     #pragma unroll
                     for (int _lp = 0; _lp < 1; _lp++) {
-                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_panel2[_lp*2 + 6], state_panel2[_lp*2+1 + 6]));
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_panel_2[_lp*2 + 6], state_panel_2[_lp*2+1 + 6]));
                         packed_4[_lp + 3] = *(uint32_t*)&_bf2;
                     }
                     #pragma unroll
                     for (int _lp = 0; _lp < 1; _lp++) {
-                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_panel2[_lp*2 + 8], state_panel2[_lp*2+1 + 8]));
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_panel_2[_lp*2 + 8], state_panel_2[_lp*2+1 + 8]));
                         packed_4[_lp + 4] = *(uint32_t*)&_bf2;
                     }
                     #pragma unroll
                     for (int _lp = 0; _lp < 1; _lp++) {
-                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_panel2[_lp*2 + 10], state_panel2[_lp*2+1 + 10]));
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_panel_2[_lp*2 + 10], state_panel_2[_lp*2+1 + 10]));
                         packed_4[_lp + 5] = *(uint32_t*)&_bf2;
                     }
                     #pragma unroll
                     for (int _lp = 0; _lp < 1; _lp++) {
-                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_panel2[_lp*2 + 12], state_panel2[_lp*2+1 + 12]));
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_panel_2[_lp*2 + 12], state_panel_2[_lp*2+1 + 12]));
                         packed_4[_lp + 6] = *(uint32_t*)&_bf2;
                     }
                     #pragma unroll
                     for (int _lp = 0; _lp < 1; _lp++) {
-                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_panel2[_lp*2 + 14], state_panel2[_lp*2+1 + 14]));
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_panel_2[_lp*2 + 14], state_panel_2[_lp*2+1 + 14]));
                         packed_4[_lp + 7] = *(uint32_t*)&_bf2;
                     }
                     reinterpret_cast<int4*>(reinterpret_cast<__nv_bfloat16*>(state_checkpoints_addr) + early_checkpoint_col_2)[0] = reinterpret_cast<int4*>(packed_4)[0];
@@ -1141,42 +1141,42 @@ kernel_cake_kda_prefill_ff6ff8fe36e1946aadfe(__nv_bfloat16* __restrict__ q, cons
                     unsigned int packed_1_3[8];
                     #pragma unroll
                     for (int _lp = 0; _lp < 1; _lp++) {
-                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_panel2[_lp*2 + 16], state_panel2[_lp*2+1 + 16]));
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_panel_2[_lp*2 + 16], state_panel_2[_lp*2+1 + 16]));
                         packed_1_3[_lp] = *(uint32_t*)&_bf2;
                     }
                     #pragma unroll
                     for (int _lp = 0; _lp < 1; _lp++) {
-                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_panel2[_lp*2 + 18], state_panel2[_lp*2+1 + 18]));
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_panel_2[_lp*2 + 18], state_panel_2[_lp*2+1 + 18]));
                         packed_1_3[_lp + 1] = *(uint32_t*)&_bf2;
                     }
                     #pragma unroll
                     for (int _lp = 0; _lp < 1; _lp++) {
-                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_panel2[_lp*2 + 20], state_panel2[_lp*2+1 + 20]));
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_panel_2[_lp*2 + 20], state_panel_2[_lp*2+1 + 20]));
                         packed_1_3[_lp + 2] = *(uint32_t*)&_bf2;
                     }
                     #pragma unroll
                     for (int _lp = 0; _lp < 1; _lp++) {
-                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_panel2[_lp*2 + 22], state_panel2[_lp*2+1 + 22]));
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_panel_2[_lp*2 + 22], state_panel_2[_lp*2+1 + 22]));
                         packed_1_3[_lp + 3] = *(uint32_t*)&_bf2;
                     }
                     #pragma unroll
                     for (int _lp = 0; _lp < 1; _lp++) {
-                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_panel2[_lp*2 + 24], state_panel2[_lp*2+1 + 24]));
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_panel_2[_lp*2 + 24], state_panel_2[_lp*2+1 + 24]));
                         packed_1_3[_lp + 4] = *(uint32_t*)&_bf2;
                     }
                     #pragma unroll
                     for (int _lp = 0; _lp < 1; _lp++) {
-                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_panel2[_lp*2 + 26], state_panel2[_lp*2+1 + 26]));
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_panel_2[_lp*2 + 26], state_panel_2[_lp*2+1 + 26]));
                         packed_1_3[_lp + 5] = *(uint32_t*)&_bf2;
                     }
                     #pragma unroll
                     for (int _lp = 0; _lp < 1; _lp++) {
-                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_panel2[_lp*2 + 28], state_panel2[_lp*2+1 + 28]));
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_panel_2[_lp*2 + 28], state_panel_2[_lp*2+1 + 28]));
                         packed_1_3[_lp + 6] = *(uint32_t*)&_bf2;
                     }
                     #pragma unroll
                     for (int _lp = 0; _lp < 1; _lp++) {
-                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_panel2[_lp*2 + 30], state_panel2[_lp*2+1 + 30]));
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_panel_2[_lp*2 + 30], state_panel_2[_lp*2+1 + 30]));
                         packed_1_3[_lp + 7] = *(uint32_t*)&_bf2;
                     }
                     reinterpret_cast<int4*>(reinterpret_cast<__nv_bfloat16*>(state_checkpoints_addr) + (early_checkpoint_col_2 + 16))[0] = reinterpret_cast<int4*>(packed_1_3)[0];
@@ -1184,18 +1184,18 @@ kernel_cake_kda_prefill_ff6ff8fe36e1946aadfe(__nv_bfloat16* __restrict__ q, cons
                 }
                 #pragma unroll
                 for (int _lp = 0; _lp < 16; _lp++) {
-                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_panel2[_lp*2 + 0], state_panel2[_lp*2+1 + 0]));
-                    state_packed2[_lp] = *(uint32_t*)&_bf2;
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_panel_2[_lp*2 + 0], state_panel_2[_lp*2+1 + 0]));
+                    state_packed_2[_lp] = *(uint32_t*)&_bf2;
                 }
                 asm volatile(
                     "tcgen05.st.sync.aligned.32x32b.x16.b32"
                     " [%0], {%1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16};"
-                    :: "r"(taddr + (unsigned int)tmem_row_base + 32), "r"(state_packed2[0]), "r"(state_packed2[1]), "r"(state_packed2[2]), "r"(state_packed2[3]), "r"(state_packed2[4]), "r"(state_packed2[5]), "r"(state_packed2[6]), "r"(state_packed2[7]), "r"(state_packed2[8]), "r"(state_packed2[9]), "r"(state_packed2[10]), "r"(state_packed2[11]), "r"(state_packed2[12]), "r"(state_packed2[13]), "r"(state_packed2[14]), "r"(state_packed2[15]));
+                    :: "r"(taddr + (unsigned int)tmem_row_base + 32), "r"(state_packed_2[0]), "r"(state_packed_2[1]), "r"(state_packed_2[2]), "r"(state_packed_2[3]), "r"(state_packed_2[4]), "r"(state_packed_2[5]), "r"(state_packed_2[6]), "r"(state_packed_2[7]), "r"(state_packed_2[8]), "r"(state_packed_2[9]), "r"(state_packed_2[10]), "r"(state_packed_2[11]), "r"(state_packed_2[12]), "r"(state_packed_2[13]), "r"(state_packed_2[14]), "r"(state_packed_2[15]));
                 int state_addr_2 = taddr + 64 + (unsigned int)tmem_row_base + 96;
                 asm volatile(
                     "tcgen05.ld.sync.aligned.32x32b.x32.b32"
                     " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
-                    : "=f"(state_panel3[0]), "=f"(state_panel3[1]), "=f"(state_panel3[2]), "=f"(state_panel3[3]), "=f"(state_panel3[4]), "=f"(state_panel3[5]), "=f"(state_panel3[6]), "=f"(state_panel3[7]), "=f"(state_panel3[8]), "=f"(state_panel3[9]), "=f"(state_panel3[10]), "=f"(state_panel3[11]), "=f"(state_panel3[12]), "=f"(state_panel3[13]), "=f"(state_panel3[14]), "=f"(state_panel3[15]), "=f"(state_panel3[16]), "=f"(state_panel3[17]), "=f"(state_panel3[18]), "=f"(state_panel3[19]), "=f"(state_panel3[20]), "=f"(state_panel3[21]), "=f"(state_panel3[22]), "=f"(state_panel3[23]), "=f"(state_panel3[24]), "=f"(state_panel3[25]), "=f"(state_panel3[26]), "=f"(state_panel3[27]), "=f"(state_panel3[28]), "=f"(state_panel3[29]), "=f"(state_panel3[30]), "=f"(state_panel3[31])
+                    : "=f"(state_panel_3[0]), "=f"(state_panel_3[1]), "=f"(state_panel_3[2]), "=f"(state_panel_3[3]), "=f"(state_panel_3[4]), "=f"(state_panel_3[5]), "=f"(state_panel_3[6]), "=f"(state_panel_3[7]), "=f"(state_panel_3[8]), "=f"(state_panel_3[9]), "=f"(state_panel_3[10]), "=f"(state_panel_3[11]), "=f"(state_panel_3[12]), "=f"(state_panel_3[13]), "=f"(state_panel_3[14]), "=f"(state_panel_3[15]), "=f"(state_panel_3[16]), "=f"(state_panel_3[17]), "=f"(state_panel_3[18]), "=f"(state_panel_3[19]), "=f"(state_panel_3[20]), "=f"(state_panel_3[21]), "=f"(state_panel_3[22]), "=f"(state_panel_3[23]), "=f"(state_panel_3[24]), "=f"(state_panel_3[25]), "=f"(state_panel_3[26]), "=f"(state_panel_3[27]), "=f"(state_panel_3[28]), "=f"(state_panel_3[29]), "=f"(state_panel_3[30]), "=f"(state_panel_3[31])
                     : "r"(state_addr_2));
                 asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
                 if (checkpoint_entering != 0 && chunk_idx != 0) {
@@ -1204,42 +1204,42 @@ kernel_cake_kda_prefill_ff6ff8fe36e1946aadfe(__nv_bfloat16* __restrict__ q, cons
                     unsigned int packed_5[8];
                     #pragma unroll
                     for (int _lp = 0; _lp < 1; _lp++) {
-                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_panel3[_lp*2 + 0], state_panel3[_lp*2+1 + 0]));
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_panel_3[_lp*2 + 0], state_panel_3[_lp*2+1 + 0]));
                         packed_5[_lp] = *(uint32_t*)&_bf2;
                     }
                     #pragma unroll
                     for (int _lp = 0; _lp < 1; _lp++) {
-                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_panel3[_lp*2 + 2], state_panel3[_lp*2+1 + 2]));
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_panel_3[_lp*2 + 2], state_panel_3[_lp*2+1 + 2]));
                         packed_5[_lp + 1] = *(uint32_t*)&_bf2;
                     }
                     #pragma unroll
                     for (int _lp = 0; _lp < 1; _lp++) {
-                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_panel3[_lp*2 + 4], state_panel3[_lp*2+1 + 4]));
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_panel_3[_lp*2 + 4], state_panel_3[_lp*2+1 + 4]));
                         packed_5[_lp + 2] = *(uint32_t*)&_bf2;
                     }
                     #pragma unroll
                     for (int _lp = 0; _lp < 1; _lp++) {
-                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_panel3[_lp*2 + 6], state_panel3[_lp*2+1 + 6]));
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_panel_3[_lp*2 + 6], state_panel_3[_lp*2+1 + 6]));
                         packed_5[_lp + 3] = *(uint32_t*)&_bf2;
                     }
                     #pragma unroll
                     for (int _lp = 0; _lp < 1; _lp++) {
-                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_panel3[_lp*2 + 8], state_panel3[_lp*2+1 + 8]));
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_panel_3[_lp*2 + 8], state_panel_3[_lp*2+1 + 8]));
                         packed_5[_lp + 4] = *(uint32_t*)&_bf2;
                     }
                     #pragma unroll
                     for (int _lp = 0; _lp < 1; _lp++) {
-                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_panel3[_lp*2 + 10], state_panel3[_lp*2+1 + 10]));
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_panel_3[_lp*2 + 10], state_panel_3[_lp*2+1 + 10]));
                         packed_5[_lp + 5] = *(uint32_t*)&_bf2;
                     }
                     #pragma unroll
                     for (int _lp = 0; _lp < 1; _lp++) {
-                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_panel3[_lp*2 + 12], state_panel3[_lp*2+1 + 12]));
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_panel_3[_lp*2 + 12], state_panel_3[_lp*2+1 + 12]));
                         packed_5[_lp + 6] = *(uint32_t*)&_bf2;
                     }
                     #pragma unroll
                     for (int _lp = 0; _lp < 1; _lp++) {
-                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_panel3[_lp*2 + 14], state_panel3[_lp*2+1 + 14]));
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_panel_3[_lp*2 + 14], state_panel_3[_lp*2+1 + 14]));
                         packed_5[_lp + 7] = *(uint32_t*)&_bf2;
                     }
                     reinterpret_cast<int4*>(reinterpret_cast<__nv_bfloat16*>(state_checkpoints_addr) + early_checkpoint_col_3)[0] = reinterpret_cast<int4*>(packed_5)[0];
@@ -1247,42 +1247,42 @@ kernel_cake_kda_prefill_ff6ff8fe36e1946aadfe(__nv_bfloat16* __restrict__ q, cons
                     unsigned int packed_1_4[8];
                     #pragma unroll
                     for (int _lp = 0; _lp < 1; _lp++) {
-                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_panel3[_lp*2 + 16], state_panel3[_lp*2+1 + 16]));
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_panel_3[_lp*2 + 16], state_panel_3[_lp*2+1 + 16]));
                         packed_1_4[_lp] = *(uint32_t*)&_bf2;
                     }
                     #pragma unroll
                     for (int _lp = 0; _lp < 1; _lp++) {
-                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_panel3[_lp*2 + 18], state_panel3[_lp*2+1 + 18]));
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_panel_3[_lp*2 + 18], state_panel_3[_lp*2+1 + 18]));
                         packed_1_4[_lp + 1] = *(uint32_t*)&_bf2;
                     }
                     #pragma unroll
                     for (int _lp = 0; _lp < 1; _lp++) {
-                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_panel3[_lp*2 + 20], state_panel3[_lp*2+1 + 20]));
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_panel_3[_lp*2 + 20], state_panel_3[_lp*2+1 + 20]));
                         packed_1_4[_lp + 2] = *(uint32_t*)&_bf2;
                     }
                     #pragma unroll
                     for (int _lp = 0; _lp < 1; _lp++) {
-                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_panel3[_lp*2 + 22], state_panel3[_lp*2+1 + 22]));
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_panel_3[_lp*2 + 22], state_panel_3[_lp*2+1 + 22]));
                         packed_1_4[_lp + 3] = *(uint32_t*)&_bf2;
                     }
                     #pragma unroll
                     for (int _lp = 0; _lp < 1; _lp++) {
-                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_panel3[_lp*2 + 24], state_panel3[_lp*2+1 + 24]));
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_panel_3[_lp*2 + 24], state_panel_3[_lp*2+1 + 24]));
                         packed_1_4[_lp + 4] = *(uint32_t*)&_bf2;
                     }
                     #pragma unroll
                     for (int _lp = 0; _lp < 1; _lp++) {
-                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_panel3[_lp*2 + 26], state_panel3[_lp*2+1 + 26]));
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_panel_3[_lp*2 + 26], state_panel_3[_lp*2+1 + 26]));
                         packed_1_4[_lp + 5] = *(uint32_t*)&_bf2;
                     }
                     #pragma unroll
                     for (int _lp = 0; _lp < 1; _lp++) {
-                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_panel3[_lp*2 + 28], state_panel3[_lp*2+1 + 28]));
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_panel_3[_lp*2 + 28], state_panel_3[_lp*2+1 + 28]));
                         packed_1_4[_lp + 6] = *(uint32_t*)&_bf2;
                     }
                     #pragma unroll
                     for (int _lp = 0; _lp < 1; _lp++) {
-                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_panel3[_lp*2 + 30], state_panel3[_lp*2+1 + 30]));
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_panel_3[_lp*2 + 30], state_panel_3[_lp*2+1 + 30]));
                         packed_1_4[_lp + 7] = *(uint32_t*)&_bf2;
                     }
                     reinterpret_cast<int4*>(reinterpret_cast<__nv_bfloat16*>(state_checkpoints_addr) + (early_checkpoint_col_3 + 16))[0] = reinterpret_cast<int4*>(packed_1_4)[0];
@@ -1290,13 +1290,13 @@ kernel_cake_kda_prefill_ff6ff8fe36e1946aadfe(__nv_bfloat16* __restrict__ q, cons
                 }
                 #pragma unroll
                 for (int _lp = 0; _lp < 16; _lp++) {
-                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_panel3[_lp*2 + 0], state_panel3[_lp*2+1 + 0]));
-                    state_packed3[_lp] = *(uint32_t*)&_bf2;
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_panel_3[_lp*2 + 0], state_panel_3[_lp*2+1 + 0]));
+                    state_packed_3[_lp] = *(uint32_t*)&_bf2;
                 }
                 asm volatile(
                     "tcgen05.st.sync.aligned.32x32b.x16.b32"
                     " [%0], {%1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16};"
-                    :: "r"(taddr + (unsigned int)tmem_row_base + 48), "r"(state_packed3[0]), "r"(state_packed3[1]), "r"(state_packed3[2]), "r"(state_packed3[3]), "r"(state_packed3[4]), "r"(state_packed3[5]), "r"(state_packed3[6]), "r"(state_packed3[7]), "r"(state_packed3[8]), "r"(state_packed3[9]), "r"(state_packed3[10]), "r"(state_packed3[11]), "r"(state_packed3[12]), "r"(state_packed3[13]), "r"(state_packed3[14]), "r"(state_packed3[15]));
+                    :: "r"(taddr + (unsigned int)tmem_row_base + 48), "r"(state_packed_3[0]), "r"(state_packed_3[1]), "r"(state_packed_3[2]), "r"(state_packed_3[3]), "r"(state_packed_3[4]), "r"(state_packed_3[5]), "r"(state_packed_3[6]), "r"(state_packed_3[7]), "r"(state_packed_3[8]), "r"(state_packed_3[9]), "r"(state_packed_3[10]), "r"(state_packed_3[11]), "r"(state_packed_3[12]), "r"(state_packed_3[13]), "r"(state_packed_3[14]), "r"(state_packed_3[15]));
                 asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
                 if (elect_sync()) {
                     asm volatile("tcgen05.fence::before_thread_sync;");
@@ -1315,9 +1315,9 @@ kernel_cake_kda_prefill_ff6ff8fe36e1946aadfe(__nv_bfloat16* __restrict__ q, cons
                     }
                     #pragma unroll
                     for (int _ls = 0; _ls < 8; _ls++)
-                        mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>((state_panel0 + state_half * 16))[_ls], reinterpret_cast<const float2*>(state_scale)[_ls]);
+                        mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>((state_panel_0 + state_half * 16))[_ls], reinterpret_cast<const float2*>(state_scale)[_ls]);
                 }
-                tmem_st_x32_f32(taddr + 64 + (unsigned int)tmem_row_base, state_panel0);
+                tmem_st_x32_f32(taddr + 64 + (unsigned int)tmem_row_base, state_panel_0);
                 float state_scale_0[16];
                 #pragma unroll
                 for (int state_half_1 = 0; state_half_1 < 2; state_half_1++) {
@@ -1327,9 +1327,9 @@ kernel_cake_kda_prefill_ff6ff8fe36e1946aadfe(__nv_bfloat16* __restrict__ q, cons
                     }
                     #pragma unroll
                     for (int _ls = 0; _ls < 8; _ls++)
-                        mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>((state_panel1 + state_half_1 * 16))[_ls], reinterpret_cast<const float2*>(state_scale_0)[_ls]);
+                        mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>((state_panel_1 + state_half_1 * 16))[_ls], reinterpret_cast<const float2*>(state_scale_0)[_ls]);
                 }
-                tmem_st_x32_f32(taddr + 64 + (unsigned int)tmem_row_base + 32, state_panel1);
+                tmem_st_x32_f32(taddr + 64 + (unsigned int)tmem_row_base + 32, state_panel_1);
                 float state_scale_1[16];
                 #pragma unroll
                 for (int state_half_2 = 0; state_half_2 < 2; state_half_2++) {
@@ -1339,9 +1339,9 @@ kernel_cake_kda_prefill_ff6ff8fe36e1946aadfe(__nv_bfloat16* __restrict__ q, cons
                     }
                     #pragma unroll
                     for (int _ls = 0; _ls < 8; _ls++)
-                        mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>((state_panel2 + state_half_2 * 16))[_ls], reinterpret_cast<const float2*>(state_scale_1)[_ls]);
+                        mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>((state_panel_2 + state_half_2 * 16))[_ls], reinterpret_cast<const float2*>(state_scale_1)[_ls]);
                 }
-                tmem_st_x32_f32(taddr + 64 + (unsigned int)tmem_row_base + 64, state_panel2);
+                tmem_st_x32_f32(taddr + 64 + (unsigned int)tmem_row_base + 64, state_panel_2);
                 float state_scale_2[16];
                 #pragma unroll
                 for (int state_half_3 = 0; state_half_3 < 2; state_half_3++) {
@@ -1351,9 +1351,9 @@ kernel_cake_kda_prefill_ff6ff8fe36e1946aadfe(__nv_bfloat16* __restrict__ q, cons
                     }
                     #pragma unroll
                     for (int _ls = 0; _ls < 8; _ls++)
-                        mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>((state_panel3 + state_half_3 * 16))[_ls], reinterpret_cast<const float2*>(state_scale_2)[_ls]);
+                        mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>((state_panel_3 + state_half_3 * 16))[_ls], reinterpret_cast<const float2*>(state_scale_2)[_ls]);
                 }
-                tmem_st_x32_f32(taddr + 64 + (unsigned int)tmem_row_base + 96, state_panel3);
+                tmem_st_x32_f32(taddr + 64 + (unsigned int)tmem_row_base + 96, state_panel_3);
                 int _stage_v_full = (int)((unsigned int)chunk_idx % 4);
                 int _parity_v_full = (int)((unsigned int)chunk_idx / 4 % 2);
                 mbarrier_wait(v_full_addr + (_stage_v_full) * 8, _parity_v_full);

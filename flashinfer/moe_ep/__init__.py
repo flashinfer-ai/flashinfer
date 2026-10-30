@@ -88,6 +88,9 @@ from .backends.mega.kernel.sm100.mxfp8_mxfp8_bf16_cutedsl import (
     Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig,
     preprocess_mega_weights as preprocess_mxfp8_cutedsl_mega_weights,
 )
+from .backends.mega.kernel.sm100.mxfp8_mxfp4_bf16_cutedsl import (
+    Sm100_Mxfp8_Mxfp4_Bf16_Cutedsl_MegaMoeConfig,
+)
 from .backends.mega.kernel.sm100.bf16_mxfp8_bf16_cutedsl import (
     Sm100_Bf16_Mxfp8_Bf16_Cutedsl_MegaMoeConfig,
 )
@@ -323,6 +326,7 @@ __all__ = [
     "UnquantizedMoEWeights",
     "Sm100_Bf16_Mxfp8_Bf16_Cutedsl_MegaMoeConfig",
     "Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig",
+    "Sm100_Mxfp8_Mxfp4_Bf16_Cutedsl_MegaMoeConfig",
     "NCCLEPConfig",
     "NVLinkOneSidedAlltoAll",
     "NVLinkOneSidedConfig",

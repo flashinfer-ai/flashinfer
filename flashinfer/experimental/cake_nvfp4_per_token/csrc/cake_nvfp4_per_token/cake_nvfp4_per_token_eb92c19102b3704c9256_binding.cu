@@ -61,7 +61,6 @@ void Run(TensorView a_x, TensorView a_out_fp4, TensorView a_out_sf, TensorView a
   TVM_FFI_CHECK(a_x_row_stride >= -2147483648LL && a_x_row_stride <= 2147483647LL, ValueError)
       << KERNEL_NAME << ": 'x_row_stride' = " << a_x_row_stride
       << " is outside the i32 range [-2147483648, 2147483647]";
-  check_contiguous(a_x, "x");
   check_contiguous(a_out_fp4, "out_fp4");
   check_same_device(a_out_fp4, a_x, "out_fp4", "x");
   check_contiguous(a_out_sf, "out_sf");

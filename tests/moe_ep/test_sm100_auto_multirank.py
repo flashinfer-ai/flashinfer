@@ -33,6 +33,8 @@ def config(kind, variant, **options):
         return moe_ep.Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
             kernel_name="sm100_nvfp4_nvfp4_bf16_cutedsl_next", **common
         )
+    if kind == "mxfp4_mxfp8":
+        return moe_ep.Sm100_Mxfp8_Mxfp4_Bf16_Cutedsl_MegaMoeConfig(**common)
     return moe_ep.Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig(
         kind=kind,
         kernel_variant=variant,
@@ -156,6 +158,7 @@ def test_phase_interleave_fc1_readiness(blackwell_bootstrap, monkeypatch):
         ("nvfp4", "inference", "native"),
         ("mxfp8_e4m3", "inference", "native"),
         ("mxfp8_e5m2", "inference", "native"),
+        ("mxfp4_mxfp8", "inference", "native"),
         ("mxfp8_e4m3", "genphase", "native"),
         ("nvfp4", "inference", "eager-cold"),
         ("nvfp4", "inference", "auto-cold"),

@@ -240,6 +240,23 @@ def test_omitted_backend_takes_the_auto_route(monkeypatch):
     assert [tag for tag, _, _ in calls] == [want]
 
 
+@pytest.mark.parametrize("kv_dtype", [torch.float8_e4m3fn, torch.bfloat16])
+def test_omitted_backend_sends_fp8_and_bf16_to_the_existing_implementation(
+    monkeypatch, kv_dtype
+):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA device required")
+    calls = _patch_both_backends(monkeypatch)
+    t = torch.empty(0, device="cuda")
+    kv = t.to(kv_dtype)
+    with _quiet():
+        result = public_api.qsa_sparse_paged_attention(
+            t, kv, kv, t, t, t, False, output_gate=t
+        )
+    assert result == "existing"
+    assert [tag for tag, _, _ in calls] == ["existing"]
+
+
 def test_omitted_backend_on_a_cpu_tensor_takes_the_existing_implementation(monkeypatch):
     calls = _patch_both_backends(monkeypatch)
     t = torch.empty(0)

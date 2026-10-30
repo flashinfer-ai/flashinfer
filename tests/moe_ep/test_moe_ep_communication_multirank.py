@@ -293,23 +293,42 @@ def test_split_layer_cuda_graph_replays_new_inputs(backend):
         layer.destroy()
 
 
-def _fused_moe_split_config(comm, quant_pair, *, rank, world_size, num_experts):
+def _split_candidate(quant_pair, prims_ts):
+    from flashinfer.fused_moe.api import (
+        CuteDslConfig,
+        PrimsTsConfig,
+        QuantFormat,
+        TrtllmFp4Config,
+        TrtllmFp8BlockConfig,
+    )
+
+    weight = QuantFormat[quant_pair[0]]
+    if prims_ts:
+        return PrimsTsConfig()
+    if weight is QuantFormat.NVFP4:
+        return TrtllmFp4Config()
+    if weight is QuantFormat.DeepSeekFp8:
+        return TrtllmFp8BlockConfig()
+    return CuteDslConfig()
+
+
+def _fused_moe_split_config(
+    comm, quant_pair, *, rank, world_size, num_experts, prims_ts=False
+):
     from flashinfer.fused_moe.api import (
         BackendOptions,
-        CuteDslConfig,
         ExecutionConfig,
         ExpertConfig,
         MoEConfig,
         QuantConfig,
         QuantFormat,
         RoutingConfig,
-        TrtllmFp4Config,
     )
     from flashinfer.moe_ep import FusedMoeKernelConfig, SplitConfig
 
     weight, activation = (QuantFormat[name] for name in quant_pair)
     local_num_experts = num_experts // world_size
-    candidate = TrtllmFp4Config() if weight is QuantFormat.NVFP4 else CuteDslConfig()
+    candidate = _split_candidate(quant_pair, prims_ts)
     moe_config = MoEConfig(
         routing=RoutingConfig(num_experts=num_experts, top_k=2),
         quant=QuantConfig(weight=weight, activation=activation),
@@ -325,15 +344,35 @@ def _fused_moe_split_config(comm, quant_pair, *, rank, world_size, num_experts):
 
 
 @pytest.mark.gpu_2
-@pytest.mark.parametrize("quant_pair", [("NVFP4", "NVFP4"), ("MXFP4", "MXFP8")])
+@pytest.mark.parametrize(
+    "quant_pair, prims_ts",
+    [
+        (("NVFP4", "NVFP4"), False),
+        (("MXFP4", "MXFP8"), False),
+        (("DeepSeekFp8", "DeepSeekFp8"), False),
+        (("NVFP4", "NVFP4"), True),
+        (("MXFP4", "MXFP8"), True),
+        (("MXFP8", "MXFP8"), True),
+        (("DeepSeekFp8", "DeepSeekFp8"), True),
+    ],
+    ids=[
+        "nvfp4",
+        "mxfp4_mxfp8",
+        "deepseek_fp8",
+        "prims_ts-nvfp4",
+        "prims_ts-mxfp4_mxfp8",
+        "prims_ts-mxfp8",
+        "prims_ts-deepseek_fp8",
+    ],
+)
 @pytest.mark.parametrize("backend", _BACKENDS)
-def test_split_layer_quantizes_tokens_before_dispatch(backend, quant_pair):
+def test_split_layer_quantizes_tokens_before_dispatch(backend, quant_pair, prims_ts):
     """Quantized activations travel over the wire and match receiver-side
     quantization.
 
-    NVFP4 and MXFP8 quantize each token row on its own, so a layer that
-    quantizes before dispatch must produce the output of one that dispatches
-    BF16 rows and quantizes them on the receiving rank.
+    NVFP4, MXFP8 and DeepSeek FP8 quantize each token row on its own, so a
+    layer that quantizes before dispatch must produce the output of one that
+    dispatches BF16 rows and quantizes them on the receiving rank.
     """
     import torch
     import torch.distributed as dist
@@ -349,6 +388,15 @@ def test_split_layer_quantizes_tokens_before_dispatch(backend, quant_pair):
         MoEWeightPack,
     )
 
+    if prims_ts:
+        from flashinfer.prims_ts.utils import is_prims_ts_available
+
+        if not is_prims_ts_available():
+            pytest.skip("Prims-TS needs nvidia-cutlass-dsl with cutlass.experimental")
+    candidate = _split_candidate(quant_pair, prims_ts)
+    major, minor = torch.cuda.get_device_capability()
+    if not candidate.supported(major * 10 + minor):
+        pytest.skip(f"{type(candidate).__name__} does not support SM{major}{minor}")
     rank, world_size = _init_dist()
     _backend_config(backend)
     num_tokens, hidden, intermediate = 16, 1024, 512
@@ -382,6 +430,7 @@ def test_split_layer_quantizes_tokens_before_dispatch(backend, quant_pair):
                 rank=rank,
                 world_size=world_size,
                 num_experts=num_experts,
+                prims_ts=prims_ts,
             ),
         )
 
