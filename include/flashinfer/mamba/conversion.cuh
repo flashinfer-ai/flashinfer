@@ -183,35 +183,44 @@ __device__ __forceinline__ uint32_t philox_randint(int64_t seed, int64_t offset)
 // =============================================================================
 
 // Software stochastic rounding: convert one fp32 value to fp16 using 13 random bits.
-// Adds random noise at the sub-fp16-mantissa position, then truncates.
 // rand13: 13-bit random value in bits [12:0].
+//
+// Rounds |x| to one of the two fp16 values that bracket it — the truncation toward zero `lo` and
+// the next value away from zero `hi` — choosing `hi` with probability (|x| - lo) / (hi - lo), so
+// E[result] == x over the full fp16 range, including the subnormal range |x| < 2^-14.
+//
+// For fp16-normal results (|x| >= 2^-14) this is bit-identical to adding the 13 random bits at the
+// fp32 mantissa positions [12:0] and truncating (a carry into bit 13 rounds up), i.e. the 13 bits
+// are consumed with the same carry convention.  Below 2^-14 the fp16 ulp is fixed (2^-24) and
+// wider than 13 fp32 mantissa bits, so the fraction is computed explicitly instead; the earlier
+// add-and-truncate formulation flushed every |x| < 2^-14 to zero there.
 __device__ __forceinline__ uint16_t cvt_rs_f16_sw(float x, uint32_t rand13) {
   uint32_t bits = __float_as_uint(x);
-  uint32_t sign = bits & 0x80000000u;
+  uint16_t sign16 = static_cast<uint16_t>((bits & 0x80000000u) >> 16);
   uint32_t abs_bits = bits & 0x7FFFFFFFu;
 
-  // fp32 has 23 mantissa bits, fp16 has 10. The 13 LSBs are the remainder.
-  // Add 13-bit random noise at bits [12:0]. Carry into bit 13 → round up.
-  abs_bits += (rand13 & 0x1FFFu);
-
-  // Convert to fp16 by truncation.
-  uint32_t f32_exp = (abs_bits >> 23) & 0xFFu;
-  uint32_t f32_mantissa = abs_bits & 0x7FFFFFu;
-
-  uint16_t f16_bits;
-  if (f32_exp == 0xFF) {
-    f16_bits = (f32_mantissa != 0) ? 0x7E00u : 0x7C00u;  // NaN or Inf
-  } else if (f32_exp > 142) {                            // 127 + 15 = 142 → overflow to Inf
-    f16_bits = 0x7C00u;
-  } else if (f32_exp < 113) {  // 127 - 14 = 113 → underflow to zero
-    f16_bits = 0;
-  } else {
-    uint16_t f16_exp = static_cast<uint16_t>(f32_exp - 112);  // rebias: 127→15
-    uint16_t f16_mantissa = static_cast<uint16_t>(f32_mantissa >> 13);
-    f16_bits = (f16_exp << 10) | f16_mantissa;
+  if (abs_bits >= 0x7F800000u) {  // NaN or Inf
+    return sign16 | static_cast<uint16_t>((abs_bits > 0x7F800000u) ? 0x7E00u : 0x7C00u);
+  }
+  if (abs_bits >= 0x47800000u) {  // |x| >= 65536 = 2^16 → overflow to Inf
+    return sign16 | static_cast<uint16_t>(0x7C00u);
   }
 
-  return static_cast<uint16_t>(sign >> 16) | f16_bits;
+  // Truncate toward zero to fp16; keeps fp16 subnormals.  `rem` is exact.
+  float ax = __uint_as_float(abs_bits);
+  uint16_t lo = __half_as_ushort(__float2half_rz(ax));
+  float lo_f = __half2float(__ushort_as_half(lo));
+  float rem = ax - lo_f;
+
+  if (rem > 0.0f) {
+    uint16_t hi = static_cast<uint16_t>(lo + 1u);  // next fp16 away from zero (0x7BFF + 1 = Inf)
+    float ulp = (hi == 0x7C00u) ? 32.0f : (__half2float(__ushort_as_half(hi)) - lo_f);
+    // Round up with probability rem / ulp; `rem / ulp * 8192` is an exact integer for normal
+    // results.
+    if (static_cast<float>(rand13 & 0x1FFFu) >= 8192.0f - rem / ulp * 8192.0f) lo = hi;
+  }
+
+  return sign16 | lo;
 }
 
 // Forward declaration (defined below, after cvt_rs_f16x2_f32).
@@ -234,7 +243,8 @@ __device__ __forceinline__ __half cvt_rs_f16_f32(float x, uint32_t rand13) {
 
 // Stochastic rounding: convert two fp32 values to packed fp16x2 using random bits.
 // On sm_100a/sm_103a/sm_107a: uses PTX cvt.rs.f16x2.f32 instruction.
-// On other archs: software emulation matching the hardware behavior.
+// On other archs: software emulation (cvt_rs_f16_sw): bit-identical to the hardware for fp16-normal
+// results, and unbiased (E[result] == x) in the fp16 subnormal range.
 //
 // rbits layout (from PTX docs):
 //   bits [28:16] = 13 random bits for PTX operand "a" (→ d[31:16], high half)
