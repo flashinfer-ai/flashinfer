@@ -216,16 +216,26 @@ class Sm100W8A16Fp8GemmKernel:
                 transform_tidx,
             )
         )
-        # The two transform warpgroups split the A blocks of a stage between them.
-        num_transform_blocks = cute.size(tAsA_input, mode=[3])
+        # The two transform warpgroups split a stage's A between them.  The partition
+        # is (copy, M-blocks, K-blocks, blocks, stages); into TMEM the per-thread blocks
+        # sit in mode 3 (the 32x32b store repeats), into smem the cotiled copy puts them
+        # in mode 1 and mode 3 is 1, so split whichever mode the two groups divide.
+        split_mode = 3 if cute.size(tAsA_input, mode=[3]) % 2 == 0 else 1
+        num_transform_blocks = cute.size(tAsA_input, mode=[split_mode])
         assert num_transform_blocks % self.num_transform_warpgroups == 0, (
-            "A blocks must divide evenly across transform warpgroups"
+            "A blocks must divide evenly across transform warpgroups: partitioned A is "
+            f"{tAsA_input.shape} (source {self.transform_a_source}, tile "
+            f"{self.cta_tile_shape_mnk})"
         )
         blocks_per_transform_group = (
             num_transform_blocks // self.num_transform_warpgroups
         )
-        transform_group_tiler = (None, None, None, blocks_per_transform_group, None)
-        transform_group_coord = (None, None, None, (None, transform_group_idx), None)
+        transform_group_tiler = [None] * 5
+        transform_group_tiler[split_mode] = blocks_per_transform_group
+        transform_group_tiler = tuple(transform_group_tiler)
+        transform_group_coord = [None] * 5
+        transform_group_coord[split_mode] = (None, transform_group_idx)
+        transform_group_coord = tuple(transform_group_coord)
         tAsA_input = cute.logical_divide(tAsA_input, transform_group_tiler)[
             transform_group_coord
         ]
@@ -490,6 +500,12 @@ class Sm100W8A16Fp8GemmKernel:
             tile_info_empty_mbar_ptr: cute.struct.MemRange[
                 cutlass.Int64, self.num_tile_info_stage
             ]
+            # The bias of the current tile's weight rows, fp32, double-buffered by tile
+            # parity so the next tile's staging never races the previous tile's reads.
+            bias_tile: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Float32, 2 * self.cta_tile_shape_mnk[0]],
+                16,
+            ]
             tmem_dealloc_mbar: cutlass.Int64
             tmem_holding_buf: cutlass.Int32
 
@@ -667,6 +683,9 @@ class Sm100W8A16Fp8GemmKernel:
                 byte_alignment=self.smem_buffer_align_bytes,
                 swizzle=a_smem_layout_transform.inner,
             )
+        sBias = storage.bias_tile.get_tensor(
+            cute.make_layout((self.cta_tile_shape_mnk[0], 2))
+        )
         sTile_info = storage.tile_info.get_tensor(
             cute.make_layout((4, self.num_tile_info_stage), stride=(1, 4))
         )
@@ -1195,14 +1214,11 @@ class Sm100W8A16Fp8GemmKernel:
             )
             weight_rows = cutlass.Int32(cute.size(tensor_c.shape[0]))
             num_prev_subtiles = cutlass.Int32(0)
-            # Every tile here has 128 rows per CTA, so the TMEM load is the 32x32b
-            # shape: one epilogue thread owns one output row for the whole tile, and
-            # the bias of that row is a single register.
             assert self.cta_tile_shape_mnk[0] == 128, (
-                "the per-thread bias register assumes the 32x32b TMEM load (128 rows)"
+                "the bias staging uses the 128 epilogue threads, one per CTA-tile row"
             )
-            thread_row = m_thr_offset[(0, 0, 0, 0)][0]
             dbg_tiles = cutlass.Int32(0)
+            epi_tile_count = cutlass.Int32(0)
             while work_tile.is_valid_tile:
                 m_base = work_tile.cta_coord_m * self.cta_tile_shape_mnk[0]
                 if cutlass.const_expr(self.debug):
@@ -1261,11 +1277,17 @@ class Sm100W8A16Fp8GemmKernel:
                 # Scale and bias are read after the accumulator wait so that under PDL
                 # they are ordered behind the preceding grid too.
                 scale_val = cutlass.Float32(scale[0])
-                bias_val = cutlass.Float32(0.0)
+                bias_buf = epi_tile_count % 2
                 if cutlass.const_expr(self.has_bias):
-                    bias_row = m_base + thread_row
+                    # One fp32 bias per weight row of this tile, staged by the 128
+                    # epilogue threads (rows past the weight read 0); the elements a
+                    # thread holds span several rows, so each is indexed by its row.
+                    bias_row = m_base + epi_tidx
+                    bias_val = cutlass.Float32(0.0)
                     if bias_row < weight_rows:
                         bias_val = cutlass.Float32(bias[bias_row])
+                    sBias[(epi_tidx, bias_buf)] = bias_val
+                    self.epilog_sync_barrier.arrive_and_wait()
                 subtile_cnt = cute.size(tTR_tAcc.shape, mode=[3])
                 for subtile_idx in cutlass.range(subtile_cnt):
                     cute.copy(
@@ -1279,9 +1301,14 @@ class Sm100W8A16Fp8GemmKernel:
                             acc_pipeline.consumer_release(acc_consumer_state)
                         acc_consumer_state.advance()
                     m_thr_slice = m_thr_offset[(None, None, None, subtile_idx)]
-                    # scale * acc (+ bias[row]) in fp32, on the whole fragment.
+                    # scale * acc (+ bias[row]) in fp32: vectorized without the bias,
+                    # per element (the row comes from the identity partition) with it.
                     if cutlass.const_expr(self.has_bias):
-                        tTR_rAcc.store(scale_val * tTR_rAcc.load() + bias_val)
+                        for i in cutlass.range(cute.size(tTR_rAcc), unroll_full=True):
+                            tTR_rAcc[i] = (
+                                scale_val * tTR_rAcc[i]
+                                + sBias[(m_thr_slice[(i)][0], bias_buf)]
+                            )
                     else:
                         tTR_rAcc.store(scale_val * tTR_rAcc.load())
 
@@ -1320,6 +1347,7 @@ class Sm100W8A16Fp8GemmKernel:
                             cute.flatten(tTR_gC[(None, None, None, subtile_idx)]),
                             pred=cute.flatten(tCpC),
                         )
+                epi_tile_count += 1
                 if cutlass.const_expr(self.debug):
                     dbg_tiles += 1
                     if epi_tidx == 0:
@@ -1404,6 +1432,7 @@ class Sm100W8A16Fp8GemmKernel:
             cute.size_in_bytes(cute.Int32, cute.make_layout((4, num_tile_info_stage)))
             + bytes_per_pipeline_stage * num_tile_info_stage
         )
+        bias_bytes = 2 * 4 * cta_tile_shape_mnk[0]
         c_stage_count = 2
         c_smem_layout_staged_one = sm100_utils.make_smem_layout_epi(
             c_dtype, c_layout, epi_tile, 1
@@ -1416,6 +1445,7 @@ class Sm100W8A16Fp8GemmKernel:
             bytes_per_pipeline_stage * accumulator_stage_count
             + c_bytes
             + tile_info_bytes
+            + bias_bytes
         )
         num_tmem_acc_cols = cute.round_up(
             accumulator_stage_count * num_tmem_acc_col_per_stage, 4
