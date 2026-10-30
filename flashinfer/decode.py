@@ -3182,13 +3182,18 @@ class BatchDecodeWithPagedKVCacheWrapper:
             XQA MTP is selected only for the documented SM90 graph-mode
             ``auto`` shapes; other plans retain the existing route.
         paged_kv_cache : Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
-            The paged KV cache as either a ``(k_cache, v_cache)`` tuple of
-            4-D tensors or a single packed 5-D tensor. Tuple entries have shape
-            ``[max_num_pages, page_size, num_kv_heads, head_dim]`` for ``NHD``
-            and ``[max_num_pages, num_kv_heads, page_size, head_dim]`` for
-            ``HND``. The packed form inserts a size-2 K/V axis after
-            ``max_num_pages``; ``paged_kv_cache[:, 0]`` is the key cache and
-            ``paged_kv_cache[:, 1]`` is the value cache.
+            The paged KV-Cache stored as a tuple of tensors or a single tensor: a
+            tuple ``(k_cache, v_cache)`` of 4-D tensors, each with shape:
+            ``[max_num_pages, page_size, num_kv_heads, head_dim]`` if
+            :attr:`kv_layout` is ``NHD``, and
+            ``[max_num_pages, num_kv_heads, page_size, head_dim]`` if
+            :attr:`kv_layout` is ``HND``; or a single 5-D tensor with shape:
+            ``[max_num_pages, 2, page_size, num_kv_heads, head_dim]`` if
+            :attr:`kv_layout` is ``NHD``, and
+            ``[max_num_pages, 2, num_kv_heads, page_size, head_dim]`` if
+            :attr:`kv_layout` is ``HND``. Where ``paged_kv_cache[:, 0]`` is the
+            key-cache and
+            ``paged_kv_cache[:, 1]`` is the value-cache.
         *args
             Additional arguments for the custom kernel.
         q_scale : Optional[float]
@@ -3228,14 +3233,19 @@ class BatchDecodeWithPagedKVCacheWrapper:
             Setting the threshold to a higher value generally increases kernel performance at the cost of accuracy degradation.
             The actual threshold value equals the provided threshold_scale_factor divided by the context length.
         kv_cache_sf : Optional[Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]]
-            Per-block scale factors for NVFP4 KV cache, as either a
-            ``(k_scales, v_scales)`` tuple of 4-D tensors or a single packed
-            5-D tensor. Tuple entries have shape
-            ``[num_pages, page_size, num_kv_heads, head_dim // 16]`` for
-            ``NHD`` and ``[num_pages, num_kv_heads, page_size, head_dim // 16]``
-            for ``HND``. The packed form inserts a size-2 K/V axis after
-            ``num_pages``. Both forms use ``torch.float8_e4m3fn`` and currently
-            support the ``fa2`` and ``trtllm-gen`` backends.
+            Per-block scale factors for NVFP4 KV cache. Accepts the same formats
+            as ``paged_kv_cache``: a tuple ``(k_scales, v_scales)`` of 4-D
+            tensors, each with shape:
+            ``[num_pages, page_size, num_kv_heads, head_dim // 16]`` if
+            :attr:`kv_layout` is ``NHD``, and
+            ``[num_pages, num_kv_heads, page_size, head_dim // 16]`` if
+            :attr:`kv_layout` is ``HND``; or a single 5-D tensor with shape:
+            ``[num_pages, 2, page_size, num_kv_heads, head_dim // 16]`` if
+            :attr:`kv_layout` is ``NHD``, and
+            ``[num_pages, 2, num_kv_heads, page_size, head_dim // 16]`` if
+            :attr:`kv_layout` is ``HND``, where dim 1 holds k (index 0) and v
+            (index 1) scales. Both tensors have dtype ``torch.float8_e4m3fn``.
+            Currently, NVFP4 KV supports `fa2` and `trtllm-gen` backend.
             With ``use_token_head_sf=True`` (plan time), ``kv_cache_sf`` must be a
             ``(k_sf, v_sf)`` tuple of ``float32`` tensors mirroring the KV layout
             minus ``head_dim``: ``[num_pages, page_size, num_kv_heads]`` if
@@ -3245,9 +3255,11 @@ class BatchDecodeWithPagedKVCacheWrapper:
         Returns
         -------
         Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
-            The attention output with shape
-            ``[batch_size, num_qo_heads, head_dim]`` when :attr:`return_lse` is
-            ``False``; otherwise ``(output, lse)``, where ``lse`` has shape
+            If :attr:`return_lse` is ``False``, the attention output, shape:
+            ``[batch_size, num_qo_heads, head_dim]``. If :attr:`return_lse` is
+            ``True``, a tuple of two tensors: attention output, shape:
+            ``[batch_size, num_qo_heads, head_dim]``; and logsumexp of attention
+            scores, shape:
             ``[batch_size, num_qo_heads]``.
         """
         if enable_pdl is None:
