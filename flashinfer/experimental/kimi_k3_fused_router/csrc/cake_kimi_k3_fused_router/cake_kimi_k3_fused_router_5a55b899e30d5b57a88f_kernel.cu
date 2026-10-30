@@ -543,16 +543,16 @@ kernel_cake_kimi_k3_fused_router_5a55b899e30d5b57a88f(float* __restrict__ logits
             unsigned int p_peers[16];
             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                 : "=r"(*reinterpret_cast<uint32_t*>(&p_peers[0])), "=r"(*reinterpret_cast<uint32_t*>(&p_peers[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&p_peers[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&p_peers[(0) + 3]))
-                : "r"(w_comp_addr + (unsigned int)((comp_base + 0 + 0) * 8)));
+                : "r"(w_comp_addr + (unsigned int)(comp_base * 8)));
             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                 : "=r"(*reinterpret_cast<uint32_t*>(&p_peers[4])), "=r"(*reinterpret_cast<uint32_t*>(&p_peers[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&p_peers[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&p_peers[(4) + 3]))
-                : "r"(w_comp_addr + (unsigned int)((comp_base + 0 + 2) * 8)));
+                : "r"(w_comp_addr + (unsigned int)((comp_base + 2) * 8)));
             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                 : "=r"(*reinterpret_cast<uint32_t*>(&p_peers[8])), "=r"(*reinterpret_cast<uint32_t*>(&p_peers[(8) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&p_peers[(8) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&p_peers[(8) + 3]))
-                : "r"(w_comp_addr + (unsigned int)((comp_base + 0 + 4) * 8)));
+                : "r"(w_comp_addr + (unsigned int)((comp_base + 4) * 8)));
             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                 : "=r"(*reinterpret_cast<uint32_t*>(&p_peers[12])), "=r"(*reinterpret_cast<uint32_t*>(&p_peers[(12) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&p_peers[(12) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&p_peers[(12) + 3]))
-                : "r"(w_comp_addr + (unsigned int)((comp_base + 0 + 6) * 8)));
+                : "r"(w_comp_addr + (unsigned int)((comp_base + 6) * 8)));
             p_ra += ((p_comp < ((unsigned long long)p_peers[1] << 32 | (unsigned long long)p_peers[0])) ? 1 : 0);
             p_rb += ((p_comp < ((unsigned long long)p_peers[3] << 32 | (unsigned long long)p_peers[2])) ? 1 : 0);
             p_rc += ((p_comp < ((unsigned long long)p_peers[5] << 32 | (unsigned long long)p_peers[4])) ? 1 : 0);
@@ -563,7 +563,7 @@ kernel_cake_kimi_k3_fused_router_5a55b899e30d5b57a88f(float* __restrict__ logits
             p_rd += ((p_comp < ((unsigned long long)p_peers[15] << 32 | (unsigned long long)p_peers[14])) ? 1 : 0);
             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                 : "=r"(*reinterpret_cast<uint32_t*>(&p_peers[0])), "=r"(*reinterpret_cast<uint32_t*>(&p_peers[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&p_peers[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&p_peers[(0) + 3]))
-                : "r"(w_comp_addr + (unsigned int)((comp_base + 8 + 0) * 8)));
+                : "r"(w_comp_addr + (unsigned int)((comp_base + 8) * 8)));
             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                 : "=r"(*reinterpret_cast<uint32_t*>(&p_peers[4])), "=r"(*reinterpret_cast<uint32_t*>(&p_peers[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&p_peers[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&p_peers[(4) + 3]))
                 : "r"(w_comp_addr + (unsigned int)((comp_base + 8 + 2) * 8)));
@@ -584,7 +584,7 @@ kernel_cake_kimi_k3_fused_router_5a55b899e30d5b57a88f(float* __restrict__ logits
             if (p_total > 16) {
                 asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                     : "=r"(*reinterpret_cast<uint32_t*>(&p_peers[0])), "=r"(*reinterpret_cast<uint32_t*>(&p_peers[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&p_peers[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&p_peers[(0) + 3]))
-                    : "r"(w_comp_addr + (unsigned int)((comp_base + 16 + 0) * 8)));
+                    : "r"(w_comp_addr + (unsigned int)((comp_base + 16) * 8)));
                 asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                     : "=r"(*reinterpret_cast<uint32_t*>(&p_peers[4])), "=r"(*reinterpret_cast<uint32_t*>(&p_peers[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&p_peers[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&p_peers[(4) + 3]))
                     : "r"(w_comp_addr + (unsigned int)((comp_base + 16 + 2) * 8)));
@@ -606,7 +606,7 @@ kernel_cake_kimi_k3_fused_router_5a55b899e30d5b57a88f(float* __restrict__ logits
             if (p_total > 24) {
                 asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                     : "=r"(*reinterpret_cast<uint32_t*>(&p_peers[0])), "=r"(*reinterpret_cast<uint32_t*>(&p_peers[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&p_peers[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&p_peers[(0) + 3]))
-                    : "r"(w_comp_addr + (unsigned int)((comp_base + 24 + 0) * 8)));
+                    : "r"(w_comp_addr + (unsigned int)((comp_base + 24) * 8)));
                 asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                     : "=r"(*reinterpret_cast<uint32_t*>(&p_peers[4])), "=r"(*reinterpret_cast<uint32_t*>(&p_peers[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&p_peers[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&p_peers[(4) + 3]))
                     : "r"(w_comp_addr + (unsigned int)((comp_base + 24 + 2) * 8)));
@@ -643,7 +643,7 @@ kernel_cake_kimi_k3_fused_router_5a55b899e30d5b57a88f(float* __restrict__ logits
                 unsigned int p_wins[16];
                 asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                     : "=r"(*reinterpret_cast<uint32_t*>(&p_wins[0])), "=r"(*reinterpret_cast<uint32_t*>(&p_wins[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&p_wins[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&p_wins[(0) + 3]))
-                    : "r"(w_hist_addr + (unsigned int)((cand_base + 32 + 0) * 4)));
+                    : "r"(w_hist_addr + (unsigned int)((cand_base + 32) * 4)));
                 asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                     : "=r"(*reinterpret_cast<uint32_t*>(&p_wins[4])), "=r"(*reinterpret_cast<uint32_t*>(&p_wins[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&p_wins[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&p_wins[(4) + 3]))
                     : "r"(w_hist_addr + (unsigned int)((cand_base + 32 + 4) * 4)));
@@ -735,16 +735,16 @@ kernel_cake_kimi_k3_fused_router_5a55b899e30d5b57a88f(float* __restrict__ logits
                 unsigned int q_peers[16];
                 asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                     : "=r"(*reinterpret_cast<uint32_t*>(&q_peers[0])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(0) + 3]))
-                    : "r"(w_comp_addr + (unsigned int)((q_comp_base + 0 + 0) * 8)));
+                    : "r"(w_comp_addr + (unsigned int)(q_comp_base * 8)));
                 asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                     : "=r"(*reinterpret_cast<uint32_t*>(&q_peers[4])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(4) + 3]))
-                    : "r"(w_comp_addr + (unsigned int)((q_comp_base + 0 + 2) * 8)));
+                    : "r"(w_comp_addr + (unsigned int)((q_comp_base + 2) * 8)));
                 asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                     : "=r"(*reinterpret_cast<uint32_t*>(&q_peers[8])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(8) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(8) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(8) + 3]))
-                    : "r"(w_comp_addr + (unsigned int)((q_comp_base + 0 + 4) * 8)));
+                    : "r"(w_comp_addr + (unsigned int)((q_comp_base + 4) * 8)));
                 asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                     : "=r"(*reinterpret_cast<uint32_t*>(&q_peers[12])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(12) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(12) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(12) + 3]))
-                    : "r"(w_comp_addr + (unsigned int)((q_comp_base + 0 + 6) * 8)));
+                    : "r"(w_comp_addr + (unsigned int)((q_comp_base + 6) * 8)));
                 q_lo_a += ((((unsigned long long)q_peers[1] << 32 | (unsigned long long)q_peers[0]) > q_comp_lo) ? 1 : 0);
                 q_lo_b += ((((unsigned long long)q_peers[3] << 32 | (unsigned long long)q_peers[2]) > q_comp_lo) ? 1 : 0);
                 q_hi_a += ((((unsigned long long)q_peers[1] << 32 | (unsigned long long)q_peers[0]) > q_comp_hi) ? 1 : 0);
@@ -763,7 +763,7 @@ kernel_cake_kimi_k3_fused_router_5a55b899e30d5b57a88f(float* __restrict__ logits
                 q_hi_b += ((((unsigned long long)q_peers[15] << 32 | (unsigned long long)q_peers[14]) > q_comp_hi) ? 1 : 0);
                 asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                     : "=r"(*reinterpret_cast<uint32_t*>(&q_peers[0])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(0) + 3]))
-                    : "r"(w_comp_addr + (unsigned int)((q_comp_base + 8 + 0) * 8)));
+                    : "r"(w_comp_addr + (unsigned int)((q_comp_base + 8) * 8)));
                 asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                     : "=r"(*reinterpret_cast<uint32_t*>(&q_peers[4])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(4) + 3]))
                     : "r"(w_comp_addr + (unsigned int)((q_comp_base + 8 + 2) * 8)));
@@ -791,7 +791,7 @@ kernel_cake_kimi_k3_fused_router_5a55b899e30d5b57a88f(float* __restrict__ logits
                 q_hi_b += ((((unsigned long long)q_peers[15] << 32 | (unsigned long long)q_peers[14]) > q_comp_hi) ? 1 : 0);
                 asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                     : "=r"(*reinterpret_cast<uint32_t*>(&q_peers[0])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(0) + 3]))
-                    : "r"(w_comp_addr + (unsigned int)((q_comp_base + 16 + 0) * 8)));
+                    : "r"(w_comp_addr + (unsigned int)((q_comp_base + 16) * 8)));
                 asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                     : "=r"(*reinterpret_cast<uint32_t*>(&q_peers[4])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(4) + 3]))
                     : "r"(w_comp_addr + (unsigned int)((q_comp_base + 16 + 2) * 8)));
@@ -819,7 +819,7 @@ kernel_cake_kimi_k3_fused_router_5a55b899e30d5b57a88f(float* __restrict__ logits
                 q_hi_b += ((((unsigned long long)q_peers[15] << 32 | (unsigned long long)q_peers[14]) > q_comp_hi) ? 1 : 0);
                 asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                     : "=r"(*reinterpret_cast<uint32_t*>(&q_peers[0])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(0) + 3]))
-                    : "r"(w_comp_addr + (unsigned int)((q_comp_base + 24 + 0) * 8)));
+                    : "r"(w_comp_addr + (unsigned int)((q_comp_base + 24) * 8)));
                 asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                     : "=r"(*reinterpret_cast<uint32_t*>(&q_peers[4])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(4) + 3]))
                     : "r"(w_comp_addr + (unsigned int)((q_comp_base + 24 + 2) * 8)));
@@ -848,7 +848,7 @@ kernel_cake_kimi_k3_fused_router_5a55b899e30d5b57a88f(float* __restrict__ logits
                 if (p_total > 32) {
                     asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&q_peers[0])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(0) + 3]))
-                        : "r"(w_comp_addr + (unsigned int)((q_comp_base + 32 + 0) * 8)));
+                        : "r"(w_comp_addr + (unsigned int)((q_comp_base + 32) * 8)));
                     asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&q_peers[4])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(4) + 3]))
                         : "r"(w_comp_addr + (unsigned int)((q_comp_base + 32 + 2) * 8)));
@@ -878,7 +878,7 @@ kernel_cake_kimi_k3_fused_router_5a55b899e30d5b57a88f(float* __restrict__ logits
                 if (p_total > 40) {
                     asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&q_peers[0])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(0) + 3]))
-                        : "r"(w_comp_addr + (unsigned int)((q_comp_base + 40 + 0) * 8)));
+                        : "r"(w_comp_addr + (unsigned int)((q_comp_base + 40) * 8)));
                     asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&q_peers[4])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(4) + 3]))
                         : "r"(w_comp_addr + (unsigned int)((q_comp_base + 40 + 2) * 8)));
@@ -908,7 +908,7 @@ kernel_cake_kimi_k3_fused_router_5a55b899e30d5b57a88f(float* __restrict__ logits
                 if (p_total > 48) {
                     asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&q_peers[0])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(0) + 3]))
-                        : "r"(w_comp_addr + (unsigned int)((q_comp_base + 48 + 0) * 8)));
+                        : "r"(w_comp_addr + (unsigned int)((q_comp_base + 48) * 8)));
                     asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&q_peers[4])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(4) + 3]))
                         : "r"(w_comp_addr + (unsigned int)((q_comp_base + 48 + 2) * 8)));
@@ -938,7 +938,7 @@ kernel_cake_kimi_k3_fused_router_5a55b899e30d5b57a88f(float* __restrict__ logits
                 if (p_total > 56) {
                     asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&q_peers[0])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(0) + 3]))
-                        : "r"(w_comp_addr + (unsigned int)((q_comp_base + 56 + 0) * 8)));
+                        : "r"(w_comp_addr + (unsigned int)((q_comp_base + 56) * 8)));
                     asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&q_peers[4])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(4) + 3]))
                         : "r"(w_comp_addr + (unsigned int)((q_comp_base + 56 + 2) * 8)));
@@ -988,7 +988,7 @@ kernel_cake_kimi_k3_fused_router_5a55b899e30d5b57a88f(float* __restrict__ logits
                     unsigned int q_wins[16];
                     asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&q_wins[0])), "=r"(*reinterpret_cast<uint32_t*>(&q_wins[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&q_wins[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&q_wins[(0) + 3]))
-                        : "r"(w_hist_addr + (unsigned int)((cand_base + 32 + 0) * 4)));
+                        : "r"(w_hist_addr + (unsigned int)((cand_base + 32) * 4)));
                     asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&q_wins[4])), "=r"(*reinterpret_cast<uint32_t*>(&q_wins[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&q_wins[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&q_wins[(4) + 3]))
                         : "r"(w_hist_addr + (unsigned int)((cand_base + 32 + 4) * 4)));
@@ -1321,9 +1321,9 @@ kernel_cake_kimi_k3_fused_router_5a55b899e30d5b57a88f(float* __restrict__ logits
             int hit_count = (int)(unsigned int)__popc(hit_mask);
             int stage_before = 0;
             int stage_total = 0;
-            unsigned int stage_ballot_4_0 = __ballot_sync(0xFFFFFFFF, (hit_count >> 0 & 1) != 0);
-            stage_before += (int)(unsigned int)__popc(stage_ballot_4_0 & lanemask_lt) << 0;
-            stage_total += (int)(unsigned int)__popc(stage_ballot_4_0) << 0;
+            unsigned int stage_ballot_4_0 = __ballot_sync(0xFFFFFFFF, (hit_count & 1) != 0);
+            stage_before += (int)(unsigned int)__popc(stage_ballot_4_0 & lanemask_lt);
+            stage_total += (int)(unsigned int)__popc(stage_ballot_4_0);
             unsigned int stage_ballot_4_1 = __ballot_sync(0xFFFFFFFF, (hit_count >> 1 & 1) != 0);
             stage_before += (int)(unsigned int)__popc(stage_ballot_4_1 & lanemask_lt) << 1;
             stage_total += (int)(unsigned int)__popc(stage_ballot_4_1) << 1;
@@ -1421,8 +1421,8 @@ kernel_cake_kimi_k3_fused_router_5a55b899e30d5b57a88f(float* __restrict__ logits
             }
             int slot_count = (int)(unsigned int)__popc(slot_bits);
             int slot_before = 0;
-            unsigned int slot_ballot_5_0 = __ballot_sync(0xFFFFFFFF, (slot_count >> 0 & 1) != 0);
-            slot_before += (int)(unsigned int)__popc(slot_ballot_5_0 & lanemask_lt) << 0;
+            unsigned int slot_ballot_5_0 = __ballot_sync(0xFFFFFFFF, (slot_count & 1) != 0);
+            slot_before += (int)(unsigned int)__popc(slot_ballot_5_0 & lanemask_lt);
             unsigned int slot_ballot_5_1 = __ballot_sync(0xFFFFFFFF, (slot_count >> 1 & 1) != 0);
             slot_before += (int)(unsigned int)__popc(slot_ballot_5_1 & lanemask_lt) << 1;
             unsigned int slot_ballot_5_2 = __ballot_sync(0xFFFFFFFF, (slot_count >> 2 & 1) != 0);
