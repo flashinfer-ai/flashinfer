@@ -178,6 +178,18 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
                 "use_2cta_instrs=False; "
                 f"got mma_tiler_mnk={mma_tiler_mnk}, use_2cta_instrs={use_2cta_instrs}."
             )
+        if n in (72, 80) and m != 256:
+            raise ValueError(
+                "Sm90SwapABSwigluFp8Fc12Kernel token tiles N72/N80 require M=256; "
+                f"got mma_tiler_mnk={mma_tiler_mnk}."
+            )
+        if sf_padding_block % n != 0:
+            # The activation-SF TMA addresses token tile t of an expert as
+            # (expert SF base + t * N) // N, so every SF base must divide by N.
+            raise ValueError(
+                f"sf_padding_block={sf_padding_block} must be a multiple of the "
+                f"token tile N={n}."
+            )
 
         # Store ab_dtype so workspace-size helpers can use it without tensors.
         self.ab_dtype = ab_dtype

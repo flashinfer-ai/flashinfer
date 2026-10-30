@@ -532,8 +532,8 @@ class TokenInPullTokenBackPush:
         # (a deep queue lengthens per-request RTT and fights the GEMM for
         # L2/issue slots).  Deeper per-warp pipelining (donating idle
         # warps' smem slots as extra in-flight stages) was measured at
-        # -0.8%..+0.1% net in those sweeps; it pays only for some packed-FP4
-        # shapes (``pull_batch``; H2560/I640/E512/EP2 defaults keep 2-3 rows).
+        # -0.8%..+0.1% net there; it pays for some packed-FP4 shapes instead
+        # (``pull_batch``: the H2560/I640/E512/EP2 defaults keep 2-3 rows).
         if active_dispatch_warps not in (1, 2, self.num_dispatch_warps):
             raise ValueError(
                 "active_dispatch_warps must be 1, 2, or "
@@ -569,8 +569,9 @@ class TokenInPullTokenBackPush:
         # Rows kept in flight per active dispatch warp.  The serial pull waits
         # one NVLink round trip per row; the non-compact pull buffer has
         # num_dispatch_warps // active_dispatch_warps slots per active warp, so
-        # a warp can overlap that many rows (dispatch-side token-back / dedup
-        # paths keep the serial loop).
+        # a warp can overlap that many rows (dispatch-side token-back, SF
+        # token-back of a quantized combine, dedup and grouped token-back keep
+        # the serial loop).
         max_pull_batch = 1
         if not (self.compact_pull_buffer or self.enable_token_back
                 or self.dedup_dispatch or self.grouped_token_back):
@@ -579,7 +580,8 @@ class TokenInPullTokenBackPush:
             raise ValueError(
                 f"pull_batch={pull_batch} needs that many free pull-buffer slots per "
                 f"active dispatch warp; this layout has {max_pull_batch} (requires "
-                "compact_pull_buffer=False and no dispatch-side token-back/dedup)"
+                "compact_pull_buffer=False, a BF16 combine and no dispatch-side "
+                "token-back, dedup or grouped token-back)"
             )
         self._pull_batch = int(pull_batch)
         # Rotation: pass k takes row k*G + (g + k) % G instead of k*G + g, so a
@@ -1675,7 +1677,9 @@ class TokenInPullTokenBackPush:
 
         Same token -> (expert, rank, row) mapping as the serial pull loop, but
         the per-(rank, expert) receive counts come from registers preloaded
-        once per launch, so resolving a token issues no memory access.
+        once per launch, so resolving a token issues no memory access. It is
+        kept apart from the serial loop's inline mapping so that the serial
+        path (FP8, BF16 and every ``pull_batch=1`` tactic) compiles as on main.
         """
         NUM_EXPERTS_PER_LANE: cutlass.Constexpr[int] = (
             self.num_experts_per_rank + 31
@@ -2782,20 +2786,24 @@ class TokenInPullTokenBackPush:
             _iket.range_pop()
             _iket.range_push("Dispatch_Pull")
 
+        # Arguments both pull loops take, in their parameter order.
+        pull_args = (
+            token_comm_storage,
+            token_comm_args.input_token_buffer,
+            token_comm_args.input_sf_buffer,
+            token_comm_args.input_topk_weights_buffer,
+            token_comm_args.src_token_topk_idx,
+            token_comm_args.expert_recv_count,
+            token_comm_args.expert_recv_count_sum,
+            token_comm_args.fc1_input_token_buffer,
+            token_comm_args.fc1_input_sf_buffer,
+            token_comm_args.fc1_input_topk_weights_buffer,
+            token_comm_args.fc1_ready_counter,
+            token_comm_args.token_src_metadata,
+        )
         if cutlass.const_expr(self._pull_batch > 1):
             phase_bit, stored_num_tokens_per_expert = self._dispatch_pull_batched(
-                token_comm_storage,
-                token_comm_args.input_token_buffer,
-                token_comm_args.input_sf_buffer,
-                token_comm_args.input_topk_weights_buffer,
-                token_comm_args.src_token_topk_idx,
-                token_comm_args.expert_recv_count,
-                token_comm_args.expert_recv_count_sum,
-                token_comm_args.fc1_input_token_buffer,
-                token_comm_args.fc1_input_sf_buffer,
-                token_comm_args.fc1_input_topk_weights_buffer,
-                token_comm_args.fc1_ready_counter,
-                token_comm_args.token_src_metadata,
+                *pull_args,
                 token_comm_args.peer_rank_ptr_mapper,
                 cta_linear_id,
                 local_warp_idx,
@@ -2804,18 +2812,7 @@ class TokenInPullTokenBackPush:
             )
         else:
             phase_bit, stored_num_tokens_per_expert = self.dispatch_pull(
-                token_comm_storage,
-                token_comm_args.input_token_buffer,
-                token_comm_args.input_sf_buffer,
-                token_comm_args.input_topk_weights_buffer,
-                token_comm_args.src_token_topk_idx,
-                token_comm_args.expert_recv_count,
-                token_comm_args.expert_recv_count_sum,
-                token_comm_args.fc1_input_token_buffer,
-                token_comm_args.fc1_input_sf_buffer,
-                token_comm_args.fc1_input_topk_weights_buffer,
-                token_comm_args.fc1_ready_counter,
-                token_comm_args.token_src_metadata,
+                *pull_args,
                 token_comm_args.carrier_row_table,
                 token_comm_args.group_count,
                 token_comm_args.group_rows,

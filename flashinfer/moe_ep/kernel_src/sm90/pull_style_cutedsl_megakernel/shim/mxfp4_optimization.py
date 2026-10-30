@@ -421,25 +421,58 @@ def _k128_fused_defaults() -> dict[int, dict[str, Any]]:
     }
 
 
-# Per-bucket defaults measured on H200 with block-permutation routing
-# (October 2026 sweeps), as complete tactics including strategy and pull fields.
-# A model uses the table of the largest tile K that divides its hidden and
-# intermediate sizes. The legacy 8-bucket table in mxfp4_tuner still orders the
-# geometry candidates, seeds the tail-pair candidates and backs the NV fallback.
+# Per-bucket defaults measured on H200 with block-permutation routing in
+# October 2026, as complete tactics including strategy and pull fields. Each
+# table serves only the shape it was measured on; other shapes keep the legacy
+# heuristic. The legacy 8-bucket table in mxfp4_tuner still orders the geometry
+# candidates, seeds the tail-pair candidates and backs the NV fallback.
 _FUSED_DEFAULTS = {
     MXFP4_BLOCK_PERMUTATION_ROUTING_PROFILE: (
-        (256, _k256_fused_defaults()),
-        (128, _k128_fused_defaults()),
+        (
+            dict(
+                hidden=7168,
+                intermediate=3072,
+                num_experts=384,
+                world_size=4,
+                num_topk=6,
+            ),
+            _k256_fused_defaults(),
+        ),
+        (
+            dict(
+                hidden=2560,
+                intermediate=640,
+                num_experts=512,
+                world_size=2,
+                num_topk=10,
+            ),
+            _k128_fused_defaults(),
+        ),
     ),
 }
 
 
 def _fused_default_table(
-    hidden: int, intermediate: int, routing_profile: str
+    routing_profile: str,
+    *,
+    hidden: int,
+    intermediate: int,
+    num_experts: int,
+    world_size: int,
+    num_topk: int | None = None,
 ) -> dict[int, dict[str, Any]]:
+    """The table measured on this shape; ``num_topk=None`` matches any top-k."""
     profile = normalize_hopper_mxfp4_routing_profile(routing_profile)
-    for tile_k, table in _FUSED_DEFAULTS.get(profile, ()):
-        if hidden % tile_k == 0 and intermediate % tile_k == 0:
+    shape = dict(
+        hidden=hidden,
+        intermediate=intermediate,
+        num_experts=num_experts,
+        world_size=world_size,
+    )
+    for reference, table in _FUSED_DEFAULTS.get(profile, ()):
+        if all(reference[name] == value for name, value in shape.items()) and (
+            num_topk is None or num_topk == reference["num_topk"]
+        ):
             return table
     return {}
 
@@ -497,13 +530,22 @@ def hopper_mxfp4_fused_default_tactic(
     64/72/80 that needs the fewest tiles for the balanced rows per expert,
     ``max_tokens * num_topk * world_size / num_experts``.
 
-    Returns None when no table covers the routing profile and tile alignment,
-    or when the bucket's tactic is not eligible for this model/EP shape; the
+    Returns None for a shape or routing profile without a measured table, or
+    when the bucket's tactic is not eligible for this model/EP shape; the
     caller then keeps the legacy heuristic.
     """
     if type(max_tokens) is not int or max_tokens <= 0:
         raise ValueError("max_tokens must be a positive integer")
-    table = _fused_default_table(hidden, intermediate, routing_profile)
+    if num_topk is not None and (type(num_topk) is not int or num_topk <= 0):
+        raise ValueError("num_topk must be a positive integer")
+    table = _fused_default_table(
+        routing_profile,
+        hidden=hidden,
+        intermediate=intermediate,
+        num_experts=num_experts,
+        world_size=world_size,
+        num_topk=num_topk,
+    )
     if not table:
         return None
     bucket = next(
@@ -512,8 +554,6 @@ def hopper_mxfp4_fused_default_tactic(
     )
     tactic = dict(table[bucket])
     if num_topk is not None:
-        if type(num_topk) is not int or num_topk <= 0:
-            raise ValueError("num_topk must be a positive integer")
         tactic = _row_tiled(tactic, max_tokens * num_topk * world_size, num_experts)
     try:
         resolve_mxfp4_tactic_optimizations(
@@ -537,7 +577,8 @@ def mxfp4_fused_default_provenance(routing_profile: str) -> dict[str, Any] | Non
         return None
     tactics = [tactic for _, table in tables for tactic in table.values()]
     return {
-        "eligibility": "largest_tile_k_table_n72_n80_tilings_v1",
+        "eligibility": "measured_shape_tables_n72_n80_tilings_v2",
+        "reference_shapes": [dict(reference) for reference, _ in tables],
         "candidate_union_sha256": mxfp4_optimization_candidate_sha256(
             [
                 *tactics,
@@ -560,13 +601,12 @@ def hopper_mxfp4_candidates(
     """The single ordered strategy domain for fused offline and online tuning.
 
     Token capacity orders the geometry candidates and never changes strategy
-    eligibility or selects an alternate source tree. The eligible per-bucket
-    defaults of the shape's table follow, then the N72 and N80 tilings of this
-    capacity's bucket default, so tuning always measures the untuned default
-    (the row-tiled one included); these extensions depend on the table and
-    the capacity bucket. NV seeds its own domain
+    eligibility or selects an alternate source tree. For a shape with a
+    measured table, the eligible per-bucket defaults follow, then the N72 and
+    N80 tilings of this capacity's bucket default, so tuning always measures
+    the untuned default (the row-tiled one included). NV seeds its own domain
     with ``include_fused_defaults=False``: those defaults were measured on
-    MXFP4 only.
+    MXFP4 only. Candidates with dispatch-side token-back are left out.
     """
     base = _ordered_base_candidates(
         max_tokens,
@@ -583,9 +623,7 @@ def hopper_mxfp4_candidates(
     result = expand_mxfp4_optimization_candidates(base, **shape)
     extensions = list(_tail_pair_candidate_extensions())
     if include_fused_defaults:
-        extensions += _fused_default_table(
-            hidden, intermediate, routing_profile
-        ).values()
+        extensions += _fused_default_table(routing_profile, **shape).values()
         default = hopper_mxfp4_fused_default_tactic(
             max_tokens, routing_profile=routing_profile, **shape
         )
@@ -604,7 +642,14 @@ def hopper_mxfp4_candidates(
             continue
         if candidate not in result:
             result.append(dict(candidate))
-    return result
+    # Dispatch-side token-back (reuse / standalone warps) shows run-to-run
+    # output differences on main (cause open), so tuning never selects it; an
+    # explicit token_back_mode still can.
+    return [
+        candidate
+        for candidate in result
+        if candidate.get("token_back_mode", "epi_warps") == "epi_warps"
+    ]
 
 
 def mxfp4_optimization_candidate_sha256(tactics: Iterable[Mapping[str, Any]]) -> str:

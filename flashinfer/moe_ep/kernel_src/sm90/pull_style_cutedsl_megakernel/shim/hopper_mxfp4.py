@@ -137,9 +137,13 @@ class MegaMoEHopperMxfp4Config(MegaMoEHopperFp8Config):
     swap_ab: bool = True
     # Preserve the qualified MXFP4 layout when the FP8 base gains new features.
     # The compact pull buffer (one dispatch slot per active warp) and the
-    # inherited dispatch-pull batch/rotation are tactic fields; omitted fields
+    # dispatch-pull batch/rotation below are tactic fields; omitted fields
     # select the full 4-slot buffer and the serial, static pull.
     compact_pull_buffer: bool = False
+    # Dispatch-pull rows in flight per active dispatch warp, and the per-pass
+    # rotation of the warp -> row assignment (output-invariant).
+    dispatch_pull_batch: int = 1
+    dispatch_pull_rotate: bool = False
     generate_c: Literal[False] = False
     mma_tiler_mnk: Tuple[int, int, int] = _MXFP4_MMA_TILER_DEFAULT
     # Local layout improvements are derived defaults, not tuning axes.
@@ -245,6 +249,21 @@ class MegaMoEHopperMxfp4Config(MegaMoEHopperFp8Config):
         if tile_n in (72, 80):
             base_kwargs["mma_tiler_mnk"] = (tile_m, 64, tile_k)
         MegaMoEHopperFp8Config(**base_kwargs)
+        from .mxfp4_optimization import _normalize_pull_fields
+
+        _normalize_pull_fields(
+            {
+                "compact_pull_buffer": self.compact_pull_buffer,
+                "dispatch_pull_batch": self.dispatch_pull_batch,
+                "dispatch_pull_rotate": self.dispatch_pull_rotate,
+            },
+            {
+                "token_back_mode": self.resolved_token_back_mode,
+                "dedup_dispatch": self.dedup_dispatch,
+                "grouped_token_back": self.grouped_token_back,
+                "active_dispatch_warps": self.active_dispatch_warps,
+            },
+        )
 
         if tile_n in (72, 80) and tile_m != 256:
             raise ValueError(
@@ -425,6 +444,7 @@ class MegaMoEHopperMxfp4Frontend(MegaMoEHopperFp8Frontend):
             ("fc1_logical_storage_k", c.hidden, c.hidden // 2),
             ("fc2_logical_storage_k", c.intermediate, c.intermediate // 2),
             ("compact_pull_buffer", c.compact_pull_buffer),
+            ("dispatch_pull", c.dispatch_pull_batch, c.dispatch_pull_rotate),
             *super()._mega_compile_key(),
         )
 
@@ -1089,6 +1109,31 @@ def _resolve_hopper_mxfp4_mega_moe_config(
             compact_pull_buffer or token_back_mode not in (None, "epi_warps")
         ):
             resolved["dispatch_pull_batch"] = 1
+        # Symmetrically, an explicit batch > 1 needs the full buffer and drops
+        # the tactic's compact one. It cannot override the tactic's token-back,
+        # dedup or dispatch-warp layout, so a conflict there is an error.
+        if dispatch_pull_batch is not None and dispatch_pull_batch > 1:
+            if compact_pull_buffer is None:
+                resolved["compact_pull_buffer"] = False
+            mode = token_back_mode or resolved.get("token_back_mode", "epi_warps")
+            warps = resolved.get("active_dispatch_warps", 1)
+            if (
+                mode != "epi_warps"
+                or resolved.get("dedup_dispatch", False)
+                or resolved.get("grouped_token_back", False)
+                or dispatch_pull_batch * warps > 4
+            ):
+                raise ValueError(
+                    f"dispatch_pull_batch={dispatch_pull_batch} needs "
+                    "token_back_mode='epi_warps' without dedup_dispatch or "
+                    "grouped_token_back, and dispatch_pull_batch * "
+                    "active_dispatch_warps <= 4; the selected tactic has "
+                    f"token_back_mode={mode!r}, "
+                    f"dedup_dispatch={resolved.get('dedup_dispatch', False)}, "
+                    f"grouped_token_back={resolved.get('grouped_token_back', False)}, "
+                    f"active_dispatch_warps={warps}. Pass a complete tactic with "
+                    "knobs= or leave dispatch_pull_batch unset."
+                )
 
     config = MegaMoEHopperMxfp4Config(
         rank=rank,

@@ -892,9 +892,23 @@ class Sm90SwapABSwigluMxfp4Fp8Fc12Kernel(
         Only token tiles of N >= 64 have WGMMAs long enough to hide it; N16
         and N32 tiles keep the in-order loop (measured 2-3% slower with it).
         Dispatch-side token-back (FC2 rows staged in the local pool) keeps the
-        in-order loop too: with the early wait its outputs varied run to run.
+        in-order loop too: the early wait made that path's run-to-run output
+        differences on main far more frequent (their cause is open).
         """
         return self.mma_tiler[1] >= 64 and not self.token_back_by_dispatch
+
+    @cute.jit
+    def _wait_and_load_stage(
+        self, ab_pipeline, weight_sf_pipeline, state, tiled_copy, smem_partition, copy_view
+    ):
+        """Wait for a K128 stage and copy its packed weights to registers."""
+        ab_pipeline.consumer_wait(state)
+        weight_sf_pipeline.consumer_wait(state)
+        cute.copy(
+            tiled_copy,
+            smem_partition[(None, None, None, state.index)],
+            copy_view,
+        )
 
     @cute.jit
     def _mma_mxfp4_hybrid_fc1(
@@ -955,12 +969,9 @@ class Sm90SwapABSwigluMxfp4Fp8Fc12Kernel(
             if cutlass.const_expr(prefetch):
                 # Stage 0 is waited for and loaded here; every iteration then
                 # waits for and loads the next stage while its WGMMAs run.
-                ab_pipeline.consumer_wait(ab_consumer_state)
-                weight_sf_pipeline.consumer_wait(ab_consumer_state)
-                cute.copy(
-                    tiled_copy,
-                    smem_partition[(None, None, None, ab_consumer_state.index)],
-                    copy_view,
+                self._wait_and_load_stage(
+                    ab_pipeline, weight_sf_pipeline, ab_consumer_state,
+                    tiled_copy, smem_partition, copy_view,
                 )
             for k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
                 if cutlass.const_expr(not prefetch):
@@ -1014,12 +1025,9 @@ class Sm90SwapABSwigluMxfp4Fp8Fc12Kernel(
                     next_state = ab_consumer_state.clone()
                     next_state.advance()
                     if k_tile + cutlass.Int32(1) < k_tile_cnt:
-                        ab_pipeline.consumer_wait(next_state)
-                        weight_sf_pipeline.consumer_wait(next_state)
-                        cute.copy(
-                            tiled_copy,
-                            smem_partition[(None, None, None, next_state.index)],
-                            copy_view,
+                        self._wait_and_load_stage(
+                            ab_pipeline, weight_sf_pipeline, next_state,
+                            tiled_copy, smem_partition, copy_view,
                         )
                 warpgroup.wait_group(0)
                 weight_sf_pipeline.consumer_release(ab_consumer_state)
@@ -1542,12 +1550,9 @@ class Sm90SwapABSwigluMxfp4Fp8Fc12Kernel(
             if cutlass.const_expr(prefetch):
                 # Stage 0 is waited for and loaded here; every iteration then
                 # waits for and loads the next stage while its last WGMMAs run.
-                ab_pipeline.consumer_wait(ab_consumer_state)
-                weight_sf_pipeline.consumer_wait(ab_consumer_state)
-                cute.copy(
-                    tiled_copy,
-                    smem_partition[(None, None, None, ab_consumer_state.index)],
-                    copy_view,
+                self._wait_and_load_stage(
+                    ab_pipeline, weight_sf_pipeline, ab_consumer_state,
+                    tiled_copy, smem_partition, copy_view,
                 )
             for k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
                 if cutlass.const_expr(not prefetch):
@@ -1626,12 +1631,9 @@ class Sm90SwapABSwigluMxfp4Fp8Fc12Kernel(
                     next_state = ab_consumer_state.clone()
                     next_state.advance()
                     if k_tile + cutlass.Int32(1) < k_tile_cnt:
-                        ab_pipeline.consumer_wait(next_state)
-                        weight_sf_pipeline.consumer_wait(next_state)
-                        cute.copy(
-                            tiled_copy,
-                            smem_partition[(None, None, None, next_state.index)],
-                            copy_view,
+                        self._wait_and_load_stage(
+                            ab_pipeline, weight_sf_pipeline, next_state,
+                            tiled_copy, smem_partition, copy_view,
                         )
                 warpgroup.wait_group(0)
                 self._promote_accum_temp_blockwise_streaming(

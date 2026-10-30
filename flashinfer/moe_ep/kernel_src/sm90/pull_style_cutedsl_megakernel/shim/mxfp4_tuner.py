@@ -523,6 +523,8 @@ def hopper_mxfp4_cache_provenance_sha256(
         "fc1_ready_mode": ["tile", "k256"],
         "tail_split_pairs": [False, True],
         "tail_candidate_extension": mxfp4_tail_candidate_provenance(),
+        # Tuning measures epi_warps token-back only (hopper_mxfp4_candidates).
+        "tuned_token_back_modes": ["epi_warps"],
     }
     fused_defaults = mxfp4_fused_default_provenance(profile)
     if include_fused_defaults and fused_defaults is not None:
