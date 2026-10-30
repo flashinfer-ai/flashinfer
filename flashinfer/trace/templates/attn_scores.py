@@ -709,8 +709,14 @@ quantize_write_index_k_nvfp4_trace = TraceTemplate(
         "key_scales": Tensor(["pages", "page_size", "scales"]),
     },
     outputs={
-        "key_cache": Tensor(["pages", "page_size", "packed_dim"], dtype="uint8"),
-        "key_scales": Tensor(["pages", "page_size", "scales"], dtype="float8_e4m3fn"),
+        "key_cache": Tensor(
+            ["pages", "page_size", "packed_dim"], dtype="uint8", param="key_cache"
+        ),
+        "key_scales": Tensor(
+            ["pages", "page_size", "scales"],
+            dtype="float8_e4m3fn",
+            param="key_scales",
+        ),
     },
     tags=["arch:sm100", "arch:sm103"],
 )
