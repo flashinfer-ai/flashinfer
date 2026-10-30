@@ -95,8 +95,8 @@ class CombinedSparseTile(SparseSourceTile):
         position = token - self.origin
         in_prefix = (position >= Int32(0)) & (position < self.length)
         index = Int32(0x7FFFFFFF)
-        # Guard the table read itself. K0 still schedules a masked main LOOP,
-        # but its combined table has no column128 and needs no dummy indices.
+        # Guard the table read itself: masked padding tokens past the table
+        # (a short last KV split) must not read beyond its 128+K columns.
         if in_prefix:
             index = Int32(self.indices[token])
         return index, in_prefix & self._valid_id(index)
@@ -164,7 +164,6 @@ def bind_combined_sparse_views(
         ),
         capacity,
     )
-    # Fixed SWA HEAD/main LOOP origins must not depend on valid counts. The
-    # existing K0 capacity256 schedule retains its fully masked second task.
+    # Fixed SWA HEAD/main LOOP origins must not depend on valid counts.
     extent = Int32(128 + ((compressed_k + 127) // 128) * 128)
     return routes, SparseKVLengths((None, None, extent, indices.shape[0]))

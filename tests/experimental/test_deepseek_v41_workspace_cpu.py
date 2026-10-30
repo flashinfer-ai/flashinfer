@@ -275,12 +275,18 @@ def test_workspace_size_and_real_cpu_views(workspace_host, k):
         assert view.untyped_storage().data_ptr() == storage.untyped_storage().data_ptr()
     assert end == size
     assert views.lse.shape == (batch, 64, 1)
+    # KV splits need three or more BK128 tiles: the SWA tile plus K/128 main.
+    tiles = 1 + -(-k // 128)
+    slots = min(tiles * batch, 128) if tiles >= 3 else 0
     assert [name for name, _, _ in sections] == ["lse"] + (
         ["dummy_main"] if k == 0 else []
+    ) + (["partials"] if slots else [])
+    assert set(views.__dataclass_fields__) == {"lse", "dummy_main", "partials"}
+    assert size == (
+        batch * 64 * 4 + (64 * 288 if k == 0 else 0) + slots * 64 * (512 * 2 + 4)
     )
-    assert set(views.__dataclass_fields__) == {"lse", "dummy_main"}
-    assert size == batch * 64 * 4 + (64 * 288 if k == 0 else 0)
     assert (views.dummy_main is None) == (k > 0)
+    assert (views.partials is None) == (slots == 0)
     assert host.public.deepseek_v41_decode_workspace_size(batch, k) == size
     assert host.state.properties == 0 and not host.state.allocations
 
@@ -289,6 +295,18 @@ def test_workspace_size_and_real_cpu_views(workspace_host, k):
 def test_workspace_pure_batch_boundaries(workspace_host, batch):
     host = workspace_host
     assert type(host.module.workspace_size(batch, 512)) is int
+    assert host.state.properties == 0 and not host.state.allocations
+
+
+@pytest.mark.parametrize("k", (0, 128, 192, 256, 512))
+def test_workspace_size_monotone_and_bounded_in_batch(workspace_host, k):
+    # A workspace sized for the largest batch must serve every smaller one,
+    # and reserved KV-split partials stay bounded at any batch size.
+    host = workspace_host
+    sizes = [host.module.workspace_size(batch, k) for batch in range(1, 300)]
+    assert sizes == sorted(sizes)
+    partials = [size - batch * 64 * 4 for batch, size in enumerate(sizes, 1)]
+    assert max(partials) <= 64 * 288 + 128 * 64 * (512 * 2 + 4)
     assert host.state.properties == 0 and not host.state.allocations
 
 

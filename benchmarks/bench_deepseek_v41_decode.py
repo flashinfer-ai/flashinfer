@@ -27,8 +27,9 @@ timing; replay includes inline live-metadata masking, selected-tile staging
 and joint attention/finalization. Cache writing, allocation, JIT, capture and
 host overhead are excluded for every arm.
 
-Prims-TS requires CuTe-DSL >= 4.8 with its bundled CUDA 13 compiler, split 1 and
-a nonpersistent schedule. Measured B200 Prims-TS and upstream FlashMLA latencies
+Prims-TS requires CuTe-DSL >= 4.8 with its bundled CUDA 13 compiler and a
+nonpersistent schedule; small batches split long KV lists across CTAs, merged by
+a separate reducer (rows record the split). Measured B200 Prims-TS and upstream FlashMLA latencies
 are recorded in examples/deepseek_v41/README.md; backend crossovers against the
 cute-dsl arm remain unmeasured.
 See examples/deepseek_v41/README.md for scope and reproducer commands.
@@ -99,14 +100,14 @@ def selected(pool, indices, fp4):
     return (data * scale).bfloat16().double()
 
 
-def fixture(batch, context, seed, backends, flashmla=False):
+def fixture(batch, context, seed, backends, flashmla=False, compressed_k=512):
     torch.manual_seed(seed + batch)
     q_source = torch.randn(batch, 1, 64, 512, device="cuda", dtype=torch.bfloat16)
     w_source = torch.randn(batch * 128, 512, device="cuda", dtype=torch.bfloat16)
     main = torch.empty(
         batch * context // 64, 64, 1, 288, device="cuda", dtype=torch.uint8
     )
-    ci = torch.empty(batch, 1, 512, device="cuda", dtype=torch.int32)
+    ci = torch.empty(batch, 1, compressed_k, device="cuda", dtype=torch.int32)
     for b in range(batch):
         values = torch.randn(context, 512, device="cuda", dtype=torch.bfloat16)
         cache = deepseek_v41_quantize_cache(
@@ -114,7 +115,8 @@ def fixture(batch, context, seed, backends, flashmla=False):
         )
         main[b * (context // 64) : (b + 1) * (context // 64)].copy_(cache)
         ci[b, 0] = (
-            torch.randperm(context, device="cuda")[:512].sort().values + b * context
+            torch.randperm(context, device="cuda")[:compressed_k].sort().values
+            + b * context
         )
     wi = (
         (
@@ -311,7 +313,7 @@ def arm_metadata(name, args):
     if native_fp8:
         arithmetic = (
             "native E4M3 Q/K/V/P for SWA and main; "
-            "BK128/Keep-AB/M64/retained8/split1/nonpersistent; "
+            "BK128/Keep-AB/M64/retained8/batch-selected KV split/nonpersistent; "
             "original E4M3 Q, no BF16 query scratch"
         )
         global_conversion = (
@@ -380,6 +382,7 @@ def prepare_decode(args, backend):
     if backend != "prims-ts":
         raise ValueError("backend must be cute-dsl or prims-ts")
 
+    from flashinfer.experimental.deepseek_v41.prims_ts import _partition
     from flashinfer.experimental.deepseek_v41.prims_ts._workspace import (
         workspace_views,
     )
@@ -419,7 +422,12 @@ def prepare_decode(args, backend):
         assert result is out
         return result, lse
 
-    return call, {"workspace_bytes": workspace.numel(), "split": 1}
+    kv_splits, head_dim_ctas = _partition(batch, compressed_k, q.device.index)
+    return call, {
+        "workspace_bytes": workspace.numel(),
+        "split": kv_splits,
+        "head_dim_ctas": head_dim_ctas,
+    }
 
 
 def graph(fn):
@@ -438,6 +446,11 @@ def graph(fn):
 def build_parser():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--batches", default="1,4,16,32,64,128,256")
+    parser.add_argument(
+        "--compressed-k",
+        default="512",
+        help="comma-separated selected main rows; prims-ts alone also accepts 0",
+    )
     parser.add_argument("--context", type=int, default=32768)
     parser.add_argument("--seed", type=int, default=7003)
     parser.add_argument(
@@ -458,6 +471,11 @@ def main():
         raise FileExistsError(opts.output)
     if opts.context < 512 or opts.context % 64:
         raise ValueError("context must be a multiple of64 >=512")
+    compressed_ks = [int(k) for k in opts.compressed_k.split(",")]
+    if any(k < 0 or k > 512 or k % 64 for k in compressed_ks):
+        raise ValueError("compressed-k values must be multiples of64 up to512")
+    if 0 in compressed_ks and (opts.flashmla or "cute-dsl" in opts.backends):
+        raise ValueError("compressed-k 0 is supported by prims-ts alone")
     from flashinfer import deepseek_v41
 
     # Locate sources from the lightweight public module, not a Frost import.
@@ -489,8 +507,9 @@ def main():
         "torch": torch.__version__,
         "context_per_request": opts.context,
         "shape": (
-            "H64/Sq1/D512; SWA128 + selected512 packed FP4; encodings/shapes per arm"
+            "H64/Sq1/D512; SWA128 + selected K packed FP4; encodings/shapes per arm"
         ),
+        "compressed_k": compressed_ks,
         "comparison": (
             "common seeded BF16 source Q/SWA; one shared packed global FP4 pool "
             "and indices; native FP8 (when selected) directly stages common-unit "
@@ -527,13 +546,16 @@ def main():
         }
     try:
         with torch.no_grad():
-            for batch in map(int, opts.batches.split(",")):
+            for compressed_k, batch in (
+                (k, b) for k in compressed_ks for b in map(int, opts.batches.split(","))
+            ):
                 arm_args = fixture(
                     batch,
                     opts.context,
                     opts.seed,
                     opts.backends,
                     opts.flashmla,
+                    compressed_k,
                 )
                 buffers, fns = {}, {}
                 for backend in opts.backends:
@@ -588,6 +610,7 @@ def main():
                         samples[name].append(start.elapsed_time(end) * 1000 / 32)
                 row = {
                     "batch": batch,
+                    "compressed_k": compressed_k,
                     "split": {name: info["split"] for name, info in buffers.items()},
                     "arms": {name: arm_metadata(name, arm_args[name]) for name in fns},
                     "correctness": stats,
@@ -600,7 +623,13 @@ def main():
                     }
                 report["rows"].append(row)
                 opts.output.write_text(json.dumps(report, indent=2))
-                print({k: row[k] for k in ("batch", "split", "median_us")}, flush=True)
+                print(
+                    {
+                        k: row[k]
+                        for k in ("batch", "compressed_k", "split", "median_us")
+                    },
+                    flush=True,
+                )
                 del graphs, fns, buffers, arm_args
                 if opts.flashmla:
                     del meta

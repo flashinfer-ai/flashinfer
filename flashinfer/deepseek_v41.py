@@ -82,10 +82,12 @@ def deepseek_v41_decode(*args, backend="cute-dsl", **kwargs):
     Q/K/V must be finite; this is inference-only.
 
     Prims-TS supports SM100, SM103 and SM107, with CuTe-DSL>=4.8 and its
-    bundled CUDA13 compiler supporting the device's compile target. Its fixed
-    Keep-AB/M64/BK128/retained-KV8/split1/nonpersistent schedule jointly
-    attends SWA/main in one finalizing kernel with inline metadata and sinks.
-    Workspace contains private LSE and a K0 dummy, not sanitized metadata.
+    bundled CUDA13 compiler supporting the device's compile target. Its
+    Keep-AB/M64/BK128/retained-KV8/nonpersistent schedule jointly attends
+    SWA/main with inline metadata and sinks: one finalizing kernel, or for
+    small batches with K >= 192 KV splits merged by one PDL-chained reducer.
+    Workspace contains private LSE, a K0 dummy and those split partials, not
+    sanitized metadata.
     Capture requires caller out/workspace and eager warmup; keep addresses
     alive/fixed and update values in place. Changing Python scales requires
     recapture. Concurrent calls require separate writable buffers or caller

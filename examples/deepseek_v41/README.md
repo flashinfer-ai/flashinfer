@@ -186,7 +186,11 @@ assert result is out
 The workspace-size helper is pure arithmetic and accepts only Prims-TS, which
 is also its default. Allocate contiguous int8/uint8 storage with a **32-byte-aligned**
 base and sufficient capacity; insufficient capacity is an error, not a hidden
-allocation fallback. Other public buffers must be contiguous and16-byte aligned.
+allocation fallback. For K >= 192 it also reserves KV-split partials (BF16 O and
+FP32 LSE, 65,792 bytes per pair) for `min(tiles * B, 128)` request/split pairs,
+with `tiles = 1 + ceil(K / 128)`: at most about 8.4 MB, and monotone in B, so a
+workspace sized for the largest batch serves every smaller one. Other public
+buffers must be contiguous and16-byte aligned.
 Eager calls may omit `out`; capture may not. The native window helper takes
 `(query, swa_kv_cache, workspace_buffer, sparse_indices=None,
 sparse_topk_lens=None, seq_lens=None, out=None, bmm1_scale=1.0, bmm2_scale=1.0,
@@ -222,10 +226,15 @@ this convention does not establish equivalence to official token/block64 quantiz
 
 ### Kernel, capture and validation boundary
 
-One joint finalizing attention uses Keep-AB/M64/BK128/retained-KV8/split1/
-nonpersistent scheduling, inline metadata and optional FP32 per-head sinks.
-There is no prepare kernel, per-source state or merge. Workspace contains
-private natural-log, sink-exclusive FP32 LSE and the K0 dummy main storage.
+Attention uses Keep-AB/M64/BK128/retained-KV8/nonpersistent scheduling, inline
+metadata and optional FP32 per-head sinks. An unsplit call is one finalizing
+kernel. A KV-split call (below) adds one PDL-chained reducer that merges the
+BF16 partials, applies sinks once and writes output and LSE. The attention
+kernel launches with PDL: it waits for the preceding grid before reading any
+input, and grids of at most a quarter of the SMs release their dependents at
+entry so the next launch overlaps them. There is no prepare
+kernel or per-source state. Workspace contains private natural-log,
+sink-exclusive FP32 LSE, the K0 dummy main storage and the split partials.
 Sinks contain finite logits or -inf and affect output normalization exactly once;
 empty rows produce exact zero output and -inf LSE. Effective Q/K/V must be finite.
 
@@ -235,28 +244,38 @@ Each main tile stages its raw FP4 payload/scales into 36 KiB of SMEM, one commit
 group per D128 stage, and converts each stage from SMEM. These copies issue
 before the tile's first KV slot is acquired: reused slots are released only after
 the previous tile's PV, which the in-order MMA issues after the next QK. With
-bundled CUDA >= 13.2 the exact E2M1 * E4M3 product is formed in F16. Final BF16
+bundled CUDA >= 13.2 the exact E2M1 * E4M3 product is formed in F16; with CUDA
+>= 13.4 on SM100/SM103, PTX 9.4's packed E2M1 x E4M3 multiply rounds it directly
+(bitwise identical, seven instead of twelve instructions per eight values, on
+the loader warps that bound main-tile throughput). Final BF16
 rows pass through 16 KiB of SMEM so global stores write whole lines; each warp
 reads its staged rows before its predicated stores, and row sinks load before
 the correction task's first wait. Two metadata stages let the next tile's row
 IDs load during the current tile.
 
-While `4 * batch` (or `2 * batch`) CTAs still fit one wave, each request's V
-columns split over four (or two) CTAs. Every V owner computes the full QK over
-the K tile it retains and reads V from its own D128 slices of that tile, so the
-split divides PV, correction and output work but not the loads or the FP4
-conversion. Outputs match one V owner bitwise.
+When `8 * batch <= SMs` and the list spans at least three BK128 tiles (K >= 192),
+each request's tiles split over that many CTAs, one tile each: split 0 owns the
+SWA tile and every later split starts with a main tile. Splitting divides the
+loads and the FP4 conversion; each split rounds P against its own running
+maximum, within the same FP64 bound. Larger batches keep one KV split, where
+the extra partials and reducer cost more than they save (B200: 15.5 us against
+13.7 us for B=32, K=512).
+
+Then, while `4 * batch * splits` (or `2 * ...`) CTAs still fit one wave, each
+request's V columns split over four (or two) CTAs. Every V owner computes the
+full QK over the K tile it retains and reads V from its own D128 slices of that
+tile, so the split divides PV, correction and output work but not the loads or
+the FP4 conversion. Outputs match one V owner bitwise for the same KV split.
 
 Capture requires caller output/workspace and eager warmup for the same declaration.
-The V split is a compiled specialization chosen from the batch size, so warm up a
-batch of each split class (`4 * batch <= SMs`, `2 * batch <= SMs`, otherwise)
-that will be captured.
+The (KV split, V split) pair is a compiled specialization chosen from the batch
+size and K, so warm up a batch of each class that will be captured.
 Keep addresses alive/fixed and update values in place. Changing Python scales
 requires recapture, not recompilation. Concurrent calls need separate writable
 buffers or synchronization. Output/workspace cannot overlap inputs or each other;
 read-only inputs may alias. Cached factories retain kernels and host facts, not
 caller buffers. Training, speculative/multi-token queries, architectures outside
-SM100/SM103/SM107, and V4 varlen/PDL/RopeQuant features are out of scope.
+SM100/SM103/SM107, and V4 varlen/RopeQuant features are out of scope.
 
 Native tests retain the independent represented-input FP64 oracle, componentwise
 FP8 output bound, LSE `rtol=0, atol=1e-5`, exact-empty/nonfinite checks and bitwise
@@ -265,6 +284,13 @@ defaults and task control; static/CLC graph coverage remains in
 `tests/attention/test_attention_ts_sparse_mla.py`.
 Regression tests cover ordinary signed BMM2, signed zero, sinks, and live
 metadata/layout/replay parity without relaxing the oracle or numerical gates.
+
+The packed-conversion, KV-split, single-K0-tile, PDL and eight-loader-warp
+revision passed **131 DS4.1 decode, 368 cache/CPU contract and all 100 generic
+sparse MLA cases** (`tests/attention/test_attention_ts_sparse_mla.py`) on **B200
+(SM100)**, using PyTorch 2.11.0+cu128, CuTe-DSL 4.8.0 and bundled CUDA 13.4.
+Unsplit outputs are bitwise identical to the previous revision. This run does not
+requalify SM103/SM107.
 
 The test-only simplification passed **320 CPU contract and 171 decode/cache
 GPU cases** without failures or skips on **B200 (SM100)**, using PyTorch
@@ -352,11 +378,10 @@ and host overhead; these are not model-token latencies.
 
 Warm CUDA Graph replay, 32 calls per replay, symmetric ABBA order, 3 rounds of
 30 samples; median us per call. Both arms ran in one process on one B200 (148
-SMs), which other users' short jobs shared intermittently; per-round medians
-stayed within 1%. The fixture is the benchmark's seeded one: context 32768 per
-request, 128 SWA rows plus `K` selected FP4 main rows, H64/D512, sinks enabled.
-Each arm passed its own FP64 gate first. Toolchain: PyTorch 2.14.1+cu130,
-CuTe-DSL 4.8.0 (bundled CUDA 13.4).
+SMs); per-round medians stayed within 0.3%. The fixture is the benchmark's seeded
+one: context 32768 per request, 128 SWA rows plus `K` selected FP4 main rows,
+H64/D512, sinks enabled. Each arm passed its own FP64 gate first. Toolchain:
+PyTorch 2.14.0+cu130, CuTe-DSL 4.8.0 (bundled CUDA 13.4).
 
 The arms differ in precision contract. Prims-TS runs E4M3 x E4M3 QK and PV MMAs
 with E4M3 Q/SWA, main FP4 rounded to E4M3 and P quantized to E4M3. Upstream
@@ -368,21 +393,23 @@ twice BF16, so part of the gap reflects that contract rather than scheduling.
 
 | Batch | K | Prims-TS before | Prims-TS after | FlashMLA | FlashMLA / after |
 |---:|---:|---:|---:|---:|---:|
-| 1 | 512 | 29.45 | 13.36 | 20.55 | 1.54 |
-| 1 | 128 | 17.29 | 7.55 | 12.34 | 1.63 |
-| 1 | 0 | 13.64 | 5.95 | 9.30 | 1.56 |
-| 16 | 512 | 29.76 | 14.36 | 20.98 | 1.46 |
-| 16 | 128 | 17.86 | 8.30 | 12.19 | 1.47 |
-| 64 | 512 | 30.69 | 16.55 | 22.24 | 1.34 |
-| 64 | 128 | 18.81 | 9.74 | 12.81 | 1.31 |
-| 128 | 512 | 33.13 | 18.47 | 23.95 | 1.30 |
-| 128 | 128 | 19.64 | 11.18 | 14.12 | 1.26 |
-| 128 | 0 | 16.31 | 8.51 | 10.61 | 1.25 |
-| 256 | 512 | 87.74 | 37.95 | 45.81 | 1.21 |
-| 256 | 128 | 37.36 | 20.74 | 27.72 | 1.34 |
-| 256 | 0 | 30.77 | 15.94 | 21.50 | 1.35 |
+| 1 | 512 | 14.38 | 7.76 | 20.98 | 2.71 |
+| 1 | 128 | 8.22 | 6.71 | 12.21 | 1.82 |
+| 1 | 0 | 6.24 | 4.58 | 9.21 | 2.01 |
+| 16 | 512 | 14.74 | 11.45 | 21.39 | 1.87 |
+| 16 | 128 | 8.47 | 7.02 | 12.39 | 1.76 |
+| 64 | 512 | 16.56 | 13.20 | 21.90 | 1.66 |
+| 64 | 128 | 9.70 | 7.93 | 12.90 | 1.63 |
+| 128 | 512 | 18.27 | 15.19 | 23.66 | 1.56 |
+| 128 | 128 | 11.16 | 9.29 | 13.88 | 1.49 |
+| 128 | 0 | 8.51 | 6.76 | 10.51 | 1.56 |
+| 256 | 512 | 38.05 | 33.57 | 45.58 | 1.36 |
+| 256 | 128 | 20.76 | 17.99 | 27.64 | 1.54 |
+| 256 | 0 | 15.89 | 13.04 | 21.44 | 1.64 |
 
-"Before" is the branch revision preceding the loader/epilogue/V-split changes,
-timed on the same GPU in the same process configuration; its FlashMLA arm agreed
-with this one within 4.8%. "After" splits V over four CTAs for batches 1-16, two
-for 64 and none from 128 (148 SMs).
+"Before" is commit `5a584f72b` (the previous revision of this table) and "after"
+adds the packed FP4 conversion, small-batch KV splits, the single K0 tile, PDL
+and eight loader warps. Both snapshots ran back to back on the same GPU in the
+same container; their FlashMLA arms agreed within 2.2%. "After" chooses KV and V
+splits with the partition rule above (148 SMs): one KV tile per CTA for batches
+1-16 with K >= 192.
