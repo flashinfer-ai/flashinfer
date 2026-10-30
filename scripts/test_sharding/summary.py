@@ -1,11 +1,16 @@
 from __future__ import annotations
 
 import csv
+import importlib
+import importlib.metadata
 import io
 import json
+import os
+import sys
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, TypedDict, cast
 
@@ -88,6 +93,8 @@ class SourceSummary(TypedDict):
 class RunSummary(TypedDict):
     schema_version: int
     complete: bool
+    gpu_name: str
+    lane_id: str
     planned_nodes: int
     finalized_nodes: int
     pending_nodes: list[str]
@@ -573,8 +580,10 @@ def publish_summary_under_lock(junit_dir: Path, plan: Plan) -> RunSummary:
     )
     capacity = _capacity_for_latest_attempt(plan, attempt_paths)
     summary: RunSummary = {
-        "schema_version": 3,
+        "schema_version": 4,
         "complete": not scan.pending,
+        "gpu_name": _detect_gpu_name(),
+        "lane_id": _detect_lane_id(),
         "planned_nodes": len(plan.nodes),
         "finalized_nodes": len(scan.rows),
         "pending_nodes": sorted(scan.pending, key=lambda value: value.encode("utf-8")),
@@ -672,6 +681,97 @@ def _format_test_elapsed(seconds: float) -> str:
     return f"{secs}s"
 
 
+def _package_version(distribution_name: str) -> str:
+    try:
+        return importlib.metadata.version(distribution_name)
+    except importlib.metadata.PackageNotFoundError:
+        return "not-installed"
+    except Exception:
+        return "unknown"
+
+
+def _torch_cuda_version() -> str:
+    try:
+        import torch  # type: ignore[import-not-found]
+
+        return str(torch.version.cuda or "none")
+    except Exception:
+        return "unavailable"
+
+
+def _cudnn_backend_version() -> str:
+    try:
+        cudnn = importlib.import_module("cudnn")
+    except ModuleNotFoundError as error:
+        if error.name != "cudnn":
+            return "unavailable"
+        return "not-installed"
+    except Exception:
+        return "unavailable"
+    try:
+        return str(cudnn.backend_version())
+    except Exception:
+        return "unavailable"
+
+
+@lru_cache(maxsize=1)
+def _detect_gpu_name() -> str:
+    """Return the GPU name from the ``CI_GPU_NAME`` environment variable.
+
+    This variable is set by the CI workflow matrix and forwarded into the
+    Docker container, avoiding the cost of initialising a CUDA context just
+    to query the device name.
+    """
+    name = os.environ.get("CI_GPU_NAME", "") or ""
+    if not name:
+        print(
+            "WARNING: CI_GPU_NAME is not set; gpu_name will be 'unknown'. "
+            "Ensure the workflow matrix sets gpu_name and ci/bash.sh forwards it.",
+            file=sys.stderr,
+        )
+        return "unknown"
+    return name
+
+
+def _detect_lane_id() -> str:
+    """Build a composite lane identifier from CI environment variables.
+
+    Format: ``{script} - {gpu_name}@{cuda}``, e.g.
+    ``task_run_unit_tests.sh - H100@cu124``.  Falls back to ``gpu_name``
+    alone when the other variables are unavailable.
+    """
+    gpu = _detect_gpu_name()
+    script = os.environ.get("CI_TEST_SCRIPT", "") or ""
+    cuda = os.environ.get("CI_MATRIX_CUDA", "") or ""
+    if script and cuda:
+        return f"{script} - {gpu}@{cuda}"
+    if script:
+        return f"{script} - {gpu}"
+    if cuda:
+        return f"{gpu}@{cuda}"
+    return gpu
+
+
+@lru_cache(maxsize=1)
+def _runtime_version_line() -> str:
+    """Format runtime and dependency versions as space-separated name=value pairs."""
+    versions = [
+        ("python", sys.version.split()[0]),
+        ("flashinfer", _package_version("flashinfer-python")),
+        ("torch", _package_version("torch")),
+        ("CUDA", _torch_cuda_version()),
+        ("CuTE-DSL", _package_version("nvidia-cutlass-dsl")),
+        ("cuda-python", _package_version("cuda-python")),
+        ("cuda-tile", _package_version("cuda-tile")),
+        ("cuDNN-frontend", _package_version("nvidia-cudnn-frontend")),
+        ("cuDNN-backend", _cudnn_backend_version()),
+        ("triton", _package_version("triton")),
+        ("nccl-extensions", _package_version("nccl-extensions")),
+        ("nccl4py", _package_version("nccl4py")),
+    ]
+    return " ".join(f"{name}={version}" for name, version in versions)
+
+
 def _format_memory(mib: float) -> str:
     return f"{mib / 1024:.1f} GiB" if mib >= 1024 else f"{mib:.0f} MiB"
 
@@ -702,10 +802,11 @@ def _top_source_lines(
 def _failure_detail_lines(
     failed_nodes: list[FailedNodeSummary], diagnostic_limit: int
 ) -> list[str]:
-    if not failed_nodes:
+    real_failures = [failure for failure in failed_nodes if not failure["synthetic"]]
+    if not real_failures:
         return []
     lines = [_TERMINAL_SEPARATOR, "FAILED TEST NODES", _TERMINAL_SEPARATOR]
-    for failure in failed_nodes:
+    for failure in real_failures:
         diagnostic = str(failure["diagnostic"])
         encoded = diagnostic.encode("utf-8")
         truncated = len(encoded) > diagnostic_limit
@@ -719,14 +820,22 @@ def _failure_detail_lines(
         )
         if truncated:
             lines.append(f"    [diagnostic truncated at {diagnostic_limit} bytes]")
-        lines.extend(
-            [
-                f"    log: {failure['log_path']}",
-                f"    results: {failure['results_path']}",
-                f"    junit: {failure['junit_path']}",
-            ]
-        )
+        lines.append(f"    log: {failure['log_path']}")
     return lines
+
+
+def _synthetic_timeout_failure_lines(
+    failed_nodes: list[FailedNodeSummary],
+) -> list[str]:
+    synthetic_failures = [failure for failure in failed_nodes if failure["synthetic"]]
+    if not synthetic_failures:
+        return []
+    return [
+        _TERMINAL_SEPARATOR,
+        "SYNTHETIC FAIL DUE TO TIMEOUT",
+        _TERMINAL_SEPARATOR,
+        *(f"  - {failure['nodeid']}" for failure in synthetic_failures),
+    ]
 
 
 def terminal_summary_lines(
@@ -748,6 +857,7 @@ def terminal_summary_lines(
         f"Start time: {_format_timestamp(test_started_at)}",
         f"End time: {_format_timestamp(test_ended_at)}",
         f"Time elapsed: {_format_test_elapsed(test_ended_at - test_started_at)}",
+        f"Versions: {_runtime_version_line()}",
     ]
     if summary is None:
         lines.extend(
@@ -820,13 +930,40 @@ def terminal_summary_lines(
     if infrastructure_errors:
         lines.extend(["", "INFRASTRUCTURE ERRORS"])
         lines.extend(f"  - {error}" for error in infrastructure_errors)
-    if failed_nodes:
-        failed_sources = sorted(
-            {failure["source_file"] for failure in failed_nodes},
+    real_failed_nodes = [
+        failure for failure in failed_nodes if not failure["synthetic"]
+    ]
+    synthetic_failed_nodes = [
+        failure for failure in failed_nodes if failure["synthetic"]
+    ]
+    if real_failed_nodes:
+        failed_sources = Counter(
+            failure["source_file"] for failure in real_failed_nodes
+        )
+        ordered_failed_sources = sorted(
+            failed_sources,
             key=lambda source: source.encode("utf-8"),
         )
         lines.extend(["", "Failed test files:"])
-        lines.extend(f"  - {source}" for source in failed_sources)
+        lines.extend(
+            f"  - {source} ({failed_sources[source]} failed "
+            f"{'node' if failed_sources[source] == 1 else 'nodes'})"
+            for source in ordered_failed_sources
+        )
+    if synthetic_failed_nodes:
+        timeout_sources = Counter(
+            failure["source_file"] for failure in synthetic_failed_nodes
+        )
+        ordered_timeout_sources = sorted(
+            timeout_sources,
+            key=lambda source: source.encode("utf-8"),
+        )
+        lines.extend(["", "Timeout test files:"])
+        lines.extend(
+            f"  - {source} ({timeout_sources[source]} timeout "
+            f"{'node' if timeout_sources[source] == 1 else 'nodes'})"
+            for source in ordered_timeout_sources
+        )
     lines.extend(
         ["", "TEST RUN RESOURCE SUMMARY", "Top 10 longest-running source files:"]
     )
@@ -847,4 +984,8 @@ def terminal_summary_lines(
             _TERMINAL_SEPARATOR,
         ]
     )
-    return [*_failure_detail_lines(failed_nodes, diagnostic_limit), *lines]
+    return [
+        *_failure_detail_lines(failed_nodes, diagnostic_limit),
+        *_synthetic_timeout_failure_lines(failed_nodes),
+        *lines,
+    ]

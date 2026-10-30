@@ -1,6 +1,13 @@
+import hashlib
+import logging
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+from threading import Barrier, local
+
 from flashinfer.artifacts import (
     ArtifactPath,
     get_available_cubin_files,
+    get_available_header_files,
     get_subdir_file_list,
 )
 
@@ -8,9 +15,76 @@ import pytest
 import responses
 
 from flashinfer.jit.cubin_loader import safe_urljoin
+from flashinfer.jit import cubin_loader
+
+
+@pytest.mark.parametrize("cached_content", [None, b"stale header"])
+@pytest.mark.parametrize(
+    "content", [b"", b"#pragma once\nenum class Layout { Linear };\n"]
+)
+def test_concurrent_get_artifact_downloads_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    cached_content: bytes | None,
+    content: bytes,
+) -> None:
+    """Concurrent cache misses must not replace an already verified artifact."""
+    checksum = hashlib.sha256(content).hexdigest()
+    destination = tmp_path / "header.h"
+    if cached_content is not None:
+        destination.write_bytes(cached_content)
+    monkeypatch.setattr(cubin_loader, "FLASHINFER_CUBIN_DIR", tmp_path)
+    monkeypatch.setattr(
+        cubin_loader, "FLASHINFER_CUBINS_REPOSITORY", "https://example.test/"
+    )
+    monkeypatch.delenv("FLASHINFER_NO_DOWNLOAD", raising=False)
+    monkeypatch.delenv("FLASHINFER_CUBIN_CHECKSUM_DISABLED", raising=False)
+
+    workers = 4
+    first_reads = Barrier(workers, timeout=10)
+    state = local()
+    load_cubin = cubin_loader.load_cubin
+
+    def synchronized_first_read(path: str, sha256: str) -> bytes | None:
+        """Wait for every worker's initial cache read before allowing downloads."""
+        data = load_cubin(path, sha256)
+        if not getattr(state, "read_once", False):
+            state.read_once = True
+            # Every worker sees a miss before any worker can start downloading.
+            first_reads.wait()
+        return data
+
+    monkeypatch.setattr(cubin_loader, "load_cubin", synchronized_first_read)
+    with responses.RequestsMock() as http:
+        http.add(
+            responses.GET, "https://example.test/header.h", body=content, status=200
+        )
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = [
+                pool.submit(cubin_loader.get_artifact, "header.h", checksum)
+                for _ in range(workers)
+            ]
+            assert [future.result(timeout=15) for future in futures] == [
+                content
+            ] * workers
+        assert len(http.calls) == 1
+    assert destination.read_bytes() == content
+
+
+def test_get_artifact_reuses_empty_cache(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A checksum-valid empty file is a cache hit even when downloads are disabled."""
+    (tmp_path / "empty.h").write_bytes(b"")
+    monkeypatch.setattr(cubin_loader, "FLASHINFER_CUBIN_DIR", tmp_path)
+    monkeypatch.setenv("FLASHINFER_NO_DOWNLOAD", "1")
+    monkeypatch.delenv("FLASHINFER_CUBIN_CHECKSUM_DISABLED", raising=False)
+
+    assert cubin_loader.get_artifact("empty.h", hashlib.sha256(b"").hexdigest()) == b""
 
 
 def test_sanity_check_urllib_behavior():
+    """Check directory and absolute-path handling when joining artifact URLs."""
     # We use safe_urljoin which ensures the base is always treated as a directory
     # by adding a trailing slash if needed before calling urljoin.
     base_with_trailing_slash = "https://example.com/some/path/"
@@ -225,27 +299,13 @@ def _mock_file_index_responses():
     responses.add(
         responses.GET, deepgemm_source, body=success_deepgemm_response, status=200
     )
-    # The Rubin pins list the *same* sm100f kernel filenames as their non-Rubin
-    # counterparts (built from different sources), so reuse the same directory
-    # index bodies. This is what makes bare-filename checksum keys collide.
-    bmm_rubin_source = safe_urljoin(
-        test_cubin_repository, artifact_paths.TRTLLM_GEN_BMM_RUBIN
-    )
-    responses.add(
-        responses.GET, bmm_rubin_source, body=success_bmm_response, status=200
-    )
-    gemm_rubin_source = safe_urljoin(
-        test_cubin_repository, artifact_paths.TRTLLM_GEN_GEMM_RUBIN
-    )
-    responses.add(
-        responses.GET, gemm_rubin_source, body=success_gemm_response, status=200
-    )
-    deepgemm_rubin_source = safe_urljoin(
-        test_cubin_repository, artifact_paths.DEEPGEMM_RUBIN
-    )
-    responses.add(
-        responses.GET, deepgemm_rubin_source, body=success_deepgemm_response, status=200
-    )
+    for source in (fmha_source, gemm_source, bmm_source):
+        responses.add(
+            responses.GET,
+            safe_urljoin(source, "include/"),
+            body='<a href="../">../</a>',
+            status=200,
+        )
 
 
 @responses.activate
@@ -272,32 +332,70 @@ def test_get_available_cubin_files():
 
 @responses.activate
 def test_get_available_cubin_files_non_200_response():
-    """Test that non-200 response codes return an empty tuple."""
+    """Artifact index HTTP failures must stop the build after retries."""
     gemm_path = "037e528e719ec3456a7d7d654f26b805e44c63b1/gemm-8704aa4-f91dc9e/"
     source = safe_urljoin(test_cubin_repository, gemm_path)
 
-    # Test 404 Not Found
-    responses.add(responses.GET, source, status=404)
-    available_cubin_files = get_available_cubin_files(
-        source, retries=1, delay=0, timeout=5
-    )
-    assert available_cubin_files == ()
+    for status in (404, 500, 403):
+        responses.reset()
+        responses.add(responses.GET, source, status=status)
+        with pytest.raises(RuntimeError, match="Failed to fetch the cubin artifact"):
+            get_available_cubin_files(source, retries=1, delay=0, timeout=5)
 
-    # Reset responses and test 500 Internal Server Error
-    responses.reset()
-    responses.add(responses.GET, source, status=500)
-    available_cubin_files = get_available_cubin_files(
-        source, retries=1, delay=0, timeout=5
-    )
-    assert available_cubin_files == ()
 
-    # Reset responses and test 403 Forbidden
-    responses.reset()
-    responses.add(responses.GET, source, status=403)
-    available_cubin_files = get_available_cubin_files(
-        source, retries=1, delay=0, timeout=5
+@responses.activate
+def test_get_available_header_files_rejects_partial_index():
+    """A failed child directory must not return an incomplete header list."""
+    source = "https://example.test/artifacts/"
+    child_source = safe_urljoin(source, "nested/")
+    responses.add(
+        responses.GET,
+        source,
+        body='<a href="root.h">root.h</a><a href="nested/">nested/</a>',
+        status=200,
     )
-    assert available_cubin_files == ()
+    responses.add(responses.GET, child_source, status=500)
+
+    with pytest.raises(RuntimeError, match="Failed to fetch the header artifact"):
+        get_available_header_files(source, retries=1, delay=0, timeout=5)
+
+
+@pytest.mark.parametrize(
+    "level, dumped", [(logging.DEBUG, True), (logging.INFO, False)]
+)
+def test_download_file_logs_error_response_only_at_debug(
+    monkeypatch, caplog, tmp_path, level, dumped
+):
+    """HTTP error headers and body are logged for CI, but not in client logs.
+
+    Akamai's 403 page carries the "Reference #" the edge team needs to identify
+    the rule that rejected a request; CI runs at DEBUG to keep it.
+    """
+    from flashinfer.jit import cubin_loader
+
+    # The JIT logger is not registered with logging's manager, so caplog cannot
+    # reach it; route the module's logging through one that it can.
+    test_logger = logging.getLogger("test_cubin_loader")
+    monkeypatch.setattr(cubin_loader, "logger", test_logger)
+    caplog.set_level(level, logger=test_logger.name)
+
+    url = "https://example.test/artifacts/kernel.cubin"
+    body = "<H1>Access Denied</H1>Reference&#32;&#35;18&#46;4d2f1502&#46;1694779729"
+    with responses.RequestsMock() as rsps:
+        rsps.add(
+            responses.GET,
+            url,
+            body=body,
+            status=403,
+            headers={"Server": "AkamaiGHost"},
+        )
+        assert not cubin_loader.download_file(
+            url, str(tmp_path / "kernel.cubin"), retries=1
+        )
+
+    assert "attempt 1 failed: 403" in caplog.text
+    assert ("Server: AkamaiGHost" in caplog.text) == dumped
+    assert (body in caplog.text) == dumped
 
 
 def test_get_checksums_unreachable_pin_raises(monkeypatch, tmp_path):
@@ -315,9 +413,9 @@ def test_get_checksums_unreachable_pin_raises(monkeypatch, tmp_path):
     monkeypatch.setattr(artifacts, "download_file", lambda *args, **kwargs: False)
 
     with pytest.raises(RuntimeError) as excinfo:
-        artifacts.get_checksums([artifact_paths.DEEPGEMM_RUBIN])
+        artifacts.get_checksums([artifact_paths.DEEPGEMM])
     # The pin must be named -- that is the whole point of the error.
-    assert artifact_paths.DEEPGEMM_RUBIN in str(excinfo.value)
+    assert artifact_paths.DEEPGEMM in str(excinfo.value)
 
 
 def test_get_checksums_falls_back_to_cached_manifest(monkeypatch, tmp_path):
@@ -331,14 +429,14 @@ def test_get_checksums_falls_back_to_cached_manifest(monkeypatch, tmp_path):
     monkeypatch.setattr(artifacts, "FLASHINFER_CUBIN_DIR", cubin_dir)
     monkeypatch.setattr(artifacts, "download_file", lambda *args, **kwargs: False)
 
-    cached = cubin_dir / safe_urljoin(artifact_paths.DEEPGEMM_RUBIN, "checksums.txt")
+    cached = cubin_dir / safe_urljoin(artifact_paths.DEEPGEMM, "checksums.txt")
     cached.parent.mkdir(parents=True)
     cached.write_text("abc123 kernel.fp8_m_grouped_gemm.007d9ebdca7e.cubin\n")
 
-    checksums = artifacts.get_checksums([artifact_paths.DEEPGEMM_RUBIN])
+    checksums = artifacts.get_checksums([artifact_paths.DEEPGEMM])
     assert checksums == {
         safe_urljoin(
-            artifact_paths.DEEPGEMM_RUBIN,
+            artifact_paths.DEEPGEMM,
             "kernel.fp8_m_grouped_gemm.007d9ebdca7e.cubin",
         ): "abc123"
     }
@@ -377,34 +475,11 @@ b5c6d7e8f9a0 Bmm_Bfloat16_E2m1E2m1_Fp32_t128x16x256_s6_et128x16_m128x16x64_cga1x
 c6d7e8f9a0b1 Bmm_Bfloat16_E2m1E2m1_Fp32_t128x16x256u2_s6_et128x16_m128x16x64_cga1x1x1_16dp256b_TN_transOut_schedP2x1x2x3_bN_clmp_dynBatch_sm100f.cubin
 """
 
-    # Rubin pins: identical kernel filenames to the non-Rubin pins above, but
-    # every hash differs (they are built from different sources). Keying the
-    # checksum map by bare filename would let whichever pin is processed last
-    # overwrite the other's hashes.
-    checksums_bmm_rubin = """1111111111111111111111111111111111111111111111111111111111111111 include/flashinferMetaInfo.h
-aaaa111122223333 Bmm_Bfloat16_E2m1E2m1_Fp32_t128x16x256_s6_et128x16_m128x16x64_cga1x1x1_16dp256b_TN_transOut_schedP2x1x2x3_bN_clmp_dynBatch_sm100f.cubin
-bbbb111122223333 Bmm_Bfloat16_E2m1E2m1_Fp32_t128x16x256_s6_et128x16_m128x16x64_cga1x1x1_16dp256b_TN_transOut_schedS_bN_clmp_dynBatch_sm100f.cubin
-cccc111122223333 Bmm_Bfloat16_E2m1E2m1_Fp32_t128x16x256u2_s6_et128x16_m128x16x64_cga1x1x1_16dp256b_TN_transOut_schedP2x1x2x3_bN_clmp_dynBatch_sm100f.cubin
-"""
-
-    checksums_gemm_rubin = """2222222222222222222222222222222222222222222222222222222222222222 include/flashinferMetaInfo.h
-dddd111122223333 Gemm_Bfloat16_E2m1E2m1_Fp32_t128x128x128_s3_et128x128_m128x128x64_cga1x1x1_16dp256b_TN_transOut_schedS_sm100f.cubin
-eeee111122223333 Gemm_Bfloat16_E2m1E2m1_Fp32_t128x128x128_s6_et128x128_m128x128x64_cga1x1x1_16dp256b_TN_transOut_schedS_sm100f.cubin
-ffff111122223333 Gemm_Bfloat16_E2m1E2m1_Fp32_t128x128x128u2_s3_et128x128_m128x128x64_cga1x1x1_16dp256b_TN_transOut_schedS_sm100f.cubin
-"""
-
     checksums_deepgemm = """b4374f857c3066089c4ec6b5e79e785559fa2c05ce2623710b0b04bf86414a48 kernel_map.json
 a0b1c2d3e4f5 kernel.fp8_m_grouped_gemm.007404769193.cubin
 d7e8f9a0b1c2 kernel.fp8_m_grouped_gemm.007d9ebdca7e.cubin
 e8f9a0b1c2d3 kernel.fp8_m_grouped_gemm.02acb2ba71fd.cubin
 f9a0b1c2d3e4 kernel.fp8_m_grouped_gemm.0457375eb02f.cubin
-"""
-
-    checksums_deepgemm_rubin = """3333333333333333333333333333333333333333333333333333333333333333 kernel_map.json
-1111aaaabbbbcccc kernel.fp8_m_grouped_gemm.007404769193.cubin
-2222aaaabbbbcccc kernel.fp8_m_grouped_gemm.007d9ebdca7e.cubin
-3333aaaabbbbcccc kernel.fp8_m_grouped_gemm.02acb2ba71fd.cubin
-4444aaaabbbbcccc kernel.fp8_m_grouped_gemm.0457375eb02f.cubin
 """
 
     # Add mock responses for checksums.txt files
@@ -426,38 +501,11 @@ f9a0b1c2d3e4 kernel.fp8_m_grouped_gemm.0457375eb02f.cubin
     )
     responses.add(responses.GET, bmm_checksums_url, body=checksums_bmm, status=200)
 
-    bmm_rubin_checksums_url = safe_urljoin(
-        test_cubin_repository,
-        safe_urljoin(artifact_paths.TRTLLM_GEN_BMM_RUBIN, "checksums.txt"),
-    )
-    responses.add(
-        responses.GET, bmm_rubin_checksums_url, body=checksums_bmm_rubin, status=200
-    )
-
-    gemm_rubin_checksums_url = safe_urljoin(
-        test_cubin_repository,
-        safe_urljoin(artifact_paths.TRTLLM_GEN_GEMM_RUBIN, "checksums.txt"),
-    )
-    responses.add(
-        responses.GET, gemm_rubin_checksums_url, body=checksums_gemm_rubin, status=200
-    )
-
     deepgemm_checksums_url = safe_urljoin(
         test_cubin_repository, safe_urljoin(artifact_paths.DEEPGEMM, "checksums.txt")
     )
     responses.add(
         responses.GET, deepgemm_checksums_url, body=checksums_deepgemm, status=200
-    )
-
-    deepgemm_rubin_checksums_url = safe_urljoin(
-        test_cubin_repository,
-        safe_urljoin(artifact_paths.DEEPGEMM_RUBIN, "checksums.txt"),
-    )
-    responses.add(
-        responses.GET,
-        deepgemm_rubin_checksums_url,
-        body=checksums_deepgemm_rubin,
-        status=200,
     )
 
     # Mock DSL_FMHA checksums + directory index for the host cpu_arch.
@@ -526,40 +574,283 @@ f9a0b1c2d3e4 kernel.fp8_m_grouped_gemm.0457375eb02f.cubin
         if "include/flashInferMetaInfo.h" in url
         or "include/flashinferMetaInfo.h" in url
     ]
-    # FMHA, GEMM, BMM, GEMM_RUBIN, BMM_RUBIN.
-    assert len(meta_info_headers) == 5, (
-        f"Meta info headers count mismatch. Expected 5, got {len(meta_info_headers)}. Headers found: {meta_info_headers}"
+    # FMHA, GEMM, BMM.
+    assert len(meta_info_headers) == 3, (
+        f"Meta info headers count mismatch. Expected 3, got {len(meta_info_headers)}. Headers found: {meta_info_headers}"
     )
 
-    # Regression: per-arch pins share kernel filenames but not hashes, so each
-    # entry must carry the checksum from its own pin. Keying the checksum map
-    # by bare filename let the pin processed last overwrite the earlier one,
-    # which failed verification for every shared name.
     by_path = dict(cubin_files)
     assert len(by_path) == len(cubin_files), "duplicate paths in cubin file list"
 
-    for shared_name, plain_dir, rubin_dir in (
-        (
-            "Bmm_Bfloat16_E2m1E2m1_Fp32_t128x16x256_s6_et128x16_m128x16x64_cga1x1x1_16dp256b_TN_transOut_schedS_bN_clmp_dynBatch_sm100f.cubin",
-            artifact_paths.TRTLLM_GEN_BMM,
-            artifact_paths.TRTLLM_GEN_BMM_RUBIN,
-        ),
-        (
-            "Gemm_Bfloat16_E2m1E2m1_Fp32_t128x128x128_s6_et128x128_m128x128x64_cga1x1x1_16dp256b_TN_transOut_schedS_sm100f.cubin",
-            artifact_paths.TRTLLM_GEN_GEMM,
-            artifact_paths.TRTLLM_GEN_GEMM_RUBIN,
-        ),
-        (
-            "kernel.fp8_m_grouped_gemm.007d9ebdca7e.cubin",
-            artifact_paths.DEEPGEMM,
-            artifact_paths.DEEPGEMM_RUBIN,
-        ),
+
+def test_get_checksums_keys_by_full_path(monkeypatch, tmp_path):
+    """Two pins shipping the same kernel filename must keep separate hashes.
+
+    Keying the checksum map by bare filename let whichever subdir was processed
+    last overwrite the earlier one, which then failed verification for every
+    shared name.
+    """
+    from flashinfer import artifacts
+
+    cubin_dir = tmp_path / "cubins"
+    monkeypatch.setattr(artifacts, "FLASHINFER_CUBIN_DIR", cubin_dir)
+    monkeypatch.setattr(artifacts, "download_file", lambda *args, **kwargs: False)
+
+    shared_name = "kernel.fp8_m_grouped_gemm.007d9ebdca7e.cubin"
+    for subdir, sha in (("pin-a/", "aaaa1111"), ("pin-b/", "bbbb2222")):
+        cached = cubin_dir / safe_urljoin(subdir, "checksums.txt")
+        cached.parent.mkdir(parents=True)
+        cached.write_text(f"{sha} {shared_name}\n")
+
+    checksums = artifacts.get_checksums(["pin-a/", "pin-b/"])
+    assert checksums == {
+        safe_urljoin("pin-a/", shared_name): "aaaa1111",
+        safe_urljoin("pin-b/", shared_name): "bbbb2222",
+    }
+
+
+def test_download_artifacts_reuses_checksum_verified_cache(monkeypatch, tmp_path):
+    """Valid cached artifacts are reused; missing or corrupt files are fetched."""
+    from flashinfer import artifacts
+
+    cubin_dir = tmp_path / "cubins"
+    monkeypatch.setattr(artifacts, "FLASHINFER_CUBIN_DIR", cubin_dir)
+    monkeypatch.setattr(artifacts, "FLASHINFER_CUBINS_REPOSITORY", "https://example/")
+
+    payloads = {
+        "pin/cached.cubin": b"already cached",
+        "pin/corrupt.cubin": b"replacement",
+        "pin/missing.cubin": b"downloaded",
+    }
+    cubin_files = [
+        (name, hashlib.sha256(payload).hexdigest())
+        for name, payload in payloads.items()
+    ]
+    monkeypatch.setattr(artifacts, "get_subdir_file_list", lambda: iter(cubin_files))
+
+    cached_path = cubin_dir / "pin/cached.cubin"
+    cached_path.parent.mkdir(parents=True)
+    cached_path.write_bytes(payloads["pin/cached.cubin"])
+    (cubin_dir / "pin/corrupt.cubin").write_bytes(b"bad cache entry")
+    stale_path = cubin_dir / "old-pin/stale.cubin"
+    stale_path.parent.mkdir(parents=True)
+    stale_path.write_bytes(b"stale cache entry")
+
+    downloads = []
+
+    def fake_download(source, destination, **_kwargs):
+        name = source.removeprefix("https://example/")
+        downloads.append(name)
+        destination_path = Path(destination)
+        destination_path.write_bytes(payloads[name])
+        return True
+
+    monkeypatch.setattr(artifacts, "download_file", fake_download)
+
+    artifacts.download_artifacts()
+
+    assert downloads == ["pin/corrupt.cubin", "pin/missing.cubin"]
+    for name, payload in payloads.items():
+        assert (cubin_dir / name).read_bytes() == payload
+    assert not stale_path.exists()
+    assert not stale_path.parent.exists()
+
+
+def _single_artifact(monkeypatch, artifacts, tmp_path, payload=b"downloaded"):
+    """Point download_artifacts at one fake artifact under tmp_path."""
+    cubin_dir = tmp_path / "cubins"
+    monkeypatch.setattr(artifacts, "FLASHINFER_CUBIN_DIR", cubin_dir)
+    monkeypatch.setattr(artifacts, "FLASHINFER_CUBINS_REPOSITORY", "https://example/")
+    monkeypatch.setenv("FLASHINFER_CUBIN_DOWNLOAD_THREADS", "1")
+    monkeypatch.setattr(
+        artifacts,
+        "get_subdir_file_list",
+        lambda: iter([("pin/file.cubin", hashlib.sha256(payload).hexdigest())]),
+    )
+    return cubin_dir
+
+
+def test_download_artifacts_retries_within_retry_window(monkeypatch, tmp_path):
+    """Retry window keeps retrying failed downloads until one succeeds."""
+    from flashinfer import artifacts
+
+    payload = b"downloaded"
+    cubin_dir = _single_artifact(monkeypatch, artifacts, tmp_path, payload)
+    monkeypatch.setenv("FLASHINFER_CUBIN_RETRY_WINDOW_SECONDS", "60")
+    monkeypatch.setattr(artifacts.time, "sleep", lambda _seconds: None)
+
+    attempts = {"count": 0}
+
+    def flaky_download(_source, destination, **kwargs):
+        attempts["count"] += 1
+        if attempts["count"] < 3:
+            return False
+        Path(destination).write_bytes(payload)
+        assert kwargs["session"] is not None
+        return True
+
+    monkeypatch.setattr(artifacts, "download_file", flaky_download)
+
+    artifacts.download_artifacts()
+
+    assert attempts["count"] == 3
+    assert (cubin_dir / "pin/file.cubin").read_bytes() == payload
+
+
+def test_download_artifacts_backs_off_exponentially_between_retries(
+    monkeypatch, tmp_path
+):
+    """Retries back off exponentially and saturate at the cap.
+
+    A long retry window must not become a high-frequency poll of an endpoint we
+    already believe is congested, so pin the cadence rather than just the fact
+    that a retry happens.
+    """
+    from flashinfer import artifacts
+
+    payload = b"downloaded"
+    _single_artifact(monkeypatch, artifacts, tmp_path, payload)
+    monkeypatch.setenv("FLASHINFER_CUBIN_RETRY_WINDOW_SECONDS", "86400")
+
+    sleeps: list[float] = []
+    monkeypatch.setattr(artifacts.time, "sleep", sleeps.append)
+    # Drop the jitter so the exponential schedule is exact; jitter only widens
+    # each delay to uniform[cap, 2*cap].
+    monkeypatch.setattr(artifacts.random, "uniform", lambda _a, _b: 0.0)
+
+    attempts = {"count": 0}
+
+    def flaky_download(_source, destination, **_kwargs):
+        attempts["count"] += 1
+        if attempts["count"] < 8:
+            return False
+        Path(destination).write_bytes(payload)
+        return True
+
+    monkeypatch.setattr(artifacts, "download_file", flaky_download)
+
+    artifacts.download_artifacts()
+
+    assert sleeps == [5.0, 10.0, 20.0, 40.0, 80.0, 150.0, 150.0]
+
+
+def test_download_artifacts_does_not_retry_without_retry_window(monkeypatch, tmp_path):
+    """Without a window, a failed download is reported immediately."""
+    from flashinfer import artifacts
+
+    _single_artifact(monkeypatch, artifacts, tmp_path)
+    monkeypatch.delenv("FLASHINFER_CUBIN_RETRY_WINDOW_SECONDS", raising=False)
+
+    attempts = {"count": 0}
+
+    def failing_download(_source, _destination, **_kwargs):
+        attempts["count"] += 1
+        return False
+
+    monkeypatch.setattr(artifacts, "download_file", failing_download)
+    monkeypatch.setattr(
+        artifacts.time, "sleep", lambda _s: pytest.fail("slept without a retry window")
+    )
+
+    with pytest.raises(RuntimeError, match="Failed to download cubins"):
+        artifacts.download_artifacts()
+
+    assert attempts["count"] == 1
+
+
+def test_download_artifacts_fails_when_retry_window_expires(monkeypatch, tmp_path):
+    """Download fails once the retry window deadline is exceeded."""
+    from flashinfer import artifacts
+
+    _single_artifact(monkeypatch, artifacts, tmp_path)
+    monkeypatch.setenv("FLASHINFER_CUBIN_RETRY_WINDOW_SECONDS", "600")
+    monkeypatch.setattr(artifacts.time, "sleep", lambda _seconds: None)
+
+    # Advance a fake clock past the window instead of sleeping through it.
+    clock = {"now": 0.0}
+
+    def fake_monotonic() -> float:
+        now = clock["now"]
+        clock["now"] += 300.0
+        return now
+
+    monkeypatch.setattr(artifacts.time, "monotonic", fake_monotonic)
+    monkeypatch.setattr(artifacts, "download_file", lambda *_args, **_kwargs: False)
+
+    with pytest.raises(RuntimeError, match="Failed to download cubins: pin/file.cubin"):
+        artifacts.download_artifacts()
+
+
+def test_download_artifacts_invalid_retry_window_env_raises(monkeypatch, tmp_path):
+    """Invalid retry-window env values fail with a clear config error."""
+    from flashinfer import artifacts
+
+    cubin_dir = tmp_path / "cubins"
+    monkeypatch.setattr(artifacts, "FLASHINFER_CUBIN_DIR", cubin_dir)
+    monkeypatch.setenv("FLASHINFER_CUBIN_RETRY_WINDOW_SECONDS", "abc")
+    monkeypatch.setattr(artifacts, "get_subdir_file_list", lambda: iter([]))
+
+    with pytest.raises(
+        RuntimeError, match="Invalid FLASHINFER_CUBIN_RETRY_WINDOW_SECONDS value"
     ):
-        plain_path = safe_urljoin(plain_dir, shared_name)
-        rubin_path = safe_urljoin(rubin_dir, shared_name)
-        assert plain_path in by_path, f"{plain_path} missing from cubin file list"
-        assert rubin_path in by_path, f"{rubin_path} missing from cubin file list"
-        assert by_path[plain_path] != by_path[rubin_path], (
-            f"{shared_name} resolved to the same checksum for both pins "
-            f"({by_path[plain_path]}) -- the per-pin hashes collided"
-        )
+        artifacts.download_artifacts()
+
+
+def test_download_artifacts_negative_retry_window_env_raises(monkeypatch, tmp_path):
+    """Negative retry-window values are rejected."""
+    from flashinfer import artifacts
+
+    cubin_dir = tmp_path / "cubins"
+    monkeypatch.setattr(artifacts, "FLASHINFER_CUBIN_DIR", cubin_dir)
+    monkeypatch.setenv("FLASHINFER_CUBIN_RETRY_WINDOW_SECONDS", "-1")
+    monkeypatch.setattr(artifacts, "get_subdir_file_list", lambda: iter([]))
+
+    with pytest.raises(
+        RuntimeError, match="Invalid FLASHINFER_CUBIN_RETRY_WINDOW_SECONDS value"
+    ):
+        artifacts.download_artifacts()
+
+
+def test_download_artifacts_reports_worker_exception_with_artifact_name(
+    monkeypatch, tmp_path
+):
+    """Unexpected worker exceptions are reported as failed artifact names."""
+    from flashinfer import artifacts
+
+    _single_artifact(monkeypatch, artifacts, tmp_path)
+    monkeypatch.delenv("FLASHINFER_CUBIN_RETRY_WINDOW_SECONDS", raising=False)
+
+    def raising_download(_source, _destination, **_kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(artifacts, "download_file", raising_download)
+
+    with pytest.raises(
+        RuntimeError, match=r"Failed to download cubins: pin/file\.cubin \(RuntimeError"
+    ):
+        artifacts.download_artifacts()
+
+
+def test_download_artifacts_rejects_bad_download_after_cache_miss(
+    monkeypatch, tmp_path
+):
+    """A successful HTTP result still must match the expected checksum."""
+    from flashinfer import artifacts
+
+    cubin_dir = tmp_path / "cubins"
+    monkeypatch.setattr(artifacts, "FLASHINFER_CUBIN_DIR", cubin_dir)
+    monkeypatch.setattr(artifacts, "FLASHINFER_CUBINS_REPOSITORY", "https://example/")
+    monkeypatch.setattr(
+        artifacts,
+        "get_subdir_file_list",
+        lambda: iter([("pin/file.cubin", hashlib.sha256(b"expected").hexdigest())]),
+    )
+
+    def fake_download(_source, destination, **_kwargs):
+        Path(destination).write_bytes(b"unexpected")
+        return True
+
+    monkeypatch.setattr(artifacts, "download_file", fake_download)
+
+    with pytest.raises(RuntimeError, match="checksum mismatch"):
+        artifacts.download_artifacts()

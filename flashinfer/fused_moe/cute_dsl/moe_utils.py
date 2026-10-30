@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import ctypes
 import functools
 import math
 from enum import IntEnum
@@ -23,6 +24,7 @@ import torch
 
 from ...jit.moe_utils import gen_moe_utils_module
 from ...tllm_enums import ActivationType, is_gated_activation, normalize_activation_type
+from ...utils import get_compute_capability
 
 
 def _get_cuda_stream_ptr() -> int:
@@ -32,6 +34,19 @@ def _get_cuda_stream_ptr() -> int:
     PyTorch's current stream, not TVM's default stream.
     """
     return torch.cuda.current_stream().cuda_stream
+
+
+def _is_finite_fp32(value: float, *, positive: bool = False) -> bool:
+    """Whether ``value`` is finite (and positive, if requested) after fp32 rounding.
+
+    The kernels consume these constants (and, for the SiTU scales, their
+    reciprocals) as fp32, so a Python float that rounds to ``0.0`` or ``inf``
+    in fp32 is unusable even though it is finite and positive in f64.
+    """
+    if not math.isfinite(value) or (positive and value <= 0):
+        return False
+    value_f32 = ctypes.c_float(value).value
+    return math.isfinite(value_f32) and (not positive or value_f32 > 0)
 
 
 # ============================ Helper Functions ============================
@@ -56,6 +71,20 @@ def normalize_cute_dsl_moe_activation_type(
     return activation_type, is_gated_activation(activation_type)
 
 
+def validate_cute_dsl_moe_swiglu_config(
+    swiglu_alpha: float,
+    swiglu_beta: float,
+    swiglu_limit: float,
+) -> None:
+    """Validate the SwiGLU epilogue constants."""
+    if not _is_finite_fp32(swiglu_alpha):
+        raise ValueError("swiglu_alpha must be finite in fp32")
+    if not _is_finite_fp32(swiglu_beta):
+        raise ValueError("swiglu_beta must be finite in fp32")
+    if not _is_finite_fp32(swiglu_limit, positive=True):
+        raise ValueError("swiglu_limit must be positive and finite in fp32")
+
+
 def validate_cute_dsl_moe_situ_config(
     activation_type: ActivationType,
     situ_beta: Optional[float],
@@ -68,12 +97,41 @@ def validate_cute_dsl_moe_situ_config(
         return
     if activation_type != ActivationType.Swiglu:
         raise ValueError("SiTU parameters require ActivationType.Swiglu")
-    if not math.isfinite(situ_beta) or situ_beta <= 0:
-        raise ValueError("situ_beta must be positive and finite")
-    if situ_linear_beta is not None and (
-        not math.isfinite(situ_linear_beta) or situ_linear_beta <= 0
+    if not _is_finite_fp32(situ_beta, positive=True):
+        raise ValueError("situ_beta must be positive and finite in fp32")
+    if situ_linear_beta is not None and not _is_finite_fp32(
+        situ_linear_beta, positive=True
     ):
-        raise ValueError("situ_linear_beta must be positive and finite when set")
+        raise ValueError(
+            "situ_linear_beta must be positive and finite in fp32 when set"
+        )
+
+
+def rubin_moe_cluster_covers_one_tile(
+    tile_size: int,
+    mma_tiler: Tuple[int, int, int],
+    mma_inst_shape: Tuple[int, int, int],
+    cluster_shape_mn: Tuple[int, int],
+) -> bool:
+    """Return whether a Rubin (SM107) MoE GEMM tactic maps one cluster to one
+    ``moe_sort`` routing tile along M.
+
+    ``moe_sort`` writes one metadata entry (expert index, M limit) per
+    ``tile_size``-row routing tile, for ``[0, num_non_exiting_tiles)`` only;
+    both Rubin GEMMs bound their metadata reads by that count. A CTA's routing
+    tile is its M tile coordinate divided by ``atom_cta_m``, the MMA CTA
+    group size along M (2 for the 2-CTA ``mma_inst_shape[0] == 256`` MMA,
+    else 1). With ``mma_tiler[0] == tile_size`` and ``cluster_shape_mn[0] ==
+    atom_cta_m`` every CTA of a cluster resolves to the same routing tile, so
+    the CTAs agree on whether the tile is valid and reach the cluster barrier
+    together: no rounding of the tile count and no initialization of the
+    metadata past the active prefix is needed. A cluster spanning several
+    routing tiles (``cluster_shape_mn[0] > atom_cta_m``) would need both, and
+    is not supported. Cluster N only multicasts A/SFA among CTAs of the same
+    routing tile and does not affect this property.
+    """
+    atom_cta_m = 2 if mma_inst_shape[0] == 256 else 1
+    return mma_tiler[0] == tile_size and cluster_shape_mn[0] == atom_cta_m
 
 
 def get_max_num_tiles(
@@ -650,25 +708,25 @@ def moe_sort(
 
     # Use pre-allocated buffers if provided, otherwise allocate new ones
     # Pre-allocation is required for CUDA graph compatibility
+    #
+    # Entries outside the active prefix are intentionally uninitialized.
+    # Routing writes [0, num_non_exiting_tiles), and both GEMMs consume exactly
+    # that count. This also holds for Rubin 2-CTA and cluster_shape_n > 1
+    # tactics, whose clusters cover exactly one routing tile; tactics with a
+    # cluster spanning several routing tiles, which would require
+    # rounded/padded metadata entries, are rejected before moe_sort (see
+    # rubin_moe_cluster_covers_one_tile).
     if out_tile_idx_to_expert_idx is not None:
         tile_idx_to_expert_idx = out_tile_idx_to_expert_idx
-        # Zero-fill to ensure safe defaults for entries beyond num_non_exiting_tiles.
-        # This prevents out-of-bounds weight accesses when Rubin kernels round up
-        # the tile count to an even number for cluster synchronization.
-        tile_idx_to_expert_idx.zero_()
     else:
-        tile_idx_to_expert_idx = torch.zeros(
+        tile_idx_to_expert_idx = torch.empty(
             (max_num_tiles,), dtype=torch.int32, device=device
         )
 
     if out_tile_idx_to_mn_limit is not None:
         tile_idx_to_mn_limit = out_tile_idx_to_mn_limit
-        # Zero-fill for the same reason as tile_idx_to_expert_idx above: the Rubin
-        # even-tile rounding can read one mn_limit slot the routing kernel never
-        # wrote; a stale value there would corrupt row stores.
-        tile_idx_to_mn_limit.zero_()
     else:
-        tile_idx_to_mn_limit = torch.zeros(
+        tile_idx_to_mn_limit = torch.empty(
             (max_num_tiles,), dtype=torch.int32, device=device
         )
 
@@ -698,11 +756,15 @@ def moe_sort(
     else:
         num_non_exiting_tiles = torch.empty((1,), dtype=torch.int32, device=device)
 
-    # Allocate expert counts buffer for large token counts (>1024).
+    # Expert counts buffer, required by the cooperative and multi-kernel routing
+    # paths. The block, dynamic-block and (SM90+ only) single-cluster kernels
+    # route small batches without it; 1024 tokens on SM90+ and 4 tokens before
+    # SM90 are conservative bounds of those kernels' limits.
     # Required size: 2 * num_experts. The kernel zeros this internally via
     # launchInitExpertCounts before reading, so no Python-side init is needed
     # (matching trt-llm's torch::empty allocation pattern).
-    if num_tokens > 1024:
+    expert_counts_min_tokens = 1024 if get_compute_capability(device)[0] >= 9 else 4
+    if num_tokens > expert_counts_min_tokens:
         expert_counts = torch.empty(
             (2 * num_experts,), dtype=torch.int32, device=device
         )
@@ -771,6 +833,8 @@ def moe_activation(
 
     This is a generic activation function that supports multiple activation types.
     For convenience, use the specific wrappers like moe_swiglu(), moe_gelu(), etc.
+    Only rows below their tile's ``tile_idx_to_mn_limit``, in the first
+    ``num_non_exiting_tiles`` tiles, are written.
 
     Args:
         input: Input tensor. For GLU activations (Swiglu, Geglu), shape is
@@ -806,6 +870,7 @@ def moe_activation(
         interm_size,
         tile_size,
         enable_pdl,
+        _get_cuda_stream_ptr(),
     )
 
 

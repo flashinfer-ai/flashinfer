@@ -2,9 +2,10 @@
 #
 # Reference Dockerfile for building FlashInfer with the moe_ep transport
 # backends enabled (the default): NIXL-EP is compiled from the in-tree git
-# submodule; NCCL-EP is the released `nccl4py>=0.3.1` wheel (a base
+# submodule; NCCL-EP is the released `nccl-extensions>=0.1.0` wheel (a base
 # dependency), which ships the `nccl.ep` API + bundled libnccl_ep.so (no
-# in-tree NCCL build).
+# in-tree NCCL build). nccl.ep used to live in nccl4py; it moved out in
+# nccl4py 0.4.1 — nccl4py is still pulled in for `nccl.core.Communicator`.
 #
 # Usage:
 #   cd /path/to/flashinfer
@@ -121,7 +122,7 @@ ENV VIRTUAL_ENV=${VENV}
 RUN uv pip install --python ${VENV}/bin/python \
         torch \
         setuptools packaging \
-        'apache-tvm-ffi>=0.1.6,<0.2,!=0.1.8,!=0.1.8.post0' \
+        'apache-tvm-ffi>=0.1.11,<0.2' \
         cython pybind11
 
 # moe_ep runtime base libraries — supplied by these pip wheels (not staged
@@ -160,7 +161,7 @@ RUN uv pip install --python ${VENV}/bin/python --no-deps \
 # loader in flashinfer/moe_ep/nixl_ep ctypes-preloads the base libs from the
 # same wheel. Set BUILD_NIXL_EP_HERMETIC=1 to opt back into the full
 # from-source build (for hosts without PyPI access or when investigating ABI
-# mismatches). NCCL-EP has no build step — it ships in the nccl4py wheel.
+# mismatches). NCCL-EP has no build step — it ships in the nccl-extensions wheel.
 ARG BUILD_NVEP=1
 ARG BUILD_NCCL_EP=
 ARG BUILD_NIXL_EP=
@@ -172,7 +173,7 @@ WORKDIR ${FLASHINFER_SRC}
 # the submodule .git pointers reference the host superproject's .git/modules/
 # tree which isn't copied, and `git apply` in _apply_patches works on a plain
 # directory without a git repo.
-# The base deps pull the released `nccl4py>=0.3.1` wheel (NCCL-EP: the
+# The base deps pull the released `nccl-extensions>=0.1.0` wheel (NCCL-EP: the
 # `nccl.ep` API + bundled libnccl_ep.so) — no in-tree NCCL build. The build
 # hook builds NIXL-EP from the submodule by default.
 RUN BUILD_NVEP=${BUILD_NVEP} \
@@ -192,6 +193,6 @@ b = available_backends(); \
 print('moe_ep backends:', b); \
 assert 'nccl_ep' in b, 'nccl_ep backend missing'; \
 assert 'nixl_ep' in b, 'nixl_ep backend missing'"
-RUN python -c "import nccl.ep; from nccl.core import Communicator; print('nccl.ep + nccl4py OK')"
+RUN python -c "import nccl.ep; from nccl.core import Communicator; print('nccl.ep (nccl-extensions) + nccl.core (nccl4py) OK')"
 
 CMD ["bash"]

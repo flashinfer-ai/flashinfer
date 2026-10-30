@@ -1,0 +1,135 @@
+{
+  "name": "trtllm_bf16_routed_moe_topk2_e8_h1024",
+  "description": "TRT-LLM BF16 MoE with precomputed topk_ids.",
+  "op_type": "moe",
+  "tags": [
+    "fi_api:flashinfer.fused_moe.backends.prims_ts.bf16_op.prims_ts_bf16_routed_moe",
+    "status:verified",
+    "backend:trtllm"
+  ],
+  "axes": {
+    "seq_len": {
+      "type": "var",
+      "description": "Number of input tokens."
+    },
+    "num_experts": {
+      "type": "var",
+      "description": "Total number of experts (passed as kwarg)."
+    },
+    "top_k": {
+      "type": "const",
+      "value": 2
+    },
+    "num_local_experts": {
+      "type": "const",
+      "value": 8,
+      "description": "Number of local experts."
+    },
+    "hidden_size": {
+      "type": "const",
+      "value": 1024
+    },
+    "intermediate_size": {
+      "type": "var",
+      "description": "MoE intermediate layer size (passed as kwarg)."
+    },
+    "gemm1_out_size": {
+      "type": "const",
+      "value": 1024,
+      "description": "2 * intermediate_size."
+    }
+  },
+  "inputs": {
+    "topk_ids": {
+      "shape": [
+        "seq_len",
+        "top_k"
+      ],
+      "dtype": "int32",
+      "description": "Precomputed top-k expert ids per token."
+    },
+    "hidden_states": {
+      "shape": [
+        "seq_len",
+        "hidden_size"
+      ],
+      "dtype": "bfloat16",
+      "description": "Input hidden states (dtype depends on variant)."
+    },
+    "gemm1_weights": {
+      "shape": [
+        "num_local_experts",
+        "gemm1_out_size",
+        "hidden_size"
+      ],
+      "dtype": "bfloat16",
+      "description": "FC1 weights (gate+up)."
+    },
+    "gemm2_weights": {
+      "shape": [
+        "num_local_experts",
+        "hidden_size",
+        "intermediate_size"
+      ],
+      "dtype": "bfloat16",
+      "description": "FC2 weights (down)."
+    },
+    "num_experts": {
+      "shape": null,
+      "dtype": "int32",
+      "description": "Total number of experts."
+    },
+    "top_k": {
+      "shape": null,
+      "dtype": "int32",
+      "description": "Number of experts to route per token."
+    },
+    "local_expert_offset": {
+      "shape": null,
+      "dtype": "int32",
+      "description": "Offset of local experts in global expert space."
+    },
+    "routed_scaling_factor": {
+      "shape": null,
+      "dtype": "float32",
+      "optional": true,
+      "description": "Scaling factor for routing weights."
+    },
+    "gemm1_alpha": {
+      "shape": [
+        "num_local_experts"
+      ],
+      "dtype": "float32",
+      "optional": true,
+      "description": "Optional per-expert SwiGLU OA alpha."
+    },
+    "gemm1_beta": {
+      "shape": [
+        "num_local_experts"
+      ],
+      "dtype": "float32",
+      "optional": true,
+      "description": "Optional per-expert SwiGLU OA beta."
+    },
+    "gemm1_clamp_limit": {
+      "shape": [
+        "num_local_experts"
+      ],
+      "dtype": "float32",
+      "optional": true,
+      "description": "Optional per-expert SwiGLU OA clamp limit."
+    }
+  },
+  "outputs": {
+    "output": {
+      "shape": [
+        "seq_len",
+        "hidden_size"
+      ],
+      "dtype": "bfloat16",
+      "description": "MoE output."
+    }
+  },
+  "reference": "from __future__ import annotations\nimport math\nimport torch\nimport torch.nn.functional as F\n\n@torch.no_grad()\ndef _trtllm_bf16_routed_moe_reference(\n    topk_ids,\n    hidden_states,\n    gemm1_weights,\n    gemm2_weights,\n    num_experts,\n    top_k,\n    local_expert_offset,\n    routed_scaling_factor=None,\n    gemm1_alpha=None,\n    gemm1_beta=None,\n    gemm1_clamp_limit=None,\n    **_unused,\n):\n    \"\"\"Reference for TRT-LLM BF16 MoE with precomputed topk_ids.\"\"\"\n    T = topk_ids.shape[0]\n    scale = float(routed_scaling_factor or 1.0)\n    # Uniform weight per selected expert (real routing scales not available).\n    w_topk = torch.full(\n        (T, int(top_k)),\n        scale / float(top_k),\n        dtype=torch.float32,\n        device=hidden_states.device,\n    )\n    return _moe_bf16_run_experts(\n        hidden_states,\n        gemm1_weights,\n        gemm2_weights,\n        w_topk,\n        topk_ids.to(torch.int64),\n        local_expert_offset,\n        int(num_experts),\n        gemm1_alpha=gemm1_alpha,\n        gemm1_beta=gemm1_beta,\n        gemm1_clamp_limit=gemm1_clamp_limit,\n    )\n",
+  "check": "def standard_check(\n    reference_outputs: Any,\n    actual_outputs: Any,\n    *,\n    rtol: Optional[float] = None,\n    atol: Optional[float] = None,\n    max_mismatch_pct: float = 0.0,\n    min_cos_sim: Optional[float] = 1.0 - 1e-3,\n) -> bool:\n    \"\"\"Default trace correctness check used when a template does not override it.\"\"\"\n    from flashinfer.trace import default_check\n\n    return default_check(\n        reference_outputs,\n        actual_outputs,\n        rtol=rtol,\n        atol=atol,\n        max_mismatch_pct=max_mismatch_pct,\n        min_cos_sim=min_cos_sim,\n    )\n"
+}

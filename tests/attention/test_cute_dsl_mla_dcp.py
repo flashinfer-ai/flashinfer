@@ -246,6 +246,34 @@ def _reference_attention(
     return out, lse
 
 
+def _reference_variable_q_attention(
+    query: torch.Tensor,
+    cum_seq_lens_q: torch.Tensor,
+    global_kv: torch.Tensor,
+    global_lens: torch.Tensor,
+    *,
+    cp_world: int = 1,
+    cp_rank: int = 0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Reference compact variable-Q attention one request at a time."""
+    outputs = []
+    lses = []
+    offsets = cum_seq_lens_q.tolist()
+    for batch_idx, (q_begin, q_end) in enumerate(
+        zip(offsets[:-1], offsets[1:], strict=True)
+    ):
+        request_out, request_lse = _reference_attention(
+            query[q_begin:q_end].unsqueeze(0),
+            global_kv[batch_idx : batch_idx + 1],
+            global_lens[batch_idx : batch_idx + 1],
+            cp_world=cp_world,
+            cp_rank=cp_rank,
+        )
+        outputs.append(request_out.squeeze(0))
+        lses.append(request_lse.squeeze(0))
+    return torch.cat(outputs), torch.cat(lses)
+
+
 def _merge_rank_outputs_natural_log(
     rank_outputs: list[torch.Tensor],
     rank_lses: list[torch.Tensor],
@@ -366,6 +394,61 @@ def _launch_rank(
     return out, lse, split_kv
 
 
+def _launch_variable_q_rank(
+    query: torch.Tensor,
+    cum_seq_lens_q: torch.Tensor,
+    max_q_len: int,
+    global_kv: torch.Tensor,
+    global_lens: torch.Tensor,
+    *,
+    cp_world: int,
+    cp_rank: int,
+) -> tuple[torch.Tensor, torch.Tensor, int]:
+    """Launch one compact variable-Q DCP rank."""
+    from flashinfer.cute_dsl.attention.monolithic.mla_decode import (
+        _get_split_kv_and_workspace_size,
+        cute_dsl_mla_decode,
+    )
+    from flashinfer.cute_dsl.utils import get_num_sm
+
+    kv_cache, block_tables, local_lens, max_local_len = _pack_cyclic_rank_pages(
+        global_kv, global_lens, cp_world, cp_rank
+    )
+    batch_size = cum_seq_lens_q.numel() - 1
+    num_heads = query.shape[1]
+    split_kv, workspace_size = _get_split_kv_and_workspace_size(
+        batch_size,
+        max_q_len,
+        num_heads,
+        _LATENT_DIM,
+        get_num_sm(query.device),
+        max_local_len,
+    )
+    workspace = torch.empty(
+        max(workspace_size, 1), dtype=torch.int8, device=query.device
+    )
+    out, lse = cute_dsl_mla_decode(
+        query=query,
+        kv_cache=kv_cache,
+        workspace_buffer=workspace,
+        kv_lora_rank=_LATENT_DIM,
+        qk_rope_head_dim=_ROPE_DIM,
+        block_tables=block_tables,
+        seq_lens=local_lens,
+        max_seq_len=max_local_len,
+        softmax_scale=1.0 / math.sqrt(_LATENT_DIM),
+        is_var_seq=True,
+        return_lse=True,
+        cum_seq_lens_q=cum_seq_lens_q,
+        max_q_len=max_q_len,
+        enable_dcp=True,
+        cp_world=cp_world,
+        cp_rank=cp_rank,
+        causal_seqlens_kv_global=global_lens,
+    )
+    return out, lse, split_kv
+
+
 def _assert_close_to_reference(
     out: torch.Tensor,
     lse: torch.Tensor,
@@ -419,6 +502,51 @@ def _assert_dcp_rank_merge_matches_reference(
 
     merged_out, merged_lse = _merge_rank_outputs_natural_log(rank_outputs, rank_lses)
     ref_out, ref_lse = _reference_attention(query, global_kv, global_lens)
+    _assert_close_to_reference(merged_out, merged_lse, ref_out, ref_lse, dtype)
+    return split_kvs
+
+
+def _assert_variable_q_dcp_rank_merge_matches_reference(
+    query: torch.Tensor,
+    cum_seq_lens_q: torch.Tensor,
+    max_q_len: int,
+    global_kv: torch.Tensor,
+    global_lens: torch.Tensor,
+    *,
+    cp_world: int,
+    dtype: torch.dtype,
+) -> list[int]:
+    """Check compact rank-local states and the final cross-rank merge."""
+    rank_outputs = []
+    rank_lses = []
+    split_kvs = []
+    for cp_rank in range(cp_world):
+        out, lse, split_kv = _launch_variable_q_rank(
+            query,
+            cum_seq_lens_q,
+            max_q_len,
+            global_kv,
+            global_lens,
+            cp_world=cp_world,
+            cp_rank=cp_rank,
+        )
+        ref_out, ref_lse = _reference_variable_q_attention(
+            query,
+            cum_seq_lens_q,
+            global_kv,
+            global_lens,
+            cp_world=cp_world,
+            cp_rank=cp_rank,
+        )
+        _assert_close_to_reference(out, lse, ref_out, ref_lse, dtype)
+        rank_outputs.append(out)
+        rank_lses.append(lse)
+        split_kvs.append(split_kv)
+
+    merged_out, merged_lse = _merge_rank_outputs_natural_log(rank_outputs, rank_lses)
+    ref_out, ref_lse = _reference_variable_q_attention(
+        query, cum_seq_lens_q, global_kv, global_lens
+    )
     _assert_close_to_reference(merged_out, merged_lse, ref_out, ref_lse, dtype)
     return split_kvs
 
@@ -572,6 +700,19 @@ def test_cute_dsl_mla_dcp_dispatch_is_strictly_monolithic():
         )
         == "monolithic"
     )
+    assert (
+        _resolve_impl(
+            requested="auto",
+            kwargs={
+                "enable_dcp": True,
+                "cp_world": 2,
+                "cp_rank": 0,
+                "cum_seq_lens_q": torch.tensor([0, 2, 3], dtype=torch.int32),
+                "max_q_len": 2,
+            },
+        )
+        == "monolithic"
+    )
     with pytest.raises(ValueError, match="only supported by the monolithic"):
         _resolve_impl(
             requested="modular",
@@ -666,6 +807,134 @@ def test_cute_dsl_mla_dcp_packed_head_counts(num_heads):
         dtype=torch.bfloat16,
     )
     assert split_kvs == [1, 1]
+
+
+@pytest.mark.parametrize(
+    "dtype",
+    [torch.bfloat16, torch.float8_e4m3fn],
+    ids=["bf16", "fp8"],
+)
+def test_cute_dsl_mla_variable_q_dcp_rank_merge(dtype):
+    """Compose compact ragged Q with DCP, empty ranks, and split-KV."""
+    _skip_if_unsupported()
+    torch.manual_seed(70)
+    q_lens = (4, 1, 0, 3)
+    max_q_len = 8
+    dense_query, global_kv, global_lens = _make_batched_inputs(
+        global_lengths=(1, 130, 3, 4101),
+        q_len=max_q_len,
+        num_heads=24,
+        dtype=dtype,
+    )
+    query = torch.cat(
+        [dense_query[batch_idx, :q_len] for batch_idx, q_len in enumerate(q_lens)]
+    )
+    cum_seq_lens_q = torch.tensor(
+        (0, 4, 5, 5, 8), dtype=torch.int32, device=query.device
+    )
+
+    split_kvs = _assert_variable_q_dcp_rank_merge_matches_reference(
+        query,
+        cum_seq_lens_q,
+        max_q_len,
+        global_kv,
+        global_lens,
+        cp_world=4,
+        dtype=dtype,
+    )
+    assert all(split_kv > 1 for split_kv in split_kvs)
+
+
+def test_cute_dsl_mla_variable_q_dcp_fp8_direct_empty_rank():
+    """Cover FP8 direct epilogue with short requests and empty local ranks."""
+    _skip_if_unsupported()
+    torch.manual_seed(72)
+    q_lens = (4, 1, 0, 3)
+    max_q_len = 8
+    dense_query, global_kv, global_lens = _make_batched_inputs(
+        global_lengths=(1, 130, 3, 129),
+        q_len=max_q_len,
+        num_heads=24,
+        dtype=torch.float8_e4m3fn,
+    )
+    query = torch.cat(
+        [dense_query[batch_idx, :q_len] for batch_idx, q_len in enumerate(q_lens)]
+    )
+    cum_seq_lens_q = torch.tensor(
+        (0, 4, 5, 5, 8), dtype=torch.int32, device=query.device
+    )
+
+    split_kvs = _assert_variable_q_dcp_rank_merge_matches_reference(
+        query,
+        cum_seq_lens_q,
+        max_q_len,
+        global_kv,
+        global_lens,
+        cp_world=4,
+        dtype=torch.float8_e4m3fn,
+    )
+    assert split_kvs == [1] * 4
+
+
+def test_cute_dsl_mla_variable_q_dcp_public_api():
+    """Route compact DCP through the public MLA backend selector."""
+    _skip_if_unsupported()
+    from flashinfer.cute_dsl.attention.monolithic.mla_decode import (
+        _get_split_kv_and_workspace_size,
+    )
+    from flashinfer.cute_dsl.utils import get_num_sm
+    from flashinfer.mla._core import trtllm_batch_decode_with_kv_cache_mla
+
+    torch.manual_seed(71)
+    dense_query, global_kv, global_lens = _make_batched_inputs(
+        global_lengths=(256, 130),
+        q_len=4,
+        num_heads=96,
+        dtype=torch.bfloat16,
+    )
+    query = torch.cat((dense_query[0, :4], dense_query[1, :1]))
+    cum_seq_lens_q = torch.tensor((0, 4, 5), dtype=torch.int32, device=query.device)
+    kv_cache, block_tables, local_lens, max_local_len = _pack_cyclic_rank_pages(
+        global_kv, global_lens, cp_world=2, cp_rank=0
+    )
+    _, workspace_size = _get_split_kv_and_workspace_size(
+        2, 4, 96, _LATENT_DIM, get_num_sm(query.device), max_local_len
+    )
+    workspace = torch.empty(
+        max(workspace_size, 1), dtype=torch.int8, device=query.device
+    )
+
+    out, lse = trtllm_batch_decode_with_kv_cache_mla(
+        query=query,
+        kv_cache=kv_cache,
+        workspace_buffer=workspace,
+        qk_nope_head_dim=128,
+        kv_lora_rank=_LATENT_DIM,
+        qk_rope_head_dim=_ROPE_DIM,
+        block_tables=block_tables,
+        seq_lens=local_lens,
+        max_seq_len=max_local_len,
+        bmm1_scale=1.0 / math.sqrt(_LATENT_DIM),
+        bmm2_scale=1.0,
+        backend="auto",
+        is_var_seq=True,
+        return_lse=True,
+        cum_seq_lens_q=cum_seq_lens_q,
+        max_q_len=4,
+        enable_dcp=True,
+        cp_world=2,
+        cp_rank=0,
+        causal_seqlens_kv_global=global_lens,
+    )
+    ref_out, ref_lse = _reference_variable_q_attention(
+        query,
+        cum_seq_lens_q,
+        global_kv,
+        global_lens,
+        cp_world=2,
+        cp_rank=0,
+    )
+    _assert_close_to_reference(out, lse, ref_out, ref_lse, torch.bfloat16)
 
 
 def test_cute_dsl_mla_dcp_public_api_autotune_profiles_causal_tensor():

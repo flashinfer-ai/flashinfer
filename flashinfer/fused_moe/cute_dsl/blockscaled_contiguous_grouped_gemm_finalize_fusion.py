@@ -41,10 +41,12 @@ Key features:
 """
 
 import functools
+import warnings
 from typing import Any, Dict, List, Optional, Tuple
 
 import cutlass
 import cutlass.cute as cute
+
 import cuda.bindings.driver as cuda
 import torch
 
@@ -253,6 +255,8 @@ def _get_compiled_finalize_kernel(
         sf_dtype,
         out_dtype,
         final_scale_dtype,
+        # The persistent grid size is a compile-time constant.
+        max_active_clusters,
         enable_pdl,
         use_a_per_token_scale,
         use_fused_finalize,
@@ -266,18 +270,6 @@ def _get_compiled_finalize_kernel(
                     "not supported by the Rubin (SM107) finalize grouped "
                     "GEMM kernel yet: its wrapper has no "
                     "a_per_token_scale_ptr parameter."
-                )
-            if not use_fused_finalize:
-                # The Rubin kernel takes no use_fused_finalize parameter: it
-                # always does the atomic scatter-add into token rows.  The
-                # caller allocates `out` with torch.empty (not torch.zeros)
-                # and shape (seq_len * topk, n) in the unfused case, so
-                # silently ignoring this would accumulate into uninitialized
-                # memory at the wrong shape.
-                raise NotImplementedError(
-                    "use_fused_finalize=False is not supported by the Rubin "
-                    "(SM107) finalize grouped GEMM kernel: it always performs "
-                    "the fused atomic scatter-add."
                 )
             if final_scale_dtype is not cutlass.Float32:
                 # The Rubin kernel hardcodes self.final_scale_dtype =
@@ -295,6 +287,7 @@ def _get_compiled_finalize_kernel(
                 raster_along_m=raster_along_m,
                 topK=topk,
                 enable_pdl=enable_pdl,
+                use_fused_finalize=use_fused_finalize,
             )
             wrapper_fn = gemm_rubin.wrapper  # type: ignore[attr-defined]
         else:
@@ -345,6 +338,8 @@ def _get_compiled_finalize_kernel(
             scaling_vector_size=sf_vec_size,
             max_active_clusters=max_active_clusters,
             stream=stream,
+            # Rubin strides must be runtime Int64s, not Python constexprs.
+            **({"c_stride_row": cutlass.Int64(0)} if is_rubin else {}),
         )
 
         _finalize_kernel_cache[cache_key] = compiled_gemm
@@ -352,7 +347,7 @@ def _get_compiled_finalize_kernel(
     return _finalize_kernel_cache[cache_key]
 
 
-def _blockscaled_contiguous_grouped_gemm_finalize_fusion(
+def blockscaled_contiguous_grouped_gemm_finalize_fusion(
     a: torch.Tensor,
     b: torch.Tensor,
     a_scale: torch.Tensor,
@@ -375,6 +370,7 @@ def _blockscaled_contiguous_grouped_gemm_finalize_fusion(
     cluster_shape_mn: Tuple[int, int] = (2, 1),
     raster_along_m: bool = False,
     sm_count: Optional[int] = None,
+    domain_id: int = -1,
     # Rubin-specific parameters (optional; when set, use SM107 kernel)
     mma_tiler: Optional[Tuple[int, int, int]] = None,
     mma_inst_shape: Optional[Tuple[int, int, int]] = None,
@@ -401,19 +397,23 @@ def _blockscaled_contiguous_grouped_gemm_finalize_fusion(
         token_final_scales: Router scaling factors, shape (seq_len, topk), float32/bf16/fp16
         out: Optional output tensor. Shape is ``(seq_len, n)`` in fused mode
              and ``(seq_len * topk, n)`` in deterministic mode. In fused mode,
-             a provided buffer must already be zero-initialized.
+             a provided buffer must already be zero-initialized. Caller-provided
+             buffers must be contiguous and on the same device as A.
         a_per_token_scale: Optional per-row operand-A scale, shape (permuted_m,).
              Used when GEMM1 output is quantized by a standalone per-token
-             NVFP4 quantizer instead of the fused GEMM1 epilogue.
+             W4A4 quantizer instead of the fused GEMM1 epilogue.
         a_dtype: Data type for the A matrix.
         b_dtype: Data type for the B matrix.
         sf_dtype: Data type for scale factors. Default: "float8_e4m3fn"
         out_dtype: Data type for output matrix. Default: "bfloat16"
-        sf_vec_size: Scale factor vector size. Default: 16 (for NVFP4)
+        sf_vec_size: Scale factor vector size. Use 16 for W4A4 or 32 for W4A8.
         mma_tiler_mn: MMA tile shape (M, N). Default: (256, 128)
         cluster_shape_mn: Cluster shape (ClusterM, ClusterN). Default: (2, 1)
         raster_along_m: If True, raster tiles along M dimension. Default: False
         sm_count: Number of SMs to use. Default: max available.
+        domain_id: Locality-domain index (0 or 1), or -1 for ordinary output.
+             Rubin localized execution writes this shard's hidden columns into
+             a caller-provided output with twice the shard's output width.
         use_fused_finalize: Use atomic fused finalize; otherwise write expanded
              rows for deterministic reduction. Default: True.
 
@@ -424,7 +424,7 @@ def _blockscaled_contiguous_grouped_gemm_finalize_fusion(
     Notes:
         - A caller-provided fused output must be zero-initialized.
         - Call create_finalize_fusion_tensors() to create permuted_idx_to_expanded_idx and token_final_scales.
-        - Requires SM100 (Blackwell) GPU architecture
+        - Supports SM100/SM103, plus W4A4 on SM107 with Rubin tactic parameters.
         - Deterministic mode requires a separate ``moe_unpermute`` call.
 
     Example:
@@ -445,7 +445,7 @@ def _blockscaled_contiguous_grouped_gemm_finalize_fusion(
         ... )
         >>>
         >>> # Run grouped GEMM with finalize fusion
-        >>> out = blockscaled_contiguous_grouped_gemm_finalize_fusion_nvfp4(
+        >>> out = blockscaled_contiguous_grouped_gemm_finalize_fusion(
         ...     a=gemm1_output_fp4,              # (valid_m, intermediate_dim//2)
         ...     b=expert_down_weights_fp4,       # (num_experts, hidden_dim, intermediate_dim//2)
         ...     a_scale=gemm1_output_scale,
@@ -456,6 +456,8 @@ def _blockscaled_contiguous_grouped_gemm_finalize_fusion(
         ...     tile_idx_to_mn_limit=mn_limit,
         ...     permuted_idx_to_expanded_idx=permuted_idx,
         ...     token_final_scales=final_scales,
+        ...     a_dtype="float4_e2m1fn",
+        ...     b_dtype="float4_e2m1fn",
         ... )  # out shape: (seq_len, hidden_dim)
     """
     # Validate inputs
@@ -508,10 +510,6 @@ def _blockscaled_contiguous_grouped_gemm_finalize_fusion(
         raise ValueError(
             f"mma_tiler/mma_inst_shape select the Rubin (SM107) finalize "
             f"kernel, but the device is SM{major}{minor}."
-        )
-    if not is_rubin and minor == 7:
-        raise ValueError(
-            "SM107 requires the Rubin tactic parameters mma_tiler and mma_inst_shape."
         )
 
     # Validate configuration
@@ -577,6 +575,23 @@ def _blockscaled_contiguous_grouped_gemm_finalize_fusion(
 
     output_rows = seq_len if use_fused_finalize else seq_len * topk
 
+    # Both domains write disjoint column ranges of one full-width output.
+    localized_half_gemm = domain_id >= 0
+    if localized_half_gemm:
+        if not is_rubin:
+            raise ValueError(
+                "locality-domain hidden-shard (domain_id >= 0) is Rubin (SM107) only"
+            )
+        if domain_id >= 2:
+            raise ValueError(f"domain_id must be 0 or 1, got {domain_id}")
+        if out is None:
+            raise ValueError(
+                "locality-domain hidden-shard requires a caller-provided full-width out. Both "
+                "dies write disjoint column halves of one shared buffer, which the "
+                "caller must also have zeroed before the fused atomic finalize."
+            )
+    expected_n = n * 2 if localized_half_gemm else n
+
     # Atomic fused finalize requires zero-initialized output.
     if out is None:
         allocator = torch.zeros if use_fused_finalize else torch.empty
@@ -587,23 +602,39 @@ def _blockscaled_contiguous_grouped_gemm_finalize_fusion(
         )
     else:
         expected_out_dtype = cutlass_to_torch_dtype(out_dtype_cutlass)
-        if out.shape != (output_rows, n):
+        if out.shape != (output_rows, expected_n):
             raise ValueError(
-                f"out must have shape ({output_rows}, {n}), got {tuple(out.shape)}"
+                f"out must have shape ({output_rows}, {expected_n}), got {tuple(out.shape)}"
             )
         if out.dtype != expected_out_dtype:
             raise TypeError(
                 f"out must have dtype {expected_out_dtype}, got {out.dtype}"
             )
+        if out.device != a.device:
+            raise ValueError(f"out must be on {a.device}, got {out.device}")
+        if not out.is_contiguous():
+            raise ValueError("out must be contiguous")
 
     # Get SM count
+    total_sm = get_num_sm(a.device)
     if sm_count is None:
-        sm_count = get_num_sm(a.device)
+        sm_count = total_sm
 
     # Compute max active clusters (cached to avoid expensive HardwareInfo queries)
     max_active_clusters = get_max_active_clusters(
         cluster_shape_mn[0] * cluster_shape_mn[1]
     )
+    # Scale full-device occupancy to the green context's SM allocation.
+    if sm_count < total_sm:
+        max_active_clusters = max(1, max_active_clusters * sm_count // total_sm)
+
+    # Each domain writes its own columns with the full output row stride.
+    if localized_half_gemm:
+        c_stride_row_val = cutlass.Int64(n * 2)
+        c_data_ptr = out.data_ptr() + domain_id * n * out.element_size()
+    else:
+        c_stride_row_val = cutlass.Int64(0)
+        c_data_ptr = out.data_ptr()
 
     tile_size = mma_tiler[0] if is_rubin else mma_tiler_mn[0]
 
@@ -620,8 +651,10 @@ def _blockscaled_contiguous_grouped_gemm_finalize_fusion(
     b_sf_ptr = make_ptr(
         sf_dtype_cutlass, b_scale.data_ptr(), cute.AddressSpace.gmem, assumed_align=16
     )
+    # c_data_ptr carries this die's column offset in locality-domain mode (== out.data_ptr()
+    # otherwise).
     c_ptr = make_ptr(
-        out_dtype_cutlass, out.data_ptr(), cute.AddressSpace.gmem, assumed_align=32
+        out_dtype_cutlass, c_data_ptr, cute.AddressSpace.gmem, assumed_align=32
     )
 
     alpha_ptr = make_ptr(cutlass.Float32, alpha.data_ptr(), cute.AddressSpace.gmem)
@@ -723,6 +756,8 @@ def _blockscaled_contiguous_grouped_gemm_finalize_fusion(
         seq_len,
         topk,
         stream=stream,
+        # Match the runtime stride traced by the Rubin wrapper.
+        **({"c_stride_row": c_stride_row_val} if is_rubin else {}),
     )
 
     return out
@@ -758,7 +793,14 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion_nvfp4(
     use_fused_finalize: bool = True,
 ) -> torch.Tensor:
     """Run the existing homogeneous NVFP4 GEMM2 finalize kernel."""
-    return _blockscaled_contiguous_grouped_gemm_finalize_fusion(
+    warnings.warn(
+        "blockscaled_contiguous_grouped_gemm_finalize_fusion_nvfp4 is "
+        "deprecated; use blockscaled_contiguous_grouped_gemm_finalize_fusion "
+        "instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    return blockscaled_contiguous_grouped_gemm_finalize_fusion(
         a,
         b,
         a_scale,
@@ -814,6 +856,13 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion_mxfp8_mxfp4(
     be divisible by 128 and by ``mma_tiler_mn[1]`` because the current finalize
     epilogue does not predicate a partial N tile.
     """
+    warnings.warn(
+        "blockscaled_contiguous_grouped_gemm_finalize_fusion_mxfp8_mxfp4 is "
+        "deprecated; use blockscaled_contiguous_grouped_gemm_finalize_fusion "
+        "instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     if a.ndim != 2 or b.ndim != 3:
         raise ValueError(f"Expected A rank 2 and B rank 3, got {a.ndim} and {b.ndim}")
     if a.dtype is not torch.float8_e4m3fn:
@@ -862,7 +911,7 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion_mxfp8_mxfp4(
         if not out.is_contiguous():
             raise ValueError("out must be contiguous")
 
-    return _blockscaled_contiguous_grouped_gemm_finalize_fusion(
+    return blockscaled_contiguous_grouped_gemm_finalize_fusion(
         a,
         b,
         a_scale,
