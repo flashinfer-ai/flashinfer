@@ -439,6 +439,6 @@
       ]
     }
   ],
-  "package": "flashinfer.experimental.cake_kda_train",
+  "package": "flashinfer.experimental.cake_kda_det_train",
   "schema": "cake-build/1"
 }
