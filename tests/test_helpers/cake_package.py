@@ -32,6 +32,7 @@ PACKAGES: dict[str, str] = {
     "cake_mok_bf16": "flashinfer.experimental.cake_mok_bf16",
     "cake_kda_train": "flashinfer.experimental.cake_kda_train",
     "cake_kda_det_train": "flashinfer.experimental.cake_kda_det_train",
+    "cake_kda_det_train_kcp": "flashinfer.experimental.cake_kda_det_train_kcp",
     "cake_gdn_det_train_kcp": "flashinfer.experimental.cake_gdn_det_train_kcp",
     "cake_kimi_k3_attn_res": "flashinfer.experimental.cake_kimi_k3_attn_res",
     "cake_stepfun_moe": "flashinfer.experimental.cake_stepfun_moe",

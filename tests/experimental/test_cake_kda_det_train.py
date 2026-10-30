@@ -41,7 +41,6 @@ from tests.test_helpers.cake_package import cake_package
 cake_backend = cake_package("cake_kda_det_train", "cake_backend")
 cake_build = cake_package("cake_kda_det_train", "cake_build")
 cake_jit = cake_package("cake_kda_det_train", "cake_jit")
-cake_kcp_jit = cake_package("cake_kda_det_train", "cake_kcp_jit")
 PACKAGE_DIR = Path(cake_jit.__file__).resolve().parent
 
 ARCHES = tuple(cake_jit.ARCHES)
@@ -3096,16 +3095,14 @@ def test_manifest_is_well_formed(manifest: dict) -> None:
     libraries = manifest["libraries"]
     names = [entry["name"] for entry in libraries]
     # The 65 programs of cake_jit.MODULES, each built for the architectures its record delivers (61 on all three,
-    # the four of RECORD_ARCHES on one each: 187 libraries), plus the KCP programs of cake_kcp_jit.MODULES
-    # on every architecture (its test-only TEST_MODULES live in build.test.json, never here).
-    kcp_libraries = {record["library"] for record in cake_kcp_jit.MODULES.values()}
+    # the four of RECORD_ARCHES on one each: 187 libraries); the KCP programs have their own package.
     train_libraries = {
         (record["library"], arch)
         for record in cake_jit.MODULES.values()
         for arch in record["arches"]
     }
     assert len(train_libraries) == 187
-    assert len(names) == len(set(names)) == 187 + len(kcp_libraries) * len(ARCHES)
+    assert len(names) == len(set(names)) == 187
     for entry in libraries:
         assert entry["arch"] in ARCHES
         assert entry["entry"] == "run"
@@ -3125,18 +3122,8 @@ def test_manifest_is_well_formed(manifest: dict) -> None:
         cake_jit.library_name(name, arch)
         for name, record in cake_jit.MODULES.items()
         for arch in record["arches"]
-    } | {
-        cake_kcp_jit.library_name(name, arch)
-        for name in cake_kcp_jit.MODULES
-        for arch in ARCHES
     }
     assert set(names) == expected
-    test_only = {
-        cake_kcp_jit.test_library_name(name, arch)
-        for name in cake_kcp_jit.TEST_MODULES
-        for arch in ARCHES
-    }
-    assert not test_only & set(names), "test-only programs never enter build.json"
 
 
 def test_library_name_refuses_an_undelivered_architecture() -> None:

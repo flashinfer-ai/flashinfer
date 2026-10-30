@@ -13,7 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
-The KDA ``KcpContext`` is one leaf of FSDP2's input walks (flashinfer issue #7914): the pre-forward hook of every
+The KDA ``ContextDetKcp`` is one leaf of FSDP2's input walks (flashinfer issue #7914): the pre-forward hook of every
 ``fully_shard`` module walks each dataclass, dict, list and tuple of the module's arguments twice
 (``collect_grad_tensors`` / ``replace_grad_tensors``), so a context carried in per-layer metadata must not be one.
 The gate is structural: the number of nodes the walk visits is the same with a context of 80 fragments, of 2,048
@@ -35,7 +35,7 @@ from torch import nn
 
 from tests.test_helpers.cake_package import cake_package
 
-kcp_plan = cake_package("cake_kda_train", "cake_kcp_plan")
+kcp_plan = cake_package("cake_kda_det_train_kcp", "cake_kcp_plan")
 
 try:
     from torch.distributed.fsdp import _common_utils as fsdp_common
@@ -61,11 +61,11 @@ class BatchMeta:
 
 def _context(lengths: list[int], cp: int, fragments: int):
     """Rank 0's context of ``lengths`` cut per document into ``2 * cp`` pieces, without a process group, in its
-    state after the first ``chunk_kda_kcp`` call of ``HEADS`` heads; ``fragments`` = the group's fragment count."""
+    state after the first ``chunk_kda_det_kcp`` call of ``HEADS`` heads; ``fragments`` = the group's fragment count."""
     cu = torch.tensor([0, *torch.tensor(lengths).cumsum(0).tolist()], dtype=torch.int64)
-    part = kcp_plan.kcp_partition(cu, cp, "zigzag_per_document")
+    part = kcp_plan.partition_det_kcp(cu, cp, "zigzag_per_document")
     assert sum(len(f) for f in part.fragments) == fragments
-    return cu, kcp_plan.build_kcp_context(part, None, 0, "cpu", heads=HEADS)
+    return cu, kcp_plan.build_context_det_kcp(part, None, 0, "cpu", heads=HEADS)
 
 
 @pytest.fixture(scope="module")
@@ -143,12 +143,12 @@ def test_input_cast_keeps_context(contexts) -> None:
 def test_context_keeps_dataclass_behavior(contexts) -> None:
     """Constructor fields in the former order, the former repr, identity equality and hash, frozen attributes."""
     _, ctx = contexts[80]
-    K = kcp_plan.KcpContext
+    K = kcp_plan.ContextDetKcp
     assert not dataclasses.is_dataclass(ctx) and not dataclasses.is_dataclass(K)
     assert tuple(inspect.signature(K).parameters) == K._FIELDS
     # the repr of the former dataclass (sequence and the "_" caches had repr=False)
     former = dataclasses.make_dataclass(
-        "KcpContext",
+        "ContextDetKcp",
         [
             (f, Any, dataclasses.field(repr=f != "sequence" and not f.startswith("_")))
             for f in K._FIELDS
@@ -191,7 +191,7 @@ class _Layer(nn.Module):
         self.proj = nn.Linear(width, width)
 
     def forward(self, x: torch.Tensor, meta: BatchMeta) -> torch.Tensor:
-        assert meta.kcp is None or isinstance(meta.kcp, kcp_plan.KcpContext)
+        assert meta.kcp is None or isinstance(meta.kcp, kcp_plan.ContextDetKcp)
         return self.proj(x)
 
 

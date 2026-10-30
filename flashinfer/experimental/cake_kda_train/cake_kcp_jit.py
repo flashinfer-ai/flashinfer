@@ -1,5 +1,5 @@
 # Copyright (c) 2026 by FlashInfer team. Licensed under Apache-2.0.
-"""Compatibility import for flashinfer.experimental.cake_kda_det_train.cake_kcp_jit (the same module object)."""
+"""Compatibility import for flashinfer.experimental.cake_kda_det_train_kcp.cake_kcp_jit (the same module object)."""
 
 from importlib import import_module
 import sys
@@ -11,5 +11,5 @@ if TYPE_CHECKING:
 
 
 sys.modules[__name__] = import_module(
-    "flashinfer.experimental.cake_kda_det_train.cake_kcp_jit"
+    "flashinfer.experimental.cake_kda_det_train_kcp.cake_kcp_jit"
 )

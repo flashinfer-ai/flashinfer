@@ -29,10 +29,10 @@ import pytest
 
 from tests.test_helpers.cake_package import cake_package
 
-cake_build = cake_package("cake_kda_train", "cake_build")
-cake_jit = cake_package("cake_kda_train", "cake_jit")
-kcp_jit = cake_package("cake_kda_train", "cake_kcp_jit")
-kcp_plan = cake_package("cake_kda_train", "cake_kcp_plan")
+cake_build = cake_package("cake_kda_det_train_kcp", "cake_build")
+cake_jit = cake_package("cake_kda_det_train", "cake_jit")
+kcp_jit = cake_package("cake_kda_det_train_kcp", "cake_kcp_jit")
+kcp_plan = cake_package("cake_kda_det_train_kcp", "cake_kcp_plan")
 
 PACKAGE_DIR = Path(cake_build.__file__).parent
 ARCHES = ("sm_100a", "sm_103a", "sm_107a")
@@ -93,7 +93,9 @@ PLANS = {
     "kcp_fwdh_tape_full": FWDH_PLAN,
     "kcp_dhu_tape_full": DHU_PLAN,
 }
-# The identity rule: ``cake_kda_train_<20 hex of sha256("<tart module>\\n<sorted JSON of the build keywords>")>``.
+# The identity rule: ``cake_kda_det_train_<20 hex of sha256("<source module>\\n<sorted JSON of the build keywords>")>``,
+# then ``_kcp`` for a program only the context-parallel route runs (every one but the two chunk stages).  The
+# digest hashes the source module path the program shipped under, so the digests are those of the previous names.
 _W = "sm100_sm103_sm107"
 IDENTITIES = {
     "kcp_fwdh_offset": (
@@ -159,6 +161,10 @@ IDENTITIES = {
         {"program": "tape"},
     ),
 }
+
+
+# The two chunk stages the route runs at the rank's shape: det programs without the ``_kcp`` suffix.
+CHUNK_STAGES = ("kcp_fwd_o", "kcp_dav")
 
 
 def _records() -> dict[str, dict]:
@@ -228,10 +234,13 @@ def test_program_names_follow_the_identity_rule() -> None:
         digest = hashlib.sha256(
             f"{module}\n{json.dumps(kwargs, sort_keys=True)}".encode()
         ).hexdigest()
-        assert _records()[name]["library"] == f"cake_kda_train_{digest[:20]}", name
+        suffix = "" if name in CHUNK_STAGES else "_kcp"
+        assert (
+            _records()[name]["library"] == f"cake_kda_det_train_{digest[:20]}{suffix}"
+        ), name
     libraries = [record["library"] for record in _records().values()]
     assert len(set(libraries)) == len(libraries), "every record is its own program"
-    assert not set(libraries) & set(cake_jit.MODULES), (
+    assert not set(libraries) & {r["library"] for r in cake_jit.MODULES.values()}, (
         "no KCP program shares a name with a single-rank one"
     )
 
@@ -371,10 +380,10 @@ def test_walk_form_rules_and_records() -> None:
 def test_the_shipped_transfer_walk_is_the_half_width_bf16x3_program() -> None:
     record = kcp_jit.MODULES["kcp_transfer_walk"]
     assert record["grid_rule"] == {"ctas_per_head": 2, "kind": "kcp_segments_heads"}
-    assert record["library"] == "cake_kda_train_9a3f306bacf8c8a1547d"
+    assert record["library"] == "cake_kda_det_train_9a3f306bacf8c8a1547d_kcp"
     previous = kcp_jit.TEST_MODULES["kcp_transfer_walk_tf32_hilo"]
     assert previous["grid_rule"] == {"kind": "kcp_segments_heads"}
-    assert previous["library"] == "cake_kda_train_1ac972f0cb7cc7b13cf7"
+    assert previous["library"] == "cake_kda_det_train_1ac972f0cb7cc7b13cf7_kcp"
     assert previous["test_knobs"] == {"transfer_walk": "tf32_hilo"}
     assert kcp_jit.TRANSFER_WALKS[0] == "bf16x3_hw64"
 
@@ -429,7 +438,7 @@ def test_test_manifest_is_the_test_only_programs_under_the_opt_in(
     assert (
         document["package"]
         == shipped["package"]
-        == "flashinfer.experimental.cake_kda_det_train"
+        == "flashinfer.experimental.cake_kda_det_train_kcp"
     )
     # the shipped manifest is re-rendered by every kernel update of the package, the test-only manifest only when its
     # programs change: the two generator records share their form, not their stamp

@@ -17,7 +17,7 @@ Benchmark of the context-parallel (KCP) Cake packed KDA training step: one
 process per rank (``torchrun --nproc_per_node N``), every rank timing the
 module boundary of its fragments -- the KCP causal convolution
 (``flashinfer.cake_causal_conv1d_train.cake_causal_conv1d_kcp``) followed by
-the KCP KDA step (``flashinfer.kda_train.chunk_kda_kcp``), forward and
+the KCP KDA step (``flashinfer.cake_kda_det_train_kcp.chunk_kda_det_kcp``), forward and
 backward -- with CUDA events, and the slowest rank's time counting for the
 iteration.
 
@@ -43,7 +43,7 @@ group.  Rank 0 prints the table and writes ``--json``.
 
 Example::
 
-    torchrun --nproc_per_node 4 benchmarks/bench_cake_kda_train_kcp.py \\
+    torchrun --nproc_per_node 4 benchmarks/bench_cake_kda_det_train_kcp.py \\
         --seqlen 65536 --docs 3 --heads 16 --channels 4096 --groups 3 --samples 8 --json kcp.json
 """
 
@@ -67,15 +67,15 @@ from flashinfer.cake_causal_conv1d_train import (  # noqa: E402
     cake_causal_conv1d,
     cake_causal_conv1d_kcp,
 )
-from flashinfer.kda_train import (  # noqa: E402
-    build_kcp_context,
-    chunk_kda,
-    chunk_kda_kcp,
-    kcp_comm_bytes,
-    kcp_partition,
-    kcp_saved_bytes,
-    kcp_workspace_bytes,
+from flashinfer.cake_kda_det_train_kcp import (  # noqa: E402
+    build_context_det_kcp,
+    chunk_kda_det_kcp,
+    kda_det_comm_bytes_kcp,
+    kda_det_saved_bytes_kcp,
+    kda_det_workspace_bytes_kcp,
+    partition_det_kcp,
 )
+from flashinfer.kda_train import chunk_kda  # noqa: E402
 from tests.test_helpers.cake_kda_train_reference import make_inputs  # noqa: E402
 
 ARMS = ("cake", "control", "local", "fla")
@@ -137,9 +137,9 @@ def make_problem(args, rank: int, world: int, device: torch.device) -> dict[str,
         torch.bfloat16
     )
     weight = (torch.randn(args.channels, WIDTH, generator=gen) * 0.3).to(device)
-    part = kcp_partition(cu_cpu, world, args.layout)
+    part = partition_det_kcp(cu_cpu, world, args.layout)
     group = dist.group.WORLD
-    ctx = build_kcp_context(part, group, rank, device)
+    ctx = build_context_det_kcp(part, group, rank, device)
     fragments = part.fragments[rank]
     local = {
         name: _shard(inputs[name], cu, fragments).to(device)
@@ -171,7 +171,7 @@ def _step_kcp(problem: dict[str, Any]) -> None:
         local[n].detach().requires_grad_(True) for n in ("q", "k", "v", "g", "beta")
     )
     y = cake_causal_conv1d_kcp(x, w, ctx)
-    out = chunk_kda_kcp(q, k, v, g, beta, ctx)
+    out = chunk_kda_det_kcp(q, k, v, g, beta, ctx)
     torch.autograd.backward([y, out], [local["dy"], local["dout"]])
 
 
@@ -292,9 +292,11 @@ def run(args, rank: int, world: int, device: torch.device) -> dict[str, Any]:
             "seed": args.seed,
         },
         "bytes": {
-            "workspace": kcp_workspace_bytes(ctx, H=args.heads, C=args.channels),
-            "saved": kcp_saved_bytes(ctx, H=args.heads, C=args.channels),
-            "comm": kcp_comm_bytes(ctx, H=args.heads, C=args.channels),
+            "workspace": kda_det_workspace_bytes_kcp(
+                ctx, H=args.heads, C=args.channels
+            ),
+            "saved": kda_det_saved_bytes_kcp(ctx, H=args.heads, C=args.channels),
+            "comm": kda_det_comm_bytes_kcp(ctx, H=args.heads, C=args.channels),
         },
         "arms": rows,
         "control_ratio": control,

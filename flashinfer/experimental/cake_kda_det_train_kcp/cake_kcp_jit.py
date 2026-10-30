@@ -16,13 +16,13 @@ limitations under the License.
 Registry and loader glue of the Cake packed KDA chunked training kernels on
 the context-parallel (KCP) route (SM100 / SM103 / SM107): the state walks,
 the transfer walk and the affine merge that :mod:`.cake_kcp` composes with the
-chunk stages of :mod:`.cake_jit`, whose records this module never edits.
+chunk stages of :mod:`..cake_kda_det_train.cake_jit`, whose records this
+module never edits.
 
 Every record of ``MODULES`` is one mechanically exported program: a CUDA
 device translation unit plus a tvm-ffi binding, compiled once per
 architecture.  A record carries the host plan only: the program's ``library``
-stem (its ``build.json`` entries are ``<library>_<arch>``, beside the chunk
-stages' entries), the architectures it is delivered for, the KCP ``program``
+stem (its ``build.json`` entries are ``<library>_<arch>``), the architectures it is delivered for, the KCP ``program``
 it serves and its ``variant``, the ``select_rule`` that picks one variant of a
 program from the launch's host-known scalars, the ``grid_rule`` that shapes
 its launch, the kernel-parameter -> logical-argument map and the argument plan
@@ -112,7 +112,8 @@ from typing import Any
 
 import tvm_ffi
 
-from . import cake_build, cake_jit, cake_kcp_plan
+from ..cake_kda_det_train import cake_jit
+from . import cake_build, cake_kcp_plan
 
 # One verified build per architecture: B200 (``sm_100a``), B300 / GB300
 # (``sm_103a``) and R200 (``sm_107a``); the chunk stages' architectures.
@@ -1452,7 +1453,8 @@ def load(name: str, arch: str) -> Any:
 
 def specs_for_arch(arch: str) -> list[Any]:
     """JIT specifications of every ``arch`` library of the package's ``build.json`` without a prebuilt file (the
-    chunk stages' and the KCP programs' alike; for ahead-of-time warm-up through FlashInfer's ``build_jit_specs``)."""
+    KCP programs and the chunk stages they run at the rank's shape; for ahead-of-time warm-up through FlashInfer's
+    ``build_jit_specs``)."""
     return cake_build.jit_specs(arch)
 
 
@@ -1720,7 +1722,7 @@ def test_specs_for_arch(arch: str) -> list[Any]:
 # The composition's launches (``cake_kcp.KernelBackend.run`` -> :func:`run_program`)
 
 # Per walk program: the compact pool its initial state / final adjoint comes from (``None``: none) and the pool it
-# writes, by the argument names of ``cake_kcp.KcpCall.walk`` (= the records' logical names).
+# writes, by the argument names of ``cake_kcp.CallDetKcp.walk`` (= the records' logical names).
 _WALK_POOLS: dict[str, tuple[str | None, str]] = {
     "kcp_fwdh_offset": ("h0", "out"),
     "kcp_fwdh_tape": ("h0", "out"),
@@ -1729,7 +1731,7 @@ _WALK_POOLS: dict[str, tuple[str | None, str]] = {
     "kcp_transfer_walk": (None, "out"),
 }
 # Per walk program: the local stage values it reads (the logical names of ``cake_backend``'s value dict, which the
-# composition holds under ``KcpCall.local_values``): the prep stages' operands and the tapes.
+# composition holds under ``CallDetKcp.local_values``): the prep stages' operands and the tapes.
 _WALK_OPERANDS: dict[str, tuple[str, ...]] = {
     "kcp_fwdh_offset": ("w", "kg", "u", "gk", "h", "v_new"),
     "kcp_fwdh_tape": ("w", "kg", "u", "gk", "h", "v_new"),
@@ -1832,7 +1834,7 @@ def _local_values(call: Any) -> Mapping[str, Any]:
     local = getattr(call, "local_values", None)
     if local is None:
         raise RuntimeError(
-            "the KCP kernel backend needs the call's local stage values (KcpCall.local_values: the logical value "
+            "the KCP kernel backend needs the call's local stage values (CallDetKcp.local_values: the logical value "
             "dict of the chunk stages, cake_backend's vocabulary) before the first walk launch"
         )
     return local
@@ -1949,7 +1951,7 @@ def _walk(name: str, args: Mapping[str, Any], call: Any, device_index: int) -> N
 
 
 def _call_knob(call: Any, knob: str, default: Any) -> Any:
-    """A test knob of the call: ``KcpCall.<knob>``, else ``KcpCall.opts.<knob>``, else ``default``."""
+    """A test knob of the call: ``CallDetKcp.<knob>``, else ``CallDetKcp.opts.<knob>``, else ``default``."""
     value = getattr(call, knob, None)
     if value is None:
         value = getattr(getattr(call, "opts", None), knob, None)
@@ -2038,7 +2040,7 @@ def run_program(name: str, args: Mapping[str, Any], *, device_index: int) -> Non
     segment is skipped), the compact pools ``h0`` / ``dht`` / ``out`` as ``Indexed`` (or ``None``), the transfer
     walk's ``init_mode`` / ``use_u`` / ``write_transposed``; for the merge the tile pools ``m`` / ``c`` / ``x0`` /
     ``y`` (``c`` / ``x0`` may be ``None``), the ``chains`` tables and ``transpose_m`` / ``write_states``; and
-    ``_call``, the ``KcpCall`` of the launch, which supplies the head count, the segment table, the operand and
+    ``_call``, the ``CallDetKcp`` of the launch, which supplies the head count, the segment table, the operand and
     tape tensors (``local_values``), ``scale`` and ``precision_mode``.  The record is selected from the launch's
     scalars (:func:`select_record`), the grid is its rule's (:func:`launch_grid`), and the kernel runs on the
     current torch stream of the device.
@@ -2046,7 +2048,7 @@ def run_program(name: str, args: Mapping[str, Any], *, device_index: int) -> Non
     call = args.get("_call")
     if call is None:
         raise ValueError(
-            "run_program needs the KcpCall of the launch under args['_call']"
+            "run_program needs the CallDetKcp of the launch under args['_call']"
         )
     if name == "kcp_affine_merge":
         _merge(args, call, device_index)

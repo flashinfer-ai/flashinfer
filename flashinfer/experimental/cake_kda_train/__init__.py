@@ -3,10 +3,11 @@
 
 The names of this package are the det package's objects.  ``__all__`` is the list this package exported before
 the move, so ``from flashinfer.experimental.cake_kda_train import *`` binds the same names as before; any other
-attribute resolves on the det package at first access.  The submodules ``cake_backend``, ``cake_build``,
-``cake_jit``, ``cake_kcp``, ``cake_kcp_jit`` and ``cake_kcp_plan`` are the det package's module objects, so the
-registries, the workspace caches and the loaded libraries exist once.  This package holds no sources and no
-manifest; importing it imports what the det package's ``__init__`` imports, never the KCP host module.
+attribute resolves on the det package at first access.  The submodules ``cake_backend``, ``cake_build`` and
+``cake_jit`` are the det package's module objects and ``cake_kcp``, ``cake_kcp_jit`` and ``cake_kcp_plan`` those of
+``flashinfer.experimental.cake_kda_det_train_kcp``, so the registries, the workspace caches and the loaded libraries
+exist once.  This package holds no sources and no manifest; importing it imports what the det package's
+``__init__`` imports, never the KCP host module.
 """
 
 from importlib import import_module
