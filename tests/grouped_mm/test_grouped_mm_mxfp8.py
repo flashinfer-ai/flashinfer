@@ -228,22 +228,29 @@ class TestGroupedMmMxfp8:
         )
         a = torch.ones(cum_m, k, device="cuda").to(torch.float8_e4m3fn)
         b = torch.ones(len(seg_lens), n, k, device="cuda").to(torch.float8_e4m3fn)
-        b_scale = torch.full((len(seg_lens), n, kb), 127, dtype=torch.uint8, device="cuda")
+        b_scale = torch.full(
+            (len(seg_lens), n, kb), 127, dtype=torch.uint8, device="cuda"
+        )
         # token scales in the F8_128x4 layout the quantizer produces: row r of the
         # block, k-block kk sits at byte (kk // 4) * 512 + (r % 32) * 16 + (r // 32) * 4 + kk % 4
-        exps = [60 + i for i in range(cum_m)]  # 128 distinct e8m0 exponents, 2^-67 .. 2^60; k * scale stays finite
+        # 128 distinct e8m0 exponents, 2^-67 .. 2^60; k * scale stays finite in fp32
+        exps = [60 + i for i in range(cum_m)]
         flat = torch.empty(cum_m * kb, dtype=torch.uint8)
         for r in range(cum_m):
             for kk in range(kb):
                 flat[(kk // 4) * 512 + (r % 32) * 16 + (r // 32) * 4 + kk % 4] = exps[r]
         a_scale = flat.cuda().view(cum_m, kb)
 
-        out = grouped_mm_mxfp8(a, b, a_scale, b_scale, m_indptr, out_dtype=torch.float32)
+        out = grouped_mm_mxfp8(
+            a, b, a_scale, b_scale, m_indptr, out_dtype=torch.float32
+        )
 
         got = out[:, 0] / k
         want = torch.tensor([2.0 ** (e - 127) for e in exps], device="cuda")
         assert torch.isfinite(out).all()
-        assert (out.max(dim=1).values == out.min(dim=1).values).all(), "a row must use one scale for every column"
+        assert (out.max(dim=1).values == out.min(dim=1).values).all(), (
+            "a row must use one scale for every column"
+        )
         wrong = (got != want).nonzero().flatten().tolist()
         assert not wrong, (
             f"{len(wrong)} of {cum_m} rows read another row's token scale; first wrong rows {wrong[:8]} "

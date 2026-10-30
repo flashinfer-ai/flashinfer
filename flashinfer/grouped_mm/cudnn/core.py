@@ -668,7 +668,7 @@ def _run_cudnn_moe_block_scale_grouped_gemm_mxfp8(
     # first on compute capability 10.x parts under the CUDA 13.4 libraries; the
     # graph's other engine ("eng9") is correct, as is the same cuDNN under CUDA
     # 13.0. Drop eng0 on that combination only. Revert when cuDNN ships the fix.
-    deselect_engines = ()
+    deselect_engines: tuple[str, ...] = ()
     cuda_version = tuple(int(x) for x in (torch.version.cuda or "0.0").split(".")[:2])
     if (
         torch.cuda.get_device_capability(a.device)[0] == 10
