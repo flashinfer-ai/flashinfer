@@ -13,6 +13,13 @@ from .._utils import _overlaps
 
 
 _ALIGNMENT = 32
+# One KV split's BF16 partial O [64,512] and FP32 log2 LSE [64] per request.
+PARTIAL_SLOT_BYTES = 64 * (512 * 2 + 4)
+# Bound on reserved (request, KV split) pairs. KV is split only while
+# batch * 8 <= SMs (at most five tiles each), so this keeps the requirement
+# small (~8.4 MB) and, being a cap on tiles * batch, monotone in the batch
+# size: a workspace sized for the largest batch also serves every smaller one.
+_MAX_PARTIAL_SLOTS = 128
 
 
 def _check_problem(batch_size, compressed_topk, backend):
@@ -28,10 +35,24 @@ def _check_problem(batch_size, compressed_topk, backend):
         raise ValueError("compressed_topk must be 0 or a multiple of64 up to512")
 
 
+def kv_tiles(compressed_topk):
+    """BK128 tiles per request: the SWA tile, then ceil(K/128) main tiles."""
+    return 1 + (compressed_topk + 127) // 128
+
+
+def partial_slots(batch_size, compressed_topk):
+    """(request, KV split) pairs with reserved partials; 0 when KV is never split."""
+    tiles = kv_tiles(compressed_topk)
+    return min(tiles * batch_size, _MAX_PARTIAL_SLOTS) if tiles >= 3 else 0
+
+
 def _sections(batch_size, compressed_topk):
     sections = [("lse", (batch_size, 64, 1), torch.float32)]
     if compressed_topk == 0:
         sections.append(("dummy_main", (1, 64, 1, 288), torch.uint8))
+    slots = partial_slots(batch_size, compressed_topk)
+    if slots:
+        sections.append(("partials", (slots * PARTIAL_SLOT_BYTES,), torch.uint8))
     return sections
 
 
@@ -49,6 +70,7 @@ def workspace_size(batch_size, compressed_topk=0, *, backend="prims-ts"):
 class WorkspaceViews:
     lse: torch.Tensor
     dummy_main: object = None
+    partials: object = None
 
 
 def workspace_views(

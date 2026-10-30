@@ -13,12 +13,24 @@ from pathlib import Path
 
 import torch
 
-from ._workspace import bind_inputs, device_sm_count
+from ._workspace import (
+    PARTIAL_SLOT_BYTES,
+    bind_inputs,
+    device_sm_count,
+    kv_tiles,
+    partial_slots,
+)
 
 
 @functools.cache
 def _compile(
-    device_index, compressed_k, *, has_sink=False, native_fp4=None, head_dim_ctas=1
+    device_index,
+    compressed_k,
+    *,
+    has_sink=False,
+    native_fp4=None,
+    head_dim_ctas=1,
+    kv_splits=1,
 ):
     if torch.cuda.is_current_stream_capturing():
         raise ValueError("warm up the decode specialization before CUDA Graph capture")
@@ -52,9 +64,9 @@ def _compile(
 
     sm_count = device_sm_count(device_index)
     attention = adapter_kernel._make_fp8_attention(
-        compressed_k, sm_count, native_fp4, head_dim_ctas
+        compressed_k, sm_count, native_fp4, head_dim_ctas, kv_splits
     )
-    decode_kernel = adapter_kernel.Fp8SwaDecodeKernel(attention)
+    decode_kernel = adapter_kernel.Fp8SwaDecodeKernel(attention, kv_splits)
     batch = cute.sym_int()
     f = cute.runtime.make_fake_compact_tensor
 
@@ -90,6 +102,11 @@ def _compile(
     topk_lens, seq_lens = lengths(), lengths()
     lse = f(cutlass.Float32, (batch, 64), stride_order=(1, 0), assumed_align=16)
     sinks = f(cutlass.Float32, (64,), assumed_align=16) if has_sink else None
+    partials = (
+        f(cutlass.Uint8, (cute.sym_int64(divisibility=16),), assumed_align=32)
+        if kv_splits > 1
+        else None
+    )
     stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
     signature = (
         "dsv41_shared_pertensor_joint_e4m3_swa512_fp4_inline_metadata_v2",
@@ -104,7 +121,7 @@ def _compile(
     native_root = Path(native_kernel.__file__).resolve().parents[3]
     return build_and_load_cute_dsl_kernel(
         "deepseek_v41_prims_ts_fp8",
-        f"h64_d512_swa128_c{compressed_k}_keep_bk128_kv8_split1_v{head_dim_ctas}_i64"
+        f"h64_d512_swa128_c{compressed_k}_keep_bk128_kv8_split{kv_splits}_v{head_dim_ctas}_i64"
         f"_shared_pertensor_joint_sink{int(has_sink)}"
         f"_nativefp4{int(native_fp4)}_sm{sm_count}_{key}",
         lambda: cute.compile[cute.FrontendNext](
@@ -118,6 +135,7 @@ def _compile(
             sinks,
             out,
             lse,
+            partials,
             cutlass.Float32(1.0),
             cutlass.Float32(1.0),
             stream,
@@ -136,14 +154,29 @@ def _compile(
     )
 
 
-def _head_dim_ctas(batch, device_index):
-    """V owners per request: four or two while the grid still fits one wave.
+def _partition(batch, compressed_k, device_index):
+    """(KV splits, V owners) per request while the grid still fits one wave.
 
-    Every owner still loads and converts the whole K tile, so only PV,
-    correction and output work divide; a second wave would cost more.
+    KV splits divide the tile loads and FP4 conversion but add BF16 partials
+    and a separate reducer launch. Every V owner still loads and converts the
+    whole K tile, so a V split divides only PV, correction and output work.
+
+    Measured on B200 (148 SMs, warm graphs, K 128-512, B 1-96): one tile per
+    split (S = tiles) with the widest fitting V split is fastest up to B = 16;
+    from B = 32 an unsplit KV with a V split wins (S3V1 at B32/K512 took
+    15.5 us against 13.7 us for S1V4). Two-tile lists never benefit.
     """
     sm_count = device_sm_count(device_index)
-    return next((v for v in (4, 2) if batch * v <= sm_count), 1)
+    tiles = kv_tiles(compressed_k)
+    splits = 1
+    if (
+        tiles >= 3
+        and batch * 8 <= sm_count
+        and batch * tiles <= partial_slots(batch, compressed_k)
+    ):
+        splits = tiles
+    head_dim_ctas = next((v for v in (4, 2) if batch * splits * v <= sm_count), 1)
+    return splits, head_dim_ctas
 
 
 def decode_mixed(
@@ -179,11 +212,20 @@ def decode_mixed(
     )
     views = bound.views
     with torch.cuda.device(query.device):
+        kv_splits, head_dim_ctas = _partition(
+            bound.batch, bound.compressed_k, query.device.index
+        )
         kernel = _compile(
             query.device.index,
             bound.compressed_k,
             has_sink=bound.sinks is not None,
-            head_dim_ctas=_head_dim_ctas(bound.batch, query.device.index),
+            head_dim_ctas=head_dim_ctas,
+            kv_splits=kv_splits,
+        )
+        partials = (
+            views.partials[: bound.batch * kv_splits * PARTIAL_SLOT_BYTES]
+            if kv_splits > 1
+            else None
         )
         kernel(
             query.permute(2, 3, 1, 0),
@@ -195,6 +237,7 @@ def decode_mixed(
             bound.sinks,
             bound.out.permute(2, 3, 1, 0),
             views.lse.view(bound.batch, 64),
+            partials,
             bound.bmm1_scale,
             bound.bmm2_scale,
         )

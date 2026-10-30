@@ -22,7 +22,7 @@ class DecodeBuffers:
 
     Six-tensor oracle fixtures keep separate wi/ci tables. Only decode_case
     copies them into this caller-owned combined table; these extra test copies
-    are intentionally excluded from the canonical single-kernel graph test.
+    are intentionally excluded from the canonical graph-node test.
     """
 
     workspace: torch.Tensor
@@ -695,9 +695,12 @@ def test_fp4_fp8_all_finite_codes(native_fp4, source, conversion_kernels):
     assert cfg.qkv_dtype == "e4m3" and cfg.tile_size_kv == 128
     assert cfg.head_dim_per_stage_kv == 128 and cfg.kv_stages == 8
     assert not hasattr(cfg, "sparse_request_kv_scale")
-    # The standalone CTA contains just the production four-warp load group.
-    # Change its warp origin, not the tile shape, dtype or stage/store layout.
+    # The standalone CTA contains just the production load group (eight warps
+    # of 16 BK128 rows). Change its warp origin, not the warp count, tile
+    # shape, dtype or stage/store layout.
     probe_cfg = dataclasses.replace(cfg, load_warp_idx=0)
+    threads = 32 * cfg.load_num_warps
+    rows_per_warp = 128 // cfg.load_num_warps
     stage_bytes = 128 * 128
 
     @cute.kernel
@@ -726,8 +729,9 @@ def test_fp4_fp8_all_finite_codes(native_fp4, source, conversion_kernels):
         # Keep the flat rank-one tuple layout required by make_array_view.
         # Production stages are native Array subviews, not bare CuTe pointers.
         staging = cutlass.make_array_view(smem)
-        smem[tid] = cutlass.Uint8(0x5A)
-        smem[128 + 8 * stage_bytes + tid] = cutlass.Uint8(0xA5)
+        if tid < 128:
+            smem[tid] = cutlass.Uint8(0x5A)
+            smem[128 + 8 * stage_bytes + tid] = cutlass.Uint8(0xA5)
         cute.arch.sync_threads()
         cached = cute.make_rmem_tensor(
             cute.make_layout(2 * cfg.sparse_cache_words), cutlass.Int32
@@ -737,10 +741,15 @@ def test_fp4_fp8_all_finite_codes(native_fp4, source, conversion_kernels):
                 cached[page_slot * cfg.sparse_cache_words + entry] = cutlass.Int32(
                     0x7FFFFFFF
                 )
-                if lane < 8:
+                # As read_offsets: lane q of a warp caches its rows' quad q.
+                if lane < rows_per_warp // 4:
                     cached[page_slot * cfg.sparse_cache_words + entry] = selected[
                         request,
-                        tile * 256 + page_slot * 128 + warp * 32 + lane * 4 + entry,
+                        tile * 256
+                        + page_slot * 128
+                        + warp * rows_per_warp
+                        + lane * 4
+                        + entry,
                     ]
             for stage_idx in cutlass.range_constexpr(4):
                 # Both physical producer paths use the real mixed resource,
@@ -763,25 +772,28 @@ def test_fp4_fp8_all_finite_codes(native_fp4, source, conversion_kernels):
                     )
         cute.arch.fence_view_async_shared()
         cute.arch.sync_threads()
-        for page_slot in cutlass.range_constexpr(2):
-            for stage_idx in cutlass.range_constexpr(4):
-                for row in range(128):
-                    # Independently read the native E4M3 SW128 byte layout,
-                    # rather than reusing the producer's store/swizzle helper.
-                    swizzled = (row * 128 + tid) ^ ((row & 7) * 16)
-                    out[
-                        request,
-                        tile * 256 + page_slot * 128 + row,
-                        stage_idx * 128 + tid,
-                    ] = smem[128 + (page_slot * 4 + stage_idx) * stage_bytes + swizzled]
-        guards[request, tile, tid] = smem[tid]
-        guards[request, tile, 128 + tid] = smem[128 + 8 * stage_bytes + tid]
+        if tid < 128:
+            for page_slot in cutlass.range_constexpr(2):
+                for stage_idx in cutlass.range_constexpr(4):
+                    for row in range(128):
+                        # Independently read the native E4M3 SW128 byte layout,
+                        # rather than reusing the producer's store/swizzle helper.
+                        swizzled = (row * 128 + tid) ^ ((row & 7) * 16)
+                        out[
+                            request,
+                            tile * 256 + page_slot * 128 + row,
+                            stage_idx * 128 + tid,
+                        ] = smem[
+                            128 + (page_slot * 4 + stage_idx) * stage_bytes + swizzled
+                        ]
+            guards[request, tile, tid] = smem[tid]
+            guards[request, tile, 128 + tid] = smem[128 + 8 * stage_bytes + tid]
 
     @cute.jit
     def launch(pool, selected, swa_pool, out, guards, stream: cuda.CUstream):
         convert(pool, selected, swa_pool, out, guards).launch(
             grid=(selected.shape[0], selected.shape[1] // 256, 1),
-            block=(128, 1, 1),
+            block=(threads, 1, 1),
             stream=stream,
         )
 
@@ -1356,13 +1368,14 @@ def test_fp8_swa_native_compile_configuration(compressed, monkeypatch):
     check_fp8(out, lse, fp8_oracle(*args))
     assert len(recorded) == len(launches) == 1
     attention, packet = recorded[0], launches[0]
-    assert len(packet) == 11 and packet[0].data_ptr() == args[0].data_ptr()
+    assert len(packet) == 12 and packet[0].data_ptr() == args[0].data_ptr()
     assert packet[0].dtype == packet[1].dtype == torch.float8_e4m3fn
     assert packet[1].data_ptr() == args[1].data_ptr()
     assert packet[3] is buffers.indices
     assert packet[4] is buffers.topk_lens and packet[5] is buffers.seq_lens
     assert packet[6] is args[5]
     assert packet[8].data_ptr() == lse.data_ptr() and packet[8].shape == (1, 64)
+    assert packet[9] is None  # no KV-split partials for two BK128 tiles
     bf16_buffers = [
         x for x in packet if isinstance(x, torch.Tensor) and x.dtype == torch.bfloat16
     ]
@@ -1379,7 +1392,7 @@ def test_fp8_swa_native_compile_configuration(compressed, monkeypatch):
     assert cfg.sparse_direct and cfg.sparse_reuse_kv
     assert not hasattr(cfg, "sparse_request_kv_scale") and cfg.fuse_sparse_epilogue
     assert cfg.use_persistent_scheduler == 0 and cfg.num_ctas_per_seq_kv == 1
-    assert cfg.num_insts_kv == 1 and cfg.load_num_warps == 4
+    assert cfg.num_insts_kv == 1 and cfg.load_num_warps == 8
     assert attention.finalize_output and not hasattr(attention, "source_state_store")
     assert attention.direct_sparse_capacities == (128, compressed)
     assert type(attention.kv_producer) is MixedFp8KvProducer
@@ -1666,12 +1679,19 @@ def test_fp8_swa_source_anchor_crossings_and_extreme_finite_sinks():
 
 @pytest.mark.parametrize("compressed", [0, 64, 192, 512])
 @pytest.mark.parametrize("has_sink", [False, True])
-def test_fp8_joint_canonical_single_kernel_graph(compressed, has_sink):
-    """Inspect real captured launch nodes, not Python calls or FFI invocations."""
+def test_fp8_joint_canonical_graph_nodes(compressed, has_sink):
+    """Inspect real captured launch nodes, not Python calls or FFI invocations.
+
+    One finalizing kernel, plus the PDL-chained reducer when KV is split.
+    """
     import cuda.bindings.driver as cuda
+
+    from flashinfer.experimental.deepseek_v41.prims_ts import _partition
 
     prims_ts_gate()
     q, swa, main, wi, ci, sink = make_fp8_case(2, compressed)
+    kv_splits, _ = _partition(2, compressed, q.device.index)
+    nodes_expected = 1 if kv_splits == 1 else 2
     if not has_sink:
         sink = None
     buffers = DecodeBuffers.allocate(q, compressed)
@@ -1695,9 +1715,9 @@ def test_fp8_joint_canonical_single_kernel_graph(compressed, has_sink):
     # Query actual graph handles/types/edges rather than counting Python calls.
     raw = cuda.CUgraph(graph.raw_cuda_graph())
     _, count = checked(cuda.cuGraphGetNodes(raw))
-    assert count == 1, count
+    assert count == nodes_expected, count
     nodes, count = checked(cuda.cuGraphGetNodes(raw, count))
-    assert len(nodes) == count == 1, (nodes, count)
+    assert len(nodes) == count == nodes_expected, (nodes, count)
     names = {}
     for node in nodes:
         (kind,) = checked(cuda.cuGraphNodeGetType(node))
@@ -1707,9 +1727,11 @@ def test_fp8_joint_canonical_single_kernel_graph(compressed, has_sink):
         names[int(node)] = name.decode()
     prepare = [node for node, name in names.items() if "_prepare" in name]
     final = [node for node, name in names.items() if "dense_kernel" in name]
+    reducer = [node for node, name in names.items() if "reduction_kernel" in name]
     assert not prepare and len(final) == 1, names
+    assert len(reducer) == nodes_expected - 1, names
     result = checked(cuda.cuGraphGetEdges(raw))
-    assert result[-1] == 0, result
+    assert result[-1] == nodes_expected - 1, result
     assert (
         not {"part_s", "part_c", "lse_s", "lse_c", "main_scale"}
         & vars(buffers.views).keys()
@@ -1717,7 +1739,7 @@ def test_fp8_joint_canonical_single_kernel_graph(compressed, has_sink):
     assert all(
         value is None
         for name, value in vars(buffers.views).items()
-        if name not in {"lse", "dummy_main"}
+        if name not in {"lse", "dummy_main", "partials"}
     )
     buffers.workspace.fill_(255)
     buffers.out.fill_(math.nan)
@@ -1732,6 +1754,75 @@ def test_fp8_joint_canonical_single_kernel_graph(compressed, has_sink):
             q, swa, main, wi, ci, disabled_sink, bmm1_scale=0.125, bmm2_scale=2.0
         ),
     )
+
+
+@pytest.mark.parametrize(
+    "batch,compressed,partitions",
+    [
+        (1, 512, [(1, 4), (2, 4), (3, 4), (5, 1), (5, 2), (5, 4)]),
+        (3, 384, [(1, 1), (2, 2), (4, 1), (4, 4)]),
+        (16, 256, [(1, 2), (2, 1), (3, 1), (3, 2)]),
+    ],
+)
+def test_fp8_kv_split_partitions_changed_graph(
+    batch, compressed, partitions, monkeypatch
+):
+    """Every forced (KV split, V owners) passes the oracle, before and after
+    changing live metadata under graph replay. V owners of one split count are
+    bitwise identical; different split counts round P per split.
+    """
+    prims_ts_gate()
+    from flashinfer.experimental.deepseek_v41 import prims_ts
+
+    q, swa, main, wi, ci, sink = make_fp8_case(batch, compressed)
+    forced = {}
+    monkeypatch.setattr(prims_ts, "_partition", lambda *args: forced["value"])
+    results = {}
+    for partition in partitions:
+        forced["value"] = partition
+        buffers = DecodeBuffers.allocate(q, compressed)
+        out, lse, _ = decode_case(q, swa, main, wi, ci, sink, buffers=buffers)
+        check_fp8(out, lse, fp8_oracle(q, swa, main, wi, ci, sink))
+        results[partition] = out.clone(), lse.clone()
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            buffers.call(q, swa, main, sink)
+        # Shorter live lists leave whole trailing splits masked; request 0
+        # loses its SWA rows and request 2 (when present) is empty.
+        visible = torch.tensor(
+            [128 + compressed // 3, 128, 0, 128 + compressed][:batch]
+            + [128 + compressed] * max(0, batch - 4),
+            device=q.device,
+            dtype=torch.int32,
+        )
+        buffers.topk_lens.copy_(visible)
+        buffers.seq_lens[0] = 0 if batch > 1 else 77
+        if batch > 2:
+            buffers.seq_lens[2] = 0
+        for sink_value in (-math.inf, 0.75, 30.0):
+            sink.fill_(sink_value)
+            buffers.workspace.fill_(255)
+            buffers.out.fill_(math.nan)
+            graph.replay()
+            keep = (
+                torch.arange(128, device=q.device)[None]
+                < buffers.seq_lens.clamp(0, 128)[:, None]
+            )
+            live_wi = torch.where(keep, wi[:, 0], -1)[:, None].contiguous()
+            main_visible = (visible.clamp(128, 128 + compressed) - 128)[:, None]
+            columns = torch.arange(compressed, device=q.device)[None]
+            live_ci = torch.where(columns < main_visible, ci[:, 0], -1)[:, None]
+            args = q, swa, main, live_wi, live_ci.contiguous(), sink
+            check_fp8(buffers.out, buffers.lse, fp8_oracle(*args))
+        sink.copy_(make_fp8_case(batch, compressed)[5])
+        buffers.topk_lens.fill_(128 + compressed)
+        buffers.seq_lens.fill_(128)
+    for (splits, _), (out, lse) in results.items():
+        for (other_splits, _), (other_out, other_lse) in results.items():
+            if other_splits == splits:
+                assert torch.equal(out.view(torch.int16), other_out.view(torch.int16))
+                assert torch.equal(lse, other_lse)
 
 
 @pytest.mark.parametrize("compressed", [0, 64, 192, 512])

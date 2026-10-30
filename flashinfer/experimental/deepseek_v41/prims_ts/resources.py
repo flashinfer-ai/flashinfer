@@ -36,6 +36,7 @@ from ....attention.prims_ts.kernels.mla_decode.helpers.ops import (
 )
 from ....attention.prims_ts.kernels.mla_decode.helpers.layout import smem_array
 from ....attention.prims_ts.kernels.mla_decode.helpers.stage import MlaStage
+from ....attention.prims_ts.kernels.mla_decode.helpers.tile import cta_idx_kv_for_stage
 from ....attention.prims_ts.kernels.mla_decode.throughput_latency_1cta.resources.smem_resources import (
     SmemKvResource,
 )
@@ -257,7 +258,7 @@ class Fp4Fp8KvProducer(Fp4KvProducer):
             or cfg.tile_size_q != 64
             or cfg.tile_size_kv != 128
             or cfg.kv_stages != 8
-            or cfg.load_num_warps != 4
+            or cfg.load_num_warps not in (4, 8)
             or not cfg.sparse_reuse_kv
             or not cfg.sparse_direct
         ):
@@ -339,6 +340,46 @@ def _fp4x8_scaled_to_e4m3x8(word: cutlass.Int32, scale: cutlass.Int32):
         "mov.b32 {$w0}, {e0, e1}; mov.b32 {$w1}, {e2, e3}; }",
         write_only_types=[cutlass.Int32] * 2,
         read_only_args=[word, scale],
+    )
+
+
+def _uses_packed_fp4_mul():
+    """Whether the compile target has PTX 9.4's packed E2M1 x E4M3 multiply."""
+    from ....attention.prims_ts.kernels.fmha_decode.fmha_decode_resources.tmem_transformed_kv import (
+        _has_packed_e4m3_e2m1_mul,
+    )
+
+    return _has_packed_e4m3_e2m1_mul()
+
+
+@cute.jit
+def _fp4x8_mul_e4m3x8(word: cutlass.Int32, scale: cutlass.Int32):
+    """Eight E2M1 values times one byte-broadcast E4M3 scale, as E4M3 RN/SATFINITE.
+
+    The packed multiply takes one E2M1 value in the low nibble of each byte, so
+    the even and odd nibbles are multiplied separately and their bytes
+    re-interleaved: 7 instructions instead of the F16 route's 12 (4 cvt, 4 mul,
+    4 cvt). The loader warps' conversion is the main-tile critical path.
+    """
+    return prims.inline_ptx(
+        "{ .reg .b32 lo, hi; "
+        "and.b32 lo, {$r0}, 0x0F0F0F0F; shr.b32 hi, {$r0}, 4; "
+        "and.b32 hi, hi, 0x0F0F0F0F; "
+        "mul.e4m3x4.e2m1p4x4.e4m3x4.satfinite lo, lo, {$r1}; "
+        "mul.e4m3x4.e2m1p4x4.e4m3x4.satfinite hi, hi, {$r1}; "
+        "prmt.b32 {$w0}, lo, hi, 0x5140; prmt.b32 {$w1}, lo, hi, 0x7362; }",
+        write_only_types=[cutlass.Int32] * 2,
+        read_only_args=[word, scale],
+    )
+
+
+@cute.jit
+def _e4m3_byte_broadcast(scale_word: cutlass.Int32, selector: cutlass.Int32):
+    """Replicate the scale byte chosen by a register PRMT selector four times."""
+    return prims.inline_ptx(
+        "prmt.b32 {$w0}, {$r0}, {$r0}, {$r1};",
+        write_only_types=[cutlass.Int32],
+        read_only_args=[scale_word, selector],
     )
 
 
@@ -424,8 +465,9 @@ class MixedFp8KvProducer(Fp4Fp8KvProducer):
 
 
 # Raw FP4 staging for one BK128 main tile. Payload: four D128 stages times
-# four row groups of one thread-private 16B chunk for each of the 128 loader
-# threads. Scales: each row's 32B (8B per stage), copied by the row's lanes.
+# one thread-private 16B chunk per row group and loader thread (four groups of
+# 128 threads or two of 256; 512 chunks per stage either way). Scales: each
+# row's 32B (8B per stage), copied by the row's lanes.
 _FP4_RAW_DATA_BYTES = 4 * 4 * 128 * 16
 _FP4_RAW_BYTES = _FP4_RAW_DATA_BYTES + 128 * 32
 
@@ -434,6 +476,20 @@ _FP4_RAW_BYTES = _FP4_RAW_DATA_BYTES + 128 * 32
 class MixedFp8SmemKvResource(Fp4Fp8SmemKvResource):
     swa_cache: cute.Tensor = None
     _fp4_raw_alloc: object = None
+
+    @property
+    def _rows_per_warp(self):
+        # 32 BK128 rows per loader warp with four warps, 16 with eight.
+        return self.cfg.tile_size_kv // self.cfg.load_num_warps
+
+    @property
+    def _fp4_groups(self):
+        # Four lanes cover one row's D128 slice, so a group spans eight rows.
+        return self._rows_per_warp // 8
+
+    @property
+    def _loader_threads(self):
+        return 32 * self.cfg.load_num_warps
 
     def get_smem_requirements(self):
         allocations = super().get_smem_requirements()
@@ -463,8 +519,23 @@ class MixedFp8SmemKvResource(Fp4Fp8SmemKvResource):
         the in-order MMA issues after the next QK. The raw staging is private,
         so its copies overlap that wait instead of following it.
         """
-        if cutlass.const_expr(section == MlaStage.Loop and self.native_fp4):
+        if cutlass.const_expr(not self.native_fp4):
+            return
+        if cutlass.const_expr(section == MlaStage.Loop):
             self._issue_fp4_tile(stage_info, cached_page_ids, page_id_slot=page_id_slot)
+        elif cutlass.const_expr(self.cfg.use_multi_ctas_kv == 1):
+            self._issue_fp4_tile(
+                stage_info,
+                cached_page_ids,
+                page_id_slot=page_id_slot,
+                enabled=self._head_is_main(stage_info),
+            )
+
+    @cute.jit
+    def _head_is_main(self, stage_info: StageInfo):
+        # KV splits are contiguous tile ranges, each starting with its own
+        # HEAD, so only split 0's HEAD is the SWA tile. Warp-uniform.
+        return cta_idx_kv_for_stage(self.cta_idx_kv, stage_info) != cutlass.Int32(0)
 
     @cute.jit
     def _issue_fp4_tile(
@@ -473,9 +544,11 @@ class MixedFp8SmemKvResource(Fp4Fp8SmemKvResource):
         cached_page_ids,
         *,
         page_id_slot: cutlass.Constexpr[int],
+        enabled=None,
     ):
         # Rows/chunks match the base loader: four lanes cover one row's D128
-        # slice in 32-element chunks, eight rows per group, four groups/warp.
+        # slice in 32-element chunks, eight rows per group, _fp4_groups groups
+        # per warp (four with four loader warps, two with eight).
         # Register loads were rescheduled next to their conversions, which
         # serialized one L2 round trip per row group. Instead, cp.async copies
         # all four D128 stages of this tile (one commit group per stage) into
@@ -490,21 +563,25 @@ class MixedFp8SmemKvResource(Fp4Fp8SmemKvResource):
         capacity = cutlass.Int64(cute.size(pool)) // (row_bytes + scale_bytes)
         chunk_idx = lane % 4
         raw = self._fp4_raw_base(stage_info)
-        # All four stage calls of the tile reuse this selection.
-        self._fp4_tile_rows = self._fp4_select_rows(
+        # All four stage calls of the tile reuse this selection. It stays
+        # outside any runtime branch so those calls can see it; a disabled
+        # (SWA) HEAD only clears any_valid and issues nothing.
+        slots, valid, any_valid = self._fp4_select_rows(
             cached_page_ids,
             capacity,
             page_id_slot * self.cfg.sparse_cache_words,
             lane,
         )
-        slots, valid, any_valid = self._fp4_tile_rows
+        if cutlass.const_expr(enabled is not None):
+            any_valid = any_valid & enabled
+        self._fp4_tile_rows = slots, valid, any_valid
         # Every stage of a tile sees the same rows, so the issue and all four
         # stage calls take the same warp-uniform branch; group counts agree.
         if cute.arch.vote_any_sync(any_valid):
             pool_base = pool.iterator.toint()
             scale_dst = raw + _FP4_RAW_DATA_BYTES
             for stage in cutlass.range_constexpr(4):
-                for group in cutlass.range_constexpr(4):
+                for group in cutlass.range_constexpr(self._fp4_groups):
                     slot = slots[group]
                     ok = valid[group]
                     # Widen before every byte-stride multiplication.
@@ -512,7 +589,9 @@ class MixedFp8SmemKvResource(Fp4Fp8SmemKvResource):
                         64 * (row_bytes + scale_bytes)
                     )
                     token = cutlass.Int64(slot & 63)
-                    slot_idx = (stage * 4 + group) * 128 + tid
+                    slot_idx = (
+                        stage * self._fp4_groups + group
+                    ) * self._loader_threads + tid
                     _cp_async_16(
                         raw + slot_idx * 16,
                         pool_base
@@ -523,7 +602,7 @@ class MixedFp8SmemKvResource(Fp4Fp8SmemKvResource):
                     )
                     if cutlass.const_expr(stage == 0):
                         # Lane c copies its row's stage-c scale block.
-                        row = warp * 32 + group * 8 + lane // 4
+                        row = warp * self._rows_per_warp + group * 8 + lane // 4
                         _cp_async_8(
                             scale_dst + row * scale_bytes + chunk_idx * 8,
                             pool_base
@@ -571,9 +650,11 @@ class MixedFp8SmemKvResource(Fp4Fp8SmemKvResource):
                 cute.arch.sync_warp()
             datas = []
             scale_words = []
-            for group in cutlass.range_constexpr(4):
-                row = warp * 32 + group * 8 + lane // 4
-                slot_idx = (stage_idx * 4 + group) * 128 + tid
+            for group in cutlass.range_constexpr(self._fp4_groups):
+                row = warp * self._rows_per_warp + group * 8 + lane // 4
+                slot_idx = (
+                    stage_idx * self._fp4_groups + group
+                ) * self._loader_threads + tid
                 datas.append(
                     cutlass.inttoptr(
                         raw + slot_idx * 16, mem_space=3, dtype=cutlass.Int32
@@ -590,29 +671,45 @@ class MixedFp8SmemKvResource(Fp4Fp8SmemKvResource):
                         dtype=cutlass.Int32,
                     ).load()
                 )
-            for group in cutlass.range_constexpr(4):
-                row = warp * 32 + group * 8 + lane // 4
-                scale0, scale1 = _e4m3x2_to_f16x2_pair(
-                    (scale_words[group] >> ((chunk_idx & 1) * 16))
-                    & cutlass.Int32(0xFFFF)
-                )
+            # A lane's 32 values span two group16 scales: bytes 0/1 of its
+            # scale word for even chunks, bytes 2/3 for odd ones.
+            selector = (chunk_idx & 1) * cutlass.Int32(0x2222)
+            for group in cutlass.range_constexpr(self._fp4_groups):
+                row = warp * self._rows_per_warp + group * 8 + lane // 4
                 packed = cutlass.Array(
                     cutlass.Int32, 8, space=cutlass.AddressSpace.rmem
                 )
-                for word in cutlass.range_constexpr(4):
-                    lo, hi = _fp4x8_scaled_to_e4m3x8(
-                        cutlass.Int32(datas[group][word]),
-                        scale0 if word < 2 else scale1,
+                if cutlass.const_expr(_uses_packed_fp4_mul()):
+                    scale0 = _e4m3_byte_broadcast(scale_words[group], selector)
+                    scale1 = _e4m3_byte_broadcast(
+                        scale_words[group], selector + cutlass.Int32(0x1111)
                     )
-                    packed[2 * word] = lo
-                    packed[2 * word + 1] = hi
+                    for word in cutlass.range_constexpr(4):
+                        lo, hi = _fp4x8_mul_e4m3x8(
+                            cutlass.Int32(datas[group][word]),
+                            scale0 if word < 2 else scale1,
+                        )
+                        packed[2 * word] = lo
+                        packed[2 * word + 1] = hi
+                else:
+                    scale0, scale1 = _e4m3x2_to_f16x2_pair(
+                        (scale_words[group] >> ((chunk_idx & 1) * 16))
+                        & cutlass.Int32(0xFFFF)
+                    )
+                    for word in cutlass.range_constexpr(4):
+                        lo, hi = _fp4x8_scaled_to_e4m3x8(
+                            cutlass.Int32(datas[group][word]),
+                            scale0 if word < 2 else scale1,
+                        )
+                        packed[2 * word] = lo
+                        packed[2 * word + 1] = hi
                 self._store_e4m3_chunk32(packed, stage_base, row, chunk_idx * 32)
         else:
             packed = cutlass.Array(cutlass.Int32, 8, space=cutlass.AddressSpace.rmem)
             for word in cutlass.range_constexpr(8):
                 packed[word] = cutlass.Int32(0)
-            for group in cutlass.range_constexpr(4):
-                row = warp * 32 + group * 8 + lane // 4
+            for group in cutlass.range_constexpr(self._fp4_groups):
+                row = warp * self._rows_per_warp + group * 8 + lane // 4
                 self._store_e4m3_chunk32(packed, stage_base, row, chunk_idx * 32)
 
     @cute.jit
@@ -620,7 +717,7 @@ class MixedFp8SmemKvResource(Fp4Fp8SmemKvResource):
         slots = []
         valid = []
         any_valid = cutlass.Boolean(False)
-        for group in cutlass.range_constexpr(4):
+        for group in cutlass.range_constexpr(self._fp4_groups):
             local_row = group * 8 + lane // 4
             raw_id = cutlass.Int32(0x7FFFFFFF)
             for entry in cutlass.range_constexpr(4):
@@ -673,7 +770,8 @@ class MixedFp8SmemKvResource(Fp4Fp8SmemKvResource):
             stage_dst = stage_base.data_ptr().toint(cutlass.Int32)
             swa_base = self.swa_cache.iterator.toint() + cutlass.Int64(dim)
             rows = []
-            for group in cutlass.range_constexpr(8):
+            # Eight lanes per row: four rows per group.
+            for group in cutlass.range_constexpr(self._rows_per_warp // 4):
                 local_row = group * 4 + lane // 8
                 raw = cutlass.Int32(0x7FFFFFFF)
                 for entry in cutlass.range_constexpr(4):
@@ -690,7 +788,7 @@ class MixedFp8SmemKvResource(Fp4Fp8SmemKvResource):
                 ok = (slot != cutlass.Int32(0x7FFFFFFF)) & (
                     cutlass.Int64(slot) < capacity
                 )
-                row = warp * 32 + local_row
+                row = warp * self._rows_per_warp + local_row
                 rows.append(
                     (
                         (row * 128 + dim) ^ ((row & 7) * 16),
@@ -708,9 +806,36 @@ class MixedFp8SmemKvResource(Fp4Fp8SmemKvResource):
                     )
                 _cp_async_commit()
         # Each writer completes its own copies before the inherited
-        # async-proxy fence and all-128-writer commit; UMMA semantics match
-        # the previous thread stores.
+        # async-proxy fence and all-writer commit; UMMA semantics match the
+        # previous thread stores.
         _cp_async_wait_group(3 - stage_idx)
+
+    @cute.jit
+    def _load_main_stage(
+        self,
+        stage_info: StageInfo,
+        stage_base,
+        cached_page_ids,
+        *,
+        stage_idx: cutlass.Constexpr[int],
+        page_id_slot: cutlass.Constexpr[int],
+    ):
+        if cutlass.const_expr(self.native_fp4):
+            self._load_fp4_tile_stage(
+                stage_info,
+                stage_base,
+                cached_page_ids,
+                stage_idx=stage_idx,
+                page_id_slot=page_id_slot,
+            )
+        else:
+            self._load_fp4_stage(
+                self.fp4_cache,
+                stage_base,
+                cached_page_ids,
+                stage_idx=stage_idx,
+                page_id_slot=page_id_slot,
+            )
 
     @cute.jit
     def _producer_load_kv_stage(
@@ -727,27 +852,38 @@ class MixedFp8SmemKvResource(Fp4Fp8SmemKvResource):
         if cutlass.const_expr(inst_id != 0 or is_v != 0):
             raise ValueError("mixed V4.1 KV retains K through PV on one stream")
         stage_base = self._stage_base(stage_info)
-        # The fixed 128-slot primary span guarantees exactly one SWA HEAD.
-        # Keep-AB's single KV pipe loads all following main tiles in LOOP;
-        # counts cannot shorten that span, even for a completely masked SWA.
-        if cutlass.const_expr(section == MlaStage.Head):
+        # The fixed 128-slot primary span guarantees exactly one SWA tile, the
+        # first HEAD. Keep-AB's single KV pipe loads every later tile (LOOP,
+        # and the HEADs of later KV splits) from main; counts cannot shorten
+        # that span, even for a completely masked SWA.
+        if cutlass.const_expr(
+            section == MlaStage.Head and self.cfg.use_multi_ctas_kv == 1
+        ):
+            if self._head_is_main(stage_info):
+                self._load_main_stage(
+                    stage_info,
+                    stage_base,
+                    cached_page_ids,
+                    stage_idx=stage_idx,
+                    page_id_slot=page_id_slot,
+                )
+            else:
+                self._load_swa_stage(
+                    stage_base,
+                    cached_page_ids,
+                    stage_idx=stage_idx,
+                    page_id_slot=page_id_slot,
+                )
+        elif cutlass.const_expr(section == MlaStage.Head):
             self._load_swa_stage(
                 stage_base,
                 cached_page_ids,
                 stage_idx=stage_idx,
                 page_id_slot=page_id_slot,
             )
-        elif cutlass.const_expr(section == MlaStage.Loop and self.native_fp4):
-            self._load_fp4_tile_stage(
-                stage_info,
-                stage_base,
-                cached_page_ids,
-                stage_idx=stage_idx,
-                page_id_slot=page_id_slot,
-            )
         elif cutlass.const_expr(section == MlaStage.Loop):
-            self._load_fp4_stage(
-                self.fp4_cache,
+            self._load_main_stage(
+                stage_info,
                 stage_base,
                 cached_page_ids,
                 stage_idx=stage_idx,

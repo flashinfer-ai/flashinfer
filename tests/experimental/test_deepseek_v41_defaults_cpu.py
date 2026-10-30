@@ -697,6 +697,7 @@ def test_benchmark_times_canonical_public_replay_with_caller_storage():
     decode = Mock(return_value=out)
     size = Mock(return_value=4096)
     views = Mock(return_value=SimpleNamespace(lse=lse))
+    partition = Mock(return_value=(3, 1))
     function = definition(_BENCHMARK, "prepare_decode")
     function.body = [
         node for node in function.body if not isinstance(node, ast.ImportFrom)
@@ -706,6 +707,7 @@ def test_benchmark_times_canonical_public_replay_with_caller_storage():
         "deepseek_v41_decode": decode,
         "deepseek_v41_decode_workspace_size": size,
         "workspace_views": views,
+        "_partition": partition,
     }
     exec(
         compile(ast.Module(body=[function], type_ignores=[]), str(_BENCHMARK), "exec"),
@@ -724,7 +726,8 @@ def test_benchmark_times_canonical_public_replay_with_caller_storage():
     ]
     size.assert_called_once_with(2, 192, backend=backend)
     views.assert_called_once_with(workspace, 2, 192, backend=backend)
-    assert info == {"workspace_bytes": 4096, "split": 1}
+    partition.assert_called_once_with(2, 192, q.device.index)
+    assert info == {"workspace_bytes": 4096, "split": 3, "head_dim_ctas": 1}
     for _ in range(2):
         result, private_lse = fn()
         assert result is out and private_lse is lse

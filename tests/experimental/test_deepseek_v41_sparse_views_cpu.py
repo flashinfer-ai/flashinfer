@@ -379,6 +379,8 @@ def _case(
     # The private binder's source order is main, SWA, not SWA, main.
     pools = (_VirtualPool(main_rows, 288), _VirtualPool(swa_rows, 512))
     extent = dict(_WIDTH_EXTENTS)[k]
+    # Bind beyond the table for K0: padding tiles past it (a short last KV
+    # split) must stay masked without reading.
     capacity = max(256, extent)
     request = np.int32(request)
     routes, lengths = host.bind_combined_sparse_views(
@@ -505,7 +507,7 @@ def test_all_widths_have_fixed_extents_and_bounded_identical_masks(
 
 
 @pytest.mark.parametrize("seq,swa_length", ((0, 0), (3, 3), (_INT_MAX, 128)))
-def test_k0_forced_masked_main_loop_never_reads_column128(sparse_host, seq, swa_length):
+def test_k0_padding_tile_never_reads_column128(sparse_host, seq, swa_length):
     case = _case(sparse_host, 0, (seq,), (_INT_MAX,))
     assert case.table.shape[1] == 128
     assert case.routes.shape[0] == 256

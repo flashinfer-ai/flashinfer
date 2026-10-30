@@ -10,7 +10,9 @@ import cutlass
 import cutlass.cute as cute
 
 
-def _make_fp8_attention(compressed_k, sm_count, native_fp4, head_dim_ctas=1):
+def _make_fp8_attention(
+    compressed_k, sm_count, native_fp4, head_dim_ctas=1, kv_splits=1
+):
     from ....attention.prims_ts.kernels.mla_decode.sparse_policy import SparseMlaProfile
     from ....attention.prims_ts.kernels.mla_decode.throughput_latency_1cta.kernel import (
         ThroughputLatencyMlaDecodeTs,
@@ -20,9 +22,10 @@ def _make_fp8_attention(compressed_k, sm_count, native_fp4, head_dim_ctas=1):
     )
     from .resources import MixedFp8KvProducer
 
-    # A fixed SWA HEAD precedes ceil(K/128) main LOOP tiles, including when
-    # every SWA entry is invalid. One online softmax/PV state spans both pools.
-    capacity = max(256, 128 + ((compressed_k + 127) // 128) * 128)
+    # A fixed SWA tile precedes ceil(K/128) main tiles, including when every
+    # SWA entry is invalid. One online softmax/PV state spans both pools per KV
+    # split; only split 0 starts with the SWA tile.
+    capacity = 128 + ((compressed_k + 127) // 128) * 128
     attention = ThroughputLatencyMlaDecodeTs(
         batch_size=1,
         num_heads=64,
@@ -41,22 +44,27 @@ def _make_fp8_attention(compressed_k, sm_count, native_fp4, head_dim_ctas=1):
             # V owners each read their D128 slices of the retained K tile, so
             # a split divides PV, correction and output work, not the loads.
             num_ctas_per_head_dim=head_dim_ctas,
+            # KV splits divide the tile loads and FP4 conversion; the separate
+            # reducer merges the BF16 partials and applies sinks once.
+            num_ctas_per_seq_kv=kv_splits,
+            use_multi_ctas_kv=int(kv_splits > 1),
             use_persistent_scheduler=0,
         ),
         logical_num_heads=64,
         logical_seq_len_q=1,
         tile_size_q=64,
-        explicit_split_kv=1,
+        explicit_split_kv=kv_splits,
         explicit_persistent=False,
         reduction_mode="gmem_separate",
         mask_type="dense",
         sparse_profile=SparseMlaProfile(
             family="keep",
             tile_size_q=64,
-            split_kv=1,
+            split_kv=kv_splits,
             scheduler="nonpersistent",
             head_dim_ctas=head_dim_ctas,
-            gather_issue_warps=4,
+            # Eight loader warps halve each warp's FP4 conversion and SWA gather.
+            gather_issue_warps=8,
             reuse_kv=True,
             reuse_kv_stages=8,
             kv_tile_size=128,
@@ -76,12 +84,18 @@ def _make_fp8_attention(compressed_k, sm_count, native_fp4, head_dim_ctas=1):
     attention.direct_sparse_capacities = (128, compressed_k)
     # Stage final BF16 rows through SMEM so global stores write whole lines.
     attention.coalesce_keeps_output = True
+    # Overlap launch and prologue with the preceding grid (PDL).
+    attention.use_pdl = True
+    # B200 A/B: an entry release saves 2-3% for B=1 grids (4-20 CTAs) and
+    # costs 2-6% once the grid covers more SMs (e.g. B16/K512: 12.50 vs 11.74 us).
+    attention.pdl_entry_trigger_max_ctas = sm_count // 4
     return attention
 
 
 class Fp8SwaDecodeKernel:
-    def __init__(self, attention):
+    def __init__(self, attention, kv_splits=1):
         self.attention = attention
+        self.kv_splits = kv_splits
 
     @cute.jit
     def __call__(
@@ -95,6 +109,7 @@ class Fp8SwaDecodeKernel:
         sinks: object,
         out: cute.Tensor,
         lse: cute.Tensor,
+        partials: object,
         bmm1_scale: cutlass.Float32,
         bmm2_scale: cutlass.Float32,
         stream: object,
@@ -114,8 +129,8 @@ class Fp8SwaDecodeKernel:
             None,
             out,
             final_lse,
-            None,
-            cutlass.Int32(1),
+            partials,
+            cutlass.Int32(self.kv_splits),
             seq_lens,
             None,
             direct,
