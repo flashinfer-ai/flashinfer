@@ -21,7 +21,16 @@ from .proxy_score import (
     msa_proxy_score_fp4,
 )
 from .sparse_prefill import msa_sparse_attention
-from .sparse_decode import msa_sparse_decode_attention
+from .sparse_decode import (
+    msa_sparse_decode_attention,
+    prepare_msa_nvfp4_sparse_decode,
+)
+from .cake_icp_indexer import (
+    create_msa_icp_indexer_workspace,
+    destroy_msa_icp_indexer_workspace,
+    msa_icp_indexer_workspace_bytes,
+    prepare_msa_icp_indexer,
+)
 from .sparse_topk_select import msa_topk_select
 
 # Legacy aggregate capability flag retained for callers that only target
@@ -41,8 +50,11 @@ def supports_packed_kv(device: torch.device | str) -> bool:
 __all__ = [
     "MSASparseAttentionWorkspace",
     "SUPPORTS_PACKED_KV",
+    "create_msa_icp_indexer_workspace",
+    "destroy_msa_icp_indexer_workspace",
     "msa_decode_nvfp4_specialized_stats",
     "msa_decode_nvfp4_specialized_warmup",
+    "msa_icp_indexer_workspace_bytes",
     "msa_prefill_nvfp4_specialized_stats",
     "msa_prefill_nvfp4_specialized_warmup",
     "msa_proxy_score",
@@ -50,5 +62,7 @@ __all__ = [
     "msa_sparse_attention",
     "msa_sparse_decode_attention",
     "msa_topk_select",
+    "prepare_msa_icp_indexer",
+    "prepare_msa_nvfp4_sparse_decode",
     "supports_packed_kv",
 ]

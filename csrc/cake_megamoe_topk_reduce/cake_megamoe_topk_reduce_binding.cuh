@@ -16,23 +16,15 @@
 
 #pragma once
 
-#ifndef CAKE_MEGAMOE_TOPK_REDUCE_BODY_FILE
-#error "CAKE_MEGAMOE_TOPK_REDUCE_BODY_FILE must name the frozen generated body"
-#endif
-#ifndef CAKE_MEGAMOE_TOPK_REDUCE_KERNEL
-#error "CAKE_MEGAMOE_TOPK_REDUCE_KERNEL must name the frozen kernel symbol"
-#endif
-#ifndef CAKE_MEGAMOE_TOPK_REDUCE_THREADS
-#error "CAKE_MEGAMOE_TOPK_REDUCE_THREADS must describe the frozen thread count"
-#endif
-#ifndef CAKE_MEGAMOE_TOPK_REDUCE_SMEM_BYTES
-#error "CAKE_MEGAMOE_TOPK_REDUCE_SMEM_BYTES must describe dynamic shared memory"
-#endif
-
-// The frozen body is a self-contained CUDA translation-unit fragment.  Keep
-// its fixed-width types intact: rewriting names such as uint32_t here would
-// make the generated vector-load code refer to undefined aliases.
-#include CAKE_MEGAMOE_TOPK_REDUCE_BODY_FILE
+// The generated body is a self-contained CUDA translation-unit fragment shared
+// by every supported architecture; each module compiles it with its own
+// -gencode and its own CAKE_MEGAMOE_TOPK_REDUCE_ARCH, which picks the token
+// tiers below.  Keep its fixed-width types intact: rewriting names such as
+// uint32_t here would make the generated vector-load code refer to undefined
+// aliases.  The include stays ahead of the toolkit headers.
+// clang-format off
+#include "cake_megamoe_topk_reduce_kernels.cu"
+// clang-format on
 
 #include <cuda.h>
 #include <cuda_bf16.h>
@@ -49,28 +41,57 @@ namespace cake_megamoe_topk_reduce {
 
 constexpr int32_t kTopK = 6;
 constexpr int32_t kHiddenSize = 4096;
-constexpr int32_t kGridCTAsPerToken = 4;
 constexpr int32_t kRequiredAlignmentBytes = 128;
 
-static_assert(CAKE_MEGAMOE_TOPK_REDUCE_THREADS == 256,
-              "the frozen MegaMoE TopK reducer requires 256 threads");
-static_assert(CAKE_MEGAMOE_TOPK_REDUCE_SMEM_BYTES == 0,
-              "the frozen MegaMoE TopK reducer uses no dynamic shared memory");
+// The generated source holds the reducer in four CTA shapes.  Every thread runs
+// the same program (six loads, FP32 adds in increasing k, one RN rounding), so
+// all shapes write bit-identical rows; they differ in threads per CTA, BF16
+// values per thread and the L2 prefetch size of the loads.
+enum class CtaShape { k512x2, k512x4, k512x4Pf256, k1024x4Pf256 };
+
+// The fastest shape depends on the live token count and the architecture: the
+// module launches the first tier whose max_tokens covers num_tokens.
+struct TokenTier {
+  int64_t max_tokens;
+  CtaShape shape;
+};
+
+constexpr int64_t kNoTokenLimit = std::numeric_limits<int64_t>::max();
+
+#if CAKE_MEGAMOE_TOPK_REDUCE_ARCH == 100
+constexpr TokenTier kTokenTiers[] = {
+    {48, CtaShape::k512x2},
+    {96, CtaShape::k512x4},
+    {2048, CtaShape::k512x4Pf256},
+    {kNoTokenLimit, CtaShape::k1024x4Pf256},
+};
+#elif CAKE_MEGAMOE_TOPK_REDUCE_ARCH == 103
+constexpr TokenTier kTokenTiers[] = {
+    {48, CtaShape::k512x2},        {96, CtaShape::k512x4},
+    {192, CtaShape::k512x4Pf256},  {256, CtaShape::k1024x4Pf256},
+    {1024, CtaShape::k512x4Pf256}, {kNoTokenLimit, CtaShape::k1024x4Pf256},
+};
+#else
+#error "CAKE_MEGAMOE_TOPK_REDUCE_ARCH must be 100 (sm_100a) or 103 (sm_103a)"
+#endif
+
+inline CtaShape SelectShape(int64_t num_tokens) {
+  for (const TokenTier& tier : kTokenTiers) {
+    if (num_tokens <= tier.max_tokens) {
+      return tier.shape;
+    }
+  }
+  return CtaShape::k1024x4Pf256;
+}
+
+// A CTA of `threads` threads with `values` BF16 outputs each covers
+// threads * values of a token's kHiddenSize outputs.
+inline dim3 TokenGrid(int64_t num_tokens, int32_t threads, int32_t values) {
+  return dim3(static_cast<uint32_t>(kHiddenSize / (threads * values) * num_tokens), 1, 1);
+}
 
 inline void CheckCuda(cudaError_t status, const char* operation) {
   TVM_FFI_ICHECK(status == cudaSuccess) << operation << " failed: " << cudaGetErrorString(status);
-}
-
-inline void CheckTarget(int32_t device_id) {
-  int major = 0;
-  int minor = 0;
-  CheckCuda(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device_id),
-            "cudaDeviceGetAttribute(major)");
-  CheckCuda(cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device_id),
-            "cudaDeviceGetAttribute(minor)");
-  TVM_FFI_ICHECK(major == 10 && minor == 0)
-      << "the frozen MegaMoE TopK reducer requires exact compute capability 10.0, got " << major
-      << "." << minor;
 }
 
 inline std::pair<uintptr_t, uintptr_t> TensorByteRange(const TensorView& tensor, const char* name) {
@@ -93,16 +114,16 @@ inline void CheckNoOverlap(const TensorView& lhs, const char* lhs_name, const Te
   const auto lhs_range = TensorByteRange(lhs, lhs_name);
   const auto rhs_range = TensorByteRange(rhs, rhs_name);
   TVM_FFI_ICHECK(lhs_range.first >= rhs_range.second || rhs_range.first >= lhs_range.second)
-      << lhs_name << " must not overlap " << rhs_name
-      << ": the frozen kernel uses __restrict__ pointers";
+      << lhs_name << " must not overlap " << rhs_name << ": the kernel uses __restrict__ pointers";
 }
 
+// partials: [capacity, 6, 4096] BF16, out: [capacity, 4096] BF16.  The kernel
+// reads and writes only the first num_tokens rows; the workspace capacity is a
+// host-side property and is not restricted beyond num_tokens <= capacity.
 void Run(TensorView partials, TensorView out, int64_t num_tokens, int64_t cuda_stream) {
   TVM_FFI_ICHECK(cuda_stream >= 0) << "cuda_stream must be a non-negative stream handle";
   CHECK_CUDA(partials);
-  const int32_t device_id = partials.device().device_id;
-  ffi::CUDADeviceGuard device_guard(device_id);
-  CheckTarget(device_id);
+  ffi::CUDADeviceGuard device_guard(partials.device().device_id);
 
   CHECK_CUDA(out);
   CHECK_DEVICE(partials, out);
@@ -110,10 +131,9 @@ void Run(TensorView partials, TensorView out, int64_t num_tokens, int64_t cuda_s
   CHECK_INPUT_TYPE(out, dl_bfloat16);
 
   TVM_FFI_ICHECK(partials.ndim() == 3) << "partials must have shape [capacity, 6, 4096]";
-  const int64_t capacity = partials.ndim() == 3 ? partials.size(0) : -1;
-  TVM_FFI_ICHECK((capacity == 256 || capacity == 4096) && partials.size(1) == kTopK &&
-                 partials.size(2) == kHiddenSize)
-      << "partials must have shape [256 or 4096, 6, 4096]";
+  const int64_t capacity = partials.size(0);
+  TVM_FFI_ICHECK(partials.size(1) == kTopK && partials.size(2) == kHiddenSize)
+      << "partials must have shape [capacity, 6, 4096]";
   CHECK_CONTIGUOUS(partials);
 
   TVM_FFI_ICHECK(out.ndim() == 2 && out.size(0) == capacity && out.size(1) == kHiddenSize)
@@ -132,13 +152,28 @@ void Run(TensorView partials, TensorView out, int64_t num_tokens, int64_t cuda_s
     return;
   }
 
-  const dim3 grid(static_cast<uint32_t>(kGridCTAsPerToken * num_tokens), 1, 1);
-  const dim3 block(CAKE_MEGAMOE_TOPK_REDUCE_THREADS, 1, 1);
+  auto* partials_ptr = reinterpret_cast<__nv_bfloat16*>(partials.data_ptr());
+  auto* out_ptr = reinterpret_cast<__nv_bfloat16*>(out.data_ptr());
   const auto stream = reinterpret_cast<cudaStream_t>(cuda_stream);
-  CAKE_MEGAMOE_TOPK_REDUCE_KERNEL<<<grid, block, CAKE_MEGAMOE_TOPK_REDUCE_SMEM_BYTES, stream>>>(
-      reinterpret_cast<__nv_bfloat16*>(partials.data_ptr()),
-      reinterpret_cast<__nv_bfloat16*>(out.data_ptr()));
-  CheckCuda(cudaGetLastError(), "frozen MegaMoE TopK-reduce launch");
+  switch (SelectShape(num_tokens)) {
+    case CtaShape::k512x2:
+      kernel_flashinfer_sm100_megamoe_workspace_topk_reduce_tiered_t512x2<<<
+          TokenGrid(num_tokens, 512, 2), 512, 0, stream>>>(partials_ptr, out_ptr);
+      break;
+    case CtaShape::k512x4:
+      kernel_flashinfer_sm100_megamoe_workspace_topk_reduce_tiered_t512x4<<<
+          TokenGrid(num_tokens, 512, 4), 512, 0, stream>>>(partials_ptr, out_ptr);
+      break;
+    case CtaShape::k512x4Pf256:
+      kernel_flashinfer_sm100_megamoe_workspace_topk_reduce_tiered_t512x4_pf256<<<
+          TokenGrid(num_tokens, 512, 4), 512, 0, stream>>>(partials_ptr, out_ptr);
+      break;
+    case CtaShape::k1024x4Pf256:
+      kernel_flashinfer_sm100_megamoe_workspace_topk_reduce_tiered_t1024x4_pf256<<<
+          TokenGrid(num_tokens, 1024, 4), 1024, 0, stream>>>(partials_ptr, out_ptr);
+      break;
+  }
+  CheckCuda(cudaGetLastError(), "MegaMoE TopK-reduce launch");
 }
 
 }  // namespace cake_megamoe_topk_reduce

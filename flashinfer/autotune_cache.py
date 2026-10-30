@@ -4,7 +4,7 @@ Design doc: ``docs/design_docs/autotuner_v2.md`` — read it before changing the
 store layout, the environment identity, or the attach semantics, and update it
 in the same PR if this file's behavior changes.
 
-This module owns *persistence only*: given an already-canonical lookup key
+This module owns managed persistence and its context controls. Given a canonical lookup key
 (the same ``str((custom_op, runner_class_name, profile, extras))`` string the
 :class:`~flashinfer.autotuner.AutoTuner` uses for its JSON config files), it
 stores one winner per key as one small JSON file under an
@@ -32,7 +32,7 @@ Design rules (kept deliberately minimal for the first version):
 
 The cache root defaults to ``FLASHINFER_CACHE_DIR/autotune`` and can be
 overridden with the ``FLASHINFER_AUTOTUNE_CACHE_DIR`` environment variable
-or ``autotune_v2(root=...)`` (always a directory, never a schema-bearing
+or ``autotune_v2(cache_root=...)`` (always a directory, never a schema-bearing
 filename: the location is placement only, so no choice of root can mix
 incompatible entries).
 """
@@ -44,7 +44,7 @@ import json
 import os
 import pathlib
 import tempfile
-from typing import Any, Dict, Optional, Set, Tuple, Union
+from typing import Any, Dict, NamedTuple, Optional, Set, Tuple, Union
 
 from .jit.core import logger
 
@@ -61,6 +61,66 @@ _SCHEMA = "v2"
 # Sentinel for "this value has no round-trippable encoding" (distinct from a
 # legitimately-stored None).
 _UNENCODABLE = object()
+
+
+@dataclasses.dataclass
+class ReplayCoverage:
+    """Bounded diagnostics for Python cache lookups in a replay region.
+
+    Counts include every observed lookup; ``records`` retains only the first
+    ``max_records`` decisions. CUDA graph replay executes no Python lookups.
+    A hit describes the tuner's selection, not a backend's executed kernel.
+    Read the report after leaving the context; concurrent tuning is unsupported.
+    """
+
+    max_records: int = 64
+    hits: int = dataclasses.field(default=0, init=False)
+    misses: int = dataclasses.field(default=0, init=False)
+    skipped: int = dataclasses.field(default=0, init=False)
+    dropped_records: int = dataclasses.field(default=0, init=False)
+    records: list[dict[str, Any]] = dataclasses.field(default_factory=list, init=False)
+
+    def __post_init__(self):
+        if type(self.max_records) is not int or self.max_records < 0:
+            raise ValueError("max_records must be a nonnegative integer")
+
+    def _record(
+        self,
+        op,
+        shapes,
+        identity,
+        *,
+        status,
+        source,
+        runner,
+        tactic,
+        reasons=(),
+        requested_policy=None,
+        stored_policy=None,
+    ):
+        if status == "hit":
+            self.hits += 1
+        elif status == "skipped":
+            self.skipped += 1
+        else:
+            self.misses += 1
+        if len(self.records) >= self.max_records:
+            self.dropped_records += 1
+            return
+        self.records.append(
+            dict(
+                op=op,
+                input_shapes=shapes,
+                cache_identity=identity,
+                status=status,
+                source=source,
+                runner=runner,
+                selected_tactic=repr(tactic)[:256],
+                requested_policy=requested_policy,
+                stored_policy=stored_policy,
+                reasons=tuple(reasons),
+            )
+        )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -95,6 +155,10 @@ class MeasurementPolicy:
         cold_l2: Force cold-/hot-L2 profiling; ``None`` (default)
             inherits each op's ``TuningConfig.use_cold_l2_cache``.
             Orthogonal to ``execution_mode``.
+        graph_timing: Hot-L2 graph measurement objective: ``"amortized"``
+            averages a repeated replay window; ``"individual"`` takes the
+            median of instrumented per-call intervals. ``None`` inherits the
+            op's setting. Cold-L2 profiling retains its own timing path.
     """
 
     execution_mode: str = "auto"
@@ -105,8 +169,20 @@ class MeasurementPolicy:
     # implementations; explicit values are identity-bearing (manifest) so
     # diagnostic runs never overwrite default entries.
     _timer: str = "auto"
+    graph_timing: Optional[str] = None
 
     def __post_init__(self):
+        if self.graph_timing not in (None, "amortized", "individual"):
+            raise ValueError(
+                "MeasurementPolicy.graph_timing must be None, 'amortized', "
+                f"or 'individual', got {self.graph_timing!r}"
+            )
+        if self.graph_timing is not None and (
+            self.execution_mode == "eager" or self._timer == "cupti"
+        ):
+            raise ValueError(
+                "MeasurementPolicy.graph_timing cannot override eager or CUPTI timing"
+            )
         if self.execution_mode not in ("auto", "cuda_graph", "eager"):
             raise ValueError(
                 f"MeasurementPolicy.execution_mode must be 'cuda_graph', "
@@ -154,6 +230,8 @@ class MeasurementPolicy:
             fields["measure_cold_l2"] = str(self.cold_l2)
         if self._timer != "auto":
             fields["measure_timer"] = self._timer
+        if self.graph_timing is not None:
+            fields["measure_graph_timing"] = self.graph_timing
         return fields
 
 
@@ -252,6 +330,21 @@ def _atomic_write_json(path: pathlib.Path, obj: Any) -> None:
         raise
 
 
+class ManagedCacheEntry(NamedTuple):
+    runner: str
+    tactic: Any
+    profiling_policy: Optional[tuple] = None
+
+    @classmethod
+    def from_json(cls, entry):
+        policy = entry.get("profiling_policy")
+        return cls(
+            entry["runner"],
+            entry["tactic"],
+            tuple(policy) if isinstance(policy, list) else None,
+        )
+
+
 class ManagedAutotuneCache:
     """Per-entry, environment-hashed persistence for autotune winners.
 
@@ -278,7 +371,7 @@ class ManagedAutotuneCache:
         # Positive/negative lookup memos: at most one filesystem probe per
         # key per process.  A concurrent process's publish becomes visible
         # on the next attach.
-        self._hits: Dict[str, Tuple[str, Any]] = {}
+        self._hits: Dict[str, ManagedCacheEntry] = {}
         self._missing: Set[str] = set()
 
     def _entry_path(self, file_key: str) -> pathlib.Path:
@@ -292,8 +385,8 @@ class ManagedAutotuneCache:
         if not manifest_path.exists():
             _atomic_write_json(manifest_path, self.manifest)
 
-    def lookup(self, file_key: str) -> Optional[Tuple[str, Any]]:
-        """Return ``(runner_class_name, json_tactic)`` for *file_key*, or None.
+    def lookup(self, file_key: str) -> Optional[ManagedCacheEntry]:
+        """Return the winner and optional profiling provenance, or None.
 
         Any failure (missing file, malformed JSON, embedded-key mismatch)
         is a cache miss.
@@ -311,7 +404,7 @@ class ManagedAutotuneCache:
             # entry must embed the exact canonical key it was stored under.
             if entry["key"] != file_key:
                 raise ValueError(f"embedded key mismatch (found {entry['key']!r})")
-            hit = (entry["runner"], entry["tactic"])
+            hit = ManagedCacheEntry.from_json(entry)
             self._hits[file_key] = hit
             return hit
         except FileNotFoundError:
@@ -325,18 +418,32 @@ class ManagedAutotuneCache:
             self._missing.add(file_key)
             return None
 
+    def discard(self, file_key: str) -> None:
+        """Forget an entry before collective re-profiling (best-effort)."""
+        self._hits.pop(file_key, None)
+        self._missing.add(file_key)
+        try:
+            self._entry_path(file_key).unlink(missing_ok=True)
+        except OSError as e:
+            logger.warning(
+                f"[Autotuner]: Failed to remove managed cache entry {file_key}: {e}"
+            )
+
     def publish(
         self,
         file_key: str,
         runner_name: str,
         json_tactic: Any,
         key_fields: Any = None,
+        profiling_policy: Optional[tuple] = None,
     ) -> None:
         """Atomically persist the tuned winner for *file_key* (best-effort).
 
         *key_fields* is the structural form of the same key; when supplied and
         encodable it is stored alongside, enabling preload().  Optional so that
         callers that predate preloading keep working unchanged.
+        *profiling_policy* records effective per-entry measurement provenance;
+        absent provenance permits replay but not reuse during tuning.
         """
         try:
             self._ensure_dirs()
@@ -345,6 +452,8 @@ class ManagedAutotuneCache:
                 "runner": runner_name,
                 "tactic": json_tactic,
             }
+            if profiling_policy is not None:
+                entry["profiling_policy"] = list(profiling_policy)
             # Structural, round-trippable form of the same key so the store can
             # be preloaded into memory (see preload()).  Additive: readers that
             # predate this field ignore it, and an entry without it is simply
@@ -354,7 +463,9 @@ class ManagedAutotuneCache:
                 if encoded is not None:
                     entry["key_fields"] = encoded
             _atomic_write_json(self._entry_path(file_key), entry)
-            self._hits[file_key] = (runner_name, json_tactic)
+            self._hits[file_key] = ManagedCacheEntry(
+                runner_name, json_tactic, profiling_policy
+            )
             self._missing.discard(file_key)
         except Exception as e:
             logger.warning(
@@ -366,8 +477,8 @@ class ManagedAutotuneCache:
     def preload(self) -> Tuple[list, int, int]:
         """Read every entry once, returning what can be served from memory.
 
-        Returns ``(triples, n_total, n_skipped)`` where each triple is
-        ``(key_fields_tuple, runner_name, json_tactic)``.  Entries written
+        Returns ``(entries, n_total, n_skipped)`` where each item is
+        ``(key_fields_tuple, ManagedCacheEntry)``.  Entries written
         before the ``key_fields`` field existed, or whose extras have no
         round-trippable encoding, are counted in *n_skipped* and left to the
         normal lazy path -- preloading is an optimisation, never a
@@ -377,12 +488,12 @@ class ManagedAutotuneCache:
         fewer preloaded entries, never an exception: the cache must not be able
         to break correctness.
         """
-        triples: list = []
+        entries: list = []
         total = skipped = 0
         try:
             paths = sorted(self.entries_dir.glob("*.json"))
         except Exception:
-            return triples, 0, 0
+            return entries, 0, 0
         for path in paths:
             total += 1
             try:
@@ -410,13 +521,14 @@ class ManagedAutotuneCache:
                 if path.stem != expect:
                     skipped += 1
                     continue
-                triples.append((fields, entry["runner"], entry["tactic"]))
+                hit = ManagedCacheEntry.from_json(entry)
+                entries.append((fields, hit))
                 # Warm the string-keyed memo too, so a lookup that does build a
                 # file_key (cold-miss path, load_from_file) also avoids the read.
-                self._hits[entry["key"]] = (entry["runner"], entry["tactic"])
+                self._hits[entry["key"]] = hit
             except Exception:
                 skipped += 1
-        return triples, total, skipped
+        return entries, total, skipped
 
     def clear_memo(self) -> None:
         """Forget memoized lookups (e.g. after AutoTuner.clear_cache)."""
@@ -430,16 +542,14 @@ class ManagedAutotuneCache:
         )
 
 
-def _resolve_managed_store(tuner, cache_root, manifest: Dict[str, str]):
-    """Return the managed store for ``(cache_root, manifest)`` and set it as
-    the process ambient (last-wins).
+def _resolve_managed_store(
+    tuner, cache_root, manifest: Dict[str, str], *, attach_ambient: bool = True
+):
+    """Resolve and hydrate an identity, optionally attaching it for bare serving.
 
-    A persistent autotune_v2 context always attaches its store as the ambient
-    the moment it opens, so bare, context-free serving after the context
-    exits resolves to it.  autotune_v2 does not nest, so there is no scoped
-    variant to preserve an outer ambient for; sequential contexts are simply
-    last-wins.  The store object (and its memos) is reused across identity
-    switches via the registry.
+    Context scopes never change the ambient pointer. Swapping and restoring
+    it would overwrite another thread's intervening process attachment.
+    Both scopes reuse the same store registry and persistence format.
     """
     resolved = (
         pathlib.Path(cache_root) if cache_root is not None else get_default_cache_root()
@@ -454,7 +564,7 @@ def _resolve_managed_store(tuner, cache_root, manifest: Dict[str, str]):
         if store is None:
             store = ManagedAutotuneCache(manifest=manifest, root=resolved)
             tuner._managed_stores[reg_key] = store
-        if store is not tuner._managed_cache:
+        if attach_ambient and store is not tuner._managed_cache:
             if tuner._managed_cache is not None:
                 logger.info(
                     f"[Autotuner]: Re-attaching managed autotune cache at "
@@ -493,17 +603,32 @@ def _hydrate_from_store(tuner, store) -> None:
         return
     try:
         from .autotuner.autotuner import _json_to_tactic
+        from .autotuner.protocol import _PROTOCOL_KEY, _protocol_cache_key
 
-        triples, total, skipped = store.preload()
-        for key_fields, runner_name, json_tactic in triples:
+        entries, total, skipped = store.preload()
+        for key_fields, entry in entries:
+            if key_fields[:1] == (_PROTOCOL_KEY,):
+                try:
+                    _, namespace, key = key_fields
+                    _protocol_cache_key(namespace, key)
+                    if entry.runner != namespace:
+                        raise ValueError("protocol identifier mismatch")
+                except (ValueError, TypeError) as exc:
+                    logger.warning(f"[Autotuner]: Ignoring protocol entry: {exc}")
+                    continue
+                records = tuner._protocol_record_partitions.setdefault(
+                    marker, {}
+                ).setdefault(namespace, {})
+                records.setdefault(key, entry.tactic)
+                continue
             memo_key = (*marker, key_fields)
             tuner._managed_decoded.setdefault(
-                memo_key, (runner_name, _json_to_tactic(json_tactic))
+                memo_key, entry._replace(tactic=_json_to_tactic(entry.tactic))
             )
         tuner._preloaded_stores.add(marker)
         if total:
             logger.info(
-                f"[Autotuner]: Preloaded {len(triples)}/{total} managed cache "
+                f"[Autotuner]: Preloaded {len(entries)}/{total} managed cache "
                 f"entries into memory"
                 + (f" ({skipped} not preloadable, served lazily)" if skipped else "")
             )
@@ -529,17 +654,30 @@ def autotune_v2_reload() -> None:
     Only meaningful when tuning published to a store: winners that were
     never published (e.g. ``persistent_cache=False`` segments) fall back to
     heuristics after the reload.
+
+    Call outside context-scoped caches. Reload clears all in-process
+    partitions and eagerly hydrates the ambient store; scoped stores hydrate
+    when next selected. Reload inside a context scope raises ``RuntimeError``.
     """
     from .autotuner import AutoTuner
 
     tuner = AutoTuner.get()
+    if tuner._v2_local.active and tuner._v2_local.cache_scope == "context":
+        raise RuntimeError("reload inside a context-scoped cache is not supported")
     with tuner._lock:
         tuner.profiling_cache.clear()
+        tuner._ranked_tactics_cache.clear()
+        tuner._ranked_tactics_partitions.clear()
         tuner._winner_partitions.clear()
+        tuner._protocol_record_partitions.clear()
+        tuner._protocol_cache_generation += 1
+        tuner._profiling_cache_policies.clear()
         tuner._managed_decoded.clear()
         # Drop the hydration markers so every store re-hydrates on its next
         # attach instead of silently degrading to lazy per-key disk reads.
         tuner._preloaded_stores.clear()
+        for registered_store in tuner._managed_stores.values():
+            registered_store.clear_memo()
         store = tuner._managed_cache
         if store is not None:
             store.clear_memo()
@@ -561,6 +699,9 @@ def autotune_v2(
     cache_root: Union[str, os.PathLike, None] = None,
     measurement_policy: Optional[MeasurementPolicy] = None,
     *,
+    cache_scope: str = "process",
+    replay_report: Optional[ReplayCoverage] = None,
+    strict_replay: bool = False,
     tuning_buckets: Optional[Tuple[int, ...]] = None,
     round_up: Optional[bool] = None,
     skip_ops: Optional[Union[str, Set[str]]] = None,
@@ -596,7 +737,7 @@ def autotune_v2(
     serves only what is already in the in-memory winner cache (e.g. tuned
     in-memory earlier this process).
 
-    **Attach semantics**: ``persistent_cache=True`` attaches the managed
+    **Attach semantics**: by default, ``persistent_cache=True`` attaches the managed
     store for the remainder of the process (like v1's ``load_configs``),
     so inference *after* the context exits keeps reusing on-disk entries.
     Publishing only happens while tuning inside a context.  See the module
@@ -617,6 +758,26 @@ def autotune_v2(
             choice of root can mix incompatible entries).  Defaults to
             ``FLASHINFER_CACHE_DIR/autotune``, overridable with the
             ``FLASHINFER_AUTOTUNE_CACHE_DIR`` environment variable.
+        cache_scope: ``"process"`` (default) attaches the store for bare
+            serving after exit. ``"context"`` selects it only inside the
+            context, without changing the ambient store. An identified
+            context (a managed store or nonempty measurement policy) ignores
+            legacy-loaded and bundled configs. With persistence disabled and
+            no policy, legacy memory/file behavior is unchanged. Use the same
+            identity for tuning and capture-time lookup; graph replay itself
+            runs no Python lookup. Nested v2 contexts and scoped reload are
+            unsupported. Concurrent tuning/serving and distributed scoped
+            stores require separate qualification.
+        replay_report: Optional bounded report for ``mode="replay"``. Records
+            hits, fallback misses and explicit ``skip_ops`` exclusions, with
+            selected runner/tactic and cache source. Backend-internal fallback
+            is not observable here. Profiling is forbidden while reporting.
+        strict_replay: Require a policy-compatible cached winner for every
+            non-skipped operation. Only supported for identified context scopes
+            in single-rank replay, before or during capture-time lookup. Run
+            all planned profiles through replay before capturing. A miss raises
+            without profiling or publishing replacement winners. Creates a report
+            if none was supplied; the context yields that report. Defaults to False.
         tuning_buckets: Forwarded to :func:`flashinfer.autotune`.
         round_up: Forwarded to :func:`flashinfer.autotune`.  Context-
             scoped: post-context lookups use each op's default bucket
@@ -642,7 +803,12 @@ def autotune_v2(
             pass
         model(inputs)  # reuses tuned winners, no context needed
     """
-    from .autotuner import AutoTuner, _collect_metadata, autotune
+    from .autotuner import (
+        AutoTuner,
+        _collect_metadata,
+        autotune,
+        get_autotune_process_group,
+    )
 
     if mode not in ("tune", "replay"):
         raise ValueError(
@@ -657,9 +823,38 @@ def autotune_v2(
             f"{type(persistent_cache).__name__!r}; to place the store, pass "
             f"cache_root=<directory> instead."
         )
+    if cache_scope not in ("process", "context"):
+        raise ValueError("cache_scope must be 'process' or 'context'")
+    if not isinstance(strict_replay, bool):
+        raise TypeError("strict_replay must be a bool")
+    if replay_report is not None and not isinstance(replay_report, ReplayCoverage):
+        raise TypeError("replay_report must be ReplayCoverage or None")
+    if mode != "replay" and (strict_replay or replay_report is not None):
+        raise ValueError("replay diagnostics require mode='replay'")
+    if strict_replay:
+        import torch.distributed as dist
+
+        if cache_scope != "context" or not (
+            persistent_cache
+            or (measurement_policy and measurement_policy.manifest_fields())
+        ):
+            raise ValueError(
+                "strict_replay requires an identified context-scoped cache"
+            )
+        if get_autotune_process_group() is not None or (
+            dist.is_initialized() and dist.get_world_size() > 1
+        ):
+            raise RuntimeError(
+                "strict_replay requires single-rank execution; use replay_report "
+                "and coordinate distributed coverage validation before capture"
+            )
+        if replay_report is None:
+            replay_report = ReplayCoverage()
     enable_tuning = mode == "tune"
 
     tuner = AutoTuner.get()
+    if replay_report is not None and tuner.is_tuning_mode:
+        raise RuntimeError("replay diagnostics cannot run while tuning is enabled")
     # autotune_v2 does not nest: a v2-inside-v2 context would have ambiguous
     # store/policy targeting (which store does the outer's later work publish
     # to?).  Fail fast instead of silently last-wins.  Nesting a plain v1
@@ -683,10 +878,9 @@ def autotune_v2(
             if measurement_policy is not None:
                 # The policy is part of the environment identity.
                 manifest.update(measurement_policy.manifest_fields())
-            # A persistent context always attaches its store as the process
-            # ambient (last-wins), so bare serving after it exits resolves
-            # to it.
-            store = _resolve_managed_store(tuner, cache_root, manifest)
+            store = _resolve_managed_store(
+                tuner, cache_root, manifest, attach_ambient=cache_scope == "process"
+            )
         else:
             # Disk forbidden for this context: lookups and publishes skip the
             # managed store even if one is attached as ambient (the ambient
@@ -702,9 +896,15 @@ def autotune_v2(
         local.active = True
         local.store = store
         local.measure = measurement_policy
+        local.cache_scope = cache_scope
+        local.replay_report = replay_report
+        local.strict_replay = strict_replay
         try:
-            yield
+            yield replay_report
         finally:
             local.active = False
             local.store = None
             local.measure = None
+            local.cache_scope = "process"
+            local.replay_report = None
+            local.strict_replay = False

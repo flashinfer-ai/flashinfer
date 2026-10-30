@@ -1,5 +1,7 @@
 """Tests for alphamoe_sm100 — the generated SM100/SM103 fused W8A8 MoE kernel.
 
+Device tests require SM100/SM103 and CUDA 12.8+, not the full SM10x family.
+
 The frozen device TU in ``csrc/alphamoe_sm100.cu`` is a generated Loom
 schedule of the Alpha-MoE up+SwiGLU+down megakernel. The torch reference
 reproduced below rounds each routed per-128-block down contribution to BF16
@@ -34,17 +36,22 @@ expert per 128-wide intermediate block).
 import pytest
 import torch
 
-from flashinfer.utils import is_sm100a_supported
+from flashinfer import utils
+from tests.test_helpers.cake_profiler import cuda_kernel_names
 
 _FP8_MAX = 448.0
 _GROUP = 128
 
 
-def _skip_if_not_sm100_family():
+def _skip_if_not_sm100_sm103():
     if not torch.cuda.is_available():
         pytest.skip("alphamoe_sm100 tests require a CUDA device")
-    if not is_sm100a_supported(torch.device("cuda")):
-        pytest.skip("alphamoe_sm100 requires SM100/SM103")
+    device = torch.device("cuda")
+    if utils.get_compute_capability(device) not in {
+        (10, 0),
+        (10, 3),
+    } or not utils.is_sm100a_supported(device):
+        pytest.skip("alphamoe_sm100 requires SM100/SM103 and CUDA 12.8+")
 
 
 def _quantize_per_row_group(values):
@@ -372,7 +379,7 @@ def test_alphamoe_sm100_matches_reference(
     seed,
 ):
     """End-to-end parity against the independent torch oracle (out=None path)."""
-    _skip_if_not_sm100_family()
+    _skip_if_not_sm100_sm103()
     case = _make_case(
         m,
         n,
@@ -410,7 +417,7 @@ def test_alphamoe_sm100_guard_skips_blocks_past_plan_extent():
     extent (pair 0 / expert 0), so any block ignoring the guard adds a
     visible spurious contribution to token 0.
     """
-    _skip_if_not_sm100_family()
+    _skip_if_not_sm100_sm103()
     _label, m, n, k, num_experts, top_k, block_m, shared, bal, scaling, seed = (
         CONTRACT_CASES[1]
     )
@@ -436,7 +443,7 @@ def test_alphamoe_sm100_guard_skips_blocks_past_plan_extent():
 
 def test_alphamoe_sm100_accumulates_into_out():
     """out is a caller-owned accumulator: result = initial value + contributions."""
-    _skip_if_not_sm100_family()
+    _skip_if_not_sm100_sm103()
     _label, m, n, k, num_experts, top_k, block_m, shared, bal, scaling, seed = (
         CONTRACT_CASES[0]
     )
@@ -462,7 +469,7 @@ def test_alphamoe_sm100_accumulates_into_out():
 
 def test_alphamoe_sm100_validates_tma_and_output_alignment():
     """Unsupported views fail synchronously, while an aligned row slice works."""
-    _skip_if_not_sm100_family()
+    _skip_if_not_sm100_sm103()
     _, m, n, k, num_experts, top_k, block_m, shared, bal, scaling, seed = (
         CONTRACT_CASES[0]
     )
@@ -504,3 +511,45 @@ def test_alphamoe_sm100_validates_tma_and_output_alignment():
     torch.cuda.synchronize()
     expected = _reference(case)
     assert torch.equal(out, expected)
+
+
+# Busy 8-row route subtiles up to which M <= 8 runs the four-CTA quad variants
+# (QuadClusterCapacity in csrc/alphamoe_sm100.cu), measured per device class by
+# SM count: 74 on GB300 (152 SMs), 71 on B200 (148 SMs). Past it the CTA pair
+# runs.
+_QUAD_CLUSTER_CAPACITY = {148: 71, 152: 74}
+
+
+@pytest.mark.parametrize(
+    "m,top_k,block_m",
+    [
+        (7, 10, 8),
+        (8, 9, 8),
+        (2, 37, 8),
+        (5, 15, 8),
+        (5, 7, 16),
+        (4, 9, 16),
+        (1, 37, 16),
+        (2, 19, 16),
+    ],
+)
+def test_alphamoe_sm100_m8_quad_cluster_capacity(m, top_k, block_m):
+    """M <= 8 at K >= 4096 runs the quad while its busy subtiles fit the device.
+
+    With more experts than routes, the plan's bound on busy 8-row subtiles is
+    m * top_k * block_m / 8. The quad variants run up to the device's measured
+    capacity and the pair above it, so a failed occupancy query (no cap) fails
+    here.
+    """
+    _skip_if_not_sm100_sm103()
+    sms = torch.cuda.get_device_properties(0).multi_processor_count
+    if sms not in _QUAD_CLUSTER_CAPACITY:
+        pytest.skip(f"no measured quad cluster capacity for {sms} SMs")
+    seed = 29700 + m * top_k + block_m
+    case = _make_case(m, 256, 7168, 257, top_k, block_m, False, 0.8, 1.0, seed)
+    names = cuda_kernel_names(lambda: _launch(case))
+    quad = any("w8a8_i2" in x or "w8a8_im" in x for x in names)
+    pair = any("w8a8_p2" in x or "w8a8_pl" in x for x in names)
+    bound = m * top_k * block_m // 8
+    assert quad != pair, names
+    assert quad == (bound <= _QUAD_CLUSTER_CAPACITY[sms]), (sms, bound, names)

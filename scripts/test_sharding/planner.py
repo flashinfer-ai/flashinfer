@@ -259,7 +259,7 @@ def build_plan(
         source_nodes[node.source_file].append(node)
 
     batches: list[Batch] = []
-    solo_sources = {node.source_file for node in nodes if node.solo}
+    node_exclusive_sources = {node.source_file for node in nodes if node.node_exclusive}
     for source_file in sorted(source_nodes, key=lambda value: value.encode("utf-8")):
         overhead_ms = estimate_book.overhead_ms_runtime(
             source_file, options.default_source_overhead_seconds
@@ -271,7 +271,7 @@ def build_plan(
             _MIN_WORK_TO_OVERHEAD_RATIO * overhead_ms,
         )
         item_capacity = max(baseline_capacity, overhead_aware_capacity)
-        if source_file in solo_sources:
+        if source_file in node_exclusive_sources:
             batch_nodes = tuple(
                 sorted(source_nodes[source_file], key=lambda node: node.order)
             )
@@ -335,7 +335,7 @@ def build_plan(
         batches_by_source, key=lambda value: value.encode("utf-8")
     ):
         source_batches = batches_by_source[source_file]
-        if source_file in solo_sources:
+        if source_file in node_exclusive_sources:
             unit_bins.extend(
                 [batch]
                 for batch in sorted(
@@ -391,12 +391,18 @@ def build_plan(
 def _estimated_worker_loads(
     units: Sequence[Unit],
     workers: int,
-    solo_sources: frozenset[str],
+    node_exclusive_sources: frozenset[str],
 ) -> list[int]:
     if workers <= 0:
         raise ValueError("workers must be positive")
-    solo_units = [unit for unit in units if _unit_is_solo(unit, solo_sources)]
-    regular_units = [unit for unit in units if not _unit_is_solo(unit, solo_sources)]
+    node_exclusive_units = [
+        unit for unit in units if _unit_is_node_exclusive(unit, node_exclusive_sources)
+    ]
+    regular_units = [
+        unit
+        for unit in units
+        if not _unit_is_node_exclusive(unit, node_exclusive_sources)
+    ]
     # Workers start with source-affine queues but steal whole units after
     # draining their own queue, so LPT is the appropriate steady-state model.
     bins = _lpt_bins(
@@ -405,15 +411,15 @@ def _estimated_worker_loads(
         lambda unit: unit.estimated_ms,
         lambda unit: unit.id,
     )
-    exclusive_ms = sum(unit.estimated_ms for unit in solo_units)
+    exclusive_ms = sum(unit.estimated_ms for unit in node_exclusive_units)
     return [
         exclusive_ms + sum(unit.estimated_ms for unit in worker_units)
         for worker_units in bins
     ]
 
 
-def _unit_is_solo(unit: Unit, solo_sources: frozenset[str]) -> bool:
-    return any(batch.source_file in solo_sources for batch in unit.batches)
+def _unit_is_node_exclusive(unit: Unit, node_exclusive_sources: frozenset[str]) -> bool:
+    return any(batch.source_file in node_exclusive_sources for batch in unit.batches)
 
 
 def capacity_metrics(
@@ -422,7 +428,12 @@ def capacity_metrics(
     *,
     deadline_seconds: int = 0,
 ) -> CapacityMetrics:
-    """Return deterministic load, makespan, and deadline-capacity estimates."""
+    """Estimate capacity, including node-wide and host-heavy serial floors.
+
+    Worker loads use LPT placement. Makespans also account for serialized
+    host-heavy work, but remain optimistic about GPU contention because this
+    interface has no GPU topology or memory measurements.
+    """
 
     configured = workers_by_shard or {}
     shard_loads: dict[str, int] = {}
@@ -430,28 +441,51 @@ def capacity_metrics(
     makespans: list[int] = []
     required_by_shard: dict[str, int | None] = {}
     deadline_ms = deadline_seconds * 1000
-    solo_sources = frozenset(node.source_file for node in plan.nodes if node.solo)
+    node_exclusive_sources = frozenset(
+        node.source_file for node in plan.nodes if node.node_exclusive
+    )
+    host_memory_heavy_sources = frozenset(
+        node.source_file for node in plan.nodes if node.host_memory_heavy
+    )
     for shard_index in range(plan.options.shard_count):
         units = [unit for unit in plan.units if unit.shard_index == shard_index]
         load = sum(unit.estimated_ms for unit in units)
         shard_loads[str(shard_index)] = load
         workers = max(1, int(configured.get(shard_index, 1)))
-        loads = _estimated_worker_loads(units, workers, solo_sources)
+        loads = _estimated_worker_loads(units, workers, node_exclusive_sources)
         worker_loads[str(shard_index)] = loads
-        makespans.append(max(loads, default=0))
+        # Node-exclusive work follows the parallel phase; host-heavy work in
+        # that phase is serialized even when more workers are available.
+        serial_floor_ms = sum(
+            unit.estimated_ms
+            for unit in units
+            if _unit_is_node_exclusive(unit, node_exclusive_sources)
+            or any(
+                batch.source_file in host_memory_heavy_sources for batch in unit.batches
+            )
+        )
+        makespans.append(max(max(loads, default=0), serial_floor_ms))
         if deadline_ms <= 0:
             required_by_shard[str(shard_index)] = None
         elif not units:
             required_by_shard[str(shard_index)] = 0
         else:
-            regular_count = sum(not _unit_is_solo(unit, solo_sources) for unit in units)
+            regular_count = sum(
+                not _unit_is_node_exclusive(unit, node_exclusive_sources)
+                for unit in units
+            )
             required_by_shard[str(shard_index)] = next(
                 (
                     candidate
                     for candidate in range(1, max(1, regular_count) + 1)
                     if max(
-                        _estimated_worker_loads(units, candidate, solo_sources),
-                        default=0,
+                        max(
+                            _estimated_worker_loads(
+                                units, candidate, node_exclusive_sources
+                            ),
+                            default=0,
+                        ),
+                        serial_floor_ms,
                     )
                     <= deadline_ms
                 ),

@@ -14,6 +14,10 @@ from flashinfer.prefill import single_prefill_with_kv_cache_with_jit_module
 from flashinfer.utils import MaskMode, get_compute_capability, is_sm90a_supported
 
 
+# H100 CI peak GPU memory: 46.9 GiB.
+pytestmark = pytest.mark.gpu_exclusive
+
+
 def test_single_decode_mask():
     torch.manual_seed(42)
     variant_decl = r"""

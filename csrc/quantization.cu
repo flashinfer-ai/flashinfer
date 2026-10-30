@@ -53,4 +53,6 @@ void segment_packbits(TensorView x, TensorView input_indptr, TensorView output_i
       static_cast<int32_t*>(output_indptr.data_ptr()), batch_size,
       bitorder == "big" ? quantization::BitOrder::kBig : quantization::BitOrder::kLittle, stream,
       x.numel());
+  TVM_FFI_ICHECK(status == cudaSuccess)
+      << "SegmentPackBits failed with error code " << cudaGetErrorString(status);
 }

@@ -30,6 +30,7 @@ Entry points:
 """
 
 import math
+from dataclasses import replace
 
 import cutlass
 import cutlass.experimental.cuda as cuda
@@ -51,7 +52,6 @@ from cutlass.experimental.task_scheduling.resources import (
     MemoryResource,
     PipelineConfig,
     TileSchedulerConfig,
-    WorkQueue,
 )
 from cutlass.experimental.task_scheduling.task import Task
 from cutlass.experimental.task_scheduling.task_manager import TaskManager
@@ -64,7 +64,6 @@ from ..._block_sparse.common import (
 )
 from ..._block_sparse.prepared import _BlockSparseRouteLayout
 from ..tensor_map import (
-    create_tensor_map_ragged_from_tensor,
     create_tensor_map_tiled,
     create_tensor_map_tiled_from_view,
 )
@@ -74,7 +73,8 @@ from .fmha_decode_constants import (
     KV_KIND_K,
     KV_KIND_V,
     KV_TILE_256_REGISTER_REALLOCATION_MIN_TILES,
-    TOTAL_SMEM_BUDGET_KIB,
+    MAX_KV_STAGE_SMEM_KIB,
+    SMEM_CAPACITY_KIB,
 )
 from .fmha_decode_resources import (
     SmemBlockSparseKvMetadataResource,
@@ -83,6 +83,7 @@ from .fmha_decode_resources import (
     SmemKvResource,
     SmemPageOffsetsKvResource,
     SmemQResource,
+    SmemTransformedKvResource,
     TmemCorrResource,
     TmemOResource,
     SmemPResource,
@@ -91,16 +92,27 @@ from .fmha_decode_resources import (
     TmemSoftmaxGlobalResource,
     TmemSoftmaxLocalResource,
     TmemSoftmaxOrderResource,
+    TmemTransformedKvResource,
 )
 from .fmha_decode_resources.helpers_common import (
+    split_kv_grid_coord,
+    UniformQueryOffsets,
     _q_group_token_base,
     _q_seq_bounds,
 )
-from .fmha_decode_resources.helpers_kv_tile_idx import _runtime_active_splits_kv
+from .fmha_decode_resources.helpers_kv_tile_idx import (
+    _runtime_active_splits_kv,
+    runtime_split_kv_is_active,
+)
+from .fmha_decode_resources.sage_scales import (
+    SageKScalesResource,
+    SageVScalesResource,
+)
 from .fmha_decode_tasks import (
     PackedDecodeWorkQueue,
     ScheduleTokenThrottleResource,
     SparseMembershipLifetimeResource,
+    _can_hold_native_page_window,
     _prefetch_prepared_sparse_row,
     create_block_sparse_load_tasks_per_inst,
     create_correction_task,
@@ -118,6 +130,7 @@ from .fmha_decode_tasks import (
     create_scheduler_task,
     create_softmax0_task,
     create_softmax1_task,
+    create_transform_kv_task,
 )
 from .reduction import (  # noqa: F401
     decode_gen_separate_reduction_kernel,
@@ -125,6 +138,9 @@ from .reduction import (  # noqa: F401
 )
 
 _PERSISTENT_SCHEDULE_TOKEN_STAGES = 2
+# Double-buffer CLC responses independently of the schedule-token throttle.
+# A single response slot triggers register spills in grouped sparse work loops.
+_WORK_QUEUE_STAGES = 2
 
 
 def _block_sparse_bshd_tma_strides(
@@ -134,6 +150,7 @@ def _block_sparse_bshd_tma_strides(
     h_k: cutlass.Integer | int,
     s_k: cutlass.Integer | int,
     d: cutlass.Integer | int,
+    element_bytes: int,
 ) -> tuple[
     tuple[cutlass.Integer | int, ...],
     tuple[cutlass.Integer | int, ...],
@@ -141,13 +158,13 @@ def _block_sparse_bshd_tma_strides(
     """Build BSHD TensorMap strides in 16-byte units using Int64 math.
 
     The raw TensorMap API omits the implicit contiguous stride and takes the
-    remaining strides in 16-byte units. Block-sparse attention supports only
-    16-bit Q/K/V with headDim=128, so one stride unit contains eight elements.
-    Keep every returned value in Int64: the outer batch stride can exceed the
+    remaining strides in 16-byte units, so one unit holds ``16 /
+    element_bytes`` elements of the 16-bit or 8-bit Q/K/V (headDim=128). Keep
+    every returned value in Int64: the outer batch stride can exceed the
     signed Int32 range even though each public tensor dimension is Int32.
     """
 
-    elements_per_stride_unit = 8
+    elements_per_stride_unit = 16 // element_bytes
     d_units = Int64(d // elements_per_stride_unit)
     h_r = h_q // h_k
     return (
@@ -236,7 +253,7 @@ def _compute_total_kv_tiles(seq_len_kv: int, tile_size_kv: int) -> int:
     return (seq_len_kv + tile_size_kv - 1) // tile_size_kv
 
 
-def _decode_min_blocks_per_mp(cfg: FmhaDecodeConfig, seq_len_kv: int) -> int:
+def _decode_min_blocks_per_mp(cfg: FmhaDecodeConfig, seq_len_kv: int | None) -> int:
     """Return the launch bound needed for dynamic register reallocation.
 
     ``setmaxnreg`` needs a kernel-entry occupancy bound before ptxas can infer
@@ -244,13 +261,14 @@ def _decode_min_blocks_per_mp(cfg: FmhaDecodeConfig, seq_len_kv: int) -> int:
     hand-off cost for a long enough mainloop; the established profiles below
     retain their existing unconditional launch bounds.
     """
-    kv256_reallocation = (
-        cfg.tile_size_kv == 256
-        and _compute_total_kv_tiles(seq_len_kv, cfg.tile_size_kv)
+    kv256_reallocation = cfg.tile_size_kv == 256 and (
+        seq_len_kv is None
+        or _compute_total_kv_tiles(seq_len_kv, cfg.tile_size_kv)
         >= KV_TILE_256_REGISTER_REALLOCATION_MIN_TILES
     )
     return int(
-        kv256_reallocation
+        cfg.use_transform_kv
+        or kv256_reallocation
         or cfg.tile_size_q == 8
         or (cfg.tile_size_q == 16 and cfg.q_dtype_bytes == 1)
         or (cfg.use_keeps_mma_ab and cfg.tile_size_q == 128)
@@ -259,22 +277,27 @@ def _decode_min_blocks_per_mp(cfg: FmhaDecodeConfig, seq_len_kv: int) -> int:
 
 def _compute_static_num_skipped_kv_tiles(cfg: FmhaDecodeConfig, seq_len_kv: int) -> int:
     """Return full leading KV tiles skipped by a static sliding window."""
-    if not cfg.use_sliding_window_causal or cfg.max_seq_len_q > 1:
+    if not cfg.use_sliding_window_causal or cfg.is_multi_token_q:
         return 0
     return max(seq_len_kv - cfg.attention_window_size, 0) // cfg.tile_size_kv
 
 
 def _compute_static_window_start_idx(cfg: FmhaDecodeConfig, seq_len_kv: int) -> int:
     """Return the token index where a static sliding window begins."""
-    if not cfg.use_sliding_window_causal or cfg.max_seq_len_q > 1:
+    if not cfg.use_sliding_window_causal or cfg.is_multi_token_q:
         return 0
     return max(seq_len_kv - cfg.attention_window_size, 0)
 
 
 def _configure_static_sliding_window(
-    cfg: FmhaDecodeConfig, seq_len_kv: int, bias_kv_tma: bool = False
+    cfg: FmhaDecodeConfig, seq_len_kv: int | None, bias_kv_tma: bool = False
 ) -> int:
     """Populate fixed-length sliding metadata and return effective seqLenKv."""
+    if seq_len_kv is None:
+        cfg.use_static_sliding_kv_tma_bias = False
+        cfg.static_num_skipped_kv_tiles = 0
+        cfg.static_window_start_idx = 0
+        return 0
     skipped_tiles = _compute_static_num_skipped_kv_tiles(cfg, seq_len_kv)
     skipped_tokens = skipped_tiles * cfg.tile_size_kv
     window_start_idx = _compute_static_window_start_idx(cfg, seq_len_kv)
@@ -317,14 +340,17 @@ def _build_decode_gen_schedule(
     split_kv_counter_ptr: cute.Pointer | None = None,
     attention_sinks_ptr: cute.Pointer | None = None,
     seqlens_kv: cute.Pointer | None = None,
-    cu_seqlens_q: cute.Pointer | None = None,
+    cu_seqlens_q: cute.Pointer | UniformQueryOffsets | None = None,
     max_seq_len_kv: int | Int32 = 0,
     corr_max_seq_len_kv: int | Int32 | None = None,
     num_heads_kv: Int32 | None = None,
     h_r: Int32 | None = None,
+    max_q_len: int | Int32 = 1,
     tma_desc_q: cutlass.Pointer | None = None,
     tma_desc_k: cutlass.Pointer | None = None,
     tma_desc_v: cutlass.Pointer | None = None,
+    tma_desc_k_sf: cutlass.Pointer | None = None,
+    tma_desc_v_sf: cutlass.Pointer | None = None,
     tma_desc_k_atom: cutlass.Pointer | None = None,
     tma_desc_v_atom: cutlass.Pointer | None = None,
     tma_desc_k_summary: cutlass.Pointer | None = None,
@@ -344,7 +370,6 @@ def _build_decode_gen_schedule(
     active_splits_kv: Int32 | None = None,
     static_full_split_prefix: bool = False,
     tile_sched_params: utils.ClcDynamicPersistentTileSchedulerParams | None = None,
-    clc_response_ptr: cute.Pointer | None = None,
     use_variable_seqlens_kv: bool = False,
     use_native_paged_kv: bool = False,
     use_static_native_seqlens_kv: bool = False,
@@ -353,6 +378,9 @@ def _build_decode_gen_schedule(
     sparse_route_metadata: cute.Pointer | None = None,
     sparse_row_route_begin: Int32 | None = None,
     sparse_route_count: Int32 | None = None,
+    sage_scales_ptr: cute.Pointer | None = None,
+    lse_ptr: cute.Pointer | None = None,
+    requested_splits=None,
 ) -> tuple[
     list[Task],
     dict[MemoryResource, list[MemoryResource]],
@@ -382,10 +410,12 @@ def _build_decode_gen_schedule(
         (task_list, dep_graph, dma labels, smem_allocator, tmem_allocator,
         eager_init_resources)
     """
+    if cfg.use_block_sparse and cfg.num_insts_kv != 2:
+        raise ValueError("block-sparse attention requires num_insts_kv == 2")
     if cfg.use_keeps_mma_ab and cfg.num_insts_kv == 1 and not cfg.uses_tmem_p:
         raise ValueError(
             "one-instance KeepsMmaAb is enabled only for the staged headDim=256 "
-            "profile with head_dim_per_stage_kv=128 and o_stages=1"
+            "profile with D128 bands (or D256 for sparse FP8) and o_stages=1"
         )
     if use_native_paged_kv and not cfg.use_paged_kv:
         raise ValueError("native paged-KV ABI requires cfg.use_paged_kv=True")
@@ -471,6 +501,10 @@ def _build_decode_gen_schedule(
         Agent.Thread, cfg.page_offsets_num_warps * WARP_SIZE
     )
     load_grp = pipeline.CooperativeGroup(Agent.Thread, cfg.load_num_warps * WARP_SIZE)
+    if cfg.use_transform_kv:
+        transform_kv_grp = pipeline.CooperativeGroup(
+            Agent.Thread, cfg.transform_kv_num_warps * WARP_SIZE
+        )
     umma_hw = pipeline.CooperativeGroup(Agent.Thread)
     # The staged one-instance S/P overlay uses this group for overwrite credit.
     mma_grp = pipeline.CooperativeGroup(Agent.Thread, cfg.mma_num_warps * WARP_SIZE)
@@ -494,9 +528,6 @@ def _build_decode_gen_schedule(
     q_bytes_per_load_warp = (
         cfg.smem_q_tile_bytes // cfg.load_num_warps if cfg.load_num_warps > 1 else None
     )
-    kv_bytes_per_load_warp = (
-        cfg.smem_kv_tile_bytes // cfg.load_num_warps if cfg.load_num_warps > 1 else None
-    )
 
     # ------------------------------------------------------------------
     # Pipeline configs
@@ -504,11 +535,28 @@ def _build_decode_gen_schedule(
     # Leave barrier_ptr unset so SmemAllocator packs every pipeline barrier
     # into the unified block. Separate barrier arrays create an alignment gap
     # before the 1024-byte-aligned data block and overflow near-capacity Q128.
-    use_paged_kv = cfg.use_paged_kv
-    use_dense_page_offsets = use_paged_kv and not cfg.use_block_sparse
+    use_one_inst_kv = cfg.num_insts_kv == 1
+    uses_page_offsets_task = cfg.uses_page_offsets_task
     use_one_inst_qkv = cfg.use_keeps_mma_ab and cfg.num_insts_kv == 1
+    # K and V of different byte widths take the split-resource paths with one
+    # K ring and one V ring, each shared by both K/V instances; equal widths
+    # (including Int8 K with E4M3 V) share one ring.
+    use_shared_inst_kv_rings = (
+        cfg.k_dtype_bytes != cfg.v_dtype_bytes and cfg.tile_size_kv != 256
+    )
     one_inst_tmem_stages = 2 if use_one_inst_qkv else 1
-    one_inst_kv_stages = cfg.num_head_dim_stages_kv if use_one_inst_qkv else 1
+    # Keep complete head-dimension rounds in each balanced K/V ring. FP8's
+    # smaller stage tiles can prefetch farther without increasing the budget.
+    one_inst_kv_stages = (
+        max(
+            cfg.num_head_dim_stages_kv,
+            cfg.kv_stages
+            // (2 * cfg.num_head_dim_stages_kv)
+            * cfg.num_head_dim_stages_kv,
+        )
+        if use_one_inst_qkv
+        else 1
+    )
     use_distributed_split_kv_stages = not use_one_inst_qkv
     if cfg.tile_size_q == 128 and use_distributed_split_kv_stages:
         # Q128's four instruction-local K0/K1/V0/V1 rings need equal depth.
@@ -552,24 +600,34 @@ def _build_decode_gen_schedule(
         if use_one_inst_qkv
         else max((split_total_v_stages + cfg.num_insts_kv - 2) // cfg.num_insts_kv, 1)
     )
+    if use_shared_inst_kv_rings and not use_one_inst_qkv:
+        # One K and one V stage per unit of depth.
+        shared_inst_kv_stages = max(
+            (MAX_KV_STAGE_SMEM_KIB * BYTES_PER_KIB)
+            // (cfg.smem_k_tile_bytes + cfg.smem_v_tile_bytes),
+            1,
+        )
+        split_k0_stages = shared_inst_kv_stages
+        split_v0_stages = shared_inst_kv_stages
     use_ordered_softmax_barrier = (
-        not use_one_inst_qkv and cfg.uses_ordered_softmax_barrier
+        not use_one_inst_kv and cfg.uses_ordered_softmax_barrier
     )
     # A two-inst Keeps profile can use the deeper shared K/V FIFO when stats
     # are standalone and P remains in SMEM.  Keep instruction-local FIFOs when
     # stats or TMEM-P alias S: their overwrite-credit cadence is tied to each
     # instruction. Dense Swaps uses the shared FIFO, including staged H256.
     # Sparse KV128 keeps instruction-local rings in either MMA orientation;
-    # sparse KV256 reuses its only feasible three-stage shared data ring while
-    # retaining instruction-local route metadata. The load warp issues V(route
-    # R) before replacing that metadata with route R+1, so its lifetime remains
-    # independent of the K/V data-ring depth.
+    # sparse KV256 reuses the shared data ring at its element-width-derived
+    # depth while retaining instruction-local route metadata. The load warp
+    # issues V(route R) before replacing that metadata with route R+1, so its
+    # lifetime remains independent of the K/V data-ring depth.
     # With cfg.keeps_stats_via_smem the stats-alias justification no longer
     # applies, but the shared FIFO still causes a material Q128 regression, so
     # the instruction-local FIFO gate remains part of that kernel policy.
     use_per_inst_kv_resources = (
         use_one_inst_qkv
         or (cfg.use_block_sparse and cfg.tile_size_kv != 256)
+        or use_shared_inst_kv_rings
         or (
             cfg.use_keeps_mma_ab
             and cfg.tile_size_kv != 256
@@ -590,9 +648,10 @@ def _build_decode_gen_schedule(
     # A held route is published once and retained through the final V issue;
     # only schedules that replace locators per tile need separate K/V state.
     use_separate_kv_page_offset_resources = (
-        use_dense_page_offsets
+        uses_page_offsets_task
         and use_per_inst_kv_resources
         and not use_one_inst_qkv
+        and not cfg.runtime_page_window
         and not (
             use_native_paged_kv
             and cfg.uses_q_token_kv_block_sparse_page_route
@@ -616,56 +675,53 @@ def _build_decode_gen_schedule(
         num_bytes_per_warp_per_cta=q_bytes_per_load_warp,
         advance_on_wait=True,
     )
-    smem_kv_cfg = PipelineConfig.create_tma_umma_pipeline_cfg(
-        num_stages=cfg.kv_stages,
-        num_bytes=cfg.smem_kv_tile_bytes,
-        producer_group=tma_producer,
-        consumer_group=umma_hw,
-        cta_layout_vmnk=cta_layout,
-        producer_signaling_threads=tma_producer_signaling,
-        num_bytes_per_warp_per_cta=kv_bytes_per_load_warp,
-        advance_on_wait=True,
-    )
-    smem_k0_cfg = PipelineConfig.create_tma_umma_pipeline_cfg(
-        num_stages=split_k0_stages,
-        num_bytes=cfg.smem_kv_tile_bytes,
-        producer_group=tma_producer,
-        consumer_group=umma_hw,
-        cta_layout_vmnk=cta_layout,
-        producer_signaling_threads=tma_producer_signaling,
-        num_bytes_per_warp_per_cta=kv_bytes_per_load_warp,
-        advance_on_wait=True,
-    )
-    smem_k1_cfg = PipelineConfig.create_tma_umma_pipeline_cfg(
-        num_stages=split_k1_stages,
-        num_bytes=cfg.smem_kv_tile_bytes,
-        producer_group=tma_producer,
-        consumer_group=umma_hw,
-        cta_layout_vmnk=cta_layout,
-        producer_signaling_threads=tma_producer_signaling,
-        num_bytes_per_warp_per_cta=kv_bytes_per_load_warp,
-        advance_on_wait=True,
-    )
-    smem_v0_cfg = PipelineConfig.create_tma_umma_pipeline_cfg(
-        num_stages=split_v0_stages,
-        num_bytes=cfg.smem_kv_tile_bytes,
-        producer_group=tma_producer,
-        consumer_group=umma_hw,
-        cta_layout_vmnk=cta_layout,
-        producer_signaling_threads=tma_producer_signaling,
-        num_bytes_per_warp_per_cta=kv_bytes_per_load_warp,
-        advance_on_wait=True,
-    )
-    smem_v1_cfg = PipelineConfig.create_tma_umma_pipeline_cfg(
-        num_stages=split_v1_stages,
-        num_bytes=cfg.smem_kv_tile_bytes,
-        producer_group=tma_producer,
-        consumer_group=umma_hw,
-        cta_layout_vmnk=cta_layout,
-        producer_signaling_threads=tma_producer_signaling,
-        num_bytes_per_warp_per_cta=kv_bytes_per_load_warp,
-        advance_on_wait=True,
-    )
+
+    def _make_raw_kv_cfg(num_stages: int, tile_bytes: int) -> PipelineConfig:
+        """Create a per-operand raw pipeline with its actual TMA byte count."""
+        num_bytes = tile_bytes + cfg.smem_kv_sf_tile_bytes
+        bytes_per_load_warp = (
+            num_bytes // cfg.load_num_warps if cfg.load_num_warps > 1 else None
+        )
+        if cfg.use_transform_kv:
+            # NVFP4 payload and scale factors complete the same raw barrier.
+            return PipelineConfig(
+                num_stages=num_stages,
+                num_bytes=num_bytes,
+                producer_group=tma_producer,
+                consumer_group=transform_kv_grp,
+                pipeline_type=PipelineType.TmaAsync,
+                cta_layout_vmnk=cta_layout,
+                producer_signaling_threads=tma_producer_signaling,
+                num_bytes_per_warp_per_cta=bytes_per_load_warp,
+                advance_on_wait=True,
+            )
+        return PipelineConfig.create_tma_umma_pipeline_cfg(
+            num_stages=num_stages,
+            num_bytes=num_bytes,
+            producer_group=tma_producer,
+            consumer_group=umma_hw,
+            cta_layout_vmnk=cta_layout,
+            producer_signaling_threads=tma_producer_signaling,
+            num_bytes_per_warp_per_cta=bytes_per_load_warp,
+            advance_on_wait=True,
+        )
+
+    smem_kv_cfg = None
+    if not use_per_inst_kv_resources:
+        smem_kv_cfg = _make_raw_kv_cfg(cfg.kv_stages, cfg.smem_kv_tile_bytes)
+    smem_transformed_kv_cfg = None
+    if cfg.use_transform_kv:
+        smem_transformed_kv_cfg = PipelineConfig.create_async_umma_pipeline_cfg(
+            num_stages=cfg.transformed_kv_stages,
+            producer_group=transform_kv_grp,
+            consumer_group=umma_hw,
+            cta_layout_vmnk=cta_layout,
+            advance_on_wait=True,
+        )
+    smem_k0_cfg = _make_raw_kv_cfg(split_k0_stages, cfg.smem_k_tile_bytes)
+    smem_k1_cfg = _make_raw_kv_cfg(split_k1_stages, cfg.smem_k_tile_bytes)
+    smem_v0_cfg = _make_raw_kv_cfg(split_v0_stages, cfg.smem_v_tile_bytes)
+    smem_v1_cfg = _make_raw_kv_cfg(split_v1_stages, cfg.smem_v_tile_bytes)
 
     def _make_page_offsets_cfg(num_stages: int | None = None) -> PipelineConfig:
         """Create the async page-offsets pipeline for the selected stage count."""
@@ -683,7 +739,7 @@ def _build_decode_gen_schedule(
 
     smem_page_offsets_cfg = None
     smem_page_offsets_v_cfg = None
-    if use_dense_page_offsets:
+    if uses_page_offsets_task:
         page_offsets_stages = (
             3 if use_separate_kv_page_offset_resources else cfg.page_offsets_stages
         )
@@ -697,11 +753,27 @@ def _build_decode_gen_schedule(
             smem_page_offsets_v_cfg = _make_page_offsets_cfg(page_offsets_stages)
     sparse_softmax_metadata0_cfg = None
     sparse_softmax_metadata1_cfg = None
+    # Load publishes a block-sparse route, and a Sage plan's K scales into the
+    # instance's ``sfK`` ring, right after the K tile. Softmax releases the
+    # route when it starts that tile and the scales after the tile's last pass
+    # that reads them. When the K/V ring frees a slot for an instance's next K
+    # tile, the oldest buffered K tile's QK has run, after the previous tile's
+    # P left the TMEM columns it aliases or, with SMEM P, after the previous
+    # tile's max pass released S. A route or ``sfK`` stage is read no later
+    # than that pass (an SMEM-P Sage row is dequantized there), so the
+    # instance's Softmax has released every stage older than the K tiles the
+    # ring buffers per instance; one stage more than those K tiles never
+    # stalls the load warp on either pipeline.
+    if use_per_inst_kv_resources:
+        inst_k_tiles = max(split_k0_stages, split_k1_stages)
+    else:
+        # One ring cycles K and V tiles of every instance.
+        inst_k_tiles = math.ceil(cfg.kv_stages / (2 * cfg.num_insts_kv))
+    k_tile_stages = inst_k_tiles + 1
     if cfg.use_block_sparse:
-        # Two stages are sufficient for the split-ring cadence: one route can
-        # await Softmax while Load publishes the next route for the same inst.
+        route_metadata_stages = k_tile_stages
         sparse_softmax_metadata0_cfg = PipelineConfig(
-            num_stages=2,
+            num_stages=route_metadata_stages,
             num_bytes=0,
             producer_group=load_grp,
             consumer_group=softmax0_grp,
@@ -710,7 +782,7 @@ def _build_decode_gen_schedule(
             advance_on_wait=True,
         )
         sparse_softmax_metadata1_cfg = PipelineConfig(
-            num_stages=2,
+            num_stages=route_metadata_stages,
             num_bytes=0,
             producer_group=load_grp,
             consumer_group=softmax1_grp,
@@ -789,15 +861,14 @@ def _build_decode_gen_schedule(
         advance_on_wait=True,
     )
 
-    # Two-instance Keeps keeps stats outside S and orders each same-instance PV
-    # before the next QK, so it needs no stats-done credit.
-    # The staged one-instance path needs an overwrite-credit gate across its
-    # double-buffered S/P overlay: correction returns the stage credit before
-    # MMA can reissue QK into those columns.
+    # The single MMA issuer orders PV before QK reuses the same S/P slot.
+    # PTX's same-warp mma(A-read) -> mma(D-write) pipeline protects that alias.
+    # Separate SMEM stats have their own softmax-local handoff, just as in
+    # two-instance Keeps; correction need not additionally gate S reuse.
     stats_done0_cfg = None
     stats_done1_cfg = None
     resource_dependency_graph: dict[MemoryResource, list[MemoryResource]]
-    if use_one_inst_qkv:
+    if use_one_inst_qkv and (not cfg.keeps_stats_via_smem or cfg.mma_num_warps != 1):
         stats_done0_cfg = PipelineConfig.create_async_async_pipeline_cfg(
             num_stages=one_inst_tmem_stages,
             producer_group=mma_grp,
@@ -834,7 +905,7 @@ def _build_decode_gen_schedule(
     if use_clc_dynamic:
         num_consumer_threads = cfg.threads_per_cta
         wq_pipeline_config = PipelineConfig.create_clc_fetch_async_pipeline_cfg(
-            num_stages=_PERSISTENT_SCHEDULE_TOKEN_STAGES,
+            num_stages=_WORK_QUEUE_STAGES,
             num_bytes=16,
             producer_group=pipeline.CooperativeGroup(Agent.Thread),
             consumer_group=pipeline.CooperativeGroup(
@@ -842,24 +913,20 @@ def _build_decode_gen_schedule(
             ),
             cta_layout_vmnk=cta_layout,
         )
+        # The scheduler config needs the CLC response slots' address; it is
+        # bound once the unified SMEM layout below is computed.
         work_queue_kwargs = {
-            "tile_scheduler_config": (
-                TileSchedulerConfig.create_clc_dynamic_persistent_tile_scheduler_params(
-                    tile_scheduler_params=tile_sched_params,
-                    response_ptr=clc_response_ptr,
-                )
-            ),
+            "tile_scheduler_config": None,
             "pipeline_config": wq_pipeline_config,
             "name": "work_queue",
         }
-        if cfg.use_variable_seqlens_q:
-            work_queue = PackedDecodeWorkQueue(
-                cfg=cfg,
-                cu_seqlens_q=cu_seqlens_q,
-                **work_queue_kwargs,
-            )
-        else:
-            work_queue = WorkQueue(**work_queue_kwargs)
+        work_queue = PackedDecodeWorkQueue(
+            cfg=cfg,
+            cu_seqlens_q=cu_seqlens_q,
+            seqlens_kv=seqlens_kv,
+            num_heads_kv=num_heads_kv,
+            **work_queue_kwargs,
+        )
 
         schedule_token_throttle = ScheduleTokenThrottleResource(
             pipeline_config=PipelineConfig.create_async_async_pipeline_cfg(
@@ -886,7 +953,7 @@ def _build_decode_gen_schedule(
                     WARP_SIZE
                     * (
                         cfg.softmax0_num_warps
-                        + (0 if use_one_inst_qkv else cfg.softmax1_num_warps)
+                        + (0 if use_one_inst_kv else cfg.softmax1_num_warps)
                     ),
                 ),
                 pipeline_type=PipelineType.AsyncAsync,
@@ -914,11 +981,14 @@ def _build_decode_gen_schedule(
     kv_seqlens = seqlens_kv if use_runtime_seqlens_kv else None
     smem_page_offsets = None
     smem_page_offsets_v = None
-    if use_dense_page_offsets:
+    if uses_page_offsets_task:
         smem_page_offsets = SmemPageOffsetsKvResource(
             pipeline_config=smem_page_offsets_cfg,
             cfg=cfg,
             stage_page_ids_per_tile=stage_page_ids_per_tile,
+            # The full membership row has no static allocation extent when
+            # KV lengths are runtime. Read its immutable GMEM words on demand.
+            cache_memberships_in_smem=cfg.fixed_seqlen,
             page_idx_kv=page_idx_kv,
             page_table_stride=page_table_stride,
             num_heads_kv=num_heads_kv,
@@ -1018,6 +1088,8 @@ def _build_decode_gen_schedule(
             cfg=cfg,
             tma_desc_k=tma_desc_k,
             tma_desc_v=tma_desc_v,
+            tma_desc_k_sf=tma_desc_k_sf,
+            tma_desc_v_sf=tma_desc_v_sf,
             tma_desc_k_atom=tma_desc_k_atom,
             tma_desc_v_atom=tma_desc_v_atom,
             tma_desc_k_summary=tma_desc_k_summary,
@@ -1036,34 +1108,39 @@ def _build_decode_gen_schedule(
             kv_kind=KV_KIND_K,
             name="smemK0",
         )
-        smem_k1 = SmemKvTileResource(
-            pipeline_config=smem_k1_cfg,
-            cfg=cfg,
-            tma_desc_k=tma_desc_k,
-            tma_desc_v=tma_desc_v,
-            tma_desc_k_atom=tma_desc_k_atom,
-            tma_desc_v_atom=tma_desc_v_atom,
-            tma_desc_k_summary=tma_desc_k_summary,
-            tma_desc_v_summary=tma_desc_v_summary,
-            tma_desc_k_summary_atom=tma_desc_k_summary_atom,
-            tma_desc_v_summary_atom=tma_desc_v_summary_atom,
-            sparse_kv_metadata=sparse_kv_metadata1,
-            page_offsets_kv=smem_page_offsets,
-            seqlens_kv=kv_seqlens,
-            max_seq_len_kv=max_seq_len_kv,
-            h_k_idx=h_k_idx,
-            b_idx=b_idx,
-            q_group_idx=q_group_idx,
-            seq_len_q=seq_len_q,
-            inst_id=1,
-            kv_kind=KV_KIND_K,
-            name="smemK1",
-        )
+        if not use_shared_inst_kv_rings:
+            smem_k1 = SmemKvTileResource(
+                pipeline_config=smem_k1_cfg,
+                cfg=cfg,
+                tma_desc_k=tma_desc_k,
+                tma_desc_v=tma_desc_v,
+                tma_desc_k_sf=tma_desc_k_sf,
+                tma_desc_v_sf=tma_desc_v_sf,
+                tma_desc_k_atom=tma_desc_k_atom,
+                tma_desc_v_atom=tma_desc_v_atom,
+                tma_desc_k_summary=tma_desc_k_summary,
+                tma_desc_v_summary=tma_desc_v_summary,
+                tma_desc_k_summary_atom=tma_desc_k_summary_atom,
+                tma_desc_v_summary_atom=tma_desc_v_summary_atom,
+                sparse_kv_metadata=sparse_kv_metadata1,
+                page_offsets_kv=smem_page_offsets,
+                seqlens_kv=kv_seqlens,
+                max_seq_len_kv=max_seq_len_kv,
+                h_k_idx=h_k_idx,
+                b_idx=b_idx,
+                q_group_idx=q_group_idx,
+                seq_len_q=seq_len_q,
+                inst_id=1,
+                kv_kind=KV_KIND_K,
+                name="smemK1",
+            )
         smem_v0 = SmemKvTileResource(
             pipeline_config=smem_v0_cfg,
             cfg=cfg,
             tma_desc_k=tma_desc_k,
             tma_desc_v=tma_desc_v,
+            tma_desc_k_sf=tma_desc_k_sf,
+            tma_desc_v_sf=tma_desc_v_sf,
             tma_desc_k_atom=tma_desc_k_atom,
             tma_desc_v_atom=tma_desc_v_atom,
             tma_desc_k_summary=tma_desc_k_summary,
@@ -1082,35 +1159,40 @@ def _build_decode_gen_schedule(
             kv_kind=KV_KIND_V,
             name="smemV0",
         )
-        smem_v1 = SmemKvTileResource(
-            pipeline_config=smem_v1_cfg,
-            cfg=cfg,
-            tma_desc_k=tma_desc_k,
-            tma_desc_v=tma_desc_v,
-            tma_desc_k_atom=tma_desc_k_atom,
-            tma_desc_v_atom=tma_desc_v_atom,
-            tma_desc_k_summary=tma_desc_k_summary,
-            tma_desc_v_summary=tma_desc_v_summary,
-            tma_desc_k_summary_atom=tma_desc_k_summary_atom,
-            tma_desc_v_summary_atom=tma_desc_v_summary_atom,
-            sparse_kv_metadata=sparse_kv_metadata1,
-            page_offsets_kv=smem_page_offsets_v or smem_page_offsets,
-            seqlens_kv=kv_seqlens,
-            max_seq_len_kv=max_seq_len_kv,
-            h_k_idx=h_k_idx,
-            b_idx=b_idx,
-            q_group_idx=q_group_idx,
-            seq_len_q=seq_len_q,
-            inst_id=1,
-            kv_kind=KV_KIND_V,
-            name="smemV1",
-        )
+        if not use_shared_inst_kv_rings:
+            smem_v1 = SmemKvTileResource(
+                pipeline_config=smem_v1_cfg,
+                cfg=cfg,
+                tma_desc_k=tma_desc_k,
+                tma_desc_v=tma_desc_v,
+                tma_desc_k_sf=tma_desc_k_sf,
+                tma_desc_v_sf=tma_desc_v_sf,
+                tma_desc_k_atom=tma_desc_k_atom,
+                tma_desc_v_atom=tma_desc_v_atom,
+                tma_desc_k_summary=tma_desc_k_summary,
+                tma_desc_v_summary=tma_desc_v_summary,
+                tma_desc_k_summary_atom=tma_desc_k_summary_atom,
+                tma_desc_v_summary_atom=tma_desc_v_summary_atom,
+                sparse_kv_metadata=sparse_kv_metadata1,
+                page_offsets_kv=smem_page_offsets_v or smem_page_offsets,
+                seqlens_kv=kv_seqlens,
+                max_seq_len_kv=max_seq_len_kv,
+                h_k_idx=h_k_idx,
+                b_idx=b_idx,
+                q_group_idx=q_group_idx,
+                seq_len_q=seq_len_q,
+                inst_id=1,
+                kv_kind=KV_KIND_V,
+                name="smemV1",
+            )
     else:
         smem_kv = SmemKvResource(
             pipeline_config=smem_kv_cfg,
             cfg=cfg,
             tma_desc_k=tma_desc_k,
             tma_desc_v=tma_desc_v,
+            tma_desc_k_sf=tma_desc_k_sf,
+            tma_desc_v_sf=tma_desc_v_sf,
             tma_desc_k_atom=tma_desc_k_atom,
             tma_desc_v_atom=tma_desc_v_atom,
             tma_desc_k_summary=tma_desc_k_summary,
@@ -1128,6 +1210,88 @@ def _build_decode_gen_schedule(
             seq_len_q=seq_len_q,
             name="smemKv",
         )
+    transformed_kv = None
+    mma_smem_kv = smem_kv
+    if cfg.use_transform_kv:
+        if cfg.store_transformed_kv_in_tmem:
+            assert smem_kv is not None
+            transformed_kv = TmemTransformedKvResource(
+                pipeline_config=smem_transformed_kv_cfg,
+                cfg=cfg,
+                src_smem_kv=smem_kv,
+                name="tmemTransformedKv",
+            )
+        else:
+            transformed_kv = SmemTransformedKvResource(
+                pipeline_config=smem_transformed_kv_cfg,
+                cfg=cfg,
+                src_smem_kv=smem_kv,
+                src_smem_k0=smem_k0,
+                src_smem_k1=smem_k1,
+                src_smem_v0=smem_v0,
+                src_smem_v1=smem_v1,
+                page_idx_kv=page_idx_kv,
+                num_heads_kv=num_heads_kv,
+                name="smemTransformedKv",
+            )
+        mma_smem_kv = transformed_kv
+
+    # The correction task stages and reads the work tile's V scales itself.
+    sage_v_scales = None
+    if cfg.use_sage_attention:
+        sage_v_scales = SageVScalesResource(
+            pipeline_config=PipelineConfig(
+                num_stages=1,
+                num_bytes=0,
+                producer_group=correction_grp,
+                consumer_group=correction_grp,
+                pipeline_type=PipelineType.AsyncAsync,
+                cta_layout_vmnk=cta_layout,
+                advance_on_wait=True,
+            ),
+            cfg=cfg,
+            sage_scales_ptr=sage_scales_ptr,
+            h_k_idx=h_k_idx,
+            b_idx=b_idx,
+            num_heads_kv=num_heads_kv,
+            name="sageVScales",
+        )
+    # Each softmax instance reads its own ``sfK`` words from a ring that the
+    # load warp fills after each K tile, through ``cp.async`` copies that the
+    # ``AsyncLoad`` commit ties to the stage: the tile's atoms of the prepared
+    # scales, a block-sparse route's or a dense tile's.
+    sage_k_scales0 = None
+    sage_k_scales1 = None
+    if cfg.use_sage_attention:
+        # Connect one K-scale SMEM ring from the load warp to its softmax instance.
+        def _sage_k_scales(inst_id: int, softmax_grp) -> SageKScalesResource:
+            return SageKScalesResource(
+                pipeline_config=PipelineConfig(
+                    num_stages=k_tile_stages,
+                    num_bytes=0,
+                    producer_group=load_grp,
+                    consumer_group=softmax_grp,
+                    pipeline_type=PipelineType.AsyncAsync,
+                    cta_layout_vmnk=cta_layout,
+                    advance_on_wait=True,
+                    async_producer_op=pipeline.PipelineOp.AsyncLoad,
+                ),
+                inst_id=inst_id,
+                route_layout=prepared_route_layout if cfg.use_block_sparse else None,
+                name=f"sageKScales{inst_id}",
+                cfg=cfg,
+                seqlens_kv=kv_seqlens,
+                max_seq_len_kv=max_seq_len_kv,
+                q_group_idx=q_group_idx,
+                seq_len_q=seq_len_q,
+                h_k_idx=h_k_idx,
+                b_idx=b_idx,
+                num_heads_kv=num_heads_kv,
+                sage_scales_ptr=sage_scales_ptr,
+            )
+
+        sage_k_scales0 = _sage_k_scales(0, softmax0_grp)
+        sage_k_scales1 = _sage_k_scales(1, softmax1_grp)
 
     tmem_s0 = TmemSResource(
         inst_id=0,
@@ -1139,32 +1303,45 @@ def _build_decode_gen_schedule(
         h_r=h_r,
         q_group_idx=q_group_idx,
         seq_len_q=seq_len_q,
+        h_k_idx=h_k_idx,
+        b_idx=b_idx,
+        num_heads_kv=num_heads_kv,
         sync_barrier_id=0,
         name="tmemS0",
+        sage_scales_ptr=sage_scales_ptr,
     )
-    tmem_s1 = TmemSResource(
-        inst_id=1,
-        pipeline_config=tmem_s1_cfg,
-        cfg=cfg,
-        scale_softmax_log2=scale_softmax_log2,
-        seqlens_kv=kv_seqlens,
-        max_seq_len_kv=max_seq_len_kv,
-        h_r=h_r,
-        q_group_idx=q_group_idx,
-        seq_len_q=seq_len_q,
-        sync_barrier_id=1,
-        name="tmemS1",
-    )
+    tmem_s1 = None
+    if not use_one_inst_kv:
+        tmem_s1 = TmemSResource(
+            inst_id=1,
+            pipeline_config=tmem_s1_cfg,
+            cfg=cfg,
+            scale_softmax_log2=scale_softmax_log2,
+            seqlens_kv=kv_seqlens,
+            max_seq_len_kv=max_seq_len_kv,
+            h_r=h_r,
+            q_group_idx=q_group_idx,
+            seq_len_q=seq_len_q,
+            h_k_idx=h_k_idx,
+            b_idx=b_idx,
+            num_heads_kv=num_heads_kv,
+            sync_barrier_id=1,
+            score_seed_owner=tmem_s0,
+            name="tmemS1",
+            sage_scales_ptr=sage_scales_ptr,
+        )
     # Packed persistent QK derives the descriptor from Q's just-waited
     # consumer stage, avoiding a routed HEAD-to-LOOP descriptor value across
     # the guarded work-tile region. Fixed/static schedules keep their existing
     # explicit descriptor route.
     tmem_s0.q_ref = smem_q
-    tmem_s1.q_ref = smem_q
+    if tmem_s1 is not None:
+        tmem_s1.q_ref = smem_q
     if cfg.uses_q_token_kv_block_sparse_page_membership:
         assert smem_page_offsets is not None
         tmem_s0.page_offsets_ref = smem_page_offsets
-        tmem_s1.page_offsets_ref = smem_page_offsets
+        if tmem_s1 is not None:
+            tmem_s1.page_offsets_ref = smem_page_offsets
 
     smem_p0 = SmemPResource(
         inst_id=0,
@@ -1174,14 +1351,16 @@ def _build_decode_gen_schedule(
         use_variable_seqlens_kv=use_runtime_seqlens_kv,
         name="smemP0",
     )
-    smem_p1 = SmemPResource(
-        inst_id=1,
-        pipeline_config=smem_p1_cfg,
-        cfg=cfg,
-        scale_softmax_log2=scale_softmax_log2,
-        use_variable_seqlens_kv=use_runtime_seqlens_kv,
-        name="smemP1",
-    )
+    smem_p1 = None
+    if not use_one_inst_kv:
+        smem_p1 = SmemPResource(
+            inst_id=1,
+            pipeline_config=smem_p1_cfg,
+            cfg=cfg,
+            scale_softmax_log2=scale_softmax_log2,
+            use_variable_seqlens_kv=use_runtime_seqlens_kv,
+            name="smemP1",
+        )
 
     tmem_o = TmemOResource(
         pipeline_config=tmem_o_cfg,
@@ -1196,12 +1375,14 @@ def _build_decode_gen_schedule(
         cfg=cfg,
         name="tmemSoftmaxLocal0",
     )
-    tmem_softmax_local1 = TmemSoftmaxLocalResource(
-        inst_id=1,
-        pipeline_config=softmax_local1_cfg,
-        cfg=cfg,
-        name="tmemSoftmaxLocal1",
-    )
+    tmem_softmax_local1 = None
+    if not use_one_inst_kv:
+        tmem_softmax_local1 = TmemSoftmaxLocalResource(
+            inst_id=1,
+            pipeline_config=softmax_local1_cfg,
+            cfg=cfg,
+            name="tmemSoftmaxLocal1",
+        )
     tmem_stats_done0 = (
         TmemStatsDoneResource(
             pipeline_config=stats_done0_cfg,
@@ -1225,26 +1406,29 @@ def _build_decode_gen_schedule(
         sum_barrier_id=2,
         name="tmemSoftmaxGlobal0",
     )
-    tmem_softmax_global1 = TmemSoftmaxGlobalResource(
-        inst_id=1,
-        cfg=cfg,
-        scale_softmax_log2=scale_softmax_log2,
-        sum_barrier_id=3,
-        name="tmemSoftmaxGlobal1",
-    )
+    tmem_softmax_global1 = None
+    if not use_one_inst_kv:
+        tmem_softmax_global1 = TmemSoftmaxGlobalResource(
+            inst_id=1,
+            cfg=cfg,
+            scale_softmax_log2=scale_softmax_log2,
+            sum_barrier_id=3,
+            name="tmemSoftmaxGlobal1",
+        )
     tmem_softmax_order = (
         TmemSoftmaxOrderResource(cfg=cfg, name="tmemSoftmaxOrder")
         if use_ordered_softmax_barrier
         else None
     )
     smem_p0.tmem_s_ref = tmem_s0
-    smem_p1.tmem_s_ref = tmem_s1
     smem_p0.tmem_o_ref = tmem_o
-    smem_p1.tmem_o_ref = tmem_o
     tmem_softmax_global0.p_ref = smem_p0
-    tmem_softmax_global1.p_ref = smem_p1
     tmem_softmax_global0.tmem_s_ref = tmem_s0
-    tmem_softmax_global1.tmem_s_ref = tmem_s1
+    if not use_one_inst_kv:
+        smem_p1.tmem_s_ref = tmem_s1
+        smem_p1.tmem_o_ref = tmem_o
+        tmem_softmax_global1.p_ref = smem_p1
+        tmem_softmax_global1.tmem_s_ref = tmem_s1
 
     tmem_corr0 = TmemCorrResource(
         inst_id=0,
@@ -1256,8 +1440,10 @@ def _build_decode_gen_schedule(
         partial_stats_ptr=partial_stats_ptr,
         split_kv_counter_ptr=split_kv_counter_ptr,
         attention_sinks_ptr=attention_sinks_ptr,
+        lse_ptr=lse_ptr,
         seqlens_kv=kv_seqlens,
         max_seq_len_kv=corr_max_seq_len_kv,
+        max_q_len=max_q_len,
         num_heads_kv=num_heads_kv,
         h_r=h_r,
         h_k_idx=h_k_idx,
@@ -1268,40 +1454,43 @@ def _build_decode_gen_schedule(
         active_splits_kv=active_splits_kv,
         static_full_split_prefix=static_full_split_prefix,
         name="tmemCorr0",
+        sage_v_scales_ref=sage_v_scales,
     )
-    tmem_corr1 = TmemCorrResource(
-        inst_id=1,
-        cfg=cfg,
-        scale_softmax_log2=scale_softmax_log2,
-        output_scale=output_scale,
-        o_ptr=o_ptr,
-        partial_o_ptr=partial_o_ptr,
-        partial_stats_ptr=partial_stats_ptr,
-        split_kv_counter_ptr=split_kv_counter_ptr,
-        attention_sinks_ptr=attention_sinks_ptr,
-        seqlens_kv=kv_seqlens,
-        max_seq_len_kv=corr_max_seq_len_kv,
-        num_heads_kv=num_heads_kv,
-        h_r=h_r,
-        h_k_idx=h_k_idx,
-        b_idx=b_idx,
-        q_group_idx=q_group_idx,
-        q_token_offset=q_token_offset,
-        seq_len_q=seq_len_q,
-        active_splits_kv=active_splits_kv,
-        static_full_split_prefix=static_full_split_prefix,
-        name="tmemCorr1",
-    )
-    tmem_corr1.smem_p0_ref = smem_p0
-    tmem_corr1.smem_p1_ref = smem_p1
     tmem_corr0.tmem_o_ref = tmem_o
-    tmem_corr1.tmem_o_ref = tmem_o
     tmem_corr0.softmax_local0_ref = tmem_softmax_local0
-    tmem_corr1.softmax_local0_ref = tmem_softmax_local0
-    if use_one_inst_qkv:
-        tmem_corr0.softmax_local1_ref = None
-        tmem_corr1.softmax_local1_ref = None
-    else:
+    tmem_corr0.softmax_local1_ref = None if use_one_inst_kv else tmem_softmax_local1
+    tmem_corr1 = None
+    if not use_one_inst_kv:
+        tmem_corr1 = TmemCorrResource(
+            inst_id=1,
+            cfg=cfg,
+            scale_softmax_log2=scale_softmax_log2,
+            output_scale=output_scale,
+            o_ptr=o_ptr,
+            partial_o_ptr=partial_o_ptr,
+            partial_stats_ptr=partial_stats_ptr,
+            split_kv_counter_ptr=split_kv_counter_ptr,
+            attention_sinks_ptr=attention_sinks_ptr,
+            lse_ptr=lse_ptr,
+            seqlens_kv=kv_seqlens,
+            max_seq_len_kv=corr_max_seq_len_kv,
+            max_q_len=max_q_len,
+            num_heads_kv=num_heads_kv,
+            h_r=h_r,
+            h_k_idx=h_k_idx,
+            b_idx=b_idx,
+            q_group_idx=q_group_idx,
+            q_token_offset=q_token_offset,
+            seq_len_q=seq_len_q,
+            active_splits_kv=active_splits_kv,
+            static_full_split_prefix=static_full_split_prefix,
+            name="tmemCorr1",
+            sage_v_scales_ref=sage_v_scales,
+        )
+        tmem_corr1.smem_p0_ref = smem_p0
+        tmem_corr1.smem_p1_ref = smem_p1
+        tmem_corr1.tmem_o_ref = tmem_o
+        tmem_corr1.softmax_local0_ref = tmem_softmax_local0
         tmem_corr0.softmax_local1_ref = tmem_softmax_local1
         tmem_corr1.softmax_local1_ref = tmem_softmax_local1
 
@@ -1330,38 +1519,59 @@ def _build_decode_gen_schedule(
         smem_resources.append(smem_k0)
         smem_resources.append(smem_v0)
     elif use_per_inst_kv_resources:
-        smem_resources.append(smem_k0)
-        smem_resources.append(smem_k1)
-        smem_resources.append(smem_v0)
-        smem_resources.append(smem_v1)
+        for resource in (smem_k0, smem_k1, smem_v0, smem_v1):
+            if resource is not None:
+                smem_resources.append(resource)
     else:
         smem_resources.append(smem_kv)
+    if transformed_kv is not None:
+        smem_resources.append(transformed_kv)
     smem_resources.append(smem_p0)
-    if not use_one_inst_qkv:
+    if not use_one_inst_kv:
         smem_resources.append(smem_p1)
+    # An instance's ``sfK`` ring follows its S resource in the layout.
     smem_resources.append(tmem_s0)
-    if not use_one_inst_qkv:
+    if sage_k_scales0 is not None:
+        smem_resources.append(sage_k_scales0)
+    if not use_one_inst_kv:
         smem_resources.append(tmem_s1)
+        if sage_k_scales1 is not None:
+            smem_resources.append(sage_k_scales1)
     smem_resources.append(tmem_o)
     smem_resources.append(tmem_softmax_local0)
-    if not use_one_inst_qkv:
+    if not use_one_inst_kv:
         smem_resources.append(tmem_softmax_local1)
     smem_resources.append(tmem_softmax_global0)
-    if not use_one_inst_qkv:
+    if not use_one_inst_kv:
         smem_resources.append(tmem_softmax_global1)
     smem_resources.append(tmem_corr0)
-    if not use_one_inst_qkv:
+    if not use_one_inst_kv:
         smem_resources.append(tmem_corr1)
+    if sage_v_scales is not None:
+        smem_resources.append(sage_v_scales)
 
-    def allocate_smem() -> SmemAllocator:
+    # Lay out all resource storage, CLC responses and the shared TMEM pointer.
+    def allocate_smem() -> tuple[SmemAllocator, SmemAllocation | None]:
         allocator = SmemAllocator()
+        clc_response_alloc = None
         for resource in smem_resources:
             allocator.add_resource(resource)
+            if resource is work_queue and tile_sched_params is not None:
+                # A compile-time offset from the unified base spares every
+                # role a separate pointer that ptxas spills to local memory.
+                clc_response_alloc = allocator.add(
+                    SmemAllocation(
+                        "clc_response",
+                        dtype=cutlass.Int128,
+                        count=_WORK_QUEUE_STAGES,
+                        alignment=16,
+                    )
+                )
         allocator.add_tmem_ptr(
             SmemAllocation("fmha_tmem_ptr_i32", dtype=cutlass.Int32, alignment=4)
         )
         allocator.compute_layout()
-        return allocator
+        return allocator, clc_response_alloc
 
     def smem_bytes(allocator: SmemAllocator) -> int:
         # Include barriers and conservatively round data to tensor alignment.
@@ -1369,20 +1579,43 @@ def _build_decode_gen_schedule(
             allocator.total_smem_bytes + cfg.stensor_align - 1
         ) // cfg.stensor_align * cfg.stensor_align + allocator.barrier_smem_bytes
 
-    smem_allocator = allocate_smem()
-    if cfg.uses_q_token_kv_block_sparse_page_membership:
-        budget = TOTAL_SMEM_BUDGET_KIB * BYTES_PER_KIB
-        if smem_bytes(smem_allocator) > budget:
-            # A full union can be much larger than a KV tile. Keep small routes
-            # cached, but let Softmax read immutable packed GMEM words on demand
-            # when the complete resource layout cannot hold the membership row.
-            # This also accounts for the fixed K/V rings of one-inst D256.
-            assert smem_page_offsets is not None
-            smem_page_offsets.cache_memberships_in_smem = False
-            smem_page_offsets._init_placeholder_state()
-            smem_allocator = allocate_smem()
-        if smem_bytes(smem_allocator) > budget:
-            raise ValueError("QToken sparse attention resources exceed the SMEM budget")
+    # The static profile checks bound only the Q and K/V pipelines; check the
+    # complete layout against the SM100-family SMEM capacity.
+    smem_capacity_bytes = SMEM_CAPACITY_KIB * BYTES_PER_KIB
+    smem_allocator, clc_response_alloc = allocate_smem()
+    if (
+        cfg.uses_q_token_kv_block_sparse_page_membership
+        and smem_bytes(smem_allocator) > smem_capacity_bytes
+    ):
+        # A full union can be much larger than a KV tile. Keep small routes
+        # cached, but let Softmax read immutable packed GMEM words on demand
+        # when the complete resource layout cannot hold the membership row.
+        # This also accounts for the fixed K/V rings of one-inst D256.
+        assert smem_page_offsets is not None
+        smem_page_offsets.cache_memberships_in_smem = False
+        smem_page_offsets._init_placeholder_state()
+        smem_allocator, clc_response_alloc = allocate_smem()
+    launch_smem_bytes = smem_bytes(smem_allocator)
+    if launch_smem_bytes > smem_capacity_bytes:
+        raise ValueError(
+            "decode resources exceed the SM shared-memory capacity: "
+            f"q_stages={cfg.q_stages}, kv_stages={cfg.kv_stages} need "
+            f"{launch_smem_bytes} bytes, capacity is {smem_capacity_bytes} bytes"
+        )
+    if clc_response_alloc is not None:
+        # Bind the scheduler config before the task manager creates the queue.
+        smem_allocator.allocate()
+        work_queue.tile_scheduler_config = (
+            TileSchedulerConfig.create_clc_dynamic_persistent_tile_scheduler_params(
+                tile_scheduler_params=tile_sched_params,
+                response_ptr=cute.make_ptr(
+                    cutlass.Int128,
+                    smem_allocator.get(clc_response_alloc).data_ptr(),
+                    mem_space=cutlass.AddressSpace.smem,
+                    assumed_align=16,
+                ),
+            )
+        )
 
     # ------------------------------------------------------------------
     # Domain computation
@@ -1412,6 +1645,12 @@ def _build_decode_gen_schedule(
         "sparse_route_count": sparse_route_count,
         "num_heads_kv": num_heads_kv,
     }
+    # A Sage plan's ``sfK`` rings follow the K tiles.
+    sage_k_scale_rings = (
+        {"sage_k_scales0": sage_k_scales0, "sage_k_scales1": sage_k_scales1}
+        if cfg.use_sage_attention
+        else {}
+    )
     if use_one_inst_qkv:
         load_tasks = (
             create_load_task_one_inst_qkv(
@@ -1448,6 +1687,7 @@ def _build_decode_gen_schedule(
                 sparse_softmax_metadata1=sparse_softmax_metadata1,
                 domain_bias=0,
                 warp_indices=load_warp_indices,
+                **sage_k_scale_rings,
                 **task_runtime_kwargs,
             )
         else:
@@ -1470,6 +1710,7 @@ def _build_decode_gen_schedule(
                     sparse_softmax_metadata1=sparse_softmax_metadata1,
                     domain_bias=0,
                     warp_idx=cfg.clc_load_warp_idx if use_clc_dynamic else None,
+                    **sage_k_scale_rings,
                     **task_runtime_kwargs,
                 ),
             )
@@ -1489,11 +1730,12 @@ def _build_decode_gen_schedule(
                 sparse_kv_metadata1=sparse_kv_metadata1,
                 sparse_softmax_metadata0=sparse_softmax_metadata0,
                 sparse_softmax_metadata1=sparse_softmax_metadata1,
+                **sage_k_scale_rings,
                 **task_runtime_kwargs,
             ),
         )
     page_offsets_task = None
-    if use_dense_page_offsets:
+    if uses_page_offsets_task:
         page_offsets_warp_idx = cfg.page_offsets_warp_idx
         if use_separate_kv_page_offset_resources:
             page_offsets_task = create_page_offsets_task_split_kv(
@@ -1546,7 +1788,7 @@ def _build_decode_gen_schedule(
             domain_bias=0,
             **task_runtime_kwargs,
         )
-    elif use_per_inst_kv_resources:
+    elif use_per_inst_kv_resources and not cfg.use_transform_kv:
         mma_task = create_mma_task_split_kv(
             smem_q,
             smem_k0,
@@ -1569,7 +1811,7 @@ def _build_decode_gen_schedule(
     else:
         mma_task = create_mma_task(
             smem_q,
-            smem_kv,
+            mma_smem_kv,
             tmem_s0,
             tmem_s1,
             smem_p0,
@@ -1578,6 +1820,21 @@ def _build_decode_gen_schedule(
             work_queue,
             cfg,
             domain=mma_domain,
+            domain_bias=0,
+            **task_runtime_kwargs,
+        )
+    transform_kv_task = None
+    if cfg.use_transform_kv:
+        transform_kv_task = create_transform_kv_task(
+            smem_kv,
+            smem_k0,
+            smem_k1,
+            smem_v0,
+            smem_v1,
+            transformed_kv,
+            work_queue,
+            cfg,
+            domain=load_domain,
             domain_bias=0,
             **task_runtime_kwargs,
         )
@@ -1593,10 +1850,11 @@ def _build_decode_gen_schedule(
         domain=softmax_domain,
         domain_bias=1,
         membership_lifetime=membership_lifetime,
+        sage_k_scales=sage_k_scales0,
         **task_runtime_kwargs,
     )
     softmax1_task = None
-    if not use_one_inst_qkv:
+    if not use_one_inst_kv:
         softmax1_task = create_softmax1_task(
             tmem_s1,
             tmem_softmax_local1,
@@ -1609,9 +1867,10 @@ def _build_decode_gen_schedule(
             domain=softmax_domain,
             domain_bias=1,
             membership_lifetime=membership_lifetime,
+            sage_k_scales=sage_k_scales1,
             **task_runtime_kwargs,
         )
-    if use_one_inst_qkv:
+    if use_one_inst_kv:
         correction_task = create_correction_task_one_inst_qkv(
             tmem_softmax_local0,
             tmem_o,
@@ -1619,6 +1878,7 @@ def _build_decode_gen_schedule(
             work_queue,
             cfg,
             tmem_stats_done=tmem_stats_done0,
+            sage_v_scales=sage_v_scales,
             domain=corr_domain,
             domain_bias=0,
             **task_runtime_kwargs,
@@ -1635,6 +1895,7 @@ def _build_decode_gen_schedule(
             domain=corr_domain,
             tmem_stats_done0=tmem_stats_done0,
             tmem_stats_done1=tmem_stats_done1,
+            sage_v_scales=sage_v_scales,
             domain_bias=0,
             **task_runtime_kwargs,
         )
@@ -1671,6 +1932,8 @@ def _build_decode_gen_schedule(
     if page_offsets_task is not None:
         task_list.append(page_offsets_task)
     task_list.extend(load_tasks)
+    if transform_kv_task is not None:
+        task_list.append(transform_kv_task)
     if use_one_inst_qkv and not use_clc_dynamic:
         task_list.extend([correction_task, mma_task])
         task_list.append(softmax0_task)
@@ -1704,6 +1967,47 @@ def _build_decode_gen_schedule(
             tmem_o: [smem_p0, smem_v0],
             tmem_corr0: [tmem_softmax_local0, tmem_o],
         }
+    elif cfg.use_transform_kv and use_per_inst_kv_resources:
+        resource_dependency_graph = {
+            smem_q: [],
+            smem_k0: smem_k_deps,
+            smem_k1: smem_k_deps,
+            smem_v0: smem_v_deps,
+            smem_v1: smem_v_deps,
+            transformed_kv: [smem_k0, smem_k1, smem_v0, smem_v1],
+            tmem_s0: [transformed_kv, smem_q],
+            smem_p0: [tmem_s0],
+            tmem_softmax_local0: [tmem_s0],
+            tmem_softmax_global0: [tmem_s0],
+            tmem_o: [smem_p0, transformed_kv],
+            tmem_corr0: [tmem_softmax_local0, tmem_o],
+        }
+        if not use_one_inst_kv:
+            resource_dependency_graph.update(
+                {
+                    tmem_s1: [transformed_kv, smem_q],
+                    smem_p1: [tmem_s1],
+                    tmem_softmax_local1: [tmem_s1],
+                    tmem_softmax_global1: [tmem_s1],
+                    tmem_o: [smem_p0, smem_p1, transformed_kv],
+                    tmem_corr1: [
+                        tmem_softmax_local0,
+                        tmem_softmax_local1,
+                        tmem_o,
+                    ],
+                }
+            )
+    elif use_one_inst_kv:
+        resource_dependency_graph = {
+            smem_q: [],
+            smem_kv: smem_kv_deps,
+            tmem_s0: [mma_smem_kv, smem_q],
+            smem_p0: [tmem_s0],
+            tmem_softmax_local0: [tmem_s0],
+            tmem_softmax_global0: [tmem_s0],
+            tmem_o: [smem_p0, mma_smem_kv],
+            tmem_corr0: [tmem_softmax_local0, tmem_o],
+        }
     elif use_per_inst_kv_resources:
         resource_dependency_graph = {
             **(
@@ -1725,21 +2029,33 @@ def _build_decode_gen_schedule(
             smem_q: [],
             smem_k0: smem_k_deps
             + ([sparse_kv_metadata0] if sparse_kv_metadata0 is not None else []),
-            smem_k1: smem_k_deps
-            + ([sparse_kv_metadata1] if sparse_kv_metadata1 is not None else []),
             smem_v0: smem_v_deps
             + ([sparse_kv_metadata0] if sparse_kv_metadata0 is not None else []),
-            smem_v1: smem_v_deps
-            + ([sparse_kv_metadata1] if sparse_kv_metadata1 is not None else []),
+            **(
+                {
+                    smem_k1: smem_k_deps
+                    + (
+                        [sparse_kv_metadata1] if sparse_kv_metadata1 is not None else []
+                    ),
+                    smem_v1: smem_v_deps
+                    + (
+                        [sparse_kv_metadata1] if sparse_kv_metadata1 is not None else []
+                    ),
+                }
+                if smem_k1 is not None
+                else {}
+            ),
             tmem_s0: [smem_k0, smem_q],
-            tmem_s1: [smem_k1, smem_q],
+            tmem_s1: [smem_k0 if smem_k1 is None else smem_k1, smem_q],
             smem_p0: [tmem_s0],
             smem_p1: [tmem_s1],
             tmem_softmax_local0: [tmem_s0],
             tmem_softmax_local1: [tmem_s1],
             tmem_softmax_global0: [tmem_s0],
             tmem_softmax_global1: [tmem_s1],
-            tmem_o: [smem_p0, smem_p1, smem_v0, smem_v1],
+            tmem_o: [smem_p0, smem_p1, smem_v0]
+            if smem_v1 is None
+            else [smem_p0, smem_p1, smem_v0, smem_v1],
             tmem_corr0: [tmem_softmax_local0, tmem_o],
             tmem_corr1: [tmem_softmax_local0, tmem_softmax_local1, tmem_o],
         }
@@ -1762,18 +2078,20 @@ def _build_decode_gen_schedule(
                 if sparse_kv_metadata0 is not None
                 else []
             ),
-            tmem_s0: [smem_kv, smem_q],
-            tmem_s1: [smem_kv, smem_q],
+            tmem_s0: [mma_smem_kv, smem_q],
+            tmem_s1: [mma_smem_kv, smem_q],
             smem_p0: [tmem_s0],
             smem_p1: [tmem_s1],
             tmem_softmax_local0: [tmem_s0],
             tmem_softmax_local1: [tmem_s1],
             tmem_softmax_global0: [tmem_s0],
             tmem_softmax_global1: [tmem_s1],
-            tmem_o: [smem_p0, smem_p1, smem_kv],
+            tmem_o: [smem_p0, smem_p1, mma_smem_kv],
             tmem_corr0: [tmem_softmax_local0, tmem_o],
             tmem_corr1: [tmem_softmax_local0, tmem_softmax_local1, tmem_o],
         }
+    if transformed_kv is not None and not use_per_inst_kv_resources:
+        resource_dependency_graph[transformed_kv] = [smem_kv]
     if sparse_softmax_metadata0 is not None:
         resource_dependency_graph[smem_p0].append(sparse_softmax_metadata0)
         resource_dependency_graph[tmem_softmax_local0].append(sparse_softmax_metadata0)
@@ -1786,15 +2104,32 @@ def _build_decode_gen_schedule(
         resource_dependency_graph[membership_lifetime] = []
         for resource in (smem_p0, tmem_softmax_local0, tmem_softmax_global0):
             resource_dependency_graph[resource].append(membership_lifetime)
-        if not use_one_inst_qkv:
+        if not use_one_inst_kv:
             for resource in (smem_p1, tmem_softmax_local1, tmem_softmax_global1):
                 resource_dependency_graph[resource].append(membership_lifetime)
     if tmem_stats_done0 is not None:
         resource_dependency_graph[tmem_s0].append(tmem_stats_done0)
         resource_dependency_graph[tmem_stats_done0] = [tmem_softmax_local0]
         if tmem_stats_done1 is not None:
+            assert tmem_s1 is not None
+            assert tmem_softmax_local1 is not None
             resource_dependency_graph[tmem_s1].append(tmem_stats_done1)
             resource_dependency_graph[tmem_stats_done1] = [tmem_softmax_local1]
+    # A softmax instance's outputs read its K scale words. The correction
+    # epilogue reads the V channel scales.
+    for scales, outputs in (
+        (sage_k_scales0, (smem_p0, tmem_softmax_local0, tmem_softmax_global0)),
+        (sage_k_scales1, (smem_p1, tmem_softmax_local1, tmem_softmax_global1)),
+    ):
+        if scales is None:
+            continue
+        resource_dependency_graph[scales] = []
+        for resource in outputs:
+            resource_dependency_graph[resource].append(scales)
+    if sage_v_scales is not None:
+        resource_dependency_graph[sage_v_scales] = []
+        for resource in (tmem_corr0, tmem_corr1):
+            resource_dependency_graph[resource].append(sage_v_scales)
     if cutlass.const_expr(use_ordered_softmax_barrier):
         resource_dependency_graph[tmem_softmax_order] = [tmem_s0]
         resource_dependency_graph[smem_p1] = [
@@ -1818,9 +2153,15 @@ def _build_decode_gen_schedule(
     dma_consumer_release_labels: dict[
         tuple[MemoryResource, MemoryResource], set[str]
     ] = {}
+    if transformed_kv is not None:
+        dma_consumer_release_labels[(transformed_kv, tmem_s0)] = {"k_desc_0"}
+        dma_consumer_release_labels[(transformed_kv, tmem_o)] = {"v_desc_0"}
+        if not use_one_inst_kv:
+            dma_consumer_release_labels[(transformed_kv, tmem_s1)] = {"k_desc_1"}
+            dma_consumer_release_labels[(transformed_kv, tmem_o)].add("v_desc_1")
     if smem_page_offsets is not None:
         if use_one_inst_qkv:
-            if smem_page_offsets.holds_encoded_locator_window:
+            if _can_hold_native_page_window(cfg, smem_page_offsets):
                 # One consumer stage remains live across the complete K/V
                 # cadence, so both DMA edges share its final release label.
                 dma_consumer_release_labels.update(
@@ -1849,6 +2190,21 @@ def _build_decode_gen_schedule(
                         for resource in (smem_k0, smem_k1, smem_v0, smem_v1)
                     }
                 )
+            elif smem_k1 is None:
+                # One ring per operand serves both instances, so the single key
+                # carries the release labels of both.
+                dma_consumer_release_labels.update(
+                    {
+                        (smem_page_offsets, smem_k0): {
+                            "read_offsets_k0",
+                            "read_offsets_k1",
+                        },
+                        (smem_page_offsets_v, smem_v0): {
+                            "read_offsets_v0",
+                            "read_offsets_v1",
+                        },
+                    }
+                )
             elif smem_page_offsets_v is not None:
                 dma_consumer_release_labels.update(
                     {
@@ -1868,22 +2224,29 @@ def _build_decode_gen_schedule(
                     }
                 )
         else:
-            dma_consumer_release_labels[(smem_page_offsets, smem_kv)] = {
-                (
-                    "cache_page_ids"
-                    if cfg.num_head_dim_stages_kv > 1
-                    and not cfg.uses_scattered_page_route
-                    else "read_offsets"
-                )
-            }
-    if smem_kv is not None:
-        dma_consumer_release_labels.update(
-            {
-                (smem_kv, tmem_s0): {"k_desc_0"},
-                (smem_kv, tmem_s1): {"k_desc_1"},
-                (smem_kv, tmem_o): {"v_desc_0", "v_desc_1"},
-            }
-        )
+            hold_page_window = _can_hold_native_page_window(cfg, smem_page_offsets)
+            if cfg.num_head_dim_stages_kv > 1 and not cfg.uses_scattered_page_route:
+                page_offset_labels = {"cache_page_ids"}
+            elif hold_page_window:
+                page_offset_labels = {"read_offsets"}
+            elif use_one_inst_kv:
+                page_offset_labels = {"read_offsets_k0", "read_offsets_v0"}
+            else:
+                page_offset_labels = {
+                    "read_offsets_k0",
+                    "read_offsets_k1",
+                    "read_offsets_v0",
+                    "read_offsets_v1",
+                }
+            dma_consumer_release_labels[(smem_page_offsets, smem_kv)] = (
+                page_offset_labels
+            )
+    if smem_kv is not None and transformed_kv is None:
+        dma_consumer_release_labels[(smem_kv, tmem_s0)] = {"k_desc_0"}
+        dma_consumer_release_labels[(smem_kv, tmem_o)] = {"v_desc_0"}
+        if not use_one_inst_kv:
+            dma_consumer_release_labels[(smem_kv, tmem_s1)] = {"k_desc_1"}
+            dma_consumer_release_labels[(smem_kv, tmem_o)].add("v_desc_1")
 
     # ------------------------------------------------------------------
     # TMEM allocator
@@ -1914,15 +2277,17 @@ def _build_decode_gen_schedule(
             tmem_allocator.add_resource(tmem_softmax_local1)
     else:
         tmem_allocator.add_resource(tmem_s0)
-        if not use_one_inst_qkv:
-            tmem_allocator.add_resource(tmem_s1)
         tmem_allocator.add_resource(tmem_softmax_local0)
-        if not use_one_inst_qkv:
+        if not use_one_inst_kv:
+            tmem_allocator.add_resource(tmem_s1)
             tmem_allocator.add_resource(tmem_softmax_local1)
     tmem_allocator.add_resource(tmem_o)
+    if cfg.store_transformed_kv_in_tmem:
+        assert transformed_kv is not None
+        tmem_allocator.add_resource(transformed_kv)
     tmem_allocator.compute_layout()
     if cfg.use_keeps_mma_ab and not use_one_inst_qkv and not cfg.uses_tmem_p:
-        # Two-inst Keeps with SMEM P (currently Q64) must retain the historical
+        # Two-inst Keeps with SMEM P (Q64/KV128 and 8-bit Q128/KV128) keeps the
         # standalone-first S/O layout after unused stats aliases are removed.
         s0_alloc = tmem_s0.get_tmem_requirements()[0]
         s1_alloc = tmem_s1.get_tmem_requirements()[0]
@@ -2008,14 +2373,17 @@ def _build_decode_gen_schedule(
             tmem_s_alloc.offset + cfg.tmem_stats_cols
         )
 
-    eager_init_resources = (
-        [tmem_corr0] if use_one_inst_qkv else [tmem_corr0, tmem_corr1]
-    )
+    eager_init_resources = [tmem_corr0] if use_one_inst_kv else [tmem_corr0, tmem_corr1]
     if cfg.streams_tmem_p_fragments:
         # Streamed TMEM P operands use one-way per-fragment ready barriers.
         # Initialize them beside correction's manually managed SMEM state.
         eager_init_resources.extend([smem_p0, smem_p1])
+    if cfg.uses_int32_scores:
+        # The score-seed operand tile is written once by its owning instance.
+        eager_init_resources.append(tmem_s0)
 
+    for task in task_list:
+        task.requested_splits = requested_splits
     return (
         task_list,
         resource_dependency_graph,
@@ -2091,6 +2459,7 @@ def build_decode_task_manager(
         total_kv_tiles,
         tile_sched_params=None,
         num_heads_kv=Int32(num_heads_kv),
+        lse_ptr=None,
     )
 
     tm = TaskManager(
@@ -2200,16 +2569,20 @@ def _run_decode_gen_active(
     tma_desc_q: cutlass.GridConstant[cuda.TensorMap],
     tma_desc_k: cutlass.GridConstant[cuda.TensorMap],
     tma_desc_v: cutlass.GridConstant[cuda.TensorMap],
+    tma_desc_k_sf: cutlass.GridConstant[cuda.TensorMap],
+    tma_desc_v_sf: cutlass.GridConstant[cuda.TensorMap],
     tma_desc_k_atom: cutlass.GridConstant[cuda.TensorMap],
     tma_desc_v_atom: cutlass.GridConstant[cuda.TensorMap],
     o_iter: cute.Pointer,
     g_s_k: Int32,
     g_h_k: Int32,
-    g_scale_s_log2_e: Float32,
-    g_output_scale: Float32,
+    scale_softmax_log2: Float32,
+    output_scale: Float32,
     g_seqlens_kv: cute.Pointer | DirectSparseMetadataView,
-    g_cu_seqlens_q: cute.Pointer,
+    g_cu_seqlens_q: cute.Pointer | UniformQueryOffsets,
     g_page_idx_kv: cute.Pointer | DirectSparseMetadataView,
+    g_k_sf: cute.Pointer,
+    g_v_sf: cute.Pointer,
     g_page_table_stride: Int64,
     g_page_table_capacity: Int32,
     g_q_token_kv_block_sparse_page_memberships: cute.Pointer,
@@ -2229,7 +2602,7 @@ def _run_decode_gen_active(
     defer_runtime_split_pruning: cutlass.Constexpr[bool],
     tile_sched_params: utils.ClcDynamicPersistentTileSchedulerParams | None,
     cfg: cutlass.Constexpr[FmhaDecodeConfig],
-    seq_len_kv: cutlass.Constexpr[int] = 2048,
+    seq_len_kv: cutlass.Constexpr[int | None] = 2048,
     use_variable_seqlens_kv: cutlass.Constexpr[bool] = False,
     use_native_paged_kv: cutlass.Constexpr[bool] = False,
     use_static_native_seqlens_kv: cutlass.Constexpr[bool] = False,
@@ -2240,6 +2613,10 @@ def _run_decode_gen_active(
     tma_desc_v_summary: cutlass.GridConstant[cuda.TensorMap] | None = None,
     tma_desc_k_summary_atom: cutlass.GridConstant[cuda.TensorMap] | None = None,
     tma_desc_v_summary_atom: cutlass.GridConstant[cuda.TensorMap] | None = None,
+    g_sage_scales: cute.Pointer | None = None,
+    lse_ptr: cute.Pointer | None = None,
+    requested_splits=None,
+    g_max_q_len: Int32 = 1,
 ) -> None:
     """Run the complete decode body for one runtime-valid Q tile.
 
@@ -2255,6 +2632,7 @@ def _run_decode_gen_active(
 
     bias_static_sliding_kv_tma = (
         cfg.use_sliding_window_causal
+        and cfg.fixed_seqlen
         and cfg.max_seq_len_q == 1
         and not cfg.use_paged_kv
         and not cfg.use_split_kv
@@ -2273,10 +2651,9 @@ def _run_decode_gen_active(
     )
     runtime_max_seq_len_kv = (
         g_s_k
-        if cutlass.const_expr(use_runtime_seqlens_kv)
+        if cutlass.const_expr(use_runtime_seqlens_kv or not cfg.fixed_seqlen)
         else Int32(cfg.static_seq_len_kv)
     )
-    use_clc_dynamic_scheduler = cfg.use_persistent_scheduler
     tma_desc_k_summary_ptr = None
     tma_desc_v_summary_ptr = None
     tma_desc_k_summary_atom_ptr = None
@@ -2303,6 +2680,9 @@ def _run_decode_gen_active(
         prims.prefetch_tensormap(tma_desc_q.get_ptr())
         prims.prefetch_tensormap(tma_desc_k.get_ptr())
         prims.prefetch_tensormap(tma_desc_v.get_ptr())
+        if cutlass.const_expr(cfg.use_nvfp4_kv):
+            prims.prefetch_tensormap(tma_desc_k_sf.get_ptr())
+            prims.prefetch_tensormap(tma_desc_v_sf.get_ptr())
         if cutlass.const_expr(cfg.use_block_sparse and uses_atom_desc):
             # KV256 and non-aligned coarse KV128 may select the exact atom maps.
             prims.prefetch_tensormap(tma_desc_k_atom.get_ptr())
@@ -2316,14 +2696,8 @@ def _run_decode_gen_active(
                 prims.prefetch_tensormap(tma_desc_v_summary_atom_ptr)
     init_warp += 1
 
-    clc_response_ptr = None
-    if cutlass.const_expr(use_clc_dynamic_scheduler):
-        clc_response_ptr = cute.arch.alloc_smem(
-            cutlass.Int128, _PERSISTENT_SCHEDULE_TOKEN_STAGES
-        )
-
     q_output_rows = g_h_r
-    if cutlass.const_expr(cfg.max_seq_len_q > 1):
+    if cutlass.const_expr(cfg.fixed_seqlen and cfg.is_multi_token_q):
         q_output_rows = g_h_r * Int32(cfg.max_seq_len_q)
 
     # Static block-sparse tiles read their prepared row header here, before
@@ -2357,9 +2731,9 @@ def _run_decode_gen_active(
     ) = _build_decode_gen_schedule(
         cfg,
         total_kv_tiles,
-        scale_softmax_log2=g_scale_s_log2_e,
+        scale_softmax_log2=scale_softmax_log2,
         o_ptr=o_iter,
-        output_scale=g_output_scale,
+        output_scale=output_scale,
         partial_o_ptr=g_partial_o,
         partial_stats_ptr=g_partial_stats,
         split_kv_counter_ptr=g_split_kv_counter,
@@ -2367,18 +2741,22 @@ def _run_decode_gen_active(
         seqlens_kv=runtime_seqlens_kv,
         cu_seqlens_q=g_cu_seqlens_q,
         max_seq_len_kv=runtime_max_seq_len_kv,
-        corr_max_seq_len_kv=seq_len_kv,
+        corr_max_seq_len_kv=runtime_max_seq_len_kv,
         num_heads_kv=g_h_k,
         h_r=q_output_rows,
+        max_q_len=g_max_q_len,
         tma_desc_q=tma_desc_q.get_ptr(),
         tma_desc_k=tma_desc_k.get_ptr(),
         tma_desc_v=tma_desc_v.get_ptr(),
+        tma_desc_k_sf=tma_desc_k_sf.get_ptr(),
+        tma_desc_v_sf=tma_desc_v_sf.get_ptr(),
         tma_desc_k_atom=tma_desc_k_atom.get_ptr(),
         tma_desc_v_atom=tma_desc_v_atom.get_ptr(),
         tma_desc_k_summary=tma_desc_k_summary_ptr,
         tma_desc_v_summary=tma_desc_v_summary_ptr,
         tma_desc_k_summary_atom=tma_desc_k_summary_atom_ptr,
         tma_desc_v_summary_atom=tma_desc_v_summary_atom_ptr,
+        sage_scales_ptr=g_sage_scales,
         page_idx_kv=g_page_idx_kv,
         page_table_stride=g_page_table_stride,
         page_table_capacity=g_page_table_capacity,
@@ -2392,7 +2770,6 @@ def _run_decode_gen_active(
         active_splits_kv=(None if defer_runtime_split_pruning else active_splits_kv),
         static_full_split_prefix=static_full_split_prefix,
         tile_sched_params=tile_sched_params,
-        clc_response_ptr=clc_response_ptr,
         use_variable_seqlens_kv=use_variable_seqlens_kv,
         use_native_paged_kv=use_native_paged_kv,
         use_static_native_seqlens_kv=use_static_native_seqlens_kv,
@@ -2401,6 +2778,8 @@ def _run_decode_gen_active(
         sparse_route_metadata=g_sparse_route_metadata,
         sparse_row_route_begin=sparse_row_route_begin,
         sparse_route_count=sparse_route_count,
+        lse_ptr=lse_ptr,
+        requested_splits=requested_splits,
     )
 
     smem_allocator.allocate()
@@ -2470,16 +2849,28 @@ def _run_decode_gen_active(
             or (use_native_paged_kv and not use_static_native_seqlens_kv)
         ):
             runtime_seq_len_kv = Int32(g_seqlens_kv[b_idx])
-        deferred_active_splits_kv = _runtime_active_splits_kv(
-            cfg,
-            runtime_seq_len_kv,
-            seq_len_q,
-            _q_group_token_base(cfg, q_group_idx),
-        )
-        split_idx = cute.arch.block_idx()[0] % Int32(cfg.splits_kv)
-        run_task_graph = cute.arch.make_warp_uniform(
-            split_idx < deferred_active_splits_kv
-        )
+        split_idx = Int32(cute.arch.block_idx()[0])
+        if cutlass.const_expr(not cfg.uses_compact_split_grid):
+            split_idx = split_idx % Int32(cfg.splits_kv)
+        if cutlass.const_expr(cfg.runtime_split_kv and requested_splits is not None):
+            active_splits = _runtime_active_splits_kv(
+                cfg,
+                runtime_seq_len_kv,
+                seq_len_q,
+                _q_group_token_base(cfg, q_group_idx),
+                requested_splits=requested_splits,
+            )
+            run_task_graph = cute.arch.make_warp_uniform(split_idx < active_splits)
+        else:
+            run_task_graph = cute.arch.make_warp_uniform(
+                runtime_split_kv_is_active(
+                    cfg,
+                    runtime_seq_len_kv,
+                    seq_len_q,
+                    _q_group_token_base(cfg, q_group_idx),
+                    split_idx,
+                )
+            )
         _retire_inactive_pdl_split(
             run_task_graph,
             tmem_ptr_i32,
@@ -2539,16 +2930,20 @@ def _run_decode_gen_runtime_prefix(
     tma_desc_q: cutlass.GridConstant[cuda.TensorMap],
     tma_desc_k: cutlass.GridConstant[cuda.TensorMap],
     tma_desc_v: cutlass.GridConstant[cuda.TensorMap],
+    tma_desc_k_sf: cutlass.GridConstant[cuda.TensorMap],
+    tma_desc_v_sf: cutlass.GridConstant[cuda.TensorMap],
     tma_desc_k_atom: cutlass.GridConstant[cuda.TensorMap],
     tma_desc_v_atom: cutlass.GridConstant[cuda.TensorMap],
     o_iter: cute.Pointer,
     g_s_k: Int32,
     g_h_k: Int32,
-    g_scale_s_log2_e: Float32,
-    g_output_scale: Float32,
+    scale_softmax_log2: Float32,
+    output_scale: Float32,
     g_seqlens_kv: cute.Pointer | DirectSparseMetadataView,
-    g_cu_seqlens_q: cute.Pointer,
+    g_cu_seqlens_q: cute.Pointer | UniformQueryOffsets,
     g_page_idx_kv: cute.Pointer | DirectSparseMetadataView,
+    g_k_sf: cute.Pointer,
+    g_v_sf: cute.Pointer,
     g_page_table_stride: Int64,
     g_page_table_capacity: Int32,
     g_q_token_kv_block_sparse_page_memberships: cute.Pointer,
@@ -2567,7 +2962,7 @@ def _run_decode_gen_runtime_prefix(
     q_token_base: Int32,
     tile_sched_params: utils.ClcDynamicPersistentTileSchedulerParams | None,
     cfg: cutlass.Constexpr[FmhaDecodeConfig],
-    seq_len_kv: cutlass.Constexpr[int],
+    seq_len_kv: cutlass.Constexpr[int | None],
     use_variable_seqlens_kv: cutlass.Constexpr[bool],
     use_native_paged_kv: cutlass.Constexpr[bool],
     use_static_native_seqlens_kv: cutlass.Constexpr[bool],
@@ -2578,6 +2973,10 @@ def _run_decode_gen_runtime_prefix(
     tma_desc_v_summary: cutlass.GridConstant[cuda.TensorMap] | None = None,
     tma_desc_k_summary_atom: cutlass.GridConstant[cuda.TensorMap] | None = None,
     tma_desc_v_summary_atom: cutlass.GridConstant[cuda.TensorMap] | None = None,
+    g_sage_scales: cute.Pointer | None = None,
+    lse_ptr: cute.Pointer | None = None,
+    requested_splits=None,
+    g_max_q_len: Int32 = 1,
 ) -> None:
     """Run the general runtime split-prefix producer or retire its suffix."""
 
@@ -2595,6 +2994,7 @@ def _run_decode_gen_runtime_prefix(
             runtime_seq_len_kv,
             seq_len_q,
             q_token_base,
+            requested_splits=requested_splits,
         )
         if cutlass.const_expr(not cfg.use_separate_reduction_kernel):
             # Preserve one neutral producer for fused empty-K semantics.
@@ -2609,7 +3009,9 @@ def _run_decode_gen_runtime_prefix(
                 # This also avoids changing the grid or adding a reducer launch.
                 if active_splits_kv == Int32(cfg.splits_kv - 1):
                     active_splits_kv = Int32(cfg.splits_kv)
-        split_idx = q_group_cta_idx % Int32(cfg.splits_kv)
+        split_idx = Int32(cute.arch.block_idx()[0])
+        if cutlass.const_expr(not cfg.uses_compact_split_grid):
+            split_idx = q_group_cta_idx % Int32(cfg.splits_kv)
         split_is_active = split_idx < active_splits_kv
 
     if cutlass.const_expr(cfg.supports_cluster_smem_reduction):
@@ -2618,16 +3020,20 @@ def _run_decode_gen_runtime_prefix(
                 tma_desc_q,
                 tma_desc_k,
                 tma_desc_v,
+                tma_desc_k_sf,
+                tma_desc_v_sf,
                 tma_desc_k_atom,
                 tma_desc_v_atom,
                 o_iter,
                 g_s_k,
                 g_h_k,
-                g_scale_s_log2_e,
-                g_output_scale,
+                scale_softmax_log2,
+                output_scale,
                 g_seqlens_kv,
                 g_cu_seqlens_q,
                 g_page_idx_kv,
+                g_k_sf,
+                g_v_sf,
                 g_page_table_stride,
                 g_page_table_capacity,
                 g_q_token_kv_block_sparse_page_memberships,
@@ -2658,6 +3064,10 @@ def _run_decode_gen_runtime_prefix(
                 tma_desc_v_summary=tma_desc_v_summary,
                 tma_desc_k_summary_atom=tma_desc_k_summary_atom,
                 tma_desc_v_summary_atom=tma_desc_v_summary_atom,
+                g_sage_scales=g_sage_scales,
+                lse_ptr=lse_ptr,
+                requested_splits=requested_splits,
+                g_max_q_len=g_max_q_len,
             )
         else:
             _run_decode_gen_inactive_cluster_rank()
@@ -2667,16 +3077,20 @@ def _run_decode_gen_runtime_prefix(
                 tma_desc_q,
                 tma_desc_k,
                 tma_desc_v,
+                tma_desc_k_sf,
+                tma_desc_v_sf,
                 tma_desc_k_atom,
                 tma_desc_v_atom,
                 o_iter,
                 g_s_k,
                 g_h_k,
-                g_scale_s_log2_e,
-                g_output_scale,
+                scale_softmax_log2,
+                output_scale,
                 g_seqlens_kv,
                 g_cu_seqlens_q,
                 g_page_idx_kv,
+                g_k_sf,
+                g_v_sf,
                 g_page_table_stride,
                 g_page_table_capacity,
                 g_q_token_kv_block_sparse_page_memberships,
@@ -2707,6 +3121,10 @@ def _run_decode_gen_runtime_prefix(
                 tma_desc_v_summary=tma_desc_v_summary,
                 tma_desc_k_summary_atom=tma_desc_k_summary_atom,
                 tma_desc_v_summary_atom=tma_desc_v_summary_atom,
+                g_sage_scales=g_sage_scales,
+                lse_ptr=lse_ptr,
+                requested_splits=requested_splits,
+                g_max_q_len=g_max_q_len,
             )
         else:
             _signal_padded_pdl_producer(cfg)
@@ -2717,16 +3135,20 @@ def decode_gen_kernel(
     tma_desc_q: cutlass.GridConstant[cuda.TensorMap],
     tma_desc_k: cutlass.GridConstant[cuda.TensorMap],
     tma_desc_v: cutlass.GridConstant[cuda.TensorMap],
+    tma_desc_k_sf: cutlass.GridConstant[cuda.TensorMap],
+    tma_desc_v_sf: cutlass.GridConstant[cuda.TensorMap],
     tma_desc_k_atom: cutlass.GridConstant[cuda.TensorMap],
     tma_desc_v_atom: cutlass.GridConstant[cuda.TensorMap],
     o_iter: cute.Pointer,
     g_s_k: Int32,
     g_h_k: Int32,
-    g_scale_s_log2_e: Float32,
-    g_output_scale: Float32,
+    scale_softmax_log2: Float32,
+    output_scale: Float32,
     g_seqlens_kv: cute.Pointer | DirectSparseMetadataView,
-    g_cu_seqlens_q: cute.Pointer,
+    g_cu_seqlens_q: cute.Pointer | UniformQueryOffsets,
     g_page_idx_kv: cute.Pointer | DirectSparseMetadataView,
+    g_k_sf: cute.Pointer,
+    g_v_sf: cute.Pointer,
     g_page_table_stride: Int64,
     g_page_table_capacity: Int32,
     g_q_token_kv_block_sparse_page_memberships: cute.Pointer,
@@ -2738,7 +3160,7 @@ def decode_gen_kernel(
     g_h_r: Int32,
     tile_sched_params: utils.ClcDynamicPersistentTileSchedulerParams | None,
     cfg: cutlass.Constexpr[FmhaDecodeConfig],
-    seq_len_kv: cutlass.Constexpr[int] = 2048,
+    seq_len_kv: cutlass.Constexpr[int | None] = 2048,
     use_variable_seqlens_kv: cutlass.Constexpr[bool] = False,
     use_native_paged_kv: cutlass.Constexpr[bool] = False,
     use_static_native_seqlens_kv: cutlass.Constexpr[bool] = False,
@@ -2750,9 +3172,28 @@ def decode_gen_kernel(
     tma_desc_v_summary: cutlass.GridConstant[cuda.TensorMap] | None = None,
     tma_desc_k_summary_atom: cutlass.GridConstant[cuda.TensorMap] | None = None,
     tma_desc_v_summary_atom: cutlass.GridConstant[cuda.TensorMap] | None = None,
+    g_sage_scales: cute.Pointer | None = None,
+    lse_ptr: cute.Pointer | None = None,
+    requested_splits=None,
+    g_max_q_len: Int32 = 1,
 ) -> None:
     """Dispatch one static Q/split tile and drain padded launch slots safely."""
-    q_group_cta_idx, h_k_idx, b_idx = cute.arch.block_idx()
+    if cutlass.const_expr(not cfg.fixed_seqlen):
+        from copy import copy
+
+        cfg = copy(cfg)
+        cfg.static_seq_len_kv = g_s_k
+        cfg.uniform_query_offsets = isinstance(g_cu_seqlens_q, UniformQueryOffsets)
+        if cutlass.const_expr(cfg.groups_tokens_heads_q):
+            cfg.runtime_q_ctas = Int32(
+                (cutlass.Uint32(g_max_q_len) + cfg.q_tokens_per_cta - 1)
+                // cfg.q_tokens_per_cta
+            )
+        else:
+            cfg.runtime_q_ctas = g_max_q_len * (
+                (cfg.heads_q_per_kv + cfg.tile_size_q - 1) // cfg.tile_size_q
+            )
+    q_group_cta_idx, h_k_idx, b_idx = split_kv_grid_coord(cfg, cute.arch.block_idx())
     if cutlass.const_expr(
         cfg.use_q_token_kv_block_sparse_route
         and not cfg.shares_sparse_pattern
@@ -2773,12 +3214,15 @@ def decode_gen_kernel(
                 g_q_token_kv_block_sparse_page_membership_stride * g_h_k
             )
     q_group_idx = q_group_cta_idx
-    if cutlass.const_expr(cfg.use_split_kv):
-        # Grid coordinates and scratch linearization retain configured fanout.
+    if cutlass.const_expr(cfg.uses_compact_split_grid):
+        q_group_idx = Int32(cute.arch.block_idx()[2]) % Int32(cfg.num_q_ctas)
+    elif cutlass.const_expr(cfg.use_split_kv):
         q_group_idx = q_group_cta_idx // Int32(cfg.splits_kv)
 
     q_token_offset = Int32(0)
-    seq_len_q = Int32(cfg.max_seq_len_q)
+    seq_len_q = Int32(0)
+    if cutlass.const_expr(not cfg.use_variable_seqlens_q):
+        seq_len_q = Int32(cfg.max_seq_len_q)
     q_token_base = Int32(0)
     q_tile_is_active = cutlass.Boolean(True)
     if cutlass.const_expr(not cfg.use_persistent_scheduler):
@@ -2786,6 +3230,15 @@ def decode_gen_kernel(
             q_token_offset, seq_len_q = _q_seq_bounds(cfg, g_cu_seqlens_q, b_idx)
         q_token_base = _q_group_token_base(cfg, q_group_idx)
         q_tile_is_active = q_token_base < seq_len_q
+        if cutlass.const_expr(
+            use_variable_seqlens_kv
+            or (use_native_paged_kv and not use_static_native_seqlens_kv)
+        ):
+            if cutlass.const_expr(cfg.use_pdl):
+                prims.griddepcontrol(kind=prims.GridDepAction.WAIT)
+            q_tile_is_active = q_tile_is_active & (
+                Int32(g_seqlens_kv[b_idx]) > Int32(0)
+            )
 
     # Persistent block coordinates identify physical workers rather than
     # logical tiles; their WorkQueue owns the equivalent Q predicate. Split-KV
@@ -2796,16 +3249,20 @@ def decode_gen_kernel(
                 tma_desc_q,
                 tma_desc_k,
                 tma_desc_v,
+                tma_desc_k_sf,
+                tma_desc_v_sf,
                 tma_desc_k_atom,
                 tma_desc_v_atom,
                 o_iter,
                 g_s_k,
                 g_h_k,
-                g_scale_s_log2_e,
-                g_output_scale,
+                scale_softmax_log2,
+                output_scale,
                 g_seqlens_kv,
                 g_cu_seqlens_q,
                 g_page_idx_kv,
+                g_k_sf,
+                g_v_sf,
                 g_page_table_stride,
                 g_page_table_capacity,
                 g_q_token_kv_block_sparse_page_memberships,
@@ -2820,8 +3277,10 @@ def decode_gen_kernel(
                 b_idx,
                 q_token_offset,
                 seq_len_q,
-                Int32(cfg.splits_kv),
-                True,
+                Int32(cfg.splits_kv)
+                if requested_splits is None
+                else requested_splits[0],
+                requested_splits is None,
                 False,
                 tile_sched_params,
                 cfg,
@@ -2832,6 +3291,9 @@ def decode_gen_kernel(
                 g_sparse_row_route_offsets,
                 g_sparse_row_route_counts,
                 g_sparse_route_metadata,
+                lse_ptr=lse_ptr,
+                requested_splits=requested_splits,
+                g_max_q_len=g_max_q_len,
             )
         elif cutlass.const_expr(cfg.use_split_kv and cfg.use_pdl):
             # The immediately preceding grid may produce seq_lens. Send every
@@ -2841,16 +3303,20 @@ def decode_gen_kernel(
                 tma_desc_q,
                 tma_desc_k,
                 tma_desc_v,
+                tma_desc_k_sf,
+                tma_desc_v_sf,
                 tma_desc_k_atom,
                 tma_desc_v_atom,
                 o_iter,
                 g_s_k,
                 g_h_k,
-                g_scale_s_log2_e,
-                g_output_scale,
+                scale_softmax_log2,
+                output_scale,
                 g_seqlens_kv,
                 g_cu_seqlens_q,
                 g_page_idx_kv,
+                g_k_sf,
+                g_v_sf,
                 g_page_table_stride,
                 g_page_table_capacity,
                 g_q_token_kv_block_sparse_page_memberships,
@@ -2881,22 +3347,30 @@ def decode_gen_kernel(
                 tma_desc_v_summary=tma_desc_v_summary,
                 tma_desc_k_summary_atom=tma_desc_k_summary_atom,
                 tma_desc_v_summary_atom=tma_desc_v_summary_atom,
+                g_sage_scales=g_sage_scales,
+                lse_ptr=lse_ptr,
+                requested_splits=requested_splits,
+                g_max_q_len=g_max_q_len,
             )
         else:
             _run_decode_gen_runtime_prefix(
                 tma_desc_q,
                 tma_desc_k,
                 tma_desc_v,
+                tma_desc_k_sf,
+                tma_desc_v_sf,
                 tma_desc_k_atom,
                 tma_desc_v_atom,
                 o_iter,
                 g_s_k,
                 g_h_k,
-                g_scale_s_log2_e,
-                g_output_scale,
+                scale_softmax_log2,
+                output_scale,
                 g_seqlens_kv,
                 g_cu_seqlens_q,
                 g_page_idx_kv,
+                g_k_sf,
+                g_v_sf,
                 g_page_table_stride,
                 g_page_table_capacity,
                 g_q_token_kv_block_sparse_page_memberships,
@@ -2926,10 +3400,14 @@ def decode_gen_kernel(
                 tma_desc_v_summary=tma_desc_v_summary,
                 tma_desc_k_summary_atom=tma_desc_k_summary_atom,
                 tma_desc_v_summary_atom=tma_desc_v_summary_atom,
+                g_sage_scales=g_sage_scales,
+                lse_ptr=lse_ptr,
+                requested_splits=requested_splits,
+                g_max_q_len=g_max_q_len,
             )
     else:
-        # Packed-Q grids use a batch-wide maximum envelope. These Q CTAs own no
-        # producer state, unlike a valid Q tile whose K domain is empty.
+        # Inactive requests publish no output or partials; dependent reducers
+        # use the same live-length predicate. Every physical CTA still signals PDL.
         _signal_padded_pdl_producer(cfg)
 
 
@@ -2939,9 +3417,11 @@ def fmha_decode_launch(
     q_iter: cute.Pointer,
     k_iter: cute.Pointer,
     v_iter: cute.Pointer,
+    k_sf_iter: cute.Pointer,
+    v_sf_iter: cute.Pointer,
     o_iter: cute.Pointer,
     seqlens_kv_iter: cute.Pointer | DirectSparseMetadataView,
-    cu_seqlens_q_iter: cute.Pointer,
+    cu_seqlens_q_iter: cute.Pointer | UniformQueryOffsets,
     total_q_tokens: Int32,
     page_idx_kv_iter: cute.Pointer | DirectSparseMetadataView,
     q_token_kv_block_sparse_page_memberships_iter: cute.Pointer,
@@ -2949,13 +3429,13 @@ def fmha_decode_launch(
     partial_stats_iter: cute.Pointer,
     split_kv_counter_iter: cute.Pointer,
     attention_sinks_iter: cute.Pointer,
-    scale_s: Float32,
+    softmax_scale: Float32,
     output_scale: Float32,
     kv_b_stride: Int32,
     max_active_clusters: Int32,
     stream: cuda_drv.CUstream,
     cfg: cutlass.Constexpr[FmhaDecodeConfig],
-    seq_len_kv: cutlass.Constexpr[int] = 2048,
+    seq_len_kv: cutlass.Constexpr[int | None] = 2048,
     use_variable_seqlens_kv: cutlass.Constexpr[bool] = False,
     use_native_paged_kv: cutlass.Constexpr[bool] = False,
     page_table_stride: Int64 = 0,
@@ -2970,13 +3450,32 @@ def fmha_decode_launch(
     v_token_stride: Int64 = 0,
     static_full_split_prefix: cutlass.Constexpr[bool] = False,
     use_static_native_seqlens_kv: cutlass.Constexpr[bool] = False,
+    sage_scales_iter: cute.Pointer | None = None,
+    lse_ptr: cute.Pointer | None = None,
+    requested_splits=None,
+    max_q_len: Int32 = 0,
+    runtime_q_capacity_rows: Int32 = 0,
 ) -> None:
-    """Standalone JIT launcher for FMHA decode TS."""
+    """Standalone JIT launcher for FMHA decode TS.
+
+    ``max_q_len`` bounds the launched Q-token grid. ``runtime_q_capacity_rows``
+    is the partial-output row stride per request/KV head and can exceed that
+    grid's live rows; both operands remain runtime values.
+    ``sage_scales_iter`` is used only by a Sage attention config, which takes
+    its Q, K and V scales from the prepared scales (``_SageScaleLayout``).
+    """
     log2_e = math.log2(math.e)
+    if cutlass.const_expr(requested_splits is not None):
+        # Prepare the reciprocal once on the host; counts stay runtime operands.
+        requested_splits = (
+            requested_splits,
+            cute.fast_divmod_create_divisor(requested_splits * Int32(cfg.num_insts_kv)),
+        )
     b, h_q, h_k, s_k, d = problem_shape
     h_r = h_q // h_k
     bias_static_sliding_kv_tma = (
         cfg.use_sliding_window_causal
+        and cfg.fixed_seqlen
         and cfg.max_seq_len_q == 1
         and not cfg.use_paged_kv
         and not cfg.use_split_kv
@@ -2986,45 +3485,96 @@ def fmha_decode_launch(
         cfg, seq_len_kv, bias_static_sliding_kv_tma
     )
 
-    q_seq = Int32(cfg.max_seq_len_q)
+    q_seq = max_q_len if not cfg.fixed_seqlen else Int32(cfg.max_seq_len_q)
     if cutlass.const_expr(cfg.use_paged_kv):
+        kv_tma_d = d
+        if cutlass.const_expr(
+            cfg.use_nvfp4_kv and not cfg.store_transformed_kv_in_tmem
+        ):
+            kv_tma_d = d // Int32(2)
         if cutlass.const_expr(use_native_paged_kv):
+            total_pages = num_physical_kv_pages
             storage_tokens_per_page = Int32(cfg.effective_storage_tokens_per_page)
-            kv_shape = (
-                d,
-                storage_tokens_per_page,
-                h_k,
-                num_physical_kv_pages,
-            )
-            k_layout = cute.make_layout(
-                kv_shape,
-                stride=(
-                    1,
-                    k_token_stride,
-                    k_head_stride,
-                    k_page_stride,
-                ),
-            )
-            v_layout = cute.make_layout(
-                kv_shape,
-                stride=(
-                    1,
-                    v_token_stride,
-                    v_head_stride,
-                    v_page_stride,
-                ),
-            )
+            k_tma_page_stride = k_page_stride
+            k_tma_head_stride = k_head_stride
+            k_tma_token_stride = k_token_stride
+            v_tma_page_stride = v_page_stride
+            v_tma_head_stride = v_head_stride
+            v_tma_token_stride = v_token_stride
+            if cutlass.const_expr(cfg.store_transformed_kv_in_tmem):
+                # B4X16_P64 tensor-map strides are expressed in logical FP4
+                # lanes while the native cache reports packed-byte strides.
+                k_tma_page_stride = k_page_stride * Int64(2)
+                k_tma_head_stride = k_head_stride * Int64(2)
+                k_tma_token_stride = k_token_stride * Int64(2)
+                v_tma_page_stride = v_page_stride * Int64(2)
+                v_tma_head_stride = v_head_stride * Int64(2)
+                v_tma_token_stride = v_token_stride * Int64(2)
+            if cutlass.const_expr(cfg.use_flat_native_kv_tma):
+                # Reinterpret compact HND rows, without copying/repacking KV
+                # or requiring contiguous sparse selections. Planning checked
+                # signed-32-bit row bounds; other bindings use the general map.
+                # For S tokens/page, F tokens/fragment and H heads, metadata
+                # emits A = page*H*(S/F) + subpage. Attention addresses row
+                # (A + head*(S/F))*F, avoiding per-copy page/subpage divmod.
+                # Bytes and TMA count are unchanged; rank-2 issuing below is a
+                # separate optimization of this descriptor-only flat view.
+                flat_tokens = (
+                    num_physical_kv_pages
+                    * Int64(storage_tokens_per_page)
+                    * Int64(cfg.flat_native_kv_num_heads)
+                )
+                kv_shape = (kv_tma_d, flat_tokens, Int32(1), Int32(1))
+                k_tma_head_stride = k_tma_token_stride * flat_tokens
+                k_tma_page_stride = k_tma_head_stride
+                v_tma_head_stride = v_tma_token_stride * flat_tokens
+                v_tma_page_stride = v_tma_head_stride
+            else:
+                kv_shape = (
+                    kv_tma_d,
+                    storage_tokens_per_page,
+                    h_k,
+                    total_pages,
+                )
+            if cutlass.const_expr(cfg.uses_2d_flat_kv_tma):
+                # The prepared flat view has no head/page coordinates. Keep
+                # the same physical rows and SW128 tile without repacking KV.
+                k_layout = cute.make_layout(
+                    (kv_shape[0], kv_shape[1]), stride=(1, k_tma_token_stride)
+                )
+                v_layout = cute.make_layout(
+                    (kv_shape[0], kv_shape[1]), stride=(1, v_tma_token_stride)
+                )
+            else:
+                k_layout = cute.make_layout(
+                    kv_shape,
+                    stride=(
+                        1,
+                        k_tma_token_stride,
+                        k_tma_head_stride,
+                        k_tma_page_stride,
+                    ),
+                )
+                v_layout = cute.make_layout(
+                    kv_shape,
+                    stride=(
+                        1,
+                        v_tma_token_stride,
+                        v_tma_head_stride,
+                        v_tma_page_stride,
+                    ),
+                )
             k_tma = cute.make_tensor(k_iter, k_layout)
             v_tma = cute.make_tensor(v_iter, v_layout)
         else:
             total_pages = b * Int32(cfg.max_num_pages_per_seq_kv)
             kv_layout = cute.make_layout(
-                (d, Int32(cfg.num_tokens_per_page), h_k, total_pages),
+                (kv_tma_d, Int32(cfg.num_tokens_per_page), h_k, total_pages),
                 stride=(
                     1,
-                    d,
-                    d * Int32(cfg.num_tokens_per_page),
-                    d * Int32(cfg.num_tokens_per_page) * h_k,
+                    kv_tma_d,
+                    kv_tma_d * Int32(cfg.num_tokens_per_page),
+                    kv_tma_d * Int32(cfg.num_tokens_per_page) * h_k,
                 ),
             )
             k_tma_iter = k_iter
@@ -3039,12 +3589,14 @@ def fmha_decode_launch(
             skipped_tokens = Int32(
                 _compute_static_num_skipped_kv_tiles(cfg, seq_len_kv) * cfg.tile_size_kv
             )
-            skipped_elems = skipped_tokens * d
+            skipped_elems = skipped_tokens * d * h_k
             k_tma_iter = k_iter + skipped_elems
             v_tma_iter = v_iter + skipped_elems
             kv_s_for_tma = Int32(effective_seq_len_kv)
+        # Contiguous K/V are compact BSHD, matching the public PrimTS tensor
+        # contract and the Q layout above.
         kv_layout = cute.make_layout(
-            (d, kv_s_for_tma, h_k, b), stride=(1, d, d * s_k, kv_b_stride)
+            (d, kv_s_for_tma, h_k, b), stride=(1, d * h_k, d, kv_b_stride)
         )
         k_tma = cute.make_tensor(k_tma_iter, kv_layout)
         v_tma = cute.make_tensor(v_tma_iter, kv_layout)
@@ -3052,10 +3604,30 @@ def fmha_decode_launch(
     # Keep the TMA inner box at 128B when possible, but never exceed headDim.
     # box_dim is expressed in elements of the source dtype, not bytes.
     tma_box0_q = min(128 // cfg.q_dtype_bytes, cfg.headdim)
-    tma_box0_kv = min(128 // cfg.kv_dtype_bytes, cfg.headdim)
-    tma_swizzle = cuda.TensorMapSwizzle.s128b
-    if cutlass.const_expr(cfg.use_fp8_qkv and cfg.headdim == 64):
-        tma_swizzle = cuda.TensorMapSwizzle.s64b
+    tma_box0_k = min(128 // cfg.k_dtype_bytes, cfg.headdim)
+    tma_box0_v = min(128 // cfg.v_dtype_bytes, cfg.headdim)
+    tma_swizzle_q = cuda.TensorMapSwizzle.s128b
+    if cutlass.const_expr(cfg.q_dtype_bytes == 1 and cfg.headdim == 64):
+        tma_swizzle_q = cuda.TensorMapSwizzle.s64b
+    tma_swizzle_k = cuda.TensorMapSwizzle.s128b
+    if cutlass.const_expr(cfg.k_dtype_bytes == 1 and cfg.headdim == 64):
+        tma_swizzle_k = cuda.TensorMapSwizzle.s64b
+    tma_swizzle_v = cuda.TensorMapSwizzle.s128b
+    if cutlass.const_expr(cfg.v_dtype_bytes == 1 and cfg.headdim == 64):
+        tma_swizzle_v = cuda.TensorMapSwizzle.s64b
+    if cutlass.const_expr(cfg.use_nvfp4_kv):
+        if cutlass.const_expr(cfg.store_transformed_kv_in_tmem):
+            # Unpacking TMA consumes 128 logical FP4 lanes and materializes
+            # one s128b-swizzled byte per lane in the raw SMEM stage.
+            tma_box0_k = cfg.head_dim_kv_stage
+            tma_box0_v = cfg.head_dim_kv_stage
+            tma_swizzle_k = cuda.TensorMapSwizzle.s128b
+            tma_swizzle_v = cuda.TensorMapSwizzle.s128b
+        else:
+            tma_box0_k = cfg.head_dim_kv_stage // 2
+            tma_box0_v = cfg.head_dim_kv_stage // 2
+            tma_swizzle_k = cuda.TensorMapSwizzle.none
+            tma_swizzle_v = cuda.TensorMapSwizzle.none
     if cutlass.const_expr(cfg.tile_size_kv == 256):
         # The 2x2 datapath consumes K in a (0, 2, 1, 3) KV64 permutation.
         # A KV64 TensorMap atom lets the shared load resource place each
@@ -3073,9 +3645,8 @@ def fmha_decode_launch(
         )
     q_box_dims: tuple[object, ...]
     if cutlass.const_expr(cfg.use_variable_seqlens_q):
-        # Packed Q is physically [sum_q_tokens, num_heads_q, head_dim]. Flatten
-        # the two head modes into Hq so the ragged token axis still fits in a
-        # rank-5 tensor map after the helper inserts its two synthetic modes.
+        # Bound packed Q by its physical [D, Hq, total_q_tokens] allocation.
+        # Per-route Q masks handle tiles that cross into the next request.
         q_tma = cute.make_tensor(
             q_iter,
             cute.make_layout(
@@ -3087,23 +3658,22 @@ def fmha_decode_launch(
             q_box_dims = (
                 tma_box0_q,
                 cfg.heads_q_per_kv,
-                cfg.q_tokens_per_cta,
+                cfg.q_tma_tokens_per_cta,
             )
-            q_groups = Int32(
-                (cfg.max_seq_len_q + cfg.q_tokens_per_cta - 1) // cfg.q_tokens_per_cta
+            q_groups = (q_seq + Int32(cfg.q_tokens_per_cta - 1)) // Int32(
+                cfg.q_tokens_per_cta
             )
         else:
             q_box_dims = (tma_box0_q, cfg.tile_size_q, 1)
             head_ctas_per_token = Int32(
                 (cfg.heads_q_per_kv + cfg.tile_size_q - 1) // cfg.tile_size_q
             )
-            q_groups = Int32(cfg.max_seq_len_q) * head_ctas_per_token
-        tma_desc_q = create_tensor_map_ragged_from_tensor(
+            q_groups = q_seq * head_ctas_per_token
+        tma_desc_q = create_tensor_map_tiled_from_view(
             q_tma,
             box_dims=q_box_dims,
-            ragged_dim=2,
             stride_order=(0, 1, 2),
-            swizzle=tma_swizzle,
+            swizzle=tma_swizzle_q,
         )
     else:
         q_tma = cute.make_tensor(
@@ -3121,8 +3691,8 @@ def fmha_decode_launch(
                 cfg.q_tokens_per_cta,
                 1,
             )
-            q_groups = Int32(
-                (cfg.max_seq_len_q + cfg.q_tokens_per_cta - 1) // cfg.q_tokens_per_cta
+            q_groups = (q_seq + Int32(cfg.q_tokens_per_cta - 1)) // Int32(
+                cfg.q_tokens_per_cta
             )
         else:
             q_box_dims = (tma_box0_q, cfg.tile_size_q, 1, 1, 1)
@@ -3133,24 +3703,101 @@ def fmha_decode_launch(
             q_tma,
             box_dims=q_box_dims,
             stride_order=(0, 1, 2, 3, 4),
-            swizzle=tma_swizzle,
+            swizzle=tma_swizzle_q,
         )
-    tma_desc_k = create_tensor_map_tiled_from_view(
-        k_tma,
-        box_dims=(tma_box0_kv, tma_kv_tokens, 1, 1),
-        stride_order=(0, 1, 2, 3),
-        swizzle=tma_swizzle,
-    )
-    tma_desc_v = create_tensor_map_tiled_from_view(
-        v_tma,
-        box_dims=(tma_box0_kv, tma_kv_tokens, 1, 1),
-        stride_order=(0, 1, 2, 3),
-        swizzle=tma_swizzle,
-    )
+    if cutlass.const_expr(cfg.uses_2d_flat_kv_tma):
+        k_box_dims = (tma_box0_k, tma_kv_tokens)
+        v_box_dims = (tma_box0_v, tma_kv_tokens)
+        kv_stride_order = (0, 1)
+    else:
+        k_box_dims = (tma_box0_k, tma_kv_tokens, 1, 1)
+        v_box_dims = (tma_box0_v, tma_kv_tokens, 1, 1)
+        kv_stride_order = (0, 1, 2, 3)
+    if cutlass.const_expr(cfg.store_transformed_kv_in_tmem):
+        tma_desc_k = create_tensor_map_tiled_from_view(
+            k_tma,
+            box_dims=k_box_dims,
+            stride_order=kv_stride_order,
+            swizzle=tma_swizzle_k,
+            dtype=cutlass.Float4E2M1FNx2,
+            tma_format=cuda.TensorMapDataFormat.B4X16_P64,
+        )
+        tma_desc_v = create_tensor_map_tiled_from_view(
+            v_tma,
+            box_dims=v_box_dims,
+            stride_order=kv_stride_order,
+            swizzle=tma_swizzle_v,
+            dtype=cutlass.Float4E2M1FNx2,
+            tma_format=cuda.TensorMapDataFormat.B4X16_P64,
+        )
+    else:
+        tma_desc_k = create_tensor_map_tiled_from_view(
+            k_tma,
+            box_dims=k_box_dims,
+            stride_order=kv_stride_order,
+            swizzle=tma_swizzle_k,
+        )
+        tma_desc_v = create_tensor_map_tiled_from_view(
+            v_tma,
+            box_dims=v_box_dims,
+            stride_order=kv_stride_order,
+            swizzle=tma_swizzle_v,
+        )
+
+    # NVFP4 scale factors are staged into SMEM by the same SmemKv TMA pipeline
+    # as the packed K/V. The SF tensor is logically
+    # (headdim // 16, storage_tokens_per_page, h_k, total_pages) E4M3. K uses
+    # token-major layout and V uses TRT-LLM's 4-token interleaved layout. The
+    # inner SF box (headdim // 16 = 8 B) is below TMA's
+    # 16 B minimum, so fold `r` tokens into dim0 for up to a 128 B inner box,
+    # without spanning semantic page fragments.
+    # This reshape is a pure reinterpretation of the same contiguous bytes.
+    tma_desc_k_sf = tma_desc_k
+    tma_desc_v_sf = tma_desc_v
+    if cutlass.const_expr(cfg.use_nvfp4_kv):
+        sf_per_token = cfg.headdim // 16
+        sf_r = cfg.sf_tma_reshape_factor
+        sf_inner = sf_per_token * sf_r
+        sf_storage_tokens_per_page = cfg.num_tokens_per_page
+        if cutlass.const_expr(use_native_paged_kv):
+            sf_storage_tokens_per_page = cfg.effective_storage_tokens_per_page
+        sf_tokens_outer = sf_storage_tokens_per_page // sf_r
+        # The descriptor spans a physical page, but each transaction copies
+        # only the semantic fragment selected by the decoded page locator.
+        sf_box_tokens_outer = cfg.num_tokens_per_page // sf_r
+        sf_page_elems = Int32(sf_per_token * sf_storage_tokens_per_page)
+        sf_layout = cute.make_layout(
+            (Int32(sf_inner), Int32(sf_tokens_outer), h_k, total_pages),
+            stride=(1, Int32(sf_inner), sf_page_elems, sf_page_elems * h_k),
+        )
+        k_sf_tma = cute.make_tensor(k_sf_iter, sf_layout)
+        v_sf_tma = cute.make_tensor(v_sf_iter, sf_layout)
+        tma_desc_k_sf = cuda.create_tensor_map_tiled_from_view(
+            k_sf_tma,
+            box_dims=(sf_inner, sf_box_tokens_outer, 1, 1),
+            stride_order=(0, 1, 2, 3),
+            swizzle=cuda.TensorMapSwizzle.none,
+        )
+        tma_desc_v_sf = cuda.create_tensor_map_tiled_from_view(
+            v_sf_tma,
+            box_dims=(sf_inner, sf_box_tokens_outer, 1, 1),
+            stride_order=(0, 1, 2, 3),
+            swizzle=cuda.TensorMapSwizzle.none,
+        )
 
     grid_x = q_groups
+    grid_batch = b
     if cutlass.const_expr(cfg.use_split_kv):
         grid_x = q_groups * Int32(cfg.splits_kv)
+        if cutlass.const_expr(cfg.uses_compact_split_grid):
+            # X contains only live policy splits. Q/batch share Z with a
+            # compile-time Q stride, avoiding runtime-count coordinate division.
+            grid_x = (
+                Int32(cfg.splits_kv)
+                if requested_splits is None
+                else requested_splits[0]
+            )
+            grid_batch = b * q_groups
 
     if cutlass.const_expr(cfg.use_persistent_scheduler):
         tile_sched_params = utils.ClcDynamicPersistentTileSchedulerParams(
@@ -3160,7 +3807,7 @@ def fmha_decode_launch(
         grid = tile_sched_params.get_grid_shape()
     else:
         tile_sched_params = None
-        grid = (grid_x, h_k, b)
+        grid = (grid_x, h_k, grid_batch)
     # cluster distributed-SMEM reduction groups the splits_kv split CTAs
     # of each sequence (contiguous in grid-X) into one cluster so they can write
     # partials into each other's shared memory via prims.mapa.
@@ -3172,50 +3819,84 @@ def fmha_decode_launch(
         0,
         mem_space=cutlass.AddressSpace.gmem,
     )
-    decode_gen_kernel(
-        tma_desc_q,
-        tma_desc_k,
-        tma_desc_v,
-        tma_desc_k,
-        tma_desc_v,
-        o_iter,
-        s_k,
-        h_k,
-        Float32(scale_s * log2_e),
-        output_scale,
-        seqlens_kv_iter,
-        cu_seqlens_q_iter,
-        page_idx_kv_iter,
-        page_table_stride,
-        page_table_capacity,
-        q_token_kv_block_sparse_page_memberships_iter,
-        q_token_kv_block_sparse_page_membership_stride,
-        partial_o_iter,
-        partial_stats_iter,
-        split_kv_counter_iter,
-        attention_sinks_iter,
-        h_r,
-        tile_sched_params,
-        cfg,
-        seq_len_kv,
-        use_variable_seqlens_kv,
-        use_native_paged_kv,
-        use_static_native_seqlens_kv,
-        null_sparse_route_ptr,
-        null_sparse_route_ptr,
-        null_sparse_route_ptr,
-        static_full_split_prefix,
-    ).launch(
-        grid=grid,
-        block=[cfg.threads_per_cta, 1, 1],
-        cluster=cluster_shape,
-        stream=stream,
-        min_blocks_per_mp=_decode_min_blocks_per_mp(cfg, effective_seq_len_kv),
-        # PDL-capable attention initializes all local task resources before
-        # acquiring its immediately preceding producer. Split attention also
-        # defers runtime prefix pruning until after that acquire.
-        use_pdl=cfg.use_pdl,
+    # Both schedules are compiled together and selected by runtime bounds.
+    # A CTA-relative 32-ID stage covers any instruction-aligned short span;
+    # longer spans retain the ordinary staged pipeline. Counts never enter
+    # the compile identity or require another JIT when this choice changes.
+    can_hold_runtime_window = (
+        cfg.runtime_split_kv
+        and requested_splits is not None
+        and use_native_paged_kv
+        and cfg.use_split_kv
+        and not cfg.use_sliding_window_causal
+        and not cfg.uses_scattered_page_route
+        and not cfg.use_block_sparse
+        and cfg.num_insts_kv * (cfg.tile_size_kv // cfg.num_tokens_per_page) <= 32
     )
+    use_runtime_window = cutlass.Boolean(False)
+    if cutlass.const_expr(can_hold_runtime_window):
+        pages_per_tile = cfg.tile_size_kv // cfg.num_tokens_per_page
+        window_tiles = (32 // pages_per_tile // cfg.num_insts_kv) * cfg.num_insts_kv
+        use_runtime_window = s_k <= requested_splits[0] * Int32(
+            window_tiles * cfg.tile_size_kv
+        )
+    for profile in cutlass.range_constexpr(2 if can_hold_runtime_window else 1):
+        launch_cfg = replace(cfg, runtime_page_window=(profile == 1))
+        if use_runtime_window == cutlass.Boolean(profile == 1):
+            decode_gen_kernel(
+                tma_desc_q,
+                tma_desc_k,
+                tma_desc_v,
+                tma_desc_k_sf,
+                tma_desc_v_sf,
+                tma_desc_k,
+                tma_desc_v,
+                o_iter,
+                s_k,
+                h_k,
+                Float32(softmax_scale * log2_e),
+                output_scale,
+                seqlens_kv_iter,
+                cu_seqlens_q_iter,
+                page_idx_kv_iter,
+                k_sf_iter,
+                v_sf_iter,
+                page_table_stride,
+                page_table_capacity,
+                q_token_kv_block_sparse_page_memberships_iter,
+                q_token_kv_block_sparse_page_membership_stride,
+                partial_o_iter,
+                partial_stats_iter,
+                split_kv_counter_iter,
+                attention_sinks_iter,
+                (runtime_q_capacity_rows if not cfg.fixed_seqlen else h_r),
+                tile_sched_params,
+                launch_cfg,
+                seq_len_kv,
+                use_variable_seqlens_kv,
+                use_native_paged_kv,
+                use_static_native_seqlens_kv,
+                null_sparse_route_ptr,
+                null_sparse_route_ptr,
+                null_sparse_route_ptr,
+                static_full_split_prefix,
+                g_sage_scales=sage_scales_iter,
+                lse_ptr=lse_ptr,
+                requested_splits=requested_splits,
+                g_max_q_len=max_q_len,
+            ).launch(
+                grid=grid,
+                block=[cfg.threads_per_cta, 1, 1],
+                cluster=cluster_shape,
+                stream=stream,
+                min_blocks_per_mp=_decode_min_blocks_per_mp(
+                    cfg, None if seq_len_kv is None else effective_seq_len_kv
+                ),
+                # PDL-capable attention initializes all local task resources before
+                # acquiring its immediately preceding producer. Split attention also
+                # defers runtime prefix pruning until after that acquire.
+                use_pdl=cfg.use_pdl,
+            )
 
 
 @cute.jit
@@ -3230,15 +3911,16 @@ def fmha_block_sparse_launch(
     row_route_offsets_iter: cute.Pointer,
     row_route_counts_iter: cute.Pointer,
     route_metadata_iter: cute.Pointer,
-    scale_s: Float32,
+    softmax_scale: Float32,
     stream: cuda_drv.CUstream,
     cfg: cutlass.Constexpr[FmhaDecodeConfig],
-    seq_len_kv: cutlass.Constexpr[int],
+    seq_len_kv: cutlass.Constexpr[int | None],
     g_seqlens_kv: cute.Pointer | None = None,
     use_variable_seqlens_kv: cutlass.Constexpr[bool] = False,
     num_physical_kv_pages: Int64 = 0,
     k_page_stride: Int64 = 0,
     v_page_stride: Int64 = 0,
+    sage_scales_iter: cute.Pointer | None = None,
 ) -> None:
     """Launch attention over exact and typed exact/proxy prepared KV routes.
 
@@ -3247,6 +3929,8 @@ def fmha_block_sparse_launch(
     words. Exact routes address K/V; proxy routes address summary K/V. Both
     layouts execute the same ``decode_gen_kernel`` schedule and
     physical copy policy. Exact builds constexpr-elide summary TensorMaps.
+    ``sage_scales_iter`` is used only by a Sage attention config, which takes
+    its Q, K and V scales from the prepared scales (``_SageScaleLayout``).
     """
     if cutlass.const_expr(not cfg.use_block_sparse):
         raise ValueError("fmha_block_sparse_launch requires block-sparse config")
@@ -3257,16 +3941,26 @@ def fmha_block_sparse_launch(
     b, h_q, h_k, s_k, d = problem_shape
     h_r = h_q // h_k
     q_seq = Int32(cfg.max_seq_len_q)
-    q_strides, kv_strides = _block_sparse_bshd_tma_strides(
+    q_strides, _ = _block_sparse_bshd_tma_strides(
         q_seq=q_seq,
         h_q=h_q,
         h_k=h_k,
         s_k=s_k,
         d=d,
+        element_bytes=cfg.q_dtype_bytes,
+    )
+    _, kv_strides = _block_sparse_bshd_tma_strides(
+        q_seq=q_seq,
+        h_q=h_q,
+        h_k=h_k,
+        s_k=s_k,
+        d=d,
+        element_bytes=cfg.kv_dtype_bytes,
     )
 
-    # FP16/BF16 H128 uses a 64-element (128-byte) inner box.  The sparse
-    # profile validator rejects other element widths and head dimensions.
+    # H128 uses a 128-byte inner box: 64 two-byte or 128 one-byte elements.
+    # The sparse profile validator rejects other head dimensions.
+    tma_box0_q = min(128 // cfg.q_dtype_bytes, cfg.headdim)
     tma_box0 = min(128 // cfg.kv_dtype_bytes, cfg.headdim)
     tma_swizzle = cuda.TensorMapSwizzle.s128b
     # Public tensors are contiguous BSHD. Q is factored into (Hr, Hkv) so the
@@ -3277,7 +3971,7 @@ def fmha_block_sparse_launch(
         global_dims=(d, h_r, h_k, q_seq, b),
         global_strides=q_strides,
         box_dims=(
-            tma_box0,
+            tma_box0_q,
             cfg.heads_q_per_kv,
             1,
             cfg.q_tokens_per_cta,
@@ -3348,7 +4042,7 @@ def fmha_block_sparse_launch(
         kv_dims = (d, s_k, h_k, b)
         k_desc_primary = create_tensor_map_tiled(
             global_address=k_iter.toint(),
-            dtype=cfg.kv_dtype,
+            dtype=cfg.k_dtype,
             global_dims=kv_dims,
             global_strides=kv_strides,
             box_dims=(tma_box0, primary_kv_box_size, 1, 1),
@@ -3356,7 +4050,7 @@ def fmha_block_sparse_launch(
         )
         v_desc_primary = create_tensor_map_tiled(
             global_address=v_iter.toint(),
-            dtype=cfg.kv_dtype,
+            dtype=cfg.v_dtype,
             global_dims=kv_dims,
             global_strides=kv_strides,
             box_dims=(tma_box0, primary_kv_box_size, 1, 1),
@@ -3369,7 +4063,7 @@ def fmha_block_sparse_launch(
             # map only when a route may join unrelated BSR entries.
             k_desc_atom = create_tensor_map_tiled(
                 global_address=k_iter.toint(),
-                dtype=cfg.kv_dtype,
+                dtype=cfg.k_dtype,
                 global_dims=kv_dims,
                 global_strides=kv_strides,
                 box_dims=(tma_box0, kv_atom_size, 1, 1),
@@ -3377,7 +4071,7 @@ def fmha_block_sparse_launch(
             )
             v_desc_atom = create_tensor_map_tiled(
                 global_address=v_iter.toint(),
-                dtype=cfg.kv_dtype,
+                dtype=cfg.v_dtype,
                 global_dims=kv_dims,
                 global_strides=kv_strides,
                 box_dims=(tma_box0, kv_atom_size, 1, 1),
@@ -3386,7 +4080,7 @@ def fmha_block_sparse_launch(
 
         if cutlass.const_expr(cfg.use_block_sparse_proxy_routes):
             num_kv_blocks, _ = _block_sparse_proxy_summary_geometry(
-                seq_len_kv,
+                s_k,
                 cfg.kv_block_size,
             )
             _, summary_kv_strides = _block_sparse_bshd_tma_strides(
@@ -3395,11 +4089,12 @@ def fmha_block_sparse_launch(
                 h_k=h_k,
                 s_k=num_kv_blocks,
                 d=d,
+                element_bytes=cfg.kv_dtype_bytes,
             )
             summary_dims = (d, num_kv_blocks, h_k, b)
             k_desc_summary_primary = create_tensor_map_tiled(
                 global_address=k_summary_iter.toint(),
-                dtype=cfg.kv_dtype,
+                dtype=cfg.k_dtype,
                 global_dims=summary_dims,
                 global_strides=summary_kv_strides,
                 box_dims=(tma_box0, primary_kv_box_size, 1, 1),
@@ -3407,7 +4102,7 @@ def fmha_block_sparse_launch(
             )
             v_desc_summary_primary = create_tensor_map_tiled(
                 global_address=v_summary_iter.toint(),
-                dtype=cfg.kv_dtype,
+                dtype=cfg.v_dtype,
                 global_dims=summary_dims,
                 global_strides=summary_kv_strides,
                 box_dims=(tma_box0, primary_kv_box_size, 1, 1),
@@ -3418,7 +4113,7 @@ def fmha_block_sparse_launch(
             if cutlass.const_expr(uses_atom_desc):
                 k_desc_summary_atom = create_tensor_map_tiled(
                     global_address=k_summary_iter.toint(),
-                    dtype=cfg.kv_dtype,
+                    dtype=cfg.k_dtype,
                     global_dims=summary_dims,
                     global_strides=summary_kv_strides,
                     box_dims=(tma_box0, kv_atom_size, 1, 1),
@@ -3426,7 +4121,7 @@ def fmha_block_sparse_launch(
                 )
                 v_desc_summary_atom = create_tensor_map_tiled(
                     global_address=v_summary_iter.toint(),
-                    dtype=cfg.kv_dtype,
+                    dtype=cfg.v_dtype,
                     global_dims=summary_dims,
                     global_strides=summary_kv_strides,
                     box_dims=(tma_box0, kv_atom_size, 1, 1),
@@ -3434,7 +4129,7 @@ def fmha_block_sparse_launch(
                 )
 
     q_groups = Int32(
-        (cfg.max_seq_len_q + cfg.q_tokens_per_cta - 1) // cfg.q_tokens_per_cta
+        (q_seq + Int32(cfg.q_tokens_per_cta - 1)) // Int32(cfg.q_tokens_per_cta)
     )
     if cutlass.const_expr(cfg.use_persistent_scheduler):
         tile_sched_params = utils.ClcDynamicPersistentTileSchedulerParams(
@@ -3463,16 +4158,20 @@ def fmha_block_sparse_launch(
         q_desc,
         k_desc_primary,
         v_desc_primary,
+        k_desc_primary,
+        v_desc_primary,
         k_desc_atom,
         v_desc_atom,
         o_iter,
         s_k,
         h_k,
-        Float32(scale_s * log2_e),
+        Float32(softmax_scale * log2_e),
         Float32(1.0),
         seqlens_kv_iter,
         null_i32_ptr,
         null_i32_ptr,
+        null_f32_ptr,
+        null_f32_ptr,
         Int64(0),  # g_page_table_stride
         Int32(0),  # g_page_table_capacity
         null_i32_ptr,
@@ -3496,6 +4195,9 @@ def fmha_block_sparse_launch(
         tma_desc_v_summary=v_desc_summary_primary,
         tma_desc_k_summary_atom=k_desc_summary_atom,
         tma_desc_v_summary_atom=v_desc_summary_atom,
+        g_sage_scales=sage_scales_iter,
+        lse_ptr=None,
+        g_max_q_len=q_seq,
     ).launch(
         grid=grid,
         block=[cfg.threads_per_cta, 1, 1],

@@ -14,11 +14,11 @@
 
 """Sweep frozen recurrent-KDA decode value splits through the public API.
 
-This exact-SM100a/SM103a harness forces every split1/2/4/8 specialization for
-the D128, H16, HV32 precomputed-gate T=1/2/4/5/6 contracts. It additionally
-sweeps both direct-state T=1 schedules (split8 and split16), while retaining
-the four T=1 WY schedules. T=1 uses the standard decode ABI; the other token
-counts use packed speculative decode. For every coordinate, it:
+This exact-SM100a/SM103a harness forces every built value-split specialization
+for the D128, H16, HV32 precomputed-gate T=2/4/5/6 contracts (split4/8 for T=2,
+split1/2/4/8 otherwise) and sweeps both direct-state T=1 schedules (split8 and
+split16). T=1 uses the standard decode ABI; the other token counts use packed
+speculative decode. For every coordinate, it:
 
 1. computes a reference with the explicit public ``backend="cute-dsl"`` path;
 2. checks the output and the complete mutated state from every forced frozen
@@ -47,7 +47,7 @@ import torch
 import torch.nn.functional as F
 
 import flashinfer
-from flashinfer.kda_decode import recurrent_kda
+from flashinfer import recurrent_kda
 from flashinfer.testing import bench_gpu_time
 
 
@@ -57,10 +57,17 @@ NUM_HEADS = 16
 NUM_VALUE_HEADS = 32
 TOKEN_COUNTS = (1, 2, 4, 5, 6)
 SEQUENCE_COUNTS = (1, 2, 3, 4, 5, 6, 7, 8, 16, 32, 64, 128)
-VALUE_SPLITS = (1, 2, 4, 8)
+# T=1 is served only by the direct-state split8/split16 schedules; T=2 keeps
+# split4/split8. The other splits are not built and are not swept.
+VALUE_SPLITS_BY_TOKENS = {
+    1: (),
+    2: (4, 8),
+    4: (1, 2, 4, 8),
+    5: (1, 2, 4, 8),
+    6: (1, 2, 4, 8),
+}
 SUPPORTED_FLASH_KDA_DECODE_ARCHS = {(10, 0): "sm100a", (10, 3): "sm103a"}
 VARIANT_PREFIXES = {
-    1: "d128_t1_precomputed_split",
     2: "d128_t2_precomputed_split",
     4: "d128_t4_precomputed_split",
     5: "d128_t5_precomputed_gram_split",
@@ -80,7 +87,7 @@ def _variant_specs_for_tokens(num_tokens: int) -> tuple[dict, ...]:
             "value_split": value_split,
             "variant": f"{VARIANT_PREFIXES[num_tokens]}{value_split}",
         }
-        for value_split in VALUE_SPLITS
+        for value_split in VALUE_SPLITS_BY_TOKENS[num_tokens]
     ]
     if num_tokens == 1:
         specs.extend(
@@ -617,7 +624,10 @@ def main() -> None:
             "N": list(SEQUENCE_COUNTS),
             "H": NUM_HEADS,
             "HV": NUM_VALUE_HEADS,
-            "value_splits": list(VALUE_SPLITS),
+            "value_splits_by_tokens": {
+                str(tokens): list(splits)
+                for tokens, splits in VALUE_SPLITS_BY_TOKENS.items()
+            },
             "variants_by_t": {
                 str(num_tokens): list(_variant_specs_for_tokens(num_tokens))
                 for num_tokens in TOKEN_COUNTS

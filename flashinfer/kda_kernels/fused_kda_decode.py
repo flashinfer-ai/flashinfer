@@ -17,8 +17,8 @@ Fused Kimi KDA decode kernel for SM100 and SM103.
 
 The kernel combines the width-four depthwise causal convolution, SiLU,
 per-key-dimension gated delta-rule recurrence, and gated RMSNorm into one
-launch. It is specialized for head dimension 128 and 12, 24, 32, 48, or 96
-heads.
+launch. It is specialized for head dimension 128 and 8, 12, 24, 32, 48, or
+96 heads.
 """
 
 import functools
@@ -37,6 +37,8 @@ from ..jit.cake_fused_kda_decode import (
     CakeFusedKDADecodeStateIndicesMode,
     CakeFusedKDADecodeTarget,
     CakeFusedKDADecodeVariant,
+    cake_fused_kda_decode_grid,
+    cake_fused_kda_decode_lower_bound_log2,
     get_cake_fused_kda_decode_variants,
     load_cake_fused_kda_decode_module,
     select_cake_fused_kda_decode_variant,
@@ -54,7 +56,7 @@ _ROWS_PER_WARP = _HEAD_DIM // _NUM_WARPS
 _CONV_THREADS = 3 * _HEAD_DIM // 4
 _Q_SCALE = _HEAD_DIM**-0.5
 _L2_EPS = 1.0e-6
-_SUPPORTED_HEADS = (12, 24, 32, 48, 96)
+_SUPPORTED_HEADS = (8, 12, 16, 24, 32, 48, 64, 96)
 _CUTE_DSL_MODULE = "fused_kda_decode"
 _SOURCE_FILES = (str(Path(__file__).resolve()),)
 
@@ -73,6 +75,17 @@ def _aligned_tensor(tensor, alignment):
     )
 
 
+def _ds_conv_chunks(conv_state, channel_in_warp, vector_idx, head_idx, slot):
+    """View one thread's DS conv state as three contiguous bf16x4 chunks.
+
+    In DS a channel's three history taps are adjacent, so the 4 channels x 3
+    taps a thread owns are 12 contiguous values; chunk c holds flat values
+    4c..4c+3, where flat value 3 * channel + tap.
+    """
+    taps = conv_state[(None, channel_in_warp, None, vector_idx, head_idx, slot)]
+    return cute.make_tensor(taps.iterator, cute.make_layout((4, 3), stride=(1, 4)))
+
+
 def _sigmoid(value):
     """Evaluate a cancellation-safe approximate sigmoid."""
     return cute.rcp(cute.exp(-value, fastmath=True) + 1.0, approx=True, ftz=True)
@@ -88,14 +101,18 @@ def _fused_kda_decode_kernel(
     A_log,
     raw_beta,
     state_indices,
+    query_start_loc,
+    packed_state_indices,
     state,
     output_gate,
     norm_weight,
     output,
+    packed_t1: cutlass.Constexpr,
     state_is_bf16: cutlass.Constexpr,
     use_lower_bound: cutlass.Constexpr,
     lower_bound: cutlass.Constexpr,
     norm_eps: cutlass.Constexpr,
+    conv_dim_first: cutlass.Constexpr,
 ):
     thread_idx, _, _ = cute.arch.thread_idx()
     head_idx, row_idx, _ = cute.arch.block_idx()
@@ -140,10 +157,38 @@ def _fused_kda_decode_kernel(
         cute.nvgpu.CopyUniversalOp(), BF16, num_bits_per_copy=64
     )
 
-    # Slot zero is a read-only null slot. Non-positive indices produce a zero
-    # output and suppress both cache updates while still following a uniform
-    # control-flow path through the CTA.
-    requested_slot = state_indices[row_idx]
+    # Slot zero is a read-only null slot. Packed T=1 resolves the sequence
+    # checkpoint in this kernel so the public wrapper has no metadata launch.
+    # Initialize before staged control flow; CuTe's Python staging requires
+    # values assigned in constexpr branches to have a definition visible on
+    # both paths.  The direct assignment below is eliminated for packed T=1.
+    requested_slot = cutlass.Int32(0)
+    if cutlass.const_expr(packed_t1):
+        num_sequences = packed_state_indices.shape[0]
+        row = cutlass.Int32(row_idx)
+        # For valid T=1 metadata, qsl[r + 1] == r + 1 proves that every
+        # preceding sequence has length one, so row r is sequence r.  Keep the
+        # endpoint load device-side: graph replay may change metadata.
+        identity = False
+        if row < num_sequences:
+            identity = query_start_loc[row + 1] == row + 1
+        if identity:
+            requested_slot = packed_state_indices[row, 0]
+        else:
+            lo = cutlass.Int32(0)
+            hi = num_sequences
+            while lo < hi:
+                mid = (lo + hi) // 2
+                if query_start_loc[mid + 1] <= row:
+                    lo = mid + 1
+                else:
+                    hi = mid
+            if lo < num_sequences:
+                requested_slot = packed_state_indices[lo, 0]
+            else:
+                requested_slot = cutlass.Int32(0)
+    else:
+        requested_slot = state_indices[row_idx]
     is_live = requested_slot > 0
     slot = cute.max(requested_slot, cutlass.Int32(0))
 
@@ -162,24 +207,44 @@ def _fused_kda_decode_kernel(
                 ),
                 weight_registers[(None, width_idx)],
             )
-        for history_idx in cutlass.range_constexpr(3):
-            cute.copy(
-                copy_bf16x4,
-                _aligned_tensor(
-                    conv_state[
-                        (
-                            None,
-                            channel_in_warp,
-                            history_idx,
-                            vector_idx,
-                            head_idx,
-                            slot,
-                        )
-                    ],
-                    8,
-                ),
-                conv_registers[(None, history_idx)],
+        if cutlass.const_expr(conv_dim_first):
+            # DS layout: load the thread's 12 contiguous values as three
+            # coalesced vectors, then transpose to (channel, tap) in registers.
+            conv_chunks = _ds_conv_chunks(
+                conv_state, channel_in_warp, vector_idx, head_idx, slot
             )
+            conv_flat = cute.make_rmem_tensor((4, 3), BF16)
+            for chunk_idx in cutlass.range_constexpr(3):
+                cute.copy(
+                    copy_bf16x4,
+                    _aligned_tensor(conv_chunks[(None, chunk_idx)], 8),
+                    conv_flat[(None, chunk_idx)],
+                )
+            for element_idx in cutlass.range_constexpr(4):
+                for history_idx in cutlass.range_constexpr(3):
+                    flat_idx = 3 * element_idx + history_idx
+                    conv_registers[(element_idx, history_idx)] = conv_flat[
+                        (flat_idx % 4, flat_idx // 4)
+                    ]
+        else:
+            for history_idx in cutlass.range_constexpr(3):
+                cute.copy(
+                    copy_bf16x4,
+                    _aligned_tensor(
+                        conv_state[
+                            (
+                                None,
+                                channel_in_warp,
+                                history_idx,
+                                vector_idx,
+                                head_idx,
+                                slot,
+                            )
+                        ],
+                        8,
+                    ),
+                    conv_registers[(None, history_idx)],
+                )
 
         mixed_registers = cute.make_rmem_tensor((4,), F32)
         for qkv_idx in cutlass.range_constexpr(4):
@@ -203,24 +268,42 @@ def _fused_kda_decode_kernel(
             _aligned_tensor(mixed_warp[(None, thread_idx)], 16),
         )
         if is_live:
-            for history_idx in cutlass.range_constexpr(3):
-                cute.copy(
-                    copy_bf16x4,
-                    conv_registers[(None, history_idx)],
-                    _aligned_tensor(
-                        conv_state[
-                            (
-                                None,
-                                channel_in_warp,
-                                history_idx,
-                                vector_idx,
-                                head_idx,
-                                slot,
-                            )
-                        ],
-                        8,
-                    ),
+            if cutlass.const_expr(conv_dim_first):
+                conv_chunks = _ds_conv_chunks(
+                    conv_state, channel_in_warp, vector_idx, head_idx, slot
                 )
+                conv_flat = cute.make_rmem_tensor((4, 3), BF16)
+                for element_idx in cutlass.range_constexpr(4):
+                    for history_idx in cutlass.range_constexpr(3):
+                        flat_idx = 3 * element_idx + history_idx
+                        conv_flat[(flat_idx % 4, flat_idx // 4)] = conv_registers[
+                            (element_idx, history_idx)
+                        ]
+                for chunk_idx in cutlass.range_constexpr(3):
+                    cute.copy(
+                        copy_bf16x4,
+                        conv_flat[(None, chunk_idx)],
+                        _aligned_tensor(conv_chunks[(None, chunk_idx)], 8),
+                    )
+            else:
+                for history_idx in cutlass.range_constexpr(3):
+                    cute.copy(
+                        copy_bf16x4,
+                        conv_registers[(None, history_idx)],
+                        _aligned_tensor(
+                            conv_state[
+                                (
+                                    None,
+                                    channel_in_warp,
+                                    history_idx,
+                                    vector_idx,
+                                    head_idx,
+                                    slot,
+                                )
+                            ],
+                            8,
+                        ),
+                    )
     elif thread_idx >= _NUM_THREADS - _HEAD_DIM:
         # Four otherwise-idle warps build the per-channel recurrence decay and
         # gated RMSNorm scale once, rather than recomputing them in every warp.
@@ -402,14 +485,18 @@ def _fused_kda_decode_launch(
     output_gate,
     norm_weight,
     output,
+    query_start_loc,
+    packed_state_indices,
     stream: cuda.CUstream,
     state_is_bf16: cutlass.Constexpr,
+    packed_t1: cutlass.Constexpr,
     use_lower_bound: cutlass.Constexpr,
     lower_bound: cutlass.Constexpr,
     norm_eps: cutlass.Constexpr,
+    conv_dim_first: cutlass.Constexpr,
 ):
     num_heads = A_log.shape[0]
-    num_rows = state_indices.shape[0]
+    num_rows = x.shape[0]
     hidden_size = num_heads * _HEAD_DIM
     qkv_size = 3 * hidden_size
 
@@ -427,18 +514,17 @@ def _fused_kda_decode_launch(
             stride=(1, 4, hidden_size, 4 * hidden_size, _HEAD_DIM),
         ),
     )
+    # (channel in vector, vector, history, q/k/v, head, slot). SD stores the
+    # three history columns as [3, 3 * H * 128] per slot, DS as [3 * H * 128, 3].
+    if cutlass.const_expr(conv_dim_first):
+        conv_strides = (3, 12, 1, 3 * hidden_size, 3 * _HEAD_DIM)
+    else:
+        conv_strides = (1, 4, qkv_size, hidden_size, _HEAD_DIM)
     conv_state_layout = cute.make_tensor(
         conv_state.iterator,
         cute.make_layout(
             (4, 32, 3, 3, num_heads, conv_state.shape[0]),
-            stride=(
-                1,
-                4,
-                qkv_size,
-                hidden_size,
-                _HEAD_DIM,
-                conv_state.stride[0],
-            ),
+            stride=(*conv_strides, conv_state.stride[0]),
         ),
     )
     gate_layout = cute.make_tensor(
@@ -496,14 +582,18 @@ def _fused_kda_decode_launch(
         A_log,
         beta_layout,
         state_indices,
+        query_start_loc,
+        packed_state_indices,
         state_layout,
         output_gate_layout,
         norm_weight_layout,
         output_layout,
+        packed_t1,
         state_is_bf16,
         use_lower_bound,
         lower_bound,
         norm_eps,
+        conv_dim_first,
     ).launch(
         grid=[num_heads, num_rows, 1],
         block=[_NUM_THREADS, 1, 1],
@@ -512,7 +602,7 @@ def _fused_kda_decode_launch(
     )
 
 
-def _make_compile_inputs(state_dtype):
+def _make_compile_inputs(state_dtype, conv_dim_first=False):
     """Build shape- and stride-dynamic inputs for CuTe compilation."""
     num_rows = cute.sym_int()
     num_heads = cute.sym_int()
@@ -535,11 +625,19 @@ def _make_compile_inputs(state_dtype):
         stride=(cute.sym_int64(), 1),
         assumed_align=16,
     )
+    # DS keeps a channel's three history taps contiguous; SD keeps channels
+    # contiguous within each tap.
+    if conv_dim_first:
+        conv_stride = (cute.sym_int64(), 3, 1)
+    else:
+        conv_stride = (cute.sym_int64(), 1, qkv_size)
+    # Both layouts move conv state as bf16x4 vectors, so the launcher only
+    # requires 8-byte aligned slots; do not assume more here.
     conv_state = cute.runtime.make_fake_tensor(
         BF16,
         shape=(conv_slots, qkv_size, 3),
-        stride=(cute.sym_int64(), 1, qkv_size),
-        assumed_align=16,
+        stride=conv_stride,
+        assumed_align=8,
     )
     raw_beta = cute.runtime.make_fake_tensor(
         BF16,
@@ -572,17 +670,30 @@ def _make_compile_inputs(state_dtype):
         raw_beta,
         compact((num_heads,), F32),
         compact((hidden_size,), F32),
-        compact((num_rows,), cutlass.Int32),
+        # This direct-ABI placeholder is also marshalled for packed T=1,
+        # where its runtime length is N rather than num_rows.  Keep its
+        # extent independent so TVM-FFI does not validate an unrelated
+        # row-count symbol before the constexpr-dead direct argument is
+        # eliminated.
+        compact((cute.sym_int(),), cutlass.Int32),
         state,
         output_gate,
         compact((_HEAD_DIM,), F32),
         compact((1, num_rows, num_heads, _HEAD_DIM), BF16),
+        cute.runtime.make_fake_tensor(
+            cutlass.Int32, (cute.sym_int(),), (1,), assumed_align=4
+        ),
+        cute.runtime.make_fake_tensor(
+            cutlass.Int32, (cute.sym_int(), 1), (1, 1), assumed_align=4
+        ),
         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
     )
 
 
 @functools.cache
-def _get_compiled_kernel(state_dtype, lower_bound, norm_eps):
+def _get_compiled_kernel(
+    state_dtype, lower_bound, norm_eps, packed_t1=False, conv_dim_first=False
+):
     """Get a shape-dynamic specialization from the two-level CuTe DSL cache."""
     state_is_bf16 = state_dtype == torch.bfloat16
     compile_state_dtype = BF16 if state_is_bf16 else F32
@@ -597,21 +708,48 @@ def _get_compiled_kernel(state_dtype, lower_bound, norm_eps):
     kernel_name = (
         f"d128_w4_{gate_name}_state{state_name}"
         f"_eps{str(float(norm_eps)).replace('.', '_').replace('-', 'm')}"
+        f"_packed{int(packed_t1)}"
+        f"{'_ds' if conv_dim_first else ''}"
     )
-    return build_and_load_cute_dsl_kernel(
+    kernel = build_and_load_cute_dsl_kernel(
         _CUTE_DSL_MODULE,
         kernel_name,
         lambda: cute.compile(
             _fused_kda_decode_launch,
-            *_make_compile_inputs(compile_state_dtype),
+            *_make_compile_inputs(compile_state_dtype, conv_dim_first),
             state_is_bf16,
+            packed_t1,
             use_lower_bound,
             compile_lower_bound,
             float(norm_eps),
+            conv_dim_first,
             options="--enable-tvm-ffi --generate-line-info",
         ),
         extra_key_files=_SOURCE_FILES,
     )
+    if packed_t1:
+        return kernel
+
+    # The launch ABI always carries both metadata tensors.  Direct T=1 uses
+    # views of state_indices as rank-compatible, unread placeholders; the
+    # constexpr specialization removes their device access.
+    def direct_kernel(*args):
+        state_indices = args[7]
+        kernel(*args, state_indices, state_indices.reshape(-1, 1))
+
+    return direct_kernel
+
+
+@functools.cache
+def _device_sm_count(device_index: int) -> int:
+    """Multiprocessor count of one CUDA device, queried once per process."""
+
+    return int(torch.cuda.get_device_properties(device_index).multi_processor_count)
+
+
+def _device_index(device) -> int:
+    index = device.index
+    return torch.cuda.current_device() if index is None else int(index)
 
 
 def _check_cuda_tensor(name, tensor, dtype):
@@ -663,6 +801,12 @@ def _select_cake_variant(
 
     num_rows = int(x.shape[0])
     num_heads = int(x.shape[1]) // (3 * _HEAD_DIM)
+    # Cake routes cover a subset of _SUPPORTED_HEADS (16 and 64 have none); the
+    # selector raises for other head counts, so fall back to CuTe DSL here.
+    if not any(
+        num_heads in rule.heads for variant in variants for rule in variant.eligibility
+    ):
+        return None
     state_dtype = "bfloat16" if state.dtype == torch.bfloat16 else "float32"
     return select_cake_fused_kda_decode_variant(
         target=target,
@@ -700,24 +844,63 @@ def _run_cake_variant(
     lower_bound,
     norm_eps,
 ) -> None:
+    """Submit the selected generated program on the caller-owned tensors.
+
+    Every buffer is the caller's storage (no staging, no allocation, no views):
+    padded rows and cache slots travel as the caller's strided tensors plus
+    their explicit strides, and the generated binding checks that layout.
+    Repeated-slot programs take the whole row set in one call: their binding
+    walks the rows in order with one launch each (grid ``(H, 1, 1)``, same
+    stream) so a slot shared by several rows observes every earlier update.
+    """
+
     module = load_cake_fused_kda_decode_module(variant.name, variant.target)
-    module.run(
-        x,
-        weight,
-        conv_state,
-        raw_gate,
-        raw_beta,
-        A_log,
-        dt_bias,
-        state_indices,
-        state,
-        output_gate,
-        norm_weight,
-        output,
-        int(lower_bound is not None),
-        0.0 if lower_bound is None else float(lower_bound),
-        float(norm_eps),
+    entry = getattr(module, variant.ffi_entry)
+    num_rows = int(x.shape[0])
+    num_heads = int(x.shape[1]) // (3 * _HEAD_DIM)
+    device_index = _device_index(x.device)
+    grid = cake_fused_kda_decode_grid(
+        variant,
+        num_heads=num_heads,
+        num_rows=num_rows,
+        sm_count=_device_sm_count(device_index),
     )
+    bindings = {
+        "grid_x": grid[0],
+        "grid_y": grid[1],
+        "grid_z": grid[2],
+        "device_index": device_index,
+        "x": x,
+        "weight": weight,
+        "conv_state": conv_state,
+        "raw_gate": raw_gate,
+        "raw_beta": raw_beta,
+        "A_log": A_log,
+        "dt_bias": dt_bias,
+        "state_indices": state_indices,
+        "state": state,
+        "output_gate": output_gate,
+        "norm_weight": norm_weight,
+        "output": output,
+        "x_row_stride": int(x.stride(0)),
+        "conv_slot_stride": int(conv_state.stride(0)),
+        "beta_row_stride": int(raw_beta.stride(1)),
+        "state_slot_stride": int(state.stride(0)),
+        "output_gate_row_stride": int(output_gate.stride(0)),
+        "H": num_heads,
+        "rows": num_rows,
+        "use_lower_bound": int(lower_bound is not None),
+        "lower_bound_log2": cake_fused_kda_decode_lower_bound_log2(lower_bound),
+        "norm_eps": float(norm_eps),
+    }
+    try:
+        arguments = [bindings[name] for _kind, name in variant.arg_plan]
+    except KeyError as exc:
+        raise RuntimeError(
+            f"Cake fused KDA program {variant.module} binds {exc.args[0]!r}, "
+            "which this host does not declare"
+        ) from None
+    entry(*arguments)
 
 
 @torch.no_grad()
@@ -739,6 +922,8 @@ def run_fused_kda_decode(
     *,
     backend: Literal["cute-dsl", "cake", "auto"] = "cute-dsl",
     state_indices_mode: CakeFusedKDADecodeStateIndicesMode | None = None,
+    query_start_loc: torch.Tensor | None = None,
+    packed_state_indices: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run fused Kimi decode and update both cache tensors in-place."""
     if backend not in ("cute-dsl", "cake", "auto"):
@@ -803,13 +988,19 @@ def run_fused_kda_decode(
         conv_state.ndim != 3
         or conv_state.shape[1:] != (3 * hidden_size, 3)
         or conv_state.stride(0) < 9 * hidden_size
-        or conv_state.stride(1) != 1
-        or conv_state.stride(2) != 3 * hidden_size
+        or conv_state.stride()[1:] not in ((1, 3 * hidden_size), (3, 1))
     ):
         raise ValueError(
-            "conv_state must have shape [slots, 3 * H * 128, 3] "
-            "and use the SD cache layout"
+            "conv_state must have shape [slots, 3 * H * 128, 3] and use the SD "
+            "(strides [slot, 1, 3 * H * 128]) or DS (strides [slot, 3, 1]) "
+            "cache layout"
         )
+    if conv_state.stride(0) % 4 or conv_state.data_ptr() % 8:
+        # Both layouts move conv state as bf16x4 vectors.
+        raise ValueError(
+            "conv_state slots must start 8-byte aligned (slot stride a multiple of 4)"
+        )
+    conv_dim_first = conv_state.stride(2) == 1
     if raw_gate.shape != (1, num_rows, num_heads, _HEAD_DIM):
         raise ValueError("raw_gate must have shape [1, num_rows, H, 128]")
     if not raw_gate.is_contiguous():
@@ -820,7 +1011,36 @@ def run_fused_kda_decode(
         raise ValueError("A_log must be contiguous with shape [H]")
     if dt_bias.shape != (hidden_size,) or not dt_bias.is_contiguous():
         raise ValueError("dt_bias must be contiguous with shape [H * 128]")
-    if state_indices.shape != (num_rows,) or not state_indices.is_contiguous():
+    if (query_start_loc is None) != (packed_state_indices is None):
+        raise ValueError(
+            "query_start_loc and packed_state_indices must be provided together"
+        )
+    packed_t1 = query_start_loc is not None
+    if packed_t1:
+        if packed_state_indices is None:
+            raise ValueError("packed_state_indices is required for packed T=1")
+        if (
+            query_start_loc.ndim != 1
+            or packed_state_indices.ndim != 2
+            or packed_state_indices.shape[1] != 1
+            or query_start_loc.shape[0] != packed_state_indices.shape[0] + 1
+            or not query_start_loc.is_contiguous()
+            or not packed_state_indices.is_contiguous()
+        ):
+            raise ValueError("invalid packed T=1 metadata shapes or strides")
+        if (
+            query_start_loc.dtype != torch.int32
+            or packed_state_indices.dtype != torch.int32
+        ):
+            raise TypeError("packed T=1 metadata must have dtype torch.int32")
+        if (
+            query_start_loc.device != x.device
+            or packed_state_indices.device != x.device
+        ):
+            raise ValueError("packed T=1 metadata must be on the same device as x")
+        if state_indices.shape not in ((num_rows,), (packed_state_indices.shape[0],)):
+            raise ValueError("state_indices must have shape [num_rows] or [N]")
+    elif state_indices.shape != (num_rows,) or not state_indices.is_contiguous():
         raise ValueError("state_indices must be contiguous with shape [num_rows]")
     if (
         state.ndim != 4
@@ -869,8 +1089,11 @@ def run_fused_kda_decode(
                 "output must be contiguous with shape [1, num_rows, H, 128]"
             )
 
+    if packed_t1 and backend != "cute-dsl":
+        raise ValueError("packed T=1 metadata requires backend='cute-dsl'")
+
     cake_variant = None
-    if backend != "cute-dsl" and state_indices_mode is not None:
+    if backend != "cute-dsl" and state_indices_mode is not None and not conv_dim_first:
         cake_variant = _select_cake_variant(
             x=x,
             conv_state=conv_state,
@@ -907,8 +1130,14 @@ def run_fused_kda_decode(
             "dtype, scalar configuration, and state_indices_mode"
         )
 
-    kernel = _get_compiled_kernel(state.dtype, lower_bound, float(norm_eps))
-    kernel(
+    kernel = _get_compiled_kernel(
+        state.dtype,
+        lower_bound,
+        float(norm_eps),
+        packed_t1=packed_t1,
+        conv_dim_first=conv_dim_first,
+    )
+    args = (
         x,
         weight,
         conv_state,
@@ -922,4 +1151,8 @@ def run_fused_kda_decode(
         norm_weight,
         output,
     )
+    if packed_t1:
+        kernel(*args, query_start_loc, packed_state_indices)
+    else:
+        kernel(*args)
     return output

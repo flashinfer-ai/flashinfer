@@ -18,6 +18,10 @@
       "value": 4,
       "description": "Fixed query length per request."
     },
+    "workspace_size": {
+      "type": "var",
+      "description": "Optional caller scratch size in bytes."
+    },
     "num_qo_heads": {
       "type": "const",
       "value": 32
@@ -47,6 +51,15 @@
       "type": "var",
       "description": "Length of cumulative Q offsets."
     },
+    "kv_storage_head_dim": {
+      "type": "const",
+      "value": 128,
+      "description": "Stored K/V width; D/2 for packed NVFP4."
+    },
+    "kv_scale_groups": {
+      "type": "var",
+      "description": "NVFP4 scale groups; one per 16 logical values."
+    },
     "storage_page_size": {
       "type": "const",
       "value": 32
@@ -55,6 +68,8 @@
   "constraints": [
     "head_dim in (64, 128, 256)",
     "page_size in (4, 8, 16, 32, 64, 128)",
+    "kv_storage_head_dim in (head_dim, head_dim // 2)",
+    "k_sf_cache is None or kv_scale_groups * 16 == head_dim",
     "storage_page_size > page_size",
     "storage_page_size % page_size == 0",
     "max_pages_per_seq * page_size >= max(seq_lens_kv)",
@@ -80,7 +95,7 @@
         "num_pages",
         "num_kv_heads",
         "storage_page_size",
-        "head_dim"
+        "kv_storage_head_dim"
       ],
       "dtype": "bfloat16"
     },
@@ -89,7 +104,7 @@
         "num_pages",
         "num_kv_heads",
         "storage_page_size",
-        "head_dim"
+        "kv_storage_head_dim"
       ],
       "dtype": "bfloat16"
     },
@@ -106,6 +121,23 @@
       ],
       "dtype": "int32"
     },
+    "workspace_buffer": {
+      "shape": [
+        "workspace_size"
+      ],
+      "dtype": "uint8",
+      "optional": true
+    },
+    "max_kv_len": {
+      "shape": null,
+      "dtype": "int32",
+      "optional": true
+    },
+    "validate": {
+      "shape": null,
+      "dtype": "bool",
+      "optional": true
+    },
     "qo_indptr": {
       "shape": [
         "len_qo_indptr"
@@ -113,12 +145,32 @@
       "dtype": "int32",
       "optional": true
     },
+    "k_sf_cache": {
+      "shape": [
+        "num_pages",
+        "num_kv_heads",
+        "storage_page_size",
+        "kv_scale_groups"
+      ],
+      "dtype": "float8_e4m3fn",
+      "optional": true
+    },
+    "v_sf_cache": {
+      "shape": [
+        "num_pages",
+        "num_kv_heads",
+        "storage_page_size",
+        "kv_scale_groups"
+      ],
+      "dtype": "float8_e4m3fn",
+      "optional": true
+    },
     "seq_len_q": {
       "shape": null,
       "dtype": "int32",
       "optional": true
     },
-    "max_seq_len_q": {
+    "max_q_len": {
       "shape": null,
       "dtype": "int32",
       "optional": true
@@ -138,12 +190,12 @@
       "dtype": "string",
       "optional": true
     },
-    "bmm1_scale": {
+    "softmax_scale": {
       "shape": null,
       "dtype": "float32",
       "optional": true
     },
-    "bmm2_scale": {
+    "output_scale": {
       "shape": null,
       "dtype": "float32",
       "optional": true

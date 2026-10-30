@@ -25,14 +25,14 @@ namespace flashinfer {
 
 template <bool SAME_KV_STRIDES, uint32_t CTA_TILE_Q, uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO,
           PosEncodingMode POS_ENCODING_MODE, bool USE_FP16_QK_REDUCTION, MaskMode MASK_MODE,
-          typename AttentionVariant, typename Params>
+          bool USE_TOKEN_HEAD_SF, typename AttentionVariant, typename Params>
 cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params params, typename Params::DTypeO* tmp_v,
                                                    float* tmp_s, bool enable_pdl,
                                                    cudaStream_t stream);
 
 template <uint32_t CTA_TILE_Q, uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO,
           PosEncodingMode POS_ENCODING_MODE, bool USE_FP16_QK_REDUCTION, MaskMode MASK_MODE,
-          typename AttentionVariant, typename Params>
+          bool USE_TOKEN_HEAD_SF, typename AttentionVariant, typename Params>
 cudaError_t BatchPrefillWithRaggedKVCacheDispatched(Params params, typename Params::DTypeO* tmp_v,
                                                     float* tmp_s, bool enable_pdl,
                                                     cudaStream_t stream);
@@ -50,7 +50,8 @@ Array<int64_t> BatchPrefillWithKVCachePlan(
     TensorView kv_len_arr, int64_t total_num_rows, int64_t batch_size, int64_t num_qo_heads,
     int64_t num_kv_heads, int64_t page_size, bool enable_cuda_graph, int64_t head_dim_qk,
     int64_t head_dim_vo, bool causal, int64_t window_left, int64_t fixed_split_size,
-    bool disable_split_kv, int64_t num_colocated_ctas = 0, int64_t uniform_q_len = 0) {
+    bool disable_split_kv, int64_t num_colocated_ctas = 0, int64_t uniform_q_len = 0,
+    bool fixed_uniform_q_len = false) {
   size_t float_workspace_size_in_bytes =
       float_workspace_buffer.size(0) * get_element_size(float_workspace_buffer);
   size_t int_workspace_size_in_bytes =
@@ -67,7 +68,7 @@ Array<int64_t> BatchPrefillWithKVCachePlan(
       static_cast<IdType*>(kv_indptr.data_ptr()), total_num_rows, batch_size, num_qo_heads,
       num_kv_heads, head_dim_qk, head_dim_vo, page_size, enable_cuda_graph,
       /*sizeof_dtype_o=*/2, window_left, fixed_split_size, disable_split_kv, num_colocated_ctas,
-      uniform_q_len, stream, /*kv_dtype_bytes=*/sizeof(DTypeKV));
+      uniform_q_len, fixed_uniform_q_len, stream, /*kv_dtype_bytes=*/sizeof(DTypeKV));
 
   TVM_FFI_ICHECK(status == cudaSuccess)
       << "Failed to plan prefill with error: " << cudaGetErrorString(status);
@@ -80,7 +81,7 @@ Array<int64_t> BatchPrefillWithKVCacheWorkspaceSize(
     int64_t total_num_rows, int64_t batch_size, int64_t num_qo_heads, int64_t num_kv_heads,
     int64_t page_size, bool enable_cuda_graph, int64_t head_dim_qk, int64_t head_dim_vo,
     bool causal, int64_t window_left, int64_t fixed_split_size, bool disable_split_kv,
-    int64_t num_colocated_ctas = 0, int64_t uniform_q_len = 0) {
+    int64_t num_colocated_ctas = 0, int64_t uniform_q_len = 0, bool fixed_uniform_q_len = false) {
   (void)kv_len_arr;
   (void)causal;
   size_t float_workspace_size_in_bytes = 0;
@@ -93,7 +94,8 @@ Array<int64_t> BatchPrefillWithKVCacheWorkspaceSize(
       static_cast<IdType*>(qo_indptr.data_ptr()), static_cast<IdType*>(kv_indptr.data_ptr()),
       total_num_rows, batch_size, num_qo_heads, num_kv_heads, head_dim_qk, head_dim_vo, page_size,
       enable_cuda_graph, /*sizeof_dtype_o=*/2, window_left, fixed_split_size, disable_split_kv,
-      num_colocated_ctas, uniform_q_len, stream, /*kv_dtype_bytes=*/sizeof(DTypeKV));
+      num_colocated_ctas, uniform_q_len, fixed_uniform_q_len, stream,
+      /*kv_dtype_bytes=*/sizeof(DTypeKV));
 
   TVM_FFI_ICHECK(status == cudaSuccess)
       << "Failed to calculate prefill workspace size with error: " << cudaGetErrorString(status);
@@ -209,14 +211,12 @@ void BatchPrefillWithRaggedKVCacheRun(TensorView float_workspace_buffer,
               GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.merge_indptr_offset);
           tmp_v = GetPtrFromBaseOffset<DTypeO>(float_buffer_ptr, plan_info.v_offset);
           tmp_s = GetPtrFromBaseOffset<float>(float_buffer_ptr, plan_info.s_offset);
-          if (plan_info.enable_cuda_graph) {
-            params.block_valid_mask =
-                GetPtrFromBaseOffset<bool>(int_buffer_ptr, plan_info.block_valid_mask_offset);
-          }
         }
         params.padded_batch_size = plan_info.padded_batch_size;
         params.max_total_num_rows = plan_info.total_num_rows;
         if (plan_info.enable_cuda_graph) {
+          params.block_valid_mask =
+              GetPtrFromBaseOffset<bool>(int_buffer_ptr, plan_info.block_valid_mask_offset);
           params.total_num_rows =
               GetPtrFromBaseOffset<uint32_t>(int_buffer_ptr, plan_info.total_num_rows_offset);
         }
@@ -226,8 +226,8 @@ void BatchPrefillWithRaggedKVCacheRun(TensorView float_workspace_buffer,
         DISPATCH_CTA_TILE_Q(plan_info.cta_tile_q, CTA_TILE_Q, {
           status = flashinfer::BatchPrefillWithRaggedKVCacheDispatched<
               CTA_TILE_Q, HEAD_DIM_QK, HEAD_DIM_VO, POS_ENCODING_MODE,
-              /*use_fp16_qk_reduction=*/USE_FP16_QK_REDUCTION, MASK_MODE, AttentionVariant,
-              RaggedParams>(params, tmp_v, tmp_s, enable_pdl, stream);
+              /*use_fp16_qk_reduction=*/USE_FP16_QK_REDUCTION, MASK_MODE, USE_TOKEN_HEAD_SF,
+              AttentionVariant, RaggedParams>(params, tmp_v, tmp_s, enable_pdl, stream);
         });
 
         TVM_FFI_ICHECK(status == cudaSuccess)

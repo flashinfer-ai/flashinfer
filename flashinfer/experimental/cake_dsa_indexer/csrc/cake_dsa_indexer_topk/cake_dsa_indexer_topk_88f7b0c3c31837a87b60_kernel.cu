@@ -1,0 +1,2323 @@
+/*
+ * Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+// Common preamble (typedefs, tensor-map ABI, compiler helpers) shared by this export's kernels.
+#include "cake_dsa_indexer_topk_device_common.cuh"
+
+#define CAKE_INF CUDART_INF_F
+#define TMEM_NCOLS 384
+#define TMEM_TMEM_ACC_OFFSET 0
+#define NUM_Q_PIPE_STAGES 1
+#define NUM_K_PIPE_STAGES 4
+#define NUM_TMEM_PIPE_STAGES 2
+#define NUM_TMEM_LAP_PIPE_STAGES 1
+#define NUM_VERDICT_PIPE_STAGES 1
+#define NUM_TK_PIPE_STAGES 2
+#define NUM_TK_PEER_PIPE_STAGES 1
+#define NUM_PEER_PIPE_STAGES 1
+#define SMEM_SMEM_Q_OFF 1024
+#define SMEM_SMEM_Q_STAGE_BYTES 49152
+#define SMEM_SMEM_Q_STRIDE 49152
+#define SMEM_SMEM_W_OFF 50176
+#define SMEM_SMEM_W_STAGE_BYTES 768
+#define SMEM_SMEM_W_STRIDE 768
+#define SMEM_SMEM_K_OFF 51200
+#define SMEM_SMEM_K_STAGE_BYTES 32768
+#define SMEM_SMEM_K_STRIDE 32768
+#define SMEM_S_HIST_OFF 182272
+#define SMEM_S_HIST_STAGE_BYTES 12288
+#define SMEM_S_HIST_STRIDE 12288
+#define SMEM_S_COUNT_OFF 194560
+#define SMEM_S_COUNT_STAGE_BYTES 72
+#define SMEM_S_COUNT_STRIDE 72
+#define SMEM_S_TAU_OFF 194632
+#define SMEM_S_TAU_STAGE_BYTES 144
+#define SMEM_S_TAU_STRIDE 144
+#define SMEM_S_FAIL_OFF 194776
+#define SMEM_S_FAIL_STAGE_BYTES 24
+#define SMEM_S_FAIL_STRIDE 24
+#define SMEM_S_TK_OFF 194840
+#define SMEM_S_TK_STAGE_BYTES 32
+#define SMEM_S_TK_STRIDE 32
+#define SMEM_S_PFAIL_OFF 194808
+#define SMEM_S_PFAIL_STAGE_BYTES 8
+#define SMEM_S_PFAIL_STRIDE 8
+#define SMEM_TOTAL 194944
+#define TILE_UNROLL 1
+#define LAUNCH_MIN_BLOCKS 1
+
+extern "C" {
+
+__global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS) __cluster_dims__(2,1,1) void
+kernel_cake_dsa_indexer_topk_88f7b0c3c31837a87b60(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap K, const __grid_constant__ CUtensorMap W, int* __restrict__ cu_seqlens_q, int* __restrict__ cu_seqlens_k, long long* __restrict__ q_offsets, int* __restrict__ Indices, float* __restrict__ Scores, long long* __restrict__ Cand, int num_segments, int top_k, int ratio, int has_offsets, int cand_cap, int first_cap, int sample_tiles_max, int sample_shift_permille, int far_sample, int check_period, int grid_ctas, float softmax_scale, int n_split)
+{
+    const int tid = threadIdx.x;
+    const int warp = make_warp_uniform(tid / 32);
+    const int lane = tid % 32;
+
+    extern __shared__ __align__(1024) char smem_raw[];
+    int smem;
+#if __CUDA_ARCH__ == 1000
+    asm volatile("{ .reg .u64 smem_ptr; cvta.to.shared.u64 smem_ptr, %1; cvt.u32.u64 %0, smem_ptr; }" : "=r"(smem) : "l"(smem_raw));
+    smem = make_warp_uniform(smem);
+#else
+    smem = (int)(unsigned long long)__cvta_generic_to_shared(smem_raw);
+#endif
+
+    const int mbar_base = smem;
+    #define q_full_addr (mbar_base + 0)
+    #define q_empty_addr (mbar_base + 8)
+    #define k_full_addr (mbar_base + 16)
+    #define k_empty_addr (mbar_base + 48)
+    #define umma_full_addr (mbar_base + 80)
+    #define umma_empty_addr (mbar_base + 96)
+    #define verdict_bar_addr (mbar_base + 112)
+    #define tk_ack_addr (mbar_base + 120)
+    #define tk_peer_addr (mbar_base + 136)
+    #define peer_bar_addr (mbar_base + 144)
+
+    const int bid = blockIdx.x;
+    const int num_bids = gridDim.x;
+    const unsigned int clusters_x = gridDim.x / 2;
+    const unsigned int cluster_id = ((blockIdx.z * gridDim.y + blockIdx.y) * clusters_x) + blockIdx.x / 2;
+    const unsigned int num_clusters = clusters_x * gridDim.y * gridDim.z;
+
+    int cta_rank;
+    asm volatile("mov.b32 %0, %%cluster_ctarank;" : "=r"(cta_rank));
+
+    // Kernel setup ops
+    __nv_bfloat16* smem_q = reinterpret_cast<__nv_bfloat16*>(smem_raw + 1024);
+    const int smem_q_addr = smem + 1024;
+    float* smem_w = reinterpret_cast<float*>(smem_raw + 50176);
+    const int smem_w_addr = smem + 50176;
+    __nv_bfloat16* smem_k = reinterpret_cast<__nv_bfloat16*>(smem_raw + 51200);
+    const int smem_k_addr = smem + 51200;
+    int* s_hist = reinterpret_cast<int*>(smem_raw + 182272);
+    const int s_hist_addr = smem + 182272;
+    int* s_count = reinterpret_cast<int*>(smem_raw + 194560);
+    const int s_count_addr = smem + 194560;
+    int* s_tau = reinterpret_cast<int*>(smem_raw + 194632);
+    const int s_tau_addr = smem + 194632;
+    int* s_fail = reinterpret_cast<int*>(smem_raw + 194776);
+    const int s_fail_addr = smem + 194776;
+    int* s_tk = reinterpret_cast<int*>(smem_raw + 194840);
+    const int s_tk_addr = smem + 194840;
+    int* s_pfail = reinterpret_cast<int*>(smem_raw + 194808);
+    const int s_pfail_addr = smem + 194808;
+    if (warp == 12) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&Q))) : "memory"); }
+    if (warp == 12) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&K))) : "memory"); }
+    if (warp == 12) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&W))) : "memory"); }
+
+    // Mbarrier init (10 pipeline groups, 0 ordered-sequence groups, 19 barriers)
+    // Mbarriers at smem_raw[0..152)
+
+    if (warp == 13) {
+        uint32_t leader = elect_sync();
+        if (leader) {
+            // --- pipeline 'q_pipe' ---
+            // q_full: 1 barriers, init_count=1
+            mbarrier_init(smem + 0, 1);
+            // q_empty: 1 barriers, init_count=416
+            mbarrier_init(smem + 8, 416);
+            // --- pipeline 'k_pipe' ---
+            // k_full: 4 barriers, init_count=1
+            mbarrier_init(smem + 16, 1);
+            mbarrier_init(smem + 24, 1);
+            mbarrier_init(smem + 32, 1);
+            mbarrier_init(smem + 40, 1);
+            // k_empty: 4 barriers, init_count=2
+            mbarrier_init(smem + 48, 2);
+            mbarrier_init(smem + 56, 2);
+            mbarrier_init(smem + 64, 2);
+            mbarrier_init(smem + 72, 2);
+            // --- pipeline 'tmem_pipe' ---
+            // umma_full: 2 barriers, init_count=1
+            mbarrier_init(smem + 80, 1);
+            mbarrier_init(smem + 88, 1);
+            // umma_empty: 2 barriers, init_count=384
+            mbarrier_init(smem + 96, 384);
+            mbarrier_init(smem + 104, 384);
+            // --- pipeline 'verdict_pipe' ---
+            // verdict_bar: 1 barriers, init_count=13
+            mbarrier_init(smem + 112, 13);
+            // --- pipeline 'tk_pipe' ---
+            // tk_ack: 2 barriers, init_count=14
+            mbarrier_init(smem + 120, 14);
+            mbarrier_init(smem + 128, 14);
+            // --- pipeline 'tk_peer_pipe' ---
+            // tk_peer: 1 barriers, init_count=1
+            mbarrier_init(smem + 136, 1);
+            // --- pipeline 'peer_pipe' ---
+            // peer_bar: 1 barriers, init_count=1
+            mbarrier_init(smem + 144, 1);
+            asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+        }
+    }
+
+    __syncwarp();
+
+    // TMEM alloc (512 columns, 384 used)
+    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 152);
+    if (warp == 14) {
+        int _tmem_hold = smem + 152;
+        asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(512) : "memory");
+        __syncwarp();
+    }
+
+    __syncthreads();
+    asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");
+    asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
+    asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
+
+    const int taddr = tmem_addr_storage[0];
+
+    // Kernel post-init ops
+    const int tmem_tmem_acc = taddr;
+    asm volatile("griddepcontrol.wait;" ::: "memory");
+    if (warp == 0) {
+        if (elect_sync()) {
+            int n_total_0 = 0;
+            #pragma unroll 1
+            for (int s_t = 0; s_t < num_segments; s_t++) {
+                int lq_t = cu_seqlens_q[s_t + 1] - cu_seqlens_q[s_t];
+                int nb_t = (lq_t + 6 - 1) / 6;
+                n_total_0 += (nb_t + 1) / 2;
+            }
+            int tk_limit_0 = n_total_0 + grid_ctas / 2 - 1;
+            s_tk[2] = tk_limit_0;
+            s_tk[3] = n_total_0;
+            long long tk_off_0 = (long long)grid_ctas * (long long)(6 * cand_cap);
+            if (n_total_0 <= grid_ctas / 2) {
+                s_tk[0] = (int)bid / 2;
+                s_tk[1] = n_total_0;
+                s_tk[4] = (int)bid / 2;
+                s_tk[5] = n_total_0;
+            } else if (((int)bid & 1) == 0) {
+                uint32_t _atomic_fetch_inc_0;
+                asm volatile("atom.acq_rel.gpu.global.inc.u32 %0, [%1], %2;"
+                    : "=r"(_atomic_fetch_inc_0) : "l"(reinterpret_cast<unsigned int*>(Cand + tk_off_0)), "r"(static_cast<uint32_t>((unsigned int)tk_limit_0)) : "memory");
+                s_tk[0] = (int)_atomic_fetch_inc_0;
+            }
+        }
+    }
+    asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");
+    asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
+    if (((int)bid & 1) != 0) {
+        if (warp == 0) {
+            if (elect_sync()) {
+                unsigned int tk_copy[1];
+                uint32_t _cluster_mapa_1;
+                asm volatile(
+                    "mapa.shared::cluster.u32 %0, %1, %2;"
+                    : "=r"(_cluster_mapa_1) : "r"(s_tk_addr), "r"(0));
+                asm volatile("ld.shared::cluster.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&tk_copy[0])) : "r"(_cluster_mapa_1));
+                s_tk[0] = (int)tk_copy[0];
+            }
+        }
+    }
+    __syncthreads();
+
+    // ---- Role: load_q ----
+    if (warp == 12) {
+        asm volatile("setmaxnreg.dec.sync.aligned.u32 56;");
+        { // load_q_main
+            unsigned int _phase_q_empty = 1;
+            unsigned int _phase_tk_ack = 1;
+            unsigned int _phase_tk_peer = 0;
+            unsigned int _phase_q_full = 0;
+            unsigned int _phase_verdict_bar = 0;
+            if (elect_sync()) {
+                int unit_base_q = 0;
+                unsigned int vphase_q = 0;
+                int tk_q = s_tk[0];
+                int tkp_q = 1;
+                unsigned int tk_limit_q = (unsigned int)s_tk[2];
+                int n_tot_q = s_tk[3];
+                int g_units_q = grid_ctas / 2;
+                long long tk_off_q = (long long)grid_ctas * (long long)(6 * cand_cap);
+                unsigned int ack_q = 0;
+                ack_q += 1;
+                if (ack_q == 2) { ack_q = 0; _phase_tk_ack ^= 1; }
+                int nunit_q = 0;
+                int rank_q = (int)bid & 1;
+                #pragma unroll 1
+                for (int seg = 0; seg < num_segments; seg++) {
+                    int q0 = cu_seqlens_q[seg];
+                    int lq = cu_seqlens_q[seg + 1] - q0;
+                    int nb = (lq + 6 - 1) / 6;
+                    int cnt_q = (nb + 1) / 2;
+                    #pragma unroll 1
+                    for (int rnd = 0; rnd < cnt_q + 1; rnd++) {
+                        int unit = tk_q;
+                        if (unit >= unit_base_q + cnt_q) {
+                            break;
+                        }
+                        tkp_q ^= 1;
+                        int _min_0 = ((unit - unit_base_q) < (unit_base_q + (nb + 1) / 2 - 1 - unit) ? (unit - unit_base_q) : (unit_base_q + (nb + 1) / 2 - 1 - unit));
+                        if (_min_0 >= 0) {
+                            int rel = unit - unit_base_q;
+                            int blk0 = nb - 1 - 2 * rel;
+                            int blk = blk0 - rank_q;
+                            if (blk < 0) {
+                                blk = 0;
+                            }
+                            #pragma unroll 1
+                            for (int attempt = 0; attempt < 2; attempt++) {
+                                mbarrier_wait(q_empty_addr, _phase_q_empty);
+                                tma_3d_gmem2smem(smem_q_addr + 0 * 49152, (&Q), 0, (q0 + blk * 6) * 32, 0, q_full_addr);
+                                tma_2d_gmem2smem(smem_w_addr + 0 * 768, (&W), 0, q0 + blk * 6, q_full_addr);
+                                int tx_q = 49920;
+                                if (attempt == 0) {
+                                    if (nunit_q >= 1) {
+                                        mbarrier_wait(tk_ack_addr + (ack_q) * 8, _phase_tk_ack);
+                                    }
+                                    if (n_tot_q > g_units_q) {
+                                        if (rank_q == 0) {
+                                            if (nunit_q >= 1) {
+                                                mbarrier_arrive_expect_tx(tk_peer_addr, 4);
+                                                mbarrier_wait_cluster_hint(tk_peer_addr, _phase_tk_peer, 10000000);
+                                                _phase_tk_peer ^= 1;
+                                            }
+                                            uint32_t _atomic_fetch_inc_1;
+                                            asm volatile("atom.acq_rel.gpu.global.inc.u32 %0, [%1], %2;"
+                                                : "=r"(_atomic_fetch_inc_1) : "l"(reinterpret_cast<unsigned int*>(Cand + tk_off_q)), "r"(static_cast<uint32_t>(tk_limit_q)) : "memory");
+                                            int drawn_q = (int)_atomic_fetch_inc_1;
+                                            s_tk[tkp_q ^ 1] = drawn_q;
+                                            tk_q = drawn_q;
+                                            uint32_t _cluster_mapa_2;
+                                            asm volatile(
+                                                "mapa.shared::cluster.u32 %0, %1, %2;"
+                                                : "=r"(_cluster_mapa_2) : "r"(s_tk_addr + (unsigned int)(16 + (tkp_q ^ 1) * 4)), "r"(1));
+                                            uint32_t _mbar_peer_3;
+                                            asm(
+                                                "mapa.shared::cluster.u32 %0, %1, %2;"
+                                                : "=r"(_mbar_peer_3) : "r"(q_full_addr), "r"(1));
+                                            asm volatile(
+                                                "st.async.shared::cluster.mbarrier::complete_tx::bytes.b32 [%0], %1, [%2];"
+                                                :: "r"(_cluster_mapa_2), "r"(drawn_q), "r"(_mbar_peer_3) : "memory");
+                                        }
+                                        tx_q += rank_q * 4;
+                                    } else {
+                                        tk_q = n_tot_q;
+                                    }
+                                }
+                                mbarrier_arrive_expect_tx(q_full_addr, tx_q);
+                                if (attempt == 0) {
+                                    if (rank_q != 0) {
+                                        mbarrier_wait(q_full_addr, _phase_q_full);
+                                        int tk_in_q = s_tk[4 + (tkp_q ^ 1)];
+                                        s_tk[tkp_q ^ 1] = tk_in_q;
+                                        tk_q = tk_in_q;
+                                        if (n_tot_q > g_units_q) {
+                                            uint32_t _cluster_mapa_4;
+                                            asm volatile(
+                                                "mapa.shared::cluster.u32 %0, %1, %2;"
+                                                : "=r"(_cluster_mapa_4) : "r"(s_tk_addr + 24), "r"(0));
+                                            uint32_t _mbar_peer_5;
+                                            asm(
+                                                "mapa.shared::cluster.u32 %0, %1, %2;"
+                                                : "=r"(_mbar_peer_5) : "r"(tk_peer_addr), "r"(0));
+                                            asm volatile(
+                                                "st.async.shared::cluster.mbarrier::complete_tx::bytes.b32 [%0], %1, [%2];"
+                                                :: "r"(_cluster_mapa_4), "r"(tk_in_q), "r"(_mbar_peer_5) : "memory");
+                                            _phase_tk_peer ^= 1;
+                                        }
+                                    }
+                                    mbarrier_arrive(verdict_bar_addr);
+                                }
+                                _phase_q_empty ^= 1;
+                                _phase_q_full ^= 1;
+                                if (attempt == 0) {
+                                    mbarrier_wait(verdict_bar_addr, _phase_verdict_bar);
+                                    _phase_verdict_bar ^= 1;
+                                    ack_q += 1;
+                                    if (ack_q == 2) { ack_q = 0; _phase_tk_ack ^= 1; }
+                                    nunit_q += 1;
+                                    if (s_pfail[1] == 0) {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    unit_base_q += (nb + 1) / 2;
+                }
+            }
+            __syncwarp();
+        }
+    // ---- Role: load_k ----
+    } else if (warp == 13) {
+        asm volatile("setmaxnreg.dec.sync.aligned.u32 56;");
+        { // load_k_main
+            unsigned int load_k_stage = 0;
+            unsigned int _phase_k_empty = 1;
+            unsigned int _phase_verdict_bar_1 = 0;
+            if (elect_sync()) {
+                int unit_base_k = 0;
+                unsigned int vphase_k = 0;
+                int tk_k = s_tk[0];
+                int tkp_k = 1;
+                unsigned int ack_k = 0;
+                mbarrier_arrive(tk_ack_addr + (ack_k) * 8);
+                ack_k += 1;
+                if (ack_k == 2) { ack_k = 0; }
+                int rank_k = (int)bid & 1;
+                #pragma unroll 1
+                for (int seg_1 = 0; seg_1 < num_segments; seg_1++) {
+                    int q0_1 = cu_seqlens_q[seg_1];
+                    int lq_1 = cu_seqlens_q[seg_1 + 1] - q0_1;
+                    int k0 = cu_seqlens_k[seg_1];
+                    int nb_1 = (lq_1 + 6 - 1) / 6;
+                    int cnt_k = (nb_1 + 1) / 2;
+                    #pragma unroll 1
+                    for (int rnd_1 = 0; rnd_1 < cnt_k + 1; rnd_1++) {
+                        int unit_1 = tk_k;
+                        if (unit_1 >= unit_base_k + cnt_k) {
+                            break;
+                        }
+                        tkp_k ^= 1;
+                        int _min_0_1 = ((unit_1 - unit_base_k) < (unit_base_k + (nb_1 + 1) / 2 - 1 - unit_1) ? (unit_1 - unit_base_k) : (unit_base_k + (nb_1 + 1) / 2 - 1 - unit_1));
+                        if (_min_0_1 >= 0) {
+                            int rel_1 = unit_1 - unit_base_k;
+                            int blk0_1 = nb_1 - 1 - 2 * rel_1;
+                            int blk_1 = blk0_1 - rank_k;
+                            int q0_0 = cu_seqlens_q[seg_1];
+                            int lq_0 = cu_seqlens_q[seg_1 + 1] - q0_0;
+                            int lk = cu_seqlens_k[seg_1 + 1] - cu_seqlens_k[seg_1];
+                            long long off = 0;
+                            if (has_offsets != 0) {
+                                off = q_offsets[seg_1];
+                            } else if (ratio == 1) {
+                                off = (long long)lk - (long long)lq_0;
+                            }
+                            long long off_1 = off;
+                            int last_u = ((blk0_1 * 6 + 5) < (lq_0 - 1) ? (blk0_1 * 6 + 5) : (lq_0 - 1));
+                            long long num = off_1 + (long long)last_u + 1;
+                            int vis = 0;
+                            if (num > 0) {
+                                long long quotient = num / (long long)ratio;
+                                long long lk64 = (long long)lk;
+                                long long bounded = ((quotient < lk64) ? quotient : lk64);
+                                vis = (int)bounded;
+                            }
+                            int v_max = vis;
+                            int n_tiles = (v_max + 128 - 1) / 128;
+                            int n_tiles_3 = n_tiles;
+                            int max_tiles = ((sample_tiles_max) < (cand_cap / 128 - check_period) ? (sample_tiles_max) : (cand_cap / 128 - check_period));
+                            int stride = 1;
+                            int n_sample = 0;
+                            if (max_tiles >= 2) {
+                                if (n_tiles_3 * 128 + 128 > cand_cap) {
+                                    stride = (n_tiles_3 + max_tiles - 1) / max_tiles;
+                                    if (stride >= 2) {
+                                        n_sample = (n_tiles_3 + stride - 1) / stride;
+                                    }
+                                }
+                            }
+                            if (max_tiles >= 2) {
+                                if (n_tiles_3 * 128 + 128 <= cand_cap) {
+                                    if (n_tiles_3 * 64 > top_k) {
+                                        int cap_fit = ((max_tiles) < (8) ? (max_tiles) : (8));
+                                        if (cap_fit >= 2) {
+                                            stride = (n_tiles_3 + cap_fit - 1) / cap_fit;
+                                            if (stride >= 2) {
+                                                n_sample = (n_tiles_3 + stride - 1) / stride;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            #pragma unroll 1
+                            for (int attempt_1 = 0; attempt_1 < 2; attempt_1++) {
+                                int n_s_k = n_sample;
+                                if (attempt_1 != 0) {
+                                    n_s_k = 0;
+                                }
+                                int d_k = 0;
+                                int r_k = 0;
+                                #pragma unroll 1
+                                for (int ti = 0; ti < n_tiles_3; ti++) {
+                                    int tile = d_k;
+#if __CUDA_ARCH__ == 1000
+                                    tile = n_tiles_3 - 1 - d_k;
+#endif
+                                    mbarrier_wait(k_empty_addr + (load_k_stage) * 8, _phase_k_empty);
+                                    asm volatile(
+                                        "cp.async.bulk.tensor.3d.shared::cluster.global.mbarrier::complete_tx::bytes.multicast::cluster"
+                                        " [%0], [%1, {%2, %3, %4}], [%5], %6;"
+                                        :: "r"(smem_k_addr + load_k_stage * 32768 + (unsigned int)(rank_k * 16384)), "l"((&K)), "r"(0), "r"(k0 + tile * 128), "r"(rank_k),
+                                           "r"(k_full_addr + (load_k_stage) * 8), "h"((uint16_t)(3)) : "memory");
+                                    mbarrier_arrive_expect_tx(k_full_addr + (load_k_stage) * 8, 32768);
+                                    load_k_stage += 1;
+                                    if (load_k_stage == 4) { load_k_stage = 0; _phase_k_empty ^= 1; }
+                                    if (n_s_k > 0) {
+                                        if (n_s_k > ti + 1) {
+                                            d_k += stride;
+                                        } else if (ti + 1 == n_s_k) {
+                                            d_k = 1;
+                                            r_k = 0;
+                                        } else {
+                                            d_k += 1;
+                                            r_k += 1;
+                                            if (r_k == stride - 1) {
+                                                r_k = 0;
+                                                d_k += 1;
+                                            }
+                                        }
+                                    } else {
+                                        d_k += 1;
+                                    }
+                                }
+                                if (attempt_1 == 0) {
+                                    mbarrier_wait(verdict_bar_addr, _phase_verdict_bar_1);
+                                    _phase_verdict_bar_1 ^= 1;
+                                    tk_k = s_tk[tkp_k ^ 1];
+                                    mbarrier_arrive(tk_ack_addr + (ack_k) * 8);
+                                    ack_k += 1;
+                                    if (ack_k == 2) { ack_k = 0; }
+                                    if (s_pfail[1] == 0) {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    unit_base_k += (nb_1 + 1) / 2;
+                }
+                #pragma unroll
+                for (int _d = 0; _d < 4; _d++) {
+                    mbarrier_wait(k_empty_addr + (load_k_stage) * 8, _phase_k_empty);
+                    load_k_stage += 1;
+                    if (load_k_stage == 4) { load_k_stage = 0; _phase_k_empty ^= 1; }
+                }
+            }
+            __syncwarp();
+        }
+    // ---- Role: mma ----
+    } else if (warp == 14) {
+        asm volatile("setmaxnreg.dec.sync.aligned.u32 56;");
+        { // mma_main
+            unsigned int mma_k_stage = 0;
+            unsigned int mma_tmem_stage = 0;
+            int unit_base_m = 0;
+            unsigned int vphase_m = 0;
+            int tk_m = 0;
+            if (lane == 0) {
+                tk_m = s_tk[0];
+            }
+            int _shfl_sync_0 = __shfl_sync(0xFFFFFFFF, tk_m, 0);
+            tk_m = _shfl_sync_0;
+            int tkp_m = 1;
+            unsigned int ack_m = 0;
+            if (lane == 0) {
+                mbarrier_arrive(tk_ack_addr + (ack_m) * 8);
+            }
+            ack_m += 1;
+            if (ack_m == 2) { ack_m = 0; }
+            int rank_m = (int)bid & 1;
+            unsigned int _phase_q_full_1 = 0;
+            unsigned int _phase_k_full = 0;
+            unsigned int _phase_umma_empty = 1;
+            unsigned int _phase_verdict_bar_2 = 0;
+            #pragma unroll 1
+            for (int seg_2 = 0; seg_2 < num_segments; seg_2++) {
+                int q0_2 = cu_seqlens_q[seg_2];
+                int lq_2 = cu_seqlens_q[seg_2 + 1] - q0_2;
+                int nb_2 = (lq_2 + 6 - 1) / 6;
+                int cnt_m = (nb_2 + 1) / 2;
+                #pragma unroll 1
+                for (int rnd_2 = 0; rnd_2 < cnt_m + 1; rnd_2++) {
+                    int unit_2 = tk_m;
+                    if (unit_2 >= unit_base_m + cnt_m) {
+                        break;
+                    }
+                    tkp_m ^= 1;
+                    int _min_1 = ((unit_2 - unit_base_m) < (unit_base_m + (nb_2 + 1) / 2 - 1 - unit_2) ? (unit_2 - unit_base_m) : (unit_base_m + (nb_2 + 1) / 2 - 1 - unit_2));
+                    if (_min_1 >= 0) {
+                        int rel_2 = unit_2 - unit_base_m;
+                        int blk0_2 = nb_2 - 1 - 2 * rel_2;
+                        int blk_2 = blk0_2 - rank_m;
+                        int q0_1_1 = cu_seqlens_q[seg_2];
+                        int lq_2_1 = cu_seqlens_q[seg_2 + 1] - q0_1_1;
+                        int lk_1 = cu_seqlens_k[seg_2 + 1] - cu_seqlens_k[seg_2];
+                        long long off_2 = 0;
+                        if (has_offsets != 0) {
+                            off_2 = q_offsets[seg_2];
+                        } else if (ratio == 1) {
+                            off_2 = (long long)lk_1 - (long long)lq_2_1;
+                        }
+                        long long off_1_1 = off_2;
+                        int last_u_1 = ((blk0_2 * 6 + 5) < (lq_2_1 - 1) ? (blk0_2 * 6 + 5) : (lq_2_1 - 1));
+                        long long num_1 = off_1_1 + (long long)last_u_1 + 1;
+                        int vis_1 = 0;
+                        if (num_1 > 0) {
+                            long long quotient_1 = num_1 / (long long)ratio;
+                            long long lk64_1 = (long long)lk_1;
+                            long long bounded_1 = ((quotient_1 < lk64_1) ? quotient_1 : lk64_1);
+                            vis_1 = (int)bounded_1;
+                        }
+                        int v_max_1 = vis_1;
+                        int n_tiles_1 = (v_max_1 + 128 - 1) / 128;
+                        int n_tiles_3_1 = n_tiles_1;
+                        #pragma unroll 1
+                        for (int attempt_2 = 0; attempt_2 < 2; attempt_2++) {
+                            mbarrier_wait(q_full_addr, _phase_q_full_1);
+                            #pragma unroll 1
+                            for (int ti_1 = 0; ti_1 < n_tiles_3_1; ti_1++) {
+                                mbarrier_wait(k_full_addr + (mma_k_stage) * 8, _phase_k_full);
+                                if (elect_sync()) {
+                                    mbarrier_wait(umma_empty_addr + (mma_tmem_stage) * 8, _phase_umma_empty);
+                                    asm volatile("tcgen05.fence::after_thread_sync;");
+                                    int _smem_desc_lo_2 = (((smem_k_addr) >> 4) & 0x3FFF) + (mma_k_stage) * 2048;
+                                    int _smem_desc_lo_3 = (((smem_q_addr) >> 4) & 0x3FFF) + (0) * 3072;
+                                    asm volatile(
+                    "{\n\t"
+                    ".reg .pred p0, p1;\n\t"
+                    ".reg .b32 adhi, bdhi, alo, blo, id;\n\t"
+                    ".reg .b64 da, db;\n\t"
+                    ""
+                    "setp.ne.b32 p0, %3, 0;\n\t"
+                    "setp.ne.b32 p1, 1, 0;\n\t"
+                    ""
+                    "mov.b32 adhi, 0x40004040;\n\t"
+                    "mov.b32 bdhi, 0x40004040;\n\t"
+                    "mov.b32 id, 137364624;\n\t"
+                    "mov.b32 alo, %0;\n\t"
+                    "mov.b32 blo, %1;\n\t"
+                    "mov.b64 da, {alo, adhi};\n\t"
+                    "mov.b64 db, {blo, bdhi};\n\t"
+                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p0;\n\t"
+                    "add.u32 alo, alo, 2;\n\t"
+                    "add.u32 blo, blo, 2;\n\t"
+                    "mov.b64 da, {alo, adhi};\n\t"
+                    "mov.b64 db, {blo, bdhi};\n\t"
+                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
+                    "add.u32 alo, alo, 2;\n\t"
+                    "add.u32 blo, blo, 2;\n\t"
+                    "mov.b64 da, {alo, adhi};\n\t"
+                    "mov.b64 db, {blo, bdhi};\n\t"
+                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
+                    "add.u32 alo, alo, 2;\n\t"
+                    "add.u32 blo, blo, 2;\n\t"
+                    "mov.b64 da, {alo, adhi};\n\t"
+                    "mov.b64 db, {blo, bdhi};\n\t"
+                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
+                    "add.u32 alo, alo, 1018;\n\t"
+                    "add.u32 blo, blo, 1530;\n\t"
+                    "mov.b64 da, {alo, adhi};\n\t"
+                    "mov.b64 db, {blo, bdhi};\n\t"
+                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
+                    "add.u32 alo, alo, 2;\n\t"
+                    "add.u32 blo, blo, 2;\n\t"
+                    "mov.b64 da, {alo, adhi};\n\t"
+                    "mov.b64 db, {blo, bdhi};\n\t"
+                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
+                    "add.u32 alo, alo, 2;\n\t"
+                    "add.u32 blo, blo, 2;\n\t"
+                    "mov.b64 da, {alo, adhi};\n\t"
+                    "mov.b64 db, {blo, bdhi};\n\t"
+                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
+                    "add.u32 alo, alo, 2;\n\t"
+                    "add.u32 blo, blo, 2;\n\t"
+                    "mov.b64 da, {alo, adhi};\n\t"
+                    "mov.b64 db, {blo, bdhi};\n\t"
+                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
+                    "}\n"
+                    :: "r"(_smem_desc_lo_2), "r"(_smem_desc_lo_3), "r"((tmem_tmem_acc + (mma_tmem_stage * 192))), "r"(0) : "memory");
+                                    tcgen05_commit(umma_full_addr + (mma_tmem_stage) * 8);
+                                    tcgen05_commit_cg1_multicast(k_empty_addr + (mma_k_stage) * 8, (uint16_t)(3));
+                                    mma_tmem_stage += 1;
+                                    if (mma_tmem_stage == 2) { mma_tmem_stage = 0; _phase_umma_empty ^= 1; }
+                                }
+                                asm volatile("tcgen05.fence::before_thread_sync;");
+                                __syncwarp();
+                                mma_k_stage += 1;
+                                if (mma_k_stage == 4) { mma_k_stage = 0; _phase_k_full ^= 1; }
+                            }
+                            mbarrier_arrive(q_empty_addr);
+                            _phase_q_full_1 ^= 1;
+                            if (attempt_2 == 0) {
+                                mbarrier_wait(verdict_bar_addr, _phase_verdict_bar_2);
+                                _phase_verdict_bar_2 ^= 1;
+                                int tread_m = 0;
+                                if (lane == 0) {
+                                    uint32_t tk_word_m;
+                                    asm volatile("ld.shared.b32 %0, [%1];" : "=r"(tk_word_m) : "r"(static_cast<uint32_t>(s_tk_addr + (unsigned int)((tkp_m ^ 1) * 4))));
+                                    tread_m = (int)tk_word_m;
+                                    mbarrier_arrive(tk_ack_addr + (ack_m) * 8);
+                                }
+                                int _shfl_sync_4 = __shfl_sync(0xFFFFFFFF, tread_m, 0);
+                                tk_m = _shfl_sync_4;
+                                ack_m += 1;
+                                if (ack_m == 2) { ack_m = 0; }
+                                int vread_m = 0;
+                                if (lane == 0) {
+                                    uint32_t _shared_weak_0;
+                                    asm volatile("ld.shared.b32 %0, [%1];" : "=r"(_shared_weak_0) : "r"(static_cast<uint32_t>(s_pfail_addr + 4)));
+                                    vread_m = (int)_shared_weak_0;
+                                }
+                                int vword_m = __shfl_sync(0xFFFFFFFF, vread_m, 0);
+                                if (vword_m == 0) {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                unit_base_m += (nb_2 + 1) / 2;
+            }
+        }
+    // ---- Role: spare ----
+    } else if (warp == 15) {
+        asm volatile("setmaxnreg.dec.sync.aligned.u32 56;");
+        { // spare_main
+            __syncwarp();
+        }
+    // ---- Role: math ----
+    } else if (warp <= 11) {
+        asm volatile("setmaxnreg.inc.sync.aligned.u32 152;");
+        { // math_main
+            int warp_in_wg = warp % 4;
+            int lane_0 = lane;
+            int local_thread_idx = warp_in_wg * 32 + lane_0;
+            unsigned int wg_idx = make_warp_uniform(warp / 4);
+            int wg = (int)wg_idx;
+            int pair = warp_in_wg / 2;
+            int half = warp_in_wg % 2;
+            int pair_bar = 5 + wg * 2 + pair;
+            int bid_i = (int)bid;
+            unsigned int one_u = 1;
+            unsigned int lower_lanes = (one_u << (unsigned int)lane) - 1;
+            int hist_base = (wg * 2 + pair) * 256;
+            unsigned int zero_u = 0;
+            unsigned int sign_mask = 2147483648;
+            unsigned int nan_floor = 2139095040;
+            unsigned int math_tmem_stage = 0;
+            unsigned int math_tmem_phase = 0;
+            int unit_base = 0;
+            int tk_u = 0;
+            if (lane == 0) {
+                tk_u = s_tk[0];
+            }
+            int _shfl_sync_0_1 = __shfl_sync(0xFFFFFFFF, tk_u, 0);
+            tk_u = _shfl_sync_0_1;
+            int tkp_u = 1;
+            int tk_in_u = ((int)bid & 1) * 4;
+            unsigned int ack_u = 0;
+            if (lane == 0) {
+                mbarrier_arrive(tk_ack_addr + (ack_u) * 8);
+            }
+            ack_u += 1;
+            if (ack_u == 2) { ack_u = 0; }
+            int rank_u = bid_i & 1;
+            int verdict_unit = 0;
+            int keep_cap = ((top_k + 64) < (cand_cap - 128 * check_period) ? (top_k + 64) : (cand_cap - 128 * check_period));
+            int trigger_room = 128 * check_period;
+            unsigned int _phase_q_full_2 = 0;
+            unsigned int _phase_umma_full = 0;
+            unsigned int _phase_peer_bar = 0;
+            #pragma unroll 1
+            for (int seg_3 = 0; seg_3 < num_segments; seg_3++) {
+                int q0_3 = cu_seqlens_q[seg_3];
+                int lq_3 = cu_seqlens_q[seg_3 + 1] - q0_3;
+                int lk_2 = cu_seqlens_k[seg_3 + 1] - cu_seqlens_k[seg_3];
+                int nb_3 = (lq_3 + 6 - 1) / 6;
+                int cnt_u = (nb_3 + 1) / 2;
+                long long off_3 = 0;
+                if (has_offsets != 0) {
+                    off_3 = q_offsets[seg_3];
+                } else if (ratio == 1) {
+                    off_3 = (long long)lk_2 - (long long)lq_3;
+                }
+                long long dst = off_3;
+                #pragma unroll 1
+                for (int rnd_3 = 0; rnd_3 < cnt_u + 1; rnd_3++) {
+                    int unit_3 = tk_u;
+                    if (unit_3 >= unit_base + cnt_u) {
+                        break;
+                    }
+                    tkp_u ^= 1;
+                    int _min_1_1 = ((unit_3 - unit_base) < (unit_base + (nb_3 + 1) / 2 - 1 - unit_3) ? (unit_3 - unit_base) : (unit_base + (nb_3 + 1) / 2 - 1 - unit_3));
+                    if (_min_1_1 >= 0) {
+                        int rel_3 = unit_3 - unit_base;
+                        int blk0_3 = nb_3 - 1 - 2 * rel_3;
+                        int blk_3 = blk0_3 - rank_u;
+                        int dummy = ((blk_3 < 0) ? 1 : 0);
+                        int u_base = blk_3 * 6;
+                        int q0_2_1 = cu_seqlens_q[seg_3];
+                        int lq_3_1 = cu_seqlens_q[seg_3 + 1] - q0_2_1;
+                        int lk_0 = cu_seqlens_k[seg_3 + 1] - cu_seqlens_k[seg_3];
+                        long long off_1_2 = 0;
+                        if (has_offsets != 0) {
+                            off_1_2 = q_offsets[seg_3];
+                        } else if (ratio == 1) {
+                            off_1_2 = (long long)lk_0 - (long long)lq_3_1;
+                        }
+                        long long off_1_0 = off_1_2;
+                        int last_u_2 = ((blk0_3 * 6 + 5) < (lq_3_1 - 1) ? (blk0_3 * 6 + 5) : (lq_3_1 - 1));
+                        long long num_2 = off_1_0 + (long long)last_u_2 + 1;
+                        int vis_2 = 0;
+                        if (num_2 > 0) {
+                            long long quotient_2 = num_2 / (long long)ratio;
+                            long long lk64_2 = (long long)lk_0;
+                            long long bounded_2 = ((quotient_2 < lk64_2) ? quotient_2 : lk64_2);
+                            vis_2 = (int)bounded_2;
+                        }
+                        int v_max_2 = vis_2;
+                        int n_tiles_2 = (v_max_2 + 128 - 1) / 128;
+                        int n_tiles_5 = n_tiles_2;
+                        int max_tiles_1 = ((sample_tiles_max) < (cand_cap / 128 - check_period) ? (sample_tiles_max) : (cand_cap / 128 - check_period));
+                        int stride_1 = 1;
+                        int n_sample_1 = 0;
+                        if (max_tiles_1 >= 2) {
+                            if (n_tiles_5 * 128 + 128 > cand_cap) {
+                                stride_1 = (n_tiles_5 + max_tiles_1 - 1) / max_tiles_1;
+                                if (stride_1 >= 2) {
+                                    n_sample_1 = (n_tiles_5 + stride_1 - 1) / stride_1;
+                                }
+                            }
+                        }
+                        if (max_tiles_1 >= 2) {
+                            if (n_tiles_5 * 128 + 128 <= cand_cap) {
+                                if (n_tiles_5 * 64 > top_k) {
+                                    int cap_fit_1 = ((max_tiles_1) < (8) ? (max_tiles_1) : (8));
+                                    if (cap_fit_1 >= 2) {
+                                        stride_1 = (n_tiles_5 + cap_fit_1 - 1) / cap_fit_1;
+                                        if (stride_1 >= 2) {
+                                            n_sample_1 = (n_tiles_5 + stride_1 - 1) / stride_1;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        int row_valid[2];
+                        int visible[2];
+                        unsigned long long tau[2];
+                        int buf_base[2];
+                        int buf_unit = (bid_i * 6 + wg * 2) * cand_cap;
+                        int u_q = u_base + wg * 2;
+                        int valid_q = ((u_q < lq_3) ? 1 : 0);
+                        if (dummy != 0) {
+                            valid_q = 0;
+                        }
+                        row_valid[0] = valid_q;
+                        int vis_q = 0;
+                        if (valid_q != 0) {
+                            long long num_0 = dst + (long long)u_q + 1;
+                            int vis_0 = 0;
+                            if (num_0 > 0) {
+                                long long quotient_3 = num_0 / (long long)ratio;
+                                long long lk64_3 = (long long)lk_2;
+                                long long bounded_3 = ((quotient_3 < lk64_3) ? quotient_3 : lk64_3);
+                                vis_0 = (int)bounded_3;
+                            }
+                            vis_q = vis_0;
+                        }
+                        visible[0] = vis_q;
+                        buf_base[0] = buf_unit;
+                        int u_q_6 = u_base + wg * 2 + 1;
+                        int valid_q_7 = ((u_q_6 < lq_3) ? 1 : 0);
+                        if (dummy != 0) {
+                            valid_q_7 = 0;
+                        }
+                        row_valid[1] = valid_q_7;
+                        int vis_q_8 = 0;
+                        if (valid_q_7 != 0) {
+                            long long num_1_1 = dst + (long long)u_q_6 + 1;
+                            int vis_2_1 = 0;
+                            if (num_1_1 > 0) {
+                                long long quotient_4 = num_1_1 / (long long)ratio;
+                                long long lk64_4 = (long long)lk_2;
+                                long long bounded_4 = ((quotient_4 < lk64_4) ? quotient_4 : lk64_4);
+                                vis_2_1 = (int)bounded_4;
+                            }
+                            vis_q_8 = vis_2_1;
+                        }
+                        visible[1] = vis_q_8;
+                        buf_base[1] = buf_unit + cand_cap;
+                        int buf_pair = buf_unit + pair * cand_cap;
+                        int slot_pair = wg * 2 + pair;
+                        int valid_pair = row_valid[1];
+                        int visible_pair = visible[1];
+                        if (pair == 0) {
+                            valid_pair = row_valid[0];
+                            visible_pair = visible[0];
+                        }
+                        #pragma unroll 1
+                        for (int attempt_3 = 0; attempt_3 < 2; attempt_3++) {
+                            int n_s = n_sample_1;
+                            if (attempt_3 != 0) {
+                                n_s = 0;
+                            }
+                            tau[0] = 0;
+                            tau[1] = 0;
+                            if (local_thread_idx < 2) {
+                                s_count[wg * 2 + local_thread_idx] = 0;
+                            }
+                            asm volatile("barrier.sync %0, 128;" :: "r"(1 + wg) : "memory");
+                            mbarrier_wait(q_full_addr, _phase_q_full_2);
+                            if (lane == 0) {
+                                tk_u = s_tk[tk_in_u + (tkp_u ^ 1)];
+                                if (attempt_3 == 0) {
+                                    mbarrier_arrive(tk_ack_addr + (ack_u) * 8);
+                                }
+                            }
+                            int _shfl_sync_2 = __shfl_sync(0xFFFFFFFF, tk_u, 0);
+                            tk_u = _shfl_sync_2;
+                            if (attempt_3 == 0) {
+                                ack_u += 1;
+                                if (ack_u == 2) { ack_u = 0; }
+                            }
+                            float weights_reg[64];
+                            int weight_stage_base = 0 * 192 + (unsigned int)(wg * 64);
+                            #pragma unroll
+                            for (int wi = 0; wi < 64; wi++) {
+                                float w_raw = smem_w[weight_stage_base + wi];
+                                weights_reg[wi] = w_raw * softmax_scale;
+                            }
+                            int d_pos = 0;
+                            int r_pos = 0;
+                            int until_check = check_period - 1;
+#if __CUDA_ARCH__ == 1000
+                            unsigned int acc_tok = 0;
+#endif
+                            constexpr int ti_2_unroll = TILE_UNROLL;
+                            #pragma unroll ti_2_unroll
+                            for (int ti_2 = 0; ti_2 < n_tiles_5; ti_2++) {
+                                int tile_1 = d_pos;
+#if __CUDA_ARCH__ == 1000
+                                tile_1 = n_tiles_5 - 1 - d_pos;
+#endif
+                                int kid = tile_1 * 128 + local_thread_idx;
+                                int nxt_w = ti_2 + 1;
+                                int r_inc_w = r_pos + 1;
+                                int wrap_w = ((r_inc_w == stride_1 - 1) ? 1 : 0);
+                                int d_gen_w = d_pos + 1 + wrap_w;
+                                int r_gen_w = ((wrap_w != 0) ? 0 : r_inc_w);
+                                int d_new_w = ((nxt_w < n_s) ? d_pos + stride_1 : ((nxt_w == n_s) ? 1 : d_gen_w));
+                                int r_new_w = ((nxt_w < n_s) ? r_pos : ((nxt_w == n_s) ? 0 : r_gen_w));
+                                d_pos = ((n_s > 0) ? d_new_w : d_pos + 1);
+                                r_pos = ((n_s > 0) ? r_new_w : r_pos);
+#if __CUDA_ARCH__ == 1000
+                                if (acc_tok == 0) {
+                                    mbarrier_wait(umma_full_addr + (math_tmem_stage) * 8, _phase_umma_full);
+                                }
+#else
+                                mbarrier_wait(umma_full_addr + (math_tmem_stage) * 8, _phase_umma_full);
+#endif
+                                asm volatile("tcgen05.fence::after_thread_sync;");
+                                float _tmem_load_0[64];
+                                asm volatile(
+                                    "tcgen05.ld.sync.aligned.32x32b.x64.b32"
+                                    " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31, %32, %33, %34, %35, %36, %37, %38, %39, %40, %41, %42, %43, %44, %45, %46, %47, %48, %49, %50, %51, %52, %53, %54, %55, %56, %57, %58, %59, %60, %61, %62, %63}, [%64];"
+                                    : "=f"(_tmem_load_0[0]), "=f"(_tmem_load_0[1]), "=f"(_tmem_load_0[2]), "=f"(_tmem_load_0[3]), "=f"(_tmem_load_0[4]), "=f"(_tmem_load_0[5]), "=f"(_tmem_load_0[6]), "=f"(_tmem_load_0[7]), "=f"(_tmem_load_0[8]), "=f"(_tmem_load_0[9]), "=f"(_tmem_load_0[10]), "=f"(_tmem_load_0[11]), "=f"(_tmem_load_0[12]), "=f"(_tmem_load_0[13]), "=f"(_tmem_load_0[14]), "=f"(_tmem_load_0[15]), "=f"(_tmem_load_0[16]), "=f"(_tmem_load_0[17]), "=f"(_tmem_load_0[18]), "=f"(_tmem_load_0[19]), "=f"(_tmem_load_0[20]), "=f"(_tmem_load_0[21]), "=f"(_tmem_load_0[22]), "=f"(_tmem_load_0[23]), "=f"(_tmem_load_0[24]), "=f"(_tmem_load_0[25]), "=f"(_tmem_load_0[26]), "=f"(_tmem_load_0[27]), "=f"(_tmem_load_0[28]), "=f"(_tmem_load_0[29]), "=f"(_tmem_load_0[30]), "=f"(_tmem_load_0[31]), "=f"(_tmem_load_0[32]), "=f"(_tmem_load_0[33]), "=f"(_tmem_load_0[34]), "=f"(_tmem_load_0[35]), "=f"(_tmem_load_0[36]), "=f"(_tmem_load_0[37]), "=f"(_tmem_load_0[38]), "=f"(_tmem_load_0[39]), "=f"(_tmem_load_0[40]), "=f"(_tmem_load_0[41]), "=f"(_tmem_load_0[42]), "=f"(_tmem_load_0[43]), "=f"(_tmem_load_0[44]), "=f"(_tmem_load_0[45]), "=f"(_tmem_load_0[46]), "=f"(_tmem_load_0[47]), "=f"(_tmem_load_0[48]), "=f"(_tmem_load_0[49]), "=f"(_tmem_load_0[50]), "=f"(_tmem_load_0[51]), "=f"(_tmem_load_0[52]), "=f"(_tmem_load_0[53]), "=f"(_tmem_load_0[54]), "=f"(_tmem_load_0[55]), "=f"(_tmem_load_0[56]), "=f"(_tmem_load_0[57]), "=f"(_tmem_load_0[58]), "=f"(_tmem_load_0[59]), "=f"(_tmem_load_0[60]), "=f"(_tmem_load_0[61]), "=f"(_tmem_load_0[62]), "=f"(_tmem_load_0[63])
+                                    : "r"(taddr + math_tmem_stage * 192 + (unsigned int)(wg * 2 * 32) + (unsigned int)(warp_in_wg * 32 << 16)));
+                                asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+                                asm volatile("tcgen05.fence::before_thread_sync;");
+                                __syncwarp();
+                                if (elect_sync()) {
+                                    asm volatile(
+                                        "mbarrier.arrive.release.cta.shared::cta.b64 _, [%0], %1;"
+                                        :: "r"(umma_empty_addr + (math_tmem_stage) * 8), "r"((uint32_t)(32)) : "memory");
+                                }
+                                unsigned int bits2[2];
+                                int emit2[2];
+                                unsigned int ballot2[2];
+                                float2 sum0 = make_float2(0.0f, 0.0f);
+                                float2 sum1 = make_float2(0.0f, 0.0f);
+                                #pragma unroll
+                                for (int j = 0; j < 32; j += 4) {
+                                    float2 doubled0 = add_f32x2_noftz(make_float2(_tmem_load_0[j], _tmem_load_0[j + 1]), make_float2(fabsf(_tmem_load_0[j]), fabsf(_tmem_load_0[j + 1])));
+                                    sum0 = fma_f32x2_rn_noftz(doubled0, make_float2(weights_reg[j], weights_reg[j + 1]), sum0);
+                                    float2 doubled1 = add_f32x2_noftz(make_float2(_tmem_load_0[j + 2], _tmem_load_0[j + 3]), make_float2(fabsf(_tmem_load_0[j + 2]), fabsf(_tmem_load_0[j + 3])));
+                                    sum1 = fma_f32x2_rn_noftz(doubled1, make_float2(weights_reg[j + 2], weights_reg[j + 3]), sum1);
+                                }
+                                float2 total = add_f32x2_noftz(sum0, sum1);
+                                float relu_wsum = (total.x + total.y) * 0.5f;
+                                float score = relu_wsum;
+                                unsigned int bits = 0;
+                                bits = reinterpret_cast<unsigned int*>(&score)[0];
+                                bits2[0] = bits;
+                                unsigned int magnitude = bits & 2147483647;
+                                unsigned int m = ((magnitude != 0) ? bits : zero_u);
+                                unsigned int key32 = (((m & sign_mask) != 0) ? ~m : m | sign_mask);
+                                if (magnitude > nan_floor) {
+                                    key32 = zero_u;
+                                }
+                                unsigned long long key64 = (unsigned long long)key32 << 32 | (unsigned long long)(unsigned int)kid;
+                                unsigned long long key = key64;
+                                int in_prefix = ((kid < visible[0]) ? 1 : 0);
+                                int above = ((key >= tau[0]) ? 1 : 0);
+                                int emit = row_valid[0] & in_prefix & above;
+                                emit2[0] = emit;
+                                unsigned int _warp_vote_3 = __ballot_sync(0xFFFFFFFF, emit != 0);
+                                ballot2[0] = _warp_vote_3;
+                                float2 sum0_0 = make_float2(0.0f, 0.0f);
+                                float2 sum1_0 = make_float2(0.0f, 0.0f);
+                                #pragma unroll
+                                for (int j_1 = 0; j_1 < 32; j_1 += 4) {
+                                    float2 doubled0_1 = add_f32x2_noftz(make_float2(_tmem_load_0[32 + j_1], _tmem_load_0[32 + (j_1 + 1)]), make_float2(fabsf(_tmem_load_0[32 + j_1]), fabsf(_tmem_load_0[32 + (j_1 + 1)])));
+                                    sum0_0 = fma_f32x2_rn_noftz(doubled0_1, make_float2(weights_reg[32 + j_1], weights_reg[32 + j_1 + 1]), sum0_0);
+                                    float2 doubled1_1 = add_f32x2_noftz(make_float2(_tmem_load_0[32 + (j_1 + 2)], _tmem_load_0[32 + (j_1 + 3)]), make_float2(fabsf(_tmem_load_0[32 + (j_1 + 2)]), fabsf(_tmem_load_0[32 + (j_1 + 3)])));
+                                    sum1_0 = fma_f32x2_rn_noftz(doubled1_1, make_float2(weights_reg[32 + j_1 + 2], weights_reg[32 + j_1 + 3]), sum1_0);
+                                }
+                                float2 total_0 = add_f32x2_noftz(sum0_0, sum1_0);
+                                float relu_wsum_0 = (total_0.x + total_0.y) * 0.5f;
+                                float score_4 = relu_wsum_0;
+                                unsigned int bits_5 = 0;
+                                bits_5 = reinterpret_cast<unsigned int*>(&score_4)[0];
+                                bits2[1] = bits_5;
+                                unsigned int magnitude_0 = bits_5 & 2147483647;
+                                unsigned int m_0 = ((magnitude_0 != 0) ? bits_5 : zero_u);
+                                unsigned int key32_0 = (((m_0 & sign_mask) != 0) ? ~m_0 : m_0 | sign_mask);
+                                if (magnitude_0 > nan_floor) {
+                                    key32_0 = zero_u;
+                                }
+                                unsigned long long key64_0 = (unsigned long long)key32_0 << 32 | (unsigned long long)(unsigned int)kid;
+                                unsigned long long key_10 = key64_0;
+                                int in_prefix_11 = ((kid < visible[1]) ? 1 : 0);
+                                int above_12 = ((key_10 >= tau[1]) ? 1 : 0);
+                                int emit_13 = row_valid[1] & in_prefix_11 & above_12;
+                                emit2[1] = emit_13;
+                                unsigned int _warp_vote_4 = __ballot_sync(0xFFFFFFFF, emit_13 != 0);
+                                ballot2[1] = _warp_vote_4;
+                                int cnt_lane = (int)(unsigned int)__popc(ballot2[1]);
+                                if (lane_0 == 0) {
+                                    cnt_lane = (int)(unsigned int)__popc(ballot2[0]);
+                                }
+                                int reservation = 0;
+                                if (lane_0 < 2) {
+                                    int _atomic_fetch_add_5 = atomicAdd(s_count + (wg * 2 + lane_0), cnt_lane);
+                                    reservation = _atomic_fetch_add_5;
+                                }
+                                int slot_base_1_0 = __shfl_sync(0xFFFFFFFF, reservation, 0);
+                                if (emit2[0] != 0) {
+                                    int slot_1_0 = buf_base[0] + slot_base_1_0 + (int)(unsigned int)__popc(ballot2[0] & lower_lanes);
+                                    unsigned long long entry = (unsigned long long)bits2[0] << 32 | (unsigned long long)(unsigned int)kid;
+                                    Cand[slot_1_0] = (long long)entry;
+                                }
+                                int slot_base_1_1 = __shfl_sync(0xFFFFFFFF, reservation, 1);
+                                if (emit2[1] != 0) {
+                                    int slot_1_1 = buf_base[1] + slot_base_1_1 + (int)(unsigned int)__popc(ballot2[1] & lower_lanes);
+                                    unsigned long long entry_1 = (unsigned long long)bits2[1] << 32 | (unsigned long long)(unsigned int)kid;
+                                    Cand[slot_1_1] = (long long)entry_1;
+                                }
+                                math_tmem_stage += 1;
+                                if (math_tmem_stage == 2) { math_tmem_stage = 0; _phase_umma_full ^= 1; }
+#if __CUDA_ARCH__ == 1000
+                                uint32_t _mbar_token_0 = mbarrier_test_wait(umma_full_addr + (math_tmem_stage) * 8, _phase_umma_full);
+                                acc_tok = _mbar_token_0;
+#endif
+                                int sample_now = ((ti_2 + 1 == n_s) ? 1 : 0);
+                                int do_check = ((until_check == 0) ? 1 : 0);
+                                do_check = do_check | sample_now;
+                                if (do_check == 0) {
+                                    until_check -= 1;
+                                } else {
+                                    until_check = check_period - 1;
+                                    asm volatile("barrier.sync %0, 128;" :: "r"(1 + wg) : "memory");
+                                    int need_any = 0;
+                                    int need[2];
+                                    int kw[2];
+                                    int km[2];
+                                    int sk[2];
+                                    int c_q_1_0 = s_count[wg * 2];
+                                    int limit_q_2_0 = ((tau[0] != 0) ? cand_cap : first_cap);
+                                    int need_q_1_0 = ((limit_q_2_0 < c_q_1_0 + trigger_room) ? 1 : 0);
+                                    int kw_q_1_0 = top_k;
+                                    int km_q_1_0 = keep_cap;
+                                    int sk_q_1_0 = 0;
+                                    if (need_q_1_0 == 0) {
+                                        if (sample_now != 0) {
+                                            if (row_valid[0] != 0) {
+                                                int vis_abs_1_0 = visible[0];
+                                                int vis_c_1_0 = vis_abs_1_0;
+#if __CUDA_ARCH__ == 1000
+                                                int _max_6 = ((vis_c_1_0 - (n_tiles_5 - 1) * 128) > (0) ? (vis_c_1_0 - (n_tiles_5 - 1) * 128) : (0));
+                                                int n_diag_1_0 = ((_max_6) < (128) ? (_max_6) : (128));
+                                                int c_far_1_0 = c_q_1_0 - n_diag_1_0;
+                                                int v_far_1_0 = vis_c_1_0 - n_diag_1_0;
+#else
+                                                int t_near_1_0 = (n_s - 1) * stride_1;
+                                                int _max_7 = ((vis_c_1_0 - t_near_1_0 * 128) > (0) ? (vis_c_1_0 - t_near_1_0 * 128) : (0));
+                                                int _min_6 = ((_max_7) < (128) ? (_max_7) : (128));
+                                                int n_near_1_0 = _min_6 * far_sample;
+                                                int c_far_1_0 = c_q_1_0 - n_near_1_0;
+                                                int v_far_1_0 = vis_c_1_0 - n_near_1_0;
+#endif
+                                                if (v_far_1_0 > 0) {
+                                                    int r_q_1_0 = (top_k * c_far_1_0 + v_far_1_0 - 1) / v_far_1_0;
+                                                    int r_shift_1_0 = r_q_1_0 + r_q_1_0 * sample_shift_permille / 1000 + 24;
+                                                    if (r_shift_1_0 < c_far_1_0) {
+                                                        need_q_1_0 = 1;
+                                                        kw_q_1_0 = r_shift_1_0;
+#if __CUDA_ARCH__ == 1000
+                                                        int _min_7 = ((r_shift_1_0 + 64) < (keep_cap) ? (r_shift_1_0 + 64) : (keep_cap));
+                                                        km_q_1_0 = _min_7;
+                                                        sk_q_1_0 = n_diag_1_0;
+#else
+                                                        int _min_8 = ((r_shift_1_0 + 64) < (keep_cap) ? (r_shift_1_0 + 64) : (keep_cap));
+                                                        km_q_1_0 = _min_8;
+                                                        sk_q_1_0 = n_near_1_0;
+#endif
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    need[0] = need_q_1_0;
+                                    kw[0] = kw_q_1_0;
+                                    km[0] = km_q_1_0;
+                                    sk[0] = sk_q_1_0;
+                                    need_any = need_any | need_q_1_0;
+                                    int c_q_1_1 = s_count[wg * 2 + 1];
+                                    int limit_q_2_1 = ((tau[1] != 0) ? cand_cap : first_cap);
+                                    int need_q_1_1 = ((limit_q_2_1 < c_q_1_1 + trigger_room) ? 1 : 0);
+                                    int kw_q_1_1 = top_k;
+                                    int km_q_1_1 = keep_cap;
+                                    int sk_q_1_1 = 0;
+                                    if (need_q_1_1 == 0) {
+                                        if (sample_now != 0) {
+                                            if (row_valid[1] != 0) {
+                                                int vis_abs_1_1 = visible[1];
+                                                int vis_c_1_1 = vis_abs_1_1;
+#if __CUDA_ARCH__ == 1000
+                                                int _max_8 = ((vis_c_1_1 - (n_tiles_5 - 1) * 128) > (0) ? (vis_c_1_1 - (n_tiles_5 - 1) * 128) : (0));
+                                                int n_diag_1_1 = ((_max_8) < (128) ? (_max_8) : (128));
+                                                int c_far_1_1 = c_q_1_1 - n_diag_1_1;
+                                                int v_far_1_1 = vis_c_1_1 - n_diag_1_1;
+#else
+                                                int t_near_1_1 = (n_s - 1) * stride_1;
+                                                int _max_10 = ((vis_c_1_1 - t_near_1_1 * 128) > (0) ? (vis_c_1_1 - t_near_1_1 * 128) : (0));
+                                                int _min_9 = ((_max_10) < (128) ? (_max_10) : (128));
+                                                int n_near_1_1 = _min_9 * far_sample;
+                                                int c_far_1_1 = c_q_1_1 - n_near_1_1;
+                                                int v_far_1_1 = vis_c_1_1 - n_near_1_1;
+#endif
+                                                if (v_far_1_1 > 0) {
+                                                    int r_q_1_1 = (top_k * c_far_1_1 + v_far_1_1 - 1) / v_far_1_1;
+                                                    int r_shift_1_1 = r_q_1_1 + r_q_1_1 * sample_shift_permille / 1000 + 24;
+                                                    if (r_shift_1_1 < c_far_1_1) {
+                                                        need_q_1_1 = 1;
+                                                        kw_q_1_1 = r_shift_1_1;
+#if __CUDA_ARCH__ == 1000
+                                                        int _min_9 = ((r_shift_1_1 + 64) < (keep_cap) ? (r_shift_1_1 + 64) : (keep_cap));
+                                                        km_q_1_1 = _min_9;
+                                                        sk_q_1_1 = n_diag_1_1;
+#else
+                                                        int _min_11 = ((r_shift_1_1 + 64) < (keep_cap) ? (r_shift_1_1 + 64) : (keep_cap));
+                                                        km_q_1_1 = _min_11;
+                                                        sk_q_1_1 = n_near_1_1;
+#endif
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    need[1] = need_q_1_1;
+                                    kw[1] = kw_q_1_1;
+                                    km[1] = km_q_1_1;
+                                    sk[1] = sk_q_1_1;
+                                    need_any = need_any | need_q_1_1;
+                                    asm volatile("barrier.sync %0, 128;" :: "r"(1 + wg) : "memory");
+                                    if (need_any != 0) {
+                                        int need_pair = need[1];
+                                        int kw_pair = kw[1];
+                                        int km_pair = km[1];
+                                        int sk_pair = sk[1];
+                                        if (pair == 0) {
+                                            need_pair = need[0];
+                                            kw_pair = kw[0];
+                                            km_pair = km[0];
+                                            sk_pair = sk[0];
+                                        }
+                                        if (need_pair != 0) {
+                                            int c_pair = s_count[slot_pair];
+                                            int k_rem = kw_pair;
+                                            int kept_above = 0;
+                                            unsigned long long prefix = 0;
+                                            unsigned long long edge = 0;
+                                            #pragma unroll 1
+                                            for (int p = 0; p < 8; p++) {
+                                                int shift = 56 - 8 * p;
+                                                asm volatile("barrier.sync %0, 64;" :: "r"(pair_bar) : "memory");
+                                                if (half == 0) {
+                                                    s_hist[hist_base + lane_0 * 8] = 0;
+                                                    s_hist[hist_base + lane_0 * 8 + 1] = 0;
+                                                    s_hist[hist_base + lane_0 * 8 + 2] = 0;
+                                                    s_hist[hist_base + lane_0 * 8 + 3] = 0;
+                                                    s_hist[hist_base + lane_0 * 8 + 4] = 0;
+                                                    s_hist[hist_base + lane_0 * 8 + 5] = 0;
+                                                    s_hist[hist_base + lane_0 * 8 + 6] = 0;
+                                                    s_hist[hist_base + lane_0 * 8 + 7] = 0;
+                                                }
+                                                asm volatile("barrier.sync %0, 64;" :: "r"(pair_bar) : "memory");
+                                                unsigned long long ring[16];
+                                                #pragma unroll
+                                                for (int s_pro = 0; s_pro < 1; s_pro++) {
+                                                    #pragma unroll
+                                                    for (int u = 0; u < 8; u++) {
+                                                        int idx_l = s_pro * 512 + half * 32 + lane_0 + 64 * u;
+                                                        ring[s_pro * 8 + u] = 0;
+                                                        if (idx_l < c_pair - sk_pair) {
+#if __CUDA_ARCH__ == 1000
+                                                            ring[s_pro * 8 + u] = (unsigned long long)Cand[buf_pair + sk_pair + idx_l];
+#else
+                                                            ring[s_pro * 8 + u] = (unsigned long long)Cand[buf_pair + idx_l];
+#endif
+                                                        }
+                                                    }
+                                                }
+                                                int nbat = (c_pair - sk_pair + 512 - 1) / 512;
+                                                #pragma unroll 1
+                                                for (int g = 0; g < nbat; g += 2) {
+                                                    #pragma unroll
+                                                    for (int s_st = 0; s_st < 2; s_st++) {
+                                                        #pragma unroll
+                                                        for (int u_1 = 0; u_1 < 8; u_1++) {
+                                                            int valid_p = (((g + s_st) * 512 + half * 32 + lane_0 + 64 * u_1 < c_pair - sk_pair) ? 1 : 0);
+                                                            unsigned int bits_0 = (unsigned int)(ring[s_st * 8 + u_1] >> 32);
+                                                            int kid_0 = (int)(unsigned int)(ring[s_st * 8 + u_1] & 4294967295);
+                                                            unsigned int magnitude_1 = bits_0 & 2147483647;
+                                                            unsigned int m_1 = ((magnitude_1 != 0) ? bits_0 : zero_u);
+                                                            unsigned int key32_1 = (((m_1 & sign_mask) != 0) ? ~m_1 : m_1 | sign_mask);
+                                                            if (magnitude_1 > nan_floor) {
+                                                                key32_1 = zero_u;
+                                                            }
+                                                            unsigned long long key64_1 = (unsigned long long)key32_1 << 32 | (unsigned long long)(unsigned int)kid_0;
+                                                            unsigned long long key_0 = key64_1;
+                                                            unsigned long long key_p = key_0;
+                                                            unsigned long long ks_p = key_p >> (unsigned long long)shift;
+                                                            int digit_p = (int)(ks_p & 255);
+                                                            int pm_p = ((ks_p >> 8 == prefix) ? 1 : 0);
+                                                            int bin_p = (((valid_p & pm_p) != 0) ? hist_base + digit_p : hist_base + 1536);
+                                                            atomicAdd(&s_hist[bin_p], 1);
+                                                        }
+                                                        #pragma unroll
+                                                        for (int u_2 = 0; u_2 < 8; u_2++) {
+                                                            int idx_l_1 = (g + s_st + 1) * 512 + half * 32 + lane_0 + 64 * u_2;
+                                                            ring[(s_st + 1) % 2 * 8 + u_2] = 0;
+                                                            if (idx_l_1 < c_pair - sk_pair) {
+#if __CUDA_ARCH__ == 1000
+                                                                ring[(s_st + 1) % 2 * 8 + u_2] = (unsigned long long)Cand[buf_pair + sk_pair + idx_l_1];
+#else
+                                                                ring[(s_st + 1) % 2 * 8 + u_2] = (unsigned long long)Cand[buf_pair + idx_l_1];
+#endif
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                                asm volatile("barrier.sync %0, 64;" :: "r"(pair_bar) : "memory");
+                                                int lane_bins[8];
+                                                int lane_sum = 0;
+                                                lane_bins[0] = s_hist[hist_base + lane_0 * 8];
+                                                lane_sum += lane_bins[0];
+                                                lane_bins[1] = s_hist[hist_base + lane_0 * 8 + 1];
+                                                lane_sum += lane_bins[1];
+                                                lane_bins[2] = s_hist[hist_base + lane_0 * 8 + 2];
+                                                lane_sum += lane_bins[2];
+                                                lane_bins[3] = s_hist[hist_base + lane_0 * 8 + 3];
+                                                lane_sum += lane_bins[3];
+                                                lane_bins[4] = s_hist[hist_base + lane_0 * 8 + 4];
+                                                lane_sum += lane_bins[4];
+                                                lane_bins[5] = s_hist[hist_base + lane_0 * 8 + 5];
+                                                lane_sum += lane_bins[5];
+                                                lane_bins[6] = s_hist[hist_base + lane_0 * 8 + 6];
+                                                lane_sum += lane_bins[6];
+                                                lane_bins[7] = s_hist[hist_base + lane_0 * 8 + 7];
+                                                lane_sum += lane_bins[7];
+                                                int suffix = lane_sum;
+                                                int above_part_4_0 = __shfl_down_sync(0xFFFFFFFF, suffix, 1, 32);
+                                                if (lane_0 + 1 < 32) {
+                                                    suffix += above_part_4_0;
+                                                }
+                                                int above_part_4_1 = __shfl_down_sync(0xFFFFFFFF, suffix, 2, 32);
+                                                if (lane_0 + 2 < 32) {
+                                                    suffix += above_part_4_1;
+                                                }
+                                                int above_part_4_2 = __shfl_down_sync(0xFFFFFFFF, suffix, 4, 32);
+                                                if (lane_0 + 4 < 32) {
+                                                    suffix += above_part_4_2;
+                                                }
+                                                int above_part_4_3 = __shfl_down_sync(0xFFFFFFFF, suffix, 8, 32);
+                                                if (lane_0 + 8 < 32) {
+                                                    suffix += above_part_4_3;
+                                                }
+                                                int above_part_4_4 = __shfl_down_sync(0xFFFFFFFF, suffix, 16, 32);
+                                                if (lane_0 + 16 < 32) {
+                                                    suffix += above_part_4_4;
+                                                }
+                                                int excl = suffix - lane_sum;
+                                                int is_target = ((excl < k_rem && k_rem <= excl + lane_sum) ? 1 : 0);
+                                                int d_sel = 0;
+                                                int above_sel = 0;
+                                                int count_sel = 0;
+                                                int found = 0;
+                                                int cum_above = excl;
+                                                if (found == 0) {
+                                                    if (k_rem <= cum_above + lane_bins[7]) {
+                                                        d_sel = 7;
+                                                        above_sel = cum_above;
+                                                        count_sel = lane_bins[7];
+                                                        found = 1;
+                                                    }
+                                                }
+                                                cum_above += lane_bins[7];
+                                                if (found == 0) {
+                                                    if (k_rem <= cum_above + lane_bins[6]) {
+                                                        d_sel = 6;
+                                                        above_sel = cum_above;
+                                                        count_sel = lane_bins[6];
+                                                        found = 1;
+                                                    }
+                                                }
+                                                cum_above += lane_bins[6];
+                                                if (found == 0) {
+                                                    if (k_rem <= cum_above + lane_bins[5]) {
+                                                        d_sel = 5;
+                                                        above_sel = cum_above;
+                                                        count_sel = lane_bins[5];
+                                                        found = 1;
+                                                    }
+                                                }
+                                                cum_above += lane_bins[5];
+                                                if (found == 0) {
+                                                    if (k_rem <= cum_above + lane_bins[4]) {
+                                                        d_sel = 4;
+                                                        above_sel = cum_above;
+                                                        count_sel = lane_bins[4];
+                                                        found = 1;
+                                                    }
+                                                }
+                                                cum_above += lane_bins[4];
+                                                if (found == 0) {
+                                                    if (k_rem <= cum_above + lane_bins[3]) {
+                                                        d_sel = 3;
+                                                        above_sel = cum_above;
+                                                        count_sel = lane_bins[3];
+                                                        found = 1;
+                                                    }
+                                                }
+                                                cum_above += lane_bins[3];
+                                                if (found == 0) {
+                                                    if (k_rem <= cum_above + lane_bins[2]) {
+                                                        d_sel = 2;
+                                                        above_sel = cum_above;
+                                                        count_sel = lane_bins[2];
+                                                        found = 1;
+                                                    }
+                                                }
+                                                cum_above += lane_bins[2];
+                                                if (found == 0) {
+                                                    if (k_rem <= cum_above + lane_bins[1]) {
+                                                        d_sel = 1;
+                                                        above_sel = cum_above;
+                                                        count_sel = lane_bins[1];
+                                                        found = 1;
+                                                    }
+                                                }
+                                                cum_above += lane_bins[1];
+                                                if (found == 0) {
+                                                    if (k_rem <= cum_above + lane_bins[0]) {
+                                                        d_sel = 0;
+                                                        above_sel = cum_above;
+                                                        count_sel = lane_bins[0];
+                                                        found = 1;
+                                                    }
+                                                }
+                                                cum_above += lane_bins[0];
+                                                int target_lane;
+                                                asm volatile("redux.sync.max.s32 %0, %1, 0xffffffff;" : "=r"(target_lane) : "r"(is_target * lane_0));
+                                                int digit_sel = __shfl_sync(0xFFFFFFFF, d_sel, target_lane);
+                                                int above_cnt = __shfl_sync(0xFFFFFFFF, above_sel, target_lane);
+                                                int bucket_cnt = __shfl_sync(0xFFFFFFFF, count_sel, target_lane);
+                                                k_rem = k_rem - above_cnt;
+                                                kept_above += above_cnt;
+                                                prefix = prefix << 8 | (unsigned long long)(unsigned int)(target_lane * 8 + digit_sel);
+                                                edge = prefix << (unsigned long long)shift;
+                                                if (km_pair >= kept_above + bucket_cnt) {
+                                                    break;
+                                                }
+                                            }
+                                            unsigned long long edge_0 = edge;
+                                            if (half == 0) {
+                                                int write_pos = 0;
+                                                #pragma unroll 1
+                                                for (int e0 = 0; e0 < c_pair; e0 += 256) {
+                                                    unsigned long long ent[8];
+                                                    #pragma unroll
+                                                    for (int u_3 = 0; u_3 < 8; u_3++) {
+                                                        ent[u_3] = 0;
+                                                        if (c_pair > e0 + lane_0 + 32 * u_3) {
+                                                            ent[u_3] = (unsigned long long)Cand[buf_pair + e0 + lane_0 + 32 * u_3];
+                                                        }
+                                                    }
+                                                    #pragma unroll
+                                                    for (int u_4 = 0; u_4 < 8; u_4++) {
+                                                        int keep = 0;
+                                                        if (c_pair > e0 + lane_0 + 32 * u_4) {
+                                                            unsigned int bits_1 = (unsigned int)(ent[u_4] >> 32);
+                                                            int kid_1 = (int)(unsigned int)(ent[u_4] & 4294967295);
+                                                            unsigned int magnitude_2 = bits_1 & 2147483647;
+                                                            unsigned int m_2 = ((magnitude_2 != 0) ? bits_1 : zero_u);
+                                                            unsigned int key32_2 = (((m_2 & sign_mask) != 0) ? ~m_2 : m_2 | sign_mask);
+                                                            if (magnitude_2 > nan_floor) {
+                                                                key32_2 = zero_u;
+                                                            }
+                                                            unsigned long long key64_2 = (unsigned long long)key32_2 << 32 | (unsigned long long)(unsigned int)kid_1;
+                                                            unsigned long long key_1 = key64_2;
+                                                            keep = ((key_1 >= edge_0) ? 1 : 0);
+                                                        }
+                                                        unsigned int vote = __ballot_sync(0xFFFFFFFF, keep != 0);
+                                                        if (keep != 0) {
+                                                            Cand[buf_pair + write_pos + (int)(unsigned int)__popc(vote & lower_lanes)] = (long long)ent[u_4];
+                                                        }
+                                                        write_pos += (int)(unsigned int)__popc(vote);
+                                                    }
+                                                }
+                                                if (lane_0 == 0) {
+                                                    s_count[slot_pair] = write_pos;
+                                                    s_tau[slot_pair * 2] = (int)(unsigned int)edge_0;
+                                                    s_tau[slot_pair * 2 + 1] = (int)(unsigned int)(edge_0 >> 32);
+                                                }
+                                            }
+                                            asm volatile("barrier.sync %0, 64;" :: "r"(pair_bar) : "memory");
+                                        }
+                                        asm volatile("barrier.sync %0, 128;" :: "r"(1 + wg) : "memory");
+                                        if (need[0] != 0) {
+                                            unsigned int lo = (unsigned int)s_tau[wg * 2 * 2];
+                                            unsigned int hi = (unsigned int)s_tau[wg * 2 * 2 + 1];
+                                            unsigned long long tau_new = (unsigned long long)hi << 32 | (unsigned long long)lo;
+#if __CUDA_ARCH__ == 1000
+                                            unsigned long long _max_10 = ((tau_new) > (tau[0]) ? (tau_new) : (tau[0]));
+                                            tau[0] = _max_10;
+#else
+                                            unsigned long long _max_12 = ((tau_new) > (tau[0]) ? (tau_new) : (tau[0]));
+                                            tau[0] = _max_12;
+#endif
+                                        }
+                                        if (need[1] != 0) {
+                                            unsigned int lo_1 = (unsigned int)s_tau[(wg * 2 + 1) * 2];
+                                            unsigned int hi_1 = (unsigned int)s_tau[(wg * 2 + 1) * 2 + 1];
+                                            unsigned long long tau_new_1 = (unsigned long long)hi_1 << 32 | (unsigned long long)lo_1;
+#if __CUDA_ARCH__ == 1000
+                                            unsigned long long _max_11 = ((tau_new_1) > (tau[1]) ? (tau_new_1) : (tau[1]));
+                                            tau[1] = _max_11;
+#else
+                                            unsigned long long _max_13 = ((tau_new_1) > (tau[1]) ? (tau_new_1) : (tau[1]));
+                                            tau[1] = _max_13;
+#endif
+                                        }
+                                    }
+                                }
+                            }
+                            asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+                            mbarrier_arrive(q_empty_addr);
+                            _phase_q_full_2 ^= 1;
+                            int c_final = 0;
+                            asm volatile("barrier.sync %0, 128;" :: "r"(1 + wg) : "memory");
+                            c_final = s_count[slot_pair];
+                            int verdict = 0;
+                            if (attempt_3 == 0) {
+                                int fail_pair = 0;
+                                if (valid_pair != 0) {
+#if __CUDA_ARCH__ == 1000
+                                    int _min_12 = ((top_k) < (visible_pair) ? (top_k) : (visible_pair));
+                                    if (c_final < _min_12) {
+#else
+                                    int _min_14 = ((top_k) < (visible_pair) ? (top_k) : (visible_pair));
+                                    if (c_final < _min_14) {
+#endif
+                                        fail_pair = 1;
+                                    }
+                                }
+#if __CUDA_ARCH__ == 1000
+                                if (half == 0) {
+                                    if (lane_0 == 0) {
+                                        s_fail[slot_pair] = fail_pair;
+#else
+                                int need_verdict = ((n_sample_1 > 0) ? 1 : 0);
+                                if (need_verdict != 0) {
+                                    if (half == 0) {
+                                        if (lane_0 == 0) {
+                                            s_fail[slot_pair] = fail_pair;
+                                        }
+#endif
+                                    }
+#if __CUDA_ARCH__ == 1000
+                                }
+                                asm volatile("barrier.sync 4, 384;" ::: "memory");
+                                int vread = 0;
+                                if (lane_0 == 0) {
+                                    uint32_t shared_weak;
+                                    asm volatile("ld.shared.b32 %0, [%1];" : "=r"(shared_weak) : "r"(static_cast<uint32_t>(s_fail_addr)));
+                                    unsigned int f = shared_weak;
+                                    for (int fw = 1; fw < 6; fw++) {
+                                        uint32_t shared_weak_1;
+                                        asm volatile("ld.shared.b32 %0, [%1];" : "=r"(shared_weak_1) : "r"(static_cast<uint32_t>(s_fail_addr + (unsigned int)(4 * fw))));
+                                        f = f | shared_weak_1;
+#else
+                                    asm volatile("barrier.sync 4, 384;" ::: "memory");
+                                    int vread = 0;
+                                    if (lane_0 == 0) {
+                                        uint32_t shared_weak;
+                                        asm volatile("ld.shared.b32 %0, [%1];" : "=r"(shared_weak) : "r"(static_cast<uint32_t>(s_fail_addr)));
+                                        unsigned int f = shared_weak;
+                                        for (int fw = 1; fw < 6; fw++) {
+                                            uint32_t shared_weak_1;
+                                            asm volatile("ld.shared.b32 %0, [%1];" : "=r"(shared_weak_1) : "r"(static_cast<uint32_t>(s_fail_addr + (unsigned int)(4 * fw))));
+                                            f = f | shared_weak_1;
+                                        }
+                                        vread = (int)f;
+#endif
+                                    }
+#if __CUDA_ARCH__ == 1000
+                                    vread = (int)f;
+                                }
+                                int _shfl_sync_13 = __shfl_sync(0xFFFFFFFF, vread, 0);
+                                verdict = _shfl_sync_13;
+                                if (warp == 0) {
+                                    if (elect_sync()) {
+                                        int peer_u = rank_u ^ 1;
+                                        mbarrier_arrive_expect_tx(peer_bar_addr, 4);
+                                        uint32_t _cluster_mapa_14;
+                                        asm volatile(
+                                            "mapa.shared::cluster.u32 %0, %1, %2;"
+                                            : "=r"(_cluster_mapa_14) : "r"(s_pfail_addr), "r"(peer_u));
+                                        uint32_t _mbar_peer_15;
+                                        asm(
+                                            "mapa.shared::cluster.u32 %0, %1, %2;"
+                                            : "=r"(_mbar_peer_15) : "r"(peer_bar_addr), "r"(peer_u));
+                                        asm volatile(
+                                            "st.async.shared::cluster.mbarrier::complete_tx::bytes.b32 [%0], %1, [%2];"
+                                            :: "r"(_cluster_mapa_14), "r"(verdict), "r"(_mbar_peer_15) : "memory");
+#else
+                                    int _shfl_sync_15 = __shfl_sync(0xFFFFFFFF, vread, 0);
+                                    verdict = _shfl_sync_15;
+                                    if (warp == 0) {
+                                        if (elect_sync()) {
+                                            int peer_u = rank_u ^ 1;
+                                            mbarrier_arrive_expect_tx(peer_bar_addr, 4);
+                                            uint32_t _cluster_mapa_16;
+                                            asm volatile(
+                                                "mapa.shared::cluster.u32 %0, %1, %2;"
+                                                : "=r"(_cluster_mapa_16) : "r"(s_pfail_addr), "r"(peer_u));
+                                            uint32_t _mbar_peer_17;
+                                            asm(
+                                                "mapa.shared::cluster.u32 %0, %1, %2;"
+                                                : "=r"(_mbar_peer_17) : "r"(peer_bar_addr), "r"(peer_u));
+                                            asm volatile(
+                                                "st.async.shared::cluster.mbarrier::complete_tx::bytes.b32 [%0], %1, [%2];"
+                                                :: "r"(_cluster_mapa_16), "r"(verdict), "r"(_mbar_peer_17) : "memory");
+                                        }
+#endif
+                                    }
+#if __CUDA_ARCH__ == 1000
+                                }
+                                mbarrier_wait_cluster_hint(peer_bar_addr, _phase_peer_bar, 10000000);
+                                _phase_peer_bar ^= 1;
+                                verdict = verdict | s_pfail[0];
+                                if (warp == 0) {
+#else
+                                    mbarrier_wait_cluster_hint(peer_bar_addr, _phase_peer_bar, 10000000);
+                                    _phase_peer_bar ^= 1;
+                                    verdict = verdict | s_pfail[0];
+                                    if (warp == 0) {
+                                        if (elect_sync()) {
+                                            s_pfail[1] = verdict;
+                                        }
+                                    }
+                                    if (lane_0 == 0) {
+                                        mbarrier_arrive(verdict_bar_addr);
+                                    }
+                                } else if (warp == 0) {
+#endif
+                                    if (elect_sync()) {
+                                        s_pfail[1] = verdict;
+#if __CUDA_ARCH__ == 1000
+#else
+                                        mbarrier_arrive(verdict_bar_addr);
+#endif
+                                    }
+#if __CUDA_ARCH__ == 1000
+                                }
+                                if (lane_0 == 0) {
+                                    mbarrier_arrive(verdict_bar_addr);
+#else
+                                } else {
+                                    if (elect_sync()) {
+                                        mbarrier_arrive(verdict_bar_addr);
+                                    }
+#endif
+                                }
+                                verdict_unit += 1;
+                            }
+                            int n_sel = ((top_k) < (c_final) ? (top_k) : (c_final));
+                            asm volatile("barrier.sync %0, 128;" :: "r"(1 + wg) : "memory");
+                            if (verdict == 0) {
+                                unsigned long long edge_out = 0;
+                                int row = q0_3 + u_base + wg * 2 + pair;
+                                long long row_base = (long long)row * (long long)top_k;
+                                if (valid_pair != 0) {
+                                    if (c_final > top_k) {
+                                        int mid_c = (c_final / 2 + 31) / 32 * 32;
+                                        if (mid_c > c_final) {
+                                            mid_c = c_final;
+                                        }
+                                        int lo_c = 0;
+                                        int n_cand = mid_c;
+                                        if (half != 0) {
+                                            lo_c = mid_c;
+                                            n_cand = c_final - mid_c;
+                                        }
+                                        int out_pos = 0;
+                                        int k_rem_c = top_k;
+                                        int kept_above_c = 0;
+                                        unsigned long long prefix_c = 0;
+                                        unsigned long long edge_c = 0;
+                                        int digit_prev = 0;
+                                        int dummy_idx_c = hist_base + 1536;
+#if __CUDA_ARCH__ == 1000
+#else
+                                        unsigned long long s0_ent[1];
+                                        s0_ent[0] = (unsigned long long)Cand[buf_pair];
+                                        int s0_c = 0;
+                                        int hit_c = 0;
+                                        int h0s_c = 0;
+#endif
+                                        #pragma unroll 1
+                                        for (int p_1 = 0; p_1 < 8; p_1++) {
+                                            int shift_c = 56 - 8 * p_1;
+#if __CUDA_ARCH__ == 1000
+#else
+                                            int skip_s = 0;
+                                            if (p_1 == 1) {
+                                                if (hit_c != 0) {
+                                                    skip_s = 1;
+                                                }
+                                            }
+#endif
+                                            asm volatile("barrier.sync %0, 64;" :: "r"(pair_bar) : "memory");
+                                            if (half == 0) {
+                                                s_hist[hist_base + lane_0 * 8] = 0;
+                                                s_hist[hist_base + lane_0 * 8 + 1] = 0;
+                                                s_hist[hist_base + lane_0 * 8 + 2] = 0;
+                                                s_hist[hist_base + lane_0 * 8 + 3] = 0;
+                                                s_hist[hist_base + lane_0 * 8 + 4] = 0;
+                                                s_hist[hist_base + lane_0 * 8 + 5] = 0;
+                                                s_hist[hist_base + lane_0 * 8 + 6] = 0;
+                                                s_hist[hist_base + lane_0 * 8 + 7] = 0;
+                                            }
+#if __CUDA_ARCH__ == 1000
+                                            asm volatile("barrier.sync %0, 64;" :: "r"(pair_bar) : "memory");
+                                            int cand_pos = 0;
+                                            unsigned long long ring_c[12];
+                                            #pragma unroll
+                                            for (int s_pro_1 = 0; s_pro_1 < 2; s_pro_1++) {
+                                                #pragma unroll
+                                                for (int u_5 = 0; u_5 < 4; u_5++) {
+                                                    int idx_l_2 = s_pro_1 * 128 + lane_0 + 32 * u_5;
+                                                    ring_c[s_pro_1 * 4 + u_5] = 0;
+                                                    if (idx_l_2 < n_cand) {
+                                                        ring_c[s_pro_1 * 4 + u_5] = (unsigned long long)Cand[buf_pair + lo_c + idx_l_2];
+#else
+                                            if (half == 0) {
+                                                if (skip_s != 0) {
+                                                    int h1_lane = 0;
+                                                    if (lane_0 != 0) {
+                                                        int h1_v0_0 = s_hist[hist_base + lane_0 * 8 + 1536];
+                                                        s_hist[hist_base + lane_0 * 8] = h1_v0_0;
+                                                        h1_lane += h1_v0_0;
+                                                    }
+                                                    int h1_v_0 = s_hist[hist_base + lane_0 * 8 + 1 + 1536];
+                                                    s_hist[hist_base + lane_0 * 8 + 1] = h1_v_0;
+                                                    h1_lane += h1_v_0;
+                                                    int h1_v_1 = s_hist[hist_base + lane_0 * 8 + 2 + 1536];
+                                                    s_hist[hist_base + lane_0 * 8 + 2] = h1_v_1;
+                                                    h1_lane += h1_v_1;
+                                                    int h1_v_2 = s_hist[hist_base + lane_0 * 8 + 3 + 1536];
+                                                    s_hist[hist_base + lane_0 * 8 + 3] = h1_v_2;
+                                                    h1_lane += h1_v_2;
+                                                    int h1_v_3 = s_hist[hist_base + lane_0 * 8 + 4 + 1536];
+                                                    s_hist[hist_base + lane_0 * 8 + 4] = h1_v_3;
+                                                    h1_lane += h1_v_3;
+                                                    int h1_v_4 = s_hist[hist_base + lane_0 * 8 + 5 + 1536];
+                                                    s_hist[hist_base + lane_0 * 8 + 5] = h1_v_4;
+                                                    h1_lane += h1_v_4;
+                                                    int h1_v_5 = s_hist[hist_base + lane_0 * 8 + 6 + 1536];
+                                                    s_hist[hist_base + lane_0 * 8 + 6] = h1_v_5;
+                                                    h1_lane += h1_v_5;
+                                                    int h1_v_6 = s_hist[hist_base + lane_0 * 8 + 7 + 1536];
+                                                    s_hist[hist_base + lane_0 * 8 + 7] = h1_v_6;
+                                                    h1_lane += h1_v_6;
+                                                    int h1_sum;
+                                                    asm volatile("redux.sync.add.s32 %0, %1, 0xffffffff;" : "=r"(h1_sum) : "r"(h1_lane));
+                                                    if (lane_0 == 0) {
+                                                        s_hist[hist_base] = h0s_c - h1_sum;
+#endif
+                                                    }
+                                                }
+#if __CUDA_ARCH__ == 1000
+#else
+                                            } else if (p_1 == 0) {
+                                                if (lane_0 != 0) {
+                                                    s_hist[hist_base + lane_0 * 8 + 1536] = 0;
+                                                }
+                                                s_hist[hist_base + lane_0 * 8 + 1 + 1536] = 0;
+                                                s_hist[hist_base + lane_0 * 8 + 2 + 1536] = 0;
+                                                s_hist[hist_base + lane_0 * 8 + 3 + 1536] = 0;
+                                                s_hist[hist_base + lane_0 * 8 + 4 + 1536] = 0;
+                                                s_hist[hist_base + lane_0 * 8 + 5 + 1536] = 0;
+                                                s_hist[hist_base + lane_0 * 8 + 6 + 1536] = 0;
+                                                s_hist[hist_base + lane_0 * 8 + 7 + 1536] = 0;
+#endif
+                                            }
+#if __CUDA_ARCH__ == 1000
+                                            int nbat_c = (n_cand + 128 - 1) / 128;
+#else
+                                            asm volatile("barrier.sync %0, 64;" :: "r"(pair_bar) : "memory");
+                                            int cand_pos = 0;
+                                            int n_save = n_cand;
+                                            if (skip_s != 0) {
+                                                n_cand = 0;
+                                            }
+                                            int pw_c = (int)(prefix_c & 65535);
+                                            if (p_1 == 0) {
+                                                unsigned int bits_2 = (unsigned int)(s0_ent[0] >> 32);
+                                                int kid_2 = (int)(unsigned int)(s0_ent[0] & 4294967295);
+                                                unsigned int magnitude_3 = bits_2 & 2147483647;
+                                                unsigned int m_3 = ((magnitude_3 != 0) ? bits_2 : zero_u);
+                                                unsigned int key32_3 = (((m_3 & sign_mask) != 0) ? ~m_3 : m_3 | sign_mask);
+                                                if (magnitude_3 > nan_floor) {
+                                                    key32_3 = zero_u;
+                                                }
+                                                unsigned long long key64_3 = (unsigned long long)key32_3 << 32 | (unsigned long long)(unsigned int)kid_2;
+                                                unsigned long long key_2 = key64_3;
+                                                s0_c = (int)(key_2 >> 56 & 255);
+                                            }
+#endif
+                                            #pragma unroll 1
+#if __CUDA_ARCH__ == 1000
+                                            for (int g_1 = 0; g_1 < nbat_c; g_1 += 3) {
+#else
+                                            for (int e0_1 = 0; e0_1 < n_cand; e0_1 += 256) {
+                                                unsigned long long ent_c[8];
+#endif
+                                                #pragma unroll
+#if __CUDA_ARCH__ == 1000
+                                                for (int s_st_1 = 0; s_st_1 < 3; s_st_1++) {
+                                                    #pragma unroll
+                                                    for (int u_6 = 0; u_6 < 4; u_6++) {
+                                                        int valid_c = ((n_cand > (g_1 + s_st_1) * 128 + lane_0 + 32 * u_6) ? 1 : 0);
+                                                        unsigned int bits_2 = (unsigned int)(ring_c[s_st_1 * 4 + u_6] >> 32);
+                                                        int kid_2 = (int)(unsigned int)(ring_c[s_st_1 * 4 + u_6] & 4294967295);
+                                                        unsigned int magnitude_3 = bits_2 & 2147483647;
+                                                        unsigned int m_3 = ((magnitude_3 != 0) ? bits_2 : zero_u);
+                                                        unsigned int key32_3 = (((m_3 & sign_mask) != 0) ? ~m_3 : m_3 | sign_mask);
+                                                        if (magnitude_3 > nan_floor) {
+                                                            key32_3 = zero_u;
+                                                        }
+                                                        unsigned long long key64_3 = (unsigned long long)key32_3 << 32 | (unsigned long long)(unsigned int)kid_2;
+                                                        unsigned long long key_2 = key64_3;
+                                                        unsigned long long key_c = key_2;
+                                                        unsigned long long ks_c = key_c >> (unsigned long long)shift_c;
+                                                        int digit_c = (int)(ks_c & 255);
+                                                        if (p_1 == 0) {
+                                                            int bin_c0 = ((valid_c != 0) ? hist_base + digit_c : dummy_idx_c);
+                                                            atomicAdd(&s_hist[bin_c0], 1);
+                                                        } else {
+                                                            int dprev_c = (int)(ks_c >> 8 & 255);
+                                                            int keep_c = 0;
+                                                            int stay_c = 0;
+                                                            if (valid_c != 0) {
+                                                                if (dprev_c > digit_prev) {
+                                                                    keep_c = 1;
+                                                                }
+                                                                if (dprev_c == digit_prev) {
+                                                                    stay_c = 1;
+                                                                }
+                                                            }
+                                                            unsigned int _vote_1 = __ballot_sync(0xFFFFFFFF, keep_c != 0);
+                                                            unsigned int _vote_2 = __ballot_sync(0xFFFFFFFF, stay_c != 0);
+                                                            if (keep_c != 0) {
+                                                                int rank_c = out_pos + (int)(unsigned int)__popc(_vote_1 & lower_lanes);
+                                                                long long slot_c = row_base + (long long)rank_c;
+                                                                if (half != 0) {
+                                                                    slot_c = row_base + (long long)(top_k - 1 - rank_c);
+                                                                }
+                                                                float score_c = 0.0f;
+                                                                unsigned int bits_2_1 = (unsigned int)(ring_c[s_st_1 * 4 + u_6] >> 32);
+                                                                score_c = reinterpret_cast<float*>(&bits_2_1)[0];
+                                                                int kid_2_1 = (int)(unsigned int)(ring_c[s_st_1 * 4 + u_6] & 4294967295);
+                                                                Indices[slot_c] = kid_2_1;
+                                                                Scores[slot_c] = score_c;
+                                                            }
+                                                            if (stay_c != 0) {
+                                                                Cand[buf_pair + lo_c + cand_pos + (int)(unsigned int)__popc(_vote_2 & lower_lanes)] = (long long)ring_c[s_st_1 * 4 + u_6];
+                                                            }
+                                                            out_pos += (int)(unsigned int)__popc(_vote_1);
+                                                            cand_pos += (int)(unsigned int)__popc(_vote_2);
+                                                            int bin_c1 = ((stay_c != 0) ? hist_base + digit_c : dummy_idx_c);
+                                                            atomicAdd(&s_hist[bin_c1], 1);
+                                                        }
+#else
+                                                for (int u_5 = 0; u_5 < 8; u_5++) {
+                                                    ent_c[u_5] = 0;
+                                                    if (n_cand > e0_1 + lane_0 + 32 * u_5) {
+                                                        ent_c[u_5] = (unsigned long long)Cand[buf_pair + lo_c + e0_1 + lane_0 + 32 * u_5];
+#endif
+                                                    }
+#if __CUDA_ARCH__ == 1000
+                                                    #pragma unroll
+                                                    for (int u_7 = 0; u_7 < 4; u_7++) {
+                                                        int idx_l_3 = (g_1 + s_st_1 + 2) * 128 + lane_0 + 32 * u_7;
+                                                        ring_c[(s_st_1 + 2) % 3 * 4 + u_7] = 0;
+                                                        if (idx_l_3 < n_cand) {
+                                                            ring_c[(s_st_1 + 2) % 3 * 4 + u_7] = (unsigned long long)Cand[buf_pair + lo_c + idx_l_3];
+#else
+                                                }
+                                                #pragma unroll
+                                                for (int u_6 = 0; u_6 < 8; u_6++) {
+                                                    int valid_c = ((n_cand > e0_1 + lane_0 + 32 * u_6) ? 1 : 0);
+                                                    unsigned int bits_3 = (unsigned int)(ent_c[u_6] >> 32);
+                                                    int kid_3 = (int)(unsigned int)(ent_c[u_6] & 4294967295);
+                                                    unsigned int magnitude_4 = bits_3 & 2147483647;
+                                                    unsigned int m_4 = ((magnitude_4 != 0) ? bits_3 : zero_u);
+                                                    unsigned int key32_4 = (((m_4 & sign_mask) != 0) ? ~m_4 : m_4 | sign_mask);
+                                                    if (magnitude_4 > nan_floor) {
+                                                        key32_4 = zero_u;
+                                                    }
+                                                    unsigned long long key64_4 = (unsigned long long)key32_4 << 32 | (unsigned long long)(unsigned int)kid_3;
+                                                    unsigned long long key_3 = key64_4;
+                                                    unsigned long long key_c = key_3;
+                                                    unsigned long long ks_c = key_c >> (unsigned long long)shift_c;
+                                                    int digit_c = (int)(ks_c & 255);
+                                                    if (p_1 == 0) {
+                                                        int bin_c0 = ((valid_c != 0) ? hist_base + digit_c : dummy_idx_c);
+                                                        atomicAdd(&s_hist[bin_c0], 1);
+                                                        int bin_h1 = ((valid_c != 0 && digit_c == s0_c) ? dummy_idx_c + (int)(key_c >> 48 & 255) : dummy_idx_c);
+                                                        atomicAdd(&s_hist[bin_h1], 1);
+                                                    } else {
+                                                        int dprev_c = (int)(ks_c >> 8 & 65535);
+                                                        int keep_c = 0;
+                                                        int stay_c = 0;
+                                                        if (valid_c != 0) {
+                                                            if (dprev_c > pw_c) {
+                                                                keep_c = 1;
+                                                            }
+                                                            if (dprev_c == pw_c) {
+                                                                stay_c = 1;
+                                                            }
+#endif
+                                                        }
+#if __CUDA_ARCH__ == 1000
+#else
+                                                        unsigned int _vote_1 = __ballot_sync(0xFFFFFFFF, keep_c != 0);
+                                                        unsigned int _vote_2 = __ballot_sync(0xFFFFFFFF, stay_c != 0);
+                                                        if (keep_c != 0) {
+                                                            int rank_c = out_pos + (int)(unsigned int)__popc(_vote_1 & lower_lanes);
+                                                            long long slot_c = row_base + (long long)rank_c;
+                                                            if (half != 0) {
+                                                                slot_c = row_base + (long long)(top_k - 1 - rank_c);
+                                                            }
+                                                            float score_c = 0.0f;
+                                                            unsigned int bits_2_1 = (unsigned int)(ent_c[u_6] >> 32);
+                                                            score_c = reinterpret_cast<float*>(&bits_2_1)[0];
+                                                            int kid_2_1 = (int)(unsigned int)(ent_c[u_6] & 4294967295);
+                                                            Indices[slot_c] = kid_2_1;
+                                                            Scores[slot_c] = score_c;
+                                                        }
+                                                        if (stay_c != 0) {
+                                                            Cand[buf_pair + lo_c + cand_pos + (int)(unsigned int)__popc(_vote_2 & lower_lanes)] = (long long)ent_c[u_6];
+                                                        }
+                                                        out_pos += (int)(unsigned int)__popc(_vote_1);
+                                                        cand_pos += (int)(unsigned int)__popc(_vote_2);
+                                                        int bin_c1 = ((stay_c != 0) ? hist_base + digit_c : dummy_idx_c);
+                                                        atomicAdd(&s_hist[bin_c1], 1);
+#endif
+                                                    }
+                                                }
+                                            }
+                                            if (p_1 > 0) {
+#if __CUDA_ARCH__ == 1000
+                                                n_cand = cand_pos;
+#else
+                                                n_cand = ((skip_s == 0) ? cand_pos : n_save);
+#endif
+                                            }
+                                            asm volatile("barrier.sync %0, 64;" :: "r"(pair_bar) : "memory");
+                                            int lane_bins_c[8];
+                                            int lane_sum_c = 0;
+                                            lane_bins_c[0] = s_hist[hist_base + lane_0 * 8];
+                                            lane_sum_c += lane_bins_c[0];
+                                            lane_bins_c[1] = s_hist[hist_base + lane_0 * 8 + 1];
+                                            lane_sum_c += lane_bins_c[1];
+                                            lane_bins_c[2] = s_hist[hist_base + lane_0 * 8 + 2];
+                                            lane_sum_c += lane_bins_c[2];
+                                            lane_bins_c[3] = s_hist[hist_base + lane_0 * 8 + 3];
+                                            lane_sum_c += lane_bins_c[3];
+                                            lane_bins_c[4] = s_hist[hist_base + lane_0 * 8 + 4];
+                                            lane_sum_c += lane_bins_c[4];
+                                            lane_bins_c[5] = s_hist[hist_base + lane_0 * 8 + 5];
+                                            lane_sum_c += lane_bins_c[5];
+                                            lane_bins_c[6] = s_hist[hist_base + lane_0 * 8 + 6];
+                                            lane_sum_c += lane_bins_c[6];
+                                            lane_bins_c[7] = s_hist[hist_base + lane_0 * 8 + 7];
+                                            lane_sum_c += lane_bins_c[7];
+                                            int suffix_c = lane_sum_c;
+                                            int above_part_c_4_0 = __shfl_down_sync(0xFFFFFFFF, suffix_c, 1, 32);
+                                            if (lane_0 + 1 < 32) {
+                                                suffix_c += above_part_c_4_0;
+                                            }
+                                            int above_part_c_4_1 = __shfl_down_sync(0xFFFFFFFF, suffix_c, 2, 32);
+                                            if (lane_0 + 2 < 32) {
+                                                suffix_c += above_part_c_4_1;
+                                            }
+                                            int above_part_c_4_2 = __shfl_down_sync(0xFFFFFFFF, suffix_c, 4, 32);
+                                            if (lane_0 + 4 < 32) {
+                                                suffix_c += above_part_c_4_2;
+                                            }
+                                            int above_part_c_4_3 = __shfl_down_sync(0xFFFFFFFF, suffix_c, 8, 32);
+                                            if (lane_0 + 8 < 32) {
+                                                suffix_c += above_part_c_4_3;
+                                            }
+                                            int above_part_c_4_4 = __shfl_down_sync(0xFFFFFFFF, suffix_c, 16, 32);
+                                            if (lane_0 + 16 < 32) {
+                                                suffix_c += above_part_c_4_4;
+                                            }
+                                            int excl_c = suffix_c - lane_sum_c;
+                                            int is_target_c = ((excl_c < k_rem_c && k_rem_c <= excl_c + lane_sum_c) ? 1 : 0);
+                                            int d_sel_c = 0;
+                                            int above_sel_c = 0;
+                                            int count_sel_c = 0;
+                                            int found_c = 0;
+                                            int cum_above_c = excl_c;
+                                            if (found_c == 0) {
+                                                if (k_rem_c <= cum_above_c + lane_bins_c[7]) {
+                                                    d_sel_c = 7;
+                                                    above_sel_c = cum_above_c;
+                                                    count_sel_c = lane_bins_c[7];
+                                                    found_c = 1;
+                                                }
+                                            }
+                                            cum_above_c += lane_bins_c[7];
+                                            if (found_c == 0) {
+                                                if (k_rem_c <= cum_above_c + lane_bins_c[6]) {
+                                                    d_sel_c = 6;
+                                                    above_sel_c = cum_above_c;
+                                                    count_sel_c = lane_bins_c[6];
+                                                    found_c = 1;
+                                                }
+                                            }
+                                            cum_above_c += lane_bins_c[6];
+                                            if (found_c == 0) {
+                                                if (k_rem_c <= cum_above_c + lane_bins_c[5]) {
+                                                    d_sel_c = 5;
+                                                    above_sel_c = cum_above_c;
+                                                    count_sel_c = lane_bins_c[5];
+                                                    found_c = 1;
+                                                }
+                                            }
+                                            cum_above_c += lane_bins_c[5];
+                                            if (found_c == 0) {
+                                                if (k_rem_c <= cum_above_c + lane_bins_c[4]) {
+                                                    d_sel_c = 4;
+                                                    above_sel_c = cum_above_c;
+                                                    count_sel_c = lane_bins_c[4];
+                                                    found_c = 1;
+                                                }
+                                            }
+                                            cum_above_c += lane_bins_c[4];
+                                            if (found_c == 0) {
+                                                if (k_rem_c <= cum_above_c + lane_bins_c[3]) {
+                                                    d_sel_c = 3;
+                                                    above_sel_c = cum_above_c;
+                                                    count_sel_c = lane_bins_c[3];
+                                                    found_c = 1;
+                                                }
+                                            }
+                                            cum_above_c += lane_bins_c[3];
+                                            if (found_c == 0) {
+                                                if (k_rem_c <= cum_above_c + lane_bins_c[2]) {
+                                                    d_sel_c = 2;
+                                                    above_sel_c = cum_above_c;
+                                                    count_sel_c = lane_bins_c[2];
+                                                    found_c = 1;
+                                                }
+                                            }
+                                            cum_above_c += lane_bins_c[2];
+                                            if (found_c == 0) {
+                                                if (k_rem_c <= cum_above_c + lane_bins_c[1]) {
+                                                    d_sel_c = 1;
+                                                    above_sel_c = cum_above_c;
+                                                    count_sel_c = lane_bins_c[1];
+                                                    found_c = 1;
+                                                }
+                                            }
+                                            cum_above_c += lane_bins_c[1];
+                                            if (found_c == 0) {
+                                                if (k_rem_c <= cum_above_c + lane_bins_c[0]) {
+                                                    d_sel_c = 0;
+                                                    above_sel_c = cum_above_c;
+                                                    count_sel_c = lane_bins_c[0];
+                                                    found_c = 1;
+                                                }
+                                            }
+                                            cum_above_c += lane_bins_c[0];
+                                            int target_lane_c;
+                                            asm volatile("redux.sync.max.s32 %0, %1, 0xffffffff;" : "=r"(target_lane_c) : "r"(is_target_c * lane_0));
+                                            int digit_sel_c = __shfl_sync(0xFFFFFFFF, d_sel_c, target_lane_c);
+                                            int above_cnt_c = __shfl_sync(0xFFFFFFFF, above_sel_c, target_lane_c);
+                                            int bucket_cnt_c = __shfl_sync(0xFFFFFFFF, count_sel_c, target_lane_c);
+                                            k_rem_c = k_rem_c - above_cnt_c;
+                                            kept_above_c += above_cnt_c;
+                                            digit_prev = target_lane_c * 8 + digit_sel_c;
+                                            prefix_c = prefix_c << 8 | (unsigned long long)(unsigned int)digit_prev;
+#if __CUDA_ARCH__ == 1000
+#else
+                                            if (p_1 == 0) {
+                                                hit_c = ((digit_prev == s0_c) ? 1 : 0);
+                                                h0s_c = bucket_cnt_c;
+                                            }
+#endif
+                                            edge_c = prefix_c << (unsigned long long)shift_c;
+                                            if (kept_above_c + bucket_cnt_c <= top_k) {
+                                                break;
+                                            }
+                                        }
+#if __CUDA_ARCH__ == 1000
+                                        unsigned long long ring_f[12];
+                                        #pragma unroll
+                                        for (int s_pro_2 = 0; s_pro_2 < 2; s_pro_2++) {
+#else
+                                        #pragma unroll 1
+                                        for (int e0_2 = 0; e0_2 < n_cand; e0_2 += 256) {
+                                            unsigned long long ent_f[8];
+#endif
+                                            #pragma unroll
+#if __CUDA_ARCH__ == 1000
+                                            for (int u_8 = 0; u_8 < 4; u_8++) {
+                                                int idx_l_4 = s_pro_2 * 128 + lane_0 + 32 * u_8;
+                                                ring_f[s_pro_2 * 4 + u_8] = 0;
+                                                if (idx_l_4 < n_cand) {
+                                                    ring_f[s_pro_2 * 4 + u_8] = (unsigned long long)Cand[buf_pair + lo_c + idx_l_4];
+#else
+                                            for (int u_7 = 0; u_7 < 8; u_7++) {
+                                                ent_f[u_7] = 0;
+                                                if (n_cand > e0_2 + lane_0 + 32 * u_7) {
+                                                    ent_f[u_7] = (unsigned long long)Cand[buf_pair + lo_c + e0_2 + lane_0 + 32 * u_7];
+#endif
+                                                }
+                                            }
+#if __CUDA_ARCH__ == 1000
+                                        }
+                                        int nbat_f = (n_cand + 128 - 1) / 128;
+                                        #pragma unroll 1
+                                        for (int g_2 = 0; g_2 < nbat_f; g_2 += 3) {
+#endif
+                                            #pragma unroll
+#if __CUDA_ARCH__ == 1000
+                                            for (int s_st_2 = 0; s_st_2 < 3; s_st_2++) {
+                                                #pragma unroll
+                                                for (int u_9 = 0; u_9 < 4; u_9++) {
+                                                    int keep_f = 0;
+                                                    if (n_cand > (g_2 + s_st_2) * 128 + lane_0 + 32 * u_9) {
+                                                        unsigned int bits_3 = (unsigned int)(ring_f[s_st_2 * 4 + u_9] >> 32);
+                                                        int kid_3 = (int)(unsigned int)(ring_f[s_st_2 * 4 + u_9] & 4294967295);
+                                                        unsigned int magnitude_4 = bits_3 & 2147483647;
+                                                        unsigned int m_4 = ((magnitude_4 != 0) ? bits_3 : zero_u);
+                                                        unsigned int key32_4 = (((m_4 & sign_mask) != 0) ? ~m_4 : m_4 | sign_mask);
+                                                        if (magnitude_4 > nan_floor) {
+                                                            key32_4 = zero_u;
+                                                        }
+                                                        unsigned long long key64_4 = (unsigned long long)key32_4 << 32 | (unsigned long long)(unsigned int)kid_3;
+                                                        unsigned long long key_3 = key64_4;
+                                                        keep_f = ((key_3 >= edge_c) ? 1 : 0);
+#else
+                                            for (int u_8 = 0; u_8 < 8; u_8++) {
+                                                int keep_f = 0;
+                                                if (n_cand > e0_2 + lane_0 + 32 * u_8) {
+                                                    unsigned int bits_4 = (unsigned int)(ent_f[u_8] >> 32);
+                                                    int kid_4 = (int)(unsigned int)(ent_f[u_8] & 4294967295);
+                                                    unsigned int magnitude_5 = bits_4 & 2147483647;
+                                                    unsigned int m_5 = ((magnitude_5 != 0) ? bits_4 : zero_u);
+                                                    unsigned int key32_5 = (((m_5 & sign_mask) != 0) ? ~m_5 : m_5 | sign_mask);
+                                                    if (magnitude_5 > nan_floor) {
+                                                        key32_5 = zero_u;
+#endif
+                                                    }
+#if __CUDA_ARCH__ == 1000
+                                                    unsigned int _vote_3 = __ballot_sync(0xFFFFFFFF, keep_f != 0);
+                                                    if (keep_f != 0) {
+                                                        int rank_f = out_pos + (int)(unsigned int)__popc(_vote_3 & lower_lanes);
+                                                        long long slot_f = row_base + (long long)rank_f;
+                                                        if (half != 0) {
+                                                            slot_f = row_base + (long long)(top_k - 1 - rank_f);
+                                                        }
+                                                        float score_f = 0.0f;
+                                                        unsigned int bits_4 = (unsigned int)(ring_f[s_st_2 * 4 + u_9] >> 32);
+                                                        score_f = reinterpret_cast<float*>(&bits_4)[0];
+                                                        int kid_4 = (int)(unsigned int)(ring_f[s_st_2 * 4 + u_9] & 4294967295);
+                                                        Indices[slot_f] = kid_4;
+                                                        Scores[slot_f] = score_f;
+                                                    }
+                                                    out_pos += (int)(unsigned int)__popc(_vote_3);
+#else
+                                                    unsigned long long key64_5 = (unsigned long long)key32_5 << 32 | (unsigned long long)(unsigned int)kid_4;
+                                                    unsigned long long key_4 = key64_5;
+                                                    keep_f = ((key_4 >= edge_c) ? 1 : 0);
+#endif
+                                                }
+#if __CUDA_ARCH__ == 1000
+                                                #pragma unroll
+                                                for (int u_10 = 0; u_10 < 4; u_10++) {
+                                                    int idx_l_5 = (g_2 + s_st_2 + 2) * 128 + lane_0 + 32 * u_10;
+                                                    ring_f[(s_st_2 + 2) % 3 * 4 + u_10] = 0;
+                                                    if (idx_l_5 < n_cand) {
+                                                        ring_f[(s_st_2 + 2) % 3 * 4 + u_10] = (unsigned long long)Cand[buf_pair + lo_c + idx_l_5];
+#else
+                                                unsigned int _vote_3 = __ballot_sync(0xFFFFFFFF, keep_f != 0);
+                                                if (keep_f != 0) {
+                                                    int rank_f = out_pos + (int)(unsigned int)__popc(_vote_3 & lower_lanes);
+                                                    long long slot_f = row_base + (long long)rank_f;
+                                                    if (half != 0) {
+                                                        slot_f = row_base + (long long)(top_k - 1 - rank_f);
+#endif
+                                                    }
+#if __CUDA_ARCH__ == 1000
+#else
+                                                    float score_f = 0.0f;
+                                                    unsigned int bits_6 = (unsigned int)(ent_f[u_8] >> 32);
+                                                    score_f = reinterpret_cast<float*>(&bits_6)[0];
+                                                    int kid_5 = (int)(unsigned int)(ent_f[u_8] & 4294967295);
+                                                    Indices[slot_f] = kid_5;
+                                                    Scores[slot_f] = score_f;
+#endif
+                                                }
+#if __CUDA_ARCH__ == 1000
+#else
+                                                out_pos += (int)(unsigned int)__popc(_vote_3);
+#endif
+                                            }
+                                        }
+                                        if (half != 0) {
+                                            #pragma unroll 1
+                                            for (int pad_c = top_k + lane_0; pad_c < top_k; pad_c += 32) {
+                                                long long pad_slot_c = row_base + (long long)pad_c;
+                                                Indices[pad_slot_c] = -1;
+                                                Scores[pad_slot_c] = -CUDART_INF_F;
+                                            }
+                                        }
+                                    } else {
+                                        int mid_w = (c_final / 2 + 31) / 32 * 32;
+                                        if (mid_w > c_final) {
+                                            mid_w = c_final;
+                                        }
+                                        if (half == 0) {
+                                            int front_w = 0;
+                                            #pragma unroll 1
+#if __CUDA_ARCH__ == 1000
+                                            for (int e0_1 = 0; e0_1 < mid_w; e0_1 += 128) {
+                                                unsigned long long ent_wf[4];
+#else
+                                            for (int e0_3 = 0; e0_3 < mid_w; e0_3 += 256) {
+                                                unsigned long long ent_wf[8];
+#endif
+                                                #pragma unroll
+#if __CUDA_ARCH__ == 1000
+                                                for (int u_11 = 0; u_11 < 4; u_11++) {
+                                                    ent_wf[u_11] = 0;
+                                                    if (mid_w > e0_1 + lane_0 + 32 * u_11) {
+                                                        ent_wf[u_11] = (unsigned long long)Cand[buf_pair + e0_1 + lane_0 + 32 * u_11];
+#else
+                                                for (int u_9 = 0; u_9 < 8; u_9++) {
+                                                    ent_wf[u_9] = 0;
+                                                    if (mid_w > e0_3 + lane_0 + 32 * u_9) {
+                                                        ent_wf[u_9] = (unsigned long long)Cand[buf_pair + e0_3 + lane_0 + 32 * u_9];
+#endif
+                                                    }
+                                                }
+                                                #pragma unroll
+#if __CUDA_ARCH__ == 1000
+                                                for (int u_12 = 0; u_12 < 4; u_12++) {
+#else
+                                                for (int u_10 = 0; u_10 < 8; u_10++) {
+#endif
+                                                    int keep_wf = 0;
+#if __CUDA_ARCH__ == 1000
+                                                    if (mid_w > e0_1 + lane_0 + 32 * u_12) {
+                                                        unsigned int bits_6 = (unsigned int)(ent_wf[u_12] >> 32);
+                                                        int kid_5 = (int)(unsigned int)(ent_wf[u_12] & 4294967295);
+                                                        unsigned int magnitude_5 = bits_6 & 2147483647;
+                                                        unsigned int m_5 = ((magnitude_5 != 0) ? bits_6 : zero_u);
+                                                        unsigned int key32_5 = (((m_5 & sign_mask) != 0) ? ~m_5 : m_5 | sign_mask);
+                                                        if (magnitude_5 > nan_floor) {
+                                                            key32_5 = zero_u;
+#else
+                                                    if (mid_w > e0_3 + lane_0 + 32 * u_10) {
+                                                        unsigned int bits_7 = (unsigned int)(ent_wf[u_10] >> 32);
+                                                        int kid_6 = (int)(unsigned int)(ent_wf[u_10] & 4294967295);
+                                                        unsigned int magnitude_6 = bits_7 & 2147483647;
+                                                        unsigned int m_6 = ((magnitude_6 != 0) ? bits_7 : zero_u);
+                                                        unsigned int key32_6 = (((m_6 & sign_mask) != 0) ? ~m_6 : m_6 | sign_mask);
+                                                        if (magnitude_6 > nan_floor) {
+                                                            key32_6 = zero_u;
+#endif
+                                                        }
+#if __CUDA_ARCH__ == 1000
+                                                        unsigned long long key64_5 = (unsigned long long)key32_5 << 32 | (unsigned long long)(unsigned int)kid_5;
+                                                        unsigned long long key_4 = key64_5;
+                                                        keep_wf = ((key_4 >= edge_out) ? 1 : 0);
+#else
+                                                        unsigned long long key64_6 = (unsigned long long)key32_6 << 32 | (unsigned long long)(unsigned int)kid_6;
+                                                        unsigned long long key_5 = key64_6;
+                                                        keep_wf = ((key_5 >= edge_out) ? 1 : 0);
+#endif
+                                                    }
+                                                    unsigned int vote_1 = __ballot_sync(0xFFFFFFFF, keep_wf != 0);
+                                                    if (keep_wf != 0) {
+                                                        long long slot_wf = row_base + (long long)(front_w + (int)(unsigned int)__popc(vote_1 & lower_lanes));
+                                                        float score_wf = 0.0f;
+#if __CUDA_ARCH__ == 1000
+                                                        unsigned int bits_7 = (unsigned int)(ent_wf[u_12] >> 32);
+                                                        score_wf = reinterpret_cast<float*>(&bits_7)[0];
+                                                        int kid_6 = (int)(unsigned int)(ent_wf[u_12] & 4294967295);
+                                                        Indices[slot_wf] = kid_6;
+#else
+                                                        unsigned int bits_8 = (unsigned int)(ent_wf[u_10] >> 32);
+                                                        score_wf = reinterpret_cast<float*>(&bits_8)[0];
+                                                        int kid_7 = (int)(unsigned int)(ent_wf[u_10] & 4294967295);
+                                                        Indices[slot_wf] = kid_7;
+#endif
+                                                        Scores[slot_wf] = score_wf;
+                                                    }
+                                                    front_w += (int)(unsigned int)__popc(vote_1);
+                                                }
+                                            }
+                                        } else {
+                                            int back_w = 0;
+                                            #pragma unroll 1
+#if __CUDA_ARCH__ == 1000
+                                            for (int e0_2 = mid_w; e0_2 < c_final; e0_2 += 128) {
+                                                unsigned long long ent_wb[4];
+#else
+                                            for (int e0_4 = mid_w; e0_4 < c_final; e0_4 += 256) {
+                                                unsigned long long ent_wb[8];
+#endif
+                                                #pragma unroll
+#if __CUDA_ARCH__ == 1000
+                                                for (int u_13 = 0; u_13 < 4; u_13++) {
+                                                    ent_wb[u_13] = 0;
+                                                    if (c_final > e0_2 + lane_0 + 32 * u_13) {
+                                                        ent_wb[u_13] = (unsigned long long)Cand[buf_pair + e0_2 + lane_0 + 32 * u_13];
+#else
+                                                for (int u_11 = 0; u_11 < 8; u_11++) {
+                                                    ent_wb[u_11] = 0;
+                                                    if (c_final > e0_4 + lane_0 + 32 * u_11) {
+                                                        ent_wb[u_11] = (unsigned long long)Cand[buf_pair + e0_4 + lane_0 + 32 * u_11];
+#endif
+                                                    }
+                                                }
+                                                #pragma unroll
+#if __CUDA_ARCH__ == 1000
+                                                for (int u_14 = 0; u_14 < 4; u_14++) {
+#else
+                                                for (int u_12 = 0; u_12 < 8; u_12++) {
+#endif
+                                                    int keep_wb = 0;
+#if __CUDA_ARCH__ == 1000
+                                                    if (c_final > e0_2 + lane_0 + 32 * u_14) {
+                                                        unsigned int bits_8 = (unsigned int)(ent_wb[u_14] >> 32);
+                                                        int kid_7 = (int)(unsigned int)(ent_wb[u_14] & 4294967295);
+                                                        unsigned int magnitude_6 = bits_8 & 2147483647;
+                                                        unsigned int m_6 = ((magnitude_6 != 0) ? bits_8 : zero_u);
+                                                        unsigned int key32_6 = (((m_6 & sign_mask) != 0) ? ~m_6 : m_6 | sign_mask);
+                                                        if (magnitude_6 > nan_floor) {
+                                                            key32_6 = zero_u;
+#else
+                                                    if (c_final > e0_4 + lane_0 + 32 * u_12) {
+                                                        unsigned int bits_9 = (unsigned int)(ent_wb[u_12] >> 32);
+                                                        int kid_8 = (int)(unsigned int)(ent_wb[u_12] & 4294967295);
+                                                        unsigned int magnitude_7 = bits_9 & 2147483647;
+                                                        unsigned int m_7 = ((magnitude_7 != 0) ? bits_9 : zero_u);
+                                                        unsigned int key32_7 = (((m_7 & sign_mask) != 0) ? ~m_7 : m_7 | sign_mask);
+                                                        if (magnitude_7 > nan_floor) {
+                                                            key32_7 = zero_u;
+#endif
+                                                        }
+#if __CUDA_ARCH__ == 1000
+                                                        unsigned long long key64_6 = (unsigned long long)key32_6 << 32 | (unsigned long long)(unsigned int)kid_7;
+                                                        unsigned long long key_5 = key64_6;
+                                                        keep_wb = ((key_5 >= edge_out) ? 1 : 0);
+#else
+                                                        unsigned long long key64_7 = (unsigned long long)key32_7 << 32 | (unsigned long long)(unsigned int)kid_8;
+                                                        unsigned long long key_6 = key64_7;
+                                                        keep_wb = ((key_6 >= edge_out) ? 1 : 0);
+#endif
+                                                    }
+                                                    unsigned int vote_1_1 = __ballot_sync(0xFFFFFFFF, keep_wb != 0);
+                                                    if (keep_wb != 0) {
+                                                        long long slot_wb = row_base + (long long)(n_sel - 1 - (back_w + (int)(unsigned int)__popc(vote_1_1 & lower_lanes)));
+                                                        float score_wb = 0.0f;
+#if __CUDA_ARCH__ == 1000
+                                                        unsigned int bits_9 = (unsigned int)(ent_wb[u_14] >> 32);
+                                                        score_wb = reinterpret_cast<float*>(&bits_9)[0];
+                                                        int kid_8 = (int)(unsigned int)(ent_wb[u_14] & 4294967295);
+                                                        Indices[slot_wb] = kid_8;
+#else
+                                                        unsigned int bits_10 = (unsigned int)(ent_wb[u_12] >> 32);
+                                                        score_wb = reinterpret_cast<float*>(&bits_10)[0];
+                                                        int kid_9 = (int)(unsigned int)(ent_wb[u_12] & 4294967295);
+                                                        Indices[slot_wb] = kid_9;
+#endif
+                                                        Scores[slot_wb] = score_wb;
+                                                    }
+                                                    back_w += (int)(unsigned int)__popc(vote_1_1);
+                                                }
+                                            }
+                                            #pragma unroll 1
+                                            for (int pad_w = n_sel + lane_0; pad_w < top_k; pad_w += 32) {
+                                                long long pad_slot_w = row_base + (long long)pad_w;
+                                                Indices[pad_slot_w] = -1;
+                                                Scores[pad_slot_w] = -CUDART_INF_F;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            if (verdict == 0) {
+                                break;
+                            }
+                        }
+                    }
+                }
+                unit_base += (nb_3 + 1) / 2;
+            }
+            asm volatile("barrier.sync 4, 384;" ::: "memory");
+            if (warp == 0) {
+                asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;" :: "r"(0), "r"(512));
+            }
+        }
+    }
+
+    // Kernel teardown ops
+    asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");
+    asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
+
+    // Cleanup
+}
+
+} // extern "C"

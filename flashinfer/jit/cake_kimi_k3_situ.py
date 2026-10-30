@@ -1,0 +1,1527 @@
+"""
+Copyright (c) 2026 by FlashInfer team.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+  http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+"""
+
+from functools import cache
+from pathlib import Path
+from typing import Any
+
+from . import env as jit_env
+from .core import gen_jit_spec, sm100a_nvcc_flags, sm103a_nvcc_flags
+
+# Generated-program registry of the Cake SiTU backend. One record per physical
+# program (device + binding translation units, launch contract, the
+# architectures it compiles for); every architecture compiles the same source
+# with its own flag set. A program whose exported binding differed from another
+# program's only in the kernel symbol and the host-shim namespace names that
+# program's binding in "sources" and selects its own values through the
+# CAKE_SITU_KERNEL / CAKE_SITU_SHIM compile definitions in "compile_flags".
+# Written by the Cake exporter and hand-edited here pending exporter support.
+MODULES: dict[str, dict[str, Any]] = {
+    "cake_kimi_k3_nvfp4_situ_routed_moe_13ccea112756c78b4f7f": {
+        "sources": [
+            "csrc/fused_moe/cake_kimi_k3_situ/cake_kimi_k3_nvfp4_situ_routed_moe_13ccea112756c78b4f7f_kernel.cu",
+            "csrc/fused_moe/cake_kimi_k3_situ/cake_kimi_k3_nvfp4_situ_routed_moe_13ccea112756c78b4f7f_binding.cu",
+        ],
+        "compile_flags": [],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["tma_buffer", "A"],
+            ["tma_buffer", "B"],
+            ["tma_buffer", "SFA"],
+            ["tma_buffer", "SFB"],
+            ["tma_buffer", "C_tma"],
+            ["buffer", "C"],
+            ["buffer", "scale_c"],
+            ["buffer", "tile_expert"],
+            ["buffer", "tile_mn_limit"],
+            ["buffer", "num_non_exiting_ctas"],
+            ["buffer", "work_counter"],
+            ["parameter", "M"],
+            ["parameter", "K"],
+            ["parameter", "grid_m"],
+            ["parameter", "grid_n"],
+            ["parameter", "K_tiles"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "specializations": {},
+        "arches": ["sm_103a"],
+        "closure_sha256": "cb10bc3b20619239df66e149374dfc025f2cefb59d0e12996c8488457b0f3ff3",
+    },
+    "cake_kimi_k3_nvfp4_situ_routed_moe_151cbac5f51ddfa2f9f6": {
+        "sources": [
+            "csrc/fused_moe/cake_kimi_k3_situ/cake_kimi_k3_nvfp4_situ_routed_moe_151cbac5f51ddfa2f9f6_kernel.cu",
+            "csrc/fused_moe/cake_kimi_k3_situ/cake_kimi_k3_nvfp4_situ_routed_moe_151cbac5f51ddfa2f9f6_binding.cu",
+        ],
+        "compile_flags": [],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["tma_buffer", "A"],
+            ["tma_buffer", "B"],
+            ["tma_buffer", "SFA"],
+            ["tma_buffer", "SFB"],
+            ["tma_buffer", "C_tma"],
+            ["buffer", "C"],
+            ["buffer", "scale_c"],
+            ["buffer", "tile_expert"],
+            ["buffer", "tile_mn_limit"],
+            ["parameter", "M"],
+            ["parameter", "K"],
+            ["parameter", "grid_m"],
+            ["parameter", "grid_n"],
+            ["parameter", "K_tiles"],
+            ["buffer", "total_tiles"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "specializations": {},
+        "arches": ["sm_100a", "sm_103a"],
+        "closure_sha256": "866a71ccf52b6e5b73a6b045e652bed674f2cdadcce65bd94be1035c2a8ce6c0",
+    },
+    "cake_kimi_k3_nvfp4_situ_routed_moe_177a36ce879102b71f56": {
+        "sources": [
+            "csrc/fused_moe/cake_kimi_k3_situ/cake_kimi_k3_nvfp4_situ_routed_moe_177a36ce879102b71f56_kernel.cu",
+            "csrc/fused_moe/cake_kimi_k3_situ/cake_kimi_k3_nvfp4_situ_routed_moe_177a36ce879102b71f56_binding.cu",
+        ],
+        "compile_flags": [],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["tma_buffer", "A"],
+            ["buffer", "B"],
+            ["tma_buffer", "SFA"],
+            ["buffer", "SFB"],
+            ["tma_buffer", "C"],
+            ["buffer", "SFC"],
+            ["buffer", "total_tiles"],
+            ["buffer", "x"],
+            ["buffer", "qx"],
+            ["buffer", "topk_ids"],
+            ["buffer", "token_to_permuted"],
+            ["buffer", "expert_counts"],
+            ["buffer", "expert_tile_offsets"],
+            ["buffer", "expert_scatter_offsets"],
+            ["buffer", "route_map"],
+            ["buffer", "tile_expert"],
+            ["buffer", "tile_mn_limit"],
+            ["buffer", "scale_c"],
+            ["buffer", "scale_gate"],
+            ["buffer", "clamp_limit"],
+            ["buffer", "act_alpha"],
+            ["buffer", "act_beta"],
+            ["parameter", "M_out"],
+            ["parameter", "K"],
+            ["parameter", "grid_m"],
+            ["parameter", "grid_n"],
+            ["parameter", "K_tiles"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "specializations": {},
+        "arches": ["sm_100a", "sm_103a"],
+        "closure_sha256": "584440e8f6d6df05f1dc1e8b228af88b4d2667ce9b15e88db34207ea1a8fb876",
+    },
+    "cake_kimi_k3_nvfp4_situ_routed_moe_194f5c89b6e5659e023f": {
+        "sources": [
+            "csrc/fused_moe/cake_kimi_k3_situ/cake_kimi_k3_nvfp4_situ_routed_moe_194f5c89b6e5659e023f_kernel.cu",
+            "csrc/fused_moe/cake_kimi_k3_situ/cake_kimi_k3_nvfp4_situ_routed_moe_194f5c89b6e5659e023f_binding.cu",
+        ],
+        "compile_flags": [],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["buffer", "topk_ids"],
+            ["buffer", "expert_counts"],
+            ["parameter", "total_pairs"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "specializations": {},
+        "arches": ["sm_100a"],
+        "closure_sha256": "79dc6f6073d1e2f702c05b31e0ceeec461d2796bc2cde9079a899bf686033e33",
+    },
+    "cake_kimi_k3_nvfp4_situ_routed_moe_1b1fd4abd86b36aca7f2": {
+        "sources": [
+            "csrc/fused_moe/cake_kimi_k3_situ/cake_kimi_k3_nvfp4_situ_routed_moe_1b1fd4abd86b36aca7f2_kernel.cu",
+            "csrc/fused_moe/cake_kimi_k3_situ/cake_kimi_k3_nvfp4_situ_routed_moe_1b1fd4abd86b36aca7f2_binding.cu",
+        ],
+        "compile_flags": [],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["tma_buffer", "A"],
+            ["tma_buffer", "B"],
+            ["tma_buffer", "SFA"],
+            ["tma_buffer", "SFB"],
+            ["tma_buffer", "C_tma"],
+            ["buffer", "C"],
+            ["buffer", "scale_c"],
+            ["buffer", "tile_expert"],
+            ["buffer", "tile_mn_limit"],
+            ["parameter", "M"],
+            ["parameter", "K"],
+            ["parameter", "grid_m"],
+            ["parameter", "grid_n"],
+            ["parameter", "K_tiles"],
+            ["buffer", "total_tiles"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "specializations": {},
+        "arches": ["sm_100a", "sm_103a"],
+        "closure_sha256": "b90cb119de16431f75a75e77b62f01cfd12009947de812d975d5028a69a50f1b",
+    },
+    "cake_kimi_k3_nvfp4_situ_routed_moe_1dc27deff743b34ea395": {
+        "sources": [
+            "csrc/fused_moe/cake_kimi_k3_situ/cake_kimi_k3_nvfp4_situ_routed_moe_1dc27deff743b34ea395_kernel.cu",
+            "csrc/fused_moe/cake_kimi_k3_situ/cake_kimi_k3_nvfp4_situ_routed_moe_1dc27deff743b34ea395_binding.cu",
+        ],
+        "compile_flags": [],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["tma_buffer", "A"],
+            ["buffer", "B"],
+            ["tma_buffer", "SFA"],
+            ["buffer", "SFB"],
+            ["tma_buffer", "C"],
+            ["buffer", "SFC"],
+            ["buffer", "route_map"],
+            ["buffer", "tile_expert"],
+            ["buffer", "tile_mn_limit"],
+            ["buffer", "total_tiles"],
+            ["buffer", "scale_c"],
+            ["buffer", "scale_gate"],
+            ["buffer", "clamp_limit"],
+            ["buffer", "act_alpha"],
+            ["buffer", "act_beta"],
+            ["parameter", "M_out"],
+            ["parameter", "K"],
+            ["parameter", "grid_m"],
+            ["parameter", "grid_n"],
+            ["parameter", "K_tiles"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "specializations": {},
+        "arches": ["sm_100a", "sm_103a"],
+        "closure_sha256": "2651b1c5946829ea0065f3869e4462ecf62b12a08a718218634ade1a84d63c8e",
+    },
+    "cake_kimi_k3_nvfp4_situ_routed_moe_21e60b8de2ebfd3e71bd": {
+        "sources": [
+            "csrc/fused_moe/cake_kimi_k3_situ/cake_kimi_k3_nvfp4_situ_routed_moe_21e60b8de2ebfd3e71bd_kernel.cu",
+            "csrc/fused_moe/cake_kimi_k3_situ/cake_kimi_k3_nvfp4_situ_routed_moe_21e60b8de2ebfd3e71bd_binding.cu",
+        ],
+        "compile_flags": [],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["tma_buffer", "A"],
+            ["buffer", "B"],
+            ["tma_buffer", "SFA"],
+            ["buffer", "SFB"],
+            ["tma_buffer", "C"],
+            ["buffer", "SFC"],
+            ["buffer", "route_map"],
+            ["buffer", "tile_expert"],
+            ["buffer", "tile_mn_limit"],
+            ["buffer", "scale_c"],
+            ["buffer", "scale_gate"],
+            ["buffer", "clamp_limit"],
+            ["buffer", "act_alpha"],
+            ["buffer", "act_beta"],
+            ["parameter", "M_out"],
+            ["parameter", "K"],
+            ["parameter", "grid_m"],
+            ["parameter", "grid_n"],
+            ["parameter", "K_tiles"],
+            ["buffer", "total_tiles"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "specializations": {},
+        "arches": ["sm_100a", "sm_103a"],
+        "closure_sha256": "eb074c70a8a2e2685e153c6524eec331157b61561da22ea37905b7f24fb2136d",
+    },
+    "cake_kimi_k3_nvfp4_situ_routed_moe_236a65678045e1d2c8eb": {
+        "sources": [
+            "csrc/fused_moe/cake_kimi_k3_situ/cake_kimi_k3_nvfp4_situ_routed_moe_236a65678045e1d2c8eb_kernel.cu",
+            "csrc/fused_moe/cake_kimi_k3_situ/cake_kimi_k3_nvfp4_situ_routed_moe_236a65678045e1d2c8eb_binding.cu",
+        ],
+        "compile_flags": [],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["tma_buffer", "A"],
+            ["buffer", "B"],
+            ["tma_buffer", "SFA"],
+            ["buffer", "SFB"],
+            ["tma_buffer", "C"],
+            ["buffer", "SFC"],
+            ["buffer", "route_map"],
+            ["buffer", "tile_expert"],
+            ["buffer", "tile_mn_limit"],
+            ["buffer", "scale_c"],
+            ["buffer", "scale_gate"],
+            ["buffer", "clamp_limit"],
+            ["buffer", "act_alpha"],
+            ["buffer", "act_beta"],
+            ["parameter", "M_out"],
+            ["parameter", "K"],
+            ["parameter", "grid_m"],
+            ["parameter", "grid_n"],
+            ["parameter", "K_tiles"],
+            ["buffer", "total_tiles"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "specializations": {},
+        "arches": ["sm_100a", "sm_103a"],
+        "closure_sha256": "466984408e0b978196f7fa3e8ecd83a645502c9ed6bdc8d3d8de3013dec2953d",
+    },
+    "cake_kimi_k3_nvfp4_situ_routed_moe_2edb34923b075b7ab878": {
+        "sources": [
+            "csrc/fused_moe/cake_kimi_k3_situ/cake_kimi_k3_nvfp4_situ_routed_moe_2edb34923b075b7ab878_kernel.cu",
+            "csrc/fused_moe/cake_kimi_k3_situ/cake_kimi_k3_nvfp4_situ_routed_moe_2edb34923b075b7ab878_binding.cu",
+        ],
+        "compile_flags": [],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["buffer", "x"],
+            ["buffer", "qx"],
+            ["buffer", "packed"],
+            ["buffer", "scales"],
+            ["parameter", "M"],
+            ["buffer", "expert_counts"],
+            ["buffer", "expert_scatter_offsets"],
+            ["buffer", "route_map"],
+            ["buffer", "tile_expert"],
+            ["buffer", "tile_mn_limit"],
+            ["buffer", "total_tiles"],
+            ["parameter", "num_experts"],
+            ["parameter", "max_tiles"],
+            ["parameter", "tile_n"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "specializations": {},
+        "arches": ["sm_100a"],
+        "closure_sha256": "675d9ec15294279c5f6939ee5133546a2a3b36075b2ede1af7198a799daaf235",
+    },
+    "cake_kimi_k3_nvfp4_situ_routed_moe_33aa68fb31dbfec22b5e": {
+        "sources": [
+            "csrc/fused_moe/cake_kimi_k3_situ/cake_kimi_k3_nvfp4_situ_routed_moe_33aa68fb31dbfec22b5e_kernel.cu",
+            "csrc/fused_moe/cake_kimi_k3_situ/cake_kimi_k3_nvfp4_situ_routed_moe_33aa68fb31dbfec22b5e_binding.cu",
+        ],
+        "compile_flags": [],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["tma_buffer", "A"],
+            ["tma_buffer", "B"],
+            ["tma_buffer", "SFA"],
+            ["tma_buffer", "SFB"],
+            ["tma_buffer", "C_tma"],
+            ["buffer", "C"],
+            ["buffer", "scale_c"],
+            ["buffer", "tile_expert"],
+            ["buffer", "tile_mn_limit"],
+            ["buffer", "num_non_exiting_ctas"],
+            ["buffer", "work_counter"],
+            ["parameter", "M"],
+            ["parameter", "K"],
+            ["parameter", "grid_m"],
+            ["parameter", "grid_n"],
+            ["parameter", "K_tiles"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "specializations": {},
+        "arches": ["sm_100a", "sm_103a"],
+        "closure_sha256": "312167e7a6b96f5b945ede23619d79445058fbf43b6219f9fa75822642901d9c",
+    },
+    "cake_kimi_k3_nvfp4_situ_routed_moe_43cac4c0eddfbf24a375": {
+        "sources": [
+            "csrc/fused_moe/cake_kimi_k3_situ/cake_kimi_k3_nvfp4_situ_routed_moe_43cac4c0eddfbf24a375_kernel.cu",
+            "csrc/fused_moe/cake_kimi_k3_situ/cake_kimi_k3_nvfp4_situ_routed_moe_43cac4c0eddfbf24a375_binding.cu",
+        ],
+        "compile_flags": [],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["tma_buffer", "A"],
+            ["tma_buffer", "B"],
+            ["tma_buffer", "SFA"],
+            ["tma_buffer", "SFB"],
+            ["tma_buffer", "C_tma"],
+            ["buffer", "C"],
+            ["buffer", "scale_c"],
+            ["buffer", "tile_expert"],
+            ["buffer", "tile_mn_limit"],
+            ["buffer", "num_non_exiting_ctas"],
+            ["buffer", "work_counter"],
+            ["parameter", "M"],
+            ["parameter", "K"],
+            ["parameter", "grid_m"],
+            ["parameter", "grid_n"],
+            ["parameter", "K_tiles"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "specializations": {},
+        "arches": ["sm_100a", "sm_103a"],
+        "closure_sha256": "ed3908681510bdc67ac2450e07db20c808caf95713d0cf2e8747bbccec2f54b9",
+    },
+    "cake_kimi_k3_nvfp4_situ_routed_moe_4fd6f9d8778fe6e5e68a": {
+        "sources": [
+            "csrc/fused_moe/cake_kimi_k3_situ/cake_kimi_k3_nvfp4_situ_routed_moe_4fd6f9d8778fe6e5e68a_kernel.cu",
+            "csrc/fused_moe/cake_kimi_k3_situ/cake_kimi_k3_nvfp4_situ_routed_moe_4fd6f9d8778fe6e5e68a_binding.cu",
+        ],
+        "compile_flags": [],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["buffer", "topk_ids"],
+            ["buffer", "expert_counts"],
+            ["buffer", "expert_tile_offsets"],
+            ["buffer", "expert_scatter_offsets"],
+            ["buffer", "route_map"],
+            ["buffer", "token_to_permuted"],
+            ["buffer", "tile_expert"],
+            ["buffer", "tile_mn_limit"],
+            ["buffer", "total_tiles"],
+            ["parameter", "total_pairs"],
+            ["parameter", "num_experts"],
+            ["parameter", "max_tiles"],
+            ["parameter", "top_k"],
+            ["parameter", "tile_n"],
+            ["buffer", "fc2_work_counter"],
+            ["parameter", "fc2_pool_ctas"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "specializations": {},
+        "arches": ["sm_100a", "sm_103a"],
+        "closure_sha256": "cd20117d93d8cf4a8acfcdde544b91aec208593e780f4a290ae6f793c6aeaf0f",
+    },
+    "cake_kimi_k3_nvfp4_situ_routed_moe_50228c4ae81ee9f8d962": {
+        "sources": [
+            "csrc/fused_moe/cake_kimi_k3_situ/cake_kimi_k3_nvfp4_situ_routed_moe_50228c4ae81ee9f8d962_kernel.cu",
+            "csrc/fused_moe/cake_kimi_k3_situ/cake_kimi_k3_nvfp4_situ_routed_moe_50228c4ae81ee9f8d962_binding.cu",
+        ],
+        "compile_flags": [],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["buffer", "expert_counts"],
+            ["buffer", "expert_tile_offsets"],
+            ["buffer", "expert_scatter_offsets"],
+            ["buffer", "total_tiles"],
+            ["parameter", "num_experts"],
+            ["parameter", "tile_n"],
+            ["parameter", "tile_n_shift"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "specializations": {},
+        "arches": ["sm_100a", "sm_103a"],
+        "closure_sha256": "ae58d91fdc29c8578209dfb3aff9b955da442ebd4778b3e1802b7ab9d72e1240",
+    },
+    "cake_kimi_k3_nvfp4_situ_routed_moe_5237090cc1d6ad6ce001": {
+        "sources": [
+            "csrc/fused_moe/cake_kimi_k3_situ/cake_kimi_k3_nvfp4_situ_routed_moe_5237090cc1d6ad6ce001_kernel.cu",
+            "csrc/fused_moe/cake_kimi_k3_situ/cake_kimi_k3_nvfp4_situ_routed_moe_5237090cc1d6ad6ce001_binding.cu",
+        ],
+        "compile_flags": [],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["buffer", "topk_ids"],
+            ["buffer", "expert_counts"],
+            ["buffer", "expert_tile_offsets"],
+            ["buffer", "expert_scatter_offsets"],
+            ["buffer", "route_map"],
+            ["buffer", "token_to_permuted"],
+            ["buffer", "tile_expert"],
+            ["buffer", "tile_mn_limit"],
+            ["parameter", "total_pairs"],
+            ["parameter", "top_k"],
+            ["parameter", "tile_n"],
+            ["parameter", "tile_n_shift"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "specializations": {},
+        "arches": ["sm_100a"],
+        "closure_sha256": "bbb51856e3234f38d3d4657a8c014cfa672579b00f6f3e0bfbffa37d4fcc7614",
+    },
+    "cake_kimi_k3_nvfp4_situ_routed_moe_5f1134ff62964abafd6b": {
+        "sources": [
+            "csrc/fused_moe/cake_kimi_k3_situ/cake_kimi_k3_nvfp4_situ_routed_moe_5f1134ff62964abafd6b_kernel.cu",
+            "csrc/fused_moe/cake_kimi_k3_situ/cake_kimi_k3_nvfp4_situ_routed_moe_5f1134ff62964abafd6b_binding.cu",
+        ],
+        "compile_flags": [],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["tma_buffer", "A"],
+            ["tma_buffer", "B"],
+            ["tma_buffer", "SFA"],
+            ["tma_buffer", "SFB"],
+            ["tma_buffer", "C_tma"],
+            ["buffer", "C"],
+            ["buffer", "scale_c"],
+            ["buffer", "tile_expert"],
+            ["buffer", "tile_mn_limit"],
+            ["buffer", "num_non_exiting_ctas"],
+            ["buffer", "work_counter"],
+            ["parameter", "M"],
+            ["parameter", "K"],
+            ["parameter", "grid_m"],
+            ["parameter", "grid_n"],
+            ["parameter", "K_tiles"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "specializations": {},
+        "arches": ["sm_100a"],
+        "closure_sha256": "bd73196c03fd0a3bd5a0891f8363dc9640d06c1e0b4ccb10e01c5bd8826e16ff",
+    },
+    "cake_kimi_k3_nvfp4_situ_routed_moe_69614acac074b2501413": {
+        "sources": [
+            "csrc/fused_moe/cake_kimi_k3_situ/cake_kimi_k3_nvfp4_situ_routed_moe_69614acac074b2501413_kernel.cu",
+            "csrc/fused_moe/cake_kimi_k3_situ/cake_kimi_k3_nvfp4_situ_routed_moe_69614acac074b2501413_binding.cu",
+        ],
+        "compile_flags": [],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["buffer", "topk_ids"],
+            ["buffer", "expert_counts"],
+            ["buffer", "expert_tile_offsets"],
+            ["buffer", "expert_scatter_offsets"],
+            ["buffer", "route_map"],
+            ["buffer", "token_to_permuted"],
+            ["buffer", "tile_expert"],
+            ["buffer", "tile_mn_limit"],
+            ["parameter", "total_pairs"],
+            ["parameter", "top_k"],
+            ["parameter", "tile_n"],
+            ["parameter", "tile_n_shift"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "specializations": {},
+        "arches": ["sm_100a", "sm_103a"],
+        "closure_sha256": "029540d21149e21f342d3341cc47fdf9392f186d5b7d95fcd02ef593b7ec8c73",
+    },
+    "cake_kimi_k3_nvfp4_situ_routed_moe_8bef6fee644a2ec7d899": {
+        "sources": [
+            "csrc/fused_moe/cake_kimi_k3_situ/cake_kimi_k3_nvfp4_situ_routed_moe_8bef6fee644a2ec7d899_kernel.cu",
+            "csrc/fused_moe/cake_kimi_k3_situ/cake_kimi_k3_nvfp4_situ_routed_moe_8bef6fee644a2ec7d899_binding.cu",
+        ],
+        "compile_flags": [],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["buffer", "topk_ids"],
+            ["buffer", "expert_counts"],
+            ["parameter", "total_pairs"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "specializations": {},
+        "arches": ["sm_100a", "sm_103a"],
+        "closure_sha256": "adf651c75770f042d2e6d3053fb8e42fea51a10370476732e3b8b4a4f2738cdb",
+    },
+    "cake_kimi_k3_nvfp4_situ_routed_moe_91e741e16955d57e9c7c": {
+        "sources": [
+            "csrc/fused_moe/cake_kimi_k3_situ/cake_kimi_k3_nvfp4_situ_routed_moe_91e741e16955d57e9c7c_kernel.cu",
+            "csrc/fused_moe/cake_kimi_k3_situ/cake_kimi_k3_nvfp4_situ_routed_moe_91e741e16955d57e9c7c_binding.cu",
+        ],
+        "compile_flags": [],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["buffer", "topk_ids"],
+            ["buffer", "expert_counts"],
+            ["buffer", "expert_tile_offsets"],
+            ["buffer", "expert_scatter_offsets"],
+            ["buffer", "route_map"],
+            ["buffer", "token_to_permuted"],
+            ["buffer", "tile_expert"],
+            ["buffer", "tile_mn_limit"],
+            ["buffer", "total_tiles"],
+            ["parameter", "total_pairs"],
+            ["parameter", "num_experts"],
+            ["parameter", "max_tiles"],
+            ["parameter", "top_k"],
+            ["parameter", "tile_n"],
+            ["buffer", "fc2_work_counter"],
+            ["parameter", "fc2_pool_ctas"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "specializations": {},
+        "arches": ["sm_100a", "sm_103a"],
+        "closure_sha256": "c96af18f9cc6f88fe1b35ff7af149f77dbf965b92c5359bb79a238f81be94671",
+    },
+    "cake_kimi_k3_nvfp4_situ_routed_moe_920a885b92d4dbd32aaf": {
+        "sources": [
+            "csrc/fused_moe/cake_kimi_k3_situ/cake_kimi_k3_nvfp4_situ_routed_moe_920a885b92d4dbd32aaf_kernel.cu",
+            "csrc/fused_moe/cake_kimi_k3_situ/cake_kimi_k3_nvfp4_situ_routed_moe_920a885b92d4dbd32aaf_binding.cu",
+        ],
+        "compile_flags": [],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["buffer", "expert_output"],
+            ["buffer", "route_weights"],
+            ["buffer", "token_to_permuted"],
+            ["buffer", "out"],
+            ["parameter", "M"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "specializations": {},
+        "arches": ["sm_100a", "sm_103a"],
+        "closure_sha256": "616cfba4b3185af97b9ea8404523465dcd625bd61891b2a776c514c6c9a66bb1",
+    },
+    "cake_kimi_k3_nvfp4_situ_routed_moe_92ed1deb1d0aa6e28892": {
+        "sources": [
+            "csrc/fused_moe/cake_kimi_k3_situ/cake_kimi_k3_nvfp4_situ_routed_moe_92ed1deb1d0aa6e28892_kernel.cu",
+            "csrc/fused_moe/cake_kimi_k3_situ/cake_kimi_k3_nvfp4_situ_routed_moe_92ed1deb1d0aa6e28892_binding.cu",
+        ],
+        "compile_flags": [],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["buffer", "x"],
+            ["buffer", "qx"],
+            ["buffer", "packed"],
+            ["buffer", "scales"],
+            ["parameter", "M"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "specializations": {},
+        "arches": ["sm_100a", "sm_103a"],
+        "closure_sha256": "ede9f29eeb0d624f515743701cd90598c25d808b6ebf20e495b38be0d55d5c5d",
+    },
+    "cake_kimi_k3_nvfp4_situ_routed_moe_93e2350178fff1f9c9ac": {
+        "sources": [
+            "csrc/fused_moe/cake_kimi_k3_situ/cake_kimi_k3_nvfp4_situ_routed_moe_93e2350178fff1f9c9ac_kernel.cu",
+            "csrc/fused_moe/cake_kimi_k3_situ/cake_kimi_k3_nvfp4_situ_routed_moe_93e2350178fff1f9c9ac_binding.cu",
+        ],
+        "compile_flags": [],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["tma_buffer", "A"],
+            ["buffer", "B"],
+            ["tma_buffer", "SFA"],
+            ["buffer", "SFB"],
+            ["tma_buffer", "C"],
+            ["buffer", "SFC"],
+            ["buffer", "route_map"],
+            ["buffer", "tile_expert"],
+            ["buffer", "tile_mn_limit"],
+            ["buffer", "total_tiles"],
+            ["buffer", "scale_c"],
+            ["buffer", "scale_gate"],
+            ["buffer", "clamp_limit"],
+            ["buffer", "act_alpha"],
+            ["buffer", "act_beta"],
+            ["parameter", "M_out"],
+            ["parameter", "K"],
+            ["parameter", "grid_m"],
+            ["parameter", "grid_n"],
+            ["parameter", "K_tiles"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "specializations": {},
+        "arches": ["sm_100a", "sm_103a"],
+        "closure_sha256": "0531ac9e8abafb22f6e2865b982eb263a3efea7321365355ccb60acd6a35e10a",
+    },
+    "cake_kimi_k3_nvfp4_situ_routed_moe_94ed2948cdb1b434548f": {
+        "sources": [
+            "csrc/fused_moe/cake_kimi_k3_situ/cake_kimi_k3_nvfp4_situ_routed_moe_94ed2948cdb1b434548f_kernel.cu",
+            "csrc/fused_moe/cake_kimi_k3_situ/cake_kimi_k3_nvfp4_situ_routed_moe_920a885b92d4dbd32aaf_binding.cu",
+        ],
+        "compile_flags": [
+            "-DCAKE_SITU_KERNEL=kernel_cake_kimi_k3_nvfp4_situ_routed_moe_94ed2948cdb1b434548f",
+            "-DCAKE_SITU_SHIM=cake_host_shim_3c096cf9099f7b16",
+        ],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["buffer", "expert_output"],
+            ["buffer", "route_weights"],
+            ["buffer", "token_to_permuted"],
+            ["buffer", "out"],
+            ["parameter", "M"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "specializations": {},
+        "arches": ["sm_100a", "sm_103a"],
+        "closure_sha256": "c68f05ba7e24f374a36b286eb061116f079dd8faaa018907e360a9818ccedf14",
+    },
+    "cake_kimi_k3_nvfp4_situ_routed_moe_98eeb51d40321f05a2e9": {
+        "sources": [
+            "csrc/fused_moe/cake_kimi_k3_situ/cake_kimi_k3_nvfp4_situ_routed_moe_98eeb51d40321f05a2e9_kernel.cu",
+            "csrc/fused_moe/cake_kimi_k3_situ/cake_kimi_k3_nvfp4_situ_routed_moe_5237090cc1d6ad6ce001_binding.cu",
+        ],
+        "compile_flags": [
+            "-DCAKE_SITU_KERNEL=kernel_cake_kimi_k3_nvfp4_situ_routed_moe_98eeb51d40321f05a2e9",
+            "-DCAKE_SITU_SHIM=cake_host_shim_e8dc03f98b763511",
+        ],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["buffer", "topk_ids"],
+            ["buffer", "expert_counts"],
+            ["buffer", "expert_tile_offsets"],
+            ["buffer", "expert_scatter_offsets"],
+            ["buffer", "route_map"],
+            ["buffer", "token_to_permuted"],
+            ["buffer", "tile_expert"],
+            ["buffer", "tile_mn_limit"],
+            ["parameter", "total_pairs"],
+            ["parameter", "top_k"],
+            ["parameter", "tile_n"],
+            ["parameter", "tile_n_shift"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "specializations": {},
+        "arches": ["sm_100a"],
+        "closure_sha256": "b7951f15d50812923a2d36547cf8f85bc239b43747f3fb658c8a3345f354384c",
+    },
+    "cake_kimi_k3_nvfp4_situ_routed_moe_9b180b07b1e91d891258": {
+        "sources": [
+            "csrc/fused_moe/cake_kimi_k3_situ/cake_kimi_k3_nvfp4_situ_routed_moe_9b180b07b1e91d891258_kernel.cu",
+            "csrc/fused_moe/cake_kimi_k3_situ/cake_kimi_k3_nvfp4_situ_routed_moe_9b180b07b1e91d891258_binding.cu",
+        ],
+        "compile_flags": [],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["buffer", "expert_output"],
+            ["buffer", "route_weights"],
+            ["buffer", "token_to_permuted"],
+            ["buffer", "out"],
+            ["parameter", "M"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "specializations": {},
+        "arches": ["sm_100a", "sm_103a"],
+        "closure_sha256": "d57f083513d8f74ad93a90fa9441b996b558369336f9cb798aa758e9a2307119",
+    },
+    "cake_kimi_k3_nvfp4_situ_routed_moe_af08a3678dee668769ef": {
+        "sources": [
+            "csrc/fused_moe/cake_kimi_k3_situ/cake_kimi_k3_nvfp4_situ_routed_moe_af08a3678dee668769ef_kernel.cu",
+            "csrc/fused_moe/cake_kimi_k3_situ/cake_kimi_k3_nvfp4_situ_routed_moe_920a885b92d4dbd32aaf_binding.cu",
+        ],
+        "compile_flags": [
+            "-DCAKE_SITU_KERNEL=kernel_cake_kimi_k3_nvfp4_situ_routed_moe_af08a3678dee668769ef",
+            "-DCAKE_SITU_SHIM=cake_host_shim_5d44b4d2fe76f87e",
+        ],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["buffer", "expert_output"],
+            ["buffer", "route_weights"],
+            ["buffer", "token_to_permuted"],
+            ["buffer", "out"],
+            ["parameter", "M"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "specializations": {},
+        "arches": ["sm_100a", "sm_103a"],
+        "closure_sha256": "532c58d4b1fc894f4f4966b5ef759f5c49e4a065a71528e4bc27876a2ea668c3",
+    },
+    "cake_kimi_k3_nvfp4_situ_routed_moe_b2c812c6b0328fbe0449": {
+        "sources": [
+            "csrc/fused_moe/cake_kimi_k3_situ/cake_kimi_k3_nvfp4_situ_routed_moe_b2c812c6b0328fbe0449_kernel.cu",
+            "csrc/fused_moe/cake_kimi_k3_situ/cake_kimi_k3_nvfp4_situ_routed_moe_b2c812c6b0328fbe0449_binding.cu",
+        ],
+        "compile_flags": [],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["tma_buffer", "A"],
+            ["buffer", "B"],
+            ["tma_buffer", "SFA"],
+            ["buffer", "SFB"],
+            ["tma_buffer", "C"],
+            ["buffer", "SFC"],
+            ["buffer", "route_map"],
+            ["buffer", "tile_expert"],
+            ["buffer", "tile_mn_limit"],
+            ["buffer", "total_tiles"],
+            ["buffer", "scale_c"],
+            ["buffer", "scale_gate"],
+            ["buffer", "clamp_limit"],
+            ["buffer", "act_alpha"],
+            ["buffer", "act_beta"],
+            ["parameter", "M_out"],
+            ["parameter", "K"],
+            ["parameter", "grid_m"],
+            ["parameter", "grid_n"],
+            ["parameter", "K_tiles"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "specializations": {},
+        "arches": ["sm_103a"],
+        "closure_sha256": "121fb251145e0462b07b8d9a703bb319a9043438afba71cfd84f9ef7429af171",
+    },
+    "cake_kimi_k3_nvfp4_situ_routed_moe_ba7714cb206fc1ad50c2": {
+        "sources": [
+            "csrc/fused_moe/cake_kimi_k3_situ/cake_kimi_k3_nvfp4_situ_routed_moe_ba7714cb206fc1ad50c2_kernel.cu",
+            "csrc/fused_moe/cake_kimi_k3_situ/cake_kimi_k3_nvfp4_situ_routed_moe_ba7714cb206fc1ad50c2_binding.cu",
+        ],
+        "compile_flags": [],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["tma_buffer", "A"],
+            ["tma_buffer", "B"],
+            ["tma_buffer", "SFA"],
+            ["tma_buffer", "SFB"],
+            ["tma_buffer", "C_tma"],
+            ["buffer", "C"],
+            ["buffer", "scale_c"],
+            ["buffer", "tile_expert"],
+            ["buffer", "tile_mn_limit"],
+            ["parameter", "M"],
+            ["parameter", "K"],
+            ["parameter", "grid_m"],
+            ["parameter", "grid_n"],
+            ["parameter", "K_tiles"],
+            ["buffer", "total_tiles"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "specializations": {},
+        "arches": ["sm_100a", "sm_103a"],
+        "closure_sha256": "c96b5ddc708a8c71d531466d8b9f2b56c4bfaf7024eb28c1c0f5d93a191bcb42",
+    },
+    "cake_kimi_k3_nvfp4_situ_routed_moe_bbe92c87025334a5d802": {
+        "sources": [
+            "csrc/fused_moe/cake_kimi_k3_situ/cake_kimi_k3_nvfp4_situ_routed_moe_bbe92c87025334a5d802_kernel.cu",
+            "csrc/fused_moe/cake_kimi_k3_situ/cake_kimi_k3_nvfp4_situ_routed_moe_bbe92c87025334a5d802_binding.cu",
+        ],
+        "compile_flags": [],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["tma_buffer", "A"],
+            ["tma_buffer", "B"],
+            ["tma_buffer", "SFA"],
+            ["tma_buffer", "SFB"],
+            ["tma_buffer", "C_tma"],
+            ["buffer", "C"],
+            ["buffer", "scale_c"],
+            ["buffer", "tile_expert"],
+            ["buffer", "tile_mn_limit"],
+            ["parameter", "M"],
+            ["parameter", "K"],
+            ["parameter", "grid_m"],
+            ["parameter", "grid_n"],
+            ["parameter", "K_tiles"],
+            ["buffer", "total_tiles"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "specializations": {},
+        "arches": ["sm_100a", "sm_103a"],
+        "closure_sha256": "5cc5ce90d8418a32d300c64a00c115d52ea4f6e0b6b9caf17ad29f6503f23da9",
+    },
+    "cake_kimi_k3_nvfp4_situ_routed_moe_bf03708b8a006adcd5e1": {
+        "sources": [
+            "csrc/fused_moe/cake_kimi_k3_situ/cake_kimi_k3_nvfp4_situ_routed_moe_bf03708b8a006adcd5e1_kernel.cu",
+            "csrc/fused_moe/cake_kimi_k3_situ/cake_kimi_k3_nvfp4_situ_routed_moe_194f5c89b6e5659e023f_binding.cu",
+        ],
+        "compile_flags": [
+            "-DCAKE_SITU_KERNEL=kernel_cake_kimi_k3_nvfp4_situ_routed_moe_bf03708b8a006adcd5e1",
+            "-DCAKE_SITU_SHIM=cake_host_shim_7912fe34ef798eda",
+        ],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["buffer", "topk_ids"],
+            ["buffer", "expert_counts"],
+            ["parameter", "total_pairs"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "specializations": {},
+        "arches": ["sm_100a"],
+        "closure_sha256": "1bdd4afd0dbf88cbdafef25b1a37507fdd3b232d1cc25f4fba440816032afd43",
+    },
+    "cake_kimi_k3_nvfp4_situ_routed_moe_bf607b3707fa37b411b7": {
+        "sources": [
+            "csrc/fused_moe/cake_kimi_k3_situ/cake_kimi_k3_nvfp4_situ_routed_moe_bf607b3707fa37b411b7_kernel.cu",
+            "csrc/fused_moe/cake_kimi_k3_situ/cake_kimi_k3_nvfp4_situ_routed_moe_9b180b07b1e91d891258_binding.cu",
+        ],
+        "compile_flags": [
+            "-DCAKE_SITU_KERNEL=kernel_cake_kimi_k3_nvfp4_situ_routed_moe_bf607b3707fa37b411b7",
+            "-DCAKE_SITU_SHIM=cake_host_shim_d24ce3a0218bb59d",
+        ],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["buffer", "expert_output"],
+            ["buffer", "route_weights"],
+            ["buffer", "token_to_permuted"],
+            ["buffer", "out"],
+            ["parameter", "M"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "specializations": {},
+        "arches": ["sm_100a", "sm_103a"],
+        "closure_sha256": "549ab4f0c2c90d2916ce5c14e3d5c55fe9be626f9d6d29323caab7abae942fc4",
+    },
+    "cake_kimi_k3_nvfp4_situ_routed_moe_c356f590ffd963970de4": {
+        "sources": [
+            "csrc/fused_moe/cake_kimi_k3_situ/cake_kimi_k3_nvfp4_situ_routed_moe_c356f590ffd963970de4_kernel.cu",
+            "csrc/fused_moe/cake_kimi_k3_situ/cake_kimi_k3_nvfp4_situ_routed_moe_c356f590ffd963970de4_binding.cu",
+        ],
+        "compile_flags": [],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["buffer", "expert_output"],
+            ["buffer", "partial_scale"],
+            ["buffer", "route_weights"],
+            ["buffer", "token_to_permuted"],
+            ["buffer", "out"],
+            ["parameter", "M"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "specializations": {},
+        "arches": ["sm_100a", "sm_103a"],
+        "closure_sha256": "3113644cf81ba98b223cb2c7ea80852d502c74b8bf92ee29650cecb049683587",
+    },
+    "cake_kimi_k3_nvfp4_situ_routed_moe_cf193d0feedc02c4cb8d": {
+        "sources": [
+            "csrc/fused_moe/cake_kimi_k3_situ/cake_kimi_k3_nvfp4_situ_routed_moe_cf193d0feedc02c4cb8d_kernel.cu",
+            "csrc/fused_moe/cake_kimi_k3_situ/cake_kimi_k3_nvfp4_situ_routed_moe_cf193d0feedc02c4cb8d_binding.cu",
+        ],
+        "compile_flags": [],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["buffer", "topk_ids"],
+            ["buffer", "s2b_x"],
+            ["buffer", "s2b_qx"],
+            ["buffer", "s2b_packed"],
+            ["buffer", "s2b_scales"],
+            ["parameter", "s2b_num_tokens"],
+            ["buffer", "expert_counts"],
+            ["buffer", "expert_tile_offsets"],
+            ["buffer", "expert_scatter_offsets"],
+            ["buffer", "route_map"],
+            ["buffer", "token_to_permuted"],
+            ["buffer", "tile_expert"],
+            ["buffer", "tile_mn_limit"],
+            ["buffer", "total_tiles"],
+            ["parameter", "total_pairs"],
+            ["parameter", "num_experts"],
+            ["parameter", "max_tiles"],
+            ["parameter", "top_k"],
+            ["parameter", "tile_n"],
+            ["buffer", "fc2_work_counter"],
+            ["parameter", "fc2_pool_ctas"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "specializations": {},
+        "arches": ["sm_100a", "sm_103a"],
+        "closure_sha256": "e36cbc129d3c2dd212dbfce96d53b4697f6f6d6755ccf6395e8fb874d782bfed",
+    },
+    "cake_kimi_k3_nvfp4_situ_routed_moe_d38238b36758aa7bd6d9": {
+        "sources": [
+            "csrc/fused_moe/cake_kimi_k3_situ/cake_kimi_k3_nvfp4_situ_routed_moe_d38238b36758aa7bd6d9_kernel.cu",
+            "csrc/fused_moe/cake_kimi_k3_situ/cake_kimi_k3_nvfp4_situ_routed_moe_d38238b36758aa7bd6d9_binding.cu",
+        ],
+        "compile_flags": [],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["tma_buffer", "A"],
+            ["tma_buffer", "B"],
+            ["tma_buffer", "SFA"],
+            ["tma_buffer", "SFB"],
+            ["tma_buffer", "C_tma"],
+            ["buffer", "C"],
+            ["buffer", "scale_c"],
+            ["buffer", "tile_expert"],
+            ["buffer", "tile_mn_limit"],
+            ["buffer", "partial_scale"],
+            ["parameter", "M"],
+            ["parameter", "K"],
+            ["parameter", "grid_m"],
+            ["parameter", "grid_n"],
+            ["parameter", "K_tiles"],
+            ["buffer", "total_tiles"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "specializations": {},
+        "arches": ["sm_100a", "sm_103a"],
+        "closure_sha256": "c12b24a19e9929f8a7b9052e64379c8d7f59b5aa9f897a5da6787ef840467626",
+    },
+    "cake_kimi_k3_nvfp4_situ_routed_moe_d49ae2797759f6ac37fb": {
+        "sources": [
+            "csrc/fused_moe/cake_kimi_k3_situ/cake_kimi_k3_nvfp4_situ_routed_moe_d49ae2797759f6ac37fb_kernel.cu",
+            "csrc/fused_moe/cake_kimi_k3_situ/cake_kimi_k3_nvfp4_situ_routed_moe_d49ae2797759f6ac37fb_binding.cu",
+        ],
+        "compile_flags": [],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["tma_buffer", "A"],
+            ["tma_buffer", "B"],
+            ["tma_buffer", "SFA"],
+            ["tma_buffer", "SFB"],
+            ["tma_buffer", "C_tma"],
+            ["buffer", "C"],
+            ["buffer", "scale_c"],
+            ["buffer", "tile_expert"],
+            ["buffer", "tile_mn_limit"],
+            ["parameter", "M"],
+            ["parameter", "K"],
+            ["parameter", "grid_m"],
+            ["parameter", "grid_n"],
+            ["parameter", "K_tiles"],
+            ["buffer", "total_tiles"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "specializations": {},
+        "arches": ["sm_100a", "sm_103a"],
+        "closure_sha256": "8513b9cb021068c0edb0b8d10332bc6e5e892f19a07c409cadd5e1fb35dd8374",
+    },
+    "cake_kimi_k3_nvfp4_situ_routed_moe_d879256424e97e4fe373": {
+        "sources": [
+            "csrc/fused_moe/cake_kimi_k3_situ/cake_kimi_k3_nvfp4_situ_routed_moe_d879256424e97e4fe373_kernel.cu",
+            "csrc/fused_moe/cake_kimi_k3_situ/cake_kimi_k3_nvfp4_situ_routed_moe_13ccea112756c78b4f7f_binding.cu",
+        ],
+        "compile_flags": [
+            "-DCAKE_SITU_KERNEL=kernel_cake_kimi_k3_nvfp4_situ_routed_moe_d879256424e97e4fe373",
+            "-DCAKE_SITU_SHIM=cake_host_shim_e8983ee7ef44c799",
+        ],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["tma_buffer", "A"],
+            ["tma_buffer", "B"],
+            ["tma_buffer", "SFA"],
+            ["tma_buffer", "SFB"],
+            ["tma_buffer", "C_tma"],
+            ["buffer", "C"],
+            ["buffer", "scale_c"],
+            ["buffer", "tile_expert"],
+            ["buffer", "tile_mn_limit"],
+            ["buffer", "num_non_exiting_ctas"],
+            ["buffer", "work_counter"],
+            ["parameter", "M"],
+            ["parameter", "K"],
+            ["parameter", "grid_m"],
+            ["parameter", "grid_n"],
+            ["parameter", "K_tiles"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "specializations": {},
+        "arches": ["sm_100a"],
+        "closure_sha256": "9fec834570aa0665ab7ec6e515627aa3a28ef500fce491e6bad916d308a6bb36",
+    },
+    "cake_kimi_k3_nvfp4_situ_routed_moe_d8a21008075dd1af4de1": {
+        "sources": [
+            "csrc/fused_moe/cake_kimi_k3_situ/cake_kimi_k3_nvfp4_situ_routed_moe_d8a21008075dd1af4de1_kernel.cu",
+            "csrc/fused_moe/cake_kimi_k3_situ/cake_kimi_k3_nvfp4_situ_routed_moe_d8a21008075dd1af4de1_binding.cu",
+        ],
+        "compile_flags": [],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["tma_buffer", "A"],
+            ["buffer", "B"],
+            ["tma_buffer", "SFA"],
+            ["buffer", "SFB"],
+            ["tma_buffer", "C"],
+            ["buffer", "SFC"],
+            ["buffer", "route_map"],
+            ["buffer", "tile_expert"],
+            ["buffer", "tile_mn_limit"],
+            ["buffer", "scale_c"],
+            ["buffer", "scale_gate"],
+            ["buffer", "clamp_limit"],
+            ["buffer", "act_alpha"],
+            ["buffer", "act_beta"],
+            ["parameter", "M_out"],
+            ["parameter", "K"],
+            ["parameter", "grid_m"],
+            ["parameter", "grid_n"],
+            ["parameter", "K_tiles"],
+            ["buffer", "total_tiles"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "specializations": {},
+        "arches": ["sm_100a", "sm_103a"],
+        "closure_sha256": "a5feaa9095a374df4129b7e7c87a2b5f8ad75168ab2cb71cb7743a0cca102b56",
+    },
+    "cake_kimi_k3_nvfp4_situ_routed_moe_df166979b48ef2b54cf3": {
+        "sources": [
+            "csrc/fused_moe/cake_kimi_k3_situ/cake_kimi_k3_nvfp4_situ_routed_moe_df166979b48ef2b54cf3_kernel.cu",
+            "csrc/fused_moe/cake_kimi_k3_situ/cake_kimi_k3_nvfp4_situ_routed_moe_df166979b48ef2b54cf3_binding.cu",
+        ],
+        "compile_flags": [],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["buffer", "x"],
+            ["buffer", "qx"],
+            ["buffer", "packed"],
+            ["buffer", "scales"],
+            ["parameter", "M"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "specializations": {},
+        "arches": ["sm_100a", "sm_103a"],
+        "closure_sha256": "9992bf9f66e8d8589ed856bc4521b78d5fb57cf6b6b67279833eaabb7a2e281a",
+    },
+    "cake_kimi_k3_nvfp4_situ_routed_moe_eb341800f93919d98c45": {
+        "sources": [
+            "csrc/fused_moe/cake_kimi_k3_situ/cake_kimi_k3_nvfp4_situ_routed_moe_eb341800f93919d98c45_kernel.cu",
+            "csrc/fused_moe/cake_kimi_k3_situ/cake_kimi_k3_nvfp4_situ_routed_moe_5f1134ff62964abafd6b_binding.cu",
+        ],
+        "compile_flags": [
+            "-DCAKE_SITU_KERNEL=kernel_cake_kimi_k3_nvfp4_situ_routed_moe_eb341800f93919d98c45",
+            "-DCAKE_SITU_SHIM=cake_host_shim_1142fb2428bec1d5",
+        ],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["tma_buffer", "A"],
+            ["tma_buffer", "B"],
+            ["tma_buffer", "SFA"],
+            ["tma_buffer", "SFB"],
+            ["tma_buffer", "C_tma"],
+            ["buffer", "C"],
+            ["buffer", "scale_c"],
+            ["buffer", "tile_expert"],
+            ["buffer", "tile_mn_limit"],
+            ["buffer", "num_non_exiting_ctas"],
+            ["buffer", "work_counter"],
+            ["parameter", "M"],
+            ["parameter", "K"],
+            ["parameter", "grid_m"],
+            ["parameter", "grid_n"],
+            ["parameter", "K_tiles"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "specializations": {},
+        "arches": ["sm_103a"],
+        "closure_sha256": "6699f1ba2cd5feec4d540738162b61a0d02a25ce6118f89b47de44554392c8f8",
+    },
+    "cake_kimi_k3_nvfp4_situ_routed_moe_eca3a107617c19a7c046": {
+        "sources": [
+            "csrc/fused_moe/cake_kimi_k3_situ/cake_kimi_k3_nvfp4_situ_routed_moe_eca3a107617c19a7c046_kernel.cu",
+            "csrc/fused_moe/cake_kimi_k3_situ/cake_kimi_k3_nvfp4_situ_routed_moe_eca3a107617c19a7c046_binding.cu",
+        ],
+        "compile_flags": [],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["tma_buffer", "A"],
+            ["buffer", "B"],
+            ["tma_buffer", "SFA"],
+            ["buffer", "SFB"],
+            ["tma_buffer", "C"],
+            ["buffer", "SFC"],
+            ["buffer", "route_map"],
+            ["buffer", "tile_expert"],
+            ["buffer", "tile_mn_limit"],
+            ["buffer", "scale_c"],
+            ["buffer", "scale_gate"],
+            ["buffer", "clamp_limit"],
+            ["buffer", "act_alpha"],
+            ["buffer", "act_beta"],
+            ["parameter", "M_out"],
+            ["parameter", "K"],
+            ["parameter", "grid_m"],
+            ["parameter", "grid_n"],
+            ["parameter", "K_tiles"],
+            ["buffer", "total_tiles"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "specializations": {},
+        "arches": ["sm_100a", "sm_103a"],
+        "closure_sha256": "35b0191c21f5020bbc3434f80bafbfcd5d0d3b52acca7417efb02a34cc0ad773",
+    },
+    "cake_kimi_k3_nvfp4_situ_routed_moe_ee6f3fc4b76d21d768a6": {
+        "sources": [
+            "csrc/fused_moe/cake_kimi_k3_situ/cake_kimi_k3_nvfp4_situ_routed_moe_ee6f3fc4b76d21d768a6_kernel.cu",
+            "csrc/fused_moe/cake_kimi_k3_situ/cake_kimi_k3_nvfp4_situ_routed_moe_ee6f3fc4b76d21d768a6_binding.cu",
+        ],
+        "compile_flags": [],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["buffer", "expert_counts"],
+            ["buffer", "expert_scatter_offsets"],
+            ["buffer", "route_map"],
+            ["buffer", "tile_expert"],
+            ["buffer", "tile_mn_limit"],
+            ["buffer", "total_tiles"],
+            ["parameter", "num_experts"],
+            ["parameter", "max_tiles"],
+            ["parameter", "tile_n"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "specializations": {},
+        "arches": ["sm_100a", "sm_103a"],
+        "closure_sha256": "c80b51c3d47b76b51f45a965e65c3e8195e4a6a4e1c8d1eb30ee28ccd2063229",
+    },
+    "cake_kimi_k3_nvfp4_situ_routed_moe_f732ff559a0b5d60dbe9": {
+        "sources": [
+            "csrc/fused_moe/cake_kimi_k3_situ/cake_kimi_k3_nvfp4_situ_routed_moe_f732ff559a0b5d60dbe9_kernel.cu",
+            "csrc/fused_moe/cake_kimi_k3_situ/cake_kimi_k3_nvfp4_situ_routed_moe_eca3a107617c19a7c046_binding.cu",
+        ],
+        "compile_flags": [
+            "-DCAKE_SITU_KERNEL=kernel_cake_kimi_k3_nvfp4_situ_routed_moe_f732ff559a0b5d60dbe9",
+            "-DCAKE_SITU_SHIM=cake_host_shim_4ee595b5db600994",
+        ],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["tma_buffer", "A"],
+            ["buffer", "B"],
+            ["tma_buffer", "SFA"],
+            ["buffer", "SFB"],
+            ["tma_buffer", "C"],
+            ["buffer", "SFC"],
+            ["buffer", "route_map"],
+            ["buffer", "tile_expert"],
+            ["buffer", "tile_mn_limit"],
+            ["buffer", "scale_c"],
+            ["buffer", "scale_gate"],
+            ["buffer", "clamp_limit"],
+            ["buffer", "act_alpha"],
+            ["buffer", "act_beta"],
+            ["parameter", "M_out"],
+            ["parameter", "K"],
+            ["parameter", "grid_m"],
+            ["parameter", "grid_n"],
+            ["parameter", "K_tiles"],
+            ["buffer", "total_tiles"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "specializations": {},
+        "arches": ["sm_100a", "sm_103a"],
+        "closure_sha256": "6ba7d2512b750a1154c121bc41ef7d02012f7f418a02090e643aeb5b09778ed9",
+    },
+    "cake_kimi_k3_nvfp4_situ_routed_moe_ffc17ea7b5160932a22c": {
+        "sources": [
+            "csrc/fused_moe/cake_kimi_k3_situ/cake_kimi_k3_nvfp4_situ_routed_moe_ffc17ea7b5160932a22c_kernel.cu",
+            "csrc/fused_moe/cake_kimi_k3_situ/cake_kimi_k3_nvfp4_situ_routed_moe_b2c812c6b0328fbe0449_binding.cu",
+        ],
+        "compile_flags": [
+            "-DCAKE_SITU_KERNEL=kernel_cake_kimi_k3_nvfp4_situ_routed_moe_ffc17ea7b5160932a22c",
+            "-DCAKE_SITU_SHIM=cake_host_shim_0a43a7ac2965ab39",
+        ],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["tma_buffer", "A"],
+            ["buffer", "B"],
+            ["tma_buffer", "SFA"],
+            ["buffer", "SFB"],
+            ["tma_buffer", "C"],
+            ["buffer", "SFC"],
+            ["buffer", "route_map"],
+            ["buffer", "tile_expert"],
+            ["buffer", "tile_mn_limit"],
+            ["buffer", "total_tiles"],
+            ["buffer", "scale_c"],
+            ["buffer", "scale_gate"],
+            ["buffer", "clamp_limit"],
+            ["buffer", "act_alpha"],
+            ["buffer", "act_beta"],
+            ["parameter", "M_out"],
+            ["parameter", "K"],
+            ["parameter", "grid_m"],
+            ["parameter", "grid_n"],
+            ["parameter", "K_tiles"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "specializations": {},
+        "arches": ["sm_100a"],
+        "closure_sha256": "8c87236217c2aa80fd4194aa3751962dfcfcdd699c82c65c008e89f66f917392",
+    },
+}
+
+# arch -> logical kernel key -> program name. The host selects a route (an
+# ordered list of stages with one kernel key each) from host-known scalars and
+# binds each stage through this table.
+KERNELS: dict[str, dict[str, str]] = {
+    "sm_100a": {
+        "fc1:n128": "cake_kimi_k3_nvfp4_situ_routed_moe_eca3a107617c19a7c046",
+        "fc1:n128_work5fd": "cake_kimi_k3_nvfp4_situ_routed_moe_f732ff559a0b5d60dbe9",
+        "fc1:n16": "cake_kimi_k3_nvfp4_situ_routed_moe_236a65678045e1d2c8eb",
+        "fc1:n16_claim8": "cake_kimi_k3_nvfp4_situ_routed_moe_1dc27deff743b34ea395",
+        "fc1:n32": "cake_kimi_k3_nvfp4_situ_routed_moe_21e60b8de2ebfd3e71bd",
+        "fc1:n32_claim8": "cake_kimi_k3_nvfp4_situ_routed_moe_93e2350178fff1f9c9ac",
+        "fc1:n8": "cake_kimi_k3_nvfp4_situ_routed_moe_d8a21008075dd1af4de1",
+        "fc1:n8_persistent_ef": "cake_kimi_k3_nvfp4_situ_routed_moe_ffc17ea7b5160932a22c",
+        "fc1:n8_s2a": "cake_kimi_k3_nvfp4_situ_routed_moe_177a36ce879102b71f56",
+        "fc2:n128": "cake_kimi_k3_nvfp4_situ_routed_moe_1b1fd4abd86b36aca7f2",
+        "fc2:n128_q8i": "cake_kimi_k3_nvfp4_situ_routed_moe_d38238b36758aa7bd6d9",
+        "fc2:n16": "cake_kimi_k3_nvfp4_situ_routed_moe_d49ae2797759f6ac37fb",
+        "fc2:n16_claim8": "cake_kimi_k3_nvfp4_situ_routed_moe_43cac4c0eddfbf24a375",
+        "fc2:n32": "cake_kimi_k3_nvfp4_situ_routed_moe_ba7714cb206fc1ad50c2",
+        "fc2:n32_claim8": "cake_kimi_k3_nvfp4_situ_routed_moe_33aa68fb31dbfec22b5e",
+        "fc2:n8": "cake_kimi_k3_nvfp4_situ_routed_moe_151cbac5f51ddfa2f9f6",
+        "fc2:n8_m1": "cake_kimi_k3_nvfp4_situ_routed_moe_bbe92c87025334a5d802",
+        "fc2:n8_w2a_s4_f2e": "cake_kimi_k3_nvfp4_situ_routed_moe_5f1134ff62964abafd6b",
+        "fc2:n8_workfeed_f2e": "cake_kimi_k3_nvfp4_situ_routed_moe_d879256424e97e4fe373",
+        "finalize:feature": "cake_kimi_k3_nvfp4_situ_routed_moe_af08a3678dee668769ef",
+        "finalize:n128": "cake_kimi_k3_nvfp4_situ_routed_moe_94ed2948cdb1b434548f",
+        "finalize:n128_q8i": "cake_kimi_k3_nvfp4_situ_routed_moe_c356f590ffd963970de4",
+        "finalize:n16": "cake_kimi_k3_nvfp4_situ_routed_moe_9b180b07b1e91d891258",
+        "finalize:n32": "cake_kimi_k3_nvfp4_situ_routed_moe_9b180b07b1e91d891258",
+        "finalize:n32_claim8": "cake_kimi_k3_nvfp4_situ_routed_moe_920a885b92d4dbd32aaf",
+        "finalize:n8": "cake_kimi_k3_nvfp4_situ_routed_moe_bf607b3707fa37b411b7",
+        "fused_router:cluster_v16_mc8": "cake_kimi_k3_nvfp4_situ_routed_moe_91e741e16955d57e9c7c",
+        "fused_router:single_cta_v16": "cake_kimi_k3_nvfp4_situ_routed_moe_4fd6f9d8778fe6e5e68a",
+        "quant": "cake_kimi_k3_nvfp4_situ_routed_moe_df166979b48ef2b54cf3",
+        "quant:n32_claim8": "cake_kimi_k3_nvfp4_situ_routed_moe_92ed1deb1d0aa6e28892",
+        "quant_reset:n128_p512fh2qr": "cake_kimi_k3_nvfp4_situ_routed_moe_2edb34923b075b7ab878",
+        "quant_route:s2b": "cake_kimi_k3_nvfp4_situ_routed_moe_cf193d0feedc02c4cb8d",
+        "route_histogram": "cake_kimi_k3_nvfp4_situ_routed_moe_8bef6fee644a2ec7d899",
+        "route_histogram:n128_p1024": "cake_kimi_k3_nvfp4_situ_routed_moe_bf03708b8a006adcd5e1",
+        "route_histogram:n128_p512f": "cake_kimi_k3_nvfp4_situ_routed_moe_194f5c89b6e5659e023f",
+        "route_prefix": "cake_kimi_k3_nvfp4_situ_routed_moe_50228c4ae81ee9f8d962",
+        "route_reset": "cake_kimi_k3_nvfp4_situ_routed_moe_ee6f3fc4b76d21d768a6",
+        "route_scatter": "cake_kimi_k3_nvfp4_situ_routed_moe_69614acac074b2501413",
+        "route_scatter:n128_p1024": "cake_kimi_k3_nvfp4_situ_routed_moe_5237090cc1d6ad6ce001",
+        "route_scatter:n128_p512fh2": "cake_kimi_k3_nvfp4_situ_routed_moe_98eeb51d40321f05a2e9",
+    },
+    "sm_103a": {
+        "fc1:n128": "cake_kimi_k3_nvfp4_situ_routed_moe_eca3a107617c19a7c046",
+        "fc1:n128_work5fd": "cake_kimi_k3_nvfp4_situ_routed_moe_f732ff559a0b5d60dbe9",
+        "fc1:n16": "cake_kimi_k3_nvfp4_situ_routed_moe_236a65678045e1d2c8eb",
+        "fc1:n16_claim8": "cake_kimi_k3_nvfp4_situ_routed_moe_1dc27deff743b34ea395",
+        "fc1:n32": "cake_kimi_k3_nvfp4_situ_routed_moe_21e60b8de2ebfd3e71bd",
+        "fc1:n32_claim8": "cake_kimi_k3_nvfp4_situ_routed_moe_93e2350178fff1f9c9ac",
+        "fc1:n8": "cake_kimi_k3_nvfp4_situ_routed_moe_d8a21008075dd1af4de1",
+        "fc1:n8_s2a": "cake_kimi_k3_nvfp4_situ_routed_moe_177a36ce879102b71f56",
+        "fc1:n8_s3b": "cake_kimi_k3_nvfp4_situ_routed_moe_b2c812c6b0328fbe0449",
+        "fc2:n128": "cake_kimi_k3_nvfp4_situ_routed_moe_1b1fd4abd86b36aca7f2",
+        "fc2:n128_q8i": "cake_kimi_k3_nvfp4_situ_routed_moe_d38238b36758aa7bd6d9",
+        "fc2:n16": "cake_kimi_k3_nvfp4_situ_routed_moe_d49ae2797759f6ac37fb",
+        "fc2:n16_claim8": "cake_kimi_k3_nvfp4_situ_routed_moe_43cac4c0eddfbf24a375",
+        "fc2:n32": "cake_kimi_k3_nvfp4_situ_routed_moe_ba7714cb206fc1ad50c2",
+        "fc2:n32_claim8": "cake_kimi_k3_nvfp4_situ_routed_moe_33aa68fb31dbfec22b5e",
+        "fc2:n8": "cake_kimi_k3_nvfp4_situ_routed_moe_151cbac5f51ddfa2f9f6",
+        "fc2:n8_m1": "cake_kimi_k3_nvfp4_situ_routed_moe_bbe92c87025334a5d802",
+        "fc2:n8_w2a_s4": "cake_kimi_k3_nvfp4_situ_routed_moe_eb341800f93919d98c45",
+        "fc2:n8_workfeed": "cake_kimi_k3_nvfp4_situ_routed_moe_13ccea112756c78b4f7f",
+        "finalize:feature": "cake_kimi_k3_nvfp4_situ_routed_moe_af08a3678dee668769ef",
+        "finalize:n128": "cake_kimi_k3_nvfp4_situ_routed_moe_94ed2948cdb1b434548f",
+        "finalize:n128_q8i": "cake_kimi_k3_nvfp4_situ_routed_moe_c356f590ffd963970de4",
+        "finalize:n16": "cake_kimi_k3_nvfp4_situ_routed_moe_9b180b07b1e91d891258",
+        "finalize:n32": "cake_kimi_k3_nvfp4_situ_routed_moe_9b180b07b1e91d891258",
+        "finalize:n32_claim8": "cake_kimi_k3_nvfp4_situ_routed_moe_920a885b92d4dbd32aaf",
+        "finalize:n8": "cake_kimi_k3_nvfp4_situ_routed_moe_bf607b3707fa37b411b7",
+        "fused_router:cluster_v16_mc8": "cake_kimi_k3_nvfp4_situ_routed_moe_91e741e16955d57e9c7c",
+        "fused_router:single_cta_v16": "cake_kimi_k3_nvfp4_situ_routed_moe_4fd6f9d8778fe6e5e68a",
+        "quant": "cake_kimi_k3_nvfp4_situ_routed_moe_df166979b48ef2b54cf3",
+        "quant:n32_claim8": "cake_kimi_k3_nvfp4_situ_routed_moe_92ed1deb1d0aa6e28892",
+        "quant_route:s2b": "cake_kimi_k3_nvfp4_situ_routed_moe_cf193d0feedc02c4cb8d",
+        "route_histogram": "cake_kimi_k3_nvfp4_situ_routed_moe_8bef6fee644a2ec7d899",
+        "route_prefix": "cake_kimi_k3_nvfp4_situ_routed_moe_50228c4ae81ee9f8d962",
+        "route_reset": "cake_kimi_k3_nvfp4_situ_routed_moe_ee6f3fc4b76d21d768a6",
+        "route_scatter": "cake_kimi_k3_nvfp4_situ_routed_moe_69614acac074b2501413",
+    },
+}
+
+# Provenance of the programs carried from the previous generation of this
+# directory because their producer was not regenerated (regeneration follow-up;
+# the routes that launch them are covered by the behavioural tests of this
+# backend). One line per program: the first six hex digits of its digest, its
+# source, its label where the export set one (m8 / m16) and the digest of the
+# kernel shipped for every architecture it was delivered for. A source is a
+# revision of this repository (rev, by commit hash) or a sealed export (export,
+# by SHA-256); the program lines abbreviate them as
+#   rev c68f810df = c68f810df573fb2099e3afac27c309e6116eefd9
+#   rev f8d3729e9 = f8d3729e9c85d20afdf4a1e672771cdb157e0e33
+#   export 160ede77 = 160ede77cd5bc37c8f587dfd6bf6ba39ffa75f6dcf42f303c69aad06c996eeaf
+#   export 278a8668 = 278a866855ec2e2fba8fc8612d999905b9c43c2f0167af746e39945031c5696c
+#   export 85f13cd1 = 85f13cd19fbb6d92ee34cc0cdff2f85d3af8e82bd7cb613a8c203e853b4c59ec
+#   export c70528bc = c70528bc9a28f79cbc54bb5a11434110b8417a8a43197a912ef2b08c74fbc998
+#   export ed4d76c0 = ed4d76c0d8c2c2f74bc83cb078e940adbb143f20115c15325636cd2b86ed5abf
+#   13ccea rev f8d3729e9       sm_103a=45df0c2e767b73958213
+#   177a36 export c70528bc     sm_100a=177a36ce879102b71f56
+#   194f5c export 160ede77     sm_100a=194f5c89b6e5659e023f
+#   1b1fd4 rev f8d3729e9       sm_100a=1b1fd4abd86b36aca7f2 sm_103a=d1df5f44ad0b1609b6ae
+#   1dc27d rev f8d3729e9       sm_100a=1dc27deff743b34ea395 sm_103a=9de635e77a52b5ac3cf9
+#   2edb34 export 160ede77     sm_100a=2edb34923b075b7ab878
+#   33aa68 rev f8d3729e9       sm_100a=33aa68fb31dbfec22b5e sm_103a=2181a3eddddb148553eb
+#   43cac4 rev f8d3729e9       sm_100a=43cac4c0eddfbf24a375 sm_103a=e0380732d28096abc164
+#   4fd6f9 rev f8d3729e9       sm_100a=4fd6f9d8778fe6e5e68a sm_103a=7e38a898309c6cd49d1a
+#   523709 export ed4d76c0     sm_100a=5237090cc1d6ad6ce001
+#   5f1134 export 85f13cd1 m16 sm_100a=5f1134ff62964abafd6b
+#   8adb08 rev c68f810df       sm_103a=8adb088a23619bcf252f (folded into 177a36 as its SM103 branch)
+#   91e741 rev f8d3729e9       sm_100a=91e741e16955d57e9c7c sm_103a=19bc672867635493f224
+#   920a88 rev f8d3729e9       sm_100a=920a885b92d4dbd32aaf sm_103a=8ebdd0a338c99465fe95
+#   92ed1d rev f8d3729e9       sm_100a=92ed1deb1d0aa6e28892 sm_103a=43068b41c10a6b619dac
+#   93e235 rev f8d3729e9       sm_100a=93e2350178fff1f9c9ac sm_103a=b288df8f7d6265baa8bf
+#   94ed29 rev f8d3729e9       sm_100a=94ed2948cdb1b434548f sm_103a=816a2739dcbfa5e462e1
+#   98eeb5 export 160ede77     sm_100a=98eeb51d40321f05a2e9
+#   af08a3 rev f8d3729e9       sm_100a=af08a3678dee668769ef sm_103a=d9854c0d763014b3e55f
+#   b2c812 rev f8d3729e9       sm_103a=a70f4b000ef979ec769f
+#   bbe92c rev f8d3729e9       sm_100a=bbe92c87025334a5d802 sm_103a=94d884d58ac92911738a
+#   bf0370 export ed4d76c0     sm_100a=bf03708b8a006adcd5e1
+#   c356f5 export 278a8668     sm_100a=c356f590ffd963970de4 sm_103a=1ba6921046b292c2a98f
+#   cf193d rev f8d3729e9       sm_100a=cf193d0feedc02c4cb8d sm_103a=e1b47e4b13719f2e146f
+#   d38238 export 278a8668     sm_100a=d38238b36758aa7bd6d9 sm_103a=ad5623664c0619d269a9
+#   d87925 export 85f13cd1 m8  sm_100a=d879256424e97e4fe373
+#   eb3418 rev f8d3729e9       sm_103a=774f954d1df3f4427897
+#   eca3a1 rev f8d3729e9       sm_100a=eca3a107617c19a7c046 sm_103a=9245a8285150b361d78f
+#   f732ff rev f8d3729e9       sm_100a=f732ff559a0b5d60dbe9 sm_103a=3503b53e81d6b185a2d7
+#   ffc17e export 85f13cd1 m8  sm_100a=ffc17ea7b5160932a22c
+
+_ARCH_FLAGS = {"sm_100a": sm100a_nvcc_flags, "sm_103a": sm103a_nvcc_flags}
+
+
+def _source_path(relative):
+    installed = jit_env.FLASHINFER_CSRC_DIR / relative.removeprefix("csrc/")
+    checkout = Path(__file__).resolve().parents[2] / relative
+    if installed.is_file():
+        return installed
+    if checkout.is_file():
+        return checkout
+    raise FileNotFoundError(f"generated SiTU source is not installed: {relative}")
+
+
+def _include_paths(sources):
+    checkout_root = Path(__file__).resolve().parents[2]
+    include_dir = jit_env.FLASHINFER_INCLUDE_DIR
+    if not include_dir.is_dir():
+        include_dir = checkout_root / "include"
+    return list(
+        dict.fromkeys(
+            [
+                *(source.parent for source in sources),
+                jit_env.FLASHINFER_CSRC_DIR,
+                checkout_root / "csrc",
+                include_dir,
+            ]
+        )
+    )
+
+
+@cache
+def gen_cake_situ_module(name, arch):
+    record = MODULES[name]
+    if arch not in record["arches"]:
+        raise ValueError(f"program {name} is not built for {arch}")
+    sources = [_source_path(path) for path in record["sources"]]
+    flags = [
+        *record["compile_flags"],
+        *(f"-D{key}={value}" for key, value in record["specializations"].items()),
+    ]
+    spec = gen_jit_spec(
+        f"cake_situ_{arch}_{name}_{record['closure_sha256'][:16]}",
+        sources=sources,
+        extra_cuda_cflags=[*_ARCH_FLAGS[arch], *flags],
+        extra_include_paths=_include_paths(sources),
+    )
+    # gen_jit_spec adds fast math for ordinary FlashInfer kernels. The source
+    # compiler does not enable it by default: retain exactly the exported
+    # semantic setting, including an explicitly authored fast-math option.
+    if not any(flag in {"-use_fast_math", "--use_fast_math"} for flag in flags):
+        spec.extra_cuda_cflags = [
+            flag
+            for flag in spec.extra_cuda_cflags
+            if flag not in {"-use_fast_math", "--use_fast_math"}
+        ]
+    return spec
+
+
+# Host-only entry that submits a prepared route plan (every stage's two-phase
+# entry points and argument vector) from one FFI call: it prepares every stage of
+# the call before it launches the first, so the launches reach the stream back to
+# back. No device code, no state; see the source for the argument layout.
+SUBMIT_MODULE = "cake_kimi_k3_nvfp4_situ_submit"
+SUBMIT_SOURCE = "csrc/fused_moe/cake_kimi_k3_situ/cake_kimi_k3_nvfp4_situ_submit.cu"
+
+
+@cache
+def gen_cake_situ_submit(arch):
+    sources = [_source_path(SUBMIT_SOURCE)]
+    return gen_jit_spec(
+        f"cake_situ_{arch}_{SUBMIT_MODULE}",
+        sources=sources,
+        extra_cuda_cflags=list(_ARCH_FLAGS[arch]),
+        extra_include_paths=_include_paths(sources),
+    )
+
+
+@cache
+def get_cake_situ_submit(arch):
+    return gen_cake_situ_submit(arch).build_and_load()
+
+
+@cache
+def get_cake_situ_module(name, arch):
+    return gen_cake_situ_module(name, arch).build_and_load()
+
+
+@cache
+def cake_situ_stage_entries(name, arch):
+    """``(prepare, submit)`` addresses of one program's two-phase stage shim, for the route submitter."""
+    module = get_cake_situ_module(name, arch)
+    return int(module.prepare_entry()), int(module.submit_entry())
+
+
+def cake_situ_program(arch, kernel_key):
+    """The program name bound to one logical kernel key on one architecture."""
+    try:
+        return KERNELS[arch][kernel_key]
+    except KeyError:
+        raise ValueError(f"no SiTU program for {kernel_key!r} on {arch}") from None
