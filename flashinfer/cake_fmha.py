@@ -637,12 +637,12 @@ _CONTEXT_FP8_RUNTIME_ROUTES: dict[str, dict[tuple[int, int | None], str]] = {
     },
 }
 # Short sm103a launches keep each stage's P tile in its own S columns: the
-# program an exact or runtime-size route names maps to the same schedule
-# and arguments with the default P placement, for launches of at most the
-# keys the entry names.  With one 128-key block per tile the swapped
-# schedule has no next QK product to issue while P is written; the exact
-# programs keep the default placement up to two blocks per tile, where
-# their launches of many tiles run slower swapped.
+# program an exact, runtime-size or (every page size) one-stage route names
+# maps to the same schedule and arguments with the default P placement, for
+# launches of at most the keys the entry names.  With one 128-key block per
+# tile the swapped schedule has no next QK product to issue while P is
+# written; the exact programs keep the default placement up to two blocks per
+# tile, where their launches of many tiles run slower swapped.
 _CONTEXT_FP8_SHORT_KV_ROUTES: dict[str, dict[str, tuple[str, int]]] = {
     "sm103a": {
         "B256_PX": ("B256_KV4", 256),
@@ -655,6 +655,10 @@ _CONTEXT_FP8_SHORT_KV_ROUTES: dict[str, dict[str, tuple[str, int]]] = {
         "RUNTIME_PACK4_PAGE64_PX": ("RUNTIME_PACK4_PAGE64", 128),
         "RUNTIME_PACK2_PAGE64_PX": ("RUNTIME_PACK2_PAGE64", 128),
         "RUNTIME_PACK1_PAGE64_PX": ("RUNTIME_PACK1_PAGE64", 128),
+        "RUNTIME_PACK8_PX_Q1": ("RUNTIME_PACK8_Q1", 128),
+        "RUNTIME_PACK4_PX_Q1": ("RUNTIME_PACK4_Q1", 128),
+        "RUNTIME_PACK2_PX_Q1": ("RUNTIME_PACK2_Q1", 128),
+        "RUNTIME_PACK1_PX_Q1": ("RUNTIME_PACK1_Q1", 128),
     },
 }
 # The packs the runtime programs ship besides 1: a pack serves every GQA group
@@ -5427,18 +5431,21 @@ def select_cake_fmha_context_route(
                 total_bh = batch_size * (num_q_heads // pack)
                 l2_swizzle = 8 if total_bh % 8 == 0 else 1
                 break
-        # An FP8 call the runtime-size route serves (not its short-KV entry),
-        # or an exact program (its short-KV entry included), whose tiles hold
-        # at most one query stage at a shipped pack: the one-stage program of
-        # the pack the one-stage choice names
-        # (:func:`_context_fp8_one_stage_choice`) and the page size, where it
-        # predicts a gain over the launch chosen above; else the call keeps it.
-        # An exact program's tiles hold two query stages of its pack: at a
-        # smaller pack, one stage holds every query token of a tile.
+        # An FP8 call the runtime-size route serves, or an exact program (its
+        # short-KV entry included), whose tiles hold at most one query stage at
+        # a shipped pack: the one-stage program of the pack the one-stage
+        # choice names (:func:`_context_fp8_one_stage_choice`) and the page
+        # size, where it predicts a gain over the launch chosen above.  A
+        # runtime-size call of at most the keys of that program's short-KV
+        # entry takes the entry's program, and keeps its launch where the
+        # program has none.  Else the call keeps its launch.  An exact
+        # program's tiles hold two query stages of its pack: at a smaller
+        # pack, one stage holds every query token of a tile.
         one_stage = _CONTEXT_FP8_ONE_STAGE_ROUTES.get(target)
-        stage_pack = runtime_pack if not shortened else None
+        stage_pack = runtime_pack
         if exact_fp8_pack is not None:
             stage_pack = _context_fp8_runtime_pack(exact_fp8_pack)
+        short_runtime = shortened and runtime_pack is not None
         if stage_pack is not None and one_stage and sm_count:
             one_stage_pack = _context_fp8_one_stage_choice(
                 target,
@@ -5456,6 +5463,13 @@ def select_cake_fmha_context_route(
                 else one_stage.get((one_stage_pack, page_size))
                 or one_stage.get((one_stage_pack, None))
             )
+            if short_runtime and one_stage_program is not None:
+                short = _CONTEXT_FP8_SHORT_KV_ROUTES.get(target, {}).get(
+                    one_stage_program
+                )
+                one_stage_program = (
+                    short[0] if short and max_kv_len <= short[1] else None
+                )
             if one_stage_pack is not None and one_stage_program is not None:
                 program = one_stage_program
                 pack_g = one_stage_pack

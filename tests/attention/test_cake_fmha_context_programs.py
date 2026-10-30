@@ -734,26 +734,42 @@ def test_cake_fmha_context_fp8_exact_routes_come_first(monkeypatch, target) -> N
 
 @pytest.mark.parametrize("target", ("sm100a", "sm103a"))
 def test_cake_fmha_context_fp8_short_kv_routes(monkeypatch, target) -> None:
-    """A launch of at most the keys of its exact or runtime-size route's
-    short-KV entry, where the target names one, takes the entry's program
-    (sm103a: the same schedule with each stage's P tile in its own S
-    columns; 256 keys for the exact programs, 128 for the runtime-size
-    ones), for host and device scales alike; one key more keeps the
-    route's program."""
+    """A launch of at most the keys of its exact, runtime-size or one-stage
+    route's short-KV entry, where the target names one, takes the entry's
+    program (sm103a: the same schedule with each stage's P tile in its own S
+    columns; 256 keys for the exact programs, 128 for the runtime-size and
+    the every-page-size one-stage ones), for host and device scales alike;
+    one key more keeps the route's program."""
 
     short = cake_api._CONTEXT_FP8_SHORT_KV_ROUTES.get(target, {})
     routed = {
         *cake_api._CONTEXT_PROGRAM_ROUTES[target].values(),
         *cake_api._CONTEXT_FP8_RUNTIME_ROUTES[target].values(),
+        *cake_api._CONTEXT_FP8_ONE_STAGE_ROUTES[target].values(),
     }
     assert set(short) <= routed and (target == "sm103a") == bool(short)
+    one_stage = {swapped for swapped in short if swapped.endswith("_Q1")}
+    assert (
+        one_stage
+        == {
+            identifier
+            for (_, page), identifier in cake_api._CONTEXT_FP8_ONE_STAGE_ROUTES[
+                target
+            ].items()
+            if page is None
+        }
+        or not short
+    )
     for swapped, (identifier, keys) in short.items():
         assert keys == (256 if identifier.startswith("B256") else 128)
         assert (
             cake_api._CONTEXT_PROGRAMS[("context_fp8", swapped)][1:]
             == cake_api._CONTEXT_PROGRAMS[("context_fp8", identifier)][1:]
         )
-        assert swapped == f"{identifier.removesuffix('_KV4')}_PX"
+        if swapped in one_stage:
+            assert swapped == f"{identifier.removesuffix('_Q1')}_PX_Q1"
+        else:
+            assert swapped == f"{identifier.removesuffix('_KV4')}_PX"
     monkeypatch.setattr(cake_api, "_cake_fmha_target", lambda device: target)
     for row in ("fp8_b16_q32_k128", "fp8_b16_q32_k128_g4"):
         component, batch, q_len, _, hq, hkv, page, shared, _ = SHAPE_ROWS[row]
@@ -1377,8 +1393,10 @@ def test_cake_fmha_context_fp8_one_stage_route(monkeypatch, target, page) -> Non
     route), take pack 1's one-stage program of the page size on a CUDA device
     (one m-block of 128 tokens), for host and device scales; off a CUDA
     device the call keeps its runtime-size program.  A call of the exact
-    class and an sm103a call of at most 128 keys (its short-KV program) keep
-    their programs."""
+    class keeps its program; an sm103a call of at most 128 keys takes the
+    one-stage program with P in its own S columns of the pack the one-stage
+    choice names where it names one and the page size has one (every page
+    size), else keeps its short-KV program."""
 
     monkeypatch.setattr(cake_api, "_cake_fmha_target", lambda device: target)
     meta = torch.device("meta")
@@ -1408,7 +1426,14 @@ def test_cake_fmha_context_fp8_one_stage_route(monkeypatch, target, page) -> Non
         route = cake_api.select_cake_fmha_context_route(
             meta, **_context_kwargs(short, device="meta")
         )
-        assert route.program == f"RUNTIME_PACK{route.pack_g}{suffix}", route
+        pack = cake_api._context_fp8_one_stage_choice(
+            target, 2, 64, 128, 32, 8, sm_count, (8, None)
+        )
+        if page == 16 and pack is not None:
+            assert route.program == f"RUNTIME_PACK{pack}_Q1", route
+            assert (route.pack_g, route.num_m_blocks) == (pack, 1)
+        else:
+            assert route.program == f"RUNTIME_PACK{route.pack_g}{suffix}", route
 
 
 # --- The page tables a launch passes (host-only) -----------------------------
