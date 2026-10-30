@@ -219,23 +219,24 @@ def _get_sm100_kernel(
     return compiled
 
 
-def _get_reduce_kernel(act_dtype: torch.dtype, has_bias: bool, pointers: Tuple, stream):
+def _get_reduce_kernel(
+    act_dtype: torch.dtype, has_bias: bool, splits: int, pointers: Tuple, stream
+):
     """The split-K reduce (sum of slices, scale, bias, cast), compiled once per
-    activation dtype and bias presence."""
+    activation dtype, bias presence and slice count."""
     import cutlass.cute as cute
 
     from .kernels.cute_dsl.w8a16_fp8_splitk_reduce import W8A16SplitKReduce
 
-    key = ("reduce", act_dtype, has_bias)
+    key = ("reduce", act_dtype, has_bias, splits)
     compiled = _KERNEL_CACHE.get(key)
     if compiled is not None:
         return compiled
     compiled = cute.compile(
-        W8A16SplitKReduce(has_bias).wrapper,
+        W8A16SplitKReduce(has_bias, splits).wrapper,
         *pointers,
         1,
         8,
-        1,
         stream=stream,
         options="--opt-level 2 --enable-tvm-ffi",
     )
@@ -405,7 +406,9 @@ def w8a16_fp8_gemm_cute_dsl(
                 act_ctype, out.data_ptr(), cute.AddressSpace.gmem, assumed_align=16
             ),
         )
-        reduce = _get_reduce_kernel(act.dtype, has_bias, reduce_pointers, stream)
+        reduce = _get_reduce_kernel(
+            act.dtype, has_bias, splits, reduce_pointers, stream
+        )
         reduce(
             partials.data_ptr(),
             weight_scale.data_ptr(),
@@ -413,7 +416,6 @@ def w8a16_fp8_gemm_cute_dsl(
             out.data_ptr(),
             m,
             n,
-            splits,
             stream,
         )
     return out

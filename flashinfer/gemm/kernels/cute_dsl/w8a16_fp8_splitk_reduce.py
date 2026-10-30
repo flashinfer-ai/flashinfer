@@ -8,7 +8,9 @@ the per-tensor scale and the optional per-N bias, and casts to the activation dt
 
 ``partials`` is the GEMM kernel's C for ``splits`` slices: [splits, M, N] fp32,
 N contiguous (the kernel's C[n, m, l] column-major).  One thread handles eight
-consecutive n (one 16-byte store, two 16-byte loads per slice)."""
+consecutive n (one 16-byte store, two 16-byte loads per slice).  The slice count is
+a compile-time constant so the slice loop unrolls and every slice's loads are in
+flight at once (the kernel is latency-bound: 128 CTAs for a 1024 x 256 output)."""
 
 import cuda.bindings.driver as cuda
 import cutlass
@@ -19,8 +21,9 @@ _THREADS = 256
 
 
 class W8A16SplitKReduce:
-    def __init__(self, has_bias: bool):
+    def __init__(self, has_bias: bool, splits: int):
         self.has_bias = has_bias
+        self.splits = splits
 
     @cute.jit
     def wrapper(
@@ -31,14 +34,13 @@ class W8A16SplitKReduce:
         out_ptr: cute.Pointer,
         m: cutlass.Int64,
         n: cutlass.Int64,
-        splits: cutlass.Int64,
         stream: cuda.CUstream,
     ):
         # Flat views in units of 8-element vectors; N is a multiple of 8.
         mn_vecs = m * n // _VEC
         partials = cute.make_tensor(
             partials_ptr,
-            cute.make_layout((_VEC, mn_vecs, splits), stride=(1, _VEC, m * n)),
+            cute.make_layout((_VEC, mn_vecs, self.splits), stride=(1, _VEC, m * n)),
         )
         out = cute.make_tensor(
             out_ptr, cute.make_layout((_VEC, mn_vecs), stride=(1, _VEC))
@@ -48,7 +50,7 @@ class W8A16SplitKReduce:
         )
         scale = cute.make_tensor(scale_ptr, cute.make_layout((1,)))
         num_blocks = cute.ceil_div(mn_vecs, _THREADS)
-        self.kernel(partials, scale, bias, out, mn_vecs, n // _VEC, splits).launch(
+        self.kernel(partials, scale, bias, out, mn_vecs, n // _VEC).launch(
             grid=[num_blocks, 1, 1], block=[_THREADS, 1, 1], stream=stream
         )
 
@@ -61,14 +63,13 @@ class W8A16SplitKReduce:
         out: cute.Tensor,
         mn_vecs: cutlass.Int64,
         n_vecs: cutlass.Int64,
-        splits: cutlass.Int64,
     ):
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
         idx = bidx * _THREADS + tidx
         if idx < mn_vecs:
             acc = partials[(None, idx, 0)].load()
-            for s in cutlass.range(1, splits, 1):
+            for s in cutlass.range_constexpr(1, self.splits):
                 acc = acc + partials[(None, idx, s)].load()
             acc = cutlass.Float32(scale[0]) * acc
             if cutlass.const_expr(self.has_bias):
