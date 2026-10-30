@@ -160,10 +160,14 @@ def _plain(x):
     """Dataclass / tensor / tuple -> JSON-like plain values (tensors as lists with their dtype)."""
     if isinstance(x, torch.Tensor):
         return {"dtype": str(x.dtype), "shape": list(x.shape), "values": x.tolist()}
-    if hasattr(x, "__dataclass_fields__"):
+    # the contexts are plain classes listing their fields in ``_FIELDS``; the other plan objects are dataclasses
+    fields = getattr(type(x), "_FIELDS", None) or getattr(
+        x, "__dataclass_fields__", None
+    )
+    if fields is not None:
         return {
             f: _plain(getattr(x, f))
-            for f in x.__dataclass_fields__
+            for f in fields
             if not f.startswith("_") and f != "sequence"
         }
     if isinstance(x, dict):
