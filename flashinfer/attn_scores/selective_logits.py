@@ -120,9 +120,9 @@ class FP8PagedMQATopKWrapper:
         Supply positive ``max_context_length`` (original tokens),
         ``max_chunk_size`` (total query rows) and ``max_batch_size``. Give
         either an unretained ``kv_layout`` exemplar or ``num_pages`` plus
-        ``device`` for a contiguous pool. Call ``plan`` and ``prepare_pool``
-        outside capture before using a full layout. Selective preparation
-        can also happen on the first eager ``run``. Unsupported selective
+        ``device`` for a contiguous pool. After ``plan``, either strategy can
+        prepare a pool on its first eager ``run``. Optional ``prepare_pool``
+        moves compilation and warmup out of that call. Unsupported selective
         specializations fail at preparation. Both strategies are experimental.
 
         ``max_workspace_size`` bounds only the full FP32 score arena, in
@@ -170,8 +170,8 @@ class FP8PagedMQATopKWrapper:
         Full uses the constructor's bounded shared score arena; in-capacity length
         and page-map changes preserve prepared bindings and buffer addresses.
         A full graph bucket is keyed by supplied Q rows, request count
-        (``qo_indptr.numel() - 1``) and ``next_n``. Eagerly plan and prepare
-        every layer pool for that bucket before capturing it.
+        (``qo_indptr.numel() - 1``) and ``next_n``. Eagerly plan, then run or
+        explicitly prepare every layer pool for that bucket before capture.
         The page map requires at least
         ``ceil((max_context_length // compression_ratio) / page_size)``
         columns. Every request or expanded row table must fit int32 indexing:
@@ -213,6 +213,9 @@ class FP8PagedMQATopKWrapper:
 
         Normal instances dispatch directly to the backend method, without
         an additional experimental-warning or forwarding layer per run.
+        Either strategy prepares a missing pool binding on its first eager
+        run; warmed bindings incur no preparation. Caller capture requires
+        an earlier eager run or explicit ``prepare_pool`` for the binding.
         Full requires an unhinted active plan when recording ``run`` inside
         caller capture; a ``host_length_hints`` plan is eager-only.
         """
@@ -221,12 +224,15 @@ class FP8PagedMQATopKWrapper:
     def prepare_pool(self, kv_fused):
         """Compile, warm and bind one layer pool outside capture.
 
-        Full requires an eager plan then preparation for every
-        ``(supplied Q rows, request count, next_n)`` graph bucket and pool.
+        Optional for eager execution: either strategy also prepares lazily
+        on its first eager run. Full needs an eager plan followed by either
+        preparation or an eager run for every
+        ``(supplied Q rows, request count, next_n)`` graph bucket and pool
+        before capture.
         First-pool preparation warms every pitch bucket, even without host
         hints. Score/TopK scratch is shared across serialized layer pools;
-        compilation and warmup are setup costs, separate from plan/run.
-        Selective can also prepare on its first eager run.
+        compilation and warmup are setup costs, paid here or on the first
+        eager run, not on warmed runs.
         """
         return _backend_call(self, "prepare_pool", kv_fused)
 

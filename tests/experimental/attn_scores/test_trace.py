@@ -16,7 +16,11 @@
 Reference implementations are adapted from TRT-LLM test scripts.
 """
 
+import importlib.util
 import inspect
+import runpy
+import sys
+from pathlib import Path
 from types import SimpleNamespace
 import pytest
 import torch
@@ -28,6 +32,18 @@ from tests.trace.test_fi_trace import _check_defn
 pytestmark = pytest.mark.filterwarnings(
     "ignore:.*FP8PagedMQATopKWrapper.*:flashinfer.api_logging.ExperimentalWarning"
 )
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or importlib.util.find_spec("cutlass") is None
+    or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
+    reason="experimental paged TopK requires SM100 or SM103",
+)
+def test_example_main(monkeypatch, tmp_path):
+    monkeypatch.setattr(sys, "argv", ["example.py", "--output-dir", str(tmp_path)])
+    runpy.run_path(str(Path(__file__).with_name("example.py")), run_name="__main__")
+    assert len(list(tmp_path.glob("*.json"))) == 3
 
 
 class _CpuCapacityPlan:

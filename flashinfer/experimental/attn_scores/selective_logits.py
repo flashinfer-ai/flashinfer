@@ -4272,10 +4272,11 @@ class FP8PagedMQATopKWrapper(_PublicWrapper):
         ``max_batch_size`` rows and enough columns for the maximum per-request
         physical extent. Construction allocates the step workspace outside
         CUDA graph capture. Full reserves a bounded score arena and compiles
-        device metadata at construction; call ``plan`` and ``prepare_pool``
-        outside capture to warm each full layout. In-capacity replans preserve
-        pool bindings and storage addresses. Selective can prepare the layout
-        before its first step or on its first eager ``run``. Both refresh
+        device metadata at construction. After ``plan``, either strategy
+        prepares lazily on its first eager ``run``; optional ``prepare_pool``
+        performs compilation and warmup explicitly before that call or capture.
+        In-capacity replans preserve pool bindings and storage addresses.
+        Selective can also prepare the layout before its first step. Both refresh
         unhinted step metadata without host reads under caller capture.
         Unsupported selective
         scoring specializations are rejected when that chain is first built;
@@ -4533,8 +4534,11 @@ class FP8PagedMQATopKWrapper(_PublicWrapper):
         Release wrappers and their plans outside all CUDA graph capture,
         including captures owned by other wrappers: retirement unloads private
         CUDA libraries immediately.
-        Selective caller capture needs one earlier ``prepare_pool`` or eager run
-        to compile the layout; it then binds any equal-layout pool in place.
+        Missing pool bindings prepare lazily on an eager run, including full
+        host-hinted plans. Warmed runs do not prepare again. Before caller
+        capture, full needs one eager run or ``prepare_pool`` for each layout
+        bucket and pool. Selective needs one earlier preparation or eager run
+        to compile the layout; it then binds equal-layout pools in place.
         Use one wrapper per concurrent stream; calls must not overlap.
 
         Args:
@@ -4572,8 +4576,9 @@ class FP8PagedMQATopKWrapper(_PublicWrapper):
         alive; the constructor's ``kv_layout``
         exemplar is not bound.
 
-        Full requires eager plan then preparation on every layer pool for each
-        (supplied Q rows, request count, next_n) graph bucket. It binds
+        Optional for eager runs. Full needs eager plan then either preparation
+        or an eager run on every layer pool for each
+        (supplied Q rows, request count, next_n) graph bucket before capture. It binds
         scorer/GVR-v2 launches and warms all pitch buckets outside capture,
         even without host hints. Full pools share staged
         inputs, step metadata, the bounded score arena and GVR-v2 workspace;

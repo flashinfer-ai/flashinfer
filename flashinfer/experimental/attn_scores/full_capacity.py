@@ -567,7 +567,12 @@ class _CapacityFullTopKPlan:
             raise ValueError("Q rows must match plan num_query_rows")
         binding = self._pools.get((self._pool_key(pool), self._layout_key))
         if binding is None:
-            raise RuntimeError("prepare_pool must precede full run")
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    "prepare_pool or one eager run must precede caller capture"
+                )
+            self.prepare_pool(pool)
+            binding = self._pools[(self._pool_key(pool), self._layout_key)]
         if out is not None and (
             out.device != self._device
             or out.dtype != torch.int32

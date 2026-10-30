@@ -99,6 +99,8 @@ class _HostHintedFull:
 
         key = pool.data_ptr()
         if key in self.prepared:
+            if hasattr(self, "key"):
+                self._bind(full, pool)
             return
         # Warm all route bands AND populate exact-row CPU launchers. Engine
         # compilation is banded, not one compilation per possible row count.
@@ -187,7 +189,8 @@ class _HostHintedFull:
     def run(self, full, pool):
         launches = self.bindings.get((pool.data_ptr(), self.key))
         if launches is None:
-            raise RuntimeError("prepare_pool must precede host-hinted full run")
+            self.prepare_pool(full, pool)
+            launches = self.bindings[(pool.data_ptr(), self.key)]
         for fn, arguments in launches:
             fn(*arguments)
         return self.selected

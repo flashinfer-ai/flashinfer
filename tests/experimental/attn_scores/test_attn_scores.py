@@ -2031,11 +2031,10 @@ def test_full_wrapper_gvr2_workspace_capture_and_replan(monkeypatch, ieee_matmul
             wrapper.plan(one_q, cu_kv, table, num_query_rows=one_query.shape[0])
             wrapper.prepare_pool(fused)
             wrapper.run(one_query, one_weights, fused)
+        with pytest.raises(RuntimeError, match="injected full GVR preparation failure"):
+            wrapper.run(one_query, one_weights, fused)
     assert wrapper._full_gvr2_workspace is slab
-    with pytest.raises(RuntimeError, match="prepare_pool must precede"):
-        wrapper.run(q=one_query, kv_fused=fused, weights=one_weights)
-    wrapper.plan(one_q, cu_kv, table, num_query_rows=one_query.shape[0])
-    wrapper.prepare_pool(fused)
+    # An eager retry prepares the missing binding after the failure is removed.
     wrapper.run(one_query, one_weights, fused)
     assert wrapper._full_gvr2_workspace is slab
     recovered = wrapper.run(q=one_query, kv_fused=fused, weights=one_weights)
@@ -4130,8 +4129,13 @@ def test_full_wrapper_failed_preparation_rejects_run_and_retries(monkeypatch, q_
         patch.setattr(type(wrapper._full_capacity_plan), "_bind_launches", fail_prepare)
         with pytest.raises(RuntimeError, match="injected preparation failure"):
             wrapper.prepare_pool(unprepared_pool)
-    with pytest.raises(RuntimeError, match="prepare_pool must precede"):
-        wrapper.run(q=q, kv_fused=unprepared_pool, weights=weights)
+        with pytest.raises(RuntimeError, match="injected preparation failure"):
+            wrapper.run(q=q, kv_fused=unprepared_pool, weights=weights)
+    _check_selection(
+        wrapper.run(q, weights, unprepared_pool),
+        _oracle_rows((q, kv, scale, weights, cu_q, cu_kv)),
+        512,
+    )
     _check_selection(
         wrapper.run(q, weights, fused),
         _oracle_rows((q, kv, scale, weights, cu_q, cu_kv)),
@@ -8531,6 +8535,116 @@ def _full_plan_regression_inputs(strategy="full"):
         kv_layout=pool,
     )
     return wrapper, inputs, pool, table
+
+
+@_requires_selective_sm100
+@pytest.mark.parametrize("hinted", [False, True])
+def test_full_first_eager_run_prepares_lazily(monkeypatch, hinted, ieee_matmul):
+    wrapper, inputs, pool, table = _full_plan_regression_inputs()
+    q, _, _, weights, qo, kv = inputs
+    options = dict(num_query_rows=2, next_n=2)
+    if hinted:
+        options["host_length_hints"] = (
+            qo.cpu(),
+            torch.tensor([1031], dtype=torch.int32),
+        )
+    wrapper.plan(qo, kv, table, **options)
+    expected = _oracle_rows(inputs)
+    _check_selection(wrapper.run(q, weights, pool), expected, 512)
+    torch.cuda.synchronize()
+
+    def reject_setup(*args, **kwargs):
+        pytest.fail("warmed full run must not prepare or synchronize with the host")
+
+    plan = wrapper._full_capacity_plan
+    allocated = torch.cuda.memory_stats()["allocation.all.allocated"]
+    with monkeypatch.context() as patch:
+        patch.setattr(type(plan), "prepare_pool", reject_setup)
+        patch.setattr(type(plan._host_hints), "prepare_pool", reject_setup)
+        patch.setattr(torch.cuda, "synchronize", reject_setup)
+        for name in ("item", "cpu", "tolist"):
+            patch.setattr(torch.Tensor, name, reject_setup)
+        for _ in range(2):
+            selected = wrapper.run(q, weights, pool)
+    assert torch.cuda.memory_stats()["allocation.all.allocated"] == allocated
+    _check_selection(selected, expected, 512)
+    assert wrapper.error.item() == wrapper.repair_error.item() == 0
+    owner, plan_owner = weakref.ref(wrapper), weakref.ref(plan)
+    del plan, wrapper
+    assert owner() is None
+    assert plan_owner() is None
+
+
+@_requires_selective_sm100
+def test_full_unwarmed_capture_rejection_keeps_capture_valid(monkeypatch, ieee_matmul):
+    wrapper, inputs, pool, table = _full_plan_regression_inputs()
+    q, _, _, weights, qo, kv = inputs
+    wrapper.plan(qo, kv, table, num_query_rows=2, next_n=2)
+    sentinel = torch.zeros(1, device=q.device)
+
+    def reject_setup(*args, **kwargs):
+        pytest.fail("capture miss must fail before preparation or CUDA launches")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(type(wrapper._full_capacity_plan), "prepare_pool", reject_setup)
+        patch.setattr(type(wrapper._full_capacity_plan), "_execute", reject_setup)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            with pytest.raises(
+                RuntimeError, match="one eager run must precede caller capture"
+            ):
+                wrapper.run(q, weights, pool)
+            sentinel.fill_(1)
+        graph.replay()
+        assert sentinel.item() == 1
+        layout_graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(layout_graph):
+            with pytest.raises(RuntimeError, match="capturing a new full layout"):
+                wrapper.plan(qo, kv, table, num_query_rows=2, next_n=1)
+            sentinel.fill_(2)
+        layout_graph.replay()
+        assert sentinel.item() == 2
+    wrapper.plan(qo, kv, table, num_query_rows=2, next_n=2)
+    _check_selection(wrapper.run(q, weights, pool), _oracle_rows(inputs), 512)
+    warmed = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(warmed):
+        selected = wrapper.run(q, weights, pool)
+    warmed.replay()
+    _check_selection(selected, _oracle_rows(inputs), 512)
+
+
+@_requires_selective_sm100
+def test_full_hinted_lazy_preparation_failure_retries(monkeypatch, ieee_matmul):
+    wrapper, inputs, pool, table = _full_plan_regression_inputs()
+    q, _, _, weights, qo, kv = inputs
+    wrapper.plan(
+        qo,
+        kv,
+        table,
+        num_query_rows=2,
+        host_length_hints=(qo.cpu(), torch.tensor([1031], dtype=torch.int32)),
+    )
+    hinted_type = type(wrapper._full_capacity_plan._host_hints)
+    bind = hinted_type._bind
+    failed = False
+
+    def fail_once(self, *args):
+        nonlocal failed
+        if not failed:
+            failed = True
+            raise RuntimeError("injected hinted binding failure")
+        return bind(self, *args)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(hinted_type, "_bind", fail_once)
+        with pytest.raises(RuntimeError, match="injected hinted binding failure"):
+            wrapper.run(q, weights, pool)
+        selected = wrapper.run(q, weights, pool)
+    _check_selection(selected, _oracle_rows(inputs), 512)
+    assert wrapper.error.item() == wrapper.repair_error.item() == 0
+    owner = weakref.ref(wrapper)
+    del wrapper
+    assert owner() is None
 
 
 @_requires_selective_sm100
