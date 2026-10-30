@@ -664,6 +664,13 @@ _CONTEXT_FP8_SHORT_KV_ROUTES: dict[str, dict[str, tuple[str, int]]] = {
 # The packs the runtime programs ship besides 1: a pack serves every GQA group
 # it divides.
 _CONTEXT_FP8_RUNTIME_PACKS = (8, 4, 2)
+# Per target, the most tiles of a short-KV call (one 128-key block per tile,
+# served by a short-KV one-stage program) at which it takes the smallest pack
+# whose tiles number at most that many, in place of the one-stage choice: such
+# a tile's time is mostly fixed cost that falls with its query rows, and more
+# tiles than this ran slower (timed GB300: 1 .. 16 requests of 16 .. 128 query
+# tokens over 64 .. 128 keys, heads 32/4, 32/8 and 64/8).
+_CONTEXT_FP8_SHORT_KV_ONE_STAGE_TILES: dict[str, int] = {"sm103a": 64}
 # The FP8 split-KV context programs: the runtime-size schedule and arguments,
 # with the key range of the first ``split_tiles`` tiles split over work units
 # of ``split_blocks`` KV blocks (at most ``num_splits`` per tile), whose FP32
@@ -5438,9 +5445,11 @@ def select_cake_fmha_context_route(
         # size, where it predicts a gain over the launch chosen above.  A
         # runtime-size call of at most the keys of that program's short-KV
         # entry takes the entry's program, and keeps its launch where the
-        # program has none.  Else the call keeps its launch.  An exact
-        # program's tiles hold two query stages of its pack: at a smaller
-        # pack, one stage holds every query token of a tile.
+        # program has none; it takes the smallest such pack whose tiles number
+        # at most :data:`_CONTEXT_FP8_SHORT_KV_ONE_STAGE_TILES`, where one
+        # exists.  Else the call keeps its launch.  An exact program's tiles
+        # hold two query stages of its pack: at a smaller pack, one stage holds
+        # every query token of a tile.
         one_stage = _CONTEXT_FP8_ONE_STAGE_ROUTES.get(target)
         stage_pack = runtime_pack
         if exact_fp8_pack is not None:
@@ -5457,6 +5466,19 @@ def select_cake_fmha_context_route(
                 sm_count,
                 (pack_g, split_plan),
             )
+            short_tiles = _CONTEXT_FP8_SHORT_KV_ONE_STAGE_TILES.get(target)
+            if short_runtime and runtime_pack is not None and short_tiles is not None:
+                one_stage_pack = next(
+                    (
+                        candidate
+                        for candidate in (1, *reversed(_CONTEXT_FP8_RUNTIME_PACKS))
+                        if candidate <= runtime_pack
+                        and runtime_pack % candidate == 0
+                        and max_q_len <= 128 // candidate
+                        and batch_size * (num_q_heads // candidate) <= short_tiles
+                    ),
+                    one_stage_pack,
+                )
             one_stage_program = (
                 None
                 if one_stage_pack is None

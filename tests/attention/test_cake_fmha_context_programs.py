@@ -1394,9 +1394,9 @@ def test_cake_fmha_context_fp8_one_stage_route(monkeypatch, target, page) -> Non
     (one m-block of 128 tokens), for host and device scales; off a CUDA
     device the call keeps its runtime-size program.  A call of the exact
     class keeps its program; an sm103a call of at most 128 keys takes the
-    one-stage program with P in its own S columns of the pack the one-stage
-    choice names where it names one and the page size has one (every page
-    size), else keeps its short-KV program."""
+    one-stage program with P in its own S columns of the smallest pack whose
+    tiles number at most ``_CONTEXT_FP8_SHORT_KV_ONE_STAGE_TILES`` where the
+    page size has one (every page size), else keeps its short-KV program."""
 
     monkeypatch.setattr(cake_api, "_cake_fmha_target", lambda device: target)
     meta = torch.device("meta")
@@ -1426,14 +1426,70 @@ def test_cake_fmha_context_fp8_one_stage_route(monkeypatch, target, page) -> Non
         route = cake_api.select_cake_fmha_context_route(
             meta, **_context_kwargs(short, device="meta")
         )
-        pack = cake_api._context_fp8_one_stage_choice(
-            target, 2, 64, 128, 32, 8, sm_count, (8, None)
-        )
-        if page == 16 and pack is not None:
-            assert route.program == f"RUNTIME_PACK{pack}_Q1", route
-            assert (route.pack_g, route.num_m_blocks) == (pack, 1)
+        if page == 16:
+            assert route.program == "RUNTIME_PACK1_Q1", route
+            assert (route.pack_g, route.num_m_blocks) == (1, 1)
         else:
             assert route.program == f"RUNTIME_PACK{route.pack_g}{suffix}", route
+
+
+@pytest.mark.parametrize("target", ("sm100a", "sm103a"))
+def test_cake_fmha_context_fp8_short_kv_one_stage_pack(monkeypatch, target) -> None:
+    """An sm103a call of at most 128 keys at 16-token pages takes the
+    one-stage program of the smallest pack dividing its runtime pack whose
+    tiles hold every query token in one stage and number at most
+    ``_CONTEXT_FP8_SHORT_KV_ONE_STAGE_TILES`` (64), and the one-stage choice
+    where no pack has so few tiles; an sm100a call keeps its route (no
+    short-KV programs)."""
+
+    monkeypatch.setattr(cake_api, "_cake_fmha_target", lambda device: target)
+    sm_count = _SM_COUNT[target]
+    monkeypatch.setattr(cake_api, "_context_split_sm_count", lambda device: sm_count)
+    meta = torch.device("meta")
+    if target == "sm103a":
+        assert cake_api._CONTEXT_FP8_SHORT_KV_ONE_STAGE_TILES == {"sm103a": 64}
+    else:
+        assert target not in cake_api._CONTEXT_FP8_SHORT_KV_ONE_STAGE_TILES
+    # (batch, query tokens, keys, query heads, KV heads) -> sm103a pack
+    cases = {
+        (1, 64, 128, 32, 4): 1,
+        (2, 64, 128, 32, 4): 1,
+        (4, 64, 128, 32, 4): 2,
+        (1, 32, 128, 32, 4): 1,
+        (2, 32, 128, 64, 8): 2,
+        (4, 16, 100, 32, 4): 2,
+        (8, 16, 128, 32, 4): 4,
+        (16, 16, 128, 32, 4): 8,
+        (1, 128, 128, 32, 4): 1,
+        (1, 64, 128, 32, 8): 1,
+    }
+    for (batch, q_len, kv_len, hq, hkv), pack in cases.items():
+        row = ("context_fp8", batch, q_len, kv_len, hq, hkv, 16, True, None)
+        route = cake_api.select_cake_fmha_context_route(
+            meta, **_context_kwargs(row, device="meta")
+        )
+        if target == "sm103a":
+            assert route.program == f"RUNTIME_PACK{pack}_Q1", (row, route)
+            assert (route.pack_g, route.num_m_blocks) == (pack, 1), (row, route)
+        else:
+            with monkeypatch.context() as patch:
+                patch.setattr(cake_api, "_CONTEXT_FP8_SHORT_KV_ONE_STAGE_TILES", {})
+                kept = cake_api.select_cake_fmha_context_route(
+                    meta, **_context_kwargs(row, device="meta")
+                )
+            assert route == kept, (row, route, kept)
+    # 8 requests of 64 tokens: pack 1 and 2 tiles number 256 and 128, so the
+    # one-stage choice names the pack
+    row = ("context_fp8", 8, 64, 128, 32, 4, 16, True, None)
+    route = cake_api.select_cake_fmha_context_route(
+        meta, **_context_kwargs(row, device="meta")
+    )
+    if target == "sm103a":
+        pack = cake_api._context_fp8_one_stage_choice(
+            target, 8, 64, 128, 32, 8, sm_count, (8, None)
+        )
+        assert pack is not None
+        assert route.program == f"RUNTIME_PACK{pack}_Q1", route
 
 
 # --- The page tables a launch passes (host-only) -----------------------------
