@@ -1722,6 +1722,12 @@ def _weak(obj: Any) -> Any:
         return lambda: obj
 
 
+def _table_tensors(tb: Any) -> list[torch.Tensor]:
+    """The live device tables a table set held by a workspace (not by its context) has uploaded
+    (:meth:`_Tables.upload_specs`)."""
+    return list(tb.__dict__.get("_uploaded", ()))
+
+
 def _context_list(ctxs: Any) -> list[Any]:
     """One context or a sequence of contexts as a list."""
     if isinstance(ctxs, (list, tuple)):
@@ -2921,10 +2927,16 @@ class _Tables:
         call costs one asynchronous copy."""
         up = getattr(self.ctx, "upload_tables", None)
         if up is None:  # a duck-typed context: the same copy, unrecorded
-            return cake_kcp_plan._upload_tables(specs, device)[0]
-        # recorded for ctx.wait_ready only when this set lives as long as the context (its own table-set cache);
-        # a set of the table_cache="workspace" knob may be rebuilt per call and must not accumulate records
-        return up(specs, device, record=self.on_context)
+            out = cake_kcp_plan._upload_tables(specs, device)[0]
+        else:
+            # recorded for ctx.wait_ready only when this set lives as long as the context (its own table-set cache);
+            # a set of the table_cache="workspace" knob may be rebuilt per call and must not accumulate records
+            out = up(specs, device, record=self.on_context)
+        if not self.on_context:  # held by a workspace: its stream changes record them (KcpWorkspace._live_storages)
+            self.__dict__.setdefault("_uploaded", weakref.WeakSet()).update(
+                out.values()
+            )
+        return out
 
     def upload(
         self, values: Sequence[int], dtype: torch.dtype, device: torch.device | str
@@ -3120,7 +3132,10 @@ class KcpWorkspace:
     (``kcp_workspace_bytes([ctx, ...], H=H)`` predicts its ``bytes``).  No content crosses calls, so the results are
     bitwise those of one workspace per pack.  The workspace keeps no context alive.  It records the stream of its
     last call; a call on another stream first orders that stream's queued work before its own (one
-    ``wait_stream``, never a host wait).  ``allocate=False`` with a context allocates nothing until the first call
+    ``wait_stream``, never a host wait) and marks the workspace's live storages as used on its stream (one
+    ``record_stream`` each, :meth:`_order_stream`), so a pool or arena a later call replaces, or the storage of a
+    dropped workspace, goes back to the caching allocator only after the queued work of every stream that used it;
+    calls on one stream do neither.  ``allocate=False`` with a context allocates nothing until the first call
     and keeps ``backward`` as a sizing floor, so a first forward allocates the backward workspace at once instead
     of a forward-only one that its first backward would replace."""
 
@@ -3217,7 +3232,7 @@ class KcpWorkspace:
         its tables and local view at once while no pool or arena was replaced since (the pools only grow and the
         arena is replaced only by a pack that does not fit, so nothing is to do; one record per context and
         signature, at most :data:`ENSURE_CACHE_MAX`, the contexts and tables held weakly).  Every ensure orders the
-        call's stream after the workspace's last one (:meth:`_order_stream`)."""
+        call's stream after the workspace's last one (:meth:`_order_stream`) before it sizes anything."""
         dev: torch.device = (
             torch.device(device) if device is not None else torch.device(ctx.device)
         )
@@ -3236,8 +3251,9 @@ class KcpWorkspace:
         # workspace it has already taken apart
         self._check_device(dev)
         tb = self.tables(ctx, H, fused_walks=fused_walks, walk_geometry=walk_geometry)
-        self._size_pools(self._pool_need(tb, backward), dev)
+        # ordered (and the live storages recorded) before a pool or the arena can be released
         self._order_stream(dev)
+        self._size_pools(self._pool_need(tb, backward), dev)
         self.local_view = None
         if self.with_local and ctx.T_r > 0 and dev.type == "cuda":
             self.local_view = self._bind_local(ctx, int(H), dev, backward)
@@ -3287,8 +3303,8 @@ class KcpWorkspace:
                 )
             for name, n in sizes.items():
                 need[name] = max(need.get(name, 0), n)
-        self._size_pools(need, dev)
         self._order_stream(dev)
+        self._size_pools(need, dev)
         if self.with_local and dev.type == "cuda":
             local = [ctx for ctx in ctxs if ctx.T_r > 0]
             plans = {
@@ -3348,8 +3364,13 @@ class KcpWorkspace:
 
     def _order_stream(self, device: torch.device) -> None:
         """Record the stream of this call; when it differs from the last call's, order the last stream's queued work
-        (which may still use this workspace) before the work this call enqueues: one ``wait_stream`` per change, no
-        host wait, skipped while the current stream captures a CUDA graph (the capture's own ordering applies)."""
+        (which may still use this workspace) before the work this call enqueues (one ``wait_stream``, no host wait)
+        and mark every live device storage of the workspace as used on this stream (``record_stream``,
+        :meth:`_live_storages`), so a storage released later (a grown pool, a replaced arena, the dropped workspace)
+        returns to the caching allocator only once this stream's work queued by then has run, whichever stream
+        allocated it.  Called before any release.  Nothing on the same stream (stream order covers it) or while the
+        current stream captures a CUDA graph (the capture's own ordering applies, and its allocations live in the
+        graph's private pool)."""
         if device.type != "cuda":
             return
         index = (
@@ -3360,9 +3381,42 @@ class KcpWorkspace:
         if last is not None and last[0] == raw:
             return
         cur = torch.cuda.current_stream(index)
-        if last is not None and not torch.cuda.is_current_stream_capturing():
-            cur.wait_stream(last[1])
+        if not torch.cuda.is_current_stream_capturing():
+            if last is not None:
+                cur.wait_stream(last[1])
+            for t in self._live_storages():
+                t.record_stream(cur)
         self._stream = (raw, cur)
+
+    def _live_storages(self) -> list[torch.Tensor]:
+        """One tensor per live device storage of this workspace that a call's kernels can touch: each distinct pool
+        (a :data:`cake_kcp_plan.SHARED_POOLS` pair once), the local arena's bytes and its identity tile (``eye`` /
+        ``flags``, shared by its views), the scratch table buffer of the arena and of each cached plan view (one
+        buffer per set, its tables are slices of it), and the device tables of the ``table_cache="workspace"`` knob's
+        table sets (the shipped path's table sets live on the context, whose ``wait_ready`` records them per
+        stream)."""
+        out: dict[int, torch.Tensor] = {}
+
+        def add(t: Any) -> None:
+            if isinstance(t, torch.Tensor) and t.is_cuda:
+                ptr = t.untyped_storage().data_ptr()
+                if ptr:  # an empty storage has no block
+                    out.setdefault(ptr, t)
+
+        for t in self._pools.values():
+            add(t)
+        local = self.local
+        if local is not None:
+            add(local.arena)
+            add(local._eye_box[0])
+            for arena in (local, *self._views.values()):
+                for t in (arena.__dict__.get(SCRATCH_TABLES_ATTR) or {}).values():
+                    add(t)
+                    break  # every table of the set is a slice of one buffer
+        for tb in self._tables.values():
+            for t in _table_tensors(tb):
+                add(t)
+        return list(out.values())
 
     def _local_plan(self, key: tuple[int, int, int], device: torch.device) -> Any:
         index = (
