@@ -1696,6 +1696,39 @@ def kcp_local_grid(stage: str, p: Any) -> tuple[int, int, int]:
     raise ValueError(f"no KCP-owned local record for stage {stage!r}")
 
 
+VIEW_CACHE_MAX = 64  # plan views of one local arena a KcpWorkspace keeps (the least recently bound goes first)
+SLICE_CACHE_MAX = 256  # pool[:n] views a KcpWorkspace keeps (cleared when full)
+ENSURE_CACHE_MAX = (
+    128  # trimmed-path ensure records a KcpWorkspace keeps (cleared when full)
+)
+
+
+def _plan_view(arena: Any, plan: Any) -> Any:
+    """A view of the local arena ``arena`` (``cake_backend.KdaWorkspace``) under the plan of another pack whose
+    layouts fit it: the same bytes, ``eye`` / ``flags`` and epoch counter, with its own layout views, its own launch
+    templates (:data:`TEMPLATE_CACHE_ATTR`) and its own scratch table set (:data:`SCRATCH_TABLES_ATTR`, sized by its
+    plan).  ``KdaWorkspace.views`` checks that each layout fits the arena's bytes."""
+    view = arena._view(plan)
+    view.__dict__.pop(TEMPLATE_CACHE_ATTR, None)
+    view.__dict__.pop(SCRATCH_TABLES_ATTR, None)
+    return view
+
+
+def _weak(obj: Any) -> Any:
+    """A callable returning ``obj`` that holds it weakly where its type allows (a duck-typed context may not)."""
+    try:
+        return weakref.ref(obj)
+    except TypeError:
+        return lambda: obj
+
+
+def _context_list(ctxs: Any) -> list[Any]:
+    """One context or a sequence of contexts as a list."""
+    if isinstance(ctxs, (list, tuple)):
+        return list(ctxs)
+    return [ctxs]
+
+
 def _scratch_tables(local: Any) -> dict[str, torch.Tensor]:
     """The table set the intra record that computes the chunk layout from ``cu_seqlens`` writes (the existing
     backend's tables, its block table included), on a scratch buffer held by the arena: the KCP's CPU-built tables
@@ -3075,7 +3108,21 @@ class KcpWorkspace:
     superseded pool and local arena (and the graph-cache entries pinning that arena) before allocating its successor
     (the old and the new storage never coexist, so a backward on a forward workspace peaks at the grown workspace plus
     the call's own peak).  ``bytes`` counts every pool storage once plus the local arena (:func:`kcp_workspace_bytes`
-    is the plan module's prediction of the same quantity for an a2a workspace, CONSISTENCY-6)."""
+    is the plan module's prediction of the same quantity for an a2a workspace, CONSISTENCY-6).
+
+    One workspace serves any number of prepared packs (contexts) whose calls run in stream order: the pools hold
+    the largest need of the packs served and the local arena the largest of their layouts; a pack whose layout fits
+    the arena runs on a view of it under its own plan (:func:`_plan_view`, at most :data:`VIEW_CACHE_MAX` cached per
+    arena; each view has its own launch templates and its own scratch table set where the intra record writes one,
+    :func:`cake_kcp_plan.local_scratch_table_bytes`), and the arena is replaced only by a pack that does not fit.
+    A forward never replaces a backward arena with a forward-only one.  :meth:`reserve` sizes the workspace for a
+    list of contexts up front, so the calls of those packs allocate nothing and every pointer stays put
+    (``kcp_workspace_bytes([ctx, ...], H=H)`` predicts its ``bytes``).  No content crosses calls, so the results are
+    bitwise those of one workspace per pack.  The workspace keeps no context alive.  It records the stream of its
+    last call; a call on another stream first orders that stream's queued work before its own (one
+    ``wait_stream``, never a host wait).  ``allocate=False`` with a context allocates nothing until the first call
+    and keeps ``backward`` as a sizing floor, so a first forward allocates the backward workspace at once instead
+    of a forward-only one that its first backward would replace."""
 
     def __init__(
         self,
@@ -3087,6 +3134,7 @@ class KcpWorkspace:
         state_dtype: torch.dtype = torch.float32,
         local: bool = True,
         save_mode: str = "light",
+        allocate: bool = True,
     ) -> None:
         if save_mode not in SAVE_MODES:
             raise ValueError(
@@ -3099,16 +3147,29 @@ class KcpWorkspace:
         self._pools: dict[str, torch.Tensor] = {}
         self._tables: dict[tuple[Any, int, int, str], _Tables] = {}
         self.local: Any | None = None
-        self._last_ensure: tuple[Any, ...] | None = (
-            None  # (ctx, H, device, backward, fused_walks, walk_geometry, tb)
+        # the arena (or its plan view) the last ensured context runs on; None on a rank without tokens
+        self.local_view: Any | None = None
+        # plan views of the arena per (S, num_docs, H), least recently bound first
+        self._views: dict[tuple[int, int, int], Any] = {}
+        self._views_scratch = 0  # local_scratch_table_bytes over the cached views
+        # a forward sizes the workspace for the backward too (allocate=False with a context, reserve())
+        self._backward_floor = False
+        self._stream: tuple[int, Any] | None = (
+            None  # (raw handle, stream) of the last call
         )
+        # the trimmed path's ensure records per (id(ctx), (H, device, backward, fused_walks, walk_geometry)):
+        # (weak ctx, weak tables, local view); dropped whenever a pool or the arena is replaced or a view evicted
+        self._fast: dict[tuple[Any, ...], tuple[Any, Any, Any]] = {}
         self._slices: dict[
             tuple[str, int], tuple[torch.Tensor, torch.Tensor]
-        ] = {}  # pool[:n] views per (name, n)
+        ] = {}  # pool[:n] views per (name, n), at most SLICE_CACHE_MAX
         if ctx is not None:
             if H is None:
                 raise ValueError("KcpWorkspace: H is required with ctx")
-            self.ensure(ctx, H, device=device, backward=backward)
+            if allocate:
+                self.ensure(ctx, H, device=device, backward=backward)
+            else:
+                self._backward_floor = bool(backward)
 
     def tables(
         self,
@@ -3152,26 +3213,117 @@ class KcpWorkspace:
         host_trim: bool = False,
     ) -> _Tables:
         """Size the pools (and the local arena) for ``(ctx, H)``; returns the tables.  ``host_trim``: a call
-        with the same ``(ctx, H, device, backward, fused_walks, walk_geometry)`` as the last ensure returns its tables
-        at once (the pools only grow and the arena is replaced only by a different plan, so nothing is to do)."""
-        device = (
+        with the same ``(ctx, H, device, backward, fused_walks, walk_geometry)`` as an earlier trimmed ensure returns
+        its tables and local view at once while no pool or arena was replaced since (the pools only grow and the
+        arena is replaced only by a pack that does not fit, so nothing is to do; one record per context and
+        signature, at most :data:`ENSURE_CACHE_MAX`, the contexts and tables held weakly).  Every ensure orders the
+        call's stream after the workspace's last one (:meth:`_order_stream`)."""
+        dev: torch.device = (
             torch.device(device) if device is not None else torch.device(ctx.device)
         )
-        sig = (int(H), device, bool(backward), int(fused_walks), str(walk_geometry))
+        backward = bool(backward) or self._backward_floor
+        sig = (int(H), dev, backward, int(fused_walks), str(walk_geometry))
         if host_trim:
-            last = self._last_ensure
-            if last is not None and last[0] is ctx and last[1] == sig:
-                return last[2]
-        # set again only once this ensure succeeds: a failed one (an allocation error after a release) must not
-        # leave the fast path approving a workspace it has already taken apart
-        self._last_ensure = None
+            hit = self._fast.get((id(ctx), sig))
+            if hit is not None and hit[0]() is ctx:
+                tb = hit[1]()
+                if tb is not None:
+                    self.local_view = hit[2]
+                    self._order_stream(dev)
+                    return tb
+        # a record is added only once this ensure succeeds, and every pool or arena replacement drops them all
+        # first: a failed ensure (an allocation error after a release) never leaves the fast path approving a
+        # workspace it has already taken apart
+        self._check_device(dev)
+        tb = self.tables(ctx, H, fused_walks=fused_walks, walk_geometry=walk_geometry)
+        self._size_pools(self._pool_need(tb, backward), dev)
+        self._order_stream(dev)
+        self.local_view = None
+        if self.with_local and ctx.T_r > 0 and dev.type == "cuda":
+            self.local_view = self._bind_local(ctx, int(H), dev, backward)
+        if host_trim:
+            if len(self._fast) >= ENSURE_CACHE_MAX:
+                self._fast.clear()
+            self._fast[(id(ctx), sig)] = (_weak(ctx), _weak(tb), self.local_view)
+        return tb
+
+    def reserve(
+        self,
+        ctxs: Any,
+        H: int,
+        *,
+        device: torch.device | str | None = None,
+        backward: bool = True,
+        fused_walks: int = FUSED_WALKS_DEFAULT,
+        walk_geometry: str = WALK_GEOMETRY_DEFAULT,
+        ring: bool = False,
+    ) -> int:
+        """Size this workspace for every context of ``ctxs`` (one context or a sequence of them) at ``H`` heads: each
+        pool to its largest need, the local arena to the largest layout (replaced only when one does not fit) with a
+        plan view per other pack and its scratch table set, all allocated now on the current stream.  With
+        ``backward`` (the default) a later forward never re-sizes it, so the calls of the reserved packs allocate
+        nothing and every pool and view keeps its pointer; ``bytes`` is then
+        ``kcp_workspace_bytes(ctxs, H=H)`` for a workspace reserved once.  Host work and allocations only (no
+        device wait).  ``ring=True`` also sizes the ring exchange's hop pools (:data:`cake_kcp_plan.LAZY_POOLS`,
+        otherwise allocated by the first ``exchange="ring"`` call; ``kcp_arena_layout(...)["ring"]`` bytes per
+        context, the largest over the contexts).  Returns :attr:`bytes`."""
+        ctxs = _context_list(ctxs)
+        if not ctxs:
+            raise ValueError("KcpWorkspace.reserve: no context given")
+        dev: torch.device = torch.device(ctxs[0].device if device is None else device)
+        backward = bool(backward) or self._backward_floor
+        self._backward_floor = backward
+        self._check_device(dev)
+        H = int(H)
+        need: dict[str, int] = {}
+        for ctx in ctxs:
+            tb = self.tables(
+                ctx, H, fused_walks=fused_walks, walk_geometry=walk_geometry
+            )
+            sizes = self._pool_need(tb, backward)
+            if ring:
+                sizes.update(
+                    (name, tb.sizes[name]) for name in cake_kcp_plan.LAZY_POOLS
+                )
+            for name, n in sizes.items():
+                need[name] = max(need.get(name, 0), n)
+        self._size_pools(need, dev)
+        self._order_stream(dev)
+        if self.with_local and dev.type == "cuda":
+            local = [ctx for ctx in ctxs if ctx.T_r > 0]
+            plans = {
+                id(ctx): self._local_plan((int(ctx.T_r), int(ctx.n_frag), H), dev)
+                for ctx in local
+            }
+            # the largest layout first: every other pack then runs on a view of its arena
+            local.sort(
+                key=lambda c: -plans[id(c)].arena_bytes(
+                    backward=backward,
+                    save_mode=self.save_mode,
+                    fwd_layout=cake_kcp_plan.local_fwd_layout(backward, self.save_mode),
+                )
+            )
+            for ctx in local:
+                view = self._bind_local(ctx, H, dev, backward)
+                for path in (LOCAL_PATH_FWD, LOCAL_PATH_BWD):
+                    if cake_kcp_plan.intra_writes_tables(view.plan, path):
+                        _scratch_tables(view)
+                        break
+            self.local_view = None
+        return self.bytes
+
+    def _check_device(self, device: torch.device) -> None:
         if self.device is None:
             self.device = device
         elif self.device != device:
             raise ValueError(
                 f"KcpWorkspace: lives on {self.device}, the call is on {device}"
             )
-        tb = self.tables(ctx, H, fused_walks=fused_walks, walk_geometry=walk_geometry)
+
+    @staticmethod
+    def _pool_need(tb: _Tables, backward: bool) -> dict[str, int]:
+        """The elements of every pool ``tb`` needs on a ``backward`` / forward-only workspace, the lazily
+        allocated pools excluded and each :data:`cake_kcp_plan.SHARED_POOLS` pair at the larger need of the two."""
         # allocated by the first call that reads them (pool()): the ring pools; on a forward-only workspace the pools
         # only a forward without a saved set reads
         lazy = cake_kcp_plan.LAZY_POOLS + (
@@ -3185,37 +3337,96 @@ class KcpWorkspace:
             for m in pair:
                 if m in need:
                     need[m] = top
+        return need
+
+    def _size_pools(self, need: dict[str, int], device: torch.device) -> None:
         replaced = False
         for name, n in need.items():
             replaced |= self._grow(name, n, device)
         if replaced and self._slices:
             self._drop_stale_slices()
-        if self.with_local and ctx.T_r > 0 and torch.device(device).type == "cuda":
-            p = self.local.plan if self.local is not None else None
-            if (
-                p is None
-                or (ctx.T_r, ctx.n_frag, int(H)) != (p.S, p.N, p.H)
-                or (backward and not self.local.backward)
-            ):
-                if self.local is not None:
-                    # no contents carry over: release the superseded arena (and the graph-cache entries pinning it)
-                    # before its successor is allocated, so the two never coexist -- the first training step then
-                    # peaks at the retained workspace plus the call's own peak, as every later step does (with the
-                    # SPEC-3 probe off, the default)
-                    _graph_release(self.local)
-                    self.local = None
-                self.local = cake_backend.KdaWorkspace.for_problem(
-                    ctx.T_r,
-                    ctx.n_frag,
-                    int(H),
-                    device,
-                    backward=backward,
-                    save_mode=self.save_mode,
-                    fwd_layout=cake_kcp_plan.local_fwd_layout(backward, self.save_mode),
-                )
-        if host_trim:
-            self._last_ensure = (ctx, sig, tb)
-        return tb
+
+    def _order_stream(self, device: torch.device) -> None:
+        """Record the stream of this call; when it differs from the last call's, order the last stream's queued work
+        (which may still use this workspace) before the work this call enqueues: one ``wait_stream`` per change, no
+        host wait, skipped while the current stream captures a CUDA graph (the capture's own ordering applies)."""
+        if device.type != "cuda":
+            return
+        index = (
+            device.index if device.index is not None else torch.cuda.current_device()
+        )
+        raw = _raw_stream(index)
+        last = self._stream
+        if last is not None and last[0] == raw:
+            return
+        cur = torch.cuda.current_stream(index)
+        if last is not None and not torch.cuda.is_current_stream_capturing():
+            cur.wait_stream(last[1])
+        self._stream = (raw, cur)
+
+    def _local_plan(self, key: tuple[int, int, int], device: torch.device) -> Any:
+        index = (
+            device.index if device.index is not None else torch.cuda.current_device()
+        )
+        return cake_backend.plan(
+            *key, cake_jit.sm_count(index), cake_jit.device_arch(index)
+        )
+
+    def _bind_local(
+        self, ctx: Any, H: int, device: torch.device, backward: bool
+    ) -> Any:
+        """The local arena, or its plan view, that ``ctx``'s calls run on: the arena's own plan, a cached view, a
+        new view of a plan whose layouts fit the arena (of its kind: a backward arena serves forwards too), or a new
+        arena -- of the backward kind when the call, the sizing floor or the superseded arena is one -- after the
+        superseded arena, its views and the graph-cache entries pinning them are released (the two never
+        coexist)."""
+        key = (int(ctx.T_r), int(ctx.n_frag), int(H))
+        base = self.local
+        if base is not None and (base.backward or not backward):
+            p = base.plan
+            if key == (p.S, p.N, p.H):
+                return base
+            view = self._views.pop(key, None)
+            if view is None:
+                plan = self._local_plan(key, device)
+                if (
+                    plan.arena_bytes(
+                        backward=base.backward,
+                        save_mode=self.save_mode,
+                        fwd_layout=base.fwd_layout,
+                    )
+                    <= base.bytes
+                ):
+                    view = _plan_view(base, plan)
+                    self._views_scratch += cake_kcp_plan.local_scratch_table_bytes(plan)
+                    while len(self._views) >= VIEW_CACHE_MAX:
+                        self._fast.clear()
+                        old = self._views.pop(next(iter(self._views)))
+                        self._views_scratch -= cake_kcp_plan.local_scratch_table_bytes(
+                            old.plan
+                        )
+            if view is not None:
+                self._views[key] = view  # most recently bound last
+                return view
+        kind = backward or (base is not None and base.backward)
+        if base is not None:
+            # no contents carry over: release the superseded arena, its views (and the graph-cache entries pinning
+            # them) before its successor is allocated, so the two never coexist -- the first training step then
+            # peaks at the retained workspace plus the call's own peak, as every later step does (with the SPEC-3
+            # probe off, the default)
+            self._fast.clear()
+            _graph_release(base)
+            self._views.clear()
+            self._views_scratch = 0
+            self.local_view = self.local = base = None
+        self.local = cake_backend.KdaWorkspace.for_problem(
+            *key,
+            device,
+            backward=kind,
+            save_mode=self.save_mode,
+            fwd_layout=cake_kcp_plan.local_fwd_layout(kind, self.save_mode),
+        )
+        return self.local
 
     def _grow(self, name: str, n: int, device: torch.device) -> bool:
         """Make pool ``name`` hold ``n`` elements; a :data:`cake_kcp_plan.SHARED_POOLS` pair stays one tensor.
@@ -3234,6 +3445,7 @@ class KcpWorkspace:
             None,
         )
         mt = self._pools.get(mate) if mate is not None else None
+        self._fast.clear()
         if mt is not None and mt.numel() >= n:
             self._pools[name] = mt  # the pair's storage is already large enough
             return True
@@ -3293,6 +3505,8 @@ class KcpWorkspace:
             if hit is not None and hit[0] is t:
                 return hit[1]
             v = t[:n]
+            if len(self._slices) >= SLICE_CACHE_MAX:  # bounded: many packs' sizes
+                self._slices.clear()
             self._slices[(name, n)] = (t, v)
             return v
         return t[:n]
@@ -3308,11 +3522,12 @@ class KcpWorkspace:
             for t in {id(t): t for t in self._pools.values()}.values()
         )
         local = 0
-        if (
-            self.local is not None
-        ):  # the arena and the intra record's scratch table set where it writes one
-            local = int(self.local.bytes) + cake_kcp_plan.local_scratch_table_bytes(
-                self.local.plan
+        if self.local is not None:
+            # the arena and the intra record's scratch table set where it writes one, its own and each plan view's
+            local = (
+                int(self.local.bytes)
+                + cake_kcp_plan.local_scratch_table_bytes(self.local.plan)
+                + self._views_scratch
             )
         return kcp + local
 
@@ -3668,7 +3883,9 @@ class KcpCall:
         self.scratch: dict[str, Any] = {}
         self.bufs: dict[str, torch.Tensor] = {}
         self.local = (
-            ws.local if (backend.local_stages and ws.local is not None) else None
+            ws.local_view
+            if (backend.local_stages and ws.local_view is not None)
+            else None
         )
         self.local_values: dict[str, Any] | None = None
         self.out: torch.Tensor | None = None
@@ -4844,6 +5061,9 @@ def _graph_capture(kind: str, entry: _GraphEntry, call: KcpCall, body: Any) -> A
     LAST_CALL[kind].update(graph_event="capture", graph_key=entry.digest)
     entry.record = dict(LAST_CALL[kind])
     entry.graph = g
+    if call.local is not None and call.local is not call.ws.local:
+        # a plan view of the arena: the graph holds its scratch table set, so the entry keeps the view alive
+        entry.pins += (call.local,)
     entry.seen += 1
     GRAPH_STATS["capture"] += 1
     call.backend.end_call(call)
@@ -4883,8 +5103,22 @@ def _graph_release(pinned: Any) -> int:
     graphs) would keep that storage alive.  The dropped entries also let go of their pins (the entry of the call doing
     the upgrade, created before its ``ensure``, is still referenced by that call): once the arena is freed its id may
     be reused, and a later call that builds an equal key finds no entry and starts a new one.  Returns the number
-    dropped."""
-    stale = [key for key, e in _GRAPHS.items() if any(p is pinned for p in e.pins)]
+    dropped.  A pinned plan view of the arena ``pinned`` (:func:`_plan_view`, the same ``arena`` tensor) matches
+    too."""
+    arena = pinned.arena if isinstance(pinned, cake_backend.KdaWorkspace) else None
+    stale = [
+        key
+        for key, e in _GRAPHS.items()
+        if any(
+            p is pinned
+            or (
+                arena is not None
+                and isinstance(p, cake_backend.KdaWorkspace)
+                and p.arena is arena
+            )
+            for p in e.pins
+        )
+    ]
     for key in stale:
         _GRAPHS.pop(key).pins = ()
     return len(stale)

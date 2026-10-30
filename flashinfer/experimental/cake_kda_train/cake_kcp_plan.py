@@ -105,7 +105,7 @@ import bisect
 import dataclasses
 import operator
 import weakref
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 import torch
@@ -2729,18 +2729,29 @@ def kcp_arena_layout(
     need = {
         name: numel[name] * 4 for name in FWD_POOLS + (BWD_POOLS if backward else ())
     }
-    shared = {name for pair in SHARED_POOLS for name in pair}
-    # the forward-only pools no forward with a saved set reads: left to a forward without one
-    deferred = (
-        ()
-        if backward
-        else tuple(
-            name
-            for name in FWD_LAZY_POOLS
-            if save_transfer or name not in FWD_TRANSFER_POOLS
-        )
+    out = {f"pool.{name}": v for name, v in need.items()}
+    out["ring"] = sum(need[name] for name in LAZY_POOLS)
+    out["lazy"] = sum(need[name] for name in _deferred_pools(backward, save_transfer))
+    out["arena"] = _pools_arena(need, backward=backward, save_transfer=save_transfer)
+    return out
+
+
+def _deferred_pools(backward: bool, save_transfer: bool) -> tuple[str, ...]:
+    """The forward-only pools no forward with a saved set reads: left to a forward without one."""
+    if backward:
+        return ()
+    return tuple(
+        name
+        for name in FWD_LAZY_POOLS
+        if save_transfer or name not in FWD_TRANSFER_POOLS
     )
-    lazy = LAZY_POOLS + deferred
+
+
+def _pools_arena(need: dict[str, int], *, backward: bool, save_transfer: bool) -> int:
+    """The bytes a workspace allocates for the pool needs ``need`` (bytes by pool name): every pool once, each
+    :data:`SHARED_POOLS` pair as one storage of the larger need, the lazily allocated pools not at all."""
+    shared = {name for pair in SHARED_POOLS for name in pair}
+    lazy = LAZY_POOLS + _deferred_pools(backward, save_transfer)
     arena = sum(
         v for name, v in need.items() if name not in shared and name not in lazy
     )
@@ -2748,11 +2759,7 @@ def kcp_arena_layout(
         max((need[name] for name in pair if name in need), default=0)
         for pair in SHARED_POOLS
     )
-    out = {f"pool.{name}": v for name, v in need.items()}
-    out["ring"] = sum(need[name] for name in LAZY_POOLS)
-    out["lazy"] = sum(need[name] for name in deferred)
-    out["arena"] = arena
-    return out
+    return arena
 
 
 # The paths of the existing backend's plan the KCP's local stages take their records from: the forward without a
@@ -2792,7 +2799,7 @@ def local_scratch_table_bytes(plan) -> int:
 
 
 def kcp_workspace_bytes(
-    ctx: KcpContext,
+    ctx: KcpContext | Sequence[KcpContext],
     *,
     H: int = 64,
     save_mode: str = "light",
@@ -2809,44 +2816,66 @@ def kcp_workspace_bytes(
     set (the training forward) under ``save_transfer`` -- pass the forward's value: without it such a forward also
     allocates the :data:`FWD_TRANSFER_POOLS` -- and ``kcp_arena_layout(..., save_transfer=save_transfer)["lazy"]``
     more once a forward without one has read the rest of the :data:`FWD_LAZY_POOLS`.  The ring exchange's hop pools
-    (``["ring"]``) are not counted; its forward-only workspace holds no c1 receive pool (``["pool.c1_recv"]``)."""
+    (``["ring"]``) are not counted; its forward-only workspace holds no c1 receive pool (``["pool.c1_recv"]``).
+
+    A sequence of contexts gives the bytes of one workspace that serves all of them (``KcpWorkspace.reserve``):
+    each pool at its largest need over the contexts (each :data:`SHARED_POOLS` pair one storage of the larger), the
+    largest local arena, and the scratch table set of every distinct ``(T_r, n_frag)`` that has one (zero at
+    ``H = 64``; KiB scale where present).  The bytes of a list of one context are those of the context."""
     _check_save_mode(save_mode)
-    local = 0
-    if ctx.T_r > 0:
+    ctxs = list(ctx) if isinstance(ctx, (list, tuple)) else [ctx]
+    if not ctxs:
+        raise ValueError("kcp_workspace_bytes: no context given")
+    arena = 0
+    scratch: dict[tuple[int, int], int] = {}
+    for c in ctxs:
+        if c.T_r <= 0:
+            continue
         from . import (
             cake_backend,
         )  # the existing backend's arena rule; imported here so the metadata module stays torch-only
 
-        local = int(
-            cake_backend.workspace_bytes(
-                ctx.T_r,
-                ctx.n_frag,
-                int(H),
-                backward=backward,
-                save_mode=save_mode,
-                sm_count=ctx.sm_count,
-                fwd_layout=local_fwd_layout(backward, save_mode),
-            )
+        arena = max(
+            arena,
+            int(
+                cake_backend.workspace_bytes(
+                    c.T_r,
+                    c.n_frag,
+                    int(H),
+                    backward=backward,
+                    save_mode=save_mode,
+                    sm_count=c.sm_count,
+                    fwd_layout=local_fwd_layout(backward, save_mode),
+                )
+            ),
         )
         # the scratch table set where the intra record writes one (the rule is architecture-independent; the
         # buffer size follows the same segment-count convention as the arena bytes above)
-        if intra_writes_tables(
-            cake_backend.plan(ctx.T_r, ctx.n_frag, int(H), ctx.sm_count)
-        ):
-            local += int(
-                cake_backend.tables_bytes(
-                    ctx.T_r, ctx.n_frag, int(H), sm_count=ctx.sm_count
-                )
+        if intra_writes_tables(cake_backend.plan(c.T_r, c.n_frag, int(H), c.sm_count)):
+            scratch[(int(c.T_r), int(c.n_frag))] = int(
+                cake_backend.tables_bytes(c.T_r, c.n_frag, int(H), sm_count=c.sm_count)
             )
-    arena = kcp_arena_layout(
-        ctx,
-        H=H,
-        save_mode=save_mode,
-        backward=backward,
-        save_transfer=save_transfer,
-        C=C,
-    )
-    return local + arena["arena"]
+    layouts = [
+        kcp_arena_layout(
+            c,
+            H=H,
+            save_mode=save_mode,
+            backward=backward,
+            save_transfer=save_transfer,
+            C=C,
+        )
+        for c in ctxs
+    ]
+    if len(layouts) == 1:
+        pools = layouts[0]["arena"]
+    else:  # each pool at its largest need, by the rule of kcp_arena_layout
+        need = {
+            key[len("pool.") :]: max(lay[key] for lay in layouts)
+            for key in layouts[0]
+            if key.startswith("pool.")
+        }
+        pools = _pools_arena(need, backward=backward, save_transfer=save_transfer)
+    return arena + sum(scratch.values()) + pools
 
 
 # ----------------------------------------------------------------------------------------------------------------
