@@ -78,7 +78,6 @@ def _get_variant_name(
     enable_tvm_ffi: bool = False,
     enable_skip_softmax: bool = False,
     enable_sink: bool = False,
-    use_pdl: bool = False,
     p_exp_mode: str = "exp2",
 ) -> str:
     """Generate the block-scaled variant name used by the artifact compiler."""
@@ -90,10 +89,9 @@ def _get_variant_name(
     lse_str = "_lse" if with_lse else ""
     skip_str = "_skipsm" if enable_skip_softmax else ""
     sink_str = "_sink" if enable_sink else ""
-    pdl_str = "_pdl" if use_pdl else ""
     ffi_str = "_tvmffi" if enable_tvm_ffi else ""
     exp_str = "" if p_exp_mode == "exp2" else f"_{p_exp_mode}"
-    return f"cute_dsl_fmha_blockscaled_{qk_mode}_{pv_str}_{out_str}_h{head_dim}_{causal_str}_{persist_str}{varlen_str}{lse_str}{skip_str}{sink_str}{pdl_str}{exp_str}{ffi_str}"
+    return f"cute_dsl_fmha_blockscaled_{qk_mode}_{pv_str}_{out_str}_h{head_dim}_{causal_str}_{persist_str}{varlen_str}{lse_str}{skip_str}{sink_str}{exp_str}{ffi_str}"
 
 
 @functools.cache
@@ -110,7 +108,6 @@ def get_cute_dsl_fmha_blockscaled_kernel(
     with_lse: bool = False,
     enable_skip_softmax: bool = False,
     enable_sink: bool = False,
-    use_pdl: bool = False,
     p_exp_mode: str = "exp2",
 ):
     """Load a compiled block-scaled FMHA kernel from local or remote artifacts."""
@@ -131,7 +128,6 @@ def get_cute_dsl_fmha_blockscaled_kernel(
         enable_tvm_ffi=enable_tvm_ffi,
         enable_skip_softmax=enable_skip_softmax,
         enable_sink=enable_sink,
-        use_pdl=use_pdl,
         p_exp_mode=p_exp_mode,
     )
 
@@ -227,7 +223,6 @@ def cute_dsl_fmha_blockscaled_prefill(
             enable_tvm_ffi=True,
             with_lse=lse is not None,
             enable_skip_softmax=use_skip_softmax,
-            use_pdl=enable_pdl,
             p_exp_mode=p_exp_mode,
         )
     except (RuntimeError, FileNotFoundError) as e:
@@ -246,7 +241,6 @@ def cute_dsl_fmha_blockscaled_prefill(
             is_causal,
             lse is not None,
             use_skip_softmax,
-            enable_pdl,
             q.device,
             p_exp_mode=p_exp_mode,
             has_window_left=window_left != -1,
