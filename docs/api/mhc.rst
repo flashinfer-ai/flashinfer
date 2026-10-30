@@ -18,8 +18,9 @@ mixing with a fixed ``HC=4`` sub-head layout.
 Training mHC (Cake)
 -------------------
 
-Four-stream mHC training forward / backward for hidden size 4096 on SM100,
-SM103 and SM107: the forward mapping, coefficients and collapse
+Four-stream mHC training forward / backward for hidden sizes 4096, 5120 and
+7168 on SM100 and SM103 (4096 on SM107); each call takes the hidden size ``H``
+from ``X`` ``[T, 4, H]``: the forward mapping, coefficients and collapse
 (``forward_prepare``), the residual mixing (``forward_finish``), the branch
 gradient and gradient statistics (``backward_prepare``), the single-cast input
 gradient with fixed-order FP32 parameter gradients (``backward_finish``),
@@ -28,11 +29,12 @@ external branch. The caller holds the workspaces:
 ``cake_mhc_det_train_forward_workspace_bytes`` / ``cake_mhc_det_train_forward_workspace``
 and ``cake_mhc_det_train_backward_workspace_bytes`` /
 ``cake_mhc_det_train_backward_workspace`` size and allocate a zero-initialized
-buffer that serves every token count up to ``T``,
+buffer for one hidden size (``hidden=``, default 4096) that serves the calls of
+that hidden size for every token count up to ``T``,
 ``cake_mhc_det_train_reset_workspace`` returns such a caller-owned buffer to its
 first-use state after an interrupted launch or capture, and
-``is_cake_mhc_det_train_supported`` reports whether a device has every exported
-route.
+``is_cake_mhc_det_train_supported`` reports whether a device (optionally at a given
+hidden size) has every exported route.
 
 CUDA graphs: one training iteration -- the direct entry points, or
 ``cake_mhc_det_train_prepare`` / ``cake_mhc_det_train_finish`` around the external

@@ -67,6 +67,20 @@ import pytest
 from tests.test_helpers.cake_package import cake_package
 
 loader = cake_package("cake_mhc_det_train", "cake_jit")
+# The tables of record of this module describe the hidden size 4096: the H 4096 records, their routes and record
+# scalars. The sizes 5120 / 7168 are checked in test_cake_mhc_det_train_rules_hidden.py.
+H4096_MODULES = {
+    name: record for name, record in loader.MODULES.items() if record["hidden"] == 4096
+}
+H4096_ROUTES = {
+    arch: {key: names for key, names in routes.items() if key.endswith("_h4096")}
+    for arch, routes in loader.ROUTES.items()
+}
+H4096_SCALARS = {
+    name: scalars
+    for name, scalars in loader.RECORD_SCALARS.items()
+    if name in H4096_MODULES
+}
 
 SM_COUNTS = (148, 152, 208, 216)
 BOARDS = (("sm_100a", 148), ("sm_103a", 152), ("sm_107a", 208), ("sm_107a", 216))
@@ -1289,7 +1303,11 @@ PROGRAM_RULE_KERNELS = {
 
 
 def _rows() -> list[dict]:
-    return [dict(zip(RULES_COLUMNS, row, strict=False)) for row in RULES_ROWS]
+    """The H 4096 rows of record (``rules_row`` names the hidden size in its ``hidden`` column)."""
+    return [
+        {**dict(zip(RULES_COLUMNS, row, strict=False)), "hidden": 4096}
+        for row in RULES_ROWS
+    ]
 
 
 def _first_programs(fn, arch: str, sms) -> list:
@@ -1307,7 +1325,7 @@ def _first_programs(fn, arch: str, sms) -> list:
 
 
 def _is(name: str, *prefixes: str) -> bool:
-    return loader.MODULES[name]["library"].startswith(prefixes)
+    return H4096_MODULES[name]["library"].startswith(prefixes)
 
 
 @pytest.mark.cpu_only
@@ -1318,10 +1336,12 @@ def test_rules_table_is_the_harness_table_of_record() -> None:
     assert tuple(tuple(board) for board in loader.RULES_BOARDS) == BOARDS
     assert sorted({row["T"] for row in expected}) == sorted(loader.RULES_T_VALUES)
     assert {(row["arch"], row["sm_count"]) for row in expected} == set(BOARDS)
-    actual = loader.rules_table()
+    actual = loader.rules_table(hiddens=(4096,))
     assert len(actual) == len(expected)
+    assert len(loader.rules_table()) == len(expected) * len(loader.HIDDEN_SIZES)
+    columns = {*RULES_COLUMNS, "hidden"}
     for want, got in zip(expected, actual, strict=False):
-        assert set(got) == set(RULES_COLUMNS), sorted(set(got) ^ set(RULES_COLUMNS))
+        assert set(got) == columns, sorted(set(got) ^ columns)
         assert got == want, {
             key: (want[key], got.get(key)) for key in want if want[key] != got.get(key)
         }
@@ -1735,13 +1755,18 @@ def test_registry_tables_are_literals() -> None:
     assert literals["MODULES"] == loader.MODULES
     assert literals["ROUTES"] == loader.ROUTES
     assert literals["RECORD_SCALARS"] == loader.RECORD_SCALARS
-    assert tuple(literals["HIDDEN_SIZES"]) == (4096,)
+    assert tuple(literals["HIDDEN_SIZES"]) == (4096, 5120, 7168)
+    assert {record["hidden"] for record in loader.MODULES.values()} == {
+        4096,
+        5120,
+        7168,
+    }
     assert tuple(literals["ARCHES"]) == ARCHES
 
 
 @pytest.mark.cpu_only
 def test_records_are_consistent() -> None:
-    modules = loader.MODULES
+    modules = H4096_MODULES
     assert len(modules) == len(RECORD_ARCHES) == N_RECORDS
     libraries = sorted({record["library"] for record in modules.values()})
     assert len(libraries) == N_LIBRARIES and all(
@@ -1764,7 +1789,7 @@ def test_records_are_consistent() -> None:
             name for name, record in modules.items() if record["library"] == library
         ] == [library], library
     routed = {
-        arch: {name for names in loader.ROUTES[arch].values() for name in names}
+        arch: {name for names in H4096_ROUTES[arch].values() for name in names}
         for arch in loader.ARCHES
     }
     for name, record in modules.items():
@@ -1915,7 +1940,7 @@ def test_records_are_consistent() -> None:
             LIBRARY_ARCHES[library]
         ), library
         assert len({repr(record["launch"]) for record in group}) == 1, library
-    for arch, routes in loader.ROUTES.items():
+    for arch, routes in H4096_ROUTES.items():
         assert arch in loader.ARCHES
         assert set(routes) == {loader.route_key(4096, kind) for kind in loader.KINDS}
         for kind in loader.KINDS:
@@ -1960,10 +1985,10 @@ def test_records_are_consistent() -> None:
             slabs = [SLAB_LIBRARY[loader.BWD_SLAB_PROGRAM[arch]]]
         reduces = _first_programs(loader.bwd_reduce_program, arch, sms)
         # the token-owner run-time-count record closes the token-owner records
-        assert libs(loader.ROUTES[arch]["bwd_finish_h4096"]) == [
+        assert libs(H4096_ROUTES[arch]["bwd_finish_h4096"]) == [
             split, *tokens, "cake_mhc_det_train_bwd_token__rt64", *slabs, *[REDUCE_LIBRARY[p] for p in reduces]
         ], arch  # fmt: skip
-        assert loader.ROUTES[arch]["bwd_finish_h4096"][0] == f"{split}__t"
+        assert H4096_ROUTES[arch]["bwd_finish_h4096"][0] == f"{split}__t"
         # the fn split records launch their program's fixed grid (the rules' fn_split_grid / fn_split_grid_t columns)
         assert modules[f"{split}__t"]["grid_rule"] == {
             "kind": "fixed",
@@ -1975,12 +2000,12 @@ def test_records_are_consistent() -> None:
         }, arch
         maps = [
             n
-            for n in libs(loader.ROUTES[arch]["fwd_prepare_h4096"])
+            for n in libs(H4096_ROUTES[arch]["fwd_prepare_h4096"])
             if n.startswith("cake_mhc_det_train_fwd_map")
         ]
         coefs = [
             n
-            for n in libs(loader.ROUTES[arch]["fwd_prepare_h4096"])
+            for n in libs(H4096_ROUTES[arch]["fwd_prepare_h4096"])
             if n.startswith("cake_mhc_det_train_fwd_coef")
         ]
         assert set(maps) == {
@@ -1996,18 +2021,18 @@ def test_records_are_consistent() -> None:
             for sm in SM_COUNTS
         }, arch
         assert (
-            loader.ROUTES[arch]["fwd_prepare_h4096"][0]
-            == loader.ROUTES[arch]["fwd_recompute_h4096"][0]
+            H4096_ROUTES[arch]["fwd_prepare_h4096"][0]
+            == H4096_ROUTES[arch]["fwd_recompute_h4096"][0]
             == split_fwd
         )
         assert (
-            loader.ROUTES[arch]["fwd_prepare_h4096"][-1]
+            H4096_ROUTES[arch]["fwd_prepare_h4096"][-1]
             == "cake_mhc_det_train_fwd_collapse"
         )
-        assert loader.ROUTES[arch]["fwd_finish_h4096"] == [FINISH_OF[arch]], arch
+        assert H4096_ROUTES[arch]["fwd_finish_h4096"] == [FINISH_OF[arch]], arch
         assert (
-            loader.ROUTES[arch]["fwd_prepare_h4096"][:-1]
-            == loader.ROUTES[arch]["fwd_recompute_h4096"]
+            H4096_ROUTES[arch]["fwd_prepare_h4096"][:-1]
+            == H4096_ROUTES[arch]["fwd_recompute_h4096"]
         )
         for name in routed[arch]:
             assert arch in LIBRARY_ARCHES[modules[name]["library"]], (arch, name)
@@ -2019,8 +2044,8 @@ def test_records_are_consistent() -> None:
     # (want_t 0) and the transposed one of the backward (want_t 1); the production form
     # carries the forward layout alone (every architecture) and the 16-byte-store forms the transposed layout alone
     # (tv128 on sm_100a / sm_103a, its 128-thread form tv128_t128 on sm_107a).
-    assert loader.RECORD_SCALARS == RECORD_SCALARS
-    for name, scalars in loader.RECORD_SCALARS.items():
+    assert H4096_SCALARS == RECORD_SCALARS
+    for name, scalars in H4096_SCALARS.items():
         assert modules[name]["role"] == (
             "fn_split_fwd" if scalars["want_t"] == 0 else "fn_split_bwd"
         ), name
@@ -2038,7 +2063,7 @@ def test_every_call_selects_one_record_per_dispatched_kernel(
     """``selected_modules`` keeps exactly one fn-split, one mapping-pass and one coefficient-pass record per forward
     call and exactly one fn-split, one token-owner, one column-slab and one reduction record per backward call, the
     ones the rules of record name, on every token count up to 70000 and at every band boundary."""
-    modules = loader.MODULES
+    modules = H4096_MODULES
 
     def only(selected, *prefixes):
         found = [n for n in selected if _is(n, *prefixes)]
@@ -2132,10 +2157,10 @@ def test_pdl_only_where_the_kernel_waits_for_the_preceding_grid() -> None:
     a kernel that releases its dependents right after its own wait (the libraries of ``PDL_EDGES``: the collapse and the
     backward prepare after the coefficient pass, the column-slab pass after the token-owner pass, the final reduction
     after the column-slab pass) take the attribute per call (``"runtime"``)."""
-    pdl = {name: record["launch"]["use_pdl"] for name, record in loader.MODULES.items()}
+    pdl = {name: record["launch"]["use_pdl"] for name, record in H4096_MODULES.items()}
     runtime = {
         name
-        for name, record in loader.MODULES.items()
+        for name, record in H4096_MODULES.items()
         if loader.pdl_edge(record["library"]) is not None
     }
     assert pdl == {
@@ -2146,10 +2171,10 @@ def test_pdl_only_where_the_kernel_waits_for_the_preceding_grid() -> None:
                 name, "cake_mhc_det_train_fn_split", "cake_mhc_det_train_fwd_map"
             )
         )
-        for name in loader.MODULES
+        for name in H4096_MODULES
     }
-    assert runtime == {name for name in loader.MODULES if _is(name, *loader.PDL_EDGES)}
-    n_map = sum(1 for name in loader.MODULES if _is(name, "cake_mhc_det_train_fwd_map"))
+    assert runtime == {name for name in H4096_MODULES if _is(name, *loader.PDL_EDGES)}
+    n_map = sum(1 for name in H4096_MODULES if _is(name, "cake_mhc_det_train_fwd_map"))
     assert (
         sum(1 for value in pdl.values() if value is False)
         == len(RECORD_SCALARS) + n_map
@@ -2159,16 +2184,16 @@ def test_pdl_only_where_the_kernel_waits_for_the_preceding_grid() -> None:
     # one record of each layout -- the forward one (want_t 0) opens fwd_prepare / fwd_recompute, the transposed one
     # (want_t 1) opens bwd_finish.
     assert {
-        name for name in loader.MODULES if _is(name, "cake_mhc_det_train_fn_split")
+        name for name in H4096_MODULES if _is(name, "cake_mhc_det_train_fn_split")
     } == set(RECORD_SCALARS)
     assert all(scalars.get("want_t") in (0, 1) for scalars in RECORD_SCALARS.values())
-    assert {loader.MODULES[name]["library"] for name in RECORD_SCALARS} == set(
+    assert {H4096_MODULES[name]["library"] for name in RECORD_SCALARS} == set(
         SPLIT_LIBRARY.values()
     )
     for arch in loader.ARCHES:
         splits = {
             route: [
-                name for name in loader.ROUTES[arch][route] if name in RECORD_SCALARS
+                name for name in H4096_ROUTES[arch][route] if name in RECORD_SCALARS
             ]
             for route in (
                 "fwd_prepare_h4096",
@@ -2219,7 +2244,7 @@ def test_pdl_bands_of_record() -> None:
                         path,
                         bands,
                     )
-    for name, record in loader.MODULES.items():
+    for name, record in H4096_MODULES.items():
         plan = [tuple(entry) for entry in record["arg_plan"]]
         slots = [index for index, (role, _) in enumerate(plan) if role == "launch"]
         assert plan[-3:] == [
@@ -2235,7 +2260,7 @@ def test_pdl_bands_of_record() -> None:
         else:
             assert not slots, name
     for arch in ARCHES:
-        for name, record in loader.MODULES.items():
+        for name, record in H4096_MODULES.items():
             if arch not in record["arches"]:
                 continue
             edge = loader.pdl_edge(record["library"])
@@ -2276,27 +2301,27 @@ def test_launch_facts_of_record() -> None:
             record["launch"]["dynamic_smem_bytes"],
             record["launch"]["persistent_ctas_per_sm"],
         )
-        for name, record in loader.MODULES.items()
+        for name, record in H4096_MODULES.items()
     }
     assert facts == LAUNCH_FACTS
-    for name in loader.RECORD_SCALARS:
+    for name in H4096_SCALARS:
         # the fn split covers 65536 thread-slots of 8 elements: 256 CTAs x 256 threads, or 512 x 128 for the 128-thread form
-        ctas = loader.MODULES[name]["grid_rule"]["ctas"]
+        ctas = H4096_MODULES[name]["grid_rule"]["ctas"]
         assert facts[name] == ((65536 // ctas, 1, 1), 0, 1) and ctas in (256, 512), name
     for library, names in MULTI_RECORDS.items():
         assert len({facts[name] for name in names}) == 1, (
             library
         )  # the records of a library agree on their launch
     pools = {4 * 28672 + 1024: 2, 3 * 28672 + 1024: 2, 5 * 28672 + 1024: 1}
-    for name in (n for n in loader.MODULES if _is(n, "cake_mhc_det_train_fwd_map")):
+    for name in (n for n in H4096_MODULES if _is(n, "cake_mhc_det_train_fwd_map")):
         block, smem, pcs = facts[name]
-        if loader.MODULES[name]["library"].endswith("_ct"):
+        if H4096_MODULES[name]["library"].endswith("_ct"):
             # the tail-control forms keep the control records after the ring, not in the 1024-byte prefix:
             # their pools are the render's figures (LAUNCH_FACTS pins them), below the prefix form's
             assert block == (192, 1, 1) and pcs == 2 and smem < 4 * 28672 + 1024, name
             continue
         assert block == (192, 1, 1) and smem in pools and pcs == pools[smem], name
-    for name, record in loader.MODULES.items():
+    for name, record in H4096_MODULES.items():
         if _is(name, "cake_mhc_det_train_fwd_coef"):
             want = (
                 ((512, 1, 1), 0, 1)
@@ -2352,19 +2377,19 @@ def test_launch_grids_follow_the_rules(
 ) -> None:
     monkeypatch.setattr(loader, "sm_count", lambda device_index: sm)
     monkeypatch.setattr(loader, "device_arch", lambda device_index: arch)
-    modules = loader.MODULES
+    modules = H4096_MODULES
     for row in _rows():
         T = row["T"]
         if T == 0 or (row["sm_count"], row["arch"]) != (sm, arch):
             continue
         grid = lambda name: loader.launch_grid(modules[name], T, device_index=0)  # noqa: E731
-        for name in loader.RECORD_SCALARS:
+        for name in H4096_SCALARS:
             assert grid(name) == (modules[name]["grid_rule"]["ctas"], 1, 1), name
         for want_t, route, column in (
             (0, "fwd_prepare_h4096", "fn_split_grid"),
             (1, "bwd_finish_h4096", "fn_split_grid_t"),
         ):
-            selected = loader.ROUTES[arch][route][0]  # the route's fn split record
+            selected = H4096_ROUTES[arch][route][0]  # the route's fn split record
             assert (
                 grid(selected)
                 == (row[column], 1, 1)
@@ -2548,7 +2573,8 @@ def test_the_p_k_band_changes_the_forward_workspace_on_sm_103a_alone() -> None:
 
 @pytest.mark.cpu_only
 def test_route_glue() -> None:
-    assert loader.supported_hidden_sizes("sm_100a") == (4096,)
+    assert loader.supported_hidden_sizes("sm_100a") == (4096, 5120, 7168)
+    assert loader.supported_hidden_sizes("sm_107a") == (4096,)
     assert loader.arch_for_capability((10, 0)) == "sm_100a"
     assert loader.arch_for_capability((10, 3)) == "sm_103a"
     assert loader.arch_for_capability((10, 7)) == "sm_107a"
@@ -2580,14 +2606,14 @@ def test_route_glue() -> None:
             route = loader.route_modules(arch, 4096, kind)
             # a route with band records selects a strict subset; a route of unconditional records selects every record
             banded = any(
-                loader.MODULES[name]["select_rule"] is not None for name in route
+                H4096_MODULES[name]["select_rule"] is not None for name in route
             )
             assert set(selected) <= set(route)
             assert (set(selected) < set(route)) == banded, (arch, kind)
         selected = loader.selected_modules(
             arch, 4096, "fwd_prepare", rows=129, sm_count=148
         )
-        libraries = {loader.MODULES[name]["library"] for name in selected}
+        libraries = {H4096_MODULES[name]["library"] for name in selected}
         want = loader.fwd_coef_program(129, 148, arch)
         assert (
             COEF_LIBRARY[want] in libraries
@@ -2595,7 +2621,7 @@ def test_route_glue() -> None:
         )
         assert MAP_LIBRARY[loader.fwd_map_program(129, 148, arch)] in libraries
     # library_name: the library's architecture suffix where the record ships for the architecture, a refusal elsewhere.
-    for name, record in loader.MODULES.items():
+    for name, record in H4096_MODULES.items():
         for arch in loader.ARCHES:
             if arch in record["arches"]:
                 assert (
@@ -2619,11 +2645,11 @@ def test_selection_by_sinkhorn_count() -> None:
     other kernel the default's record, on every board and route."""
     run_time = {
         name
-        for name, record in loader.MODULES.items()
+        for name, record in H4096_MODULES.items()
         if (record["select_rule"] or {}).get("kind") == "run_time_iters"
     }
     assert run_time == set(RUN_TIME_ITERS)
-    roles = {loader.MODULES[name]["role"]: name for name in run_time}
+    roles = {H4096_MODULES[name]["role"]: name for name in run_time}
     assert set(roles) == {"fwd_coef", "bwd_token"}
     for arch, sm in BOARDS:
         for kind in loader.KINDS:
@@ -2638,8 +2664,7 @@ def test_selection_by_sinkhorn_count() -> None:
                         arch, 4096, kind, rows=T, sm_count=sm, sinkhorn_iters=iters
                     )
                     expected = tuple(
-                        roles.get(loader.MODULES[name]["role"], name)
-                        for name in default
+                        roles.get(H4096_MODULES[name]["role"], name) for name in default
                     )
                     assert other == expected, (arch, kind, T, iters)
                     assert other == tuple(
