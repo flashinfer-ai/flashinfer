@@ -53,6 +53,31 @@ pytestmark = pytest.mark.filterwarnings(
 # Selective FP8 MQA: inputs, independent oracles, kernels and wrapper lifecycle
 
 
+@pytest.fixture
+def ieee_matmul():
+    # This backend proxy exposes a setter, not a deletable instance attribute.
+    # Restore through the setter so pytest cleanup also works on PyTorch 2.13.
+    previous = torch.backends.cuda.matmul.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = False
+    try:
+        yield
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = previous
+
+
+@pytest.fixture
+def isolated_capture_gc():
+    """Keep forced-collection oracles independent of predecessor garbage."""
+    enabled = gc.isenabled()
+    gc.collect()
+    gc.disable()
+    try:
+        yield
+    finally:
+        if enabled:
+            gc.enable()
+
+
 _requires_selective_sm100 = pytest.mark.skipif(
     not torch.cuda.is_available()
     or importlib.util.find_spec("cutlass") is None
@@ -458,8 +483,7 @@ def test_capacity_uniform_full_odd_and_empty_storage(next_n):
 
 
 @_requires_selective_sm100
-def test_full_capacity_stripes_captured_plan_refresh(monkeypatch):
-    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
+def test_full_capacity_stripes_captured_plan_refresh(monkeypatch, ieee_matmul):
     inputs = _request_inputs([3, 0, 2], [1031, 0, 2051], heads=64)
     q, _, _, weights, qo, kv = inputs
     pool, original_table = _paged_inputs(inputs)
@@ -583,7 +607,9 @@ def test_full_capacity_stripes_captured_plan_refresh(monkeypatch):
 @_requires_selective_sm100
 @pytest.mark.parametrize("strategy", ["full", "selective"])
 @pytest.mark.parametrize("tied", [False, True])
-def test_wrapper_leaves_all_graph_ownership_to_caller(monkeypatch, strategy, tied):
+def test_wrapper_leaves_all_graph_ownership_to_caller(
+    monkeypatch, strategy, tied, isolated_capture_gc
+):
     """Preparation/eager/captured execution uses no library-created graphs."""
     inputs = _request_inputs([2, 1], [9001, 257])
     q, _, _, weights, qo, kv = inputs
@@ -631,11 +657,59 @@ def test_wrapper_leaves_all_graph_ownership_to_caller(monkeypatch, strategy, tie
     torch.cuda.synchronize()
     _check_selection(captured, expected, 512)
     assert wrapper.error.item() == wrapper.repair_error.item() == 0
+    if strategy == "full":
+        plan = wrapper._full_capacity_plan
+        callables = [
+            plan._metadata,
+            *plan._uniform_metadata.values(),
+            plan._pack,
+            plan._scatter,
+        ]
+    else:
+        plan = wrapper._capacity_plan
+        callables = [plan._state._compiled, plan._state._sample_compiled]
+    modules = [
+        weakref.ref(compiled.jit_module)
+        for compiled in callables
+        if compiled is not None
+    ]
+    del callables, plan
     # Caller-owned graphs must be retired outside subsequent captures.
     del graph
     owner = weakref.ref(wrapper)
     del wrapper
     assert owner() is None
+    assert all(
+        reference() is None
+        or (reference().is_unloaded() and not reference().cuda_library)
+        for reference in modules
+    )
+    from cutlass.cutlass_dsl.cuda_jit_executor import CudaDialectJitModule
+
+    unload = CudaDialectJitModule.unload
+    calls = []
+
+    def observe_unload(module):
+        if module.cuda_library:
+            calls.append(torch.cuda.is_current_stream_capturing())
+        return unload(module)
+
+    monkeypatch.setattr(CudaDialectJitModule, "unload", observe_unload)
+    output = torch.zeros(1, device=q.device)
+    stream = torch.cuda.Stream()
+    graph = torch.cuda.CUDAGraph()
+    torch.cuda.synchronize()
+    # Unlike torch.cuda.graph's context manager, capture_begin does not collect
+    # before capture: CuTe's already-unloaded self-cycles are collected inside it.
+    with torch.cuda.stream(stream):
+        graph.capture_begin()
+        gc.collect()
+        output.fill_(1)
+        graph.capture_end()
+    graph.replay()
+    torch.cuda.synchronize()
+    assert output.item() == 1
+    assert calls == []
 
 
 @pytest.mark.parametrize(
@@ -861,11 +935,10 @@ def _check_compressed_wrapper(output, payload, top_k):
     ],
 )
 def test_engine_compressed_original_token_bounds_and_graph(
-    heads, page_size, top_k, q_lengths, token_lengths, monkeypatch
+    heads, page_size, top_k, q_lengths, token_lengths, monkeypatch, ieee_matmul
 ):
     """Nonzero-Q empty requests, per-request floors, poisoned pages and repair."""
     monkeypatch.setenv("FLASHINFER_VALIDATE_INPUTS", "1")
-    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
     payload = _compressed_wrapper_fixture(q_lengths, token_lengths, heads, page_size)
     q, fused, weights, cu_q, cu_tokens, table = payload
     wrapper = SelectiveEngineCase()
@@ -993,9 +1066,9 @@ def test_compressed_wrapper_empty_live_empty_replan(strategy, monkeypatch, heads
     wrapper = FP8PagedMQATopKWrapper(**specialization, **capacities, kv_layout=fused)
     with monkeypatch.context() as patch:
         patch.setattr(
-            wrapper._capacity_plan,
+            type(wrapper._capacity_plan),
             "_build_engine",
-            lambda _: (_ for _ in ()).throw(
+            lambda self, _: (_ for _ in ()).throw(
                 RuntimeError("injected compressed preparation failure")
             ),
         )
@@ -1012,6 +1085,15 @@ def test_compressed_wrapper_empty_live_empty_replan(strategy, monkeypatch, heads
     output = wrapper.run(q, weights, fused)
     torch.cuda.synchronize()
     _check_compressed_wrapper(output, (q, fused, weights, cu_q, cu_tokens, table), 512)
+    # Restoring an instance's bound method would keep the plan and its private
+    # CUDA modules alive until an unrelated cyclic collection.
+    owner = weakref.ref(wrapper)
+    plan_owner = weakref.ref(wrapper._capacity_plan)
+    state_owner = weakref.ref(wrapper._capacity_plan._state)
+    del wrapper
+    assert owner() is None
+    assert plan_owner() is None
+    assert state_owner() is None
 
 
 _requires_selective_cuda = pytest.mark.skipif(
@@ -1179,7 +1261,9 @@ def _paged_inputs(inputs, block_size: int = 128):
 
 @pytest.mark.parametrize("heads,query_tile", [(8, 16), (64, 4)])
 @pytest.mark.parametrize("ratio", [1, 4])
-def test_fp8_grouped_public_scorer_live_maps(heads, query_tile, ratio, monkeypatch):
+def test_fp8_grouped_public_scorer_live_maps(
+    heads, query_tile, ratio, monkeypatch, ieee_matmul
+):
     """Private grouped scoring preserves request bounds and live graph inputs."""
     from flashinfer.attn_scores.attn_scores import _fp8_paged_mqa_logits
     from flashinfer.attn_scores.fp8_kernel_config import _FP8MQAKernelConfig
@@ -1187,7 +1271,6 @@ def test_fp8_grouped_public_scorer_live_maps(heads, query_tile, ratio, monkeypat
 
     if not torch.cuda.is_available() or not is_sm100a_supported(torch.device("cuda")):
         pytest.skip("grouped FP8 scorer requires SM100 or SM103")
-    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
     q_lengths = [query_tile + 1, 0, 1]
     token_lengths = [ratio * 385 + ratio - 1, ratio * 129, 1]
     physical_lengths = [length // ratio for length in token_lengths]
@@ -1664,7 +1747,9 @@ def test_full_capacity_bucket_accepts_smaller_step(monkeypatch):
 
 
 @_requires_selective_sm100
-def test_capacity_retired_metadata_modules_do_not_unload_during_capture(monkeypatch):
+def test_capacity_retired_metadata_modules_do_not_unload_during_capture(
+    monkeypatch, isolated_capture_gc
+):
     """A predecessor's cyclic CuTe modules must be retired before another capture."""
     import weakref
 
@@ -1690,6 +1775,10 @@ def test_capacity_retired_metadata_modules_do_not_unload_during_capture(monkeypa
     state.prepare()
     state_ref = weakref.ref(state)
     compiled_refs = [weakref.ref(state._compiled), weakref.ref(state._sample_compiled)]
+    module_refs = [
+        weakref.ref(state._compiled.jit_module),
+        weakref.ref(state._sample_compiled.jit_module),
+    ]
     output = torch.empty(1, device="cuda")
     graph = torch.cuda.CUDAGraph()
     enabled = gc.isenabled()
@@ -1701,6 +1790,11 @@ def test_capacity_retired_metadata_modules_do_not_unload_during_capture(monkeypa
         assert state_ref() is None
         assert all(reference() is None for reference in compiled_refs)
         assert unloads == [False, False]
+        assert all(
+            reference() is None
+            or (reference().is_unloaded() and not reference().cuda_library)
+            for reference in module_refs
+        )
         with torch.cuda.graph(graph):
             gc.collect()
             output.fill_(1)
@@ -1816,11 +1910,10 @@ def test_full_wrapper_plan_capture_preserves_prepared_pool():
 
 
 @_requires_selective_sm100
-def test_full_wrapper_gvr2_workspace_capture_and_replan(monkeypatch):
+def test_full_wrapper_gvr2_workspace_capture_and_replan(monkeypatch, ieee_matmul):
     """The full prefill route owns scratch across eager and graph streams."""
     from flashinfer.topk_varlen.kernels import gvr2_topk_host
 
-    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
     q_rows, kv_rows = 8192, 65536
     q, kv, scale, weights, _, _ = _inputs(q_rows=q_rows, kv_rows=kv_rows)
     cu_q = torch.tensor([0, q_rows], device="cuda", dtype=torch.int32)
@@ -1933,7 +2026,7 @@ def test_full_wrapper_gvr2_workspace_capture_and_replan(monkeypatch):
         raise RuntimeError("injected full GVR preparation failure")
 
     with monkeypatch.context() as patch:
-        patch.setattr(wrapper._full_capacity_plan, "_bind_launches", fail_prepare)
+        patch.setattr(type(wrapper._full_capacity_plan), "_bind_launches", fail_prepare)
         with pytest.raises(RuntimeError, match="injected full GVR preparation failure"):
             wrapper.plan(one_q, cu_kv, table, num_query_rows=one_query.shape[0])
             wrapper.prepare_pool(fused)
@@ -1955,6 +2048,11 @@ def test_full_wrapper_gvr2_workspace_capture_and_replan(monkeypatch):
         ),
         512,
     )
+    owner = weakref.ref(wrapper)
+    plan_owner = weakref.ref(wrapper._full_capacity_plan)
+    del wrapper
+    assert owner() is None
+    assert plan_owner() is None
 
 
 @_requires_selective_sm100
@@ -4029,7 +4127,7 @@ def test_full_wrapper_failed_preparation_rejects_run_and_retries(monkeypatch, q_
         raise RuntimeError("injected preparation failure")
 
     with monkeypatch.context() as patch:
-        patch.setattr(wrapper._full_capacity_plan, "_bind_launches", fail_prepare)
+        patch.setattr(type(wrapper._full_capacity_plan), "_bind_launches", fail_prepare)
         with pytest.raises(RuntimeError, match="injected preparation failure"):
             wrapper.prepare_pool(unprepared_pool)
     with pytest.raises(RuntimeError, match="prepare_pool must precede"):
@@ -4053,6 +4151,11 @@ def test_full_wrapper_failed_preparation_rejects_run_and_retries(monkeypatch, q_
             atol=5e-5,
             rtol=1e-5,
         )
+    owner = weakref.ref(wrapper)
+    plan_owner = weakref.ref(wrapper._full_capacity_plan)
+    del wrapper
+    assert owner() is None
+    assert plan_owner() is None
 
 
 @_requires_selective_sm100
@@ -5337,14 +5440,13 @@ def test_h64_candidate_variant_requires_128_token_pages():
 @pytest.mark.parametrize("ratio", [1, 4])
 @pytest.mark.parametrize("h64_candidate", [False, True])
 def test_single_pool8192_changed_map_tail_graph(
-    top_k, ratio, h64_candidate, monkeypatch
+    top_k, ratio, h64_candidate, monkeypatch, ieee_matmul
 ):
     """Split-1 H64 candidates, partial Q/page and mutable map replay.
 
     The pooled layout publishes one repair-wide pool; the specialized H64
     candidate variant splits the same backing into four warp segments.
     """
-    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
     physical = 16387
     q, kv, scales, weights, _, _ = _inputs(9, physical, 64)
     cu_q = torch.tensor([0, 9], device="cuda", dtype=torch.int32)
@@ -5409,9 +5511,8 @@ def test_single_pool8192_changed_map_tail_graph(
 @_requires_selective_sm100
 @pytest.mark.parametrize("top_k", [512, 1024, 2048])
 @pytest.mark.parametrize("ratio", [1, 4])
-def test_lane_local8192_changed_map_tail_graph(top_k, ratio, monkeypatch):
+def test_lane_local8192_changed_map_tail_graph(top_k, ratio, monkeypatch, ieee_matmul):
     """K>=1024 H8 prefill lane banks use the repair-wide backing; K512 keeps 6144."""
-    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
     physical, rows = 16387, 33
     q, kv, scales, weights, _, _ = _inputs(rows, physical, 8)
     cu_q = torch.tensor([0, rows], device="cuda", dtype=torch.int32)
@@ -5805,16 +5906,29 @@ def test_selective_tmem_warp_role_barrier(participants, threads):
     output = torch.zeros(threads, dtype=torch.int32, device="cuda")
     args = (from_dlpack(output),)
     compiled = cute.compile(RoleBarrier(), *args, _current_stream(output.device))
+    compiled.to()
+    module = compiled.jit_module
+    owner = weakref.ref(compiled)
     graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        compiled(*args, _current_stream(output.device))
-    expected = torch.zeros_like(output)
-    expected[: participants - 32] = 17
-    expected[participants + 32 : participants + 64] = 17
-    for _ in range(2):
-        output.zero_()
-        graph.replay()
-        torch.testing.assert_close(output, expected)
+    try:
+        with torch.cuda.graph(graph):
+            compiled(*args, _current_stream(output.device))
+        expected = torch.zeros_like(output)
+        expected[: participants - 32] = 17
+        expected[participants + 32 : participants + 64] = 17
+        for _ in range(2):
+            output.zero_()
+            graph.replay()
+            torch.testing.assert_close(output, expected)
+    finally:
+        torch.cuda.synchronize()
+        graph.reset()
+        # CuTe's executor can keep its module in a bound-method cycle. Retire
+        # this test-owned library before another caller starts graph capture.
+        module.unload()
+    del compiled
+    assert owner() is None
+    assert module.is_unloaded() and not module.cuda_library
 
 
 @_requires_selective_sm100
@@ -6707,8 +6821,9 @@ def test_capacity_first_compact_pool_precompiles_metadata(monkeypatch, record_pr
 @_requires_selective_sm100
 @pytest.mark.parametrize("ratio", [1, 4])
 @pytest.mark.parametrize("physical_capacity", [6143, 6144, 6145])
-def test_capacity_sampling_physical_boundary(ratio, physical_capacity, monkeypatch):
-    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
+def test_capacity_sampling_physical_boundary(
+    ratio, physical_capacity, monkeypatch, ieee_matmul
+):
     inputs = _request_inputs([3], [physical_capacity])
     q, keys, scales, weights, qo, _ = inputs
     fused, table = _paged_inputs(inputs)
@@ -6758,12 +6873,11 @@ def test_capacity_sampling_physical_boundary(ratio, physical_capacity, monkeypat
 
 @_requires_selective_sm100
 @pytest.mark.parametrize("ratio", [1, 4])
-def test_capacity_sampling_on_off_same_bucket(ratio, monkeypatch):
+def test_capacity_sampling_on_off_same_bucket(ratio, monkeypatch, ieee_matmul):
     from flashinfer.experimental.attn_scores.selective_capacity import (
         _CapacitySelectiveTopKPlan,
     )
 
-    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
     inputs = _request_inputs([2], [6144])
     q, keys, scales, weights, qo, _ = inputs
     fused, table = _paged_inputs(inputs)
