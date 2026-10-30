@@ -7956,6 +7956,7 @@ class PrimsTsRunner(_TrtllmRunnerBase):
             use_shuffled_weight=True,
             weight_layout=self._weight_layout(v),
             do_finalize=self.config.finalize.do_finalize,
+            zero_rows_without_local_expert=act.zero_rows_without_local_expert,
             enable_pdl=self._enable_pdl,
             activation_type=self._activation_type,
             norm_topk_prob=True,

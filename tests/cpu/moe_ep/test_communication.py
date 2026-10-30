@@ -448,6 +448,9 @@ def test_cake_payload_plumbing(fake_cake) -> None:
 
     buffer = comm.get_combine_input_buffer(torch.bfloat16)
     assert buffer.shape == (4, 8)
+    # Cake dispatch also sends a token to the rank an invalid pick (such as -1)
+    # maps to, where its row can have no local expert, so every row is written.
+    assert not comm.combine_reads_only_local_expert_rows
     comm.combine(buffer)
     payload, local_num_tokens, args, kwargs = fake_cake.calls["combine"]
     assert payload.shape == (2, 2, 8) and local_num_tokens == 2
@@ -1163,6 +1166,7 @@ def test_nvlink_one_sided_payload_plumbing(fake_one_sided) -> None:
 
     buffer = comm.get_combine_input_buffer(torch.bfloat16)
     assert buffer.shape == (4, 8)
+    assert comm.combine_reads_only_local_expert_rows
     out = comm.combine(buffer)
     assert out.shape == (2, 8)
     payload, local_num_tokens = calls["combine"][:2]

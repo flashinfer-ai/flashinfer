@@ -509,6 +509,106 @@ def test_split_layer_quantizes_tokens_before_dispatch(backend, quant_pair, prims
 
 
 @pytest.mark.gpu_2
+@pytest.mark.parametrize("sync_protocol", ["fence", "sentinel"])
+def test_split_layer_leaves_rows_the_combine_never_reads(sync_protocol, monkeypatch):
+    """NVLinkOneSided combines read only the received rows with a local expert,
+    so the fused MoE finalizes into the combine input without their zero rows.
+
+    The combine input is filled with NaN before every expert computation: the
+    rows without a local expert keep it, and the layer output is bitwise the
+    one with the zero rows written.
+    """
+    import torch
+    import torch.distributed as dist
+
+    from flashinfer.moe_ep import (
+        BootstrapConfig,
+        EpAlgorithm,
+        EpLayout,
+        FleetParams,
+        MoEEpLayer,
+        MoEEpTensors,
+        MoEWeightPack,
+    )
+    from flashinfer.moe_ep.backends.split.comm.nvlink_one_sided.communication import (
+        NVLinkOneSidedAlltoAll,
+    )
+    from flashinfer.moe_ep.backends.split.kernel.fused_moe.backend import (
+        FusedMoeSplitKernelBackend,
+    )
+    from flashinfer.prims_ts.utils import is_prims_ts_available
+
+    if not is_prims_ts_available():
+        pytest.skip("Prims-TS needs nvidia-cutlass-dsl with cutlass.experimental")
+    quant_pair = ("MXFP4", "MXFP8")
+    candidate = _split_candidate(quant_pair, prims_ts=True)
+    major, minor = torch.cuda.get_device_capability()
+    if not candidate.supported(major * 10 + minor):
+        pytest.skip(f"{type(candidate).__name__} does not support SM{major}{minor}")
+    rank, world_size = _init_dist()
+    comm = _backend_config("nvlink_one_sided", sync_protocol=sync_protocol)
+    num_tokens, hidden, intermediate = 16, 1024, 512
+    num_experts = 4 * world_size
+    generator = torch.Generator().manual_seed(29 + rank)
+    x = torch.randn(num_tokens, hidden, generator=generator).to("cuda", torch.bfloat16)
+    topk_ids, topk_weights = _random_routing(num_tokens, num_experts, 2, generator)
+    t = MoEEpTensors(
+        hidden_states=x, topk_ids=topk_ids.long(), topk_weights=topk_weights
+    )
+    weight_generator = torch.Generator().manual_seed(1000 + rank)
+    w13 = torch.randn(4, 2 * intermediate, hidden, generator=weight_generator) * 0.05
+    w2 = torch.randn(4, hidden, intermediate, generator=weight_generator) * 0.05
+    layer = MoEEpLayer(
+        BootstrapConfig(world_size=world_size, rank=rank),
+        FleetParams(
+            num_experts=num_experts,
+            max_tokens_per_rank=num_tokens,
+            token_hidden_size=hidden,
+            algorithm=EpAlgorithm.LOW_LATENCY,
+            layout=EpLayout.RANK_MAJOR,
+        ),
+        MoEWeightPack(
+            w13=w13.to("cuda", torch.bfloat16), w2=w2.to("cuda", torch.bfloat16)
+        ),
+        backend=_fused_moe_split_config(
+            comm,
+            quant_pair,
+            rank=rank,
+            world_size=world_size,
+            num_experts=num_experts,
+            prims_ts=True,
+        ),
+    )
+    unwritten_rows, sentinel_rounds = [], []
+    compute = FusedMoeSplitKernelBackend.compute
+
+    def compute_into_nan(self, ctx):
+        sentinel_rounds.append(layer._communication._round["sentinel"])
+        ctx.output.fill_(float("nan"))
+        expert_out = compute(self, ctx)
+        unwritten_rows.append(int(torch.isnan(ctx.output).all(dim=-1).sum()))
+        return expert_out
+
+    try:
+        # Tunes the fused MoE, so both measured calls run the same tactics.
+        layer(t)
+        monkeypatch.setattr(FusedMoeSplitKernelBackend, "compute", compute_into_nan)
+        skipped = layer(t)
+        monkeypatch.setattr(
+            NVLinkOneSidedAlltoAll, "combine_reads_only_local_expert_rows", False
+        )
+        zeroed = layer(t)
+        assert sentinel_rounds == [sync_protocol == "sentinel"] * 2
+        assert unwritten_rows[0] > 0 and unwritten_rows[1] == 0
+        assert not torch.isnan(skipped).any()
+        assert torch.equal(skipped, zeroed)
+    finally:
+        torch.cuda.synchronize()
+        dist.barrier()
+        layer.destroy()
+
+
+@pytest.mark.gpu_2
 @pytest.mark.parametrize("backend", _BACKENDS)
 def test_split_layer_dispatches_runtime_max_tokens_per_rank(backend):
     """MoEEpTensors.runtime_max_tokens_per_rank sizes the layer's dispatch.

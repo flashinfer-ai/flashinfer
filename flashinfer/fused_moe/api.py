@@ -3854,6 +3854,12 @@ class MoEActivationPack:
     # Runners that write it in place (Prims-TS) write it here and return it;
     # the others allocate their own. Callers use the returned tensor.
     output: Optional[Tensor] = field(default=None, kw_only=True)
+    # Whether the output rows of tokens without a local expert (no top-k id in
+    # this rank's local expert range) are written as zeros. False is for
+    # callers that never read those rows, such as an all-to-all combine that
+    # reads only rows with a local expert: the runners that honor it
+    # (Prims-TS) then leave them as they are, the others still write zeros.
+    zero_rows_without_local_expert: bool = field(default=True, kw_only=True)
 
     def __post_init__(self) -> None:
         """Fail fast on mode/field mismatches at construction time.

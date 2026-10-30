@@ -720,6 +720,22 @@ namespace tg = batchedGemm::trtllm::gen;
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+// Whether the token's output row is written: always with zeroRowsWithoutLocalExpert, else only
+// when one of its topK experts is local. A kernel skipping a row still waits on the primary first,
+// so that a grid skipping every token completes after it.
+template <typename KernelParams>
+__device__ __forceinline__ bool writesTokenRow(KernelParams const& params, int64_t tokenIdx) {
+  if (params.zeroRowsWithoutLocalExpert) {
+    return true;
+  }
+  for (int k = 0; k < params.topK; k++) {
+    if (params.expandedIdxToPermutedIdx[tokenIdx * params.topK + k] != -1) {
+      return true;
+    }
+  }
+  return false;
+}
+
 template <typename KernelParams>
 __global__ void finalizeKernel(KernelParams params) {
   using Type = typename KernelParams::Type;
@@ -733,6 +749,9 @@ __global__ void finalizeKernel(KernelParams params) {
 #endif
 
   for (int tokenIdx = blockIdx.y; tokenIdx < params.numTokens; tokenIdx += gridDim.y) {
+    if (!writesTokenRow(params, tokenIdx)) {
+      continue;
+    }
     // Loop over hidden dim
     for (int hiddenIdx = threadIdx.x + blockDim.x * blockIdx.x; hiddenIdx < params.hiddenDim;
          hiddenIdx += blockDim.x * gridDim.x) {
@@ -940,6 +959,7 @@ __global__ void finalizeKernelVecLoad(KernelParams params) {
   }
 #endif
 
+  bool hasLocalExpert = false;
   for (int kChunkIdx = threadIdx.x; kChunkIdx < params.topK / TopKUnrollFactor;
        kChunkIdx += blockDim.x) {
     int const expandedIdx = tokenIdx * params.topK + kChunkIdx * TopKUnrollFactor;
@@ -951,13 +971,23 @@ __global__ void finalizeKernelVecLoad(KernelParams params) {
 
     scaleArrSmem[kChunkIdx] = scalePacked;
     permutedIdxArrSmem[kChunkIdx] = permutedIdxPacked;
+    auto const permutedIdxArr = *reinterpret_cast<IdxArrayType const*>(&permutedIdxPacked);
+#pragma unroll
+    for (int ki = 0; ki < TopKUnrollFactor; ++ki) {
+      hasLocalExpert = hasLocalExpert || permutedIdxArr[ki] != -1;
+    }
   }
+  // writesTokenRow from the expanded indices read above, each thread holding some of the chunks.
+  bool const writeRow = params.zeroRowsWithoutLocalExpert || __syncthreads_or(hasLocalExpert);
 
   auto const offset = tokenIdx * params.hiddenDim;
   Type* outputPtr = params.outPtr + offset;
   auto* outElemPtr = reinterpret_cast<OutputElem*>(outputPtr);
   auto const* inElemPtr = reinterpret_cast<InputElem const*>(params.inPtr);
 
+  if (!writeRow) {
+    return;
+  }
   __syncthreads();
 
   auto const* inElemPtr2 = reinterpret_cast<InputElem const*>(params.inPtr2);
@@ -1025,6 +1055,7 @@ constexpr int64_t FINALIZE_TOKEN_SPREAD_STRIDE = 1000003;
 // With SingleExpertTokensDone, the GEMM producing the input already wrote every token that has
 // exactly one local expert to the output (see finalizeKernelMultiExpertTokens): such tokens are
 // skipped, and tokens without a local expert only get their zero row.
+// Without zeroRowsWithoutLocalExpert, tokens without a local expert write nothing.
 template <typename KernelParams, bool SingleExpertTokensDone>
 __device__ __forceinline__ void finalizeWarpPerToken(KernelParams const& params) {
   using Type = typename KernelParams::Type;
@@ -1076,7 +1107,7 @@ __device__ __forceinline__ void finalizeWarpPerToken(KernelParams const& params)
   auto* outVecPtr = reinterpret_cast<VecElem*>(params.outPtr + tokenIdx * params.hiddenDim);
   if constexpr (SingleExpertTokensDone) {
     int const numLocal = __popc(localMask);
-    if (numLocal == 0) {
+    if (numLocal == 0 && params.zeroRowsWithoutLocalExpert) {
       VecElem zero;
       zero.fill(Type(0.f));
       for (int64_t vec = vecBegin + lane; vec < vecEnd; vec += 32) {
@@ -1119,7 +1150,7 @@ __device__ __forceinline__ void finalizeWarpPerToken(KernelParams const& params)
     }
 #pragma unroll
     for (int u = 0; u < FINALIZE_WARP_VECS; ++u) {
-      if (vecBase + u * 32 < vecEnd) {
+      if (vecBase + u * 32 < vecEnd && (localMask != 0 || params.zeroRowsWithoutLocalExpert)) {
         outVecPtr[vecBase + u * 32] = arrayConvert<ComputeElem, VecElem>(acc[u]);
       }
     }
@@ -1134,7 +1165,7 @@ __global__ void __launch_bounds__(FINALIZE_WARP_THREADS)
 
 // Finalize after a GEMM whose epilogue stored each token with exactly one local expert straight
 // into the output, scaled by its expert weight: writes the zero rows of tokens without a local
-// expert and reduces the tokens with several.
+// expert (with zeroRowsWithoutLocalExpert) and reduces the tokens with several.
 template <typename KernelParams>
 __global__ void __launch_bounds__(FINALIZE_WARP_THREADS)
     finalizeKernelMultiExpertTokens(KernelParams params) {
@@ -1202,6 +1233,19 @@ __global__ void __launch_bounds__(SMALL_BATCH_FINALIZE_THREADS)
       scale[j] = params.expertWeightsPtr != nullptr
                      ? static_cast<float>(params.expertWeightsPtr[expandedIdx])
                      : 1.f;
+    }
+  }
+
+  if (!params.zeroRowsWithoutLocalExpert) {
+    // writesTokenRow from the expanded indices read above: the block's first vector is always
+    // active and holds every topK slot of the token.
+    bool hasLocalExpert = false;
+#pragma unroll
+    for (int j = 0; j < SMALL_BATCH_FINALIZE_MAX_LOADS; ++j) {
+      hasLocalExpert = hasLocalExpert || permutedIdx[j] != -1;
+    }
+    if (!__syncthreads_or(hasLocalExpert)) {
+      return;
     }
   }
 
@@ -1273,6 +1317,9 @@ __global__ void finalizeDeepSeekKernel(KernelParams params) {
 #endif
 
   for (int tokenIdx = blockIdx.y; tokenIdx < params.numTokens; tokenIdx += gridDim.y) {
+    if (!writesTokenRow(params, tokenIdx)) {
+      continue;
+    }
     // Loop over hidden dim
     for (int hiddenIdx = threadIdx.x + blockDim.x * blockIdx.x; hiddenIdx < params.hiddenDim;
          hiddenIdx += blockDim.x * gridDim.x) {

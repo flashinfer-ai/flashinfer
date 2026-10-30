@@ -2946,13 +2946,15 @@ void run_staged_moe_finalize(
     TensorView output, Optional<TensorView> const& expert_weights,
     TensorView expanded_idx_to_permuted_idx, TensorView total_num_padded_tokens, int64_t num_tokens,
     int64_t num_experts, int64_t top_k, bool enable_pdl, bool use_routing_scales_on_input,
-    Optional<TensorView> const& gemm2_output2, bool single_expert_tokens_done = false) {
+    Optional<TensorView> const& gemm2_output2, bool zero_rows_without_local_expert,
+    bool single_expert_tokens_done = false) {
   moe::dev::finalize::Data finalizeData;
   finalizeData.mDtypeElt = dtype_elt;
   finalizeData.mDtypeExpW = dtype_exp_w;
   finalizeData.mUsePdl = enable_pdl;
   finalizeData.mUseDeepSeekFp8 = use_deep_seek_fp8;
   finalizeData.mSingleExpertTokensDone = single_expert_tokens_done;
+  finalizeData.mZeroRowsWithoutLocalExpert = zero_rows_without_local_expert;
   finalizeData.inPtr = const_cast<void*>(gemm2_output.data_ptr());
   finalizeData.inPtr2 =
       gemm2_output2.has_value() ? const_cast<void*>(gemm2_output2.value().data_ptr()) : nullptr;
@@ -3408,13 +3410,16 @@ static bool check_staged_moe_finalize_args(TensorView gemm2_output, TensorView o
   return true;
 }
 
+// Reduces each token's expert rows into its `output` row. Tokens without a local expert get a zero
+// row, or keep theirs as it is without zero_rows_without_local_expert.
 void trtllm_moe_run_finalize(TensorView gemm2_output, TensorView output,
                              Optional<TensorView> const& expert_weights,
                              TensorView expanded_idx_to_permuted_idx,
                              TensorView total_num_padded_tokens, int64_t num_tokens,
                              int64_t num_experts, int64_t top_k, int64_t hidden_size,
                              bool enable_pdl, bool use_routing_scales_on_input,
-                             Optional<TensorView> const& gemm2_output2) {
+                             Optional<TensorView> const& gemm2_output2,
+                             bool zero_rows_without_local_expert) {
   if (!check_staged_moe_finalize_args(gemm2_output, output, expert_weights,
                                       expanded_idx_to_permuted_idx, total_num_padded_tokens,
                                       num_tokens, num_experts, top_k, hidden_size, gemm2_output2)) {
@@ -3424,16 +3429,18 @@ void trtllm_moe_run_finalize(TensorView gemm2_output, TensorView output,
                           /*use_deep_seek_fp8=*/false, gemm2_output, output, expert_weights,
                           expanded_idx_to_permuted_idx, total_num_padded_tokens, num_tokens,
                           num_experts, top_k, enable_pdl, use_routing_scales_on_input,
-                          gemm2_output2);
+                          gemm2_output2, zero_rows_without_local_expert);
 }
 
 // Finalize after an FC2 whose epilogue already stored each token with exactly one local expert
-// in `output`, scaled by its expert weight: zero rows for tokens without a local expert and the
-// weighted sum of `gemm2_output` rows for tokens with several.
+// in `output`, scaled by its expert weight: zero rows for tokens without a local expert (with
+// zero_rows_without_local_expert) and the weighted sum of `gemm2_output` rows for tokens with
+// several.
 void trtllm_moe_run_finalize_multi_expert_tokens(
     TensorView gemm2_output, TensorView output, TensorView expert_weights,
     TensorView expanded_idx_to_permuted_idx, TensorView total_num_padded_tokens, int64_t num_tokens,
-    int64_t num_experts, int64_t top_k, int64_t hidden_size, bool enable_pdl) {
+    int64_t num_experts, int64_t top_k, int64_t hidden_size, bool enable_pdl,
+    bool zero_rows_without_local_expert) {
   if (!check_staged_moe_finalize_args(gemm2_output, output, expert_weights,
                                       expanded_idx_to_permuted_idx, total_num_padded_tokens,
                                       num_tokens, num_experts, top_k, hidden_size,
@@ -3445,7 +3452,7 @@ void trtllm_moe_run_finalize_multi_expert_tokens(
                           expanded_idx_to_permuted_idx, total_num_padded_tokens, num_tokens,
                           num_experts, top_k, enable_pdl,
                           /*use_routing_scales_on_input=*/false,
-                          /*gemm2_output2=*/Optional<TensorView>(),
+                          /*gemm2_output2=*/Optional<TensorView>(), zero_rows_without_local_expert,
                           /*single_expert_tokens_done=*/true);
 }
 
