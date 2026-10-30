@@ -1409,13 +1409,23 @@ def test_turnover_launch_is_bitwise_the_work_binned_launch(
 # rule admits on a 148-SM sm_100a and a 152-SM sm_103a part: bins of one and
 # two tasks, every two-task bin paired with a one-task bin it gives chunks to.
 # They take the bin-mix build on the WORK_BIN_MIX_ARCHES parts and keep the
-# turnover build on the others.
+# turnover build on the others.  The third value says whether the plan passes
+# the span check of the WORK_BIN_MIX_SPAN_ARCHES parts: mixed16-h12 gives
+# single chunks to helpers with longer tasks than the owner's shorter task, so
+# it keeps the turnover build there.
 BIN_MIX_ROWS = [
-    pytest.param([64] * 16, 12, id="bs16x64-h12"),
-    pytest.param([128] * 16, 12, id="bs16x128-h12"),
-    pytest.param([256] * 16, 12, id="bs16x256-h12"),
-    pytest.param([256, 224, 192, 160] * 4, 12, id="mixed16-h12"),
+    pytest.param([64] * 16, 12, True, id="bs16x64-h12"),
+    pytest.param([128] * 16, 12, True, id="bs16x128-h12"),
+    pytest.param([256] * 16, 12, True, id="bs16x256-h12"),
+    pytest.param([256, 224, 192, 160] * 4, 12, False, id="mixed16-h12"),
 ]
+
+
+def _takes_bin_mix(span_ok):
+    arch = registry.device_arch()
+    if arch not in runtime.WORK_BIN_MIX_ARCHES:
+        return False
+    return span_ok or arch not in runtime.WORK_BIN_MIX_SPAN_ARCHES
 
 
 def _bin_mix_programs():
@@ -1440,9 +1450,9 @@ def _without_bin_mix(patch):
 
 @requires_blackwell
 @pytest.mark.parametrize("rows", [True, False], ids=["rows", "no-rows"])
-@pytest.mark.parametrize("lengths,heads", BIN_MIX_ROWS)
+@pytest.mark.parametrize("lengths,heads,span_ok", BIN_MIX_ROWS)
 def test_bin_mix_launch_is_bitwise_the_turnover_launch(
-    lengths, heads, rows, monkeypatch
+    lengths, heads, span_ok, rows, monkeypatch
 ):
     """A turnover launch whose bin table the bin-mix rule admits takes the
     bin-mix build: a one-task bin prepares the last chunks of its paired
@@ -1453,6 +1463,11 @@ def test_bin_mix_launch_is_bitwise_the_turnover_launch(
     launch after launch (the owners leave every ready word zero), in either
     order."""
     mix = _bin_mix_programs()
+    if not _takes_bin_mix(span_ok):
+        pytest.skip(
+            f"{registry.device_arch()} keeps the turnover build for this row "
+            "(test_bin_mix_rows_keep_the_turnover_build_elsewhere)"
+        )
     d = _inputs(lengths, heads)
     mixed = _Call(d, None, rows=rows)
     schedule = str(mixed.prepared.schedule)
@@ -1478,16 +1493,17 @@ def test_bin_mix_launch_is_bitwise_the_turnover_launch(
 
 @requires_blackwell
 @pytest.mark.parametrize("rows", [True, False], ids=["rows", "no-rows"])
-@pytest.mark.parametrize("lengths,heads", BIN_MIX_ROWS)
+@pytest.mark.parametrize("lengths,heads,span_ok", BIN_MIX_ROWS)
 def test_bin_mix_rows_keep_the_turnover_build_elsewhere(
-    lengths, heads, rows, monkeypatch
+    lengths, heads, span_ok, rows, monkeypatch
 ):
-    """On a part outside ``WORK_BIN_MIX_ARCHES`` a turnover launch whose bin
-    table the bin-mix rule admits keeps the turnover build: no bin-mix
-    program, the work-binned launch's schedule with ``_turnover`` added, and
-    bit for bit the work-binned launch."""
+    """On a part outside ``WORK_BIN_MIX_ARCHES``, or on a
+    ``WORK_BIN_MIX_SPAN_ARCHES`` part for a plan that fails the span check, a
+    turnover launch whose bin table the bin-mix rule admits keeps the
+    turnover build: no bin-mix program, the work-binned launch's schedule with
+    ``_turnover`` added, and bit for bit the work-binned launch."""
     arch = registry.device_arch()
-    if arch in runtime.WORK_BIN_MIX_ARCHES:
+    if _takes_bin_mix(span_ok):
         pytest.skip(
             f"{arch} takes the bin-mix build "
             "(test_bin_mix_launch_is_bitwise_the_turnover_launch)"

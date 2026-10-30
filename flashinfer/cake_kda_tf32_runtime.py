@@ -227,11 +227,18 @@ M64_OWNER_HELPER_MIN_SEQ_LEN_GB300: tuple[tuple[int, ...], ...] = ((36, 1024),)
 # 16 sequences of 64 to 256 tokens and 12 heads (two-task bins of 4 to 16
 # chunks); 32-token sequences (d = 1) keep the turnover build.
 WORK_BIN_MIX_MAGIC = 0x58313221
-# Architectures whose admitted launches take the bin-mix build.  On a 152-SM
-# sm_103a part the rule's admitted launches of held-out sequence-length mixes
-# ran 0.7 to 5.1 % slower than the turnover build, so every sm_103a launch keeps
-# the turnover build.
-WORK_BIN_MIX_ARCHES = ("sm_100a",)
+# Architectures whose admitted launches take the bin-mix build.
+WORK_BIN_MIX_ARCHES = ("sm_100a", "sm_103a")
+# Architectures where the rule also requires the plan to shorten the launch's
+# longest bin.  A give costs the helper more than the chunk it saves the owner,
+# so on a 152-SM sm_103a part two kinds of admitted launches ran up to 6.2 %
+# slower than the turnover build: a plan that leaves the longest bin as long as
+# before (every give counted as one chunk on its helper), and a single-chunk
+# give to a helper whose own task has more chunks than the owner's shorter
+# task.  Both keep the turnover build there.  In paired timings of 190
+# admitted launches (8 to 16 heads, two parts) the other 115 ran 0.7 to 11 %
+# faster with the bin-mix build.
+WORK_BIN_MIX_SPAN_ARCHES = ("sm_103a",)
 WORK_BIN_MIX_MAX_GIVE = 8
 WORK_BIN_MIX_SLOTS = 8
 WORK_BIN_MIX_SLOT_ELEMENTS = 16384
@@ -1435,6 +1442,7 @@ def _work_bin_mix_plan(
     num_bins: int,
     seq_lens: tuple[int, ...],
     num_heads: int,
+    shorten_span: bool = False,
 ) -> Optional[tuple[int, ...]]:
     """The bin-mix plan words of a work-bin table, or ``None`` to keep the
     turnover build.
@@ -1448,8 +1456,12 @@ def _work_bin_mix_plan(
     chunks and keeps ``tf`` = owner chunks - ``g``: owner words
     ``(g, tf, 0, 0)``, helper words ``(-g, owner, helper chunks, tf)``.  A
     pair with ``g < 1`` keeps zero words, and a table without a pair that
-    gives keeps the turnover build.  The words follow the table, four per
-    bin, then ``WORK_BIN_MIX_MAGIC``.
+    gives keeps the turnover build.  With ``shorten_span`` (the parts of
+    ``WORK_BIN_MIX_SPAN_ARCHES``) the plan must also shorten the longest bin,
+    each give counted as one chunk on its helper, and no single-chunk give
+    may go to a helper whose task has more chunks than the owner's shorter
+    task; otherwise the launch keeps the turnover build.  The words follow
+    the table, four per bin, then ``WORK_BIN_MIX_MAGIC``.
     """
     if num_bins < 2 or len(table) != num_bins + 1 + len(seq_lens) * num_heads:
         return None
@@ -1467,6 +1479,7 @@ def _work_bin_mix_plan(
         sum(chunks[task // num_heads] for task in bin_tasks) for bin_tasks in tasks
     ]
     words = [0] * (4 * num_bins)
+    gives = []
     for owner, helper in zip(owners, helpers, strict=False):
         difference = loads[owner] - loads[helper]
         give = min(
@@ -1479,8 +1492,20 @@ def _work_bin_mix_plan(
         keep = loads[owner] - give
         words[4 * owner : 4 * owner + 4] = [give, keep, 0, 0]
         words[4 * helper : 4 * helper + 4] = [-give, owner, loads[helper], keep]
-    if not any(words):
+        gives.append((owner, helper, give))
+    if not gives:
         return None
+    if shorten_span:
+        after = list(loads)
+        for owner, helper, give in gives:
+            after[owner] -= give
+            after[helper] += give
+        if max(after) >= max(loads):
+            return None
+        for owner, helper, give in gives:
+            shorter = min(chunks[task // num_heads] for task in tasks[owner])
+            if give == 1 and loads[helper] > shorter:
+                return None
     return (*words, WORK_BIN_MIX_MAGIC)
 
 
@@ -4165,7 +4190,11 @@ class FlashKDABlackwellBF16FusedLaunch:
             )
             if bin_mix_program is not None:
                 bin_mix_plan = _work_bin_mix_plan(
-                    tuple(work_bin_table), num_work_bins, seq_lens, num_heads
+                    tuple(work_bin_table),
+                    num_work_bins,
+                    seq_lens,
+                    num_heads,
+                    gpu_arch in WORK_BIN_MIX_SPAN_ARCHES,
                 )
             work_bin_upload = _upload_int32_batch(
                 q.device,
