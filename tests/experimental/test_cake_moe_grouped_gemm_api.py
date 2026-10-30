@@ -19,7 +19,7 @@ The experimental entry points ``grouped_gemm_fwd``, ``grouped_gemm_dgrad``,
 ``grouped_gemm_wgrad`` and ``cake_grouped_mm`` of ``flashinfer.grouped_mm`` (the
 thin core module ``flashinfer.grouped_mm.cake``) and the stable entry point
 ``flashinfer.grouped_mm.grouped_mm_bf16(..., backend="cake")`` hand off to
-``flashinfer.experimental.cake_moe_grouped_gemm``.  This suite covers the core
+``flashinfer.experimental.cake_moe_grouped_det_gemm``.  This suite covers the core
 entry points on CPU -- the experimental-API marking, the signatures and docstrings
 they share with the package functions, the once-only ``ExperimentalWarning`` that
 the package functions never emit, and the deferred import that keeps the package
@@ -42,10 +42,10 @@ import pytest
 import torch
 
 import flashinfer.api_logging as api_logging
-import flashinfer.experimental.cake_moe_grouped_gemm as pkg
+import flashinfer.experimental.cake_moe_grouped_det_gemm as pkg
 import flashinfer.grouped_mm as grouped_mm
-from flashinfer.experimental.cake_moe_grouped_gemm import cake_backend as cb
-from flashinfer.experimental.cake_moe_grouped_gemm.cake_backend import (
+from flashinfer.experimental.cake_moe_grouped_det_gemm import cake_backend as cb
+from flashinfer.experimental.cake_moe_grouped_det_gemm.cake_backend import (
     SUPPORTED_COMPUTE_CAPABILITIES,
 )
 
@@ -94,14 +94,14 @@ def _run_cpu_subprocess(code):
 def test_core_entry_points_are_the_experimental_api():
     """``flashinfer.grouped_mm.<name>`` is the experimental API of the package
     function of the same name: marked with the feature
-    ``cake_moe_grouped_gemm.<name>``, carrying the package function's signature
+    ``cake_moe_grouped_det_gemm.<name>``, carrying the package function's signature
     and its docstring behind the experimental banner, and exported by
     ``flashinfer.grouped_mm``; the package function itself is unmarked."""
     for name in ENTRY_POINTS:
         entry, impl = getattr(grouped_mm, name), getattr(pkg, name)
         assert name in grouped_mm.__all__, name
         assert entry.is_experimental is True, name
-        assert entry.experimental_feature == f"cake_moe_grouped_gemm.{name}", name
+        assert entry.experimental_feature == f"cake_moe_grouped_det_gemm.{name}", name
         assert inspect.signature(entry) == inspect.signature(impl), name
         assert entry.__doc__.startswith(".. warning::"), name
         assert entry.__doc__.endswith(impl.__doc__), name
@@ -114,7 +114,7 @@ import warnings
 import torch
 
 import flashinfer.api_logging as api_logging
-import flashinfer.experimental.cake_moe_grouped_gemm as pkg
+import flashinfer.experimental.cake_moe_grouped_det_gemm as pkg
 import flashinfer.grouped_mm as grouped_mm
 
 assert not torch.cuda.is_available()
@@ -155,7 +155,7 @@ for name, args in operands.items():
     [w] = warnings_of(entry, args)  # first call: exactly one warning
     assert w.category is api_logging.ExperimentalWarning, (name, w.category)
     message = str(w.message)
-    assert f"'cake_moe_grouped_gemm.{name}' is an experimental" in message, message
+    assert f"'cake_moe_grouped_det_gemm.{name}' is an experimental" in message, message
     assert warnings_of(entry, args) == [], name  # second call: silent
     assert warnings_of(impl, args) == [], name  # the package function: never
 print("OK")
@@ -174,13 +174,13 @@ def test_importing_grouped_mm_does_not_import_the_package():
     """``flashinfer.grouped_mm`` reaches the package through deferred imports only
     (experimental containment): a fresh interpreter that imports it has the thin
     module ``flashinfer.grouped_mm.cake`` loaded and no module of
-    ``flashinfer.experimental.cake_moe_grouped_gemm``."""
+    ``flashinfer.experimental.cake_moe_grouped_det_gemm``."""
     code = (
         "import json, sys\n"
         "import flashinfer.grouped_mm\n"
         "print(json.dumps(sorted(m for m in sys.modules"
         " if m == 'flashinfer.grouped_mm.cake'"
-        " or m.startswith('flashinfer.experimental.cake_moe_grouped_gemm'))))\n"
+        " or m.startswith('flashinfer.experimental.cake_moe_grouped_det_gemm'))))\n"
     )
     assert json.loads(_run_cpu_subprocess(code)) == ["flashinfer.grouped_mm.cake"]
 

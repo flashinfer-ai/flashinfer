@@ -31,7 +31,7 @@ This suite exercises the backend package alone: it names the package once,
 through ``tests.test_helpers.cake_package``, and imports nothing else from
 flashinfer, so a build that vendors the package under another import path
 runs it unchanged after pointing that table entry at its package.  The
-``flashinfer.cake_rmsnorm_train`` facade and the ``flashinfer`` top-level
+``flashinfer.cake_rmsnorm_det_train`` facade and the ``flashinfer`` top-level
 exposure are covered by ``test_cake_rmsnorm_train_api.py``.
 """
 
@@ -46,9 +46,9 @@ import torch
 
 from tests.test_helpers.cake_package import cake_package
 
-pkg = cake_package("cake_rmsnorm_train")
-cake_build = cake_package("cake_rmsnorm_train", "cake_build")
-loader = cake_package("cake_rmsnorm_train", "cake_jit")
+pkg = cake_package("cake_rmsnorm_det_train")
+cake_build = cake_package("cake_rmsnorm_det_train", "cake_build")
+loader = cake_package("cake_rmsnorm_det_train", "cake_jit")
 cake_rmsnorm = pkg.cake_rmsnorm
 cake_rmsnorm_train_backward = pkg.cake_rmsnorm_train_backward
 cake_rmsnorm_train_backward_workspace = pkg.cake_rmsnorm_train_backward_workspace
@@ -98,7 +98,7 @@ def _supported() -> bool:
 
 pytestmark = pytest.mark.skipif(
     not _supported(),
-    reason="cake_rmsnorm_train needs an SM100 / SM103 / SM107 device with exported routes",
+    reason="cake_rmsnorm_det_train needs an SM100 / SM103 / SM107 device with exported routes",
 )
 
 

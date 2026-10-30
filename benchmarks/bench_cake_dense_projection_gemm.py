@@ -16,7 +16,7 @@ limitations under the License.
 
 """Benchmark the experimental Cake dense projection GEMMs (SM100 / SM103 / SM107).
 
-Times the GLM-5.2 training GEMMs of ``flashinfer.experimental.dense_projection_gemm``
+Times the GLM-5.2 training GEMMs of ``flashinfer.experimental.dense_projection_det_gemm``
 paired against ``torch.matmul`` on the same strided views:
 
 * the 11 projection rows (``o_proj``, ``q_a``, ``q_b``, ``kv_a``, ``shared_gate_up``,
@@ -55,7 +55,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from flashinfer.experimental.dense_projection_gemm import cake_backend  # noqa: E402
+from flashinfer.experimental.dense_projection_det_gemm import cake_backend  # noqa: E402
 from flashinfer.testing import bench_gpu_time  # noqa: E402
 
 # GLM-5.2 projection rows: label -> (K = in features, N = out features).
@@ -207,7 +207,9 @@ def eager_arm(spec, inp):
         return lambda: cake_backend.router_fp32_gemm(inp["A"], inp["B"], inp["out"])
     if spec["family"] == "proj" and spec["op"] == "wgrad":
         return lambda: cake_backend.projection_wgrad(inp["G"], inp["X"], inp["out"])
-    return lambda: cake_backend.dense_projection_gemm(inp["A"], inp["B"], inp["out"])
+    return lambda: cake_backend.dense_projection_det_gemm(
+        inp["A"], inp["B"], inp["out"]
+    )
 
 
 def torch_arm(spec, inp):

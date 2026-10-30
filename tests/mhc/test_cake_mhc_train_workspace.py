@@ -55,8 +55,8 @@ import torch
 
 from tests.test_helpers.cake_package import PACKAGES, cake_package
 
-pkg = cake_package("cake_mhc_train")
-loader = cake_package("cake_mhc_train", "cake_jit")
+pkg = cake_package("cake_mhc_det_train")
+loader = cake_package("cake_mhc_det_train", "cake_jit")
 
 SUPPORTED_CAPABILITIES = ((10, 0), (10, 3), (10, 7))
 STREAMS, HIDDEN, N, MAPPING_ROWS = 4, 4096, 16384, 24
@@ -91,7 +91,7 @@ def _supported() -> bool:
 
 pytestmark = pytest.mark.skipif(
     not _supported(),
-    reason="cake_mhc_train needs an SM100 / SM103 / SM107 device with exported routes",
+    reason="cake_mhc_det_train needs an SM100 / SM103 / SM107 device with exported routes",
 )
 
 
@@ -295,7 +295,7 @@ def test_default_workspace_reported_sequence(Ts: tuple) -> None:
             sys.executable,
             "-c",
             _REPORTED_CHILD,
-            PACKAGES["cake_mhc_train"],
+            PACKAGES["cake_mhc_det_train"],
             ",".join(map(str, Ts)),
         ],
         cwd=Path(__file__).resolve().parents[2],

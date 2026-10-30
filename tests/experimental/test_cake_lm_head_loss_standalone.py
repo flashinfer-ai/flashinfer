@@ -15,7 +15,7 @@ limitations under the License.
 
 Standalone-import tests of the Cake chunked LM-head + loss package.
 
-A copy of ``flashinfer/experimental/cake_lm_head_loss`` must import and reach
+A copy of ``flashinfer/experimental/cake_lm_head_det_loss`` must import and reach
 its host-side checks on its own: under another top-level name, in a
 ``python -I`` subprocess with ``flashinfer`` blocked (the form of a vendoring
 gate, ``scripts/check_cake_build_manifests.py --vendored-gate``).  The package
@@ -43,7 +43,7 @@ import torch
 
 tvm_ffi = pytest.importorskip("tvm_ffi")  # the package's load path imports it
 
-import flashinfer.experimental.cake_lm_head_loss as pkg
+import flashinfer.experimental.cake_lm_head_det_loss as pkg
 
 PACKAGE_DIR = Path(pkg.__file__).resolve().parent
 VENDORED_NAME = "vendored_lm_head_loss"  # the copy's top-level name in the subprocess

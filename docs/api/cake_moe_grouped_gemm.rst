@@ -7,7 +7,7 @@ Cake ragged BF16 grouped GEMM (experimental)
 
 The experimental ragged BF16 grouped GEMM entry points live in
 :mod:`flashinfer.grouped_mm` and hand off to the backend package
-:mod:`flashinfer.experimental.cake_moe_grouped_gemm`: generated ragged BF16 grouped
+:mod:`flashinfer.experimental.cake_moe_grouped_det_gemm`: generated ragged BF16 grouped
 GEMM programs for the expert projections of Mixture-of-Experts layers on SM100
 (B200 / GB200), SM103 (B300 / GB300) and SM107 (R200).  Both the API and the backend
 are experimental (see :ref:`experimental`); calling one of the functions below, or
@@ -72,7 +72,7 @@ Prepared launches
 -----------------
 
 The backend package also holds the prepare-once / launch-many surface:
-``flashinfer.experimental.cake_moe_grouped_gemm.prepare_grouped_gemm_fwd``,
+``flashinfer.experimental.cake_moe_grouped_det_gemm.prepare_grouped_gemm_fwd``,
 ``prepare_grouped_gemm_dgrad`` and ``prepare_grouped_gemm_wgrad`` validate the
 arguments, bind one generated program and return a ``GroupedGemmLaunch`` whose
 ``launch()`` performs no allocation and no host synchronisation and is CUDA-graph

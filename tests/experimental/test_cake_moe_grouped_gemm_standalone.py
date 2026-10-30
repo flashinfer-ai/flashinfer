@@ -15,7 +15,7 @@ limitations under the License.
 
 Standalone-import tests of the Cake MoE grouped GEMM package.
 
-A copy of ``flashinfer/experimental/cake_moe_grouped_gemm`` must import and
+A copy of ``flashinfer/experimental/cake_moe_grouped_det_gemm`` must import and
 reach its host-side checks on its own: under another top-level name, in a
 ``python -I`` subprocess with ``flashinfer`` blocked (the form of a vendoring
 gate).  The package imports only itself, ``torch`` and ``tvm_ffi``; the
@@ -40,7 +40,7 @@ import torch
 
 tvm_ffi = pytest.importorskip("tvm_ffi")  # cake_backend imports it at module level
 
-import flashinfer.experimental.cake_moe_grouped_gemm as pkg
+import flashinfer.experimental.cake_moe_grouped_det_gemm as pkg
 
 PACKAGE_DIR = Path(pkg.__file__).resolve().parent
 VENDORED_NAME = "vendored_grouped_gemm"  # the copy's top-level name in the subprocess

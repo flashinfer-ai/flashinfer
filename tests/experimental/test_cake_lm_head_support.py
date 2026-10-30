@@ -46,8 +46,8 @@ from tests.test_helpers.cake_lm_head_support_reference import (
 )
 from tests.test_helpers.cake_package import cake_package
 
-cake_support = cake_package("cake_lm_head_loss", "cake_support")
-cake_backend = cake_package("cake_lm_head_loss", "cake_backend")
+cake_support = cake_package("cake_lm_head_det_loss", "cake_support")
+cake_backend = cake_package("cake_lm_head_det_loss", "cake_backend")
 support_logprob = cake_support.chunked_lm_head_support_logprob
 support_kl = cake_support.chunked_lm_head_support_kl
 Engine = cake_support.SupportReferenceEngine
@@ -1267,7 +1267,7 @@ def test_device_assert_ends_the_context(what):
         f"""
         import torch
         from tests.test_helpers.cake_package import cake_package
-        cs = cake_package("cake_lm_head_loss", "cake_support")
+        cs = cake_package("cake_lm_head_det_loss", "cake_support")
         X = torch.zeros(4, 256, dtype=torch.bfloat16, device="cuda")
         W = torch.zeros(512, 256, dtype=torch.bfloat16, device="cuda")
         ids = torch.tensor([1, 2, 3, 4], device="cuda")
@@ -1695,7 +1695,7 @@ def test_cake_device_assert_ends_the_context(what):
         f"""
         import torch
         from tests.test_helpers.cake_package import cake_package
-        cs = cake_package("cake_lm_head_loss", "cake_support")
+        cs = cake_package("cake_lm_head_det_loss", "cake_support")
         T = 0 if "{what}" == "first offset" else 4
         X = torch.zeros(T, 256, dtype=torch.bfloat16, device="cuda")
         W = torch.zeros(512, 256, dtype=torch.bfloat16, device="cuda")

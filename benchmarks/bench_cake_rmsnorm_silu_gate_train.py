@@ -62,7 +62,7 @@ from typing import Callable, Optional
 import torch
 import torch.utils.checkpoint
 
-from flashinfer.cake_rmsnorm_silu_gate_train import (
+from flashinfer.cake_rmsnorm_silu_gate_det_train import (
     cake_rmsnorm_silu_gate,
     cake_rmsnorm_silu_gate_train_backward,
     cake_rmsnorm_silu_gate_train_backward_workspace,

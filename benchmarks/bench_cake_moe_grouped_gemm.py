@@ -33,8 +33,8 @@ import math
 
 import torch
 
-from flashinfer.experimental.cake_moe_grouped_gemm import cake_backend as cb
-from flashinfer.experimental.cake_moe_grouped_gemm.cake_backend import (
+from flashinfer.experimental.cake_moe_grouped_det_gemm import cake_backend as cb
+from flashinfer.experimental.cake_moe_grouped_det_gemm.cake_backend import (
     prepare_grouped_gemm_dgrad,
     prepare_grouped_gemm_fwd,
     prepare_grouped_gemm_wgrad,

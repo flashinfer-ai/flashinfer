@@ -50,7 +50,7 @@ FP32 statistics and accumulation, one FP32 reciprocal RMS saved per row,
 fused ``dx`` + deterministic FP32 ``dw`` backward, optional residual-add
 fusion and an autograd wrapper.
 
-.. currentmodule:: flashinfer.cake_rmsnorm_train
+.. currentmodule:: flashinfer.cake_rmsnorm_det_train
 
 .. autosummary::
     :toctree: ../generated
@@ -72,7 +72,7 @@ inputs, outputs and gradients, a weight shared by every token and head whose
 gradient is summed in a fixed order (repeated calls return the same bits), and
 an autograd wrapper that saves only its inputs.
 
-.. currentmodule:: flashinfer.cake_rmsnorm_silu_gate_train
+.. currentmodule:: flashinfer.cake_rmsnorm_silu_gate_det_train
 
 .. autosummary::
     :toctree: ../generated

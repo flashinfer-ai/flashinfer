@@ -12,7 +12,7 @@ limitations under the License.
 
 CPU tests of the public surface of the context-parallel packed GDN training route: the options validator
 (``cake_gdn_det_train_kcp.cake_options``), the keyword-only signatures, the facade ``flashinfer.gdn_train`` (the contract names),
-the package hygiene rules (no environment variable, no ``cake_kda_train`` import, the host module's import allow-list)
+the package hygiene rules (no environment variable, no ``cake_kda_det_train`` import, the host module's import allow-list)
 and the host tables built on the CPU for the correctness rows' partitions.  No kernel runs here.
 """
 
@@ -400,7 +400,7 @@ def test_package_init_re_exports_the_route() -> None:
 
 
 # ----------------------------------------------------------------------------------------------------------------
-# package hygiene (no cake_kda_train import; no os.environ; the host module's import allow-list)
+# package hygiene (no cake_kda_det_train import; no os.environ; the host module's import allow-list)
 
 
 def _package_sources() -> list[pathlib.Path]:
@@ -422,16 +422,16 @@ def test_package_never_imports_cake_kda_train() -> None:
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
                 for a in node.names:
-                    assert "cake_kda_train" not in a.name, (path.name, a.name)
+                    assert "cake_kda_det_train" not in a.name, (path.name, a.name)
             elif isinstance(node, ast.ImportFrom):
-                assert "cake_kda_train" not in (node.module or ""), (
+                assert "cake_kda_det_train" not in (node.module or ""), (
                     path.name,
                     node.module,
                 )
                 for a in node.names:
-                    assert a.name != "cake_kda_train", (path.name, a.name)
+                    assert a.name != "cake_kda_det_train", (path.name, a.name)
         assert (
-            "cake_kda_train"
+            "cake_kda_det_train"
             not in path.read_text().replace("Provenance", "").split("import os")[0]
             or True
         )

@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 flashinfer public-API tests of the Cake packed KDA chunked training package
-(``flashinfer.experimental.cake_kda_train``).
+(``flashinfer.experimental.cake_kda_det_train``).
 
 The backend suite ``test_cake_kda_train.py`` imports only the package.  This file covers what needs flashinfer
 itself: the experimental public entry points ``flashinfer.kda_train.chunk_kda_fwd`` / ``chunk_kda_bwd`` /
@@ -31,7 +31,7 @@ import torch
 
 import flashinfer.kda_train as public_api
 from flashinfer.api_logging import ExperimentalWarning
-from flashinfer.experimental.cake_kda_train import cake_backend, cake_jit
+from flashinfer.experimental.cake_kda_det_train import cake_backend, cake_jit
 from tests.test_helpers.cake_kda_train_reference import make_inputs
 
 ENTRY_POINTS = (
@@ -254,7 +254,7 @@ def test_kcp_workspace_query_resolves_save_transfer_like_the_forward(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # An unset save_transfer resolves to the plan default, as the a2a forward does; an explicit value passes through.
-    from flashinfer.experimental.cake_kda_train import cake_kcp_plan
+    from flashinfer.experimental.cake_kda_det_train import cake_kcp_plan
 
     calls = []
     monkeypatch.setattr(
@@ -492,7 +492,7 @@ def test_kcp_recompute_handle_keywords_are_forwarded(
     ``kcp_saved_bytes`` / ``kcp_comm_bytes`` forward ``checkpoint_keep`` (and ``save_transfer=None`` under a tier,
     ``False`` without one); ``KcpRecomputeHandle`` resolves lazily to
     the KCP module's class.  Device-free (recorders)."""
-    from flashinfer.experimental.cake_kda_train import cake_kcp, cake_kcp_plan
+    from flashinfer.experimental.cake_kda_det_train import cake_kcp, cake_kcp_plan
 
     calls = []
 

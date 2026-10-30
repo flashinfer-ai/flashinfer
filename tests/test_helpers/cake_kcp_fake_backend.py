@@ -47,7 +47,7 @@ from tests.test_helpers import cake_kda_kcp_reference as rk
 from tests.test_helpers import cake_kda_kcp_shapes as kcp_shapes
 from tests.test_helpers.cake_package import cake_package
 
-kp = cake_package("cake_kda_train", "cake_kcp_plan")
+kp = cake_package("cake_kda_det_train", "cake_kcp_plan")
 
 F64 = torch.float64
 D = kp.HEAD_DIM

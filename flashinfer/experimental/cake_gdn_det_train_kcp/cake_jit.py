@@ -63,7 +63,7 @@ Programs (``*`` = new program package, ``=`` = reused verbatim):
                              the (chunk, Q/K head) groups drawn from the ``ticket`` word
   #9 * ``gate_epilogue``     reverse cumsum of the dg partials + the chunk term; grid ceil(NC x HV / 128)
 
-Provenance of the rules: ``flashinfer/experimental/cake_kda_train/cake_kcp_jit.py`` (records_of_program,
+Provenance of the rules: ``flashinfer/experimental/cake_kda_det_train/cake_kcp_jit.py`` (records_of_program,
 select_record, launch_grid; sha256 c405e7dcd36c9cbe0ff01e3e3194fd760491504655bda28a646c2067a23b4c90) at
 FlashInfer 13d7fcf4041635f5b7f573bb0dbab23570ae1034, adapted to the GDN vocabulary; the loader glue moved to
 :mod:`.cake_backend`.

@@ -85,7 +85,7 @@ This suite exercises the backend package alone: it names the package once,
 through ``tests.test_helpers.cake_package``, and imports nothing else from
 flashinfer, so a build that vendors the package under another import path
 runs it unchanged after pointing that table entry at its package.  The
-``flashinfer.cake_mhc_train`` facade and the ``flashinfer`` top-level
+``flashinfer.cake_mhc_det_train`` facade and the ``flashinfer`` top-level
 exposure are covered by ``test_cake_mhc_train_api.py``; the host rules by
 ``test_cake_mhc_train_rules.py``.
 """
@@ -103,9 +103,9 @@ import torch
 
 from tests.test_helpers.cake_package import cake_package
 
-pkg = cake_package("cake_mhc_train")
-cake_build = cake_package("cake_mhc_train", "cake_build")
-loader = cake_package("cake_mhc_train", "cake_jit")
+pkg = cake_package("cake_mhc_det_train")
+cake_build = cake_package("cake_mhc_det_train", "cake_build")
+loader = cake_package("cake_mhc_det_train", "cake_jit")
 forward_prepare = pkg.cake_mhc_train_forward_prepare
 forward_stats = pkg.cake_mhc_train_forward_stats
 forward_finish = pkg.cake_mhc_train_forward_finish
@@ -190,7 +190,7 @@ def _supported() -> bool:
 
 pytestmark = pytest.mark.skipif(
     not _supported(),
-    reason="cake_mhc_train needs an SM100 / SM103 / SM107 device with exported routes",
+    reason="cake_mhc_det_train needs an SM100 / SM103 / SM107 device with exported routes",
 )
 
 

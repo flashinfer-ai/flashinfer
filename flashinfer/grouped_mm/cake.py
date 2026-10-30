@@ -4,7 +4,7 @@
 
 Thin core entry points, per ``flashinfer/experimental/README.md``: each
 function below carries the public signature and the documentation of its
-namesake in :mod:`flashinfer.experimental.cake_moe_grouped_gemm`, adds the
+namesake in :mod:`flashinfer.experimental.cake_moe_grouped_det_gemm`, adds the
 experimental-API marking, and hands off to it.
 The kernels, the host planning, the autograd wrapper and the JIT
 registration live in that package, which every function imports inside its
@@ -28,7 +28,7 @@ __all__ = [
 ]
 
 
-@flashinfer_experimental_api(feature="cake_moe_grouped_gemm.grouped_gemm_fwd")
+@flashinfer_experimental_api(feature="cake_moe_grouped_det_gemm.grouped_gemm_fwd")
 def grouped_gemm_fwd(
     x: torch.Tensor,
     w: torch.Tensor,
@@ -61,12 +61,12 @@ def grouped_gemm_fwd(
     tensors (or CUDA Graph capture) use ``prepare_grouped_gemm_fwd`` once and
     call ``launch()`` on the returned object.
     """
-    from ..experimental.cake_moe_grouped_gemm import grouped_gemm_fwd as _impl
+    from ..experimental.cake_moe_grouped_det_gemm import grouped_gemm_fwd as _impl
 
     return _impl(x, w, offs, out=out)
 
 
-@flashinfer_experimental_api(feature="cake_moe_grouped_gemm.grouped_gemm_dgrad")
+@flashinfer_experimental_api(feature="cake_moe_grouped_det_gemm.grouped_gemm_dgrad")
 def grouped_gemm_dgrad(
     g: torch.Tensor,
     w: torch.Tensor,
@@ -80,12 +80,12 @@ def grouped_gemm_dgrad(
     offsets (or ``m_indptr`` ``[E + 1]``) and ``out`` is ``[sum_m, K]`` bfloat16.  ``K % 256 == 0`` and
     ``N % 64 == 0`` are required.  See ``grouped_gemm_fwd`` for the prepared form.
     """
-    from ..experimental.cake_moe_grouped_gemm import grouped_gemm_dgrad as _impl
+    from ..experimental.cake_moe_grouped_det_gemm import grouped_gemm_dgrad as _impl
 
     return _impl(g, w, offs, out=out)
 
 
-@flashinfer_experimental_api(feature="cake_moe_grouped_gemm.grouped_gemm_wgrad")
+@flashinfer_experimental_api(feature="cake_moe_grouped_det_gemm.grouped_gemm_wgrad")
 def grouped_gemm_wgrad(
     g: torch.Tensor,
     x: torch.Tensor,
@@ -105,12 +105,12 @@ def grouped_gemm_wgrad(
     or 512 when chosen) are required.  See ``grouped_gemm_fwd`` for the
     prepared form.
     """
-    from ..experimental.cake_moe_grouped_gemm import grouped_gemm_wgrad as _impl
+    from ..experimental.cake_moe_grouped_det_gemm import grouped_gemm_wgrad as _impl
 
     return _impl(g, x, offs, out=out, out_dtype=out_dtype, num_groups=num_groups)
 
 
-@flashinfer_experimental_api(feature="cake_moe_grouped_gemm.cake_grouped_mm")
+@flashinfer_experimental_api(feature="cake_moe_grouped_det_gemm.cake_grouped_mm")
 def cake_grouped_mm(
     x: torch.Tensor,
     w: torch.Tensor,
@@ -140,7 +140,7 @@ def cake_grouped_mm(
         bfloat16 and ``w.grad`` ``[E, N, K]`` in ``w``'s dtype (bfloat16); use
         :func:`grouped_gemm_wgrad` directly for an fp32 weight gradient.
     """
-    from ..experimental.cake_moe_grouped_gemm.cake_autograd import (
+    from ..experimental.cake_moe_grouped_det_gemm.cake_autograd import (
         cake_grouped_mm as _impl,
     )
 

@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 Benchmark of the Cake packed KDA chunked training kernels
-(``flashinfer.experimental.cake_kda_train``) on three boundaries of a
+(``flashinfer.experimental.cake_kda_det_train``) on three boundaries of a
 training step, against flash-linear-attention's ``chunk_kda`` when it is
 installed:
 
@@ -50,7 +50,7 @@ from torch.utils.checkpoint import checkpoint
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from flashinfer.experimental.cake_kda_train import cake_backend, cake_jit  # noqa: E402
+from flashinfer.experimental.cake_kda_det_train import cake_backend, cake_jit  # noqa: E402
 from flashinfer.testing import bench_gpu_time  # noqa: E402
 from tests.test_helpers.cake_kda_train_reference import make_inputs  # noqa: E402
 

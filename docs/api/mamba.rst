@@ -37,7 +37,7 @@ launch and left zero by every launch, so one buffer serves every later call of
 one stream); when the caller passes none the package keeps one per device and
 stream.
 
-.. currentmodule:: flashinfer.cake_causal_conv1d_train
+.. currentmodule:: flashinfer.cake_causal_conv1d_det_train
 
 .. autosummary::
     :toctree: ../generated

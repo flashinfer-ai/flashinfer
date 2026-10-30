@@ -19,7 +19,7 @@ backward launch sequences with their collectives, the saved set
 :class:`KcpSaved`, the autograd Function and the entry points
 ``chunk_gdn_kcp`` / ``chunk_gdn_kcp_fwd`` / ``chunk_gdn_kcp_bwd``.
 
-Provenance: adapted from ``flashinfer/experimental/cake_kda_train/cake_kcp.py``
+Provenance: adapted from ``flashinfer/experimental/cake_kda_det_train/cake_kcp.py``
 at FlashInfer ``13d7fcf4041635f5b7f573bb0dbab23570ae1034`` (the KDA KCP host
 module).  Verbatim parts: the compact pools and chains (``Indexed``,
 ``Chains``), the exchange tables (``_Tables``), the per-call state

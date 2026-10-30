@@ -30,8 +30,8 @@ import torch
 
 from tests.test_helpers.cake_package import cake_package
 
-pkg = cake_package("cake_rmsnorm_train")
-loader = cake_package("cake_rmsnorm_train", "cake_jit")
+pkg = cake_package("cake_rmsnorm_det_train")
+loader = cake_package("cake_rmsnorm_det_train", "cake_jit")
 
 SUPPORTED_CAPABILITIES = ((10, 0), (10, 3), (10, 7))
 HIDDEN_SIZES = (6144, 4096, 2048, 1536, 512)

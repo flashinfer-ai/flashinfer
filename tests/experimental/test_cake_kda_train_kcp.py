@@ -37,10 +37,10 @@ from tests.test_helpers import cake_kda_kcp_shapes as kcp_shapes
 from tests.test_helpers.cake_kda_train_kcp_saved import written_carry, written_tensors
 from tests.test_helpers.cake_package import cake_package
 
-kp = cake_package("cake_kda_train", "cake_kcp_plan")
-cake_backend = cake_package("cake_kda_train", "cake_backend")
-cake_jit = cake_package("cake_kda_train", "cake_jit")
-cake_kcp_jit = cake_package("cake_kda_train", "cake_kcp_jit")
+kp = cake_package("cake_kda_det_train", "cake_kcp_plan")
+cake_backend = cake_package("cake_kda_det_train", "cake_backend")
+cake_jit = cake_package("cake_kda_det_train", "cake_jit")
+cake_kcp_jit = cake_package("cake_kda_det_train", "cake_kcp_jit")
 
 SM_COUNT = 152  # GB300; the plan rule's examples of the design note §7.2
 EVIDENCE_DIR = os.environ.get("KCP_EVIDENCE_DIR")
@@ -2460,7 +2460,7 @@ def test_byte_queries_and_knobs(monkeypatch) -> None:
 
 # --------------------------------------------------------------------------- the schedule / fused-walk / column-rule knobs
 
-cake_kcp = cake_package("cake_kda_train", "cake_kcp")
+cake_kcp = cake_package("cake_kda_det_train", "cake_kcp")
 LEVER_TENSORS = ("out", "dq", "dk", "dv", "dg", "dbeta")
 
 
@@ -5068,7 +5068,7 @@ def test_host_trim_backward_walk_sublists_are_table_owned() -> None:
 def test_host_trim_table_identity_caches() -> None:
     """Trimmed host path: the table set's identity-keyed device copies (walk lists, the segment table, tile tables, Indexed
     metadata, chain tables) hold the same integers as the content-keyed copies of today's path."""
-    from flashinfer.experimental.cake_kda_train import cake_kcp_jit
+    from flashinfer.experimental.cake_kda_det_train import cake_kcp_jit
 
     part = _small_partition(4, lengths=(3000,), layout="contiguous")
     ctx = kp.build_kcp_context(part, None, 1, "cpu", 4, sm_count=SM_COUNT)

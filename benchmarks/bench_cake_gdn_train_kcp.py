@@ -16,7 +16,7 @@ limitations under the License.
 Benchmark of the context-parallel (KCP) Cake packed GDN training step: one
 process per rank (``torchrun --nproc_per_node N``), every rank timing the
 module boundary of its fragments -- the KCP causal convolution
-(``flashinfer.cake_causal_conv1d_train.cake_causal_conv1d_kcp``, 10,240
+(``flashinfer.cake_causal_conv1d_det_train.cake_causal_conv1d_kcp``, 10,240
 channels) followed by the KCP GDN step (``flashinfer.gdn_train.chunk_gdn_kcp``)
 -- with CUDA events, the slowest rank's time counting for the iteration.
 
@@ -75,7 +75,7 @@ from torch.utils.checkpoint import checkpoint
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from flashinfer.cake_causal_conv1d_train import (  # noqa: E402
+from flashinfer.cake_causal_conv1d_det_train import (  # noqa: E402
     cake_causal_conv1d,
     cake_causal_conv1d_kcp,
 )

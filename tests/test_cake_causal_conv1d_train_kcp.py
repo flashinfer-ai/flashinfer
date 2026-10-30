@@ -41,12 +41,12 @@ import types
 import pytest
 import torch
 
-from flashinfer.cake_causal_conv1d_train import (
+from flashinfer.cake_causal_conv1d_det_train import (
     cake_causal_conv1d_train_backward,
     cake_causal_conv1d_train_forward,
     is_cake_causal_conv1d_train_supported,
 )
-from flashinfer.cake_causal_conv1d_train_backend.kcp import (
+from flashinfer.cake_causal_conv1d_det_train_backend.kcp import (
     cake_causal_conv1d_kcp,
     cake_causal_conv1d_kcp_backward,
     cake_causal_conv1d_kcp_forward,
@@ -64,7 +64,7 @@ NOCP_ATOL, NOCP_RTOL = 1e-2, 1e-2
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available()
     or not is_cake_causal_conv1d_train_supported(torch.device("cuda")),
-    reason="cake_causal_conv1d_train needs a supported CUDA device (SM100 / SM103 / SM107)",
+    reason="cake_causal_conv1d_det_train needs a supported CUDA device (SM100 / SM103 / SM107)",
 )
 
 # Rows: (document lengths, fragment lengths over the packed sequence); each fragment is cut at document
@@ -180,7 +180,7 @@ def _context(lens, cuts, device):
     is importable, else a stand-in with the same fields the conv host module reads."""
     S, cu_global, frags = _fragments(lens, cuts)
     try:
-        from flashinfer.experimental.cake_kda_train.cake_kcp_plan import (
+        from flashinfer.experimental.cake_kda_det_train.cake_kcp_plan import (
             build_kcp_context,
             kcp_partition,
         )
@@ -496,8 +496,8 @@ def test_kcp_plans_with_the_legacy_tile_rule(monkeypatch):
     n_ch_tiles) = (128, 1, 2)`` (the training routes tile it as (32, 4, 5)), and the forward's ``y`` stays
     bitwise the unpartitioned forward's."""
 
-    from flashinfer.cake_causal_conv1d_train_backend import cake_jit
-    from flashinfer.cake_causal_conv1d_train_backend import kcp as conv_kcp
+    from flashinfer.cake_causal_conv1d_det_train_backend import cake_jit
+    from flashinfer.cake_causal_conv1d_det_train_backend import kcp as conv_kcp
 
     geometry = {"threads": 128, "vec": 8}
     legacy = cake_jit.plan(5000, 1280, 2, geometry=geometry, legacy=True)
@@ -529,7 +529,7 @@ def test_graph_replay_knob_is_bitwise(monkeypatch, form) -> None:
     the second is captured and replayed once, later calls replay the graph; ``y`` / ``hist`` / ``dx`` / ``dweight``
     are bitwise the knob-off results on every call.  The backward's key holds the forward's ``hist`` pointer, so
     its capture follows the forward's by one call.  Another input pointer is another key (eager, still bitwise)."""
-    from flashinfer.cake_causal_conv1d_train_backend import kcp as conv_kcp
+    from flashinfer.cake_causal_conv1d_det_train_backend import kcp as conv_kcp
 
     device = torch.device("cuda")
     p = _problem((5000, 1003), (1, 2, 4997, 1003), 512, device)
@@ -632,7 +632,7 @@ def _ckpt_run(p, *, handle=None, reentrant=False, ckpt=True, counter=None, twice
 
     from torch.utils.checkpoint import checkpoint
 
-    from flashinfer import cake_causal_conv1d_train as facade
+    from flashinfer import cake_causal_conv1d_det_train as facade
 
     x = p.x_local.clone().requires_grad_(True)
     w = p.w.clone().requires_grad_(True)
@@ -675,7 +675,7 @@ def test_recompute_handle_is_bitwise_and_exchange_free(
     ``y`` / ``dx`` / ``dweight`` are bitwise the plain checkpoint's, the direct pass's and the explicit
     forward / backward calls' (``recompute_handle=None`` is the unchanged path); the handle holds exactly the
     history pool, the saved set's own tensor."""
-    from flashinfer.cake_causal_conv1d_train_backend import kcp as conv_kcp
+    from flashinfer.cake_causal_conv1d_det_train_backend import kcp as conv_kcp
 
     device = torch.device("cuda")
     p = _problem(lens, cuts, C, device)
@@ -726,8 +726,8 @@ def test_recompute_handle_retain_graph_and_nested_checkpoints(monkeypatch) -> No
 
     from torch.utils.checkpoint import checkpoint
 
-    from flashinfer import cake_causal_conv1d_train as facade
-    from flashinfer.cake_causal_conv1d_train_backend import kcp as conv_kcp
+    from flashinfer import cake_causal_conv1d_det_train as facade
+    from flashinfer.cake_causal_conv1d_det_train_backend import kcp as conv_kcp
 
     device = torch.device("cuda")
     p = _problem((5000, 1003), (1, 2, 4997, 1003), 512, device)
@@ -782,8 +782,8 @@ def test_recompute_handle_misuse_raises() -> None:
     lost its entry before the recompute makes it an original forward again (exchanges, still bitwise)."""
     from torch.utils.checkpoint import checkpoint
 
-    from flashinfer import cake_causal_conv1d_train as facade
-    from flashinfer.cake_causal_conv1d_train_backend import kcp as conv_kcp
+    from flashinfer import cake_causal_conv1d_det_train as facade
+    from flashinfer.cake_causal_conv1d_det_train_backend import kcp as conv_kcp
 
     device = torch.device("cuda")
     p = _problem((5000, 1003), (1, 2, 4997, 1003), 512, device)
@@ -861,7 +861,7 @@ def test_recompute_handle_misuse_raises() -> None:
 
 
 def test_recompute_handle_knob_graph_is_refused(monkeypatch) -> None:
-    from flashinfer.cake_causal_conv1d_train_backend import kcp as conv_kcp
+    from flashinfer.cake_causal_conv1d_det_train_backend import kcp as conv_kcp
 
     device = torch.device("cuda")
     p = _problem((65,), (64, 1), 256, device)
@@ -888,7 +888,7 @@ def test_recompute_handle_knob_graph_is_refused(monkeypatch) -> None:
 def test_recompute_handle_both_host_paths(monkeypatch, host_trim) -> None:
     """The replay binds the stored pool on the trimmed and on the previous host path alike: bitwise, and no exchange
     in the recompute (the plain checkpoint, the positive control, exchanges once there)."""
-    from flashinfer.cake_causal_conv1d_train_backend import kcp as conv_kcp
+    from flashinfer.cake_causal_conv1d_det_train_backend import kcp as conv_kcp
 
     device = torch.device("cuda")
     p = _problem((1, 2, 3, 57), (3, 30, 30), 384, device)

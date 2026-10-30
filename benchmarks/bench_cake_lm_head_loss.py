@@ -69,7 +69,7 @@ import flashinfer  # noqa: E402
 from flashinfer import chunked_lm_head as public_lm_head  # noqa: E402
 from flashinfer.api_logging import ExperimentalWarning  # noqa: E402
 from flashinfer.chunked_lm_head import chunked_lm_head_logprob, chunked_lm_head_loss  # noqa: E402
-from flashinfer.experimental.cake_lm_head_loss import cake_backend  # noqa: E402
+from flashinfer.experimental.cake_lm_head_det_loss import cake_backend  # noqa: E402
 from flashinfer.testing import bench_gpu_time  # noqa: E402
 from tests.test_helpers.cake_lm_head_loss_reference import (  # noqa: E402
     DEFAULT_H,

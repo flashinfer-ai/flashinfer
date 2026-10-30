@@ -15,9 +15,9 @@ limitations under the License.
 
 Tests of the flashinfer public surface of the Cake packed width-4 depthwise
 causal convolution + SiLU training kernels (SM100 / SM103 / SM107): the
-``flashinfer.cake_causal_conv1d_train`` facade and its re-export from the
+``flashinfer.cake_causal_conv1d_det_train`` facade and its re-export from the
 ``flashinfer`` top-level package.  The facade's three entry points are
-pass-throughs to ``flashinfer.cake_causal_conv1d_train_backend``; this module
+pass-throughs to ``flashinfer.cake_causal_conv1d_det_train_backend``; this module
 checks that identity (same objects at the top level, the backend's exact
 signatures, same bits as the backend) and leaves the numerical contract to
 ``test_cake_causal_conv1d_train.py``, which imports only the backend package.
@@ -31,9 +31,9 @@ import pytest
 import torch
 
 import flashinfer
-import flashinfer.cake_causal_conv1d_train
-import flashinfer.cake_causal_conv1d_train_backend as backend
-from flashinfer.cake_causal_conv1d_train import (
+import flashinfer.cake_causal_conv1d_det_train
+import flashinfer.cake_causal_conv1d_det_train_backend as backend
+from flashinfer.cake_causal_conv1d_det_train import (
     CakeCausalConv1dFunction,
     cake_causal_conv1d,
     cake_causal_conv1d_train_backward,
@@ -43,7 +43,7 @@ from flashinfer.cake_causal_conv1d_train import (
     cake_causal_conv1d_train_forward_workspace_bytes,
     is_cake_causal_conv1d_train_supported,
 )
-from flashinfer.cake_causal_conv1d_train_backend import cake_jit as loader
+from flashinfer.cake_causal_conv1d_det_train_backend import cake_jit as loader
 from flashinfer.jit.env import has_flashinfer_jit_cache
 from flashinfer.utils import get_compute_capability
 
@@ -65,7 +65,7 @@ def _supported() -> bool:
 
 pytestmark = pytest.mark.skipif(
     not _supported(),
-    reason="cake_causal_conv1d_train needs an SM100 / SM103 / SM107 device with exported routes",
+    reason="cake_causal_conv1d_det_train needs an SM100 / SM103 / SM107 device with exported routes",
 )
 
 
@@ -111,7 +111,9 @@ def test_facade_signatures_mirror_the_backend() -> None:
         "cake_causal_conv1d_train_backward",
         "cake_causal_conv1d",
     ):
-        facade = inspect.signature(getattr(flashinfer.cake_causal_conv1d_train, name))
+        facade = inspect.signature(
+            getattr(flashinfer.cake_causal_conv1d_det_train, name)
+        )
         backend_signature = inspect.signature(getattr(backend, name))
         assert facade == backend_signature, (name, facade, backend_signature)
     backward = inspect.signature(cake_causal_conv1d_train_backward).parameters

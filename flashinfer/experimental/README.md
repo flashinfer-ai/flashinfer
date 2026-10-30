@@ -363,3 +363,5 @@ To graduate a feature to stable:
 Removal instead of graduation: delete the backend directory, the tagged API,
 and the tests; note the removal in the tracking issue. No deprecation cycle
 is required.
+
+CAKE training backend names follow the [determinism and KCP naming policy](../../docs/training_backend_names.md).

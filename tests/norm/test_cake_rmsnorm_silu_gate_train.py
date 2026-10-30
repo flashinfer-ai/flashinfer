@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 Tests of the Cake SiLU-gated RMSNorm training forward / backward
-(:mod:`flashinfer.cake_rmsnorm_silu_gate_train`): ``RMSNorm(x) * w * SiLU(z)``
+(:mod:`flashinfer.cake_rmsnorm_silu_gate_det_train`): ``RMSNorm(x) * w * SiLU(z)``
 against the eager FP32 operation (one final BF16 cast) and an independent
 FP64 reference, over dynamic token and head counts, irregular tails, strided
 layouts, near-zero variance, saturated gates, gradient accumulation,
@@ -23,7 +23,7 @@ gradient.
 
 This suite exercises the backend package alone: it names the package once,
 through ``tests.test_helpers.cake_package``, and imports nothing else from
-flashinfer.  The ``flashinfer.cake_rmsnorm_silu_gate_train`` facade and the
+flashinfer.  The ``flashinfer.cake_rmsnorm_silu_gate_det_train`` facade and the
 ``flashinfer`` top-level exposure are covered by
 ``test_cake_rmsnorm_silu_gate_train_api.py``.
 """
@@ -36,9 +36,9 @@ import torch.utils.checkpoint
 
 from tests.test_helpers.cake_package import cake_package
 
-pkg = cake_package("cake_rmsnorm_silu_gate_train")
-cake_build = cake_package("cake_rmsnorm_silu_gate_train", "cake_build")
-loader = cake_package("cake_rmsnorm_silu_gate_train", "cake_jit")
+pkg = cake_package("cake_rmsnorm_silu_gate_det_train")
+cake_build = cake_package("cake_rmsnorm_silu_gate_det_train", "cake_build")
+loader = cake_package("cake_rmsnorm_silu_gate_det_train", "cake_jit")
 cake_rmsnorm_silu_gate = pkg.cake_rmsnorm_silu_gate
 cake_rmsnorm_silu_gate_train_backward = pkg.cake_rmsnorm_silu_gate_train_backward
 cake_rmsnorm_silu_gate_train_backward_workspace = (
@@ -391,7 +391,7 @@ def test_registry_records_reference_the_build_manifest():
     package's kernel and binding sources and the precise-arithmetic flags."""
     manifest = cake_build.manifest()
     assert manifest["schema"] == "cake-build/1"
-    assert manifest["package"] == "flashinfer.cake_rmsnorm_silu_gate_train_backend"
+    assert manifest["package"] == "flashinfer.cake_rmsnorm_silu_gate_det_train_backend"
     libraries = cake_build.libraries_by_name()
     package = Path(cake_build.__file__).parent
     for arch in loader.ARCHES:

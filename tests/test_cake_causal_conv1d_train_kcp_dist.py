@@ -203,9 +203,9 @@ def _run_rank(
 ) -> dict:
     from torch.utils.checkpoint import checkpoint
 
-    from flashinfer import cake_causal_conv1d_train as conv
-    from flashinfer.cake_causal_conv1d_train_backend import kcp as conv_kcp
-    from flashinfer.experimental.cake_kda_train import cake_kcp_plan as plan
+    from flashinfer import cake_causal_conv1d_det_train as conv
+    from flashinfer.cake_causal_conv1d_det_train_backend import kcp as conv_kcp
+    from flashinfer.experimental.cake_kda_det_train import cake_kcp_plan as plan
 
     lengths, _w, layout, C = row
     device = torch.device("cuda", local_id % max(torch.cuda.device_count(), 1))
@@ -423,7 +423,7 @@ def _free_port() -> int:
 def _supported() -> bool:
     if not torch.cuda.is_available():
         return False
-    from flashinfer.cake_causal_conv1d_train import (
+    from flashinfer.cake_causal_conv1d_det_train import (
         is_cake_causal_conv1d_train_supported,
     )
 
@@ -451,7 +451,7 @@ def test_recompute_handle_rows(row) -> None:
         assert report["pass"], report
         return
     if not _supported():
-        pytest.skip("cake_causal_conv1d_train needs a supported CUDA device")
+        pytest.skip("cake_causal_conv1d_det_train needs a supported CUDA device")
     if torch.cuda.device_count() < W:
         pytest.skip(f"{W} CUDA devices required, {torch.cuda.device_count()} visible")
     with tempfile.TemporaryDirectory(prefix="cake_conv_kcp_dist_") as tmp:

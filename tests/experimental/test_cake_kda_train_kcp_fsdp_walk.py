@@ -35,7 +35,7 @@ from torch import nn
 
 from tests.test_helpers.cake_package import cake_package
 
-kcp_plan = cake_package("cake_kda_train", "cake_kcp_plan")
+kcp_plan = cake_package("cake_kda_det_train", "cake_kcp_plan")
 
 try:
     from torch.distributed.fsdp import _common_utils as fsdp_common

@@ -13,7 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
-Tests of the Cake mHC training head (``flashinfer.cake_mhc_train``): the stream
+Tests of the Cake mHC training head (``flashinfer.cake_mhc_det_train``): the stream
 mean ``Y = X.mean(dim=1)`` of BF16 ``X`` ``[T, 4, H]`` and its gradient, bit
 for bit against torch (signed zeros and NaN encodings included) at hidden
 4096, 5120 and 7168, through the forward / backward entry points, the
@@ -28,7 +28,7 @@ import torch
 import torch.utils.checkpoint
 
 import flashinfer
-from flashinfer import cake_mhc_train as facade
+from flashinfer import cake_mhc_det_train as facade
 from flashinfer.utils import get_compute_capability
 
 SUPPORTED_CAPABILITIES = ((10, 0), (10, 3), (10, 7))

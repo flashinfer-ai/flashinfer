@@ -47,12 +47,12 @@ from tests.test_helpers.cake_package import cake_package
 # build that vendors the package under another import path runs this file unchanged after pointing the ``PACKAGES``
 # entry at it).  The tests of the public entry points ``flashinfer.chunked_lm_head`` -- their experimental marking and
 # the FLASHINFER_CAKE_LM_HEAD_LOSS_* environment variables they read -- live in ``test_cake_lm_head_loss_api.py``.
-pkg = cake_package("cake_lm_head_loss")
-cake_backend = cake_package("cake_lm_head_loss", "cake_backend")
+pkg = cake_package("cake_lm_head_det_loss")
+cake_backend = cake_package("cake_lm_head_det_loss", "cake_backend")
 # The opt-in forms (``memory_mode`` / ``num_valid_rows``); a call with neither keyword is ``cake_backend``'s.
-opt_in = cake_package("cake_lm_head_loss", "cake_backend_opt_in")
-cake_build = cake_package("cake_lm_head_loss", "cake_build")
-cake_jit = cake_package("cake_lm_head_loss", "cake_jit")
+opt_in = cake_package("cake_lm_head_det_loss", "cake_backend_opt_in")
+cake_build = cake_package("cake_lm_head_det_loss", "cake_build")
+cake_jit = cake_package("cake_lm_head_det_loss", "cake_jit")
 ABI_CONTRACT = cake_backend.ABI_CONTRACT
 COMMON_SCALARS = cake_backend.COMMON_SCALARS
 COMMON_TENSORS = cake_backend.COMMON_TENSORS
@@ -278,7 +278,7 @@ def _same(a, b) -> bool:
 
 
 _KERNEL_SOURCE_RE = re.compile(
-    r"^csrc/cake_lm_head_loss/cake_lm_head_loss_([0-9a-f]{20})_kernel\.cu$"
+    r"^csrc/cake_lm_head_det_loss/cake_lm_head_loss_([0-9a-f]{20})_kernel\.cu$"
 )
 _PROGRAM_KERNEL_DEFINITION_RE = re.compile(
     r"^-DCAKE_PROGRAM_KERNEL=(kernel_cake_lm_head_loss_[0-9a-f]{20})$"
@@ -394,7 +394,7 @@ def test_registry_records_are_well_formed():
             assert len(entry["closure_sha256"]) == 64
             assert len(entry["sources"]) == 2
             assert all(
-                s.startswith("csrc/cake_lm_head_loss/") for s in entry["sources"]
+                s.startswith("csrc/cake_lm_head_det_loss/") for s in entry["sources"]
             )
             assert set(entry["sha256"]) == set(entry["sources"])
             kinds = {kind for kind, _ in physical["arg_plan"]}
@@ -417,11 +417,13 @@ def test_registry_records_are_well_formed():
             # kernel through CAKE_PROGRAM_KERNEL in its compile definitions
             kernel_unit, defined = _kernel_source_symbol(entry, package)
             assert (
-                kernel == f"cake_lm_head_loss/cake_lm_head_loss_{kernel_unit}_kernel.cu"
+                kernel
+                == f"cake_lm_head_det_loss/cake_lm_head_loss_{kernel_unit}_kernel.cu"
             )
             assert kernel_unit == unit or defined == f"kernel_cake_lm_head_loss_{unit}"
             assert re.fullmatch(
-                r"cake_lm_head_loss/cake_lm_head_loss_[0-9a-f]{20}_binding\.cu", binding
+                r"cake_lm_head_det_loss/cake_lm_head_loss_[0-9a-f]{20}_binding\.cu",
+                binding,
             )
             csrc = package / "csrc"
             assert (csrc / kernel).is_file() and (csrc / binding).is_file()
@@ -465,9 +467,10 @@ def test_registry_records_are_well_formed():
         for stage in record["stages"]
     }
     if cake_jit.MODULES:
-        unit_dir = package / "csrc" / "cake_lm_head_loss"
+        unit_dir = package / "csrc" / "cake_lm_head_det_loss"
         assert sorted(
-            f"csrc/cake_lm_head_loss/{p.name}" for p in unit_dir.glob("*_binding.cu")
+            f"csrc/cake_lm_head_det_loss/{p.name}"
+            for p in unit_dir.glob("*_binding.cu")
         ) == sorted(used)
 
 
@@ -6968,7 +6971,7 @@ import sys, torch
 sys.path.insert(0, {root!r})
 from tests.test_helpers.cake_lm_head_loss_reference import make_inputs
 from tests.test_helpers.cake_package import cake_package
-cake_backend = cake_package("cake_lm_head_loss", "cake_backend")
+cake_backend = cake_package("cake_lm_head_det_loss", "cake_backend")
 W = make_inputs(1, seed={seed_w}, device="cuda", ignore_frac=0.0).W  # the module fixture's weight
 inp = make_inputs({T}, seed={seed}, device="cuda", W=W, ignore_frac=0.05)
 X = inp.X.detach().requires_grad_(True)
@@ -8680,7 +8683,7 @@ _WRONG_COUNT_SCRIPT = """
 import sys, torch
 sys.path.insert(0, {root!r})
 from tests.test_helpers.cake_package import cake_package
-opt_in = cake_package("cake_lm_head_loss", "cake_backend_opt_in")
+opt_in = cake_package("cake_lm_head_det_loss", "cake_backend_opt_in")
 labels = torch.tensor([0, -100, 3, 1, -100, 2], device="cuda")
 index, _ = opt_in.given_valid_rows(labels, 4)
 torch.cuda.synchronize()

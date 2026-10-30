@@ -18,7 +18,7 @@ Packed KDA (Kimi Delta Attention) chunked training forward and backward
 
 Thin experimental entry points.  The contract, the host plan, the workspace,
 the launch sequences, the autograd Function and the generated kernels live in
-``flashinfer.experimental.cake_kda_train``; this module validates nothing
+``flashinfer.experimental.cake_kda_det_train``; this module validates nothing
 itself and forwards every keyword.  Every switch is a keyword argument; no
 environment variable is read.
 
@@ -135,7 +135,7 @@ def chunk_kda_fwd(
     -------
     ``(out, saved)``: ``out`` BF16 like ``v``; ``saved`` a ``KdaChunkSaved`` (versioned) or ``None``.
     """
-    from .experimental.cake_kda_train import cake_backend
+    from .experimental.cake_kda_det_train import cake_backend
 
     return cake_backend.chunk_kda_fwd(
         q,
@@ -197,7 +197,7 @@ def chunk_kda_bwd(
     ``(dq, dk, dv, dbeta, dg)``: BF16 gradients of ``q, k, v, beta`` and the FP32 gradient of ``g``, ranked
     like the inputs.  Bitwise reproducible for the same inputs.
     """
-    from .experimental.cake_kda_train import cake_backend
+    from .experimental.cake_kda_det_train import cake_backend
 
     return cake_backend.chunk_kda_bwd(
         q,
@@ -236,7 +236,7 @@ def chunk_kda(
     operands, ``save_mode``, ``arena`` and ``doc_lengths`` (the node records the option and the document lengths,
     so a backward that allocates its own workspace takes them too) and :func:`chunk_kda_bwd` for the gradients.
     """
-    from .experimental.cake_kda_train import cake_backend
+    from .experimental.cake_kda_det_train import cake_backend
 
     return cake_backend.chunk_kda(
         q,
@@ -272,7 +272,7 @@ def kda_train_arena(
     arena); the calls then take ``doc_lengths``.  Bitwise the same results, except that an exactly-zero
     ``u`` / ``w`` entry of a chunk whose pair partner changed may change sign; refused on the rows with at most four
     (document, head) chains on the segmented route."""
-    from .experimental.cake_kda_train import cake_backend
+    from .experimental.cake_kda_det_train import cake_backend
 
     return cake_backend.KdaArena(
         lean=lean,
@@ -299,7 +299,7 @@ def kda_train_workspace(
     ``arena`` (:func:`kda_train_arena`) is the lower-memory arena option, off when ``None``; under a batched
     option ``doc_lengths`` (the documents' token counts) sizes the arena for the exact document groups instead of
     the bound of every group."""
-    from .experimental.cake_kda_train import cake_backend
+    from .experimental.cake_kda_det_train import cake_backend
 
     return cake_backend.KdaWorkspace.for_problem(
         S,
@@ -328,7 +328,7 @@ def kda_train_workspace_bytes(
     current CUDA device's when ``None``; it sets the segment count of the segmented recurrences; ``arena``: the
     lower-memory arena option, off when ``None``; ``doc_lengths``: the exact document groups of a batched option,
     else their bound)."""
-    from .experimental.cake_kda_train import cake_backend
+    from .experimental.cake_kda_det_train import cake_backend
 
     return cake_backend.workspace_bytes(
         S,
@@ -354,7 +354,7 @@ def kda_train_saved_bytes(
     tables and the version's per-call tensors: the forward's gated queries ``qg`` (and, on the rows whose backward
     reads it from the set, the WY representation ``w`` / ``u``) and the segment-boundary states under the size rule
     with ``save_mode="light"``; the state tape, ``v_new`` and the segment transfers with ``save_mode="tape"``."""
-    from .experimental.cake_kda_train import cake_backend
+    from .experimental.cake_kda_det_train import cake_backend
 
     return cake_backend.saved_bytes(
         S, H, num_docs, save_mode=save_mode, sm_count=sm_count
@@ -363,7 +363,7 @@ def kda_train_saved_bytes(
 
 # --------------------------------------------------------------------------- context-parallel training (KCP)
 #
-# The KCP entry points forward to ``flashinfer.experimental.cake_kda_train.cake_kcp`` (the per-rank launch
+# The KCP entry points forward to ``flashinfer.experimental.cake_kda_det_train.cake_kcp`` (the per-rank launch
 # sequences over the kernels of the ``cake_kcp_jit`` registry) and ``cake_kcp_plan`` (the partition, the context's
 # tables and collectives, the byte queries).  Every keyword is forwarded; nothing is validated here.
 
@@ -395,7 +395,7 @@ def kcp_partition(
     ``KcpPartition``: per rank its fragments (document, token range) of the batch; the input of
     :func:`build_kcp_context` on every rank.
     """
-    from .experimental.cake_kda_train import cake_kcp_plan
+    from .experimental.cake_kda_det_train_kcp import cake_kcp_plan
 
     return cake_kcp_plan.kcp_partition(
         cu_seqlens_global_cpu, world_size, layout, fragments, cut_points=cut_points
@@ -443,7 +443,7 @@ def build_kcp_context(
     -------
     ``KcpContext``: the argument every KCP entry point takes; reusable across calls of the same batch layout.
     """
-    from .experimental.cake_kda_train import cake_kcp_plan
+    from .experimental.cake_kda_det_train_kcp import cake_kcp_plan
 
     return cake_kcp_plan.build_kcp_context(
         part,
@@ -503,7 +503,7 @@ def chunk_kda_kcp_fwd(
     -------
     ``(out, saved)``: ``out`` BF16 like ``v`` (this rank's tokens); ``saved`` a ``KcpSaved`` or ``None``.
     """
-    from .experimental.cake_kda_train import cake_kcp
+    from .experimental.cake_kda_det_train_kcp import cake_kcp
 
     return cake_kcp.chunk_kda_kcp_fwd(
         q,
@@ -556,7 +556,7 @@ def chunk_kda_kcp_bwd(
     -------
     ``(dq, dk, dv, dbeta, dg)`` of this rank's tokens: BF16 ``dq, dk, dv, dbeta``, FP32 ``dg``.
     """
-    from .experimental.cake_kda_train import cake_kcp
+    from .experimental.cake_kda_det_train_kcp import cake_kcp
 
     return cake_kcp.chunk_kda_kcp_bwd(
         q,
@@ -621,7 +621,7 @@ def chunk_kda_kcp(
     torch.Tensor
         BF16 ``out`` like ``v`` (this rank's tokens).
     """
-    from .experimental.cake_kda_train import cake_kcp
+    from .experimental.cake_kda_det_train_kcp import cake_kcp
 
     return cake_kcp.chunk_kda_kcp(
         q,
@@ -664,7 +664,7 @@ def kcp_workspace_bytes(
     Under ``exchange="ring"`` it never holds the c1 receive pool.  ``ctx`` may be a list of contexts: the bytes of
     one workspace that serves all of them (``KcpWorkspace.reserve(ctxs, H)``): each pool at its largest need and
     the largest local arena, not their sum."""
-    from .experimental.cake_kda_train import cake_kcp_plan
+    from .experimental.cake_kda_det_train_kcp import cake_kcp_plan
 
     if save_transfer is None:
         save_transfer = cake_kcp_plan.SAVE_TRANSFER_DEFAULT
@@ -694,7 +694,7 @@ def kcp_saved_bytes(
     (``"states"`` | ``"transfer"``): instead the bytes a recompute handle of that tier retains for the layer
     (:func:`chunk_kda_kcp`; plus one convolution's history rows with ``with_conv``).  ``save_transfer``: ``None``
     is ``False`` without a tier; with one, an explicit value that contradicts it raises ``ValueError``."""
-    from .experimental.cake_kda_train import cake_kcp_plan
+    from .experimental.cake_kda_det_train_kcp import cake_kcp_plan
 
     if save_transfer is None and checkpoint_keep is None:
         save_transfer = False
@@ -724,7 +724,7 @@ def kcp_comm_bytes(
     as a table per collective and per boundary (``cake_kcp_plan.kcp_comm_bytes``).  ``checkpoint_keep``: the
     traffic of a checkpointed step with a recompute handle of that tier (the tier fixes ``save_transfer``; ``None``
     is ``False`` without a tier; an explicit value that contradicts the tier raises ``ValueError``)."""
-    from .experimental.cake_kda_train import cake_kcp_plan
+    from .experimental.cake_kda_det_train_kcp import cake_kcp_plan
 
     if save_transfer is None and checkpoint_keep is None:
         save_transfer = False
@@ -741,7 +741,7 @@ def kcp_comm_bytes(
 def is_kda_train_supported(device: torch.device | str | int | None = None) -> bool:
     """Whether ``device`` (the current CUDA device by default) is a target of the Cake kernels
     (compute capability 10.0, 10.3 or 10.7)."""
-    from .experimental.cake_kda_train import cake_backend
+    from .experimental.cake_kda_det_train import cake_backend
 
     return cake_backend.is_supported(device)
 
@@ -750,7 +750,9 @@ def __getattr__(name: str) -> Any:
     # ``KcpRecomputeHandle`` (the KCP route's checkpoint recompute handle) resolves on first access, so importing this
     # module does not import the KCP host module (torch.distributed, the KCP loader), like the entry points above.
     if name == "KcpRecomputeHandle":
-        from .experimental.cake_kda_train.cake_kcp import KcpRecomputeHandle
+        from .experimental.cake_kda_det_train_kcp import cake_kcp
+
+        KcpRecomputeHandle = cake_kcp.KcpRecomputeHandle
 
         return KcpRecomputeHandle
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

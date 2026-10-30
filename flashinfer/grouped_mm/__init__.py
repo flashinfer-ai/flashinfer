@@ -9,7 +9,7 @@ backend has its own subpackage (e.g. :mod:`.cudnn`); future backends
 should follow the same convention.  The experimental Cake entry points
 (``grouped_gemm_fwd``, ``grouped_gemm_dgrad``, ``grouped_gemm_wgrad``,
 ``cake_grouped_mm``) live in :mod:`.cake` and hand off to
-:mod:`flashinfer.experimental.cake_moe_grouped_gemm`.
+:mod:`flashinfer.experimental.cake_moe_grouped_det_gemm`.
 """
 
 from .cake import cake_grouped_mm as cake_grouped_mm

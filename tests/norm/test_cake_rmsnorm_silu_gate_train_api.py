@@ -14,10 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 Tests of the flashinfer public surface of the Cake SiLU-gated RMSNorm training
-kernels (SM100 / SM103 / SM107): the ``flashinfer.cake_rmsnorm_silu_gate_train``
+kernels (SM100 / SM103 / SM107): the ``flashinfer.cake_rmsnorm_silu_gate_det_train``
 facade and its re-export from the ``flashinfer`` top-level package.  The
 facade's entry points are pass-throughs to
-``flashinfer.cake_rmsnorm_silu_gate_train_backend``; this module checks that
+``flashinfer.cake_rmsnorm_silu_gate_det_train_backend``; this module checks that
 identity (same objects at the top level, same bits as the backend) and leaves
 the numerical contract to ``test_cake_rmsnorm_silu_gate_train.py``.
 """
@@ -28,8 +28,8 @@ import pytest
 import torch
 
 import flashinfer
-import flashinfer.cake_rmsnorm_silu_gate_train_backend as backend
-from flashinfer.cake_rmsnorm_silu_gate_train import (
+import flashinfer.cake_rmsnorm_silu_gate_det_train_backend as backend
+from flashinfer.cake_rmsnorm_silu_gate_det_train import (
     CakeRMSNormSiLUGateFunction,
     cake_rmsnorm_silu_gate,
     cake_rmsnorm_silu_gate_train_backward,

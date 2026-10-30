@@ -10,7 +10,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
-Multi-GPU rows of the context-parallel (KCP) KDA training route (``cake_kda_train.cake_kcp``): ``W`` ranks over
+Multi-GPU rows of the context-parallel (KCP) KDA training route (``cake_kda_det_train.cake_kcp``): ``W`` ranks over
 NCCL, each holding the fragments of one partition of a packed batch, compared with the exact FP64 per-document
 recurrence of the same operands (``tests/test_helpers/cake_kda_train_reference``) and with one another (saved ==
 replay, repeat, autograd == explicit, checkpoint == direct, document-alone == slice, graph replay == eager with
@@ -49,10 +49,10 @@ from tests.test_helpers.cake_kda_train_reference import (
 )
 from tests.test_helpers.cake_package import cake_package
 
-cake_kcp = cake_package("cake_kda_train", "cake_kcp")
-cake_kcp_plan = cake_package("cake_kda_train", "cake_kcp_plan")
-cake_jit = cake_package("cake_kda_train", "cake_jit")
-cake_kcp_jit = cake_package("cake_kda_train", "cake_kcp_jit")
+cake_kcp = cake_package("cake_kda_det_train", "cake_kcp")
+cake_kcp_plan = cake_package("cake_kda_det_train", "cake_kcp_plan")
+cake_jit = cake_package("cake_kda_det_train", "cake_jit")
+cake_kcp_jit = cake_package("cake_kda_det_train", "cake_kcp_jit")
 
 PACKAGE_DIR = Path(cake_jit.__file__).resolve().parent
 TENSORS = ("out",) + GRAD_NAMES
@@ -545,7 +545,7 @@ def _run_upload_rank(rank: int, W: int, row, port: int, result_dir: str | None) 
     pack prepared behind queued work (``heads=H``) issues one pinned copy, does not wait and runs bitwise; a pack
     prepared from another thread on a held-back side stream does the same; repeated ``exchange="ring"`` calls record
     no further upload on the context (ring rows); the plan's ``P`` of each rank is reported."""
-    from flashinfer.cake_causal_conv1d_train_backend import kcp as conv
+    from flashinfer.cake_causal_conv1d_det_train_backend import kcp as conv
     from tests.test_helpers.cake_host_sync import (
         census,
         counts_agree,
@@ -1117,7 +1117,7 @@ def _run_rank_ckpt(
 
     from torch.utils.checkpoint import checkpoint, set_checkpoint_early_stop
 
-    conv_kcp = cake_package("cake_causal_conv1d_train", "kcp")
+    conv_kcp = cake_package("cake_causal_conv1d_det_train", "kcp")
     lengths, H, _w, layout = row
     device = torch.device("cuda", local_id % max(torch.cuda.device_count(), 1))
     torch.cuda.set_device(device)

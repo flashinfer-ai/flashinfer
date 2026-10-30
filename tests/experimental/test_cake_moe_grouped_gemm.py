@@ -25,9 +25,9 @@ from tests.test_helpers.cake_package import cake_package
 # of flashinfer is imported here.  The tests of the stable flashinfer entry point
 # ``flashinfer.grouped_mm.grouped_mm_bf16(..., backend="cake")`` live in
 # ``test_cake_moe_grouped_gemm_api.py``.
-pkg = cake_package("cake_moe_grouped_gemm")
-cb = cake_package("cake_moe_grouped_gemm", "cake_backend")
-cake_jit = cake_package("cake_moe_grouped_gemm", "cake_jit")
+pkg = cake_package("cake_moe_grouped_det_gemm")
+cb = cake_package("cake_moe_grouped_det_gemm", "cake_backend")
+cake_jit = cake_package("cake_moe_grouped_det_gemm", "cake_jit")
 grouped_gemm_dgrad = pkg.grouped_gemm_dgrad
 grouped_gemm_fwd = pkg.grouped_gemm_fwd
 grouped_gemm_wgrad = pkg.grouped_gemm_wgrad

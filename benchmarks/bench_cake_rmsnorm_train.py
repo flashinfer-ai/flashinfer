@@ -43,13 +43,13 @@ from typing import Callable, Optional
 import torch
 
 import flashinfer
-from flashinfer.cake_rmsnorm_train import (
+from flashinfer.cake_rmsnorm_det_train import (
     cake_rmsnorm_train_backward,
     cake_rmsnorm_train_backward_workspace,
     cake_rmsnorm_train_forward,
     is_cake_rmsnorm_train_supported,
 )
-from flashinfer.cake_rmsnorm_train_backend import cake_jit as loader
+from flashinfer.cake_rmsnorm_det_train_backend import cake_jit as loader
 from flashinfer.testing import bench_gpu_time
 
 WIDTHS = ((6144, 1e-5), (4096, 1e-5), (2048, 1e-6), (1536, 1e-6), (512, 1e-6))
@@ -417,7 +417,7 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     device = torch.device("cuda", torch.cuda.current_device())
     if not is_cake_rmsnorm_train_supported(device):
-        raise SystemExit("cake_rmsnorm_train has no exported route on this device")
+        raise SystemExit("cake_rmsnorm_det_train has no exported route on this device")
     comparators = []
     for comparator in COMPARATORS:
         if comparator.name in args.skip:

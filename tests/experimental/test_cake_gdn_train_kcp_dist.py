@@ -1955,7 +1955,7 @@ def _run_rank_conv(
     """C7 on one rank: ``y`` / ``dx`` / ``dweight`` of the rank's tokens against the FP64 oracle of the whole pack,
     ``y`` bitwise equal to the single-rank conv of the whole pack on the rank's tokens, repeat bitwise, and the
     halo-row gradients delivered to the predecessor ranks (rank 0 / 1: 1 / 2 tokens of document 0)."""
-    from flashinfer import cake_causal_conv1d_train as conv
+    from flashinfer import cake_causal_conv1d_det_train as conv
 
     part, cu = _partition(row)
     ctx = plan.build_kcp_context(part, group, rank, device)
@@ -2049,7 +2049,7 @@ def test_conv_halo_row(slurm) -> None:
     an empty predecessor and a document start.  Runs under Slurm with >= 4 ranks."""
     if slurm is None:
         pytest.skip("the conv halo row runs under Slurm (4 ranks)")
-    conv = pytest.importorskip("flashinfer.cake_causal_conv1d_train")
+    conv = pytest.importorskip("flashinfer.cake_causal_conv1d_det_train")
     if not conv.is_cake_causal_conv1d_train_supported(slurm.device):
         pytest.skip("the conv package does not support this device")
     _slurm_row(C7_ROW, slurm, "conv", _run_rank_conv)
@@ -2102,7 +2102,7 @@ def _run_rank_layer(
 ) -> dict:
     import inspect
 
-    from flashinfer import cake_causal_conv1d_train as conv
+    from flashinfer import cake_causal_conv1d_det_train as conv
 
     H_qk, HV = row.heads
     C = (2 * H_qk + HV) * 128
@@ -2252,7 +2252,7 @@ def test_layer_checkpoint_rows(row: Row, slurm) -> None:
     recompute handle (see the block comment above).  Runs under Slurm with >= the row's ranks."""
     if slurm is None:
         pytest.skip("the layer rows run under Slurm")
-    conv = pytest.importorskip("flashinfer.cake_causal_conv1d_train")
+    conv = pytest.importorskip("flashinfer.cake_causal_conv1d_det_train")
     if not conv.is_cake_causal_conv1d_train_supported(slurm.device):
         pytest.skip("the conv package does not support this device")
     _slurm_row(row, slurm, _backend_name(), _run_rank_layer)

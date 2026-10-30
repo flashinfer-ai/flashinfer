@@ -38,10 +38,10 @@ from tests.test_helpers.cake_package import cake_package
 # flashinfer: a build that vendors the package under another import path runs it unchanged after pointing the
 # ``PACKAGES`` entry at its own package.  The public entry points of ``flashinfer.kda_train`` are covered by
 # ``test_cake_kda_train_api.py``.
-cake_backend = cake_package("cake_kda_train", "cake_backend")
-cake_build = cake_package("cake_kda_train", "cake_build")
-cake_jit = cake_package("cake_kda_train", "cake_jit")
-cake_kcp_jit = cake_package("cake_kda_train", "cake_kcp_jit")
+cake_backend = cake_package("cake_kda_det_train", "cake_backend")
+cake_build = cake_package("cake_kda_det_train", "cake_build")
+cake_jit = cake_package("cake_kda_det_train", "cake_jit")
+cake_kcp_jit = cake_package("cake_kda_det_train", "cake_kcp_jit")
 PACKAGE_DIR = Path(cake_jit.__file__).resolve().parent
 
 ARCHES = tuple(cake_jit.ARCHES)
@@ -3090,7 +3090,7 @@ def test_tail_stages_bind_only_range_safe_operands() -> None:
 
 def test_manifest_is_well_formed(manifest: dict) -> None:
     assert manifest["schema"] == "cake-build/1"
-    assert manifest["package"] == "flashinfer.experimental.cake_kda_train"
+    assert manifest["package"] == "flashinfer.experimental.cake_kda_det_train"
     arch_flags = manifest["arch_flags"]
     assert set(ARCHES) <= set(arch_flags)
     libraries = manifest["libraries"]

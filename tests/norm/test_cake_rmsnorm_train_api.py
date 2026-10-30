@@ -14,10 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 Tests of the flashinfer public surface of the Cake fused BF16 RMSNorm
-training kernels (SM100 / SM103 / SM107): the ``flashinfer.cake_rmsnorm_train``
+training kernels (SM100 / SM103 / SM107): the ``flashinfer.cake_rmsnorm_det_train``
 facade and its re-export from the ``flashinfer`` top-level package.  The
 facade's three entry points are pass-throughs to
-``flashinfer.cake_rmsnorm_train_backend``; this module checks that identity
+``flashinfer.cake_rmsnorm_det_train_backend``; this module checks that identity
 (same objects at the top level, same bits as the backend) and leaves the
 numerical contract to ``test_cake_rmsnorm_train.py``, which imports only the
 backend package.
@@ -29,8 +29,8 @@ import pytest
 import torch
 
 import flashinfer
-import flashinfer.cake_rmsnorm_train_backend as backend
-from flashinfer.cake_rmsnorm_train import (
+import flashinfer.cake_rmsnorm_det_train_backend as backend
+from flashinfer.cake_rmsnorm_det_train import (
     CakeRMSNormFunction,
     cake_rmsnorm,
     cake_rmsnorm_train_backward,
@@ -38,7 +38,7 @@ from flashinfer.cake_rmsnorm_train import (
     cake_rmsnorm_train_forward,
     is_cake_rmsnorm_train_supported,
 )
-from flashinfer.cake_rmsnorm_train_backend import cake_jit as loader
+from flashinfer.cake_rmsnorm_det_train_backend import cake_jit as loader
 from flashinfer.jit.env import has_flashinfer_jit_cache
 from flashinfer.utils import get_compute_capability
 
@@ -63,7 +63,7 @@ def _supported() -> bool:
 
 pytestmark = pytest.mark.skipif(
     not _supported(),
-    reason="cake_rmsnorm_train needs an SM100 / SM103 / SM107 device with exported routes",
+    reason="cake_rmsnorm_det_train needs an SM100 / SM103 / SM107 device with exported routes",
 )
 
 

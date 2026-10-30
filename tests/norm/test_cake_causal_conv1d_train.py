@@ -63,7 +63,7 @@ This suite exercises the backend package alone: it names the package once,
 through ``tests.test_helpers.cake_package``, and imports nothing else from
 flashinfer, so a build that vendors the package under another import path
 runs it unchanged after pointing that table entry at its package.  The
-``flashinfer.cake_causal_conv1d_train`` facade and the ``flashinfer``
+``flashinfer.cake_causal_conv1d_det_train`` facade and the ``flashinfer``
 top-level exposure are covered by ``test_cake_causal_conv1d_train_api.py``.
 """
 
@@ -80,10 +80,10 @@ import torch
 
 from tests.test_helpers.cake_package import cake_package
 
-pkg = cake_package("cake_causal_conv1d_train")
-cake_build = cake_package("cake_causal_conv1d_train", "cake_build")
-loader = cake_package("cake_causal_conv1d_train", "cake_jit")
-kcp_loader = cake_package("cake_causal_conv1d_train", "kcp_jit")
+pkg = cake_package("cake_causal_conv1d_det_train")
+cake_build = cake_package("cake_causal_conv1d_det_train", "cake_build")
+loader = cake_package("cake_causal_conv1d_det_train", "cake_jit")
+kcp_loader = cake_package("cake_causal_conv1d_det_train", "kcp_jit")
 cake_causal_conv1d = pkg.cake_causal_conv1d
 cake_causal_conv1d_train_backward = pkg.cake_causal_conv1d_train_backward
 cake_causal_conv1d_train_backward_workspace = (
@@ -251,7 +251,7 @@ def _supported() -> bool:
 
 pytestmark = pytest.mark.skipif(
     not _supported(),
-    reason="cake_causal_conv1d_train needs an SM100 / SM103 / SM107 device with exported routes",
+    reason="cake_causal_conv1d_det_train needs an SM100 / SM103 / SM107 device with exported routes",
 )
 
 
@@ -2396,7 +2396,7 @@ def test_registry_records_reference_the_build_manifest() -> None:
     assert manifest["schema"] == "cake-build/1"
     # The manifest names the package by its FlashInfer import path, also in a copy
     # vendored under another name (``pkg.__name__`` is then the copy's).
-    assert manifest["package"] == "flashinfer.cake_causal_conv1d_train_backend"
+    assert manifest["package"] == "flashinfer.cake_causal_conv1d_det_train_backend"
     libraries = cake_build.libraries_by_name()
     package = Path(cake_build.__file__).parent
     referenced = set()

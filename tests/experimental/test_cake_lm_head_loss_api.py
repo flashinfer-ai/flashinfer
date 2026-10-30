@@ -17,7 +17,7 @@ flashinfer public-API tests of the Cake chunked LM-head + loss package.
 
 The experimental entry points ``flashinfer.chunked_lm_head.chunked_lm_head_loss`` and
 ``chunked_lm_head_logprob`` are thin wrappers over
-``flashinfer.experimental.cake_lm_head_loss.cake_backend``: they carry the experimental
+``flashinfer.experimental.cake_lm_head_det_loss.cake_backend``: they carry the experimental
 marking, accept ``backend="cake"`` only and own FlashInfer's A/B environment variables
 ``FLASHINFER_CAKE_LM_HEAD_LOSS_*`` -- a switch keyword left at ``None`` falls back to its
 variable and the resolved value is passed down; the two binding-cache variables are
@@ -39,8 +39,8 @@ import torch
 import flashinfer.chunked_lm_head as public
 from flashinfer.api_logging import ExperimentalWarning
 from flashinfer.chunked_lm_head import chunked_lm_head_logprob, chunked_lm_head_loss
-from flashinfer.experimental.cake_lm_head_loss import cake_backend
-from flashinfer.experimental.cake_lm_head_loss.cake_backend import (
+from flashinfer.experimental.cake_lm_head_det_loss import cake_backend
+from flashinfer.experimental.cake_lm_head_det_loss.cake_backend import (
     SUPPORTED_COMPUTE_CAPABILITIES,
     BindingCache,
     forward_binding_key,

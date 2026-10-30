@@ -30,9 +30,9 @@ from tests.test_helpers.cake_package import cake_package
 
 # Backend suite: the package is named once, through ``cake_package``; nothing else
 # of flashinfer is imported here.
-cake_backend = cake_package("dense_projection_gemm", "cake_backend")
-cake_build = cake_package("dense_projection_gemm", "cake_build")
-cake_jit = cake_package("dense_projection_gemm", "cake_jit")
+cake_backend = cake_package("dense_projection_det_gemm", "cake_backend")
+cake_build = cake_package("dense_projection_det_gemm", "cake_build")
+cake_jit = cake_package("dense_projection_det_gemm", "cake_jit")
 ARCH_RULE_DEFAULTS = cake_backend.ARCH_RULE_DEFAULTS
 BLOCK_K = cake_backend.BLOCK_K
 BLOCK_N_CHOICES = cake_backend.BLOCK_N_CHOICES

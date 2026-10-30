@@ -36,7 +36,7 @@ every call.
 The backward beside a kernel resident on every SM (issue #7548, item 2): a
 backward main kernel needs a large shared-memory carveout, so a side kernel
 holding every SM with the default carveout delays its start until the side
-kernel exits (documented in :mod:`flashinfer.cake_rmsnorm_train`).  The
+kernel exits (documented in :mod:`flashinfer.cake_rmsnorm_det_train`).  The
 documented remedy is checked here: with the side kernel's preferred carveout
 set to the maximum shared memory, the backward and the forward start beside it
 and cost at most ``MAX_ALL_SM_EXTRA_MS`` more than alone, far below the side
@@ -55,8 +55,8 @@ import torch
 
 from tests.test_helpers.cake_package import cake_package
 
-pkg = cake_package("cake_rmsnorm_train")
-loader = cake_package("cake_rmsnorm_train", "cake_jit")
+pkg = cake_package("cake_rmsnorm_det_train")
+loader = cake_package("cake_rmsnorm_det_train", "cake_jit")
 cake_rmsnorm_train_backward = pkg.cake_rmsnorm_train_backward
 cake_rmsnorm_train_backward_workspace = pkg.cake_rmsnorm_train_backward_workspace
 cake_rmsnorm_train_forward = pkg.cake_rmsnorm_train_forward
@@ -103,7 +103,7 @@ def _supported() -> bool:
 
 pytestmark = pytest.mark.skipif(
     not _supported(),
-    reason="cake_rmsnorm_train needs an SM100 / SM103 / SM107 device with exported routes",
+    reason="cake_rmsnorm_det_train needs an SM100 / SM103 / SM107 device with exported routes",
 )
 
 
@@ -271,7 +271,7 @@ MAX_ALL_SM_EXTRA_MS = 1.0
 # cudaSharedmemCarveoutMaxShared
 CARVEOUT_MAX_SHARED = 100
 # Programs that need a whole SM wait beside a kernel resident on every SM
-# whatever its carveout (documented in :mod:`flashinfer.cake_rmsnorm_train`):
+# whatever its carveout (documented in :mod:`flashinfer.cake_rmsnorm_det_train`):
 # (capability, kind, hidden) -> the token counts above which the call does.
 WHOLE_SM_ABOVE = {
     ((10, 7), "bwd", 1536): 1024,

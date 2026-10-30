@@ -13,7 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
-Host synchronization of the KCP route (``cake_kda_train.cake_kcp`` / ``cake_kcp_plan``): pack preparation and the
+Host synchronization of the KCP route (``cake_kda_det_train.cake_kcp`` / ``cake_kcp_plan``): pack preparation and the
 KDA / conv halo calls never copy a table from pageable memory and never wait for queued device work, with or without
 a caller-owned workspace.  The signals of a window are those of ``tests/test_helpers/cake_host_sync.py``: an upload
 counter that needs no device tracing (equal to the profiler's host-to-device copies by kind where the profiler
@@ -42,10 +42,10 @@ from tests.test_helpers.cake_host_sync import (
 )
 from tests.test_helpers.cake_package import cake_package
 
-kp = cake_package("cake_kda_train", "cake_kcp_plan")
-cake_kcp = cake_package("cake_kda_train", "cake_kcp")
-cake_kcp_jit = cake_package("cake_kda_train", "cake_kcp_jit")
-cake_jit = cake_package("cake_kda_train", "cake_jit")
+kp = cake_package("cake_kda_det_train", "cake_kcp_plan")
+cake_kcp = cake_package("cake_kda_det_train", "cake_kcp")
+cake_kcp_jit = cake_package("cake_kda_det_train", "cake_kcp_jit")
+cake_jit = cake_package("cake_kda_det_train", "cake_jit")
 
 # the previous path (A/B, negative control)
 OLD = {"upload": "blocking", "table_cache": "workspace"}
@@ -450,7 +450,7 @@ def test_gpu_new_path_is_bitwise_the_previous_path(device, knobs, p_class) -> No
         assert len(a) == 18
         for i, (x, y) in enumerate(zip(a, b, strict=True)):
             assert torch.equal(x, y), (i, ws_new is None)
-    from flashinfer.cake_causal_conv1d_train_backend import kcp as conv
+    from flashinfer.cake_causal_conv1d_det_train_backend import kcp as conv
 
     gen = torch.Generator(device=device).manual_seed(7)
     x = torch.randn(new.T_r, C_CONV, device=device, generator=gen).to(torch.bfloat16)
@@ -534,7 +534,7 @@ def test_gpu_side_stream_preparation_is_ordered(device, form, hook) -> None:
     copy itself (``ctx.wait_ready()``, an event wait): the context's wait record for the compute stream is empty
     before the pack and set after it, and the results are bitwise those of a context prepared on an idle device.
     Without that ordering the kernels would read the blob before its copy."""
-    from flashinfer.cake_causal_conv1d_train_backend import kcp as conv
+    from flashinfer.cake_causal_conv1d_det_train_backend import kcp as conv
 
     H = 2
     part = kp.kcp_partition(list(CU), 1)
@@ -591,7 +591,7 @@ def test_gpu_conv_halo_orders_a_cached_context_on_every_stream(device) -> None:
     copy: the blob reuses a block of P's pool that holds zeros (a call reading the tables before the copy sees empty
     fragments and leaves its sentinel-filled output unwritten).  Both outputs are bitwise the reference, and the
     context's wait record names A and B (``wait_event`` plus ``record_stream`` of the blob on each)."""
-    from flashinfer.cake_causal_conv1d_train_backend import kcp as conv
+    from flashinfer.cake_causal_conv1d_det_train_backend import kcp as conv
 
     part = kp.kcp_partition(list(CU), 1)
     ref_ctx = kp.build_kcp_context(part, None, 0, device)
@@ -645,7 +645,7 @@ def test_gpu_fresh_context_with_conv_halo_releases_everything(device) -> None:
     ``workspace=None`` keeps nothing once the conv module's host cache is cleared: the context, its table sets and
     its blobs are freed by reference counting alone (the cycle collector disabled; the table set holds its context
     through a weak proxy) and ``memory_allocated`` returns to its level after the first step."""
-    from flashinfer.cake_causal_conv1d_train_backend import kcp as conv
+    from flashinfer.cake_causal_conv1d_det_train_backend import kcp as conv
 
     H = 2
     part = kp.kcp_partition(list(CU), 1)

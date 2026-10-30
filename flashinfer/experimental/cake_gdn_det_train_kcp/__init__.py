@@ -23,7 +23,7 @@ limitations under the License.
 # ``chunk_gdn_kcp_bwd`` and the byte queries; the partition / context plan, the
 # host orchestration, the options, the registry and the generated sources live
 # here.  This package imports itself, torch and torch.distributed only (never
-# ``cake_kda_train``) and reads no environment variable.
+# ``cake_kda_det_train``) and reads no environment variable.
 
 from .cake_kcp import (
     KCP_SAVED_VERSION,

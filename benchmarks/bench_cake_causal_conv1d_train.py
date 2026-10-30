@@ -69,14 +69,14 @@ from typing import Callable, Optional
 
 import torch
 
-from flashinfer.cake_causal_conv1d_train import (
+from flashinfer.cake_causal_conv1d_det_train import (
     cake_causal_conv1d_train_backward,
     cake_causal_conv1d_train_backward_workspace,
     cake_causal_conv1d_train_forward,
     cake_causal_conv1d_train_forward_workspace,
     is_cake_causal_conv1d_train_supported,
 )
-from flashinfer.cake_causal_conv1d_train_backend import cake_jit as loader
+from flashinfer.cake_causal_conv1d_det_train_backend import cake_jit as loader
 from flashinfer.testing import bench_gpu_time
 
 WIDTH = 4
@@ -562,7 +562,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     device = torch.device("cuda", torch.cuda.current_device())
     if not is_cake_causal_conv1d_train_supported(device):
         raise SystemExit(
-            "cake_causal_conv1d_train has no exported route on this device"
+            "cake_causal_conv1d_det_train has no exported route on this device"
         )
     arch = loader.arch_for_capability(torch.cuda.get_device_capability(device))
     route = mode.backward_route()

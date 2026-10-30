@@ -13,11 +13,11 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
-Provenance: package-local copy of ``flashinfer/experimental/cake_kda_train/cake_kcp_plan.py`` at FlashInfer
+Provenance: package-local copy of ``flashinfer/experimental/cake_kda_det_train/cake_kcp_plan.py`` at FlashInfer
 commit 13d7fcf4041635f5b7f573bb0dbab23570ae1034 (sha256 0f2d8b06bbea49df37b043fba3026a06799f0a0cba09d697e490d02bb747dfbf),
 adapted for the GDN KCP route: the head count of every per-head state is the value-head count ``HV``
 (``H := HV``), the plan rule is a keyword-only argument (no environment variable), and the byte queries live
-in ``cake_bytes`` (GDN saved set and exchange formulas).  ``cake_gdn_det_train_kcp`` never imports ``cake_kda_train``;
+in ``cake_bytes`` (GDN saved set and exchange formulas).  ``cake_gdn_det_train_kcp`` never imports ``cake_kda_det_train``;
 a CPU test asserts field-identical partitions and contexts on the same inputs.
 
 Metadata layer of the context-parallel (KCP) route of the Cake packed GDN

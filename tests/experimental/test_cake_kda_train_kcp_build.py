@@ -29,10 +29,10 @@ import pytest
 
 from tests.test_helpers.cake_package import cake_package
 
-cake_build = cake_package("cake_kda_train", "cake_build")
-cake_jit = cake_package("cake_kda_train", "cake_jit")
-kcp_jit = cake_package("cake_kda_train", "cake_kcp_jit")
-kcp_plan = cake_package("cake_kda_train", "cake_kcp_plan")
+cake_build = cake_package("cake_kda_det_train", "cake_build")
+cake_jit = cake_package("cake_kda_det_train", "cake_jit")
+kcp_jit = cake_package("cake_kda_det_train", "cake_kcp_jit")
+kcp_plan = cake_package("cake_kda_det_train", "cake_kcp_plan")
 
 PACKAGE_DIR = Path(cake_build.__file__).parent
 ARCHES = ("sm_100a", "sm_103a", "sm_107a")
@@ -429,7 +429,7 @@ def test_test_manifest_is_the_test_only_programs_under_the_opt_in(
     assert (
         document["package"]
         == shipped["package"]
-        == "flashinfer.experimental.cake_kda_train"
+        == "flashinfer.experimental.cake_kda_det_train"
     )
     # the shipped manifest is re-rendered by every kernel update of the package, the test-only manifest only when its
     # programs change: the two generator records share their form, not their stamp

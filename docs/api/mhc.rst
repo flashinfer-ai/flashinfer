@@ -51,7 +51,7 @@ at zero, so a replay needs no host-side reset.
 interrupted launch or capture; callers that need this recovery pass their own
 workspaces.
 
-.. currentmodule:: flashinfer.cake_mhc_train
+.. currentmodule:: flashinfer.cake_mhc_det_train
 
 .. autosummary::
     :toctree: ../generated

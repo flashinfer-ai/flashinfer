@@ -178,7 +178,7 @@ def test_the_package_imports_nothing_from_the_kda_training_package() -> None:
                 names = [node.module or ""] + [alias.name for alias in node.names]
             else:
                 continue
-            if any("cake_kda_train" in name for name in names):
+            if any("cake_kda_det_train" in name for name in names):
                 offenders.append(f"{path.name}:{node.lineno}")
     assert not offenders, offenders
 
@@ -222,7 +222,7 @@ def test_the_loader_and_header_are_the_pinned_bytes_of_every_cake_package() -> N
     header too."""
     kda_dir = Path(
         importlib.import_module(
-            "flashinfer.experimental.cake_kda_train.cake_build"
+            "flashinfer.experimental.cake_kda_det_train.cake_build"
         ).__file__
     ).parent
     for relative in ("cake_build.py", "csrc/cake_ffi_checks.h"):

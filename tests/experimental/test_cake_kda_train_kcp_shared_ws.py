@@ -13,7 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
-One KCP workspace shared by several prepared packs (``cake_kda_train.cake_kcp.KcpWorkspace``): ``reserve`` sizes it
+One KCP workspace shared by several prepared packs (``cake_kda_det_train.cake_kcp.KcpWorkspace``): ``reserve`` sizes it
 for a list of contexts (each pool at its largest need, the local arena at the largest layout, a plan view of it per
 other pack), ``kcp_workspace_bytes([ctx, ...], H=)`` predicts its bytes, and the calls of the reserved packs, in any
 interleaving, allocate nothing, keep every pointer and give bitwise the results of one workspace per pack.  The
@@ -48,10 +48,10 @@ from tests.test_helpers.cake_host_sync import (
 from tests.test_helpers.cake_kda_train_kcp_saved import written_tensors
 from tests.test_helpers.cake_package import cake_package
 
-kp = cake_package("cake_kda_train", "cake_kcp_plan")
-cake_kcp = cake_package("cake_kda_train", "cake_kcp")
-cake_backend = cake_package("cake_kda_train", "cake_backend")
-cake_jit = cake_package("cake_kda_train", "cake_jit")
+kp = cake_package("cake_kda_det_train", "cake_kcp_plan")
+cake_kcp = cake_package("cake_kda_det_train", "cake_kcp")
+cake_backend = cake_package("cake_kda_det_train", "cake_backend")
+cake_jit = cake_package("cake_kda_det_train", "cake_jit")
 
 SM_COUNT = 152
 # the document lengths of four packs of one rank: different T_r and n_frag; at H = 4 the one-document and
