@@ -2278,7 +2278,11 @@ def main():
             "DISTRIBUTED_MODEL_JSON",
             {
                 "model": args.model,
-                **asdict(CFG),
+                **{
+                    key: value
+                    for key, value in asdict(CFG).items()
+                    if key not in ("name", "routing", "swiglu_limit", "default_ep")
+                },
                 "scope": "synthetic_nvfp4_routed_expert_core",
                 "precomputed_routing": args.precomputed_routing,
                 "weight_seed": "1000 + rank",

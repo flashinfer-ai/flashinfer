@@ -1652,13 +1652,12 @@ def _benchmark_single(
         do_autotune: Forwarded to each bench_* function — wraps pre-warm only.
     """
     selected = set(backends or _family_backends(quant_family))
-    if backends is None and profile_backend in (
-        "cute-dsl-mxfp8",
-        "cute-dsl-w4a8",
-        "trtllm-mxfp8",
-        "trtllm-mxfp4",
-    ):
-        selected = {profile_backend}
+    if backends is None and profile_backend is not None:
+        selected = {
+            "cutedsl"
+            if profile_backend in ("cute-dsl", "cute-dsl-w4a16")
+            else profile_backend
+        }
     trtllm_backends = (
         ("trtllm-nvfp4", "nvfp4", False, "TRTLLM NVFP4"),
         ("trtllm-per-token", "nvfp4", True, "TRTLLM PER-TOKEN"),
