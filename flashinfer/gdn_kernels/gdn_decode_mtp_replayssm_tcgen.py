@@ -329,9 +329,7 @@ def gdn_verify_kernel_mtp_replayssm_tcgen(
     cute.arch.fence_view_async_shared()
     cute.arch.barrier()
 
-    # Tree paths: fold the path-cumulative decay and the ancestor set into one
-    # T x T weight matrix, so the epilogue keeps constexpr bounds and no
-    # divergence.  Visibility is covered by the pre-epilogue block barrier.
+    # Tree paths fold the path decay and ancestor set into one T x T weight matrix.
     if cutlass.const_expr(HAS_PATHS):
         if warp == 2:
             if lane == 0:
@@ -340,19 +338,18 @@ def gdn_verify_kernel_mtp_replayssm_tcgen(
                     mask = cutlass.Int32(0)
                     # The root has no in-draft parent whatever the entry says.
                     if cutlass.const_expr(i_t > 0):
-                        if parent >= 0:
+                        if parent >= 0 and parent < i_t:
                             mask = s_anc[parent] | (cutlass.Int32(1) << parent)
                     s_anc[i_t] = mask
                     for head in cutlass.range_constexpr(HEADS_PER_CTA):
                         acc = s_log_decay[(head, i_t)]
                         if cutlass.const_expr(i_t > 0):
-                            if parent >= 0:
+                            if parent >= 0 and parent < i_t:
                                 acc = acc + s_log_path[(head, parent)]
                         s_log_path[(head, i_t)] = acc
                         s_path_decay[(head, i_t)] = cute.exp(acc, fastmath=True)
             cute.arch.sync_warp()
-            # W[j,i] = exp(logG[i] - logG[j]) for ancestors, 0 otherwise.  All
-            # weights land in (0,1], so no reciprocal decay product is formed.
+            # W[j,i] = exp(logG[i] - logG[j]) for ancestors, 0 otherwise; W in (0,1].
             for rep in cutlass.range_constexpr((HEADS_PER_CTA * T * T + 31) // 32):
                 flat = lane + rep * 32
                 if flat < HEADS_PER_CTA * T * T:
@@ -520,8 +517,7 @@ def gdn_verify_kernel_mtp_replayssm_tcgen(
         coeff = cute.make_rmem_tensor(cute.make_layout((8,)), _ACC)
         coeff.fill(0.0)
         if cutlass.const_expr(HAS_PATHS):
-            # Same loop shape as the chain path: the triangle is now weighted by
-            # W, which is zero off the ancestor set, so no branch is needed.
+            # Chain loop shape; W is zero off the ancestor set, so no branch.
             for i_t in cutlass.range_constexpr(T):
                 path_scale = s_path_decay[(epilogue_head, i_t)]
                 prediction = path_scale * r_base[i_t]

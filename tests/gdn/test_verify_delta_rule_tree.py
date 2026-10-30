@@ -154,10 +154,16 @@ def test_rejects_malformed_parents():
         [-1, 2, 1, 2, 3, 4, 5, 6],
         [-1, 1, 1, 2, 3, 4, 5, 6],
         [-2, 0, 1, 2, 3, 4, 5, 6],
-        [0, 0, 1, 2, 3, 4, 5, 6],
         [-1, 0, 1, 2, 3, 4, 5],
     ):
         with pytest.raises(ValueError):
             _run(args, bad)
+    # The root entry is ignored, so 0 there is the same tree as -1.
+    torch.testing.assert_close(
+        _run(args, [0, 0, 1, 2, 3, 4, 5, 6]),
+        _run(args, [-1, 0, 1, 2, 3, 4, 5, 6]),
+        atol=0,
+        rtol=0,
+    )
     with pytest.raises(ValueError):
         _run(args, batch_parents(CHAIN_8, 3))

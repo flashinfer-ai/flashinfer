@@ -1325,6 +1325,7 @@ def _validate_parents(parents, batch: int, steps: int) -> torch.Tensor:
             f"got {parents.dtype} {tuple(parents.shape)}"
         )
     parents = parents.long()
-    if bool((parents < -1).any()) or bool((parents >= torch.arange(steps)).any()):
+    limit = torch.arange(steps, device=parents.device).clamp_min(1)
+    if bool((parents < -1).any()) or bool((parents >= limit).any()):
         raise ValueError("parents[t] must be in [-1, t): a token follows its parent")
     return parents

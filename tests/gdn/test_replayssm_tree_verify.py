@@ -1,9 +1,9 @@
 """Parent-indexed (tree) ReplaySSM verify on the SM100 tcgen05 kernel.
 
-Checks two things. That ``verify_parents=None`` is bit-identical to the kernel
-before the change, so chain decoding is untouched; and that a tree-shaped
-parent array matches an independent FP64 oracle which replays each node's own
-root-to-node ancestor path from the frozen checkpoint.
+Checks two things. That ``verify_parents=None`` selects the chain variant and
+is deterministic, so chain decoding is untouched by the tree code; and that a
+tree-shaped parent array matches an independent FP64 oracle which replays each
+node's own root-to-node ancestor path from the frozen checkpoint.
 
 The chain parent array ``[-1, 0, 1, ...]`` must reproduce the chain path
 exactly, which is the tightest available cross-check on the masked form.
@@ -112,7 +112,7 @@ def _rel(got, ref):
 
 
 def test_chain_path_is_bit_identical_without_parents():
-    """The chain fast path must not move: same kernel, same bits."""
+    """The chain fast path is deterministic: two runs, same bits."""
     args, cache = _inputs()
     baseline = _run(args, cache).clone()
     again = _run(args, cache)
@@ -125,8 +125,7 @@ def test_chain_parents_reproduce_the_chain_path():
     chain = _run(args, cache).clone()
     masked = _run(args, cache, CHAIN)
     ref = _oracle(args, CHAIN)
-    # Both forms are the same mathematics; tie them to the oracle and to
-    # each other at the bf16 output's own resolution.
+    # Same mathematics in both forms, compared at the bf16 output's resolution.
     assert _rel(chain, ref) < 5e-3
     assert _rel(masked, ref) < 5e-3
     assert _rel(masked, chain.double()) < 5e-3
@@ -171,6 +170,10 @@ def test_tree_differs_from_chain_where_the_tree_forks():
 
 def _run_child_with_validation(parents):
     env = dict(os.environ, FLASHINFER_VALIDATE_VERIFY_PARENTS="1")
+    repo_root = str(Path(__file__).resolve().parents[2])
+    env["PYTHONPATH"] = os.pathsep.join(
+        filter(None, [repo_root, env.get("PYTHONPATH")])
+    )
     return subprocess.run(
         [
             sys.executable,

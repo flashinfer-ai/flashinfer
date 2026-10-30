@@ -1346,11 +1346,11 @@ def gated_delta_rule_mtp(
     use_qk_l2norm: bool = True,
     output_state_indices: Optional[torch.Tensor] = None,
     cache_replayssm: bool = False,
-    verify_parents: Optional[torch.Tensor] = None,
     replayssm_rawv: Optional[torch.Tensor] = None,
     replayssm_rawk: Optional[torch.Tensor] = None,
     replayssm_g: Optional[torch.Tensor] = None,
     replayssm_beta: Optional[torch.Tensor] = None,
+    verify_parents: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""Gated Delta Rule MTP kernel (Multiple Token Processing).
 
@@ -1459,6 +1459,13 @@ def gated_delta_rule_mtp(
         FP32 log-decay window of shape ``[pool_size, HV, T]``.
     replayssm_beta : torch.Tensor, optional
         FP32 sigmoid-beta window of shape ``[pool_size, HV, T]``.
+    verify_parents : torch.Tensor, optional
+        Int32 ``[B, T]`` parent index of each draft token for tree-structured
+        drafts; token ``i`` continues from the state after its parent instead
+        of token ``i - 1``. Requires ``parent[i] < i`` for ``i >= 1``; the
+        root entry may be -1 or 0. Checked on device only when
+        ``FLASHINFER_VALIDATE_VERIFY_PARENTS=1``. Only the tcgen05 ReplaySSM
+        verify honors it; any other path raises ``ValueError``.
 
     Returns
     -------
