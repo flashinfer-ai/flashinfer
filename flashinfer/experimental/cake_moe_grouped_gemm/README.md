@@ -163,23 +163,23 @@ constants delivered with the generated programs (`HOST_PLAN_CONSTANTS`):
   one whose 4 KB probe chunk of `sched` (at the first 8 KB boundary 128 bytes
   past it, or the next chunk) is homed in its own die, and which die homes a
   chunk depends on the physical page, so the even split misplaces tiles on a
-  device whose dies have unequal SM pairs (e.g. 36 / 40). On the architectures
-  listed in `domain_split_archs`, a launch of an op in `domain_split_ops` (the
-  data gradient; the forward keeps the even split) whose group weight has at
-  most `domain_split_max_weight_elems` elements (`N * K`, the down projection)
-  passes the SM pairs nearer each chunk of its own `sched` as `c0` / `c1`
-  (`"probed"`; otherwise `"even"`). The first such launch on a kept
-  stream workspace enqueues a probe on the stream (five rounds of one CTA per
-  SM timing an add-zero atomic on a line of each chunk, majority per SM pair)
-  and copies the counts to pinned host memory behind an event; later launches
-  pass them once the event has completed, and nothing waits for it. Until
-  then, under CUDA graph capture, for another device, without a CUDA compiler
-  (the probe kernel is built once per compute capability with
-  `tvm_ffi.cpp.load_inline` at preparation) or when the probe does not see
-  every SM and both dies, the launch passes the even split. The output bits do
-  not depend on the split. `stream_queue_split(device, stream=None)` returns
-  the split a stream's probed launches pass, or `None` while it is the even
-  split.
+  device whose dies have unequal SM pairs (36 / 40 on GB300, 35 / 39 on B200).
+  On the architectures listed in `domain_split_archs`, a launch of an op in
+  `domain_split_ops` (the data gradient; the forward keeps the even split)
+  whose group weight has at most `domain_split_max_weight_elems` elements
+  (`N * K`, the down projection) passes the SM pairs nearer each chunk of its
+  own `sched` as `c0` / `c1` (`"probed"`; otherwise `"even"`). The first such
+  launch on a kept stream workspace enqueues a probe on the stream (five
+  rounds of one CTA per SM timing an add-zero atomic on a line of each chunk,
+  majority per SM pair) and copies the counts to pinned host memory behind an
+  event; later launches pass them once the event has completed, and nothing
+  waits for it. Until then, under CUDA graph capture, for another device,
+  without a CUDA compiler (the probe kernel is built once per compute
+  capability with `tvm_ffi.cpp.load_inline` at preparation) or when the probe
+  does not see every SM and both dies, the launch passes the even split. The
+  output bits do not depend on the split.
+  `stream_queue_split(device, stream=None)` returns the split a stream's
+  probed launches pass, or `None` while it is the even split.
 - Weight-gradient k tile (`select_wgrad_tile`): 512 when `K % 512 == 0`, the
   architecture is listed in `k512_archs` and the average rows per group reach
   the architecture's `k512_min_rows_per_group`; 256 otherwise. The two tiles

@@ -871,7 +871,7 @@ HOST_PLAN_CONSTANTS: dict[str, Any] = {
     "wave_sync_words": 2,
     "sched_words": 4224,
     "sched_rest": [0, 2147483648, 0],
-    "domain_split_archs": ["sm_103a"],
+    "domain_split_archs": ["sm_100a", "sm_103a"],
     "domain_split_ops": ["dgrad"],
     "domain_split_max_weight_elems": 12582912,
     "wgrad_tail_split": 1,

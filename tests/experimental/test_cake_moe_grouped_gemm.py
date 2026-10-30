@@ -557,10 +557,10 @@ def test_bench_rows_take_the_measured_wide_ts33_stage(arch):
 
 @pytest.mark.parametrize("arch", ["sm_100a", "sm_103a", "sm_107a"])
 def test_bench_rows_take_the_probed_queue_split(arch):
-    """Over the MoE benchmark rows (``BENCH_ROWS`` x ``BENCH_PROJ``, both ops): sm_103a
-    passes the probed queue split for every data-gradient down-projection row (9 rows
-    with the E4 variants) and the even split for every forward row and every gate/up
-    row; sm_100a and sm_107a pass the even split everywhere."""
+    """Over the MoE benchmark rows (``BENCH_ROWS`` x ``BENCH_PROJ``, both ops): sm_100a
+    and sm_103a pass the probed queue split for every data-gradient down-projection row
+    (9 rows with the E4 variants) and the even split for every forward row and every
+    gate/up row; sm_107a passes the even split everywhere."""
     c = HOST_PLAN_CONSTANTS
     taken = set()
     for op in ("fwd", "dgrad"):
@@ -587,13 +587,13 @@ def test_bench_rows_take_the_probed_queue_split(arch):
                     assert plan["queue_split"] == "even", (op, proj, label)
     expected = (
         {("dgrad", "down", label) for label, _sum_m, _groups, _variants in BENCH_ROWS}
-        if arch == "sm_103a"
+        if arch in ("sm_100a", "sm_103a")
         else set()
     )
     assert taken == expected, (arch, sorted(taken ^ expected))
     variants = {label: v for label, _sum_m, _groups, v in BENCH_ROWS}
     rows = sum(variants[label] for _op, _proj, label in taken)
-    assert rows == {"sm_100a": 0, "sm_103a": 9, "sm_107a": 0}[arch]
+    assert rows == {"sm_100a": 9, "sm_103a": 9, "sm_107a": 0}[arch]
 
 
 @pytest.mark.parametrize("out_dtype", ["bfloat16", "float32"])
