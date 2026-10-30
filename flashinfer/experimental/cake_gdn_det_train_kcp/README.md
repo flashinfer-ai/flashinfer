@@ -1,4 +1,4 @@
-# Cake packed GDN context-parallel (KCP) training backend (SM100 / SM103 / SM107)
+# Cake deterministic GDN context-parallel (KCP) training backend (SM100 / SM103 / SM107)
 
 Experimental backend for context-parallel training of packed GDN (scalar-gated
 DeltaNet) layers with native grouped Q/K heads: forward, backward and
@@ -20,6 +20,14 @@ variable.
 
 > Status: scaffolding.  The numbers of this file (shapes, bytes, limits) are
 > the contract; measured figures are added with the kernels.
+
+The backend package is `flashinfer.experimental.cake_gdn_det_train_kcp`.
+Both this KCP backend and the single-device `cake_gdn_det_train` backend are
+deterministic for a fixed execution plan; the `_kcp` suffix distinguishes
+context parallelism. The public API remains `flashinfer.gdn_train`.
+The former `flashinfer.experimental.cake_gdn_train` import path is retained
+as a compatibility alias. Generated CUDA library names retain their original
+identifiers so the source hashes and compiled ABI stay unchanged.
 
 ## Public entry points (`flashinfer/gdn_train.py`)
 

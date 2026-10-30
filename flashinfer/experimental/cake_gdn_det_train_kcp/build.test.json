@@ -187,6 +187,6 @@
       ]
     }
   ],
-  "package": "flashinfer.experimental.cake_gdn_train",
+  "package": "flashinfer.experimental.cake_gdn_det_train_kcp",
   "schema": "cake-build/1"
 }

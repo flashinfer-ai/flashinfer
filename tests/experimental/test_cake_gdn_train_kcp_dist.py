@@ -10,7 +10,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
-Multi-GPU rows of the context-parallel (KCP) packed GDN training route (``cake_gdn_train.cake_kcp``): ``W`` ranks over
+Multi-GPU rows of the context-parallel (KCP) packed GDN training route (``cake_gdn_det_train_kcp.cake_kcp``): ``W`` ranks over
 NCCL, each holding the fragments of one partition of a packed batch, compared with the exact FP64 per-document
 recurrence of the same operands and with one another.  Per row and rank the test checks
 
@@ -62,14 +62,14 @@ import torch.multiprocessing as mp
 
 from tests.test_helpers.kcp_collective_shims import CollectiveCounter, RecomputePhase
 
-PACKAGE = "flashinfer.experimental.cake_gdn_train"
+PACKAGE = "flashinfer.experimental.cake_gdn_det_train_kcp"
 
 
 def _mod(sub: str | None = None):
     try:
         from tests.test_helpers.cake_package import cake_package
 
-        return cake_package("cake_gdn_train", sub)
+        return cake_package("cake_gdn_det_train_kcp", sub)
     except (ImportError, KeyError):
         return importlib.import_module(PACKAGE if sub is None else f"{PACKAGE}.{sub}")
 
@@ -572,7 +572,7 @@ def _live_blocks_since(mark: int, device, *, skip=()) -> list[dict]:
             if (
                 "/torch/" in fn
                 and "checkpoint" not in fn
-                and "cake_gdn_train" not in fn
+                and "cake_gdn_det_train_kcp" not in fn
             ):
                 continue
             frames.append(f"{fn.rsplit('/', 1)[-1]}:{f.get('line')} {f.get('name')}")
@@ -1844,7 +1844,7 @@ def test_public_api_cannot_select_test_programs() -> None:
     """The precision policy: the shipped record is ``precision_mode=0`` / ``transfer_walk="tf32_hilo"``;
     the test-only records (1 ``_three_mma``, 2 ``_plain_tf32``, ``"bf16x3"``) are refused unless ``test_knobs`` names
     the same value; nothing in the environment changes that (there is no environment hook)."""
-    from flashinfer.experimental.cake_gdn_train import cake_options
+    from flashinfer.experimental.cake_gdn_det_train_kcp import cake_options
 
     for mode in (1, 2):
         with pytest.raises(ValueError):

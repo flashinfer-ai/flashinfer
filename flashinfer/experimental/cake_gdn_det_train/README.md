@@ -18,6 +18,10 @@ libraries are loaded prebuilt from `aot/` when a builder compiled them and
 JIT-built by FlashInfer from the sources and flags `build.json` records
 otherwise.  The package reads no environment variable.
 
+For context-parallel training, use the deterministic
+[`cake_gdn_det_train_kcp`](../cake_gdn_det_train_kcp/README.md) backend through
+`flashinfer.gdn_train`.
+
 ## Opt-in
 
 Import the entry point explicitly; nothing in `flashinfer` imports this

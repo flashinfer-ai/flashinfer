@@ -50,7 +50,7 @@ from tests.test_helpers.cake_gdn_train_reference import (
 
 gdn_api = pytest.importorskip(
     "flashinfer.gdn_train",
-    reason="the cake_gdn_train facade is not part of this tree",
+    reason="the cake_gdn_det_train_kcp backend is not part of this tree",
 )
 
 # Accuracy gate, declared before the first run: every output elementwise within
@@ -289,7 +289,9 @@ ISSUE_CU = [
 def test_context_preparation_does_not_synchronize(device) -> None:
     """``kcp_partition`` + ``build_kcp_context`` + ``prepare`` of a new layout make no synchronizing CUDA call (the
     tables travel in pinned, asynchronous copies), and every device table is bitwise the table built on the CPU."""
-    plan = pytest.importorskip("flashinfer.experimental.cake_gdn_train.cake_kcp_plan")
+    plan = pytest.importorskip(
+        "flashinfer.experimental.cake_gdn_det_train_kcp.cake_kcp_plan"
+    )
     torch.cuda.synchronize(device)
     torch.cuda.set_sync_debug_mode("error")
     try:
@@ -380,8 +382,10 @@ def test_workspace_bytes_match_what_the_backward_binds(device, cu, heads) -> Non
 
     from torch.utils.checkpoint import checkpoint
 
-    kcp = pytest.importorskip("flashinfer.experimental.cake_gdn_train.cake_kcp")
-    gb = pytest.importorskip("flashinfer.experimental.cake_gdn_train.cake_bytes")
+    kcp = pytest.importorskip("flashinfer.experimental.cake_gdn_det_train_kcp.cake_kcp")
+    gb = pytest.importorskip(
+        "flashinfer.experimental.cake_gdn_det_train_kcp.cake_bytes"
+    )
     H, HV = heads
     inputs = make_inputs(cu, H, HV)
     ctx = _local_context(cu, device)
@@ -436,7 +440,7 @@ def test_reuse_recompute_tapes_auto_follows_the_region_shape(
     (``holders_remain``); ``True`` always hands off (``always``), ``False`` never (``off``).  Every form is bitwise the
     direct autograd result, the registry is empty afterwards, and the ``"auto"`` backward -- the recompute forward,
     the frame proof over the autograd graph, the take -- makes no synchronizing CUDA call."""
-    kcp = pytest.importorskip("flashinfer.experimental.cake_gdn_train.cake_kcp")
+    kcp = pytest.importorskip("flashinfer.experimental.cake_gdn_det_train_kcp.cake_kcp")
     H, HV = 2, 6
     cu = [0, 1500, 4200, 6144]
     inputs = make_inputs(cu, H, HV)

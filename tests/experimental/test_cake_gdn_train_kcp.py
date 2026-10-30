@@ -13,7 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
-CPU tests of the GDN KCP metadata layer of ``flashinfer.experimental.cake_gdn_train``: the package-local plan
+CPU tests of the GDN KCP metadata layer of ``flashinfer.experimental.cake_gdn_det_train_kcp``: the package-local plan
 module against ``cake_kda_train.cake_kcp_plan`` (field-identical partitions and contexts on the step-0 rows with
 ``H := HV``; the KDA package is imported HERE only, never by the package), the per-rank crossing counts and
 exchange bytes against the rows of record, the table builders (pool addressing, segment lists, chains), head
@@ -49,10 +49,10 @@ def _package(submodule: str):
     try:
         from tests.test_helpers.cake_package import cake_package
 
-        return cake_package("cake_gdn_train", submodule)
+        return cake_package("cake_gdn_det_train_kcp", submodule)
     except KeyError:  # the registry entry is added by the package scaffolding lane
         return importlib.import_module(
-            f"flashinfer.experimental.cake_gdn_train.{submodule}"
+            f"flashinfer.experimental.cake_gdn_det_train_kcp.{submodule}"
         )
 
 
@@ -213,7 +213,7 @@ def _sha(obj) -> str:
 @ROWS
 @pytest.mark.parametrize("path", ROW_FILES, ids=ROW_IDS)
 def test_plan_parity_with_kda_on_rows(path, monkeypatch) -> None:
-    """Result 1: ``cake_gdn_train.cake_kcp_plan`` is field-identical to ``cake_kda_train.cake_kcp_plan`` on every
+    """Result 1: ``cake_gdn_det_train_kcp.cake_kcp_plan`` is field-identical to ``cake_kda_train.cake_kcp_plan`` on every
     step-0 row (partition, every rank's context and head plan at ``H := HV``) and reproduces the row's recorded
     fragment table.  Result 2: ``n_in`` / ``n_out`` / ``max_chain_fragments`` and the exchange bytes of
     ``gdn_kcp_comm_bytes`` equal the row JSON.  Both modules plan under the per-rank rule they share,
@@ -1426,7 +1426,7 @@ def test_registry_seed() -> None:
     }
     # the rendered manifests: one library per shipped record and exported arch; the test-only walks likewise
     manifest = json.loads((PACKAGE_DIR / "build.json").read_text())
-    assert manifest["package"] == "flashinfer.experimental.cake_gdn_train"
+    assert manifest["package"] == "flashinfer.experimental.cake_gdn_det_train_kcp"
     n_libs = len(manifest["libraries"])
     assert n_libs == len(gj.MODULES) * len(gj.ARCHES)
     assert {lib["arch"] for lib in manifest["libraries"]} == set(gj.ARCHES)

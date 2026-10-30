@@ -11,7 +11,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 CPU tests of the public surface of the context-parallel packed GDN training route: the options validator
-(``cake_gdn_train.cake_options``), the keyword-only signatures, the facade ``flashinfer.gdn_train`` (the contract names),
+(``cake_gdn_det_train_kcp.cake_options``), the keyword-only signatures, the facade ``flashinfer.gdn_train`` (the contract names),
 the package hygiene rules (no environment variable, no ``cake_kda_train`` import, the host module's import allow-list)
 and the host tables built on the CPU for the correctness rows' partitions.  No kernel runs here.
 """
@@ -27,7 +27,7 @@ import pathlib
 import pytest
 import torch
 
-PACKAGE = "flashinfer.experimental.cake_gdn_train"
+PACKAGE = "flashinfer.experimental.cake_gdn_det_train_kcp"
 
 
 def _mod(sub: str | None = None):
@@ -35,7 +35,7 @@ def _mod(sub: str | None = None):
     try:
         from tests.test_helpers.cake_package import cake_package
 
-        return cake_package("cake_gdn_train", sub)
+        return cake_package("cake_gdn_det_train_kcp", sub)
     except (ImportError, KeyError):
         return importlib.import_module(PACKAGE if sub is None else f"{PACKAGE}.{sub}")
 
@@ -1100,3 +1100,30 @@ def test_workspace_holds_one_zeroed_ticket_slot_per_persistent_site() -> None:
         ]
         == gb.TICKET_BYTES
     )
+
+
+@pytest.mark.parametrize(
+    "submodule",
+    [
+        "cake_kcp",
+        "cake_kcp_plan",
+        "cake_options",
+        "cake_backend",
+        "cake_build",
+        "cake_jit",
+    ],
+)
+def test_legacy_backend_modules_share_canonical_state(submodule):
+    legacy = importlib.import_module(
+        f"flashinfer.experimental.cake_gdn_train.{submodule}"
+    )
+    canonical = importlib.import_module(f"{PACKAGE}.{submodule}")
+    assert legacy is canonical
+
+
+def test_legacy_backend_exports_preserve_type_identity():
+    legacy = importlib.import_module("flashinfer.experimental.cake_gdn_train")
+    canonical = _mod()
+    assert legacy.__all__ == canonical.__all__
+    for name in canonical.__all__:
+        assert getattr(legacy, name) is getattr(canonical, name), name

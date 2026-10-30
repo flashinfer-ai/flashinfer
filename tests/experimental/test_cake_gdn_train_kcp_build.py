@@ -35,7 +35,7 @@ import pytest
 
 from tests.test_helpers.cake_package import PACKAGES, cake_package
 
-PACKAGE = "cake_gdn_train"
+PACKAGE = "cake_gdn_det_train_kcp"
 cake_build = cake_package(PACKAGE, "cake_build")
 PACKAGE_DIR = Path(cake_build.__file__).parent
 PACKAGE_IMPORT = PACKAGES[PACKAGE]

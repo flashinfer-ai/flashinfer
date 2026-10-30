@@ -18,7 +18,7 @@ precise cross-rank state passing (SM100 / SM103 / SM107), the Cake backend.
 
 Thin experimental entry points.  The partition / context plan, the host
 orchestration, the saved set, the autograd Function and the generated kernels
-live in ``flashinfer.experimental.cake_gdn_train``; this module validates
+live in ``flashinfer.experimental.cake_gdn_det_train_kcp``; this module validates
 nothing itself and forwards every keyword.  Every switch is a keyword
 argument; no environment variable is read.
 
@@ -65,9 +65,9 @@ DEFAULT_SCALE = 128**-0.5
 
 
 def _pkg():
-    from .experimental import cake_gdn_train  # noqa: PLC0415 - the backend package, imported on first use
+    from .experimental import cake_gdn_det_train_kcp  # noqa: PLC0415 - the backend package, imported on first use
 
-    return cake_gdn_train
+    return cake_gdn_det_train_kcp
 
 
 @flashinfer_experimental_api(feature=_FEATURE)
@@ -366,7 +366,7 @@ def is_gdn_train_supported(device: torch.device | str | int | None = None) -> bo
         return False
     try:
         pkg = _pkg()
-        from .experimental.cake_gdn_train import cake_jit  # noqa: PLC0415
+        from .experimental.cake_gdn_det_train_kcp import cake_jit  # noqa: PLC0415
 
         if device is None:
             index = torch.cuda.current_device()
@@ -384,7 +384,7 @@ def _device_arch(cake_jit: Any, index: int) -> str | None:
     """The exported ``sm_`` arch name of CUDA device ``index``: the loader's ``cake_backend.device_arch`` when the
     package ships it, else the registry's ``ARCH_BY_CAPABILITY`` map of ``torch.cuda.get_device_capability``."""
     try:
-        from .experimental.cake_gdn_train import cake_backend  # noqa: PLC0415
+        from .experimental.cake_gdn_det_train_kcp import cake_backend  # noqa: PLC0415
 
         return cake_backend.device_arch(index)
     except ImportError:
