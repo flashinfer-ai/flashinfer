@@ -28,6 +28,7 @@ without it), ``GDN_EVIDENCE_DIR`` (JSONL evidence records), the FP64 reference `
 from __future__ import annotations
 
 import ast
+import collections.abc
 import dataclasses
 import glob
 import hashlib
@@ -171,7 +172,9 @@ def _plain(x):
             for f in fields
             if not f.startswith("_") and f != "sequence"
         }
-    if isinstance(x, dict):
+    if isinstance(
+        x, collections.abc.Mapping
+    ):  # dicts and the KDA module's lazily uploaded table mapping
         return {str(k): _plain(v) for k, v in x.items()}
     if isinstance(x, (list, tuple)):
         return [_plain(v) for v in x]
@@ -192,6 +195,11 @@ def _context_record(ctx, HV: int) -> dict:
     rec = _plain(ctx)
     rec.pop("partition", None)
     rec.pop("group", None)
+    # the KDA module keeps the fragment table as host rows plus a lazily uploaded property and records its upload
+    # knobs; compare the table itself on both sides
+    for name in ("frag_rows", "upload", "table_cache"):
+        rec.pop(name, None)
+    rec["frag_table"] = _plain(ctx.frag_table)
     rec["device"] = str(ctx.device)
     rec["heads"] = _plain(ctx.heads(HV))
     rec["describe"] = ctx.describe(HV)
