@@ -239,13 +239,14 @@ echo "Provider concurrency: ${AOT_PROVIDER_CONCURRENCY}, MAX_JOBS per provider: 
 build_provider_wheel() {
     local provider_architecture=$1
     local provider_dir="flashinfer-jit-cache-provider-build-${provider_architecture//./}"
-    rm -rf "${provider_dir}"
-    cp -a flashinfer-jit-cache-provider "${provider_dir}"
+    # Explicit returns: errexit is off inside a function the caller guards with ||.
+    rm -rf "${provider_dir}" || return 1
+    cp -a flashinfer-jit-cache-provider "${provider_dir}" || return 1
     rm -rf "${provider_dir}/dist" "${provider_dir}/build" \
         "${provider_dir}"/*.egg-info \
-        "${provider_dir}/flashinfer_jit_cache_provider/jit_cache"
+        "${provider_dir}/flashinfer_jit_cache_provider/jit_cache" || return 1
     rm -f "${provider_dir}/flashinfer_jit_cache_provider/manifest.json" \
-        "${provider_dir}/flashinfer_jit_cache_provider/_build_meta.py"
+        "${provider_dir}/flashinfer_jit_cache_provider/_build_meta.py" || return 1
     # Prefix each line so interleaved output stays attributable. pipefail (set
     # above) keeps the build's exit status.
     {
@@ -256,10 +257,17 @@ build_provider_wheel() {
             python -m build --wheel --no-isolation --skip-dependency-check \
             "${provider_dir}"
     } 2>&1 | sed -u "s/^/[${provider_architecture}] /" || return 1
-    # Explicit returns: errexit is off inside a function the caller guards with ||.
     cp "${provider_dir}"/dist/*.whl "${WHEELHOUSE}/" || return 1
-    rm -rf "${provider_dir}"
+    rm -rf "${provider_dir}" || return 1
 }
+
+# The pool runs each build in a subshell, whose additions to the report list would
+# be lost, so the expected report paths are registered here.
+for provider_architecture in "${BUILD_ARCHITECTURE_LIST[@]}"; do
+    report_label=$(python3 "${AOT_MEMORY_MONITOR_SCRIPT}" safe-label \
+        "build_jit_cache_provider_${provider_architecture}")
+    AOT_MEMORY_REPORT_FILES+=("${AOT_MEMORY_REPORT_DIR}/${report_label}.memory.csv")
+done
 
 PROVIDER_BUILD_STARTED_AT=${SECONDS}
 run_bounded_parallel "${AOT_PROVIDER_CONCURRENCY}" build_provider_wheel \
