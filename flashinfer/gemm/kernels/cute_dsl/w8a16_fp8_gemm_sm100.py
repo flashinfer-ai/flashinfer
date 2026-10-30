@@ -411,7 +411,7 @@ class Sm100W8A16Fp8GemmKernel:
         )
         scale = cute.make_tensor(scale_ptr, cute.make_layout((1,)))
         bias = cute.make_tensor(bias_ptr, cute.make_layout((n,)))
-        dbg = cute.make_tensor(dbg_ptr, cute.make_layout((32 * 4096,)))
+        dbg = cute.make_tensor(dbg_ptr, cute.make_layout((64 * 4096,)))
         return self(
             weight, activation, scale, bias, output, dbg, max_active_clusters, stream
         )
@@ -580,7 +580,7 @@ class Sm100W8A16Fp8GemmKernel:
         tidx, _, _ = cute.arch.thread_idx()
         bidx, bidy, bidz = cute.arch.block_idx()
         gdx, gdy, _ = cute.arch.grid_dim()
-        dbg_base = (bidx + gdx * (bidy + gdy * bidz)) * 32
+        dbg_base = (bidx + gdx * (bidy + gdy * bidz)) * 64
         if cutlass.const_expr(self.debug):
             # Slots 16..31: low 32 bits of %globaltimer at points of the first tile.
             # The tensor's iterator is materialized here, in straight-line code: the
@@ -788,8 +788,20 @@ class Sm100W8A16Fp8GemmKernel:
             cute.append(acc_shape, self.num_acc_stage)
         )
 
+        if cutlass.const_expr(self.debug):
+            if warp_idx == self.schedule_warp_id:
+                with cute.arch.elect_one():
+                    dbg[dbg_base + 32] = global_timer_lo(32)
         pipeline_init_wait(cluster_shape_mn=self.cluster_shape_mn)
+        if cutlass.const_expr(self.debug):
+            if warp_idx == self.schedule_warp_id:
+                with cute.arch.elect_one():
+                    dbg[dbg_base + 33] = global_timer_lo(33)
         tmem.allocate(self.num_tmem_alloc_cols)
+        if cutlass.const_expr(self.debug):
+            if warp_idx == self.schedule_warp_id:
+                with cute.arch.elect_one():
+                    dbg[dbg_base + 34] = global_timer_lo(34)
         tmem.wait_for_alloc()
         if cutlass.const_expr(self.debug):
             if warp_idx == self.schedule_warp_id:
@@ -864,11 +876,6 @@ class Sm100W8A16Fp8GemmKernel:
                     self.sched_sync_barrier.arrive_and_wait()
                     tile_info_pipeline.producer_commit(tile_info_producer_state)
                     tile_info_producer_state.advance()
-                    if cutlass.const_expr(self.debug):
-                        with cute.arch.elect_one():
-                            dbg[dbg_base + _slot_if(dbg_tiles == 1, 17)] = (
-                                global_timer_lo(17)
-                            )
                 if has_work:
                     lin += num_persistent
                 else:
@@ -1372,13 +1379,17 @@ class Sm100W8A16Fp8GemmKernel:
                     sBias[(epi_tidx, bias_buf)] = bias_val
                     self.epilog_sync_barrier.arrive_and_wait()
                 subtile_cnt = cute.size(tTR_tAcc.shape, mode=[3])
-                for subtile_idx in cutlass.range(subtile_cnt):
+                # Unrolled (the count is static).  Loading the next subtile's
+                # accumulator ahead of the current one's store was tried and bought
+                # nothing: the subtile's cost is the smem write, two named barriers
+                # and the TMA store issue, not the TMEM load (GB200 timeline).
+                for subtile_idx in cutlass.range_constexpr(subtile_cnt):
                     cute.copy(
                         tiled_copy_t2r,
                         tTR_tAcc[(None, None, None, subtile_idx)],
                         tTR_rAcc,
                     )
-                    if subtile_idx == subtile_cnt - 1:
+                    if cutlass.const_expr(subtile_idx == subtile_cnt - 1):
                         cute.arch.fence_view_async_tmem_load()
                         with cute.arch.elect_one():
                             acc_pipeline.consumer_release(acc_consumer_state)
@@ -1396,6 +1407,11 @@ class Sm100W8A16Fp8GemmKernel:
                             )
                     else:
                         tTR_rAcc.store(scale_val * tTR_rAcc.load())
+                    if cutlass.const_expr(self.debug and subtile_idx == 0):
+                        if epi_tidx == 0:
+                            dbg[dbg_base + _slot_if(epi_tile_count == 0, 6)] = (
+                                global_timer_lo(6)
+                            )
 
                     if work_tile.distance_to_boundary >= self.cta_tile_shape_mnk[1]:
                         acc_vec = tiled_copy_r2s.retile(tTR_rAcc).load()
@@ -1407,6 +1423,11 @@ class Sm100W8A16Fp8GemmKernel:
                         )
                         cute.arch.fence_proxy("async.shared", space="cta")
                         self.epilog_sync_barrier.arrive_and_wait()
+                        if cutlass.const_expr(self.debug and subtile_idx == 0):
+                            if epi_tidx == 0:
+                                dbg[dbg_base + _slot_if(epi_tile_count == 0, 7)] = (
+                                    global_timer_lo(7)
+                                )
                         if warp_idx == self.epilog_warp_id[0]:
                             cute.copy(
                                 tma_atom_c,
@@ -1415,7 +1436,17 @@ class Sm100W8A16Fp8GemmKernel:
                             )
                             c_pipeline.producer_commit()
                             c_pipeline.producer_acquire()
+                        if cutlass.const_expr(self.debug and subtile_idx == 0):
+                            if epi_tidx == 0:
+                                dbg[dbg_base + _slot_if(epi_tile_count == 0, 14)] = (
+                                    global_timer_lo(14)
+                                )
                         self.epilog_sync_barrier.arrive_and_wait()
+                        if cutlass.const_expr(self.debug and subtile_idx == 0):
+                            if epi_tidx == 0:
+                                dbg[dbg_base + _slot_if(epi_tile_count == 0, 17)] = (
+                                    global_timer_lo(17)
+                                )
                     else:
                         # Partial last activation tile: predicated SIMT store.
                         tTR_rC.store(tTR_rAcc.load().to(self.c_dtype))

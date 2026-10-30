@@ -215,6 +215,14 @@ def _get_sm100_kernel(
         stream=stream,
         options="--opt-level 2 --enable-tvm-ffi",
     )
+    if debug:
+        print(
+            f"w8a16 dsl kernel algo {algo}: stages load2trans "
+            f"{kernel.num_load2trans_stage} trans2mma {kernel.num_trans2mma_stage} acc "
+            f"{kernel.num_acc_stage} c {kernel.num_c_stage}, tmem cols "
+            f"{kernel.num_tmem_alloc_cols}",
+            flush=True,
+        )
     _KERNEL_CACHE[key] = compiled
     return compiled
 
@@ -256,7 +264,7 @@ def w8a16_fp8_gemm_cute_dsl(
     """Blackwell W8A16 GEMM in CuTe-DSL.  ``algo`` as the C++ op's codes (0 = the
     dispatcher's choice); split-K and stream-K codes are not implemented yet and
     fall back to the plain 256x128 tile.  ``debug_buffer``: an Int32 tensor of at
-    least 32 * 4096 entries (pinned host memory to watch a hang) that the kernel's
+    least 64 * 4096 entries (pinned host memory to watch a hang) that the kernel's
     debug build writes its per-CTA progress into; None = the production build."""
     import cutlass
     import cutlass.cute as cute

@@ -36,11 +36,16 @@ class W8A16SplitKReduce:
         n: cutlass.Int64,
         stream: cuda.CUstream,
     ):
-        # Flat views in units of 8-element vectors; N is a multiple of 8.
+        # Flat views in units of 8-element vectors; N is a multiple of 8.  The slice
+        # stride is spelled as _VEC * mn_vecs (not m * n) so the compiler can see that
+        # every slice's vector is 16-byte aligned and keep the 16-byte loads (with m * n
+        # it emitted eight 4-byte loads per slice).
         mn_vecs = m * n // _VEC
         partials = cute.make_tensor(
             partials_ptr,
-            cute.make_layout((_VEC, mn_vecs, self.splits), stride=(1, _VEC, m * n)),
+            cute.make_layout(
+                (_VEC, mn_vecs, self.splits), stride=(1, _VEC, _VEC * mn_vecs)
+            ),
         )
         out = cute.make_tensor(
             out_ptr, cute.make_layout((_VEC, mn_vecs), stride=(1, _VEC))

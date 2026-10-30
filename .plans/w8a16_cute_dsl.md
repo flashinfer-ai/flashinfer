@@ -107,3 +107,18 @@ Until then the C++ stays as-is and the DSL kernel lives beside it.
   25.8/27.5 +6.6%, 72.4/72.4, 130.4/125.4 -3.8%; gate_up 61.0/61.8 +1.3%, 196.4/197.0,
   383.7/384.6; mlp.down 62.2/63.9 +2.7%, 202.7/202.8, 371.3/371.8.  Left: the M=1024
   rows (+1.3..6.6%) and the two split-K rows (+5.5%, +12.9%).
+- Sat 31 Oct 2026, early: small-M residue hunted with a debug timeline (%globaltimer
+  stamps per warp role, slots 16-34 of the per-CTA debug record).  First tile on GB200:
+  prologue 1.4 us (barrier init 0.5, cluster sync 0.3, TMEM alloc + wait 0.4), first
+  TMA -> first MMA 1.7 us, mainloop ~0.55 us per k-tile (L2-bound, same for the C++),
+  epilogue 1.6-2.3 us per tile (0.3-0.4 us per 8 KB subtile: smem write, two named
+  barriers, TMA store issue; TMEM load latency is not it).  Done: every warp derives its
+  first work item itself (saves the 0.6 us scheduler hop); reduce kernel with a
+  compile-time slice count and 16-byte-aligned slice loads.  Tried and dropped: TMEM
+  load one subtile ahead (no change).  ncu, one tile per CTA (und.kv split-K): GEMM 20.6
+  vs 19.4 us, reduce 7.2 vs 6.6 (M=4096); the C++ is non-persistent there (one CTA per
+  tile, 128 CTAs) and cannot be stamped without plumbing a debug pointer through CUTLASS.
+  Current GB200 table (C++ / DSL us): within +-1% on 11 of 18 rows; behind on the M=1024
+  rows (gen.qkv 30.2/31.8, attn.out 25.8/27.2, gate_up 60.9/62.0, mlp.down 64.9/66.5),
+  und.q 4096 72.7/74.2 and the split-K rows (und.kv 15.4/16.4, 21.7/22.9); ahead on
+  attn.out 8192 (130.4/125.2).  Next: Hopper port; the small-M residue after that.
