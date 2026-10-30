@@ -18,7 +18,8 @@ for a list of contexts (each pool at its largest need, the local arena at the la
 other pack), ``kcp_workspace_bytes([ctx, ...], H=)`` predicts its bytes, and the calls of the reserved packs, in any
 interleaving, allocate nothing, keep every pointer and give bitwise the results of one workspace per pack.  The
 workspace holds no context, its host caches are bounded, a call on another stream is ordered after the last one on
-the device, and ``allocate=False`` sizes the first forward for the backward.  Checkpointed layers with one recompute
+the device and a storage it releases is reused only after that stream's queued work (``record_stream`` on a switch
+only), and ``allocate=False`` sizes the first forward for the backward.  Checkpointed layers with one recompute
 handle per pack and layer on a shared workspace are bitwise and exchange-free in their recompute, and the tensors a
 handle stores are never in the workspace (the other packs' calls cannot overwrite them).  The multi-GPU rows are in
 ``test_cake_kda_train_kcp_dist.py``-style launch forms at the end of this file (``spawn`` or one process per Slurm
@@ -700,7 +701,10 @@ def test_gpu_fresh_contexts_on_a_long_lived_shared_workspace_release_everything(
 
 def test_gpu_call_on_another_stream_waits_for_the_last_one(device) -> None:
     """Stream rule: a call on another stream is ordered after the work the workspace's last stream queued (one
-    ``wait_stream``, no host wait, no error), and its results are bitwise those of the same call on one stream."""
+    ``wait_stream``, no host wait, no error), and its results are bitwise those of the same call on one stream.  The
+    order is checked by events, with no timing assumption: once the second stream's work is complete, an event
+    recorded after the first stream's queued call (behind ~1.5 s of device sleep) is complete too.  Without the wait
+    the second stream's work completes while the first stream still sleeps."""
     H = 4
     ctxs, ops = _packs(device, H, packs=PACKS[:2])
     ws = _new_ws()
@@ -709,12 +713,15 @@ def test_gpu_call_on_another_stream_waits_for_the_last_one(device) -> None:
     ref_grads = _bwd(ctxs[1], ops[1], ws, ref_saved)
     torch.cuda.synchronize(device)
     s1, s2 = torch.cuda.Stream(device), torch.cuda.Stream(device)
+    assert s1.cuda_stream != s2.cuda_stream
     cycles = sleep_cycles(device, 1500.0)
     for s in (s1, s2):
         s.wait_stream(torch.cuda.current_stream(device))
     with torch.cuda.stream(s1):
         torch.cuda._sleep(cycles)
         out0, _ = _fwd(ctxs[0], ops[0], ws)
+        first = torch.cuda.Event()
+        first.record()
     t0 = time.perf_counter()
     with torch.cuda.stream(s2):
         out, saved = _fwd(ctxs[1], ops[1], ws)
@@ -722,16 +729,211 @@ def test_gpu_call_on_another_stream_waits_for_the_last_one(device) -> None:
         done = torch.cuda.Event()
         done.record()
     host = time.perf_counter() - t0
-    time.sleep(0.3)
-    waited = not done.query()  # still queued behind s1's sleep
+    done.synchronize()
+    # complete whenever the second stream's work is, if that work waited for it
+    ordered = first.query()
     torch.cuda.synchronize(device)
     assert host < 1.0, host
-    assert waited, (
+    assert ordered, (
         "the call on the second stream did not wait for the first stream's queued work"
     )
     assert ws._stream is not None and ws._stream[0] == s2.cuda_stream
     assert torch.equal(out, ref_out) and _same(grads, ref_grads)
     del out0
+
+
+def _live_ranges(ws) -> dict[int, int]:
+    """``data_ptr -> nbytes`` of every device storage the workspace holds (:func:`_storages`)."""
+    return {
+        t.untyped_storage().data_ptr(): t.untyped_storage().nbytes()
+        for t in _storages(ws)
+    }
+
+
+def _hits(tensors, ranges: dict[int, int]) -> list[tuple[int, int]]:
+    """The ``(data_ptr, nbytes)`` of ``ranges`` that one of ``tensors`` overlaps."""
+    out = []
+    for t in tensors:
+        a = t.untyped_storage().data_ptr()
+        b = a + t.untyped_storage().nbytes()
+        out += [(p, n) for p, n in ranges.items() if a < p + n and p < b]
+    return out
+
+
+def _switch_setup(device, H: int):
+    """A small pack and a pack whose arena and pools are larger (their tables already copied by a first call), and a
+    workspace reserved for the small pack on a fresh stream ``sa``, with the large pack's tables built; plus a second
+    fresh stream ``sb``."""
+    small, small_ops = _packs(device, H, packs=(PACKS[0],))
+    big, big_ops = _packs(device, H, packs=((4000, 1700),))
+    warm = _new_ws()
+    _fwd(small[0], small_ops[0], warm)
+    _fwd(big[0], big_ops[0], warm)
+    del warm
+    gc.collect()
+    torch.cuda.synchronize(device)
+    torch.cuda.empty_cache()
+    sa, sb = torch.cuda.Stream(device), torch.cuda.Stream(device)
+    with torch.cuda.stream(sa):
+        ws = _new_ws()
+        ws.reserve(small, H)
+        ws.tables(big[0], H)
+    torch.cuda.synchronize(device)
+    return (small[0], small_ops[0]), (big[0], big_ops[0]), ws, sa, sb
+
+
+# device sleep of the stream-switch rows, in ms: a later attempt runs only when stream B finished before the host's
+# check (an inconclusive attempt, never a pass); each attempt's results are checked whatever its timing
+SWITCH_SLEEPS_MS = (1000.0, 4000.0, 16000.0)
+
+
+def test_gpu_storage_a_switched_stream_used_is_not_reused_while_it_runs(device) -> None:
+    """Allocator rule of a stream switch (``record_stream``): a workspace allocated on stream A serves a call on
+    stream B queued behind device sleep, and an ``ensure`` on B for a larger pack then replaces its pools and its
+    arena.  While B is still busy (checked after the allocations; an attempt where B already finished is repeated
+    with a longer sleep), allocations on A of every released storage's size (twice each) never overlap a released
+    storage: the caching allocator returns a block to the stream that allocated it, so without the record it would
+    hand A the block B's queued work still reads and writes (the negative control: the previous head)."""
+    H = 4
+    for ms in SWITCH_SLEEPS_MS:
+        (sc, so), (bc, _bo), ws, sa, sb = _switch_setup(device, H)
+        old = _live_ranges(ws)
+        cycles = sleep_cycles(device, ms)
+        with torch.cuda.stream(sb):
+            torch.cuda._sleep(cycles)
+            out, _ = _fwd(sc, so, ws, save_for_backward=False)
+            ws.ensure(bc, H, device=device, backward=True)
+        live = _live_ranges(ws)
+        freed = {p: n for p, n in old.items() if p not in live}
+        held = []
+        with torch.cuda.stream(sa):
+            for n in freed.values():
+                for _ in range(2):
+                    held.append(torch.empty((n,), dtype=torch.uint8, device=device))
+        busy = not sb.query()  # B had not finished when the allocations were made
+        hits = _hits(held, freed)
+        torch.cuda.synchronize(device)
+        print(
+            f"STREAM_SWITCH_REUSE sleep_ms={ms} freed={sorted(freed.values())} held={len(held)} busy={busy} "
+            f"hits={hits}"
+        )
+        assert ws.local is not None and ws.local.arena.data_ptr() not in old
+        assert len(freed) >= 2, (old, live)  # the arena and at least one pool
+        del out, held, ws
+        if busy:
+            assert not hits, (
+                f"a storage stream B's queued work uses was handed to stream A: {hits}"
+            )
+            return
+    pytest.fail(f"stream B finished before the check at every sleep {SWITCH_SLEEPS_MS}")
+
+
+def test_gpu_stream_switch_with_a_replacement_and_poisoned_reuse_is_bitwise(
+    device,
+) -> None:
+    """A workspace allocated on stream A serves, on stream B behind device sleep, a forward and backward of a small
+    pack and then of a larger pack that replaces its pools and arena; once B's sleep ends, stream A fills blocks of
+    the released sizes allocated after the switch with NaN, over and over, while B's calls run.  The outputs and
+    gradients are bitwise those of one workspace per pack on one stream (checked at every attempt; an attempt whose
+    poison was queued only after B finished is repeated with a longer sleep)."""
+    H = 4
+    for ms in SWITCH_SLEEPS_MS:
+        (sc, so), (bc, bo), ws, sa, sb = _switch_setup(device, H)
+        refs = []
+        for c, o in ((sc, so), (bc, bo)):
+            w = _new_ws()
+            out, s = _fwd(c, o, w)
+            refs.append((out, _bwd(c, o, w, s)))
+            del w
+        torch.cuda.synchronize(device)
+        old = _live_ranges(ws)
+        cycles = sleep_cycles(device, ms)
+        got = []
+        with torch.cuda.stream(sb):
+            torch.cuda._sleep(cycles)
+            woke = torch.cuda.Event()
+            woke.record()
+            for c, o in ((sc, so), (bc, bo)):
+                out, s = _fwd(c, o, ws)
+                got.append((out, _bwd(c, o, ws, s)))
+            done = torch.cuda.Event()
+            done.record()
+        freed = {p: n for p, n in old.items() if p not in _live_ranges(ws)}
+        assert len(freed) >= 2, freed
+        with torch.cuda.stream(sa):
+            held = [
+                torch.empty((n // 4,), dtype=torch.float32, device=device)
+                for n in freed.values()
+            ]
+            sa.wait_event(woke)
+            for _ in range(64):
+                for t in held:
+                    t.fill_(float("nan"))
+                torch.cuda._sleep(max(cycles // 20000, 1))
+        busy = not done.query()  # the poison was queued before B's calls ran
+        torch.cuda.synchronize(device)
+        print(f"STREAM_SWITCH_POISON sleep_ms={ms} busy={busy}")
+        for i, ((out, grads), (rout, rgrads)) in enumerate(zip(got, refs, strict=True)):
+            assert torch.equal(out, rout) and _same(grads, rgrads), (ms, i)
+        del held, got, refs, ws
+        if busy:
+            return
+    pytest.fail(
+        f"stream B finished before the poison was queued at every sleep {SWITCH_SLEEPS_MS}"
+    )
+
+
+def test_gpu_record_stream_only_on_a_stream_switch(device, monkeypatch) -> None:
+    """Census of ``record_stream``: steady rounds of two packs on one stream record nothing; the first call on
+    another stream records each live storage of the workspace once (every pool, the arena and the scratch table
+    sets among them), and the later calls on that stream record nothing again; bitwise the first round."""
+    H = 4
+    ctxs, ops = _packs(device, H, packs=PACKS[:2])
+    ws = _new_ws()
+    ws.reserve(ctxs, H)
+
+    def rnd():
+        res = []
+        for c, o in zip(ctxs, ops, strict=True):
+            out, s = _fwd(c, o, ws)
+            res += [out, *_bwd(c, o, ws, s)]
+        return res
+
+    first = rnd()
+    rnd()
+    seen: list[tuple[int, int]] = []
+    record = torch.Tensor.record_stream
+
+    def counting(self, stream):
+        seen.append((self.untyped_storage().data_ptr(), stream.cuda_stream))
+        return record(self, stream)
+
+    monkeypatch.setattr(torch.Tensor, "record_stream", counting)
+    for _ in range(2):
+        assert _same(rnd(), first)
+    steady = list(seen)
+    s2 = torch.cuda.Stream(device)
+    s2.wait_stream(torch.cuda.current_stream(device))
+    with torch.cuda.stream(s2):
+        res = rnd()
+        switch = list(seen[len(steady) :])
+        res2 = rnd()
+        after = list(seen[len(steady) + len(switch) :])
+    torch.cuda.current_stream(device).wait_stream(s2)
+    recorded = {p for p, s in switch if s == s2.cuda_stream}
+    print(
+        f"RECORD_STREAM steady={len(steady)} switch={len(switch)} storages={len(_live_ranges(ws))} "
+        f"recorded={len(recorded & set(_live_ranges(ws)))} after={len(after)}"
+    )
+    assert steady == [], steady
+    assert set(_live_ranges(ws)) <= recorded, (
+        "a storage of the workspace was not recorded on the new stream"
+    )
+    live = {t.untyped_storage().data_ptr() for t in ws._live_storages()}
+    mine = sorted(p for p, s in switch if p in live and s == s2.cuda_stream)
+    assert mine == sorted(live), (mine, sorted(live))
+    assert after == [], after
+    assert _same(res, first) and _same(res2, first)
 
 
 def test_gpu_graph_replay_on_a_reserved_shared_workspace(device) -> None:
