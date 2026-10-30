@@ -126,6 +126,7 @@ def test_routing_check_rebinds_inputs_and_replays(
         validate_routing_values,
     )
 
+    monkeypatch.setenv("FLASHINFER_SM107_MEGA_CHECK_ROUTES", "1")
     monkeypatch.setenv("FLASHINFER_SM107_PREP_TVM_FFI", ffi)
     monkeypatch.setenv("FLASHINFER_SM107_FUSED_ROUTE_CHECK", fused)
     tokens, topk = shape
@@ -236,7 +237,7 @@ def test_routing_check_reuses_kernel_across_row_counts(
 @pytest.mark.parametrize("prequantized", [False, True])
 @pytest.mark.parametrize("fused", ["0", "1"])
 @pytest.mark.parametrize("score_dtype", [torch.float16, torch.bfloat16, torch.float32])
-def test_staging_zeroes_masked_scores(
+def test_staging_preserves_masked_scores(
     monkeypatch, kind, prequantized, fused, score_dtype
 ):
     from flashinfer.moe_ep import MoEEpTensors
@@ -283,12 +284,14 @@ def test_staging_zeroes_masked_scores(
         ids[0] = -1
         scores[:, column] = value
         scores[0] = value
-        expected = scores.float().masked_fill(ids == -1, 0)
+        expected = scores.float()
         for launch in (stage, graph.replay):
             ws.topk_weights.fill_(123)
             launch()
             torch.cuda.synchronize()
-            torch.testing.assert_close(ws.topk_weights[:live], expected, rtol=0, atol=0)
+            torch.testing.assert_close(
+                ws.topk_weights[:live], expected, rtol=0, atol=0, equal_nan=True
+            )
             assert torch.equal(ws.topk_idx[:live], ids.to(torch.int32))
             assert (ws.topk_idx[live:] == -1).all()
             assert (
@@ -360,9 +363,10 @@ def test_route_staging_rebinds_and_replays(
                 assert torch.equal(ids_out[:live], ids.to(torch.int32))
                 torch.testing.assert_close(
                     scores_out[:live],
-                    scores.float().masked_fill(ids == -1, 0),
+                    scores.float(),
                     rtol=0,
                     atol=0,
+                    equal_nan=True,
                 )
                 assert (ids_out[live:] == -7).all()
                 assert (scores_out[live:] == -7).all()
@@ -425,7 +429,10 @@ def test_mxfp8_fused_staging_matches_torch(monkeypatch, kind, hidden, topk, id_d
                 atol=0,
             )
         assert torch.equal(actual[2], expected[2])
-        assert torch.equal(actual[3][:live], expected[3][:live])
+        for out in (actual, expected):
+            torch.testing.assert_close(
+                out[3][:live], scores, rtol=0, atol=0, equal_nan=True
+            )
 
 
 @pytest.mark.parametrize("kind", ["mxfp8_e4m3", "mxfp8_e5m2"])
@@ -500,6 +507,80 @@ def test_mxfp8_fused_staging_keeps_scale_policies_separate(kind):
         assert torch.equal(ids_out, ids) and torch.equal(scores_out, scores)
 
 
+@pytest.mark.parametrize("id_dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("ffi", [False, True])
+def test_shared_route_staging_keeps_score_policies_separate(id_dtype, ffi):
+    from flashinfer.moe_ep.backends.mega.kernel.routing_staging import stage_routes
+
+    ids = torch.tensor([[0, -1, -1, -1]], device="cuda", dtype=id_dtype)
+    scores = torch.tensor(
+        [[0.25, float("nan"), float("inf"), -float("inf")]], device="cuda"
+    )
+    ids_out = torch.empty_like(ids, dtype=torch.int32)
+    scores_out = torch.empty_like(scores)
+    workspace = SimpleNamespace()
+    for options in ({}, {"zero_masked_scores": False}, {}):
+
+        def stage():
+            stage_routes(
+                ids,
+                scores,
+                ids_out,
+                scores_out,
+                workspace=workspace,
+                use_tvm_ffi=ffi,
+                **options,
+            )
+
+        stage()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            stage()
+        scores_out.fill_(123)
+        graph.replay()
+        torch.cuda.synchronize()
+        expected = scores if options else scores.masked_fill(ids == -1, 0)
+        torch.testing.assert_close(scores_out, expected, rtol=0, atol=0, equal_nan=True)
+        assert torch.equal(ids_out, ids.to(torch.int32))
+        graph.reset()
+    assert torch.isnan(scores[:, 1]).all()
+    assert torch.isposinf(scores[:, 2]).all() and torch.isneginf(scores[:, 3]).all()
+
+
+@pytest.mark.parametrize("id_dtype", [torch.int32, torch.int64])
+def test_shared_staging_keeps_default_score_policy(id_dtype):
+    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import fused_quant_stage
+
+    x = torch.ones(8, 512, device="cuda", dtype=torch.bfloat16)
+    ids = torch.tensor([0, -1, -1, -1], device="cuda", dtype=id_dtype).repeat(8, 1)
+    scores = torch.tensor(
+        [0.25, float("nan"), float("inf"), -float("inf")], device="cuda"
+    ).repeat(8, 1)
+    q = torch.empty_like(x, dtype=torch.float8_e4m3fn)
+    sf = torch.empty(8, 16, device="cuda", dtype=torch.float8_e8m0fnu)
+    ids_out, scores_out = torch.empty_like(ids), torch.empty_like(scores)
+    for options in ({}, {"zero_masked_scores": False}, {}):
+        fused_quant_stage(
+            x,
+            ids,
+            scores,
+            q,
+            sf,
+            ids_out,
+            scores_out,
+            quant_type="mxfp8_e4m3",
+            **options,
+        )
+        torch.cuda.synchronize()
+        expected = scores
+        if not options and id_dtype == torch.int32:
+            expected = scores.masked_fill(ids == -1, 0)
+        torch.testing.assert_close(scores_out, expected, rtol=0, atol=0, equal_nan=True)
+        assert torch.equal(ids_out, ids)
+    assert torch.isnan(scores[:, 1]).all()
+    assert torch.isposinf(scores[:, 2]).all() and torch.isneginf(scores[:, 3]).all()
+
+
 @pytest.mark.parametrize("kind", ["mxfp8_e4m3", "mxfp8_e5m2", "mxfp4_mxfp8"])
 @pytest.mark.parametrize("tail_fused", ["0", "1"])
 @pytest.mark.parametrize("capacity", [129, 4096])
@@ -566,8 +647,9 @@ def test_mxfp8_staging_graph_masks_dirty_tail(monkeypatch, kind, tail_fused, cap
             assert torch.equal(out[2][:live], ids[:live].to(torch.int32))
             assert (out[2][live:limit] == -1).all()
             assert (out[2][limit:] == 7).all()
-            expected = scores[:live].masked_fill(ids[:live] == -1, 0)
-            torch.testing.assert_close(out[3][:live], expected, rtol=0, atol=0)
+            torch.testing.assert_close(
+                out[3][:live], scores[:live], rtol=0, atol=0, equal_nan=True
+            )
     finally:
         for _, _, graph in captures:
             graph.reset()
