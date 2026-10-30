@@ -212,7 +212,7 @@ in-block QSA indexer's DECODE step over the pools that the Qwen 3.8 sibling bind
 fused prepare with the paged side-cache arms, the paged scorer, the decode top-k and the decode-grid split combine of the block-sparse
 core --, plus, on `develop`: the block-sparse decode schedule's split rule (the wave rule), the programmatic-dependent-launch sites of
 the block-sparse chain (served under the caller-list form, off by default), the e4m3 compressed-key cache arms of the compress and
-scorer kernels (served by the tree; the sibling entry declines that dtype by name until its own surface lands), the DSL-free front door
+scorer kernels (served by the tree, and by the Qwen 3.8 sibling's forms since the 4c8e24355 pin; the e4m3 KV pool stays a named decline), the DSL-free front door
 `_tupledict.py`, and the `QSA` selection package (the paged scorer's DSL-free hosts moved there from `gated_attention_block/`); since the
 `7301fad21` pin, the LEAN decode tile of the block-sparse core (`sdpa/fwd/kernels/sm107/sparse_lean_d256_f16.py`, behind the sibling entry's
 `sparse_tile_form` knob with its measured AUTO default on cc 10.7) with the visible-set helper it shares with the tcgen05 core, the

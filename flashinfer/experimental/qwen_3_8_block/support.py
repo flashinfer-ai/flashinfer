@@ -262,7 +262,7 @@ def extend_rows_reason(
     if rows <= EXTEND_ROWS_MAX:
         return None
     return (
-        f"{form}: batch_size x q_len_per_req = {batch_size} x {q_len_per_req} = {rows} rows per run exceed {EXTEND_ROWS_MAX}: the fused QKV + gate "
+        f"batch_size x q_len_per_req = {batch_size} x {q_len_per_req} = {rows} rows per run exceed {EXTEND_ROWS_MAX}: the fused QKV + gate "
         f"+ indexer-band slab (N={geometry.n_qkvg}, off the 256-column grid) names a JIT tile on the vendored projection GEMM's small-M route at "
         f"{EXTEND_ROWS_MAX} rows at most, and past it the slab resolves to the cuDNN graph route, which the vendored tree does not carry (no cuDNN "
         f"library) -- run the chunk as several uniform chunks of at most {EXTEND_ROWS_MAX} rows per batch (grouped by their length), or at a "

@@ -87,6 +87,7 @@ import torch
 from flashinfer.qwen_3_8_block import (
     Qwen38BlockGeometry, Qwen38BlockWrapper, qwen_3_8_block_support, qwen_3_8_block_pack_weights,
     qwen_3_8_block_rope_position_tables,
+    qwen_3_8_block_rope_tables,
 )
 
 # the geometry at THIS rank: the Qwen 3.5 fields first, the indexer appended (Qwen3.8-Flash-Next at TP 1; 12 / 1 at TP 2, 6 / 1 at TP 4)

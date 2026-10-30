@@ -752,7 +752,7 @@ def gen_vendor_md(
         "## License\n",
         f"Every vendored file keeps its original SPDX header verbatim: {lic.get('MIT', 0)} files `SPDX-License-Identifier: MIT` (one of them the file from the FE test tree, "
         f"`sdpa/fwd/_binding_reference.py`), {lic.get('Apache-2.0', 0)} files "
-        f"`Apache-2.0`, {lic.get('Apache-2.0 AND MIT', 0)} file `Apache-2.0 AND MIT` (all `Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES`).  "
+        f"`Apache-2.0`, {lic.get('Apache-2.0 AND MIT', 0)} file{'' if lic.get('Apache-2.0 AND MIT', 0) == 1 else 's'} `Apache-2.0 AND MIT` (all `Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES`).  "
         "FlashInfer's root NOTICE must name this origin and commit; the MIT text ships as `licenses/LICENSE.cudnn-frontend-MIT.txt` next to the other third-party texts.  "
         "The generated files are FlashInfer-side (Apache-2.0).\n",
         "## How to re-vendor\n",

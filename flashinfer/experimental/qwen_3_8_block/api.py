@@ -904,7 +904,7 @@ def _light_extend_gates(
         )
     rows = _support.extend_rows_reason(geometry, form, batch_size, q_len)
     if rows is not None:
-        raise NotImplementedError(f"{_PKG} ({rows}")
+        raise NotImplementedError(f"{_PKG} ({form}): {rows}")
     if kv_cache_dtype is not None and kv_cache_dtype not in (torch.bfloat16,):
         raise NotImplementedError(
             f"{_PKG} ({form}): kv_cache_dtype={kv_cache_dtype}: the in-block indexer's steps over the pools serve bf16 pools; the e4m3 pool "
