@@ -37,7 +37,11 @@ from cutlass.utils.mixed_input_helpers import TransformMode
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cute.arch import griddepcontrol_launch_dependents, griddepcontrol_wait
 
-from .w8a16_fp8_gemm_sm100_utils import clock_lo, convert_e4m3_fragment
+from .w8a16_fp8_gemm_sm100_utils import (
+    clock_lo,
+    convert_e4m3_fragment,
+    global_timer_lo,
+)
 
 
 def _slot_if(cond: cutlass.Boolean, slot: int) -> cutlass.Int32:
@@ -188,6 +192,7 @@ class Sm100W8A16Fp8GemmKernel:
             self.num_trans2mma_stage,
             self.num_acc_stage,
             self.num_c_stage,
+            self.num_b_stage,
             self.num_tile_info_stage,
             self.num_acc_tmem_cols,
             self.num_a_tmem_cols,
@@ -219,13 +224,22 @@ class Sm100W8A16Fp8GemmKernel:
         (
             self.smem_layout_a,
             self.smem_layout_a_transform,
-            self.smem_layout_b,
+            _,
         ) = mixed_input_utils.compute_smem_layout(
             tiled_mma,
             self.mma_tiler,
             self.a_dtype,
             self.b_dtype,
             self.num_load2trans_stage,
+            self.num_trans2mma_stage,
+        )
+        # The B pipeline is deeper than the raw-weight one (see the stage computation).
+        _, _, self.smem_layout_b = mixed_input_utils.compute_smem_layout(
+            tiled_mma,
+            self.mma_tiler,
+            self.a_dtype,
+            self.b_dtype,
+            self.num_b_stage,
             self.num_trans2mma_stage,
         )
 
@@ -579,10 +593,10 @@ class Sm100W8A16Fp8GemmKernel:
                 cutlass.Int64, self.num_trans2mma_stage
             ]
             b_load2mma_full_mbar_ptr: cute.struct.MemRange[
-                cutlass.Int64, self.num_load2trans_stage
+                cutlass.Int64, self.num_b_stage
             ]
             b_load2mma_empty_mbar_ptr: cute.struct.MemRange[
-                cutlass.Int64, self.num_load2trans_stage
+                cutlass.Int64, self.num_b_stage
             ]
             acc_full_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_acc_stage]
             acc_empty_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_acc_stage]
@@ -673,7 +687,7 @@ class Sm100W8A16Fp8GemmKernel:
             # later uses outside that branch without a dominating definition.
             _ = dbg.iterator
             if tidx == 0:
-                dbg[dbg_base + 16] = clock_lo(16)
+                dbg[dbg_base + 16] = global_timer_lo(16)
         if warp_idx == self.epilog_warp_id[0]:
             cpasync.prefetch_descriptor(tma_atom_a)
             cpasync.prefetch_descriptor(tma_atom_b)
@@ -733,7 +747,7 @@ class Sm100W8A16Fp8GemmKernel:
         )
         b_load2mma_pipeline = pipeline.PipelineTmaUmma.create(
             barrier_storage=storage.b_load2mma_full_mbar_ptr.data_ptr(),
-            num_stages=self.num_load2trans_stage,
+            num_stages=self.num_b_stage,
             producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
             consumer_group=pipeline.CooperativeGroup(
                 pipeline.Agent.Thread, self.num_mcast_ctas_b
@@ -991,7 +1005,7 @@ class Sm100W8A16Fp8GemmKernel:
                 tensor_c, cta_m_in_cluster, act_in_cluster, fd_total, fd_major
             )
             b_load2mma_producer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Producer, self.num_load2trans_stage
+                pipeline.PipelineUserType.Producer, self.num_b_stage
             )
             if cutlass.const_expr(self.enable_pdl):
                 griddepcontrol_wait()
@@ -1038,6 +1052,13 @@ class Sm100W8A16Fp8GemmKernel:
                             dbg[dbg_base + _slot_if(first, 38)] = b_stage_free.to(
                                 cutlass.Int32
                             )
+                    # Tight poll (no suspend) until the stage is free: the MMA frees B
+                    # stages one k-tile at a time and the reload must go out at once,
+                    # or the MMA starves on B (measured 6-10% of its time).
+                    while not b_stage_free:
+                        b_stage_free = b_load2mma_pipeline.producer_try_acquire(
+                            b_load2mma_producer_state
+                        )
                     b_load2mma_pipeline.producer_acquire(
                         b_load2mma_producer_state, b_stage_free
                     )
@@ -1127,6 +1148,12 @@ class Sm100W8A16Fp8GemmKernel:
                         )
                     )
                 for _k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
+                    while not peek_load2trans_empty_status:
+                        peek_load2trans_empty_status = (
+                            a_load2trans_pipeline.producer_try_acquire(
+                                a_load2trans_producer_state
+                            )
+                        )
                     a_load2trans_pipeline.producer_acquire(
                         a_load2trans_producer_state, peek_load2trans_empty_status
                     )
@@ -1304,7 +1331,7 @@ class Sm100W8A16Fp8GemmKernel:
                 pipeline.PipelineUserType.Consumer, self.num_trans2mma_stage
             )
             b_load2mma_consumer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Consumer, self.num_load2trans_stage
+                pipeline.PipelineUserType.Consumer, self.num_b_stage
             )
             acc_producer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer, self.num_acc_stage
@@ -1313,6 +1340,7 @@ class Sm100W8A16Fp8GemmKernel:
             # Debug wait accounting (cycles): inputs (transformed A + B stages), a free
             # accumulator stage, k-tiles seen, and the warp's total.
             mma_wait_in = cutlass.Int32(0)
+            mma_wait_b = cutlass.Int32(0)
             mma_wait_acc = cutlass.Int32(0)
             mma_ktiles = cutlass.Int32(0)
             mma_clock0 = self._dbg_clock(40)
@@ -1347,12 +1375,15 @@ class Sm100W8A16Fp8GemmKernel:
                         trans2mma_pipeline.consumer_wait(
                             trans2mma_consumer_state, peek_trans2mma_full_status
                         )
+                        t_b0 = self._dbg_clock(45)
                         if cutlass.const_expr(self.debug):
                             with cute.arch.elect_one():
                                 dbg[dbg_base + 12] = cutlass.Int32(3)
                         b_load2mma_pipeline.consumer_wait(b_load2mma_consumer_state)
                         if cutlass.const_expr(self.debug):
-                            mma_wait_in += clock_lo(44) - t_in0
+                            t_b1 = clock_lo(44)
+                            mma_wait_b += t_b1 - t_b0
+                            mma_wait_in += t_b1 - t_in0
                             mma_ktiles += 1
                             with cute.arch.elect_one():
                                 dbg[dbg_base + 12] = cutlass.Int32(4)
@@ -1418,6 +1449,7 @@ class Sm100W8A16Fp8GemmKernel:
                     dbg[dbg_base + 40] = mma_wait_in
                     dbg[dbg_base + 41] = mma_wait_acc
                     dbg[dbg_base + 42] = mma_ktiles
+                    dbg[dbg_base + 55] = mma_wait_b
                     dbg[dbg_base + 47] = clock_lo(47) - mma_clock0
 
         # ---- epilogue warps: D = scale * acc (+ bias[row]), cast, TMA store.
@@ -1626,7 +1658,19 @@ class Sm100W8A16Fp8GemmKernel:
                                 clock_lo(6)
                             )
 
-                    if work_tile.distance_to_boundary >= self.cta_tile_shape_mnk[1]:
+                    # A partial last activation tile goes through the TMA store as well
+                    # when the output is the final one: the TMA clips the rows past the
+                    # tensor's extent.  Only split-K partials, whose slices abut in
+                    # memory, need the predicated SIMT store (a clipped TMA store would
+                    # run into the next slice).  The SIMT path costs a partial-tile CTA
+                    # ~1.7 us and set the kernel's end on every M not a multiple of the
+                    # tile (GB200 gen.qkv / attn.out M=1024 on the 160-wide tile).
+                    tma_store_ok = (
+                        work_tile.distance_to_boundary >= self.cta_tile_shape_mnk[1]
+                    )
+                    if cutlass.const_expr(self.splits == 1):
+                        tma_store_ok = cutlass.Boolean(True)
+                    if tma_store_ok:
                         acc_vec = tiled_copy_r2s.retile(tTR_rAcc).load()
                         tRS_rC.store(acc_vec.to(self.c_dtype))
                         num_prev_subtiles += 1
@@ -1688,7 +1732,7 @@ class Sm100W8A16Fp8GemmKernel:
                         dbg[dbg_base + _slot_if(epi_tile_count == 1, 25)] = (
                             clock_lo(25)
                         )
-                        dbg[dbg_base + 26] = clock_lo(26)
+                        dbg[dbg_base + 26] = global_timer_lo(26)
                         dbg[dbg_base + 5] = dbg_tiles
                         dbg[dbg_base + 13] = cutlass.Int32(3)
                 work_tile, tile_info_consumer_state, tile_l = self._next_work_tile(
@@ -1868,7 +1912,7 @@ class Sm100W8A16Fp8GemmKernel:
         c_layout: utils.LayoutEnum,
         transform_a_source: tcgen05.OperandSource,
         smem_buffer_align_bytes: int,
-    ) -> tuple[int, int, int, int, int, int, int]:
+    ) -> tuple[int, int, int, int, int, int, int, int]:
         """Fit the load, transform, accumulator and epilogue pipelines into smem and TMEM.
 
         Accumulator stages: two when the accumulator leaves room for them (so the
@@ -1988,17 +2032,25 @@ class Sm100W8A16Fp8GemmKernel:
         ):
             raise ValueError("Not enough SMEM or TMEM capacity for selected tile size")
         num_tmem_a_cols = transform2mma_stage_count * num_tmem_cols_a_per_stage
-        c_stage_count += (
+        # The smem left over goes to extra activation (B) stages: the MMA waited 6-10%
+        # of its time for B with the B pipeline as deep as the raw-weight one (the TMA
+        # latency of a first-touch k-tile exceeds five stages' worth of MMA time), and
+        # two epilogue stages are all the epilogue overlaps.
+        leftover = (
             smem_capacity
             - carveout_smem_bytes
             - load2transform_stage_count * ab_load_bytes_per_stage
             - transform2mma_stage_count * a_transform_bytes_per_stage
-        ) // c_bytes_per_stage
+        )
+        b_stage_count = load2transform_stage_count + leftover // (
+            b_load_bytes_per_stage + 2 * bytes_per_pipeline_stage
+        )
         return (
             load2transform_stage_count,
             transform2mma_stage_count,
             accumulator_stage_count,
             c_stage_count,
+            b_stage_count,
             num_tile_info_stage,
             num_tmem_acc_cols,
             num_tmem_a_cols,

@@ -228,7 +228,7 @@ def _get_sm100_kernel(
         print(
             f"w8a16 dsl kernel algo {algo}: stages load2trans "
             f"{kernel.num_load2trans_stage} trans2mma {kernel.num_trans2mma_stage} acc "
-            f"{kernel.num_acc_stage} c {kernel.num_c_stage}, tmem cols "
+            f"{kernel.num_acc_stage} c {kernel.num_c_stage} b {kernel.num_b_stage}, tmem cols "
             f"{kernel.num_tmem_alloc_cols}",
             flush=True,
         )

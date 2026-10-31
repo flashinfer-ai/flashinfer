@@ -47,6 +47,27 @@
 // fixed costs of a launch; off by default, no code otherwise).
 #ifdef W8A16_SM100_TRACE
 __device__ long long w8a16_sm100_trace_buf[64];
+__device__ unsigned long long w8a16_sm100_trace_cta[2 * 8192];  // per CTA: entry, end (globaltimer)
+__device__ __forceinline__ unsigned long long w8a16_globaltimer() {
+  unsigned long long t;
+  asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+  return t;
+}
+#define W8A16_TRACE_CTA_ENTRY()                                                        \
+  do {                                                                                  \
+    if (threadIdx.x == 0) {                                                             \
+      int cta = blockIdx.x + gridDim.x * (blockIdx.y + gridDim.y * blockIdx.z);         \
+      w8a16_sm100_trace_cta[2 * cta] = w8a16_globaltimer();                             \
+    }                                                                                   \
+  } while (0)
+#define W8A16_TRACE_CTA_END()                                                          \
+  do {                                                                                  \
+    if ((threadIdx.x % 32) == 0 && (threadIdx.x / 32) == 0) {                           \
+      int cta = blockIdx.x + gridDim.x * (blockIdx.y + gridDim.y * blockIdx.z);         \
+      unsigned long long t = w8a16_globaltimer();                                       \
+      printf("CPPCTA %d %llu %llu\n", cta, w8a16_sm100_trace_cta[2 * cta], t);          \
+    }                                                                                   \
+  } while (0)
 #define W8A16_TRACE_STAMP(slot)                                               \
   do {                                                                        \
     if (blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 && (threadIdx.x % 32) == 0) {                         \
@@ -68,6 +89,12 @@ __device__ long long w8a16_sm100_trace_buf[64];
   } while (0)
 #define W8A16_TRACE_PRINT(role, a, b, c, d) \
   do {                                      \
+  } while (0)
+#define W8A16_TRACE_CTA_ENTRY() \
+  do {                          \
+  } while (0)
+#define W8A16_TRACE_CTA_END() \
+  do {                        \
   } while (0)
 #endif
 #include "cutlass/kernel_hardware_info.hpp"
@@ -435,6 +462,7 @@ class GemmUniversal<ProblemShape_, CollectiveMainloop_, CollectiveEpilogue_, Til
     int warp_idx = canonical_warp_idx_sync();
     WarpCategory warp_category = warp_category_of(warp_idx);
     W8A16_TRACE_STAMP(warp_idx);
+    W8A16_TRACE_CTA_ENTRY();
 
     int thread_idx = int(threadIdx.x);
     int thread_idx_in_warp = thread_idx % 32;
@@ -1136,6 +1164,7 @@ class GemmUniversal<ProblemShape_, CollectiveMainloop_, CollectiveEpilogue_, Til
     }
     W8A16_TRACE_STAMP(32);
     W8A16_TRACE_PRINT("epi(prewait,accready,stored,tail)", 29, 30, 31, 32);
+    W8A16_TRACE_CTA_END();
   }
 
   //
