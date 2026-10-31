@@ -26,7 +26,7 @@ plans or parallel partitions. `kcp` is the suffix for a context-parallel route.
 | `cake_backend.ChunkedLmHeadDetLossFunction` | `ChunkedLmHeadLossFunction` |
 | `cake_backend.ChunkedLmHeadDetLogprobFunction` | `ChunkedLmHeadLogprobFunction` |
 | `cake_support.SupportDetLogprobFunction` | `SupportLogprobFunction` |
-| `cake_jit.load_cake_lm_head_det_loss_module` | `load_cake_lm_head_loss_module` |
+| `cake_jit.load_cake_lm_head_det_loss_module` | `load_cake_lm_head_loss_module` (in `cake_jit`, `cake_backend` and `cake_backend_opt_in`) |
 
 The generated sources, programs, kernel symbols and libraries are named
 `cake_lm_head_det_loss_<20 hex>` (`csrc/cake_lm_head_det_loss/`,

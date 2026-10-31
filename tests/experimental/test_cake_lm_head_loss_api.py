@@ -118,6 +118,7 @@ OLD_NAMES = {
         "LmHeadLossRunner": "LmHeadDetLossRunner",
         "ChunkedLmHeadLossFunction": "ChunkedLmHeadDetLossFunction",
         "ChunkedLmHeadLogprobFunction": "ChunkedLmHeadDetLogprobFunction",
+        "load_cake_lm_head_loss_module": "load_cake_lm_head_det_loss_module",
     },
     "flashinfer.experimental.cake_lm_head_det_loss.cake_backend_opt_in": {
         "chunked_lm_head_loss": "chunked_lm_head_det_loss",
@@ -127,6 +128,7 @@ OLD_NAMES = {
         "LmHeadLossRunner": "LmHeadDetLossRunner",
         "ChunkedLmHeadLossFunction": "ChunkedLmHeadDetLossFunction",
         "ChunkedLmHeadLogprobFunction": "ChunkedLmHeadDetLogprobFunction",
+        "load_cake_lm_head_loss_module": "load_cake_lm_head_det_loss_module",
     },
     "flashinfer.experimental.cake_lm_head_det_loss.cake_support": {
         "chunked_lm_head_support_logprob": "chunked_lm_head_det_support_logprob",
@@ -155,6 +157,25 @@ def test_old_names_are_the_canonical_objects():
             canonical = getattr(module, new)
             assert getattr(module, old) is canonical, (module_name, old)
             assert canonical.__name__ == new, (module_name, new, canonical.__name__)
+
+
+def test_backend_loader_aliases_are_the_jit_loader():
+    """The stage loader's name before the ``det`` naming, read from either backend module (by the new or the old
+    package path), is the package loader itself, ``cake_jit.load_cake_lm_head_det_loss_module``."""
+    jit = importlib.import_module(
+        "flashinfer.experimental.cake_lm_head_det_loss.cake_jit"
+    )
+    loader = jit.load_cake_lm_head_det_loss_module
+    for name in ("cake_backend", "cake_backend_opt_in"):
+        module = importlib.import_module(
+            f"flashinfer.experimental.cake_lm_head_det_loss.{name}"
+        )
+        old = importlib.import_module(
+            f"flashinfer.experimental.cake_lm_head_loss.{name}"
+        )
+        assert module.load_cake_lm_head_det_loss_module is loader, name
+        assert module.load_cake_lm_head_loss_module is loader, name
+        assert old.load_cake_lm_head_loss_module is loader, name
 
 
 def test_old_package_path_is_the_canonical_package():

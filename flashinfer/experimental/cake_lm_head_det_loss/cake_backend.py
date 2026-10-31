@@ -6590,3 +6590,4 @@ ChunkedLmHeadLossFunction = ChunkedLmHeadDetLossFunction
 ChunkedLmHeadLogprobFunction = ChunkedLmHeadDetLogprobFunction
 chunked_lm_head_loss = chunked_lm_head_det_loss
 chunked_lm_head_logprob = chunked_lm_head_det_logprob
+load_cake_lm_head_loss_module = load_cake_lm_head_det_loss_module
