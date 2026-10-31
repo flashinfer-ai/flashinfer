@@ -51,8 +51,10 @@ import math
 import os
 import socket
 import statistics
+import sys
 import tempfile
 import time
+import traceback
 from pathlib import Path
 
 import pytest
@@ -594,6 +596,15 @@ def _test_mode() -> str:
     return mode
 
 
+def _rank_fragments(ctx, rank: int) -> tuple:
+    """This rank's fragments from ``ctx.fragments``: the local tuple of fragments (empty on a rank that holds no
+    tokens, e.g. ``ragged:1200,0,900,900``) or a per-rank table (a tuple of such tuples), indexed by ``rank``."""
+    frs = ctx.fragments
+    if len(frs) > 0 and isinstance(frs[0], tuple):
+        return frs[rank]
+    return frs
+
+
 def _run_rank_fwd(
     rank: int,
     W: int,
@@ -650,9 +661,7 @@ def _run_rank_fwd(
         else out.new_zeros((0, HV, 128, 128), dtype=torch.float32)
     )
     cuts = [None] * int(ctx.n_in)
-    for f in (
-        ctx.fragments[rank] if isinstance(ctx.fragments[0], tuple) else ctx.fragments
-    ):
+    for f in _rank_fragments(ctx, rank):
         if f.length > 0 and f.off > 0:
             cuts[int(ctx.in_slot[f.slot])] = int(cu[f.doc] + f.off)
     info["s_in_cuts"] = cuts
@@ -1714,15 +1723,26 @@ def _slurm_row(row: Row, slurm, backend: str, body) -> None:
         pytest.skip("the KCP programs are not exported in the package's build.json yet")
     report = None
     if slurm.rank < W:
-        report = body(
-            slurm.rank,
-            W,
-            row,
-            group,
-            slurm.device,
-            os.environ.get("KCP_TEST_RESULT_DIR"),
-            backend,
-        )
+        try:
+            report = body(
+                slurm.rank,
+                W,
+                row,
+                group,
+                slurm.device,
+                os.environ.get("KCP_TEST_RESULT_DIR"),
+                backend,
+            )
+        except Exception:
+            # print now: the other ranks wait in a collective until its timeout, which would hide this rank's error
+            print(
+                f"rank {slurm.rank}: row {_row_id(row)} raised:",
+                file=sys.stderr,
+                flush=True,
+            )
+            traceback.print_exc(file=sys.stderr)
+            sys.stderr.flush()
+            raise
     ok = report is None or bool(report["pass"])
     if slurm.world > 1:
         verdicts: list = [None] * slurm.world
