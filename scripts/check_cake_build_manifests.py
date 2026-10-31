@@ -303,6 +303,14 @@ def refs_shipped_modules(package_dir: Path, loader: str) -> set[str]:
     return generic_library_refs(module_literals(package_dir / loader)["MODULES"])
 
 
+def refs_with_kcp(package_dir: Path, loader: str) -> set[str]:
+    """A package whose ``build.json`` also lists the programs of its context-parallel registry ``kcp_jit.py``: the
+    generic walk over ``loader`` and the ``MODULES`` records of ``kcp_jit.py``."""
+    return refs_generic(package_dir, loader) | refs_shipped_modules(
+        package_dir, "kcp_jit.py"
+    )
+
+
 def refs_mok_bf16(package_dir: Path, loader: str) -> set[str]:
     """``sources.json``: role -> {library, arches, arguments}."""
     registry = json.loads((package_dir / loader).read_text())
@@ -335,10 +343,10 @@ PACKAGES: tuple[Package, ...] = (
         refs_generic,
     ),
     Package(
-        "flashinfer.cake_causal_conv1d_train_backend",
-        "flashinfer/cake_causal_conv1d_train_backend",
+        "flashinfer.cake_causal_conv1d_det_train_backend",
+        "flashinfer/cake_causal_conv1d_det_train_backend",
         "cake_jit.py",
-        refs_generic,
+        refs_with_kcp,
     ),
     Package(
         "flashinfer.cake_gated_act_mxfp8_backend",
@@ -385,6 +393,12 @@ PACKAGES: tuple[Package, ...] = (
     Package(
         "flashinfer.cake_mhc_det_train_head_backend",
         "flashinfer/cake_mhc_det_train_head_backend",
+        "cake_jit.py",
+        refs_generic,
+    ),
+    Package(
+        "flashinfer.experimental.cake.cake_mhc_train_backend",
+        "flashinfer/experimental/cake/cake_mhc_train_backend",
         "cake_jit.py",
         refs_generic,
     ),
