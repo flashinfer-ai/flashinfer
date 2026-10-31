@@ -180,6 +180,8 @@ launcher's.
 * `A`, `B`, `out` FP32 2-D views: `A [M, K]` with unit stride on `m` or `k`
   (other stride a multiple of 4), `B [K, N]` with unit stride on `k` or `n`,
   `out [M, N]` with unit inner stride and 16-byte rows; `N` a multiple of 8.
+  A single-split `kk` / `kn` launch stores 16-byte vectors straight into `out`,
+  so `out` must then start at a 16-byte aligned address.
 * The operand layouts select the instance and the production split-K count:
   `kk` (forward, 4 splits), `kn` (input gradient, 1), both MN-major -> the
   swapped transposed-store weight gradient `nn_t` (6 splits; `out.T = B.T

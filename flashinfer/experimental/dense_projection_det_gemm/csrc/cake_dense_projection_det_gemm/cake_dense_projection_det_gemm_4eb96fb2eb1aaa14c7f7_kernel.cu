@@ -654,7 +654,7 @@ kernel_cake_dense_projection_det_gemm_4eb96fb2eb1aaa14c7f7(const __grid_constant
                     int off_n_1 = bid_n * 256;
                     int bidx = head;
                     int part_4 = ((kbeg_2 > 0) ? 1 : ((kend_2 < k_iters) ? 1 : 0));
-                    int slab = u_1_1 + tail_t_2;
+                    int slab = tail_t_2 * 3 + ((kbeg_2 > 0) ? 1 : 0) + ((kbeg_2 > iters_per_unit) ? 1 : 0);
                     int global_row = off_m_1 + local_row;
                     int row0 = off_m_1 + warp_row0;
                     int col0 = slice_col0;
@@ -867,16 +867,20 @@ kernel_cake_dense_projection_det_gemm_4eb96fb2eb1aaa14c7f7(const __grid_constant
                         __syncwarp();
                         asm volatile("tcgen05.fence::after_thread_sync;");
                         int cidx = tail_t_2 * 16 + cta_rank * 8 + (warp - 2);
+                        int slab0 = tail_t_2 * 3;
                         int u_first = tail_t_2 * k_iters / iters_per_unit;
                         int u_last = ((tail_t_2 + 1) * k_iters - 1) / iters_per_unit;
                         int nparts = u_last - u_first + 1;
-                        unsigned int inc = ((lane == 0) ? 1 : 0);
-                        int aidx = ((lane == 0) ? cidx : 4096 + (cta_rank * 8 + (warp - 2)) * 32 + lane);
-                        unsigned int _atomic_fetch_add_1;
-                        asm volatile("atom.acq_rel.gpu.global.add.u32 %0, [%1], %2;"
-                            : "=r"(_atomic_fetch_add_1) : "l"(&counters[aidx]), "r"(static_cast<uint32_t>(inc)) : "memory");
-                        unsigned int _shfl_sync_0 = __shfl_sync(0xFFFFFFFF, _atomic_fetch_add_1, 0);
-                        if (_shfl_sync_0 == (unsigned int)(nparts - 1)) {
+                        unsigned int old = 0;
+                        if (lane == 0) {
+                            unsigned int _atomic_fetch_add_0;
+                            asm volatile("atom.acq_rel.gpu.global.add.u32 %0, [%1], %2;"
+                                : "=r"(_atomic_fetch_add_0) : "l"(&counters[cidx]), "r"(static_cast<uint32_t>(1)) : "memory");
+                            old = _atomic_fetch_add_0;
+                        }
+                        unsigned int arrival = __shfl_sync(0xFFFFFFFF, old, 0);
+                        if (arrival == (unsigned int)(nparts - 1)) {
+                            __syncwarp();
                             #pragma unroll
                             for (int j_4 = 0; j_4 < 128; j_4++) {
                                 red[j_4] = 0.0f;
@@ -885,7 +889,7 @@ kernel_cake_dense_projection_det_gemm_4eb96fb2eb1aaa14c7f7(const __grid_constant
                             #pragma unroll 1
                             for (int sidx = 0; sidx < nparts; sidx++) {
                                 int slice_id_2 = cta_rank * 8 + (warp - 2);
-                                unsigned long long off_2 = (unsigned long long)((u_first + sidx + tail_t_2) * 16 + slice_id_2) * 4096 + (unsigned long long)((col0 - slice_col0) * 32 + lane * 4);
+                                unsigned long long off_2 = (unsigned long long)((slab0 + sidx) * 16 + slice_id_2) * 4096 + (unsigned long long)((col0 - slice_col0) * 32 + lane * 4);
                                 unsigned long long off_0_2 = off_2;
                                 if (nvalid_2 >= 128) {
                                     #pragma unroll
