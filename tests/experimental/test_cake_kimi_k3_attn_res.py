@@ -261,6 +261,15 @@ _ROUND_23_ROWS: dict[tuple[str, int, int, int], tuple[str, str, int]] = {
     ),
 }
 
+# Round 24: the sm_103a (512, 4) cell at 148 SMs runs the ``consumer_regs`` 232 pair program.
+_ROUND_24_ROWS: dict[tuple[str, int, int, int], tuple[str, str, int]] = {
+    ("sm_103a", 512, 4, 148): (
+        "pair",
+        "pair_ws384_nc2_prefix_bf16_add_fastmath_consumer_regs232_grid148",
+        148,
+    ),
+}
+
 
 def _expected_at(sm_count: int, grid_x, schedule_id: str) -> tuple[int, str]:
     """The (grid, schedule id) a POLICY_ROWS cell takes on ``sm_count`` SMs: the native ports and the
@@ -278,7 +287,7 @@ def _expected_at(sm_count: int, grid_x, schedule_id: str) -> tuple[int, str]:
 def test_plan_route_policy(arch, M, K, pdl, kind, schedule_id, grid_x, sm_count):
     grid_x, schedule_id = _expected_at(sm_count, grid_x, schedule_id)
     kind, schedule_id, grid_x = (
-        _ROUND_2_ROWS | _ROUND_5_ROWS | _ROUND_6_ROWS | _ROUND_23_ROWS
+        _ROUND_2_ROWS | _ROUND_5_ROWS | _ROUND_6_ROWS | _ROUND_23_ROWS | _ROUND_24_ROWS
     ).get((arch, M, K, sm_count), (kind, schedule_id, grid_x))
     plan = plan_route(arch, sm_count, M, K, pdl)
     assert plan.kind == kind
@@ -320,8 +329,9 @@ def test_plan_route_policy(arch, M, K, pdl, kind, schedule_id, grid_x, sm_count)
         (4096, 2, False),
         (4097, 2, False),
         (6144, 2, False),
-        # K4: the nc5 band M513..1023 + the pow2 cells {512, 2048, 4096}; held at 1024..2047 and above 4096.
-        (512, 4, True),
+        # K4: the nc5 band M513..1023 + the pow2 cells {2048, 4096}; held at 1024..2047 and above 4096.
+        # Round 24: the (512, 4) cell runs the ``consumer_regs`` 232 pair program
+        # (``test_consumer_regs_pair_cells_take_the_384_thread_programs``).
         (513, 4, True),
         # round 23: the (768, 4) cell runs the ``consumer_regs`` 232 pair program
         # (``test_consumer_regs_pair_cells_take_the_384_thread_programs``); its band neighbours keep
@@ -772,7 +782,8 @@ def test_consumer_regs_pair_cells_take_the_384_thread_programs():
     whole warpgroups, 384 threads); its schedule label adds ``_consumer_regs232`` ahead of the grid.
     The sm_100a (192, 4), (192, 5) and (192, 8) cells and the sm_103a (192, 4) and (192, 5) cells at
     both SM counts run it at both PDL modes; round 23 adds the sm_100a (768, 4), (768, 5) and
-    (256, 8) cells and the sm_103a (768, 4), (256, 5) and (768, 5) cells at both SM counts.  No cell
+    (256, 8) cells and the sm_103a (768, 4), (256, 5) and (768, 5) cells at both SM counts; round 24
+    adds the sm_100a (512, 4) and (512, 8) cells and the sm_103a (512, 4) cell at 148 SMs.  No cell
     runs the 320-thread pair program."""
     cells = (
         [("sm_100a", 148, 192, K) for K in (4, 5, 8)]
@@ -783,6 +794,8 @@ def test_consumer_regs_pair_cells_take_the_384_thread_programs():
             for sm_count in SM_COUNTS
             for M, K in ((768, 4), (256, 5), (768, 5))
         ]
+        + [("sm_100a", 148, 512, K) for K in (4, 8)]
+        + [("sm_103a", 148, 512, 4)]
     )
     for arch, sm_count, M, K in cells:
         for pdl in (False, True):
@@ -817,7 +830,8 @@ def test_park_acc_pair_cells_take_the_384_thread_programs():
     ``_consumer_regs200_park_acc1`` ahead of the grid. The sm_100a (192, 6) and (192, 7) cells at
     148 SMs and the sm_103a (192, 6), (192, 7) and (192, 8) cells at both SM counts run it at both
     PDL modes; round 23 adds the sm_100a (256, 6) cell and the sm_103a (256, 6), (768, 6) and
-    (256, 8) cells at both SM counts."""
+    (256, 8) cells at both SM counts; round 24 adds the sm_100a (512, 6) and sm_103a (512, 8) cells
+    at 148 SMs."""
     cells = (
         [("sm_100a", 148, 192, K) for K in (6, 7)]
         + [("sm_103a", sm_count, 192, K) for sm_count in SM_COUNTS for K in (6, 7, 8)]
@@ -827,6 +841,7 @@ def test_park_acc_pair_cells_take_the_384_thread_programs():
             for sm_count in SM_COUNTS
             for M, K in ((256, 6), (768, 6), (256, 8))
         ]
+        + [("sm_100a", 148, 512, 6), ("sm_103a", 148, 512, 8)]
     )
     for arch, sm_count, M, K in cells:
         for pdl in (False, True):
@@ -1478,15 +1493,15 @@ def test_every_common_path_route_resolves_to_a_registered_program(arch, sm_count
 # First token count of every dense route band: the M at which ``plan_route`` changes its kernel
 # key on some architecture, SM count in SM_COUNTS or PDL setting, per K.  The bands follow the
 # route tables (the small-M table and its cluster / chunk / fast-math bands, the round-r5 cells,
-# the round-2 / round-3 / round-6 / round-20 / round-23 cells (among them the single-cell
-# fast-math cells of K 0), the release bands, the nc / depth edges, the native and pair cells)
+# the round-2 / round-3 / round-6 / round-20 / round-23 / round-24 cells (among them the
+# single-cell fast-math cells of K 0), the release bands, the nc / depth edges, the native and pair cells)
 # and, for K8 on sm_100a, the SM count itself (the release flips at M = SMs + 1).
 # ``test_gpu_rows_are_the_route_band_starts`` recomputes the set from the tables.
 # fmt: off
 _ROUTE_BAND_START_ROWS = {
     0: (
         1, 9, 12, 13, 16, 17, 24, 25, 32, 33, 48, 49, 64, 65, 96, 97, 128, 129, 192, 193, 256, 257,
-        513,
+        384, 385, 512, 513,
     ),
     1: (
         1, 513, 768, 769, 1024, 1025, 1536, 1537, 2048, 2049, 3072, 3073, 4096, 4097, 6144, 6145,
