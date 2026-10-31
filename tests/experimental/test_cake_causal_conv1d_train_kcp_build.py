@@ -29,6 +29,10 @@ import re
 import pytest
 
 from tests.test_helpers.cake_package import cake_package
+from tests.test_helpers.cake_causal_conv1d_early_render import apply_to_package
+
+# Test-only: the early render's backward rules predate the required ``slots`` (the package applies no default).
+apply_to_package()
 
 KEY = "cake.cake_causal_conv1d_train"
 cake_jit = cake_package(KEY, "cake_jit")
@@ -61,11 +65,10 @@ ACCUMULATORS = {"acc": "float32", "kind": "accumulators", "taps": 4, "work": "ui
 
 
 def _accumulator_rule(rule: dict) -> dict:
-    """``rule`` without an explicit one-copy ``slots`` (the KCP programs keep one FP32 copy; a rule may name it)."""
+    """``rule`` without its ``slots``, which must name one copy (the KCP programs keep one FP32 accumulator)."""
 
     rule = dict(rule)
-    if rule.get("slots") == 1:
-        del rule["slots"]
+    assert rule.pop("slots", None) == 1, "a KCP accumulators rule names slots 1"
     return rule
 
 
@@ -179,7 +182,10 @@ def test_kcp_backward_workspace(arch) -> None:
 
     owners = kcp_jit.workspace_owners(arch)
     assert [o["kernel"] for o in owners] == list(kcp_jit.route_modules(arch, "kcp_bwd"))
-    assert _accumulator_rule(kcp_jit.workspace_record(arch)["workspace_rule"]) == ACCUMULATORS
+    assert (
+        _accumulator_rule(kcp_jit.workspace_record(arch)["workspace_rule"])
+        == ACCUMULATORS
+    )
     for C in CHANNELS:
         n_ch_tiles = -(-(C // 8) // min(C // 8, 128))
         layout = kcp_jit.accumulator_layout(owners[0], C, n_ch_tiles)

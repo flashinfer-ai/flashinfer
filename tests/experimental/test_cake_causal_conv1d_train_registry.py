@@ -41,6 +41,10 @@ import pytest
 import torch
 
 from tests.test_helpers.cake_package import cake_package
+from tests.test_helpers.cake_causal_conv1d_early_render import apply_to_package
+
+# Test-only: the early render's backward rules predate the required ``slots`` (the package applies no default).
+apply_to_package()
 
 KEY = "cake.cake_causal_conv1d_train"
 pkg = cake_package(KEY)
@@ -210,7 +214,8 @@ def test_backward_records_are_one_launch_with_accumulators() -> None:
         )
         assert cake_jit.select_rule(record) == det_jit.select_rule(det), label
         rule = dict(record["workspace_rule"])
-        slots = rule.pop("slots", 1)
+        assert "slots" in rule, label  # required: the package never defaults it
+        slots = rule.pop("slots")
         assert rule == {
             "acc": "float64" if kind.endswith("fp32g") else "float32",
             "kind": "accumulators",
@@ -267,7 +272,7 @@ def test_accumulator_layout() -> None:
                 C, geometry=record["grid_rule"]["geometry"], role="bwd"
             )
             layout = cake_jit.accumulator_layout(record, C, n_ch_tiles)
-            words = rule.get("slots", 1) * rule["taps"]
+            words = rule["slots"] * rule["taps"]
             assert cake_jit.accumulator_words_per_channel(record) == words
             acc_bytes = words * C * size
             assert layout == {
@@ -297,8 +302,8 @@ def test_accumulator_layout() -> None:
 @pytest.mark.parametrize("C", (512, 8192))
 def test_accumulators_are_sized_from_the_rule(kind, C) -> None:
     """The accumulator size comes from the rendered rule, never a fixed ``C x taps``: an fp32g program whose rule
-    names ``slots`` FP64 copies gets ``slots x taps x C`` words (1 copy when it names none), and the public
-    workspace grows with it; a malformed ``slots`` is refused."""
+    names ``slots`` FP64 copies gets ``slots x taps x C`` words; a rule without ``slots``, or with a malformed one,
+    is refused."""
 
     import copy
 
@@ -313,7 +318,7 @@ def test_accumulators_are_sized_from_the_rule(kind, C) -> None:
             C, geometry=record["grid_rule"]["geometry"], role="bwd"
         )
         rendered = cake_jit.accumulator_layout(record, C, n_ch_tiles)
-        assert rendered["acc_elems"] == rule.get("slots", 1) * rule["taps"] * C
+        assert rendered["acc_elems"] == rule["slots"] * rule["taps"] * C
         for slots in (1, 4):
             variant = copy.deepcopy(record)
             variant["workspace_rule"]["slots"] = slots
@@ -322,11 +327,20 @@ def test_accumulators_are_sized_from_the_rule(kind, C) -> None:
             assert layout["acc_bytes"] == 8 * slots * rule["taps"] * C
             assert layout["work_offset"] == _align16(layout["acc_bytes"])
             assert layout["total_bytes"] >= layout["work_offset"] + 4 * n_ch_tiles
-        for slots in (0, -1, 1.5, True, "4"):
+        for slots in (0, -1, 1.5, True, "4", None):
             variant = copy.deepcopy(record)
             variant["workspace_rule"]["slots"] = slots
             with pytest.raises(ValueError, match="slots"):
                 cake_jit.accumulator_layout(variant, C, n_ch_tiles)
+        # A rule without the field is refused (no default could size dw_acc for every program).
+        variant = copy.deepcopy(record)
+        del variant["workspace_rule"]["slots"]
+        with pytest.raises(ValueError, match="slots"):
+            cake_jit.accumulator_layout(variant, C, n_ch_tiles)
+        with pytest.raises(ValueError, match="slots"):
+            cake_jit.accumulator_words_per_channel(variant)
+        with pytest.raises(ValueError, match="slots"):
+            pkg._accumulator_layout(variant, C, n_ch_tiles)
 
 
 @pytest.mark.cpu_only

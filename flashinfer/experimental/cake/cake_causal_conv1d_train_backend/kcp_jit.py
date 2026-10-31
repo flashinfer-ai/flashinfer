@@ -714,9 +714,10 @@ def workspace_record(arch: str) -> dict[str, Any]:
 
     def per_channel(owner: dict[str, Any]) -> int:
         rule = owner["workspace_rule"]
-        return _zero_history.accumulator_words_per_channel(
-            owner
-        ) * _zero_history.ACCUMULATOR_DTYPES[rule["acc"]]
+        return (
+            _zero_history.accumulator_words_per_channel(owner)
+            * _zero_history.ACCUMULATOR_DTYPES[rule["acc"]]
+        )
 
     best = owners[0]
     for owner in owners[1:]:

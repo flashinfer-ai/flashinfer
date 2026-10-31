@@ -39,6 +39,10 @@ from tests.test_cake_causal_conv1d_det_train_kcp import (
     _context,
 )
 from tests.test_cake_causal_conv1d_det_train_kcp_multi import MROWS, _problem, _same
+from tests.test_helpers.cake_causal_conv1d_early_render import apply_to_package
+
+# Test-only: the early render's backward rules predate the required ``slots`` (the package applies no default).
+apply_to_package()
 
 NONDET = {"deterministic": False}
 

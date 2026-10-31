@@ -49,6 +49,10 @@ import pytest
 import torch
 
 from tests.test_helpers.cake_package import cake_package
+from tests.test_helpers.cake_causal_conv1d_early_render import apply_to_package
+
+# Test-only: the early render's backward rules predate the required ``slots`` (the package applies no default).
+apply_to_package()
 
 KEY = "cake.cake_causal_conv1d_train"
 pkg = cake_package(KEY)
@@ -969,7 +973,7 @@ def test_backward_is_one_launch_with_zeroed_accumulators(monkeypatch) -> None:
         layout = loader.accumulator_layout(record, C, values["n_ch_tiles"])
         acc_dtype = torch.float64 if "fp32g" in kind else torch.float32
         taps = 5 if "bias" in kind else 4
-        words = record["workspace_rule"].get("slots", 1) * taps
+        words = record["workspace_rule"]["slots"] * taps
         assert loader.accumulator_words_per_channel(record) == words
         assert values["acc"].dtype == acc_dtype and values["acc"].numel() == words * C
         assert (
@@ -1001,7 +1005,9 @@ def test_fp32g_accumulators_follow_the_rendered_rule(kind, C, monkeypatch) -> No
     launch = pkg.run_module
 
     def record_launch(name, values, *, device_index, grid=None):
-        seen.append((name, values["acc"].dtype, values["acc"].numel(), values["n_ch_tiles"]))
+        seen.append(
+            (name, values["acc"].dtype, values["acc"].numel(), values["n_ch_tiles"])
+        )
         return launch(name, values, device_index=device_index, grid=grid)
 
     monkeypatch.setattr(pkg, "run_module", record_launch)
@@ -1011,14 +1017,20 @@ def test_fp32g_accumulators_follow_the_rendered_rule(kind, C, monkeypatch) -> No
     record = loader.MODULES[name]
     layout = loader.accumulator_layout(record, C, n_ch_tiles)
     assert acc_dtype == torch.float64
-    assert acc_numel == layout["acc_elems"] == loader.accumulator_words_per_channel(record) * C
+    assert (
+        acc_numel
+        == layout["acc_elems"]
+        == loader.accumulator_words_per_channel(record) * C
+    )
     assert workspace.numel() >= layout["total_bytes"]
     _check_grads(
         dx, dw, db, reference_backward(x, w, cu, dy, b=b, policy=policy),
         policy=policy, label=f"{kind} C={C}",
     )  # fmt: skip
     dx_d, _, _ = _det_backward(det, x, w, cu, dy, b, policy)
-    assert torch.equal(dx, dx_d), f"dx differs from the deterministic package ({kind} C={C})"
+    assert torch.equal(dx, dx_d), (
+        f"dx differs from the deterministic package ({kind} C={C})"
+    )
     assert int(torch.count_nonzero(workspace)) == 0
 
 

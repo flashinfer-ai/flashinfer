@@ -2341,9 +2341,9 @@ LOGICAL_TENSORS = (
 )
 # The workspace-rule vocabulary (``record["workspace_rule"]["kind"]``): a
 # backward program's ``accumulators`` (``{"kind": "accumulators", "taps": 4 | 5,
-# "acc": "float32" | "float64", "work": "uint32"[, "slots": K]}``:
+# "acc": "float32" | "float64", "work": "uint32", "slots": K}``:
 # ``slots x taps x C`` accumulator words of dtype ``acc`` -- ``slots`` copies
-# (the program's accumulator copies; 1 when absent) of the ``[C, 4]`` taps, then
+# (the program's accumulator copies; required, a positive int) of the ``[C, 4]`` taps, then
 # the ``[C]`` bias on the bias routes -- and one ``work`` ticket counter per
 # channel tile,
 # :func:`accumulator_layout`) and a forward program's ``tile_counters`` (its
@@ -3059,26 +3059,29 @@ def _accumulator_rule(record: dict[str, Any]) -> dict[str, Any]:
         raise ValueError(
             f"module {record['kernel']}: unknown accumulator dtypes {rule['acc']!r} / {rule['work']!r}"
         )
-    slots = rule.get("slots", 1)
+    # No default: a rule without its copies would undersize ``dw_acc`` for a program that keeps several.
+    slots = rule.get("slots")
     if not isinstance(slots, int) or isinstance(slots, bool) or slots < 1:
         raise ValueError(
-            f"module {record['kernel']}: the accumulator rule's slots must be a positive int, got {slots!r}"
+            f"module {record['kernel']}: an accumulators rule must name its accumulator copies as a positive int "
+            f"'slots', got {slots!r}"
         )
     return rule
 
 
 def accumulator_words_per_channel(record: dict[str, Any]) -> int:
     """Accumulator elements per channel of a backward record's rule: ``slots x taps`` (``slots`` copies of the
-    ``taps`` per-channel sums; 1 copy when the rule names none)."""
+    ``taps`` per-channel sums)."""
 
     rule = _accumulator_rule(record)
-    return int(rule.get("slots", 1)) * int(rule["taps"])
+    return int(rule["slots"]) * int(rule["taps"])
 
 
 def _accumulator_bytes_per_channel(record: dict[str, Any]) -> int:
-    return accumulator_words_per_channel(record) * ACCUMULATOR_DTYPES[
-        record["workspace_rule"]["acc"]
-    ]
+    return (
+        accumulator_words_per_channel(record)
+        * ACCUMULATOR_DTYPES[record["workspace_rule"]["acc"]]
+    )
 
 
 def accumulator_layout(
@@ -3087,8 +3090,8 @@ def accumulator_layout(
     """Byte layout of one backward launch's ``acc`` / ``work`` inside the ``uint8`` backward workspace.
 
     ``acc``: ``slots x taps x C`` words of the rule's ``acc`` dtype (FP32, or
-    FP64 on the ``_fp32g`` routes) at offset 0 -- ``slots`` copies (the rule's,
-    1 when it names none; the program spreads its CTAs over them) of the
+    FP64 on the ``_fp32g`` routes) at offset 0 -- ``slots`` copies (the rule's
+    required field; the program spreads its CTAs over them) of the
     ``[C, 4]`` tap accumulators, then the ``[C]`` bias accumulators on the bias
     routes, in the program's own order; ``work``: ``n_ch_tiles``
     uint32 ticket counters at the next :data:`WORKSPACE_ALIGN` boundary.  The

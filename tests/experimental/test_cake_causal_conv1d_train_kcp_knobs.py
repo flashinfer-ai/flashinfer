@@ -31,6 +31,10 @@ import torch
 from flashinfer.experimental.cake.cake_causal_conv1d_train_backend import (
     kcp as conv_kcp,
 )
+from tests.test_helpers.cake_causal_conv1d_early_render import apply_to_package
+
+# Test-only: the early render's backward rules predate the required ``slots`` (the package applies no default).
+apply_to_package()
 
 
 @pytest.mark.cpu_only

@@ -595,7 +595,7 @@ def _accumulator_layout(record: dict, C: int, n_ch_tiles: int) -> dict:
         rule["kind"],
         rule["acc"],
         rule["taps"],
-        rule.get("slots", 1),
+        rule.get("slots"),  # a rule without it misses here and is refused below
         rule["work"],
         C,
         n_ch_tiles,
