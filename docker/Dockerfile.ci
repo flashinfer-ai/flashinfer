@@ -2,7 +2,6 @@ ARG CUDA_IMAGE=nvidia/cuda:12.9.0-devel-ubuntu24.04
 FROM ${CUDA_IMAGE} AS base
 
 ARG PYTORCH_INDEX=cu129
-ARG CUDNN_VERSION
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV FLASHINFER_PYTHON_ENV=flashinfer
@@ -29,13 +28,22 @@ ENV LD_LIBRARY_PATH="/opt/conda/envs/${FLASHINFER_PYTHON_ENV}/python-site-packag
 ENV TRITON_PTXAS_PATH="/usr/local/cuda/bin/ptxas"
 ENV TRITON_PTXAS_BLACKWELL_PATH="/usr/local/cuda/bin/ptxas"
 ENV FLASHINFER_PYTORCH_INDEX="${PYTORCH_INDEX}"
-ENV FLASHINFER_CUDNN_VERSION="${CUDNN_VERSION}"
 
+# One layer per stage, most stable first (see install_python_packages.sh), so a
+# cuDNN or requirements bump does not invalidate and re-pull the multi-GB torch
+# layer. The torch stage therefore runs before CUDNN_VERSION and the files that
+# change with it (requirements.txt, build_utils.py, cuda-versions.json) enter
+# the build.
+COPY docker/install/install_python_packages.sh /install/install_python_packages.sh
+RUN bash /install/install_python_packages.sh "${PYTORCH_INDEX}" "" torch
+
+ARG CUDNN_VERSION
+ENV FLASHINFER_CUDNN_VERSION="${CUDNN_VERSION}"
 COPY requirements.txt /install/requirements.txt
 COPY build_utils.py /install/build_utils.py
 COPY ci/cuda-versions.json /install/ci/cuda-versions.json
-COPY docker/install/install_python_packages.sh /install/install_python_packages.sh
-RUN bash /install/install_python_packages.sh "${PYTORCH_INDEX}" "${CUDNN_VERSION}"
+RUN bash /install/install_python_packages.sh "${PYTORCH_INDEX}" "${CUDNN_VERSION}" deps
+RUN bash /install/install_python_packages.sh "${PYTORCH_INDEX}" "${CUDNN_VERSION}" cudnn
 
 RUN conda install -n "$FLASHINFER_PYTHON_ENV" -y mpi4py mpich
 
