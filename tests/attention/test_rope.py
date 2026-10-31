@@ -1834,6 +1834,97 @@ def test_rope_quantize_fp8_cutile_rejects_unsupported(unsupported):
         flashinfer.rope.rope_quantize_fp8(**kwargs)
 
 
+ROPE_BOUND_HEAD_DIM = 64
+
+# Every public RoPE entry point, in-place and out-of-place. ``uses_pos_ids`` picks
+# the ``pos_ids`` signature over the ``indptr``/``offsets`` one.
+ROPE_ENTRY_POINTS = [
+    (flashinfer.apply_rope_inplace, False),
+    (flashinfer.apply_rope_pos_ids_inplace, True),
+    (flashinfer.apply_llama31_rope_inplace, False),
+    (flashinfer.apply_llama31_rope_pos_ids_inplace, True),
+    (flashinfer.apply_rope, False),
+    (flashinfer.apply_rope_pos_ids, True),
+    (flashinfer.apply_llama31_rope, False),
+    (flashinfer.apply_llama31_rope_pos_ids, True),
+]
+ROPE_ENTRY_POINT_IDS = [
+    "apply_rope_inplace",
+    "apply_rope_pos_ids_inplace",
+    "apply_llama31_rope_inplace",
+    "apply_llama31_rope_pos_ids_inplace",
+    "apply_rope",
+    "apply_rope_pos_ids",
+    "apply_llama31_rope",
+    "apply_llama31_rope_pos_ids",
+]
+
+
+def _rope_bound_inputs(
+    device, q_head_dim=ROPE_BOUND_HEAD_DIM, k_head_dim=None, dtype=torch.float16
+):
+    """A single-sequence ragged batch: ``indptr`` has ``batch_size + 1`` entries and
+    ``offsets`` has ``batch_size`` entries."""
+    if k_head_dim is None:
+        k_head_dim = q_head_dim
+    nnz, nheads = 2, 2
+    q = torch.zeros((nnz, nheads, q_head_dim), dtype=dtype, device=device)
+    k = torch.zeros((nnz, nheads, k_head_dim), dtype=dtype, device=device)
+    indptr = torch.tensor([0, nnz], dtype=torch.int32, device=device)
+    offsets = torch.zeros((1,), dtype=torch.int32, device=device)
+    pos_ids = torch.arange(nnz, dtype=torch.int32, device=device)
+    return q, k, indptr, offsets, pos_ids
+
+
+def _call_rope_entry_point(function, uses_pos_ids, rotary_dim, device, **head_dims):
+    q, k, indptr, offsets, pos_ids = _rope_bound_inputs(device, **head_dims)
+    if uses_pos_ids:
+        return function(q, k, pos_ids, rotary_dim=rotary_dim)
+    return function(q, k, indptr, offsets, rotary_dim=rotary_dim)
+
+
+@pytest.mark.parametrize(
+    "function,uses_pos_ids", ROPE_ENTRY_POINTS, ids=ROPE_ENTRY_POINT_IDS
+)
+@pytest.mark.parametrize(
+    "rotary_dim", [2 * ROPE_BOUND_HEAD_DIM, 3 * ROPE_BOUND_HEAD_DIM]
+)
+def test_rope_rotary_dim_exceeds_head_dim_raises(function, uses_pos_ids, rotary_dim):
+    # rotary_dim > head_dim would make the kernel read into the next head, so every
+    # wrapper rejects it before any JIT/kernel work and this runs without a GPU.
+    with pytest.raises(
+        ValueError, match=r"head_dim \(q=\d+, k=\d+\) must be >= rotary_dim \(\d+\)"
+    ):
+        _call_rope_entry_point(function, uses_pos_ids, rotary_dim, "cpu")
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs GPU for the kernel")
+@pytest.mark.parametrize(
+    "function,uses_pos_ids", ROPE_ENTRY_POINTS, ids=ROPE_ENTRY_POINT_IDS
+)
+def test_rope_rotary_dim_equal_head_dim_does_not_raise(function, uses_pos_ids):
+    # The out-of-place entry points drive the native launcher, whose own guard must
+    # accept the valid rotary_dim == head_dim case.
+    _call_rope_entry_point(function, uses_pos_ids, ROPE_BOUND_HEAD_DIM, "cuda")
+
+
+@pytest.mark.parametrize(
+    "function,uses_pos_ids", ROPE_ENTRY_POINTS, ids=ROPE_ENTRY_POINT_IDS
+)
+def test_rope_rotary_dim_exceeds_smaller_qk_head_raises(function, uses_pos_ids):
+    # The native layer requires equal q/k head dimensions, but the Python bound
+    # check runs first and names both dimensions in the error.
+    with pytest.raises(ValueError, match=r"head_dim \(q=128, k=64\)"):
+        _call_rope_entry_point(
+            function,
+            uses_pos_ids,
+            rotary_dim=128,
+            device="cpu",
+            q_head_dim=128,
+            k_head_dim=64,
+        )
+
+
 if __name__ == "__main__":
     # test_rope(2, 1, 8, 8, 1, 128, "llama", 1.0, False)
     # test_rope_pos_ids(2, 1, 8, 8, 1, 128, "llama31", 1.0, False)
