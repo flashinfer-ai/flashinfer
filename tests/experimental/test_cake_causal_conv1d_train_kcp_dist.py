@@ -226,7 +226,9 @@ def _run_rank(
     info["dx_ratio_to_one_bf16_ulp_vs_fp64"] = ulp_ratio(
         direct["dx"], _local(part, rank, cu, dx_ref)
     )
-    flags["y_within_one_bf16_ulp_of_fp64"] = info["y_ratio_to_one_bf16_ulp_vs_fp64"] <= 1.0
+    flags["y_within_one_bf16_ulp_of_fp64"] = (
+        info["y_ratio_to_one_bf16_ulp_vs_fp64"] <= 1.0
+    )
     flags["dx_within_one_bf16_ulp_of_fp64"] = (
         info["dx_ratio_to_one_bf16_ulp_vs_fp64"] <= 1.0
     )
@@ -251,7 +253,9 @@ def _run_rank(
     info["dw_sum_ratio_to_budget"] = ratio(total, total_det, float(W))
     flags["dw_sum_within_budget"] = info["dw_sum_ratio_to_budget"] <= 1.0
     info["dw_sum_ratio_to_budget_vs_fp64"] = ratio(total, dw_ref)
-    flags["dw_sum_within_budget_of_fp64"] = info["dw_sum_ratio_to_budget_vs_fp64"] <= 1.0
+    flags["dw_sum_within_budget_of_fp64"] = (
+        info["dw_sum_ratio_to_budget_vs_fp64"] <= 1.0
+    )
     flags["plain_eq_direct"] = eq(plain, direct)
     flags["handle_eq_plain"] = eq(withh, plain)
     flags["reentrant_plain_eq_direct"] = eq(plain_re, direct)

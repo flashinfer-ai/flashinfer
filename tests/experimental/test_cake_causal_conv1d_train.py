@@ -571,7 +571,9 @@ def test_routes_match_reference(case, combo) -> None:
     def outs():
         return {
             "dweight": torch.empty(C, WIDTH, dtype=dweight_dtype, device=device),
-            "dbias": None if b is None else torch.empty(C, dtype=dbias_dtype, device=device),
+            "dbias": None
+            if b is None
+            else torch.empty(C, dtype=dbias_dtype, device=device),
         }
 
     out = outs()
@@ -608,7 +610,9 @@ def test_bf16_dweight_out_with_f32_taps_keeps_dx_bitwise(case, policy) -> None:
     under ``"fp32"``) give the FP32-out call's ``dx`` bits: the tap load form is the same, only the store differs;
     the BF16 ``dweight`` is the FP32 one's within one BF16 rounding."""
 
-    _require_route(_combo_route(F32, None, policy), _combo_route(F32, None, policy, BF16))
+    _require_route(
+        _combo_route(F32, None, policy), _combo_route(F32, None, policy, BF16)
+    )
     S, C, docs = case
     x, w, cu, dy = _inputs(S, C, docs, key=7)
     dx, dw, _ = _backward(x, w, cu, dy, None, policy)
@@ -622,7 +626,9 @@ def test_bf16_dweight_out_with_f32_taps_keeps_dx_bitwise(case, policy) -> None:
         dweight=torch.empty(C, WIDTH, dtype=BF16, device=_device()),
     )
     assert dw.dtype == F32 and dw_dt.dtype == BF16
-    assert torch.equal(dx_dt, dx), f"BF16-out dx differs from the FP32-out dx at {case} {policy}"
+    assert torch.equal(dx_dt, dx), (
+        f"BF16-out dx differs from the FP32-out dx at {case} {policy}"
+    )
     atol, rtol = _grad_tolerance(policy, BF16)
     _assert_within(
         dw_dt.float(),
@@ -679,7 +685,9 @@ def test_backward_programs_switch_on_channel_count(kind, monkeypatch) -> None:
         assert int(torch.count_nonzero(workspace)) == 0, label
         if det is not None:
             dx_d, _, _ = _det_backward(det, x, w, cu, dy, b, policy)
-            assert torch.equal(dx, dx_d), f"dx differs from the deterministic package ({label})"
+            assert torch.equal(dx, dx_d), (
+                f"dx differs from the deterministic package ({label})"
+            )
     assert launched == set(names), f"never launched {set(names) - launched}"
 
 
@@ -716,7 +724,9 @@ def test_large_case_over_two_to_the_31_elements(kind) -> None:
     det = _det_or_none()
     if det is not None:
         dx_d, _, _ = _det_backward(det, x, w, cu, dy, b, policy)
-        assert torch.equal(dx, dx_d), f"dx differs from the deterministic package ({label})"
+        assert torch.equal(dx, dx_d), (
+            f"dx differs from the deterministic package ({label})"
+        )
         del dx_d
     del x, dy, dx
     torch.cuda.empty_cache()
@@ -1537,19 +1547,34 @@ def test_fp32_dweight_must_be_16_byte_aligned() -> None:
             with pytest.raises(ValueError, match="16-byte aligned"):
                 _backward(x, w, cu, dy, bias, dweight=misaligned, workspace=workspace)
     torch.cuda.synchronize(device)
-    assert int(torch.count_nonzero(buf)) == 0 and int(torch.count_nonzero(workspace)) == 0
+    assert (
+        int(torch.count_nonzero(buf)) == 0 and int(torch.count_nonzero(workspace)) == 0
+    )
     aligned = buf[4:].view(C, WIDTH)
     db_view = torch.zeros(C + 1, dtype=F32, device=device)[1:]
-    dx, dw, db = _backward(x, w, cu, dy, b, dweight=aligned, dbias=db_view, workspace=workspace)
+    dx, dw, db = _backward(
+        x, w, cu, dy, b, dweight=aligned, dbias=db_view, workspace=workspace
+    )
     assert dw is aligned and db is db_view
     _check_grads(dx, dw, db, refs, policy="bf16", label="16-byte aligned dweight view")
     for dweight_offset, dbias_offset in ((4, 1), (2, 3)):
-        dw16 = torch.zeros(n + 4, dtype=BF16, device=device)[dweight_offset:][:n].view(C, WIDTH)
+        dw16 = torch.zeros(n + 4, dtype=BF16, device=device)[dweight_offset:][:n].view(
+            C, WIDTH
+        )
         db16 = torch.zeros(C + 4, dtype=BF16, device=device)[dbias_offset:][:C]
         assert dw16.data_ptr() % 16 != 0
-        dx, dw, db = _backward(x, w, cu, dy, b, dweight=dw16, dbias=db16, workspace=workspace)
+        dx, dw, db = _backward(
+            x, w, cu, dy, b, dweight=dw16, dbias=db16, workspace=workspace
+        )
         assert dw is dw16 and db is db16
-        _check_grads(dx, dw, db, refs, policy="bf16", label=f"bf16 outs at element offsets {dweight_offset} / {dbias_offset}")
+        _check_grads(
+            dx,
+            dw,
+            db,
+            refs,
+            policy="bf16",
+            label=f"bf16 outs at element offsets {dweight_offset} / {dbias_offset}",
+        )
     assert int(torch.count_nonzero(workspace)) == 0
 
 

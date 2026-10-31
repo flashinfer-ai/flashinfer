@@ -150,9 +150,15 @@ def test_multi_matches_the_fp64_reference(name, lens, cuts, Cs) -> None:
         x_g[l2g], dy_g[l2g] = xs[i], dys[i]
         y_ref, dx_ref, dw_ref = _reference(x_g, ws[i], cu, dy_g)
         label = f"{name} tensor {i} (C={Cs[i]})"
-        _assert_within(ys[i], y_ref[l2g], atol=Y_ATOL, rtol=Y_RTOL, label=f"y vs FP64 {label}")
-        _assert_within(dxs[i], dx_ref[l2g], atol=Y_ATOL, rtol=Y_RTOL, label=f"dx vs FP64 {label}")
-        _assert_within(dws[i], dw_ref, atol=DW_ATOL, rtol=DW_RTOL, label=f"dweight vs FP64 {label}")
+        _assert_within(
+            ys[i], y_ref[l2g], atol=Y_ATOL, rtol=Y_RTOL, label=f"y vs FP64 {label}"
+        )
+        _assert_within(
+            dxs[i], dx_ref[l2g], atol=Y_ATOL, rtol=Y_RTOL, label=f"dx vs FP64 {label}"
+        )
+        _assert_within(
+            dws[i], dw_ref, atol=DW_ATOL, rtol=DW_RTOL, label=f"dweight vs FP64 {label}"
+        )
 
 
 @pytest.mark.parametrize("name,lens,cuts,Cs", MROWS, ids=[r[0] for r in MROWS])

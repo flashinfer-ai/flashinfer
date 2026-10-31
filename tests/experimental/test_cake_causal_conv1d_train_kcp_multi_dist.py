@@ -43,7 +43,12 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from tests.test_cake_causal_conv1d_det_train_kcp import WIDTH, Y_ATOL, Y_RTOL, _reference
+from tests.test_cake_causal_conv1d_det_train_kcp import (
+    WIDTH,
+    Y_ATOL,
+    Y_RTOL,
+    _reference,
+)
 from tests.test_cake_causal_conv1d_det_train_kcp_dist import _free_port, _local
 from tests.test_cake_causal_conv1d_det_train_kcp_multi_dist import (
     GRAPH_ROWS,
@@ -83,7 +88,9 @@ def _ulp_ratio(a: torch.Tensor, b: torch.Tensor) -> float:
     return float(((a - b).abs() / (Y_ATOL + Y_RTOL * b.abs())).max())
 
 
-def _global_inputs(row, T: int) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+def _global_inputs(
+    row, T: int
+) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
     """``(x_all, w_all, dy_all)`` per tensor of the whole pack, drawn in ``_setup``'s order from its seed (the
     caller checks them against ``_setup``'s tensors)."""
 
@@ -256,7 +263,9 @@ def _run_rank(rank: int, W: int, row, port: int, result_dir, local_id: int) -> d
         y_ref, dx_ref, dw_ref = _reference(
             x_all.to(device), ws[i], cu_dev, dy_all.to(device)
         )
-        worst_y = max(worst_y, _ulp_ratio(m_direct[i]["y"], _local(part, rank, cu, y_ref)))
+        worst_y = max(
+            worst_y, _ulp_ratio(m_direct[i]["y"], _local(part, rank, cu, y_ref))
+        )
         worst_dx = max(
             worst_dx, _ulp_ratio(m_direct[i]["dx"], _local(part, rank, cu, dx_ref))
         )
