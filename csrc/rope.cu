@@ -622,3 +622,12 @@ void rope_quantize_append_paged_kv_cache(
     });
   });
 }
+
+// Test-only: force the token-parallel launch schedule. two_heads < 0 and split == 0 restore
+// the automatic choice.
+void rope_set_launch_override(int64_t two_heads, int64_t split) {
+  TVM_FFI_ICHECK(split >= 0 && split <= 65535) << "split must be in [0, 65535], got " << split;
+  RopeLaunchOverride& launch_override = GetRopeLaunchOverride();
+  launch_override.two_heads = two_heads < 0 ? -1 : static_cast<int32_t>(two_heads != 0);
+  launch_override.split = static_cast<uint32_t>(split);
+}
