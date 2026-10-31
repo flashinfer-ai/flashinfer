@@ -208,6 +208,137 @@ def convert_e4m3_pairs(
     return cute.TensorSSA(result_vector, (2 * count,), mma_dtype)
 
 
+# Load one e4m3 pair (a 16-bit unit at shared address $1) and convert it to one bf16x2
+# / f16x2 word ($0) in a single statement.
+_E4M3X2_SMEM_TO_BF16X2_ALU = """
+{
+    .reg .b32 s, k;
+    ld.shared.u16 s, [$1];
+    mov.b32 k, 0x7B807B80;
+    prmt.b32 s, s, 0, 0x9180;
+    shl.b32 s, s, 4;
+    and.b32 s, s, 0x87F087F0;
+    mul.rn.bf16x2 $0, s, k;
+}
+"""
+_E4M3X2_SMEM_TO_BF16X2_NATIVE = """
+{
+    .reg .b16 h;
+    ld.shared.u16 h, [$1];
+    cvt.rn.bf16x2.e4m3x2 $0, h;
+}
+"""
+_E4M3X2_SMEM_TO_F16X2 = """
+{
+    .reg .b16 h;
+    ld.shared.u16 h, [$1];
+    cvt.rn.f16x2.e4m3x2 $0, h;
+}
+"""
+
+
+def _asm_for_pair_smem(mma_dtype: type[cutlass.Numeric], native_cvt: bool) -> str:
+    if mma_dtype is cutlass.BFloat16:
+        return (
+            _E4M3X2_SMEM_TO_BF16X2_NATIVE
+            if native_cvt and _HAS_NATIVE_E4M3_BF16_CVT
+            else _E4M3X2_SMEM_TO_BF16X2_ALU
+        )
+    if mma_dtype is cutlass.Float16:
+        return _E4M3X2_SMEM_TO_F16X2
+    raise ValueError(f"W8A16 converts e4m3 to bf16 or fp16, not {mma_dtype}")
+
+
+@dsl_user_op
+def load_convert_e4m3_units(
+    addrs: list,
+    mma_dtype: type[cutlass.Numeric],
+    native_cvt: bool = True,
+    *,
+    loc=None,
+    ip=None,
+) -> cute.TensorSSA:
+    """Load the e4m3 pairs at the shared-memory addresses ``addrs`` (``Int32`` each, a
+    16-bit unit of two consecutive weights) and convert them to ``mma_dtype``; the
+    result holds ``2 * len(addrs)`` values in order.  The Hopper mainloop computes the
+    swizzled unit addresses of its fragment once per thread and loads through this, one
+    load-and-convert statement per unit, instead of a copy whose per-load swizzle
+    arithmetic the compiler could not hoist."""
+    asm = _asm_for_pair_smem(mma_dtype, native_cvt)
+    count = len(addrs)
+    out_words: list[ir.Value] = []
+    for addr in addrs:
+        word = llvm.inline_asm(
+            Uint32.mlir_type,
+            [addr.ir_value(loc=loc, ip=ip)],
+            asm,
+            "=r,r",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+        out_words.append(word)
+    out_words_type = ir.VectorType.get([count], Uint32.mlir_type, loc=loc)
+    out_words_vector = vector.from_elements(out_words_type, out_words, loc=loc, ip=ip)
+    result_type = ir.VectorType.get([2 * count], mma_dtype.mlir_type, loc=loc)
+    result_vector = llvm.bitcast(result_type, out_words_vector, loc=loc, ip=ip)
+    return cute.TensorSSA(result_vector, (2 * count,), mma_dtype)
+
+
+@dsl_user_op
+def load_e4m3_unit(addr: cutlass.Int32, *, loc=None, ip=None) -> cutlass.Uint32:
+    """``ld.shared.u16`` of the e4m3 pair at shared address ``addr`` into a zero-extended
+    32-bit register (the pair converter's input)."""
+    word = llvm.inline_asm(
+        Uint32.mlir_type,
+        [addr.ir_value(loc=loc, ip=ip)],
+        "ld.shared.u16 $0, [$1];",
+        "=r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return Uint32(word)
+
+
+@dsl_user_op
+def convert_e4m3_words(
+    words: list,
+    mma_dtype: type[cutlass.Numeric],
+    native_cvt: bool = True,
+    *,
+    loc=None,
+    ip=None,
+) -> cute.TensorSSA:
+    """Convert e4m3 pairs held zero-extended in 32-bit registers (``Uint32`` each, from
+    ``load_e4m3_unit``) to ``mma_dtype``; ``2 * len(words)`` values in order."""
+    asm = _asm_for_pair(mma_dtype, native_cvt)
+    count = len(words)
+    out_words: list[ir.Value] = []
+    for w in words:
+        out = llvm.inline_asm(
+            Uint32.mlir_type,
+            [w.ir_value(loc=loc, ip=ip)],
+            asm,
+            "=r,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+        out_words.append(out)
+    out_words_type = ir.VectorType.get([count], Uint32.mlir_type, loc=loc)
+    out_words_vector = vector.from_elements(out_words_type, out_words, loc=loc, ip=ip)
+    result_type = ir.VectorType.get([2 * count], mma_dtype.mlir_type, loc=loc)
+    result_vector = llvm.bitcast(result_type, out_words_vector, loc=loc, ip=ip)
+    return cute.TensorSSA(result_vector, (2 * count,), mma_dtype)
+
+
 @dsl_user_op
 def global_timer_lo(tag: int, *, loc=None, ip=None) -> cutlass.Int32:
     """Low 32 bits of ``%globaltimer`` (nanoseconds); debug-mode timelines only.
@@ -227,4 +358,11 @@ def global_timer_lo(tag: int, *, loc=None, ip=None) -> cutlass.Int32:
     return cutlass.Int32(val)
 
 
-__all__ = ["convert_e4m3_fragment", "convert_e4m3_pairs", "global_timer_lo"]
+__all__ = [
+    "convert_e4m3_fragment",
+    "convert_e4m3_pairs",
+    "convert_e4m3_words",
+    "global_timer_lo",
+    "load_convert_e4m3_units",
+    "load_e4m3_unit",
+]

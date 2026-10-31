@@ -40,7 +40,7 @@ import cutlass.utils as utils
 import cutlass.utils.hopper_helpers as sm90_utils
 from cutlass.cute.nvgpu import cpasync, warpgroup
 
-from .w8a16_fp8_gemm_sm100_utils import convert_e4m3_pairs
+from .w8a16_fp8_gemm_sm100_utils import convert_e4m3_words, load_e4m3_unit
 
 
 class Sm90W8A16Fp8GemmKernel:
@@ -531,26 +531,26 @@ class Sm90W8A16Fp8GemmKernel:
         # A in registers: the converted (16-bit) fragment the wgmma reads, and the
         # fp8 fragment of the same shape the smem copy fills.
         tCrA_mma = thr_mma.make_fragment_A(tCsA[(None, None, None, 0)])
-        tCrA_load = cute.make_fragment_like(tCrA_mma, self.a_dtype)
-        # The fragment's smem -> register copy moves 16-bit units (two consecutive k of
-        # one row, the wgmma A fragment's granularity); the convert then takes each
-        # unit from its own register (convert_e4m3_pairs).
-        smem_copy_atom_a = cute.make_copy_atom(
-            cute.nvgpu.CopyUniversalOp(), self.a_dtype, num_bits_per_copy=16
-        )
-        smem_tiled_copy_a = cute.make_tiled_copy_A(smem_copy_atom_a, tiled_mma)
-        smem_thr_copy_a = smem_tiled_copy_a.get_slice(ctid)
-        # The A stage is addressed by pointer arithmetic (stage base + a per-stage
-        # layout) rather than by indexing the staged tensor: the per-element swizzled
-        # offsets are then compile-time constants on top of one dynamic base, instead
-        # of a swizzle recomputed for every load (ncu: three address ops per load).
-        # (The kernel's layout argument, not self's host-side value: a kernel region
-        # may not capture values built in the host trace.)
-        a_stage_layout = cute.slice_(a_smem_layout_staged, (None, None, 0))
-        a_stage_elems = cute.cosize(a_stage_layout)
-        tCrA_copy_view = smem_thr_copy_a.retile(tCrA_load)  # (CPY, CPY_M, CPY_K)
         num_k_blocks = cute.size(tCrA_mma, mode=[2])
         k_wait_max = min(num_k_blocks - 1, 7)
+        # A fragment loads: the wgmma m64k16 A fragment of a thread is four 16-bit units
+        # (two consecutive k of one row): rows r0 and r0 + 8, k offsets c0 and c0 + 8
+        # within the k-block, r0 = warp * 16 + lane / 4 of its 64 rows, c0 = (lane % 4)
+        # * 2.  Their byte offsets within the stage's K_SW64 layout (64-byte rows,
+        # Swizzle<2, 4, 3>: bits [5:4] ^= bits [8:7]) are computed once per thread; the
+        # loop adds the stage base and loads through load_convert_e4m3_units.
+        assert tile_k == 64, "the hand-swizzled A addressing assumes 64-byte rows"
+        lane = ctid % 32
+        wg_rows0 = 0 if self.pingpong else (ctid // 128) * 64
+        r0 = wg_rows0 + ((ctid % 128) // 32) * 16 + lane // 4
+        c0 = (lane % 4) * 2
+        a_unit_off = []
+        for kb in cutlass.range_constexpr(num_k_blocks):
+            for i in cutlass.range_constexpr(4):
+                off = (r0 + 8 * (i & 1)) * tile_k + 16 * kb + c0 + 8 * (i >> 1)
+                a_unit_off.append(off ^ (((off >> 7) & 3) << 4))
+        a_smem_addr = sA_base.toint()
+        a_stage_bytes = tile_m * tile_k
 
         # The MMA slice is per warpgroup (wgmma operands and accumulator layout are
         # warpgroup-uniform), so partition_C of the tile's identity gives each element
@@ -637,38 +637,15 @@ class Sm90W8A16Fp8GemmKernel:
 
             # First k-tile: no wgmma in flight, so no wait before the converts.
             ab_pipeline.consumer_wait(read_state)
-            # The A stage as its own swizzled tensor: one dynamic base address (stages
-            # are swizzle-atom aligned, the pointer keeps its alignment when rebuilt
-            # from the integer), the swizzle on the pointer, a static per-stage layout,
-            # so the fragment copy's element offsets fold to constants.  (The loop
-            # below binds its own stage tensor under another name: a tensor rebound
-            # inside a staged loop would be threaded as a loop-carried value.)
-            stage_addr = sA_base.toint() + read_state.index * a_stage_elems
-            stage_ptr = cute.recast_ptr(
-                cute.make_ptr(
-                    self.a_dtype,
-                    stage_addr,
-                    cute.AddressSpace.smem,
-                    assumed_align=self.buffer_align_bytes,
-                ),
-                a_stage_layout.inner,
-                dtype=self.a_dtype,
-            )
-            tCsA_stage = smem_thr_copy_a.partition_S(
-                cute.make_tensor(stage_ptr, a_stage_layout.outer)
-            )
-            cute.copy(
-                smem_tiled_copy_a,
-                tCsA_stage[(None, None, 0)],
-                tCrA_copy_view[(None, None, 0)],
-            )
+            # Loads run two k-blocks ahead of the wgmma, converts one ahead, as the
+            # CUTLASS mainloop: the smem latency and the ALU work hide behind the
+            # tensor core.
+            stage_addr = a_smem_addr + read_state.index * a_stage_bytes
+            a_words = {}
+            a_words[0] = self._a_loads(0, stage_addr, a_unit_off)
             if cutlass.const_expr(num_k_blocks > 1):
-                cute.copy(
-                    smem_tiled_copy_a,
-                    tCsA_stage[(None, None, 1)],
-                    tCrA_copy_view[(None, None, 1)],
-                )
-            self._convert_a_kblock(tCrA_load, tCrA_mma, 0)
+                a_words[1] = self._a_loads(1, stage_addr, a_unit_off)
+            self._a_convert(tCrA_mma, 0, a_words[0])
             warpgroup.fence()
             for kb in cutlass.range_constexpr(num_k_blocks):
                 cute.gemm(
@@ -680,49 +657,25 @@ class Sm90W8A16Fp8GemmKernel:
                 )
                 warpgroup.commit_group()
                 if cutlass.const_expr(kb + 2 < num_k_blocks):
-                    cute.copy(
-                        smem_tiled_copy_a,
-                        tCsA_stage[(None, None, kb + 2)],
-                        tCrA_copy_view[(None, None, kb + 2)],
-                    )
+                    a_words[kb + 2] = self._a_loads(kb + 2, stage_addr, a_unit_off)
                 if cutlass.const_expr(kb + 1 < num_k_blocks):
-                    self._convert_a_kblock(tCrA_load, tCrA_mma, kb + 1)
+                    self._a_convert(tCrA_mma, kb + 1, a_words[kb + 1])
             warpgroup.fence()
             read_state.advance()
 
-            # Steady state: wgmma of k-block kb issued, at most k_wait_max groups
+            # Steady state: the wgmma of k-block kb issued, at most k_wait_max groups
             # pending, then the previous stage is released at the last k-block (all
             # its wgmma are done) and the registers of k-block kb + 1 are refilled
             # (their reader, k-block kb + 1 of the previous k-tile, is done).
             for _k_tile in cutlass.range(1, k_tile_cnt, 1, unroll=1):
                 ab_pipeline.consumer_wait(read_state)
-                stage_addr = sA_base.toint() + read_state.index * a_stage_elems
-                stage_ptr = cute.recast_ptr(
-                    cute.make_ptr(
-                        self.a_dtype,
-                        stage_addr,
-                        cute.AddressSpace.smem,
-                        assumed_align=self.buffer_align_bytes,
-                    ),
-                    a_stage_layout.inner,
-                    dtype=self.a_dtype,
-                )
-                tCsA_stage_k = smem_thr_copy_a.partition_S(
-                    cute.make_tensor(stage_ptr, a_stage_layout.outer)
-                )
-                cute.copy(
-                    smem_tiled_copy_a,
-                    tCsA_stage_k[(None, None, 0)],
-                    tCrA_copy_view[(None, None, 0)],
-                )
+                stage_addr_k = a_smem_addr + read_state.index * a_stage_bytes
+                a_words_k = {}
+                a_words_k[0] = self._a_loads(0, stage_addr_k, a_unit_off)
                 if cutlass.const_expr(num_k_blocks > 1):
-                    cute.copy(
-                        smem_tiled_copy_a,
-                        tCsA_stage_k[(None, None, 1)],
-                        tCrA_copy_view[(None, None, 1)],
-                    )
+                    a_words_k[1] = self._a_loads(1, stage_addr_k, a_unit_off)
                 warpgroup.wait_group(k_wait_max)
-                self._convert_a_kblock(tCrA_load, tCrA_mma, 0)
+                self._a_convert(tCrA_mma, 0, a_words_k[0])
                 warpgroup.fence()
                 for kb in cutlass.range_constexpr(num_k_blocks):
                     cute.gemm(
@@ -738,13 +691,11 @@ class Sm90W8A16Fp8GemmKernel:
                         ab_pipeline.consumer_release(release_state)
                         release_state.advance()
                     if cutlass.const_expr(kb + 2 < num_k_blocks):
-                        cute.copy(
-                            smem_tiled_copy_a,
-                            tCsA_stage_k[(None, None, kb + 2)],
-                            tCrA_copy_view[(None, None, kb + 2)],
+                        a_words_k[kb + 2] = self._a_loads(
+                            kb + 2, stage_addr_k, a_unit_off
                         )
                     if cutlass.const_expr(kb + 1 < num_k_blocks):
-                        self._convert_a_kblock(tCrA_load, tCrA_mma, kb + 1)
+                        self._a_convert(tCrA_mma, kb + 1, a_words_k[kb + 1])
                 warpgroup.fence()
                 read_state.advance()
             if cutlass.const_expr(self.pingpong):
@@ -866,16 +817,15 @@ class Sm90W8A16Fp8GemmKernel:
             n_tile = full_groups * group + t2 % rem
         return m_tile, n_tile, tile_l
 
-    @cute.jit
-    def _convert_a_kblock(
-        self,
-        tCrA_load: cute.Tensor,
-        tCrA_mma: cute.Tensor,
-        kb: cutlass.Constexpr,
-    ):
-        pairs = cute.recast_tensor(tCrA_load[(None, None, kb)], cutlass.Uint16).load()
+    # Plain (trace-time) methods: they emit ops inline at the call site.
+    def _a_loads(self, kb: int, stage_addr, a_unit_off: list) -> list:
+        """The four 16-bit units of k-block ``kb`` of the thread's A fragment, loaded
+        from the stage at shared address ``stage_addr`` into 32-bit registers."""
+        return [load_e4m3_unit(stage_addr + a_unit_off[4 * kb + i]) for i in range(4)]
+
+    def _a_convert(self, tCrA_mma: cute.Tensor, kb: int, words: list) -> None:
         tCrA_mma[(None, None, kb)].store(
-            convert_e4m3_pairs(pairs, self.mma_dtype, native_cvt=False)
+            convert_e4m3_words(words, self.mma_dtype, native_cvt=False)
         )
 
     # ----------------------------------------------------------------- launch
