@@ -522,21 +522,22 @@ def wcx_resolves_on(
     (the argument, else the environment) > 0, an early-start geometry, and a
     grouped GEMM with the early-start and WCX pairs (the shipped launcher; a
     development launcher is assumed to have both, and the runner still turns
-    WCX off if it does not)."""
+    WCX off if it does not). With WCX off it returns before it reads the
+    environment or imports a development launcher."""
+    if wcx_max_tokens <= 0 or not early_start_geometry_ok(
+        num_local_experts, hidden_size, intermediate_size
+    ):
+        return False
     early_max = (
         _fc2_early_max_tokens_default()
         if fc2_early_max_tokens is None
         else int(fc2_early_max_tokens)
     )
-    gemm_ok = _dev_launcher_factory() is not None or (
+    if early_max <= 0:
+        return False
+    return _dev_launcher_factory() is not None or (
         getattr(ExportedGroupedGemm, "supports_early_start", False)
         and getattr(ExportedGroupedGemm, "supports_wcx", False)
-    )
-    return (
-        wcx_max_tokens > 0
-        and early_max > 0
-        and early_start_geometry_ok(num_local_experts, hidden_size, intermediate_size)
-        and gemm_ok
     )
 
 

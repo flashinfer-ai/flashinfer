@@ -932,6 +932,13 @@ def test_wcx_resolves_on_conditions(monkeypatch) -> None:
     monkeypatch.setenv(cake_runner.FC2_EARLY_MAX_TOKENS_ENV, "0")
     assert not cake_runner.wcx_resolves_on(**base)
     assert cake_runner.wcx_resolves_on(**{**base, "fc2_early_max_tokens": 16})
+    # with WCX off it reads neither the FC2 setting nor the development launcher
+    monkeypatch.setenv(cake_runner.FC2_EARLY_MAX_TOKENS_ENV, "not-an-int")
+    monkeypatch.setenv(
+        "FLASHINFER_SM90_CAKE_BF16_DEV_LAUNCHER", "flashinfer_no_such_module"
+    )
+    assert not cake_runner.wcx_resolves_on(**{**base, "wcx_max_tokens": 0})
+    assert not cake_runner.wcx_resolves_on(**{**base, "hidden_size": 128})
 
 
 @requires_sm90
