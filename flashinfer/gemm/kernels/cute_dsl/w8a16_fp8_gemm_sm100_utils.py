@@ -15,7 +15,7 @@ import cutlass
 import cutlass.cute as cute
 from cutlass._mlir import ir
 from cutlass._mlir.dialects import llvm, vector
-from cutlass.cutlass_dsl import Uint16, Uint32, dsl_user_op
+from cutlass.cutlass_dsl import Uint16, Uint32, Uint64, dsl_user_op
 
 # ``cvt.rn.bf16x2.e4m3x2`` (PTX ISA 9.2, sm_100+) converts a pair in one instruction;
 # it needs CUDA 13.2 or newer.  Older toolkits take the four-instruction ALU chain.
@@ -396,6 +396,36 @@ def ld_acquire_gpu_s32(addr: cutlass.Int64, *, loc=None, ip=None) -> cutlass.Int
         ip=ip,
     )
     return cutlass.Int32(val)
+
+
+@dsl_user_op
+def atomic_add_acq_rel_gpu_u64(
+    addr: cutlass.Int64, value: cutlass.Int64, *, loc=None, ip=None
+) -> cutlass.Int64:
+    """``atom.acq_rel.gpu.global.add.u64`` on the global 64-bit word at ``addr``;
+    returns the old value."""
+    old = _asm_op(
+        Uint64.mlir_type,
+        [addr.ir_value(loc=loc, ip=ip), value.ir_value(loc=loc, ip=ip)],
+        "atom.acq_rel.gpu.global.add.u64 $0, [$1], $2;",
+        "=l,l,l",
+        loc=loc,
+        ip=ip,
+    )
+    return cutlass.Int64(old)
+
+
+@dsl_user_op
+def ld_acquire_gpu_u64(addr: cutlass.Int64, *, loc=None, ip=None) -> cutlass.Int64:
+    val = _asm_op(
+        Uint64.mlir_type,
+        [addr.ir_value(loc=loc, ip=ip)],
+        "ld.acquire.gpu.global.u64 $0, [$1];",
+        "=l,l",
+        loc=loc,
+        ip=ip,
+    )
+    return cutlass.Int64(val)
 
 
 @dsl_user_op

@@ -673,11 +673,12 @@ _TAIL_COUNTERS: Dict[torch.device, torch.Tensor] = {}
 
 
 def _sm90_tail_counters(device: torch.device, count: int) -> torch.Tensor:
-    """Per-device int32 arrival counters for the tail tiles: zero between calls (the
-    last slice of a tile resets its counter), grown when a call needs more."""
+    """Per-device 64-bit arrival counters for the tail tiles.  They only grow (every
+    finished tile advances its counter by one ``TAIL_COUNTER_STRIDE``, so a counter is
+    always at a stride boundary between calls); grown when a call needs more."""
     buf = _TAIL_COUNTERS.get(device)
     if buf is None or buf.numel() < count:
-        buf = torch.zeros(max(count, 1024), dtype=torch.int32, device=device)
+        buf = torch.zeros(max(count, 1024), dtype=torch.int64, device=device)
         _TAIL_COUNTERS[device] = buf
     return buf
 
@@ -786,7 +787,7 @@ def _w8a16_fp8_gemm_sm90(
         make_ptr(bias_ctype, bias_tensor.data_ptr(), cute_gmem(), assumed_align=4),
         make_ptr(act_ctype, out.data_ptr(), cute_gmem(), assumed_align=16),
         make_ptr(cutlass.Float32, workspace.data_ptr(), cute_gmem(), assumed_align=16),
-        make_ptr(cutlass.Int32, counters.data_ptr(), cute_gmem(), assumed_align=4),
+        make_ptr(cutlass.Int64, counters.data_ptr(), cute_gmem(), assumed_align=8),
     )
     stream = current_cuda_stream()
     compiled = _get_sm90_kernel(

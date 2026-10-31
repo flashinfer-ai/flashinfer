@@ -47,14 +47,22 @@ import cutlass.utils.hopper_helpers as sm90_utils
 from cutlass.cute.nvgpu import cpasync, warpgroup
 
 from .w8a16_fp8_gemm_sm100_utils import (
-    atomic_add_acq_rel_gpu,
+    atomic_add_acq_rel_gpu_u64,
     bulk_store_complete_fence,
     convert_e4m3_words,
-    ld_acquire_gpu_s32,
+    ld_acquire_gpu_u64,
     load_e4m3_unit,
     nanosleep,
-    st_relaxed_gpu_s32,
 )
+
+# The tail tiles' arrival counters only ever grow.  Every slice of a tile adds
+# ``TAIL_COUNTER_STRIDE // splits``, so a complete tile advances its counter by exactly
+# one stride whatever its split count (the stride is lcm(1..16); 16 is the most slices
+# a tile is cut into), and a slice waits for the next stride boundary above the value
+# it saw.  No reset, so no second round trip, and a counter that a different launch
+# used with another split count is still at a boundary.  Launches to overflow a
+# 64-bit counter: 2^63 / 720720, never.
+TAIL_COUNTER_STRIDE = 720720
 
 
 @cute.jit
@@ -1072,23 +1080,26 @@ class Sm90W8A16Fp8GemmKernel:
         it (bulk stores complete, release), count in on the tile's counter, wait for
         the tile's ``tail_splits`` slices, then reduce this slice's share of the tile's
         activation columns over all blocks, apply scale and bias and store the 16-bit
-        output.  A second count by every slice lets the last one reset the counter."""
+        output.  The counter is monotonic (see ``TAIL_COUNTER_STRIDE``): the add's
+        return value tells the last slice it is last, so only the others poll."""
         tile_m, tile_a, _ = self.tile_shape_mnk
         epi_barrier = pipeline.NamedBarrier(
             barrier_id=barrier_id, num_threads=self.num_epi_threads
         )
-        counter_addr = counters.iterator.toint() + tail_tile * 4
+        counter_addr = counters.iterator.toint() + tail_tile * 8
         # ``etid``: the thread's index within the tile's epilogue group (both consumer
         # warpgroups under cooperative, its own under ping-pong).
         if warp_idx == epi_store_warp:
             bulk_store_complete_fence()
         epi_barrier.arrive_and_wait()
         if etid == 0:
-            atomic_add_acq_rel_gpu(counter_addr, cutlass.Int32(1))
-            seen = ld_acquire_gpu_s32(counter_addr)
-            while seen < tail_splits:
+            step = cutlass.Int64(TAIL_COUNTER_STRIDE // tail_splits)
+            old = atomic_add_acq_rel_gpu_u64(counter_addr, step)
+            target = (old // TAIL_COUNTER_STRIDE + 1) * TAIL_COUNTER_STRIDE
+            seen = old + step
+            while seen < target:
                 nanosleep(64)
-                seen = ld_acquire_gpu_s32(counter_addr)
+                seen = ld_acquire_gpu_u64(counter_addr)
         epi_barrier.arrive_and_wait()
 
         # This slice's columns: [slice * q + min(slice, rem), ...), q = tile_a / splits.
@@ -1111,8 +1122,11 @@ class Sm90W8A16Fp8GemmKernel:
             w_row = w_base + rvec * 8
             if act_row < act_rows:
                 if w_row < weight_rows:
+                    # Unrolled so the slices' loads are all in flight before the first
+                    # add (a thread usually owns one vector; serial loads would cost a
+                    # global-memory latency per slice).
                     acc = wv[(None, rvec, block0 * tile_a + col)].load()
-                    for sl in cutlass.range(1, tail_splits, 1, unroll=1):
+                    for sl in cutlass.range(1, tail_splits, 1, unroll=8):
                         acc = (
                             acc + wv[(None, rvec, (block0 + sl) * tile_a + col)].load()
                         )
@@ -1120,12 +1134,6 @@ class Sm90W8A16Fp8GemmKernel:
                     if cutlass.const_expr(self.has_bias):
                         acc = acc + bv[(None, w_row // 8)].load().to(cutlass.Float32)
                     cv[(None, w_row // 8, act_row)].store(acc.to(cv.element_type))
-
-        epi_barrier.arrive_and_wait()
-        if etid == 0:
-            prev = atomic_add_acq_rel_gpu(counter_addr, cutlass.Int32(1))
-            if prev == 2 * tail_splits - 1:
-                st_relaxed_gpu_s32(counter_addr, cutlass.Int32(0))
 
     # ------------------------------------------------------- output epilogue
     @cute.jit
@@ -1268,8 +1276,8 @@ class Sm90W8A16Fp8GemmKernel:
         """Weight [n, k] fp8 and activation [m, k] 16-bit, K-major; out [m, n] row-major
         is C[n, m, 1].  The workspace holds ``tail_blocks`` fp32 tiles of
         (tile_m, tile_a), one per tail work item, as W[tile_m, tail_blocks * tile_a, 1]
-        (weight rows contiguous, as C); ``counters`` are the tail tiles' int32 arrival
-        counters (zero on entry, left zero)."""
+        (weight rows contiguous, as C); ``counters`` are the tail tiles' 64-bit
+        monotonic arrival counters (``TAIL_COUNTER_STRIDE``), one per tail tile."""
         tile_m, tile_a, _ = self.tile_shape_mnk
         weight = cute.make_tensor(
             weight_ptr, cute.make_ordered_layout((n, k, 1), order=(1, 0, 2))
