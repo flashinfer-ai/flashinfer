@@ -694,6 +694,15 @@ _CONTEXT_FP8_SHORT_KV_ONE_STAGE_PROGRAMS: dict[str, frozenset[str]] = {
         f"RUNTIME_PACK{pack}_PAGE64_PX_Q1" for pack in (*_CONTEXT_FP8_RUNTIME_PACKS, 1)
     ),
 }
+# Per target, the query tokens at most which a short-KV call of 64-token
+# pages tries pack 2 before pack 1 when its pack-2 tiles number at least
+# _CONTEXT_FP8_SHORT_KV_PAGE64_PACK2_TILES: its page-64 tiles of two query
+# heads ran faster than those of one (timed GB300: 1 .. 8 requests of 1 .. 32
+# query tokens over 128 keys, heads 8/1 .. 64/8, with 32 or more pack-2
+# tiles); with fewer tiles pack 1 spreads the call over more SMs and some of
+# those calls ran slower with pack 2.
+_CONTEXT_FP8_SHORT_KV_PAGE64_PACK2_TOKENS: dict[str, int] = {"sm103a": 32}
+_CONTEXT_FP8_SHORT_KV_PAGE64_PACK2_TILES: dict[str, int] = {"sm103a": 32}
 # The FP8 split-KV context programs: the runtime-size schedule and arguments,
 # with the key range of the first ``split_tiles`` tiles split over work units
 # of ``split_blocks`` KV blocks (at most ``num_splits`` per tile), whose FP32
@@ -5563,10 +5572,19 @@ def select_cake_fmha_context_route(
             short_tiles = _CONTEXT_FP8_SHORT_KV_ONE_STAGE_TILES.get(target)
             short_pack = None
             if short_runtime and runtime_pack is not None and short_tiles is not None:
+                order = (1, *reversed(_CONTEXT_FP8_RUNTIME_PACKS))
+                if (
+                    page_size == 64
+                    and max_q_len
+                    <= _CONTEXT_FP8_SHORT_KV_PAGE64_PACK2_TOKENS.get(target, 0)
+                    and batch_size * (num_q_heads // 2)
+                    >= _CONTEXT_FP8_SHORT_KV_PAGE64_PACK2_TILES.get(target, 0)
+                ):
+                    order = (2, 1, *reversed(_CONTEXT_FP8_RUNTIME_PACKS[:-1]))
                 short_pack = next(
                     (
                         candidate
-                        for candidate in (1, *reversed(_CONTEXT_FP8_RUNTIME_PACKS))
+                        for candidate in order
                         if candidate <= runtime_pack
                         and runtime_pack % candidate == 0
                         and max_q_len <= 128 // candidate
