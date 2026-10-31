@@ -125,6 +125,11 @@ class Sm90W8A16Fp8GemmKernel:
         self.has_tail = has_tail
         self.enable_pdl = enable_pdl
         self.acc_dtype = cutlass.Float32
+        # EXPERIMENT: cut the tail fix-up: 1 = partial store only, 2 = + publish, count
+        # and spin, 3 = + reduce loads (no output store), 0 = everything.
+        import os
+
+        self.fixup_cut = int(os.environ.get("W8A16_DSL_FIXUP_CUT", "0"))
 
         # Two consumer warpgroups either way.  Cooperative (128 weight rows): both work
         # on one tile, 64 rows each.  Ping-pong (64 rows): each owns every other tile of
@@ -956,7 +961,7 @@ class Sm90W8A16Fp8GemmKernel:
                         cute.group_modes(sW, 0, 2),
                         tCgW_epi,
                     )
-                    for m_sub in cutlass.range_constexpr(m_subs):
+                    for m_sub in cutlass.range_constexpr(0 if self.fixup_cut == 4 else m_subs):
                         for n_sub in cutlass.range_constexpr(n_subs):
                             base = (m_sub * n_subs + n_sub) * size_tRS_rW
                             for b in cutlass.range_constexpr(n8_blocks):
@@ -973,6 +978,13 @@ class Sm90W8A16Fp8GemmKernel:
                                 tRS_sW[(None, None, None, epi_buffer)],
                             )
                             cute.arch.fence_proxy("async.shared", space="cta")
+                            # One barrier per subtile: the storing warp first waits
+                            # for the previous TMA store to finish reading its buffer
+                            # (the one the next subtile writes), so after the barrier
+                            # everyone may write it and the store of this subtile can
+                            # be issued.
+                            if warp_idx == epi_store_warp:
+                                cute.arch.cp_async_bulk_wait_group(0, read=True)
                             epi_barrier.arrive_and_wait()
                             if warp_idx == epi_store_warp:
                                 cute.copy(
@@ -981,8 +993,6 @@ class Sm90W8A16Fp8GemmKernel:
                                     bSG_gW[(None, (m_sub, n_sub))],
                                 )
                                 tma_store_pipeline.producer_commit()
-                                tma_store_pipeline.producer_acquire()
-                            epi_barrier.arrive_and_wait()
                     self._tail_fixup(
                         1 + cg,
                         tile_idx - body_items,
@@ -1090,6 +1100,8 @@ class Sm90W8A16Fp8GemmKernel:
             barrier_id=barrier_id, num_threads=self.num_epi_threads
         )
         counter_addr = counters.iterator.toint() + tail_tile * 8
+        if cutlass.const_expr(self.fixup_cut == 1 or self.fixup_cut == 4):
+            return
         # ``etid``: the thread's index within the tile's epilogue group (both consumer
         # warpgroups under cooperative, its own under ping-pong).
         if warp_idx == epi_store_warp:
@@ -1104,6 +1116,8 @@ class Sm90W8A16Fp8GemmKernel:
                 nanosleep(64)
                 seen = ld_acquire_gpu_u64(counter_addr)
         epi_barrier.arrive_and_wait()
+        if cutlass.const_expr(self.fixup_cut == 2):
+            return
 
         # This slice's columns: [slice * q + min(slice, rem), ...), q = tile_a / splits.
         q = tile_a // tail_splits
@@ -1136,7 +1150,11 @@ class Sm90W8A16Fp8GemmKernel:
                     acc = scale_val * acc
                     if cutlass.const_expr(self.has_bias):
                         acc = acc + bv[(None, w_row // 8)].load().to(cutlass.Float32)
-                    cv[(None, w_row // 8, act_row)].store(acc.to(cv.element_type))
+                    if cutlass.const_expr(self.fixup_cut == 3):
+                        if acc[0] == 12345.0:
+                            cv[(None, w_row // 8, act_row)].store(acc.to(cv.element_type))
+                    else:
+                        cv[(None, w_row // 8, act_row)].store(acc.to(cv.element_type))
 
     # ------------------------------------------------------- output epilogue
     @cute.jit
@@ -1200,6 +1218,10 @@ class Sm90W8A16Fp8GemmKernel:
                     tiled_copy_r2s, tRS_rD_out, tRS_sD[(None, None, None, epi_buffer)]
                 )
                 cute.arch.fence_proxy("async.shared", space="cta")
+                # One barrier per subtile (see the tail path): the storing warp waits
+                # for the previous store's smem read before the barrier.
+                if warp_idx == epi_store_warp:
+                    cute.arch.cp_async_bulk_wait_group(0, read=True)
                 epi_barrier.arrive_and_wait()
                 if warp_idx == epi_store_warp:
                     cute.copy(
@@ -1208,8 +1230,6 @@ class Sm90W8A16Fp8GemmKernel:
                         bSG_gD[(None, (m_sub, n_sub))],
                     )
                     tma_store_pipeline.producer_commit()
-                    tma_store_pipeline.producer_acquire()
-                epi_barrier.arrive_and_wait()
 
     # --------------------------------------------------------------- helpers
     @cute.jit

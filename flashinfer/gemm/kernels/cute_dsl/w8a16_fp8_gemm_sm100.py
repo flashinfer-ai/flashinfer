@@ -1682,6 +1682,12 @@ class Sm100W8A16Fp8GemmKernel:
                         t_s0 = self._dbg_clock(63)
                         if cutlass.const_expr(self.debug):
                             epi_cyc_cvt += t_s0 - t_c0
+                        # One CTA barrier per subtile: the storing warp first waits for
+                        # the previous TMA store to finish reading its buffer (the one
+                        # the next subtile writes); after the barrier everyone may write
+                        # it and this subtile's store is issued.
+                        if warp_idx == self.epilog_warp_id[0]:
+                            cute.arch.cp_async_bulk_wait_group(0, read=True)
                         self.epilog_sync_barrier.arrive_and_wait()
                         if cutlass.const_expr(self.debug and subtile_idx == 0):
                             if epi_tidx == 0:
@@ -1695,15 +1701,11 @@ class Sm100W8A16Fp8GemmKernel:
                                 bSG_gC[(None, subtile_idx)],
                             )
                             c_pipeline.producer_commit()
-                            c_pipeline.producer_acquire()
                         if cutlass.const_expr(self.debug and subtile_idx == 0):
                             if epi_tidx == 0:
                                 dbg[dbg_base + _slot_if(epi_tile_count == 0, 14)] = (
                                     clock_lo(14)
                                 )
-                        self.epilog_sync_barrier.arrive_and_wait()
-                        if cutlass.const_expr(self.debug and subtile_idx == 0):
-                            if epi_tidx == 0:
                                 dbg[dbg_base + _slot_if(epi_tile_count == 0, 17)] = (
                                     clock_lo(17)
                                 )
