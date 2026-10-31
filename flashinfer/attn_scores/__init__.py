@@ -20,7 +20,7 @@ from .attn_scores import (
     padded_seq_len,
     precompile_paged_mqa_logits,
 )
-from .single_head import single_head_paged_mqa_logits
+from .single_head import quantize_write_index_k_nvfp4, single_head_paged_mqa_logits
 
 __all__ = [
     "fp8_paged_mqa_logits",
@@ -29,5 +29,6 @@ __all__ = [
     "min_block_table_width",
     "padded_seq_len",
     "precompile_paged_mqa_logits",
+    "quantize_write_index_k_nvfp4",
     "single_head_paged_mqa_logits",
 ]
