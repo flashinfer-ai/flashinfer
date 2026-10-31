@@ -30,7 +30,7 @@ host overhead are excluded for every arm.
 Prims-TS requires CuTe-DSL >= 4.8 with its bundled CUDA 13 compiler. Grids
 above one wave run persistently; small batches split long KV lists across CTAs,
 merged by a separate reducer (rows record the split). Measured B200 Prims-TS
-and upstream FlashMLA latencies are recorded in examples/deepseek_v41/README.md;
+and TRTLLM-GEN latencies are recorded in examples/deepseek_v41/README.md;
 backend crossovers against the cute-dsl arm remain unmeasured.
 See examples/deepseek_v41/README.md for scope and reproducer commands.
 """
