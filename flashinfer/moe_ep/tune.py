@@ -191,7 +191,8 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         "--apply-topk-in-fc1",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="apply routing weights in FC1; disable for post-FC2 weighting (SM100 NVFP4)",
+        help="apply routing weights in FC1; disable for post-FC2 weighting "
+        "(SM100 and SM107 NVFP4)",
     )
     parser.add_argument(
         "--max-candidates",
@@ -399,13 +400,21 @@ def main(argv: Optional[List[str]] = None) -> int:
     if not args.do_finalize or (
         not args.apply_routing_weights_before_fc2 and args.kernel_variant != "genphase"
     ):
-        if family != "sm100" or not (
+        if family not in ("sm100", "sm107") or not (
             args.dtype == "nvfp4"
             or (next_standard and args.kernel_variant == "inference")
         ):
             print(
                 "caller finalization and routing-weight placement require SM100 "
-                "NVFP4 or the next standard implementation",
+                "NVFP4 or the next standard implementation"
+                " (routing-weight placement: SM107 NVFP4 too)",
+                file=sys.stderr,
+            )
+            return 2
+        if not args.do_finalize and family != "sm100":
+            print(
+                "caller finalization requires SM100 NVFP4 or the next standard "
+                "implementation",
                 file=sys.stderr,
             )
             return 2

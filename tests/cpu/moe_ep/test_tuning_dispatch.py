@@ -104,7 +104,19 @@ def test_blackwell_genphase_dtype_dispatch(dtype, implementation, dispatched):
         ["--arch", "sm107", "--dtype", "mxfp8_e4m3", "--input-norm-const", "2"],
         ["--arch", "sm107", "--no-do-finalize"],
         ["--arch", "sm100", "--dtype", "bf16", "--no-do-finalize"],
-        ["--arch", "sm107", "--no-apply-routing-weights-before-fc2"],
+        [
+            "--arch",
+            "sm107",
+            "--dtype",
+            "mxfp8_e4m3",
+            "--no-apply-routing-weights-before-fc2",
+        ],
+        [
+            "--arch",
+            "sm107",
+            "--no-apply-routing-weights-before-fc2",
+            "--allow-nondeterministic",
+        ],
         ["--arch", "sm100", "--no-do-finalize", "--allow-nondeterministic"],
         [
             "--arch",
@@ -159,6 +171,20 @@ def test_finalization_and_routing_options_reach_nvfp4_tuner(
     )
     (args,) = received
     assert args.do_finalize == do_finalize
+    assert not args.apply_routing_weights_before_fc2
+
+
+@pytest.mark.cpu_only
+def test_post_fc2_routing_weights_reach_sm107_nvfp4_tuner(monkeypatch):
+    received = []
+    monkeypatch.setattr(
+        tune.importlib,
+        "import_module",
+        lambda *args: SimpleNamespace(run_tuning=lambda args: received.append(args)),
+    )
+    tune.main([*_GEOMETRY, "--arch", "sm107", "--no-apply-routing-weights-before-fc2"])
+    (args,) = received
+    assert args.do_finalize
     assert not args.apply_routing_weights_before_fc2
 
 
