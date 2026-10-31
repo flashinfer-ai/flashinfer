@@ -122,3 +122,16 @@ Until then the C++ stays as-is and the DSL kernel lives beside it.
   rows (gen.qkv 30.2/31.8, attn.out 25.8/27.2, gate_up 60.9/62.0, mlp.down 64.9/66.5),
   und.q 4096 72.7/74.2 and the split-K rows (und.kv 15.4/16.4, 21.7/22.9); ahead on
   attn.out 8192 (130.4/125.2).  Next: Hopper port; the small-M residue after that.
+- Sat 31 Oct 2026: Hopper port first light on H100 (s4124-0017, x86 venv
+  `w8a16-x86-venv`, public CUDA 13.3.1 for the C++ JIT).  Kernel: persistent warp-
+  specialized, producer warpgroup + 1 or 2 consumer warpgroups, A (fp8 weight) smem ->
+  registers -> ALU convert -> register-sourced wgmma, B from smem, TMA-store epilogue,
+  C++ grouped tile order, split-K with tile-padded partials (no predicated store path).
+  Every variant (128x256/192/160/128, 64x256, 64x128, split-K 10/11; bias on/off) matches
+  the C++ bitwise where the C++ auto picks the same tile.  Lessons: the per-element row
+  of a wgmma accumulator = identity partition (warpgroup-uniform) + warp*16 + lane/4; the
+  fp32 partials go through the plain 32-bit copy whose fragment order is (row, col pair,
+  n8) while the accumulator chunk runs (col pair, row, n8).  First H100 bench: DSL 7-50%
+  behind; the cost model picks the ping-pong tiles on 8 of 18 rows, which run here as
+  single-warpgroup tiles (half the wgmma issue) -> implementing true ping-pong next;
+  stream-K rows (gate_up 4096/8192, mlp.down 1024) pay the wave quantization (+17%).

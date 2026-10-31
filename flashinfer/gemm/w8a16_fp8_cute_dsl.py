@@ -14,17 +14,19 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-"""W8A16 FP8 GEMM, CuTe-DSL kernels (Blackwell first).
+"""W8A16 FP8 GEMM, CuTe-DSL kernels (Blackwell and Hopper).
 
 Same contract as the C++ op in ``w8a16_fp8.py``:
 ``out[M, N] = act[M, K] @ (fp8_weight[N, K] * scale).T (+ bias[N])``.  While the
 two implementations coexist this module is reached through
 ``w8a16_fp8_gemm_cute_dsl``; the variant selection (``algo`` codes, tile walk) is
-the C++ dispatcher's (``include/flashinfer/gemm/w8a16_sm100/dispatch.hpp``,
-``tile_order.hpp``) ported line by line so the two run the same kernel for a
-problem.
+the C++ dispatchers' (``include/flashinfer/gemm/w8a16_sm100/dispatch.hpp`` and
+``tile_order.hpp``, ``w8a16_sm90/dispatch.hpp`` and ``tile_order.hpp``) ported
+line by line so the two run the same kernel for a problem.
 """
 
+import math
+import os
 from typing import Dict, Optional, Tuple
 
 import torch
@@ -245,6 +247,7 @@ def _get_reduce_kernel(
         *pointers,
         1,
         8,
+        1,
         stream=stream,
         options="--opt-level 2 --enable-tvm-ffi",
     )
@@ -275,8 +278,11 @@ def w8a16_fp8_gemm_cute_dsl(
         raise ValueError(f"act must be bf16 or fp16, got {act.dtype}")
     if weight.dtype != torch.float8_e4m3fn:
         raise ValueError(f"weight must be float8_e4m3fn, got {weight.dtype}")
-    if get_compute_capability(act.device)[0] != 10:
-        raise RuntimeError("the CuTe-DSL W8A16 kernel is Blackwell-only for now")
+    major = get_compute_capability(act.device)[0]
+    if major not in (9, 10):
+        raise RuntimeError(
+            "the CuTe-DSL W8A16 kernel runs on Hopper and Blackwell only"
+        )
     if act.dim() != 2 or weight.dim() != 2 or weight.shape[1] != act.shape[1]:
         raise ValueError(
             f"act [M, K] and weight [N, K] must share K, got {tuple(act.shape)} and "
@@ -301,6 +307,10 @@ def w8a16_fp8_gemm_cute_dsl(
     for name, t in (("act", act), ("weight", weight), ("out", out)):
         if t.data_ptr() % 16:
             raise ValueError(f"{name} must be 16-byte aligned")
+    if major == 9:
+        if debug_buffer is not None:
+            raise ValueError("debug_buffer is a Blackwell-kernel feature")
+        return _w8a16_fp8_gemm_sm90(act, weight, weight_scale, bias, out, algo)
     num_sms = get_device_sm_count(act.device)
     if algo == 0:
         algo = sm100_pick_algo(m, n, k, num_sms)
@@ -424,6 +434,364 @@ def w8a16_fp8_gemm_cute_dsl(
             out.data_ptr(),
             m,
             n,
+            m * n // 8,
             stream,
         )
     return out
+
+
+# ======================================================================= Hopper
+# The C++ Hopper dispatcher (``w8a16_sm90/dispatch.hpp``, ``tile_order.hpp``) ported.
+# Tile configurations by algo code (W8A16Sm90Algo): (weight rows, activation rows).
+_SM90_TILES: Dict[int, Tuple[int, int]] = {
+    2: (128, 256),
+    3: (128, 192),
+    4: (128, 160),
+    5: (128, 128),
+    6: (64, 256),
+    9: (64, 128),
+}
+# Stream-K codes run the plain tile (CUTLASS's stream-K scheduler is not ported);
+# split-K codes run the tile over K-slices.
+_SM90_STREAMK_TILE: Dict[int, int] = {7: 2, 8: 3}
+_SM90_SPLITK_TILE: Dict[int, int] = {10: 5, 11: 2}
+_SM90_TILE_K = 64
+_SM90_MAX_SPLITS = 8
+_SM90_MIN_KTILES_PER_SPLIT = 8
+_SM90_MAX_PARTIALS_BYTES = 64 << 20
+
+# The cost model's tile menu: (algo, weight rows, activation rows, ns per unit of K of one
+# tile alone on an SM, ping-pong).  Candidate order breaks ties.
+_SM90_TILE_COSTS: Tuple[Tuple[int, int, int, float, bool], ...] = (
+    (2, 128, 256, 11.37, False),
+    (3, 128, 192, 9.00, False),
+    (5, 128, 128, 7.45, False),
+    (6, 64, 256, 6.15, True),
+    (9, 64, 128, 4.50, True),
+)
+
+
+def _sm90_tile_of(algo: int) -> Tuple[int, int, int, float, bool]:
+    base = _SM90_STREAMK_TILE.get(algo, _SM90_SPLITK_TILE.get(algo, algo))
+    for t in _SM90_TILE_COSTS:
+        if t[0] == base:
+            return t
+    return _SM90_TILE_COSTS[0]
+
+
+def _sm90_is_legal_split(k: int, s: int) -> bool:
+    if s < 2 or s > _SM90_MAX_SPLITS or k % _SM90_TILE_K != 0:
+        return False
+    ktiles = k // _SM90_TILE_K
+    return ktiles % s == 0 and ktiles // s >= _SM90_MIN_KTILES_PER_SPLIT
+
+
+def _sm90_tile_us(t, k_len: float) -> float:
+    _, _, tile_a, ns_per_k, pingpong = t
+    epi = 0.0 if pingpong else 2.0 * tile_a / 256
+    return ns_per_k * 1e-3 * k_len + epi
+
+
+def _sm90_tiles_of(t, m: int, n: int) -> float:
+    return float(_tiles(n, t[1])) * float(_tiles(m, t[2]))
+
+
+def _sm90_split_us(t, m: int, n: int, k: int, num_sms: int, s: int) -> float:
+    if 4.0 * m * n * s > _SM90_MAX_PARTIALS_BYTES:
+        return 1e30
+    return (
+        math.ceil(_sm90_tiles_of(t, m, n) * s / max(num_sms, 1))
+        * _sm90_tile_us(t, k / s)
+        + 2.0
+        + 2e-6 * m * n * s
+    )
+
+
+def _sm90_pick_splits(t, m: int, n: int, k: int, num_sms: int) -> int:
+    best, best_us = 1, 1e30
+    for s in range(2, _SM90_MAX_SPLITS + 1):
+        if not _sm90_is_legal_split(k, s):
+            continue
+        us = _sm90_split_us(t, m, n, k, num_sms, s)
+        if us < best_us:
+            best_us, best = us, s
+    return best
+
+
+def sm90_splits_for(algo: int, m: int, n: int, k: int, num_sms: int) -> int:
+    """W8A16Sm90SplitsFor: the model's split, or the smallest legal one when the
+    variant is forced; 1 = K cannot be sliced."""
+    t = _sm90_tile_of(algo)
+    s = _sm90_pick_splits(t, m, n, k, num_sms)
+    if s >= 2:
+        return s
+    for c in range(2, _SM90_MAX_SPLITS + 1):
+        if _sm90_is_legal_split(k, c):
+            return c
+    return 1
+
+
+def _sm90_plain_us(t, m: int, n: int, k: int, num_sms: int) -> float:
+    return math.ceil(_sm90_tiles_of(t, m, n) / max(num_sms, 1)) * _sm90_tile_us(t, k)
+
+
+def _sm90_streamk_us(t, m: int, n: int, k: int, num_sms: int) -> float:
+    sms = float(max(num_sms, 1))
+    ktiles = k // _SM90_TILE_K
+    tiles = _sm90_tiles_of(t, m, n)
+    tile_us = _sm90_tile_us(t, k)
+    full_waves, total_waves = math.floor(tiles / sms), math.ceil(tiles / sms)
+    tail_tiles = tiles - full_waves * sms
+    if (
+        full_waves == total_waves
+        or ktiles <= 8
+        or (full_waves >= 1 and 2 * tail_tiles >= sms)
+    ):
+        return total_waves * tile_us
+    dp_waves = full_waves - 1 if full_waves > 1 else 0
+    sk_tiles = tiles - dp_waves * sms
+    units = max(1.0, min(sms, math.floor(sk_tiles * ktiles / 8.0)))
+    return (
+        dp_waves * tile_us
+        + sk_tiles * ktiles / units * (tile_us / ktiles) * 1.1
+        + 8.0
+        + 2.0 * units / sk_tiles
+    )
+
+
+def _sm90_pick_by_cost(m: int, n: int, k: int, num_sms: int) -> int:
+    best, best_us = 2, 1e30
+
+    def consider(a: int, us: float) -> None:
+        nonlocal best, best_us
+        if us < best_us:
+            best_us, best = us, a
+
+    for t in _SM90_TILE_COSTS:
+        consider(t[0], _sm90_plain_us(t, m, n, k, num_sms))
+    for a in (7, 8):
+        consider(a, _sm90_streamk_us(_sm90_tile_of(a), m, n, k, num_sms))
+    for a in (10, 11):
+        t = _sm90_tile_of(a)
+        for s in range(2, _SM90_MAX_SPLITS + 1):
+            if _sm90_is_legal_split(k, s):
+                consider(a, _sm90_split_us(t, m, n, k, num_sms, s))
+    return best
+
+
+def sm90_pick_algo(m: int, n: int, k: int, num_sms: int) -> int:
+    """W8A16Sm90PickAlgo: the cost model up to M = 8192, wave-count rules above."""
+    units = _tiles(n, 128) * _tiles(m, 256)
+    waves = units / max(num_sms, 1)
+    frac = waves - math.floor(waves)
+    if m <= 8192:
+        return _sm90_pick_by_cost(m, n, k, num_sms)
+    if n <= 512:
+        if waves < 0.75:
+            return 5
+        if m >= 16384:
+            return 3
+        return 2
+    if k <= 1024 and m >= 16384:
+        return 6
+    if waves <= 1.5:
+        if k >= 4096 and waves >= 0.7:
+            return 7
+        if n <= 2048 or k <= 3200:
+            return 6
+        return 2
+    if frac >= 0.8:
+        return 2
+    if frac < 0.15 and k >= 2048 and waves <= 16.0:
+        return 7
+    if waves <= 3.0:
+        return 6
+    return 2
+
+
+def sm90_pick_group(m: int, n: int, k: int, tile_w: int) -> int:
+    """W8A16Sm90PickGroup: activation tiles per L2 group (1 = ungrouped)."""
+    if n * k < 40 * 1000 * 1000 or m < 16384:
+        return 1
+    return 4 if _tiles(n, tile_w) >= 64 else 2
+
+
+def _get_sm90_kernel(
+    tile_algo: int,
+    act_dtype: torch.dtype,
+    has_bias: bool,
+    group: int,
+    num_persistent: int,
+    pointers: Tuple,
+    n: int,
+    m: int,
+    k: int,
+    c_cols: int,
+    stream,
+    partial_output: bool = False,
+):
+    import cutlass.cute as cute
+
+    from .kernels.cute_dsl.w8a16_fp8_gemm_sm90 import Sm90W8A16Fp8GemmKernel
+
+    key = (
+        "sm90",
+        tile_algo,
+        act_dtype,
+        has_bias,
+        group,
+        num_persistent,
+        partial_output,
+    )
+    compiled = _KERNEL_CACHE.get(key)
+    if compiled is not None:
+        return compiled
+    kernel = Sm90W8A16Fp8GemmKernel(
+        _SM90_TILES[tile_algo],
+        has_bias=has_bias,
+        group_size=group,
+        partial_output=partial_output,
+    )
+    compiled = cute.compile(
+        kernel.wrapper,
+        *pointers,
+        n,
+        m,
+        k,
+        c_cols,
+        num_persistent=num_persistent,
+        stream=stream,
+        options="--opt-level 2 --enable-tvm-ffi",
+    )
+    if os.environ.get("W8A16_DSL_VERBOSE") == "1":
+        print(
+            f"w8a16 dsl sm90 tile {_SM90_TILES[tile_algo]}: ab stages {kernel.ab_stage}, epi "
+            f"stages {kernel.epi_stage}, group {group}, partial {partial_output}",
+            flush=True,
+        )
+    _KERNEL_CACHE[key] = compiled
+    return compiled
+
+
+def _w8a16_fp8_gemm_sm90(
+    act: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    out: torch.Tensor,
+    algo: int,
+) -> torch.Tensor:
+    """The Hopper path of ``w8a16_fp8_gemm_cute_dsl`` (inputs already validated)."""
+    import cutlass
+
+    from ..cute_dsl.utils import current_cuda_stream, make_ptr
+
+    m, k = act.shape
+    n = weight.shape[0]
+    num_sms = get_device_sm_count(act.device)
+    if algo == 0:
+        algo = sm90_pick_algo(m, n, k, num_sms)
+    if algo == 1 or algo > 11:
+        raise ValueError(f"w8a16_fp8_gemm: unknown Hopper algo code {algo}")
+    splits = 1
+    partials = None
+    tile_algo = algo
+    if algo in _SM90_STREAMK_TILE:
+        tile_algo = _SM90_STREAMK_TILE[algo]  # stream-K not ported: the plain tile
+    elif algo in _SM90_SPLITK_TILE:
+        splits = sm90_splits_for(algo, m, n, k, num_sms)
+        if splits < 2:
+            raise ValueError(
+                f"w8a16_fp8_gemm split-K cannot slice K={k}: K must be a multiple of 64 "
+                "with at least 8 k-tiles per slice"
+            )
+        tile_algo = _SM90_SPLITK_TILE[algo]
+    tile_w, tile_a = _SM90_TILES[tile_algo]
+    if splits > 1 and k % (splits * _SM90_TILE_K) != 0:
+        raise ValueError(
+            "w8a16_fp8_gemm split-K: K must split into whole 64-wide k-tiles"
+        )
+    # Split-K partials: [splits, m_padded, n] fp32 with m_padded a whole number of
+    # activation tiles, so a slice's last tile never writes into the next slice.
+    m_padded = _tiles(m, tile_a) * tile_a
+    if splits > 1:
+        partials = torch.empty(
+            (splits, m_padded, n), dtype=torch.float32, device=act.device
+        )
+    c_cols = splits * m_padded if partials is not None else m
+    group = sm90_pick_group(m, n, k, tile_w)
+    has_bias = bias is not None
+    act_ctype = cutlass.BFloat16 if act.dtype == torch.bfloat16 else cutlass.Float16
+    bias_tensor = bias if has_bias else weight_scale  # any valid pointer when unused
+    bias_ctype = act_ctype if has_bias else cutlass.Float32
+    gemm_out = partials if partials is not None else out
+    gemm_out_ctype = cutlass.Float32 if partials is not None else act_ctype
+    pointers = (
+        make_ptr(
+            cutlass.Float8E4M3FN, weight.data_ptr(), cute_gmem(), assumed_align=16
+        ),
+        make_ptr(act_ctype, act.data_ptr(), cute_gmem(), assumed_align=16),
+        make_ptr(
+            cutlass.Float32, weight_scale.data_ptr(), cute_gmem(), assumed_align=4
+        ),
+        make_ptr(bias_ctype, bias_tensor.data_ptr(), cute_gmem(), assumed_align=4),
+        make_ptr(gemm_out_ctype, gemm_out.data_ptr(), cute_gmem(), assumed_align=16),
+    )
+    stream = current_cuda_stream()
+    compiled = _get_sm90_kernel(
+        tile_algo,
+        act.dtype,
+        has_bias,
+        group,
+        num_sms,
+        pointers,
+        n,
+        m,
+        k,
+        c_cols,
+        stream,
+        partial_output=partials is not None,
+    )
+    compiled(
+        weight.data_ptr(),
+        act.data_ptr(),
+        weight_scale.data_ptr(),
+        bias_tensor.data_ptr(),
+        gemm_out.data_ptr(),
+        n,
+        m,
+        k,
+        c_cols,
+        stream,
+    )
+    if partials is not None:
+        reduce_pointers = (
+            make_ptr(
+                cutlass.Float32, partials.data_ptr(), cute_gmem(), assumed_align=16
+            ),
+            make_ptr(
+                cutlass.Float32, weight_scale.data_ptr(), cute_gmem(), assumed_align=4
+            ),
+            make_ptr(bias_ctype, bias_tensor.data_ptr(), cute_gmem(), assumed_align=16),
+            make_ptr(act_ctype, out.data_ptr(), cute_gmem(), assumed_align=16),
+        )
+        reduce = _get_reduce_kernel(
+            act.dtype, has_bias, splits, reduce_pointers, stream
+        )
+        reduce(
+            partials.data_ptr(),
+            weight_scale.data_ptr(),
+            bias_tensor.data_ptr(),
+            out.data_ptr(),
+            m,
+            n,
+            m_padded * n // 8,
+            stream,
+        )
+    return out
+
+
+def cute_gmem():
+    import cutlass.cute as cute
+
+    return cute.AddressSpace.gmem

@@ -66,11 +66,11 @@ _E4M3X4_TO_F16X4 = """
 """
 
 
-def _asm_for(mma_dtype: type[cutlass.Numeric]) -> str:
+def _asm_for(mma_dtype: type[cutlass.Numeric], native_cvt: bool) -> str:
     if mma_dtype is cutlass.BFloat16:
         return (
             _E4M3X4_TO_BF16X4_NATIVE
-            if _HAS_NATIVE_E4M3_BF16_CVT
+            if native_cvt and _HAS_NATIVE_E4M3_BF16_CVT
             else _E4M3X4_TO_BF16X4_ALU
         )
     if mma_dtype is cutlass.Float16:
@@ -82,12 +82,14 @@ def _asm_for(mma_dtype: type[cutlass.Numeric]) -> str:
 def convert_e4m3_fragment(
     packed_fragment: cute.TensorSSA,
     mma_dtype: type[cutlass.Numeric],
+    native_cvt: bool = True,
     *,
     loc=None,
     ip=None,
 ) -> cute.TensorSSA:
     """Convert a fragment of e4m3 bytes (``Uint8`` SSA, a multiple of 4 long) to
-    ``mma_dtype`` values in the same order."""
+    ``mma_dtype`` values in the same order.  ``native_cvt=False`` forces the ALU bf16
+    path (``cvt.rn.bf16x2.e4m3x2`` is sm_100+; the Hopper kernel passes it)."""
     count = cute.size(packed_fragment.shape)
     assert count % 4 == 0, "e4m3 fragments convert four bytes (one word) at a time"
     num_words = count // 4
@@ -95,7 +97,7 @@ def convert_e4m3_fragment(
     words_vector = llvm.bitcast(
         words_type, packed_fragment.ir_value(loc=loc, ip=ip), loc=loc, ip=ip
     )
-    asm = _asm_for(mma_dtype)
+    asm = _asm_for(mma_dtype, native_cvt)
     pair_type = llvm.StructType.get_literal([Uint32.mlir_type] * 2)
     out_words: list[ir.Value] = []
     for idx in range(num_words):

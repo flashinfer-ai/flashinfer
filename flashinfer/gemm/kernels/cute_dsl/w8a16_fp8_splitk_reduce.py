@@ -6,8 +6,9 @@ the per-tensor scale and the optional per-N bias, and casts to the activation dt
 
     out[m, n] = cast(scale * sum_l partials[l, m, n] + bias[n])
 
-``partials`` is the GEMM kernel's C for ``splits`` slices: [splits, M, N] fp32,
-N contiguous (the kernel's C[n, m, l] column-major).  One thread handles eight
+``partials`` is the GEMM kernel's C for ``splits`` slices: [splits, M_padded, N] fp32,
+N contiguous (the kernel's C[n, splits * M_padded] column-major; M_padded >= M, the
+Hopper kernel pads a slice to whole activation tiles).  One thread handles eight
 consecutive n (one 16-byte store, two 16-byte loads per slice).  The slice count is
 a compile-time constant so the slice loop unrolls and every slice's loads are in
 flight at once (the kernel is latency-bound: 128 CTAs for a 1024 x 256 output)."""
@@ -34,17 +35,20 @@ class W8A16SplitKReduce:
         out_ptr: cute.Pointer,
         m: cutlass.Int64,
         n: cutlass.Int64,
+        slice_vecs: cutlass.Int64,
         stream: cuda.CUstream,
     ):
+        """``slice_vecs``: elements between two slices' partials, in 8-element vectors
+        (M_padded * N / 8)."""
         # Flat views in units of 8-element vectors; N is a multiple of 8.  The slice
-        # stride is spelled as _VEC * mn_vecs (not m * n) so the compiler can see that
-        # every slice's vector is 16-byte aligned and keep the 16-byte loads (with m * n
-        # it emitted eight 4-byte loads per slice).
+        # stride is spelled as _VEC * slice_vecs so the compiler can see that every
+        # slice's vector is 16-byte aligned and keep the 16-byte loads (spelled as an
+        # element count it emitted eight 4-byte loads per slice).
         mn_vecs = m * n // _VEC
         partials = cute.make_tensor(
             partials_ptr,
             cute.make_layout(
-                (_VEC, mn_vecs, self.splits), stride=(1, _VEC, _VEC * mn_vecs)
+                (_VEC, mn_vecs, self.splits), stride=(1, _VEC, _VEC * slice_vecs)
             ),
         )
         out = cute.make_tensor(
