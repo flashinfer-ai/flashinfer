@@ -492,19 +492,26 @@ test "${{FLASHINFER_NVCC_LAUNCHER}}" = sccache
 
 
 def _write_test_sccache_fakes(
-    tmp_path, sccache_version, *, serve_archive=False, start_server_fails=False
+    tmp_path,
+    sccache_version,
+    *,
+    serve_archive=False,
+    start_server_fails=False,
+    zero_stats_fails=False,
 ):
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
     sccache_log = tmp_path / "sccache.log"
     sccache = fake_bin / "sccache"
     start_server_status = 1 if start_server_fails else 0
+    zero_stats_status = 1 if zero_stats_fails else 0
     sccache.write_text(
         "#!/bin/bash\n"
         f'echo "$*" >> "{sccache_log}"\n'
         f'if [ "$1" = --version ]; then echo "sccache {sccache_version}"; fi\n'
         'if [ "$1" = --show-stats ]; then echo "Cache hits 1"; fi\n'
         f'if [ "$1" = --start-server ]; then exit {start_server_status}; fi\n'
+        f'if [ "$1" = --zero-stats ]; then exit {zero_stats_status}; fi\n'
     )
     # Downloads fail by default so a version mismatch takes the fail-open path
     # offline. serve_archive instead "downloads" an archive whose published
@@ -604,6 +611,8 @@ def test_gpu_lane_sccache_wrapper_enables_cache_and_keeps_exit_code(tmp_path):
 @pytest.mark.cpu_only
 def test_gpu_lane_sccache_wrapper_fails_open_when_download_fails(tmp_path):
     child, sccache_log, _, env = _write_test_sccache_fakes(tmp_path, "0.0.0")
+    env["FLASHINFER_NVCC_LAUNCHER"] = "sccache"
+    env["FLASHINFER_CXX_LAUNCHER"] = "sccache"
 
     result = _run_with_test_sccache(tmp_path, child, env)
 
@@ -628,6 +637,8 @@ def test_gpu_lane_sccache_wrapper_rejects_checksum_mismatch(tmp_path):
 @pytest.mark.cpu_only
 def test_gpu_lane_sccache_wrapper_fails_open_without_nvcc(tmp_path):
     child, sccache_log, _, env = _write_test_sccache_fakes(tmp_path, "0.18.0")
+    env["FLASHINFER_NVCC_LAUNCHER"] = "sccache"
+    env["FLASHINFER_CXX_LAUNCHER"] = "sccache"
     (tmp_path / "cuda" / "bin" / "nvcc").unlink()
 
     result = _run_with_test_sccache(tmp_path, child, env)
@@ -647,6 +658,22 @@ def test_gpu_lane_sccache_wrapper_fails_open_when_server_start_fails(tmp_path):
     _assert_ran_uncached(result)
     assert "--start-server" in sccache_log.read_text().splitlines()
     assert not (tmp_path / "stats" / "sccache-stats.txt").exists()
+
+
+@pytest.mark.cpu_only
+def test_gpu_lane_sccache_wrapper_fails_open_when_zero_stats_fails(tmp_path):
+    child, sccache_log, _, env = _write_test_sccache_fakes(
+        tmp_path, "0.18.0", zero_stats_fails=True
+    )
+
+    result = _run_with_test_sccache(tmp_path, child, env)
+
+    _assert_ran_uncached(result)
+    calls = sccache_log.read_text().splitlines()
+    assert "--start-server" in calls
+    assert "--zero-stats" in calls
+    assert "--stop-server" in calls
+    assert not (tmp_path / "stats").exists()
 
 
 @pytest.mark.cpu_only
