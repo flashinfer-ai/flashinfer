@@ -88,9 +88,13 @@ def test_malformed_step_shapes_are_argument_declines(kw, kind):
 
 @pytest.fixture
 def as_sm100(monkeypatch):
-    """The FROST admission as it reads on a 148-SM SM100 part (its device facts patched)."""
+    """The FROST admission as it reads on a 148-SM SM100 part with CuTe DSL installed (device facts and DSL probe
+    patched)."""
     monkeypatch.setattr(admission, "device_cc", lambda device: (10, 0))
     monkeypatch.setattr(admission, "_sm_count", lambda device: 148)
+    monkeypatch.setattr(
+        "flashinfer.cute_dsl.availability.is_cute_dsl_available", lambda: True
+    )
 
 
 @pytest.mark.parametrize(

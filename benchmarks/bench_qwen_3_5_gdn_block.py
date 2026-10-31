@@ -3,7 +3,8 @@
 """Time the backends of the experimental Qwen 3.5 GDN block at the Qwen3.8-27B geometry.
 
 Every registered backend runs the same plan-bound call (decode rows, MTP verify requests x T) under CUDA-graph replay
-with a cold L2 (CUDA-event timing of graph replays). A backend registered outside this package is loaded with ``--register module`` (a module that calls
+with a cold L2 (CUDA-event timing of graph replays), in two passes, the second in reverse backend order; each cell is
+the median of both passes. A backend registered outside this package is loaded with ``--register module`` (a module that calls
 ``flashinfer.experimental.qwen_3_5_gdn_block.api.register_backend`` on import). There is no unfused baseline here: the
 serving chain the block replaces lives in the serving framework.
 
@@ -85,6 +86,27 @@ def touched_bytes(rows):
     return state + weights + activations + rows * c * g.conv_kernel * 2
 
 
+def time_plan(plan, form, requests, tokens, device, props):
+    # Cold L2 by rotating whole input sets inside the graph: the utility's
+    # clone-based rotation would make the strided qkv / z views contiguous, a
+    # different binding than serving passes.
+    n_sets = min(
+        64,
+        max(4, -(-3 * props.L2_cache_size // touched_bytes(requests * tokens))),
+    )
+    sets = [make_inputs(form, requests, tokens, device) for _ in range(n_sets)]
+    for x in sets:
+        plan.run(**x)
+    rotation = itertools.cycle(sets)
+    return bench_gpu_time_with_cudagraph(
+        lambda: plan.run(**next(rotation)),
+        dry_run_iters=10,
+        repeat_iters=100,
+        num_iters_within_graph=n_sets,
+        cold_l2_cache=False,
+    )
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--backends", nargs="+", default=["frost"])
@@ -109,7 +131,7 @@ def main():
         + " ".join(f"{b:>12}" for b in args.backends)
     )
     for form, requests, tokens in shapes:
-        cells = []
+        plans = {}
         for backend in args.backends:
             sup = qwen_3_5_gdn_block_support(
                 device,
@@ -119,37 +141,29 @@ def main():
                 requests=requests,
                 tokens_per_request=tokens,
             )
-            if not sup.served:
-                cells.append(f"{'-':>12}")
-                continue
-            plan = prepare_qwen_3_5_gdn_block(
-                form,
-                geometry=GEOMETRY,
-                device=device,
-                requests=requests,
-                tokens_per_request=tokens,
-                backend=backend,
-            )
-            # Cold L2 by rotating whole input sets inside the graph: the
-            # utility's clone-based rotation would make the strided qkv / z
-            # views contiguous, a different binding than serving passes.
-            n_sets = min(
-                64,
-                max(4, -(-3 * props.L2_cache_size // touched_bytes(requests * tokens))),
-            )
-            sets = [make_inputs(form, requests, tokens, device) for _ in range(n_sets)]
-            for x in sets:
-                plan.run(**x)
-            rotation = itertools.cycle(sets)
-            times = bench_gpu_time_with_cudagraph(
-                lambda: plan.run(**next(rotation)),
-                dry_run_iters=10,
-                repeat_iters=100,
-                num_iters_within_graph=n_sets,
-                cold_l2_cache=False,
-            )
-            del sets
-            cells.append(f"{statistics.median(times) * 1e3:>9.2f} us")
+            if sup.served:
+                plans[backend] = prepare_qwen_3_5_gdn_block(
+                    form,
+                    geometry=GEOMETRY,
+                    device=device,
+                    requests=requests,
+                    tokens_per_request=tokens,
+                    backend=backend,
+                )
+        # The second pass runs the backends in reverse order, so clock or
+        # thermal drift does not favor the one that runs first.
+        times = {b: [] for b in plans}
+        for order in (list(plans), list(plans)[::-1]):
+            for backend in order:
+                times[backend] += time_plan(
+                    plans[backend], form, requests, tokens, device, props
+                )
+        cells = [
+            f"{statistics.median(times[b]) * 1e3:>9.2f} us"
+            if b in plans
+            else f"{'-':>12}"
+            for b in args.backends
+        ]
         print(f"{form:<7} {requests:>4} {tokens:>3} " + " ".join(cells))
 
 
