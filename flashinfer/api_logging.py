@@ -2397,9 +2397,15 @@ def _attach_fi_trace(
     return wrapped
 
 
-def flashinfer_api(func: Callable = None, *, trace=None) -> Callable:
+def flashinfer_api(
+    func: Callable = None, *, trace=None, pdl_static: Tuple[str, ...] = ()
+) -> Callable:
     """
     Decorator to FlashInfer's APIs.
+
+    ``pdl_static`` names the tensor parameters that the preceding kernel never
+    writes, such as weights, so that a PDL launch may read them before
+    ``griddepcontrol.wait``. Every other tensor parameter is read after it.
 
     .. warning::
         This API logging feature is experimental and may change in future versions.
@@ -2482,12 +2488,17 @@ def flashinfer_api(func: Callable = None, *, trace=None) -> Callable:
     - The %i pattern is automatically replaced with the process ID for multi-process environments.
     - The logger does not propagate to the root logger to avoid duplicate logs.
     """
+
     # If logging is disabled, return original function with zero overhead.
     # We still attach fi_trace so it is always available regardless of log level.
+    def attach(wrapped: Callable, original: Callable) -> Callable:
+        wrapped.pdl_static = frozenset(pdl_static)  # type: ignore[attr-defined]
+        return _attach_fi_trace(wrapped, original, trace_template=trace)
+
     if _API_LOG_LEVEL == 0:
         if func is None:
-            return lambda f: _attach_fi_trace(f, f, trace_template=trace)
-        return _attach_fi_trace(func, func, trace_template=trace)
+            return lambda f: attach(f, f)
+        return attach(func, func)
 
     def decorator(f: Callable) -> Callable:
         @functools.wraps(f)
@@ -2576,7 +2587,7 @@ def flashinfer_api(func: Callable = None, *, trace=None) -> Callable:
 
             return result
 
-        return _attach_fi_trace(wrapper, f, trace_template=trace)
+        return attach(wrapper, f)
 
     if func is None:
         return decorator

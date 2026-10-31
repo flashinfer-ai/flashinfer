@@ -1572,8 +1572,8 @@ def shuffle_matrix_sf_a(
 
 @flashinfer_api(trace=nvfp4_quantize_trace)
 def nvfp4_quantize(
-    a,
-    a_global_sf,
+    a: torch.Tensor,
+    a_global_sf: torch.Tensor,
     sfLayout=SfLayout.layout_128x4,
     do_shuffle=False,
     sf_vec_size=16,
