@@ -493,8 +493,10 @@ def gdn_verify_kernel_mtp(
         # All subsequent kernel sites use these views uniformly via
         # `cute.local_tile(h_*_view, (1, vec_size), (v, lane))`.
         if cutlass.const_expr(use_pool_indexing):
-            h_read_view = h0_source[(cache_idx, i_hv, None, None)]
-            h_write_view = h0_source[(write_cache_idx, i_hv, None, None)]
+            # Widen before multiplying by the slot stride: padded pools can
+            # exceed the Int32 element-offset range even with Int32 indices.
+            h_read_view = h0_source[(cutlass.Int64(cache_idx), i_hv, None, None)]
+            h_write_view = h0_source[(cutlass.Int64(write_cache_idx), i_hv, None, None)]
         else:
             h_read_view = h0_source[(flat_state_idx, None, None)]
             h_write_view = h0_source[(flat_write_idx, None, None)]
@@ -2018,8 +2020,10 @@ def gdn_verify_kernel_mtp_inline(
         # All subsequent kernel sites use these views uniformly via
         # `cute.local_tile(h_*_view, (1, vec_size), (v, lane))`.
         if cutlass.const_expr(use_pool_indexing):
-            h_read_view = h0_source[(cache_idx, i_hv, None, None)]
-            h_write_view = h0_source[(write_cache_idx, i_hv, None, None)]
+            # Widen before multiplying by the slot stride: padded pools can
+            # exceed the Int32 element-offset range even with Int32 indices.
+            h_read_view = h0_source[(cutlass.Int64(cache_idx), i_hv, None, None)]
+            h_write_view = h0_source[(cutlass.Int64(write_cache_idx), i_hv, None, None)]
         else:
             h_read_view = h0_source[(flat_state_idx, None, None)]
             h_write_view = h0_source[(flat_write_idx, None, None)]
@@ -2897,7 +2901,11 @@ def run_mtp_decode(
     - BS >= 3: Warp-specialized kernel (SMEM precompute + h-state prefetch)
 
     Args:
-        h0_source: Reshaped initial state [pool_size * HV, V, K].
+        h0_source: Initial state as either a compact [pool_size * HV, V, K]
+            view or a strided [pool_size, HV, V, K] pool when
+            use_pool_indexing=True. The 4D pool's leading stride must be a
+            multiple of vec_size FP32 elements. Capacity is dynamic; strides
+            remain specialized.
         intermediate_states: Reshaped intermediate state cache, or dummy tensor.
         A_log: Log decay parameter [HV].
         a: Input-dependent decay [B, T, HV].
@@ -2996,9 +3004,15 @@ def run_mtp_decode(
         )
         return
 
-    # cute.compile bakes pool strides; key them only for the 4D pool-indexing path.
+    # Keep all 4D pool strides in both the memory and disk cache keys. A static
+    # slot stride preserves address-generation optimizations across capacities.
     if use_pool_indexing:
-        pool_strides_key = tuple(h0_source.stride())
+        pool_strides_key = tuple(int(stride) for stride in h0_source.stride())
+        assert pool_strides_key[0] % vec_size == 0, (
+            "initial_state stride(0) must be a multiple of "
+            f"{vec_size} FP32 elements for {vec_size * 32}-bit state copies, "
+            f"got stride(0)={pool_strides_key[0]}"
+        )
     else:
         pool_strides_key = None
 
@@ -3136,17 +3150,14 @@ def run_mtp_decode(
         stream = cuda.CUstream(torch.cuda.current_stream(device=q.device).cuda_stream)
 
         if use_pool_indexing:
-            # 4D pool [pool, HV, V, K], possibly non-contiguous (e.g. a strided
-            # slice of an oversized backing tensor). main's mark_compact_shape_dynamic
-            # assumes a compact 3D flat pool (wrong rank + compactness here), and
-            # mark_layout_dynamic would make V/K dynamic (the kernel needs them as
-            # compile-time constants, e.g. num_v_tiles). So pass the layout through
-            # statically: the exact strides are baked in and keyed via
-            # pool_strides_key. The pool-dim (mode 0) stride is independent of the
-            # pool size, so one compiled kernel is reused across batch sizes and
-            # indexes correctly by cache_idx * stride — pool_size is not needed in
-            # the cache key or as a compile-time shape.
-            h0_source_tensor = from_dlpack(h0_source, assumed_align=16)
+            # Capacity is absent from the cache key, so it must also be dynamic
+            # in the compiled ABI. Inner dimensions and all strides stay static.
+            h0_source_tensor = cute.runtime.make_fake_tensor(
+                cute.Float32,
+                shape=(cute.sym_int(), HV, V, K),
+                stride=pool_strides_key,
+                assumed_align=16,
+            )
         else:
             # 3D flat pool [pool*HV, V, K], compact.
             h0_source_tensor = from_dlpack(
