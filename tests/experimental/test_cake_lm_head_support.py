@@ -1495,9 +1495,10 @@ def test_cake_sparse_weight_gradient_drops_out_of_range_ids(dw):
     torch.testing.assert_close(got[1 : V + 1].double(), expect, rtol=1e-2, atol=2e-2)
 
 
-def test_cake_sparse_global_dw_zero_fill_bits():
+def test_cake_sparse_global_dw_zero_fill_bits(monkeypatch):
     """The global-mode sparse dW zero fill (FP32 words over the BF16 buffer) leaves +0 in every row that receives no
-    pair, even over reused all-ones memory, and every row has the bits of the same pass over a BF16 zero fill."""
+    pair, even when the dW storage starts as all-ones bits, and every row has the bits of the same pass over a BF16
+    zero fill."""
     _require_cake()
     T, H, V = 96, 512, 1000
     gen = torch.Generator().manual_seed(SEED)
@@ -1531,10 +1532,21 @@ def test_cake_sparse_global_dw_zero_fill_bits():
     off32 = off.to(CUDA)
     active = cake_support._row_active(off32, None, False)
     torch.cuda.synchronize()
-    # all-ones bits (a BF16 NaN) in the memory the fill reuses
-    junk = torch.full((V, H), -1, dtype=torch.int16, device=CUDA)
-    del junk
+    # the dW storage starts as all-ones bits (a BF16 NaN): the BF16 [V, H] allocation of the call is filled with -1
+    empty, dirtied = torch.empty, []
+
+    def dirty_empty(*args, **kwargs):
+        out = empty(*args, **kwargs)
+        if out.dtype == torch.bfloat16 and tuple(out.shape) == (V, H):
+            out.view(torch.int16).fill_(-1)
+            dirtied.append(out.data_ptr())
+        return out
+
+    monkeypatch.setattr(torch, "empty", dirty_empty)
     got = cake_support._sparse_dw(cx, plan, problem, X, ids, off32, dz, active)
+    monkeypatch.undo()
+    # a dirtied allocation is the dW storage itself
+    assert dirtied in ([], [got.data_ptr()])
     rows, ld = cake_support._rows_operand(X)
     ref = torch.zeros((V, H), dtype=torch.bfloat16, device=CUDA)
     cake_support._sga_dw_range(
