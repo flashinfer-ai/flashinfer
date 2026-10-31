@@ -502,6 +502,14 @@
       "sm_100a": 34048,
       "sm_103a": 65536
     },
+    "fused_qle2048_small_q_max_kv": {
+      "sm_100a": 34048,
+      "sm_103a": 65792
+    },
+    "fused_qle2048_small_q_max_queries": {
+      "sm_100a": 128,
+      "sm_103a": 256
+    },
     "fused_scan32_max_kv": 1048576,
     "fused_scan768_max_kv": 8192,
     "fused_scan_ceilings": [
