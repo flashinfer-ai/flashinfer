@@ -22,7 +22,6 @@ from dataclasses import dataclass
 from typing import Tuple
 
 from ..helpers.constants import (
-    MAX_MLA_SPLITS_KV,
     SUPPORTED_MLA_PAGE_SIZES,
     WARP_LANES,
 )
@@ -97,7 +96,7 @@ def compute_split_kv(
     split_heur = min(max_splits, blocks_per_batch)
     k_waves = ceil_div(max_splits, split_heur)
     split_wave_aware = ceil_div(max_splits, k_waves)
-    return min(split_wave_aware, MAX_MLA_SPLITS_KV)
+    return split_wave_aware
 
 
 def compute_workspace_size(
@@ -289,6 +288,7 @@ class MlaDecodeConfig(Nvfp4KVConfig):
     # BF16 P stays unscaled.  See ``max_softmax_rescale_threshold_log2`` for
     # the bounds.
     softmax_rescale_threshold_log2: float = 0.0
+    lse_base_on_e: bool = False
 
     @property
     def tokens_per_k_tile(self) -> int:
@@ -370,6 +370,7 @@ def make_mla_decode_config(
     softmax_rescale_threshold_log2: float = 0.0,
     kv_cache_format: str = "native",
     extra_kv_cache_format: str = "native",
+    lse_base_on_e: bool = False,
 ) -> MlaDecodeConfig:
     """Create and populate a MlaDecodeConfig from problem parameters."""
     validate_nvfp4_kv_formats(
@@ -406,6 +407,7 @@ def make_mla_decode_config(
     cfg.mask_type = normalize_mask_type(mask_type)
     # Range-checked by MlaDecodeTs and plan().
     cfg.softmax_rescale_threshold_log2 = softmax_rescale_threshold_log2
+    cfg.lse_base_on_e = lse_base_on_e
 
     def _require_positive(name: str, value: int) -> None:
         """Validate that a named configuration value is positive."""

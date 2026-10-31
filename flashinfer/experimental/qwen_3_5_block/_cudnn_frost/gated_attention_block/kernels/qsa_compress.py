@@ -146,7 +146,7 @@ gather, no conversion -- through ONE shared addressing helper per table (:func:`
 the fused prepare launch of ``qsa_prepare.py`` calls the same two) and derives every position in-kernel
 (:func:`step_position`)::
 
-    pos0[b]          = kv_lens[b] - S_q                             # kv_lens = the KV length AFTER the step
+    pos0[b]          = max(kv_lens[b], 0) - S_q                     # kv_lens = the KV length AFTER the step (clamped at 0 first: no int32 wrap)
     pos              = pos0[b] + j                                  # row j of sequence b
     ring row of pos  = (index_state_block_table[b, 0], pos % cap)   # == the slot  block * cap + pos % cap
     kbar row of blk  = (block_table[b, blk // (P / POOL)], blk % (P / POOL))
@@ -190,8 +190,64 @@ of the step's raw keys, never quantized -- an e4m3 ring is a form error naming t
 the bf16 form's before the cast.  f16 io has no e4m3 arm (the helper widens bf16 words; ``check_index_cache_dtype`` refuses the pair by
 name).  The fp8 ``cvt`` is an sm_89+ instruction: an older part is declined BY NAME at compile time (Rule 7), never through ptxas.
 
-Still no shared memory, no mbarrier, no TMA, no tcgen05 in either form: the barrier table and the SMEM table of this kernel
-stay EMPTY by construction.
+The CHUNK form -- ``ring_write=False``: the step form at T rows with the ring READ-ONLY (2026-10-29)
+----------------------------------------------------------------------------------------------------
+
+A prefill chunk of ``T`` rows behind a cached prefix of ``P`` tokens (the in-block indexer's EXTEND step) is the step form at
+``S_q = T``: every piece of the step body is right at T rows -- the positions from ``kv_lens`` (``pos0 = kv_lens[b] - T``), the
+straddling block (the 4-token group begun in the prefix and completed by the chunk) pooled from the ring below ``pos0`` and from the
+chunk's rows at or above it, the paged cache row through the MAIN table, the RoPE at the block START, the ``-2`` reports -- EXCEPT the
+ring write: with ``T >= cap`` the T rows alias every ring slot, the last writer is undefined across lane groups, and the straddling
+group's lane group reads slots other lane groups overwrite in the same launch (the hazard the host rule ``cap >= S_q + pool - 1``
+exists to exclude).  ``compile_qsa_compress_step(ring_write=False)`` (an appended compile key of BOTH the dense and the paged form)
+folds the ring write out: the ring is read-only in that launch, and the host rule becomes ``cap >= pool - 1`` (= 3;
+``min_ring_rows(rows, pool, ring_write=False)``): the straddling group reads at most ``pool - 1`` consecutive positions, distinct
+modulo any ``cap >= pool - 1`` -- the kernel's TRUE bound, not an asserted one (vLLM's floor of 4 satisfies it).  ``ring_slots=True``
+is refused with it (nothing to name).  Everything else -- the fp32 chain, the e4m3 store arm, the reports, the two tables'
+addressing -- is untouched, so a chunk-written row is BITWISE the from-scratch prefill compress of the same four raw keys.  The
+per-row arithmetic is ``pool`` x redundant against the per-block prefill kernel; on ``T x 256 B`` of raw keys that is nothing against
+a chunk step, and it buys the ring read, the paged write and the position derivation for free.
+
+The ring INPUT contract of the chunk form: the ring must ALREADY hold positions ``4 floor(P / 4) .. P - 1`` of every sequence (at most
+three) -- a previous writer wrote the sequence's last ``cap >= 3`` tokens (the stack's circular-slot rule, or the ring tail write of the
+previous chunk / decode step).  A stack that primed fewer rows reads STALE slots and no device report is possible (a slot holds a
+16-bit row either way).  ``P % 4 == 0`` and ``P = 0`` read nothing from the ring.  The chunk's own tail (its last ``cap`` raw keys)
+enters the ring by a SEPARATE launch after this one (``cache_write.py`` over the ring's slots, stream order), never inside it: any
+one-launch form that writes the tail and reads the straddling group needs the read and the write ordered inside one CTA.
+
+Degenerate inputs of the chunk form, each inherited from the step form: ``P = 0`` and ``P % 4 == 0`` (no straddling block: ``tok0 >=
+pos0`` for every block, no ring read); a chunk shorter than the group remainder (``T < 4 - P % 4``: no row completes a block, nothing
+written, every slot ``-1``); a dead sequence (``kv_lens 0`` -> ``pos0 < 0``: every row dead, slot ``-1``); a sequence owning no ring
+(a straddling block reports ``-2``, never the null block's rows); a block past the table (``-2``); the RoPE-table ceiling (``-2``).
+
+The pooled-mean rounding attribute -- ``rounding`` in ``INDEX_COMPRESS_ROUNDINGS = ("single", "hf")`` (2026-10-29)
+--------------------------------------------------------------------------------------------------------------------
+
+The rounding points of the indexer's two compress chains -- the pool-4 compressed KEY and the pool-1 indexer QUERY -- at EVERY writer:
+the prefill form (``compile_qsa_compress(rounding=)``, pool 4 and pool 1), the chunk / decode step form
+(``compile_qsa_compress_step(rounding=)``) and the fused prepare launch's query and compress arms
+(``QsaPrepareIndexArms.rounding``); a per-recipe compile key, the default artifacts keep their keys.
+
+* ``"single"`` (the default, the reference): fp32 through the mean, the RMSNorm and the RoPE, ONE rounding at the store -- under the
+  e4m3 cache the e4m3 cast of that bf16 row (``_store_row_chunk_e4m3``: two roundings, the bf16 one then the e4m3 one, the
+  convention above).
+* ``"hf"``: the HF / vLLM-prepare dtype flow -- in order, with ``io()`` = round-to-nearest-even to the io dtype
+  (``tile_dsl.pointwise.round_pair_io``: the store path's own ``cvt``)::
+
+      pooled = io(mean_fp32(rows))             the key sites (pool 4); the identity on the query (pool 1: an io row is already io)
+      y      = io(pooled * rstd * (w + off))   ALL dims -- the rotated and the passthrough (vLLM's y.to(cos.dtype), HF's .to(out_dtype))
+      rot    = io(io(y * cos) + io(partner * sin))   the rotated dims: the io-dtype rotation, each op rounded (rope_rotate_half_io)
+      store  = io(rot | y)                     exact: every value is already io-representable (the e4m3 cache then casts the row once)
+
+  The same ROUNDING POINTS as a vLLM-written cache row, NOT its bits: the fp32 reduction orders differ (the 4-row mean in position
+  order vs torch's reduce; the sum of squares as 16 lane partials + a butterfly vs ``tl.sum`` / torch; the fast-math rsqrt), so a
+  one-ulp flip at a rounding point remains possible -- a statistic the tests measure (the bitwise fraction against the HF-rounding
+  oracle), never claimed bitwise.  Under EITHER value the FROST writers stay BITWISE one another (the tests pin it): that is what
+  "the prefill writer and the step form round identically" means.  The attention's own Q / K norm + RoPE is not governed by it.
+
+Still no shared memory, no mbarrier, no TMA, no tcgen05 in any form (the chunk form folds a store OUT; the rounding arm adds
+register-only ``cvt`` round trips): the barrier table and the SMEM table of this kernel stay EMPTY by construction, and the shuffles
+(``rmsnorm_rstd``'s butterfly, the rotation's partner shuffle in both its forms) are reached by every lane of every warp as before.
 """
 
 from typing import NamedTuple, Optional
@@ -206,10 +262,22 @@ from flashinfer.experimental.qwen_3_5_block._cudnn_frost.datatypes import _conve
 from flashinfer.experimental.qwen_3_5_block._cudnn_frost.frost.buffers import cutedsl_requirement_error
 from flashinfer.experimental.qwen_3_5_block._cudnn_frost.frost.device import compute_capability, current_device
 from flashinfer.experimental.qwen_3_5_block._cudnn_frost.frost.tile_dsl.barrier import launch_dependent_grids, wait_on_dependent_grids
-from flashinfer.experimental.qwen_3_5_block._cudnn_frost.frost.tile_dsl.pointwise import bf16_words_to_e4m3_words, f16x2_to_f32, fp32_to_fp16, rmsnorm_rstd, rope_rotate_half
+from flashinfer.experimental.qwen_3_5_block._cudnn_frost.frost.tile_dsl.pointwise import (
+    bf16_words_to_e4m3_words,
+    f16x2_to_f32,
+    fp32_to_fp16,
+    rmsnorm_rstd,
+    rope_rotate_half,
+    rope_rotate_half_io,
+    round_values_io,
+)
 from flashinfer.experimental.qwen_3_5_block._cudnn_frost.frost.tile_dsl.tma import ld_global, ld_global_v2, ld_global_v4, st_global, st_global_v2, st_global_v4
 
-from ..cache_write_contract import DEFAULT_POOL  # tokens per compressed block (the QSA compress ratio): defined DSL-free, re-exported here
+from ..cache_write_contract import (  # DSL-free definitions, re-exported here: the compress ratio and the rounding attribute's values
+    DEFAULT_POOL,
+    INDEX_COMPRESS_ROUNDING_DEFAULT,
+    INDEX_COMPRESS_ROUNDINGS,
+)
 from .qk_norm_rope import ACCESS_BYTES, ELEMS_PER_ACCESS, lanes_per_row, validate_shape, vec_chunks
 
 # ``DEFAULT_POOL`` -- tokens per compressed block, the QSA compress ratio (``indexer_compress_ratio``) -- is imported above from the DSL-free
@@ -263,6 +331,7 @@ def frost_qsa_compress(
     pool: cutlass.Constexpr[int],
     threads_per_cta: cutlass.Constexpr[int],
     use_pdl: cutlass.Constexpr[bool],
+    round_io: cutlass.Constexpr[bool],  # appended: the "hf" rounding arm (module docstring); False = the single-rounding chain
 ) -> None:
     """One lane group (``lanes_per_row(d)`` lanes) per compressed block.
 
@@ -276,6 +345,7 @@ def frost_qsa_compress(
         wait_on_dependent_grids()
 
     has_seq_lens = cutlass.const_expr(mSeqLens is not None)
+    io_dt = mK.element_type  # the io dtype the "hf" arm rounds to (bf16 / f16); the store rounds to mOut's
     lanes = cutlass.const_expr(lanes_per_row(d))
     chunks = cutlass.const_expr(vec_chunks(d))
     groups_per_cta = cutlass.const_expr(threads_per_cta // lanes)
@@ -325,7 +395,9 @@ def frost_qsa_compress(
     inv_pool = cutlass.Float32(1.0 / pool)
     pooled = []
     for c in cutlass.range_constexpr(chunks):
-        pooled.append([acc[c][i] * inv_pool for i in range(ELEMS_PER_ACCESS)])
+        row = [acc[c][i] * inv_pool for i in range(ELEMS_PER_ACCESS)]
+        # "hf": the pooled key rounded to the io dtype BEFORE its norm (the identity at pool 1: an io row is already io)
+        pooled.append(round_values_io(row, io_dt) if cutlass.const_expr(round_io) else row)
 
     # --- RMSNorm over D: lane partial -> 16-lane butterfly -> rsqrt -----------
     ssq = cutlass.Float32(0.0)
@@ -342,7 +414,9 @@ def frost_qsa_compress(
         off = cutlass.Int64((c * lanes) * ACCESS_BYTES) + lane_off
         w_pairs = [f16x2_to_f32(wd, dtype=mW.element_type) for wd in ld_global_v4(w_base + off, cutlass.Int32)]
         w_vals = [v for pair in w_pairs for v in pair]
-        ys.append([pooled[c][i] * rstd * (w_vals[i] + w_offset) for i in range(ELEMS_PER_ACCESS)])
+        row = [pooled[c][i] * rstd * (w_vals[i] + w_offset) for i in range(ELEMS_PER_ACCESS)]
+        # "hf": the normed row -- ALL dims, the rotated and the passthrough -- rounded to the io dtype before its rotation
+        ys.append(round_values_io(row, io_dt) if cutlass.const_expr(round_io) else row)
 
     # --- partial RoPE on dims [0, rope_dim) at the block START position -------
     if cutlass.const_expr(rope_dim > 0):
@@ -364,9 +438,18 @@ def frost_qsa_compress(
             sin_v = [v for pair in s_pairs for v in pair]
         # The shuffle inside rope_rotate_half is unconditional -- every lane of
         # the warp reaches it -- and only the rope lanes keep the result.
-        for i in cutlass.range_constexpr(ELEMS_PER_ACCESS):
-            rotated = rope_rotate_half(ys[0][i], cos_v[i], sin_v[i], lane, half_lanes)
-            ys[0][i] = rotated if in_rope else ys[0][i]
+        if cutlass.const_expr(round_io):
+            # "hf": the io-dtype rotation, its three operations each rounded (pairs: one cvt rounds two values); the shuffles inside
+            # are unconditional -- every lane of the warp reaches them -- and only the rope lanes keep the result
+            for ii in cutlass.range_constexpr(ELEMS_PER_ACCESS // 2):
+                i0 = 2 * ii
+                r0, r1 = rope_rotate_half_io(ys[0][i0], ys[0][i0 + 1], cos_v[i0], cos_v[i0 + 1], sin_v[i0], sin_v[i0 + 1], lane, half_lanes, io_dt)
+                ys[0][i0] = r0 if in_rope else ys[0][i0]
+                ys[0][i0 + 1] = r1 if in_rope else ys[0][i0 + 1]
+        else:
+            for i in cutlass.range_constexpr(ELEMS_PER_ACCESS):
+                rotated = rope_rotate_half(ys[0][i], cos_v[i], sin_v[i], lane, half_lanes)
+                ys[0][i] = rotated if in_rope else ys[0][i]
 
     # --- the ONE rounding, 256 B per block row (the e4m3 store arm: the bf16 words rounded once more, 128 B per row) ------
     out_fp8 = cutlass.const_expr(mOut.element_type == cutlass.Float8E4M3FN)
@@ -403,9 +486,10 @@ def qsa_compress_launch(
     pool: cutlass.Constexpr[int],
     threads_per_cta: cutlass.Constexpr[int],
     use_pdl: cutlass.Constexpr[bool],
+    round_io: cutlass.Constexpr[bool],
     stream: cuda.CUstream,
 ):
-    frost_qsa_compress(k, out, w, cos, sin, seq_lens, eps, w_offset, d, rope_dim, pool, threads_per_cta, use_pdl).launch(
+    frost_qsa_compress(k, out, w, cos, sin, seq_lens, eps, w_offset, d, rope_dim, pool, threads_per_cta, use_pdl, round_io).launch(
         grid=(grid_x, grid_y, 1), block=(threads_per_cta, 1, 1), stream=stream, use_pdl=use_pdl
     )
 
@@ -435,6 +519,13 @@ class QsaCompressRecipe(NamedTuple):
     dtype: object
     table_dtype: object
     out_dtype: object = None  # appended: ``out``'s dtype -- the io dtype, or float8_e4m3fn (the e4m3 store arm)
+    rounding: str = INDEX_COMPRESS_ROUNDING_DEFAULT  # appended: the rounding points of the chain (module docstring), a compile key
+
+
+def check_rounding(who: str, rounding) -> None:
+    """``rounding`` against :data:`INDEX_COMPRESS_ROUNDINGS`, typed and naming the values (the declaration validates the same tuple)."""
+    if rounding not in INDEX_COMPRESS_ROUNDINGS:
+        raise ValueError(f"{who}: rounding must be one of {INDEX_COMPRESS_ROUNDINGS} (the rounding points of the indexer's compress chains), got {rounding!r}")
 
 
 def _fake_strided(dtype, shape, stride):
@@ -456,6 +547,7 @@ def compile_qsa_compress(
     threads_per_cta: int = DEFAULT_THREADS_PER_CTA,
     use_pdl: bool = False,
     out_dtype=None,
+    rounding: str = INDEX_COMPRESS_ROUNDING_DEFAULT,
 ) -> QsaCompressRecipe:
     """Build the artifact from SHAPES ALONE -- no device allocation, no launch.
 
@@ -464,12 +556,16 @@ def compile_qsa_compress(
     an older part is a typed ``NotImplementedError`` naming the instruction); any other value a ``ValueError``.  ``table_dtype`` is
     that of ``cos`` / ``sin`` (defaults to ``dtype``).  The batch stride and the token stride of ``k_raw`` are SYMBOLIC, so a column
     slice of the fused projection slab (token stride = the slab width) and a compact ``[B, S, D]`` buffer share one artifact with no
-    repack.  ``out_dtype`` is in the cache key (an e4m3 artifact is a different trace).
+    repack.  ``out_dtype`` is in the cache key (an e4m3 artifact is a different trace).  ``rounding`` (appended) names the chain's
+    rounding points (module docstring: ``"single"`` = the default chain, ``"hf"`` = the HF / vLLM-prepare dtype flow); a per-recipe
+    compile key -- the pool-1 QUERY recipe and the pool-4 KEY recipe each take it -- extended off the default only, so today's
+    artifacts keep their keys; any other value is a ``ValueError`` naming the tuple.
     """
     too_old = cutedsl_requirement_error("qsa_compress")
     if too_old is not None:
         raise NotImplementedError(too_old)
     validate_compress_shape(d, rope_dim, pool, threads_per_cta)
+    check_rounding("qsa_compress", rounding)
     if dtype not in _IO_DTYPES:
         raise ValueError(f"qsa_compress serves bf16/f16 io only, got dtype={dtype}")
     table_dtype = dtype if table_dtype is None else table_dtype
@@ -479,8 +575,10 @@ def compile_qsa_compress(
     out_dtype = dtype if out_dtype is None else out_dtype
     check_e4m3_store_target("qsa_compress", out_dtype)
 
-    key = (str(dtype), str(table_dtype), int(d), int(rope_dim), int(pool), int(threads_per_cta), bool(has_seq_lens), bool(use_pdl), current_device()) + (
-        () if out_dtype == dtype else (str(out_dtype),)
+    key = (
+        (str(dtype), str(table_dtype), int(d), int(rope_dim), int(pool), int(threads_per_cta), bool(has_seq_lens), bool(use_pdl), current_device())
+        + (() if out_dtype == dtype else (str(out_dtype),))
+        + (() if rounding == INDEX_COMPRESS_ROUNDING_DEFAULT else (f"rounding={rounding}",))  # appended off the default only
     )
     if key not in compiled_cache:
         batch = cute.sym_int()
@@ -506,6 +604,7 @@ def compile_qsa_compress(
             int(pool),
             int(threads_per_cta),
             bool(use_pdl),
+            rounding == "hf",  # round_io
             _FAKE_STREAM,
             options="--enable-tvm-ffi",
         )
@@ -519,6 +618,7 @@ def compile_qsa_compress(
         dtype=dtype,
         table_dtype=table_dtype,
         out_dtype=out_dtype,
+        rounding=rounding,
     )
 
 
@@ -636,6 +736,7 @@ def build_qsa_compress(
     threads_per_cta: int = DEFAULT_THREADS_PER_CTA,
     use_pdl: bool = False,
     stream,
+    rounding: str = INDEX_COMPRESS_ROUNDING_DEFAULT,
 ) -> QsaCompressRecipe:
     """Compile (cached) and run once -- the convenience form for tests and
     benchmarks.  Production callers split it: :func:`compile_qsa_compress` at
@@ -652,6 +753,7 @@ def build_qsa_compress(
         threads_per_cta=threads_per_cta,
         use_pdl=use_pdl,
         out_dtype=out.dtype,
+        rounding=rounding,
     )
     run_qsa_compress(r, k_raw, out, w, cos, sin, seq_lens, eps=eps, norm_weight_offset=norm_weight_offset, stream=stream)
     return r
@@ -694,11 +796,15 @@ def check_e4m3_store_target(who: str, cache_dtype) -> None:
         )
 
 
-def min_ring_rows(rows_per_step: int, pool: int = DEFAULT_POOL) -> int:
+def min_ring_rows(rows_per_step: int, pool: int = DEFAULT_POOL, *, ring_write: bool = True) -> int:
     """The smallest raw-key ring that serves a step of ``rows_per_step`` tokens per sequence: a completing row pools
     ring positions down to ``pos0 - pool + 1`` while the step writes positions ``pos0 .. pos0 + rows - 1``; with
     ``rows + pool - 1`` rows no write of a launch aliases one of its reads, and no committed key a later step pools is
-    overwritten by a draft."""
+    overwritten by a draft.  ``ring_write=False`` (appended; the CHUNK form, the ring read-only): the launch writes no ring row,
+    so only the straddling block's ``pool - 1`` consecutive positions must be distinct modulo the ring -- ``pool - 1`` rows,
+    whatever ``rows_per_step`` is (the kernel's true bound, module docstring)."""
+    if not ring_write:
+        return int(pool) - 1
     return int(rows_per_step) + int(pool) - 1
 
 
@@ -707,11 +813,17 @@ def min_ring_rows(rows_per_step: int, pool: int = DEFAULT_POOL) -> int:
 
 @cute.jit
 def step_position(mPos0: Optional[cute.Tensor], mKvLens: Optional[cute.Tensor], b: cutlass.Int32, s_q: cutlass.Int32) -> cutlass.Int32:
-    """The position of row 0 of sequence ``b``: ``kv_lens[b] - S_q`` from the KV length AFTER the step (the paged form -- a
-    negative value marks the rows below position 0 dead), or the ``pos0`` vector clamped at 0 (the dense form -- a negative
-    ``pos0`` is the first step of a sequence).  Exactly one of the two vectors is bound (the host checks)."""
+    """The position of row 0 of sequence ``b``: ``max(kv_lens[b], 0) - S_q`` from the KV length AFTER the step (the paged form -- a
+    negative value marks the rows below position 0 dead; the length is clamped at 0 FIRST, exactly as the kbar gather derives its
+    positions, so an int32 length within ``S_q`` of ``INT_MIN`` -- a stack bug -- reads as a dead sequence like every other ``L <= 0``
+    instead of wrapping to a live positive position; equal in value for every length that does not wrap: every ``L <= 0`` leaves every
+    row of the step dead either way), or the ``pos0`` vector clamped at 0 (the dense form -- a negative ``pos0`` is the first step of
+    a sequence).  Exactly one of the two vectors is bound (the host checks).  ONE helper for the step kernel and the fused prepare
+    launch's position sites."""
     if cutlass.const_expr(mKvLens is not None):
-        pos0 = ld_global(mKvLens.iterator.toint() + b.to(cutlass.Int64) * cutlass.Int64(4), cutlass.Int32) - s_q
+        kv = ld_global(mKvLens.iterator.toint() + b.to(cutlass.Int64) * cutlass.Int64(4), cutlass.Int32)
+        kv = kv if kv > cutlass.Int32(0) else cutlass.Int32(0)
+        pos0 = kv - s_q
     else:
         p0 = ld_global(mPos0.iterator.toint() + b.to(cutlass.Int64) * cutlass.Int64(4), cutlass.Int32)
         pos0 = p0 if p0 > cutlass.Int32(0) else cutlass.Int32(0)
@@ -813,6 +925,8 @@ def frost_qsa_compress_step(
     threads_per_cta: cutlass.Constexpr[int],
     use_pdl: cutlass.Constexpr[bool],
     ring_slot_i64: cutlass.Constexpr[bool],
+    ring_write: cutlass.Constexpr[bool],  # appended: False = the CHUNK form, the ring read-only (module docstring); the public key's name
+    round_io: cutlass.Constexpr[bool],  # appended: the "hf" rounding arm (module docstring)
 ) -> None:
     """One lane group (``lanes_per_row(d)`` lanes) per NEW ROW of the step.
 
@@ -824,12 +938,15 @@ def frost_qsa_compress_step(
     shuffles) and stores nothing.  The ring writes and the ring reads of one launch never alias (host rule
     ``RING >= S_q + pool - 1``), so there is no intra-launch ordering requirement.  The dense and the paged form
     (``mBlockTable`` present) differ ONLY in where a position's ring row and a block's cache row live
-    (:func:`ring_row_address`, :func:`paged_block_row`) and in the position source (:func:`step_position`).
+    (:func:`ring_row_address`, :func:`paged_block_row`) and in the position source (:func:`step_position`).  Under
+    ``ring_write=False`` (the CHUNK form) step (1) is folded out: the ring is read-only, the launch has no ring write to order
+    against its ring reads at any ``S_q``, and the host rule is ``cap >= pool - 1``.
     """
     if cutlass.const_expr(use_pdl):
         wait_on_dependent_grids()
 
     has_n_commit = cutlass.const_expr(mNCommit is not None)
+    io_dt = mKnew.element_type  # the io dtype the "hf" arm rounds to (bf16 / f16); the store rounds to mOut's
     paged = cutlass.const_expr(mBlockTable is not None)
     has_ring_slots = cutlass.const_expr(mRingSlots is not None)
     lanes = cutlass.const_expr(lanes_per_row(d))
@@ -894,19 +1011,21 @@ def frost_qsa_compress_step(
     knew_tok = cutlass.Int64(mKnew.stride[1]) * bpe
     knew_b = mKnew.iterator.toint() + b64 * cutlass.Int64(mKnew.stride[0]) * bpe
 
-    # --- (1) the committed row's raw key enters the ring: a bit copy, 16 B per lane (never for a row at or past the table) ----
-    ring_write = committed & owns_ring & in_table
-    if cutlass.const_expr(has_ring_slots):
-        dst, slot_live = ring_slot_address(mRing, mRingSlots, b * s_q + jr, ring_slot_i64, bpe)
-        ring_write = ring_write & slot_live
-    else:
-        dst = ring_row_address(mRing, entry, p, bpe)
-    if ring_write:
-        src = knew_b + jr.to(cutlass.Int64) * knew_tok
-        for c in cutlass.range_constexpr(chunks):
-            off = cutlass.Int64((c * lanes) * ACCESS_BYTES) + lane_off
-            words = ld_global_v4(src + off, cutlass.Int32)
-            st_global_v4(dst + off, words, cutlass.Int32)
+    # --- (1) the committed row's raw key enters the ring: a bit copy, 16 B per lane (never for a row at or past the table); folded
+    # OUT under the chunk form (ring_write=False: the ring is read-only in this launch, the tail enters it by a later launch) ----
+    if cutlass.const_expr(ring_write):
+        ring_store = committed & owns_ring & in_table  # THIS row's store; the launch-wide switch is the constexpr ring_write
+        if cutlass.const_expr(has_ring_slots):
+            dst, slot_live = ring_slot_address(mRing, mRingSlots, b * s_q + jr, ring_slot_i64, bpe)
+            ring_store = ring_store & slot_live
+        else:
+            dst = ring_row_address(mRing, entry, p, bpe)
+        if ring_store:
+            src = knew_b + jr.to(cutlass.Int64) * knew_tok
+            for c in cutlass.range_constexpr(chunks):
+                off = cutlass.Int64((c * lanes) * ACCESS_BYTES) + lane_off
+                words = ld_global_v4(src + off, cutlass.Int32)
+                st_global_v4(dst + off, words, cutlass.Int32)
 
     # --- (2) pool: the block's rows in POSITION order, each from the ring (below pos0) or this step ----
     acc = []
@@ -930,7 +1049,9 @@ def frost_qsa_compress_step(
     inv_pool = cutlass.Float32(1.0 / pool)
     pooled = []
     for c in cutlass.range_constexpr(chunks):
-        pooled.append([acc[c][i] * inv_pool for i in range(ELEMS_PER_ACCESS)])
+        row = [acc[c][i] * inv_pool for i in range(ELEMS_PER_ACCESS)]
+        # "hf": the pooled key rounded to the io dtype BEFORE its norm (the identity at pool 1: an io row is already io)
+        pooled.append(round_values_io(row, io_dt) if cutlass.const_expr(round_io) else row)
 
     # --- RMSNorm over D (the prefill kernel's chain) ------------------------------
     ssq = cutlass.Float32(0.0)
@@ -945,7 +1066,9 @@ def frost_qsa_compress_step(
         off = cutlass.Int64((c * lanes) * ACCESS_BYTES) + lane_off
         w_pairs = [f16x2_to_f32(wd, dtype=mW.element_type) for wd in ld_global_v4(w_base + off, cutlass.Int32)]
         w_vals = [v for pair in w_pairs for v in pair]
-        ys.append([pooled[c][i] * rstd * (w_vals[i] + w_offset) for i in range(ELEMS_PER_ACCESS)])
+        row = [pooled[c][i] * rstd * (w_vals[i] + w_offset) for i in range(ELEMS_PER_ACCESS)]
+        # "hf": the normed row -- ALL dims, the rotated and the passthrough -- rounded to the io dtype before its rotation
+        ys.append(round_values_io(row, io_dt) if cutlass.const_expr(round_io) else row)
 
     # --- partial RoPE at the block START position (table row clamped in-bounds) ------
     if cutlass.const_expr(rope_dim > 0):
@@ -963,9 +1086,18 @@ def frost_qsa_compress_step(
             s_pairs = [f16x2_to_f32(wd, dtype=mSin.element_type) for wd in ld_global_v4(s_addr, cutlass.Int32)]
             cos_v = [v for pair in c_pairs for v in pair]
             sin_v = [v for pair in s_pairs for v in pair]
-        for i in cutlass.range_constexpr(ELEMS_PER_ACCESS):
-            rotated = rope_rotate_half(ys[0][i], cos_v[i], sin_v[i], lane, half_lanes)
-            ys[0][i] = rotated if in_rope else ys[0][i]
+        if cutlass.const_expr(round_io):
+            # "hf": the io-dtype rotation, its three operations each rounded (pairs: one cvt rounds two values); the shuffles inside
+            # are unconditional -- every lane of the warp reaches them -- and only the rope lanes keep the result
+            for ii in cutlass.range_constexpr(ELEMS_PER_ACCESS // 2):
+                i0 = 2 * ii
+                r0, r1 = rope_rotate_half_io(ys[0][i0], ys[0][i0 + 1], cos_v[i0], cos_v[i0 + 1], sin_v[i0], sin_v[i0 + 1], lane, half_lanes, io_dt)
+                ys[0][i0] = r0 if in_rope else ys[0][i0]
+                ys[0][i0 + 1] = r1 if in_rope else ys[0][i0 + 1]
+        else:
+            for i in cutlass.range_constexpr(ELEMS_PER_ACCESS):
+                rotated = rope_rotate_half(ys[0][i], cos_v[i], sin_v[i], lane, half_lanes)
+                ys[0][i] = rotated if in_rope else ys[0][i]
 
     # --- the ONE rounding, into the block's own cache row (the e4m3 store arm: the bf16 words rounded once more) ----------
     if write_blk:
@@ -1015,6 +1147,8 @@ def qsa_compress_step_launch(
     threads_per_cta: cutlass.Constexpr[int],
     use_pdl: cutlass.Constexpr[bool],
     ring_slot_i64: cutlass.Constexpr[bool],
+    ring_write: cutlass.Constexpr[bool],
+    round_io: cutlass.Constexpr[bool],
     stream: cuda.CUstream,
 ):
     frost_qsa_compress_step(
@@ -1039,6 +1173,8 @@ def qsa_compress_step_launch(
         threads_per_cta,
         use_pdl,
         ring_slot_i64,
+        ring_write,
+        round_io,
     ).launch(grid=(grid_x, grid_y, 1), block=(threads_per_cta, 1, 1), stream=stream, use_pdl=use_pdl)
 
 
@@ -1063,6 +1199,8 @@ class QsaCompressStepRecipe(NamedTuple):
     ring_slots: bool = False
     ring_slot_dtype: object = torch.int64
     index_cache_dtype: object = None  # appended: the compressed-key cache's dtype -- None = the io dtype, float8_e4m3fn = the e4m3 store arm
+    ring_write: bool = True  # appended: False = the CHUNK form (the ring read-only; host rule cap >= pool - 1), a compile key
+    rounding: str = INDEX_COMPRESS_ROUNDING_DEFAULT  # appended: the rounding points of the chain (module docstring), a compile key
 
 
 def _fake_i32_table(shape, stride):
@@ -1114,6 +1252,8 @@ def compile_qsa_compress_step(
     ring_slots: bool = False,
     ring_slot_dtype=torch.int64,
     index_cache_dtype=None,
+    ring_write: bool = True,
+    rounding: str = INDEX_COMPRESS_ROUNDING_DEFAULT,
 ) -> QsaCompressStepRecipe:
     """Build the decode-step artifact from SHAPES ALONE -- no device allocation, no launch (see
     :func:`compile_qsa_compress` for the io / table dtype rules, which are the same here).
@@ -1123,12 +1263,17 @@ def compile_qsa_compress_step(
     ``ring_slots=True`` (paged only) takes the ring WRITE rows from ``index_state_slot_mapping`` of ``ring_slot_dtype``
     instead of deriving them; ``index_cache_dtype`` names the cache's dtype -- ``None`` = the io dtype, ``torch.float8_e4m3fn`` =
     the e4m3 store arm (module docstring; the dense AND the paged form, bf16 io only, sm_89+ -- an older part is a typed
-    ``NotImplementedError`` naming the instruction).  Every flag is in the cache key.
+    ``NotImplementedError`` naming the instruction).  ``ring_write=False`` (appended) traces the CHUNK form of either state form
+    (module docstring): the ring READ-ONLY, the launch's ring write folded out, the host rule ``cap >= pool - 1`` in place of
+    ``cap >= S_q + pool - 1``; ``ring_slots=True`` is refused with it (no write row to name).  ``rounding`` (appended) names the
+    chain's rounding points (``"single"`` / ``"hf"``, module docstring).  Every flag is in the cache key, the two appended ones off
+    their defaults only (today's artifacts keep their keys).
     """
     too_old = cutedsl_requirement_error("qsa_compress_step")
     if too_old is not None:
         raise NotImplementedError(too_old)
     validate_compress_shape(d, rope_dim, pool, threads_per_cta)
+    check_rounding("qsa_compress_step", rounding)
     if dtype not in _IO_DTYPES:
         raise ValueError(f"qsa_compress_step serves bf16/f16 io only, got dtype={dtype}")
     table_dtype = dtype if table_dtype is None else table_dtype
@@ -1136,6 +1281,11 @@ def compile_qsa_compress_step(
         raise ValueError(f"qsa_compress_step takes 16-bit cos / sin tables (bf16/f16), got table_dtype={table_dtype}")
     if ring_slots and not paged:
         raise ValueError("ring_slots=True takes the ring write rows from the stack's slot mapping of the PAGED ring; it needs paged=True")
+    if ring_slots and not ring_write:
+        raise ValueError(
+            "ring_slots=True names the ring WRITE rows, but ring_write=False (the chunk form) writes no ring row in this launch -- the chunk's tail "
+            "enters the ring by the cache-write launch over the ring's slots; pass ring_slots=False"
+        )
     if ring_slot_dtype not in _RING_SLOT_DTYPES:
         raise ValueError(f"ring_slot_dtype must be int32 or int64, got {ring_slot_dtype}")
     check_index_cache_dtype(index_cache_dtype, dtype)
@@ -1156,7 +1306,9 @@ def compile_qsa_compress_step(
         bool(ring_slots),
         str(ring_slot_dtype) if ring_slots else None,
         str(cache_dtype) if cache_dtype != dtype else None,  # appended: the e4m3 store arm is its own artifact
-    )
+    ) + (
+        (() if ring_write else ("ring_write=False",)) + (() if rounding == INDEX_COMPRESS_ROUNDING_DEFAULT else (f"rounding={rounding}",))
+    )  # appended off the defaults only: today's artifacts keep their keys
     if key not in step_compiled_cache:
         batch = cute.sym_int()
         rows = cute.sym_int()
@@ -1203,6 +1355,8 @@ def compile_qsa_compress_step(
             int(threads_per_cta),
             bool(use_pdl),
             bool(ring_slots and ring_slot_dtype == torch.int64),
+            bool(ring_write),  # ring_write
+            rounding == "hf",  # round_io
             _FAKE_STREAM,
             options="--enable-tvm-ffi",
         )
@@ -1219,6 +1373,8 @@ def compile_qsa_compress_step(
         ring_slots=bool(ring_slots),
         ring_slot_dtype=ring_slot_dtype,
         index_cache_dtype=cache_dtype,
+        ring_write=bool(ring_write),
+        rounding=rounding,
     )
 
 
@@ -1380,7 +1536,12 @@ def run_qsa_compress_step(
     if rows < 1:
         raise ValueError("k_new must hold at least one row per sequence")
     _check_row_tensor("k_new", k_new, dtype=r.dtype, last_dim=r.d)
-    need = min_ring_rows(rows, r.pool)
+    need = min_ring_rows(rows, r.pool, ring_write=r.ring_write)
+    ring_rule = (
+        f"raw-key ring: a step of {rows} rows needs rows + pool - 1 = {rows} + {r.pool} - 1 so this launch's ring writes never alias its ring reads"
+        if r.ring_write
+        else f"raw-key ring, read-only in the chunk form (ring_write=False): the straddling block reads pool - 1 = {r.pool} - 1 consecutive positions, distinct modulo any ring of that many rows"
+    )
     if r.paged:
         check_paged_state(
             "ring",
@@ -1388,7 +1549,7 @@ def run_qsa_compress_step(
             dtype=r.dtype,
             d=r.d,
             min_rows=need,
-            what=f"raw-key ring: a step of {rows} rows needs rows + pool - 1 = {rows} + {r.pool} - 1 so this launch's ring writes never alias its ring reads",
+            what=ring_rule,
         )
         check_paged_state(
             "out",
@@ -1403,10 +1564,12 @@ def run_qsa_compress_step(
         if ring.ndim != 3 or int(ring.shape[0]) != batch or int(ring.shape[2]) != r.d or not ring.is_contiguous():
             raise ValueError(f"ring must be a compact [B={batch}, RING, D={r.d}] tensor, got shape {tuple(ring.shape)}")
         if int(ring.shape[1]) < need:
-            raise ValueError(
-                f"ring holds {int(ring.shape[1])} rows per sequence; a step of {rows} rows needs at least {need} (rows + pool - 1 = {rows} + {r.pool} - 1) "
-                "so this launch's ring writes never alias its ring reads and no committed key a later step pools is overwritten by a draft"
-            )
+            if r.ring_write:
+                raise ValueError(
+                    f"ring holds {int(ring.shape[1])} rows per sequence; a step of {rows} rows needs at least {need} (rows + pool - 1 = {rows} + {r.pool} - 1) "
+                    "so this launch's ring writes never alias its ring reads and no committed key a later step pools is overwritten by a draft"
+                )
+            raise ValueError(f"ring holds {int(ring.shape[1])} rows per sequence; the chunk form needs at least {need} ({ring_rule})")
         _check_row_tensor("ring", ring, dtype=r.dtype, last_dim=r.d)
         if out.ndim != 3 or int(out.shape[0]) != batch or int(out.shape[2]) != r.d or int(out.shape[1]) < 1 or not out.is_contiguous():
             raise ValueError(f"out must be a compact [B={batch}, NB >= 1, D={r.d}] tensor, got shape {tuple(out.shape)}")
@@ -1492,10 +1655,13 @@ def build_qsa_compress_step(
     block_table: Optional[torch.Tensor] = None,
     index_state_block_table: Optional[torch.Tensor] = None,
     index_state_slot_mapping: Optional[torch.Tensor] = None,
+    ring_write: bool = True,
+    rounding: str = INDEX_COMPRESS_ROUNDING_DEFAULT,
 ) -> QsaCompressStepRecipe:
     """Compile (cached) and run one decode step -- the convenience form for tests.  Production callers split it:
     :func:`compile_qsa_compress_step` at plan time, :func:`run_qsa_compress_step` per step.  The paged form is traced
-    when ``block_table`` is given (its slot-mapping arm when ``index_state_slot_mapping`` is)."""
+    when ``block_table`` is given (its slot-mapping arm when ``index_state_slot_mapping`` is); ``ring_write=False`` traces the
+    chunk form, ``rounding`` the chain's rounding points (both appended; module docstring)."""
     if k_new.ndim != 3:
         raise ValueError(f"k_new must be [B, S_q, D], got shape {tuple(k_new.shape)}")
     paged = block_table is not None
@@ -1512,6 +1678,8 @@ def build_qsa_compress_step(
         ring_slots=paged and index_state_slot_mapping is not None,
         ring_slot_dtype=index_state_slot_mapping.dtype if (paged and index_state_slot_mapping is not None) else torch.int64,
         index_cache_dtype=out.dtype,  # both forms: the dense arm is the e4m3 paged arm's oracle twin
+        ring_write=ring_write,
+        rounding=rounding,
     )
     run_qsa_compress_step(
         r,

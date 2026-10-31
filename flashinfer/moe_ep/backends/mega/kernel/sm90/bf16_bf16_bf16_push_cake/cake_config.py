@@ -73,9 +73,9 @@ class Sm90_Bf16_Bf16_Bf16_PushCake_MegaMoeConfig:
     opening, count, reserve, store and, at ``fused_begin`` 2, the receiver
     prefix in one cooperative launch over the co-resident blocks), ahead of
     the fused small-round path.  ``None`` reads
-    ``FLASHINFER_SM90_CAKE_BF16_GRID_DISPATCH_MIN_TOKENS`` (default ``513``, the
-    rounds above the default fused bound; ``0`` = off).  It changes no stored
-    value.
+    ``FLASHINFER_SM90_CAKE_BF16_GRID_DISPATCH_MIN_TOKENS`` (default ``512`` at
+    EP size 8, else ``513``, the rounds above the default fused bound; ``0`` =
+    off).  It changes no stored value.
 
     ``compact_form`` and ``publish_form`` select kernel forms that write the
     same bytes: ``1`` runs the latency-pipelined compact (several rows in

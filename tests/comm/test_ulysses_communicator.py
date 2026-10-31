@@ -2376,7 +2376,8 @@ def _init_fault_body(rank, world_size, group, arg):
         def bad_init(*a, **k):
             raise RuntimeError("injected init failure")
 
-        ulysses_mod.init_ulysses_a2a = bad_init
+        # Inject at the configured initializer used by the communicator.
+        ulysses_mod._init_ulysses_a2a_configured = bad_init
     elif fault == "jit" and rank == 0:
         # rank-local stage-J failure: nothing may be allocated anywhere
         vllm_ar_mod = importlib.import_module("flashinfer.comm.vllm_ar")

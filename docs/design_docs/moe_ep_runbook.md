@@ -303,10 +303,11 @@ On the receiving rank the combine tail (wait for every source, fp32 top-k
 reduce, ack) runs as one fused kernel without a per-round combine-inbox fill;
 `FLASHINFER_SM90_CAKE_BF16_FUSED_TAIL=0` selects the vendored three-kernel
 tail (bit-identical output) for A/B checks, and peers may mix the two. Dedup
-rounds of up to 512 tokens per rank dispatch through one cooperative kernel
+rounds below the grid-dispatch bound (513 tokens per rank, 512 at EP 8) by
+default dispatch through one cooperative kernel
 (count + reserve + store_publish, with the round opening and the receiver-side
-prefix folded in), larger dedup rounds through one grid-strided cooperative
-kernel over the co-resident blocks; `FLASHINFER_SM90_CAKE_BF16_FUSED_DISPATCH=0`
+prefix folded in), dedup rounds from the bound on through one grid-strided
+cooperative kernel over the co-resident blocks; `FLASHINFER_SM90_CAKE_BF16_FUSED_DISPATCH=0`
 plus `FLASHINFER_SM90_CAKE_BF16_GRID_DISPATCH_MIN_TOKENS=0` select the vendored
 dispatch kernels, which non-dedup pipes always use. The dispatch wire format is
 the vendored one in every combination.
@@ -323,7 +324,7 @@ None of them changes an output byte (the section tests compare them bitwise).
 | `per_route_publish_pdl` (`PER_ROUTE_PUBLISH_PDL`) | `True` | On the per-route wire, the combine publish is a programmatic dependent launch too. |
 | `fused_begin` (`FUSED_BEGIN`) | `2` | Round opening folded into the dispatch launch: 1 = tag bump and ack wait, 2 = also the receiver-side prefix. |
 | `fused_dispatch_max_tokens` (`FUSED_DISPATCH_MAX_TOKENS`) | `512` | Largest round (tokens per rank) of the fused dispatch kernel (at most 512). |
-| `grid_dispatch_min_tokens` (`GRID_DISPATCH_MIN_TOKENS`) | `513` | Smallest round of the grid-strided dispatch kernel; `0` = off. |
+| `grid_dispatch_min_tokens` (`GRID_DISPATCH_MIN_TOKENS`) | `512` at EP 8, `513` at other EP sizes | Smallest round of the grid-strided dispatch kernel; `0` = off. |
 | `compact_form`, `publish_form` (`COMPACT_FORM`, `PUBLISH_FORM`) | `1` | Latency-pipelined compact and load-hoisted pre-reduced publish; `0` = the one-row-per-block compact and the route-serial publish. |
 | `fc2_early_max_tokens` (`FC2_EARLY_MAX_TOKENS`) | `128` | Rounds with 1 to this many tokens on the rank start FC2 inside FC1's tail wave: FC1 releases a readiness counter per 128-row tile and FC2 claims the ready tiles (same tiles and per-tile instructions). Needs at most 1023 local experts and hidden and intermediate sizes of at least 256, otherwise off; `0` = off. Rank-local, so ranks may differ. |
 | `fc2_early_windows` (`FC2_EARLY_WINDOWS`) | `True` | Larger rounds of a measured shape also start FC2 inside FC1's tail wave when the rank's token count lies in the shape's window: hidden 7168, intermediate 2048, 256 experts, top-k 8 at EP 8 from 129 to 4096 tokens and at EP 4 from 129 to 1024 tokens; hidden 7168, intermediate 3072, 384 experts, top-k 6 at EP 8 from 513 to 1024 tokens. Other shapes keep the `fc2_early_max_tokens` window only. Needs the same conditions as `fc2_early_max_tokens`; same bits; rank-local. |
@@ -577,7 +578,7 @@ env (all runs pass `--moe-backend deep_gemm_mega_moe`; the fi path is env-gated)
 ```bash
 W=$ROOT/moe_ep_benchmark/vllm_e2e
 # 1) hold a 4-GPU node; run every command through the container helper:
-JOBID=$(sbatch --parsable -A coreai_libraries_cudnn -p batch -N1 \
+JOBID=$(sbatch --parsable -A "$SLURM_ACCOUNT" -p batch -N1 \
     --ntasks-per-node=1 --time=04:00:00 -J fi.vllm_e2e.hold \
     --output=$W/logs/hold_%j.log --wrap "sleep 14400")
 # 2) one-time venv: vllm==0.25.1 + editable fi branch + patch_0251 (keeps
@@ -639,6 +640,26 @@ prefill chunks), per-role offline knob caches.
 ---
 
 ## Blackwell standard autotuning
+
+`Sm100_Mxfp8_Mxfp4_Bf16_Cutedsl_MegaMoeConfig` selects standard inference
+with MXFP4 weights, MXFP8 E4M3 activations and BF16 output. Hidden and
+intermediate sizes must be multiples of 128. Supply canonical BF16 weights
+or packed E2M1 weights with unswizzled per-32 E8M0 scales; preprocessing
+packs the gate/up layout once at construction.
+
+With `MegaConfig.quantize_input=True`, eligible BF16 inputs use fused
+quantization and workspace staging. `quantize_input=False` takes E4M3 data
+and linear E8M0 scales, copies them into the workspace, and uses the shared
+route-staging kernel to convert IDs and scores and zero masked scores.
+Unsupported layouts or `FLASHINFER_MEGA_FUSED_STAGE=0` use Torch staging.
+As on the other Blackwell paths, callers supply valid routing values.
+This configuration supports default/fixed knobs and `knobs="auto"` below;
+offline tuning uses `--arch sm100 --implementation next --dtype mxfp4_mxfp8`.
+For GenPhase, use `Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig`
+with `kind="mxfp4_mxfp8"` and `kernel_variant="genphase"`.
+
+Run `tests/moe_ep/test_sm100_mxfp4_mxfp8.py` under `torchrun` for multirank
+weight, staging and shared-workspace graph-replay checks.
 
 The `sm100_nvfp4_nvfp4_bf16_cutedsl_next` and
 `sm100_mxfp8_mxfp8_bf16_cutedsl_next` selectors support `knobs="auto"` through

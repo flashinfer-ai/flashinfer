@@ -38,6 +38,7 @@ MoKBackwardMXFP8 = kernels.MoKBackwardMXFP8
 MoKForwardMXFP8 = kernels.MoKForwardMXFP8
 MoKRecomputeMXFP8 = kernels.MoKRecomputeMXFP8
 quantize_mok_mxfp8_weights = api.quantize_mok_mxfp8_weights
+mxfp8 = cake_package("cake_mok_bf16", "mxfp8")
 
 LIMITS = pytest.mark.parametrize("swiglu_limit", [None, 0.75], ids=["plain", "clamped"])
 
@@ -143,6 +144,43 @@ def test_weight_quantizer_matches_recipe():
     assert torch.equal(backward_w[2][1], expected_down[3])
     rel = (dequantize(*expected[:2]) - up.float()).norm() / up.float().norm()
     assert rel.item() < 0.05
+
+
+def _flat(value):
+    return [t for v in value for t in (_flat(v) if isinstance(v, tuple) else [v])]
+
+
+@pytest.mark.parametrize("experts_per_chunk", [1, 2, 3])
+def test_weight_quantizer_paths_are_bitwise(monkeypatch, experts_per_chunk):
+    """The fused CUDA quantizer, the chunked PyTorch path and the per-matrix
+    reference produce the same bytes, NaN / infinity / zero blocks included."""
+    require_gpu()
+    torch.manual_seed(23)
+    gate = torch.randn(5, 256, 512, device="cuda", dtype=torch.bfloat16)
+    gate[2, 9, 32:64] = float("nan")
+    gate[3, 1, :32] = float("inf")
+    gate[3, 7, 100] = -float("inf")
+    gate[4, 0, 64:96] = 0
+    gate[0, 5, :64] = 1e-30
+    gate[1, 200, 128:160] = 3.0e38
+    gate[1, 201, 160:192] = torch.tensor([448.0, 449.0, -464.0, 480.0] * 8)
+    up = torch.randn_like(gate) * 1e-3
+    down = torch.randn(5, 512, 256, device="cuda", dtype=torch.bfloat16) * 1e3
+    for matrix in (gate[1], gate[2], down[3]):
+        single = mxfp8.mxfp8_quantize(matrix)
+        assert all(
+            torch.equal(a.view(torch.uint8), b.view(torch.uint8))
+            for a, b in zip(single, quantize(matrix), strict=True)
+        )
+    fused = quantize_mok_mxfp8_weights(gate, up, down)
+    monkeypatch.setattr(mxfp8, "triton", None)
+    monkeypatch.setattr(mxfp8, "_CHUNK_BYTES", experts_per_chunk * 256 * 512 * 4)
+    chunked = quantize_mok_mxfp8_weights(gate, up, down)
+    pairs = list(zip(_flat(fused), _flat(chunked), strict=True))
+    assert len(pairs) == 16
+    for a, b in pairs:
+        assert a.shape == b.shape and a.dtype == b.dtype
+        assert torch.equal(a.view(torch.uint8), b.view(torch.uint8))
 
 
 @LIMITS

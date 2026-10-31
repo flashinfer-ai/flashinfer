@@ -40,8 +40,8 @@ the native reload loader retains its arbitrary-hole masks.
 These are separate schedules within the shared kernel framework. D512, packed
 formats, narrower heads, extra pools and sinks retain their qualified paths.
 
-The public LSE is always natural-log; split scratch stays base 2 until the final
-store. An empty sparse row writes zero output and negative-infinity LSE. Native
+Sparse public LSE is natural-log; dense optional final LSE is base 2. Split
+scratch stays base 2 until the final store. An empty sparse row writes zero output and negative-infinity LSE. Native
 cache pools accept flat `[rows,D]` storage as well as paged views; indices always
 include each pool's physical row stride. Scale arguments remain host-runtime
 values with the same graph-capture semantics on both schedules.
@@ -72,7 +72,7 @@ synchronizes. Q quantization and query RoPE are caller-owned preparation.
 
 Fixed plans retain their B/Sq geometry. A sparse wrapper can serve a range of
 independent row counts with one profile: plan `batch_size=1`,
-`packed_query=True`, `max_seq_len_q=row_capacity`, then pass `[rows,H,D]` Q and
+`packed_query=True`, `max_q_len=row_capacity`, then pass `[rows,H,D]` Q and
 CUDA INT32 `qo_indptr=[0,rows]` with `rows <= row_capacity`. Choose capacity for
 the desired workload range; each graph retains its captured views and addresses.
 
@@ -108,3 +108,9 @@ until it rises by more than T binades and scales FP8 probabilities by
 `448 * 2**-T`, trading tail precision for fewer output corrections. Bounds are
 0–8 for E4M3 and 0–32 for BF16. Each distinct T specializes a kernel; see the
 `plan()` docstring for the precision implications.
+
+Dense plans select cached policies and compiled kernels from explicit problem
+bounds; runs bind live metadata and reuse scratch. See the shared
+[planning contract](../../README.md#reusable-plans),
+[runtime split-KV policy](../../README.md#runtime-split-kv-policy), and
+[final statistics contract](../../README.md#final-statistics-and-sink-semantics).

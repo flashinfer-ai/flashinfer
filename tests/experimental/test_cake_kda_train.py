@@ -316,8 +316,10 @@ GRID_KINDS = (
     "chunks",
     "chunk_blocks",
     "pairs_bounded",
+    "pair_items",
     "per_doc_head",
     "sm_bounded",
+    "chunk_items",
     "docs_heads",
     "carry_groups",
     "segments_heads",
@@ -1053,8 +1055,8 @@ def _expected_grid(
         "gate_epilogue",
     ):
         return (nc_pad, h, 1)
-    if name.startswith(("wy_", "dav")):  # persistent over the (pair, head) items
-        return (max(1, min(nc_pad // 2 * h, sm)), 1, 1)
+    if name.startswith(("wy_", "dav")):  # one CTA per (pair, head) item
+        return (max(1, nc_pad // 2 * h), 1, 1)
     if name == "fwdh_v3":
         return (2 * nseg * h, 1, 1)
     if name.startswith("fwdh_p3"):
@@ -1072,8 +1074,8 @@ def _expected_grid(
     if name.startswith("fwdh_") or name.startswith("dhu_"):
         narrow = name.startswith(("fwdh_o_v2", "fwdh_v2", "dhu_v2t"))
         return (n * h * (4 if narrow else 2), 1, 1)
-    if name.startswith("dqkg"):
-        return (max(1, min(ctas, sm)), 1, 1)
+    if name.startswith("dqkg"):  # one CTA per (chunk, head) item
+        return (max(1, ctas), 1, 1)
     raise AssertionError(name)
 
 
@@ -1527,18 +1529,20 @@ def test_pairs_grid_needs_an_even_chunk_bound() -> None:
         )
 
 
-def test_pair_kernels_walk_the_pairs_on_a_persistent_grid() -> None:
-    # The WY and dA / dv programs: one CTA per SM at most, walking the (chunk pair, head) items; the pair count is
-    # a plan scalar.
+def test_pair_kernels_launch_one_cta_per_pair_item() -> None:
+    # The WY and dA programs: one CTA per (chunk pair, head) item at any SM count; the CTAs that start take the
+    # items of the CTAs that have not started (Cluster Launch Control), so an SM another stream holds costs only
+    # its share of the items.  The pair count is a plan scalar.
     for name in (
         "wy_fwd",
+        "wy_fwd_rows",
         "wy_bwd",
         "wy_bwd_replay",
         "dav_serial",
         "dav_serial_replay",
     ):
         record = cake_jit.MODULES[name]
-        assert record["grid_rule"] == {"kind": "pairs_bounded", "ctas_per_sm": 1}
+        assert record["grid_rule"] == {"kind": "pair_items"}
         assert ["parameter", "num_pairs"] in [list(pair) for pair in record["arg_plan"]]
         assert record["logical"]["num_pairs"] == "num_pairs"
         for nc_pad, h, sm in (
@@ -1550,7 +1554,25 @@ def test_pair_kernels_walk_the_pairs_on_a_persistent_grid() -> None:
             grid = cake_jit.launch_grid(
                 name, num_chunks_pad=nc_pad, num_seqs=1, num_heads=h, sm_count=sm
             )
-            assert grid == (max(1, min(nc_pad // 2 * h, sm)), 1, 1)
+            assert grid == (max(1, nc_pad // 2 * h), 1, 1)
+
+
+def test_fused_gradient_launches_one_cta_per_chunk_item() -> None:
+    # The fused gradient: one CTA per (chunk, head) item at any SM count, its items handed out the same way.
+    for name in (
+        "dqkg",
+        "dqkg_int",
+        "dqkg_davq",
+        "dqkg_int_davq",
+        "dqkg_davq_nohint",
+        "dqkg_int_davq_nohint",
+    ):
+        assert cake_jit.MODULES[name]["grid_rule"] == {"kind": "chunk_items"}
+        for nc_pad, h, sm in ((1, 1, 148), (64, 4, 148), (4096, 64, 132)):
+            grid = cake_jit.launch_grid(
+                name, num_chunks_pad=nc_pad, num_seqs=1, num_heads=h, sm_count=sm
+            )
+            assert grid == (max(1, nc_pad * h), 1, 1)
 
 
 def test_the_backward_reads_the_token_rows_without_chunk_layout_copies() -> None:

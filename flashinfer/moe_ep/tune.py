@@ -362,12 +362,13 @@ def main(argv: Optional[List[str]] = None) -> int:
             print(f"--dtype {args.dtype} is unsupported on {family}", file=sys.stderr)
             return 2
         if args.dtype == "mxfp4_mxfp8":
-            if family != "sm107" and not (
-                family == "sm100" and args.kernel_variant == "genphase"
+            if (
+                family == "sm100"
+                and args.kernel_variant != "genphase"
+                and args.implementation != "next"
             ):
                 print(
-                    "--dtype mxfp4_mxfp8 requires SM107 or SM100 GenPhase",
-                    file=sys.stderr,
+                    "SM100 MXFP4/MXFP8 requires --implementation next", file=sys.stderr
                 )
                 return 2
             backend = (
@@ -389,7 +390,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         family != "sm100"
         or args.dtype not in ("nvfp4", "mxfp8_e4m3", "mxfp8_e5m2", "mxfp4_mxfp8")
     ):
-        print("--implementation next requires SM100 NVFP4 or MXFP8", file=sys.stderr)
+        print(
+            "--implementation next requires SM100 block-scaled inference",
+            file=sys.stderr,
+        )
         return 2
 
     if not args.do_finalize or (

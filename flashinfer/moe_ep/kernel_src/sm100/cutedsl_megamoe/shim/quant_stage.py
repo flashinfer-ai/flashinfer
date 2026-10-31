@@ -400,12 +400,12 @@ def fused_quant_stage(
     ``scale_multiplier`` optionally supplies the rounded ``norm_const / 6``
     factor used by the caller's NVFP4 quantization contract.
     ``mxfp8_normal_scales`` clamps MXFP8 scales to the normal FP32 range,
-    matching Rubin's Torch quantizer; other callers retain the full E8M0 range.
+    matching the block-scaled Torch quantizer; other callers retain the full E8M0 range.
     ``num_experts`` optionally checks route bounds, uniqueness and finite
     unmasked scores in the same kernel, before narrowing IDs to int32.
     ``fuse_tail_mask`` additionally masks all trailing routing rows in that
     launch when the live CTAs have enough parallelism. Large tails retain a
-    separate fill. It requires normal-scale MXFP8 with int32 route storage.
+    separate fill. It requires NVFP4 or normal-scale MXFP8 with int32 routes.
     """
     if quant_type not in _QUANT_TYPES:
         raise ValueError(
@@ -426,12 +426,13 @@ def fused_quant_stage(
     num_tokens, hidden = hidden_states.shape
     capacity = x_out.shape[0]
     if fuse_tail_mask and (
-        not mxfp8_normal_scales
+        not (is_nvfp4 or mxfp8_normal_scales)
         or topk_idx_out.dtype != torch.int32
         or topk_idx_out.shape[0] != capacity
     ):
         raise ValueError(
-            "fused tail masking requires normal-scale MXFP8 and full-capacity int32 routes"
+            "fused tail masking requires NVFP4 or normal-scale MXFP8 "
+            "and full-capacity int32 routes"
         )
     if num_tokens == 0:
         # Nothing to quantize, but the staging contract still applies: rows a

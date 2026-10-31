@@ -888,6 +888,160 @@ def _get_bf16q_fp8kv_transform_mode(
         ) from err
 
 
+def _make_xqa_mtp_causal_mask(
+    batch_size: int, q_len_per_req: int, device: torch.device
+) -> torch.Tensor:
+    num_packed_masks_per_token = (q_len_per_req + 31) // 32
+    q_indices = torch.arange(q_len_per_req, device=device, dtype=torch.int32).unsqueeze(
+        1
+    )
+    kv_indices = torch.arange(
+        q_len_per_req, device=device, dtype=torch.int32
+    ).unsqueeze(0)
+    causal_mask = kv_indices <= q_indices
+
+    padded_seq_len = num_packed_masks_per_token * 32
+    if padded_seq_len > q_len_per_req:
+        padding = torch.zeros(
+            q_len_per_req,
+            padded_seq_len - q_len_per_req,
+            device=device,
+            dtype=torch.bool,
+        )
+        causal_mask = torch.cat([causal_mask, padding], dim=1)
+
+    causal_mask = causal_mask.view(q_len_per_req, num_packed_masks_per_token, 32)
+    bit_positions = 1 << torch.arange(32, device=device, dtype=torch.int64)
+    mask_uint32 = (
+        (causal_mask.to(torch.int64) * bit_positions).sum(dim=-1).to(torch.uint32)
+    )
+    mask_uint32 = (
+        mask_uint32.unsqueeze(0)
+        .expand(batch_size, q_len_per_req, num_packed_masks_per_token)
+        .contiguous()
+    )
+    return mask_uint32.view(torch.uint16)
+
+
+def _make_block_tables_from_indptr(
+    indptr_host: torch.Tensor,
+    indices: torch.Tensor,
+    batch_size: int,
+    device: torch.device,
+    *,
+    block_tables: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    blocks_per_seq = (
+        indptr_host[1 : batch_size + 1] - indptr_host[:batch_size]
+    ).tolist()
+    max_blocks_per_seq = max(blocks_per_seq) if blocks_per_seq else 0
+    if block_tables is None:
+        block_tables = torch.zeros(
+            (batch_size, max_blocks_per_seq), dtype=torch.int32, device=device
+        )
+    else:
+        if (
+            block_tables.shape[0] != batch_size
+            or block_tables.shape[1] < max_blocks_per_seq
+        ):
+            raise ValueError(
+                "XQA MTP CUDA graph block table cannot grow after planning; "
+                "pass a fixed block_tables sized for the longest sequence "
+                "the graph will see."
+            )
+        block_tables.zero_()
+    indptr_list = indptr_host.tolist()
+    for i, num_blocks in enumerate(blocks_per_seq):
+        if num_blocks == 0:
+            continue
+        start = indptr_list[i]
+        block_tables[i, :num_blocks] = indices[start : start + num_blocks]
+    return block_tables
+
+
+def _is_xqa_mtp_decode_supported(
+    device: torch.device,
+    backend: str,
+    use_tensor_cores: bool,
+    q_len_per_req: int,
+    q_data_type: torch.dtype,
+    kv_data_type: torch.dtype,
+    head_dim: int,
+    page_size: int,
+    pos_encoding_mode: str,
+    logits_soft_cap: float,
+    fixed_split_size: int,
+    has_jit_module: bool,
+    *,
+    uses_cudnn: bool = False,
+    use_token_head_sf: bool = False,
+    disable_split_kv: bool = False,
+    o_data_type: Optional[torch.dtype] = None,
+) -> bool:
+    if not use_tensor_cores or has_jit_module or uses_cudnn:
+        return False
+    if use_token_head_sf or disable_split_kv:
+        return False
+    if o_data_type is not None and o_data_type != q_data_type:
+        return False
+    if backend not in ("auto", "fa2", "fa3"):
+        return False
+    if q_len_per_req <= 1:
+        return False
+    if q_data_type not in (torch.float16, torch.bfloat16):
+        return False
+    if kv_data_type not in (torch.float16, torch.bfloat16, torch.float8_e4m3fn):
+        return False
+    if head_dim < 16 or head_dim > 256 or head_dim % 16 != 0:
+        return False
+    if page_size not in (16, 32, 64, 128):
+        return False
+    if pos_encoding_mode != "NONE" or logits_soft_cap != 0.0:
+        return False
+    if fixed_split_size != -1:
+        return False
+    return get_compute_capability(device)[0] in (9, 10, 12)
+
+
+def _xqa_mtp_decode_has_measured_shape(
+    *,
+    device: torch.device,
+    backend: str,
+    kv_layout: str,
+    use_cuda_graph: bool,
+    batch_size: int,
+    q_len_per_req: int,
+    q_data_type: torch.dtype,
+    kv_data_type: torch.dtype,
+    head_dim: int,
+    page_size: int,
+    num_qo_heads: int,
+    num_kv_heads: int,
+    kv_lens_arr_host: torch.Tensor,
+    window_left: int,
+) -> bool:
+    """Provisional SM90 graph policy limited to the stronger reported H100 shapes."""
+    if backend != "auto" or not use_cuda_graph or kv_layout != "NHD":
+        return False
+    if q_data_type != torch.float16 or kv_data_type != torch.float16:
+        return False
+    if (head_dim, page_size, num_qo_heads, num_kv_heads) != (128, 16, 32, 8):
+        return False
+    if window_left != -1 or batch_size not in (4, 16, 64):
+        return False
+    if q_len_per_req not in (4, 8) or get_compute_capability(device) != (9, 0):
+        return False
+    if kv_lens_arr_host.ndim != 1 or kv_lens_arr_host.numel() != batch_size:
+        return False
+    kv_len = int(kv_lens_arr_host[0])
+    if not bool(torch.all(kv_lens_arr_host == kv_len)):
+        return False
+    # Do not interpolate from selected medians or include near-parity cases.
+    if q_len_per_req == 8 and kv_len == 8192:
+        return True
+    return batch_size == 16 and kv_len == 1024
+
+
 @flashinfer_api
 def single_decode_with_kv_cache_with_jit_module(
     jit_module: Any,
@@ -1361,6 +1515,16 @@ class BatchDecodeWithPagedKVCacheWrapper:
             at the first run.
             Pass a fixed ``block_tables`` to :meth:`plan` when capturing CUDA graphs so
             the captured block-table buffer is stable across re-plans.
+            On SM90, tensor-core ``auto`` graph-mode wrappers may select XQA MTP
+            for FP16 NHD, page16, head128, 32Q/8KV-head plans with uniform KV
+            lengths: q8/KV8192 at batch4/16/64, or q4/q8/KV1024 at batch16.
+            This provisional rule excludes ordinary wrappers, explicit backends,
+            q2 and unmeasured shapes. It is based on selected historical H100
+            graph results, not a guarantee of gains on every SM90 GPU. The
+            preferred route is frozen for graph-mode wrappers; changes in
+            eligibility require a separate wrapper and graph capture. Eager
+            warmups of such wrappers use their selected graph-mode route.
+            ``workspace_size`` is unavailable for XQA-selected shapes.
 
         jit_args : Optional[List[Any]]
             If provided, the wrapper will use the provided arguments to create the JIT module,
@@ -1490,6 +1654,12 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 float_workspace_buffer, use_cuda_graph=use_cuda_graph
             )
 
+        self._xqa_mtp_decode_frozen: Optional[bool] = None
+        self._use_xqa_mtp_decode = False
+        self._xqa_mtp_causal_mask: Optional[torch.Tensor] = None
+        self._xqa_mtp_block_tables: Optional[torch.Tensor] = None
+        self._xqa_mtp_q_len_per_req = 1
+
     @property
     def use_tensor_cores(self) -> bool:
         return self._use_tensor_cores
@@ -1574,7 +1744,11 @@ class BatchDecodeWithPagedKVCacheWrapper:
         when the auto rule picked cuDNN, the tensor-core pick (``"fa2"`` / ``"fa3"``)
         otherwise, ``"fa2"`` for the CUDA-core decode kernel. An explicit backend
         reports itself; a tensor-core ``auto`` wrapper reports ``"auto"`` before its
-        first :meth:`plan`."""
+        first :meth:`plan`. An auto-selected XQA MTP plan reports ``"xqa"``;
+        unsupported per-call options can still use the fallback.
+        """
+        if getattr(self, "_use_xqa_mtp_decode", False):
+            return "xqa"
         if self._cudnn_auto:
             return "cudnn"
         if self._backend == "auto" and not self._use_tensor_cores:
@@ -1797,6 +1971,42 @@ class BatchDecodeWithPagedKVCacheWrapper:
             kv_lens_arr_host = get_seq_lens(indptr_host, last_page_len_host, page_size)
         else:
             kv_lens_arr_host = seq_lens.cpu().to(torch.int32)
+        if _is_xqa_mtp_decode_supported(
+            self.device,
+            self._requested_backend,
+            self.use_tensor_cores,
+            q_len_per_req,
+            q_data_type,
+            kv_data_type,
+            head_dim,
+            page_size,
+            pos_encoding_mode,
+            logits_soft_cap,
+            fixed_split_size,
+            self._jit_module is not None,
+            uses_cudnn=backend == "cudnn",
+            disable_split_kv=disable_split_kv,
+            o_data_type=o_data_type,
+        ) and _xqa_mtp_decode_has_measured_shape(
+            device=self.device,
+            backend=self._requested_backend,
+            kv_layout=self._kv_layout,
+            use_cuda_graph=self.is_cuda_graph_enabled,
+            batch_size=batch_size,
+            q_len_per_req=q_len_per_req,
+            q_data_type=q_data_type,
+            kv_data_type=kv_data_type,
+            head_dim=head_dim,
+            page_size=page_size,
+            num_qo_heads=num_qo_heads,
+            num_kv_heads=num_kv_heads,
+            kv_lens_arr_host=kv_lens_arr_host,
+            window_left=window_left,
+        ):
+            raise NotImplementedError(
+                "workspace_size is not available for XQA MTP plans; "
+                "FA2 workspace sizes do not cover XQA requirements."
+            )
         if q_len_per_req > 1:
             min_kv_len = int(kv_lens_arr_host.min())
             if min_kv_len < q_len_per_req:
@@ -1995,9 +2205,15 @@ class BatchDecodeWithPagedKVCacheWrapper:
         disable_split_kv : bool,
             Whether to disable the split-kv for determinism in CUDA Graph, defaults to ``False``.
         q_len_per_req : int
-            The number of query tokens per request. Defaults to ``1``.
+            The number of query tokens per request. Defaults to ``1``. This
+            must be set at :meth:`plan` time to enable the XQA MTP decode fast
+            path; setting it only at :meth:`run` time will not enable that
+            path.
             ``q_len_per_req > 1`` is currently supported on the fa2
             tensor-core backend (and natively by trtllm-gen/cute-dsl).
+            In CUDA graph mode, an auto-built XQA block table keeps its
+            initial capacity. Pass ``block_tables`` sized for the longest
+            sequence the graph will see if the page count will grow.
             Under ``use_cuda_graph``, this value is part of the frozen
             shape (like the batch size): once the wrapper has been
             planned, re-planning with a different value raises.
@@ -2310,6 +2526,81 @@ class BatchDecodeWithPagedKVCacheWrapper:
             kv_lens_arr_host = get_seq_lens(indptr_host, last_page_len_host, page_size)
         else:
             kv_lens_arr_host = seq_lens.cpu().to(torch.int32)
+        use_xqa_mtp_decode = _is_xqa_mtp_decode_supported(
+            self.device,
+            self._backend,
+            self.use_tensor_cores,
+            q_len_per_req,
+            q_data_type,
+            kv_data_type,
+            head_dim,
+            page_size,
+            pos_encoding_mode,
+            logits_soft_cap,
+            fixed_split_size,
+            self._jit_module is not None,
+            uses_cudnn=self._uses_cudnn,
+            use_token_head_sf=use_token_head_sf,
+            disable_split_kv=disable_split_kv,
+            o_data_type=o_data_type,
+        ) and _xqa_mtp_decode_has_measured_shape(
+            device=self.device,
+            backend=self._requested_backend,
+            kv_layout=self._kv_layout,
+            use_cuda_graph=self.is_cuda_graph_enabled,
+            batch_size=batch_size,
+            q_len_per_req=q_len_per_req,
+            q_data_type=q_data_type,
+            kv_data_type=kv_data_type,
+            head_dim=head_dim,
+            page_size=page_size,
+            num_qo_heads=num_qo_heads,
+            num_kv_heads=num_kv_heads,
+            kv_lens_arr_host=kv_lens_arr_host,
+            window_left=window_left,
+        )
+        if self.is_cuda_graph_enabled:
+            if (
+                self._xqa_mtp_decode_frozen is not None
+                and self._xqa_mtp_decode_frozen != use_xqa_mtp_decode
+            ):
+                raise ValueError(
+                    "XQA MTP routing is part of the frozen cudagraph shape; "
+                    "use a separate wrapper and recapture when eligibility changes."
+                )
+            self._xqa_mtp_decode_frozen = use_xqa_mtp_decode
+        self._use_xqa_mtp_decode = use_xqa_mtp_decode
+        self._xqa_mtp_q_len_per_req = q_len_per_req
+        if self._use_xqa_mtp_decode:
+            self._max_kv_len = int(kv_lens_arr_host.max().item())
+            required_size = len(kv_lens_arr_host)
+            if (
+                self._kv_lens_buffer is None
+                or required_size > self._kv_lens_buffer.shape[0]
+            ):
+                self._kv_lens_buffer = torch.empty(
+                    (required_size,), dtype=torch.int32, device=self.device
+                )
+            self._kv_lens_buffer[:required_size].copy_(
+                kv_lens_arr_host, non_blocking=non_blocking
+            )
+            if self._block_tables is None:
+                self._block_tables = _make_block_tables_from_indptr(
+                    indptr_host,
+                    self._paged_kv_indices_buf,
+                    batch_size,
+                    self.device,
+                    block_tables=self._xqa_mtp_block_tables
+                    if self.is_cuda_graph_enabled
+                    else None,
+                )
+                self._xqa_mtp_block_tables = self._block_tables
+            if self._xqa_mtp_causal_mask is None or self._xqa_mtp_causal_mask.shape[
+                :2
+            ] != (batch_size, q_len_per_req):
+                self._xqa_mtp_causal_mask = _make_xqa_mtp_causal_mask(
+                    batch_size, q_len_per_req, self.device
+                )
         if q_len_per_req > 1 and is_causal:
             min_kv_len = int(kv_lens_arr_host.min())
             if min_kv_len < q_len_per_req:
@@ -2480,25 +2771,9 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 kv_lens_arr_host, non_blocking=non_blocking
             )
             if self._block_tables is None:
-                blocks_per_seq = [
-                    (seq_len + page_size - 1) // page_size
-                    for seq_len in kv_lens_arr_host
-                ]
-                max_num_blocks_per_seq = max(blocks_per_seq)
-                self._block_tables = torch.zeros(
-                    (batch_size, max_num_blocks_per_seq),
-                    dtype=torch.int,
-                    device=self.device,
+                self._block_tables = _make_block_tables_from_indptr(
+                    indptr_host, self._paged_kv_indices_buf, batch_size, self.device
                 )
-                block_id = int(indptr_host[0].item())
-                for i in range(batch_size):
-                    num_blocks_needed = blocks_per_seq[i]
-                    self._block_tables[i, :num_blocks_needed] = (
-                        self._paged_kv_indices_buf[
-                            block_id : block_id + num_blocks_needed
-                        ]
-                    )
-                    block_id += num_blocks_needed
             self._cached_module = get_trtllm_gen_decode_module(
                 q_data_type,
                 kv_data_type,
@@ -2904,6 +3179,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
             On the trtllm-gen and cute-dsl backends the q_len_per_req implied
             by ``q.shape[0]`` may differ from the planned value; the fa2/fa3
             tensor-core path requires it to match :meth:`plan`.
+            XQA MTP is selected only for the documented SM90 graph-mode
+            ``auto`` shapes; other plans retain the existing route.
         paged_kv_cache : Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
             The paged KV-Cache stored as a tuple of tensors or a single tensor:
 
@@ -2917,6 +3194,9 @@ class BatchDecodeWithPagedKVCacheWrapper:
               ``[max_num_pages, 2, num_kv_heads, page_size, head_dim]`` if
               :attr:`kv_layout` is ``HND``. Where ``paged_kv_cache[:, 0]`` is the key-cache and
               ``paged_kv_cache[:, 1]`` is the value-cache.
+
+            For NVFP4 ``torch.uint8`` caches, the last dimension is
+            ``head_dim // 2`` because each byte stores two FP4 values.
         *args
             Additional arguments for the custom kernel.
         q_scale : Optional[float]
@@ -2969,7 +3249,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
 
             Both tensors have dtype ``torch.float8_e4m3fn``.
 
-            Currently, NVFP4 KV supports `fa2` and `trtllm-gen` backend.
+            Currently, NVFP4 KV supports the ``fa2`` and ``trtllm-gen`` backends;
+            ``fa2`` requires ``use_tensor_cores=True``.
 
             With ``use_token_head_sf=True`` (plan time), ``kv_cache_sf`` must be a
             ``(k_sf, v_sf)`` tuple of ``float32`` tensors mirroring the KV layout
@@ -2980,11 +3261,14 @@ class BatchDecodeWithPagedKVCacheWrapper:
         Returns
         -------
         Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
-            If :attr:`return_lse` is ``False``, the attention output, shape: ``[batch_size, num_qo_heads, head_dim]``.
+            If :attr:`return_lse` is ``False``, the attention output, shape:
+            ``[batch_size * q_len_per_req, num_qo_heads, head_dim]``.
             If :attr:`return_lse` is ``True``, a tuple of two tensors:
 
-            * attention output, shape: ``[batch_size, num_qo_heads, head_dim]``
-            * logsumexp of attention scores, shape: ``[batch_size, num_qo_heads]``.
+            * attention output, shape:
+              ``[batch_size * q_len_per_req, num_qo_heads, head_dim]``
+            * logsumexp of attention scores, shape:
+              ``[batch_size * q_len_per_req, num_qo_heads]``.
         """
         if enable_pdl is None:
             enable_pdl = device_support_pdl(q.device)
@@ -3260,7 +3544,56 @@ class BatchDecodeWithPagedKVCacheWrapper:
             )
             return (out, lse) if return_lse else out
 
-        if self._backend == "trtllm-gen":
+        use_xqa_mtp_decode_run = (
+            self._use_xqa_mtp_decode
+            and q_len_per_req > 1
+            and not return_lse
+            and lse is None
+            and key_block_scales is None
+            and value_block_scales is None
+            and skip_softmax_threshold_scale_factor is None
+        )
+        if use_xqa_mtp_decode_run:
+            if self._block_tables is None or self._kv_lens_buffer is None:
+                raise RuntimeError("XQA MTP decode metadata is not initialized")
+            if self._max_kv_len is None:
+                raise RuntimeError("XQA MTP decode max KV length is not initialized")
+            if (
+                self._xqa_mtp_causal_mask is None
+                or self._xqa_mtp_q_len_per_req != q_len_per_req
+                or self._xqa_mtp_causal_mask.shape[0] != actual_batch_size
+            ):
+                self._xqa_mtp_causal_mask = _make_xqa_mtp_causal_mask(
+                    actual_batch_size, q_len_per_req, q.device
+                )
+                self._xqa_mtp_q_len_per_req = q_len_per_req
+
+            xqa_batch_decode_with_kv_cache(
+                query=q,
+                kv_cache=(k_cache, v_cache),
+                workspace_buffer=self._float_workspace_buffer,
+                block_tables=self._block_tables,
+                seq_lens=self._kv_lens_buffer[:actual_batch_size],
+                max_seq_len=self._max_kv_len,
+                bmm1_scale=sm_scale,
+                bmm2_scale=1.0,
+                window_left=window_left,
+                out=out,
+                sinks=sinks,
+                kv_layout=self._kv_layout,
+                enable_pdl=enable_pdl,
+                q_len_per_req=q_len_per_req,
+                o_scale=1.0,
+                mask=self._xqa_mtp_causal_mask,
+            )
+            is_float_one = isinstance(v_scale, float) and v_scale == 1.0
+            if v_scale is not None and not is_float_one:
+                if is_float8(out):
+                    out = (out.to(torch.float32) * v_scale).to(out.dtype)
+                else:
+                    out *= v_scale
+            return out
+        elif self._backend == "trtllm-gen":
             q = q.view(q.size(0) // q_len_per_req, q_len_per_req, q.size(1), q.size(2))
 
         trtllm_gen_bmm2_scale: Optional[Union[float, torch.Tensor]] = None
@@ -3491,6 +3824,12 @@ class BatchDecodeWithPagedKVCacheWrapper:
                     ]
 
             self._cached_module.paged_run(*run_args)
+            if self._use_xqa_mtp_decode:
+                # FA2 fallback shares scratch with XQA; restore its semaphore
+                # before a later XQA call or captured graph replay.
+                self._float_workspace_buffer.view(torch.uint8)[
+                    : 8 * 1024 * 1024
+                ].zero_()
         else:
             # trtllm-gen does not need plan info
             if self._backend == "trtllm-gen" and self._plan_info is None:
@@ -3974,6 +4313,7 @@ def trtllm_batch_decode_with_kv_cache(
     bf16q_fp8kv_transform_mode: Optional[Literal["k_only", "separate_kv"]] = None,
     request_order: Optional[torch.Tensor] = None,
     request_order_plan: Optional[Any] = None,
+    sparse_top_k: int = 0,
 ) -> Union[
     torch.Tensor, FP4Tensor, Tuple[Union[torch.Tensor, FP4Tensor], torch.Tensor]
 ]:
@@ -4205,6 +4545,18 @@ def trtllm_batch_decode_with_kv_cache(
         descriptors are initialized; subsequent replays may update only the
         contents of ``request_order`` in place.
 
+    sparse_top_k : int = 0
+        Static token-sparse MQA (``trtllm-gen`` backend): each query token attends to
+        its own list of at most ``sparse_top_k`` KV tokens, such as a Top-K selection. Each
+        query token is its own request over pages of one token, with one KV head. Pass
+        ``uses_shared_paged_kv_idx=False`` and ``block_tables`` of shape
+        ``[batch_size, 2, sparse_top_k]`` with each token's K and V token indices, and
+        ``seq_lens`` with how many leading entries of each list are valid. ``sparse_top_k``
+        must be a multiple of 4, the query heads at most 128, and ``batch_size`` at most
+        65535. A sliding window, attention sinks and head dim 512 (MLA's, see
+        :func:`trtllm_batch_decode_with_kv_cache_mla`) are not supported. ``0``
+        (default) disables it.
+
     Returns
     -------
     out : Union[torch.Tensor, FP4Tensor]
@@ -4235,6 +4587,43 @@ def trtllm_batch_decode_with_kv_cache(
             # NOTE(Zihao): unbind transforms [num_pages, 2, ...] to ([num_pages, ...], [num_pages, ...])
             # it doesn't change underlying storage
             k_cache, v_cache = kv_cache.unbind(dim=1)
+
+    if sparse_top_k:
+        if q_len_per_req != 1 or cum_seq_lens_q is not None:
+            raise ValueError("sparse_top_k requires one query token per request")
+        # The token-sparse kernels apply neither a sliding window nor sinks.
+        if window_left != -1 or sinks is not None:
+            raise ValueError(
+                "sparse_top_k supports neither a sliding window nor attention sinks"
+            )
+        if (
+            uses_shared_paged_kv_idx
+            or block_tables.shape[1:] != (2, sparse_top_k)
+            or block_tables.shape[0] < query.shape[0]
+            or seq_lens.shape[0] < query.shape[0]
+        ):
+            raise ValueError(
+                "sparse_top_k requires uses_shared_paged_kv_idx=False, block_tables of shape "
+                f"[batch_size, 2, {sparse_top_k}] and batch_size seq_lens, got "
+                f"{tuple(block_tables.shape)} and {tuple(seq_lens.shape)}"
+            )
+        page_size = k_cache.shape[-2 if kv_layout == "HND" else -3]
+        if page_size != 1 or k_cache.stride(0) != v_cache.stride(0):
+            raise ValueError("sparse_top_k needs one-token K and V pages of one stride")
+        # The token-sparse kernels address K/V without a head stride: one KV head.
+        if k_cache.shape[-3 if kv_layout == "HND" else -2] != 1:
+            raise ValueError("sparse_top_k needs one KV head (MQA)")
+        # Sparse 512/512 head dims select the MLA kernels (one latent K/V pool).
+        if query.shape[-1] == 512:
+            raise ValueError(
+                "sparse_top_k with head dim 512 is MLA's: use trtllm_batch_decode_with_kv_cache_mla"
+            )
+        # The kernel copies indices with 16-byte cp.async (four int32s), and its
+        # non-persistent launch grid caps the request count at 65535 (as in mla/_core.py).
+        if sparse_top_k % 4 or query.shape[0] > 65535:
+            raise ValueError(
+                "sparse_top_k must be a multiple of 4 and batch_size at most 65535"
+            )
 
     if k_cache.dtype == torch.uint8 or v_cache.dtype == torch.uint8:
         if kv_cache_sf is None:
@@ -4364,6 +4753,10 @@ def trtllm_batch_decode_with_kv_cache(
             "trtllm-gen" if get_compute_capability(query.device)[0] == 10 else "xqa"
         )
 
+    if sparse_top_k and backend != "trtllm-gen":
+        raise ValueError(
+            f"sparse_top_k is only supported by the trtllm-gen backend, got {backend!r}"
+        )
     if backend not in ("trtllm-gen", "cake") and bmm1_scale_log2 is not None:
         raise ValueError(
             "bmm1_scale_log2 is only supported when backend is 'trtllm-gen' or 'cake'"
@@ -4835,7 +5228,7 @@ def trtllm_batch_decode_with_kv_cache(
             o_sf_start_index,
             batch_size,
             window_left,
-            0,  # sparse_mla_top_k
+            sparse_top_k,
             sm_count,
             enable_pdl,
             workspace_buffer.numel() * workspace_buffer.element_size(),
@@ -5157,9 +5550,27 @@ def fast_decode_plan(
             fixed_split_size=fixed_split_size,
             disable_split_kv=disable_split_kv,
         )
-    if wants_cudnn or self._cudnn_auto:
+    if (
+        wants_cudnn
+        or self._cudnn_auto
+        or getattr(self, "_use_xqa_mtp_decode", False)
+        or (
+            self._requested_backend == "auto"
+            and self.is_cuda_graph_enabled
+            and get_compute_capability(self.device) == (9, 0)
+            and (num_qo_heads, num_kv_heads, head_dim, page_size) == (32, 8, 128, 16)
+            and (
+                (q_len_per_req == 8 and len(last_page_len) in (4, 16, 64))
+                or (q_len_per_req == 4 and len(last_page_len) == 16)
+            )
+        )
+    ):
+        # XQA needs its KV lengths and block table refreshed by the regular
+        # planner too; the FA2 copy-elision path leaves that metadata stale.
         # cuDNN (explicit or auto), and an auto wrapper leaving cuDNN, go
-        # through the regular planner: it refreshes cuDNN's KV lengths and
+        # through the regular planner, as do graph-mode auto wrappers whose
+        # XQA eligibility must be rechecked even after a fallback plan.
+        # It refreshes cuDNN's KV lengths and
         # block table (compatible prepared graphs are reused) or builds the
         # FA2/FA3 module the fast path below replans. Call the implementation
         # directly: serving callers replace self.plan with

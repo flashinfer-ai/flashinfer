@@ -1022,8 +1022,12 @@ class _Tcgen05Window(NamedTuple):
 # other inputs of 2056 to 8184 while PACKED's grid fits one wave (6784 output
 # features take 212 CTAs).  Without a bias, PACKED_M64_N8 also serves 4 and 5 rows
 # at 3584 to 4608 output features and an input of 2048; PACKED_M64_N4 serves 4
-# rows at 4097 to 6144 output features and inputs of 3072 to 6144 that are a
-# multiple of 64.  On sm_100a, after the windows above, PACKED_BOX8 and PACKED_M64_N8
+# rows at 4097 to 6144 output features and inputs of 3072 to 6144 that are a multiple
+# of 64.  After those, PACKED_M64_N8 serves more shapes without a bias: 8 rows above
+# 6784 and up to 7167 output features at inputs of 2112 to 2304 that are a multiple of
+# 64, 6 and 7 rows at 4096 output features and an input of 2048, and 8 rows above 6784
+# and up to 7056 output features at the inputs of 7169 to 8184 that are not a multiple
+# of 64.  On sm_100a, after the windows above, PACKED_BOX8 and PACKED_M64_N8 first
 # serve rows without a bias in windows from 3584 output features and an input of 2048.
 # At 8192 output features and inputs of 2048 to 8192, PACKED_M64_N8 serves 1 to 8 rows
 # when the input is a multiple of 64 and PACKED_BOX8 serves the other inputs.
@@ -1031,17 +1035,46 @@ class _Tcgen05Window(NamedTuple):
 # 8192, and at 3584 to 4608 output features and inputs of 6152 to 8192.  After those,
 # PACKED_M64_N8 serves 1 to 7 rows at 4480 to 8192 output features and inputs of 2048 to
 # 6152, and at 7000 to 8192 and inputs up to 8192 that are a multiple of 64; it serves 8
-# rows at 12288 output features and inputs up to 16384 that are a multiple of 64.  On
-# sm_103a, after the windows above, PACKED_BOX8 and PACKED_M64_N8 also serve rows
+# rows at 12288 output features and inputs up to 16384 that are a multiple of 64.  The
+# rows without a bias that no window above admits then go to PACKED_M64_N8 on 8 rows at
+# inputs that are a multiple of 64: at 4480 to 7167 output features and inputs of 2048
+# to 4352 or 5632 to 6144, at 7168 to 16384 output features and inputs of 2048 to 6144,
+# and at 7168 to 9216 output features and inputs above 6152 up to 8192.  PACKED_BOX8
+# serves the other 8-row inputs of 2048 to 8192 at 4480 to 4608 output features, and 8
+# rows at 3584 to 4479 output features and inputs of 6152 to 8192.  PACKED serves 9
+# to 16 rows at 4097 to 16384 output features and inputs of 2048 to 12288, also where
+# its grid takes more than one wave.  PACKED_BOX8 serves 8 rows at 4112 to 4464 output
+# features and inputs of 2048 to 6144, and 1 to 7 rows there when the input is a
+# multiple of 64.  Last, on inputs that are a multiple of 64, PACKED_M64_N8 serves 1 to
+# 7 rows at 8193 to 16384 output features and inputs of 2048 to 4096, and at 8192 output
+# features and inputs of 10240 to 12288; 8 rows at 16400 to 24576 output features and
+# inputs of 2048 to 6144, at 6144 to 16384 output features and inputs of 1024 to 1984,
+# and at 7168 to 7808 output features and inputs of 8256 to 12288; and 1 to 8 rows at
+# 2880 to 3568 output features and inputs of 7168 to 16384.  On the other 8-row inputs,
+# PACKED_BOX8 serves 7168 to 7808 output features and inputs of 8200 to 9992, and
+# PACKED_M64_N8 10240 to 16384 output features and inputs of 2056 to 6136.  On
+# sm_103a, after the windows above, PACKED_BOX8 and PACKED_M64_N8 first serve rows
 # without a bias in windows from 3584 output features and an input of 2048.  PACKED_BOX8
 # serves 8 rows at 4480 to 4608 output features and inputs of 2048 to 12288.  At 8192
 # output features and inputs of 2048 to 8192, PACKED_M64_N8 serves 1 to 8 rows when the
 # input is a multiple of 64 and PACKED_BOX8 serves the other inputs.  After those,
 # PACKED_M64_N8 serves 8 rows at 4480 to 16384 output features and inputs up to 6152
 # that are a multiple of 64, and 1 to 7 rows above 4608 and up to 8192 output features
-# at inputs of 2048 to 6152.  Last, on inputs that are a multiple of 64, it serves 8
+# at inputs of 2048 to 6152.  Then, on inputs that are a multiple of 64, it serves 8
 # rows at 8192 and 12288 output features and inputs of 2048 to 12288, and at 3584 output
-# features and inputs above 12288 up to 16384.
+# features and inputs above 12288 up to 16384.  The rows without a bias that no window
+# above admits then go to PACKED_M64_N8 on 8 rows at 7424 to 9216 output features and
+# inputs above 6152 up to 8192, and on 1 to 7 rows at 7424 to 8192 output features and
+# those inputs when they are a multiple of 64; on 8 rows at 5008 to 7423 output features
+# and inputs of 2048 to 5631, and at 7424 to 16384 output features and inputs of 2048 to
+# 6144.  PACKED serves 9 to 16 rows at 4097 to 16384 output features and inputs of 2048
+# to 12288, also where its grid takes more than one wave, and PACKED_BOX8 8 rows at 4097
+# to 4479 output features and inputs of 2048 to 6144.  Last, PACKED_M64_N8 serves 1 to 7
+# rows above 8192 output features: up to 16384 at inputs of 2048 to 4096, and up to
+# 12288 at inputs above 4096 up to 8192 that are a multiple of 64; 8 rows at 16385 to
+# 24576 output features and inputs of 2048 to 6144, and at 3584 to 16384 output features
+# and inputs of 1024 to 2047; and 1 to 8 rows at 2880 to 3583 output features and inputs
+# above 6144 up to 12288 that are a multiple of 64.
 _LARGE_WEIGHT = 6_000_000
 
 
@@ -1177,6 +1210,108 @@ _SM100 = (
         16384,
         input_features_multiple=64,
     ),
+    _Tcgen05Window(
+        "PACKED_M64_N8", 8, 8, False, 4480, 7167, 2048, 4352, input_features_multiple=64
+    ),
+    _Tcgen05Window(
+        "PACKED_M64_N8", 8, 8, False, 4480, 7167, 5632, 6144, input_features_multiple=64
+    ),
+    _Tcgen05Window(
+        "PACKED_M64_N8",
+        8,
+        8,
+        False,
+        7168,
+        16384,
+        2048,
+        6144,
+        input_features_multiple=64,
+    ),
+    _Tcgen05Window(
+        "PACKED_M64_N8", 8, 8, False, 7168, 7679, 6153, 8192, input_features_multiple=64
+    ),
+    _Tcgen05Window(
+        "PACKED_M64_N8", 8, 8, False, 7680, 9216, 6153, 8192, input_features_multiple=64
+    ),
+    _Tcgen05Window("PACKED", 9, 16, False, 4224, 16384, 2048, 12288),
+    _Tcgen05Window("PACKED_BOX8", 8, 8, False, 4112, 4464, 2048, 6144),
+    _Tcgen05Window(
+        "PACKED_BOX8", 1, 7, False, 4112, 4464, 2048, 6144, input_features_multiple=64
+    ),
+    _Tcgen05Window(
+        "PACKED_M64_N8",
+        1,
+        7,
+        False,
+        9216,
+        16384,
+        2048,
+        4096,
+        input_features_multiple=64,
+    ),
+    _Tcgen05Window(
+        "PACKED_M64_N8",
+        1,
+        7,
+        False,
+        8192,
+        8192,
+        10240,
+        12288,
+        input_features_multiple=64,
+    ),
+    _Tcgen05Window(
+        "PACKED_M64_N8",
+        8,
+        8,
+        False,
+        16400,
+        24576,
+        2048,
+        6144,
+        input_features_multiple=64,
+    ),
+    _Tcgen05Window(
+        "PACKED_M64_N8",
+        8,
+        8,
+        False,
+        6144,
+        16384,
+        1024,
+        1984,
+        input_features_multiple=64,
+    ),
+    _Tcgen05Window(
+        "PACKED_M64_N8",
+        1,
+        8,
+        False,
+        2880,
+        3568,
+        7168,
+        16384,
+        input_features_multiple=64,
+    ),
+    _Tcgen05Window(
+        "PACKED_M64_N8",
+        8,
+        8,
+        False,
+        7168,
+        7808,
+        8256,
+        12288,
+        input_features_multiple=64,
+    ),
+    _Tcgen05Window("PACKED_BOX8", 8, 8, False, 7168, 7808, 8200, 9992),
+    _Tcgen05Window("PACKED_M64_N8", 8, 8, False, 10240, 16384, 2056, 6136),
+    _Tcgen05Window("PACKED_BOX8", 8, 8, False, 4480, 4608, 2048, 8192),
+    _Tcgen05Window("PACKED_BOX8", 8, 8, False, 3584, 4479, 6152, 8192),
+    _Tcgen05Window(
+        "PACKED_M64_N8", 1, 7, False, 8193, 9215, 2048, 4096, input_features_multiple=64
+    ),
+    _Tcgen05Window("PACKED", 9, 16, False, 4097, 4223, 2048, 12288),
 )
 _SM103 = (
     _Tcgen05Window("PACKED_NARROW_FULL_STAGES", 1, 6, True, 32, 384, 8192, 20480),
@@ -1254,6 +1389,41 @@ _SM103 = (
         16384,
         input_features_multiple=64,
     ),
+    _Tcgen05Window("PACKED_M64_N8", 8, 8, False, 7424, 8191, 6153, 8192),
+    _Tcgen05Window("PACKED_M64_N8", 8, 8, False, 8193, 9216, 6153, 8192),
+    _Tcgen05Window(
+        "PACKED_M64_N8", 1, 7, False, 7424, 8192, 6153, 8192, input_features_multiple=64
+    ),
+    _Tcgen05Window("PACKED_M64_N8", 8, 8, False, 5008, 7423, 2048, 5631),
+    _Tcgen05Window("PACKED_M64_N8", 8, 8, False, 7424, 16384, 2048, 6144),
+    _Tcgen05Window("PACKED", 9, 16, False, 4097, 16384, 2048, 6144),
+    _Tcgen05Window("PACKED", 9, 16, False, 4097, 16384, 6145, 12288),
+    _Tcgen05Window("PACKED_BOX8", 8, 8, False, 4097, 4479, 2048, 6144),
+    _Tcgen05Window("PACKED_M64_N8", 1, 7, False, 8193, 16384, 2048, 4096),
+    _Tcgen05Window(
+        "PACKED_M64_N8",
+        1,
+        7,
+        False,
+        8193,
+        12288,
+        4097,
+        8192,
+        input_features_multiple=64,
+    ),
+    _Tcgen05Window("PACKED_M64_N8", 8, 8, False, 16385, 24576, 2048, 6144),
+    _Tcgen05Window("PACKED_M64_N8", 8, 8, False, 3584, 16384, 1024, 2047),
+    _Tcgen05Window(
+        "PACKED_M64_N8",
+        1,
+        8,
+        False,
+        2880,
+        3583,
+        6145,
+        12288,
+        input_features_multiple=64,
+    ),
 )
 _SM107 = (
     _Tcgen05Window("PACKED_NARROW_U4", 1, 8, True, 64, 384, 10240, 20480),
@@ -1302,6 +1472,11 @@ _SM107 = (
         "PACKED_M64_N4", 4, 4, False, 4097, 6144, 3072, 6144, input_features_multiple=64
     ),
     _Tcgen05Window("PACKED_M64_N8", 4, 5, False, 3584, 4608, 2048, 2048),
+    _Tcgen05Window(
+        "PACKED_M64_N8", 8, 8, False, 6785, 7167, 2112, 2304, input_features_multiple=64
+    ),
+    _Tcgen05Window("PACKED_M64_N8", 6, 7, False, 4096, 4096, 2048, 2048),
+    _Tcgen05Window("PACKED_M64_N8", 8, 8, False, 6785, 7056, 7169, 8184),
     _Tcgen05Window("PACKED", 9, 16, True, 3584, 4096, 2112, 6144),
     *_SM107_SMALL_ACTIVATIONS,
     *_many_rows_nobias(1728),

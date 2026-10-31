@@ -105,6 +105,8 @@ def ref_fp4_quant(x, global_scale, block_size, sf_use_ue8m0=False):
     Both backends preserve FP32 subnormals. Returned FP32 scales use FlashInfer's
     host-decode convention: UE8M0 byte zero becomes zero. Compare packed
     payloads and scale bytes with zero tolerance, including signed zeros.
+    FP32 inputs are also accepted to reference fused operators that quantize
+    FP32 intermediates without first rounding them to FP16/BF16.
     """
     assert isinstance(global_scale, (float, int)) or global_scale.dtype == torch.float32
 
@@ -112,8 +114,14 @@ def ref_fp4_quant(x, global_scale, block_size, sf_use_ue8m0=False):
     sliced_x = x.to(torch.float32).reshape(sliced_shape)
     vec_max = sliced_x.abs().amax(dim=-1, keepdim=True)
     if sf_use_ue8m0:
-        if block_size != 32 or x.dtype not in (torch.float16, torch.bfloat16):
-            raise ValueError("MXFP4 reference requires FP16/BF16 and block size 32")
+        if block_size != 32 or x.dtype not in (
+            torch.float16,
+            torch.bfloat16,
+            torch.float32,
+        ):
+            raise ValueError(
+                "MXFP4 reference requires FP16/BF16/FP32 and block size 32"
+            )
         six = torch.full((), 6.0, dtype=torch.float32, device=x.device)
         normalized_max = vec_max * _ref_rcp_approx_ftz(six)
 

@@ -62,6 +62,9 @@ through the plan's collectives (``build_kcp_context``)::
     out_local = chunk_kda_kcp(q_local, k_local, v_local, g_local, beta_local, ctx)   # autograd
     out_local, saved = chunk_kda_kcp_fwd(q_local, k_local, v_local, g_local, beta_local, ctx)
     grads = chunk_kda_kcp_bwd(q_local, k_local, v_local, g_local, beta_local, ctx, dout_local, saved=saved)
+
+    ctx_next = build_kcp_context(part_next, group, rank, device, heads=H)   # prepare the next pack while this one
+                                                                          # runs: one async copy, no host wait
 """
 
 from __future__ import annotations
@@ -408,6 +411,8 @@ def build_kcp_context(
     conv_kernel_size: int = 4,
     *,
     sm_count: Optional[int] = None,
+    heads: Optional[Any] = None,
+    stream: Optional[Any] = None,
 ) -> Any:
     r"""This rank's context of a partition: its device tables, the collectives of the state and halo exchanges and
     the segment plan of its fragments.
@@ -426,6 +431,13 @@ def build_kcp_context(
         The width of the causal convolution whose history rows the context exchanges (4).
     sm_count : int, optional
         The device's SM count when it should not be queried.
+    heads : int or sequence of int, optional
+        Head counts whose head plans are derived now (host work only) instead of at the first call.
+    stream : torch.cuda.Stream, optional
+        The stream of the context's one asynchronous table copy (default: the current stream of ``device``).  The
+        host never waits for device work: a pack can be prepared while the previous one runs.  A thread other than
+        the one that runs the pack must pass the stream that will run it, or call ``ctx.wait_ready(stream)`` before
+        that stream reads the tables (the KCP entry points call ``ctx.wait_ready()`` on their current stream).
 
     Returns
     -------
@@ -434,7 +446,14 @@ def build_kcp_context(
     from .experimental.cake_kda_train import cake_kcp_plan
 
     return cake_kcp_plan.build_kcp_context(
-        part, group, rank, device, conv_kernel_size, sm_count=sm_count
+        part,
+        group,
+        rank,
+        device,
+        conv_kernel_size,
+        sm_count=sm_count,
+        heads=heads,
+        stream=stream,
     )
 
 
@@ -474,7 +493,8 @@ def chunk_kda_kcp_fwd(
         ``"saved"`` keeps the received boundary states in the saved set; ``"replay"`` saves nothing and lets the
         backward replay the forward's exchanges.
     workspace : KcpWorkspace, optional
-        A reused workspace of this rank; without one the call allocates its own.
+        A reused workspace of this rank; without one the call allocates its own.  One workspace may serve every
+        prepared pack of the rank (``KcpWorkspace.reserve(ctxs, H)`` sizes it for all of them up front).
     **options
         Further KCP options (``save_transfer``, ``exchange``, ``head_groups``, ``offset_class``, ``graph``),
         forwarded.
@@ -566,10 +586,35 @@ def chunk_kda_kcp(
     save_mode: str = "light",
     boundary_mode: str = "saved",
     workspace: Optional[Any] = None,
+    *,
+    recompute_handle: Optional[Any] = None,
+    checkpoint_keep: Optional[str] = None,
     **options: Any,
 ) -> torch.Tensor:
     r"""Autograd-enabled context-parallel packed KDA chunked training step of this rank's fragments (the forward of
     :func:`chunk_kda_kcp_fwd`; the backward of :func:`chunk_kda_kcp_bwd` from its saved set).
+
+    Parameters
+    ----------
+    recompute_handle : KcpRecomputeHandle, optional
+        Keyword-only, default ``None`` (unchanged behavior).  A handle (``flashinfer.kda_train.KcpRecomputeHandle``
+        or any object with an ``entries`` dict, such as the convolution's handle of the same layer) makes the
+        ``torch.utils.checkpoint`` recompute of this call run without the forward state exchange: the original
+        forward exchanges as always and stores its incoming states (the saved set's own tensors, key ``"kda"``) in
+        the handle; the recompute inside the backward reads them back, so ``out`` and the gradients are bitwise
+        those of the same checkpoint without a handle.  The backward still exchanges.  Create one handle per layer
+        and micro-step, outside the outermost checkpoint region, and pass it as an argument of the checkpointed
+        function; a forward outside the backward that finds an entry raises.  Refused with ``graph="replay"``,
+        inside a CUDA-graph capture, with ``debug_sequence``, ``spec3_probe`` and ``boundary_mode="replay"``.  The
+        exchange is a collective: every rank of ``ctx.group`` passes a handle for the same call or none, created at
+        the same checkpoint nesting level; a mismatch hangs or corrupts data (no check is made).
+    checkpoint_keep : str, optional
+        With a handle only.  ``"states"`` (default): the handle keeps ``S_in`` and the call runs with
+        ``save_transfer=False`` (bitwise the default form; the backward re-sends the maps).  ``"transfer"``: it also
+        keeps the owner's c1 receive tensor (``save_transfer=True``; not with ``exchange="ring"``).  An explicit
+        ``save_transfer`` must agree with the tier (``"states"`` -> ``False``, ``"transfer"`` -> ``True``); a
+        contradicting value raises ``ValueError``.  The retained bytes are ``kcp_saved_bytes(ctx, H=...,
+        checkpoint_keep=..., with_conv=False)``.
 
     Returns
     -------
@@ -589,6 +634,8 @@ def chunk_kda_kcp(
         save_mode=save_mode,
         boundary_mode=boundary_mode,
         workspace=workspace,
+        recompute_handle=recompute_handle,
+        checkpoint_keep=checkpoint_keep,
         **options,
     )
 
@@ -600,16 +647,27 @@ def kcp_workspace_bytes(
     H: int = 64,
     save_mode: str = "light",
     backward: bool = True,
-    save_transfer: bool = False,
+    save_transfer: Optional[bool] = None,
     C: int = 8192,
 ) -> int:
-    """Bytes of this rank's KCP workspace for ``H`` heads: the local arena of :func:`kda_train_workspace_bytes` plus
+    """Bytes of this rank's KCP workspace for ``H`` heads: the local arena (that of :func:`kda_train_workspace_bytes`
+    for a backward workspace; a forward-only one takes the KCP forward layout, 2432 B per internal token-head) plus
     the boundary pools of the context's collectives, as ``KcpWorkspace`` allocates them (the backward's send pools
     share the forward's storage; the ring exchange's hop pools, allocated by the first ``exchange="ring"`` call, are
-    not counted).  The saved set and the convolution's halo rows are per-call tensors, so ``save_transfer`` and
-    ``C`` do not change it."""
+    not counted).  The saved set and the convolution's halo rows are per-call tensors, so ``C`` does not change it,
+    and ``save_transfer`` does not change a backward workspace.  A forward-only workspace (``backward=False``) has
+    two states.  After its forwards with a saved set it holds the bytes returned here for the forward's
+    ``save_transfer`` (``None``, the default, resolves to ``True`` as the a2a forward does; pass ``False`` for the
+    ring or the recompute form); with ``True`` it holds no c1 receive, transfer staging or carry pool, with ``False``
+    it holds the first two.  Once a forward without a saved set has allocated the rest, it holds
+    ``cake_kcp_plan.kcp_arena_layout(ctx, H=H, backward=False, save_transfer=save_transfer)["lazy"]`` bytes more.
+    Under ``exchange="ring"`` it never holds the c1 receive pool.  ``ctx`` may be a list of contexts: the bytes of
+    one workspace that serves all of them (``KcpWorkspace.reserve(ctxs, H)``): each pool at its largest need and
+    the largest local arena, not their sum."""
     from .experimental.cake_kda_train import cake_kcp_plan
 
+    if save_transfer is None:
+        save_transfer = cake_kcp_plan.SAVE_TRANSFER_DEFAULT
     return cake_kcp_plan.kcp_workspace_bytes(
         ctx,
         H=H,
@@ -626,14 +684,20 @@ def kcp_saved_bytes(
     *,
     H: int = 64,
     save_mode: str = "light",
-    save_transfer: bool = False,
+    save_transfer: Optional[bool] = None,
     with_conv: bool = True,
     C: int = 8192,
+    checkpoint_keep: Optional[str] = None,
 ) -> int:
     """Bytes of this rank's KCP saved set for ``H`` heads: the local saved set (:func:`kda_train_saved_bytes`), the
-    boundary states, and (``with_conv``) the convolution's history rows of ``C`` channels."""
+    boundary states, and (``with_conv``) the convolution's history rows of ``C`` channels.  ``checkpoint_keep``
+    (``"states"`` | ``"transfer"``): instead the bytes a recompute handle of that tier retains for the layer
+    (:func:`chunk_kda_kcp`; plus one convolution's history rows with ``with_conv``).  ``save_transfer``: ``None``
+    is ``False`` without a tier; with one, an explicit value that contradicts it raises ``ValueError``."""
     from .experimental.cake_kda_train import cake_kcp_plan
 
+    if save_transfer is None and checkpoint_keep is None:
+        save_transfer = False
     return cake_kcp_plan.kcp_saved_bytes(
         ctx,
         H=H,
@@ -641,6 +705,7 @@ def kcp_saved_bytes(
         save_transfer=save_transfer,
         with_conv=with_conv,
         C=C,
+        checkpoint_keep=checkpoint_keep,
     )
 
 
@@ -650,16 +715,26 @@ def kcp_comm_bytes(
     *,
     H: int = 64,
     C: int = 8192,
-    save_transfer: bool = False,
+    save_transfer: Optional[bool] = None,
     boundary_mode: str = "saved",
+    checkpoint_keep: Optional[str] = None,
 ) -> dict:
     """Bytes this rank sends and receives in one training step (forward and backward) for ``H`` heads and ``C``
     convolution channels: the state summaries, the boundary states and the halo rows of the context's collectives,
-    as a table per collective and per boundary (``cake_kcp_plan.kcp_comm_bytes``)."""
+    as a table per collective and per boundary (``cake_kcp_plan.kcp_comm_bytes``).  ``checkpoint_keep``: the
+    traffic of a checkpointed step with a recompute handle of that tier (the tier fixes ``save_transfer``; ``None``
+    is ``False`` without a tier; an explicit value that contradicts the tier raises ``ValueError``)."""
     from .experimental.cake_kda_train import cake_kcp_plan
 
+    if save_transfer is None and checkpoint_keep is None:
+        save_transfer = False
     return cake_kcp_plan.kcp_comm_bytes(
-        ctx, H=H, C=C, save_transfer=save_transfer, boundary_mode=boundary_mode
+        ctx,
+        H=H,
+        C=C,
+        save_transfer=save_transfer,
+        boundary_mode=boundary_mode,
+        checkpoint_keep=checkpoint_keep,
     )
 
 
@@ -671,8 +746,19 @@ def is_kda_train_supported(device: torch.device | str | int | None = None) -> bo
     return cake_backend.is_supported(device)
 
 
+def __getattr__(name: str) -> Any:
+    # ``KcpRecomputeHandle`` (the KCP route's checkpoint recompute handle) resolves on first access, so importing this
+    # module does not import the KCP host module (torch.distributed, the KCP loader), like the entry points above.
+    if name == "KcpRecomputeHandle":
+        from .experimental.cake_kda_train.cake_kcp import KcpRecomputeHandle
+
+        return KcpRecomputeHandle
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
 __all__ = [
     "DEFAULT_SCALE",
+    "KcpRecomputeHandle",  # noqa: F822 - resolved by __getattr__
     "build_kcp_context",
     "chunk_kda",
     "chunk_kda_bwd",

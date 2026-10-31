@@ -309,8 +309,8 @@ kernel_cake_kda_train_184d5ccfffea932ff1d8(const __grid_constant__ CUtensorMap m
                 rd += 1;
                 if (rd == 3) { rd = 0; _phase_mma_done ^= 1; }
                 asm volatile("tcgen05.fence::after_thread_sync;");
-                long long base_0 = ((long long)sout * (long long)num_heads + (long long)head) * 16384 + (long long)lane_v;
-                long long o_base = base_0 + k_off;
+                long long base_1 = ((long long)sout * (long long)num_heads + (long long)head) * 16384 + (long long)lane_v;
+                long long o_base = base_1 + k_off;
                 float _tmem_load_0[32];
                 asm volatile(
                     "tcgen05.ld.sync.aligned.16x32bx2.x32.b32"
@@ -393,11 +393,11 @@ kernel_cake_kda_train_184d5ccfffea932ff1d8(const __grid_constant__ CUtensorMap m
                     s_1 = nseg_1 - 1;
                 }
                 int segment_1 = seg0_1 + s_1;
-                long long base_1 = ((long long)segment_1 * (long long)num_heads + (long long)head_1) * 16384 + (long long)lane_v_1;
+                long long base_2 = ((long long)segment_1 * (long long)num_heads + (long long)head_1) * 16384 + (long long)lane_v_1;
                 #pragma unroll
                 for (int k_2 = 0; k_2 < 32; k_2++) {
                     {
-                        bcol[k_2] = *reinterpret_cast<const float*>(b + (base_1 + k_off_1 + (long long)(k_2 * 128)));
+                        bcol[k_2] = *reinterpret_cast<const float*>(b + (base_2 + k_off_1 + (long long)(k_2 * 128)));
                     }
                 }
                 asm volatile(
@@ -414,11 +414,11 @@ kernel_cake_kda_train_184d5ccfffea932ff1d8(const __grid_constant__ CUtensorMap m
                     s_2 = nseg_1 - 1 - 1;
                 }
                 int segment_2 = seg0_1 + s_2;
-                long long base_2 = ((long long)segment_2 * (long long)num_heads + (long long)head_1) * 16384 + (long long)lane_v_1;
+                long long base_3 = ((long long)segment_2 * (long long)num_heads + (long long)head_1) * 16384 + (long long)lane_v_1;
                 #pragma unroll
                 for (int k_3 = 0; k_3 < 32; k_3++) {
                     {
-                        bcol[k_3] = *reinterpret_cast<const float*>(b + (base_2 + k_off_1 + (long long)(k_3 * 128)));
+                        bcol[k_3] = *reinterpret_cast<const float*>(b + (base_3 + k_off_1 + (long long)(k_3 * 128)));
                     }
                 }
             }
@@ -455,11 +455,11 @@ kernel_cake_kda_train_184d5ccfffea932ff1d8(const __grid_constant__ CUtensorMap m
                         s_3 = nseg_1 - 1 - (step_1 + 2);
                     }
                     int segment_3 = seg0_1 + s_3;
-                    long long base_3 = ((long long)segment_3 * (long long)num_heads + (long long)head_1) * 16384 + (long long)lane_v_1;
+                    long long base_4 = ((long long)segment_3 * (long long)num_heads + (long long)head_1) * 16384 + (long long)lane_v_1;
                     #pragma unroll
                     for (int k_4 = 0; k_4 < 32; k_4++) {
                         {
-                            bcol[k_4] = *reinterpret_cast<const float*>(b + (base_3 + k_off_1 + (long long)(k_4 * 128)));
+                            bcol[k_4] = *reinterpret_cast<const float*>(b + (base_4 + k_off_1 + (long long)(k_4 * 128)));
                         }
                     }
                 }

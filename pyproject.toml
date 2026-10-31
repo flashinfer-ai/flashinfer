@@ -94,12 +94,13 @@ exclude = [
 "flashinfer.cake_fused_qk_rope_fp8_append_backend" = ["csrc/**", "build.json"]
 "flashinfer.cake_vsa_sm90_backend" = ["csrc/**", "build.json"]
 "flashinfer.cake_gdp_backend" = ["csrc/**", "build.json"]
-"flashinfer.cake_mhc_train_backend" = ["csrc/**", "build.json"]
+"flashinfer.cake_mhc_det_train_backend" = ["csrc/**", "build.json"]
+"flashinfer.cake_mhc_det_train_head_backend" = ["csrc/**", "build.json"]
 "flashinfer.cake_gated_act_mxfp8_backend" = ["csrc/**", "build.json"]
 "flashinfer.cake_rmsnorm_silu_gate_train_backend" = ["csrc/**", "build.json"]
 "flashinfer.experimental.cake_dsa_train" = ["csrc/**", "build.json"]
 "flashinfer.experimental.cake_kda_train" = ["csrc/**", "build.json"]
-"flashinfer.experimental.cake_gdn_train" = ["csrc/**", "build.json", "build.test.json"]
+"flashinfer.experimental.cake_gdn_det_train_kcp" = ["csrc/**", "build.json", "build.test.json"]
 "flashinfer.experimental.cake_gdn_det_train" = ["csrc/**", "build.json"]
 "flashinfer.experimental.cake_gqa_train" = ["csrc/**", "build.json"]
 "flashinfer.experimental.cake_rubin_mla_nvfp4_decode" = ["csrc/**", "build.json"]
@@ -146,15 +147,24 @@ exclude = [
 # Their in-package JIT kernel source, compiled on demand by
 # flashinfer/jit/gdn_fused_decode.py.
 "flashinfer.gdn_kernels.experimental.kernel" = ["*.cu"]
+# Experimental SM120 CuTe GDN prefill. include-package-data is false, so the
+# license, README, and autocp coefficients must be listed or a wheel omits them.
+"flashinfer.experimental.gdn_sm120_cute" = [
+  "README.md",
+  "LICENSE.FlashQLA",
+]
+"flashinfer.experimental.gdn_sm120_cute.autocp" = [
+  "coefs/*.csv",
+]
 # Generated sources for the experimental exact-SM103a MXFP8 MegaMoE backend.
 "flashinfer.experimental.cake_mxfp8_megamoe_ep16" = ["csrc/**"]
 # Generated programs, hand-written bindings and manifest of the experimental
 # exact-SM103a W8A8 MXFP8 MegaMoE EP16 backend, compiled on demand.
 "flashinfer.experimental.cake_w8a8_megamoe_ep16" = ["csrc/**"]
 # Generated sources for the experimental exact-SM100a/SM103a/SM107a ragged BF16 MoE grouped GEMM backend.
-"flashinfer.experimental.cake_moe_grouped_gemm" = ["csrc/**", "build.json"]
+"flashinfer.experimental.cake_moe_grouped_det_gemm" = ["csrc/**", "build.json"]
 # Generated sources for the experimental exact-SM100a/SM107a dense projection GEMM backend.
-"flashinfer.experimental.dense_projection_gemm" = ["csrc/**", "build.json"]
+"flashinfer.experimental.dense_projection_det_gemm" = ["csrc/**", "build.json"]
 # Generated sources for the experimental exact-SM100a/SM103a StepFun fused-MoE backend (cake-build/1).
 "flashinfer.experimental.cake_stepfun_moe" = ["csrc/**", "build.json"]
 # Standalone cuDNN Frost Python sources and the native MoE adapter, compiled on first use.

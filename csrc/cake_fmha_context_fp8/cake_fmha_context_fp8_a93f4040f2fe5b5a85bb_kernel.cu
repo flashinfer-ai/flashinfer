@@ -2445,7 +2445,7 @@ kernel_cake_fmha_context_fp8_a93f4040f2fe5b5a85bb(const __grid_constant__ CUtens
                         us_blocks_1 = us_hi_1;
                     }
                 }
-                int q_head_base = unit_1 * 1;
+                int q_head_base = unit_1;
                 int row_tok = (warp % 4 * 32 + lane) / 1;
                 int row_head = q_head_base + (warp % 4 * 32 + lane) % 1;
                 int tok_base = cu_seq_lens_q[b_idx_1];
@@ -3499,8 +3499,8 @@ kernel_cake_fmha_context_fp8_a93f4040f2fe5b5a85bb(const __grid_constant__ CUtens
                         us_blocks_4 = us_hi_4;
                     }
                 }
-                uint32_t group_head = (heads_per_group.divisor != 1) ? (__umulhi((uint32_t)(unit_5 * 1), heads_per_group.multiplier) >> heads_per_group.shift_right) : (uint32_t)(unit_5 * 1);
-                uint32_t group_rank = (uint32_t)(unit_5 * 1) - group_head * (uint32_t)(heads_per_group.divisor);
+                uint32_t group_head = (heads_per_group.divisor != 1) ? (__umulhi((uint32_t)(unit_5), heads_per_group.multiplier) >> heads_per_group.shift_right) : (uint32_t)(unit_5);
+                uint32_t group_rank = (uint32_t)(unit_5) - group_head * (uint32_t)(heads_per_group.divisor);
                 int kv_head = group_head;
                 int tok_q0 = (unsigned int)cu_seq_lens_q[b_idx_5] + m_block_5 * 2 * 128;
                 int tok_q1 = tok_q0 + 128;

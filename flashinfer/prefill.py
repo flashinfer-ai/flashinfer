@@ -4599,7 +4599,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
         Parameters
         ----------
         q : torch.Tensor
-            The query tensor, shape: ``[qo_indptr[-1], num_qo_heads, head_dim]``
+            The query tensor, shape:
+            ``[qo_indptr[-1], num_qo_heads, head_dim_qk]``
         paged_kv_cache : Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
             The paged KV-Cache stored as a tuple of tensors or a single tensor:
 
@@ -4613,6 +4614,12 @@ class BatchPrefillWithPagedKVCacheWrapper:
               ``[max_num_pages, 2, num_kv_heads, page_size, head_dim]`` if
               :attr:`kv_layout` is ``HND``. Where ``paged_kv_cache[:, 0]`` is the key-cache and
               ``paged_kv_cache[:, 1]`` is the value-cache.
+
+            In these shapes, ``head_dim`` is ``head_dim_qk`` for the key cache and
+            ``head_dim_vo`` for the value cache. For NVFP4 ``torch.uint8`` caches,
+            the stored last dimensions are ``head_dim_qk // 2`` and
+            ``head_dim_vo // 2``, respectively. A single 5-D tensor requires equal
+            key and value storage widths.
 
         *args
             Additional arguments for custom kernels.
@@ -4664,9 +4671,13 @@ class BatchPrefillWithPagedKVCacheWrapper:
               and ``[num_pages, 2, num_kv_heads, page_size, head_dim // 16]`` if :attr:`kv_layout` is ``HND``,
               where dim 1 holds k (index 0) and v (index 1) scales.
 
+            For the tuple form, ``head_dim`` is ``head_dim_qk`` in ``k_scales``
+            and ``head_dim_vo`` in ``v_scales``. A single 5-D tensor requires
+            equal key and value scale widths.
+
             Both tensors have dtype ``torch.float8_e4m3fn``. ``k_scales`` uses a linear
             (row-major) layout, while ``v_scales`` must use TRT-LLM's 4-token interleaved
-            layout within each ``[page_size, head_dim // 16]`` tile if backend is `trtllm-gen`. Use
+            layout within each ``[page_size, head_dim_vo // 16]`` tile if backend is `trtllm-gen`. Use
             :func:`flashinfer.fp4_quantization.nvfp4_quantize_paged_kv_cache` to produce
             correctly formatted scale factors.
 
@@ -4699,10 +4710,12 @@ class BatchPrefillWithPagedKVCacheWrapper:
         Returns
         -------
         Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
-            If :attr:`return_lse` is ``False``, the attention output, shape: ``[qo_indptr[-1], num_qo_heads, head_dim]``.
+            If :attr:`return_lse` is ``False``, the attention output, shape:
+            ``[qo_indptr[-1], num_qo_heads, head_dim_vo]``.
             If :attr:`return_lse` is ``True``, a tuple of two tensors:
 
-            * The attention output, shape: ``[qo_indptr[-1], num_qo_heads, head_dim]``.
+            * The attention output, shape:
+              ``[qo_indptr[-1], num_qo_heads, head_dim_vo]``.
             * The logsumexp of attention output, shape: ``[qo_indptr[-1], num_qo_heads]``
               (``lse_layout="NH"``, default) or ``[num_qo_heads, qo_indptr[-1]]``
               (``"HN"``), in the base selected by :attr:`lse_base`.

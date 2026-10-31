@@ -264,7 +264,7 @@ def refs_lm_head_loss(package_dir: Path, loader: str) -> set[str]:
     }
 
 
-def refs_moe_grouped_gemm(package_dir: Path, loader: str) -> set[str]:
+def refs_moe_grouped_det_gemm(package_dir: Path, loader: str) -> set[str]:
     """Route stages bind a program and its compile-line specializations; the build is
     ``<library><tag>_<arch>`` for every architecture the route and the program share."""
     literals = module_literals(package_dir / loader)
@@ -377,8 +377,14 @@ PACKAGES: tuple[Package, ...] = (
         refs_generic,
     ),
     Package(
-        "flashinfer.cake_mhc_train_backend",
-        "flashinfer/cake_mhc_train_backend",
+        "flashinfer.cake_mhc_det_train_backend",
+        "flashinfer/cake_mhc_det_train_backend",
+        "cake_jit.py",
+        refs_generic,
+    ),
+    Package(
+        "flashinfer.cake_mhc_det_train_head_backend",
+        "flashinfer/cake_mhc_det_train_head_backend",
         "cake_jit.py",
         refs_generic,
     ),
@@ -401,16 +407,16 @@ PACKAGES: tuple[Package, ...] = (
         refs_generic,
     ),
     Package(
-        "flashinfer.experimental.cake_gdn_train",
-        "flashinfer/experimental/cake_gdn_train",
+        "flashinfer.experimental.cake_gdn_det_train_kcp",
+        "flashinfer/experimental/cake_gdn_det_train_kcp",
         "cake_jit.py",
         refs_shipped_modules,
     ),
     Package(
-        "flashinfer.experimental.cake_moe_grouped_gemm",
-        "flashinfer/experimental/cake_moe_grouped_gemm",
+        "flashinfer.experimental.cake_moe_grouped_det_gemm",
+        "flashinfer/experimental/cake_moe_grouped_det_gemm",
         "cake_jit.py",
-        refs_moe_grouped_gemm,
+        refs_moe_grouped_det_gemm,
     ),
     Package(
         "flashinfer.experimental.cake_lm_head_loss",
@@ -425,8 +431,8 @@ PACKAGES: tuple[Package, ...] = (
         refs_mok_bf16,
     ),
     Package(
-        "flashinfer.experimental.dense_projection_gemm",
-        "flashinfer/experimental/dense_projection_gemm",
+        "flashinfer.experimental.dense_projection_det_gemm",
+        "flashinfer/experimental/dense_projection_det_gemm",
         "cake_jit.py",
         refs_generic,
     ),

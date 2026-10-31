@@ -586,6 +586,11 @@ dq, dk, dv, dbeta, dg = chunk_kda_kcp_bwd(q_local, k_local, v_local, g_local, be
                                           dout_local, saved=saved)
 ```
 
+The context is a plain frozen object, not a dataclass: the pre-forward hooks
+of FSDP2 (`fully_shard`) walk every dataclass, dict, list and tuple of a
+module's arguments, and see the context as one leaf. Per-layer metadata that
+carries it costs no walk time per fragment.
+
 CUDA-graph replay: the three KDA entry points -- `chunk_kda_kcp`,
 `chunk_kda_kcp_fwd` and `chunk_kda_kcp_bwd` -- take `graph="replay"`
 (default `"off"`, the eager path); the convolution halo takes `graph=` only
@@ -641,7 +646,46 @@ send pools (a call waits its sends before a backward writes either), and the
 ring exchange's hop pools are allocated by the first `exchange="ring"` call.
 `kcp_workspace_bytes` is the number of bytes an a2a workspace allocates
 (`KcpWorkspace.bytes` after its first backward); the saved set and the
-convolution's halo rows are per-call tensors outside it.
+convolution's halo rows are per-call tensors outside it.  A workspace that
+has served forwards only (`kcp_workspace_bytes(..., backward=False)`) holds
+its local arena in the KCP forward layout (`fwd_kcp`: 2432 B per internal
+token-head against at least 2560 for the existing backend's forward layout;
+no segment state blocks, the internal `Akk` rows under the `h` tape) and leaves
+the c1 receive, transfer staging and carry pools to their first reader.  A
+forward with a saved set writes a fresh carry plane in place of the carry
+pool and, with `save_transfer=True` (the a2a default), fresh saved-set
+tensors in place of the other two; with `save_transfer=False` it allocates
+those two, so pass the forward's `save_transfer` to the byte query.  A
+forward without a saved set allocates the rest
+(`cake_kcp_plan.kcp_arena_layout(ctx, H=H, backward=False,
+save_transfer=...)["lazy"]` bytes more).  Under `exchange="ring"` such a
+workspace never allocates the c1 receive pool.  The first backward on such a
+workspace releases its forward arena before it allocates the backward one;
+outputs, saved sets and gradients are bitwise those of a backward workspace.
+
+One workspace serves every prepared pack of a rank whose calls run in stream
+order, so the workspace memory does not grow with the number of prepared
+packs: its pools hold the largest need of the packs and its local arena the
+largest layout, and a smaller pack runs on a view of that arena under its own
+plan.  `ws.reserve([ctx_a, ctx_b, ...], H)` sizes it for a list of contexts
+before the first call (host work and allocations only; `ring=True` also
+sizes the ring exchange's hop pools); the calls of those
+packs then allocate nothing, keep every pointer (so graph keys stay valid) and
+never re-size it -- a forward never turns a backward arena into a forward-only
+one.  `kcp_workspace_bytes([ctx_a, ctx_b, ...], H=H)` is its size: each pool at
+its largest need, the largest local arena and, where the intra record writes
+one, each pack's scratch table set (KiB scale; none at 64 heads).  No content
+crosses calls, so outputs, saved sets and gradients are bitwise those of one
+workspace per pack.  The workspace holds no context alive.  It records the
+stream of its last call; a call on another stream first waits for that
+stream's queued work on the device (one `wait_stream`, no host wait) and
+marks the workspace's storages as used on its own stream (`record_stream`),
+so a pool or arena that a later call replaces, or a dropped workspace, is
+reused by the caching allocator only after every stream that used it has
+run its queued work.  Calls on one stream do neither.
+`KcpWorkspace(ctx, H, allocate=False)` allocates nothing until its first call
+and sizes that call for the backward, so a first forward does not build a
+forward-only arena that the first backward replaces.
 
 Saved set of a rank (`KcpSaved`, `boundary_mode="saved"`): the fresh `S_in`
 (the initial states of its fragments), with `save_transfer` the owner's c1
@@ -681,6 +725,31 @@ through the private test knob `host_trim` (after
 `cake_kcp_plan.enable_test_knobs()`; the conv module's
 `_set_test_knobs({"host_trim": 0})`).
 
+Host synchronization: no KCP call and no pack preparation copies a table from
+pageable memory or waits for queued device work, with or without a
+caller-owned workspace. `build_kcp_context` copies the context's tables in one
+pinned non-blocking copy on `stream=` (default: the current stream), so pack
+N+1 can be prepared while pack N runs; `heads=H` derives the head plans there
+as well (host work; their device tables are copied only when read, and the
+byte queries are host-only). The launch tables of a `(ctx, H)` live on the
+context, shared by every workspace and by `workspace=None` calls: each is
+copied once, by the first call that reads it, in one asynchronous pinned copy
+on the call's stream. A context prepared on another stream is ordered on the
+stream of each call by `ctx.wait_ready()` (event wait, no host wait; the KDA
+and conv halo entry points call it on every call). A thread other than the
+compute thread must pass `stream=` (the current stream is per thread). Copies
+are refused under CUDA-graph capture (`graph="replay"` runs the first call of
+a key eagerly). Not covered: `workspace=None` calls allocate their pools per
+call (a caching-allocator miss can call `cudaMalloc`, an out-of-memory retry
+synchronizes; reuse a workspace under memory pressure), the debug paths
+(`spec3_probe`, `debug_sequence`) and `TORCH_NCCL_BLOCKING_WAIT=1`. The
+previous copies stay reachable for A/B records through the context test knobs
+`upload="blocking"` and `table_cache="workspace"` (the latter only with the
+former). Eager KCP calls are host-bound at high CP: bind each rank's threads
+to the cores of its GPU's socket (for example `srun --cpu-bind=cores` with as
+many threads as bound cores), since unbound torch threads of several ranks
+oversubscribe the CPUs.
+
 Options of the KDA entry points: `save_transfer` keeps the owner's c1 receive
 tensor (and `M_seg`) for the backward instead of re-sending it in the backward
 exchange -- the default with the all-to-all exchange (an earlier revision).
@@ -702,6 +771,79 @@ same value on every rank: the probe is a rank-local check, so `"assert"`
 serves single-process debugging.  Under `graph="replay"` the probing
 backward runs eagerly; a rank without tokens does not hold back its capture.
 No environment variable selects it.
+
+Checkpoint recompute without the state exchange (issue #7815): under
+`torch.utils.checkpoint` the backward re-runs the forward of the region, and
+with it the forward's c1 / c2 exchanges (and the convolution's halo exchange).
+A recompute handle keeps what the original forward received instead:
+
+```python
+from flashinfer.kda_train import KcpRecomputeHandle, chunk_kda_kcp
+from flashinfer.cake_causal_conv1d_train import cake_causal_conv1d_kcp
+
+def layer(xq, xk, xv, g, beta, hq, hk, hv):
+    q = cake_causal_conv1d_kcp(xq, wq, ctx, recompute_handle=hq)   # "conv" entry of hq
+    k = cake_causal_conv1d_kcp(xk, wk, ctx, recompute_handle=hk)
+    v = cake_causal_conv1d_kcp(xv, wv, ctx, recompute_handle=hv)
+    ...                                                          # split heads, normalize q / k
+    return chunk_kda_kcp(q, k, v, g, beta, ctx, recompute_handle=hq)   # "kda" entry of hq
+
+handles = [KcpRecomputeHandle() for _ in range(3)]               # per layer and micro-step
+out = torch.utils.checkpoint.checkpoint(layer, xq, xk, xv, g, beta, *handles, use_reentrant=False)
+```
+
+The original forward exchanges as always and stores its incoming states
+`S_in` (the saved set's own tensor, key `"kda"`; one entry per key, so one
+handle serves the KDA call and one convolution call); the recompute inside the
+backward binds them and launches only the rank-local programs -- no
+collective, no wait -- so the outputs and gradients are bitwise those of the
+checkpoint without a handle (`use_reentrant=True` and `False`, `retain_graph`,
+nested regions).  `checkpoint_keep="states"` (the default) keeps `S_in` only
+and runs the call with `save_transfer=False` (the backward re-sends the maps
+in b1; bitwise the default form); `checkpoint_keep="transfer"` also keeps the
+owner's c1 receive tensor (`save_transfer=True`; not with the ring exchange).
+An explicit `save_transfer` that contradicts the tier raises `ValueError`, in
+the entry point and in both byte queries.  The handle retains
+`kcp_saved_bytes(ctx, H=..., checkpoint_keep=..., with_conv=False)` bytes for
+the KDA entry until it is dropped (`with_conv` adds one convolution's history
+rows); `kcp_comm_bytes(ctx, ..., checkpoint_keep=...)` reports the step's
+traffic (`B1 + B2`; the recompute moves nothing when the layer's convolutions
+carry handles too -- a convolution without one still sends its `halo_fwd`
+rows in the recompute).  Rules: create the handles outside the outermost checkpoint
+region (a handle created inside a region is empty in that region's recompute,
+which then exchanges -- correct, not communication-free); a forward outside
+the backward that finds an entry raises (a handle reused across micro-steps);
+a recompute whose entry was stored by another context or call configuration
+raises; `graph="replay"`, CUDA-graph capture, `debug_sequence`, `spec3_probe`
+and `boundary_mode="replay"` are refused with a handle.  The exchange is a
+collective: every rank passes a handle for the same call or none, at the same
+nesting level -- a mismatch hangs or corrupts data, and no rank checks the
+others.  The phase comes from `torch._C._current_graph_task_id()`; a torch
+without it refuses the handle.
+
+One halo exchange for a layer's q / k / v convolutions:
+`cake_causal_conv1d_kcp_multi((xq, xk, xv), (wq, wk, wv), ctx)` returns the
+three outputs bitwise equal to three `cake_causal_conv1d_kcp` calls (outputs,
+`dx` and `dweight`), but its forward and its backward each issue one halo
+collective instead of three: the history rows of the three tensors travel side
+by side in one `all_to_all_single` and are copied out after the wait, and each
+tensor then runs its own kernels. With `recompute_handle=h` one handle serves
+the call (its `"conv"` entry holds the three history pools) and may also carry
+the layer's `"kda"` entry, so the checkpointed layer above needs one handle:
+
+```python
+def layer(xq, xk, xv, g, beta, h):
+    q, k, v = cake_causal_conv1d_kcp_multi((xq, xk, xv), (wq, wk, wv), ctx, recompute_handle=h)
+    ...
+    return chunk_kda_kcp(q, k, v, g, beta, ctx, recompute_handle=h)
+
+out = torch.utils.checkpoint.checkpoint(layer, xq, xk, xv, g, beta, KcpRecomputeHandle(),
+                                        use_reentrant=False)
+```
+
+Per layer the halo collectives drop from 3 / 3 / 3 (original forward /
+recompute / backward, without handles) or 3 / 0 / 3 (with handles) to 1 / 1 / 1
+or 1 / 0 / 1.
 
 The segment plan splits every fragment into `P` segments: above the 256-chunk
 chain cap the equal-segment wave rule on ranks with at most three fragments,
