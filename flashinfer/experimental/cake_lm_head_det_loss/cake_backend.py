@@ -3218,19 +3218,50 @@ def bind_stage(
 _FFI_DEVICES: dict[int, Any] = {}
 
 
+def _constant_cells(device: torch.device) -> dict[str, torch.Tensor]:
+    """The cells of :func:`_device_constants`, filled on the current stream."""
+    return {
+        "grad_scale": torch.ones((1,), dtype=torch.float32, device=device),
+        "unit_scale": torch.ones((1,), dtype=torch.float32, device=device),
+        "f32_dummy": torch.zeros((16,), dtype=torch.float32, device=device),
+    }
+
+
+# The constant cells of each device index (:func:`_device_constants`): the first cells stored for a device are the
+# ones every thread uses.
+_DEVICE_CELLS: dict[int, dict[str, torch.Tensor]] = {}
+
+
 @functools.lru_cache(maxsize=None)
 def _device_constants(index: int) -> dict[str, torch.Tensor]:
     """The constant cells a remembered binding binds on every call, allocated once per device:
     ``grad_scale`` / ``unit_scale`` (``[1] = 1.0``; read-only here -- the loss entry's backward
     casts through :func:`backward_loss`, the log-probability entry's cast scale is 1) and the
     unused fp32 ``WS`` of the unsliced GEMMs.  Per-call ``torch.ones`` / ``torch.zeros`` would add
-    three fill launches to every remembered forward and backward."""
+    three fill launches to every remembered forward and backward.
+
+    Every stream and thread shares the cells, so they are filled on a stream from torch's stream
+    pool, and an event recorded behind the fills is waited for before they are cached: a call on
+    another stream never reads a cell before its fill.  The wait is not a stream or device
+    synchronization (PyTorch's synchronization debug mode does not flag it, and the mode is not
+    changed), but it can also wait for other work: torch hands out its pool streams round-robin, so
+    the caller's current stream can be that same stream (the fills then queue behind the caller's
+    work), and with CUDA lazy loading a kernel's first launch can wait for the device.  The first
+    calls of threads that miss the cache together each form cells, and all return the first cells
+    stored in :data:`_DEVICE_CELLS`; the other cells were waited for and are never read, so freeing
+    them is safe.  Under a CUDA graph capture, which cannot wait, the cells are made on the
+    capturing stream."""
     device = torch.device("cuda", int(index))
-    return {
-        "grad_scale": torch.ones((1,), dtype=torch.float32, device=device),
-        "unit_scale": torch.ones((1,), dtype=torch.float32, device=device),
-        "f32_dummy": torch.zeros((16,), dtype=torch.float32, device=device),
-    }
+    if torch.cuda.is_current_stream_capturing():
+        cells = _constant_cells(device)
+    else:
+        stream = torch.cuda.Stream(device=device)
+        with torch.cuda.stream(stream):
+            cells = _constant_cells(device)
+            filled = torch.cuda.Event()
+            filled.record(stream)
+        filled.synchronize()
+    return _DEVICE_CELLS.setdefault(int(index), cells)
 
 
 def _unit_scale(device: torch.device) -> torch.Tensor:
