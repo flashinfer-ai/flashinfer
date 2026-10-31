@@ -93,11 +93,13 @@ PROGRAM_WINDOWS: dict[str, dict[str, tuple[tuple[int, int | None, str], ...]]] =
         ),
         "bwd_h5120": (
             (0, 256, "cake_rmsnorm_det_train_db01cec1153cd7fb2759"),
-            (256, None, "cake_rmsnorm_det_train_b482c84dbffcd75a4a4c"),
+            (256, 20992, "cake_rmsnorm_det_train_b482c84dbffcd75a4a4c"),
+            (20992, None, "cake_rmsnorm_det_train_c145ef195d7aeb04f242"),
         ),
         "bwd_w32_h5120": (
             (0, 256, "cake_rmsnorm_det_train_6042554b427634669739"),
-            (256, None, "cake_rmsnorm_det_train_40227b2a2b2122628d58"),
+            (256, 20992, "cake_rmsnorm_det_train_40227b2a2b2122628d58"),
+            (20992, None, "cake_rmsnorm_det_train_9479b1298a1b19d4d996"),
         ),
         "bwd_h6144": (
             (0, 256, "cake_rmsnorm_det_train_b93bf060d4d3defc8150"),
@@ -281,8 +283,14 @@ PROGRAM_WINDOWS: dict[str, dict[str, tuple[tuple[int, int | None, str], ...]]] =
             (4096, 32768, "cake_rmsnorm_det_train_56ee8e66479625fd078a"),
             (32768, None, "cake_rmsnorm_det_train_a546f410ec8cf03ef20d"),
         ),
-        "bwd_h5120": ((0, None, "cake_rmsnorm_det_train_2fc4932fbde0bc848b32"),),
-        "bwd_w32_h5120": ((0, None, "cake_rmsnorm_det_train_79811a76205d7d7dd197"),),
+        "bwd_h5120": (
+            (0, 20480, "cake_rmsnorm_det_train_2fc4932fbde0bc848b32"),
+            (20480, None, "cake_rmsnorm_det_train_7ffb443a63a92ab6b0e0"),
+        ),
+        "bwd_w32_h5120": (
+            (0, 20480, "cake_rmsnorm_det_train_79811a76205d7d7dd197"),
+            (20480, None, "cake_rmsnorm_det_train_f9f7d4cd75ef91cc8374"),
+        ),
         "bwd_h6144": (
             (0, 4096, "cake_rmsnorm_det_train_5c804aed7ad14b99e1d0"),
             (4096, None, "cake_rmsnorm_det_train_322574af704b51aef0bb"),
@@ -454,11 +462,13 @@ PROGRAM_WINDOWS: dict[str, dict[str, tuple[tuple[int, int | None, str], ...]]] =
         ),
         "bwd_h5120": (
             (0, 4096, "cake_rmsnorm_det_train_838c077df3a6d35d55b7"),
-            (4096, None, "cake_rmsnorm_det_train_6816fb80e97380f1bcbc"),
+            (4096, 29184, "cake_rmsnorm_det_train_6816fb80e97380f1bcbc"),
+            (29184, None, "cake_rmsnorm_det_train_b8b0913b40f035f43b76"),
         ),
         "bwd_w32_h5120": (
             (0, 4096, "cake_rmsnorm_det_train_cd612de56c0985bb4caa"),
-            (4096, None, "cake_rmsnorm_det_train_468cc4d1b8128187b4b3"),
+            (4096, 29184, "cake_rmsnorm_det_train_468cc4d1b8128187b4b3"),
+            (29184, None, "cake_rmsnorm_det_train_7b9e10b21b75d4615135"),
         ),
         "bwd_h6144": ((0, None, "cake_rmsnorm_det_train_5d292172df772adb17ae"),),
         "bwd_w32_h6144": ((0, None, "cake_rmsnorm_det_train_7d2f6707bfa3d2cd60bb"),),
@@ -589,8 +599,8 @@ EDGES: dict[str, dict[str, tuple[tuple[int, str], ...]]] = {
         "bwd_w32_h4096": ((256, "same"), (1024, "same"), (4096, "same")),
         "bwd_h512": ((1024, "ulp"), (4096, "same"), (32768, "same")),
         "bwd_w32_h512": ((1024, "ulp"), (4096, "same"), (32768, "same")),
-        "bwd_h5120": ((256, "unmeasured"),),
-        "bwd_w32_h5120": ((256, "unmeasured"),),
+        "bwd_h5120": ((256, "unmeasured"), (20992, "unmeasured")),
+        "bwd_w32_h5120": ((256, "unmeasured"), (20992, "unmeasured")),
         "bwd_h6144": ((256, "same"), (4096, "same")),
         "bwd_w32_h6144": ((256, "same"), (4096, "same")),
         "bwd_residual_h6144": (),
@@ -665,8 +675,8 @@ EDGES: dict[str, dict[str, tuple[tuple[int, str], ...]]] = {
         "bwd_w32_h4096": ((256, "same"), (1024, "same"), (4096, "same")),
         "bwd_h512": ((1024, "ulp"), (4096, "same"), (32768, "same")),
         "bwd_w32_h512": ((1024, "ulp"), (4096, "same"), (32768, "same")),
-        "bwd_h5120": (),
-        "bwd_w32_h5120": (),
+        "bwd_h5120": ((20480, "unmeasured"),),
+        "bwd_w32_h5120": ((20480, "unmeasured"),),
         "bwd_h6144": ((4096, "same"),),
         "bwd_w32_h6144": ((4096, "same"),),
         "bwd_residual_h6144": (),
@@ -717,8 +727,8 @@ EDGES: dict[str, dict[str, tuple[tuple[int, str], ...]]] = {
         "bwd_w32_h4096": ((256, "same"), (1024, "same"), (4096, "same")),
         "bwd_h512": ((1024, "same"), (4096, "same"), (16384, "unmeasured")),
         "bwd_w32_h512": ((1024, "same"), (4096, "same"), (16384, "unmeasured")),
-        "bwd_h5120": ((4096, "unmeasured"),),
-        "bwd_w32_h5120": ((4096, "unmeasured"),),
+        "bwd_h5120": ((4096, "unmeasured"), (29184, "unmeasured")),
+        "bwd_w32_h5120": ((4096, "unmeasured"), (29184, "unmeasured")),
         "bwd_h6144": (),
         "bwd_w32_h6144": (),
         "bwd_residual_h6144": (),
@@ -789,10 +799,18 @@ the table below lists them).  Within one window a row's ``y``, ``rstd`` and ``dx
 not depend on ``T``: two calls whose token counts fall in the same forward window (and,
 for the backward, the same backward window) return bitwise-identical results on their
 common rows.  Across a forward edge between programs of different per-row thread groups
-the sum of squares is reduced in another order, so ``rstd`` moves by one FP32 ulp (two
-on H = 1536) on about 11-15 % of the rows (25-30 % on the residual route) and ``y`` by
-one BF16 ulp on at most 1.6 % of them, and ``dx`` follows on those rows; across the
-other forward edges nothing changes.  Across a backward-only edge ``dx`` is bitwise
+the sum of squares is reduced in another order.  On the rows both programs compute,
+``rstd`` then moves by at most two FP32 ulps (three on SM107 at the residual route's
+edge 1024) on 10.8-18.2 % of the rows (24.0-31.6 % on the residual route); ``y`` moves
+by one BF16 ulp, only on rows whose ``rstd`` moved, on at most 2.34 % of the rows
+(4.30 % on the residual route); ``dx`` follows on those rows and the residual output
+``h_new`` does not change.  Across every other forward edge, every edge of H = 256 and
+H = 5120 among them, the outputs are bitwise identical.  Measured over three random
+inputs per edge, with BF16 and FP32 weights: on B200 (sm_100a) at most two ulps on up
+to 18.0 % of the rows (27.3 % on the residual route), ``y`` on up to 2.03 % (2.83 %);
+on GB300 (sm_103a) at most two ulps on up to 17.3 % (27.8 %), ``y`` on up to 2.03 %
+(2.34 %); on R200 (sm_107a, 212- and 216-SM boards) at most three ulps on up to 18.2 %
+(31.6 %), ``y`` on up to 2.34 % (4.30 %).  Across a backward-only edge ``dx`` is bitwise
 identical: the H = 6144 route, which switched between the base backward kernel and the
 bulk-copy one with ``dx`` differing on about 1-2 % of the rows, now runs the bulk-copy
 kernel at every ``T`` on every architecture.  ``dw`` sums every row and depends on ``T``
@@ -810,10 +828,18 @@ the table below lists them).  Within one window a row's ``y``, ``rstd`` and ``dx
 not depend on ``T``: two calls whose token counts fall in the same forward window (and,
 for the backward, the same backward window) return bitwise-identical results on their
 common rows.  Across a forward edge between programs of different per-row thread groups
-the sum of squares is reduced in another order, so ``rstd`` moves by one FP32 ulp (two
-on H = 1536) on about 11-15 % of the rows (25-30 % on the residual route) and ``y`` by
-one BF16 ulp on at most 1.6 % of them, and ``dx`` follows on those rows; across the
-other forward edges nothing changes.  Across a backward-only edge ``dx`` is bitwise
+the sum of squares is reduced in another order.  On the rows both programs compute,
+``rstd`` then moves by at most two FP32 ulps (three on SM107 at the residual route's
+edge 1024) on 10.8-18.2 % of the rows (24.0-31.6 % on the residual route); ``y`` moves
+by one BF16 ulp, only on rows whose ``rstd`` moved, on at most 2.34 % of the rows
+(4.30 % on the residual route); ``dx`` follows on those rows and the residual output
+``h_new`` does not change.  Across every other forward edge, every edge of H = 256 and
+H = 5120 among them, the outputs are bitwise identical.  Measured over three random
+inputs per edge, with BF16 and FP32 weights: on B200 (sm_100a) at most two ulps on up
+to 18.0 % of the rows (27.3 % on the residual route), ``y`` on up to 2.03 % (2.83 %);
+on GB300 (sm_103a) at most two ulps on up to 17.3 % (27.8 %), ``y`` on up to 2.03 %
+(2.34 %); on R200 (sm_107a, 212- and 216-SM boards) at most three ulps on up to 18.2 %
+(31.6 %), ``y`` on up to 2.34 % (4.30 %).  Across a backward-only edge ``dx`` is bitwise
 identical: the H = 6144 route, which switched between the base backward kernel and the
 bulk-copy one with ``dx`` differing on about 1-2 % of the rows, now runs the bulk-copy
 kernel at every ``T`` on every architecture.  ``dw`` sums every row and depends on ``T``
@@ -911,10 +937,18 @@ the table below lists them).  Within one window a row's ``y``, ``rstd`` and ``dx
 not depend on ``T``: two calls whose token counts fall in the same forward window (and,
 for the backward, the same backward window) return bitwise-identical results on their
 common rows.  Across a forward edge between programs of different per-row thread groups
-the sum of squares is reduced in another order, so ``rstd`` moves by one FP32 ulp (two
-on H = 1536) on about 11-15 % of the rows (25-30 % on the residual route) and ``y`` by
-one BF16 ulp on at most 1.6 % of them, and ``dx`` follows on those rows; across the
-other forward edges nothing changes.  Across a backward-only edge ``dx`` is bitwise
+the sum of squares is reduced in another order.  On the rows both programs compute,
+``rstd`` then moves by at most two FP32 ulps (three on SM107 at the residual route's
+edge 1024) on 10.8-18.2 % of the rows (24.0-31.6 % on the residual route); ``y`` moves
+by one BF16 ulp, only on rows whose ``rstd`` moved, on at most 2.34 % of the rows
+(4.30 % on the residual route); ``dx`` follows on those rows and the residual output
+``h_new`` does not change.  Across every other forward edge, every edge of H = 256 and
+H = 5120 among them, the outputs are bitwise identical.  Measured over three random
+inputs per edge, with BF16 and FP32 weights: on B200 (sm_100a) at most two ulps on up
+to 18.0 % of the rows (27.3 % on the residual route), ``y`` on up to 2.03 % (2.83 %);
+on GB300 (sm_103a) at most two ulps on up to 17.3 % (27.8 %), ``y`` on up to 2.03 %
+(2.34 %); on R200 (sm_107a, 212- and 216-SM boards) at most three ulps on up to 18.2 %
+(31.6 %), ``y`` on up to 2.34 % (4.30 %).  Across a backward-only edge ``dx`` is bitwise
 identical: the H = 6144 route, which switched between the base backward kernel and the
 bulk-copy one with ``dx`` differing on about 1-2 % of the rows, now runs the bulk-copy
 kernel at every ``T`` on every architecture.  ``dw`` sums every row and depends on ``T``
@@ -942,7 +976,8 @@ its own windows.
   (1024, 4096] 9a830956 = (4096, inf) 35a0b0ca
 * ``sm_100a`` ``bwd_h512``: (0, 1024] 09601d42 ~ (1024, 4096] 123db0b2 =
   (4096, 32768] ad1a5a3c = (32768, inf) 8877322a
-* ``sm_100a`` ``bwd_h5120``: (0, 256] db01cec1 ? (256, inf) b482c84d
+* ``sm_100a`` ``bwd_h5120``: (0, 256] db01cec1 ? (256, 20992] b482c84d ?
+  (20992, inf) c145ef19
 * ``sm_100a`` ``bwd_h6144``: (0, 256] b93bf060 = (256, 4096] 5c804aed =
   (4096, inf) b93bf060
 * ``sm_100a`` ``bwd_residual_h6144``: (0, inf) 0dcdc563
@@ -956,7 +991,7 @@ its own windows.
   (1024, 4096] 24643edc = (4096, inf) 35a0b0ca
 * ``sm_103a`` ``bwd_h512``: (0, 1024] 09601d42 ~ (1024, 4096] 8e7f4d81 =
   (4096, 32768] 274b0055 = (32768, inf) cfaae3ce
-* ``sm_103a`` ``bwd_h5120``: (0, inf) 2fc4932f
+* ``sm_103a`` ``bwd_h5120``: (0, 20480] 2fc4932f ? (20480, inf) 7ffb443a
 * ``sm_103a`` ``bwd_h6144``: (0, 4096] 5c804aed = (4096, inf) 322574af
 * ``sm_103a`` ``bwd_residual_h6144``: (0, inf) 0dcdc563
 * ``sm_107a`` ``bwd_h1536``: (0, 1024] 7dc29629 = (1024, 16384] 6a428da2 =
@@ -968,7 +1003,8 @@ its own windows.
   (1024, 4096] d41a514f = (4096, inf) ee4a9053
 * ``sm_107a`` ``bwd_h512``: (0, 1024] 3feed502 = (1024, 4096] 3feed502 =
   (4096, 16384] dfaf378a ? (16384, inf) eb141cc9
-* ``sm_107a`` ``bwd_h5120``: (0, 4096] 838c077d ? (4096, inf) 6816fb80
+* ``sm_107a`` ``bwd_h5120``: (0, 4096] 838c077d ? (4096, 29184] 6816fb80 ?
+  (29184, inf) b8b0913b
 * ``sm_107a`` ``bwd_h6144``: (0, inf) 5d292172
 * ``sm_107a`` ``bwd_residual_h6144``: (0, inf) 0dcdc563
 """
