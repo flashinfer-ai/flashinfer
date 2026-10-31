@@ -60,6 +60,24 @@ Install from Source
 
 In certain cases, you may want to install FlashInfer from source code to try out the latest features in the main branch, or to customize the library for your specific needs.
 
+.. note::
+   Several Hopper (SM90) MegaMoE surfaces are available on ``main`` but are
+   **not** included in the latest PyPI release ``flashinfer-python==0.7.2.post1``.
+   Install from source (this section) if you need any of:
+
+   - ``flashinfer.megamoe`` — standalone SM90 MegaMoE CUDA API (merged via
+     `#6343 <https://github.com/flashinfer-ai/flashinfer/pull/6343>`_ /
+     `#6517 <https://github.com/flashinfer-ai/flashinfer/pull/6517>`_).
+     See :ref:`apimegamoe`.
+   - SM90 NVFP4×FP8 ``moe_ep`` CuTe DSL backend (merged via
+     `#6999 <https://github.com/flashinfer-ai/flashinfer/pull/6999>`_).
+     The ``main`` checkout must contain merge commit ``479c38bbfc`` or later.
+     See the design note
+     `moe_ep_sm90_nvfp4.md <https://github.com/flashinfer-ai/flashinfer/blob/main/docs/design_docs/moe_ep_sm90_nvfp4.md>`_.
+
+   Nightly wheels may also lag ``main`` for these surfaces; prefer a source
+   build when following those APIs or design docs.
+
 You can follow the steps below to install FlashInfer from source code:
 
 1. Clone the FlashInfer repository:
