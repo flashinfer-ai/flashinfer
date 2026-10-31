@@ -244,7 +244,8 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
           collective_mainloop.get_num_kv_tiles(mainloop_params, q_tile_idx, qo_len, kv_len);
       if (num_kv_tiles <= 0) {  // We exit early and write 0 to gO and -inf to gLSE.
         collective_epilogue.store_zero(epilogue_params, shared_storage,
-                                       threadIdx.x - NUM_COPY_THREADS, block_coord);
+                                       threadIdx.x - NUM_COPY_THREADS, block_coord, variant,
+                                       mainloop_params);
         continue;
       }
 
@@ -281,7 +282,8 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
           qo_head_idx, kv_head_idx, prefix_len, token_pos_in_items,
           num_kv_tiles_outside_items_window, num_kv_tiles_prefix);
       collective_epilogue.store(epilogue_params, tOrO, attention_updater.get_lse(), shared_storage,
-                                tiled_mma_pv, threadIdx.x - NUM_COPY_THREADS, block_coord);
+                                tiled_mma_pv, threadIdx.x - NUM_COPY_THREADS, block_coord, variant,
+                                mainloop_params);
 
       ++work_idx;
     }
