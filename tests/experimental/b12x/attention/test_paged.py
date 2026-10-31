@@ -8,6 +8,7 @@ substitute for paged graph coverage.
 
 from __future__ import annotations
 
+import pytest
 import torch
 from b12x.preparation import PreparationSession, PreparedCall
 
@@ -131,12 +132,28 @@ def _cosine(a: torch.Tensor, b: torch.Tensor) -> float:
     ).item()
 
 
-def test_run_decode_matches_reference() -> None:
+@pytest.mark.parametrize("page_size", [64, 128])
+@pytest.mark.parametrize(
+    ("head_dim_qk", "head_dim_vo"),
+    [(64, 64), (128, 64), (192, 64), (256, 64), (128, 128), (256, 256)],
+)
+@pytest.mark.parametrize(("q_heads", "kv_heads"), [(8, 1), (14, 2)])
+def test_run_decode_matches_reference(
+    page_size: int,
+    head_dim_qk: int,
+    head_dim_vo: int,
+    q_heads: int,
+    kv_heads: int,
+) -> None:
     require_b12x()
     q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = make_paged_inputs(
         q_seqlens=[1, 1, 1, 1],
         cache_seqlens=[64, 128, 192, 256],
-        page_size=64,
+        page_size=page_size,
+        head_dim_qk=head_dim_qk,
+        head_dim_vo=head_dim_vo,
+        q_heads=q_heads,
+        kv_heads=kv_heads,
         seed=73,
     )
     out, _ = _run_eager(

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from b12x.attention.paged.planner import create_paged_plan
@@ -11,6 +12,37 @@ from b12x.attention.paged.traits import (
 )
 
 from .test_attention_paged_planner import _make_inputs
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        pytest.param(
+            {"q_dtype": torch.float16, "o_dtype": torch.bfloat16}, id="fp16-query"
+        ),
+        pytest.param({"kv_dtype": torch.float16}, id="fp16-kv"),
+        pytest.param({"o_dtype": torch.float16}, id="fp16-output"),
+        pytest.param({"kv_dtype": torch.float8_e4m3fn}, id="fp8-kv"),
+        pytest.param({"cta_tile_q": 8}, id="non-decode-tile"),
+        pytest.param({"cta_tile_q": 64}, id="multiple-query-warps"),
+        pytest.param({"exact_num_mma_kv": 3}, id="three-kv-mmas"),
+        pytest.param({"head_dim_qk": 80}, id="qk-not-multiple-of-64"),
+        pytest.param({"head_dim_qk": 320}, id="qk-above-256"),
+    ],
+)
+def test_head64_decode_rejects_unsupported_exact_layouts(overrides) -> None:
+    arguments = dict(
+        cta_tile_q=16,
+        head_dim_qk=64,
+        head_dim_vo=64,
+        q_dtype=torch.bfloat16,
+        kv_dtype=torch.bfloat16,
+        exact_num_mma_kv=1,
+        device="cuda",
+    )
+    arguments.update(overrides)
+    with pytest.raises(ValueError, match="no valid NUM_MMA_KV"):
+        select_paged_forward_traits(**arguments)
 
 
 def test_paged_decode_fp8_traits_match_flashinfer_shape_rules() -> None:
