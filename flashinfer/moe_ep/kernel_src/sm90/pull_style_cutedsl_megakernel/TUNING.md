@@ -897,7 +897,49 @@ three large-token configurations and 12 distinct tail-pair neighbors bring
 the total to 43. Every model considers the same bounded extension catalog,
 then filters candidates through tile alignment and strategy eligibility.
 Other shapes can therefore have fewer than 43 candidates. Token capacity
-changes ordering, not the union; the untuned heuristic buckets are unchanged.
+changes the ordering of this union; the per-bucket defaults and their N72/N80
+tilings described below then add table- and capacity-dependent members.
+
+Untuned launches use per-bucket defaults measured on H200 with
+block-permutation routing in October 2026
+(`shim/mxfp4_optimization.py::_FUSED_DEFAULTS`). They cover the FP8
+heuristic's 13 buckets (8 to 32768 tokens per rank) and store complete
+tactics, including the strategy and pull-buffer fields. A model uses the table
+of the largest tile K that divides its hidden and intermediate sizes. The K256
+table was measured on H7168/I3072/E384/top-6/EP4 and the K128 table on
+H2560/I640/E512/top-10/EP2. The legacy 8-bucket heuristic still applies to the
+published-exact profile and to buckets whose tactic is not eligible for the
+model; for example, N8 tails and K256 readiness exist only for the
+H7168/I3072/E384/EP4 layout. Other models therefore use the eligible entries
+of a table that was measured on one reference shape. A folded M256 N64
+default then takes the token-tile width of 64, 72 or 80 that needs the
+fewest tiles for the balanced rows per expert,
+`max_tokens * top_k * EP / experts`; ties keep N64. One N72 or N80 task holds
+an expert's 65-72 or 65-80 rows where N64 needs a second, nearly empty tile.
+On H200 that measured 4-38% faster, while equal tile counts measured 3-15%
+slower. For example, H2560/I640/E512/top-10/EP2 at 2048 tokens (80 rows per
+expert) runs N80 at 0.85x the N64 time, and at 1792 tokens N72 at 0.79x.
+Routing that spreads rows across a tile boundary can favor N72 even at equal
+balanced tile counts (H7168/I3072/E384/top-6/EP4 at 1024 and 2048 tokens:
+0.88x and 0.93x), so the N72 and N80 tilings of the capacity's bucket default
+join the candidates together with the selected table's tactics; tuning
+therefore always measures the default. H7168/I3072/E384/EP4 grows from 43
+to 49 candidates (51 where the bucket default is a folded N64 tile), and
+H2560/I640/E512/EP2 from 8 to 17 (19). NV candidates and NV cache
+provenance exclude these MXFP4 defaults. NV instead adds the N72/N80 tilings
+of its own bucket default (NV tuning version v3) when that default is a
+folded N64 tile. A scale-ring default is tiled on its lockstep (sf0) core:
+the two-slot ring needs four AB stages, which N72/N80 tiles do not fit.
+H7168/I3072/E384/EP4 NV tuning thus grows from 60 to 62 candidates above
+256 tokens. There the sf0 N72 tiling measured 0.89x the scale-ring default
+at 1024 tokens and 0.92x the NV default at 2048 tokens. The NV reference
+defaults without the scale ring (every bucket but 512 and 1024 tokens) take
+the same row rule as MXFP4. Against their N64 tiles that measured 0.61x at
+1152 tokens (N72), 0.87x at 1280 (N80), 0.75x at 2304 (N72), 0.94x at 2560
+(N80), 0.87x at 4608 (N72), 0.95x at 5120 (N80), and 0.98x, 0.94x and 0.94x
+at 8192, 16384 and 32768 tokens (N80); capacities with equal tile counts,
+such as 2048 and 4096 tokens, keep N64. The tail-pair candidates are still
+derived from the legacy table.
 
 Online `knobs="auto"` and offline `flashinfer.moe_ep.tune` use the same
 `hopper_mxfp4_candidates` list. The default public scorer takes

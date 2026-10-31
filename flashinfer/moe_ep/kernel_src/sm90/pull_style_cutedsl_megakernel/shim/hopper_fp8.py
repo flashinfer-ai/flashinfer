@@ -178,6 +178,11 @@ class MegaMoEHopperFp8Config:
     # idle warps' slots otherwise cost 3 * hidden bytes of AB-stage SMEM per
     # CTA).  Output-invariant; False restores the 4-slot buffer for A/B.
     compact_pull_buffer: bool = True
+    # Dispatch pull: rows in flight per active dispatch warp (> 1 needs the
+    # non-compact pull buffer and no dispatch-side token-back / dedup) and the
+    # per-pass rotation of the warp -> row assignment.  Output-invariant.
+    dispatch_pull_batch: int = 1
+    dispatch_pull_rotate: bool = False
     # FC1 store offload to the empty warp (S2G + fc1_done publish leave the
     # epilogue warps).  Self-gating: active only for non-swap non-ping-pong
     # kernels with register headroom for the store server; elsewhere it
@@ -409,6 +414,32 @@ class MegaMoEHopperFp8Config:
                 raise ValueError(
                     f"epi_flag_batch[{leg}] must be in [1, 32], got {val}."
                 )
+        if (
+            isinstance(self.dispatch_pull_batch, bool)
+            or not isinstance(self.dispatch_pull_batch, int)
+            or not 1 <= self.dispatch_pull_batch <= 4
+        ):
+            raise ValueError(
+                "dispatch_pull_batch must be an int in [1, 4], got "
+                f"{self.dispatch_pull_batch!r}."
+            )
+        if not isinstance(self.dispatch_pull_rotate, bool):
+            raise ValueError("dispatch_pull_rotate must be a bool.")
+        if self.dispatch_pull_batch > 1 and (
+            self.compact_pull_buffer
+            or self.resolved_token_back_mode != "epi_warps"
+            or self.dedup_dispatch
+            or self.grouped_token_back
+            or self.dispatch_pull_batch * self.active_dispatch_warps > 4
+        ):
+            # The batch keeps rows in the idle slots of the 4-slot pull
+            # buffer of the serial epi_warps dispatch path.
+            raise ValueError(
+                "dispatch_pull_batch > 1 requires compact_pull_buffer=False, "
+                "token_back_mode='epi_warps' without dedup_dispatch / "
+                "grouped_token_back, and dispatch_pull_batch * "
+                "active_dispatch_warps <= 4."
+            )
 
     @property
     def num_experts_per_rank(self) -> int:
@@ -723,6 +754,9 @@ class MegaMoEHopperFp8Frontend:
             c.fold_producer_warps,
             self._gate_up_clamp,
             c.enable_iket,
+            c.compact_pull_buffer,
+            c.generate_c,
+            ("dispatch_pull", c.dispatch_pull_batch, c.dispatch_pull_rotate),
         )
 
     @staticmethod
@@ -838,6 +872,8 @@ class MegaMoEHopperFp8Frontend:
             fold_producer_warps=c.fold_producer_warps,
             generate_c=c.generate_c,
             tail_split_pairs=c.tail_split_pairs,
+            dispatch_pull_batch=c.dispatch_pull_batch,
+            dispatch_pull_rotate=c.dispatch_pull_rotate,
         )
 
         local_ws_bytes, shared_ws_bytes = kernel.get_workspace_sizes()
@@ -1412,6 +1448,8 @@ def resolve_hopper_fp8_mega_moe_config(
     combine_format: str = "bf16",
     active_dispatch_warps: int = 1,
     compact_pull_buffer: bool = True,
+    dispatch_pull_batch: int = 1,
+    dispatch_pull_rotate: bool = False,
     fc1_store_offload: bool = True,
     fc1_early_done_publish: bool = False,
     fold_producer_warps: bool = True,
@@ -1557,6 +1595,8 @@ def resolve_hopper_fp8_mega_moe_config(
         combine_format=combine_format,
         active_dispatch_warps=active_dispatch_warps,
         compact_pull_buffer=compact_pull_buffer,
+        dispatch_pull_batch=dispatch_pull_batch,
+        dispatch_pull_rotate=dispatch_pull_rotate,
         fc1_store_offload=fc1_store_offload,
         fc1_early_done_publish=fc1_early_done_publish,
         fold_producer_warps=fold_producer_warps,
@@ -1614,6 +1654,8 @@ def get_symm_buffer_for_hopper_fp8_mega_moe(
     combine_format: str = "bf16",
     active_dispatch_warps: int = 1,
     compact_pull_buffer: bool = True,
+    dispatch_pull_batch: int = 1,
+    dispatch_pull_rotate: bool = False,
     fc1_store_offload: bool = True,
     fc1_early_done_publish: bool = False,
     fold_producer_warps: bool = True,
@@ -1680,6 +1722,8 @@ def get_symm_buffer_for_hopper_fp8_mega_moe(
         combine_format=combine_format,
         active_dispatch_warps=active_dispatch_warps,
         compact_pull_buffer=compact_pull_buffer,
+        dispatch_pull_batch=dispatch_pull_batch,
+        dispatch_pull_rotate=dispatch_pull_rotate,
         fc1_store_offload=fc1_store_offload,
         fc1_early_done_publish=fc1_early_done_publish,
         fold_producer_warps=fold_producer_warps,
