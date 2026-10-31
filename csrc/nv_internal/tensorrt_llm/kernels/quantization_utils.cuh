@@ -825,6 +825,7 @@ __device__ uint64_t cvt_warp_fp8_to_fp4(PackedVec<Type, CVT_ELTS_PER_THREAD>& ve
   // TODO: use half as compute data type.
   float SFValue = SFScaleVal * (vecMax * reciprocal_approximate_ftz(6.0f));
   float SFValueNarrow;
+  float outputScale;
   // 8 bits representation of the SF.
   uint8_t fp8SFVal;
   // Write the SF to global memory (STG.8).
@@ -832,7 +833,7 @@ __device__ uint64_t cvt_warp_fp8_to_fp4(PackedVec<Type, CVT_ELTS_PER_THREAD>& ve
     __nv_fp8_e8m0 tmp;
     tmp.__x = __nv_cvt_float_to_e8m0(SFValue, __NV_SATFINITE, cudaRoundPosInf);
     fp8SFVal = tmp.__x;
-    outputScale = SFScaleVal * ue8m0_inverse_scale(fp8SFVal);
+    outputScale = vecMax != 0.0f ? SFScaleVal * ue8m0_inverse_scale(fp8SFVal) : 0.0f;
   } else {
     // Here SFValue is always positive, so E4M3 is the same as UE4M3.
     __nv_fp8_e4m3 tmp = __nv_fp8_e4m3(SFValue);
