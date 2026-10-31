@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import dataclasses
 import math
-from typing import Any, Literal, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Literal, Optional, Tuple
 
 import torch
 
@@ -37,6 +37,9 @@ from . import comm
 from .dependencies import require_sm107_dsl
 from .kernel_helpers import Mxfp8BlockSize, Nvfp4BlockSize, swizzled_flat_sf_size
 from .tuning_state import AutoTuningState
+
+if TYPE_CHECKING:
+    from flashinfer.moe_ep.tensors import MoEEpTensors
 
 Sm107QuantKind = Literal["nvfp4", "mxfp8_e4m3", "mxfp8_e5m2", "mxfp4_mxfp8"]
 Sm107TokenBackMode = Literal["epi_warps", "standalone_warps", "reuse_dispatch_warps"]
@@ -526,6 +529,7 @@ class Sm107BlockScaledSymmBuffer:
         self._staged_tokens: Optional[int] = None
         self._destroyed = False
         self._tuning_state = AutoTuningState()
+        self._tuning_inputs: tuple[MoEEpTensors, bool] | None = None
         self._routing_checks: dict[tuple, Any] = {}
         # Missing scalar bindings use the workspace's own tensors.
         self._bound_scalars: dict = {}
@@ -931,6 +935,7 @@ class Sm107BlockScaledSymmBuffer:
         torch.cuda.synchronize()
         self._release_execution_state()
         self._routing_checks.clear()
+        self._tuning_inputs = None
         self._bound_scalars = {}
         for name in ("x", "x_sf", "topk_weights"):
             comm.free_sym_tensor(getattr(self, name, None))

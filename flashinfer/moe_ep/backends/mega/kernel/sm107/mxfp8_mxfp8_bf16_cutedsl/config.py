@@ -51,7 +51,8 @@ class Sm107_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig:
     activation: Literal["swiglu", "situ"] = "swiglu"
     situ_beta: Optional[float] = None
     situ_linear_beta: Optional[float] = None
+    # "auto" compares eligible variants with knobs="auto" during warmup.
     # GenPhase requires cluster (4, 1), fc2_use_bulk=True, and <=1024 tokens/rank.
-    kernel_variant: Literal["inference", "genphase"] = "inference"
+    kernel_variant: Literal["inference", "genphase", "auto"] = "inference"
     # Quantizes the FC2 return payload; the operator still returns BF16.
     combine_dtype: Literal["bf16", "nvfp4", "mxfp8"] = "bf16"
