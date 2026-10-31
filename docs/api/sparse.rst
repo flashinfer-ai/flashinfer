@@ -157,10 +157,16 @@ index heads.
 The default decode chain is the score plane
 (``msa_icp_decode_index_score_sharded``) followed by
 ``msa_icp_topk_select_publish``; ``msa_icp_decode_score_publish`` fuses the two
-steps and is an option. Call ``warmup()`` on the plan returned by
-``prepare_msa_icp_indexer`` on every rank before the first exchange and before
-CUDA Graph capture: it loads every kernel into the device's context, so that no
-first launch waits on module loading while a peer's merge spins.
+steps and is an option. With ``enable_pdl`` on compute capability 10.0 and
+10.3 at 64 or 128 local K rows per page, the score plane reads ``seq_lens`` and
+``block_table`` and starts loading the history index-K pages before it waits on
+the preceding kernel; that kernel must not write them and must be launched
+without programmatic dependent launch or wait on its own predecessor before it
+triggers (``enable_pdl=False`` removes this requirement). Call ``warmup()`` on
+the plan returned by ``prepare_msa_icp_indexer`` on every rank before the first
+exchange and before CUDA Graph capture: it loads every kernel into the device's
+context, so that no first launch waits on module loading while a peer's merge
+spins.
 
 .. autosummary::
     :toctree: ../generated

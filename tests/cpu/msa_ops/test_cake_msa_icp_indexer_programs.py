@@ -126,6 +126,7 @@ class Launch:
     grid_args: dict[str, int]
     arch: str
     enable_pdl: bool
+    device_index: int | None = None
 
 
 class Launches(list):
@@ -171,7 +172,7 @@ def _intercept(monkeypatch, arch: str, *, real_registry: bool) -> Launches:
     monkeypatch.setattr(cake_jit, "route", route)
     monkeypatch.setattr(cake_jit, "launch_grid", launch_grid)
 
-    def run_module(name, values, *, grid, arch, enable_pdl=False):
+    def run_module(name, values, *, grid, arch, enable_pdl=False, device_index=None):
         role, rows = route_of[name]
         launches.append(
             Launch(
@@ -182,6 +183,7 @@ def _intercept(monkeypatch, arch: str, *, real_registry: bool) -> Launches:
                 dict(grids.get(name, {})),
                 arch,
                 enable_pdl,
+                device_index,
             )
         )
 
@@ -1009,6 +1011,114 @@ def test_host_plan_derives_the_offsets(fake) -> None:
         msa_ops.msa_icp_index_score_sharded_plan(
             lens, kv[:3], H, qo_offset=qo, device="cpu"
         )
+
+
+def test_host_plan_rejects_negative_or_overflowing_lengths(fake) -> None:
+    """The eager plan sizes its storage from the lengths' sum: a negative
+    length (a smaller sum than the items the plan writes) or a sum past int32
+    (a wrapped cumsum) must be rejected before any allocation or launch."""
+    e = msa_ops.msa_icp_index_score_sharded_plan
+    kv = torch.tensor([6400, 6400, 6400, 6400], dtype=torch.int32)
+    for lens in ([6400, 6400, 6400, -12800], [0, 0, 0, -1]):
+        q = torch.tensor(lens, dtype=torch.int32)
+        with pytest.raises(ValueError, match="non-negative"):
+            e(q, kv, H, qo_offset=torch.zeros(4, dtype=torch.int32), device="cpu")
+    with pytest.raises(ValueError, match="non-negative"):
+        e(
+            torch.ones(4, dtype=torch.int32),
+            kv,
+            H,
+            qo_offset=torch.tensor([0, -1, 0, 0], dtype=torch.int32),
+            device="cpu",
+        )
+    big = torch.full((5,), 1 << 30, dtype=torch.int32)
+    with pytest.raises(ValueError, match="2\\*\\*31"):
+        e(big, big, H, qo_offset=torch.zeros(5, dtype=torch.int32), device="cpu")
+    assert not fake
+
+
+def test_plan_rejects_windows_past_the_packed_fields(fake) -> None:
+    """The plan packs the segment and item indices and the columns per item in
+    16 bits and the column total in int32 (work_info / work_range)."""
+    e = msa_ops.msa_icp_index_score_sharded_plan_device
+    a = plan_device_args()
+    batch = a["qo_segment_lens"].numel()
+    # Up to (total_q + 63) // 64 + batch - 1 items: 65535 is the most the plan packs.
+    ok = (65535 - batch + 1) * cb.PLAN_ITEM_TOKENS
+    cb._plan_limits(batch, ok, 128)
+    with pytest.raises(ValueError, match="65535 query items"):
+        cb._plan_limits(batch, ok + 1, 128)
+    with pytest.raises(ValueError, match="65536 segments"):
+        cb._plan_limits(65537, 65537, 128)
+    cb._plan_limits(1, 64, 65535 * 128)
+    with pytest.raises(ValueError, match="65535 per item"):
+        cb._plan_limits(1, 64, 65535 * 128 + 1)
+    with pytest.raises(ValueError, match="int32 total"):
+        cb._plan_limits(1, 40000 * 64, 65535 * 128)  # 40000 items x 65535 columns
+    _expect_rejected(fake, e, _with(a, max_seq_len=65535 * 128 + 1), "per item")
+    assert not fake
+
+
+def test_launches_name_the_device_of_their_tensors(fake) -> None:
+    """Every launch passes the device the backend derived from its tensors, so
+    residency and the launch stream follow the tensors, not the current device."""
+    _call(msa_ops.msa_icp_index_score_sharded_plan_device, plan_device_args())
+    _call(msa_ops.msa_icp_decode_index_score_sharded, decode_args())
+    assert fake and all(launch.device_index == 0 for launch in fake)
+
+
+def test_load_and_run_follow_the_given_device(monkeypatch) -> None:
+    """``run_module(..., device_index=1)`` with device 0 current makes the
+    kernel resident and binds the stream on device 1: ``load`` enters device 1
+    before its capture check and residency calls."""
+    entered: list[int] = []
+    current = [0]
+
+    class Device:
+        def __init__(self, index):
+            self.index, self.saved = index, None
+
+        def __enter__(self):
+            entered.append(self.index)
+            self.saved, current[0] = current[0], self.index
+
+        def __exit__(self, *exc):
+            current[0] = self.saved
+
+    resident_on: list[tuple[str, int, int]] = []
+    streams: list[tuple[int, int]] = []
+    module = types.SimpleNamespace(entry=lambda *args: None)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: current[0])
+    monkeypatch.setattr(torch.cuda, "device", Device)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(
+        torch._C, "_cuda_getCurrentRawStream", lambda d: 100 + d, raising=False
+    )
+    monkeypatch.setattr(
+        cake_jit,
+        "_make_resident",
+        lambda name, arch, device: resident_on.append((name, device, current[0])),
+    )
+    monkeypatch.setattr(
+        cake_jit,
+        "_set_ffi_stream",
+        lambda kind, device, stream: streams.append((device, stream)) or 0,
+    )
+    name = next(iter(cake_jit.MODULES))
+    record = dict(cake_jit.MODULES[name], ffi_entry="entry", arg_plan=[])
+    monkeypatch.setitem(cake_jit.MODULES, name, record)
+    monkeypatch.setattr(cake_jit, "_argument_plan", lambda n: ())
+    monkeypatch.setattr(cake_jit, "_LOADED", {(name, "sm_103a"): module})
+    monkeypatch.setattr(cake_jit, "_RESIDENT", set())
+    monkeypatch.setattr(cake_jit, "_LAUNCHERS", {})
+    cake_jit.run_module(name, {}, grid=(1, 1, 1), arch="sm_103a", device_index=1)
+    assert resident_on == [(name, 1, 1)] and entered == [1]
+    assert sorted(cake_jit._RESIDENT) == [(name, 1)]
+    assert (name, "sm_103a", 1) in cake_jit._LAUNCHERS
+    assert streams[0] == (1, 101) and current[0] == 0
+    # A second launch on device 1 is a cache hit: no device switch, no reload.
+    cake_jit.run_module(name, {}, grid=(1, 1, 1), arch="sm_103a", device_index=1)
+    assert entered == [1] and len(resident_on) == 1
 
 
 def test_select_prefill_rejects_invalid_metadata(fake) -> None:

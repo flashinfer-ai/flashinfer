@@ -309,7 +309,16 @@ def msa_icp_decode_index_score_sharded(
         ``1 <= decode_query_len <= max_decode_query_len``,
         ``4 * max_decode_query_len <= 32``.
     enable_pdl : bool
-        Launch with programmatic dependent launch.
+        Launch with programmatic dependent launch. On compute capability 10.0
+        and 10.3 with 64 or 128 local K rows per page (P128 TP2, P256 TP2 and
+        TP4) the scorer then reads ``seq_lens`` and ``block_table`` and starts
+        loading the ``index_k`` pages that end at or before
+        ``seq_len - decode_query_len`` before it waits on the preceding
+        kernel. The kernel launched just before it must not write them, and
+        must either be launched without programmatic dependent launch or wait
+        on its own predecessor before it triggers its dependents, so that
+        every earlier write is complete. ``enable_pdl=False`` removes the
+        requirement.
     backend : str
         Only ``"cake"``.
     """
@@ -596,7 +605,9 @@ def prepare_msa_icp_indexer(
     * ``decode(index_q, index_k, block_table, seq_lens, num_valid_pages,
       scores, output, *, comm, slot, tagged, decode_query_len,
       enable_pdl=True, pool=None)``:
-      score plane -> Top16 select and publish -> owner merge (the default);
+      score plane -> Top16 select and publish -> owner merge (the default;
+      its score plane follows the ``enable_pdl`` contract of
+      :func:`msa_icp_decode_index_score_sharded`);
       with ``pool`` the fused scorer and publisher of
       :func:`msa_icp_decode_score_publish` replace the first two steps;
     * ``prefill_window_plan(window, ...)`` once per query window and step,

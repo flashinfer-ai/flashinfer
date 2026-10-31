@@ -74,6 +74,11 @@ NUM_INDEX_HEADS = 4
 MAX_DECODE_ROWS = 32
 DEFAULT_SPIN_LIMIT = 1 << 26
 _INT32_MAX = (1 << 31) - 1
+# The prefill plan's item size (its build constant tile_tokens) and the 16-bit
+# fields it packs: segment and item indices, columns per item (work_info and
+# work_range); the column total is an int32.
+PLAN_ITEM_TOKENS = 64
+_PLAN_FIELD_MAX = (1 << 16) - 1
 _FP8 = torch.float8_e4m3fn
 
 
@@ -267,6 +272,27 @@ def index_layout(page_size: int, world_size: int, rank: int) -> tuple[int, int]:
 # --------------------------------------------------------------------------- sizing (host only)
 
 
+def _plan_limits(batch: int, total_q: int, max_seq_len: int) -> None:
+    """Reject a window whose plan fields would not fit their packing: the
+    segment index and the item count below 65536, at most 65535 B128 columns
+    per item and an int32 column total.  Host bounds only (no device read),
+    from the caller's upper bounds total_q and max_seq_len."""
+    items = min(
+        (total_q + PLAN_ITEM_TOKENS - 1) // PLAN_ITEM_TOKENS + batch - 1, total_q
+    )
+    columns = (max_seq_len + 127) // 128
+    if batch > _PLAN_FIELD_MAX + 1 or items > _PLAN_FIELD_MAX:
+        raise ValueError(
+            f"a prefill window holds at most 65536 segments and 65535 query items of "
+            f"{PLAN_ITEM_TOKENS} tokens (got batch {batch}, up to {items} items)"
+        )
+    if columns > _PLAN_FIELD_MAX or items * columns > _INT32_MAX:
+        raise ValueError(
+            f"max_seq_len {max_seq_len} gives {columns} B128 columns per item; the plan "
+            f"admits at most 65535 per item and an int32 total over {items} items"
+        )
+
+
 def index_score_plan_storage(
     *, num_qo_heads: int, total_q: int, batch: int, device: torch.device
 ) -> dict[str, int]:
@@ -280,6 +306,10 @@ def index_score_plan_storage(
         "work_range_numel": cake_jit.sm_count(
             torch.cuda.current_device() if index is None else index
         ),
+        # The MSA plan formula.  The plan writes one record per item of
+        # PLAN_ITEM_TOKENS queries of one segment, all heads folded in: at most
+        # (total_q + 63) // 64 + batch - 1 records, which this formula covers
+        # at the four heads _heads() admits.
         "work_info_numel": ((total_q + 127) // 128 + batch - 1) * num_qo_heads,
         "workspace_bytes": PLAN_WORKSPACE_BYTES,
     }
@@ -428,6 +458,7 @@ def index_score_sharded_plan_device(
     if batch < 1 or total_q < 1 or not 0 < max_query_len <= total_q or max_seq_len < 1:
         raise ValueError("invalid query/sequence bounds")
     _heads(num_qo_heads)
+    _plan_limits(batch, total_q, max_seq_len)
     storage = index_score_plan_storage(
         num_qo_heads=num_qo_heads, total_q=total_q, batch=batch, device=device
     )
@@ -497,6 +528,7 @@ def index_score_sharded_plan_device(
         },
         grid=cake_jit.launch_grid(name),
         arch=arch,
+        device_index=dev,
     )
     return plan
 
@@ -519,6 +551,12 @@ def index_score_sharded_plan(
     batch = qo_segment_lens.numel()
     if batch < 1 or kv_segment_lens.numel() != batch or qo_offset.numel() != batch:
         raise ValueError("segment metadata must have one entry per segment")
+    if any(bool((t < 0).any()) for t in lens):
+        raise ValueError("segment lengths and query offsets must be non-negative")
+    if any(int(t.sum(dtype=torch.int64)) > _INT32_MAX for t in lens[:2]):
+        raise ValueError(
+            "the segment lengths of a window must sum to at most 2**31 - 1"
+        )
     device = (
         torch.device("cuda", torch.cuda.current_device())
         if device is None
@@ -636,6 +674,7 @@ def index_score_sharded(
         },
         grid=cake_jit.launch_grid(name, sm_count=plan.packed_work_range.numel()),
         arch=arch,
+        device_index=dev,
         enable_pdl=enable_pdl,
     )
 
@@ -696,6 +735,7 @@ def topk_select_prefill(
         },
         grid=cake_jit.launch_grid(name, tokens=t, heads=h),
         arch=arch,
+        device_index=dev,
     )
 
 
@@ -779,6 +819,7 @@ def decode_index_score_sharded(
         },
         grid=cake_jit.launch_grid(name, batch=batch, splits=splits),
         arch=arch,
+        device_index=dev,
         enable_pdl=enable_pdl,
     )
 
@@ -921,6 +962,7 @@ def topk_select_publish(
         },
         grid=cake_jit.launch_grid(name, tokens=t, heads=h),
         arch=arch,
+        device_index=dev,
         enable_pdl=enable_pdl,
     )
 
@@ -1053,6 +1095,7 @@ def decode_score_publish(
         values,
         grid=cake_jit.launch_grid(scorer, batch=batch, splits=splits),
         arch=arch,
+        device_index=dev,
         enable_pdl=enable_pdl,
     )
     cake_jit.run_module(
@@ -1060,6 +1103,7 @@ def decode_score_publish(
         values,
         grid=cake_jit.launch_grid(publisher, tokens=t, heads=h),
         arch=arch,
+        device_index=dev,
         enable_pdl=enable_pdl,
     )
 
@@ -1188,6 +1232,7 @@ def merge_candidates(
         },
         grid=cake_jit.launch_grid(name, tokens=t, heads=hpr),
         arch=arch,
+        device_index=dev,
         enable_pdl=enable_pdl,
     )
 
@@ -1203,7 +1248,7 @@ def warmup(device: torch.device) -> None:
     with torch.cuda.device(index):
         for name, record in cake_jit.MODULES.items():
             if arch in record["arches"]:
-                cake_jit.load(name, arch)
+                cake_jit.load(name, arch, index)
 
 
 def is_supported(device: torch.device | str | int | None = None) -> bool:

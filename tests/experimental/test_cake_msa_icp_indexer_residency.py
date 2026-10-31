@@ -186,3 +186,61 @@ def test_residency_ignores_a_second_runtime_copy_in_the_process() -> None:
     )
     foreign.cudaGetLastError()
     cake_jit._make_resident(name, arch, torch.cuda.current_device())
+
+
+_OTHER_DEVICE_CHILD = """
+import importlib
+import sys
+
+import torch
+
+cake_jit = importlib.import_module(sys.argv[1] + ".cake_jit")
+cake_backend = importlib.import_module(sys.argv[1] + ".cake_backend")
+
+torch.cuda.set_device(0)
+arch = cake_jit.device_arch(1)
+qo = torch.tensor([100, 0, 37, 64], dtype=torch.int32)
+kv = torch.tensor([300, 5, 600, 64], dtype=torch.int32)
+plan = cake_backend.index_score_sharded_plan(qo, kv, 4, qo_offset=kv - qo, device="cuda:1")
+name = cake_jit.route("plan", None, arch)
+assert torch.cuda.current_device() == 0
+assert (name, 1) in cake_jit._RESIDENT, sorted(cake_jit._RESIDENT)
+assert (name, 0) not in cake_jit._RESIDENT, sorted(cake_jit._RESIDENT)
+torch.cuda.synchronize(1)
+with torch.cuda.device(1):
+    ref = cake_backend.index_score_sharded_plan(qo, kv, 4, qo_offset=kv - qo, device="cuda:1")
+torch.cuda.synchronize(1)
+items = sum((int(q) + 63) // 64 for q in qo)
+assert torch.equal(plan.packed_work_info[:items].cpu(), ref.packed_work_info[:items].cpu())
+assert torch.equal(plan.packed_work_range.cpu(), ref.packed_work_range.cpu())
+print("CHILD_OTHER_DEVICE_OK", flush=True)
+"""
+
+
+@requires_arch
+def test_a_launch_on_a_non_current_device_runs_there(tmp_path) -> None:
+    """With device 0 current, a call on device 1 tensors makes its kernel
+    resident on device 1 (not 0) and gives device 1's result.  A fresh process
+    keeps residency from other tests out."""
+    import subprocess
+    import sys
+
+    if torch.cuda.device_count() < 2:
+        pytest.skip("needs 2 GPUs")
+    if cake_jit.arch_for_capability(torch.cuda.get_device_capability(1)) is None:
+        pytest.skip("device 1 is not an sm_100a / sm_103a / sm_107a GPU")
+    script = tmp_path / "child.py"
+    script.write_text(_OTHER_DEVICE_CHILD)
+    repo = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    env = dict(os.environ)
+    env["PYTHONPATH"] = os.pathsep.join(filter(None, [repo, env.get("PYTHONPATH")]))
+    result = subprocess.run(
+        [sys.executable, str(script), PACKAGE],
+        cwd=repo,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30 * 60,
+    )
+    output = result.stdout + result.stderr
+    assert result.returncode == 0 and "CHILD_OTHER_DEVICE_OK" in output, output[-6000:]

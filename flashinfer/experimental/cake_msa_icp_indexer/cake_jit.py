@@ -2220,19 +2220,26 @@ def _make_resident(name: str, arch: str, device: int) -> None:
     )
 
 
-def load(name: str, arch: str) -> Any:
+def load(name: str, arch: str, device_index: int | None = None) -> Any:
     """The loaded tvm-ffi module of record ``name`` built for ``arch``: the
     prebuilt ``aot/`` library when a builder compiled it, else FlashInfer's JIT
     build of the same sources and flags, with its kernel resident in the
-    current device's context (:func:`_make_resident`).  Under CUDA Graph
-    capture an unloaded program is refused before any build (call ``warmup``
-    on every rank first)."""
+    context of device ``device_index`` (default: the current device;
+    :func:`_make_resident`).  Under CUDA Graph capture on that device an
+    unloaded program is refused before any build (call ``warmup`` on every
+    rank first)."""
     import torch
 
-    device = torch.cuda.current_device()
+    current = torch.cuda.current_device()
+    device = current if device_index is None else device_index
     module = _LOADED.get((name, arch))
     if module is not None and (name, device) in _RESIDENT:
         return module
+    if device != current:
+        # The capture check and the residency calls act on the current
+        # device's stream and context: run them on ``device_index``.
+        with torch.cuda.device(device):
+            return load(name, arch, device)
     if module is None:
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError(
@@ -2283,14 +2290,16 @@ def run_module(
     grid: tuple[int, int, int],
     arch: str,
     enable_pdl: bool = False,
+    device_index: int | None = None,
 ) -> None:
     """Launch record ``name`` with logical argument ``values`` on ``grid`` on
-    the current torch stream.  ``enable_pdl`` is the per-call programmatic
-    dependent launch switch of a ``launch.use_pdl = "runtime"`` record; a
-    record without it launches as built and takes no switch."""
+    torch's current stream of device ``device_index``, the device of the
+    arguments (default: the current device).  ``enable_pdl`` is the per-call
+    programmatic dependent launch switch of a ``launch.use_pdl = "runtime"``
+    record; a record without it launches as built and takes no switch."""
     import torch
 
-    device = torch.cuda.current_device()
+    device = torch.cuda.current_device() if device_index is None else device_index
     # The bound entry and argument plan of a loaded, resident record (load()
     # runs once per (record, arch, device); the cache follows _LOADED and
     # _RESIDENT, so dropping either reloads).
@@ -2300,7 +2309,7 @@ def run_module(
         or launcher[0] is not _LOADED.get((name, arch))
         or (name, device) not in _RESIDENT
     ):
-        module = load(name, arch)
+        module = load(name, arch, device)
         launcher = (
             module,
             getattr(module, MODULES[name]["ffi_entry"]),
@@ -2314,13 +2323,13 @@ def run_module(
         for kind, key in plan
     ]
     if _set_ffi_stream is None:
-        with tvm_ffi.use_torch_stream():
+        with torch.cuda.device(device), tvm_ffi.use_torch_stream():
             entry(*args)
         return
     # tvm_ffi.use_torch_stream() without its per-call torch Stream object and
     # device-string parsing: the binding launches on the FFI environment
-    # stream of the current device, set here to torch's current (or
-    # capturing) stream and restored afterwards.
+    # stream of the device, set here to torch's current (or capturing) stream
+    # of that device and restored afterwards.
     previous = _set_ffi_stream(
         _DL_CUDA, device, torch._C._cuda_getCurrentRawStream(device)
     )
