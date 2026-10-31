@@ -108,8 +108,8 @@ def _catalog():
 
 def _fused_qle2048_bounds():
     """``policy.fused_qle2048_max_kv``: the KV bound of the single-launch fused ``fp8:qle2048:short`` route PER
-    ARCHITECTURE (``{"sm_100a": 34048, "sm_103a": 65536}``; the one per-arch policy key -- each bound was measured on
-    its device)."""
+    ARCHITECTURE (``{"sm_100a": 34048, "sm_103a": 65536}``; each bound was measured on its device -- the FP4 scan-class
+    bounds ``fp4.fused_scan32_max_kv`` / ``fp4.fused_scan1024_max_kv`` are per-architecture maps too, :func:`_scan_bound`)."""
     return {a: int(v) for a, v in _catalog()["policy"]["fused_qle2048_max_kv"].items()}
 
 
@@ -305,10 +305,14 @@ def _single_launch_precedence(arch, tier):
     return tuple(table[arch][tier])
 
 
-def _route_name_on(precision, queries, keys, num_heads, arch, *, qle2048_max_kv=None):
+def _route_name_on(
+    precision, queries, keys, num_heads, arch, *, qle2048_max_kv=None, scan_arch=False
+):
     """The route of a problem under ONE architecture's rule -- its single-launch precedence and its fused Q <= 2048 bound
-    (``qle2048_max_kv`` overrides that bound: the logical name applies the most permissive one).  Host scalars only, no
-    K-rule check (``_keys_served``)."""
+    (``qle2048_max_kv`` overrides that bound: the logical name applies the most permissive one; ``scan_arch=None`` reads
+    a per-architecture scan-class bound as its most permissive value, likewise).  Host scalars only, no K-rule check
+    (``_keys_served``)."""
+    scan_on = arch if scan_arch is False else scan_arch
     policy = _catalog()["policy"]
     if precision not in ("fp4", "fp8"):
         raise ValueError("precision must be 'fp4' or 'fp8'")
@@ -321,7 +325,7 @@ def _route_name_on(precision, queries, keys, num_heads, arch, *, qle2048_max_kv=
                 if keys <= int(fp4["fused_q1_max_kv"]):
                     return f"{prefix}:q1:short"
                 return f"{prefix}:q1"
-            scan = _fused_scan_class(queries, keys, fp4)
+            scan = _fused_scan_class(queries, keys, fp4, scan_on)
             if scan:
                 # the le1024 class is served by its first-tile-prefetch program at and below the
                 # policy's query bound and by the plain CTA-scan program above it (one class, one
@@ -361,7 +365,11 @@ def _route_name_on(precision, queries, keys, num_heads, arch, *, qle2048_max_kv=
             if family == "le_class":
                 # Q = 128 is owned by the fused-Q128 rule: above its bound it takes the
                 # two-launch pair, never the le32 class.
-                scan = 0 if queries == 128 else _fused_scan_class(queries, keys, policy)
+                scan = (
+                    0
+                    if queries == 128
+                    else _fused_scan_class(queries, keys, policy, scan_on)
+                )
                 if scan:
                     return f"{prefix}:{kind}:le{scan}:short"
             elif family == "qle":
@@ -431,14 +439,20 @@ def route_name(precision, queries, keys, num_heads=NUM_HEADS):
     with the first-tile L2 prefetch -- and ``fp4:le1024:short`` above that query
     count), then the pair. A scan class is the smallest ``fused_scan_ceilings``
     entry covering ``ceil(Q / 4)`` and is served only while
-    ``K <= fused_scan<ceiling>_max_kv`` of that class (:func:`_fused_scan_class`).
+    ``K <= fused_scan<ceiling>_max_kv`` of that class (:func:`_fused_scan_class`;
+    a class bound may be a per-architecture map -- the FP4 ``fused_scan32_max_kv`` /
+    ``fused_scan1024_max_kv`` are ``{"sm_100a": 1048576, "sm_103a": 1048832}`` /
+    ``{"sm_100a": 65536, "sm_103a": 65792}`` -- where the logical name applies the most
+    permissive value and :func:`served_route` the device's own).
     The logical name needs one rule: every architecture must share the tier's
     precedence (``ValueError`` otherwise -- pass the device to :func:`served_route`).
     """
     arches = sorted(_catalog()["arches"])
     union = max(_fused_qle2048_bounds().values())
     verdicts = {
-        a: _route_name_on(precision, queries, keys, num_heads, a, qle2048_max_kv=union)
+        a: _route_name_on(
+            precision, queries, keys, num_heads, a, qle2048_max_kv=union, scan_arch=None
+        )
         for a in arches
     }
     if len(set(verdicts.values())) != 1:
@@ -449,7 +463,15 @@ def route_name(precision, queries, keys, num_heads=NUM_HEADS):
     return next(iter(verdicts.values()))
 
 
-def _fused_scan_class(queries, keys, bounds):
+def _scan_bound(value, arch):
+    """A ``fused_scan<ceiling>_max_kv`` value on ``arch``: a shared int, or a per-architecture map ``{arch: int}`` (each
+    bound measured on its device); ``arch=None`` reads a map as its most permissive value (the logical route name)."""
+    if isinstance(value, dict):
+        return max(int(v) for v in value.values()) if arch is None else int(value[arch])
+    return int(value)
+
+
+def _fused_scan_class(queries, keys, bounds, arch=None):
     """The in-kernel scan class that serves a 32-head call, or 0: the SMALLEST
     query-block ceiling of ``bounds["fused_scan_ceilings"]`` covering ``ceil(Q / 4)``
     when ``K <= bounds["fused_scan<ceiling>_max_kv"]``. The class is fixed by the
@@ -459,7 +481,7 @@ def _fused_scan_class(queries, keys, bounds):
     for ceiling in bounds["fused_scan_ceilings"]:
         ceiling = int(ceiling)
         if blocks <= ceiling:
-            if keys <= int(bounds[f"fused_scan{ceiling}_max_kv"]):
+            if keys <= _scan_bound(bounds[f"fused_scan{ceiling}_max_kv"], arch):
                 return ceiling
             return 0
     return 0
