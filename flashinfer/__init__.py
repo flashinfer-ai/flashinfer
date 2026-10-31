@@ -171,7 +171,16 @@ _PRIMS_TS_LAZY_EXPORTS = frozenset(
 )
 
 
+# Compatibility module paths of the causal conv1d facade and its backend package; each
+# resolves on first attribute access and loads no KCP host module.
+_COMPAT_SUBMODULES = frozenset(
+    {"cake_causal_conv1d_train", "cake_causal_conv1d_train_backend"}
+)
+
+
 def __getattr__(name: str):
+    if name in _COMPAT_SUBMODULES:
+        return importlib.import_module(f"{__name__}.{name}")
     if name not in _PRIMS_TS_LAZY_EXPORTS:
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
     from . import fused_moe as _fused_moe
@@ -334,22 +343,37 @@ from . import cake_rmsnorm_silu_gate_train as cake_rmsnorm_silu_gate_train
 from . import (
     cake_rmsnorm_silu_gate_train_backend as cake_rmsnorm_silu_gate_train_backend,
 )
-from .cake_causal_conv1d_train import (
-    CakeCausalConv1dFunction as CakeCausalConv1dFunction,
+from .cake_causal_conv1d_det_train import (
+    CakeCausalConv1dDetFunction as CakeCausalConv1dDetFunction,
 )
-from .cake_causal_conv1d_train import cake_causal_conv1d as cake_causal_conv1d
-from .cake_causal_conv1d_train import (
-    cake_causal_conv1d_train_backward as cake_causal_conv1d_train_backward,
+from .cake_causal_conv1d_det_train import (
+    cake_causal_conv1d_det as cake_causal_conv1d_det,
 )
-from .cake_causal_conv1d_train import (
-    cake_causal_conv1d_train_backward_workspace_bytes as cake_causal_conv1d_train_backward_workspace_bytes,
+from .cake_causal_conv1d_det_train import (
+    cake_causal_conv1d_det_train_backward as cake_causal_conv1d_det_train_backward,
 )
-from .cake_causal_conv1d_train import (
-    cake_causal_conv1d_train_forward as cake_causal_conv1d_train_forward,
+from .cake_causal_conv1d_det_train import (
+    cake_causal_conv1d_det_train_backward_workspace_bytes as cake_causal_conv1d_det_train_backward_workspace_bytes,
 )
-from .cake_causal_conv1d_train import (
-    cake_causal_conv1d_train_forward_workspace_bytes as cake_causal_conv1d_train_forward_workspace_bytes,
+from .cake_causal_conv1d_det_train import (
+    cake_causal_conv1d_det_train_forward as cake_causal_conv1d_det_train_forward,
 )
+from .cake_causal_conv1d_det_train import (
+    cake_causal_conv1d_det_train_forward_workspace_bytes as cake_causal_conv1d_det_train_forward_workspace_bytes,
+)
+
+# Compatibility names of the causal conv1d entry points, bound to the same objects as the det names.
+CakeCausalConv1dFunction = CakeCausalConv1dDetFunction
+cake_causal_conv1d = cake_causal_conv1d_det
+cake_causal_conv1d_train_backward = cake_causal_conv1d_det_train_backward
+cake_causal_conv1d_train_backward_workspace_bytes = (
+    cake_causal_conv1d_det_train_backward_workspace_bytes
+)
+cake_causal_conv1d_train_forward = cake_causal_conv1d_det_train_forward
+cake_causal_conv1d_train_forward_workspace_bytes = (
+    cake_causal_conv1d_det_train_forward_workspace_bytes
+)
+
 from .cake_mhc_det_train import (
     CakeMHCDetTrainFinishFunction as CakeMHCDetTrainFinishFunction,
 )

@@ -15,7 +15,7 @@ from types import ModuleType
 # suite / package name -> import path of the package
 PACKAGES: dict[str, str] = {
     "cake_rmsnorm_det_train": "flashinfer.cake_rmsnorm_det_train_backend",
-    "cake_causal_conv1d_train": "flashinfer.cake_causal_conv1d_train_backend",
+    "cake_causal_conv1d_det_train": "flashinfer.cake_causal_conv1d_det_train_backend",
     "cake_gated_act_mxfp8": "flashinfer.cake_gated_act_mxfp8_backend",
     "cake_rmsnorm_silu_gate_det_train": "flashinfer.cake_rmsnorm_silu_gate_det_train_backend",
     "cake_ulysses": "flashinfer.cake_ulysses_backend",
@@ -48,6 +48,8 @@ PACKAGES: dict[str, str] = {
     "cake_gdn_det_train": "flashinfer.experimental.cake_gdn_det_train",
     "cake_gqa_train": "flashinfer.experimental.cake_gqa_train",
 }
+# Compatibility key: suites that name the causal conv1d package ``cake_causal_conv1d_train`` load the det package.
+PACKAGES["cake_causal_conv1d_train"] = PACKAGES["cake_causal_conv1d_det_train"]
 
 
 def cake_package(name: str, submodule: str | None = None) -> ModuleType:
