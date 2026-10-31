@@ -241,3 +241,16 @@ Until then the C++ stays as-is and the DSL kernel lives beside it.
   M=1024 rows now: gen.qkv -4.0%, attn.out -3.9%, mlp.down -1.8%, und.q -4.7%.  The
   C++ kernel has an opt-in -DW8A16_SM100_TRACE clock trace (block 0 roles, per-CTA
   end times) that made the per-phase comparison possible.
+- Sat 31 Oct 2026, 05:00-06:30: Hopper small rows.  (1) A 64x128 split-K variant (algo
+  12, DSL only) takes und.kv 1024 from 14.9 to 14.2 us (C++ 14.6): the cost model picks
+  it.  (2) und.kv 4096 (M=4096, N=256: 128 tiles of 64x128 on 132 SMs, one tile per CTA,
+  the ping-pong kernel's second consumer warpgroup idle) got a shared-item mode: a CTA
+  with a single work item runs it on both consumer warpgroups, k-tiles by parity, group
+  1 handing its accumulators to group 0 through the idle activation stages.  Correct on
+  every shape (max error equals the C++'s; not bitwise, the halves sum in another
+  order), but slower everywhere it engages: und.kv 4096 +4.1% (off: +1.5%), und.kv 8192
+  +8%, und.q 1024 +8% (h20).  ncu at that shape: L2 52% of peak, DRAM 52%, L2 bytes
+  100 MB (not the 4x activation re-read I expected), so it is not a bandwidth limit on
+  paper; the stall breakdown is being collected.  Kept behind W8A16_DSL_KSPLIT (default
+  on until the profile is read; to be removed or defaulted off).  ipp2-0146 lost its GPU
+  a second time (h19, then h22); replacement h23 is s4124-0017.
