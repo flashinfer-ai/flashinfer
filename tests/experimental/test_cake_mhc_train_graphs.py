@@ -54,6 +54,7 @@ calls at the larger count, closes the module.
 from __future__ import annotations
 
 import functools
+import gc
 
 import pytest
 import torch
@@ -119,6 +120,15 @@ def warmup_jit():
         for spec in [*det_loader.specs_for_arch(arch), *loader.specs_for_arch(arch)]:
             spec.build_and_load()
     yield
+
+
+@pytest.fixture(autouse=True)
+def collect_dead_graphs():
+    # torch skips its gc.collect() before a capture by default (TORCH_CUDAGRAPH_GC): an earlier test's dead CUDA graph
+    # that a cyclic collection destroys during a global-mode capture invalidates that capture.
+    gc.collect()
+    yield
+    gc.collect()
 
 
 def _arch() -> str:

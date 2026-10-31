@@ -148,6 +148,15 @@ def warmup_jit():
     yield
 
 
+@pytest.fixture(autouse=True)
+def collect_dead_graphs():
+    # torch skips its gc.collect() before a capture by default (TORCH_CUDAGRAPH_GC): an earlier test's dead CUDA graph
+    # that a cyclic collection destroys during a global-mode capture invalidates that capture.
+    gc.collect()
+    yield
+    gc.collect()
+
+
 @contextlib.contextmanager
 def _torch_deterministic(mode: bool, *, warn_only: bool = False):
     previous = (
