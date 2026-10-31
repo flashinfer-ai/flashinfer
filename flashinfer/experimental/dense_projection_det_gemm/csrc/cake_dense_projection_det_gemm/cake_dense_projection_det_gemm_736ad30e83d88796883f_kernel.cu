@@ -675,30 +675,35 @@ kernel_cake_dense_projection_det_gemm_736ad30e83d88796883f(const __grid_constant
                         asm volatile("tcgen05.fence::before_thread_sync;");
                         __syncwarp();
                         asm volatile("tcgen05.fence::after_thread_sync;");
-                        unsigned int inc = ((lane == 0) ? 1 : 0);
-                        int aidx = ((lane == 0) ? cidx_e : 4096 + (cta_rank * 8 + (warp - 2)) * 32 + lane);
-                        unsigned int _atomic_fetch_add_0;
-                        asm volatile("atom.acq_rel.gpu.global.add.u32 %0, [%1], %2;"
-                            : "=r"(_atomic_fetch_add_0) : "l"(&counters[aidx]), "r"(static_cast<uint32_t>(inc)) : "memory");
-                        unsigned int _shfl_0 = __shfl_sync(0xFFFFFFFF, _atomic_fetch_add_0, 0);
-                        if (_shfl_0 == 0) {
+                        unsigned int old = 0;
+                        if (lane == 0) {
+                            unsigned int _atomic_fetch_add_0;
+                            asm volatile("atom.acq_rel.gpu.global.add.u32 %0, [%1], %2;"
+                                : "=r"(_atomic_fetch_add_0) : "l"(&counters[cidx_e]), "r"(static_cast<uint32_t>(1)) : "memory");
+                            old = _atomic_fetch_add_0;
+                        }
+                        unsigned int arrival = __shfl_sync(0xFFFFFFFF, old, 0);
+                        if (arrival == 0) {
                             role = 1;
                         } else {
                             role = 2;
-                            if (_shfl_0 == 1) {
+                            if (arrival == 1) {
                                 #pragma unroll 1
                                 for (int _spin = 0; _spin < 1073741824; _spin++) {
-                                    unsigned int inc_0 = ((lane == 0) ? 0 : 0);
-                                    int aidx_1 = ((lane == 0) ? cidx_e : 4096 + (cta_rank * 8 + (warp - 2)) * 32 + lane);
-                                    unsigned int _atomic_fetch_add_2;
-                                    asm volatile("atom.acq_rel.gpu.global.add.u32 %0, [%1], %2;"
-                                        : "=r"(_atomic_fetch_add_2) : "l"(&counters[aidx_1]), "r"(static_cast<uint32_t>(inc_0)) : "memory");
-                                    unsigned int _shfl_sync_1 = __shfl_sync(0xFFFFFFFF, _atomic_fetch_add_2, 0);
-                                    if (_shfl_sync_1 >= 3) {
+                                    unsigned int old_0 = 0;
+                                    if (lane == 0) {
+                                        unsigned int _atomic_fetch_add_1;
+                                        asm volatile("atom.acq_rel.gpu.global.add.u32 %0, [%1], %2;"
+                                            : "=r"(_atomic_fetch_add_1) : "l"(&counters[cidx_e]), "r"(static_cast<uint32_t>(0)) : "memory");
+                                        old_0 = _atomic_fetch_add_1;
+                                    }
+                                    unsigned int arrival_0 = __shfl_sync(0xFFFFFFFF, old_0, 0);
+                                    if (arrival_0 >= 3) {
                                         break;
                                     }
                                 }
                             }
+                            __syncwarp();
                         }
                     }
                     if (nseg_2 <= seg_2 + 1) {
@@ -837,10 +842,10 @@ kernel_cake_dense_projection_det_gemm_736ad30e83d88796883f(const __grid_constant
                                             packed[_lp + 7] = *(uint32_t*)&_bf2;
                                         }
                                         {
-                                            const unsigned* _raw_stv8_3 = reinterpret_cast<const unsigned*>(packed);
+                                            const unsigned* _raw_stv8_2 = reinterpret_cast<const unsigned*>(packed);
                                             asm volatile(
                                                 "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
-                                                :: "l"((void*)(out + (row_base + (unsigned long long)col))), "r"(_raw_stv8_3[0]), "r"(_raw_stv8_3[1]), "r"(_raw_stv8_3[2]), "r"(_raw_stv8_3[3]), "r"(_raw_stv8_3[4]), "r"(_raw_stv8_3[5]), "r"(_raw_stv8_3[6]), "r"(_raw_stv8_3[7]) : "memory");
+                                                :: "l"((void*)(out + (row_base + (unsigned long long)col))), "r"(_raw_stv8_2[0]), "r"(_raw_stv8_2[1]), "r"(_raw_stv8_2[2]), "r"(_raw_stv8_2[3]), "r"(_raw_stv8_2[4]), "r"(_raw_stv8_2[5]), "r"(_raw_stv8_2[6]), "r"(_raw_stv8_2[7]) : "memory");
                                         }
                                     } else {
                                         unsigned int packed_1[4];
@@ -972,10 +977,10 @@ kernel_cake_dense_projection_det_gemm_736ad30e83d88796883f(const __grid_constant
                                                 _packed_4[_lp + 7] = *(uint32_t*)&_bf2;
                                             }
                                             {
-                                                const unsigned* _raw_stv8_4 = reinterpret_cast<const unsigned*>(_packed_4);
+                                                const unsigned* _raw_stv8_3 = reinterpret_cast<const unsigned*>(_packed_4);
                                                 asm volatile(
                                                     "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
-                                                    :: "l"((void*)(out + (row_base_1 + (unsigned long long)col_1))), "r"(_raw_stv8_4[0]), "r"(_raw_stv8_4[1]), "r"(_raw_stv8_4[2]), "r"(_raw_stv8_4[3]), "r"(_raw_stv8_4[4]), "r"(_raw_stv8_4[5]), "r"(_raw_stv8_4[6]), "r"(_raw_stv8_4[7]) : "memory");
+                                                    :: "l"((void*)(out + (row_base_1 + (unsigned long long)col_1))), "r"(_raw_stv8_3[0]), "r"(_raw_stv8_3[1]), "r"(_raw_stv8_3[2]), "r"(_raw_stv8_3[3]), "r"(_raw_stv8_3[4]), "r"(_raw_stv8_3[5]), "r"(_raw_stv8_3[6]), "r"(_raw_stv8_3[7]) : "memory");
                                             }
                                         } else {
                                             unsigned int _packed_5[4];
@@ -1212,10 +1217,10 @@ kernel_cake_dense_projection_det_gemm_736ad30e83d88796883f(const __grid_constant
                                             packed_4[_lp + 7] = *(uint32_t*)&_bf2;
                                         }
                                         {
-                                            const unsigned* _raw_stv8_7 = reinterpret_cast<const unsigned*>(packed_4);
+                                            const unsigned* _raw_stv8_6 = reinterpret_cast<const unsigned*>(packed_4);
                                             asm volatile(
                                                 "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
-                                                :: "l"((void*)(out + (row_base_2 + (unsigned long long)col_2))), "r"(_raw_stv8_7[0]), "r"(_raw_stv8_7[1]), "r"(_raw_stv8_7[2]), "r"(_raw_stv8_7[3]), "r"(_raw_stv8_7[4]), "r"(_raw_stv8_7[5]), "r"(_raw_stv8_7[6]), "r"(_raw_stv8_7[7]) : "memory");
+                                                :: "l"((void*)(out + (row_base_2 + (unsigned long long)col_2))), "r"(_raw_stv8_6[0]), "r"(_raw_stv8_6[1]), "r"(_raw_stv8_6[2]), "r"(_raw_stv8_6[3]), "r"(_raw_stv8_6[4]), "r"(_raw_stv8_6[5]), "r"(_raw_stv8_6[6]), "r"(_raw_stv8_6[7]) : "memory");
                                         }
                                     } else {
                                         unsigned int packed_1_1[4];
@@ -1394,10 +1399,10 @@ kernel_cake_dense_projection_det_gemm_736ad30e83d88796883f(const __grid_constant
                                             packed_5[_lp + 7] = *(uint32_t*)&_bf2;
                                         }
                                         {
-                                            const unsigned* _raw_stv8_8 = reinterpret_cast<const unsigned*>(packed_5);
+                                            const unsigned* _raw_stv8_7 = reinterpret_cast<const unsigned*>(packed_5);
                                             asm volatile(
                                                 "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
-                                                :: "l"((void*)(out + (row_base_3 + (unsigned long long)col_3))), "r"(_raw_stv8_8[0]), "r"(_raw_stv8_8[1]), "r"(_raw_stv8_8[2]), "r"(_raw_stv8_8[3]), "r"(_raw_stv8_8[4]), "r"(_raw_stv8_8[5]), "r"(_raw_stv8_8[6]), "r"(_raw_stv8_8[7]) : "memory");
+                                                :: "l"((void*)(out + (row_base_3 + (unsigned long long)col_3))), "r"(_raw_stv8_7[0]), "r"(_raw_stv8_7[1]), "r"(_raw_stv8_7[2]), "r"(_raw_stv8_7[3]), "r"(_raw_stv8_7[4]), "r"(_raw_stv8_7[5]), "r"(_raw_stv8_7[6]), "r"(_raw_stv8_7[7]) : "memory");
                                         }
                                     } else {
                                         unsigned int packed_1_2[4];
@@ -1529,10 +1534,10 @@ kernel_cake_dense_projection_det_gemm_736ad30e83d88796883f(const __grid_constant
                                                 packed_6[_lp + 7] = *(uint32_t*)&_bf2;
                                             }
                                             {
-                                                const unsigned* _raw_stv8_9 = reinterpret_cast<const unsigned*>(packed_6);
+                                                const unsigned* _raw_stv8_8 = reinterpret_cast<const unsigned*>(packed_6);
                                                 asm volatile(
                                                     "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
-                                                    :: "l"((void*)(out + (row_base_4 + (unsigned long long)col_4))), "r"(_raw_stv8_9[0]), "r"(_raw_stv8_9[1]), "r"(_raw_stv8_9[2]), "r"(_raw_stv8_9[3]), "r"(_raw_stv8_9[4]), "r"(_raw_stv8_9[5]), "r"(_raw_stv8_9[6]), "r"(_raw_stv8_9[7]) : "memory");
+                                                    :: "l"((void*)(out + (row_base_4 + (unsigned long long)col_4))), "r"(_raw_stv8_8[0]), "r"(_raw_stv8_8[1]), "r"(_raw_stv8_8[2]), "r"(_raw_stv8_8[3]), "r"(_raw_stv8_8[4]), "r"(_raw_stv8_8[5]), "r"(_raw_stv8_8[6]), "r"(_raw_stv8_8[7]) : "memory");
                                             }
                                         } else {
                                             unsigned int packed_1_3[4];
@@ -1636,12 +1641,14 @@ kernel_cake_dense_projection_det_gemm_736ad30e83d88796883f(const __grid_constant
                         }
                         asm volatile("tcgen05.fence::before_thread_sync;");
                         __syncwarp();
-                        unsigned int inc_1 = ((lane == 0) ? 1 : 0);
-                        int aidx_2 = ((lane == 0) ? cidx_e : 4096 + (cta_rank * 8 + (warp - 2)) * 32 + lane);
-                        unsigned int _atomic_fetch_add_10;
-                        asm volatile("atom.acq_rel.gpu.global.add.u32 %0, [%1], %2;"
-                            : "=r"(_atomic_fetch_add_10) : "l"(&counters[aidx_2]), "r"(static_cast<uint32_t>(inc_1)) : "memory");
-                        unsigned int _shfl_1 = __shfl_sync(0xFFFFFFFF, _atomic_fetch_add_10, 0);
+                        unsigned int old_1 = 0;
+                        if (lane == 0) {
+                            unsigned int _atomic_fetch_add_9;
+                            asm volatile("atom.acq_rel.gpu.global.add.u32 %0, [%1], %2;"
+                                : "=r"(_atomic_fetch_add_9) : "l"(&counters[cidx_e]), "r"(static_cast<uint32_t>(1)) : "memory");
+                            old_1 = _atomic_fetch_add_9;
+                        }
+                        unsigned int arrival_1 = __shfl_sync(0xFFFFFFFF, old_1, 0);
                     }
                     if (role == 2) {
                         if (sb_on2 != 0) {
@@ -1776,10 +1783,10 @@ kernel_cake_dense_projection_det_gemm_736ad30e83d88796883f(const __grid_constant
                                             packed_7[_lp + 7] = *(uint32_t*)&_bf2;
                                         }
                                         {
-                                            const unsigned* _raw_stv8_13 = reinterpret_cast<const unsigned*>(packed_7);
+                                            const unsigned* _raw_stv8_12 = reinterpret_cast<const unsigned*>(packed_7);
                                             asm volatile(
                                                 "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
-                                                :: "l"((void*)(out + (row_base_5 + (unsigned long long)col_5))), "r"(_raw_stv8_13[0]), "r"(_raw_stv8_13[1]), "r"(_raw_stv8_13[2]), "r"(_raw_stv8_13[3]), "r"(_raw_stv8_13[4]), "r"(_raw_stv8_13[5]), "r"(_raw_stv8_13[6]), "r"(_raw_stv8_13[7]) : "memory");
+                                                :: "l"((void*)(out + (row_base_5 + (unsigned long long)col_5))), "r"(_raw_stv8_12[0]), "r"(_raw_stv8_12[1]), "r"(_raw_stv8_12[2]), "r"(_raw_stv8_12[3]), "r"(_raw_stv8_12[4]), "r"(_raw_stv8_12[5]), "r"(_raw_stv8_12[6]), "r"(_raw_stv8_12[7]) : "memory");
                                         }
                                     } else {
                                         unsigned int packed_1_4[4];

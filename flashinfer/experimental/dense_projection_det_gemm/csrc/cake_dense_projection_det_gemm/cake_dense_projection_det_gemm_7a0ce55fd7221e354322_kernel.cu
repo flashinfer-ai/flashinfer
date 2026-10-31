@@ -459,11 +459,42 @@ kernel_cake_dense_projection_det_gemm_7a0ce55fd7221e354322(const __grid_constant
                         int big_init = ((kc == 0) ? 1 : 0);
                         int small_init = ((iter_k_1 == 0) ? 1 : 0);
 #if __CUDA_ARCH__ == 1070
+                        int _mma_a_lo = (((a1_addr) >> 4) & 0x7FFF) + (mma_tma_stage) * 3328;
+                        int _mma_b_lo = ((((b1_addr) >> 4) & 0x7FFF) | 0x800000) + (mma_tma_stage) * 3328;
+#else
+                        int _mma_a_lo = (((a1_addr) >> 4) & 0x3FFF) + (mma_tma_stage) * 3328;
+                        int _mma_b_lo = ((((b1_addr) >> 4) & 0x3FFF) | 0x800000) + (mma_tma_stage) * 3328;
+#endif
+                        asm volatile(
+                    "{\n\t"
+                    ".reg .pred leader, p0, p1;\n\t"
+                    ".reg .b32 adhi, bdhi, alo, blo, id, m0, m1, m2, m3, m4, m5, m6, m7;\n\t"
+                    ".reg .b64 da, db;\n\t"
+                    "elect.sync _|leader, 0xFFFFFFFF;\n\t"
+                    "setp.ne.b32 p0, %3, 0;\n\t"
+                    "setp.ne.b32 p1, 1, 0;\n\t"
+                    "mov.b32 m0, 0; mov.b32 m1, 0; mov.b32 m2, 0; mov.b32 m3, 0;\n\tmov.b32 m4, 0; mov.b32 m5, 0; mov.b32 m6, 0; mov.b32 m7, 0;\n\t"
+                    "mov.b32 adhi, 0x80004020;\n\t"
+                    "mov.b32 bdhi, 0x80004020;\n\t"
+                    "mov.b32 id, 270599312;\n\t"
+                    "mov.b32 alo, %0;\n\t"
+                    "mov.b32 blo, %1;\n\t"
+                    "mov.b64 da, {alo, adhi};\n\t"
+                    "mov.b64 db, {blo, bdhi};\n\t"
+                    "@leader tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p0;\n\t"
+                    "add.u32 alo, alo, 2;\n\t"
+                    "add.u32 blo, blo, 64;\n\t"
+                    "mov.b64 da, {alo, adhi};\n\t"
+                    "mov.b64 db, {blo, bdhi};\n\t"
+                    "@leader tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
+                    "}\n"
+                    :: "r"(_mma_a_lo), "r"(_mma_b_lo), "r"((tmem_chunk_acc + (chunk_stage * 128))), "r"(((big_init) ? 0 : 1)) : "memory");
+#if __CUDA_ARCH__ == 1070
                         int _mma_a_lo_0 = (((a1_addr) >> 4) & 0x7FFF) + (mma_tma_stage) * 3328;
-                        int _mma_b_lo_0 = ((((b1_addr) >> 4) & 0x7FFF) | 0x800000) + (mma_tma_stage) * 3328;
+                        int _mma_b_lo_0 = ((((b2_addr) >> 4) & 0x7FFF) | 0x800000) + (mma_tma_stage) * 3328;
 #else
                         int _mma_a_lo_0 = (((a1_addr) >> 4) & 0x3FFF) + (mma_tma_stage) * 3328;
-                        int _mma_b_lo_0 = ((((b1_addr) >> 4) & 0x3FFF) | 0x800000) + (mma_tma_stage) * 3328;
+                        int _mma_b_lo_0 = ((((b2_addr) >> 4) & 0x3FFF) | 0x800000) + (mma_tma_stage) * 3328;
 #endif
                         asm volatile(
                     "{\n\t"
@@ -488,13 +519,13 @@ kernel_cake_dense_projection_det_gemm_7a0ce55fd7221e354322(const __grid_constant
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "@leader tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
                     "}\n"
-                    :: "r"(_mma_a_lo_0), "r"(_mma_b_lo_0), "r"((tmem_chunk_acc + (chunk_stage * 128))), "r"(((big_init) ? 0 : 1)) : "memory");
+                    :: "r"(_mma_a_lo_0), "r"(_mma_b_lo_0), "r"((tmem_small_acc + (mma_epi_stage * 128))), "r"(((small_init) ? 0 : 1)) : "memory");
 #if __CUDA_ARCH__ == 1070
-                        int _mma_a_lo_1 = (((a1_addr) >> 4) & 0x7FFF) + (mma_tma_stage) * 3328;
-                        int _mma_b_lo_1 = ((((b2_addr) >> 4) & 0x7FFF) | 0x800000) + (mma_tma_stage) * 3328;
+                        int _mma_a_lo_1 = (((a2_addr) >> 4) & 0x7FFF) + (mma_tma_stage) * 3328;
+                        int _mma_b_lo_1 = ((((b1_addr) >> 4) & 0x7FFF) | 0x800000) + (mma_tma_stage) * 3328;
 #else
-                        int _mma_a_lo_1 = (((a1_addr) >> 4) & 0x3FFF) + (mma_tma_stage) * 3328;
-                        int _mma_b_lo_1 = ((((b2_addr) >> 4) & 0x3FFF) | 0x800000) + (mma_tma_stage) * 3328;
+                        int _mma_a_lo_1 = (((a2_addr) >> 4) & 0x3FFF) + (mma_tma_stage) * 3328;
+                        int _mma_b_lo_1 = ((((b1_addr) >> 4) & 0x3FFF) | 0x800000) + (mma_tma_stage) * 3328;
 #endif
                         asm volatile(
                     "{\n\t"
@@ -519,13 +550,13 @@ kernel_cake_dense_projection_det_gemm_7a0ce55fd7221e354322(const __grid_constant
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "@leader tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
                     "}\n"
-                    :: "r"(_mma_a_lo_1), "r"(_mma_b_lo_1), "r"((tmem_small_acc + (mma_epi_stage * 128))), "r"(((small_init) ? 0 : 1)) : "memory");
+                    :: "r"(_mma_a_lo_1), "r"(_mma_b_lo_1), "r"((tmem_small_acc + (mma_epi_stage * 128))), "r"(1) : "memory");
 #if __CUDA_ARCH__ == 1070
-                        int _mma_a_lo_2 = (((a2_addr) >> 4) & 0x7FFF) + (mma_tma_stage) * 3328;
-                        int _mma_b_lo_2 = ((((b1_addr) >> 4) & 0x7FFF) | 0x800000) + (mma_tma_stage) * 3328;
+                        int _mma_a_lo_2 = (((a1_addr) >> 4) & 0x7FFF) + (mma_tma_stage) * 3328;
+                        int _mma_b_lo_2 = ((((b3_addr) >> 4) & 0x7FFF) | 0x800000) + (mma_tma_stage) * 3328;
 #else
-                        int _mma_a_lo_2 = (((a2_addr) >> 4) & 0x3FFF) + (mma_tma_stage) * 3328;
-                        int _mma_b_lo_2 = ((((b1_addr) >> 4) & 0x3FFF) | 0x800000) + (mma_tma_stage) * 3328;
+                        int _mma_a_lo_2 = (((a1_addr) >> 4) & 0x3FFF) + (mma_tma_stage) * 3328;
+                        int _mma_b_lo_2 = ((((b3_addr) >> 4) & 0x3FFF) | 0x800000) + (mma_tma_stage) * 3328;
 #endif
                         asm volatile(
                     "{\n\t"
@@ -552,11 +583,11 @@ kernel_cake_dense_projection_det_gemm_7a0ce55fd7221e354322(const __grid_constant
                     "}\n"
                     :: "r"(_mma_a_lo_2), "r"(_mma_b_lo_2), "r"((tmem_small_acc + (mma_epi_stage * 128))), "r"(1) : "memory");
 #if __CUDA_ARCH__ == 1070
-                        int _mma_a_lo_3 = (((a1_addr) >> 4) & 0x7FFF) + (mma_tma_stage) * 3328;
-                        int _mma_b_lo_3 = ((((b3_addr) >> 4) & 0x7FFF) | 0x800000) + (mma_tma_stage) * 3328;
+                        int _mma_a_lo_3 = (((a2_addr) >> 4) & 0x7FFF) + (mma_tma_stage) * 3328;
+                        int _mma_b_lo_3 = ((((b2_addr) >> 4) & 0x7FFF) | 0x800000) + (mma_tma_stage) * 3328;
 #else
-                        int _mma_a_lo_3 = (((a1_addr) >> 4) & 0x3FFF) + (mma_tma_stage) * 3328;
-                        int _mma_b_lo_3 = ((((b3_addr) >> 4) & 0x3FFF) | 0x800000) + (mma_tma_stage) * 3328;
+                        int _mma_a_lo_3 = (((a2_addr) >> 4) & 0x3FFF) + (mma_tma_stage) * 3328;
+                        int _mma_b_lo_3 = ((((b2_addr) >> 4) & 0x3FFF) | 0x800000) + (mma_tma_stage) * 3328;
 #endif
                         asm volatile(
                     "{\n\t"
@@ -583,11 +614,11 @@ kernel_cake_dense_projection_det_gemm_7a0ce55fd7221e354322(const __grid_constant
                     "}\n"
                     :: "r"(_mma_a_lo_3), "r"(_mma_b_lo_3), "r"((tmem_small_acc + (mma_epi_stage * 128))), "r"(1) : "memory");
 #if __CUDA_ARCH__ == 1070
-                        int _mma_a_lo_4 = (((a2_addr) >> 4) & 0x7FFF) + (mma_tma_stage) * 3328;
-                        int _mma_b_lo_4 = ((((b2_addr) >> 4) & 0x7FFF) | 0x800000) + (mma_tma_stage) * 3328;
+                        int _mma_a_lo_4 = (((a3_addr) >> 4) & 0x7FFF) + (mma_tma_stage) * 3328;
+                        int _mma_b_lo_4 = ((((b1_addr) >> 4) & 0x7FFF) | 0x800000) + (mma_tma_stage) * 3328;
 #else
-                        int _mma_a_lo_4 = (((a2_addr) >> 4) & 0x3FFF) + (mma_tma_stage) * 3328;
-                        int _mma_b_lo_4 = ((((b2_addr) >> 4) & 0x3FFF) | 0x800000) + (mma_tma_stage) * 3328;
+                        int _mma_a_lo_4 = (((a3_addr) >> 4) & 0x3FFF) + (mma_tma_stage) * 3328;
+                        int _mma_b_lo_4 = ((((b1_addr) >> 4) & 0x3FFF) | 0x800000) + (mma_tma_stage) * 3328;
 #endif
                         asm volatile(
                     "{\n\t"
@@ -613,37 +644,6 @@ kernel_cake_dense_projection_det_gemm_7a0ce55fd7221e354322(const __grid_constant
                     "@leader tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
                     "}\n"
                     :: "r"(_mma_a_lo_4), "r"(_mma_b_lo_4), "r"((tmem_small_acc + (mma_epi_stage * 128))), "r"(1) : "memory");
-#if __CUDA_ARCH__ == 1070
-                        int _mma_a_lo_5 = (((a3_addr) >> 4) & 0x7FFF) + (mma_tma_stage) * 3328;
-                        int _mma_b_lo_5 = ((((b1_addr) >> 4) & 0x7FFF) | 0x800000) + (mma_tma_stage) * 3328;
-#else
-                        int _mma_a_lo_5 = (((a3_addr) >> 4) & 0x3FFF) + (mma_tma_stage) * 3328;
-                        int _mma_b_lo_5 = ((((b1_addr) >> 4) & 0x3FFF) | 0x800000) + (mma_tma_stage) * 3328;
-#endif
-                        asm volatile(
-                    "{\n\t"
-                    ".reg .pred leader, p0, p1;\n\t"
-                    ".reg .b32 adhi, bdhi, alo, blo, id, m0, m1, m2, m3, m4, m5, m6, m7;\n\t"
-                    ".reg .b64 da, db;\n\t"
-                    "elect.sync _|leader, 0xFFFFFFFF;\n\t"
-                    "setp.ne.b32 p0, %3, 0;\n\t"
-                    "setp.ne.b32 p1, 1, 0;\n\t"
-                    "mov.b32 m0, 0; mov.b32 m1, 0; mov.b32 m2, 0; mov.b32 m3, 0;\n\tmov.b32 m4, 0; mov.b32 m5, 0; mov.b32 m6, 0; mov.b32 m7, 0;\n\t"
-                    "mov.b32 adhi, 0x80004020;\n\t"
-                    "mov.b32 bdhi, 0x80004020;\n\t"
-                    "mov.b32 id, 270599312;\n\t"
-                    "mov.b32 alo, %0;\n\t"
-                    "mov.b32 blo, %1;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p0;\n\t"
-                    "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 64;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
-                    "}\n"
-                    :: "r"(_mma_a_lo_5), "r"(_mma_b_lo_5), "r"((tmem_small_acc + (mma_epi_stage * 128))), "r"(1) : "memory");
                         elect_commit_cg2_multicast(mma_done_addr + (mma_tma_stage) * 8, (uint16_t)(3));
                         mma_tma_stage += 1;
                         if (mma_tma_stage == 4) { mma_tma_stage = 0; _phase_parts_full ^= 1; }
