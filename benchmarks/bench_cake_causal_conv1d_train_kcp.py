@@ -47,9 +47,10 @@ Measures (on every rank; a row reports the slowest rank and the JSON keeps every
 * ``wall_us``: the synchronized wall time of one call (barrier, ``perf_counter``, the call, device synchronize; the
   slowest rank per sample, the halo exchange included) and ``host_us``: the time to enqueue it;
 * ``first`` / ``steady``: the first call of the phase after the packages' workspace caches are cleared (workspace
-  allocation and zeroing included) and the next call: wall time, the allocator's peak above the bytes held before
-  the call (``peak_temp_bytes``) and the bytes still held after it (``retained_bytes``; ``fwd``: its outputs and
-  saved set; ``ckpt``: with the leaves' gradients dropped again);
+  allocation and zeroing included) and the next call, one sample each: the slowest rank's wall time, the allocator's
+  peak above the bytes held before the call (``peak_temp_bytes``) and the net bytes still held after it
+  (``retained_bytes``; ``fwd``: its outputs and saved set; ``bwd``: its gradients less the saved set it frees;
+  ``ckpt``: with the leaves' gradients dropped again);
 * ``halo``: per rank, the bytes one call sends and receives in each halo exchange (``ckpt`` runs the forward
   exchange twice).
 
@@ -263,8 +264,9 @@ def _probe(fn: Callable[[], object], device: torch.device) -> dict:
     """One call of ``fn``: the slowest rank's wall time and the allocator's peak above / bytes held after, per rank."""
 
     torch.cuda.synchronize(device)
-    dist.barrier()
+    # Collect before the barrier: the ranks leave it together and start the call at once.
     gc.collect()
+    dist.barrier()
     before = torch.cuda.memory_allocated(device)
     torch.cuda.reset_peak_memory_stats(device)
     t0 = time.perf_counter()
