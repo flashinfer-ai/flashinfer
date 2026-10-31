@@ -27,8 +27,10 @@ the record.  It depends on nothing but the standard library so that the
 generated-program export can run the very same code against the kernel's own
 dispatch functions before a record is frozen (a disagreement fails the export,
 never the user).  A record may give the wide program precedence over the
-three-warpgroup rule from ``wide_first_rule[0]`` mean unit tiles on, and the
-CTA pair serves the unit geometries of ``pair_units`` only.  A record may also
+three-warpgroup rule from ``wide_first_rule[0]`` mean unit tiles on, the
+CTA pair serves the unit geometries of ``pair_units`` only and the key-range
+split those of ``split_units`` only (the units whose split program the
+architecture registers).  A record may also
 replace the sampled rank shift from a ``top_k`` of ``sample_shift_rule[0]`` on
 (``sample_shift_for``); an explicit ``sample_shift_permille`` knob still
 overrides it.  The candidate-capacity floor may depend on ``top_k`` the same
@@ -71,6 +73,7 @@ POLICY_FIELDS = (
     "split_max",  # most key-range splits per unit
     "split_min_range_tiles",  # a split's key range is at least this many tiles
     "split_wave_rule",  # [min mean unit tiles, min CTA-efficiency gain] for a two-way split, or None
+    "split_units",  # unit geometries ("l6", "narrow", "wide") whose split program the architecture registers; any other unit never splits
     "pair_rule",  # [min mean unit tiles, max mean unit tiles, min top_k] of the CTA-pair program, or None
     "pair_units",  # unit geometries ("l6", "narrow", "wide") whose CTA-pair program the architecture registers; the pair rule applies to these units only
     "snake_default",  # snake unit order when no rule applies
@@ -234,6 +237,7 @@ class DispatchPolicy:
     split_max: int
     split_min_range_tiles: int
     split_wave_rule: Optional[list]
+    split_units: list
     pair_rule: Optional[list]
     pair_units: list
     snake_default: bool
@@ -339,6 +343,15 @@ class DispatchPolicy:
         if raw["pair_rule"] is not None and not pair_units:
             raise ValueError(
                 "policy['pair_units'] must name at least one unit geometry when policy['pair_rule'] is set"
+            )
+        split_units = raw["split_units"]
+        if (
+            not isinstance(split_units, (list, tuple))
+            or not all(isinstance(u, str) and u in UNITS for u in split_units)
+            or list(split_units) != sorted(set(split_units))
+        ):
+            raise ValueError(
+                f"policy['split_units'] must be an ascending list of unit geometries {UNITS}, got {split_units!r}"
             )
         shift_lo, shift_hi = SAMPLE_SHIFT_PERMILLE_BOUNDS
         shift_rule = raw["sample_shift_rule"]
@@ -513,6 +526,7 @@ class DispatchPolicy:
         values["rank_t16_slots"] = [int(v) for v in values["rank_t16_slots"]]
         values["sample_fit_kinds"] = [str(k) for k in values["sample_fit_kinds"]]
         values["pair_units"] = [str(u) for u in values["pair_units"]]
+        values["split_units"] = [str(u) for u in values["split_units"]]
         values["check_period_kind_overrides"] = {
             str(k): int(v) for k, v in values["check_period_kind_overrides"].items()
         }
@@ -728,6 +742,25 @@ class DispatchPolicy:
         grid: int,
         block_q: int,
     ) -> int:
+        """Key-range splits per unit of the unit ``block_q``: the split rule (``split_rule_for``) for a unit of
+        ``split_units``; 1 for any other unit, whose split program the architecture does not register."""
+        if self.unit_name(block_q) not in self.split_units:
+            return 1
+        return self.split_rule_for(
+            num_queries, num_keys, num_segments, ratio, grid, block_q
+        )
+
+    def split_rule_for(
+        self,
+        num_queries: int,
+        num_keys: int,
+        num_segments: int,
+        ratio: int,
+        grid: int,
+        block_q: int,
+    ) -> int:
+        """The split rule alone (no registration guard): ``min(grid // units, mean tiles // split_min_range_tiles,
+        split_max)``, at least 1, and the two-way wave split of ``split_wave_rule`` where that gives 1."""
         units = max(1, -(-int(num_queries) // int(block_q)))
         mean_tiles = self._mean_unit_tiles_floor(
             num_queries, num_keys, num_segments, ratio

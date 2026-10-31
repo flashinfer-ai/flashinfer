@@ -105,6 +105,7 @@ _COMMON = dict(
     wide_first_rule=None,
     split_max=32,
     split_min_range_tiles=64,
+    split_units=["l6", "narrow", "wide"],
     snake_default=False,
     tile_unroll_default=1,
     tile_unroll_factor=2,
@@ -342,6 +343,14 @@ def test_registry_records_are_well_formed():
                 k.split(":")[1][len("pair_") :]
                 for k in scan_keys
                 if k.startswith("scan:pair_")
+            }
+        ), arch
+        # the key-range split serves exactly the unit geometries whose split program the architecture registers
+        assert policy.split_units == sorted(
+            {
+                k.split(":")[1][len("split_") :]
+                for k in scan_keys
+                if k.startswith("scan:split_")
             }
         ), arch
         # the wide-first precedence reaches the unrolled wide program in both fit forms
@@ -700,6 +709,11 @@ def test_policy_record_round_trip_and_validation():
         dict(wide_first_rule=[512.0, 1]),
         dict(wide_first_rule=[-1.0]),
         dict(wide_first_rule=[True]),
+        # the units that split: an ascending list of unit geometries (may be empty)
+        dict(split_units="l6"),
+        dict(split_units=["split_l6"]),
+        dict(split_units=["wide", "l6"]),
+        dict(split_units=["l6", "l6"]),
         # the units the CTA pair serves: an ascending list of unit geometries, not empty while pair_rule is set
         dict(pair_units="l6"),
         dict(pair_units=["pair_l6"]),
@@ -1524,6 +1538,73 @@ def test_policy_selects_registered_programs_on_a_dense_geometry_grid():
                             )
 
 
+def test_split_units_keep_every_split_plan_registered():
+    """A unit outside ``split_units`` never splits: on sm_107a (no ``split_l6`` program) an l6 unit whose mean is exactly
+    2 x ``split_min_range_tiles`` tiles (T = 2, Tkv = 8193: 64.0 mean tiles, the l6 rule's bound) stays one unsplit (paired) unit,
+    where the split rule alone gives two splits; every plan of a geometry grid around the split and l6 bounds runs a
+    registered scan program on every architecture and SM count."""
+    if not cake_jit.PROGRAM_KEYS:
+        pytest.skip("placeholder registry")
+    p = policy_for("sm_107a")
+    assert "l6" not in p.split_units
+    assert p.split_rule_for(2, 8193, 1, 1, 212, p.block_q_l6) == 2
+    assert p.n_split_for(2, 8193, 1, 1, 212, p.block_q_l6) == 1
+    c = select_program(
+        p, num_queries=2, num_keys=8193, num_segments=1, ratio=1, top_k=2048, grid=212
+    )
+    assert (c.kind, c.n_split) == (
+        "pair_l6",
+        1,
+    ) and c.scan_key in cake_jit.PROGRAM_KEYS["sm_107a"]
+    # without the guard (every unit in split_units) the same call composes the unregistered split_l6 key
+    loose = DispatchPolicy.from_record(
+        dict(p.record(), split_units=["l6", "narrow", "wide"])
+    )
+    assert (
+        select_program(
+            loose,
+            num_queries=2,
+            num_keys=8193,
+            num_segments=1,
+            ratio=1,
+            top_k=2048,
+            grid=212,
+        ).scan_key
+        == "scan:split_l6:u1:s0:f0"
+    )
+    for arch, grids in (
+        ("sm_100a", (148, 152)),
+        ("sm_103a", (148, 152)),
+        ("sm_107a", (208, 212, 216)),
+    ):
+        policy, keys = policy_for(arch), cake_jit.PROGRAM_KEYS[arch]
+        for grid in grids:
+            for T in (1, 2, 4, 6, 16, 64, 256):
+                for tiles in (63, 64, 65, 96, 128, 129, 256, 1024):
+                    for S, delta in ((1, 0), (1, 64), (2, 0)):
+                        Tkv = S * tiles * 128 + T // 2 + delta
+                        for sample in (None, 0):
+                            c = select_program(
+                                policy,
+                                num_queries=T,
+                                num_keys=Tkv,
+                                num_segments=S,
+                                ratio=1,
+                                top_k=2048,
+                                grid=grid,
+                                sample_tiles_max=sample,
+                            )
+                            assert c.scan_key in keys, (
+                                arch,
+                                grid,
+                                T,
+                                Tkv,
+                                S,
+                                sample,
+                                c.scan_key,
+                            )
+
+
 def test_sample_fit_kinds_name_exactly_the_registered_sampled_fit_programs():
     """``sample_fit_kinds`` is the registry's own list: every scan kind with a registered ``:f1`` program and no other, so
     the dispatch never composes a sampled-fit key the architecture does not ship (round 3: a 32768-slot capacity made
@@ -1545,7 +1626,7 @@ def test_sample_fit_kinds_name_exactly_the_registered_sampled_fit_programs():
         num_queries=4, num_keys=22018, num_segments=1, ratio=1, top_k=2048, grid=148
     )
     c = select_program(p, candidate_multiplier=16, **geometry)
-    assert (c.scan_key, c.n_split, c.cand_cap) == ("scan:split_l6:u1:s0:f0", 2, 32768)
+    assert (c.scan_key, c.n_split, c.cand_cap) == ("scan:split_l6:u1:s0:f0", 5, 32768)
     assert c.physical_kind == "split_l6" and not c.sample_fit
     assert (
         select_program(p, **geometry).cand_cap == 32768
