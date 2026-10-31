@@ -46,7 +46,8 @@ SHIPPED_SLABS = (16, 32, 64)
 ROWS = (
     1, 2, 7, 63, 64, 65, 127, 128, 129, 255, 256, 257, 1023, 1024, 1025, 2048, 2049, 3072, 3073, 4096, 4097,
     5120, 5121, 12288, 12289, 14928, 14929, 15566, 15567, 16231, 16263, 16384, 16385, 20480, 20481, 20992, 20993,
-    29184, 29185, 32768, 32769, 40960, 40961, 65536, 65537, 81920, 81921, 114688, 114689,
+    29184, 29185, 32768, 32769, 40960, 40961, 65536, 65537, 70656, 70657, 80896, 80897, 81920, 81921, 114688, 114689,
+    139264, 139265, 1179648, 1179649, 1572864, 1572865,
 )  # fmt: skip
 # The row count standing in for an unbounded window's upper edge.
 OPEN_WINDOW_ROWS = 65536
@@ -313,10 +314,15 @@ def test_rows_cover_every_backward_window_edge() -> None:
 
 # The H = 256 backward route: per sm_100a / sm_103a window the faster of the four-CTA pipeline (``pd4``) and the
 # five-CTA ring at issue distance three without the L2 hint (``a3``), both at ``tail_div=4``, in two sessions per
-# architecture (BF16 and FP32 weight alike); sm_107a runs the pipeline to 65536 rows and the ring above.
+# architecture (BF16 and FP32 weight alike); sm_107a runs the pipeline to 65536 rows and the ring above.  Above the
+# ring's dw accuracy edge of each architecture (80896 rows on sm_100a, 139264 on sm_103a, 70656 on sm_107a) the ring
+# with compensated dw sums (``dc``) runs instead, and above 1572864 rows on sm_100a and 1179648 rows on sm_103a /
+# sm_107a its form with hi / lo partial rows (``dchl``).
 H256_BWD_PROGRAMS = {
     "pd4": "rmsnorm_train_bwd_h256_t128x4_pd4_k_s32_split_pts_cl_td4",
     "a3": "rmsnorm_train_bwd_h256_t128x5_cpa8a3nhkc8_k_s32_split_pts_cl_td4_cs",
+    "dc": "rmsnorm_train_bwd_h256_t128x5_cpa8a3nhftdf_k_s32_split_pts_cl_td4_cs",
+    "dchl": "rmsnorm_train_bwd_h256_t128x5_cpa8a3nhftdfhl_k_s32_split_pts_cl_td4_cs",
 }
 H256_BWD_SPLIT = {
     **{
@@ -325,11 +331,21 @@ H256_BWD_SPLIT = {
             (2048, 5120, "pd4"),
             (5120, 12288, "a3"),
             (12288, 40960, "pd4"),
-            (40960, None, "a3"),
+            (40960, edge, "a3"),
+            (edge, hl, "dc"),
+            (hl, None, "dchl"),
         )
-        for arch in ("sm_100a", "sm_103a")
+        for arch, edge, hl in (
+            ("sm_100a", 80896, 1572864),
+            ("sm_103a", 139264, 1179648),
+        )
     },
-    "sm_107a": ((0, 65536, "pd4"), (65536, None, "a3")),
+    "sm_107a": (
+        (0, 65536, "pd4"),
+        (65536, 70656, "a3"),
+        (70656, 1179648, "dc"),
+        (1179648, None, "dchl"),
+    ),
 }
 
 
@@ -791,7 +807,12 @@ def test_workspace_puts_the_counters_first_and_grows_with_the_rows(hidden: int) 
                 <= layout["capacity_chunks"]
                 == min(rows, loader.MAX_ROUNDS * slots)
             )
-            assert layout["partial_bytes"] == 4 * layout["capacity_chunks"] * hidden
+            # a record with hi / lo partials keeps two partial rows per chunk
+            partial_rows = int(record["workspace_rule"].get("partial_rows", 1))
+            assert (
+                layout["partial_bytes"]
+                == 4 * partial_rows * layout["capacity_chunks"] * hidden
+            )
             assert (
                 layout["total_bytes"]
                 == loader.COUNTERS_BYTES + -(-layout["partial_bytes"] // 256) * 256

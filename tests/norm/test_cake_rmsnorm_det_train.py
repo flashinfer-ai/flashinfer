@@ -1514,11 +1514,23 @@ def test_registry_records_reference_the_build_manifest() -> None:
     assert (package / "csrc" / "cake_ffi_checks.h").is_file()
 
 
-# The per-element dw bound of the H = 5120 contract at the largest row counts of its long-chunk window: every element
-# of dw within atol = rtol = 1e-4 of the FP64 sum of the same products (g, x and the FP32 rstd the forward returned),
-# where an FP32 chunk sum over many rows accumulates the most rounding.  A few seeds per case; BF16 and FP32 weight.
+# The per-element dw bound at the largest row counts of the long-chunk windows: every element of dw within
+# atol = rtol = 1e-4 of the FP64 sum of the same products (g, x and the FP32 rstd the forward returned), where an FP32
+# chunk sum over many rows accumulates the most rounding: H = 5120 at 40960 and 65536 rows; H = 256 above the
+# compensated-sum edges (81920 rows), at the key rows of a 65536-token batch (262144), above the sm_103a / sm_107a
+# hi / lo edge (1179649 rows), at the query rows of a 65536-token batch (1572864) and above the sm_100a hi / lo edge
+# (1572865).
+# A few seeds per case; BF16 and FP32 weight.
 DW_ELEMENT_TOL = 1e-4
-LARGE_ROW_DW_ROWS = (40960, 65536)
+LARGE_ROW_DW_CASES = (
+    (5120, 40960),
+    (5120, 65536),
+    (256, 81920),
+    (256, 262144),
+    (256, 1179649),
+    (256, 1572864),
+    (256, 1572865),
+)
 
 
 def _dw_fp64(g: torch.Tensor, x: torch.Tensor, rstd: torch.Tensor) -> torch.Tensor:
@@ -1533,13 +1545,12 @@ def _dw_fp64(g: torch.Tensor, x: torch.Tensor, rstd: torch.Tensor) -> torch.Tens
     return dw
 
 
-@pytest.mark.parametrize("rows", LARGE_ROW_DW_ROWS)
+@pytest.mark.parametrize(("hidden", "rows"), LARGE_ROW_DW_CASES)
 @pytest.mark.parametrize("fp32_weight", (False, True))
 @pytest.mark.parametrize("seed", (0, 1, 2))
 def test_large_row_dw_meets_the_per_element_bound(
-    rows: int, fp32_weight: bool, seed: int
+    hidden: int, rows: int, fp32_weight: bool, seed: int
 ) -> None:
-    hidden = 5120
     if fp32_weight:
         _skip_unless_fp32_routes(hidden, False)
     else:
@@ -1561,7 +1572,7 @@ def test_large_row_dw_meets_the_per_element_bound(
     )
     worst = int(ratio.argmax())
     assert float(ratio.max()) <= 1.0, (
-        f"rows={rows} fp32_weight={fp32_weight} seed={seed}: dw[{worst}] = "
+        f"hidden={hidden} rows={rows} fp32_weight={fp32_weight} seed={seed}: dw[{worst}] = "
         f"{float(dw[worst])!r} vs FP64 {float(reference[worst])!r} "
         f"({float(ratio.max()):.3f} x the bound, {int((ratio > 1).sum())} elements over)"
     )

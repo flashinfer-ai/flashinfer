@@ -376,7 +376,10 @@ def cake_rmsnorm_det_train_backward_workspace_bytes(
     its first ``cake_jit.COUNTERS_BYTES`` bytes, then the FP32 per-chunk ``dw``
     partial rows: one row per chunk of the backward chunk table, whose count
     is bounded by ``min(rows, MAX_ROUNDS x slots)`` of the route's largest
-    persistent grid (``cake_jit.chunk_capacity``).  The size grows with
+    persistent grid (``cake_jit.chunk_capacity``), and two rows per chunk
+    (the partial's high and low part) for a module whose workspace rule
+    spells ``partial_rows`` 2, among the modules a call of at most ``rows``
+    tokens can launch.  The size grows with
     ``rows`` and a buffer sized for ``rows`` serves every call with at most
     that many tokens.  The counters must be zero on first use (allocate with
     ``torch.zeros`` or use :func:`cake_rmsnorm_det_train_backward_workspace`); the
@@ -399,6 +402,12 @@ def cake_rmsnorm_det_train_backward_workspace_bytes(
         owner = _workspace_record(arch, hidden, residual, max(rows, 1), w_dtype)
         for record in _backward_module_records(arch, hidden, residual, w_dtype):
             if record.get("workspace_rule") is None:
+                continue
+            # A module selected only above ``rows`` tokens never runs on this buffer.
+            select = record.get("select_rule") or {}
+            if select.get("kind") == "rows_between" and max(rows, 1) <= int(
+                select["above"]
+            ):
                 continue
             layout = _loader.workspace_layout(
                 record, max(rows, 1), device_index=device_index, capacity_record=owner
@@ -452,10 +461,9 @@ def _workspace_views(
         )
     hidden = int(record["hidden"])
     begin = layout["partial_offset"]
-    partial = workspace[begin : begin + 4 * layout["n_chunks"] * hidden].view(
-        torch.float32
-    )
-    partial = partial.view(layout["n_chunks"], hidden)
+    n_rows = layout["n_chunks"] * layout["partial_rows"]
+    partial = workspace[begin : begin + 4 * n_rows * hidden].view(torch.float32)
+    partial = partial.view(n_rows, hidden)
     begin = layout["counters_offset"]
     counters = workspace[begin : begin + 4 * max(layout["counters"], 1)].view(
         torch.uint32
