@@ -47,12 +47,12 @@ from tests.test_helpers.cake_package import cake_package
 # build that vendors the package under another import path runs this file unchanged after pointing the ``PACKAGES``
 # entry at it).  The tests of the public entry points ``flashinfer.chunked_lm_head`` -- their experimental marking and
 # the FLASHINFER_CAKE_LM_HEAD_LOSS_* environment variables they read -- live in ``test_cake_lm_head_loss_api.py``.
-pkg = cake_package("cake_lm_head_loss")
-cake_backend = cake_package("cake_lm_head_loss", "cake_backend")
+pkg = cake_package("cake_lm_head_det_loss")
+cake_backend = cake_package("cake_lm_head_det_loss", "cake_backend")
 # The opt-in forms (``memory_mode`` / ``num_valid_rows``); a call with neither keyword is ``cake_backend``'s.
-opt_in = cake_package("cake_lm_head_loss", "cake_backend_opt_in")
-cake_build = cake_package("cake_lm_head_loss", "cake_build")
-cake_jit = cake_package("cake_lm_head_loss", "cake_jit")
+opt_in = cake_package("cake_lm_head_det_loss", "cake_backend_opt_in")
+cake_build = cake_package("cake_lm_head_det_loss", "cake_build")
+cake_jit = cake_package("cake_lm_head_det_loss", "cake_jit")
 ABI_CONTRACT = cake_backend.ABI_CONTRACT
 COMMON_SCALARS = cake_backend.COMMON_SCALARS
 COMMON_TENSORS = cake_backend.COMMON_TENSORS
@@ -71,16 +71,16 @@ cluster_resident = cake_backend.cluster_resident
 forward_binding_key = cake_backend.forward_binding_key
 generated_program_available = cake_backend.generated_program_available
 grid_dims = cake_backend.grid_dims
-lm_head_loss_workspace_size = cake_backend.lm_head_loss_workspace_size
+lm_head_det_loss_workspace_size = cake_backend.lm_head_det_loss_workspace_size
 logprob_backward_binding_key = cake_backend.logprob_backward_binding_key
 memory_report = cake_backend.memory_report
 plan_chunks = cake_backend.plan_chunks
-prepare_lm_head_loss = cake_backend.prepare_lm_head_loss
+prepare_lm_head_det_loss = cake_backend.prepare_lm_head_det_loss
 recommended_k_slices = cake_backend.recommended_k_slices
 record_abi = cake_backend.record_abi
 stage_values = cake_backend.stage_values
 stages_for_entry = cake_backend.stages_for_entry
-validate_lm_head_inputs = cake_backend.validate_lm_head_inputs
+validate_lm_head_det_inputs = cake_backend.validate_lm_head_det_inputs
 wave_efficiency = cake_backend.wave_efficiency
 workspace_layout = cake_backend.workspace_layout
 
@@ -188,7 +188,7 @@ def _run(
     W = inp.W.detach().requires_grad_(train_w)
     be = opt_in if _OPT_IN_KEYWORDS & switches.keys() else cake_backend
     if entry == "loss":
-        loss, logp = be.chunked_lm_head_loss(
+        loss, logp = be.chunked_lm_head_det_loss(
             X,
             W,
             inp.labels,
@@ -207,7 +207,7 @@ def _run(
         if train_x or train_w:
             (loss if scale is None else loss * scale).backward()
     else:
-        logp = be.chunked_lm_head_logprob(
+        logp = be.chunked_lm_head_det_logprob(
             X,
             W,
             inp.labels,
@@ -278,14 +278,14 @@ def _same(a, b) -> bool:
 
 
 _KERNEL_SOURCE_RE = re.compile(
-    r"^csrc/cake_lm_head_loss/cake_lm_head_loss_([0-9a-f]{20})_kernel\.cu$"
+    r"^csrc/cake_lm_head_det_loss/cake_lm_head_det_loss_([0-9a-f]{20})_kernel\.cu$"
 )
 _PROGRAM_KERNEL_DEFINITION_RE = re.compile(
-    r"^-DCAKE_PROGRAM_KERNEL=(kernel_cake_lm_head_loss_[0-9a-f]{20})$"
+    r"^-DCAKE_PROGRAM_KERNEL=(kernel_cake_lm_head_det_loss_[0-9a-f]{20})$"
 )
 _PROGRAM_KERNEL_DEFAULT_RE = re.compile(
     r"^#ifndef CAKE_PROGRAM_KERNEL\n"
-    r"#define CAKE_PROGRAM_KERNEL (kernel_cake_lm_head_loss_[0-9a-f]{20})\n"
+    r"#define CAKE_PROGRAM_KERNEL (kernel_cake_lm_head_det_loss_[0-9a-f]{20})\n"
     r"#endif$",
     re.MULTILINE,
 )
@@ -298,7 +298,7 @@ def _kernel_source_symbol(entry, package):
     a sibling form's symbol from the library's compile definitions."""
     kernel_unit = _KERNEL_SOURCE_RE.match(entry["sources"][0]).group(1)
     text = (package / entry["sources"][0]).read_text()
-    own = f"kernel_cake_lm_head_loss_{kernel_unit}"
+    own = f"kernel_cake_lm_head_det_loss_{kernel_unit}"
     defaults = _PROGRAM_KERNEL_DEFAULT_RE.findall(text)
     carried = [
         m.group(1)
@@ -384,7 +384,7 @@ def test_registry_records_are_well_formed():
         for stage in stages:
             physical = record[stage]
             assert physical["module"] and physical["ffi_entry"]
-            unit = physical["module"].removeprefix("cake_lm_head_loss_")
+            unit = physical["module"].removeprefix("cake_lm_head_det_loss_")
             assert physical["library"] == cake_jit.library_stem(unit)
             entry = libraries[cake_jit.library_name(name, stage)]
             assert entry["arch"] == record["arch"]
@@ -394,7 +394,7 @@ def test_registry_records_are_well_formed():
             assert len(entry["closure_sha256"]) == 64
             assert len(entry["sources"]) == 2
             assert all(
-                s.startswith("csrc/cake_lm_head_loss/") for s in entry["sources"]
+                s.startswith("csrc/cake_lm_head_det_loss/") for s in entry["sources"]
             )
             assert set(entry["sha256"]) == set(entry["sources"])
             kinds = {kind for kind, _ in physical["arg_plan"]}
@@ -417,11 +417,15 @@ def test_registry_records_are_well_formed():
             # kernel through CAKE_PROGRAM_KERNEL in its compile definitions
             kernel_unit, defined = _kernel_source_symbol(entry, package)
             assert (
-                kernel == f"cake_lm_head_loss/cake_lm_head_loss_{kernel_unit}_kernel.cu"
+                kernel
+                == f"cake_lm_head_det_loss/cake_lm_head_det_loss_{kernel_unit}_kernel.cu"
             )
-            assert kernel_unit == unit or defined == f"kernel_cake_lm_head_loss_{unit}"
+            assert (
+                kernel_unit == unit or defined == f"kernel_cake_lm_head_det_loss_{unit}"
+            )
             assert re.fullmatch(
-                r"cake_lm_head_loss/cake_lm_head_loss_[0-9a-f]{20}_binding\.cu", binding
+                r"cake_lm_head_det_loss/cake_lm_head_det_loss_[0-9a-f]{20}_binding\.cu",
+                binding,
             )
             csrc = package / "csrc"
             assert (csrc / kernel).is_file() and (csrc / binding).is_file()
@@ -465,9 +469,10 @@ def test_registry_records_are_well_formed():
         for stage in record["stages"]
     }
     if cake_jit.MODULES:
-        unit_dir = package / "csrc" / "cake_lm_head_loss"
+        unit_dir = package / "csrc" / "cake_lm_head_det_loss"
         assert sorted(
-            f"csrc/cake_lm_head_loss/{p.name}" for p in unit_dir.glob("*_binding.cu")
+            f"csrc/cake_lm_head_det_loss/{p.name}"
+            for p in unit_dir.glob("*_binding.cu")
         ) == sorted(used)
 
 
@@ -621,7 +626,7 @@ def _valid_call(T=4):
 
 def test_validate_accepts_strided_x():
     kw = _valid_call()
-    p = validate_lm_head_inputs(**kw)
+    p = validate_lm_head_det_inputs(**kw)
     assert (p.num_rows, p.hidden, p.vocab, p.chunk) == (4, H_HOST, V_HOST, 4096)
     assert (p.ld_x, p.x_copy, p.objective, p.loss_div, p.entry, p.mode) == (
         H_HOST,
@@ -632,14 +637,14 @@ def test_validate_accepts_strided_x():
         MODE_CE,
     )
     wide = torch.zeros(4, H_HOST + 8, dtype=torch.bfloat16)[:, :H_HOST]
-    p = validate_lm_head_inputs(**dict(kw, X=wide))
+    p = validate_lm_head_det_inputs(**dict(kw, X=wide))
     assert not p.x_copy and p.ld_x == H_HOST + 8  # a 16 B pitch is launched as is
     odd = torch.zeros(4, H_HOST + 3, dtype=torch.bfloat16)[:, :H_HOST]
-    p = validate_lm_head_inputs(**dict(kw, X=odd))
+    p = validate_lm_head_det_inputs(**dict(kw, X=odd))
     assert p.x_copy and p.ld_x == H_HOST  # copied to a contiguous tensor
-    p = validate_lm_head_inputs(**dict(kw, X=kw["X"][:0], labels=kw["labels"][:0]))
+    p = validate_lm_head_det_inputs(**dict(kw, X=kw["X"][:0], labels=kw["labels"][:0]))
     assert p.num_rows == 0 and not p.x_copy
-    policy = validate_lm_head_inputs(
+    policy = validate_lm_head_det_inputs(
         **dict(
             kw,
             objective="policy",
@@ -649,13 +654,14 @@ def test_validate_accepts_strided_x():
         )
     )
     assert policy.mode == MODE_POLICY and policy.loss_div is None
-    logprob = validate_lm_head_inputs(**dict(kw, loss_div=None), entry="logprob")
+    logprob = validate_lm_head_det_inputs(**dict(kw, loss_div=None), entry="logprob")
     assert logprob.mode == MODE_NONE and logprob.entry == "logprob"
     # loss_div also as a CPU scalar tensor / an int
     assert (
-        validate_lm_head_inputs(**dict(kw, loss_div=torch.tensor(2.5))).loss_div == 2.5
+        validate_lm_head_det_inputs(**dict(kw, loss_div=torch.tensor(2.5))).loss_div
+        == 2.5
     )
-    assert validate_lm_head_inputs(**dict(kw, loss_div=3)).loss_div == 3.0
+    assert validate_lm_head_det_inputs(**dict(kw, loss_div=3)).loss_div == 3.0
 
 
 def _cuda_scalar():
@@ -781,7 +787,7 @@ def _cuda_scalar():
 )
 def test_validate_rejects(mutate, exc, match):
     with pytest.raises(exc, match=match):
-        validate_lm_head_inputs(**mutate(_valid_call()))
+        validate_lm_head_det_inputs(**mutate(_valid_call()))
 
 
 def test_workspace_layout_and_memory_rule():
@@ -879,11 +885,13 @@ def test_workspace_layout_and_memory_rule():
         assert rep["vocab_rows_max"] == min(T, C)
         assert rep["temporary"]["logits"] == min(T, C) * V * 2
     assert (
-        lm_head_loss_workspace_size(16231, V, C, backend="reference")
+        lm_head_det_loss_workspace_size(16231, V, C, backend="reference")
         == workspace_layout(16231, V, C)["total"]
     )
     assert (
-        lm_head_loss_workspace_size(16231, V, C, entry="logprob", backend="reference")
+        lm_head_det_loss_workspace_size(
+            16231, V, C, entry="logprob", backend="reference"
+        )
         == workspace_layout(16231, V, C, entry="logprob")["total"]
     )
 
@@ -2730,11 +2738,11 @@ def test_gemm_tuning_default_is_no_knob():
     common = dict(
         objective="ce", loss_div=inp.loss_div, backend="reference", chunk_size=16
     )
-    narrow = prepare_lm_head_loss(
+    narrow = prepare_lm_head_det_loss(
         inp.X, inp.W, inp.labels, gemm_tuning={"dx": {"tile_n": 256}}, **common
     )
     assert "gemm_dx_tn256" in narrow.stages and "gemm_dx" not in narrow.stages
-    plain = prepare_lm_head_loss(inp.X, inp.W, inp.labels, gemm_tuning={}, **common)
+    plain = prepare_lm_head_det_loss(inp.X, inp.W, inp.labels, gemm_tuning={}, **common)
     assert "gemm_dx" in plain.stages and plain.plan.variants == ()
     narrow.step(torch.tensor(2.0))
     plain.step(torch.tensor(2.0))
@@ -2811,12 +2819,12 @@ def test_select_module_one_record_per_arch(monkeypatch):
         cake_jit,
         "MODULES",
         {
-            "cake_lm_head_loss_sm_100a": rec("sm_100a"),
-            "cake_lm_head_loss_sm_103a": rec("sm_103a"),
+            "cake_lm_head_det_loss_sm_100a": rec("sm_100a"),
+            "cake_lm_head_det_loss_sm_103a": rec("sm_103a"),
         },
     )
-    assert cake_jit.select_module("sm_100a") == "cake_lm_head_loss_sm_100a"
-    assert cake_jit.select_module("sm_103a") == "cake_lm_head_loss_sm_103a"
+    assert cake_jit.select_module("sm_100a") == "cake_lm_head_det_loss_sm_100a"
+    assert cake_jit.select_module("sm_103a") == "cake_lm_head_det_loss_sm_103a"
     with pytest.raises(NotImplementedError):
         cake_jit.select_module("sm_90a")
     monkeypatch.setattr(cake_jit, "MODULES", {"a": rec("sm_100a"), "b": rec("sm_100a")})
@@ -2915,7 +2923,7 @@ def test_wave_efficiency_uses_the_dx_cluster():
 def test_stage_values_names():
     T, C = 37, 16
     inp = _host_inputs(T)
-    runner = prepare_lm_head_loss(
+    runner = prepare_lm_head_det_loss(
         inp.X,
         inp.W,
         inp.labels,
@@ -3034,7 +3042,7 @@ def test_stage_values_names():
     with pytest.raises(ValueError):
         stage_values("not_a_stage", t, plan, 0)
     # the log-probability entry reads the caller's [T] dlogp at d[row0 + r]
-    lp = prepare_lm_head_loss(
+    lp = prepare_lm_head_det_loss(
         inp.X,
         inp.W,
         inp.labels,
@@ -3060,7 +3068,7 @@ def test_stage_values_names():
             == MODE_NONE
         )
     with pytest.raises(ValueError, match="T > 0"):
-        prepare_lm_head_loss(
+        prepare_lm_head_det_loss(
             inp.X[:0],
             inp.W,
             inp.labels[:0],
@@ -3091,7 +3099,7 @@ def _fake_record(arg_plan):
         "stages": ["row_grad"],
         "row_grad": {
             "module": "fake",
-            "library": "cake_lm_head_loss_fake",
+            "library": "cake_lm_head_det_loss_fake",
             "ffi_entry": "run",
             "arg_plan": arg_plan,
             "tma_workspace_bytes": 0,
@@ -3119,7 +3127,7 @@ def _row_grad_values():
 
 
 def test_bind_stage_fails_closed_on_unknown_argument(monkeypatch):
-    name = "cake_lm_head_loss_fake"
+    name = "cake_lm_head_det_loss_fake"
     monkeypatch.setitem(
         cake_jit.MODULES,
         name,
@@ -3127,7 +3135,7 @@ def test_bind_stage_fails_closed_on_unknown_argument(monkeypatch):
     )
     monkeypatch.setattr(
         cake_backend,
-        "load_cake_lm_head_loss_module",
+        "load_cake_lm_head_det_loss_module",
         lambda n, s: SimpleNamespace(run=lambda *a: None),
     )
     with pytest.raises(KeyError, match="not_a_host_value"):
@@ -3140,12 +3148,12 @@ def test_bind_stage_fails_closed_on_unknown_argument(monkeypatch):
 
 
 def test_bind_stage_records_tensor_slots(monkeypatch):
-    name = "cake_lm_head_loss_fake"
+    name = "cake_lm_head_det_loss_fake"
     monkeypatch.setitem(cake_jit.MODULES, name, _fake_record(_ROW_GRAD_PLAN))
     calls = []
     monkeypatch.setattr(
         cake_backend,
-        "load_cake_lm_head_loss_module",
+        "load_cake_lm_head_det_loss_module",
         lambda n, s: SimpleNamespace(run=lambda *a: calls.append(a)),
     )
     values = _row_grad_values()
@@ -3624,7 +3632,7 @@ def test_grad_weight_dtype_fp32():
     with pytest.raises(ValueError, match="W.dtype"):
         _run(inp, 64, grad_weight_dtype=torch.float32)
     with pytest.raises(ValueError, match="W.dtype"):
-        cake_backend.chunked_lm_head_loss(
+        cake_backend.chunked_lm_head_det_loss(
             inp.X,
             inp.W,
             inp.labels,
@@ -3738,7 +3746,7 @@ def test_retain_graph_repeated_backward():
     inp = _host_inputs(37, "policy")
     X = inp.X.detach().requires_grad_()
     W = inp.W.detach().requires_grad_()
-    loss = cake_backend.chunked_lm_head_loss(
+    loss = cake_backend.chunked_lm_head_det_loss(
         X,
         W,
         inp.labels,
@@ -3827,16 +3835,16 @@ def test_return_logp_detached():
     X = inp.X.detach().requires_grad_()
     W = inp.W.detach().requires_grad_()
     kw = dict(objective="ce", loss_div=inp.loss_div, chunk_size=16, backend="reference")
-    loss, logp = cake_backend.chunked_lm_head_loss(
+    loss, logp = cake_backend.chunked_lm_head_det_loss(
         X, W, inp.labels, return_logp=True, **kw
     )
     assert loss.requires_grad and loss.grad_fn is not None
     assert (
         not logp.requires_grad and logp.grad_fn is None and logp.dtype == torch.float32
     )
-    only = cake_backend.chunked_lm_head_loss(X, W, inp.labels, **kw)
+    only = cake_backend.chunked_lm_head_det_loss(X, W, inp.labels, **kw)
     assert isinstance(only, torch.Tensor) and torch.equal(only, loss.detach())
-    lp = cake_backend.chunked_lm_head_logprob(
+    lp = cake_backend.chunked_lm_head_det_logprob(
         X, W, inp.labels, chunk_size=16, backend="reference"
     )
     assert lp.requires_grad and torch.equal(lp.detach(), logp)
@@ -3846,9 +3854,9 @@ def test_zero_rows_return_zeros_without_binding(monkeypatch):
     def refuse(*args, **kwargs):
         raise AssertionError("a call without rows must neither bind nor launch")
 
-    monkeypatch.setattr(cake_backend, "prepare_lm_head_loss", refuse)
+    monkeypatch.setattr(cake_backend, "prepare_lm_head_det_loss", refuse)
     monkeypatch.setattr(cake_backend, "record_for", refuse)
-    monkeypatch.setattr(cake_backend, "load_cake_lm_head_loss_module", refuse)
+    monkeypatch.setattr(cake_backend, "load_cake_lm_head_det_loss_module", refuse)
     W = torch.zeros(V_HOST, H_HOST, dtype=torch.bfloat16, device=DEV)
     X0 = torch.zeros(0, H_HOST, dtype=torch.bfloat16, device=DEV)
     labels0 = torch.zeros(0, dtype=torch.int64, device=DEV)
@@ -3897,7 +3905,7 @@ def test_zero_rows_return_zeros_without_binding(monkeypatch):
                 loss_weights=torch.zeros(0, device=DEV),
             )
         )
-        loss, logp = cake_backend.chunked_lm_head_loss(
+        loss, logp = cake_backend.chunked_lm_head_det_loss(
             X, Wt, labels0, return_logp=True, backend="reference", **kw
         )
         assert (
@@ -3915,7 +3923,7 @@ def test_zero_rows_return_zeros_without_binding(monkeypatch):
         )
     X = X0.clone().requires_grad_()
     Wt = W.clone().requires_grad_()
-    lp = cake_backend.chunked_lm_head_logprob(X, Wt, labels0, backend="reference")
+    lp = cake_backend.chunked_lm_head_det_logprob(X, Wt, labels0, backend="reference")
     assert tuple(lp.shape) == (0,) and lp.dtype == torch.float32
     lp.sum().backward()
     assert tuple(X.grad.shape) == (0, H_HOST) and torch.all(Wt.grad == 0)
@@ -3955,7 +3963,7 @@ def test_all_ignored_rows(objective, entry):
 def test_noncontiguous_x_strides(ld_pad, copied):
     inp = _host_inputs(37, ld_pad=ld_pad)
     assert inp.X.stride() == (H_HOST + ld_pad, 1) and not inp.X.is_contiguous()
-    problem = validate_lm_head_inputs(
+    problem = validate_lm_head_det_inputs(
         inp.X, inp.W, inp.labels, objective="ce", loss_div=inp.loss_div
     )
     assert problem.x_copy is copied and problem.ld_x == (
@@ -4371,7 +4379,7 @@ def test_logprob_arm_switches_belong_to_the_logprob_entry():
     inp = _host_inputs(37)
     for kw in (dict(logprob_dz=True), dict(logprob_lbl=True)):
         with pytest.raises(ValueError, match="log-probability"):
-            prepare_lm_head_loss(
+            prepare_lm_head_det_loss(
                 inp.X,
                 inp.W,
                 inp.labels,
@@ -4380,7 +4388,7 @@ def test_logprob_arm_switches_belong_to_the_logprob_entry():
                 backend="reference",
                 **kw,
             )
-    runner = prepare_lm_head_loss(
+    runner = prepare_lm_head_det_loss(
         inp.X,
         inp.W,
         inp.labels,
@@ -4391,7 +4399,7 @@ def test_logprob_arm_switches_belong_to_the_logprob_entry():
         logprob_lbl=False,
     )
     assert not (runner.plan.logprob_dz or runner.plan.logprob_lbl)
-    runner = prepare_lm_head_loss(
+    runner = prepare_lm_head_det_loss(
         inp.X,
         inp.W,
         inp.labels,
@@ -4406,14 +4414,14 @@ def test_logprob_arm_switches_belong_to_the_logprob_entry():
     for name, fns in (
         (
             "logprob_lbl",
-            (cake_backend.forward_logprob, cake_backend.chunked_lm_head_logprob),
+            (cake_backend.forward_logprob, cake_backend.chunked_lm_head_det_logprob),
         ),
         (
             "logprob_dz",
-            (cake_backend.backward_logprob, cake_backend.chunked_lm_head_logprob),
+            (cake_backend.backward_logprob, cake_backend.chunked_lm_head_det_logprob),
         ),
     ):
-        for fn in (*fns, prepare_lm_head_loss):
+        for fn in (*fns, prepare_lm_head_det_loss):
             param = inspect.signature(fn).parameters[name]
             assert param.kind is inspect.Parameter.KEYWORD_ONLY
             assert param.default is None, (fn.__name__, name)
@@ -4430,7 +4438,7 @@ def test_hidden_count_eligibility_rules(monkeypatch, toolchain_check_uncached):
     base) and a toolchain whose sm_103a code runs it (not nvcc 13.0.x)."""
     monkeypatch.setattr(cake_build, "record_cuda_version", lambda arch: (13, 4))
     assert cake_backend.HIDDEN_COUNT_MIN_CHUNKS == 3
-    name = "cake_lm_head_loss_fake"
+    name = "cake_lm_head_det_loss_fake"
 
     def record(*stages):
         rec = _fake_record(_ROW_GRAD_PLAN)
@@ -4818,15 +4826,17 @@ def test_dx_finalize_plan_keys():
     common = dict(
         objective="ce", loss_div=inp.loss_div, chunk_size=16, backend="reference"
     )
-    on = prepare_lm_head_loss(inp.X, inp.W, inp.labels, dx_finalize=True, **common)
-    off = prepare_lm_head_loss(inp.X, inp.W, inp.labels, dx_finalize=False, **common)
+    on = prepare_lm_head_det_loss(inp.X, inp.W, inp.labels, dx_finalize=True, **common)
+    off = prepare_lm_head_det_loss(
+        inp.X, inp.W, inp.labels, dx_finalize=False, **common
+    )
     assert on.plan.dx_finalize and not off.plan.dx_finalize
     assert "slab_sum" not in on.stages and on.stages == off.stages
     assert ("scale_cast_bf16", "dx") in on.backward_order
     on.step(torch.tensor(3.0))
     off.step(torch.tensor(3.0))
     assert torch.equal(on.dx_out, off.dx_out) and torch.equal(on.dw_out, off.dw_out)
-    lp = prepare_lm_head_loss(
+    lp = prepare_lm_head_det_loss(
         inp.X,
         inp.W,
         inp.labels,
@@ -4996,7 +5006,7 @@ def test_dw_stream_schedule_keys():
     )
     results = []
     for value in (False, True):
-        runner = prepare_lm_head_loss(
+        runner = prepare_lm_head_det_loss(
             inp.X, inp.W, inp.labels, dw_stream=value, **common
         )
         assert runner.dw_stream == cake_backend.dw_stream_mode(value)
@@ -5038,10 +5048,10 @@ def test_fused_dw_cast_plan_and_stage_values():
     inp = _host_inputs(37)
     C = 16
     common = dict(objective="ce", loss_div=inp.loss_div, backend="reference")
-    fused = prepare_lm_head_loss(
+    fused = prepare_lm_head_det_loss(
         inp.X, inp.W, inp.labels, chunk_size=C, fuse_dw_cast=True, **common
     )
-    plain = prepare_lm_head_loss(
+    plain = prepare_lm_head_det_loss(
         inp.X, inp.W, inp.labels, chunk_size=C, fuse_dw_cast=False, **common
     )
     plan, t = fused.plan, fused.tensors
@@ -5095,7 +5105,7 @@ def test_fused_dw_cast_plan_and_stage_values():
         t["dw_acc"] + cake_backend._mm_fp32(v["A"].t(), v["B"]), plain.tensors["dw_acc"]
     )
     # one chunk: no FP32 [V, H] accumulator exists, the GEMM stores cast(g * tile)
-    one = prepare_lm_head_loss(
+    one = prepare_lm_head_det_loss(
         inp.X, inp.W, inp.labels, chunk_size=64, fuse_dw_cast=True, **common
     )
     assert one.plan.dw_deferred and not one.plan.dw_acc_needed and one.dw_acc is None
@@ -5107,7 +5117,7 @@ def test_fused_dw_cast_plan_and_stage_values():
     )
     v1 = stage_values("gemm_dw_cast_bf16", one.tensors, one.plan, 0)
     assert v1["WS"] is one.tensors["f32_dummy"] and v1["first_chunk"] == 1
-    one_plain = prepare_lm_head_loss(
+    one_plain = prepare_lm_head_det_loss(
         inp.X, inp.W, inp.labels, chunk_size=64, fuse_dw_cast=False, **common
     )
     one.step()
@@ -5116,7 +5126,7 @@ def test_fused_dw_cast_plan_and_stage_values():
         one.loss, one_plain.loss
     )
     # compacted FP32 dW: the last chunk's X rows are gathered again before the fused GEMM
-    cf = prepare_lm_head_loss(
+    cf = prepare_lm_head_det_loss(
         inp.X,
         inp.W,
         inp.labels,
@@ -5141,7 +5151,7 @@ def test_fused_dw_cast_plan_and_stage_values():
         vc["B"].data_ptr() == cf.tensors["x_c"].data_ptr()
         and vc["C"].dtype == torch.float32
     )
-    cp = prepare_lm_head_loss(
+    cp = prepare_lm_head_det_loss(
         inp.X,
         inp.W,
         inp.labels,
@@ -5155,7 +5165,7 @@ def test_fused_dw_cast_plan_and_stage_values():
     cp.step(torch.tensor(0.5))
     assert torch.equal(cf.dw_out, cp.dw_out) and torch.equal(cf.dx_out, cp.dx_out)
     # the log-probability entry runs the fused GEMM inside the recompute (its scale is the constant 1)
-    lp = prepare_lm_head_loss(
+    lp = prepare_lm_head_det_loss(
         inp.X,
         inp.W,
         inp.labels,
@@ -5174,7 +5184,7 @@ def test_fused_dw_cast_plan_and_stage_values():
         stage_values("gemm_dw_cast_bf16", lp.tensors, lp.plan, 2)["STATS_OUT"]
         is lp.tensors["unit_scale"]
     )
-    lpp = prepare_lm_head_loss(
+    lpp = prepare_lm_head_det_loss(
         inp.X,
         inp.W,
         inp.labels,
@@ -5211,7 +5221,7 @@ def test_fused_dw_cast_autograd_is_bitwise():
     for compact in (False, True):
         X = inp.X.detach().clone().requires_grad_(True)
         W = inp.W.detach().clone().requires_grad_(True)
-        loss = cake_backend.chunked_lm_head_loss(
+        loss = cake_backend.chunked_lm_head_det_loss(
             X,
             W,
             inp.labels,
@@ -5394,13 +5404,13 @@ def test_memory_report_compaction():
     with pytest.raises(ValueError, match="hidden"):
         workspace_layout(T_v, V, C, compact=True)
     assert (
-        lm_head_loss_workspace_size(
+        lm_head_det_loss_workspace_size(
             T, V, C, backend="reference", hidden=H, compact_rows=True
         )
         == workspace_layout(T, V, C, hidden=H, compact=True)["total"]
     )
     with pytest.raises(ValueError, match="hidden"):
-        lm_head_loss_workspace_size(T, V, C, backend="reference", compact_rows=True)
+        lm_head_det_loss_workspace_size(T, V, C, backend="reference", compact_rows=True)
 
 
 COMPACTION_CASES = [("ce", "loss"), ("policy", "loss"), ("ce", "logprob")]
@@ -5510,7 +5520,7 @@ def test_compacted_runner_binds_the_valid_rows():
     inp = _host_inputs(T, "policy", ignore_frac=0.5)
     idx = cake_backend.valid_row_index(inp.labels)
     T_v = int(idx.numel())
-    runner = prepare_lm_head_loss(
+    runner = prepare_lm_head_det_loss(
         inp.X,
         inp.W,
         inp.labels,
@@ -5602,7 +5612,7 @@ def test_compacted_runner_binds_the_valid_rows():
             0,
         )
     # the log-probability runner gathers the caller's [T] dlogp at the start of its backward
-    lp = prepare_lm_head_loss(
+    lp = prepare_lm_head_det_loss(
         inp.X,
         inp.W,
         inp.labels,
@@ -5631,7 +5641,7 @@ def test_compacted_runner_binds_the_valid_rows():
     )
     # a runner cannot be prepared over no valid rows; a mismatching index is rejected
     with pytest.raises(ValueError, match="valid row"):
-        prepare_lm_head_loss(
+        prepare_lm_head_det_loss(
             inp.X,
             inp.W,
             torch.full_like(inp.labels, IGNORE_INDEX),
@@ -5642,7 +5652,7 @@ def test_compacted_runner_binds_the_valid_rows():
             compact_rows=True,
         )
     with pytest.raises(ValueError, match="int64"):
-        prepare_lm_head_loss(
+        prepare_lm_head_det_loss(
             inp.X,
             inp.W,
             inp.labels,
@@ -5661,7 +5671,7 @@ def test_all_ignored_rows_compacted_return_zeros_without_binding(entry, monkeypa
             "a call whose every row is ignored must neither bind nor launch"
         )
 
-    monkeypatch.setattr(cake_backend, "prepare_lm_head_loss", refuse)
+    monkeypatch.setattr(cake_backend, "prepare_lm_head_det_loss", refuse)
     monkeypatch.setattr(cake_backend, "record_for", refuse)
     inp = _host_inputs(37, ignore_frac=1.0)
     cache = cake_backend.BINDING_CACHE
@@ -5750,7 +5760,7 @@ def _loss_graph(inp, C=16, **kw):
     W = inp.W.detach().requires_grad_()
     if not _OPT_IN_KEYWORDS & kw.keys():
         kw["num_valid_rows"] = int(inp.valid.sum())
-    loss = opt_in.chunked_lm_head_loss(
+    loss = opt_in.chunked_lm_head_det_loss(
         X,
         W,
         inp.labels,
@@ -5911,7 +5921,7 @@ def test_backward_releases_the_saved_state():
     # a frozen W: the dX-only backward releases as well
     inp = _host_inputs(37)
     X = inp.X.detach().requires_grad_()
-    loss = opt_in.chunked_lm_head_loss(
+    loss = opt_in.chunked_lm_head_det_loss(
         X,
         inp.W,
         inp.labels,
@@ -5958,9 +5968,9 @@ def test_default_call_is_the_backend_entry():
     inp = _host_inputs(37)
     n = int(inp.valid.sum())
     for kw, cls in (
-        ({}, cake_backend.ChunkedLmHeadLossFunction),
-        (dict(memory_mode="fast"), cake_backend.ChunkedLmHeadLossFunction),
-        (dict(num_valid_rows=n), opt_in.ChunkedLmHeadLossFunction),
+        ({}, cake_backend.ChunkedLmHeadDetLossFunction),
+        (dict(memory_mode="fast"), cake_backend.ChunkedLmHeadDetLossFunction),
+        (dict(num_valid_rows=n), opt_in.ChunkedLmHeadDetLossFunction),
     ):
         X, W, loss = _loss_graph(inp, **(kw or dict(memory_mode=None)))
         assert loss.grad_fn._forward_cls is cls, kw
@@ -5972,7 +5982,7 @@ def test_default_call_is_the_backend_entry():
         with pytest.raises(ValueError, match="needs num_valid_rows"):
             _loss_graph(inp, memory_mode=mode, check_num_valid_rows=True)
         with pytest.raises(ValueError, match="needs num_valid_rows"):
-            opt_in.chunked_lm_head_logprob(
+            opt_in.chunked_lm_head_det_logprob(
                 inp.X,
                 inp.W,
                 inp.labels,
@@ -5982,11 +5992,11 @@ def test_default_call_is_the_backend_entry():
                 check_num_valid_rows=True,
             )
     for kw, cls in (
-        ({}, cake_backend.ChunkedLmHeadLogprobFunction),
-        (dict(memory_mode="fast"), cake_backend.ChunkedLmHeadLogprobFunction),
-        (dict(num_valid_rows=n), opt_in.ChunkedLmHeadLogprobFunction),
+        ({}, cake_backend.ChunkedLmHeadDetLogprobFunction),
+        (dict(memory_mode="fast"), cake_backend.ChunkedLmHeadDetLogprobFunction),
+        (dict(num_valid_rows=n), opt_in.ChunkedLmHeadDetLogprobFunction),
     ):
-        logp = opt_in.chunked_lm_head_logprob(
+        logp = opt_in.chunked_lm_head_det_logprob(
             inp.X.detach().requires_grad_(),
             inp.W,
             inp.labels,
@@ -5998,12 +6008,12 @@ def test_default_call_is_the_backend_entry():
 
 
 def test_template_only_runner_never_launches():
-    """The opt-in module's ``prepare_lm_head_loss(_template_only=True)`` (its eager entry points' binding build, whose
+    """The opt-in module's ``prepare_lm_head_det_loss(_template_only=True)`` (its eager entry points' binding build, whose
     buffers alias one another) takes the ``cake`` backend only, and a template-only runner refuses to launch."""
     inp = _host_inputs(37)
     common = dict(objective="ce", loss_div=inp.loss_div, chunk_size=16)
     with pytest.raises(ValueError, match="template-only"):
-        opt_in.prepare_lm_head_loss(
+        opt_in.prepare_lm_head_det_loss(
             inp.X,
             inp.W,
             inp.labels,
@@ -6011,7 +6021,7 @@ def test_template_only_runner_never_launches():
             _template_only=True,
             **common,
         )
-    runner = opt_in.prepare_lm_head_loss(
+    runner = opt_in.prepare_lm_head_det_loss(
         inp.X, inp.W, inp.labels, backend="reference", **common
     )
     assert runner._template_only is False
@@ -6594,7 +6604,7 @@ def test_device_grad_weight_dtype_fp32(glm_weight):
     inp = _device_inputs(4097, W=glm_weight)
     bf16 = _run(inp, 4096, backend="cake")
     with pytest.raises(ValueError, match="W.dtype"):
-        cake_backend.chunked_lm_head_loss(
+        cake_backend.chunked_lm_head_det_loss(
             inp.X.detach().requires_grad_(),
             inp.W,
             inp.labels,
@@ -6778,7 +6788,7 @@ def test_device_binding_cache_hits_are_bitwise_and_pin_nothing(glm_weight):
 def test_device_runner_launches_without_allocation(glm_weight):
     _require_program(entry="loss")
     inp = _device_inputs(4097, "policy", W=glm_weight)
-    runner = prepare_lm_head_loss(
+    runner = prepare_lm_head_det_loss(
         inp.X,
         inp.W,
         inp.labels,
@@ -6835,8 +6845,8 @@ def test_device_compaction_parity(glm_weight):
     assert rel_l2(compact["dW"].float(), plain["dW"].float()) <= GATE_TINY["dW_rel_l2"]
     assert torch.allclose(compact["loss"], plain["loss"], rtol=1e-5, atol=1e-6)
     kw = dict(objective="ce", loss_div=inp.loss_div, chunk_size=4096, backend="cake")
-    rc = prepare_lm_head_loss(inp.X, inp.W, inp.labels, compact_rows=True, **kw)
-    rp = prepare_lm_head_loss(inp.X, inp.W, inp.labels, compact_rows=False, **kw)
+    rc = prepare_lm_head_det_loss(inp.X, inp.W, inp.labels, compact_rows=True, **kw)
+    rp = prepare_lm_head_det_loss(inp.X, inp.W, inp.labels, compact_rows=False, **kw)
     assert (
         rc.plan.compact
         and rc.plan.rows == T_v
@@ -6942,11 +6952,11 @@ def test_device_dw_stream_switch_is_bitwise(glm_weight, monkeypatch):
         backend="cake",
         compact_rows=True,
     )
-    runner = prepare_lm_head_loss(three.X, three.W, three.labels, **kw)
+    runner = prepare_lm_head_det_loss(three.X, three.W, three.labels, **kw)
     assert runner.plan.num_chunks == 3 and runner.dw_stream == "auto"
     steps = {}
     for env, expect in (("0", 1), ("auto", 2), ("1", 2)):
-        runner.dw_stream = env  # the mode of the following launches (``dw_stream`` of prepare_lm_head_loss)
+        runner.dw_stream = env  # the mode of the following launches (``dw_stream`` of prepare_lm_head_det_loss)
         streams.clear()
         runner.step()
         torch.cuda.synchronize()
@@ -6968,12 +6978,12 @@ import sys, torch
 sys.path.insert(0, {root!r})
 from tests.test_helpers.cake_lm_head_loss_reference import make_inputs
 from tests.test_helpers.cake_package import cake_package
-cake_backend = cake_package("cake_lm_head_loss", "cake_backend")
+cake_backend = cake_package("cake_lm_head_det_loss", "cake_backend")
 W = make_inputs(1, seed={seed_w}, device="cuda", ignore_frac=0.0).W  # the module fixture's weight
 inp = make_inputs({T}, seed={seed}, device="cuda", W=W, ignore_frac=0.05)
 X = inp.X.detach().requires_grad_(True)
 W = inp.W.detach().requires_grad_(True)
-logp = cake_backend.chunked_lm_head_logprob(X, W, inp.labels, chunk_size={C}, backend="cake")
+logp = cake_backend.chunked_lm_head_det_logprob(X, W, inp.labels, chunk_size={C}, backend="cake")
 dX, dW = torch.autograd.grad(logp, (X, W), inp.dlogp)
 torch.cuda.synchronize()
 torch.save(dict(logp=logp.detach().cpu(), dX=dX.cpu(), dW=dW.cpu()), {out!r})
@@ -6992,7 +7002,7 @@ def test_device_logprob_grad_from_fresh_thread_and_process(glm_weight, tmp_path)
     def grad_path():
         X = inp.X.detach().requires_grad_(True)
         W = inp.W.detach().requires_grad_(True)
-        logp = cake_backend.chunked_lm_head_logprob(
+        logp = cake_backend.chunked_lm_head_det_logprob(
             X, W, inp.labels, chunk_size=C, backend="cake"
         )
         dX, dW = torch.autograd.grad(logp, (X, W), inp.dlogp)
@@ -7049,7 +7059,7 @@ def test_device_memory_rule(glm_weight):
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats()
     base = torch.cuda.memory_allocated()
-    runner = prepare_lm_head_loss(
+    runner = prepare_lm_head_det_loss(
         inp.X,
         inp.W,
         inp.labels,
@@ -7152,7 +7162,7 @@ def test_device_fused_dw_cast_is_bitwise(glm_weight):
         assert torch.equal(plain[key], fused[key]), key
     # the prepared runner: the deferred chunk's dz stays in the workspace between forward() and backward()
     workspace = torch.empty(
-        cake_backend.lm_head_loss_workspace_size(
+        cake_backend.lm_head_det_loss_workspace_size(
             inp.T, inp.V, 2048, inp.X.device, hidden=inp.H, compact_rows=True
         ),
         dtype=torch.uint8,
@@ -7163,7 +7173,7 @@ def test_device_fused_dw_cast_is_bitwise(glm_weight):
     sparse_labels = torch.full_like(inp.labels, IGNORE_INDEX)
     for keep in (1, 3, 129, 2047, 2049, min(inp.T, 3591)):
         sparse_labels[:keep] = inp.labels[:keep].clamp(min=0)  # valid rows only
-        cake_backend.prepare_lm_head_loss(
+        cake_backend.prepare_lm_head_det_loss(
             inp.X,
             inp.W,
             sparse_labels,
@@ -7175,7 +7185,7 @@ def test_device_fused_dw_cast_is_bitwise(glm_weight):
             compact_rows=True,
             fuse_dw_cast=True,
         )
-    runner = cake_backend.prepare_lm_head_loss(
+    runner = cake_backend.prepare_lm_head_det_loss(
         inp.X,
         inp.W,
         inp.labels,
@@ -7385,7 +7395,7 @@ def test_device_dx_finalize_is_bitwise(glm_weight, monkeypatch):
         )
         compacted = int(inp.valid.sum()) < inp.T
         # whether this device's plan slices some dX GEMM of the 4096-row chunk loop (the plan decides from the SM count)
-        probe = prepare_lm_head_loss(
+        probe = prepare_lm_head_det_loss(
             inp.X,
             inp.W,
             inp.labels,
@@ -7466,7 +7476,9 @@ def test_device_dx_finalize_is_bitwise(glm_weight, monkeypatch):
     common = dict(
         objective="ce", loss_div=inp.loss_div, chunk_size=4096, backend="cake"
     )
-    runner = prepare_lm_head_loss(inp.X, inp.W, inp.labels, dx_finalize=True, **common)
+    runner = prepare_lm_head_det_loss(
+        inp.X, inp.W, inp.labels, dx_finalize=True, **common
+    )
     plan = runner.plan
     sliced = [i for i in range(plan.num_chunks) if plan.dx_slices_of(i) > 1]
     assert sliced and all(("slab_sum", i) in runner.launches for i in sliced)
@@ -7488,7 +7500,9 @@ def test_device_dx_finalize_is_bitwise(glm_weight, monkeypatch):
             1,
             1,
         )
-    plain = prepare_lm_head_loss(inp.X, inp.W, inp.labels, dx_finalize=False, **common)
+    plain = prepare_lm_head_det_loss(
+        inp.X, inp.W, inp.labels, dx_finalize=False, **common
+    )
     assert "slab_sum" not in plain.stages and all(
         ("dx_reduce", i) in plain.values for i in sliced
     )
@@ -7543,7 +7557,7 @@ def test_device_hidden_count_kernels_match_torch(glm_weight):
         inp = make_inputs(
             T, seed=SEED + 62 + T, device=CUDA, W=glm_weight, ignore_frac=ignore
         )
-        problem = validate_lm_head_inputs(
+        problem = validate_lm_head_det_inputs(
             inp.X, inp.W, inp.labels, chunk_size=C, entry="logprob"
         )
         assert cake_backend.hidden_count_eligible(
@@ -7578,7 +7592,7 @@ def test_device_hidden_count_kernels_match_torch(glm_weight):
         # the shipped host-bound GEMM over chunk 0's rows (the log-probability forward of the stored-logits form,
         # ``logprob_lbl=False``, keeps the logits intact); an explicit index also when every row is valid: the call has
         # several chunks and only chunk 0 is compared
-        runner = prepare_lm_head_loss(
+        runner = prepare_lm_head_det_loss(
             inp.X,
             inp.W,
             inp.labels,
@@ -8015,7 +8029,7 @@ def test_device_logprob_backward_does_not_synchronize(glm_weight):
         X = inp.X.detach().requires_grad_(True)
         W = inp.W.detach().requires_grad_(True)
         for i in range(2):
-            logp = cake_backend.chunked_lm_head_logprob(
+            logp = cake_backend.chunked_lm_head_det_logprob(
                 X, W, inp.labels, chunk_size=C, backend="cake", compact_rows=compact
             )
             torch.cuda.synchronize()
@@ -8171,7 +8185,7 @@ def _budget_step(inp, C, entry, **kw):
     base = torch.cuda.memory_allocated()
     mplan = None
     if entry == "loss":
-        loss, logp = opt_in.chunked_lm_head_loss(
+        loss, logp = opt_in.chunked_lm_head_det_loss(
             X,
             W,
             inp.labels,
@@ -8188,7 +8202,7 @@ def _budget_step(inp, C, entry, **kw):
         loss.backward()
         loss = loss.detach()
     else:
-        logp = opt_in.chunked_lm_head_logprob(
+        logp = opt_in.chunked_lm_head_det_logprob(
             X, W, inp.labels, chunk_size=C, backend="cake", **kw
         )
         logp.backward(inp.dlogp)
@@ -8503,7 +8517,7 @@ def test_device_check_num_valid_rows_checks_every_path(glm_weight, monkeypatch, 
                 torch.cuda.set_sync_debug_mode("error")
                 try:
                     if entry == "loss":
-                        opt_in.chunked_lm_head_loss(
+                        opt_in.chunked_lm_head_det_loss(
                             X,
                             W,
                             inp.labels,
@@ -8515,7 +8529,7 @@ def test_device_check_num_valid_rows_checks_every_path(glm_weight, monkeypatch, 
                             **kw,
                         )
                     else:
-                        opt_in.chunked_lm_head_logprob(X, W, inp.labels, **kw)
+                        opt_in.chunked_lm_head_det_logprob(X, W, inp.labels, **kw)
                 finally:
                     torch.cuda.set_sync_debug_mode("default")
                 torch.cuda.synchronize()
@@ -8633,7 +8647,7 @@ def test_device_given_count_is_bitwise_and_does_not_synchronize(glm_weight):
                 torch.cuda.synchronize()
                 torch.cuda.set_sync_debug_mode("error")
                 try:
-                    loss = opt_in.chunked_lm_head_loss(
+                    loss = opt_in.chunked_lm_head_det_loss(
                         X,
                         W,
                         inp.labels,
@@ -8663,7 +8677,7 @@ def test_device_given_count_is_bitwise_and_does_not_synchronize(glm_weight):
         torch.cuda.synchronize()
         torch.cuda.set_sync_debug_mode("error")
         try:
-            opt_in.chunked_lm_head_logprob(
+            opt_in.chunked_lm_head_det_logprob(
                 inp.X,
                 inp.W,
                 inp.labels,
@@ -8680,7 +8694,7 @@ _WRONG_COUNT_SCRIPT = """
 import sys, torch
 sys.path.insert(0, {root!r})
 from tests.test_helpers.cake_package import cake_package
-opt_in = cake_package("cake_lm_head_loss", "cake_backend_opt_in")
+opt_in = cake_package("cake_lm_head_det_loss", "cake_backend_opt_in")
 labels = torch.tensor([0, -100, 3, 1, -100, 2], device="cuda")
 index, _ = opt_in.given_valid_rows(labels, 4)
 torch.cuda.synchronize()

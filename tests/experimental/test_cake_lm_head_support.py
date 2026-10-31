@@ -46,10 +46,10 @@ from tests.test_helpers.cake_lm_head_support_reference import (
 )
 from tests.test_helpers.cake_package import cake_package
 
-cake_support = cake_package("cake_lm_head_loss", "cake_support")
-cake_backend = cake_package("cake_lm_head_loss", "cake_backend")
-support_logprob = cake_support.chunked_lm_head_support_logprob
-support_kl = cake_support.chunked_lm_head_support_kl
+cake_support = cake_package("cake_lm_head_det_loss", "cake_support")
+cake_backend = cake_package("cake_lm_head_det_loss", "cake_backend")
+support_logprob = cake_support.chunked_lm_head_det_support_logprob
+support_kl = cake_support.chunked_lm_head_det_support_kl
 Engine = cake_support.SupportReferenceEngine
 SupportRows = cake_support.SupportRows
 NO_ERROR = cake_support.NO_ERROR
@@ -1267,14 +1267,14 @@ def test_device_assert_ends_the_context(what):
         f"""
         import torch
         from tests.test_helpers.cake_package import cake_package
-        cs = cake_package("cake_lm_head_loss", "cake_support")
+        cs = cake_package("cake_lm_head_det_loss", "cake_support")
         X = torch.zeros(4, 256, dtype=torch.bfloat16, device="cuda")
         W = torch.zeros(512, 256, dtype=torch.bfloat16, device="cuda")
         ids = torch.tensor([1, 2, 3, 4], device="cuda")
         off = torch.tensor([0, 4, 4, 4, 4], device="cuda") if "{what}" == "support" else torch.tensor(
             [0, 1, 2, 3, 4], device="cuda")
         tau = torch.tensor([1.0, 0.0, 1.0, 1.0], device="cuda") if "{what}" == "temperature" else 1.0
-        out = cs.chunked_lm_head_support_logprob(X, W, ids, off, k_cap=2, temperature=tau, backend="reference")
+        out = cs.chunked_lm_head_det_support_logprob(X, W, ids, off, k_cap=2, temperature=tau, backend="reference")
         print("QUEUED", flush=True)
         torch.cuda.synchronize()
         print("NO_ASSERT", flush=True)
@@ -1695,7 +1695,7 @@ def test_cake_device_assert_ends_the_context(what):
         f"""
         import torch
         from tests.test_helpers.cake_package import cake_package
-        cs = cake_package("cake_lm_head_loss", "cake_support")
+        cs = cake_package("cake_lm_head_det_loss", "cake_support")
         T = 0 if "{what}" == "first offset" else 4
         X = torch.zeros(T, 256, dtype=torch.bfloat16, device="cuda")
         W = torch.zeros(512, 256, dtype=torch.bfloat16, device="cuda")
@@ -1703,7 +1703,7 @@ def test_cake_device_assert_ends_the_context(what):
         off = {{"support": [0, 4, 4, 4, 4], "temperature": [0, 1, 2, 3, 4], "first offset": [3]}}["{what}"]
         off = torch.tensor(off, device="cuda")
         tau = torch.tensor([1.0, 0.0, 1.0, 1.0], device="cuda") if "{what}" == "temperature" else 1.0
-        out = cs.chunked_lm_head_support_logprob(X, W, ids, off, k_cap=2, temperature=tau, backend="cake")
+        out = cs.chunked_lm_head_det_support_logprob(X, W, ids, off, k_cap=2, temperature=tau, backend="cake")
         print("QUEUED", flush=True)
         torch.cuda.synchronize()
         print("NO_ASSERT", flush=True)
@@ -1863,7 +1863,10 @@ def test_public_support_entries():
 
     import flashinfer.chunked_lm_head as public
 
-    for name in ("chunked_lm_head_support_logprob", "chunked_lm_head_support_kl"):
+    for name in (
+        "chunked_lm_head_det_support_logprob",
+        "chunked_lm_head_det_support_kl",
+    ):
         fn = getattr(public, name)
         assert fn.is_experimental is True
         assert "SM100" in fn.__doc__
@@ -1875,9 +1878,9 @@ def test_public_support_entries():
             assert outer[p].default == inner[p].default, (name, p)
     X, W, ids, off = _base()
     with pytest.raises(ValueError, match="backend"):
-        public.chunked_lm_head_support_logprob(X, W, ids, off, k_cap=3, backend=REF)
+        public.chunked_lm_head_det_support_logprob(X, W, ids, off, k_cap=3, backend=REF)
     with pytest.raises(ValueError, match="use backend='reference'"):
-        public.chunked_lm_head_support_logprob(X, W, ids, off, k_cap=3)
+        public.chunked_lm_head_det_support_logprob(X, W, ids, off, k_cap=3)
 
 
 def test_cake_public_entries_match_the_backend():
@@ -1886,10 +1889,10 @@ def test_cake_public_entries_match_the_backend():
 
     inp = cuda_inputs(100, k_cap=16, labels=True, teacher=True, tau_form="hetero")
     args = (inp.X, inp.W, inp.support_ids, inp.support_offsets)
-    a = public.chunked_lm_head_support_logprob(*args, inp.labels, **inp.kwargs())
+    a = public.chunked_lm_head_det_support_logprob(*args, inp.labels, **inp.kwargs())
     b = support_logprob(*args, inp.labels, backend="cake", **inp.kwargs())
     assert torch.equal(a.view(torch.int32), b.view(torch.int32))
-    ka, la = public.chunked_lm_head_support_kl(
+    ka, la = public.chunked_lm_head_det_support_kl(
         *args, inp.teacher, return_logprobs=True, **inp.kwargs()
     )
     kb, lb = support_kl(
