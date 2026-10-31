@@ -1947,7 +1947,9 @@ __global__ FLASHINFER_SAMPLING_LAUNCH_BOUNDS(BLOCK_THREADS) void ChainSpeculativ
     float q = target_probs[(row_idx * (num_speculative_tokens + 1) + i) * d + draft_id],
           p = draft_probs[(row_idx * num_speculative_tokens + i) * d + draft_id];
     float u = curand_uniform(&curand_state);
-    if (u * p < q) {
+    // The first rejected position was already sampled by the prefix loop. Consume this
+    // draw to preserve the correction-sampling RNG sequence, but do not count it twice.
+    if (i != pos && u * p < q) {
       ++accepted_token_num;
     }
   }
