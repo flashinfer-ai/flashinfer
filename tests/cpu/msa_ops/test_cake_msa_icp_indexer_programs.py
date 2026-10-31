@@ -1121,6 +1121,27 @@ def test_load_and_run_follow_the_given_device(monkeypatch) -> None:
     assert entered == [1] and len(resident_on) == 1
 
 
+def test_load_refuses_residency_under_capture(monkeypatch) -> None:
+    """A program loaded on one device but not yet resident on the capturing
+    device is refused under CUDA Graph capture, before any residency call."""
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 1)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+
+    def refuse(*args):
+        raise AssertionError("made resident during capture")
+
+    monkeypatch.setattr(cake_jit, "_make_resident", refuse)
+    name = next(iter(cake_jit.MODULES))
+    module = types.SimpleNamespace()
+    monkeypatch.setattr(cake_jit, "_LOADED", {(name, "sm_103a"): module})
+    monkeypatch.setattr(cake_jit, "_RESIDENT", {(name, 0)})
+    with pytest.raises(RuntimeError, match="not resident on device 1"):
+        cake_jit.load(name, "sm_103a")
+    # Resident on the capturing device: returned without a residency call.
+    cake_jit._RESIDENT.add((name, 1))
+    assert cake_jit.load(name, "sm_103a") is module
+
+
 def test_select_prefill_rejects_invalid_metadata(fake) -> None:
     e = msa_ops.msa_icp_topk_select_prefill
     a = select_prefill_args()

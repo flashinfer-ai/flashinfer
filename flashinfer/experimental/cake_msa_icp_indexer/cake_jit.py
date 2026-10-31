@@ -2225,9 +2225,9 @@ def load(name: str, arch: str, device_index: int | None = None) -> Any:
     prebuilt ``aot/`` library when a builder compiled it, else FlashInfer's JIT
     build of the same sources and flags, with its kernel resident in the
     context of device ``device_index`` (default: the current device;
-    :func:`_make_resident`).  Under CUDA Graph capture on that device an
-    unloaded program is refused before any build (call ``warmup`` on every
-    rank first)."""
+    :func:`_make_resident`).  Under CUDA Graph capture on that device a
+    program not yet resident there is refused before any build or residency
+    call (call ``warmup`` on every rank first)."""
     import torch
 
     current = torch.cuda.current_device()
@@ -2240,12 +2240,12 @@ def load(name: str, arch: str, device_index: int | None = None) -> Any:
         # device's stream and context: run them on ``device_index``.
         with torch.cuda.device(device):
             return load(name, arch, device)
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError(
+            f"Cake MSA ICP indexer program {name} for {arch} is not resident on "
+            f"device {device}; warm it up before CUDA Graph capture"
+        )
     if module is None:
-        if torch.cuda.is_current_stream_capturing():
-            raise RuntimeError(
-                f"Cake MSA ICP indexer program {name} for {arch} is not loaded; "
-                "warm it up before CUDA Graph capture"
-            )
         from . import cake_build
 
         module = cake_build.load_library(library_name(name, arch))
