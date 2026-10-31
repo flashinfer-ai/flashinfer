@@ -56,7 +56,9 @@ Dispatch (one row per call; "warns" is a ``UserWarning`` once per entry point)::
 
 The mode of :func:`cake_grouped_mm` is fixed at its forward call: the backward
 runs the package the forward chose (a non-reentrant activation-checkpoint
-replay re-runs the same forward, bitwise).  Called directly, the package
+replay that recomputes the forward gives the same bits; with early stop on,
+the non-deterministic package's replay may skip its forward GEMM, as a
+built-in op's does).  Called directly, the package
 ``flashinfer.experimental.cake.cake_moe_grouped_gemm`` accepts only
 ``deterministic=False`` and, under torch's deterministic mode, its weight
 gradient raises PyTorch's non-determinism alert (a ``RuntimeError``, or a
