@@ -150,6 +150,10 @@ def test_backward_repeats_dx_bitwise_dweight_within_budget(
     _assert_within(
         dx_det, dx_ref[p.l2g], atol=Y_ATOL, rtol=Y_RTOL, label="dx vs FP64 oracle"
     )
+    # The independent reference for this package's own dx too (one rank: the whole pack, in local order).
+    _assert_within(
+        dx, dx_ref[p.l2g], atol=Y_ATOL, rtol=Y_RTOL, label="non-det dx vs FP64 oracle"
+    )
     print(f"{name}: {REPEATS} launches, worst dweight |err|/budget vs FP64 {worst_ref:.3f}, vs det {worst_det:.3f}, "
           f"{len(patterns)} distinct dweight bit patterns")  # fmt: skip
     record_property("repeats", REPEATS)
@@ -198,6 +202,34 @@ def test_rejects_mismatched_context_and_keeps_the_kcp_contract():
         conv_kcp.cake_causal_conv1d_forward_kcp(
             p.x_local, p.w, p.ctx, bias=torch.zeros(p.C, device=device)
         )
+
+
+def test_fp32_dweight_must_be_16_byte_aligned():
+    """The KCP backward stores one channel's four FP32 ``dweight`` taps with one 16-byte store: a ``dweight`` off
+    the 16-byte grid is refused (``ValueError``) before anything launches; a 16-byte aligned view inside a larger
+    buffer is written (``dx`` the direct call's bits, ``dweight`` within budget of its FP64 oracle)."""
+
+    device = torch.device("cuda")
+    p = _problem((5000, 1003), (1, 2, 4997, 1003), 512, device)
+    _, hist = _fwd(p.x_local, p.w, p.ctx)
+    dx_direct, _ = _bwd(p.x_local, p.w, p.ctx, p.dy_local, hist)
+    _, _, dw_ref = _reference(p.x, p.w, p.cu, p.dy)
+    n = p.C * WIDTH
+    buf = torch.zeros(n + 4, dtype=torch.float32, device=device)
+    for offset in (1, 2, 3):
+        misaligned = buf[offset : offset + n].view(p.C, WIDTH)
+        assert misaligned.data_ptr() % 16 != 0
+        with pytest.raises(ValueError, match="16-byte aligned"):
+            _bwd(p.x_local, p.w, p.ctx, p.dy_local, hist, dweight=misaligned)
+    torch.cuda.synchronize()
+    assert int(torch.count_nonzero(buf)) == 0
+    held = _stream_workspace()
+    assert held is None or int(torch.count_nonzero(held)) == 0
+    aligned = buf[4:].view(p.C, WIDTH)
+    dx, dw = _bwd(p.x_local, p.w, p.ctx, p.dy_local, hist, dweight=aligned)
+    assert dw is aligned
+    assert torch.equal(_bits(dx), _bits(dx_direct))
+    _dw_within(dw, dw_ref, "16-byte aligned dweight view vs FP64 oracle")
 
 
 def test_kcp_plans_with_the_legacy_tile_rule(monkeypatch):

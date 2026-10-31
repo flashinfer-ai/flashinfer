@@ -81,7 +81,8 @@ CHANNELS = (
     4096,
     8192,
 )
-TOKENS = (1, 1000, 65536, 98304, 147456, 250340)
+# 262143 / 262144: both sides of the sm_107a token-floored backward program's floor.
+TOKENS = (1, 1000, 65536, 98304, 147456, 250340, 262143, 262144)
 
 
 @contextmanager

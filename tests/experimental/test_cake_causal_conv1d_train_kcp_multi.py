@@ -36,7 +36,11 @@ from tests.test_cake_causal_conv1d_det_train_kcp import (
     DW_ATOL,
     DW_RTOL,
     WIDTH,
+    Y_ATOL,
+    Y_RTOL,
+    _assert_within,
     _context,
+    _reference,
 )
 from tests.test_cake_causal_conv1d_det_train_kcp_multi import MROWS, _problem, _same
 from tests.test_helpers.cake_causal_conv1d_early_render import apply_to_package
@@ -118,6 +122,37 @@ def test_multi_matches_single_calls(name, lens, cuts, Cs) -> None:
         assert ys2[i] is outs[i] and dxs2[i] is dx_o[i] and dws2[i] is dw_o[i]
         assert _same(outs[i], r["y"]) and _same(dx_o[i], r["dx"])
         _close(dw_o[i], r["dw"], f"{name} {i} caller-owned dweight")
+
+
+@pytest.mark.parametrize("name,lens,cuts,Cs", MROWS, ids=[r[0] for r in MROWS])
+def test_multi_matches_the_fp64_reference(name, lens, cuts, Cs) -> None:
+    """One rank (W = 1), an independent reference per tensor: ``y`` and ``dx`` within one BF16 ulp of the global
+    FP64 oracle of the pack (the KCP SiLU' policy; the rank's local tokens mapped to the global ones) and
+    ``dweight`` within the package budget of the FP64 ``dweight``."""
+
+    device = torch.device("cuda")
+    ctx, xs, ws, dys = _problem(lens, cuts, Cs, device)
+    _, S, cu_global, frags = _context(lens, cuts, device)
+    l2g = torch.tensor(
+        [cu_global[d] + off + t for d, off, ln in frags for t in range(ln)],
+        dtype=torch.int64,
+        device=device,
+    )
+    assert l2g.numel() == S and int(torch.unique(l2g).numel()) == S
+    cu = torch.tensor(cu_global, dtype=torch.int32, device=device)
+    ys, hists = conv_kcp.cake_causal_conv1d_multi_forward_kcp(xs, ws, ctx, **NONDET)
+    dxs, dws = conv_kcp.cake_causal_conv1d_multi_backward_kcp(
+        xs, ws, ctx, dys, hists, **NONDET
+    )
+    torch.cuda.synchronize()
+    for i in range(len(Cs)):
+        x_g, dy_g = torch.empty_like(xs[i]), torch.empty_like(dys[i])
+        x_g[l2g], dy_g[l2g] = xs[i], dys[i]
+        y_ref, dx_ref, dw_ref = _reference(x_g, ws[i], cu, dy_g)
+        label = f"{name} tensor {i} (C={Cs[i]})"
+        _assert_within(ys[i], y_ref[l2g], atol=Y_ATOL, rtol=Y_RTOL, label=f"y vs FP64 {label}")
+        _assert_within(dxs[i], dx_ref[l2g], atol=Y_ATOL, rtol=Y_RTOL, label=f"dx vs FP64 {label}")
+        _assert_within(dws[i], dw_ref, atol=DW_ATOL, rtol=DW_RTOL, label=f"dweight vs FP64 {label}")
 
 
 @pytest.mark.parametrize("name,lens,cuts,Cs", MROWS, ids=[r[0] for r in MROWS])

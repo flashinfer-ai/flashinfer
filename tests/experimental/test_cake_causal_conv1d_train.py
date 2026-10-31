@@ -81,6 +81,7 @@ CASES = (
     (1, 128, None),
     (5, 136, (2, 0, 3)),
     (63, 384, (1, 2, 3, 57)),
+    (64, 128, None),
     (65, 256, (64, 1)),
     (1000, 512, "perf"),
     (1000, 256, (27,) * 37 + (1,)),
@@ -88,7 +89,9 @@ CASES = (
     (4097, 2048, (1000, 0, 3, 3094)),
     (4097, 768, (1000, 0, 3, 3094)),
     (5, 512, (2, 0, 3)),
+    (5, 1024, (2, 0, 3)),
     (4097, 1280, (1000, 0, 3, 3094)),
+    (5, 1280, (2, 0, 3)),
     (5, 1536, (2, 0, 3)),
     (4097, 2560, (1000, 0, 3, 3094)),
     (4097, 1160, (1000, 0, 3, 3094)),
@@ -110,6 +113,9 @@ REPEAT_CASES = (
 )
 PRECISION_CASES = ((250340, 512, "perf"), (250340, 1280, "perf"))
 PRECISION_REPEATS = 5
+# S x C > 2^31 elements (64-bit offsets) at a token count past the sm_107a token floor.
+LARGE_CASE = (262401, 8192, "perf")
+LARGE_CASE_FREE_BYTES = 40 * 2**30
 GRAPH_CASES = (
     (65, 256, (64, 1)),
     (5, 136, (2, 0, 3)),
@@ -132,6 +138,25 @@ FORWARD_OF = {
     "bwd_fp32g": "fwd",
     "bwd_bias_fp32g": "fwd_bias",
 }
+# Every dtype combination a backward call takes: taps x bias (none, FP32, BF16) x SiLU' policy x the dweight /
+# dbias out dtypes (each FP32 or BF16, independently of its parameter).  Each resolves to one route: BF16 taps on
+# the fp32g and bias routes, and both mixed bwd_dt combinations (BF16 taps + FP32 dweight, FP32 taps + BF16
+# dweight), are among them.
+DTYPE_COMBOS = tuple(
+    (weight_dtype, bias_dtype, policy, dweight_dtype, dbias_dtype)
+    for policy in ("bf16", "fp32")
+    for weight_dtype in (F32, BF16)
+    for bias_dtype in (None, F32, BF16)
+    for dweight_dtype in (F32, BF16)
+    for dbias_dtype in ((None,) if bias_dtype is None else (F32, BF16))
+)
+# The autograd entry returns the gradients in the parameters' dtypes: taps x bias x policy.
+AUTOGRAD_COMBOS = tuple(
+    (weight_dtype, bias_dtype, policy)
+    for policy in ("bf16", "fp32")
+    for weight_dtype in (F32, BF16)
+    for bias_dtype in (None, F32, BF16)
+)
 
 
 def _device() -> torch.device:
@@ -183,6 +208,41 @@ def _case_id(case) -> str:
     return f"S{S}-C{C}-{tag}"
 
 
+def _dtype_id(dtype) -> str:
+    return {None: "none", F32: "f32", BF16: "bf16"}[dtype]
+
+
+def _combo_id(combo) -> str:
+    weight_dtype, bias_dtype, policy, *outs = combo
+    label = f"w{_dtype_id(weight_dtype)}-b{_dtype_id(bias_dtype)}-{policy}"
+    if outs:
+        dweight_dtype, dbias_dtype = outs
+        label += f"-dw{_dtype_id(dweight_dtype)}"
+        if bias_dtype is not None:
+            label += f"-db{_dtype_id(dbias_dtype)}"
+    return label
+
+
+def _combo_route(weight_dtype, bias_dtype, policy, dweight_dtype=None) -> str:
+    """The backward route a call of these dtypes runs (``dweight_dtype`` ``None``: the taps' dtype)."""
+
+    return loader.backward_route(
+        bias=bias_dtype is not None,
+        fp32_grad=policy == "fp32",
+        bf16_taps_or_dweight=BF16 in (weight_dtype, dweight_dtype or weight_dtype),
+    )
+
+
+def _det_or_none():
+    """The deterministic package, or ``None`` when this build does not carry it (the parity checks are skipped,
+    the reference checks still run)."""
+
+    try:
+        return cake_package("cake_causal_conv1d_det_train")
+    except Exception:  # noqa: BLE001 - a vendored copy without the det package
+        return None
+
+
 def _arch() -> str:
     return loader.arch_for_capability(_capability())
 
@@ -204,6 +264,30 @@ def _require_route(*kinds: str) -> None:
             pending = _route_pending(_arch(), needed)
             if pending:
                 pytest.skip(pending)
+
+
+def _backward_thresholds(arch: str, kind: str) -> tuple[int, ...]:
+    """The channel thresholds of the programs route ``kind`` selects by channel count on ``arch`` (empty when the
+    route ships its fallback program only there)."""
+
+    thresholds = set()
+    for name in loader.route_modules(arch, kind):
+        rule = loader.select_rule(loader.MODULES[name])
+        if rule is not None and arch in rule["channels"]:
+            thresholds.add(int(rule["channels"][arch]))
+    return tuple(sorted(thresholds))
+
+
+def _token_floors(arch: str, kind: str) -> dict[str, tuple[int, int]]:
+    """The programs of route ``kind`` on ``arch`` whose rule carries a token floor: name -> (channel threshold,
+    token floor)."""
+
+    floors = {}
+    for name in loader.route_modules(arch, kind):
+        rule = loader.select_rule(loader.MODULES[name])
+        if rule is not None and arch in rule.get("tokens", {}):
+            floors[name] = (int(rule["channels"][arch]), int(rule["tokens"][arch]))
+    return floors
 
 
 def _generator(*keys: int) -> torch.Generator:
@@ -463,33 +547,179 @@ def test_forward_backward_match_reference(case) -> None:
     )
 
 
-@pytest.mark.parametrize("kind", tuple(ROUTE_SETTINGS))
+@pytest.mark.parametrize("combo", DTYPE_COMBOS, ids=_combo_id)
 @pytest.mark.parametrize("case", ROUTE_CASES, ids=_case_id)
-def test_routes_match_reference(case, kind) -> None:
-    """Every backward route (BF16 taps, FP32 / BF16 bias, the fp32 SiLU' policy with FP64 accumulators) against
-    the reference; the BF16 gradient outs of the ``dtype_flags`` routes as well."""
+def test_routes_match_reference(case, combo) -> None:
+    """Every backward route in every dtype combination (FP32 / BF16 taps, no / FP32 / BF16 bias, both SiLU'
+    policies, FP32 / BF16 ``dweight`` and ``dbias`` outs): ``y``, ``dx``, ``dweight`` and ``dbias`` against the
+    reference; ``y`` / ``dx`` bitwise the deterministic package's for the same call and its ``dweight`` /
+    ``dbias`` within the route's budget of the deterministic ones (when that package is importable)."""
 
+    weight_dtype, bias_dtype, policy, dweight_dtype, dbias_dtype = combo
+    kind = _combo_route(weight_dtype, bias_dtype, policy, dweight_dtype)
     _require_route(kind)
     S, C, docs = case
-    x, w, cu, dy, b, policy = _route_inputs(S, C, docs, kind, key=1)
+    device = _device()
+    label = f"{kind} {_combo_id(combo)} {case}"
+    x, w, cu, dy = _inputs(S, C, docs, key=1, weight_dtype=weight_dtype)
+    b = None if bias_dtype is None else _bias_input(C, bias_dtype, key=1)
+    y = _forward(x, w, cu, bias=b)
     _assert_within(
-        _forward(x, w, cu, bias=b),
-        reference_forward(x, w, cu, b),
-        atol=Y_ATOL,
-        rtol=Y_RTOL,
-        label=f"y {kind} {case}",
+        y, reference_forward(x, w, cu, b), atol=Y_ATOL, rtol=Y_RTOL, label=f"y {label}"
     )
+
+    def outs():
+        return {
+            "dweight": torch.empty(C, WIDTH, dtype=dweight_dtype, device=device),
+            "dbias": None if b is None else torch.empty(C, dtype=dbias_dtype, device=device),
+        }
+
+    out = outs()
+    dx, dw, db = _backward(x, w, cu, dy, b, policy, **out)
+    assert dw is out["dweight"] and db is out["dbias"], label
     refs = reference_backward(x, w, cu, dy, b=b, policy=policy)
-    dx, dw, db = _backward(x, w, cu, dy, b, policy)
-    assert dw.dtype == w.dtype and (db is None or db.dtype == b.dtype)
-    _check_grads(dx, dw, db, refs, policy=policy, label=f"{kind} {case}")
-    if kind != "bwd":
-        # BF16 gradient outs (flags bits 1 and 3).
-        dw16 = torch.empty(C, WIDTH, dtype=BF16, device=_device())
-        db16 = None if b is None else torch.empty(C, dtype=BF16, device=_device())
-        dx, dw, db = _backward(x, w, cu, dy, b, policy, dweight=dw16, dbias=db16)
-        assert dw is dw16 and (db is db16)
-        _check_grads(dx, dw, db, refs, policy=policy, label=f"{kind} bf16 outs {case}")
+    _check_grads(dx, dw, db, refs, policy=policy, label=label)
+    det = _det_or_none()
+    if det is None:
+        return
+    assert torch.equal(y, det.cake_causal_conv1d_det_train_forward(x, w, cu, bias=b)), (
+        f"y differs from the deterministic package ({label})"
+    )
+    dx_d, dw_d, db_d = _det_backward(det, x, w, cu, dy, b, policy, **outs())
+    assert torch.equal(dx, dx_d), f"dx differs from the deterministic package ({label})"
+    for got, expected, name in ((dw, dw_d, "dweight"), (db, db_d, "dbias")):
+        if got is None:
+            continue
+        assert got.dtype == expected.dtype, f"{name} {label}"
+        atol, rtol = _grad_tolerance(policy, got.dtype)
+        _assert_within(
+            got.float(),
+            expected.float(),
+            atol=atol,
+            rtol=rtol,
+            label=f"{name} vs det {label}",
+        )
+
+
+@pytest.mark.parametrize("policy", ("bf16", "fp32"))
+@pytest.mark.parametrize("case", ROUTE_CASES, ids=_case_id)
+def test_bf16_dweight_out_with_f32_taps_keeps_dx_bitwise(case, policy) -> None:
+    """FP32 taps with a BF16 ``dweight`` out (``bwd_dt`` under the default policy, the fp32g route's BF16 store
+    under ``"fp32"``) give the FP32-out call's ``dx`` bits: the tap load form is the same, only the store differs;
+    the BF16 ``dweight`` is the FP32 one's within one BF16 rounding."""
+
+    _require_route(_combo_route(F32, None, policy), _combo_route(F32, None, policy, BF16))
+    S, C, docs = case
+    x, w, cu, dy = _inputs(S, C, docs, key=7)
+    dx, dw, _ = _backward(x, w, cu, dy, None, policy)
+    dx_dt, dw_dt, _ = _backward(
+        x,
+        w,
+        cu,
+        dy,
+        None,
+        policy,
+        dweight=torch.empty(C, WIDTH, dtype=BF16, device=_device()),
+    )
+    assert dw.dtype == F32 and dw_dt.dtype == BF16
+    assert torch.equal(dx_dt, dx), f"BF16-out dx differs from the FP32-out dx at {case} {policy}"
+    atol, rtol = _grad_tolerance(policy, BF16)
+    _assert_within(
+        dw_dt.float(),
+        dw,
+        atol=atol,
+        rtol=rtol,
+        label=f"bf16 dweight vs the f32 one {case} {policy}",
+    )
+
+
+@pytest.mark.parametrize("kind", tuple(ROUTE_SETTINGS))
+def test_backward_programs_switch_on_channel_count(kind, monkeypatch) -> None:
+    """Exactly one program of the route runs per call and every program the route ships on this architecture runs
+    for some ``(S, C)``: each matches the reference on both sides of its channel threshold (and of its token floor,
+    where its rule has one) on a caller-owned workspace that reads back zero, with ``dx`` bitwise the deterministic
+    package's (when importable)."""
+
+    _require_route(kind)
+    arch, device = _arch(), _device()
+    names = loader.route_modules(arch, kind)
+    thresholds = _backward_thresholds(arch, kind)
+    channels = sorted({C for T in thresholds for C in (T - 8, T, T + 8)} | {8192})
+    rows = [
+        (S, docs, C) for S, docs in ((5, (2, 0, 3)), (1000, "perf")) for C in channels
+    ]
+    # A token-floored program runs from its floor only: both sides of the floor at its channel threshold.
+    for T, floor in _token_floors(arch, kind).values():
+        rows += [(S, "perf", C) for S in (floor - 8, floor) for C in (T - 8, T, T + 8)]
+    det = _det_or_none()
+    seen = []
+    launch = pkg.run_module
+
+    def record_launch(name, values, *, device_index, grid=None):
+        seen.append(name)
+        return launch(name, values, device_index=device_index, grid=grid)
+
+    monkeypatch.setattr(pkg, "run_module", record_launch)
+    launched = set()
+    for S, docs, C in rows:
+        (selected,) = loader.selected_modules(arch, kind, C=C, S=S)
+        label = f"{kind} S={S} C={C} docs={docs} program={selected}"
+        x, w, cu, dy, b, policy = _route_inputs(S, C, docs, kind, key=6)
+        workspace = pkg.cake_causal_conv1d_train_backward_workspace(
+            S, C, device, deterministic=False
+        )
+        seen.clear()
+        dx, dw, db = _backward(x, w, cu, dy, b, policy, workspace=workspace)
+        assert seen == [selected], f"{label}: launched {seen}"
+        launched.add(selected)
+        _check_grads(
+            dx, dw, db, reference_backward(x, w, cu, dy, b=b, policy=policy),
+            policy=policy, label=label,
+        )  # fmt: skip
+        assert int(torch.count_nonzero(workspace)) == 0, label
+        if det is not None:
+            dx_d, _, _ = _det_backward(det, x, w, cu, dy, b, policy)
+            assert torch.equal(dx, dx_d), f"dx differs from the deterministic package ({label})"
+    assert launched == set(names), f"never launched {set(names) - launched}"
+
+
+@pytest.mark.parametrize("kind", tuple(ROUTE_SETTINGS))
+def test_large_case_over_two_to_the_31_elements(kind) -> None:
+    """``S x C > 2^31`` elements (64-bit offsets) at ``C`` 8192: ``y``, ``dx``, ``dweight`` and ``dbias`` against
+    the reference, ``dx`` bitwise the deterministic package's (when importable), the workspace left zero."""
+
+    _require_route(kind)
+    free, _total = torch.cuda.mem_get_info(_device())
+    if free < LARGE_CASE_FREE_BYTES:
+        pytest.skip(
+            f"needs {LARGE_CASE_FREE_BYTES >> 30} GiB free, {free >> 30} GiB available"
+        )
+    S, C, docs = LARGE_CASE
+    assert S * C > 2**31
+    device = _device()
+    label = f"{kind} {_case_id(LARGE_CASE)}"
+    x, w, cu, dy, b, policy = _route_inputs(S, C, docs, kind, key=5)
+    y = _forward(x, w, cu, bias=b)
+    _assert_within(
+        y, reference_forward(x, w, cu, b), atol=Y_ATOL, rtol=Y_RTOL, label=f"y {label}"
+    )
+    del y
+    workspace = pkg.cake_causal_conv1d_train_backward_workspace(
+        S, C, device, deterministic=False
+    )
+    dx, dw, db = _backward(x, w, cu, dy, b, policy, workspace=workspace)
+    assert int(torch.count_nonzero(workspace)) == 0, label
+    _check_grads(
+        dx, dw, db, reference_backward(x, w, cu, dy, b=b, policy=policy),
+        policy=policy, label=label,
+    )  # fmt: skip
+    det = _det_or_none()
+    if det is not None:
+        dx_d, _, _ = _det_backward(det, x, w, cu, dy, b, policy)
+        assert torch.equal(dx, dx_d), f"dx differs from the deterministic package ({label})"
+        del dx_d
+    del x, dy, dx
+    torch.cuda.empty_cache()
 
 
 @pytest.mark.parametrize("kind", tuple(ROUTE_SETTINGS))
@@ -1107,15 +1337,18 @@ def test_zero_tokens_return_empty_outputs() -> None:
 # Autograd, checkpointing, accumulation.
 
 
-@pytest.mark.parametrize("kind", tuple(ROUTE_SETTINGS))
-def test_autograd_end_to_end(kind) -> None:
-    """``cake_causal_conv1d(..., deterministic=False)``: the forward's bits, ``dx`` bitwise the direct backward's,
-    the parameter gradients within budget of the reference, in the parameters' dtypes; a non-contiguous incoming
-    gradient is materialized."""
+@pytest.mark.parametrize("combo", AUTOGRAD_COMBOS, ids=_combo_id)
+def test_autograd_end_to_end(combo) -> None:
+    """``cake_causal_conv1d(..., deterministic=False)`` with FP32 / BF16 taps, no / FP32 / BF16 bias, under both
+    SiLU' policies: the forward's bits, ``dx`` bitwise the direct backward's, the parameter gradients within
+    budget of the reference, in the parameters' dtypes; a non-contiguous incoming gradient is materialized."""
 
+    weight_dtype, bias_dtype, policy = combo
+    kind = _combo_route(weight_dtype, bias_dtype, policy)
     _require_route(kind)
     S, C, docs = 1000, 512, "perf"
-    x0, w0, cu, dy, b0, policy = _route_inputs(S, C, docs, kind, key=3)
+    x0, w0, cu, dy = _inputs(S, C, docs, key=3, weight_dtype=weight_dtype)
+    b0 = None if bias_dtype is None else _bias_input(C, bias_dtype, key=3)
     refs = reference_backward(x0, w0, cu, dy, b=b0, policy=policy)
     dx_direct, _, _ = _backward(x0, w0, cu, dy, b0, policy)
     for incoming in (dy, dy.t().contiguous().t()):
@@ -1135,7 +1368,7 @@ def test_autograd_end_to_end(kind) -> None:
             None if b is None else b.grad,
             refs,
             policy=policy,
-            label=f"autograd {kind}",
+            label=f"autograd {kind} {_combo_id(combo)}",
         )
 
 
@@ -1279,6 +1512,45 @@ def test_argument_validation() -> None:
         _backward(x, w, cu, dy, policy="fp16")
     with pytest.raises(ValueError, match="CUDA"):
         _forward(x.cpu(), w.cpu(), cu.cpu())
+
+
+def test_fp32_dweight_must_be_16_byte_aligned() -> None:
+    """The backward programs store one channel's four FP32 ``dweight`` taps with one 16-byte store: an FP32
+    ``dweight`` out off the 16-byte grid is refused (``ValueError``) before anything launches; a 16-byte aligned
+    view inside a larger buffer is written, and a BF16 ``dweight`` or an FP32 / BF16 ``dbias`` (stored per
+    element) is accepted at any element offset."""
+
+    S, C, docs = 1000, 512, "perf"
+    device = _device()
+    x, w, cu, dy = _inputs(S, C, docs, key=8)
+    b = _bias_input(C, F32, key=8)
+    refs = reference_backward(x, w, cu, dy, b=b)
+    n = C * WIDTH
+    buf = torch.zeros(n + 4, dtype=F32, device=device)
+    workspace = pkg.cake_causal_conv1d_train_backward_workspace(
+        S, C, device, deterministic=False
+    )
+    for bias in (None, b):
+        for offset in (1, 2, 3):
+            misaligned = buf[offset : offset + n].view(C, WIDTH)
+            assert misaligned.data_ptr() % 16 != 0
+            with pytest.raises(ValueError, match="16-byte aligned"):
+                _backward(x, w, cu, dy, bias, dweight=misaligned, workspace=workspace)
+    torch.cuda.synchronize(device)
+    assert int(torch.count_nonzero(buf)) == 0 and int(torch.count_nonzero(workspace)) == 0
+    aligned = buf[4:].view(C, WIDTH)
+    db_view = torch.zeros(C + 1, dtype=F32, device=device)[1:]
+    dx, dw, db = _backward(x, w, cu, dy, b, dweight=aligned, dbias=db_view, workspace=workspace)
+    assert dw is aligned and db is db_view
+    _check_grads(dx, dw, db, refs, policy="bf16", label="16-byte aligned dweight view")
+    for dweight_offset, dbias_offset in ((4, 1), (2, 3)):
+        dw16 = torch.zeros(n + 4, dtype=BF16, device=device)[dweight_offset:][:n].view(C, WIDTH)
+        db16 = torch.zeros(C + 4, dtype=BF16, device=device)[dbias_offset:][:C]
+        assert dw16.data_ptr() % 16 != 0
+        dx, dw, db = _backward(x, w, cu, dy, b, dweight=dw16, dbias=db16, workspace=workspace)
+        assert dw is dw16 and db is db16
+        _check_grads(dx, dw, db, refs, policy="bf16", label=f"bf16 outs at element offsets {dweight_offset} / {dbias_offset}")
+    assert int(torch.count_nonzero(workspace)) == 0
 
 
 # ----------------------------------------------------------------------------------------------------------------

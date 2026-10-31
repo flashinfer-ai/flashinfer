@@ -20,6 +20,9 @@ row and rank:
 
 - ``y`` is bitwise the single-rank zero-history convolution of the whole pack on the rank's tokens (anchor) and
   the deterministic KCP call's; ``dx`` is bitwise the deterministic KCP call's;
+- an independent reference: the rank's ``y`` and ``dx`` (its tokens gathered from the global FP64 oracle of the
+  whole pack under the KCP SiLU' policy) within one BF16 ulp, and the all-reduced ``dweight`` partial sum within
+  the package budget of the global FP64 ``dweight``;
 - the rank-local FP32 ``dweight`` partial is within the package budget of the deterministic partial, on each of
   ``REPEATS`` launches (``dx`` bitwise on every one; the worst case is recorded), and the sum of the partials over
   the ranks is within ``W`` x the budget of the deterministic sum;
@@ -49,6 +52,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
+from tests.test_cake_causal_conv1d_det_train_kcp import Y_ATOL, Y_RTOL, _reference
 from tests.test_cake_causal_conv1d_det_train_kcp_dist import (
     ROWS,
     WIDTH,
@@ -173,6 +177,16 @@ def _run_rank(
             ((a - b).abs() / (scale * DW_ATOL + scale * DW_RTOL * b.abs())).max()
         )
 
+    def ulp_ratio(a: torch.Tensor, b: torch.Tensor) -> float:
+        """The worst ``|a - b| / (Y_ATOL + Y_RTOL |b|)`` (``<= 1``: within one BF16 ulp)."""
+
+        if a.numel() == 0:
+            return 0.0
+        a, b = a.double(), b.double()
+        if not torch.isfinite(a).all():
+            return float("inf")
+        return float(((a - b).abs() / (Y_ATOL + Y_RTOL * b.abs())).max())
+
     def eq(a, b, scale: float = 1.0) -> bool:
         return (
             same(a["y"], b["y"])
@@ -204,6 +218,18 @@ def _run_rank(
         direct["dx"], det["dx"]
     )
     flags["dw_within_budget_of_deterministic"] = ratio(direct["dw"], det["dw"]) <= 1.0
+    # The independent reference: the global FP64 oracle of the whole pack, the rank's tokens gathered from it.
+    y_ref, dx_ref, dw_ref = _reference(x_all.to(device), w, cu_dev, dy_all.to(device))
+    info["y_ratio_to_one_bf16_ulp_vs_fp64"] = ulp_ratio(
+        direct["y"], _local(part, rank, cu, y_ref)
+    )
+    info["dx_ratio_to_one_bf16_ulp_vs_fp64"] = ulp_ratio(
+        direct["dx"], _local(part, rank, cu, dx_ref)
+    )
+    flags["y_within_one_bf16_ulp_of_fp64"] = info["y_ratio_to_one_bf16_ulp_vs_fp64"] <= 1.0
+    flags["dx_within_one_bf16_ulp_of_fp64"] = (
+        info["dx_ratio_to_one_bf16_ulp_vs_fp64"] <= 1.0
+    )
     # Repeated launches: dx bitwise every time, dweight within budget every time.
     worst, patterns, dx_ok = 0.0, set(), True
     for _ in range(REPEATS):
@@ -224,6 +250,8 @@ def _run_rank(
     dist.all_reduce(total_det)
     info["dw_sum_ratio_to_budget"] = ratio(total, total_det, float(W))
     flags["dw_sum_within_budget"] = info["dw_sum_ratio_to_budget"] <= 1.0
+    info["dw_sum_ratio_to_budget_vs_fp64"] = ratio(total, dw_ref)
+    flags["dw_sum_within_budget_of_fp64"] = info["dw_sum_ratio_to_budget_vs_fp64"] <= 1.0
     flags["plain_eq_direct"] = eq(plain, direct)
     flags["handle_eq_plain"] = eq(withh, plain)
     flags["reentrant_plain_eq_direct"] = eq(plain_re, direct)

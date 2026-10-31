@@ -21,6 +21,9 @@ convolutions of a layer with one halo exchange per direction) on the determinist
   bitwise the single-rank zero-history convolution; each ``dweight`` partial is within the package budget of the
   deterministic one -- direct, plain checkpoint, checkpoint with one handle, ``use_reentrant`` False and True,
   nested checkpoints and ``retain_graph`` (``dx`` exactly twice, ``dweight`` within twice the budget);
+- an independent reference per tensor: the rank's ``y`` and ``dx`` (its tokens gathered from the global FP64
+  oracle of the whole pack under the KCP SiLU' policy) within one BF16 ulp, and the all-reduced ``dweight``
+  partial sum within the package budget of the global FP64 ``dweight``;
 - the collective counts per phase of the deterministic suite: multi 1/0/1 direct, 1/1/1 plain checkpoint, 1/0/1
   with a handle; single calls n/0/n;
 - ``graph="replay"`` of the multi forward / backward: ``y`` / ``hist`` / ``dx`` bitwise the eager single calls on
@@ -40,6 +43,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
+from tests.test_cake_causal_conv1d_det_train_kcp import WIDTH, Y_ATOL, Y_RTOL, _reference
 from tests.test_cake_causal_conv1d_det_train_kcp_dist import _free_port, _local
 from tests.test_cake_causal_conv1d_det_train_kcp_multi_dist import (
     GRAPH_ROWS,
@@ -66,6 +70,31 @@ def _ratio(a: torch.Tensor, b: torch.Tensor, scale: float = 1.0) -> float:
     if not torch.isfinite(a).all():
         return float("inf")
     return float(((a - b).abs() / (scale * DW_ATOL + scale * DW_RTOL * b.abs())).max())
+
+
+def _ulp_ratio(a: torch.Tensor, b: torch.Tensor) -> float:
+    """The worst ``|a - b| / (Y_ATOL + Y_RTOL |b|)`` (``<= 1``: within one BF16 ulp)."""
+
+    if a.numel() == 0:
+        return 0.0
+    a, b = a.double(), b.double()
+    if not torch.isfinite(a).all():
+        return float("inf")
+    return float(((a - b).abs() / (Y_ATOL + Y_RTOL * b.abs())).max())
+
+
+def _global_inputs(row, T: int) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+    """``(x_all, w_all, dy_all)`` per tensor of the whole pack, drawn in ``_setup``'s order from its seed (the
+    caller checks them against ``_setup``'s tensors)."""
+
+    g = torch.Generator(device="cpu").manual_seed(7815)
+    out = []
+    for C in row[3]:
+        x_all = torch.randn(T, C, generator=g).to(torch.bfloat16)
+        w_all = (torch.randn(C, WIDTH, generator=g) * 0.5).contiguous()
+        dy_all = torch.randn(T, C, generator=g).to(torch.bfloat16)
+        out.append((x_all, w_all, dy_all))
+    return out
 
 
 def _eq(a, b, n: int, scale: float = 1.0) -> bool:
@@ -213,6 +242,34 @@ def _run_rank(rank: int, W: int, row, port: int, result_dir, local_id: int) -> d
     info["worst_dw_ratio_vs_det"] = max(
         _ratio(m_direct[i]["dw"], det[i]["dw"]) for i in range(n)
     )
+    # The independent reference per tensor: the global FP64 oracle of the whole pack, the rank's tokens gathered
+    # from it; the rank partials' sum (the framework's reduction) against the global FP64 dweight.
+    inputs = _global_inputs(row, cu[-1])
+    flags["reference_inputs_match_setup"] = all(
+        _same(x_all, xs_all[i])
+        and _same(w_all.to(device), ws[i])
+        and _same(_local(part, rank, cu, dy_all).to(device), dys[i])
+        for i, (x_all, w_all, dy_all) in enumerate(inputs)
+    )
+    worst_y = worst_dx = worst_dw = 0.0
+    for i, (x_all, _w_all, dy_all) in enumerate(inputs):
+        y_ref, dx_ref, dw_ref = _reference(
+            x_all.to(device), ws[i], cu_dev, dy_all.to(device)
+        )
+        worst_y = max(worst_y, _ulp_ratio(m_direct[i]["y"], _local(part, rank, cu, y_ref)))
+        worst_dx = max(
+            worst_dx, _ulp_ratio(m_direct[i]["dx"], _local(part, rank, cu, dx_ref))
+        )
+        total = m_direct[i]["dw"].clone()
+        dist.all_reduce(total)
+        worst_dw = max(worst_dw, _ratio(total, dw_ref))
+    info["vs_fp64"] = {
+        "worst_y_ratio_to_one_bf16_ulp": worst_y,
+        "worst_dx_ratio_to_one_bf16_ulp": worst_dx,
+        "worst_dw_sum_ratio_to_budget": worst_dw,
+    }
+    flags["y_dx_within_one_bf16_ulp_of_fp64"] = worst_y <= 1.0 and worst_dx <= 1.0
+    flags["dw_sum_within_budget_of_fp64"] = worst_dw <= 1.0
     flags["counts"] = (
         cs_direct["calls"] == table(n, 0, n)
         and cm_direct["calls"] == table(1, 0, 1)
