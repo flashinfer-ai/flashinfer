@@ -648,17 +648,32 @@ def test_mxfp4_k3_routed_expert_geometry_multirank():
 @pytest.mark.gpu_2
 @pytest.mark.arch_rubin
 @pytest.mark.parametrize(
-    "kind,variant,combine",
+    "kind,variant,combine,early,ikr",
     [
-        (kind, variant, "bf16")
+        (kind, variant, "bf16", early, ikr)
         for kind in ("nvfp4", "mxfp8_e4m3", "mxfp8_e5m2", "mxfp4_mxfp8")
         for variant in ("inference", "genphase")
+        for early, ikr in ((False, False), (True, False), (True, True))
     ]
-    + [("nvfp4", "inference", combine) for combine in ("nvfp4", "mxfp8")],
+    + [
+        (kind, "inference", combine, early, False)
+        for kind in ("nvfp4", "mxfp8_e4m3", "mxfp8_e5m2", "mxfp4_mxfp8")
+        for combine in ("nvfp4", "mxfp8")
+        for early in (False, True)
+    ],
 )
-def test_masked_nonfinite_scores_pooled_graph(kind, variant, combine):
+def test_masked_nonfinite_scores_pooled_graph(kind, variant, combine, early, ikr):
     import torch.distributed as dist
     from tests.moe_ep.sm107_test_utils import quantize, weight_pack
+
+    def check_output(output, reference):
+        assert torch.isfinite(output).all()
+        if ikr:
+            # Atomic accumulation need not reproduce the same addition order.
+            error = (output.float() - reference.float()).norm()
+            assert float(error / reference.float().norm().clamp_min(1e-6)) < 0.02
+        else:
+            torch.testing.assert_close(output, reference, rtol=0, atol=0)
 
     rank, world = _launcher_ranks()
     if world < 2:
@@ -670,7 +685,8 @@ def test_masked_nonfinite_scores_pooled_graph(kind, variant, combine):
         kind,
         kernel_variant=variant,
         combine_dtype=combine,
-        apply_topk_in_fc1=False,
+        apply_topk_in_fc1=early,
+        in_kernel_fc2_reduce=ikr,
         **(
             dict(cluster_shape_mn=(4, 1), fc2_use_bulk=True)
             if variant == "genphase"
@@ -737,14 +753,26 @@ def test_masked_nonfinite_scores_pooled_graph(kind, variant, combine):
             ]
             for t in inputs:
                 t.topk_weights.masked_fill_(t.topk_ids == -1, value)
+            if combine != "bf16":
+                # Masked return slots are not written by FC2 or cleared by launch.
+                ws = layers[0]._workspace
+                assert ws.kernel.masks_invalid_combine_slots
+                ws._pre_reduced_activation.view(torch.uint8).fill_(255)
+                ws._pre_reduced_activation_sf.view(torch.uint8).fill_(255)
             for layer, t, reference in zip(layers, inputs, expected, strict=True):
-                torch.testing.assert_close(layer.forward(t), reference, rtol=0, atol=0)
+                check_output(layer.forward(t), reference)
+                torch.testing.assert_close(
+                    layer._workspace.topk_weights[: t.topk_ids.shape[0]],
+                    t.topk_weights.float(),
+                    rtol=0,
+                    atol=0,
+                    equal_nan=True,
+                )
             for _ in range(3):
                 graph.replay()
                 torch.cuda.synchronize()
                 for output, reference in zip(outputs, expected, strict=True):
-                    assert torch.isfinite(output).all()
-                    torch.testing.assert_close(output, reference, rtol=0, atol=0)
+                    check_output(output, reference)
     finally:
         if graph is not None:
             graph.reset()
