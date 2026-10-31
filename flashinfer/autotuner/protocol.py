@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from contextvars import ContextVar
 from threading import Lock
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Generic, Protocol, TypeVar
 
 if TYPE_CHECKING:
@@ -51,16 +51,23 @@ class TuningContext:
     tuning_enabled: bool
     force_tune: bool
     scope: object | None = None
+    _generation: int = field(
+        default_factory=lambda: _execution_generation,
+        init=False,
+        repr=False,
+        compare=False,
+    )
 
     @property
     def execution_generation(self) -> int:
-        """Process-wide context and store transitions invalidate prepared execution.
+        """Process-wide generation observed when this invocation was created.
 
         Unlike cache_identity, this does not change on rank-local cache clearing.
         Collective protocols can keep serving an agreed configuration until the
         next collective preparation point, without polling their peers.
+        A transition during preparation remains visible to the next invocation.
         """
-        return _execution_generation
+        return self._generation
 
     @property
     def skipped(self) -> bool:

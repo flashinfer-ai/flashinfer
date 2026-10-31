@@ -65,7 +65,8 @@ def test_prepared_execution_observes_other_threads(managed, transition):
     from flashinfer import autotune_v2
     from flashinfer.autotune_cache import autotune_v2_reload
 
-    before = managed.protocol_context("test.protocol").execution_generation
+    context = managed.protocol_context("test.protocol")
+    before = context.execution_generation
 
     def change():
         if transition == "reload":
@@ -76,6 +77,7 @@ def test_prepared_execution_observes_other_threads(managed, transition):
 
     with ThreadPoolExecutor(max_workers=1) as executor:
         executor.submit(change).result()
+    assert context.execution_generation == before
     assert managed.protocol_context("test.protocol").execution_generation > before
 
 
