@@ -63,6 +63,17 @@ graph capture a missing companion raises ``ValueError`` (pass a
 capture).  The outputs of either package feed the other's entry points (the
 records are the same bits).
 
+Default workspaces (``workspace=None``): each package keeps one buffer per
+device and power-of-two token-count bucket, shared by every stream and every
+graph replay on that device; calls that can run concurrently on different
+streams pass caller-owned workspaces.  The non-deterministic package creates no
+default buffer while the current stream of the buffer's device is capturing a
+CUDA graph (``ValueError``): warm up with the same ``deterministic`` value and
+token count before the capture.  A companion is allocated zeroed outside any
+capture and every completed launch leaves its
+ticket words at zero, so it needs no reset;
+:func:`cake_mhc_train_reset_workspace` zeroes the buffer it is given.
+
 Name map (the deterministic names are unchanged and always deterministic)::
 
     flashinfer.cake_mhc_det_train                 this module (deterministic=...)

@@ -133,6 +133,17 @@ deterministic backward, the call runs on a private zeroed companion buffer of
 that workspace, never on the shared default buffer. Inside a CUDA graph
 capture a missing companion raises ``ValueError``.
 
+The default workspaces (``workspace=None``) are one buffer per device and
+power-of-two token-count bucket in each package, shared by every stream and
+every graph replay on the device: calls that can run concurrently on different
+streams pass caller-owned workspaces. ``deterministic=False`` creates no
+default buffer while the current stream of the buffer's device is capturing a
+CUDA graph (``ValueError``); warm up with the same ``deterministic`` value and
+token count before the capture. A companion is allocated zeroed outside any
+capture and every completed launch leaves its
+ticket words at zero, so it needs no reset; ``cake_mhc_train_reset_workspace``
+zeroes the buffer it is given.
+
 The head (``cake_mhc_det_train_head*``) has no cross-token reduction and no
 counterpart in this module; use the deterministic names above.
 
