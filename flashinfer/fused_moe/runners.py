@@ -8727,8 +8727,16 @@ class SM12xNvfp4Bf16Runner(MoERunner):
     weight_view_keys = (backend_key, *weight_view_aliases)
     supported_routing_modes = (RoutingInputMode.PackedPrecomputed,)
     supported_quant_variants = ((QuantFormat.NVFP4, QuantFormat.BF16),)
-    supported_activation_classes = (SwiGLU, ReLU2)
+    supported_activation_classes = (SwiGLU, GeGLUTanh, ReLU2)
     supports_expert_parallelism = False
+    # Typed activation -> ``activation`` name of ``run_moe_w4a16`` and
+    # ``run_moe_w4a4``. SwiGLU and GeGLU-tanh share the w1 geometry, so the
+    # kernels need the name to specialize (and cache) the right epilogue.
+    _KERNEL_ACTIVATIONS: ClassVar[dict[type[ActivationConfig], str]] = {
+        SwiGLU: "silu",
+        GeGLUTanh: "geglu_tanh",
+        ReLU2: "relu2",
+    }
 
     def __init__(self, config: MoEConfig, device: torch.device):
         super().__init__()
@@ -8738,6 +8746,13 @@ class SM12xNvfp4Bf16Runner(MoERunner):
             self.device = torch.device("cuda", torch.cuda.current_device())
         self.tuning_config = TuningConfig()
         self._workspaces: dict[int, list[torch.Tensor]] = {}
+
+    @property
+    def _kernel_activation(self) -> str:
+        """Kernel name of the configured activation (``"silu"``,
+        ``"geglu_tanh"`` or ``"relu2"``), passed as ``activation=`` to the
+        W4A4 / W4A16 kernels and their workspace allocators."""
+        return self._KERNEL_ACTIVATIONS[type(self.config.activation)]
 
     def _check_activation_parameters(self) -> None:
         activation = self.config.activation
@@ -8793,6 +8808,7 @@ class SM12xNvfp4Bf16Runner(MoERunner):
                 top_k=self.config.routing.top_k,
                 is_gated=self.config.activation.is_gated,
                 device=self.device,
+                activation=self._kernel_activation,
             )
             self._workspaces[capacity] = workspace
         return workspace
@@ -8925,7 +8941,20 @@ class SM12xNvfp4Bf16Runner(MoERunner):
             raise ValueError(f"{type(self).__name__} supports only tactic -1.")
         out, x, ids, topk_weights, w1, s1, g1, w2, s2, g2 = inputs
         workspace = self._workspace(x.shape[0], x.shape[1])
-        self._run(x, ids, topk_weights, w1, s1, g1, w2, s2, g2, out, workspace)
+        self._run(
+            x,
+            ids,
+            topk_weights,
+            w1,
+            s1,
+            g1,
+            w2,
+            s2,
+            g2,
+            out,
+            workspace,
+            activation=self._kernel_activation,
+        )
         return out[: getattr(inputs, "num_tokens", out.shape[0])]
 
 
@@ -9078,7 +9107,22 @@ class SM12xNvfp4Runner(SM12xNvfp4Bf16Runner):
             raise ValueError(f"{type(self).__name__} supports only tactic -1.")
         out, x, ids, topk_weights, w1, s1, g1, w2, s2, g2, a1, a2 = inputs
         workspace = self._workspace(x.shape[0], x.shape[1])
-        self._run(x, ids, topk_weights, w1, s1, g1, w2, s2, g2, a1, a2, out, workspace)
+        self._run(
+            x,
+            ids,
+            topk_weights,
+            w1,
+            s1,
+            g1,
+            w2,
+            s2,
+            g2,
+            a1,
+            a2,
+            out,
+            workspace,
+            activation=self._kernel_activation,
+        )
         return out[: getattr(inputs, "num_tokens", out.shape[0])]
 
 
