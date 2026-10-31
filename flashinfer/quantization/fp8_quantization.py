@@ -322,7 +322,7 @@ def mxfp8_quantize(
 
     Raises
     ------
-    ValueError
+    RuntimeError
         If ``backend="cuda"`` receives a CUDA tensor on a device older
         than SM100.
 
@@ -369,7 +369,7 @@ def mxfp8_quantize(
         if input.device.type == "cuda":
             major, minor = get_compute_capability(input.device)
             if major < 10:
-                raise ValueError(
+                raise RuntimeError(
                     "mxfp8_quantize with backend='cuda' requires SM100 or newer, "
                     f"got SM{major}{minor}"
                 )

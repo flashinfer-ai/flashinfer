@@ -29,12 +29,27 @@ def test_mxfp8_quantize_rejects_unsupported_cuda_before_jit(monkeypatch, capabil
     monkeypatch.setattr(fp8_quantization, "get_mxfp8_quantization_sm100_module", loader)
     monkeypatch.setattr(fp8_quantization, "device_support_pdl", pdl_query)
 
-    with pytest.raises(ValueError, match="requires SM100 or newer"):
+    with pytest.raises(RuntimeError, match="requires SM100 or newer"):
         mxfp8_quantize(input, backend="cuda")
 
     capability_query.assert_called_once_with(input.device)
     loader.assert_not_called()
     pdl_query.assert_not_called()
+
+
+def test_mxfp8_quantize_rejects_unsupported_real_cuda():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is not available")
+    device = torch.device("cuda", torch.cuda.current_device())
+    major, minor = torch.cuda.get_device_capability(device)
+    if major >= 10:
+        pytest.skip("Requires a CUDA device older than SM100")
+
+    input = torch.ones((1, 32), dtype=torch.bfloat16, device=device)
+    with pytest.raises(
+        RuntimeError, match=f"requires SM100 or newer, got SM{major}{minor}"
+    ):
+        mxfp8_quantize(input, backend="cuda")
 
 
 @pytest.mark.parametrize("capability", [(10, 0), (10, 3), (12, 0)])
