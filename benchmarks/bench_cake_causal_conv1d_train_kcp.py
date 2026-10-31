@@ -72,6 +72,11 @@ one call each.  Per row ``sota`` keeps each arm's library version, determinism, 
 and a numerics check (``y`` / ``dx`` on its rows, the summed ``dweight``) against the whole-pack Cake
 non-deterministic result, or the reason it cannot run the row (every rank must be able to); ``best_sota`` names the
 fastest eligible arm per phase and measure, ``speedup_vs_sota`` its time over the non-deterministic time.
+``comparison`` is the row's two-baseline comparison on one column, the ``ahead`` time (``COMPARISON_COLUMN``: a
+CUPTI span of a multi-op autograd phase also counts its host gaps; ``wall`` stays in ``modes`` and ``sota``): per
+phase the deterministic and non-deterministic Cake times, the best eligible arm (or ``unsupported`` with every arm's
+reason, e.g. a layout no eligible arm runs), ``det_over_nondet`` and ``sota_over_nondet``; the ``compare`` lines
+print it.
 
 Example::
 
@@ -135,6 +140,13 @@ AHEAD_SAMPLES = 10
 # any rank saw while warming up.
 AHEAD_MIN_MS = 2.0
 AHEAD_ENQUEUE_FACTOR = 3.0
+# The two-baseline comparison of a row (det Cake, nondet Cake, best eligible non-Cake arm) uses one timing column: the
+# host-hidden GPU time, since a CUPTI span of a multi-op autograd phase also counts the host gaps between its kernels.
+COMPARISON_COLUMN = "ahead"
+COMPARISON_RULE = (
+    "KCP: every arm compared on the host-hidden GPU time (ahead; the slowest rank); wall kept in the JSON; "
+    "feature- or precision-mismatched arms are listed, never the best"
+)
 # The deterministic KCP suite's dweight budget.
 DW_ATOL, DW_RTOL = 5e-2, 1e-4
 
@@ -684,6 +696,9 @@ def bench_row(
         result["best_sota"], result["speedup_vs_sota"] = baselines.best_baseline(
             sota_entries, entries["nondet"], keys
         )
+        result["comparison"] = baselines.comparison(
+            result, PHASES, COMPARISON_COLUMN, COMPARISON_RULE
+        )
     result["check"] = _check(p, device)
     del p
     gc.collect()
@@ -724,12 +739,8 @@ def _format(result: dict, world: int) -> list[str]:
     lines.append(
         f"{head} tokens per rank {result['tokens_local']} check {result['check']}"
     )
-    for kind in ("gpu", "ahead"):
-        lines.extend(
-            baselines.format_sota(
-                result, head, PHASES, kind, describe_arms=kind == "ahead"
-            )
-        )
+    lines.extend(baselines.format_sota(result, head, PHASES, COMPARISON_COLUMN))
+    lines.extend(baselines.format_comparison(result, head))
     return lines
 
 

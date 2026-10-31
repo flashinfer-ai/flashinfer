@@ -722,17 +722,9 @@ def describe(entry: dict) -> str:
     )
 
 
-def format_sota(
-    result: dict,
-    head: str,
-    phases: Sequence[str],
-    kind: str,
-    *,
-    describe_arms: bool = True,
-) -> list[str]:
+def format_sota(result: dict, head: str, phases: Sequence[str], kind: str) -> list[str]:
     """Per phase every baseline's ``kind`` time (us) and the best eligible one over the non-deterministic time;
-    then (``describe_arms``) one line per baseline: library, determinism, match, numerics, or the reason it cannot
-    run the row."""
+    then one line per baseline: library, determinism, match, numerics, or the reason it cannot run the row."""
 
     arms = result.get("sota")
     if not arms:
@@ -751,8 +743,98 @@ def format_sota(
             else f"best {best['arm']} {best['us']:9.2f} -> sota/nondet {result['speedup_vs_sota'][key]:5.3f}x"
         )
         lines.append(f"{head} {phase:4s} sota {kind} | {cells} | {tail}")
-    if describe_arms:
-        lines.extend(f"{head} sota {describe(entry)}" for entry in arms.values())
+    lines.extend(f"{head} sota {describe(entry)}" for entry in arms.values())
+    return lines
+
+
+def ineligible_reason(entry: dict) -> Optional[str]:
+    """Why an arm is not a candidate for the best baseline of a row (``None``: it is one)."""
+
+    if "unsupported" in entry:
+        return entry["unsupported"]
+    reasons = []
+    if entry["feature"]["match"] not in ("exact", "more_precise"):
+        reasons.append(
+            f"feature mismatch ({entry['feature']['match']}: "
+            + "; ".join(entry["feature"]["notes"])
+            + ")"
+        )
+    numerics = entry.get("numerics", {})
+    if not numerics.get("ok"):
+        reasons.append(
+            f"numerics above the {NUMERICS_REL_L2:g} relative L2 budget {numerics.get('rel_l2')}"
+        )
+    return "; ".join(reasons) or None
+
+
+def comparison(result: dict, phases: Sequence[str], column: str, rule: str) -> dict:
+    """The two-baseline comparison of a row on one timing ``column`` (``gpu``: the CUPTI cold-L2 span; ``ahead``:
+    the GPU time with the host enqueue hidden): per phase the deterministic and non-deterministic Cake times, the
+    best eligible baseline (or ``unsupported`` with every arm's reason) and the ratios ``det / nondet`` and
+    ``sota / nondet`` (above 1: the non-deterministic Cake mode is faster); every arm is listed with its time and,
+    when it cannot be the best, the reason."""
+
+    det, nondet = result["modes"]["det"], result["modes"]["nondet"]
+    arms = result.get("sota", {})
+    reasons = {name: ineligible_reason(entry) for name, entry in arms.items()}
+    excluded = "; ".join(
+        f"{name}: {reason}" for name, reason in reasons.items() if reason
+    )
+    out: dict = {"column": column, "rule": rule, "phases": {}}
+    for phase in phases:
+        key = f"{phase}_{column}"
+        row: dict = {
+            "det_us": det.get(f"{key}_us"),
+            "nondet_us": nondet.get(f"{key}_us"),
+            "arms": {
+                name: {
+                    "us": entry.get(f"{key}_us"),
+                    "eligible": reasons[name] is None,
+                    **({"excluded": reasons[name]} if reasons[name] else {}),
+                }
+                for name, entry in arms.items()
+            },
+        }
+        if row["det_us"] is not None and row["nondet_us"]:
+            row["det_over_nondet"] = row["det_us"] / row["nondet_us"]
+        best = result.get("best_sota", {}).get(key)
+        if best is not None and row["nondet_us"]:
+            row["sota"] = {
+                "arm": best["arm"],
+                "library": arms[best["arm"]].get("library"),
+                "determinism": arms[best["arm"]].get("determinism"),
+                "match": arms[best["arm"]]["feature"]["match"],
+                "us": best["us"],
+                "sota_over_nondet": best["us"] / row["nondet_us"],
+            }
+        else:
+            row["sota"] = {"unsupported": excluded or "no non-Cake baseline requested"}
+        out["phases"][phase] = row
+    return out
+
+
+def format_comparison(result: dict, head: str) -> list[str]:
+    """One line per phase of the row's two-baseline comparison: the timing column, det, nondet, the best eligible
+    baseline and the two ratios, or ``unsupported: <reason>``."""
+
+    block = result.get("comparison")
+    if not block:
+        return []
+    lines = []
+    for phase, row in block["phases"].items():
+        det, nondet = row["det_us"], row["nondet_us"]
+        cake = (
+            f"det {det:9.2f} nondet {nondet:9.2f} det/nondet {row['det_over_nondet']:5.3f}x"
+            if det is not None and nondet
+            else "det - nondet -"
+        )
+        sota = row["sota"]
+        best = (
+            f"unsupported: {sota['unsupported']}"
+            if "unsupported" in sota
+            else f"best {sota['arm']} ({sota['match']}) {sota['us']:9.2f} sota/nondet {sota['sota_over_nondet']:5.3f}x"
+        )
+        lines.append(f"{head} {phase:4s} compare [{block['column']}] {cake} | {best}")
     return lines
 
 

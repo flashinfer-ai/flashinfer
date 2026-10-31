@@ -55,7 +55,10 @@ two Cake modes in the same rounds and timed the same way (``fwd``: the training 
 ``sota`` with the library version, determinism, feature match and a numerics check against the Cake
 non-deterministic result, or as unsupported with the reason.  ``best_sota`` names the fastest eligible arm per phase
 and measure, ``speedup_vs_sota`` its time over the non-deterministic time (above 1: Cake faster), and every arm's
-``speedup`` its own ratio.
+``speedup`` its own ratio.  ``comparison`` is the row's two-baseline comparison on one column, the ``gpu`` time
+(``COMPARISON_COLUMN``): per phase the deterministic and non-deterministic Cake times, the best eligible arm with
+its library, determinism and match (or ``unsupported`` with every arm's reason; a feature- or precision-mismatched
+arm is listed but never the best), ``det_over_nondet`` and ``sota_over_nondet``; the ``compare`` lines print it.
 
 Example::
 
@@ -116,6 +119,12 @@ AHEAD_ENQUEUE_FACTOR = 3.0
 SIDE_KERNEL_CYCLES = 10_000_000
 SIDE_KERNEL_WARMUPS = 3
 SIDE_KERNEL_SAMPLES = 7
+# The two-baseline comparison of a row (det Cake, nondet Cake, best eligible non-Cake arm) uses one timing column.
+COMPARISON_COLUMN = "gpu"
+COMPARISON_RULE = (
+    "single rank: every arm compared on the CUPTI cold-L2 span (gpu; ckpt: the host-hidden span); "
+    "feature- or precision-mismatched arms are listed, never the best"
+)
 
 
 @dataclass(frozen=True)
@@ -578,6 +587,9 @@ def bench_row(
             nondet,
             [f"{phase}_{kind}" for phase in PHASES for kind in KINDS],
         )
+        result["comparison"] = baselines.comparison(
+            result, PHASES, COMPARISON_COLUMN, COMPARISON_RULE
+        )
     keys = [
         f"{phase}_{kind}"
         for phase in PHASES
@@ -645,7 +657,8 @@ def _format(result: dict) -> list[str]:
             )
     if "check" in result:
         lines.append(f"{head} check {result['check']}")
-    lines.extend(baselines.format_sota(result, head, PHASES, "gpu"))
+    lines.extend(baselines.format_sota(result, head, PHASES, COMPARISON_COLUMN))
+    lines.extend(baselines.format_comparison(result, head))
     return lines
 
 
