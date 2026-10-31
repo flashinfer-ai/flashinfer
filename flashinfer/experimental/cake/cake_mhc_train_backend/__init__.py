@@ -577,7 +577,11 @@ def _default_workspace(kind: str, rows: int, device: torch.device) -> torch.Tens
     key = (_device_index(device), kind, bucket)
     found = _DEFAULT_WORKSPACES.get(key)
     if found is None:
-        if torch.cuda.is_current_stream_capturing():
+        # The fill runs on the current stream of ``device`` (the stream the
+        # call launches on), which need not be the current device's stream.
+        with torch.cuda.device(key[0]):
+            capturing = torch.cuda.is_current_stream_capturing()
+        if capturing:
             raise ValueError(
                 f"no default {kind} workspace exists for T={rows} (token-count bucket {bucket}) and none can "
                 "be allocated during a CUDA graph capture: run the call once with deterministic=False and the "

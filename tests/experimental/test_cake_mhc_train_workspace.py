@@ -48,6 +48,10 @@ reference's).  On one buffer reused over realistic token-count sequences:
 * no default buffer is created during a CUDA graph capture (``ValueError``,
   nothing cached), and the eager call after it creates the buffer and matches
   the caller-owned workspace's call;
+* with two devices, the capture check reads the workspace device's current
+  stream, not the current device's: a capture on the workspace device raises
+  while another device is current, and a capture on another device does not
+  stop the call from creating the buffer and running eagerly;
 * one buffer over a ragged sequence with caller outputs, and the sizes of the
   workspace and which sizing serves which backward.
 """
@@ -655,6 +659,125 @@ def test_default_workspace_is_not_created_during_capture() -> None:
         f"{what}: the capture cached a default buffer"
     )
     assert out["cached_after_eager"], f"{what}: the eager call cached no default buffer"
+    assert out["finite"], f"{what}: non-finite outputs"
+    assert not out["differs"], (
+        f"{what}: {out['differs']} differ from the caller-owned workspace's call"
+    )
+
+
+# A fresh process with two devices: ``backward_finish(..., deterministic=False)`` on a caller-owned workspace of each
+# device (every module loaded), then the call with ``workspace=None`` on cuda:1 tensors, before any default buffer of
+# its bucket exists, (a) inside a capture on cuda:1 while cuda:0 is the current device and (b) inside a relaxed-mode
+# capture on cuda:0 (the call's stream, cuda:1's current stream, is not capturing).
+_CAPTURE_DEVICE_CHILD = r"""
+import importlib, json, sys
+import torch
+pkg = importlib.import_module(sys.argv[1])
+T = int(sys.argv[2])
+dev0, dev1 = torch.device("cuda:0"), torch.device("cuda:1")
+gen = torch.Generator(device="cpu").manual_seed(0)
+def r(*shape, dtype=torch.float32, scale=1.0):
+    return (torch.randn(shape, generator=gen) * scale).to(dtype)
+host = [r(T, 4, 4096, dtype=torch.bfloat16), r(T, 4, 4096, dtype=torch.bfloat16, scale=1e-3),
+        r(T, 4096, dtype=torch.bfloat16, scale=1e-3), None, r(24, 16384, scale=0.05), r(3, scale=0.1),
+        r(24), r(T, 64), r(T, 32, scale=1e-3)]
+def on(dev):
+    return [None if t is None else t.to(dev) for t in host]
+names = ("dX", "dfn", "dscale", "dbase")
+bucket = 1 << (T - 1).bit_length()
+for dev in (dev0, dev1):
+    ws = pkg.cake_mhc_train_backward_workspace(T, dev, deterministic=False)
+    pkg.cake_mhc_train_backward_finish(*on(dev), workspace=ws, deterministic=False)
+args1 = on(dev1)
+ws1 = pkg.cake_mhc_train_backward_workspace(T, dev1, deterministic=False)
+ref = [t.clone() for t in pkg.cake_mhc_train_backward_finish(*args1, workspace=ws1, deterministic=False)]
+torch.cuda.synchronize(dev0)
+torch.cuda.synchronize(dev1)
+out = {"cached_before": [(i, "bwd", bucket) in pkg._DEFAULT_WORKSPACES for i in (0, 1)], "raised_a": None, "raised_b": None}
+# Each capture gets its own stream: torch.cuda.graph's default capture stream is created once, on the device that
+# was current at the first capture, and reused by later captures on any device.
+capture1 = torch.cuda.Stream(device=dev1)
+with torch.cuda.device(dev1):
+    graph = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(graph, stream=capture1):
+            with torch.cuda.device(dev0):
+                out["stream_a"] = [torch.cuda.current_device(), torch.cuda.current_stream(dev1).cuda_stream == capture1.cuda_stream]
+                pkg.cake_mhc_train_backward_finish(*args1, deterministic=False)
+    except ValueError as e:
+        out["raised_a"] = str(e)
+    del graph
+torch.cuda.synchronize(dev1)
+out["cached_after_a"] = (1, "bwd", bucket) in pkg._DEFAULT_WORKSPACES
+y = torch.zeros(16, device=dev0)
+got = None
+capture0 = torch.cuda.Stream(device=dev0)
+with torch.cuda.device(dev0):
+    graph = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(graph, stream=capture0, capture_error_mode="relaxed"):
+            y.add_(1)
+            with torch.cuda.device(dev1):
+                capturing1 = torch.cuda.is_current_stream_capturing()
+            out["stream_b"] = [torch.cuda.current_device(), torch.cuda.current_stream(dev0).cuda_stream == capture0.cuda_stream, capturing1]
+            got = [t.clone() for t in pkg.cake_mhc_train_backward_finish(*args1, deterministic=False)]
+    except ValueError as e:
+        out["raised_b"] = str(e)
+    del graph
+torch.cuda.synchronize(dev0)
+torch.cuda.synchronize(dev1)
+out["cached_after_b"] = [(i, "bwd", bucket) in pkg._DEFAULT_WORKSPACES for i in (0, 1)]
+out["ran_b"] = got is not None
+if got is not None:
+    out["differs"] = [n for n, a, b in zip(names, got, ref) if n != "dfn" and not torch.equal(a, b)]
+    out["finite"] = all(bool(torch.isfinite(t).all()) for t in got)
+print(json.dumps(out), flush=True)
+"""
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs two CUDA devices")
+def test_default_workspace_capture_check_uses_workspace_device() -> None:
+    T = 300
+    run = subprocess.run(
+        [sys.executable, "-c", _CAPTURE_DEVICE_CHILD, PACKAGES[KEY], str(T)],
+        cwd=Path(__file__).resolve().parents[2],
+        capture_output=True,
+        text=True,
+        timeout=900,
+    )
+    tail = "\n".join((run.stdout + run.stderr).strip().splitlines()[-6:])
+    assert run.returncode == 0, (
+        f"two-device capture child: exit {run.returncode}\n{tail}"
+    )
+    lines = [
+        json.loads(line) for line in run.stdout.splitlines() if line.startswith("{")
+    ]
+    assert len(lines) == 1, tail
+    out = lines[0]
+    what = (
+        f"backward_finish(deterministic=False) at T={T} on cuda:1's default workspace"
+    )
+    assert out["cached_before"] == [False, False], (
+        f"{what}: a default buffer existed before the captures"
+    )
+    assert out.get("stream_a") == [0, True], (
+        f"{what}: capture (a) did not run on cuda:1's stream with cuda:0 current ({out.get('stream_a')})"
+    )
+    assert out.get("stream_b") == [0, True, False], (
+        f"{what}: capture (b) did not run on cuda:0's stream with cuda:1 idle ({out.get('stream_b')})"
+    )
+    assert out["raised_a"] is not None and "CUDA graph capture" in out["raised_a"], (
+        f"{what}: no ValueError inside a capture on cuda:1 with cuda:0 current ({out['raised_a']!r})"
+    )
+    assert not out["cached_after_a"], (
+        f"{what}: the capture on cuda:1 cached a default buffer"
+    )
+    assert out["raised_b"] is None, (
+        f"{what}: ValueError inside a capture on cuda:0 ({out['raised_b']!r})"
+    )
+    assert out["ran_b"] and out["cached_after_b"] == [False, True], (
+        f"{what}: the call during a capture on cuda:0 cached {out['cached_after_b']}"
+    )
     assert out["finite"], f"{what}: non-finite outputs"
     assert not out["differs"], (
         f"{what}: {out['differs']} differ from the caller-owned workspace's call"

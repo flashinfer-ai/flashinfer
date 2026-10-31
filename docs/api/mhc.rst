@@ -137,9 +137,10 @@ The default workspaces (``workspace=None``) are one buffer per device and
 power-of-two token-count bucket in each package, shared by every stream and
 every graph replay on the device: calls that can run concurrently on different
 streams pass caller-owned workspaces. ``deterministic=False`` creates no
-default buffer during a CUDA graph capture (``ValueError``); warm up with the
-same ``deterministic`` value and token count before the capture. A companion
-is allocated zeroed outside any capture and every completed launch leaves its
+default buffer while the current stream of the buffer's device is capturing a
+CUDA graph (``ValueError``); warm up with the same ``deterministic`` value and
+token count before the capture. A companion is allocated zeroed outside any
+capture and every completed launch leaves its
 ticket words at zero, so it needs no reset; ``cake_mhc_train_reset_workspace``
 zeroes the buffer it is given.
 
