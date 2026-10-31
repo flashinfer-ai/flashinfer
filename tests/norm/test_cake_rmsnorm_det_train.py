@@ -49,6 +49,7 @@ from tests.test_helpers.cake_package import cake_package
 pkg = cake_package("cake_rmsnorm_det_train")
 cake_build = cake_package("cake_rmsnorm_det_train", "cake_build")
 loader = cake_package("cake_rmsnorm_det_train", "cake_jit")
+windows = cake_package("cake_rmsnorm_det_train", "cake_windows")
 cake_rmsnorm_det = pkg.cake_rmsnorm_det
 cake_rmsnorm_det_train_backward = pkg.cake_rmsnorm_det_train_backward
 cake_rmsnorm_det_train_backward_workspace = (
@@ -61,7 +62,15 @@ cake_rmsnorm_det_train_forward = pkg.cake_rmsnorm_det_train_forward
 is_cake_rmsnorm_det_train_supported = pkg.is_cake_rmsnorm_det_train_supported
 
 SUPPORTED_CAPABILITIES = ((10, 0), (10, 3), (10, 7))
-WIDTHS = ((6144, 1e-5), (4096, 1e-5), (2048, 1e-6), (1536, 1e-6), (512, 1e-6))
+WIDTHS = (
+    (6144, 1e-5),
+    (5120, 1e-5),
+    (4096, 1e-5),
+    (2048, 1e-6),
+    (1536, 1e-6),
+    (512, 1e-6),
+    (256, 1e-6),
+)
 HIDDEN_SIZES = tuple(hidden for hidden, _eps in WIDTHS)
 EPS = {hidden: eps for hidden, eps in WIDTHS}
 # Widths whose contract names both eps values: every case runs at each.
@@ -74,6 +83,18 @@ CONTRACT_ROWS = {
     1536: (1023, 1025, 4097, 14928, 15566, 16263, 16384, 32769, 65536),
 }
 STRIDE_PADS = (0, 64, "2H")
+# The row count standing in for the open end of a route's last program window.
+OPEN_WINDOW_ROWS = 65536
+# Bounds of the differences a window edge of class ``ulp`` / ``dx`` / ``unmeasured`` may show on the common rows
+# of T = edge and T = edge + 1 (``cake_windows.EDGES``; the measured figures are in the docstring notes): rstd within
+# a few FP32 ulps on at most half of the rows; y and dx within one BF16 ulp of the element -- or within a 2^-14 share
+# of the row's RMS, for the elements a cancellation leaves far below it -- on at most a twentieth of the rows across
+# an edge of class ``dx`` (whose forward is identical) and, across an edge of class ``ulp`` / ``unmeasured``, only on
+# rows whose rstd differs (the residual H = 6144 route moves dx on about a tenth of the rows at its edge 1024).
+EDGE_RSTD_ULPS = 4
+EDGE_RSTD_ROW_SHARE = 0.5
+EDGE_BF16_ROW_SHARE = 0.05
+EDGE_BF16_ROW_FLOOR = 2.0**-14
 SCALES = (1.0, 1e-3, 1e3)
 ATOL = 1e-2
 RTOL = 1e-2
@@ -407,6 +428,250 @@ def test_backward_programs_switch_on_row_count(hidden: int) -> None:
     )
 
 
+# --------------------------------------------------------------------------- the program windows
+
+
+def _route_edges(
+    arch: str, hidden: int, kind: str, residual: bool
+) -> list[tuple[int, str]]:
+    """``(edge, class)`` of every window edge a call of the route crosses, the edges from the registry's windows
+    (``program_windows``) and the class from the exporter's measurements (``cake_windows.EDGES``); a backward route
+    crosses the forward's edges inside its windows as well (the backward consumes the forward's rstd) and takes the
+    forward's class there."""
+
+    route = loader.route_key(hidden, kind, residual)
+    classes = dict(windows.EDGES[arch][route])
+    edges = {}
+    for _low, high, _library in loader.program_windows(arch, hidden, kind, residual):
+        if high is not None:
+            edges[high] = classes[high]
+    if kind == "bwd":
+        forward = dict(windows.EDGES[arch][loader.route_key(hidden, "fwd", residual)])
+        for _low, high, _library in loader.program_windows(
+            arch, hidden, "fwd", residual
+        ):
+            if high is not None:
+                edges.setdefault(high, forward[high])
+    return sorted(edges.items())
+
+
+def _window_spans(
+    arch: str, hidden: int, kind: str, residual: bool
+) -> list[tuple[int, int]]:
+    """``(first, last)`` row counts of every window of the route (a backward route's windows cut at the forward's
+    edges too); the open last window ends at ``OPEN_WINDOW_ROWS``, or ``OPEN_WINDOW_ROWS`` past the last edge when
+    that edge is not below it."""
+
+    edges = [edge for edge, _cls in _route_edges(arch, hidden, kind, residual)]
+    top = max(edges, default=0)
+    end = OPEN_WINDOW_ROWS if top < OPEN_WINDOW_ROWS else top + OPEN_WINDOW_ROWS
+    bounds = [0, *edges, end]
+    return [(low + 1, high) for low, high in zip(bounds, bounds[1:], strict=False)]
+
+
+def _base_inputs(
+    hidden: int, rows: int, kind: str, residual: bool
+) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
+    """One random input of ``rows`` rows whose prefixes the window tests slice, and the weight."""
+
+    generator = _generator(hidden, 61, kind == "bwd", residual)
+    base = {"x": _rows(rows, hidden, generator=generator)}
+    w = _weight(hidden, generator)
+    if residual:
+        base["u"] = _rows(rows, hidden, generator=generator)
+    if kind == "bwd":
+        base["g"] = _rows(rows, hidden, generator=generator)
+        if residual:
+            base["g_h"] = _rows(rows, hidden, generator=generator)
+    return base, w
+
+
+def _route_outputs(
+    kind: str,
+    residual: bool,
+    base: dict[str, torch.Tensor],
+    rows: int,
+    w: torch.Tensor,
+    eps: float,
+) -> dict[str, torch.Tensor]:
+    """The outputs of one call of the route on the first ``rows`` rows of ``base``: y, rstd (and h_new) of the
+    forward, and dx as well for a backward route (dw sums every row and depends on T by definition)."""
+
+    x = base["x"][:rows]
+    u = base["u"][:rows] if residual else None
+    outputs = cake_rmsnorm_det_train_forward(x, w, eps, residual=u)
+    result = {"y": outputs[0], "rstd": outputs[1]}
+    if residual:
+        result["h_new"] = outputs[2]
+    if kind == "bwd":
+        g_h = base["g_h"][:rows] if residual else None
+        dx, _dw = cake_rmsnorm_det_train_backward(
+            base["g"][:rows],
+            outputs[2] if residual else x,
+            w,
+            outputs[1],
+            g_residual=g_h,
+        )
+        result["dx"] = dx
+    return result
+
+
+def _ordered_bits(t: torch.Tensor) -> torch.Tensor:
+    """The float bits as an integer key monotone in the value: the key distance of two floats is their distance in
+    ulps of the format."""
+
+    if t.dtype == torch.bfloat16:
+        bits, sign = t.view(torch.int16).to(torch.int64), 1 << 15
+    else:
+        assert t.dtype == torch.float32
+        bits, sign = t.view(torch.int32).to(torch.int64), 1 << 31
+    return torch.where(bits >= 0, bits, -(bits + sign))
+
+
+def _ulps_apart(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    return (_ordered_bits(a) - _ordered_bits(b)).abs()
+
+
+def _differing_rows(a: torch.Tensor, b: torch.Tensor) -> int:
+    differs = a != b
+    if differs.ndim > 1:
+        differs = differs.reshape(differs.shape[0], -1).any(dim=1)
+    return int(differs.sum().item())
+
+
+def _assert_within_a_bf16_ulp(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    label: str,
+    *,
+    row_share: float = EDGE_BF16_ROW_SHARE,
+) -> None:
+    """``a`` and ``b`` (BF16 ``[rows, H]``) agree to one BF16 ulp per element -- or to ``EDGE_BF16_ROW_FLOOR`` of the
+    row's RMS where a cancellation leaves the element far below it -- and differ on at most ``row_share`` of the
+    rows."""
+
+    floor = EDGE_BF16_ROW_FLOOR * a.float().pow(2).mean(dim=1, keepdim=True).sqrt()
+    within = (_ulps_apart(a, b) <= 1) | ((a.float() - b.float()).abs() <= floor)
+    assert within.all(), f"{label}: {int((~within).sum())} elements beyond one BF16 ulp"
+    rows = _differing_rows(a, b)
+    assert rows <= row_share * a.shape[0], (
+        f"{label}: differs on {rows} of {a.shape[0]} rows"
+    )
+
+
+def _assert_edge_class(
+    low: dict[str, torch.Tensor], high: dict[str, torch.Tensor], cls: str, label: str
+) -> None:
+    """The outputs of T = edge (``low``) and T = edge + 1 (``high``) on their common rows behave as the edge's class
+    says: ``same`` -- bitwise identical; ``ulp`` -- rstd differs on some rows by a few FP32 ulps, y and dx by at most
+    one BF16 ulp and only on rows whose rstd differs; ``dx`` -- y and rstd identical, dx differs on a few rows (the
+    base and the bulk-copy backward reduce a row in different orders); ``unmeasured`` -- bounded like ``ulp``."""
+
+    rows = low["rstd"].shape[0]
+    common = {key: value[:rows] for key, value in high.items()}
+    assert set(low) == set(common), label
+    if cls == "same":
+        for key, value in low.items():
+            assert torch.equal(value, common[key]), (
+                f"{label}: {key} differs across an edge of class 'same'"
+            )
+        return
+    assert cls in ("ulp", "dx", "unmeasured"), (label, cls)
+    if "h_new" in low:
+        assert torch.equal(low["h_new"], common["h_new"]), f"{label}: h_new differs"
+    same_rstd = low["rstd"] == common["rstd"]
+    rstd_rows = rows - int(same_rstd.sum().item())
+    if cls == "dx":
+        assert rstd_rows == 0 and torch.equal(low["y"], common["y"]), (
+            f"{label}: the forward differs across an edge of class 'dx' ({rstd_rows} rstd rows)"
+        )
+    else:
+        assert (_ulps_apart(low["rstd"], common["rstd"]) <= EDGE_RSTD_ULPS).all(), (
+            f"{label}: rstd beyond {EDGE_RSTD_ULPS} FP32 ulps"
+        )
+        assert rstd_rows <= EDGE_RSTD_ROW_SHARE * rows, (
+            f"{label}: rstd differs on {rstd_rows} of {rows} rows"
+        )
+        # y and dx move only with rstd (asserted exactly for class 'ulp' below): the rstd share bounds their rows.
+        _assert_within_a_bf16_ulp(
+            low["y"], common["y"], f"{label}: y", row_share=EDGE_RSTD_ROW_SHARE
+        )
+        if cls == "ulp":
+            assert rstd_rows > 0, (
+                f"{label}: rstd is identical across an edge of class 'ulp' (re-measure the edge)"
+            )
+            assert torch.equal(low["y"][same_rstd], common["y"][same_rstd]), (
+                f"{label}: y differs on rows whose rstd agrees"
+            )
+    if "dx" in low:
+        share = EDGE_BF16_ROW_SHARE if cls == "dx" else EDGE_RSTD_ROW_SHARE
+        _assert_within_a_bf16_ulp(
+            low["dx"], common["dx"], f"{label}: dx", row_share=share
+        )
+        if cls == "ulp":
+            assert torch.equal(low["dx"][same_rstd], common["dx"][same_rstd]), (
+                f"{label}: dx differs on rows whose rstd agrees"
+            )
+        elif cls == "dx" and rows >= 4096:
+            assert _differing_rows(low["dx"], common["dx"]) > 0, (
+                f"{label}: dx is identical across an edge of class 'dx' (re-measure the edge)"
+            )
+
+
+@pytest.mark.parametrize("hidden", HIDDEN_SIZES)
+@pytest.mark.parametrize("kind", ("fwd", "bwd"))
+@pytest.mark.parametrize("residual", (False, True))
+def test_outputs_are_prefix_invariant_within_windows(
+    hidden: int, kind: str, residual: bool
+) -> None:
+    """Within one program window a row's outputs do not depend on T: for every window of the route (a backward
+    route's windows cut at the forward's edges too) the calls at the window's first and last row count
+    (``_window_spans``' end standing for an open window) return bitwise-identical y, rstd, h_new and dx on their
+    common rows."""
+
+    _skip_unless_route(hidden, residual)
+    arch = loader.arch_for_capability(_capability())
+    label = f"{arch} {loader.route_key(hidden, kind, residual)}"
+    spans = _window_spans(arch, hidden, kind, residual)
+    base, w = _base_inputs(hidden, max(last for _first, last in spans), kind, residual)
+    for first, last in spans:
+        low = _route_outputs(kind, residual, base, first, w, EPS[hidden])
+        high = _route_outputs(kind, residual, base, last, w, EPS[hidden])
+        for key, value in low.items():
+            assert torch.equal(value, high[key][:first]), (
+                f"{label} window [{first}, {last}]: {key} depends on T"
+            )
+
+
+@pytest.mark.parametrize("hidden", HIDDEN_SIZES)
+@pytest.mark.parametrize("kind", ("fwd", "bwd"))
+@pytest.mark.parametrize("residual", (False, True))
+def test_window_edges_match_the_measured_classes(
+    hidden: int, kind: str, residual: bool
+) -> None:
+    """At every window edge of the route the outputs of T = edge and T = edge + 1 behave on their common rows as the
+    exporter measured (``cake_windows.EDGES``, see ``_assert_edge_class``); an unmeasured edge is bounded and named."""
+
+    _skip_unless_route(hidden, residual)
+    arch = loader.arch_for_capability(_capability())
+    route = loader.route_key(hidden, kind, residual)
+    edges = _route_edges(arch, hidden, kind, residual)
+    if not edges:
+        pytest.skip(f"{arch} {route} has one program window")
+    base, w = _base_inputs(hidden, edges[-1][0] + 1, kind, residual)
+    unmeasured = []
+    for edge, cls in edges:
+        low = _route_outputs(kind, residual, base, edge, w, EPS[hidden])
+        high = _route_outputs(kind, residual, base, edge + 1, w, EPS[hidden])
+        _assert_edge_class(low, high, cls, f"{arch} {route} edge {edge} (class {cls})")
+        if cls == "unmeasured":
+            unmeasured.append(edge)
+    if unmeasured:
+        pytest.skip(
+            f"{arch} {route}: edges {unmeasured} are within bounds but unmeasured"
+        )
+
+
 @pytest.mark.parametrize("hidden", HIDDEN_SIZES)
 @pytest.mark.parametrize("stride_pad", STRIDE_PADS[1:])
 @pytest.mark.parametrize("rows", (7, 129, 16231))
@@ -582,6 +847,337 @@ def test_half_vector_aligned_weight_is_materialized(hidden: int) -> None:
     _assert_dw(dw, dw_ref, g, x, rstd, f"dw {label}")
     dx_aligned, dw_aligned = cake_rmsnorm_det_train_backward(g, x, w_aligned, rstd)
     assert torch.equal(dx, dx_aligned) and torch.equal(dw, dw_aligned), label
+
+
+# --------------------------------------------------------------------------- N-D inputs (the row collapse)
+
+
+def _nd_rows(
+    rows: int, heads: int, hidden: int, *, pitch_pad: int, generator: torch.Generator
+) -> torch.Tensor:
+    """BF16 ``[rows, heads, hidden]`` view of a ``[rows, heads, hidden + pitch_pad]`` buffer: strides
+    ``(heads x (hidden + pad), hidden + pad, 1)``, the issue's layout when ``pad > 0``."""
+
+    base = torch.randn(
+        max(rows, 1),
+        heads,
+        hidden + pitch_pad,
+        dtype=torch.float32,
+        device=_device(),
+        generator=generator,
+    ).to(torch.bfloat16)
+    return base[:rows, :, :hidden]
+
+
+@pytest.mark.parametrize("hidden", HIDDEN_SIZES)
+@pytest.mark.parametrize("heads", (1, 3, 24))
+@pytest.mark.parametrize("rows", (0, 1, 7, 129))
+@pytest.mark.parametrize("pitch_pad", (0, 16, 256))
+def test_nd_inputs_collapse_to_rows(
+    hidden: int, heads: int, rows: int, pitch_pad: int
+) -> None:
+    """A ``[T, heads, H]`` input whose leading dimensions are contiguous with one another (strides
+    ``(heads x pitch, pitch, 1)``) is the ``[T x heads, H]`` call: y, rstd, dx and dw bitwise equal to the 2-D call
+    on the same rows, the outputs in the input's leading shape, a flat rstd accepted by the backward too."""
+
+    _skip_unless_hidden(hidden)
+    generator = _generator(hidden, heads, rows, pitch_pad, 71)
+    x3 = _nd_rows(rows, heads, hidden, pitch_pad=pitch_pad, generator=generator)
+    if (hidden, heads, pitch_pad) == (256, 24, 256):
+        assert tuple(x3.stride()) == (12288, 512, 1)  # the issue's per-head view
+    w = _weight(hidden, generator)
+    g3 = _nd_rows(rows, heads, hidden, pitch_pad=pitch_pad, generator=generator)
+    eps = EPS[hidden]
+    x2 = x3.reshape(rows * heads, hidden)
+    g2 = g3.reshape(rows * heads, hidden)
+    y3, rstd3 = cake_rmsnorm_det_train_forward(x3, w, eps)
+    y2, rstd2 = cake_rmsnorm_det_train_forward(x2, w, eps)
+    assert tuple(y3.shape) == (rows, heads, hidden) and y3.is_contiguous()
+    assert tuple(rstd3.shape) == (rows, heads) and rstd3.dtype == torch.float32
+    assert torch.equal(y3.reshape(-1, hidden), y2) and torch.equal(
+        rstd3.reshape(-1), rstd2
+    )
+    dx3, dw3 = cake_rmsnorm_det_train_backward(g3, x3, w, rstd3)
+    dx2, dw2 = cake_rmsnorm_det_train_backward(g2, x2, w, rstd2)
+    assert tuple(dx3.shape) == (rows, heads, hidden) and dx3.is_contiguous()
+    assert torch.equal(dx3.reshape(-1, hidden), dx2) and torch.equal(dw3, dw2)
+    dx3_flat, dw3_flat = cake_rmsnorm_det_train_backward(g3, x3, w, rstd3.reshape(-1))
+    assert torch.equal(dx3_flat, dx3) and torch.equal(dw3_flat, dw3)
+    if rows == 0:
+        return
+    # Preallocated N-D outputs: contiguous ones are written in place, a strided one receives a copy.
+    out = torch.empty_like(y3)
+    rstd_out = torch.empty(rows, heads, dtype=torch.float32, device=_device())
+    outputs = cake_rmsnorm_det_train_forward(x3, w, eps, out=out, rstd=rstd_out)
+    assert outputs[0] is out and outputs[1] is rstd_out
+    assert torch.equal(out, y3) and torch.equal(rstd_out, rstd3)
+    strided = torch.empty(
+        rows, heads, hidden + 16, dtype=torch.bfloat16, device=_device()
+    )[..., :hidden]
+    outputs = cake_rmsnorm_det_train_forward(x3, w, eps, out=strided)
+    assert outputs[0] is strided and torch.equal(strided, y3)
+    dx_out = torch.empty_like(dx3)
+    outputs = cake_rmsnorm_det_train_backward(g3, x3, w, rstd3, dx=dx_out)
+    assert outputs[0] is dx_out and torch.equal(dx_out, dx3)
+
+
+@pytest.mark.parametrize("hidden", HIDDEN_SIZES)
+def test_nd_autograd_matches_the_2d_call(hidden: int) -> None:
+    _skip_unless_hidden(hidden)
+    rows, heads = 7, 3
+    generator = _generator(hidden, rows, heads, 73)
+    x3 = _nd_rows(rows, heads, hidden, pitch_pad=16, generator=generator)
+    g3 = _nd_rows(rows, heads, hidden, pitch_pad=0, generator=generator)
+    w = _weight(hidden, generator)
+    x3_leaf = x3.detach().clone().requires_grad_(True)
+    x2_leaf = x3.reshape(rows * heads, hidden).detach().clone().requires_grad_(True)
+    w3 = w.detach().clone().requires_grad_(True)
+    w2 = w.detach().clone().requires_grad_(True)
+    y3 = cake_rmsnorm_det(x3_leaf, w3, EPS[hidden])
+    y2 = cake_rmsnorm_det(x2_leaf, w2, EPS[hidden])
+    assert tuple(y3.shape) == (rows, heads, hidden)
+    assert torch.equal(y3.reshape(-1, hidden), y2)
+    y3.backward(g3)
+    y2.backward(g3.reshape(-1, hidden))
+    assert tuple(x3_leaf.grad.shape) == (rows, heads, hidden)
+    assert torch.equal(x3_leaf.grad.reshape(-1, hidden), x2_leaf.grad)
+    assert torch.equal(w3.grad, w2.grad)
+
+
+def test_the_issues_hidden_256_view_collapses_before_the_route_lookup() -> None:
+    """The ``[T, 24, 256]`` view with strides ``(12288, 512, 1)`` of a ``[T, 24, 512]`` buffer collapses to
+    ``24 T`` rows of 256: the host reaches the route lookup, which answers for hidden 256 with the width-256
+    route (a device without it gets the ValueError naming hidden=256, not the shape)."""
+
+    rows = 16
+    buffer = torch.zeros(rows, 24, 512, dtype=torch.bfloat16, device=_device())
+    x = buffer[..., :256]
+    assert tuple(x.stride()) == (12288, 512, 1)
+    w = torch.ones(256, dtype=torch.bfloat16, device=_device())
+    if is_cake_rmsnorm_det_train_supported(_device(), 256):
+        y, rstd = cake_rmsnorm_det_train_forward(x, w, 1e-6)
+        assert tuple(y.shape) == (rows, 24, 256) and tuple(rstd.shape) == (rows, 24)
+        dx, dw = cake_rmsnorm_det_train_backward(x, x, w, rstd)
+        assert tuple(dx.shape) == (rows, 24, 256) and tuple(dw.shape) == (256,)
+        return
+    with pytest.raises(
+        ValueError, match=r"no exported Cake RMSNorm training forward for hidden=256 "
+    ):
+        cake_rmsnorm_det_train_forward(x, w, 1e-6)
+    rstd = torch.ones(rows, 24, dtype=torch.float32, device=_device())
+    with pytest.raises(
+        ValueError, match=r"no exported Cake RMSNorm training backward for hidden=256 "
+    ):
+        cake_rmsnorm_det_train_backward(x, x, w, rstd)
+
+
+@pytest.mark.parametrize("hidden", HIDDEN_SIZES[:1])
+def test_nd_inputs_outside_the_collapse_rule_are_refused(hidden: int) -> None:
+    _skip_unless_hidden(hidden)
+    rows, heads = 8, 4
+    eps = EPS[hidden]
+    w = _weight(hidden, _generator(hidden, 5))
+    # Heads-major storage viewed as [T, heads, H]: stride(0) != stride(1) * heads.
+    x = torch.zeros(
+        heads, rows, hidden, dtype=torch.bfloat16, device=_device()
+    ).transpose(0, 1)
+    assert tuple(x.stride()) == (hidden, rows * hidden, 1)
+    with pytest.raises(ValueError, match=r"cannot be viewed as \[32, "):
+        cake_rmsnorm_det_train_forward(x, w, eps)
+    rstd = torch.ones(rows, heads, dtype=torch.float32, device=_device())
+    with pytest.raises(ValueError, match=r"cannot be viewed as \[32, "):
+        cake_rmsnorm_det_train_backward(x.contiguous(), x, w, rstd)
+    # A feature dimension that is not contiguous.
+    x = torch.zeros(rows, heads, hidden, 2, dtype=torch.bfloat16, device=_device())[
+        ..., 0
+    ]
+    with pytest.raises(ValueError, match="cannot be viewed as"):
+        cake_rmsnorm_det_train_forward(x, w, eps)
+    # One dimension is not enough.
+    with pytest.raises(ValueError, match=r"must be a \[T, H\] tensor"):
+        cake_rmsnorm_det_train_forward(
+            torch.zeros(hidden, dtype=torch.bfloat16, device=_device()), w, eps
+        )
+    # Companions take x's N-D shape.
+    x3 = torch.zeros(rows, heads, hidden, dtype=torch.bfloat16, device=_device())
+    with pytest.raises(ValueError, match="residual must have shape"):
+        cake_rmsnorm_det_train_forward(
+            x3, w, eps, residual=x3.reshape(rows * heads, hidden)
+        )
+    with pytest.raises(ValueError, match="g must have shape"):
+        cake_rmsnorm_det_train_backward(x3.reshape(rows * heads, hidden), x3, w, rstd)
+    # Dimensions of size one are free: [T, 1, H] slices of a wider buffer collapse to T rows.
+    x = torch.zeros(rows, 3, hidden, dtype=torch.bfloat16, device=_device())[:, 1:2, :]
+    y, rstd = cake_rmsnorm_det_train_forward(x, w, eps)
+    assert tuple(y.shape) == (rows, 1, hidden) and tuple(rstd.shape) == (rows, 1)
+
+
+# --------------------------------------------------------------------------- FP32 effective weights
+
+
+def _fp32_route(hidden: int, kind: str, residual: bool) -> bool:
+    return loader.route_applies(
+        device_capability=_capability(),
+        hidden=hidden,
+        kind=kind,
+        residual=residual,
+        w_dtype="f32",
+    )
+
+
+def _skip_unless_fp32_routes(hidden: int, residual: bool) -> None:
+    _skip_unless_route(hidden, residual)
+    if not (
+        _fp32_route(hidden, "fwd", residual) and _fp32_route(hidden, "bwd", residual)
+    ):
+        pytest.skip(
+            f"hidden={hidden} residual={residual}: no FP32-weight route on this device"
+        )
+
+
+def _fp32_case(
+    hidden: int,
+    rows: int,
+    residual: bool,
+    w32: torch.Tensor,
+    generator: torch.Generator,
+) -> tuple[
+    tuple[torch.Tensor, ...], torch.Tensor, torch.Tensor, dict[str, torch.Tensor]
+]:
+    """One forward + backward with the FP32 weight ``w32``: ``(forward outputs, dx, dw, inputs)``."""
+
+    eps = EPS[hidden]
+    x = _rows(rows, hidden, generator=generator)
+    u = _rows(rows, hidden, generator=generator) if residual else None
+    g = _rows(rows, hidden, generator=generator)
+    g_h = _rows(rows, hidden, generator=generator) if residual else None
+    outputs = cake_rmsnorm_det_train_forward(x, w32, eps, residual=u)
+    normalized = outputs[2] if residual else x
+    dx, dw = cake_rmsnorm_det_train_backward(
+        g, normalized, w32, outputs[1], g_residual=g_h
+    )
+    return (
+        outputs,
+        dx,
+        dw,
+        {"x": x, "u": u, "g": g, "g_h": g_h, "normalized": normalized},
+    )
+
+
+def _window_rows(hidden: int, residual: bool) -> tuple[int, ...]:
+    """The row counts that visit every window of the route's forward and backward programs:
+    both sides of every window edge, the smallest counts and the training shape."""
+
+    arch = loader.arch_for_capability(_capability())
+    rows = {1, 2, 129, 16231}
+    for kind in ("fwd", "bwd"):
+        for above, at_most, _library in loader.program_windows(
+            arch, hidden, kind, residual
+        ):
+            rows.add(above + 1)
+            if at_most is not None:
+                rows.update((at_most, at_most + 1))
+    return tuple(sorted(rows))
+
+
+@pytest.mark.parametrize("hidden", HIDDEN_SIZES)
+@pytest.mark.parametrize("residual", (False, True))
+def test_fp32_weight_equal_to_the_bf16_weight_matches_it_bitwise(
+    hidden: int, residual: bool
+) -> None:
+    """``w32 = float(w16)`` gives bitwise the BF16 path's y, rstd, h_new, dx and dw in every
+    window of the route: the FP32-weight programs are the BF16 programs with the weight loaded
+    at FP32, selected over the same windows."""
+
+    _skip_unless_fp32_routes(hidden, residual)
+    for rows in _window_rows(hidden, residual):
+        generator = _generator(hidden, rows, residual, 83)
+        w16 = _weight(hidden, generator)
+        seed = generator.get_state()
+        outputs16, dx16, dw16, _ = _fp32_case(hidden, rows, residual, w16, generator)
+        generator.set_state(seed)
+        outputs32, dx32, dw32, _ = _fp32_case(
+            hidden, rows, residual, w16.float(), generator
+        )
+        assert len(outputs16) == len(outputs32) == (3 if residual else 2)
+        for name, a, b in zip(
+            ("y", "rstd", "h_new")[: len(outputs16)], outputs16, outputs32, strict=True
+        ):
+            assert torch.equal(a, b), (
+                f"hidden={hidden} residual={residual} rows={rows}: {name} differs"
+            )
+        label = f"hidden={hidden} residual={residual} rows={rows}"
+        assert torch.equal(dx16, dx32), f"{label}: dx differs"
+        assert torch.equal(dw16, dw32), f"{label}: dw differs"
+
+
+@pytest.mark.parametrize("hidden", HIDDEN_SIZES)
+@pytest.mark.parametrize("residual", (False, True))
+@pytest.mark.parametrize("rows", (7, 16231))
+def test_fp32_weight_is_applied_at_fp32(hidden: int, residual: bool, rows: int) -> None:
+    """An effective weight ``1 + delta`` that BF16 cannot represent is applied as given: y and dx match the FP64
+    reference computed with the FP32 weight, and differ from the BF16 path given ``bf16(w32)``."""
+
+    _skip_unless_fp32_routes(hidden, residual)
+    generator = _generator(hidden, rows, residual, 89)
+    w32 = 1.0 + 1e-3 * torch.randn(
+        hidden, dtype=torch.float32, device=_device(), generator=generator
+    )
+    assert not torch.equal(w32.to(torch.bfloat16).float(), w32)
+    seed = generator.get_state()
+    outputs, dx, dw, inputs = _fp32_case(hidden, rows, residual, w32, generator)
+    eps = EPS[hidden]
+    y_ref, rstd_ref, _h = _reference_forward(
+        inputs["x"], w32, eps, residual=inputs["u"]
+    )
+    dx_ref, dw_ref = _reference_backward(
+        inputs["g"], inputs["normalized"], w32, eps, g_h=inputs["g_h"]
+    )
+    label = f"hidden={hidden} residual={residual} rows={rows} fp32 w"
+    _assert_bf16_close(outputs[0], y_ref, f"y {label}")
+    assert _rel_l2(outputs[1], rstd_ref) <= RSTD_REL_L2, f"rstd {label}"
+    _assert_bf16_close(dx, dx_ref, f"dx {label}")
+    _assert_dw(dw, dw_ref, inputs["g"], inputs["normalized"], outputs[1], f"dw {label}")
+    generator.set_state(seed)
+    outputs16, dx16, _dw16, _ = _fp32_case(
+        hidden, rows, residual, w32.to(torch.bfloat16), generator
+    )
+    assert torch.equal(outputs16[1], outputs[1]), f"{label}: rstd does not depend on w"
+    assert not torch.equal(outputs16[0], outputs[0]), (
+        f"{label}: y ignores the FP32 weight"
+    )
+    assert not torch.equal(dx16, dx), f"{label}: dx ignores the FP32 weight"
+
+
+@pytest.mark.parametrize("hidden", HIDDEN_SIZES)
+def test_fp32_weight_layouts_outside_the_rule_are_materialized(hidden: int) -> None:
+    """An FP32 weight that is not 32-byte aligned, or not contiguous, is copied once: the same results as the
+    aligned contiguous weight (and the autograd path returns ``dw`` in FP32 for an FP32 weight)."""
+
+    _skip_unless_fp32_routes(hidden, False)
+    rows = 129
+    generator = _generator(hidden, rows, 97)
+    w32 = 1.0 + 1e-3 * torch.randn(
+        hidden, dtype=torch.float32, device=_device(), generator=generator
+    )
+    seed = generator.get_state()
+    outputs, dx, dw, _ = _fp32_case(hidden, rows, False, w32, generator)
+    storage = torch.empty(hidden + 8, dtype=torch.float32, device=_device())
+    half_aligned = storage[4 : 4 + hidden]
+    half_aligned.copy_(w32)
+    assert half_aligned.data_ptr() % loader.FP32_WEIGHT_ALIGNMENT_BYTES == 16
+    strided = torch.empty(2 * hidden, dtype=torch.float32, device=_device())[::2]
+    strided.copy_(w32)
+    for layout in (half_aligned, strided):
+        generator.set_state(seed)
+        outputs_l, dx_l, dw_l, _ = _fp32_case(hidden, rows, False, layout, generator)
+        assert all(torch.equal(a, b) for a, b in zip(outputs, outputs_l, strict=True))
+        assert torch.equal(dx, dx_l) and torch.equal(dw, dw_l)
+    x = _rows(rows, hidden, generator=generator).requires_grad_(True)
+    w_leaf = w32.clone().requires_grad_(True)
+    y = cake_rmsnorm_det(x, w_leaf, EPS[hidden])
+    y.backward(torch.ones_like(y))
+    assert w_leaf.grad.dtype == torch.float32 and x.grad.dtype == torch.bfloat16
 
 
 @pytest.mark.parametrize("hidden", HIDDEN_SIZES)
@@ -851,7 +1447,10 @@ def test_argument_validation(hidden: int) -> None:
     with pytest.raises(ValueError):
         cake_rmsnorm_det_train_forward(x.float(), w, eps)
     with pytest.raises(ValueError):
-        cake_rmsnorm_det_train_forward(x, w.float(), eps)
+        cake_rmsnorm_det_train_forward(x, w.double(), eps)
+    if not _fp32_route(hidden, "fwd", False):
+        with pytest.raises(ValueError, match="weight dtypes exported for this route"):
+            cake_rmsnorm_det_train_forward(x, w.float(), eps)
     with pytest.raises(ValueError):
         cake_rmsnorm_det_train_forward(x[:, 1:], w[1:], eps)
     # An odd row stride is accepted (materialized once), not rejected.

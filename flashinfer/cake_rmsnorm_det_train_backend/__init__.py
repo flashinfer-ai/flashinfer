@@ -22,22 +22,28 @@ documentation live in :mod:`flashinfer.cake_rmsnorm_det_train`; import that modu
 
 from __future__ import annotations
 
+import math
+import textwrap
 from typing import Optional
 
 import torch
 
 from . import cake_jit as _loader
+from . import cake_windows as _windows
 from .cake_jit import (
     ARCH_BY_CAPABILITY,
     ARCHES,
     BACKWARD_ALIGNMENT_BYTES,
     FORWARD_ALIGNMENT_BYTES,
+    FP32_WEIGHT_ALIGNMENT_BYTES,
     arch_for_capability,
+    program_windows,
     route_applies,
     route_key,
     route_modules,
     selected_modules,
     supported_hidden_sizes,
+    weight_dtypes,
 )
 
 SUPPORTED_COMPUTE_CAPABILITIES: tuple[tuple[int, int], ...] = tuple(
@@ -94,6 +100,85 @@ def _validate_tensor(
         raise ValueError(f"{name} must be {dtype}, got {tensor.dtype}")
     if tuple(tensor.shape) != shape:
         raise ValueError(f"{name} must have shape {shape}, got {tuple(tensor.shape)}")
+
+
+def _row_view(tensor: torch.Tensor, name: str) -> tuple[torch.Tensor, tuple[int, ...]]:
+    """``(the [rows, H] view of an input, its leading shape)``.
+
+    A ``[T, H]`` tensor is its own view.  A tensor of more dimensions,
+    ``[..., H]``, collapses its leading dimensions into rows when its feature
+    dimension is contiguous (``stride(-1) == 1``) and the leading dimensions
+    are contiguous with one another in row-major order --
+    ``stride(i) == stride(i + 1) * size(i + 1)`` for every pair of leading
+    dimensions of size other than one -- so that consecutive rows sit one
+    stride apart (a ``[T, heads, H]`` slice of a wider ``[T, heads, W]``
+    buffer, strides ``(heads * W, W, 1)``, qualifies).  The view keeps that
+    row stride, so the alignment rules of the kernel inputs apply to it
+    unchanged.  Any other layout raises ``ValueError`` naming the rule: the
+    kernels index rows by one stride and write contiguous outputs.
+    """
+
+    if not isinstance(tensor, torch.Tensor):
+        raise TypeError(f"{name} must be a torch.Tensor")
+    if tensor.ndim < 2:
+        raise ValueError(
+            f"{name} must be a [T, H] tensor (or [..., H] with more leading "
+            f"dimensions), got shape {tuple(tensor.shape)}"
+        )
+    if tensor.ndim == 2:
+        return tensor, (int(tensor.shape[0]),)
+    lead = tuple(int(size) for size in tensor.shape[:-1])
+    hidden = int(tensor.shape[-1])
+    rows = math.prod(lead)
+    if rows == 0 or hidden == 0:
+        return tensor.reshape(rows, hidden), lead
+    dims = [i for i in range(tensor.ndim - 1) if tensor.shape[i] != 1]
+    collapsible = (tensor.stride(-1) == 1 or hidden == 1) and all(
+        tensor.stride(outer) == tensor.stride(inner) * tensor.shape[inner]
+        for outer, inner in zip(dims, dims[1:], strict=False)
+    )
+    if not collapsible:
+        raise ValueError(
+            f"{name} of shape {tuple(tensor.shape)} with strides "
+            f"{tuple(tensor.stride())} cannot be viewed as [{rows}, {hidden}] "
+            "rows: the feature dimension must be contiguous (stride(-1) == 1) "
+            "and the leading dimensions contiguous with one another in "
+            "row-major order (stride(i) == stride(i + 1) * size(i + 1)); "
+            "reshape or copy the tensor into such a layout"
+        )
+    pitch = tensor.stride(dims[-1]) if dims else hidden
+    view = tensor.as_strided((rows, hidden), (pitch, 1), tensor.storage_offset())
+    return view, lead
+
+
+def _companion_view(
+    tensor: torch.Tensor, name: str, *, lead: tuple[int, ...], hidden: int
+) -> torch.Tensor:
+    """The ``[rows, H]`` view of an input that takes the first input's shape
+    (``residual``; the backward's ``g``, ``x`` companions and ``g_residual``)."""
+
+    if not isinstance(tensor, torch.Tensor):
+        raise TypeError(f"{name} must be a torch.Tensor")
+    expected = (*lead, hidden)
+    if tuple(tensor.shape) != expected:
+        raise ValueError(
+            f"{name} must have shape {expected}, got {tuple(tensor.shape)}"
+        )
+    return _row_view(tensor, name)[0]
+
+
+def _rows_view(
+    tensor: torch.Tensor, *, lead: tuple[int, ...], rows: int
+) -> torch.Tensor:
+    """``rstd`` as ``[rows]``: the leading shape of an N-D call reshaped, anything else as is."""
+
+    if (
+        isinstance(tensor, torch.Tensor)
+        and len(lead) > 1
+        and tuple(tensor.shape) == tuple(lead)
+    ):
+        return tensor.reshape(rows)
+    return tensor
 
 
 def _materialize(tensor: torch.Tensor, alignment: int) -> torch.Tensor:
@@ -163,6 +248,48 @@ def _contiguous_input(
     return _materialize(tensor, alignment)
 
 
+# The weight dtypes the host accepts and their route tokens (``cake_jit.WEIGHT_DTYPES``).
+_WEIGHT_DTYPES = {torch.bfloat16: "bf16", torch.float32: "f32"}
+
+
+def _weight(
+    w: torch.Tensor, *, hidden: int, device: torch.device, alignment: int
+) -> tuple[torch.Tensor, str]:
+    """``(the weight the kernel reads, its route token)``: a BF16 weight in place
+    when contiguous and ``alignment``-byte aligned, an FP32 weight in place when
+    contiguous and ``FP32_WEIGHT_ALIGNMENT_BYTES`` aligned (the FP32-weight
+    programs load it with 32-byte vectors), else a copy; another dtype is refused."""
+
+    if not isinstance(w, torch.Tensor):
+        raise TypeError("w must be a torch.Tensor")
+    token = _WEIGHT_DTYPES.get(w.dtype)
+    if token is None:
+        raise ValueError(f"w must be one of {tuple(_WEIGHT_DTYPES)}, got {w.dtype}")
+    if token == "f32":
+        alignment = FP32_WEIGHT_ALIGNMENT_BYTES
+    kernel_w = _contiguous_input(
+        w, "w", shape=(hidden,), device=device, dtype=w.dtype, alignment=alignment
+    )
+    return kernel_w, token
+
+
+def _route_error(
+    kind: str, hidden: int, residual: bool, w: torch.Tensor, arch: str
+) -> ValueError:
+    """The error of a call no exported route serves: the hidden sizes with routes
+    on ``arch`` and the weight dtypes this route ships for."""
+
+    word = "forward" if kind == "fwd" else "backward"
+    shipped = weight_dtypes(arch, hidden, kind, residual)
+    dtypes = tuple(dtype for dtype, token in _WEIGHT_DTYPES.items() if token in shipped)
+    return ValueError(
+        f"no exported Cake RMSNorm training {word} for hidden={hidden} "
+        f"(residual={residual}, w={w.dtype}) on {arch}; supported hidden sizes: "
+        f"{supported_hidden_sizes(arch)}; weight dtypes exported for this route: "
+        f"{dtypes if dtypes else 'none'}"
+    )
+
+
 def _output_buffer(
     tensor: Optional[torch.Tensor],
     name: str,
@@ -171,37 +298,47 @@ def _output_buffer(
     device: torch.device,
     dtype: torch.dtype,
     alignment: int,
-) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-    """``(kernel buffer, user buffer to copy back into or None)``.
+    lead: Optional[tuple[int, ...]] = None,
+) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    """``(kernel buffer, the tensor returned to the caller, user buffer to copy back into or None)``.
 
     A caller-provided output of any layout is honoured: the kernel writes a
     contiguous aligned buffer directly when the caller's tensor is one, otherwise
     into a temporary that is copied back into the caller's view after the launch.
+    ``lead`` (an N-D call) is the leading shape the caller's buffer and the
+    returned tensor have in place of the ``shape[0]`` rows of the kernel buffer.
     """
 
+    user_shape = shape if lead is None else (*lead, *shape[1:])
     if tensor is None:
-        return torch.empty(shape, dtype=dtype, device=device), None
-    _validate_tensor(tensor, name, shape=shape, device=device, dtype=dtype)
+        kernel = torch.empty(shape, dtype=dtype, device=device)
+        return kernel, (kernel if lead is None else kernel.view(user_shape)), None
+    _validate_tensor(tensor, name, shape=user_shape, device=device, dtype=dtype)
     if tensor.numel() == 0 or (
         tensor.is_contiguous() and tensor.data_ptr() % alignment == 0
     ):
-        return tensor, None
-    return torch.empty(shape, dtype=dtype, device=device), tensor
+        return (tensor if lead is None else tensor.reshape(shape)), tensor, None
+    return torch.empty(shape, dtype=dtype, device=device), tensor, tensor
 
 
 def _copy_back(pairs: list[tuple[torch.Tensor, Optional[torch.Tensor]]]) -> None:
     for kernel_buffer, user_buffer in pairs:
         if user_buffer is not None:
-            user_buffer.copy_(kernel_buffer)
+            user_buffer.copy_(kernel_buffer.reshape(user_buffer.shape))
 
 
-def _backward_module_records(arch: str, hidden: int, residual: bool) -> list[dict]:
+def _backward_module_records(
+    arch: str, hidden: int, residual: bool, w_dtype: str = "bf16"
+) -> list[dict]:
     return [
-        _loader.MODULES[name] for name in route_modules(arch, hidden, "bwd", residual)
+        _loader.MODULES[name]
+        for name in route_modules(arch, hidden, "bwd", residual, w_dtype)
     ]
 
 
-def _workspace_record(arch: str, hidden: int, residual: bool, rows: int) -> dict:
+def _workspace_record(
+    arch: str, hidden: int, residual: bool, rows: int, w_dtype: str = "bf16"
+) -> dict:
     """The backward module that sizes the partial / counter workspace for ``rows`` tokens.
 
     Every main backward module of a route (the record owning a
@@ -213,7 +350,7 @@ def _workspace_record(arch: str, hidden: int, residual: bool, rows: int) -> dict
 
     owners = [
         record
-        for record in _backward_module_records(arch, hidden, residual)
+        for record in _backward_module_records(arch, hidden, residual, w_dtype)
         if record.get("workspace_rule") is not None
     ]
     if not owners:
@@ -244,7 +381,8 @@ def cake_rmsnorm_det_train_backward_workspace_bytes(
     that many tokens.  The counters must be zero on first use (allocate with
     ``torch.zeros`` or use :func:`cake_rmsnorm_det_train_backward_workspace`); the
     kernels leave them zero, so the same buffer is reusable across calls and
-    CUDA Graph replays without host writes.
+    CUDA Graph replays without host writes.  The buffer serves the BF16-weight
+    and the FP32-weight route of the width alike.
     """
 
     device = torch.device(device)
@@ -253,19 +391,20 @@ def cake_rmsnorm_det_train_backward_workspace_bytes(
     if rows < 0:
         raise ValueError("rows must be non-negative")
     arch = _device_arch(device)
-    owner = _workspace_record(arch, hidden, residual, max(rows, 1))
     device_index = _device_index(device)
-    # Every module of the route shares the owner's partial capacity; the buffer
-    # also holds the widest counter table any module of the route declares.
-    return max(
-        int(
-            _loader.workspace_layout(
+    # Every module of a route shares its owner's partial capacity; the buffer
+    # also holds the widest counter table any module of the routes declares.
+    total = 0
+    for w_dtype in weight_dtypes(arch, hidden, "bwd", residual) or ("bf16",):
+        owner = _workspace_record(arch, hidden, residual, max(rows, 1), w_dtype)
+        for record in _backward_module_records(arch, hidden, residual, w_dtype):
+            if record.get("workspace_rule") is None:
+                continue
+            layout = _loader.workspace_layout(
                 record, max(rows, 1), device_index=device_index, capacity_record=owner
-            )["total_bytes"]
-        )
-        for record in _backward_module_records(arch, hidden, residual)
-        if record.get("workspace_rule") is not None
-    )
+            )
+            total = max(total, int(layout["total_bytes"]))
+    return total
 
 
 def cake_rmsnorm_det_train_backward_workspace(
@@ -342,21 +481,34 @@ def cake_rmsnorm_det_train_forward(
         BF16 ``[T, H]`` input of any layout.  Row-strided views with a contiguous
         feature dimension, 32-byte aligned storage and a row stride that is a
         multiple of 32 bytes are read in place; other layouts (odd column offset,
-        odd row stride, transposed storage) are materialized once.  With
-        ``residual`` this is the residual stream ``h`` and the normalized value is
+        odd row stride, transposed storage) are materialized once.  A tensor of
+        more dimensions, ``[..., H]``, is normalized row by row when its feature
+        dimension is contiguous and its leading dimensions are contiguous with
+        one another in row-major order (``stride(i) == stride(i + 1) * size(i +
+        1)``; a ``[T, heads, H]`` slice of a wider ``[T, heads, W]`` buffer
+        qualifies): the leading dimensions collapse into ``prod(...)`` rows, the
+        outputs take the input's leading shape (``rstd`` is ``[...]``), ``w`` is
+        shared by every row and the backward's ``dw`` sums them all; any other
+        N-D layout raises ``ValueError`` naming the rule.  With ``residual`` this
+        is the residual stream ``h`` and the normalized value is
         ``h_new = BF16(h + residual)``.
     w : torch.Tensor
-        BF16 ``[H]`` weight, read in place when contiguous and 32-byte aligned
-        (the forward kernels load it with 32-byte vectors), else copied once.
+        BF16 or FP32 ``[H]`` weight.  BF16 is read in place when contiguous and
+        32-byte aligned (the forward kernels load it with 32-byte vectors), FP32
+        -- the effective weight ``1 + w`` a zero-centred model computes in FP32
+        -- when contiguous and 32-byte aligned; any other layout is copied once.
+        An FP32 weight needs the FP32-weight route of the width on the device
+        (:func:`weight_dtypes`), else ``ValueError``.
     eps : float
         Variance epsilon (FP32 inside the kernel).
     residual : torch.Tensor, optional
-        BF16 ``[T, H]`` update added to ``x`` before normalization (same layout
-        rules as ``x``).  Enables the fused residual-add route.
+        BF16 update of ``x``'s shape added to ``x`` before normalization (same
+        layout rules as ``x``).  Enables the fused residual-add route.
     out, rstd, residual_out : torch.Tensor, optional
-        Preallocated outputs: BF16 ``[T, H]`` ``y``, FP32 ``[T]`` reciprocal RMS
-        and (residual only) BF16 ``[T, H]`` ``h_new``.  Contiguous aligned buffers
-        are written directly; any other layout receives a copy after the launch.
+        Preallocated outputs: BF16 ``y`` of ``x``'s shape, FP32 reciprocal RMS of
+        its leading shape (``[T]``) and (residual only) BF16 ``h_new`` of ``x``'s
+        shape.  Contiguous aligned buffers are written directly; any other layout
+        receives a copy after the launch.
 
     Returns
     -------
@@ -365,8 +517,8 @@ def cake_rmsnorm_det_train_forward(
     needs; no other ``[T, H]`` temporary is produced.
     """
 
-    if not isinstance(x, torch.Tensor) or x.ndim != 2:
-        raise ValueError("x must be a [T, H] tensor")
+    x, lead = _row_view(x, "x")
+    nd = lead if len(lead) > 1 else None
     device = x.device
     rows, hidden = int(x.shape[0]), int(x.shape[1])
     arch = _device_arch(device)
@@ -381,17 +533,10 @@ def cake_rmsnorm_det_train_forward(
         dtype=torch.bfloat16,
         alignment=align,
     )
-    w = _contiguous_input(
-        w,
-        "w",
-        shape=(hidden,),
-        device=device,
-        dtype=torch.bfloat16,
-        alignment=align,
-    )
+    w, w_dtype = _weight(w, hidden=hidden, device=device, alignment=align)
     if has_residual:
         residual = _kernel_input(
-            residual,
+            _companion_view(residual, "residual", lead=lead, hidden=hidden),
             "residual",
             rows=rows,
             hidden=hidden,
@@ -404,43 +549,41 @@ def cake_rmsnorm_det_train_forward(
         hidden=hidden,
         kind="fwd",
         residual=has_residual,
+        w_dtype=w_dtype,
     ):
-        raise ValueError(
-            f"no exported Cake RMSNorm training forward for hidden={hidden} "
-            f"(residual={has_residual}) on {arch}; supported hidden sizes: "
-            f"{supported_hidden_sizes(arch)}"
-        )
-    out, out_user = _output_buffer(
+        raise _route_error("fwd", hidden, has_residual, w, arch)
+    out, y_result, out_user = _output_buffer(
         out,
         "out",
         shape=(rows, hidden),
         device=device,
         dtype=torch.bfloat16,
         alignment=align,
+        lead=nd,
     )
-    rstd, rstd_user = _output_buffer(
+    rstd, rstd_result, rstd_user = _output_buffer(
         rstd,
         "rstd",
         shape=(rows,),
         device=device,
         dtype=torch.float32,
         alignment=BACKWARD_ALIGNMENT_BYTES,
+        lead=nd,
     )
     residual_out_user = None
+    results: tuple[torch.Tensor, ...] = (y_result, rstd_result)
     if has_residual:
-        residual_out, residual_out_user = _output_buffer(
+        residual_out, h_new_result, residual_out_user = _output_buffer(
             residual_out,
             "residual_out",
             shape=(rows, hidden),
             device=device,
             dtype=torch.bfloat16,
             alignment=align,
+            lead=nd,
         )
+        results = (y_result, rstd_result, h_new_result)
     copy_backs = [(out, out_user), (rstd, rstd_user), (residual_out, residual_out_user)]
-    results = tuple(
-        user if user is not None else kernel
-        for kernel, user in copy_backs[: 3 if has_residual else 2]
-    )
     if rows == 0:
         return results
     # The plain kernel keeps the residual parameters in its signature and never
@@ -458,7 +601,9 @@ def cake_rmsnorm_det_train_forward(
         "u_stride": int(residual.stride(0)) if has_residual else 0,
     }
     device_index = _device_index(device)
-    for name in selected_modules(arch, hidden, "fwd", has_residual, rows=rows):
+    for name in selected_modules(
+        arch, hidden, "fwd", has_residual, rows=rows, w_dtype=w_dtype
+    ):
         _loader.run_module(name, values, rows=rows, device_index=device_index)
     _copy_back(copy_backs)
     return results
@@ -484,30 +629,36 @@ def cake_rmsnorm_det_train_backward(
         BF16 ``[T, H]`` gradient of ``y`` of any layout.  Views with a contiguous
         feature dimension, 16-byte aligned storage and a row stride that is a
         multiple of 16 bytes (expanded or sliced autograd gradients included) are
-        read in place; other layouts are materialized once.
+        read in place; other layouts are materialized once.  An N-D gradient,
+        ``[..., H]``, takes ``x``'s shape and collapses its leading dimensions
+        into rows under the forward's rule.
     x : torch.Tensor
-        The BF16 ``[T, H]`` tensor that was normalized (``x`` of the plain
-        forward, ``h_new`` of the residual forward); same layout rules as ``g``.
+        The BF16 ``[T, H]`` (or ``[..., H]``) tensor that was normalized (``x`` of
+        the plain forward, ``h_new`` of the residual forward); same layout rules
+        as the forward's ``x``.
     w : torch.Tensor
-        BF16 ``[H]`` weight, read in place when contiguous and 16-byte aligned,
-        else copied once.
+        BF16 or FP32 ``[H]`` weight (the forward's).  BF16 is read in place when
+        contiguous and 16-byte aligned, FP32 when contiguous and 32-byte aligned;
+        any other layout is copied once.  An FP32 weight needs the FP32-weight
+        route of the width (:func:`weight_dtypes`), else ``ValueError``.
     rstd : torch.Tensor
-        FP32 ``[T]`` reciprocal RMS returned by the forward.
+        FP32 ``[T]`` reciprocal RMS returned by the forward (of the leading
+        shape ``[...]`` for an N-D call, or flat ``[prod(...)]``).
     deterministic : bool
         Only the deterministic fixed-order ``dw`` reduction is exported;
         ``False`` is rejected.
     g_residual : torch.Tensor, optional
-        BF16 ``[T, H]`` gradient flowing directly through ``h_new`` (residual
-        forward), any layout.  It is added once so that the returned ``dx`` is
-        the gradient of both residual-add inputs.
+        BF16 gradient of ``g``'s shape flowing directly through ``h_new``
+        (residual forward), any layout.  It is added once so that the returned
+        ``dx`` is the gradient of both residual-add inputs.
     workspace : torch.Tensor, optional
         Caller-owned ``uint8`` buffer from
         :func:`cake_rmsnorm_det_train_backward_workspace` sized for at least this
         many rows; allocated when omitted.
     dx, dw : torch.Tensor, optional
-        Preallocated outputs: BF16 ``[T, H]`` and FP32 ``[H]``.  Contiguous
-        aligned buffers are written directly; any other layout receives a copy
-        after the launch.
+        Preallocated outputs: BF16 ``dx`` of ``x``'s shape and FP32 ``[H]``.
+        Contiguous aligned buffers are written directly; any other layout
+        receives a copy after the launch.
 
     Returns
     -------
@@ -519,8 +670,8 @@ def cake_rmsnorm_det_train_backward(
         raise ValueError(
             "cake_rmsnorm_det_train_backward exports only the deterministic dw reduction"
         )
-    if not isinstance(x, torch.Tensor) or x.ndim != 2:
-        raise ValueError("x must be a [T, H] tensor")
+    x, lead = _row_view(x, "x")
+    nd = lead if len(lead) > 1 else None
     device = x.device
     rows, hidden = int(x.shape[0]), int(x.shape[1])
     arch = _device_arch(device)
@@ -535,14 +686,17 @@ def cake_rmsnorm_det_train_backward(
         dtype=torch.bfloat16,
         alignment=align,
     )
-    w = _contiguous_input(
-        w, "w", shape=(hidden,), device=device, dtype=torch.bfloat16, alignment=align
-    )
+    w, w_dtype = _weight(w, hidden=hidden, device=device, alignment=align)
     rstd = _contiguous_input(
-        rstd, "rstd", shape=(rows,), device=device, dtype=torch.float32, alignment=4
+        _rows_view(rstd, lead=lead, rows=rows),
+        "rstd",
+        shape=(rows,),
+        device=device,
+        dtype=torch.float32,
+        alignment=4,
     )
     g = _kernel_input(
-        g,
+        _companion_view(g, "g", lead=lead, hidden=hidden),
         "g",
         rows=rows,
         hidden=hidden,
@@ -552,7 +706,7 @@ def cake_rmsnorm_det_train_backward(
     )
     if has_residual:
         g_residual = _kernel_input(
-            g_residual,
+            _companion_view(g_residual, "g_residual", lead=lead, hidden=hidden),
             "g_residual",
             rows=rows,
             hidden=hidden,
@@ -565,31 +719,29 @@ def cake_rmsnorm_det_train_backward(
         hidden=hidden,
         kind="bwd",
         residual=has_residual,
+        w_dtype=w_dtype,
     ):
-        raise ValueError(
-            f"no exported Cake RMSNorm training backward for hidden={hidden} "
-            f"(residual={has_residual}) on {arch}; supported hidden sizes: "
-            f"{supported_hidden_sizes(arch)}"
-        )
-    dx, dx_user = _output_buffer(
+        raise _route_error("bwd", hidden, has_residual, w, arch)
+    dx, dx_result, dx_user = _output_buffer(
         dx,
         "dx",
         shape=(rows, hidden),
         device=device,
         dtype=torch.bfloat16,
         alignment=align,
+        lead=nd,
     )
-    dw, dw_user = _output_buffer(
+    dw, dw_result, dw_user = _output_buffer(
         dw, "dw", shape=(hidden,), device=device, dtype=torch.float32, alignment=align
     )
     copy_backs = [(dx, dx_user), (dw, dw_user)]
-    dx_result = dx_user if dx_user is not None else dx
-    dw_result = dw_user if dw_user is not None else dw
     if rows == 0:
         dw_result.zero_()
         return dx_result, dw_result
-    owner = _workspace_record(arch, hidden, has_residual, rows)
-    names = selected_modules(arch, hidden, "bwd", has_residual, rows=rows)
+    owner = _workspace_record(arch, hidden, has_residual, rows, w_dtype)
+    names = selected_modules(
+        arch, hidden, "bwd", has_residual, rows=rows, w_dtype=w_dtype
+    )
     launched = [
         _loader.MODULES[name]
         for name in names
@@ -691,13 +843,17 @@ def cake_rmsnorm_det(
     Parameters
     ----------
     x : torch.Tensor
-        BF16 ``[T, H]`` input on a supported CUDA device.
+        BF16 ``[T, H]`` input on a supported CUDA device, or ``[..., H]`` under
+        the layout rule of :func:`cake_rmsnorm_det_train_forward` (its leading
+        dimensions collapse into rows).
     w : torch.Tensor
-        BF16 ``[H]`` RMSNorm weight.
+        BF16 or FP32 ``[H]`` RMSNorm weight (FP32 on the routes that ship the
+        FP32-weight programs, see :func:`weight_dtypes`); the weight gradient is
+        returned in ``w.dtype``.
     eps : float
         Variance epsilon evaluated in FP32 by the kernel.
     residual : torch.Tensor, optional
-        BF16 ``[T, H]`` update added to ``x`` before normalization.  When
+        BF16 update of ``x``'s shape added to ``x`` before normalization.  When
         provided, the normalized input ``h_new`` is returned with the output.
     deterministic : bool
         Whether to use the deterministic fixed-order weight-gradient reduction.
@@ -706,12 +862,33 @@ def cake_rmsnorm_det(
     Returns
     -------
     torch.Tensor or tuple[torch.Tensor, torch.Tensor]
-        BF16 ``y`` with shape ``[T, H]``, or ``(y, h_new)`` when ``residual``
+        BF16 ``y`` of ``x``'s shape, or ``(y, h_new)`` when ``residual``
         is given.  Backward launches the fused ``dx`` and deterministic ``dw``
         kernels of :func:`cake_rmsnorm_det_train_backward`.
     """
 
     return CakeRMSNormDetFunction.apply(x, w, eps, residual, deterministic)
+
+
+def _with_program_selection(doc: Optional[str], kind: str) -> str:
+    """``doc`` with the "Program selection by token count" notes of the routes of ``kind`` appended.
+
+    The notes are the exporter's rendering of the registry (``cake_windows``):
+    the row-count windows of every route, the measured outcome at every window
+    edge and the contract of the outputs across the windows, so the documented
+    thresholds are the registry's.  ``program_windows`` returns the windows.
+    """
+
+    section = textwrap.indent(_windows.SECTIONS[kind].strip("\n"), "    ")
+    return f"{(doc or '').rstrip()}\n\n    Notes\n    -----\n{section}\n    "
+
+
+cake_rmsnorm_det_train_forward.__doc__ = _with_program_selection(
+    cake_rmsnorm_det_train_forward.__doc__, "fwd"
+)
+cake_rmsnorm_det_train_backward.__doc__ = _with_program_selection(
+    cake_rmsnorm_det_train_backward.__doc__, "bwd"
+)
 
 
 # The names before the det rename, the same objects as the det names of this backend package (not in __all__).
@@ -736,5 +913,7 @@ __all__ = [
     "cake_rmsnorm_det_train_backward_workspace_bytes",
     "cake_rmsnorm_det_train_forward",
     "is_cake_rmsnorm_det_train_supported",
+    "program_windows",
     "route_key",
+    "weight_dtypes",
 ]

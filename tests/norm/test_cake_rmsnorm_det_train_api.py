@@ -37,13 +37,23 @@ from flashinfer.cake_rmsnorm_det_train import (
     cake_rmsnorm_det_train_backward_workspace_bytes,
     cake_rmsnorm_det_train_forward,
     is_cake_rmsnorm_det_train_supported,
+    program_windows,
+    weight_dtypes,
 )
 from flashinfer.cake_rmsnorm_det_train_backend import cake_jit as loader
 from flashinfer.jit.env import has_flashinfer_jit_cache
 from flashinfer.utils import get_compute_capability
 
 SUPPORTED_CAPABILITIES = ((10, 0), (10, 3), (10, 7))
-WIDTHS = ((6144, 1e-5), (4096, 1e-5), (2048, 1e-6), (1536, 1e-6), (512, 1e-6))
+WIDTHS = (
+    (6144, 1e-5),
+    (5120, 1e-5),
+    (4096, 1e-5),
+    (2048, 1e-6),
+    (1536, 1e-6),
+    (512, 1e-6),
+    (256, 1e-6),
+)
 HIDDEN_SIZES = tuple(hidden for hidden, _eps in WIDTHS)
 EPS = {hidden: eps for hidden, eps in WIDTHS}
 SEED = 760
@@ -95,6 +105,8 @@ def test_function_signature_is_exported() -> None:
         is cake_rmsnorm_det_train_backward_workspace_bytes
     )
     assert flashinfer.CakeRMSNormDetFunction is CakeRMSNormDetFunction
+    assert program_windows is backend.program_windows is loader.program_windows
+    assert weight_dtypes is backend.weight_dtypes is loader.weight_dtypes
 
 
 @pytest.mark.parametrize("hidden", HIDDEN_SIZES)

@@ -65,7 +65,15 @@ cake_rmsnorm_det_train_forward = pkg.cake_rmsnorm_det_train_forward
 is_cake_rmsnorm_det_train_supported = pkg.is_cake_rmsnorm_det_train_supported
 
 SUPPORTED_CAPABILITIES = ((10, 0), (10, 3), (10, 7))
-WIDTHS = ((6144, 1e-5), (4096, 1e-5), (2048, 1e-6), (1536, 1e-6), (512, 1e-6))
+WIDTHS = (
+    (6144, 1e-5),
+    (5120, 1e-5),
+    (4096, 1e-5),
+    (2048, 1e-6),
+    (1536, 1e-6),
+    (512, 1e-6),
+    (256, 1e-6),
+)
 EPS = {hidden: eps for hidden, eps in WIDTHS}
 # (hidden, residual): every backward route of the package.
 ROUTES = tuple((hidden, False) for hidden, _eps in WIDTHS) + ((6144, True),)

@@ -48,7 +48,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 }
 
 #define CAKE_INF CUDART_INF_F
-#define NUM_MAIN_STAGES 1
 #define SMEM_STAGE_BUF_OFF 1024
 #define SMEM_STAGE_BUF_STAGE_BYTES 98304
 #define SMEM_STAGE_BUF_STRIDE 98304
@@ -344,12 +343,13 @@ kernel_cake_rmsnorm_det_train_35a0b0ca6b2060313255(__nv_bfloat16* __restrict__ g
     int c0 = nd[0];
     int cb = nd[1];
     int ce = nd[2];
-    int ps[2];
+    int ps[3];
     ps[0] = nd[1];
     ps[1] = nd[2];
     int desc_n = 0;
     #pragma unroll
     for (int s = 0; s < 6; s++) {
+        ps[2] = 0;
         if (ps[0] < ps[1]) {
             int first_2 = ps[0];
             int rows_k = ((ps[1] - first_2) < (1) ? (ps[1] - first_2) : (1));
@@ -378,8 +378,8 @@ kernel_cake_rmsnorm_det_train_35a0b0ca6b2060313255(__nv_bfloat16* __restrict__ g
                 }
             }
             ps[0] = ps[0] + 1;
+            ps[2] = (int)(ps[0] >= ps[1]);
             if (ps[0] >= ps[1]) {
-                desc_n += 1;
                 if (tid == 0) {
                     int cid = (int)claim[0];
                     int nr_2 = rtab[31];
@@ -405,7 +405,7 @@ kernel_cake_rmsnorm_det_train_35a0b0ca6b2060313255(__nv_bfloat16* __restrict__ g
                         int _min_8 = ((rng[0] + stages_1) < (T) ? (rng[0] + stages_1) : (T));
                         rng[1] = _min_8;
                     }
-                    int entry_1_1 = desc_n % 8;
+                    int entry_1_1 = (desc_n + 1) % 8;
                     int word_2 = entry_1_1 * 3;
                     desc[word_2] = cid;
                     desc[word_2 + 1] = rng[0];
@@ -425,8 +425,8 @@ kernel_cake_rmsnorm_det_train_35a0b0ca6b2060313255(__nv_bfloat16* __restrict__ g
                         }
                     }
                 }
-                int entry_0 = desc_n % 8;
-                int _parity_dbar = (int)((unsigned int)desc_n / 8 % 2);
+                int entry_0 = (desc_n + 1) % 8;
+                int _parity_dbar = (int)((unsigned int)(desc_n + 1) / 8 % 2);
                 mbarrier_wait(dbar_addr + (entry_0) * 8, _parity_dbar);
                 int word_1_1 = entry_0 * 3;
                 int w0_2 = desc[word_1_1];
@@ -445,6 +445,8 @@ kernel_cake_rmsnorm_det_train_35a0b0ca6b2060313255(__nv_bfloat16* __restrict__ g
                 ps[1] = nd[2];
             }
         }
+        int desc_step = ps[2];
+        desc_n += desc_step;
     }
     float wf[16];
     #pragma unroll
@@ -712,6 +714,7 @@ kernel_cake_rmsnorm_det_train_35a0b0ca6b2060313255(__nv_bfloat16* __restrict__ g
                 dot_slots[par_1 + warp] = dot_1;
             }
             __syncthreads();
+            ps[2] = 0;
             if (ps[0] < ps[1]) {
                 int first_4 = ps[0];
                 int rows_k_2 = ((ps[1] - first_4) < (1) ? (ps[1] - first_4) : (1));
@@ -740,8 +743,8 @@ kernel_cake_rmsnorm_det_train_35a0b0ca6b2060313255(__nv_bfloat16* __restrict__ g
                     }
                 }
                 ps[0] = ps[0] + 1;
+                ps[2] = (int)(ps[0] >= ps[1]);
                 if (ps[0] >= ps[1]) {
-                    desc_n += 1;
                     if (tid == 0) {
                         int cid_1 = (int)claim[0];
                         int nr_3 = rtab[31];
@@ -767,7 +770,7 @@ kernel_cake_rmsnorm_det_train_35a0b0ca6b2060313255(__nv_bfloat16* __restrict__ g
                             int _min_23 = ((rng[0] + stages_2) < (T) ? (rng[0] + stages_2) : (T));
                             rng[1] = _min_23;
                         }
-                        int entry_1_2 = desc_n % 8;
+                        int entry_1_2 = (desc_n + 1) % 8;
                         int word_2_1 = entry_1_2 * 3;
                         desc[word_2_1] = cid_1;
                         desc[word_2_1 + 1] = rng[0];
@@ -787,8 +790,8 @@ kernel_cake_rmsnorm_det_train_35a0b0ca6b2060313255(__nv_bfloat16* __restrict__ g
                             }
                         }
                     }
-                    int entry_0_2 = desc_n % 8;
-                    int _parity_dbar_2 = (int)((unsigned int)desc_n / 8 % 2);
+                    int entry_0_2 = (desc_n + 1) % 8;
+                    int _parity_dbar_2 = (int)((unsigned int)(desc_n + 1) / 8 % 2);
                     mbarrier_wait(dbar_addr + (entry_0_2) * 8, _parity_dbar_2);
                     int word_1_2 = entry_0_2 * 3;
                     int w0_2_1 = desc[word_1_2];
@@ -807,6 +810,8 @@ kernel_cake_rmsnorm_det_train_35a0b0ca6b2060313255(__nv_bfloat16* __restrict__ g
                     ps[1] = nd[2];
                 }
             }
+            int desc_step_1 = ps[2];
+            desc_n += desc_step_1;
             float tot_1 = 0.0f;
             #pragma unroll
             for (int kk_1 = 0; kk_1 < 8; kk_1++) {

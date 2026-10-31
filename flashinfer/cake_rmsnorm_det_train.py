@@ -28,12 +28,21 @@ the gradient of both ``h`` and ``u``.
 
 All kernels use FP32 statistics and accumulation with IEEE division and
 square root (no fast-math).  Inputs and outputs are BF16; ``rstd`` and ``dw``
-are FP32.  Row-strided inputs (``x``, ``residual``, ``g``, ``g_residual``)
+are FP32.  ``w`` is BF16, or FP32 on the routes that ship the FP32-weight
+programs (the effective weight ``1 + w`` of a zero-centred model, computed by
+the caller in FP32; :func:`weight_dtypes` lists them per route).  Row-strided inputs (``x``, ``residual``, ``g``, ``g_residual``)
 are accepted when ``stride(1) == 1``, ``stride(0)`` is a multiple of eight
 elements and the storage is aligned (32 bytes for the forward inputs, 16 for
-the backward); outputs are contiguous.  The
+the backward); outputs are contiguous.  An input of more dimensions,
+``[..., H]``, is normalized row by row when its leading dimensions are
+contiguous with one another in row-major order (a ``[T, heads, H]`` slice of
+a wider buffer qualifies): the outputs take its shape, ``rstd`` its leading
+shape, ``w`` is shared by every row and ``dw`` sums them all.  The
 token count ``T`` is a runtime scalar: it may change between calls, ``T == 1``
-is supported and ``T == 0`` returns empty outputs without launching.
+is supported and ``T == 0`` returns empty outputs without launching.  Each
+route selects one of several programs from ``T``; within one program window
+a row's results do not depend on ``T`` (see "Program selection by token
+count" in the forward / backward docstrings and :func:`program_windows`).
 
 Beside kernels resident on other streams: each backward main kernel needs a
 large part of its SM's shared memory and one CTA slot, and an SM serves it only
@@ -81,7 +90,9 @@ from .cake_rmsnorm_det_train_backend import (  # noqa: F401
     cake_rmsnorm_det_train_backward_workspace,
     cake_rmsnorm_det_train_backward_workspace_bytes,
     is_cake_rmsnorm_det_train_supported,
+    program_windows,
     route_key,
+    weight_dtypes,
 )
 
 # The three stable entry points are real ``def``s here (public-API tooling reads the
@@ -180,5 +191,7 @@ __all__ = [
     "cake_rmsnorm_det_train_backward_workspace_bytes",
     "cake_rmsnorm_det_train_forward",
     "is_cake_rmsnorm_det_train_supported",
+    "program_windows",
     "route_key",
+    "weight_dtypes",
 ]

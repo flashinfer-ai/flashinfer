@@ -48,7 +48,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 }
 
 #define CAKE_INF CUDART_INF_F
-#define NUM_MAIN_STAGES 1
 #define SMEM_DOT_SLOTS_OFF 0
 #define SMEM_DOT_SLOTS_STAGE_BYTES 96
 #define SMEM_DOT_SLOTS_STRIDE 96
@@ -345,14 +344,14 @@ kernel_cake_rmsnorm_det_train_0dcdc563be377247044e(__nv_bfloat16* __restrict__ g
             for (int it = 0; it < full_end; it += 3) {
                 int rowf = row_begin + it + rg;
                 int rowf_ld = ((rowf + 2) < (last_row) ? (rowf + 2) : (last_row));
-                unsigned long long g_base_0_1 = (unsigned long long)rowf_ld * (unsigned long long)g_stride;
+                unsigned long long g_base_1 = (unsigned long long)rowf_ld * (unsigned long long)g_stride;
                 unsigned long long x_base_0 = (unsigned long long)rowf_ld * (unsigned long long)x_stride;
                 rrP2[0] = r[rowf_ld];
                 #pragma unroll
                 for (int v_3 = 0; v_3 < 2; v_3++) {
                     int coln_2 = (v_3 * 384 + tir) * 8;
                     {
-                        const uint4* _vptr_9 = reinterpret_cast<const uint4*>(g + g_base_0_1 + (unsigned long long)coln_2);
+                        const uint4* _vptr_9 = reinterpret_cast<const uint4*>(g + g_base_1 + (unsigned long long)coln_2);
                         uint4* _vdst_9 = reinterpret_cast<uint4*>(&gwP2[v_3 * 4]);
                         #pragma unroll
                         for (int _blk = 0; _blk < 1; _blk++) {
@@ -473,14 +472,14 @@ kernel_cake_rmsnorm_det_train_0dcdc563be377247044e(__nv_bfloat16* __restrict__ g
                 }
                 int rowf_0 = row_begin + (it + 1) + rg;
                 int rowf_ld_0 = ((rowf_0 + 2) < (last_row) ? (rowf_0 + 2) : (last_row));
-                unsigned long long g_base_1 = (unsigned long long)rowf_ld_0 * (unsigned long long)g_stride;
-                unsigned long long x_base_1_1 = (unsigned long long)rowf_ld_0 * (unsigned long long)x_stride;
+                unsigned long long g_base_2 = (unsigned long long)rowf_ld_0 * (unsigned long long)g_stride;
+                unsigned long long x_base_2 = (unsigned long long)rowf_ld_0 * (unsigned long long)x_stride;
                 rrP0[0] = r[rowf_ld_0];
                 #pragma unroll
                 for (int v_6 = 0; v_6 < 2; v_6++) {
                     int coln_3 = (v_6 * 384 + tir) * 8;
                     {
-                        const uint4* _vptr_13 = reinterpret_cast<const uint4*>(g + g_base_1 + (unsigned long long)coln_3);
+                        const uint4* _vptr_13 = reinterpret_cast<const uint4*>(g + g_base_2 + (unsigned long long)coln_3);
                         uint4* _vdst_13 = reinterpret_cast<uint4*>(&gwP0[v_6 * 4]);
                         #pragma unroll
                         for (int _blk = 0; _blk < 1; _blk++) {
@@ -489,7 +488,7 @@ kernel_cake_rmsnorm_det_train_0dcdc563be377247044e(__nv_bfloat16* __restrict__ g
                         }
                     }
                     {
-                        const uint4* _vptr_14 = reinterpret_cast<const uint4*>(x + x_base_1_1 + (unsigned long long)coln_3);
+                        const uint4* _vptr_14 = reinterpret_cast<const uint4*>(x + x_base_2 + (unsigned long long)coln_3);
                         uint4* _vdst_14 = reinterpret_cast<uint4*>(&xwP0[v_6 * 4]);
                         #pragma unroll
                         for (int _blk = 0; _blk < 1; _blk++) {
@@ -513,7 +512,7 @@ kernel_cake_rmsnorm_det_train_0dcdc563be377247044e(__nv_bfloat16* __restrict__ g
                     }
                 }
                 int parf_0 = it + 1 & 1;
-                float dq_0 = 0.0f;
+                float dq_1 = 0.0f;
                 #pragma unroll
                 for (int v_7 = 0; v_7 < 2; v_7++) {
                     unsigned int wvd_1[4];
@@ -525,12 +524,12 @@ kernel_cake_rmsnorm_det_train_0dcdc563be377247044e(__nv_bfloat16* __restrict__ g
                         float g1_2 = __uint_as_float(gwd_2 & 4294901760u);
                         float x0_2 = __uint_as_float(xwd_2 << 16);
                         float x1_2 = __uint_as_float(xwd_2 & 4294901760u);
-                        dq_0 = __fmaf_rn(g0_2 * __uint_as_float(ww[v_7 * 4 + e_2] << 16), x0_2, dq_0);
-                        dq_0 = __fmaf_rn(g1_2 * __uint_as_float(ww[v_7 * 4 + e_2] & 4294901760u), x1_2, dq_0);
+                        dq_1 = __fmaf_rn(g0_2 * __uint_as_float(ww[v_7 * 4 + e_2] << 16), x0_2, dq_1);
+                        dq_1 = __fmaf_rn(g1_2 * __uint_as_float(ww[v_7 * 4 + e_2] & 4294901760u), x1_2, dq_1);
                     }
                 }
                 float dots_0[1];
-                float _warp_reduce_16 = dq_0;
+                float _warp_reduce_16 = dq_1;
                 #pragma unroll
                 for (int offset = 16; offset > 0; offset >>= 1)
                     _warp_reduce_16 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_16, offset);
@@ -601,14 +600,14 @@ kernel_cake_rmsnorm_det_train_0dcdc563be377247044e(__nv_bfloat16* __restrict__ g
                 }
                 int rowf_1 = row_begin + (it + 2) + rg;
                 int rowf_ld_1 = ((rowf_1 + 2) < (last_row) ? (rowf_1 + 2) : (last_row));
-                unsigned long long g_base_2 = (unsigned long long)rowf_ld_1 * (unsigned long long)g_stride;
-                unsigned long long x_base_2 = (unsigned long long)rowf_ld_1 * (unsigned long long)x_stride;
+                unsigned long long g_base_3 = (unsigned long long)rowf_ld_1 * (unsigned long long)g_stride;
+                unsigned long long x_base_3 = (unsigned long long)rowf_ld_1 * (unsigned long long)x_stride;
                 rrP1[0] = r[rowf_ld_1];
                 #pragma unroll
                 for (int v_9 = 0; v_9 < 2; v_9++) {
                     int coln_4 = (v_9 * 384 + tir) * 8;
                     {
-                        const uint4* _vptr_17 = reinterpret_cast<const uint4*>(g + g_base_2 + (unsigned long long)coln_4);
+                        const uint4* _vptr_17 = reinterpret_cast<const uint4*>(g + g_base_3 + (unsigned long long)coln_4);
                         uint4* _vdst_17 = reinterpret_cast<uint4*>(&gwP1[v_9 * 4]);
                         #pragma unroll
                         for (int _blk = 0; _blk < 1; _blk++) {
@@ -617,7 +616,7 @@ kernel_cake_rmsnorm_det_train_0dcdc563be377247044e(__nv_bfloat16* __restrict__ g
                         }
                     }
                     {
-                        const uint4* _vptr_18 = reinterpret_cast<const uint4*>(x + x_base_2 + (unsigned long long)coln_4);
+                        const uint4* _vptr_18 = reinterpret_cast<const uint4*>(x + x_base_3 + (unsigned long long)coln_4);
                         uint4* _vdst_18 = reinterpret_cast<uint4*>(&xwP1[v_9 * 4]);
                         #pragma unroll
                         for (int _blk = 0; _blk < 1; _blk++) {
@@ -626,12 +625,12 @@ kernel_cake_rmsnorm_det_train_0dcdc563be377247044e(__nv_bfloat16* __restrict__ g
                         }
                     }
                 }
-                unsigned long long gh_base2_2_1 = (unsigned long long)rowf_ld_1 * (unsigned long long)gh_stride;
+                unsigned long long gh_base2_3 = (unsigned long long)rowf_ld_1 * (unsigned long long)gh_stride;
                 #pragma unroll
                 for (int v2_4 = 0; v2_4 < 2; v2_4++) {
                     int coln2_4 = (v2_4 * 384 + tir) * 8;
                     {
-                        const uint4* _vptr_19 = reinterpret_cast<const uint4*>(g_h + gh_base2_2_1 + (unsigned long long)coln2_4);
+                        const uint4* _vptr_19 = reinterpret_cast<const uint4*>(g_h + gh_base2_3 + (unsigned long long)coln2_4);
                         uint4* _vdst_19 = reinterpret_cast<uint4*>(&ghwP1[v2_4 * 4]);
                         #pragma unroll
                         for (int _blk = 0; _blk < 1; _blk++) {
@@ -641,7 +640,7 @@ kernel_cake_rmsnorm_det_train_0dcdc563be377247044e(__nv_bfloat16* __restrict__ g
                     }
                 }
                 int parf_1 = it + 2 & 1;
-                float dq_1 = 0.0f;
+                float dq_2 = 0.0f;
                 #pragma unroll
                 for (int v_10 = 0; v_10 < 2; v_10++) {
                     unsigned int wvd_2[4];
@@ -653,19 +652,19 @@ kernel_cake_rmsnorm_det_train_0dcdc563be377247044e(__nv_bfloat16* __restrict__ g
                         float g1_4 = __uint_as_float(gwd_4 & 4294901760u);
                         float x0_4 = __uint_as_float(xwd_4 << 16);
                         float x1_4 = __uint_as_float(xwd_4 & 4294901760u);
-                        dq_1 = __fmaf_rn(g0_4 * __uint_as_float(ww[v_10 * 4 + e_4] << 16), x0_4, dq_1);
-                        dq_1 = __fmaf_rn(g1_4 * __uint_as_float(ww[v_10 * 4 + e_4] & 4294901760u), x1_4, dq_1);
+                        dq_2 = __fmaf_rn(g0_4 * __uint_as_float(ww[v_10 * 4 + e_4] << 16), x0_4, dq_2);
+                        dq_2 = __fmaf_rn(g1_4 * __uint_as_float(ww[v_10 * 4 + e_4] & 4294901760u), x1_4, dq_2);
                     }
                 }
-                float dots_1[1];
-                float _warp_reduce_20 = dq_1;
+                float dots_2[1];
+                float _warp_reduce_20 = dq_2;
                 #pragma unroll
                 for (int offset = 16; offset > 0; offset >>= 1)
                     _warp_reduce_20 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_20, offset);
-                dots_1[0] = _warp_reduce_20;
+                dots_2[0] = _warp_reduce_20;
                 float rq_1 = rrP2[0];
                 if (lane == 0) {
-                    dot_slots[parf_1 * 12 + warp] = dots_1[0];
+                    dot_slots[parf_1 * 12 + warp] = dots_2[0];
                 }
                 __syncthreads();
                 float tot_1 = 0.0f;
@@ -674,8 +673,8 @@ kernel_cake_rmsnorm_det_train_0dcdc563be377247044e(__nv_bfloat16* __restrict__ g
                     float d_2 = dot_slots[parf_1 * 12 + rg * 12 + k_3];
                     tot_1 += d_2;
                 }
-                dots_1[0] = tot_1;
-                float cq_1 = __fdiv_rn(dots_1[0], 6144.0f);
+                dots_2[0] = tot_1;
+                float cq_1 = __fdiv_rn(dots_2[0], 6144.0f);
                 float kx_1 = rq_1 * rq_1 * rq_1 * cq_1;
                 float nkx_1 = -kx_1;
                 unsigned long long dx_base_1 = (unsigned long long)rowf_1 * 6144;
@@ -734,14 +733,14 @@ kernel_cake_rmsnorm_det_train_0dcdc563be377247044e(__nv_bfloat16* __restrict__ g
                     int rowk = row_begin + it_1 + rg;
                     if (n_iters > it_1 + 2) {
                         int rowk_ld = ((rowk + 2) < (last_row) ? (rowk + 2) : (last_row));
-                        unsigned long long g_base_3 = (unsigned long long)rowk_ld * (unsigned long long)g_stride;
-                        unsigned long long x_base_3 = (unsigned long long)rowk_ld * (unsigned long long)x_stride;
+                        unsigned long long g_base_4 = (unsigned long long)rowk_ld * (unsigned long long)g_stride;
+                        unsigned long long x_base_4 = (unsigned long long)rowk_ld * (unsigned long long)x_stride;
                         rrP2[0] = r[rowk_ld];
                         #pragma unroll
                         for (int v_12 = 0; v_12 < 2; v_12++) {
                             int coln_5 = (v_12 * 384 + tir) * 8;
                             {
-                                const uint4* _vptr_21 = reinterpret_cast<const uint4*>(g + g_base_3 + (unsigned long long)coln_5);
+                                const uint4* _vptr_21 = reinterpret_cast<const uint4*>(g + g_base_4 + (unsigned long long)coln_5);
                                 uint4* _vdst_21 = reinterpret_cast<uint4*>(&gwP2[v_12 * 4]);
                                 #pragma unroll
                                 for (int _blk = 0; _blk < 1; _blk++) {
@@ -750,7 +749,7 @@ kernel_cake_rmsnorm_det_train_0dcdc563be377247044e(__nv_bfloat16* __restrict__ g
                                 }
                             }
                             {
-                                const uint4* _vptr_22 = reinterpret_cast<const uint4*>(x + x_base_3 + (unsigned long long)coln_5);
+                                const uint4* _vptr_22 = reinterpret_cast<const uint4*>(x + x_base_4 + (unsigned long long)coln_5);
                                 uint4* _vdst_22 = reinterpret_cast<uint4*>(&xwP2[v_12 * 4]);
                                 #pragma unroll
                                 for (int _blk = 0; _blk < 1; _blk++) {
@@ -759,12 +758,12 @@ kernel_cake_rmsnorm_det_train_0dcdc563be377247044e(__nv_bfloat16* __restrict__ g
                                 }
                             }
                         }
-                        unsigned long long gh_base2_3 = (unsigned long long)rowk_ld * (unsigned long long)gh_stride;
+                        unsigned long long gh_base2_4 = (unsigned long long)rowk_ld * (unsigned long long)gh_stride;
                         #pragma unroll
                         for (int v2_5 = 0; v2_5 < 2; v2_5++) {
                             int coln2_5 = (v2_5 * 384 + tir) * 8;
                             {
-                                const uint4* _vptr_23 = reinterpret_cast<const uint4*>(g_h + gh_base2_3 + (unsigned long long)coln2_5);
+                                const uint4* _vptr_23 = reinterpret_cast<const uint4*>(g_h + gh_base2_4 + (unsigned long long)coln2_5);
                                 uint4* _vdst_23 = reinterpret_cast<uint4*>(&ghwP2[v2_5 * 4]);
                                 #pragma unroll
                                 for (int _blk = 0; _blk < 1; _blk++) {
@@ -775,7 +774,7 @@ kernel_cake_rmsnorm_det_train_0dcdc563be377247044e(__nv_bfloat16* __restrict__ g
                         }
                     }
                     int park = it_1 & 1;
-                    float dq_2 = 0.0f;
+                    float dq_3 = 0.0f;
                     #pragma unroll
                     for (int v_13 = 0; v_13 < 2; v_13++) {
                         unsigned int wvd_3[4];
@@ -787,19 +786,19 @@ kernel_cake_rmsnorm_det_train_0dcdc563be377247044e(__nv_bfloat16* __restrict__ g
                             float g1_6 = __uint_as_float(gwd_6 & 4294901760u);
                             float x0_6 = __uint_as_float(xwd_6 << 16);
                             float x1_6 = __uint_as_float(xwd_6 & 4294901760u);
-                            dq_2 = __fmaf_rn(g0_6 * __uint_as_float(ww[v_13 * 4 + e_6] << 16), x0_6, dq_2);
-                            dq_2 = __fmaf_rn(g1_6 * __uint_as_float(ww[v_13 * 4 + e_6] & 4294901760u), x1_6, dq_2);
+                            dq_3 = __fmaf_rn(g0_6 * __uint_as_float(ww[v_13 * 4 + e_6] << 16), x0_6, dq_3);
+                            dq_3 = __fmaf_rn(g1_6 * __uint_as_float(ww[v_13 * 4 + e_6] & 4294901760u), x1_6, dq_3);
                         }
                     }
-                    float dots_2[1];
-                    float _warp_reduce_24 = dq_2;
+                    float dots_1[1];
+                    float _warp_reduce_24 = dq_3;
                     #pragma unroll
                     for (int offset = 16; offset > 0; offset >>= 1)
                         _warp_reduce_24 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_24, offset);
-                    dots_2[0] = _warp_reduce_24;
+                    dots_1[0] = _warp_reduce_24;
                     float rq_2 = rrP0[0];
                     if (lane == 0) {
-                        dot_slots[park * 12 + warp] = dots_2[0];
+                        dot_slots[park * 12 + warp] = dots_1[0];
                     }
                     __syncthreads();
                     float tot_2 = 0.0f;
@@ -808,8 +807,8 @@ kernel_cake_rmsnorm_det_train_0dcdc563be377247044e(__nv_bfloat16* __restrict__ g
                         float d_3 = dot_slots[park * 12 + rg * 12 + k_4];
                         tot_2 += d_3;
                     }
-                    dots_2[0] = tot_2;
-                    float cq_2 = __fdiv_rn(dots_2[0], 6144.0f);
+                    dots_1[0] = tot_2;
+                    float cq_2 = __fdiv_rn(dots_1[0], 6144.0f);
                     float kx_2 = rq_2 * rq_2 * rq_2 * cq_2;
                     float nkx_2 = -kx_2;
                     unsigned long long dx_base_2 = (unsigned long long)rowk * 6144;
@@ -866,14 +865,14 @@ kernel_cake_rmsnorm_det_train_0dcdc563be377247044e(__nv_bfloat16* __restrict__ g
                     int rowk_1 = row_begin + (it_1 + 1) + rg;
                     if (n_iters > it_1 + 1 + 2) {
                         int rowk_ld_1 = ((rowk_1 + 2) < (last_row) ? (rowk_1 + 2) : (last_row));
-                        unsigned long long g_base_4 = (unsigned long long)rowk_ld_1 * (unsigned long long)g_stride;
-                        unsigned long long x_base_4 = (unsigned long long)rowk_ld_1 * (unsigned long long)x_stride;
+                        unsigned long long g_base_5 = (unsigned long long)rowk_ld_1 * (unsigned long long)g_stride;
+                        unsigned long long x_base_5 = (unsigned long long)rowk_ld_1 * (unsigned long long)x_stride;
                         rrP0[0] = r[rowk_ld_1];
                         #pragma unroll
                         for (int v_15 = 0; v_15 < 2; v_15++) {
                             int coln_6 = (v_15 * 384 + tir) * 8;
                             {
-                                const uint4* _vptr_25 = reinterpret_cast<const uint4*>(g + g_base_4 + (unsigned long long)coln_6);
+                                const uint4* _vptr_25 = reinterpret_cast<const uint4*>(g + g_base_5 + (unsigned long long)coln_6);
                                 uint4* _vdst_25 = reinterpret_cast<uint4*>(&gwP0[v_15 * 4]);
                                 #pragma unroll
                                 for (int _blk = 0; _blk < 1; _blk++) {
@@ -882,7 +881,7 @@ kernel_cake_rmsnorm_det_train_0dcdc563be377247044e(__nv_bfloat16* __restrict__ g
                                 }
                             }
                             {
-                                const uint4* _vptr_26 = reinterpret_cast<const uint4*>(x + x_base_4 + (unsigned long long)coln_6);
+                                const uint4* _vptr_26 = reinterpret_cast<const uint4*>(x + x_base_5 + (unsigned long long)coln_6);
                                 uint4* _vdst_26 = reinterpret_cast<uint4*>(&xwP0[v_15 * 4]);
                                 #pragma unroll
                                 for (int _blk = 0; _blk < 1; _blk++) {
@@ -891,12 +890,12 @@ kernel_cake_rmsnorm_det_train_0dcdc563be377247044e(__nv_bfloat16* __restrict__ g
                                 }
                             }
                         }
-                        unsigned long long gh_base2_4 = (unsigned long long)rowk_ld_1 * (unsigned long long)gh_stride;
+                        unsigned long long gh_base2_5 = (unsigned long long)rowk_ld_1 * (unsigned long long)gh_stride;
                         #pragma unroll
                         for (int v2_6 = 0; v2_6 < 2; v2_6++) {
                             int coln2_6 = (v2_6 * 384 + tir) * 8;
                             {
-                                const uint4* _vptr_27 = reinterpret_cast<const uint4*>(g_h + gh_base2_4 + (unsigned long long)coln2_6);
+                                const uint4* _vptr_27 = reinterpret_cast<const uint4*>(g_h + gh_base2_5 + (unsigned long long)coln2_6);
                                 uint4* _vdst_27 = reinterpret_cast<uint4*>(&ghwP0[v2_6 * 4]);
                                 #pragma unroll
                                 for (int _blk = 0; _blk < 1; _blk++) {
@@ -907,7 +906,7 @@ kernel_cake_rmsnorm_det_train_0dcdc563be377247044e(__nv_bfloat16* __restrict__ g
                         }
                     }
                     int park_1 = it_1 + 1 & 1;
-                    float dq_3 = 0.0f;
+                    float dq_4 = 0.0f;
                     #pragma unroll
                     for (int v_16 = 0; v_16 < 2; v_16++) {
                         unsigned int wvd_4[4];
@@ -919,12 +918,12 @@ kernel_cake_rmsnorm_det_train_0dcdc563be377247044e(__nv_bfloat16* __restrict__ g
                             float g1_8 = __uint_as_float(gwd_8 & 4294901760u);
                             float x0_8 = __uint_as_float(xwd_8 << 16);
                             float x1_8 = __uint_as_float(xwd_8 & 4294901760u);
-                            dq_3 = __fmaf_rn(g0_8 * __uint_as_float(ww[v_16 * 4 + e_8] << 16), x0_8, dq_3);
-                            dq_3 = __fmaf_rn(g1_8 * __uint_as_float(ww[v_16 * 4 + e_8] & 4294901760u), x1_8, dq_3);
+                            dq_4 = __fmaf_rn(g0_8 * __uint_as_float(ww[v_16 * 4 + e_8] << 16), x0_8, dq_4);
+                            dq_4 = __fmaf_rn(g1_8 * __uint_as_float(ww[v_16 * 4 + e_8] & 4294901760u), x1_8, dq_4);
                         }
                     }
                     float dots_3[1];
-                    float _warp_reduce_28 = dq_3;
+                    float _warp_reduce_28 = dq_4;
                     #pragma unroll
                     for (int offset = 16; offset > 0; offset >>= 1)
                         _warp_reduce_28 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_28, offset);
@@ -998,14 +997,14 @@ kernel_cake_rmsnorm_det_train_0dcdc563be377247044e(__nv_bfloat16* __restrict__ g
                     int rowk_2 = row_begin + (it_1 + 2) + rg;
                     if (n_iters > it_1 + 2 + 2) {
                         int rowk_ld_2 = ((rowk_2 + 2) < (last_row) ? (rowk_2 + 2) : (last_row));
-                        unsigned long long g_base_5 = (unsigned long long)rowk_ld_2 * (unsigned long long)g_stride;
-                        unsigned long long x_base_5 = (unsigned long long)rowk_ld_2 * (unsigned long long)x_stride;
+                        unsigned long long g_base_6 = (unsigned long long)rowk_ld_2 * (unsigned long long)g_stride;
+                        unsigned long long x_base_6 = (unsigned long long)rowk_ld_2 * (unsigned long long)x_stride;
                         rrP1[0] = r[rowk_ld_2];
                         #pragma unroll
                         for (int v_18 = 0; v_18 < 2; v_18++) {
                             int coln_7 = (v_18 * 384 + tir) * 8;
                             {
-                                const uint4* _vptr_29 = reinterpret_cast<const uint4*>(g + g_base_5 + (unsigned long long)coln_7);
+                                const uint4* _vptr_29 = reinterpret_cast<const uint4*>(g + g_base_6 + (unsigned long long)coln_7);
                                 uint4* _vdst_29 = reinterpret_cast<uint4*>(&gwP1[v_18 * 4]);
                                 #pragma unroll
                                 for (int _blk = 0; _blk < 1; _blk++) {
@@ -1014,7 +1013,7 @@ kernel_cake_rmsnorm_det_train_0dcdc563be377247044e(__nv_bfloat16* __restrict__ g
                                 }
                             }
                             {
-                                const uint4* _vptr_30 = reinterpret_cast<const uint4*>(x + x_base_5 + (unsigned long long)coln_7);
+                                const uint4* _vptr_30 = reinterpret_cast<const uint4*>(x + x_base_6 + (unsigned long long)coln_7);
                                 uint4* _vdst_30 = reinterpret_cast<uint4*>(&xwP1[v_18 * 4]);
                                 #pragma unroll
                                 for (int _blk = 0; _blk < 1; _blk++) {
@@ -1023,12 +1022,12 @@ kernel_cake_rmsnorm_det_train_0dcdc563be377247044e(__nv_bfloat16* __restrict__ g
                                 }
                             }
                         }
-                        unsigned long long gh_base2_5 = (unsigned long long)rowk_ld_2 * (unsigned long long)gh_stride;
+                        unsigned long long gh_base2_6 = (unsigned long long)rowk_ld_2 * (unsigned long long)gh_stride;
                         #pragma unroll
                         for (int v2_7 = 0; v2_7 < 2; v2_7++) {
                             int coln2_7 = (v2_7 * 384 + tir) * 8;
                             {
-                                const uint4* _vptr_31 = reinterpret_cast<const uint4*>(g_h + gh_base2_5 + (unsigned long long)coln2_7);
+                                const uint4* _vptr_31 = reinterpret_cast<const uint4*>(g_h + gh_base2_6 + (unsigned long long)coln2_7);
                                 uint4* _vdst_31 = reinterpret_cast<uint4*>(&ghwP1[v2_7 * 4]);
                                 #pragma unroll
                                 for (int _blk = 0; _blk < 1; _blk++) {
@@ -1039,7 +1038,7 @@ kernel_cake_rmsnorm_det_train_0dcdc563be377247044e(__nv_bfloat16* __restrict__ g
                         }
                     }
                     int park_2 = it_1 + 2 & 1;
-                    float dq_4 = 0.0f;
+                    float dq_5 = 0.0f;
                     #pragma unroll
                     for (int v_19 = 0; v_19 < 2; v_19++) {
                         unsigned int wvd_5[4];
@@ -1051,12 +1050,12 @@ kernel_cake_rmsnorm_det_train_0dcdc563be377247044e(__nv_bfloat16* __restrict__ g
                             float g1_10 = __uint_as_float(gwd_10 & 4294901760u);
                             float x0_10 = __uint_as_float(xwd_10 << 16);
                             float x1_10 = __uint_as_float(xwd_10 & 4294901760u);
-                            dq_4 = __fmaf_rn(g0_10 * __uint_as_float(ww[v_19 * 4 + e_10] << 16), x0_10, dq_4);
-                            dq_4 = __fmaf_rn(g1_10 * __uint_as_float(ww[v_19 * 4 + e_10] & 4294901760u), x1_10, dq_4);
+                            dq_5 = __fmaf_rn(g0_10 * __uint_as_float(ww[v_19 * 4 + e_10] << 16), x0_10, dq_5);
+                            dq_5 = __fmaf_rn(g1_10 * __uint_as_float(ww[v_19 * 4 + e_10] & 4294901760u), x1_10, dq_5);
                         }
                     }
                     float dots_4[1];
-                    float _warp_reduce_32 = dq_4;
+                    float _warp_reduce_32 = dq_5;
                     #pragma unroll
                     for (int offset = 16; offset > 0; offset >>= 1)
                         _warp_reduce_32 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_32, offset);
