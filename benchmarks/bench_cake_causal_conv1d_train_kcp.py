@@ -38,9 +38,11 @@ Phases per row and mode, each through the autograd entry with gradient-requiring
 
 Measures (on every rank; a row reports the slowest rank and the JSON keeps every rank's value):
 
-* ``gpu_us``: the CUPTI span of the phase's kernels on the rank (``flashinfer.testing.bench_gpu_time``, cold L2, the
-  same iteration counts on every rank).  The exchange's NCCL kernels are among them, so a rank's span includes its
-  wait for its peers; a host-bound phase (the autograd host time above its kernels' time) also puts host gaps in it;
+* ``gpu_us``: the CUDA-event span of the phase on the rank (``flashinfer.testing.bench_gpu_time``, cold L2, the same
+  iteration counts on every rank; CUDA events, not CUPTI: the CUPTI path finalizes CUPTI after every measurement,
+  and a finalize while the NCCL watchdog thread is inside a CUDA runtime call ends the process with SIGSEGV in
+  ``cudaGetDevice``).  The exchange's NCCL kernels are in the span, so a rank's span includes its wait for its
+  peers; a host-bound phase (the autograd host time above its kernels' time) also puts host gaps in it;
 * ``ahead_us``: the GPU time with the host enqueue hidden: after a barrier and an L2 flush, a spin kernel of the same
   length on every rank runs while the host enqueues the phase behind it; CUDA events around the phase
   (``ahead_late`` counts the samples whose enqueue outlasted the spin; 0 expected);
@@ -72,8 +74,8 @@ one call each.  Per row ``sota`` keeps each arm's library version, determinism, 
 and a numerics check (``y`` / ``dx`` on its rows, the summed ``dweight``) against the whole-pack Cake
 non-deterministic result, or the reason it cannot run the row (every rank must be able to); ``best_sota`` names the
 fastest eligible arm per phase and measure, ``speedup_vs_sota`` its time over the non-deterministic time.
-``comparison`` is the row's two-baseline comparison on one column, the ``ahead`` time (``COMPARISON_COLUMN``: a
-CUPTI span of a multi-op autograd phase also counts its host gaps; ``wall`` stays in ``modes`` and ``sota``): per
+``comparison`` is the row's two-baseline comparison on one column, the ``ahead`` time (``COMPARISON_COLUMN``: the
+``gpu`` span of a multi-op autograd phase also counts its host gaps; ``wall`` stays in ``modes`` and ``sota``): per
 phase the deterministic and non-deterministic Cake times, the best eligible arm (or ``unsupported`` with every arm's
 reason, e.g. a layout no eligible arm runs), ``det_over_nondet`` and ``sota_over_nondet``; the ``compare`` lines
 print it.
@@ -141,7 +143,7 @@ AHEAD_SAMPLES = 10
 AHEAD_MIN_MS = 2.0
 AHEAD_ENQUEUE_FACTOR = 3.0
 # The two-baseline comparison of a row (det Cake, nondet Cake, best eligible non-Cake arm) uses one timing column: the
-# host-hidden GPU time, since a CUPTI span of a multi-op autograd phase also counts the host gaps between its kernels.
+# host-hidden GPU time, since the gpu span of a multi-op autograd phase also counts the host gaps between its kernels.
 COMPARISON_COLUMN = "ahead"
 COMPARISON_RULE = (
     "KCP: every arm compared on the host-hidden GPU time (ahead; the slowest rank); wall kept in the JSON; "
@@ -191,11 +193,14 @@ def _max_over_ranks(values: list[float], device: torch.device) -> list[float]:
 
 
 def _gpu_ms(fn: Callable[[], object]) -> list[float]:
-    """Every rank's median CUPTI span (ms) of ``fn``'s kernels, cold L2; every rank runs the same iteration counts."""
+    """Every rank's median CUDA-event span (ms) of ``fn``, cold L2; every rank runs the same iteration counts.
+
+    Not CUPTI: its per-measurement finalize races the NCCL watchdog thread's CUDA calls (SIGSEGV in ``cudaGetDevice``).
+    """
 
     times = bench_gpu_time(
         fn,
-        enable_cupti=True,
+        enable_cupti=False,
         cold_l2_cache=True,
         dry_run_iters=GPU_WARMUPS,
         repeat_iters=GPU_SAMPLES,
@@ -820,6 +825,33 @@ def main(argv: Optional[list[str]] = None) -> int:
         ]
     ahead = _GpuAhead(device)
     results = []
+
+    def write_json(complete: bool) -> None:
+        # Rewritten after every row (complete=False) so a later failure keeps the finished rows.
+        if rank != 0 or not args.json:
+            return
+        with open(args.json, "w") as handle:
+            json.dump(
+                {
+                    "device": torch.cuda.get_device_name(device),
+                    "capability": list(torch.cuda.get_device_capability(device)),
+                    "sm_count": torch.cuda.get_device_properties(
+                        device
+                    ).multi_processor_count,
+                    "cuda": torch.version.cuda,
+                    "torch": torch.__version__,
+                    "world": world,
+                    "layout": args.layout,
+                    "tensors": args.tensors,
+                    "sota_arms": args.sota_arms,
+                    "gpu_timer": "cuda_event",
+                    "complete": complete,
+                    "rows": results,
+                },
+                handle,
+                indent=1,
+            )
+
     for tokens, channels in rows:
         result = bench_row(
             tokens,
@@ -834,32 +866,13 @@ def main(argv: Optional[list[str]] = None) -> int:
         if rank == 0:
             for line in _format(result, world):
                 print(line, flush=True)
+        write_json(complete=False)
     ok = all(result["check"]["ok"] for result in results)
-    if rank == 0:
-        if not ok:
-            print("CHECK FAILED: " + ", ".join(
-                f"S={r['tokens']} C={r['channels']}" for r in results if not r["check"]["ok"]
-            ))  # fmt: skip
-        if args.json:
-            with open(args.json, "w") as handle:
-                json.dump(
-                    {
-                        "device": torch.cuda.get_device_name(device),
-                        "capability": list(torch.cuda.get_device_capability(device)),
-                        "sm_count": torch.cuda.get_device_properties(
-                            device
-                        ).multi_processor_count,
-                        "cuda": torch.version.cuda,
-                        "torch": torch.__version__,
-                        "world": world,
-                        "layout": args.layout,
-                        "tensors": args.tensors,
-                        "sota_arms": args.sota_arms,
-                        "rows": results,
-                    },
-                    handle,
-                    indent=1,
-                )
+    if rank == 0 and not ok:
+        print("CHECK FAILED: " + ", ".join(
+            f"S={r['tokens']} C={r['channels']}" for r in results if not r["check"]["ok"]
+        ))  # fmt: skip
+    write_json(complete=True)
     dist.barrier()
     dist.destroy_process_group()
     return 0 if ok else 1
