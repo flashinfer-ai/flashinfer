@@ -16,6 +16,7 @@ limitations under the License.
 
 from __future__ import annotations
 
+import ctypes
 import math
 from array import array
 from dataclasses import dataclass, replace
@@ -970,9 +971,11 @@ def host_tables(
     """
     words = _plan_table_words(plan, layout, q_indptr=q_indptr, row_splits=row_splits)
     # array packs the words as int32 without torch.tensor's per-element type
-    # inference; pin_memory copies them into pinned memory.
+    # inference; one memmove copies them into the pinned image.
     packed = array(_INT32_CODE, words)
-    return torch.frombuffer(packed, dtype=torch.int32).pin_memory()
+    image = torch.empty((len(packed),), dtype=torch.int32, pin_memory=True)
+    ctypes.memmove(image.data_ptr(), packed.buffer_info()[0], len(packed) * 4)
+    return image
 
 
 # ---------------------------------------------------------------------------
