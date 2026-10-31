@@ -122,35 +122,45 @@ def convert_e4m3_fragment(
     return cute.TensorSSA(result_vector, (count,), mma_dtype)
 
 
-# One e4m3 pair held in a 16-bit register ($1) -> one bf16x2 / f16x2 word ($0).  The
-# pair is widened to a word (high half zero) and the 4-byte converters above run on
-# it; only lane 0 / 1 (the two real bytes) are kept, so the selector is the low one.
-_E4M3X2_TO_BF16X2_ALU_H = """
+# One e4m3 pair, zero-extended into a 32-bit register ($1, bytes 0 and 1) -> one bf16x2
+# / f16x2 word ($0): the low-pair half of the 4-byte converter above.  Taking the pair
+# as a word lets the compiler feed the 16-bit smem load's zero-extended register in
+# directly (no repacking instruction).
+_E4M3X2_TO_BF16X2_ALU_W = """
 {
     .reg .b32 s, k;
-    .reg .b16 z;
-    mov.b16 z, 0;
-    mov.b32 s, {$1, z};
     mov.b32 k, 0x7B807B80;
-    prmt.b32 s, s, 0, 0x9180;
+    prmt.b32 s, $1, 0, 0x9180;
     shl.b32 s, s, 4;
     and.b32 s, s, 0x87F087F0;
     mul.rn.bf16x2 $0, s, k;
 }
 """
-_E4M3X2_TO_BF16X2_NATIVE_H = "cvt.rn.bf16x2.e4m3x2 $0, $1;"
-_E4M3X2_TO_F16X2_H = "cvt.rn.f16x2.e4m3x2 $0, $1;"
+_E4M3X2_TO_BF16X2_NATIVE_W = """
+{
+    .reg .b16 l, h;
+    mov.b32 {l, h}, $1;
+    cvt.rn.bf16x2.e4m3x2 $0, l;
+}
+"""
+_E4M3X2_TO_F16X2_W = """
+{
+    .reg .b16 l, h;
+    mov.b32 {l, h}, $1;
+    cvt.rn.f16x2.e4m3x2 $0, l;
+}
+"""
 
 
 def _asm_for_pair(mma_dtype: type[cutlass.Numeric], native_cvt: bool) -> str:
     if mma_dtype is cutlass.BFloat16:
         return (
-            _E4M3X2_TO_BF16X2_NATIVE_H
+            _E4M3X2_TO_BF16X2_NATIVE_W
             if native_cvt and _HAS_NATIVE_E4M3_BF16_CVT
-            else _E4M3X2_TO_BF16X2_ALU_H
+            else _E4M3X2_TO_BF16X2_ALU_W
         )
     if mma_dtype is cutlass.Float16:
-        return _E4M3X2_TO_F16X2_H
+        return _E4M3X2_TO_F16X2_W
     raise ValueError(f"W8A16 converts e4m3 to bf16 or fp16, not {mma_dtype}")
 
 
@@ -178,11 +188,12 @@ def convert_e4m3_pairs(
     out_words: list[ir.Value] = []
     for idx in range(count):
         half = vector.extract(halves_vector, [], [idx], loc=loc, ip=ip)
+        half32 = llvm.zext(Uint32.mlir_type, half, loc=loc, ip=ip)
         word = llvm.inline_asm(
             Uint32.mlir_type,
-            [half],
+            [half32],
             asm,
-            "=r,h",
+            "=r,r",
             has_side_effects=False,
             is_align_stack=False,
             asm_dialect=llvm.AsmDialect.AD_ATT,

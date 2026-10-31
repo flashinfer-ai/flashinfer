@@ -417,6 +417,8 @@ class Sm90W8A16Fp8GemmKernel:
                         ab_pipeline,
                         order_bar,
                         sA,
+                        storage.sA.data_ptr(),
+                        a_smem_layout_staged,
                         sB,
                         sC,
                         sBias,
@@ -439,6 +441,8 @@ class Sm90W8A16Fp8GemmKernel:
                         ab_pipeline,
                         order_bar,
                         sA,
+                        storage.sA.data_ptr(),
+                        a_smem_layout_staged,
                         sB,
                         sC,
                         sBias,
@@ -462,6 +466,8 @@ class Sm90W8A16Fp8GemmKernel:
                     ab_pipeline,
                     order_bar,
                     sA,
+                    storage.sA.data_ptr(),
+                    a_smem_layout_staged,
                     sB,
                     sC,
                     sBias,
@@ -487,6 +493,8 @@ class Sm90W8A16Fp8GemmKernel:
         ab_pipeline: pipeline.PipelineTmaAsync,
         order_bar: cute.Pointer,
         sA: cute.Tensor,
+        sA_base: cute.Pointer,
+        a_smem_layout_staged: cute.ComposedLayout,
         sB: cute.Tensor,
         sC: cute.Tensor,
         sBias: cute.Tensor,
@@ -532,7 +540,14 @@ class Sm90W8A16Fp8GemmKernel:
         )
         smem_tiled_copy_a = cute.make_tiled_copy_A(smem_copy_atom_a, tiled_mma)
         smem_thr_copy_a = smem_tiled_copy_a.get_slice(ctid)
-        tCsA_copy = smem_thr_copy_a.partition_S(sA)  # (CPY, CPY_M, CPY_K, STAGE)
+        # The A stage is addressed by pointer arithmetic (stage base + a per-stage
+        # layout) rather than by indexing the staged tensor: the per-element swizzled
+        # offsets are then compile-time constants on top of one dynamic base, instead
+        # of a swizzle recomputed for every load (ncu: three address ops per load).
+        # (The kernel's layout argument, not self's host-side value: a kernel region
+        # may not capture values built in the host trace.)
+        a_stage_layout = cute.slice_(a_smem_layout_staged, (None, None, 0))
+        a_stage_elems = cute.cosize(a_stage_layout)
         tCrA_copy_view = smem_thr_copy_a.retile(tCrA_load)  # (CPY, CPY_M, CPY_K)
         num_k_blocks = cute.size(tCrA_mma, mode=[2])
         k_wait_max = min(num_k_blocks - 1, 7)
@@ -622,16 +637,36 @@ class Sm90W8A16Fp8GemmKernel:
 
             # First k-tile: no wgmma in flight, so no wait before the converts.
             ab_pipeline.consumer_wait(read_state)
-            self._load_a_kblock(
-                smem_tiled_copy_a, tCsA_copy, tCrA_copy_view, 0, read_state.index
+            # The A stage as its own swizzled tensor: one dynamic base address (stages
+            # are swizzle-atom aligned, the pointer keeps its alignment when rebuilt
+            # from the integer), the swizzle on the pointer, a static per-stage layout,
+            # so the fragment copy's element offsets fold to constants.  (The loop
+            # below binds its own stage tensor under another name: a tensor rebound
+            # inside a staged loop would be threaded as a loop-carried value.)
+            stage_addr = sA_base.toint() + read_state.index * a_stage_elems
+            stage_ptr = cute.recast_ptr(
+                cute.make_ptr(
+                    self.a_dtype,
+                    stage_addr,
+                    cute.AddressSpace.smem,
+                    assumed_align=self.buffer_align_bytes,
+                ),
+                a_stage_layout.inner,
+                dtype=self.a_dtype,
+            )
+            tCsA_stage = smem_thr_copy_a.partition_S(
+                cute.make_tensor(stage_ptr, a_stage_layout.outer)
+            )
+            cute.copy(
+                smem_tiled_copy_a,
+                tCsA_stage[(None, None, 0)],
+                tCrA_copy_view[(None, None, 0)],
             )
             if cutlass.const_expr(num_k_blocks > 1):
-                self._load_a_kblock(
+                cute.copy(
                     smem_tiled_copy_a,
-                    tCsA_copy,
-                    tCrA_copy_view,
-                    1,
-                    read_state.index,
+                    tCsA_stage[(None, None, 1)],
+                    tCrA_copy_view[(None, None, 1)],
                 )
             self._convert_a_kblock(tCrA_load, tCrA_mma, 0)
             warpgroup.fence()
@@ -645,12 +680,10 @@ class Sm90W8A16Fp8GemmKernel:
                 )
                 warpgroup.commit_group()
                 if cutlass.const_expr(kb + 2 < num_k_blocks):
-                    self._load_a_kblock(
+                    cute.copy(
                         smem_tiled_copy_a,
-                        tCsA_copy,
-                        tCrA_copy_view,
-                        kb + 2,
-                        read_state.index,
+                        tCsA_stage[(None, None, kb + 2)],
+                        tCrA_copy_view[(None, None, kb + 2)],
                     )
                 if cutlass.const_expr(kb + 1 < num_k_blocks):
                     self._convert_a_kblock(tCrA_load, tCrA_mma, kb + 1)
@@ -663,20 +696,30 @@ class Sm90W8A16Fp8GemmKernel:
             # (their reader, k-block kb + 1 of the previous k-tile, is done).
             for _k_tile in cutlass.range(1, k_tile_cnt, 1, unroll=1):
                 ab_pipeline.consumer_wait(read_state)
-                self._load_a_kblock(
+                stage_addr = sA_base.toint() + read_state.index * a_stage_elems
+                stage_ptr = cute.recast_ptr(
+                    cute.make_ptr(
+                        self.a_dtype,
+                        stage_addr,
+                        cute.AddressSpace.smem,
+                        assumed_align=self.buffer_align_bytes,
+                    ),
+                    a_stage_layout.inner,
+                    dtype=self.a_dtype,
+                )
+                tCsA_stage_k = smem_thr_copy_a.partition_S(
+                    cute.make_tensor(stage_ptr, a_stage_layout.outer)
+                )
+                cute.copy(
                     smem_tiled_copy_a,
-                    tCsA_copy,
-                    tCrA_copy_view,
-                    0,
-                    read_state.index,
+                    tCsA_stage_k[(None, None, 0)],
+                    tCrA_copy_view[(None, None, 0)],
                 )
                 if cutlass.const_expr(num_k_blocks > 1):
-                    self._load_a_kblock(
+                    cute.copy(
                         smem_tiled_copy_a,
-                        tCsA_copy,
-                        tCrA_copy_view,
-                        1,
-                        read_state.index,
+                        tCsA_stage_k[(None, None, 1)],
+                        tCrA_copy_view[(None, None, 1)],
                     )
                 warpgroup.wait_group(k_wait_max)
                 self._convert_a_kblock(tCrA_load, tCrA_mma, 0)
@@ -695,12 +738,10 @@ class Sm90W8A16Fp8GemmKernel:
                         ab_pipeline.consumer_release(release_state)
                         release_state.advance()
                     if cutlass.const_expr(kb + 2 < num_k_blocks):
-                        self._load_a_kblock(
+                        cute.copy(
                             smem_tiled_copy_a,
-                            tCsA_copy,
-                            tCrA_copy_view,
-                            kb + 2,
-                            read_state.index,
+                            tCsA_stage_k[(None, None, kb + 2)],
+                            tCrA_copy_view[(None, None, kb + 2)],
                         )
                     if cutlass.const_expr(kb + 1 < num_k_blocks):
                         self._convert_a_kblock(tCrA_load, tCrA_mma, kb + 1)
@@ -824,21 +865,6 @@ class Sm90W8A16Fp8GemmKernel:
             m_tile = t2 // rem
             n_tile = full_groups * group + t2 % rem
         return m_tile, n_tile, tile_l
-
-    @cute.jit
-    def _load_a_kblock(
-        self,
-        smem_tiled_copy_a: cute.TiledCopy,
-        tCsA_copy: cute.Tensor,
-        tCrA_copy_view: cute.Tensor,
-        kb: cutlass.Constexpr,
-        stage: cutlass.Int32,
-    ):
-        cute.copy(
-            smem_tiled_copy_a,
-            tCsA_copy[(None, None, kb, stage)],
-            tCrA_copy_view[(None, None, kb)],
-        )
 
     @cute.jit
     def _convert_a_kblock(
