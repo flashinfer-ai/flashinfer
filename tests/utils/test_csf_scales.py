@@ -1,0 +1,106 @@
+"""
+Copyright (c) 2026 by FlashInfer team.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+  http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+"""
+
+import numpy as np
+import pytest
+import torch
+
+from flashinfer.quantization import encode_csf_scales
+
+
+def encode_ref(scales: np.ndarray):
+    """The CSF fixed and exception streams of one ``[rows, cols]`` uint8 matrix."""
+    rows, cols = scales.shape
+    flat = scales.astype(np.int64) + 256 * np.arange(rows)[:, None]
+    hist = np.bincount(flat.ravel(), minlength=256 * rows).reshape(rows, 256)
+    cum = np.pad(hist.cumsum(1), ((0, 0), (1, 0)))
+    base = (cum[:, 16:] - cum[:, :-16]).argmax(1)
+    diff = scales.astype(np.int64) - base[:, None]
+    outside = (diff < 0) | (diff > 15)
+    codes = np.where(outside, 0, diff).astype(np.uint8)
+    fixed = np.concatenate(
+        (
+            base.reshape(-1, 16).astype(np.uint8),
+            (codes[:, 0::2] | codes[:, 1::2] << 4).reshape(rows // 16, -1),
+        ),
+        axis=1,
+    )
+    pos = np.flatnonzero(outside)
+    return fixed, (pos | scales.ravel()[pos].astype(np.int64) << 24).astype(np.uint32)
+
+
+def decode_ref(fixed: np.ndarray, exceptions: np.ndarray, rows: int, cols: int):
+    packed = fixed[:, 16:].reshape(rows, cols // 2)
+    out = np.stack((packed & 15, packed >> 4), -1).reshape(rows, cols)
+    out = (out + fixed[:, :16].reshape(rows, 1)).ravel()
+    out[exceptions & 0xFFFFFF] = exceptions >> 24
+    return out.reshape(rows, cols)
+
+
+def check_encode(scales: np.ndarray):
+    num_matrices, rows, cols = scales.shape
+    csf = encode_csf_scales(torch.from_numpy(scales).cuda().view(torch.float8_e4m3fn))
+    fixed = csf.fixed.cpu().numpy()
+    exceptions = csf.exceptions.cpu().numpy()
+    offsets = csf.exc_offsets.cpu().numpy()
+    slabs = rows // 16
+    assert (csf.rows, csf.cols) == (rows, cols)
+    assert (
+        offsets.shape == (num_matrices * slabs + 1,) and offsets[-1] == exceptions.size
+    )
+    for i in range(num_matrices):
+        ref_fixed, ref_exceptions = encode_ref(scales[i])
+        own = exceptions[offsets[i * slabs] : offsets[(i + 1) * slabs]]
+        np.testing.assert_array_equal(fixed[i], ref_fixed)
+        np.testing.assert_array_equal(own, ref_exceptions)
+        np.testing.assert_array_equal(
+            np.diff(offsets[i * slabs : (i + 1) * slabs + 1]),
+            np.bincount((ref_exceptions & 0xFFFFFF) // (16 * cols), minlength=slabs),
+        )
+        np.testing.assert_array_equal(decode_ref(fixed[i], own, rows, cols), scales[i])
+
+
+@pytest.mark.parametrize(
+    "num_matrices,rows,cols", [(1, 16, 2), (3, 16, 40), (4, 128, 160), (2, 64, 256)]
+)
+@pytest.mark.parametrize("spread", [3.0, 12.0, None])
+def test_encode_csf_scales_random(num_matrices, rows, cols, spread):
+    rng = np.random.default_rng(0)
+    shape = (num_matrices, rows, cols)
+    if spread is None:  # mostly exceptions
+        scales = rng.integers(0, 256, shape)
+    else:
+        center = rng.integers(0, 256, (num_matrices, rows, 1))
+        scales = np.clip(np.rint(rng.normal(center, spread, shape)), 0, 255)
+    check_encode(scales.astype(np.uint8))
+
+
+def test_encode_csf_scales_edges():
+    rows = np.zeros((16, 32), np.uint8)
+    rows[0] = np.repeat(np.arange(0, 256, 16), 2)  # every window covers two bytes
+    rows[1] = 240 + np.arange(32) % 16  # the highest base
+    rows[2] = 255
+    rows[3, :16], rows[3, 16:] = 10, 100  # tied windows
+    rows[4] = np.arange(32) * 8
+    check_encode(rows[None])
+
+
+def test_encode_csf_scales_position_limit():
+    rng = np.random.default_rng(1)
+    scales = rng.integers(0, 256, (1, 1 << 16, 256), dtype=np.uint8)
+    check_encode(scales)
+    with pytest.raises(Exception, match="2\\^24"):
+        encode_csf_scales(torch.zeros(1 << 16, 258, dtype=torch.uint8, device="cuda"))
