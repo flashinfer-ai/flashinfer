@@ -34,7 +34,8 @@ and the block's Q / scale / weight boxes (identical logits and schedule words) o
 the forms the per-architecture policy list ``policy.fp4.first_tile_prefetch_forms``
 names: ``q1`` (``fp4:q1:short``; both architectures), ``le32`` (``fp4:le32:short``;
 sm_103a only -- one route, the route record binds the prefetch program on sm_103a
-and the plain warp-scan program on sm_100a) and ``qle1024``: where it is listed
+and the plain warp-scan program on sm_100a, whose ``K <= 4096`` stage bucket
+launches the warp-scan text with the prefetch) and ``qle1024``: where it is listed
 (both architectures) the FP4 ``le1024`` class ships two programs,
 ``fp4:qle1024:short`` for ``Q <= policy.fp4.first_tile_prefetch_max_queries_scan1024``
 (the CTA-scan text with the prefetch) and ``fp4:le1024:short`` above that query
@@ -62,14 +63,15 @@ rule and is applied at the catalogued count, not the device's; it is consulted
 before the ``:short`` / ``:ts`` shape gates, so a call inside both it and the
 ``:ts`` gate is named by its KV-split plan.
 
-A ``:kvsplit`` route record may carry ``stage_buckets``
+A ``:kvsplit`` or ``:short`` route record may carry ``stage_buckets``
 (``{arch: [{"kv_max": K, "stages": [[stage, program], ...]}, ...]}``): a plan
 whose KV length is at most an entry's ``kv_max`` launches the first such entry's
-stages on that architecture (:func:`route_stages`) -- on a route of the full
-kind its partial-kind twin's program, on a route of the partial kind a program
-of its own that no route's ``stages`` name -- with the same host call, logits
-and schedule words as the record's program; the route name, its admission and
-its metadata buffer are the record's.
+stages on that architecture (:func:`route_stages`) -- on a ``:kvsplit`` route
+of the full kind its partial-kind twin's program, on a ``:kvsplit`` route of the
+partial kind or a ``:short`` route a program of its own that no route's
+``stages`` name -- with the same host call, logits and schedule words as the
+record's program; the route name, its admission and its metadata buffer are the
+record's.
 """
 
 from __future__ import annotations
