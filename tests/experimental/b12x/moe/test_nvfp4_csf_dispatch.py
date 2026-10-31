@@ -12,6 +12,35 @@ from tests.experimental.b12x.preparation.test_precision_choices import (
 )
 
 
+@pytest.mark.parametrize("compressed", [False, True])
+@pytest.mark.parametrize("tokens", [1, 16, 32, 128])
+def test_tensor_planner_selects_inline_only_for_prepared_compressed_scales(
+    compressed, tokens
+):
+    from b12x.moe import fused_moe as moe
+    from ..conftest import require_b12x
+    import torch
+
+    device = require_b12x()
+    weights = moe.plan_weights(
+        source=moe.PackedSource(format="modelopt_nvfp4", w13_layout="w13"),
+        activation=moe.ActivationSpec(
+            mode="a4", nonlinearity="silu", io_dtype=torch.bfloat16
+        ),
+        geometry=moe.MoEGeometry(
+            num_experts=512, hidden_size=2560, intermediate_size=640
+        ),
+    )._impl
+    caps = moe.Caps(
+        max_tokens=tokens,
+        num_topk=10,
+        device=device,
+        quant_mode="nvfp4",
+        weight_plan=replace(weights, nvfp4_inline_scales=compressed),
+    )
+    assert caps.decode_config.nvfp4_inline_scales == (compressed and tokens > 4)
+
+
 @pytest.mark.parametrize("capacity", [4, 32, 128])
 def test_prepared_compressed_planes_race_both_scale_decoders(capacity):
     native = replace(_nvfp4_query(), num_tokens=capacity, routed_rows=capacity * 4)
