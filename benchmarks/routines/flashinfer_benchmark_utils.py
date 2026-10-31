@@ -583,12 +583,11 @@ routine_cc_to_supported_backends = {
     # Every gemm routine filters by this table first (rows mirror the library's
     # per-backend @supported_compute_capability guards, cited per routine), then
     # probes each remaining backend with a trial call to drop shape/dtype limits.
-    # 10.0 / 10.3 / 10.7 rows are pipecleaned on B200 / B300 / GR100 (a row the
-    # guard allows but hardware could not run is dropped, with the reason);
-    # 9.0, 11.0 and 12.x rows are guard-backed only.
+    # 10.0 / 10.3 / 10.7 rows are pipecleaned on B200 / B300 / GR100 (a backend
+    # the guard allows stays listed even if it fails to build; the trial call
+    # drops it at run time); 9.0, 11.0 and 12.x rows are guard-backed only.
     # cutlass flashinfer/gemm/gemm_base.py:10237, trtllm :10256, cutile :10305 (K-major only),
     # cute-dsl :10334 (SM107 only). auto picks cute-dsl/cutlass (:10383).
-    # cutile dropped at 10.7 despite its guard: cuTile SM107: 'No valid config found in search space' (pipeclean 2026-10-26).
     "gemm_fp8_nt_groupwise": {
         "7.5": [],
         "8.0": [],
@@ -597,7 +596,7 @@ routine_cc_to_supported_backends = {
         "9.0": [],
         "10.0": ["cutlass", "trtllm", "cutile", "auto"],
         "10.3": ["cutlass", "trtllm", "cutile", "auto"],
-        "10.7": ["cutlass", "trtllm", "cute-dsl", "auto"],
+        "10.7": ["cutlass", "trtllm", "cutile", "cute-dsl", "auto"],
         "11.0": ["cutile"],
         "12.0": ["cutlass", "cutile", "auto"],
         "12.1": ["cutlass", "cutile", "auto"],
@@ -607,7 +606,6 @@ routine_cc_to_supported_backends = {
     # deepgemm = group_deepgemm_fp8_nt_groupwise (:11621),
     # cute-dsl = group_gemm_fp8_nt_groupwise_contiguous (:11775).
     # SM12x raises for num_groups > 1 (:10950); the probe drops it.
-    # cutile dropped at 10.7 despite its guard: cuTile SM107: TileCompilerExecutionError (pipeclean 2026-10-26).
     "group_gemm_fp8_nt_groupwise": {
         "7.5": [],
         "8.0": [],
@@ -616,7 +614,7 @@ routine_cc_to_supported_backends = {
         "9.0": [],
         "10.0": ["cutlass", "cutile", "deepgemm", "cute-dsl"],
         "10.3": ["cutlass", "cutile", "deepgemm", "cute-dsl"],
-        "10.7": ["cutlass", "deepgemm", "cute-dsl"],
+        "10.7": ["cutlass", "cutile", "deepgemm", "cute-dsl"],
         "11.0": [],
         "12.0": ["cutlass", "cutile"],
         "12.1": ["cutlass", "cutile"],
@@ -783,7 +781,6 @@ routine_cc_to_supported_backends = {
     },
     # cutlass flashinfer/gemm/gemm_base.py:366, cublaslt :394, cudnn :425, tgv :441, cute-dsl :474,
     # cutile :534, tinygemm :562 (no SM107).
-    # cutile dropped at 10.7 despite its guard: cuTile SM107: 'No valid config found in search space' (pipeclean 2026-10-26).
     "mm_bf16": {
         "7.5": [],
         "8.0": ["cudnn", "cublaslt", "auto"],
@@ -810,14 +807,21 @@ routine_cc_to_supported_backends = {
             "cute-dsl",
             "auto",
         ],
-        "10.7": ["cudnn", "cutlass", "tgv", "cublaslt", "cute-dsl", "auto"],
+        "10.7": [
+            "cudnn",
+            "cutlass",
+            "tgv",
+            "cublaslt",
+            "cutile",
+            "cute-dsl",
+            "auto",
+        ],
         "11.0": ["cudnn", "cublaslt", "tinygemm", "cutile", "auto"],
         "12.0": ["cudnn", "cublaslt", "tinygemm", "cutile", "auto"],
         "12.1": ["cudnn", "cublaslt", "tinygemm", "cutile", "auto"],
     },
     # cutlass flashinfer/gemm/gemm_base.py:857, cudnn :870, cutile :882, tgv :901.
     # cake (:923, experimental) is not benchmarked.
-    # cutile dropped at 10.7 despite its guard: cuTile SM107: 'No valid config found in search space' (pipeclean 2026-10-26).
     "bmm_bf16": {
         "7.5": [],
         "8.0": ["cudnn", "auto"],
@@ -826,7 +830,7 @@ routine_cc_to_supported_backends = {
         "9.0": ["cudnn", "cutile", "auto"],
         "10.0": ["cudnn", "cutlass", "cutile", "tgv", "auto"],
         "10.3": ["cudnn", "cutlass", "cutile", "tgv", "auto"],
-        "10.7": ["cudnn", "cutlass", "tgv", "auto"],
+        "10.7": ["cudnn", "cutlass", "cutile", "tgv", "auto"],
         "11.0": ["cudnn", "cutile", "auto"],
         "12.0": ["cudnn", "cutile", "auto"],
         "12.1": ["cudnn", "cutile", "auto"],
