@@ -128,6 +128,11 @@ def _score(rows: int, keys: tuple, args: tuple) -> None:
         raise ValueError(
             f"Scales must be [pages, {PAGE}, {SCALES_PER_KEY}] and [rows, {SCALES_PER_KEY}]"
         )
+    scale_dtypes = (torch.float8_e4m3fn, torch.uint8)
+    if nvfp4 and (
+        key_scales.dtype not in scale_dtypes or query_scales.dtype not in scale_dtypes
+    ):
+        raise ValueError("NVFP4 scales must be float8_e4m3fn, or their uint8 bytes")
     if (
         key_cache.stride()[1:] != (dim, 1)
         or nvfp4
@@ -205,6 +210,18 @@ def quantize_write_index_k_nvfp4(
             f"key_scales must be [pages, {PAGE}, {SCALES_PER_KEY}] for the pages of "
             "key_cache, with a slot per key"
         )
+    if (
+        key.dtype not in (torch.bfloat16, torch.float16)
+        or slots.dtype != torch.int64
+        or key_cache.dtype != torch.uint8
+        or key_scales.dtype not in (torch.float8_e4m3fn, torch.uint8)
+    ):
+        raise ValueError(
+            "key must be BF16 or FP16, slots int64, key_cache uint8 and key_scales "
+            "float8_e4m3fn"
+        )
+    if get_compute_capability(key.device)[0] != 10:
+        raise ValueError("quantize_write_index_k_nvfp4 requires SM10x")
     if key.shape[0]:
         launch(
             single_head_scorer.index_k_write_kernel,

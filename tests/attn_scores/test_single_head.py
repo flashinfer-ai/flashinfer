@@ -168,13 +168,28 @@ def test_quantize_write_index_k_nvfp4_matches_reference(tokens: int) -> None:
 
 
 @torch.inference_mode()
-def test_quantize_write_index_k_nvfp4_rejects_fewer_scale_pages() -> None:
+def test_quantize_write_index_k_nvfp4_rejects_bad_inputs(monkeypatch) -> None:
     key = torch.zeros(1, 128, dtype=torch.bfloat16, device="cuda")
     slots = torch.zeros(1, dtype=torch.int64, device="cuda")
     key_cache = torch.zeros(4, 64, 64, dtype=torch.uint8, device="cuda")
-    key_scales = torch.zeros(3, 64, 8, dtype=torch.float8_e4m3fn, device="cuda")
+    key_scales = torch.zeros(4, 64, 8, dtype=torch.float8_e4m3fn, device="cuda")
+    run = quantize_write_index_k_nvfp4
     with pytest.raises(ValueError, match="key_scales must be"):
-        quantize_write_index_k_nvfp4(key, slots, key_cache, key_scales)
+        run(key, slots, key_cache, key_scales[:3])
+    for wrong in (
+        (key.float(), slots, key_cache, key_scales),
+        (key, slots.int(), key_cache, key_scales),
+        (key, slots, key_cache.bfloat16(), key_scales),
+        (key, slots, key_cache, key_scales.float()),
+    ):
+        with pytest.raises(ValueError, match="must be BF16 or FP16"):
+            run(*wrong)
+    monkeypatch.setattr(
+        "flashinfer.attn_scores.single_head.get_compute_capability",
+        lambda device: (9, 0),
+    )
+    with pytest.raises(ValueError, match="requires SM10x"):
+        run(key, slots, key_cache, key_scales)
 
 
 @torch.inference_mode()
@@ -198,4 +213,15 @@ def test_single_head_paged_mqa_logits_rejects_bad_shapes() -> None:
             context,
             requests=requests,
             scores=scores,
+        )
+    with pytest.raises(ValueError, match="NVFP4 scales must be"):
+        run(
+            torch.zeros(4, 64, dtype=torch.uint8, device="cuda"),
+            torch.zeros(4, 64, 64, dtype=torch.uint8, device="cuda"),
+            table,
+            context,
+            requests=requests,
+            scores=scores,
+            query_scales=torch.zeros(4, 8, device="cuda"),
+            key_scales=torch.zeros(4, 64, 8, device="cuda"),
         )
