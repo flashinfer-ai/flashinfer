@@ -26,7 +26,7 @@ class CustomCommunicator(CommBackend):
     def Get_size(self) -> int:
         return dist.get_world_size(self._group)
 
-    def allgather(self, data: int | bytes):
+    def allgather(self, data: Any):
         device = f"cuda:{torch.cuda.current_device()}"
         if isinstance(data, int):
             local_tensor = torch.tensor([data], device=device, dtype=torch.int32)
@@ -36,14 +36,9 @@ class CustomCommunicator(CommBackend):
             dist.all_gather(gathered, local_tensor, group=self._group)
             return [int(x.item()) for x in gathered]
 
-        elif isinstance(data, bytes):
-            local_tensor = torch.ByteTensor(list(data)).unsqueeze(0).to(device)
-            world_size = self.Get_size()
-            gathered = [data] * self.Get_size()
-            dist.all_gather_object(gathered, data, group=self._group)
-            return gathered
-        else:
-            raise TypeError(f"Unsupported type for allgather: {type(data)}")
+        gathered = [None] * self.Get_size()
+        dist.all_gather_object(gathered, data, group=self._group)
+        return gathered
 
     def bcast(self, data: Any, root: int) -> Any:
         obj_list = [data]
@@ -130,7 +125,7 @@ def _init_mnnvl_memory(world_size, rank, dtype, distributed_init_port):
     )
     dist.barrier(group=group)
     for r in range(world_size):
-        torch.equal(
+        assert torch.equal(
             tensor0[(r + 1) % world_size],
             torch.arange(start=r, end=r + numel_per_rank, device="cuda"),
         )
@@ -152,7 +147,7 @@ def _init_mnnvl_memory(world_size, rank, dtype, distributed_init_port):
     )
     dist.barrier(group=group)
     for r in range(world_size):
-        torch.equal(
+        assert torch.equal(
             tensor1[(r + 5) % world_size],
             torch.arange(
                 start=r, end=r + numel_per_rank, dtype=torch.float32, device="cuda"
