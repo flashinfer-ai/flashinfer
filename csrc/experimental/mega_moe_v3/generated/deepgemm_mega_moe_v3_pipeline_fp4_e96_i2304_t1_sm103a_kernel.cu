@@ -736,13 +736,13 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e96_i2304_t1_sm103a(int* __restrict__ t
         { // load_b_main
             asm volatile("griddepcontrol.wait;" ::: "memory");
             asm volatile("barrier.sync 11, 256;" ::: "memory");
-            int direct_w_0 = 0 + lane;
+            int direct_w_0 = lane;
             if (direct_w_0 < 40) {
-                smem_xsf[0 + direct_w_0] = x_sf[0 + direct_w_0];
+                smem_xsf[direct_w_0] = x_sf[direct_w_0];
             }
             int direct_w_1 = 32 + lane;
             if (direct_w_1 < 40) {
-                smem_xsf[0 + direct_w_1] = x_sf[0 + direct_w_1];
+                smem_xsf[direct_w_1] = x_sf[direct_w_1];
             }
             __syncwarp();
             unsigned int task_1[8];
@@ -972,7 +972,7 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e96_i2304_t1_sm103a(int* __restrict__ t
                     if (direct_hit_0 != 0) {
                         int _find_first_set_4 = __ffs(direct_hit_0);
                         unsigned int direct_lane_0 = _find_first_set_4 - 1;
-                        direct_expert = 0 + direct_lane_0;
+                        direct_expert = direct_lane_0;
                         if (direct_phase == 2) {
                             unsigned int _shfl_sync_5 = __shfl_sync(0xFFFFFFFF, counts[0], direct_lane_0);
                             direct_valid = _shfl_sync_5;
@@ -1113,8 +1113,8 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e96_i2304_t1_sm103a(int* __restrict__ t
                 if (task_4[0] == 1) {
                     unsigned int direct_routed = 0;
                     if (lane < 1) {
-                        int direct_route_0 = topk_idx_i32[(lane * 6 + 0) * 2] - local_expert_offset;
-                        float direct_rw_0 = topk_weights[lane * 6 + 0];
+                        int direct_route_0 = topk_idx_i32[lane * 6 * 2] - local_expert_offset;
+                        float direct_rw_0 = topk_weights[lane * 6];
                         if (direct_routed == 0 && (unsigned int)direct_route_0 == task_4[1]) {
                             direct_routed = 1;
                             pre_weight = direct_rw_0;
@@ -1272,7 +1272,7 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e96_i2304_t1_sm103a(int* __restrict__ t
                                         uint32_t _uv4_1_2;
                                         uint32_t _uv4_1_3;
                                         asm volatile("ld.global.cg.v4.b32 {%0, %1, %2, %3}, [%4];"
-                                            : "=r"(_uv4_1_0), "=r"(_uv4_1_1), "=r"(_uv4_1_2), "=r"(_uv4_1_3) : "l"((const void*)(PrivateSF1Words + (sk_base + 0 + sk_lane) + (0))) : "memory");
+                                            : "=r"(_uv4_1_0), "=r"(_uv4_1_1), "=r"(_uv4_1_2), "=r"(_uv4_1_3) : "l"((const void*)(PrivateSF1Words + (sk_base + sk_lane) + (0))) : "memory");
                                         _sk_p[0 + 0] = _uv4_1_0;
                                         _sk_p[0 + 1] = _uv4_1_1;
                                         _sk_p[0 + 2] = _uv4_1_2;
@@ -1284,7 +1284,7 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e96_i2304_t1_sm103a(int* __restrict__ t
                                         uint32_t _uv4_2_2;
                                         uint32_t _uv4_2_3;
                                         asm volatile("ld.global.cg.v4.b32 {%0, %1, %2, %3}, [%4];"
-                                            : "=r"(_uv4_2_0), "=r"(_uv4_2_1), "=r"(_uv4_2_2), "=r"(_uv4_2_3) : "l"((const void*)(PrivateSF1Words + (sk_base + 0 + 512 + sk_lane) + (0))) : "memory");
+                                            : "=r"(_uv4_2_0), "=r"(_uv4_2_1), "=r"(_uv4_2_2), "=r"(_uv4_2_3) : "l"((const void*)(PrivateSF1Words + (sk_base + 512 + sk_lane) + (0))) : "memory");
                                         _sk_p[4 + 0] = _uv4_2_0;
                                         _sk_p[4 + 1] = _uv4_2_1;
                                         _sk_p[4 + 2] = _uv4_2_2;
@@ -1824,7 +1824,7 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e96_i2304_t1_sm103a(int* __restrict__ t
                     }
                     unsigned int routed = __ballot_sync(0xFFFFFFFF, stored_row >= 0);
                     unsigned int row_0 = __shfl_sync(0xFFFFFFFF, (unsigned int)stored_row, 0);
-                    if ((routed >> 0 & 1) != 0) {
+                    if ((routed & 1) != 0) {
                         {
                             const uint4* _vptr_56 = reinterpret_cast<const uint4*>(expert_output + ((unsigned long long)row_0 * 5120 + lane_off) + 0);
                             uint4* _vdst_56 = reinterpret_cast<uint4*>(&values[0]);
@@ -1897,7 +1897,7 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e96_i2304_t1_sm103a(int* __restrict__ t
                     reduced[5] = 0.0f;
                     reduced[6] = 0.0f;
                     reduced[7] = 0.0f;
-                    if ((routed >> 0 & 1) != 0) {
+                    if ((routed & 1) != 0) {
                         float _bf16x2_add_f32_0[2];
                         asm volatile(
                             "{\n\t"
