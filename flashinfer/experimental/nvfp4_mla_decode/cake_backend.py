@@ -19,7 +19,7 @@ from __future__ import annotations
 import ctypes
 import math
 from array import array
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from itertools import chain
 from typing import Optional, Sequence
 
@@ -1021,17 +1021,40 @@ class NVFP4MLADecodeRunner:
     reduce_entry: object
     reduce_arguments: tuple
     host_tables: Optional[torch.Tensor] = None
+    # The launch form of the arguments above, packed once by
+    # bind_decode_payload: (entry, arguments) per program, and the result.
+    launches: tuple = field(default=(), repr=False, compare=False)
+    result: object = field(default=None, repr=False, compare=False)
 
     def launch(self):
         # Tensor maps are encoded by the host binding and passed by value; the
         # split-KV combine runs only when the plan has more than one split.
-        with tvm_ffi.use_torch_stream():
-            self.main_entry(*self.main_arguments)
-            if self.reduce_entry is not None:
-                self.reduce_entry(*self.reduce_arguments)
-        return (self.out, self.lse) if self.return_lse else self.out
+        # Each call's first CUDA tensor stays a torch.Tensor: tvm-ffi runs the
+        # call on the current torch stream of its device, as FlashInfer's
+        # other kernels do; the other tensors were converted once at bind.
+        for entry, arguments in self.launches:
+            entry(*arguments)
+        return self.result
 
     __call__ = launch
+
+
+def _launch_form(arguments: tuple) -> tuple:
+    """``arguments`` with every tensor but the first CUDA one converted once
+    to a ``tvm_ffi.Tensor`` view of the same memory (no per-launch DLPack
+    exchange); the first CUDA tensor stays a ``torch.Tensor`` and carries
+    the launch stream."""
+    packed, carrier = [], False
+    for argument in arguments:
+        if isinstance(argument, torch.Tensor):
+            if carrier or not argument.is_cuda:
+                argument = tvm_ffi.from_dlpack(argument)
+            else:
+                carrier = True
+        packed.append(argument)
+    if not carrier:
+        raise ValueError("a launch needs a CUDA tensor argument")
+    return tuple(packed)
 
 
 def generated_program_available(device: torch.device) -> bool:
@@ -1112,6 +1135,11 @@ def bind_decode_payload(
         reduce_program = combine["library"]
         reduce_entry = getattr(load(reduce_record, arch), combine["ffi_entry"])
         reduce_arguments = launch_args(combine, reduce_kwargs, reduce_kwargs["grid"])
+    launches: tuple[tuple[object, tuple], ...] = (
+        (main_entry, _launch_form(main_arguments)),
+    )
+    if reduce_entry is not None:
+        launches += ((reduce_entry, _launch_form(reduce_arguments)),)
     return NVFP4MLADecodeRunner(
         arch,
         main_program,
@@ -1127,6 +1155,8 @@ def bind_decode_payload(
         reduce_entry,
         reduce_arguments,
         host_tables,
+        launches,
+        (out, lse) if return_lse else out,
     )
 
 

@@ -2000,6 +2000,27 @@ def test_nvfp4_mla_decode(
     torch.cuda.synchronize()
     torch.testing.assert_close(out, snapshot_out, atol=0, rtol=0)
     torch.testing.assert_close(lse, snapshot_lse, atol=0, rtol=0)
+    # The launch form: one (entry, arguments) per program, each call's first
+    # CUDA tensor a torch.Tensor (it carries the stream), the rest converted.
+    entries = [decode.main_entry]
+    if decode.reduce_entry is not None:
+        entries.append(decode.reduce_entry)
+    assert [entry for entry, _ in decode.launches] == entries
+    for _, arguments in decode.launches:
+        assert sum(isinstance(a, torch.Tensor) for a in arguments) == 1
+    # A runner launches on the current stream: captured on a side stream,
+    # every launch joins the graph, and its replay writes the same bits.
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        decode()
+    out.zero_()
+    lse.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out, snapshot_out, atol=0, rtol=0)
+    torch.testing.assert_close(lse, snapshot_lse, atol=0, rtol=0)
 
 
 def assert_programs_match_bitwise(
