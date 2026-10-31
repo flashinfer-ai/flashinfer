@@ -103,6 +103,8 @@ def as_sm100(monkeypatch):
         ("decode", None, None, True),
         ("decode", 1, None, True),
         ("decode", 512, 1, True),
+        ("decode", 65535, 1, True),
+        ("decode", 65536, 1, False),
         ("decode", 4, 2, False),
         ("verify", None, None, True),
         ("verify", 1, 10, True),

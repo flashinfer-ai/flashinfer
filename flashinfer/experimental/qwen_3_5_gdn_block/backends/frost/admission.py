@@ -29,6 +29,8 @@ GEOMETRY = {
 THREADS = 256
 #: FrostGdnVerify.fuses_conv admits more requests only while 48 x CTAs x requests fits one wave
 VERIFY_MAX_REQUESTS_ANY_DEVICE = 4
+#: gdn.py launches the decode as grid (48 x CTAs, rows, 1); CUDA caps grid Y at 65535
+DECODE_MAX_ROWS = 65535
 
 
 def verify_ctas(requests: int) -> int:
@@ -80,6 +82,12 @@ def support(
         return Qwen35GdnDecline(
             "dsl",
             "nvidia-cutlass-dsl is not installed; the FROST GDN kernels are CuTe DSL",
+        )
+    if form == "decode" and requests is not None and requests > DECODE_MAX_ROWS:
+        return Qwen35GdnDecline(
+            "shape",
+            f"the FROST decode launches one grid row per request, at most {DECODE_MAX_ROWS} (CUDA's grid Y "
+            f"limit); got requests={requests}",
         )
     if form == "verify":
         if tokens_per_request is not None and tokens_per_request < 2:

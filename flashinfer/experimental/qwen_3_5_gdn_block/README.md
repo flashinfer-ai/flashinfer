@@ -117,7 +117,7 @@ branch they were validated in (only headers, docstrings and comments changed); `
 and `runner.py` binds a plan's inputs to the two wrappers (whose compiled kernels are shared by every plan that compiles
 the same code).
 
-Served: decode at any row count; verify at `2 <= T <= 10` tokens per request for one request and `2 <= T <= 8` from
+Served: decode at up to 65535 rows (one grid row per request, CUDA's grid Y limit); verify at `2 <= T <= 10` tokens per request for one request and `2 <= T <= 8` from
 two requests on, up to 4 requests (the fused conv's envelope; a grid within one wave would admit more, which no current
 part reaches), with a channel-contiguous conv pool. The launch policies (CTAs per head, resident CTAs per SM, state-copy
 ring depth) follow the device's SM count and were tuned on a 148-SM B200.
