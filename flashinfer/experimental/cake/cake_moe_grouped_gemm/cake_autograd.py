@@ -23,7 +23,11 @@ limitations under the License.
 # ``Y``); the weight gradient may add its split tail with unordered fp32
 # reductions (``cake_backend``, numerical mode).  ``CakeGroupedMm`` calls the
 # three generated programs as plain functions; no torch custom op is
-# registered.
+# registered.  ``cake_grouped_mm`` launches the forward after
+# ``CakeGroupedMm.apply`` returns, so autograd saves ``x``, ``w`` and ``offs``
+# before the GEMM runs, as it does for a built-in op: a non-reentrant
+# checkpoint with early stop on (the torch default) then skips the recomputed
+# GEMM when these are the last saves of the innermost checkpointed region.
 
 from __future__ import annotations
 
@@ -70,6 +74,20 @@ def _bf16_rows(t: torch.Tensor) -> torch.Tensor:
     return t
 
 
+# Passed by ``cake_grouped_mm`` as the fifth argument of ``CakeGroupedMm.apply``:
+# ``forward`` then allocates ``Y`` without launching, and the wrapper fills it
+# after ``apply`` returns (after autograd saved the inputs).
+_DEFER_FWD = object()
+
+
+def _fill_fwd(
+    x: torch.Tensor, w: torch.Tensor, offs: torch.Tensor, y: torch.Tensor
+) -> None:
+    """The forward GEMM into ``y`` as ``forward`` runs it: grad mode off, so no node and no saved tensor."""
+    with torch.no_grad():
+        _fwd_op(x, w, offs, y.detach())
+
+
 class CakeGroupedMm(torch.autograd.Function):
     """``Y = grouped X @ W[e].T`` with ``dX`` and ``dW`` from the Cake programs, ``dW`` non-deterministic.
 
@@ -81,17 +99,28 @@ class CakeGroupedMm(torch.autograd.Function):
     split tail (512-wide k tile) is added in an order the launch does not fix;
     empty groups give exact zeros.  Under
     ``torch.use_deterministic_algorithms(True)`` a backward that computes
-    ``dW`` raises the non-determinism alert before launching it.
+    ``dW`` raises the non-determinism alert before launching it.  Through
+    :func:`cake_grouped_mm` the forward GEMM runs after autograd saved ``x``,
+    ``w`` and ``offs``, so a checkpoint's early stop can skip it; a direct
+    ``CakeGroupedMm.apply(x, w, offs, False)`` launches inside ``forward``
+    and a checkpoint always recomputes it, as does the wrapper under
+    ``torch.jit.trace`` and ``torch.compile``.
     """
 
     @staticmethod
     def forward(
-        ctx, x: torch.Tensor, w: torch.Tensor, offs: torch.Tensor, deterministic: bool
+        ctx,
+        x: torch.Tensor,
+        w: torch.Tensor,
+        offs: torch.Tensor,
+        deterministic: bool,
+        _launch=None,
     ):
         _require_deterministic_false(deterministic, "CakeGroupedMm")
         num_groups = int(w.shape[0])
         y = torch.empty(x.shape[0], w.shape[1], dtype=torch.bfloat16, device=x.device)
-        _fwd_op(x, w, offs, y)
+        if _launch is not _DEFER_FWD:
+            _fwd_op(x, w, offs, y)
         ctx.save_for_backward(x, w, offs)
         ctx.num_groups = num_groups
         return y
@@ -116,7 +145,7 @@ class CakeGroupedMm(torch.autograd.Function):
                 ctx.num_groups, w.shape[1], w.shape[2], dtype=w.dtype, device=w.device
             )
             _wgrad_op(g, x, offs, dw, ctx.num_groups)
-        return dx, dw, None, None
+        return (dx, dw) + (None,) * (len(ctx.needs_input_grad) - 2)
 
 
 def cake_grouped_mm(
@@ -153,9 +182,20 @@ def cake_grouped_mm(
         reproducible run to run where the 512-wide k tile splits its tail; use
         :func:`grouped_gemm_wgrad` directly for an fp32 weight gradient.  Under
         ``torch.use_deterministic_algorithms(True)`` the backward raises the
-        non-determinism alert (no fallback).
+        non-determinism alert (no fallback).  The forward GEMM runs after
+        autograd saved ``x``, ``w`` and ``offs``: under a non-reentrant
+        checkpoint with early stop on, the recomputation skips it when these
+        are the last saves of the innermost checkpointed region, as for a
+        built-in op.
     """
     _require_deterministic_false(deterministic, "cake_grouped_mm")
     if x.dtype != torch.bfloat16 or w.dtype != torch.bfloat16:
         raise ValueError(f"x and w must be bfloat16 (got {x.dtype} and {w.dtype})")
-    return CakeGroupedMm.apply(x, w, offs, deterministic)
+    if torch.jit.is_tracing() or torch.compiler.is_compiling():
+        # A trace records ``apply`` only, and Dynamo cannot lift the deferred
+        # launch out of a checkpointed region: keep the launch inside ``forward``.
+        return CakeGroupedMm.apply(x, w, offs, deterministic)
+    # ``apply`` saves x, w and offs; a checkpoint recomputation may stop inside it.
+    y = CakeGroupedMm.apply(x, w, offs, deterministic, _DEFER_FWD)
+    _fill_fwd(x, w, offs, y)
+    return y
