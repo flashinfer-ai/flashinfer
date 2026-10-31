@@ -60,9 +60,9 @@ deterministic already.*
 ## Planners and rule tables
 
 A planner decides, per row and device, whether `deterministic=False` runs this package's program and with which
-parameters; a row it leaves runs the deterministic program (`plan_dense_projection_gemm` /
-`plan_router_fp32_gemm` say which).  Only measured rows carry a program: a row runs this package's program where
-that program was faster than the deterministic package's shipped plan of the row in a one-sided paired sign test
+parameters; a row it leaves runs the deterministic program (`plan_dense_projection_gemm` / `plan_router_fp32_gemm`
+say which).  Only measured rows carry a program: a row runs this package's program where that program was faster
+than the deterministic package's shipped plan of the row in every measurement run: a one-sided paired sign test
 (p < 0.05) with a median time ratio below 0.99, both in eager launches and in CUDA graph replays, at token counts
 16172 to 16384, and no more than 3 % slower than that plan next to a kernel holding 8, 16 or 32 SMs on another
 stream.  A `None` entry is a measured row that missed; a row without an entry was not measured.  Both run the
@@ -72,6 +72,7 @@ deterministic program.
 |---|---|---|
 | `K1_SPLIT_RULES` | `(arch, L, M, N, out_dtype)`: the transposed-store launch `out[l, n, m]` (`M` = the stored inner extent, `d_in` of a weight gradient; `N` = its rows, `d_out`), `out_dtype` `"bf16"` / `"f32"` | `(block_n, num_splits)` (this package's program) or `None` (the deterministic program) |
 | `K1_MIN_SM_COUNT` | `arch` | the fewest SMs for the K1 verdicts of the architecture (`sm_100a` / `sm_103a`: 148, `sm_107a`: 216) |
+| `K1_RULE_MIN_SM_COUNT` | a key of `K1_SPLIT_RULES` | the fewest SMs for that row's verdict where it is above `K1_MIN_SM_COUNT` (`sm_103a` `4096 -> 48`: 152) |
 | `ROUTER_RULES` | `(arch, layout, hidden, experts)`: `layout` `"kk"` (forward, `hidden = K`) or `"nn_t"` (weight gradient, `hidden` = the launch's `M`), `experts` = the launch's `N` | a partition spec (`"waves"`, `"forward"`, `"pairs"`, `"tiles"`, `"S<n>"` or a unit count) or `None` (the deterministic program) |
 
 *Table: the rule tables.*
@@ -79,13 +80,16 @@ deterministic program.
 | architecture | K1 weight gradient `d_in -> d_out` (`block_n`, `num_splits`), BF16 and FP32 out unless marked | K2 forward | K2 weight gradient |
 |---|---|---|---|
 | `sm_100a` (>= 148 SMs) | `4096 -> 32, 48, 64`; `5120 -> 32, 48, 64`; `6144 -> 32`: (64, 2).  `4096 -> 128`: deterministic (measured, missed) | deterministic (4 splits) | hidden 5120, 256 experts: `"waves"`; hidden 4096 / 6144: deterministic (6 splits) |
-| `sm_103a` (>= 148 SMs) | `4096 -> 32, 48, 64`; `5120 -> 32, 48, 64`; `6144 -> 32`: (64, 2); `5120 -> 128`, `6144 -> 128`: (128, 2).  `4096 -> 128`: deterministic (measured, missed) | deterministic (4 splits) | hidden 5120, 256 experts: `"waves"`; hidden 4096 / 6144: deterministic (6 splits) |
-| `sm_107a` (>= 216 SMs) | `4096 -> 32` BF16 (64, 4), FP32 (64, 3); `4096 -> 48` FP32 (64, 3); `4096 -> 64` BF16 (64, 4), FP32 (64, 3); `5120 -> 32` (64, 3); `5120 -> 48`, `5120 -> 64` FP32 (64, 3); `6144 -> 32` (64, 3); `8192 -> 128` (128, 2); `4096 -> 512` BF16 (256, 3), FP32 (128, 1) `p = 1`; `5120 -> 512` FP32 (128, 1) `p = 1`; `4096 -> 1024` FP32 (256, 1) `p = 1`; `5120 -> 1024` (256, 1) `p = 1`; `4096 -> 4096` FP32 (128, 1) `p = 1`.  `4096 -> 128`: deterministic (measured, missed) | deterministic (4 splits) | deterministic (6 splits); hidden 5120 measured, missed (432 `"waves"` units lose next to a kernel holding 32 SMs) |
+| `sm_103a` (>= 148 SMs) | `4096 -> 32`; `5120 -> 32, 48, 64`; `6144 -> 32`: (64, 2); `4096 -> 48` (>= 152 SMs): (64, 2); `5120 -> 128`, `6144 -> 128`: (128, 2).  `4096 -> 64`, `4096 -> 128`: deterministic (measured, missed) | deterministic (4 splits) | hidden 5120, 256 experts: `"waves"`; hidden 4096 / 6144: deterministic (6 splits) |
+| `sm_107a` (>= 216 SMs) | `4096 -> 32` BF16 (64, 4), FP32 (64, 3); `4096 -> 48` FP32 (64, 3); `4096 -> 64` FP32 (64, 3); `5120 -> 32` (64, 3); `5120 -> 48`, `5120 -> 64` FP32 (64, 3); `6144 -> 32` (64, 3); `8192 -> 128` (128, 2); `4096 -> 512` FP32 (128, 1) `p = 1`; `5120 -> 512` FP32 (128, 1) `p = 1`; `4096 -> 1024` FP32 (256, 1) `p = 1`; `5120 -> 1024` (256, 1) `p = 1`.  `4096 -> 64` BF16, `4096 -> 128`, `4096 -> 512` BF16, `4096 -> 4096` FP32: deterministic (measured, missed) | deterministic (4 splits) | deterministic (6 splits); hidden 5120 measured, missed (432 `"waves"` units lose next to a kernel holding 32 SMs) |
 
 *Table: the rows that run this package's programs.  `4096 -> 128` misses on `sm_100a` / `sm_103a` next to a kernel
-holding 32 SMs (its 128 CTAs no longer fit the free SMs) and on `sm_107a` at 16384 tokens.  The `sm_107a` one-split
-rows store whole tiles: they win where the deterministic package's `sm_107a` program of the row is slower.  Every K1 choice also needs `num_splits * 64 <=
-T + 63` (shorter token counts run the deterministic program).*
+holding 32 SMs (its 128 CTAs no longer fit the free SMs) and on `sm_107a` at 16384 tokens; on `sm_107a`,
+`4096 -> 512` BF16 (192 CTAs) and `4096 -> 4096` FP32 (216 CTAs) miss next to a kernel holding 32 SMs the same way.
+`4096 -> 64` (`sm_103a`; `sm_107a` BF16) and `4096 -> 48` on 148-SM `sm_103a` parts are not faster than the
+deterministic plan in every run.  The `sm_107a` one-split rows store whole tiles: they win where the deterministic
+package's `sm_107a` program of the row is slower.  Every K1 choice also needs `num_splits * 64 <= T + 63` (shorter
+token counts run the deterministic program).*
 
 `"waves"` (`router_waves`) launches whole waves of the device's CTA pairs (`pairs = sm_count // 2`): `c * pairs`
 units with `c = max(2, round(tiles * k_iters / (68 * pairs))) + 1`, and only where the deterministic plan's six
@@ -99,19 +103,20 @@ forward takes at most two splits.  `benchmarks/bench_cake_dense_projection_gemm.
 
 ## Workspace
 
-A K1 launch with more than one split uses an FP32 slot workspace (`tiles * num_splits * 256 * block_n` elements, no
-initialization) and the ticket counters (`tiles * 512` words, zero at creation, zero again after every complete
-launch).  A prepared launch owns both; the convenience path keeps them in an arena per (device, stream), so
-concurrent launches on different streams never share them.  After an aborted launch, call
-`PreparedAtomicGemm.reset_counters()` (or `clear_convenience_caches()`).  A K2 launch with part tiles zeroes `out` on
-the launch stream (one memset) between the split and the program; prepared launches of both programs allocate nothing
-and can be captured in a CUDA graph.  A prepared K2 launch binds everything but the stream when prepared (its FFI
-arguments are converted once), so a call issues its launches back to back.
+A K1 launch with more than one split uses an FP32 slot workspace (`tiles * num_splits * 256 * block_n` elements,
+zero at creation: the last split of a partial tile reads the padding columns no split writes, and discards them) and
+the ticket counters (`tiles * 512` words, zero at creation, zero again after every complete launch).  A prepared
+launch owns both; the convenience path keeps them in an arena per (device, stream), so concurrent launches on
+different streams never share them.  After an aborted launch, call `PreparedAtomicGemm.reset_counters()` (or
+`clear_convenience_caches()`).  A K2 launch with part tiles zeroes `out` on the launch stream (one memset) between
+the split and the program; prepared launches of both programs allocate nothing and can be captured in a CUDA graph.
+A prepared K2 launch binds everything but the stream when prepared (its FFI arguments are converted once), so a call
+issues its launches back to back.
 
 ## Benchmark
 
-`benchmarks/bench_cake_dense_projection_gemm.py` times every row of the deterministic family's benchmark with the arms
-`det` (the deterministic package's prepared launch), `atomic` (`deterministic=False`), `atomic_p1` (the same
+`benchmarks/bench_cake_dense_projection_gemm.py` times every row of the deterministic family's benchmark with the
+arms `det` (the deterministic package's prepared launch), `atomic` (`deterministic=False`), `atomic_p1` (the same
 program at one split), `cublas` (`torch.matmul`), `cublaslt` (a cuBLASLt heuristic sweep) and `bf16x9` (cuBLAS FP32
 in `CUBLAS_FP32_EMULATED_BF16X9_MATH`, the router rows), in paired groups, eager and in CUDA graphs; `--resident`
 re-times `det` and `atomic` next to a kernel holding `--resident-sms` SMs on another stream.
@@ -136,7 +141,8 @@ left it as an alias of the renamed modules.  The names keep their spelling and, 
 | every other module name (`ROW_RULES`, `stream_k_plan`, `wgrad_views`, ...) | the same name | read through to the deterministic package |
 | program templates `dense_proj_gemm_*`, `router_fp32_gemm_<layout>`, `split_fp32_bf16x3` | `dense_proj_det_gemm_*`, `router_fp32_det_gemm_<layout>`, `split_fp32_det_bf16x3` | this package's templates are new: `dense_proj_gemm_atomic_nn_n<64\|128\|256>[_f32]_t`, `router_fp32_gemm_atomic_{kk,nn_t}` |
 
-*Table: the names before #8046, their deterministic names, and what this path offers (`cake_backend.DETERMINISTIC_NAMES`).*
+*Table: the names before #8046, their deterministic names, and what this path offers
+(`cake_backend.DETERMINISTIC_NAMES`).*
 
 | name (`flashinfer.experimental.dense_projection_gemm`) | default | `deterministic=False` |
 |---|---|---|
@@ -160,6 +166,6 @@ package; set it there.
 | `cake_jit.py` | the registry of this package's programs (`ARG_PLANS`, `MODULES`, `KERNELS`) and the loader |
 | `cake_build.py`, `build.json`, `csrc/cake_dense_projection_gemm/` | the `cake-build/1` loader, manifest and generated sources of this package's programs (written by the Cake exporter) |
 
-The deterministic package is resolved as this package's sibling on first use; the package never imports
-`flashinfer` by absolute name.  A consumer that vendors this package vendors the deterministic package too and binds
-it with `cake_backend.use_deterministic_backend(<its cake_backend module>)`.
+The deterministic package is resolved as this package's sibling on first use; the package never imports `flashinfer`
+by absolute name.  A consumer that vendors this package vendors the deterministic package too and binds it with
+`cake_backend.use_deterministic_backend(<its cake_backend module>)`.

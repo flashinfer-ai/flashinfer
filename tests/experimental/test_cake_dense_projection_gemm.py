@@ -255,8 +255,10 @@ def test_deterministic_spellings_are_not_read_through(name):
 
 
 def test_the_deterministic_package_resolves_as_a_sibling(monkeypatch):
-    if not cake_jit.__name__.startswith("flashinfer."):
-        pytest.skip("a vendored copy has no sibling package")
+    """In a FlashInfer tree and in a copy vendored with the deterministic package beside it (the vendored gate's
+    layout) the deterministic package resolves as this package's sibling."""
+    if not cake_jit.__name__.rpartition(".")[0].rpartition(".")[0]:
+        pytest.skip("a top-level copy has no parent package to hold a sibling")
     monkeypatch.setattr(cake_jit, "_det_package", None)
     assert cake_backend.deterministic_backend() is det_backend
     assert cake_jit.deterministic_module("cake_jit") is det_jit
@@ -524,11 +526,18 @@ SM_COUNTS = {"sm_100a": 148, "sm_103a": 152, "sm_107a": 216}
 
 
 @pytest.mark.parametrize(
-    "arch, rows", [("sm_100a", 28), ("sm_103a", 36), ("sm_107a", 40)]
+    "arch, sm_count, rows",
+    [
+        ("sm_100a", 148, 28),
+        ("sm_103a", 152, 32),
+        ("sm_103a", 148, 28),
+        ("sm_107a", 216, 34),
+    ],
 )
-def test_k1_planners_take_the_measured_rows(arch, rows):
-    """The verdicts of the three architectures take 28 / 36 / 40 of the 124 weight-gradient rows (the MLA head rows,
-    ``L = 64``, run the deterministic program), at token counts near 16k."""
+def test_k1_planners_take_the_measured_rows(arch, sm_count, rows):
+    """The verdicts of the three architectures take 28 / 32 / 34 of the 124 weight-gradient rows (the MLA head rows,
+    ``L = 64``, run the deterministic program), at token counts near 16k; on 148 SMs sm_103a leaves ``4096 -> 48`` to
+    the deterministic program (28 rows)."""
     taken = 0
     for d_in, d_out in WGRAD_SHAPES:
         for out_f32 in (False, True):
@@ -540,7 +549,7 @@ def test_k1_planners_take_the_measured_rows(arch, rows):
                     N=d_out,
                     K=T,
                     out_f32=out_f32,
-                    sm_count=SM_COUNTS[arch],
+                    sm_count=sm_count,
                 )
                 if choice is not None:
                     block_n, splits = choice
@@ -555,7 +564,7 @@ def test_k1_planners_take_the_measured_rows(arch, rows):
                 N=d_out,
                 K=16231,
                 out_f32=False,
-                sm_count=SM_COUNTS[arch],
+                sm_count=sm_count,
             )
             is None
         )
@@ -565,10 +574,31 @@ def test_k1_planners_take_the_measured_rows(arch, rows):
 def test_k1_planner_choices():
     kw = dict(L=1, K=16231, out_f32=False)
     # sm_103a: 64-wide tiles, 128-wide for d_out = 128 from d_in 5120 up; a row without a verdict runs det
-    assert cake_backend.k1_plan(arch="sm_103a", M=4096, N=64, sm_count=152, **kw) == (
+    assert cake_backend.k1_plan(arch="sm_103a", M=4096, N=32, sm_count=148, **kw) == (
         64,
         2,
     )
+    # d_out 48 at d_in 4096: from 152 SMs only (K1_RULE_MIN_SM_COUNT)
+    for out_f32 in (False, True):
+        k48 = dict(arch="sm_103a", L=1, M=4096, N=48, K=16231, out_f32=out_f32)
+        assert cake_backend.k1_plan(sm_count=152, **k48) == (64, 2)
+        assert cake_backend.k1_plan(sm_count=148, **k48) is None
+        # d_out 64 at d_in 4096 was measured and missed
+        key = ("sm_103a", 1, 4096, 64, "f32" if out_f32 else "bf16")
+        assert key in cake_backend.K1_SPLIT_RULES
+        assert cake_backend.K1_SPLIT_RULES[key] is None
+        assert (
+            cake_backend.k1_plan(
+                arch="sm_103a",
+                M=4096,
+                N=64,
+                sm_count=152,
+                L=1,
+                K=16231,
+                out_f32=out_f32,
+            )
+            is None
+        )
     assert cake_backend.k1_plan(arch="sm_103a", M=6144, N=128, sm_count=152, **kw) == (
         128,
         2,
@@ -611,6 +641,23 @@ def test_k1_planner_choices():
     assert cake_backend.k1_plan(
         arch="sm_107a", M=4096, N=512, sm_count=216, L=1, K=16231, out_f32=True
     ) == (128, 1)
+    # measured and missed on sm_107a: 4096 -> 64 BF16, 4096 -> 512 BF16, 4096 -> 4096 FP32
+    for N, out_f32 in ((64, False), (512, False), (4096, True)):
+        key = ("sm_107a", 1, 4096, N, "f32" if out_f32 else "bf16")
+        assert key in cake_backend.K1_SPLIT_RULES
+        assert cake_backend.K1_SPLIT_RULES[key] is None
+        assert (
+            cake_backend.k1_plan(
+                arch="sm_107a",
+                M=4096,
+                N=N,
+                sm_count=216,
+                L=1,
+                K=16231,
+                out_f32=out_f32,
+            )
+            is None
+        )
     for out_f32 in (False, True):
         key = ("sm_107a", 1, 4096, 128, "f32" if out_f32 else "bf16")
         assert cake_backend.K1_SPLIT_RULES[key] is None  # measured, missed
@@ -644,6 +691,10 @@ def test_k1_verdicts_name_registered_programs_and_fit_one_wave():
             assert splits == 2
             tiles = -(-M // cake_backend.K1_PAIR_ROWS) * -(-N // block_n)
             assert tiles * splits <= cake_backend.K1_MIN_SM_COUNT[arch] // 2
+    # a row's own SM-count floor names a row with a verdict and lies above its architecture's floor
+    for key, floor in cake_backend.K1_RULE_MIN_SM_COUNT.items():
+        assert cake_backend.K1_SPLIT_RULES.get(key) is not None, key
+        assert floor > cake_backend.K1_MIN_SM_COUNT[key[0]], key
 
 
 def test_k1_small_token_counts_run_the_deterministic_program():
@@ -658,8 +709,8 @@ def test_k1_small_token_counts_run_the_deterministic_program():
 
 
 def test_k1_rule_table_entries_decide_the_row(monkeypatch):
-    kw = dict(L=1, M=4096, N=64, K=16231, out_f32=True)
-    key = ("sm_103a", 1, 4096, 64, "f32")
+    kw = dict(L=1, M=4096, N=32, K=16231, out_f32=True)
+    key = ("sm_103a", 1, 4096, 32, "f32")
     assert cake_backend.k1_plan(arch="sm_103a", sm_count=152, **kw) == (64, 2)
     monkeypatch.setitem(cake_backend.K1_SPLIT_RULES, key, None)
     assert cake_backend.k1_plan(arch="sm_103a", sm_count=152, **kw) is None
@@ -668,12 +719,16 @@ def test_k1_rule_table_entries_decide_the_row(monkeypatch):
     # the T guard applies to a verdict too
     assert (
         cake_backend.k1_plan(
-            arch="sm_103a", sm_count=152, L=1, M=4096, N=64, K=128, out_f32=True
+            arch="sm_103a", sm_count=152, L=1, M=4096, N=32, K=128, out_f32=True
         )
         is None
     )
+    # a row's own minimum SM count applies on top of the architecture's
+    monkeypatch.setitem(cake_backend.K1_RULE_MIN_SM_COUNT, key, 160)
+    assert cake_backend.k1_plan(arch="sm_103a", sm_count=152, **kw) is None
+    assert cake_backend.k1_plan(arch="sm_103a", sm_count=160, **kw) == (128, 3)
     # a verdict of an architecture with a minimum SM count applies from that count only
-    key107 = ("sm_107a", 1, 4096, 64, "f32")
+    key107 = ("sm_107a", 1, 4096, 32, "f32")
     monkeypatch.setitem(cake_backend.K1_SPLIT_RULES, key107, (64, 2))
     assert cake_backend.k1_plan(arch="sm_107a", sm_count=216, **kw) == (64, 2)
     assert cake_backend.k1_plan(arch="sm_107a", sm_count=212, **kw) is None
@@ -1240,11 +1295,11 @@ def test_clear_convenience_caches_clears_both_packages():
 
 
 def test_the_split_k_workspace_kinds():
-    """The K1 tickets are zeroed when allocated or grown; the K1 slots are scratch (never initialised); the kinds
-    are not the deterministic package's."""
+    """The K1 tickets and the K1 slots are zeroed when allocated or grown (the last split of a partial tile reads
+    slot columns no split writes); the kinds are not the deterministic package's."""
     kinds = cake_backend._ATOMIC_ARENA_KINDS
     assert kinds["k1_tickets"] == (torch.uint32, True)
-    assert kinds["k1_slots"] == (torch.float32, False)
+    assert kinds["k1_slots"] == (torch.float32, True)
     assert not set(kinds) & set(det_backend._ARENA_KINDS)
     arena = cake_backend._AtomicArena(torch.device("cpu"), (0, 0))
     tickets = arena.require("k1_tickets", 100)
@@ -1255,7 +1310,9 @@ def test_the_split_k_workspace_kinds():
     assert grown.numel() == 1000 and not grown.to(torch.int64).any()
     assert arena.version == 2
     slots = arena.require("k1_slots", 3)
-    assert slots.dtype == torch.float32 and slots.numel() == 16
+    assert slots.dtype == torch.float32 and slots.numel() == 16 and not slots.any()
+    grown = arena.require("k1_slots", 300)
+    assert grown.numel() == 300 and not grown.any()
 
 
 # ---------------------------------------------------------------------------
@@ -1440,12 +1497,10 @@ def k1_rule(monkeypatch):
         block_n = block_n or cake_backend.k1_block_n(N)
         f32 = out.dtype == torch.float32
         _require_template(arch, cake_backend.atomic_k1_template(block_n, f32))
+        key = (arch, 1, K, N, "f32" if f32 else "bf16")
         monkeypatch.setitem(cake_backend.K1_MIN_SM_COUNT, arch, 0)
-        monkeypatch.setitem(
-            cake_backend.K1_SPLIT_RULES,
-            (arch, 1, K, N, "f32" if f32 else "bf16"),
-            (block_n, splits),
-        )
+        monkeypatch.delitem(cake_backend.K1_RULE_MIN_SM_COUNT, key, raising=False)
+        monkeypatch.setitem(cake_backend.K1_SPLIT_RULES, key, (block_n, splits))
         cake_backend.clear_convenience_caches()
         return cake_backend.atomic_k1_template(block_n, f32)
 
@@ -1550,9 +1605,10 @@ def test_gpu_k1_batched_mla_head_views():
 
 def test_gpu_k1_ragged_token_counts_reuse_poisoned_scratch(k1_rule):
     """Changing ``T`` up and down on one stream with a verdict for the row: the convenience path reuses its arena
-    (grown, never shrunk); the split slots are poisoned with NaN before each call (they need no initialisation),
-    every output -- poisoned too -- meets the budget, and the tickets are zero throughout.  The shortest token
-    count (65) is below the split count's 129 rows, so that call runs the deterministic program (its bits)."""
+    (grown, never shrunk); the split slots are poisoned with NaN before each call (a stale value never reaches
+    ``out``: the padding columns the last split reads are discarded), every output -- poisoned too -- meets the
+    budget, and the tickets are zero throughout.  The shortest token count (65) is below the split count's 129 rows,
+    so that call runs the deterministic program (its bits)."""
     device, arch = _atomic_device_or_skip()
     k1_rule(*_k1_wgrad_inputs("thin_48", 128, torch.bfloat16, device, SEED), 3)
     for i, T in enumerate(K1_RAGGED_T):

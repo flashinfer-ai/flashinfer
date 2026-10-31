@@ -255,10 +255,11 @@ K1_BLOCK_N_CHOICES = (64, 128, 256)
 #: Per-row verdicts of the K1 weight gradient, ``(arch, L, M, N, out_dtype) -> (block_n, num_splits)`` (this
 #: package's program with that tile width and split count) or ``-> None`` (the deterministic program); ``M`` / ``N``
 #: as above, ``out_dtype`` ``"bf16"`` or ``"f32"``.  A row carries a program only where that program was measured
-#: faster than the deterministic package's shipped plan of the row: a one-sided paired sign test (p < 0.05) with a
-#: median time ratio below 0.99, in eager launches and in CUDA graph replays, at token counts 16172 to 16384, and no
-#: more than 3 % slower than that plan next to a kernel holding 8, 16 or 32 SMs on another stream.  A ``None`` entry
-#: is a measured row that missed; a row without an entry was not measured.  Both run the deterministic program.
+#: faster than the deterministic package's shipped plan of the row in every measurement run: a one-sided paired sign
+#: test (p < 0.05) with a median time ratio below 0.99, in eager launches and in CUDA graph replays, at token counts
+#: 16172 to 16384, and no more than 3 % slower than that plan next to a kernel holding 8, 16 or 32 SMs on another
+#: stream.  A ``None`` entry is a measured row that missed; a row without an entry was not measured.  Both run the
+#: deterministic program.
 # fmt: off
 K1_SPLIT_RULES: dict[tuple[str, int, int, int, str], Optional[tuple[int, int]]] = {
     # sm_100a: two splits of 64-wide tiles (one wave of the CTA pairs; two partials, bitwise reproducible).  d_out 128
@@ -271,11 +272,12 @@ K1_SPLIT_RULES: dict[tuple[str, int, int, int, str], Optional[tuple[int, int]]] 
     ("sm_100a", 1, 5120, 48, "bf16"): (64, 2), ("sm_100a", 1, 5120, 48, "f32"): (64, 2),
     ("sm_100a", 1, 5120, 64, "bf16"): (64, 2), ("sm_100a", 1, 5120, 64, "f32"): (64, 2),
     ("sm_100a", 1, 6144, 32, "bf16"): (64, 2), ("sm_100a", 1, 6144, 32, "f32"): (64, 2),
-    # sm_103a: two splits of 64-wide tiles, of 128-wide tiles for d_out = 128 at d_in >= 5120 (one wave); d_out 128 at
-    # d_in 4096 as on sm_100a
+    # sm_103a: two splits of 64-wide tiles, of 128-wide tiles for d_out = 128 at d_in >= 5120 (one wave); d_out 48 at
+    # d_in 4096 from 152 SMs only (K1_RULE_MIN_SM_COUNT); d_out 64 at d_in 4096 is not faster than the deterministic
+    # plan in every run; d_out 128 at d_in 4096 as on sm_100a
     ("sm_103a", 1, 4096, 32, "bf16"): (64, 2), ("sm_103a", 1, 4096, 32, "f32"): (64, 2),
     ("sm_103a", 1, 4096, 48, "bf16"): (64, 2), ("sm_103a", 1, 4096, 48, "f32"): (64, 2),
-    ("sm_103a", 1, 4096, 64, "bf16"): (64, 2), ("sm_103a", 1, 4096, 64, "f32"): (64, 2),
+    ("sm_103a", 1, 4096, 64, "bf16"): None, ("sm_103a", 1, 4096, 64, "f32"): None,
     ("sm_103a", 1, 4096, 128, "bf16"): None, ("sm_103a", 1, 4096, 128, "f32"): None,
     ("sm_103a", 1, 5120, 32, "bf16"): (64, 2), ("sm_103a", 1, 5120, 32, "f32"): (64, 2),
     ("sm_103a", 1, 5120, 48, "bf16"): (64, 2), ("sm_103a", 1, 5120, 48, "f32"): (64, 2),
@@ -284,14 +286,16 @@ K1_SPLIT_RULES: dict[tuple[str, int, int, int, str], Optional[tuple[int, int]]] 
     ("sm_103a", 1, 6144, 32, "bf16"): (64, 2), ("sm_103a", 1, 6144, 32, "f32"): (64, 2),
     ("sm_103a", 1, 6144, 128, "bf16"): (128, 2), ("sm_103a", 1, 6144, 128, "f32"): (128, 2),
     # sm_107a (216 SMs): two to four splits; the one-split rows store whole tiles (deterministic) and win where the
-    # deterministic package's sm_107a program of the row is slower
+    # deterministic package's sm_107a program of the row is slower.  d_out 64 BF16 at d_in 4096 is not faster than the
+    # deterministic plan in every run; d_in 4096 to d_out 512 BF16 (192 CTAs) and to d_out 4096 FP32 (216 CTAs) need
+    # more SMs than a kernel holding 32 SMs leaves free and lose next to it
     ("sm_107a", 1, 4096, 32, "bf16"): (64, 4), ("sm_107a", 1, 4096, 32, "f32"): (64, 3),
     ("sm_107a", 1, 4096, 48, "f32"): (64, 3),
-    ("sm_107a", 1, 4096, 64, "bf16"): (64, 4), ("sm_107a", 1, 4096, 64, "f32"): (64, 3),
+    ("sm_107a", 1, 4096, 64, "bf16"): None, ("sm_107a", 1, 4096, 64, "f32"): (64, 3),
     ("sm_107a", 1, 4096, 128, "bf16"): None, ("sm_107a", 1, 4096, 128, "f32"): None,
-    ("sm_107a", 1, 4096, 512, "bf16"): (256, 3), ("sm_107a", 1, 4096, 512, "f32"): (128, 1),
+    ("sm_107a", 1, 4096, 512, "bf16"): None, ("sm_107a", 1, 4096, 512, "f32"): (128, 1),
     ("sm_107a", 1, 4096, 1024, "f32"): (256, 1),
-    ("sm_107a", 1, 4096, 4096, "f32"): (128, 1),
+    ("sm_107a", 1, 4096, 4096, "f32"): None,
     ("sm_107a", 1, 5120, 32, "bf16"): (64, 3), ("sm_107a", 1, 5120, 32, "f32"): (64, 3),
     ("sm_107a", 1, 5120, 48, "f32"): (64, 3),
     ("sm_107a", 1, 5120, 64, "f32"): (64, 3),
@@ -302,9 +306,17 @@ K1_SPLIT_RULES: dict[tuple[str, int, int, int, str], Optional[tuple[int, int]]] 
 }
 # fmt: on
 #: The fewest SMs a device of the architecture needs for the verdicts of :data:`K1_SPLIT_RULES`; a device with fewer
-#: runs every K1 row on the deterministic program.  Every sm_100a / sm_103a verdict fits one wave of 74 CTA pairs; the
-#: sm_107a verdicts were measured on 216-SM parts.
+#: runs every K1 row on the deterministic program, and a row of :data:`K1_RULE_MIN_SM_COUNT` needs more.  The sm_100a
+#: and sm_103a verdicts were measured on 148-SM and 152-SM parts (each fits one wave of the 74 CTA pairs of 148 SMs);
+#: the sm_107a verdicts on 216-SM parts.
 K1_MIN_SM_COUNT: dict[str, int] = {"sm_100a": 148, "sm_103a": 148, "sm_107a": 216}
+#: Rows of :data:`K1_SPLIT_RULES` whose verdict holds only from a higher SM count than :data:`K1_MIN_SM_COUNT` of
+#: their architecture, ``key -> fewest SMs``: below it the row runs the deterministic program.  sm_103a d_in 4096 to
+#: d_out 48 is faster on 152 SMs and not faster than the deterministic plan in every run on 148 SMs.
+K1_RULE_MIN_SM_COUNT: dict[tuple[str, int, int, int, str], int] = {
+    ("sm_103a", 1, 4096, 48, "bf16"): 152,
+    ("sm_103a", 1, 4096, 48, "f32"): 152,
+}
 
 
 def k1_splits_fit(splits: int, K: int) -> bool:
@@ -326,13 +338,13 @@ def k1_plan(
     """``(block_n, num_splits)`` of this package's K1 program for the transposed-store launch ``out[l, n, m]``
     (``M``, ``N`` as in the comment above; ``K`` the token count) on a device of ``sm_count`` SMs, or ``None``: the
     row runs the deterministic program.  The row's verdict in :data:`K1_SPLIT_RULES`; a row without one, a device
-    below :data:`K1_MIN_SM_COUNT` and a ``K`` too short for the split count (:func:`k1_splits_fit`) run the
-    deterministic program."""
-    if int(sm_count) < K1_MIN_SM_COUNT.get(arch, 0):
+    below :data:`K1_MIN_SM_COUNT` or below the row's :data:`K1_RULE_MIN_SM_COUNT`, and a ``K`` too short for the
+    split count (:func:`k1_splits_fit`) run the deterministic program."""
+    key = (arch, int(L), int(M), int(N), "f32" if out_f32 else "bf16")
+    floor = max(K1_MIN_SM_COUNT.get(arch, 0), K1_RULE_MIN_SM_COUNT.get(key, 0))
+    if int(sm_count) < floor:
         return None
-    choice = K1_SPLIT_RULES.get(
-        (arch, int(L), int(M), int(N), "f32" if out_f32 else "bf16")
-    )
+    choice = K1_SPLIT_RULES.get(key)
     if choice is None:
         return None
     block_n, splits = (int(v) for v in choice)
@@ -401,7 +413,9 @@ class AtomicGemmPlan:
     @property
     def ws_f32_elems(self) -> int:
         """FP32 elements of the split workspace: one ``256 x block_n`` slot per tile and split (none with one
-        split).  Every launch writes the slots it reads: the workspace needs no initialisation."""
+        split).  A launch writes every slot it reads except the padding columns of a partial tile (``N`` not a
+        multiple of ``block_n``), which the last split reads and discards (they never reach ``out``); the workspace
+        is zeroed when allocated, so no read is of uninitialised memory, and needs no memset per launch."""
         return self.items * K1_PAIR_ROWS * self.block_n if self.splits > 1 else 0
 
     @property
@@ -1082,12 +1096,12 @@ def _k1_dummies(device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
 
 @dataclass
 class PreparedAtomicGemm:
-    """One prepared K1 launch of this package: the bound program and its workspace (the FP32 split slots, written
-    before they are read, and the tickets, zero when prepared and zero again after every complete launch).
-    ``launch()`` writes ``out`` and returns it without allocating; it captures into a CUDA graph as one kernel.  A
-    prepared launch must not run concurrently with itself (two streams would share its workspace); after a launch
-    that did not complete (an aborted process step, a device error), :meth:`reset_counters` re-zeroes the tickets
-    on the current stream."""
+    """One prepared K1 launch of this package: the bound program and its workspace (the FP32 split slots, zeroed
+    when prepared because the last split of a partial tile reads padding columns that no split writes and discards
+    them; the tickets, zero when prepared and zero again after every complete launch).  ``launch()`` writes ``out``
+    and returns it without allocating; it captures into a CUDA graph as one kernel.  A prepared launch must not run
+    concurrently with itself (two streams would share its workspace); after a launch that did not complete (an
+    aborted process step, a device error), :meth:`reset_counters` re-zeroes the tickets on the current stream."""
 
     module_name: str
     arch: str
@@ -1206,7 +1220,8 @@ def _prepare_atomic_k1(
     det = deterministic_backend()
     device = out.device
     if plan.splits > 1:
-        ws = torch.empty(plan.ws_f32_elems, device=device, dtype=torch.float32)
+        # zeroed once: the last split reads the never-written padding columns of a partial tile (and discards them)
+        ws = torch.zeros(plan.ws_f32_elems, device=device, dtype=torch.float32)
         counters = torch.zeros(plan.counters_u32, device=device, dtype=torch.uint32)
     else:
         ws, counters = _k1_dummies(device)
@@ -1357,15 +1372,16 @@ def _atomic_k2(
 # both packages.  A cached entry holds its plan and the resolved program entry, never a caller's tensor: the views
 # are rebuilt from the caller's tensors on every call.  The launches of one stream share its arena; launches on
 # different streams never do.  The K1 tickets are zero when allocated or grown (``torch.zeros`` on the arena's
-# stream) and zero again after every complete launch, so a launch needs no memset; the K1 split slots are written
-# before they are read and are never initialised.  A row the planner keeps on the deterministic program is cached
+# stream) and zero again after every complete launch, so a launch needs no memset; the K1 split slots are zeroed when
+# allocated or grown (the last split reads the never-written padding columns of a partial tile and discards them) and
+# need no memset per launch either.  A row the planner keeps on the deterministic program is cached
 # as such and calls the deterministic package's convenience path.  After a launch that did not complete,
 # :func:`clear_convenience_caches` drops the arenas (fresh tickets on the next call).
 
 #: workspace kind -> (dtype, zeroed when allocated)
 _ATOMIC_ARENA_KINDS: dict[str, tuple[torch.dtype, bool]] = {
-    # K1 split partial slots: written before they are read
-    "k1_slots": (torch.float32, False),
+    # K1 split partial slots, zeroed: the padding columns of a partial tile are read (and discarded), never written
+    "k1_slots": (torch.float32, True),
     # K1 per-(tile, warp slice, lane) arrival tickets, zero between launches
     "k1_tickets": (torch.uint32, True),
     # K2 BF16x3 stack of the split operand ``[3, *split_src.shape]``
