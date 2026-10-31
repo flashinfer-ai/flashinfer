@@ -35,14 +35,15 @@ def ptx(request, tmp_path_factory) -> str:
         WarpSplitKTactic,
     )
 
-    # The operands run_warp_splitk_dense passes: row-major, M dynamic.
+    # The operands run_warp_splitk_dense passes: row-major, with a dynamic
+    # 32-bit M (the PTX then matches the runtime JIT build).
     bf16 = cutlass.BFloat16
     weight = make_fake_tensor(bf16, (_N, _K), (_K, 1), assumed_align=32)
     activation = make_fake_tensor(
-        bf16, (cute.sym_int64(), _K), (_K, 1), assumed_align=32
+        bf16, (cute.sym_int32(), _K), (_K, 1), assumed_align=32
     )
     bias = make_fake_tensor(bf16, (_N,), (1,), assumed_align=32)
-    output = make_fake_tensor(bf16, (cute.sym_int64(), _N), (_N, 1), assumed_align=32)
+    output = make_fake_tensor(bf16, (cute.sym_int32(), _N), (_N, 1), assumed_align=32)
     dump_dir = tmp_path_factory.mktemp(request.param)
     compiled = cute_ext.compile(
         CpAsyncWarpSplitKKernel(WarpSplitKTactic(*_TACTIC), True, False),
