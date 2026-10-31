@@ -169,6 +169,7 @@ import functools
 import math
 import re
 import struct
+import threading
 from collections import OrderedDict
 from dataclasses import dataclass, field, replace
 from typing import Any, Callable, NamedTuple, Optional, Union
@@ -1515,9 +1516,23 @@ DW_STREAM_MODES = (
     "auto",
 )  # the normalised ``dw_stream`` modes: never / every multi-chunk call / the chunk rule (:func:`dw_stream_mode`)
 DW_STREAM_MIN_CHUNKS = 3  # the side stream pays one cross-stream join per chunk and overlaps only the chunks before a deferred last one
-_DW_STREAMS: dict[
-    int, tuple
-] = {}  # device index -> (side stream, fork event); not a tensor, outside every workspace / binding
+# the per-thread, per-device host state of the calls (:func:`_thread_state`)
+_THREAD_STATE = threading.local()
+
+
+def _thread_state(name: str) -> dict:
+    """The calling thread's per-device dict ``name`` of the calls' host state -- ``"dw_streams"`` (device index ->
+    (side stream, fork event), :func:`_dw_stream`), ``"cells"`` (device index -> (pinned int32 [1] cell, event),
+    :func:`_hidden_count_cell`) and ``"arange"`` (device index -> the growing int32 constant 1, 2, ..,
+    :func:`_hidden_count_arange`).  None is a tensor of a workspace or a binding.  Calls of different threads on one
+    device (each on its own stream) never share a stream, an event, a cell or the constant: one thread's call cannot
+    re-record another's fork event, overwrite its count before the read, or reallocate the constant its queued
+    kernels read; one thread runs one call at a time."""
+    state = getattr(_THREAD_STATE, name, None)
+    if state is None:
+        state = {}
+        setattr(_THREAD_STATE, name, state)
+    return state
 
 
 def dw_stream_mode(dw_stream: Optional[Union[bool, str]] = None) -> str:
@@ -1553,8 +1568,8 @@ def dw_side_stream(
     rule of :data:`DW_STREAM_MIN_CHUNKS` chunks.  Kernels, buffers, launch order per kernel and numerics are unchanged
     (the dX GEMM writes the dX rows / slabs, the accumulate reads the same ``dz`` and read-modify-writes ``dW_acc``;
     each kernel keeps its own order): only the launch stream differs, so every output is bitwise the single-stream
-    path's.  The per-device stream and fork event are shared by the calls on that device (one call at a time per
-    device, as the generated launches themselves)."""
+    path's.  The side stream and its fork event are per thread and per device (:func:`_thread_state`): calls of
+    different threads on one device never share them."""
     n = int(num_chunks)
     if n <= 1:
         return False
@@ -1567,10 +1582,12 @@ def dw_side_stream(
 
 
 def _dw_stream(index: int) -> tuple:
-    """``(side stream, fork event)`` of device ``index`` (created on first use; never part of a binding or a workspace)."""
-    pair = _DW_STREAMS.get(index)
+    """The calling thread's ``(side stream, fork event)`` of device ``index`` (created on first use; never part of a
+    binding or a workspace)."""
+    streams = _thread_state("dw_streams")
+    pair = streams.get(index)
     if pair is None:
-        pair = _DW_STREAMS[index] = (
+        pair = streams[index] = (
             torch.cuda.Stream(device=index),
             torch.cuda.Event(),
         )
@@ -1617,18 +1634,13 @@ def compaction_index(
     return valid, pos, idx_full
 
 
-_HIDDEN_COUNT_CELLS: dict[
-    int, tuple
-] = {}  # device index -> (pinned int32 [1] cell, event); one pair per device, reused by every call
-_HIDDEN_COUNT_ARANGE: dict[
-    int, torch.Tensor
-] = {}  # device index -> the growing int32 constant 1, 2, ... (no kernel per call)
-
-
 def _hidden_count_cell(index: int) -> tuple:
-    pair = _HIDDEN_COUNT_CELLS.get(index)
+    """The calling thread's ``(pinned int32 [1] cell, event)`` of device ``index``: the count's copy target and the
+    event behind it, reused by the thread's calls (each reads its count before the next call)."""
+    cells = _thread_state("cells")
+    pair = cells.get(index)
     if pair is None:
-        pair = _HIDDEN_COUNT_CELLS[index] = (
+        pair = cells[index] = (
             torch.empty((1,), dtype=torch.int32, pin_memory=True),
             torch.cuda.Event(),
         )
@@ -1636,12 +1648,17 @@ def _hidden_count_cell(index: int) -> tuple:
 
 
 def _hidden_count_arange(index: int, T: int) -> torch.Tensor:
-    ar = _HIDDEN_COUNT_ARANGE.get(index)
+    """The calling thread's int32 constant ``1, 2, ..`` of device ``index`` with at least ``T`` entries (no kernel per
+    call; grown by doubling), recorded on the current stream so a replaced constant is not reused before the
+    kernels queued on it have read it."""
+    aranges = _thread_state("arange")
+    ar = aranges.get(index)
     if ar is None or ar.numel() < T:
         cap = max(int(T), 2 * (0 if ar is None else int(ar.numel())))
-        ar = _HIDDEN_COUNT_ARANGE[index] = torch.arange(
+        ar = aranges[index] = torch.arange(
             1, cap + 1, dtype=torch.int32, device=torch.device("cuda", index)
         )
+    ar.record_stream(torch.cuda.current_stream(index))
     return ar
 
 
