@@ -820,6 +820,53 @@ MODULES: dict[str, dict[str, Any]] = {
         "module": "tart.attention_split_kv_merge_bf16_rowsplits_with_lse.sm100_sm103.dsv4_nvfp4_fmha_decode_reduce",
         "stage": "reduce",
     },
+    "reduce_two_splits": {
+        "arches": [
+            "sm_100a",
+        ],
+        "arg_plan": [
+            ["buffer", "o"],
+            ["buffer", "lse"],
+            ["buffer", "partial_o"],
+            ["buffer", "partial_lse"],
+            ["buffer", "row_splits"],
+            ["parameter", "total_q"],
+            ["parameter", "num_heads"],
+            ["parameter", "max_splits"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "build": {"two_splits": True},
+        "ffi_entry": "run",
+        "grid_rule": {
+            "heads_per_cta": 16,
+            "kind": "rows_by_heads",
+        },
+        "kernel": "cake_nvfp4_mla_decode_654cb434614f1d4f26c6",
+        "kernel_symbol": "kernel_cake_nvfp4_mla_decode_654cb434614f1d4f26c6",
+        "launch": {
+            "block": (256, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 0,
+            "use_pdl": False,
+        },
+        "library": "cake_nvfp4_mla_decode_654cb434614f1d4f26c6",
+        "logical": {
+            "lse": "lse",
+            "max_splits": "max_splits",
+            "num_heads": "num_heads",
+            "o": "o",
+            "partial_lse": "partial_lse",
+            "partial_o": "partial_o",
+            "row_splits": "row_splits",
+            "total_q": "total_q",
+        },
+        "max_splits": 64,
+        "module": "tart.attention_split_kv_merge_bf16_rowsplits_with_lse.sm100_sm103.dsv4_nvfp4_fmha_decode_reduce",
+        "stage": "reduce",
+    },
 }
 
 
