@@ -260,6 +260,28 @@ PageAttention for MLA
 
 .. note::
 
+    Experimental ``SparseMLASm120Wrapper.run_mega`` with ``backend="sparse"``
+    fuses query GPT-J RoPE, sparse attention, inverse output RoPE, and per-32
+    FP8 E4M3 output quantization. It supports native V4 FP8 and NVFP4 caches,
+    and V4.1 FP8 routes with optional FP4 compressed caches. Query shape is
+    BF16 ``[T,H,512]``; the final 64 coordinates are rotated. Pass int32
+    ``positions[T]``, FP32 ``cos_sin[max_position,64]`` (cosine then sine),
+    FP8 ``output[T,H,512]``, and uint8 ``output_scales[T,H,16]`` (UE8M0).
+    Positions must be in bounds and input/output storage must not overlap.
+    Warm up before CUDA graph capture. Other attention keywords follow
+    ``run`` semantics, including sparse lengths, the second cache and LSE.
+
+    This route preserves the native attention arithmetic and BF16 context
+    rounding, but does not materialize the rotated query or BF16 context in
+    global memory. Split decode still uses its existing partial-output
+    workspace; inverse RoPE and quantization run after the final merge.
+    V4 FP8-cache prefill retains its hybrid BF16-QK/FP8-PV computation.
+    Full-BF16 attention plans are rejected. Output uses ordinary head-major
+    layout, not FlashMLA's GEMM-permuted layout. Query normalization, cache
+    insertion, sparse selection, and learned projections remain outside.
+
+.. note::
+
     With ``backend="cake"`` on SM120/SM121 (``kv_cache_format="nvfp4"``), every
     call runs the Cake split decode kernel or the single-launch prefill kernel
     as chosen by ``cake_sparse_mla_sm120_dsv4_nvfp4_select_kernel`` from the

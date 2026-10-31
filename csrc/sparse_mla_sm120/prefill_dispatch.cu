@@ -31,6 +31,7 @@ PrefillLaunchResult dispatch_prefill(const execution::AttentionParams& p,
                          p.extra_kv,          p.extra_indices,
                          m.extra_page_size,   m.page_size};
   cold.lse_scale = p.lse_scale;
+  cold.mega = p.mega;
   if (cache_format_info(mt).inline_scale) {
     cold.kv_stride_bytes = m.row_stride_bytes;
     // Inline-scale extra sections address flat rows at their row pitch.

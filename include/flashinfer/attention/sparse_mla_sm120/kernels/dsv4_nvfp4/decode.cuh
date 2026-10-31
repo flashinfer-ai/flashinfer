@@ -40,7 +40,7 @@ __global__ void __launch_bounds__(DECODE_BLOCK_THREADS) sparse_mla_decode_dsv4_n
     const int32_t* __restrict__ extra_indices, const int* __restrict__ extra_topk_length_ptr,
     int extra_topk, int extra_page_block_size, size_t extra_page_stride_bytes, int num_tokens,
     int scratch_split_stride, int chunks_per_block, float sm_scale, int page_block_size,
-    size_t page_stride_bytes, bool write_direct, float lse_scale) {
+    size_t page_stride_bytes, bool write_direct, float lse_scale, SparseMlaMegaParams mega = {}) {
   using KV = KVCacheTraits<MT>;
   static_assert(MT == ModelType::DSV4);
   constexpr int D_NOPE = KV::D_NOPE;
@@ -80,7 +80,13 @@ __global__ void __launch_bounds__(DECODE_BLOCK_THREADS) sparse_mla_decode_dsv4_n
     if (!is_io) {
       if (write_direct) {
         for (int i = threadIdx.x; i < VALID_HPB * D_V_C; i += DECODE_MATH_THREADS) {
-          output[((size_t)token_idx * NUM_HEADS + h_start) * D_V_C + i] = __float2bfloat16(0.f);
+          const size_t offset = ((size_t)token_idx * NUM_HEADS + h_start) * D_V_C + i;
+          if (mega.output) {
+            mega.output[offset] = 0;
+            // ceil_pow2(1e-4/448) = 2^-22, UE8M0 = 105.
+            if ((i & 31) == 0) mega.scales[offset / 32] = 105;
+          } else
+            output[offset] = __float2bfloat16(0.f);
         }
         if (threadIdx.x < VALID_HPB) {
           const int h = h_start + threadIdx.x;
@@ -101,7 +107,9 @@ __global__ void __launch_bounds__(DECODE_BLOCK_THREADS) sparse_mla_decode_dsv4_n
   __shared__ bf16 sm_p_full[HPB][DECODE_CAND_WINDOW];
   const int32_t* idx_base = indices + (size_t)token_idx * TOPK;
 
-  using Ring = pipeline::AsyncRing<DECODE_KV_BUF_COUNT>;
+  // Every consumer publishes completion of its reads before the producer
+  // reuses a raw slot, matching the streaming kernel's counted handoff.
+  using Ring = pipeline::AsyncRing<DECODE_KV_BUF_COUNT, 1, DECODE_MATH_THREADS>;
   if (threadIdx.x == 0) Ring::init(sm.mbar_full(0), sm.mbar_empty(0));
   __syncthreads();
 
@@ -130,7 +138,7 @@ __global__ void __launch_bounds__(DECODE_BLOCK_THREADS) sparse_mla_decode_dsv4_n
   const int tid = lane & 3;
   const bf16* q_base = q + (size_t)token_idx * NUM_HEADS * D_QK + (size_t)h_start * D_QK;
   quantize_q_nvfp4_to_smem<DECODE_MATH_THREADS>(sm.q_fp4(), sm.q_sc(), sm.q_rope(), q_base,
-                                                VALID_HPB);
+                                                VALID_HPB, mega.row(token_idx));
 
   float acc_nope_groups[1][PV_GROUPS_PER_WARP][PV_N8_TILES_PER_GROUP][4] = {0};
   auto& acc_nope = acc_nope_groups[0];
@@ -369,7 +377,7 @@ __global__ void __launch_bounds__(DECODE_BLOCK_THREADS) sparse_mla_decode_dsv4_n
     }
 
     bar_sync_t<Dsv4Nvfp4Sync::MATH, DECODE_MATH_THREADS>();
-    if (threadIdx.x == 0) Ring::Free::publish(sm.mbar_empty(raw_consumer_slot));
+    Ring::Free::publish(sm.mbar_empty(raw_consumer_slot));
     Ring::advance(raw_consumer_slot, raw_ready_phase);
   }
 
@@ -418,6 +426,9 @@ __global__ void __launch_bounds__(DECODE_BLOCK_THREADS) sparse_mla_decode_dsv4_n
                        split_idx) *
                           D_V_C;
   const size_t head_stride = write_direct ? D_V_C : (size_t)scratch_split_stride * D_V_C;
+  // Both raw KV buffers are dead after the final tile and normalization barrier.
+  static_assert(2 * DecodeNVFP4Smem<MT>::SMEM_KV_FP4_BUF >= HPB * D_V_C * sizeof(bf16));
+  if (write_direct && mega.output) destination = reinterpret_cast<bf16*>(sm.kv_fp4(0));
 
 #pragma unroll
   for (int slot = 0; slot < PV_GROUPS_PER_WARP; ++slot) {
@@ -448,6 +459,13 @@ __global__ void __launch_bounds__(DECODE_BLOCK_THREADS) sparse_mla_decode_dsv4_n
       *reinterpret_cast<__nv_bfloat162*>(&destination[(size_t)(gid + 8) * head_stride + d0]) = hi;
     }
   }
+  if (write_direct && mega.output) {
+    bar_sync_t<Dsv4Nvfp4Sync::Q_STAGE, DECODE_MATH_THREADS>();
+    for (int i = threadIdx.x; i < VALID_HPB * D_V_C / 8; i += DECODE_MATH_THREADS) {
+      mega_store8(*reinterpret_cast<const uint4*>(destination + i * 8),
+                  ((size_t)token_idx * NUM_HEADS + h_start) * D_V_C + i * 8, token_idx, mega);
+    }
+  }
   if (warp_id == 0 && tid == 0) {
     if (write_direct) {
       out_lse[(size_t)token_idx * NUM_HEADS + h_start + gid] =
@@ -476,7 +494,7 @@ __global__ void __launch_bounds__(DECODE_MERGE2_THREADS, 2)
                                                bf16* __restrict__ output,
                                                float* __restrict__ out_lse,
                                                const float* __restrict__ attn_sink, int num_tokens,
-                                               float lse_scale) {
+                                               float lse_scale, SparseMlaMegaParams mega = {}) {
   constexpr int D_V = 512;
   constexpr int VECS_PER_HEAD = D_V / 8;
   constexpr int H_BLOCKS = (NUM_HEADS + HPB - 1) / HPB;
@@ -546,7 +564,12 @@ __global__ void __launch_bounds__(DECODE_MERGE2_THREADS, 2)
     }
     bf16* final_output =
         output + ((size_t)token_idx * NUM_HEADS + h_start + local_head) * D_V + dim;
-    *reinterpret_cast<uint4*>(final_output) = merged;
+    if (mega.output) {
+      mega_store8(merged, ((size_t)token_idx * NUM_HEADS + h_start + local_head) * D_V + dim,
+                  token_idx, mega);
+    } else {
+      *reinterpret_cast<uint4*>(final_output) = merged;
+    }
   }
 }
 

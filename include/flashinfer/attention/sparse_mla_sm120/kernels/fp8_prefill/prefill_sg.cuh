@@ -159,9 +159,11 @@ __device__ __forceinline__ void sparse_mla_prefill_math_pc(
     const bf16* q_base = Q + (size_t)s_i * NUM_HEADS * KV::D_QK + (size_t)h_start * KV::D_QK;
 
     if constexpr (QkMode == QkComputeMode::BF16) {
-      load_q_bf16_to_smem<MT, QK_THREADS>(sm.q_nope_bf16, sm.q_rope, q_base, VALID_HPB);
+      load_q_bf16_to_smem<MT, QK_THREADS>(sm.q_nope_bf16, sm.q_rope, q_base, VALID_HPB,
+                                          cold.mega.row(s_i));
     } else {
-      quantize_q_to_smem<MT, QK_THREADS>(sm.q_nope_fp8, sm.q_nope_sc, sm.q_rope, q_base, VALID_HPB);
+      quantize_q_to_smem<MT, QK_THREADS>(sm.q_nope_fp8, sm.q_nope_sc, sm.q_rope, q_base, VALID_HPB,
+                                         cold.mega.row(s_i));
     }
     QRopeRegs<MT> q_rope_regs = preload_q_rope_regs<MT>(sm.q_rope, lane);
 
@@ -509,7 +511,11 @@ __device__ __forceinline__ void sparse_mla_prefill_math_pc(
         int h = idx / STORES_PER_HEAD;
         int d8 = (idx - h * STORES_PER_HEAD) * BF16_PER_STORE;
         uint4 v = *reinterpret_cast<const uint4*>(&staging_bf16[h * BF16_STAGING_STRIDE + d8]);
-        *reinterpret_cast<uint4*>(&output[out_base + h * h_stride + d8]) = v;
+        if (cold.mega.output) {
+          mega_store8(v, out_base + h * h_stride + d8, s_i, cold.mega);
+        } else {
+          *reinterpret_cast<uint4*>(&output[out_base + h * h_stride + d8]) = v;
+        }
       }
     }
   }
@@ -699,10 +705,11 @@ __global__ void __launch_bounds__((Fp8PrefillResources<MT, QkMode, GatherSchedul
     const int qk_nb = mwarp * Cfg::ENTRIES_PER_WARP;
 
     if constexpr (QkMode == QkComputeMode::BF16) {
-      load_q_bf16_to_smem<MT, Cfg::MATH_THREADS>(sm.q_nope_bf16, sm.q_rope, q_base, VALID_HPB);
+      load_q_bf16_to_smem<MT, Cfg::MATH_THREADS>(sm.q_nope_bf16, sm.q_rope, q_base, VALID_HPB,
+                                                 cold.mega.row(s_i));
     } else {
       quantize_q_to_smem<MT, Cfg::MATH_THREADS>(sm.q_nope_fp8, sm.q_nope_sc, sm.q_rope, q_base,
-                                                VALID_HPB);
+                                                VALID_HPB, cold.mega.row(s_i));
     }
     QRopeRegs<MT> q_rope_regs = preload_q_rope_regs<MT>(sm.q_rope, lane);
 
@@ -1098,7 +1105,11 @@ __global__ void __launch_bounds__((Fp8PrefillResources<MT, QkMode, GatherSchedul
         int h = idx / STORES_PER_HEAD;
         int d8 = (idx - h * STORES_PER_HEAD) * BF16_PER_STORE;
         uint4 v = *reinterpret_cast<const uint4*>(&staging_bf16[h * BF16_STAGING_STRIDE + d8]);
-        *reinterpret_cast<uint4*>(&output[out_base + h * h_stride + d8]) = v;
+        if (cold.mega.output) {
+          mega_store8(v, out_base + h * h_stride + d8, s_i, cold.mega);
+        } else {
+          *reinterpret_cast<uint4*>(&output[out_base + h * h_stride + d8]) = v;
+        }
       }
     }
 

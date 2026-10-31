@@ -15,10 +15,10 @@
  */
 
 #pragma once
-
 #include <cuda_bf16.h>
 
 #include "../../arch/barrier.cuh"
+#include "../../compute/mega.cuh"
 #include "../../compute/nvfp4_quantization.cuh"
 #include "resources.cuh"
 
@@ -30,7 +30,8 @@ template <int MATH_THREADS, int PACKED_STRIDE = DSV4_NVFP4_Q_PACKED_STRIDE,
           int SCALE_STRIDE = DSV4_NVFP4_SCALE_STRIDE>
 __device__ __forceinline__ void quantize_q_nvfp4_to_smem(uint8_t* q_nope_fp4,
                                                          uint8_t* q_nope_scales, bf16* q_rope,
-                                                         const bf16* q_base, int valid_hpb = HPB) {
+                                                         const bf16* q_base, int valid_hpb = HPB,
+                                                         const float* mega_cs = nullptr) {
   using KV = KVCacheTraits<ModelType::DSV4>;
   constexpr int NUM_GROUPS = HPB * DSV4_NVFP4_NUM_SCALES;
 
@@ -51,8 +52,12 @@ __device__ __forceinline__ void quantize_q_nvfp4_to_smem(uint8_t* q_nope_fp4,
   for (int i = threadIdx.x; i < HPB * KV::D_ROPE; i += MATH_THREADS) {
     const int head = i / KV::D_ROPE;
     const int dim = i % KV::D_ROPE;
-    q_rope[i] =
-        (head < valid_hpb) ? q_base[head * KV::D_QK + KV::D_NOPE + dim] : __float2bfloat16(0.f);
+    q_rope[i] = (head < valid_hpb)
+                    ? __float2bfloat16_rn(mega_rotate(
+                          __bfloat162float(q_base[head * KV::D_QK + KV::D_NOPE + dim]),
+                          __bfloat162float(q_base[head * KV::D_QK + KV::D_NOPE + (dim ^ 1)]),
+                          KV::D_NOPE + dim, mega_cs))
+                    : __float2bfloat16(0.f);
   }
   bar_sync_t<Dsv4Nvfp4Sync::Q_STAGE, MATH_THREADS>();
 }
