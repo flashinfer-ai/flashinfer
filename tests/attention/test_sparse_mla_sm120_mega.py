@@ -410,3 +410,94 @@ def test_mega_head_tiles(cache_format, tokens, heads):
         (f["out"].float(), f["scales"], actual_lse), expected, strict=True
     ):
         torch.testing.assert_close(actual, target, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("cache_format", ["fp8", "nvfp4"])
+@pytest.mark.parametrize("splits", [10, 31, 32, 33])
+@pytest.mark.parametrize("regime", ["normal", "empty", "underflow"])
+def test_mega_merge_split_boundary(cache_format, splits, regime):
+    """Cover both sides of the warp reduction limit and masked split inputs."""
+    from flashinfer.mla._sparse_mla_sm120._prepared import (
+        validate_metadata,
+        device_caps,
+    )
+    from flashinfer.mla._sparse_mla_sm120._execution import get_sparse_mla_sm120_module
+
+    nvfp4 = cache_format == "nvfp4"
+    empty = regime == "empty"
+    f = fixture(3, 16, cache_format, extra_topk=(splits - 2) * 64, with_sink=not empty)
+    if regime == "underflow":
+        f["q"].mul_(256)
+        f["sink"][::2] = 4096
+    if empty:
+        for lengths in f["lengths"]:
+            lengths.zero_()
+    else:
+        f["indices"][0][1].fill_(-1)
+        f["lengths"][1][2] = 65
+    f["prologue"]()
+    m = validate_metadata(
+        f["q"],
+        f["caches"][0],
+        f["indices"][0],
+        f["context"],
+        f["lengths"][0],
+        f["sink"],
+        f["caches"][1],
+        f["indices"][1],
+        f["lengths"][1],
+        None,
+        None,
+        None,
+        model=1,
+        is_dsv4_nvfp4=nvfp4,
+        extra_fp4=False,
+        value_dim=512,
+    )
+    module = get_sparse_mla_sm120_module()
+    sm, shared = device_caps(f["q"].device)
+    if nvfp4:
+        plan = module.dsv4_nvfp4_resolve_attention(
+            m._replace(variant=0), 3, 1, sm, shared, False
+        )
+    else:
+        plan = module.resolve_attention(m._replace(variant=0), 0, 1, sm, shared)
+    assert plan.inspect()["active_splits"] == splits
+    assert plan.inspect()["merge"] == "general"
+    buffers = [
+        torch.empty(tuple(shape), dtype=getattr(torch, str(dtype)), device="cuda")
+        for shape, dtype, _, _ in plan.workspace()
+    ]
+    mid, mlse, lse = buffers
+    common = (
+        f["caches"][0],
+        f["indices"][0],
+        mid,
+        mlse,
+        f["context"],
+        lse,
+        512**-0.5,
+        f["lengths"][0],
+        f["sink"],
+        f["caches"][1],
+        f["indices"][1],
+        f["lengths"][1],
+        1.0,
+    )
+    prefix = "dsv4_nvfp4_" if nvfp4 else ""
+    getattr(module, prefix + "execute_attention")(plan, f["rotated"], *common)
+    f["post"]()
+    expected = (f["out"].float().clone(), f["scales"].clone(), lse.clone())
+    getattr(module, prefix + "execute_mega_attention")(
+        plan,
+        f["q"],
+        *common,
+        f["positions"],
+        f["cs"],
+        f["out"].view(torch.uint8),
+        f["scales"],
+    )
+    for actual, target in zip(
+        (f["out"].float(), f["scales"], lse), expected, strict=True
+    ):
+        torch.testing.assert_close(actual, target, atol=0, rtol=0)

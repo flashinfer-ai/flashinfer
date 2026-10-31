@@ -71,8 +71,13 @@ cudaError_t launch_decode(const AttentionParams& p, const ExecutionPlan& plan,
   constexpr int MERGE_THREADS = 64;
   auto merge = sparse_mla_decode_dsv4_merge_kernel<NUM_HEADS, KV::D_V, MERGE_THREADS,
                                                    KV::D_V / MERGE_THREADS>;
-  merge<<<dim3(p.num_tokens, q_heads), dim3(MERGE_THREADS),
-          size_t(p.allocated_splits) * sizeof(float), stream>>>(
+  size_t merge_smem = size_t(p.allocated_splits) * sizeof(float);
+  if (p.mega.output && p.allocated_splits <= 32) {
+    merge = sparse_mla_decode_dsv4_merge_kernel<NUM_HEADS, KV::D_V, MERGE_THREADS,
+                                                KV::D_V / MERGE_THREADS, true>;
+    merge_smem = 0;
+  }
+  merge<<<dim3(p.num_tokens, q_heads), dim3(MERGE_THREADS), merge_smem, stream>>>(
       p.mid_out, p.mid_lse, p.output, p.out_lse, p.attn_sink, p.num_tokens, p.allocated_splits,
       q_heads, h_blocks * HPB, p.out_lse_stride_elems, p.lse_scale, p.mega);
   return cudaGetLastError();

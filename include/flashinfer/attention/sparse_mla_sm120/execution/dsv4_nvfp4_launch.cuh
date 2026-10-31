@@ -67,7 +67,12 @@ cudaError_t launch_decode(const Dsv4Nvfp4AttentionParams& params,
   constexpr int MERGE_THREADS = 64;
   constexpr int DIMS_PER_THREAD = 512 / MERGE_THREADS;
   auto kernel = sparse_mla_decode_dsv4_merge_kernel<NUM_HEADS, 512, MERGE_THREADS, DIMS_PER_THREAD>;
-  const size_t merge_smem = static_cast<size_t>(active_splits) * sizeof(float);
+  size_t merge_smem = static_cast<size_t>(active_splits) * sizeof(float);
+  if (mega.output && active_splits <= 32) {
+    kernel =
+        sparse_mla_decode_dsv4_merge_kernel<NUM_HEADS, 512, MERGE_THREADS, DIMS_PER_THREAD, true>;
+    merge_smem = 0;
+  }
   kernel<<<dim3(num_tokens, NUM_HEADS), dim3(MERGE_THREADS), merge_smem, stream>>>(
       mid_out, mid_lse, output, out_lse, attn_sink, num_tokens, active_splits, NUM_HEADS, NUM_HEADS,
       NUM_HEADS, lse_scale, mega);

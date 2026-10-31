@@ -80,7 +80,20 @@ def unpack_output(q, sf):
 
 
 def fixture(
-    tokens=1, heads=64, cache_format="fp8", pool_tokens=4096, seed=42, ragged=False
+    tokens=1,
+    heads=64,
+    cache_format="fp8",
+    pool_tokens=4096,
+    seed=42,
+    ragged=False,
+    *,
+    topk=128,
+    extra_topk=512,
+    extra_page_size=64,
+    extra_pool_tokens=None,
+    input_scale=1.0,
+    with_sink=True,
+    keep_decoded=True,
 ):
     from flashinfer.mla import (
         SparseMLASm120Wrapper,
@@ -100,15 +113,31 @@ def fixture(
     require_sm12x()
     torch.manual_seed(seed)
     q = torch.randn(tokens, heads, 512, device="cuda", dtype=torch.bfloat16)
+    if input_scale != 1.0:
+        q = (q * input_scale).clamp(-1, 1)
     positions = torch.randint(0, 100001, (tokens,), device="cuda", dtype=torch.int32)
     freq = torch.arange(32, device="cuda").float() / 32
     angles = torch.arange(100001, device="cuda").float()[:, None] * (10000.0**-freq)
     cs = torch.cat((angles.cos(), angles.sin()), -1)
     caches, decoded = [], []
-    for cache_index in range(2):
+    pool_sizes = (pool_tokens, extra_pool_tokens or pool_tokens)
+    for cache_index, page_size in enumerate((64, extra_page_size)):
+        if cache_index == 1 and extra_topk == 0:
+            caches.append(None)
+            decoded.append(None)
+            continue
+        if pool_sizes[cache_index] % page_size:
+            raise ValueError("pool size must be a multiple of page size")
         kv = torch.randn(
-            pool_tokens // 64, 64, 1, 512, device="cuda", dtype=torch.bfloat16
+            pool_sizes[cache_index] // page_size,
+            page_size,
+            1,
+            512,
+            device="cuda",
+            dtype=torch.bfloat16,
         )
+        if input_scale != 1.0:
+            kv = (kv * input_scale).clamp(-1, 1)
         if cache_format in ("v41_fp8", "v41_mixed"):
             fp4 = cache_format == "v41_mixed" and cache_index == 1
             pack = (
@@ -116,30 +145,38 @@ def fixture(
                 if fp4
                 else dsv41_fp8_quantize_pack_sparse_mla_cache
             )
-            footer = pack(kv.squeeze(2), kv_layout="NHD")
-            dec = (dequantize_kv_dsv4_1_fp4 if fp4 else dequantize_kv_dsv4_1)(footer)
+            if keep_decoded:
+                footer = pack(kv.squeeze(2), kv_layout="NHD")
+                dec = (dequantize_kv_dsv4_1_fp4 if fp4 else dequantize_kv_dsv4_1)(
+                    footer
+                )
             # The same packer emits FlashMLA/vLLM's inline record ABI.
             cache = pack(kv.squeeze(2), kv_layout="NHD", inline_scale=True)
         elif cache_format == "nvfp4":
             cache = nvfp4_quantize_pack_sparse_mla_cache(kv.squeeze(2), kv_layout="NHD")
-            dec = _dequantize_nvfp4_cache(cache)
+            if keep_decoded:
+                dec = _dequantize_nvfp4_cache(cache)
         else:
             cache = quantize_kv_dsv4(kv)
-            dec = dequantize_kv_dsv4(cache)
+            if keep_decoded:
+                dec = dequantize_kv_dsv4(cache)
         caches.append(cache)
-        decoded.append(dec.reshape(-1, 512))
+        decoded.append(dec.reshape(-1, 512) if keep_decoded else None)
     indices = [
-        torch.randint(pool_tokens, (tokens, k), device="cuda", dtype=torch.int32)
-        for k in (128, 512)
+        torch.randint(n, (tokens, k), device="cuda", dtype=torch.int32) if k else None
+        for n, k in zip(pool_sizes, (topk, extra_topk), strict=True)
     ]
     lengths = [
-        torch.full((tokens,), k, device="cuda", dtype=torch.int32) for k in (128, 512)
+        torch.full((tokens,), k, device="cuda", dtype=torch.int32) if k else None
+        for k in (topk, extra_topk)
     ]
     if ragged:
         for idx, lens in zip(indices, lengths, strict=True):
+            if idx is None:
+                continue
             lens.copy_(torch.arange(tokens, device="cuda") % (idx.shape[1] + 1))
             idx[:, ::7] = -1
-    sink = torch.randn(heads, device="cuda")
+    sink = torch.randn(heads, device="cuda") if with_sink else None
     rotated, context = torch.empty_like(q), torch.empty_like(q)
     out = torch.empty_like(q, dtype=torch.float8_e4m3fn)
     scales = torch.empty(tokens, heads, 16, device="cuda", dtype=torch.uint8)
@@ -188,6 +225,8 @@ def reference(f):
     q = rope_reference(f["q"], f["positions"], f["cs"]).bfloat16().double()
     rows, valid = [], []
     for dec, idx, lens in zip(f["decoded"], f["indices"], f["lengths"], strict=True):
+        if idx is None:
+            continue
         rows.append(dec[idx.clamp_min(0).long()].double())
         valid.append(
             (idx >= 0)
@@ -197,7 +236,9 @@ def reference(f):
     valid = torch.cat(valid, 1)
     scores = (q @ kv.transpose(1, 2)) * 512**-0.5
     scores.masked_fill_(~valid[:, None, :], -torch.inf)
-    lse = torch.logaddexp(torch.logsumexp(scores, -1), f["sink"].double()[None])
+    lse = torch.logsumexp(scores, -1)
+    if f["sink"] is not None:
+        lse = torch.logaddexp(lse, f["sink"].double()[None])
     context = torch.exp(scores - lse[..., None]) @ kv
     return rope_reference(context, f["positions"], f["cs"], inverse=True), lse
 
