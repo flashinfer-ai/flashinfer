@@ -705,6 +705,7 @@ def select_reduce_record(
     *,
     num_sms: Optional[int] = None,
     row_splits: Optional[Sequence[int]] = None,
+    decode_record: Optional[str] = None,
 ) -> str:
     """Registry record of the combine program that runs ``plan`` on ``arch``.
 
@@ -718,7 +719,9 @@ def select_reduce_record(
     ``REDUCE_TWO_SPLITS_TARGETS`` and the rows of two splits (``row_splits``,
     one count per query row) form one contiguous range (``split_row_range``);
     every other plan runs ``"reduce"``. The combine programs' outputs are
-    bitwise identical.
+    bitwise identical. ``decode_record`` is the plan's
+    ``select_decode_record(plan, arch, num_sms)`` when the caller holds it
+    (``prepare``), so it is not selected a second time.
     """
     if (
         _delivered(REDUCE_GENERAL_RECORD, arch)
@@ -731,7 +734,8 @@ def select_reduce_record(
         and num_sms is not None
         and row_splits is not None
         and (arch, num_sms // CLUSTER_PAIR) in REDUCE_TWO_SPLITS_TARGETS
-        and select_decode_record(plan, arch, num_sms) in SHORT_DECODE_RECORDS
+        and (decode_record or select_decode_record(plan, arch, num_sms))
+        in SHORT_DECODE_RECORDS
         and split_row_range(row_splits) is not None
     ):
         return REDUCE_TWO_SPLITS_RECORD
@@ -1304,7 +1308,11 @@ def prepare_nvfp4_batch_decode_with_kv_cache_mla(
     else:
         row_splits_host = [1] * total_q
     reduce_record = select_reduce_record(
-        plan, arch, num_sms=num_sms, row_splits=row_splits_host
+        plan,
+        arch,
+        num_sms=num_sms,
+        row_splits=row_splits_host,
+        decode_record=decode_record,
     )
     tables = host_tables(
         plan, layout, q_indptr=q_indptr_host, row_splits=row_splits_host
@@ -1348,38 +1356,28 @@ def prepare_nvfp4_batch_decode_with_kv_cache_mla(
         grid=launch_grid(MODULES[decode_record], units=plan.num_units),
     )
     reduce_kwargs = None
-    if max_splits > 1 and reduce_record == REDUCE_TWO_SPLITS_RECORD:
+    if max_splits > 1:
         # The two-split combine runs the contiguous range of split rows alone:
         # one CTA row per range row, every per-row pointer offset to the
         # range's first row; total_q stays the full count (the split stride).
-        first, count = split_row_range(row_splits_host)
-        row_elems = num_heads * HEAD_DIM
+        # Every other combine runs all total_q rows. select_reduce_record
+        # picked it only for a contiguous range (split_row_range) of rows of
+        # two splits, so the range is the first such row and their count.
+        first, rows = 0, total_q
+        if reduce_record == REDUCE_TWO_SPLITS_RECORD:
+            first, rows = row_splits_host.index(2), row_splits_host.count(2)
         reduce_kwargs = dict(
-            o=out.view(-1)[first * row_elems :],
-            lse=lse.view(-1)[first * num_heads :],
-            partial_o=partial_o.view(-1)[first * row_elems :],
-            partial_lse=partial_lse.view(-1)[first * num_heads * max_splits :],
-            row_splits=row_splits[first:],
+            o=out[first:] if first else out,
+            lse=lse[first:] if first else lse,
+            partial_o=partial_o.view(-1)[first * num_heads * HEAD_DIM :]
+            if first
+            else partial_o,
+            partial_lse=partial_lse[first:] if first else partial_lse,
+            row_splits=row_splits[first:] if first else row_splits,
             total_q=total_q,
             num_heads=num_heads,
             max_splits=max_splits,
-            grid=launch_grid(
-                MODULES[reduce_record], total_q=count, num_heads=num_heads
-            ),
-        )
-    elif max_splits > 1:
-        reduce_kwargs = dict(
-            o=out,
-            lse=lse,
-            partial_o=partial_o,
-            partial_lse=partial_lse,
-            row_splits=row_splits,
-            total_q=total_q,
-            num_heads=num_heads,
-            max_splits=max_splits,
-            grid=launch_grid(
-                MODULES[reduce_record], total_q=total_q, num_heads=num_heads
-            ),
+            grid=launch_grid(MODULES[reduce_record], total_q=rows, num_heads=num_heads),
         )
     assert tuple(main_kwargs) == MAIN_KWARGS
     assert reduce_kwargs is None or tuple(reduce_kwargs) == REDUCE_KWARGS
