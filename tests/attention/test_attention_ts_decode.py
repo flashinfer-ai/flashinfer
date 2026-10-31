@@ -6469,6 +6469,58 @@ def test_attention_ts_decode_public_head_band_does_not_reduce_kv_fanout(
     assert cfg.use_persistent_scheduler is False
 
 
+def test_attention_ts_decode_split_workspace_tracks_plan_fanout(monkeypatch) -> None:
+    """GMEM split scratch follows the plan's fanout, not the SM count."""
+    _mock_decode_hardware(monkeypatch)
+
+    from contextlib import nullcontext
+
+    from flashinfer.attention.prims_ts import decode as decode_module
+    from flashinfer.attention.prims_ts.kernels.fmha_decode import fmha_decode_config
+
+    sm_count = 152
+    monkeypatch.setattr(
+        fmha_decode_config,
+        "get_max_active_clusters_for_cluster_size",
+        lambda cluster_size: sm_count // cluster_size,
+    )
+    monkeypatch.setattr(torch.cuda, "device", lambda *_args, **_kwargs: nullcontext())
+    decode_module._resolve_decode_launch_spec.cache_clear()
+    checked = 0
+    try:
+        for batch_size in range(1, 129):
+            spec = decode_module._resolve_decode_launch_spec(
+                0,
+                batch_size,
+                32,
+                8,
+                128,
+                32,
+                131072,
+                4,
+                "float16",
+                "float16",
+                "float16",
+                "float16",
+                "HND",
+                "causal",
+                False,
+                -1,
+            )
+            cfg = spec.config
+            if not (cfg.use_split_kv and cfg.runtime_split_kv):
+                continue
+            if cfg.use_cluster_smem_reduction:
+                continue
+            capacity = int(cfg.max_splits_kv)
+            assert spec.scratch_shapes[0][2] == capacity
+            assert spec.requested_splits <= capacity <= 2 * spec.requested_splits
+            checked += 1
+    finally:
+        decode_module._resolve_decode_launch_spec.cache_clear()
+    assert checked
+
+
 def test_attention_ts_decode_explicit_kv_does_not_change_sq1_q_policy(
     monkeypatch,
 ) -> None:
