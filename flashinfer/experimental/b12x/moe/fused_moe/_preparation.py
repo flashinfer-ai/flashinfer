@@ -124,6 +124,8 @@ def _control_snapshot() -> FrozenMapping:
             "trellis_decode_table": trellis_decode_table(),
             "w4a16_small_m_occupancy": _w4a16_small_m_occupancy(),
             "w4a8_csf_inline_max_tokens": _impl.W4A8_CSF_INLINE_MAX_TOKENS,
+            "w4a8_csf_inline_explicit_limit": "B12X_W4A8_CSF_INLINE_MAX_TOKENS"
+            in _impl.os.environ,
             "w4a16_prefill_fused_sum": prefill_fused_sum_enabled(),
             "w4a16_csf_stage_max_tokens": _impl.W4A16_CSF_STAGE_MAX_TOKENS,
             "w4a16_skip_empty_m_blocks": _impl.os.environ.get(
@@ -220,7 +222,18 @@ def _query(
         w4a16_block_size_m=invocation.get("w4a16_block_size_m"),
         fast_math=bool(invocation.get("fast_math", True)),
         numerical_recipe=invocation.get("numerical_recipe"),
-        controls=controls,
+        controls=FrozenMapping(
+            {
+                **controls.to_dict(),
+                "w4a8_n64_repacked": bool(
+                    getattr(
+                        getattr(experts._impl.representation, "value", None),
+                        "n64_repack",
+                        False,
+                    )
+                ),
+            }
+        ),
         shared_input_scales=experts._impl.can_share_input(input_scales_static=True),
         nvfp4_inline_scales=plan.nvfp4_inline_scales,
     )
@@ -238,6 +251,7 @@ def _weight_payload(experts: PreparedExperts) -> dict[str, object]:
         "nvfp4_inline_scales": plan.nvfp4_inline_scales,
         "w4a16_compressed_scales": plan.w4a16_compressed_scales,
         "w4a8_csf_inline": plan.w4a8_csf_inline,
+        "w4a8_n64_repacked": plan.w4a8_n64_repacked,
         "activation": plan.activation,
         "params_dtype": plan.io_dtype,
         "num_experts": plan.num_experts,
@@ -291,6 +305,21 @@ def _lower_caps(
     device: torch.device,
 ) -> TPMoEScratchCaps:
     """One config-to-Caps lowering shared by compilation, sizing and serving."""
+    inline_limit = int(query.controls.get("w4a8_csf_inline_max_tokens", 1536))
+    if (
+        weight_plan.w4a8_csf_inline
+        and weight_plan.w4a8_n64_repacked
+        and config.backend == "dynamic"
+        and config.dynamic_tile_m == 64
+        and query.intermediate_size % 128 == 0
+        and inline_limit == 1536
+        and not query.controls.get("w4a8_csf_inline_explicit_limit", False)
+        and query.routed_rows <= 64 * query.num_experts
+        and torch.cuda.get_device_capability(device) == (12, 1)
+    ):
+        # GB10 measurements support this M64 prefill band; keep larger or
+        # more concentrated plans on per-call expansion.
+        inline_limit = 2048
     if getattr(
         weight_plan, "w4a16_compressed_scales", False
     ) and query.num_tokens > int(
@@ -338,11 +367,7 @@ def _lower_caps(
         w4a16_fast_math=query.fast_math,
         w4a8_csf_inline=bool(
             weight_plan.w4a8_csf_inline
-            and (
-                config.backend != "dynamic"
-                or query.num_tokens
-                <= int(query.controls.get("w4a8_csf_inline_max_tokens", 1536))
-            )
+            and (config.backend != "dynamic" or query.num_tokens <= inline_limit)
         ),
         w4a16_prefill_fused_sum=bool(
             query.controls.get("w4a16_prefill_fused_sum", False)
@@ -617,7 +642,7 @@ def _dynamic_program_arguments(plan, caps) -> dict[str, object]:
     n64_repacked = bool(
         prepared_w4a8
         and caps.weight_plan.source_format == "fp4_e8m0_k32"
-        and int(n) % 128 == 64
+        and plan.w4a8_n64_repacked
     )
     if prepared_w4a8 and int(n) % 128 != 0 and not n64_repacked:
         n = _impl._dynamic_kernel_intermediate_size(n, quant_mode)
@@ -708,7 +733,7 @@ def _compact_launches(plan, caps):
         plan.implementation == "micro"
         and plan.quant_mode == "w4a8_mx"
         and caps.weight_plan.source_format == "fp4_e8m0_k32"
-        and plan.n % 128 == 64
+        and plan.w4a8_n64_repacked
     ):
         return None
     from b12x._lib.quant.mxfp8_rows import (
