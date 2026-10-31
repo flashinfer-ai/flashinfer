@@ -194,12 +194,12 @@ _SEGMENT_PREPROCESS_MODULE = "factorized_persistent_segment_preprocess_2904ce6fe
 # arguments, launch grid and bitwise outputs, with the Rubin load and store
 # schedule; the loader builds it on capability (10, 7) in place of the shared
 # module (:func:`_arch_program`).  Refreshed by the Cake export.
-_SM107_SEGMENT_PREPROCESS_MODULE = "factorized_persistent_segment_preprocess_3fdd933bec"
+_SM107_SEGMENT_PREPROCESS_MODULE = "factorized_persistent_segment_preprocess_d6e84d073f"
 # Its twin that triggers the dependent launch at its start
 # (``griddepcontrol.launch_dependents``), the sm_107a preprocess of the
 # ``_PDL_TRIGGER_FAMILIES`` programs.  Refreshed by the Cake export.
 _SM107_SEGMENT_PREPROCESS_TRIGGER_MODULE = (
-    "factorized_persistent_segment_preprocess_4a4134cc42"
+    "factorized_persistent_segment_preprocess_8e2c68be2d"
 )
 # Retained start programs (the FlashInfer 36fd76859292 files): a literal the
 # Cake export does not fill.
@@ -314,47 +314,50 @@ _EXACTONE_MODULES = {
 # as do the fused initial-state bulk programs
 # (``exactfused_<state>_varlen_ibulk``, :func:`fused_ibulk_selected`), the
 # fused batched z-prefetch programs (``exactfused_<state>_batched_zpf``,
-# :func:`fused_z_prefetch_selected`) and the one-CTA-cluster twins
+# :func:`fused_z_prefetch_selected`), the fused batched programs with the
+# appended seq_idx check CTA (``exactfused_<state>_batched_chk`` and
+# ``_zpfchk``, :func:`single_sequence_batched_variant`) and the
+# one-CTA-cluster twins
 # (``exactpre_<state>_varlen_unit``,
 # ``exactone_<state>_varlen_tablefirstunit``,
 # ``exactone_f32_varlen_tablerolesunit``, :func:`unit_cluster_variant`):
 # their entries are their sole sources (no fold module, never built for
 # another architecture).
 _SM107_MODULES = {
-    "exactfused_bf16_varlen": "mamba_ssd_q_tmem_alias_bf16_varlen_2cbbfc3dd6",
-    "exactfused_f16_varlen": "mamba_ssd_q_tmem_alias_f16_varlen_9a77db3ad6",
-    "exactfused_f32_varlen": "mamba_ssd_q_tmem_alias_f32_varlen_ca9cc524b2",
-    "exactfused_bf16_varlen_noring": "mamba_ssd_q_tmem_alias_bf16_varlen_noring_af9953b0ca",
-    "exactfused_f16_varlen_noring": "mamba_ssd_q_tmem_alias_f16_varlen_noring_bf2aca076b",
-    "chunkpar_bf16_batched": "mamba_ssd_chunk_parallel_v3_bf16_batched_0d36ddcff6",
-    "chunkpar_bf16_varlen": "mamba_ssd_chunk_parallel_v3_bf16_varlen_cc9360d18a",
-    "chunkpar_f16_batched": "mamba_ssd_chunk_parallel_v3_f16_batched_74041d25de",
-    "chunkpar_f16_varlen": "mamba_ssd_chunk_parallel_v3_f16_varlen_fd7ee521e3",
-    "chunkpar_f32_batched": "mamba_ssd_chunk_parallel_v3_f32_batched_77be0da401",
-    "chunkpar_f32_varlen": "mamba_ssd_chunk_parallel_v3_f32_varlen_b7f2b1f440",
+    "exactfused_bf16_varlen": "mamba_ssd_q_tmem_alias_bf16_varlen_da9777c315",
+    "exactfused_f16_varlen": "mamba_ssd_q_tmem_alias_f16_varlen_a9d2a3654f",
+    "exactfused_f32_varlen": "mamba_ssd_q_tmem_alias_f32_varlen_94a91cbd54",
+    "exactfused_bf16_varlen_noring": "mamba_ssd_q_tmem_alias_bf16_varlen_noring_24f1ab6c11",
+    "exactfused_f16_varlen_noring": "mamba_ssd_q_tmem_alias_f16_varlen_noring_1c89156428",
+    "chunkpar_bf16_batched": "mamba_ssd_chunk_parallel_v3_bf16_batched_bf68b8f8f3",
+    "chunkpar_bf16_varlen": "mamba_ssd_chunk_parallel_v3_bf16_varlen_f2d6324ea2",
+    "chunkpar_f16_batched": "mamba_ssd_chunk_parallel_v3_f16_batched_8f204dd7bf",
+    "chunkpar_f16_varlen": "mamba_ssd_chunk_parallel_v3_f16_varlen_e03e956d2e",
+    "chunkpar_f32_batched": "mamba_ssd_chunk_parallel_v3_f32_batched_e788b244f4",
+    "chunkpar_f32_varlen": "mamba_ssd_chunk_parallel_v3_f32_varlen_ea7e6fd350",
     "exactpre_bf16_varlen": "mamba_ssd_q_tmem_alias_bf16_varlen_precomputed_d143ae24ea",
     "exactpre_f16_varlen": "mamba_ssd_q_tmem_alias_f16_varlen_precomputed_ae77ddc912",
     "exactpre_f32_varlen": "mamba_ssd_q_tmem_alias_f32_varlen_precomputed_ee7d6500e5",
-    "exactone_bf16_varlen": "mamba_ssd_q_tmem_alias_bf16_varlen_8cf6f8fef2",
-    "exactone_f16_varlen": "mamba_ssd_q_tmem_alias_f16_varlen_7e8ffa5e3b",
-    "exactone_f32_varlen": "mamba_ssd_q_tmem_alias_f32_varlen_e9ab92eb70",
-    "exactone_bf16_varlen_noring": "mamba_ssd_q_tmem_alias_bf16_varlen_noring_b16946e456",
-    "exactone_f16_varlen_noring": "mamba_ssd_q_tmem_alias_f16_varlen_noring_103692cecd",
-    "exactfused_bf16_batched": "mamba_ssd_q_tmem_alias_bf16_batched_a926c4b548",
-    "exactfused_f16_batched": "mamba_ssd_q_tmem_alias_f16_batched_20a770476a",
-    "exactfused_f32_batched": "mamba_ssd_q_tmem_alias_f32_batched_52f18e0520",
-    "exactfused_bf16_batched_noring": "mamba_ssd_q_tmem_alias_bf16_batched_noring_424f20baf3",
-    "exactfused_f16_batched_noring": "mamba_ssd_q_tmem_alias_f16_batched_noring_d4df352680",
-    "exactfused_f32_batched_noring": "mamba_ssd_q_tmem_alias_f32_batched_noring_c6eb1c176c",
+    "exactone_bf16_varlen": "mamba_ssd_q_tmem_alias_bf16_varlen_d6ebef6fe1",
+    "exactone_f16_varlen": "mamba_ssd_q_tmem_alias_f16_varlen_e07ae30b9c",
+    "exactone_f32_varlen": "mamba_ssd_q_tmem_alias_f32_varlen_ffad0741b7",
+    "exactone_bf16_varlen_noring": "mamba_ssd_q_tmem_alias_bf16_varlen_noring_28b9c00efa",
+    "exactone_f16_varlen_noring": "mamba_ssd_q_tmem_alias_f16_varlen_noring_dec73a4d81",
+    "exactfused_bf16_batched": "mamba_ssd_q_tmem_alias_bf16_batched_f50d8568b5",
+    "exactfused_f16_batched": "mamba_ssd_q_tmem_alias_f16_batched_4e298ebb45",
+    "exactfused_f32_batched": "mamba_ssd_q_tmem_alias_f32_batched_231fcdbe99",
+    "exactfused_bf16_batched_noring": "mamba_ssd_q_tmem_alias_bf16_batched_noring_17444adc41",
+    "exactfused_f16_batched_noring": "mamba_ssd_q_tmem_alias_f16_batched_noring_83d228d84c",
+    "exactfused_f32_batched_noring": "mamba_ssd_q_tmem_alias_f32_batched_noring_64e0b8fd3d",
     "exactpre_bf16_batched": "mamba_ssd_q_tmem_alias_bf16_batched_precomputed_542047a878",
     "exactpre_f16_batched": "mamba_ssd_q_tmem_alias_f16_batched_precomputed_8a0418850b",
     "exactpre_f32_batched": "mamba_ssd_q_tmem_alias_f32_batched_precomputed_5bb1e2274f",
     "exactpre_bf16_batched_tail": "mamba_ssd_q_tmem_alias_bf16_batched_precomputed_tail_a0ea2820d8",
     "exactpre_f16_batched_tail": "mamba_ssd_q_tmem_alias_f16_batched_precomputed_tail_48e80d8704",
-    "exactpre_bf16_varlen_tail": "mamba_ssd_q_tmem_alias_bf16_varlen_precomputed_tail_8edaef9799",
-    "exactpre_f16_varlen_tail": "mamba_ssd_q_tmem_alias_f16_varlen_precomputed_tail_4ff710621d",
+    "exactpre_bf16_varlen_tail": "mamba_ssd_q_tmem_alias_bf16_varlen_precomputed_tail_a9564ce055",
+    "exactpre_f16_varlen_tail": "mamba_ssd_q_tmem_alias_f16_varlen_precomputed_tail_10c02fe15e",
     "exactpre_f32_batched_tail": "mamba_ssd_q_tmem_alias_f32_batched_precomputed_tail_fc388577dc",
-    "exactpre_f32_varlen_tail": "mamba_ssd_q_tmem_alias_f32_varlen_precomputed_tail_7fd866a0ea",
+    "exactpre_f32_varlen_tail": "mamba_ssd_q_tmem_alias_f32_varlen_precomputed_tail_62c88e8153",
     "chunkpar3_bf16_batched": "mamba_ssd_chunk_parallel_bf16_batched_39bb8597d5",
     "chunkpar3_f16_batched": "mamba_ssd_chunk_parallel_f16_batched_35f6e66f75",
     "chunkpar3_bf16_varlen": "mamba_ssd_chunk_parallel_bf16_varlen_3449e8c0f2",
@@ -365,26 +368,30 @@ _SM107_MODULES = {
     "exactpre_f32_varlen_claim": "mamba_ssd_q_tmem_alias_f32_varlen_precomputed_claim_8ae380b2cd",
     "exactpre_bf16_varlen_ibulk": "mamba_ssd_q_tmem_alias_bf16_varlen_precomputed_ibulk_272db07349",
     "exactpre_f16_varlen_ibulk": "mamba_ssd_q_tmem_alias_f16_varlen_precomputed_ibulk_ae9645a9b3",
-    "exactone_bf16_varlen_tablefirst": "mamba_ssd_q_tmem_alias_bf16_varlen_tablefirst_76a8f20d0d",
-    "exactone_f16_varlen_tablefirst": "mamba_ssd_q_tmem_alias_f16_varlen_tablefirst_494f203d00",
-    "exactone_f32_varlen_tablefirst": "mamba_ssd_q_tmem_alias_f32_varlen_tablefirst_13c07efd3e",
-    "exactone_bf16_varlen_tableroles": "mamba_ssd_q_tmem_alias_bf16_varlen_tableroles_cd9bb4215b",
-    "exactone_f16_varlen_tableroles": "mamba_ssd_q_tmem_alias_f16_varlen_tableroles_b7f24c6017",
-    "exactone_f32_varlen_tableroles": "mamba_ssd_q_tmem_alias_f32_varlen_tableroles_fd7c260936",
-    "exactfused_bf16_varlen_ibulk": "mamba_ssd_q_tmem_alias_bf16_varlen_ibulk_7e3e039507",
-    "exactfused_f16_varlen_ibulk": "mamba_ssd_q_tmem_alias_f16_varlen_ibulk_ad95ebc012",
-    "exactpre_bf16_varlen_tailone": "mamba_ssd_q_tmem_alias_bf16_varlen_precomputed_tailone_cb5978f317",
-    "exactpre_f16_varlen_tailone": "mamba_ssd_q_tmem_alias_f16_varlen_precomputed_tailone_ed8277f475",
-    "exactpre_f32_varlen_tailone": "mamba_ssd_q_tmem_alias_f32_varlen_precomputed_tailone_a6f49c4f67",
-    "exactfused_bf16_batched_zpf": "mamba_ssd_q_tmem_alias_bf16_batched_zpf_d541c37f1b",
-    "exactfused_f32_batched_zpf": "mamba_ssd_q_tmem_alias_f32_batched_zpf_fa1db6bd09",
+    "exactone_bf16_varlen_tablefirst": "mamba_ssd_q_tmem_alias_bf16_varlen_tablefirst_919b15eab0",
+    "exactone_f16_varlen_tablefirst": "mamba_ssd_q_tmem_alias_f16_varlen_tablefirst_2c8fb4061a",
+    "exactone_f32_varlen_tablefirst": "mamba_ssd_q_tmem_alias_f32_varlen_tablefirst_0d97c77a55",
+    "exactone_bf16_varlen_tableroles": "mamba_ssd_q_tmem_alias_bf16_varlen_tableroles_24a80aed96",
+    "exactone_f16_varlen_tableroles": "mamba_ssd_q_tmem_alias_f16_varlen_tableroles_c93e2ea350",
+    "exactone_f32_varlen_tableroles": "mamba_ssd_q_tmem_alias_f32_varlen_tableroles_eba5f32222",
+    "exactfused_bf16_varlen_ibulk": "mamba_ssd_q_tmem_alias_bf16_varlen_ibulk_5a2348bf3f",
+    "exactfused_f16_varlen_ibulk": "mamba_ssd_q_tmem_alias_f16_varlen_ibulk_2158454d40",
+    "exactpre_bf16_varlen_tailone": "mamba_ssd_q_tmem_alias_bf16_varlen_precomputed_tailone_b708fb0cbd",
+    "exactpre_f16_varlen_tailone": "mamba_ssd_q_tmem_alias_f16_varlen_precomputed_tailone_1494bfd93c",
+    "exactpre_f32_varlen_tailone": "mamba_ssd_q_tmem_alias_f32_varlen_precomputed_tailone_d1940edbda",
+    "exactfused_bf16_batched_zpf": "mamba_ssd_q_tmem_alias_bf16_batched_zpf_853e3f9c12",
+    "exactfused_f32_batched_zpf": "mamba_ssd_q_tmem_alias_f32_batched_zpf_9a7b9d1222",
     "exactpre_bf16_varlen_unit": "mamba_ssd_q_tmem_alias_bf16_varlen_precomputed_unit_86c0dcc2d4",
     "exactpre_f32_varlen_unit": "mamba_ssd_q_tmem_alias_f32_varlen_precomputed_unit_8d8c0d5ef1",
-    "exactone_bf16_varlen_tablefirstunit": "mamba_ssd_q_tmem_alias_bf16_varlen_tablefirstunit_a61f3e7a56",
-    "exactone_f32_varlen_tablefirstunit": "mamba_ssd_q_tmem_alias_f32_varlen_tablefirstunit_0815cf65cd",
-    "exactone_f32_varlen_tablerolesunit": "mamba_ssd_q_tmem_alias_f32_varlen_tablerolesunit_f04c2e3916",
-    "exactpre_bf16_varlen_wrap": "mamba_ssd_q_tmem_alias_bf16_varlen_precomputed_wrap_b778c7bb4c",
-    "exactpre_f32_varlen_wrap": "mamba_ssd_q_tmem_alias_f32_varlen_precomputed_wrap_4898725595",
+    "exactone_bf16_varlen_tablefirstunit": "mamba_ssd_q_tmem_alias_bf16_varlen_tablefirstunit_1b60272131",
+    "exactone_f32_varlen_tablefirstunit": "mamba_ssd_q_tmem_alias_f32_varlen_tablefirstunit_22af6b5b49",
+    "exactone_f32_varlen_tablerolesunit": "mamba_ssd_q_tmem_alias_f32_varlen_tablerolesunit_4743b4456a",
+    "exactpre_bf16_varlen_wrap": "mamba_ssd_q_tmem_alias_bf16_varlen_precomputed_wrap_6c0da31578",
+    "exactpre_f32_varlen_wrap": "mamba_ssd_q_tmem_alias_f32_varlen_precomputed_wrap_72a9ccdcba",
+    "exactfused_bf16_batched_chk": "mamba_ssd_q_tmem_alias_bf16_batched_chk_b93b8c643a",
+    "exactfused_bf16_batched_zpfchk": "mamba_ssd_q_tmem_alias_bf16_batched_zpfchk_cff885c8dc",
+    "exactfused_f32_batched_chk": "mamba_ssd_q_tmem_alias_f32_batched_chk_a978f5be55",
+    "exactfused_f32_batched_zpfchk": "mamba_ssd_q_tmem_alias_f32_batched_zpfchk_bb6a238109",
 }
 
 _SEGMENT_PREPROCESS = _Kernel(
@@ -610,9 +617,12 @@ _FUSED_ONLY_MAIN_ARGS = ("cu_seqlens", "metadata_from_cu_seqlens", "preprocess_s
 # source: the published / caller ``seq_chunk_cumsum`` vector (every program
 # but the two below; the two-kernel and chunk-parallel programs pass 0), the
 # ``cu_seqlens`` closed form derived per item (``exactfused`` in the cu_seqlens
-# form), or -- the ``exactone`` programs only -- the table the CTA prologue
+# form), or -- the ``exactone`` programs -- the table the CTA prologue
 # derives from the int32 / int64 seq_idx triple into its private row of the
-# ``seq_chunk_cumsum`` scratch.
+# ``seq_chunk_cumsum`` scratch.  The sm_107a seq_idx check programs
+# (``exactfused_*_batched_chk`` / ``_zpfchk``) take the same two values to
+# name the int32 / int64 triple their check CTA reads (their main CTAs read no
+# table); 0 runs them without the check.
 _TABLE_PUBLISHED = 0
 _TABLE_CU_SEQLENS = 1
 _TABLE_IN_KERNEL_I32 = 2
@@ -766,6 +776,8 @@ _VARIANT_SMEM_BYTES = {
     ("exactone", "tablefirst"): _EXACTONE_SMEM_BYTES,
     ("exactone", "tableroles"): _EXACTONE_SMEM_BYTES,
     ("exactfused", "zpf"): _EXACTFUSED_SMEM_BYTES,
+    ("exactfused", "chk"): _EXACTFUSED_SMEM_BYTES,
+    ("exactfused", "zpfchk"): _EXACTFUSED_SMEM_BYTES,
     ("exactpre", "unit"): _EXACTPRE_SMEM_BYTES,
     ("exactone", "tablefirstunit"): _EXACTONE_SMEM_BYTES,
     ("exactone", "tablerolesunit"): _EXACTONE_SMEM_BYTES,
@@ -830,14 +842,14 @@ _PROGRAMS: dict[str, _Program] = {
     )
 }
 # The sm_107a-only programs (the claim, initial-state bulk, one-CTA pair,
-# wrap-plan and z-prefetch programs, the one-launch programs' table forms and
-# the one-CTA-cluster twins): their ``_SM107_MODULES`` entry is their main
-# module on every architecture; only capability (10, 7) routes to them
-# (:func:`claim_selected`, :func:`ibulk_selected`,
+# wrap-plan, z-prefetch and seq_idx check programs, the one-launch programs'
+# table forms and the one-CTA-cluster twins): their ``_SM107_MODULES`` entry
+# is their main module on every architecture; only capability (10, 7)
+# routes to them (:func:`claim_selected`, :func:`ibulk_selected`,
 # :func:`tail_one_cta_selected`, :func:`wrap_long_selected`,
 # :func:`fused_ibulk_selected`,
-# :func:`fused_z_prefetch_selected`, :func:`exactone_table_variant`,
-# :func:`unit_cluster_variant`).
+# :func:`fused_z_prefetch_selected`, :func:`single_sequence_batched_variant`,
+# :func:`exactone_table_variant`, :func:`unit_cluster_variant`).
 _SM107_ONLY_PROGRAMS = frozenset(_SM107_MODULES) - frozenset(_PROGRAMS)
 _PROGRAMS.update(
     (name, _program(name, _SM107_MODULES[name]))
@@ -852,8 +864,9 @@ def _program_name(
     packed-varlen mode; ``variant`` names a non-default schedule variant of the
     family (``"noring"`` for the exact-scan families other than the two-kernel
     one, ``"tail"``, ``"tailone"``, ``"claim"``, ``"ibulk"`` or ``"unit"``
-    for the two-kernel exact-scan family, ``"ibulk"`` or ``"zpf"`` for the
-    fused one, ``"tablefirst"``, ``"tableroles"``, ``"tablefirstunit"`` or
+    for the two-kernel exact-scan family, ``"ibulk"``, ``"zpf"``, ``"chk"``
+    or ``"zpfchk"`` for the fused one,
+    ``"tablefirst"``, ``"tableroles"``, ``"tablefirstunit"`` or
     ``"tablerolesunit"`` for the one-launch family)."""
 
     mode_key = "varlen" if mode_varlen else "batched"
@@ -2099,6 +2112,95 @@ def fused_z_prefetch_selected(
         and state_dtype in _FUSED_Z_PREFETCH_STATE_DTYPES
         and int(nchunks) >= _FUSED_Z_PREFETCH_MIN_CHUNKS
     )
+
+
+# sm_107a (R200, 212 SMs): a single-sequence packed-varlen call (batch 1)
+# in the seq_idx triple form whose table the device derives (no caller
+# ``seq_chunk_cumsum``) runs the fused batched program on the batched
+# geometry of its ``[1, T]`` view (the canonical chunk-128 segments of one
+# sequence are that view's chunks), in one launch, with one CTA appended to
+# the persistent grid: that CTA owns no work item and checks the call's
+# seq_idx at every segment start as the varlen programs do, setting the
+# ``preprocess_status`` word on an out-of-range or decreasing id
+# (``exactfused_<state>_batched_chk``; ``_zpfchk``, the z-prefetch program
+# with the same check, where :func:`fused_z_prefetch_selected` takes the
+# batched view).  The outputs of a valid call are bitwise those of its
+# varlen program.  Only calls whose varlen program is an exact-scan program
+# and whose batched view is inside the fused window, with fewer heads than
+# SMs (the check CTA takes a free SM), without checkpoint outputs and with
+# a bf16 / f32 state are routed; the cu_seqlens form and caller tables keep
+# their program.
+_SINGLE_SEQUENCE_CHECK_CAPABILITIES = frozenset({(10, 7)})
+_SINGLE_SEQUENCE_CHECK_STATE_DTYPES = frozenset({torch.bfloat16, torch.float32})
+
+
+def single_sequence_batched_variant(
+    *,
+    capability: Optional[Tuple[int, int]],
+    mode_varlen: bool,
+    batch: int,
+    num_sequences: int,
+    derives_table: bool,
+    checkpoint_state_count: int,
+    state_dtype: torch.dtype,
+    nheads: int,
+    nchunks: int,
+    sm_count: int,
+    has_z: bool,
+    varlen_family: str,
+    chunk_parallel_mode: str,
+) -> Optional[str]:
+    """The variant (``"chk"`` / ``"zpfchk"``) of the fused batched program a
+    single-sequence varlen call runs on a
+    ``_SINGLE_SEQUENCE_CHECK_CAPABILITIES`` device, or ``None`` (the call
+    keeps its program): batch 1, one sequence, the seq_idx triple form with
+    the table derived on the device (``derives_table``), no checkpoint
+    outputs, a ``_SINGLE_SEQUENCE_CHECK_STATE_DTYPES`` state, a varlen
+    program of the exact-scan family (``varlen_family``) and fewer heads than
+    SMs, whose batched view of ``nchunks`` chunks takes the exact scan
+    (:func:`chunk_parallel_family`) inside the fused window
+    (:func:`fused_selected`); ``"zpfchk"`` where
+    :func:`fused_z_prefetch_selected` takes that view."""
+
+    if capability is None or (
+        (int(capability[0]), int(capability[1]))
+        not in _SINGLE_SEQUENCE_CHECK_CAPABILITIES
+    ):
+        return None
+    if not mode_varlen or int(batch) != 1 or int(num_sequences) != 1:
+        return None
+    if not derives_table or int(checkpoint_state_count) != 0:
+        return None
+    if state_dtype not in _SINGLE_SEQUENCE_CHECK_STATE_DTYPES:
+        return None
+    if varlen_family in ("chunkpar", "chunkpar3") or int(nheads) >= int(sm_count):
+        return None
+    family = chunk_parallel_family(
+        nheads=nheads,
+        num_sequences=1,
+        num_segments=nchunks,
+        nchunks=nchunks,
+        mode_varlen=False,
+        sm_count=sm_count,
+        capability=capability,
+        mode=chunk_parallel_mode,
+    )
+    if family != "exact" or not fused_selected(
+        nheads=nheads,
+        num_sequences=1,
+        nchunks=nchunks,
+        mode_varlen=False,
+        total_tokens=nchunks * _CHUNK_SIZE,
+    ):
+        return None
+    zpf = fused_z_prefetch_selected(
+        capability=capability,
+        state_dtype=state_dtype,
+        mode_varlen=False,
+        has_z=has_z,
+        nchunks=nchunks,
+    )
+    return "zpfchk" if zpf else "chk"
 
 
 # sm_107a: the one-launch ring programs (``exactone_<state>_varlen``) in
@@ -3880,6 +3982,11 @@ class CakeSSDCombined:
             preparing=False,
         )
         self.last_program_name = plan.program_name
+        if not capturing and plan.workspace["program"] != plan.program_name:
+            # The seq_idx check program replaced the shape's own program for
+            # this call without checkpoint outputs: load (build) the shape's
+            # program too, so a run of the shape with them builds nothing.
+            _load_generated_program(plan.workspace["program"], plan.arch)
         if capturing:
             # The graph replays into exactly these addresses: pin the
             # workspace (never evicted) and the chunk-parallel buffers it
@@ -3998,6 +4105,12 @@ class CakeSSDCombined:
             preparing=True,
         )
         _load_generated_program(plan.program_name, plan.arch)
+        if plan.workspace["program"] != plan.program_name:
+            # The seq_idx check program replaced the shape's own program for
+            # this call without checkpoint outputs; a run of the shape with
+            # them launches the shape's program: load it too, so that run
+            # builds and loads nothing.
+            _load_generated_program(plan.workspace["program"], plan.arch)
         # Only a successful preparation freezes the family choice and pins
         # the workspace: a failed allocation or build leaves no trace.
         shape: _ShapeKey = tuple(plan.workspace_key[:-1])
@@ -4349,15 +4462,72 @@ class CakeSSDCombined:
             capability=_ARCH_CAPABILITIES[arch],
         )
         program_name = workspace["program"]
+        # sm_107a: a single-sequence call in the seq_idx triple form whose
+        # table the device derives runs the batched view's fused program with
+        # the appended seq_idx check CTA (``single_sequence_batched_variant``);
+        # ``check_form`` is the table form that CTA reads (0: no check).
+        check_form = 0
+        check_rule: dict[str, Any] = dict(
+            capability=_ARCH_CAPABILITIES[arch],
+            mode_varlen=mode_varlen,
+            batch=batch,
+            num_sequences=num_sequences,
+            derives_table=seq_chunk_cumsum is None and not from_cu_seqlens,
+            checkpoint_state_count=checkpoint_state_count,
+            state_dtype=self.state_dtype,
+            nheads=self.nheads,
+            nchunks=nchunks,
+            sm_count=sm_count,
+            has_z=self.has_z,
+            varlen_family=_PROGRAMS[program_name].family,
+            chunk_parallel_mode=key.chunk_parallel_mode,
+        )
+        check_variant = single_sequence_batched_variant(**check_rule)
+        if check_variant is not None:
+            check_name = _program_name(
+                "exactfused", self.state_dtype, False, check_variant
+            )
+            # The rule reads the call's checkpoint outputs, which the
+            # workspace key does not: an eager run of the shape with them
+            # launches the shape's own program.  A captured call whose check
+            # program has not been launched in this process keeps that
+            # launched program instead -- both give bitwise the same outputs
+            # and final states on every input the contract defines and the
+            # same status word.
+            if not (
+                capturing
+                and (check_name, arch) not in _LOADED_PROGRAMS
+                and (program_name, arch) in _LOADED_PROGRAMS
+            ):
+                program_name = check_name
+                check_form = (
+                    _TABLE_IN_KERNEL_I64
+                    if self.seq_idx_dtype == torch.int64
+                    else _TABLE_IN_KERNEL_I32
+                )
         program = _PROGRAMS[program_name]
         if capturing and (program_name, arch) not in _LOADED_PROGRAMS:
             # Loading (possibly building) the program is host work a graph
             # cannot record, and the host shim resolves its kernel handles
             # on the first launch.
+            advice = "run the shape eagerly once before capturing it"
+            if (
+                checkpoint_state_count
+                and single_sequence_batched_variant(
+                    **dict(check_rule, checkpoint_state_count=0)
+                )
+                is not None
+            ):
+                # The call shape without checkpoint outputs runs the seq_idx
+                # check program, so warming it up launched only that one.
+                advice = (
+                    "checkpoint outputs select a different program for this "
+                    "call: run the call eagerly once with checkpoint outputs "
+                    "before capturing it"
+                )
             raise CakeSSDCombinedCaptureError(
                 f"Cake SSDCombined program {program_name} ({arch}) has not been "
-                "launched in this process: run the shape eagerly once before "
-                "capturing it"
+                f"launched in this process: {advice}"
             )
         # The kernel needs valid storage even when final states are disabled.
         # Returned final states live in fresh caller-owned storage per eager
@@ -4587,6 +4757,11 @@ class CakeSSDCombined:
             grid = _persistent_grid_size(
                 total_work=num_sequences * self.nheads, sm_count=sm_count
             )
+        if check_form:
+            # One launch (no stage): the persistent grid of the batched view
+            # and the seq_idx check CTA after it.
+            preprocess_grid = (0, 1, 1)
+            grid = grid + 1
         if program.family == "exactone":
             # One launch: no stage runs (grid 0).  The main kernel's CTA
             # prologue derives this CTA's sequence table from the seq_idx
@@ -4695,6 +4870,11 @@ class CakeSSDCombined:
             ),
             "preprocess_status": preprocess_status,
         }
+        if check_form:
+            # The batched geometry of the [1, T] view (batch 1, seqlen T, one
+            # sequence); the check CTA reads the caller's triple in this form.
+            main_values["mode_varlen"] = 0
+            main_values["metadata_from_cu_seqlens"] = check_form
         if program.family in ("chunkpar", "chunkpar3"):
             # Neither chunk-parallel signature (``_MAIN_ARGS_CHUNKPAR``,
             # ``_MAIN_ARGS_CHUNKPAR3``) has a fused input: bind exactly the
