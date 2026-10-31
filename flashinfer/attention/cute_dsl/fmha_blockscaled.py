@@ -165,6 +165,7 @@ def cute_dsl_fmha_blockscaled_prefill(
     scale_o: float | torch.Tensor = 1.0,
     skip_softmax_threshold_scale_factor: Optional[float] = None,
     enable_pdl: bool = False,
+    p_exp_mode: str = "exp2",
 ) -> None:
     """Batched (non-varlen) block-scaled prefill via the trtllm kernel.
 
@@ -173,6 +174,11 @@ def cute_dsl_fmha_blockscaled_prefill(
     - k (b, s_k, H_k, D), k_sf (quantized block-scaled format)
     - v/o: (b, s, H, D_v)
 
+    ``p_exp_mode="expcast"`` opts into a direct approximate exponential-to-E4M3
+    mapping with fixed beta=-0.35. It requires E4M3 V and uses the generated
+    FP8 weights for both PV and the denominator (including approximate LSE).
+    Expcast variants are JIT-only; the default retains artifact-first loading.
+
     The per-tensor scales accept a Python float or a 0-d tensor (as returned by the
     quantizer); tensors are converted to floats here at the eager boundary.
     """
@@ -180,6 +186,10 @@ def cute_dsl_fmha_blockscaled_prefill(
         raise ValueError(
             f"qk_mode must be one of {tuple(_BLOCKSCALED_MODES)}, got {qk_mode!r}"
         )
+    if p_exp_mode not in ("exp2", "expcast"):
+        raise ValueError(f"Unsupported p_exp_mode: {p_exp_mode!r}")
+    if p_exp_mode == "expcast" and v.dtype != torch.float8_e4m3fn:
+        raise ValueError("expcast requires E4M3 PV")
     batch_size, s_q, H_q, D = q.shape
     _, s_k, H_k, _ = k.shape
     D_v = v.shape[-1]
@@ -192,30 +202,34 @@ def cute_dsl_fmha_blockscaled_prefill(
         skip_softmax_threshold_scale_factor is not None
         and skip_softmax_threshold_scale_factor > 0
     )
-    try:
-        if window_left != -1 or window_right != -1:
-            # The artifact name has no window axis, so only its traced
-            # no-window/causal-right-bound signatures are safe to load.
-            raise RuntimeError(
-                "windowed block-scaled DSL FMHA variants are not exported"
+    kernel_fn = None
+    if p_exp_mode == "exp2":
+        try:
+            if window_left != -1 or window_right != -1:
+                # The artifact name has no window axis, so only its traced
+                # no-window/causal-right-bound signatures are safe to load.
+                raise RuntimeError(
+                    "windowed block-scaled DSL FMHA variants are not exported"
+                )
+            kernel_fn = get_cute_dsl_fmha_blockscaled_kernel(
+                _get_gpu_arch(q.device),
+                qk_mode,
+                v.dtype,
+                o.dtype,
+                D,
+                is_causal,
+                is_persistent=False,
+                enable_tvm_ffi=True,
+                with_lse=lse is not None,
+                enable_skip_softmax=use_skip_softmax,
+                use_pdl=enable_pdl,
             )
-        kernel_fn = get_cute_dsl_fmha_blockscaled_kernel(
-            _get_gpu_arch(q.device),
-            qk_mode,
-            v.dtype,
-            o.dtype,
-            D,
-            is_causal,
-            is_persistent=False,
-            enable_tvm_ffi=True,
-            with_lse=lse is not None,
-            enable_skip_softmax=use_skip_softmax,
-            use_pdl=enable_pdl,
-        )
-    except (RuntimeError, FileNotFoundError) as e:
-        logger.info(
-            f"Block-scaled DSL FMHA cubin unavailable ({e}); JIT-compiling the kernel."
-        )
+        except (RuntimeError, FileNotFoundError) as e:
+            logger.info(
+                f"Block-scaled DSL FMHA cubin unavailable ({e}); JIT-compiling the kernel."
+            )
+            kernel_fn = None
+    if kernel_fn is None:
         kernel_fn = compile_cute_dsl_fmha_blockscaled_kernel(
             qk_mode,
             v.dtype,
@@ -228,6 +242,7 @@ def cute_dsl_fmha_blockscaled_prefill(
             use_skip_softmax,
             enable_pdl,
             q.device,
+            p_exp_mode=p_exp_mode,
             has_window_left=window_left != -1,
             has_window_right=is_causal or window_right != -1,
         )
