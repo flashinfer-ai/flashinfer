@@ -26,15 +26,21 @@ nudged off a multiple of 64).  Per row and mode:
 * ``fwd``, ``bwd`` and ``step`` (``fwd + bwd``): the explicit calls with caller-owned outputs and workspaces;
 * ``ckpt``: ``torch.utils.checkpoint(..., use_reentrant=False)`` around the autograd entry, then its backward (two
   forwards and one backward, the autograd overhead included);
-* ``gpu_us``: the median GPU time of the phase's kernels (CUPTI activity, cold L2;
-  ``flashinfer.testing.bench_gpu_time(enable_cupti=True)``);
+* ``gpu_us``: the GPU time of the phase, cold L2.  ``fwd`` / ``bwd`` / ``step``: the span of the phase's kernels
+  (CUPTI activity; ``flashinfer.testing.bench_gpu_time(enable_cupti=True)``).  ``ckpt``: the autograd host time
+  exceeds its kernels' time, so a CUPTI span measures host gaps; instead the whole step is enqueued behind a spin
+  kernel (the host finishes enqueuing before the GPU starts the step) and timed with CUDA events around it
+  (``ckpt_ahead_late`` counts the samples whose enqueue outlasted the spin; 0 expected);
 * ``wall_us``: the median host wall time of one synchronized call (``perf_counter`` between two device
   synchronizations, warm L2) and ``host_us``: the median time to enqueue it (the call's return, no synchronization);
 * ``peak_temp_bytes`` / ``retained_bytes``: the allocator's peak above the bytes held before the call and the bytes
   still held after it, on the first call with the package's own workspaces (no caller workspace; caches cleared)
   and on a steady-state call; plus the public backward workspace size of each mode.
 
-``speedup`` is ``det / nondet`` of each timing (above 1: the non-deterministic mode is faster).  A sanity check per
+The timings interleave the modes: ``--rounds`` rounds, each timing every phase of both modes (det first in even
+rounds, nondet first in odd ones).  Each value is the median over the rounds of the round's median, with its
+``[min, max]`` over the rounds (``*_us_range``).  ``speedup`` is ``det / nondet`` of the medians (above 1: the
+non-deterministic mode is faster), ``speedup_range`` the ``[min, max]`` of the per-round ratios.  A sanity check per
 row (not a gate) records whether ``dx`` is bitwise equal between the modes and the largest relative ``dweight``
 difference.  The route is chosen as in the deterministic benchmark (``--weight-dtype``, ``--bias``,
 ``--silu-grad-preactivation``); ``--side-kernel`` adds the backward's wall latency beside a kernel resident on another
@@ -79,8 +85,14 @@ SEED = 0
 DTYPES = {"float32": torch.float32, "bfloat16": torch.bfloat16}
 MODES = {"det": True, "nondet": False}
 PHASES = ("fwd", "bwd", "step", "ckpt")
+KINDS = ("gpu", "wall", "host")
+ROUNDS = 7
 WALL_WARMUPS = 3
 WALL_SAMPLES = 20
+AHEAD_WARMUPS = 2
+AHEAD_SAMPLES = 10
+AHEAD_MIN_MS = 2.0  # the spin kernel ahead of a ckpt sample lasts at least this long ...
+AHEAD_ENQUEUE_FACTOR = 3.0  # ... and this many times the longest enqueue seen while warming up
 SIDE_KERNEL_CYCLES = 10_000_000
 SIDE_KERNEL_WARMUPS = 3
 SIDE_KERNEL_SAMPLES = 7
@@ -157,6 +169,52 @@ def _host_ms(fn: Callable[[], object], device: torch.device) -> tuple[float, flo
             hosts.append((t1 - t0) * 1e3)
             walls.append((t2 - t0) * 1e3)
     return _median(walls), _median(hosts)
+
+
+class _GpuAhead:
+    """GPU time (ms) of a call whose host enqueue outlasts its kernels: an L2 flush, then a spin kernel long enough
+    for the host to enqueue the whole call behind it, then CUDA events around the call (no host gap enters)."""
+
+    def __init__(self, device: torch.device) -> None:
+        self.device = device
+        l2_bytes = torch.cuda.get_device_properties(device).L2_cache_size
+        self.flush = torch.empty(2 * l2_bytes, dtype=torch.int8, device=device)
+        self.start = torch.cuda.Event(enable_timing=True)
+        self.end = torch.cuda.Event(enable_timing=True)
+        probe = 1_000_000
+        spins = []
+        for _ in range(3):
+            torch.cuda.synchronize(device)
+            self.start.record()
+            torch.cuda._sleep(probe)
+            self.end.record()
+            torch.cuda.synchronize(device)
+            spins.append(self.start.elapsed_time(self.end))
+        self.cycles_per_ms = probe / _median(spins)
+
+    def _sample(self, fn: Callable[[], object], spin_ms: float) -> tuple[float, float]:
+        torch.cuda.synchronize(self.device)
+        self.flush.zero_()
+        torch.cuda._sleep(int(spin_ms * self.cycles_per_ms))
+        self.start.record()
+        t0 = time.perf_counter()
+        fn()
+        enqueue_ms = (time.perf_counter() - t0) * 1e3
+        self.end.record()
+        torch.cuda.synchronize(self.device)
+        return self.start.elapsed_time(self.end), enqueue_ms
+
+    def __call__(self, fn: Callable[[], object]) -> tuple[float, int]:
+        """``(median_ms, late)``: ``late`` counts the samples whose enqueue outlasted the spin."""
+
+        enqueues = [self._sample(fn, AHEAD_MIN_MS)[1] for _ in range(AHEAD_WARMUPS)]
+        spin_ms = max(AHEAD_MIN_MS, AHEAD_ENQUEUE_FACTOR * max(enqueues))
+        times, late = [], 0
+        for _ in range(AHEAD_SAMPLES):
+            elapsed, enqueue_ms = self._sample(fn, spin_ms)
+            times.append(elapsed)
+            late += enqueue_ms >= spin_ms
+        return _median(times), late
 
 
 def _clear_package_caches() -> None:
@@ -316,7 +374,14 @@ def _calls(p: Problem, route: Route, deterministic: bool, *, own_workspace: bool
 
 
 def bench_row(
-    tokens: int, channels: int, *, route: Route, device: torch.device, side_kernel: bool
+    tokens: int,
+    channels: int,
+    *,
+    route: Route,
+    device: torch.device,
+    side_kernel: bool,
+    rounds: int,
+    ahead: _GpuAhead,
 ) -> dict:
     p = Problem(tokens, channels, route, device)
     arch = loader.arch_for_capability(torch.cuda.get_device_capability(device))
@@ -328,15 +393,18 @@ def bench_row(
             arch, route.backward_route(), C=channels, S=tokens
         )[0],
         **route.describe(),
+        "rounds": rounds,
         "modes": {},
     }
-    grads = {}
+    entries: dict[str, dict] = {}
+    timed: dict[str, dict] = {}
     for mode, deterministic in MODES.items():
         entry: dict = {
             "backward_workspace_bytes": conv.cake_causal_conv1d_train_backward_workspace_bytes(
                 tokens, channels, device, deterministic=deterministic
             )
         }
+        entries[mode] = entry
         try:
             # Memory: the package's own workspaces, first call after clearing the caches, then a steady-state call.
             _clear_package_caches()
@@ -350,13 +418,54 @@ def bench_row(
             for phase in PHASES:
                 calls[phase]()
             torch.cuda.synchronize(device)
-            for phase in PHASES:
-                entry[f"{phase}_gpu_us"] = _gpu_ms(calls[phase]) * 1e3
-                wall, host = _host_ms(calls[phase], device)
-                entry[f"{phase}_wall_us"], entry[f"{phase}_host_us"] = (
-                    wall * 1e3,
-                    host * 1e3,
-                )
+            timed[mode] = calls
+            entry["ckpt_ahead_late"] = 0
+        except Exception as exc:  # keep the other mode's row
+            entry["error"] = repr(exc)[:300]
+    # Interleaved rounds: every phase of both modes per round, the first mode alternating.
+    samples = {
+        mode: {f"{phase}_{kind}": [] for phase in PHASES for kind in KINDS}
+        for mode in timed
+    }
+    order = list(timed)
+    for index in range(rounds):
+        for mode in order if index % 2 == 0 else order[::-1]:
+            if "error" in entries[mode]:
+                continue
+            calls = timed[mode]
+            try:
+                values = {}
+                for phase in PHASES:
+                    if phase == "ckpt":
+                        gpu, late = ahead(calls[phase])
+                        entries[mode]["ckpt_ahead_late"] += late
+                    else:
+                        gpu = _gpu_ms(calls[phase])
+                    wall, host = _host_ms(calls[phase], device)
+                    values.update(
+                        {
+                            f"{phase}_gpu": gpu * 1e3,
+                            f"{phase}_wall": wall * 1e3,
+                            f"{phase}_host": host * 1e3,
+                        }
+                    )
+            except Exception as exc:  # keep the other mode's row
+                entries[mode]["error"] = repr(exc)[:300]
+                continue
+            for key, value in values.items():
+                samples[mode][key].append(value)
+    for mode, per_key in samples.items():
+        if "error" in entries[mode]:
+            continue
+        for key, values in per_key.items():
+            entries[mode][f"{key}_us"] = _median(values)
+            entries[mode][f"{key}_us_range"] = [min(values), max(values)]
+    grads = {}
+    for mode, calls in timed.items():
+        entry = entries[mode]
+        if "error" in entry:
+            continue
+        try:
             if side_kernel:
                 alone, beside = _latency_beside(calls["bwd"], device)
                 entry["bwd_alone_us"], entry["bwd_beside_us"] = (
@@ -369,15 +478,21 @@ def bench_row(
             grads[mode] = tuple(t.clone() for t in out)
         except Exception as exc:  # keep the other mode's row
             entry["error"] = repr(exc)[:300]
-        result["modes"][mode] = entry
-        torch.cuda.empty_cache()
-    det, nondet = result["modes"]["det"], result["modes"]["nondet"]
-    result["speedup"] = {
-        f"{phase}_{kind}": det[f"{phase}_{kind}_us"] / nondet[f"{phase}_{kind}_us"]
+    result["modes"] = entries
+    det, nondet = entries["det"], entries["nondet"]
+    keys = [
+        f"{phase}_{kind}"
         for phase in PHASES
-        for kind in ("gpu", "wall", "host")
+        for kind in KINDS
         if f"{phase}_{kind}_us" in det and f"{phase}_{kind}_us" in nondet
-    }
+    ]
+    result["speedup"] = {key: det[f"{key}_us"] / nondet[f"{key}_us"] for key in keys}
+    result["speedup_range"] = {}
+    for key in keys:
+        ratios = [
+            d / n for d, n in zip(samples["det"][key], samples["nondet"][key], strict=True)
+        ]
+        result["speedup_range"][key] = [min(ratios), max(ratios)]
     if "det" in grads and "nondet" in grads:
         (dx_d, dw_d, *_), (dx_n, dw_n, *_) = grads["det"], grads["nondet"]
         result["check"] = {
@@ -400,11 +515,20 @@ def _format(result: dict) -> list[str]:
         cells = []
         for entry in (det, nondet):
             gpu, wall = entry.get(f"{phase}_gpu_us"), entry.get(f"{phase}_wall_us")
-            cells.append("-" if gpu is None else f"{gpu:9.2f} gpu {wall:9.2f} wall")
+            if gpu is None:
+                cells.append("-")
+                continue
+            lo, hi = entry[f"{phase}_gpu_us_range"]
+            cells.append(f"{gpu:9.2f} gpu [{lo:9.2f}, {hi:9.2f}] {wall:9.2f} wall")
         ratio = result["speedup"].get(f"{phase}_gpu")
+        spread = result.get("speedup_range", {}).get(f"{phase}_gpu")
         lines.append(
             f"{head} {phase:4s} | det {cells[0]} | nondet {cells[1]} | det/nondet gpu "
-            + ("-" if ratio is None else f"{ratio:5.3f}x")
+            + (
+                "-"
+                if ratio is None
+                else f"{ratio:5.3f}x [{spread[0]:5.3f}, {spread[1]:5.3f}]"
+            )
         )
     for mode, entry in (("det", det), ("nondet", nondet)):
         if "error" in entry:
@@ -465,6 +589,12 @@ def main(argv: Optional[list[str]] = None) -> int:
         action="store_true",
         help="also time the backward's wall latency alone and beside a 1-thread kernel on another stream",
     )
+    parser.add_argument(
+        "--rounds",
+        type=int,
+        default=ROUNDS,
+        help="interleaved det / nondet timing rounds (each value: the median over the rounds, with its range)",
+    )
     args = parser.parse_args(argv)  # fmt: skip
     route = Route(
         weight_dtype=DTYPES[args.weight_dtype],
@@ -501,12 +631,22 @@ def main(argv: Optional[list[str]] = None) -> int:
             for s in (args.tokens or [P2_TOKENS])
             for c in (args.channels or [P1_CHANNELS])
         ]
+    if args.rounds < 1:
+        raise SystemExit("--rounds must be at least 1")
+    ahead = _GpuAhead(device)
     results = []
     for tokens, channels in rows:
         result = bench_row(
-            tokens, channels, route=route, device=device, side_kernel=args.side_kernel
+            tokens,
+            channels,
+            route=route,
+            device=device,
+            side_kernel=args.side_kernel,
+            rounds=args.rounds,
+            ahead=ahead,
         )
         results.append(result)
+        torch.cuda.empty_cache()
         for line in _format(result):
             print(line, flush=True)
     if args.json:
