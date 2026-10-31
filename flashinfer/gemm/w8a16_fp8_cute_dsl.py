@@ -626,23 +626,15 @@ def _get_sm90_kernel(
     n: int,
     m: int,
     k: int,
-    c_cols: int,
+    tail_blocks: int,
     stream,
-    partial_output: bool = False,
+    has_tail: bool = False,
 ):
     import cutlass.cute as cute
 
     from .kernels.cute_dsl.w8a16_fp8_gemm_sm90 import Sm90W8A16Fp8GemmKernel
 
-    key = (
-        "sm90",
-        tile_algo,
-        act_dtype,
-        has_bias,
-        group,
-        num_persistent,
-        partial_output,
-    )
+    key = ("sm90", tile_algo, act_dtype, has_bias, group, num_persistent, has_tail)
     compiled = _KERNEL_CACHE.get(key)
     if compiled is not None:
         return compiled
@@ -650,7 +642,7 @@ def _get_sm90_kernel(
         _SM90_TILES[tile_algo],
         has_bias=has_bias,
         group_size=group,
-        partial_output=partial_output,
+        has_tail=has_tail,
     )
     compiled = cute.compile(
         kernel.wrapper,
@@ -658,7 +650,9 @@ def _get_sm90_kernel(
         n,
         m,
         k,
-        c_cols,
+        tail_blocks,
+        1,  # body_items: dynamic
+        1,  # tail_splits: dynamic
         num_persistent=num_persistent,
         stream=stream,
         options="--opt-level 2 --enable-tvm-ffi",
@@ -666,11 +660,81 @@ def _get_sm90_kernel(
     if os.environ.get("W8A16_DSL_VERBOSE") == "1":
         print(
             f"w8a16 dsl sm90 tile {_SM90_TILES[tile_algo]}: ab stages {kernel.ab_stage}, epi "
-            f"stages {kernel.epi_stage}, group {group}, partial {partial_output}",
+            f"stages {kernel.epi_stage}, group {group}, tail {has_tail}",
             flush=True,
         )
     _KERNEL_CACHE[key] = compiled
     return compiled
+
+
+def _get_sm90_tail_reduce(
+    act_dtype: torch.dtype,
+    has_bias: bool,
+    tile: Tuple[int, int],
+    pointers: Tuple,
+    stream,
+):
+    import cutlass.cute as cute
+
+    from .kernels.cute_dsl.w8a16_fp8_splitk_reduce import W8A16Sm90TailReduce
+
+    key = ("sm90-reduce", act_dtype, has_bias, tile)
+    compiled = _KERNEL_CACHE.get(key)
+    if compiled is not None:
+        return compiled
+    compiled = cute.compile(
+        W8A16Sm90TailReduce(has_bias, tile[0], tile[1]).wrapper,
+        *pointers,
+        1,
+        8,
+        1,
+        1,
+        1,
+        0,
+        1,
+        1,
+        stream=stream,
+        options="--opt-level 2 --enable-tvm-ffi",
+    )
+    _KERNEL_CACHE[key] = compiled
+    return compiled
+
+
+_SM90_TAIL_WORKSPACE_CAP = 64 << 20
+
+
+def sm90_tail_plan(
+    algo: int, m: int, n: int, k: int, num_sms: int
+) -> Tuple[int, int, int]:
+    """The work decomposition of a Hopper variant: (tile algo, body tiles, tail
+    splits).  Plain tiles: every tile whole.  Split-K codes: no body, every tile cut
+    into W8A16Sm90SplitsFor slices.  Stream-K codes: the whole waves plain and the
+    last partial wave cut into the slice count that best fills the SMs (fewest rounds
+    of the shortest slices under the workspace cap), or plain when CUTLASS's own
+    stream-K would run data-parallel (no tail, or a tail of at least half a wave)."""
+    tile_algo = _SM90_STREAMK_TILE.get(algo, _SM90_SPLITK_TILE.get(algo, algo))
+    tile_w, tile_a = _SM90_TILES[tile_algo]
+    tiles = _tiles(n, tile_w) * _tiles(m, tile_a)
+    k_tiles = k // _SM90_TILE_K
+    if algo in _SM90_SPLITK_TILE:
+        return tile_algo, 0, sm90_splits_for(algo, m, n, k, num_sms)
+    if algo not in _SM90_STREAMK_TILE:
+        return tile_algo, tiles, 1
+    full = tiles // num_sms
+    tail = tiles - full * num_sms
+    if tail == 0 or 2 * tail >= num_sms or k_tiles < 4:
+        return tile_algo, tiles, 1
+    block_bytes = tile_w * tile_a * 4
+    best_s, best_cost = 1, float(math.ceil(tail / num_sms))
+    for s in range(2, _SM90_MAX_SPLITS + 1):
+        if k_tiles // s < 2 or tail * s * block_bytes > _SM90_TAIL_WORKSPACE_CAP:
+            break
+        cost = math.ceil(tail * s / num_sms) / s
+        if cost < best_cost:
+            best_cost, best_s = cost, s
+    if best_s == 1:
+        return tile_algo, tiles, 1
+    return tile_algo, full * num_sms, best_s
 
 
 def _w8a16_fp8_gemm_sm90(
@@ -693,39 +757,36 @@ def _w8a16_fp8_gemm_sm90(
         algo = sm90_pick_algo(m, n, k, num_sms)
     if algo == 1 or algo > 11:
         raise ValueError(f"w8a16_fp8_gemm: unknown Hopper algo code {algo}")
-    splits = 1
-    partials = None
-    tile_algo = algo
-    if algo in _SM90_STREAMK_TILE:
-        tile_algo = _SM90_STREAMK_TILE[algo]  # stream-K not ported: the plain tile
-    elif algo in _SM90_SPLITK_TILE:
-        splits = sm90_splits_for(algo, m, n, k, num_sms)
-        if splits < 2:
-            raise ValueError(
-                f"w8a16_fp8_gemm split-K cannot slice K={k}: K must be a multiple of 64 "
-                "with at least 8 k-tiles per slice"
-            )
-        tile_algo = _SM90_SPLITK_TILE[algo]
-    tile_w, tile_a = _SM90_TILES[tile_algo]
-    if splits > 1 and k % (splits * _SM90_TILE_K) != 0:
+    if algo in _SM90_SPLITK_TILE and k % _SM90_TILE_K != 0:
+        raise ValueError("w8a16_fp8_gemm split-K: K must be a multiple of 64")
+    tile_algo, body_items, tail_splits = sm90_tail_plan(algo, m, n, k, num_sms)
+    if algo in _SM90_SPLITK_TILE and tail_splits < 2:
         raise ValueError(
-            "w8a16_fp8_gemm split-K: K must split into whole 64-wide k-tiles"
+            f"w8a16_fp8_gemm split-K cannot slice K={k}: K must be a multiple of 64 "
+            "with at least 8 k-tiles per slice"
         )
-    # Split-K partials: [splits, m_padded, n] fp32 with m_padded a whole number of
-    # activation tiles, so a slice's last tile never writes into the next slice.
-    m_padded = _tiles(m, tile_a) * tile_a
-    if splits > 1:
-        partials = torch.empty(
-            (splits, m_padded, n), dtype=torch.float32, device=act.device
+    tile_w, tile_a = _SM90_TILES[tile_algo]
+    tiles = _tiles(n, tile_w) * _tiles(m, tile_a)
+    tail_tiles = tiles - body_items
+    has_tail = tail_tiles > 0 and tail_splits > 1
+    if not has_tail:
+        body_items, tail_splits, tail_tiles = tiles, 1, 0
+    tail_blocks = tail_tiles * tail_splits
+    # One fp32 (tile_w x tile_a) block per tail work item.
+    workspace = (
+        torch.empty(
+            (max(tail_blocks, 1), tile_a, tile_w),
+            dtype=torch.float32,
+            device=act.device,
         )
-    c_cols = splits * m_padded if partials is not None else m
+        if has_tail
+        else weight_scale
+    )
     group = sm90_pick_group(m, n, k, tile_w)
     has_bias = bias is not None
     act_ctype = cutlass.BFloat16 if act.dtype == torch.bfloat16 else cutlass.Float16
     bias_tensor = bias if has_bias else weight_scale  # any valid pointer when unused
     bias_ctype = act_ctype if has_bias else cutlass.Float32
-    gemm_out = partials if partials is not None else out
-    gemm_out_ctype = cutlass.Float32 if partials is not None else act_ctype
     pointers = (
         make_ptr(
             cutlass.Float8E4M3FN, weight.data_ptr(), cute_gmem(), assumed_align=16
@@ -735,7 +796,8 @@ def _w8a16_fp8_gemm_sm90(
             cutlass.Float32, weight_scale.data_ptr(), cute_gmem(), assumed_align=4
         ),
         make_ptr(bias_ctype, bias_tensor.data_ptr(), cute_gmem(), assumed_align=4),
-        make_ptr(gemm_out_ctype, gemm_out.data_ptr(), cute_gmem(), assumed_align=16),
+        make_ptr(act_ctype, out.data_ptr(), cute_gmem(), assumed_align=16),
+        make_ptr(cutlass.Float32, workspace.data_ptr(), cute_gmem(), assumed_align=16),
     )
     stream = current_cuda_stream()
     compiled = _get_sm90_kernel(
@@ -748,26 +810,29 @@ def _w8a16_fp8_gemm_sm90(
         n,
         m,
         k,
-        c_cols,
+        max(tail_blocks, 1),
         stream,
-        partial_output=partials is not None,
+        has_tail=has_tail,
     )
     compiled(
         weight.data_ptr(),
         act.data_ptr(),
         weight_scale.data_ptr(),
         bias_tensor.data_ptr(),
-        gemm_out.data_ptr(),
+        out.data_ptr(),
+        workspace.data_ptr(),
         n,
         m,
         k,
-        c_cols,
+        max(tail_blocks, 1),
+        body_items,
+        tail_splits,
         stream,
     )
-    if partials is not None:
+    if has_tail:
         reduce_pointers = (
             make_ptr(
-                cutlass.Float32, partials.data_ptr(), cute_gmem(), assumed_align=16
+                cutlass.Float32, workspace.data_ptr(), cute_gmem(), assumed_align=16
             ),
             make_ptr(
                 cutlass.Float32, weight_scale.data_ptr(), cute_gmem(), assumed_align=4
@@ -775,17 +840,22 @@ def _w8a16_fp8_gemm_sm90(
             make_ptr(bias_ctype, bias_tensor.data_ptr(), cute_gmem(), assumed_align=16),
             make_ptr(act_ctype, out.data_ptr(), cute_gmem(), assumed_align=16),
         )
-        reduce = _get_reduce_kernel(
-            act.dtype, has_bias, splits, reduce_pointers, stream
+        reduce = _get_sm90_tail_reduce(
+            act.dtype, has_bias, (tile_w, tile_a), reduce_pointers, stream
         )
         reduce(
-            partials.data_ptr(),
+            workspace.data_ptr(),
             weight_scale.data_ptr(),
             bias_tensor.data_ptr(),
             out.data_ptr(),
             m,
             n,
-            m_padded * n // 8,
+            _tiles(n, tile_w),
+            _tiles(m, tile_a),
+            min(group, _tiles(m, tile_a)),
+            body_items,
+            tail_tiles,
+            tail_splits,
             stream,
         )
     return out
