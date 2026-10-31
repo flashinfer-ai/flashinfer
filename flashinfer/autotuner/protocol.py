@@ -60,11 +60,11 @@ class TuningContext:
 
     @property
     def execution_generation(self) -> int:
-        """Process-wide generation observed when this invocation was created.
+        """Process-store attachment/reload generation observed at invocation entry.
 
-        Unlike cache_identity, this does not change on rank-local cache clearing.
-        Collective protocols can keep serving an agreed configuration until the
-        next collective preparation point, without polling their peers.
+        Unrelated context entry/exit and rank-local cache clearing do not change
+        this generation. Collective protocols must coordinate process-wide store
+        changes and reloads across their participants before resuming execution.
         A transition during preparation remains visible to the next invocation.
         """
         return self._generation

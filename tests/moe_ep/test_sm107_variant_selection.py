@@ -354,6 +354,8 @@ def test_compute_releases_staged_tensors(protocol, monkeypatch, phase):
 def test_prepared_eager_execution_does_not_poll_cache_or_peers(
     protocol, monkeypatch, winner
 ):
+    from tests.moe_ep.sm107_test_utils import unrelated_autotune_contexts
+
     protocol, _ = protocol
     backend, owner = protocol.backend, protocol.owner
     state = owner._tuning_state
@@ -370,14 +372,21 @@ def test_prepared_eager_execution_does_not_poll_cache_or_peers(
         patch.setattr(selection, "_cache_identity", unexpected)
         # Rank-local invalidation is reconciled in an explicit context.
         AutoTuner.get().clear_cache()
-        for _ in range(3):
-            assert not backend.coordinate_workspace_replacement(owner)
-            backend.compute(owner, (None, None), output=None)
-            assert owner.tensors is None
+        with unrelated_autotune_contexts():
+            for _ in range(3):
+                assert not backend.coordinate_workspace_replacement(owner)
+                backend.compute(owner, (None, None), output=None)
+                assert owner.tensors is None
+        backend.compute(owner, (None, None), output=None)
     with autotune_v2(mode="replay", persistent_cache=False):
         assert not selection.prepared_for_serving(state, selection._context())
         assert selection._pending(state, selection._context())
-    # Even an empty context must invalidate bare execution preparation.
+    assert selection.prepared_for_serving(state, selection._context())
+    # An actual scoped forward requires reconciliation after leaving that scope.
+    owner.tensors = protocol.tensors
+    monkeypatch.setattr(AutoTuner.get(), "choose_with_protocol", Mock())
+    with autotune_v2(mode="replay", persistent_cache=False):
+        backend.compute(owner, (None, None), output=None)
     assert not selection.prepared_for_serving(state, selection._context())
 
 

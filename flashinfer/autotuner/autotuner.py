@@ -49,7 +49,6 @@ from flashinfer.autotuner.protocol import (
     TuningProtocol,
     _protocol_cache_key,
     _tuning_scope,
-    _advance_execution_generation,
 )
 
 # This version should be updated whenever the nvfp4_cutlass backend is changed,
@@ -1107,7 +1106,6 @@ def autotune(
         override_stack.append((new_buckets, new_round_up, new_profile_replays))
 
     scope_token = _tuning_scope.set(object())
-    _advance_execution_generation()
 
     # Reference-counted tuning mode: is_tuning_mode stays True as long as
     # at least one autotune(True) context is active, even if an
@@ -1123,7 +1121,6 @@ def autotune(
             logger.info("[Autotuner]: Autotuning process starts ...")
     except BaseException:
         _tuning_scope.reset(scope_token)
-        _advance_execution_generation()
         if pushed:
             override_stack.pop()
         if skip_ops is not None:
@@ -1134,7 +1131,6 @@ def autotune(
         yield
     finally:
         _tuning_scope.reset(scope_token)
-        _advance_execution_generation()
         with tuner._lock:
             if tune_mode:
                 tuner._active_tuning_contexts -= 1

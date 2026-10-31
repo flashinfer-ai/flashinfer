@@ -359,12 +359,15 @@ existing graphs; captured explicit handles require a new handle.
 
 Rubin automatic workspaces reuse their agreed configuration during ordinary
 eager execution, without selection collectives or cache lookups on each forward.
-The first forward after entering or leaving an autotune context reconciles the
-current cache and controls. This also covers a context that only attaches a store,
-including an attachment from another thread.
-Explicit tuning and replay contexts keep collective checks enabled. After
-`autotune_v2_reload()` on every EP rank, the next eager forward reconciles the
-reloaded records. A rank-local `AutoTuner.clear_cache()` alone does not change a
+Calling the layer inside an explicit tuning or replay context performs collective
+checks; the first bare forward afterward reconciles the ambient cache and controls.
+Unrelated contexts, including tuning on another thread, do not invalidate a
+prepared workspace. Use `cache_scope="context"` for rank-local cache contexts.
+Process-wide store changes and `autotune_v2_reload()` must be coordinated across
+EP ranks before serving resumes. When changing the attached store, call the layer
+in a replay or tuning context on every rank, including ranks already using that
+store. After a coordinated reload, the next eager forward reconciles the reloaded
+records. A rank-local `AutoTuner.clear_cache()` alone does not change a
 prepared workspace during bare serving; call the layer in a replay or tuning
 context on every rank to adopt the change. CUDA graph replay keeps its captured
 configuration and storage.

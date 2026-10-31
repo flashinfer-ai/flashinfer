@@ -543,6 +543,7 @@ def test_fixed_prepared_eager_execution_skips_collective_lookup(
 ):
     from flashinfer.moe_ep.backends.mega.kernel.sm107 import automatic
     from flashinfer.autotune_cache import autotune_v2_reload
+    from tests.moe_ep.sm107_test_utils import unrelated_autotune_contexts
 
     backend = SimpleNamespace(
         _kernel_config=SimpleNamespace(knobs="auto"),
@@ -567,13 +568,17 @@ def test_fixed_prepared_eager_execution_skips_collective_lookup(
         patch.setattr(torch.distributed, "all_gather_object", unexpected)
         patch.setattr(automatic, "needs_selection", unexpected)
         state.tuner.clear_cache()
-        for _ in range(3):
-            _stage_for_auto(workspace)
-            assert not automatic.coordinate_workspace_replacement(backend, workspace)
-            automatic.prepare_auto_configuration(
-                backend, workspace, (None, None), None, 4
-            )
-            assert workspace._tuning_inputs is None
+        with unrelated_autotune_contexts():
+            for _ in range(3):
+                _stage_for_auto(workspace)
+                assert not automatic.coordinate_workspace_replacement(
+                    backend, workspace
+                )
+                automatic.prepare_auto_configuration(
+                    backend, workspace, (None, None), None, 4
+                )
+                assert workspace._tuning_inputs is None
+        automatic.prepare_auto_configuration(backend, workspace, (None, None), None, 4)
     autotune_v2_reload()
     assert not automatic.prepared_for_serving(
         workspace._tuning_state, automatic.tuning_context()

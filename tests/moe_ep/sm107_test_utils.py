@@ -4,6 +4,11 @@ The reference evaluates activation and scaling math without the production
 weight transform. Quantization and unpacking helpers are shared with the shim.
 """
 
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager, nullcontext
+from tempfile import TemporaryDirectory
+from threading import Event
+
 import torch
 
 from flashinfer.moe_ep import PrequantizedMoEWeights
@@ -14,6 +19,35 @@ from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe import (
     scale_to_f32,
     unpack_fp4_to_f32,
 )
+
+
+@contextmanager
+def unrelated_autotune_contexts():
+    """Change local controls, then keep unrelated tuning active on another thread."""
+    from flashinfer import autotune, autotune_v2
+
+    with autotune(False):
+        pass
+    with autotune_v2(mode="replay", persistent_cache=False):
+        pass
+    entered, release = Event(), Event()
+
+    def tune_elsewhere(root):
+        with autotune_v2(cache_scope="context", cache_root=root):
+            entered.set()
+            if not release.wait(60):
+                raise TimeoutError("unrelated tuning test did not finish")
+
+    with TemporaryDirectory() as root, ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(tune_elsewhere, root)
+        try:
+            if not entered.wait(30):
+                future.result(timeout=0)
+                raise TimeoutError("unrelated tuning test did not enter its context")
+            yield
+        finally:
+            release.set()
+            future.result(timeout=30)
 
 
 def assert_prepared_eager_execution(
@@ -35,6 +69,16 @@ def assert_prepared_eager_execution(
         for _ in range(3):
             actual = layer.forward(tensors, workspace=workspace)
             assert_reference(actual, expected, kind)
+        # Only rank zero changes contexts. No peer may enter selector collectives.
+        with unrelated_autotune_contexts() if dist.get_rank() == 0 else nullcontext():
+            dist.barrier()
+            for _ in range(3):
+                actual = layer.forward(tensors, workspace=workspace)
+                assert_reference(actual, expected, kind)
+            dist.barrier()
+        dist.barrier()
+        actual = layer.forward(tensors, workspace=workspace)
+        assert_reference(actual, expected, kind)
 
 
 def quantize(tensor, kind, norm=1.0):

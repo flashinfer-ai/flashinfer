@@ -57,12 +57,11 @@ def tuning_identity(context: TuningContext) -> tuple:
 
 
 def prepared_for_serving(state: AutoTuningState, context: TuningContext) -> bool:
-    # Explicit contexts retain collective cache checks, including rank-local
-    # invalidation. Bare forwards reuse the last agreed workspace until a
-    # context transition or coordinated reload requires preparation again.
+    # Only a context used by this forward opts into collective preparation.
+    # Another thread's tuning flag must not send one rank into a collective.
     return (
         context.scope is None
-        and not context.tuning_enabled
+        and not context.force_tune
         and state.serving_generation == context.execution_generation
     )
 
@@ -73,7 +72,7 @@ def record_prepared(state: AutoTuningState, context: TuningContext) -> None:
     state.serving_generation = (
         context.execution_generation
         if context.scope is None
-        and not context.tuning_enabled
+        and not context.force_tune
         and not (torch.cuda.is_available() and torch.cuda.is_current_stream_capturing())
         else None
     )
