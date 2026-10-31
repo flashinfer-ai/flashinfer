@@ -1225,6 +1225,24 @@ def _decode_launch_spec_from_config(
     )
 
 
+def _runtime_split_kv_capacity(requested_splits: int, sm_count: int) -> int:
+    """Prepared GMEM split capacity for a runtime split-KV fanout.
+
+    Ranges 1, 2-4, 5-8, 9-16, 17-32, 33-64, then sixteen-split ranges above 64,
+    clipped to the SM count (see "Runtime split-KV policy" in README.md). Every
+    fanout in a range shares one compiled topology, and the capacity is at most
+    twice the fanout, so per-plan scratch no longer scales with the SM count.
+    """
+
+    if requested_splits <= 1:
+        return 1
+    if requested_splits <= 64:
+        capacity = max(4, 1 << (requested_splits - 1).bit_length())
+    else:
+        capacity = -(-requested_splits // 16) * 16
+    return min(capacity, sm_count)
+
+
 # Share CPU policy selection across equivalent plans/layers.
 @functools.cache
 def _resolve_decode_launch_spec(
@@ -1457,14 +1475,16 @@ def _resolve_decode_launch_spec(
     if cfg.use_split_kv and not use_q_token_kv_block_sparse_route:
         sm_count = get_device_sm_count(torch.device("cuda", device_index))
         requested_splits = min(requested_splits, sm_count)
-        # GMEM capacity is a device bound, independent of the runtime fanout.
+        # GMEM capacity is the prepared range of the runtime fanout, not the SM
+        # count: plans in one range share a compiled topology, and partial-O
+        # scratch stays proportional to the fanout the plan can request.
         # Keep Q/batch fusion within CUDA's grid-Z limit; larger grids retain
         # the original exact-fanout launch. Cluster sizes remain resident topology.
         compact_grid = batch_size * q_ctas(cfg) <= 65535
         capacity = (
             requested_splits
             if cfg.use_cluster_smem_reduction or not compact_grid
-            else sm_count
+            else _runtime_split_kv_capacity(requested_splits, sm_count)
         )
         cfg = replace(
             cfg,
@@ -1482,7 +1502,7 @@ def _resolve_decode_launch_spec(
         seq_len_q=seq_len_q,
         max_active_clusters=int(max_active_clusters),
     )
-    # Report the runtime fanout separately from the SM-bound workspace capacity.
+    # Report the runtime fanout separately from the prepared workspace capacity.
     policy = dict(resolved.policy)
     policy["splits_kv"] = requested_splits
     return replace(
