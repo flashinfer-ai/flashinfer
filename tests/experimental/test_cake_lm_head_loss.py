@@ -3373,12 +3373,24 @@ def test_binding_keys_cover_pointer_shape_stride_dtype_and_options():
         X, W, labels, lse, dlogp, chunk_size=4096, need_dx=True, need_dw=True
     )
     assert bwd[:2] == ("bwd", "logprob") and bwd != base
-    assert bwd != logprob_backward_binding_key(
+    # lse and dlogp are fresh tensors on every step: keyed by layout, not address (one binding serves every step)
+    assert bwd == logprob_backward_binding_key(
         X, W, labels, lse, dlogp.clone(), chunk_size=4096, need_dx=True, need_dw=True
     )
-    assert bwd != logprob_backward_binding_key(
+    assert bwd == logprob_backward_binding_key(
         X, W, labels, lse.clone(), dlogp, chunk_size=4096, need_dx=True, need_dw=True
     )
+    for other in (
+        torch.zeros(4),
+        torch.zeros(8, dtype=torch.float64),
+        torch.zeros(16)[::2],
+    ):
+        assert bwd != logprob_backward_binding_key(
+            X, W, labels, other, dlogp, chunk_size=4096, need_dx=True, need_dw=True
+        )  # shape, dtype, stride
+        assert bwd != logprob_backward_binding_key(
+            X, W, labels, lse, other, chunk_size=4096, need_dx=True, need_dw=True
+        )
     assert bwd != logprob_backward_binding_key(
         X, W, labels, lse, dlogp, chunk_size=4096, need_dx=True, need_dw=False
     )

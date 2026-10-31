@@ -4669,6 +4669,12 @@ def _meta(t: Optional[torch.Tensor]):
     )
 
 
+def _layout(t: Optional[torch.Tensor]):
+    """``(shape, stride, dtype)``: the key of a per-step operand whose address no plan reads (the remembered launches
+    re-bind it on every call)."""
+    return None if t is None else (tuple(t.shape), tuple(t.stride()), t.dtype)
+
+
 def forward_binding_key(
     X,
     W,
@@ -4740,15 +4746,18 @@ def logprob_backward_binding_key(
     logprob_dz=False,
 ) -> tuple:
     """Cache key of a log-probability backward binding (as :func:`forward_binding_key`); ``logprob_dz`` the resolved
-    recompute form (:func:`logprob_dz_default`)."""
+    recompute form (:func:`logprob_dz_default`).  ``lse`` and ``dlogp`` are keyed by layout alone (:func:`_layout`):
+    the forward's statistic and the incoming gradient are fresh tensors on every step, so their addresses would make
+    every step whose allocations moved a miss (a new runner, its allocations and validation), while the remembered
+    launches re-bind both per call."""
     return (
         "bwd",
         "logprob",
         _meta(X),
         _meta(W),
         _meta(labels),
-        _meta(lse),
-        _meta(dlogp),
+        _layout(lse),
+        _layout(dlogp),
         int(chunk_size),
         bool(need_dx),
         bool(need_dw),

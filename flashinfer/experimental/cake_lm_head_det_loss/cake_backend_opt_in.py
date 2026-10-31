@@ -96,6 +96,7 @@ from .cake_backend import (
     _hidden_count_arange,
     _hidden_count_cell,
     _hidden_count_memory,
+    _layout,
     _logprob_arm,
     _meta,
     _mm_fp32,
@@ -2065,15 +2066,16 @@ def logprob_backward_binding_key(
     logprob_dz=False,
 ) -> tuple:
     """Cache key of a log-probability backward binding (as :func:`forward_binding_key`); ``logprob_dz`` the resolved
-    recompute form (:func:`logprob_dz_default`).  A budget form appends its accumulated rows (:attr:`Plan.dw_rows`)."""
+    recompute form (:func:`logprob_dz_default`).  A budget form appends its accumulated rows (:attr:`Plan.dw_rows`).
+    ``lse`` and ``dlogp`` are keyed by layout alone (:func:`_layout`), as in :mod:`.cake_backend`."""
     return (
         "bwd",
         "logprob",
         _meta(X),
         _meta(W),
         _meta(labels),
-        _meta(lse),
-        _meta(dlogp),
+        _layout(lse),
+        _layout(dlogp),
         int(chunk_size),
         bool(need_dx),
         bool(need_dw),
