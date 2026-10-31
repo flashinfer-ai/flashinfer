@@ -15,7 +15,12 @@
  */
 
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
+#include <mutex>
+#include <string>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "flashinfer/trtllm/batched_gemm/KernelRunner.h"
@@ -36,6 +41,126 @@ using namespace batchedGemm::gemm;
 using namespace batchedGemm::trtllm::gen;
 
 static BatchedGemmInterface::ModuleCache globalTrtllmGenBatchedGemmModuleCache;
+// Serialises the loads below, their inserts into the cache above, and the dispatch that reads it.
+// The cache is shared rather than per thread so that a short-lived host thread does not load a
+// module it can never unload: the handles live for the process, as before this change.
+static std::mutex globalTrtllmGenBatchedGemmModuleMutex;
+
+namespace {
+
+/**
+ * Key prefix of the current CUDA context: the raw context id bytes, exactly as
+ * BatchedGemmInterface::run() builds its module-cache key. Modules are per context, so a load
+ * in one context never stands in for another.
+ *
+ * @param key Receives the context id bytes on success.
+ * @param failedCall Receives the name of the driver call that failed.
+ * @return CUDA_SUCCESS, or the CUresult of the failed driver call.
+ */
+CUresult currentContextKey(std::string* key, std::string* failedCall) {
+  CUcontext ctx = nullptr;
+  CUresult res = cuCtxGetCurrent(&ctx);
+  if (res == CUDA_SUCCESS && ctx == nullptr) {
+    cudaFree(nullptr);
+    res = cuCtxGetCurrent(&ctx);
+  }
+  if (res != CUDA_SUCCESS || ctx == nullptr) {
+    *failedCall = "cuCtxGetCurrent";
+    return res == CUDA_SUCCESS ? CUDA_ERROR_INVALID_CONTEXT : res;
+  }
+  unsigned long long ctxId = 0;
+  res = cuCtxGetId(ctx, &ctxId);
+  if (res != CUDA_SUCCESS) {
+    *failedCall = "cuCtxGetId";
+    return res;
+  }
+  *key = std::string(reinterpret_cast<char*>(&ctxId), sizeof(ctxId));
+  return CUDA_SUCCESS;
+}
+
+/**
+ * Loads the cubin of `config` into `cache` with checked CUresults, so that
+ * BatchedGemmInterface::run() finds the module in the cache and never reaches its own
+ * unchecked cuModuleLoadData / cuModuleGetFunction (GitHub #5322). An empty cubin, which the
+ * Python loader hands back after a failed download or checksum, fails here with the driver's
+ * CUresult like a cubin the driver rejects.
+ *
+ * @param config The batched-GEMM config whose cubin and kernel are loaded.
+ * @param cache The module cache shared with BatchedGemmInterface::run().
+ * @param failedCall Receives the name of the driver call that failed.
+ * @return CUDA_SUCCESS when the module is in the cache, else the failing CUresult.
+ */
+CUresult preloadModule(BatchedGemmConfig const& config, BatchedGemmInterface::ModuleCache& cache,
+                       std::string* failedCall) {
+  std::string ctxKey;
+  CUresult res = currentContextKey(&ctxKey, failedCall);
+  if (res != CUDA_SUCCESS) {
+    return res;
+  }
+  std::string const key = ctxKey + std::string(config.mFunctionName);
+  if (cache.find(key) != cache.end()) {
+    return CUDA_SUCCESS;
+  }
+  CUmodule module = nullptr;
+  CUfunction function = nullptr;
+  res = loadCubinData(&module, config);
+  if (res != CUDA_SUCCESS) {
+    *failedCall = "cuModuleLoadData";
+    return res;
+  }
+  res = cuModuleGetFunction(&function, module, config.mFunctionName);
+  if (res != CUDA_SUCCESS) {
+    *failedCall = "cuModuleGetFunction";
+    cuModuleUnload(module);
+    return res;
+  }
+  cache.emplace(key, std::make_tuple(module, function));
+  return CUDA_SUCCESS;
+}
+
+/**
+ * Whether the cubin of `config` loads on this driver, remembered per CUDA context so a cubin that
+ * does not load is tried once rather than on every call. A load is tried twice before a cubin
+ * counts as unloadable: on the Windows arm64 drivers of GitHub #5322 some two-CTA kernels fail
+ * once and load on the second attempt. An out-of-memory result is not remembered, since it can
+ * clear. A cubin that does not load is reported once on stderr. A successful load stays in the
+ * module cache for run().
+ *
+ * @param config The batched-GEMM config to load.
+ * @return true when the cubin loads, false when it does not.
+ */
+bool cubinLoads(BatchedGemmConfig const& config) {
+  static std::unordered_map<std::string, bool> probed;
+  static std::unordered_set<std::string> reported;
+  std::lock_guard<std::mutex> lock(globalTrtllmGenBatchedGemmModuleMutex);
+  std::string failedCall;
+  std::string ctxKey;
+  CUresult res = currentContextKey(&ctxKey, &failedCall);
+  FLASHINFER_CHECK(res == CUDA_SUCCESS, failedCall, " returned CUresult ", static_cast<int>(res),
+                   " while loading trtllm-gen cubin ", config.mFunctionName);
+  std::string const name = ctxKey + std::string(config.mFunctionName);
+  auto const it = probed.find(name);
+  if (it != probed.end()) {
+    return it->second;
+  }
+  res = preloadModule(config, globalTrtllmGenBatchedGemmModuleCache, &failedCall);
+  if (res != CUDA_SUCCESS) {
+    res = preloadModule(config, globalTrtllmGenBatchedGemmModuleCache, &failedCall);
+  }
+  bool const ok = res == CUDA_SUCCESS;
+  if (!ok && reported.insert(name).second) {
+    std::fprintf(stderr,
+                 "[FlashInfer] trtllm-gen cubin %s does not load on this driver (%s returned "
+                 "CUresult %d); skipping it (GitHub #5322)\n",
+                 config.mFunctionName, failedCall.c_str(), static_cast<int>(res));
+  }
+  if (ok || res != CUDA_ERROR_OUT_OF_MEMORY) {
+    probed.emplace(name, ok);
+  }
+  return ok;
+}
+
+}  // namespace
 
 namespace {
 
@@ -414,6 +539,19 @@ void TrtllmGenBatchedGemmRunner::run(
   // FIXME once we start using all-reduce in the epilogue of the bmm this can be moved elsewhere
   bmm.runInitBeforeWorldSync(config, gemmData, static_cast<void*>(stream));
 
+  // Load the kernel with checked CUresults before the launch: the export header's run() ignores
+  // the results of its own cuModuleLoadData / cuModuleGetFunction and would launch an
+  // uninitialised handle (GitHub #5322). The lock stays held across bmm.run(): the header reads
+  // the module cache during dispatch, and a load on another thread could rehash the map
+  // underneath it. The launch itself is asynchronous, so the critical section is short.
+  std::lock_guard<std::mutex> lock(globalTrtllmGenBatchedGemmModuleMutex);
+  std::string failedCall;
+  CUresult const loadRes =
+      preloadModule(config, globalTrtllmGenBatchedGemmModuleCache, &failedCall);
+  FLASHINFER_CHECK(loadRes == CUDA_SUCCESS, failedCall, " returned CUresult ",
+                   static_cast<int>(loadRes), " for trtllm-gen cubin ", config.mFunctionName,
+                   " (numBatches: ", numBatches, ", GemmMNK: ", m, " ", n, " ", k, ")");
+
   auto const err =
       bmm.run(config, workspace, gemmData, static_cast<void*>(stream), multiProcessorCount,
               enable_pdl, /*pinnedHostBuffer=*/nullptr, globalTrtllmGenBatchedGemmModuleCache);
@@ -614,7 +752,22 @@ int64_t TrtllmGenBatchedGemmRunner::getDefaultValidConfigIndex(
   auto const validConfigIndices =
       getValidConfigIndices(m, n, k, batchedTokens, numTokens, numBatches, maxNumCtasInBatchDim);
 
-  return validConfigIndices[0];
+  // The default is the first config in priority order whose cubin loads on this driver. Where
+  // every cubin loads that is the first entry, and the load is the one run() needs anyway. The
+  // autotuner needs no such filter: run() raises for a tactic whose cubin does not load and the
+  // tuner skips that tactic.
+  auto const bmm = BatchedGemmInterface();
+  auto const configs = bmm.getBatchedGemmConfigs();
+  for (auto const& configIndex : validConfigIndices) {
+    if (cubinLoads(configs[configIndex])) {
+      return configIndex;
+    }
+  }
+  throw NoLoadableKernelError(
+      __FUNCTION__, __FILE__, __LINE__,
+      "All " + std::to_string(validConfigIndices.size()) +
+          " configs valid for this problem shape have cubins that do not load on this driver "
+          "(GitHub #5322)");
 }
 
 bool TrtllmGenBatchedGemmRunner::isValidConfigIndex(int32_t configIndex, int32_t m, int32_t n,

@@ -21,6 +21,7 @@
 #include <cstdint>
 #include <vector>
 
+#include "flashinfer/exception.h"
 #include "flashinfer/trtllm/batched_gemm/trtllmGen_bmm_export/Enums.h"
 #include "flashinfer/trtllm/batched_gemm/trtllmGen_bmm_export/GemmGatedActOptions.h"
 #include "flashinfer/trtllm/batched_gemm/trtllmGen_bmm_export/GemmOptions.h"
@@ -28,6 +29,15 @@
 
 namespace tensorrt_llm {
 namespace kernels {
+
+// Thrown by TrtllmGenBatchedGemmRunner::getDefaultValidConfigIndex when configs exist for the
+// problem shape but none of their cubins loads on this driver (GitHub #5322). A caller that can
+// serve the problem another way, such as the MoE launcher's tile fallback, catches this type;
+// every other failure of the runner is a plain flashinfer::Error.
+class NoLoadableKernelError : public flashinfer::Error {
+ public:
+  using flashinfer::Error::Error;
+};
 
 // Keep this in sync with the ActType in
 // cpp/tensorrt_llm/kernels/trtllmGenKernels/batchedGemm/trtllmGen_bmm_export/GemmGatedActOptions.h
