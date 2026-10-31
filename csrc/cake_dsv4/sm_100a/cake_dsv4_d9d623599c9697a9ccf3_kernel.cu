@@ -358,7 +358,7 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
 extern "C" {
 
 __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS) void
-kernel_cake_dsv4_430c388f48f1e672627c(const __grid_constant__ CUtensorMap tmap_q, const __grid_constant__ CUtensorMap tmap_swa_kv, const __grid_constant__ CUtensorMap tmap_compressed_kv, __nv_bfloat16* __restrict__ O, float* __restrict__ partial_lse, int* __restrict__ swa_indices, int* __restrict__ compressed_indices, int* __restrict__ sparse_topk_lens, float* __restrict__ sinks, float* __restrict__ bmm1_scale, float* __restrict__ bmm2_scale, int num_heads, int swa_index_stride, int compressed_index_stride, int sparse_topk_lens_offset, int num_query_tokens, int sparse_topk, int has_sinks, int total_work_items, int* __restrict__ seq_lens, int* __restrict__ cum_seq_lens_q, int ragged_query, int max_q_len, int batch_size)
+kernel_cake_dsv4_d9d623599c9697a9ccf3(const __grid_constant__ CUtensorMap tmap_q, const __grid_constant__ CUtensorMap tmap_swa_kv, const __grid_constant__ CUtensorMap tmap_compressed_kv, __nv_bfloat16* __restrict__ O, float* __restrict__ partial_lse, int* __restrict__ swa_indices, int* __restrict__ compressed_indices, int* __restrict__ sparse_topk_lens, float* __restrict__ sinks, float* __restrict__ bmm1_scale, float* __restrict__ bmm2_scale, int num_heads, int swa_index_stride, int compressed_index_stride, int sparse_topk_lens_offset, int num_query_tokens, int sparse_topk, int has_sinks, int total_work_items, int* __restrict__ seq_lens, int* __restrict__ cum_seq_lens_q, int ragged_query, int max_q_len, int batch_size)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -906,261 +906,116 @@ kernel_cake_dsv4_430c388f48f1e672627c(const __grid_constant__ CUtensorMap tmap_q
                         invalid_cols[w] = _warp_vote_1;
                         any_invalid = any_invalid | invalid_cols[w];
                     }
-                    float sv[32];
-                    float sv_red0;
-                    #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 1000)
-                    #error "TmemLoadRed requires tcgen05.ld.red support (sm_103/sm_101-sm_110 family), not sm_100"
-                    #endif
+                    float _tmem_load_0[32];
                     asm volatile(
-                        "tcgen05.ld.red.sync.aligned.32x32b.x32.max.f32"
-                        " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, %32, [%33];"
-                        : "=f"(sv[0]), "=f"(sv[1]), "=f"(sv[2]), "=f"(sv[3]), "=f"(sv[4]), "=f"(sv[5]), "=f"(sv[6]), "=f"(sv[7]), "=f"(sv[8]), "=f"(sv[9]), "=f"(sv[10]), "=f"(sv[11]), "=f"(sv[12]), "=f"(sv[13]), "=f"(sv[14]), "=f"(sv[15]), "=f"(sv[16]), "=f"(sv[17]), "=f"(sv[18]), "=f"(sv[19]), "=f"(sv[20]), "=f"(sv[21]), "=f"(sv[22]), "=f"(sv[23]), "=f"(sv[24]), "=f"(sv[25]), "=f"(sv[26]), "=f"(sv[27]), "=f"(sv[28]), "=f"(sv[29]), "=f"(sv[30]), "=f"(sv[31]), "=f"(sv_red0)
+                        "tcgen05.ld.sync.aligned.32x32b.x32.b32"
+                        " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
+                        : "=f"(_tmem_load_0[0]), "=f"(_tmem_load_0[1]), "=f"(_tmem_load_0[2]), "=f"(_tmem_load_0[3]), "=f"(_tmem_load_0[4]), "=f"(_tmem_load_0[5]), "=f"(_tmem_load_0[6]), "=f"(_tmem_load_0[7]), "=f"(_tmem_load_0[8]), "=f"(_tmem_load_0[9]), "=f"(_tmem_load_0[10]), "=f"(_tmem_load_0[11]), "=f"(_tmem_load_0[12]), "=f"(_tmem_load_0[13]), "=f"(_tmem_load_0[14]), "=f"(_tmem_load_0[15]), "=f"(_tmem_load_0[16]), "=f"(_tmem_load_0[17]), "=f"(_tmem_load_0[18]), "=f"(_tmem_load_0[19]), "=f"(_tmem_load_0[20]), "=f"(_tmem_load_0[21]), "=f"(_tmem_load_0[22]), "=f"(_tmem_load_0[23]), "=f"(_tmem_load_0[24]), "=f"(_tmem_load_0[25]), "=f"(_tmem_load_0[26]), "=f"(_tmem_load_0[27]), "=f"(_tmem_load_0[28]), "=f"(_tmem_load_0[29]), "=f"(_tmem_load_0[30]), "=f"(_tmem_load_0[31])
                         : "r"(s_base));
-                    float sv_f1[32];
-                    float sv_red1;
-                    #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 1000)
-                    #error "TmemLoadRed requires tcgen05.ld.red support (sm_103/sm_101-sm_110 family), not sm_100"
-                    #endif
+                    float _tmem_load_1[4];
+                    tmem_ld_x4(&_tmem_load_1[0], s_base);
+                    float _tmem_load_2[32];
                     asm volatile(
-                        "tcgen05.ld.red.sync.aligned.32x32b.x32.max.f32"
-                        " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, %32, [%33];"
-                        : "=f"(sv_f1[0]), "=f"(sv_f1[1]), "=f"(sv_f1[2]), "=f"(sv_f1[3]), "=f"(sv_f1[4]), "=f"(sv_f1[5]), "=f"(sv_f1[6]), "=f"(sv_f1[7]), "=f"(sv_f1[8]), "=f"(sv_f1[9]), "=f"(sv_f1[10]), "=f"(sv_f1[11]), "=f"(sv_f1[12]), "=f"(sv_f1[13]), "=f"(sv_f1[14]), "=f"(sv_f1[15]), "=f"(sv_f1[16]), "=f"(sv_f1[17]), "=f"(sv_f1[18]), "=f"(sv_f1[19]), "=f"(sv_f1[20]), "=f"(sv_f1[21]), "=f"(sv_f1[22]), "=f"(sv_f1[23]), "=f"(sv_f1[24]), "=f"(sv_f1[25]), "=f"(sv_f1[26]), "=f"(sv_f1[27]), "=f"(sv_f1[28]), "=f"(sv_f1[29]), "=f"(sv_f1[30]), "=f"(sv_f1[31]), "=f"(sv_red1)
+                        "tcgen05.ld.sync.aligned.32x32b.x32.b32"
+                        " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
+                        : "=f"(_tmem_load_2[0]), "=f"(_tmem_load_2[1]), "=f"(_tmem_load_2[2]), "=f"(_tmem_load_2[3]), "=f"(_tmem_load_2[4]), "=f"(_tmem_load_2[5]), "=f"(_tmem_load_2[6]), "=f"(_tmem_load_2[7]), "=f"(_tmem_load_2[8]), "=f"(_tmem_load_2[9]), "=f"(_tmem_load_2[10]), "=f"(_tmem_load_2[11]), "=f"(_tmem_load_2[12]), "=f"(_tmem_load_2[13]), "=f"(_tmem_load_2[14]), "=f"(_tmem_load_2[15]), "=f"(_tmem_load_2[16]), "=f"(_tmem_load_2[17]), "=f"(_tmem_load_2[18]), "=f"(_tmem_load_2[19]), "=f"(_tmem_load_2[20]), "=f"(_tmem_load_2[21]), "=f"(_tmem_load_2[22]), "=f"(_tmem_load_2[23]), "=f"(_tmem_load_2[24]), "=f"(_tmem_load_2[25]), "=f"(_tmem_load_2[26]), "=f"(_tmem_load_2[27]), "=f"(_tmem_load_2[28]), "=f"(_tmem_load_2[29]), "=f"(_tmem_load_2[30]), "=f"(_tmem_load_2[31])
                         : "r"(s_base + 32));
-                    float sv_f2[32];
-                    float sv_red2;
-                    #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 1000)
-                    #error "TmemLoadRed requires tcgen05.ld.red support (sm_103/sm_101-sm_110 family), not sm_100"
-                    #endif
+                    float _tmem_load_3[32];
                     asm volatile(
-                        "tcgen05.ld.red.sync.aligned.32x32b.x32.max.f32"
-                        " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, %32, [%33];"
-                        : "=f"(sv_f2[0]), "=f"(sv_f2[1]), "=f"(sv_f2[2]), "=f"(sv_f2[3]), "=f"(sv_f2[4]), "=f"(sv_f2[5]), "=f"(sv_f2[6]), "=f"(sv_f2[7]), "=f"(sv_f2[8]), "=f"(sv_f2[9]), "=f"(sv_f2[10]), "=f"(sv_f2[11]), "=f"(sv_f2[12]), "=f"(sv_f2[13]), "=f"(sv_f2[14]), "=f"(sv_f2[15]), "=f"(sv_f2[16]), "=f"(sv_f2[17]), "=f"(sv_f2[18]), "=f"(sv_f2[19]), "=f"(sv_f2[20]), "=f"(sv_f2[21]), "=f"(sv_f2[22]), "=f"(sv_f2[23]), "=f"(sv_f2[24]), "=f"(sv_f2[25]), "=f"(sv_f2[26]), "=f"(sv_f2[27]), "=f"(sv_f2[28]), "=f"(sv_f2[29]), "=f"(sv_f2[30]), "=f"(sv_f2[31]), "=f"(sv_red2)
+                        "tcgen05.ld.sync.aligned.32x32b.x32.b32"
+                        " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
+                        : "=f"(_tmem_load_3[0]), "=f"(_tmem_load_3[1]), "=f"(_tmem_load_3[2]), "=f"(_tmem_load_3[3]), "=f"(_tmem_load_3[4]), "=f"(_tmem_load_3[5]), "=f"(_tmem_load_3[6]), "=f"(_tmem_load_3[7]), "=f"(_tmem_load_3[8]), "=f"(_tmem_load_3[9]), "=f"(_tmem_load_3[10]), "=f"(_tmem_load_3[11]), "=f"(_tmem_load_3[12]), "=f"(_tmem_load_3[13]), "=f"(_tmem_load_3[14]), "=f"(_tmem_load_3[15]), "=f"(_tmem_load_3[16]), "=f"(_tmem_load_3[17]), "=f"(_tmem_load_3[18]), "=f"(_tmem_load_3[19]), "=f"(_tmem_load_3[20]), "=f"(_tmem_load_3[21]), "=f"(_tmem_load_3[22]), "=f"(_tmem_load_3[23]), "=f"(_tmem_load_3[24]), "=f"(_tmem_load_3[25]), "=f"(_tmem_load_3[26]), "=f"(_tmem_load_3[27]), "=f"(_tmem_load_3[28]), "=f"(_tmem_load_3[29]), "=f"(_tmem_load_3[30]), "=f"(_tmem_load_3[31])
                         : "r"(s_base + 64));
-                    float sv_f3[32];
-                    float sv_red3;
-                    #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 1000)
-                    #error "TmemLoadRed requires tcgen05.ld.red support (sm_103/sm_101-sm_110 family), not sm_100"
-                    #endif
+                    float _tmem_load_4[32];
                     asm volatile(
-                        "tcgen05.ld.red.sync.aligned.32x32b.x32.max.f32"
-                        " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, %32, [%33];"
-                        : "=f"(sv_f3[0]), "=f"(sv_f3[1]), "=f"(sv_f3[2]), "=f"(sv_f3[3]), "=f"(sv_f3[4]), "=f"(sv_f3[5]), "=f"(sv_f3[6]), "=f"(sv_f3[7]), "=f"(sv_f3[8]), "=f"(sv_f3[9]), "=f"(sv_f3[10]), "=f"(sv_f3[11]), "=f"(sv_f3[12]), "=f"(sv_f3[13]), "=f"(sv_f3[14]), "=f"(sv_f3[15]), "=f"(sv_f3[16]), "=f"(sv_f3[17]), "=f"(sv_f3[18]), "=f"(sv_f3[19]), "=f"(sv_f3[20]), "=f"(sv_f3[21]), "=f"(sv_f3[22]), "=f"(sv_f3[23]), "=f"(sv_f3[24]), "=f"(sv_f3[25]), "=f"(sv_f3[26]), "=f"(sv_f3[27]), "=f"(sv_f3[28]), "=f"(sv_f3[29]), "=f"(sv_f3[30]), "=f"(sv_f3[31]), "=f"(sv_red3)
+                        "tcgen05.ld.sync.aligned.32x32b.x32.b32"
+                        " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
+                        : "=f"(_tmem_load_4[0]), "=f"(_tmem_load_4[1]), "=f"(_tmem_load_4[2]), "=f"(_tmem_load_4[3]), "=f"(_tmem_load_4[4]), "=f"(_tmem_load_4[5]), "=f"(_tmem_load_4[6]), "=f"(_tmem_load_4[7]), "=f"(_tmem_load_4[8]), "=f"(_tmem_load_4[9]), "=f"(_tmem_load_4[10]), "=f"(_tmem_load_4[11]), "=f"(_tmem_load_4[12]), "=f"(_tmem_load_4[13]), "=f"(_tmem_load_4[14]), "=f"(_tmem_load_4[15]), "=f"(_tmem_load_4[16]), "=f"(_tmem_load_4[17]), "=f"(_tmem_load_4[18]), "=f"(_tmem_load_4[19]), "=f"(_tmem_load_4[20]), "=f"(_tmem_load_4[21]), "=f"(_tmem_load_4[22]), "=f"(_tmem_load_4[23]), "=f"(_tmem_load_4[24]), "=f"(_tmem_load_4[25]), "=f"(_tmem_load_4[26]), "=f"(_tmem_load_4[27]), "=f"(_tmem_load_4[28]), "=f"(_tmem_load_4[29]), "=f"(_tmem_load_4[30]), "=f"(_tmem_load_4[31])
                         : "r"(s_base + 96));
-                    asm volatile("tcgen05.wait::ld.sync.aligned;");
-                    float _tmem_load_0[4];
-                    tmem_ld_x4(&_tmem_load_0[0], s_base);
                     asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
-                    int ldred_full = any_invalid == 0 && valid_sparse_cols >= 128;
-                    if (ldred_full != 0) {
-                        new_max = max_noftz(new_max, sv_red0);
-                        new_max = max_noftz(new_max, sv_red1);
-                        new_max = max_noftz(new_max, sv_red2);
-                        new_max = max_noftz(new_max, sv_red3);
-                    } else {
-                        int frag_valid_0 = valid_sparse_cols;
-                        uint32_t _thresh_mask_2;
-                        {
-                            int _lim_3 = frag_valid_0;
-                            if (_lim_3 <= 0) { _thresh_mask_2 = 0u; }
-                            else if (_lim_3 >= 32) { _thresh_mask_2 = 0xFFFFFFFFu; }
-                            else {
-                                asm volatile("{"
-                                    ".reg .u32 t;\n\t"
-                                    "shl.b32 t, 1, %1;\n\t"
-                                    "add.u32 %0, t, -1;\n\t"
-                                    "}" : "=r"(_thresh_mask_2) : "r"(_lim_3));
-                            }
-                        }
-                        if (!(_thresh_mask_2 & (1u << 0))) sv[0] = -CUDART_INF_F;
-                        if (!(_thresh_mask_2 & (1u << 1))) sv[1] = -CUDART_INF_F;
-                        if (!(_thresh_mask_2 & (1u << 2))) sv[2] = -CUDART_INF_F;
-                        if (!(_thresh_mask_2 & (1u << 3))) sv[3] = -CUDART_INF_F;
-                        if (!(_thresh_mask_2 & (1u << 4))) sv[4] = -CUDART_INF_F;
-                        if (!(_thresh_mask_2 & (1u << 5))) sv[5] = -CUDART_INF_F;
-                        if (!(_thresh_mask_2 & (1u << 6))) sv[6] = -CUDART_INF_F;
-                        if (!(_thresh_mask_2 & (1u << 7))) sv[7] = -CUDART_INF_F;
-                        if (!(_thresh_mask_2 & (1u << 8))) sv[8] = -CUDART_INF_F;
-                        if (!(_thresh_mask_2 & (1u << 9))) sv[9] = -CUDART_INF_F;
-                        if (!(_thresh_mask_2 & (1u << 10))) sv[10] = -CUDART_INF_F;
-                        if (!(_thresh_mask_2 & (1u << 11))) sv[11] = -CUDART_INF_F;
-                        if (!(_thresh_mask_2 & (1u << 12))) sv[12] = -CUDART_INF_F;
-                        if (!(_thresh_mask_2 & (1u << 13))) sv[13] = -CUDART_INF_F;
-                        if (!(_thresh_mask_2 & (1u << 14))) sv[14] = -CUDART_INF_F;
-                        if (!(_thresh_mask_2 & (1u << 15))) sv[15] = -CUDART_INF_F;
-                        if (!(_thresh_mask_2 & (1u << 16))) sv[16] = -CUDART_INF_F;
-                        if (!(_thresh_mask_2 & (1u << 17))) sv[17] = -CUDART_INF_F;
-                        if (!(_thresh_mask_2 & (1u << 18))) sv[18] = -CUDART_INF_F;
-                        if (!(_thresh_mask_2 & (1u << 19))) sv[19] = -CUDART_INF_F;
-                        if (!(_thresh_mask_2 & (1u << 20))) sv[20] = -CUDART_INF_F;
-                        if (!(_thresh_mask_2 & (1u << 21))) sv[21] = -CUDART_INF_F;
-                        if (!(_thresh_mask_2 & (1u << 22))) sv[22] = -CUDART_INF_F;
-                        if (!(_thresh_mask_2 & (1u << 23))) sv[23] = -CUDART_INF_F;
-                        if (!(_thresh_mask_2 & (1u << 24))) sv[24] = -CUDART_INF_F;
-                        if (!(_thresh_mask_2 & (1u << 25))) sv[25] = -CUDART_INF_F;
-                        if (!(_thresh_mask_2 & (1u << 26))) sv[26] = -CUDART_INF_F;
-                        if (!(_thresh_mask_2 & (1u << 27))) sv[27] = -CUDART_INF_F;
-                        if (!(_thresh_mask_2 & (1u << 28))) sv[28] = -CUDART_INF_F;
-                        if (!(_thresh_mask_2 & (1u << 29))) sv[29] = -CUDART_INF_F;
-                        if (!(_thresh_mask_2 & (1u << 30))) sv[30] = -CUDART_INF_F;
-                        if (!(_thresh_mask_2 & (1u << 31))) sv[31] = -CUDART_INF_F;
-                        if (any_invalid != 0) {
-                            unsigned int frag_mask_word_0 = invalid_cols[0];
-                            sv[0] = (((frag_mask_word_0 & 1) != 0) ? -CUDART_INF_F : sv[0]);
-                            sv[1] = (((frag_mask_word_0 >> 1 & 1) != 0) ? -CUDART_INF_F : sv[1]);
-                            sv[2] = (((frag_mask_word_0 >> 2 & 1) != 0) ? -CUDART_INF_F : sv[2]);
-                            sv[3] = (((frag_mask_word_0 >> 3 & 1) != 0) ? -CUDART_INF_F : sv[3]);
-                            sv[4] = (((frag_mask_word_0 >> 4 & 1) != 0) ? -CUDART_INF_F : sv[4]);
-                            sv[5] = (((frag_mask_word_0 >> 5 & 1) != 0) ? -CUDART_INF_F : sv[5]);
-                            sv[6] = (((frag_mask_word_0 >> 6 & 1) != 0) ? -CUDART_INF_F : sv[6]);
-                            sv[7] = (((frag_mask_word_0 >> 7 & 1) != 0) ? -CUDART_INF_F : sv[7]);
-                            sv[8] = (((frag_mask_word_0 >> 8 & 1) != 0) ? -CUDART_INF_F : sv[8]);
-                            sv[9] = (((frag_mask_word_0 >> 9 & 1) != 0) ? -CUDART_INF_F : sv[9]);
-                            sv[10] = (((frag_mask_word_0 >> 10 & 1) != 0) ? -CUDART_INF_F : sv[10]);
-                            sv[11] = (((frag_mask_word_0 >> 11 & 1) != 0) ? -CUDART_INF_F : sv[11]);
-                            sv[12] = (((frag_mask_word_0 >> 12 & 1) != 0) ? -CUDART_INF_F : sv[12]);
-                            sv[13] = (((frag_mask_word_0 >> 13 & 1) != 0) ? -CUDART_INF_F : sv[13]);
-                            sv[14] = (((frag_mask_word_0 >> 14 & 1) != 0) ? -CUDART_INF_F : sv[14]);
-                            sv[15] = (((frag_mask_word_0 >> 15 & 1) != 0) ? -CUDART_INF_F : sv[15]);
-                            sv[16] = (((frag_mask_word_0 >> 16 & 1) != 0) ? -CUDART_INF_F : sv[16]);
-                            sv[17] = (((frag_mask_word_0 >> 17 & 1) != 0) ? -CUDART_INF_F : sv[17]);
-                            sv[18] = (((frag_mask_word_0 >> 18 & 1) != 0) ? -CUDART_INF_F : sv[18]);
-                            sv[19] = (((frag_mask_word_0 >> 19 & 1) != 0) ? -CUDART_INF_F : sv[19]);
-                            sv[20] = (((frag_mask_word_0 >> 20 & 1) != 0) ? -CUDART_INF_F : sv[20]);
-                            sv[21] = (((frag_mask_word_0 >> 21 & 1) != 0) ? -CUDART_INF_F : sv[21]);
-                            sv[22] = (((frag_mask_word_0 >> 22 & 1) != 0) ? -CUDART_INF_F : sv[22]);
-                            sv[23] = (((frag_mask_word_0 >> 23 & 1) != 0) ? -CUDART_INF_F : sv[23]);
-                            sv[24] = (((frag_mask_word_0 >> 24 & 1) != 0) ? -CUDART_INF_F : sv[24]);
-                            sv[25] = (((frag_mask_word_0 >> 25 & 1) != 0) ? -CUDART_INF_F : sv[25]);
-                            sv[26] = (((frag_mask_word_0 >> 26 & 1) != 0) ? -CUDART_INF_F : sv[26]);
-                            sv[27] = (((frag_mask_word_0 >> 27 & 1) != 0) ? -CUDART_INF_F : sv[27]);
-                            sv[28] = (((frag_mask_word_0 >> 28 & 1) != 0) ? -CUDART_INF_F : sv[28]);
-                            sv[29] = (((frag_mask_word_0 >> 29 & 1) != 0) ? -CUDART_INF_F : sv[29]);
-                            sv[30] = (((frag_mask_word_0 >> 30 & 1) != 0) ? -CUDART_INF_F : sv[30]);
-                            sv[31] = (((frag_mask_word_0 >> 31 & 1) != 0) ? -CUDART_INF_F : sv[31]);
-                        }
+                    int fast_full = any_invalid == 0 && valid_sparse_cols >= 128;
+                    if (fast_full != 0) {
+                        float2 _reg_reduce_max2_3 = {-CAKE_INF, -CAKE_INF};
+                        _reg_reduce_max2_3.x = max_noftz(_reg_reduce_max2_3.x, max_noftz(_tmem_load_0[0], _tmem_load_0[1]));
+                        _reg_reduce_max2_3.y = max_noftz(_reg_reduce_max2_3.y, max_noftz(_tmem_load_0[2], _tmem_load_0[3]));
+                        _reg_reduce_max2_3.x = max_noftz(_reg_reduce_max2_3.x, max_noftz(_tmem_load_0[4], _tmem_load_0[5]));
+                        _reg_reduce_max2_3.y = max_noftz(_reg_reduce_max2_3.y, max_noftz(_tmem_load_0[6], _tmem_load_0[7]));
+                        _reg_reduce_max2_3.x = max_noftz(_reg_reduce_max2_3.x, max_noftz(_tmem_load_0[8], _tmem_load_0[9]));
+                        _reg_reduce_max2_3.y = max_noftz(_reg_reduce_max2_3.y, max_noftz(_tmem_load_0[10], _tmem_load_0[11]));
+                        _reg_reduce_max2_3.x = max_noftz(_reg_reduce_max2_3.x, max_noftz(_tmem_load_0[12], _tmem_load_0[13]));
+                        _reg_reduce_max2_3.y = max_noftz(_reg_reduce_max2_3.y, max_noftz(_tmem_load_0[14], _tmem_load_0[15]));
+                        _reg_reduce_max2_3.x = max_noftz(_reg_reduce_max2_3.x, max_noftz(_tmem_load_0[16], _tmem_load_0[17]));
+                        _reg_reduce_max2_3.y = max_noftz(_reg_reduce_max2_3.y, max_noftz(_tmem_load_0[18], _tmem_load_0[19]));
+                        _reg_reduce_max2_3.x = max_noftz(_reg_reduce_max2_3.x, max_noftz(_tmem_load_0[20], _tmem_load_0[21]));
+                        _reg_reduce_max2_3.y = max_noftz(_reg_reduce_max2_3.y, max_noftz(_tmem_load_0[22], _tmem_load_0[23]));
+                        _reg_reduce_max2_3.x = max_noftz(_reg_reduce_max2_3.x, max_noftz(_tmem_load_0[24], _tmem_load_0[25]));
+                        _reg_reduce_max2_3.y = max_noftz(_reg_reduce_max2_3.y, max_noftz(_tmem_load_0[26], _tmem_load_0[27]));
+                        _reg_reduce_max2_3.x = max_noftz(_reg_reduce_max2_3.x, max_noftz(_tmem_load_0[28], _tmem_load_0[29]));
+                        _reg_reduce_max2_3.y = max_noftz(_reg_reduce_max2_3.y, max_noftz(_tmem_load_0[30], _tmem_load_0[31]));
+                        float _reg_array_reduce_2 = row_max_reduce(_reg_reduce_max2_3);
+                        new_max = max_noftz(new_max, _reg_array_reduce_2);
                         float2 _reg_reduce_max2_5 = {-CAKE_INF, -CAKE_INF};
-                        _reg_reduce_max2_5.x = max_noftz(_reg_reduce_max2_5.x, max_noftz(sv[0], sv[1]));
-                        _reg_reduce_max2_5.y = max_noftz(_reg_reduce_max2_5.y, max_noftz(sv[2], sv[3]));
-                        _reg_reduce_max2_5.x = max_noftz(_reg_reduce_max2_5.x, max_noftz(sv[4], sv[5]));
-                        _reg_reduce_max2_5.y = max_noftz(_reg_reduce_max2_5.y, max_noftz(sv[6], sv[7]));
-                        _reg_reduce_max2_5.x = max_noftz(_reg_reduce_max2_5.x, max_noftz(sv[8], sv[9]));
-                        _reg_reduce_max2_5.y = max_noftz(_reg_reduce_max2_5.y, max_noftz(sv[10], sv[11]));
-                        _reg_reduce_max2_5.x = max_noftz(_reg_reduce_max2_5.x, max_noftz(sv[12], sv[13]));
-                        _reg_reduce_max2_5.y = max_noftz(_reg_reduce_max2_5.y, max_noftz(sv[14], sv[15]));
-                        _reg_reduce_max2_5.x = max_noftz(_reg_reduce_max2_5.x, max_noftz(sv[16], sv[17]));
-                        _reg_reduce_max2_5.y = max_noftz(_reg_reduce_max2_5.y, max_noftz(sv[18], sv[19]));
-                        _reg_reduce_max2_5.x = max_noftz(_reg_reduce_max2_5.x, max_noftz(sv[20], sv[21]));
-                        _reg_reduce_max2_5.y = max_noftz(_reg_reduce_max2_5.y, max_noftz(sv[22], sv[23]));
-                        _reg_reduce_max2_5.x = max_noftz(_reg_reduce_max2_5.x, max_noftz(sv[24], sv[25]));
-                        _reg_reduce_max2_5.y = max_noftz(_reg_reduce_max2_5.y, max_noftz(sv[26], sv[27]));
-                        _reg_reduce_max2_5.x = max_noftz(_reg_reduce_max2_5.x, max_noftz(sv[28], sv[29]));
-                        _reg_reduce_max2_5.y = max_noftz(_reg_reduce_max2_5.y, max_noftz(sv[30], sv[31]));
+                        _reg_reduce_max2_5.x = max_noftz(_reg_reduce_max2_5.x, max_noftz(_tmem_load_2[0], _tmem_load_2[1]));
+                        _reg_reduce_max2_5.y = max_noftz(_reg_reduce_max2_5.y, max_noftz(_tmem_load_2[2], _tmem_load_2[3]));
+                        _reg_reduce_max2_5.x = max_noftz(_reg_reduce_max2_5.x, max_noftz(_tmem_load_2[4], _tmem_load_2[5]));
+                        _reg_reduce_max2_5.y = max_noftz(_reg_reduce_max2_5.y, max_noftz(_tmem_load_2[6], _tmem_load_2[7]));
+                        _reg_reduce_max2_5.x = max_noftz(_reg_reduce_max2_5.x, max_noftz(_tmem_load_2[8], _tmem_load_2[9]));
+                        _reg_reduce_max2_5.y = max_noftz(_reg_reduce_max2_5.y, max_noftz(_tmem_load_2[10], _tmem_load_2[11]));
+                        _reg_reduce_max2_5.x = max_noftz(_reg_reduce_max2_5.x, max_noftz(_tmem_load_2[12], _tmem_load_2[13]));
+                        _reg_reduce_max2_5.y = max_noftz(_reg_reduce_max2_5.y, max_noftz(_tmem_load_2[14], _tmem_load_2[15]));
+                        _reg_reduce_max2_5.x = max_noftz(_reg_reduce_max2_5.x, max_noftz(_tmem_load_2[16], _tmem_load_2[17]));
+                        _reg_reduce_max2_5.y = max_noftz(_reg_reduce_max2_5.y, max_noftz(_tmem_load_2[18], _tmem_load_2[19]));
+                        _reg_reduce_max2_5.x = max_noftz(_reg_reduce_max2_5.x, max_noftz(_tmem_load_2[20], _tmem_load_2[21]));
+                        _reg_reduce_max2_5.y = max_noftz(_reg_reduce_max2_5.y, max_noftz(_tmem_load_2[22], _tmem_load_2[23]));
+                        _reg_reduce_max2_5.x = max_noftz(_reg_reduce_max2_5.x, max_noftz(_tmem_load_2[24], _tmem_load_2[25]));
+                        _reg_reduce_max2_5.y = max_noftz(_reg_reduce_max2_5.y, max_noftz(_tmem_load_2[26], _tmem_load_2[27]));
+                        _reg_reduce_max2_5.x = max_noftz(_reg_reduce_max2_5.x, max_noftz(_tmem_load_2[28], _tmem_load_2[29]));
+                        _reg_reduce_max2_5.y = max_noftz(_reg_reduce_max2_5.y, max_noftz(_tmem_load_2[30], _tmem_load_2[31]));
                         float _reg_array_reduce_4 = row_max_reduce(_reg_reduce_max2_5);
                         new_max = max_noftz(new_max, _reg_array_reduce_4);
-                        int frag_valid_1 = valid_sparse_cols - 32;
-                        uint32_t _thresh_mask_6;
-                        {
-                            int _lim_7 = frag_valid_1;
-                            if (_lim_7 <= 0) { _thresh_mask_6 = 0u; }
-                            else if (_lim_7 >= 32) { _thresh_mask_6 = 0xFFFFFFFFu; }
-                            else {
-                                asm volatile("{"
-                                    ".reg .u32 t;\n\t"
-                                    "shl.b32 t, 1, %1;\n\t"
-                                    "add.u32 %0, t, -1;\n\t"
-                                    "}" : "=r"(_thresh_mask_6) : "r"(_lim_7));
-                            }
-                        }
-                        if (!(_thresh_mask_6 & (1u << 0))) sv_f1[0] = -CUDART_INF_F;
-                        if (!(_thresh_mask_6 & (1u << 1))) sv_f1[1] = -CUDART_INF_F;
-                        if (!(_thresh_mask_6 & (1u << 2))) sv_f1[2] = -CUDART_INF_F;
-                        if (!(_thresh_mask_6 & (1u << 3))) sv_f1[3] = -CUDART_INF_F;
-                        if (!(_thresh_mask_6 & (1u << 4))) sv_f1[4] = -CUDART_INF_F;
-                        if (!(_thresh_mask_6 & (1u << 5))) sv_f1[5] = -CUDART_INF_F;
-                        if (!(_thresh_mask_6 & (1u << 6))) sv_f1[6] = -CUDART_INF_F;
-                        if (!(_thresh_mask_6 & (1u << 7))) sv_f1[7] = -CUDART_INF_F;
-                        if (!(_thresh_mask_6 & (1u << 8))) sv_f1[8] = -CUDART_INF_F;
-                        if (!(_thresh_mask_6 & (1u << 9))) sv_f1[9] = -CUDART_INF_F;
-                        if (!(_thresh_mask_6 & (1u << 10))) sv_f1[10] = -CUDART_INF_F;
-                        if (!(_thresh_mask_6 & (1u << 11))) sv_f1[11] = -CUDART_INF_F;
-                        if (!(_thresh_mask_6 & (1u << 12))) sv_f1[12] = -CUDART_INF_F;
-                        if (!(_thresh_mask_6 & (1u << 13))) sv_f1[13] = -CUDART_INF_F;
-                        if (!(_thresh_mask_6 & (1u << 14))) sv_f1[14] = -CUDART_INF_F;
-                        if (!(_thresh_mask_6 & (1u << 15))) sv_f1[15] = -CUDART_INF_F;
-                        if (!(_thresh_mask_6 & (1u << 16))) sv_f1[16] = -CUDART_INF_F;
-                        if (!(_thresh_mask_6 & (1u << 17))) sv_f1[17] = -CUDART_INF_F;
-                        if (!(_thresh_mask_6 & (1u << 18))) sv_f1[18] = -CUDART_INF_F;
-                        if (!(_thresh_mask_6 & (1u << 19))) sv_f1[19] = -CUDART_INF_F;
-                        if (!(_thresh_mask_6 & (1u << 20))) sv_f1[20] = -CUDART_INF_F;
-                        if (!(_thresh_mask_6 & (1u << 21))) sv_f1[21] = -CUDART_INF_F;
-                        if (!(_thresh_mask_6 & (1u << 22))) sv_f1[22] = -CUDART_INF_F;
-                        if (!(_thresh_mask_6 & (1u << 23))) sv_f1[23] = -CUDART_INF_F;
-                        if (!(_thresh_mask_6 & (1u << 24))) sv_f1[24] = -CUDART_INF_F;
-                        if (!(_thresh_mask_6 & (1u << 25))) sv_f1[25] = -CUDART_INF_F;
-                        if (!(_thresh_mask_6 & (1u << 26))) sv_f1[26] = -CUDART_INF_F;
-                        if (!(_thresh_mask_6 & (1u << 27))) sv_f1[27] = -CUDART_INF_F;
-                        if (!(_thresh_mask_6 & (1u << 28))) sv_f1[28] = -CUDART_INF_F;
-                        if (!(_thresh_mask_6 & (1u << 29))) sv_f1[29] = -CUDART_INF_F;
-                        if (!(_thresh_mask_6 & (1u << 30))) sv_f1[30] = -CUDART_INF_F;
-                        if (!(_thresh_mask_6 & (1u << 31))) sv_f1[31] = -CUDART_INF_F;
-                        if (any_invalid != 0) {
-                            unsigned int frag_mask_word_1 = invalid_cols[1];
-                            sv_f1[0] = (((frag_mask_word_1 & 1) != 0) ? -CUDART_INF_F : sv_f1[0]);
-                            sv_f1[1] = (((frag_mask_word_1 >> 1 & 1) != 0) ? -CUDART_INF_F : sv_f1[1]);
-                            sv_f1[2] = (((frag_mask_word_1 >> 2 & 1) != 0) ? -CUDART_INF_F : sv_f1[2]);
-                            sv_f1[3] = (((frag_mask_word_1 >> 3 & 1) != 0) ? -CUDART_INF_F : sv_f1[3]);
-                            sv_f1[4] = (((frag_mask_word_1 >> 4 & 1) != 0) ? -CUDART_INF_F : sv_f1[4]);
-                            sv_f1[5] = (((frag_mask_word_1 >> 5 & 1) != 0) ? -CUDART_INF_F : sv_f1[5]);
-                            sv_f1[6] = (((frag_mask_word_1 >> 6 & 1) != 0) ? -CUDART_INF_F : sv_f1[6]);
-                            sv_f1[7] = (((frag_mask_word_1 >> 7 & 1) != 0) ? -CUDART_INF_F : sv_f1[7]);
-                            sv_f1[8] = (((frag_mask_word_1 >> 8 & 1) != 0) ? -CUDART_INF_F : sv_f1[8]);
-                            sv_f1[9] = (((frag_mask_word_1 >> 9 & 1) != 0) ? -CUDART_INF_F : sv_f1[9]);
-                            sv_f1[10] = (((frag_mask_word_1 >> 10 & 1) != 0) ? -CUDART_INF_F : sv_f1[10]);
-                            sv_f1[11] = (((frag_mask_word_1 >> 11 & 1) != 0) ? -CUDART_INF_F : sv_f1[11]);
-                            sv_f1[12] = (((frag_mask_word_1 >> 12 & 1) != 0) ? -CUDART_INF_F : sv_f1[12]);
-                            sv_f1[13] = (((frag_mask_word_1 >> 13 & 1) != 0) ? -CUDART_INF_F : sv_f1[13]);
-                            sv_f1[14] = (((frag_mask_word_1 >> 14 & 1) != 0) ? -CUDART_INF_F : sv_f1[14]);
-                            sv_f1[15] = (((frag_mask_word_1 >> 15 & 1) != 0) ? -CUDART_INF_F : sv_f1[15]);
-                            sv_f1[16] = (((frag_mask_word_1 >> 16 & 1) != 0) ? -CUDART_INF_F : sv_f1[16]);
-                            sv_f1[17] = (((frag_mask_word_1 >> 17 & 1) != 0) ? -CUDART_INF_F : sv_f1[17]);
-                            sv_f1[18] = (((frag_mask_word_1 >> 18 & 1) != 0) ? -CUDART_INF_F : sv_f1[18]);
-                            sv_f1[19] = (((frag_mask_word_1 >> 19 & 1) != 0) ? -CUDART_INF_F : sv_f1[19]);
-                            sv_f1[20] = (((frag_mask_word_1 >> 20 & 1) != 0) ? -CUDART_INF_F : sv_f1[20]);
-                            sv_f1[21] = (((frag_mask_word_1 >> 21 & 1) != 0) ? -CUDART_INF_F : sv_f1[21]);
-                            sv_f1[22] = (((frag_mask_word_1 >> 22 & 1) != 0) ? -CUDART_INF_F : sv_f1[22]);
-                            sv_f1[23] = (((frag_mask_word_1 >> 23 & 1) != 0) ? -CUDART_INF_F : sv_f1[23]);
-                            sv_f1[24] = (((frag_mask_word_1 >> 24 & 1) != 0) ? -CUDART_INF_F : sv_f1[24]);
-                            sv_f1[25] = (((frag_mask_word_1 >> 25 & 1) != 0) ? -CUDART_INF_F : sv_f1[25]);
-                            sv_f1[26] = (((frag_mask_word_1 >> 26 & 1) != 0) ? -CUDART_INF_F : sv_f1[26]);
-                            sv_f1[27] = (((frag_mask_word_1 >> 27 & 1) != 0) ? -CUDART_INF_F : sv_f1[27]);
-                            sv_f1[28] = (((frag_mask_word_1 >> 28 & 1) != 0) ? -CUDART_INF_F : sv_f1[28]);
-                            sv_f1[29] = (((frag_mask_word_1 >> 29 & 1) != 0) ? -CUDART_INF_F : sv_f1[29]);
-                            sv_f1[30] = (((frag_mask_word_1 >> 30 & 1) != 0) ? -CUDART_INF_F : sv_f1[30]);
-                            sv_f1[31] = (((frag_mask_word_1 >> 31 & 1) != 0) ? -CUDART_INF_F : sv_f1[31]);
-                        }
+                        float2 _reg_reduce_max2_7 = {-CAKE_INF, -CAKE_INF};
+                        _reg_reduce_max2_7.x = max_noftz(_reg_reduce_max2_7.x, max_noftz(_tmem_load_3[0], _tmem_load_3[1]));
+                        _reg_reduce_max2_7.y = max_noftz(_reg_reduce_max2_7.y, max_noftz(_tmem_load_3[2], _tmem_load_3[3]));
+                        _reg_reduce_max2_7.x = max_noftz(_reg_reduce_max2_7.x, max_noftz(_tmem_load_3[4], _tmem_load_3[5]));
+                        _reg_reduce_max2_7.y = max_noftz(_reg_reduce_max2_7.y, max_noftz(_tmem_load_3[6], _tmem_load_3[7]));
+                        _reg_reduce_max2_7.x = max_noftz(_reg_reduce_max2_7.x, max_noftz(_tmem_load_3[8], _tmem_load_3[9]));
+                        _reg_reduce_max2_7.y = max_noftz(_reg_reduce_max2_7.y, max_noftz(_tmem_load_3[10], _tmem_load_3[11]));
+                        _reg_reduce_max2_7.x = max_noftz(_reg_reduce_max2_7.x, max_noftz(_tmem_load_3[12], _tmem_load_3[13]));
+                        _reg_reduce_max2_7.y = max_noftz(_reg_reduce_max2_7.y, max_noftz(_tmem_load_3[14], _tmem_load_3[15]));
+                        _reg_reduce_max2_7.x = max_noftz(_reg_reduce_max2_7.x, max_noftz(_tmem_load_3[16], _tmem_load_3[17]));
+                        _reg_reduce_max2_7.y = max_noftz(_reg_reduce_max2_7.y, max_noftz(_tmem_load_3[18], _tmem_load_3[19]));
+                        _reg_reduce_max2_7.x = max_noftz(_reg_reduce_max2_7.x, max_noftz(_tmem_load_3[20], _tmem_load_3[21]));
+                        _reg_reduce_max2_7.y = max_noftz(_reg_reduce_max2_7.y, max_noftz(_tmem_load_3[22], _tmem_load_3[23]));
+                        _reg_reduce_max2_7.x = max_noftz(_reg_reduce_max2_7.x, max_noftz(_tmem_load_3[24], _tmem_load_3[25]));
+                        _reg_reduce_max2_7.y = max_noftz(_reg_reduce_max2_7.y, max_noftz(_tmem_load_3[26], _tmem_load_3[27]));
+                        _reg_reduce_max2_7.x = max_noftz(_reg_reduce_max2_7.x, max_noftz(_tmem_load_3[28], _tmem_load_3[29]));
+                        _reg_reduce_max2_7.y = max_noftz(_reg_reduce_max2_7.y, max_noftz(_tmem_load_3[30], _tmem_load_3[31]));
+                        float _reg_array_reduce_6 = row_max_reduce(_reg_reduce_max2_7);
+                        new_max = max_noftz(new_max, _reg_array_reduce_6);
                         float2 _reg_reduce_max2_9 = {-CAKE_INF, -CAKE_INF};
-                        _reg_reduce_max2_9.x = max_noftz(_reg_reduce_max2_9.x, max_noftz(sv_f1[0], sv_f1[1]));
-                        _reg_reduce_max2_9.y = max_noftz(_reg_reduce_max2_9.y, max_noftz(sv_f1[2], sv_f1[3]));
-                        _reg_reduce_max2_9.x = max_noftz(_reg_reduce_max2_9.x, max_noftz(sv_f1[4], sv_f1[5]));
-                        _reg_reduce_max2_9.y = max_noftz(_reg_reduce_max2_9.y, max_noftz(sv_f1[6], sv_f1[7]));
-                        _reg_reduce_max2_9.x = max_noftz(_reg_reduce_max2_9.x, max_noftz(sv_f1[8], sv_f1[9]));
-                        _reg_reduce_max2_9.y = max_noftz(_reg_reduce_max2_9.y, max_noftz(sv_f1[10], sv_f1[11]));
-                        _reg_reduce_max2_9.x = max_noftz(_reg_reduce_max2_9.x, max_noftz(sv_f1[12], sv_f1[13]));
-                        _reg_reduce_max2_9.y = max_noftz(_reg_reduce_max2_9.y, max_noftz(sv_f1[14], sv_f1[15]));
-                        _reg_reduce_max2_9.x = max_noftz(_reg_reduce_max2_9.x, max_noftz(sv_f1[16], sv_f1[17]));
-                        _reg_reduce_max2_9.y = max_noftz(_reg_reduce_max2_9.y, max_noftz(sv_f1[18], sv_f1[19]));
-                        _reg_reduce_max2_9.x = max_noftz(_reg_reduce_max2_9.x, max_noftz(sv_f1[20], sv_f1[21]));
-                        _reg_reduce_max2_9.y = max_noftz(_reg_reduce_max2_9.y, max_noftz(sv_f1[22], sv_f1[23]));
-                        _reg_reduce_max2_9.x = max_noftz(_reg_reduce_max2_9.x, max_noftz(sv_f1[24], sv_f1[25]));
-                        _reg_reduce_max2_9.y = max_noftz(_reg_reduce_max2_9.y, max_noftz(sv_f1[26], sv_f1[27]));
-                        _reg_reduce_max2_9.x = max_noftz(_reg_reduce_max2_9.x, max_noftz(sv_f1[28], sv_f1[29]));
-                        _reg_reduce_max2_9.y = max_noftz(_reg_reduce_max2_9.y, max_noftz(sv_f1[30], sv_f1[31]));
+                        _reg_reduce_max2_9.x = max_noftz(_reg_reduce_max2_9.x, max_noftz(_tmem_load_4[0], _tmem_load_4[1]));
+                        _reg_reduce_max2_9.y = max_noftz(_reg_reduce_max2_9.y, max_noftz(_tmem_load_4[2], _tmem_load_4[3]));
+                        _reg_reduce_max2_9.x = max_noftz(_reg_reduce_max2_9.x, max_noftz(_tmem_load_4[4], _tmem_load_4[5]));
+                        _reg_reduce_max2_9.y = max_noftz(_reg_reduce_max2_9.y, max_noftz(_tmem_load_4[6], _tmem_load_4[7]));
+                        _reg_reduce_max2_9.x = max_noftz(_reg_reduce_max2_9.x, max_noftz(_tmem_load_4[8], _tmem_load_4[9]));
+                        _reg_reduce_max2_9.y = max_noftz(_reg_reduce_max2_9.y, max_noftz(_tmem_load_4[10], _tmem_load_4[11]));
+                        _reg_reduce_max2_9.x = max_noftz(_reg_reduce_max2_9.x, max_noftz(_tmem_load_4[12], _tmem_load_4[13]));
+                        _reg_reduce_max2_9.y = max_noftz(_reg_reduce_max2_9.y, max_noftz(_tmem_load_4[14], _tmem_load_4[15]));
+                        _reg_reduce_max2_9.x = max_noftz(_reg_reduce_max2_9.x, max_noftz(_tmem_load_4[16], _tmem_load_4[17]));
+                        _reg_reduce_max2_9.y = max_noftz(_reg_reduce_max2_9.y, max_noftz(_tmem_load_4[18], _tmem_load_4[19]));
+                        _reg_reduce_max2_9.x = max_noftz(_reg_reduce_max2_9.x, max_noftz(_tmem_load_4[20], _tmem_load_4[21]));
+                        _reg_reduce_max2_9.y = max_noftz(_reg_reduce_max2_9.y, max_noftz(_tmem_load_4[22], _tmem_load_4[23]));
+                        _reg_reduce_max2_9.x = max_noftz(_reg_reduce_max2_9.x, max_noftz(_tmem_load_4[24], _tmem_load_4[25]));
+                        _reg_reduce_max2_9.y = max_noftz(_reg_reduce_max2_9.y, max_noftz(_tmem_load_4[26], _tmem_load_4[27]));
+                        _reg_reduce_max2_9.x = max_noftz(_reg_reduce_max2_9.x, max_noftz(_tmem_load_4[28], _tmem_load_4[29]));
+                        _reg_reduce_max2_9.y = max_noftz(_reg_reduce_max2_9.y, max_noftz(_tmem_load_4[30], _tmem_load_4[31]));
                         float _reg_array_reduce_8 = row_max_reduce(_reg_reduce_max2_9);
                         new_max = max_noftz(new_max, _reg_array_reduce_8);
-                        int frag_valid_2 = valid_sparse_cols - 64;
+                    } else {
+                        int frag_valid_0 = valid_sparse_cols;
                         uint32_t _thresh_mask_10;
                         {
-                            int _lim_11 = frag_valid_2;
+                            int _lim_11 = frag_valid_0;
                             if (_lim_11 <= 0) { _thresh_mask_10 = 0u; }
                             else if (_lim_11 >= 32) { _thresh_mask_10 = 0xFFFFFFFFu; }
                             else {
@@ -1171,96 +1026,96 @@ kernel_cake_dsv4_430c388f48f1e672627c(const __grid_constant__ CUtensorMap tmap_q
                                     "}" : "=r"(_thresh_mask_10) : "r"(_lim_11));
                             }
                         }
-                        if (!(_thresh_mask_10 & (1u << 0))) sv_f2[0] = -CUDART_INF_F;
-                        if (!(_thresh_mask_10 & (1u << 1))) sv_f2[1] = -CUDART_INF_F;
-                        if (!(_thresh_mask_10 & (1u << 2))) sv_f2[2] = -CUDART_INF_F;
-                        if (!(_thresh_mask_10 & (1u << 3))) sv_f2[3] = -CUDART_INF_F;
-                        if (!(_thresh_mask_10 & (1u << 4))) sv_f2[4] = -CUDART_INF_F;
-                        if (!(_thresh_mask_10 & (1u << 5))) sv_f2[5] = -CUDART_INF_F;
-                        if (!(_thresh_mask_10 & (1u << 6))) sv_f2[6] = -CUDART_INF_F;
-                        if (!(_thresh_mask_10 & (1u << 7))) sv_f2[7] = -CUDART_INF_F;
-                        if (!(_thresh_mask_10 & (1u << 8))) sv_f2[8] = -CUDART_INF_F;
-                        if (!(_thresh_mask_10 & (1u << 9))) sv_f2[9] = -CUDART_INF_F;
-                        if (!(_thresh_mask_10 & (1u << 10))) sv_f2[10] = -CUDART_INF_F;
-                        if (!(_thresh_mask_10 & (1u << 11))) sv_f2[11] = -CUDART_INF_F;
-                        if (!(_thresh_mask_10 & (1u << 12))) sv_f2[12] = -CUDART_INF_F;
-                        if (!(_thresh_mask_10 & (1u << 13))) sv_f2[13] = -CUDART_INF_F;
-                        if (!(_thresh_mask_10 & (1u << 14))) sv_f2[14] = -CUDART_INF_F;
-                        if (!(_thresh_mask_10 & (1u << 15))) sv_f2[15] = -CUDART_INF_F;
-                        if (!(_thresh_mask_10 & (1u << 16))) sv_f2[16] = -CUDART_INF_F;
-                        if (!(_thresh_mask_10 & (1u << 17))) sv_f2[17] = -CUDART_INF_F;
-                        if (!(_thresh_mask_10 & (1u << 18))) sv_f2[18] = -CUDART_INF_F;
-                        if (!(_thresh_mask_10 & (1u << 19))) sv_f2[19] = -CUDART_INF_F;
-                        if (!(_thresh_mask_10 & (1u << 20))) sv_f2[20] = -CUDART_INF_F;
-                        if (!(_thresh_mask_10 & (1u << 21))) sv_f2[21] = -CUDART_INF_F;
-                        if (!(_thresh_mask_10 & (1u << 22))) sv_f2[22] = -CUDART_INF_F;
-                        if (!(_thresh_mask_10 & (1u << 23))) sv_f2[23] = -CUDART_INF_F;
-                        if (!(_thresh_mask_10 & (1u << 24))) sv_f2[24] = -CUDART_INF_F;
-                        if (!(_thresh_mask_10 & (1u << 25))) sv_f2[25] = -CUDART_INF_F;
-                        if (!(_thresh_mask_10 & (1u << 26))) sv_f2[26] = -CUDART_INF_F;
-                        if (!(_thresh_mask_10 & (1u << 27))) sv_f2[27] = -CUDART_INF_F;
-                        if (!(_thresh_mask_10 & (1u << 28))) sv_f2[28] = -CUDART_INF_F;
-                        if (!(_thresh_mask_10 & (1u << 29))) sv_f2[29] = -CUDART_INF_F;
-                        if (!(_thresh_mask_10 & (1u << 30))) sv_f2[30] = -CUDART_INF_F;
-                        if (!(_thresh_mask_10 & (1u << 31))) sv_f2[31] = -CUDART_INF_F;
+                        if (!(_thresh_mask_10 & (1u << 0))) _tmem_load_0[0] = -CUDART_INF_F;
+                        if (!(_thresh_mask_10 & (1u << 1))) _tmem_load_0[1] = -CUDART_INF_F;
+                        if (!(_thresh_mask_10 & (1u << 2))) _tmem_load_0[2] = -CUDART_INF_F;
+                        if (!(_thresh_mask_10 & (1u << 3))) _tmem_load_0[3] = -CUDART_INF_F;
+                        if (!(_thresh_mask_10 & (1u << 4))) _tmem_load_0[4] = -CUDART_INF_F;
+                        if (!(_thresh_mask_10 & (1u << 5))) _tmem_load_0[5] = -CUDART_INF_F;
+                        if (!(_thresh_mask_10 & (1u << 6))) _tmem_load_0[6] = -CUDART_INF_F;
+                        if (!(_thresh_mask_10 & (1u << 7))) _tmem_load_0[7] = -CUDART_INF_F;
+                        if (!(_thresh_mask_10 & (1u << 8))) _tmem_load_0[8] = -CUDART_INF_F;
+                        if (!(_thresh_mask_10 & (1u << 9))) _tmem_load_0[9] = -CUDART_INF_F;
+                        if (!(_thresh_mask_10 & (1u << 10))) _tmem_load_0[10] = -CUDART_INF_F;
+                        if (!(_thresh_mask_10 & (1u << 11))) _tmem_load_0[11] = -CUDART_INF_F;
+                        if (!(_thresh_mask_10 & (1u << 12))) _tmem_load_0[12] = -CUDART_INF_F;
+                        if (!(_thresh_mask_10 & (1u << 13))) _tmem_load_0[13] = -CUDART_INF_F;
+                        if (!(_thresh_mask_10 & (1u << 14))) _tmem_load_0[14] = -CUDART_INF_F;
+                        if (!(_thresh_mask_10 & (1u << 15))) _tmem_load_0[15] = -CUDART_INF_F;
+                        if (!(_thresh_mask_10 & (1u << 16))) _tmem_load_0[16] = -CUDART_INF_F;
+                        if (!(_thresh_mask_10 & (1u << 17))) _tmem_load_0[17] = -CUDART_INF_F;
+                        if (!(_thresh_mask_10 & (1u << 18))) _tmem_load_0[18] = -CUDART_INF_F;
+                        if (!(_thresh_mask_10 & (1u << 19))) _tmem_load_0[19] = -CUDART_INF_F;
+                        if (!(_thresh_mask_10 & (1u << 20))) _tmem_load_0[20] = -CUDART_INF_F;
+                        if (!(_thresh_mask_10 & (1u << 21))) _tmem_load_0[21] = -CUDART_INF_F;
+                        if (!(_thresh_mask_10 & (1u << 22))) _tmem_load_0[22] = -CUDART_INF_F;
+                        if (!(_thresh_mask_10 & (1u << 23))) _tmem_load_0[23] = -CUDART_INF_F;
+                        if (!(_thresh_mask_10 & (1u << 24))) _tmem_load_0[24] = -CUDART_INF_F;
+                        if (!(_thresh_mask_10 & (1u << 25))) _tmem_load_0[25] = -CUDART_INF_F;
+                        if (!(_thresh_mask_10 & (1u << 26))) _tmem_load_0[26] = -CUDART_INF_F;
+                        if (!(_thresh_mask_10 & (1u << 27))) _tmem_load_0[27] = -CUDART_INF_F;
+                        if (!(_thresh_mask_10 & (1u << 28))) _tmem_load_0[28] = -CUDART_INF_F;
+                        if (!(_thresh_mask_10 & (1u << 29))) _tmem_load_0[29] = -CUDART_INF_F;
+                        if (!(_thresh_mask_10 & (1u << 30))) _tmem_load_0[30] = -CUDART_INF_F;
+                        if (!(_thresh_mask_10 & (1u << 31))) _tmem_load_0[31] = -CUDART_INF_F;
                         if (any_invalid != 0) {
-                            unsigned int frag_mask_word_2 = invalid_cols[2];
-                            sv_f2[0] = (((frag_mask_word_2 & 1) != 0) ? -CUDART_INF_F : sv_f2[0]);
-                            sv_f2[1] = (((frag_mask_word_2 >> 1 & 1) != 0) ? -CUDART_INF_F : sv_f2[1]);
-                            sv_f2[2] = (((frag_mask_word_2 >> 2 & 1) != 0) ? -CUDART_INF_F : sv_f2[2]);
-                            sv_f2[3] = (((frag_mask_word_2 >> 3 & 1) != 0) ? -CUDART_INF_F : sv_f2[3]);
-                            sv_f2[4] = (((frag_mask_word_2 >> 4 & 1) != 0) ? -CUDART_INF_F : sv_f2[4]);
-                            sv_f2[5] = (((frag_mask_word_2 >> 5 & 1) != 0) ? -CUDART_INF_F : sv_f2[5]);
-                            sv_f2[6] = (((frag_mask_word_2 >> 6 & 1) != 0) ? -CUDART_INF_F : sv_f2[6]);
-                            sv_f2[7] = (((frag_mask_word_2 >> 7 & 1) != 0) ? -CUDART_INF_F : sv_f2[7]);
-                            sv_f2[8] = (((frag_mask_word_2 >> 8 & 1) != 0) ? -CUDART_INF_F : sv_f2[8]);
-                            sv_f2[9] = (((frag_mask_word_2 >> 9 & 1) != 0) ? -CUDART_INF_F : sv_f2[9]);
-                            sv_f2[10] = (((frag_mask_word_2 >> 10 & 1) != 0) ? -CUDART_INF_F : sv_f2[10]);
-                            sv_f2[11] = (((frag_mask_word_2 >> 11 & 1) != 0) ? -CUDART_INF_F : sv_f2[11]);
-                            sv_f2[12] = (((frag_mask_word_2 >> 12 & 1) != 0) ? -CUDART_INF_F : sv_f2[12]);
-                            sv_f2[13] = (((frag_mask_word_2 >> 13 & 1) != 0) ? -CUDART_INF_F : sv_f2[13]);
-                            sv_f2[14] = (((frag_mask_word_2 >> 14 & 1) != 0) ? -CUDART_INF_F : sv_f2[14]);
-                            sv_f2[15] = (((frag_mask_word_2 >> 15 & 1) != 0) ? -CUDART_INF_F : sv_f2[15]);
-                            sv_f2[16] = (((frag_mask_word_2 >> 16 & 1) != 0) ? -CUDART_INF_F : sv_f2[16]);
-                            sv_f2[17] = (((frag_mask_word_2 >> 17 & 1) != 0) ? -CUDART_INF_F : sv_f2[17]);
-                            sv_f2[18] = (((frag_mask_word_2 >> 18 & 1) != 0) ? -CUDART_INF_F : sv_f2[18]);
-                            sv_f2[19] = (((frag_mask_word_2 >> 19 & 1) != 0) ? -CUDART_INF_F : sv_f2[19]);
-                            sv_f2[20] = (((frag_mask_word_2 >> 20 & 1) != 0) ? -CUDART_INF_F : sv_f2[20]);
-                            sv_f2[21] = (((frag_mask_word_2 >> 21 & 1) != 0) ? -CUDART_INF_F : sv_f2[21]);
-                            sv_f2[22] = (((frag_mask_word_2 >> 22 & 1) != 0) ? -CUDART_INF_F : sv_f2[22]);
-                            sv_f2[23] = (((frag_mask_word_2 >> 23 & 1) != 0) ? -CUDART_INF_F : sv_f2[23]);
-                            sv_f2[24] = (((frag_mask_word_2 >> 24 & 1) != 0) ? -CUDART_INF_F : sv_f2[24]);
-                            sv_f2[25] = (((frag_mask_word_2 >> 25 & 1) != 0) ? -CUDART_INF_F : sv_f2[25]);
-                            sv_f2[26] = (((frag_mask_word_2 >> 26 & 1) != 0) ? -CUDART_INF_F : sv_f2[26]);
-                            sv_f2[27] = (((frag_mask_word_2 >> 27 & 1) != 0) ? -CUDART_INF_F : sv_f2[27]);
-                            sv_f2[28] = (((frag_mask_word_2 >> 28 & 1) != 0) ? -CUDART_INF_F : sv_f2[28]);
-                            sv_f2[29] = (((frag_mask_word_2 >> 29 & 1) != 0) ? -CUDART_INF_F : sv_f2[29]);
-                            sv_f2[30] = (((frag_mask_word_2 >> 30 & 1) != 0) ? -CUDART_INF_F : sv_f2[30]);
-                            sv_f2[31] = (((frag_mask_word_2 >> 31 & 1) != 0) ? -CUDART_INF_F : sv_f2[31]);
+                            unsigned int frag_mask_word_0 = invalid_cols[0];
+                            _tmem_load_0[0] = (((frag_mask_word_0 & 1) != 0) ? -CUDART_INF_F : _tmem_load_0[0]);
+                            _tmem_load_0[1] = (((frag_mask_word_0 >> 1 & 1) != 0) ? -CUDART_INF_F : _tmem_load_0[1]);
+                            _tmem_load_0[2] = (((frag_mask_word_0 >> 2 & 1) != 0) ? -CUDART_INF_F : _tmem_load_0[2]);
+                            _tmem_load_0[3] = (((frag_mask_word_0 >> 3 & 1) != 0) ? -CUDART_INF_F : _tmem_load_0[3]);
+                            _tmem_load_0[4] = (((frag_mask_word_0 >> 4 & 1) != 0) ? -CUDART_INF_F : _tmem_load_0[4]);
+                            _tmem_load_0[5] = (((frag_mask_word_0 >> 5 & 1) != 0) ? -CUDART_INF_F : _tmem_load_0[5]);
+                            _tmem_load_0[6] = (((frag_mask_word_0 >> 6 & 1) != 0) ? -CUDART_INF_F : _tmem_load_0[6]);
+                            _tmem_load_0[7] = (((frag_mask_word_0 >> 7 & 1) != 0) ? -CUDART_INF_F : _tmem_load_0[7]);
+                            _tmem_load_0[8] = (((frag_mask_word_0 >> 8 & 1) != 0) ? -CUDART_INF_F : _tmem_load_0[8]);
+                            _tmem_load_0[9] = (((frag_mask_word_0 >> 9 & 1) != 0) ? -CUDART_INF_F : _tmem_load_0[9]);
+                            _tmem_load_0[10] = (((frag_mask_word_0 >> 10 & 1) != 0) ? -CUDART_INF_F : _tmem_load_0[10]);
+                            _tmem_load_0[11] = (((frag_mask_word_0 >> 11 & 1) != 0) ? -CUDART_INF_F : _tmem_load_0[11]);
+                            _tmem_load_0[12] = (((frag_mask_word_0 >> 12 & 1) != 0) ? -CUDART_INF_F : _tmem_load_0[12]);
+                            _tmem_load_0[13] = (((frag_mask_word_0 >> 13 & 1) != 0) ? -CUDART_INF_F : _tmem_load_0[13]);
+                            _tmem_load_0[14] = (((frag_mask_word_0 >> 14 & 1) != 0) ? -CUDART_INF_F : _tmem_load_0[14]);
+                            _tmem_load_0[15] = (((frag_mask_word_0 >> 15 & 1) != 0) ? -CUDART_INF_F : _tmem_load_0[15]);
+                            _tmem_load_0[16] = (((frag_mask_word_0 >> 16 & 1) != 0) ? -CUDART_INF_F : _tmem_load_0[16]);
+                            _tmem_load_0[17] = (((frag_mask_word_0 >> 17 & 1) != 0) ? -CUDART_INF_F : _tmem_load_0[17]);
+                            _tmem_load_0[18] = (((frag_mask_word_0 >> 18 & 1) != 0) ? -CUDART_INF_F : _tmem_load_0[18]);
+                            _tmem_load_0[19] = (((frag_mask_word_0 >> 19 & 1) != 0) ? -CUDART_INF_F : _tmem_load_0[19]);
+                            _tmem_load_0[20] = (((frag_mask_word_0 >> 20 & 1) != 0) ? -CUDART_INF_F : _tmem_load_0[20]);
+                            _tmem_load_0[21] = (((frag_mask_word_0 >> 21 & 1) != 0) ? -CUDART_INF_F : _tmem_load_0[21]);
+                            _tmem_load_0[22] = (((frag_mask_word_0 >> 22 & 1) != 0) ? -CUDART_INF_F : _tmem_load_0[22]);
+                            _tmem_load_0[23] = (((frag_mask_word_0 >> 23 & 1) != 0) ? -CUDART_INF_F : _tmem_load_0[23]);
+                            _tmem_load_0[24] = (((frag_mask_word_0 >> 24 & 1) != 0) ? -CUDART_INF_F : _tmem_load_0[24]);
+                            _tmem_load_0[25] = (((frag_mask_word_0 >> 25 & 1) != 0) ? -CUDART_INF_F : _tmem_load_0[25]);
+                            _tmem_load_0[26] = (((frag_mask_word_0 >> 26 & 1) != 0) ? -CUDART_INF_F : _tmem_load_0[26]);
+                            _tmem_load_0[27] = (((frag_mask_word_0 >> 27 & 1) != 0) ? -CUDART_INF_F : _tmem_load_0[27]);
+                            _tmem_load_0[28] = (((frag_mask_word_0 >> 28 & 1) != 0) ? -CUDART_INF_F : _tmem_load_0[28]);
+                            _tmem_load_0[29] = (((frag_mask_word_0 >> 29 & 1) != 0) ? -CUDART_INF_F : _tmem_load_0[29]);
+                            _tmem_load_0[30] = (((frag_mask_word_0 >> 30 & 1) != 0) ? -CUDART_INF_F : _tmem_load_0[30]);
+                            _tmem_load_0[31] = (((frag_mask_word_0 >> 31 & 1) != 0) ? -CUDART_INF_F : _tmem_load_0[31]);
                         }
                         float2 _reg_reduce_max2_13 = {-CAKE_INF, -CAKE_INF};
-                        _reg_reduce_max2_13.x = max_noftz(_reg_reduce_max2_13.x, max_noftz(sv_f2[0], sv_f2[1]));
-                        _reg_reduce_max2_13.y = max_noftz(_reg_reduce_max2_13.y, max_noftz(sv_f2[2], sv_f2[3]));
-                        _reg_reduce_max2_13.x = max_noftz(_reg_reduce_max2_13.x, max_noftz(sv_f2[4], sv_f2[5]));
-                        _reg_reduce_max2_13.y = max_noftz(_reg_reduce_max2_13.y, max_noftz(sv_f2[6], sv_f2[7]));
-                        _reg_reduce_max2_13.x = max_noftz(_reg_reduce_max2_13.x, max_noftz(sv_f2[8], sv_f2[9]));
-                        _reg_reduce_max2_13.y = max_noftz(_reg_reduce_max2_13.y, max_noftz(sv_f2[10], sv_f2[11]));
-                        _reg_reduce_max2_13.x = max_noftz(_reg_reduce_max2_13.x, max_noftz(sv_f2[12], sv_f2[13]));
-                        _reg_reduce_max2_13.y = max_noftz(_reg_reduce_max2_13.y, max_noftz(sv_f2[14], sv_f2[15]));
-                        _reg_reduce_max2_13.x = max_noftz(_reg_reduce_max2_13.x, max_noftz(sv_f2[16], sv_f2[17]));
-                        _reg_reduce_max2_13.y = max_noftz(_reg_reduce_max2_13.y, max_noftz(sv_f2[18], sv_f2[19]));
-                        _reg_reduce_max2_13.x = max_noftz(_reg_reduce_max2_13.x, max_noftz(sv_f2[20], sv_f2[21]));
-                        _reg_reduce_max2_13.y = max_noftz(_reg_reduce_max2_13.y, max_noftz(sv_f2[22], sv_f2[23]));
-                        _reg_reduce_max2_13.x = max_noftz(_reg_reduce_max2_13.x, max_noftz(sv_f2[24], sv_f2[25]));
-                        _reg_reduce_max2_13.y = max_noftz(_reg_reduce_max2_13.y, max_noftz(sv_f2[26], sv_f2[27]));
-                        _reg_reduce_max2_13.x = max_noftz(_reg_reduce_max2_13.x, max_noftz(sv_f2[28], sv_f2[29]));
-                        _reg_reduce_max2_13.y = max_noftz(_reg_reduce_max2_13.y, max_noftz(sv_f2[30], sv_f2[31]));
+                        _reg_reduce_max2_13.x = max_noftz(_reg_reduce_max2_13.x, max_noftz(_tmem_load_0[0], _tmem_load_0[1]));
+                        _reg_reduce_max2_13.y = max_noftz(_reg_reduce_max2_13.y, max_noftz(_tmem_load_0[2], _tmem_load_0[3]));
+                        _reg_reduce_max2_13.x = max_noftz(_reg_reduce_max2_13.x, max_noftz(_tmem_load_0[4], _tmem_load_0[5]));
+                        _reg_reduce_max2_13.y = max_noftz(_reg_reduce_max2_13.y, max_noftz(_tmem_load_0[6], _tmem_load_0[7]));
+                        _reg_reduce_max2_13.x = max_noftz(_reg_reduce_max2_13.x, max_noftz(_tmem_load_0[8], _tmem_load_0[9]));
+                        _reg_reduce_max2_13.y = max_noftz(_reg_reduce_max2_13.y, max_noftz(_tmem_load_0[10], _tmem_load_0[11]));
+                        _reg_reduce_max2_13.x = max_noftz(_reg_reduce_max2_13.x, max_noftz(_tmem_load_0[12], _tmem_load_0[13]));
+                        _reg_reduce_max2_13.y = max_noftz(_reg_reduce_max2_13.y, max_noftz(_tmem_load_0[14], _tmem_load_0[15]));
+                        _reg_reduce_max2_13.x = max_noftz(_reg_reduce_max2_13.x, max_noftz(_tmem_load_0[16], _tmem_load_0[17]));
+                        _reg_reduce_max2_13.y = max_noftz(_reg_reduce_max2_13.y, max_noftz(_tmem_load_0[18], _tmem_load_0[19]));
+                        _reg_reduce_max2_13.x = max_noftz(_reg_reduce_max2_13.x, max_noftz(_tmem_load_0[20], _tmem_load_0[21]));
+                        _reg_reduce_max2_13.y = max_noftz(_reg_reduce_max2_13.y, max_noftz(_tmem_load_0[22], _tmem_load_0[23]));
+                        _reg_reduce_max2_13.x = max_noftz(_reg_reduce_max2_13.x, max_noftz(_tmem_load_0[24], _tmem_load_0[25]));
+                        _reg_reduce_max2_13.y = max_noftz(_reg_reduce_max2_13.y, max_noftz(_tmem_load_0[26], _tmem_load_0[27]));
+                        _reg_reduce_max2_13.x = max_noftz(_reg_reduce_max2_13.x, max_noftz(_tmem_load_0[28], _tmem_load_0[29]));
+                        _reg_reduce_max2_13.y = max_noftz(_reg_reduce_max2_13.y, max_noftz(_tmem_load_0[30], _tmem_load_0[31]));
                         float _reg_array_reduce_12 = row_max_reduce(_reg_reduce_max2_13);
                         new_max = max_noftz(new_max, _reg_array_reduce_12);
-                        int frag_valid_3 = valid_sparse_cols - 96;
+                        int frag_valid_1 = valid_sparse_cols - 32;
                         uint32_t _thresh_mask_14;
                         {
-                            int _lim_15 = frag_valid_3;
+                            int _lim_15 = frag_valid_1;
                             if (_lim_15 <= 0) { _thresh_mask_14 = 0u; }
                             else if (_lim_15 >= 32) { _thresh_mask_14 = 0xFFFFFFFFu; }
                             else {
@@ -1271,92 +1126,292 @@ kernel_cake_dsv4_430c388f48f1e672627c(const __grid_constant__ CUtensorMap tmap_q
                                     "}" : "=r"(_thresh_mask_14) : "r"(_lim_15));
                             }
                         }
-                        if (!(_thresh_mask_14 & (1u << 0))) sv_f3[0] = -CUDART_INF_F;
-                        if (!(_thresh_mask_14 & (1u << 1))) sv_f3[1] = -CUDART_INF_F;
-                        if (!(_thresh_mask_14 & (1u << 2))) sv_f3[2] = -CUDART_INF_F;
-                        if (!(_thresh_mask_14 & (1u << 3))) sv_f3[3] = -CUDART_INF_F;
-                        if (!(_thresh_mask_14 & (1u << 4))) sv_f3[4] = -CUDART_INF_F;
-                        if (!(_thresh_mask_14 & (1u << 5))) sv_f3[5] = -CUDART_INF_F;
-                        if (!(_thresh_mask_14 & (1u << 6))) sv_f3[6] = -CUDART_INF_F;
-                        if (!(_thresh_mask_14 & (1u << 7))) sv_f3[7] = -CUDART_INF_F;
-                        if (!(_thresh_mask_14 & (1u << 8))) sv_f3[8] = -CUDART_INF_F;
-                        if (!(_thresh_mask_14 & (1u << 9))) sv_f3[9] = -CUDART_INF_F;
-                        if (!(_thresh_mask_14 & (1u << 10))) sv_f3[10] = -CUDART_INF_F;
-                        if (!(_thresh_mask_14 & (1u << 11))) sv_f3[11] = -CUDART_INF_F;
-                        if (!(_thresh_mask_14 & (1u << 12))) sv_f3[12] = -CUDART_INF_F;
-                        if (!(_thresh_mask_14 & (1u << 13))) sv_f3[13] = -CUDART_INF_F;
-                        if (!(_thresh_mask_14 & (1u << 14))) sv_f3[14] = -CUDART_INF_F;
-                        if (!(_thresh_mask_14 & (1u << 15))) sv_f3[15] = -CUDART_INF_F;
-                        if (!(_thresh_mask_14 & (1u << 16))) sv_f3[16] = -CUDART_INF_F;
-                        if (!(_thresh_mask_14 & (1u << 17))) sv_f3[17] = -CUDART_INF_F;
-                        if (!(_thresh_mask_14 & (1u << 18))) sv_f3[18] = -CUDART_INF_F;
-                        if (!(_thresh_mask_14 & (1u << 19))) sv_f3[19] = -CUDART_INF_F;
-                        if (!(_thresh_mask_14 & (1u << 20))) sv_f3[20] = -CUDART_INF_F;
-                        if (!(_thresh_mask_14 & (1u << 21))) sv_f3[21] = -CUDART_INF_F;
-                        if (!(_thresh_mask_14 & (1u << 22))) sv_f3[22] = -CUDART_INF_F;
-                        if (!(_thresh_mask_14 & (1u << 23))) sv_f3[23] = -CUDART_INF_F;
-                        if (!(_thresh_mask_14 & (1u << 24))) sv_f3[24] = -CUDART_INF_F;
-                        if (!(_thresh_mask_14 & (1u << 25))) sv_f3[25] = -CUDART_INF_F;
-                        if (!(_thresh_mask_14 & (1u << 26))) sv_f3[26] = -CUDART_INF_F;
-                        if (!(_thresh_mask_14 & (1u << 27))) sv_f3[27] = -CUDART_INF_F;
-                        if (!(_thresh_mask_14 & (1u << 28))) sv_f3[28] = -CUDART_INF_F;
-                        if (!(_thresh_mask_14 & (1u << 29))) sv_f3[29] = -CUDART_INF_F;
-                        if (!(_thresh_mask_14 & (1u << 30))) sv_f3[30] = -CUDART_INF_F;
-                        if (!(_thresh_mask_14 & (1u << 31))) sv_f3[31] = -CUDART_INF_F;
+                        if (!(_thresh_mask_14 & (1u << 0))) _tmem_load_2[0] = -CUDART_INF_F;
+                        if (!(_thresh_mask_14 & (1u << 1))) _tmem_load_2[1] = -CUDART_INF_F;
+                        if (!(_thresh_mask_14 & (1u << 2))) _tmem_load_2[2] = -CUDART_INF_F;
+                        if (!(_thresh_mask_14 & (1u << 3))) _tmem_load_2[3] = -CUDART_INF_F;
+                        if (!(_thresh_mask_14 & (1u << 4))) _tmem_load_2[4] = -CUDART_INF_F;
+                        if (!(_thresh_mask_14 & (1u << 5))) _tmem_load_2[5] = -CUDART_INF_F;
+                        if (!(_thresh_mask_14 & (1u << 6))) _tmem_load_2[6] = -CUDART_INF_F;
+                        if (!(_thresh_mask_14 & (1u << 7))) _tmem_load_2[7] = -CUDART_INF_F;
+                        if (!(_thresh_mask_14 & (1u << 8))) _tmem_load_2[8] = -CUDART_INF_F;
+                        if (!(_thresh_mask_14 & (1u << 9))) _tmem_load_2[9] = -CUDART_INF_F;
+                        if (!(_thresh_mask_14 & (1u << 10))) _tmem_load_2[10] = -CUDART_INF_F;
+                        if (!(_thresh_mask_14 & (1u << 11))) _tmem_load_2[11] = -CUDART_INF_F;
+                        if (!(_thresh_mask_14 & (1u << 12))) _tmem_load_2[12] = -CUDART_INF_F;
+                        if (!(_thresh_mask_14 & (1u << 13))) _tmem_load_2[13] = -CUDART_INF_F;
+                        if (!(_thresh_mask_14 & (1u << 14))) _tmem_load_2[14] = -CUDART_INF_F;
+                        if (!(_thresh_mask_14 & (1u << 15))) _tmem_load_2[15] = -CUDART_INF_F;
+                        if (!(_thresh_mask_14 & (1u << 16))) _tmem_load_2[16] = -CUDART_INF_F;
+                        if (!(_thresh_mask_14 & (1u << 17))) _tmem_load_2[17] = -CUDART_INF_F;
+                        if (!(_thresh_mask_14 & (1u << 18))) _tmem_load_2[18] = -CUDART_INF_F;
+                        if (!(_thresh_mask_14 & (1u << 19))) _tmem_load_2[19] = -CUDART_INF_F;
+                        if (!(_thresh_mask_14 & (1u << 20))) _tmem_load_2[20] = -CUDART_INF_F;
+                        if (!(_thresh_mask_14 & (1u << 21))) _tmem_load_2[21] = -CUDART_INF_F;
+                        if (!(_thresh_mask_14 & (1u << 22))) _tmem_load_2[22] = -CUDART_INF_F;
+                        if (!(_thresh_mask_14 & (1u << 23))) _tmem_load_2[23] = -CUDART_INF_F;
+                        if (!(_thresh_mask_14 & (1u << 24))) _tmem_load_2[24] = -CUDART_INF_F;
+                        if (!(_thresh_mask_14 & (1u << 25))) _tmem_load_2[25] = -CUDART_INF_F;
+                        if (!(_thresh_mask_14 & (1u << 26))) _tmem_load_2[26] = -CUDART_INF_F;
+                        if (!(_thresh_mask_14 & (1u << 27))) _tmem_load_2[27] = -CUDART_INF_F;
+                        if (!(_thresh_mask_14 & (1u << 28))) _tmem_load_2[28] = -CUDART_INF_F;
+                        if (!(_thresh_mask_14 & (1u << 29))) _tmem_load_2[29] = -CUDART_INF_F;
+                        if (!(_thresh_mask_14 & (1u << 30))) _tmem_load_2[30] = -CUDART_INF_F;
+                        if (!(_thresh_mask_14 & (1u << 31))) _tmem_load_2[31] = -CUDART_INF_F;
                         if (any_invalid != 0) {
-                            unsigned int frag_mask_word_3 = invalid_cols[3];
-                            sv_f3[0] = (((frag_mask_word_3 & 1) != 0) ? -CUDART_INF_F : sv_f3[0]);
-                            sv_f3[1] = (((frag_mask_word_3 >> 1 & 1) != 0) ? -CUDART_INF_F : sv_f3[1]);
-                            sv_f3[2] = (((frag_mask_word_3 >> 2 & 1) != 0) ? -CUDART_INF_F : sv_f3[2]);
-                            sv_f3[3] = (((frag_mask_word_3 >> 3 & 1) != 0) ? -CUDART_INF_F : sv_f3[3]);
-                            sv_f3[4] = (((frag_mask_word_3 >> 4 & 1) != 0) ? -CUDART_INF_F : sv_f3[4]);
-                            sv_f3[5] = (((frag_mask_word_3 >> 5 & 1) != 0) ? -CUDART_INF_F : sv_f3[5]);
-                            sv_f3[6] = (((frag_mask_word_3 >> 6 & 1) != 0) ? -CUDART_INF_F : sv_f3[6]);
-                            sv_f3[7] = (((frag_mask_word_3 >> 7 & 1) != 0) ? -CUDART_INF_F : sv_f3[7]);
-                            sv_f3[8] = (((frag_mask_word_3 >> 8 & 1) != 0) ? -CUDART_INF_F : sv_f3[8]);
-                            sv_f3[9] = (((frag_mask_word_3 >> 9 & 1) != 0) ? -CUDART_INF_F : sv_f3[9]);
-                            sv_f3[10] = (((frag_mask_word_3 >> 10 & 1) != 0) ? -CUDART_INF_F : sv_f3[10]);
-                            sv_f3[11] = (((frag_mask_word_3 >> 11 & 1) != 0) ? -CUDART_INF_F : sv_f3[11]);
-                            sv_f3[12] = (((frag_mask_word_3 >> 12 & 1) != 0) ? -CUDART_INF_F : sv_f3[12]);
-                            sv_f3[13] = (((frag_mask_word_3 >> 13 & 1) != 0) ? -CUDART_INF_F : sv_f3[13]);
-                            sv_f3[14] = (((frag_mask_word_3 >> 14 & 1) != 0) ? -CUDART_INF_F : sv_f3[14]);
-                            sv_f3[15] = (((frag_mask_word_3 >> 15 & 1) != 0) ? -CUDART_INF_F : sv_f3[15]);
-                            sv_f3[16] = (((frag_mask_word_3 >> 16 & 1) != 0) ? -CUDART_INF_F : sv_f3[16]);
-                            sv_f3[17] = (((frag_mask_word_3 >> 17 & 1) != 0) ? -CUDART_INF_F : sv_f3[17]);
-                            sv_f3[18] = (((frag_mask_word_3 >> 18 & 1) != 0) ? -CUDART_INF_F : sv_f3[18]);
-                            sv_f3[19] = (((frag_mask_word_3 >> 19 & 1) != 0) ? -CUDART_INF_F : sv_f3[19]);
-                            sv_f3[20] = (((frag_mask_word_3 >> 20 & 1) != 0) ? -CUDART_INF_F : sv_f3[20]);
-                            sv_f3[21] = (((frag_mask_word_3 >> 21 & 1) != 0) ? -CUDART_INF_F : sv_f3[21]);
-                            sv_f3[22] = (((frag_mask_word_3 >> 22 & 1) != 0) ? -CUDART_INF_F : sv_f3[22]);
-                            sv_f3[23] = (((frag_mask_word_3 >> 23 & 1) != 0) ? -CUDART_INF_F : sv_f3[23]);
-                            sv_f3[24] = (((frag_mask_word_3 >> 24 & 1) != 0) ? -CUDART_INF_F : sv_f3[24]);
-                            sv_f3[25] = (((frag_mask_word_3 >> 25 & 1) != 0) ? -CUDART_INF_F : sv_f3[25]);
-                            sv_f3[26] = (((frag_mask_word_3 >> 26 & 1) != 0) ? -CUDART_INF_F : sv_f3[26]);
-                            sv_f3[27] = (((frag_mask_word_3 >> 27 & 1) != 0) ? -CUDART_INF_F : sv_f3[27]);
-                            sv_f3[28] = (((frag_mask_word_3 >> 28 & 1) != 0) ? -CUDART_INF_F : sv_f3[28]);
-                            sv_f3[29] = (((frag_mask_word_3 >> 29 & 1) != 0) ? -CUDART_INF_F : sv_f3[29]);
-                            sv_f3[30] = (((frag_mask_word_3 >> 30 & 1) != 0) ? -CUDART_INF_F : sv_f3[30]);
-                            sv_f3[31] = (((frag_mask_word_3 >> 31 & 1) != 0) ? -CUDART_INF_F : sv_f3[31]);
+                            unsigned int frag_mask_word_1 = invalid_cols[1];
+                            _tmem_load_2[0] = (((frag_mask_word_1 & 1) != 0) ? -CUDART_INF_F : _tmem_load_2[0]);
+                            _tmem_load_2[1] = (((frag_mask_word_1 >> 1 & 1) != 0) ? -CUDART_INF_F : _tmem_load_2[1]);
+                            _tmem_load_2[2] = (((frag_mask_word_1 >> 2 & 1) != 0) ? -CUDART_INF_F : _tmem_load_2[2]);
+                            _tmem_load_2[3] = (((frag_mask_word_1 >> 3 & 1) != 0) ? -CUDART_INF_F : _tmem_load_2[3]);
+                            _tmem_load_2[4] = (((frag_mask_word_1 >> 4 & 1) != 0) ? -CUDART_INF_F : _tmem_load_2[4]);
+                            _tmem_load_2[5] = (((frag_mask_word_1 >> 5 & 1) != 0) ? -CUDART_INF_F : _tmem_load_2[5]);
+                            _tmem_load_2[6] = (((frag_mask_word_1 >> 6 & 1) != 0) ? -CUDART_INF_F : _tmem_load_2[6]);
+                            _tmem_load_2[7] = (((frag_mask_word_1 >> 7 & 1) != 0) ? -CUDART_INF_F : _tmem_load_2[7]);
+                            _tmem_load_2[8] = (((frag_mask_word_1 >> 8 & 1) != 0) ? -CUDART_INF_F : _tmem_load_2[8]);
+                            _tmem_load_2[9] = (((frag_mask_word_1 >> 9 & 1) != 0) ? -CUDART_INF_F : _tmem_load_2[9]);
+                            _tmem_load_2[10] = (((frag_mask_word_1 >> 10 & 1) != 0) ? -CUDART_INF_F : _tmem_load_2[10]);
+                            _tmem_load_2[11] = (((frag_mask_word_1 >> 11 & 1) != 0) ? -CUDART_INF_F : _tmem_load_2[11]);
+                            _tmem_load_2[12] = (((frag_mask_word_1 >> 12 & 1) != 0) ? -CUDART_INF_F : _tmem_load_2[12]);
+                            _tmem_load_2[13] = (((frag_mask_word_1 >> 13 & 1) != 0) ? -CUDART_INF_F : _tmem_load_2[13]);
+                            _tmem_load_2[14] = (((frag_mask_word_1 >> 14 & 1) != 0) ? -CUDART_INF_F : _tmem_load_2[14]);
+                            _tmem_load_2[15] = (((frag_mask_word_1 >> 15 & 1) != 0) ? -CUDART_INF_F : _tmem_load_2[15]);
+                            _tmem_load_2[16] = (((frag_mask_word_1 >> 16 & 1) != 0) ? -CUDART_INF_F : _tmem_load_2[16]);
+                            _tmem_load_2[17] = (((frag_mask_word_1 >> 17 & 1) != 0) ? -CUDART_INF_F : _tmem_load_2[17]);
+                            _tmem_load_2[18] = (((frag_mask_word_1 >> 18 & 1) != 0) ? -CUDART_INF_F : _tmem_load_2[18]);
+                            _tmem_load_2[19] = (((frag_mask_word_1 >> 19 & 1) != 0) ? -CUDART_INF_F : _tmem_load_2[19]);
+                            _tmem_load_2[20] = (((frag_mask_word_1 >> 20 & 1) != 0) ? -CUDART_INF_F : _tmem_load_2[20]);
+                            _tmem_load_2[21] = (((frag_mask_word_1 >> 21 & 1) != 0) ? -CUDART_INF_F : _tmem_load_2[21]);
+                            _tmem_load_2[22] = (((frag_mask_word_1 >> 22 & 1) != 0) ? -CUDART_INF_F : _tmem_load_2[22]);
+                            _tmem_load_2[23] = (((frag_mask_word_1 >> 23 & 1) != 0) ? -CUDART_INF_F : _tmem_load_2[23]);
+                            _tmem_load_2[24] = (((frag_mask_word_1 >> 24 & 1) != 0) ? -CUDART_INF_F : _tmem_load_2[24]);
+                            _tmem_load_2[25] = (((frag_mask_word_1 >> 25 & 1) != 0) ? -CUDART_INF_F : _tmem_load_2[25]);
+                            _tmem_load_2[26] = (((frag_mask_word_1 >> 26 & 1) != 0) ? -CUDART_INF_F : _tmem_load_2[26]);
+                            _tmem_load_2[27] = (((frag_mask_word_1 >> 27 & 1) != 0) ? -CUDART_INF_F : _tmem_load_2[27]);
+                            _tmem_load_2[28] = (((frag_mask_word_1 >> 28 & 1) != 0) ? -CUDART_INF_F : _tmem_load_2[28]);
+                            _tmem_load_2[29] = (((frag_mask_word_1 >> 29 & 1) != 0) ? -CUDART_INF_F : _tmem_load_2[29]);
+                            _tmem_load_2[30] = (((frag_mask_word_1 >> 30 & 1) != 0) ? -CUDART_INF_F : _tmem_load_2[30]);
+                            _tmem_load_2[31] = (((frag_mask_word_1 >> 31 & 1) != 0) ? -CUDART_INF_F : _tmem_load_2[31]);
                         }
                         float2 _reg_reduce_max2_17 = {-CAKE_INF, -CAKE_INF};
-                        _reg_reduce_max2_17.x = max_noftz(_reg_reduce_max2_17.x, max_noftz(sv_f3[0], sv_f3[1]));
-                        _reg_reduce_max2_17.y = max_noftz(_reg_reduce_max2_17.y, max_noftz(sv_f3[2], sv_f3[3]));
-                        _reg_reduce_max2_17.x = max_noftz(_reg_reduce_max2_17.x, max_noftz(sv_f3[4], sv_f3[5]));
-                        _reg_reduce_max2_17.y = max_noftz(_reg_reduce_max2_17.y, max_noftz(sv_f3[6], sv_f3[7]));
-                        _reg_reduce_max2_17.x = max_noftz(_reg_reduce_max2_17.x, max_noftz(sv_f3[8], sv_f3[9]));
-                        _reg_reduce_max2_17.y = max_noftz(_reg_reduce_max2_17.y, max_noftz(sv_f3[10], sv_f3[11]));
-                        _reg_reduce_max2_17.x = max_noftz(_reg_reduce_max2_17.x, max_noftz(sv_f3[12], sv_f3[13]));
-                        _reg_reduce_max2_17.y = max_noftz(_reg_reduce_max2_17.y, max_noftz(sv_f3[14], sv_f3[15]));
-                        _reg_reduce_max2_17.x = max_noftz(_reg_reduce_max2_17.x, max_noftz(sv_f3[16], sv_f3[17]));
-                        _reg_reduce_max2_17.y = max_noftz(_reg_reduce_max2_17.y, max_noftz(sv_f3[18], sv_f3[19]));
-                        _reg_reduce_max2_17.x = max_noftz(_reg_reduce_max2_17.x, max_noftz(sv_f3[20], sv_f3[21]));
-                        _reg_reduce_max2_17.y = max_noftz(_reg_reduce_max2_17.y, max_noftz(sv_f3[22], sv_f3[23]));
-                        _reg_reduce_max2_17.x = max_noftz(_reg_reduce_max2_17.x, max_noftz(sv_f3[24], sv_f3[25]));
-                        _reg_reduce_max2_17.y = max_noftz(_reg_reduce_max2_17.y, max_noftz(sv_f3[26], sv_f3[27]));
-                        _reg_reduce_max2_17.x = max_noftz(_reg_reduce_max2_17.x, max_noftz(sv_f3[28], sv_f3[29]));
-                        _reg_reduce_max2_17.y = max_noftz(_reg_reduce_max2_17.y, max_noftz(sv_f3[30], sv_f3[31]));
+                        _reg_reduce_max2_17.x = max_noftz(_reg_reduce_max2_17.x, max_noftz(_tmem_load_2[0], _tmem_load_2[1]));
+                        _reg_reduce_max2_17.y = max_noftz(_reg_reduce_max2_17.y, max_noftz(_tmem_load_2[2], _tmem_load_2[3]));
+                        _reg_reduce_max2_17.x = max_noftz(_reg_reduce_max2_17.x, max_noftz(_tmem_load_2[4], _tmem_load_2[5]));
+                        _reg_reduce_max2_17.y = max_noftz(_reg_reduce_max2_17.y, max_noftz(_tmem_load_2[6], _tmem_load_2[7]));
+                        _reg_reduce_max2_17.x = max_noftz(_reg_reduce_max2_17.x, max_noftz(_tmem_load_2[8], _tmem_load_2[9]));
+                        _reg_reduce_max2_17.y = max_noftz(_reg_reduce_max2_17.y, max_noftz(_tmem_load_2[10], _tmem_load_2[11]));
+                        _reg_reduce_max2_17.x = max_noftz(_reg_reduce_max2_17.x, max_noftz(_tmem_load_2[12], _tmem_load_2[13]));
+                        _reg_reduce_max2_17.y = max_noftz(_reg_reduce_max2_17.y, max_noftz(_tmem_load_2[14], _tmem_load_2[15]));
+                        _reg_reduce_max2_17.x = max_noftz(_reg_reduce_max2_17.x, max_noftz(_tmem_load_2[16], _tmem_load_2[17]));
+                        _reg_reduce_max2_17.y = max_noftz(_reg_reduce_max2_17.y, max_noftz(_tmem_load_2[18], _tmem_load_2[19]));
+                        _reg_reduce_max2_17.x = max_noftz(_reg_reduce_max2_17.x, max_noftz(_tmem_load_2[20], _tmem_load_2[21]));
+                        _reg_reduce_max2_17.y = max_noftz(_reg_reduce_max2_17.y, max_noftz(_tmem_load_2[22], _tmem_load_2[23]));
+                        _reg_reduce_max2_17.x = max_noftz(_reg_reduce_max2_17.x, max_noftz(_tmem_load_2[24], _tmem_load_2[25]));
+                        _reg_reduce_max2_17.y = max_noftz(_reg_reduce_max2_17.y, max_noftz(_tmem_load_2[26], _tmem_load_2[27]));
+                        _reg_reduce_max2_17.x = max_noftz(_reg_reduce_max2_17.x, max_noftz(_tmem_load_2[28], _tmem_load_2[29]));
+                        _reg_reduce_max2_17.y = max_noftz(_reg_reduce_max2_17.y, max_noftz(_tmem_load_2[30], _tmem_load_2[31]));
                         float _reg_array_reduce_16 = row_max_reduce(_reg_reduce_max2_17);
                         new_max = max_noftz(new_max, _reg_array_reduce_16);
+                        int frag_valid_2 = valid_sparse_cols - 64;
+                        uint32_t _thresh_mask_18;
+                        {
+                            int _lim_19 = frag_valid_2;
+                            if (_lim_19 <= 0) { _thresh_mask_18 = 0u; }
+                            else if (_lim_19 >= 32) { _thresh_mask_18 = 0xFFFFFFFFu; }
+                            else {
+                                asm volatile("{"
+                                    ".reg .u32 t;\n\t"
+                                    "shl.b32 t, 1, %1;\n\t"
+                                    "add.u32 %0, t, -1;\n\t"
+                                    "}" : "=r"(_thresh_mask_18) : "r"(_lim_19));
+                            }
+                        }
+                        if (!(_thresh_mask_18 & (1u << 0))) _tmem_load_3[0] = -CUDART_INF_F;
+                        if (!(_thresh_mask_18 & (1u << 1))) _tmem_load_3[1] = -CUDART_INF_F;
+                        if (!(_thresh_mask_18 & (1u << 2))) _tmem_load_3[2] = -CUDART_INF_F;
+                        if (!(_thresh_mask_18 & (1u << 3))) _tmem_load_3[3] = -CUDART_INF_F;
+                        if (!(_thresh_mask_18 & (1u << 4))) _tmem_load_3[4] = -CUDART_INF_F;
+                        if (!(_thresh_mask_18 & (1u << 5))) _tmem_load_3[5] = -CUDART_INF_F;
+                        if (!(_thresh_mask_18 & (1u << 6))) _tmem_load_3[6] = -CUDART_INF_F;
+                        if (!(_thresh_mask_18 & (1u << 7))) _tmem_load_3[7] = -CUDART_INF_F;
+                        if (!(_thresh_mask_18 & (1u << 8))) _tmem_load_3[8] = -CUDART_INF_F;
+                        if (!(_thresh_mask_18 & (1u << 9))) _tmem_load_3[9] = -CUDART_INF_F;
+                        if (!(_thresh_mask_18 & (1u << 10))) _tmem_load_3[10] = -CUDART_INF_F;
+                        if (!(_thresh_mask_18 & (1u << 11))) _tmem_load_3[11] = -CUDART_INF_F;
+                        if (!(_thresh_mask_18 & (1u << 12))) _tmem_load_3[12] = -CUDART_INF_F;
+                        if (!(_thresh_mask_18 & (1u << 13))) _tmem_load_3[13] = -CUDART_INF_F;
+                        if (!(_thresh_mask_18 & (1u << 14))) _tmem_load_3[14] = -CUDART_INF_F;
+                        if (!(_thresh_mask_18 & (1u << 15))) _tmem_load_3[15] = -CUDART_INF_F;
+                        if (!(_thresh_mask_18 & (1u << 16))) _tmem_load_3[16] = -CUDART_INF_F;
+                        if (!(_thresh_mask_18 & (1u << 17))) _tmem_load_3[17] = -CUDART_INF_F;
+                        if (!(_thresh_mask_18 & (1u << 18))) _tmem_load_3[18] = -CUDART_INF_F;
+                        if (!(_thresh_mask_18 & (1u << 19))) _tmem_load_3[19] = -CUDART_INF_F;
+                        if (!(_thresh_mask_18 & (1u << 20))) _tmem_load_3[20] = -CUDART_INF_F;
+                        if (!(_thresh_mask_18 & (1u << 21))) _tmem_load_3[21] = -CUDART_INF_F;
+                        if (!(_thresh_mask_18 & (1u << 22))) _tmem_load_3[22] = -CUDART_INF_F;
+                        if (!(_thresh_mask_18 & (1u << 23))) _tmem_load_3[23] = -CUDART_INF_F;
+                        if (!(_thresh_mask_18 & (1u << 24))) _tmem_load_3[24] = -CUDART_INF_F;
+                        if (!(_thresh_mask_18 & (1u << 25))) _tmem_load_3[25] = -CUDART_INF_F;
+                        if (!(_thresh_mask_18 & (1u << 26))) _tmem_load_3[26] = -CUDART_INF_F;
+                        if (!(_thresh_mask_18 & (1u << 27))) _tmem_load_3[27] = -CUDART_INF_F;
+                        if (!(_thresh_mask_18 & (1u << 28))) _tmem_load_3[28] = -CUDART_INF_F;
+                        if (!(_thresh_mask_18 & (1u << 29))) _tmem_load_3[29] = -CUDART_INF_F;
+                        if (!(_thresh_mask_18 & (1u << 30))) _tmem_load_3[30] = -CUDART_INF_F;
+                        if (!(_thresh_mask_18 & (1u << 31))) _tmem_load_3[31] = -CUDART_INF_F;
+                        if (any_invalid != 0) {
+                            unsigned int frag_mask_word_2 = invalid_cols[2];
+                            _tmem_load_3[0] = (((frag_mask_word_2 & 1) != 0) ? -CUDART_INF_F : _tmem_load_3[0]);
+                            _tmem_load_3[1] = (((frag_mask_word_2 >> 1 & 1) != 0) ? -CUDART_INF_F : _tmem_load_3[1]);
+                            _tmem_load_3[2] = (((frag_mask_word_2 >> 2 & 1) != 0) ? -CUDART_INF_F : _tmem_load_3[2]);
+                            _tmem_load_3[3] = (((frag_mask_word_2 >> 3 & 1) != 0) ? -CUDART_INF_F : _tmem_load_3[3]);
+                            _tmem_load_3[4] = (((frag_mask_word_2 >> 4 & 1) != 0) ? -CUDART_INF_F : _tmem_load_3[4]);
+                            _tmem_load_3[5] = (((frag_mask_word_2 >> 5 & 1) != 0) ? -CUDART_INF_F : _tmem_load_3[5]);
+                            _tmem_load_3[6] = (((frag_mask_word_2 >> 6 & 1) != 0) ? -CUDART_INF_F : _tmem_load_3[6]);
+                            _tmem_load_3[7] = (((frag_mask_word_2 >> 7 & 1) != 0) ? -CUDART_INF_F : _tmem_load_3[7]);
+                            _tmem_load_3[8] = (((frag_mask_word_2 >> 8 & 1) != 0) ? -CUDART_INF_F : _tmem_load_3[8]);
+                            _tmem_load_3[9] = (((frag_mask_word_2 >> 9 & 1) != 0) ? -CUDART_INF_F : _tmem_load_3[9]);
+                            _tmem_load_3[10] = (((frag_mask_word_2 >> 10 & 1) != 0) ? -CUDART_INF_F : _tmem_load_3[10]);
+                            _tmem_load_3[11] = (((frag_mask_word_2 >> 11 & 1) != 0) ? -CUDART_INF_F : _tmem_load_3[11]);
+                            _tmem_load_3[12] = (((frag_mask_word_2 >> 12 & 1) != 0) ? -CUDART_INF_F : _tmem_load_3[12]);
+                            _tmem_load_3[13] = (((frag_mask_word_2 >> 13 & 1) != 0) ? -CUDART_INF_F : _tmem_load_3[13]);
+                            _tmem_load_3[14] = (((frag_mask_word_2 >> 14 & 1) != 0) ? -CUDART_INF_F : _tmem_load_3[14]);
+                            _tmem_load_3[15] = (((frag_mask_word_2 >> 15 & 1) != 0) ? -CUDART_INF_F : _tmem_load_3[15]);
+                            _tmem_load_3[16] = (((frag_mask_word_2 >> 16 & 1) != 0) ? -CUDART_INF_F : _tmem_load_3[16]);
+                            _tmem_load_3[17] = (((frag_mask_word_2 >> 17 & 1) != 0) ? -CUDART_INF_F : _tmem_load_3[17]);
+                            _tmem_load_3[18] = (((frag_mask_word_2 >> 18 & 1) != 0) ? -CUDART_INF_F : _tmem_load_3[18]);
+                            _tmem_load_3[19] = (((frag_mask_word_2 >> 19 & 1) != 0) ? -CUDART_INF_F : _tmem_load_3[19]);
+                            _tmem_load_3[20] = (((frag_mask_word_2 >> 20 & 1) != 0) ? -CUDART_INF_F : _tmem_load_3[20]);
+                            _tmem_load_3[21] = (((frag_mask_word_2 >> 21 & 1) != 0) ? -CUDART_INF_F : _tmem_load_3[21]);
+                            _tmem_load_3[22] = (((frag_mask_word_2 >> 22 & 1) != 0) ? -CUDART_INF_F : _tmem_load_3[22]);
+                            _tmem_load_3[23] = (((frag_mask_word_2 >> 23 & 1) != 0) ? -CUDART_INF_F : _tmem_load_3[23]);
+                            _tmem_load_3[24] = (((frag_mask_word_2 >> 24 & 1) != 0) ? -CUDART_INF_F : _tmem_load_3[24]);
+                            _tmem_load_3[25] = (((frag_mask_word_2 >> 25 & 1) != 0) ? -CUDART_INF_F : _tmem_load_3[25]);
+                            _tmem_load_3[26] = (((frag_mask_word_2 >> 26 & 1) != 0) ? -CUDART_INF_F : _tmem_load_3[26]);
+                            _tmem_load_3[27] = (((frag_mask_word_2 >> 27 & 1) != 0) ? -CUDART_INF_F : _tmem_load_3[27]);
+                            _tmem_load_3[28] = (((frag_mask_word_2 >> 28 & 1) != 0) ? -CUDART_INF_F : _tmem_load_3[28]);
+                            _tmem_load_3[29] = (((frag_mask_word_2 >> 29 & 1) != 0) ? -CUDART_INF_F : _tmem_load_3[29]);
+                            _tmem_load_3[30] = (((frag_mask_word_2 >> 30 & 1) != 0) ? -CUDART_INF_F : _tmem_load_3[30]);
+                            _tmem_load_3[31] = (((frag_mask_word_2 >> 31 & 1) != 0) ? -CUDART_INF_F : _tmem_load_3[31]);
+                        }
+                        float2 _reg_reduce_max2_21 = {-CAKE_INF, -CAKE_INF};
+                        _reg_reduce_max2_21.x = max_noftz(_reg_reduce_max2_21.x, max_noftz(_tmem_load_3[0], _tmem_load_3[1]));
+                        _reg_reduce_max2_21.y = max_noftz(_reg_reduce_max2_21.y, max_noftz(_tmem_load_3[2], _tmem_load_3[3]));
+                        _reg_reduce_max2_21.x = max_noftz(_reg_reduce_max2_21.x, max_noftz(_tmem_load_3[4], _tmem_load_3[5]));
+                        _reg_reduce_max2_21.y = max_noftz(_reg_reduce_max2_21.y, max_noftz(_tmem_load_3[6], _tmem_load_3[7]));
+                        _reg_reduce_max2_21.x = max_noftz(_reg_reduce_max2_21.x, max_noftz(_tmem_load_3[8], _tmem_load_3[9]));
+                        _reg_reduce_max2_21.y = max_noftz(_reg_reduce_max2_21.y, max_noftz(_tmem_load_3[10], _tmem_load_3[11]));
+                        _reg_reduce_max2_21.x = max_noftz(_reg_reduce_max2_21.x, max_noftz(_tmem_load_3[12], _tmem_load_3[13]));
+                        _reg_reduce_max2_21.y = max_noftz(_reg_reduce_max2_21.y, max_noftz(_tmem_load_3[14], _tmem_load_3[15]));
+                        _reg_reduce_max2_21.x = max_noftz(_reg_reduce_max2_21.x, max_noftz(_tmem_load_3[16], _tmem_load_3[17]));
+                        _reg_reduce_max2_21.y = max_noftz(_reg_reduce_max2_21.y, max_noftz(_tmem_load_3[18], _tmem_load_3[19]));
+                        _reg_reduce_max2_21.x = max_noftz(_reg_reduce_max2_21.x, max_noftz(_tmem_load_3[20], _tmem_load_3[21]));
+                        _reg_reduce_max2_21.y = max_noftz(_reg_reduce_max2_21.y, max_noftz(_tmem_load_3[22], _tmem_load_3[23]));
+                        _reg_reduce_max2_21.x = max_noftz(_reg_reduce_max2_21.x, max_noftz(_tmem_load_3[24], _tmem_load_3[25]));
+                        _reg_reduce_max2_21.y = max_noftz(_reg_reduce_max2_21.y, max_noftz(_tmem_load_3[26], _tmem_load_3[27]));
+                        _reg_reduce_max2_21.x = max_noftz(_reg_reduce_max2_21.x, max_noftz(_tmem_load_3[28], _tmem_load_3[29]));
+                        _reg_reduce_max2_21.y = max_noftz(_reg_reduce_max2_21.y, max_noftz(_tmem_load_3[30], _tmem_load_3[31]));
+                        float _reg_array_reduce_20 = row_max_reduce(_reg_reduce_max2_21);
+                        new_max = max_noftz(new_max, _reg_array_reduce_20);
+                        int frag_valid_3 = valid_sparse_cols - 96;
+                        uint32_t _thresh_mask_22;
+                        {
+                            int _lim_23 = frag_valid_3;
+                            if (_lim_23 <= 0) { _thresh_mask_22 = 0u; }
+                            else if (_lim_23 >= 32) { _thresh_mask_22 = 0xFFFFFFFFu; }
+                            else {
+                                asm volatile("{"
+                                    ".reg .u32 t;\n\t"
+                                    "shl.b32 t, 1, %1;\n\t"
+                                    "add.u32 %0, t, -1;\n\t"
+                                    "}" : "=r"(_thresh_mask_22) : "r"(_lim_23));
+                            }
+                        }
+                        if (!(_thresh_mask_22 & (1u << 0))) _tmem_load_4[0] = -CUDART_INF_F;
+                        if (!(_thresh_mask_22 & (1u << 1))) _tmem_load_4[1] = -CUDART_INF_F;
+                        if (!(_thresh_mask_22 & (1u << 2))) _tmem_load_4[2] = -CUDART_INF_F;
+                        if (!(_thresh_mask_22 & (1u << 3))) _tmem_load_4[3] = -CUDART_INF_F;
+                        if (!(_thresh_mask_22 & (1u << 4))) _tmem_load_4[4] = -CUDART_INF_F;
+                        if (!(_thresh_mask_22 & (1u << 5))) _tmem_load_4[5] = -CUDART_INF_F;
+                        if (!(_thresh_mask_22 & (1u << 6))) _tmem_load_4[6] = -CUDART_INF_F;
+                        if (!(_thresh_mask_22 & (1u << 7))) _tmem_load_4[7] = -CUDART_INF_F;
+                        if (!(_thresh_mask_22 & (1u << 8))) _tmem_load_4[8] = -CUDART_INF_F;
+                        if (!(_thresh_mask_22 & (1u << 9))) _tmem_load_4[9] = -CUDART_INF_F;
+                        if (!(_thresh_mask_22 & (1u << 10))) _tmem_load_4[10] = -CUDART_INF_F;
+                        if (!(_thresh_mask_22 & (1u << 11))) _tmem_load_4[11] = -CUDART_INF_F;
+                        if (!(_thresh_mask_22 & (1u << 12))) _tmem_load_4[12] = -CUDART_INF_F;
+                        if (!(_thresh_mask_22 & (1u << 13))) _tmem_load_4[13] = -CUDART_INF_F;
+                        if (!(_thresh_mask_22 & (1u << 14))) _tmem_load_4[14] = -CUDART_INF_F;
+                        if (!(_thresh_mask_22 & (1u << 15))) _tmem_load_4[15] = -CUDART_INF_F;
+                        if (!(_thresh_mask_22 & (1u << 16))) _tmem_load_4[16] = -CUDART_INF_F;
+                        if (!(_thresh_mask_22 & (1u << 17))) _tmem_load_4[17] = -CUDART_INF_F;
+                        if (!(_thresh_mask_22 & (1u << 18))) _tmem_load_4[18] = -CUDART_INF_F;
+                        if (!(_thresh_mask_22 & (1u << 19))) _tmem_load_4[19] = -CUDART_INF_F;
+                        if (!(_thresh_mask_22 & (1u << 20))) _tmem_load_4[20] = -CUDART_INF_F;
+                        if (!(_thresh_mask_22 & (1u << 21))) _tmem_load_4[21] = -CUDART_INF_F;
+                        if (!(_thresh_mask_22 & (1u << 22))) _tmem_load_4[22] = -CUDART_INF_F;
+                        if (!(_thresh_mask_22 & (1u << 23))) _tmem_load_4[23] = -CUDART_INF_F;
+                        if (!(_thresh_mask_22 & (1u << 24))) _tmem_load_4[24] = -CUDART_INF_F;
+                        if (!(_thresh_mask_22 & (1u << 25))) _tmem_load_4[25] = -CUDART_INF_F;
+                        if (!(_thresh_mask_22 & (1u << 26))) _tmem_load_4[26] = -CUDART_INF_F;
+                        if (!(_thresh_mask_22 & (1u << 27))) _tmem_load_4[27] = -CUDART_INF_F;
+                        if (!(_thresh_mask_22 & (1u << 28))) _tmem_load_4[28] = -CUDART_INF_F;
+                        if (!(_thresh_mask_22 & (1u << 29))) _tmem_load_4[29] = -CUDART_INF_F;
+                        if (!(_thresh_mask_22 & (1u << 30))) _tmem_load_4[30] = -CUDART_INF_F;
+                        if (!(_thresh_mask_22 & (1u << 31))) _tmem_load_4[31] = -CUDART_INF_F;
+                        if (any_invalid != 0) {
+                            unsigned int frag_mask_word_3 = invalid_cols[3];
+                            _tmem_load_4[0] = (((frag_mask_word_3 & 1) != 0) ? -CUDART_INF_F : _tmem_load_4[0]);
+                            _tmem_load_4[1] = (((frag_mask_word_3 >> 1 & 1) != 0) ? -CUDART_INF_F : _tmem_load_4[1]);
+                            _tmem_load_4[2] = (((frag_mask_word_3 >> 2 & 1) != 0) ? -CUDART_INF_F : _tmem_load_4[2]);
+                            _tmem_load_4[3] = (((frag_mask_word_3 >> 3 & 1) != 0) ? -CUDART_INF_F : _tmem_load_4[3]);
+                            _tmem_load_4[4] = (((frag_mask_word_3 >> 4 & 1) != 0) ? -CUDART_INF_F : _tmem_load_4[4]);
+                            _tmem_load_4[5] = (((frag_mask_word_3 >> 5 & 1) != 0) ? -CUDART_INF_F : _tmem_load_4[5]);
+                            _tmem_load_4[6] = (((frag_mask_word_3 >> 6 & 1) != 0) ? -CUDART_INF_F : _tmem_load_4[6]);
+                            _tmem_load_4[7] = (((frag_mask_word_3 >> 7 & 1) != 0) ? -CUDART_INF_F : _tmem_load_4[7]);
+                            _tmem_load_4[8] = (((frag_mask_word_3 >> 8 & 1) != 0) ? -CUDART_INF_F : _tmem_load_4[8]);
+                            _tmem_load_4[9] = (((frag_mask_word_3 >> 9 & 1) != 0) ? -CUDART_INF_F : _tmem_load_4[9]);
+                            _tmem_load_4[10] = (((frag_mask_word_3 >> 10 & 1) != 0) ? -CUDART_INF_F : _tmem_load_4[10]);
+                            _tmem_load_4[11] = (((frag_mask_word_3 >> 11 & 1) != 0) ? -CUDART_INF_F : _tmem_load_4[11]);
+                            _tmem_load_4[12] = (((frag_mask_word_3 >> 12 & 1) != 0) ? -CUDART_INF_F : _tmem_load_4[12]);
+                            _tmem_load_4[13] = (((frag_mask_word_3 >> 13 & 1) != 0) ? -CUDART_INF_F : _tmem_load_4[13]);
+                            _tmem_load_4[14] = (((frag_mask_word_3 >> 14 & 1) != 0) ? -CUDART_INF_F : _tmem_load_4[14]);
+                            _tmem_load_4[15] = (((frag_mask_word_3 >> 15 & 1) != 0) ? -CUDART_INF_F : _tmem_load_4[15]);
+                            _tmem_load_4[16] = (((frag_mask_word_3 >> 16 & 1) != 0) ? -CUDART_INF_F : _tmem_load_4[16]);
+                            _tmem_load_4[17] = (((frag_mask_word_3 >> 17 & 1) != 0) ? -CUDART_INF_F : _tmem_load_4[17]);
+                            _tmem_load_4[18] = (((frag_mask_word_3 >> 18 & 1) != 0) ? -CUDART_INF_F : _tmem_load_4[18]);
+                            _tmem_load_4[19] = (((frag_mask_word_3 >> 19 & 1) != 0) ? -CUDART_INF_F : _tmem_load_4[19]);
+                            _tmem_load_4[20] = (((frag_mask_word_3 >> 20 & 1) != 0) ? -CUDART_INF_F : _tmem_load_4[20]);
+                            _tmem_load_4[21] = (((frag_mask_word_3 >> 21 & 1) != 0) ? -CUDART_INF_F : _tmem_load_4[21]);
+                            _tmem_load_4[22] = (((frag_mask_word_3 >> 22 & 1) != 0) ? -CUDART_INF_F : _tmem_load_4[22]);
+                            _tmem_load_4[23] = (((frag_mask_word_3 >> 23 & 1) != 0) ? -CUDART_INF_F : _tmem_load_4[23]);
+                            _tmem_load_4[24] = (((frag_mask_word_3 >> 24 & 1) != 0) ? -CUDART_INF_F : _tmem_load_4[24]);
+                            _tmem_load_4[25] = (((frag_mask_word_3 >> 25 & 1) != 0) ? -CUDART_INF_F : _tmem_load_4[25]);
+                            _tmem_load_4[26] = (((frag_mask_word_3 >> 26 & 1) != 0) ? -CUDART_INF_F : _tmem_load_4[26]);
+                            _tmem_load_4[27] = (((frag_mask_word_3 >> 27 & 1) != 0) ? -CUDART_INF_F : _tmem_load_4[27]);
+                            _tmem_load_4[28] = (((frag_mask_word_3 >> 28 & 1) != 0) ? -CUDART_INF_F : _tmem_load_4[28]);
+                            _tmem_load_4[29] = (((frag_mask_word_3 >> 29 & 1) != 0) ? -CUDART_INF_F : _tmem_load_4[29]);
+                            _tmem_load_4[30] = (((frag_mask_word_3 >> 30 & 1) != 0) ? -CUDART_INF_F : _tmem_load_4[30]);
+                            _tmem_load_4[31] = (((frag_mask_word_3 >> 31 & 1) != 0) ? -CUDART_INF_F : _tmem_load_4[31]);
+                        }
+                        float2 _reg_reduce_max2_25 = {-CAKE_INF, -CAKE_INF};
+                        _reg_reduce_max2_25.x = max_noftz(_reg_reduce_max2_25.x, max_noftz(_tmem_load_4[0], _tmem_load_4[1]));
+                        _reg_reduce_max2_25.y = max_noftz(_reg_reduce_max2_25.y, max_noftz(_tmem_load_4[2], _tmem_load_4[3]));
+                        _reg_reduce_max2_25.x = max_noftz(_reg_reduce_max2_25.x, max_noftz(_tmem_load_4[4], _tmem_load_4[5]));
+                        _reg_reduce_max2_25.y = max_noftz(_reg_reduce_max2_25.y, max_noftz(_tmem_load_4[6], _tmem_load_4[7]));
+                        _reg_reduce_max2_25.x = max_noftz(_reg_reduce_max2_25.x, max_noftz(_tmem_load_4[8], _tmem_load_4[9]));
+                        _reg_reduce_max2_25.y = max_noftz(_reg_reduce_max2_25.y, max_noftz(_tmem_load_4[10], _tmem_load_4[11]));
+                        _reg_reduce_max2_25.x = max_noftz(_reg_reduce_max2_25.x, max_noftz(_tmem_load_4[12], _tmem_load_4[13]));
+                        _reg_reduce_max2_25.y = max_noftz(_reg_reduce_max2_25.y, max_noftz(_tmem_load_4[14], _tmem_load_4[15]));
+                        _reg_reduce_max2_25.x = max_noftz(_reg_reduce_max2_25.x, max_noftz(_tmem_load_4[16], _tmem_load_4[17]));
+                        _reg_reduce_max2_25.y = max_noftz(_reg_reduce_max2_25.y, max_noftz(_tmem_load_4[18], _tmem_load_4[19]));
+                        _reg_reduce_max2_25.x = max_noftz(_reg_reduce_max2_25.x, max_noftz(_tmem_load_4[20], _tmem_load_4[21]));
+                        _reg_reduce_max2_25.y = max_noftz(_reg_reduce_max2_25.y, max_noftz(_tmem_load_4[22], _tmem_load_4[23]));
+                        _reg_reduce_max2_25.x = max_noftz(_reg_reduce_max2_25.x, max_noftz(_tmem_load_4[24], _tmem_load_4[25]));
+                        _reg_reduce_max2_25.y = max_noftz(_reg_reduce_max2_25.y, max_noftz(_tmem_load_4[26], _tmem_load_4[27]));
+                        _reg_reduce_max2_25.x = max_noftz(_reg_reduce_max2_25.x, max_noftz(_tmem_load_4[28], _tmem_load_4[29]));
+                        _reg_reduce_max2_25.y = max_noftz(_reg_reduce_max2_25.y, max_noftz(_tmem_load_4[30], _tmem_load_4[31]));
+                        float _reg_array_reduce_24 = row_max_reduce(_reg_reduce_max2_25);
+                        new_max = max_noftz(new_max, _reg_array_reduce_24);
                     }
                     float delta = __fmaf_rn(row_max_val, softmax_scale_log2, (-new_max) * softmax_scale_log2);
                     float exp_delta = approx_exp2(delta);
@@ -1371,79 +1426,79 @@ kernel_cake_dsv4_430c388f48f1e672627c(const __grid_constant__ CUtensorMap tmap_q
                     float block_sum = 0.0f;
                     int p_off_all = ((phase != 0) ? 224 : 96);
                     int p_base_all = taddr + (unsigned int)p_off_all + (unsigned int)(tmem_row_base << 16);
-                    const float2 _fma_b2_18 = {softmax_scale_log2, softmax_scale_log2};
-                    const float2 _fma_c2_19 = {8.0f - max_scaled, 8.0f - max_scaled};
-                    float2 _fma_pair_20 = fma_f32x2(make_float2(sv[0], sv[1]), _fma_b2_18, _fma_c2_19);
-                    sv[0] = _fma_pair_20.x;
-                    sv[1] = _fma_pair_20.y;
-                    float2 _fma_pair_21 = fma_f32x2(make_float2(sv[2], sv[3]), _fma_b2_18, _fma_c2_19);
-                    sv[2] = _fma_pair_21.x;
-                    sv[3] = _fma_pair_21.y;
-                    float2 _fma_pair_22 = fma_f32x2(make_float2(sv[4], sv[5]), _fma_b2_18, _fma_c2_19);
-                    sv[4] = _fma_pair_22.x;
-                    sv[5] = _fma_pair_22.y;
-                    float2 _fma_pair_23 = fma_f32x2(make_float2(sv[6], sv[7]), _fma_b2_18, _fma_c2_19);
-                    sv[6] = _fma_pair_23.x;
-                    sv[7] = _fma_pair_23.y;
-                    float2 _fma_pair_24 = fma_f32x2(make_float2(sv[8], sv[9]), _fma_b2_18, _fma_c2_19);
-                    sv[8] = _fma_pair_24.x;
-                    sv[9] = _fma_pair_24.y;
-                    float2 _fma_pair_25 = fma_f32x2(make_float2(sv[10], sv[11]), _fma_b2_18, _fma_c2_19);
-                    sv[10] = _fma_pair_25.x;
-                    sv[11] = _fma_pair_25.y;
-                    float2 _fma_pair_26 = fma_f32x2(make_float2(sv[12], sv[13]), _fma_b2_18, _fma_c2_19);
-                    sv[12] = _fma_pair_26.x;
-                    sv[13] = _fma_pair_26.y;
-                    float2 _fma_pair_27 = fma_f32x2(make_float2(sv[14], sv[15]), _fma_b2_18, _fma_c2_19);
-                    sv[14] = _fma_pair_27.x;
-                    sv[15] = _fma_pair_27.y;
-                    float2 _fma_pair_28 = fma_f32x2(make_float2(sv[16], sv[17]), _fma_b2_18, _fma_c2_19);
-                    sv[16] = _fma_pair_28.x;
-                    sv[17] = _fma_pair_28.y;
-                    float2 _fma_pair_29 = fma_f32x2(make_float2(sv[18], sv[19]), _fma_b2_18, _fma_c2_19);
-                    sv[18] = _fma_pair_29.x;
-                    sv[19] = _fma_pair_29.y;
-                    float2 _fma_pair_30 = fma_f32x2(make_float2(sv[20], sv[21]), _fma_b2_18, _fma_c2_19);
-                    sv[20] = _fma_pair_30.x;
-                    sv[21] = _fma_pair_30.y;
-                    float2 _fma_pair_31 = fma_f32x2(make_float2(sv[22], sv[23]), _fma_b2_18, _fma_c2_19);
-                    sv[22] = _fma_pair_31.x;
-                    sv[23] = _fma_pair_31.y;
-                    float2 _fma_pair_32 = fma_f32x2(make_float2(sv[24], sv[25]), _fma_b2_18, _fma_c2_19);
-                    sv[24] = _fma_pair_32.x;
-                    sv[25] = _fma_pair_32.y;
-                    float2 _fma_pair_33 = fma_f32x2(make_float2(sv[26], sv[27]), _fma_b2_18, _fma_c2_19);
-                    sv[26] = _fma_pair_33.x;
-                    sv[27] = _fma_pair_33.y;
-                    float2 _fma_pair_34 = fma_f32x2(make_float2(sv[28], sv[29]), _fma_b2_18, _fma_c2_19);
-                    sv[28] = _fma_pair_34.x;
-                    sv[29] = _fma_pair_34.y;
-                    float2 _fma_pair_35 = fma_f32x2(make_float2(sv[30], sv[31]), _fma_b2_18, _fma_c2_19);
-                    sv[30] = _fma_pair_35.x;
-                    sv[31] = _fma_pair_35.y;
+                    const float2 _fma_b2_26 = {softmax_scale_log2, softmax_scale_log2};
+                    const float2 _fma_c2_27 = {8.0f - max_scaled, 8.0f - max_scaled};
+                    float2 _fma_pair_28 = fma_f32x2(make_float2(_tmem_load_0[0], _tmem_load_0[1]), _fma_b2_26, _fma_c2_27);
+                    _tmem_load_0[0] = _fma_pair_28.x;
+                    _tmem_load_0[1] = _fma_pair_28.y;
+                    float2 _fma_pair_29 = fma_f32x2(make_float2(_tmem_load_0[2], _tmem_load_0[3]), _fma_b2_26, _fma_c2_27);
+                    _tmem_load_0[2] = _fma_pair_29.x;
+                    _tmem_load_0[3] = _fma_pair_29.y;
+                    float2 _fma_pair_30 = fma_f32x2(make_float2(_tmem_load_0[4], _tmem_load_0[5]), _fma_b2_26, _fma_c2_27);
+                    _tmem_load_0[4] = _fma_pair_30.x;
+                    _tmem_load_0[5] = _fma_pair_30.y;
+                    float2 _fma_pair_31 = fma_f32x2(make_float2(_tmem_load_0[6], _tmem_load_0[7]), _fma_b2_26, _fma_c2_27);
+                    _tmem_load_0[6] = _fma_pair_31.x;
+                    _tmem_load_0[7] = _fma_pair_31.y;
+                    float2 _fma_pair_32 = fma_f32x2(make_float2(_tmem_load_0[8], _tmem_load_0[9]), _fma_b2_26, _fma_c2_27);
+                    _tmem_load_0[8] = _fma_pair_32.x;
+                    _tmem_load_0[9] = _fma_pair_32.y;
+                    float2 _fma_pair_33 = fma_f32x2(make_float2(_tmem_load_0[10], _tmem_load_0[11]), _fma_b2_26, _fma_c2_27);
+                    _tmem_load_0[10] = _fma_pair_33.x;
+                    _tmem_load_0[11] = _fma_pair_33.y;
+                    float2 _fma_pair_34 = fma_f32x2(make_float2(_tmem_load_0[12], _tmem_load_0[13]), _fma_b2_26, _fma_c2_27);
+                    _tmem_load_0[12] = _fma_pair_34.x;
+                    _tmem_load_0[13] = _fma_pair_34.y;
+                    float2 _fma_pair_35 = fma_f32x2(make_float2(_tmem_load_0[14], _tmem_load_0[15]), _fma_b2_26, _fma_c2_27);
+                    _tmem_load_0[14] = _fma_pair_35.x;
+                    _tmem_load_0[15] = _fma_pair_35.y;
+                    float2 _fma_pair_36 = fma_f32x2(make_float2(_tmem_load_0[16], _tmem_load_0[17]), _fma_b2_26, _fma_c2_27);
+                    _tmem_load_0[16] = _fma_pair_36.x;
+                    _tmem_load_0[17] = _fma_pair_36.y;
+                    float2 _fma_pair_37 = fma_f32x2(make_float2(_tmem_load_0[18], _tmem_load_0[19]), _fma_b2_26, _fma_c2_27);
+                    _tmem_load_0[18] = _fma_pair_37.x;
+                    _tmem_load_0[19] = _fma_pair_37.y;
+                    float2 _fma_pair_38 = fma_f32x2(make_float2(_tmem_load_0[20], _tmem_load_0[21]), _fma_b2_26, _fma_c2_27);
+                    _tmem_load_0[20] = _fma_pair_38.x;
+                    _tmem_load_0[21] = _fma_pair_38.y;
+                    float2 _fma_pair_39 = fma_f32x2(make_float2(_tmem_load_0[22], _tmem_load_0[23]), _fma_b2_26, _fma_c2_27);
+                    _tmem_load_0[22] = _fma_pair_39.x;
+                    _tmem_load_0[23] = _fma_pair_39.y;
+                    float2 _fma_pair_40 = fma_f32x2(make_float2(_tmem_load_0[24], _tmem_load_0[25]), _fma_b2_26, _fma_c2_27);
+                    _tmem_load_0[24] = _fma_pair_40.x;
+                    _tmem_load_0[25] = _fma_pair_40.y;
+                    float2 _fma_pair_41 = fma_f32x2(make_float2(_tmem_load_0[26], _tmem_load_0[27]), _fma_b2_26, _fma_c2_27);
+                    _tmem_load_0[26] = _fma_pair_41.x;
+                    _tmem_load_0[27] = _fma_pair_41.y;
+                    float2 _fma_pair_42 = fma_f32x2(make_float2(_tmem_load_0[28], _tmem_load_0[29]), _fma_b2_26, _fma_c2_27);
+                    _tmem_load_0[28] = _fma_pair_42.x;
+                    _tmem_load_0[29] = _fma_pair_42.y;
+                    float2 _fma_pair_43 = fma_f32x2(make_float2(_tmem_load_0[30], _tmem_load_0[31]), _fma_b2_26, _fma_c2_27);
+                    _tmem_load_0[30] = _fma_pair_43.x;
+                    _tmem_load_0[31] = _fma_pair_43.y;
                     #pragma unroll
                     for (int _le = 0; _le < 32; _le++) {
-                        sv[_le] = approx_exp2(sv[_le]);
+                        _tmem_load_0[_le] = approx_exp2(_tmem_load_0[_le]);
                     }
-                    float2 _reg_reduce_sum2_37 = make_float2(0.0f, 0.0f);
-                    _reg_reduce_sum2_37 = add_f32x2(_reg_reduce_sum2_37, make_float2(sv[0], sv[1]));
-                    _reg_reduce_sum2_37 = add_f32x2(_reg_reduce_sum2_37, make_float2(sv[2], sv[3]));
-                    _reg_reduce_sum2_37 = add_f32x2(_reg_reduce_sum2_37, make_float2(sv[4], sv[5]));
-                    _reg_reduce_sum2_37 = add_f32x2(_reg_reduce_sum2_37, make_float2(sv[6], sv[7]));
-                    _reg_reduce_sum2_37 = add_f32x2(_reg_reduce_sum2_37, make_float2(sv[8], sv[9]));
-                    _reg_reduce_sum2_37 = add_f32x2(_reg_reduce_sum2_37, make_float2(sv[10], sv[11]));
-                    _reg_reduce_sum2_37 = add_f32x2(_reg_reduce_sum2_37, make_float2(sv[12], sv[13]));
-                    _reg_reduce_sum2_37 = add_f32x2(_reg_reduce_sum2_37, make_float2(sv[14], sv[15]));
-                    _reg_reduce_sum2_37 = add_f32x2(_reg_reduce_sum2_37, make_float2(sv[16], sv[17]));
-                    _reg_reduce_sum2_37 = add_f32x2(_reg_reduce_sum2_37, make_float2(sv[18], sv[19]));
-                    _reg_reduce_sum2_37 = add_f32x2(_reg_reduce_sum2_37, make_float2(sv[20], sv[21]));
-                    _reg_reduce_sum2_37 = add_f32x2(_reg_reduce_sum2_37, make_float2(sv[22], sv[23]));
-                    _reg_reduce_sum2_37 = add_f32x2(_reg_reduce_sum2_37, make_float2(sv[24], sv[25]));
-                    _reg_reduce_sum2_37 = add_f32x2(_reg_reduce_sum2_37, make_float2(sv[26], sv[27]));
-                    _reg_reduce_sum2_37 = add_f32x2(_reg_reduce_sum2_37, make_float2(sv[28], sv[29]));
-                    _reg_reduce_sum2_37 = add_f32x2(_reg_reduce_sum2_37, make_float2(sv[30], sv[31]));
-                    float _reg_array_reduce_36 = _reg_reduce_sum2_37.x + _reg_reduce_sum2_37.y;
-                    block_sum = block_sum + _reg_array_reduce_36;
+                    float2 _reg_reduce_sum2_45 = make_float2(0.0f, 0.0f);
+                    _reg_reduce_sum2_45 = add_f32x2(_reg_reduce_sum2_45, make_float2(_tmem_load_0[0], _tmem_load_0[1]));
+                    _reg_reduce_sum2_45 = add_f32x2(_reg_reduce_sum2_45, make_float2(_tmem_load_0[2], _tmem_load_0[3]));
+                    _reg_reduce_sum2_45 = add_f32x2(_reg_reduce_sum2_45, make_float2(_tmem_load_0[4], _tmem_load_0[5]));
+                    _reg_reduce_sum2_45 = add_f32x2(_reg_reduce_sum2_45, make_float2(_tmem_load_0[6], _tmem_load_0[7]));
+                    _reg_reduce_sum2_45 = add_f32x2(_reg_reduce_sum2_45, make_float2(_tmem_load_0[8], _tmem_load_0[9]));
+                    _reg_reduce_sum2_45 = add_f32x2(_reg_reduce_sum2_45, make_float2(_tmem_load_0[10], _tmem_load_0[11]));
+                    _reg_reduce_sum2_45 = add_f32x2(_reg_reduce_sum2_45, make_float2(_tmem_load_0[12], _tmem_load_0[13]));
+                    _reg_reduce_sum2_45 = add_f32x2(_reg_reduce_sum2_45, make_float2(_tmem_load_0[14], _tmem_load_0[15]));
+                    _reg_reduce_sum2_45 = add_f32x2(_reg_reduce_sum2_45, make_float2(_tmem_load_0[16], _tmem_load_0[17]));
+                    _reg_reduce_sum2_45 = add_f32x2(_reg_reduce_sum2_45, make_float2(_tmem_load_0[18], _tmem_load_0[19]));
+                    _reg_reduce_sum2_45 = add_f32x2(_reg_reduce_sum2_45, make_float2(_tmem_load_0[20], _tmem_load_0[21]));
+                    _reg_reduce_sum2_45 = add_f32x2(_reg_reduce_sum2_45, make_float2(_tmem_load_0[22], _tmem_load_0[23]));
+                    _reg_reduce_sum2_45 = add_f32x2(_reg_reduce_sum2_45, make_float2(_tmem_load_0[24], _tmem_load_0[25]));
+                    _reg_reduce_sum2_45 = add_f32x2(_reg_reduce_sum2_45, make_float2(_tmem_load_0[26], _tmem_load_0[27]));
+                    _reg_reduce_sum2_45 = add_f32x2(_reg_reduce_sum2_45, make_float2(_tmem_load_0[28], _tmem_load_0[29]));
+                    _reg_reduce_sum2_45 = add_f32x2(_reg_reduce_sum2_45, make_float2(_tmem_load_0[30], _tmem_load_0[31]));
+                    float _reg_array_reduce_44 = _reg_reduce_sum2_45.x + _reg_reduce_sum2_45.y;
+                    block_sum = block_sum + _reg_array_reduce_44;
                     unsigned int _fp8_0[8];
                     {
                         uint32_t _packed;
@@ -1454,8 +1509,8 @@ kernel_cake_dsv4_430c388f48f1e672627c(const __grid_constant__ CUtensorMap tmap_q
                             "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
                             "mov.b32 %0, {_lo, _hi};\n\t"
                             "}"
-                            : "=r"(_packed) : "f"(sv[0]), "f"(sv[1]),
-                                               "f"(sv[2]), "f"(sv[3]));
+                            : "=r"(_packed) : "f"(_tmem_load_0[0]), "f"(_tmem_load_0[1]),
+                                               "f"(_tmem_load_0[2]), "f"(_tmem_load_0[3]));
                         _fp8_0[0] = _packed;
                     }
                     {
@@ -1467,8 +1522,8 @@ kernel_cake_dsv4_430c388f48f1e672627c(const __grid_constant__ CUtensorMap tmap_q
                             "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
                             "mov.b32 %0, {_lo, _hi};\n\t"
                             "}"
-                            : "=r"(_packed) : "f"(sv[4]), "f"(sv[5]),
-                                               "f"(sv[6]), "f"(sv[7]));
+                            : "=r"(_packed) : "f"(_tmem_load_0[4]), "f"(_tmem_load_0[5]),
+                                               "f"(_tmem_load_0[6]), "f"(_tmem_load_0[7]));
                         _fp8_0[1] = _packed;
                     }
                     {
@@ -1480,8 +1535,8 @@ kernel_cake_dsv4_430c388f48f1e672627c(const __grid_constant__ CUtensorMap tmap_q
                             "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
                             "mov.b32 %0, {_lo, _hi};\n\t"
                             "}"
-                            : "=r"(_packed) : "f"(sv[8]), "f"(sv[9]),
-                                               "f"(sv[10]), "f"(sv[11]));
+                            : "=r"(_packed) : "f"(_tmem_load_0[8]), "f"(_tmem_load_0[9]),
+                                               "f"(_tmem_load_0[10]), "f"(_tmem_load_0[11]));
                         _fp8_0[2] = _packed;
                     }
                     {
@@ -1493,8 +1548,8 @@ kernel_cake_dsv4_430c388f48f1e672627c(const __grid_constant__ CUtensorMap tmap_q
                             "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
                             "mov.b32 %0, {_lo, _hi};\n\t"
                             "}"
-                            : "=r"(_packed) : "f"(sv[12]), "f"(sv[13]),
-                                               "f"(sv[14]), "f"(sv[15]));
+                            : "=r"(_packed) : "f"(_tmem_load_0[12]), "f"(_tmem_load_0[13]),
+                                               "f"(_tmem_load_0[14]), "f"(_tmem_load_0[15]));
                         _fp8_0[3] = _packed;
                     }
                     {
@@ -1506,8 +1561,8 @@ kernel_cake_dsv4_430c388f48f1e672627c(const __grid_constant__ CUtensorMap tmap_q
                             "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
                             "mov.b32 %0, {_lo, _hi};\n\t"
                             "}"
-                            : "=r"(_packed) : "f"(sv[16]), "f"(sv[17]),
-                                               "f"(sv[18]), "f"(sv[19]));
+                            : "=r"(_packed) : "f"(_tmem_load_0[16]), "f"(_tmem_load_0[17]),
+                                               "f"(_tmem_load_0[18]), "f"(_tmem_load_0[19]));
                         _fp8_0[4] = _packed;
                     }
                     {
@@ -1519,8 +1574,8 @@ kernel_cake_dsv4_430c388f48f1e672627c(const __grid_constant__ CUtensorMap tmap_q
                             "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
                             "mov.b32 %0, {_lo, _hi};\n\t"
                             "}"
-                            : "=r"(_packed) : "f"(sv[20]), "f"(sv[21]),
-                                               "f"(sv[22]), "f"(sv[23]));
+                            : "=r"(_packed) : "f"(_tmem_load_0[20]), "f"(_tmem_load_0[21]),
+                                               "f"(_tmem_load_0[22]), "f"(_tmem_load_0[23]));
                         _fp8_0[5] = _packed;
                     }
                     {
@@ -1532,8 +1587,8 @@ kernel_cake_dsv4_430c388f48f1e672627c(const __grid_constant__ CUtensorMap tmap_q
                             "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
                             "mov.b32 %0, {_lo, _hi};\n\t"
                             "}"
-                            : "=r"(_packed) : "f"(sv[24]), "f"(sv[25]),
-                                               "f"(sv[26]), "f"(sv[27]));
+                            : "=r"(_packed) : "f"(_tmem_load_0[24]), "f"(_tmem_load_0[25]),
+                                               "f"(_tmem_load_0[26]), "f"(_tmem_load_0[27]));
                         _fp8_0[6] = _packed;
                     }
                     {
@@ -1545,84 +1600,84 @@ kernel_cake_dsv4_430c388f48f1e672627c(const __grid_constant__ CUtensorMap tmap_q
                             "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
                             "mov.b32 %0, {_lo, _hi};\n\t"
                             "}"
-                            : "=r"(_packed) : "f"(sv[28]), "f"(sv[29]),
-                                               "f"(sv[30]), "f"(sv[31]));
+                            : "=r"(_packed) : "f"(_tmem_load_0[28]), "f"(_tmem_load_0[29]),
+                                               "f"(_tmem_load_0[30]), "f"(_tmem_load_0[31]));
                         _fp8_0[7] = _packed;
                     }
                     tmem_st_x8_u32(p_base_all, (const uint32_t*)_fp8_0);
-                    const float2 _fma_b2_38 = {softmax_scale_log2, softmax_scale_log2};
-                    const float2 _fma_c2_39 = {8.0f - max_scaled, 8.0f - max_scaled};
-                    float2 _fma_pair_40 = fma_f32x2(make_float2(sv_f1[0], sv_f1[1]), _fma_b2_38, _fma_c2_39);
-                    sv_f1[0] = _fma_pair_40.x;
-                    sv_f1[1] = _fma_pair_40.y;
-                    float2 _fma_pair_41 = fma_f32x2(make_float2(sv_f1[2], sv_f1[3]), _fma_b2_38, _fma_c2_39);
-                    sv_f1[2] = _fma_pair_41.x;
-                    sv_f1[3] = _fma_pair_41.y;
-                    float2 _fma_pair_42 = fma_f32x2(make_float2(sv_f1[4], sv_f1[5]), _fma_b2_38, _fma_c2_39);
-                    sv_f1[4] = _fma_pair_42.x;
-                    sv_f1[5] = _fma_pair_42.y;
-                    float2 _fma_pair_43 = fma_f32x2(make_float2(sv_f1[6], sv_f1[7]), _fma_b2_38, _fma_c2_39);
-                    sv_f1[6] = _fma_pair_43.x;
-                    sv_f1[7] = _fma_pair_43.y;
-                    float2 _fma_pair_44 = fma_f32x2(make_float2(sv_f1[8], sv_f1[9]), _fma_b2_38, _fma_c2_39);
-                    sv_f1[8] = _fma_pair_44.x;
-                    sv_f1[9] = _fma_pair_44.y;
-                    float2 _fma_pair_45 = fma_f32x2(make_float2(sv_f1[10], sv_f1[11]), _fma_b2_38, _fma_c2_39);
-                    sv_f1[10] = _fma_pair_45.x;
-                    sv_f1[11] = _fma_pair_45.y;
-                    float2 _fma_pair_46 = fma_f32x2(make_float2(sv_f1[12], sv_f1[13]), _fma_b2_38, _fma_c2_39);
-                    sv_f1[12] = _fma_pair_46.x;
-                    sv_f1[13] = _fma_pair_46.y;
-                    float2 _fma_pair_47 = fma_f32x2(make_float2(sv_f1[14], sv_f1[15]), _fma_b2_38, _fma_c2_39);
-                    sv_f1[14] = _fma_pair_47.x;
-                    sv_f1[15] = _fma_pair_47.y;
-                    float2 _fma_pair_48 = fma_f32x2(make_float2(sv_f1[16], sv_f1[17]), _fma_b2_38, _fma_c2_39);
-                    sv_f1[16] = _fma_pair_48.x;
-                    sv_f1[17] = _fma_pair_48.y;
-                    float2 _fma_pair_49 = fma_f32x2(make_float2(sv_f1[18], sv_f1[19]), _fma_b2_38, _fma_c2_39);
-                    sv_f1[18] = _fma_pair_49.x;
-                    sv_f1[19] = _fma_pair_49.y;
-                    float2 _fma_pair_50 = fma_f32x2(make_float2(sv_f1[20], sv_f1[21]), _fma_b2_38, _fma_c2_39);
-                    sv_f1[20] = _fma_pair_50.x;
-                    sv_f1[21] = _fma_pair_50.y;
-                    float2 _fma_pair_51 = fma_f32x2(make_float2(sv_f1[22], sv_f1[23]), _fma_b2_38, _fma_c2_39);
-                    sv_f1[22] = _fma_pair_51.x;
-                    sv_f1[23] = _fma_pair_51.y;
-                    float2 _fma_pair_52 = fma_f32x2(make_float2(sv_f1[24], sv_f1[25]), _fma_b2_38, _fma_c2_39);
-                    sv_f1[24] = _fma_pair_52.x;
-                    sv_f1[25] = _fma_pair_52.y;
-                    float2 _fma_pair_53 = fma_f32x2(make_float2(sv_f1[26], sv_f1[27]), _fma_b2_38, _fma_c2_39);
-                    sv_f1[26] = _fma_pair_53.x;
-                    sv_f1[27] = _fma_pair_53.y;
-                    float2 _fma_pair_54 = fma_f32x2(make_float2(sv_f1[28], sv_f1[29]), _fma_b2_38, _fma_c2_39);
-                    sv_f1[28] = _fma_pair_54.x;
-                    sv_f1[29] = _fma_pair_54.y;
-                    float2 _fma_pair_55 = fma_f32x2(make_float2(sv_f1[30], sv_f1[31]), _fma_b2_38, _fma_c2_39);
-                    sv_f1[30] = _fma_pair_55.x;
-                    sv_f1[31] = _fma_pair_55.y;
+                    const float2 _fma_b2_46 = {softmax_scale_log2, softmax_scale_log2};
+                    const float2 _fma_c2_47 = {8.0f - max_scaled, 8.0f - max_scaled};
+                    float2 _fma_pair_48 = fma_f32x2(make_float2(_tmem_load_2[0], _tmem_load_2[1]), _fma_b2_46, _fma_c2_47);
+                    _tmem_load_2[0] = _fma_pair_48.x;
+                    _tmem_load_2[1] = _fma_pair_48.y;
+                    float2 _fma_pair_49 = fma_f32x2(make_float2(_tmem_load_2[2], _tmem_load_2[3]), _fma_b2_46, _fma_c2_47);
+                    _tmem_load_2[2] = _fma_pair_49.x;
+                    _tmem_load_2[3] = _fma_pair_49.y;
+                    float2 _fma_pair_50 = fma_f32x2(make_float2(_tmem_load_2[4], _tmem_load_2[5]), _fma_b2_46, _fma_c2_47);
+                    _tmem_load_2[4] = _fma_pair_50.x;
+                    _tmem_load_2[5] = _fma_pair_50.y;
+                    float2 _fma_pair_51 = fma_f32x2(make_float2(_tmem_load_2[6], _tmem_load_2[7]), _fma_b2_46, _fma_c2_47);
+                    _tmem_load_2[6] = _fma_pair_51.x;
+                    _tmem_load_2[7] = _fma_pair_51.y;
+                    float2 _fma_pair_52 = fma_f32x2(make_float2(_tmem_load_2[8], _tmem_load_2[9]), _fma_b2_46, _fma_c2_47);
+                    _tmem_load_2[8] = _fma_pair_52.x;
+                    _tmem_load_2[9] = _fma_pair_52.y;
+                    float2 _fma_pair_53 = fma_f32x2(make_float2(_tmem_load_2[10], _tmem_load_2[11]), _fma_b2_46, _fma_c2_47);
+                    _tmem_load_2[10] = _fma_pair_53.x;
+                    _tmem_load_2[11] = _fma_pair_53.y;
+                    float2 _fma_pair_54 = fma_f32x2(make_float2(_tmem_load_2[12], _tmem_load_2[13]), _fma_b2_46, _fma_c2_47);
+                    _tmem_load_2[12] = _fma_pair_54.x;
+                    _tmem_load_2[13] = _fma_pair_54.y;
+                    float2 _fma_pair_55 = fma_f32x2(make_float2(_tmem_load_2[14], _tmem_load_2[15]), _fma_b2_46, _fma_c2_47);
+                    _tmem_load_2[14] = _fma_pair_55.x;
+                    _tmem_load_2[15] = _fma_pair_55.y;
+                    float2 _fma_pair_56 = fma_f32x2(make_float2(_tmem_load_2[16], _tmem_load_2[17]), _fma_b2_46, _fma_c2_47);
+                    _tmem_load_2[16] = _fma_pair_56.x;
+                    _tmem_load_2[17] = _fma_pair_56.y;
+                    float2 _fma_pair_57 = fma_f32x2(make_float2(_tmem_load_2[18], _tmem_load_2[19]), _fma_b2_46, _fma_c2_47);
+                    _tmem_load_2[18] = _fma_pair_57.x;
+                    _tmem_load_2[19] = _fma_pair_57.y;
+                    float2 _fma_pair_58 = fma_f32x2(make_float2(_tmem_load_2[20], _tmem_load_2[21]), _fma_b2_46, _fma_c2_47);
+                    _tmem_load_2[20] = _fma_pair_58.x;
+                    _tmem_load_2[21] = _fma_pair_58.y;
+                    float2 _fma_pair_59 = fma_f32x2(make_float2(_tmem_load_2[22], _tmem_load_2[23]), _fma_b2_46, _fma_c2_47);
+                    _tmem_load_2[22] = _fma_pair_59.x;
+                    _tmem_load_2[23] = _fma_pair_59.y;
+                    float2 _fma_pair_60 = fma_f32x2(make_float2(_tmem_load_2[24], _tmem_load_2[25]), _fma_b2_46, _fma_c2_47);
+                    _tmem_load_2[24] = _fma_pair_60.x;
+                    _tmem_load_2[25] = _fma_pair_60.y;
+                    float2 _fma_pair_61 = fma_f32x2(make_float2(_tmem_load_2[26], _tmem_load_2[27]), _fma_b2_46, _fma_c2_47);
+                    _tmem_load_2[26] = _fma_pair_61.x;
+                    _tmem_load_2[27] = _fma_pair_61.y;
+                    float2 _fma_pair_62 = fma_f32x2(make_float2(_tmem_load_2[28], _tmem_load_2[29]), _fma_b2_46, _fma_c2_47);
+                    _tmem_load_2[28] = _fma_pair_62.x;
+                    _tmem_load_2[29] = _fma_pair_62.y;
+                    float2 _fma_pair_63 = fma_f32x2(make_float2(_tmem_load_2[30], _tmem_load_2[31]), _fma_b2_46, _fma_c2_47);
+                    _tmem_load_2[30] = _fma_pair_63.x;
+                    _tmem_load_2[31] = _fma_pair_63.y;
                     #pragma unroll
                     for (int _le = 0; _le < 32; _le++) {
-                        sv_f1[_le] = approx_exp2(sv_f1[_le]);
+                        _tmem_load_2[_le] = approx_exp2(_tmem_load_2[_le]);
                     }
-                    float2 _reg_reduce_sum2_57 = make_float2(0.0f, 0.0f);
-                    _reg_reduce_sum2_57 = add_f32x2(_reg_reduce_sum2_57, make_float2(sv_f1[0], sv_f1[1]));
-                    _reg_reduce_sum2_57 = add_f32x2(_reg_reduce_sum2_57, make_float2(sv_f1[2], sv_f1[3]));
-                    _reg_reduce_sum2_57 = add_f32x2(_reg_reduce_sum2_57, make_float2(sv_f1[4], sv_f1[5]));
-                    _reg_reduce_sum2_57 = add_f32x2(_reg_reduce_sum2_57, make_float2(sv_f1[6], sv_f1[7]));
-                    _reg_reduce_sum2_57 = add_f32x2(_reg_reduce_sum2_57, make_float2(sv_f1[8], sv_f1[9]));
-                    _reg_reduce_sum2_57 = add_f32x2(_reg_reduce_sum2_57, make_float2(sv_f1[10], sv_f1[11]));
-                    _reg_reduce_sum2_57 = add_f32x2(_reg_reduce_sum2_57, make_float2(sv_f1[12], sv_f1[13]));
-                    _reg_reduce_sum2_57 = add_f32x2(_reg_reduce_sum2_57, make_float2(sv_f1[14], sv_f1[15]));
-                    _reg_reduce_sum2_57 = add_f32x2(_reg_reduce_sum2_57, make_float2(sv_f1[16], sv_f1[17]));
-                    _reg_reduce_sum2_57 = add_f32x2(_reg_reduce_sum2_57, make_float2(sv_f1[18], sv_f1[19]));
-                    _reg_reduce_sum2_57 = add_f32x2(_reg_reduce_sum2_57, make_float2(sv_f1[20], sv_f1[21]));
-                    _reg_reduce_sum2_57 = add_f32x2(_reg_reduce_sum2_57, make_float2(sv_f1[22], sv_f1[23]));
-                    _reg_reduce_sum2_57 = add_f32x2(_reg_reduce_sum2_57, make_float2(sv_f1[24], sv_f1[25]));
-                    _reg_reduce_sum2_57 = add_f32x2(_reg_reduce_sum2_57, make_float2(sv_f1[26], sv_f1[27]));
-                    _reg_reduce_sum2_57 = add_f32x2(_reg_reduce_sum2_57, make_float2(sv_f1[28], sv_f1[29]));
-                    _reg_reduce_sum2_57 = add_f32x2(_reg_reduce_sum2_57, make_float2(sv_f1[30], sv_f1[31]));
-                    float _reg_array_reduce_56 = _reg_reduce_sum2_57.x + _reg_reduce_sum2_57.y;
-                    block_sum = block_sum + _reg_array_reduce_56;
+                    float2 _reg_reduce_sum2_65 = make_float2(0.0f, 0.0f);
+                    _reg_reduce_sum2_65 = add_f32x2(_reg_reduce_sum2_65, make_float2(_tmem_load_2[0], _tmem_load_2[1]));
+                    _reg_reduce_sum2_65 = add_f32x2(_reg_reduce_sum2_65, make_float2(_tmem_load_2[2], _tmem_load_2[3]));
+                    _reg_reduce_sum2_65 = add_f32x2(_reg_reduce_sum2_65, make_float2(_tmem_load_2[4], _tmem_load_2[5]));
+                    _reg_reduce_sum2_65 = add_f32x2(_reg_reduce_sum2_65, make_float2(_tmem_load_2[6], _tmem_load_2[7]));
+                    _reg_reduce_sum2_65 = add_f32x2(_reg_reduce_sum2_65, make_float2(_tmem_load_2[8], _tmem_load_2[9]));
+                    _reg_reduce_sum2_65 = add_f32x2(_reg_reduce_sum2_65, make_float2(_tmem_load_2[10], _tmem_load_2[11]));
+                    _reg_reduce_sum2_65 = add_f32x2(_reg_reduce_sum2_65, make_float2(_tmem_load_2[12], _tmem_load_2[13]));
+                    _reg_reduce_sum2_65 = add_f32x2(_reg_reduce_sum2_65, make_float2(_tmem_load_2[14], _tmem_load_2[15]));
+                    _reg_reduce_sum2_65 = add_f32x2(_reg_reduce_sum2_65, make_float2(_tmem_load_2[16], _tmem_load_2[17]));
+                    _reg_reduce_sum2_65 = add_f32x2(_reg_reduce_sum2_65, make_float2(_tmem_load_2[18], _tmem_load_2[19]));
+                    _reg_reduce_sum2_65 = add_f32x2(_reg_reduce_sum2_65, make_float2(_tmem_load_2[20], _tmem_load_2[21]));
+                    _reg_reduce_sum2_65 = add_f32x2(_reg_reduce_sum2_65, make_float2(_tmem_load_2[22], _tmem_load_2[23]));
+                    _reg_reduce_sum2_65 = add_f32x2(_reg_reduce_sum2_65, make_float2(_tmem_load_2[24], _tmem_load_2[25]));
+                    _reg_reduce_sum2_65 = add_f32x2(_reg_reduce_sum2_65, make_float2(_tmem_load_2[26], _tmem_load_2[27]));
+                    _reg_reduce_sum2_65 = add_f32x2(_reg_reduce_sum2_65, make_float2(_tmem_load_2[28], _tmem_load_2[29]));
+                    _reg_reduce_sum2_65 = add_f32x2(_reg_reduce_sum2_65, make_float2(_tmem_load_2[30], _tmem_load_2[31]));
+                    float _reg_array_reduce_64 = _reg_reduce_sum2_65.x + _reg_reduce_sum2_65.y;
+                    block_sum = block_sum + _reg_array_reduce_64;
                     unsigned int _fp8_1[8];
                     {
                         uint32_t _packed;
@@ -1633,8 +1688,8 @@ kernel_cake_dsv4_430c388f48f1e672627c(const __grid_constant__ CUtensorMap tmap_q
                             "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
                             "mov.b32 %0, {_lo, _hi};\n\t"
                             "}"
-                            : "=r"(_packed) : "f"(sv_f1[0]), "f"(sv_f1[1]),
-                                               "f"(sv_f1[2]), "f"(sv_f1[3]));
+                            : "=r"(_packed) : "f"(_tmem_load_2[0]), "f"(_tmem_load_2[1]),
+                                               "f"(_tmem_load_2[2]), "f"(_tmem_load_2[3]));
                         _fp8_1[0] = _packed;
                     }
                     {
@@ -1646,8 +1701,8 @@ kernel_cake_dsv4_430c388f48f1e672627c(const __grid_constant__ CUtensorMap tmap_q
                             "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
                             "mov.b32 %0, {_lo, _hi};\n\t"
                             "}"
-                            : "=r"(_packed) : "f"(sv_f1[4]), "f"(sv_f1[5]),
-                                               "f"(sv_f1[6]), "f"(sv_f1[7]));
+                            : "=r"(_packed) : "f"(_tmem_load_2[4]), "f"(_tmem_load_2[5]),
+                                               "f"(_tmem_load_2[6]), "f"(_tmem_load_2[7]));
                         _fp8_1[1] = _packed;
                     }
                     {
@@ -1659,8 +1714,8 @@ kernel_cake_dsv4_430c388f48f1e672627c(const __grid_constant__ CUtensorMap tmap_q
                             "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
                             "mov.b32 %0, {_lo, _hi};\n\t"
                             "}"
-                            : "=r"(_packed) : "f"(sv_f1[8]), "f"(sv_f1[9]),
-                                               "f"(sv_f1[10]), "f"(sv_f1[11]));
+                            : "=r"(_packed) : "f"(_tmem_load_2[8]), "f"(_tmem_load_2[9]),
+                                               "f"(_tmem_load_2[10]), "f"(_tmem_load_2[11]));
                         _fp8_1[2] = _packed;
                     }
                     {
@@ -1672,8 +1727,8 @@ kernel_cake_dsv4_430c388f48f1e672627c(const __grid_constant__ CUtensorMap tmap_q
                             "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
                             "mov.b32 %0, {_lo, _hi};\n\t"
                             "}"
-                            : "=r"(_packed) : "f"(sv_f1[12]), "f"(sv_f1[13]),
-                                               "f"(sv_f1[14]), "f"(sv_f1[15]));
+                            : "=r"(_packed) : "f"(_tmem_load_2[12]), "f"(_tmem_load_2[13]),
+                                               "f"(_tmem_load_2[14]), "f"(_tmem_load_2[15]));
                         _fp8_1[3] = _packed;
                     }
                     {
@@ -1685,8 +1740,8 @@ kernel_cake_dsv4_430c388f48f1e672627c(const __grid_constant__ CUtensorMap tmap_q
                             "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
                             "mov.b32 %0, {_lo, _hi};\n\t"
                             "}"
-                            : "=r"(_packed) : "f"(sv_f1[16]), "f"(sv_f1[17]),
-                                               "f"(sv_f1[18]), "f"(sv_f1[19]));
+                            : "=r"(_packed) : "f"(_tmem_load_2[16]), "f"(_tmem_load_2[17]),
+                                               "f"(_tmem_load_2[18]), "f"(_tmem_load_2[19]));
                         _fp8_1[4] = _packed;
                     }
                     {
@@ -1698,8 +1753,8 @@ kernel_cake_dsv4_430c388f48f1e672627c(const __grid_constant__ CUtensorMap tmap_q
                             "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
                             "mov.b32 %0, {_lo, _hi};\n\t"
                             "}"
-                            : "=r"(_packed) : "f"(sv_f1[20]), "f"(sv_f1[21]),
-                                               "f"(sv_f1[22]), "f"(sv_f1[23]));
+                            : "=r"(_packed) : "f"(_tmem_load_2[20]), "f"(_tmem_load_2[21]),
+                                               "f"(_tmem_load_2[22]), "f"(_tmem_load_2[23]));
                         _fp8_1[5] = _packed;
                     }
                     {
@@ -1711,8 +1766,8 @@ kernel_cake_dsv4_430c388f48f1e672627c(const __grid_constant__ CUtensorMap tmap_q
                             "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
                             "mov.b32 %0, {_lo, _hi};\n\t"
                             "}"
-                            : "=r"(_packed) : "f"(sv_f1[24]), "f"(sv_f1[25]),
-                                               "f"(sv_f1[26]), "f"(sv_f1[27]));
+                            : "=r"(_packed) : "f"(_tmem_load_2[24]), "f"(_tmem_load_2[25]),
+                                               "f"(_tmem_load_2[26]), "f"(_tmem_load_2[27]));
                         _fp8_1[6] = _packed;
                     }
                     {
@@ -1724,84 +1779,84 @@ kernel_cake_dsv4_430c388f48f1e672627c(const __grid_constant__ CUtensorMap tmap_q
                             "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
                             "mov.b32 %0, {_lo, _hi};\n\t"
                             "}"
-                            : "=r"(_packed) : "f"(sv_f1[28]), "f"(sv_f1[29]),
-                                               "f"(sv_f1[30]), "f"(sv_f1[31]));
+                            : "=r"(_packed) : "f"(_tmem_load_2[28]), "f"(_tmem_load_2[29]),
+                                               "f"(_tmem_load_2[30]), "f"(_tmem_load_2[31]));
                         _fp8_1[7] = _packed;
                     }
                     tmem_st_x8_u32(p_base_all + 8, (const uint32_t*)_fp8_1);
-                    const float2 _fma_b2_58 = {softmax_scale_log2, softmax_scale_log2};
-                    const float2 _fma_c2_59 = {8.0f - max_scaled, 8.0f - max_scaled};
-                    float2 _fma_pair_60 = fma_f32x2(make_float2(sv_f2[0], sv_f2[1]), _fma_b2_58, _fma_c2_59);
-                    sv_f2[0] = _fma_pair_60.x;
-                    sv_f2[1] = _fma_pair_60.y;
-                    float2 _fma_pair_61 = fma_f32x2(make_float2(sv_f2[2], sv_f2[3]), _fma_b2_58, _fma_c2_59);
-                    sv_f2[2] = _fma_pair_61.x;
-                    sv_f2[3] = _fma_pair_61.y;
-                    float2 _fma_pair_62 = fma_f32x2(make_float2(sv_f2[4], sv_f2[5]), _fma_b2_58, _fma_c2_59);
-                    sv_f2[4] = _fma_pair_62.x;
-                    sv_f2[5] = _fma_pair_62.y;
-                    float2 _fma_pair_63 = fma_f32x2(make_float2(sv_f2[6], sv_f2[7]), _fma_b2_58, _fma_c2_59);
-                    sv_f2[6] = _fma_pair_63.x;
-                    sv_f2[7] = _fma_pair_63.y;
-                    float2 _fma_pair_64 = fma_f32x2(make_float2(sv_f2[8], sv_f2[9]), _fma_b2_58, _fma_c2_59);
-                    sv_f2[8] = _fma_pair_64.x;
-                    sv_f2[9] = _fma_pair_64.y;
-                    float2 _fma_pair_65 = fma_f32x2(make_float2(sv_f2[10], sv_f2[11]), _fma_b2_58, _fma_c2_59);
-                    sv_f2[10] = _fma_pair_65.x;
-                    sv_f2[11] = _fma_pair_65.y;
-                    float2 _fma_pair_66 = fma_f32x2(make_float2(sv_f2[12], sv_f2[13]), _fma_b2_58, _fma_c2_59);
-                    sv_f2[12] = _fma_pair_66.x;
-                    sv_f2[13] = _fma_pair_66.y;
-                    float2 _fma_pair_67 = fma_f32x2(make_float2(sv_f2[14], sv_f2[15]), _fma_b2_58, _fma_c2_59);
-                    sv_f2[14] = _fma_pair_67.x;
-                    sv_f2[15] = _fma_pair_67.y;
-                    float2 _fma_pair_68 = fma_f32x2(make_float2(sv_f2[16], sv_f2[17]), _fma_b2_58, _fma_c2_59);
-                    sv_f2[16] = _fma_pair_68.x;
-                    sv_f2[17] = _fma_pair_68.y;
-                    float2 _fma_pair_69 = fma_f32x2(make_float2(sv_f2[18], sv_f2[19]), _fma_b2_58, _fma_c2_59);
-                    sv_f2[18] = _fma_pair_69.x;
-                    sv_f2[19] = _fma_pair_69.y;
-                    float2 _fma_pair_70 = fma_f32x2(make_float2(sv_f2[20], sv_f2[21]), _fma_b2_58, _fma_c2_59);
-                    sv_f2[20] = _fma_pair_70.x;
-                    sv_f2[21] = _fma_pair_70.y;
-                    float2 _fma_pair_71 = fma_f32x2(make_float2(sv_f2[22], sv_f2[23]), _fma_b2_58, _fma_c2_59);
-                    sv_f2[22] = _fma_pair_71.x;
-                    sv_f2[23] = _fma_pair_71.y;
-                    float2 _fma_pair_72 = fma_f32x2(make_float2(sv_f2[24], sv_f2[25]), _fma_b2_58, _fma_c2_59);
-                    sv_f2[24] = _fma_pair_72.x;
-                    sv_f2[25] = _fma_pair_72.y;
-                    float2 _fma_pair_73 = fma_f32x2(make_float2(sv_f2[26], sv_f2[27]), _fma_b2_58, _fma_c2_59);
-                    sv_f2[26] = _fma_pair_73.x;
-                    sv_f2[27] = _fma_pair_73.y;
-                    float2 _fma_pair_74 = fma_f32x2(make_float2(sv_f2[28], sv_f2[29]), _fma_b2_58, _fma_c2_59);
-                    sv_f2[28] = _fma_pair_74.x;
-                    sv_f2[29] = _fma_pair_74.y;
-                    float2 _fma_pair_75 = fma_f32x2(make_float2(sv_f2[30], sv_f2[31]), _fma_b2_58, _fma_c2_59);
-                    sv_f2[30] = _fma_pair_75.x;
-                    sv_f2[31] = _fma_pair_75.y;
+                    const float2 _fma_b2_66 = {softmax_scale_log2, softmax_scale_log2};
+                    const float2 _fma_c2_67 = {8.0f - max_scaled, 8.0f - max_scaled};
+                    float2 _fma_pair_68 = fma_f32x2(make_float2(_tmem_load_3[0], _tmem_load_3[1]), _fma_b2_66, _fma_c2_67);
+                    _tmem_load_3[0] = _fma_pair_68.x;
+                    _tmem_load_3[1] = _fma_pair_68.y;
+                    float2 _fma_pair_69 = fma_f32x2(make_float2(_tmem_load_3[2], _tmem_load_3[3]), _fma_b2_66, _fma_c2_67);
+                    _tmem_load_3[2] = _fma_pair_69.x;
+                    _tmem_load_3[3] = _fma_pair_69.y;
+                    float2 _fma_pair_70 = fma_f32x2(make_float2(_tmem_load_3[4], _tmem_load_3[5]), _fma_b2_66, _fma_c2_67);
+                    _tmem_load_3[4] = _fma_pair_70.x;
+                    _tmem_load_3[5] = _fma_pair_70.y;
+                    float2 _fma_pair_71 = fma_f32x2(make_float2(_tmem_load_3[6], _tmem_load_3[7]), _fma_b2_66, _fma_c2_67);
+                    _tmem_load_3[6] = _fma_pair_71.x;
+                    _tmem_load_3[7] = _fma_pair_71.y;
+                    float2 _fma_pair_72 = fma_f32x2(make_float2(_tmem_load_3[8], _tmem_load_3[9]), _fma_b2_66, _fma_c2_67);
+                    _tmem_load_3[8] = _fma_pair_72.x;
+                    _tmem_load_3[9] = _fma_pair_72.y;
+                    float2 _fma_pair_73 = fma_f32x2(make_float2(_tmem_load_3[10], _tmem_load_3[11]), _fma_b2_66, _fma_c2_67);
+                    _tmem_load_3[10] = _fma_pair_73.x;
+                    _tmem_load_3[11] = _fma_pair_73.y;
+                    float2 _fma_pair_74 = fma_f32x2(make_float2(_tmem_load_3[12], _tmem_load_3[13]), _fma_b2_66, _fma_c2_67);
+                    _tmem_load_3[12] = _fma_pair_74.x;
+                    _tmem_load_3[13] = _fma_pair_74.y;
+                    float2 _fma_pair_75 = fma_f32x2(make_float2(_tmem_load_3[14], _tmem_load_3[15]), _fma_b2_66, _fma_c2_67);
+                    _tmem_load_3[14] = _fma_pair_75.x;
+                    _tmem_load_3[15] = _fma_pair_75.y;
+                    float2 _fma_pair_76 = fma_f32x2(make_float2(_tmem_load_3[16], _tmem_load_3[17]), _fma_b2_66, _fma_c2_67);
+                    _tmem_load_3[16] = _fma_pair_76.x;
+                    _tmem_load_3[17] = _fma_pair_76.y;
+                    float2 _fma_pair_77 = fma_f32x2(make_float2(_tmem_load_3[18], _tmem_load_3[19]), _fma_b2_66, _fma_c2_67);
+                    _tmem_load_3[18] = _fma_pair_77.x;
+                    _tmem_load_3[19] = _fma_pair_77.y;
+                    float2 _fma_pair_78 = fma_f32x2(make_float2(_tmem_load_3[20], _tmem_load_3[21]), _fma_b2_66, _fma_c2_67);
+                    _tmem_load_3[20] = _fma_pair_78.x;
+                    _tmem_load_3[21] = _fma_pair_78.y;
+                    float2 _fma_pair_79 = fma_f32x2(make_float2(_tmem_load_3[22], _tmem_load_3[23]), _fma_b2_66, _fma_c2_67);
+                    _tmem_load_3[22] = _fma_pair_79.x;
+                    _tmem_load_3[23] = _fma_pair_79.y;
+                    float2 _fma_pair_80 = fma_f32x2(make_float2(_tmem_load_3[24], _tmem_load_3[25]), _fma_b2_66, _fma_c2_67);
+                    _tmem_load_3[24] = _fma_pair_80.x;
+                    _tmem_load_3[25] = _fma_pair_80.y;
+                    float2 _fma_pair_81 = fma_f32x2(make_float2(_tmem_load_3[26], _tmem_load_3[27]), _fma_b2_66, _fma_c2_67);
+                    _tmem_load_3[26] = _fma_pair_81.x;
+                    _tmem_load_3[27] = _fma_pair_81.y;
+                    float2 _fma_pair_82 = fma_f32x2(make_float2(_tmem_load_3[28], _tmem_load_3[29]), _fma_b2_66, _fma_c2_67);
+                    _tmem_load_3[28] = _fma_pair_82.x;
+                    _tmem_load_3[29] = _fma_pair_82.y;
+                    float2 _fma_pair_83 = fma_f32x2(make_float2(_tmem_load_3[30], _tmem_load_3[31]), _fma_b2_66, _fma_c2_67);
+                    _tmem_load_3[30] = _fma_pair_83.x;
+                    _tmem_load_3[31] = _fma_pair_83.y;
                     #pragma unroll
                     for (int _le = 0; _le < 32; _le++) {
-                        sv_f2[_le] = approx_exp2(sv_f2[_le]);
+                        _tmem_load_3[_le] = approx_exp2(_tmem_load_3[_le]);
                     }
-                    float2 _reg_reduce_sum2_77 = make_float2(0.0f, 0.0f);
-                    _reg_reduce_sum2_77 = add_f32x2(_reg_reduce_sum2_77, make_float2(sv_f2[0], sv_f2[1]));
-                    _reg_reduce_sum2_77 = add_f32x2(_reg_reduce_sum2_77, make_float2(sv_f2[2], sv_f2[3]));
-                    _reg_reduce_sum2_77 = add_f32x2(_reg_reduce_sum2_77, make_float2(sv_f2[4], sv_f2[5]));
-                    _reg_reduce_sum2_77 = add_f32x2(_reg_reduce_sum2_77, make_float2(sv_f2[6], sv_f2[7]));
-                    _reg_reduce_sum2_77 = add_f32x2(_reg_reduce_sum2_77, make_float2(sv_f2[8], sv_f2[9]));
-                    _reg_reduce_sum2_77 = add_f32x2(_reg_reduce_sum2_77, make_float2(sv_f2[10], sv_f2[11]));
-                    _reg_reduce_sum2_77 = add_f32x2(_reg_reduce_sum2_77, make_float2(sv_f2[12], sv_f2[13]));
-                    _reg_reduce_sum2_77 = add_f32x2(_reg_reduce_sum2_77, make_float2(sv_f2[14], sv_f2[15]));
-                    _reg_reduce_sum2_77 = add_f32x2(_reg_reduce_sum2_77, make_float2(sv_f2[16], sv_f2[17]));
-                    _reg_reduce_sum2_77 = add_f32x2(_reg_reduce_sum2_77, make_float2(sv_f2[18], sv_f2[19]));
-                    _reg_reduce_sum2_77 = add_f32x2(_reg_reduce_sum2_77, make_float2(sv_f2[20], sv_f2[21]));
-                    _reg_reduce_sum2_77 = add_f32x2(_reg_reduce_sum2_77, make_float2(sv_f2[22], sv_f2[23]));
-                    _reg_reduce_sum2_77 = add_f32x2(_reg_reduce_sum2_77, make_float2(sv_f2[24], sv_f2[25]));
-                    _reg_reduce_sum2_77 = add_f32x2(_reg_reduce_sum2_77, make_float2(sv_f2[26], sv_f2[27]));
-                    _reg_reduce_sum2_77 = add_f32x2(_reg_reduce_sum2_77, make_float2(sv_f2[28], sv_f2[29]));
-                    _reg_reduce_sum2_77 = add_f32x2(_reg_reduce_sum2_77, make_float2(sv_f2[30], sv_f2[31]));
-                    float _reg_array_reduce_76 = _reg_reduce_sum2_77.x + _reg_reduce_sum2_77.y;
-                    block_sum = block_sum + _reg_array_reduce_76;
+                    float2 _reg_reduce_sum2_85 = make_float2(0.0f, 0.0f);
+                    _reg_reduce_sum2_85 = add_f32x2(_reg_reduce_sum2_85, make_float2(_tmem_load_3[0], _tmem_load_3[1]));
+                    _reg_reduce_sum2_85 = add_f32x2(_reg_reduce_sum2_85, make_float2(_tmem_load_3[2], _tmem_load_3[3]));
+                    _reg_reduce_sum2_85 = add_f32x2(_reg_reduce_sum2_85, make_float2(_tmem_load_3[4], _tmem_load_3[5]));
+                    _reg_reduce_sum2_85 = add_f32x2(_reg_reduce_sum2_85, make_float2(_tmem_load_3[6], _tmem_load_3[7]));
+                    _reg_reduce_sum2_85 = add_f32x2(_reg_reduce_sum2_85, make_float2(_tmem_load_3[8], _tmem_load_3[9]));
+                    _reg_reduce_sum2_85 = add_f32x2(_reg_reduce_sum2_85, make_float2(_tmem_load_3[10], _tmem_load_3[11]));
+                    _reg_reduce_sum2_85 = add_f32x2(_reg_reduce_sum2_85, make_float2(_tmem_load_3[12], _tmem_load_3[13]));
+                    _reg_reduce_sum2_85 = add_f32x2(_reg_reduce_sum2_85, make_float2(_tmem_load_3[14], _tmem_load_3[15]));
+                    _reg_reduce_sum2_85 = add_f32x2(_reg_reduce_sum2_85, make_float2(_tmem_load_3[16], _tmem_load_3[17]));
+                    _reg_reduce_sum2_85 = add_f32x2(_reg_reduce_sum2_85, make_float2(_tmem_load_3[18], _tmem_load_3[19]));
+                    _reg_reduce_sum2_85 = add_f32x2(_reg_reduce_sum2_85, make_float2(_tmem_load_3[20], _tmem_load_3[21]));
+                    _reg_reduce_sum2_85 = add_f32x2(_reg_reduce_sum2_85, make_float2(_tmem_load_3[22], _tmem_load_3[23]));
+                    _reg_reduce_sum2_85 = add_f32x2(_reg_reduce_sum2_85, make_float2(_tmem_load_3[24], _tmem_load_3[25]));
+                    _reg_reduce_sum2_85 = add_f32x2(_reg_reduce_sum2_85, make_float2(_tmem_load_3[26], _tmem_load_3[27]));
+                    _reg_reduce_sum2_85 = add_f32x2(_reg_reduce_sum2_85, make_float2(_tmem_load_3[28], _tmem_load_3[29]));
+                    _reg_reduce_sum2_85 = add_f32x2(_reg_reduce_sum2_85, make_float2(_tmem_load_3[30], _tmem_load_3[31]));
+                    float _reg_array_reduce_84 = _reg_reduce_sum2_85.x + _reg_reduce_sum2_85.y;
+                    block_sum = block_sum + _reg_array_reduce_84;
                     unsigned int _fp8_2[8];
                     {
                         uint32_t _packed;
@@ -1812,8 +1867,8 @@ kernel_cake_dsv4_430c388f48f1e672627c(const __grid_constant__ CUtensorMap tmap_q
                             "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
                             "mov.b32 %0, {_lo, _hi};\n\t"
                             "}"
-                            : "=r"(_packed) : "f"(sv_f2[0]), "f"(sv_f2[1]),
-                                               "f"(sv_f2[2]), "f"(sv_f2[3]));
+                            : "=r"(_packed) : "f"(_tmem_load_3[0]), "f"(_tmem_load_3[1]),
+                                               "f"(_tmem_load_3[2]), "f"(_tmem_load_3[3]));
                         _fp8_2[0] = _packed;
                     }
                     {
@@ -1825,8 +1880,8 @@ kernel_cake_dsv4_430c388f48f1e672627c(const __grid_constant__ CUtensorMap tmap_q
                             "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
                             "mov.b32 %0, {_lo, _hi};\n\t"
                             "}"
-                            : "=r"(_packed) : "f"(sv_f2[4]), "f"(sv_f2[5]),
-                                               "f"(sv_f2[6]), "f"(sv_f2[7]));
+                            : "=r"(_packed) : "f"(_tmem_load_3[4]), "f"(_tmem_load_3[5]),
+                                               "f"(_tmem_load_3[6]), "f"(_tmem_load_3[7]));
                         _fp8_2[1] = _packed;
                     }
                     {
@@ -1838,8 +1893,8 @@ kernel_cake_dsv4_430c388f48f1e672627c(const __grid_constant__ CUtensorMap tmap_q
                             "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
                             "mov.b32 %0, {_lo, _hi};\n\t"
                             "}"
-                            : "=r"(_packed) : "f"(sv_f2[8]), "f"(sv_f2[9]),
-                                               "f"(sv_f2[10]), "f"(sv_f2[11]));
+                            : "=r"(_packed) : "f"(_tmem_load_3[8]), "f"(_tmem_load_3[9]),
+                                               "f"(_tmem_load_3[10]), "f"(_tmem_load_3[11]));
                         _fp8_2[2] = _packed;
                     }
                     {
@@ -1851,8 +1906,8 @@ kernel_cake_dsv4_430c388f48f1e672627c(const __grid_constant__ CUtensorMap tmap_q
                             "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
                             "mov.b32 %0, {_lo, _hi};\n\t"
                             "}"
-                            : "=r"(_packed) : "f"(sv_f2[12]), "f"(sv_f2[13]),
-                                               "f"(sv_f2[14]), "f"(sv_f2[15]));
+                            : "=r"(_packed) : "f"(_tmem_load_3[12]), "f"(_tmem_load_3[13]),
+                                               "f"(_tmem_load_3[14]), "f"(_tmem_load_3[15]));
                         _fp8_2[3] = _packed;
                     }
                     {
@@ -1864,8 +1919,8 @@ kernel_cake_dsv4_430c388f48f1e672627c(const __grid_constant__ CUtensorMap tmap_q
                             "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
                             "mov.b32 %0, {_lo, _hi};\n\t"
                             "}"
-                            : "=r"(_packed) : "f"(sv_f2[16]), "f"(sv_f2[17]),
-                                               "f"(sv_f2[18]), "f"(sv_f2[19]));
+                            : "=r"(_packed) : "f"(_tmem_load_3[16]), "f"(_tmem_load_3[17]),
+                                               "f"(_tmem_load_3[18]), "f"(_tmem_load_3[19]));
                         _fp8_2[4] = _packed;
                     }
                     {
@@ -1877,8 +1932,8 @@ kernel_cake_dsv4_430c388f48f1e672627c(const __grid_constant__ CUtensorMap tmap_q
                             "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
                             "mov.b32 %0, {_lo, _hi};\n\t"
                             "}"
-                            : "=r"(_packed) : "f"(sv_f2[20]), "f"(sv_f2[21]),
-                                               "f"(sv_f2[22]), "f"(sv_f2[23]));
+                            : "=r"(_packed) : "f"(_tmem_load_3[20]), "f"(_tmem_load_3[21]),
+                                               "f"(_tmem_load_3[22]), "f"(_tmem_load_3[23]));
                         _fp8_2[5] = _packed;
                     }
                     {
@@ -1890,8 +1945,8 @@ kernel_cake_dsv4_430c388f48f1e672627c(const __grid_constant__ CUtensorMap tmap_q
                             "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
                             "mov.b32 %0, {_lo, _hi};\n\t"
                             "}"
-                            : "=r"(_packed) : "f"(sv_f2[24]), "f"(sv_f2[25]),
-                                               "f"(sv_f2[26]), "f"(sv_f2[27]));
+                            : "=r"(_packed) : "f"(_tmem_load_3[24]), "f"(_tmem_load_3[25]),
+                                               "f"(_tmem_load_3[26]), "f"(_tmem_load_3[27]));
                         _fp8_2[6] = _packed;
                     }
                     {
@@ -1903,84 +1958,84 @@ kernel_cake_dsv4_430c388f48f1e672627c(const __grid_constant__ CUtensorMap tmap_q
                             "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
                             "mov.b32 %0, {_lo, _hi};\n\t"
                             "}"
-                            : "=r"(_packed) : "f"(sv_f2[28]), "f"(sv_f2[29]),
-                                               "f"(sv_f2[30]), "f"(sv_f2[31]));
+                            : "=r"(_packed) : "f"(_tmem_load_3[28]), "f"(_tmem_load_3[29]),
+                                               "f"(_tmem_load_3[30]), "f"(_tmem_load_3[31]));
                         _fp8_2[7] = _packed;
                     }
                     tmem_st_x8_u32(p_base_all + 16, (const uint32_t*)_fp8_2);
-                    const float2 _fma_b2_78 = {softmax_scale_log2, softmax_scale_log2};
-                    const float2 _fma_c2_79 = {8.0f - max_scaled, 8.0f - max_scaled};
-                    float2 _fma_pair_80 = fma_f32x2(make_float2(sv_f3[0], sv_f3[1]), _fma_b2_78, _fma_c2_79);
-                    sv_f3[0] = _fma_pair_80.x;
-                    sv_f3[1] = _fma_pair_80.y;
-                    float2 _fma_pair_81 = fma_f32x2(make_float2(sv_f3[2], sv_f3[3]), _fma_b2_78, _fma_c2_79);
-                    sv_f3[2] = _fma_pair_81.x;
-                    sv_f3[3] = _fma_pair_81.y;
-                    float2 _fma_pair_82 = fma_f32x2(make_float2(sv_f3[4], sv_f3[5]), _fma_b2_78, _fma_c2_79);
-                    sv_f3[4] = _fma_pair_82.x;
-                    sv_f3[5] = _fma_pair_82.y;
-                    float2 _fma_pair_83 = fma_f32x2(make_float2(sv_f3[6], sv_f3[7]), _fma_b2_78, _fma_c2_79);
-                    sv_f3[6] = _fma_pair_83.x;
-                    sv_f3[7] = _fma_pair_83.y;
-                    float2 _fma_pair_84 = fma_f32x2(make_float2(sv_f3[8], sv_f3[9]), _fma_b2_78, _fma_c2_79);
-                    sv_f3[8] = _fma_pair_84.x;
-                    sv_f3[9] = _fma_pair_84.y;
-                    float2 _fma_pair_85 = fma_f32x2(make_float2(sv_f3[10], sv_f3[11]), _fma_b2_78, _fma_c2_79);
-                    sv_f3[10] = _fma_pair_85.x;
-                    sv_f3[11] = _fma_pair_85.y;
-                    float2 _fma_pair_86 = fma_f32x2(make_float2(sv_f3[12], sv_f3[13]), _fma_b2_78, _fma_c2_79);
-                    sv_f3[12] = _fma_pair_86.x;
-                    sv_f3[13] = _fma_pair_86.y;
-                    float2 _fma_pair_87 = fma_f32x2(make_float2(sv_f3[14], sv_f3[15]), _fma_b2_78, _fma_c2_79);
-                    sv_f3[14] = _fma_pair_87.x;
-                    sv_f3[15] = _fma_pair_87.y;
-                    float2 _fma_pair_88 = fma_f32x2(make_float2(sv_f3[16], sv_f3[17]), _fma_b2_78, _fma_c2_79);
-                    sv_f3[16] = _fma_pair_88.x;
-                    sv_f3[17] = _fma_pair_88.y;
-                    float2 _fma_pair_89 = fma_f32x2(make_float2(sv_f3[18], sv_f3[19]), _fma_b2_78, _fma_c2_79);
-                    sv_f3[18] = _fma_pair_89.x;
-                    sv_f3[19] = _fma_pair_89.y;
-                    float2 _fma_pair_90 = fma_f32x2(make_float2(sv_f3[20], sv_f3[21]), _fma_b2_78, _fma_c2_79);
-                    sv_f3[20] = _fma_pair_90.x;
-                    sv_f3[21] = _fma_pair_90.y;
-                    float2 _fma_pair_91 = fma_f32x2(make_float2(sv_f3[22], sv_f3[23]), _fma_b2_78, _fma_c2_79);
-                    sv_f3[22] = _fma_pair_91.x;
-                    sv_f3[23] = _fma_pair_91.y;
-                    float2 _fma_pair_92 = fma_f32x2(make_float2(sv_f3[24], sv_f3[25]), _fma_b2_78, _fma_c2_79);
-                    sv_f3[24] = _fma_pair_92.x;
-                    sv_f3[25] = _fma_pair_92.y;
-                    float2 _fma_pair_93 = fma_f32x2(make_float2(sv_f3[26], sv_f3[27]), _fma_b2_78, _fma_c2_79);
-                    sv_f3[26] = _fma_pair_93.x;
-                    sv_f3[27] = _fma_pair_93.y;
-                    float2 _fma_pair_94 = fma_f32x2(make_float2(sv_f3[28], sv_f3[29]), _fma_b2_78, _fma_c2_79);
-                    sv_f3[28] = _fma_pair_94.x;
-                    sv_f3[29] = _fma_pair_94.y;
-                    float2 _fma_pair_95 = fma_f32x2(make_float2(sv_f3[30], sv_f3[31]), _fma_b2_78, _fma_c2_79);
-                    sv_f3[30] = _fma_pair_95.x;
-                    sv_f3[31] = _fma_pair_95.y;
+                    const float2 _fma_b2_86 = {softmax_scale_log2, softmax_scale_log2};
+                    const float2 _fma_c2_87 = {8.0f - max_scaled, 8.0f - max_scaled};
+                    float2 _fma_pair_88 = fma_f32x2(make_float2(_tmem_load_4[0], _tmem_load_4[1]), _fma_b2_86, _fma_c2_87);
+                    _tmem_load_4[0] = _fma_pair_88.x;
+                    _tmem_load_4[1] = _fma_pair_88.y;
+                    float2 _fma_pair_89 = fma_f32x2(make_float2(_tmem_load_4[2], _tmem_load_4[3]), _fma_b2_86, _fma_c2_87);
+                    _tmem_load_4[2] = _fma_pair_89.x;
+                    _tmem_load_4[3] = _fma_pair_89.y;
+                    float2 _fma_pair_90 = fma_f32x2(make_float2(_tmem_load_4[4], _tmem_load_4[5]), _fma_b2_86, _fma_c2_87);
+                    _tmem_load_4[4] = _fma_pair_90.x;
+                    _tmem_load_4[5] = _fma_pair_90.y;
+                    float2 _fma_pair_91 = fma_f32x2(make_float2(_tmem_load_4[6], _tmem_load_4[7]), _fma_b2_86, _fma_c2_87);
+                    _tmem_load_4[6] = _fma_pair_91.x;
+                    _tmem_load_4[7] = _fma_pair_91.y;
+                    float2 _fma_pair_92 = fma_f32x2(make_float2(_tmem_load_4[8], _tmem_load_4[9]), _fma_b2_86, _fma_c2_87);
+                    _tmem_load_4[8] = _fma_pair_92.x;
+                    _tmem_load_4[9] = _fma_pair_92.y;
+                    float2 _fma_pair_93 = fma_f32x2(make_float2(_tmem_load_4[10], _tmem_load_4[11]), _fma_b2_86, _fma_c2_87);
+                    _tmem_load_4[10] = _fma_pair_93.x;
+                    _tmem_load_4[11] = _fma_pair_93.y;
+                    float2 _fma_pair_94 = fma_f32x2(make_float2(_tmem_load_4[12], _tmem_load_4[13]), _fma_b2_86, _fma_c2_87);
+                    _tmem_load_4[12] = _fma_pair_94.x;
+                    _tmem_load_4[13] = _fma_pair_94.y;
+                    float2 _fma_pair_95 = fma_f32x2(make_float2(_tmem_load_4[14], _tmem_load_4[15]), _fma_b2_86, _fma_c2_87);
+                    _tmem_load_4[14] = _fma_pair_95.x;
+                    _tmem_load_4[15] = _fma_pair_95.y;
+                    float2 _fma_pair_96 = fma_f32x2(make_float2(_tmem_load_4[16], _tmem_load_4[17]), _fma_b2_86, _fma_c2_87);
+                    _tmem_load_4[16] = _fma_pair_96.x;
+                    _tmem_load_4[17] = _fma_pair_96.y;
+                    float2 _fma_pair_97 = fma_f32x2(make_float2(_tmem_load_4[18], _tmem_load_4[19]), _fma_b2_86, _fma_c2_87);
+                    _tmem_load_4[18] = _fma_pair_97.x;
+                    _tmem_load_4[19] = _fma_pair_97.y;
+                    float2 _fma_pair_98 = fma_f32x2(make_float2(_tmem_load_4[20], _tmem_load_4[21]), _fma_b2_86, _fma_c2_87);
+                    _tmem_load_4[20] = _fma_pair_98.x;
+                    _tmem_load_4[21] = _fma_pair_98.y;
+                    float2 _fma_pair_99 = fma_f32x2(make_float2(_tmem_load_4[22], _tmem_load_4[23]), _fma_b2_86, _fma_c2_87);
+                    _tmem_load_4[22] = _fma_pair_99.x;
+                    _tmem_load_4[23] = _fma_pair_99.y;
+                    float2 _fma_pair_100 = fma_f32x2(make_float2(_tmem_load_4[24], _tmem_load_4[25]), _fma_b2_86, _fma_c2_87);
+                    _tmem_load_4[24] = _fma_pair_100.x;
+                    _tmem_load_4[25] = _fma_pair_100.y;
+                    float2 _fma_pair_101 = fma_f32x2(make_float2(_tmem_load_4[26], _tmem_load_4[27]), _fma_b2_86, _fma_c2_87);
+                    _tmem_load_4[26] = _fma_pair_101.x;
+                    _tmem_load_4[27] = _fma_pair_101.y;
+                    float2 _fma_pair_102 = fma_f32x2(make_float2(_tmem_load_4[28], _tmem_load_4[29]), _fma_b2_86, _fma_c2_87);
+                    _tmem_load_4[28] = _fma_pair_102.x;
+                    _tmem_load_4[29] = _fma_pair_102.y;
+                    float2 _fma_pair_103 = fma_f32x2(make_float2(_tmem_load_4[30], _tmem_load_4[31]), _fma_b2_86, _fma_c2_87);
+                    _tmem_load_4[30] = _fma_pair_103.x;
+                    _tmem_load_4[31] = _fma_pair_103.y;
                     #pragma unroll
                     for (int _le = 0; _le < 32; _le++) {
-                        sv_f3[_le] = approx_exp2(sv_f3[_le]);
+                        _tmem_load_4[_le] = approx_exp2(_tmem_load_4[_le]);
                     }
-                    float2 _reg_reduce_sum2_97 = make_float2(0.0f, 0.0f);
-                    _reg_reduce_sum2_97 = add_f32x2(_reg_reduce_sum2_97, make_float2(sv_f3[0], sv_f3[1]));
-                    _reg_reduce_sum2_97 = add_f32x2(_reg_reduce_sum2_97, make_float2(sv_f3[2], sv_f3[3]));
-                    _reg_reduce_sum2_97 = add_f32x2(_reg_reduce_sum2_97, make_float2(sv_f3[4], sv_f3[5]));
-                    _reg_reduce_sum2_97 = add_f32x2(_reg_reduce_sum2_97, make_float2(sv_f3[6], sv_f3[7]));
-                    _reg_reduce_sum2_97 = add_f32x2(_reg_reduce_sum2_97, make_float2(sv_f3[8], sv_f3[9]));
-                    _reg_reduce_sum2_97 = add_f32x2(_reg_reduce_sum2_97, make_float2(sv_f3[10], sv_f3[11]));
-                    _reg_reduce_sum2_97 = add_f32x2(_reg_reduce_sum2_97, make_float2(sv_f3[12], sv_f3[13]));
-                    _reg_reduce_sum2_97 = add_f32x2(_reg_reduce_sum2_97, make_float2(sv_f3[14], sv_f3[15]));
-                    _reg_reduce_sum2_97 = add_f32x2(_reg_reduce_sum2_97, make_float2(sv_f3[16], sv_f3[17]));
-                    _reg_reduce_sum2_97 = add_f32x2(_reg_reduce_sum2_97, make_float2(sv_f3[18], sv_f3[19]));
-                    _reg_reduce_sum2_97 = add_f32x2(_reg_reduce_sum2_97, make_float2(sv_f3[20], sv_f3[21]));
-                    _reg_reduce_sum2_97 = add_f32x2(_reg_reduce_sum2_97, make_float2(sv_f3[22], sv_f3[23]));
-                    _reg_reduce_sum2_97 = add_f32x2(_reg_reduce_sum2_97, make_float2(sv_f3[24], sv_f3[25]));
-                    _reg_reduce_sum2_97 = add_f32x2(_reg_reduce_sum2_97, make_float2(sv_f3[26], sv_f3[27]));
-                    _reg_reduce_sum2_97 = add_f32x2(_reg_reduce_sum2_97, make_float2(sv_f3[28], sv_f3[29]));
-                    _reg_reduce_sum2_97 = add_f32x2(_reg_reduce_sum2_97, make_float2(sv_f3[30], sv_f3[31]));
-                    float _reg_array_reduce_96 = _reg_reduce_sum2_97.x + _reg_reduce_sum2_97.y;
-                    block_sum = block_sum + _reg_array_reduce_96;
+                    float2 _reg_reduce_sum2_105 = make_float2(0.0f, 0.0f);
+                    _reg_reduce_sum2_105 = add_f32x2(_reg_reduce_sum2_105, make_float2(_tmem_load_4[0], _tmem_load_4[1]));
+                    _reg_reduce_sum2_105 = add_f32x2(_reg_reduce_sum2_105, make_float2(_tmem_load_4[2], _tmem_load_4[3]));
+                    _reg_reduce_sum2_105 = add_f32x2(_reg_reduce_sum2_105, make_float2(_tmem_load_4[4], _tmem_load_4[5]));
+                    _reg_reduce_sum2_105 = add_f32x2(_reg_reduce_sum2_105, make_float2(_tmem_load_4[6], _tmem_load_4[7]));
+                    _reg_reduce_sum2_105 = add_f32x2(_reg_reduce_sum2_105, make_float2(_tmem_load_4[8], _tmem_load_4[9]));
+                    _reg_reduce_sum2_105 = add_f32x2(_reg_reduce_sum2_105, make_float2(_tmem_load_4[10], _tmem_load_4[11]));
+                    _reg_reduce_sum2_105 = add_f32x2(_reg_reduce_sum2_105, make_float2(_tmem_load_4[12], _tmem_load_4[13]));
+                    _reg_reduce_sum2_105 = add_f32x2(_reg_reduce_sum2_105, make_float2(_tmem_load_4[14], _tmem_load_4[15]));
+                    _reg_reduce_sum2_105 = add_f32x2(_reg_reduce_sum2_105, make_float2(_tmem_load_4[16], _tmem_load_4[17]));
+                    _reg_reduce_sum2_105 = add_f32x2(_reg_reduce_sum2_105, make_float2(_tmem_load_4[18], _tmem_load_4[19]));
+                    _reg_reduce_sum2_105 = add_f32x2(_reg_reduce_sum2_105, make_float2(_tmem_load_4[20], _tmem_load_4[21]));
+                    _reg_reduce_sum2_105 = add_f32x2(_reg_reduce_sum2_105, make_float2(_tmem_load_4[22], _tmem_load_4[23]));
+                    _reg_reduce_sum2_105 = add_f32x2(_reg_reduce_sum2_105, make_float2(_tmem_load_4[24], _tmem_load_4[25]));
+                    _reg_reduce_sum2_105 = add_f32x2(_reg_reduce_sum2_105, make_float2(_tmem_load_4[26], _tmem_load_4[27]));
+                    _reg_reduce_sum2_105 = add_f32x2(_reg_reduce_sum2_105, make_float2(_tmem_load_4[28], _tmem_load_4[29]));
+                    _reg_reduce_sum2_105 = add_f32x2(_reg_reduce_sum2_105, make_float2(_tmem_load_4[30], _tmem_load_4[31]));
+                    float _reg_array_reduce_104 = _reg_reduce_sum2_105.x + _reg_reduce_sum2_105.y;
+                    block_sum = block_sum + _reg_array_reduce_104;
                     unsigned int _fp8_3[8];
                     {
                         uint32_t _packed;
@@ -1991,8 +2046,8 @@ kernel_cake_dsv4_430c388f48f1e672627c(const __grid_constant__ CUtensorMap tmap_q
                             "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
                             "mov.b32 %0, {_lo, _hi};\n\t"
                             "}"
-                            : "=r"(_packed) : "f"(sv_f3[0]), "f"(sv_f3[1]),
-                                               "f"(sv_f3[2]), "f"(sv_f3[3]));
+                            : "=r"(_packed) : "f"(_tmem_load_4[0]), "f"(_tmem_load_4[1]),
+                                               "f"(_tmem_load_4[2]), "f"(_tmem_load_4[3]));
                         _fp8_3[0] = _packed;
                     }
                     {
@@ -2004,8 +2059,8 @@ kernel_cake_dsv4_430c388f48f1e672627c(const __grid_constant__ CUtensorMap tmap_q
                             "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
                             "mov.b32 %0, {_lo, _hi};\n\t"
                             "}"
-                            : "=r"(_packed) : "f"(sv_f3[4]), "f"(sv_f3[5]),
-                                               "f"(sv_f3[6]), "f"(sv_f3[7]));
+                            : "=r"(_packed) : "f"(_tmem_load_4[4]), "f"(_tmem_load_4[5]),
+                                               "f"(_tmem_load_4[6]), "f"(_tmem_load_4[7]));
                         _fp8_3[1] = _packed;
                     }
                     {
@@ -2017,8 +2072,8 @@ kernel_cake_dsv4_430c388f48f1e672627c(const __grid_constant__ CUtensorMap tmap_q
                             "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
                             "mov.b32 %0, {_lo, _hi};\n\t"
                             "}"
-                            : "=r"(_packed) : "f"(sv_f3[8]), "f"(sv_f3[9]),
-                                               "f"(sv_f3[10]), "f"(sv_f3[11]));
+                            : "=r"(_packed) : "f"(_tmem_load_4[8]), "f"(_tmem_load_4[9]),
+                                               "f"(_tmem_load_4[10]), "f"(_tmem_load_4[11]));
                         _fp8_3[2] = _packed;
                     }
                     {
@@ -2030,8 +2085,8 @@ kernel_cake_dsv4_430c388f48f1e672627c(const __grid_constant__ CUtensorMap tmap_q
                             "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
                             "mov.b32 %0, {_lo, _hi};\n\t"
                             "}"
-                            : "=r"(_packed) : "f"(sv_f3[12]), "f"(sv_f3[13]),
-                                               "f"(sv_f3[14]), "f"(sv_f3[15]));
+                            : "=r"(_packed) : "f"(_tmem_load_4[12]), "f"(_tmem_load_4[13]),
+                                               "f"(_tmem_load_4[14]), "f"(_tmem_load_4[15]));
                         _fp8_3[3] = _packed;
                     }
                     {
@@ -2043,8 +2098,8 @@ kernel_cake_dsv4_430c388f48f1e672627c(const __grid_constant__ CUtensorMap tmap_q
                             "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
                             "mov.b32 %0, {_lo, _hi};\n\t"
                             "}"
-                            : "=r"(_packed) : "f"(sv_f3[16]), "f"(sv_f3[17]),
-                                               "f"(sv_f3[18]), "f"(sv_f3[19]));
+                            : "=r"(_packed) : "f"(_tmem_load_4[16]), "f"(_tmem_load_4[17]),
+                                               "f"(_tmem_load_4[18]), "f"(_tmem_load_4[19]));
                         _fp8_3[4] = _packed;
                     }
                     {
@@ -2056,8 +2111,8 @@ kernel_cake_dsv4_430c388f48f1e672627c(const __grid_constant__ CUtensorMap tmap_q
                             "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
                             "mov.b32 %0, {_lo, _hi};\n\t"
                             "}"
-                            : "=r"(_packed) : "f"(sv_f3[20]), "f"(sv_f3[21]),
-                                               "f"(sv_f3[22]), "f"(sv_f3[23]));
+                            : "=r"(_packed) : "f"(_tmem_load_4[20]), "f"(_tmem_load_4[21]),
+                                               "f"(_tmem_load_4[22]), "f"(_tmem_load_4[23]));
                         _fp8_3[5] = _packed;
                     }
                     {
@@ -2069,8 +2124,8 @@ kernel_cake_dsv4_430c388f48f1e672627c(const __grid_constant__ CUtensorMap tmap_q
                             "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
                             "mov.b32 %0, {_lo, _hi};\n\t"
                             "}"
-                            : "=r"(_packed) : "f"(sv_f3[24]), "f"(sv_f3[25]),
-                                               "f"(sv_f3[26]), "f"(sv_f3[27]));
+                            : "=r"(_packed) : "f"(_tmem_load_4[24]), "f"(_tmem_load_4[25]),
+                                               "f"(_tmem_load_4[26]), "f"(_tmem_load_4[27]));
                         _fp8_3[6] = _packed;
                     }
                     {
@@ -2082,8 +2137,8 @@ kernel_cake_dsv4_430c388f48f1e672627c(const __grid_constant__ CUtensorMap tmap_q
                             "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
                             "mov.b32 %0, {_lo, _hi};\n\t"
                             "}"
-                            : "=r"(_packed) : "f"(sv_f3[28]), "f"(sv_f3[29]),
-                                               "f"(sv_f3[30]), "f"(sv_f3[31]));
+                            : "=r"(_packed) : "f"(_tmem_load_4[28]), "f"(_tmem_load_4[29]),
+                                               "f"(_tmem_load_4[30]), "f"(_tmem_load_4[31]));
                         _fp8_3[7] = _packed;
                     }
                     tmem_st_x8_u32(p_base_all + 24, (const uint32_t*)_fp8_3);
@@ -2100,8 +2155,8 @@ kernel_cake_dsv4_430c388f48f1e672627c(const __grid_constant__ CUtensorMap tmap_q
                 mbarrier_wait_hint(o_done_addr, _phase_o_done_0, 10000000);
                 _phase_o_done_0 ^= 1;
                 asm volatile("tcgen05.fence::after_thread_sync;");
-                float _rcp_98 = approx_rcp(row_sum_val);
-                float epi_inv_sum = ((row_sum_val > 0.0f) ? _rcp_98 : 0.0f);
+                float _rcp_106 = approx_rcp(row_sum_val);
+                float epi_inv_sum = ((row_sum_val > 0.0f) ? _rcp_106 : 0.0f);
                 int epi_v_chunk = work_idx_2 & 1;
                 int epi_o_offset = (query_idx_1 * num_heads + my_row) * 512 + epi_v_chunk * 256;
                 #pragma unroll
@@ -2109,11 +2164,11 @@ kernel_cake_dsv4_430c388f48f1e672627c(const __grid_constant__ CUtensorMap tmap_q
                     int epi_o_base = taddr + 256 + (unsigned int)(epi_vs * 128) + (unsigned int)(tmem_row_base << 16);
                     #pragma unroll
                     for (int epi_c = 64; epi_c < 128; epi_c += 32) {
-                        float _tmem_load_1[32];
+                        float _tmem_load_5[32];
                         asm volatile(
                             "tcgen05.ld.sync.aligned.32x32b.x32.b32"
                             " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
-                            : "=f"(_tmem_load_1[0]), "=f"(_tmem_load_1[1]), "=f"(_tmem_load_1[2]), "=f"(_tmem_load_1[3]), "=f"(_tmem_load_1[4]), "=f"(_tmem_load_1[5]), "=f"(_tmem_load_1[6]), "=f"(_tmem_load_1[7]), "=f"(_tmem_load_1[8]), "=f"(_tmem_load_1[9]), "=f"(_tmem_load_1[10]), "=f"(_tmem_load_1[11]), "=f"(_tmem_load_1[12]), "=f"(_tmem_load_1[13]), "=f"(_tmem_load_1[14]), "=f"(_tmem_load_1[15]), "=f"(_tmem_load_1[16]), "=f"(_tmem_load_1[17]), "=f"(_tmem_load_1[18]), "=f"(_tmem_load_1[19]), "=f"(_tmem_load_1[20]), "=f"(_tmem_load_1[21]), "=f"(_tmem_load_1[22]), "=f"(_tmem_load_1[23]), "=f"(_tmem_load_1[24]), "=f"(_tmem_load_1[25]), "=f"(_tmem_load_1[26]), "=f"(_tmem_load_1[27]), "=f"(_tmem_load_1[28]), "=f"(_tmem_load_1[29]), "=f"(_tmem_load_1[30]), "=f"(_tmem_load_1[31])
+                            : "=f"(_tmem_load_5[0]), "=f"(_tmem_load_5[1]), "=f"(_tmem_load_5[2]), "=f"(_tmem_load_5[3]), "=f"(_tmem_load_5[4]), "=f"(_tmem_load_5[5]), "=f"(_tmem_load_5[6]), "=f"(_tmem_load_5[7]), "=f"(_tmem_load_5[8]), "=f"(_tmem_load_5[9]), "=f"(_tmem_load_5[10]), "=f"(_tmem_load_5[11]), "=f"(_tmem_load_5[12]), "=f"(_tmem_load_5[13]), "=f"(_tmem_load_5[14]), "=f"(_tmem_load_5[15]), "=f"(_tmem_load_5[16]), "=f"(_tmem_load_5[17]), "=f"(_tmem_load_5[18]), "=f"(_tmem_load_5[19]), "=f"(_tmem_load_5[20]), "=f"(_tmem_load_5[21]), "=f"(_tmem_load_5[22]), "=f"(_tmem_load_5[23]), "=f"(_tmem_load_5[24]), "=f"(_tmem_load_5[25]), "=f"(_tmem_load_5[26]), "=f"(_tmem_load_5[27]), "=f"(_tmem_load_5[28]), "=f"(_tmem_load_5[29]), "=f"(_tmem_load_5[30]), "=f"(_tmem_load_5[31])
                             : "r"(epi_o_base + epi_c));
                         asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
                         int epi_gmem_base = epi_o_offset + epi_vs * 128 + epi_c;
@@ -2121,10 +2176,10 @@ kernel_cake_dsv4_430c388f48f1e672627c(const __grid_constant__ CUtensorMap tmap_q
                             #pragma unroll
                             for (int epi_j = 0; epi_j < 32; epi_j += 16) {
                                 float _scaled_0[16];
-                                const float2 _scale2_99 = {epi_inv_sum * epi_output_scale, epi_inv_sum * epi_output_scale};
+                                const float2 _scale2_107 = {epi_inv_sum * epi_output_scale, epi_inv_sum * epi_output_scale};
                                 #pragma unroll
                                 for (int _ls = 0; _ls < 8; _ls++)
-                                    reinterpret_cast<float2*>(_scaled_0)[_ls] = mul_f32x2_rn_noftz(reinterpret_cast<float2*>((_tmem_load_1 + epi_j))[_ls], _scale2_99);
+                                    reinterpret_cast<float2*>(_scaled_0)[_ls] = mul_f32x2_rn_noftz(reinterpret_cast<float2*>((_tmem_load_5 + epi_j))[_ls], _scale2_107);
                                 unsigned int _packed_0[8];
                                 #pragma unroll
                                 for (int _lp = 0; _lp < 1; _lp++) {
@@ -2167,10 +2222,10 @@ kernel_cake_dsv4_430c388f48f1e672627c(const __grid_constant__ CUtensorMap tmap_q
                                     _packed_0[_lp + 7] = *(uint32_t*)&_bf2;
                                 }
                                 {
-                                    const unsigned* _raw_stv8_100 = reinterpret_cast<const unsigned*>(_packed_0);
+                                    const unsigned* _raw_stv8_108 = reinterpret_cast<const unsigned*>(_packed_0);
                                     asm volatile(
                                         "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
-                                        :: "l"((void*)(O + (epi_gmem_base + epi_j))), "r"(_raw_stv8_100[0]), "r"(_raw_stv8_100[1]), "r"(_raw_stv8_100[2]), "r"(_raw_stv8_100[3]), "r"(_raw_stv8_100[4]), "r"(_raw_stv8_100[5]), "r"(_raw_stv8_100[6]), "r"(_raw_stv8_100[7]) : "memory");
+                                        :: "l"((void*)(O + (epi_gmem_base + epi_j))), "r"(_raw_stv8_108[0]), "r"(_raw_stv8_108[1]), "r"(_raw_stv8_108[2]), "r"(_raw_stv8_108[3]), "r"(_raw_stv8_108[4]), "r"(_raw_stv8_108[5]), "r"(_raw_stv8_108[6]), "r"(_raw_stv8_108[7]) : "memory");
                                 }
                             }
                         }
@@ -2232,14 +2287,14 @@ kernel_cake_dsv4_430c388f48f1e672627c(const __grid_constant__ CUtensorMap tmap_q
                                 int o_base = taddr + 256 + (unsigned int)(vs * 128) + (unsigned int)corr_row;
                                 #pragma unroll
                                 for (int c = 0; c < 128; c += 16) {
-                                    float _tmem_load_2[16];
-                                    tmem_ld_x16(&_tmem_load_2[0], o_base + c);
+                                    float _tmem_load_6[16];
+                                    tmem_ld_x16(&_tmem_load_6[0], o_base + c);
                                     asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
                                     const float2 _scale2_0 = {acc_scale_1, acc_scale_1};
                                     #pragma unroll
                                     for (int _ls = 0; _ls < 8; _ls++)
-                                        mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(_tmem_load_2)[_ls], _scale2_0);
-                                    tmem_st_x16_f32(o_base + c, _tmem_load_2);
+                                        mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(_tmem_load_6)[_ls], _scale2_0);
+                                    tmem_st_x16_f32(o_base + c, _tmem_load_6);
                                     asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
                                 }
                             }
@@ -2275,11 +2330,11 @@ kernel_cake_dsv4_430c388f48f1e672627c(const __grid_constant__ CUtensorMap tmap_q
                     int o_base_epi = taddr + 256 + (unsigned int)(vs_1 * 128) + (unsigned int)corr_row;
                     #pragma unroll
                     for (int c_1 = 0; c_1 < 64; c_1 += 32) {
-                        float _tmem_load_3[32];
+                        float _tmem_load_7[32];
                         asm volatile(
                             "tcgen05.ld.sync.aligned.32x32b.x32.b32"
                             " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
-                            : "=f"(_tmem_load_3[0]), "=f"(_tmem_load_3[1]), "=f"(_tmem_load_3[2]), "=f"(_tmem_load_3[3]), "=f"(_tmem_load_3[4]), "=f"(_tmem_load_3[5]), "=f"(_tmem_load_3[6]), "=f"(_tmem_load_3[7]), "=f"(_tmem_load_3[8]), "=f"(_tmem_load_3[9]), "=f"(_tmem_load_3[10]), "=f"(_tmem_load_3[11]), "=f"(_tmem_load_3[12]), "=f"(_tmem_load_3[13]), "=f"(_tmem_load_3[14]), "=f"(_tmem_load_3[15]), "=f"(_tmem_load_3[16]), "=f"(_tmem_load_3[17]), "=f"(_tmem_load_3[18]), "=f"(_tmem_load_3[19]), "=f"(_tmem_load_3[20]), "=f"(_tmem_load_3[21]), "=f"(_tmem_load_3[22]), "=f"(_tmem_load_3[23]), "=f"(_tmem_load_3[24]), "=f"(_tmem_load_3[25]), "=f"(_tmem_load_3[26]), "=f"(_tmem_load_3[27]), "=f"(_tmem_load_3[28]), "=f"(_tmem_load_3[29]), "=f"(_tmem_load_3[30]), "=f"(_tmem_load_3[31])
+                            : "=f"(_tmem_load_7[0]), "=f"(_tmem_load_7[1]), "=f"(_tmem_load_7[2]), "=f"(_tmem_load_7[3]), "=f"(_tmem_load_7[4]), "=f"(_tmem_load_7[5]), "=f"(_tmem_load_7[6]), "=f"(_tmem_load_7[7]), "=f"(_tmem_load_7[8]), "=f"(_tmem_load_7[9]), "=f"(_tmem_load_7[10]), "=f"(_tmem_load_7[11]), "=f"(_tmem_load_7[12]), "=f"(_tmem_load_7[13]), "=f"(_tmem_load_7[14]), "=f"(_tmem_load_7[15]), "=f"(_tmem_load_7[16]), "=f"(_tmem_load_7[17]), "=f"(_tmem_load_7[18]), "=f"(_tmem_load_7[19]), "=f"(_tmem_load_7[20]), "=f"(_tmem_load_7[21]), "=f"(_tmem_load_7[22]), "=f"(_tmem_load_7[23]), "=f"(_tmem_load_7[24]), "=f"(_tmem_load_7[25]), "=f"(_tmem_load_7[26]), "=f"(_tmem_load_7[27]), "=f"(_tmem_load_7[28]), "=f"(_tmem_load_7[29]), "=f"(_tmem_load_7[30]), "=f"(_tmem_load_7[31])
                             : "r"(o_base_epi + c_1));
                         asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
                         int gmem_base = o_offset + vs_1 * 128 + c_1;
@@ -2290,7 +2345,7 @@ kernel_cake_dsv4_430c388f48f1e672627c(const __grid_constant__ CUtensorMap tmap_q
                                 const float2 _scale2_3 = {inv_sum * output_scale, inv_sum * output_scale};
                                 #pragma unroll
                                 for (int _ls = 0; _ls < 8; _ls++)
-                                    reinterpret_cast<float2*>(_scaled_1)[_ls] = mul_f32x2_rn_noftz(reinterpret_cast<float2*>((_tmem_load_3 + j))[_ls], _scale2_3);
+                                    reinterpret_cast<float2*>(_scaled_1)[_ls] = mul_f32x2_rn_noftz(reinterpret_cast<float2*>((_tmem_load_7 + j))[_ls], _scale2_3);
                                 unsigned int _packed_1[8];
                                 #pragma unroll
                                 for (int _lp = 0; _lp < 1; _lp++) {
