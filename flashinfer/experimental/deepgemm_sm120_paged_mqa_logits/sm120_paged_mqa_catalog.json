@@ -3375,6 +3375,28 @@
               "sm120:fp8:h64:p64:n5:a2:atom2_mx_bta_ha_wr"
             ]
           ],
+          "h64:p64:n5:a3:c16k": [
+            [
+              128,
+              "sm120:fp8:h64:p64:n5:a5:atom5_mpf_bta_ha_k2q_ef"
+            ],
+            [
+              256,
+              "sm120:fp8:h64:p64:n5:a5:atom5_mpf_bta_ha_k2q_ef"
+            ]
+          ],
+          "h64:p64:n5:a3:c4k": [
+            [
+              256,
+              "sm120:fp8:h64:p64:n5:a5:atom5_mpf_bta_ha_k2q_ef"
+            ]
+          ],
+          "h64:p64:n5:a3:c64k": [
+            [
+              128,
+              "sm120:fp8:h64:p64:n5:a5:atom5_mpf_bta_ha_k2q_ef"
+            ]
+          ],
           "h64:p64:n6:a2:c16k": [
             [
               1,
@@ -3390,7 +3412,7 @@
             ],
             [
               64,
-              null
+              "sm120:fp8:h64:p64:n6:a6:atom6_mpf_bta_ha_ef"
             ]
           ],
           "h64:p64:n6:a2:c4k": [
@@ -3415,6 +3437,28 @@
             [
               32,
               "sm120:fp8:h64:p64:n6:a2:atom2_mx_bta_ha_wr"
+            ]
+          ],
+          "h64:p64:n6:a3:c16k": [
+            [
+              128,
+              "sm120:fp8:h64:p64:n6:a6:atom6_mpf_bta_ha_ef"
+            ],
+            [
+              256,
+              "sm120:fp8:h64:p64:n6:a6:atom6_mpf_bta_ha_ef"
+            ]
+          ],
+          "h64:p64:n6:a3:c4k": [
+            [
+              256,
+              "sm120:fp8:h64:p64:n6:a6:atom6_mpf_bta_ha_ef"
+            ]
+          ],
+          "h64:p64:n6:a3:c64k": [
+            [
+              128,
+              "sm120:fp8:h64:p64:n6:a6:atom6_mpf_bta_ha_ef"
             ]
           ]
         },
