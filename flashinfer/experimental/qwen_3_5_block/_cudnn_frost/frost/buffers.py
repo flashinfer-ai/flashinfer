@@ -625,13 +625,14 @@ def cutedsl_arch_requirement_error(device_cc):
 
 
 def cutedsl_primitives_error(what):
-    """Message when the DSL is new enough but exports no ``cutlass.primitives``.
+    """Message when the DSL is new enough but exports no ``cutlass.experimental.primitives``.
 
-    Clearing the version floor does not imply the primitive layer is reachable
-    under that name: public wheels have shipped it as
-    ``cutlass.experimental.primitives``, and where ``cutlass.primitives`` does
-    work it can be an alias with no directory of its own -- so neither the
-    version nor the filesystem answers this. Only an import does.
+    The kernels that call this import the primitive layer under the name public
+    wheels ship, ``cutlass.experimental.primitives`` (builds that also export
+    ``cutlass.primitives`` alias it to the same module). Clearing the version
+    floor does not imply that module is reachable, and it can be an alias with
+    no directory of its own -- so neither the version nor the filesystem answers
+    this. Only an import does.
 
     That import executes the cutlass package (~1 s), which is why this is NOT
     folded into :func:`cutedsl_requirement_error`: callers run it last, once an
@@ -644,7 +645,7 @@ def cutedsl_primitives_error(what):
         import importlib
 
         try:
-            importlib.import_module("cutlass.primitives")
+            importlib.import_module("cutlass.experimental.primitives")
             _DSL_PRIMITIVES = False
         except Exception:  # noqa: BLE001 - any failure to reach it is the same answer
             _DSL_PRIMITIVES = True
@@ -654,7 +655,7 @@ def cutedsl_primitives_error(what):
     found = version[1] if version else "unknown"
     floor = ".".join(str(x) for x in CUTEDSL_MIN_VERSION)
     return (
-        f"{what} lowers through the CuTe DSL primitive layer (cutlass.primitives), "
+        f"{what} lowers through the CuTe DSL primitive layer (cutlass.experimental.primitives), "
         f"which the installed nvidia-cutlass-dsl ({found}) does not export. "
         f"Install a build that provides it (>= {floor})."
     )

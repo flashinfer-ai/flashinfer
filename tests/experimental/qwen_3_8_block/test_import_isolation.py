@@ -62,7 +62,7 @@ assert q.Qwen38BlockWrapper.is_experimental is True and q.Qwen38BlockWrapper.pla
 import torch
 g = q.Qwen38BlockGeometry(d_model=2560, num_qo_heads=24, num_kv_heads=2)
 sup = q.qwen_3_8_block_support(torch.device("cpu"), g)
-assert sup.served is False and sup.source.commit.startswith("977757763")
+assert sup.served is False and sup.source.commit.startswith("4c8e24355")
 # the probe on a CPU host reads no vendored tree and imports no kernel module (FlashInfer's own cute_dsl availability probe may load the
 # DSL's Python frontend: the Qwen 3.5 package's rule, not this package's)
 assert not any(k.startswith("flashinfer.experimental.qwen_3_5_block._cudnn_frost") for k in sys.modules), "the probe on CPU reads no vendored tree"
@@ -86,6 +86,8 @@ mods = sorted(k for k in sys.modules if (".kernels." in k and k.startswith("flas
 assert not mods, mods
 assert support.INDEX_HEAD_DIM == 128 and support.INDEX_QUERY_ROWS_MAX == 64 and support.INDEX_STATE_ROWS_EXTRA == 3
 assert support.INDEX_TOP_K_RANGE == (4, 512, 4) and support.PAGE_SIZES == (16, 32, 64, 128) and support.DECODE_CAPTURE_ROWS_MAX == 128
+assert support.FORMS == ("prefill", "extend", "decode") and support.INDEX_EXTEND_RING_ROWS_MIN == 3 and support.INDEX_COMPRESS_ROUNDINGS == ("single", "hf")
+assert support.INDEX_SELECT_FORMS == ("auto", "decode", "extend") and support.INDEX_EXTEND_SELECT_BUDGET_BYTES == 512 << 20 and support.EXTEND_ROWS_MAX == 128
 print("OK")
 """
     )
@@ -94,8 +96,10 @@ print("OK")
 
 def test_vendored_tree_declares_the_decode_form_without_cudnn():
     """With the DSL importable: the Qwen 3.8 decode declaration (the in-block indexer over the pools, the two paged side caches, the four
-    input-contract arms) builds on host tensors with the ``cudnn`` package blocked -- the closure the 3.8 route added is complete; the
-    envelope's decode record carries the indexer rows the support module mirrors."""
+    input-contract arms) AND the EXTEND declaration (``index_select_form="extend"`` at 128 rows, the stack's ring slots, per-token tables;
+    the scorer's head-group rule reads the vendored DSA subtree at declaration) build on host tensors with the ``cudnn`` package blocked --
+    the closure the 3.8 routes added is complete; the envelope's decode record carries the indexer rows the support module mirrors, the
+    extend step's rows included."""
     pytest.importorskip("cutlass")
     out = _run_isolated(
         _BLOCK_CUDNN
@@ -116,8 +120,19 @@ for fused, tables, slots in ((True, True, True), (True, True, False), (False, Fa
             sample_index_kv_cache=torch.zeros(12, P // 4, 1, DI, dtype=DT), sample_index_state_cache=torch.zeros(5, 8, 1, DI, dtype=DT),
             sample_index_state_block_table=torch.zeros(4, 1, dtype=torch.int32), index_state_slot_mapping_present=slots, rope_position_tables_only=tables)
     assert b.indexer_decode and b.fuse_prepare is fused and b.qsa_list_form == "per_row", (fused, tables, slots)
+# the EXTEND step at 128 rows (the 4c8e24355 pin): the pin, the ring slots, the per-token tables, fuse_prepare None -> False, a ring of cap 4
+e = Fwd(mk(1, 128, DM), *w[:3], mk(1, 128, ROPE), mk(1, 128, ROPE), w[3], mk(1, 128, DM), g, paged_kv_page_size=P, kv_source="paged",
+        sample_k_cache=kc, sample_v_cache=vc, sample_block_table=torch.zeros(1, 12, dtype=torch.int32), fuse_norm_rope=False, fuse_gate=True,
+        sample_index_kv_cache=torch.zeros(12, P // 4, 1, DI, dtype=DT), sample_index_state_cache=torch.zeros(2, 4, 1, DI, dtype=DT),
+        sample_index_state_block_table=torch.zeros(1, 1, dtype=torch.int32), index_state_slot_mapping_present=True, rope_position_tables_only=False,
+        index_select_form="extend")
+assert e.indexer_extend and e.index_select_form_resolved == "extend" and e.fuse_prepare is False and e._indexer_extend.n_windows == 1
+assert e._cache_write.index_ring and e._cache_write.index_ring_cap == 4 and e._indexer_extend.launches_per_execute() == 6
 env = Fwd.serving_envelope(g, DT, torch.device("cpu"), device_cc=(10, 7))
 d = env.decode
+assert d.index_select_forms == support.INDEX_SELECT_FORMS and d.index_extend_ring_rows_min == support.INDEX_EXTEND_RING_ROWS_MIN
+assert d.index_extend_select_budget_bytes == support.INDEX_EXTEND_SELECT_BUDGET_BYTES and d.index_compress_roundings == support.INDEX_COMPRESS_ROUNDINGS
+assert tuple(d.index_cache_dtypes) == (DT, torch.float8_e4m3fn)
 assert d.sparse_core and d.index_sources == ("caller", "indexer") and d.index_list_forms == ("per_row",), (d.index_sources, d.index_list_forms)
 assert d.index_head_dims == (support.INDEX_HEAD_DIM,) and d.index_query_rows_max == support.INDEX_QUERY_ROWS_MAX
 assert d.index_state_rows_extra == support.INDEX_STATE_ROWS_EXTRA and d.index_top_k_range == support.INDEX_TOP_K_RANGE
@@ -137,9 +152,10 @@ print("OK")
 
 
 def test_the_closure_modules_the_decode_route_added_import_without_cudnn():
-    """Every module the 3.8 route added to the shared vendored tree (the block-sparse core and its lean second body, the paged indexer
-    kernels and their DSL-free hosts) imports with the ``cudnn`` package blocked and no GPU; the lazily imported paths outside the
-    closure (the e4m3 pool's upcast arm, the DSA top-k) are named and stay out."""
+    """Every module the 3.8 routes added to the shared vendored tree (the block-sparse core and its lean second body, the paged indexer
+    kernels and their DSL-free hosts; since the 4c8e24355 pin the extend step's two kernels and the DSA indexer scorer + top-k subtree it
+    scores through) imports with the ``cudnn`` package blocked and no GPU; the lazily imported paths outside the closure (the e4m3 pool's
+    upcast arm, the DSA subtree's backward packages) are named and stay out."""
     pytest.importorskip("cutlass")
     out = _run_isolated(
         _BLOCK_CUDNN
@@ -152,7 +168,14 @@ added = ("sdpa.fwd.sparse_gqa_sm107", "sdpa.fwd.kernels.sm107.sparse_d256_f16", 
          # the 7301fad21 pin: the lean decode tile, the shared visible-set helper it and the tcgen05 core import, the THD origins module
          "sdpa.fwd.kernels.sm107.sparse_lean_d256_f16", "sdpa.fwd.kernels.sm107._sparse_item_common", "sdpa.fwd.kernels.thd_origins",
          # the 977757763 pin: the DSL-free rules module (the tile_form vocabulary, the lean placement rule in CTAs per chunk) the heuristics re-export
-         "sdpa.fwd.sparse_tile_rules")
+         "sdpa.fwd.sparse_tile_rules",
+         # the 4c8e24355 pin: the EXTEND step's two kernels (the dense kbar gather, the canonical-order kernel) and the DSA indexer scorer +
+         # top-k subtree the step scores through (the entry points the vendored selection host imports inside qsa_select_forward)
+         "gated_attention_block.kernels.qsa_kbar_gather", "gated_attention_block.kernels.qsa_canonical_list",
+         "deepseek_sparse_attention", "deepseek_sparse_attention.indexer_forward", "deepseek_sparse_attention.indexer_forward._support",
+         "deepseek_sparse_attention.indexer_top_k", "deepseek_sparse_attention.utils.runtime", "deepseek_sparse_attention.score_recompute",
+         # two SDPA host modules the changed adapters import at this pin
+         "sdpa.layout", "sdpa.native_sm80")
 failed, declined = [], []
 for name in added:
     try:
@@ -168,13 +191,14 @@ assert topk.QSA_TOPK_DECODE_KERNEL_MODULE == root + "gated_attention_block.kerne
 m = importlib.import_module(root + "sdpa.fwd.sparse_gqa_sm107")
 # the bare `import cudnn` of this module was rewritten to the vendored root: its data_type enum is the shim's
 assert m.cudnn.__name__ == root[:-1] and m.cudnn.data_type.BFLOAT16 == 10, (m.cudnn.__name__,)
-for absent in ("gated_attention_block.kernels.qsa_kv_upcast", "deepseek_sparse_attention"):
+for absent in ("gated_attention_block.kernels.qsa_kv_upcast", "deepseek_sparse_attention.indexer_backward", "deepseek_sparse_attention.sparse_attention_backward",
+               "deepseek_sparse_attention.sparse_attention_forward", "deepseek_sparse_attention.training"):
     try:
         importlib.import_module(root + absent)
     except ModuleNotFoundError:
         pass
     else:
-        raise AssertionError(f"{absent} is vendored but excluded by policy")
+        raise AssertionError(f"{absent} is vendored but excluded (by policy, or by the extend route's trace)")
 leaked = sorted(k for k in sys.modules if (k == "cudnn" and sys.modules[k] is not None) or k.startswith("cudnn."))
 assert not leaked, leaked
 print("OK", len(added), "declined", len(declined))

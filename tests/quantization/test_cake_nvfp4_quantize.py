@@ -181,8 +181,8 @@ def test_row_strided_activation_at_a_new_width_runs_a_registered_program():
     assert replaced > 0
 
 
-# The bindings that check that x is contiguous (the cluster-split, pad-chunked and _ru
-# programs); every other quantizer binding reads x through its row stride.
+# The bindings that check that x is contiguous: the static-K programs, which read rows
+# K_STATIC apart; every runtime-geometry binding reads x through its row stride.
 _X_CONTIGUOUS_CHECK = re.compile(r'check_contiguous\((?:a|arg)_x,\s*"x"\)')
 
 
@@ -190,55 +190,80 @@ _X_CONTIGUOUS_CHECK = re.compile(r'check_contiguous\((?:a|arg)_x,\s*"x"\)')
     "arch,sm_count",
     [("sm_100a", 148), ("sm_100a", 152), ("sm_103a", 148), ("sm_103a", 152)],
 )
-def test_row_strided_activations_run_one_cta_per_row(arch, sm_count):
-    """A row-strided view (``M >= 2``, row stride != K) runs one CTA per padded row, on a
-    program whose binding takes ``x`` through its row stride: the cluster-split,
-    pad-chunked and ``_ru`` programs check that ``x`` is contiguous, so they take
-    contiguous rows only.  The quantizer alone and the chain plan such a row alike, and a
-    row whose contiguous plan already runs one CTA per row with the entry read keeps it."""
+def test_row_strided_activations_keep_the_quantizer_alone_plan(arch, sm_count):
+    """A row-strided view (``M >= 2``, row stride != K) runs on a program whose binding
+    takes ``x`` through its row stride.  The quantizer alone plans it like the contiguous
+    row of the same shape -- the cluster split, the pad-chunked program and the late
+    out_scale read included -- unless the contiguous row takes a compiled-in width or the
+    row is in STRIDED_ALONE_ONE_CTA, which runs the chain's plan; the chain's quantizer
+    runs it one CTA per padded row with the entry read, as it runs the contiguous row when
+    that row's chain plan is one CTA per row."""
     csrc = Path(cb.__file__).resolve().parent / "csrc"
     checks_x: dict[str, bool] = {}
     for module in set(KERNELS[arch].values()):
         text = (csrc / MODULES[module]["sources"][1]).read_text()
         checks_x[module] = bool(_X_CONTIGUOUS_CHECK.search(text))
     assert any(checks_x.values())
+    assert all(
+        re.search(r"_k\d+$", key)
+        for key, module in KERNELS[arch].items()
+        if checks_x[module]
+    )
     ms = (*range(2, cb.SINGLE_WAVE_MAX_ROWS + 3), 257, 511, 512, 513, 2048, 8192)
-    moved = 0
+    kept = one_cta_rows = 0
     for k in REACHABLE_K:
         for m in ms:
             for fold in (False, True):
-                strided = _registered(
-                    cb.quant_plan(m, k, True, fold, arch, sm_count, k + 64), arch
+                alone = _registered(
+                    cb.quant_plan(m, k, True, fold, arch, sm_count, k + 64, alone=True),
+                    arch,
                 )
-                assert strided.cluster_split == 1 and not strided.pad_chunked
-                assert strided.out_scale_read == "entry" and strided.k_static is None
-                assert strided.grid == strided.padded_rows, (k, m, fold)
-                assert not checks_x[KERNELS[arch][strided.kernel_key]], (
+                assert alone.k_static is None, (k, m, fold)
+                assert not checks_x[KERNELS[arch][alone.kernel_key]], (
                     k,
                     m,
                     fold,
-                    strided.kernel_key,
+                    alone.kernel_key,
                 )
-                assert strided == cb.quant_plan(
-                    m, k, True, fold, arch, sm_count, k + 64, alone=True
-                ), (k, m, fold)
-                for alone in (False, True):
-                    contiguous = cb.quant_plan(
-                        m, k, True, fold, arch, sm_count, alone=alone
-                    )
+                contiguous = cb.quant_plan(m, k, True, fold, arch, sm_count, alone=True)
+                one_cta = cb.strided_alone_one_cta(m, k, True, fold, arch, sm_count)
+                one_cta_rows += one_cta
+                registered = (
+                    contiguous.k_static is None and contiguous.unregistered_key is None
+                )
+                if registered and not one_cta:
+                    assert alone == contiguous, (k, m, fold)
                     if (
                         contiguous.cluster_split > 1
                         or contiguous.pad_chunked
                         or contiguous.out_scale_read != "entry"
                     ):
-                        moved += 1
-                    elif (
-                        contiguous.k_static is None
-                        and contiguous.unregistered_key is None
-                    ):
-                        assert contiguous == strided, (k, m, fold, alone)
-    assert moved > 0
-    # the one-CTA programs the cluster-split and pad-chunked rows run when row-strided
+                        kept += 1
+                chain = _registered(
+                    cb.quant_plan(m, k, True, fold, arch, sm_count, k + 64), arch
+                )
+                assert chain.cluster_split == 1 and not chain.pad_chunked
+                assert chain.out_scale_read == "entry" and chain.k_static is None
+                assert chain.grid == chain.padded_rows, (k, m, fold)
+                assert not checks_x[KERNELS[arch][chain.kernel_key]], (
+                    k,
+                    m,
+                    fold,
+                    chain.kernel_key,
+                )
+                cc = cb.quant_plan(m, k, True, fold, arch, sm_count)
+                if (
+                    cc.cluster_split == 1
+                    and cc.k_static is None
+                    and cc.unregistered_key is None
+                ):
+                    assert chain == cc, (k, m, fold)
+                if one_cta:
+                    assert alone == chain, (k, m, fold)
+    assert kept > 0
+    if cb.MEASURED_SM_COUNT.get(arch) == sm_count and arch in cb.STRIDED_ALONE_ONE_CTA:
+        assert one_cta_rows > 0
+    # the one-CTA programs the chain runs for row-strided rows
     for k, m, key in (
         (16384, 8, "quant:t512_b2_mb1_bf16"),
         (18432, 8, "quant:t512_b3_mb1_bf16"),
@@ -1060,11 +1085,10 @@ def test_quantizer_alone_out_scale_read_rows():
                     assert near.out_scale_read == "entry", (arch, k, m)
 
 
-def test_quantizer_alone_out_scale_read_keeps_row_strided_rows():
-    """The ``_ru`` program takes contiguous rows only: a row-strided row of a
-    QUANT_ALONE_OUT_SCALE_READ range keeps the plan of the row without the range (the
-    entry read), while the contiguous row of the same shape reads ``out_scale`` at its
-    use."""
+def test_quantizer_alone_out_scale_read_takes_row_strided_rows():
+    """The ``_ru`` program's binding takes ``x`` through its row stride: a row-strided
+    row of a QUANT_ALONE_OUT_SCALE_READ range reads ``out_scale`` at its use like the
+    contiguous row of the same shape, while the chain's quantizer keeps the entry read."""
     suffix = cb.OUT_SCALE_READ_SUFFIX
     for arch, table in cb.QUANT_ALONE_OUT_SCALE_READ.items():
         sm_count = cb.MEASURED_SM_COUNT[arch]
@@ -1072,22 +1096,17 @@ def test_quantizer_alone_out_scale_read_keeps_row_strided_rows():
             for lo, hi, read in ranges:
                 for m in sorted({lo, hi}):
                     stride = k + 64
-                    strided = cb.quant_plan(
-                        m, k, True, True, arch, sm_count, stride, alone=True
-                    )
-                    assert strided.out_scale_read == "entry", (arch, k, m)
-                    assert not strided.kernel_key.endswith(suffix[read]), (arch, k, m)
-                    assert strided == cb.quant_plan(
-                        m, k, True, True, arch, sm_count, stride
-                    ), (arch, k, m)
-                    for row_stride in (None, k):
-                        contiguous = cb.quant_plan(
+                    for row_stride in (None, k, stride):
+                        plan = cb.quant_plan(
                             m, k, True, True, arch, sm_count, row_stride, alone=True
                         )
-                        assert contiguous.out_scale_read == read, (arch, k, m)
-                        assert contiguous.kernel_key.endswith(suffix[read])
+                        assert plan.out_scale_read == read, (arch, k, m, row_stride)
+                        assert plan.kernel_key.endswith(suffix[read]), (arch, k, m)
+                    chain = cb.quant_plan(m, k, True, True, arch, sm_count, stride)
+                    assert chain.out_scale_read == "entry", (arch, k, m)
+                    assert not chain.kernel_key.endswith(suffix[read]), (arch, k, m)
     plan = cb.quant_plan(512, 28672, True, True, "sm_103a", 152, 28736, alone=True)
-    assert plan.kernel_key == "quant:t256_b7_mb3_bf16_fold_sl"
+    assert plan.kernel_key == "quant:t256_b7_mb3_bf16_fold_sl_ru"
 
 
 _ALONE_OUT_SCALE_READ_CASES = sorted(
@@ -1124,9 +1143,9 @@ def test_quantizer_alone_out_scale_read_matches_the_chain_quantizer(k, m):
 
 @pytest.mark.parametrize("k,m", _ALONE_OUT_SCALE_READ_CASES)
 def test_quantizer_alone_out_scale_read_row_strided_matches_contiguous(k, m):
-    """A row-strided view of a QUANT_ALONE_OUT_SCALE_READ row runs (its plan keeps the
-    entry read) and writes the same codes, block scales (padding included) and per-token
-    scales as the contiguous copy, bit for bit."""
+    """A row-strided view of a QUANT_ALONE_OUT_SCALE_READ row runs the late-read program
+    of the contiguous row and writes the same codes, block scales (padding included) and
+    per-token scales as the contiguous copy, bit for bit."""
     device = _require_program()
     g = torch.Generator(device=device).manual_seed(6000 + m + k)
     full = torch.randn(m, k + 64, device=device, dtype=torch.bfloat16, generator=g)
@@ -1138,13 +1157,18 @@ def test_quantizer_alone_out_scale_read_row_strided_matches_contiguous(k, m):
     want = cb.allocate_nvfp4_per_token_quantize_outputs(m, k, device)
     for t in (*got, *want):
         t.view(torch.uint8).fill_(0xFF)
-    cb.prepare_nvfp4_per_token_quantize(x, gs_inv, got, out_scale=out_scale)()
+    runner = cb.prepare_nvfp4_per_token_quantize(x, gs_inv, got, out_scale=out_scale)
+    runner()
     cb.prepare_nvfp4_per_token_quantize(
         x.contiguous(), gs_inv, want, out_scale=out_scale
     )()
     torch.cuda.synchronize()
     for a, b in zip(got, want, strict=True):
         assert torch.equal(a.reshape(-1), b.reshape(-1))
+    arch, sm_count = cb._device_arch(device), cb._sm_count(device)
+    contiguous = cb.quant_plan(m, k, True, True, arch, sm_count, alone=True)
+    if contiguous.k_static is None and contiguous.unregistered_key is None:
+        assert runner.plan == contiguous, (k, m)
     public = cb.nvfp4_quantize_per_token(x, gs_inv, out_scale=out_scale)
     torch.cuda.synchronize()
     for a, b in zip(public, got, strict=True):
@@ -1368,9 +1392,10 @@ _STRIDED_SPLIT_CASES = sorted(
 @pytest.mark.parametrize("k,m,fold", _STRIDED_SPLIT_CASES)
 def test_quantize_reads_row_strided_split_rows_in_place(k, m, fold):
     """A row-strided view of a row the cluster split or the pad-chunked program serves
-    when contiguous runs one CTA per padded row and writes the same codes, block scales
-    (padding included) and per-token scales as the contiguous copy, bit for bit, through
-    the prepared entry and both public entries."""
+    when contiguous runs the same program in place and writes the same codes, block
+    scales (padding included) and per-token scales as the contiguous copy, bit for bit,
+    through the prepared entry and both public entries; the chain's quantizer runs the
+    view one CTA per padded row and writes the same outputs."""
     device = _require_program()
     g = torch.Generator(device=device).manual_seed(7000 + m + k)
     full = torch.randn(m, k + 64, device=device, dtype=torch.bfloat16, generator=g)
@@ -1405,7 +1430,26 @@ def test_quantize_reads_row_strided_split_rows_in_place(k, m, fold):
                 a.reshape(-1).view(torch.uint8), b.reshape(-1).view(torch.uint8)
             )
     _check_against_reference(x, gs_inv, out_scale, *got)
-    assert runner.plan.cluster_split == 1 and not runner.plan.pad_chunked
+    arch, sm_count = cb._device_arch(device), cb._sm_count(device)
+    contiguous = cb.quant_plan(m, k, True, fold, arch, sm_count, alone=True)
+    one_cta = cb.strided_alone_one_cta(m, k, True, fold, arch, sm_count)
+    registered = contiguous.k_static is None and contiguous.unregistered_key is None
+    if registered and not one_cta:
+        assert runner.plan == contiguous, (k, m, fold)
+    chain_out = cb.allocate_nvfp4_per_token_quantize_outputs(m, k, device)
+    for t in chain_out:
+        t.view(torch.uint8).fill_(0xFF)
+    chain = cb._prepare_quantize(x, gs_inv, chain_out, out_scale=out_scale, alone=False)
+    chain()
+    torch.cuda.synchronize()
+    for a, b in zip(chain_out, want, strict=True):
+        assert torch.equal(
+            a.reshape(-1).view(torch.uint8), b.reshape(-1).view(torch.uint8)
+        )
+    assert chain.plan.cluster_split == 1 and not chain.plan.pad_chunked
+    assert chain.plan.out_scale_read == "entry"
+    if one_cta:
+        assert runner.plan == chain.plan, (k, m, fold)
 
 
 def _misaligned_view(kind, m, k, device):

@@ -38,6 +38,21 @@ Cake VSA
     run_cake_vsa
 
 
+Token-Sparse Attention Inputs
+-----------------------------
+
+Build cache-slot lists for token-sparse attention.
+Build grouped key unions and masks for masked dense attention.
+
+.. currentmodule:: flashinfer.token_sparse
+
+.. autosummary::
+    :toctree: ../generated
+
+    token_sparse_kv_indices
+    group_union_masks
+
+
 .. currentmodule:: flashinfer.sparse
 
 

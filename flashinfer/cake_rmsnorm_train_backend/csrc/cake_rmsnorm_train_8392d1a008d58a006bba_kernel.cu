@@ -189,28 +189,28 @@ kernel_cake_rmsnorm_train_8392d1a008d58a006bba(__nv_bfloat16* __restrict__ x, __
                 for (int j_3 = 0; j_3 < 8; j_3++) {
                     x_cache[v_3 * 8 + j_3] = x_cache[v_3 * 8 + j_3] * rstd * w_cache[v_3 * 8 + j_3];
                 }
-                unsigned int _packed_0[4];
+                unsigned int packed_1[4];
                 #pragma unroll
                 for (int _lp = 0; _lp < 1; _lp++) {
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2((x_cache + v_3 * 8)[_lp*2 + 0], (x_cache + v_3 * 8)[_lp*2+1 + 0]));
-                    _packed_0[_lp] = *(uint32_t*)&_bf2;
+                    packed_1[_lp] = *(uint32_t*)&_bf2;
                 }
                 #pragma unroll
                 for (int _lp = 0; _lp < 1; _lp++) {
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2((x_cache + v_3 * 8)[_lp*2 + 2], (x_cache + v_3 * 8)[_lp*2+1 + 2]));
-                    _packed_0[_lp + 1] = *(uint32_t*)&_bf2;
+                    packed_1[_lp + 1] = *(uint32_t*)&_bf2;
                 }
                 #pragma unroll
                 for (int _lp = 0; _lp < 1; _lp++) {
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2((x_cache + v_3 * 8)[_lp*2 + 4], (x_cache + v_3 * 8)[_lp*2+1 + 4]));
-                    _packed_0[_lp + 2] = *(uint32_t*)&_bf2;
+                    packed_1[_lp + 2] = *(uint32_t*)&_bf2;
                 }
                 #pragma unroll
                 for (int _lp = 0; _lp < 1; _lp++) {
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2((x_cache + v_3 * 8)[_lp*2 + 6], (x_cache + v_3 * 8)[_lp*2+1 + 6]));
-                    _packed_0[_lp + 3] = *(uint32_t*)&_bf2;
+                    packed_1[_lp + 3] = *(uint32_t*)&_bf2;
                 }
-                reinterpret_cast<int4*>(y + (obase + (long long)(gtid * 8 + v_3 * (GROUP_THREADS * 8))))[0] = reinterpret_cast<int4*>(_packed_0)[0];
+                reinterpret_cast<int4*>(y + (obase + (long long)(gtid * 8 + v_3 * (GROUP_THREADS * 8))))[0] = reinterpret_cast<int4*>(packed_1)[0];
             }
         }
     }

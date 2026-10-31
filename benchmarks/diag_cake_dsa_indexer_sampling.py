@@ -820,6 +820,23 @@ def time_default_vs_off(inputs, label, max_seqlen_k, reps, warmup, knobs):
     )
     off = dict(knobs)
     off["sample_tiles_max"] = 0
+    # The benchmark harness bounds a row at max(seg_k); time the arms with the call's own bound so the
+    # timed plans are the plan this script prints (a saved caller bound can exceed max(seg_k)).
+    harness_extra = bcdi.row_extra
+
+    def call_extra(row_inputs):
+        if row_inputs.label == label and max_seqlen_k is not None:
+            return {"max_seqlen_k": int(max_seqlen_k)}
+        return harness_extra(row_inputs)
+
+    bcdi.row_extra = call_extra
+    try:
+        return _time_arms(inputs, knobs, off, reps, warmup, max_seqlen_k)
+    finally:
+        bcdi.row_extra = harness_extra
+
+
+def _time_arms(inputs, knobs, off, reps, warmup, max_seqlen_k):
     arms = {
         "default": bcdi.CakeArm(inputs, knobs=knobs, name="default"),
         "sampling_off": bcdi.CakeArm(inputs, knobs=off, name="sampling_off"),
@@ -853,6 +870,7 @@ def time_default_vs_off(inputs, label, max_seqlen_k, reps, warmup, knobs):
     result["same_bits"] = ref.same_bits(outputs["default"], outputs["sampling_off"])
     result["timer"] = bcdi.timer_record()
     result["reps"] = reps
+    result["max_seqlen_k"] = max_seqlen_k
     return result
 
 
@@ -1059,6 +1077,17 @@ def main():
         num_sms = torch.cuda.get_device_properties(device).multi_processor_count
     else:
         num_sms = DEFAULT_NUM_SMS[arch]
+    if args.time:
+        # checked before the replay, which can take minutes on a large rank
+        if device.type != "cuda":
+            raise SystemExit("--time needs a CUDA device")
+        if (
+            arch != cake_backend.arch_for(device)
+            or num_sms != torch.cuda.get_device_properties(device).multi_processor_count
+        ):
+            raise SystemExit(
+                "--time runs the kernel on this device: do not combine it with --arch / --num-sms"
+            )
     plan = host_plan(inputs, arch, num_sms, knobs, max_seqlen_k)
     if args.statistic != "auto":
         plan["statistic"] = args.statistic
@@ -1073,15 +1102,6 @@ def main():
     agg = aggregate(records, plan, inputs)
     timing = None
     if args.time:
-        if device.type != "cuda":
-            raise SystemExit("--time needs a CUDA device")
-        if (
-            arch != cake_backend.arch_for(device)
-            or num_sms != torch.cuda.get_device_properties(device).multi_processor_count
-        ):
-            raise SystemExit(
-                "--time runs the kernel on this device: do not combine it with --arch / --num-sms"
-            )
         timing = time_default_vs_off(
             inputs, label, max_seqlen_k, args.reps, args.warmup, knobs
         )

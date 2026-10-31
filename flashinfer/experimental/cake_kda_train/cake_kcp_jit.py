@@ -1772,19 +1772,35 @@ def _flat_pool(pool: Any, what: str) -> Any:
 
 
 def _pool_arguments(
-    ix: Any, *, what: str, H: int, nseg: int, device: str, trim: bool = False
+    ix: Any,
+    *,
+    what: str,
+    H: int,
+    nseg: int,
+    device: str,
+    trim: bool = False,
+    tb: Any = None,
 ) -> tuple[Any, Any, int, int, int | None]:
     """``(pool view, slot table, hg, n, tile_stride)`` of a compact pool as the kernels address it.
 
     ``ix`` is a ``cake_kcp.Indexed`` (pool, ``index[nseg]``, ``tiles[slot][h]``): its tile table is recovered into
     the two-integer form through ``Indexed.addressing`` and the pool view starts at its base tile.  ``None`` (or a
     non-pool value, the tape program's unused ``out``) is the absent pool: every slot ``-1`` over a dummy tile, with
-    no stride of its own.
+    no stride of its own (on the trimmed path with the shipped upload knobs the slot table is the table set's own
+    copy, ``tb.absent_index``).
     """
     if ix is None or not hasattr(ix, "addressing"):
+        # the table set's own copy on the shipped path; the previous path's knobs keep the process cache
+        absent = (
+            getattr(tb, "absent_index", None)
+            if trim and getattr(tb, "own_absent", False)
+            else None
+        )
         return (
             _dummy_tile(device),
-            _device_table((-1,) * nseg, "int32", device),
+            absent(device)
+            if absent is not None
+            else _device_table((-1,) * nseg, "int32", device),
             int(H),
             1,
             None,
@@ -1869,6 +1885,7 @@ def _walk(name: str, args: Mapping[str, Any], call: Any, device_index: int) -> N
             nseg=nseg,
             device=device,
             trim=trim,
+            tb=call.tb,
         )
         values.update(
             {key: pool, f"{key}_index": index, f"{key}_hg": hg, f"{key}_n": n}
@@ -1995,7 +2012,12 @@ def _merge(args: Mapping[str, Any], call: Any, device_index: int) -> None:
     if trim and hasattr(
         chains, "device_tables"
     ):  # the chain set's own cached device tables (same integers)
-        values.update(chains.device_tables(device))
+        values.update(
+            chains.device_tables(
+                device,
+                upload=getattr(getattr(call, "tb", None), "upload_specs", None),
+            )
+        )
     else:
         values.update(_chain_tables(chains, device))
     run_module(

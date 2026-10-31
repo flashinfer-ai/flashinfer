@@ -91,8 +91,18 @@ class Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig:
 
     def __post_init__(self) -> None:
         """Reject incompatible dtype, activation and finalization options."""
-        if self.kind == "mxfp4_mxfp8" and self.kernel_variant != "genphase":
-            raise ValueError("Mixed MXFP4/MXFP8 requires kernel_variant='genphase'.")
+        if (
+            self.kind == "mxfp4_mxfp8"
+            and self.kernel_variant != "genphase"
+            and self.kernel_name
+            not in (
+                "sm100_mxfp8_mxfp8_bf16_cutedsl_next",
+                "sm100_mxfp8_mxfp4_bf16_cutedsl",
+            )
+        ):
+            raise ValueError(
+                "MXFP4/MXFP8 requires GenPhase or the standard provider export."
+            )
         if (self.swiglu_alpha is None) != (self.swiglu_beta is None):
             raise ValueError("swiglu_alpha and swiglu_beta must be set together.")
         if self.swiglu_alpha is not None and self.swiglu_beta is not None:
@@ -134,9 +144,9 @@ class Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig:
                 raise ValueError(
                     "finalize_mode=NONE requires enable_in_kernel_fc2_reduce=False."
                 )
-            if (
-                self.knobs == "auto"
-                and self.kernel_name != "sm100_mxfp8_mxfp8_bf16_cutedsl_next"
+            if self.knobs == "auto" and self.kernel_name not in (
+                "sm100_mxfp8_mxfp8_bf16_cutedsl_next",
+                "sm100_mxfp8_mxfp4_bf16_cutedsl",
             ):
                 raise ValueError(
                     "finalize_mode=NONE requires fixed/offline-tuned knobs."

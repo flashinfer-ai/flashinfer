@@ -193,6 +193,18 @@ the same ABI) for the orchestration tests.
 Semantics and contracts follow the KCP design note (its sections 3.5, 3.6, 6.4,
 6.5, 7.2-7.5, 9, 10 and 16).
 
+Checkpoint recompute without the state exchange (FlashInfer issue #7815; the
+GDN twin is #7818): with ``chunk_kda_kcp(..., recompute_handle=)``
+(:class:`KcpRecomputeHandle`, or any object with an ``entries`` dict) the
+original forward exchanges as always and stores its incoming states ``S_in``
+(the saved set's own tensor, key ``"kda"``; with ``checkpoint_keep="transfer"``
+also the owner's c1 receive tensor) in the handle; torch's recompute of that
+forward inside the backward binds them and runs the rank-local programs only --
+no c1 / c2 (no ring hop), no wait, no owner merge, no summary walk at ``P = 1``
+-- so ``out`` and the saved set are bitwise those of the exchanging recompute.
+The backward is unchanged (``checkpoint_keep="states"``, the default, runs it
+with ``save_transfer=False``: bitwise the default form).
+
 
 P > 1 staging: the K1 ``_offset`` / K2 ``_offset`` / K3 passes of the segmented rank write two
 dense planes ``stage_b`` / ``stage_m`` ([NSEG, H, 128, 128] FP32 each, ``tile_stride`` 1); K4 reads them element-wise through
@@ -380,6 +392,9 @@ LOCAL_PATH_FWD = cake_kcp_plan.LOCAL_PATH_FWD
 LOCAL_PATH_BWD = cake_kcp_plan.LOCAL_PATH_BWD
 LOCAL_LAYOUT_FWD = "fwd"
 LOCAL_LAYOUT_BWD = "replay"
+# a forward-only local arena's layout (:func:`cake_kcp_plan.local_fwd_layout`): the forward runs on the layout its
+# arena was sized for (``KdaWorkspace.fwd_layout``), on a backward arena :data:`LOCAL_LAYOUT_FWD`
+LOCAL_LAYOUT_FWD_ONLY = cake_kcp_plan.LOCAL_LAYOUT_FWD_ONLY
 # The KCP-owned local records (:mod:`.cake_kcp_jit`), by the stage name the launch sequences use: the output program
 # over the K1 ``h`` / ``v_new`` tapes and the ``dA_qk`` / ``dv1`` program whose ``dv1`` K2 reads (the forms the
 # existing backend's output and dA / dv programs had before its fused recurrences took them over).
@@ -626,7 +641,8 @@ class KernelBackend(Backend):
     Local stages (:data:`LOCAL_STAGES_FWD` / :data:`LOCAL_STAGES_BWD`): a forward call runs the existing backend's
     intra program (``write_prep = 1``: the GLM prep's rows and the internal ``Aqk`` / ``Akk`` rows; the token-row
     copies are never written, ``write_ext = 0``), its forward WY program and the KCP's output program ``kcp_fwd_o``
-    (the output from the K1 ``h`` / ``v_new`` tapes) on the arena's ``fwd`` layout, with the records the plan selects
+    (the output from the K1 ``h`` / ``v_new`` tapes) on the arena's forward layout (``fwd``; a forward-only arena's
+    ``fwd_kcp``, :data:`LOCAL_LAYOUT_FWD_ONLY`), with the records the plan selects
     on the forward path without a saved set (:data:`LOCAL_PATH_FWD`).  A backward call runs on the ``replay`` layout
     with the records of the replay path (:data:`LOCAL_PATH_BWD`) in both modes: the replay prep (the GLM prep's rows
     and the internal ``dout`` copy ``do_int``), the intra program (``write_prep = 0``: the internal ``Aqk`` / ``Akk``
@@ -714,7 +730,7 @@ class KernelBackend(Backend):
             raise ValueError(
                 f"local plan geometry (NC_pad, R) = {(p.NC_pad, p.R)} differs from the KCP context's {(ctx.NC_pad, ctx.R)}"
             )
-        views = ws.views(LOCAL_LAYOUT_BWD if call.backward else LOCAL_LAYOUT_FWD)
+        views = ws.views(LOCAL_LAYOUT_BWD if call.backward else ws.fwd_layout)
         if call.host_trim:  # the call-independent part of the value dict is built once per (arena, tables, direction)
             # the template is cached on the ARENA whose views it holds (it dies with the arena), keyed by the
             # table set's identity with a WEAK reference to it (a hit needs that very table set alive); the backend
@@ -1680,6 +1696,45 @@ def kcp_local_grid(stage: str, p: Any) -> tuple[int, int, int]:
     raise ValueError(f"no KCP-owned local record for stage {stage!r}")
 
 
+VIEW_CACHE_MAX = 64  # plan views of one local arena a KcpWorkspace keeps (the least recently bound goes first)
+SLICE_CACHE_MAX = 256  # pool[:n] views a KcpWorkspace keeps (cleared when full)
+ENSURE_CACHE_MAX = (
+    128  # trimmed-path ensure records a KcpWorkspace keeps (cleared when full)
+)
+
+
+def _plan_view(arena: Any, plan: Any) -> Any:
+    """A view of the local arena ``arena`` (``cake_backend.KdaWorkspace``) under the plan of another pack whose
+    layouts fit it: the same bytes, ``eye`` / ``flags`` and epoch counter, with its own layout views, its own launch
+    templates (:data:`TEMPLATE_CACHE_ATTR`) and its own scratch table set (:data:`SCRATCH_TABLES_ATTR`, sized by its
+    plan).  ``KdaWorkspace.views`` checks that each layout fits the arena's bytes."""
+    view = arena._view(plan)
+    view.__dict__.pop(TEMPLATE_CACHE_ATTR, None)
+    view.__dict__.pop(SCRATCH_TABLES_ATTR, None)
+    return view
+
+
+def _weak(obj: Any) -> Any:
+    """A callable returning ``obj`` that holds it weakly where its type allows (a duck-typed context may not)."""
+    try:
+        return weakref.ref(obj)
+    except TypeError:
+        return lambda: obj
+
+
+def _table_tensors(tb: Any) -> list[torch.Tensor]:
+    """The live device tables a table set held by a workspace (not by its context) has uploaded
+    (:meth:`_Tables.upload_specs`)."""
+    return list(tb.__dict__.get("_uploaded", ()))
+
+
+def _context_list(ctxs: Any) -> list[Any]:
+    """One context or a sequence of contexts as a list."""
+    if isinstance(ctxs, (list, tuple)):
+        return list(ctxs)
+    return [ctxs]
+
+
 def _scratch_tables(local: Any) -> dict[str, torch.Tensor]:
     """The table set the intra record that computes the chunk layout from ``cu_seqlens`` writes (the existing
     backend's tables, its block table included), on a scratch buffer held by the arena: the KCP's CPU-built tables
@@ -2185,35 +2240,35 @@ class Chains:
                     f"Chains: {name} holds an offset that is not a multiple of 4 floats"
                 )
 
-    def device_tables(self, device: str) -> dict[str, torch.Tensor]:
+    def device_tables(
+        self, device: str, upload: Any | None = None
+    ) -> dict[str, torch.Tensor]:
         """Trimmed host path: the six device tables of the K4 launch (``chain_start`` int32; ``elem_m`` / ``elem_c`` / ``elem_y`` /
         ``x0_index`` / ``y_final`` int64; an empty element table holds one 0 so the kernel has a valid pointer -- the
         same tensors :func:`cake_kcp_jit._chain_tables` builds), cached on the chain set per device.  The tables are
-        frozen once the launches start (``_Tables`` builds them once per ``(ctx, H)``)."""
+        frozen once the launches start (``_Tables`` builds them once per ``(ctx, H)``).  ``upload`` (the table set's
+        :meth:`_Tables.upload_specs`) copies the six in one asynchronous pinned copy; without it one
+        ``torch.tensor(..., device=)`` each."""
         cache = self.__dict__.setdefault("_dev_tables", {})
         t = cache.get(device)
         if t is None:
             pad = lambda table: table if table else [0]  # noqa: E731
-            t = cache[device] = {
-                "chain_start": torch.tensor(
-                    list(self.chain_start), dtype=torch.int32, device=device
-                ),
-                "elem_m": torch.tensor(
-                    pad(list(self.elem_m)), dtype=torch.int64, device=device
-                ),
-                "elem_c": torch.tensor(
-                    pad(list(self.elem_c)), dtype=torch.int64, device=device
-                ),
-                "elem_y": torch.tensor(
-                    pad(list(self.elem_y)), dtype=torch.int64, device=device
-                ),
-                "x0_index": torch.tensor(
-                    list(self.x0_index), dtype=torch.int64, device=device
-                ),
-                "y_final": torch.tensor(
-                    list(self.y_final), dtype=torch.int64, device=device
-                ),
+            i32, i64 = torch.int32, torch.int64
+            specs: dict[str, tuple] = {
+                "chain_start": (list(self.chain_start), i32, None),
+                "elem_m": (pad(list(self.elem_m)), i64, None),
+                "elem_c": (pad(list(self.elem_c)), i64, None),
+                "elem_y": (pad(list(self.elem_y)), i64, None),
+                "x0_index": (list(self.x0_index), i64, None),
+                "y_final": (list(self.y_final), i64, None),
             }
+            if upload is not None:
+                t = cache[device] = upload(specs, device)
+            else:
+                t = cache[device] = {
+                    name: torch.tensor(values, dtype=dtype, device=device)
+                    for name, (values, dtype, _shape) in specs.items()
+                }
         return t
 
     @classmethod
@@ -2257,7 +2312,10 @@ def _prefix(values) -> list[int]:
 class _Tables:
     """Everything the launch sequences read for one ``(ctx, H)``: the segment plan, walk lists, the compact tile
     tables of every pool, the collective splits and the K4 chains, derived once from ``cake_kcp_plan.KcpContext`` /
-    ``KcpHeadPlan`` and cached by the workspace (the design note §7.2, §10.3, §14.4).
+    ``KcpHeadPlan`` and cached on the context (``ctx._table_sets``, shared by every workspace; the test knob
+    ``table_cache="workspace"`` keeps the previous per-workspace cache) (the design note §7.2, §10.3, §14.4).  The set
+    holds the context weakly; a table it copies to the device at first use costs one asynchronous pinned copy
+    (:meth:`upload_specs`).
 
     Pools (tile = 16384 floats; tile numbers pool-relative): ``c1_send`` = owner-major ``(out_slot, head)`` pairs
     ``[B_f | M_f^T]`` (B tile ``2 t``, M tile ``2 t + 1`` of ``hp.out_tile[out_slot][h] = t``); ``S_in`` (the c2
@@ -2275,6 +2333,10 @@ class _Tables:
     """
 
     _ring: _Ring | None = None  # the ring-exchange tables, derived on first use
+    # held by the context's table-set cache (KcpWorkspace.tables)
+    on_context: bool = False
+    # the trimmed path's absent-pool slot table is this set's own copy (absent_index; KcpWorkspace.tables)
+    own_absent: bool = False
 
     def __init__(
         self,
@@ -2284,7 +2346,10 @@ class _Tables:
         fused_walks: int = FUSED_WALKS_DEFAULT,
         walk_geometry: str = WALK_GEOMETRY_DEFAULT,
     ) -> None:
-        self.ctx = ctx
+        try:  # the context owns its table sets (ctx._table_sets): no reference cycle, refcount frees both
+            self.ctx = weakref.proxy(ctx)
+        except TypeError:  # a context type without weak references
+            self.ctx = ctx
         self.H = H = int(H)
         self.fused_walks = int(
             fused_walks
@@ -2849,9 +2914,44 @@ class _Tables:
         t = cache.get(key)
         if t is None:
             flat = [int(x) for row in tiles for x in row]
-            t = torch.tensor(flat, dtype=torch.int64, device=device)
+            t = self.upload(flat, torch.int64, device)
             cache[key] = t
         return t
+
+    def upload_specs(
+        self, specs: dict[str, tuple], device: torch.device | str
+    ) -> dict[str, torch.Tensor]:
+        """Device copies of tables of this set (``name -> (values, dtype, shape)``) in one pinned non-blocking copy
+        on the current stream, recorded on the context for its ``wait_ready`` (the context's ``upload="blocking"``
+        knob keeps the previous pageable per-table copies).  Never a host synchronization: a table-set miss of a
+        call costs one asynchronous copy."""
+        up = getattr(self.ctx, "upload_tables", None)
+        if up is None:  # a duck-typed context: the same copy, unrecorded
+            out = cake_kcp_plan._upload_tables(specs, device)[0]
+        else:
+            # recorded for ctx.wait_ready only when this set lives as long as the context (its own table-set cache);
+            # a set of the table_cache="workspace" knob may be rebuilt per call and must not accumulate records
+            out = up(specs, device, record=self.on_context)
+        if not self.on_context:  # held by a workspace: its stream changes record them (KcpWorkspace._live_storages)
+            self.__dict__.setdefault("_uploaded", weakref.WeakSet()).update(
+                out.values()
+            )
+        return out
+
+    def upload(
+        self, values: Sequence[int], dtype: torch.dtype, device: torch.device | str
+    ) -> torch.Tensor:
+        """One flat table of this set on the device (:meth:`upload_specs`)."""
+        return self.upload_specs({"t": (values, dtype, None)}, device)["t"]
+
+    def absent_index(self, device: torch.device | str) -> torch.Tensor:
+        """Trimmed host path: the slot table of an absent pool (``NSEG`` entries of ``-1``), one device copy per
+        table set and device, used when ``own_absent`` (the untrimmed path and the test knobs of the previous path
+        keep the process cache of ``cake_kcp_jit``)."""
+        lst = self.__dict__.get("_absent")
+        if lst is None:
+            lst = self._absent = [-1] * self.NSEG
+        return self.dev_list(lst, device)
 
     @functools.cached_property
     def walk_all_p0(self) -> list[int]:
@@ -2888,7 +2988,7 @@ class _Tables:
         hit = cache.get(key)
         if hit is not None and hit[0] is values:
             return hit[1]
-        t = torch.tensor([int(v) for v in values], dtype=dtype, device=device)
+        t = self.upload([int(v) for v in values], dtype, device)
         cache[key] = (values, t)
         return t
 
@@ -2916,7 +3016,7 @@ class _Tables:
             H=int(H),
             addr=addr,
             device=str(device),
-            dev_index=torch.tensor(list(index_t), dtype=torch.int32, device=device),
+            dev_index=self.upload(list(index_t), torch.int32, device),
         )
         cache[key] = (index, tiles, meta)
         return meta
@@ -3007,14 +3107,37 @@ class KcpWorkspace:
     one identity tile ``eye``.  The backward send pools share the storage of the forward ones
     (``cake_kcp_plan.SHARED_POOLS``: ``b1_send`` = ``c1_send``, ``b2_send`` = ``c2_send``, one tensor of the larger
     need; a call waits its c1 / c2 sends before a backward writes either).  The ring exchange's hop pools
-    ``ring_out`` / ``ring_in`` (``cake_kcp_plan.LAZY_POOLS``) are allocated by the first call that reads them.  The
-    saved-set tensors (``S_in`` = the c2 output, the c1 receive tensor under ``save_transfer``, ``M_seg`` under
-    ``save_transfer`` at ``P > 1``) are never arena slices: the calls allocate them fresh (SPEC-4).  A workspace is
+    ``ring_out`` / ``ring_in`` (``cake_kcp_plan.LAZY_POOLS``) are allocated by the first call that reads them, and so
+    are, on a forward-only workspace, ``c1_recv`` / ``stage_m`` / ``carry`` (``cake_kcp_plan.FWD_LAZY_POOLS``: a
+    forward with a saved set writes a fresh carry plane in place of ``carry`` and, under ``save_transfer``, fresh
+    tensors in place of the other two, which it reads without it; a forward without one reads all three; their first
+    allocation drops the graph-cache entries pinning the workspace, whose keys hold its pools).  A forward-only
+    local arena takes the KCP forward layout (:data:`LOCAL_LAYOUT_FWD_ONLY`, 2432 B per internal token-head); a
+    backward workspace sizes every pool and the existing backend's layouts.  The saved-set tensors (``S_in`` = the c2
+    output, the c1 receive tensor under ``save_transfer``, ``M_seg`` under ``save_transfer`` at ``P > 1``) are never
+    arena slices: the calls allocate them fresh (SPEC-4).  A workspace is
     reusable across calls and layers of the same ``(ctx, H)``; a call with a larger need grows it, releasing each
     superseded pool and local arena (and the graph-cache entries pinning that arena) before allocating its successor
     (the old and the new storage never coexist, so a backward on a forward workspace peaks at the grown workspace plus
     the call's own peak).  ``bytes`` counts every pool storage once plus the local arena (:func:`kcp_workspace_bytes`
-    is the plan module's prediction of the same quantity for an a2a workspace, CONSISTENCY-6)."""
+    is the plan module's prediction of the same quantity for an a2a workspace, CONSISTENCY-6).
+
+    One workspace serves any number of prepared packs (contexts) whose calls run in stream order: the pools hold
+    the largest need of the packs served and the local arena the largest of their layouts; a pack whose layout fits
+    the arena runs on a view of it under its own plan (:func:`_plan_view`, at most :data:`VIEW_CACHE_MAX` cached per
+    arena; each view has its own launch templates and its own scratch table set where the intra record writes one,
+    :func:`cake_kcp_plan.local_scratch_table_bytes`), and the arena is replaced only by a pack that does not fit.
+    A forward never replaces a backward arena with a forward-only one.  :meth:`reserve` sizes the workspace for a
+    list of contexts up front, so the calls of those packs allocate nothing and every pointer stays put
+    (``kcp_workspace_bytes([ctx, ...], H=H)`` predicts its ``bytes``).  No content crosses calls, so the results are
+    bitwise those of one workspace per pack.  The workspace keeps no context alive.  It records the stream of its
+    last call; a call on another stream first orders that stream's queued work before its own (one
+    ``wait_stream``, never a host wait) and marks the workspace's live storages as used on its stream (one
+    ``record_stream`` each, :meth:`_order_stream`), so a pool or arena a later call replaces, or the storage of a
+    dropped workspace, goes back to the caching allocator only after the queued work of every stream that used it;
+    calls on one stream do neither.  ``allocate=False`` with a context allocates nothing until the first call
+    and keeps ``backward`` as a sizing floor, so a first forward allocates the backward workspace at once instead
+    of a forward-only one that its first backward would replace."""
 
     def __init__(
         self,
@@ -3026,6 +3149,7 @@ class KcpWorkspace:
         state_dtype: torch.dtype = torch.float32,
         local: bool = True,
         save_mode: str = "light",
+        allocate: bool = True,
     ) -> None:
         if save_mode not in SAVE_MODES:
             raise ValueError(
@@ -3038,16 +3162,29 @@ class KcpWorkspace:
         self._pools: dict[str, torch.Tensor] = {}
         self._tables: dict[tuple[Any, int, int, str], _Tables] = {}
         self.local: Any | None = None
-        self._last_ensure: tuple[Any, ...] | None = (
-            None  # (ctx, H, device, backward, fused_walks, walk_geometry, tb)
+        # the arena (or its plan view) the last ensured context runs on; None on a rank without tokens
+        self.local_view: Any | None = None
+        # plan views of the arena per (S, num_docs, H), least recently bound first
+        self._views: dict[tuple[int, int, int], Any] = {}
+        self._views_scratch = 0  # local_scratch_table_bytes over the cached views
+        # a forward sizes the workspace for the backward too (allocate=False with a context, reserve())
+        self._backward_floor = False
+        self._stream: tuple[int, Any] | None = (
+            None  # (raw handle, stream) of the last call
         )
+        # the trimmed path's ensure records per (id(ctx), (H, device, backward, fused_walks, walk_geometry)):
+        # (weak ctx, weak tables, local view); dropped whenever a pool or the arena is replaced or a view evicted
+        self._fast: dict[tuple[Any, ...], tuple[Any, Any, Any]] = {}
         self._slices: dict[
             tuple[str, int], tuple[torch.Tensor, torch.Tensor]
-        ] = {}  # pool[:n] views per (name, n)
+        ] = {}  # pool[:n] views per (name, n), at most SLICE_CACHE_MAX
         if ctx is not None:
             if H is None:
                 raise ValueError("KcpWorkspace: H is required with ctx")
-            self.ensure(ctx, H, device=device, backward=backward)
+            if allocate:
+                self.ensure(ctx, H, device=device, backward=backward)
+            else:
+                self._backward_floor = bool(backward)
 
     def tables(
         self,
@@ -3057,11 +3194,26 @@ class KcpWorkspace:
         fused_walks: int = FUSED_WALKS_DEFAULT,
         walk_geometry: str = WALK_GEOMETRY_DEFAULT,
     ) -> _Tables:
-        key = (ctx, int(H), int(fused_walks), str(walk_geometry))
-        tb = self._tables.get(key)
+        key: tuple = (int(H), int(fused_walks), str(walk_geometry))
+        sets = getattr(ctx, "_table_sets", None)
+        if (
+            sets is None
+            or getattr(ctx, "table_cache", cake_kcp_plan.TABLE_CACHE_DEFAULT)
+            != "context"
+        ):  # a duck-typed context, or the table_cache="workspace" knob: the previous per-workspace cache
+            sets, key = self._tables, (ctx, *key)
+        tb = sets.get(key)
         if tb is None:
             tb = _Tables(ctx, H, fused_walks=fused_walks, walk_geometry=walk_geometry)
-            self._tables[key] = tb
+            tb.on_context = sets is not self._tables
+            # the absent-pool slot table: the set's own copy on the shipped path; the upload="blocking" /
+            # table_cache="workspace" knobs keep the previous process cache of cake_kcp_jit
+            tb.own_absent = (
+                getattr(ctx, "upload", cake_kcp_plan.UPLOAD_DEFAULT) == "async"
+                and getattr(ctx, "table_cache", cake_kcp_plan.TABLE_CACHE_DEFAULT)
+                == "context"
+            )
+            sets[key] = tb
         return tb
 
     def ensure(
@@ -3076,67 +3228,259 @@ class KcpWorkspace:
         host_trim: bool = False,
     ) -> _Tables:
         """Size the pools (and the local arena) for ``(ctx, H)``; returns the tables.  ``host_trim``: a call
-        with the same ``(ctx, H, device, backward, fused_walks, walk_geometry)`` as the last ensure returns its tables
-        at once (the pools only grow and the arena is replaced only by a different plan, so nothing is to do)."""
-        device = (
+        with the same ``(ctx, H, device, backward, fused_walks, walk_geometry)`` as an earlier trimmed ensure returns
+        its tables and local view at once while no pool or arena was replaced since (the pools only grow and the
+        arena is replaced only by a pack that does not fit, so nothing is to do; one record per context and
+        signature, at most :data:`ENSURE_CACHE_MAX`, the contexts and tables held weakly).  Every ensure orders the
+        call's stream after the workspace's last one (:meth:`_order_stream`) before it sizes anything."""
+        dev: torch.device = (
             torch.device(device) if device is not None else torch.device(ctx.device)
         )
-        sig = (int(H), device, bool(backward), int(fused_walks), str(walk_geometry))
+        backward = bool(backward) or self._backward_floor
+        sig = (int(H), dev, backward, int(fused_walks), str(walk_geometry))
         if host_trim:
-            last = self._last_ensure
-            if last is not None and last[0] is ctx and last[1] == sig:
-                return last[2]
-        # set again only once this ensure succeeds: a failed one (an allocation error after a release) must not
-        # leave the fast path approving a workspace it has already taken apart
-        self._last_ensure = None
+            hit = self._fast.get((id(ctx), sig))
+            if hit is not None and hit[0]() is ctx:
+                tb = hit[1]()
+                if tb is not None:
+                    self.local_view = hit[2]
+                    self._order_stream(dev)
+                    return tb
+        # a record is added only once this ensure succeeds, and every pool or arena replacement drops them all
+        # first: a failed ensure (an allocation error after a release) never leaves the fast path approving a
+        # workspace it has already taken apart
+        self._check_device(dev)
+        tb = self.tables(ctx, H, fused_walks=fused_walks, walk_geometry=walk_geometry)
+        # ordered (and the live storages recorded) before a pool or the arena can be released
+        self._order_stream(dev)
+        self._size_pools(self._pool_need(tb, backward), dev)
+        self.local_view = None
+        if self.with_local and ctx.T_r > 0 and dev.type == "cuda":
+            self.local_view = self._bind_local(ctx, int(H), dev, backward)
+        if host_trim:
+            if len(self._fast) >= ENSURE_CACHE_MAX:
+                self._fast.clear()
+            self._fast[(id(ctx), sig)] = (_weak(ctx), _weak(tb), self.local_view)
+        return tb
+
+    def reserve(
+        self,
+        ctxs: Any,
+        H: int,
+        *,
+        device: torch.device | str | None = None,
+        backward: bool = True,
+        fused_walks: int = FUSED_WALKS_DEFAULT,
+        walk_geometry: str = WALK_GEOMETRY_DEFAULT,
+        ring: bool = False,
+    ) -> int:
+        """Size this workspace for every context of ``ctxs`` (one context or a sequence of them) at ``H`` heads: each
+        pool to its largest need, the local arena to the largest layout (replaced only when one does not fit) with a
+        plan view per other pack and its scratch table set, all allocated now on the current stream.  With
+        ``backward`` (the default) a later forward never re-sizes it, so the calls of the reserved packs allocate
+        nothing and every pool and view keeps its pointer; ``bytes`` is then
+        ``kcp_workspace_bytes(ctxs, H=H)`` for a workspace reserved once.  Host work and allocations only (no
+        device wait).  ``ring=True`` also sizes the ring exchange's hop pools (:data:`cake_kcp_plan.LAZY_POOLS`,
+        otherwise allocated by the first ``exchange="ring"`` call; ``kcp_arena_layout(...)["ring"]`` bytes per
+        context, the largest over the contexts).  Returns :attr:`bytes`."""
+        ctxs = _context_list(ctxs)
+        if not ctxs:
+            raise ValueError("KcpWorkspace.reserve: no context given")
+        dev: torch.device = torch.device(ctxs[0].device if device is None else device)
+        backward = bool(backward) or self._backward_floor
+        self._backward_floor = backward
+        self._check_device(dev)
+        H = int(H)
+        need: dict[str, int] = {}
+        for ctx in ctxs:
+            tb = self.tables(
+                ctx, H, fused_walks=fused_walks, walk_geometry=walk_geometry
+            )
+            sizes = self._pool_need(tb, backward)
+            if ring:
+                sizes.update(
+                    (name, tb.sizes[name]) for name in cake_kcp_plan.LAZY_POOLS
+                )
+            for name, n in sizes.items():
+                need[name] = max(need.get(name, 0), n)
+        self._order_stream(dev)
+        self._size_pools(need, dev)
+        if self.with_local and dev.type == "cuda":
+            local = [ctx for ctx in ctxs if ctx.T_r > 0]
+            plans = {
+                id(ctx): self._local_plan((int(ctx.T_r), int(ctx.n_frag), H), dev)
+                for ctx in local
+            }
+            # the largest layout first: every other pack then runs on a view of its arena
+            local.sort(
+                key=lambda c: -plans[id(c)].arena_bytes(
+                    backward=backward,
+                    save_mode=self.save_mode,
+                    fwd_layout=cake_kcp_plan.local_fwd_layout(backward, self.save_mode),
+                )
+            )
+            for ctx in local:
+                view = self._bind_local(ctx, H, dev, backward)
+                for path in (LOCAL_PATH_FWD, LOCAL_PATH_BWD):
+                    if cake_kcp_plan.intra_writes_tables(view.plan, path):
+                        _scratch_tables(view)
+                        break
+            self.local_view = None
+        return self.bytes
+
+    def _check_device(self, device: torch.device) -> None:
         if self.device is None:
             self.device = device
         elif self.device != device:
             raise ValueError(
                 f"KcpWorkspace: lives on {self.device}, the call is on {device}"
             )
-        tb = self.tables(ctx, H, fused_walks=fused_walks, walk_geometry=walk_geometry)
+
+    @staticmethod
+    def _pool_need(tb: _Tables, backward: bool) -> dict[str, int]:
+        """The elements of every pool ``tb`` needs on a ``backward`` / forward-only workspace, the lazily
+        allocated pools excluded and each :data:`cake_kcp_plan.SHARED_POOLS` pair at the larger need of the two."""
+        # allocated by the first call that reads them (pool()): the ring pools; on a forward-only workspace the pools
+        # only a forward without a saved set reads
+        lazy = cake_kcp_plan.LAZY_POOLS + (
+            () if backward else cake_kcp_plan.FWD_LAZY_POOLS
+        )
         need = {
-            name: n
-            for name, n in tb.pool_sizes(backward).items()
-            if name
-            not in cake_kcp_plan.LAZY_POOLS  # allocated by the first call that reads them (pool())
+            name: n for name, n in tb.pool_sizes(backward).items() if name not in lazy
         }
         for pair in cake_kcp_plan.SHARED_POOLS:  # one storage of the larger need
             top = max((need[m] for m in pair if m in need), default=0)
             for m in pair:
                 if m in need:
                     need[m] = top
+        return need
+
+    def _size_pools(self, need: dict[str, int], device: torch.device) -> None:
         replaced = False
         for name, n in need.items():
             replaced |= self._grow(name, n, device)
         if replaced and self._slices:
             self._drop_stale_slices()
-        if self.with_local and ctx.T_r > 0 and torch.device(device).type == "cuda":
-            p = self.local.plan if self.local is not None else None
-            if (
-                p is None
-                or (ctx.T_r, ctx.n_frag, int(H)) != (p.S, p.N, p.H)
-                or (backward and not self.local.backward)
-            ):
-                if self.local is not None:
-                    # no contents carry over: release the superseded arena (and the graph-cache entries pinning it)
-                    # before its successor is allocated, so the two never coexist -- the first training step then
-                    # peaks at the retained workspace plus the call's own peak, as every later step does (with the
-                    # SPEC-3 probe off, the default)
-                    _graph_release(self.local)
-                    self.local = None
-                self.local = cake_backend.KdaWorkspace.for_problem(
-                    ctx.T_r,
-                    ctx.n_frag,
-                    int(H),
-                    device,
-                    backward=backward,
-                    save_mode=self.save_mode,
-                )
-        if host_trim:
-            self._last_ensure = (ctx, sig, tb)
-        return tb
+
+    def _order_stream(self, device: torch.device) -> None:
+        """Record the stream of this call; when it differs from the last call's, order the last stream's queued work
+        (which may still use this workspace) before the work this call enqueues (one ``wait_stream``, no host wait)
+        and mark every live device storage of the workspace as used on this stream (``record_stream``,
+        :meth:`_live_storages`), so a storage released later (a grown pool, a replaced arena, the dropped workspace)
+        returns to the caching allocator only once this stream's work queued by then has run, whichever stream
+        allocated it.  Called before any release.  Nothing on the same stream (stream order covers it) or while the
+        current stream captures a CUDA graph (the capture's own ordering applies, and its allocations live in the
+        graph's private pool)."""
+        if device.type != "cuda":
+            return
+        index = (
+            device.index if device.index is not None else torch.cuda.current_device()
+        )
+        raw = _raw_stream(index)
+        last = self._stream
+        if last is not None and last[0] == raw:
+            return
+        cur = torch.cuda.current_stream(index)
+        if not torch.cuda.is_current_stream_capturing():
+            if last is not None:
+                cur.wait_stream(last[1])
+            for t in self._live_storages():
+                t.record_stream(cur)
+        self._stream = (raw, cur)
+
+    def _live_storages(self) -> list[torch.Tensor]:
+        """One tensor per live device storage of this workspace that a call's kernels can touch: each distinct pool
+        (a :data:`cake_kcp_plan.SHARED_POOLS` pair once), the local arena's bytes and its identity tile (``eye`` /
+        ``flags``, shared by its views), the scratch table buffer of the arena and of each cached plan view (one
+        buffer per set, its tables are slices of it), and the device tables of the ``table_cache="workspace"`` knob's
+        table sets (the shipped path's table sets live on the context, whose ``wait_ready`` records them per
+        stream)."""
+        out: dict[int, torch.Tensor] = {}
+
+        def add(t: Any) -> None:
+            if isinstance(t, torch.Tensor) and t.is_cuda:
+                ptr = t.untyped_storage().data_ptr()
+                if ptr:  # an empty storage has no block
+                    out.setdefault(ptr, t)
+
+        for t in self._pools.values():
+            add(t)
+        local = self.local
+        if local is not None:
+            add(local.arena)
+            add(local._eye_box[0])
+            for arena in (local, *self._views.values()):
+                for t in (arena.__dict__.get(SCRATCH_TABLES_ATTR) or {}).values():
+                    add(t)
+                    break  # every table of the set is a slice of one buffer
+        for tb in self._tables.values():
+            for t in _table_tensors(tb):
+                add(t)
+        return list(out.values())
+
+    def _local_plan(self, key: tuple[int, int, int], device: torch.device) -> Any:
+        index = (
+            device.index if device.index is not None else torch.cuda.current_device()
+        )
+        return cake_backend.plan(
+            *key, cake_jit.sm_count(index), cake_jit.device_arch(index)
+        )
+
+    def _bind_local(
+        self, ctx: Any, H: int, device: torch.device, backward: bool
+    ) -> Any:
+        """The local arena, or its plan view, that ``ctx``'s calls run on: the arena's own plan, a cached view, a
+        new view of a plan whose layouts fit the arena (of its kind: a backward arena serves forwards too), or a new
+        arena -- of the backward kind when the call, the sizing floor or the superseded arena is one -- after the
+        superseded arena, its views and the graph-cache entries pinning them are released (the two never
+        coexist)."""
+        key = (int(ctx.T_r), int(ctx.n_frag), int(H))
+        base = self.local
+        if base is not None and (base.backward or not backward):
+            p = base.plan
+            if key == (p.S, p.N, p.H):
+                return base
+            view = self._views.pop(key, None)
+            if view is None:
+                plan = self._local_plan(key, device)
+                if (
+                    plan.arena_bytes(
+                        backward=base.backward,
+                        save_mode=self.save_mode,
+                        fwd_layout=base.fwd_layout,
+                    )
+                    <= base.bytes
+                ):
+                    view = _plan_view(base, plan)
+                    self._views_scratch += cake_kcp_plan.local_scratch_table_bytes(plan)
+                    while len(self._views) >= VIEW_CACHE_MAX:
+                        self._fast.clear()
+                        old = self._views.pop(next(iter(self._views)))
+                        self._views_scratch -= cake_kcp_plan.local_scratch_table_bytes(
+                            old.plan
+                        )
+            if view is not None:
+                self._views[key] = view  # most recently bound last
+                return view
+        kind = backward or (base is not None and base.backward)
+        if base is not None:
+            # no contents carry over: release the superseded arena, its views (and the graph-cache entries pinning
+            # them) before its successor is allocated, so the two never coexist -- the first training step then
+            # peaks at the retained workspace plus the call's own peak, as every later step does (with the SPEC-3
+            # probe off, the default)
+            self._fast.clear()
+            _graph_release(base)
+            self._views.clear()
+            self._views_scratch = 0
+            self.local_view = self.local = base = None
+        self.local = cake_backend.KdaWorkspace.for_problem(
+            *key,
+            device,
+            backward=kind,
+            save_mode=self.save_mode,
+            fwd_layout=cake_kcp_plan.local_fwd_layout(kind, self.save_mode),
+        )
+        return self.local
 
     def _grow(self, name: str, n: int, device: torch.device) -> bool:
         """Make pool ``name`` hold ``n`` elements; a :data:`cake_kcp_plan.SHARED_POOLS` pair stays one tensor.
@@ -3155,6 +3499,7 @@ class KcpWorkspace:
             None,
         )
         mt = self._pools.get(mate) if mate is not None else None
+        self._fast.clear()
         if mt is not None and mt.numel() >= n:
             self._pools[name] = mt  # the pair's storage is already large enough
             return True
@@ -3183,9 +3528,19 @@ class KcpWorkspace:
     def pool(
         self, name: str, n: int | None = None, *, cached: bool = False
     ) -> torch.Tensor:
-        if name in cake_kcp_plan.LAZY_POOLS and n and self.device is not None:
-            if self._grow(name, n, self.device) and self._slices:
-                self._drop_stale_slices()
+        # the graph-cache keys hold the forward-only lazy pools (not the ring's): once one is allocated or replaced, no
+        # later call matches an earlier key of this workspace, so its entries (and their captured memory) go
+        fwd_lazy = name in cake_kcp_plan.FWD_LAZY_POOLS
+        if (
+            (name in cake_kcp_plan.LAZY_POOLS or fwd_lazy)
+            and n
+            and self.device is not None
+        ):
+            if self._grow(name, n, self.device):
+                if self._slices:
+                    self._drop_stale_slices()
+                if fwd_lazy:
+                    _graph_release(self)
         t = self._pools.get(name)
         if t is None:
             if n not in (None, 0) or self.device is None:
@@ -3193,6 +3548,8 @@ class KcpWorkspace:
                     f"KcpWorkspace: pool {name!r} was not sized for this call (ensure() first)"
                 )
             t = self._pools[name] = _alloc((0,), self.state_dtype, self.device)
+            if fwd_lazy:
+                _graph_release(self)
         if n is None:
             return t
         if (
@@ -3202,6 +3559,8 @@ class KcpWorkspace:
             if hit is not None and hit[0] is t:
                 return hit[1]
             v = t[:n]
+            if len(self._slices) >= SLICE_CACHE_MAX:  # bounded: many packs' sizes
+                self._slices.clear()
             self._slices[(name, n)] = (t, v)
             return v
         return t[:n]
@@ -3217,11 +3576,12 @@ class KcpWorkspace:
             for t in {id(t): t for t in self._pools.values()}.values()
         )
         local = 0
-        if (
-            self.local is not None
-        ):  # the arena and the intra record's scratch table set where it writes one
-            local = int(self.local.bytes) + cake_kcp_plan.local_scratch_table_bytes(
-                self.local.plan
+        if self.local is not None:
+            # the arena and the intra record's scratch table set where it writes one, its own and each plan view's
+            local = (
+                int(self.local.bytes)
+                + cake_kcp_plan.local_scratch_table_bytes(self.local.plan)
+                + self._views_scratch
             )
         return kcp + local
 
@@ -3577,7 +3937,9 @@ class KcpCall:
         self.scratch: dict[str, Any] = {}
         self.bufs: dict[str, torch.Tensor] = {}
         self.local = (
-            ws.local if (backend.local_stages and ws.local is not None) else None
+            ws.local_view
+            if (backend.local_stages and ws.local_view is not None)
+            else None
         )
         self.local_values: dict[str, Any] | None = None
         self.out: torch.Tensor | None = None
@@ -3827,6 +4189,9 @@ def _record(kind: str, call: KcpCall) -> None:
         "spec3": call.scratch.get(
             "spec3"
         ),  # the SPEC-3 debug assertion's result (first saved-mode backward)
+        "recompute_handle": call.scratch.get(
+            "recompute_handle"
+        ),  # None without a handle; "capture" (the original forward stored its entry) / "replay" (it bound one)
         "graph": call.opts.graph,
         "graph_event": "eager",
         "graph_key": None,
@@ -3870,6 +4235,9 @@ class _Ring:
         ctx = tb.ctx
         rank = int(ctx.rank)
         self.hops = tb.max_hops
+        # the K4 chains of the hops (one Chains per family, built at its first call): their device tables are copied
+        # once per table set, not per call
+        self.chains: dict[str, Chains] = {}
         pos: dict[
             int, tuple[int, int]
         ] = {}  # slot -> (position in its document chain, chain length)
@@ -3998,17 +4366,18 @@ def _ring_wait(works) -> None:
 def _ring_chain(
     tb: _Tables, family: str, elems: list[tuple[int, int, int, int]]
 ) -> Chains:
-    """One-element chains per (fragment, head) from tile numbers ``(x0, m, c, y)`` (K4 state step on one fragment)."""
-    ch = Chains(ncols=D)
-    for (
-        x0,
-        m,
-        c,
-        y,
-    ) in (
-        elems
-    ):  # tile numbers -> element offsets (the chain tables address pools in elements)
-        ch.add([(m * TILE, c * TILE, -1)], x0=x0 * TILE, y_final=y * TILE)
+    """One-element chains per (fragment, head) from tile numbers ``(x0, m, c, y)`` (K4 state step on one fragment),
+    cached per ``family`` on the table set's ring tables: ``elems`` derive from the table set alone, so every call
+    of the set reuses the chains and their device tables (a fresh set per call would upload them, and record the
+    upload on the context, on every call)."""
+    ring = _ring_tables(tb)
+    ch = ring.chains.get(family)
+    if ch is None:
+        ch = Chains(ncols=D)
+        # tile numbers -> element offsets (the chain tables address pools in elements)
+        for x0, m, c, y in elems:
+            ch.add([(m * TILE, c * TILE, -1)], x0=x0 * TILE, y_final=y * TILE)
+        ring.chains[family] = ch
     return ch
 
 
@@ -4074,14 +4443,7 @@ def _ring_forward(call: KcpCall) -> None:
             ],
         )
         if h == 1 and call.schedule == "overlap":
-            carry = (
-                call.indexed("carry", tb.carry_index, tb.carry_tiles)
-                if tb.P > 1
-                else None
-            )
-            call.walk(
-                "kcp_fwdh_tape", tb.walk_start, h0=carry, out=call.out
-            )  # document starts: under hop 1 (R7)
+            _ring_start_walk(call)  # document starts: under hop 1 (R7)
         _ring_wait(works)
         for f in receivers:
             _ring_scatter(
@@ -4093,6 +4455,29 @@ def _ring_forward(call: KcpCall) -> None:
                 tb.s_in_tiles,
                 ring.in_slot[f.slot],
             )
+    if (
+        ring.hops == 0 and call.schedule == "overlap"
+    ):  # no document crosses a rank: no hop 1 to hide it under, the walk still writes the document starts' rows
+        _ring_start_walk(call)
+
+
+def _ring_start_walk(call: KcpCall) -> None:
+    """The overlap schedule's document-start tape walk of the ring forward (under hop 1; alone when there is none)."""
+    tb = call.tb
+    carry = call.indexed("carry", tb.carry_index, tb.carry_tiles) if tb.P > 1 else None
+    call.walk("kcp_fwdh_tape", tb.walk_start, h0=carry, out=call.out)
+
+
+def _ring_end_walk(call: KcpCall) -> None:
+    """The overlap schedule's ``dcarry_end`` merge and document-end tape walk of the ring backward (under hop 1;
+    alone when there is none)."""
+    tb = call.tb
+    dcarry = (
+        call.indexed("carry", tb.dcarry_index, tb.carry_tiles) if tb.P > 1 else None
+    )
+    if tb.P > 1:
+        call.merge("dcarry_end")
+    call.walk("kcp_dhu_tape", tb.walk_end, dht=dcarry)
 
 
 def _ring_backward(call: KcpCall) -> None:
@@ -4153,16 +4538,7 @@ def _ring_backward(call: KcpCall) -> None:
             ],
         )
         if h == 1 and call.schedule == "overlap":
-            dcarry = (
-                call.indexed("carry", tb.dcarry_index, tb.carry_tiles)
-                if tb.P > 1
-                else None
-            )
-            if tb.P > 1:
-                call.merge("dcarry_end")
-            call.walk(
-                "kcp_dhu_tape", tb.walk_end, dht=dcarry
-            )  # document ends: under hop 1 (R7)
+            _ring_end_walk(call)  # document ends: under hop 1 (R7)
         _ring_wait(works)
         for f in receivers:
             _ring_scatter(
@@ -4174,6 +4550,8 @@ def _ring_backward(call: KcpCall) -> None:
                 tb.ds_out_tiles,
                 ring.out_slot[f.slot],
             )
+    if ring.hops == 0 and call.schedule == "overlap":  # the mirror of _ring_forward's
+        _ring_end_walk(call)
 
 
 def _summaries(call: KcpCall) -> None:
@@ -4197,6 +4575,18 @@ def _summaries(call: KcpCall) -> None:
             write_transposed=0,
         )
         return
+    _stage_walks(call)
+    call.merge(
+        "map"
+    )  # B_f (from 0) and M_f (from I) of every crossing-out fragment, forward family
+    call.transpose_tiles(
+        "c1_send", tb.mf_tiles, "c1_send", tb.c1_m_tiles
+    )  # M_f^T into the c1 pairs (bitwise)
+
+
+def _stage_walks(call: KcpCall) -> None:
+    """``P > 1``: the K1 ``_offset`` / K3 walks of every segment into the staging planes ``stage_b`` / ``stage_m``."""
+    tb = call.tb
     call.walk(
         "kcp_fwdh_offset",
         tb.walk_offset,
@@ -4211,12 +4601,6 @@ def _summaries(call: KcpCall) -> None:
         use_u=0,
         write_transposed=0,
     )
-    call.merge(
-        "map"
-    )  # B_f (from 0) and M_f (from I) of every crossing-out fragment, forward family
-    call.transpose_tiles(
-        "c1_send", tb.mf_tiles, "c1_send", tb.c1_m_tiles
-    )  # M_f^T into the c1 pairs (bitwise)
 
 
 def _fwd_tapes(
@@ -4275,9 +4659,20 @@ def _adj_tapes(call: KcpCall, *, dcarry: Indexed | None, wait_first: bool) -> No
         call.walk("kcp_dhu_tape", tb.walk_cross_rest, dht=dcarry)
 
 
-def _forward(call: KcpCall, *, save: bool, replay: bool) -> None:
+def _forward(
+    call: KcpCall,
+    *,
+    save: bool,
+    replay: bool,
+    bound: dict[str, torch.Tensor] | None = None,
+) -> None:
     """The design note §3.5.  ``save``: the saved set is kept (fresh ``S_in``; with ``save_transfer`` also the c1 receive
     tensor and ``M_seg``); ``replay``: the forward of a replay-mode backward (no ``fwd_o``, nothing kept).
+    ``bound``: the received tensors a recompute handle stored (``S_in``; under ``save_transfer`` also ``c1_recv``):
+    the recompute of a checkpointed forward binds them instead of exchanging -- no c1 / c2 / ring hop and no wait, no
+    owner merge, and no summary launch whose only reader is the exchange (``P = 1``: none; ``P > 1``: the two stage
+    walks that feed the carry merges stay, the map merge and the transpose into ``c1_send`` go); every other launch
+    is the same on the same bits.
     ``schedule="wait_first"`` (the shipped default since an earlier revision): ``c1 -> wait -> fwd merge -> c2 -> wait -> carry merges -> tape walk(s)``
     -- no merge or walk is issued while a collective is in flight (the R7 overlap of the document-start walk under c1
     is dropped); the merges read only ``c1_recv`` / the staging planes and the tapes read no collective buffer, so
@@ -4285,9 +4680,15 @@ def _forward(call: KcpCall, *, save: bool, replay: bool) -> None:
     tb, opts = call.tb, call.opts
     wait_first = call.schedule == "wait_first"
     keep_transfer = opts.save_transfer and save and not replay
-    call.fresh("S_in")
+    if bound is None:
+        call.fresh("S_in")
+    else:
+        call.bufs["S_in"] = bound["S_in"]
     if keep_transfer:
-        call.fresh("c1_recv")
+        if bound is None:
+            call.fresh("c1_recv")
+        else:
+            call.bufs["c1_recv"] = bound["c1_recv"]
         if tb.P > 1:
             call.fresh("stage_m")  # M_seg^T of the segmented fragments (§16 item 5b)
     if (
@@ -4302,9 +4703,21 @@ def _forward(call: KcpCall, *, save: bool, replay: bool) -> None:
     else:  # the intra program writes the GLM prep's rows itself (write_prep = 1); no token-row copies are saved
         call.stage("fwd_intra")
         call.stage("wy_fwd")
-    _summaries(call)
+    if bound is None:
+        _summaries(call)
+    elif (
+        tb.P > 1
+    ):  # the stage walks only: the carry merges below read stage_b / stage_m
+        _stage_walks(call)
     carry = call.indexed("carry", tb.carry_index, tb.carry_tiles) if tb.P > 1 else None
     if (
+        bound is not None
+    ):  # S_in is bound: no exchange; the overlap schedule's launches of the exchange window, in its order
+        if not wait_first:
+            if tb.P > 1:
+                call.merge("carry_start")
+            call.walk("kcp_fwdh_tape", tb.walk_start, h0=carry, out=call.out)
+    elif (
         call.exchange == "ring"
     ):  # SPEC-2: per-document hops; S_in filled as c2 would (bitwise)
         if tb.P > 1 and not wait_first:
@@ -4702,6 +5115,9 @@ def _graph_capture(kind: str, entry: _GraphEntry, call: KcpCall, body: Any) -> A
     LAST_CALL[kind].update(graph_event="capture", graph_key=entry.digest)
     entry.record = dict(LAST_CALL[kind])
     entry.graph = g
+    if call.local is not None and call.local is not call.ws.local:
+        # a plan view of the arena: the graph holds its scratch table set, so the entry keeps the view alive
+        entry.pins += (call.local,)
     entry.seen += 1
     GRAPH_STATS["capture"] += 1
     call.backend.end_call(call)
@@ -4734,13 +5150,29 @@ def graph_cache_clear() -> int:
     return n
 
 
-def _graph_release(arena: Any) -> int:
-    """Drop the cached graphs whose key pins ``arena``, a local arena that :meth:`KcpWorkspace.ensure` supersedes: no
-    later call can match their keys, and their pins would keep its storage alive.  The dropped entries also let go of
-    their pins (the entry of the call doing the upgrade, created before its ``ensure``, is still referenced by that
-    call): once the arena is freed its id may be reused, and a later call that builds an equal key finds no entry and
-    starts a new one.  Returns the number dropped."""
-    stale = [key for key, e in _GRAPHS.items() if any(p is arena for p in e.pins)]
+def _graph_release(pinned: Any) -> int:
+    """Drop the cached graphs whose key pins ``pinned``: a local arena that :meth:`KcpWorkspace.ensure` supersedes, or
+    a workspace whose :meth:`KcpWorkspace.pool` has just allocated a forward-only lazy pool
+    (``cake_kcp_plan.FWD_LAZY_POOLS``, part of every key): no later call can match their keys, and their pins (and
+    graphs) would keep that storage alive.  The dropped entries also let go of their pins (the entry of the call doing
+    the upgrade, created before its ``ensure``, is still referenced by that call): once the arena is freed its id may
+    be reused, and a later call that builds an equal key finds no entry and starts a new one.  Returns the number
+    dropped.  A pinned plan view of the arena ``pinned`` (:func:`_plan_view`, the same ``arena`` tensor) matches
+    too."""
+    arena = pinned.arena if isinstance(pinned, cake_backend.KdaWorkspace) else None
+    stale = [
+        key
+        for key, e in _GRAPHS.items()
+        if any(
+            p is pinned
+            or (
+                arena is not None
+                and isinstance(p, cake_backend.KdaWorkspace)
+                and p.arena is arena
+            )
+            for p in e.pins
+        )
+    ]
     for key in stale:
         _GRAPHS.pop(key).pins = ()
     return len(stale)
@@ -4780,6 +5212,10 @@ def _prepare(
         raise ValueError(
             f"workspace state dtype {workspace.state_dtype} differs from the backend's {backend.dtypes['state']}"
         )
+    wait_ready = getattr(ctx, "wait_ready", None)
+    # a context prepared on another stream: order its uploads on this one (enqueue only)
+    if wait_ready is not None:
+        wait_ready()
     tb = workspace.ensure(
         ctx,
         H,
@@ -4889,11 +5325,17 @@ def chunk_kda_kcp_fwd(
 
 
 def _fwd_body(
-    call: KcpCall, *, save: bool, save_mode: str, ctx: Any
+    call: KcpCall,
+    *,
+    save: bool,
+    save_mode: str,
+    ctx: Any,
+    bound: dict[str, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, KcpSaved | None]:
-    """The forward's allocations and launches (eagerly or inside a capture): ``out`` and the saved set."""
+    """The forward's allocations and launches (eagerly or inside a capture): ``out`` and the saved set.  ``bound``:
+    the tensors of a recompute handle's entry (:func:`_forward`); the saved set then holds them."""
     call.out = _alloc((call.T_r, call.H, D), call.backend.dtypes["out"], call.device)
-    _forward(call, save=save, replay=False)
+    _forward(call, save=save, replay=False, bound=bound)
     saved = None
     if save:
         tb, opts = call.tb, call.opts
@@ -5097,6 +5539,281 @@ def _bwd_body(call: KcpCall, saved: KcpSaved | None) -> tuple[torch.Tensor, ...]
 
 
 # ----------------------------------------------------------------------------------------------------------------
+# Checkpoint recompute without the state exchange: the recompute handle (``recompute_handle=``; issue #7815, GDN #7818)
+#
+# The phase comes from ``torch._C._current_graph_task_id()`` (checked once: present and returning an int; without it a
+# call with a handle raises): -1 outside the autograd engine (an original forward), the running graph task inside a
+# backward (torch's checkpoint recompute, reentrant or not).  Rules of a call with a handle:
+#   * no "kda" entry -> an original forward (also one inside an outer checkpoint's recompute, nested regions):
+#     exchange as always, then store ``S_in`` (and under ``checkpoint_keep="transfer"`` the c1 receive tensor) --
+#     the saved set's own tensors, no copy -- with the call's context and static fingerprint;
+#   * an entry inside the backward -> the recompute: check the context and the fingerprint, bind the stored tensors,
+#     issue no collective; the entry stays (``retain_graph`` / a second backward binds it again);
+#   * an entry outside the backward -> raise (a handle reused across micro-steps or for a second KDA call).
+# Graph replay (keyword or knob), a forward inside a CUDA-graph capture, ``debug_sequence``, ``spec3_probe`` and
+# ``boundary_mode="replay"`` are refused with a handle, in the autograd Function itself (:func:`_handle_refusals`).
+# The ranks are not checked against each other: the forward exchange is a collective, so every rank of the group must
+# take the same branch (all with a handle at the same nesting level, or all without); a mismatch hangs or pairs the
+# wrong exchanges (documented, no check, no all-gather).
+
+HANDLE_KEY = "kda"  # this package's entry in a recompute handle
+CHECKPOINT_KEEPS = cake_kcp_plan.CHECKPOINT_KEEPS  # "states" (default) | "transfer"
+CHECKPOINT_KEEP_DEFAULT = "states"
+
+_GRAPH_TASK_ID_BINDING = getattr(torch._C, "_current_graph_task_id", None)
+_GRAPH_TASK_ID_USABLE: bool | None = None  # None = not checked yet
+
+
+class KcpRecomputeHandle:
+    """The boundary tensors of one checkpointed call, carried from its original forward to torch's recompute of that
+    forward (``chunk_kda_kcp(..., recompute_handle=handle)``), so the recompute runs without cross-rank
+    communication.
+
+    Create one handle per layer and micro-step, outside the outermost checkpoint region, and pass it as an argument
+    of the checkpointed function, so the recompute sees the same object::
+
+        def layer(q, k, v, g, beta, handle):
+            return chunk_kda_kcp(q, k, v, g, beta, ctx, recompute_handle=handle)
+
+        out = torch.utils.checkpoint.checkpoint(layer, q, k, v, g, beta, KcpRecomputeHandle(), use_reentrant=False)
+
+    ``entries`` maps an operation key to that operation's entry: ``"kda"`` is this package's (the forward's incoming
+    states ``S_in`` -- and with ``checkpoint_keep="transfer"`` the owner's c1 receive tensor --, the very tensors
+    the saved set holds, plus the call's context and fingerprint); other packages that accept a handle with an
+    ``entries`` dict use their own keys (the causal convolution's history rows: ``"conv"``), so one handle may serve
+    the KDA call and one convolution call of the same layer.  A handle holds one entry per key.  A handle created
+    inside a checkpoint region is a new, empty one in that region's recompute, which then exchanges again (correct,
+    not communication-free).  The entries live as long as the handle; :meth:`nbytes` is the retained size
+    (``kcp_saved_bytes(ctx, H=..., checkpoint_keep=..., with_conv=False)`` for the KDA entry).
+
+    The forward state exchange is a collective.  Every rank of ``ctx.group`` must pass a handle for the same call, or
+    no rank passes one, and every rank creates it at the same checkpoint nesting level.  A mismatch pairs one rank's
+    recompute exchange with another rank's backward exchange: the ranks hang or exchange wrong data.  No check is
+    made across ranks.  Never share one handle between two KDA calls (also not in nested regions).  Never call
+    :meth:`clear` on a handle, or reuse it, while a backward that needs its entry is pending."""
+
+    __slots__ = ("entries",)
+
+    def __init__(self) -> None:
+        self.entries: dict[str, dict[str, Any]] = {}
+
+    def clear(self) -> None:
+        """Drop every entry (the retained tensors go with the last reference)."""
+        self.entries.clear()
+
+    def nbytes(self) -> int:
+        """Bytes of the distinct tensors the entries hold."""
+        seen: dict[int, int] = {}
+        for entry in self.entries.values():
+            for t in entry.values():
+                for x in t if isinstance(t, (tuple, list)) else (t,):
+                    if isinstance(x, torch.Tensor):
+                        seen[id(x)] = x.numel() * x.element_size()
+        return sum(seen.values())
+
+
+def _kcp_in_backward() -> bool:
+    """Whether this thread runs inside the autograd engine's backward pass (torch's checkpoint recompute runs there,
+    an original forward does not).  The one place the recompute handle reads the phase.  Raises without the torch
+    binding (checked once)."""
+    global _GRAPH_TASK_ID_USABLE
+    if _GRAPH_TASK_ID_USABLE is None:
+        ok = False
+        if _GRAPH_TASK_ID_BINDING is not None:
+            try:
+                gid = _GRAPH_TASK_ID_BINDING()
+                ok = isinstance(gid, int) and not isinstance(gid, bool)
+            except Exception:  # noqa: BLE001 - an unusable binding disables the option
+                ok = False
+        _GRAPH_TASK_ID_USABLE = ok
+    if not _GRAPH_TASK_ID_USABLE:
+        raise RuntimeError(
+            "recompute_handle needs torch._C._current_graph_task_id to tell the recompute from the original "
+            "forward; this torch does not provide it"
+        )
+    return int(_GRAPH_TASK_ID_BINDING()) != -1
+
+
+def _handle_refusals(opts: KcpOptions, boundary_mode: str, handle: Any) -> None:
+    """The refusals of a call with a handle, shared by :func:`chunk_kda_kcp` and the autograd Function: graph replay
+    (keyword or test knob), a forward inside a CUDA-graph capture, ``debug_sequence``, ``spec3_probe``,
+    ``boundary_mode="replay"`` and a handle without an ``entries`` dict."""
+    if not isinstance(getattr(handle, "entries", None), dict):
+        raise TypeError(
+            f"recompute_handle must carry an 'entries' dict (KcpRecomputeHandle), got {type(handle).__name__}"
+        )
+    if opts.graph != "off":
+        raise ValueError(
+            f"recompute_handle needs graph='off' (keyword and test knob), got {opts.graph!r}"
+        )
+    if _capturing():
+        raise ValueError(
+            "recompute_handle is refused inside a CUDA-graph capture (a replay would overwrite the stored states)"
+        )
+    if boundary_mode != "saved":
+        raise ValueError(
+            f"recompute_handle needs boundary_mode='saved' (the replay mode keeps no state), got {boundary_mode!r}"
+        )
+    if opts.debug_sequence:
+        raise ValueError(
+            "recompute_handle refuses debug_sequence (it gathers the issue order across ranks)"
+        )
+    if opts.spec3_probe != "off":
+        raise ValueError(
+            f"recompute_handle refuses spec3_probe (a debug probe), got {opts.spec3_probe!r}"
+        )
+
+
+def _handle_options(
+    opts: KcpOptions, checkpoint_keep: str | None, explicit_save_transfer: Any
+) -> KcpOptions:
+    """The options of a call with a handle: ``checkpoint_keep`` (default ``"states"``) fixes ``save_transfer``
+    (``"states"`` -> ``False``, ``"transfer"`` -> ``True``); an explicit ``save_transfer`` that contradicts it, and
+    ``"transfer"`` with the ring exchange (no c1 receive tensor), are refused."""
+    keep = CHECKPOINT_KEEP_DEFAULT if checkpoint_keep is None else checkpoint_keep
+    if keep not in CHECKPOINT_KEEPS:
+        raise ValueError(
+            f"checkpoint_keep must be one of {CHECKPOINT_KEEPS}, got {checkpoint_keep!r}"
+        )
+    transfer = keep == "transfer"
+    if explicit_save_transfer is not None and bool(explicit_save_transfer) != transfer:
+        raise ValueError(
+            f"checkpoint_keep={keep!r} runs the call with save_transfer={transfer}; "
+            f"save_transfer={explicit_save_transfer!r} contradicts it"
+        )
+    if transfer and opts.exchange == "ring":
+        raise ValueError(
+            "checkpoint_keep='transfer' keeps the c1 receive tensor; exchange='ring' receives none (use 'states')"
+        )
+    if opts.save_transfer == transfer:
+        return opts
+    return dataclasses.replace(opts, save_transfer=transfer)
+
+
+def _handle_lookup(handle: Any) -> dict[str, Any] | None:
+    """The handle's ``"kda"`` entry when this forward is the recompute of the forward that stored it, ``None`` for an
+    original forward (no entry yet: it exchanges and stores one; also a forward inside an outer checkpoint's
+    recompute).  An entry found outside the backward raises."""
+    in_backward = _kcp_in_backward()
+    entry = handle.entries.get(HANDLE_KEY)
+    if entry is None:
+        return None
+    if not in_backward:
+        raise RuntimeError(
+            "recompute_handle: the handle already holds a 'kda' entry outside the backward -- a handle serves one "
+            "KDA call of one micro-step; create a new KcpRecomputeHandle per layer and micro-step"
+        )
+    return entry
+
+
+def _handle_fingerprint(
+    call: KcpCall, *, save_mode: str, keep: str, **modes: Any
+) -> tuple:
+    """The static configuration of a call that a handle entry must match to stand in for the recompute's exchange
+    (host data only): the problem (``T_r``, ``H``, the fragment and segment counts, the operands' shapes and dtypes),
+    ``scale``, ``save_mode``, the exchange, the tier and every option.  The context is compared by identity beside
+    it.  ``modes``: keywords of the entry point that select another form of the recurrence (a gate mode, an in-kernel
+    q / k normalization); every such keyword joins the fingerprint here, so a replay never binds states captured
+    under another mode."""
+    tb = call.tb
+    return (
+        ("T_r", call.T_r),
+        ("H", call.H),
+        ("n_frag", tb.n_frag),
+        ("P", tb.P),
+        ("NSEG", tb.NSEG),
+        ("scale", call.scale),
+        ("save_mode", save_mode),
+        ("exchange", call.exchange),
+        ("keep", keep),
+        (
+            "operands",
+            tuple((n, tuple(t.shape), t.dtype) for n, t in call.ops.items()),
+        ),
+        ("options", tuple(sorted(dataclasses.asdict(call.opts).items()))),
+        ("modes", tuple(sorted(modes.items()))),
+    )
+
+
+def _handle_bind(
+    entry: dict[str, Any], call: KcpCall, fingerprint: tuple, keep: str
+) -> dict[str, torch.Tensor]:
+    """The stored tensors of ``entry``, checked against this recompute: the same context, the same fingerprint and
+    the shapes / dtype / device of the call's pools."""
+    if entry.get("ctx") is not call.ctx:
+        raise ValueError(
+            "recompute_handle: the 'kda' entry belongs to another KcpContext"
+        )
+    stored = entry.get("fingerprint")
+    if stored != fingerprint:
+        differ = (
+            sorted(
+                k
+                for k, v in dict(fingerprint).items()
+                if dict(stored).get(k, object()) != v
+            )
+            if isinstance(stored, tuple)
+            else ["fingerprint"]
+        )
+        raise ValueError(
+            f"recompute_handle: the 'kda' entry was stored by another call configuration (differs in {differ})"
+        )
+    names = ("S_in", "c1_recv") if keep == "transfer" else ("S_in",)
+    bound = {}
+    for name in names:
+        t = entry.get(name)
+        if not isinstance(t, torch.Tensor):
+            raise ValueError(
+                f"recompute_handle: the 'kda' entry holds no {name} tensor"
+            )
+        _check(
+            t,
+            f"recompute_handle {name}",
+            (call.tb.sizes[name],),
+            call.state_dtype,
+            call.device,
+        )
+        bound[name] = t
+    return bound
+
+
+def _fwd_handle(
+    q, k, v, g, beta, ctx, *, scale, save_mode, workspace, opts, handle
+) -> tuple[torch.Tensor, KcpSaved]:
+    """The forward of a call with a handle (eager, saved mode): the original forward exchanges and stores the
+    handle's entry; the recompute binds it (:func:`_forward`)."""
+    keep = "transfer" if opts.save_transfer else "states"
+    entry = _handle_lookup(handle)
+    call, batched = _prepare(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        ctx,
+        scale=scale,
+        save_mode=save_mode,
+        workspace=workspace,
+        options=opts,
+        backward=False,
+    )
+    fingerprint = _handle_fingerprint(call, save_mode=save_mode, keep=keep)
+    bound = None if entry is None else _handle_bind(entry, call, fingerprint, keep)
+    out, saved = _fwd_body(call, save=True, save_mode=save_mode, ctx=ctx, bound=bound)
+    if entry is None:
+        stored: dict[str, Any] = {"S_in": saved.S_in}
+        if keep == "transfer":
+            stored["c1_recv"] = saved.c1_recv
+        stored["ctx"] = ctx
+        stored["fingerprint"] = fingerprint
+        handle.entries[HANDLE_KEY] = stored
+    call.scratch["recompute_handle"] = "capture" if entry is None else "replay"
+    _record("fwd", call)
+    call.backend.end_call(call)
+    return _ranked(out, batched), saved
+
+
+# ----------------------------------------------------------------------------------------------------------------
 # autograd
 
 
@@ -5104,26 +5821,60 @@ class ChunkKDAKcpFunction(torch.autograd.Function):
     """:func:`chunk_kda_kcp` as an autograd node: the forward keeps the inputs and the saved set (saved mode) or
     the inputs only (replay mode); the backward runs :func:`chunk_kda_kcp_bwd`.  Under
     ``torch.utils.checkpoint(use_reentrant=False)`` the forward is re-run in the backward: the same program order
-    on every rank, so the collectives match (R7)."""
+    on every rank, so the collectives match (R7).  ``handle``: a recompute handle (:class:`KcpRecomputeHandle`):
+    the original forward stores its received states in it, the recompute binds them and exchanges nothing; the
+    saved set has the same members either way.  The tier follows the options' ``save_transfer`` (``False``:
+    ``S_in``; ``True``: also the c1 receive tensor; :func:`chunk_kda_kcp` sets it from ``checkpoint_keep``).  A
+    handle is refused with graph replay, inside a CUDA-graph capture, with ``debug_sequence``, ``spec3_probe`` and
+    ``boundary_mode="replay"``."""
 
     @staticmethod
     def forward(
-        fctx, q, k, v, g, beta, ctx, scale, save_mode, boundary_mode, workspace, options
+        fctx,
+        q,
+        k,
+        v,
+        g,
+        beta,
+        ctx,
+        scale,
+        save_mode,
+        boundary_mode,
+        workspace,
+        options,
+        handle=None,
     ):
-        out, saved = chunk_kda_kcp_fwd(
-            q,
-            k,
-            v,
-            g,
-            beta,
-            ctx,
-            scale=scale,
-            save_for_backward=True,
-            save_mode=save_mode,
-            boundary_mode=boundary_mode,
-            workspace=workspace,
-            **options,
-        )
+        if handle is None:
+            out, saved = chunk_kda_kcp_fwd(
+                q,
+                k,
+                v,
+                g,
+                beta,
+                ctx,
+                scale=scale,
+                save_for_backward=True,
+                save_mode=save_mode,
+                boundary_mode=boundary_mode,
+                workspace=workspace,
+                **options,
+            )
+        else:
+            opts = _options(options)
+            _handle_refusals(opts, boundary_mode, handle)
+            out, saved = _fwd_handle(
+                q,
+                k,
+                v,
+                g,
+                beta,
+                ctx,
+                scale=scale,
+                save_mode=save_mode,
+                workspace=workspace,
+                opts=opts,
+                handle=handle,
+            )
         tensors = saved.tensors() if saved is not None else ()
         fctx.save_for_backward(q, k, v, g, beta, *tensors)
         fctx.kcp = (
@@ -5161,7 +5912,7 @@ class ChunkKDAKcpFunction(torch.autograd.Function):
             workspace=workspace,
             **options,
         )
-        return dq, dk, dv, dg, dbeta, None, None, None, None, None, None
+        return dq, dk, dv, dg, dbeta, None, None, None, None, None, None, None
 
 
 def chunk_kda_kcp(
@@ -5175,18 +5926,67 @@ def chunk_kda_kcp(
     save_mode: str = "light",
     boundary_mode: str = "saved",
     workspace: KcpWorkspace | None = None,
+    *,
+    recompute_handle: Any = None,
+    checkpoint_keep: str | None = None,
     **options: Any,
 ) -> torch.Tensor:
-    """The differentiable KCP forward (the KCP contract §3.2 signature): ``out`` like ``v``; gradients for ``q, k, v, g, beta``."""
+    """The differentiable KCP forward (the KCP contract §3.2 signature): ``out`` like ``v``; gradients for ``q, k, v, g, beta``.
+
+    ``recompute_handle`` (keyword-only; ``None`` = unchanged): a :class:`KcpRecomputeHandle` (any object with an
+    ``entries`` dict) makes torch's checkpoint recompute of this call run without the forward state exchange -- the
+    original forward stores its incoming states under ``"kda"``, the recompute inside the backward binds them
+    (bitwise the exchanging recompute); the backward still exchanges.  One handle per layer and micro-step, created
+    outside the outermost checkpoint region; a forward outside the backward that finds an entry raises.
+    ``checkpoint_keep`` (with a handle only): ``"states"`` (default) keeps ``S_in`` and runs the call with
+    ``save_transfer=False`` (bitwise the default form; the backward re-sends the maps in b1); ``"transfer"`` also
+    keeps the owner's c1 receive tensor (``save_transfer=True``; not with ``exchange="ring"``).  An explicit
+    ``save_transfer`` must agree with the tier.  Refused with ``graph="replay"`` (keyword or knob), inside a
+    CUDA-graph capture, with ``debug_sequence``, ``spec3_probe`` and ``boundary_mode="replay"``.  Retains
+    ``recompute_handle.nbytes()`` (``kcp_saved_bytes(ctx, H=..., checkpoint_keep=..., with_conv=False)``) while
+    the handle lives.  The exchange is a collective: every rank of ``ctx.group`` passes a handle for the same call or
+    none, at the same checkpoint nesting level; a mismatch hangs or corrupts data (no check across ranks)."""
     opts = _options(options)  # validate on the caller's frame
     if boundary_mode not in BOUNDARY_MODES:
         raise ValueError(
             f"boundary_mode must be one of {BOUNDARY_MODES}, got {boundary_mode!r}"
         )
-    if opts.host_trim:  # the forward and the backward reuse the validated options instead of re-validating the dict
-        options = {"_kcp_options": opts}
+    if recompute_handle is None:
+        if checkpoint_keep is not None:
+            raise ValueError(
+                "checkpoint_keep selects what a recompute handle keeps: it needs recompute_handle"
+            )
+        if opts.host_trim:  # the forward and the backward reuse the validated options instead of re-validating the dict
+            options = {"_kcp_options": opts}
+        return ChunkKDAKcpFunction.apply(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            ctx,
+            scale,
+            save_mode,
+            boundary_mode,
+            workspace,
+            dict(options),
+            None,
+        )
+    opts = _handle_options(opts, checkpoint_keep, options.get("save_transfer"))
+    _handle_refusals(opts, boundary_mode, recompute_handle)
     return ChunkKDAKcpFunction.apply(
-        q, k, v, g, beta, ctx, scale, save_mode, boundary_mode, workspace, dict(options)
+        q,
+        k,
+        v,
+        g,
+        beta,
+        ctx,
+        scale,
+        save_mode,
+        boundary_mode,
+        workspace,
+        {"_kcp_options": opts},
+        recompute_handle,
     )
 
 
@@ -5223,6 +6023,9 @@ __all__ = [
     "set_kernel_node_carveout",
     "GRAPH_STATS",
     "CACHE_CONFIG_STATS",
+    "CHECKPOINT_KEEPS",
+    "HANDLE_KEY",
+    "KcpRecomputeHandle",
     "graph_cache_clear",
     "KCP_PROGRAMS",
     "KCP_SAVED_VERSION",

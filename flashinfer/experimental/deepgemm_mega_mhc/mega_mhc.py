@@ -291,7 +291,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
             "block": [768, 1, 1],
             "dynamic_smem_bytes": 208896,
             "cooperative": True,
-            "use_pdl": False,
+            "use_pdl": True,
         },
     },
     "cake_mega_mhc_c549b064530c3765f9ba": {
@@ -345,7 +345,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
             "block": [768, 1, 1],
             "dynamic_smem_bytes": 208896,
             "cooperative": True,
-            "use_pdl": False,
+            "use_pdl": True,
         },
     },
     "cake_mega_mhc_41024b807c02040677b3": {
@@ -399,7 +399,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
             "block": [768, 1, 1],
             "dynamic_smem_bytes": 217088,
             "cooperative": True,
-            "use_pdl": False,
+            "use_pdl": True,
         },
     },
     "cake_mega_mhc_a940c94296afad2b2497": {
@@ -456,7 +456,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
             "block": [768, 1, 1],
             "dynamic_smem_bytes": 208896,
             "cooperative": True,
-            "use_pdl": False,
+            "use_pdl": True,
         },
     },
     "cake_mega_mhc_1c61fed11caf93d1b762": {
@@ -513,7 +513,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
             "block": [768, 1, 1],
             "dynamic_smem_bytes": 208896,
             "cooperative": True,
-            "use_pdl": False,
+            "use_pdl": True,
         },
     },
     "cake_mega_mhc_ed3f407e5a68eb65478e": {
@@ -570,7 +570,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
             "block": [768, 1, 1],
             "dynamic_smem_bytes": 208896,
             "cooperative": True,
-            "use_pdl": False,
+            "use_pdl": True,
         },
     },
     "cake_mega_mhc_892d774130f06423fd7c": {
@@ -627,7 +627,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
             "block": [768, 1, 1],
             "dynamic_smem_bytes": 217088,
             "cooperative": True,
-            "use_pdl": False,
+            "use_pdl": True,
         },
     },
     "cake_mega_mhc_91c9979888321fdbf94f": {
@@ -684,7 +684,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
             "block": [768, 1, 1],
             "dynamic_smem_bytes": 208896,
             "cooperative": True,
-            "use_pdl": False,
+            "use_pdl": True,
         },
     },
     "cake_mega_mhc_9823742e18a9ffa6515b": {
@@ -741,7 +741,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
             "block": [768, 1, 1],
             "dynamic_smem_bytes": 208896,
             "cooperative": True,
-            "use_pdl": False,
+            "use_pdl": True,
         },
     },
     "cake_mega_mhc_5c5eaa3072b0d4f69ccd": {
@@ -798,7 +798,64 @@ PROGRAMS: dict[str, dict[str, Any]] = {
             "block": [768, 1, 1],
             "dynamic_smem_bytes": 217088,
             "cooperative": True,
-            "use_pdl": False,
+            "use_pdl": True,
+        },
+    },
+    "cake_mega_mhc_da939508a9b583ab4d87": {
+        "sources": [
+            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_da939508a9b583ab4d87_kernel.cu",
+            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_da939508a9b583ab4d87_binding.cu",
+        ],
+        "kernel_symbol": "kernel_cake_mega_mhc_da939508a9b583ab4d87",
+        "hidden": 4096,
+        "shifted": False,
+        "shared_sf": False,
+        "shared_sf_block_m": 0,
+        "num_splits": "runtime",
+        "arches": ["sm_107a"],
+        "compile_flags": [],
+        "compile_options": ["--fmad=true"],
+        "compile_time_sm_count": False,
+        "arg_plan": [
+            ["tma_buffer", "residual_map"],
+            ["tma_buffer", "x_map"],
+            ["tma_buffer", "fnp_map"],
+            ["tma_buffer", "post_map"],
+            ["tma_buffer", "comb_map"],
+            ["tma_buffer", "new_residual_map"],
+            ["buffer", "mix_scales"],
+            ["buffer", "mix_bases"],
+            ["buffer", "new_post_mix"],
+            ["buffer", "new_comb_res_mix"],
+            ["buffer", "rmsnorm_weight"],
+            ["buffer", "new_residual"],
+            ["buffer", "y_bf16"],
+            ["buffer", "scratch"],
+            ["buffer", "split_barriers"],
+            ["buffer", "launch_epochs"],
+            ["parameter", "num_tokens"],
+            ["parameter", "num_splits"],
+            ["parameter", "split_div"],
+            ["parameter", "num_ctas"],
+            ["parameter", "hc_norm_eps"],
+            ["parameter", "hc_pre_eps"],
+            ["parameter", "hc_post_scale"],
+            ["parameter", "sinkhorn_eps"],
+            ["parameter", "num_sinkhorn_iters"],
+            ["parameter", "rmsnorm_eps"],
+            ["parameter", "rmsnorm_scale"],
+            ["buffer", "y_fp8"],
+            ["buffer", "y_fp8_sf"],
+            ["parameter", "fp8_sf_ue8m0"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "launch": {
+            "block": [768, 1, 1],
+            "dynamic_smem_bytes": 208896,
+            "cooperative": True,
+            "use_pdl": True,
         },
     },
     "cake_mega_mhc_5018692c75652529e6fd": {
@@ -855,7 +912,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
             "block": [768, 1, 1],
             "dynamic_smem_bytes": 208896,
             "cooperative": True,
-            "use_pdl": False,
+            "use_pdl": True,
         },
     },
     "cake_mega_mhc_12e5bcc41e7940e7d511": {
@@ -912,7 +969,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
             "block": [768, 1, 1],
             "dynamic_smem_bytes": 217088,
             "cooperative": True,
-            "use_pdl": False,
+            "use_pdl": True,
         },
     },
 }
@@ -1106,6 +1163,34 @@ ROUTES: list[dict[str, Any]] = [
         "sf_layout": "fp8_group128",
         "fp8_sf_ue8m0": True,
         "program": "cake_mega_mhc_5c5eaa3072b0d4f69ccd",
+        "defines": {},
+    },
+    # The raw scale mode's launches of the plain FP8 group-128 program's regime
+    # that its fp8_fast_div form (the FP8 store dividing through one reciprocal
+    # per lane) serves on sm_107a: every deterministic launch and the token
+    # counts of "tokens" (inclusive ranges).
+    {
+        "hidden": 4096,
+        "num_splits": "runtime",
+        "regime": "bf16",
+        "shifted": False,
+        "shared_sf": False,
+        "sf_layout": "fp8_group128",
+        "fp8_sf_ue8m0": False,
+        "deterministic": True,
+        "program": "cake_mega_mhc_da939508a9b583ab4d87",
+        "defines": {},
+    },
+    {
+        "hidden": 4096,
+        "num_splits": "runtime",
+        "regime": "bf16",
+        "shifted": False,
+        "shared_sf": False,
+        "sf_layout": "fp8_group128",
+        "fp8_sf_ue8m0": False,
+        "tokens": [[1, 128], [1024, 1048576]],
+        "program": "cake_mega_mhc_da939508a9b583ab4d87",
         "defines": {},
     },
     {
@@ -1528,7 +1613,16 @@ def _support_matrix():
 
 
 def select_program(
-    hidden, splits, shifted, shared_sf, sf_layout, arch, regime=None, fp8_sf_ue8m0=None
+    hidden,
+    splits,
+    shifted,
+    shared_sf,
+    sf_layout,
+    arch,
+    regime=None,
+    fp8_sf_ue8m0=None,
+    tokens=None,
+    deterministic=None,
 ):
     """(source name, compile-line defines) serving the schedule key on ``arch``, or raise.
     ``regime`` is the host rule's name for the split regime of the launch
@@ -1537,7 +1631,11 @@ def select_program(
     its key, so a layout with several programs needs the regime to select.
     ``fp8_sf_ue8m0`` is the FP8 group-128 scale mode of the launch: a route keyed on
     it (the UE8M0-only programs on sm_107a) serves that mode alone, a route without
-    the key both modes and a caller that passes no mode."""
+    the key both modes and a caller that passes no mode.
+    ``tokens`` and ``deterministic`` describe the launch (its token count and its
+    mode): a route keyed on ``tokens`` (inclusive ``[first, last]`` ranges) serves
+    the token counts of its ranges alone, a route keyed on ``deterministic`` that
+    mode alone; a caller that passes no launch takes neither."""
     output = route_output(sf_layout)
     for route in ROUTES:
         if (
@@ -1545,6 +1643,14 @@ def select_program(
             and route["num_splits"] in (splits, "runtime")
             and route_regime(route) in (None, regime)
             and route.get("fp8_sf_ue8m0") in (None, fp8_sf_ue8m0)
+            and route.get("deterministic") in (None, deterministic)
+            and (
+                "tokens" not in route
+                or (
+                    tokens is not None
+                    and any(first <= tokens <= last for first, last in route["tokens"])
+                )
+            )
             and route["shifted"] == shifted
             and route["shared_sf"] == shared_sf
             and route.get("sf_layout", "fp8") == output
@@ -1864,6 +1970,8 @@ class MegaMHCPlan:
             arch,
             regime=regime,
             fp8_sf_ue8m0=(bool(fp8_sf_ue8m0) if sf_layout == "fp8_group128" else None),
+            tokens=tokens,
+            deterministic=bool(deterministic),
         )
         record = PROGRAMS[program]
         block_m = shared_sf_block_m if shared_sf else 0

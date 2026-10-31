@@ -1734,7 +1734,11 @@ def test_cake_ssd_combined_cu_seqlens_form_is_bitwise_the_triple(
             fused,
         )
         ring_triple = _without_table_form(
-            module, program_triple, state_dtype=state_dtype, num_sequences=len(lengths)
+            module,
+            program_triple,
+            state_dtype=state_dtype,
+            num_sequences=len(lengths),
+            total_tokens=sum(lengths),
         )
         assert program_cu.split("_", 1)[1] == ring_triple.split("_", 1)[1], (
             program_cu,
@@ -3906,13 +3910,17 @@ def _derived_family(module, lengths, *, nheads=8):
     )
 
 
-def _without_table_form(module, name, *, state_dtype, num_sequences, nheads=8):
+def _without_table_form(
+    module, name, *, state_dtype, num_sequences, total_tokens, nheads=8
+):
     """The ring one-launch program a derived-table call stands for on this
     device: ``name`` without the prologue form that ``exactone_table_variant``
     picks for the call's launch grid (SM107: ``tablefirst`` below its grid
-    threshold, ``tableroles`` from it on).  The forms move only where the CTA
-    prologue derives the table; the arithmetic is the ring program's.  Every
-    other program is returned as is."""
+    threshold, ``tableroles`` from it on), in its one-CTA-cluster twin
+    (``tablefirstunit`` / ``tablerolesunit``) where ``unit_cluster_variant``
+    takes it.  The forms move only where the CTA prologue derives the table
+    and the twin only adds the static one-CTA cluster shape; the arithmetic
+    is the ring program's.  Every other program is returned as is."""
 
     program = module._PROGRAMS[name]
     if program.family != "exactone" or program.variant == "noring":
@@ -3925,6 +3933,16 @@ def _without_table_form(module, name, *, state_dtype, num_sequences, nheads=8):
             total_work=num_sequences * nheads,
             sm_count=module._sm_count(torch.cuda.current_device()),
         ),
+    )
+    form = module.unit_cluster_variant(
+        capability=torch.cuda.get_device_capability(),
+        family="exactone",
+        variant=form,
+        state_dtype=state_dtype,
+        mode_varlen=True,
+        num_sequences=num_sequences,
+        nheads=nheads,
+        total_tokens=total_tokens,
     )
     assert program.variant == form, (name, form)
     return name[: -len(form) - 1] if form else name
@@ -4803,11 +4821,21 @@ def test_source_program_table_names_shipped_sources():
         "exactone_f16_varlen_tableroles",
         "exactone_f32_varlen_tablefirst",
         "exactone_f32_varlen_tableroles",
-    } | {f"exactpre_{state}_varlen_tailone" for state in ("bf16", "f16", "f32")}
+    } | {f"exactpre_{state}_varlen_tailone" for state in ("bf16", "f16", "f32")} | {
+        f"exactfused_{state}_batched_zpf" for state in ("bf16", "f32")
+    } | {
+        "exactpre_bf16_varlen_unit",
+        "exactpre_f32_varlen_unit",
+        "exactone_bf16_varlen_tablefirstunit",
+        "exactone_f32_varlen_tablefirstunit",
+        "exactone_f32_varlen_tablerolesunit",
+    } | {f"exactpre_{state}_varlen_wrap" for state in ("bf16", "f32")}
     # The sm_107a-only programs (the claim programs, the two-kernel and fused
-    # initial-state bulk programs, the two-kernel one-CTA pair programs and
-    # the one-launch programs in the tablefirst / tableroles prologue forms):
-    # their ``_SM107_MODULES`` entry is their sole source.
+    # initial-state bulk programs, the two-kernel one-CTA pair and wrap-plan
+    # programs, the one-launch programs in the tablefirst / tableroles prologue
+    # forms, the fused batched z-prefetch programs and the one-CTA-cluster
+    # twins): their
+    # ``_SM107_MODULES`` entry is their sole source.
     assert {
         "exactpre_bf16_varlen_claim",
         "exactpre_f32_varlen_claim",
@@ -4824,6 +4852,15 @@ def test_source_program_table_names_shipped_sources():
         "exactone_f16_varlen_tableroles",
         "exactone_f32_varlen_tablefirst",
         "exactone_f32_varlen_tableroles",
+        "exactfused_bf16_batched_zpf",
+        "exactfused_f32_batched_zpf",
+        "exactpre_bf16_varlen_unit",
+        "exactpre_f32_varlen_unit",
+        "exactone_bf16_varlen_tablefirstunit",
+        "exactone_f32_varlen_tablefirstunit",
+        "exactone_f32_varlen_tablerolesunit",
+        "exactpre_bf16_varlen_wrap",
+        "exactpre_f32_varlen_wrap",
     } == module._SM107_ONLY_PROGRAMS
     assert set(module._SCAN_MODULES) == {
         name for name in module._PROGRAMS if name.startswith("exact_")
@@ -4898,7 +4935,7 @@ def test_source_program_table_names_shipped_sources():
         }
         | module._SM107_ONLY_PROGRAMS
     )
-    assert len(module._SM107_MODULES) == 55
+    assert len(module._SM107_MODULES) == 64
     assert set(module._SM107_MODULES) <= set(module._PROGRAMS)
     assert set(module._PROGRAMS) - set(module._SM107_MODULES) == {
         name for name in module._PROGRAMS if name.startswith(("exact_", "exactmeta_"))
@@ -4976,6 +5013,11 @@ def test_source_program_table_names_shipped_sources():
                 "ibulk",
                 "tablefirst",
                 "tableroles",
+                "zpf",
+                "unit",
+                "tablefirstunit",
+                "tablerolesunit",
+                "wrap",
             )
             assert family in (
                 "exact",
@@ -4994,9 +5036,34 @@ def test_source_program_table_names_shipped_sources():
                 assert (state_key, mode) in (("bf16", "varlen"), ("f32", "varlen"))
             if variant_name == "ibulk":
                 assert (state_key, mode) in (("bf16", "varlen"), ("f16", "varlen"))
-            if variant_name in ("tablefirst", "tableroles"):
+            if variant_name in (
+                "tablefirst",
+                "tableroles",
+                "tablefirstunit",
+                "tablerolesunit",
+            ):
                 assert family == "exactone" and mode == "varlen"
-            sm107_only = ("claim", "ibulk", "tailone", "tablefirst", "tableroles")
+            if variant_name == "zpf":
+                assert family == "exactfused" and mode == "batched"
+                assert state_key in ("bf16", "f32")
+            if variant_name == "unit":
+                assert family == "exactpre" and mode == "varlen"
+                assert state_key in ("bf16", "f32")
+            if variant_name == "wrap":
+                assert family == "exactpre" and mode == "varlen"
+                assert state_key in ("bf16", "f32")
+            sm107_only = (
+                "claim",
+                "ibulk",
+                "tailone",
+                "tablefirst",
+                "tableroles",
+                "zpf",
+                "unit",
+                "tablefirstunit",
+                "tablerolesunit",
+                "wrap",
+            )
             assert (variant_name in sm107_only) == (name in module._SM107_ONLY_PROGRAMS)
             smem_bytes = module._VARIANT_SMEM_BYTES[(family, variant_name)]
             assert (
@@ -5012,7 +5079,12 @@ def test_source_program_table_names_shipped_sources():
                     ("exactpre", "claim"): module._EXACTPRE_CLAIM_SMEM_BYTES,
                     ("exactpre", "ibulk"): module._EXACTPRE_IBULK_SMEM_BYTES,
                     ("exactpre", "tailone"): module._EXACTPRE_TAILONE_SMEM_BYTES,
+                    ("exactpre", "wrap"): module._EXACTPRE_TAILONE_SMEM_BYTES,
                     ("exactfused", "ibulk"): module._EXACTFUSED_IBULK_SMEM_BYTES,
+                    ("exactfused", "zpf"): module._EXACTFUSED_SMEM_BYTES,
+                    ("exactpre", "unit"): module._EXACTPRE_SMEM_BYTES,
+                    ("exactone", "tablefirstunit"): module._EXACTONE_SMEM_BYTES,
+                    ("exactone", "tablerolesunit"): module._EXACTONE_SMEM_BYTES,
                 }[(family, variant_name)]
             )
         assert program.variant == (variant[0] if variant else "")
@@ -6488,6 +6560,25 @@ def _state_key(state_dtype):
     return module._STATE_DTYPE_KEYS[state_dtype]
 
 
+def _fused_ring_program(module, state_dtype, mode, *, nchunks, has_z=True):
+    """The fused ring program (``exactfused``, variant ``""``) of a call on
+    this device: ``exactfused_<state>_<mode>``, or its z-prefetch program
+    (``_zpf``) where ``fused_z_prefetch_selected`` takes it (SM107 batched
+    calls with ``z`` of at least two chunks per item; bitwise the same
+    outputs)."""
+
+    name = f"exactfused_{_state_key(state_dtype)}_{mode}"
+    if module.fused_z_prefetch_selected(
+        capability=tuple(torch.cuda.get_device_capability()),
+        state_dtype=state_dtype,
+        mode_varlen=mode == "varlen",
+        has_z=has_z,
+        nchunks=nchunks,
+    ):
+        name += "_zpf"
+    return name
+
+
 def _forced_runs(monkeypatch, runner, tensors, arguments):
     """The same call on the forced exact scan (``never``), the forced
     look-back program (``always``) and the forced three-phase program
@@ -6766,7 +6857,17 @@ def test_cake_ssd_combined_chunk_parallel_is_bitwise_the_exact_scan(
         )
     else:
         family = "exactfused"
-    assert exact.program == f"{family}_{_state_key(state_dtype)}_{mode}"
+    expected_exact = (
+        _fused_ring_program(
+            module,
+            state_dtype,
+            mode,
+            nchunks=-(-max(lengths) // 128) if varlen else 1024 // 128,
+        )
+        if family == "exactfused"
+        else f"{family}_{_state_key(state_dtype)}_{mode}"
+    )
+    assert exact.program == expected_exact
     assert chunk_parallel.program == f"chunkpar_{_state_key(state_dtype)}_{mode}"
     assert three_phase.program == f"chunkpar3_{_state_key(state_dtype)}_{mode}"
     assert chunk_parallel.final.dtype == state_dtype
@@ -6895,9 +6996,23 @@ def test_cake_ssd_combined_chunk_parallel_checkpoints_are_bitwise_the_exact_scan
     exact_program = exact.program
     if form == "triple":
         exact_program = _without_table_form(
-            module, exact_program, state_dtype=state_dtype, num_sequences=len(lengths)
+            module,
+            exact_program,
+            state_dtype=state_dtype,
+            num_sequences=len(lengths),
+            total_tokens=sum(lengths),
         )
-    assert exact_program == f"{family}_{_state_key(state_dtype)}_{mode}"
+    expected_exact = (
+        _fused_ring_program(
+            module,
+            state_dtype,
+            mode,
+            nchunks=1024 // 128 if form == "batched" else -(-max(lengths) // 128),
+        )
+        if family == "exactfused"
+        else f"{family}_{_state_key(state_dtype)}_{mode}"
+    )
+    assert exact_program == expected_exact
     assert chunk_parallel.program == f"chunkpar_{_state_key(state_dtype)}_{mode}"
     assert three_phase.program == f"chunkpar3_{_state_key(state_dtype)}_{mode}"
     written = {slot for slot in slots if slot >= 0}
@@ -7001,7 +7116,9 @@ def test_cake_ssd_combined_auto_selects_three_phase_for_a_short_few_head_prefill
     assert cake.last_program_name == "chunkpar3_bf16_batched"
     monkeypatch.setenv(_CHUNK_PARALLEL_ENV, "never")
     out_exact, final_exact = runner.run(*tensors, **arguments)
-    assert cake.last_program_name == "exactfused_bf16_batched"
+    assert cake.last_program_name == _fused_ring_program(
+        module, torch.bfloat16, "batched", nchunks=2048 // 128
+    )
     assert out_exact.shape == out.shape and final_exact.shape == final.shape
     monkeypatch.setenv(_CHUNK_PARALLEL_ENV, "always")
     runner.run(*tensors, **arguments)
@@ -7020,12 +7137,15 @@ def test_cake_ssd_combined_auto_keeps_the_exact_scan_for_many_heads(monkeypatch)
     per-tile cost exceeds the scan's per-chunk cost."""
 
     _skip_unless_cake_arch()
+    module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
     constructor, tensors, arguments = _case(batch=1, seqlen=1024, nheads=128, ngroups=8)
     runner = SSDCombined(**constructor, backend="cake")
 
     out, final = runner.run(*tensors, **arguments)
 
-    assert runner._cake_runner.last_program_name == "exactfused_bf16_batched"
+    assert runner._cake_runner.last_program_name == _fused_ring_program(
+        module, torch.bfloat16, "batched", nchunks=1024 // 128
+    )
     assert tuple(out.shape) == (1, 1024, 128, 64)
     assert tuple(final.shape) == (1, 128, 64, 128)
 
@@ -7194,16 +7314,16 @@ def test_source_exact_scan_variant_programs():
                 assert a.main.module != b.main.module
     # the retained and the fused family: six ring programs and the five
     # ``_noring`` programs the variant rule can select; the fused family also
-    # the two sm_107a-only ``_ibulk`` programs
+    # the two sm_107a-only ``_ibulk`` and the two ``_zpf`` programs
     assert len([name for name in module._PROGRAMS if name.startswith("exact_")]) == 11
     assert (
-        len([name for name in module._PROGRAMS if name.startswith("exactfused_")]) == 13
+        len([name for name in module._PROGRAMS if name.startswith("exactfused_")]) == 15
     )
     # the two-kernel family: six ring and six ``_tail`` programs, no ``_noring``,
-    # and the sm_107a-only programs: two ``_claim``, two ``_ibulk`` and three
-    # ``_tailone``
+    # and the sm_107a-only programs: two ``_claim``, two ``_ibulk``, three
+    # ``_tailone``, two ``_unit`` and two ``_wrap``
     assert (
-        len([name for name in module._PROGRAMS if name.startswith("exactpre_")]) == 19
+        len([name for name in module._PROGRAMS if name.startswith("exactpre_")]) == 23
     )
     assert not any(name.endswith("_noring") for name in module._EXACTPRE_MODULES)
     assert len([name for name in module._PROGRAMS if name.startswith("chunkpar_")]) == 6
@@ -7217,11 +7337,12 @@ def test_source_exact_scan_variant_programs():
     )
     # The exactone programs: the SM103 render of the same five fused varlen
     # entries (one launch), their own device modules, and the sm_107a-only
-    # programs in the tablefirst / tableroles prologue forms.
+    # programs in the tablefirst / tableroles prologue forms and their three
+    # one-CTA-cluster twins.
     assert (
-        len([name for name in module._PROGRAMS if name.startswith("exactone_")]) == 11
+        len([name for name in module._PROGRAMS if name.startswith("exactone_")]) == 14
     )
-    assert len(module._PROGRAMS) == 71
+    assert len(module._PROGRAMS) == 80
 
 
 @pytest.mark.parametrize(
@@ -7426,11 +7547,18 @@ def test_source_sm107_exactone_table_rule():
         assert variant(grid=8, state_dtype=state_dtype) == "tablefirst"
         assert variant(grid=212, state_dtype=state_dtype) == "tableroles"
     # the programs it selects are exactly the sm_107a-only one-launch entries
-    assert {
+    # other than their one-CTA-cluster twins, each the twin of a selected program
+    exactone = {
+        name for name in module._SM107_ONLY_PROGRAMS if name.startswith("exactone_")
+    }
+    twins = {name for name in exactone if name.endswith("unit")}
+    selected = {
         module._program_name("exactone", state_dtype, True, form)
         for state_dtype in module._EXACTONE_TABLE_STATE_DTYPES
         for form in ("tablefirst", "tableroles")
-    } == {name for name in module._SM107_ONLY_PROGRAMS if name.startswith("exactone_")}
+    }
+    assert selected == exactone - twins
+    assert {name.removesuffix("unit") for name in twins} <= selected
 
 
 @pytest.mark.parametrize("arch", ("sm_103a", "sm_107a"))
@@ -7797,6 +7925,82 @@ def test_source_sm107_short_varlen_pair_calls_take_the_one_cta_pair_program(
     status = launch["main"]["preprocess_status"]
     assert tuple(status.shape) == (2 + 106 + 4,) and status.dtype == torch.int32
     assert launch["preprocess"]["preprocess_status"] is status
+
+
+@pytest.mark.parametrize("state", ("bf16", "f32"))
+@pytest.mark.parametrize("has_z", (False, True))
+@pytest.mark.parametrize(
+    ("num_seqs", "tokens", "nheads", "variant"),
+    (
+        # perf_varlen_32x32: 256 items of 32 chunks, a pair-rule call
+        (32, 4096, 8, "wrap"),
+        # 320 items of 32 chunks, a ring call
+        (20, 4096, 16, "wrap"),
+        # 448 items of 16 chunks
+        (56, 1950, 8, "wrap"),
+    ),
+)
+def test_source_sm107_long_varlen_calls_take_the_wrap_program(
+    monkeypatch, state, has_z, num_seqs, tokens, nheads, variant
+):
+    """On SM107 a packed-varlen call without z of 32 sequences x 4096 tokens
+    x 8 heads, 20 sequences x 4096 tokens x 16 heads or 56 sequences x 1950
+    tokens x 8 heads (256 / 320 items of 32 chunks, 448 items of 16 chunks on
+    212 SMs) runs the wrap program of its bf16 / f32 state on one CTA per
+    SM, ``run`` and ``prepare`` alike; its preprocess shares the runner's
+    status words (the slot ticket and the boundary bits).  The same calls
+    with z keep a program without the wrap plan."""
+
+    module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
+    state_dtype = {"bf16": torch.bfloat16, "f32": torch.float32}[state]
+    calls = []
+    runner = _cpu_forwarding_runner(
+        module,
+        monkeypatch,
+        calls,
+        nheads=nheads,
+        ngroups=8,
+        has_varlen=True,
+        has_initial_states=True,
+        has_z=has_z,
+        state_dtype=state_dtype,
+        arch="sm_107a",
+    )
+    monkeypatch.setattr(module, "_sm_count", lambda _: 212)
+    seqlen = num_seqs * tokens
+    x = torch.empty((1, seqlen, nheads, 64), dtype=torch.bfloat16)
+    dt = torch.empty((1, seqlen, nheads), dtype=torch.float32)
+    A = torch.empty((nheads,), dtype=torch.float32)
+    B = torch.empty((1, seqlen, 8, 128), dtype=torch.bfloat16)
+    C = torch.empty_like(B)
+    kwargs = {
+        "cu_seqlens": torch.arange(0, seqlen + 1, tokens, dtype=torch.int32),
+        "initial_states": torch.empty((num_seqs, nheads, 64, 128), dtype=state_dtype),
+    }
+    if has_z:
+        kwargs["z"] = torch.empty_like(x)
+    runner.run(x, dt, A, B, C, **kwargs)
+    ((name, launch),) = calls
+    monkeypatch.setattr(module, "_load_generated_program", lambda *_: None)
+    prepared = runner.prepare(x=x, dt=dt, A=A, B=B, C=C, **kwargs)
+    assert prepared.program_name == name
+    if has_z:
+        assert name.startswith(f"exactpre_{state}_varlen")
+        assert not name.endswith("_wrap")
+        return
+    assert name == f"exactpre_{state}_varlen_{variant}"
+    if variant == "wrap":
+        assert launch["main_grid"] == (module._wrap_grid_size(sm_count=212), 1, 1)
+        assert launch["main_grid"] == (212, 1, 1)
+        pairs = module._tail_grid_size(sm_count=212) // 2
+        status = launch["main"]["preprocess_status"]
+        assert tuple(status.shape) == (2 + pairs + (pairs + 31) // 32,)
+        assert status.dtype == torch.int32
+        assert launch["preprocess"]["preprocess_status"] is status
+    else:
+        items = num_seqs * nheads
+        grid = module._persistent_grid_size(total_work=items, sm_count=212)
+        assert launch["main_grid"] == (grid, 1, 1)
 
 
 def test_source_sm107_ibulk_rule():

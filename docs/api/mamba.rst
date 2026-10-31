@@ -44,6 +44,8 @@ stream.
 
     cake_causal_conv1d
     cake_causal_conv1d_kcp
+    cake_causal_conv1d_kcp_multi
+    KcpRecomputeHandle
     cake_causal_conv1d_train_forward
     cake_causal_conv1d_train_backward
     cake_causal_conv1d_train_backward_workspace_bytes

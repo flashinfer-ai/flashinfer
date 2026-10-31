@@ -40,10 +40,10 @@ SHARDS = ("12_1", "6_1")
 LENS = (100, 2300, 0, 303)
 
 
-def _geometry(name):
+def _geometry(name, **over):
     from flashinfer.qwen_3_8_block import Qwen38BlockGeometry
 
-    return Qwen38BlockGeometry(**GEOMETRIES[name])
+    return Qwen38BlockGeometry(**dict(GEOMETRIES[name], **over))
 
 
 def _plan(case, g, **kw):
@@ -170,6 +170,47 @@ def test_decode_matches_the_two_stage_oracle(name, q_len):
     assert completed == want, (completed, want)
     assert plan.supports(hidden_states=case.hidden_states, **case.decode_args())
     assert not plan.supports(hidden_states=case.hidden_states[:1], **case.decode_args())
+
+
+@pytest.mark.parametrize("q_len", [1, 4])
+def test_decode_over_an_e4m3_compressed_key_cache(q_len):
+    """The e4m3 compressed-key cache on the decode step (served since the 4c8e24355 re-vendor; ``Qwen38BlockGeometry.index_cache_dtype``):
+    the prefix primed through the vendored compress kernel's e4m3 store arm, the step's completed blocks bitwise that chain, the scorer's
+    e4m3 read arm against the two-stage oracle over the kernel's own e4m3 operands; the plan key carries the dtype."""
+    g = _geometry("24_2", index_cache_dtype=torch.float8_e4m3fn)
+    case = Qsa38PagedCase(g, LENS, q_len, page_size=16, seed=41)
+    assert (
+        case.index_kv_cache.dtype == torch.float8_e4m3fn
+        and case.cache_dtype == torch.float8_e4m3fn
+    )
+    case.prime()
+    plan = _plan(case, g)
+    assert (
+        plan.index_cache_dtype == torch.float8_e4m3fn
+        and plan.declaration["index_cache_dtype"] == torch.float8_e4m3fn
+    )
+    assert plan.index_compress_rounding == "single"
+    out = _run(plan, case)
+    stats, completed = _check_step(case, plan, out, f"decode e4m3 cache q{q_len}")
+    want = sum(
+        1 for L in LENS if L for j in range(q_len) if (L - q_len + j + 1) % 4 == 0
+    )
+    assert completed == want, (completed, want)
+    assert _qi(plan).dtype == torch.float8_e4m3fn
+    # a bf16-cache plan refuses the e4m3 buffer by dtype
+    bf = _plan(
+        Qsa38PagedCase(_geometry("24_2"), LENS, q_len, page_size=16, seed=41),
+        _geometry("24_2"),
+    )
+    with pytest.raises(ValueError, match="index_kv_cache must be torch.bfloat16"):
+        bf.run(
+            case.hidden_states,
+            None,
+            None,
+            case.weights38,
+            case.w_o,
+            **case.decode_args(),
+        )
 
 
 @pytest.mark.parametrize("name", SHARDS)

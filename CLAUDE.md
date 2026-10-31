@@ -246,8 +246,9 @@ or torchrun worker; launcher exit 1 alone is not evidence of an assertion failur
 All local worker ranks must finish, and at least one test must execute, to allow
 publication. A completed run with assertion failures remains eligible, while
 crashes, timeouts, and unfinished invocations do not. With the variable unset,
-reporting is disabled. The CPU suite above covers this contract without GPU
-dependencies.
+reporting is disabled. Missing JUnit output and file timeouts still fail the
+wrapper when reporting is disabled. The CPU suite above covers this contract
+without GPU dependencies.
 
 ### Skipping Tests Based on CUDA Architecture
 
@@ -969,7 +970,7 @@ Used by `flashinfer.trace` / `fi_trace`.
 | `FLASHINFER_SM90_CAKE_BF16_FUSED_TAIL` | `1` | `flashinfer/moe_ep/kernel_src/sm90/cake_bf16_megamoe/shim/cake_runner.py` | Fallback of the runner's `fused_combine_tail` keyword when it is `None`: `0` / `false` / `off` / `no` runs the vendored wait, reduce and ack combine-tail kernels with the per-round combine-inbox fill instead of the one-kernel fused tail. Bit-identical outputs; ranks may differ. The pre-reduced combine wires require the fused tail. |
 | `FLASHINFER_SM90_CAKE_BF16_FUSED_DISPATCH` | `1` | `flashinfer/moe_ep/kernel_src/sm90/cake_bf16_megamoe/shim/cake_runner.py` | Fallback of the runner's `fused_dispatch` keyword when it is `None`: `0` / `false` / `off` / `no` keeps the vendored three-kernel dispatch for small rounds instead of the single cooperative dispatch launch. Bit-identical outputs; ranks may differ. |
 | `FLASHINFER_SM90_CAKE_BF16_FUSED_DISPATCH_MAX_TOKENS` | `512` | `flashinfer/moe_ep/kernel_src/sm90/cake_bf16_megamoe/shim/cake_runner.py` | Fallback of the runner's `fused_dispatch_max_tokens` keyword when it is `None`: dedup rounds with at most this many tokens per rank (and `T * top_k <= 4096`) use the fused dispatch launch. Must be in `[1, 512]`. |
-| `FLASHINFER_SM90_CAKE_BF16_GRID_DISPATCH_MIN_TOKENS` | `513` | `flashinfer/moe_ep/kernel_src/sm90/cake_bf16_megamoe/shim/cake_runner.py` | Fallback of the runner's `grid_dispatch_min_tokens` keyword when it is `None`: dedup rounds with at least this many tokens per rank use the grid-strided single-launch dispatch instead of the vendored kernels; `0` disables it. Must be `>= 0`. Bit-identical outputs; ranks may differ. |
+| `FLASHINFER_SM90_CAKE_BF16_GRID_DISPATCH_MIN_TOKENS` | unset (`512` at EP 8, `513` at other EP sizes) | `flashinfer/moe_ep/kernel_src/sm90/cake_bf16_megamoe/shim/cake_runner.py` | Fallback of the runner's `grid_dispatch_min_tokens` keyword when it is `None`: dedup rounds with at least this many tokens per rank use the grid-strided single-launch dispatch instead of the vendored kernels; `0` disables it. Must be `>= 0`. Bit-identical outputs; ranks may differ. |
 | `FLASHINFER_SM90_CAKE_BF16_PDL` | `6` (FC1 and FC2) | `flashinfer/moe_ep/kernel_src/sm90/cake_bf16_megamoe/shim/cake_runner.py` | Fallback of the runner's `pdl` keyword when it is `None`: which kernels of the round get a programmatic dependent launch. `0` / `false` / `off` / `no` none, `1` / `true` / `on` / `yes` all, or an integer mask of compact `1`, FC1 `2`, FC2 `4`, combine publish `8`, combine tail `16`. |
 | `FLASHINFER_SM90_CAKE_BF16_PDL_LATE` | `1` | `flashinfer/moe_ep/kernel_src/sm90/cake_bf16_megamoe/shim/cake_runner.py` | Fallback of the runner's `pdl_late` keyword when it is `None`: `1` lets the PDL dependents of the package's small kernels be scheduled only when those kernels exit; `0` / `false` / `off` / `no` triggers them right after their own grid-dependency wait. |
 | `FLASHINFER_SM90_CAKE_BF16_PER_ROUTE_PUBLISH_PDL` | `1` | `flashinfer/moe_ep/kernel_src/sm90/cake_bf16_megamoe/shim/cake_runner.py` | Fallback of the runner's `per_route_publish_pdl` keyword when it is `None`: with the per-route combine wire, `1` launches the combine publish with PDL as if bit `8` were in the `FLASHINFER_SM90_CAKE_BF16_PDL` mask; `0`, `false`, `off`, `no` or empty does not. Pipes on the pre-reduced wires are unaffected. |

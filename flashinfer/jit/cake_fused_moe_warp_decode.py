@@ -72,9 +72,10 @@ _COMMON_SOURCES: tuple[str, ...] = (
     "cake_warp_decode_b0e329ce4c715a895df4_kernel.cu",
     "cake_warp_decode_b13a3c739fad28717595_kernel.cu",
     "cake_warp_decode_cd21fb851016fd6c8700_kernel.cu",
-    "cake_warp_decode_de0e5a68a49864417599_kernel.cu",
     "cake_warp_decode_dec95a54bfb9b2c25e78_kernel.cu",
     "cake_warp_decode_ecc887263394f9e50152_kernel.cu",
+    "cake_warp_decode_f98d7be305512cc51f52_kernel.cu",
+    "cake_warp_decode_fa70513ac950a52c5297_kernel.cu",
     "cake_warp_decode_fab66ea04cef9673f6d8_kernel.cu",
 )
 _SM100A_SOURCES: tuple[str, ...] = (

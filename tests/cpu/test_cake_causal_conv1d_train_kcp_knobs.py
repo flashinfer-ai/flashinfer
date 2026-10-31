@@ -263,3 +263,126 @@ def test_host_trim_ffi_device_and_cpu_refusal(monkeypatch) -> None:
     with pytest.raises(ValueError, match="CUDA"):
         conv_kcp._kcp_forward(x, w, ctx)
     conv_kcp.host_cache_clear()
+
+
+# ----------------------------------------------------------------------------------------------------------------
+# Recompute handle (issues #7815 / #7818): the handle object, the phase helper and the entry rules (no kernel runs).
+
+
+@pytest.mark.cpu_only
+def test_recompute_handle_object() -> None:
+    h = conv_kcp.KcpRecomputeHandle()
+    assert conv_kcp.KcpRecomputeHandle.__slots__ == ("entries",)
+    assert h.entries == {} and h.nbytes() == 0
+    with pytest.raises(AttributeError):
+        h.other = 1
+    a = torch.zeros(3, 16, dtype=torch.bfloat16)
+    h.entries["conv"] = {"hist": a, "shape": (3, 16)}
+    h.entries["gdn"] = {"S_in": torch.zeros(2, dtype=torch.float32), "pair": (a, 1)}
+    assert h.nbytes() == 3 * 16 * 2 + 2 * 4  # distinct tensors only
+    h.clear()
+    assert h.entries == {} and h.nbytes() == 0
+    assert conv_kcp.HANDLE_KEY == "conv"
+    assert {"KcpRecomputeHandle", "HANDLE_KEY"} <= set(conv_kcp.__all__)
+
+
+@pytest.mark.cpu_only
+def test_recompute_handle_phase_and_entry_rules() -> None:
+    """Outside the backward: no entry -> original forward (None), an entry -> raise.  Inside the backward: an entry
+    -> the recompute (the entry, not popped), no entry -> an original forward too (nested regions)."""
+    assert conv_kcp._kcp_in_backward() is False
+    seen = {}
+
+    class Probe(torch.autograd.Function):
+        @staticmethod
+        def forward(fctx, t):
+            return t.clone()
+
+        @staticmethod
+        def backward(fctx, g):
+            seen["in_backward"] = conv_kcp._kcp_in_backward()
+            seen["empty"] = conv_kcp._handle_lookup(conv_kcp.KcpRecomputeHandle())
+            seen["entry"] = conv_kcp._handle_lookup(full)
+            return g
+
+    full = conv_kcp.KcpRecomputeHandle()
+    full.entries["conv"] = {"hist": torch.zeros(1, 8, dtype=torch.bfloat16)}
+    t = torch.zeros(4, requires_grad=True)
+    Probe.apply(t).sum().backward()
+    assert seen["in_backward"] is True
+    assert seen["empty"] is None
+    assert seen["entry"] is full.entries["conv"] and "conv" in full.entries
+    assert conv_kcp._handle_lookup(conv_kcp.KcpRecomputeHandle()) is None
+    with pytest.raises(RuntimeError, match="micro-step"):
+        conv_kcp._handle_lookup(full)
+    with pytest.raises(TypeError, match="entries"):
+        conv_kcp._handle_lookup(object())
+    with pytest.raises(TypeError, match="entries"):
+        conv_kcp._handle_lookup(types.SimpleNamespace(entries=[]))
+
+
+@pytest.mark.cpu_only
+def test_recompute_handle_needs_the_graph_task_binding(monkeypatch) -> None:
+    monkeypatch.setattr(conv_kcp, "_GRAPH_TASK_ID_BINDING", None)
+    monkeypatch.setattr(conv_kcp, "_GRAPH_TASK_ID_USABLE", None)
+    with pytest.raises(RuntimeError, match="_current_graph_task_id"):
+        conv_kcp._handle_lookup(conv_kcp.KcpRecomputeHandle())
+    with pytest.raises(RuntimeError, match="_current_graph_task_id"):
+        conv_kcp._kcp_in_backward()
+
+
+@pytest.mark.cpu_only
+def test_recompute_handle_hist_validation() -> None:
+    ctx = types.SimpleNamespace()
+    x = torch.zeros(5, 16, dtype=torch.bfloat16)
+    hist = torch.zeros(3, 16, dtype=torch.bfloat16)
+    entry = {
+        "hist": hist,
+        "shape": (3, 16),
+        "dtype": torch.bfloat16,
+        "device": hist.device,
+        "ctx": ctx,
+        "key": (5, 16),
+    }
+    assert conv_kcp._handle_hist(entry, x, ctx) is hist
+    assert conv_kcp._handle_hist(entry, x.view(1, 5, 16), ctx) is hist
+    for change in (
+        {"ctx": types.SimpleNamespace()},
+        {"key": (4, 16)},
+        {"shape": (2, 16)},
+        {"dtype": torch.float32},
+        {"hist": hist.float()},
+        {"hist": None},
+    ):
+        with pytest.raises(ValueError, match="recompute_handle"):
+            conv_kcp._handle_hist({**entry, **change}, x, ctx)
+    with pytest.raises(ValueError, match="recompute_handle"):
+        conv_kcp._handle_hist(entry, torch.zeros(5, 8, dtype=torch.bfloat16), ctx)
+
+
+@pytest.mark.cpu_only
+def test_facade_reexports_the_handle_lazily() -> None:
+    """``flashinfer.cake_causal_conv1d_train.KcpRecomputeHandle`` is the backend's class; importing the facade does not
+    import the KCP host modules (``kcp`` imports torch.distributed; ``kcp_jit``) -- checked in a fresh interpreter;
+    the facade's KCP entry carries the keyword-only ``recompute_handle=None``."""
+    import subprocess
+    import sys
+
+    code = (
+        "import inspect, sys\n"
+        "import flashinfer.cake_causal_conv1d_train as f\n"
+        "kcp = 'flashinfer.cake_causal_conv1d_train_backend.kcp'\n"
+        "jit = 'flashinfer.cake_causal_conv1d_train_backend.kcp_jit'\n"
+        "assert kcp not in sys.modules and jit not in sys.modules, sorted(m for m in sys.modules if 'kcp' in m)\n"
+        "p = inspect.signature(f.cake_causal_conv1d_kcp).parameters['recompute_handle']\n"
+        "assert p.kind is inspect.Parameter.KEYWORD_ONLY and p.default is None\n"
+        "assert kcp not in sys.modules\n"
+        "from flashinfer.cake_causal_conv1d_train import KcpRecomputeHandle\n"
+        "from flashinfer.cake_causal_conv1d_train_backend.kcp import KcpRecomputeHandle as B\n"
+        "assert KcpRecomputeHandle is B and 'KcpRecomputeHandle' in f.__all__\n"
+        "print('FACADE_IMPORT_OK')\n"
+    )
+    r = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, timeout=600
+    )
+    assert r.returncode == 0 and "FACADE_IMPORT_OK" in r.stdout, (r.stdout, r.stderr)

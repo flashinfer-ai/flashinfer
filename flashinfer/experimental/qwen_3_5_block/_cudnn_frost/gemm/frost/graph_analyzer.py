@@ -1,18 +1,15 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: MIT
 
-"""Analyze a user-built ``cudnn.pygraph`` and produce a ``FusionChain``.
-
-``cudnn.pygraph`` is the Python-native graph IR: it records its op DAG directly,
-exposed via ``graph.nodes`` / ``graph.tensors``. ``analyze(g)`` reads that IR, so a
-graph is analyzable whenever it is built — no construction-time hook required.
-"""
+"""Analyze a user-built ``cudnn.pygraph`` and produce a ``FusionChain``."""
 
 from __future__ import annotations
 
 import logging
-import threading
-from dataclasses import dataclass, field
+from collections import deque
+from dataclasses import dataclass, field, replace
+from functools import lru_cache
+from math import isfinite
 from typing import Any
 
 import flashinfer.experimental.qwen_3_5_block._cudnn_frost as cudnn
@@ -105,6 +102,9 @@ _BINARY_OP_MAP: dict[str, str] = {
 
 _POINTWISE_ATTR_KEYS = ("negative_slope", "lower_clip", "upper_clip", "swish_beta", "axis")
 
+# Mainloop attribute support is deliberately narrower than the epilogue's.
+_MAINLOOP_POINTWISE_ATTR_KEYS = {"leaky_relu": frozenset({"negative_slope"})}
+
 
 # Internal recording state, attached to each cudnn.pygraph instance
 
@@ -132,8 +132,6 @@ class _RecordedOp:
     top_k: int = 1
     op_attrs: tuple = ()  # pointwise scalar attrs (negative_slope/clips/swish_beta/axis)
     reduction_mode: str | None = None  # "add"/"amax"/"max"/"min"; None otherwise
-    # Optional groupOffset input for grouped reductions / grouped col quant
-    # (MoE: == first_token_offset).
     group_offset: int | None = None
 
 
@@ -147,21 +145,10 @@ class _TensorMeta:
     # SF reorder layout name (e.g. "F8_128x4") or None for the default (NONE).
     reordering: str | None = None
     alignment_value: int = 1
-    # Strong ref to the cuDNN tensor object, used to bind each role for the
-    # variant-pack dict (uid / name / object) instead of positional args.
     tensor: Any = None
-
-
-# The native tensor mirrors set_output / set_data_type / set_dim / set_reordering_type
-# onto its own attributes; these side tables (keyed by id(tensor)) carry them into
-# the analyzer, repopulated from graph.nodes each analyze (see _state_from_graph).
-_TENSOR_OUTPUT_FLAG: dict[int, bool] = {}
-_TENSOR_EXPLICIT_DTYPE: dict[int, Any] = {}
-_TENSOR_DIM_OVERRIDE: dict[int, tuple[int, ...]] = {}
-_TENSOR_REORDERING_OVERRIDE: dict[int, str | None] = {}
-
-# The side tables above are module-global; serialize the analyze path around them.
-_ANALYZE_LOCK = threading.RLock()
+    output_index: int | None = None
+    explicit_dtype: Any = None
+    dim_override: tuple[int, ...] | None = None
 
 
 # Variant-pack binding — maps each graph role to its cuDNN tensor
@@ -169,15 +156,7 @@ _ANALYZE_LOCK = threading.RLock()
 
 @dataclass
 class GemmBinding:
-    """Maps each graph role to its cuDNN tensor so a compiled kernel takes a
-    variant-pack dict (keyed by tensor object / uid / name) not positional args.
-
-    Operand lists are in kernel distinct-slot order; ``outputs`` in
-    :pyattr:`FusionChain.outputs` slot order (recorder order); ``aux`` in
-    :pyattr:`FusionChain.aux_tensors` order. Block-scale fills ``sfa/sfb_operands``
-    parallel to ``a/b_operands``; MoE fills ``first_token_offset``. Routing modes
-    bind ``token_index``; SCATTER/COMBINE also bind ``token_ks``, and COMBINE
-    binds ``top_k_scores`` in original token/slot order."""
+    """Maps each graph role to its cuDNN tensor so a compiled kernel takes a variant-pack dict (keyed by tensor object / uid / name) not positional args."""
 
     a_operands: list[Any] = field(default_factory=list)
     b_operands: list[Any] = field(default_factory=list)
@@ -191,6 +170,7 @@ class GemmBinding:
     top_k_scores: Any = None
 
     def bound_tensors(self) -> list[Any]:
+        """List tensors bound by this GEMM plan."""
         ts = [
             *self.a_operands,
             *self.b_operands,
@@ -249,8 +229,6 @@ def _make_multi_binding(
         objs = []
         for i in ids:
             sid = caps[i].get("sf_id")
-            # A fake-dequant side has complete logical SF metadata (so the
-            # ordinary registry key decides support) but no runtime SF tensor.
             if sid is not None:
                 objs.append(meta[sid].tensor)
         return objs
@@ -270,6 +248,7 @@ def _make_multi_binding(
 
 
 def _safe_name(t: Any) -> str | None:
+    """Return a tensor name when available."""
     try:
         nm = t.get_name()
     except Exception:  # noqa: BLE001 — unbuilt tensors can throw
@@ -278,6 +257,7 @@ def _safe_name(t: Any) -> str | None:
 
 
 def _safe_uid(t: Any) -> int | None:
+    """Return a tensor UID when available."""
     try:
         uid = t.get_uid()
     except Exception:  # noqa: BLE001
@@ -287,10 +267,7 @@ def _safe_uid(t: Any) -> int | None:
 
 
 def resolve_variant_pack(variant_pack: dict, binding: GemmBinding) -> dict[int, Any]:
-    """Resolve a ``{key: buffer}`` variant pack to ``{id(bound_tensor): buffer}``.
-
-    Keys may be the cuDNN tensor object, its uid (once positive), or its name.
-    Raises on an unknown / unmatched key."""
+    """Resolve a ``{key: buffer}`` variant pack to ``{id(bound_tensor): buffer}``."""
     if not isinstance(variant_pack, dict):
         raise TypeError("compiled kernels are called with a variant-pack dict " "{cudnn_tensor | uid | name: buffer}; got " f"{type(variant_pack).__name__}")
     bound = binding.bound_tensors()
@@ -369,9 +346,7 @@ def _reordering_name(t: Any) -> "str | None":
 
 
 def _node_to_recorded_op(node: Any) -> "_RecordedOp | None":
-    """Translate one native-IR ``Node`` into a :class:`_RecordedOp`, or None when
-    this family has no lowering for that node type. The caller must DECLINE on
-    None — never skip the node."""
+    """Translate one native-IR ``Node`` into a :class:`_RecordedOp`, or None when this family has no lowering for that node type."""
     node_type = node.node_type.name
     name = node.name
     compute = _map_dtype(node.compute_data_type)
@@ -470,14 +445,7 @@ def _node_to_recorded_op(node: Any) -> "_RecordedOp | None":
 
 
 def _state_from_graph(graph: cudnn.pygraph) -> dict:
-    """Read a Python-native ``cudnn.pygraph`` into the analyzer's working state:
-    the op list + per-tensor metadata + graph dtype defaults, plus the tensor-flag
-    side tables. The native graph exposes its op DAG directly via ``graph.nodes``,
-    so nothing is recorded at construction time."""
-    _TENSOR_OUTPUT_FLAG.clear()
-    _TENSOR_EXPLICIT_DTYPE.clear()
-    _TENSOR_DIM_OVERRIDE.clear()
-    _TENSOR_REORDERING_OVERRIDE.clear()
+    """Read a Python-native ``cudnn.pygraph`` into the analyzer's working state:"""
 
     ctx = graph.context
     raw_io = getattr(ctx, "io_data_type", None)
@@ -521,11 +489,9 @@ def _state_from_graph(graph: cudnn.pygraph) -> dict:
             tensor=t,
         )
         if getattr(t, "data_type", None) is not None:
-            _TENSOR_EXPLICIT_DTYPE[id(t)] = t.get_data_type()
+            tensor_meta[id(t)].explicit_dtype = t.get_data_type()
         if getattr(t, "dim_assigned", False) and id(t) in produced:
-            _TENSOR_DIM_OVERRIDE[id(t)] = tuple(t.dim)
-        if reordering is not None:
-            _TENSOR_REORDERING_OVERRIDE[id(t)] = reordering
+            tensor_meta[id(t)].dim_override = tuple(t.dim)
 
     for node in nodes:
         for t in node.inputs.values():
@@ -533,21 +499,18 @@ def _state_from_graph(graph: cudnn.pygraph) -> dict:
         for t in node.outputs.values():
             _register(t)
 
-    # Materialized (non-virtual) op outputs, in node order.
+    output_index = 0
     for node in nodes:
         for out in node.outputs.values():
             if out is not None and not out.is_virtual:
-                _TENSOR_OUTPUT_FLAG[id(out)] = True
+                if tensor_meta[id(out)].output_index is None:
+                    tensor_meta[id(out)].output_index = output_index
+                    output_index += 1
 
     ops: list[_RecordedOp] = []
     for node in nodes:
         recorded = _node_to_recorded_op(node)
         if recorded is None:
-            # Declining beats ignoring. Dropping an unrecognized node compiled a
-            # SUBGRAPH and then asked the caller for buffers it never bound
-            # (matmul -> reshape died in execute with "missing buffers for
-            # ['mm::C']"), and because the engine had already claimed the graph
-            # there was no backend left to fall back to.
             raise NotImplementedError(f"frost_gemm: no lowering for node type {node.node_type.name}")
         ops.append(recorded)
 
@@ -579,12 +542,6 @@ def _graph_has_gemm(graph: cudnn.pygraph) -> bool:
     return False
 
 
-# The two halves the GEMM engine (cudnn/gemm/frost/engine.py) is built from:
-# probe_gemm_plan = eligibility, no compile; build_gemm_plan = the JIT, run when
-# the plan walk reaches this engine. Forced-config callers use
-# jit_from_cudnn_graph directly.
-
-
 def probe_gemm_plan(graph: cudnn.pygraph) -> bool:
     """Cheap eligibility check for the GEMM engine (analyze + support gates, NO
     ``cute.compile``). Never raises (a probe must not break the native path)."""
@@ -606,22 +563,13 @@ def probe_gemm_plan(graph: cudnn.pygraph) -> bool:
 
 
 def build_gemm_plan(graph: cudnn.pygraph, knobs=None):
-    """Analyze + JIT the graph into a compiled GEMM plan.
-
-    ``knobs`` (:class:`~cudnn.gemm.frost.knobs.GemmKnobs`) pins the tile config
-    a recorded plan ran with; the explicit config is re-gated through
-    :func:`~cudnn.gemm.frost.compiler.probe_chain` so a stale or foreign record
-    declines instead of compiling something the gates never admitted. Without
-    knobs the automatic strategy is used, as before.
-
-    Returns a callable :class:`CompiledFusedGemm`; raises ``NotImplementedError`` /
-    ``ValueError`` (type + message preserved) on rejection."""
+    """Analyze + JIT the graph into a compiled GEMM plan."""
     if not _graph_has_gemm(graph):
         raise ValueError("cudnn.gemm.frost: graph has no matmul / moe_grouped_matmul node; nothing to compile")
-    from .compiler import _graph_dynamic_shapes, jit_from_cudnn_graph, plan_config, probe_chain
+    from .compiler import _graph_dynamic_shapes, _graph_shapes_fixed, jit_from_cudnn_graph, plan_config, probe_chain
 
     chain = analyze(graph)
-    config = plan_config(chain, dynamic_shapes=_graph_dynamic_shapes(graph), knobs=knobs)
+    config = plan_config(chain, dynamic_shapes=_graph_dynamic_shapes(graph), knobs=knobs, shapes_fixed=_graph_shapes_fixed(graph))
     if knobs is not None:
         probe_chain(chain, config)
     return jit_from_cudnn_graph(graph, config=config)
@@ -650,6 +598,7 @@ def _infer_bcast_mode(matmul_out_dim: tuple[int, ...], aux_dim: tuple[int, ...])
 
 
 def _infer_a_major(dim: tuple[int, ...], stride: tuple[int, ...]) -> AMajor:
+    """Infer the A operand major axis from graph strides."""
     if stride[-1] == 1:
         return "k"
     if stride[-2] == 1:
@@ -658,6 +607,7 @@ def _infer_a_major(dim: tuple[int, ...], stride: tuple[int, ...]) -> AMajor:
 
 
 def _infer_b_major(dim: tuple[int, ...], stride: tuple[int, ...]) -> BMajor:
+    """Infer the B operand major axis from graph strides."""
     if stride[-2] == 1:
         return "k"
     if stride[-1] == 1:
@@ -665,18 +615,25 @@ def _infer_b_major(dim: tuple[int, ...], stride: tuple[int, ...]) -> BMajor:
     raise ValueError(f"B must be K-major or N-major in the inner (K,N) plane; " f"got dim={dim} stride={stride}")
 
 
+def _is_output(meta: dict[int, _TensorMeta], tensor_id: int) -> bool:
+    item = meta.get(tensor_id)
+    return item is not None and item.output_index is not None
+
+
+def _materialized_output_ids(meta: dict[int, _TensorMeta]) -> list[int]:
+    """Collect materialized tensor IDs in graph order."""
+    return [tid for _, tid in sorted((item.output_index, tid) for tid, item in meta.items() if item.output_index is not None)]
+
+
 def _resolve_out_dtype(
     out_id: int,
     output_tensor: Any,
     io_dtype: Dtype,
     intermediate_dtype: Dtype,
+    meta: dict[int, _TensorMeta],
 ) -> Dtype:
-    """Declared data_type of a chain tensor: explicit set_data_type, else io_dtype
-    if a materialized output, else intermediate_dtype.
-
-    The running value is rounded to this dtype before downstream ops read it, so a
-    narrow declared dtype loses precision on purpose (matches cuDNN, even virtual)."""
-    explicit = _TENSOR_EXPLICIT_DTYPE.get(out_id)
+    """Declared data_type of a chain tensor: explicit set_data_type, else io_dtype if a materialized output, else intermediate_dtype."""
+    explicit = meta[out_id].explicit_dtype
     if explicit is not None and explicit in _DTYPE_FROM_CUDNN:
         return _DTYPE_FROM_CUDNN[explicit]
     if output_tensor is not None:
@@ -686,7 +643,7 @@ def _resolve_out_dtype(
             dt = None
         if dt is not None and dt != cudnn.data_type.NOT_SET and dt in _DTYPE_FROM_CUDNN:
             return _DTYPE_FROM_CUDNN[dt]
-    if _TENSOR_OUTPUT_FLAG.get(out_id, False):
+    if _is_output(meta, out_id):
         return io_dtype
     return intermediate_dtype
 
@@ -707,15 +664,13 @@ def _collect_quants(
     fto_id: int | None = None,
     num_groups: int | None = None,
 ) -> tuple[list[BlockQuantizeSpec], list["_RecordedOp"], list[Dtype], list[Any]]:
-    """Fold every reachable ``block_scale_quantize`` whose data output is
-    materialized into a :class:`BlockQuantizeSpec`. Returns (specs, recorded
-    ops, data dtypes, scale output tensors), all in graph-node order."""
+    """Fold every reachable ``block_scale_quantize`` whose data output is materialized into a :class:`BlockQuantizeSpec`."""
     quants: list[BlockQuantizeSpec] = []
     recs: list[_RecordedOp] = []
     data_dtypes: list[Dtype] = []
     scale_objs: list[Any] = []
     for qop in reachable_quant_ops:
-        if not _TENSOR_OUTPUT_FLAG.get(qop.output, False):
+        if not _is_output(meta, qop.output):
             continue
         (input_id,) = qop.inputs
         if input_id in op_position_by_id:
@@ -726,13 +681,10 @@ def _collect_quants(
             raise ValueError(f"block_scale_quantize {qop.op_name!r} input must be a fusion-op output " f"of the shared {err_ctx} epilogue")
         if qop.scale_output is None or qop.scale_output_tensor is None:
             raise AssertionError("block_scale_quantize recorded without scale output")
-        if not _TENSOR_OUTPUT_FLAG.get(qop.scale_output, False):
+        if not _is_output(meta, qop.scale_output):
             raise ValueError("block_scale_quantize scale output must be materialized with set_output(True)")
-        scale_dtype = _resolve_out_dtype(qop.scale_output, qop.scale_output_tensor, io_dtype, intermediate_dtype)
-        scale_reorder = _TENSOR_REORDERING_OVERRIDE.get(qop.scale_output)
-        if scale_reorder is None:
-            scale_meta = meta.get(qop.scale_output)
-            scale_reorder = scale_meta.reordering if scale_meta is not None else None
+        scale_dtype = _resolve_out_dtype(qop.scale_output, qop.scale_output_tensor, io_dtype, intermediate_dtype, meta)
+        scale_reorder = meta[qop.scale_output].reordering
         bs = int(qop.block_size[0]) if qop.block_size else 0
         if bs <= 0:
             raise ValueError(f"block_scale_quantize block_size must be positive; got {bs}")
@@ -768,7 +720,7 @@ def _collect_quants(
                     _round_up(logical_scale_dim[1], 128),
                     _round_up(logical_scale_dim[2], 4),
                 )
-        scale_dim = _TENSOR_DIM_OVERRIDE.get(qop.scale_output)
+        scale_dim = meta[qop.scale_output].dim_override
         if scale_dim is None:
             scale_meta = meta.get(qop.scale_output)
             scale_dim = scale_meta.dim if scale_meta is not None else ()
@@ -778,12 +730,9 @@ def _collect_quants(
             raise ValueError(f"block_scale_quantize scale output must be rank-3; got {scale_dim}")
         grouped_row = grouped_by_moe and axis != 1
         if grouped_row:
-            # Runtime fto values live on device. Size for the exact worst-case
-            # partition at graph time rather than synchronizing fto or relying
-            # on an execute-time caller precondition.
             if num_groups is None:
                 raise AssertionError("grouped row block quantize recorded without a MoE group count")
-            if qop.scale_output not in _TENSOR_DIM_OVERRIDE:
+            if meta[qop.scale_output].dim_override is None:
                 raise ValueError(
                     f"block_scale_quantize {qop.op_name!r} grouped row scale output " "requires an explicit scale dim [1, segmented_rows, padded_N_blocks]"
                 )
@@ -829,14 +778,7 @@ def _collect_quants(
 
 
 def _dedup_operand(pid: int, cap: dict, ids: list[int], caps: dict[int, dict], side: str, meta: "dict[int, _TensorMeta]") -> int:
-    """Index of this operand among the distinct ones, registering it on first sight.
-
-    Dedup is by the packed-DATA tensor and the scale factor travels with it, so a
-    second capture of the same data must describe the SAME dequantize. Two
-    dequantizes over one packed tensor -- different SF, block size, or declared
-    output dtype -- would otherwise collapse onto the first capture and run every
-    GEMM with it, which is a wrong answer the variant pack cannot even express
-    (the dropped SF is not a graph input)."""
+    """Index of this operand among the distinct ones, registering it on first sight."""
     prev = caps.get(pid)
     if prev is None:
         ids.append(pid)
@@ -863,12 +805,7 @@ def _normalize_one_sided_block_scale(
     a_caps: "dict[int, dict]",
     b_caps: "dict[int, dict]",
 ) -> None:
-    """Give a raw-FP8 peer logical scale metadata copied from one real dequant.
-
-    This is shared by dense and MoE analysis.  The fake mark is intentionally
-    codegen-only; registry support continues to be decided from the normalized
-    ordinary block-scale MMA key.
-    """
+    """Give a raw-FP8 peer logical scale metadata copied from one real dequant."""
     raw_fp8_dtypes = {"fp8_e4m3", "fp8_e5m2"}
 
     def _fake_from(peer: dict, *, is_a: bool) -> dict:
@@ -899,14 +836,7 @@ def _require_materialized_block_scale_inputs(
     ops: list[_RecordedOp],
     meta: dict[int, _TensorMeta],
 ) -> None:
-    """Require dequantized operands to come from the caller's variant pack.
-
-    FROST folds ``block_scale_dequantize`` into the GEMM.  It does not execute
-    an upstream quantizer, so accepting virtual ``block_scale_quantize``
-    outputs here would produce a plan whose packed data and scales have no
-    runtime binding.  Standalone quantize callers materialize both tensors and
-    pass them as ordinary graph inputs instead.
-    """
+    """Require dequantized operands to come from the caller's variant pack."""
 
     data_meta = meta[data_id]
     sf_meta = meta[sf_id]
@@ -922,258 +852,65 @@ def _require_materialized_block_scale_inputs(
     raise NotImplementedError("block-scale matmul requires its packed data and scale-factor tensors " "to be non-virtual materialized graph inputs")
 
 
-def _build_multi_moe_chain(
-    moe_ops: list[_RecordedOp],
+@dataclass
+class _EpilogueDag:
+    """Shared pointwise DAG and producer references for dense and grouped GEMMs."""
+
+    gemm_indices: dict[int, int]
+    positions: dict[int, int]
+    ops: list[FusionOp]
+    quant_ops: list[_RecordedOp]
+    recorded: dict[int, _RecordedOp]
+
+    def source_ref(self, tensor_id: int) -> int:
+        if tensor_id in self.gemm_indices:
+            return gemm_source(self.gemm_indices[tensor_id])
+        return self.positions[tensor_id]
+
+
+def _build_epilogue_dag(
+    anchors: list[_RecordedOp],
     ops: list[_RecordedOp],
     meta: dict[int, _TensorMeta],
+    matmul_out_dim: tuple[int, int, int],
     io_dtype: Dtype,
     intermediate_dtype: Dtype,
     compute_dtype: Dtype,
-) -> FusionChain:
-    """Build a FusionChain for K >= 1 MoE grouped matmuls sharing one
-    ``first_token_offset`` and one pointwise epilogue DAG (the unified builder
-    for every MoE graph; e.g. grouped SwiGLU).
-
-    All GEMMs must share the routed-group layout (same fto), shape / major / dtype,
-    and expert count. Operands deduped by tensor id (shared token → one A operand).
-    K == 1 additionally supports: no epilogue at all (raw MoE output alone)
-    and the raw output as quant source. Forward NONE/GATHER/SCATTER, no mainloop
-    fusion; for K > 1 every output must be a fusion op or a block_scale_quantize
-    fed by one. Block-scale supported (dequant folds into a shared
-    :class:`BlockScaleSpec`)."""
-    from .fusion_ir import BlockQuantizeSpec, BlockScaleSpec, MoeSpec
-
-    if any(op.cudnn_name == "matmul" for op in ops):
-        raise ValueError("a MoE grouped matmul graph cannot also contain a plain matmul; " "mixed MoE + matmul graphs are out of POC scope")
-    combine = moe_ops[0].moe_mode == "combine"
-    if combine and (len(moe_ops) != 1 or any(op.cudnn_name not in ("moe_grouped_matmul", "block_scale_dequantize") for op in ops)):
-        raise NotImplementedError("MoE COMBINE currently requires one GEMM with no post-combine operations")
-    for moe in moe_ops:
-        if moe.top_k_scores is not None and moe.moe_mode != "combine":
-            raise ValueError("top_k_scores is only valid for MoE COMBINE")
-        if moe.moe_mode not in ("none", "gather", "scatter", "combine"):
-            raise NotImplementedError(f"MoE grouped matmul mode {moe.moe_mode!r} is unsupported")
-        if (moe.moe_mode, moe.token_index, moe.token_ks, moe.top_k) != (moe_ops[0].moe_mode, moe_ops[0].token_index, moe_ops[0].token_ks, moe_ops[0].top_k):
-            raise ValueError("parallel MoE grouped matmuls must share the same mode, token_index, token_ks and top_k")
-    index_meta = None
-    ks_meta = scores_meta = None
-    if moe_ops[0].moe_mode in ("gather", "scatter", "combine"):
-        mode = moe_ops[0].moe_mode.upper()
-        index_meta = meta.get(moe_ops[0].token_index)
-        if index_meta is None:
-            raise ValueError(f"MoE {mode} requires token_index")
-        if len(index_meta.dim) != 3 or index_meta.dim[0] != 1 or index_meta.dim[2] != 1 or index_meta.dim[1] < 1:
-            raise ValueError(f"MoE {mode} token_index must have shape [1, routed_rows, 1]")
-        if index_meta.dtype != "int32" or index_meta.stride[1] != 1:
-            raise NotImplementedError(f"MoE {mode} token_index must be INT32 with contiguous routed rows")
-        if mode in ("SCATTER", "COMBINE"):
-            ks_meta = meta.get(moe_ops[0].token_ks)
-            if ks_meta is None or ks_meta.dim != index_meta.dim:
-                raise ValueError(f"MoE {mode} token_ks must match token_index shape [1, routed_rows, 1]")
-            if ks_meta.dtype != "int32" or ks_meta.stride[1] != 1:
-                raise NotImplementedError(f"MoE {mode} token_ks must be INT32 with contiguous routed rows")
-
-    # All GEMMs must share the SAME first_token_offset (identical routed-group layout).
-    fto_id = moe_ops[0].inputs[2]
-    for moe in moe_ops[1:]:
-        if moe.inputs[2] != fto_id:
-            raise ValueError("parallel MoE grouped matmuls must share the same " "first_token_offset tensor")
-    fto_meta = meta.get(fto_id)
-    offset_dtype = fto_meta.dtype if fto_meta is not None else "int32"
-    num_groups = int(fto_meta.dim[0]) - 1 if fto_meta is not None and fto_meta.dim else 0
-    offset_multiple = fto_meta.alignment_value if fto_meta is not None else 1
-
-    # Resolve each moe operand through any dequant, then dedup by PACKED data
-    # tensor id (shared dequant → one distinct operand; SF travels with its data).
-    dequant_by_output = {op.output: op for op in ops if op.cudnn_name == "block_scale_dequantize"}
-
-    def _capture_side(operand_id: int) -> dict:
-        deq = dequant_by_output.get(operand_id)
-        if deq is None:
-            return dict(
-                data_id=operand_id,
-                data_dtype=meta[operand_id].dtype,
-                block_size_2d=None,
-                sf_dtype=None,
-                sf_reorder=None,
-                deq_compute=None,
-                deq_out=None,
-                sf_id=None,
-                fake_dequant=False,
-            )
-        data_id, sf_id = deq.inputs
-        _require_materialized_block_scale_inputs(data_id, sf_id, ops, meta)
-        sf_meta = meta[sf_id]
-        if moe_ops[0].moe_mode == "gather" and sf_meta.reordering is None and deq.block_size and all(b > 0 for b in deq.block_size):
-            data_dim = meta[data_id].dim
-            expected = (data_dim[0],) + tuple(-(-d // block) for d, block in zip(data_dim[1:], deq.block_size))
-            if sf_meta.dim != expected:
-                raise ValueError(f"MoE GATHER linear scale shape must be {expected}; got {sf_meta.dim}")
-        deq_compute = deq.compute_dtype if deq.compute_dtype is not None else compute_dtype
-        deq_out = _resolve_out_dtype(deq.output, deq.output_tensor, io_dtype, intermediate_dtype)
-        return dict(
-            data_id=data_id,
-            data_dtype=meta[data_id].dtype,
-            block_size_2d=(tuple(deq.block_size) if deq.block_size else None),
-            sf_dtype=sf_meta.dtype,
-            sf_reorder=sf_meta.reordering,
-            deq_compute=deq_compute,
-            deq_out=deq_out,
-            sf_id=sf_id,
-            fake_dequant=False,
-        )
-
-    a_ids: list[int] = []  # distinct PACKED token (A) data ids
-    b_ids: list[int] = []  # distinct PACKED weight (B) data ids
-    a_caps: dict[int, dict] = {}
-    b_caps: dict[int, dict] = {}
-    gemm_operands: list[tuple[int, int]] = []
-    for moe in moe_ops:
-        a_cap = _capture_side(moe.inputs[0])
-        b_cap = _capture_side(moe.inputs[1])
-        gemm_operands.append(
-            (
-                _dedup_operand(a_cap["data_id"], a_cap, a_ids, a_caps, "A", meta),
-                _dedup_operand(b_cap["data_id"], b_cap, b_ids, b_caps, "B", meta),
-            )
-        )
-
-    _normalize_one_sided_block_scale(gemm_operands, a_ids, b_ids, a_caps, b_caps)
-    is_block_scale = any(c["sf_dtype"] is not None for c in (*a_caps.values(), *b_caps.values()))
-
-    def _moe_geometry(token_id: int, weight_id: int):
-        token_meta = meta[token_id]
-        weight_meta = meta[weight_id]
-        if len(token_meta.dim) != 3 or len(weight_meta.dim) != 3:
-            raise ValueError(f"moe operands must be 3D; got token={token_meta.dim} " f"weight={weight_meta.dim}")
-        _bt, M, Ka = token_meta.dim  # token [1, T, H]
-        if index_meta is not None and _bt != 1:
-            raise ValueError(f"MoE {moe_ops[0].moe_mode.upper()} token must have shape [1, rows, K]")
-        E, Kb, N = weight_meta.dim  # weight [E, H, N]
-        if Ka != Kb:
-            raise ValueError(f"moe K mismatch: token K={Ka} vs weight K={Kb}")
-        return (
-            int(M),
-            int(N),
-            int(Ka),
-            int(E),
-            _infer_a_major(token_meta.dim, token_meta.stride),
-            _infer_b_major(weight_meta.dim, weight_meta.stride),
-            token_meta.dtype,
-            weight_meta.dtype,
-        )
-
-    geom0 = _moe_geometry(a_ids[gemm_operands[0][0]], b_ids[gemm_operands[0][1]])
-    for ai, bi in gemm_operands[1:]:
-        if _moe_geometry(a_ids[ai], b_ids[bi]) != geom0:
-            raise ValueError("parallel MoE grouped matmuls must share shape / layout / dtype " "/ expert count; heterogeneous GEMMs are out of POC scope")
-    M, N, K, E, a_major, b_major, a_dtype, b_dtype = geom0
-    if E < 1 or num_groups < 1 or num_groups % E:
-        raise NotImplementedError("FROST MoE requires G+1 explicit first_token_offset boundaries, where G is a positive multiple of num_experts")
-    if moe_ops[0].moe_mode in ("scatter", "combine"):
-        top_k = moe_ops[0].top_k
-        if not isinstance(top_k, int) or top_k < 1 or top_k > E or (not combine and M % top_k):
-            raise ValueError(f"MoE {moe_ops[0].moe_mode.upper()} requires 1 <= top_k <= num_experts; SCATTER routed_rows must be divisible by top_k")
-        if index_meta.dim[1] != M:
-            raise ValueError(f"MoE {moe_ops[0].moe_mode.upper()} token_index and token_ks must match token rows")
-    if moe_ops[0].moe_mode == "gather":
-        M = int(index_meta.dim[1])
-    matmul_out_dim = (1, M, N)
-    if combine:
-        scores_meta = meta.get(moe_ops[0].top_k_scores)
-        if scores_meta is None:
-            raise ValueError("MoE COMBINE requires top_k_scores")
-        if len(scores_meta.dim) != 3 or scores_meta.dim[0] != 1 or scores_meta.dim[1] < 1 or scores_meta.dim[2] != top_k:
-            raise ValueError("MoE COMBINE top_k_scores must have shape [1, tokens, top_k]")
-        if scores_meta.dtype != "fp32" or scores_meta.stride[1:] != (top_k, 1):
-            raise NotImplementedError("MoE COMBINE top_k_scores must be compact FP32")
-        if tuple(moe_ops[0].output_tensor.get_dim()) != (1, scores_meta.dim[1], N):
-            raise ValueError("MoE COMBINE output must have shape [1, tokens, N] matching top_k_scores")
-
-    # Shared BlockScaleSpec (every distinct operand must match GEMM 0's combo).
-    block_scale_spec = None
-    if is_block_scale:
-        a0 = a_caps[a_ids[gemm_operands[0][0]]]
-        b0 = b_caps[b_ids[gemm_operands[0][1]]]
-
-        def _combo_key(cap):
-            return (
-                cap["data_dtype"],
-                cap["block_size_2d"],
-                cap["sf_dtype"],
-                cap["sf_reorder"],
-                cap["deq_compute"],
-                cap["deq_out"],
-                cap["fake_dequant"],
-            )
-
-        for cap in a_caps.values():
-            if moe_ops[0].moe_mode == "gather" and cap["sf_id"] is not None and cap["sf_reorder"] is None:
-                from .kernel_registry import linear_token_sf_reject
-
-                sf = meta[cap["sf_id"]]
-                data = meta[cap["data_id"]]
-                kblock = int(cap["block_size_2d"][-1]) if cap["block_size_2d"] else 1
-                if kblock <= 0:
-                    raise ValueError("MoE GATHER token scale K block size must be positive")
-                scale_k = -(-int(data.dim[-1]) // kblock)
-                reason = linear_token_sf_reject(sf.dim, sf.stride, data.dim[1], scale_k)
-                if reason is not None:
-                    raise NotImplementedError(reason)
-            if _combo_key(cap) != _combo_key(a0):
-                raise ValueError("all token operands of a block-scale multi-MoE must share the same SF combo")
-        for cap in b_caps.values():
-            if _combo_key(cap) != _combo_key(b0):
-                raise ValueError("all weight operands of a block-scale multi-MoE must share the same SF combo")
-        block_scale_spec = BlockScaleSpec(
-            a_dtype=a0["data_dtype"],
-            b_dtype=b0["data_dtype"],
-            block_size_a=a0["block_size_2d"],
-            block_size_b=b0["block_size_2d"],
-            sf_dtype_a=a0["sf_dtype"],
-            sf_dtype_b=b0["sf_dtype"],
-            sfa_reorder=a0["sf_reorder"],
-            sfb_reorder=b0["sf_reorder"],
-            sfa_dim=meta[a0["sf_id"]].dim if a0["sf_id"] is not None else None,
-            sfa_stride=meta[a0["sf_id"]].stride if a0["sf_id"] is not None else None,
-            sfb_dim=meta[b0["sf_id"]].dim if b0["sf_id"] is not None else None,
-            sfb_stride=meta[b0["sf_id"]].stride if b0["sf_id"] is not None else None,
-            dequant_compute_a=a0["deq_compute"],
-            dequant_compute_b=b0["deq_compute"],
-            dequant_out_a=a0["deq_out"],
-            dequant_out_b=b0["deq_out"],
-            fake_dequant_a=a0["fake_dequant"],
-            fake_dequant_b=b0["fake_dequant"],
-        )
-    mm_compute = moe_ops[0].compute_dtype if moe_ops[0].compute_dtype is not None else compute_dtype
-
-    # Epilogue DAG over multiple roots (each MoE GEMM output).
-    gemm_idx_by_output: dict[int, int] = {mm.output: g for g, mm in enumerate(moe_ops)}
+    aux_tensors: list[TensorRef],
+    aux_objs: list[Any],
+    aux_seen: set[int],
+    *,
+    num_groups: int | None = None,
+) -> _EpilogueDag:
+    """Collect and lower the pointwise DAG shared by all GEMM roots."""
+    anchor_kind = anchors[0].cudnn_name
+    excluded = {anchor_kind, "matmul", "reduction", "block_scale_quantize"}
+    gemm_idx_by_output: dict[int, int] = {mm.output: g for g, mm in enumerate(anchors)}
     consumers_by_input: dict[int, list[_RecordedOp]] = {}
     for op in ops:
         for inp in op.inputs:
             consumers_by_input.setdefault(inp, []).append(op)
 
     reachable_op_ids: set[int] = set()
-    bfs_queue: list[int] = [mm.output for mm in moe_ops]
+    bfs_queue = deque(mm.output for mm in anchors)
     visited_tensors: set[int] = set()
     while bfs_queue:
-        tid = bfs_queue.pop(0)
+        tid = bfs_queue.popleft()
         if tid in visited_tensors:
             continue
         visited_tensors.add(tid)
         for op in consumers_by_input.get(tid, []):
-            if op.cudnn_name == "moe_grouped_matmul":
+            if op.cudnn_name == anchor_kind:
                 continue
             if op.output not in reachable_op_ids:
                 reachable_op_ids.add(op.output)
                 bfs_queue.append(op.output)
     pointwise_producer = {op.output: op for op in ops if op.cudnn_name in _UNARY_OP_MAP or op.cudnn_name in _BINARY_OP_MAP or op.cudnn_name == "binary_select"}
-    demand: list[int] = [tid for tid, flagged in _TENSOR_OUTPUT_FLAG.items() if flagged]
+    demand: list[int] = _materialized_output_ids(meta)
     for op in ops:
         if op.output in reachable_op_ids:
             demand.extend(op.inputs)
-        elif op.cudnn_name in ("reduction", "block_scale_quantize") and _TENSOR_OUTPUT_FLAG.get(op.output, False):
+        elif op.cudnn_name in ("reduction", "block_scale_quantize") and _is_output(meta, op.output):
             demand.extend(op.inputs)
     while demand:
         tid = demand.pop()
@@ -1181,9 +918,7 @@ def _build_multi_moe_chain(
         if prod is not None and prod.output not in reachable_op_ids:
             reachable_op_ids.add(prod.output)
             demand.extend(prod.inputs)
-    reachable_ops = [
-        op for op in ops if op.output in reachable_op_ids and op.cudnn_name not in {"moe_grouped_matmul", "matmul", "reduction", "block_scale_quantize"}
-    ]
+    reachable_ops = [op for op in ops if op.output in reachable_op_ids and op.cudnn_name not in excluded]
     reachable_quant_ops = [
         op for op in ops if op.cudnn_name == "block_scale_quantize" and (op.output in reachable_op_ids or any(i in reachable_op_ids for i in op.inputs))
     ]
@@ -1206,9 +941,6 @@ def _build_multi_moe_chain(
         ordered_ops.append(op)
         placed.add(op.output)
 
-    aux_tensors: list[TensorRef] = []
-    aux_objs: list[Any] = []
-    aux_seen: set[int] = set()
     op_position_by_id: dict[int, int] = {}
     pending_ops: list[tuple[FusionOp, int]] = []
 
@@ -1219,7 +951,7 @@ def _build_multi_moe_chain(
         if aux_id not in aux_seen:
             aux_seen.add(aux_id)
             aux_dim = tuple(aux_meta.dim)
-            grouped_aux = len(aux_dim) == 3 and aux_dim[0] != 1
+            grouped_aux = num_groups is not None and len(aux_dim) == 3 and aux_dim[0] != 1
             if grouped_aux:
                 if aux_dim[0] != num_groups:
                     raise ValueError(f"aux {aux_meta.name!r} leading dim {aux_dim[0]} must be 1 or " f"num_groups ({num_groups}) for a MoE epilogue aux")
@@ -1308,13 +1040,6 @@ def _build_multi_moe_chain(
         pending_ops.append((fop, next_op.output))
         op_position_by_id[next_op.output] = len(pending_ops) - 1
 
-    if not pending_ops and len(moe_ops) > 1:
-        raise ValueError("multi-MoE graph has no fusion op; parallel grouped matmuls must " "share a pointwise epilogue (the no-epilogue case is out of scope)")
-
-    set_output_ids_in_order = [tid for tid in _TENSOR_OUTPUT_FLAG if _TENSOR_OUTPUT_FLAG[tid]]
-
-    from dataclasses import replace as _replace
-
     recorded_by_out = {op.output: op for op in ordered_ops}
     fusion_ops: list[FusionOp] = []
     for fop, out_id in pending_ops:
@@ -1323,14 +1048,346 @@ def _build_multi_moe_chain(
             continue
         recorded = recorded_by_out[out_id]
         op_compute = recorded.compute_dtype if recorded.compute_dtype is not None else compute_dtype
-        op_out_dtype = _resolve_out_dtype(out_id, recorded.output_tensor, io_dtype, intermediate_dtype)
-        fusion_ops.append(_replace(fop, compute_dtype=op_compute, out_dtype=op_out_dtype))
+        op_out_dtype = _resolve_out_dtype(out_id, recorded.output_tensor, io_dtype, intermediate_dtype, meta)
+        fusion_ops.append(replace(fop, compute_dtype=op_compute, out_dtype=op_out_dtype))
+
+    return _EpilogueDag(gemm_idx_by_output, op_position_by_id, fusion_ops, reachable_quant_ops, recorded_by_out)
+
+
+def _block_scale_combo(cap):
+    return (
+        cap["data_dtype"],
+        cap["block_size_2d"],
+        cap["sf_dtype"],
+        cap["sf_reorder"],
+        cap["deq_compute"],
+        cap["deq_out"],
+        cap["fake_dequant"],
+    )
+
+
+def _block_scale_spec(a0, b0, meta):
+    """Construct the shared block-scale operand specification."""
+    from .fusion_ir import BlockScaleSpec
+
+    return BlockScaleSpec(
+        a_dtype=a0["data_dtype"],
+        b_dtype=b0["data_dtype"],
+        block_size_a=a0["block_size_2d"],
+        block_size_b=b0["block_size_2d"],
+        sf_dtype_a=a0["sf_dtype"],
+        sf_dtype_b=b0["sf_dtype"],
+        sfa_reorder=a0["sf_reorder"],
+        sfb_reorder=b0["sf_reorder"],
+        sfa_dim=meta[a0["sf_id"]].dim if a0["sf_id"] is not None else None,
+        sfa_stride=meta[a0["sf_id"]].stride if a0["sf_id"] is not None else None,
+        sfb_dim=meta[b0["sf_id"]].dim if b0["sf_id"] is not None else None,
+        sfb_stride=meta[b0["sf_id"]].stride if b0["sf_id"] is not None else None,
+        dequant_compute_a=a0["deq_compute"],
+        dequant_compute_b=b0["deq_compute"],
+        dequant_out_a=a0["deq_out"],
+        dequant_out_b=b0["deq_out"],
+        fake_dequant_a=a0["fake_dequant"],
+        fake_dequant_b=b0["fake_dequant"],
+    )
+
+
+def _collect_reductions(ops, meta, dag, io_dtype, intermediate_dtype, compute_dtype, batch, M, N, *, fto_id=None, num_groups=0):
+    """Collect terminal reductions and their output bindings."""
+    grouped = fto_id is not None
+    context = "multi-MoE" if grouped else "multi-GEMM"
+    kind = "moe" if grouped else "matmul"
+    full = (int(batch), int(M), int(N))
+    reductions = []
+    outputs = []
+    for red in ops:
+        if red.cudnn_name != "reduction" or not _is_output(meta, red.output):
+            continue
+        (input_id,) = red.inputs
+        if input_id not in dag.gemm_indices and input_id not in dag.positions:
+            raise ValueError(f"reduction {red.op_name!r} input is not produced by this {context} epilogue chain")
+        source_ref = dag.source_ref(input_id)
+        compute = red.compute_dtype if red.compute_dtype is not None else compute_dtype
+        dtype = _resolve_out_dtype(red.output, red.output_tensor, io_dtype, intermediate_dtype, meta)
+        if red.reduction_mode is None:
+            raise NotImplementedError(
+                f"reduction {red.op_name!r} mode is not supported by cudnn.gemm.frost; "
+                "supported modes are ADD, AMAX, MAX, MIN, AVG, MUL, MUL_NO_ZEROS, NORM1, and NORM2"
+            )
+        dim = meta[red.output].dim_override
+        if dim is None:
+            try:
+                dim = tuple(red.output_tensor.get_dim())
+            except Exception:  # noqa: BLE001
+                dim = ()
+        if len(dim) != 3:
+            raise ValueError(f"reduction {red.op_name!r} must set a rank-3 output dim; got {dim}")
+        grouped_by_moe = grouped and red.group_offset is not None
+        if grouped_by_moe:
+            if red.group_offset != fto_id:
+                raise ValueError(f"reduction {red.op_name!r} groupOffset must be the MoE first_token_offset tensor")
+            if int(dim[0]) != num_groups:
+                raise ValueError(f"reduction {red.op_name!r} with groupOffset must use output dim[0] == num_groups ({num_groups}); got {dim}")
+        expected = (num_groups if grouped_by_moe else full[0], full[1], full[2])
+        for axis, (out_extent, full_extent) in enumerate(zip(dim, expected)):
+            if out_extent not in (1, full_extent):
+                raise ValueError(
+                    f"reduction {red.op_name!r} output dim {dim} is not compatible with {kind} output {full}: axis {axis} must be 1 or {full_extent}"
+                )
+        if all(out_extent == full_extent for out_extent, full_extent in zip(dim, expected)):
+            raise ValueError(f"reduction {red.op_name!r} output dim {dim} does not reduce any axis")
+        reductions.append(
+            ReductionSpec(
+                mode=red.reduction_mode, source_ref=source_ref, dim=tuple(map(int, dim)), dtype=dtype, compute_dtype=compute, grouped_by_moe=grouped_by_moe
+            )
+        )
+        outputs.append(red.output_tensor)
+    return reductions, outputs
+
+
+def _output_layouts(dense_entries, quant_recs, meta):
+    """Attach each materialized output's declared dimensions and strides."""
+    from dataclasses import replace as _spec_replace
+
+    for _di in range(len(dense_entries)):
+        _spec_i, _obj_i = dense_entries[_di]
+        _d_i = tuple(_obj_i.get_dim()) if _obj_i is not None else ()
+        _s_i = tuple(_obj_i.get_stride()) if _obj_i is not None else ()
+        if (not _d_i or not _s_i) and _spec_i.quant_idx is not None:
+            _meta_i = meta.get(quant_recs[_spec_i.quant_idx].output)
+            if _meta_i is not None:
+                _d_i, _s_i = _meta_i.dim, _meta_i.stride
+        _layout = {}
+        if _d_i:
+            _layout["dim"] = tuple(_d_i)
+        if _s_i:
+            _layout["stride"] = tuple(_s_i)
+        dense_entries[_di] = (_spec_replace(_spec_i, **_layout), _obj_i)
+    return dense_entries
+
+
+def _capture_dequant_operand(operand_id: int, dequant_by_output, ops, meta, io_dtype, intermediate_dtype, compute_dtype, *, gather: bool = False) -> dict:
+    """Packed data id + block-scale fields for a matmul operand (all None for
+    a non-dequantized side)."""
+    deq = dequant_by_output.get(operand_id)
+    if deq is None:
+        return dict(
+            data_id=operand_id,
+            data_dtype=meta[operand_id].dtype,
+            block_size_2d=None,
+            sf_dtype=None,
+            sf_reorder=None,
+            deq_compute=None,
+            deq_out=None,
+            sf_id=None,
+            fake_dequant=False,
+        )
+    data_id, sf_id = deq.inputs
+    _require_materialized_block_scale_inputs(data_id, sf_id, ops, meta)
+    sf_meta = meta[sf_id]
+    if gather and sf_meta.reordering is None and deq.block_size and all(b > 0 for b in deq.block_size):
+        data_dim = meta[data_id].dim
+        expected = (data_dim[0],) + tuple(-(-d // block) for d, block in zip(data_dim[1:], deq.block_size))
+        if sf_meta.dim != expected:
+            raise ValueError(f"MoE GATHER linear scale shape must be {expected}; got {sf_meta.dim}")
+    deq_compute = deq.compute_dtype if deq.compute_dtype is not None else compute_dtype
+    deq_out = _resolve_out_dtype(deq.output, deq.output_tensor, io_dtype, intermediate_dtype, meta)
+    return dict(
+        data_id=data_id,
+        data_dtype=meta[data_id].dtype,
+        block_size_2d=(tuple(deq.block_size) if deq.block_size else None),
+        sf_dtype=sf_meta.dtype,
+        sf_reorder=sf_meta.reordering,
+        deq_compute=deq_compute,
+        deq_out=deq_out,
+        sf_id=sf_id,
+        fake_dequant=False,
+    )
+
+
+def _build_multi_moe_chain(
+    moe_ops: list[_RecordedOp],
+    ops: list[_RecordedOp],
+    meta: dict[int, _TensorMeta],
+    io_dtype: Dtype,
+    intermediate_dtype: Dtype,
+    compute_dtype: Dtype,
+) -> FusionChain:
+    """Build the shared fusion chain and binding for grouped GEMMs."""
+    from .fusion_ir import MoeSpec
+
+    if any(op.cudnn_name == "matmul" for op in ops):
+        raise ValueError("a MoE grouped matmul graph cannot also contain a plain matmul; " "mixed MoE + matmul graphs are out of POC scope")
+    combine = moe_ops[0].moe_mode == "combine"
+    if combine and (len(moe_ops) != 1 or any(op.cudnn_name not in ("moe_grouped_matmul", "block_scale_dequantize") for op in ops)):
+        raise NotImplementedError("MoE COMBINE currently requires one GEMM with no post-combine operations")
+    for moe in moe_ops:
+        if moe.top_k_scores is not None and moe.moe_mode != "combine":
+            raise ValueError("top_k_scores is only valid for MoE COMBINE")
+        if moe.moe_mode not in ("none", "gather", "scatter", "combine"):
+            raise NotImplementedError(f"MoE grouped matmul mode {moe.moe_mode!r} is unsupported")
+        if (moe.moe_mode, moe.token_index, moe.token_ks, moe.top_k) != (moe_ops[0].moe_mode, moe_ops[0].token_index, moe_ops[0].token_ks, moe_ops[0].top_k):
+            raise ValueError("parallel MoE grouped matmuls must share the same mode, token_index, token_ks and top_k")
+    index_meta = None
+    ks_meta = scores_meta = None
+    if moe_ops[0].moe_mode in ("gather", "scatter", "combine"):
+        mode = moe_ops[0].moe_mode.upper()
+        index_meta = meta.get(moe_ops[0].token_index)
+        if index_meta is None:
+            raise ValueError(f"MoE {mode} requires token_index")
+        if len(index_meta.dim) != 3 or index_meta.dim[0] != 1 or index_meta.dim[2] != 1 or index_meta.dim[1] < 1:
+            raise ValueError(f"MoE {mode} token_index must have shape [1, routed_rows, 1]")
+        if index_meta.dtype != "int32" or index_meta.stride[1] != 1:
+            raise NotImplementedError(f"MoE {mode} token_index must be INT32 with contiguous routed rows")
+        if mode in ("SCATTER", "COMBINE"):
+            ks_meta = meta.get(moe_ops[0].token_ks)
+            if ks_meta is None or ks_meta.dim != index_meta.dim:
+                raise ValueError(f"MoE {mode} token_ks must match token_index shape [1, routed_rows, 1]")
+            if ks_meta.dtype != "int32" or ks_meta.stride[1] != 1:
+                raise NotImplementedError(f"MoE {mode} token_ks must be INT32 with contiguous routed rows")
+
+    # All GEMMs must share the SAME first_token_offset (identical routed-group layout).
+    fto_id = moe_ops[0].inputs[2]
+    for moe in moe_ops[1:]:
+        if moe.inputs[2] != fto_id:
+            raise ValueError("parallel MoE grouped matmuls must share the same " "first_token_offset tensor")
+    fto_meta = meta.get(fto_id)
+    offset_dtype = fto_meta.dtype if fto_meta is not None else "int32"
+    num_groups = int(fto_meta.dim[0]) - 1 if fto_meta is not None and fto_meta.dim else 0
+    offset_multiple = fto_meta.alignment_value if fto_meta is not None else 1
+
+    dequant_by_output = {op.output: op for op in ops if op.cudnn_name == "block_scale_dequantize"}
+
+    a_ids: list[int] = []  # distinct PACKED token (A) data ids
+    b_ids: list[int] = []  # distinct PACKED weight (B) data ids
+    a_caps: dict[int, dict] = {}
+    b_caps: dict[int, dict] = {}
+    gemm_operands: list[tuple[int, int]] = []
+    for moe in moe_ops:
+        a_cap = _capture_dequant_operand(
+            moe.inputs[0], dequant_by_output, ops, meta, io_dtype, intermediate_dtype, compute_dtype, gather=moe_ops[0].moe_mode == "gather"
+        )
+        b_cap = _capture_dequant_operand(
+            moe.inputs[1], dequant_by_output, ops, meta, io_dtype, intermediate_dtype, compute_dtype, gather=moe_ops[0].moe_mode == "gather"
+        )
+        gemm_operands.append(
+            (
+                _dedup_operand(a_cap["data_id"], a_cap, a_ids, a_caps, "A", meta),
+                _dedup_operand(b_cap["data_id"], b_cap, b_ids, b_caps, "B", meta),
+            )
+        )
+
+    _normalize_one_sided_block_scale(gemm_operands, a_ids, b_ids, a_caps, b_caps)
+    is_block_scale = any(c["sf_dtype"] is not None for c in (*a_caps.values(), *b_caps.values()))
+
+    def _moe_geometry(token_id: int, weight_id: int):
+        token_meta = meta[token_id]
+        weight_meta = meta[weight_id]
+        if len(token_meta.dim) != 3 or len(weight_meta.dim) != 3:
+            raise ValueError(f"moe operands must be 3D; got token={token_meta.dim} " f"weight={weight_meta.dim}")
+        _bt, M, Ka = token_meta.dim  # token [1, T, H]
+        if index_meta is not None and _bt != 1:
+            raise ValueError(f"MoE {moe_ops[0].moe_mode.upper()} token must have shape [1, rows, K]")
+        E, Kb, N = weight_meta.dim  # weight [E, H, N]
+        if Ka != Kb:
+            raise ValueError(f"moe K mismatch: token K={Ka} vs weight K={Kb}")
+        return (
+            int(M),
+            int(N),
+            int(Ka),
+            int(E),
+            _infer_a_major(token_meta.dim, token_meta.stride),
+            _infer_b_major(weight_meta.dim, weight_meta.stride),
+            token_meta.dtype,
+            weight_meta.dtype,
+        )
+
+    geom0 = _moe_geometry(a_ids[gemm_operands[0][0]], b_ids[gemm_operands[0][1]])
+    for ai, bi in gemm_operands[1:]:
+        if _moe_geometry(a_ids[ai], b_ids[bi]) != geom0:
+            raise ValueError("parallel MoE grouped matmuls must share shape / layout / dtype " "/ expert count; heterogeneous GEMMs are out of POC scope")
+    M, N, K, E, a_major, b_major, a_dtype, b_dtype = geom0
+    if E < 1 or num_groups < 1 or num_groups % E:
+        raise NotImplementedError("FROST MoE requires G+1 explicit first_token_offset boundaries, where G is a positive multiple of num_experts")
+    if moe_ops[0].moe_mode in ("scatter", "combine"):
+        top_k = moe_ops[0].top_k
+        if not isinstance(top_k, int) or top_k < 1 or top_k > E or (not combine and M % top_k):
+            raise ValueError(f"MoE {moe_ops[0].moe_mode.upper()} requires 1 <= top_k <= num_experts; SCATTER routed_rows must be divisible by top_k")
+        if index_meta.dim[1] != M:
+            raise ValueError(f"MoE {moe_ops[0].moe_mode.upper()} token_index and token_ks must match token rows")
+    if moe_ops[0].moe_mode == "gather":
+        M = int(index_meta.dim[1])
+    matmul_out_dim = (1, M, N)
+    if combine:
+        scores_meta = meta.get(moe_ops[0].top_k_scores)
+        if scores_meta is None:
+            raise ValueError("MoE COMBINE requires top_k_scores")
+        if len(scores_meta.dim) != 3 or scores_meta.dim[0] != 1 or scores_meta.dim[1] < 1 or scores_meta.dim[2] != top_k:
+            raise ValueError("MoE COMBINE top_k_scores must have shape [1, tokens, top_k]")
+        if scores_meta.dtype != "fp32" or scores_meta.stride[1:] != (top_k, 1):
+            raise NotImplementedError("MoE COMBINE top_k_scores must be compact FP32")
+        if tuple(moe_ops[0].output_tensor.get_dim()) != (1, scores_meta.dim[1], N):
+            raise ValueError("MoE COMBINE output must have shape [1, tokens, N] matching top_k_scores")
+
+    # Shared BlockScaleSpec (every distinct operand must match GEMM 0's combo).
+    block_scale_spec = None
+    if is_block_scale:
+        a0 = a_caps[a_ids[gemm_operands[0][0]]]
+        b0 = b_caps[b_ids[gemm_operands[0][1]]]
+
+        for cap in a_caps.values():
+            if moe_ops[0].moe_mode == "gather" and cap["sf_id"] is not None and cap["sf_reorder"] is None:
+                from .kernel_registry import linear_token_sf_reject
+
+                sf = meta[cap["sf_id"]]
+                data = meta[cap["data_id"]]
+                kblock = int(cap["block_size_2d"][-1]) if cap["block_size_2d"] else 1
+                if kblock <= 0:
+                    raise ValueError("MoE GATHER token scale K block size must be positive")
+                scale_k = -(-int(data.dim[-1]) // kblock)
+                reason = linear_token_sf_reject(sf.dim, sf.stride, data.dim[1], scale_k)
+                if reason is not None:
+                    raise NotImplementedError(reason)
+            if _block_scale_combo(cap) != _block_scale_combo(a0):
+                raise ValueError("all token operands of a block-scale multi-MoE must share the same SF combo")
+        for cap in b_caps.values():
+            if _block_scale_combo(cap) != _block_scale_combo(b0):
+                raise ValueError("all weight operands of a block-scale multi-MoE must share the same SF combo")
+        block_scale_spec = _block_scale_spec(a0, b0, meta)
+    mm_compute = moe_ops[0].compute_dtype if moe_ops[0].compute_dtype is not None else compute_dtype
+    gemm_out_dtypes = tuple(_resolve_out_dtype(mm.output, mm.output_tensor, io_dtype, intermediate_dtype, meta) for mm in moe_ops)
+    if combine:
+        gemm_out_dtypes = ("fp32",) * len(moe_ops)
+
+    aux_tensors: list[TensorRef] = []
+    aux_objs: list[Any] = []
+    aux_seen: set[int] = set()
+    dag = _build_epilogue_dag(
+        moe_ops,
+        ops,
+        meta,
+        matmul_out_dim,
+        io_dtype,
+        intermediate_dtype,
+        compute_dtype,
+        aux_tensors,
+        aux_objs,
+        aux_seen,
+        num_groups=num_groups,
+    )
+    gemm_idx_by_output, op_position_by_id = dag.gemm_indices, dag.positions
+    fusion_ops, reachable_quant_ops, recorded_by_out = dag.ops, dag.quant_ops, dag.recorded
+
+    if not fusion_ops and len(moe_ops) > 1:
+        raise ValueError("multi-MoE graph has no fusion op; parallel grouped matmuls must " "share a pointwise epilogue (the no-epilogue case is out of scope)")
+
+    set_output_ids_in_order = _materialized_output_ids(meta)
 
     quants, quant_recs, quant_dtypes, quant_scale_objs = _collect_quants(
         reachable_quant_ops,
         op_position_by_id,
         gemm_idx_by_output,
-        not pending_ops,
+        not fusion_ops,
         meta,
         io_dtype,
         intermediate_dtype,
@@ -1343,8 +1400,6 @@ def _build_multi_moe_chain(
         num_groups=num_groups,
     )
 
-    # Dense outputs in plain recorder (set_output) order — no output position
-    # carries semantics or capability; specs[0] merely binds first.
     dense_entries: list[tuple[OutputSpec, Any]] = []
     for tid in set_output_ids_in_order:
         qi = next((i for i, rec in enumerate(quant_recs) if rec.output == tid), None)
@@ -1355,7 +1410,7 @@ def _build_multi_moe_chain(
                     quant_recs[qi].output_tensor,
                 )
             )
-        elif tid in op_position_by_id and _TENSOR_OUTPUT_FLAG.get(tid, False):
+        elif tid in op_position_by_id and _is_output(meta, tid):
             pos = op_position_by_id[tid]
             dense_entries.append(
                 (
@@ -1363,104 +1418,29 @@ def _build_multi_moe_chain(
                     recorded_by_out[tid].output_tensor,
                 )
             )
+        elif tid in gemm_idx_by_output:
+            index = gemm_idx_by_output[tid]
+            tensor = moe_ops[index].output_tensor
+            dtype = _resolve_out_dtype(tid, tensor, io_dtype, intermediate_dtype, meta)
+            dense_entries.append((OutputSpec(source_ref=gemm_source(index), dtype=dtype), tensor))
 
-    def _reduction_output(red: _RecordedOp) -> tuple[tuple[int, int, int], bool]:
-        dim = _TENSOR_DIM_OVERRIDE.get(red.output)
-        if dim is None:
-            try:
-                dim = tuple(red.output_tensor.get_dim())
-            except Exception:  # noqa: BLE001
-                dim = ()
-        if len(dim) != 3:
-            raise ValueError(f"reduction {red.op_name!r} must set a rank-3 output dim; got {dim}")
-        full = (1, int(M), int(N))
-        grouped_by_moe = False
-        if red.group_offset is not None:
-            if red.group_offset != fto_id:
-                raise ValueError(f"reduction {red.op_name!r} groupOffset must be the MoE " "first_token_offset tensor")
-            if int(dim[0]) != num_groups:
-                raise ValueError(f"reduction {red.op_name!r} with groupOffset must use " f"output dim[0] == num_groups ({num_groups}); got {dim}")
-            grouped_by_moe = True
-        axis0_extent = num_groups if grouped_by_moe else full[0]
-        compat_full = (axis0_extent, full[1], full[2])
-        for axis, (out_extent, full_extent) in enumerate(zip(dim, compat_full)):
-            if out_extent not in (1, full_extent):
-                raise ValueError(
-                    f"reduction {red.op_name!r} output dim {dim} is not compatible " f"with moe output {full}: axis {axis} must be 1 or {full_extent}"
-                )
-        if all(out_extent == full_extent for out_extent, full_extent in zip(dim, compat_full)):
-            raise ValueError(f"reduction {red.op_name!r} output dim {dim} does not reduce any axis")
-        return (int(dim[0]), int(dim[1]), int(dim[2])), grouped_by_moe
+    reductions, reduction_objs = _collect_reductions(ops, meta, dag, io_dtype, intermediate_dtype, compute_dtype, 1, M, N, fto_id=fto_id, num_groups=num_groups)
 
-    reductions: list[ReductionSpec] = []
-    reduction_objs: list[Any] = []
-    for red in ops:
-        if red.cudnn_name != "reduction":
-            continue
-        if not _TENSOR_OUTPUT_FLAG.get(red.output, False):
-            continue
-        (input_id,) = red.inputs
-        if input_id in gemm_idx_by_output or input_id in op_position_by_id:
-            source_ref = _operand_ref(input_id)
-        else:
-            raise ValueError(f"reduction {red.op_name!r} input is not produced by this " "multi-MoE epilogue chain")
-        compute = red.compute_dtype if red.compute_dtype is not None else compute_dtype
-        dtype = _resolve_out_dtype(red.output, red.output_tensor, io_dtype, intermediate_dtype)
-        if red.reduction_mode is None:
-            raise NotImplementedError(
-                f"reduction {red.op_name!r} mode is not supported by cudnn.gemm.frost; "
-                "supported modes are ADD, AMAX, MAX, MIN, AVG, MUL, MUL_NO_ZEROS, NORM1, and NORM2"
-            )
-        red_dim, grouped_by_moe = _reduction_output(red)
-        reductions.append(
-            ReductionSpec(
-                mode=red.reduction_mode,  # type: ignore[arg-type]
-                source_ref=source_ref,
-                dim=red_dim,
-                dtype=dtype,
-                compute_dtype=compute,
-                grouped_by_moe=grouped_by_moe,
-            )
-        )
-        reduction_objs.append(red.output_tensor)
-
-    matmul_out_dtype = _resolve_out_dtype(moe_ops[0].output, moe_ops[0].output_tensor, io_dtype, intermediate_dtype)
+    matmul_out_dtype = _resolve_out_dtype(moe_ops[0].output, moe_ops[0].output_tensor, io_dtype, intermediate_dtype, meta)
     implicit_raw = False
     if not dense_entries:
-        if not pending_ops:
-            # Raw MoE output (explicit set_output, or implicit when nothing at
-            # all was requested).
-            implicit_raw = not _TENSOR_OUTPUT_FLAG.get(moe_ops[0].output, False)
+        if not fusion_ops:
+            implicit_raw = not _is_output(meta, moe_ops[0].output)
             dense_entries.append(
                 (
                     OutputSpec(source_ref=gemm_source(0), dtype=matmul_out_dtype),
                     moe_ops[0].output_tensor,
                 )
             )
-        elif any(_TENSOR_OUTPUT_FLAG.get(mm.output, False) for mm in moe_ops):
-            raise ValueError("materializing the raw MoE grouped matmul output alongside pointwise " "ops is not supported; tap a fusion-op output instead")
         elif not reductions:
             raise ValueError("graph materializes no output; mark at least one tensor " "set_output(True)")
 
-    if dense_entries:
-        from dataclasses import replace as _spec_replace
-
-        for _di in range(len(dense_entries)):
-            _spec_i, _obj_i = dense_entries[_di]
-            _d_i = tuple(_obj_i.get_dim()) if _obj_i is not None else ()
-            _s_i = tuple(_obj_i.get_stride()) if _obj_i is not None else ()
-            if (not _d_i or not _s_i) and _spec_i.quant_idx is not None:
-                _meta_i = meta.get(quant_recs[_spec_i.quant_idx].output)
-                if _meta_i is not None:
-                    _d_i, _s_i = _meta_i.dim, _meta_i.stride
-            # Recorded independently — a derived tensor carries its stride long
-            # before cuDNN fills its dim (only at build_operation_graph time).
-            _layout = {}
-            if _d_i:
-                _layout["dim"] = tuple(_d_i)
-            if _s_i:
-                _layout["stride"] = tuple(_s_i)
-            dense_entries[_di] = (_spec_replace(_spec_i, **_layout), _obj_i)
+    dense_entries = _output_layouts(dense_entries, quant_recs, meta)
     matmul_spec = MatmulSpec(
         M=M,
         N=N,
@@ -1476,8 +1456,6 @@ def _build_multi_moe_chain(
         # COMBINE rounds the weighted contribution, not the raw FC2 result.
         out_dtype="fp32" if combine else matmul_out_dtype,
     )
-    # An implicit (never set_output) raw-MoE output is kept only when nothing
-    # else was requested; with reductions present it is dropped (no phantom C).
     if implicit_raw and reductions:
         dense_entries = []
     output_specs: list[OutputSpec] = [spec for spec, _obj in dense_entries]
@@ -1490,6 +1468,7 @@ def _build_multi_moe_chain(
         num_a_operands=len(a_ids),
         num_b_operands=len(b_ids),
         gemm_operands=gemm_operands,
+        gemm_out_dtypes=gemm_out_dtypes if len(gemm_out_dtypes) > 1 else (),
         moe=MoeSpec(
             num_experts=int(E),
             mode=moe_ops[0].moe_mode,
@@ -1529,69 +1508,105 @@ def _walk_mainloop_chain(
     aux_tensors: list[TensorRef],
     aux_objs: list[Any],
     aux_seen: set[int],
+    io_dtype: Dtype,
+    intermediate_dtype: Dtype,
+    compute_dtype: Dtype,
 ) -> tuple[int, list[FusionOp]]:
-    """Walk backwards from a matmul operand through pointwise ops (unary, or
-    binary with one SCALAR graph-input aux) to the root graph input. Returns
-    (root_tensor_id, mainloop_ops) in graph-input -> operand' order; registers
-    scalar auxes in aux_tensors."""
+    """Walk operand pointwise ops to a graph input (scalar aux, or per-K multiply on either operand)."""
 
     def _is_scalar_input(tid: int) -> bool:
         m = meta.get(tid)
         return m is not None and m.is_input and len(m.dim) > 0 and all(d == 1 for d in m.dim)
+
+    @lru_cache(maxsize=None)
+    def _pointwise_dim(tid: int) -> tuple[int, ...]:
+        m = meta.get(tid)
+        if m is not None and m.dim:
+            return m.dim
+        producer = op_by_output.get(tid)
+        if producer is None or (producer.cudnn_name not in _UNARY_OP_MAP and producer.cudnn_name not in _BINARY_OP_MAP):
+            return ()
+        dims = [_pointwise_dim(inp) for inp in producer.inputs]
+        if not dims or any(len(dim) != 3 for dim in dims):
+            return ()
+        if any(len({d for d in axis if d != 1}) > 1 for axis in zip(*dims)):
+            return ()
+        return tuple(max(axis) for axis in zip(*dims))
+
+    def _is_per_k_input(tid: int, other: int) -> bool:
+        m = meta.get(tid)
+        k_axis = 2 if label == "A" else 1
+        if m is None or not m.is_input or len(m.dim) != 3 or m.dim[0] != 1 or m.dim[3 - k_axis] != 1:
+            return False
+        source_dim = _pointwise_dim(other)
+        if len(source_dim) != 3:
+            return False
+        expected = (1, 1, source_dim[2]) if label == "A" else (1, source_dim[1], 1)
+        return m.dim == expected and source_dim[3 - k_axis] != 1
 
     # Each entry: (cudnn_name, is_binary, aux_name_or_None, aux_on_rhs).
     steps: list[tuple] = []
     cur = operand_id
     while cur in op_by_output:
         producer = op_by_output[cur]
+        if producer.cudnn_name == "gen_index":
+            raise ValueError(
+                f"matmul {label} operand producer {producer.op_name!r}: gen_index is unsupported in mainloop fusion (requires logical operand coordinates)"
+            )
+        if producer.cudnn_name in _UNARY_OP_MAP or producer.cudnn_name in _BINARY_OP_MAP:
+            allowed_attrs = _MAINLOOP_POINTWISE_ATTR_KEYS.get(producer.cudnn_name, frozenset())
+            for key, value in producer.op_attrs:
+                if key not in allowed_attrs:
+                    raise ValueError(f"matmul {label} operand producer {producer.op_name!r}: {producer.cudnn_name}.{key} is unsupported in mainloop fusion")
+                if not isfinite(value):
+                    raise ValueError(f"matmul {label} operand producer {producer.op_name!r}: {producer.cudnn_name}.{key} must be finite")
         if producer.cudnn_name in _UNARY_OP_MAP:
-            if producer.cudnn_name == "gen_index" or producer.op_attrs:
-                raise ValueError(
-                    f"matmul {label} operand producer {producer.op_name!r}: gen_index and " "pointwise scalar attrs are not supported in mainloop fusion"
-                )
-            steps.append((producer.cudnn_name, False, None, True))
+            steps.append((producer.cudnn_name, False, None, True, producer))
             (cur,) = producer.inputs
         elif producer.cudnn_name in _BINARY_OP_MAP:
-            if producer.op_attrs:
-                raise ValueError(f"matmul {label} operand producer {producer.op_name!r}: pointwise scalar " "attrs are not supported in mainloop fusion")
             i0, i1 = producer.inputs
             s0, s1 = _is_scalar_input(i0), _is_scalar_input(i1)
             if s0 and not s1:
                 aux_id, chain_id, aux_on_rhs = i0, i1, False
             elif s1 and not s0:
                 aux_id, chain_id, aux_on_rhs = i1, i0, True
+            elif producer.cudnn_name == "mul" and _is_per_k_input(i0, i1):
+                aux_id, chain_id, aux_on_rhs = i0, i1, False
+            elif producer.cudnn_name == "mul" and _is_per_k_input(i1, i0):
+                aux_id, chain_id, aux_on_rhs = i1, i0, True
             else:
                 raise ValueError(
                     f"matmul {label} operand is produced by binary op "
                     f"{producer.op_name!r} ({producer.cudnn_name!r}) — mainloop "
-                    "fusion only supports a binary op with exactly one SCALAR "
-                    "graph-input aux (e.g. A * alpha); per-row/col/elem aux on an "
-                    "operand is out of POC scope (needs swizzle-aware indexing)"
+                    "fusion supports a binary op with exactly one SCALAR graph-input aux "
+                    "(e.g. A * alpha), or mul with an A-side [1,1,K] or B-side [1,K,1] scale"
                 )
             aux_meta = meta[aux_id]
             if aux_id not in aux_seen:
                 aux_seen.add(aux_id)
+                scalar_aux = _is_scalar_input(aux_id)
                 aux_tensors.append(
                     TensorRef(
                         name=aux_meta.name,
                         dim=aux_meta.dim,
                         stride=aux_meta.stride,
                         dtype=aux_meta.dtype,
-                        bcast_mode="scalar",
+                        bcast_mode="scalar" if scalar_aux else "per_k",
+                        reduction_axis=None if scalar_aux else (2 if label == "A" else 1),
                     )
                 )
                 aux_objs.append(aux_meta.tensor)
-            steps.append((producer.cudnn_name, True, aux_meta.name, aux_on_rhs))
+            steps.append((producer.cudnn_name, True, aux_meta.name, aux_on_rhs, producer))
             cur = chain_id
         else:
             raise ValueError(
                 f"matmul {label} operand is produced by op {producer.op_name!r} "
                 f"({producer.cudnn_name!r}) which is not a pointwise op — mainloop "
-                "fusion supports unary ops and scalar-aux binary ops in the POC"
+                "fusion supports unary ops, scalar-aux binary ops and per-K mul"
             )
     steps.reverse()
     fops: list[FusionOp] = []
-    for idx, (cudnn_name, is_binary, aux_name, aux_on_rhs) in enumerate(steps):
+    for idx, (cudnn_name, is_binary, aux_name, aux_on_rhs, producer) in enumerate(steps):
         parent = idx - 1 if idx > 0 else -1
         if is_binary:
             fops.append(
@@ -1604,6 +1619,12 @@ def _walk_mainloop_chain(
             )
         else:
             fops.append(FusionOp(op=_UNARY_OP_MAP[cudnn_name], parent_idx=parent))
+        fops[-1] = replace(
+            fops[-1],
+            attrs=producer.op_attrs,
+            compute_dtype=producer.compute_dtype or compute_dtype,
+            out_dtype=_resolve_out_dtype(producer.output, producer.output_tensor, io_dtype, intermediate_dtype, meta),
+        )
     return cur, fops
 
 
@@ -1615,64 +1636,14 @@ def _build_multi_gemm_chain(
     intermediate_dtype: Dtype,
     compute_dtype: Dtype,
 ) -> FusionChain:
-    """Build a FusionChain for K >= 1 parallel GEMMs sharing one pointwise
-    epilogue DAG (the unified builder for every plain-matmul graph).
+    """Build a FusionChain for K >= 1 parallel GEMMs sharing one pointwise epilogue DAG (the unified builder for every plain-matmul graph)."""
 
-    All GEMMs share shape / layout / dtype but may use shared or distinct A / B
-    operands (deduped by tensor id). GEMM outputs are the DAG roots; an op refs a
-    GEMM output via a negative ``parent_idx`` (``gemm_source(g)``). Block-scale
-    supported (dequant folds into the packed tensor; shared dequant → one operand).
-    K == 1 additionally supports: mainloop fusion, the matmul-output tap, the
-    raw matmul output / quant source. K > 1 POC scope: no mainloop
-    fusion, no per-GEMM taps; outputs must be fusion ops or a
-    block_scale_quantize fed by one (no-epilogue K > 1: one output per GEMM)."""
-    from .fusion_ir import BlockQuantizeSpec, BlockScaleSpec
-
-    # Resolve each matmul operand through any dequant, then dedup by PACKED data
-    # tensor id (shared dequant → one distinct operand), matching the runtime dedup.
     dequant_by_output = {op.output: op for op in ops if op.cudnn_name == "block_scale_dequantize"}
-
-    def _capture_side(operand_id: int) -> dict:
-        """Packed data id + block-scale fields for a matmul operand (all None for
-        a non-dequantized side)."""
-        deq = dequant_by_output.get(operand_id)
-        if deq is None:
-            return dict(
-                data_id=operand_id,
-                data_dtype=meta[operand_id].dtype,
-                block_size_2d=None,
-                sf_dtype=None,
-                sf_reorder=None,
-                deq_compute=None,
-                deq_out=None,
-                sf_id=None,
-                fake_dequant=False,
-            )
-        data_id, sf_id = deq.inputs
-        _require_materialized_block_scale_inputs(data_id, sf_id, ops, meta)
-        sf_meta = meta[sf_id]
-        deq_compute = deq.compute_dtype if deq.compute_dtype is not None else compute_dtype
-        deq_out = _resolve_out_dtype(deq.output, deq.output_tensor, io_dtype, intermediate_dtype)
-        return dict(
-            data_id=data_id,
-            data_dtype=meta[data_id].dtype,
-            block_size_2d=(tuple(deq.block_size) if deq.block_size else None),
-            sf_dtype=sf_meta.dtype,
-            sf_reorder=sf_meta.reordering,
-            deq_compute=deq_compute,
-            deq_out=deq_out,
-            sf_id=sf_id,
-            fake_dequant=False,
-        )
 
     aux_tensors: list[TensorRef] = []
     aux_objs: list[Any] = []
     aux_seen: set[int] = set()
 
-    # Mainloop fusion (K == 1, non-block-scale only): walk backwards from each
-    # operand through unary / scalar-aux ops to the root graph input; the MMA
-    # dtype is resolved from the tensor feeding the matmul, the LOAD dtype from
-    # the root. Scalar mainloop auxes register FIRST (ahead of epilogue auxes).
     mainloop_a_ops: list[FusionOp] = []
     mainloop_b_ops: list[FusionOp] = []
     mainloop_a_load_dtype: "Dtype | None" = None
@@ -1683,12 +1654,16 @@ def _build_multi_gemm_chain(
         mm0 = matmuls[0]
         op_by_output = {op.output: op for op in ops if op.cudnn_name != "matmul"}
         A_id, B_id = mm0.inputs
-        root_a, mainloop_a_ops = _walk_mainloop_chain(A_id, "A", op_by_output, meta, aux_tensors, aux_objs, aux_seen)
-        root_b, mainloop_b_ops = _walk_mainloop_chain(B_id, "B", op_by_output, meta, aux_tensors, aux_objs, aux_seen)
+        root_a, mainloop_a_ops = _walk_mainloop_chain(
+            A_id, "A", op_by_output, meta, aux_tensors, aux_objs, aux_seen, io_dtype, intermediate_dtype, compute_dtype
+        )
+        root_b, mainloop_b_ops = _walk_mainloop_chain(
+            B_id, "B", op_by_output, meta, aux_tensors, aux_objs, aux_seen, io_dtype, intermediate_dtype, compute_dtype
+        )
 
         def _mma_operand_dtype(operand_id: int) -> Dtype:
             om = meta.get(operand_id)
-            return _resolve_out_dtype(operand_id, om.tensor if om else None, io_dtype, intermediate_dtype)
+            return _resolve_out_dtype(operand_id, om.tensor if om else None, io_dtype, intermediate_dtype, meta)
 
         mma_a_dtype = _mma_operand_dtype(A_id)
         mma_b_dtype = _mma_operand_dtype(B_id)
@@ -1704,8 +1679,8 @@ def _build_multi_gemm_chain(
     gemm_operands: list[tuple[int, int]] = []
     for mm in matmuls:
         mm_a_id, mm_b_id = operand_ids_by_mm[mm.output]
-        a_cap = _capture_side(mm_a_id)
-        b_cap = _capture_side(mm_b_id)
+        a_cap = _capture_dequant_operand(mm_a_id, dequant_by_output, ops, meta, io_dtype, intermediate_dtype, compute_dtype)
+        b_cap = _capture_dequant_operand(mm_b_id, dequant_by_output, ops, meta, io_dtype, intermediate_dtype, compute_dtype)
         gemm_operands.append(
             (
                 _dedup_operand(a_cap["data_id"], a_cap, a_ids, a_caps, "A", meta),
@@ -1756,208 +1731,38 @@ def _build_multi_gemm_chain(
         a0 = a_caps[a_ids[gemm_operands[0][0]]]
         b0 = b_caps[b_ids[gemm_operands[0][1]]]
 
-        def _combo_key(cap):
-            return (
-                cap["data_dtype"],
-                cap["block_size_2d"],
-                cap["sf_dtype"],
-                cap["sf_reorder"],
-                cap["deq_compute"],
-                cap["deq_out"],
-                cap["fake_dequant"],
-            )
-
         for cap in a_caps.values():
-            if _combo_key(cap) != _combo_key(a0):
+            if _block_scale_combo(cap) != _block_scale_combo(a0):
                 raise ValueError("all A operands of a block-scale multi-GEMM must share the same SF combo")
         for cap in b_caps.values():
-            if _combo_key(cap) != _combo_key(b0):
+            if _block_scale_combo(cap) != _block_scale_combo(b0):
                 raise ValueError("all B operands of a block-scale multi-GEMM must share the same SF combo")
-        block_scale_spec = BlockScaleSpec(
-            a_dtype=a0["data_dtype"],
-            b_dtype=b0["data_dtype"],
-            block_size_a=a0["block_size_2d"],
-            block_size_b=b0["block_size_2d"],
-            sf_dtype_a=a0["sf_dtype"],
-            sf_dtype_b=b0["sf_dtype"],
-            sfa_reorder=a0["sf_reorder"],
-            sfb_reorder=b0["sf_reorder"],
-            sfa_dim=meta[a0["sf_id"]].dim if a0["sf_id"] is not None else None,
-            sfa_stride=meta[a0["sf_id"]].stride if a0["sf_id"] is not None else None,
-            sfb_dim=meta[b0["sf_id"]].dim if b0["sf_id"] is not None else None,
-            sfb_stride=meta[b0["sf_id"]].stride if b0["sf_id"] is not None else None,
-            dequant_compute_a=a0["deq_compute"],
-            dequant_compute_b=b0["deq_compute"],
-            dequant_out_a=a0["deq_out"],
-            dequant_out_b=b0["deq_out"],
-            fake_dequant_a=a0["fake_dequant"],
-            fake_dequant_b=b0["fake_dequant"],
-        )
+        block_scale_spec = _block_scale_spec(a0, b0, meta)
     mm_compute = matmuls[0].compute_dtype if matmuls[0].compute_dtype is not None else compute_dtype
+    gemm_out_dtypes = tuple(_resolve_out_dtype(mm.output, mm.output_tensor, io_dtype, intermediate_dtype, meta) for mm in matmuls)
     matmul_out_dim = (batch, M, N)
 
-    # Epilogue DAG over multiple roots (each GEMM output).
-    gemm_idx_by_output: dict[int, int] = {mm.output: g for g, mm in enumerate(matmuls)}
-    consumers_by_input: dict[int, list[_RecordedOp]] = {}
-    for op in ops:
-        for inp in op.inputs:
-            consumers_by_input.setdefault(inp, []).append(op)
+    dag = _build_epilogue_dag(
+        matmuls,
+        ops,
+        meta,
+        matmul_out_dim,
+        io_dtype,
+        intermediate_dtype,
+        compute_dtype,
+        aux_tensors,
+        aux_objs,
+        aux_seen,
+    )
+    gemm_idx_by_output, op_position_by_id = dag.gemm_indices, dag.positions
+    fusion_ops, reachable_quant_ops, recorded_by_out = dag.ops, dag.quant_ops, dag.recorded
 
-    # Pass 1: reachable op set (BFS from all GEMM outputs).
-    reachable_op_ids: set[int] = set()
-    bfs_queue: list[int] = [mm.output for mm in matmuls]
-    visited_tensors: set[int] = set()
-    while bfs_queue:
-        tid = bfs_queue.pop(0)
-        if tid in visited_tensors:
-            continue
-        visited_tensors.add(tid)
-        for op in consumers_by_input.get(tid, []):
-            if op.cudnn_name == "matmul":
-                continue
-            if op.output not in reachable_op_ids:
-                reachable_op_ids.add(op.output)
-                bfs_queue.append(op.output)
-    pointwise_producer = {op.output: op for op in ops if op.cudnn_name in _UNARY_OP_MAP or op.cudnn_name in _BINARY_OP_MAP or op.cudnn_name == "binary_select"}
-    demand: list[int] = [tid for tid, flagged in _TENSOR_OUTPUT_FLAG.items() if flagged]
-    for op in ops:
-        if op.output in reachable_op_ids:
-            demand.extend(op.inputs)
-        elif op.cudnn_name in ("reduction", "block_scale_quantize") and _TENSOR_OUTPUT_FLAG.get(op.output, False):
-            demand.extend(op.inputs)
-    while demand:
-        tid = demand.pop()
-        prod = pointwise_producer.get(tid)
-        if prod is not None and prod.output not in reachable_op_ids:
-            reachable_op_ids.add(prod.output)
-            demand.extend(prod.inputs)
-    reachable_ops = [op for op in ops if op.output in reachable_op_ids and op.cudnn_name not in {"matmul", "reduction", "block_scale_quantize"}]
-    reachable_quant_ops = [
-        op for op in ops if op.cudnn_name == "block_scale_quantize" and (op.output in reachable_op_ids or any(i in reachable_op_ids for i in op.inputs))
-    ]
-
-    def _is_in_chain(tid: int) -> bool:
-        return tid in gemm_idx_by_output or tid in reachable_op_ids
-
-    in_chain_deps: dict[int, list[int]] = {op.output: [inp for inp in op.inputs if _is_in_chain(inp)] for op in reachable_ops}
-
-    # Pass 2: Kahn topo sort (placed seeded with all GEMM outputs).
-    placed: set[int] = set(gemm_idx_by_output)
-    remaining = list(reachable_ops)
-    ordered_ops: list[_RecordedOp] = []
-    while remaining:
-        ready_idx = next(
-            (i for i, op in enumerate(remaining) if all(d in placed for d in in_chain_deps[op.output])),
-            None,
-        )
-        if ready_idx is None:
-            raise AssertionError(f"cycle / unsatisfiable deps: {[op.op_name for op in remaining]}")
-        op = remaining.pop(ready_idx)
-        ordered_ops.append(op)
-        placed.add(op.output)
-
-    op_position_by_id: dict[int, int] = {}
-    pending_ops: list[tuple[FusionOp, int]] = []
-
-    def _register_aux(aux_id: int, op_name: str) -> str:
-        aux_meta = meta[aux_id]
-        if not aux_meta.is_input:
-            raise ValueError(f"aux input {aux_meta.name!r} of op {op_name!r} is " "not a graph input — POC supports only graph-input aux")
-        if aux_id not in aux_seen:
-            aux_seen.add(aux_id)
-            bcast = _infer_bcast_mode(matmul_out_dim, aux_meta.dim)
-            aux_tensors.append(
-                TensorRef(
-                    name=aux_meta.name,
-                    dim=aux_meta.dim,
-                    stride=aux_meta.stride,
-                    dtype=aux_meta.dtype,
-                    bcast_mode=bcast,
-                )
-            )
-            aux_objs.append(aux_meta.tensor)
-        return aux_meta.name
-
-    def _aux_root_ref(tid: int, op_name: str) -> int:
-        if tid in op_position_by_id:
-            return op_position_by_id[tid]
-        name = _register_aux(tid, op_name)
-        pending_ops.append((FusionOp(op="aux_load", aux=name), tid))
-        op_position_by_id[tid] = len(pending_ops) - 1
-        return op_position_by_id[tid]
-
-    def _operand_ref(tid: int, op_name: str = "") -> int:
-        """In-chain operand id → producing-op ref: ``gemm_source(g)`` (<0) for a
-        GEMM output, an op index, or a synthesized aux_load root for a graph input."""
-        if tid in gemm_idx_by_output:
-            return gemm_source(gemm_idx_by_output[tid])
-        if tid in op_position_by_id:
-            return op_position_by_id[tid]
-        m = meta.get(tid)
-        if m is not None and m.is_input:
-            return _aux_root_ref(tid, op_name)
-        raise ValueError(f"op {op_name!r} input is not produced by this epilogue chain and is " "not a graph input")
-
-    for next_op in ordered_ops:
-        if next_op.cudnn_name in _UNARY_OP_MAP:
-            (parent_id,) = next_op.inputs
-            if next_op.cudnn_name == "gen_index" and dict(next_op.op_attrs).get("axis") not in (1, 2):
-                raise NotImplementedError(f"gen_index {next_op.op_name!r}: only axis 1 (M) or 2 (N) is supported " "in cudnn.gemm.frost")
-            fop = FusionOp(op=_UNARY_OP_MAP[next_op.cudnn_name], parent_idx=_operand_ref(parent_id, next_op.op_name), attrs=next_op.op_attrs)
-        elif next_op.cudnn_name in _BINARY_OP_MAP:
-            inp0, inp1 = next_op.inputs
-            in0, in1 = _is_in_chain(inp0), _is_in_chain(inp1)
-            if in0 and in1:
-                fop = FusionOp(
-                    op=_BINARY_OP_MAP[next_op.cudnn_name],
-                    aux=None,
-                    aux_on_rhs=True,
-                    parent_idx=_operand_ref(inp0),
-                    parent_idx_b=_operand_ref(inp1),
-                    attrs=next_op.op_attrs,
-                )
-            elif in0 or in1:
-                if in0:
-                    chain_id, aux_id, aux_on_rhs = inp0, inp1, True
-                else:
-                    chain_id, aux_id, aux_on_rhs = inp1, inp0, False
-                fop = FusionOp(
-                    op=_BINARY_OP_MAP[next_op.cudnn_name],
-                    aux=_register_aux(aux_id, next_op.op_name),
-                    aux_on_rhs=aux_on_rhs,
-                    parent_idx=_operand_ref(chain_id, next_op.op_name),
-                    attrs=next_op.op_attrs,
-                )
-            else:
-                fop = FusionOp(
-                    op=_BINARY_OP_MAP[next_op.cudnn_name],
-                    aux=_register_aux(inp1, next_op.op_name),
-                    aux_on_rhs=True,
-                    parent_idx=_operand_ref(inp0, next_op.op_name),
-                    attrs=next_op.op_attrs,
-                )
-        elif next_op.cudnn_name == "binary_select":
-            i0, i1, im = next_op.inputs
-            fop = FusionOp(
-                op="binary_select",
-                parent_idx=_operand_ref(i0, next_op.op_name),
-                parent_idx_b=_operand_ref(i1, next_op.op_name),
-                parent_idx_c=_operand_ref(im, next_op.op_name),
-            )
-        else:
-            raise ValueError(f"op {next_op.cudnn_name!r} (name={next_op.op_name!r}) is not in " "the POC pointwise subset; out-of-scope")
-        pending_ops.append((fop, next_op.output))
-        op_position_by_id[next_op.output] = len(pending_ops) - 1
-
-    # No fusion epilogue: each GEMM output materializes directly to its own GMEM
-    # buffer. Each must set_output(True); outputs bind in GEMM order.
-    # (K == 1 falls through: the matmul output binds like any chain output.)
-    if not pending_ops and len(matmuls) > 1:
+    if not fusion_ops and len(matmuls) > 1:
         per_gemm_dtypes: list[Dtype] = []
         for mm in matmuls:
-            if not _TENSOR_OUTPUT_FLAG.get(mm.output, False):
+            if not _is_output(meta, mm.output):
                 raise ValueError("no-epilogue multi-GEMM: every GEMM output must be " "set_output(True) (no fusion op materializes it)")
-            per_gemm_dtypes.append(_resolve_out_dtype(mm.output, mm.output_tensor, io_dtype, intermediate_dtype))
+            per_gemm_dtypes.append(_resolve_out_dtype(mm.output, mm.output_tensor, io_dtype, intermediate_dtype, meta))
         matmul_spec = MatmulSpec(
             M=M,
             N=N,
@@ -1976,10 +1781,16 @@ def _build_multi_gemm_chain(
             matmul=matmul_spec,
             aux_tensors=aux_tensors,
             ops=[],
-            output_specs=[OutputSpec(source_ref=gemm_source(g), dtype=dt) for g, dt in enumerate(per_gemm_dtypes)],
+            output_specs=[
+                spec
+                for spec, _ in _output_layouts(
+                    [(OutputSpec(source_ref=gemm_source(g), dtype=dt), mm.output_tensor) for g, (dt, mm) in enumerate(zip(per_gemm_dtypes, matmuls))], [], meta
+                )
+            ],
             num_a_operands=len(a_ids),
             num_b_operands=len(b_ids),
             gemm_operands=gemm_operands,
+            gemm_out_dtypes=gemm_out_dtypes if len(gemm_out_dtypes) > 1 else (),
             block_scale=block_scale_spec,
         )
         # No-epilogue outputs = each GEMM's own buffer, in GEMM order.
@@ -1995,20 +1806,7 @@ def _build_multi_gemm_chain(
         )
         return chain, binding
 
-    set_output_ids_in_order = [tid for tid in _TENSOR_OUTPUT_FLAG if _TENSOR_OUTPUT_FLAG[tid]]
-
-    from dataclasses import replace as _replace
-
-    recorded_by_out = {op.output: op for op in ordered_ops}
-    fusion_ops: list[FusionOp] = []
-    for fop, out_id in pending_ops:
-        if fop.op == "aux_load":
-            fusion_ops.append(fop)
-            continue
-        recorded = recorded_by_out[out_id]
-        op_compute = recorded.compute_dtype if recorded.compute_dtype is not None else compute_dtype
-        op_out_dtype = _resolve_out_dtype(out_id, recorded.output_tensor, io_dtype, intermediate_dtype)
-        fusion_ops.append(_replace(fop, compute_dtype=op_compute, out_dtype=op_out_dtype))
+    set_output_ids_in_order = _materialized_output_ids(meta)
 
     quants, quant_recs, quant_dtypes, quant_scale_objs = _collect_quants(
         reachable_quant_ops,
@@ -2025,14 +1823,8 @@ def _build_multi_gemm_chain(
         "multi-GEMM",
     )
 
-    # GEMM output declared dtype — the epilogue rounds each accumulator to it
-    # before the op chain. All GEMMs share it; resolve from GEMM 0.
-    matmul_out_dtype = _resolve_out_dtype(matmuls[0].output, matmuls[0].output_tensor, io_dtype, intermediate_dtype)
+    matmul_out_dtype = _resolve_out_dtype(matmuls[0].output, matmuls[0].output_tensor, io_dtype, intermediate_dtype, meta)
 
-    # Dense outputs in plain recorder (set_output) order — no output position
-    # carries semantics or capability; specs[0] merely binds first. The raw
-    # matmul output participates for K == 1 (per-GEMM raw taps stay out of
-    # scope for K > 1).
     dense_entries: list[tuple[OutputSpec, Any]] = []
     for tid in set_output_ids_in_order:
         qi = next((i for i, rec in enumerate(quant_recs) if rec.output == tid), None)
@@ -2043,7 +1835,7 @@ def _build_multi_gemm_chain(
                     quant_recs[qi].output_tensor,
                 )
             )
-        elif tid in op_position_by_id and _TENSOR_OUTPUT_FLAG.get(tid, False):
+        elif tid in op_position_by_id and _is_output(meta, tid):
             pos = op_position_by_id[tid]
             dense_entries.append(
                 (
@@ -2051,67 +1843,20 @@ def _build_multi_gemm_chain(
                     recorded_by_out[tid].output_tensor,
                 )
             )
-        elif len(matmuls) == 1 and tid == matmuls[0].output and _TENSOR_OUTPUT_FLAG.get(tid, False):
+        elif tid in gemm_idx_by_output:
             dense_entries.append(
                 (
-                    OutputSpec(source_ref=gemm_source(0), dtype=matmul_out_dtype),
-                    matmuls[0].output_tensor,
+                    OutputSpec(source_ref=gemm_source(gemm_idx_by_output[tid]), dtype=gemm_out_dtypes[gemm_idx_by_output[tid]]),
+                    matmuls[gemm_idx_by_output[tid]].output_tensor,
                 )
             )
 
-    def _reduction_output_dim(red: _RecordedOp) -> tuple[int, int, int]:
-        dim = _TENSOR_DIM_OVERRIDE.get(red.output)
-        if dim is None:
-            try:
-                dim = tuple(red.output_tensor.get_dim())
-            except Exception:  # noqa: BLE001
-                dim = ()
-        if len(dim) != 3:
-            raise ValueError(f"reduction {red.op_name!r} must set a rank-3 output dim; got {dim}")
-        full = (int(batch), int(M), int(N))
-        for axis, (out_extent, full_extent) in enumerate(zip(dim, full)):
-            if out_extent not in (1, full_extent):
-                raise ValueError(
-                    f"reduction {red.op_name!r} output dim {dim} is not compatible " f"with matmul output {full}: axis {axis} must be 1 or {full_extent}"
-                )
-        if all(out_extent == full_extent for out_extent, full_extent in zip(dim, full)):
-            raise ValueError(f"reduction {red.op_name!r} output dim {dim} does not reduce any axis")
-        return (int(dim[0]), int(dim[1]), int(dim[2]))
-
-    reductions: list[ReductionSpec] = []
-    reduction_objs: list[Any] = []
-    for red in ops:
-        if red.cudnn_name != "reduction":
-            continue
-        if not _TENSOR_OUTPUT_FLAG.get(red.output, False):
-            continue
-        (input_id,) = red.inputs
-        if input_id in gemm_idx_by_output or input_id in op_position_by_id:
-            source_ref = _operand_ref(input_id)
-        else:
-            raise ValueError(f"reduction {red.op_name!r} input is not produced by this " "multi-GEMM epilogue chain")
-        compute = red.compute_dtype if red.compute_dtype is not None else compute_dtype
-        dtype = _resolve_out_dtype(red.output, red.output_tensor, io_dtype, intermediate_dtype)
-        if red.reduction_mode is None:
-            raise NotImplementedError(
-                f"reduction {red.op_name!r} mode is not supported by cudnn.gemm.frost; "
-                "supported modes are ADD, AMAX, MAX, MIN, AVG, MUL, MUL_NO_ZEROS, NORM1, and NORM2"
-            )
-        reductions.append(
-            ReductionSpec(
-                mode=red.reduction_mode,  # type: ignore[arg-type]
-                source_ref=source_ref,
-                dim=_reduction_output_dim(red),
-                dtype=dtype,
-                compute_dtype=compute,
-            )
-        )
-        reduction_objs.append(red.output_tensor)
+    reductions, reduction_objs = _collect_reductions(ops, meta, dag, io_dtype, intermediate_dtype, compute_dtype, batch, M, N)
 
     implicit_raw = False
     if not dense_entries:
         if len(matmuls) == 1:
-            implicit_raw = not _TENSOR_OUTPUT_FLAG.get(matmuls[0].output, False)
+            implicit_raw = not _is_output(meta, matmuls[0].output)
             dense_entries.append(
                 (
                     OutputSpec(source_ref=gemm_source(0), dtype=matmul_out_dtype),
@@ -2121,25 +1866,7 @@ def _build_multi_gemm_chain(
         elif not reductions:
             raise ValueError("graph materializes no output; mark at least one tensor " "set_output(True)")
 
-    if dense_entries:
-        from dataclasses import replace as _spec_replace
-
-        for _di in range(len(dense_entries)):
-            _spec_i, _obj_i = dense_entries[_di]
-            _d_i = tuple(_obj_i.get_dim()) if _obj_i is not None else ()
-            _s_i = tuple(_obj_i.get_stride()) if _obj_i is not None else ()
-            if (not _d_i or not _s_i) and _spec_i.quant_idx is not None:
-                _meta_i = meta.get(quant_recs[_spec_i.quant_idx].output)
-                if _meta_i is not None:
-                    _d_i, _s_i = _meta_i.dim, _meta_i.stride
-            # Recorded independently — a derived tensor carries its stride long
-            # before cuDNN fills its dim (only at build_operation_graph time).
-            _layout = {}
-            if _d_i:
-                _layout["dim"] = tuple(_d_i)
-            if _s_i:
-                _layout["stride"] = tuple(_s_i)
-            dense_entries[_di] = (_spec_replace(_spec_i, **_layout), _obj_i)
+    dense_entries = _output_layouts(dense_entries, quant_recs, meta)
     matmul_spec = MatmulSpec(
         M=M,
         N=N,
@@ -2154,9 +1881,6 @@ def _build_multi_gemm_chain(
         accum_dtype=mm_compute,
         out_dtype=matmul_out_dtype,
     )
-    # An implicit (never set_output) raw-matmul output is kept only when
-    # nothing else was requested; with reductions present it is dropped (no
-    # phantom C).
     if implicit_raw and reductions:
         dense_entries = []
     output_specs: list[OutputSpec] = [spec for spec, _obj in dense_entries]
@@ -2169,6 +1893,7 @@ def _build_multi_gemm_chain(
         num_a_operands=len(a_ids),
         num_b_operands=len(b_ids),
         gemm_operands=gemm_operands,
+        gemm_out_dtypes=gemm_out_dtypes if len(gemm_out_dtypes) > 1 else (),
         mainloop_a_ops=mainloop_a_ops,
         mainloop_b_ops=mainloop_b_ops,
         mainloop_a_load_dtype=mainloop_a_load_dtype,
@@ -2199,8 +1924,7 @@ def _build_chain(
     intermediate_dtype: Dtype = "fp32",
     compute_dtype: Dtype = "fp32",
 ) -> FusionChain:
-    # MoE grouped matmul (own graph type): K >= 1 grouped matmuls sharing one
-    # fto + one epilogue DAG (K == 1 with or without epilogue degenerates).
+    """Dispatch a graph snapshot to the dense or grouped builder."""
     moe_ops = [op for op in ops if op.cudnn_name == "moe_grouped_matmul"]
     if moe_ops:
         return _build_multi_moe_chain(moe_ops, ops, meta, io_dtype, intermediate_dtype, compute_dtype)
@@ -2208,8 +1932,6 @@ def _build_chain(
     matmuls = [op for op in ops if op.cudnn_name == "matmul"]
     if len(matmuls) == 0:
         raise ValueError("POC scope is >=1 matmul per graph; found 0")
-    # K >= 1 parallel GEMMs sharing one epilogue DAG (K == 1 degenerates to the
-    # single-GEMM kernel: matmul tap / mainloop fusion / TMA-store all apply).
     return _build_multi_gemm_chain(matmuls, ops, meta, io_dtype, intermediate_dtype, compute_dtype)
 
 
@@ -2218,17 +1940,20 @@ def analyze_with_binding(
 ) -> "tuple[FusionChain, GemmBinding | None]":
     """Build the FusionChain AND a variant-pack binding (role -> cuDNN tensor).
     See :class:`GemmBinding`."""
-    with _ANALYZE_LOCK:
-        state = _state_from_graph(graph)
-        if not state["ops"]:
-            raise ValueError("graph has no ops; nothing to compile")
-        return _build_chain(
-            state["ops"],
-            state["tensor_meta"],
-            state["io_dtype"],
-            state["intermediate_dtype"],
-            state["compute_dtype"],
-        )
+    return _analyze_state(_state_from_graph(graph))
+
+
+def _analyze_state(state: dict) -> tuple[FusionChain, GemmBinding | None]:
+    """Lower one graph metadata snapshot."""
+    if not state["ops"]:
+        raise ValueError("graph has no ops; nothing to compile")
+    return _build_chain(
+        state["ops"],
+        state["tensor_meta"],
+        state["io_dtype"],
+        state["intermediate_dtype"],
+        state["compute_dtype"],
+    )
 
 
 def analyze(graph: cudnn.pygraph) -> FusionChain:

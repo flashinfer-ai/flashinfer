@@ -92,6 +92,13 @@ THE bf16 ROW, one ``st.global.v2.b32`` of 8 B per lane), the SAME helper and con
 fused launch stays bitwise the unfused chain under the attribute too.  The ring stays the io dtype (a bit copy, never quantized -- an e4m3
 ring is a form error naming that rule); the fp8 ``cvt`` needs sm_89+ (an older part is declined by name at compile time, Rule 7).
 
+The rounding attribute (``QsaPrepareIndexArms.rounding`` in ``INDEX_COMPRESS_ROUNDINGS``; 2026-10-29): the indexer-query arm and the
+compress arm are two of the FOUR kernel sites of the indexer's compress chain (``qsa_compress.py``, "The pooled-mean rounding
+attribute"): ``"single"`` is the chain above unchanged; ``"hf"`` rounds the normed row to the io dtype before its rotation and runs the
+rotation in the io dtype (``rope_rotate_half_io``) on BOTH arms, and rounds the pooled key before its norm on the compress arm (the
+identity on the query arm: ``inv_pool = 1.0`` on an io row).  A compile key through the record; the fused launch stays bitwise the
+unfused twins -- ``compile_qsa_compress(pool=1, rounding=)`` and ``compile_qsa_compress_step(rounding=)`` -- under either value.
+
 Bytes per launch (the roofline term is HBM bytes; no perf claim is made here until one is measured on an exclusive GPU):
 Q and K read once and written once, V read once and written once (the pool), the raw key read up to three times (pool,
 ring, its own block) and written to the pool and the ring, the indexer queries read once and written once, plus the slot
@@ -109,7 +116,7 @@ from cutlass.cute.runtime import make_fake_stream
 from flashinfer.experimental.qwen_3_5_block._cudnn_frost.frost.buffers import cutedsl_requirement_error
 from flashinfer.experimental.qwen_3_5_block._cudnn_frost.frost.device import current_device
 from flashinfer.experimental.qwen_3_5_block._cudnn_frost.frost.tile_dsl.barrier import launch_dependent_grids, wait_on_dependent_grids
-from flashinfer.experimental.qwen_3_5_block._cudnn_frost.frost.tile_dsl.pointwise import f16x2_to_f32, fp32_to_fp16, rmsnorm_rstd, rope_rotate_half
+from flashinfer.experimental.qwen_3_5_block._cudnn_frost.frost.tile_dsl.pointwise import f16x2_to_f32, fp32_to_fp16, rmsnorm_rstd, rope_rotate_half, rope_rotate_half_io, round_values_io
 from flashinfer.experimental.qwen_3_5_block._cudnn_frost.frost.tile_dsl.tma import ld_global, ld_global_v2, ld_global_v4, st_global, st_global_v4
 
 from ..cache_write_contract import QsaPrepareIndexArms, check_pool, check_slot_mapping  # the arms record: re-exported for this kernel's callers
@@ -138,6 +145,7 @@ from .qsa_compress import (
     check_e4m3_store_target,
     check_index_cache_dtype,
     check_paged_state,
+    check_rounding,
     check_paged_step_operands,
     min_ring_rows,
     paged_block_row,
@@ -290,6 +298,7 @@ def frost_qsa_prepare(
     h_i_ct: cutlass.Constexpr[int],
     const_head_counts: cutlass.Constexpr[bool],
     use_pdl: cutlass.Constexpr[bool],
+    round_io: cutlass.Constexpr[bool],  # appended: the "hf" rounding arm of the indexer-query and compress arms (module docstring)
 ) -> None:
     """One warp = ``32 // lanes_per_row`` consecutive rows of one arm (module docstring); the arm boundaries are the warp
     counts :func:`prepare_warp_counts` derives, recomputed here from ``n_tok`` so the host's grid and the device's row map
@@ -485,6 +494,7 @@ def frost_qsa_prepare(
             inv_pool = cutlass.Float32(1.0)
             pooled = []
             for c in cutlass.range_constexpr(chunks_i):
+                # ("hf": the pooled-key rounding is the identity here -- acc * 1.0 IS the io row -- so the arm adds nothing at this point)
                 pooled.append([acc[c][i] * inv_pool for i in range(ELEMS_PER_ACCESS)])
             ssq = cutlass.Float32(0.0)
             for c in cutlass.range_constexpr(chunks_i):
@@ -497,7 +507,9 @@ def frost_qsa_prepare(
                 coff = cutlass.Int64((c * lanes_i) * ACCESS_BYTES) + lane_off
                 w_pairs = [f16x2_to_f32(wd, dtype=mWiq.element_type) for wd in ld_global_v4(w_base + coff, cutlass.Int32)]
                 w_vals = [v for pair in w_pairs for v in pair]
-                ys.append([pooled[c][i] * rstd * (w_vals[i] + w_offset_i) for i in range(ELEMS_PER_ACCESS)])
+                row = [pooled[c][i] * rstd * (w_vals[i] + w_offset_i) for i in range(ELEMS_PER_ACCESS)]
+                # "hf": the normed row (all dims) rounded to the io dtype before its rotation -- qsa_compress.py's point, same helper
+                ys.append(round_values_io(row, mIQsrc.element_type) if cutlass.const_expr(round_io) else row)
             if cutlass.const_expr(rope_dim > 0):
                 in_rope = lane < cutlass.Int32(rope_lanes)
                 cos_v = [cutlass.Float32(0.0)] * ELEMS_PER_ACCESS
@@ -508,9 +520,19 @@ def frost_qsa_prepare(
                     s_pairs = [f16x2_to_f32(wd, dtype=table_dtype) for wd in ld_global_v4(s_addr, cutlass.Int32)]
                     cos_v = [v for pair in c_pairs for v in pair]
                     sin_v = [v for pair in s_pairs for v in pair]
-                for i in cutlass.range_constexpr(ELEMS_PER_ACCESS):
-                    rotated = rope_rotate_half(ys[0][i], cos_v[i], sin_v[i], lane, half_lanes)
-                    ys[0][i] = rotated if in_rope else ys[0][i]
+                if cutlass.const_expr(round_io):
+                    # "hf": the io-dtype rotation, each op rounded (qsa_compress.py's arm, the same helper); every lane reaches the shuffles
+                    for ii in cutlass.range_constexpr(ELEMS_PER_ACCESS // 2):
+                        i0 = 2 * ii
+                        r0, r1 = rope_rotate_half_io(
+                            ys[0][i0], ys[0][i0 + 1], cos_v[i0], cos_v[i0 + 1], sin_v[i0], sin_v[i0 + 1], lane, half_lanes, mIQsrc.element_type
+                        )
+                        ys[0][i0] = r0 if in_rope else ys[0][i0]
+                        ys[0][i0 + 1] = r1 if in_rope else ys[0][i0 + 1]
+                else:
+                    for i in cutlass.range_constexpr(ELEMS_PER_ACCESS):
+                        rotated = rope_rotate_half(ys[0][i], cos_v[i], sin_v[i], lane, half_lanes)
+                        ys[0][i] = rotated if in_rope else ys[0][i]
             if store_qi:
                 iq_fp8 = cutlass.const_expr(mIQout.element_type == cutlass.Float8E4M3FN)  # the e4m3 store arm: 1 B per element
                 iq_bpe = cutlass.Int64(1) if cutlass.const_expr(iq_fp8) else bpe
@@ -635,7 +657,9 @@ def frost_qsa_prepare(
                 inv_pool = cutlass.Float32(1.0 / pool)
                 pooled = []
                 for c in cutlass.range_constexpr(chunks_i):
-                    pooled.append([acc[c][i] * inv_pool for i in range(ELEMS_PER_ACCESS)])
+                    row = [acc[c][i] * inv_pool for i in range(ELEMS_PER_ACCESS)]
+                    # "hf": the pooled key rounded to the io dtype BEFORE its norm (qsa_compress.py's point, the same helper)
+                    pooled.append(round_values_io(row, mIKsrc.element_type) if cutlass.const_expr(round_io) else row)
                 ssq = cutlass.Float32(0.0)
                 for c in cutlass.range_constexpr(chunks_i):
                     for i in cutlass.range_constexpr(ELEMS_PER_ACCESS):
@@ -647,7 +671,9 @@ def frost_qsa_prepare(
                     coff = cutlass.Int64((c * lanes_i) * ACCESS_BYTES) + lane_off
                     w_pairs = [f16x2_to_f32(wd, dtype=mWik.element_type) for wd in ld_global_v4(w_base + coff, cutlass.Int32)]
                     w_vals = [v for pair in w_pairs for v in pair]
-                    ys.append([pooled[c][i] * rstd * (w_vals[i] + w_offset_i) for i in range(ELEMS_PER_ACCESS)])
+                    row = [pooled[c][i] * rstd * (w_vals[i] + w_offset_i) for i in range(ELEMS_PER_ACCESS)]
+                    # "hf": the normed row (all dims) rounded to the io dtype before its rotation
+                    ys.append(round_values_io(row, mIKsrc.element_type) if cutlass.const_expr(round_io) else row)
                 if cutlass.const_expr(rope_dim > 0):
                     in_rope = lane < cutlass.Int32(rope_lanes)
                     bc = b if cutlass.Int32(mCosPos.shape[0]) > cutlass.Int32(1) else cutlass.Int32(0)
@@ -667,9 +693,19 @@ def frost_qsa_prepare(
                         s_pairs = [f16x2_to_f32(wd, dtype=mSinPos.element_type) for wd in ld_global_v4(s_addr, cutlass.Int32)]
                         cos_v = [v for pair in c_pairs for v in pair]
                         sin_v = [v for pair in s_pairs for v in pair]
-                    for i in cutlass.range_constexpr(ELEMS_PER_ACCESS):
-                        rotated = rope_rotate_half(ys[0][i], cos_v[i], sin_v[i], lane, half_lanes)
-                        ys[0][i] = rotated if in_rope else ys[0][i]
+                    if cutlass.const_expr(round_io):
+                        # "hf": the io-dtype rotation, each op rounded (qsa_compress.py's arm); every lane reaches the shuffles
+                        for ii in cutlass.range_constexpr(ELEMS_PER_ACCESS // 2):
+                            i0 = 2 * ii
+                            r0, r1 = rope_rotate_half_io(
+                                ys[0][i0], ys[0][i0 + 1], cos_v[i0], cos_v[i0 + 1], sin_v[i0], sin_v[i0 + 1], lane, half_lanes, mIKsrc.element_type
+                            )
+                            ys[0][i0] = r0 if in_rope else ys[0][i0]
+                            ys[0][i0 + 1] = r1 if in_rope else ys[0][i0 + 1]
+                    else:
+                        for i in cutlass.range_constexpr(ELEMS_PER_ACCESS):
+                            rotated = rope_rotate_half(ys[0][i], cos_v[i], sin_v[i], lane, half_lanes)
+                            ys[0][i] = rotated if in_rope else ys[0][i]
                 if write_blk:
                     for c in cutlass.range_constexpr(chunks_i):
                         y = ys[c]
@@ -745,6 +781,7 @@ def qsa_prepare_launch(
     h_i_ct: cutlass.Constexpr[int],
     const_head_counts: cutlass.Constexpr[bool],
     use_pdl: cutlass.Constexpr[bool],
+    round_io: cutlass.Constexpr[bool],
     stream: cuda.CUstream,
 ):
     frost_qsa_prepare(
@@ -799,6 +836,7 @@ def qsa_prepare_launch(
         h_i_ct,
         const_head_counts,
         use_pdl,
+        round_io,
     ).launch(grid=(n_blocks, 1, 1), block=(threads_per_cta, 1, 1), stream=stream, use_pdl=use_pdl)
 
 
@@ -853,12 +891,15 @@ def compile_qsa_prepare(
     switch); ``index`` names the indexer arms to trace (``None`` = no indexer band: the attention rows and the K / V pools
     only); ``index_cache_dtype`` (appended) names the indexer queries' and the compressed-key cache's dtype -- ``None`` = the io
     dtype, ``torch.float8_e4m3fn`` = the e4m3 store arm of the query and the compress arms (module docstring; bf16 io only; sm_89+ --
-    an older part is a typed ``NotImplementedError`` naming the instruction).  Every flag is in the cache key.
+    an older part is a typed ``NotImplementedError`` naming the instruction).  ``index.rounding`` (the record's appended field) names
+    the rounding points of the query and the compress arms (``"single"`` / ``"hf"``; module docstring).  Every flag is in the cache key.
     """
     too_old = cutedsl_requirement_error("qsa_prepare")
     if too_old is not None:
         raise NotImplementedError(too_old)
     ix = index if (index is not None and index.any) else None
+    if ix is not None:
+        check_rounding("qsa_prepare", ix.rounding)
     validate_prepare_shape(d, rope_dim, page_size, threads_per_cta, None if ix is None else ix.head_dim, DEFAULT_POOL if ix is None else ix.pool)
     if dtype not in _IO_DTYPES:
         raise ValueError(f"qsa_prepare serves bf16 / f16 io only, got {dtype}")
@@ -989,6 +1030,7 @@ def compile_qsa_prepare(
             int(h_i),
             bool(const_head_counts),
             bool(use_pdl),
+            bool(ix is not None and ix.rounding == "hf"),  # round_io
             _FAKE_STREAM,
             options="--enable-tvm-ffi",
         )

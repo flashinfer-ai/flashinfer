@@ -54,7 +54,7 @@ groups of a two-stream stage write disjoint outputs, so the outputs and
 gradients are bitwise run to run for one layout and one plan, with one or two
 streams.
 The plan pins that tests and tuning use are explicit keyword arguments of
-:func:`chunk_gated_delta_rule` (``scan_config``, ``segment_chunks``,
+:func:`chunk_gated_delta_rule_det` (``scan_config``, ``segment_chunks``,
 ``finalize``, ``warmup_log2``, ``dhu_scan``, ``prep``, ``lpt``, ``streams``);
 nothing here reads an environment variable.
 """
@@ -79,6 +79,7 @@ __all__ = [
     "PRESCAN_CONFIGS",
     "REG_SCAN_CONFIGS",
     "ChainOptions",
+    "ChunkGatedDeltaRuleDetFunction",
     "ChunkGatedDeltaRuleFunction",
     "ChunkMeta",
     "ScanPlan",
@@ -89,9 +90,12 @@ __all__ = [
     "build_chunk_meta_from_cu_seqlens",
     "choose_scan_plan",
     "chunk_gated_delta_rule",
+    "chunk_gated_delta_rule_det",
     "dhu_tc_pricing",
     "finalize_stage",
     "gdn_chunk_backward",
+    "gdn_chunk_det_backward",
+    "gdn_chunk_det_forward",
     "gdn_chunk_forward",
     "lpt_sequence_order",
     "lpt_walk",
@@ -1488,7 +1492,7 @@ def _launch_fwd_ho(arch, qn, kn, w, u, g_cs, initial_state, meta, num_heads, num
     return h, v_new, final_state, o
 
 
-def gdn_chunk_forward(q, k, v, g, beta, *, meta, arch, scale=None, initial_state=None, output_final_state=False,
+def gdn_chunk_det_forward(q, k, v, g, beta, *, meta, arch, scale=None, initial_state=None, output_final_state=False,
                       normalize_qk=True, options: ChainOptions | None = None) -> dict[str, Any]:  # fmt: skip
     """The forward chain over flattened ``[T, H, 128]`` / ``[T, HV, 128]`` inputs and one chunk table; returns the
     output and the tape the backward reads."""
@@ -1496,7 +1500,7 @@ def gdn_chunk_forward(q, k, v, g, beta, *, meta, arch, scale=None, initial_state
     num_heads, key_dim = q.shape[-2], q.shape[-1]
     num_v_heads, value_dim = v.shape[-2], v.shape[-1]
     if key_dim != HEAD_DIM or value_dim != HEAD_DIM:
-        raise ValueError("gdn_chunk_forward requires K = V = 128")
+        raise ValueError("gdn_chunk_det_forward requires K = V = 128")
     if num_v_heads % num_heads != 0:
         raise ValueError("num_v_heads must be a multiple of num_heads")
     total_tokens = q.numel() // (num_heads * key_dim)
@@ -1563,7 +1567,7 @@ def gdn_chunk_forward(q, k, v, g, beta, *, meta, arch, scale=None, initial_state
 # --------------------------------------------------------------------------- #
 # backward
 # --------------------------------------------------------------------------- #
-def gdn_chunk_backward(
+def gdn_chunk_det_backward(
     forward, do, dht=None, *, initial_state=None, dbeta_dtype=None
 ) -> dict[str, Any]:
     """The backward chain over one forward tape; returns ``dq``, ``dk``, ``dv``, ``dg``, ``dbeta`` and
@@ -1768,7 +1772,7 @@ _OPTIONAL_INPUT = 5
 
 
 def _check_inputs(q, k, v, g, beta, initial_state, cu_seqlens, cu_seqlens_cpu) -> None:
-    """The API-boundary checks of :func:`chunk_gated_delta_rule`: devices, shapes and the offsets' form, from tensor
+    """The API-boundary checks of :func:`chunk_gated_delta_rule_det`: devices, shapes and the offsets' form, from tensor
     metadata only (no device synchronization; the values of ``cu_seqlens_cpu`` are checked when its layout is first
     planned, those of the device ``cu_seqlens`` not at all).  FLA's ``chunk_gated_delta_rule`` checks the head
     counts, the batch of a packed call and the rows of ``initial_state``; the rest is this backend's contract.
@@ -1926,7 +1930,7 @@ def _chunk_meta(
     return meta
 
 
-class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
+class ChunkGatedDeltaRuleDetFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, q, k, v, g, beta, scale, initial_state, output_final_state, cu_seqlens, cu_seqlens_cpu,
                 use_qk_l2norm_in_kernel, options):  # fmt: skip
@@ -1937,7 +1941,7 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
         meta = _chunk_meta(
             cu_seqlens, cu_seqlens_cpu, batch, seq_len, index, num_v_heads, options
         )
-        fwd = gdn_chunk_forward(q, k, v, g, beta, meta=meta, arch=arch, scale=scale, initial_state=initial_state,
+        fwd = gdn_chunk_det_forward(q, k, v, g, beta, meta=meta, arch=arch, scale=scale, initial_state=initial_state,
                                 output_final_state=output_final_state, normalize_qk=use_qk_l2norm_in_kernel,
                                 options=options)  # fmt: skip
         state_tensors = (
@@ -1969,7 +1973,7 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
                 "g_shape": g_shape, "beta_shape": beta_shape, "options": ctx.options}  # fmt: skip
         if ctx.saved_state_tensors:
             tape["w"], tape["u"], tape["h"], tape["v_new"] = state_tensors
-        grads = gdn_chunk_backward(
+        grads = gdn_chunk_det_backward(
             tape,
             do.contiguous(),
             dht,
@@ -1999,7 +2003,7 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
         )
 
 
-def chunk_gated_delta_rule(
+def chunk_gated_delta_rule_det(
     q,
     k,
     v,
@@ -2052,5 +2056,12 @@ def chunk_gated_delta_rule(
         g = g.float()
     if scale is None:
         scale = 1.0 / math.sqrt(q.shape[-1])
-    return ChunkGatedDeltaRuleFunction.apply(q, k, v, g, beta, float(scale), initial_state, output_final_state,
-                                             cu_seqlens, cu_seqlens_cpu, use_qk_l2norm_in_kernel, options)  # fmt: skip
+    return ChunkGatedDeltaRuleDetFunction.apply(q, k, v, g, beta, float(scale), initial_state, output_final_state,
+                                                cu_seqlens, cu_seqlens_cpu, use_qk_l2norm_in_kernel, options)  # fmt: skip
+
+
+# Former names of the entry points, kept as aliases of the deterministic ones.
+ChunkGatedDeltaRuleFunction = ChunkGatedDeltaRuleDetFunction
+chunk_gated_delta_rule = chunk_gated_delta_rule_det
+gdn_chunk_forward = gdn_chunk_det_forward
+gdn_chunk_backward = gdn_chunk_det_backward

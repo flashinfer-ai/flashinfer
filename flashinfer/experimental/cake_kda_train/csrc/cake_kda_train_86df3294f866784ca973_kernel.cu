@@ -330,87 +330,87 @@ kernel_cake_kda_train_86df3294f866784ca973(float* __restrict__ g, __nv_bfloat16*
         uint2* _vdst_5 = reinterpret_cast<uint2*>(&dwa[0]);
         *_vdst_5 = _vld_5;
     }
-    int t_u_2_1 = warp_0 * 8 + 1;
-    int t_c_3 = t_u_2_1;
-    if (t_u_2_1 > clast) {
-        t_c_3 = clast;
+    int t_u_r_0 = warp_0 * 8 + 1;
+    int t_c_r_0 = t_u_r_0;
+    if (t_u_r_0 > clast) {
+        t_c_r_0 = clast;
     }
-    long long eidx_d_4 = ebase + (long long)(t_c_3 * rs);
+    long long eidx_d_r_0 = ebase + (long long)(t_c_r_0 * rs);
     {
         uint2 _vld_6;
-        _vld_6 = *reinterpret_cast<const uint2*>(do_ + eidx_d_4);
+        _vld_6 = *reinterpret_cast<const uint2*>(do_ + eidx_d_r_0);
         uint2* _vdst_6 = reinterpret_cast<uint2*>(&dwa[2]);
         *_vdst_6 = _vld_6;
     }
-    int t_u_5 = warp_0 * 8 + 2;
-    int t_c_6 = t_u_5;
-    if (t_u_5 > clast) {
-        t_c_6 = clast;
+    int t_u_r_1 = warp_0 * 8 + 2;
+    int t_c_r_1 = t_u_r_1;
+    if (t_u_r_1 > clast) {
+        t_c_r_1 = clast;
     }
-    long long eidx_d_7 = ebase + (long long)(t_c_6 * rs);
+    long long eidx_d_r_1 = ebase + (long long)(t_c_r_1 * rs);
     {
         uint2 _vld_7;
-        _vld_7 = *reinterpret_cast<const uint2*>(do_ + eidx_d_7);
+        _vld_7 = *reinterpret_cast<const uint2*>(do_ + eidx_d_r_1);
         uint2* _vdst_7 = reinterpret_cast<uint2*>(&dwa[4]);
         *_vdst_7 = _vld_7;
     }
-    int t_u_8 = warp_0 * 8 + 3;
-    int t_c_9 = t_u_8;
-    if (t_u_8 > clast) {
-        t_c_9 = clast;
+    int t_u_r_2 = warp_0 * 8 + 3;
+    int t_c_r_2 = t_u_r_2;
+    if (t_u_r_2 > clast) {
+        t_c_r_2 = clast;
     }
-    long long eidx_d_10 = ebase + (long long)(t_c_9 * rs);
+    long long eidx_d_r_2 = ebase + (long long)(t_c_r_2 * rs);
     {
         uint2 _vld_8;
-        _vld_8 = *reinterpret_cast<const uint2*>(do_ + eidx_d_10);
+        _vld_8 = *reinterpret_cast<const uint2*>(do_ + eidx_d_r_2);
         uint2* _vdst_8 = reinterpret_cast<uint2*>(&dwa[6]);
         *_vdst_8 = _vld_8;
     }
-    int t_u_11 = warp_0 * 8 + 4;
-    int t_c_12 = t_u_11;
-    if (t_u_11 > clast) {
-        t_c_12 = clast;
+    int t_u_r_3 = warp_0 * 8 + 4;
+    int t_c_r_3 = t_u_r_3;
+    if (t_u_r_3 > clast) {
+        t_c_r_3 = clast;
     }
-    long long eidx_d_13 = ebase + (long long)(t_c_12 * rs);
+    long long eidx_d_r_3 = ebase + (long long)(t_c_r_3 * rs);
     {
         uint2 _vld_9;
-        _vld_9 = *reinterpret_cast<const uint2*>(do_ + eidx_d_13);
+        _vld_9 = *reinterpret_cast<const uint2*>(do_ + eidx_d_r_3);
         uint2* _vdst_9 = reinterpret_cast<uint2*>(&dwa[8]);
         *_vdst_9 = _vld_9;
     }
-    int t_u_14 = warp_0 * 8 + 5;
-    int t_c_15 = t_u_14;
-    if (t_u_14 > clast) {
-        t_c_15 = clast;
+    int t_u_r_4 = warp_0 * 8 + 5;
+    int t_c_r_4 = t_u_r_4;
+    if (t_u_r_4 > clast) {
+        t_c_r_4 = clast;
     }
-    long long eidx_d_16 = ebase + (long long)(t_c_15 * rs);
+    long long eidx_d_r_4 = ebase + (long long)(t_c_r_4 * rs);
     {
         uint2 _vld_10;
-        _vld_10 = *reinterpret_cast<const uint2*>(do_ + eidx_d_16);
+        _vld_10 = *reinterpret_cast<const uint2*>(do_ + eidx_d_r_4);
         uint2* _vdst_10 = reinterpret_cast<uint2*>(&dwa[10]);
         *_vdst_10 = _vld_10;
     }
-    int t_u_17 = warp_0 * 8 + 6;
-    int t_c_18 = t_u_17;
-    if (t_u_17 > clast) {
-        t_c_18 = clast;
+    int t_u_r_5 = warp_0 * 8 + 6;
+    int t_c_r_5 = t_u_r_5;
+    if (t_u_r_5 > clast) {
+        t_c_r_5 = clast;
     }
-    long long eidx_d_19 = ebase + (long long)(t_c_18 * rs);
+    long long eidx_d_r_5 = ebase + (long long)(t_c_r_5 * rs);
     {
         uint2 _vld_11;
-        _vld_11 = *reinterpret_cast<const uint2*>(do_ + eidx_d_19);
+        _vld_11 = *reinterpret_cast<const uint2*>(do_ + eidx_d_r_5);
         uint2* _vdst_11 = reinterpret_cast<uint2*>(&dwa[12]);
         *_vdst_11 = _vld_11;
     }
-    int t_u_20 = warp_0 * 8 + 7;
-    int t_c_21 = t_u_20;
-    if (t_u_20 > clast) {
-        t_c_21 = clast;
+    int t_u_r_6 = warp_0 * 8 + 7;
+    int t_c_r_6 = t_u_r_6;
+    if (t_u_r_6 > clast) {
+        t_c_r_6 = clast;
     }
-    long long eidx_d_22 = ebase + (long long)(t_c_21 * rs);
+    long long eidx_d_r_6 = ebase + (long long)(t_c_r_6 * rs);
     {
         uint2 _vld_12;
-        _vld_12 = *reinterpret_cast<const uint2*>(do_ + eidx_d_22);
+        _vld_12 = *reinterpret_cast<const uint2*>(do_ + eidx_d_r_6);
         uint2* _vdst_12 = reinterpret_cast<uint2*>(&dwa[14]);
         *_vdst_12 = _vld_12;
     }
