@@ -397,14 +397,22 @@ def make_dsl(
 ) -> Callable[[], torch.Tensor]:
     """The CuTe-DSL kernel (``--impls dsl``), same contract and algo names as the
     C++ one; ``dsl:<algo>`` columns pin a variant like ``kernel:<algo>``."""
-    from flashinfer.gemm.w8a16_fp8 import W8A16_FP8_GEMM_ALGOS_SM100
+    from flashinfer.gemm.w8a16_fp8 import (
+        W8A16_FP8_GEMM_ALGOS_SM90,
+        W8A16_FP8_GEMM_ALGOS_SM100,
+    )
     from flashinfer.gemm.w8a16_fp8_cute_dsl import w8a16_fp8_gemm_cute_dsl
 
     if out is None:
         out = torch.empty(
             act.shape[0], w_fp8.shape[0], dtype=act.dtype, device=act.device
         )
-    code = 0 if algo in (None, "auto") else W8A16_FP8_GEMM_ALGOS_SM100[algo]
+    table = (
+        W8A16_FP8_GEMM_ALGOS_SM90
+        if torch.cuda.get_device_capability(act.device)[0] == 9
+        else W8A16_FP8_GEMM_ALGOS_SM100
+    )
+    code = 0 if algo in (None, "auto") else table[algo]
     scale1 = scale.reshape(1).contiguous()
 
     def run() -> torch.Tensor:
