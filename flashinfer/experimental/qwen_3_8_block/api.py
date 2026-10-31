@@ -8,8 +8,9 @@ batch, the query rows per sequence, the page size and the pools' layout, the blo
 compressed-key cache's rows per page, the ring's capacity --, the input-contract flags, the knobs); ``prepare`` builds it outside
 CUDA-graph capture (it JIT-compiles the kernels and sizes the workspace), ``run`` launches it -- on the DECODE form the FIRST ``run``
 after ``prepare`` may already be captured (no plan constant, no allocation, no host read on the execute path); on the EXTEND forms a
-capture takes the run AFTER one eager warm-up on the capture stream (the first run uploads the select window plan's constants; under
-the 128-row bound every projection rides the capture-safe JIT route).  The functional entry point keeps a small LRU of plans keyed on exactly the facts
+capture takes the run AFTER one eager warm-up on the capture stream (the first run uploads the select window plan's constants; every
+projection rides the capture-safe JIT route at every row count -- past 128 rows the band slab takes the GEMM engine's own baseline tile,
+the 6b21be0e0 pin).  The functional entry point keeps a small LRU of plans keyed on exactly the facts
 a plan compiles in (the Qwen 3.5 package's rules: a plan a CUDA graph was captured over outlives its eviction and is released by
 ``clear_plan_cache`` only).  The vendored tree is the Qwen 3.5 package's (``..qwen_3_5_block._cudnn_frost``) and so are the cache roots
 (``configure_vendored_tree``) and the operand helpers.
@@ -29,7 +30,10 @@ values; stated in the README): ``seq_lens[b] in {0} u [T, max_pages x page_size]
 nothing written), a shorter live sequence reported ``-2`` and one past the table's reach ``-3`` in the plan's workspace, never raised;
 the ring INPUT contract (positions ``4 floor(P / 4) .. P - 1`` already in the ring: the stack's rule or the block's own previous chunk /
 step); mixed steps (decodes + prefills) = one decode plan and one extend plan per layer, run back to back; ragged chunks = several
-runs grouped by ``T``.
+runs grouped by ``T``.  ONE run holds at most ``support.EXTEND_ROWS_GRID_MAX`` = 65,535 rows at this pin (``batch x T``; ``batch x q_len``
+on the decode form, whose step's query compress shares the launch) -- the vendored indexer's query compress launches with the run's row
+count as a CUDA grid dimension -- so a longer chunk at a batch is several runs and a wider decode step several steps or a smaller batch;
+the light gates decline it typed, before any vendored code (the ``indexer_extend_grid_rows`` row of every form record of the probe).
 
 The sparse core's BODY knob (``sparse_tile_form``, appended with the 7301fad21 pin; performance-only): ``"auto"`` (the default) lets
 the vendored tree pick the body -- on cc 10.7 the LEAN decode tile at ``batch x H_kv <= 4`` CTAs per chunk (the bound's unit since the
@@ -843,10 +847,14 @@ def _light_decode_gates(
     kv_cache_dtype,
     use_pdl,
     sparse_tile_form: str = SPARSE_TILE_FORM_AUTO,
+    *,
+    batch_size: int,
 ) -> None:
     """The decode form's typed declines that need no vendored code (the mirrored constants): the page sizes the paged scorer addresses,
-    the scorer's query-row envelope, the e4m3 pool, the sparse core's body vocabulary.  The vendored declaration repeats them with the
-    envelope's own texts."""
+    the scorer's query-row envelope, the launch-grid bound of one run (``batch_size x q_len <= EXTEND_ROWS_GRID_MAX`` = 65,535 at this pin:
+    the decode step's query compress shares the extend step's launch, the run's row count as a CUDA grid dimension --
+    :func:`support.extend_rows_grid_reason`, the same row and remedy as the extend forms'), the e4m3 pool, the sparse core's body
+    vocabulary.  The vendored declaration repeats the envelope rows with its own texts; the launch-grid row is this entry's."""
     if page_size not in PAGE_SIZES:
         raise NotImplementedError(
             f"{_PKG} (decode): the paged scorer splits a block id into its page and row by a shift, so page_size must be one of {PAGE_SIZES} "
@@ -859,6 +867,9 @@ def _light_decode_gates(
             f"the decode scorer's envelope ({INDEX_QUERY_ROWS_MAX}: four 16-row MMA tiles) -- at most q_len_per_req={geometry.decode_max_q_len} "
             "at this head count"
         )
+    grid = _support.extend_rows_grid_reason(geometry, "decode", batch_size, q_len)
+    if grid is not None:
+        raise NotImplementedError(f"{_PKG} (decode): {grid}")
     if kv_cache_dtype is not None and kv_cache_dtype not in (torch.bfloat16,):
         raise NotImplementedError(
             f"{_PKG} (decode): kv_cache_dtype={kv_cache_dtype}: the block-sparse decode step with the in-block indexer serves bf16 pools; the "
@@ -882,29 +893,33 @@ def _light_extend_gates(
     geometry: Qwen38BlockGeometry,
     form: str,
     page_size: int,
-    batch_size: int,
-    q_len: int,
     kv_cache_dtype,
     use_pdl,
     fuse_prepare,
     sparse_tile_form: str = SPARSE_TILE_FORM_AUTO,
+    *,
+    batch_size: int,
+    q_len_per_req: int,
 ) -> None:
     """The extend / prefill forms' typed declines that need no vendored code: the page sizes the paged indexer addresses (both steps read
-    the compressed-key cache by a shift), the FlashInfer-side rows bound of one run (``batch_size x q_len_per_req <= EXTEND_ROWS_MAX``: the
-    band slab's JIT-only projection route at this pin -- past it the slab takes the cuDNN graph route the vendored tree does not carry),
-    the e4m3 pool (the vendored ``indexer_e4m3_pool`` row applies to both steps), the types of ``use_pdl`` / ``fuse_prepare`` (an explicit
-    ``fuse_prepare=True`` reaches the vendored declaration, which declines it by name: ``indexer_extend_fuse_prepare``), the sparse core's
-    body vocabulary.  The decode scorer's query-row envelope (``INDEX_QUERY_ROWS_MAX``) is the DECODE form's row and does not apply: the
-    EXTEND step serves any ``q_len_per_req`` up to the block table's reach (checked in :func:`prepare` once the table's width is known) and
-    the rows bound.  The vendored declaration repeats every envelope row with its own text."""
+    the compressed-key cache by a shift), the e4m3 pool (the vendored ``indexer_e4m3_pool`` row applies to both steps), the types of
+    ``use_pdl`` / ``fuse_prepare`` (an explicit ``fuse_prepare=True`` reaches the vendored declaration, which declines it by name:
+    ``indexer_extend_fuse_prepare``), the sparse core's body vocabulary.  The decode scorer's query-row envelope (``INDEX_QUERY_ROWS_MAX``)
+    is the DECODE form's row and does not apply: the EXTEND step serves any ``q_len_per_req`` up to the block table's reach (checked in
+    :func:`prepare` once the table's width is known) at any batch -- no projection rows bound since the 6b21be0e0 pin, where the band slab's
+    projection takes the GEMM engine's own baseline tile past 128 rows on the same JIT-only route (the previous pin's
+    ``extend_proj_slab_rows`` decline is retired); the ONE rows bound that remains is the launch-grid bound of one run
+    (``batch_size x q_len_per_req <= EXTEND_ROWS_GRID_MAX`` = 65,535 at this pin: the vendored indexer's query compress launches with the
+    run's row count as a CUDA grid dimension), raised here typed and named (:func:`support.extend_rows_grid_reason`) before any vendored
+    code.  The vendored declaration repeats every envelope row with its own text."""
     if page_size not in PAGE_SIZES:
         raise NotImplementedError(
             f"{_PKG} ({form}): the paged indexer splits a block id into its page and row by a shift, so page_size must be one of {PAGE_SIZES} "
             f"(a power-of-two count of {geometry.block_size}-token compressed rows per page); got page_size={page_size}"
         )
-    rows = _support.extend_rows_reason(geometry, form, batch_size, q_len)
-    if rows is not None:
-        raise NotImplementedError(f"{_PKG} ({form}): {rows}")
+    grid = _support.extend_rows_grid_reason(geometry, form, batch_size, q_len_per_req)
+    if grid is not None:
+        raise NotImplementedError(f"{_PKG} ({form}): {grid}")
     if kv_cache_dtype is not None and kv_cache_dtype not in (torch.bfloat16,):
         raise NotImplementedError(
             f"{_PKG} ({form}): kv_cache_dtype={kv_cache_dtype}: the in-block indexer's steps over the pools serve bf16 pools; the e4m3 pool "
@@ -1029,21 +1044,28 @@ def prepare(
         )
     if extend:
         # the EXTEND step's own light gates: the decode scorer's query-row envelope does not apply (any chunk up to the table's reach,
-        # checked below once the table's width is known); the ring floor is cap >= 3 (checked on the sample below)
+        # checked below once the table's width is known, within ONE run's launch-grid bound of 65,535 rows at this pin, checked here); the
+        # ring floor is cap >= 3 (checked on the sample below)
         _light_extend_gates(
             geometry,
             form,
             page_size,
-            batch_size,
-            q,
             kv_cache_dtype,
             use_pdl,
             fuse_prepare,
             sparse_tile_form,
+            batch_size=batch_size,
+            q_len_per_req=q,
         )
     else:
         _light_decode_gates(
-            geometry, page_size, q, kv_cache_dtype, use_pdl, sparse_tile_form
+            geometry,
+            page_size,
+            q,
+            kv_cache_dtype,
+            use_pdl,
+            sparse_tile_form,
+            batch_size=batch_size,
         )
     pool_dtype = dtype if kv_cache_dtype is None else kv_cache_dtype
     _check_weights(weights, w_o, geometry, dtype, dev)
@@ -1231,9 +1253,11 @@ def prepare(
             f"{'extend' if extend else 'decode'}); the adapter's form routing (api.prepare) must be updated with the re-vendored tree"
         )
     if not extend:
-        # The projection GEMMs on the capture-safe JIT route by construction (the band slab's 128-row tile at batch x q_len <= 128).  On the
-        # extend forms the band slab leaves the small-M route past 128 rows (the graph route, where the forced flag would be the driver's
-        # typed decline at compile): the vendored block flags each paged projection stage itself at compile from its own (M, N, K).
+        # The decode form forces the capture-safe JIT route on both projections (the band slab's 128-row small-M tile inside the validated
+        # decode capture envelope; a route without a JIT tile would be the driver's typed decline at compile, never a silent graph route).
+        # On the extend forms the vendored block flags each paged projection stage itself at compile from its own (M, N, K) -- the small-M
+        # tile up to 128 rows, the GEMM engine's own baseline tile past them (the 6b21be0e0 pin): the JIT-only route at every row count,
+        # read back below as proj_capture_safe / out_proj_capture_safe.
         for st in (blk._proj, blk._out_proj):
             if st is not None:
                 st.capture_safe = True
@@ -1278,6 +1302,10 @@ def prepare(
         + (1 if (out_proj_tile and "splitK" in str(out_proj_tile)) else 0)
     )
     n_windows = int(getattr(ixd, "n_windows", 0)) if extend else 0
+    # the vendored block's own capture-safe reading of its two projection stages after compile (True = the JIT-only route: no backend plan,
+    # no cuDNN handle; the decode form forces it, the extend forms read it off the tile resolver at every row count since the 6b21be0e0 pin)
+    proj_capture_safe = bool(getattr(blk._proj, "capture_safe", False))
+    out_proj_capture_safe = bool(getattr(blk._out_proj, "capture_safe", False))
     declaration = dict(
         form=form,
         page_size=page_size,
@@ -1326,7 +1354,14 @@ def prepare(
         indexer_launches=int(ixd.launches_per_execute()),
         launches_per_execute=launches,
         capture_rows_max=DECODE_CAPTURE_ROWS_MAX,
-        capture_safe_rows=bool(batch_size * q <= DECODE_CAPTURE_ROWS_MAX),
+        # whether this plan's run may live in a CUDA graph: the extend forms read the vendored block's own flags on the two projection
+        # stages (True at every row count at this pin: the band slab's small-M tile up to 128 rows, the engine's baseline past them), the
+        # decode form the validated decode capture envelope (``DECODE_CAPTURE_ROWS_MAX`` rows: the small-M route's scope)
+        capture_safe_rows=(
+            (proj_capture_safe and out_proj_capture_safe)
+            if extend
+            else bool(batch_size * q <= DECODE_CAPTURE_ROWS_MAX)
+        ),
         position_table_rows=int(cos_pos.shape[1]),
         # appended: the sparse core's body (the lean decode tile beside the tcgen05 core): the declaration, the resolved body, its
         # kernel_template (pinned by the vendored block against the compiled kernel) and the lean tile's sub-tiles per CTA (None on the core)
@@ -1349,10 +1384,8 @@ def prepare(
         select_budget_bytes=(_vendored_extend_select_budget_bytes() if extend else 0),
         ring_cap_exact=extend,
         capture_warm_up_required=extend,
-        # the vendored block's own capture-safe reading of its two projection stages after compile (True = the JIT-only route: no
-        # backend plan, no cuDNN handle; the decode form forces it, the extend forms read it off the tile resolver under the rows bound)
-        proj_capture_safe=bool(getattr(blk._proj, "capture_safe", False)),
-        out_proj_capture_safe=bool(getattr(blk._out_proj, "capture_safe", False)),
+        proj_capture_safe=proj_capture_safe,
+        out_proj_capture_safe=out_proj_capture_safe,
     )
     return Qwen38BlockPlan(
         form=form,
@@ -1454,16 +1487,18 @@ def workspace_size(
             geometry,
             form,
             page_size,
-            batch_size,
-            q,
             None,
             None,
             fuse_prepare,
             sparse_tile_form,
+            batch_size=batch_size,
+            q_len_per_req=q,
         )
         _check_extend_chunk_rows(form, q, int(max_pages), page_size)
     else:
-        _light_decode_gates(geometry, page_size, q, None, None, sparse_tile_form)
+        _light_decode_gates(
+            geometry, page_size, q, None, None, sparse_tile_form, batch_size=batch_size
+        )
     floor = INDEX_EXTEND_RING_ROWS_MIN if extend else q + INDEX_STATE_ROWS_EXTRA
     cap = int(ring_cap) if ring_cap is not None else floor
     if cap < floor:
