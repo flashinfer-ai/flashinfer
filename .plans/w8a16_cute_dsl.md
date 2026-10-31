@@ -219,3 +219,10 @@ Until then the C++ stays as-is and the DSL kernel lives beside it.
   throttled-GPU artifact (gate_up 8192 +17% while all times ran 30% slow; an isolated
   rerun gave 713.7 / 699.2).  Remaining Blackwell gap: gen.qkv / attn.out at M=1024
   (+4..6%, 160-wide tile, one tile per CTA) and mlp.down 1024 (+2.4%).
+- Sat 31 Oct 2026, ~01:00: per-warp epilogue stores tried (each epilogue warp TMA-stores
+  its own 32-row slab after a warp sync, no CTA barrier per subtile).  Wrong results
+  (slab smem addressing, both the partitioned-pointer and the byte-address forms) and
+  only -6% epilogue cycles on the 160 tile in the broken state (3918 -> 3676), so
+  reverted rather than debugged: the whole epilogue is ~2 us of the 27 us row.  The
+  160 / 192 fixed-cost gap (+0.8 / +1.2 us vs C++ at one k-tile; 128 and 1-SM tiles are
+  0.4 us ahead) remains open; the epilogue is not the main part of it.
