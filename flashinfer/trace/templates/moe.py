@@ -4112,15 +4112,15 @@ trtllm_mxint4_block_scale_moe_trace = TraceTemplate(
 
 
 # ---------------------------------------------------------------------------
-# CuteDSL MoE variants (precomputed routing, FP4 weights on SM100+)
+# CuteDSL MoE variants (precomputed routing, block-scaled weights on SM100+)
 # ---------------------------------------------------------------------------
 
 cute_dsl_fused_moe_trace = TraceTemplate(
     op_type="moe",
     name_prefix="cute_dsl_fused_moe",
     description=(
-        "CuteDSL fused MoE on SM100, SM103, or SM107 (W4A8 excludes SM107). "
-        "Runs W4A4, W4A8, or W4A16 with precomputed top-k routing."
+        "CuteDSL fused MoE on SM100, SM103, or SM107 (MX formats exclude SM107). "
+        "Runs W4A4, W4A8, W4A16, or MXFP8 with precomputed top-k routing."
     ),
     axes={
         "num_tokens": Var(description="Total tokens across the batch."),
@@ -4130,11 +4130,13 @@ cute_dsl_fused_moe_trace = TraceTemplate(
         "hidden_size": Const(abbrev="h"),
         "intermediate_size": Var(description="MoE intermediate size (kwarg)."),
         "input_width": Var(
-            description="hidden_size // 2 for W4A4 or hidden_size for W4A8/W4A16."
+            description="hidden_size // 2 for W4A4; hidden_size for W4A8/W4A16/MXFP8."
         ),
-        "num_packed_hidden": Var(description="hidden_size // 2 (packed FP4)."),
+        "num_packed_hidden": Var(
+            description="hidden_size // 2 for FP4 weights; hidden_size for MXFP8."
+        ),
         "num_packed_intermediate": Var(
-            description="intermediate_size // 2 (packed FP4)."
+            description="intermediate_size // 2 for FP4 weights; intermediate_size for MXFP8."
         ),
         "num_fp4_hidden_blocks": Var(
             description="Scale-factor count along hidden_size (x_sf)."
@@ -4147,9 +4149,13 @@ cute_dsl_fused_moe_trace = TraceTemplate(
             abbrev="", value=4, description="MMA SF atom inner-K count."
         ),
         "w1_sf_m_tiles": Var(description="ceil(gemm1_out_size / 128)."),
-        "w1_sf_k_tiles": Var(description="ceil(hidden_size / 128)."),
+        "w1_sf_k_tiles": Var(
+            description="ceil(hidden_size / 64) for NVFP4, / 128 for MX formats."
+        ),
         "w2_sf_m_tiles": Var(description="ceil(hidden_size / 128)."),
-        "w2_sf_k_tiles": Var(description="ceil(intermediate_size / 128)."),
+        "w2_sf_k_tiles": Var(
+            description="ceil(intermediate_size / 64) for NVFP4, / 128 for MX formats."
+        ),
         "gemm1_out_size": Const(
             abbrev="",
             description=(
@@ -4162,12 +4168,15 @@ cute_dsl_fused_moe_trace = TraceTemplate(
     inputs={
         "x": Tensor(
             ["num_tokens", "input_width"],
-            description="Packed W4A4, MXFP8 W4A8, or BF16 W4A16 input.",
+            description="Packed W4A4, E4M3 W4A8/MXFP8, or BF16 W4A16 input.",
         ),
         "x_sf": Tensor(
             ["num_tokens", "num_fp4_hidden_blocks"],
             optional=True,
-            description="Activation scales for W4A4/W4A8; omitted for W4A16.",
+            description=(
+                "Linear activation scales for W4A4/W4A8/MXFP8; omitted for W4A16. "
+                "W4A4 also accepts a trailing singleton dimension."
+            ),
         ),
         "token_selected_experts": Tensor(
             ["num_tokens", "top_k"],
@@ -4181,7 +4190,7 @@ cute_dsl_fused_moe_trace = TraceTemplate(
         ),
         "w1_weight": Tensor(
             ["num_local_experts", "gemm1_out_size", "num_packed_hidden"],
-            description="Packed FP4 FC1 weights (float8_e4m3fn for mxfp8).",
+            description="Packed FP4 or homogeneous MXFP8 FC1 weights.",
         ),
         "w1_weight_sf": Tensor(
             [
@@ -4213,7 +4222,7 @@ cute_dsl_fused_moe_trace = TraceTemplate(
         ),
         "w2_weight": Tensor(
             ["num_local_experts", "hidden_size", "num_packed_intermediate"],
-            description="Packed FP4 FC2 weights (float8_e4m3fn for mxfp8).",
+            description="Packed FP4 or homogeneous MXFP8 FC2 weights.",
         ),
         "w2_weight_sf": Tensor(
             [
@@ -4239,6 +4248,11 @@ cute_dsl_fused_moe_trace = TraceTemplate(
             dtype="float32",
             optional=True,
             description="Optional W4A4 per-token input row scale.",
+        ),
+        "swap_ab": Scalar(
+            "bool",
+            optional=True,
+            description="Use the Blackwell activations-on-B kernel and weight layout.",
         ),
         "quant_mode": Scalar(
             "string",
@@ -4331,6 +4345,11 @@ _cute_dsl_wrapper_inputs["swiglu_limit"] = Scalar(
     "float32",
     optional=True,
     description="Set at wrapper __init__, not passed to run().",
+)
+_cute_dsl_wrapper_inputs["swap_ab"] = Scalar(
+    "bool",
+    optional=True,
+    description="Kernel and weight layout set at wrapper __init__, not passed to run().",
 )
 _cute_dsl_wrapper_inputs["quant_mode"] = Scalar(
     "string",
@@ -4994,6 +5013,8 @@ def _cute_dsl_fused_moe_reference(
     situ_beta=None,
     situ_linear_beta=None,
     per_token_scale=None,
+    local_expert_offset=0,
+    swap_ab=False,
     **_unused,
 ):
     """Reference for CuteDSL block-scaled MoE with alpha folded into weights."""
@@ -5003,6 +5024,7 @@ def _cute_dsl_fused_moe_reference(
     if quant_mode in ("nvfp4", "w4a4"):
         if x_sf is None:
             raise ValueError("x_sf is required when quant_mode='w4a4'")
+        x_sf = x_sf.view(torch.float8_e4m3fn).reshape(x.shape[0], x.shape[1] // 8)
         hs_deq = _dequantize_fp4_tensor(x, x_sf, is_ue8m0_scales=False)
     elif quant_mode in ("w4a8", "mxfp8"):
         if x_sf is None:
@@ -5014,27 +5036,26 @@ def _cute_dsl_fused_moe_reference(
         hs_deq = x.to(torch.float32)
     else:
         raise ValueError(f"Unsupported quant_mode {quant_mode!r}")
-    is_mxfp4 = quant_mode == "w4a8"
-    is_mxfp8 = quant_mode == "mxfp8"
-    if is_mxfp4 or is_mxfp8:
+    is_mxfp = quant_mode in ("w4a8", "mxfp8")
+    sf_vec_size = 32 if is_mxfp else 16
+    # FP4 weights pack two values per byte; FP8 weights are unpacked.
+    weight_packing = 1 if quant_mode == "mxfp8" else 2
 
-        def mma_scales_to_logical(scales, rows, columns):
-            groups = scales.shape[5]
-            return (
-                scales.permute(5, 2, 1, 0, 4, 3)
-                .contiguous()
-                .reshape(groups, -1, scales.shape[4] * 4)[:, :rows, : columns // 32]
-            )
+    def mma_scales_to_logical(scales, weight):
+        # All CuTe DSL weight formats use the same 6D MMA scale layout.
+        scales = (
+            scales.permute(5, 2, 1, 0, 4, 3)
+            .contiguous()
+            .reshape(E_local, -1, scales.shape[4] * 4)
+        )
+        scales = scales[
+            :, : weight.shape[1], : weight.shape[2] * weight_packing // sf_vec_size
+        ]
+        return scales if is_mxfp else scales.view(torch.float8_e4m3fn)
 
-        # FP4 weights pack two values per byte; FP8 weights are unpacked.
-        k_per_byte = 2 if is_mxfp4 else 1
-        w1_weight_sf = mma_scales_to_logical(
-            w1_weight_sf, w1_weight.shape[1], w1_weight.shape[2] * k_per_byte
-        )
-        w2_weight_sf = mma_scales_to_logical(
-            w2_weight_sf, w2_weight.shape[1], w2_weight.shape[2] * k_per_byte
-        )
-    if is_mxfp8:
+    w1_weight_sf = mma_scales_to_logical(w1_weight_sf, w1_weight)
+    w2_weight_sf = mma_scales_to_logical(w2_weight_sf, w2_weight)
+    if quant_mode == "mxfp8":
         W1 = _dequantize_fp4_hidden_states(
             w1_weight, w1_weight_sf, is_weights_mxfp4=True
         )
@@ -5042,8 +5063,20 @@ def _cute_dsl_fused_moe_reference(
             w2_weight, w2_weight_sf, is_weights_mxfp4=True
         )
     else:
-        W1 = _dequantize_fp4_tensor(w1_weight, w1_weight_sf, is_ue8m0_scales=is_mxfp4)
-        W2 = _dequantize_fp4_tensor(w2_weight, w2_weight_sf, is_ue8m0_scales=is_mxfp4)
+        W1 = _dequantize_fp4_tensor(w1_weight, w1_weight_sf, is_ue8m0_scales=is_mxfp)
+        W2 = _dequantize_fp4_tensor(w2_weight, w2_weight_sf, is_ue8m0_scales=is_mxfp)
+    if int(activation_type) != ActivationType.Relu2.value:
+        from ...fused_moe.prepare import _cute_dsl_gated_weight_group_size
+
+        # Undo the weight-preparation interleave for the shared reference.
+        group_size = _cute_dsl_gated_weight_group_size(
+            w1_weight.device, swap_ab=swap_ab
+        )
+        W1 = (
+            W1.reshape(E_local, -1, 2, group_size, W1.shape[-1])
+            .transpose(1, 2)
+            .reshape(E_local, -1, W1.shape[-1])
+        )
     if per_token_scale is not None:
         hs_deq = hs_deq * per_token_scale.to(torch.float32).view(-1, 1)
     W1 = W1 * w1_alpha.to(torch.float32).view(E_local, 1, 1)
@@ -5054,7 +5087,7 @@ def _cute_dsl_fused_moe_reference(
         W2,
         token_final_scales,
         token_selected_experts.to(torch.int64),
-        local_expert_offset=0,
+        local_expert_offset=local_expert_offset,
         E_global=int(num_experts),
         activation_type=activation_type,
         gemm1_alpha=swiglu_alpha,
