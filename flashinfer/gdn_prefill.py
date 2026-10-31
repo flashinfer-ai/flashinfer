@@ -1021,13 +1021,18 @@ def _cp_delta_rule_rejection_reason(
             return "GDN CP SM100 kernel is unavailable"
         if not use_gdn_cp_backend and cp_delta_rule_dsl_sm100 is None:
             return "CP delta rule SM100 DSL kernel is unavailable"
+    elif arch_major == 11:
+        if cuda_version < (13, 0):
+            return "CP delta rule SM110 DSL kernel requires CUDA 13 or newer"
+        if cp_delta_rule_dsl_sm100 is None:
+            return "CP delta rule SM100 DSL kernel is unavailable"
     elif arch_major == 12:
         if cp_delta_rule_dsl_sm120 is None:
             return "CP delta rule SM120 DSL kernel is unavailable"
     else:
         return (
             "CP delta rule is currently implemented only for SM8x, SM90, "
-            "SM100, and SM120"
+            "SM100, SM110, and SM120"
         )
     if q.shape[-1] != 128:
         return f"CP delta rule only supports head_size=128, got {q.shape[-1]}"
@@ -1201,11 +1206,11 @@ def chunk_gated_delta_rule(
         Initial KV state. Packed, sequence-ordered shape
         ``[num_seqs, num_sab_heads, head_size, head_size]``.  Must be
         float32, bfloat16, float16, float8_e4m3fn, or float8_e5m2. Starts from zero state
-        when ``None``.  When ``state_indices`` is given (SM8x/SM90/SM100/SM103/SM120),
+        when ``None``.  When ``state_indices`` is given (SM8x/SM90/SM100/SM103/SM110/SM120),
         this is instead the state **pool** ``[N_pool, num_sab_heads,
         head_size, head_size]`` and sequence ``i`` reads its initial state
-        from row ``state_indices[i]``; on SM100/SM103 every rank-4 positive,
-        non-overlapping stride layout is accepted.
+        from row ``state_indices[i]``; on SM100/SM103/SM110 every rank-4
+        positive, non-overlapping stride layout is accepted.
     output_final_state : bool
         Whether to output the final state.  Default: ``False``.
     cu_seqlens : torch.Tensor
@@ -1233,14 +1238,14 @@ def chunk_gated_delta_rule(
         ``output_state is initial_state``); it must be provided by the
         caller (auto-allocation is rejected, since a compact ``[num_seqs, ...]``
         buffer would be indexed out of bounds by the pool slot ids).
-        SM100/SM103 accepts the same positive, non-overlapping rank-4 stride
-        layouts as ``initial_state``.
+        SM100/SM103/SM110 accepts the same positive, non-overlapping rank-4
+        stride layouts as ``initial_state``.
     state_checkpoints : torch.Tensor, optional
         Pre-allocated checkpoint tensor of shape ``[total_checkpoints,
         num_sab_heads, head_size, head_size]``. May be float32, bfloat16,
         float16, float8_e4m3fn, or float8_e5m2. Required when
         ``checkpoint_every_n_tokens > 0``. Context-parallel checkpointing is
-        currently supported on SM8x, SM90, SM100, and SM120.
+        currently supported on SM8x, SM90, SM100, SM110, and SM120.
     checkpoint_cu_starts : torch.Tensor, optional
         Cumulative checkpoint counts of shape ``[num_seqs + 1]``, int32 or
         int64 on the same CUDA device as ``q``.
@@ -1260,15 +1265,18 @@ def chunk_gated_delta_rule(
         chunk size (64).  ``0`` disables checkpointing (default).
     use_cp : Literal["auto"] | bool, optional:
         Whether to use the architecture-specific context-parallel DSL
-        implementation on SM8x, SM90, SM100/SM103/SM107 or SM120, where it is
-        supported and low-parallelism heuristics match. SM100/SM103/SM107 uses
+        implementation on SM8x, SM90, SM100/SM103/SM107, SM110 or SM120, where
+        it is supported and low-parallelism heuristics match. SM110 uses the
+        SM100 CuTe-DSL implementation, and its ``"auto"`` rule takes CP only
+        for at most 2 parallel states on a longest sequence of at least 4096
+        tokens (see ``max_seqlen``). SM100/SM103/SM107 uses
         the generated GDN CP-only four-stage implementation for structurally
         supported shapes; other legal configurations retain the CuTe-DSL
         implementation. ``"auto"`` enables conservative routing, ``True``
         requires CP support, and ``False`` disables CP. Default: ``"auto"``.
     state_indices : torch.Tensor, optional
         Int32 or int64 tensor of shape ``[num_seqs]``
-        (SM8x/SM90/SM100/SM103/SM120). When provided,
+        (SM8x/SM90/SM100/SM103/SM110/SM120). When provided,
         ``initial_state`` and ``output_state`` are treated as a state pool whose
         first dimension is indexed by these slot ids rather than laid out in
         sequence order: sequence ``i`` reads its initial state from row
@@ -1346,10 +1354,11 @@ def chunk_gated_delta_rule(
         back from the GPU. When omitted, CP uses ``total_seq_len``, which is
         correct for any batch; passing the exact maximum of a batched call
         lets CP launch smaller grids.  The SM100/SM103 ``use_cp="auto"``
-        band reads the hint (or the exact maximum from ``cu_seqlens_cpu``) as
-        the longest sequence and, without either, the balanced-batch estimate
-        ``ceil(total_seq_len / num_seqs)``; pass the exact maximum so the band
-        decision matches the Cake dispatcher's. ``backend="cake_gdn"`` without
+        band and the SM110 ``use_cp="auto"`` rule read the hint (or the exact
+        maximum from ``cu_seqlens_cpu``) as the longest sequence and, without
+        either, the balanced-batch estimate ``ceil(total_seq_len / num_seqs)``;
+        pass the exact maximum so the band decision matches the Cake
+        dispatcher's. ``backend="cake_gdn"`` without
         CP uses the same bound (or the exact maximum from ``cu_seqlens_cpu``)
         to select its kernel variant; a loose bound is always correct and only
         affects whether the single-chunk kernel is eligible.  The persistent
@@ -1442,7 +1451,7 @@ def chunk_gated_delta_rule(
 
         ``output_state_indices``, ``checkpoint_state_indices`` and
         ``prefix_lens`` are served by the native non-CP kernels on SM8x, SM90,
-        SM100/SM103/SM107 and SM120 (``backend="auto"`` or
+        SM100/SM103/SM107, SM110 and SM120 (``backend="auto"`` or
         ``"flashinfer"``); ``use_cp=True``, ``backend="cake_gdn"`` and
         ``backend="cudnn"`` reject them.
 
@@ -1469,9 +1478,11 @@ def chunk_gated_delta_rule(
     - Supports GQA (``num_q_heads > num_k_heads = num_v_heads``) and GVA
       (``num_v_heads > num_q_heads = num_k_heads``).
     - The final state layout is ``[N, H, V, K]``.
-    - Requires SM8x (Ampere), SM90 (Hopper), SM100 (Blackwell) or SM120. The
-      SM100 path requires ``head_size == 128``. On SM100/SM103, ``gdn_cp``
-      supports structurally legal equal-head, GQA, and GVA shapes on
+    - Requires SM8x (Ampere), SM90 (Hopper), SM100 (Blackwell), SM110 or SM120.
+      SM110 runs the SM100 non-CP and CP CuTe-DSL kernels (not ``cake_gdn``).
+      The SM100 and SM110 path requires CUDA 13 and ``head_size == 128``.
+      On SM100/SM103, ``gdn_cp`` supports structurally legal equal-head, GQA,
+      and GVA shapes on
       CUDA 12.8, CUDA 12.9, and CUDA 13; SM107 supports the same shapes with
       an ``nvcc`` that can emit ``compute_107a``.
       Other SM100 CP DSL routes require CUDA 13 and
@@ -1806,12 +1817,21 @@ def chunk_gated_delta_rule(
                 "max_seqlen is smaller than the longest sequence in cu_seqlens_cpu"
             )
     cp_heuristic_matches = (
-        _arch_major in (9, 10, 12)
+        _arch_major in (9, 10, 11, 12)
         and should_use_cp_host(
             _parallel_work,
             _sm_count,
             _device_name,
             device_capability=_device_capability,
+            # Only the SM110 rule reads it: the caller's hint, the host prefix,
+            # or the balanced-batch estimate, never a device readback.
+            max_seq_len=(
+                _cake_gdn_cp_band_max_seqlen(
+                    max_seqlen, total_seq_len, num_seqs, cu_seqlens_cpu=cu_seqlens_cpu
+                )
+                if _arch_major == 11
+                else None
+            ),
         )
     ) or should_use_cp_sm80_host(
         sm8x_max_seqlen,
@@ -1911,9 +1931,9 @@ def chunk_gated_delta_rule(
             )
         # Reject unsupported dispatch paths rather than silently reading/writing
         # the state in packed, sequence-ordered layout.
-        if _arch_major not in (8, 9, 10, 12):
+        if _arch_major not in (8, 9, 10, 11, 12):
             raise NotImplementedError(
-                "state_indices is only supported on the SM80/SM90/SM100/SM103/SM120 "
+                "state_indices is only supported on the SM80/SM90/SM100/SM103/SM110/SM120 "
                 f"GDN prefill kernels; got compute-capability major {_arch_major}, "
                 f"use_cp={use_cp!r}."
             )
@@ -1966,8 +1986,8 @@ def chunk_gated_delta_rule(
 
     if (
         use_qk_l2norm_in_kernel
-        and _arch_major in (8, 9, 10, 12)
-        and (_arch_major != 10 or _cuda_major >= 13)
+        and _arch_major in (8, 9, 10, 11, 12)
+        and (_arch_major not in (10, 11) or _cuda_major >= 13)
         and is_cute_dsl_arch_supported(*_device_capability)
     ):
         # The chunked backends consume caller-normalized operands. Honor the
@@ -2070,6 +2090,7 @@ def chunk_gated_delta_rule(
                     8: cp_delta_rule_dsl_sm80,
                     9: cp_delta_rule_dsl_sm90,
                     10: cp_delta_rule_dsl_sm100,
+                    11: cp_delta_rule_dsl_sm100,
                     12: cp_delta_rule_dsl_sm120,
                 }[_arch_major],
             )
@@ -2082,7 +2103,7 @@ def chunk_gated_delta_rule(
                     "checkpoint_cu_starts": checkpoint_cu_starts,
                     "checkpoint_every_n_tokens": checkpoint_every_n_tokens,
                 }
-                if _arch_major in (8, 9, 10, 12)
+                if _arch_major in (8, 9, 10, 11, 12)
                 else {}
             )
             cp_delta_rule_dsl(
@@ -2138,7 +2159,7 @@ def chunk_gated_delta_rule(
         if slot_args
         else {}
     )
-    if _arch_major == 10:
+    if _arch_major in (10, 11):
         if _cuda_major < 13:
             raise NotImplementedError(
                 "Blackwell GDN prefill is only supported on CUDA 13+"
@@ -2146,7 +2167,7 @@ def chunk_gated_delta_rule(
         if chunk_gated_delta_rule_sm100 is None:
             raise NotImplementedError("Blackwell GDN prefill kernel is unavailable")
 
-        # Blackwell SM100 and SM103 path (CuTe DSL kernel)
+        # Blackwell SM100, SM103 and SM110 path (CuTe DSL kernel)
         assert head_size == 128, (
             f"Blackwell GDN prefill requires head_size=128, got {head_size}"
         )

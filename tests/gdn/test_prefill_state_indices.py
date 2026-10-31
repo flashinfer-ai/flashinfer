@@ -25,7 +25,11 @@ import torch
 import torch.nn.functional as F
 import pytest
 
-from flashinfer.utils import get_compute_capability, is_sm100a_supported
+from flashinfer.utils import (
+    get_compute_capability,
+    is_sm100a_supported,
+    is_sm110a_supported,
+)
 from flashinfer.gdn_prefill import chunk_gated_delta_rule
 from flashinfer.jit.cake_gdn import CakeGDNUnsupportedError
 
@@ -60,9 +64,9 @@ def _skip_if_not_supported(backend, use_cp):
         pytest.skip("cake_gdn prefill requires SM100, SM103 or SM107")
     if backend == "cake_gdn" and use_cp is True and (major, minor) == (10, 7):
         pytest.skip("Cake GDN CP prefill is not provided on SM107")
-    if major not in (8, 9, 10, 12):
+    if major not in (8, 9, 10, 11, 12):
         pytest.skip(
-            "state_indices GDN prefill path requires SM8x, SM90, SM100, or SM120"
+            "state_indices GDN prefill path requires SM8x, SM90, SM100, SM110, or SM120"
         )
     cuda_version = tuple(
         int(part) for part in (torch.version.cuda or "0.0").split(".")[:2]
@@ -70,8 +74,10 @@ def _skip_if_not_supported(backend, use_cp):
     cuda_major = cuda_version[0]
     if backend == "cake_gdn" and use_cp is True and cuda_version < (12, 8):
         pytest.skip(f"Cake GDN CP requires CUDA 12.8+, got {torch.version.cuda}")
-    if backend != "cake_gdn" and is_sm100a_supported(device) and cuda_major < 13:
-        pytest.skip(f"SM100 GDN prefill requires CUDA 13+, got {torch.version.cuda}")
+    if backend != "cake_gdn" and major in (10, 11) and cuda_major < 13:
+        pytest.skip(
+            f"SM100/SM110 GDN prefill requires CUDA 13+, got {torch.version.cuda}"
+        )
 
 
 def _make_inputs(seq_lens, H, D, dtype, device, seed):
@@ -360,9 +366,19 @@ def test_prefill_integer_index_dtypes(index_dtype, backend, use_cp, H):
     assert torch.equal(packed_final, indexed_final[slots])
 
 
-@pytest.mark.parametrize("backend,use_cp,H", BACKEND_CP_HEAD_CASES)
+@pytest.mark.parametrize(
+    "backend,use_cp,H",
+    (
+        *BACKEND_CP_HEAD_CASES,
+        # 16 states select a UTCMMA fixup on B200 (8 select SIMT there), so the
+        # strided pool must not be routed to a different-precision fixup.
+        pytest.param("flashinfer", True, 16, id="flashinfer-cp-16-heads"),
+    ),
+)
 def test_prefill_state_indices_preserves_inner_strides(backend, use_cp, H):
-    """Indexed views preserve inner strides or reject unsupported layouts."""
+    """Indexed views preserve inner strides or reject unsupported layouts. The
+    final state must not depend on the pool layout, since the CP fixup kind is
+    chosen from the state count alone."""
     _skip_if_not_supported(backend, use_cp)
     device = torch.device("cuda")
     D = 128
@@ -473,15 +489,16 @@ def _make_transposed_pool(init_state, perm, n_pool, dtype, device, fill):
 )
 @pytest.mark.parametrize("transposed", ["initial", "output", "in-place"])
 def test_prefill_cp_transposed_state_pools(seq_lens, H, transposed):
-    """The SM100/SM103 CP route honors [N, H, K, V]-backed (transposed) initial
-    and output state pools: outputs and final states match contiguous pools,
-    every requested row is written and no other row is touched. The cases cover
-    the SIMT (<= 9 states) and the UTCMMA fixup state counts."""
+    """The SM100/SM103/SM110 CP route honors [N, H, K, V]-backed (transposed)
+    initial and output state pools: outputs and final states match contiguous
+    pools, every requested row is written and no other row is touched. The
+    cases cover the SIMT and the UTCMMA fixup state counts of B200 (SIMT up to
+    9 states) and Thor (SIMT up to 1 state)."""
     _skip_if_not_supported("flashinfer", True)
     device = torch.device("cuda")
-    if not is_sm100a_supported(device):
+    if not (is_sm100a_supported(device) or is_sm110a_supported(device)):
         pytest.skip(
-            "arbitrary pool layouts are only documented on SM100/SM103, and "
+            "arbitrary pool layouts are only documented on SM100/SM103/SM110, and "
             "only the SM100 CP fixup is covered by this regression test"
         )
     D = 128
@@ -777,12 +794,12 @@ if __name__ == "__main__" and len(sys.argv) == 3 and sys.argv[1] == "--invalid-s
     # A plain script: the parent turns this marker into the skip.
     if not torch.cuda.is_available():
         print("SKIP: no CUDA device")
-    elif get_compute_capability(torch.device("cuda"))[0] not in (8, 9, 10, 12):
+    elif get_compute_capability(torch.device("cuda"))[0] not in (8, 9, 10, 11, 12):
         print("SKIP: no GDN prefill kernel for this device")
     elif (
-        is_sm100a_supported(torch.device("cuda"))
+        get_compute_capability(torch.device("cuda"))[0] in (10, 11)
         and (int(torch.version.cuda.split(".")[0]) if torch.version.cuda else 0) < 13
     ):
-        print("SKIP: SM100 GDN prefill requires CUDA 13+")
+        print("SKIP: SM100/SM110 GDN prefill requires CUDA 13+")
     else:
         _run_invalid_slot_child(sys.argv[2] == "True")

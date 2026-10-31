@@ -165,6 +165,7 @@ output_column_dict = {
         "pool_mode",
         "update_state",
         "use_qk_l2norm",
+        "use_cp",
     ],
     "kda": [
         # Which variant the policy chose, and whether this device's thresholds
@@ -1228,7 +1229,7 @@ routine_cc_to_supported_backends = {
         "10.0": ["flashinfer", "fla"],
         "10.3": ["flashinfer", "fla"],
         "10.7": ["flashinfer"],
-        "11.0": [],
+        "11.0": ["flashinfer"],
         "12.0": [],
         "12.1": [],
     },
