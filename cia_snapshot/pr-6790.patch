@@ -1,0 +1,2004 @@
+diff --git a/CLAUDE.md b/CLAUDE.md
+index 29f6bbc9b4b..e4dc8b84cbe 100644
+--- a/CLAUDE.md
++++ b/CLAUDE.md
+@@ -800,7 +800,7 @@ Used by `flashinfer.trace` / `fi_trace`.
+ | `FLASHINFER_TOPK_ALGO` | unset | `flashinfer/topk.py` | Force a specific top-k backend (otherwise the dispatcher chooses based on shape/dtype/mode via benefit gates): `default` (radix), `clusters` (SM100), `cub` (cub::DeviceBatchedTopK; bypasses the benefit gates). Used for benchmarking / regression bisection. |
+ | `FLASHINFER_USE_CUDA_NORM` | `0` | `flashinfer/norm/__init__.py` | `1` switches the norm path from the default backend to the legacy CUDA-only kernels. Diagnostic toggle. |
+ | `FLASHINFER_DISABLE_EAGLE_VERIFY_FP8KV_SM90` | `0` | `flashinfer/prefill.py` | `1` keeps `BatchPrefillWithPagedKVCacheWrapper.run` on the FA2 kernel for the speculative-decoding target-verify problems that the specialized SM90 fp8-KV split-KV kernel (`csrc/eagle_verify_fp8kv_sm90.cu`) would otherwise serve: `plan(..., uniform_q_len=4)` with a custom mask, 4 query heads per KV head, head_dim 256, page size 1, NHD, bf16 q/o, e4m3 KV, compute capability 9.0. Read at plan and run time. The `uniform_q_len` plan hint itself is unaffected. |
+-| `FLASHINFER_SPECIALIZED_KERNEL_DISABLE` | unset | `flashinfer/mla_kv_pack.py` | `1` forces `concat_mla_kv_quant_fp8` onto its composable PyTorch fallback (two fp8 casts + two strided copies, same bytes) instead of the fused MLA K/V pack kernel. Read at call time; the kill switch for A/B testing the fused path. |
++| `FLASHINFER_SPECIALIZED_KERNEL_DISABLE` | unset | `flashinfer/mla_kv_pack.py`, `flashinfer/experimental/mhc_pre_big_fuse_with_norm/backend.py` | `1` forces `concat_mla_kv_quant_fp8` onto its composable PyTorch fallback (two fp8 casts + two strided copies, same bytes) instead of the fused MLA K/V pack kernel, and makes the experimental `mhc_pre_big_fuse_with_norm` skip its SM100/SM103 cluster kernel and run its composable PyTorch implementation. Read at call time; the kill switch for A/B testing the fused paths. |
+ | `FLASHINFER_ROUTING_FORCE_BLOCK_PER_TOKEN` | unset | `csrc/fused_moe/trtllm_backend/trtllm_fused_moe_routing_custom.cuh` | Forces the TRT-LLM MoE custom-routing kernel into "one-block-per-token" mode regardless of the active routing policy. Mainly used to reproduce specific perf points. |
+ | `FLASHINFER_B12X_MICRO_SHARE_INPUT` | `1` | `flashinfer/fused_moe/cute_dsl/blackwell_sm12x/moe_dispatch.py` | `0` disables the B12x MoE micro-batch input-sharing optimization. Internal/experimental — leave at the default unless investigating an SM12x MoE regression. |
+ | `FLASHINFER_B12X_FORCE_MOE_W4A16` | unset | `flashinfer/fused_moe/cute_dsl/blackwell_sm12x/moe_dispatch.py` | `1` forces the SM12x MoE dispatcher onto the W4A16 path with BF16 activations. Internal/experimental — used to reproduce W4A16-specific issues. |
+diff --git a/examples/experimental/mhc_pre_big_fuse_with_norm.py b/examples/experimental/mhc_pre_big_fuse_with_norm.py
+new file mode 100644
+index 00000000000..4309a8d04b6
+--- /dev/null
++++ b/examples/experimental/mhc_pre_big_fuse_with_norm.py
+@@ -0,0 +1,103 @@
++"""
++Copyright (c) 2026 by FlashInfer team.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++"""
++
++# Run the experimental mHC pre big-fuse + RMSNorm op on an SM100 / SM103 GPU,
++# eagerly and inside a CUDA graph, and compare it with its composable
++# PyTorch implementation.
++
++import argparse
++import os
++
++import torch
++
++from flashinfer.mhc import (
++    mhc_pre_big_fuse_with_norm,
++    mhc_pre_big_fuse_with_norm_supported,
++    mhc_pre_big_fuse_with_norm_warmup,
++)
++
++HIDDEN, HC, MIX = 4096, 4, 24
++CONSTANTS = dict(
++    rms_eps=1e-5,
++    hc_pre_eps=1e-6,
++    hc_sinkhorn_eps=1e-6,
++    hc_post_mult_value=2.0,
++    sinkhorn_repeat=20,
++    norm_eps=1e-5,
++)
++
++
++def make_inputs(tokens: int, num_splits: int) -> dict:
++    # Split-K partials of the mix projection of x = residual.flatten(1).
++    x = torch.randn(tokens, HC, HIDDEN, device="cuda")
++    fn = torch.randn(MIX, HC, HIDDEN, device="cuda") * 0.03
++    xs = x.view(tokens, HC, num_splits, HIDDEN // num_splits)
++    fs = fn.view(MIX, HC, num_splits, HIDDEN // num_splits)
++    return dict(
++        gemm_out_mul=torch.einsum("tjsk,njsk->stn", xs, fs).contiguous(),
++        gemm_out_sqrsum=xs.square().sum(dim=(1, 3)).t().contiguous(),
++        hc_scale=torch.tensor([0.09, 0.16, 0.21], device="cuda"),
++        hc_base=torch.randn(MIX, device="cuda"),
++        residual=x.to(torch.bfloat16),
++        norm_weight=torch.ones(HIDDEN, dtype=torch.bfloat16, device="cuda"),
++    )
++
++
++def main() -> None:
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--tokens", type=int, default=4)
++    parser.add_argument("--num-splits", type=int, default=8, choices=[8, 64])
++    args = parser.parse_args()
++
++    inputs = make_inputs(args.tokens, args.num_splits)
++    print("cluster kernel usable:", mhc_pre_big_fuse_with_norm_warmup())
++    print(
++        "cluster kernel serves this call:",
++        mhc_pre_big_fuse_with_norm_supported(**inputs, **CONSTANTS),
++    )
++
++    # Eager call.
++    post_mix, comb_mix, layer_input = mhc_pre_big_fuse_with_norm(**inputs, **CONSTANTS)
++
++    # CUDA-graph capture with caller-owned outputs (warmup above loaded the kernel).
++    outs = (torch.empty_like(post_mix), torch.empty_like(comb_mix))
++    outs += (torch.empty_like(layer_input),)
++    graph = torch.cuda.CUDAGraph()
++    with torch.cuda.graph(graph):
++        mhc_pre_big_fuse_with_norm(
++            **inputs,
++            **CONSTANTS,
++            post_mix=outs[0],
++            comb_mix=outs[1],
++            layer_input=outs[2],
++        )
++    graph.replay()
++
++    # Composable PyTorch implementation of the same contract.
++    os.environ["FLASHINFER_SPECIALIZED_KERNEL_DISABLE"] = "1"
++    ref = mhc_pre_big_fuse_with_norm(**inputs, **CONSTANTS)
++    del os.environ["FLASHINFER_SPECIALIZED_KERNEL_DISABLE"]
++    torch.cuda.synchronize()
++
++    for name, got, want in zip(
++        ("post_mix", "comb_mix", "layer_input"), outs, ref, strict=True
++    ):
++        err = (got.float() - want.float()).abs().max().item()
++        print(f"{name}: shape={tuple(got.shape)} dtype={got.dtype} max|diff|={err:.3e}")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/flashinfer/experimental/mhc_pre_big_fuse_with_norm/README.md b/flashinfer/experimental/mhc_pre_big_fuse_with_norm/README.md
+new file mode 100644
+index 00000000000..880b855d3d3
+--- /dev/null
++++ b/flashinfer/experimental/mhc_pre_big_fuse_with_norm/README.md
+@@ -0,0 +1,143 @@
++# Experimental mHC pre big-fuse with fused RMSNorm
++
++`flashinfer.mhc.mhc_pre_big_fuse_with_norm` is an **experimental API** with an
++experimental implementation. It is the last step of a manifold-constrained
++hyper-connection (mHC) boundary with `HC = 4` residual streams, in the decode
++regime of models that use mHC. The op consumes the split-K partials of the mHC
++mix projection, so it runs right after the kernel that produces them. It
++returns the mixing coefficients for the next boundary and the RMSNorm'd input
++of the next sublayer:
++
++```
++rms         = rsqrt(sum_s gemm_out_sqrsum[s] / (4 H) + rms_eps)
++mixes       = (sum_s gemm_out_mul[s]) * rms
++pre         = sigmoid(mixes[0:4] * hc_scale[0] + hc_base[0:4]) + hc_pre_eps
++post_mix    = sigmoid(mixes[4:8] * hc_scale[1] + hc_base[4:8]) * hc_post_mult_value
++comb_mix    = sinkhorn_repeat-iteration Sinkhorn of
++              softmax(mixes[8:24].view(4, 4) * hc_scale[2] + hc_base[8:24]) + hc_sinkhorn_eps
++ol          = sum_j pre[j] * residual[:, j]                                   (fp32)
++layer_input = bf16(float(bf16(ol)) * rsqrt(mean(ol^2) + norm_eps) * norm_weight)
++```
++
++It differs from the stable `mhc_pre_big_fuse` in its contract: the output
++RMSNorm (`norm_weight`, `norm_eps`) is fused into `layer_input`, and the split
++count is read from the leading dimension of the partials.
++
++The experimental lifecycle is owned by `@nv-yunzheq` and tracked in issue #TODO.
++
++## Inputs and outputs
++
++| Tensor | dtype | Shape |
++|---|---|---|
++| `gemm_out_mul` | fp32 | `[NS, T, 24]` |
++| `gemm_out_sqrsum` | fp32 | `[NS, T]` |
++| `hc_scale` / `hc_base` | fp32 | `[3]` / `[24]` |
++| `residual` | bf16 | `[T, 4, H]` |
++| `norm_weight` | bf16 | `[H]` |
++| `post_mix` (out) | fp32 | `[T, 4]` |
++| `comb_mix` (out) | fp32 | `[T, 16]` (or a caller-owned `[T, 4, 4]`) |
++| `layer_input` (out) | bf16 | `[T, H]` |
++
++The outputs are allocated when omitted. The model constants have no defaults,
++because they are part of the numerical contract.
++
++## Implementations
++
++- **Cluster kernel** (`csrc/mhc_pre_big_fuse_with_norm_cluster.cu`, SM100 /
++  SM103). It covers `H = 4096`, `1 <= T <= 32` and `NS` in `{8, 64}`. Its
++  compiled-in constants are `rms_eps = norm_eps = 1e-5`,
++  `hc_pre_eps = hc_sinkhorn_eps = 1e-6`, `hc_post_mult_value = 2` and
++  `sinkhorn_repeat = 20`; the support check compares these as fp32. Inputs and
++  outputs must be dense, contiguous and 16-byte aligned.
++  - Each token runs on one thread-block cluster: 4 CTAs, or 2 CTAs when
++    `T > 24`. Each CTA owns 1024 channels.
++  - Two warps per CTA collapse the four bf16 streams. They all-gather the
++    `sum(ol^2)` partials over distributed shared memory (`st.async` +
++    `mbarrier`), then apply the RMSNorm.
++  - Warp 0 of CTA rank 1 computes the softmax and a division-free 20-iteration
++    Sinkhorn. Warp 0 of the post rank writes `post_mix`.
++  - `enable_pdl=True` launches with programmatic dependent launch. The kernel
++    reads no input before `griddepcontrol.wait`.
++- **Composable implementation** (`backend.composable`). An fp32 PyTorch
++  implementation of the contract for any `NS`, `T` and `H`. It serves every
++  call outside the kernel's envelope, so the API always returns a result.
++
++`mhc_pre_big_fuse_with_norm_supported(...)` reports which path a call takes.
++Callers that have their own fast path for the op should keep it whenever this
++returns `False`.
++
++### Numerics
++
++The module is compiled without `-use_fast_math`:
++
++- `expf` is libdevice, and the post sigmoid uses IEEE division.
++- The pre sigmoids and the final Sinkhorn `1/G` use Newton-refined reciprocals.
++- `rsqrt.approx` is applied only to arguments `>= 1e-5`.
++- fp32 add, mul and fma never flush to zero.
++
++The Sinkhorn is kept in diagonal-scaling form `c = r K s / G`:
++
++- Cofactor products replace the per-step divisions.
++- The common denominator is renormalised by an exact power of two.
++- An exact power-of-two rebalance of `r` and `s` after every column half-step
++  keeps both within `(2^-64, 2^50)` for every finite input.
++
++`comb_mix` is therefore finite for all finite logits, including the extreme
++patterns in the tests.
++
++Against the composable implementation, the kernel holds these tolerances:
++
++| Output | atol | rtol / bound |
++|---|---|---|
++| `post_mix` | `2e-6` | rtol `2e-6` |
++| `comb_mix` | `1e-7` | rtol `1e-5` |
++| `layer_input` | — | within `2^-5` relative, and at least 99.5% bit-identical |
++
++## Opt-in, gating and routing
++
++- Calling `mhc_pre_big_fuse_with_norm`, `mhc_pre_big_fuse_with_norm_supported`
++  or `mhc_pre_big_fuse_with_norm_warmup` is the opt-in. Each warns once with an
++  `ExperimentalWarning`; no environment variable is needed.
++- The op does not take part in any automatic routing: no stable API dispatches
++  to it, and it has no autotuning or trace-apply support.
++  `FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS` has no effect on it.
++- `FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1`, read at call time, forces the
++  composable implementation.
++- The kernel is JIT-only. It is not part of the `flashinfer-jit-cache` /
++  `flashinfer-cubin` packages.
++
++## CUDA graphs
++
++The kernel module is never built during CUDA-graph capture. A capturing call
++made before the module is loaded captures the composable implementation.
++
++Call `mhc_pre_big_fuse_with_norm_warmup()` before capture to build and load the
++kernel. Pass caller-owned `post_mix`, `comb_mix` and `layer_input` buffers to
++captured calls.
++
++## Limitations
++
++- The kernel targets SM100 / SM103 only. It has been validated on GB300
++  (SM103); SM100 is compiled but not separately validated.
++- The kernel covers `H = 4096` and `HC = 4` only, with the constants listed
++  above. Prefill-sized batches (`T > 32`) and other models' constants run the
++  composable implementation, which is much slower.
++- The kernel supports `NS` in `{8, 64}`.
++
++## Example and tests
++
++```bash
++python examples/experimental/mhc_pre_big_fuse_with_norm.py --tokens 4 --num-splits 8
++pytest tests/experimental/test_mhc_pre_big_fuse_with_norm.py
++```
++
++## Graduation
++
++Graduation requires:
++
++- an agreed placement next to the stable `mhc_pre_big_fuse` APIs (a variant
++  flag versus a separate function);
++- runtime constants in place of the compiled-in model constants, or a
++  per-constant-set specialization;
++- validation on SM100;
++- a trace template.
+diff --git a/flashinfer/experimental/mhc_pre_big_fuse_with_norm/__init__.py b/flashinfer/experimental/mhc_pre_big_fuse_with_norm/__init__.py
+new file mode 100644
+index 00000000000..327c4b46366
+--- /dev/null
++++ b/flashinfer/experimental/mhc_pre_big_fuse_with_norm/__init__.py
+@@ -0,0 +1,22 @@
++"""
++Copyright (c) 2026 by FlashInfer team.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++  http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++"""
++
++# Experimental mHC pre big-fuse with the fused output RMSNorm (SM100 / SM103
++# cluster kernel + composable implementation).
++
++from .backend import run, supported, warmup
++
++__all__ = ["run", "supported", "warmup"]
+diff --git a/flashinfer/experimental/mhc_pre_big_fuse_with_norm/backend.py b/flashinfer/experimental/mhc_pre_big_fuse_with_norm/backend.py
+new file mode 100644
+index 00000000000..ccacdb83143
+--- /dev/null
++++ b/flashinfer/experimental/mhc_pre_big_fuse_with_norm/backend.py
+@@ -0,0 +1,338 @@
++"""
++Copyright (c) 2026 by FlashInfer team.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++  http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++"""
++
++# mHC pre big-fuse with the fused output RMSNorm (``norm_weight`` variant).
++#
++# The split-K partials of the mHC mix projection (``gemm_out_mul`` [NS, T, 24],
++# ``gemm_out_sqrsum`` [NS, T]) plus the residual streams [T, 4, H] and the next
++# sublayer's RMSNorm weight [H] go in; ``post_mix`` [T, 4], ``comb_mix`` [T, 16]
++# (row-major 4x4) and the RMSNorm'd ``layer_input`` [T, H] (bf16) come out. For
++# H = 4096 on SM100 / SM103 a thread-block-cluster kernel spreads every token
++# over 4 CTAs (2 CTAs for T > 24; decode regime, T <= 32, NS in {8, 64}); every
++# other call runs the composable fp32 torch implementation below, which is the
++# arithmetic contract of the op.
++
++from __future__ import annotations
++
++import os
++import struct
++import threading
++from typing import Optional
++
++import torch
++
++from ...jit.core import logger
++from .jit import gen_mhc_pre_big_fuse_with_norm_module
++
++# ``1`` makes every call skip the cluster kernel and run the composable
++# implementation (read at call time, for A/B testing the kernel).
++KILL_SWITCH_ENV = "FLASHINFER_SPECIALIZED_KERNEL_DISABLE"
++
++# What the cluster kernel is compiled for. The model constants are compile-time
++# constants of the kernel and are compared as fp32; calls outside this set run
++# the composable implementation.
++HIDDEN_SIZE = 4096
++HC_MULT = 4
++MIX = HC_MULT * (2 + HC_MULT)
++NUM_SPLITS = frozenset({8, 64})
++MIN_TOKENS = 1
++MAX_TOKENS = 32
++COMPUTE_CAPABILITIES = frozenset({(10, 0), (10, 3)})
++CONSTANTS = {
++    "rms_eps": 1e-5,
++    "hc_pre_eps": 1e-6,
++    "hc_sinkhorn_eps": 1e-6,
++    "hc_post_mult_value": 2.0,
++    "sinkhorn_repeat": 20,
++    "norm_eps": 1e-5,
++}
++
++
++def _fp32(value: float) -> float:
++    return struct.unpack("f", struct.pack("f", float(value)))[0]
++
++
++_CONSTANTS_FP32 = {k: _fp32(v) for k, v in CONSTANTS.items() if k != "sinkhorn_repeat"}
++
++_lock = threading.Lock()
++_state: dict = {"module": None, "module_error": None}
++_device_capability: dict = {}
++# Call counters (kernel calls, composable calls and the reason of every
++# rejected support check), for debugging and tests.
++STATS: dict = {"kernel_calls": 0, "composable_calls": 0, "rejects": {}}
++
++
++def _reject(reason: str) -> bool:
++    rejects = STATS["rejects"]
++    rejects[reason] = rejects.get(reason, 0) + 1
++    return False
++
++
++def _is_capturing() -> bool:
++    try:
++        return bool(torch.cuda.is_current_stream_capturing())
++    except Exception:
++        return False
++
++
++def _load_module():
++    """Build / load the cluster kernel once (never during CUDA-graph capture)."""
++    if _state["module"] is not None:
++        return _state["module"]
++    if _state["module_error"] is not None:
++        return None
++    with _lock:
++        if _state["module"] is None and _state["module_error"] is None:
++            try:
++                _state["module"] = (
++                    gen_mhc_pre_big_fuse_with_norm_module().build_and_load()
++                )
++            except Exception as exc:  # the composable path keeps the op working
++                message = f"{type(exc).__name__}: {exc}"
++                _state["module_error"] = message
++                logger.warning(
++                    "mhc_pre_big_fuse_with_norm: cluster kernel unavailable, "
++                    f"using the composable implementation ({message[:2000]})"
++                )
++    return _state["module"]
++
++
++def _capability_for(device: torch.device, capturing: bool) -> Optional[tuple]:
++    index = device.index if device.index is not None else torch.cuda.current_device()
++    capability = _device_capability.get(index)
++    if capability is None and not capturing:
++        capability = tuple(torch.cuda.get_device_capability(index))
++        _device_capability[index] = capability
++    return capability
++
++
++def _dense(t: Optional[torch.Tensor], shape: tuple, dtype: torch.dtype) -> bool:
++    return (
++        isinstance(t, torch.Tensor)
++        and t.dtype == dtype
++        and tuple(t.shape) == shape
++        and t.is_contiguous()
++    )
++
++
++def supported(
++    gemm_out_mul: torch.Tensor,
++    gemm_out_sqrsum: torch.Tensor,
++    hc_scale: torch.Tensor,
++    hc_base: torch.Tensor,
++    residual: torch.Tensor,
++    norm_weight: Optional[torch.Tensor],
++    rms_eps: float,
++    hc_pre_eps: float,
++    hc_sinkhorn_eps: float,
++    hc_post_mult_value: float,
++    sinkhorn_repeat: int,
++    norm_eps: float,
++    post_mix: Optional[torch.Tensor] = None,
++    comb_mix: Optional[torch.Tensor] = None,
++    layer_input: Optional[torch.Tensor] = None,
++) -> bool:
++    """Return True when :func:`run` launches the cluster kernel for these arguments."""
++    if os.environ.get(KILL_SWITCH_ENV, "") == "1":
++        return _reject("kill_switch")
++    # cheap shape rejects first (callers may probe every call, decode or not)
++    if not isinstance(gemm_out_mul, torch.Tensor) or gemm_out_mul.dim() != 3:
++        return _reject("shape")
++    ns, t_tokens, mix = (int(v) for v in gemm_out_mul.shape)
++    if mix != MIX:
++        return _reject("shape")
++    if ns not in NUM_SPLITS:
++        return _reject("num_splits")
++    if not MIN_TOKENS <= t_tokens <= MAX_TOKENS:
++        return _reject("num_tokens")
++    if norm_weight is None:
++        return _reject("no_norm_weight")
++    if (
++        _fp32(rms_eps) != _CONSTANTS_FP32["rms_eps"]
++        or _fp32(hc_pre_eps) != _CONSTANTS_FP32["hc_pre_eps"]
++        or _fp32(hc_sinkhorn_eps) != _CONSTANTS_FP32["hc_sinkhorn_eps"]
++        or _fp32(hc_post_mult_value) != _CONSTANTS_FP32["hc_post_mult_value"]
++        or _fp32(norm_eps) != _CONSTANTS_FP32["norm_eps"]
++        or int(sinkhorn_repeat) != CONSTANTS["sinkhorn_repeat"]
++    ):
++        return _reject("constants")
++    if not (
++        _dense(gemm_out_mul, (ns, t_tokens, MIX), torch.float32)
++        and _dense(gemm_out_sqrsum, (ns, t_tokens), torch.float32)
++        and _dense(hc_scale, (3,), torch.float32)
++        and _dense(hc_base, (MIX,), torch.float32)
++        and _dense(residual, (t_tokens, HC_MULT, HIDDEN_SIZE), torch.bfloat16)
++        and _dense(norm_weight, (HIDDEN_SIZE,), torch.bfloat16)
++    ):
++        return _reject("input_layout")
++    if post_mix is not None and not _dense(
++        post_mix, (t_tokens, HC_MULT), torch.float32
++    ):
++        return _reject("output_layout")
++    if comb_mix is not None and not (
++        _dense(comb_mix, (t_tokens, HC_MULT * HC_MULT), torch.float32)
++        or _dense(comb_mix, (t_tokens, HC_MULT, HC_MULT), torch.float32)
++    ):
++        return _reject("output_layout")
++    if layer_input is not None and not _dense(
++        layer_input, (t_tokens, HIDDEN_SIZE), torch.bfloat16
++    ):
++        return _reject("output_layout")
++    # 16-byte vector loads / stores
++    for t in (gemm_out_mul, hc_base, residual, norm_weight, comb_mix, layer_input):
++        if t is not None and t.data_ptr() % 16 != 0:
++            return _reject("alignment")
++    # device last
++    tensors = [gemm_out_mul, gemm_out_sqrsum, hc_scale, hc_base, residual, norm_weight]
++    tensors += [t for t in (post_mix, comb_mix, layer_input) if t is not None]
++    device = residual.device
++    if device.type != "cuda" or any(t.device != device for t in tensors):
++        return _reject("device")
++    capturing = _is_capturing()
++    capability = _capability_for(device, capturing)
++    if capability is None:
++        return _reject("capture_unready")
++    if capability not in COMPUTE_CAPABILITIES:
++        return _reject("arch")
++    if _state["module"] is None:
++        if capturing:
++            return _reject("capture_unready")
++        if _load_module() is None:
++            return _reject("module_unavailable")
++    return True
++
++
++def composable(
++    gemm_out_mul: torch.Tensor,
++    gemm_out_sqrsum: torch.Tensor,
++    hc_scale: torch.Tensor,
++    hc_base: torch.Tensor,
++    residual: torch.Tensor,
++    norm_weight: torch.Tensor,
++    rms_eps: float,
++    hc_pre_eps: float,
++    hc_sinkhorn_eps: float,
++    hc_post_mult_value: float,
++    sinkhorn_repeat: int,
++    norm_eps: float,
++    post_mix: torch.Tensor,
++    comb_mix: torch.Tensor,
++    layer_input: torch.Tensor,
++) -> None:
++    """fp32 torch implementation of the op contract (any NS / T / H, HC = 4)."""
++    t_tokens, hc, hidden = residual.shape
++    f32 = torch.float32
++    sq = gemm_out_sqrsum.to(f32).sum(dim=0)
++    rms = torch.rsqrt(sq / (hc * hidden) + rms_eps)
++    mixes = gemm_out_mul.to(f32).sum(dim=0) * rms.unsqueeze(-1)
++    scale = hc_scale.to(f32)
++    base = hc_base.to(f32)
++    pre = torch.sigmoid(mixes[:, :hc] * scale[0] + base[:hc]) + hc_pre_eps
++    post = (
++        torch.sigmoid(mixes[:, hc : 2 * hc] * scale[1] + base[hc : 2 * hc])
++        * hc_post_mult_value
++    )
++    comb = mixes[:, 2 * hc :].view(t_tokens, hc, hc) * scale[2] + base[2 * hc :].view(
++        1, hc, hc
++    )
++    comb = torch.softmax(comb, dim=-1) + hc_sinkhorn_eps
++    comb = comb / (comb.sum(dim=-2, keepdim=True) + hc_sinkhorn_eps)
++    for _ in range(int(sinkhorn_repeat) - 1):
++        comb = comb / (comb.sum(dim=-1, keepdim=True) + hc_sinkhorn_eps)
++        comb = comb / (comb.sum(dim=-2, keepdim=True) + hc_sinkhorn_eps)
++    ol = pre[:, 0:1] * residual[:, 0, :].to(f32)
++    for j in range(1, hc):
++        ol = ol + pre[:, j : j + 1] * residual[:, j, :].to(f32)
++    ob = ol.to(torch.bfloat16)
++    r = torch.rsqrt(ol.square().mean(dim=-1, keepdim=True) + norm_eps)
++    post_mix.copy_(post.view(post_mix.shape))
++    comb_mix.copy_(comb.reshape(comb_mix.shape))
++    layer_input.copy_((ob.to(f32) * r * norm_weight.to(f32)).to(torch.bfloat16))
++
++
++def run(
++    gemm_out_mul: torch.Tensor,
++    gemm_out_sqrsum: torch.Tensor,
++    hc_scale: torch.Tensor,
++    hc_base: torch.Tensor,
++    residual: torch.Tensor,
++    norm_weight: torch.Tensor,
++    rms_eps: float,
++    hc_pre_eps: float,
++    hc_sinkhorn_eps: float,
++    hc_post_mult_value: float,
++    sinkhorn_repeat: int,
++    norm_eps: float,
++    post_mix: Optional[torch.Tensor] = None,
++    comb_mix: Optional[torch.Tensor] = None,
++    layer_input: Optional[torch.Tensor] = None,
++    enable_pdl: Optional[bool] = None,
++) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
++    t_tokens, hc, hidden = residual.shape
++    device = residual.device
++    if post_mix is None:
++        post_mix = torch.empty((t_tokens, hc), dtype=torch.float32, device=device)
++    if comb_mix is None:
++        comb_mix = torch.empty((t_tokens, hc * hc), dtype=torch.float32, device=device)
++    if layer_input is None:
++        layer_input = torch.empty(
++            (t_tokens, hidden), dtype=torch.bfloat16, device=device
++        )
++    args = (
++        gemm_out_mul,
++        gemm_out_sqrsum,
++        hc_scale,
++        hc_base,
++        residual,
++        norm_weight,
++        rms_eps,
++        hc_pre_eps,
++        hc_sinkhorn_eps,
++        hc_post_mult_value,
++        sinkhorn_repeat,
++        norm_eps,
++        post_mix,
++        comb_mix,
++        layer_input,
++    )
++    if supported(*args):
++        _state["module"].mhc_pre_big_fuse_with_norm_cluster(
++            post_mix,
++            comb_mix,
++            layer_input,
++            gemm_out_mul,
++            gemm_out_sqrsum,
++            hc_scale,
++            hc_base,
++            residual,
++            norm_weight,
++            bool(enable_pdl),
++        )
++        STATS["kernel_calls"] += 1
++    else:
++        composable(*args)
++        STATS["composable_calls"] += 1
++    return post_mix, comb_mix, layer_input
++
++
++def warmup(device: Optional[torch.device] = None) -> bool:
++    """Load the cluster kernel (and the device memo) outside CUDA-graph capture."""
++    if _is_capturing():
++        return False
++    device = torch.device("cuda") if device is None else torch.device(device)
++    if _capability_for(device, False) not in COMPUTE_CAPABILITIES:
++        return False
++    return _load_module() is not None
+diff --git a/flashinfer/experimental/mhc_pre_big_fuse_with_norm/csrc/mhc_pre_big_fuse_with_norm_cluster.cu b/flashinfer/experimental/mhc_pre_big_fuse_with_norm/csrc/mhc_pre_big_fuse_with_norm_cluster.cu
+new file mode 100644
+index 00000000000..1ff177c635c
+--- /dev/null
++++ b/flashinfer/experimental/mhc_pre_big_fuse_with_norm/csrc/mhc_pre_big_fuse_with_norm_cluster.cu
+@@ -0,0 +1,681 @@
++/*
++ * Copyright (c) 2026 by FlashInfer team.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *   http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++// mHC pre-map big-fuse with fused output RMSNorm (H = 4096, HC = 4), decode regime.
++// SM100-family only (thread-block clusters, distributed shared memory, st.async).
++//
++// One CL-CTA thread-block cluster per token (CL = 4, or 2 for T > 24); CTA `rank` owns channels
++// [rank * CH, (rank + 1) * CH).
++//   warps 1..NWC   : pre sigmoids (all 4 in every lane), 4-stream collapse (16 B bf16 loads),
++//                    bf16 rounding of ol, sum(ol^2) partial, DSMEM all-gather of the partials
++//                    (st.async + mbarrier; the cluster wait is taken during the DRAM loads),
++//                    RMSNorm x weight, store.
++//   warp 0, rank 1 : softmax + 20-iteration division-free Sinkhorn (rolled loop) -> comb_mix.
++//   warp 0, rank 2 : post sigmoid -> post_mix.  Warp 0 of the other ranks is idle (warp 0 of
++//                    block 0 is routinely the last warp of the grid to start, so it carries no
++//                    work).
++// Every warp issues its loads first (one DRAM round trip): the logit partials are spread over the
++// lanes (lane group g = lane >> 2 loads split-K partial s = g, reduced later by an xor butterfly),
++// so the code in front of the first load is a few dozen instructions.  All input loads are plain
++// ld.global (an .nc load gets hoisted by ptxas above griddepcontrol.wait).
++//
++// Numerics (no fast-math): libdevice expf, IEEE division for the post sigmoid and a Newton-refined
++// reciprocal for the pre sigmoids (rcp.approx seed, e = fma(-d, y, 1), y' = fma(y, e, y)),
++// rsqrt.approx.ftz for rsqrt (arguments >= 1e-5, never subnormal).  The Sinkhorn half-steps are
++// division-free (exact cofactor products + power-of-two rescaling, see hs_lam and rebalance); the
++// one reciprocal (final 1/G) is a Newton-refined rcp.approx seed.  Every Sinkhorn quantity stays
++// within proven bounds far inside the normal fp32 range for every finite input (see rebalance).
++
++#include <cuda_bf16.h>
++#include <cuda_runtime.h>
++#include <stdint.h>
++
++#include "tvm_ffi_utils.h"
++
++namespace flashinfer::mhc::pre_norm_cluster {
++namespace {
++
++constexpr int H = 4096;
++constexpr int HC = 4;
++constexpr int MIX = 24;
++constexpr int MIX4 = MIX / 4;       // float4 per (s, t) row of gemm_out_mul
++constexpr int VEC = 8;              // bf16 per 16 B
++constexpr int NCT = 64;             // collapse threads per CTA
++constexpr int NWC = NCT / 32;       // collapse warps per CTA
++constexpr int NTHREADS = NCT + 32;  // + Sinkhorn / post warp
++constexpr int CL_MAX = 8;           // largest cluster (CTAs per token)
++constexpr int PU = 8;               // NS partials loaded per lane per pass
++
++constexpr float RMS_EPS = 1e-5f;
++constexpr float HC_PRE_EPS = 1e-6f;
++constexpr float SK_EPS = 1e-6f;
++constexpr float POST_MULT = 2.0f;
++constexpr float NORM_EPS = 1e-5f;
++constexpr float INV_RMS_NUMEL = 1.0f / 16384.0f;  // exact power of two: x * 2^-14 == x / 16384
++constexpr float INV_H = 1.0f / 4096.0f;           // exact power of two
++
++__device__ __forceinline__ uint32_t smem_u32(const void* p) {
++  return static_cast<uint32_t>(__cvta_generic_to_shared(p));
++}
++__device__ __forceinline__ uint32_t cluster_ctarank() {
++  uint32_t r;
++  asm volatile("mov.u32 %0, %%cluster_ctarank;" : "=r"(r));
++  return r;
++}
++__device__ __forceinline__ uint32_t mapa(uint32_t addr, uint32_t rank) {
++  uint32_t r;
++  asm volatile("mapa.shared::cluster.u32 %0, %1, %2;" : "=r"(r) : "r"(addr), "r"(rank));
++  return r;
++}
++
++// MUFU reciprocal seed. NEVER used directly: every use below is followed by a Newton step.
++__device__ __forceinline__ float rcp_seed(float x) {
++  float y;
++  asm("rcp.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
++  return y;
++}
++// Newton-refined reciprocal: e = fma(-x, y, 1); y' = fma(y, e, y).
++__device__ __forceinline__ float rcp_refined(float x) {
++  const float y = rcp_seed(x);
++  const float e = fmaf(-x, y, 1.0f);
++  return fmaf(y, e, y);
++}
++
++// MUFU.RSQ (as torch.rsqrt); the arguments are >= 1e-5, so the ftz form needs no subnormal guard.
++__device__ __forceinline__ float rsqrt_ftz(float x) {
++  float y;
++  asm("rsqrt.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
++  return y;
++}
++
++// IEEE sigmoid (rcp.rn, libdevice expf), as torch.sigmoid.
++__device__ __forceinline__ float sigmoid_ieee(float x) { return 1.0f / (1.0f + expf(-x)); }
++
++// Coherent global loads (ld.global, not .nc): ptxas hoists read-only .nc loads above
++// griddepcontrol.wait, which would break the PDL contract (no input read before the wait).
++__device__ __forceinline__ float ld_f32(const float* p) {
++  float v;
++  asm volatile("ld.global.f32 %0, [%1];" : "=f"(v) : "l"(p) : "memory");
++  return v;
++}
++__device__ __forceinline__ float4 ld_f32x4(const float4* p) {
++  float4 v;
++  asm volatile("ld.global.v4.f32 {%0, %1, %2, %3}, [%4];"
++               : "=f"(v.x), "=f"(v.y), "=f"(v.z), "=f"(v.w)
++               : "l"(p)
++               : "memory");
++  return v;
++}
++__device__ __forceinline__ uint4 ld_u32x4(const void* p) {
++  uint4 v;
++  asm volatile("ld.global.v4.u32 {%0, %1, %2, %3}, [%4];"
++               : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w)
++               : "l"(p)
++               : "memory");
++  return v;
++}
++
++// sigmoid with a Newton-refined reciprocal (rcp.approx seed, e = fma(-d, y, 1), y' = fma(y, e, y))
++// and libdevice expf.  d = 1 + expf(-x) >= 1 is clamped to 2^126 so the seed and the residual stay
++// finite (for d >= 2^126 the IEEE result is <= 2^-126, below every eps it is added to).
++__device__ __forceinline__ float sigmoid_nr(float x) {
++  return rcp_refined(fminf(1.0f + expf(-x), 0x1p126f));
++}
++
++__device__ __forceinline__ float bf_lo(uint32_t w) { return __uint_as_float(w << 16); }
++__device__ __forceinline__ float bf_hi(uint32_t w) { return __uint_as_float(w & 0xffff0000u); }
++__device__ __forceinline__ uint32_t pack_bf16x2(float lo, float hi) {
++  __nv_bfloat162 v = __floats2bfloat162_rn(lo, hi);
++  return *reinterpret_cast<uint32_t*>(&v);
++}
++
++__device__ __forceinline__ float4 add4(float4 a, float4 b) {
++  return make_float4(a.x + b.x, a.y + b.y, a.z + b.z, a.w + b.w);
++}
++__device__ __forceinline__ float4 shfl_xor4(float4 v, int m) {
++  v.x = __shfl_xor_sync(0xffffffffu, v.x, m);
++  v.y = __shfl_xor_sync(0xffffffffu, v.y, m);
++  v.z = __shfl_xor_sync(0xffffffffu, v.z, m);
++  v.w = __shfl_xor_sync(0xffffffffu, v.w, m);
++  return v;
++}
++__device__ __forceinline__ float sel4(float4 v, int j) {
++  return j == 0 ? v.x : (j == 1 ? v.y : (j == 2 ? v.z : v.w));
++}
++
++// Division-free Sinkhorn in diagonal-scaling form.
++//   c[i][j] = r[i] * K[i][j] * s[j] / G,   K = S_i * (softmax + eps) (fixed),  E = eps * G.
++// A half-step that normalises axis k (z_k = sum_k(c) + eps) is, exactly in real arithmetic,
++//   W_k = (scale_k * matvec_k) + E      (= G * z_k)
++//   1/z_k = G * Q_k / P,  Q_k = prod_{l != k} W_l,  P = prod_l W_l     (batch-inverted reciprocal)
++//   scale_k <- scale_k * kappa * Q_k,  G <- kappa * P,  E <- eps * G
++// i.e. the common denominator P of the batch-inverted reciprocal is accumulated into G and the
++// division by G is done once, at the end, with a Newton-refined reciprocal.  kappa is an exact
++// power of two taken from the exponent bits of G (keeps every value in range, exact).
++// No reciprocal, division or approximate instruction is executed inside the 39 half-steps.
++// The scale vectors carry a free power-of-two gauge that rebalance() fixes once per (rows, columns)
++// pair, which keeps every carried quantity at a provable scale.
++
++// kappa = 2^(-e(P)) (first half-step only: resets the scale from the softmax product).
++__device__ __forceinline__ float kappa_direct(float P) {
++  const uint32_t eb = __float_as_uint(P) & 0x7f800000u;
++  return __uint_as_float((254u << 23) - eb);
++}
++
++// Same half-step with the power-of-two rescale lambda = kappa entering through lambda*b1 and
++// lambda*E only (applied as exponent-field integer adds): W1' = lambda*W1 exactly, so W13' =
++// lambda*W1*W3 and every cofactor product carries exactly one factor lambda (one multiply level
++// shorter than scaling the cofactor pairs).  The summation / statement order is the one that gave
++// ptxas's loop allocation the fewest register-bank conflicts.
++template <bool COL>
++__device__ __forceinline__ void hs_lam(const float K[4][4], const float a[4], float b[4], float& G,
++                                       float& E) {
++#define KM(i, k) (COL ? K[i][k] : K[k][i])
++  // lambda = 2^(-4 e(G)) applied as an exact exponent-field add: bits(x * lambda) ==
++  // bits(x) + 4 * (~bits(G) & expmask)  (mod 2^32) while x * lambda is normal  (LOP3 + 2 LEA).
++  const uint32_t lm = ~__float_as_uint(G) & 0x7f800000u;
++  const float v2 =
++      fmaf(KM(1, 2), a[1], fmaf(KM(2, 2), a[2], fmaf(KM(3, 2), a[3], KM(0, 2) * a[0])));
++  const float v0 =
++      fmaf(KM(1, 0), a[1], fmaf(KM(2, 0), a[2], fmaf(KM(3, 0), a[3], KM(0, 0) * a[0])));
++  const float v3 =
++      fmaf(KM(1, 3), a[1], fmaf(KM(2, 3), a[2], fmaf(KM(3, 3), a[3], KM(0, 3) * a[0])));
++  const float v1 =
++      fmaf(KM(1, 1), a[1], fmaf(KM(2, 1), a[2], fmaf(KM(3, 1), a[3], KM(0, 1) * a[0])));
++#undef KM
++  uint32_t lb1b, lEb;
++  asm("mad.lo.u32 %0, %1, 4, %2;" : "=r"(lb1b) : "r"(lm), "r"(__float_as_uint(b[1])));
++  asm("mad.lo.u32 %0, %1, 4, %2;" : "=r"(lEb) : "r"(lm), "r"(__float_as_uint(E)));
++  const float lb1 = __uint_as_float(lb1b), lE = __uint_as_float(lEb);
++  const float W3 = fmaf(b[3], v3, E);
++  const float W1 = fmaf(lb1, v1, lE);
++  const float W0 = fmaf(b[0], v0, E);
++  const float W2 = fmaf(b[2], v2, E);
++  const float W02 = W0 * W2, W13 = W1 * W3;
++  b[1] = (lb1 * W3) * W02;
++  b[3] = (b[3] * W1) * W02;
++  b[0] = (b[0] * W2) * W13;
++  b[2] = (b[2] * W0) * W13;
++  G = W02 * W13;
++  E = SK_EPS * G;
++}
++
++// Exact power-of-two rebalance of the two scale vectors.  c = r K s / G is invariant under
++// (r, s) -> (r * 2^-k, s * 2^k), a free gauge that lambda (which renormalises only G) does not fix.
++// Once per (rows, columns) pair, k = (e(r[1]) - e(s[1])) >> 1 (biased exponents, arithmetic shift)
++// is moved from r to s as integer adds on the exponent fields; afterwards |e(r[1]) - e(s[1])| <= 1.
++// Power-of-two scaling is exact and fp32 rounding is scale-equivariant in the normal range, so c, G
++// and every later rounding (hence comb_mix) are bit-identical to the un-rebalanced recursion.  What
++// changes is that r and s stay at a provable scale: r_i * s_j = c_ij * G / K_ij is bounded for
++// every input, the rebalance splits r_1 * s_1 evenly between the two vectors, and one half-step
++// moves a vector by at most 12 binades, so every r and s stays within (2^-64, 2^50) (normal fp32
++// range: [2^-126, 2^128)).
++//
++// s[1] is the last value of the column half-step, so k is formed from it with one subtract and one
++// shift: with r[1]'s mantissa forced to all ones, (bits(r1) | 0x7fffff) - bits(s1) =
++// (e(r1) - e(s1)) * 2^23 + delta with delta in [0, 2^23), and the arithmetic shift by 24 floors it
++// to (e(r1) - e(s1)) >> 1 (r, s > 0: no sign bits).  The exponent adds are mad.lo.u32 (one
++// shift-add each, like lambda in hs_lam).
++__device__ __forceinline__ void rebalance(float r[4], float s[4]) {
++  const int k = (int)((__float_as_uint(r[1]) | 0x7fffffu) - __float_as_uint(s[1])) >> 24;
++  const uint32_t kp = (uint32_t)k, kn = (uint32_t)(-k);
++#pragma unroll
++  for (int i = 0; i < 4; ++i) {
++    uint32_t rb, sb;
++    asm("mad.lo.u32 %0, %1, 0x800000, %2;" : "=r"(rb) : "r"(kn), "r"(__float_as_uint(r[i])));
++    asm("mad.lo.u32 %0, %1, 0x800000, %2;" : "=r"(sb) : "r"(kp), "r"(__float_as_uint(s[i])));
++    r[i] = __uint_as_float(rb);
++    s[i] = __uint_as_float(sb);
++  }
++}
++
++// NS split-K partials of one float4 logit row (+ the sqrsum partials).  Lane group g = lane >> 2
++// loads partial s = g (one 16 B row + one float): a single load per lane, issued right after the
++// kernel prologue (the code in front of the first load is fetched cold when the L2 is cold, so it
++// is kept short). NS > 8 also issues s = g + 8k (k < PU) up front and a tail loop covers NS > 64;
++// reduce_partials adds the per-lane partials and then the 8 lane groups with an xor butterfly.
++struct Partials {
++  float4 v[PU];
++  float w[PU];
++};
++__device__ __forceinline__ void issue_partials(Partials& p, const float4* m0, const float* s0,
++                                               int mstride, int T, int NS, int g) {
++  p.v[0] = make_float4(0.f, 0.f, 0.f, 0.f);
++  p.w[0] = 0.f;
++  if (g < NS) {
++    p.v[0] = ld_f32x4(m0 + g * mstride);
++    p.w[0] = ld_f32(s0 + g * T);
++  }
++}
++// NS > 8 only: s = g + 8k, k = 1..PU-1, issued by each role after its main loads.
++__device__ __forceinline__ void issue_tail(Partials& p, const float4* m0, const float* s0,
++                                           int mstride, int T, int NS, int g) {
++  if (__builtin_expect(NS > 8, 0)) {
++#pragma unroll
++    for (int k = 1; k < PU; ++k) {
++      const int s = g + 8 * k;
++      p.v[k] = make_float4(0.f, 0.f, 0.f, 0.f);
++      p.w[k] = 0.f;
++      if (s < NS) {
++        p.v[k] = ld_f32x4(m0 + s * mstride);
++        p.w[k] = ld_f32(s0 + s * T);
++      }
++    }
++  }
++}
++// -> logits x[0..3] of the row: (sum * scale) * rms + base
++__device__ __forceinline__ float4 reduce_partials(Partials& p, const float4* m0, const float* s0,
++                                                  int mstride, int T, int NS, int g, float scale,
++                                                  float4 bias) {
++  float4 acc = p.v[0];
++  float sq = p.w[0];
++  if (__builtin_expect(NS > 8, 0)) {
++#pragma unroll
++    for (int h = PU / 2; h >= 1; h >>= 1) {
++#pragma unroll
++      for (int k = 0; k < h; ++k) {
++        p.v[k + 1] =
++            add4(p.v[k + 1], h + k + 1 < PU ? p.v[k + 1 + h] : make_float4(0.f, 0.f, 0.f, 0.f));
++        p.w[k + 1] = p.w[k + 1] + (h + k + 1 < PU ? p.w[k + 1 + h] : 0.f);
++      }
++    }
++    acc = add4(acc, p.v[1]);
++    sq = sq + p.w[1];
++#pragma unroll 1
++    for (int s = g + 8 * PU; s < NS; s += 8) {  // NS > 64 only
++      acc = add4(acc, ld_f32x4(m0 + s * mstride));
++      sq = sq + ld_f32(s0 + s * T);
++    }
++  }
++#pragma unroll
++  for (int m = 4; m <= 16; m <<= 1) {
++    acc = add4(acc, shfl_xor4(acc, m));
++    sq = sq + __shfl_xor_sync(0xffffffffu, sq, m);
++  }
++  const float rms = rsqrt_ftz(sq * INV_RMS_NUMEL + RMS_EPS);
++  return make_float4(fmaf(acc.x * scale, rms, bias.x), fmaf(acc.y * scale, rms, bias.y),
++                     fmaf(acc.z * scale, rms, bias.z), fmaf(acc.w * scale, rms, bias.w));
++}
++
++// CL CTAs per token (thread-block cluster); each collapse thread owns NV 16-byte chunks per stream.
++template <int CL>
++__global__ __launch_bounds__(NTHREADS, 1) void __cluster_dims__(CL, 1, 1)
++    mhc_pre_cluster_kernel(const float* __restrict__ gemm_out_mul,
++                           const float* __restrict__ gemm_out_sqrsum,
++                           const float* __restrict__ hc_scale, const float* __restrict__ hc_base,
++                           const __nv_bfloat16* __restrict__ residual,
++                           const __nv_bfloat16* __restrict__ norm_weight,
++                           float* __restrict__ post_mix, float* __restrict__ comb_mix,
++                           __nv_bfloat16* __restrict__ layer_input, int T, int NS) {
++  constexpr int CH = H / CL;            // channels per CTA
++  constexpr int NV = CH / (NCT * VEC);  // 16 B chunks per stream per collapse thread
++  constexpr int NSLOT = CL * NWC;       // sum(ol^2) partials per token
++  static_assert(CL <= CL_MAX && NV * NCT * VEC == CH, "bad cluster size");
++  __shared__ float red[NSLOT];
++  __shared__ __align__(8) uint64_t mbar;
++  __shared__ float4 sK[4];  // Sinkhorn warp: K rows
++  __shared__ float4 sS;     // Sinkhorn warp: softmax row sums
++
++  const int tid = threadIdx.x;
++  const int warp = tid >> 5;
++  const int lane = tid & 31;
++  const int j4 = lane & 3;
++  const int g = lane >> 2;
++  const int t = blockIdx.y;
++  const uint32_t rank = cluster_ctarank();
++  // warp 0: control (rank 1 = comb / Sinkhorn, rank 2 = post, ranks 0 and 3 idle); warps 1..NWC:
++  // collapse.  Warp 0 of block 0 is routinely the last warp of the grid to start, so it carries no
++  // work.
++  constexpr uint32_t POST_RANK = CL > 2 ? 2 : 0;  // CL = 2: post on rank 0 (short path)
++  const bool collapse = warp > 0;
++  // idle warp-0s leave after the shared load prologue (an early exit would serialize the parameter
++  // loads behind the S2R latency of the role test)
++  const bool idle = !collapse && rank != 1 && rank != POST_RANK;
++  const bool sink = !collapse && rank == 1;
++  // logit row of this warp's role: pre (collapse), comb row j4 (rank 1 control), post
++  // (POST_RANK control)
++  const int fidx = collapse ? 0 : (sink ? 2 + j4 : 1);
++  const float4* mrow = reinterpret_cast<const float4*>(gemm_out_mul) + t * MIX4 + fidx;
++  const float* sp = gemm_out_sqrsum + t;
++  const int mstride = T * MIX4;  // float4 units
++  // collapse chunk c of this thread: channels [ch0 + c*NCT*VEC, +VEC)
++  const size_t ch0 = (size_t)rank * CH + (size_t)(tid & (NCT - 1)) * VEC;
++
++  // PDL: no global reads before the producer grid is complete.
++  asm volatile("griddepcontrol.wait;" ::: "memory");
++
++  // ---- logit partials of every role first, straight after the prologue (one DRAM round trip) ----
++  Partials p;
++  issue_partials(p, mrow, sp, mstride, T, NS, g);
++  const float scale = ld_f32(hc_scale + (collapse ? 0 : (sink ? 2 : 1)));
++  const float4 bias = ld_f32x4(reinterpret_cast<const float4*>(hc_base) + fidx);
++  if (idle) return;
++  if (!collapse) {
++    // ================= control warp: rank 1 = comb (Sinkhorn), rank 2 = post =================
++    issue_tail(p, mrow, sp, mstride, T, NS, g);
++    asm volatile("barrier.cluster.arrive.relaxed.aligned;" ::: "memory");
++    if (sink) {
++      // ---------------- comb: softmax (lane j4 = row) + division-free Sinkhorn ----------------
++      const float4 x = reduce_partials(p, mrow, sp, mstride, T, NS, g, scale, bias);
++      const float m = fmaxf(fmaxf(x.x, x.y), fmaxf(x.z, x.w));
++      const float e0 = expf(x.x - m), e1 = expf(x.y - m), e2 = expf(x.z - m), e3 = expf(x.w - m);
++      const float Sr = (e0 + e1) + (e2 + e3);
++      // K = S * (softmax + eps) = e + eps * S   (softmax denominator S deferred into r and G)
++      const float k0 = fmaf(SK_EPS, Sr, e0), k1 = fmaf(SK_EPS, Sr, e1);
++      const float k2 = fmaf(SK_EPS, Sr, e2), k3 = fmaf(SK_EPS, Sr, e3);
++      if (lane < 4) {
++        sK[lane] = make_float4(k0, k1, k2, k3);
++        reinterpret_cast<float*>(&sS)[lane] = Sr;
++      }
++      __syncwarp();
++      float K[4][4];
++#pragma unroll
++      for (int r = 0; r < 4; ++r) {
++        const float4 q = sK[r];
++        K[r][0] = q.x;
++        K[r][1] = q.y;
++        K[r][2] = q.z;
++        K[r][3] = q.w;
++      }
++      const float4 S = sS;
++      // r_i = prod_{l != i} S_l, G = prod S: c = r K s / G = softmax + eps (s = 1)
++      const float S01 = S.x * S.y, S23 = S.z * S.w;
++      float rv[4] = {S.y * S23, S.x * S23, S.w * S01, S.z * S01};
++      float sv[4];
++      float G, E;
++      {
++        // half-step 0 (columns), s = 1; scale reset from P itself (kappa_direct)
++        const float E0 = SK_EPS * (S01 * S23);
++        float W[4];
++#pragma unroll
++        for (int k = 0; k < 4; ++k)
++          W[k] = fmaf(K[3][k], rv[3],
++                      fmaf(K[2][k], rv[2], fmaf(K[1][k], rv[1], fmaf(K[0][k], rv[0], E0))));
++        const float W02 = W[0] * W[2], W13 = W[1] * W[3];
++        const float kap = kappa_direct(W02 * W13);
++        const float kW02 = kap * W02, kW13 = kap * W13;
++        sv[0] = W[2] * kW13;
++        sv[2] = W[0] * kW13;
++        sv[1] = W[3] * kW02;
++        sv[3] = W[1] * kW02;
++        G = kW02 * W13;
++        E = SK_EPS * G;
++      }
++      // 19 x (rows, columns): 39 half-steps in total, no early exit (1 peeled + 9 x 2)
++      hs_lam<false>(K, sv, rv, G, E);
++      hs_lam<true>(K, rv, sv, G, E);
++      rebalance(rv, sv);
++#pragma unroll 1
++      for (int it = 0; it < 9; ++it) {
++        hs_lam<false>(K, sv, rv, G, E);
++        hs_lam<true>(K, rv, sv, G, E);
++        rebalance(rv, sv);
++        hs_lam<false>(K, sv, rv, G, E);
++        hs_lam<true>(K, rv, sv, G, E);
++        rebalance(rv, sv);
++      }
++      // c = r K s / G: one Newton-refined reciprocal; lane i < 4 writes row i (its own K row).
++      // The numerators (r_i K_ij) s_j are formed while the reciprocal is in flight.
++      const float rr = (lane & 2) ? ((lane & 1) ? rv[3] : rv[2]) : ((lane & 1) ? rv[1] : rv[0]);
++      const float n0 = (rr * k0) * sv[0], n1 = (rr * k1) * sv[1];
++      const float n2 = (rr * k2) * sv[2], n3 = (rr * k3) * sv[3];
++      const float invG = rcp_refined(G);
++      if (lane < 4)
++        reinterpret_cast<float4*>(comb_mix + (size_t)t * 16)[lane] =
++            make_float4(n0 * invG, n1 * invG, n2 * invG, n3 * invG);
++    } else {
++      // ---------------- post (rank 2): lane j4 -> post_mix[t, j4] ----------------
++      const float4 x = reduce_partials(p, mrow, sp, mstride, T, NS, g, scale, bias);
++      const float pv = sigmoid_ieee(sel4(x, j4)) * POST_MULT;
++      if (lane < 4) post_mix[(size_t)t * 4 + lane] = pv;
++    }
++  } else {
++    // ================= collapse warps: CH channels of this CTA =================
++    uint4 rv[NV][HC], wv[NV];
++#pragma unroll
++    for (int c = 0; c < NV; ++c) {
++#pragma unroll
++      for (int hc = 0; hc < HC; ++hc)
++        rv[c][hc] = ld_u32x4(residual + ((size_t)t * HC + hc) * H + ch0 + c * NCT * VEC);
++      wv[c] = ld_u32x4(norm_weight + ch0 + c * NCT * VEC);
++    }
++    issue_tail(p, mrow, sp, mstride, T, NS, g);
++    // mbarrier for the sum(ol^2) all-gather; its init is published to the cluster by the fence +
++    // the cluster barrier that every sender waits on before its first st.async.
++    const uint32_t mbar_addr = smem_u32(&mbar);
++    if (tid == 32) {
++      asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;" ::"r"(mbar_addr) : "memory");
++      asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" ::"r"(mbar_addr),
++                   "r"((uint32_t)(NSLOT * sizeof(float)))
++                   : "memory");
++      asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
++    }
++    asm volatile("barrier.cluster.arrive.relaxed.aligned;" ::: "memory");
++    // The cluster wait (every remote mbarrier initialised before our first st.async) is taken here,
++    // while the loads are still in flight, instead of on the critical path after the collapse.
++    asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
++    // every lane holds the whole pre row after the butterfly: 4 independent sigmoids, no shuffles
++    const float4 x = reduce_partials(p, mrow, sp, mstride, T, NS, g, scale, bias);
++    const float pre0 = sigmoid_nr(x.x) + HC_PRE_EPS;
++    const float pre1 = sigmoid_nr(x.y) + HC_PRE_EPS;
++    const float pre2 = sigmoid_nr(x.z) + HC_PRE_EPS;
++    const float pre3 = sigmoid_nr(x.w) + HC_PRE_EPS;
++
++    float ob[NV][VEC];
++    float ss = 0.f;
++#pragma unroll
++    for (int c = 0; c < NV; ++c) {
++      const uint32_t* r0 = reinterpret_cast<const uint32_t*>(&rv[c][0]);
++      const uint32_t* r1 = reinterpret_cast<const uint32_t*>(&rv[c][1]);
++      const uint32_t* r2 = reinterpret_cast<const uint32_t*>(&rv[c][2]);
++      const uint32_t* r3 = reinterpret_cast<const uint32_t*>(&rv[c][3]);
++#pragma unroll
++      for (int k = 0; k < VEC / 2; ++k) {
++        float o_lo = pre0 * bf_lo(r0[k]);
++        o_lo = fmaf(pre1, bf_lo(r1[k]), o_lo);
++        o_lo = fmaf(pre2, bf_lo(r2[k]), o_lo);
++        o_lo = fmaf(pre3, bf_lo(r3[k]), o_lo);
++        float o_hi = pre0 * bf_hi(r0[k]);
++        o_hi = fmaf(pre1, bf_hi(r1[k]), o_hi);
++        o_hi = fmaf(pre2, bf_hi(r2[k]), o_hi);
++        o_hi = fmaf(pre3, bf_hi(r3[k]), o_hi);
++        ss = fmaf(o_lo, o_lo, ss);
++        ss = fmaf(o_hi, o_hi, ss);
++        const uint32_t pb = pack_bf16x2(o_lo, o_hi);  // bf16(ol); statistic stays fp32
++        ob[c][2 * k] = bf_lo(pb);
++        ob[c][2 * k + 1] = bf_hi(pb);
++      }
++    }
++#pragma unroll
++    for (int m = 16; m >= 1; m >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, m);
++
++    // bf16(ol) * weight, formed while the all-gather is in flight (layer = (ob * w) * r)
++#pragma unroll
++    for (int c = 0; c < NV; ++c) {
++      const uint32_t* wp = reinterpret_cast<const uint32_t*>(&wv[c]);
++#pragma unroll
++      for (int k = 0; k < VEC / 2; ++k) {
++        ob[c][2 * k] *= bf_lo(wp[k]);
++        ob[c][2 * k + 1] *= bf_hi(wp[k]);
++      }
++    }
++    // all-gather of the NSLOT partials over DSMEM
++    if (lane < CL) {
++      const uint32_t dst = mapa(smem_u32(&red[rank * NWC + warp - 1]), (uint32_t)lane);
++      const uint32_t dbar = mapa(mbar_addr, (uint32_t)lane);
++      asm volatile(
++          "st.async.shared::cluster.mbarrier::complete_tx::bytes.b32 [%0], %1, [%2];" ::"r"(dst),
++          "r"(__float_as_uint(ss)), "r"(dbar)
++          : "memory");
++    }
++    {
++      uint32_t done = 0;
++      do {
++        asm volatile(
++            "{\n .reg .pred p;\n"
++            " mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64 p, [%1], 0;\n"
++            " selp.u32 %0, 1, 0, p;\n}"
++            : "=r"(done)
++            : "r"(mbar_addr)
++            : "memory");
++      } while (!done);
++    }
++    float part[NSLOT];
++#pragma unroll
++    for (int k = 0; k < NSLOT; ++k) part[k] = red[k];
++#pragma unroll
++    for (int h = NSLOT / 2; h >= 1; h >>= 1)
++#pragma unroll
++      for (int k = 0; k < h; ++k) part[k] = part[k] + part[k + h];
++    const float r = rsqrt_ftz(part[0] * INV_H + NORM_EPS);
++
++#pragma unroll
++    for (int c = 0; c < NV; ++c) {
++      uint4 out;
++      uint32_t* op = reinterpret_cast<uint32_t*>(&out);
++#pragma unroll
++      for (int k = 0; k < VEC / 2; ++k) op[k] = pack_bf16x2(ob[c][2 * k] * r, ob[c][2 * k + 1] * r);
++      *reinterpret_cast<uint4*>(layer_input + (size_t)t * H + ch0 + c * NCT * VEC) = out;
++    }
++  }
++  asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
++}
++
++// One launch per call on the caller's stream. The cluster shape is compiled into the kernel
++// (__cluster_dims__), so only the programmatic-dependent-launch attribute is set here: the kernel
++// waits (griddepcontrol.wait) before its first global read and triggers its dependents after its
++// last global write, so the attribute is safe either way.
++template <int CL>
++void launch_cl(const float* gemm_out_mul, const float* gemm_out_sqrsum, const float* hc_scale,
++               const float* hc_base, const __nv_bfloat16* residual,
++               const __nv_bfloat16* norm_weight, float* post_mix, float* comb_mix,
++               __nv_bfloat16* layer_input, int T, int NS, bool enable_pdl, cudaStream_t stream) {
++  cudaLaunchConfig_t cfg = {};
++  cfg.gridDim = dim3(CL, T, 1);
++  cfg.blockDim = dim3(NTHREADS, 1, 1);
++  cfg.dynamicSmemBytes = 0;
++  cfg.stream = stream;
++  cudaLaunchAttribute attrs[1];
++  attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
++  attrs[0].val.programmaticStreamSerializationAllowed = enable_pdl ? 1 : 0;
++  cfg.attrs = attrs;
++  cfg.numAttrs = 1;
++  cudaLaunchKernelEx(&cfg, mhc_pre_cluster_kernel<CL>, gemm_out_mul, gemm_out_sqrsum, hc_scale,
++                     hc_base, residual, norm_weight, post_mix, comb_mix, layer_input, T, NS);
++}
++
++void launch_cluster_kernel(const float* gemm_out_mul, const float* gemm_out_sqrsum,
++                           const float* hc_scale, const float* hc_base,
++                           const __nv_bfloat16* residual, const __nv_bfloat16* norm_weight,
++                           float* post_mix, float* comb_mix, __nv_bfloat16* layer_input, int T,
++                           int NS, bool enable_pdl, cudaStream_t stream) {
++  // 4 CTAs (one thread-block cluster) per token while that is at most 96 CTAs; beyond that
++  // 2 CTAs per token (fewer clusters to place at T = 32, equal time at T = 4..24).
++  if (4 * T <= 96) {
++    launch_cl<4>(gemm_out_mul, gemm_out_sqrsum, hc_scale, hc_base, residual, norm_weight, post_mix,
++                 comb_mix, layer_input, T, NS, enable_pdl, stream);
++  } else {
++    launch_cl<2>(gemm_out_mul, gemm_out_sqrsum, hc_scale, hc_base, residual, norm_weight, post_mix,
++                 comb_mix, layer_input, T, NS, enable_pdl, stream);
++  }
++}
++
++}  // namespace
++
++// Destination-passing entry point. Shapes (all contiguous, one CUDA device):
++//   post_mix fp32 [T, 4], comb_mix fp32 [T, 16] or [T, 4, 4], layer_input bf16 [T, 4096],
++//   gemm_out_mul fp32 [NS, T, 24], gemm_out_sqrsum fp32 [NS, T], hc_scale fp32 [3],
++//   hc_base fp32 [24], residual bf16 [T, 4, 4096], norm_weight bf16 [4096].
++// gemm_out_mul, hc_base, residual, norm_weight, comb_mix and layer_input are accessed with
++// 16-byte vectors. The epsilons / post multiplier / Sinkhorn iteration count are compile-time
++// constants of this kernel; the Python support check only dispatches calls whose values match.
++void mhc_pre_big_fuse_with_norm_cluster(TensorView post_mix, TensorView comb_mix,
++                                        TensorView layer_input, TensorView gemm_out_mul,
++                                        TensorView gemm_out_sqrsum, TensorView hc_scale,
++                                        TensorView hc_base, TensorView residual,
++                                        TensorView norm_weight, bool enable_pdl) {
++  CHECK_INPUT_AND_TYPE(post_mix, dl_float32);
++  CHECK_INPUT_AND_TYPE(comb_mix, dl_float32);
++  CHECK_INPUT_AND_TYPE(layer_input, dl_bfloat16);
++  CHECK_INPUT_AND_TYPE(gemm_out_mul, dl_float32);
++  CHECK_INPUT_AND_TYPE(gemm_out_sqrsum, dl_float32);
++  CHECK_INPUT_AND_TYPE(hc_scale, dl_float32);
++  CHECK_INPUT_AND_TYPE(hc_base, dl_float32);
++  CHECK_INPUT_AND_TYPE(residual, dl_bfloat16);
++  CHECK_INPUT_AND_TYPE(norm_weight, dl_bfloat16);
++  CHECK_DEVICE(residual, post_mix);
++  CHECK_DEVICE(residual, comb_mix);
++  CHECK_DEVICE(residual, layer_input);
++  CHECK_DEVICE(residual, gemm_out_mul);
++  CHECK_DEVICE(residual, gemm_out_sqrsum);
++  CHECK_DEVICE(residual, hc_scale);
++  CHECK_DEVICE(residual, hc_base);
++  CHECK_DEVICE(residual, norm_weight);
++  CHECK_DIM(3, gemm_out_mul);
++  CHECK_DIM(2, gemm_out_sqrsum);
++  CHECK_DIM(3, residual);
++  CHECK_DIM(1, norm_weight);
++  CHECK_DIM(1, hc_scale);
++  CHECK_DIM(1, hc_base);
++  CHECK_DIM(2, post_mix);
++  CHECK_DIM(2, layer_input);
++
++  const int64_t NS = gemm_out_mul.size(0);
++  const int64_t T = gemm_out_mul.size(1);
++  TVM_FFI_ICHECK_EQ(gemm_out_mul.size(2), MIX) << "gemm_out_mul.shape[2] must be 24";
++  TVM_FFI_ICHECK_GE(NS, 1) << "gemm_out_mul.shape[0] (split count) must be >= 1";
++  TVM_FFI_ICHECK_EQ(gemm_out_sqrsum.size(0), NS) << "gemm_out_sqrsum.shape[0] must match";
++  TVM_FFI_ICHECK_EQ(gemm_out_sqrsum.size(1), T) << "gemm_out_sqrsum.shape[1] must match";
++  TVM_FFI_ICHECK_EQ(residual.size(0), T) << "residual.shape[0] must match";
++  TVM_FFI_ICHECK_EQ(residual.size(1), HC) << "residual.shape[1] must be 4";
++  TVM_FFI_ICHECK_EQ(residual.size(2), H) << "residual.shape[2] must be 4096";
++  TVM_FFI_ICHECK_EQ(norm_weight.size(0), H) << "norm_weight must have shape [4096]";
++  TVM_FFI_ICHECK_EQ(hc_scale.size(0), 3) << "hc_scale must have shape [3]";
++  TVM_FFI_ICHECK_EQ(hc_base.size(0), MIX) << "hc_base must have shape [24]";
++  TVM_FFI_ICHECK_EQ(post_mix.size(0), T) << "post_mix.shape[0] must match";
++  TVM_FFI_ICHECK_EQ(post_mix.size(1), HC) << "post_mix.shape[1] must be 4";
++  TVM_FFI_ICHECK_EQ(comb_mix.numel(), T * HC * HC) << "comb_mix must hold T * 16 elements";
++  TVM_FFI_ICHECK_EQ(comb_mix.size(0), T) << "comb_mix.shape[0] must match";
++  TVM_FFI_ICHECK_EQ(layer_input.size(0), T) << "layer_input.shape[0] must match";
++  TVM_FFI_ICHECK_EQ(layer_input.size(1), H) << "layer_input.shape[1] must be 4096";
++  TVM_FFI_ICHECK_LE(T, 65535) << "token count exceeds the grid limit";
++
++  if (T == 0) {
++    return;
++  }
++
++  ffi::CUDADeviceGuard device_guard(residual.device().device_id);
++  auto stream = get_stream(residual.device());
++  launch_cluster_kernel(
++      static_cast<const float*>(gemm_out_mul.data_ptr()),
++      static_cast<const float*>(gemm_out_sqrsum.data_ptr()),
++      static_cast<const float*>(hc_scale.data_ptr()), static_cast<const float*>(hc_base.data_ptr()),
++      reinterpret_cast<const __nv_bfloat16*>(residual.data_ptr()),
++      reinterpret_cast<const __nv_bfloat16*>(norm_weight.data_ptr()),
++      static_cast<float*>(post_mix.data_ptr()), static_cast<float*>(comb_mix.data_ptr()),
++      reinterpret_cast<__nv_bfloat16*>(layer_input.data_ptr()), static_cast<int>(T),
++      static_cast<int>(NS), enable_pdl, stream);
++  cudaError_t status = cudaPeekAtLastError();
++  TVM_FFI_ICHECK(status == cudaSuccess)
++      << "mhc_pre_big_fuse_with_norm_cluster kernel launch failed with error code "
++      << cudaGetErrorString(status);
++}
++
++TVM_FFI_DLL_EXPORT_TYPED_FUNC(
++    mhc_pre_big_fuse_with_norm_cluster,
++    flashinfer::mhc::pre_norm_cluster::mhc_pre_big_fuse_with_norm_cluster);
++
++}  // namespace flashinfer::mhc::pre_norm_cluster
+diff --git a/flashinfer/experimental/mhc_pre_big_fuse_with_norm/jit.py b/flashinfer/experimental/mhc_pre_big_fuse_with_norm/jit.py
+new file mode 100644
+index 00000000000..626f1bb308a
+--- /dev/null
++++ b/flashinfer/experimental/mhc_pre_big_fuse_with_norm/jit.py
+@@ -0,0 +1,43 @@
++"""
++Copyright (c) 2026 by FlashInfer team.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++  http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++"""
++
++# JIT specification of the SM100-family mHC pre big-fuse + RMSNorm cluster kernel.
++
++from pathlib import Path
++
++from ...jit.core import JitSpec, current_compilation_context, gen_jit_spec
++
++
++def gen_mhc_pre_big_fuse_with_norm_module() -> JitSpec:
++    """SM100-family cluster kernel for mHC pre big-fuse with the fused output RMSNorm.
++
++    The kernel relies on accurate libdevice ``expf``, IEEE fp32 rounding without flush-to-zero
++    on add / mul / fma, an IEEE division and explicitly Newton-refined reciprocals, so the
++    module is compiled WITHOUT ``-use_fast_math``: fast-math would turn ``expf`` into
++    ``__expf``, flush denormals in every fp32 operation and make divisions approximate.
++    """
++    root = Path(__file__).resolve().parent
++    return gen_jit_spec(
++        "mhc_pre_big_fuse_with_norm_sm10x",
++        [root / "csrc" / "mhc_pre_big_fuse_with_norm_cluster.cu"],
++        extra_cuda_cflags=current_compilation_context.get_nvcc_flags_list(
++            supported_major_versions=[10],
++        ),
++        use_fast_math=False,
++    )
++
++
++__all__ = ["gen_mhc_pre_big_fuse_with_norm_module"]
+diff --git a/flashinfer/mhc.py b/flashinfer/mhc.py
+index 16cc33b1add..ebde5c58162 100644
+--- a/flashinfer/mhc.py
++++ b/flashinfer/mhc.py
+@@ -16,10 +16,11 @@
+ 
+ import functools
+ import math
++from typing import Optional
+ 
+ import torch
+ 
+-from .api_logging import flashinfer_api
++from .api_logging import flashinfer_api, flashinfer_experimental_api
+ from .jit.mhc import gen_mhc_module
+ from .trace.templates.mhc import (
+     mhc_post_trace,
+@@ -566,3 +567,159 @@ def _mhc_pre_big_fuse_with_prenorm_impl_fake(
+     block_size: int,
+ ) -> None:
+     pass
++
++
++@flashinfer_experimental_api
++def mhc_pre_big_fuse_with_norm(
++    gemm_out_mul: torch.Tensor,
++    gemm_out_sqrsum: torch.Tensor,
++    hc_scale: torch.Tensor,
++    hc_base: torch.Tensor,
++    residual: torch.Tensor,
++    norm_weight: torch.Tensor,
++    rms_eps: float,
++    hc_pre_eps: float,
++    hc_sinkhorn_eps: float,
++    hc_post_mult_value: float,
++    sinkhorn_repeat: int,
++    norm_eps: float,
++    post_mix: Optional[torch.Tensor] = None,
++    comb_mix: Optional[torch.Tensor] = None,
++    layer_input: Optional[torch.Tensor] = None,
++    enable_pdl: Optional[bool] = None,
++) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
++    r"""mHC pre-map big-fuse from split-K partials, with the output RMSNorm fused in.
++
++    ``rms = rsqrt(sum_s gemm_out_sqrsum[s] / (4 H) + rms_eps)``,
++    ``mixes = (sum_s gemm_out_mul[s]) * rms``; ``pre = sigmoid(mixes[0:4] * hc_scale[0]
++    + hc_base[0:4]) + hc_pre_eps``, ``post_mix = sigmoid(mixes[4:8] * hc_scale[1] +
++    hc_base[4:8]) * hc_post_mult_value``, ``comb_mix`` = ``sinkhorn_repeat``-iteration
++    Sinkhorn of ``softmax(mixes[8:24].view(4, 4) * hc_scale[2] + hc_base[8:24])``;
++    ``ol = sum_j pre[j] * residual[:, j]`` (fp32), ``layer_input = bf16(float(bf16(ol)) *
++    rsqrt(mean(ol^2) + norm_eps) * norm_weight)``.
++
++    On SM100 / SM103, ``H = 4096`` decode calls (``1 <= T <= 32``, ``NS`` in ``{8, 64}``,
++    ``rms_eps = norm_eps = 1e-5``, ``hc_pre_eps = hc_sinkhorn_eps = 1e-6``,
++    ``hc_post_mult_value = 2``, ``sinkhorn_repeat = 20``, dense 16-byte aligned tensors) run a
++    thread-block-cluster kernel; every other call runs a composable fp32 PyTorch
++    implementation of the same contract.
++
++    Parameters
++    ----------
++    gemm_out_mul : torch.Tensor
++        fp32 ``[NS, T, 24]`` split-K partial projection logits.
++    gemm_out_sqrsum : torch.Tensor
++        fp32 ``[NS, T]`` split-K partial sums of squares of the residual.
++    hc_scale, hc_base : torch.Tensor
++        fp32 ``[3]`` and ``[24]`` logit scales / biases.
++    residual : torch.Tensor
++        bf16 ``[T, 4, H]`` residual streams.
++    norm_weight : torch.Tensor
++        bf16 ``[H]`` RMSNorm weight applied to the collapsed stream.
++    rms_eps, hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat, norm_eps
++        Model constants (no defaults: they are part of the numerical contract).
++    post_mix, comb_mix, layer_input : Optional[torch.Tensor]
++        Optional destination buffers (fp32 ``[T, 4]``, fp32 ``[T, 16]`` or ``[T, 4, 4]``,
++        bf16 ``[T, H]``); allocated when omitted.
++    enable_pdl : Optional[bool]
++        Launch the cluster kernel with programmatic dependent launch. ``None`` (default)
++        launches without it, which is the faster choice for an isolated call; a caller whose
++        producer kernel triggers its dependents early may pass ``True``.
++
++    Returns
++    -------
++    Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
++        ``(post_mix, comb_mix, layer_input)``.
++
++    Notes
++    -----
++    :func:`mhc_pre_big_fuse_with_norm_supported` reports whether the cluster kernel serves a
++    call, and :func:`mhc_pre_big_fuse_with_norm_warmup` loads it ahead of CUDA-graph capture
++    (it is never built during capture). ``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1`` forces the
++    composable implementation at call time.
++    """
++    if residual.dim() != 3:
++        raise ValueError("residual must have shape [T, 4, H]")
++    if residual.shape[1] != _MHC_HC:
++        raise ValueError(f"residual.shape[1] / HC must be 4, got {residual.shape[1]}")
++
++    from .experimental.mhc_pre_big_fuse_with_norm import run
++
++    return run(
++        gemm_out_mul,
++        gemm_out_sqrsum,
++        hc_scale,
++        hc_base,
++        residual,
++        norm_weight,
++        rms_eps,
++        hc_pre_eps,
++        hc_sinkhorn_eps,
++        hc_post_mult_value,
++        sinkhorn_repeat,
++        norm_eps,
++        post_mix=post_mix,
++        comb_mix=comb_mix,
++        layer_input=layer_input,
++        enable_pdl=enable_pdl,
++    )
++
++
++@flashinfer_experimental_api
++def mhc_pre_big_fuse_with_norm_supported(
++    gemm_out_mul: torch.Tensor,
++    gemm_out_sqrsum: torch.Tensor,
++    hc_scale: torch.Tensor,
++    hc_base: torch.Tensor,
++    residual: torch.Tensor,
++    norm_weight: Optional[torch.Tensor],
++    rms_eps: float,
++    hc_pre_eps: float,
++    hc_sinkhorn_eps: float,
++    hc_post_mult_value: float,
++    sinkhorn_repeat: int,
++    norm_eps: float,
++    post_mix: Optional[torch.Tensor] = None,
++    comb_mix: Optional[torch.Tensor] = None,
++    layer_input: Optional[torch.Tensor] = None,
++) -> bool:
++    r"""Return True when :func:`mhc_pre_big_fuse_with_norm` runs its cluster kernel for
++    exactly these arguments.
++
++    The decision is made at call time: the ``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1``
++    switch, the supported shapes and model constants, dtypes, strides, 16-byte alignment,
++    the device architecture and -- under CUDA-graph capture -- whether the kernel module is
++    already loaded. Callers that have their own fast path for the op should keep it whenever
++    this returns False.
++    """
++    from .experimental.mhc_pre_big_fuse_with_norm import supported
++
++    return supported(
++        gemm_out_mul,
++        gemm_out_sqrsum,
++        hc_scale,
++        hc_base,
++        residual,
++        norm_weight,
++        rms_eps,
++        hc_pre_eps,
++        hc_sinkhorn_eps,
++        hc_post_mult_value,
++        sinkhorn_repeat,
++        norm_eps,
++        post_mix=post_mix,
++        comb_mix=comb_mix,
++        layer_input=layer_input,
++    )
++
++
++@flashinfer_experimental_api
++def mhc_pre_big_fuse_with_norm_warmup(device: Optional[torch.device] = None) -> bool:
++    r"""Load the cluster kernel of :func:`mhc_pre_big_fuse_with_norm` outside CUDA-graph
++    capture.
++
++    Returns True when the kernel is usable on ``device`` (default: the current CUDA device).
++    """
++    from .experimental.mhc_pre_big_fuse_with_norm import warmup
++
++    return warmup(device)
+diff --git a/pyproject.toml b/pyproject.toml
+index b8b3edab8de..0f082cb30eb 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -116,6 +116,8 @@ exclude = ["flashinfer-jit-cache*", "flashinfer-cubin*", "flashinfer.experimenta
+ "flashinfer.experimental.sm110_gqa_decode" = ["csrc/**"]
+ # Frozen native sources and manifest for the exact-SM110 XQA backend.
+ "flashinfer.experimental.sm110_xqa" = ["csrc/**"]
++# CUDA source of the experimental SM100/SM103 mHC pre big-fuse + RMSNorm cluster kernel.
++"flashinfer.experimental.mhc_pre_big_fuse_with_norm" = ["csrc/**"]
+ # Raw CUDA sources for the SM90 push-style FP8 mega-MoE drop, JIT-compiled at
+ # runtime; registered so non-editable installs ship them (PR #4069).
+ "flashinfer.moe_ep.kernel_src.sm90.push_style_megamoe" = [
+diff --git a/tests/experimental/test_mhc_pre_big_fuse_with_norm.py b/tests/experimental/test_mhc_pre_big_fuse_with_norm.py
+new file mode 100644
+index 00000000000..47dbd00d3da
+--- /dev/null
++++ b/tests/experimental/test_mhc_pre_big_fuse_with_norm.py
+@@ -0,0 +1,429 @@
++"""
++Copyright (c) 2026 by FlashInfer team.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++  http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++"""
++
++# Tests for the experimental mhc_pre_big_fuse_with_norm API: the support check,
++# the composable implementation against a float64 reference (any host), and the
++# SM100 / SM103 cluster kernel against the composable implementation, a float64
++# Sinkhorn on extreme logits, and CUDA-graph capture.
++
++import re
++import subprocess
++import sys
++from pathlib import Path
++
++import pytest
++import torch
++
++import flashinfer.mhc as mhc
++from flashinfer.experimental.mhc_pre_big_fuse_with_norm import backend
++from flashinfer.utils import get_compute_capability
++
++H = 4096
++HC = 4
++MIX = HC * (2 + HC)
++CONSTS = dict(
++    rms_eps=1e-5,
++    hc_pre_eps=1e-6,
++    hc_sinkhorn_eps=1e-6,
++    hc_post_mult_value=2.0,
++    sinkhorn_repeat=20,
++    norm_eps=1e-5,
++)
++KILL_SWITCH = "FLASHINFER_SPECIALIZED_KERNEL_DISABLE"
++
++# Comb logits that stress the Sinkhorn: inputs that drive the scale vectors' power-of-two gauge
++# the furthest, peaked / same-column / near-permutation / Hall-violating patterns with large
++# gaps, exact ties, |x| up to 1e30, and one-hot rows that all peak in one column.
++# fmt: off
++EXTREME_COMB_LOGITS = {
++    "gauge_drift_cycle": [
++        -0.001066722092218697, -40.849876403808594, -68.89411926269531, -21.326635360717773,
++        -9.155299949270557e-07, -17.12651252746582, -180.71405029296875, -133.67942810058594,
++        -3.600817706228554e-07, -40.78141784667969, -206.076904296875, -18.190526962280273,
++        -0.00023028221039567143, -23.177854537963867, -27.096738815307617, -36.789642333984375
++    ],
++    "gauge_drift_side": [
++        -2.438597732634662e-07, -15.393172264099121, -33.856449127197266, -26.9609317779541,
++        -6.436353601202427e-07, -18.90549659729004, -54.867042541503906, -25.174983978271484,
++        -6.910326919751242e-05, -30.612531661987305, -23.293027877807617, -59.79174041748047,
++        -6.739954551449046e-05, -14.53339958190918, -22.531600952148438, -29.887998580932617
++    ],
++    "exponent_reach": [
++        -29.140092849731445, -37.4259033203125, -155.30215454101562, 0.12972554564476013,
++        -29.431982040405273, -73.03096771240234, -16.719484329223633, 0.0, 0.0,
++        -3.8528892993927, -15.567123413085938, -22.057586669921875, -15.968350410461426,
++        -80.7394027709961, -98.5098876953125, 8.106473501356959e-07
++    ],
++    "iid_wide": [
++        -6.956757545471191, -2.8573360443115234, -4.691375732421875, -9.76917552947998,
++        -5.8167595863342285, 20.65135955810547, -8.403948783874512, -8.17123794555664,
++        4.197597503662109, -2.217984199523926, 9.423771858215332, 0.7752690315246582,
++        -9.630749702453613, 12.668396949768066, -1.534620761871338, -1.9574013948440552
++    ],
++    "three_rows_one_column_noisy": [
++        -0.04553842917084694, -5.968676567077637, -6.008527755737305, -6.036728382110596,
++        0.052443988621234894, -5.9925127029418945, -5.935831069946289, -5.921547889709473,
++        0.02344232238829136, -5.93055534362793, -5.970357418060303, -5.924376964569092,
++        -5.983889102935791, -6.004086494445801, -6.015609264373779, -0.08347638696432114
++    ],
++    "peaked": [
++        -92.28055572509766, -1.897629737854004, 0.0, -76.70032501220703, -17.874927520751953,
++        -26.17359161376953, -98.40567016601562, 0.0, -113.32694244384766, -148.49537658691406,
++        0.0, -77.13370513916016, -79.97402954101562, -82.64522552490234, -73.06037902832031, 0.0
++    ],
++    "same_column": [
++        0.0, -17.61452293395996, -30.93341636657715, -47.217613220214844, 0.0,
++        -96.44166564941406, -124.4942626953125, -162.72108459472656, 0.0, -145.14852905273438,
++        -146.66363525390625, -62.89583969116211, 0.0, -26.72414207458496, -33.25218200683594,
++        -29.900049209594727
++    ],
++    "near_permutation": [
++        -173.6573944091797, 0.0, -31.658599853515625, -37.261940002441406,
++        -0.010502124205231667, -0.5176069140434265, 0.0, -102.33224487304688,
++        -51.40129470825195, -145.13021850585938, -165.3909149169922, 0.0, 0.0,
++        -140.92306518554688, -106.04235076904297, -86.0247573852539
++    ],
++    "hall_violating": [
++        -0.7919648289680481, -1.7849817276000977, -87.25366973876953, -87.25366973876953,
++        -2.0112876892089844, -6.858701229095459, -87.25366973876953, -87.25366973876953,
++        -10.774415969848633, -14.573726654052734, -87.25366973876953, -87.25366973876953,
++        -44.290863037109375, -51.5079231262207, -58.8403434753418, -36.99163818359375
++    ],
++    "exact_ties": [
++        -22.773212432861328, -22.773212432861328, 0.0, 0.0, -22.773212432861328,
++        -22.773212432861328, 0.0, -22.773212432861328, -22.773212432861328, -22.773212432861328,
++        -22.773212432861328, 0.0, -22.773212432861328, 0.0, -22.773212432861328,
++        -22.773212432861328
++    ],
++    "huge_magnitudes": [
++        -257.8782043457031, 0.33135437965393066, -1.5496666974465625e+27, -1.3206441402435303,
++        -104573206528.0, 4.0163316101559825e+20, -87907008512.0, 132733.03125, 115300.8515625,
++        -4.878467442907394e+25, -1.3332345396144374e+18, 3.4476771072855245e+17,
++        -5.964796044908062e+20, -2.1706987664155787e+22, -2751713.5, -4.135654456950416e+23
++    ],
++    "three_rows_one_column": [
++        0.0, -6.0, -6.0, -6.0, 0.0, -6.0, -6.0, -6.0, 0.0, -6.0, -6.0, -6.0, -6.0, -6.0, -6.0,
++        0.0
++    ],
++    "all_equal": [
++        0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
++    ],
++    "one_hot_same_column": [
++        0.0, -1.0000000150474662e+30, -1.0000000150474662e+30, -1.0000000150474662e+30, 0.0,
++        -1.0000000150474662e+30, -1.0000000150474662e+30, -1.0000000150474662e+30, 0.0,
++        -1.0000000150474662e+30, -1.0000000150474662e+30, -1.0000000150474662e+30, 0.0,
++        -1.0000000150474662e+30, -1.0000000150474662e+30, -1.0000000150474662e+30
++    ],
++}
++# fmt: on
++
++
++@pytest.fixture(autouse=True)
++def _kill_switch_unset(monkeypatch):
++    monkeypatch.delenv(KILL_SWITCH, raising=False)
++
++
++def _require_sm10x() -> None:
++    if not torch.cuda.is_available():
++        pytest.skip("CUDA required")
++    if get_compute_capability(torch.device("cuda")) not in backend.COMPUTE_CAPABILITIES:
++        pytest.skip(
++            "the mHC pre big-fuse + RMSNorm cluster kernel targets SM100 / SM103"
++        )
++
++
++def _inputs(t: int, ns: int, seed: int = 0, device: str = "cuda"):
++    g = torch.Generator(device=device).manual_seed(seed * 7919 + t * 131 + ns)
++    amp = torch.exp(
++        torch.empty(t, 1, 1, device=device).uniform_(-3.9, 0.7, generator=g)
++    )
++    new_r = torch.randn(t, HC, H, device=device, generator=g) * amp
++    residual = new_r.to(torch.bfloat16)
++    fn = torch.randn(MIX, HC * H, device=device, generator=g) * 0.03
++    xs = new_r.reshape(t, HC, ns, H // ns)
++    fs = fn.view(MIX, HC, ns, H // ns)
++    gemm_out_mul = torch.einsum("tjsk,njsk->stn", xs, fs).contiguous()
++    gemm_out_sqrsum = xs.square().sum(dim=(1, 3)).transpose(0, 1).contiguous()
++    hc_scale = torch.tensor([0.09, 0.16, 0.21], device=device)
++    hc_base = torch.randn(MIX, device=device, generator=g)
++    norm_weight = (0.2 + 0.01 * torch.randn(H, device=device, generator=g)).to(
++        torch.bfloat16
++    )
++    return dict(
++        gemm_out_mul=gemm_out_mul,
++        gemm_out_sqrsum=gemm_out_sqrsum,
++        hc_scale=hc_scale,
++        hc_base=hc_base,
++        residual=residual,
++        norm_weight=norm_weight,
++    )
++
++
++def _sinkhorn_fp64(logits: torch.Tensor, eps: float = 1e-6, repeat: int = 20):
++    x = logits.double().reshape(-1, HC, HC)
++    c = torch.softmax(x, dim=-1) + eps
++    c = c / (c.sum(dim=-2, keepdim=True) + eps)
++    for _ in range(repeat - 1):
++        c = c / (c.sum(dim=-1, keepdim=True) + eps)
++        c = c / (c.sum(dim=-2, keepdim=True) + eps)
++    return c.reshape(-1, HC * HC)
++
++
++def _reference_fp64(inp: dict, consts: dict):
++    """float64 evaluation of the op contract (bf16 rounding of ol kept, as in the contract)."""
++    f64 = torch.float64
++    residual = inp["residual"].to(f64)
++    t_tokens = residual.shape[0]
++    sq = inp["gemm_out_sqrsum"].to(f64).sum(dim=0)
++    rms = torch.rsqrt(sq / (HC * H) + consts["rms_eps"])
++    mixes = inp["gemm_out_mul"].to(f64).sum(dim=0) * rms.unsqueeze(-1)
++    scale = inp["hc_scale"].to(f64)
++    base = inp["hc_base"].to(f64)
++    pre = torch.sigmoid(mixes[:, :HC] * scale[0] + base[:HC]) + consts["hc_pre_eps"]
++    post = (
++        torch.sigmoid(mixes[:, HC : 2 * HC] * scale[1] + base[HC : 2 * HC])
++        * consts["hc_post_mult_value"]
++    )
++    comb = _sinkhorn_fp64(
++        mixes[:, 2 * HC :] * scale[2] + base[2 * HC :],
++        consts["hc_sinkhorn_eps"],
++        consts["sinkhorn_repeat"],
++    )
++    ol = (pre.unsqueeze(-1) * residual).sum(dim=1)
++    r = torch.rsqrt(ol.square().mean(dim=-1, keepdim=True) + consts["norm_eps"])
++    li = ol.to(torch.bfloat16).to(f64) * r * inp["norm_weight"].to(f64)
++    return post, comb.reshape(t_tokens, HC * HC), li
++
++
++def _check(out, ref):
++    post, comb, li = out
++    rpost, rcomb, rli = ref
++    torch.testing.assert_close(post, rpost, atol=2e-6, rtol=2e-6)
++    torch.testing.assert_close(comb, rcomb, atol=1e-7, rtol=1e-5)
++    err = (li.float() - rli.float()).abs()
++    assert bool((err <= 1e-6 + 2.0**-5 * rli.float().abs()).all())
++    exact = (li.view(torch.int16) == rli.view(torch.int16)).float().mean().item()
++    assert exact >= 0.995, exact
++
++
++def _reject_count(reason: str) -> int:
++    return backend.STATS["rejects"].get(reason, 0)
++
++
++# ---------------------------------------------------------------- any host (no GPU needed) ------
++
++
++def test_api_is_experimental():
++    for fn in (
++        mhc.mhc_pre_big_fuse_with_norm,
++        mhc.mhc_pre_big_fuse_with_norm_supported,
++        mhc.mhc_pre_big_fuse_with_norm_warmup,
++    ):
++        assert getattr(fn, "is_experimental", False), fn.__name__
++
++
++def test_core_import_does_not_load_the_backend():
++    code = (
++        "import sys, flashinfer, flashinfer.mhc; "
++        "assert 'flashinfer.experimental.mhc_pre_big_fuse_with_norm' not in sys.modules"
++    )
++    subprocess.run([sys.executable, "-c", code], check=True)
++
++
++def test_support_envelope_matches_the_kernel_constants():
++    src = (
++        Path(backend.__file__).parent / "csrc" / "mhc_pre_big_fuse_with_norm_cluster.cu"
++    ).read_text()
++
++    def constexpr(name: str) -> float:
++        m = re.search(rf"constexpr (?:int|float) {name} = ([0-9.e+-]+)f?;", src)
++        assert m is not None, name
++        return float(m.group(1))
++
++    assert constexpr("H") == backend.HIDDEN_SIZE == H
++    assert constexpr("HC") == backend.HC_MULT == HC
++    assert constexpr("RMS_EPS") == backend.CONSTANTS["rms_eps"] == CONSTS["rms_eps"]
++    assert constexpr("HC_PRE_EPS") == backend.CONSTANTS["hc_pre_eps"]
++    assert constexpr("SK_EPS") == backend.CONSTANTS["hc_sinkhorn_eps"]
++    assert constexpr("POST_MULT") == backend.CONSTANTS["hc_post_mult_value"]
++    assert constexpr("NORM_EPS") == backend.CONSTANTS["norm_eps"] == CONSTS["norm_eps"]
++    assert backend.CONSTANTS == CONSTS
++    assert sorted(backend.NUM_SPLITS) == [8, 64]
++    assert (backend.MIN_TOKENS, backend.MAX_TOKENS) == (1, 32)
++
++
++def test_support_rejects_before_touching_the_device():
++    # CPU tensors: every semantic / shape / layout check runs before the device check.
++    inp = _inputs(2, 8, device="cpu")
++    cases = [
++        ("num_tokens", dict(inp, **_inputs(33, 8, device="cpu")), CONSTS),
++        ("num_splits", dict(inp, **_inputs(2, 16, device="cpu")), CONSTS),
++        ("constants", inp, dict(CONSTS, hc_post_mult_value=1.0)),
++        ("constants", inp, dict(CONSTS, sinkhorn_repeat=19)),
++        ("no_norm_weight", dict(inp, norm_weight=None), CONSTS),
++        (
++            "input_layout",
++            dict(
++                inp,
++                residual=inp["residual"].transpose(0, 1).contiguous().transpose(0, 1),
++            ),
++            CONSTS,
++        ),  # fmt: skip
++        ("device", inp, CONSTS),
++    ]
++    for reason, args, consts in cases:
++        before = _reject_count(reason)
++        assert not mhc.mhc_pre_big_fuse_with_norm_supported(**args, **consts)
++        assert _reject_count(reason) == before + 1, reason
++    misaligned = torch.empty(2 * HC * HC + 1, dtype=torch.float32)[1:].view(2, HC * HC)
++    before = _reject_count("alignment")
++    assert not mhc.mhc_pre_big_fuse_with_norm_supported(
++        **inp, **CONSTS, comb_mix=misaligned
++    )
++    assert _reject_count("alignment") == before + 1
++
++
++def test_kill_switch_is_read_at_call_time(monkeypatch):
++    inp = _inputs(1, 8, device="cpu")
++    monkeypatch.setenv(KILL_SWITCH, "1")
++    before = _reject_count("kill_switch")
++    assert not mhc.mhc_pre_big_fuse_with_norm_supported(**inp, **CONSTS)
++    assert _reject_count("kill_switch") == before + 1
++    monkeypatch.delenv(KILL_SWITCH)
++    mhc.mhc_pre_big_fuse_with_norm_supported(**inp, **CONSTS)
++    assert _reject_count("kill_switch") == before + 1
++
++
++@pytest.mark.parametrize("t,ns", [(1, 8), (3, 8), (5, 64), (40, 4)])
++def test_composable_path_matches_fp64_reference(t, ns):
++    inp = _inputs(t, ns, seed=t, device="cpu")
++    before = backend.STATS["composable_calls"]
++    out = mhc.mhc_pre_big_fuse_with_norm(**inp, **CONSTS)
++    assert backend.STATS["composable_calls"] == before + 1
++    post, comb, li = out
++    assert post.shape == (t, HC) and post.dtype == torch.float32
++    assert comb.shape == (t, HC * HC) and comb.dtype == torch.float32
++    assert li.shape == (t, H) and li.dtype == torch.bfloat16
++    rpost, rcomb, rli = _reference_fp64(inp, CONSTS)
++    torch.testing.assert_close(post.double(), rpost, atol=1e-6, rtol=1e-6)
++    torch.testing.assert_close(comb.double(), rcomb, atol=1e-6, rtol=1e-5)
++    # layer_input: bf16(ol) may round one ulp apart, plus the final bf16 rounding
++    err = (li.double() - rli).abs()
++    assert bool((err <= 1e-6 + 2.0**-6 * rli.abs()).all())
++
++
++# ---------------------------------------------------------------- SM100 / SM103 GPUs ------------
++
++
++@pytest.mark.parametrize("t", [1, 2, 3, 4, 8, 13, 16, 24, 25, 31, 32])
++@pytest.mark.parametrize("ns", [8, 64])
++def test_kernel_matches_composable(t, ns, monkeypatch):
++    _require_sm10x()
++    inp = _inputs(t, ns)
++    assert mhc.mhc_pre_big_fuse_with_norm_supported(**inp, **CONSTS)
++    before = backend.STATS["kernel_calls"]
++    out = mhc.mhc_pre_big_fuse_with_norm(**inp, **CONSTS)
++    assert backend.STATS["kernel_calls"] == before + 1
++    monkeypatch.setenv(KILL_SWITCH, "1")
++    assert not mhc.mhc_pre_big_fuse_with_norm_supported(**inp, **CONSTS)
++    ref = mhc.mhc_pre_big_fuse_with_norm(**inp, **CONSTS)
++    _check(out, ref)
++
++
++@pytest.mark.parametrize("enable_pdl", [False, True])
++def test_sinkhorn_extreme_comb_logits(enable_pdl):
++    # The comb logits are injected through hc_base with hc_scale[2] = 0, so they are exactly
++    # the rows above; comb_mix must be finite and match a float64 Sinkhorn.
++    _require_sm10x()
++    for ns in (8, 64):
++        for name, row in EXTREME_COMB_LOGITS.items():
++            logits = torch.tensor(row, dtype=torch.float32)
++            inp = _inputs(2, ns)
++            inp["hc_scale"][2] = 0.0
++            inp["hc_base"][2 * HC :] = logits.cuda()
++            assert mhc.mhc_pre_big_fuse_with_norm_supported(**inp, **CONSTS)
++            _, comb, _ = mhc.mhc_pre_big_fuse_with_norm(
++                **inp, **CONSTS, enable_pdl=enable_pdl
++            )
++            ref = _sinkhorn_fp64(logits)
++            got = comb.double().cpu()
++            assert torch.isfinite(got).all(), name
++            bound = 1e-7 + 1e-5 * ref.abs()
++            assert bool(((got - ref).abs() <= bound).all()), name
++
++
++def test_unsupported_calls_take_composable_path():
++    _require_sm10x()
++    inp = _inputs(33, 8)
++    assert not mhc.mhc_pre_big_fuse_with_norm_supported(**inp, **CONSTS)
++    before = backend.STATS["composable_calls"]
++    mhc.mhc_pre_big_fuse_with_norm(**inp, **CONSTS)
++    assert backend.STATS["composable_calls"] == before + 1
++    consts = dict(CONSTS, hc_post_mult_value=1.0)
++    assert not mhc.mhc_pre_big_fuse_with_norm_supported(**_inputs(2, 8), **consts)
++
++
++def _graph_outputs(t):
++    return tuple(
++        torch.empty(s, dtype=d, device="cuda")
++        for s, d in (
++            ((t, HC), torch.float32),
++            ((t, HC * HC), torch.float32),
++            ((t, H), torch.bfloat16),
++        )
++    )
++
++
++def test_cuda_graph_capture_after_warmup(monkeypatch):
++    _require_sm10x()
++    assert mhc.mhc_pre_big_fuse_with_norm_warmup(torch.device("cuda"))
++    inp = _inputs(2, 8)
++    outs = _graph_outputs(2)
++    before = backend.STATS["kernel_calls"]
++    graph = torch.cuda.CUDAGraph()
++    with torch.cuda.graph(graph):
++        mhc.mhc_pre_big_fuse_with_norm(
++            **inp, **CONSTS, post_mix=outs[0], comb_mix=outs[1], layer_input=outs[2]
++        )
++    assert backend.STATS["kernel_calls"] == before + 1
++    graph.replay()
++    torch.cuda.synchronize()
++    monkeypatch.setenv(KILL_SWITCH, "1")
++    ref = mhc.mhc_pre_big_fuse_with_norm(**inp, **CONSTS)
++    _check(outs, ref)
++
++
++def test_cuda_graph_capture_without_loaded_module_falls_back(monkeypatch):
++    # A capturing call never builds or loads the module: it captures the composable path.
++    _require_sm10x()
++    assert mhc.mhc_pre_big_fuse_with_norm_warmup(torch.device("cuda"))
++    monkeypatch.setitem(backend._state, "module", None)
++    inp = _inputs(2, 8)
++    outs = _graph_outputs(2)
++    unready = _reject_count("capture_unready")
++    kernel_calls = backend.STATS["kernel_calls"]
++    graph = torch.cuda.CUDAGraph()
++    with torch.cuda.graph(graph):
++        mhc.mhc_pre_big_fuse_with_norm(
++            **inp, **CONSTS, post_mix=outs[0], comb_mix=outs[1], layer_input=outs[2]
++        )
++    assert _reject_count("capture_unready") == unready + 1
++    assert backend.STATS["kernel_calls"] == kernel_calls
++    assert backend._state["module"] is None
++    graph.replay()
++    torch.cuda.synchronize()
++    monkeypatch.setenv(KILL_SWITCH, "1")
++    _check(outs, mhc.mhc_pre_big_fuse_with_norm(**inp, **CONSTS))

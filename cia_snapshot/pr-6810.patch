@@ -1,0 +1,476 @@
+diff --git a/.github/workflows/pr-test.yml b/.github/workflows/pr-test.yml
+index 9a92e1f0fe9..9d9e695199d 100644
+--- a/.github/workflows/pr-test.yml
++++ b/.github/workflows/pr-test.yml
+@@ -358,6 +358,12 @@ jobs:
+       # Empty for every lane except the experimental one. Quoted at the use site and
+       # never interpolated into script text - it originates from the PR body.
+       TEST_PATH_ARG: ${{ matrix.test_path }}
++      # GPU lanes route their JIT compiles through the AOT lanes' S3 sccache.
++      # On unless the repository variable FLASHINFER_GPU_TEST_SCCACHE is '0',
++      # which turns it off for A/B timing without a code change. The `|| '1'`
++      # matters: an unset variable is null, and `null != '0'` is false because
++      # mismatched types are compared as numbers (null and '0' both become 0).
++      GPU_TEST_SCCACHE: ${{ matrix.kind != 'aot' && (vars.FLASHINFER_GPU_TEST_SCCACHE || '1') != '0' && '1' || '0' }}
+     steps:
+       - name: Cleanup
+         if: matrix.kind != 'h100'
+@@ -427,40 +433,13 @@ jobs:
+             -e SCCACHE_STATS_DIR /workspace/sccache-stats \
+             --no-gpu "./scripts/${TEST_SCRIPT}"
+ 
+-      - name: Display sccache stats
+-        if: always() && matrix.kind == 'aot'
+-        run: |
+-          STATS_FILE="${GITHUB_WORKSPACE}/sccache-stats/sccache-stats.txt"
+-          if [ -s "${STATS_FILE}" ]; then
+-            cat "${STATS_FILE}"
+-          else
+-            echo "::warning::sccache stats were not produced"
+-          fi
+-
+-      - name: Record sccache job metadata
+-        if: always() && matrix.kind == 'aot'
+-        run: |
+-          mkdir -p "${GITHUB_WORKSPACE}/sccache-stats"
+-          IMAGE_DIGESTS=$(docker image inspect --format '{{json .RepoDigests}}' "${DOCKER_IMAGE}" 2>/dev/null || printf 'unavailable')
+-          {
+-            printf 'git_commit=%s\n' "$(git rev-parse HEAD)"
+-            printf 'docker_image=%s\n' "${DOCKER_IMAGE}"
+-            printf 'docker_image_repo_digests=%s\n' "${IMAGE_DIGESTS}"
+-            printf 'matrix_cuda=%s\n' "${MATRIX_CUDA}"
+-            printf 'matrix_arch=%s\n' "${MATRIX_ARCH}"
+-          } > "${GITHUB_WORKSPACE}/sccache-stats/job-metadata.txt"
+-
+-      - name: Upload sccache stats
+-        if: always() && matrix.kind == 'aot'
+-        uses: actions/upload-artifact@v4
+-        with:
+-          name: sccache-stats-${{ matrix.cuda }}-${{ matrix.runner[2] }}
+-          path: sccache-stats/
+-          if-no-files-found: warn
+-          retention-days: 14
+-
+       - name: Run Test
+         if: matrix.kind != 'aot'
++        env:
++          SCCACHE_BUCKET: ${{ vars.SCCACHE_BUCKET }}
++          SCCACHE_REGION: ${{ vars.SCCACHE_REGION }}
++          AWS_ACCESS_KEY_ID: ${{ env.GPU_TEST_SCCACHE == '1' && secrets.SCCACHE_AWS_ACCESS_KEY_ID || '' }}
++          AWS_SECRET_ACCESS_KEY: ${{ env.GPU_TEST_SCCACHE == '1' && secrets.SCCACHE_AWS_SECRET_ACCESS_KEY || '' }}
+         run: |
+           case "${TEST_SCRIPT}" in
+             task_jit_run_tests_part[1-5].sh|task_jit_run_tests_t4.sh|task_run_unit_tests.sh) ;;
+@@ -469,6 +448,21 @@ jobs:
+               exit 1
+               ;;
+           esac
++          # ci/bash.sh options must precede the command. The credentials are
++          # forwarded by name so ci/bash.sh never echoes their values.
++          DOCKER_ARGS=()
++          LANE_COMMAND=("./scripts/${TEST_SCRIPT}")
++          if [ "${GPU_TEST_SCCACHE}" = "1" ]; then
++            mkdir -p "${GITHUB_WORKSPACE}/sccache-stats"
++            DOCKER_ARGS+=(
++              -e SCCACHE_BUCKET "${SCCACHE_BUCKET}"
++              -e SCCACHE_REGION "${SCCACHE_REGION}"
++              -e AWS_ACCESS_KEY_ID
++              -e AWS_SECRET_ACCESS_KEY
++              -e SCCACHE_STATS_DIR /workspace/sccache-stats
++            )
++            LANE_COMMAND=(./scripts/run_with_test_sccache.sh "${LANE_COMMAND[@]}")
++          fi
+           TEST_RUNNER_ARGS=()
+           if [ "${MATRIX_KIND}" = "h100" ]; then
+             TEST_RUNNER_ARGS+=(--workers-per-gpu 2)
+@@ -485,11 +479,46 @@ jobs:
+             # to unit_test_runner.py, whose parser takes the scope as an option (or the
+             # TEST_PATH env var, which ci/bash.sh does not forward into the container).
+             # Bare paths fail argument-preflight with "unrecognized arguments".
+-            bash ci/bash.sh "${DOCKER_IMAGE}" "./scripts/${TEST_SCRIPT}" "${TEST_RUNNER_ARGS[@]}" --test-path "${TEST_TARGETS[@]}"
++            bash ci/bash.sh "${DOCKER_IMAGE}" "${DOCKER_ARGS[@]}" "${LANE_COMMAND[@]}" "${TEST_RUNNER_ARGS[@]}" --test-path "${TEST_TARGETS[@]}"
+           else
+-            bash ci/bash.sh "${DOCKER_IMAGE}" "./scripts/${TEST_SCRIPT}" "${TEST_RUNNER_ARGS[@]}"
++            bash ci/bash.sh "${DOCKER_IMAGE}" "${DOCKER_ARGS[@]}" "${LANE_COMMAND[@]}" "${TEST_RUNNER_ARGS[@]}"
+           fi
+ 
++      - name: Display sccache stats
++        if: always() && (matrix.kind == 'aot' || env.GPU_TEST_SCCACHE == '1')
++        run: |
++          STATS_FILE="${GITHUB_WORKSPACE}/sccache-stats/sccache-stats.txt"
++          if [ -s "${STATS_FILE}" ]; then
++            cat "${STATS_FILE}"
++          else
++            echo "::warning::sccache stats were not produced"
++          fi
++
++      - name: Record sccache job metadata
++        if: always() && (matrix.kind == 'aot' || env.GPU_TEST_SCCACHE == '1')
++        run: |
++          mkdir -p "${GITHUB_WORKSPACE}/sccache-stats"
++          IMAGE_DIGESTS=$(docker image inspect --format '{{json .RepoDigests}}' "${DOCKER_IMAGE}" 2>/dev/null || printf 'unavailable')
++          {
++            printf 'git_commit=%s\n' "$(git rev-parse HEAD)"
++            printf 'docker_image=%s\n' "${DOCKER_IMAGE}"
++            printf 'docker_image_repo_digests=%s\n' "${IMAGE_DIGESTS}"
++            printf 'matrix_cuda=%s\n' "${MATRIX_CUDA}"
++            printf 'matrix_arch=%s\n' "${MATRIX_ARCH}"
++            printf 'matrix_kind=%s\n' "${MATRIX_KIND}"
++            printf 'test_script=%s\n' "${TEST_SCRIPT}"
++          } > "${GITHUB_WORKSPACE}/sccache-stats/job-metadata.txt"
++
++      - name: Upload sccache stats
++        if: always() && (matrix.kind == 'aot' || env.GPU_TEST_SCCACHE == '1')
++        uses: actions/upload-artifact@v4
++        with:
++          # GPU lanes share a CUDA/runner pair, so they add the matrix index.
++          name: ${{ matrix.kind == 'aot' && format('sccache-stats-{0}-{1}', matrix.cuda, matrix.runner[2]) || format('sccache-stats-{0}-{1}-{2}', matrix.kind, matrix.cuda, strategy.job-index) }}
++          path: sccache-stats/
++          if-no-files-found: warn
++          retention-days: 14
++
+       - name: Make JUnit XML readable
+         if: ${{ always() && (matrix.kind == 'h100' || startsWith(matrix.script, 'task_jit_run_tests_part')) }}
+         run: |
+diff --git a/CLAUDE.md b/CLAUDE.md
+index 30b29daf21c..06e6d9da9a9 100644
+--- a/CLAUDE.md
++++ b/CLAUDE.md
+@@ -723,6 +723,15 @@ the whole build container, so diagnostics include compiler processes owned by
+ the sccache daemon even though they are outside the wrapped process group. The
+ CI `docker run --rm` boundary provides final cleanup for those processes.
+ 
++PR GPU test lanes run their test script through `scripts/run_with_test_sccache.sh`,
++which routes JIT compiles through the same S3 cache and prefix as the AOT lanes
++and uploads `sccache-stats-<kind>-<cuda>-<index>` artifacts. Set the repository
++variable `FLASHINFER_GPU_TEST_SCCACHE=0` to turn this off for A/B timing. If the
++sccache install fails, the wrapper runs the lane uncached. Compiles run in the
++sccache server, so a timed-out unit's process-group kill does not reach them, and
++per-unit memory telemetry excludes nvcc. Locally:
++`scripts/run_with_test_sccache.sh scripts/task_run_unit_tests.sh` (read-only without AWS credentials).
++
+ ##### Cubin / Artifact Loader
+ 
+ | Variable | Default | Read in | Effect |
+diff --git a/scripts/jit_cache_build_common.sh b/scripts/jit_cache_build_common.sh
+index 611e1806604..1ed38ad045b 100644
+--- a/scripts/jit_cache_build_common.sh
++++ b/scripts/jit_cache_build_common.sh
+@@ -4,6 +4,7 @@
+ #   - scripts/build_flashinfer_jit_cache_whl.sh         (release/nightly)
+ #   - scripts/build_jit_cache_provider_wheelhouse.sh    (provider experiment)
+ #   - scripts/task_test_jit_cache_package_build_import.sh (PR tests)
++#   - scripts/run_with_test_sccache.sh                  (PR GPU test lanes)
+ 
+ SCCACHE_VERSION="0.18.0"
+ 
+@@ -285,7 +286,13 @@ setup_sccache() {
+   local source_root=$2
+   local sccache_arch
+   sccache_arch=$(uname -m)
+-  install_sccache "${SCCACHE_VERSION}" "${sccache_arch}"
++  if [ "$(sccache --version 2>/dev/null)" = "sccache ${SCCACHE_VERSION}" ]; then
++    # Already installed (e.g. by run_with_test_sccache.sh's fail-open probe).
++    export FLASHINFER_SCCACHE_INSTALL_SOURCE="${FLASHINFER_SCCACHE_INSTALL_SOURCE:-preinstalled}"
++    export FLASHINFER_SCCACHE_REVISION="${FLASHINFER_SCCACHE_REVISION:-v${SCCACHE_VERSION}}"
++  else
++    install_sccache "${SCCACHE_VERSION}" "${sccache_arch}"
++  fi
+ 
+   export SCCACHE_REGION="${SCCACHE_REGION:-us-west-2}"
+   export SCCACHE_BASEDIRS="${source_root}${SCCACHE_BASEDIRS:+:${SCCACHE_BASEDIRS}}"
+@@ -314,7 +321,9 @@ setup_sccache() {
+   fi
+   (( _sccache_xtrace )) && set -x
+ 
+-  sccache --start-server
++  # Explicit return: a caller that guards setup_sccache with `if` runs it with
++  # errexit off, and must still see a failed startup.
++  sccache --start-server || return $?
+   sccache --zero-stats
+   export FLASHINFER_SCCACHE_ACTIVE=true
+   echo "sccache version: $(sccache --version)"
+diff --git a/scripts/run_with_test_sccache.sh b/scripts/run_with_test_sccache.sh
+new file mode 100755
+index 00000000000..5d23866c221
+--- /dev/null
++++ b/scripts/run_with_test_sccache.sh
+@@ -0,0 +1,82 @@
++#!/bin/bash
++# Run a GPU test lane script with its JIT compiles routed through sccache.
++#
++# Usage: scripts/run_with_test_sccache.sh <test-script> [args...]
++#
++# The GPU lanes JIT-compile every module from scratch on each run. This wrapper
++# reuses the AOT lanes' S3 cache setup (setup_sccache), so a module compiled by
++# an earlier run of any lane with the same toolchain is fetched instead of
++# rebuilt. It fails open: if sccache cannot be installed, the lane still runs,
++# just uncached. Cache read/write errors fall back to local compilation inside
++# sccache itself.
++#
++# Reads (optional): SCCACHE_BUCKET, SCCACHE_REGION, SCCACHE_STATS_DIR,
++# AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY (read-write when both are set,
++# read-only anonymous access otherwise), FLASHINFER_WORKSPACE_BASE.
++
++set -eo pipefail
++
++if [ "$#" -lt 1 ]; then
++    echo "Usage: $0 <test-script> [args...]" >&2
++    exit 2
++fi
++
++SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
++# shellcheck source=scripts/jit_cache_build_common.sh
++source "${SCRIPT_DIR}/jit_cache_build_common.sh"
++
++echo "========================================"
++echo "Setting up sccache for JIT test compiles"
++echo "========================================"
++
++# The subshell keeps a failed download or checksum from aborting the lane;
++# setup_sccache then finds the installed binary and skips the download. It must
++# not run under `!`, `if`, `&&` or `||`: bash ignores errexit there, including
++# inside the subshell, and the installer relies on errexit to stop after a
++# failed curl or `sha256sum -c` instead of installing an unverified binary.
++if [ "$(sccache --version 2>/dev/null)" != "sccache ${SCCACHE_VERSION}" ]; then
++    set +e
++    (
++        set -e
++        install_sccache "${SCCACHE_VERSION}" "$(uname -m)"
++    )
++    install_status=$?
++    set -e
++    if [ "${install_status}" -ne 0 ] ||
++        [ "$(sccache --version 2>/dev/null)" != "sccache ${SCCACHE_VERSION}" ]; then
++        echo "::warning::sccache install failed; running without the compiler cache"
++        exec "$@"
++    fi
++fi
++
++NVCC_BIN="${CUDA_HOME:-/usr/local/cuda}/bin/nvcc"
++CUDA_TAG=$(
++    "${NVCC_BIN}" --version |
++        sed -n 's/.*release \([0-9][0-9]*\)\.\([0-9][0-9]*\).*/\1\2/p' |
++        head -n1
++) || CUDA_TAG=""
++if [ -z "${CUDA_TAG}" ]; then
++    echo "::warning::could not read the CUDA version from ${NVCC_BIN}; running without the compiler cache"
++    exec "$@"
++fi
++
++# JIT sources are generated under the workspace cache, outside the checkout.
++# Strip that prefix too so cache keys do not depend on the container's HOME.
++JIT_CACHE_ROOT="${FLASHINFER_WORKSPACE_BASE:-${HOME}}/.cache/flashinfer"
++mkdir -p "${JIT_CACHE_ROOT}"
++JIT_CACHE_ROOT=$(cd "${JIT_CACHE_ROOT}" && pwd -P)
++export SCCACHE_BASEDIRS="${JIT_CACHE_ROOT}${SCCACHE_BASEDIRS:+:${SCCACHE_BASEDIRS}}"
++
++export SCCACHE_BUCKET="${SCCACHE_BUCKET:-flashinfer-build-cache}"
++# Same prefix as the AOT lanes, which build in this toolchain image.
++if ! setup_sccache "cuda${CUDA_TAG}-$(uname -m)" "$(pwd -P)"; then
++    # sccache checks the S3 backend at startup; an outage or denied access
++    # must not fail the lane.
++    echo "::warning::sccache startup failed; running without the compiler cache"
++    unset FLASHINFER_CXX_LAUNCHER FLASHINFER_NVCC_LAUNCHER
++    exec "$@"
++fi
++
++# Not exec: stats must be collected after the lane exits, from this shell.
++trap 'collect_sccache_stats || true' EXIT
++"$@"
+diff --git a/tests/jit/test_jit_cache_providers.py b/tests/jit/test_jit_cache_providers.py
+index f23852aa243..b803b93d571 100644
+--- a/tests/jit/test_jit_cache_providers.py
++++ b/tests/jit/test_jit_cache_providers.py
+@@ -426,7 +426,26 @@ def test_jit_cache_build_setup_preserves_indexes_and_cleans_constraint(tmp_path)
+     assert trap_marker.is_file()
+ 
+ 
+-def test_sccache_setup_uses_server_side_compilation(tmp_path):
++def _sccache_free_env():
++    """Return os.environ without the sccache state of an enclosing CI lane.
++
++    The GPU lanes run pytest under scripts/run_with_test_sccache.sh, which
++    exports the real cache prefix, stats directory, launchers and AWS keys.
++    Shell tests that inherit them write into the lane's stats directory (and,
++    with a real sccache on PATH, could reach its server).
++    """
++    return {
++        name: value
++        for name, value in os.environ.items()
++        if not name.startswith(("SCCACHE_", "AWS_", "FLASHINFER_SCCACHE_"))
++        and name not in ("FLASHINFER_NVCC_LAUNCHER", "FLASHINFER_CXX_LAUNCHER")
++    }
++
++
++def test_sccache_setup_uses_server_side_compilation(tmp_path, monkeypatch):
++    # Simulate running inside a wrapped GPU lane; the test must not touch it.
++    lane_stats_dir = tmp_path / "lane-stats"
++    monkeypatch.setenv("SCCACHE_STATS_DIR", str(lane_stats_dir))
+     common_script = (
+         Path(__file__).resolve().parents[2] / "scripts" / "jit_cache_build_common.sh"
+     )
+@@ -453,7 +472,162 @@ def test_sccache_setup_uses_server_side_compilation(tmp_path):
+ test "${{FLASHINFER_NVCC_LAUNCHER}}" = sccache
+ """
+ 
+-    subprocess.run(["bash", "-c", script], check=True)
++    subprocess.run(["bash", "-c", script], check=True, env=_sccache_free_env())
++
++    assert not lane_stats_dir.exists()
++
++
++def _write_test_sccache_fakes(
++    tmp_path, sccache_version, *, serve_archive=False, start_server_fails=False
++):
++    fake_bin = tmp_path / "bin"
++    fake_bin.mkdir()
++    sccache_log = tmp_path / "sccache.log"
++    sccache = fake_bin / "sccache"
++    start_server_status = 1 if start_server_fails else 0
++    sccache.write_text(
++        "#!/bin/bash\n"
++        f'echo "$*" >> "{sccache_log}"\n'
++        f'if [ "$1" = --version ]; then echo "sccache {sccache_version}"; fi\n'
++        'if [ "$1" = --show-stats ]; then echo "Cache hits 1"; fi\n'
++        f'if [ "$1" = --start-server ]; then exit {start_server_status}; fi\n'
++    )
++    # Downloads fail by default so a version mismatch takes the fail-open path
++    # offline. serve_archive instead "downloads" an archive whose published
++    # checksum does not match, which must stop the install before extraction.
++    curl = fake_bin / "curl"
++    if serve_archive:
++        curl.write_text(
++            "#!/bin/bash\n"
++            'while [ "$#" -gt 0 ]; do\n'
++            '  case "$1" in -o) out=$2; shift 2 ;; *) url=$1; shift ;; esac\n'
++            "done\n"
++            'case "$url" in\n'
++            '  *.sha256) echo "0000000000000000000000000000000000000000000000000000000000000000  x" > "$out" ;;\n'
++            '  *) echo "not the published archive" > "$out" ;;\n'
++            "esac\n"
++        )
++    else:
++        curl.write_text("#!/bin/bash\nexit 22\n")
++    tar_log = tmp_path / "tar.log"
++    tar = fake_bin / "tar"
++    tar.write_text(f'#!/bin/bash\necho "$*" >> "{tar_log}"\n')
++    # Pin a supported architecture so every host reaches the checksum check.
++    uname = fake_bin / "uname"
++    uname.write_text("#!/bin/bash\necho x86_64\n")
++    cuda_bin = tmp_path / "cuda" / "bin"
++    cuda_bin.mkdir(parents=True)
++    nvcc = cuda_bin / "nvcc"
++    nvcc.write_text(
++        "#!/bin/bash\necho 'Cuda compilation tools, release 12.9, V12.9.86'\n"
++    )
++    for executable in (sccache, curl, tar, uname, nvcc):
++        executable.chmod(0o755)
++    child = tmp_path / "lane.sh"
++    child.write_text(
++        "#!/bin/bash\n"
++        'echo "nvcc_launcher=${FLASHINFER_NVCC_LAUNCHER:-}"\n'
++        'echo "cxx_launcher=${FLASHINFER_CXX_LAUNCHER:-}"\n'
++        'echo "prefix=${SCCACHE_S3_KEY_PREFIX:-}"\n'
++        'echo "basedirs=${SCCACHE_BASEDIRS:-}"\n'
++        'echo "args=$*"\n'
++        "exit 7\n"
++    )
++    child.chmod(0o755)
++    env = {
++        **_sccache_free_env(),
++        "PATH": f"{fake_bin}:{os.environ['PATH']}",
++        "CUDA_HOME": str(tmp_path / "cuda"),
++        "FLASHINFER_WORKSPACE_BASE": str(tmp_path / "home"),
++        "SCCACHE_STATS_DIR": str(tmp_path / "stats"),
++    }
++    return child, sccache_log, tar_log, env
++
++
++def _run_with_test_sccache(tmp_path, child, env):
++    wrapper = (
++        Path(__file__).resolve().parents[2] / "scripts" / "run_with_test_sccache.sh"
++    )
++    return subprocess.run(
++        ["bash", str(wrapper), str(child), "--workers-per-gpu", "2"],
++        cwd=tmp_path,
++        env=env,
++        capture_output=True,
++        text=True,
++    )
++
++
++def _assert_ran_uncached(result):
++    assert result.returncode == 7, result.stdout + result.stderr
++    assert "running without the compiler cache" in result.stdout
++    assert "nvcc_launcher=\n" in result.stdout
++    assert "cxx_launcher=\n" in result.stdout
++    assert "args=--workers-per-gpu 2\n" in result.stdout
++
++
++def test_gpu_lane_sccache_wrapper_enables_cache_and_keeps_exit_code(tmp_path):
++    child, sccache_log, _, env = _write_test_sccache_fakes(tmp_path, "0.18.0")
++
++    result = _run_with_test_sccache(tmp_path, child, env)
++
++    assert result.returncode == 7, result.stdout + result.stderr
++    lines = dict(
++        line.split("=", 1) for line in result.stdout.splitlines() if "=" in line
++    )
++    assert lines["nvcc_launcher"] == "sccache"
++    assert lines["cxx_launcher"] == "sccache"
++    assert lines["prefix"] == "cuda129-x86_64"
++    jit_root = (tmp_path / "home" / ".cache" / "flashinfer").resolve()
++    assert lines["basedirs"] == f"{tmp_path.resolve()}:{jit_root}"
++    assert lines["args"] == "--workers-per-gpu 2"
++    calls = sccache_log.read_text().splitlines()
++    assert "--start-server" in calls
++    assert "--stop-server" in calls
++    assert (tmp_path / "stats" / "sccache-stats.txt").read_text() == "Cache hits 1\n"
++
++
++def test_gpu_lane_sccache_wrapper_fails_open_when_download_fails(tmp_path):
++    child, sccache_log, _, env = _write_test_sccache_fakes(tmp_path, "0.0.0")
++
++    result = _run_with_test_sccache(tmp_path, child, env)
++
++    _assert_ran_uncached(result)
++    assert "--start-server" not in sccache_log.read_text().splitlines()
++
++
++def test_gpu_lane_sccache_wrapper_rejects_checksum_mismatch(tmp_path):
++    child, sccache_log, tar_log, env = _write_test_sccache_fakes(
++        tmp_path, "0.0.0", serve_archive=True
++    )
++
++    result = _run_with_test_sccache(tmp_path, child, env)
++
++    _assert_ran_uncached(result)
++    # A failed `sha256sum -c` must stop the install before extraction.
++    assert not tar_log.exists()
++    assert "--start-server" not in sccache_log.read_text().splitlines()
++
++
++def test_gpu_lane_sccache_wrapper_fails_open_without_nvcc(tmp_path):
++    child, sccache_log, _, env = _write_test_sccache_fakes(tmp_path, "0.18.0")
++    (tmp_path / "cuda" / "bin" / "nvcc").unlink()
++
++    result = _run_with_test_sccache(tmp_path, child, env)
++
++    _assert_ran_uncached(result)
++    assert "--start-server" not in sccache_log.read_text().splitlines()
++
++
++def test_gpu_lane_sccache_wrapper_fails_open_when_server_start_fails(tmp_path):
++    child, sccache_log, _, env = _write_test_sccache_fakes(
++        tmp_path, "0.18.0", start_server_fails=True
++    )
++
++    result = _run_with_test_sccache(tmp_path, child, env)
++
++    _assert_ran_uncached(result)
++    assert "--start-server" in sccache_log.read_text().splitlines()
++    assert not (tmp_path / "stats" / "sccache-stats.txt").exists()
+ 
+ 
+ @pytest.mark.parametrize(

@@ -1,0 +1,198 @@
+diff --git a/csrc/cake_dsv4/common/cake_dsv4_3af1afa1871d27324303_kernel.cu b/csrc/cake_dsv4/common/cake_dsv4_3af1afa1871d27324303_kernel.cu
+index 1cf4cf60692..a3f50880f1a 100644
+--- a/csrc/cake_dsv4/common/cake_dsv4_3af1afa1871d27324303_kernel.cu
++++ b/csrc/cake_dsv4/common/cake_dsv4_3af1afa1871d27324303_kernel.cu
+@@ -488,7 +488,7 @@ kernel_cake_dsv4_3af1afa1871d27324303(const __grid_constant__ CUtensorMap tmap_q
+                     meta[1] = row_max_val;
+                     meta[2] = acc_scale;
+                     meta[3] = no_correction;
+-                    int meta_addr = taddr + 384 + (unsigned int)(score_phase * 8) + (unsigned int)(n_half * 4) + (unsigned int)(head_row_base << 16);
++                    int meta_addr = taddr + 384 + (unsigned int)(score_phase * 8) + (unsigned int)(n_half * 4) + (unsigned int)(score_row_base << 16);
+                     tmem_st_x4_f32(meta_addr, meta);
+                     asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
+                     mbarrier_arrive(stats_addr + (score_phase) * 8);
+@@ -543,7 +543,7 @@ kernel_cake_dsv4_3af1afa1871d27324303(const __grid_constant__ CUtensorMap tmap_q
+             const int output_row_base = warp % 4 * 32;
+             const int n_half_1 = warp % 4 / 2;
+             const int my_row_1 = head_row_base_1 + lane;
+-            const int corr_row = head_row_base_1 << 16;
++            const int corr_row = output_row_base << 16;
+             int tile_cursor_1 = 0;
+             unsigned int _phase_o_full_0 = 0;
+             #pragma unroll 1
+diff --git a/csrc/cake_dsv4/common/cake_dsv4_71e0baa44c61b948d82c_kernel.cu b/csrc/cake_dsv4/common/cake_dsv4_71e0baa44c61b948d82c_kernel.cu
+index abfd355505c..574acc0c98e 100644
+--- a/csrc/cake_dsv4/common/cake_dsv4_71e0baa44c61b948d82c_kernel.cu
++++ b/csrc/cake_dsv4/common/cake_dsv4_71e0baa44c61b948d82c_kernel.cu
+@@ -488,7 +488,7 @@ kernel_cake_dsv4_71e0baa44c61b948d82c(const __grid_constant__ CUtensorMap tmap_q
+                     meta[1] = row_max_val;
+                     meta[2] = acc_scale;
+                     meta[3] = no_correction;
+-                    int meta_addr = taddr + 384 + (unsigned int)(score_phase * 8) + (unsigned int)(n_half * 4) + (unsigned int)(head_row_base << 16);
++                    int meta_addr = taddr + 384 + (unsigned int)(score_phase * 8) + (unsigned int)(n_half * 4) + (unsigned int)(score_row_base << 16);
+                     tmem_st_x4_f32(meta_addr, meta);
+                     asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
+                     mbarrier_arrive(stats_addr + (score_phase) * 8);
+@@ -543,7 +543,7 @@ kernel_cake_dsv4_71e0baa44c61b948d82c(const __grid_constant__ CUtensorMap tmap_q
+             const int output_row_base = warp % 4 * 32;
+             const int n_half_1 = warp % 4 / 2;
+             const int my_row_1 = head_row_base_1 + lane;
+-            const int corr_row = head_row_base_1 << 16;
++            const int corr_row = output_row_base << 16;
+             int tile_cursor_1 = 0;
+             unsigned int _phase_o_full_0 = 0;
+             #pragma unroll 1
+diff --git a/csrc/cake_dsv4/common/cake_dsv4_fc73aade5a5f4f85a9e8_kernel.cu b/csrc/cake_dsv4/common/cake_dsv4_fc73aade5a5f4f85a9e8_kernel.cu
+index e03d3b7048e..207b8f4529d 100644
+--- a/csrc/cake_dsv4/common/cake_dsv4_fc73aade5a5f4f85a9e8_kernel.cu
++++ b/csrc/cake_dsv4/common/cake_dsv4_fc73aade5a5f4f85a9e8_kernel.cu
+@@ -491,7 +491,7 @@ kernel_cake_dsv4_fc73aade5a5f4f85a9e8(const __grid_constant__ CUtensorMap tmap_q
+                     meta[1] = row_max_val;
+                     meta[2] = acc_scale;
+                     meta[3] = no_correction;
+-                    int meta_addr = taddr + 384 + (unsigned int)(score_phase * 8) + (unsigned int)(n_half * 4) + (unsigned int)(head_row_base << 16);
++                    int meta_addr = taddr + 384 + (unsigned int)(score_phase * 8) + (unsigned int)(n_half * 4) + (unsigned int)(score_row_base << 16);
+                     tmem_st_x4_f32(meta_addr, meta);
+                     asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
+                     mbarrier_arrive(stats_addr + (score_phase) * 8);
+@@ -546,7 +546,7 @@ kernel_cake_dsv4_fc73aade5a5f4f85a9e8(const __grid_constant__ CUtensorMap tmap_q
+             const int output_row_base = warp % 4 * 32;
+             const int n_half_1 = warp % 4 / 2;
+             const int my_row_1 = head_row_base_1 + lane;
+-            const int corr_row = head_row_base_1 << 16;
++            const int corr_row = output_row_base << 16;
+             int tile_cursor_1 = 0;
+             unsigned int _phase_o_full_0 = 0;
+             #pragma unroll 1
+diff --git a/csrc/cake_dsv4/sm_100a/cake_dsv4_1b4dfa2ab26fc784f640_kernel.cu b/csrc/cake_dsv4/sm_100a/cake_dsv4_1b4dfa2ab26fc784f640_kernel.cu
+index d2059272ff2..8ef4980fda5 100644
+--- a/csrc/cake_dsv4/sm_100a/cake_dsv4_1b4dfa2ab26fc784f640_kernel.cu
++++ b/csrc/cake_dsv4/sm_100a/cake_dsv4_1b4dfa2ab26fc784f640_kernel.cu
+@@ -496,7 +496,7 @@ kernel_cake_dsv4_1b4dfa2ab26fc784f640(const __grid_constant__ CUtensorMap tmap_q
+                     meta[1] = row_max_val;
+                     meta[2] = acc_scale;
+                     meta[3] = no_correction;
+-                    int meta_addr = taddr + 384 + (unsigned int)(score_phase * 8) + (unsigned int)(n_half * 4) + (unsigned int)(head_row_base << 16);
++                    int meta_addr = taddr + 384 + (unsigned int)(score_phase * 8) + (unsigned int)(n_half * 4) + (unsigned int)(score_row_base << 16);
+                     tmem_st_x4_f32(meta_addr, meta);
+                     asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
+                     mbarrier_arrive(stats_addr + (score_phase) * 8);
+@@ -551,7 +551,7 @@ kernel_cake_dsv4_1b4dfa2ab26fc784f640(const __grid_constant__ CUtensorMap tmap_q
+             const int output_row_base = warp % 4 * 32;
+             const int n_half_1 = warp % 4 / 2;
+             const int my_row_1 = head_row_base_1 + lane;
+-            const int corr_row = head_row_base_1 << 16;
++            const int corr_row = output_row_base << 16;
+             int tile_cursor_1 = 0;
+             unsigned int _phase_o_full_0 = 0;
+             #pragma unroll 1
+diff --git a/csrc/cake_dsv4/sm_100a/cake_dsv4_860a0ac41a77c1305873_kernel.cu b/csrc/cake_dsv4/sm_100a/cake_dsv4_860a0ac41a77c1305873_kernel.cu
+index c7f7a14e642..576305cda93 100644
+--- a/csrc/cake_dsv4/sm_100a/cake_dsv4_860a0ac41a77c1305873_kernel.cu
++++ b/csrc/cake_dsv4/sm_100a/cake_dsv4_860a0ac41a77c1305873_kernel.cu
+@@ -703,7 +703,7 @@ kernel_cake_dsv4_860a0ac41a77c1305873(const __grid_constant__ CUtensorMap tmap_q
+                     meta[1] = row_max_val;
+                     meta[2] = acc_scale;
+                     meta[3] = no_correction;
+-                    int meta_addr = taddr + 384 + (unsigned int)(score_phase * 8) + (unsigned int)(n_half * 4) + (unsigned int)(head_row_base << 16);
++                    int meta_addr = taddr + 384 + (unsigned int)(score_phase * 8) + (unsigned int)(n_half * 4) + (unsigned int)(score_row_base << 16);
+                     tmem_st_x4_f32(meta_addr, meta);
+                     asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
+                     mbarrier_arrive(stats_addr + (score_phase) * 8);
+@@ -750,7 +750,7 @@ kernel_cake_dsv4_860a0ac41a77c1305873(const __grid_constant__ CUtensorMap tmap_q
+             const int output_row_base = warp % 4 * 32;
+             const int n_half_1 = warp % 4 / 2;
+             const int my_row_1 = head_row_base_1 + lane;
+-            const int corr_row = head_row_base_1 << 16;
++            const int corr_row = output_row_base << 16;
+             int tile_cursor_1 = 0;
+             int work_base_1 = (unsigned int)total_work_items / num_clusters;
+             int work_extra_1 = (unsigned int)total_work_items % num_clusters;
+diff --git a/csrc/cake_dsv4/sm_100a/cake_dsv4_8a33d6688c16c25820e9_kernel.cu b/csrc/cake_dsv4/sm_100a/cake_dsv4_8a33d6688c16c25820e9_kernel.cu
+index 56f462c3aa1..6aaeec1252d 100644
+--- a/csrc/cake_dsv4/sm_100a/cake_dsv4_8a33d6688c16c25820e9_kernel.cu
++++ b/csrc/cake_dsv4/sm_100a/cake_dsv4_8a33d6688c16c25820e9_kernel.cu
+@@ -740,7 +740,7 @@ kernel_cake_dsv4_8a33d6688c16c25820e9(const __grid_constant__ CUtensorMap tmap_q
+                     meta[1] = row_max_val;
+                     meta[2] = acc_scale;
+                     meta[3] = no_correction;
+-                    int meta_addr = taddr + 384 + (unsigned int)(score_phase * 8) + (unsigned int)(n_half * 4) + (unsigned int)(head_row_base << 16);
++                    int meta_addr = taddr + 384 + (unsigned int)(score_phase * 8) + (unsigned int)(n_half * 4) + (unsigned int)(score_row_base << 16);
+                     tmem_st_x4_f32(meta_addr, meta);
+                     asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
+                     mbarrier_arrive(stats_addr + (score_phase) * 8);
+@@ -787,7 +787,7 @@ kernel_cake_dsv4_8a33d6688c16c25820e9(const __grid_constant__ CUtensorMap tmap_q
+             const int output_row_base = warp % 4 * 32;
+             const int n_half_1 = warp % 4 / 2;
+             const int my_row_1 = head_row_base_1 + lane;
+-            const int corr_row = head_row_base_1 << 16;
++            const int corr_row = output_row_base << 16;
+             int tile_cursor_1 = 0;
+             int work_base_1 = (unsigned int)total_work_items / num_clusters;
+             int work_extra_1 = (unsigned int)total_work_items % num_clusters;
+diff --git a/csrc/cake_dsv4/sm_103a/cake_dsv4_06cdf778054cc6c67dc5_kernel.cu b/csrc/cake_dsv4/sm_103a/cake_dsv4_06cdf778054cc6c67dc5_kernel.cu
+index a63d5a89fd7..042e84dd071 100644
+--- a/csrc/cake_dsv4/sm_103a/cake_dsv4_06cdf778054cc6c67dc5_kernel.cu
++++ b/csrc/cake_dsv4/sm_103a/cake_dsv4_06cdf778054cc6c67dc5_kernel.cu
+@@ -550,7 +550,7 @@ kernel_cake_dsv4_06cdf778054cc6c67dc5(const __grid_constant__ CUtensorMap tmap_q
+                     meta[1] = row_max_val;
+                     meta[2] = acc_scale;
+                     meta[3] = no_correction;
+-                    int meta_addr = taddr + 384 + (unsigned int)(score_phase * 8) + (unsigned int)(n_half * 4) + (unsigned int)(head_row_base << 16);
++                    int meta_addr = taddr + 384 + (unsigned int)(score_phase * 8) + (unsigned int)(n_half * 4) + (unsigned int)(score_row_base << 16);
+                     tmem_st_x4_f32(meta_addr, meta);
+                     asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
+                     mbarrier_arrive(stats_addr + (score_phase) * 8);
+@@ -597,7 +597,7 @@ kernel_cake_dsv4_06cdf778054cc6c67dc5(const __grid_constant__ CUtensorMap tmap_q
+             const int output_row_base = warp % 4 * 32;
+             const int n_half_1 = warp % 4 / 2;
+             const int my_row_1 = head_row_base_1 + lane;
+-            const int corr_row = head_row_base_1 << 16;
++            const int corr_row = output_row_base << 16;
+             int tile_cursor_1 = 0;
+             int work_base_1 = (unsigned int)total_work_items / num_clusters;
+             int work_extra_1 = (unsigned int)total_work_items % num_clusters;
+diff --git a/csrc/cake_dsv4/sm_103a/cake_dsv4_3b4ec80fd59f1a59eb0d_kernel.cu b/csrc/cake_dsv4/sm_103a/cake_dsv4_3b4ec80fd59f1a59eb0d_kernel.cu
+index 113f24e7fbf..ea55ca15632 100644
+--- a/csrc/cake_dsv4/sm_103a/cake_dsv4_3b4ec80fd59f1a59eb0d_kernel.cu
++++ b/csrc/cake_dsv4/sm_103a/cake_dsv4_3b4ec80fd59f1a59eb0d_kernel.cu
+@@ -509,7 +509,7 @@ kernel_cake_dsv4_3b4ec80fd59f1a59eb0d(const __grid_constant__ CUtensorMap tmap_q
+                     meta[1] = row_max_val;
+                     meta[2] = acc_scale;
+                     meta[3] = no_correction;
+-                    int meta_addr = taddr + 384 + (unsigned int)(score_phase * 8) + (unsigned int)(n_half * 4) + (unsigned int)(head_row_base << 16);
++                    int meta_addr = taddr + 384 + (unsigned int)(score_phase * 8) + (unsigned int)(n_half * 4) + (unsigned int)(score_row_base << 16);
+                     tmem_st_x4_f32(meta_addr, meta);
+                     asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
+                     mbarrier_arrive(stats_addr + (score_phase) * 8);
+@@ -564,7 +564,7 @@ kernel_cake_dsv4_3b4ec80fd59f1a59eb0d(const __grid_constant__ CUtensorMap tmap_q
+             const int output_row_base = warp % 4 * 32;
+             const int n_half_1 = warp % 4 / 2;
+             const int my_row_1 = head_row_base_1 + lane;
+-            const int corr_row = head_row_base_1 << 16;
++            const int corr_row = output_row_base << 16;
+             int tile_cursor_1 = 0;
+             unsigned int _phase_o_full_0 = 0;
+             #pragma unroll 1
+diff --git a/csrc/cake_dsv4/sm_103a/cake_dsv4_a8b112bf2abd1a8ed848_kernel.cu b/csrc/cake_dsv4/sm_103a/cake_dsv4_a8b112bf2abd1a8ed848_kernel.cu
+index 20913186647..e035387e44e 100644
+--- a/csrc/cake_dsv4/sm_103a/cake_dsv4_a8b112bf2abd1a8ed848_kernel.cu
++++ b/csrc/cake_dsv4/sm_103a/cake_dsv4_a8b112bf2abd1a8ed848_kernel.cu
+@@ -587,7 +587,7 @@ kernel_cake_dsv4_a8b112bf2abd1a8ed848(const __grid_constant__ CUtensorMap tmap_q
+                     meta[1] = row_max_val;
+                     meta[2] = acc_scale;
+                     meta[3] = no_correction;
+-                    int meta_addr = taddr + 384 + (unsigned int)(score_phase * 8) + (unsigned int)(n_half * 4) + (unsigned int)(head_row_base << 16);
++                    int meta_addr = taddr + 384 + (unsigned int)(score_phase * 8) + (unsigned int)(n_half * 4) + (unsigned int)(score_row_base << 16);
+                     tmem_st_x4_f32(meta_addr, meta);
+                     asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
+                     mbarrier_arrive(stats_addr + (score_phase) * 8);
+@@ -634,7 +634,7 @@ kernel_cake_dsv4_a8b112bf2abd1a8ed848(const __grid_constant__ CUtensorMap tmap_q
+             const int output_row_base = warp % 4 * 32;
+             const int n_half_1 = warp % 4 / 2;
+             const int my_row_1 = head_row_base_1 + lane;
+-            const int corr_row = head_row_base_1 << 16;
++            const int corr_row = output_row_base << 16;
+             int tile_cursor_1 = 0;
+             int work_base_1 = (unsigned int)total_work_items / num_clusters;
+             int work_extra_1 = (unsigned int)total_work_items % num_clusters;

@@ -1,0 +1,701 @@
+diff --git a/flashinfer/topk_varlen/kernels/gvr2_topk_host.py b/flashinfer/topk_varlen/kernels/gvr2_topk_host.py
+index 0b721ed5636..da027471a25 100644
+--- a/flashinfer/topk_varlen/kernels/gvr2_topk_host.py
++++ b/flashinfer/topk_varlen/kernels/gvr2_topk_host.py
+@@ -705,7 +705,7 @@ def route_split(b: int, n: int, npad: int, k: int, sms: int = 148) -> dict[str,
+ 
+ 
+ def route_streaming(
+-    b: int, n: int, npad: int, k: int, force_main: bool = False
++    b: int, n: int, npad: int, k: int, force_main: bool = False, big: bool | None = None
+ ) -> dict[str, object]:
+     """route() restricted to its STREAMING half (main / clus) — the varlen
+     capture policy: per-row kernels must be picked from the families that are
+@@ -713,7 +713,9 @@ def route_streaming(
+     skipped even when the envelope n would normally land on them.  Where
+     route() itself lands on main/clus this is IDENTICAL to route().
+     force_main additionally skips the clus rounding, so the raw
+-    min(r1, r2) R matches the CUDA else-branch exactly."""
++    min(r1, r2) R matches the CUDA else-branch exactly. ``big`` overrides the
++    regime selector (_big_regime) for a caller that decides the slab's CTA
++    shape itself (the windowed tier-0 slab, _prefill_slab_plan)."""
+     if b < 1:
+         raise RuntimeError(f"route_streaming requires b >= 1, got {b}")
+     R = 1
+@@ -732,7 +734,7 @@ def route_streaming(
+             p2 = 4
+         R = p2
+         useclus = True
+-    big = _big_regime(b, R, n >> 2)
++    big = _big_regime(b, R, n >> 2) if big is None else bool(big)
+     scap = (16384 if R == 1 else 8192) if big else (8192 if k > 1024 else 4096)
+     cmp_ = (4096 if k > 1024 else 2048) if big else 1024
+     aim = (
+@@ -1145,33 +1147,40 @@ def _prefill_env_error() -> str | None:
+ _PREFILL_CACHE: dict = {}
+ _PREFILL_ROW_SLAB = 32768  # gridDim.y <= 65535; slab so keys stay bounded
+ _PREFILL_TIER_ROWS = (75, 149, 297)  # (rows<=148, 149..296, >296) band reps
+-# The tier-0 plan is the BLK=1024 non-split slab, whose compile-time pair-sample
+-# gate is n > 16384, so under an envelope <= 16384 every row runs the unsampled
+-# path. The tier-1 BLK=512 plan samples above its own gate (4096 for k <= 1024,
+-# 8192 for k > 1024); <= 148-row launches take it when the envelope is above
+-# that gate by a margin (just above the gate the freshly sampling BLK=512 plan
+-# is slower than the unsampled BLK=1024 plan for b >= 32) and at most 16384
+-# (above that the BLK=1024 plan samples too and is the better slab). Upstream
+-# TRT-LLM refinement of #18702.
+-_PREFILL_T1_MARGIN = 256
+-_PREFILL_T1_MAX = 16384
++# Slab tiers are row bands. Tier 0 (<= 148 rows, one CTA per row) picks its
++# CTA shape by envelope bucket (_prefill_slab_plan: 512 threads up to the 32K
++# bucket, 1024 threads from the 64K bucket) and keeps the big-regime sampling
++# scalars; tiers 1 and 2 keep route_streaming's non-big regime (tier 1: 512
++# threads, MINB 2; tier 2: 256 threads, MINB 4) with its own scalars, so up
++# to the 32K bucket a tier-0 and a tier-1 launch differ only in those
++# scalars. Upstream's refinement of #18702 sent <= 148-row launches with
++# envelopes just above the pair-sample gate (4096 / 8192 + 256 ... 16384) to
++# tier 1; it was tuned for the BLK=1024 tier-0 plan and is dropped here.
++# Re-measured on B200 after the plan split (CUPTI, rows 16-148, envelopes
++# 8.7K-16K; the 4.4K-8.7K part of the K <= 1024 band was not measured): at
++# K <= 1024 the tier-0 scalars win 15-24% for 64-148 rows and at 16 rows x
++# K = 1024, and lose 0-5% at 16 rows x K = 512; at K = 2048 the detour keeps
++# 4-11% at 16 rows and 6-9% at 8.7K for every row count, while the tier-0
++# scalars win 13-21% at 10K-16K for 64-148 rows (except 64 rows x 12K,
++# detour +6%, and 148 rows x 14-16K cold, 6-9%).
+ 
+ 
+-def _prefill_scpb_tier1(k: int) -> int:
+-    return 8192 if k > 1024 else 4096
++def _prefill_tier(rows: int, n_env: int, k: int) -> int:
++    """Slab tier of a windowed launch: a pure row band (pinned by
++    test_prefill_tiers_are_row_bands). ``n_env`` and ``k`` stay in the
++    signature for the callers that route per envelope class."""
++    return 0 if rows <= 148 else 1 if rows <= 296 else 2
+ 
+ 
+-def _prefill_tier(rows: int, n_env: int, k: int) -> int:
+-    tier = 0 if rows <= 148 else 1 if rows <= 296 else 2
+-    if tier == 0 and _prefill_scpb_tier1(k) + _PREFILL_T1_MARGIN < n_env <= _PREFILL_T1_MAX:
+-        tier = 1
+-    return tier
++_PREFILL_WIDE_BUCKET = 65536  # tier 0 changes CTA shape here (512 -> 1024 threads)
+ 
+ 
+ def _prefill_bucket(n_env: int) -> int:
+     # pow2-quantize the envelope so a growing envelope reuses one plan; cap at
+-    # 32768 because U=8 for every n>=32768 on the tier-0 arm.
+-    return min(1 << max(int(n_env) - 1, 1).bit_length(), 32768)
++    # the wide bucket: U=8 for every n>=32768 on the tier-0 arm and the only
++    # plan change past 32768 is tier 0's CTA shape at the 64K bucket
++    # (_prefill_slab_plan), so every wider envelope shares that launcher.
++    return min(1 << max(int(n_env) - 1, 1).bit_length(), _PREFILL_WIDE_BUCKET)
+ 
+ 
+ def _prefill_bucket_for(n_env: int, k: int) -> int:
+@@ -1375,6 +1384,31 @@ def _prefill_get(
+     return lc
+ 
+ 
++def _prefill_slab_plan(tier: int, k: int, n_bucket: int) -> dict[str, object]:
++    """Streaming-slab plan of a windowed launch (pure; pinned by
++    test_prefill_tier0_slab_plan_is_pinned).
++
++    Tier 0 (<= 148 rows: one CTA per row, a single wave) picks its CTA shape
++    by envelope bucket instead of route_streaming's regime rule: the
++    512-thread (512, U 8, MINB 2) plan up to the 32K bucket and the
++    1024-thread (1024, U 8, MINB 1) plan from the 64K bucket on, which every
++    wider window maps to. Measured on B200 (CUPTI kernel time, rows 16-148,
++    K 512-2048, 3 runs, spread <= 1.5%): at 32K the 512-thread plan is 5-20%
++    faster with L2-resident logits and between 11% faster and 8% slower with
++    a cold L2; at 128K the 1024-thread CTA hides the HBM latency better and
++    is 0-11% faster hot (a wash at K = 2048), at 256K 17-25% faster hot, and
++    13-51% faster cold from 128K on; 64K sits between (within 5% hot, 5-20%
++    for 1024 threads cold) and goes with the wide side. Tiers 1 and 2 (149
++    rows and up) keep route_streaming's own regime."""
++    b_route = _PREFILL_TIER_ROWS[tier]
++    n_route = max(n_bucket, k + 1)
++    big = (n_bucket >= _PREFILL_WIDE_BUCKET) if tier == 0 else None
++    plan = route_streaming(b_route, n_route, n_route, k, force_main=True, big=big)
++    if plan["kernel"] != "main":
++        raise RuntimeError(f"prefill route did not land on gvr_main: {plan['kernel']}")
++    return plan
++
++
+ def _prefill_launcher(tier: int, k: int, n_bucket: int, abs_out: bool = False) -> tuple:
+     """Windowed slab plan + compiled launcher: ``_varlen_launcher``'s main branch
+     with r_const=1, split=False, hint_free=True and the prefill compile flag.
+@@ -1383,11 +1417,7 @@ def _prefill_launcher(tier: int, k: int, n_bucket: int, abs_out: bool = False) -
+     hit = _PREFILL_CACHE.get(key)
+     if hit is not None:
+         return hit
+-    b_route = _PREFILL_TIER_ROWS[tier]
+-    n_route = max(n_bucket, k + 1)
+-    plan = route_streaming(b_route, n_route, n_route, k, force_main=True)
+-    if plan["kernel"] != "main":
+-        raise RuntimeError(f"prefill route did not land on gvr_main: {plan['kernel']}")
++    plan = _prefill_slab_plan(tier, k, n_bucket)
+     rt = plan["rt"]
+     if rt["R"] != 1:
+         raise RuntimeError(f"prefill requires R==1 (got {rt['R']})")
+@@ -1398,6 +1428,12 @@ def _prefill_launcher(tier: int, k: int, n_bucket: int, abs_out: bool = False) -
+             tpl[:6] + (False,) + (1, 0, 1), hint_free=True, prefill=True, prefill_abs=abs_out
+         )
+     )
++    # tier 0 keeps the big-regime sampling scalars (aim_base / sd_en) with
++    # BOTH of its CTA shapes: paired with the 512-thread plan they measured
++    # 24-46% faster than the regime-consistent scalars at K = 512 and at
++    # K = 2048 for 64-148 rows (26-46%) on B200, 3-6% slower at K = 1024 and
++    # 7-9% slower at K = 2048 with 16 rows (the reviewer's B100 numbers point
++    # the same way); see _prefill_slab_plan for the plan itself
+     big = tier == 0
+     # r_const==1 branch of the _varlen_launcher tuning scalars
+     aim_base = (
+@@ -1515,8 +1551,10 @@ def warmup_prefill(
+     rows is issued in launches of at most 32768 rows, each routed on its own
+     count. For every row count in ``num_rows_list`` and every power-of-two
+     bucket of the bound from the first above ``top_k`` up to the one
+-    covering ``max_cols`` (buckets are capped at 32768 columns; wider bounds
+-    share that bucket), at both edges of the bucket, this compiles the
++    covering ``max_cols`` (buckets are capped at 65536 columns; wider bounds
++    share that bucket, and since the 64K bucket is a launcher of its own a
++    bound above 32768 needs a warm-up whose ``max_cols`` covers it), at both
++    edges of the bucket, this compiles the
+     streaming engine that bound takes and the register-resident engine
+     (2048-, 4096- or 8192-column class) the host admits for it. A later call
+     is covered when its ``top_k`` and ``absolute_indices`` match, its bound
+@@ -2429,12 +2467,22 @@ def run_varlen(
+             )
+         if not page_table.is_contiguous():
+             raise RuntimeError("page_table must be contiguous")
+-        # every column the kernels can emit (< min(envelope, width)) needs a page
+-        need_pages = (min(_index(max_seq_len) // cr if max_seq_len is not None else logits.shape[1], logits.shape[1]) + ps - 1) // ps
+-        if page_table.shape[1] < need_pages:
++        # engine-independent bound: every engine ranks at least the view width
++        # (the reference engine ranks exactly the view), so a table short of it
++        # is refused here, on the host, before any launch. The auto engines'
++        # stride-based bound is checked below once their envelope is known.
++        need_lo = (
++            min(
++                _index(max_seq_len) // cr if max_seq_len is not None else logits.shape[1],
++                logits.shape[1],
++            )
++            + ps
++            - 1
++        ) // ps
++        if page_table.shape[1] < need_lo:
+             raise RuntimeError(
+                 f"page_table has {page_table.shape[1]} pages per request; the logits width "
+-                f"needs {need_pages} at page_size={ps}"
++                f"needs {need_lo} at page_size={ps}"
+             )
+     d = logits.get_device()
+     if not 0 <= d < _GVR_MAX_DEV:
+@@ -2536,12 +2584,29 @@ def run_varlen(
+                     "host — pass max_seq_len (a capture-stable engine "
+                     "constant) under CUDA graph capture"
+                 )
+-            n_env = int(kv_lens.max().item()) >> cshift
++            kv_cols = int(kv_lens.max().item()) >> cshift
+             # eager mode: quantize the data-dependent envelope up to the next
+             # power of two so a growing decode does not recompile at every
+             # R increment (bounded plans, bounded _VARLEN_CACHE)
+-            n_env = 1 << max(n_env - 1, 1).bit_length()
++            n_env = 1 << max(kv_cols - 1, 1).bit_length()
+         n_env = min(max(n_env, 1), npad)
++        if page_table is not None:
++            # every column the engines can emit needs a page. The emit bound is
++            # the envelope clamped to the row STRIDE, not the view width: a view
++            # narrower than its stride ranks the arena columns up to the caller's
++            # bound, and a table sized from the view width mapped the columns
++            # beyond it through missing entries (staged as -1 on the smem-table
++            # compile, read past the row on the global-table compile) and came
++            # back as negative slots without an error. In eager mode the bound
++            # is the live kv maximum, not the power-of-two envelope the cache
++            # key quantizes it to.
++            emit_bound = n_env if max_seq_len is not None else min(max(kv_cols, 1), npad)
++            need_pages = (emit_bound + ps - 1) >> page_shift
++            if page_table.shape[1] < need_pages:
++                raise RuntimeError(
++                    f"page_table has {page_table.shape[1]} pages per request; the engine "
++                    f"envelope of {emit_bound} columns needs {need_pages} at page_size={ps}"
++                )
+         if windowed:
+             idx = indices
+             if idx.shape[1] != k:
+diff --git a/flashinfer/trace/templates/topk.py b/flashinfer/trace/templates/topk.py
+index a8fff31a366..df98aaf90cc 100644
+--- a/flashinfer/trace/templates/topk.py
++++ b/flashinfer/trace/templates/topk.py
+@@ -72,36 +72,45 @@ def _top_k_varlen_check(
+     next_n=1,
+     **_unused,
+ ):
+-    """Tie-safe value check: every selected value must be >= the row's K-th largest.
++    """Tie-aware top-k check: the selection must be a correct top-k set, not
++    the reference's exact set.
+ 
+-    Exact set equality is not required because ties at the K-th boundary may be
+-    broken differently by the kernel vs the reference. Instead we verify that
+-    each selected index points to a value no smaller than the true K-th largest
+-    (matching the check used in tests/topk_varlen/test_topk_varlen.py::_check_correct).
+-    This requires the original logits and seq_lens, which the template passes
+-    via **_unused from the check call in the test.
++    Ties at the K-th boundary may be broken differently by the kernel and the
++    reference, so instead of index equality each row must hold top_k distinct
++    in-window indices whose sorted values equal the row's sorted top-k values
++    (both gathered from the same fp32 image, so no tolerance is needed), with
++    pads exactly -1 and only where the window is shorter than top_k. This
++    requires the original logits and seq_lens, which the template passes via
++    **_unused from the check call in the test; without them the check falls
++    back to exact multiset equality with the reference. A NaN inside a window
++    fails the row (NaN compares unequal to itself; the kernels' NaN ordering is
++    implementation-specific).
+     """
+-    act = actual_outputs if not isinstance(actual_outputs, list) else actual_outputs[0]
++    act = (
++        actual_outputs[0]
++        if isinstance(actual_outputs, (list, tuple))
++        else actual_outputs
++    )
+     if logits is None or seq_lens is None or top_k is None:
+-        # Fallback to exact set equality when logits are unavailable.
++        # Fallback to exact multiset equality (pads included) when logits are
++        # unavailable: the same indices, in any order.
+         ref = (
+-            reference_outputs
+-            if not isinstance(reference_outputs, list)
+-            else reference_outputs[0]
++            reference_outputs[0]
++            if isinstance(reference_outputs, (list, tuple))
++            else reference_outputs
+         )
+         if ref.shape != act.shape:
+             return False
+         for r in range(ref.shape[0]):
+-            ref_set = set(ref[r].cpu().tolist())
+-            act_set = set(act[r].cpu().tolist())
+-            ref_set.discard(-1)
+-            act_set.discard(-1)
+-            if ref_set != act_set:
++            if sorted(ref[r].cpu().tolist()) != sorted(act[r].cpu().tolist()):
+                 return False
+         return True
+ 
+     logits_f32 = logits.to(torch.float32)
+     N = logits_f32.shape[1]
++    top_k = int(top_k)
++    if act.shape[1] != top_k:
++        return False
+     if page_table is not None:
+         ps = 1 if page_size is None else int(page_size)
+         pt64 = page_table.to(torch.int64)
+@@ -109,6 +118,9 @@ def _top_k_varlen_check(
+         s = min(max(int(row_starts[r].item()), 0), N) if row_starts is not None else 0
+         n = max(min(s + int(seq_lens[r].item()), N) - s, 0)
+         sel = act[r].long()  # window-local indices (absolute: shift back by s)
++        pad = sel == -1  # a pad is exactly -1, taken from the raw output
++        if bool((sel < -1).any()):
++            return False  # no other negative value is valid
+         if page_table is not None:
+             # paged output holds physical KV slots: map every valid slot back to
+             # its logits column through the request's page map (one physical
+@@ -146,9 +158,14 @@ def _top_k_varlen_check(
+             sel = torch.where(sel >= 0, sel - s, sel)  # -1 pads stay -1
+         if n < top_k:
+             # short window: every window position exactly once (the identity
+-            # set, in any order) and top_k - n pads of -1 -- never skipped
+-            valid = sel[sel >= 0]
+-            if int((sel < 0).sum()) != top_k - n or valid.numel() != n:
++            # set, in any order) and top_k - n pads of -1 -- never skipped. The
++            # pad count comes from the raw output: after the absolute-frame
++            # shift a raw column below the window start is negative too, and
++            # that is an index outside the window, not a pad.
++            if int(pad.sum()) != top_k - n:
++                return False
++            valid = sel[~pad]
++            if bool((valid < 0).any()) or bool((valid >= n).any()):
+                 return False
+             if n and not torch.equal(
+                 torch.sort(valid).values, torch.arange(n, device=sel.device)
+@@ -156,12 +173,17 @@ def _top_k_varlen_check(
+                 return False
+             continue
+         row = logits_f32[r, s : s + n]
+-        kth = torch.topk(row, top_k).values[-1].item()
+         # a -1 pad in a full row, or any index outside the window, is a
+         # failure -- not a wrap-around gather or a device-side index assert
+         if bool((sel < 0).any()) or bool((sel >= n).any()):
+             return False
+-        if (row[sel] < kth - 1e-5).any():
++        # a correct top-k set: top_k distinct indices whose values are exactly
++        # the row's top_k values as a multiset. Ties may fall on any of the
++        # tied indices, but a value strictly above the K-th is never dropped
++        # and nothing below the K-th is ever selected.
++        if sel.unique().numel() != top_k or not torch.equal(
++            torch.sort(row[sel]).values, torch.topk(row, top_k).values.sort().values
++        ):
+             return False
+     return True
+ 
+diff --git a/tests/topk_varlen/test_topk_varlen_paged.py b/tests/topk_varlen/test_topk_varlen_paged.py
+index f66808b28ff..bebf3a89f76 100644
+--- a/tests/topk_varlen/test_topk_varlen_paged.py
++++ b/tests/topk_varlen/test_topk_varlen_paged.py
+@@ -117,7 +117,7 @@ def _run_pair(lg, lens, top_k, pt, page_size, next_n=1, cr=1):
+ 
+ 
+ # rows x columns shapes spanning the four engine families of the varlen router
+-_SHAPES = [(4, 4096), (8, 32768), (96, 65536), (640, 16384)]
++_SHAPES = [(4, 4096), (8, 32768), (96, 65536), (640, 16384), (32, 262144)]
+ 
+ 
+ @requires_gvr2
+@@ -136,12 +136,15 @@ def test_paged_matches_transformed_local(top_k, shape):
+ 
+ @requires_gvr2
+ def test_paged_engine_families_covered():
+-    """The shape grid above reaches at least three of the four engine families."""
+-    fams = set()
+-    for rows, ncols in _SHAPES:
+-        lc = _host._varlen_launcher(rows, ncols, 512, ncols, 1, 1, True, 6)
+-        fams.add(lc[0])
+-    assert len(fams) >= 3, fams
++    """The shape grid above reaches all four engine families at top_k = 512:
++    the register family (either flavour), the clustered-register family, the
++    cluster family ((32, 262144) lands there) and the streaming slab."""
++    fams = {
++        _host._varlen_launcher(rows, ncols, 512, ncols, 1, 1, True, 6)[0]
++        for rows, ncols in _SHAPES
++    }
++    assert fams & {"reg", "regimg"}, fams
++    assert {"reg_clus", "clus", "main"} <= fams, fams
+ 
+ 
+ @requires_gvr2
+@@ -444,3 +447,193 @@ def test_paged_empty_row_tie_aware_check():
+         bad = out.clone()
+         bad[0, 0] = 0  # a slot for a request that spans no pages
+         assert not check(out, bad, **kw)
++
++
++@requires_gvr2
++def test_paged_table_requirement_follows_the_engine_envelope():
++    """run_varlen's emit bound is the envelope clamped to the row STRIDE, not
++    the view width: on a [2, 2048] view of a [2, 4096] arena with kv_lens =
++    max_seq_len = 4096 the engines rank the arena columns up to 4096, so a page
++    table sized from the view width (32 pages of 64) is too small. That used to
++    pass validation and come back as garbage slots (reviewer's case); now the
++    call is refused, with or without an explicit envelope, and a table with the
++    64 pages the envelope needs gives the exact top-k of the arena rows. The
++    reference engine ranks the view, so the view-width bound stays for it; in
++    eager mode the auto engines' bound is the live kv maximum. The public API
++    passes the view width as the envelope, so it stays inside the view."""
++    k, ps = 1024, 64
++    arena = torch.randn(2, 4096, device=_DEV)
++    view = arena[:, :2048]
++    lens = torch.full((2,), 4096, dtype=torch.int32, device=_DEV)
++    out = torch.full((2, k), -7, dtype=torch.int32, device=_DEV)
++    short_pt = (
++        torch.arange(32, dtype=torch.int32, device=_DEV).repeat(2, 1).contiguous()
++    )
++    for msl in (4096, None):
++        with pytest.raises(RuntimeError, match="pages per request"):
++            _host.run_varlen(
++                view,
++                None,
++                lens,
++                out,
++                max_seq_len=msl,
++                top_k=k,
++                page_table=short_pt,
++                page_size=ps,
++            )
++    full_pt = torch.arange(64, dtype=torch.int32, device=_DEV).repeat(2, 1).contiguous()
++    _host.run_varlen(
++        view,
++        None,
++        lens,
++        out,
++        max_seq_len=4096,
++        top_k=k,
++        page_table=full_pt,
++        page_size=ps,
++    )
++    torch.cuda.synchronize()
++    for r in range(2):  # identity table: slot == arena column
++        sel = out[r].long()
++        assert (
++            int(sel.min()) >= 0 and int(sel.max()) < 4096 and sel.unique().numel() == k
++        )
++        assert torch.equal(
++            torch.sort(arena[r, sel]).values,
++            torch.sort(torch.topk(arena[r], k).values).values,
++        )
++    # the reference engine ranks the view, so the view-width bound still holds
++    # for it, on the host and before any launch: a 10-page table is refused
++    # instead of indexing the table out of range on the device
++    with pytest.raises(RuntimeError, match="pages per request"):
++        _host.run_varlen(
++            view,
++            None,
++            lens,
++            out,
++            max_seq_len=4096,
++            top_k=k,
++            page_table=short_pt[:, :10].contiguous(),
++            page_size=ps,
++            engine="reference",
++        )
++    # eager mode (no envelope): the requirement follows the live kv maximum, not
++    # the power-of-two envelope the cache key quantizes it to: a 3000-column view
++    # of a 65536-stride arena with kv 3000 needs 47 pages, not 64
++    wide = torch.randn(2, 65536, device=_DEV)
++    v3000 = wide[:, :3000]
++    lens3000 = torch.full((2,), 3000, dtype=torch.int32, device=_DEV)
++    pt47 = torch.arange(47, dtype=torch.int32, device=_DEV).repeat(2, 1).contiguous()
++    out3 = torch.full((2, k), -7, dtype=torch.int32, device=_DEV)
++    _host.run_varlen(
++        v3000, None, lens3000, out3, top_k=k, page_table=pt47, page_size=ps
++    )
++    torch.cuda.synchronize()
++    for r in range(2):  # identity table: slot == arena column, all inside the view
++        sel = out3[r].long()
++        assert (
++            int(sel.min()) >= 0 and int(sel.max()) < 3000 and sel.unique().numel() == k
++        )
++        assert torch.equal(
++            torch.sort(wide[r, sel]).values,
++            torch.sort(torch.topk(wide[r, :3000], k).values).values,
++        )
++    idx, _ = flashinfer.top_k_varlen(
++        view, lens, k, page_table=short_pt, page_size=ps, backend="gvr_2"
++    )
++    torch.cuda.synchronize()
++    assert int(idx.min()) >= 0 and int(idx.max()) < 2048
++
++
++def test_tie_aware_check_is_an_exact_top_k_oracle():
++    """The trace checker is an exact top-k oracle up to tie-breaking (edge-case
++    hunt after the paged branch landed). Rejected, paged and unpaged: a
++    duplicate index in a full row, an output width other than top_k, a
++    selection that drops a value strictly above the K-th for a boundary tie, a
++    value just below the K-th (inside the old 1e-5 slack), a pad that is
++    negative but not -1, a slot beyond the window inside the last live page,
++    and a wrong LAST row, and in the absolute frame a raw column below the
++    window start posing as a pad. Accepted: differently tie-broken sets, pads
++    in any position of a short row, a partial last page, tuple outputs; the
++    no-logits fallback compares multisets."""
++    from flashinfer.trace.templates.topk import _top_k_varlen_check as check
++
++    def i32(*rows):
++        return torch.tensor(list(rows), dtype=torch.int32, device=_DEV)
++
++    lg = torch.tensor(
++        [[1.0, 9.0, 5.0, 7.0, 8.0, 3.0, 2.0, 6.0]], device=_DEV
++    )  # top-3: columns 1, 4, 3
++    seq = torch.tensor([8], dtype=torch.int32, device=_DEV)
++    pt = torch.tensor(
++        [[5, 2]], dtype=torch.int32, device=_DEV
++    )  # page_size 4: c -> pt[c // 4] * 4 + c % 4
++    good = i32([21, 8, 23])  # slots of columns 1, 4, 3
++    kw = dict(logits=lg, seq_lens=seq, top_k=3, page_table=pt, page_size=4)
++    assert check(good, good, **kw)
++    assert check(good, i32([23, 21, 8]), **kw)  # any order
++    assert not check(good, i32([21, 21, 8]), **kw)  # duplicate: column 3 is missing
++    assert not check(good, i32([21, 8]), **kw)  # width != top_k
++    assert not check(good, i32([21, 8, 23, 23]), **kw)
++    assert not check(
++        i32([1, 4]), i32([1, 1]), logits=lg, seq_lens=seq, top_k=2
++    )  # unpaged duplicate
++    # a value strictly above the K-th can never be traded for a boundary tie
++    tie = torch.tensor([[9.0, 1.0, 1.0, 1.0]], device=_DEV)
++    four = torch.tensor([4], dtype=torch.int32, device=_DEV)
++    assert check(i32([0, 1]), i32([0, 3]), logits=tie, seq_lens=four, top_k=2)
++    assert not check(i32([0, 1]), i32([1, 2]), logits=tie, seq_lens=four, top_k=2)
++    # a value just below the K-th is wrong, however close
++    near = torch.tensor([[0.5, 0.5 - 5e-6, 0.0]], device=_DEV)
++    three = torch.tensor([3], dtype=torch.int32, device=_DEV)
++    assert check(i32([0]), i32([0]), logits=near, seq_lens=three, top_k=1)
++    assert not check(i32([0]), i32([1]), logits=near, seq_lens=three, top_k=1)
++    # short rows: pads are exactly -1 and may sit anywhere; -2 / -7 are not pads
++    short = torch.tensor([3], dtype=torch.int32, device=_DEV)  # n = 3 < top_k = 5
++    pt4 = torch.tensor([[5, 2, 5, 5]], dtype=torch.int32, device=_DEV)
++    kw5 = dict(logits=lg, seq_lens=short, top_k=5, page_table=pt4, page_size=4)
++    assert check(i32([20, 21, 22, -1, -1]), i32([-1, 22, -1, 20, 21]), **kw5)
++    assert not check(i32([20, 21, 22, -1, -1]), i32([20, 21, 22, -2, -1]), **kw5)
++    assert not check(
++        i32([0, 1, 2, -1, -1]),
++        i32([0, 1, 2, -7, -1]),
++        logits=lg,
++        seq_lens=short,
++        top_k=5,
++    )
++    # a partial last page: n = 6 at page_size 4 (columns 4, 5 are the live half of page 2)
++    six = torch.tensor([6], dtype=torch.int32, device=_DEV)
++    kw6 = dict(logits=lg, seq_lens=six, top_k=3, page_table=pt, page_size=4)
++    assert check(good, good, **kw6)  # columns 1, 4, 3 (values 9, 8, 7)
++    assert not check(
++        good, i32([21, 8, 10]), **kw6
++    )  # slot of column 6: beyond n inside the live page
++    # several requests: a wrong LAST row fails (no early accept)
++    lg3, seq3, pt3, good3 = (
++        lg.repeat(3, 1),
++        seq.repeat(3),
++        pt.repeat(3, 1),
++        good.repeat(3, 1),
++    )
++    bad3 = good3.clone()
++    bad3[2, 0] = 20  # row 2 takes column 0 (value 1) instead of column 1
++    assert check(
++        good3, good3, logits=lg3, seq_lens=seq3, top_k=3, page_table=pt3, page_size=4
++    )
++    assert not check(
++        good3, bad3, logits=lg3, seq_lens=seq3, top_k=3, page_table=pt3, page_size=4
++    )
++    # absolute_indices short rows: a raw column below the window start is an
++    # index outside the window, not a pad -- pads are exactly -1 in every frame
++    lg20 = torch.arange(20.0, device=_DEV)[None]
++    kwa = dict(
++        logits=lg20, seq_lens=i32(2), top_k=3, row_starts=i32(10), absolute_indices=True
++    )
++    assert check(i32([10, 11, -1]), i32([11, -1, 10]), **kwa)
++    for bad_abs in ([10, 11, 9], [10, 11, 3], [10, 11, 0]):
++        assert not check(i32([10, 11, -1]), i32(bad_abs), **kwa), bad_abs
++    # tuple outputs (the API returns (indices, values)) unwrap like lists
++    assert check((good,), (good, torch.zeros(1, 3, device=_DEV)), **kw)
++    # the no-logits fallback compares multisets: a duplicate filling a pad fails
++    assert not check(i32([1, 2, 3, -1]), i32([1, 2, 3, 3]))
++    assert check(i32([1, 2, 3, -1]), i32([3, -1, 2, 1]))
+diff --git a/tests/topk_varlen/test_topk_varlen_prefill.py b/tests/topk_varlen/test_topk_varlen_prefill.py
+index 1a0a7e33e12..623fb0f4c50 100644
+--- a/tests/topk_varlen/test_topk_varlen_prefill.py
++++ b/tests/topk_varlen/test_topk_varlen_prefill.py
+@@ -1392,3 +1392,105 @@ def test_prefill_all_neginf_window(top_k, lead, hinted):
+     torch.cuda.synchronize()
+     _check_windowed(lg, out, rs, le, top_k)
+     assert bool((vals == float("-inf")).all())
++
++
++def test_prefill_tier0_slab_plan_is_pinned():
++    """The windowed slab plan is a deliberate choice (post-#5312 review, measured
++    on B200; see _prefill_slab_plan): tier 0 runs the 512-thread (512, 8, 2) plan
++    up to the 32K envelope bucket and the 1024-thread (1024, 8, 1) plan from the
++    64K bucket, which every wider window maps to; tiers 1 and 2 keep
++    route_streaming's non-big regime (512 and 256 threads). A change to the
++    wide bucket, to the tier-0 override or to route_streaming's CTA-shape
++    branches must fail here, not show up in a perf chart (tier 0 bypasses the
++    shared selector on purpose)."""
++    for k in (512, 1024, 2048):
++        for n, want in (
++            (8192, (512, 8, 2)),
++            (32768, (512, 8, 2)),
++            (65536, (1024, 8, 1)),
++            (262144, (1024, 8, 1)),
++        ):
++            nb = _host._prefill_bucket_for(n, k)
++            plan = _host._prefill_slab_plan(0, k, nb)
++            assert plan["kernel"] == "main" and tuple(plan["tpl"])[:3] == want, (
++                k,
++                n,
++                nb,
++                plan["tpl"],
++            )
++        assert (
++            _host._prefill_bucket_for(262144, k)
++            == _host._prefill_bucket_for(65536, k)
++            == 65536
++        )
++        for tier, want in (
++            (1, (512, 8, 2)),
++            (2, (256, 8, 4)),
++        ):  # 149+ rows: the non-big regime
++            for n in (8192, 65536):
++                nb = _host._prefill_bucket_for(n, k)
++                assert (
++                    tuple(_host._prefill_slab_plan(tier, k, nb)["tpl"])[:3] == want
++                ), (tier, k, n)
++
++
++def test_prefill_tiers_are_row_bands():
++    """Slab tiers depend on the row count alone: the upstream detour of <= 148-row
++    launches to tier 1 just above the pair-sample gate was tuned for the old
++    tier-0 plan and is gone (measured B200: the tier-0 scalars win 13-23% in most
++    of that band)."""
++    for k in (512, 1024, 2048):
++        for n in (4353, 8704, 12288, 16384, 65536):
++            assert _host._prefill_tier(100, n, k) == 0, (k, n)
++            assert _host._prefill_tier(148, n, k) == 0
++            assert _host._prefill_tier(149, n, k) == 1
++            assert _host._prefill_tier(296, n, k) == 1
++            assert _host._prefill_tier(297, n, k) == 2
++
++
++@requires_gvr2
++@pytest.mark.parametrize("rows", [16, 148])
++def test_prefill_tier0_wide_bucket_slab_exact_and_captures(rows):
++    """The 1024-thread windowed slab at the 64K bucket (tier 0, bounds above
++    32768) became reachable with the deliberate plan: exact under +inf lead
++    lanes and misaligned starts, found by prefill_ready after
++    warmup_prefill(k, 65536) as the 64K-bucket launcher, and replayed from a
++    CUDA graph captured on a side stream."""
++    k, bound = 512, 65536
++    n = bound + 4
++    lg, rs, le = _make_case(rows, n, [3] * rows, [bound] * rows, seed=rows)
++    s = torch.cuda.Stream()
++    s.wait_stream(torch.cuda.current_stream())
++    with torch.cuda.stream(s):
++        _host.warmup_prefill(k, bound)
++        assert _host.prefill_ready(rows, k, bound, width=n)
++        assert (
++            _host._prefill_cache_key("main", 0, k, 65536, False) in _host._PREFILL_CACHE
++        )
++        out = torch.full((rows, k), -7, dtype=torch.int32, device=_DEV)
++        flashinfer.top_k_varlen(
++            lg,
++            le,
++            k,
++            row_starts=rs,
++            max_window_len=bound,
++            out_indices=out,
++            backend="gvr_2",
++        )
++        torch.cuda.synchronize()
++        _check_windowed(lg, out, rs, le, k)
++        out2 = torch.full((rows, k), -7, dtype=torch.int32, device=_DEV)
++        g = torch.cuda.CUDAGraph()
++        with torch.cuda.graph(g, stream=s):
++            flashinfer.top_k_varlen(
++                lg,
++                le,
++                k,
++                row_starts=rs,
++                max_window_len=bound,
++                out_indices=out2,
++                backend="gvr_2",
++            )
++        g.replay()
++    torch.cuda.synchronize()
++    _check_windowed(lg, out2, rs, le, k)
+diff --git a/tests/trace/fi_trace_out/top_k_varlen_n4096_k512.json b/tests/trace/fi_trace_out/top_k_varlen_n4096_k512.json
+index 0067afca856..5d1f35f81e3 100644
+--- a/tests/trace/fi_trace_out/top_k_varlen_n4096_k512.json
++++ b/tests/trace/fi_trace_out/top_k_varlen_n4096_k512.json
+@@ -103,6 +103,6 @@
+     }
+   },
+   "reference": "from __future__ import annotations\nimport math\nimport torch\nimport torch.nn.functional as F\n\n@torch.no_grad()\ndef _top_k_varlen_reference(\n    logits,\n    seq_lens,\n    top_k,\n    pre_idx=None,\n    row_starts=None,\n    absolute_indices=False,\n    page_table=None,\n    page_size=None,\n    next_n=1,\n    **_unused,\n):\n    \"\"\"Per-row top-K with seq_lens masking (window ``[row_starts[r],\n    row_starts[r] + seq_lens[r])`` with window-local indices when\n    ``row_starts`` is given, absolute columns with ``absolute_indices``).\n    Reference uses torch.topk on each row.\"\"\"\n    page_size = 1 if page_size is None else page_size\n    num_rows, N = logits.shape\n    indices = torch.empty(num_rows, top_k, dtype=torch.int32, device=logits.device)\n    logits_f32 = logits.to(torch.float32)\n    for r in range(num_rows):\n        # the kernel clamps a negative start to 0 and a start past the width\n        # to the width (an empty window); the window end is clamped to the width\n        s = min(max(int(row_starts[r].item()), 0), N) if row_starts is not None else 0\n        n = max(min(s + int(seq_lens[r].item()), N) - s, 0)\n        row = logits_f32[r, s : s + n]\n        _, idx = torch.topk(row, min(top_k, n), largest=True, sorted=False)\n        idx = idx.to(torch.int32) + (s if absolute_indices else 0)\n        if page_table is not None:\n            pt = page_table[r // next_n].to(torch.int64)\n            i64 = idx.to(torch.int64)\n            idx = ((pt[i64 // page_size] * page_size) + i64 % page_size).to(torch.int32)\n        indices[r, : len(idx)] = idx\n        if len(idx) < top_k:\n            indices[r, len(idx) :] = -1\n    return indices\n",
+-  "check": "def _top_k_varlen_check(\n    reference_outputs,\n    actual_outputs,\n    logits=None,\n    seq_lens=None,\n    top_k=None,\n    row_starts=None,\n    absolute_indices=False,\n    page_table=None,\n    page_size=None,\n    next_n=1,\n    **_unused,\n):\n    \"\"\"Tie-safe value check: every selected value must be >= the row's K-th largest.\n\n    Exact set equality is not required because ties at the K-th boundary may be\n    broken differently by the kernel vs the reference. Instead we verify that\n    each selected index points to a value no smaller than the true K-th largest\n    (matching the check used in tests/topk_varlen/test_topk_varlen.py::_check_correct).\n    This requires the original logits and seq_lens, which the template passes\n    via **_unused from the check call in the test.\n    \"\"\"\n    act = actual_outputs if not isinstance(actual_outputs, list) else actual_outputs[0]\n    if logits is None or seq_lens is None or top_k is None:\n        # Fallback to exact set equality when logits are unavailable.\n        ref = (\n            reference_outputs\n            if not isinstance(reference_outputs, list)\n            else reference_outputs[0]\n        )\n        if ref.shape != act.shape:\n            return False\n        for r in range(ref.shape[0]):\n            ref_set = set(ref[r].cpu().tolist())\n            act_set = set(act[r].cpu().tolist())\n            ref_set.discard(-1)\n            act_set.discard(-1)\n            if ref_set != act_set:\n                return False\n        return True\n\n    logits_f32 = logits.to(torch.float32)\n    N = logits_f32.shape[1]\n    if page_table is not None:\n        ps = 1 if page_size is None else int(page_size)\n        pt64 = page_table.to(torch.int64)\n    for r in range(act.shape[0]):\n        s = min(max(int(row_starts[r].item()), 0), N) if row_starts is not None else 0\n        n = max(min(s + int(seq_lens[r].item()), N) - s, 0)\n        sel = act[r].long()  # window-local indices (absolute: shift back by s)\n        if page_table is not None:\n            # paged output holds physical KV slots: map every valid slot back to\n            # its logits column through the request's page map (one physical\n            # page per logical page, so the map inverts), then validate the\n            # columns exactly like the other frames -- ties at the K-th value\n            # may be broken differently from the reference and still be correct.\n            # Only the pages the row's length spans take part: later table\n            # entries are padding (and may repeat a live page id). A slot\n            # outside the spanned pages is a failure.\n            row_pt = pt64[r // next_n][: (n + ps - 1) // ps]\n            valid = sel >= 0\n            slots = sel[valid]\n            # an all-pad row (an empty request, or a full row wrongly padded)\n            # has nothing to map; the pad checks below decide it. A slot in a\n            # row that spans no pages is a failure, not an empty reduction.\n            if slots.numel():\n                if row_pt.numel() == 0:\n                    return False\n                phys = slots // ps\n                if bool((phys > row_pt.max()).any()):\n                    return False\n                inv = torch.full(\n                    (int(row_pt.max().item()) + 1,),\n                    -1,\n                    dtype=torch.int64,\n                    device=sel.device,\n                )\n                inv[row_pt] = torch.arange(row_pt.numel(), device=sel.device)\n                logical = inv[phys]\n                if bool((logical < 0).any()):\n                    return False\n                sel = sel.clone()\n                sel[valid] = logical * ps + slots % ps\n        if absolute_indices:\n            sel = torch.where(sel >= 0, sel - s, sel)  # -1 pads stay -1\n        if n < top_k:\n            # short window: every window position exactly once (the identity\n            # set, in any order) and top_k - n pads of -1 -- never skipped\n            valid = sel[sel >= 0]\n            if int((sel < 0).sum()) != top_k - n or valid.numel() != n:\n                return False\n            if n and not torch.equal(\n                torch.sort(valid).values, torch.arange(n, device=sel.device)\n            ):\n                return False\n            continue\n        row = logits_f32[r, s : s + n]\n        kth = torch.topk(row, top_k).values[-1].item()\n        # a -1 pad in a full row, or any index outside the window, is a\n        # failure -- not a wrap-around gather or a device-side index assert\n        if bool((sel < 0).any()) or bool((sel >= n).any()):\n            return False\n        if (row[sel] < kth - 1e-5).any():\n            return False\n    return True\n",
++  "check": "def _top_k_varlen_check(\n    reference_outputs,\n    actual_outputs,\n    logits=None,\n    seq_lens=None,\n    top_k=None,\n    row_starts=None,\n    absolute_indices=False,\n    page_table=None,\n    page_size=None,\n    next_n=1,\n    **_unused,\n):\n    \"\"\"Tie-aware top-k check: the selection must be a correct top-k set, not\n    the reference's exact set.\n\n    Ties at the K-th boundary may be broken differently by the kernel and the\n    reference, so instead of index equality each row must hold top_k distinct\n    in-window indices whose sorted values equal the row's sorted top-k values\n    (both gathered from the same fp32 image, so no tolerance is needed), with\n    pads exactly -1 and only where the window is shorter than top_k. This\n    requires the original logits and seq_lens, which the template passes via\n    **_unused from the check call in the test; without them the check falls\n    back to exact multiset equality with the reference. A NaN inside a window\n    fails the row (NaN compares unequal to itself; the kernels' NaN ordering is\n    implementation-specific).\n    \"\"\"\n    act = (\n        actual_outputs[0]\n        if isinstance(actual_outputs, (list, tuple))\n        else actual_outputs\n    )\n    if logits is None or seq_lens is None or top_k is None:\n        # Fallback to exact multiset equality (pads included) when logits are\n        # unavailable: the same indices, in any order.\n        ref = (\n            reference_outputs[0]\n            if isinstance(reference_outputs, (list, tuple))\n            else reference_outputs\n        )\n        if ref.shape != act.shape:\n            return False\n        for r in range(ref.shape[0]):\n            if sorted(ref[r].cpu().tolist()) != sorted(act[r].cpu().tolist()):\n                return False\n        return True\n\n    logits_f32 = logits.to(torch.float32)\n    N = logits_f32.shape[1]\n    top_k = int(top_k)\n    if act.shape[1] != top_k:\n        return False\n    if page_table is not None:\n        ps = 1 if page_size is None else int(page_size)\n        pt64 = page_table.to(torch.int64)\n    for r in range(act.shape[0]):\n        s = min(max(int(row_starts[r].item()), 0), N) if row_starts is not None else 0\n        n = max(min(s + int(seq_lens[r].item()), N) - s, 0)\n        sel = act[r].long()  # window-local indices (absolute: shift back by s)\n        pad = sel == -1  # a pad is exactly -1, taken from the raw output\n        if bool((sel < -1).any()):\n            return False  # no other negative value is valid\n        if page_table is not None:\n            # paged output holds physical KV slots: map every valid slot back to\n            # its logits column through the request's page map (one physical\n            # page per logical page, so the map inverts), then validate the\n            # columns exactly like the other frames -- ties at the K-th value\n            # may be broken differently from the reference and still be correct.\n            # Only the pages the row's length spans take part: later table\n            # entries are padding (and may repeat a live page id). A slot\n            # outside the spanned pages is a failure.\n            row_pt = pt64[r // next_n][: (n + ps - 1) // ps]\n            valid = sel >= 0\n            slots = sel[valid]\n            # an all-pad row (an empty request, or a full row wrongly padded)\n            # has nothing to map; the pad checks below decide it. A slot in a\n            # row that spans no pages is a failure, not an empty reduction.\n            if slots.numel():\n                if row_pt.numel() == 0:\n                    return False\n                phys = slots // ps\n                if bool((phys > row_pt.max()).any()):\n                    return False\n                inv = torch.full(\n                    (int(row_pt.max().item()) + 1,),\n                    -1,\n                    dtype=torch.int64,\n                    device=sel.device,\n                )\n                inv[row_pt] = torch.arange(row_pt.numel(), device=sel.device)\n                logical = inv[phys]\n                if bool((logical < 0).any()):\n                    return False\n                sel = sel.clone()\n                sel[valid] = logical * ps + slots % ps\n        if absolute_indices:\n            sel = torch.where(sel >= 0, sel - s, sel)  # -1 pads stay -1\n        if n < top_k:\n            # short window: every window position exactly once (the identity\n            # set, in any order) and top_k - n pads of -1 -- never skipped. The\n            # pad count comes from the raw output: after the absolute-frame\n            # shift a raw column below the window start is negative too, and\n            # that is an index outside the window, not a pad.\n            if int(pad.sum()) != top_k - n:\n                return False\n            valid = sel[~pad]\n            if bool((valid < 0).any()) or bool((valid >= n).any()):\n                return False\n            if n and not torch.equal(\n                torch.sort(valid).values, torch.arange(n, device=sel.device)\n            ):\n                return False\n            continue\n        row = logits_f32[r, s : s + n]\n        # a -1 pad in a full row, or any index outside the window, is a\n        # failure -- not a wrap-around gather or a device-side index assert\n        if bool((sel < 0).any()) or bool((sel >= n).any()):\n            return False\n        # a correct top-k set: top_k distinct indices whose values are exactly\n        # the row's top_k values as a multiset. Ties may fall on any of the\n        # tied indices, but a value strictly above the K-th is never dropped\n        # and nothing below the K-th is ever selected.\n        if sel.unique().numel() != top_k or not torch.equal(\n            torch.sort(row[sel]).values, torch.topk(row, top_k).values.sort().values\n        ):\n            return False\n    return True\n",
+   "init": "from __future__ import annotations\nimport math\nimport torch\n\n# ----- shared init helpers -----\n# Copyright (c) 2025 by FlashInfer team.\n#\n# Licensed under the Apache License, Version 2.0 (the \"License\");\n# you may not use this file except in compliance with the License.\n# You may obtain a copy of the License at\n#\n#   http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an \"AS IS\" BASIS,\n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n# See the License for the specific language governing permissions and\n# limitations under the License.\n\n\"\"\"Shared helpers used by ``TraceTemplate.init`` functions.\n\nThis module contains the small set of input-construction patterns that\nrecur across many templates (paged-KV cache index arrays, ragged indptr,\nRoPE pos_ids and cos/sin caches, sampling probs). Each helper is short and\ndocumented; init functions in ``templates/<category>.py`` call into here so\nthe per-template init bodies stay focused on shape/dtype, not boilerplate.\n\nThe full source of this module is **inlined into every dumped JSON's\n``\"init\"`` field** by ``flashinfer/trace/template.py:_render_init_source``,\nso downstream consumers don't need flashinfer installed to re-run the init\nsnippets.\n\"\"\"\n\n\nfrom typing import Optional, Tuple\n\nimport torch\n\n\ndef make_paged_kv_indices(\n    batch_size: int,\n    num_pages_per_seq: int,\n    page_size: int,\n    *,\n    device: str = \"cuda\",\n) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:\n    \"\"\"Return ``(kv_indptr, kv_indices, kv_last_page_len)`` for a uniform batch.\n\n    Every sequence is assigned exactly ``num_pages_per_seq`` pages, fully\n    populated (last-page length == page_size).\n\n    Invariants\n    ----------\n    - ``kv_indptr.shape == (batch_size + 1,)``, dtype int32, monotonic, [0]=0.\n    - ``kv_indices == arange(0, batch_size * num_pages_per_seq)``, int32.\n    - ``kv_last_page_len == full(batch_size, page_size)``, int32.\n    \"\"\"\n    total_pages = batch_size * num_pages_per_seq\n    kv_indptr = (\n        torch.arange(batch_size + 1, dtype=torch.int32, device=device)\n        * num_pages_per_seq\n    )\n    kv_indices = torch.arange(total_pages, dtype=torch.int32, device=device)\n    kv_last_page_len = torch.full(\n        (batch_size,), page_size, dtype=torch.int32, device=device\n    )\n    return kv_indptr, kv_indices, kv_last_page_len\n\n\ndef make_ragged_indptr(\n    seg_lens,\n    *,\n    device: str = \"cuda\",\n    dtype: torch.dtype = torch.int32,\n) -> torch.Tensor:\n    \"\"\"Return cumulative-sum ``indptr`` of length ``len(seg_lens)+1``.\n\n    ``seg_lens`` may be a list / tuple / 1-D tensor of segment lengths.\n    \"\"\"\n    if isinstance(seg_lens, torch.Tensor):\n        lens = seg_lens.to(device=device, dtype=dtype)\n    else:\n        lens = torch.tensor(list(seg_lens), dtype=dtype, device=device)\n    indptr = torch.zeros(lens.numel() + 1, dtype=dtype, device=device)\n    indptr[1:] = torch.cumsum(lens, dim=0).to(dtype)\n    return indptr\n\n\ndef make_uniform_qo_indptr(\n    batch_size: int,\n    qo_len: int,\n    *,\n    device: str = \"cuda\",\n) -> torch.Tensor:\n    \"\"\"Return ``[0, qo_len, 2*qo_len, ..., batch_size*qo_len]`` int32.\"\"\"\n    return torch.arange(batch_size + 1, dtype=torch.int32, device=device) * qo_len\n\n\ndef make_pos_ids(\n    nnz: int,\n    max_seq_len: Optional[int] = None,\n    *,\n    device: str = \"cuda\",\n) -> torch.Tensor:\n    \"\"\"Return ``[0, 1, ..., nnz-1] (% max_seq_len)`` as int32 on ``device``.\n\n    If ``max_seq_len`` is None, no wrapping is applied.\n    \"\"\"\n    pos = torch.arange(nnz, dtype=torch.int32, device=device)\n    if max_seq_len is not None:\n        pos = pos % max_seq_len\n    return pos\n\n\ndef make_rope_cos_sin_cache(\n    max_seq_len: int,\n    rope_dim: int,\n    *,\n    base: float = 1e4,\n    device: str = \"cuda\",\n    dtype: torch.dtype = torch.float32,\n) -> torch.Tensor:\n    \"\"\"Return concatenated ``[cos | sin]`` cache of shape ``[max_seq_len, rope_dim]``.\"\"\"\n    t = torch.arange(max_seq_len, dtype=torch.float32, device=device)\n    inv = 1.0 / (\n        base\n        ** (torch.arange(0, rope_dim, 2, dtype=torch.float32, device=device) / rope_dim)\n    )\n    freqs = t.unsqueeze(-1) * inv.unsqueeze(0)\n    cache = torch.cat([torch.cos(freqs), torch.sin(freqs)], dim=-1)\n    return cache.to(dtype)\n\n\ndef make_probs(\n    batch_size: int,\n    vocab_size: int,\n    *,\n    device: str = \"cuda\",\n    dtype: torch.dtype = torch.float32,\n) -> torch.Tensor:\n    \"\"\"Return a ``[batch_size, vocab_size]`` probability distribution.\n\n    Uses ``softmax(randn(...))`` so each row sums to 1.0. This mirrors the\n    pattern used throughout ``tests/utils/test_sampling.py``.\n    \"\"\"\n    return torch.softmax(\n        torch.randn(batch_size, vocab_size, dtype=torch.float32, device=device),\n        dim=-1,\n    ).to(dtype)\n\n\ndef make_logits(\n    batch_size: int,\n    vocab_size: int,\n    *,\n    device: str = \"cuda\",\n    dtype: torch.dtype = torch.float32,\n) -> torch.Tensor:\n    \"\"\"Return ``randn(batch_size, vocab_size)`` logits.\"\"\"\n    return torch.randn(batch_size, vocab_size, dtype=dtype, device=device)\n\n\ndef fp8_safe_randn(\n    *shape: int,\n    scale: float = 0.1,\n    device: str = \"cuda\",\n    dtype: torch.dtype = torch.bfloat16,\n) -> torch.Tensor:\n    \"\"\"``randn(*shape) * scale`` \u2014 keeps values in the FP8/FP4 representable range.\n\n    Tests for fp8/fp4 paths typically multiply ``randn`` by 0.1 to avoid\n    saturation when quantizing. Use this helper to mirror that convention.\n    \"\"\"\n    return (torch.randn(*shape, dtype=dtype, device=device) * scale).to(dtype)\n\n\ndef per_tensor_fp8_quantize(\n    x: torch.Tensor,\n    *,\n    fp8_dtype: torch.dtype = torch.float8_e4m3fn,\n) -> Tuple[torch.Tensor, torch.Tensor]:\n    \"\"\"Per-tensor FP8 quantization, mirroring ``tests/utils_fp8.py:to_float8``.\n\n    Returns ``(x_fp8, inv_scale)`` where ``inv_scale`` is the dequant\n    multiplier (``float \u2248 fp8 * inv_scale``).\n    \"\"\"\n    finfo = torch.finfo(fp8_dtype)\n    amax = x.abs().amax().clamp(min=1e-12)\n    scale = finfo.max / amax\n    x_q = (x.float() * scale).clamp(min=finfo.min, max=finfo.max).to(fp8_dtype)\n    return x_q, scale.float().reciprocal()\n\n\ndef fp8_block_quant_1d(\n    x_bf16: torch.Tensor,\n    block: int = 128,\n) -> Tuple[torch.Tensor, torch.Tensor]:\n    \"\"\"Quantize ``[T, H]`` activations into FP8 with per-``(token, block)``\n    column-block scales. Returns ``(x_fp8, scales)`` where\n    ``scales`` has shape ``[T, H // block]``.\n\n    Mirrors ``_fp8_block_quant_1d`` in\n    ``tests/moe/test_dpsk_fused_moe_fp8.py``.\n    \"\"\"\n    assert x_bf16.dim() == 2\n    T, H = x_bf16.shape\n    assert H % block == 0\n    nb = H // block\n    finfo = torch.finfo(torch.float8_e4m3fn)\n    max_fp8 = finfo.max\n    x_f32 = x_bf16.to(torch.float32)\n    x_fp8 = torch.empty((T, H), dtype=torch.float8_e4m3fn, device=x_bf16.device)\n    scales = torch.empty((T, nb), dtype=torch.float32, device=x_bf16.device)\n    for j in range(nb):\n        sl = slice(j * block, (j + 1) * block)\n        blk = x_f32[:, sl]\n        amax = torch.amax(torch.abs(blk), dim=1)\n        s = torch.where(amax > 0, amax / max_fp8, torch.ones_like(amax))\n        x_fp8[:, sl] = (blk / s.unsqueeze(1)).to(torch.float8_e4m3fn)\n        scales[:, j] = s\n    return x_fp8, scales\n\n\ndef fp8_block_quant_2d(\n    w_bf16: torch.Tensor,\n    block: int = 128,\n) -> Tuple[torch.Tensor, torch.Tensor]:\n    \"\"\"Quantize weights ``[..., R, C]`` with 2-D ``block \u00d7 block`` scales.\n\n    Returns ``(w_fp8, scales)`` where ``scales`` has shape\n    ``[..., R // block, C // block]``. Mirrors ``_fp8_block_quant_2d`` in\n    ``tests/moe/test_dpsk_fused_moe_fp8.py``.\n    \"\"\"\n    assert w_bf16.dim() >= 2\n    *prefix, R, C = w_bf16.shape\n    assert R % block == 0 and C % block == 0\n    nb_r, nb_c = R // block, C // block\n    finfo = torch.finfo(torch.float8_e4m3fn)\n    max_fp8 = finfo.max\n    w_f32 = w_bf16.to(torch.float32).contiguous()\n    prefix_ndim = len(prefix)\n    reshaped = w_f32.reshape(*prefix, nb_r, block, nb_c, block)\n    permute_dims = tuple(range(prefix_ndim)) + (\n        prefix_ndim,\n        prefix_ndim + 2,\n        prefix_ndim + 1,\n        prefix_ndim + 3,\n    )\n    blocks = reshaped.permute(permute_dims).contiguous()\n    amax = torch.amax(torch.abs(blocks), dim=(-1, -2))\n    scales = torch.where(\n        amax > 0, amax / max_fp8, torch.ones_like(amax, dtype=torch.float32)\n    )\n    q_blocks = (blocks / scales.unsqueeze(-1).unsqueeze(-1)).to(torch.float8_e4m3fn)\n    inv_permute = [0] * (prefix_ndim + 4)\n    for i, p in enumerate(permute_dims):\n        inv_permute[p] = i\n    w_fp8 = q_blocks.permute(*inv_permute).reshape(*prefix, R, C).contiguous()\n    return w_fp8, scales\n\n\n__all__ = [\n    \"make_paged_kv_indices\",\n    \"make_ragged_indptr\",\n    \"make_uniform_qo_indptr\",\n    \"make_pos_ids\",\n    \"make_rope_cos_sin_cache\",\n    \"make_probs\",\n    \"make_logits\",\n    \"fp8_safe_randn\",\n    \"per_tensor_fp8_quantize\",\n    \"fp8_block_quant_1d\",\n    \"fp8_block_quant_2d\",\n]\n\n# ----- init -----\ndef _top_k_varlen_init(\n    *,\n    batch_size: int,\n    max_seq_len: int = 8192,\n    top_k: int = 1024,\n    max_pages: int = 0,  # paged-output axis; the example never builds a page table\n    device: str = \"cuda\",\n    seed: int = 0,\n):\n    \"\"\"Build inputs for ``flashinfer.top_k_varlen`` (radix_cutlass backend, no pre_idx).\n\n    Uses the ``radix_cutlass`` (masked CUTLASS radix) backend so the example\n    runs on any GPU.\n    ``seq_lens`` is randomised in ``[top_k + 1, max_seq_len]`` to guarantee\n    that every row has at least ``top_k`` valid entries.\n    ``max_seq_len`` is padded to the next multiple of 8 (fp16/bf16 alignment).\n    \"\"\"\n    max_seq_len = (max_seq_len + 7) // 8 * 8\n    torch.manual_seed(seed)\n    logits = torch.randn(batch_size, max_seq_len, dtype=torch.bfloat16, device=device)\n    seq_lens = torch.randint(\n        top_k + 1, max_seq_len + 1, (batch_size,), dtype=torch.int32, device=device\n    )\n    return {\n        \"logits\": logits,\n        \"seq_lens\": seq_lens,\n        \"top_k\": top_k,\n        \"backend\": \"radix_cutlass\",\n    }\n"
+ }
+diff --git a/tests/trace/fi_trace_out/top_k_varlen_n8192_k1024.json b/tests/trace/fi_trace_out/top_k_varlen_n8192_k1024.json
+index fe68e2f7673..6d72be708f7 100644
+--- a/tests/trace/fi_trace_out/top_k_varlen_n8192_k1024.json
++++ b/tests/trace/fi_trace_out/top_k_varlen_n8192_k1024.json
+@@ -103,6 +103,6 @@
+     }
+   },
+   "reference": "from __future__ import annotations\nimport math\nimport torch\nimport torch.nn.functional as F\n\n@torch.no_grad()\ndef _top_k_varlen_reference(\n    logits,\n    seq_lens,\n    top_k,\n    pre_idx=None,\n    row_starts=None,\n    absolute_indices=False,\n    page_table=None,\n    page_size=None,\n    next_n=1,\n    **_unused,\n):\n    \"\"\"Per-row top-K with seq_lens masking (window ``[row_starts[r],\n    row_starts[r] + seq_lens[r])`` with window-local indices when\n    ``row_starts`` is given, absolute columns with ``absolute_indices``).\n    Reference uses torch.topk on each row.\"\"\"\n    page_size = 1 if page_size is None else page_size\n    num_rows, N = logits.shape\n    indices = torch.empty(num_rows, top_k, dtype=torch.int32, device=logits.device)\n    logits_f32 = logits.to(torch.float32)\n    for r in range(num_rows):\n        # the kernel clamps a negative start to 0 and a start past the width\n        # to the width (an empty window); the window end is clamped to the width\n        s = min(max(int(row_starts[r].item()), 0), N) if row_starts is not None else 0\n        n = max(min(s + int(seq_lens[r].item()), N) - s, 0)\n        row = logits_f32[r, s : s + n]\n        _, idx = torch.topk(row, min(top_k, n), largest=True, sorted=False)\n        idx = idx.to(torch.int32) + (s if absolute_indices else 0)\n        if page_table is not None:\n            pt = page_table[r // next_n].to(torch.int64)\n            i64 = idx.to(torch.int64)\n            idx = ((pt[i64 // page_size] * page_size) + i64 % page_size).to(torch.int32)\n        indices[r, : len(idx)] = idx\n        if len(idx) < top_k:\n            indices[r, len(idx) :] = -1\n    return indices\n",
+-  "check": "def _top_k_varlen_check(\n    reference_outputs,\n    actual_outputs,\n    logits=None,\n    seq_lens=None,\n    top_k=None,\n    row_starts=None,\n    absolute_indices=False,\n    page_table=None,\n    page_size=None,\n    next_n=1,\n    **_unused,\n):\n    \"\"\"Tie-safe value check: every selected value must be >= the row's K-th largest.\n\n    Exact set equality is not required because ties at the K-th boundary may be\n    broken differently by the kernel vs the reference. Instead we verify that\n    each selected index points to a value no smaller than the true K-th largest\n    (matching the check used in tests/topk_varlen/test_topk_varlen.py::_check_correct).\n    This requires the original logits and seq_lens, which the template passes\n    via **_unused from the check call in the test.\n    \"\"\"\n    act = actual_outputs if not isinstance(actual_outputs, list) else actual_outputs[0]\n    if logits is None or seq_lens is None or top_k is None:\n        # Fallback to exact set equality when logits are unavailable.\n        ref = (\n            reference_outputs\n            if not isinstance(reference_outputs, list)\n            else reference_outputs[0]\n        )\n        if ref.shape != act.shape:\n            return False\n        for r in range(ref.shape[0]):\n            ref_set = set(ref[r].cpu().tolist())\n            act_set = set(act[r].cpu().tolist())\n            ref_set.discard(-1)\n            act_set.discard(-1)\n            if ref_set != act_set:\n                return False\n        return True\n\n    logits_f32 = logits.to(torch.float32)\n    N = logits_f32.shape[1]\n    if page_table is not None:\n        ps = 1 if page_size is None else int(page_size)\n        pt64 = page_table.to(torch.int64)\n    for r in range(act.shape[0]):\n        s = min(max(int(row_starts[r].item()), 0), N) if row_starts is not None else 0\n        n = max(min(s + int(seq_lens[r].item()), N) - s, 0)\n        sel = act[r].long()  # window-local indices (absolute: shift back by s)\n        if page_table is not None:\n            # paged output holds physical KV slots: map every valid slot back to\n            # its logits column through the request's page map (one physical\n            # page per logical page, so the map inverts), then validate the\n            # columns exactly like the other frames -- ties at the K-th value\n            # may be broken differently from the reference and still be correct.\n            # Only the pages the row's length spans take part: later table\n            # entries are padding (and may repeat a live page id). A slot\n            # outside the spanned pages is a failure.\n            row_pt = pt64[r // next_n][: (n + ps - 1) // ps]\n            valid = sel >= 0\n            slots = sel[valid]\n            # an all-pad row (an empty request, or a full row wrongly padded)\n            # has nothing to map; the pad checks below decide it. A slot in a\n            # row that spans no pages is a failure, not an empty reduction.\n            if slots.numel():\n                if row_pt.numel() == 0:\n                    return False\n                phys = slots // ps\n                if bool((phys > row_pt.max()).any()):\n                    return False\n                inv = torch.full(\n                    (int(row_pt.max().item()) + 1,),\n                    -1,\n                    dtype=torch.int64,\n                    device=sel.device,\n                )\n                inv[row_pt] = torch.arange(row_pt.numel(), device=sel.device)\n                logical = inv[phys]\n                if bool((logical < 0).any()):\n                    return False\n                sel = sel.clone()\n                sel[valid] = logical * ps + slots % ps\n        if absolute_indices:\n            sel = torch.where(sel >= 0, sel - s, sel)  # -1 pads stay -1\n        if n < top_k:\n            # short window: every window position exactly once (the identity\n            # set, in any order) and top_k - n pads of -1 -- never skipped\n            valid = sel[sel >= 0]\n            if int((sel < 0).sum()) != top_k - n or valid.numel() != n:\n                return False\n            if n and not torch.equal(\n                torch.sort(valid).values, torch.arange(n, device=sel.device)\n            ):\n                return False\n            continue\n        row = logits_f32[r, s : s + n]\n        kth = torch.topk(row, top_k).values[-1].item()\n        # a -1 pad in a full row, or any index outside the window, is a\n        # failure -- not a wrap-around gather or a device-side index assert\n        if bool((sel < 0).any()) or bool((sel >= n).any()):\n            return False\n        if (row[sel] < kth - 1e-5).any():\n            return False\n    return True\n",
++  "check": "def _top_k_varlen_check(\n    reference_outputs,\n    actual_outputs,\n    logits=None,\n    seq_lens=None,\n    top_k=None,\n    row_starts=None,\n    absolute_indices=False,\n    page_table=None,\n    page_size=None,\n    next_n=1,\n    **_unused,\n):\n    \"\"\"Tie-aware top-k check: the selection must be a correct top-k set, not\n    the reference's exact set.\n\n    Ties at the K-th boundary may be broken differently by the kernel and the\n    reference, so instead of index equality each row must hold top_k distinct\n    in-window indices whose sorted values equal the row's sorted top-k values\n    (both gathered from the same fp32 image, so no tolerance is needed), with\n    pads exactly -1 and only where the window is shorter than top_k. This\n    requires the original logits and seq_lens, which the template passes via\n    **_unused from the check call in the test; without them the check falls\n    back to exact multiset equality with the reference. A NaN inside a window\n    fails the row (NaN compares unequal to itself; the kernels' NaN ordering is\n    implementation-specific).\n    \"\"\"\n    act = (\n        actual_outputs[0]\n        if isinstance(actual_outputs, (list, tuple))\n        else actual_outputs\n    )\n    if logits is None or seq_lens is None or top_k is None:\n        # Fallback to exact multiset equality (pads included) when logits are\n        # unavailable: the same indices, in any order.\n        ref = (\n            reference_outputs[0]\n            if isinstance(reference_outputs, (list, tuple))\n            else reference_outputs\n        )\n        if ref.shape != act.shape:\n            return False\n        for r in range(ref.shape[0]):\n            if sorted(ref[r].cpu().tolist()) != sorted(act[r].cpu().tolist()):\n                return False\n        return True\n\n    logits_f32 = logits.to(torch.float32)\n    N = logits_f32.shape[1]\n    top_k = int(top_k)\n    if act.shape[1] != top_k:\n        return False\n    if page_table is not None:\n        ps = 1 if page_size is None else int(page_size)\n        pt64 = page_table.to(torch.int64)\n    for r in range(act.shape[0]):\n        s = min(max(int(row_starts[r].item()), 0), N) if row_starts is not None else 0\n        n = max(min(s + int(seq_lens[r].item()), N) - s, 0)\n        sel = act[r].long()  # window-local indices (absolute: shift back by s)\n        pad = sel == -1  # a pad is exactly -1, taken from the raw output\n        if bool((sel < -1).any()):\n            return False  # no other negative value is valid\n        if page_table is not None:\n            # paged output holds physical KV slots: map every valid slot back to\n            # its logits column through the request's page map (one physical\n            # page per logical page, so the map inverts), then validate the\n            # columns exactly like the other frames -- ties at the K-th value\n            # may be broken differently from the reference and still be correct.\n            # Only the pages the row's length spans take part: later table\n            # entries are padding (and may repeat a live page id). A slot\n            # outside the spanned pages is a failure.\n            row_pt = pt64[r // next_n][: (n + ps - 1) // ps]\n            valid = sel >= 0\n            slots = sel[valid]\n            # an all-pad row (an empty request, or a full row wrongly padded)\n            # has nothing to map; the pad checks below decide it. A slot in a\n            # row that spans no pages is a failure, not an empty reduction.\n            if slots.numel():\n                if row_pt.numel() == 0:\n                    return False\n                phys = slots // ps\n                if bool((phys > row_pt.max()).any()):\n                    return False\n                inv = torch.full(\n                    (int(row_pt.max().item()) + 1,),\n                    -1,\n                    dtype=torch.int64,\n                    device=sel.device,\n                )\n                inv[row_pt] = torch.arange(row_pt.numel(), device=sel.device)\n                logical = inv[phys]\n                if bool((logical < 0).any()):\n                    return False\n                sel = sel.clone()\n                sel[valid] = logical * ps + slots % ps\n        if absolute_indices:\n            sel = torch.where(sel >= 0, sel - s, sel)  # -1 pads stay -1\n        if n < top_k:\n            # short window: every window position exactly once (the identity\n            # set, in any order) and top_k - n pads of -1 -- never skipped. The\n            # pad count comes from the raw output: after the absolute-frame\n            # shift a raw column below the window start is negative too, and\n            # that is an index outside the window, not a pad.\n            if int(pad.sum()) != top_k - n:\n                return False\n            valid = sel[~pad]\n            if bool((valid < 0).any()) or bool((valid >= n).any()):\n                return False\n            if n and not torch.equal(\n                torch.sort(valid).values, torch.arange(n, device=sel.device)\n            ):\n                return False\n            continue\n        row = logits_f32[r, s : s + n]\n        # a -1 pad in a full row, or any index outside the window, is a\n        # failure -- not a wrap-around gather or a device-side index assert\n        if bool((sel < 0).any()) or bool((sel >= n).any()):\n            return False\n        # a correct top-k set: top_k distinct indices whose values are exactly\n        # the row's top_k values as a multiset. Ties may fall on any of the\n        # tied indices, but a value strictly above the K-th is never dropped\n        # and nothing below the K-th is ever selected.\n        if sel.unique().numel() != top_k or not torch.equal(\n            torch.sort(row[sel]).values, torch.topk(row, top_k).values.sort().values\n        ):\n            return False\n    return True\n",
+   "init": "from __future__ import annotations\nimport math\nimport torch\n\n# ----- shared init helpers -----\n# Copyright (c) 2025 by FlashInfer team.\n#\n# Licensed under the Apache License, Version 2.0 (the \"License\");\n# you may not use this file except in compliance with the License.\n# You may obtain a copy of the License at\n#\n#   http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an \"AS IS\" BASIS,\n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n# See the License for the specific language governing permissions and\n# limitations under the License.\n\n\"\"\"Shared helpers used by ``TraceTemplate.init`` functions.\n\nThis module contains the small set of input-construction patterns that\nrecur across many templates (paged-KV cache index arrays, ragged indptr,\nRoPE pos_ids and cos/sin caches, sampling probs). Each helper is short and\ndocumented; init functions in ``templates/<category>.py`` call into here so\nthe per-template init bodies stay focused on shape/dtype, not boilerplate.\n\nThe full source of this module is **inlined into every dumped JSON's\n``\"init\"`` field** by ``flashinfer/trace/template.py:_render_init_source``,\nso downstream consumers don't need flashinfer installed to re-run the init\nsnippets.\n\"\"\"\n\n\nfrom typing import Optional, Tuple\n\nimport torch\n\n\ndef make_paged_kv_indices(\n    batch_size: int,\n    num_pages_per_seq: int,\n    page_size: int,\n    *,\n    device: str = \"cuda\",\n) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:\n    \"\"\"Return ``(kv_indptr, kv_indices, kv_last_page_len)`` for a uniform batch.\n\n    Every sequence is assigned exactly ``num_pages_per_seq`` pages, fully\n    populated (last-page length == page_size).\n\n    Invariants\n    ----------\n    - ``kv_indptr.shape == (batch_size + 1,)``, dtype int32, monotonic, [0]=0.\n    - ``kv_indices == arange(0, batch_size * num_pages_per_seq)``, int32.\n    - ``kv_last_page_len == full(batch_size, page_size)``, int32.\n    \"\"\"\n    total_pages = batch_size * num_pages_per_seq\n    kv_indptr = (\n        torch.arange(batch_size + 1, dtype=torch.int32, device=device)\n        * num_pages_per_seq\n    )\n    kv_indices = torch.arange(total_pages, dtype=torch.int32, device=device)\n    kv_last_page_len = torch.full(\n        (batch_size,), page_size, dtype=torch.int32, device=device\n    )\n    return kv_indptr, kv_indices, kv_last_page_len\n\n\ndef make_ragged_indptr(\n    seg_lens,\n    *,\n    device: str = \"cuda\",\n    dtype: torch.dtype = torch.int32,\n) -> torch.Tensor:\n    \"\"\"Return cumulative-sum ``indptr`` of length ``len(seg_lens)+1``.\n\n    ``seg_lens`` may be a list / tuple / 1-D tensor of segment lengths.\n    \"\"\"\n    if isinstance(seg_lens, torch.Tensor):\n        lens = seg_lens.to(device=device, dtype=dtype)\n    else:\n        lens = torch.tensor(list(seg_lens), dtype=dtype, device=device)\n    indptr = torch.zeros(lens.numel() + 1, dtype=dtype, device=device)\n    indptr[1:] = torch.cumsum(lens, dim=0).to(dtype)\n    return indptr\n\n\ndef make_uniform_qo_indptr(\n    batch_size: int,\n    qo_len: int,\n    *,\n    device: str = \"cuda\",\n) -> torch.Tensor:\n    \"\"\"Return ``[0, qo_len, 2*qo_len, ..., batch_size*qo_len]`` int32.\"\"\"\n    return torch.arange(batch_size + 1, dtype=torch.int32, device=device) * qo_len\n\n\ndef make_pos_ids(\n    nnz: int,\n    max_seq_len: Optional[int] = None,\n    *,\n    device: str = \"cuda\",\n) -> torch.Tensor:\n    \"\"\"Return ``[0, 1, ..., nnz-1] (% max_seq_len)`` as int32 on ``device``.\n\n    If ``max_seq_len`` is None, no wrapping is applied.\n    \"\"\"\n    pos = torch.arange(nnz, dtype=torch.int32, device=device)\n    if max_seq_len is not None:\n        pos = pos % max_seq_len\n    return pos\n\n\ndef make_rope_cos_sin_cache(\n    max_seq_len: int,\n    rope_dim: int,\n    *,\n    base: float = 1e4,\n    device: str = \"cuda\",\n    dtype: torch.dtype = torch.float32,\n) -> torch.Tensor:\n    \"\"\"Return concatenated ``[cos | sin]`` cache of shape ``[max_seq_len, rope_dim]``.\"\"\"\n    t = torch.arange(max_seq_len, dtype=torch.float32, device=device)\n    inv = 1.0 / (\n        base\n        ** (torch.arange(0, rope_dim, 2, dtype=torch.float32, device=device) / rope_dim)\n    )\n    freqs = t.unsqueeze(-1) * inv.unsqueeze(0)\n    cache = torch.cat([torch.cos(freqs), torch.sin(freqs)], dim=-1)\n    return cache.to(dtype)\n\n\ndef make_probs(\n    batch_size: int,\n    vocab_size: int,\n    *,\n    device: str = \"cuda\",\n    dtype: torch.dtype = torch.float32,\n) -> torch.Tensor:\n    \"\"\"Return a ``[batch_size, vocab_size]`` probability distribution.\n\n    Uses ``softmax(randn(...))`` so each row sums to 1.0. This mirrors the\n    pattern used throughout ``tests/utils/test_sampling.py``.\n    \"\"\"\n    return torch.softmax(\n        torch.randn(batch_size, vocab_size, dtype=torch.float32, device=device),\n        dim=-1,\n    ).to(dtype)\n\n\ndef make_logits(\n    batch_size: int,\n    vocab_size: int,\n    *,\n    device: str = \"cuda\",\n    dtype: torch.dtype = torch.float32,\n) -> torch.Tensor:\n    \"\"\"Return ``randn(batch_size, vocab_size)`` logits.\"\"\"\n    return torch.randn(batch_size, vocab_size, dtype=dtype, device=device)\n\n\ndef fp8_safe_randn(\n    *shape: int,\n    scale: float = 0.1,\n    device: str = \"cuda\",\n    dtype: torch.dtype = torch.bfloat16,\n) -> torch.Tensor:\n    \"\"\"``randn(*shape) * scale`` \u2014 keeps values in the FP8/FP4 representable range.\n\n    Tests for fp8/fp4 paths typically multiply ``randn`` by 0.1 to avoid\n    saturation when quantizing. Use this helper to mirror that convention.\n    \"\"\"\n    return (torch.randn(*shape, dtype=dtype, device=device) * scale).to(dtype)\n\n\ndef per_tensor_fp8_quantize(\n    x: torch.Tensor,\n    *,\n    fp8_dtype: torch.dtype = torch.float8_e4m3fn,\n) -> Tuple[torch.Tensor, torch.Tensor]:\n    \"\"\"Per-tensor FP8 quantization, mirroring ``tests/utils_fp8.py:to_float8``.\n\n    Returns ``(x_fp8, inv_scale)`` where ``inv_scale`` is the dequant\n    multiplier (``float \u2248 fp8 * inv_scale``).\n    \"\"\"\n    finfo = torch.finfo(fp8_dtype)\n    amax = x.abs().amax().clamp(min=1e-12)\n    scale = finfo.max / amax\n    x_q = (x.float() * scale).clamp(min=finfo.min, max=finfo.max).to(fp8_dtype)\n    return x_q, scale.float().reciprocal()\n\n\ndef fp8_block_quant_1d(\n    x_bf16: torch.Tensor,\n    block: int = 128,\n) -> Tuple[torch.Tensor, torch.Tensor]:\n    \"\"\"Quantize ``[T, H]`` activations into FP8 with per-``(token, block)``\n    column-block scales. Returns ``(x_fp8, scales)`` where\n    ``scales`` has shape ``[T, H // block]``.\n\n    Mirrors ``_fp8_block_quant_1d`` in\n    ``tests/moe/test_dpsk_fused_moe_fp8.py``.\n    \"\"\"\n    assert x_bf16.dim() == 2\n    T, H = x_bf16.shape\n    assert H % block == 0\n    nb = H // block\n    finfo = torch.finfo(torch.float8_e4m3fn)\n    max_fp8 = finfo.max\n    x_f32 = x_bf16.to(torch.float32)\n    x_fp8 = torch.empty((T, H), dtype=torch.float8_e4m3fn, device=x_bf16.device)\n    scales = torch.empty((T, nb), dtype=torch.float32, device=x_bf16.device)\n    for j in range(nb):\n        sl = slice(j * block, (j + 1) * block)\n        blk = x_f32[:, sl]\n        amax = torch.amax(torch.abs(blk), dim=1)\n        s = torch.where(amax > 0, amax / max_fp8, torch.ones_like(amax))\n        x_fp8[:, sl] = (blk / s.unsqueeze(1)).to(torch.float8_e4m3fn)\n        scales[:, j] = s\n    return x_fp8, scales\n\n\ndef fp8_block_quant_2d(\n    w_bf16: torch.Tensor,\n    block: int = 128,\n) -> Tuple[torch.Tensor, torch.Tensor]:\n    \"\"\"Quantize weights ``[..., R, C]`` with 2-D ``block \u00d7 block`` scales.\n\n    Returns ``(w_fp8, scales)`` where ``scales`` has shape\n    ``[..., R // block, C // block]``. Mirrors ``_fp8_block_quant_2d`` in\n    ``tests/moe/test_dpsk_fused_moe_fp8.py``.\n    \"\"\"\n    assert w_bf16.dim() >= 2\n    *prefix, R, C = w_bf16.shape\n    assert R % block == 0 and C % block == 0\n    nb_r, nb_c = R // block, C // block\n    finfo = torch.finfo(torch.float8_e4m3fn)\n    max_fp8 = finfo.max\n    w_f32 = w_bf16.to(torch.float32).contiguous()\n    prefix_ndim = len(prefix)\n    reshaped = w_f32.reshape(*prefix, nb_r, block, nb_c, block)\n    permute_dims = tuple(range(prefix_ndim)) + (\n        prefix_ndim,\n        prefix_ndim + 2,\n        prefix_ndim + 1,\n        prefix_ndim + 3,\n    )\n    blocks = reshaped.permute(permute_dims).contiguous()\n    amax = torch.amax(torch.abs(blocks), dim=(-1, -2))\n    scales = torch.where(\n        amax > 0, amax / max_fp8, torch.ones_like(amax, dtype=torch.float32)\n    )\n    q_blocks = (blocks / scales.unsqueeze(-1).unsqueeze(-1)).to(torch.float8_e4m3fn)\n    inv_permute = [0] * (prefix_ndim + 4)\n    for i, p in enumerate(permute_dims):\n        inv_permute[p] = i\n    w_fp8 = q_blocks.permute(*inv_permute).reshape(*prefix, R, C).contiguous()\n    return w_fp8, scales\n\n\n__all__ = [\n    \"make_paged_kv_indices\",\n    \"make_ragged_indptr\",\n    \"make_uniform_qo_indptr\",\n    \"make_pos_ids\",\n    \"make_rope_cos_sin_cache\",\n    \"make_probs\",\n    \"make_logits\",\n    \"fp8_safe_randn\",\n    \"per_tensor_fp8_quantize\",\n    \"fp8_block_quant_1d\",\n    \"fp8_block_quant_2d\",\n]\n\n# ----- init -----\ndef _top_k_varlen_init(\n    *,\n    batch_size: int,\n    max_seq_len: int = 8192,\n    top_k: int = 1024,\n    max_pages: int = 0,  # paged-output axis; the example never builds a page table\n    device: str = \"cuda\",\n    seed: int = 0,\n):\n    \"\"\"Build inputs for ``flashinfer.top_k_varlen`` (radix_cutlass backend, no pre_idx).\n\n    Uses the ``radix_cutlass`` (masked CUTLASS radix) backend so the example\n    runs on any GPU.\n    ``seq_lens`` is randomised in ``[top_k + 1, max_seq_len]`` to guarantee\n    that every row has at least ``top_k`` valid entries.\n    ``max_seq_len`` is padded to the next multiple of 8 (fp16/bf16 alignment).\n    \"\"\"\n    max_seq_len = (max_seq_len + 7) // 8 * 8\n    torch.manual_seed(seed)\n    logits = torch.randn(batch_size, max_seq_len, dtype=torch.bfloat16, device=device)\n    seq_lens = torch.randint(\n        top_k + 1, max_seq_len + 1, (batch_size,), dtype=torch.int32, device=device\n    )\n    return {\n        \"logits\": logits,\n        \"seq_lens\": seq_lens,\n        \"top_k\": top_k,\n        \"backend\": \"radix_cutlass\",\n    }\n"
+ }

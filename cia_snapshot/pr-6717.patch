@@ -1,0 +1,107 @@
+diff --git a/docs/api/comm.rst b/docs/api/comm.rst
+index 024c8611747..e34e902f1ff 100644
+--- a/docs/api/comm.rst
++++ b/docs/api/comm.rst
+@@ -606,9 +606,10 @@ Per-architecture row-count gates shape each call's host plan: on SM100 and
+ SM103 a call with at most 4096 rows per rank publishes one readiness word per
+ destination, and a call with at least 16384 rows per rank launches the producer
+ once per destination run of its tile table (the first launch carrying the
+-folded rendezvous); on SM90 a call with at least 16384 rows per rank runs the
+-persistent producer grid over every SM (no reserved SMs) and the other two gates
+-are off; on SM107 every gate is off.  The environment variable ``FLASHINFER_QKV_EXCHANGE_SHAPE_GATES``
++folded rendezvous); on SM90 a call with at most 4096 rows per rank publishes one
++readiness word per destination, a call with at least 16384 rows per rank runs the
++persistent producer grid over every SM (no reserved SMs), and the per-destination
++launch gate is off; on SM107 every gate is off.  The environment variable ``FLASHINFER_QKV_EXCHANGE_SHAPE_GATES``
+ (``auto`` / ``off`` /
+ ``words_capacity_small_m=N,reserved_sms_large_m=N,per_dest_large_m=N``)
+ overrides them per session, rank-uniformly; ``describe()`` reports the resolved
+diff --git a/flashinfer/comm/cake_qkv_exchange_plan.py b/flashinfer/comm/cake_qkv_exchange_plan.py
+index 69c31c7b560..1ab0e839806 100644
+--- a/flashinfer/comm/cake_qkv_exchange_plan.py
++++ b/flashinfer/comm/cake_qkv_exchange_plan.py
+@@ -127,8 +127,8 @@
+ # instead of one persistent grid.  ``0`` = the gate never fires.  Every gate is
+ # inclusive at its threshold and changes neither the tile table nor the stored
+ # bits.  Measured per architecture: SM100 / SM103 ship the small-row word gate
+-# and the per-destination launch gate, SM90 ships the large-row reserved-SM gate,
+-# SM107 ships none;
++# and the per-destination launch gate, SM90 ships the small-row word gate and the
++# large-row reserved-SM gate, SM107 ships none;
+ # ``FLASHINFER_QKV_EXCHANGE_SHAPE_GATES`` (see the Cake backend) overrides a
+ # session's gates in either direction.
+ SHAPE_GATE_NAMES: tuple[str, ...] = (
+@@ -138,8 +138,10 @@
+ )
+ SHAPE_GATE_OFF = 0
+ SHAPE_GATE_DEFAULT_BY_ARCH: dict[str, dict[str, int]] = {
++    # SM90: the small-row word gate (4096) and the large-row reserved-SM gate (16384) on every group size; the
++    # per-destination launch gate off.
+     "sm_90a": {
+-        "words_capacity_small_m": SHAPE_GATE_OFF,
++        "words_capacity_small_m": 4096,
+         "reserved_sms_large_m": 16384,
+         "per_dest_large_m": SHAPE_GATE_OFF,
+     },
+diff --git a/flashinfer/comm/qkv_norm_rope_exchange_overlap.py b/flashinfer/comm/qkv_norm_rope_exchange_overlap.py
+index 7a9f0f270f8..b8465ec12e1 100644
+--- a/flashinfer/comm/qkv_norm_rope_exchange_overlap.py
++++ b/flashinfer/comm/qkv_norm_rope_exchange_overlap.py
+@@ -324,8 +324,9 @@ class QkvNormRopeExchangeOverlap:
+     The Cake backend also applies per-architecture row-count gates to each call's host plan
+     (``cake_qkv_exchange_plan.SHAPE_GATE_DEFAULT_BY_ARCH``; SM100 / SM103: a call with ``batch * s_local <= 4096``
+     rows publishes one readiness word per destination, a call with ``>= 16384`` rows launches the producer once per
+-    destination run; SM90: a call with ``>= 16384`` rows runs the persistent producer grid over every SM --
+-    ``reserved_sms_large_m = 16384``, no reserved SMs --, the other two gates off; SM107: every gate off).  The
++    destination run; SM90: a call with ``<= 4096`` rows publishes one readiness word per destination and a call
++    with ``>= 16384`` rows runs the persistent producer grid over every SM -- ``reserved_sms_large_m = 16384``, no
++    reserved SMs --, the per-destination launch gate off; SM107: every gate off).  The
+     environment variable
+     ``FLASHINFER_QKV_EXCHANGE_SHAPE_GATES`` (``auto`` / ``off`` /
+     ``words_capacity_small_m=N,reserved_sms_large_m=N,per_dest_large_m=N``, ``0`` = never) overrides them for a
+diff --git a/tests/comm/test_qkv_norm_rope_exchange_overlap.py b/tests/comm/test_qkv_norm_rope_exchange_overlap.py
+index 53b917b1c2a..b0bb7601273 100644
+--- a/tests/comm/test_qkv_norm_rope_exchange_overlap.py
++++ b/tests/comm/test_qkv_norm_rope_exchange_overlap.py
+@@ -322,9 +322,9 @@ def test_fold_barrier_resolution(monkeypatch):
+ 
+ def test_shape_gate_default_table():
+     """The row-count gates per architecture: one readiness word per destination for calls of at most 4096 rows and one
+-    producer launch per destination run for calls of at least 16384 rows on SM100 / SM103; on SM90 the persistent
+-    producer grid over every SM (no reserved SMs) for calls of at least 16384 rows and the other two gates off; on
+-    SM107 every gate is off."""
++    producer launch per destination run for calls of at least 16384 rows on SM100 / SM103; on SM90 one readiness word
++    per destination for calls of at most 4096 rows, the persistent producer grid over every SM (no reserved SMs) for
++    calls of at least 16384 rows, and the per-destination launch gate off; on SM107 every gate is off."""
+ 
+     assert plans.SHAPE_GATE_NAMES == (
+         "words_capacity_small_m",
+@@ -334,7 +334,7 @@ def test_shape_gate_default_table():
+     assert plans.SHAPE_GATE_OFF == 0 and plans.RESERVED_SMS == 2
+     assert plans.SHAPE_GATE_DEFAULT_BY_ARCH == {
+         "sm_90a": {
+-            "words_capacity_small_m": 0,
++            "words_capacity_small_m": 4096,
+             "reserved_sms_large_m": 16384,
+             "per_dest_large_m": 0,
+         },
+@@ -401,11 +401,16 @@ def test_shape_gate_default_table():
+     assert plans.gate_rows(blackwell, 16384).words_capacity_per_dest is None
+     assert plans.gate_rows(blackwell, 16384).reserved_sms is None
+     hopper = plans.default_shape_gates("sm_90a")
+-    for rows in (128, 4096, 16383):
++    # SM90 ships the small-row word gate too (one readiness word per destination).
++    for rows in (128, 4096):
+         verdict = plans.gate_rows(hopper, rows)
+-        assert verdict.fired == () and verdict.producer_launches == "persistent"
+-        assert verdict.words_capacity_per_dest is None and verdict.reserved_sms is None
++        assert verdict.fired == ("words_capacity_small_m",)
++        assert verdict.producer_launches == "persistent"
++        assert verdict.words_capacity_per_dest == 1 and verdict.reserved_sms is None
+         assert verdict.summary()["rows"] == rows
++    verdict = plans.gate_rows(hopper, 16383)
++    assert verdict.fired == () and verdict.producer_launches == "persistent"
++    assert verdict.words_capacity_per_dest is None and verdict.reserved_sms is None
+     for rows in (16384, 65536):
+         verdict = plans.gate_rows(hopper, rows)
+         assert verdict.fired == ("reserved_sms_large_m",)

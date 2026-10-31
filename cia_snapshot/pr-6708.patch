@@ -1,0 +1,884 @@
+diff --git a/benchmarks/bench_cake_sparse_mla_sm120_dsv4_nvfp4_prefill.py b/benchmarks/bench_cake_sparse_mla_sm120_dsv4_nvfp4_prefill.py
+index 24f6aadcbd1..0108e29521b 100644
+--- a/benchmarks/bench_cake_sparse_mla_sm120_dsv4_nvfp4_prefill.py
++++ b/benchmarks/bench_cake_sparse_mla_sm120_dsv4_nvfp4_prefill.py
+@@ -26,8 +26,10 @@
+ 
+ * ``sparse`` -- ``SparseMLASm120Wrapper(kv_cache_format="nvfp4", backend="sparse")``;
+ * ``cake`` -- the same wrapper with ``backend="cake"`` (decode / prefill crossover);
+-* ``cake-prefill`` -- the low-level Cake prefill entry (``--head-tiles`` /
+-  ``--persistent`` override the planner);
++* ``cake-prefill`` -- the low-level Cake prefill entry (``--head-tiles``
++  overrides the planner's head-tile count; the ``plan`` column shows the
++  resolved ``ht<head_tiles>-st<num_stages>`` plus ``-qef`` / ``-hbf`` when the
++  planner enables the query L2 evict-first policy / the head-blocks-first grid);
+ * ``cake-decode`` -- the low-level Cake split decode with caller-owned scratch.
+ 
+ Each row prints the GPU median (CUPTI-timed, cold L2 between repetitions), the
+@@ -48,7 +50,6 @@
+ from flashinfer.mla._sparse_mla_sm120._cake_dsv4_nvfp4 import (
+     cake_sparse_mla_sm120_dsv4_nvfp4_decode,
+     cake_sparse_mla_sm120_dsv4_nvfp4_num_chunks,
+-    cake_sparse_mla_sm120_dsv4_nvfp4_plan_prefill,
+     cake_sparse_mla_sm120_dsv4_nvfp4_prefill,
+     cake_sparse_mla_sm120_dsv4_nvfp4_select_kernel,
+ )
+@@ -144,12 +145,6 @@ def main() -> None:
+         default=None,
+         help="cake-prefill: head tiles per CTA (1, 2, 4); default = planner",
+     )
+-    parser.add_argument(
+-        "--persistent",
+-        choices=("auto", "on", "off"),
+-        default="auto",
+-        help="cake-prefill: persistent CTAs; default = planner",
+-    )
+     parser.add_argument("--warmup-ms", type=int, default=50)
+     parser.add_argument("--measure-ms", type=int, default=300)
+     parser.add_argument("--seed", type=int, default=42)
+@@ -264,20 +259,25 @@ def run() -> None:
+                                 )
+ 
+                         elif backend == "cake-prefill":
+-                            head_tiles, persistent = (
+-                                cake_sparse_mla_sm120_dsv4_nvfp4_plan_prefill(
+-                                    num_tokens=num_tokens,
+-                                    num_heads=num_heads,
+-                                    topk=topk,
+-                                    extra_topk=args.extra_topk,
+-                                    num_sms=num_sms,
+-                                )
++                            resolved = cake_sparse_mla_sm120_dsv4_nvfp4_prefill(
++                                q,
++                                cache,
++                                indices,
++                                output,
++                                out_lse,
++                                sm_scale,
++                                topk_length=lengths,
++                                attn_sink=sink,
++                                extra_kv_cache=extra_cache,
++                                extra_indices=extra_indices,
++                                extra_topk_length=extra_lengths,
++                                head_tiles=args.head_tiles,
+                             )
+-                            if args.head_tiles is not None:
+-                                head_tiles = args.head_tiles
+-                            if args.persistent != "auto":
+-                                persistent = args.persistent == "on"
+-                            plan = f"ht{head_tiles}{'-pers' if persistent else ''}"
++                            plan = "ht{head_tiles}-st{num_stages}".format(**resolved)
++                            if resolved["q_evict_first"]:
++                                plan += "-qef"
++                            if resolved["grid_head_blocks_first"]:
++                                plan += "-hbf"
+ 
+                             def run() -> None:
+                                 cake_sparse_mla_sm120_dsv4_nvfp4_prefill(
+@@ -292,8 +292,7 @@ def run() -> None:
+                                     extra_kv_cache=extra_cache,
+                                     extra_indices=extra_indices,
+                                     extra_topk_length=extra_lengths,
+-                                    head_tiles=head_tiles,
+-                                    persistent=persistent,
++                                    head_tiles=args.head_tiles,
+                                 )
+ 
+                         else:
+diff --git a/csrc/cake_dsv4/README.md b/csrc/cake_dsv4/README.md
+index 9b3d81ce1bc..303061e510c 100644
+--- a/csrc/cake_dsv4/README.md
++++ b/csrc/cake_dsv4/README.md
+@@ -91,14 +91,14 @@ tracker: flashinfer#4254):
+   over one shared candidate gather);
+ * **prefill** -- one translation unit per head count 16 .. 128,
+   `cake_sparse_mla_dsv4_nvfp4_prefill_h<N>.cu`, with one kernel per (head tiles
+-  x single / dual cache x one-item / persistent CTAs): a prefill CTA holds
++  x single / dual cache x cp.async ring depth): a prefill CTA holds
+   `16 * head_tiles` heads of one token (1 tile always, 2 for head counts
+   divisible by 32, 4 for head counts divisible by 64) and runs *all* of the
+   token's 64-candidate chunks (at most 16, so `topk + extra_topk <= 1024`)
+-  with a direct epilogue -- no split scratch, no merge launch. The persistent
+-  form launches `min(items, SMs)` CTAs that walk the (token, head block) items
+-  with a grid stride while the IO warps prefetch and quantize the next item's
+-  Q.
++  with a direct epilogue -- no split scratch, no merge launch. The gather ring
++  holds two chunks; the one-tile instance also ships a three-stage form. The
++  launch runs one CTA per (token, head block) item, token-major or head
++  blocks first, and takes the query L2 policy as a kernel argument.
+ 
+ Both share the TVM-FFI binding `cake_sparse_mla_dsv4_nvfp4_binding.cu`
+ (entries `cake_sparse_mla_sm120_dsv4_nvfp4_decode` and
+@@ -136,22 +136,37 @@ candidates always split) mirror the generating kernel module's launcher;
+ `head_tiles` / `num_splits` on the low-level decode entry override them.
+ `backend="auto"` keeps the hand-written SM120 kernels.
+ 
+-For several query tokens the same entry points pick between the decode and
+-the prefill kernel through
+-`flashinfer.mla.cake_sparse_mla_sm120_dsv4_nvfp4_select_kernel` (one token,
+-head counts without a prefill instance, more than 16 chunks and candidate
+-counts that are not multiples of 64 always decode; wide head counts (>= 64)
+-decode up to 16 tokens, or up to 32 tokens with at most 128 candidates;
+-narrower head counts decode up to 64 tokens with at least 512 candidates). The
+-prefill planner `cake_sparse_mla_sm120_dsv4_nvfp4_plan_prefill` returns
+-`(head_tiles, persistent)`: two tiles below 128 tokens for head counts >= 64
+-that are divisible by 32, otherwise the largest instance (one tile for 16 / 32
+-/ 48 heads), persistent CTAs once the one-item grid covers two waves of SMs.
+-These thresholds are provisional until the paired decode / prefill sweeps on
+-RTX PRO 6000 Blackwell and RTX 5090 land. The low-level entry
++At every token count the same entry points pick between the decode and the
++prefill kernel through
++`flashinfer.mla.cake_sparse_mla_sm120_dsv4_nvfp4_select_kernel`, keyed on
++`(num_tokens, num_heads, topk, extra_topk, num_sms)`: head counts without a
++prefill instance (8) and more than 16 chunks (over 1024 candidates) always
++decode; a partial 64-wide chunk is served by the prefill's masked tail. With
++`candidates = topk + extra_topk`, wide head counts (>= 64) decode up to 8
++tokens at 512 and more candidates and up to 16 below; narrower head counts
++decode up to 8 tokens on devices with >= 180 SMs (RTX PRO 6000 Blackwell:
++188) and up to 32 on smaller ones (RTX 5090: 170) at 512 and more candidates,
++and run the prefill at every token count below 512, one token included. The
++thresholds were measured by paired decode / prefill sweeps on both SKUs and
++live in `_PREFILL_POLICY` (`flashinfer/mla/_sparse_mla_sm120/_cake_dsv4_nvfp4.py`);
++the CPU tests in `tests/attention/test_cake_sparse_mla_sm120_dsv4_nvfp4_prefill.py`
++pin them.
++
++The prefill planner `cake_sparse_mla_sm120_dsv4_nvfp4_plan_prefill` returns
++the `head_tiles` int: for head counts >= 64 that are divisible by 32, two
++tiles up to 96 tokens (128 tokens for 128 heads with 512 .. 639 candidates on
++the >= 180-SM die) and the largest instance above; every other head count
++takes its largest instance at every token count (two tiles for 32 heads, one
++for 16 / 48 / 80 / 112). Three companions fix the rest of the launch:
++`..._plan_prefill_stages` (cp.async ring depth: 3 for the one-tile instance
++from 8 chunks per token, except dual-cache lists below 16 chunks and 512
++tokens; 2 otherwise), `..._plan_prefill_q_evict_first` (L2 evict-first on the
++query loads from 512 tokens) and `..._plan_prefill_grid_head_blocks_first`
++(head blocks first for lists of at most 4 chunks and at most 65535 tokens,
++the CUDA grid.y limit). The low-level entry
+ `flashinfer.mla.cake_sparse_mla_sm120_dsv4_nvfp4_prefill` runs the prefill
+-directly (caller-owned `output` / `out_lse`, `head_tiles` / `persistent`
+-overrides, no scratch):
++directly (caller-owned `output` / `out_lse`, optional `head_tiles` override,
++no scratch) and returns the resolved plan:
+ 
+ ```python
+ from flashinfer.mla import cake_sparse_mla_sm120_dsv4_nvfp4_prefill
+@@ -161,7 +176,9 @@ plan = cake_sparse_mla_sm120_dsv4_nvfp4_prefill(
+     topk_length=lengths, attn_sink=sink,
+     extra_kv_cache=compressed_cache, extra_indices=extra_indices,
+ )
+-# plan == {"head_tiles": 4, "persistent": 1, "num_ctas": <SMs>} for 128 heads x 2048 tokens
++# 128 heads x 2048 tokens with 512 + 128 candidates (10 chunks):
++# plan == {"head_tiles": 4, "num_ctas": 4096, "num_stages": 2,
++#          "q_evict_first": True, "grid_head_blocks_first": False}
+ ```
+ 
+ ```bash
+@@ -248,7 +265,9 @@ is launched as a programmatic dependent of the decode grid when `enable_pdl`
+ is set (`None` = device default; the merge waits for the decode's memory before
+ its first load, so both settings are bitwise identical). The names are distinct
+ from the NVFP4 family above so the two generated kernel sets never share a
+-translation unit, header, manifest or JIT module name. Without the manifest,
++translation unit, kernel header, manifest or JIT module name (the two host
++bindings share only the hand-written tensor checks in
++`cake_sparse_mla_sm120_host_checks.h`). Without the manifest,
+ `flashinfer.mla.cake_sparse_mla_sm120_dsv41_mixed_format_info()["kernels_available"]`
+ is `False`, the planners run on the provisional geometry and the first launch
+ raises `FileNotFoundError` naming the expected manifest location.
+diff --git a/csrc/cake_dsv4/sm_120a/cake_sparse_mla_dsv41_mixed_binding.cu b/csrc/cake_dsv4/sm_120a/cake_sparse_mla_dsv41_mixed_binding.cu
+index 414f2c41824..c1c837bd8c1 100644
+--- a/csrc/cake_dsv4/sm_120a/cake_sparse_mla_dsv41_mixed_binding.cu
++++ b/csrc/cake_dsv4/sm_120a/cake_sparse_mla_dsv41_mixed_binding.cu
+@@ -66,43 +66,7 @@ constexpr MergeBody kMergeBodies[kNumMergeBodies] = {
+     CAKE_SM120_DSV41_MIXED_FOR_EACH_MERGE_BODY(CAKE_SM120_DSV41_MIXED_MERGE_BODY)};
+ #undef CAKE_SM120_DSV41_MIXED_MERGE_BODY
+ 
+-void CheckDevice(const TensorView& tensor, const char* name, DLDevice device, int64_t alignment) {
+-  TVM_FFI_CHECK(tensor.device().device_type == kDLCUDA, ValueError) << name << " must be a CUDA tensor";
+-  TVM_FFI_CHECK(tensor.device().device_id == device.device_id, ValueError)
+-      << name << " must be on the same CUDA device as q";
+-  TVM_FFI_CHECK(reinterpret_cast<uintptr_t>(tensor.data_ptr()) % alignment == 0, ValueError)
+-      << name << " must be " << alignment << "-byte aligned";
+-}
+-
+-void CheckDtype(const TensorView& tensor, const char* name, DLDataType dtype, const char* dtype_name) {
+-  TVM_FFI_CHECK(encode_dlpack_dtype(tensor.dtype()) == encode_dlpack_dtype(dtype), ValueError)
+-      << name << " must be " << dtype_name;
+-}
+-
+-void CheckRows(const TensorView& tensor, const char* name, int64_t tokens, int64_t heads, int64_t dim, DLDevice device) {
+-  CheckDevice(tensor, name, device, 16);
+-  CheckDtype(tensor, name, dl_bfloat16, "bfloat16");
+-  TVM_FFI_CHECK(tensor.ndim() == 3 && tensor.size(0) == tokens && tensor.size(1) == heads && tensor.size(2) == dim,
+-                ValueError)
+-      << name << " must have shape [" << tokens << ", " << heads << ", " << dim << "]";
+-  TVM_FFI_CHECK(tensor.IsContiguous(), ValueError) << name << " must be contiguous";
+-}
+-
+-void CheckLse(const TensorView& tensor, const char* name, int64_t tokens, int64_t heads, DLDevice device) {
+-  CheckDevice(tensor, name, device, 4);
+-  CheckDtype(tensor, name, dl_float32, "float32");
+-  TVM_FFI_CHECK(tensor.ndim() == 2 && tensor.size(0) == tokens && tensor.size(1) == heads, ValueError)
+-      << name << " must have shape [" << tokens << ", " << heads << "]";
+-  TVM_FFI_CHECK(tensor.IsContiguous(), ValueError) << name << " must be contiguous";
+-}
+-
+-void CheckIndices(const TensorView& tensor, const char* name, int64_t tokens, DLDevice device) {
+-  CheckDevice(tensor, name, device, 4);
+-  CheckDtype(tensor, name, dl_int32, "int32");
+-  TVM_FFI_CHECK(tensor.ndim() == 2 && tensor.size(0) == tokens && tensor.size(1) >= 1, ValueError)
+-      << name << " must have shape [" << tokens << ", topk] with topk >= 1";
+-  TVM_FFI_CHECK(tensor.IsContiguous(), ValueError) << name << " must be contiguous";
+-}
++#include "cake_sparse_mla_sm120_host_checks.h"
+ 
+ // The caches arrive as flat uint8 views over the pool's storage span (the Python wrapper flattens the
+ // [pages, (1,) page_size, (1,) bytes] layouts and padded page strides); the page geometry is explicit.
+diff --git a/csrc/cake_dsv4/sm_120a/cake_sparse_mla_dsv4_nvfp4_binding.cu b/csrc/cake_dsv4/sm_120a/cake_sparse_mla_dsv4_nvfp4_binding.cu
+index c30c3fc1013..c4ff19506f3 100644
+--- a/csrc/cake_dsv4/sm_120a/cake_sparse_mla_dsv4_nvfp4_binding.cu
++++ b/csrc/cake_dsv4/sm_120a/cake_sparse_mla_dsv4_nvfp4_binding.cu
+@@ -115,43 +115,7 @@ void ConfigureOnce(int device, const HeadEntry& entry) {
+   configured.emplace_back(device, entry.heads);
+ }
+ 
+-void CheckDevice(const TensorView& tensor, const char* name, DLDevice device, int64_t alignment) {
+-  TVM_FFI_CHECK(tensor.device().device_type == kDLCUDA, ValueError) << name << " must be a CUDA tensor";
+-  TVM_FFI_CHECK(tensor.device().device_id == device.device_id, ValueError)
+-      << name << " must be on the same CUDA device as q";
+-  TVM_FFI_CHECK(reinterpret_cast<uintptr_t>(tensor.data_ptr()) % alignment == 0, ValueError)
+-      << name << " must be " << alignment << "-byte aligned";
+-}
+-
+-void CheckDtype(const TensorView& tensor, const char* name, DLDataType dtype, const char* dtype_name) {
+-  TVM_FFI_CHECK(encode_dlpack_dtype(tensor.dtype()) == encode_dlpack_dtype(dtype), ValueError)
+-      << name << " must be " << dtype_name;
+-}
+-
+-void CheckRows(const TensorView& tensor, const char* name, int64_t tokens, int64_t heads, int64_t dim, DLDevice device) {
+-  CheckDevice(tensor, name, device, 16);
+-  CheckDtype(tensor, name, dl_bfloat16, "bfloat16");
+-  TVM_FFI_CHECK(tensor.ndim() == 3 && tensor.size(0) == tokens && tensor.size(1) == heads && tensor.size(2) == dim,
+-                ValueError)
+-      << name << " must have shape [" << tokens << ", " << heads << ", " << dim << "]";
+-  TVM_FFI_CHECK(tensor.IsContiguous(), ValueError) << name << " must be contiguous";
+-}
+-
+-void CheckLse(const TensorView& tensor, const char* name, int64_t tokens, int64_t heads, DLDevice device) {
+-  CheckDevice(tensor, name, device, 4);
+-  CheckDtype(tensor, name, dl_float32, "float32");
+-  TVM_FFI_CHECK(tensor.ndim() == 2 && tensor.size(0) == tokens && tensor.size(1) == heads, ValueError)
+-      << name << " must have shape [" << tokens << ", " << heads << "]";
+-  TVM_FFI_CHECK(tensor.IsContiguous(), ValueError) << name << " must be contiguous";
+-}
+-
+-void CheckIndices(const TensorView& tensor, const char* name, int64_t tokens, DLDevice device) {
+-  CheckDevice(tensor, name, device, 4);
+-  CheckDtype(tensor, name, dl_int32, "int32");
+-  TVM_FFI_CHECK(tensor.ndim() == 2 && tensor.size(0) == tokens && tensor.size(1) >= 1, ValueError)
+-      << name << " must have shape [" << tokens << ", topk] with topk >= 1";
+-  TVM_FFI_CHECK(tensor.IsContiguous(), ValueError) << name << " must be contiguous";
+-}
++#include "cake_sparse_mla_sm120_host_checks.h"
+ 
+ // The caches arrive as flat uint8 views over the pool's storage span (the Python wrapper flattens the
+ // [pages, (1,) page_size, (1,) 384] layouts and padded page strides); the page geometry is explicit.
+diff --git a/csrc/cake_dsv4/sm_120a/cake_sparse_mla_dsv4_nvfp4_manifest.json b/csrc/cake_dsv4/sm_120a/cake_sparse_mla_dsv4_nvfp4_manifest.json
+index 3ecdaf4967c..b8e8f059f6c 100644
+--- a/csrc/cake_dsv4/sm_120a/cake_sparse_mla_dsv4_nvfp4_manifest.json
++++ b/csrc/cake_dsv4/sm_120a/cake_sparse_mla_dsv4_nvfp4_manifest.json
+@@ -27,21 +27,6 @@
+     "lse_scale",
+     "write_direct"
+   ],
+-  "decode_smem_bytes": 90240,
+-  "decode_smem_bytes_two_tile": 100480,
+-  "decode_sources": [
+-    "cake_sparse_mla_dsv4_nvfp4_h112.cu",
+-    "cake_sparse_mla_dsv4_nvfp4_h128.cu",
+-    "cake_sparse_mla_dsv4_nvfp4_h16.cu",
+-    "cake_sparse_mla_dsv4_nvfp4_h32.cu",
+-    "cake_sparse_mla_dsv4_nvfp4_h48.cu",
+-    "cake_sparse_mla_dsv4_nvfp4_h64.cu",
+-    "cake_sparse_mla_dsv4_nvfp4_h8.cu",
+-    "cake_sparse_mla_dsv4_nvfp4_h80.cu",
+-    "cake_sparse_mla_dsv4_nvfp4_h96.cu"
+-  ],
+-  "decode_sources_kept": false,
+-  "decode_threads": 320,
+   "entry": "cake_sparse_mla_sm120_dsv4_nvfp4_decode",
+   "family": "cake_sparse_mla_sm120_dsv4_nvfp4",
+   "generated_at": "2026-10-03T21:16:37Z",
+@@ -75,18 +60,6 @@
+     "scratch_split_stride",
+     "lse_scale"
+   ],
+-  "merge_threads": 256,
+-  "module_head_counts": [
+-    8,
+-    16,
+-    32,
+-    48,
+-    64,
+-    80,
+-    96,
+-    112,
+-    128
+-  ],
+   "prefill_entry": "cake_sparse_mla_sm120_dsv4_nvfp4_prefill",
+   "prefill_head_counts": [
+     16,
+@@ -132,7 +105,6 @@
+   },
+   "prefill_kernel_commit": "917e54848e82bcb5c39db366caf2ec1acfa27b48",
+   "prefill_max_chunks": 16,
+-  "prefill_min_blocks_per_sm": 1,
+   "prefill_params": [
+     "q",
+     "kv_cache",
+@@ -168,25 +140,6 @@
+       2
+     ]
+   },
+-  "prefill_smem_bytes": {
+-    "1": 73856,
+-    "2": 81536,
+-    "4": 96896
+-  },
+-  "prefill_smem_bytes_three_stages": {
+-    "1": 98688
+-  },
+-  "prefill_sources": [
+-    "cake_sparse_mla_dsv4_nvfp4_prefill_h112.cu",
+-    "cake_sparse_mla_dsv4_nvfp4_prefill_h128.cu",
+-    "cake_sparse_mla_dsv4_nvfp4_prefill_h16.cu",
+-    "cake_sparse_mla_dsv4_nvfp4_prefill_h32.cu",
+-    "cake_sparse_mla_dsv4_nvfp4_prefill_h48.cu",
+-    "cake_sparse_mla_dsv4_nvfp4_prefill_h64.cu",
+-    "cake_sparse_mla_dsv4_nvfp4_prefill_h80.cu",
+-    "cake_sparse_mla_dsv4_nvfp4_prefill_h96.cu"
+-  ],
+-  "prefill_threads": 384,
+   "sources": [
+     "cake_sparse_mla_dsv4_nvfp4_binding.cu",
+     "cake_sparse_mla_dsv4_nvfp4_h112.cu",
+diff --git a/csrc/cake_dsv4/sm_120a/cake_sparse_mla_sm120_host_checks.h b/csrc/cake_dsv4/sm_120a/cake_sparse_mla_sm120_host_checks.h
+new file mode 100644
+index 00000000000..c15e566dfa3
+--- /dev/null
++++ b/csrc/cake_dsv4/sm_120a/cake_sparse_mla_sm120_host_checks.h
+@@ -0,0 +1,67 @@
++/*
++ * Copyright (c) 2026 by FlashInfer team.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *   http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++// clang-format off
++// Tensor checks shared by the Cake SM120 sparse-MLA host bindings
++// (cake_sparse_mla_dsv4_nvfp4_binding.cu and cake_sparse_mla_dsv41_mixed_binding.cu).
++//
++// Verbatim fragment, not a free-standing header: each binding includes it from inside its anonymous
++// namespace, after "tvm_ffi_utils.h" (TensorView, DLDevice, DLDataType, the dl_* dtype constants,
++// encode_dlpack_dtype, TVM_FFI_CHECK) and after the family's *_kernels.h, at the exact position where
++// these definitions used to stand.  It therefore opens no namespace and includes nothing itself; the
++// preprocessed text of each binding is unchanged apart from line markers.  The messages are those of
++// the sparse-MLA bindings (the reference tensor is q); the RoPE-insert binding keeps its own
++// CheckDevice (reference tensor kv).  CheckCache (page payload per family) and LengthPointer stay in
++// the bindings.
++#pragma once
++
++void CheckDevice(const TensorView& tensor, const char* name, DLDevice device, int64_t alignment) {
++  TVM_FFI_CHECK(tensor.device().device_type == kDLCUDA, ValueError) << name << " must be a CUDA tensor";
++  TVM_FFI_CHECK(tensor.device().device_id == device.device_id, ValueError)
++      << name << " must be on the same CUDA device as q";
++  TVM_FFI_CHECK(reinterpret_cast<uintptr_t>(tensor.data_ptr()) % alignment == 0, ValueError)
++      << name << " must be " << alignment << "-byte aligned";
++}
++
++void CheckDtype(const TensorView& tensor, const char* name, DLDataType dtype, const char* dtype_name) {
++  TVM_FFI_CHECK(encode_dlpack_dtype(tensor.dtype()) == encode_dlpack_dtype(dtype), ValueError)
++      << name << " must be " << dtype_name;
++}
++
++void CheckRows(const TensorView& tensor, const char* name, int64_t tokens, int64_t heads, int64_t dim, DLDevice device) {
++  CheckDevice(tensor, name, device, 16);
++  CheckDtype(tensor, name, dl_bfloat16, "bfloat16");
++  TVM_FFI_CHECK(tensor.ndim() == 3 && tensor.size(0) == tokens && tensor.size(1) == heads && tensor.size(2) == dim,
++                ValueError)
++      << name << " must have shape [" << tokens << ", " << heads << ", " << dim << "]";
++  TVM_FFI_CHECK(tensor.IsContiguous(), ValueError) << name << " must be contiguous";
++}
++
++void CheckLse(const TensorView& tensor, const char* name, int64_t tokens, int64_t heads, DLDevice device) {
++  CheckDevice(tensor, name, device, 4);
++  CheckDtype(tensor, name, dl_float32, "float32");
++  TVM_FFI_CHECK(tensor.ndim() == 2 && tensor.size(0) == tokens && tensor.size(1) == heads, ValueError)
++      << name << " must have shape [" << tokens << ", " << heads << "]";
++  TVM_FFI_CHECK(tensor.IsContiguous(), ValueError) << name << " must be contiguous";
++}
++
++void CheckIndices(const TensorView& tensor, const char* name, int64_t tokens, DLDevice device) {
++  CheckDevice(tensor, name, device, 4);
++  CheckDtype(tensor, name, dl_int32, "int32");
++  TVM_FFI_CHECK(tensor.ndim() == 2 && tensor.size(0) == tokens && tensor.size(1) >= 1, ValueError)
++      << name << " must have shape [" << tokens << ", topk] with topk >= 1";
++  TVM_FFI_CHECK(tensor.IsContiguous(), ValueError) << name << " must be contiguous";
++}
++// clang-format on
+diff --git a/docs/api/attention.rst b/docs/api/attention.rst
+index f578d9a5a99..3621e61f0e9 100644
+--- a/docs/api/attention.rst
++++ b/docs/api/attention.rst
+@@ -250,10 +250,10 @@ PageAttention for MLA
+ 
+ .. note::
+ 
+-    With ``backend="cake"`` on SM120/SM121 (``kv_cache_format="nvfp4"``), one
+-    query token runs the Cake split decode kernel and several tokens run the
+-    decode or the single-launch prefill kernel as chosen by
+-    ``cake_sparse_mla_sm120_dsv4_nvfp4_select_kernel`` (DeepSeek-V4 sparse MLA
++    With ``backend="cake"`` on SM120/SM121 (``kv_cache_format="nvfp4"``), every
++    call runs the Cake split decode kernel or the single-launch prefill kernel
++    as chosen by ``cake_sparse_mla_sm120_dsv4_nvfp4_select_kernel`` from the
++    token, head and candidate counts and the SM count (DeepSeek-V4 sparse MLA
+     SM120 tracker: flashinfer#4254).
+ 
+ .. note::
+diff --git a/flashinfer/jit/cake_sparse_mla_sm120_dsv41_mixed.py b/flashinfer/jit/cake_sparse_mla_sm120_dsv41_mixed.py
+index 0fdd2b58264..4b60acb33d1 100644
+--- a/flashinfer/jit/cake_sparse_mla_sm120_dsv41_mixed.py
++++ b/flashinfer/jit/cake_sparse_mla_sm120_dsv41_mixed.py
+@@ -29,7 +29,8 @@
+ 
+ # Family name of the generated DeepSeek-V4.1 mixed-cache (528 B FP8 main + 288 B V41_FP4 extra, BF16 Q)
+ # sparse-MLA decode kernels. Distinct from ``cake_sparse_mla_dsv4_nvfp4`` (the 384 B NVFP4 family) so the
+-# two generated kernel sets never share a translation unit, header, manifest or JIT module name.
++# two generated kernel sets never share a translation unit, kernel header, manifest or JIT module name
++# (the two host bindings share only the hand-written tensor checks in cake_sparse_mla_sm120_host_checks.h).
+ _FAMILY = "cake_sparse_mla_dsv41_mixed"
+ _SOURCE_SUBDIR = Path("cake_dsv4") / "sm_120a"
+ _MANIFEST_NAME = f"{_FAMILY}_manifest.json"
+diff --git a/flashinfer/mla/_sparse_mla_sm120/_cake_dsv4_nvfp4.py b/flashinfer/mla/_sparse_mla_sm120/_cake_dsv4_nvfp4.py
+index 282a09ebd54..48e66cfc039 100644
+--- a/flashinfer/mla/_sparse_mla_sm120/_cake_dsv4_nvfp4.py
++++ b/flashinfer/mla/_sparse_mla_sm120/_cake_dsv4_nvfp4.py
+@@ -85,8 +85,13 @@ def _manifest() -> dict:
+     return cake_sparse_mla_sm120_dsv4_nvfp4_manifest()
+ 
+ 
++@functools.cache
+ def cake_sparse_mla_sm120_dsv4_nvfp4_format_info() -> dict:
+-    """Static facts of the Cake SM120 NVFP4 route (mirrors ``dsv4_nvfp4_format_info``)."""
++    """Static facts of the Cake SM120 NVFP4 route (mirrors ``dsv4_nvfp4_format_info``).
++
++    Built once per process from the cached manifest (the planners and the entries
++    read it several times per call); the returned dict is shared, do not mutate it.
++    """
+ 
+     manifest = _manifest()
+     return {
+@@ -1159,8 +1164,10 @@ def cake_sparse_mla_sm120_dsv4_nvfp4_prefill(
+     ``out_lse``), but one CTA runs every chunk of a token: the candidate list
+     is limited to 16 chunks (``topk + extra_topk <= 1024`` slots) and the
+     head count needs a prefill instance (16 .. 128, multiples of 16).  Writes
+-    ``output`` and ``out_lse`` in place and returns the resolved plan
+-    ``{"head_tiles", "num_ctas"}`` (one CTA per (token, head block) item);
++    ``output`` and ``out_lse`` in place and returns the resolved plan:
++    ``head_tiles``, ``num_ctas`` (one CTA per (token, head block) item),
++    ``num_stages`` (cp.async ring depth), ``q_evict_first`` and
++    ``grid_head_blocks_first`` (the launch hints of the ``plan_prefill_*`` planners);
+     ``head_tiles`` (see :func:`cake_sparse_mla_sm120_dsv4_nvfp4_prefill_head_tiles`)
+     overrides :func:`cake_sparse_mla_sm120_dsv4_nvfp4_plan_prefill`.
+ 
+@@ -1201,7 +1208,8 @@ def cake_sparse_mla_sm120_dsv4_nvfp4_prefill(
+     Returns
+     -------
+     dict[str, int]
+-        The resolved plan ``{"head_tiles", "num_ctas"}``.
++        The resolved plan: ``head_tiles``, ``num_ctas``, ``num_stages``,
++        ``q_evict_first`` and ``grid_head_blocks_first`` (the last two ``bool``).
+     """
+ 
+     p = _prepare_inputs(
+diff --git a/tests/attention/test_cake_sparse_mla_sm120_dsv4_nvfp4.py b/tests/attention/test_cake_sparse_mla_sm120_dsv4_nvfp4.py
+index 5f1aeb14864..adad5ad7aac 100644
+--- a/tests/attention/test_cake_sparse_mla_sm120_dsv4_nvfp4.py
++++ b/tests/attention/test_cake_sparse_mla_sm120_dsv4_nvfp4.py
+@@ -19,10 +19,7 @@
+ atol=rtol=2e-2).
+ """
+ 
+-import importlib
+-import itertools
+ import math
+-import os
+ 
+ import pytest
+ import torch
+@@ -50,8 +47,6 @@
+ 
+ _D = _D_NOPE + _D_ROPE
+ _BYTES = 384
+-# Dotted name of the generating kernel module (planner parity test); unset -> skipped.
+-_KERNEL_MODULE_ENV = "CAKE_SPARSE_MLA_SM120_DSV4_KERNEL_MODULE"
+ _OUT_TOL = dict(atol=5e-2, rtol=5e-2)
+ _LSE_TOL = dict(atol=2e-2, rtol=2e-2)
+ 
+@@ -293,61 +288,6 @@ def test_cake_plan_head_tiles_rules() -> None:
+     assert plan(num_tokens=1, num_heads=128, topk=512, num_sms=48) == 1
+ 
+ 
+-def test_cake_planner_parity_with_kernel_module() -> None:
+-    """The Python planners mirror the generating kernel module exactly.
+-
+-    Set ``CAKE_SPARSE_MLA_SM120_DSV4_KERNEL_MODULE`` to the module's dotted name to run it.
+-    """
+-
+-    name = os.environ.get(_KERNEL_MODULE_ENV)
+-    if not name:
+-        pytest.skip(f"{_KERNEL_MODULE_ENV} not set")
+-    try:
+-        mod = importlib.import_module(name)
+-    except ImportError as exc:  # pragma: no cover - environment dependent
+-        pytest.skip(f"kernel module {name} unavailable: {exc}")
+-    info = cake_sparse_mla_sm120_dsv4_nvfp4_format_info()
+-    assert info["heads_per_block"] == mod.HPB
+-    assert info["max_chunks_per_block"] == mod.MAX_CPB
+-    assert tuple(mod.SUPPORTED_HEAD_COUNTS) == info["heads"]
+-    max_cpb = info["max_chunks_per_block"]
+-    grid = itertools.product(
+-        (1, 2, 4, 8, 16, 32, 64, 128),
+-        info["heads"],
+-        (64, 128, 256, 512, 1024),
+-        (0, 128, 512),
+-        (48, 170, 188),
+-    )
+-    for num_tokens, num_heads, topk, extra_topk, num_sms in grid:
+-        chunks = cake_sparse_mla_sm120_dsv4_nvfp4_num_chunks(topk, extra_topk)
+-        assert chunks == mod.max_chunks(topk, extra_topk)
+-        kwargs = dict(
+-            num_tokens=num_tokens,
+-            num_heads=num_heads,
+-            topk=topk,
+-            extra_topk=extra_topk,
+-            num_sms=num_sms,
+-        )
+-        tiles = cake_sparse_mla_sm120_dsv4_nvfp4_plan_head_tiles(**kwargs)
+-        assert tiles == mod.plan_head_tiles(**kwargs), kwargs
+-        plan = cake_sparse_mla_sm120_dsv4_nvfp4_plan_splits(
+-            **kwargs, max_splits=16, head_tiles=tiles
+-        )
+-        assert plan == mod.plan_splits(**kwargs, max_splits=16, head_tiles=tiles), (
+-            kwargs
+-        )
+-        splits, cpb = plan
+-        assert cpb <= max_cpb and splits >= -(-chunks // max_cpb)
+-        if chunks > max_cpb:
+-            # > 1024 candidates: both sides refuse a max_splits below ceil(chunks / 16).
+-            with pytest.raises(ValueError):
+-                mod.plan_splits(**kwargs, max_splits=1, head_tiles=tiles)
+-            with pytest.raises(ValueError):
+-                cake_sparse_mla_sm120_dsv4_nvfp4_plan_splits(
+-                    **kwargs, max_splits=1, head_tiles=tiles
+-                )
+-
+-
+ @pytest.mark.parametrize("topk", [128, 512])
+ @pytest.mark.parametrize("page_size", [32, 64, 128])
+ @pytest.mark.parametrize("num_heads", [8, 16, 64, 128])
+diff --git a/tests/attention/test_cake_sparse_mla_sm120_dsv4_nvfp4_prefill.py b/tests/attention/test_cake_sparse_mla_sm120_dsv4_nvfp4_prefill.py
+index 31b820b6c06..6b0d163ac78 100644
+--- a/tests/attention/test_cake_sparse_mla_sm120_dsv4_nvfp4_prefill.py
++++ b/tests/attention/test_cake_sparse_mla_sm120_dsv4_nvfp4_prefill.py
+@@ -21,10 +21,8 @@
+ exercised.
+ """
+ 
+-import importlib
+ import itertools
+ import math
+-import os
+ 
+ import pytest
+ import torch
+@@ -59,8 +57,6 @@
+     _require_sm120,
+ )
+ 
+-# Dotted name of the generating prefill kernel module (planner parity test); unset -> skipped.
+-_KERNEL_MODULE_ENV = "CAKE_SPARSE_MLA_SM120_DSV4_PREFILL_KERNEL_MODULE"
+ _PREFILL_HEADS = (16, 32, 48, 64, 80, 96, 112, 128)
+ 
+ 
+@@ -140,6 +136,83 @@ def test_cake_plan_prefill_rules() -> None:
+         plan(num_tokens=128, num_heads=128, topk=512, num_sms=0)
+ 
+ 
++# Dense planner sweep: every input ``plan_prefill`` reads (token count, head count,
++# ``topk + extra_topk``, SM count) crosses every ``_PREFILL_POLICY`` threshold (two-tile
++# token limits 96 / 128, candidate band 512 .. 639, ``large_sms`` 180) on the GB10 (48),
++# RTX 5090 (170) and RTX PRO 6000 (188) SM counts.
++_SWEEP_TOKENS = (*range(1, 133), 255, 256, 511, 512, 513, 2048, 8192, 65536)
++_SWEEP_CANDIDATES = tuple(
++    (topk, extra_topk)
++    for topk in (64, 128, 256, 448, 511, 512, 513, 576, 639, 640, 768, 1024)
++    for extra_topk in (0, 64, 128, 512)
++    if topk + extra_topk <= 1024
++)
++_SWEEP_SMS = (48, 170, 180, 188)
++
++
++def test_cake_plan_prefill_never_plans_single_tile_for_wide_heads() -> None:
++    """The planner never selects one head tile for 32 / 64 / 96 / 128 heads.
++
++    Over the dense sweep ``plan_prefill`` returns 2 or 4 for every head count with a
++    two-tile instance, so the planned launch never asks for their one-tile kernels nor
++    for the three-stage ring (exported for one tile only).  Those instances are reached
++    there only through the explicit ``head_tiles`` override of the prefill entry.
++    """
++
++    info = cake_sparse_mla_sm120_dsv4_nvfp4_format_info()
++    plan = cake_sparse_mla_sm120_dsv4_nvfp4_plan_prefill
++    stages = cake_sparse_mla_sm120_dsv4_nvfp4_plan_prefill_stages
++    two_tile_heads = tuple(
++        h for h in info["prefill_heads"] if 2 in info["prefill_head_tiles"][h]
++    )
++    assert two_tile_heads == (32, 64, 96, 128)
++    planned = {num_heads: set() for num_heads in two_tile_heads}
++    for num_heads, num_sms, (topk, extra_topk), num_tokens in itertools.product(
++        two_tile_heads, _SWEEP_SMS, _SWEEP_CANDIDATES, _SWEEP_TOKENS
++    ):
++        tiles = info["prefill_head_tiles"][num_heads]
++        head_tiles = plan(
++            num_tokens=num_tokens,
++            num_heads=num_heads,
++            topk=topk,
++            extra_topk=extra_topk,
++            num_sms=num_sms,
++        )
++        case = (num_heads, num_sms, topk, extra_topk, num_tokens)
++        assert head_tiles in tiles, case
++        assert head_tiles != 1, case
++        # the planned launch keeps two ring stages (three exist for one tile only)
++        assert (
++            stages(
++                head_tiles=head_tiles,
++                topk=topk,
++                extra_topk=extra_topk,
++                dual=extra_topk > 0,
++                num_tokens=num_tokens,
++            )
++            == 2
++        ), case
++        planned[num_heads].add(head_tiles)
++    # Every multi-tile instance is planned somewhere in the sweep.
++    assert planned == {32: {2}, 64: {2, 4}, 96: {2}, 128: {2, 4}}
++    # One tile is planned only for the head counts whose single instance it is.
++    for num_heads, num_sms, (topk, extra_topk) in itertools.product(
++        (16, 48, 80, 112), _SWEEP_SMS, _SWEEP_CANDIDATES
++    ):
++        assert cake_sparse_mla_sm120_dsv4_nvfp4_prefill_head_tiles(num_heads) == (1,)
++        for num_tokens in (1, 96, 97, 128, 129, 8192):
++            assert (
++                plan(
++                    num_tokens=num_tokens,
++                    num_heads=num_heads,
++                    topk=topk,
++                    extra_topk=extra_topk,
++                    num_sms=num_sms,
++                )
++                == 1
++            )
++
++
+ def test_cake_plan_prefill_stages_rules() -> None:
+     stages = cake_sparse_mla_sm120_dsv4_nvfp4_plan_prefill_stages
+     # three cp.async stages only for the one-tile instance from 8 chunks (512 candidates) per token
+@@ -166,6 +239,37 @@ def test_cake_plan_prefill_stages_rules() -> None:
+     )
+ 
+ 
++def test_cake_plan_prefill_stages_three_only_for_single_tile() -> None:
++    """Three ring stages are planned for the one-tile instance only.
++
++    The manifest exports a three-stage form for one head tile alone; the planner asks
++    for it from 8 chunks per token, except dual-cache lists below 16 chunks and below
++    512 tokens.  Two- and four-tile launches keep two stages at every chunk and token
++    count.
++    """
++
++    ring = cake_sparse_mla_sm120_dsv4_nvfp4_format_info()["prefill_ring_stages"]
++    assert [ht for ht in ring if 3 in ring[ht]] == [1]
++    stages = cake_sparse_mla_sm120_dsv4_nvfp4_plan_prefill_stages
++    for head_tiles, (topk, extra_topk), dual, num_tokens in itertools.product(
++        (1, 2, 4), _SWEEP_CANDIDATES, (False, True), (1, 128, 511, 512, 513, 8192)
++    ):
++        chunks = cake_sparse_mla_sm120_dsv4_nvfp4_num_chunks(topk, extra_topk)
++        expected = 3 if head_tiles == 1 and chunks >= 8 else 2
++        if dual and chunks < 16 and num_tokens < 512:
++            expected = 2
++        assert (
++            stages(
++                head_tiles=head_tiles,
++                topk=topk,
++                extra_topk=extra_topk,
++                dual=dual,
++                num_tokens=num_tokens,
++            )
++            == expected
++        ), (head_tiles, topk, extra_topk, dual, num_tokens)
++
++
+ def test_cake_plan_prefill_grid_order_rules() -> None:
+     grid = cake_sparse_mla_sm120_dsv4_nvfp4_plan_prefill_grid_head_blocks_first
+     # head blocks first (the head blocks of one token are adjacent CTAs) up to 4 chunks of 64 candidates per block
+@@ -254,140 +358,6 @@ def test_cake_select_kernel_rules() -> None:
+             assert head_tiles in _valid_tiles(num_heads)
+ 
+ 
+-def test_cake_prefill_planner_parity_with_kernel_module() -> None:
+-    """The Python prefill facts mirror the generating kernel module exactly.
+-
+-    Set ``CAKE_SPARSE_MLA_SM120_DSV4_PREFILL_KERNEL_MODULE`` to the module's dotted name to run it.
+-    """
+-
+-    name = os.environ.get(_KERNEL_MODULE_ENV)
+-    if not name:
+-        pytest.skip(f"{_KERNEL_MODULE_ENV} not set")
+-    try:
+-        mod = importlib.import_module(name)
+-    except ImportError as exc:  # pragma: no cover - environment dependent
+-        pytest.skip(f"kernel module {name} unavailable: {exc}")
+-    info = cake_sparse_mla_sm120_dsv4_nvfp4_format_info()
+-    assert info["heads_per_block"] == mod.HPB
+-    assert info["prefill_max_chunks"] == mod.MAX_CPB
+-    assert tuple(mod.SUPPORTED_HEAD_COUNTS) == info["prefill_heads"]
+-    for num_heads in info["prefill_heads"]:
+-        tiles = cake_sparse_mla_sm120_dsv4_nvfp4_prefill_head_tiles(num_heads)
+-        # The module's default is the largest instance; every exported tile count traces.
+-        assert mod.plan_head_tiles(num_heads) == max(tiles)
+-        assert tiles == tuple(ht for ht in (1, 2, 4) if num_heads % (mod.HPB * ht) == 0)
+-        for num_tokens in (128, 2048):
+-            head_tiles = cake_sparse_mla_sm120_dsv4_nvfp4_plan_prefill(
+-                num_tokens=num_tokens, num_heads=num_heads, topk=512, num_sms=188
+-            )
+-            assert head_tiles in tiles
+-    for topk, extra_topk in ((64, 0), (128, 128), (512, 512), (130, 1), (1024, 0)):
+-        assert cake_sparse_mla_sm120_dsv4_nvfp4_num_chunks(
+-            topk, extra_topk
+-        ) == mod.max_chunks(topk, extra_topk)
+-    # Ring depth and query L2 policy mirror the module's planner over the measured grid.
+-    assert mod.PLAN_NUM_STAGES_MIN_CHUNKS == 8
+-    assert mod.PLAN_NUM_STAGES_DUAL_MIN_CHUNKS == 16
+-    assert mod.PLAN_NUM_STAGES_DUAL_MIN_TOKENS == 512
+-    assert mod.PLAN_Q_EVICT_MIN_TOKENS == 512
+-    assert mod.PLAN_GRID_HB_FIRST_MAX_CHUNKS == 4
+-    assert mod.PLAN_GRID_HB_FIRST_MAX_TOKENS == 65535
+-    for num_tokens in (1, 128, 511, 512, 2048, 8192, 65535, 65536):
+-        assert cake_sparse_mla_sm120_dsv4_nvfp4_plan_prefill_q_evict_first(
+-            num_tokens=num_tokens
+-        ) == mod.plan_q_evict_first(num_tokens)
+-        for head_tiles in (1, 2, 4):
+-            for topk, extra_topk, dual in (
+-                (128, 0, False),
+-                (448, 0, False),
+-                (512, 0, False),
+-                (512, 128, True),
+-                (512, 512, True),
+-                (1024, 0, False),
+-            ):
+-                assert cake_sparse_mla_sm120_dsv4_nvfp4_plan_prefill_stages(
+-                    head_tiles=head_tiles,
+-                    topk=topk,
+-                    extra_topk=extra_topk,
+-                    dual=dual,
+-                    num_tokens=num_tokens,
+-                ) == mod.plan_num_stages(
+-                    head_tiles,
+-                    mod.max_chunks(topk, extra_topk),
+-                    dual=dual,
+-                    num_tokens=num_tokens,
+-                ), (num_tokens, head_tiles, topk, extra_topk, dual)
+-                assert (
+-                    cake_sparse_mla_sm120_dsv4_nvfp4_plan_prefill_grid_head_blocks_first(
+-                        head_tiles=head_tiles,
+-                        topk=topk,
+-                        extra_topk=extra_topk,
+-                        num_tokens=num_tokens,
+-                    )
+-                    == mod.plan_grid_head_blocks_first(
+-                        head_tiles, mod.max_chunks(topk, extra_topk), num_tokens
+-                    )
+-                ), (num_tokens, head_tiles, topk, extra_topk)
+-    # The decode / prefill crossover and the tile choice mirror the module's planner on both
+-    # sm_120a SKUs (188 / 170 SMs) over the measured token, head and candidate grid.
+-    for num_sms in (188, 170):
+-        for num_tokens in (
+-            1,
+-            4,
+-            8,
+-            9,
+-            16,
+-            17,
+-            24,
+-            32,
+-            33,
+-            48,
+-            64,
+-            96,
+-            97,
+-            128,
+-            129,
+-            512,
+-            2048,
+-        ):
+-            for num_heads in info["prefill_heads"]:
+-                for topk, extra_topk in (
+-                    (128, 0),
+-                    (256, 0),
+-                    (512, 0),
+-                    (256, 256),
+-                    (512, 512),
+-                ):
+-                    plan = mod.plan_prefill(
+-                        num_tokens, num_heads, topk, extra_topk, num_sms=num_sms
+-                    )
+-                    form = cake_sparse_mla_sm120_dsv4_nvfp4_select_kernel(
+-                        num_tokens=num_tokens,
+-                        num_heads=num_heads,
+-                        topk=topk,
+-                        extra_topk=extra_topk,
+-                        num_sms=num_sms,
+-                    )
+-                    assert form == plan["form"], (
+-                        num_sms,
+-                        num_tokens,
+-                        num_heads,
+-                        topk,
+-                        extra_topk,
+-                    )
+-                    if form == "prefill":
+-                        assert (
+-                            cake_sparse_mla_sm120_dsv4_nvfp4_plan_prefill(
+-                                num_tokens=num_tokens,
+-                                num_heads=num_heads,
+-                                topk=topk,
+-                                extra_topk=extra_topk,
+-                                num_sms=num_sms,
+-                            )
+-                            == plan["head_tiles"]
+-                        ), (num_sms, num_tokens, num_heads, topk, extra_topk)
+-
+-
+ # ----------------------------------------------------------------------------- GPU: attention cases
+ 
+ 

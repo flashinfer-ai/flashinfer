@@ -1,0 +1,123 @@
+diff --git a/flashinfer/fused_moe/runners.py b/flashinfer/fused_moe/runners.py
+index dd71a7c607d..363aa63ce3d 100644
+--- a/flashinfer/fused_moe/runners.py
++++ b/flashinfer/fused_moe/runners.py
+@@ -7219,22 +7219,9 @@ def pack_inputs(
+ 
+         per_token_scale = None
+         if is_fp4:
++            # MXFP4xMXFP8 keeps the compact TRT-LLM UE8M0 row here;
++            # PrimsTsMxfp4Mxfp8MoERunner pads it to the GEMM's row stride.
+             hidden_states_scale = self._validate_fp4_tensors(act, v, hidden_size)
+-            if pair == (QuantFormat.MXFP4, QuantFormat.MXFP8):
+-                # TRT-LLM stores a compact linear UE8M0 row. The Prims-TS
+-                # MXFP8 activation GEMM reads K-blocks rounded up to 16.
+-                # Padding happens on every pack_inputs, including the hot
+-                # forward path: one allocation, fill, and copy per call, so
+-                # the public activation pack can stay the shared TRT-LLM layout.
+-                from flashinfer.prims_ts.moe.runner import (
+-                    _pad_mxfp8_linear_scale_for_prims,
+-                )
+-
+-                hidden_states_scale = _pad_mxfp8_linear_scale_for_prims(
+-                    hidden_states_scale,
+-                    num_tokens=num_tokens,
+-                    hidden_size=hidden_size,
+-                ).view(torch.float8_e4m3fn)
+             if is_nvfp4:
+                 if self._per_token and act.per_token_scale is None:
+                     raise RuntimeError(
+diff --git a/flashinfer/prims_ts/moe/runner.py b/flashinfer/prims_ts/moe/runner.py
+index f6eb3af0777..90c4ebc32e8 100644
+--- a/flashinfer/prims_ts/moe/runner.py
++++ b/flashinfer/prims_ts/moe/runner.py
+@@ -1221,6 +1221,21 @@ def _make_tuning_config(
+             **kwargs,
+         )
+ 
++    def _gemm_hidden_states_scale(
++        self, moe_inputs: MoeRunnerInputs, num_tokens: int
++    ) -> torch.Tensor:
++        """MXFP8 activation scales in the layout the routed FC1 GEMM reads.
++
++        Callers pass the compact TRT-LLM row of ``hidden_size // 32`` UE8M0
++        bytes per token; the GEMM reads ``round_up(hidden_size // 32, 16)``
++        bytes per token. Already padded input is returned unchanged.
++        """
++        return _pad_mxfp8_linear_scale_for_prims(
++            moe_inputs.hidden_states_scale,
++            num_tokens=num_tokens,
++            hidden_size=self.hidden_size,
++        )
++
+     def get_valid_tactics(
+         self,
+         inputs: List[torch.Tensor],
+@@ -1360,7 +1375,9 @@ def precompile_tactics(
+ 
+                 common_io_kwargs = dict(
+                     hidden_states=hidden_states,
+-                    hidden_states_scale=moe_inputs.hidden_states_scale,
++                    hidden_states_scale=self._gemm_hidden_states_scale(
++                        moe_inputs, num_tokens
++                    ),
+                     gemm1_weights=kwargs["gemm1_weights"],
+                     gemm1_weights_scale=kwargs["gemm1_weights_scale"],
+                     gemm1_bias=kwargs.get("gemm1_bias"),
+@@ -1522,7 +1539,7 @@ def forward(
+ 
+         common_io_kwargs = dict(
+             hidden_states=hidden_states,
+-            hidden_states_scale=moe_inputs.hidden_states_scale,
++            hidden_states_scale=self._gemm_hidden_states_scale(moe_inputs, num_tokens),
+             gemm1_weights=kwargs["gemm1_weights"],
+             gemm1_weights_scale=kwargs["gemm1_weights_scale"],
+             gemm1_bias=kwargs.get("gemm1_bias"),
+diff --git a/tests/moe/test_trtllm_gen_fused_moe.py b/tests/moe/test_trtllm_gen_fused_moe.py
+index 0a61127f073..d94fd0fdbc1 100644
+--- a/tests/moe/test_trtllm_gen_fused_moe.py
++++ b/tests/moe/test_trtllm_gen_fused_moe.py
+@@ -851,6 +851,43 @@ def test_fp4_moe_gemm_bias_prims_ts(bias, moe_impl, cache_permute_indices):
+     )
+ 
+ 
++@pytest.mark.parametrize("hidden_size", [768])
++def test_mxfp4_mxfp8_prims_ts_unpadded_scale_row(hidden_size, cache_permute_indices):
++    """Compact MXFP8 activation scales whose row (hidden_size // 32) is not a
++    multiple of 16 bytes go through the flat Prims-TS op correctly."""
++    _skip_prims_ts_on_sm107()
++    intermediate_size = 512
++    run_moe_test(
++        num_tokens=32,
++        hidden_size=hidden_size,
++        intermediate_size=intermediate_size,
++        moe_impl=FP4Moe(quant_mode=QuantMode.FP4_MXFP4_MXFP8),
++        routing_config={
++            "num_experts": 8,
++            "top_k": 2,
++            "padding": 8,
++            "n_groups": None,
++            "top_k_groups": None,
++            "routed_scaling": None,
++            "has_routing_bias": False,
++            "routing_method_type": RoutingMethodType.Renormalize,
++            "compatible_moe_impls": [FP4Moe],
++            "compatible_intermediate_size": [intermediate_size],
++            "enable_autotune": False,
++        },
++        weight_processing={
++            "use_shuffled_weight": True,
++            "layout": WeightLayout.MajorK,
++            "compatible_moe_impls": [FP4Moe],
++            "compatible_gemm_backends": [MoeGemmBackend.PRIMS_TS],
++        },
++        activation_type=ActivationType.Swiglu,
++        cache_permute_indices=cache_permute_indices,
++        routing_logits_dtype=torch.bfloat16,
++        moe_gemm_backend=MoeGemmBackend.PRIMS_TS,
++    )
++
++
+ def test_mxfp4_mxfp8_kimi_k3_situ_reference(moe_gemm_backend, cache_permute_indices):
+     """Kimi K3 SiTU matches the dequantized reference on both backends."""
+     num_tokens = 32
