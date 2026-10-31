@@ -148,6 +148,18 @@ class Sm100W8A16Fp8GemmKernel:
             self.c_layout,
             self.c_dtype,
         )
+        # 64 activation columns per epilogue subtile where the tile allows (the helper
+        # picks 32 for a 16-bit C): half the subtiles, so half the named-barrier and
+        # TMA-store round trips per tile, which is what the epilogue's time is (GB200,
+        # 2sm256x128 tile: 1.5 -> 1.0 us per tile).  The smem per stage doubles and
+        # the stage count halves, same footprint.
+        # (The helper's tile entries may be layouts rather than ints, hence cute.size.)
+        if (
+            self.c_dtype.width == 16
+            and self.cta_tile_shape_mnk[1] % 64 == 0
+            and cute.size(self.epi_tile[1]) < 64
+        ):
+            self.epi_tile = (self.epi_tile[0], 64)
 
         (
             self.num_load2trans_stage,
