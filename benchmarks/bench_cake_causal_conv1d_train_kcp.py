@@ -23,9 +23,9 @@ group (W = 1).
 
 Rows: the single-rank benchmark's performance matrix (``C = 512`` over eight packed token counts and ``S = 250340``
 over the channel counts), each the same four-document pack (0.37 / 0.29 / 0.21 / rest of ``S``, nudged off a multiple
-of 64), token-sharded over the W ranks by ``flashinfer.kda_train.kcp_partition`` (``--layout``; ``contiguous``: equal
-token shares in order, documents cut at the shard boundaries, whose first tokens read their history rows through
-the halo exchange).  ``S`` is the whole pack; a rank holds about ``S / W`` tokens.  Every rank draws the whole pack
+of 64), token-sharded over the W ranks by ``flashinfer.cake_kda_det_train_kcp.partition_det_kcp`` (``--layout``;
+``contiguous``: equal token shares in order, documents cut at the shard boundaries, whose first tokens read their
+history rows through the halo exchange).  ``S`` is the whole pack; a rank holds about ``S / W`` tokens.  Every rank draws the whole pack
 from the same seed and keeps its fragments.
 
 Phases per row and mode, each through the autograd entry with gradient-requiring leaves:
@@ -62,6 +62,17 @@ status 1 when it fails): the non-deterministic ``y`` and ``dx`` are bitwise the 
 ``dweight`` partial is within ``5e-2 + 1e-4 |det|`` of the deterministic partial.  Rank 0 prints the rows and writes
 ``--json``.
 
+Non-Cake context-parallel baselines (``--sota``, default ``all``; ``cake_causal_conv1d_baselines.py``):
+flash-linear-attention's ``causal_conv1d`` with its ``cp_context`` on the Triton (``fla_cp_triton``) and CUDA
+(``fla_cp_cuda``, Dao's kernel, ``contiguous`` only) backends, on FLA's own partition of the pack padded to a
+multiple of ``2 W`` tokens, and Attention Gym's fragment-tail exchange with its CuTe DSL ``causal_conv1d``
+(``attn_gym_cp``, BF16 taps: a feature mismatch, never the best baseline) on this benchmark's partition.  They run
+the same phases through autograd in the same interleaved rounds and measures, with ``--tensors`` convolutions as
+one call each.  Per row ``sota`` keeps each arm's library version, determinism, feature match, local token counts
+and a numerics check (``y`` / ``dx`` on its rows, the summed ``dweight``) against the whole-pack Cake
+non-deterministic result, or the reason it cannot run the row (every rank must be able to); ``best_sota`` names the
+fastest eligible arm per phase and measure, ``speedup_vs_sota`` its time over the non-deterministic time.
+
 Example::
 
     python benchmarks/bench_cake_causal_conv1d_train_kcp.py --tokens 250340 --channels 512 1280
@@ -93,6 +104,7 @@ import flashinfer.cake_causal_conv1d_det_train_backend as det_backend  # noqa: E
 import flashinfer.cake_causal_conv1d_train_kcp as kcp_api  # noqa: E402
 import flashinfer.experimental.cake.cake_causal_conv1d_train as conv  # noqa: E402
 import flashinfer.experimental.cake.cake_causal_conv1d_train_backend as nondet_backend  # noqa: E402
+import cake_causal_conv1d_baselines as baselines  # noqa: E402
 from bench_cake_causal_conv1d_train import (  # noqa: E402
     P1_CHANNELS,
     P2_TOKENS,
@@ -100,7 +112,10 @@ from bench_cake_causal_conv1d_train import (  # noqa: E402
     perf_rows,
 )
 from flashinfer.api_logging import ExperimentalWarning  # noqa: E402
-from flashinfer.kda_train import build_kcp_context, kcp_partition  # noqa: E402
+from flashinfer.cake_kda_det_train_kcp import (  # noqa: E402
+    build_context_det_kcp,
+    partition_det_kcp,
+)
 from flashinfer.testing import bench_gpu_time  # noqa: E402
 
 WIDTH = 4
@@ -113,7 +128,7 @@ ROUNDS = 7
 GPU_WARMUPS = 3
 GPU_SAMPLES = 10
 WALL_WARMUPS = 3
-WALL_SAMPLES = 10
+WALL_SAMPLES = 40
 AHEAD_WARMUPS = 2
 AHEAD_SAMPLES = 10
 # The spin kernel ahead of a sample lasts at least AHEAD_MIN_MS and AHEAD_ENQUEUE_FACTOR times the longest enqueue
@@ -297,7 +312,8 @@ def _bits(t: torch.Tensor) -> torch.Tensor:
 
 
 class Problem:
-    """One row: the whole pack drawn on every rank from the same seed, this rank's fragments kept."""
+    """One row: the whole pack drawn on every rank from the same seed, this rank's fragments kept (and the whole
+    pack too with ``keep_global``, for the baselines)."""
 
     def __init__(
         self,
@@ -308,13 +324,15 @@ class Problem:
         rank: int,
         world: int,
         device: torch.device,
+        keep_global: bool = False,
     ) -> None:
         self.lens = doc_lengths(tokens)
         cu = [0]
         for n in self.lens:
             cu.append(cu[-1] + n)
-        self.part = kcp_partition(cu, world, layout)
-        self.ctx = build_kcp_context(
+        self.cu = cu
+        self.part = partition_det_kcp(cu, world, layout)
+        self.ctx = build_context_det_kcp(
             self.part, dist.group.WORLD, rank, device, conv_kernel_size=WIDTH
         )
         fragments = [f for f in self.part.fragments[rank] if f.length > 0]
@@ -327,6 +345,8 @@ class Problem:
 
         generator = torch.Generator(device=device).manual_seed(SEED)
         self.xs, self.ws, self.dys = [], [], []
+        self.global_xs: list[torch.Tensor] = []
+        self.global_dys: list[torch.Tensor] = []
         for _ in range(tensors):
             x = torch.randn(
                 tokens,
@@ -347,6 +367,9 @@ class Problem:
             self.xs.append(shard(x))
             self.ws.append(w.contiguous())
             self.dys.append(shard(dy))
+            if keep_global:
+                self.global_xs.append(x)
+                self.global_dys.append(dy)
             del x, dy
         self.tokens_local = int(self.xs[0].shape[0])
         # The halo exchange per call and direction (rows: BF16 history rows forward, FP32 derivative rows backward).
@@ -474,6 +497,85 @@ def _check(p: Problem, device: torch.device) -> dict:
     }
 
 
+def _all_reduce(t: torch.Tensor) -> torch.Tensor:
+    dist.all_reduce(t)
+    return t
+
+
+def _agreed(reason: Optional[str]) -> Optional[str]:
+    """``None`` when no rank has a reason, else every rank's distinct reasons (the same on every rank)."""
+
+    reasons = _gather(reason)
+    distinct = sorted({r for r in reasons if r})
+    if not distinct:
+        return None
+    if len(distinct) == 1 and all(reasons):
+        return distinct[0]
+    return "; ".join(f"rank {rank}: {r}" for rank, r in enumerate(reasons) if r)
+
+
+def _baselines(
+    p: Problem, args: argparse.Namespace, rank: int, world: int, device: torch.device
+) -> tuple[dict[str, dict], dict[str, dict]]:
+    """``(entries, calls)`` of the requested non-Cake arms on the row: each built on every rank, checked against
+    the whole-pack Cake non-deterministic result and warmed up (outside the timing).  An arm runs only when every
+    rank can run it.  The whole pack is released afterwards."""
+
+    entries: dict[str, dict] = {}
+    runs: dict[str, dict] = {}
+    if not args.sota_arms:
+        return entries, runs
+    cu_t = torch.tensor(p.cu, dtype=torch.int32, device=device)
+    references = []
+    for x, w, dy in zip(p.global_xs, p.ws, p.global_dys, strict=True):
+        xl = x.detach().clone().requires_grad_(True)
+        wl = w.detach().clone().requires_grad_(True)
+        y = conv.cake_causal_conv1d(xl, wl, cu_t, None, deterministic=False)
+        y.backward(dy)
+        references.append((y.detach(), xl.grad, wl.grad))
+        del xl, wl, y
+    fragments = [
+        baselines.merged_fragments(p.cu, p.part.fragments[r]) for r in range(world)
+    ]
+    for name in args.sota_arms:
+        entry, built = baselines.kcp_arm(
+            name, xs=p.global_xs, ws=p.ws, dys=p.global_dys, cu=p.cu, fragments=fragments,
+            layout=args.layout, group=dist.group.WORLD, rank=rank, world=world,
+        )  # fmt: skip
+        entries[name] = entry
+        reason = _agreed(entry.get("unsupported"))
+        if reason is None and built is not None:
+            calls, rows = built
+            error = None
+            try:
+                entry["numerics"] = baselines.kcp_numerics(
+                    calls, rows, references, _all_reduce
+                )
+                for phase in PHASES:
+                    calls[phase]()
+                calls["record"]()
+                torch.cuda.synchronize(device)
+            except Exception as exc:  # noqa: BLE001 -- a failing library is reported, the row goes on
+                error = f"{type(exc).__name__}: {str(exc)[:300]}"
+            reason = _agreed(error)
+            entry["tokens_local"] = _gather(int(rows.numel()))
+        if reason is not None:
+            entry["unsupported"] = reason
+            entry["eligible"] = False
+            continue
+        entry["eligible"] = (
+            entry["feature"]["match"] in ("exact", "more_precise")
+            and entry["numerics"]["ok"]
+        )
+        runs[name] = calls
+    del references
+    p.global_xs.clear()
+    p.global_dys.clear()
+    gc.collect()
+    torch.cuda.empty_cache()
+    return entries, runs
+
+
 def bench_row(
     tokens: int,
     channels: int,
@@ -484,7 +586,10 @@ def bench_row(
     device: torch.device,
     ahead: _GpuAhead,
 ) -> dict:
-    p = Problem(tokens, channels, args.tensors, args.layout, rank, world, device)
+    p = Problem(
+        tokens, channels, args.tensors, args.layout, rank, world, device,
+        keep_global=bool(args.sota_arms),
+    )  # fmt: skip
     result: dict = {
         "tokens": tokens,
         "channels": channels,
@@ -518,20 +623,23 @@ def bench_row(
                     "ckpt": calls["ckpt_memory"],
                 }[phase]
                 entries[mode][f"{phase}_{when}"] = _probe(probe, device)
-    # Interleaved rounds: every phase of both modes per round, the first mode alternating.
+    sota_entries, sota_calls = _baselines(p, args, rank, world, device)
+    # Interleaved rounds: every phase of both modes and of every baseline per round, the order alternating.
     timed = {mode: _calls(p, deterministic) for mode, deterministic in MODES.items()}
     for calls in timed.values():
         calls["record"]()
+    timed.update(sota_calls)
+    records = {**entries, **sota_entries}
     samples = {
         mode: {f"{phase}_{kind}": [] for phase in PHASES for kind in KINDS}
-        for mode in MODES
+        for mode in timed
     }
     per_rank = {
         mode: {f"{phase}_{kind}": [] for phase in PHASES for kind in ("gpu", "ahead")}
-        for mode in MODES
+        for mode in timed
     }
-    late = {mode: 0 for mode in MODES}
-    order = list(MODES)
+    late = {mode: 0 for mode in timed}
+    order = list(timed)
     for index in range(args.rounds):
         for mode in order if index % 2 == 0 else order[::-1]:
             calls = timed[mode]
@@ -550,8 +658,8 @@ def bench_row(
                     ("host", host),
                 ):
                     samples[mode][f"{phase}_{kind}"].append(value * 1e3)
-    for mode in MODES:
-        entry = entries[mode]
+    for mode in timed:
+        entry = records[mode]
         for key, values in samples[mode].items():
             entry[f"{key}_us"] = _median(values)
             entry[f"{key}_us_range"] = [min(values), max(values)]
@@ -571,6 +679,11 @@ def bench_row(
             for d, n in zip(samples["det"][key], samples["nondet"][key], strict=True)
         ]
         result["speedup_range"][key] = [min(ratios), max(ratios)]
+    if args.sota_arms:
+        result["sota"] = sota_entries
+        result["best_sota"], result["speedup_vs_sota"] = baselines.best_baseline(
+            sota_entries, entries["nondet"], keys
+        )
     result["check"] = _check(p, device)
     del p
     gc.collect()
@@ -611,6 +724,12 @@ def _format(result: dict, world: int) -> list[str]:
     lines.append(
         f"{head} tokens per rank {result['tokens_local']} check {result['check']}"
     )
+    for kind in ("gpu", "ahead"):
+        lines.extend(
+            baselines.format_sota(
+                result, head, PHASES, kind, describe_arms=kind == "ahead"
+            )
+        )
     return lines
 
 
@@ -652,9 +771,16 @@ def main(argv: Optional[list[str]] = None) -> int:
         default=None,
         help="rank 0 writes all rows to this JSON file",
     )
+    parser.add_argument(
+        "--sota",
+        nargs="*",
+        default=["all"],
+        help=f"non-Cake baselines: all (default), none, or names from {list(baselines.KCP_ARMS)}",
+    )
     args = parser.parse_args(argv)
     if args.rounds < 1 or args.tensors < 1:
         parser.error("--rounds and --tensors must be at least 1")
+    args.sota_arms = baselines.parse_arms(args.sota, baselines.KCP_ARMS)
     warnings.simplefilter("ignore", ExperimentalWarning)
     rank, world, device = _init()
     for mode, deterministic in MODES.items():
@@ -717,6 +843,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                         "world": world,
                         "layout": args.layout,
                         "tensors": args.tensors,
+                        "sota_arms": args.sota_arms,
                         "rows": results,
                     },
                     handle,

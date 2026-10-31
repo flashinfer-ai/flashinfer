@@ -46,11 +46,23 @@ difference.  The route is chosen as in the deterministic benchmark (``--weight-d
 ``--silu-grad-preactivation``); ``--side-kernel`` adds the backward's wall latency beside a kernel resident on another
 stream (FlashInfer issues #7038 / #7548).
 
+Non-Cake baselines (``--sota``, default ``all``; ``cake_causal_conv1d_baselines.py``): flash-linear-attention's
+``causal_conv1d`` on its Triton (``fla``) and opt-in Gluon (``fla_gluon``) backends, Dao-AILab ``causal_conv1d_fn``
+with its atomic (``dao``) and deterministic (``dao_det``) weight gradients, and the cuDNN frontend's
+``cudnn.ops.causal_conv1d`` (``cudnn_fe``).  They run through autograd on the row's tensors, interleaved with the
+two Cake modes in the same rounds and timed the same way (``fwd``: the training forward with its graph recorded;
+``bwd``: the backward of a recorded forward; ``step``: both; ``ckpt``: as above), and are reported per row under
+``sota`` with the library version, determinism, feature match and a numerics check against the Cake
+non-deterministic result, or as unsupported with the reason.  ``best_sota`` names the fastest eligible arm per phase
+and measure, ``speedup_vs_sota`` its time over the non-deterministic time (above 1: Cake faster), and every arm's
+``speedup`` its own ratio.
+
 Example::
 
     python benchmarks/bench_cake_causal_conv1d_train.py
     python benchmarks/bench_cake_causal_conv1d_train.py --channels 512 1280 --tokens 250340 --json out.json
     python benchmarks/bench_cake_causal_conv1d_train.py --silu-grad-preactivation fp32 --bias float32
+    python benchmarks/bench_cake_causal_conv1d_train.py --channels 512 --tokens 250340 --sota fla_gluon dao
 """
 
 from __future__ import annotations
@@ -59,10 +71,12 @@ import argparse
 import gc
 import json
 import statistics
+import sys
 import time
 import warnings
 from dataclasses import dataclass
-from typing import Callable, Optional
+from pathlib import Path
+from typing import Callable, Optional, Sequence
 
 import torch
 
@@ -74,6 +88,10 @@ from flashinfer.experimental.cake.cake_causal_conv1d_train_backend import (
     cake_jit as loader,
 )
 from flashinfer.testing import bench_gpu_time
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import cake_causal_conv1d_baselines as baselines  # noqa: E402
 
 WIDTH = 4
 P1_TOKENS = (239718, 245028, 249866, 250340, 258574, 259042, 259584, 261393)
@@ -88,7 +106,7 @@ PHASES = ("fwd", "bwd", "step", "ckpt")
 KINDS = ("gpu", "wall", "host")
 ROUNDS = 7
 WALL_WARMUPS = 3
-WALL_SAMPLES = 20
+WALL_SAMPLES = 50
 AHEAD_WARMUPS = 2
 AHEAD_SAMPLES = 10
 # The spin kernel ahead of a ckpt sample lasts at least AHEAD_MIN_MS and AHEAD_ENQUEUE_FACTOR times the longest
@@ -375,6 +393,61 @@ def _calls(p: Problem, route: Route, deterministic: bool, *, own_workspace: bool
     }
 
 
+def _cake_reference(p: Problem, route: Route) -> tuple:
+    """The non-deterministic Cake ``(y, dx, dweight, dbias)`` of the row through autograd (the baselines' check)."""
+
+    leaves = [
+        t.detach().clone().requires_grad_(True)
+        for t in (p.x, p.w, p.b)
+        if t is not None
+    ]
+    y = conv.cake_causal_conv1d(
+        leaves[0],
+        leaves[1],
+        p.cu,
+        leaves[2] if len(leaves) > 2 else None,
+        silu_grad_preactivation=route.silu_grad_preactivation,
+        deterministic=False,
+    )
+    y.backward(p.dy)
+    return (y.detach(), *(leaf.grad for leaf in leaves))
+
+
+def _baselines(
+    p: Problem, route: Route, sota: Sequence[str], device: torch.device
+) -> tuple[dict[str, dict], dict[str, dict]]:
+    """``(entries, calls)`` of the requested non-Cake arms on the row: each built, checked against the Cake result
+    and warmed up (JIT compilation and autotuning happen here, outside the timing)."""
+
+    entries: dict[str, dict] = {}
+    calls: dict[str, dict] = {}
+    if not sota:
+        return entries, calls
+    reference = _cake_reference(p, route)
+    for name in sota:
+        entry, arm = baselines.single_rank_arm(
+            name, x=p.x, w=p.w, b=p.b, dy=p.dy, cu=p.cu, lens=p.lens,
+            cake_preactivation=route.silu_grad_preactivation, reference=reference,
+        )  # fmt: skip
+        entries[name] = entry
+        if arm is None:
+            continue
+        try:
+            with baselines.environment(entry["env"]):
+                for phase in PHASES:
+                    arm[phase]()
+            torch.cuda.synchronize(device)
+        except Exception as exc:  # noqa: BLE001 -- a failing library is reported, the row goes on
+            entry["unsupported"] = f"{type(exc).__name__}: {str(exc)[:300]}"
+            entry["eligible"] = False
+            continue
+        entry["ckpt_ahead_late"] = 0
+        calls[name] = arm
+    del reference
+    torch.cuda.empty_cache()
+    return entries, calls
+
+
 def bench_row(
     tokens: int,
     channels: int,
@@ -384,6 +457,7 @@ def bench_row(
     side_kernel: bool,
     rounds: int,
     ahead: _GpuAhead,
+    sota: Sequence[str] = (),
 ) -> dict:
     p = Problem(tokens, channels, route, device)
     arch = loader.arch_for_capability(torch.cuda.get_device_capability(device))
@@ -424,44 +498,59 @@ def bench_row(
             entry["ckpt_ahead_late"] = 0
         except Exception as exc:  # keep the other mode's row
             entry["error"] = repr(exc)[:300]
-    # Interleaved rounds: every phase of both modes per round, the first mode alternating.
-    samples = {
-        mode: {f"{phase}_{kind}": [] for phase in PHASES for kind in KINDS}
-        for mode in timed
+    sota_entries, sota_calls = _baselines(p, route, sota, device)
+    # Interleaved rounds: every phase of both modes and of every baseline per round, the order alternating.
+    runners = {
+        **{mode: (calls, {}, entries[mode]) for mode, calls in timed.items()},
+        **{
+            name: (calls, sota_entries[name]["env"], sota_entries[name])
+            for name, calls in sota_calls.items()
+        },
     }
-    order = list(timed)
+    samples = {
+        name: {f"{phase}_{kind}": [] for phase in PHASES for kind in KINDS}
+        for name in runners
+    }
+    order = list(runners)
     for index in range(rounds):
-        for mode in order if index % 2 == 0 else order[::-1]:
-            if "error" in entries[mode]:
+        for name in order if index % 2 == 0 else order[::-1]:
+            calls, env, record = runners[name]
+            if "error" in record or "unsupported" in record:
                 continue
-            calls = timed[mode]
             try:
                 values = {}
-                for phase in PHASES:
-                    if phase == "ckpt":
-                        gpu, late = ahead(calls[phase])
-                        entries[mode]["ckpt_ahead_late"] += late
-                    else:
-                        gpu = _gpu_ms(calls[phase])
-                    wall, host = _host_ms(calls[phase], device)
-                    values.update(
-                        {
-                            f"{phase}_gpu": gpu * 1e3,
-                            f"{phase}_wall": wall * 1e3,
-                            f"{phase}_host": host * 1e3,
-                        }
-                    )
-            except Exception as exc:  # keep the other mode's row
-                entries[mode]["error"] = repr(exc)[:300]
+                with baselines.environment(env):
+                    for phase in PHASES:
+                        if phase == "ckpt":
+                            gpu, late = ahead(calls[phase])
+                            record["ckpt_ahead_late"] += late
+                        else:
+                            gpu = _gpu_ms(calls[phase])
+                        wall, host = _host_ms(calls[phase], device)
+                        values.update(
+                            {
+                                f"{phase}_gpu": gpu * 1e3,
+                                f"{phase}_wall": wall * 1e3,
+                                f"{phase}_host": host * 1e3,
+                            }
+                        )
+            except Exception as exc:  # keep the other rows
+                if name in MODES:
+                    record["error"] = repr(exc)[:300]
+                else:
+                    record["unsupported"] = repr(exc)[:300]
+                    record["eligible"] = False
                 continue
             for key, value in values.items():
-                samples[mode][key].append(value)
-    for mode, per_key in samples.items():
-        if "error" in entries[mode]:
+                samples[name][key].append(value)
+    for name, per_key in samples.items():
+        record = runners[name][2]
+        if "error" in record or "unsupported" in record:
             continue
         for key, values in per_key.items():
-            entries[mode][f"{key}_us"] = _median(values)
-            entries[mode][f"{key}_us_range"] = [min(values), max(values)]
+            record[f"{key}_us"] = _median(values)
+            record[f"{key}_us_range"] = [min(values), max(values)]
+    sota_calls.clear()
     grads = {}
     for mode, calls in timed.items():
         entry = entries[mode]
@@ -482,6 +571,13 @@ def bench_row(
             entry["error"] = repr(exc)[:300]
     result["modes"] = entries
     det, nondet = entries["det"], entries["nondet"]
+    if sota:
+        result["sota"] = sota_entries
+        result["best_sota"], result["speedup_vs_sota"] = baselines.best_baseline(
+            sota_entries,
+            nondet,
+            [f"{phase}_{kind}" for phase in PHASES for kind in KINDS],
+        )
     keys = [
         f"{phase}_{kind}"
         for phase in PHASES
@@ -549,6 +645,7 @@ def _format(result: dict) -> list[str]:
             )
     if "check" in result:
         lines.append(f"{head} check {result['check']}")
+    lines.extend(baselines.format_sota(result, head, PHASES, "gpu"))
     return lines
 
 
@@ -598,7 +695,14 @@ def main(argv: Optional[list[str]] = None) -> int:
         default=ROUNDS,
         help="interleaved det / nondet timing rounds (each value: the median over the rounds, with its range)",
     )
+    parser.add_argument(
+        "--sota",
+        nargs="*",
+        default=["all"],
+        help=f"non-Cake baselines: all (default), none, or names from {list(baselines.SINGLE_RANK_ARMS)}",
+    )
     args = parser.parse_args(argv)  # fmt: skip
+    sota = baselines.parse_arms(args.sota, baselines.SINGLE_RANK_ARMS)
     route = Route(
         weight_dtype=DTYPES[args.weight_dtype],
         bias_dtype=None if args.bias == "none" else DTYPES[args.bias],
@@ -647,6 +751,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             side_kernel=args.side_kernel,
             rounds=args.rounds,
             ahead=ahead,
+            sota=sota,
         )
         results.append(result)
         torch.cuda.empty_cache()
@@ -664,6 +769,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                     "cuda": torch.version.cuda,
                     "torch": torch.__version__,
                     "route": route.describe(),
+                    "sota_arms": sota,
                     "rows": results,
                 },
                 handle,
