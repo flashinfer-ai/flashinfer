@@ -181,3 +181,17 @@ Until then the C++ stays as-is and the DSL kernel lives beside it.
   gate_up / gen.qkv / mlp.down 4-13% behind on the same tile, at M=4096 the DSL wins
   most tiles -> suspected power-cap clock effect (B200 1000 W); measuring clocks and
   profiling at locked clocks next.
+- Fri 30 Oct 2026, night: Blackwell mainloop.  Debug-mode cycle accounting per warp
+  role (slots 40-63; the timeline script prints the shares) showed the transform warps
+  ~92% busy and the leader MMA warp waiting 16-25% for transformed A: a k-tile's chain
+  (4 LDS.128, 32 F2FP, 4 STTM, tcgen05.wait::st, arrive) is ~1000 cycles of latency
+  with all eight warps on the same k-tile.  The two transform warpgroups now take
+  alternate k-tiles (each converts a stage in two halves; raw stage released after the
+  converts); arrival counts halved.  Not a power effect: both kernels run ~1865 MHz on
+  the B200.  B200 at locked clocks (ncu, C++ / DSL us): mlp.down 8192 323.1/326.9,
+  gate_up 8192 317.9/322.8, gate_up 4096 164.7/164.8, mlp.down 4096 166.7/168.2,
+  attn.out 8192 108.2/107.9, gen.qkv 1024 26.1/27.0, attn.out 1024 22.8/23.6.  GB200
+  bench: all M=4096/8192 rows within +-2% (attn.out 8192 -3.9%, gate_up 8192 -2.0%,
+  mlp.down 8192 -2.1%); M=1024 rows +2.5..+6.6% (one tile per CTA: prologue 0.8 us,
+  first TMA -> first MMA 1.4 us, epilogue 1.5 us per tile).  The B200 bench itself is
+  +-4% noisy run to run (C++ mlp.down 8192 measured 331..357); use ncu for B200.
