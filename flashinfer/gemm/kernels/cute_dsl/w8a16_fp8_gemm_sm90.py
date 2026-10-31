@@ -869,43 +869,59 @@ class Sm90W8A16Fp8GemmKernel:
             read_state.reset_count()
             release_state.reset_count()
 
-            # First k-tile: no wgmma in flight, so no wait before the converts.
+            # First k-tile: no wgmma in flight, so no wait before the converts.  The
+            # stage index is taken before the state advances so the next stage's full
+            # barrier can be probed early (below); a tile's k-blocks all read `stage`.
             ab_pipeline.consumer_wait(read_state)
+            stage = cutlass.Int32(read_state.index)
+            read_state.advance()
+            if k_split:
+                read_state.advance()
             # Loads run two k-blocks ahead of the wgmma, converts one ahead, as the
             # CUTLASS mainloop: the smem latency and the ALU work hide behind the
             # tensor core.
-            stage_addr = a_smem_addr + read_state.index * a_stage_bytes
+            stage_addr = a_smem_addr + stage * a_stage_bytes
             a_words = {}
             a_words[0] = self._a_loads(0, stage_addr, a_unit_off)
             if cutlass.const_expr(num_k_blocks > 1):
                 a_words[1] = self._a_loads(1, stage_addr, a_unit_off)
             self._a_convert(tCrA_mma, 0, a_words[0])
             warpgroup.fence()
+            next_full = cutlass.Boolean(False)
             for kb in cutlass.range_constexpr(num_k_blocks):
                 cute.gemm(
                     tiled_mma,
                     accumulators,
                     tCrA_mma[(None, None, kb)],
-                    tCrB[(None, None, kb, read_state.index)],
+                    tCrB[(None, None, kb, stage)],
                     accumulators,
                 )
                 warpgroup.commit_group()
+                if cutlass.const_expr(kb == 0):
+                    # Probe the next stage now; the wait at the top of the next
+                    # k-tile then blocks only if the probe failed (the CUTLASS
+                    # mainloop does the same: a cold try_wait costs ~100 cycles).
+                    # Only when a next k-tile exists: try_wait on a stage nobody
+                    # fills suspends the thread until the hardware time limit.
+                    if k_tiles_own > 1:
+                        next_full = ab_pipeline.consumer_try_wait(read_state)
                 if cutlass.const_expr(kb + 2 < num_k_blocks):
                     a_words[kb + 2] = self._a_loads(kb + 2, stage_addr, a_unit_off)
                 if cutlass.const_expr(kb + 1 < num_k_blocks):
                     self._a_convert(tCrA_mma, kb + 1, a_words[kb + 1])
             warpgroup.fence()
-            read_state.advance()
-            if k_split:
-                read_state.advance()
 
             # Steady state: the wgmma of k-block kb issued, at most k_wait_max groups
             # pending, then the previous stage is released at the last k-block (all
             # its wgmma are done) and the registers of k-block kb + 1 are refilled
             # (their reader, k-block kb + 1 of the previous k-tile, is done).
             for _k_tile in cutlass.range(1, k_tiles_own, 1, unroll=1):
-                ab_pipeline.consumer_wait(read_state)
-                stage_addr_k = a_smem_addr + read_state.index * a_stage_bytes
+                ab_pipeline.consumer_wait(read_state, next_full)
+                stage = cutlass.Int32(read_state.index)
+                read_state.advance()
+                if k_split:
+                    read_state.advance()
+                stage_addr_k = a_smem_addr + stage * a_stage_bytes
                 a_words_k = {}
                 a_words_k[0] = self._a_loads(0, stage_addr_k, a_unit_off)
                 if cutlass.const_expr(num_k_blocks > 1):
@@ -918,11 +934,14 @@ class Sm90W8A16Fp8GemmKernel:
                         tiled_mma,
                         accumulators,
                         tCrA_mma[(None, None, kb)],
-                        tCrB[(None, None, kb, read_state.index)],
+                        tCrB[(None, None, kb, stage)],
                         accumulators,
                     )
                     warpgroup.commit_group()
                     warpgroup.wait_group(k_wait_max)
+                    if cutlass.const_expr(kb == 0):
+                        if _k_tile + 1 < k_tiles_own:
+                            next_full = ab_pipeline.consumer_try_wait(read_state)
                     if cutlass.const_expr(kb == num_k_blocks - 1):
                         ab_pipeline.consumer_release(release_state)
                         release_state.advance()
@@ -935,9 +954,6 @@ class Sm90W8A16Fp8GemmKernel:
                     if cutlass.const_expr(kb + 1 < num_k_blocks):
                         self._a_convert(tCrA_mma, kb + 1, a_words_k[kb + 1])
                 warpgroup.fence()
-                read_state.advance()
-                if k_split:
-                    read_state.advance()
             if cutlass.const_expr(self.pingpong):
                 if not k_split:
                     # The other group's mainloop may start; this one drains behind it.
