@@ -106,6 +106,10 @@ to apply it to) is a ``ValueError`` (a malformed declaration, like ``out_scale``
 ``NotImplementedError`` (the typed decline: the convention is a bf16 chain's -- refused by name rather than defined for f16, which has no
 consumer, no ground truth and a narrower range below which the two conventions part); a value outside the vocabulary is a ``ValueError`` at
 construction.  :attr:`SparseGqaFwdDslSm107.out_rounding` reads the attribute back.
+The per-form COST of ``"staged"`` is a PERFORMANCE fact of the attribute, not a numerics change, recorded in the tracker's "Measured cost
+of the staged convention" note (``python/cudnn/sdpa/frost/SUPPORT_MATRIX_TRACKER.md``; 2026-10-30, the Rubin 212-SM class): a tie inside
+the noise on the served decode-grid combine at one token per sequence, 0.13-0.30 us per layer at four, 1.2-1.5 us per layer (-6.7..-8.5 %)
+where the combine resolves to the module's own forms -- prefer ``"single"`` on such a declaration until the staged arithmetic is rescheduled.
 
 TWO BODIES, ONE FUNCTION (``tile_form``, appended; a PERFORMANCE knob): the tcgen05 core (``kernels/sm107/sparse_d256_f16.py``, the
 module above, ``kernel_template`` ``"sparse_d256_f16"``) and the LEAN decode tile (``kernels/sm107/sparse_lean_d256_f16.py``: ``mma.sync``

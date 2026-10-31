@@ -116,9 +116,12 @@ def qwen_3_8_block_support(
     Qwen38BlockSupport
         ``served``, ``reason``, the device and CuTe DSL facts, the served ``forms`` (``("prefill", "extend", "decode")`` where the geometry
         is served: the three forms are ONE vendored declaration form and are served together), one record per form with the typed
-        declines it can raise at plan time (the extend / prefill records add the FlashInfer-side rows bound
-        ``extend_proj_slab_rows``), the validated page sizes and cache spellings, the decode envelope (``decode_max_q_len``,
-        ``decode_capture_rows_max``), the extend forms' rows bound (``extend_rows_max``), the served ``rope_dims``,
+        declines it can raise at plan time (one table for the three forms: the vendored rows, the five ``indexer_extend_*`` rows among
+        them, plus the FlashInfer-side ``indexer_extend_grid_rows`` row -- one run's launch-grid bound at this pin), the
+        validated page sizes and cache spellings, the decode envelope (``decode_max_q_len``, ``decode_capture_rows_max``), the rows one
+        run of any form may hold (``extend_rows_grid_max``, 65535 at this pin: the vendored indexer's query compress -- the decode step's
+        and the extend step's -- launches with the run's row count as a CUDA grid dimension), the served
+        ``rope_dims``,
         the indexer facts READ off the vendored envelope (``index_sources``, ``index_list_forms``, ``index_cache_dtypes``,
         ``index_head_dims``, ``index_kv_heads``, ``index_block_sizes``, ``index_top_k_range``, ``index_query_rows_max``,
         ``index_state_rows_extra``, ``index_page_sizes``, ``kv_cache_dtypes``, ``fuse_prepare_default``, ``pdl_default``, and -- the
@@ -281,13 +284,16 @@ def prepare_qwen_3_8_block_bf16(
     """Declare, check and compile the block for one shape bucket of ``form``, outside CUDA-graph capture.
 
     The plan compiles in: the form, ``batch_size``, ``q_len_per_req`` (decode: 1 .. 16 at four indexer heads; extend / prefill: the
-    chunk's rows, any ``T`` with ``batch_size x T <= 128`` and ``T <= max_pages x page_size``), ``page_size`` (16 / 32 / 64 / 128) and
+    chunk's rows, any ``T`` with ``T <= max_pages x page_size``, at any batch; on every form within ``batch_size x q_len_per_req <= 65535``
+    rows per run at this pin -- the vendored indexer's query compress launches with the run's row count as a CUDA grid dimension; a
+    longer chunk is several runs, a wider decode step several steps or a smaller batch), ``page_size`` (16 / 32 / 64 / 128) and
     the pools' layout, page count and strides (read from ``kv_cache``), the block table's columns and row stride (from ``block_table``
     when given -- the sparse core binds the whole table, so ``max_pages`` must be its width), ``max_seq_len``, the split, the side caches'
     FORM (the compressed-key cache's rows per page, the ring's capacity -- decode: ``cap >= q_len_per_req + 3``; extend / prefill:
     ``cap >= 3``, and a run then binds a ring of EXACTLY that capacity; never their strides), the two input-contract flags and the knobs.
-    Typed errors: ``NotImplementedError`` for a device, DSL version, dtype, geometry, page size, step width, chunk rows or pool dtype the
-    kernels do not serve (named), ``ValueError`` for a malformed argument (named), ``RuntimeError`` under capture.
+    Typed errors: ``NotImplementedError`` for a device, DSL version, dtype, geometry, page size, step width, chunk rows, a run of more
+    than 65,535 rows (any form) or pool dtype the kernels do not serve (named), ``ValueError`` for a malformed argument (named),
+    ``RuntimeError`` under capture.
 
     **The extend / prefill forms** (the in-block indexer's EXTEND step; one vendored form, two names): a UNIFORM chunk of
     ``q_len_per_req = T`` rows of every live sequence behind its cached prefix ``P = seq_lens[b] - T`` -- ``"prefill"`` is the same plan run
@@ -304,9 +310,12 @@ def prepare_qwen_3_8_block_bf16(
     ``T`` and one past the table's reach are REPORTED in the plan's workspace (``-2`` / ``-3``) and never raised; the ring INPUT contract:
     positions ``4 floor(P / 4) .. P - 1`` already sit in the ring (the stack's own rule, or the block's previous chunk / step).  Mixed
     steps (decodes + prefills) are one decode plan and one extend plan per layer, run back to back; ragged chunks are several runs
-    grouped by their length.  At this pin one run holds at most 128 rows (``batch_size x q_len_per_req``): the indexer-band slab's
-    JIT projection route ends there (``extend_proj_slab_rows``: a longer prompt is several chunks).  A CUDA-graph capture of these forms
-    takes the run AFTER one eager warm-up on the capture stream (the first run uploads the select window plan's constants).
+    grouped by their length.  One run holds any ``batch_size x q_len_per_req`` the vendored block serves up to 65,535 rows (the launch-grid
+    bound of this pin, ``support.EXTEND_ROWS_GRID_MAX``: the vendored indexer's query compress launches with the run's row count as a CUDA
+    grid dimension; a longer run is the typed decline ``indexer_extend_grid_rows`` before any vendored code): past 128 rows the indexer-band
+    slab's projection takes the GEMM engine's own baseline tile for its shape on the same JIT-only route (the 6b21be0e0 pin: capture-safe,
+    no cuDNN handle; ``plan.declaration["proj_tile"]`` names it).  A CUDA-graph capture of these forms takes the run AFTER one eager warm-up
+    on the capture stream (the first run uploads the select window plan's constants).
 
     Parameters
     ----------
@@ -329,8 +338,10 @@ def prepare_qwen_3_8_block_bf16(
     kv_layout : str
         ``"NHD"``, ``"HND"`` or ``"UNIFIED"``.
     q_len_per_req : int
-        Decode: query rows per sequence (``1 + drafts``); at most ``INDEX_QUERY_ROWS_MAX // next_pow2(index_heads)`` = 16 at four heads.
-        Extend / prefill: the chunk's rows ``T`` (uniform over the batch), with ``batch_size x T <= 128`` and ``T <= max_pages x page_size``.
+        Decode: query rows per sequence (``1 + drafts``); at most ``INDEX_QUERY_ROWS_MAX // next_pow2(index_heads)`` = 16 at four heads,
+        and ``batch_size x q_len_per_req <= 65535`` (the launch-grid bound of one run at this pin, as on the extend / prefill forms).
+        Extend / prefill: the chunk's rows ``T`` (uniform over the batch), with ``T <= max_pages x page_size`` and
+        ``batch_size x T <= 65535`` (the launch-grid bound of one run at this pin; a longer chunk is several runs).
     max_pages : Optional[int]
         Table columns a step may address (default and, with ``block_table``, required: the table's width).
     block_table : Optional[torch.Tensor]
@@ -456,6 +467,8 @@ def qwen_3_8_block_bf16_decode(
     sparse_tile_form: str = "auto",
 ) -> torch.Tensor:
     """The decode form: ``batch`` sequences x ``q_len_per_req`` new tokens each over the paged caches, the selection made in the block.
+    One step holds at most 65,535 rows (``batch x q_len_per_req``) at this pin -- the launch-grid bound shared with the extend / prefill
+    forms (the step's query compress launches with the run's row count as a CUDA grid dimension); a wider step is the typed decline.
 
     Per step the block projects the step's rows (the Q / GATE / K / V bands and the indexer band), norms and rotates them, writes the K / V
     rows into the pools at ``slot_mapping`` and the raw indexer key into the ring, pools / norms / rotates the compressed key of the block a
