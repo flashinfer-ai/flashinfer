@@ -403,8 +403,8 @@ PACKAGES: tuple[Package, ...] = (
         refs_generic,
     ),
     Package(
-        "flashinfer.experimental.cake_dsa_indexer",
-        "flashinfer/experimental/cake_dsa_indexer",
+        "flashinfer.experimental.cake_dsa_indexer_det",
+        "flashinfer/experimental/cake_dsa_indexer_det",
         "cake_jit.py",
         refs_generic,
     ),
