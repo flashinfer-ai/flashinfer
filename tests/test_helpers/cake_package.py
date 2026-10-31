@@ -18,6 +18,7 @@ PACKAGES: dict[str, str] = {
     "cake_causal_conv1d_det_train": "flashinfer.cake_causal_conv1d_det_train_backend",
     "cake_gated_act_mxfp8": "flashinfer.cake_gated_act_mxfp8_backend",
     "cake_rmsnorm_silu_gate_det_train": "flashinfer.cake_rmsnorm_silu_gate_det_train_backend",
+    "cake_rmsnorm_silu_gate_train": "flashinfer.cake_rmsnorm_silu_gate_train_backend",
     "cake_ulysses": "flashinfer.cake_ulysses_backend",
     "cake_fused_qk_rope_append": "flashinfer.cake_fused_qk_rope_append_backend",
     "cake_sage_block_sparse_attention": "flashinfer.cake_sage_block_sparse_attention_backend",

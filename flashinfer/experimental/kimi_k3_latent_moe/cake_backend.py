@@ -637,13 +637,13 @@ def tail_sb_norm_n_pad(num_tokens: int, tp: int, num_partials: int) -> int:
 # that instance and, per part (SM count, architecture), per token count the fewest partials it serves there: the cells
 # where it measured faster than the route without it on that part (paired CUDA-graph timing, cold L2, both passes
 # beyond the A/A band), all of them cells whose route without it takes the resident-B arithmetic.  The TP1 rows serve
-# sm_103a parts only, the rows of 3 tokens on the 152-SM part from 9 partials.
+# sm_103a parts only.
 TAIL_SB_SPLIT_ROUTES: dict[int, tuple[int, dict[tuple[int, str], dict[int, int]]]] = {
     1: (
         32,
         {
             (148, "sm_103a"): {t: 8 for t in range(1, 9)},
-            (152, "sm_103a"): {t: 9 if t == 3 else 8 for t in range(1, 9)},
+            (152, "sm_103a"): {t: 8 for t in range(1, 9)},
         },
     ),
     8: (
