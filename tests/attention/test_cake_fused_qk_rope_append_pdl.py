@@ -29,9 +29,11 @@ Every call with ``enable_pdl=True`` must write the same bytes as a call with
 ``enable_pdl=False`` on the ``qkv`` the producer wrote: eagerly, over repeated
 calls whose producer output changes, and under CUDA graph replay with the
 producer output changing between replays.  The captured edge from the producer
-to the kernel is programmatic exactly where the package takes its pdl build
-(SM100 / SM103 on the problems ``PDL_POLICY`` admits); every other call is a
-plain launch.
+to the kernel is programmatic exactly where the package takes a pdl build
+(SM100 / SM103 on the problems ``PDL_POLICY`` admits, the build the policy names
+for each card); every other call is a plain launch.  An FP8 launch that takes a
+CTA cap (``max_ctas_per_sm``) runs at the smallest dynamic shared memory that
+holds the kernel to that many CTAs per SM.
 """
 
 from __future__ import annotations
@@ -161,6 +163,7 @@ class Problem:
     call: Callable[[bool], Any]
     stage: Callable[[bool], str]
     sources: list[torch.Tensor] = field(default_factory=list)
+    cap: Callable[[str], int] = lambda stage: 0
 
     def reset(self) -> None:
         for out, initial in zip(self.outputs, self.pristine, strict=True):
@@ -324,6 +327,24 @@ def _fp8_problem(case) -> Problem:
             enable_pdl=enable_pdl,
         )
 
+    def cap(name: str) -> int:
+        record = fp8_loader.MODULES[name]
+        num_sms = fp8_loader.sm_count(0)
+        grid = fp8_loader.launch_grid(
+            record, num_rows=rows, num_requests=batch, num_kv_heads=hkv, num_sms=num_sms
+        )
+        return fp8_loader.cta_cap(
+            record,
+            arch=fp8_loader.device_arch(0),
+            num_sms=num_sms,
+            num_q_heads=hq,
+            num_kv_heads=hkv,
+            num_rows=rows,
+            num_requests=batch,
+            is_prefill=case.prefill,
+            grid=grid,
+        )
+
     return Problem(
         qkv,
         [oq, qs, flags, kc, vc],
@@ -331,40 +352,91 @@ def _fp8_problem(case) -> Problem:
         call,
         stage,
         [*sources, decoy],
+        cap,
     )
 
 
 @dataclass(frozen=True)
 class Case:
-    """A problem and whether a call that asks for PDL takes the pdl build on
-    SM100 / SM103 (never on SM90)."""
+    """A problem and the build a call that asks for PDL takes per card (B200,
+    GB200, B300, GB300; never a pdl build on SM90): ``True`` the plain stage's
+    twin, ``False`` the plain stage, a name that pdl build.  ``cap`` is the
+    ``max_ctas_per_sm`` of that FP8 launch per card (0: none)."""
 
     label: str
     route: str
     heads: tuple[int, int]
     q_lens: tuple[int, ...]
     ctx_lens: tuple[int, ...]
-    pdl: dict[str, bool]
+    pdl: dict[str, bool | str]
     page_size: int = 64
     prefill: bool = False
     seed: int = 0
+    cap: dict[str, int] = field(default_factory=dict)
 
     def problem(self) -> Problem:
         return _bf16_problem(self) if self.route == "bf16" else _fp8_problem(self)
 
 
-_ON = {"sm_100a": True, "sm_103a": True}
-_OFF = {"sm_100a": False, "sm_103a": False}
+_CARDS = ("b200", "gb200", "b300", "gb300")
+_ON = dict.fromkeys(_CARDS, True)
+_OFF = dict.fromkeys(_CARDS, False)
+# The BF16 single-KV-head decode stage with one clearing unit per warp, and the
+# FP8 prefetching stages.
+_BF16_U1 = "hq8_hkv1_vsub3_d_lookup_rounds0_single_weight1_pdl"
+_ER2PP = "fp8_e4m3_early_rt21_page_prefetch1_clear_tie1_pdl"
 CASES = [
     Case("bf16_decode_8x1_b32", "bf16", (8, 1), (1,) * 32, (2048,) * 32, _ON, seed=1),
     Case("bf16_decode_64x8_b32", "bf16", (64, 8), (1,) * 32, (2048,) * 32, _ON, seed=2),
     Case("bf16_prefill_8x1_b4q64", "bf16", (8, 1), (64,) * 4, (500,) * 4, _ON, seed=3),
     Case("bf16_prefill_64x8_q128", "bf16", (64, 8), (128,), (1000,), _ON, seed=4),
     Case(
-        "bf16_decode_8x1_b512", "bf16", (8, 1), (1,) * 512, (300,) * 512, _OFF, seed=5
+        "bf16_decode_8x1_b512",
+        "bf16",
+        (8, 1),
+        (1,) * 512,
+        (300,) * 512,
+        _OFF,
+        seed=5,
+    ),
+    Case(
+        "bf16_decode_8x1_b520",
+        "bf16",
+        (8, 1),
+        (1,) * 520,
+        (300,) * 520,
+        dict.fromkeys(_CARDS, _BF16_U1),
+        seed=20,
+    ),
+    Case(
+        "bf16_decode_8x1_b1024",
+        "bf16",
+        (8, 1),
+        (1,) * 1024,
+        (300,) * 1024,
+        _ON,
+        seed=14,
     ),
     Case("bf16_prefill_64x8_q1024", "bf16", (64, 8), (1024,), (1024,), _OFF, seed=6),
-    Case("fp8_decode_8x1_b32", "fp8", (8, 1), (1,) * 32, (2048,) * 32, _ON, seed=7),
+    Case(
+        "fp8_decode_8x1_b32",
+        "fp8",
+        (8, 1),
+        (1,) * 32,
+        (2048,) * 32,
+        {**_ON, "gb300": _ER2PP},
+        seed=7,
+    ),
+    Case(
+        "fp8_decode_8x1_b32_page16",
+        "fp8",
+        (8, 1),
+        (1,) * 32,
+        (2048,) * 32,
+        {"b200": _ER2PP, "gb200": _ER2PP, "b300": _ER2PP, "gb300": True},
+        page_size=16,
+        seed=15,
+    ),
     Case("fp8_decode_64x8_b32", "fp8", (64, 8), (1,) * 32, (2048,) * 32, _ON, seed=8),
     Case(
         "fp8_prefill_8x1_b8q16",
@@ -392,8 +464,49 @@ CASES = [
         (8, 1),
         (1,) * 160,
         (300,) * 160,
-        {"sm_100a": False, "sm_103a": True},
+        _ON,
         seed=11,
+        cap={"b200": 3},
+    ),
+    Case(
+        "fp8_decode_8x1_b200",
+        "fp8",
+        (8, 1),
+        (1,) * 200,
+        (300,) * 200,
+        _ON,
+        seed=16,
+        cap=dict.fromkeys(_CARDS, 3),
+    ),
+    Case(
+        "fp8_decode_8x1_b200_ctx4000",
+        "fp8",
+        (8, 1),
+        (1,) * 200,
+        (4000,) * 200,
+        _OFF,
+        seed=17,
+    ),
+    Case(
+        "fp8_decode_8x1_b256",
+        "fp8",
+        (8, 1),
+        (1,) * 256,
+        (300,) * 256,
+        _ON,
+        seed=18,
+        cap=dict.fromkeys(_CARDS, 4),
+    ),
+    Case(
+        "fp8_prefill_8x1_b4q128",
+        "fp8",
+        (8, 1),
+        (128,) * 4,
+        (2048,) * 4,
+        _ON,
+        prefill=True,
+        seed=19,
+        cap=dict.fromkeys(_CARDS, 4),
     ),
     Case(
         "fp8_decode_64x8_b256", "fp8", (64, 8), (1,) * 256, (300,) * 256, _OFF, seed=12
@@ -412,8 +525,30 @@ CASES = [
 _IDS = [case.label for case in CASES]
 
 
-def _expects_pdl(case: Case, arch: str) -> bool:
-    return case.pdl.get(arch, False)
+def _card() -> str | None:
+    """The PDL policy's card of device 0, ``None`` off SM100 / SM103."""
+    arch = fp8_loader.device_arch(0)
+    if arch not in fp8_loader.PDL_POLICY["arches"]:
+        return None
+    return fp8_loader.pdl_card(arch, fp8_loader.sm_count(0))
+
+
+def _expected_stage(case: Case, plain: str) -> str:
+    card = _card()
+    expected = False if card is None else case.pdl[card]
+    if expected is True:
+        return plain + "_pdl"
+    return plain if expected is False else expected
+
+
+def _expects_pdl(case: Case) -> bool:
+    _arch()
+    return _card() is not None and case.pdl[_card()] is not False
+
+
+def _expected_cap(case: Case) -> int:
+    card = _card()
+    return 0 if card is None else case.cap.get(card, 0)
 
 
 # ----------------------------------------------------------------------------------------------
@@ -495,11 +630,13 @@ def _prepare(problem: Problem, producer, generation: int) -> None:
 
 @pytest.mark.parametrize("case", CASES, ids=_IDS)
 def test_enable_pdl_takes_the_pdl_build_where_measured(case):
-    arch = _arch()
+    _arch()
     problem = case.problem()
     plain, chosen = problem.stage(False), problem.stage(True)
     assert not plain.endswith("_pdl")
-    assert chosen == (plain + "_pdl" if _expects_pdl(case, arch) else plain)
+    assert chosen == _expected_stage(case, plain)
+    if case.route == "fp8":
+        assert problem.cap(chosen) == _expected_cap(case)
 
 
 @pytest.mark.parametrize("case", CASES, ids=_IDS)
@@ -596,9 +733,10 @@ def _graph_edges(graph_handle: int) -> list[tuple[int, int, int]]:
     ]
 
 
-def _kernel_graph(graph) -> tuple[list[str], list[tuple[int, int, int]]]:
+def _kernel_graph(graph, launches=None) -> tuple[list[str], list[tuple[int, int, int]]]:
     """Kernel node names and kernel-to-kernel edges of a captured graph that has
-    not been instantiated."""
+    not been instantiated; ``launches`` (a list) receives each kernel node's
+    ``(function, block threads, dynamic shared memory)``."""
     driver = pytest.importorskip("cuda.bindings.driver")
 
     def checked(result):
@@ -622,6 +760,9 @@ def _kernel_graph(graph) -> tuple[list[str], list[tuple[int, int, int]]]:
             func = checked(driver.cuKernelGetFunction(params.kern))
         index[int(node)] = len(names)
         names.append(checked(driver.cuFuncGetName(func)).decode())
+        if launches is not None:
+            threads = params.blockDimX * params.blockDimY * params.blockDimZ
+            launches.append((func, threads, int(params.sharedMemBytes)))
     edges = [
         (index[source], index[target], kind)
         for source, target, kind in _graph_edges(int(raw))
@@ -632,7 +773,7 @@ def _kernel_graph(graph) -> tuple[list[str], list[tuple[int, int, int]]]:
 
 @pytest.mark.parametrize("case", CASES, ids=_IDS)
 def test_the_producer_edge_is_programmatic_exactly_for_the_pdl_build(producer, case):
-    arch = _arch()
+    _arch()
     pytest.importorskip("cuda.bindings.driver")
     if not hasattr(torch.cuda.CUDAGraph, "raw_cuda_graph"):
         pytest.skip("reading graph edges requires CUDAGraph.raw_cuda_graph")
@@ -658,6 +799,59 @@ def test_the_producer_edge_is_programmatic_exactly_for_the_pdl_build(producer, c
         (copy_node,) = [i for i, n in enumerate(names) if "TriggerThenCopyKernel" in n]
         (edge,) = [(target, kind) for src, target, kind in edges if src == copy_node]
         assert "TriggerThenCopyKernel" not in names[edge[0]], names
-        programmatic = enable_pdl and _expects_pdl(case, arch)
+        programmatic = enable_pdl and _expects_pdl(case)
         expected = _PROGRAMMATIC_EDGE if programmatic else _DEFAULT_EDGE
         assert edge[1] == expected, (names, edges, enable_pdl)
+
+
+def _occupancy(func, threads: int, smem: int) -> int:
+    driver = pytest.importorskip("cuda.bindings.driver")
+    error, blocks = driver.cuOccupancyMaxActiveBlocksPerMultiprocessor(
+        func, threads, smem
+    )
+    assert error == driver.CUresult.CUDA_SUCCESS, repr(error)
+    return int(blocks)
+
+
+@pytest.mark.parametrize(
+    "case", [c for c in CASES if c.route == "fp8"], ids=lambda c: c.label
+)
+def test_a_capped_launch_holds_the_kernel_to_its_cap(producer, case):
+    _arch()
+    pytest.importorskip("cuda.bindings.driver")
+    if not hasattr(torch.cuda.CUDAGraph, "raw_cuda_graph"):
+        pytest.skip("reading graph nodes requires CUDAGraph.raw_cuda_graph")
+    problem = case.problem()
+    cap = problem.cap(problem.stage(True))
+    assert cap == _expected_cap(case)
+    source = _TriggerProducer(producer, problem)
+    stream = torch.cuda.Stream()
+    torch.cuda.synchronize()
+    with torch.cuda.stream(stream):
+        _prepare(problem, source, 0)
+        source.run()
+        problem.call(True)
+    stream.synchronize()
+    graph = torch.cuda.CUDAGraph(keep_graph=True)
+    with torch.cuda.graph(graph, stream=stream):
+        source.run()
+        problem.call(True)
+    stream.synchronize()
+    launches: list[tuple[Any, int, int]] = []
+    names, _ = _kernel_graph(graph, launches)
+    del graph
+    ((func, threads, smem),) = [
+        launch
+        for name, launch in zip(names, launches, strict=True)
+        if "TriggerThenCopyKernel" not in name
+    ]
+    if cap == 0:
+        assert smem == 0
+        return
+    unbounded = _occupancy(func, threads, 0)
+    if unbounded <= cap:
+        assert smem == 0, (unbounded, cap)
+        return
+    # The smallest dynamic shared memory, in 16-byte steps, that holds the
+    # kernel to the cap.
+    assert _occupancy(func, threads, smem) <= cap < _occupancy(func, threads, smem - 16)
