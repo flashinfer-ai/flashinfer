@@ -47,7 +47,8 @@ tvm_ffi = pytest.importorskip("tvm_ffi")  # the package's loaders import it
 import flashinfer.experimental.cake.cake_causal_conv1d_train_backend as pkg
 
 PACKAGE_DIR = Path(pkg.__file__).resolve().parent
-VENDORED_NAME = "vendored_causal_conv1d_train"  # the copy's top-level name in the subprocess
+# The copy's top-level name in the subprocess.
+VENDORED_NAME = "vendored_causal_conv1d_train"
 
 
 # ---------------------------------------------------------------------------
