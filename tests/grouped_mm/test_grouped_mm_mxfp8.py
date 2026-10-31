@@ -20,6 +20,19 @@ class TestGroupedMmMxfp8:
     """Tests for grouped_mm_mxfp8 (block-scaled MXFP8 grouped GEMM)."""
 
     MIN_COS_SIM = 0.9
+    # Expert segments that do not start on a multiple of 128 rows, the shape real
+    # routing produces. cuDNN reads token scales padded to 128 rows per group, so
+    # these exercise the re-layout in _segment_token_descale_per_group; before it,
+    # every segment that started mid-tile was silently wrong (or NaN).
+    UNALIGNED_SEGMENTS = [
+        [64, 64],
+        [120, 136],
+        [16, 48, 64],
+        [128, 64, 64],
+        [192, 64],
+        [13, 83, 0, 67, 77],
+    ]
+    MIN_SEGMENT_COS_SIM = 0.97
 
     @staticmethod
     def _quantize_a(a_bf16):
@@ -148,6 +161,101 @@ class TestGroupedMmMxfp8:
             dim=0,
         )
         assert cos_sim > self.MIN_COS_SIM
+
+    @requires_cudnn_moe_block_scale
+    @pytest.mark.parametrize("seg_lens", UNALIGNED_SEGMENTS)
+    def test_unaligned_segments(self, seg_lens):
+        """Segments starting off a 128-row boundary are as accurate as aligned ones."""
+        torch.manual_seed(3)
+        num_experts = len(seg_lens)
+        cum_m = sum(seg_lens)
+        k, n = 512, 256
+
+        a_bf16 = torch.randn(cum_m, k, dtype=torch.bfloat16, device="cuda")
+        b_bf16 = torch.randn(num_experts, n, k, dtype=torch.bfloat16, device="cuda")
+        m_indptr = torch.tensor(
+            [0, *torch.tensor(seg_lens).cumsum(0).tolist()],
+            dtype=torch.int32,
+            device="cuda",
+        )
+
+        a_mxfp8, a_scale = self._quantize_a(a_bf16)
+        b_mxfp8, b_scale = self._quantize_b(b_bf16)
+
+        out = grouped_mm_mxfp8(
+            a_mxfp8,
+            b_mxfp8,
+            a_scale,
+            b_scale,
+            m_indptr,
+            out_dtype=torch.bfloat16,
+        )
+        ref = ref_grouped_mm(a_bf16, b_bf16, m_indptr, out_dtype=torch.bfloat16)
+
+        assert torch.isfinite(out).all()
+        for e in range(num_experts):
+            start, end = m_indptr[e].item(), m_indptr[e + 1].item()
+            if start == end:
+                continue
+            cos_sim = F.cosine_similarity(
+                ref[start:end].reshape(-1).float(),
+                out[start:end].reshape(-1).float(),
+                dim=0,
+            )
+            assert cos_sim > self.MIN_SEGMENT_COS_SIM, (
+                f"segment {e} rows [{start}, {end}): cosine similarity {cos_sim:.4f}"
+            )
+
+    @requires_cudnn_moe_block_scale
+    @pytest.mark.parametrize("seg_lens", [[64, 64], [16, 48, 64]])
+    def test_token_scale_rows_read_per_group(self, seg_lens):
+        """Each output row uses its own token scale, also for groups after the first.
+
+        A = 1 and B = 1 with unit weight scales, and token row i carries one e8m0
+        scale 2^(e_i - 127) in all its k-blocks, so out[i] / k must equal that
+        scale exactly; a kernel that reads another row's scale (as cuDNN 9.26's
+        heuristic-best SM100 engine does under CUDA 13.4 for groups after the
+        first) fails here even though cosine-similarity tests stay near 0.96.
+        """
+        cum_m = sum(seg_lens)
+        assert cum_m == 128, "one 128-row scale block keeps the layout simple"
+        k, n = 512, 256
+        kb = k // 32
+        m_indptr = torch.tensor(
+            [0, *torch.tensor(seg_lens).cumsum(0).tolist()],
+            dtype=torch.int32,
+            device="cuda",
+        )
+        a = torch.ones(cum_m, k, device="cuda").to(torch.float8_e4m3fn)
+        b = torch.ones(len(seg_lens), n, k, device="cuda").to(torch.float8_e4m3fn)
+        b_scale = torch.full(
+            (len(seg_lens), n, kb), 127, dtype=torch.uint8, device="cuda"
+        )
+        # token scales in the F8_128x4 layout the quantizer produces: row r of the
+        # block, k-block kk sits at byte (kk // 4) * 512 + (r % 32) * 16 + (r // 32) * 4 + kk % 4
+        # 128 distinct e8m0 exponents, 2^-67 .. 2^60; k * scale stays finite in fp32
+        exps = [60 + i for i in range(cum_m)]
+        flat = torch.empty(cum_m * kb, dtype=torch.uint8)
+        for r in range(cum_m):
+            for kk in range(kb):
+                flat[(kk // 4) * 512 + (r % 32) * 16 + (r // 32) * 4 + kk % 4] = exps[r]
+        a_scale = flat.cuda().view(cum_m, kb)
+
+        out = grouped_mm_mxfp8(
+            a, b, a_scale, b_scale, m_indptr, out_dtype=torch.float32
+        )
+
+        got = out[:, 0] / k
+        want = torch.tensor([2.0 ** (e - 127) for e in exps], device="cuda")
+        assert torch.isfinite(out).all()
+        assert (out.max(dim=1).values == out.min(dim=1).values).all(), (
+            "a row must use one scale for every column"
+        )
+        wrong = (got != want).nonzero().flatten().tolist()
+        assert not wrong, (
+            f"{len(wrong)} of {cum_m} rows read another row's token scale; first wrong rows {wrong[:8]} "
+            f"(segments {seg_lens})"
+        )
 
     @requires_cudnn_moe_block_scale
     def test_single_expert(self):

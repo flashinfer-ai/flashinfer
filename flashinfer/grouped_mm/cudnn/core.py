@@ -402,6 +402,78 @@ def _run_cudnn_moe_grouped_gemm(
     return out
 
 
+def _segmented_token_scale_capacity_rows(total_rows: int, num_groups: int) -> int:
+    """Rows of the per-group-padded token scale blob cuDNN's MoE block-scale kernels read.
+
+    Mirrors cuDNN frontend's ``segmented_row_scale_capacity_rows``: with ``total_rows``
+    tokens split over at most ``num_groups`` non-empty groups, independently padding
+    every group to whole 128-row blocks needs at most ``A + (total_rows - A) // 128``
+    blocks, ``A = min(total_rows, num_groups)``. The bound is static, so the blob can
+    be sized without reading ``m_indptr`` on the host.
+    """
+    active = min(total_rows, num_groups)
+    return 128 * (active + (total_rows - active) // 128)
+
+
+def _segment_token_descale_per_group(
+    a_descale: torch.Tensor, m_indptr: torch.Tensor, cum_m: int, k_blocks: int
+) -> torch.Tensor:
+    """Re-lay A's block scales from one 128x4 swizzle over all ``cum_m`` tokens into
+    the layout cuDNN's MoE block-scale kernels read.
+
+    ``grouped_mm_fp4`` / ``grouped_mm_mxfp8`` take ``a_descale`` as one F8_128x4-reordered
+    tensor over every token, which is what the quantizers produce. cuDNN's MoE grouped
+    block-scale kernels (SM100 and SM12x) instead read token scales that are
+    F8_128x4-reordered and padded to whole 128-row blocks *per group*, groups
+    concatenated in order: group ``g`` starts at block ``sum(ceil(rows_g' / 128))`` over
+    the groups before it, and its rows are addressed group-locally. The two layouts
+    coincide only when every group starts on a multiple of 128 rows; for any other
+    ``m_indptr`` the kernel reads the wrong scales (or past the buffer) and returns
+    wrong values without an error.
+
+    One Triton kernel does it: each program writes one destination 128-row block,
+    finding its group from ``m_indptr`` on the device, so this needs no host
+    synchronization and is safe under CUDA graph capture. Padding rows are zero. Returns a dense ``(capacity_rows, round_up(k_blocks, 4))``
+    tensor of ``a_descale``'s dtype.
+    """
+    import triton
+
+    from ...triton.kernels.grouped_scale import segment_scale_128x4_per_group_kernel
+
+    cols = ((k_blocks + 3) // 4) * 4
+    col_words = cols // 4
+    rows = a_descale.numel() // cols
+    num_groups = m_indptr.numel() - 1
+    cap = _segmented_token_scale_capacity_rows(cum_m, num_groups)
+    src = a_descale.contiguous().view(torch.uint8).view(torch.int32)
+    dst = torch.empty(cap * col_words, dtype=torch.int32, device=a_descale.device)
+    block_c = min(32, triton.next_power_of_2(col_words))
+    grid = (cap // 128, triton.cdiv(col_words, block_c))
+    segment_scale_128x4_per_group_kernel[grid](
+        src,
+        dst,
+        m_indptr.to(dtype=torch.int32).contiguous(),
+        num_groups,
+        rows,
+        num_col_words=col_words,
+        BLOCK_G=max(16, triton.next_power_of_2(num_groups)),
+        BLOCK_C=block_c,
+    )
+    return dst.view(torch.uint8).view(cap, cols).view(a_descale.dtype)
+
+
+def _bind_as_declared(blob: torch.Tensor, declared: torch.Tensor) -> torch.Tensor:
+    """A view of ``blob`` with ``declared``'s shape and dense strides.
+
+    The graph declares the logical token scales, and cuDNN reads the scale buffer
+    through its base pointer, so the larger segmented blob is bound through a view
+    whose shape matches the declaration. Binding a tensor of a different shape makes
+    cuDNN take its per-call shape-override path, which costs tens of milliseconds of
+    host time per execute. The view keeps the blob alive.
+    """
+    return blob.reshape(-1)[: declared.numel()].view(declared.shape)
+
+
 @functools.lru_cache(maxsize=1024)
 def _build_cudnn_moe_block_scale_grouped_gemm_graph(
     handle,
@@ -423,6 +495,7 @@ def _build_cudnn_moe_block_scale_grouped_gemm_graph(
     output_cudnn_dtype,
     block_size,
     policy=None,
+    deselect_engines=(),
 ):
     if policy is None:
         policy = cudnn.build_plan_policy.HEURISTICS_CHOICE
@@ -519,10 +592,56 @@ def _build_cudnn_moe_block_scale_grouped_gemm_graph(
     graph.validate()
     graph.build_operation_graph()
     graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+    if deselect_engines:
+        graph.deselect_engines(list(deselect_engines))
     graph.check_support()
     graph.build_plans(policy)
 
     return graph, graph.get_workspace_size()
+
+
+def _mxfp8_engines_to_deselect(device: torch.device) -> tuple[str, ...]:
+    """Engines dropped from the MXFP8 grouped-GEMM plan list on one combination.
+
+    WORKAROUND(cudnn-frontend#2081): cuDNN 9.26's heuristic-best engine for this
+    graph ("eng0") reads the wrong token-scale rows for every group after the
+    first on compute capability 10.x parts under the CUDA 13.4 libraries; the
+    graph's other engine ("eng9") is correct, as is the same cuDNN under CUDA
+    13.0. Used by the MXFP8 runner and by the plan-count query, so ``tactic``
+    indices refer to the same plan list. Revert when cuDNN ships the fix.
+    """
+    if (
+        torch.cuda.get_device_capability(device)[0] == 10
+        and cudnn.backend_version() >= 92600
+        and _loaded_cuda_runtime_version() >= (13, 4)
+    ):
+        return ("eng0",)
+    return ()
+
+
+def _loaded_cuda_runtime_version() -> tuple[int, int]:
+    """(major, minor) of the CUDA runtime library loaded in this process.
+
+    Asked of the library itself (``cudaRuntimeGetVersion`` through ctypes on the
+    ``libcudart`` torch has already loaded), since ``torch.version.cuda`` is the
+    build version and the pip CUDA libraries can be newer. Falls back to
+    ``torch.version.cuda`` when the library cannot be queried.
+    """
+    major_str = (torch.version.cuda or "0").split(".")[0]
+    try:
+        import ctypes
+
+        lib = ctypes.CDLL(f"libcudart.so.{major_str}")
+        version = ctypes.c_int()
+        if lib.cudaRuntimeGetVersion(ctypes.byref(version)) == 0 and version.value > 0:
+            return version.value // 1000, (version.value % 1000) // 10
+    except OSError:
+        pass
+    parts = (torch.version.cuda or "0.0").split(".")
+    try:
+        return int(parts[0]), int(parts[1]) if len(parts) > 1 else 0
+    except ValueError:
+        return (0, 0)
 
 
 def _cudnn_moe_block_scale_grouped_gemm_plan_count(
@@ -547,6 +666,7 @@ def _cudnn_moe_block_scale_grouped_gemm_plan_count(
     """
     token_3d = a.unsqueeze(0)
     weight_3d = b.transpose(1, 2)
+    a_descale = a_descale.contiguous()
     token_descale_3d = a_descale.unsqueeze(0)
     weight_descale_3d = b_descale.transpose(1, 2)
     fto = _cudnn_moe_first_token_offset(m_indptr, a.shape[0])
@@ -585,6 +705,11 @@ def _cudnn_moe_block_scale_grouped_gemm_plan_count(
         _to_cudnn_dtype(out_dtype),
         block_size=block_size,
         policy=cudnn.build_plan_policy.ALL,
+        deselect_engines=(
+            _mxfp8_engines_to_deselect(a.device)
+            if a_descale.dtype == torch.uint8
+            else ()
+        ),
     )
     return graph.get_execution_plan_count()
 
@@ -616,7 +741,19 @@ def _run_cudnn_moe_block_scale_grouped_gemm_mxfp8(
     _, n, _ = b.shape
 
     token_3d = a.unsqueeze(0)
+    a_descale = a_descale.contiguous()
     token_descale_3d = a_descale.unsqueeze(0)
+    # The graph declares the logical token scales; the kernel reads the per-group
+    # padded blob (see _segment_token_descale_per_group), so that is what runs.
+    token_descale_runtime = _bind_as_declared(
+        _segment_token_descale_per_group(
+            a_descale,
+            m_indptr,
+            cum_m,
+            a.shape[1] // 32,  # MXFP8: one UE8M0 scale per 32
+        ),
+        a_descale,
+    ).unsqueeze(0)
     weight_3d = b.transpose(1, 2)
     weight_descale_3d = b_descale.transpose(1, 2)
     fto = _cudnn_moe_first_token_offset(m_indptr, cum_m)
@@ -650,6 +787,7 @@ def _run_cudnn_moe_block_scale_grouped_gemm_mxfp8(
         out_cudnn_dtype,
         block_size=32,
         policy=policy,
+        deselect_engines=_mxfp8_engines_to_deselect(a.device),
     )
 
     if out is None:
@@ -658,7 +796,7 @@ def _run_cudnn_moe_block_scale_grouped_gemm_mxfp8(
 
     variant_pack = {
         _CUDNN_UIDs.TOKEN.value: token_3d,
-        _CUDNN_UIDs.TOKEN_SCALE_FACTOR.value: token_descale_3d,
+        _CUDNN_UIDs.TOKEN_SCALE_FACTOR.value: token_descale_runtime,
         _CUDNN_UIDs.WEIGHT.value: weight_3d,
         _CUDNN_UIDs.WEIGHT_SCALE_FACTOR.value: weight_descale_3d,
         _CUDNN_UIDs.FIRST_TOKEN_OFFSET.value: fto,
@@ -717,7 +855,19 @@ def _run_cudnn_moe_block_scale_grouped_gemm_fp4(
     _, n, _ = b.shape
 
     token_3d = a.unsqueeze(0)
+    a_descale = a_descale.contiguous()
     token_descale_3d = a_descale.unsqueeze(0)
+    # The graph declares the logical token scales; the kernel reads the per-group
+    # padded blob (see _segment_token_descale_per_group), so that is what runs.
+    token_descale_runtime = _bind_as_declared(
+        _segment_token_descale_per_group(
+            a_descale,
+            m_indptr,
+            cum_m,
+            a.shape[1] * 2 // block_size,  # packed FP4: two per byte
+        ),
+        a_descale,
+    ).unsqueeze(0)
     weight_3d = b.transpose(1, 2)
     weight_descale_3d = b_descale.transpose(1, 2)
     fto = _cudnn_moe_first_token_offset(m_indptr, cum_m)
@@ -766,7 +916,7 @@ def _run_cudnn_moe_block_scale_grouped_gemm_fp4(
 
     variant_pack = {
         _CUDNN_UIDs.TOKEN.value: token_3d,
-        _CUDNN_UIDs.TOKEN_SCALE_FACTOR.value: token_descale_3d,
+        _CUDNN_UIDs.TOKEN_SCALE_FACTOR.value: token_descale_runtime,
         _CUDNN_UIDs.WEIGHT.value: weight_3d,
         _CUDNN_UIDs.WEIGHT_SCALE_FACTOR.value: weight_descale_3d,
         _CUDNN_UIDs.FIRST_TOKEN_OFFSET.value: fto,
