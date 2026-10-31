@@ -31,11 +31,14 @@ BF16 weight gradients, accumulation, ``compute_grad_weight=False``, grids of 1,
 3 and 7 CTAs (every CTA claims), empty work, a workspace reused across shapes
 (zero after every call), a workspace with nonzero scratch returned to zero by
 ``cake_rmsnorm_silu_gate_train_reset_workspace``, two streams with their own
-workspaces, CUDA Graph capture and replay, the autograd wrapper (non-reentrant
-checkpointing included), the state a checkpointed step keeps (FlashInfer issue
-#7039) and the mode policy: every compute and workspace entry point refuses any
-``deterministic`` but ``False``, and the backward alerts under
-``torch.use_deterministic_algorithms(True)``.
+workspaces, CUDA Graph capture and replay (captured calls without a
+workspace: one workspace per capture and capture stream, zero-filled outside
+the graph, no fill kernel in it; two such graphs replayed at the same time on
+two streams; the fill inside the graph past the graph-workspace limit), the
+autograd wrapper (non-reentrant checkpointing included), the state a
+checkpointed step keeps (FlashInfer issue #7039) and the mode policy: every
+compute and workspace entry point refuses any ``deterministic`` but ``False``,
+and the backward alerts under ``torch.use_deterministic_algorithms(True)``.
 
 This suite exercises the package alone, named once through
 ``tests.test_helpers.cake_package`` (so a vendored copy runs it unchanged), and
@@ -710,6 +713,173 @@ def test_cuda_graph_capture_and_replay():
         assert (err <= total.abs() * 2.0**-21 + total_mag * DW_MAG_TOL).all(), k
 
 
+def _kept_graph() -> torch.cuda.CUDAGraph:
+    try:
+        return torch.cuda.CUDAGraph(keep_graph=True)
+    except TypeError:
+        pytest.skip("listing graph nodes needs torch.cuda.CUDAGraph(keep_graph=True)")
+
+
+def _graph_node_types(graph: torch.cuda.CUDAGraph) -> list[str]:
+    """The node types of a graph captured with ``keep_graph=True``."""
+    driver = pytest.importorskip("cuda.bindings.driver")
+    handle = driver.CUgraph(graph.raw_cuda_graph())
+    _, _, count = driver.cuGraphGetNodes(handle)
+    _, nodes, count = driver.cuGraphGetNodes(handle, count)
+    return [
+        driver.cuGraphNodeGetType(node)[1].name.replace("CU_GRAPH_NODE_TYPE_", "")
+        for node in nodes[:count]
+    ]
+
+
+@pytest.fixture
+def reserve(monkeypatch: pytest.MonkeyPatch) -> dict:
+    """Fresh reserve and capture tables; the reserve of the current device,
+    filled and seen ready by eager calls without a workspace."""
+    monkeypatch.setattr(pkg, "_RESERVES", {})
+    monkeypatch.setattr(pkg, "_CAPTURE_WORKSPACES", {})
+    x, z, w, dy = make(17, 48, seed=69)
+    backward(dy, x, z, w, EPS)  # loads the module, fills the reserve
+    torch.cuda.synchronize()
+    backward(dy, x, z, w, EPS)  # sees the fill complete
+    torch.cuda.synchronize()
+    state = pkg._RESERVES[torch.cuda.current_device()]
+    assert len(state["ready"]) == pkg._RESERVE_SIZE and not state["pending"]
+    return state
+
+
+def test_capture_without_workspace_takes_a_reserve_workspace(reserve):
+    """Backwards without a caller workspace captured in one graph on one
+    stream share one zero-filled workspace taken from the reserve: the graph
+    holds the backward kernels only (no fill kernel, memset or event wait), for
+    both weight-gradient dtypes; every replay matches eager launches and leaves
+    the workspace zero; eager calls do not touch it."""
+    pytest.importorskip("cuda.bindings.runtime")
+    T, H = 129, 48
+    x, z, w, dy = make(T, H, seed=70)
+    dx_d, dz_d, _ = backward(dy, x, z, w, EPS)
+    dw64, mag = fp64_reference(dy, x, z, w, EPS)[3], magnitudes(dy, x, z, EPS)
+    main = torch.zeros(D, dtype=torch.float32, device="cuda")
+    backward(dy, x, z, w, EPS, grad_weight=main, accumulate_grad_weight=True)
+    torch.cuda.synchronize()
+    main.zero_()
+    ready = list(reserve["ready"])
+
+    def step():
+        outs = [backward(dy, x, z, w, EPS) for _ in range(2)]
+        backward(dy, x, z, w, EPS, grad_weight=main, accumulate_grad_weight=True)
+        return outs
+
+    graph = _kept_graph()
+    with torch.cuda.graph(graph):
+        outs = step()
+    types = _graph_node_types(graph)
+    assert types == ["KERNEL"] * 3, types
+    taken = [ws for ws in ready if all(ws is not r for r in reserve["ready"])]
+    assert len(taken) == 1 and len(reserve["ready"]) == len(ready) - 1
+    ws = taken[0]
+    for k in range(3):
+        backward(dy, x, z, w, EPS)  # an eager call between replays
+        graph.replay()
+        torch.cuda.synchronize()
+        for dx, dz, dw in outs:
+            assert torch.equal(dx, dx_d) and torch.equal(dz, dz_d), k
+            assert_dw_within(dw, dw64, mag, what=f"replay {k} dw")
+        assert not bool(ws.any()), k
+        err = (main.double() - (k + 1) * dw64).abs()
+        assert (err <= (k + 1) * (dw64.abs() * 2.0**-21 + mag * DW_MAG_TOL)).all(), k
+
+
+def test_graphs_without_workspace_replay_together_on_two_streams(reserve):
+    """Two graphs, each capturing a backward without a caller workspace, own
+    two reserve workspaces and replay at the same time on two streams, the
+    first replays right after the captures with no host synchronization."""
+    cases = [make(4097, 48, seed=71), make(1031, 16, seed=72)]
+    refs = [backward(dy, x, z, w, EPS) for x, z, w, dy in cases]
+    budgets = [
+        (fp64_reference(dy, x, z, w, EPS)[3], magnitudes(dy, x, z, EPS))
+        for x, z, w, dy in cases
+    ]
+    torch.cuda.synchronize()
+    graphs, outs, taken = [], [], []
+    for x, z, w, dy in cases:
+        ready = list(reserve["ready"])
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            outs.append(backward(dy, x, z, w, EPS))
+        graphs.append(graph)
+        taken += [ws for ws in ready if all(ws is not r for r in reserve["ready"])]
+    assert len(taken) == 2 and taken[0].data_ptr() != taken[1].data_ptr()
+    streams = [torch.cuda.Stream(), torch.cuda.Stream()]
+    for stream in streams:
+        stream.wait_stream(torch.cuda.current_stream())
+    results: list[list] = [[], []]
+    for _ in range(5):
+        for i, stream in enumerate(streams):
+            with torch.cuda.stream(stream):
+                graphs[i].replay()
+                results[i].append(tuple(t.clone() for t in outs[i]))
+    for stream in streams:
+        torch.cuda.current_stream().wait_stream(stream)
+    torch.cuda.synchronize()
+    for i in range(2):
+        dx_d, dz_d, _ = refs[i]
+        dw64, mag = budgets[i]
+        for dx, dz, dw in results[i]:
+            assert torch.equal(dx, dx_d) and torch.equal(dz, dz_d), i
+            assert_dw_within(dw, dw64, mag, what=f"graph {i} dw")
+        assert not bool(taken[i].any()), i
+
+
+def test_captured_calls_without_capture_ids_take_one_workspace_each(
+    reserve, monkeypatch
+):
+    """Without cuda-python's capture ids, each captured call takes its own
+    reserve workspace; replays stay correct and leave them zero."""
+    monkeypatch.setattr(pkg, "_cudart", lambda: None)
+    x, z, w, dy = make(129, 48, seed=74)
+    dx_d, dz_d, _ = backward(dy, x, z, w, EPS)
+    dw64, mag = fp64_reference(dy, x, z, w, EPS)[3], magnitudes(dy, x, z, EPS)
+    torch.cuda.synchronize()
+    ready = list(reserve["ready"])
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        outs = [backward(dy, x, z, w, EPS) for _ in range(3)]
+    taken = [ws for ws in ready if all(ws is not r for r in reserve["ready"])]
+    assert len(taken) == 3
+    for k in range(2):
+        graph.replay()
+        torch.cuda.synchronize()
+        for dx, dz, dw in outs:
+            assert torch.equal(dx, dx_d) and torch.equal(dz, dz_d), k
+            assert_dw_within(dw, dw64, mag, what=f"replay {k} dw")
+        assert not any(bool(ws.any()) for ws in taken), k
+
+
+def test_capture_with_no_ready_workspace_fills_in_the_graph(monkeypatch):
+    """With no ready reserve workspace a captured backward without a caller
+    workspace zero-fills one from the graph's pool inside the graph (a fill
+    kernel before the backward kernel) and stays correct."""
+    monkeypatch.setattr(pkg, "_RESERVES", {})
+    monkeypatch.setattr(pkg, "_CAPTURE_WORKSPACES", {})
+    monkeypatch.setattr(pkg, "_RESERVE_SIZE", 0)
+    x, z, w, dy = make(129, 48, seed=73)
+    dx_d, dz_d, _ = backward(dy, x, z, w, EPS)
+    dw64, mag = fp64_reference(dy, x, z, w, EPS)[3], magnitudes(dy, x, z, EPS)
+    torch.cuda.synchronize()
+    assert pkg._RESERVES[torch.cuda.current_device()]["blocks"] == []
+    graph = _kept_graph()
+    with torch.cuda.graph(graph):
+        dx, dz, dw = backward(dy, x, z, w, EPS)
+    types = _graph_node_types(graph)
+    assert types == ["KERNEL", "KERNEL"], types
+    for k in range(3):
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(dx, dx_d) and torch.equal(dz, dz_d), k
+        assert_dw_within(dw, dw64, mag, what=f"replay {k} dw")
+
+
 def test_autograd_matches_functional_and_checkpoint(launches):
     x, z, w, dy = make(513, 48, seed=8)
     # the functional entry points' bits
@@ -890,10 +1060,12 @@ def test_checkpointed_steps_keep_only_the_stream_workspace(monkeypatch):
     """FlashInfer issue #7039: a non-reentrant checkpointed forward keeps nothing
     alive but its output, and once the first step has run, every checkpointed
     forward and backward leaves ``torch.cuda.memory_allocated()`` unchanged.  The
-    one buffer kept across steps is the workspace of the backward without a
-    caller workspace: one per (device, stream, backward module), of
-    ``workspace_bytes`` bytes."""
+    buffers kept across steps are the workspace of the backward without a
+    caller workspace, one per (device, stream, backward module) of
+    ``workspace_bytes`` bytes, and the device's reserve of zero-filled
+    workspaces for CUDA Graph captures (one allocation)."""
     monkeypatch.setattr(pkg, "_STREAM_WORKSPACES", {})
+    monkeypatch.setattr(pkg, "_RESERVES", {})
     # Small enough for the caching allocator's small pool, whose blocks are the
     # requested sizes rounded up to 512 bytes.
     x, z, w, dy = make(17, 48, seed=63)
@@ -920,7 +1092,10 @@ def test_checkpointed_steps_keep_only_the_stream_workspace(monkeypatch):
     assert list(pkg._STREAM_WORKSPACES) == [key]
     sums, _ = pkg._STREAM_WORKSPACES[key]
     assert sums.untyped_storage().nbytes() == nbytes
-    assert nbytes <= kept < nbytes + 512, (kept, nbytes)
+    (block,) = pkg._RESERVES[torch.cuda.current_device()]["blocks"]
+    reserved = block.untyped_storage().nbytes()
+    assert reserved == pkg._RESERVE_SIZE * 544 * 8, reserved
+    assert nbytes + reserved <= kept < nbytes + reserved + 512, (kept, nbytes)
     base = torch.cuda.memory_allocated()
     for step in range(3):
         y = checkpointed()

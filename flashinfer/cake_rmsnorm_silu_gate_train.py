@@ -85,7 +85,11 @@ that anything else wrote into, must be zeroed with
 before its next backward.  It is not interchangeable with the deterministic
 package's partial buffer.  Calls without a workspace use one 4104-byte buffer
 per device, stream and weight-gradient dtype, kept for later calls; the
-autograd node retains nothing else.
+autograd node retains nothing else.  They also keep a reserve of 64
+zero-filled 4104-byte buffers per device (about 272 KiB, filled outside any
+capture): a call during CUDA Graph capture takes one per capture and capture
+stream from it and keeps it for the life of the process, so a replay launches
+no fill kernel (with none ready, the graph zero-fills a buffer of its own).
 
 Beside kernels resident on other streams (FlashInfer issue #7548; observed on
 B200, sm_100a): each CTA of the non-deterministic backward needs 16640 bytes of
@@ -421,8 +425,9 @@ def cake_rmsnorm_silu_gate_train_backward(
         wrote into it).  When omitted: the deterministic package allocates its
         buffer per call; the non-deterministic backward uses one zero-filled
         buffer per device, stream and weight-gradient dtype, kept for later
-        calls (a call during CUDA Graph capture allocates its own).  One buffer
-        per backward that may run at the same time on another stream.
+        calls (during CUDA Graph capture, one zero-filled buffer per capture
+        and capture stream, from a reserve those calls keep).  One buffer per
+        backward that may run at the same time on another stream.
     deterministic : bool
         ``True`` (default) runs the deterministic package's backward
         (:func:`flashinfer.cake_rmsnorm_silu_gate_det_train.cake_rmsnorm_silu_gate_det_train_backward`)

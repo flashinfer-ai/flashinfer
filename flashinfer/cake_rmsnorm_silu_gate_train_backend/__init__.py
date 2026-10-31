@@ -79,8 +79,11 @@ Host design (the input layout rules are the deterministic package's):
   stream, backward module), allocated on first use and kept in
   ``_STREAM_WORKSPACES`` for later calls: 4104 bytes each, at most one per
   weight-gradient dtype (two backward modules) for every stream that ran such
-  a backward.  A call during CUDA Graph capture allocates its own workspace
-  instead, owned by the graph.
+  a backward.  Such eager calls also keep a reserve of 64 zero-filled
+  workspaces per device (one allocation of about 272 KiB, filled outside any
+  capture), from which a call during CUDA Graph capture takes the workspace of
+  its capture and capture stream for good, so a replay launches no fill kernel
+  (see ``_RESERVES``; with none ready, the graph zero-fills one of its own).
 - Grids: the forward launches one CTA per block of 16 rows.  The backward
   launches ``cake_jit.backward_ctas`` CTAs, ``G = min(row blocks,
   ctas_per_sm * SMs)`` with ``ctas_per_sm = 4``, so at most one wave.  With at
@@ -103,6 +106,7 @@ Host design (the input layout rules are the deterministic package's):
 from __future__ import annotations
 
 import functools
+import threading
 import warnings
 from typing import Any, Optional
 
@@ -485,10 +489,121 @@ def cake_rmsnorm_silu_gate_train_reset_workspace(
 # per (device, stream, backward module), zero-filled once and kept for the
 # process (4104 bytes each, at most two per stream).  Every backward leaves its
 # workspace zero and the calls of one stream run in order, so they share it (no
-# allocation and no fill per call).  A call during CUDA Graph capture allocates
-# its own instead, so a graph replayed on another stream never shares a buffer
-# with eager calls.
+# allocation and no fill per call).  A call during CUDA Graph capture uses a
+# workspace of its capture instead (``_capture_workspace``), so a graph replayed
+# on another stream never shares a buffer with eager calls or other graphs.
 _STREAM_WORKSPACES: dict[tuple[int, int, str], tuple[torch.Tensor, torch.Tensor]] = {}
+
+# The workspaces of captured calls without a caller workspace.  A replay must
+# find its workspace zero when the backward kernel starts and no other launch
+# may use it, yet a fill inside the graph adds a kernel to every replay (and an
+# event wait between two kernels costs more).  So eager calls without a caller
+# workspace keep a reserve of zero-filled workspaces per device, filled outside
+# any capture: ``_RESERVE_SIZE`` at a time from one allocation, each ready once
+# a later eager call has seen its fill complete (``Event.query``).  The first
+# such call of a capture on a capture stream takes a ready one for good and
+# adds no node to the graph: the first replay finds it zero, every launch
+# leaves it zero, launches of one graph never overlap, and no other launch gets
+# it.  Later calls of the same capture on the same capture stream run after it
+# in the graph and reuse it (capture ids from cuda-python; without it, each
+# captured call takes its own).  No graph can tell this package when it is
+# destroyed, so the reserve's memory is kept for the process: at most
+# ``_GRAPH_WORKSPACE_LIMIT`` workspaces per device.  With none ready (the
+# reserve still filling or used up), a captured call zero-fills a workspace from
+# the graph's pool inside the graph (one fill kernel per call and replay).
+# ``_RESERVE_LOCK`` serializes the reserve's bookkeeping between threads, so a
+# workspace moves to ready once, after its fill was seen complete.
+_RESERVE_SIZE = 64
+_GRAPH_WORKSPACE_LIMIT = 1024
+# device index -> {"ready": [workspace, ...], "pending": [(event recorded after
+# the fill, [workspace, ...]), ...], "blocks": [allocation, ...], "carved": int}
+_RESERVES: dict[int, dict[str, Any]] = {}
+# (device index, capture stream) -> (capture id, the workspace of that capture)
+_CAPTURE_WORKSPACES: dict[tuple[int, int], tuple[int, torch.Tensor]] = {}
+_RESERVE_LOCK = threading.Lock()
+
+
+def _refill_reserve(arch: str, device: torch.device) -> None:
+    """Eager calls: move filled reserve workspaces to ready and, below half the
+    reserve and under the limit, zero-fill ``_RESERVE_SIZE`` more on the
+    current stream (no host synchronization)."""
+
+    index = _device_index(device)
+    with _RESERVE_LOCK:
+        reserve = _RESERVES.get(index)
+        if reserve is None:
+            reserve = _RESERVES[index] = {
+                "ready": [],
+                "pending": [],
+                "blocks": [],
+                "carved": 0,
+            }
+        pending = reserve["pending"]
+        while pending and pending[0][0].query():
+            reserve["ready"].extend(pending.pop(0)[1])
+        waiting = sum(len(workspaces) for _, workspaces in pending)
+        count = min(_RESERVE_SIZE, _GRAPH_WORKSPACE_LIMIT - reserve["carved"])
+        if 2 * (len(reserve["ready"]) + waiting) >= _RESERVE_SIZE or count <= 0:
+            return
+        elements = _workspace_elements(arch)
+        stride = -(-elements // 32) * 32  # 256-byte aligned workspaces
+        block = torch.zeros(count * stride, dtype=torch.float64, device=device)
+        filled = torch.cuda.Event()
+        filled.record(torch.cuda.current_stream(device))
+        reserve["blocks"].append(block)
+        reserve["carved"] += count
+        pending.append(
+            (filled, [block[i * stride : i * stride + elements] for i in range(count)])
+        )
+
+
+@functools.cache
+def _cudart() -> Any:
+    """cuda-python's runtime module, or None when it is not installed."""
+
+    try:
+        from cuda.bindings import runtime
+    except ImportError:
+        return None
+    return runtime
+
+
+def _capture_id(cudart: Any, stream: Any) -> Optional[int]:
+    """The id of the capture in progress on ``stream``, or None."""
+
+    result = cudart.cudaStreamGetCaptureInfo(cudart.cudaStream_t(stream.cuda_stream))
+    if (
+        result[0] != cudart.cudaError_t.cudaSuccess
+        or result[1] != cudart.cudaStreamCaptureStatus.cudaStreamCaptureStatusActive
+    ):
+        return None
+    return int(result[2])
+
+
+def _capture_workspace(arch: str, device: torch.device) -> torch.Tensor:
+    """The FP64 workspace of a call without a caller workspace during CUDA
+    Graph capture on the current stream of ``device``."""
+
+    index = _device_index(device)
+    stream = torch.cuda.current_stream(device)
+    cudart = _cudart()
+    capture = None if cudart is None else _capture_id(cudart, stream)
+    key = (index, stream.cuda_stream)
+    if capture is not None:
+        held = _CAPTURE_WORKSPACES.get(key)
+        if held is not None and held[0] == capture:
+            return held[1]
+    with _RESERVE_LOCK:
+        reserve = _RESERVES.get(index)
+        workspace = reserve["ready"].pop() if reserve and reserve["ready"] else None
+    if workspace is None:
+        # Inside the graph: from its pool, zero-filled at every replay.
+        return torch.zeros(
+            _workspace_elements(arch), dtype=torch.float64, device=device
+        )
+    if capture is not None:
+        _CAPTURE_WORKSPACES[key] = (capture, workspace)
+    return workspace
 
 
 def _stream_workspace_views(
@@ -498,11 +613,8 @@ def _stream_workspace_views(
     ``name`` for a call without a caller workspace."""
 
     if torch.cuda.is_current_stream_capturing():
-        return _workspace_views(
-            torch.zeros(_workspace_elements(arch), dtype=torch.float64, device=device),
-            name,
-            device,
-        )
+        return _workspace_views(_capture_workspace(arch, device), name, device)
+    _refill_reserve(arch, device)
     key = (_device_index(device), torch.cuda.current_stream(device).cuda_stream, name)
     views = _STREAM_WORKSPACES.get(key)
     if views is None:
@@ -680,8 +792,10 @@ def cake_rmsnorm_silu_gate_train_backward(
     :func:`flashinfer.cake_rmsnorm_silu_gate_train.cake_rmsnorm_silu_gate_train_backward`;
     ``workspace`` is this package's FP64 buffer
     (:func:`cake_rmsnorm_silu_gate_train_backward_workspace`) or ``None`` (the
-    buffer of the current device and stream) and ``deterministic`` must be
-    ``False``.  Under ``torch.use_deterministic_algorithms(True)`` a call with
+    buffer of the current device and stream; during CUDA Graph capture, a
+    zero-filled buffer of the capture and capture stream) and
+    ``deterministic`` must be ``False``.  Under
+    ``torch.use_deterministic_algorithms(True)`` a call with
     ``compute_grad_weight=True`` raises PyTorch's alert (``RuntimeError``; a
     ``UserWarning`` under ``warn_only=True``, then it runs) before any
     validation or launch.
