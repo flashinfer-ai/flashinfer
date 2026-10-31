@@ -253,6 +253,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "workspace_rule": {
             "acc": "float32",
             "kind": "accumulators",
+            "slots": 1,
             "taps": 4,
             "work": "uint32",
         },
@@ -341,6 +342,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "workspace_rule": {
             "acc": "float32",
             "kind": "accumulators",
+            "slots": 1,
             "taps": 4,
             "work": "uint32",
         },
@@ -445,6 +447,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "workspace_rule": {
             "acc": "float32",
             "kind": "accumulators",
+            "slots": 1,
             "taps": 4,
             "work": "uint32",
         },
