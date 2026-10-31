@@ -55,9 +55,9 @@
     }
   },
   "generator": {
-    "cake_revision": "e6f54fc372bdd200cfa6e715ff0f25d49b6bfaf5",
+    "cake_revision": "64e7f9be276d76239acc510a268a4202b0a22666",
     "cuda": "13.4.92",
-    "rendered_at": "2026-10-31T06:49:34Z"
+    "rendered_at": "2026-10-31T14:34:39Z"
   },
   "libraries": [
     {
