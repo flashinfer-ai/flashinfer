@@ -18,8 +18,9 @@ mixing with a fixed ``HC=4`` sub-head layout.
 Training mHC (Cake)
 -------------------
 
-Four-stream mHC training forward / backward for hidden size 4096 on SM100,
-SM103 and SM107: the forward mapping, coefficients and collapse
+Four-stream mHC training forward / backward for hidden sizes 4096, 5120 and
+7168 on SM100 and SM103 (4096 on SM107); each call takes the hidden size ``H``
+from ``X`` ``[T, 4, H]``: the forward mapping, coefficients and collapse
 (``forward_prepare``), the residual mixing (``forward_finish``), the branch
 gradient and gradient statistics (``backward_prepare``), the single-cast input
 gradient with fixed-order FP32 parameter gradients (``backward_finish``),
@@ -28,11 +29,12 @@ external branch. The caller holds the workspaces:
 ``cake_mhc_det_train_forward_workspace_bytes`` / ``cake_mhc_det_train_forward_workspace``
 and ``cake_mhc_det_train_backward_workspace_bytes`` /
 ``cake_mhc_det_train_backward_workspace`` size and allocate a zero-initialized
-buffer that serves every token count up to ``T``,
+buffer for one hidden size (``hidden=``, default 4096) that serves the calls of
+that hidden size for every token count up to ``T``,
 ``cake_mhc_det_train_reset_workspace`` returns such a caller-owned buffer to its
 first-use state after an interrupted launch or capture, and
-``is_cake_mhc_det_train_supported`` reports whether a device has every exported
-route.
+``is_cake_mhc_det_train_supported`` reports whether a device (optionally at a given
+hidden size) has every exported route.
 
 CUDA graphs: one training iteration -- the direct entry points, or
 ``cake_mhc_det_train_prepare`` / ``cake_mhc_det_train_finish`` around the external
@@ -50,6 +52,19 @@ at zero, so a replay needs no host-side reset.
 ``cake_mhc_det_train_reset_workspace`` restores a caller-owned workspace after an
 interrupted launch or capture; callers that need this recovery pass their own
 workspaces.
+
+Side streams: ``forward_prepare`` and ``backward_finish`` keep running while a
+kernel on another stream holds some SMs, or holds one CTA on every SM that was
+launched with a shared-memory carveout preference of at least 50 percent
+(``cudaFuncAttributePreferredSharedMemoryCarveout``). With the driver's default
+carveout such a side CTA leaves room for at most 1 KB of dynamic shared memory
+next to it on its SM, so every launch that needs more waits until the side
+kernel's first CTA exits; raise the side kernel's carveout preference to avoid
+this. Under a side kernel that holds every SM, ``backward_finish`` still waits
+at some token counts up to 4096 on SM100 at hidden 4096, at every token count
+up to 4096 on SM100 at hidden 5120 and 7168, at token counts up to 1535
+(hidden 5120) and 1151 (hidden 7168) on SM103, and on SM107, which keeps the
+static schedule.
 
 .. currentmodule:: flashinfer.cake_mhc_det_train
 
@@ -92,12 +107,13 @@ with a ``deterministic: bool = True`` keyword on every entry point except
 ``cake_mhc_train_reset_workspace`` and ``route_key``.
 
 * ``deterministic=True`` (default) runs ``flashinfer.cake_mhc_det_train``
-  unchanged.
+  unchanged, for hidden sizes 4096, 5120 and 7168 (4096 on SM107).
 * ``deterministic=False`` runs the non-deterministic package
-  ``flashinfer.experimental.cake.cake_mhc_train_backend``. Its backward has no
-  final reduction kernel: the column-slab pass adds the ``dfn`` sum of every
-  (column slab, token chunk) unit into ``dfn`` with FP32 reductions and folds
-  ``dscale`` / ``dbase`` in the same grid.
+  ``flashinfer.experimental.cake.cake_mhc_train_backend``, for hidden size 4096
+  only; its entry points raise ``ValueError`` for another hidden size. Its
+  backward has no final reduction kernel: the column-slab pass adds the ``dfn``
+  sum of every (column slab, token chunk) unit into ``dfn`` with FP32 reductions
+  and folds ``dscale`` / ``dbase`` in the same grid.
 
 Numerical contract of ``deterministic=False``: only the summation order of
 ``dfn`` varies from run to run. Each element lies within ``P`` FP32 roundings
@@ -122,7 +138,9 @@ Interaction with ``torch.use_deterministic_algorithms(True)``:
 * Every compute and workspace entry point of the non-deterministic package
   raises ``ValueError`` unless ``deterministic=False``.
 
-Workspaces: the forward workspace has one layout in both modes. The
+Workspaces: the workspace helpers take the deterministic package's
+``hidden=`` keyword (default 4096); ``deterministic=False`` accepts 4096 only.
+The forward workspace has one layout in both modes. The
 ``deterministic=False`` backward workspace is the deterministic one at the same
 offsets without the per-chunk FP32 ``dfn`` partials (``P x 24 x 16384 x 4``
 bytes), so ``cake_mhc_train_backward_workspace(T, device, deterministic=True)``

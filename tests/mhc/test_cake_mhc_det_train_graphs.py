@@ -14,7 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 CUDA-graph capture of the Cake four-stream mHC training entry points (hidden
-4096, 4 streams; SM100 / SM103 / SM107).
+4096, 5120 and 7168, 4 streams; SM100 / SM103 at the three hidden sizes, SM107
+at 4096).  Every case runs at each hidden size the device's architecture
+exports (workspaces sized with ``hidden=``); a size it does not export is
+skipped with the reason.
 
 One training iteration of a layer -- prepare, an external branch ``B = U @ W``
 (BF16, ``W`` fixed), finish, the loss and its backward -- is captured whole
@@ -42,6 +45,8 @@ values.
 
 from __future__ import annotations
 
+import gc
+
 import pytest
 import torch
 from torch.utils.checkpoint import checkpoint
@@ -52,7 +57,8 @@ pkg = cake_package("cake_mhc_det_train")
 loader = cake_package("cake_mhc_det_train", "cake_jit")
 
 SUPPORTED_CAPABILITIES = ((10, 0), (10, 3), (10, 7))
-STREAMS, HIDDEN, N, MAPPING_ROWS = 4, 4096, 16384, 24
+STREAMS, MAPPING_ROWS = 4, 24
+HIDDEN_SIZES = tuple(loader.HIDDEN_SIZES)
 BF16, F32 = torch.bfloat16, torch.float32
 REPLAYS = 3
 
@@ -84,28 +90,54 @@ def warmup_jit():
     yield
 
 
-def _inputs(T: int, seed: int) -> dict:
+@pytest.fixture(autouse=True)
+def collect_graphs():
+    """Free leftover CUDA graphs before and after each case.
+
+    ``torch.cuda.make_graphed_callables`` keeps its graphs in reference cycles,
+    so only the cyclic collector frees them; a collection that runs inside a
+    later capture would release a graph's memory pool there and invalidate
+    that capture.
+    """
+    gc.collect()
+    yield
+    gc.collect()
+
+
+@pytest.fixture(params=HIDDEN_SIZES, ids=lambda h: f"H{h}")
+def hidden(request) -> int:
+    """The hidden size of a case (every size of the package; skipped where the architecture has no route)."""
+    arch = loader.arch_for_capability(torch.cuda.get_device_capability(_device()))
+    sizes = tuple(loader.supported_hidden_sizes(arch)) if arch else ()
+    if request.param not in sizes:
+        pytest.skip(
+            f"hidden {request.param} has no exported route on {arch} (exported hidden sizes: {sizes})"
+        )
+    return request.param
+
+
+def _inputs(T: int, seed: int, hidden: int) -> dict:
     g = torch.Generator(device=_device()).manual_seed(seed)
 
     def randn(*shape: int, dtype: torch.dtype = F32) -> torch.Tensor:
         return torch.randn(*shape, generator=g, device=_device(), dtype=F32).to(dtype)
 
     return {
-        "X": randn(T, STREAMS, HIDDEN, dtype=BF16),
-        "fn": (randn(MAPPING_ROWS, N) * 1e-2).contiguous(),
+        "X": randn(T, STREAMS, hidden, dtype=BF16),
+        "fn": (randn(MAPPING_ROWS, STREAMS * hidden) * 1e-2).contiguous(),
         "scale": 1.0 + 0.1 * randn(3),
         "base": 0.1 * randn(MAPPING_ROWS),
-        "W": (randn(HIDDEN, HIDDEN) / 64.0).to(BF16),
-        "dY": randn(T, STREAMS, HIDDEN, dtype=BF16),
+        "W": (randn(hidden, hidden) / 64.0).to(BF16),
+        "dY": randn(T, STREAMS, hidden, dtype=BF16),
     }
 
 
-def _workspaces(T: int, caller_owned: bool):
+def _workspaces(T: int, caller_owned: bool, hidden: int):
     if not caller_owned:
         return None, None
     return (
-        pkg.cake_mhc_det_train_forward_workspace(T, _device()),
-        pkg.cake_mhc_det_train_backward_workspace(T, _device()),
+        pkg.cake_mhc_det_train_forward_workspace(T, _device(), hidden=hidden),
+        pkg.cake_mhc_det_train_backward_workspace(T, _device(), hidden=hidden),
     )
 
 
@@ -236,12 +268,12 @@ def _capture_and_replay(make) -> list:
 
 @pytest.mark.parametrize("T", (1, 129, 2049))
 @pytest.mark.parametrize("caller_owned", (False, True))
-def test_direct_entry_points_capture(T: int, caller_owned: bool) -> None:
-    i = _inputs(T, seed=7046 + T)
-    wsf, wsb = _workspaces(T, caller_owned)
+def test_direct_entry_points_capture(T: int, caller_owned: bool, hidden: int) -> None:
+    i = _inputs(T, seed=7046 + T, hidden=hidden)
+    wsf, wsb = _workspaces(T, caller_owned, hidden)
     ref = _eager(lambda: _direct_step(i, wsf, wsb))
     for r, got in enumerate(_capture_and_replay(lambda: _direct_step(i, wsf, wsb))):
-        _assert_bitwise(ref, got, f"direct T={T} replay {r}")
+        _assert_bitwise(ref, got, f"direct T={T} H={hidden} replay {r}")
 
 
 @pytest.mark.parametrize("T", (1, 129, 2049))
@@ -249,24 +281,26 @@ def test_direct_entry_points_capture(T: int, caller_owned: bool) -> None:
 @pytest.mark.parametrize("ckpt", (False, True))
 @pytest.mark.parametrize("caller_owned", (False, True))
 def test_autograd_iteration_capture(
-    T: int, save_stats: bool, ckpt: bool, caller_owned: bool
+    T: int, save_stats: bool, ckpt: bool, caller_owned: bool, hidden: int
 ) -> None:
-    i = _inputs(T, seed=7146 + T)
-    wsf, wsb = _workspaces(T, caller_owned)
+    i = _inputs(T, seed=7146 + T, hidden=hidden)
+    wsf, wsb = _workspaces(T, caller_owned, hidden)
 
     def make():
         return _autograd_step(i, wsf, wsb, save_stats=save_stats, ckpt=ckpt)
 
     ref = _eager(make)
     for r, got in enumerate(_capture_and_replay(make)):
-        _assert_bitwise(ref, got, f"autograd ckpt={ckpt} T={T} replay {r}")
+        _assert_bitwise(ref, got, f"autograd ckpt={ckpt} T={T} H={hidden} replay {r}")
 
 
 @pytest.mark.parametrize("T", (129, 2049))
 @pytest.mark.parametrize("save_stats", (True, False))
 @pytest.mark.parametrize("ckpt", (False, True))
-def test_make_graphed_callables(T: int, save_stats: bool, ckpt: bool) -> None:
-    i = _inputs(T, seed=7246 + T)
+def test_make_graphed_callables(
+    T: int, save_stats: bool, ckpt: bool, hidden: int
+) -> None:
+    i = _inputs(T, seed=7246 + T, hidden=hidden)
     layer = _layer(i, None, None, save_stats)
     if ckpt:
 
@@ -290,7 +324,9 @@ def test_make_graphed_callables(T: int, save_stats: bool, ckpt: bool) -> None:
     for r in range(REPLAYS):
         # New values of the same shapes on every call: a call whose graphs did
         # not replay would return the previous call's outputs and fail.
-        ir = _inputs(T, seed=7246 + T + 1000 * (r + 1))
+        ir = _inputs(T, seed=7246 + T + 1000 * (r + 1), hidden=hidden)
         ref = run(fwd, ir)
         got = run(graphed, ir)
-        _assert_bitwise(ref, got, f"make_graphed_callables ckpt={ckpt} T={T} call {r}")
+        _assert_bitwise(
+            ref, got, f"make_graphed_callables ckpt={ckpt} T={T} H={hidden} call {r}"
+        )

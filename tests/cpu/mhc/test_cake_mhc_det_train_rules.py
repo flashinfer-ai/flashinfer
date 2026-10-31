@@ -67,6 +67,20 @@ import pytest
 from tests.test_helpers.cake_package import cake_package
 
 loader = cake_package("cake_mhc_det_train", "cake_jit")
+# The tables of record of this module describe the hidden size 4096: the H 4096 records, their routes and record
+# scalars. The sizes 5120 / 7168 are checked in test_cake_mhc_det_train_rules_hidden.py.
+H4096_MODULES = {
+    name: record for name, record in loader.MODULES.items() if record["hidden"] == 4096
+}
+H4096_ROUTES = {
+    arch: {key: names for key, names in routes.items() if key.endswith("_h4096")}
+    for arch, routes in loader.ROUTES.items()
+}
+H4096_SCALARS = {
+    name: scalars
+    for name, scalars in loader.RECORD_SCALARS.items()
+    if name in H4096_MODULES
+}
 
 SM_COUNTS = (148, 152, 208, 216)
 BOARDS = (("sm_100a", 148), ("sm_103a", 152), ("sm_107a", 208), ("sm_107a", 216))
@@ -83,10 +97,13 @@ MAP_LIBRARY = {
     "nsx_st5_mb1": "cake_mhc_det_train_fwd_map__nsx_st5_mb1",
     "nsx_g2_ol2l": "cake_mhc_det_train_fwd_map__nsx_g2_ol2l",
     "ns96_g2_ol2l": "cake_mhc_det_train_fwd_map__ns96_g2_ol2l",
+    "ns96_g2_ol2l_ct": "cake_mhc_det_train_fwd_map__ns96_g2_ol2l_ct",
     "nsx_ct": "cake_mhc_det_train_fwd_map__nsx_ct",
     "tk_nsx_g2_ol2l_ct": "cake_mhc_det_train_fwd_map__tk_nsx_g2_ol2l_ct",
     # nsx's ticket form is not exported: where the rule names it (no SM count of record) its __tk record runs nsx
     "tk_nsx_ct": "cake_mhc_det_train_fwd_map__nsx",
+    # likewise ns96_g2_ol2l's ticket form (sm_100a): its __tk record runs ns96_g2_ol2l
+    "tk_ns96_g2_ol2l_ct": "cake_mhc_det_train_fwd_map__ns96_g2_ol2l",
 }
 COEF_LIBRARY = {
     "qe_mb10": "cake_mhc_det_train_fwd_coef__qe_mb10",
@@ -207,6 +224,7 @@ LIBRARY_ARCHES = {
     "cake_mhc_det_train_fwd_finish__r2": ("sm_107a",),
     "cake_mhc_det_train_fwd_map": ("sm_107a",),
     "cake_mhc_det_train_fwd_map__ns96_g2_ol2l": ("sm_100a",),
+    "cake_mhc_det_train_fwd_map__ns96_g2_ol2l_ct": ("sm_100a",),
     "cake_mhc_det_train_fwd_map__nsx": ("sm_103a",),
     "cake_mhc_det_train_fwd_map__nsx_ct": ("sm_103a",),
     "cake_mhc_det_train_fwd_map__nsx_g2_ol2l": ("sm_100a", "sm_103a", "sm_107a"),
@@ -227,6 +245,10 @@ MULTI_RECORDS = {
     "cake_mhc_det_train_fwd_map__nsx": [
         "cake_mhc_det_train_fwd_map__nsx",
         "cake_mhc_det_train_fwd_map__nsx__tk",
+    ],
+    "cake_mhc_det_train_fwd_map__ns96_g2_ol2l": [
+        "cake_mhc_det_train_fwd_map__ns96_g2_ol2l",
+        "cake_mhc_det_train_fwd_map__ns96_g2_ol2l__tk",
     ],
     "cake_mhc_det_train_fwd_map__nsx_g2_ol2l": [
         "cake_mhc_det_train_fwd_map__nsx_g2_ol2l",
@@ -263,7 +285,7 @@ MULTI_RECORDS = {
         "cake_mhc_det_train_bwd_slab__xrsg__a7",
     ],
 }
-N_RECORDS, N_LIBRARIES = 60, 45
+N_RECORDS, N_LIBRARIES = 62, 46
 RECORD_SCALARS = {
     "cake_mhc_det_train_fn_split": {"want_t": 0},
     "cake_mhc_det_train_fn_split__tv128__t": {"want_t": 1},
@@ -291,7 +313,7 @@ TABLES = {
     },
     "FWD_MAP_CLAIM": {
         "sm_100a": (
-            ("ns96_g2_ol2l", "tk_ns96_g2_ol2l_ct", None),
+            ("ns96_g2_ol2l", "tk_ns96_g2_ol2l_ct", "ns96_g2_ol2l_ct"),
             ("nsx_g2_ol2l", "tk_nsx_g2_ol2l_ct", None),
         ),
         "sm_103a": (
@@ -318,7 +340,18 @@ TABLES = {
         "sm_107a": (),
     },
     "BWD_SLAB_FIT": {
-        "sm_100a": ("dynl", "xrsg", (9, 19), ((7, 1536, 1792), (7, 1920, 2240))),
+        "sm_100a": (
+            "dynl",
+            "xrsg",
+            (),
+            (
+                (7, 1536, 1792),
+                (9, 2176, 2304),
+                (7, 1920, 2240),
+                (19, 2304, 2432),
+                (19, 3584, 3648),
+            ),
+        ),
         "sm_103a": None,
         "sm_107a": None,
     },
@@ -589,15 +622,15 @@ DISPATCH_EXPECTED = (
     (1664, 'sm_103a', 152, 32, 416, 'nsx', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
     (1664, 'sm_107a', 208, 16, 208, 'nsx_st5_mb1', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
     (1664, 'sm_107a', 216, 16, 208, 'nsx_st5_mb1', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
-    (1665, 'sm_100a', 148, 8, 112, 'nsx_st5_mb1', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4_spred', 411),
+    (1665, 'sm_100a', 148, 8, 112, 'nsx_st5_mb1', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_tma_ntr', 'dynl', 'wpu4_spred', 411),
     (1665, 'sm_103a', 152, 32, 448, 'nsx', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
     (1665, 'sm_107a', 208, 32, 448, 'nsx_g2_ol2l', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
     (1665, 'sm_107a', 216, 32, 448, 'nsx_g2_ol2l', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
-    (1720, 'sm_100a', 148, 8, 112, 'nsx_st5_mb1', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4_spred', 411),
+    (1720, 'sm_100a', 148, 8, 112, 'nsx_st5_mb1', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_tma_ntr', 'dynl', 'wpu4_spred', 411),
     (1720, 'sm_103a', 152, 32, 448, 'nsx', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
     (1720, 'sm_107a', 208, 32, 448, 'nsx_g2_ol2l', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
     (1720, 'sm_107a', 216, 32, 448, 'nsx_g2_ol2l', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
-    (1721, 'sm_100a', 148, 8, 112, 'nsx_st5_mb1', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4_spred', 411),
+    (1721, 'sm_100a', 148, 8, 112, 'nsx_st5_mb1', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_tma_ntr', 'dynl', 'wpu4_spred', 411),
     (1721, 'sm_103a', 152, 32, 448, 'nsx', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
     (1721, 'sm_107a', 208, 32, 448, 'nsx_g2_ol2l', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
     (1721, 'sm_107a', 216, 32, 448, 'nsx_g2_ol2l', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
@@ -637,27 +670,27 @@ DISPATCH_EXPECTED = (
     (2561, 'sm_103a', 152, 32, 672, 'nsx', 'qe_mb10_tree', 16, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
     (2561, 'sm_107a', 208, 8, 168, 'nsx_st5_mb1', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
     (2561, 'sm_107a', 216, 8, 168, 'nsx_st5_mb1', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
-    (3328, 'sm_100a', 148, 16, 416, 'ns96_g2_ol2l', 'st16_lp2_as_el_qd', 16, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4_spred', 411),
+    (3328, 'sm_100a', 148, 16, 416, 'ns96_g2_ol2l', 'st16_lp2_as_el_qd', 16, 'ao22_rae7_pd1_tma_ntr', 'dynl', 'wpu4_spred', 411),
     (3328, 'sm_103a', 152, 16, 416, 'nsx', 'qe_mb10_tree', 16, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
     (3328, 'sm_107a', 208, 8, 208, 'nsx_st5_mb1', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
     (3328, 'sm_107a', 216, 8, 208, 'nsx_st5_mb1', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
-    (3329, 'sm_100a', 148, 16, 432, 'ns96_g2_ol2l', 'st16_lp2_as_el_qd', 16, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4_spred', 411),
+    (3329, 'sm_100a', 148, 16, 432, 'ns96_g2_ol2l', 'st16_lp2_as_el_qd', 16, 'ao22_rae7_pd1_tma_ntr', 'dynl', 'wpu4_spred', 411),
     (3329, 'sm_103a', 152, 16, 432, 'nsx', 'qe_mb10_tree', 16, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
     (3329, 'sm_107a', 208, 32, 864, 'nsx_g2_ol2l', 'pfl2_qmt', 16, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
     (3329, 'sm_107a', 216, 8, 216, 'nsx_st5_mb1', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
-    (3456, 'sm_100a', 148, 16, 432, 'ns96_g2_ol2l', 'st16_lp2_as_el_qd', 16, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4_spred', 411),
+    (3456, 'sm_100a', 148, 16, 432, 'ns96_g2_ol2l', 'st16_lp2_as_el_qd', 16, 'ao22_rae7_pd1_tma_ntr', 'dynl', 'wpu4_spred', 411),
     (3456, 'sm_103a', 152, 16, 432, 'nsx', 'qe_mb10_tree', 16, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
     (3456, 'sm_107a', 208, 32, 864, 'nsx_g2_ol2l', 'pfl2_qmt', 16, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
     (3456, 'sm_107a', 216, 8, 216, 'nsx_st5_mb1', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
-    (3457, 'sm_100a', 148, 8, 224, 'ns96_g2_ol2l', 'qe_mb10_tree', 16, 'ao22_rae7_pd1_tma_ntr', 'dynl', 'wpu4_spred', 411),
+    (3457, 'sm_100a', 148, 8, 224, 'ns96_g2_ol2l_ct', 'qe_mb10_tree', 16, 'ao22_rae7_pd1_tma_ntr', 'dynl', 'wpu4_spred', 411),
     (3457, 'sm_103a', 152, 16, 448, 'nsx', 'qe_mb10_tree', 16, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
     (3457, 'sm_107a', 208, 32, 896, 'nsx_g2_ol2l', 'pfl2_qmt', 16, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
     (3457, 'sm_107a', 216, 32, 896, 'nsx_g2_ol2l', 'pfl2_qmt', 16, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
-    (4095, 'sm_100a', 148, 8, 256, 'ns96_g2_ol2l', 'qe_mb10_tree', 16, 'ao22_rae7_pd1_tma_ntr', 'dynl', 'wpu4_fadd', 411),
+    (4095, 'sm_100a', 148, 8, 256, 'ns96_g2_ol2l_ct', 'qe_mb10_tree', 16, 'ao22_rae7_pd1_tma_ntr', 'dynl', 'wpu4_fadd', 411),
     (4095, 'sm_103a', 152, 8, 256, 'nsx_ct', 'qe_mb10_tree', 16, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
     (4095, 'sm_107a', 208, 32, 1024, 'nsx_g2_ol2l', 'pfl2_qmt', 16, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
     (4095, 'sm_107a', 216, 32, 1024, 'nsx_g2_ol2l', 'pfl2_qmt', 16, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
-    (4096, 'sm_100a', 148, 8, 256, 'ns96_g2_ol2l', 'qe_mb10_tree', 16, 'ao22_rae7_pd1_tma_ntr', 'dynl', 'wpu4_fadd', 411),
+    (4096, 'sm_100a', 148, 8, 256, 'ns96_g2_ol2l_ct', 'qe_mb10_tree', 16, 'ao22_rae7_pd1_tma_ntr', 'dynl', 'wpu4_fadd', 411),
     (4096, 'sm_103a', 152, 8, 256, 'nsx_ct', 'qe_mb10_tree', 16, 'ao22_rae7_pd1_ntr', 'dynr', 'pt32', 3099),
     (4096, 'sm_107a', 208, 32, 1024, 'nsx_g2_ol2l', 'pfl2_qmt', 16, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
     (4096, 'sm_107a', 216, 32, 1024, 'nsx_g2_ol2l', 'pfl2_qmt', 16, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
@@ -1046,7 +1079,7 @@ RULES_ROWS = (
     (2049, 152, 'sm_103a', 2176, True, 8, 136, 136, 7, 448, 152, 320, 257, 8, 129, 608, 4098, 1025, 2049, 4886784, 14815744, 'b16', 'tv128', 256, 256, 'qe_mb10_tree', 'nsx_st5_mb1', 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563, 't128', 'production'),
     (2049, 208, 'sm_107a', 2176, True, 32, 544, 416, 3, 192, 192, 704, 257, 8, 129, 832, 4098, 2049, 2049, 10109184, 8524288, 'b16', 'tv128_t128', 256, 512, 'pfl2_qmt', 'nsx_g2_ol2l', 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411, 't128', 'r2'),
     (2049, 216, 'sm_107a', 2176, True, 32, 544, 432, 3, 192, 192, 704, 257, 8, 129, 864, 4098, 2049, 2049, 10109184, 8524288, 'b16', 'tv128_t128', 256, 512, 'pfl2_qmt', 'nsx_g2_ol2l', 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411, 't128', 'r2'),
-    (4096, 148, 'sm_100a', 4096, True, 8, 256, 256, 16, 1024, 148, 256, 296, 16, 256, 592, 8192, 2048, 4096, 6422784, 29529344, 'b16', 'tv128', 256, 256, 'qe_mb10_tree', 'ns96_g2_ol2l', 'ao22_rae7_pd1_tma_ntr', 'dynl', 'wpu4_fadd', 411, 't128', 'production'),
+    (4096, 148, 'sm_100a', 4096, True, 8, 256, 256, 16, 1024, 148, 256, 296, 16, 256, 592, 8192, 2048, 4096, 6422784, 29529344, 'b16', 'tv128', 256, 256, 'qe_mb10_tree', 'ns96_g2_ol2l_ct', 'ao22_rae7_pd1_tma_ntr', 'dynl', 'wpu4_fadd', 411, 't128', 'production'),
     (4096, 152, 'sm_103a', 4096, True, 8, 256, 256, 16, 1024, 152, 256, 304, 16, 256, 608, 8192, 2048, 4096, 6422784, 29530368, 'b16', 'tv128', 256, 256, 'qe_mb10_tree', 'nsx_ct', 'ao22_rae7_pd1_ntr', 'dynr', 'pt32', 3099, 't128', 'production'),
     (4096, 208, 'sm_107a', 4096, True, 32, 1024, 416, 13, 832, 208, 320, 416, 16, 256, 832, 8192, 4096, 4096, 16253184, 24826112, 'b16', 'tv128_t128', 256, 512, 'pfl2_qmt', 'nsx_g2_ol2l', 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411, 't128', 'r2'),
     (4096, 216, 'sm_107a', 4096, True, 32, 1024, 432, 13, 832, 216, 320, 432, 16, 256, 864, 8192, 4096, 4096, 16253184, 24828160, 'b16', 'tv128_t128', 256, 512, 'pfl2_qmt', 'nsx_g2_ol2l', 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411, 't128', 'r2'),
@@ -1111,6 +1144,8 @@ LAUNCH_FACTS = {
     "cake_mhc_det_train_fwd_map__tk_nsx_g2_ol2l_ct": ((192, 1, 1), 114944, 2),
     "cake_mhc_det_train_fwd_map__nsx_st5_mb1__a3": ((192, 1, 1), 144384, 1),
     "cake_mhc_det_train_fwd_map__ns96_g2_ol2l": ((192, 1, 1), 115712, 2),
+    "cake_mhc_det_train_fwd_map__ns96_g2_ol2l__tk": ((192, 1, 1), 115712, 2),
+    "cake_mhc_det_train_fwd_map__ns96_g2_ol2l_ct": ((192, 1, 1), 114816, 2),
     "cake_mhc_det_train_fwd_map__nsx_g2_ol2l__a3": ((192, 1, 1), 115712, 2),
     "cake_mhc_det_train_fwd_map__nsx_st5_mb1__a7": ((192, 1, 1), 144384, 1),
     "cake_mhc_det_train_fwd_map__nsx_g2_ol2l__a7": ((192, 1, 1), 115712, 2),
@@ -1173,6 +1208,8 @@ RECORD_ARCHES = {
     "cake_mhc_det_train_fwd_map__tk_nsx_g2_ol2l_ct": ("sm_100a", "sm_103a"),
     "cake_mhc_det_train_fwd_map__nsx_st5_mb1__a3": ("sm_100a",),
     "cake_mhc_det_train_fwd_map__ns96_g2_ol2l": ("sm_100a",),
+    "cake_mhc_det_train_fwd_map__ns96_g2_ol2l__tk": ("sm_100a",),
+    "cake_mhc_det_train_fwd_map__ns96_g2_ol2l_ct": ("sm_100a",),
     "cake_mhc_det_train_fwd_map__nsx_g2_ol2l__a3": ("sm_100a",),
     "cake_mhc_det_train_fwd_map__nsx_st5_mb1__a7": ("sm_107a",),
     "cake_mhc_det_train_fwd_map__nsx_g2_ol2l__a7": ("sm_107a",),
@@ -1289,7 +1326,11 @@ PROGRAM_RULE_KERNELS = {
 
 
 def _rows() -> list[dict]:
-    return [dict(zip(RULES_COLUMNS, row, strict=False)) for row in RULES_ROWS]
+    """The H 4096 rows of record (``rules_row`` names the hidden size in its ``hidden`` column)."""
+    return [
+        {**dict(zip(RULES_COLUMNS, row, strict=False)), "hidden": 4096}
+        for row in RULES_ROWS
+    ]
 
 
 def _first_programs(fn, arch: str, sms) -> list:
@@ -1307,7 +1348,7 @@ def _first_programs(fn, arch: str, sms) -> list:
 
 
 def _is(name: str, *prefixes: str) -> bool:
-    return loader.MODULES[name]["library"].startswith(prefixes)
+    return H4096_MODULES[name]["library"].startswith(prefixes)
 
 
 @pytest.mark.cpu_only
@@ -1318,10 +1359,12 @@ def test_rules_table_is_the_harness_table_of_record() -> None:
     assert tuple(tuple(board) for board in loader.RULES_BOARDS) == BOARDS
     assert sorted({row["T"] for row in expected}) == sorted(loader.RULES_T_VALUES)
     assert {(row["arch"], row["sm_count"]) for row in expected} == set(BOARDS)
-    actual = loader.rules_table()
+    actual = loader.rules_table(hiddens=(4096,))
     assert len(actual) == len(expected)
+    assert len(loader.rules_table()) == len(expected) * len(loader.HIDDEN_SIZES)
+    columns = {*RULES_COLUMNS, "hidden"}
     for want, got in zip(expected, actual, strict=False):
-        assert set(got) == set(RULES_COLUMNS), sorted(set(got) ^ set(RULES_COLUMNS))
+        assert set(got) == columns, sorted(set(got) ^ columns)
         assert got == want, {
             key: (want[key], got.get(key)) for key in want if want[key] != got.get(key)
         }
@@ -1527,7 +1570,7 @@ def test_dispatch_of_record_at_the_boundaries() -> None:
     assert loader.fwd_map_program(16263, 152, "sm_103a") == "tk_nsx_g2_ol2l_ct"
     assert loader.fwd_map_program(16263, 148, "sm_100a") == "nsx_g2_ol2l"
     assert loader.fwd_map_program(32768, 148, "sm_100a") == "tk_nsx_g2_ol2l_ct"
-    assert loader.fwd_map_program(4096, 148, "sm_100a") == "ns96_g2_ol2l"
+    assert loader.fwd_map_program(4096, 148, "sm_100a") == "ns96_g2_ol2l_ct"
     assert loader.K5_GRID_BANDS == {
         "sm_100a": ((0, 1024, 2),),
         "sm_103a": ((0, 4096, 2),),
@@ -1620,16 +1663,28 @@ def test_dispatch_of_record_at_the_boundaries() -> None:
         for _above, _at_most, program in loader.BWD_SLAB_BANDS[arch]:
             assert SLAB_LIBRARY[program] in LIBRARY_ARCHES, (arch, program)
     # the column-slab programs of record: on sm_100a the late-claim form dynl for 1024 < T <= 4096 (its
-    # token-count band) but where BWD_SLAB_FIT keeps xrsg (the K7 units fit the SMs in one round, the chunk
-    # counts P = 9 and P = 19, the P = 7 runs 1537..1792 and 1921..2240), the dynamic-schedule form dynr at the
-    # other token counts on sm_100a and at every token count on sm_103a, xrsg at every token count on sm_107a
+    # token-count band) but where BWD_SLAB_FIT keeps xrsg (the K7 units fit the SMs in one round, the runs
+    # P = 7 1537..1792 and 1921..2240, P = 9 2177..2304, P = 19 2305..2432 and 3585..3648), the dynamic-schedule
+    # form dynr at the other token counts on sm_100a and at every token count on sm_103a, xrsg at every token count
+    # on sm_107a
     assert loader.BWD_SLAB_BANDS == {
         "sm_100a": ((1024, 4096, "dynl"),),
         "sm_103a": (),
         "sm_107a": (),
     }
     assert loader.BWD_SLAB_FIT == {
-        "sm_100a": ("dynl", "xrsg", (9, 19), ((7, 1536, 1792), (7, 1920, 2240))),
+        "sm_100a": (
+            "dynl",
+            "xrsg",
+            (),
+            (
+                (7, 1536, 1792),
+                (9, 2176, 2304),
+                (7, 1920, 2240),
+                (19, 2304, 2432),
+                (19, 3584, 3648),
+            ),
+        ),
         "sm_103a": None,
         "sm_107a": None,
     }
@@ -1643,8 +1698,13 @@ def test_dispatch_of_record_at_the_boundaries() -> None:
             k7 = "dynr"
             if 1024 < T <= 4096:
                 P, units = loader.k7_chunks(T, sm)[:2]
-                run = P == 7 and (1536 < T <= 1792 or 1920 < T <= 2240)
-                k7 = "xrsg" if units <= sm or P in (9, 19) or run else "dynl"
+                run = (
+                    (P == 7 and (1536 < T <= 1792 or 1920 < T <= 2240))
+                    or (P == 9 and 2176 < T <= 2304)
+                    or (P == 19 and 2304 < T <= 2432)
+                    or (P == 19 and 3584 < T <= 3648)
+                )
+                k7 = "xrsg" if units <= sm or run else "dynl"
             slab = [loader.bwd_slab_program(T, sm, arch) for arch in ARCHES]
             assert slab == [k7, "dynr", "xrsg"], (T, sm)
     # the band's edges on 148 SMs (xrsg from 1025 to 2048 tokens, dynl from 2049: P = 11; 4096: P = 16) and the
@@ -1735,13 +1795,18 @@ def test_registry_tables_are_literals() -> None:
     assert literals["MODULES"] == loader.MODULES
     assert literals["ROUTES"] == loader.ROUTES
     assert literals["RECORD_SCALARS"] == loader.RECORD_SCALARS
-    assert tuple(literals["HIDDEN_SIZES"]) == (4096,)
+    assert tuple(literals["HIDDEN_SIZES"]) == (4096, 5120, 7168)
+    assert {record["hidden"] for record in loader.MODULES.values()} == {
+        4096,
+        5120,
+        7168,
+    }
     assert tuple(literals["ARCHES"]) == ARCHES
 
 
 @pytest.mark.cpu_only
 def test_records_are_consistent() -> None:
-    modules = loader.MODULES
+    modules = H4096_MODULES
     assert len(modules) == len(RECORD_ARCHES) == N_RECORDS
     libraries = sorted({record["library"] for record in modules.values()})
     assert len(libraries) == N_LIBRARIES and all(
@@ -1764,7 +1829,7 @@ def test_records_are_consistent() -> None:
             name for name, record in modules.items() if record["library"] == library
         ] == [library], library
     routed = {
-        arch: {name for names in loader.ROUTES[arch].values() for name in names}
+        arch: {name for names in H4096_ROUTES[arch].values() for name in names}
         for arch in loader.ARCHES
     }
     for name, record in modules.items():
@@ -1915,7 +1980,7 @@ def test_records_are_consistent() -> None:
             LIBRARY_ARCHES[library]
         ), library
         assert len({repr(record["launch"]) for record in group}) == 1, library
-    for arch, routes in loader.ROUTES.items():
+    for arch, routes in H4096_ROUTES.items():
         assert arch in loader.ARCHES
         assert set(routes) == {loader.route_key(4096, kind) for kind in loader.KINDS}
         for kind in loader.KINDS:
@@ -1960,10 +2025,10 @@ def test_records_are_consistent() -> None:
             slabs = [SLAB_LIBRARY[loader.BWD_SLAB_PROGRAM[arch]]]
         reduces = _first_programs(loader.bwd_reduce_program, arch, sms)
         # the token-owner run-time-count record closes the token-owner records
-        assert libs(loader.ROUTES[arch]["bwd_finish_h4096"]) == [
+        assert libs(H4096_ROUTES[arch]["bwd_finish_h4096"]) == [
             split, *tokens, "cake_mhc_det_train_bwd_token__rt64", *slabs, *[REDUCE_LIBRARY[p] for p in reduces]
         ], arch  # fmt: skip
-        assert loader.ROUTES[arch]["bwd_finish_h4096"][0] == f"{split}__t"
+        assert H4096_ROUTES[arch]["bwd_finish_h4096"][0] == f"{split}__t"
         # the fn split records launch their program's fixed grid (the rules' fn_split_grid / fn_split_grid_t columns)
         assert modules[f"{split}__t"]["grid_rule"] == {
             "kind": "fixed",
@@ -1975,12 +2040,12 @@ def test_records_are_consistent() -> None:
         }, arch
         maps = [
             n
-            for n in libs(loader.ROUTES[arch]["fwd_prepare_h4096"])
+            for n in libs(H4096_ROUTES[arch]["fwd_prepare_h4096"])
             if n.startswith("cake_mhc_det_train_fwd_map")
         ]
         coefs = [
             n
-            for n in libs(loader.ROUTES[arch]["fwd_prepare_h4096"])
+            for n in libs(H4096_ROUTES[arch]["fwd_prepare_h4096"])
             if n.startswith("cake_mhc_det_train_fwd_coef")
         ]
         assert set(maps) == {
@@ -1996,18 +2061,18 @@ def test_records_are_consistent() -> None:
             for sm in SM_COUNTS
         }, arch
         assert (
-            loader.ROUTES[arch]["fwd_prepare_h4096"][0]
-            == loader.ROUTES[arch]["fwd_recompute_h4096"][0]
+            H4096_ROUTES[arch]["fwd_prepare_h4096"][0]
+            == H4096_ROUTES[arch]["fwd_recompute_h4096"][0]
             == split_fwd
         )
         assert (
-            loader.ROUTES[arch]["fwd_prepare_h4096"][-1]
+            H4096_ROUTES[arch]["fwd_prepare_h4096"][-1]
             == "cake_mhc_det_train_fwd_collapse"
         )
-        assert loader.ROUTES[arch]["fwd_finish_h4096"] == [FINISH_OF[arch]], arch
+        assert H4096_ROUTES[arch]["fwd_finish_h4096"] == [FINISH_OF[arch]], arch
         assert (
-            loader.ROUTES[arch]["fwd_prepare_h4096"][:-1]
-            == loader.ROUTES[arch]["fwd_recompute_h4096"]
+            H4096_ROUTES[arch]["fwd_prepare_h4096"][:-1]
+            == H4096_ROUTES[arch]["fwd_recompute_h4096"]
         )
         for name in routed[arch]:
             assert arch in LIBRARY_ARCHES[modules[name]["library"]], (arch, name)
@@ -2019,8 +2084,8 @@ def test_records_are_consistent() -> None:
     # (want_t 0) and the transposed one of the backward (want_t 1); the production form
     # carries the forward layout alone (every architecture) and the 16-byte-store forms the transposed layout alone
     # (tv128 on sm_100a / sm_103a, its 128-thread form tv128_t128 on sm_107a).
-    assert loader.RECORD_SCALARS == RECORD_SCALARS
-    for name, scalars in loader.RECORD_SCALARS.items():
+    assert H4096_SCALARS == RECORD_SCALARS
+    for name, scalars in H4096_SCALARS.items():
         assert modules[name]["role"] == (
             "fn_split_fwd" if scalars["want_t"] == 0 else "fn_split_bwd"
         ), name
@@ -2038,7 +2103,7 @@ def test_every_call_selects_one_record_per_dispatched_kernel(
     """``selected_modules`` keeps exactly one fn-split, one mapping-pass and one coefficient-pass record per forward
     call and exactly one fn-split, one token-owner, one column-slab and one reduction record per backward call, the
     ones the rules of record name, on every token count up to 70000 and at every band boundary."""
-    modules = loader.MODULES
+    modules = H4096_MODULES
 
     def only(selected, *prefixes):
         found = [n for n in selected if _is(n, *prefixes)]
@@ -2132,10 +2197,10 @@ def test_pdl_only_where_the_kernel_waits_for_the_preceding_grid() -> None:
     a kernel that releases its dependents right after its own wait (the libraries of ``PDL_EDGES``: the collapse and the
     backward prepare after the coefficient pass, the column-slab pass after the token-owner pass, the final reduction
     after the column-slab pass) take the attribute per call (``"runtime"``)."""
-    pdl = {name: record["launch"]["use_pdl"] for name, record in loader.MODULES.items()}
+    pdl = {name: record["launch"]["use_pdl"] for name, record in H4096_MODULES.items()}
     runtime = {
         name
-        for name, record in loader.MODULES.items()
+        for name, record in H4096_MODULES.items()
         if loader.pdl_edge(record["library"]) is not None
     }
     assert pdl == {
@@ -2146,10 +2211,10 @@ def test_pdl_only_where_the_kernel_waits_for_the_preceding_grid() -> None:
                 name, "cake_mhc_det_train_fn_split", "cake_mhc_det_train_fwd_map"
             )
         )
-        for name in loader.MODULES
+        for name in H4096_MODULES
     }
-    assert runtime == {name for name in loader.MODULES if _is(name, *loader.PDL_EDGES)}
-    n_map = sum(1 for name in loader.MODULES if _is(name, "cake_mhc_det_train_fwd_map"))
+    assert runtime == {name for name in H4096_MODULES if _is(name, *loader.PDL_EDGES)}
+    n_map = sum(1 for name in H4096_MODULES if _is(name, "cake_mhc_det_train_fwd_map"))
     assert (
         sum(1 for value in pdl.values() if value is False)
         == len(RECORD_SCALARS) + n_map
@@ -2159,16 +2224,16 @@ def test_pdl_only_where_the_kernel_waits_for_the_preceding_grid() -> None:
     # one record of each layout -- the forward one (want_t 0) opens fwd_prepare / fwd_recompute, the transposed one
     # (want_t 1) opens bwd_finish.
     assert {
-        name for name in loader.MODULES if _is(name, "cake_mhc_det_train_fn_split")
+        name for name in H4096_MODULES if _is(name, "cake_mhc_det_train_fn_split")
     } == set(RECORD_SCALARS)
     assert all(scalars.get("want_t") in (0, 1) for scalars in RECORD_SCALARS.values())
-    assert {loader.MODULES[name]["library"] for name in RECORD_SCALARS} == set(
+    assert {H4096_MODULES[name]["library"] for name in RECORD_SCALARS} == set(
         SPLIT_LIBRARY.values()
     )
     for arch in loader.ARCHES:
         splits = {
             route: [
-                name for name in loader.ROUTES[arch][route] if name in RECORD_SCALARS
+                name for name in H4096_ROUTES[arch][route] if name in RECORD_SCALARS
             ]
             for route in (
                 "fwd_prepare_h4096",
@@ -2219,7 +2284,7 @@ def test_pdl_bands_of_record() -> None:
                         path,
                         bands,
                     )
-    for name, record in loader.MODULES.items():
+    for name, record in H4096_MODULES.items():
         plan = [tuple(entry) for entry in record["arg_plan"]]
         slots = [index for index, (role, _) in enumerate(plan) if role == "launch"]
         assert plan[-3:] == [
@@ -2235,7 +2300,7 @@ def test_pdl_bands_of_record() -> None:
         else:
             assert not slots, name
     for arch in ARCHES:
-        for name, record in loader.MODULES.items():
+        for name, record in H4096_MODULES.items():
             if arch not in record["arches"]:
                 continue
             edge = loader.pdl_edge(record["library"])
@@ -2276,27 +2341,27 @@ def test_launch_facts_of_record() -> None:
             record["launch"]["dynamic_smem_bytes"],
             record["launch"]["persistent_ctas_per_sm"],
         )
-        for name, record in loader.MODULES.items()
+        for name, record in H4096_MODULES.items()
     }
     assert facts == LAUNCH_FACTS
-    for name in loader.RECORD_SCALARS:
+    for name in H4096_SCALARS:
         # the fn split covers 65536 thread-slots of 8 elements: 256 CTAs x 256 threads, or 512 x 128 for the 128-thread form
-        ctas = loader.MODULES[name]["grid_rule"]["ctas"]
+        ctas = H4096_MODULES[name]["grid_rule"]["ctas"]
         assert facts[name] == ((65536 // ctas, 1, 1), 0, 1) and ctas in (256, 512), name
     for library, names in MULTI_RECORDS.items():
         assert len({facts[name] for name in names}) == 1, (
             library
         )  # the records of a library agree on their launch
     pools = {4 * 28672 + 1024: 2, 3 * 28672 + 1024: 2, 5 * 28672 + 1024: 1}
-    for name in (n for n in loader.MODULES if _is(n, "cake_mhc_det_train_fwd_map")):
+    for name in (n for n in H4096_MODULES if _is(n, "cake_mhc_det_train_fwd_map")):
         block, smem, pcs = facts[name]
-        if loader.MODULES[name]["library"].endswith("_ct"):
+        if H4096_MODULES[name]["library"].endswith("_ct"):
             # the tail-control forms keep the control records after the ring, not in the 1024-byte prefix:
             # their pools are the render's figures (LAUNCH_FACTS pins them), below the prefix form's
             assert block == (192, 1, 1) and pcs == 2 and smem < 4 * 28672 + 1024, name
             continue
         assert block == (192, 1, 1) and smem in pools and pcs == pools[smem], name
-    for name, record in loader.MODULES.items():
+    for name, record in H4096_MODULES.items():
         if _is(name, "cake_mhc_det_train_fwd_coef"):
             want = (
                 ((512, 1, 1), 0, 1)
@@ -2352,19 +2417,19 @@ def test_launch_grids_follow_the_rules(
 ) -> None:
     monkeypatch.setattr(loader, "sm_count", lambda device_index: sm)
     monkeypatch.setattr(loader, "device_arch", lambda device_index: arch)
-    modules = loader.MODULES
+    modules = H4096_MODULES
     for row in _rows():
         T = row["T"]
         if T == 0 or (row["sm_count"], row["arch"]) != (sm, arch):
             continue
         grid = lambda name: loader.launch_grid(modules[name], T, device_index=0)  # noqa: E731
-        for name in loader.RECORD_SCALARS:
+        for name in H4096_SCALARS:
             assert grid(name) == (modules[name]["grid_rule"]["ctas"], 1, 1), name
         for want_t, route, column in (
             (0, "fwd_prepare_h4096", "fn_split_grid"),
             (1, "bwd_finish_h4096", "fn_split_grid_t"),
         ):
-            selected = loader.ROUTES[arch][route][0]  # the route's fn split record
+            selected = H4096_ROUTES[arch][route][0]  # the route's fn split record
             assert (
                 grid(selected)
                 == (row[column], 1, 1)
@@ -2548,7 +2613,8 @@ def test_the_p_k_band_changes_the_forward_workspace_on_sm_103a_alone() -> None:
 
 @pytest.mark.cpu_only
 def test_route_glue() -> None:
-    assert loader.supported_hidden_sizes("sm_100a") == (4096,)
+    assert loader.supported_hidden_sizes("sm_100a") == (4096, 5120, 7168)
+    assert loader.supported_hidden_sizes("sm_107a") == (4096,)
     assert loader.arch_for_capability((10, 0)) == "sm_100a"
     assert loader.arch_for_capability((10, 3)) == "sm_103a"
     assert loader.arch_for_capability((10, 7)) == "sm_107a"
@@ -2580,14 +2646,14 @@ def test_route_glue() -> None:
             route = loader.route_modules(arch, 4096, kind)
             # a route with band records selects a strict subset; a route of unconditional records selects every record
             banded = any(
-                loader.MODULES[name]["select_rule"] is not None for name in route
+                H4096_MODULES[name]["select_rule"] is not None for name in route
             )
             assert set(selected) <= set(route)
             assert (set(selected) < set(route)) == banded, (arch, kind)
         selected = loader.selected_modules(
             arch, 4096, "fwd_prepare", rows=129, sm_count=148
         )
-        libraries = {loader.MODULES[name]["library"] for name in selected}
+        libraries = {H4096_MODULES[name]["library"] for name in selected}
         want = loader.fwd_coef_program(129, 148, arch)
         assert (
             COEF_LIBRARY[want] in libraries
@@ -2595,7 +2661,7 @@ def test_route_glue() -> None:
         )
         assert MAP_LIBRARY[loader.fwd_map_program(129, 148, arch)] in libraries
     # library_name: the library's architecture suffix where the record ships for the architecture, a refusal elsewhere.
-    for name, record in loader.MODULES.items():
+    for name, record in H4096_MODULES.items():
         for arch in loader.ARCHES:
             if arch in record["arches"]:
                 assert (
@@ -2619,11 +2685,11 @@ def test_selection_by_sinkhorn_count() -> None:
     other kernel the default's record, on every board and route."""
     run_time = {
         name
-        for name, record in loader.MODULES.items()
+        for name, record in H4096_MODULES.items()
         if (record["select_rule"] or {}).get("kind") == "run_time_iters"
     }
     assert run_time == set(RUN_TIME_ITERS)
-    roles = {loader.MODULES[name]["role"]: name for name in run_time}
+    roles = {H4096_MODULES[name]["role"]: name for name in run_time}
     assert set(roles) == {"fwd_coef", "bwd_token"}
     for arch, sm in BOARDS:
         for kind in loader.KINDS:
@@ -2638,8 +2704,7 @@ def test_selection_by_sinkhorn_count() -> None:
                         arch, 4096, kind, rows=T, sm_count=sm, sinkhorn_iters=iters
                     )
                     expected = tuple(
-                        roles.get(loader.MODULES[name]["role"], name)
-                        for name in default
+                        roles.get(H4096_MODULES[name]["role"], name) for name in default
                     )
                     assert other == expected, (arch, kind, T, iters)
                     assert other == tuple(

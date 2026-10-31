@@ -290,6 +290,13 @@ def _deep_gemm_check(
     assert torch.equal(plan.metadata[span:], meta[span:])
 
 
+def _logits_route(precision, queries, keys, arch):
+    """The route a 32-head logits plan serves on ``arch``: the device's own route
+    (``served_route``), not the logical ``route_name``, which applies the most
+    permissive architecture's bound (the FP4 scan-class bounds are per arch)."""
+    return _runtime.served_route(precision, queries, keys, arch=arch)
+
+
 @pytest.mark.parametrize("precision,queries,keys", CASES)
 def test_dense_mqa_logits(precision, queries, keys):
     _skip_unless_exported()
@@ -302,7 +309,7 @@ def test_dense_mqa_logits(precision, queries, keys):
     plan = prepare_dense_mqa_logits(
         precision, q, kv, weights, starts, ends, q_scales=qs, kv_scales=ks
     )
-    assert plan.route_name == _runtime.route_name(precision, queries, keys)
+    assert plan.route_name == _logits_route(precision, queries, keys, arch)
     # One submission per stage, or one for a prepared sequence; a ``:short``
     # route is a single logits launch that writes the schedule itself.
     assert plan.launch_count == (
@@ -361,18 +368,26 @@ def test_dense_mqa_logits(precision, queries, keys):
         ("fp4", 1, 131584, "fp4:q1"),
         ("fp4", 7, 2048, "fp4:le32:short"),
         ("fp4", 16, 1048576, "fp4:le32:short"),
-        ("fp4", 16, 1048832, "fp4:le16"),
+        # the FP4 scan-class bounds are per architecture (fp4.fused_scan32_max_kv sm_100a 1048576,
+        # sm_103a 1048832): the logical name applies the most permissive one, served_route the device's
+        # (test_dense_fp4_scan_bounds_are_per_arch)
+        ("fp4", 16, 1048832, "fp4:le32:short"),
+        ("fp4", 16, 1049088, "fp4:le16"),
         ("fp4", 17, 2048, "fp4:le32:short"),
         ("fp4", 128, 4096, "fp4:le32:short"),
-        ("fp4", 33, 1048832, "fp4:le128"),
+        ("fp4", 33, 1048832, "fp4:le32:short"),
+        ("fp4", 33, 1049088, "fp4:le128"),
         # the 1024-block FP4 class: the first-tile-prefetch program at and below the policy's query bound
         # (``fp4.first_tile_prefetch_max_queries_scan1024``, 1024), the plain CTA-scan program above it
         ("fp4", 130, 65536, "fp4:qle1024:short"),
-        ("fp4", 130, 65792, "fp4:le2048"),
+        # fp4.fused_scan1024_max_kv: sm_100a 65536, sm_103a 65792 (logical name: the most permissive)
+        ("fp4", 130, 65792, "fp4:qle1024:short"),
+        ("fp4", 130, 66048, "fp4:le2048"),
         ("fp4", 1024, 2048, "fp4:qle1024:short"),
         ("fp4", 1025, 2048, "fp4:le1024:short"),
         ("fp4", 2049, 4096, "fp4:le1024:short"),
-        ("fp4", 2052, 65792, "fp4:any"),
+        ("fp4", 2052, 65792, "fp4:le1024:short"),
+        ("fp4", 2052, 66048, "fp4:any"),
         ("fp4", 4100, 2048, "fp4:any"),  # 1025 query blocks: no scan class
         # FP8: fused Q1 chain, plain Q1 pair, fused Q128 text, the scan class
         # qualified by block kind (Q = 128 never takes a class), then the pair.
@@ -547,8 +562,12 @@ def test_dense_single_launch_policy_is_published():
         ceilings = [int(c) for c in table["fused_scan_ceilings"]]
         assert ceilings == sorted(ceilings) and ceilings[0] >= 1, precision
         for ceiling in ceilings:
-            bound = int(table[f"fused_scan{ceiling}_max_kv"])
-            assert bound >= 256 and bound % 256 == 0, (precision, ceiling)
+            value = table[f"fused_scan{ceiling}_max_kv"]
+            if isinstance(value, dict):  # a per-architecture map (the FP4 scan classes)
+                assert sorted(value) == arches, (precision, ceiling)
+            for arch in arches:
+                bound = _runtime._scan_bound(value, arch)
+                assert bound >= 256 and bound % 256 == 0, (precision, ceiling, arch)
         q1_bound = int(table["fused_q1_max_kv"])
         assert q1_bound >= 256 and q1_bound % 256 == 0, precision
     assert int(policy["fused_q128_max_kv"]) % 256 == 0
@@ -607,11 +626,12 @@ def test_dense_single_launch_policy_is_published():
     ):
         blocks = (max_q + _runtime.BLOCK_Q - 1) // _runtime.BLOCK_Q
         ceiling = next(c for c in ceilings if blocks <= c)
-        class_bound = int(policy[f"fused_scan{ceiling}_max_kv"])
         for arch in arches:
             bounds = {
                 "qle": qle128_bound if tier == "le128" else qle2048_bounds[arch],
-                "le_class": class_bound,
+                "le_class": _runtime._scan_bound(
+                    policy[f"fused_scan{ceiling}_max_kv"], arch
+                ),
             }
             order = list(policy["single_launch_precedence"][arch][tier])
             if "qle" not in order:
@@ -631,6 +651,99 @@ def test_dense_single_launch_policy_is_published():
         assert int(record["kv_min"]) == divisor, route
         assert sorted(record["kv_alignment"]) == arches, route
         assert all(int(v) == divisor for v in record["kv_alignment"].values()), route
+
+
+def test_dense_fp4_scan_bounds_are_per_arch():
+    """Host-only: the FP4 scan-class KV bounds are per architecture -- ``fp4.fused_scan32_max_kv`` /
+    ``fp4.fused_scan1024_max_kv`` are ``{"sm_100a": 1048576, "sm_103a": 1048832}`` / ``{"sm_100a": 65536,
+    "sm_103a": 65792}`` (each measured on its device): ``served_route`` applies the device's bound, the logical
+    ``route_name`` the most permissive one, and ``served_route`` without an architecture refuses the KV lengths the
+    architectures disagree on."""
+    fp4 = _runtime._catalog()["policy"]["fp4"]
+    assert fp4["fused_scan32_max_kv"] == {"sm_100a": 1048576, "sm_103a": 1048832}
+    assert fp4["fused_scan1024_max_kv"] == {"sm_100a": 65536, "sm_103a": 65792}
+    assert _runtime._scan_bound(fp4["fused_scan32_max_kv"], "sm_100a") == 1048576
+    assert _runtime._scan_bound(fp4["fused_scan32_max_kv"], "sm_103a") == 1048832
+    assert _runtime._scan_bound(fp4["fused_scan32_max_kv"], None) == 1048832
+    assert (
+        _runtime._scan_bound(4096, "sm_100a")
+        == _runtime._scan_bound(4096, None)
+        == 4096
+    )
+    # (queries, keys): {arch: served route}, the logical name = the most permissive architecture's route
+    cases = {
+        (16, 1048576): {"sm_100a": "fp4:le32:short", "sm_103a": "fp4:le32:short"},
+        (16, 1048832): {"sm_100a": "fp4:le16", "sm_103a": "fp4:le32:short"},
+        (33, 1048832): {"sm_100a": "fp4:le128", "sm_103a": "fp4:le32:short"},
+        (128, 1048832): {"sm_100a": "fp4:le128", "sm_103a": "fp4:le32:short"},
+        (16, 1049088): {"sm_100a": "fp4:le16", "sm_103a": "fp4:le16"},
+        (130, 65536): {"sm_100a": "fp4:qle1024:short", "sm_103a": "fp4:qle1024:short"},
+        (130, 65792): {"sm_100a": "fp4:le2048", "sm_103a": "fp4:qle1024:short"},
+        (1025, 65792): {"sm_100a": "fp4:le2048", "sm_103a": "fp4:le1024:short"},
+        (2052, 65792): {"sm_100a": "fp4:any", "sm_103a": "fp4:le1024:short"},
+        (130, 66048): {"sm_100a": "fp4:le2048", "sm_103a": "fp4:le2048"},
+    }
+    for (queries, keys), served in cases.items():
+        for arch, route in served.items():
+            assert _runtime.served_route("fp4", queries, keys, arch=arch) == route, (
+                queries,
+                keys,
+                arch,
+            )
+        assert _runtime.route_name("fp4", queries, keys) == served["sm_103a"], (
+            queries,
+            keys,
+        )
+        if len(set(served.values())) == 1:
+            assert _runtime.served_route("fp4", queries, keys) == served["sm_103a"]
+        else:
+            with pytest.raises(ValueError, match="pass arch"):
+                _runtime.served_route("fp4", queries, keys)
+    # the FP8 scan-class bounds stay one value on every architecture
+    policy = _runtime._catalog()["policy"]
+    assert isinstance(policy["fused_scan32_max_kv"], int) and isinstance(
+        policy["fused_scan768_max_kv"], int
+    )
+
+
+def test_dense_logits_route_expectation_is_per_arch():
+    """Host-only: the route ``test_dense_mqa_logits`` expects on every catalog
+    architecture. Where the architectures serve different routes for a logits case
+    (the FP4 scan-class KV bounds), the expectation follows the device and is
+    listed here; at the next KV block both architectures agree again."""
+    per_arch = {
+        ("fp4", 16, 1048832): {"sm_100a": "fp4:le16", "sm_103a": "fp4:le32:short"},
+        ("fp4", 33, 1048832): {"sm_100a": "fp4:le128", "sm_103a": "fp4:le32:short"},
+        ("fp4", 130, 65792): {"sm_100a": "fp4:le2048", "sm_103a": "fp4:qle1024:short"},
+        ("fp4", 2052, 65792): {"sm_100a": "fp4:any", "sm_103a": "fp4:le1024:short"},
+        ("fp4", 16, 1049088): {"sm_100a": "fp4:le16", "sm_103a": "fp4:le16"},
+        ("fp4", 33, 1049088): {"sm_100a": "fp4:le128", "sm_103a": "fp4:le128"},
+        ("fp4", 130, 66048): {"sm_100a": "fp4:le2048", "sm_103a": "fp4:le2048"},
+        ("fp4", 2052, 66048): {"sm_100a": "fp4:any", "sm_103a": "fp4:any"},
+    }
+    arches = sorted(_runtime._catalog()["arches"])
+    for (precision, queries, keys), served in per_arch.items():
+        assert sorted(served) == arches
+        for arch, route in served.items():
+            assert _runtime.dense_route_available(
+                32, queries, keys, precision, arch=arch
+            )
+            assert _logits_route(precision, queries, keys, arch) == route, (
+                precision,
+                queries,
+                keys,
+                arch,
+            )
+    # every logits case whose served route differs between architectures (so the
+    # logical route name is not every device's route) has its routes listed above
+    for case in CASES:
+        routes = {
+            arch: _logits_route(*case, arch)
+            for arch in arches
+            if _runtime.dense_route_available(32, case[1], case[2], case[0], arch=arch)
+        }
+        if len(set(routes.values())) > 1:
+            assert case in per_arch, case
 
 
 @pytest.mark.parametrize("sm_count", [132, 148, 152])
@@ -1944,7 +2057,10 @@ def _route_point(route_name, record):
         table = policy if precision == "fp8" else policy["fp4"]
         bounds = [int(table["fused_q1_max_kv"])]
         for ceiling in table["fused_scan_ceilings"]:
-            bounds.append(int(table[f"fused_scan{int(ceiling)}_max_kv"]))
+            value = table[f"fused_scan{int(ceiling)}_max_kv"]
+            bounds.extend(
+                int(v) for v in (value.values() if isinstance(value, dict) else [value])
+            )
         if precision == "fp8":
             bounds.append(int(policy["fused_q128_max_kv"]))
             bounds.append(int(policy["fused_qle128_max_kv"]))

@@ -932,3 +932,50 @@ def test_fallback_under_cuda_graph_capture(
         "the captured fallback wrote the caller's workspace"
     )
     del graph
+
+
+_WORKSPACE_HELPERS = (
+    "cake_mhc_train_forward_workspace_bytes",
+    "cake_mhc_train_backward_workspace_bytes",
+    "cake_mhc_train_forward_workspace",
+    "cake_mhc_train_backward_workspace",
+)
+
+
+@pytest.mark.cpu_only
+def test_nondeterministic_workspace_helpers_reject_other_hidden_sizes() -> None:
+    """``deterministic=False`` exports hidden 4096 only: its workspace helpers raise ``ValueError`` for another
+    hidden size before any device query, in the facade and in the backend."""
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", ExperimentalWarning)
+        for name in _WORKSPACE_HELPERS:
+            for module in (facade, backend):
+                for hidden in (5120, 7168):
+                    with pytest.raises(ValueError, match="supports hidden=4096 only"):
+                        getattr(module, name)(
+                            1, torch.device("cuda"), hidden=hidden, deterministic=False
+                        )
+
+
+@requires_device
+@pytest.mark.parametrize("hidden", (5120, 7168))
+def test_hidden_sizes_follow_the_mode(hidden) -> None:
+    """``deterministic=True`` sizes the deterministic package's workspaces for each hidden size it exports;
+    ``deterministic=False`` refuses an ``X`` of another hidden size with ``ValueError``."""
+    if not det_facade.is_cake_mhc_det_train_supported(_device(), hidden):
+        pytest.skip(f"hidden {hidden} is not exported on this device")
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", ExperimentalWarning)
+        for name in _WORKSPACE_HELPERS[:2]:
+            det_name = name.replace("cake_mhc_train", "cake_mhc_det_train")
+            want = getattr(det_facade, det_name)(300, _device(), hidden=hidden)
+            assert want != getattr(det_facade, det_name)(300, _device())
+            assert getattr(facade, name)(300, _device(), hidden=hidden) == want
+        X = torch.zeros(7, 4, hidden, dtype=BF16, device=_device())
+        fn = torch.zeros(24, 4 * hidden, device=_device())
+        scale = torch.ones(3, device=_device())
+        base = torch.zeros(24, device=_device())
+        with pytest.raises(ValueError):
+            facade.cake_mhc_train_forward_prepare(
+                X, fn, scale, base, deterministic=False
+            )

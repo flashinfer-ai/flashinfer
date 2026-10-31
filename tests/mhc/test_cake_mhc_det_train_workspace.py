@@ -14,14 +14,17 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 Workspace reuse across token counts for the Cake four-stream mHC training
-package (hidden 4096, 4 streams; SM100 / SM103 / SM107).
+package (hidden 4096, 5120 and 7168, 4 streams; SM100 / SM103 at the three
+hidden sizes, SM107 at 4096).  Every case runs at each hidden size the
+device's architecture exports, its buffers sized with ``hidden=``; a size it
+does not export is skipped with the reason.
 
 A caller-owned workspace sized by ``cake_mhc_det_train_{forward,backward}_workspace_bytes(T_max)``
 serves every token count up to ``T_max`` and CUDA Graph replays at a smaller
 ``T``; its ticket words must be zero on first use and the kernels leave them
-zero.  The dynamic-schedule column-slab form (sm_103a up to 4096 tokens,
-sm_100a above 4096 up to 8192 tokens) draws its work units from the backward
-workspace's ticket word with a self-resetting ``atom.inc``: a word that is not
+zero.  The dynamic-schedule column-slab form (at hidden 4096: sm_103a up to
+4096 tokens, sm_100a above 4096 up to 8192 tokens) draws its work units from
+the backward workspace's ticket word with a self-resetting ``atom.inc``: a word that is not
 zero at launch makes the launch skip units (wrong ``dX`` / ``dfn``) or end away
 from zero.  The ticket region therefore sits at the same offset for every
 token count.  On one buffer reused over realistic token-count sequences:
@@ -59,7 +62,8 @@ pkg = cake_package("cake_mhc_det_train")
 loader = cake_package("cake_mhc_det_train", "cake_jit")
 
 SUPPORTED_CAPABILITIES = ((10, 0), (10, 3), (10, 7))
-STREAMS, HIDDEN, N, MAPPING_ROWS = 4, 4096, 16384, 24
+STREAMS, MAPPING_ROWS = 4, 24
+HIDDEN_SIZES = tuple(loader.HIDDEN_SIZES)
 BF16, F32 = torch.bfloat16, torch.float32
 SEED = 7046
 # Token-count sequences of one buffer (the largest first: the buffer is sized for it).  The first two run the
@@ -104,11 +108,23 @@ def warmup_jit():
     yield
 
 
-_INPUTS: dict[int, dict] = {}
+@pytest.fixture(params=HIDDEN_SIZES, ids=lambda h: f"H{h}")
+def hidden(request) -> int:
+    """The hidden size of a case (every size of the package; skipped where the architecture has no route)."""
+    arch = loader.arch_for_capability(torch.cuda.get_device_capability(_device()))
+    sizes = tuple(loader.supported_hidden_sizes(arch)) if arch else ()
+    if request.param not in sizes:
+        pytest.skip(
+            f"hidden {request.param} has no exported route on {arch} (exported hidden sizes: {sizes})"
+        )
+    return request.param
 
 
-def _inputs(T: int) -> dict:
-    if T not in _INPUTS:
+_INPUTS: dict[tuple[int, int], dict] = {}
+
+
+def _inputs(T: int, hidden: int) -> dict:
+    if (T, hidden) not in _INPUTS:
         g = torch.Generator(device=_device()).manual_seed(SEED + T)
 
         def randn(*shape: int, dtype: torch.dtype = F32) -> torch.Tensor:
@@ -116,17 +132,18 @@ def _inputs(T: int) -> dict:
                 dtype
             )
 
-        _INPUTS.clear()  # one token count's inputs at a time (16263 tokens hold ~1.3 GB)
-        _INPUTS[T] = {
-            "X": randn(T, STREAMS, HIDDEN, dtype=BF16),
-            "fn": (randn(MAPPING_ROWS, N) * 1e-2).contiguous(),
+        # One (token count, hidden size)'s inputs at a time (16263 tokens hold ~1.3 GB at H 4096, ~2.3 GB at 7168).
+        _INPUTS.clear()
+        _INPUTS[(T, hidden)] = {
+            "X": randn(T, STREAMS, hidden, dtype=BF16),
+            "fn": (randn(MAPPING_ROWS, STREAMS * hidden) * 1e-2).contiguous(),
             "scale": 1.0 + 0.1 * randn(3),
             "base": 0.1 * randn(MAPPING_ROWS),
-            "B": randn(T, HIDDEN, dtype=BF16),
-            "dY": randn(T, STREAMS, HIDDEN, dtype=BF16),
-            "dU": randn(T, HIDDEN, dtype=BF16),
+            "B": randn(T, hidden, dtype=BF16),
+            "dY": randn(T, STREAMS, hidden, dtype=BF16),
+            "dU": randn(T, hidden, dtype=BF16),
         }
-    return _INPUTS[T]
+    return _INPUTS[(T, hidden)]
 
 
 def _step(i: dict, fwd_ws, bwd_ws) -> dict:
@@ -148,19 +165,29 @@ def _snapshot(out: dict) -> dict:
     return {k: v.detach().clone() for k, v in out.items()}
 
 
-def _fresh(T: int) -> dict:
+def _layout(kind: str, T: int, hidden: int) -> dict:
+    return loader.workspace_layout(kind, T, device_index=_device().index, hidden=hidden)
+
+
+def _workspaces(t_max: int, hidden: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Caller-owned forward and backward workspaces for up to ``t_max`` tokens of hidden size ``hidden``."""
+    return (
+        pkg.cake_mhc_det_train_forward_workspace(t_max, _device(), hidden=hidden),
+        pkg.cake_mhc_det_train_backward_workspace(t_max, _device(), hidden=hidden),
+    )
+
+
+def _fresh(T: int, hidden: int) -> dict:
     """The outputs of one call on fresh zeroed exact-size workspaces."""
-    fwd_ws = torch.zeros(
-        loader.workspace_layout("fwd", T, device_index=_device().index)["total_bytes"],
-        dtype=torch.uint8,
-        device=_device(),
+    fwd_ws, bwd_ws = (
+        torch.zeros(
+            _layout(kind, T, hidden)["total_bytes"],
+            dtype=torch.uint8,
+            device=_device(),
+        )
+        for kind in ("fwd", "bwd")
     )
-    bwd_ws = torch.zeros(
-        loader.workspace_layout("bwd", T, device_index=_device().index)["total_bytes"],
-        dtype=torch.uint8,
-        device=_device(),
-    )
-    out = _snapshot(_step(_inputs(T), fwd_ws, bwd_ws))
+    out = _snapshot(_step(_inputs(T, hidden), fwd_ws, bwd_ws))
     torch.cuda.synchronize()
     return out
 
@@ -174,46 +201,44 @@ def _assert_bitwise(ref: dict, got: dict, what: str) -> None:
         )
 
 
-def _ticket_words(ws: torch.Tensor, kind: str, T: int) -> int:
-    """Non-zero bytes in the ticket region of ``kind``'s layout for ``T`` tokens."""
-    region = loader.workspace_layout(kind, T, device_index=_device().index)["regions"][
-        "ticket"
-    ]
+def _ticket_words(ws: torch.Tensor, kind: str, T: int, hidden: int) -> int:
+    """Non-zero bytes in the ticket region of ``kind``'s layout for ``T`` tokens of hidden size ``hidden``."""
+    region = _layout(kind, T, hidden)["regions"]["ticket"]
     return int(
         torch.count_nonzero(ws[region["offset"] : region["offset"] + region["bytes"]])
     )
 
 
-def _assert_tickets_zero(fwd_ws, bwd_ws, T: int, what: str) -> None:
+def _assert_tickets_zero(fwd_ws, bwd_ws, T: int, hidden: int, what: str) -> None:
     torch.cuda.synchronize()
     for ws, kind in ((fwd_ws, "fwd"), (bwd_ws, "bwd")):
-        nonzero = _ticket_words(ws, kind, T)
+        nonzero = _ticket_words(ws, kind, T, hidden)
         assert nonzero == 0, (
-            f"{what}: {nonzero} non-zero bytes in the {kind} ticket words of T={T}"
+            f"{what}: {nonzero} non-zero bytes in the {kind} ticket words of T={T} H={hidden}"
         )
 
 
 @pytest.mark.parametrize("name", sorted(SEQUENCES))
-def test_caller_workspace_reused_across_token_counts(name: str) -> None:
+def test_caller_workspace_reused_across_token_counts(name: str, hidden: int) -> None:
     Ts = SEQUENCES[name]
     t_max = max(Ts)
-    fwd_ws = pkg.cake_mhc_det_train_forward_workspace(t_max, _device())
-    bwd_ws = pkg.cake_mhc_det_train_backward_workspace(t_max, _device())
+    fwd_ws, bwd_ws = _workspaces(t_max, hidden)
     for n, T in enumerate(Ts):
-        ref = _fresh(T)
-        what = f"{name} call {n} (T={T} on a buffer of T={t_max})"
-        _assert_tickets_zero(fwd_ws, bwd_ws, T, what + " before the call")
-        got = _snapshot(_step(_inputs(T), fwd_ws, bwd_ws))
-        _assert_tickets_zero(fwd_ws, bwd_ws, T, what + " after the call")
+        ref = _fresh(T, hidden)
+        what = f"{name} H={hidden} call {n} (T={T} on a buffer of T={t_max})"
+        _assert_tickets_zero(fwd_ws, bwd_ws, T, hidden, what + " before the call")
+        got = _snapshot(_step(_inputs(T, hidden), fwd_ws, bwd_ws))
+        _assert_tickets_zero(fwd_ws, bwd_ws, T, hidden, what + " after the call")
         _assert_bitwise(ref, got, what)
 
 
 @pytest.mark.parametrize(("t_max", "t_small"), GRAPHS)
-def test_graph_captured_at_a_smaller_token_count(t_max: int, t_small: int) -> None:
-    fwd_ws = pkg.cake_mhc_det_train_forward_workspace(t_max, _device())
-    bwd_ws = pkg.cake_mhc_det_train_backward_workspace(t_max, _device())
-    ref_small = _fresh(t_small)
-    small = _inputs(t_small)
+def test_graph_captured_at_a_smaller_token_count(
+    t_max: int, t_small: int, hidden: int
+) -> None:
+    fwd_ws, bwd_ws = _workspaces(t_max, hidden)
+    ref_small = _fresh(t_small, hidden)
+    small = _inputs(t_small, hidden)
     side = torch.cuda.Stream()
     side.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(side):
@@ -225,51 +250,54 @@ def test_graph_captured_at_a_smaller_token_count(t_max: int, t_small: int) -> No
     with torch.cuda.graph(graph):
         out = _step(small, fwd_ws, bwd_ws)
     torch.cuda.synchronize()
-    ref_big = _fresh(t_max)
-    big = _inputs(t_max)
+    ref_big = _fresh(t_max, hidden)
+    big = _inputs(t_max, hidden)
     for r in range(3):
-        what = f"replay {r} at T={t_small} after an eager call at T={t_max}"
+        what = f"H={hidden} replay {r} at T={t_small} after an eager call at T={t_max}"
         got_big = _snapshot(_step(big, fwd_ws, bwd_ws))
-        _assert_tickets_zero(
-            fwd_ws, bwd_ws, t_max, f"eager T={t_max} before replay {r}"
-        )
-        _assert_bitwise(ref_big, got_big, f"eager T={t_max} before replay {r}")
-        _assert_tickets_zero(fwd_ws, bwd_ws, t_small, what + " (before)")
+        eager = f"H={hidden} eager T={t_max} before replay {r}"
+        _assert_tickets_zero(fwd_ws, bwd_ws, t_max, hidden, eager)
+        _assert_bitwise(ref_big, got_big, eager)
+        _assert_tickets_zero(fwd_ws, bwd_ws, t_small, hidden, what + " (before)")
         for t in out.values():
             t.fill_(float("nan"))
         graph.replay()
-        _assert_tickets_zero(fwd_ws, bwd_ws, t_small, what + " (after)")
+        _assert_tickets_zero(fwd_ws, bwd_ws, t_small, hidden, what + " (after)")
         _assert_bitwise(ref_small, _snapshot(out), what)
     del graph
 
 
 @pytest.mark.parametrize("Ts", DEFAULT_BUCKETS)
-def test_default_workspace_bucket_across_token_counts(Ts: tuple) -> None:
+def test_default_workspace_bucket_across_token_counts(Ts: tuple, hidden: int) -> None:
     for n, T in enumerate(Ts):
-        ref = _fresh(T)
-        got = _snapshot(_step(_inputs(T), None, None))
+        ref = _fresh(T, hidden)
+        got = _snapshot(_step(_inputs(T, hidden), None, None))
         torch.cuda.synchronize()
-        _assert_bitwise(ref, got, f"default workspace call {n} (T={T}) of {Ts}")
+        _assert_bitwise(
+            ref, got, f"default workspace call {n} (T={T}, H={hidden}) of {Ts}"
+        )
 
 
-# One process per sequence: the inputs of the issue's reproduction (one CPU generator seeded 0, drawn in call order),
-# each ``backward_finish`` on the default workspace, then the same call on a fresh zeroed exact-size workspace.
+# One process per sequence: the inputs of the issue's reproduction (one CPU generator seeded 0, drawn in call order)
+# at the hidden size of the case, each ``backward_finish`` on the default workspace (keyed by device, kind, hidden size
+# and power-of-two token bucket), then the same call on a fresh zeroed exact-size workspace.
 _REPORTED_CHILD = r"""
 import importlib, json, sys
 import torch
 pkg = importlib.import_module(sys.argv[1])
 loader = importlib.import_module(sys.argv[1] + ".cake_jit")
+H = int(sys.argv[3])
 dev = torch.device("cuda:0")
 gen = torch.Generator(device="cpu").manual_seed(0)
 def r(*shape, dtype=torch.float32, scale=1.0):
     return (torch.randn(shape, generator=gen) * scale).to(dtype).to(dev)
 for T in (int(t) for t in sys.argv[2].split(",")):
-    args = [r(T, 4, 4096, dtype=torch.bfloat16), r(T, 4, 4096, dtype=torch.bfloat16, scale=1e-3),
-            r(T, 4096, dtype=torch.bfloat16, scale=1e-3), None, r(24, 16384, scale=0.05), r(3, scale=0.1),
+    args = [r(T, 4, H, dtype=torch.bfloat16), r(T, 4, H, dtype=torch.bfloat16, scale=1e-3),
+            r(T, H, dtype=torch.bfloat16, scale=1e-3), None, r(24, 4 * H, scale=0.05), r(3, scale=0.1),
             r(24), r(T, 64), r(T, 32, scale=1e-3)]
-    layout = loader.workspace_layout("bwd", T, device_index=0)
+    layout = loader.workspace_layout("bwd", T, device_index=0, hidden=H)
     ticket = layout["regions"]["ticket"]
-    key = (0, "bwd", 1 << (T - 1).bit_length())
+    key = (0, "bwd", H, 1 << (T - 1).bit_length())
     def nonzero():
         torch.cuda.synchronize()
         ws = pkg._DEFAULT_WORKSPACES.get(key)
@@ -278,6 +306,7 @@ for T in (int(t) for t in sys.argv[2].split(",")):
     print(json.dumps(call), flush=True)
     got = [t.clone() for t in pkg.cake_mhc_det_train_backward_finish(*args)]
     call["ticket_after"] = nonzero()
+    call["default_found"] = key in pkg._DEFAULT_WORKSPACES
     fresh = torch.zeros(layout["total_bytes"], dtype=torch.uint8, device=dev)
     ref = pkg.cake_mhc_det_train_backward_finish(*args, workspace=fresh)
     torch.cuda.synchronize()
@@ -289,7 +318,7 @@ for T in (int(t) for t in sys.argv[2].split(",")):
 @pytest.mark.parametrize(
     "Ts", REPORTED_SEQUENCES, ids=lambda Ts: "-".join(map(str, Ts))
 )
-def test_default_workspace_reported_sequence(Ts: tuple) -> None:
+def test_default_workspace_reported_sequence(Ts: tuple, hidden: int) -> None:
     run = subprocess.run(
         [
             sys.executable,
@@ -297,6 +326,7 @@ def test_default_workspace_reported_sequence(Ts: tuple) -> None:
             _REPORTED_CHILD,
             PACKAGES["cake_mhc_det_train"],
             ",".join(map(str, Ts)),
+            str(hidden),
         ],
         cwd=Path(__file__).resolve().parents[2],
         capture_output=True,
@@ -313,7 +343,11 @@ def test_default_workspace_reported_sequence(Ts: tuple) -> None:
     done = [c for c in calls if "differs" in c]
     assert [c["T"] for c in done] == list(Ts), tail
     for c in done:
-        what = f"default workspace, backward_finish at T={c['T']} of {Ts}"
+        what = f"default workspace, backward_finish at T={c['T']} H={hidden} of {Ts}"
+        # The ticket checks read the call's default buffer, not a missing one (a vacuous zero).
+        assert c["default_found"], (
+            f"{what}: no default workspace under the probed key (device, kind, hidden, bucket)"
+        )
         assert c["ticket_before"] == 0, (
             f"{what}: {c['ticket_before']} non-zero ticket bytes before the call"
         )

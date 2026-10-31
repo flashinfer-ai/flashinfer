@@ -126,6 +126,18 @@ def _require_nondeterministic(deterministic: Any, entry: str) -> None:
         )
 
 
+def _require_hidden(hidden: Any, entry: str) -> None:
+    """The hidden-size contract of the workspace entry points: the package exports hidden ``HIDDEN`` only, so a
+    ``hidden`` keyword other than ``HIDDEN`` raises ``ValueError`` (the deterministic package also exports other
+    hidden sizes)."""
+
+    if type(hidden) is not int or hidden != HIDDEN:
+        raise ValueError(
+            f"{entry}(deterministic=False) supports hidden={HIDDEN} only (got {hidden!r}); "
+            "flashinfer.cake_mhc_det_train is the deterministic package for the other hidden sizes"
+        )
+
+
 def _alert_nondeterministic(entry: str) -> None:
     """PyTorch's alert for an operation without a deterministic implementation, raised by ``entry`` before it
     launches the unordered reduction while PyTorch's deterministic algorithms are enabled: a ``RuntimeError``, or a
@@ -405,7 +417,11 @@ def _workspace_bytes(kind: str, rows: int, device: torch.device) -> int:
 
 
 def cake_mhc_train_forward_workspace_bytes(
-    T: int, device: torch.device, *, deterministic: bool = True
+    T: int,
+    device: torch.device,
+    *,
+    hidden: int = HIDDEN,
+    deterministic: bool = True,
 ) -> int:
     """Bytes of the caller-owned forward workspace for up to ``T`` tokens on ``device``.
 
@@ -419,15 +435,20 @@ def cake_mhc_train_forward_workspace_bytes(
     zero on first use (allocate with ``torch.zeros`` or
     :func:`cake_mhc_train_forward_workspace`); the kernels leave them zero.
     ``T == 0`` needs no workspace (nothing is launched).  ``deterministic`` must
-    be ``False``.
+    be ``False`` and ``hidden`` 4096 (the package's only hidden size).
     """
 
     _require_nondeterministic(deterministic, "cake_mhc_train_forward_workspace_bytes")
+    _require_hidden(hidden, "cake_mhc_train_forward_workspace_bytes")
     return _workspace_bytes("fwd", T, device)
 
 
 def cake_mhc_train_backward_workspace_bytes(
-    T: int, device: torch.device, *, deterministic: bool = True
+    T: int,
+    device: torch.device,
+    *,
+    hidden: int = HIDDEN,
+    deterministic: bool = True,
 ) -> int:
     """Bytes of the caller-owned backward workspace for up to ``T`` tokens on ``device``.
 
@@ -440,29 +461,40 @@ def cake_mhc_train_backward_workspace_bytes(
     bytes, ``P <= 32``), so a deterministic backward workspace also serves this
     package.  The size is the maximum over every token count up to ``T`` (see
     :func:`cake_mhc_train_forward_workspace_bytes`).  ``deterministic`` must be
-    ``False``.
+    ``False`` and ``hidden`` 4096.
     """
 
     _require_nondeterministic(deterministic, "cake_mhc_train_backward_workspace_bytes")
+    _require_hidden(hidden, "cake_mhc_train_backward_workspace_bytes")
     return _workspace_bytes("bwd", T, device)
 
 
 def cake_mhc_train_forward_workspace(
-    T: int, device: torch.device, *, deterministic: bool = True
+    T: int,
+    device: torch.device,
+    *,
+    hidden: int = HIDDEN,
+    deterministic: bool = True,
 ) -> torch.Tensor:
     """Allocate a zero-initialized forward workspace (see ``..._forward_workspace_bytes``)."""
 
     _require_nondeterministic(deterministic, "cake_mhc_train_forward_workspace")
+    _require_hidden(hidden, "cake_mhc_train_forward_workspace")
     nbytes = _workspace_bytes("fwd", T, device)
     return torch.zeros(nbytes, dtype=torch.uint8, device=torch.device(device))
 
 
 def cake_mhc_train_backward_workspace(
-    T: int, device: torch.device, *, deterministic: bool = True
+    T: int,
+    device: torch.device,
+    *,
+    hidden: int = HIDDEN,
+    deterministic: bool = True,
 ) -> torch.Tensor:
     """Allocate a zero-initialized backward workspace (see ``..._backward_workspace_bytes``)."""
 
     _require_nondeterministic(deterministic, "cake_mhc_train_backward_workspace")
+    _require_hidden(hidden, "cake_mhc_train_backward_workspace")
     nbytes = _workspace_bytes("bwd", T, device)
     return torch.zeros(nbytes, dtype=torch.uint8, device=torch.device(device))
 

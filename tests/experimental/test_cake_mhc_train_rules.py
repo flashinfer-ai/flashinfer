@@ -20,8 +20,10 @@ package with the non-deterministic backward
 
 The package is a standalone copy of the deterministic package
 (``flashinfer.cake_mhc_det_train_backend``) under the ``cake_mhc_train_``
-prefix, except the ``bwd_finish`` route.  This module checks the registry
-``cake_jit.py`` against the deterministic registry on its boards of record
+prefix at hidden 4096, except the ``bwd_finish`` route.  This module checks
+the registry ``cake_jit.py`` against the deterministic registry's records,
+routes and record scalars of hidden 4096 (the deterministic package also
+exports other hidden sizes, which have no copy here) on its boards of record
 (``RULES_BOARDS``) and token counts of record (``RULES_T_VALUES``):
 
 * the program set is the deterministic set without its column-slab
@@ -134,6 +136,22 @@ DROPPED_ROLES = ("bwd_slab", "bwd_reduce")
 # Sinkhorn counts other than the count of record: the token-owner pass runs its run-time-count record.
 RUN_TIME_ITERS = (1, 7, 64)
 T_VALUES = tuple(T for T in det.RULES_T_VALUES if T > 0)
+# The deterministic records, routes and record scalars of this package's hidden size (the deterministic package also
+# exports other hidden sizes; this package copies hidden 4096 only).
+DET_MODULES = {
+    name: record for name, record in det.MODULES.items() if record["hidden"] == HIDDEN
+}
+DET_ROUTES = {
+    arch: {
+        key: route
+        for key, route in routes.items()
+        if key in {det.route_key(HIDDEN, kind) for kind in det.KINDS}
+    }
+    for arch, routes in det.ROUTES.items()
+}
+DET_RECORD_SCALARS = {
+    name: scalars for name, scalars in det.RECORD_SCALARS.items() if name in DET_MODULES
+}
 # The public entry points that take the mode keyword (every compute and workspace entry point).
 MODE_ENTRIES = (
     "cake_mhc_train_forward_prepare",
@@ -225,20 +243,21 @@ def test_program_set_is_the_deterministic_set_without_slab_reduce_and_backward_s
     launch, arguments, rules) plus the four programs of this package; the dropped records are exactly the
     deterministic column-slab and reduction roles, and the backward fn splits are the only other records without a
     copy."""
-    dropped = {name for name in det.MODULES if _dropped(name)}
+    assert DET_MODULES and HIDDEN in det.HIDDEN_SIZES
+    dropped = {name for name in DET_MODULES if _dropped(name)}
     assert dropped and {_det_role(name) for name in dropped} == set(DROPPED_ROLES)
     assert not [
         name
-        for name in det.MODULES
+        for name in DET_MODULES
         if name not in dropped and _det_role(name) in DROPPED_ROLES
     ]
     backward_splits = {
-        name for name in det.MODULES if _det_role(name) == "fn_split_bwd"
+        name for name in DET_MODULES if _det_role(name) == "fn_split_bwd"
     }
     assert backward_splits and not backward_splits & dropped
     copied = {
         _renamed(name): name
-        for name in det.MODULES
+        for name in DET_MODULES
         if name not in dropped and name not in backward_splits
     }
     assert all(name.startswith(ND_PREFIX) for name in copied)
@@ -423,8 +442,13 @@ def test_routes_are_the_deterministic_routes_but_bwd_finish() -> None:
     assert set(nd.ROUTES) == set(det.ROUTES) == set(det.ARCHES)
     routed: dict[str, set] = {}
     for arch in det.ARCHES:
-        assert set(nd.ROUTES[arch]) == set(det.ROUTES[arch]), arch
-        for key, det_route in det.ROUTES[arch].items():
+        assert set(DET_ROUTES[arch]) == {
+            det.route_key(HIDDEN, kind) for kind in det.KINDS
+        }
+        for det_route in DET_ROUTES[arch].values():
+            assert {det.MODULES[n]["hidden"] for n in det_route} == {HIDDEN}, arch
+        assert set(nd.ROUTES[arch]) == set(DET_ROUTES[arch]), arch
+        for key, det_route in DET_ROUTES[arch].items():
             route = nd.ROUTES[arch][key]
             for name in route:
                 routed.setdefault(name, set()).add(arch)
@@ -517,7 +541,7 @@ def test_pdl_follows_the_deterministic_edges(arch: str, sm: int) -> None:
                 boundaries |= {at_most, at_most + 1}
     copied = [
         n
-        for route in det.ROUTES[arch].values()
+        for route in DET_ROUTES[arch].values()
         for n in route
         if not _dropped(n) and _det_role(n) != "fn_split_bwd"
     ]
@@ -629,8 +653,8 @@ _SHARED_TABLES = (
     "TOKP_LAYOUT", "PARAM_LAYOUT", "RULES_SM_COUNTS", "RULES_BOARDS", "RULES_T_VALUES", "PK_BANDS",
     "FN_SPLIT_PROGRAM", "FN_SPLIT_GRID", "FWD_MAP_PRODUCTION", "FWD_MAP_BANDS", "FWD_MAP_FIT", "FWD_MAP_CLAIM",
     "FWD_COEF_REGIMES", "BWD_TOKEN_PROGRAM", "BWD_TOKEN_REGIMES", "BWD_TOKEN_BANDS", "K5_GRID_BANDS",
-    "K5_FORM_BANDS", "K5_FORM_ROWS", "FWD_FINISH_PROGRAM", "FWD_FINISH_ROWS", "HIDDEN_SIZES", "PDL_PATHS",
-    "SELECT_RULE_KINDS",
+    "K5_FORM_BANDS", "K5_FORM_ROWS", "FWD_FINISH_PROGRAM", "FWD_FINISH_ROWS", "FWD_FINISH_COL_SPLIT", "K3_TILING",
+    "K6_CTAS_PER_SM", "PDL_PATHS", "SELECT_RULE_KINDS", "RUN_TIME_ITERS_ROLES",
 )  # fmt: skip
 # The deterministic column-slab and reduction rules, absent here.
 _DROPPED_RULES = (
@@ -652,6 +676,13 @@ def test_host_rules_are_copies_of_the_deterministic_ones(arch: str, sm: int) -> 
     columns, with this package's backward workspace bytes."""
     for name in _SHARED_TABLES:
         assert getattr(nd, name) == getattr(det, name), name
+    # The hidden sizes: this package's one size is a deterministic size; the per-size tables of the other sizes have
+    # no copy (the tables of record above are the H 4096 ones), the per-size table names are the deterministic ones
+    # without the column-slab and reduction tables.
+    assert nd.HIDDEN_SIZES == (HIDDEN,) and HIDDEN in det.HIDDEN_SIZES
+    assert nd.H_TABLES == {} and HIDDEN not in det.H_TABLES
+    kept = tuple(name for name in det.H_TABLE_NAMES if name not in _DROPPED_RULES)
+    assert kept == nd.H_TABLE_NAMES
     for name in _DROPPED_RULES:
         assert hasattr(det, name) and not hasattr(nd, name), name
     for name in _OWN_RULES:
@@ -949,11 +980,12 @@ def test_workspace_envelope_never_runs_the_screen(monkeypatch) -> None:
 @pytest.mark.cpu_only
 def test_route_glue_and_supported_hidden_sizes() -> None:
     for arch in det.ARCHES:
-        assert (
-            nd.supported_hidden_sizes(arch)
-            == det.supported_hidden_sizes(arch)
-            == (HIDDEN,)
-        ), arch
+        assert nd.supported_hidden_sizes(arch) == (HIDDEN,), arch
+        assert HIDDEN in det.supported_hidden_sizes(arch), arch
+        # the deterministic package's other hidden sizes have no route here
+        for hidden in set(det.supported_hidden_sizes(arch)) - {HIDDEN}:
+            with pytest.raises(ValueError):
+                nd.selected_modules(arch, hidden, "bwd_finish", rows=129, sm_count=148)
     assert nd.supported_hidden_sizes("sm_90a") == ()
     for kind in det.KINDS:
         assert nd.route_key(HIDDEN, kind) == det.route_key(HIDDEN, kind)
@@ -961,9 +993,10 @@ def test_route_glue_and_supported_hidden_sizes() -> None:
             assert nd.route_applies(
                 device_capability=capability, hidden=HIDDEN, kind=kind
             )
-            assert not nd.route_applies(
-                device_capability=capability, hidden=2048, kind=kind
-            )
+            for hidden in (2048, *(h for h in det.HIDDEN_SIZES if h != HIDDEN)):
+                assert not nd.route_applies(
+                    device_capability=capability, hidden=hidden, kind=kind
+                )
         for capability in ((9, 0), (12, 0), (10, 1)):
             assert not nd.route_applies(
                 device_capability=capability, hidden=HIDDEN, kind=kind
@@ -991,7 +1024,7 @@ def test_library_names_and_record_scalars() -> None:
                     nd.library_name(name, arch)
     assert {
         _renamed(name): scalars
-        for name, scalars in det.RECORD_SCALARS.items()
+        for name, scalars in DET_RECORD_SCALARS.items()
         if _det_role(name) != "fn_split_bwd"
     } == nd.RECORD_SCALARS
     assert nd.RECORD_SCALARS == {ND_PREFIX + "fn_split": {"want_t": 0}}
