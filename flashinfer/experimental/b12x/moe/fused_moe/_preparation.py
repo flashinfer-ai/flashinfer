@@ -124,6 +124,8 @@ def _control_snapshot() -> FrozenMapping:
             "trellis_decode_table": trellis_decode_table(),
             "w4a16_small_m_occupancy": _w4a16_small_m_occupancy(),
             "w4a8_csf_inline_max_tokens": _impl.W4A8_CSF_INLINE_MAX_TOKENS,
+            "w4a8_csf_inline_explicit_limit": "B12X_W4A8_CSF_INLINE_MAX_TOKENS"
+            in _impl.os.environ,
             "w4a16_prefill_fused_sum": prefill_fused_sum_enabled(),
             "w4a16_csf_stage_max_tokens": _impl.W4A16_CSF_STAGE_MAX_TOKENS,
             "w4a16_skip_empty_m_blocks": _impl.os.environ.get(
@@ -303,6 +305,21 @@ def _lower_caps(
     device: torch.device,
 ) -> TPMoEScratchCaps:
     """One config-to-Caps lowering shared by compilation, sizing and serving."""
+    inline_limit = int(query.controls.get("w4a8_csf_inline_max_tokens", 1536))
+    if (
+        weight_plan.w4a8_csf_inline
+        and weight_plan.w4a8_n64_repacked
+        and config.backend == "dynamic"
+        and config.dynamic_tile_m == 64
+        and query.intermediate_size % 128 == 0
+        and inline_limit == 1536
+        and not query.controls.get("w4a8_csf_inline_explicit_limit", False)
+        and query.routed_rows <= 64 * query.num_experts
+        and torch.cuda.get_device_capability(device) == (12, 1)
+    ):
+        # GB10 measurements support this M64 prefill band; keep larger or
+        # more concentrated plans on per-call expansion.
+        inline_limit = 2048
     if getattr(
         weight_plan, "w4a16_compressed_scales", False
     ) and query.num_tokens > int(
@@ -350,11 +367,7 @@ def _lower_caps(
         w4a16_fast_math=query.fast_math,
         w4a8_csf_inline=bool(
             weight_plan.w4a8_csf_inline
-            and (
-                config.backend != "dynamic"
-                or query.num_tokens
-                <= int(query.controls.get("w4a8_csf_inline_max_tokens", 1536))
-            )
+            and (config.backend != "dynamic" or query.num_tokens <= inline_limit)
         ),
         w4a16_prefill_fused_sum=bool(
             query.controls.get("w4a16_prefill_fused_sum", False)

@@ -278,7 +278,17 @@ def _assert_bitwise(expected, actual):
     ],
 )
 def test_inline_scales_match_native_and_expansion_under_poisoned_replay(
-    h, n, tokens, layout, ids_dtype, monkeypatch, after_plan=None
+    h,
+    n,
+    tokens,
+    layout,
+    ids_dtype,
+    monkeypatch,
+    after_plan=None,
+    experts=8,
+    topk=2,
+    execution_override=None,
+    reads_inline=True,
 ):
     """Inline reads equal native scales and per-call expansion bit for bit.
 
@@ -286,8 +296,10 @@ def test_inline_scales_match_native_and_expansion_under_poisoned_replay(
     replay; inline launches never read or write it.
     """
     device = require_b12x()
-    e, topk = 8, 2
-    (native, expanded, inline), scratch = _prepare_arms(h, n, layout, monkeypatch)
+    e = experts
+    (native, expanded, inline), scratch = _prepare_arms(
+        h, n, layout, monkeypatch, experts=e
+    )
     assert expanded._impl.mxfp4_csf is not None
     assert expanded._impl.mxfp4_csf_inline is None
     assert not expanded.plan._impl.w4a8_csf_inline
@@ -304,6 +316,7 @@ def test_inline_scales_match_native_and_expansion_under_poisoned_replay(
             capacity=moe.ExecutionCapacity(max_tokens=tokens, top_k=topk),
             invocation={"fast_math": False},
             routing=moe.RoutingSpec(deterministic_output=True),
+            override=execution_override,
         )
         for owner in arms
     ]
@@ -360,6 +373,7 @@ def test_inline_scales_match_native_and_expansion_under_poisoned_replay(
             )
             owners.append((buffers, binding))
             outputs.append(output)
+        assert owners[2][1].w4a8_csf_inline == reads_inline
         session.freeze()
         for _, binding in owners:
             graph = torch.cuda.CUDAGraph()
@@ -382,9 +396,20 @@ def test_inline_scales_match_native_and_expansion_under_poisoned_replay(
             )
             _assert_bitwise(outputs[0], outputs[1])
             _assert_bitwise(outputs[0], outputs[2])
-            assert all(
-                bool((buffer.view(torch.uint8) == 0xFF).all()) for buffer in scratch[1]
-            )
+            if reads_inline:
+                assert all(
+                    bool((buffer.view(torch.uint8) == 0xFF).all())
+                    for buffer in scratch[1]
+                )
+            else:
+                reference = native._impl.representation.value
+                for buffer, expected in zip(
+                    scratch[1], (reference.w13_sfb, reference.w2_sfb), strict=True
+                ):
+                    assert torch.equal(
+                        buffer.view(torch.uint8).view(-1),
+                        expected.view(torch.uint8).view(-1),
+                    )
         for graph in graphs:
             graph.reset()
 
@@ -591,4 +616,60 @@ def test_inline_capacity_control_is_retained_after_declaration(monkeypatch):
         torch.int32,
         monkeypatch,
         after_plan=lambda: monkeypatch.setattr(_impl, "W4A8_CSF_INLINE_MAX_TOKENS", 0),
+    )
+
+
+@pytest.mark.parametrize(
+    "h,n,experts,topk,tokens,limit,reads_inline",
+    [
+        (1024, 256, 64, 2, 1537, None, True),
+        (1024, 256, 64, 2, 1792, None, True),
+        (1024, 256, 64, 2, 2048, None, True),
+        (2048, 512, 128, 4, 2048, None, True),
+        (1024, 256, 128, 2, 2049, None, False),
+        (1024, 256, 32, 2, 2048, None, False),
+        (1024, 256, 64, 2, 2048, 1536, False),
+        (1024, 256, 64, 2, 2048, 0, False),
+        (1024, 256, 128, 2, 2049, 4096, True),
+    ],
+)
+def test_m64_prefill_admission_preserves_outputs_and_explicit_limits(
+    h, n, experts, topk, tokens, limit, reads_inline, monkeypatch
+):
+    """The bounded SM121 policy survives replay with changed routes and controls."""
+    from b12x.moe.fused_moe import _impl
+
+    device = require_b12x()
+    if torch.cuda.get_device_capability(device) != (12, 1):
+        pytest.skip("The extended automatic prefill band targets SM121")
+    if limit is None:
+        monkeypatch.delenv("B12X_W4A8_CSF_INLINE_MAX_TOKENS", raising=False)
+    else:
+        monkeypatch.setenv("B12X_W4A8_CSF_INLINE_MAX_TOKENS", str(limit))
+    monkeypatch.setattr(
+        _impl, "W4A8_CSF_INLINE_MAX_TOKENS", 1536 if limit is None else limit
+    )
+
+    def change_controls():
+        monkeypatch.setenv("B12X_W4A8_CSF_INLINE_MAX_TOKENS", "0")
+        monkeypatch.setattr(_impl, "W4A8_CSF_INLINE_MAX_TOKENS", 0)
+
+    test_inline_scales_match_native_and_expansion_under_poisoned_replay(
+        h,
+        n,
+        tokens,
+        "w31",
+        torch.int32,
+        monkeypatch,
+        after_plan=change_controls,
+        experts=experts,
+        topk=topk,
+        execution_override=moe.MoeDecodeConfig(
+            backend="dynamic",
+            max_active_clusters=None,
+            route_planner="internal",
+            dynamic_tile_m=64,
+            dynamic_route_mode="grouped",
+        ),
+        reads_inline=reads_inline,
     )
