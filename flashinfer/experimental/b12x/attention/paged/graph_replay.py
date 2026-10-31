@@ -750,7 +750,7 @@ def update_prefill_graph_compact_nonsplit_work_metadata_triton(
     active = tl.zeros((BLOCK_WORK_ITEMS,), tl.int1)
     tile_prefix = tl.zeros((), tl.int32)
 
-    for req_idx in tl.static_range(0, BATCH):
+    for req_idx in range(0, BATCH):
         q_start = tl.load(cu_seqlens_q_ptr + req_idx).to(tl.int32)
         q_end = tl.load(cu_seqlens_q_ptr + req_idx + 1).to(tl.int32)
         q_len = tl.maximum(q_end - q_start, 0)
