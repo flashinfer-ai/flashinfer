@@ -949,6 +949,11 @@ jobs:
           SKIP_ALL_FOUND: ${{ steps.skip-all.outputs.skip_all_found }}
           TRACE_GAPS: ${{ steps.trace-coverage.outputs.trace_gaps }}
           H100_DISABLED: ${{ needs.setup.outputs.h100_disabled }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          TEST_MATRIX: ${{ needs.setup.outputs.test_matrix }}
         run: |
           echo "## Test Results Summary" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
@@ -973,6 +978,40 @@ jobs:
           RESULT="${{ needs.test.result }}"
           echo "Tests: ${{ needs.setup.outputs.test_count }}, result: $RESULT" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
+
+          # A matrix failure hides cancelled siblings in needs.test.result. Read
+          # this attempt only; diagnostics must not change the required verdict.
+          if [ "${{ needs.setup.outputs.test_count }}" != "0" ]; then
+            if timeout 20s gh api --paginate \
+                "/repos/$GH_REPO/actions/runs/$RUN_ID/attempts/$RUN_ATTEMPT/jobs?per_page=100" \
+                --jq '{jobs: [.jobs[] | {name, run_id, run_attempt, status, conclusion, html_url}]}' \
+                > "$RUNNER_TEMP/test-lane-jobs.json" && \
+              jq -nr --argjson matrix "$TEST_MATRIX" \
+                --argjson run "$RUN_ID" --argjson attempt "$RUN_ATTEMPT" \
+                --slurpfile pages "$RUNNER_TEMP/test-lane-jobs.json" '
+                  [$pages[].jobs[] | select(.run_id == $run and .run_attempt == $attempt)] as $jobs
+                  | [$matrix.include[].name as $name
+                     | [$jobs[] | select(.name == $name)] as $matches
+                     | if ($matches | length) != 1 then
+                         {name: $name, result: (if ($matches | length) == 0 then "missing" else "unknown" end)}
+                       else $matches[0]
+                         | .result = (if .status != "completed" then (.status // "unknown") else (.conclusion // "unknown") end)
+                       end] as $lanes
+                  | "### Matrix lane outcomes (attempt \($attempt))", "",
+                    ($lanes | group_by(.result) | map("\(length) \(.[0].result)") | join(", ")), "",
+                    (if any($lanes[]; .result != "success") then
+                       "Coverage is incomplete. Cancelled, skipped, missing or unfinished lanes do not establish passing coverage."
+                     else "All planned matrix lanes completed successfully." end), "",
+                    "| Lane | Outcome | Details |", "| --- | --- | --- |",
+                    ($lanes | sort_by(if .result == "failure" then 0 elif .result == "success" then 2 else 1 end)[]
+                     | "| \(.name) | \(.result) | \(if .html_url then "[Open job](\(.html_url))" else "Unavailable" end) |"), ""
+                ' > "$RUNNER_TEMP/test-lane-summary.md"; then
+              cat "$RUNNER_TEMP/test-lane-summary.md" >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo "Matrix lane outcomes unavailable (API or metadata error); per-lane coverage is unknown." >> "$GITHUB_STEP_SUMMARY"
+              echo "" >> "$GITHUB_STEP_SUMMARY"
+            fi
+          fi
 
           # A scope is sticky per SHA: re-applying run-ci by hand on a commit that
           # once had a scoped bot run silently reuses it, so this required check can
