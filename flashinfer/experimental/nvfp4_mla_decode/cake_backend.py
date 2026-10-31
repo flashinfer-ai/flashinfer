@@ -17,6 +17,7 @@ limitations under the License.
 from __future__ import annotations
 
 import math
+from array import array
 from dataclasses import dataclass, replace
 from itertools import chain
 from typing import Optional, Sequence
@@ -931,6 +932,18 @@ def max_nvfp4_mla_decode_workspace_size(
     )
 
 
+# array typecode of a 32-bit C integer (the table words).
+_INT32_CODE = next(code for code in ("i", "l") if array(code).itemsize == 4)
+
+
+def _table_region(span: torch.Tensor, layout: dict, name: str) -> torch.Tensor:
+    """Int32 region ``name`` of the plan-table span (``work_table`` through
+    ``q_indptr``, viewed as int32 from ``layout["work_table"][0]``), 1-D."""
+    offset, nbytes = layout[name]
+    first = (offset - layout["work_table"][0]) // 4
+    return span[first : first + nbytes // 4]
+
+
 def _carve(flat: torch.Tensor, layout: dict, name: str, dtype, shape):
     offset, nbytes = layout[name]
     region = flat[offset : offset + nbytes].view(dtype)
@@ -951,7 +964,10 @@ def host_tables(
     ``workspace[layout["work_table"][0] : q_indptr_end]``.
     """
     words = _plan_table_words(plan, layout, q_indptr=q_indptr, row_splits=row_splits)
-    return torch.tensor(words, dtype=torch.int32, pin_memory=True)
+    # array packs the words as int32 without torch.tensor's per-element type
+    # inference; pin_memory copies them into pinned memory.
+    packed = array(_INT32_CODE, words)
+    return torch.frombuffer(packed, dtype=torch.int32).pin_memory()
 
 
 # ---------------------------------------------------------------------------
@@ -1292,12 +1308,17 @@ def prepare_nvfp4_batch_decode_with_kv_cache_mla(
     o_shape, lse_shape = partial_shapes(plan, total_q=total_q, num_heads=num_heads)
     partial_o = _carve(flat, layout, "partial_o", torch.bfloat16, o_shape)
     partial_lse = _carve(flat, layout, "partial_lse", torch.float32, lse_shape)
-    work_table = _carve(
-        flat, layout, "work_table", torch.int32, (plan.num_items, ITEM_FIELDS)
+    # The int32 plan tables are adjacent: one int32 view of their span carves
+    # them and takes the single upload below.
+    table_base = layout["work_table"][0]
+    table_end = layout["q_indptr"][0] + layout["q_indptr"][1]
+    table_span = flat[table_base:table_end].view(torch.int32)
+    work_table = _table_region(table_span, layout, "work_table").view(
+        plan.num_items, ITEM_FIELDS
     )
-    unit_first = _carve(flat, layout, "unit_first", torch.int32, (plan.num_units + 1,))
-    row_splits = _carve(flat, layout, "row_splits", torch.int32, (total_q,))
-    q_indptr = _carve(flat, layout, "q_indptr", torch.int32, (batch + 1,))
+    unit_first = _table_region(table_span, layout, "unit_first")
+    row_splits = _table_region(table_span, layout, "row_splits")
+    q_indptr = _table_region(table_span, layout, "q_indptr")
     sink_buffer = _carve(flat, layout, "sinks", torch.float32, (num_heads,))
     # The partial regions are not initialized: single-split items keep
     # FLAG_DIRECT_OUT (their CTAs write final O / LSE directly and the combine
@@ -1322,10 +1343,7 @@ def prepare_nvfp4_batch_decode_with_kv_cache_mla(
     tables = host_tables(
         plan, layout, q_indptr=q_indptr_host, row_splits=row_splits_host
     )
-    table_base = layout["work_table"][0]
-    flat[table_base : table_base + tables.numel() * 4].view(torch.int32).copy_(
-        tables, non_blocking=True
-    )
+    table_span.copy_(tables, non_blocking=True)
     if sinks is None:
         sink_buffer.zero_()
     else:
@@ -1374,9 +1392,7 @@ def prepare_nvfp4_batch_decode_with_kv_cache_mla(
         reduce_kwargs = dict(
             o=out[first:] if first else out,
             lse=lse[first:] if first else lse,
-            partial_o=partial_o.view(-1)[first * num_heads * HEAD_DIM :]
-            if first
-            else partial_o,
+            partial_o=main_kwargs["PO"][first * num_heads :] if first else partial_o,
             partial_lse=partial_lse[first:] if first else partial_lse,
             row_splits=row_splits[first:] if first else row_splits,
             total_q=total_q,
