@@ -2245,7 +2245,11 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t1024_sm103a(int* __restrict_
                     unsigned int row_3 = __shfl_sync(0xFFFFFFFF, (unsigned int)stored_row, i_5);
                     if (elect_sync()) {
                         if ((routed >> i_5 & 1) != 0) {
-                            cp_async_bulk_gmem2smem(combine_smem_addr + (epi_warp_2 * 6 + i_5) * 2560, expert_output + ((unsigned long long)row_3 * 5120 + (unsigned long long)(chunk * 1280)), 2560, combine_barriers_addr + (((buffers + i_5 >= epi_warp_2 * 6 + 6) ? buffers + i_5 - 6 : buffers + i_5)) * 8);
+                            asm volatile(
+                                "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                " [%0], [%1], %2, [%3], %4;"
+                                :: "r"(combine_smem_addr + (epi_warp_2 * 6 + i_5) * 2560), "l"(expert_output + ((unsigned long long)row_3 * 5120 + (unsigned long long)(chunk * 1280))), "r"((unsigned)(2560)), "r"(combine_barriers_addr + (((buffers + i_5 >= epi_warp_2 * 6 + 6) ? buffers + i_5 - 6 : buffers + i_5)) * 8),
+                                   "l"(0x12F0000000000000ULL) : "memory");
                             mbarrier_arrive_expect_tx(combine_barriers_addr + (((buffers + i_5 >= epi_warp_2 * 6 + 6) ? buffers + i_5 - 6 : buffers + i_5)) * 8, 2560);
                         } else {
                             mbarrier_arrive(combine_barriers_addr + (((buffers + i_5 >= epi_warp_2 * 6 + 6) ? buffers + i_5 - 6 : buffers + i_5)) * 8);

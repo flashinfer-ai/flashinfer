@@ -24,11 +24,16 @@ column-slab records (``bwd_slab``) and final-reduction records (``bwd_reduce``)
 are absent with their selection tables and their PDL edge (``K7->K8``), and
 three programs of this package take their place:
 
-* ``cake_mhc_train_fn_split_atomic__tv128`` (sm_100a, sm_103a) and
-  ``cake_mhc_train_fn_split_atomic__tv128_t128`` (sm_107a): the deterministic
-  transposed-layout fn split of the architecture (16-byte ``fnTp`` stores on
-  256- / 128-thread CTAs), bit for bit, which with ``accumulate == 0`` also
-  zeroes the FP32 ``dfn`` output;
+* ``cake_mhc_train_fn_split_atomic__tv128_dep`` (sm_100a, sm_103a) and
+  ``cake_mhc_train_fn_split_atomic__tv128_t128_dep`` (sm_107a): the
+  deterministic transposed-layout fn split of the architecture (16-byte
+  ``fnTp`` stores on 256- / 128-thread CTAs), bit for bit, which with
+  ``accumulate == 0`` also zeroes the FP32 ``dfn`` output, launched after the
+  token-owner pass as its programmatic dependent (``_dep``): it releases its
+  own dependent first and waits for the token-owner pass as its last
+  instruction, so it runs beside that pass (it reads only ``fn`` and writes
+  only ``fnTp`` and ``dfn``, which the token-owner pass never touches) and
+  completes only after it;
 * ``cake_mhc_train_bwd_slab_atomic__dynr`` (every architecture): the
   deterministic dynamic-schedule column-slab form ``dynr`` (``dX`` bit for
   bit), which adds the ``dfn`` sum of every (column slab, token chunk) unit into
@@ -39,7 +44,7 @@ three programs of this package take their place:
   reduction's sequence: an FP64 chain in ascending order, the carried-in value
   last, one rounding), so they are bitwise the deterministic package's.
 
-So ``bwd_finish`` is the fn split, the deterministic token-owner pass and the
+So ``bwd_finish`` is the deterministic token-owner pass, the fn split and the
 column slab: no final reduction, and the ``bwd`` workspace has no per-chunk
 ``dfn`` partial region (``dfn_part``).  Only the summation order of ``dfn``
 varies from run to run: each element sums at most ``P`` per-chunk partials
@@ -109,15 +114,20 @@ Programmatic dependent launch is a launch attribute of the generated binding,
 recorded per module as ``launch.use_pdl``: ``True`` for the kernels whose device
 code waits for the preceding grid (``griddepcontrol.wait``) before reading a
 predecessor's output -- the coefficient pass, the row streams, the token-owner
-pass and the column-slab pass -- and ``False`` for the fn splits and the mapping
-pass, which carry no such wait.  The dependents of a kernel that releases its
-dependents right after its own wait (the collapse and the backward prepare
-after the coefficient pass, the column-slab pass after the token-owner pass)
-record ``"runtime"``: their binding takes ``enable_pdl`` per call, and
-:func:`enable_pdl` leaves the attribute off inside the measured token-count
-bands of ``PDL_OFF_BANDS`` (per architecture, edge and call path; the
-deterministic package's bands of those edges), where the early launch would
-hold the dependent's CTAs resident while the predecessor still runs.
+pass and the column-slab pass -- and for the backward fn split, which waits for
+the token-owner pass as its last instruction; ``False`` for the forward fn
+splits and the mapping pass, which carry no such wait.  The dependents of a
+kernel that releases its dependents right after its own wait (the collapse and
+the backward prepare after the coefficient pass) or at its start (the
+column-slab pass after the backward fn split) record ``"runtime"``: their
+binding takes ``enable_pdl`` per call, and :func:`enable_pdl` leaves the
+attribute off inside the measured token-count bands of ``PDL_OFF_BANDS`` (per
+architecture, edge and call path; the deterministic package's bands of those
+edges), where the early launch would hold the dependent's CTAs resident while
+the predecessor still runs.  The column-slab pass keeps the deterministic
+``K6->K7`` bands: the token-owner pass releases the fn split at once and the fn
+split releases the column-slab pass at once, so the column-slab pass's early
+launch overlaps the token-owner pass as in the deterministic route.
 """
 
 from __future__ import annotations
@@ -176,7 +186,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "workspace": "fwd",
         },
     },
-    "cake_mhc_train_fn_split_atomic__tv128": {
+    "cake_mhc_train_fn_split_atomic__tv128_dep": {
         "arches": [
             "sm_100a",
             "sm_103a",
@@ -196,17 +206,17 @@ MODULES: dict[str, dict[str, Any]] = {
             "kind": "fixed",
         },
         "hidden": 4096,
-        "kernel": "cake_mhc_train_fn_split_atomic__tv128",
-        "kernel_symbol": "kernel_cake_mhc_train_fn_split_atomic__tv128",
+        "kernel": "cake_mhc_train_fn_split_atomic__tv128_dep",
+        "kernel_symbol": "kernel_cake_mhc_train_fn_split_atomic__tv128_dep",
         "launch": {
             "block": (256, 1, 1),
             "cluster": (1, 1, 1),
             "cooperative": False,
             "dynamic_smem_bytes": 0,
             "persistent_ctas_per_sm": 1,
-            "use_pdl": False,
+            "use_pdl": True,
         },
-        "library": "cake_mhc_train_fn_split_atomic__tv128",
+        "library": "cake_mhc_train_fn_split_atomic__tv128_dep",
         "logical": {
             "accumulate": "accumulate",
             "dfn": "dfn",
@@ -220,7 +230,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "workspace": "bwd",
         },
     },
-    "cake_mhc_train_fn_split_atomic__tv128_t128": {
+    "cake_mhc_train_fn_split_atomic__tv128_t128_dep": {
         "arches": [
             "sm_107a",
         ],
@@ -239,17 +249,17 @@ MODULES: dict[str, dict[str, Any]] = {
             "kind": "fixed",
         },
         "hidden": 4096,
-        "kernel": "cake_mhc_train_fn_split_atomic__tv128_t128",
-        "kernel_symbol": "kernel_cake_mhc_train_fn_split_atomic__tv128_t128",
+        "kernel": "cake_mhc_train_fn_split_atomic__tv128_t128_dep",
+        "kernel_symbol": "kernel_cake_mhc_train_fn_split_atomic__tv128_t128_dep",
         "launch": {
             "block": (128, 1, 1),
             "cluster": (1, 1, 1),
             "cooperative": False,
             "dynamic_smem_bytes": 0,
             "persistent_ctas_per_sm": 1,
-            "use_pdl": False,
+            "use_pdl": True,
         },
-        "library": "cake_mhc_train_fn_split_atomic__tv128_t128",
+        "library": "cake_mhc_train_fn_split_atomic__tv128_t128_dep",
         "logical": {
             "accumulate": "accumulate",
             "dfn": "dfn",
@@ -3086,20 +3096,21 @@ MODULES: dict[str, dict[str, Any]] = {
 # one column-slab record per backward call: the per-T dispatch of rounds 2-7,
 # keyed by the architecture through the routes and by the token count and the
 # device's SM count through the rules).  The routes are the deterministic
-# package's, except ``bwd_finish``: the atomic fn split of the architecture,
-# the deterministic token-owner records and the atomic column slab (no
-# reduction record).  A record ships for the architectures of its ``arches``
-# (the sm_103a-only forms for sm_103a alone); the device code is folded over
-# those architectures.
+# package's, except ``bwd_finish``: the deterministic token-owner records, the
+# atomic fn split of the architecture (launched after the token-owner pass, as
+# its programmatic dependent) and the atomic column slab (no reduction record).
+# The launch order is the route order.  A record ships for the architectures of
+# its ``arches`` (the sm_103a-only forms for sm_103a alone); the device code is
+# folded over those architectures.
 ROUTES: dict[str, dict[str, list[str]]] = {
     "sm_100a": {
         "bwd_finish_h4096": [
-            "cake_mhc_train_fn_split_atomic__tv128",
             "cake_mhc_train_bwd_token__ao22_rae7_pd1_ntr__a3",
             "cake_mhc_train_bwd_token__ao22_rae7_pd1_tma_ntr",
             "cake_mhc_train_bwd_token__dot_ao8__a3",
             "cake_mhc_train_bwd_token__ao15_rae8_tma_ntr__a3",
             "cake_mhc_train_bwd_token__rt64",
+            "cake_mhc_train_fn_split_atomic__tv128_dep",
             "cake_mhc_train_bwd_slab_atomic__dynr",
         ],
         "bwd_prepare_h4096": [
@@ -3144,11 +3155,11 @@ ROUTES: dict[str, dict[str, list[str]]] = {
     },
     "sm_103a": {
         "bwd_finish_h4096": [
-            "cake_mhc_train_fn_split_atomic__tv128",
             "cake_mhc_train_bwd_token__ao22_rae7_pd1_ntr",
             "cake_mhc_train_bwd_token__ao15_rae8_tma_ntr",
             "cake_mhc_train_bwd_token__dot_ao8",
             "cake_mhc_train_bwd_token__rt64",
+            "cake_mhc_train_fn_split_atomic__tv128_dep",
             "cake_mhc_train_bwd_slab_atomic__dynr",
         ],
         "bwd_prepare_h4096": [
@@ -3196,13 +3207,13 @@ ROUTES: dict[str, dict[str, list[str]]] = {
     },
     "sm_107a": {
         "bwd_finish_h4096": [
-            "cake_mhc_train_fn_split_atomic__tv128_t128",
             "cake_mhc_train_bwd_token__ao22_rae7_rf3_pd1_l2l_ntr",
             "cake_mhc_train_bwd_token__ao22_rae7_pd1_tma_ntr",
             "cake_mhc_train_bwd_token__ao22_rae7_pd1_ntr__a7",
             "cake_mhc_train_bwd_token__dot_ao8_l2l",
             "cake_mhc_train_bwd_token__ao15_rae8_tma_ntr__a7",
             "cake_mhc_train_bwd_token__rt64",
+            "cake_mhc_train_fn_split_atomic__tv128_t128_dep",
             "cake_mhc_train_bwd_slab_atomic__dynr",
         ],
         "bwd_prepare_h4096": [
@@ -4346,7 +4357,8 @@ def selected_modules(
 PDL_PATHS = ("forward", "backward", "checkpoint")
 # Library stem -> the edge its records sit on (predecessor -> dependent).  The
 # bands are the deterministic package's on the edges this package has (the
-# atomic column slab takes the deterministic column slab's K6->K7 bands; there
+# atomic column slab, launched behind the fn split that the token-owner pass
+# releases at once, takes the deterministic column slab's K6->K7 bands; there
 # is no K7->K8 edge).
 PDL_EDGES = {
     "cake_mhc_train_bwd_prepare": "K1->K5",

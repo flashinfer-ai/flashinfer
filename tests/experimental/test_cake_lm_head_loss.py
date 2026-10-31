@@ -3373,12 +3373,24 @@ def test_binding_keys_cover_pointer_shape_stride_dtype_and_options():
         X, W, labels, lse, dlogp, chunk_size=4096, need_dx=True, need_dw=True
     )
     assert bwd[:2] == ("bwd", "logprob") and bwd != base
-    assert bwd != logprob_backward_binding_key(
+    # lse and dlogp are fresh tensors on every step: keyed by layout, not address (one binding serves every step)
+    assert bwd == logprob_backward_binding_key(
         X, W, labels, lse, dlogp.clone(), chunk_size=4096, need_dx=True, need_dw=True
     )
-    assert bwd != logprob_backward_binding_key(
+    assert bwd == logprob_backward_binding_key(
         X, W, labels, lse.clone(), dlogp, chunk_size=4096, need_dx=True, need_dw=True
     )
+    for other in (
+        torch.zeros(4),
+        torch.zeros(8, dtype=torch.float64),
+        torch.zeros(16)[::2],
+    ):
+        assert bwd != logprob_backward_binding_key(
+            X, W, labels, other, dlogp, chunk_size=4096, need_dx=True, need_dw=True
+        )  # shape, dtype, stride
+        assert bwd != logprob_backward_binding_key(
+            X, W, labels, lse, other, chunk_size=4096, need_dx=True, need_dw=True
+        )
     assert bwd != logprob_backward_binding_key(
         X, W, labels, lse, dlogp, chunk_size=4096, need_dx=True, need_dw=False
     )
@@ -3687,13 +3699,28 @@ def test_logprob_entry_matches_unchunked():
         inp.X, inp.W, inp.labels, fr.lse, inp.dlogp, chunk_size=64, backend="reference"
     )
     assert torch.equal(dx, result["dX"]) and torch.equal(dw, result["dW"])
-    plain = cake_backend.forward_logprob(
-        inp.X, inp.W, inp.labels, chunk_size=64, backend="reference", compact_rows=False
-    )
+    # the compacted and uncompacted statistics in one thread: a multi-threaded CPU GEMM may split the rows of the two
+    # shapes differently (a different summation order); the bits are compared for one fixed order
+    threads = torch.get_num_threads()
+    torch.set_num_threads(1)
+    try:
+        one = cake_backend.forward_logprob(
+            inp.X, inp.W, inp.labels, chunk_size=64, backend="reference"
+        )
+        plain = cake_backend.forward_logprob(
+            inp.X,
+            inp.W,
+            inp.labels,
+            chunk_size=64,
+            backend="reference",
+            compact_rows=False,
+        )
+    finally:
+        torch.set_num_threads(threads)
     assert (
         tuple(plain.lse.shape) == (inp.T,)
         and plain.row_index is None
-        and torch.equal(plain.lse[inp.valid], fr.lse)
+        and torch.equal(plain.lse[inp.valid], one.lse)
     )
     with pytest.raises(
         ValueError, match="lse"
@@ -8878,8 +8905,8 @@ def test_device_given_count_mismatch_stops_the_stream():
 
 
 def test_device_preload(glm_weight):
-    """``preload`` (by default, index and device) creates the per-device side stream and count cells, is repeatable,
-    and a call after it gives the same bits."""
+    """``preload`` (by default, index and device) creates the calling thread's side stream and count cell of the
+    device, is repeatable, and a call after it gives the same bits."""
     _require_program(entry="loss")
     inp = _device_inputs(4097, W=glm_weight)
     before = _run(inp, 4096, backend="cake")
@@ -8887,8 +8914,8 @@ def test_device_preload(glm_weight):
     index = torch.cuda.current_device()
     opt_in.preload(index)
     opt_in.preload(torch.device("cuda", index))
-    assert (
-        index in cake_backend._DW_STREAMS and index in cake_backend._HIDDEN_COUNT_CELLS
-    )
-    assert cake_backend._HIDDEN_COUNT_ARANGE[index].numel() >= opt_in.PRELOAD_ROWS
+    assert index in cake_backend._thread_state(
+        "dw_streams"
+    ) and index in cake_backend._thread_state("cells")
+    assert cake_backend._thread_state("arange")[index].numel() >= opt_in.PRELOAD_ROWS
     _assert_same_bits(before, _run(inp, 4096, backend="cake"))

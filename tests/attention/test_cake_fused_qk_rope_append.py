@@ -712,6 +712,28 @@ def test_registry_records_reference_the_build_manifest():
         ), name
         knobs = record["knobs"]
         assert set(knobs) == set(loader.KNOB_KEYS), name
+        pdl = record["knobs"]["pdl"]
+        assert record["launch"]["use_pdl"] is pdl, name
+        assert name.endswith(loader.PDL_SUFFIX) == pdl, name
+        kernel_text = (PACKAGE_DIR / f"csrc/{record['library']}_kernel.cu").read_text()
+        binding_text = (
+            PACKAGE_DIR / f"csrc/{record['library']}_binding.cu"
+        ).read_text()
+        # A pdl build waits on the preceding grid and launches with the PDL
+        # attribute; a plain build does neither.
+        assert ("ProgrammaticStreamSerialization" in binding_text) == pdl, name
+        if pdl:
+            plain = loader.MODULES[name.removesuffix(loader.PDL_SUFFIX)]
+            assert record["arches"] == [
+                arch for arch in plain["arches"] if arch in loader.PDL_POLICY["arches"]
+            ], name
+            assert {**record["knobs"], "pdl": False} == plain["knobs"], name
+            assert record["arg_plan"] == plain["arg_plan"], name
+            assert record["grid_rule"] == plain["grid_rule"], name
+            assert "griddepcontrol.wait" in kernel_text, name
+            assert "griddepcontrol.launch_dependents" not in kernel_text, name
+        else:
+            assert "griddepcontrol" not in kernel_text, name
         heads = (int(knobs["num_q_heads"]), int(knobs["num_kv_heads"]))
         assert heads in loader.SUPPORTED_HEADS, name
         assert name.startswith(f"hq{heads[0]}_hkv{heads[1]}"), name
@@ -975,6 +997,76 @@ def test_stage_policy_rejects_unsupported_heads():
         loader.stage_for(
             16, 2, arch="sm_100a", num_rows=1, num_requests=1, page_size=64, num_sms=148
         )
+
+
+# ----------------------------------------------------------------------------------------------
+# Programmatic dependent launch (CPU): ``enable_pdl`` takes the selected stage's pdl
+# build on SM100 / SM103 except where ``PDL_POLICY`` keeps the plain build;
+# ``enable_pdl=False`` is the plain selection.
+
+_PDL_TABLE: dict[tuple[str, int, int, int, int], bool] = {
+    # (arch, Hq, Hkv, num_rows, num_requests) -> the pdl build is taken
+    ("sm_90a", 8, 1, 32, 32): False,
+    ("sm_90a", 64, 8, 32, 32): False,
+    ("sm_100a", 8, 1, 32, 32): True,
+    ("sm_103a", 8, 1, 32, 32): True,
+    ("sm_100a", 8, 1, 511, 511): True,
+    ("sm_100a", 8, 1, 512, 512): False,
+    ("sm_103a", 8, 1, 547, 547): False,
+    ("sm_103a", 8, 1, 548, 548): True,
+    ("sm_100a", 8, 1, 1024, 512): True,
+    ("sm_100a", 8, 1, 8192, 1): True,
+    ("sm_100a", 64, 8, 599, 599): True,
+    ("sm_103a", 64, 8, 600, 600): False,
+    ("sm_100a", 64, 8, 1024, 1): False,
+    ("sm_103a", 64, 8, 128, 1): True,
+}
+
+
+def test_pdl_policy_table_is_well_formed():
+    policy = loader.PDL_POLICY
+    assert set(policy) == {"arches", "constants", "rule", "version"}
+    assert tuple(policy["arches"]) == ("sm_100a", "sm_103a")
+    assert loader.PDL_SUFFIX == "_pdl" and loader.KNOB_KEYS[-1] == "pdl"
+
+
+@pytest.mark.parametrize("key,expected", list(_PDL_TABLE.items()))
+def test_enable_pdl_takes_the_pdl_build_where_the_policy_admits_it(key, expected):
+    arch, hq, hkv, rows, reqs = key
+    problem = dict(
+        arch=arch, num_rows=rows, num_requests=reqs, page_size=64, num_sms=148
+    )
+    plain = loader.stage_for(hq, hkv, **problem)
+    assert loader.stage_for(hq, hkv, enable_pdl=False, **problem) == plain
+    assert not plain.endswith(loader.PDL_SUFFIX)
+    chosen = loader.stage_for(hq, hkv, enable_pdl=True, **problem)
+    assert chosen == (plain + loader.PDL_SUFFIX if expected else plain)
+    assert chosen in loader.stages_for(arch)
+    enabled = loader.pdl_enabled(hq, hkv, arch=arch, num_rows=rows, num_requests=reqs)
+    assert enabled is expected
+
+
+@pytest.mark.parametrize("arch", loader.ARCHES)
+def test_enable_pdl_only_selects_shipped_builds(arch):
+    shipped = set(loader.stages_for(arch))
+    for hq, hkv in loader.SUPPORTED_HEADS:
+        for page in (16, 64, 128):
+            for reqs in (1, 8, 32, 128, 256, 257, 512, 530, 548, 1024):
+                for rows in sorted({reqs, 1, 128, 599, 600, 4096}):
+                    for sms in (132, 148, 152):
+                        problem = dict(
+                            arch=arch,
+                            num_rows=rows,
+                            num_requests=reqs,
+                            page_size=page,
+                            num_sms=sms,
+                        )
+                        plain = loader.stage_for(hq, hkv, **problem)
+                        chosen = loader.stage_for(hq, hkv, enable_pdl=True, **problem)
+                        assert chosen in shipped, (arch, hq, hkv, rows, reqs, chosen)
+                        assert chosen in (plain, plain + loader.PDL_SUFFIX)
+                        if arch == "sm_90a":
+                            assert chosen == plain
 
 
 # Points where the w20 condition (the clearing grid fits beside the row CTAs)

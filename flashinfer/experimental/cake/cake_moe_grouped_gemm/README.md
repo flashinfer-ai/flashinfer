@@ -130,6 +130,15 @@ non-reentrant activation-checkpoint replay recomputes the same `Y`; its
 backward produces `x.grad` with the `dgrad` programs and `w.grad` with the
 `wgrad` programs in the dtype of `w`, accumulated into an existing `.grad` by
 autograd as usual. The facade fixes the mode at the forward call.
+The wrapper launches the forward GEMM after `CakeGroupedMm.apply` returns,
+that is after autograd saved `x`, `w` and `offs`, as for a built-in op. Under
+`torch.utils.checkpoint(..., use_reentrant=False)` with early stop on (the
+default), the recomputation therefore stops before this GEMM when these are
+the last saves of the innermost checkpointed region; a later save in that
+region (of its output or of any other tensor) makes it run, with the same
+bits. A direct `CakeGroupedMm.apply(x, w, offs, False)` launches inside
+`forward` and is always recomputed, as is the wrapper under `torch.jit.trace`
+and `torch.compile`.
 
 ## Host plan and workspaces
 

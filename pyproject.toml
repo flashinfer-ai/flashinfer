@@ -87,6 +87,7 @@ exclude = [
 # build manifest (build.json) their cake_build loader reads; prebuilt aot/ libraries never ship.
 "flashinfer.cake_rmsnorm_det_train_backend" = ["csrc/**", "build.json"]
 "flashinfer.cake_causal_conv1d_det_train_backend" = ["csrc/**", "build.json"]
+"flashinfer.experimental.cake.cake_causal_conv1d_train_backend" = ["csrc/**", "build.json"]
 "flashinfer.cake_ulysses_backend" = ["csrc/**", "build.json"]
 "flashinfer.cake_fused_qk_rope_append_backend" = ["csrc/**", "build.json"]
 "flashinfer.cake_nvfp4_svdquant_gemm_backend" = ["csrc/**", "build.json"]
