@@ -20,9 +20,10 @@ streams; SM100 / SM103 / SM107; FlashInfer issue #8068).
 
 The package is standalone: its forward, statistics replay, residual mixing and
 backward prepare run its own copies of the deterministic programs, and
-``cake_mhc_train_backward_finish(..., deterministic=False)`` launches its
-atomic fn split (which also clears ``dfn`` without ``accumulate``), its copy of
-the deterministic token-owner pass and its atomic column-slab pass, which adds
+``cake_mhc_train_backward_finish(..., deterministic=False)`` launches its copy
+of the deterministic token-owner pass, its atomic fn split (beside the
+token-owner pass as its programmatic dependent; it also clears ``dfn`` without
+``accumulate``) and its atomic column-slab pass, which adds
 the ``dfn`` partial of every (column slab, token chunk) unit into ``dfn`` with
 FP32 reductions and folds ``dscale`` / ``dbase`` in fixed order; there is no
 reduction kernel.  ``dX``, ``dscale`` and ``dbase`` are the deterministic
@@ -51,8 +52,8 @@ throughout, never a source of tolerances.  This module checks:
 * the forward entry points (forward prepare, statistics replay, residual
   mixing, backward prepare) bitwise the deterministic package's, and every
   launch one of this package's records (the deterministic package launches
-  nothing; the backward loads exactly the atomic fn split, the token-owner
-  record and the atomic column slab);
+  nothing; the backward loads exactly the token-owner record, the atomic fn
+  split and the atomic column slab, in that order);
 * PyTorch's deterministic algorithms: ``backward_finish`` raises PyTorch's
   alert (``RuntimeError`` before any launch; under ``warn_only`` one
   ``UserWarning`` per call, then the non-deterministic backward runs, never a
@@ -1118,8 +1119,8 @@ def test_launches_are_this_packages_records(monkeypatch) -> None:
     """Every module the package's entry points load (both forwards, the residual mixing, both backward passes, the
     autograd connection with the statistics saved and replayed, a run-time Sinkhorn count) is one of this package's
     records for the local architecture, and the deterministic package launches nothing (its launch paths refuse);
-    ``backward_finish`` loads exactly its ``bwd_finish`` selection: the architecture's atomic fn split, one
-    token-owner record and the atomic column slab."""
+    ``backward_finish`` loads exactly its ``bwd_finish`` selection, in launch order: one token-owner record, the
+    architecture's atomic fn split and the atomic column slab."""
 
     def refuse(*_args, **_kwargs):
         raise AssertionError("the deterministic package launched a kernel")
@@ -1146,11 +1147,11 @@ def test_launches_are_this_packages_records(monkeypatch) -> None:
     out = _nd_backward(i, prep)
     selection = loader.selected_modules(arch, HIDDEN, "bwd_finish", rows=T, sm_count=sm)
     assert [name for name, _ in loaded[start:]] == list(selection), loaded[start:]
-    assert selection[0] == (
-        f"cake_mhc_train_fn_split_atomic__{loader.fn_split_program(arch, 1)}"
+    assert loader.MODULES[selection[0]]["role"] == "bwd_token", selection
+    assert selection[1] == (
+        f"cake_mhc_train_fn_split_atomic__{loader.fn_split_program(arch, 1)}_dep"
     )
     assert selection[-1] == SLAB and len(selection) == 3, selection
-    assert loader.MODULES[selection[1]]["role"] == "bwd_token", selection
     assert all(torch.isfinite(v).all() for v in out.values())
     for save_stats in (True, False):
         leaves = _leaves(i)

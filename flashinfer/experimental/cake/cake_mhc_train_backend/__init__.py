@@ -25,8 +25,9 @@ dispatching entry points (``deterministic=True`` -> the deterministic package
 Numerical contract against the deterministic package: the forward, the
 statistics replay, the residual mixing and ``backward_prepare`` run copies of
 the deterministic programs (the same bits).  ``backward_finish`` runs the
-atomic fn split, the deterministic token-owner pass and the atomic column slab
-(see :mod:`.cake_jit`): the column slab adds the ``dfn`` sum of every (column
+deterministic token-owner pass, the atomic fn split (beside the token-owner
+pass, as its programmatic dependent) and the atomic column slab (see
+:mod:`.cake_jit`): the column slab adds the ``dfn`` sum of every (column
 slab, token chunk) unit into ``dfn`` with FP32 reductions, so only the
 summation order of ``dfn`` varies from run to run (each element within
 ``P <= 32`` FP32 roundings of the fixed-order sum; the FP32 reduction flushes
