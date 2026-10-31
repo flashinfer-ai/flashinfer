@@ -254,3 +254,19 @@ Until then the C++ stays as-is and the DSL kernel lives beside it.
   paper; the stall breakdown is being collected.  Kept behind W8A16_DSL_KSPLIT (default
   on until the profile is read; to be removed or defaulted off).  ipp2-0146 lost its GPU
   a second time (h19, then h22); replacement h23 is s4124-0017.
+- Sat 31 Oct 2026, 06:30-08:30: the Hopper ping-pong rows, closed.  ncu with and without
+  the cache flush, boost clocks, h20 and h23: the C++ and DSL 64x128 / 64x256 kernels
+  execute the same instruction count (31,782,452 vs 31,782,480 at gen.qkv 4096), the same
+  smem loads, stalls, tensor-pipe activity and crossbar bytes, and the same cycles within
+  0.1-0.3%; the time difference is the SM clock of the moment (sm__cycles_elapsed per
+  second 1.659 vs 1.647 GHz).  und.kv 4096 is not L2-bandwidth bound either (crossbar
+  8 TB/s vs 13.5 at gen.qkv 64x256; tensor pipe 42%, one warpgroup per SM) - the k-split
+  helps only at ncu's locked clocks.  Measurement-order swap (--impls dsl kernel) left
+  the +1% in place, so it is the bench conditions, not the kernel.
+  Then the real finding: the DSL op's Python path cost 60 us per call (C++ op: 24 us),
+  enough to starve the GPU on small rows (und.kv 4096 back to back: 60 us per call for a
+  26 us kernel; the --no-l2-flush bench showed +6.6% for that reason).  cProfile: the
+  Hopper cost model re-run per call (half), torch.cuda.current_stream() through the
+  dynamo wrapper (a third), CuTe pointer objects built per call for an already compiled
+  kernel.  Plan cached per shape, pointers built only at compile, raw stream handle:
+  12 us per call, half the C++ op's.  Checks pass on H100 (algos 2, 7, 9, 12) and GB200.
