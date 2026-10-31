@@ -16,7 +16,7 @@ limitations under the License.
 Benchmark of the context-parallel (KCP) Cake packed KDA training step: one
 process per rank (``torchrun --nproc_per_node N``), every rank timing the
 module boundary of its fragments -- the KCP causal convolution
-(``flashinfer.cake_causal_conv1d_det_train.cake_causal_conv1d_kcp``) followed by
+(``flashinfer.cake_causal_conv1d_train.cake_causal_conv1d_kcp``) followed by
 the KCP KDA step (``flashinfer.kda_train.chunk_kda_kcp``), forward and
 backward -- with CUDA events, and the slowest rank's time counting for the
 iteration.
@@ -63,8 +63,8 @@ import torch.distributed as dist
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from flashinfer.cake_causal_conv1d_det_train import (  # noqa: E402
-    cake_causal_conv1d_det,
+from flashinfer.cake_causal_conv1d_train import (  # noqa: E402
+    cake_causal_conv1d,
     cake_causal_conv1d_kcp,
 )
 from flashinfer.kda_train import (  # noqa: E402
@@ -182,7 +182,7 @@ def _step_local(problem: dict[str, Any]) -> None:
     q, k, v, g, beta = (
         local[n].detach().requires_grad_(True) for n in ("q", "k", "v", "g", "beta")
     )
-    y = cake_causal_conv1d_det(x, w, local["cu_seqlens"])
+    y = cake_causal_conv1d(x, w, local["cu_seqlens"])
     out = chunk_kda(q, k, v, g, beta, local["cu_seqlens"])
     torch.autograd.backward([y, out], [local["dy"], local["dout"]])
 

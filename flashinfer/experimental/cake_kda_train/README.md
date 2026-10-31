@@ -574,7 +574,7 @@ the partition's order) and return that shard's outputs and gradients:
 from flashinfer.kda_train import (kcp_partition, build_kcp_context, chunk_kda_kcp,
                                   chunk_kda_kcp_fwd, chunk_kda_kcp_bwd,
                                   kcp_workspace_bytes, kcp_saved_bytes, kcp_comm_bytes)
-from flashinfer.cake_causal_conv1d_det_train import cake_causal_conv1d_kcp
+from flashinfer.cake_causal_conv1d_train import cake_causal_conv1d_kcp
 
 part = kcp_partition(cu_seqlens_global_cpu, world_size)          # the same object on every rank
 ctx = build_kcp_context(part, group, rank, device)               # this rank's tables and collectives
@@ -779,7 +779,7 @@ A recompute handle keeps what the original forward received instead:
 
 ```python
 from flashinfer.kda_train import KcpRecomputeHandle, chunk_kda_kcp
-from flashinfer.cake_causal_conv1d_det_train import cake_causal_conv1d_kcp
+from flashinfer.cake_causal_conv1d_train import cake_causal_conv1d_kcp
 
 def layer(xq, xk, xv, g, beta, hq, hk, hv):
     q = cake_causal_conv1d_kcp(xq, wq, ctx, recompute_handle=hq)   # "conv" entry of hq
