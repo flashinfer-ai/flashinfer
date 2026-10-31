@@ -134,23 +134,92 @@ kernel_cake_trtllm_moe_finalize_float16_ws8_o110_small(__half* __restrict__ allr
     long long control_address = workspace_tensor[24];
     int* control_0 = reinterpret_cast<int*>(control_address);
     int control_bytes_per_buffer_word = control_0[3];
-    long long comm_stride_elems = (long long)control_bytes_per_buffer_word / 2;
     long long workspace_address = workspace_tensor[16 + rank];
     __half* workspace_local = reinterpret_cast<__half*>(workspace_address);
     asm volatile("griddepcontrol.wait;" ::: "memory");
+    int first_token = cluster_id;
+    int first_thread = cta_rank * 224 + tid;
+    int first_index[8] = {-1, -1, -1, -1, -1, -1, -1, -1};
+    unsigned int first_shared[4] = {0};
+    if (first_token < tokens) {
+        if (has_shared_expert != 0) {
+            {
+                uint4 _uv4_0 = *reinterpret_cast<const uint4*>(shared_expert_output + (first_token * 7168 + first_thread * 8) + 0);
+                first_shared[0 + 0] = _uv4_0.x;
+                first_shared[0 + 1] = _uv4_0.y;
+                first_shared[0 + 2] = _uv4_0.z;
+                first_shared[0 + 3] = _uv4_0.w;
+            }
+        }
+        if (top_k > 0) {
+            int _vec_load_0[1];
+            {
+                _vec_load_0[0] = *reinterpret_cast<const int*>(inverse_indices + (first_token * top_k));
+            }
+            first_index[0] = _vec_load_0[0];
+        }
+        if (top_k > 1) {
+            int _vec_load_1[1];
+            {
+                _vec_load_1[0] = *reinterpret_cast<const int*>(inverse_indices + (first_token * top_k + 1));
+            }
+            first_index[1] = _vec_load_1[0];
+        }
+        if (top_k > 2) {
+            int _vec_load_2[1];
+            {
+                _vec_load_2[0] = *reinterpret_cast<const int*>(inverse_indices + (first_token * top_k + 2));
+            }
+            first_index[2] = _vec_load_2[0];
+        }
+        if (top_k > 3) {
+            int _vec_load_3[1];
+            {
+                _vec_load_3[0] = *reinterpret_cast<const int*>(inverse_indices + (first_token * top_k + 3));
+            }
+            first_index[3] = _vec_load_3[0];
+        }
+        if (top_k > 4) {
+            int _vec_load_4[1];
+            {
+                _vec_load_4[0] = *reinterpret_cast<const int*>(inverse_indices + (first_token * top_k + 4));
+            }
+            first_index[4] = _vec_load_4[0];
+        }
+        if (top_k > 5) {
+            int _vec_load_5[1];
+            {
+                _vec_load_5[0] = *reinterpret_cast<const int*>(inverse_indices + (first_token * top_k + 5));
+            }
+            first_index[5] = _vec_load_5[0];
+        }
+        if (top_k > 6) {
+            int _vec_load_6[1];
+            {
+                _vec_load_6[0] = *reinterpret_cast<const int*>(inverse_indices + (first_token * top_k + 6));
+            }
+            first_index[6] = _vec_load_6[0];
+        }
+        if (top_k > 7) {
+            int _vec_load_7[1];
+            {
+                _vec_load_7[0] = *reinterpret_cast<const int*>(inverse_indices + (first_token * top_k + 7));
+            }
+            first_index[7] = _vec_load_7[0];
+        }
+    }
+    asm volatile("" :: "r"((uint32_t)(first_index[0])), "r"((uint32_t)(first_index[1])), "r"((uint32_t)(first_index[2])), "r"((uint32_t)(first_index[3])), "r"((uint32_t)(first_index[4])), "r"((uint32_t)(first_index[5])), "r"((uint32_t)(first_index[6])), "r"((uint32_t)(first_index[7])), "r"((uint32_t)(first_shared[0])), "r"((uint32_t)(first_shared[1])), "r"((uint32_t)(first_shared[2])), "r"((uint32_t)(first_shared[3])));
     int control_current_word = control_0[2];
     int control_clear_word = control_0[4];
     int control_current = control_current_word % 3;
-    int control_dirty = (control_current_word + 2) % 3;
-    long long data_base = (long long)control_current * comm_stride_elems;
-    __half* peer0 = reinterpret_cast<__half*>(workspace_tensor[16]) + data_base;
-    __half* peer1 = reinterpret_cast<__half*>(workspace_tensor[17]) + data_base;
-    __half* peer2 = reinterpret_cast<__half*>(workspace_tensor[18]) + data_base;
-    __half* peer3 = reinterpret_cast<__half*>(workspace_tensor[19]) + data_base;
-    __half* peer4 = reinterpret_cast<__half*>(workspace_tensor[20]) + data_base;
-    __half* peer5 = reinterpret_cast<__half*>(workspace_tensor[21]) + data_base;
-    __half* peer6 = reinterpret_cast<__half*>(workspace_tensor[22]) + data_base;
-    __half* peer7 = reinterpret_cast<__half*>(workspace_tensor[23]) + data_base;
+    __half* peer0 = reinterpret_cast<__half*>(workspace_tensor[16]);
+    __half* peer1 = reinterpret_cast<__half*>(workspace_tensor[17]);
+    __half* peer2 = reinterpret_cast<__half*>(workspace_tensor[18]);
+    __half* peer3 = reinterpret_cast<__half*>(workspace_tensor[19]);
+    __half* peer4 = reinterpret_cast<__half*>(workspace_tensor[20]);
+    __half* peer5 = reinterpret_cast<__half*>(workspace_tensor[21]);
+    __half* peer6 = reinterpret_cast<__half*>(workspace_tensor[22]);
+    __half* peer7 = reinterpret_cast<__half*>(workspace_tensor[23]);
     __syncthreads();
     if (tid == 0) {
         asm volatile("fence.acq_rel.gpu;" ::: "memory");
@@ -180,91 +249,129 @@ kernel_cake_trtllm_moe_finalize_float16_ws8_o110_small(__half* __restrict__ allr
         float shared_early[8];
         if (has_shared_expert != 0) {
             int shared_early_elem = token * 7168 + cluster_thread * 8;
-            float _vec_load_0[8];
-            {
-                const uint4* _vptr_0 = reinterpret_cast<const uint4*>(shared_expert_output + shared_early_elem + 0);
-                uint4 _vld_0[1];
+            float _vec_load_0_1[8];
+            unsigned int shared_words[4];
+            if (token == token_begin) {
                 #pragma unroll
-                for (int _blk = 0; _blk < 1; _blk++) {
-                    _vld_0[_blk] = _vptr_0[_blk];
-                    uint32_t* _vpairs_0 = reinterpret_cast<uint32_t*>(&_vld_0[_blk]);
-                    #pragma unroll
-                    for (int _pair = 0; _pair < 4; _pair++) {
-                        asm volatile(
-                            "{\n\t"
-                            ".reg .b16 h_lo, h_hi;\n\t"
-                            ".reg .b32 f_lo, f_hi;\n\t"
-                            "mov.b32 {h_lo, h_hi}, %1;\n\t"
-                            "cvt.f32.f16 f_lo, h_lo;\n\t"
-                            "cvt.f32.f16 f_hi, h_hi;\n\t"
-                            "mov.b64 %0, {f_lo, f_hi};\n\t"
-                            "}\n"
-                            : "=l"(*reinterpret_cast<unsigned long long*>(&_vec_load_0[0 + _blk * 8 + _pair * 2]))
-                            : "r"(_vpairs_0[_pair]));
-                    }
+                for (int w = 0; w < 4; w++) {
+                    shared_words[w] = first_shared[w];
+                }
+            } else {
+                {
+                    uint4 _uv4_1 = *reinterpret_cast<const uint4*>(shared_expert_output + shared_early_elem + 0);
+                    shared_words[0 + 0] = _uv4_1.x;
+                    shared_words[0 + 1] = _uv4_1.y;
+                    shared_words[0 + 2] = _uv4_1.z;
+                    shared_words[0 + 3] = _uv4_1.w;
                 }
             }
             #pragma unroll
+            for (int _pair = 0; _pair < 4; _pair++) {
+                asm volatile(
+                    "{\n\t"
+                    ".reg .b16 h_lo, h_hi;\n\t"
+                    ".reg .b32 f_lo, f_hi;\n\t"
+                    "mov.b32 {h_lo, h_hi}, %1;\n\t"
+                    "cvt.f32.f16 f_lo, h_lo;\n\t"
+                    "cvt.f32.f16 f_hi, h_hi;\n\t"
+                    "mov.b64 %0, {f_lo, f_hi};\n\t"
+                    "}\n"
+                    : "=l"(*reinterpret_cast<unsigned long long*>(&_vec_load_0_1[_pair * 2]))
+                    : "r"(shared_words[_pair]));
+            }
+            #pragma unroll
             for (int j_1 = 0; j_1 < 8; j_1++) {
-                shared_early[j_1] = _vec_load_0[j_1];
+                shared_early[j_1] = _vec_load_0_1[j_1];
             }
         }
         int oct_index[8] = {-1, -1, -1, -1, -1, -1, -1, -1};
         if (top_k > 0) {
-            int _vec_load_0_1[1];
-            {
-                _vec_load_0_1[0] = *reinterpret_cast<const int*>(inverse_indices + (token * top_k));
+            int _vec_load_8[1];
+            if (token == token_begin) {
+                _vec_load_8[0] = first_index[0];
+            } else {
+                {
+                    _vec_load_8[0] = *reinterpret_cast<const int*>(inverse_indices + (token * top_k));
+                }
             }
-            oct_index[0] = _vec_load_0_1[0];
+            oct_index[0] = _vec_load_8[0];
         }
         if (top_k > 1) {
-            int _vec_load_1[1];
-            {
-                _vec_load_1[0] = *reinterpret_cast<const int*>(inverse_indices + (token * top_k + 1));
+            int _vec_load_9[1];
+            if (token == token_begin) {
+                _vec_load_9[0] = first_index[1];
+            } else {
+                {
+                    _vec_load_9[0] = *reinterpret_cast<const int*>(inverse_indices + (token * top_k + 1));
+                }
             }
-            oct_index[1] = _vec_load_1[0];
+            oct_index[1] = _vec_load_9[0];
         }
         if (top_k > 2) {
-            int _vec_load_2[1];
-            {
-                _vec_load_2[0] = *reinterpret_cast<const int*>(inverse_indices + (token * top_k + 2));
+            int _vec_load_10[1];
+            if (token == token_begin) {
+                _vec_load_10[0] = first_index[2];
+            } else {
+                {
+                    _vec_load_10[0] = *reinterpret_cast<const int*>(inverse_indices + (token * top_k + 2));
+                }
             }
-            oct_index[2] = _vec_load_2[0];
+            oct_index[2] = _vec_load_10[0];
         }
         if (top_k > 3) {
-            int _vec_load_3[1];
-            {
-                _vec_load_3[0] = *reinterpret_cast<const int*>(inverse_indices + (token * top_k + 3));
+            int _vec_load_11[1];
+            if (token == token_begin) {
+                _vec_load_11[0] = first_index[3];
+            } else {
+                {
+                    _vec_load_11[0] = *reinterpret_cast<const int*>(inverse_indices + (token * top_k + 3));
+                }
             }
-            oct_index[3] = _vec_load_3[0];
+            oct_index[3] = _vec_load_11[0];
         }
         if (top_k > 4) {
-            int _vec_load_4[1];
-            {
-                _vec_load_4[0] = *reinterpret_cast<const int*>(inverse_indices + (token * top_k + 4));
+            int _vec_load_12[1];
+            if (token == token_begin) {
+                _vec_load_12[0] = first_index[4];
+            } else {
+                {
+                    _vec_load_12[0] = *reinterpret_cast<const int*>(inverse_indices + (token * top_k + 4));
+                }
             }
-            oct_index[4] = _vec_load_4[0];
+            oct_index[4] = _vec_load_12[0];
         }
         if (top_k > 5) {
-            int _vec_load_5[1];
-            {
-                _vec_load_5[0] = *reinterpret_cast<const int*>(inverse_indices + (token * top_k + 5));
+            int _vec_load_13[1];
+            if (token == token_begin) {
+                _vec_load_13[0] = first_index[5];
+            } else {
+                {
+                    _vec_load_13[0] = *reinterpret_cast<const int*>(inverse_indices + (token * top_k + 5));
+                }
             }
-            oct_index[5] = _vec_load_5[0];
+            oct_index[5] = _vec_load_13[0];
         }
         if (top_k > 6) {
-            int _vec_load_6[1];
-            {
-                _vec_load_6[0] = *reinterpret_cast<const int*>(inverse_indices + (token * top_k + 6));
+            int _vec_load_14[1];
+            if (token == token_begin) {
+                _vec_load_14[0] = first_index[6];
+            } else {
+                {
+                    _vec_load_14[0] = *reinterpret_cast<const int*>(inverse_indices + (token * top_k + 6));
+                }
             }
-            oct_index[6] = _vec_load_6[0];
+            oct_index[6] = _vec_load_14[0];
         }
         if (top_k > 7) {
-            int _vec_load_7[1];
-            {
-                _vec_load_7[0] = *reinterpret_cast<const int*>(inverse_indices + (token * top_k + 7));
+            int _vec_load_15[1];
+            if (token == token_begin) {
+                _vec_load_15[0] = first_index[7];
+            } else {
+                {
+                    _vec_load_15[0] = *reinterpret_cast<const int*>(inverse_indices + (token * top_k + 7));
+                }
             }
-            oct_index[7] = _vec_load_7[0];
+            oct_index[7] = _vec_load_15[0];
         }
         #pragma unroll 1
         for (int route_base = 0; route_base < route_end; route_base += 8) {
@@ -272,91 +379,91 @@ kernel_cake_trtllm_moe_finalize_float16_ws8_o110_small(__half* __restrict__ allr
             unsigned int oct_words[32];
             float oct_scales[8];
             if (route_base + 8 < top_k) {
-                int _vec_load_8[1];
+                int _vec_load_16[1];
                 {
-                    _vec_load_8[0] = *reinterpret_cast<const int*>(inverse_indices + (token * top_k + route_base + 8));
+                    _vec_load_16[0] = *reinterpret_cast<const int*>(inverse_indices + (token * top_k + route_base + 8));
                 }
-                next_oct_index[0] = _vec_load_8[0];
+                next_oct_index[0] = _vec_load_16[0];
             }
             if (route_base + 8 + 1 < top_k) {
-                int _vec_load_9[1];
+                int _vec_load_17[1];
                 {
-                    _vec_load_9[0] = *reinterpret_cast<const int*>(inverse_indices + (token * top_k + route_base + 8 + 1));
+                    _vec_load_17[0] = *reinterpret_cast<const int*>(inverse_indices + (token * top_k + route_base + 8 + 1));
                 }
-                next_oct_index[1] = _vec_load_9[0];
+                next_oct_index[1] = _vec_load_17[0];
             }
             if (route_base + 8 + 2 < top_k) {
-                int _vec_load_10[1];
+                int _vec_load_18[1];
                 {
-                    _vec_load_10[0] = *reinterpret_cast<const int*>(inverse_indices + (token * top_k + route_base + 8 + 2));
+                    _vec_load_18[0] = *reinterpret_cast<const int*>(inverse_indices + (token * top_k + route_base + 8 + 2));
                 }
-                next_oct_index[2] = _vec_load_10[0];
+                next_oct_index[2] = _vec_load_18[0];
             }
             if (route_base + 8 + 3 < top_k) {
-                int _vec_load_11[1];
+                int _vec_load_19[1];
                 {
-                    _vec_load_11[0] = *reinterpret_cast<const int*>(inverse_indices + (token * top_k + route_base + 8 + 3));
+                    _vec_load_19[0] = *reinterpret_cast<const int*>(inverse_indices + (token * top_k + route_base + 8 + 3));
                 }
-                next_oct_index[3] = _vec_load_11[0];
+                next_oct_index[3] = _vec_load_19[0];
             }
             if (route_base + 8 + 4 < top_k) {
-                int _vec_load_12[1];
+                int _vec_load_20[1];
                 {
-                    _vec_load_12[0] = *reinterpret_cast<const int*>(inverse_indices + (token * top_k + route_base + 8 + 4));
+                    _vec_load_20[0] = *reinterpret_cast<const int*>(inverse_indices + (token * top_k + route_base + 8 + 4));
                 }
-                next_oct_index[4] = _vec_load_12[0];
+                next_oct_index[4] = _vec_load_20[0];
             }
             if (route_base + 8 + 5 < top_k) {
-                int _vec_load_13[1];
+                int _vec_load_21[1];
                 {
-                    _vec_load_13[0] = *reinterpret_cast<const int*>(inverse_indices + (token * top_k + route_base + 8 + 5));
+                    _vec_load_21[0] = *reinterpret_cast<const int*>(inverse_indices + (token * top_k + route_base + 8 + 5));
                 }
-                next_oct_index[5] = _vec_load_13[0];
+                next_oct_index[5] = _vec_load_21[0];
             }
             if (route_base + 8 + 6 < top_k) {
-                int _vec_load_14[1];
+                int _vec_load_22[1];
                 {
-                    _vec_load_14[0] = *reinterpret_cast<const int*>(inverse_indices + (token * top_k + route_base + 8 + 6));
+                    _vec_load_22[0] = *reinterpret_cast<const int*>(inverse_indices + (token * top_k + route_base + 8 + 6));
                 }
-                next_oct_index[6] = _vec_load_14[0];
+                next_oct_index[6] = _vec_load_22[0];
             }
             if (route_base + 8 + 7 < top_k) {
-                int _vec_load_15[1];
+                int _vec_load_23[1];
                 {
-                    _vec_load_15[0] = *reinterpret_cast<const int*>(inverse_indices + (token * top_k + route_base + 8 + 7));
+                    _vec_load_23[0] = *reinterpret_cast<const int*>(inverse_indices + (token * top_k + route_base + 8 + 7));
                 }
-                next_oct_index[7] = _vec_load_15[0];
+                next_oct_index[7] = _vec_load_23[0];
             }
             if (oct_index[0] >= 0) {
                 long long expert_elem = (long long)oct_index[0] * 7168 + (long long)(cluster_thread * 8);
-                unsigned int _vec_load_17[4];
+                unsigned int _vec_load_17_1[4];
                 {
-                    uint4 _uv4_1 = *reinterpret_cast<const uint4*>(allreduce_in + expert_elem + 0);
-                    _vec_load_17[0 + 0] = _uv4_1.x;
-                    _vec_load_17[0 + 1] = _uv4_1.y;
-                    _vec_load_17[0 + 2] = _uv4_1.z;
-                    _vec_load_17[0 + 3] = _uv4_1.w;
+                    uint4 _uv4_2 = *reinterpret_cast<const uint4*>(allreduce_in + expert_elem + 0);
+                    _vec_load_17_1[0 + 0] = _uv4_2.x;
+                    _vec_load_17_1[0 + 1] = _uv4_2.y;
+                    _vec_load_17_1[0 + 2] = _uv4_2.z;
+                    _vec_load_17_1[0 + 3] = _uv4_2.w;
                 }
                 #pragma unroll
-                for (int w = 0; w < 4; w++) {
-                    oct_words[w] = _vec_load_17[w];
+                for (int w_1 = 0; w_1 < 4; w_1++) {
+                    oct_words[w_1] = _vec_load_17_1[w_1];
                 }
-                float _vec_load_18[1];
+                float _vec_load_18_1[1];
                 {
-                    __half _f16_2 = *reinterpret_cast<const __half*>(expert_scales + token * top_k + route_base);
-                    _vec_load_18[0] = __half2float(_f16_2);
+                    __half _f16_3 = *reinterpret_cast<const __half*>(expert_scales + token * top_k + route_base);
+                    _vec_load_18_1[0] = __half2float(_f16_3);
                 }
-                oct_scales[0] = _vec_load_18[0];
+                oct_scales[0] = _vec_load_18_1[0];
             }
             if (oct_index[1] >= 0) {
                 long long expert_elem_0 = (long long)oct_index[1] * 7168 + (long long)(cluster_thread * 8);
                 unsigned int vec_load_0[4];
                 {
-                    uint4 _uv4_3 = *reinterpret_cast<const uint4*>(allreduce_in + expert_elem_0 + 0);
-                    vec_load_0[0 + 0] = _uv4_3.x;
-                    vec_load_0[0 + 1] = _uv4_3.y;
-                    vec_load_0[0 + 2] = _uv4_3.z;
-                    vec_load_0[0 + 3] = _uv4_3.w;
+                    uint4 _uv4_4 = *reinterpret_cast<const uint4*>(allreduce_in + expert_elem_0 + 0);
+                    vec_load_0[0 + 0] = _uv4_4.x;
+                    vec_load_0[0 + 1] = _uv4_4.y;
+                    vec_load_0[0 + 2] = _uv4_4.z;
+                    vec_load_0[0 + 3] = _uv4_4.w;
                 }
                 #pragma unroll
                 for (int w_0 = 0; w_0 < 4; w_0++) {
@@ -364,8 +471,8 @@ kernel_cake_trtllm_moe_finalize_float16_ws8_o110_small(__half* __restrict__ allr
                 }
                 float vec_load_r_0[1];
                 {
-                    __half _f16_4 = *reinterpret_cast<const __half*>(expert_scales + token * top_k + route_base + 1);
-                    vec_load_r_0[0] = __half2float(_f16_4);
+                    __half _f16_5 = *reinterpret_cast<const __half*>(expert_scales + token * top_k + route_base + 1);
+                    vec_load_r_0[0] = __half2float(_f16_5);
                 }
                 oct_scales[1] = vec_load_r_0[0];
             }
@@ -373,20 +480,20 @@ kernel_cake_trtllm_moe_finalize_float16_ws8_o110_small(__half* __restrict__ allr
                 long long expert_elem_1 = (long long)oct_index[2] * 7168 + (long long)(cluster_thread * 8);
                 unsigned int vec_load_1[4];
                 {
-                    uint4 _uv4_5 = *reinterpret_cast<const uint4*>(allreduce_in + expert_elem_1 + 0);
-                    vec_load_1[0 + 0] = _uv4_5.x;
-                    vec_load_1[0 + 1] = _uv4_5.y;
-                    vec_load_1[0 + 2] = _uv4_5.z;
-                    vec_load_1[0 + 3] = _uv4_5.w;
+                    uint4 _uv4_6 = *reinterpret_cast<const uint4*>(allreduce_in + expert_elem_1 + 0);
+                    vec_load_1[0 + 0] = _uv4_6.x;
+                    vec_load_1[0 + 1] = _uv4_6.y;
+                    vec_load_1[0 + 2] = _uv4_6.z;
+                    vec_load_1[0 + 3] = _uv4_6.w;
                 }
                 #pragma unroll
-                for (int w_1 = 0; w_1 < 4; w_1++) {
-                    oct_words[8 + w_1] = vec_load_1[w_1];
+                for (int w_1_1 = 0; w_1_1 < 4; w_1_1++) {
+                    oct_words[8 + w_1_1] = vec_load_1[w_1_1];
                 }
                 float vec_load_r_1[1];
                 {
-                    __half _f16_6 = *reinterpret_cast<const __half*>(expert_scales + token * top_k + route_base + 2);
-                    vec_load_r_1[0] = __half2float(_f16_6);
+                    __half _f16_7 = *reinterpret_cast<const __half*>(expert_scales + token * top_k + route_base + 2);
+                    vec_load_r_1[0] = __half2float(_f16_7);
                 }
                 oct_scales[2] = vec_load_r_1[0];
             }
@@ -394,11 +501,11 @@ kernel_cake_trtllm_moe_finalize_float16_ws8_o110_small(__half* __restrict__ allr
                 long long expert_elem_2 = (long long)oct_index[3] * 7168 + (long long)(cluster_thread * 8);
                 unsigned int vec_load_2[4];
                 {
-                    uint4 _uv4_7 = *reinterpret_cast<const uint4*>(allreduce_in + expert_elem_2 + 0);
-                    vec_load_2[0 + 0] = _uv4_7.x;
-                    vec_load_2[0 + 1] = _uv4_7.y;
-                    vec_load_2[0 + 2] = _uv4_7.z;
-                    vec_load_2[0 + 3] = _uv4_7.w;
+                    uint4 _uv4_8 = *reinterpret_cast<const uint4*>(allreduce_in + expert_elem_2 + 0);
+                    vec_load_2[0 + 0] = _uv4_8.x;
+                    vec_load_2[0 + 1] = _uv4_8.y;
+                    vec_load_2[0 + 2] = _uv4_8.z;
+                    vec_load_2[0 + 3] = _uv4_8.w;
                 }
                 #pragma unroll
                 for (int w_2 = 0; w_2 < 4; w_2++) {
@@ -406,8 +513,8 @@ kernel_cake_trtllm_moe_finalize_float16_ws8_o110_small(__half* __restrict__ allr
                 }
                 float vec_load_r_2[1];
                 {
-                    __half _f16_8 = *reinterpret_cast<const __half*>(expert_scales + token * top_k + route_base + 3);
-                    vec_load_r_2[0] = __half2float(_f16_8);
+                    __half _f16_9 = *reinterpret_cast<const __half*>(expert_scales + token * top_k + route_base + 3);
+                    vec_load_r_2[0] = __half2float(_f16_9);
                 }
                 oct_scales[3] = vec_load_r_2[0];
             }
@@ -415,11 +522,11 @@ kernel_cake_trtllm_moe_finalize_float16_ws8_o110_small(__half* __restrict__ allr
                 long long expert_elem_3 = (long long)oct_index[4] * 7168 + (long long)(cluster_thread * 8);
                 unsigned int vec_load_3[4];
                 {
-                    uint4 _uv4_9 = *reinterpret_cast<const uint4*>(allreduce_in + expert_elem_3 + 0);
-                    vec_load_3[0 + 0] = _uv4_9.x;
-                    vec_load_3[0 + 1] = _uv4_9.y;
-                    vec_load_3[0 + 2] = _uv4_9.z;
-                    vec_load_3[0 + 3] = _uv4_9.w;
+                    uint4 _uv4_10 = *reinterpret_cast<const uint4*>(allreduce_in + expert_elem_3 + 0);
+                    vec_load_3[0 + 0] = _uv4_10.x;
+                    vec_load_3[0 + 1] = _uv4_10.y;
+                    vec_load_3[0 + 2] = _uv4_10.z;
+                    vec_load_3[0 + 3] = _uv4_10.w;
                 }
                 #pragma unroll
                 for (int w_3 = 0; w_3 < 4; w_3++) {
@@ -427,8 +534,8 @@ kernel_cake_trtllm_moe_finalize_float16_ws8_o110_small(__half* __restrict__ allr
                 }
                 float vec_load_r_3[1];
                 {
-                    __half _f16_10 = *reinterpret_cast<const __half*>(expert_scales + token * top_k + route_base + 4);
-                    vec_load_r_3[0] = __half2float(_f16_10);
+                    __half _f16_11 = *reinterpret_cast<const __half*>(expert_scales + token * top_k + route_base + 4);
+                    vec_load_r_3[0] = __half2float(_f16_11);
                 }
                 oct_scales[4] = vec_load_r_3[0];
             }
@@ -436,11 +543,11 @@ kernel_cake_trtllm_moe_finalize_float16_ws8_o110_small(__half* __restrict__ allr
                 long long expert_elem_4 = (long long)oct_index[5] * 7168 + (long long)(cluster_thread * 8);
                 unsigned int vec_load_4[4];
                 {
-                    uint4 _uv4_11 = *reinterpret_cast<const uint4*>(allreduce_in + expert_elem_4 + 0);
-                    vec_load_4[0 + 0] = _uv4_11.x;
-                    vec_load_4[0 + 1] = _uv4_11.y;
-                    vec_load_4[0 + 2] = _uv4_11.z;
-                    vec_load_4[0 + 3] = _uv4_11.w;
+                    uint4 _uv4_12 = *reinterpret_cast<const uint4*>(allreduce_in + expert_elem_4 + 0);
+                    vec_load_4[0 + 0] = _uv4_12.x;
+                    vec_load_4[0 + 1] = _uv4_12.y;
+                    vec_load_4[0 + 2] = _uv4_12.z;
+                    vec_load_4[0 + 3] = _uv4_12.w;
                 }
                 #pragma unroll
                 for (int w_4 = 0; w_4 < 4; w_4++) {
@@ -448,8 +555,8 @@ kernel_cake_trtllm_moe_finalize_float16_ws8_o110_small(__half* __restrict__ allr
                 }
                 float vec_load_r_4[1];
                 {
-                    __half _f16_12 = *reinterpret_cast<const __half*>(expert_scales + token * top_k + route_base + 5);
-                    vec_load_r_4[0] = __half2float(_f16_12);
+                    __half _f16_13 = *reinterpret_cast<const __half*>(expert_scales + token * top_k + route_base + 5);
+                    vec_load_r_4[0] = __half2float(_f16_13);
                 }
                 oct_scales[5] = vec_load_r_4[0];
             }
@@ -457,11 +564,11 @@ kernel_cake_trtllm_moe_finalize_float16_ws8_o110_small(__half* __restrict__ allr
                 long long expert_elem_5 = (long long)oct_index[6] * 7168 + (long long)(cluster_thread * 8);
                 unsigned int vec_load_5[4];
                 {
-                    uint4 _uv4_13 = *reinterpret_cast<const uint4*>(allreduce_in + expert_elem_5 + 0);
-                    vec_load_5[0 + 0] = _uv4_13.x;
-                    vec_load_5[0 + 1] = _uv4_13.y;
-                    vec_load_5[0 + 2] = _uv4_13.z;
-                    vec_load_5[0 + 3] = _uv4_13.w;
+                    uint4 _uv4_14 = *reinterpret_cast<const uint4*>(allreduce_in + expert_elem_5 + 0);
+                    vec_load_5[0 + 0] = _uv4_14.x;
+                    vec_load_5[0 + 1] = _uv4_14.y;
+                    vec_load_5[0 + 2] = _uv4_14.z;
+                    vec_load_5[0 + 3] = _uv4_14.w;
                 }
                 #pragma unroll
                 for (int w_5 = 0; w_5 < 4; w_5++) {
@@ -469,8 +576,8 @@ kernel_cake_trtllm_moe_finalize_float16_ws8_o110_small(__half* __restrict__ allr
                 }
                 float vec_load_r_5[1];
                 {
-                    __half _f16_14 = *reinterpret_cast<const __half*>(expert_scales + token * top_k + route_base + 6);
-                    vec_load_r_5[0] = __half2float(_f16_14);
+                    __half _f16_15 = *reinterpret_cast<const __half*>(expert_scales + token * top_k + route_base + 6);
+                    vec_load_r_5[0] = __half2float(_f16_15);
                 }
                 oct_scales[6] = vec_load_r_5[0];
             }
@@ -478,11 +585,11 @@ kernel_cake_trtllm_moe_finalize_float16_ws8_o110_small(__half* __restrict__ allr
                 long long expert_elem_6 = (long long)oct_index[7] * 7168 + (long long)(cluster_thread * 8);
                 unsigned int vec_load_6[4];
                 {
-                    uint4 _uv4_15 = *reinterpret_cast<const uint4*>(allreduce_in + expert_elem_6 + 0);
-                    vec_load_6[0 + 0] = _uv4_15.x;
-                    vec_load_6[0 + 1] = _uv4_15.y;
-                    vec_load_6[0 + 2] = _uv4_15.z;
-                    vec_load_6[0 + 3] = _uv4_15.w;
+                    uint4 _uv4_16 = *reinterpret_cast<const uint4*>(allreduce_in + expert_elem_6 + 0);
+                    vec_load_6[0 + 0] = _uv4_16.x;
+                    vec_load_6[0 + 1] = _uv4_16.y;
+                    vec_load_6[0 + 2] = _uv4_16.z;
+                    vec_load_6[0 + 3] = _uv4_16.w;
                 }
                 #pragma unroll
                 for (int w_6 = 0; w_6 < 4; w_6++) {
@@ -490,8 +597,8 @@ kernel_cake_trtllm_moe_finalize_float16_ws8_o110_small(__half* __restrict__ allr
                 }
                 float vec_load_r_6[1];
                 {
-                    __half _f16_16 = *reinterpret_cast<const __half*>(expert_scales + token * top_k + route_base + 7);
-                    vec_load_r_6[0] = __half2float(_f16_16);
+                    __half _f16_17 = *reinterpret_cast<const __half*>(expert_scales + token * top_k + route_base + 7);
+                    vec_load_r_6[0] = __half2float(_f16_17);
                 }
                 oct_scales[7] = vec_load_r_6[0];
             }
@@ -1103,29 +1210,56 @@ kernel_cake_trtllm_moe_finalize_float16_ws8_o110_small(__half* __restrict__ allr
             __half2 _h2 = __float22half2_rn(make_float2(acc[_lp*2 + 0], acc[_lp*2+1 + 0]));
             scaled_f16_10[_lp] = *(uint32_t*)&_h2;
         }
+        int publish_current_word = control_current_word;
+        asm("" : "+r"(publish_current_word));
+        int publish_current = publish_current_word % 3;
+        int publish_bytes_word = control_bytes_per_buffer_word;
+        asm("" : "+r"(publish_bytes_word));
+        long long publish_stride = (long long)publish_bytes_word / 2;
+        long long token_data_base = (long long)publish_current * publish_stride;
         int access = token * 896 + cluster_thread;
         long long slot = (long long)rank * (long long)total_access * 8 + (long long)access * 8;
-        asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(peer0 + slot), "r"((scaled_f16_10)[0]), "r"((scaled_f16_10)[1]), "r"((scaled_f16_10)[2]), "r"((scaled_f16_10)[3]) : "memory");
-        asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(peer1 + slot), "r"((scaled_f16_10)[0]), "r"((scaled_f16_10)[1]), "r"((scaled_f16_10)[2]), "r"((scaled_f16_10)[3]) : "memory");
-        asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(peer2 + slot), "r"((scaled_f16_10)[0]), "r"((scaled_f16_10)[1]), "r"((scaled_f16_10)[2]), "r"((scaled_f16_10)[3]) : "memory");
-        asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(peer3 + slot), "r"((scaled_f16_10)[0]), "r"((scaled_f16_10)[1]), "r"((scaled_f16_10)[2]), "r"((scaled_f16_10)[3]) : "memory");
-        asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(peer4 + slot), "r"((scaled_f16_10)[0]), "r"((scaled_f16_10)[1]), "r"((scaled_f16_10)[2]), "r"((scaled_f16_10)[3]) : "memory");
-        asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(peer5 + slot), "r"((scaled_f16_10)[0]), "r"((scaled_f16_10)[1]), "r"((scaled_f16_10)[2]), "r"((scaled_f16_10)[3]) : "memory");
-        asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(peer6 + slot), "r"((scaled_f16_10)[0]), "r"((scaled_f16_10)[1]), "r"((scaled_f16_10)[2]), "r"((scaled_f16_10)[3]) : "memory");
-        asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(peer7 + slot), "r"((scaled_f16_10)[0]), "r"((scaled_f16_10)[1]), "r"((scaled_f16_10)[2]), "r"((scaled_f16_10)[3]) : "memory");
+        asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(peer0 + token_data_base + slot), "r"((scaled_f16_10)[0]), "r"((scaled_f16_10)[1]), "r"((scaled_f16_10)[2]), "r"((scaled_f16_10)[3]) : "memory");
+        asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(peer1 + token_data_base + slot), "r"((scaled_f16_10)[0]), "r"((scaled_f16_10)[1]), "r"((scaled_f16_10)[2]), "r"((scaled_f16_10)[3]) : "memory");
+        asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(peer2 + token_data_base + slot), "r"((scaled_f16_10)[0]), "r"((scaled_f16_10)[1]), "r"((scaled_f16_10)[2]), "r"((scaled_f16_10)[3]) : "memory");
+        asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(peer3 + token_data_base + slot), "r"((scaled_f16_10)[0]), "r"((scaled_f16_10)[1]), "r"((scaled_f16_10)[2]), "r"((scaled_f16_10)[3]) : "memory");
+        asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(peer4 + token_data_base + slot), "r"((scaled_f16_10)[0]), "r"((scaled_f16_10)[1]), "r"((scaled_f16_10)[2]), "r"((scaled_f16_10)[3]) : "memory");
+        asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(peer5 + token_data_base + slot), "r"((scaled_f16_10)[0]), "r"((scaled_f16_10)[1]), "r"((scaled_f16_10)[2]), "r"((scaled_f16_10)[3]) : "memory");
+        asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(peer6 + token_data_base + slot), "r"((scaled_f16_10)[0]), "r"((scaled_f16_10)[1]), "r"((scaled_f16_10)[2]), "r"((scaled_f16_10)[3]) : "memory");
+        asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(peer7 + token_data_base + slot), "r"((scaled_f16_10)[0]), "r"((scaled_f16_10)[1]), "r"((scaled_f16_10)[2]), "r"((scaled_f16_10)[3]) : "memory");
+        first_index[0] = -1;
+        first_index[1] = -1;
+        first_index[2] = -1;
+        first_index[3] = -1;
+        first_index[4] = -1;
+        first_index[5] = -1;
+        first_index[6] = -1;
+        first_index[7] = -1;
+        first_shared[0] = 0;
+        first_shared[1] = 0;
+        first_shared[2] = 0;
+        first_shared[3] = 0;
     }
+    int late_current_word = control_current_word;
+    asm("" : "+r"(late_current_word));
+    int late_current = late_current_word % 3;
+    int late_dirty = (late_current_word + 2) % 3;
+    int late_bytes_word = control_bytes_per_buffer_word;
+    asm("" : "+r"(late_bytes_word));
+    long long comm_stride_elems = (long long)late_bytes_word / 2;
+    long long data_base = (long long)late_current * comm_stride_elems;
     unsigned int clear_words[4];
     #pragma unroll
     for (int word = 0; word < 4; word++) {
         clear_words[word] = 2147516416;
     }
-    long long clear_base = (long long)control_dirty * comm_stride_elems;
+    long long clear_base = (long long)late_dirty * comm_stride_elems;
     #pragma unroll 4
     for (int clear_access = first_access; clear_access < control_clear_word / 8; clear_access += access_stride) {
         {
-            auto _gst_17 = workspace_local + (clear_base + (long long)clear_access * 8);
-            __builtin_assume(__isGlobal(_gst_17));
-            reinterpret_cast<int4*>(_gst_17)[0] = reinterpret_cast<int4*>(clear_words)[0];
+            auto _gst_18 = workspace_local + (clear_base + (long long)clear_access * 8);
+            __builtin_assume(__isGlobal(_gst_18));
+            reinterpret_cast<int4*>(_gst_18)[0] = reinterpret_cast<int4*>(clear_words)[0];
         }
     }
     int access_1 = first_access;
@@ -1138,19 +1272,19 @@ kernel_cake_trtllm_moe_finalize_float16_ws8_o110_small(__half* __restrict__ allr
         float _vec_load_33[8];
         unsigned int residual_words[4];
         {
-            uint4 _uv4_18 = *reinterpret_cast<const uint4*>(residual + elem_early + 0);
-            residual_words[0 + 0] = _uv4_18.x;
-            residual_words[0 + 1] = _uv4_18.y;
-            residual_words[0 + 2] = _uv4_18.z;
-            residual_words[0 + 3] = _uv4_18.w;
+            uint4 _uv4_19 = *reinterpret_cast<const uint4*>(residual + elem_early + 0);
+            residual_words[0 + 0] = _uv4_19.x;
+            residual_words[0 + 1] = _uv4_19.y;
+            residual_words[0 + 2] = _uv4_19.z;
+            residual_words[0 + 3] = _uv4_19.w;
         }
         unsigned int norm_weight_words[4];
         {
-            uint4 _uv4_19 = *reinterpret_cast<const uint4*>(norm_weight + (cluster_thread * 8) + 0);
-            norm_weight_words[0 + 0] = _uv4_19.x;
-            norm_weight_words[0 + 1] = _uv4_19.y;
-            norm_weight_words[0 + 2] = _uv4_19.z;
-            norm_weight_words[0 + 3] = _uv4_19.w;
+            uint4 _uv4_20 = *reinterpret_cast<const uint4*>(norm_weight + (cluster_thread * 8) + 0);
+            norm_weight_words[0 + 0] = _uv4_20.x;
+            norm_weight_words[0 + 1] = _uv4_20.y;
+            norm_weight_words[0 + 2] = _uv4_20.z;
+            norm_weight_words[0 + 3] = _uv4_20.w;
         }
         asm volatile("" :: "r"((uint32_t)(residual_words[0])), "r"((uint32_t)(residual_words[1])), "r"((uint32_t)(residual_words[2])), "r"((uint32_t)(residual_words[3])), "r"((uint32_t)(norm_weight_words[0])), "r"((uint32_t)(norm_weight_words[1])), "r"((uint32_t)(norm_weight_words[2])), "r"((uint32_t)(norm_weight_words[3])));
         uint32_t _sysv_poll_group_0[32];
@@ -1556,11 +1690,11 @@ kernel_cake_trtllm_moe_finalize_float16_ws8_o110_small(__half* __restrict__ allr
         for (int j_24 = 0; j_24 < 8; j_24++) {
             square_sum = __fmaf_rn(_vec_load_33[j_24], _vec_load_33[j_24], square_sum);
         }
-        float _warp_reduce_20 = square_sum;
+        float _warp_reduce_21 = square_sum;
         #pragma unroll
         for (int offset = 16; offset > 0; offset >>= 1)
-            _warp_reduce_20 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_20, offset);
-        square_sum = _warp_reduce_20;
+            _warp_reduce_21 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_21, offset);
+        square_sum = _warp_reduce_21;
         if (lane == 0) {
             reduce_smem[warp] = square_sum;
         }
@@ -1569,50 +1703,50 @@ kernel_cake_trtllm_moe_finalize_float16_ws8_o110_small(__half* __restrict__ allr
             float block_sum = reduce_smem[0] + reduce_smem[4] + (reduce_smem[2] + reduce_smem[6]) + (reduce_smem[1] + reduce_smem[5] + reduce_smem[3]);
             mbarrier_arrive_expect_tx(rms_bar_addr + (rms_parity) * 8, 16);
             int slot_addr = rms_slots_addr + (unsigned int)(rms_parity * 16) + (unsigned int)(cta_rank * 4);
-            uint32_t _cluster_mapa_21;
+            uint32_t _cluster_mapa_22;
             asm volatile(
                 "mapa.shared::cluster.u32 %0, %1, %2;"
-                : "=r"(_cluster_mapa_21) : "r"(slot_addr), "r"(0));
-            uint32_t _mbar_peer_22;
+                : "=r"(_cluster_mapa_22) : "r"(slot_addr), "r"(0));
+            uint32_t _mbar_peer_23;
             asm(
                 "mapa.shared::cluster.u32 %0, %1, %2;"
-                : "=r"(_mbar_peer_22) : "r"(rms_bar_addr + (rms_parity) * 8), "r"(0));
+                : "=r"(_mbar_peer_23) : "r"(rms_bar_addr + (rms_parity) * 8), "r"(0));
             asm volatile(
                 "st.async.shared::cluster.mbarrier::complete_tx::bytes.f32 [%0], %1, [%2];"
-                :: "r"(_cluster_mapa_21), "f"(block_sum), "r"(_mbar_peer_22) : "memory");
-            uint32_t _cluster_mapa_23;
+                :: "r"(_cluster_mapa_22), "f"(block_sum), "r"(_mbar_peer_23) : "memory");
+            uint32_t _cluster_mapa_24;
             asm volatile(
                 "mapa.shared::cluster.u32 %0, %1, %2;"
-                : "=r"(_cluster_mapa_23) : "r"(slot_addr), "r"(1));
-            uint32_t _mbar_peer_24;
+                : "=r"(_cluster_mapa_24) : "r"(slot_addr), "r"(1));
+            uint32_t _mbar_peer_25;
             asm(
                 "mapa.shared::cluster.u32 %0, %1, %2;"
-                : "=r"(_mbar_peer_24) : "r"(rms_bar_addr + (rms_parity) * 8), "r"(1));
+                : "=r"(_mbar_peer_25) : "r"(rms_bar_addr + (rms_parity) * 8), "r"(1));
             asm volatile(
                 "st.async.shared::cluster.mbarrier::complete_tx::bytes.f32 [%0], %1, [%2];"
-                :: "r"(_cluster_mapa_23), "f"(block_sum), "r"(_mbar_peer_24) : "memory");
-            uint32_t _cluster_mapa_25;
+                :: "r"(_cluster_mapa_24), "f"(block_sum), "r"(_mbar_peer_25) : "memory");
+            uint32_t _cluster_mapa_26;
             asm volatile(
                 "mapa.shared::cluster.u32 %0, %1, %2;"
-                : "=r"(_cluster_mapa_25) : "r"(slot_addr), "r"(2));
-            uint32_t _mbar_peer_26;
+                : "=r"(_cluster_mapa_26) : "r"(slot_addr), "r"(2));
+            uint32_t _mbar_peer_27;
             asm(
                 "mapa.shared::cluster.u32 %0, %1, %2;"
-                : "=r"(_mbar_peer_26) : "r"(rms_bar_addr + (rms_parity) * 8), "r"(2));
+                : "=r"(_mbar_peer_27) : "r"(rms_bar_addr + (rms_parity) * 8), "r"(2));
             asm volatile(
                 "st.async.shared::cluster.mbarrier::complete_tx::bytes.f32 [%0], %1, [%2];"
-                :: "r"(_cluster_mapa_25), "f"(block_sum), "r"(_mbar_peer_26) : "memory");
-            uint32_t _cluster_mapa_27;
+                :: "r"(_cluster_mapa_26), "f"(block_sum), "r"(_mbar_peer_27) : "memory");
+            uint32_t _cluster_mapa_28;
             asm volatile(
                 "mapa.shared::cluster.u32 %0, %1, %2;"
-                : "=r"(_cluster_mapa_27) : "r"(slot_addr), "r"(3));
-            uint32_t _mbar_peer_28;
+                : "=r"(_cluster_mapa_28) : "r"(slot_addr), "r"(3));
+            uint32_t _mbar_peer_29;
             asm(
                 "mapa.shared::cluster.u32 %0, %1, %2;"
-                : "=r"(_mbar_peer_28) : "r"(rms_bar_addr + (rms_parity) * 8), "r"(3));
+                : "=r"(_mbar_peer_29) : "r"(rms_bar_addr + (rms_parity) * 8), "r"(3));
             asm volatile(
                 "st.async.shared::cluster.mbarrier::complete_tx::bytes.f32 [%0], %1, [%2];"
-                :: "r"(_cluster_mapa_27), "f"(block_sum), "r"(_mbar_peer_28) : "memory");
+                :: "r"(_cluster_mapa_28), "f"(block_sum), "r"(_mbar_peer_29) : "memory");
             asm volatile("fence.release.sync_restrict::shared::cta.cluster;" ::: "memory");
             asm volatile(
                 "{\n\t"
@@ -1662,8 +1796,8 @@ kernel_cake_trtllm_moe_finalize_float16_ws8_o110_small(__half* __restrict__ allr
     if (bid == 0) {
         if (tid == 0) {
             {
-                volatile int* _sysv_wait_p_29 = reinterpret_cast<volatile int*>(reinterpret_cast<unsigned int*>(control_0)) + (0);
-                while (*_sysv_wait_p_29 != static_cast<int>(num_bids)) {}
+                volatile int* _sysv_wait_p_30 = reinterpret_cast<volatile int*>(reinterpret_cast<unsigned int*>(control_0)) + (0);
+                while (*_sysv_wait_p_30 != static_cast<int>(num_bids)) {}
             }
             control_0[2] = (control_current_word + 1) % 3;
             control_0[4] = token_end * 7168 * 8;
