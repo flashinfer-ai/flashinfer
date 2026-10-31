@@ -335,6 +335,35 @@ Context manager for autotuning with optional file-based caching.
      - No
      - No-op (default behavior)
 
+Tuning a subset of operations
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+``skip_ops`` and ``only_ops`` restrict which operations tune in a context:
+
+.. code-block:: python
+
+    # Every operation tunes except fp4_gemm, which uses its fallback tactic.
+    with flashinfer.autotune(True, skip_ops={"fp4_gemm"}):
+        model(inputs)
+
+    # Only SM120 sparse MLA tunes; every other operation uses its cached config.
+    with flashinfer.autotune(True, only_ops={"sparse_mla_sm120"}):
+        model(inputs)
+
+An operation outside ``only_ops`` behaves as outside ``autotune()``: it reads
+cached or loaded configs and never profiles. An operation in ``skip_ops`` uses
+its fallback tactic and reads no cache. ``skip_ops`` takes precedence, so an
+operation in both sets uses its fallback. Nested contexts union ``skip_ops``
+and intersect ``only_ops``, so either one can only narrow what tunes.
+
+``only_ops`` is scoped to the current thread and leaves
+``AutoTuner.is_tuning_mode`` ``False``. It requires ``tune_mode=True`` and
+cannot be entered inside an active ``autotune(True)`` context. Operations
+selected by ``choose_one`` and tuning protocols follow both controls. An
+operation that runs its own calibration must ask
+``AutoTuner.get().tuning_enabled(custom_op)`` instead of reading
+``is_tuning_mode``; the SM120 sparse MLA calibration does.
+
 Multi-Thread / Multi-Process Considerations
 --------------------------------------------
 

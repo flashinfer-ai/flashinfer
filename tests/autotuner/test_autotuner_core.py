@@ -1,6 +1,7 @@
 import gc
 import json
 import random
+import threading
 import tracemalloc
 import weakref
 from dataclasses import replace
@@ -2472,6 +2473,116 @@ def test_skip_ops_restored_after_context():
 
     # After context, skip_ops should be empty — op goes through normal path
     assert tuner._effective_skip_ops == frozenset()
+
+
+# ---------------------------------------------------------------------------
+# Tests: only_ops
+# ---------------------------------------------------------------------------
+
+
+def _record_profiles(monkeypatch, timings):
+    """Patch profiling to return ``timings[tactic]`` and record each call."""
+    calls = []
+
+    def fake_profile(
+        self, runner_obj, prof_inputs, tactic, tuning_config=None, **kwargs
+    ):
+        calls.append(tactic)
+        return timings[tactic]
+
+    monkeypatch.setattr(AutoTuner, "_profile_single_kernel", fake_profile)
+    return calls
+
+
+def test_only_ops_tunes_only_named_ops(monkeypatch):
+    """Named ops profile; other ops keep their cached config and never profile."""
+    tuner = reset_autotuner()
+    runner = DummyRunner(valid_tactics=(0, 1))
+    inputs = [torch.empty((16, 32), dtype=torch.float32)]
+    config = TuningConfig()
+    calls = _record_profiles(monkeypatch, {0: 1.0, 1: 5.0})
+
+    with autotune(tune_mode=True):
+        _, seeded = tuner.choose_one("other_op", [runner], config, inputs)
+    assert seeded == 0
+    calls.clear()
+
+    with autotune(tune_mode=True, only_ops={"tuned_op"}):
+        assert not tuner.is_tuning_mode
+        assert tuner.tuning_enabled("tuned_op")
+        assert not tuner.tuning_enabled("other_op")
+        _, cached = tuner.choose_one("other_op", [runner], config, inputs)
+        _, fresh = tuner.choose_one("uncached_op", [runner], config, inputs)
+        assert calls == []
+        _, tuned = tuner.choose_one("tuned_op", [runner], config, inputs)
+
+    assert cached == 0  # the cached winner, not the skip_ops fallback
+    assert fresh == -1  # cache miss outside tuning, no profiling
+    assert tuned == 0
+    assert sorted(calls) == [0, 1]
+    assert not tuner.tuning_enabled("tuned_op")
+    assert tuner._get_only_ops_stack() == []
+
+
+def test_only_ops_nested_intersection():
+    """Nested only_ops scopes intersect, and the outer set returns on exit."""
+    tuner = reset_autotuner()
+    with autotune(tune_mode=True, only_ops={"op_a", "op_b"}):
+        with autotune(tune_mode=True, only_ops={"op_b", "op_c"}):
+            assert tuner.tuning_enabled("op_b")
+            assert not tuner.tuning_enabled("op_a")
+            assert not tuner.tuning_enabled("op_c")
+        assert tuner.tuning_enabled("op_a")
+        assert tuner.tuning_enabled("op_b")
+
+
+def test_only_ops_honors_skip_ops(monkeypatch):
+    """skip_ops still sends a named op to its fallback."""
+    tuner = reset_autotuner()
+    runner = DummyRunner(valid_tactics=(0, 1))
+    inputs = [torch.empty((16, 32), dtype=torch.float32)]
+    calls = _record_profiles(monkeypatch, {0: 1.0, 1: 5.0})
+
+    with autotune(tune_mode=True, only_ops={"op_a"}, skip_ops={"op_a"}):
+        assert not tuner.tuning_enabled("op_a")
+        _, tactic = tuner.choose_one("op_a", [runner], TuningConfig(), inputs)
+
+    assert tactic == -1
+    assert calls == []
+
+
+def test_only_ops_rejects_unsupported_scopes():
+    """only_ops needs tuning mode and cannot narrow an active tuning context."""
+    tuner = reset_autotuner()
+    with (
+        pytest.raises(ValueError, match="requires tune_mode=True"),
+        autotune(tune_mode=False, only_ops={"op_a"}),
+    ):
+        pass
+    with (
+        autotune(tune_mode=True),
+        pytest.raises(ValueError, match="cannot narrow"),
+        autotune(tune_mode=True, only_ops={"op_a"}),
+    ):
+        pass
+    assert tuner._get_only_ops_stack() == []
+    assert not tuner.is_tuning_mode
+
+
+def test_only_ops_is_thread_local():
+    """Another thread sees neither the named ops nor process-wide tuning."""
+    tuner = reset_autotuner()
+    seen = []
+    with autotune(tune_mode=True, only_ops={"op_a"}):
+        worker = threading.Thread(
+            target=lambda: seen.append(
+                (tuner.tuning_enabled("op_a"), tuner.is_tuning_mode)
+            )
+        )
+        worker.start()
+        worker.join()
+        assert tuner.tuning_enabled("op_a")
+    assert seen == [(False, False)]
 
 
 def _build_num_tokens_tuning_config(mapper):

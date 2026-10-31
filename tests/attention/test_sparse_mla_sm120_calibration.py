@@ -949,14 +949,17 @@ def test_all_calibration_entries_reject_target_capture_before_work(monkeypatch):
 
     from flashinfer.mla._sparse_mla_sm120 import _policy as policy
 
-    tuner = SimpleNamespace(is_tuning_mode=True, _get_skip_ops_stack=lambda: [])
+    tuner = SimpleNamespace(
+        is_tuning_mode=True,
+        _get_skip_ops_stack=lambda: [],
+        tuning_enabled=lambda _op: True,
+    )
     monkeypatch.setattr(policy.AutoTuner, "get", lambda: tuner)
     monkeypatch.setattr(cpb_mod, "get_constants", lambda *args: None)
     monkeypatch.setattr(
         cpb_mod, "calibrate", Mock(side_effect=AssertionError("lazy launch"))
     )
     assert policy._resolve_cpb(target, "dsv4", 4, 16, 128, 0) == -1
-    monkeypatch.setattr(native, "_autotune_skipped", lambda: False)
     native._maybe_calibrate(
         device=target,
         key=native._request_key(
@@ -2106,6 +2109,7 @@ def test_refine_nvfp4_merges_exact_token_entry(store, monkeypatch):
             lambda: SimpleNamespace(
                 is_tuning_mode=True,
                 _get_skip_ops_stack=lambda: [{"sparse_mla_sm120_nvfp4"}],
+                tuning_enabled=lambda op: op != "sparse_mla_sm120_nvfp4",
             ),
         )
         selected = native.plan_nvfp4_sparse_mla_sm120(5, device=store, **fields)
@@ -2144,7 +2148,11 @@ def test_profile_selection_refines_exact_tokens_in_tuning(
     monkeypatch.setattr(
         policy.AutoTuner,
         "get",
-        lambda: SimpleNamespace(is_tuning_mode=True, _get_skip_ops_stack=lambda: []),
+        lambda: SimpleNamespace(
+            is_tuning_mode=True,
+            _get_skip_ops_stack=lambda: [],
+            tuning_enabled=lambda _op: True,
+        ),
     )
 
     refined = []
@@ -2189,6 +2197,7 @@ def test_profile_selection_refines_exact_tokens_in_tuning(
             lambda: SimpleNamespace(
                 is_tuning_mode=True,
                 _get_skip_ops_stack=lambda: [{"sparse_mla_sm120"}],
+                tuning_enabled=lambda op: op != "sparse_mla_sm120",
             ),
         )
         assert policy.profile_selection(m, store, "fp8").cpb == 1
@@ -2226,7 +2235,11 @@ def test_lazy_calibration_waiter_observes_failure(store, monkeypatch, native_rou
     monkeypatch.setattr(
         owner.AutoTuner,
         "get",
-        lambda: SimpleNamespace(is_tuning_mode=True, _get_skip_ops_stack=lambda: []),
+        lambda: SimpleNamespace(
+            is_tuning_mode=True,
+            _get_skip_ops_stack=lambda: [],
+            tuning_enabled=lambda _op: True,
+        ),
     )
     request = cpb_mod._OrdinaryRequest(16, 128, "fp8", family="dsv4_1")
     key = "native-test" if native_route else request.key
@@ -2282,7 +2295,11 @@ def test_profile_selection_lazy_calibration_reentry_guard(
     monkeypatch.setattr(
         policy.AutoTuner,
         "get",
-        lambda: SimpleNamespace(is_tuning_mode=True, _get_skip_ops_stack=lambda: []),
+        lambda: SimpleNamespace(
+            is_tuning_mode=True,
+            _get_skip_ops_stack=lambda: [],
+            tuning_enabled=lambda _op: True,
+        ),
     )
     monkeypatch.setattr(policy._cpb, "_target_capturing", lambda device: False)
     m = AttentionMetadata(
@@ -2342,7 +2359,11 @@ def test_profile_selection_suppresses_failed_refine(
     monkeypatch.setattr(
         policy.AutoTuner,
         "get",
-        lambda: SimpleNamespace(is_tuning_mode=True, _get_skip_ops_stack=lambda: []),
+        lambda: SimpleNamespace(
+            is_tuning_mode=True,
+            _get_skip_ops_stack=lambda: [],
+            tuning_enabled=lambda _op: True,
+        ),
     )
     monkeypatch.setattr(policy._cpb, "_target_capturing", lambda device: False)
     monkeypatch.setattr(cpb_mod, "_ordinary_measure_context", lambda *args: object())
@@ -2466,7 +2487,9 @@ def test_nvfp4_memo_distinguishes_refined_token_counts(store, monkeypatch, token
     monkeypatch.setattr(native, "_eligible", lambda *args: (True, True))
     monkeypatch.setattr(native, "_plan_memo", {})
     monkeypatch.setattr(
-        native.AutoTuner, "get", lambda: SimpleNamespace(is_tuning_mode=False)
+        native.AutoTuner,
+        "get",
+        lambda: SimpleNamespace(is_tuning_mode=False, tuning_enabled=lambda _op: False),
     )
     for t in tokens:
         selected = native.plan_nvfp4_sparse_mla_sm120(t, device=store, **fields)
@@ -2568,7 +2591,11 @@ def test_ordinary_fallback_does_not_start_legacy_measurement(store, monkeypatch)
     monkeypatch.setattr(
         policy.AutoTuner,
         "get",
-        lambda: SimpleNamespace(is_tuning_mode=True, _get_skip_ops_stack=lambda: []),
+        lambda: SimpleNamespace(
+            is_tuning_mode=True,
+            _get_skip_ops_stack=lambda: [],
+            tuning_enabled=lambda _op: True,
+        ),
     )
     monkeypatch.setattr(cpb_mod, "_target_capturing", lambda device: False)
     monkeypatch.setattr(cpb_mod, "get_constants", lambda *args: None)
