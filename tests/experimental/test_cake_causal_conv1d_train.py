@@ -34,6 +34,12 @@ the backward is ONE ordinary launch (no reduce program) and keeps its speed besi
 stream (FlashInfer issues #7038 / #7548).  Autograd, non-reentrant activation checkpointing (2 x forward +
 backward) and gradient accumulation; the ``deterministic`` keyword and torch's deterministic mode.
 
+The opt-in ``bwd_grid_mult`` (every value of ``BWD_GRID_MULTS``) on every route, at single-tile, multi-sub-tile and
+partial-last-tile channel counts and at small and large ``S``: the backward launches that many times its untrimmed
+grid, ``dx`` stays bitwise the deterministic default's, the gradients stay within budget of the reference and of the
+deterministic default, the workspace (the same size at every multiple) reads back zero after every launch, under
+CUDA Graph capture / replay and through the autograd entry (plain and checkpointed).
+
 This suite names its package once, through ``tests.test_helpers.cake_package`` (key
 ``cake.cake_causal_conv1d_train``), and the deterministic package for the parity checks through the same table;
 a vendored build without the deterministic package skips those checks.  Every test skips until the exporter has
@@ -124,6 +130,18 @@ GRAPH_CASES = (
     (4097, 2560, (1000, 0, 3, 3094)),
 )
 GRAPH_REPLAYS = 4
+# The ``bwd_grid_mult`` rows: fewer tokens than CTAs (S = 5, 65), a single-tile C, the multi-sub-tile tiles (1280,
+# 1536, 2560) and the partial last channel tiles (136, 1160, 1344), at small S and at large S (65536, the perf size).
+GRID_MULT_CASES = (
+    (5, 136, (2, 0, 3)),
+    (65, 256, (64, 1)),
+    (5, 1536, (2, 0, 3)),
+    (4097, 1344, (1000, 0, 3, 3094)),
+    (4097, 2560, (1000, 0, 3, 3094)),
+    (65536, 1160, "perf"),
+    (65536, 1280, "perf"),
+    (250340, 512, "perf"),
+)
 ROUTE_SETTINGS = {
     "bwd": dict(weight_dtype=F32, bias_dtype=None, policy="bf16"),
     "bwd_dt": dict(weight_dtype=BF16, bias_dtype=None, policy="bf16"),
@@ -866,6 +884,59 @@ def test_repeated_launches_worst_case(case, kind, record_property) -> None:
     )
 
 
+@pytest.mark.parametrize("kind", tuple(ROUTE_SETTINGS))
+@pytest.mark.parametrize("case", GRID_MULT_CASES, ids=_case_id)
+def test_bwd_grid_mult_keeps_dx_and_the_budgets(case, kind, record_property) -> None:
+    """Every ``bwd_grid_mult`` on every route: ``dx`` bitwise the deterministic package's default ``dx`` (this
+    package's default where the deterministic package is not importable), ``dweight`` / ``dbias`` within the
+    route's budget of the reference and of the deterministic default, and the caller-owned workspace (allocated at
+    that multiple) and the package's stream workspace read back all zero after every launch."""
+
+    _require_route(kind)
+    S, C, docs = case
+    device = _device()
+    x, w, cu, dy, b, policy = _route_inputs(S, C, docs, kind, key=31)
+    refs = reference_backward(x, w, cu, dy, b=b, policy=policy)
+    det = _det_or_none()
+    if det is None:
+        default = _backward(x, w, cu, dy, b, policy)
+    else:
+        default = _det_backward(det, x, w, cu, dy, b, policy)
+    worst = 0.0
+    for mult in pkg.BWD_GRID_MULTS:
+        workspace = pkg.cake_causal_conv1d_train_backward_workspace(
+            S, C, device, bwd_grid_mult=mult, deterministic=False
+        )
+        for own in (True, False):
+            kwargs = {"workspace": workspace} if own else {}
+            dx, dw, db = _backward(
+                x, w, cu, dy, b, policy, bwd_grid_mult=mult, **kwargs
+            )
+            label = f"{kind} S={S} C={C} bwd_grid_mult={mult} own={own}"
+            assert torch.equal(dx, default[0]), f"dx differs from the default ({label})"
+            worst = max(
+                worst, *_check_grads(dx, dw, db, refs, policy=policy, label=label)
+            )
+            for got, expected, name in (
+                (dw, default[1], "dweight"),
+                (db, default[2], "dbias"),
+            ):
+                if got is not None:
+                    atol, rtol = _grad_tolerance(policy, got.dtype)
+                    _assert_within(
+                        got.float(),
+                        expected.float(),
+                        atol=atol,
+                        rtol=rtol,
+                        label=f"{name} vs the default {label}",
+                    )
+            held = workspace if own else _stream_workspace(device)
+            assert held is not None and int(torch.count_nonzero(held)) == 0, (
+                f"workspace not zero ({label})"
+            )
+    record_property("worst_grad_ratio_to_budget", worst)
+
+
 def _rel_l2(actual: torch.Tensor, expected: torch.Tensor) -> float:
     return float(
         torch.linalg.vector_norm(actual.double() - expected.double())
@@ -942,6 +1013,11 @@ def test_workspace_bytes_depend_on_channels_only() -> None:
         )
         assert nbytes == loader.backward_workspace_bytes(arch, C)
         assert nbytes % loader.WORKSPACE_ALIGN == 0
+        # One accumulator set and one counter per channel tile, whatever the grid: every bwd_grid_mult, one size.
+        for mult in pkg.BWD_GRID_MULTS:
+            assert nbytes == pkg.cake_causal_conv1d_train_backward_workspace_bytes(
+                1, C, device, bwd_grid_mult=mult, deterministic=False
+            )
         # The largest owner holds FP64 bias accumulators (40 bytes per channel) where the architecture has them.
         assert nbytes >= 4 * WIDTH * C
         ws = pkg.cake_causal_conv1d_train_backward_workspace(
@@ -1103,10 +1179,12 @@ def test_workspace_views_are_built_once_per_workspace() -> None:
 # Graphs, streams, launches.
 
 
-def _capture_and_replay(cases, kind: str, *, key: int, own_workspace: bool) -> int:
-    """One forward + backward graph per shape, replayed ``GRAPH_REPLAYS`` times into NaN-filled outputs: ``y`` and
-    ``dx`` equal eager bitwise, the gradients are within budget of the reference, and a caller-owned workspace
-    reads back all zero after every replay."""
+def _capture_and_replay(
+    cases, kind: str, *, key: int, own_workspace: bool, bwd_grid_mult: int = 1
+) -> int:
+    """One forward + backward graph per shape (the backward at ``bwd_grid_mult``), replayed ``GRAPH_REPLAYS`` times
+    into NaN-filled outputs: ``y`` and ``dx`` equal eager (default ``bwd_grid_mult``) bitwise, the gradients are
+    within budget of the reference, and a caller-owned workspace reads back all zero after every replay."""
 
     device = _device()
     captured = []
@@ -1121,7 +1199,7 @@ def _capture_and_replay(cases, kind: str, *, key: int, own_workspace: bool) -> i
         db = None if b is None else torch.empty(C, dtype=b.dtype, device=device)
         workspace = (
             pkg.cake_causal_conv1d_train_backward_workspace(
-                S, C, device, deterministic=False
+                S, C, device, bwd_grid_mult=bwd_grid_mult, deterministic=False
             )
             if own_workspace
             else None
@@ -1142,7 +1220,17 @@ def _capture_and_replay(cases, kind: str, *, key: int, own_workspace: bool) -> i
         ):
             _forward(x, w, cu, bias=b, out=y)
             _backward(
-                x, w, cu, dy, b, policy, workspace=ws, dx=dx, dweight=dw, dbias=db
+                x,
+                w,
+                cu,
+                dy,
+                b,
+                policy,
+                workspace=ws,
+                dx=dx,
+                dweight=dw,
+                dbias=db,
+                bwd_grid_mult=bwd_grid_mult,
             )
 
         side = torch.cuda.Stream(device=device)
@@ -1199,6 +1287,26 @@ def test_cuda_graph_replays(kind, own_workspace) -> None:
     cases = GRAPH_CASES if kind == "bwd" else ROUTE_CASES[:3]
     replays = _capture_and_replay(cases, kind, key=11, own_workspace=own_workspace)
     assert replays == GRAPH_REPLAYS * len(cases)
+
+
+@pytest.mark.parametrize("bwd_grid_mult", (2, 3, 4))
+@pytest.mark.parametrize("kind", tuple(ROUTE_SETTINGS))
+def test_cuda_graph_replays_with_bwd_grid_mult(kind, bwd_grid_mult) -> None:
+    """CUDA Graph capture / replay of a ``bwd_grid_mult`` 2-4 backward, with a caller-owned workspace and with the
+    package's: ``dx`` of every replay bitwise the eager default's, the gradients within budget, the caller-owned
+    workspace zero after every replay."""
+
+    _require_route(kind)
+    cases = ROUTE_CASES[:3]
+    for own_workspace in (True, False):
+        replays = _capture_and_replay(
+            cases,
+            kind,
+            key=33,
+            own_workspace=own_workspace,
+            bwd_grid_mult=bwd_grid_mult,
+        )
+        assert replays == GRAPH_REPLAYS * len(cases)
 
 
 def test_two_streams_with_two_workspaces() -> None:
@@ -1287,6 +1395,44 @@ def test_backward_is_one_launch_with_zeroed_accumulators(monkeypatch) -> None:
         assert layout["acc_elems"] == words * C
         assert acc_nonzero == 0 and work_nonzero == 0
         assert {"x", "w", "cu", "dy", "dx", "dw", "acc", "work"} <= set(values)
+
+
+@pytest.mark.parametrize("kind", tuple(ROUTE_SETTINGS))
+def test_bwd_grid_mult_launches_that_many_times_the_untrimmed_grid(
+    kind, monkeypatch
+) -> None:
+    """A backward at ``bwd_grid_mult`` k launches the program ``C`` selects once, with k times the record's
+    untrimmed grid for k > 1 and the call's plan (possibly trimmed) for k = 1: the option is never a silent no-op."""
+
+    _require_route(kind)
+    device = _device()
+    arch = _arch()
+    launched = []
+    run_module = pkg.run_module
+
+    def record_launch(name, values, *, device_index, grid=None):
+        launched.append((name, grid))
+        return run_module(name, values, device_index=device_index, grid=grid)
+
+    monkeypatch.setattr(pkg, "run_module", record_launch)
+    for S, C, docs in (
+        (1000, 1344, "perf"),
+        (65536, 1280, "perf"),
+        (5, 136, (2, 0, 3)),
+    ):
+        x, w, cu, dy, b, policy = _route_inputs(S, C, docs, kind, key=32)
+        name = loader.selected_modules(arch, kind, C=C, S=S)[0]
+        record = loader.MODULES[name]
+        untrimmed = loader.launch_grid(record, device_index=device.index)
+        for mult in pkg.BWD_GRID_MULTS:
+            launched.clear()
+            _backward(x, w, cu, dy, b, policy, bwd_grid_mult=mult)
+            expected = (
+                loader.launch_grid(record, device_index=device.index, C=C, S=S)
+                if mult == 1
+                else (untrimmed[0] * mult, 1, 1)
+            )
+            assert launched == [(name, expected)], (kind, S, C, mult, launched)
 
 
 @pytest.mark.parametrize("kind", ("bwd_fp32g", "bwd_bias_fp32g"))
@@ -1499,6 +1645,56 @@ def test_gradient_accumulation() -> None:
     )
 
 
+@pytest.mark.parametrize("kind", tuple(ROUTE_SETTINGS))
+def test_bwd_grid_mult_through_autograd(kind) -> None:
+    """The autograd entry carries ``bwd_grid_mult`` to its backward: at every multiple, plain and under
+    non-reentrant checkpointing, ``y`` is the forward's, ``x.grad`` bitwise the default direct backward's ``dx``
+    and the parameter gradients within budget of the reference."""
+
+    from torch.utils.checkpoint import checkpoint
+
+    _require_route(kind)
+    S, C, docs = 4097, 1344, (1000, 0, 3, 3094)
+    x0, w0, cu, dy, b0, policy = _route_inputs(S, C, docs, kind, key=34)
+    refs = reference_backward(x0, w0, cu, dy, b=b0, policy=policy)
+    y_default = _forward(x0, w0, cu, bias=b0)
+    dx_default, _, _ = _backward(x0, w0, cu, dy, b0, policy)
+    for mult in pkg.BWD_GRID_MULTS:
+        for ckpt in (False, True):
+            x = x0.detach().clone().requires_grad_(True)
+            w = w0.detach().clone().requires_grad_(True)
+            b = None if b0 is None else b0.detach().clone().requires_grad_(True)
+
+            def layer(x, w, b, mult=mult):
+                return pkg.cake_causal_conv1d(
+                    x,
+                    w,
+                    cu,
+                    b,
+                    silu_grad_preactivation=policy,
+                    bwd_grid_mult=mult,
+                    deterministic=False,
+                )
+
+            y = (
+                checkpoint(layer, x, w, b, use_reentrant=False)
+                if ckpt
+                else layer(x, w, b)
+            )
+            assert torch.equal(y.detach(), y_default)
+            y.backward(dy)
+            label = f"autograd {kind} bwd_grid_mult={mult} checkpoint={ckpt}"
+            assert torch.equal(x.grad, dx_default), label
+            _check_grads(
+                x.grad,
+                w.grad,
+                None if b is None else b.grad,
+                refs,
+                policy=policy,
+                label=label,
+            )
+
+
 # ----------------------------------------------------------------------------------------------------------------
 # The numerical-mode keyword and torch's deterministic mode.
 
@@ -1511,7 +1707,7 @@ def test_every_entry_requires_deterministic_false() -> None:
         "forward": lambda d: pkg.cake_causal_conv1d_train_forward(x, w, cu, **d),
         "backward": lambda d: pkg.cake_causal_conv1d_train_backward(x, w, cu, dy, **d),
         "autograd": lambda d: pkg.cake_causal_conv1d(x, w, cu, **d),
-        "function": lambda d: pkg.CakeCausalConv1dFunction.apply(x, w, cu, None, "bf16", d.get("deterministic", True)),
+        "function": lambda d: pkg.CakeCausalConv1dFunction.apply(x, w, cu, None, "bf16", 1, d.get("deterministic", True)),
         "bwd_ws": lambda d: pkg.cake_causal_conv1d_train_backward_workspace(S, C, device, **d),
         "bwd_ws_bytes": lambda d: pkg.cake_causal_conv1d_train_backward_workspace_bytes(S, C, device, **d),
         "fwd_ws": lambda d: pkg.cake_causal_conv1d_train_forward_workspace(S, C, device, **d),
@@ -1584,6 +1780,21 @@ def test_argument_validation() -> None:
         _backward(x, w, cu, dy, dbias=torch.empty_like(b))
     with pytest.raises(ValueError, match="silu_grad_preactivation"):
         _backward(x, w, cu, dy, policy="fp16")
+    for bad, error in (
+        (0, ValueError),
+        (5, ValueError),
+        (2.0, TypeError),
+        (True, TypeError),
+        ("2", TypeError),
+    ):
+        with pytest.raises(error, match="bwd_grid_mult must be"):
+            _backward(x, w, cu, dy, bwd_grid_mult=bad)
+        with pytest.raises(error, match="bwd_grid_mult must be"):
+            pkg.cake_causal_conv1d(x, w, cu, bwd_grid_mult=bad, deterministic=False)
+        with pytest.raises(error, match="bwd_grid_mult must be"):
+            pkg.cake_causal_conv1d_train_backward_workspace(
+                S, C, _device(), bwd_grid_mult=bad, deterministic=False
+            )
     with pytest.raises(ValueError, match="CUDA"):
         _forward(x.cpu(), w.cpu(), cu.cpu())
 

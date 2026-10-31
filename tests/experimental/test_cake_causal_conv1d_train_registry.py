@@ -412,7 +412,7 @@ def test_entry_points_refuse_a_deterministic_mode_first() -> None:
         "forward": lambda d: pkg.cake_causal_conv1d_train_forward(x, w, cu, **d),
         "backward": lambda d: pkg.cake_causal_conv1d_train_backward(x, w, cu, x, **d),
         "autograd": lambda d: pkg.cake_causal_conv1d(x, w, cu, **d),
-        "function": lambda d: pkg.CakeCausalConv1dFunction.apply(x, w, cu, None, "bf16", d.get("deterministic", True)),
+        "function": lambda d: pkg.CakeCausalConv1dFunction.apply(x, w, cu, None, "bf16", 1, d.get("deterministic", True)),
         "fwd_ws": lambda d: pkg.cake_causal_conv1d_train_forward_workspace(8, 16, cpu, **d),
         "fwd_ws_bytes": lambda d: pkg.cake_causal_conv1d_train_forward_workspace_bytes(8, 16, cpu, **d),
         "bwd_ws": lambda d: pkg.cake_causal_conv1d_train_backward_workspace(8, 16, cpu, **d),

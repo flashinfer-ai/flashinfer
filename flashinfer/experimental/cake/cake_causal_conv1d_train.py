@@ -63,6 +63,19 @@ the package keeps one zeroed buffer per (device, current stream), or a fresh
 one inside a CUDA Graph capture.  The forward workspace (zeroed int32
 token-chunk counters) has the same size and rules in both packages.
 
+The backward entry points and the backward workspace helpers take the
+deterministic package's opt-in ``bwd_grid_mult: int = 1`` (one of
+``BWD_GRID_MULTS``: 1, 2, 3 or 4), with its validation (``TypeError`` for a
+non-int, ``ValueError`` for another value): the backward launches
+``bwd_grid_mult`` times its default untrimmed CTA count, a finer static
+partition of the token axis for a backward that overlaps kernels of other
+streams.  ``deterministic=True`` and the torch-deterministic-mode fallback pass
+it to the deterministic package unchanged.  With ``deterministic=False`` the
+CTAs of each channel tile split its tokens among themselves at any grid size,
+so ``dx`` is still bitwise the deterministic one and ``dweight`` / ``dbias``
+keep their budgets; the workspace size does not depend on it (one
+accumulator set and one counter per channel tile, whatever the grid).
+
 Name map (the deterministic names and their compatibility aliases are
 unchanged and always deterministic)::
 
@@ -103,6 +116,11 @@ Usage::
     dx, dweight = cake_causal_conv1d_train_backward(
         x, weight, cu_seqlens, dy, deterministic=False
     )
+
+    # opt-in finer backward partition (1, 2, 3 or 4; default 1), either mode
+    dx, dweight = cake_causal_conv1d_train_backward(
+        x, weight, cu_seqlens, dy, bwd_grid_mult=3, deterministic=False
+    )
 """
 
 from __future__ import annotations
@@ -115,6 +133,7 @@ import torch
 from ...api_logging import flashinfer_experimental_api
 from .cake_causal_conv1d_train_backend import (  # noqa: F401
     ARCHES,
+    BWD_GRID_MULTS,
     SUPPORTED_COMPUTE_CAPABILITIES,
     CakeCausalConv1dFunction,
 )
@@ -182,15 +201,22 @@ def is_cake_causal_conv1d_train_supported(
 
 @flashinfer_experimental_api(feature=_FEATURE)
 def cake_causal_conv1d_train_backward_workspace_bytes(
-    S: int, C: int, device: torch.device, *, deterministic: bool = True
+    S: int,
+    C: int,
+    device: torch.device,
+    *,
+    bwd_grid_mult: int = 1,
+    deterministic: bool = True,
 ) -> int:
     """Bytes of the caller-owned backward workspace of the selected package for ``C`` channels on ``device``.
 
     ``deterministic=True``: the deterministic package's per-CTA partial rows
-    (no zeroing needed).  ``deterministic=False``: the non-deterministic
-    package's accumulators and counters (size depends on ``C``, not on ``S``;
-    must be zero before its first launch).  The size is of the package named by
-    ``deterministic`` (torch's deterministic mode does not change it).
+    (no zeroing needed), sized for backward calls of up to ``bwd_grid_mult``.
+    ``deterministic=False``: the non-deterministic package's accumulators and
+    counters (size depends on ``C``, not on ``S`` or ``bwd_grid_mult``, which
+    is validated; must be zero before its first launch).  The size is of the
+    package named by ``deterministic`` (torch's deterministic mode does not
+    change it).
     """
 
     if not isinstance(deterministic, bool):
@@ -199,28 +225,36 @@ def cake_causal_conv1d_train_backward_workspace_bytes(
         )
     if deterministic:
         return _det().cake_causal_conv1d_det_train_backward_workspace_bytes(
-            S, C, device
+            S, C, device, bwd_grid_mult=bwd_grid_mult
         )
     return _backend().cake_causal_conv1d_train_backward_workspace_bytes(
-        S, C, device, deterministic=False
+        S, C, device, bwd_grid_mult=bwd_grid_mult, deterministic=False
     )
 
 
 @flashinfer_experimental_api(feature=_FEATURE)
 def cake_causal_conv1d_train_backward_workspace(
-    S: int, C: int, device: torch.device, *, deterministic: bool = True
+    S: int,
+    C: int,
+    device: torch.device,
+    *,
+    bwd_grid_mult: int = 1,
+    deterministic: bool = True,
 ) -> torch.Tensor:
-    """Allocate the selected package's backward workspace (``deterministic=False``: ZEROED, kept zero by every
-    launch; reuse it for every later backward call of one stream, never for two launches that may run at once)."""
+    """Allocate the selected package's backward workspace for backward calls of up to ``bwd_grid_mult``
+    (``deterministic=False``: ZEROED, kept zero by every launch, the same size for every ``bwd_grid_mult``;
+    reuse it for every later backward call of one stream, never for two launches that may run at once)."""
 
     if not isinstance(deterministic, bool):
         raise TypeError(
             f"deterministic must be a bool, got {type(deterministic).__name__}"
         )
     if deterministic:
-        return _det().cake_causal_conv1d_det_train_backward_workspace(S, C, device)
+        return _det().cake_causal_conv1d_det_train_backward_workspace(
+            S, C, device, bwd_grid_mult=bwd_grid_mult
+        )
     return _backend().cake_causal_conv1d_train_backward_workspace(
-        S, C, device, deterministic=False
+        S, C, device, bwd_grid_mult=bwd_grid_mult, deterministic=False
     )
 
 
@@ -331,6 +365,7 @@ def cake_causal_conv1d_train_backward(
     dx: Optional[torch.Tensor] = None,
     dweight: Optional[torch.Tensor] = None,
     dbias: Optional[torch.Tensor] = None,
+    bwd_grid_mult: int = 1,
     deterministic: bool = True,
 ) -> tuple[torch.Tensor, ...]:
     r"""Packed width-4 depthwise causal convolution + SiLU, training backward.
@@ -354,6 +389,18 @@ def cake_causal_conv1d_train_backward(
         (FP32 or BF16 each; the parameter's dtype when omitted).  With
         ``deterministic=False`` an FP32 ``dweight`` must be 16-byte aligned
         (one 16-byte store per channel; ``ValueError`` otherwise).
+    bwd_grid_mult : {1, 2, 3, 4}
+        Opt-in finer static partition of the token axis (default 1, the
+        default grid): the backward launches ``bwd_grid_mult`` times its
+        default untrimmed CTA count, so each CTA streams that much fewer tokens
+        (for a backward that overlaps kernels of other streams: a CTA that
+        starts late trails by a shorter stream).  ``dx`` is bitwise the
+        default's in both modes.  ``deterministic=True``: the deterministic
+        package's option (its ``dweight`` / ``dbias`` sum more partial rows in
+        another fixed order; a ``workspace`` must be sized with the same or a
+        larger ``bwd_grid_mult``).  ``deterministic=False``: more CTAs add into
+        the same accumulators (same budgets, same workspace size).
+        ``TypeError`` for a non-int, ``ValueError`` for another value.
     deterministic : bool
         ``True`` (default): main launch + fixed-order reduce launch, bitwise
         reproducible gradients.  ``False``: one launch with unordered
@@ -382,6 +429,7 @@ def cake_causal_conv1d_train_backward(
             dx=dx,
             dweight=dweight,
             dbias=dbias,
+            bwd_grid_mult=bwd_grid_mult,
         )
     return _backend().cake_causal_conv1d_train_backward(
         x,
@@ -394,6 +442,7 @@ def cake_causal_conv1d_train_backward(
         dx=dx,
         dweight=dweight,
         dbias=dbias,
+        bwd_grid_mult=bwd_grid_mult,
         deterministic=False,
     )
 
@@ -406,6 +455,7 @@ def cake_causal_conv1d(
     bias: Optional[torch.Tensor] = None,
     *,
     silu_grad_preactivation: str = "bf16",
+    bwd_grid_mult: int = 1,
     deterministic: bool = True,
 ) -> torch.Tensor:
     """Autograd-enabled packed width-4 depthwise causal convolution + SiLU.
@@ -422,6 +472,10 @@ def cake_causal_conv1d(
         FP32 or BF16 ``[C]`` contiguous per-channel bias.
     silu_grad_preactivation : {"bf16", "fp32"}
         The weight gradient's SiLU' policy.
+    bwd_grid_mult : {1, 2, 3, 4}
+        The backward's opt-in finer partition (default 1; see
+        :func:`cake_causal_conv1d_train_backward`); checked at the forward
+        call, used by the backward.
     deterministic : bool
         ``True`` (default): ``flashinfer.cake_causal_conv1d_det_train.cake_causal_conv1d_det``.
         ``False``: the non-deterministic autograd Function
@@ -443,7 +497,12 @@ def cake_causal_conv1d(
 
     if _deterministic(deterministic, "cake_causal_conv1d"):
         return _det().cake_causal_conv1d_det(
-            x, weight, cu_seqlens, bias, silu_grad_preactivation=silu_grad_preactivation
+            x,
+            weight,
+            cu_seqlens,
+            bias,
+            silu_grad_preactivation=silu_grad_preactivation,
+            bwd_grid_mult=bwd_grid_mult,
         )
     return _backend().cake_causal_conv1d(
         x,
@@ -451,12 +510,14 @@ def cake_causal_conv1d(
         cu_seqlens,
         bias,
         silu_grad_preactivation=silu_grad_preactivation,
+        bwd_grid_mult=bwd_grid_mult,
         deterministic=False,
     )
 
 
 __all__ = [
     "ARCHES",
+    "BWD_GRID_MULTS",
     "SUPPORTED_COMPUTE_CAPABILITIES",
     "CakeCausalConv1dFunction",
     "cake_causal_conv1d",

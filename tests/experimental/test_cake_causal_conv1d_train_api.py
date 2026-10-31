@@ -22,8 +22,10 @@ package with the caller's arguments unchanged, ``deterministic=False`` the non-d
 mode is a ``TypeError``; under ``torch.use_deterministic_algorithms(True)`` a ``deterministic=False`` call runs the
 deterministic package and warns once per entry point, without handing it a non-deterministic workspace.  The
 entry points are marked experimental, mirror the packages' signatures, and leave every deterministic and legacy
-name unchanged; ``import flashinfer`` imports neither facade.  On a device (once the non-deterministic package is
-rendered): the facades return the packages' bits.  The numerical contract itself is
+name unchanged; ``import flashinfer`` imports neither facade.  The opt-in ``bwd_grid_mult`` reaches the selected
+package unchanged (the fallback included) and is refused with the deterministic package's errors in both modes.  On
+a device (once the non-deterministic package is rendered): the facades return the packages' bits, at every
+``bwd_grid_mult``.  The numerical contract itself is
 ``test_cake_causal_conv1d_train.py``'s.
 """
 
@@ -160,9 +162,10 @@ def test_entry_points_dispatch_by_keyword(recorded) -> None:
         "cake_causal_conv1d_train_forward": ((x, w, cu), {"bias": b, "out": None, "workspace": ws}),
         "cake_causal_conv1d_train_backward": (
             (x, w, cu, dy),
-            {"bias": b, "silu_grad_preactivation": "fp32", "workspace": ws, "dx": None, "dweight": None, "dbias": None},
+            {"bias": b, "silu_grad_preactivation": "fp32", "workspace": ws, "dx": None, "dweight": None, "dbias": None,
+             "bwd_grid_mult": 3},
         ),
-        "cake_causal_conv1d": ((x, w, cu, b), {"silu_grad_preactivation": "fp32"}),
+        "cake_causal_conv1d": ((x, w, cu, b), {"silu_grad_preactivation": "fp32", "bwd_grid_mult": 3}),
     }  # fmt: skip
     for entry, (det_name, nondet_name) in ENTRIES.items():
         args, kwargs = calls[entry]
@@ -188,14 +191,25 @@ def test_entry_points_dispatch_by_keyword(recorded) -> None:
 def test_helpers_dispatch_by_keyword(recorded) -> None:
     device = torch.device("cpu")
     for helper, det_name in HELPERS.items():
+        # The backward helpers size for a bwd_grid_mult (passed on by keyword in both modes); the forward ones don't.
+        sized = {"bwd_grid_mult": 1} if "backward" in helper else {}
         recorded.clear()
         assert getattr(facade, helper)(64, 256, device) == f"det.{det_name}"
-        assert recorded[-1][1:] == ((64, 256, device), {})
+        assert recorded[-1][1:] == ((64, 256, device), sized)
         assert (
             getattr(facade, helper)(64, 256, device, deterministic=False)
             == f"nondet.{helper}"
         )
-        assert recorded[-1][1:] == ((64, 256, device), {"deterministic": False})
+        assert recorded[-1][1:] == (
+            (64, 256, device),
+            {**sized, "deterministic": False},
+        )
+        if sized:
+            for mode in (True, False):
+                getattr(facade, helper)(
+                    64, 256, device, bwd_grid_mult=4, deterministic=mode
+                )
+                assert recorded[-1][2]["bwd_grid_mult"] == 4, (helper, mode)
     assert (
         facade.is_cake_causal_conv1d_train_supported(device)
         == "det.is_cake_causal_conv1d_det_train_supported"
@@ -231,6 +245,37 @@ def test_mode_must_be_a_bool(recorded) -> None:
 
 
 @pytest.mark.cpu_only
+def test_bwd_grid_mult_is_validated_like_the_deterministic_package() -> None:
+    """A ``bwd_grid_mult`` outside ``BWD_GRID_MULTS`` raises the deterministic package's ``TypeError`` (a non-int,
+    ``bool`` included) or ``ValueError`` (another int) with the same message in both modes, from every entry point
+    that takes it (and the non-deterministic autograd Function), before any tensor or device check: never a
+    silent default."""
+
+    cpu = torch.device("cpu")
+    calls = {
+        "backward": lambda m, d: facade.cake_causal_conv1d_train_backward(None, None, None, None, bwd_grid_mult=m, deterministic=d),
+        "autograd": lambda m, d: facade.cake_causal_conv1d(None, None, None, bwd_grid_mult=m, deterministic=d),
+        "bwd_ws": lambda m, d: facade.cake_causal_conv1d_train_backward_workspace(64, 256, cpu, bwd_grid_mult=m, deterministic=d),
+        "bwd_ws_bytes": lambda m, d: facade.cake_causal_conv1d_train_backward_workspace_bytes(64, 256, cpu, bwd_grid_mult=m, deterministic=d),
+    }  # fmt: skip
+    for bad in (0, 5, -1, True, False, 2.0, "2", None, torch.tensor(2)):
+        expected = ValueError if type(bad) is int else TypeError
+        for name, call in calls.items():
+            errors = []
+            for mode in (True, False):
+                with pytest.raises((TypeError, ValueError)) as info:
+                    _quiet(lambda: call(bad, mode))
+                errors.append((type(info.value), str(info.value)))
+            assert errors[0] == errors[1], (name, bad, errors)
+            assert errors[0][0] is expected, (name, bad, errors)
+            assert errors[0][1].startswith("bwd_grid_mult must be"), (name, bad, errors)
+        with pytest.raises(expected, match="bwd_grid_mult must be"):
+            backend.CakeCausalConv1dFunction.apply(
+                None, None, None, None, "bf16", bad, False
+            )
+
+
+@pytest.mark.cpu_only
 def test_torch_deterministic_mode_falls_back_and_warns_once(
     recorded, torch_deterministic
 ) -> None:
@@ -258,6 +303,23 @@ def test_torch_deterministic_mode_falls_back_and_warns_once(
     assert recorded[-1][2]["workspace"] is None
     _quiet(lambda: facade.cake_causal_conv1d_train_backward(x, w, cu, dy, workspace=ws))
     assert recorded[-1][2]["workspace"] is ws
+    # bwd_grid_mult reaches the deterministic package unchanged under the fallback (backward and autograd entry).
+    for mult in (1, 2, 4):
+        _quiet(
+            lambda: facade.cake_causal_conv1d_train_backward(
+                x, w, cu, dy, workspace=ws, bwd_grid_mult=mult, deterministic=False
+            )
+        )
+        assert recorded[-1][0] == "det.cake_causal_conv1d_det_train_backward"
+        assert recorded[-1][2]["bwd_grid_mult"] == mult
+        assert recorded[-1][2]["workspace"] is None
+        _quiet(
+            lambda: facade.cake_causal_conv1d(
+                x, w, cu, bwd_grid_mult=mult, deterministic=False
+            )
+        )
+        assert recorded[-1][0] == "det.cake_causal_conv1d_det"
+        assert recorded[-1][2]["bwd_grid_mult"] == mult
     # The forward workspace (the same int32 counters in both packages) is passed on.
     _quiet(
         lambda: facade.cake_causal_conv1d_train_forward(
@@ -338,10 +400,38 @@ def test_facade_signatures_mirror_the_packages() -> None:
             entry
         )
         assert mine[:-1] == _parameters(getattr(det_facade, det_name)), entry
-    for helper in HELPERS:
-        assert _parameters(getattr(facade, helper)) == _parameters(
-            getattr(backend, helper)
-        ), helper
+    for helper, det_name in HELPERS.items():
+        mine = _parameters(getattr(facade, helper))
+        assert mine == _parameters(getattr(backend, helper)), helper
+        assert mine[-1] == ("deterministic", inspect.Parameter.KEYWORD_ONLY, True), (
+            helper
+        )
+        assert mine[:-1] == _parameters(getattr(det_facade, det_name)), helper
+    # The deterministic package's opt-in backward grid multiple: keyword-only, default 1, on the backward, the
+    # autograd entry and both backward workspace helpers of the facade and the non-deterministic package (and its
+    # autograd Function, before ``deterministic``), with the deterministic package's choices.
+    for name in (
+        "cake_causal_conv1d_train_backward",
+        "cake_causal_conv1d",
+        "cake_causal_conv1d_train_backward_workspace",
+        "cake_causal_conv1d_train_backward_workspace_bytes",
+    ):
+        for module in (facade, backend):
+            parameter = inspect.signature(getattr(module, name)).parameters[
+                "bwd_grid_mult"
+            ]
+            assert parameter.kind is inspect.Parameter.KEYWORD_ONLY, (module, name)
+            assert parameter.default == 1, (module, name)
+    function = list(
+        inspect.signature(backend.CakeCausalConv1dFunction.forward).parameters
+    )
+    assert function[-2:] == ["bwd_grid_mult", "deterministic"], function
+    assert backend.BWD_GRID_MULTS == (1, 2, 3, 4)
+    assert facade.BWD_GRID_MULTS is backend.BWD_GRID_MULTS
+    assert "BWD_GRID_MULTS" in backend.__all__ and "BWD_GRID_MULTS" in facade.__all__
+    import flashinfer.cake_causal_conv1d_det_train_backend as det_backend
+
+    assert backend.BWD_GRID_MULTS == det_backend.BWD_GRID_MULTS
     from flashinfer.experimental.cake.cake_causal_conv1d_train_backend import (
         kcp as kcp_backend,
     )
@@ -494,6 +584,66 @@ def test_facade_returns_the_packages_bits() -> None:
         ) == det_facade.cake_causal_conv1d_det_train_forward_workspace_bytes(
             S, C, _device()
         )
+
+
+@gpu
+def test_bwd_grid_mult_in_both_modes() -> None:
+    """Every ``bwd_grid_mult``: ``deterministic=True`` returns the deterministic package's bits at that multiple
+    (backward and autograd); ``deterministic=False`` keeps ``dx`` bitwise the deterministic default's and the
+    gradients within its budget, with a workspace of the same size at every multiple, left zero."""
+
+    x, w, cu, dy, b = _problem()
+    S, C = x.shape
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", ExperimentalWarning)
+        default = det_facade.cake_causal_conv1d_det_train_backward(x, w, cu, dy, bias=b)
+        nbytes = facade.cake_causal_conv1d_train_backward_workspace_bytes(
+            S, C, _device(), deterministic=False
+        )
+        for mult in backend.BWD_GRID_MULTS:
+            expected = det_facade.cake_causal_conv1d_det_train_backward(
+                x, w, cu, dy, bias=b, bwd_grid_mult=mult
+            )
+            got = facade.cake_causal_conv1d_train_backward(
+                x, w, cu, dy, bias=b, bwd_grid_mult=mult
+            )
+            assert all(torch.equal(a, e) for a, e in zip(got, expected, strict=True))
+            ws = facade.cake_causal_conv1d_train_backward_workspace(
+                S, C, _device(), bwd_grid_mult=mult, deterministic=False
+            )
+            assert ws.numel() == nbytes and int(torch.count_nonzero(ws)) == 0
+            dx, dw, db = facade.cake_causal_conv1d_train_backward(
+                x,
+                w,
+                cu,
+                dy,
+                bias=b,
+                workspace=ws,
+                bwd_grid_mult=mult,
+                deterministic=False,
+            )
+            assert int(torch.count_nonzero(ws)) == 0
+            assert torch.equal(dx, default[0]), mult
+            torch.testing.assert_close(dw, default[1], atol=DW_ATOL, rtol=DW_RTOL)
+            torch.testing.assert_close(db, default[2], atol=DW_ATOL, rtol=DW_RTOL)
+            for mode in (True, False):
+                xg = x.clone().requires_grad_(True)
+                wg = w.clone().requires_grad_(True)
+                bg = b.clone().requires_grad_(True)
+                facade.cake_causal_conv1d(
+                    xg, wg, cu, bg, bwd_grid_mult=mult, deterministic=mode
+                ).backward(dy)
+                assert torch.equal(xg.grad, default[0]), (mult, mode)
+                if mode:
+                    assert torch.equal(wg.grad, expected[1])
+                    assert torch.equal(bg.grad, expected[2])
+                else:
+                    torch.testing.assert_close(
+                        wg.grad, default[1], atol=DW_ATOL, rtol=DW_RTOL
+                    )
+                    torch.testing.assert_close(
+                        bg.grad, default[2], atol=DW_ATOL, rtol=DW_RTOL
+                    )
 
 
 @gpu
