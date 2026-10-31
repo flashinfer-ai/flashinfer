@@ -62,12 +62,14 @@ rule and is applied at the catalogued count, not the device's; it is consulted
 before the ``:short`` / ``:ts`` shape gates, so a call inside both it and the
 ``:ts`` gate is named by its KV-split plan.
 
-A ``:kvsplit`` route record of the full kind may carry ``stage_buckets``
+A ``:kvsplit`` route record may carry ``stage_buckets``
 (``{arch: [{"kv_max": K, "stages": [[stage, program], ...]}, ...]}``): a plan
 whose KV length is at most an entry's ``kv_max`` launches the first such entry's
-stages on that architecture (:func:`route_stages`) -- its partial-kind twin's
-program, with the same host call, logits and schedule words as the record's
-program; the route name, its admission and its metadata buffer are the record's.
+stages on that architecture (:func:`route_stages`) -- on a route of the full
+kind its partial-kind twin's program, on a route of the partial kind a program
+of its own that no route's ``stages`` name -- with the same host call, logits
+and schedule words as the record's program; the route name, its admission and
+its metadata buffer are the record's.
 """
 
 from __future__ import annotations

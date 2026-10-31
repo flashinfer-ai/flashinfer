@@ -431,12 +431,12 @@ kernel_cake_deepgemm_dense_mqa_e7b37a2731dbe57280f3(const __grid_constant__ CUte
                 unsigned int start_v_1 = ((ks0_1 < ks1_1) ? ks0_1 : ks1_1);
                 unsigned int end_v_1 = ((ke0_1 > ke1_1) ? ke0_1 : ke1_1);
                 unsigned int aligned_start_1 = start_v_1 / 4 * 4;
-                unsigned int kv_start_0 = aligned_start_1;
+                unsigned int kv_start_2 = aligned_start_1;
                 unsigned int kv_end_1 = end_v_1;
-                unsigned int kv_span_1 = kv_end_1 - kv_start_0;
-                unsigned int num_kv_blocks_1_1 = (kv_span_1 + 256 - 1) / 256;
-                kv_start_1 = kv_start_0;
-                num_kv_blocks_1 = num_kv_blocks_1_1;
+                unsigned int kv_span_1 = kv_end_1 - kv_start_2;
+                unsigned int num_kv_blocks_0 = (kv_span_1 + 256 - 1) / 256;
+                kv_start_1 = kv_start_2;
+                num_kv_blocks_1 = num_kv_blocks_0;
                 #pragma unroll 1
                 for (unsigned int kv_iter = 0; kv_iter < num_kv_blocks_1; kv_iter++) {
                     int kv_row = kv_start_1 + kv_iter * 256;
@@ -473,7 +473,7 @@ kernel_cake_deepgemm_dense_mqa_e7b37a2731dbe57280f3(const __grid_constant__ CUte
             for (unsigned int q_block_idx_2 = first_q_0_2; q_block_idx_2 < mma_num_blocks; q_block_idx_2 += SM_COUNT) {
                 unsigned int scheduled_kv_start_2 = 0;
                 unsigned int scheduled_num_splits_2 = 1;
-                unsigned int kv_start_2 = scheduled_kv_start_2;
+                unsigned int kv_start_3 = scheduled_kv_start_2;
                 unsigned int num_kv_blocks_2 = scheduled_num_splits_2;
                 mbarrier_wait(q_full_addr + (mma_q_stage) * 8, _phase_q_full);
                 num_kv_blocks_2 = ts_words[mma_q_stage * 2 + 1];
@@ -607,7 +607,7 @@ kernel_cake_deepgemm_dense_mqa_e7b37a2731dbe57280f3(const __grid_constant__ CUte
                 mbarrier_wait(q_full_addr + (math_q_stage) * 8, _phase_q_full_1);
                 unsigned int q_start_2 = q_block_idx_3 * 2;
                 unsigned int ts_math_slot = math_q_stage * 2;
-                unsigned int kv_start_3 = ts_words[ts_math_slot];
+                unsigned int kv_start_4 = ts_words[ts_math_slot];
                 unsigned int num_kv_blocks_3 = ts_words[ts_math_slot + 1];
                 unsigned int dense_start[2];
                 unsigned int dense_end[2];
@@ -645,7 +645,7 @@ kernel_cake_deepgemm_dense_mqa_e7b37a2731dbe57280f3(const __grid_constant__ CUte
                     if (kv_iter_2 == num_kv_blocks_3 - 1) {
                         mbarrier_arrive(q_empty_addr + (math_q_stage) * 8);
                     }
-                    int kv_pos = kv_start_3 + kv_iter_2 * 256 + (unsigned int)math_thread_idx;
+                    int kv_pos = kv_start_4 + kv_iter_2 * 256 + (unsigned int)math_thread_idx;
                     float _tmem_load_0[64];
                     asm volatile(
                         "tcgen05.ld.sync.aligned.32x32b.x32.b32"
@@ -710,7 +710,7 @@ kernel_cake_deepgemm_dense_mqa_e7b37a2731dbe57280f3(const __grid_constant__ CUte
                     asm volatile("tcgen05.fence::before_thread_sync;");
                     mbarrier_arrive(umma_empty_addr + (math_tmem_stage) * 8);
                     float2 sum0_0 = make_float2(0.0f, 0.0f);
-                    float2 sum1_1 = make_float2(0.0f, 0.0f);
+                    float2 sum1_0 = make_float2(0.0f, 0.0f);
                     #pragma unroll
                     for (int j_1 = 0; j_1 < 64; j_1 += 4) {
                         asm("{\n\t.reg .f32 _ab0, _ab1;\n\t.reg .b64 _pr, _pa, _pb;\n\t"
@@ -726,12 +726,12 @@ kernel_cake_deepgemm_dense_mqa_e7b37a2731dbe57280f3(const __grid_constant__ CUte
                             "add.rn.f32x2 _pr, _pr, _pa;\n\t"
                             "mov.b64 _pb, {%3, %4};\n\t"
                             "fma.rn.f32x2 %0, _pr, _pb, %0;\n\t}"
-                            : "+l"(*(unsigned long long*)&sum1_1) : "f"(_tmem_load_1[j_1 + 2]), "f"(_tmem_load_1[j_1 + 3]), "f"(weights_reg[64 + j_1 + 2]), "f"(weights_reg[64 + j_1 + 3]));
+                            : "+l"(*(unsigned long long*)&sum1_0) : "f"(_tmem_load_1[j_1 + 2]), "f"(_tmem_load_1[j_1 + 3]), "f"(weights_reg[64 + j_1 + 2]), "f"(weights_reg[64 + j_1 + 3]));
                     }
-                    float2 total_2 = add_f32x2_noftz(sum0_0, sum1_1);
-                    float relu_wsum_3 = (total_2.x + total_2.y) * 0.5f;
+                    float2 total_0 = add_f32x2_noftz(sum0_0, sum1_0);
+                    float relu_wsum_0 = (total_0.x + total_0.y) * 0.5f;
                     int q_row_4 = q_start_2 + 1;
-                    float in_range_result_5 = scale_kv * relu_wsum_3;
+                    float in_range_result_5 = scale_kv * relu_wsum_0;
                     {
                         float materialized_result_1 = in_range_result_5;
                         int q_rel_1 = (unsigned int)q_row_4 - q_start_2;
