@@ -285,6 +285,11 @@ def refs_moe_grouped_det_gemm(package_dir: Path, loader: str) -> set[str]:
     return refs
 
 
+# The non-deterministic package ``flashinfer.experimental.cake.cake_moe_grouped_gemm`` has the same registry shape
+# (``PROGRAMS`` + ``ROUTES`` with per-stage specializations).
+refs_moe_grouped_gemm = refs_moe_grouped_det_gemm
+
+
 def refs_stepfun(package_dir: Path, loader: str) -> set[str]:
     """Compact rows keyed by the 20-hex program digest (``_PROGRAMS``; the library stem is
     ``_PREFIX + digest``), every program built for every architecture of ``ARCHES``."""
@@ -423,6 +428,12 @@ PACKAGES: tuple[Package, ...] = (
         "flashinfer/experimental/cake_moe_grouped_det_gemm",
         "cake_jit.py",
         refs_moe_grouped_det_gemm,
+    ),
+    Package(
+        "flashinfer.experimental.cake.cake_moe_grouped_gemm",
+        "flashinfer/experimental/cake/cake_moe_grouped_gemm",
+        "cake_jit.py",
+        refs_moe_grouped_gemm,
     ),
     Package(
         "flashinfer.experimental.cake_lm_head_loss",

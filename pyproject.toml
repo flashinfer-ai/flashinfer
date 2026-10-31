@@ -164,6 +164,8 @@ exclude = [
 "flashinfer.experimental.cake_w8a8_megamoe_ep16" = ["csrc/**"]
 # Generated sources for the experimental exact-SM100a/SM103a/SM107a ragged BF16 MoE grouped GEMM backend.
 "flashinfer.experimental.cake_moe_grouped_det_gemm" = ["csrc/**", "build.json"]
+# Generated sources of its non-deterministic counterpart (deterministic=False).
+"flashinfer.experimental.cake.cake_moe_grouped_gemm" = ["csrc/**", "build.json"]
 # Generated sources for the experimental exact-SM100a/SM107a dense projection GEMM backend.
 "flashinfer.experimental.dense_projection_det_gemm" = ["csrc/**", "build.json"]
 # Generated sources for the experimental exact-SM100a/SM103a StepFun fused-MoE backend (cake-build/1).
