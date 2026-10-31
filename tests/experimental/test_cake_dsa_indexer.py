@@ -3131,8 +3131,10 @@ def test_caller_owned_workspace_shared_by_two_geometries_keeps_every_run_exact()
     inputs_a = ref.make_random_inputs(
         [300, 200], [300, 6000], top_k=256, seed=70, device="cuda"
     )
+    # top_k 4096: where the candidate capacity has a floor (sm_107a: 8192 slots), top_k 256 and 2048 both sit on it, and
+    # with the same unit the two bounds would be equal
     inputs_b = ref.make_random_inputs(
-        [900, 300], [900, 7000], top_k=2048, seed=71, device="cuda"
+        [900, 300], [900, 7000], top_k=4096, seed=71, device="cuda"
     )
     bytes_a = _workspace_bytes(inputs_a, device)
     bytes_b = _workspace_bytes(inputs_b, device)
