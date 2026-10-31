@@ -339,6 +339,84 @@ def convert_e4m3_words(
     return cute.TensorSSA(result_vector, (2 * count,), mma_dtype)
 
 
+def _asm_op(result_type, operands, asm, constraints, *, loc, ip):
+    return llvm.inline_asm(
+        result_type,
+        operands,
+        asm,
+        constraints,
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def bulk_store_complete_fence(*, loc=None, ip=None) -> None:
+    """Wait for every bulk (TMA) store of this thread to complete, then order the
+    async-proxy global writes before the generic proxy and release them at GPU scope.
+    The tail fix-up's partial tiles are published this way before the counter add."""
+    _asm_op(
+        None,
+        [],
+        "cp.async.bulk.wait_group 0;\nfence.proxy.async.global;\nfence.acq_rel.gpu;",
+        "",
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def atomic_add_acq_rel_gpu(
+    addr: cutlass.Int64, value: cutlass.Int32, *, loc=None, ip=None
+) -> cutlass.Int32:
+    """``atom.acq_rel.gpu.global.add.s32`` on the global int32 at ``addr``; returns the
+    old value."""
+    old = _asm_op(
+        Uint32.mlir_type,
+        [addr.ir_value(loc=loc, ip=ip), value.ir_value(loc=loc, ip=ip)],
+        "atom.acq_rel.gpu.global.add.s32 $0, [$1], $2;",
+        "=r,l,r",
+        loc=loc,
+        ip=ip,
+    )
+    return cutlass.Int32(old)
+
+
+@dsl_user_op
+def ld_acquire_gpu_s32(addr: cutlass.Int64, *, loc=None, ip=None) -> cutlass.Int32:
+    val = _asm_op(
+        Uint32.mlir_type,
+        [addr.ir_value(loc=loc, ip=ip)],
+        "ld.acquire.gpu.global.s32 $0, [$1];",
+        "=r,l",
+        loc=loc,
+        ip=ip,
+    )
+    return cutlass.Int32(val)
+
+
+@dsl_user_op
+def st_relaxed_gpu_s32(
+    addr: cutlass.Int64, value: cutlass.Int32, *, loc=None, ip=None
+) -> None:
+    _asm_op(
+        None,
+        [addr.ir_value(loc=loc, ip=ip), value.ir_value(loc=loc, ip=ip)],
+        "st.relaxed.gpu.global.s32 [$0], $1;",
+        "l,r",
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def nanosleep(ns: int, *, loc=None, ip=None) -> None:
+    _asm_op(None, [], f"nanosleep.u32 {int(ns)};", "", loc=loc, ip=ip)
+
+
 @dsl_user_op
 def global_timer_lo(tag: int, *, loc=None, ip=None) -> cutlass.Int32:
     """Low 32 bits of ``%globaltimer`` (nanoseconds); debug-mode timelines only.
@@ -359,10 +437,15 @@ def global_timer_lo(tag: int, *, loc=None, ip=None) -> cutlass.Int32:
 
 
 __all__ = [
+    "atomic_add_acq_rel_gpu",
+    "bulk_store_complete_fence",
     "convert_e4m3_fragment",
     "convert_e4m3_pairs",
     "convert_e4m3_words",
     "global_timer_lo",
     "load_convert_e4m3_units",
+    "ld_acquire_gpu_s32",
     "load_e4m3_unit",
+    "nanosleep",
+    "st_relaxed_gpu_s32",
 ]

@@ -667,40 +667,19 @@ def _get_sm90_kernel(
     return compiled
 
 
-def _get_sm90_tail_reduce(
-    act_dtype: torch.dtype,
-    has_bias: bool,
-    tile: Tuple[int, int],
-    pointers: Tuple,
-    stream,
-):
-    import cutlass.cute as cute
-
-    from .kernels.cute_dsl.w8a16_fp8_splitk_reduce import W8A16Sm90TailReduce
-
-    key = ("sm90-reduce", act_dtype, has_bias, tile)
-    compiled = _KERNEL_CACHE.get(key)
-    if compiled is not None:
-        return compiled
-    compiled = cute.compile(
-        W8A16Sm90TailReduce(has_bias, tile[0], tile[1]).wrapper,
-        *pointers,
-        1,
-        8,
-        1,
-        1,
-        1,
-        0,
-        1,
-        1,
-        stream=stream,
-        options="--opt-level 2 --enable-tvm-ffi",
-    )
-    _KERNEL_CACHE[key] = compiled
-    return compiled
-
-
 _SM90_TAIL_WORKSPACE_CAP = 64 << 20
+_SM90_TAIL_MAX_SPLITS = 16
+_TAIL_COUNTERS: Dict[torch.device, torch.Tensor] = {}
+
+
+def _sm90_tail_counters(device: torch.device, count: int) -> torch.Tensor:
+    """Per-device int32 arrival counters for the tail tiles: zero between calls (the
+    last slice of a tile resets its counter), grown when a call needs more."""
+    buf = _TAIL_COUNTERS.get(device)
+    if buf is None or buf.numel() < count:
+        buf = torch.zeros(max(count, 1024), dtype=torch.int32, device=device)
+        _TAIL_COUNTERS[device] = buf
+    return buf
 
 
 def sm90_tail_plan(
@@ -724,14 +703,17 @@ def sm90_tail_plan(
     tail = tiles - full * num_sms
     if tail == 0 or 2 * tail >= num_sms or k_tiles < 4:
         return tile_algo, tiles, 1
+    # The most slices that still run in one round (the slices of a tile reduce it
+    # among themselves and must be resident together), at least two k-tiles each,
+    # under the workspace cap.
     block_bytes = tile_w * tile_a * 4
-    best_s, best_cost = 1, float(math.ceil(tail / num_sms))
-    for s in range(2, _SM90_MAX_SPLITS + 1):
-        if k_tiles // s < 2 or tail * s * block_bytes > _SM90_TAIL_WORKSPACE_CAP:
+    best_s = 1
+    for s in range(2, _SM90_TAIL_MAX_SPLITS + 1):
+        if tail * s > num_sms or k_tiles // s < 2:
             break
-        cost = math.ceil(tail * s / num_sms) / s
-        if cost < best_cost:
-            best_cost, best_s = cost, s
+        if tail * s * block_bytes > _SM90_TAIL_WORKSPACE_CAP:
+            break
+        best_s = s
     if best_s == 1:
         return tile_algo, tiles, 1
     return tile_algo, full * num_sms, best_s
@@ -769,6 +751,11 @@ def _w8a16_fp8_gemm_sm90(
     tiles = _tiles(n, tile_w) * _tiles(m, tile_a)
     tail_tiles = tiles - body_items
     has_tail = tail_tiles > 0 and tail_splits > 1
+    if has_tail and tail_tiles * tail_splits > num_sms:
+        # The slices of a tile reduce it among themselves, so they must all be
+        # resident: at most one tail item per CTA.  Split-K over a grid that does not
+        # fit runs the tiles whole instead.
+        has_tail = False
     if not has_tail:
         body_items, tail_splits, tail_tiles = tiles, 1, 0
     tail_blocks = tail_tiles * tail_splits
@@ -782,6 +769,7 @@ def _w8a16_fp8_gemm_sm90(
         if has_tail
         else weight_scale
     )
+    counters = _sm90_tail_counters(act.device, tail_tiles) if has_tail else weight_scale
     group = sm90_pick_group(m, n, k, tile_w)
     has_bias = bias is not None
     act_ctype = cutlass.BFloat16 if act.dtype == torch.bfloat16 else cutlass.Float16
@@ -798,6 +786,7 @@ def _w8a16_fp8_gemm_sm90(
         make_ptr(bias_ctype, bias_tensor.data_ptr(), cute_gmem(), assumed_align=4),
         make_ptr(act_ctype, out.data_ptr(), cute_gmem(), assumed_align=16),
         make_ptr(cutlass.Float32, workspace.data_ptr(), cute_gmem(), assumed_align=16),
+        make_ptr(cutlass.Int32, counters.data_ptr(), cute_gmem(), assumed_align=4),
     )
     stream = current_cuda_stream()
     compiled = _get_sm90_kernel(
@@ -821,6 +810,7 @@ def _w8a16_fp8_gemm_sm90(
         bias_tensor.data_ptr(),
         out.data_ptr(),
         workspace.data_ptr(),
+        counters.data_ptr(),
         n,
         m,
         k,
@@ -829,35 +819,6 @@ def _w8a16_fp8_gemm_sm90(
         tail_splits,
         stream,
     )
-    if has_tail:
-        reduce_pointers = (
-            make_ptr(
-                cutlass.Float32, workspace.data_ptr(), cute_gmem(), assumed_align=16
-            ),
-            make_ptr(
-                cutlass.Float32, weight_scale.data_ptr(), cute_gmem(), assumed_align=4
-            ),
-            make_ptr(bias_ctype, bias_tensor.data_ptr(), cute_gmem(), assumed_align=16),
-            make_ptr(act_ctype, out.data_ptr(), cute_gmem(), assumed_align=16),
-        )
-        reduce = _get_sm90_tail_reduce(
-            act.dtype, has_bias, (tile_w, tile_a), reduce_pointers, stream
-        )
-        reduce(
-            workspace.data_ptr(),
-            weight_scale.data_ptr(),
-            bias_tensor.data_ptr(),
-            out.data_ptr(),
-            m,
-            n,
-            _tiles(n, tile_w),
-            _tiles(m, tile_a),
-            min(group, _tiles(m, tile_a)),
-            body_items,
-            tail_tiles,
-            tail_splits,
-            stream,
-        )
     return out
 
 

@@ -148,3 +148,21 @@ Until then the C++ stays as-is and the DSL kernel lives beside it.
   DSL lessons: a tensor returned from or passed through a @cute.jit helper leaves layout
   values in the helper's region (inline instead); a kernel must use its layout arguments,
   not self's host-side values; a tensor rebound inside a staged loop becomes loop-carried.
+- Sat 31 Oct 2026, night: Hopper stream-K replacement.  Work items = whole-wave body of
+  plain tiles + the last partial wave cut into K-slices (up to 16, one round, workspace
+  <= 64 MB); the slices of a tile reduce it among themselves inside the kernel (publish
+  the fp32 block with cp.async.bulk.wait_group 0 + fence.proxy.async.global +
+  fence.acq_rel.gpu, atom.acq_rel.gpu counter, spin with nanosleep, each slice sums its
+  own column slab, second count resets the counter; cached zero counters per device).
+  Split-K codes = body 0.  Lessons: the per-group thread index (tidx % 128) is wrong for
+  anything per tile under cooperative (two warpgroups) -> use the epilogue-group index;
+  a jit helper cannot return a tensor nor take a pointer-built smem tensor, so the output
+  epilogue is a helper taking partitions while the tail epilogue is inline; variables
+  used in both branches of a staged `if` must exist before it.  H100 table (C++ / DSL
+  us): und.q 30.5/30.4, 107.4/107.1, 210.9/210.9; und.kv 14.6/15.8 (+8%), 26.8/27.3,
+  43.9/44.0; gen.qkv 40.5/39.8, 138.5/140.0, 261.6/261.9; attn.out 35.6/35.5,
+  112.1/112.7, 221.2/224.8; gate_up 108.7/108.5, 340.3/334.1, 684.0/679.2; mlp.down
+  109.2/107.6, 331.3/331.2, 674.0/676.0.  mlp.down 8192 swings +0.3..+9% run to run: at
+  locked clocks (ncu) and with 5 iterations the two kernels are identical; the 200-
+  iteration run shows the DSL 10% slower -> a sustained-clock / power effect, not
+  kernel work.

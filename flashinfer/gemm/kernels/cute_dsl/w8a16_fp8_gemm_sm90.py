@@ -29,10 +29,13 @@ grouped order: consecutive work items take the weight tiles of one activation ti
 Work decomposition: the first ``body_items`` tiles are plain (whole K, output written
 by the epilogue); the tiles after them are the *tail*, each cut into ``tail_splits``
 K-slices that write fp32 partial tiles into a compact workspace (one tile_m x tile_a
-block per (tile, slice)), which ``W8A16Sm90TailReduce`` sums, scales, biases and casts.
-Split-K is body 0 (every tile split); the stream-K codes run the whole waves plain and
-split only the last partial wave, which fills the idle SMs at the cost of a small
-reduce instead of CUTLASS's stream-K fix-up.
+block per (tile, slice)).  The slices of a tile then reduce it among themselves: each
+CTA publishes its block, counts in on the tile's counter, waits for all slices and
+sums its own share of the tile's columns, applying scale and bias and casting into
+the output (the CUTLASS stream-K "separate reduction" shape; the slices of one tile
+run concurrently, so every CTA holds at most one tail item).  Split-K is body 0
+(every tile split); the stream-K codes run the whole waves plain and split only the
+last partial wave over the idle SMs.
 """
 
 import cuda.bindings.driver as cuda
@@ -43,7 +46,15 @@ import cutlass.utils as utils
 import cutlass.utils.hopper_helpers as sm90_utils
 from cutlass.cute.nvgpu import cpasync, warpgroup
 
-from .w8a16_fp8_gemm_sm100_utils import convert_e4m3_words, load_e4m3_unit
+from .w8a16_fp8_gemm_sm100_utils import (
+    atomic_add_acq_rel_gpu,
+    bulk_store_complete_fence,
+    convert_e4m3_words,
+    ld_acquire_gpu_s32,
+    load_e4m3_unit,
+    nanosleep,
+    st_relaxed_gpu_s32,
+)
 
 
 @cute.jit
@@ -219,6 +230,7 @@ class Sm90W8A16Fp8GemmKernel:
         bias: cute.Tensor,
         c: cute.Tensor,
         w: cute.Tensor,
+        counters: cute.Tensor,
         act_rows: cutlass.Int32,
         body_items: cutlass.Int32,
         tail_splits: cutlass.Int32,
@@ -310,6 +322,9 @@ class Sm90W8A16Fp8GemmKernel:
             tma_tensor_c,
             tma_atom_w,
             tma_tensor_w,
+            w,
+            c,
+            counters,
             scale,
             bias,
             act_rows,
@@ -340,6 +355,9 @@ class Sm90W8A16Fp8GemmKernel:
         mC_mnl: cute.Tensor,
         tma_atom_w: cute.CopyAtom,
         mW_mnl: cute.Tensor,
+        mW_plain: cute.Tensor,
+        mC_plain: cute.Tensor,
+        counters: cute.Tensor,
         scale: cute.Tensor,
         bias: cute.Tensor,
         act_rows: cutlass.Int32,
@@ -416,6 +434,25 @@ class Sm90W8A16Fp8GemmKernel:
         gB_nkl = cute.local_tile(mB_nkl, (tile_a, tile_k), (None, None, None))
         gC_mnl = cute.local_tile(mC_mnl, (tile_m, tile_a), (None, None, None))
         gW_mnl = cute.local_tile(mW_mnl, (tile_m, tile_a), (None, None, None))
+        # Fix-up views in 8-row vectors: the workspace (8, tile_m / 8, block columns),
+        # the output (8, weight rows / 8, activation rows) and the bias (8, rows / 8).
+        n_rows_total = cute.size(mC_plain.shape[0])
+        wv = cute.make_tensor(
+            mW_plain.iterator,
+            cute.make_layout(
+                (8, tile_m // 8, cute.size(mW_plain.shape[1])), stride=(1, 8, tile_m)
+            ),
+        )
+        cv = cute.make_tensor(
+            mC_plain.iterator,
+            cute.make_layout(
+                (8, n_rows_total // 8, cute.size(mC_plain.shape[1])),
+                stride=(1, 8, n_rows_total),
+            ),
+        )
+        bv = cute.make_tensor(
+            bias.iterator, cute.make_layout((8, n_rows_total // 8), stride=(1, 8))
+        )
 
         tAsA, tAgA = cpasync.tma_partition(
             tma_atom_a,
@@ -458,7 +495,7 @@ class Sm90W8A16Fp8GemmKernel:
                 )
                 lin = cutlass.Int32(bidx)
                 while lin < total_work:
-                    tile_idx, m_tile, n_tile, k_base, k_tile_cnt, is_tail = (
+                    tile_idx, m_tile, n_tile, k_base, k_tile_cnt, is_tail, _ = (
                         self._work_item(
                             lin,
                             body_items,
@@ -514,9 +551,14 @@ class Sm90W8A16Fp8GemmKernel:
                         gC_mnl,
                         tma_atom_w,
                         gW_mnl,
+                        wv,
+                        cv,
+                        bv,
+                        counters,
                         scale,
                         bias,
                         weight_rows,
+                        act_rows,
                         weight_tiles,
                         act_tiles,
                         k_tiles_total,
@@ -543,9 +585,14 @@ class Sm90W8A16Fp8GemmKernel:
                         gC_mnl,
                         tma_atom_w,
                         gW_mnl,
+                        wv,
+                        cv,
+                        bv,
+                        counters,
                         scale,
                         bias,
                         weight_rows,
+                        act_rows,
                         weight_tiles,
                         act_tiles,
                         k_tiles_total,
@@ -573,9 +620,14 @@ class Sm90W8A16Fp8GemmKernel:
                     gC_mnl,
                     tma_atom_w,
                     gW_mnl,
+                    wv,
+                    cv,
+                    bv,
+                    counters,
                     scale,
                     bias,
                     weight_rows,
+                    act_rows,
                     weight_tiles,
                     act_tiles,
                     k_tiles_total,
@@ -605,9 +657,14 @@ class Sm90W8A16Fp8GemmKernel:
         gC_mnl: cute.Tensor,
         tma_atom_w: cute.CopyAtom,
         gW_mnl: cute.Tensor,
+        wv: cute.Tensor,
+        cv: cute.Tensor,
+        bv: cute.Tensor,
+        counters: cute.Tensor,
         scale: cute.Tensor,
         bias: cute.Tensor,
         weight_rows: cutlass.Int32,
+        act_rows: cutlass.Int32,
         weight_tiles: cutlass.Int32,
         act_tiles: cutlass.Int32,
         k_tiles_total: cutlass.Int32,
@@ -732,7 +789,7 @@ class Sm90W8A16Fp8GemmKernel:
         order_phase = cutlass.Int32(1 - cg)
         if cutlass.const_expr(self.pingpong and cg == 1):
             # Skip the stages of the other group's first item (work item bidx).
-            _, _, _, _, k_skip0, _ = self._work_item(
+            _, _, _, _, k_skip0, _, _ = self._work_item(
                 cutlass.Int32(bidx),
                 body_items,
                 tail_splits,
@@ -747,14 +804,16 @@ class Sm90W8A16Fp8GemmKernel:
         tiles_done = cutlass.Int32(0)
         k_skip = cutlass.Int32(0)  # loop-carried: a stable type on every path
         while lin < total_work:
-            tile_idx, m_tile, n_tile, k_base, k_tile_cnt, is_tail = self._work_item(
-                lin,
-                body_items,
-                tail_splits,
-                k_tiles_total,
-                weight_tiles,
-                act_tiles,
-                group,
+            tile_idx, m_tile, n_tile, k_base, k_tile_cnt, is_tail, slice_idx = (
+                self._work_item(
+                    lin,
+                    body_items,
+                    tail_splits,
+                    k_tiles_total,
+                    weight_tiles,
+                    act_tiles,
+                    group,
+                )
             )
             if cutlass.const_expr(self.pingpong):
                 cute.arch.mbarrier_wait(order_bar + cg, order_phase)
@@ -839,7 +898,7 @@ class Sm90W8A16Fp8GemmKernel:
                 lin_other = lin + gdx
                 k_skip = cutlass.Int32(0)
                 if lin_other < total_work:
-                    _, _, _, _, k_cnt_other, _ = self._work_item(
+                    _, _, _, _, k_cnt_other, _, _ = self._work_item(
                         lin_other,
                         body_items,
                         tail_splits,
@@ -913,6 +972,24 @@ class Sm90W8A16Fp8GemmKernel:
                                 tma_store_pipeline.producer_commit()
                                 tma_store_pipeline.producer_acquire()
                             epi_barrier.arrive_and_wait()
+                    self._tail_fixup(
+                        1 + cg,
+                        tile_idx - body_items,
+                        slice_idx,
+                        tail_splits,
+                        m_tile,
+                        n_tile,
+                        act_rows,
+                        weight_rows,
+                        wv,
+                        cv,
+                        bv,
+                        counters,
+                        scale,
+                        warp_idx,
+                        epi_store_warp,
+                        ctid,
+                    )
                 else:
                     self._epilogue_output(
                         1 + cg,
@@ -969,6 +1046,86 @@ class Sm90W8A16Fp8GemmKernel:
             tiles_done += 1
             lin += work_step
         tma_store_pipeline.producer_tail()
+
+    # ---------------------------------------------------------- tail fix-up
+    @cute.jit
+    def _tail_fixup(
+        self,
+        barrier_id: cutlass.Constexpr,
+        tail_tile: cutlass.Int32,
+        slice_idx: cutlass.Int32,
+        tail_splits: cutlass.Int32,
+        m_tile: cutlass.Int32,
+        n_tile: cutlass.Int32,
+        act_rows: cutlass.Int32,
+        weight_rows: cutlass.Int32,
+        wv: cute.Tensor,
+        cv: cute.Tensor,
+        bv: cute.Tensor,
+        counters: cute.Tensor,
+        scale: cute.Tensor,
+        warp_idx: cutlass.Int32,
+        epi_store_warp: cutlass.Constexpr,
+        etid: cutlass.Int32,
+    ):
+        """After this CTA's partial block of tail tile ``tail_tile`` is stored: publish
+        it (bulk stores complete, release), count in on the tile's counter, wait for
+        the tile's ``tail_splits`` slices, then reduce this slice's share of the tile's
+        activation columns over all blocks, apply scale and bias and store the 16-bit
+        output.  A second count by every slice lets the last one reset the counter."""
+        tile_m, tile_a, _ = self.tile_shape_mnk
+        epi_barrier = pipeline.NamedBarrier(
+            barrier_id=barrier_id, num_threads=self.num_epi_threads
+        )
+        counter_addr = counters.iterator.toint() + tail_tile * 4
+        # ``etid``: the thread's index within the tile's epilogue group (both consumer
+        # warpgroups under cooperative, its own under ping-pong).
+        if warp_idx == epi_store_warp:
+            bulk_store_complete_fence()
+        epi_barrier.arrive_and_wait()
+        if etid == 0:
+            atomic_add_acq_rel_gpu(counter_addr, cutlass.Int32(1))
+            seen = ld_acquire_gpu_s32(counter_addr)
+            while seen < tail_splits:
+                nanosleep(64)
+                seen = ld_acquire_gpu_s32(counter_addr)
+        epi_barrier.arrive_and_wait()
+
+        # This slice's columns: [slice * q + min(slice, rem), ...), q = tile_a / splits.
+        q = tile_a // tail_splits
+        rem = tile_a % tail_splits
+        col_begin = slice_idx * q + cutlass.min(slice_idx, rem)
+        col_cnt = q
+        if slice_idx < rem:
+            col_cnt = q + 1
+        vecs_per_col = tile_m // 8
+        block0 = tail_tile * tail_splits
+        scale_val = cutlass.Float32(scale[0])
+        act_base = n_tile * tile_a
+        w_base = m_tile * tile_m
+        items = col_cnt * vecs_per_col
+        for it in cutlass.range(etid, items, self.num_epi_threads, unroll=1):
+            col = col_begin + it // vecs_per_col
+            rvec = it % vecs_per_col
+            act_row = act_base + col
+            w_row = w_base + rvec * 8
+            if act_row < act_rows:
+                if w_row < weight_rows:
+                    acc = wv[(None, rvec, block0 * tile_a + col)].load()
+                    for sl in cutlass.range(1, tail_splits, 1, unroll=1):
+                        acc = (
+                            acc + wv[(None, rvec, (block0 + sl) * tile_a + col)].load()
+                        )
+                    acc = scale_val * acc
+                    if cutlass.const_expr(self.has_bias):
+                        acc = acc + bv[(None, w_row // 8)].load().to(cutlass.Float32)
+                    cv[(None, w_row // 8, act_row)].store(acc.to(cv.element_type))
+
+        epi_barrier.arrive_and_wait()
+        if etid == 0:
+            prev = atomic_add_acq_rel_gpu(counter_addr, cutlass.Int32(1))
+            if prev == 2 * tail_splits - 1:
+                st_relaxed_gpu_s32(counter_addr, cutlass.Int32(0))
 
     # ------------------------------------------------------- output epilogue
     @cute.jit
@@ -1075,7 +1232,7 @@ class Sm90W8A16Fp8GemmKernel:
         if slice_idx < rem:
             k_cnt = q + 1
         m_tile, n_tile = grouped_tile_at(tile_idx, weight_tiles, act_tiles, group)
-        return tile_idx, m_tile, n_tile, k_base, k_cnt, is_tail
+        return tile_idx, m_tile, n_tile, k_base, k_cnt, is_tail, slice_idx
 
     # Plain (trace-time) methods: they emit ops inline at the call site.
     def _a_loads(self, kb: int, stage_addr, a_unit_off: list) -> list:
@@ -1098,6 +1255,7 @@ class Sm90W8A16Fp8GemmKernel:
         bias_ptr: cute.Pointer,
         output_ptr: cute.Pointer,
         workspace_ptr: cute.Pointer,
+        counters_ptr: cute.Pointer,
         n: cutlass.Int64,
         m: cutlass.Int64,
         k: cutlass.Int64,
@@ -1110,7 +1268,8 @@ class Sm90W8A16Fp8GemmKernel:
         """Weight [n, k] fp8 and activation [m, k] 16-bit, K-major; out [m, n] row-major
         is C[n, m, 1].  The workspace holds ``tail_blocks`` fp32 tiles of
         (tile_m, tile_a), one per tail work item, as W[tile_m, tail_blocks * tile_a, 1]
-        (weight rows contiguous, as C)."""
+        (weight rows contiguous, as C); ``counters`` are the tail tiles' int32 arrival
+        counters (zero on entry, left zero)."""
         tile_m, tile_a, _ = self.tile_shape_mnk
         weight = cute.make_tensor(
             weight_ptr, cute.make_ordered_layout((n, k, 1), order=(1, 0, 2))
@@ -1127,6 +1286,7 @@ class Sm90W8A16Fp8GemmKernel:
                 (tile_m, tail_blocks * tile_a, 1), order=(0, 1, 2)
             ),
         )
+        counters = cute.make_tensor(counters_ptr, cute.make_layout((tail_blocks,)))
         scale = cute.make_tensor(scale_ptr, cute.make_layout((1,)))
         bias = cute.make_tensor(bias_ptr, cute.make_layout((n,)))
         return self(
@@ -1136,6 +1296,7 @@ class Sm90W8A16Fp8GemmKernel:
             bias,
             output,
             workspace,
+            counters,
             cutlass.Int32(m),
             body_items,
             tail_splits,
