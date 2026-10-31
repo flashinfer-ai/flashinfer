@@ -104,9 +104,14 @@
 // Hook-enabled epilogue copy + the subtile-hook helpers the kernel below threads
 // through the store loop.
 #include "flashinfer/gemm/nvfp4_svdquant_gemm_epilogue_sm120.h"
+#include "flashinfer/gemm/svdquant_quantize_barrier_sm120.cuh"
 
 namespace cutlass::gemm::collective {
 using namespace cute;
+
+#ifndef SVDQ_SM120_LORA_LDSM
+#define SVDQ_SM120_LORA_LDSM 1
+#endif
 
 namespace svdquant_sm120_detail {
 
@@ -132,6 +137,19 @@ struct MaybeLoRaSmemSwizzle {
 template <class Layout>
 struct MaybeLoRaSmemSwizzle<true, Layout> {
   using type = decltype(cute::composition(cute::Swizzle<3, 3, 3>{}, Layout{}));
+};
+
+// K128 stages hold 64-byte bf16 rows: the TMA 64-byte swizzle (bytes
+// Swizzle<2,4,3>, bf16 Swizzle<2,3,3>) makes eight consecutive rows of one
+// 16-byte column land in eight distinct bank quads, so ldmatrix is conflict-free.
+template <bool Enable, class Layout>
+struct MaybeLoRaSmemSwizzle64 {
+  using type = Layout;
+};
+
+template <class Layout>
+struct MaybeLoRaSmemSwizzle64<true, Layout> {
+  using type = decltype(cute::composition(cute::Swizzle<2, 3, 3>{}, Layout{}));
 };
 
 }  // namespace svdquant_sm120_detail
@@ -369,7 +387,12 @@ struct CollectiveMmaLoRaSm120 {
   static constexpr int LoRaStorageK =
       static_cast<int>(size<2>(TileShape{}) * sizeof_bits<ElementA>::value /
                        sizeof_bits<cutlass::bfloat16_t>::value);
-  static_assert(LoRaStorageK >= LoRaK, "one stage must hold at least the rank tile");
+  // A rank wider than one stage is staged as LoRaChunks consecutive stage-wide chunks,
+  // each one more byte-exact producer step after the residual K-loop. Rank <= stage width
+  // keeps the original single step (LoRaChunkK == LoRaK, LoRaChunks == 1).
+  static constexpr int LoRaChunkK = LoRaK < LoRaStorageK ? LoRaK : LoRaStorageK;
+  static constexpr int LoRaChunks = LoRaK / LoRaChunkK;
+  static_assert(LoRaK % LoRaChunkK == 0, "the rank must be a whole number of stage-wide chunks");
 
   static constexpr int AStageBf16Elems = static_cast<int>(
       cutlass::bits_to_bytes(size(take<0, 2>(SmemLayoutA{})) * sizeof_bits<ElementA>::value) /
@@ -401,34 +424,52 @@ struct CollectiveMmaLoRaSm120 {
 
   static constexpr bool EnableLoRaSmemSwizzle = Row80ProductionTraits_;
   static constexpr bool UseRow80SideSlot = UseDedicatedLoRaTma && Row80ProductionTraits_;
-  static constexpr bool UseLoRaSmemSwizzle =
-      EnableLoRaSmemSwizzle &&
-      (LoRaPath_ == Sm120LoRaPath::kByteExactMainloop || UseRow80SideSlot) && LoRaStorageK == 64;
+  // K256 stages hold 128-byte bf16 rows. Where a whole 64-column chunk is folded (rank 64
+  // and up), mma_lora reads it with ldmatrix through the 128-byte swizzle the row80
+  // production path already uses, avoiding bank conflicts in the LoRA loads.
+  // Row80 keeps its own layout and copies.
+  static constexpr bool UseLoRaSmemLdsm128 = SVDQ_SM120_LORA_LDSM && !Row80ProductionTraits_ &&
+                                             LoRaPath_ == Sm120LoRaPath::kByteExactMainloop &&
+                                             LoRaStorageK == 64 && LoRaChunkK == 64;
+  static constexpr bool UseLoRaSmemSwizzle128 =
+      (EnableLoRaSmemSwizzle &&
+       (LoRaPath_ == Sm120LoRaPath::kByteExactMainloop || UseRow80SideSlot) &&
+       LoRaStorageK == 64) ||
+      UseLoRaSmemLdsm128;
+  // Multi-chunk ranks on K128 stages (rank 64 and up) fold LoRaChunks stage-wide
+  // chunks in mma_lora. Their 64-byte rows are read with ldmatrix through a
+  // 64-byte swizzle to avoid bank conflicts in the tail. Single-chunk
+  // (rank-32) builds keep their layout and copies.
+  static constexpr bool UseLoRaSmemSwizzle64 = SVDQ_SM120_LORA_LDSM &&
+                                               LoRaPath_ == Sm120LoRaPath::kByteExactMainloop &&
+                                               LoRaStorageK == 32 && LoRaChunks > 1;
+  static constexpr bool UseLoRaSmemSwizzle = UseLoRaSmemSwizzle128 || UseLoRaSmemSwizzle64;
   // Row80ProductionTraits_ is the production-row80 selector passed by the driver.
   // Keep the bias prefetch tied to that exact tactic instead of the optional
   // build-wide swizzle diagnostic above.
   static constexpr bool UseRow80BiasPrefetch = Row80ProductionTraits_;
-  using SmemLayoutD = typename svdquant_sm120_detail::MaybeLoRaSmemSwizzle<UseLoRaSmemSwizzle,
-                                                                           SmemLayoutDLinear>::type;
-  using SmemLayoutL1 =
-      typename svdquant_sm120_detail::MaybeLoRaSmemSwizzle<UseLoRaSmemSwizzle,
-                                                           SmemLayoutL1Linear>::type;
+  using SmemLayoutD = typename svdquant_sm120_detail::MaybeLoRaSmemSwizzle64<
+      UseLoRaSmemSwizzle64, typename svdquant_sm120_detail::MaybeLoRaSmemSwizzle<
+                                UseLoRaSmemSwizzle128, SmemLayoutDLinear>::type>::type;
+  using SmemLayoutL1 = typename svdquant_sm120_detail::MaybeLoRaSmemSwizzle64<
+      UseLoRaSmemSwizzle64, typename svdquant_sm120_detail::MaybeLoRaSmemSwizzle<
+                                UseLoRaSmemSwizzle128, SmemLayoutL1Linear>::type>::type;
 
   // Rank-32 payload view of the same overlay: K extent LoRaK, row stride kept at
   // LoRaStorageK so rows still hop over the TMA zero-filled tail columns. Where
   // LoRaStorageK == LoRaK (K128 stages) these collapse to SmemLayoutD/L1 exactly.
   using SmemLayoutDPayloadLinear = decltype(make_layout(
-      make_shape(shape<0>(TileShape{}), Int<LoRaK>{}, Int<DispatchPolicy::Stages>{}),
+      make_shape(shape<0>(TileShape{}), Int<LoRaChunkK>{}, Int<DispatchPolicy::Stages>{}),
       make_stride(Int<LoRaStorageK>{}, Int<1>{}, Int<AStageBf16Elems>{})));
   using SmemLayoutL1PayloadLinear = decltype(make_layout(
-      make_shape(shape<1>(TileShape{}), Int<LoRaK>{}, Int<DispatchPolicy::Stages>{}),
+      make_shape(shape<1>(TileShape{}), Int<LoRaChunkK>{}, Int<DispatchPolicy::Stages>{}),
       make_stride(Int<LoRaStorageK>{}, Int<1>{}, Int<BStageBf16Elems>{})));
-  using SmemLayoutDPayload =
-      typename svdquant_sm120_detail::MaybeLoRaSmemSwizzle<UseLoRaSmemSwizzle,
-                                                           SmemLayoutDPayloadLinear>::type;
-  using SmemLayoutL1Payload =
-      typename svdquant_sm120_detail::MaybeLoRaSmemSwizzle<UseLoRaSmemSwizzle,
-                                                           SmemLayoutL1PayloadLinear>::type;
+  using SmemLayoutDPayload = typename svdquant_sm120_detail::MaybeLoRaSmemSwizzle64<
+      UseLoRaSmemSwizzle64, typename svdquant_sm120_detail::MaybeLoRaSmemSwizzle<
+                                UseLoRaSmemSwizzle128, SmemLayoutDPayloadLinear>::type>::type;
+  using SmemLayoutL1Payload = typename svdquant_sm120_detail::MaybeLoRaSmemSwizzle64<
+      UseLoRaSmemSwizzle64, typename svdquant_sm120_detail::MaybeLoRaSmemSwizzle<
+                                UseLoRaSmemSwizzle128, SmemLayoutL1PayloadLinear>::type>::type;
 
   static_assert(cosize_v<SmemLayoutD> == cosize_v<SmemLayoutDLinear>,
                 "D swizzle must preserve the byte-exact stage overlay size");
@@ -470,15 +511,17 @@ struct CollectiveMmaLoRaSm120 {
   using SmemLayoutDConsume = SmemLayoutDPayload;
   using SmemLayoutL1Consume = SmemLayoutL1Payload;
 
-  // The storage-width fallback's tail MMAs over the TMA zero-filled columns
-  // compute acc = acc + 0 on every lane, which canonicalizes an exactly -0.0
-  // accumulator lane to +0.0. The payload view skips those MMAs, so the same
-  // additive identity is applied explicitly to keep the output bit pattern
-  // identical to the fallback's on every valid input. K128 stages have no
-  // skipped columns and need nothing.
+  /**
+   * @brief The storage-width fallback's tail MMAs over the TMA zero-filled columns
+   * compute acc = acc + 0 on every lane, which canonicalizes an exactly -0.0
+   * accumulator lane to +0.0. The payload view skips those MMAs, so the same
+   * additive identity is applied explicitly to keep the output bit pattern
+   * identical to the fallback's on every valid input. K128 stages have no
+   * skipped columns and need nothing.
+   */
   template <class FrgTensorAcc>
   CUTLASS_DEVICE static void canonicalize_lora_tail_zeros(FrgTensorAcc&& accum) {
-    if constexpr (LoRaStorageK != LoRaK) {
+    if constexpr (LoRaStorageK != LoRaChunkK) {
       CUTLASS_PRAGMA_UNROLL
       for (int i = 0; i < cute::size(accum); ++i) {
         accum(i) = accum(i) + 0.0f;
@@ -619,9 +662,9 @@ struct CollectiveMmaLoRaSm120 {
   static_assert(cosize_v<SmemLayoutL1> <= cosize_v<SmemLayoutB>,
                 "L1 overlay must end at or before the end of smem_B");
   // Each true-rank tile must fit inside one residual stage.
-  static_assert(size<0>(TileShape{}) * LoRaK <= AStageBf16Elems,
+  static_assert(UseDedicatedLoRaTma || size<0>(TileShape{}) * LoRaChunkK <= AStageBf16Elems,
                 "the true-rank D tile must fit at a residual A stage base");
-  static_assert(size<1>(TileShape{}) * LoRaK <= BStageBf16Elems,
+  static_assert(UseDedicatedLoRaTma || size<1>(TileShape{}) * LoRaChunkK <= BStageBf16Elems,
                 "the true-rank L1 tile must fit at a residual B stage base");
 
   using TensorStorage = typename SharedStorage::TensorStorage;
@@ -673,6 +716,9 @@ struct CollectiveMmaLoRaSm120 {
     int inline_down_m{0};
     int inline_down_k{0};
     bool inline_down_wait_on_n{false};
+    // The fused linear route publishes XQ/SF through this barrier. The producer
+    // acquires it before loading A and waits for the prefix grid before LoRA-down.
+    flashinfer::gemm::SvdquantQuantizeBarrierSm120 quantize_barrier{};
   };
 
   // Device side kernel params
@@ -758,12 +804,16 @@ struct CollectiveMmaLoRaSm120 {
     int inline_down_m = 0;
     int inline_down_k = 0;
     bool inline_down_wait_on_n = false;
+    flashinfer::gemm::SvdquantQuantizeBarrierSm120 quantize_barrier{};
   };
 
   //
   // Methods
   //
 
+  /**
+   * @brief Build mainloop layouts and TMA descriptors, carrying the optional prefix barrier.
+   */
   template <class ProblemShape>
   static constexpr Params to_underlying_arguments(ProblemShape const& problem_shape,
                                                   Arguments const& args, void* workspace) {
@@ -831,6 +881,7 @@ struct CollectiveMmaLoRaSm120 {
     params.inline_down_m = args.inline_down_m;
     params.inline_down_k = args.inline_down_k;
     params.inline_down_wait_on_n = args.inline_down_wait_on_n;
+    params.quantize_barrier = args.quantize_barrier;
     if constexpr (UseLoRaPipeline) {
       auto tensor_d_dedicated = cute::recast<LoRaDedicatedTmaInternalElement>(tensor_d);
       auto tensor_l1_dedicated = cute::recast<LoRaDedicatedTmaInternalElement>(tensor_l1);
@@ -1172,9 +1223,11 @@ struct CollectiveMmaLoRaSm120 {
     }
   }
 
-  /// Producer perspective. `do_lora` appends ONE extra D/L1 pipeline step after the
-  /// residual K-loop; the kernel passes compute_epilogue(work_tile_info) so exactly the
-  /// epilogue-owning work unit produces (and later consumes) the LoRA stage.
+  /**
+   * @brief Producer perspective. `do_lora` appends ONE extra D/L1 pipeline step after the
+   * residual K-loop; the kernel passes compute_epilogue(work_tile_info) so exactly the
+   * epilogue-owning work unit produces (and later consumes) the LoRA stage.
+   */
   template <class TensorA, class TensorB, class TensorSFA, class TensorSFB, class TensorD,
             class TensorL1, class KTileIterator, class BlockCoord>
   CUTLASS_DEVICE void load(
@@ -1223,8 +1276,8 @@ struct CollectiveMmaLoRaSm120 {
       Tensor gB = gB_nkl(_, _, n_coord, _, l_coord);
       Tensor gSFA = gSFA_mkl(_, _, broadcast_m(m_coord), _, l_coord);
       Tensor gSFB = gSFB_nkl(_, _, broadcast_n(n_coord), _, l_coord);
-      Tensor gD = gD_mkl(_, _, m_coord, Int<0>{}, l_coord);
-      Tensor gL1 = gL1_nkl(_, _, n_coord, Int<0>{}, l_coord);
+      Tensor gD = gD_mkl(_, _, m_coord, _, l_coord);    // (BLK_M, chunk K, chunks)
+      Tensor gL1 = gL1_nkl(_, _, n_coord, _, l_coord);  // (BLK_N, chunk K, chunks)
 
       Tensor tAgA = block_tma_a.partition_S(gA);
       Tensor tAsA = block_tma_a.partition_D(sA);
@@ -1275,37 +1328,49 @@ struct CollectiveMmaLoRaSm120 {
         if constexpr (CompileInlineDown) {
           wait_for_inline_lora_down(params, m_coord, n_coord);
         }
+        if (params.quantize_barrier.counter != nullptr) {
+          // LoRA-down is the one prefix output still in flight; see the producer.
+          cutlass::arch::wait_on_dependent_grids();
+        }
         if constexpr (UseRow80BiasPrefetch) {
           if (params.ptr_bias != nullptr) {
             auto const* bias_tile = params.ptr_bias + int(m_coord) * int(size<0>(TileShape{}));
             asm volatile("prefetch.global.L1 [%0];" ::"l"(bias_tile));
           }
         }
-        pipeline.producer_acquire(smem_pipe_write);
+        // One byte-exact step per stage-wide rank chunk, consumed in the same order.
+        CUTLASS_PRAGMA_UNROLL
+        for (int chunk = 0; chunk < LoRaChunks; ++chunk) {
+          pipeline.producer_acquire(smem_pipe_write);
 
-        using BarrierType = typename MainloopPipeline::ProducerBarrierType;
-        BarrierType* tma_barrier = pipeline.producer_get_barrier(smem_pipe_write);
+          using BarrierType = typename MainloopPipeline::ProducerBarrierType;
+          BarrierType* tma_barrier = pipeline.producer_get_barrier(smem_pipe_write);
 
-        int write_stage = smem_pipe_write.index();
-        copy(params.tma_load_sfa.with(*tma_barrier), tAgSFA(_, _, _, Int<0>{}),
-             tAsSFA(_, _, _, write_stage));
-        copy(params.tma_load_sfb.with(*tma_barrier), tBgSFB(_, _, _, Int<0>{}),
-             tBsSFB(_, _, _, write_stage));
-        copy(params.tma_load_d.with(*tma_barrier), tDgD, tDsD(_, _, _, write_stage));
-        copy(params.tma_load_l1.with(*tma_barrier), tL1gL1, tL1sL1(_, _, _, write_stage));
+          int write_stage = smem_pipe_write.index();
+          copy(params.tma_load_sfa.with(*tma_barrier), tAgSFA(_, _, _, Int<0>{}),
+               tAsSFA(_, _, _, write_stage));
+          copy(params.tma_load_sfb.with(*tma_barrier), tBgSFB(_, _, _, Int<0>{}),
+               tBsSFB(_, _, _, write_stage));
+          copy(params.tma_load_d.with(*tma_barrier), tDgD(_, _, _, chunk),
+               tDsD(_, _, _, write_stage));
+          copy(params.tma_load_l1.with(*tma_barrier), tL1gL1(_, _, _, chunk),
+               tL1sL1(_, _, _, write_stage));
 
-        ++smem_pipe_write;
+          ++smem_pipe_write;
+        }
       }
     }
     __syncwarp();
   }
 
-  /// Producer perspective for the dedicated LoRA policy. The
-  /// residual K-loop is unchanged and its pipeline state never accounts for LoRA. For the
-  /// epilogue-owning work unit the producer acquires the one-slot LoRA pipeline and issues
-  /// exactly two true-rank TMAs (D, then L1) against its full barrier.
-  /// The slot is acquired after the residual enqueues so a still-busy slot never
-  /// blocks this unit's residual prefetch.
+  /**
+   * @brief Producer perspective for the dedicated LoRA policy. The
+   * residual K-loop is unchanged and its pipeline state never accounts for LoRA. For the
+   * epilogue-owning work unit the producer acquires the one-slot LoRA pipeline and issues
+   * exactly two true-rank TMAs (D, then L1) against its full barrier.
+   * The slot is acquired after the residual enqueues so a still-busy slot never
+   * blocks this unit's residual prefetch.
+   */
   template <class TensorA, class TensorB, class TensorSFA, class TensorSFB, class TensorD,
             class TensorL1, class KTileIterator, class BlockCoord>
   CUTLASS_DEVICE void load(
@@ -1397,6 +1462,10 @@ struct CollectiveMmaLoRaSm120 {
       if (do_lora) {
         if constexpr (CompileInlineDown) {
           wait_for_inline_lora_down(params, m_coord, n_coord);
+        }
+        if (params.quantize_barrier.counter != nullptr) {
+          // LoRA-down is the one prefix output still in flight; see the producer.
+          cutlass::arch::wait_on_dependent_grids();
         }
         if constexpr (UseRow80BiasPrefetch) {
           if (params.ptr_bias != nullptr) {
@@ -1608,9 +1677,11 @@ struct CollectiveMmaLoRaSm120 {
     });
   }
 
-  /// Consume the LoRA stage: rank-32 bf16 D@L1^T added into the SAME accumulator fragment.
-  /// Called by the kernel AFTER TileScheduler::fixup (accumulator fully reduced) and before
-  /// the epilogue, only by the epilogue-owning work unit; consumes exactly one stage.
+  /**
+   * @brief Consume all BF16 LoRA rank chunks into the residual accumulator fragment.
+   * Called after TileScheduler::fixup and before the epilogue, only by the
+   * epilogue-owning work unit; consumes one stage per rank chunk.
+   */
   template <class FrgTensorC>
   CUTLASS_DEVICE void mma_lora(MainloopPipeline pipeline, PipelineState smem_pipe_read,
                                FrgTensorC& accum, int thread_idx, TensorStorage& shared_tensors) {
@@ -1631,14 +1702,17 @@ struct CollectiveMmaLoRaSm120 {
     Tensor tCrD = thread_lora.partition_fragment_A(sD(_, _, Int<0>{}));    // (MMA,MMA_M,MMA_K)
     Tensor tCrL1 = thread_lora.partition_fragment_B(sL1(_, _, Int<0>{}));  // (MMA,MMA_N,MMA_K)
 
-    auto smem_tiled_copy_D = make_tiled_copy_A(
-        Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<32>, cutlass::bfloat16_t>{}, lora_mma);
+    using LoRaSmemCopyOp =
+        cute::conditional_t<UseLoRaSmemSwizzle64 || UseLoRaSmemLdsm128, SM75_U32x4_LDSM_N,
+                            AutoVectorizingCopyWithAssumedAlignment<32>>;
+    auto smem_tiled_copy_D =
+        make_tiled_copy_A(Copy_Atom<LoRaSmemCopyOp, cutlass::bfloat16_t>{}, lora_mma);
     auto smem_thr_copy_D = smem_tiled_copy_D.get_thread_slice(thread_idx);
     Tensor tCsD = smem_thr_copy_D.partition_S(sD);
     Tensor tCrD_copy_view = smem_thr_copy_D.retile_D(tCrD);
 
-    auto smem_tiled_copy_L1 = make_tiled_copy_B(
-        Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<32>, cutlass::bfloat16_t>{}, lora_mma);
+    auto smem_tiled_copy_L1 =
+        make_tiled_copy_B(Copy_Atom<LoRaSmemCopyOp, cutlass::bfloat16_t>{}, lora_mma);
     auto smem_thr_copy_L1 = smem_tiled_copy_L1.get_thread_slice(thread_idx);
     Tensor tCsL1 = smem_thr_copy_L1.partition_S(sL1);
     Tensor tCrL1_copy_view = smem_thr_copy_L1.retile_D(tCrL1);
@@ -1646,22 +1720,29 @@ struct CollectiveMmaLoRaSm120 {
     CUTE_STATIC_ASSERT_V(size<1>(tCrD) == size<1>(accum));   // MMA_M
     CUTE_STATIC_ASSERT_V(size<1>(tCrL1) == size<2>(accum));  // MMA_N
 
-    pipeline.consumer_wait(smem_pipe_read);
-    int read_stage = smem_pipe_read.index();
+    // One stage per rank chunk, in producer order. Each chunk's fragments are folded and
+    // its stage released before the next is staged, so register pressure stays at one
+    // chunk regardless of the rank.
+    CUTLASS_PRAGMA_UNROLL
+    for (int chunk = 0; chunk < LoRaChunks; ++chunk) {
+      pipeline.consumer_wait(smem_pipe_read);
+      int read_stage = smem_pipe_read.index();
 
-    copy(smem_tiled_copy_D, tCsD(_, _, _, read_stage), tCrD_copy_view);
-    copy(smem_tiled_copy_L1, tCsL1(_, _, _, read_stage), tCrL1_copy_view);
+      copy(smem_tiled_copy_D, tCsD(_, _, _, read_stage), tCrD_copy_view);
+      copy(smem_tiled_copy_L1, tCsL1(_, _, _, read_stage), tCrL1_copy_view);
 
-    // mma.sync accumulates C += A*B; the residual product is already in `accum`.
-    auto LORA_K_BLOCK_MAX = size<2>(tCrD);
-    for_each(make_int_sequence<LORA_K_BLOCK_MAX>{}, [&](auto k_block) {
-      cute::gemm(lora_mma, tCrD(_, _, k_block), tCrL1(_, _, k_block), accum);
-    });
+      // mma.sync accumulates C += A*B; the residual product is already in `accum`.
+      auto LORA_K_BLOCK_MAX = size<2>(tCrD);
+      for_each(make_int_sequence<LORA_K_BLOCK_MAX>{}, [&](auto k_block) {
+        cute::gemm(lora_mma, tCrD(_, _, k_block), tCrL1(_, _, k_block), accum);
+      });
+
+      cutlass::arch::NamedBarrier::sync(thr_size(TiledMma{}),
+                                        cutlass::arch::ReservedNamedBarriers::Sm120MainloopBarrier);
+      pipeline.consumer_release(smem_pipe_read);
+      ++smem_pipe_read;
+    }
     canonicalize_lora_tail_zeros(accum);
-
-    cutlass::arch::NamedBarrier::sync(thr_size(TiledMma{}),
-                                      cutlass::arch::ReservedNamedBarriers::Sm120MainloopBarrier);
-    pipeline.consumer_release(smem_pipe_read);
   }
 
   /// Epilogue-overlapped consumption of the byte-exact LoRA stage, split into two phases:
@@ -2156,6 +2237,10 @@ class GemmUniversalLoRaSm120 {
 
   static dim3 get_block_shape() { return dim3(MaxThreadsPerBlock, 1, 1); }
 
+  /**
+   * @brief Execute persistent residual GEMM work and add LoRA after split-K reduction.
+   * Only the epilogue-owning work unit consumes the LoRA stages and writes output.
+   */
   CUTLASS_DEVICE
   void operator()(Params const& params, char* smem_buf) {
     using namespace cute;
@@ -2434,7 +2519,15 @@ class GemmUniversalLoRaSm120 {
 
       // Mainloop Producer Warp
       else if (producer_warp_role == ProducerWarpRole::Mainloop) {
-        cutlass::arch::wait_on_dependent_grids();
+        if (params.mainloop.quantize_barrier.counter != nullptr) {
+          // Acquire the quantize CTAs' stores before the generic-to-async proxy
+          // fence. Launch completion alone does not make XQ/SF visible. load()
+          // still waits for the prefix grid before reading LoRA-down through TMA.
+          params.mainloop.quantize_barrier.wait();
+          asm volatile("fence.proxy.async.global;" ::: "memory");
+        } else {
+          cutlass::arch::wait_on_dependent_grids();
+        }
         bool do_load_order_arrive = true;
         bool requires_clc_query = true;
         while (work_tile_info.is_valid()) {
@@ -2479,7 +2572,8 @@ class GemmUniversalLoRaSm120 {
                 blk_coord, k_tile_iter, work_k_tile_count, lane_idx, block_rank_in_cluster,
                 shared_storage.tensors.mainloop, do_lora);
             // Update starting pipeline state for the next tile (+1 for the LoRA stage).
-            mainloop_pipe_producer_state.advance(work_k_tile_count + (do_lora ? 1 : 0));
+            mainloop_pipe_producer_state.advance(work_k_tile_count +
+                                                 (do_lora ? CollectiveMainloop::LoRaChunks : 0));
           }
 
           if (do_load_order_arrive) {
@@ -2592,7 +2686,10 @@ class GemmUniversalLoRaSm120 {
         // hook does not cover (big-tile configs that keep the builder epilogue,
         // reduction subtiles - unused by our schedulers - and the dedicated pipeline).
         bool lora_in_epilogue = false;
+        // A multi-chunk rank keeps the serial fold: the overlap path holds every chunk's
+        // fragments in registers through the epilogue.
         if constexpr ((!UseDedicatedLoRaTma || UseRow80SideSlot) &&
+                      CollectiveMainloop::LoRaChunks == 1 &&
                       flashinfer::gemm::svdquant_sm120::is_sm120_lora_hooked_epilogue_v<
                           CollectiveEpilogue>) {
           lora_in_epilogue =
@@ -2610,7 +2707,7 @@ class GemmUniversalLoRaSm120 {
             collective_mainloop.mma_lora(mainloop_pipeline, mainloop_pipe_consumer_state,
                                          accumulators, mma_thread_idx,
                                          shared_storage.tensors.mainloop);
-            mainloop_pipe_consumer_state.advance(1);
+            mainloop_pipe_consumer_state.advance(CollectiveMainloop::LoRaChunks);
           }
         }
 

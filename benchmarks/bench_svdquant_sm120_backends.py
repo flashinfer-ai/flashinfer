@@ -132,6 +132,11 @@ def run_operation(
     env: Environment,
     stream: TextIO,
 ) -> None:
+    """Tune and compare one workload, then write its accuracy and timing record.
+
+    The first configured backend supplies the accuracy reference. Trials rotate
+    backend order; all tuning and output checks finish before timed sampling.
+    """
     calls = {
         backend: make_call(case, operation, backend, options.enable_pdl)
         for backend in BACKENDS
@@ -147,8 +152,11 @@ def run_operation(
         torch.cuda.synchronize()
         tuning_time_s[backend] = time.perf_counter() - tuning_started
     with tuning_context(policy, tuning=False):
-        accuracy = compare_outputs(calls["cute-dsl"](), calls["cutlass-sm120"]())
-        auto_accuracy = compare_outputs(calls["cute-dsl"](), calls["auto"]())
+        reference = calls[BACKENDS[0]]()
+        accuracies = {
+            backend: asdict(compare_outputs(reference, calls[backend]()))
+            for backend in BACKENDS[1:]
+        }
         graph_calls = (
             1
             if options.cold_l2
@@ -233,15 +241,25 @@ def run_operation(
             "repeat_ms": options.repeat_ms,
             "trial_order": orders,
             "trial_windows": trial_windows,
-            "accuracy": asdict(accuracy),
-            "auto_accuracy": asdict(auto_accuracy),
+            "backends": list(BACKENDS),
+            "accuracy": accuracies,
             "samples_us": samples,
             "trial_medians_us": trial_medians,
             "median_us": medians,
-            "cutlass_speedup": medians["cute-dsl"] / medians["cutlass-sm120"],
-            "auto_over_best_explicit": medians["auto"]
-            / min(medians["cute-dsl"], medians["cutlass-sm120"]),
+            "speedup_vs_reference": {
+                backend: medians[BACKENDS[0]] / medians[backend]
+                for backend in BACKENDS[1:]
+            },
         }
+        # The CUTLASS-vs-CuTe-DSL and auto-selection summaries, when measured.
+        if {"cute-dsl", "cutlass-sm120"} <= medians.keys():
+            record["cutlass_speedup"] = medians["cute-dsl"] / medians["cutlass-sm120"]
+            if "auto" in medians:
+                record["auto_over_best_explicit"] = medians["auto"] / min(
+                    medians["cute-dsl"], medians["cutlass-sm120"]
+                )
+        if "auto" in accuracies:
+            record["auto_accuracy"] = accuracies["auto"]
         stream.write(json.dumps(record, allow_nan=False) + "\n")
         stream.flush()
         if options.output:
@@ -258,7 +276,8 @@ def run_operation(
                 encoding="utf-8",
             )
         print(
-            f"RESULT {shape} {operation}: {record['cutlass_speedup']:.3f}x CUTLASS speedup",
+            f"RESULT {shape} {operation} r{case.l1.shape[1]}: "
+            + " ".join(f"{b}={medians[b]:.2f}us" for b in BACKENDS),
             file=sys.stderr,
             flush=True,
         )

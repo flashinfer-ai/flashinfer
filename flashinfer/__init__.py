@@ -236,6 +236,7 @@ from .gemm import mm_nvfp4_svdquant as mm_nvfp4_svdquant
 from .gemm import nvfp4_quantize_smooth as nvfp4_quantize_smooth
 from .gemm import prepare_bf16_fp4_weights as prepare_bf16_fp4_weights
 from .gemm import prepare_nvfp4_lora_adapter as prepare_nvfp4_lora_adapter
+from .gemm import prepare_svdquant_l2t as prepare_svdquant_l2t
 from .gemm import PreparedNvFp4LoraAdapter as PreparedNvFp4LoraAdapter
 from .gemm import SegmentGEMMWrapper as SegmentGEMMWrapper
 from .gemm import StaleAdapterError as StaleAdapterError
