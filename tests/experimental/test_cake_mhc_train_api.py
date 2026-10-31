@@ -81,8 +81,8 @@ BF16 = torch.bfloat16
 _OUTPUTS = ("dX", "dfn", "dscale", "dbase")
 _EXACT = ("dX", "dscale", "dbase")
 _LEAVES = ("X", "fn", "scale", "base")
-# The ``dfn`` of the non-deterministic backward against the deterministic one: the same FP32 partial products summed
-# in another order (the per-element bound is test_cake_mhc_train.py's).
+# The ``dfn`` of the non-deterministic backward against the deterministic one: per-chunk partials, the same or another
+# partition's, summed in another order (the per-element bound is test_cake_mhc_train.py's).
 DFN_REL_L2_MAX = 1e-6
 _FALLBACK = "runs the deterministic package"
 _ALERT = "does not have a deterministic implementation"

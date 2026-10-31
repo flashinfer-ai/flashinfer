@@ -22,7 +22,7 @@ rule and table below is that registry's under the ``cake_mhc_train_`` prefix,
 except what the backward's ``bwd_finish`` route changes.  The deterministic
 column-slab records (``bwd_slab``) and final-reduction records (``bwd_reduce``)
 are absent with their selection tables and their PDL edge (``K7->K8``), and
-three programs of this package take their place:
+four programs of this package take their place:
 
 * ``cake_mhc_train_fn_split_atomic__tv128_dep`` (sm_100a, sm_103a) and
   ``cake_mhc_train_fn_split_atomic__tv128_t128_dep`` (sm_107a): the
@@ -42,18 +42,31 @@ three programs of this package take their place:
   parameter gradients ``dscale`` / ``dbase`` from the token-owner pass's per-CTA
   partials in one warp of each of the first 27 CTAs (the deterministic
   reduction's sequence: an FP64 chain in ascending order, the carried-in value
-  last, one rounding), so they are bitwise the deterministic package's.
+  last, one rounding), so they are bitwise the deterministic package's;
+* ``cake_mhc_train_bwd_slab_atomic__lpt`` (every architecture): the same
+  column slab under the two-size tail schedule (``schedule="lpt"``).  It runs
+  ``p_big`` chunks of ``rpc`` tokens first, then ``P - p_big`` smaller chunks
+  of ``rpc_small`` tokens.  Each next unit is claimed when the CTA loads the
+  last tile of its current unit, so the small units end the pass on whichever
+  SMs are free.  Every unit is the dynamic form's unit of the same tokens
+  (``dX`` bit for bit, the same parameter fold).
+  :func:`bwd_slab_atomic_program` picks it per token count and device where
+  :func:`lpt_chunks` (calibrated per architecture by ``BWD_SLAB_LPT``) returns
+  a geometry, and ``dynr`` elsewhere.
 
 So ``bwd_finish`` is the deterministic token-owner pass, the fn split and the
 column slab: no final reduction, and the ``bwd`` workspace has no per-chunk
 ``dfn`` partial region (``dfn_part``).  Only the summation order of ``dfn``
 varies from run to run: each element sums at most ``P`` per-chunk partials
-(``P <= 32``, the chunk count of :func:`k7_chunks`), so it lies within ``P`` FP32
-roundings of the fixed-order sum, and the FP32 reduction flushes subnormal
-addends and results to zero.  ``dX``, ``dscale``, ``dbase`` and every other
-route's outputs are the deterministic package's bits.  The deterministic
-package's backward fn splits (``fn_split__tv128__t``, ``fn_split__tv128_t128__t``)
-have no copy here: the atomic fn splits replace them.
+(``P <= 32``: the chunk count of :func:`k7_chunks`, or of the two-size geometry
+under ``lpt``, whose chunks can cover other token ranges, so its total can also
+differ from the deterministic ``dfn`` in the low-order bits), so it lies within
+``P`` FP32 roundings of the fixed-order sum of those partials, and the FP32
+reduction flushes subnormal addends and results to zero.  ``dX``, ``dscale``,
+``dbase`` and every other route's outputs are the deterministic package's bits.
+The deterministic package's backward fn splits (``fn_split__tv128__t``,
+``fn_split__tv128_t128__t``) have no copy here: the atomic fn splits replace
+them.
 
 Every module below is one mechanically exported production build: a CUDA
 device translation unit plus a tvm-ffi binding compiled together for exactly
@@ -85,9 +98,12 @@ count, architecture)`` (:func:`k1_units` with the measured P_K band of
 :func:`k3_grid`, :func:`k4_grid`, :func:`k5_grid`; :func:`row_grid` is the
 persistent row grid of the design table, kept for the rules table), the
 deterministic package's rules verbatim, so the work partition is a pure
-function of ``(T, device)`` and the same as the deterministic package's.
-Which program a call launches is a rule of the same kind (rounds
-2-7): :func:`fwd_map_program`, :func:`fwd_coef_program` and
+function of ``(T, device)`` and the same as the deterministic package's.  The
+column slab's two-size geometry is this package's own rule (:func:`lpt_chunks`,
+with its launch values :func:`slab_plan`), still a pure function of ``(T, SM
+count, architecture)``; where it fires, the column slab's chunks differ from
+the deterministic chunks.  Which program a call launches is a rule of the same
+kind (rounds 2-7): :func:`fwd_map_program`, :func:`fwd_coef_program` and
 :func:`bwd_token_program` name the mapping-pass, coefficient-pass and
 token-owner forms of record per token count and board (the mapping pass's
 schedule form by its K units per CTA: ``FWD_MAP_CLAIM``), spelled on the records
@@ -97,9 +113,9 @@ split's form per architecture and route (``FN_SPLIT_PROGRAM[arch] = (fnp,
 fnTp)``; the forward operand layout ``want_t = 0`` and the transposed layout of
 the backward, whose form the atomic fn split of the architecture keeps) with
 its launch grid :func:`fn_split_grid` (``FN_SPLIT_GRID`` per program: 256
-CTAs, 512 for the 128-thread form); the column-slab pass is the one record
-``cake_mhc_train_bwd_slab_atomic__dynr`` on every architecture; the
-residual mixing's program of record is per
+CTAs, 512 for the 128-thread form); the column-slab pass's form is
+:func:`bwd_slab_atomic_program`: ``dynr``, or ``lpt`` where :func:`lpt_chunks`
+returns a geometry; the residual mixing's program of record is per
 architecture too (``FWD_FINISH_PROGRAM`` / :func:`fwd_finish_program`, its
 launch grid :func:`k4_grid_of_record`), and the token-owner band
 ``BWD_TOKEN_BANDS`` (sm_107a) is read by the rule itself. The backward prepare's
@@ -124,15 +140,16 @@ binding takes ``enable_pdl`` per call, and :func:`enable_pdl` leaves the
 attribute off inside the measured token-count bands of ``PDL_OFF_BANDS`` (per
 architecture, edge and call path; the deterministic package's bands of those
 edges), where the early launch would hold the dependent's CTAs resident while
-the predecessor still runs.  The column-slab pass keeps the deterministic
-``K6->K7`` bands: the token-owner pass releases the fn split at once and the fn
-split releases the column-slab pass at once, so the column-slab pass's early
-launch overlaps the token-owner pass as in the deterministic route.
+the predecessor still runs.  The column-slab pass (both forms) keeps the
+deterministic ``K6->K7`` bands: the token-owner pass releases the fn split at
+once and the fn split releases the column-slab pass at once, so the column-slab
+pass's early launch overlaps the token-owner pass as in the deterministic route.
 """
 
 from __future__ import annotations
 
 import functools
+import heapq
 import math
 from typing import Any, Optional, Sequence
 
@@ -3081,7 +3098,92 @@ MODULES: dict[str, dict[str, Any]] = {
             "tokp": "tokp",
         },
         "role": "bwd_slab",
-        "select_rule": None,
+        "select_rule": {
+            "kind": "program",
+            "program": "dynr",
+            "rule": "bwd_slab_atomic_program",
+        },
+        "workspace_rule": {
+            "kind": "regions",
+            "workspace": "bwd",
+        },
+    },
+    "cake_mhc_train_bwd_slab_atomic__lpt": {
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+            "sm_107a",
+        ],
+        "arg_plan": [
+            ["buffer", "X"],
+            ["buffer", "dY"],
+            ["buffer", "dU"],
+            ["buffer", "dzp"],
+            ["buffer", "fnTp"],
+            ["buffer", "dX"],
+            ["buffer", "tokp"],
+            ["buffer", "dfn"],
+            ["buffer", "param_partial"],
+            ["buffer", "dscale"],
+            ["buffer", "dbase"],
+            ["parameter", "T"],
+            ["parameter", "P"],
+            ["parameter", "rpc"],
+            ["parameter", "chunks"],
+            ["parameter", "accumulate"],
+            ["buffer", "ticket"],
+            ["parameter", "p_big"],
+            ["parameter", "rpc_small"],
+            ["launch", "enable_pdl"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "chunks_rule": "lpt_chunks",
+            "kind": "slab_chunks",
+            "slabs": 64,
+        },
+        "hidden": 4096,
+        "kernel": "cake_mhc_train_bwd_slab_atomic__lpt",
+        "kernel_symbol": "kernel_cake_mhc_train_bwd_slab_atomic__lpt",
+        "launch": {
+            "block": (384, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 228480,
+            "persistent_ctas_per_sm": 1,
+            "use_pdl": "runtime",
+        },
+        "library": "cake_mhc_train_bwd_slab_atomic__lpt",
+        "logical": {
+            "P": "lpt_parts",
+            "T": "rows",
+            "X": "x_flat",
+            "accumulate": "accumulate",
+            "chunks": "chunks",
+            "dU": "du",
+            "dX": "dx_flat",
+            "dY": "dy_flat",
+            "dbase": "dbase",
+            "dfn": "dfn",
+            "dscale": "dscale",
+            "dzp": "dzp_rows",
+            "fnTp": "fnTp",
+            "p_big": "lpt_big_parts",
+            "param_partial": "param_partial",
+            "rpc": "lpt_rows_per_chunk",
+            "rpc_small": "lpt_small_rows_per_chunk",
+            "ticket": "ticket",
+            "tokp": "tokp",
+        },
+        "role": "bwd_slab",
+        "select_rule": {
+            "kind": "program",
+            "program": "lpt",
+            "rule": "bwd_slab_atomic_program",
+        },
         "workspace_rule": {
             "kind": "regions",
             "workspace": "bwd",
@@ -3098,7 +3200,8 @@ MODULES: dict[str, dict[str, Any]] = {
 # device's SM count through the rules).  The routes are the deterministic
 # package's, except ``bwd_finish``: the deterministic token-owner records, the
 # atomic fn split of the architecture (launched after the token-owner pass, as
-# its programmatic dependent) and the atomic column slab (no reduction record).
+# its programmatic dependent) and the atomic column slab's two forms (``dynr``,
+# ``lpt``: one per call by ``bwd_slab_atomic_program``; no reduction record).
 # The launch order is the route order.  A record ships for the architectures of
 # its ``arches`` (the sm_103a-only forms for sm_103a alone); the device code is
 # folded over those architectures.
@@ -3112,6 +3215,7 @@ ROUTES: dict[str, dict[str, list[str]]] = {
             "cake_mhc_train_bwd_token__rt64",
             "cake_mhc_train_fn_split_atomic__tv128_dep",
             "cake_mhc_train_bwd_slab_atomic__dynr",
+            "cake_mhc_train_bwd_slab_atomic__lpt",
         ],
         "bwd_prepare_h4096": [
             "cake_mhc_train_bwd_prepare__g2sm_le1024",
@@ -3161,6 +3265,7 @@ ROUTES: dict[str, dict[str, list[str]]] = {
             "cake_mhc_train_bwd_token__rt64",
             "cake_mhc_train_fn_split_atomic__tv128_dep",
             "cake_mhc_train_bwd_slab_atomic__dynr",
+            "cake_mhc_train_bwd_slab_atomic__lpt",
         ],
         "bwd_prepare_h4096": [
             "cake_mhc_train_bwd_prepare__t128",
@@ -3215,6 +3320,7 @@ ROUTES: dict[str, dict[str, list[str]]] = {
             "cake_mhc_train_bwd_token__rt64",
             "cake_mhc_train_fn_split_atomic__tv128_t128_dep",
             "cake_mhc_train_bwd_slab_atomic__dynr",
+            "cake_mhc_train_bwd_slab_atomic__lpt",
         ],
         "bwd_prepare_h4096": [
             "cake_mhc_train_bwd_prepare__t128__a7",
@@ -3303,7 +3409,7 @@ GSTATS_COLS = 32
 TOKP_COLS = 24
 DZP_COLS = 96  # three BF16 pieces of dz' = dz * r, 32 columns each
 PARAM_COLS = 32
-TICKET_WORDS = 64  # one 256-byte region of uint32 per workspace, zero on first use; the opt-in ticket schedule of the mapping pass (forward) and the dynamic-schedule column-slab form (backward) draw their units from word 0 and leave it 0 again; the static forms leave it unread
+TICKET_WORDS = 64  # one 256-byte region of uint32 per workspace, zero on first use; the opt-in ticket schedule of the mapping pass (forward) and the column-slab forms (backward) draw their units from word 0 and leave it 0 again; the static forms leave it unread
 STATS_LAYOUT: dict[str, tuple[int, int]] = {
     "r": (0, 1),
     "z": (1, 25),
@@ -3416,6 +3522,10 @@ LOGICAL_SCALARS = (
     "sinkhorn_iters",
     "want_t",
     "accumulate",
+    "lpt_parts",
+    "lpt_rows_per_chunk",
+    "lpt_big_parts",
+    "lpt_small_rows_per_chunk",
 )
 # The host-rule table the kernels' test references and this registry are
 # checked against (the same rows, in the same column order).
@@ -3432,6 +3542,12 @@ RULES_T_VALUES = (
 # Host rules (integer arithmetic only; valid for T >= 1).  These are the
 # deterministic package's rules verbatim (the text of record shared with the
 # kernels' test references): a change here is a change of the work partition.
+# The exception is :data:`BWD_SLAB_LPT`, :func:`lpt_chunks`,
+# :func:`bwd_slab_atomic_program` and :func:`slab_plan`, this package's own
+# column-slab rule: a list-scheduling screen in floating point with the result
+# of the column slab's kernel-test screen (not its text: _lpt_makespan takes runs
+# of equal units, the unit-by-unit schedule bit for bit), calibrated per
+# architecture by BWD_SLAB_LPT.
 
 
 # Rounds 2-7: the per-architecture dispatch of record. sm_103a (GB300) carries the forms paired on GB300 in
@@ -3612,9 +3728,11 @@ FWD_MAP_CLAIM = {
 FWD_COEF_REGIMES = {"sm_100a": "round7", "sm_103a": "round5", "sm_107a": "round9"}
 # The backward programs of record per architecture: K6 "paring" (production) / "dot_ao8" (ring_dot=True, act_offset=8;
 # KEEP 13 / 13 on B200 and on R200, FINAL) with the per-R regimes of BWD_TOKEN_REGIMES -- the deterministic package's
-# token-owner rules, verbatim.  K7 is this package's one column-slab record (``cake_mhc_train_bwd_slab_atomic__dynr``,
-# the deterministic "dynr" form with FP32-reduced dfn and the parameter fold) on every architecture: the deterministic
-# package's per-architecture column-slab and final-reduction (K8) rules do not apply here.
+# token-owner rules, verbatim.  K7 is this package's column slab: the dynr record
+# (``cake_mhc_train_bwd_slab_atomic__dynr``, the deterministic "dynr" form with FP32-reduced dfn and the parameter
+# fold) on every architecture, or its two-size tail schedule ``lpt`` where BWD_SLAB_LPT's screen fires
+# (``bwd_slab_atomic_program``): the deterministic package's per-architecture column-slab and final-reduction (K8)
+# rules do not apply here.
 # BWD_TOKEN_PROGRAM: the token-owner program per architecture outside every regime of BWD_TOKEN_REGIMES and every band
 # of BWD_TOKEN_BANDS. sm_107a: "dot_ao8_l2l" (dot_ao8 +
 # ring_l2=evict_last; CONFIGS 23) -- vs dot_ao8 s1 0.9506..0.9804 / s2 0.9531..0.9750 on the ten rows
@@ -3706,6 +3824,29 @@ K5_FORM_ROWS = {
 # 2 in both) and the rules table's k4_grid column.
 FWD_FINISH_PROGRAM = {"sm_100a": "production", "sm_103a": "production", "sm_107a": "r2"}
 FWD_FINISH_ROWS = {"production": 4, "r2": 2}
+# BWD_SLAB_LPT: the column slab's two-size tail schedule per architecture -- None (the "dynr" record at every token
+# count) or (o_tiles, keep): lpt_chunks ranks the two-size geometries of T tokens (big chunks of rb tiles, rb within
+# six tiles of the one-size k7_chunks chunks and leaving tokens after them, then S = 1..5 small chunks sharing the
+# rest; at most 32 chunks) by the list-scheduling makespan of their units in draw order on the device's SMs (a unit
+# costs o_tiles plus its 64-token tiles, each to the least loaded SM, the big units first; the fewest chunks, then the
+# biggest, among equal makespans) and runs the best on the "lpt" record where its makespan is at most keep times the
+# one-size chunks'. Calibrated by package-level A/B: the rule's geometry against dynr and a null-control rerun of dynr
+# in one process, paired per replay group, on the finish / backward / checkpointed-step graphs; the deltas below are
+# against the faster dynr arm. sm_100a (0.5, 0.99): on 148 SMs it fires at
+# 1536 / 2048 / 2560 / 3584 / 14928 / 15566 / 15590 / 16114 of the 19 benchmark token counts (finish
+# -1.2 / -2.1 / -3.5 / -6.7 / -5.4 / -14.0 / -12.9 / -6.6 us), and over 67 firing token counts in 1024..65536 finish
+# -6.4 us (-1.1 %) on average, the seven slower ones at most +2.0 % (22155, whose groups span -52..+137 us). sm_107a
+# (0.5, 0.97): on 212 SMs it fires at 1024 / 2048 / 2560 / 3072 / 3584 of the benchmark token counts (finish
+# -0.6 / -1.5 / -1.7 / -1.2 / -0.6 us) and at 21 of 160 token counts in 1024..65536, every one faster (finish -2.7 %,
+# checkpointed step -1.2 % on average); keep 0.98 adds token counts that read up to +15 us (34721..37194, 53378,
+# 61944..65181). sm_103a (0.5, 0.98): on 152 SMs it fires at
+# 1024 / 1536 / 2048 / 8192 / 14928 / 15288 / 16132 / 16164 / 16263 of the benchmark token counts (finish
+# -0.7 / -0.9 / -1.9 / -3.7 / -0.8 / -7.4 / -5.8 / -6.0 / -2.2 us) and at 27 of 160 token counts in 1024..65536, none
+# slower by more than 0.2 us (finish -1.1 %, checkpointed step -0.45 % on average); keep 0.985 adds a token count
+# whose checkpointed step reads +0.6 us in every group (26216), keep 0.99 one whose finish reads +1.6 us (16444).
+# Experiments that edit this table or replace lpt_chunks clear the package's _PLANS / _FAST_ROUTES: the selection and
+# slab_plan read both at call time, the route plans bind them per token count, and host_plan carries neither.
+BWD_SLAB_LPT = {"sm_100a": (0.5, 0.99), "sm_103a": (0.5, 0.98), "sm_107a": (0.5, 0.97)}
 
 
 def k1_units(T, sm_count, arch):  # -> (P_K, units, grid)
@@ -3905,6 +4046,122 @@ def k7_chunks(T, sm_count, slab_d=64):  # -> (P, units, grid, rows_per_chunk)
     return best[1:]
 
 
+def _lpt_units(
+    T, geometry
+):  # -> the units in draw order (every slab's big chunks, then the small ones) as [count, tiles] runs
+    P, rpc, p_big, rpc_small = geometry
+    tiles, rb, rs, slabs = -(-T // 64), rpc // 64, rpc_small // 64, HIDDEN // SLAB_D
+    big = [max(0, min(rb, tiles - p * rb)) for p in range(p_big)]
+    small = [max(0, min(rs, tiles - p_big * rb - q * rs)) for q in range(P - p_big)]
+    runs = []
+    for chunks in (big, small):
+        pattern = []  # one slab's chunks as runs
+        for t in chunks:
+            if pattern and pattern[-1][1] == t:
+                pattern[-1][0] += 1
+            else:
+                pattern.append([1, t])
+        repeats = slabs
+        if len(pattern) == 1:  # one tile count: every slab's units are one run
+            pattern, repeats = [[pattern[0][0] * slabs, pattern[0][1]]], 1
+        for _ in range(repeats):
+            for count, t in pattern:
+                if runs and runs[-1][1] == t:
+                    runs[-1][0] += count
+                else:
+                    runs.append([count, t])
+    return runs
+
+
+def _lpt_makespan(
+    runs, sm_count, o_tiles
+):  # -> list scheduling: each unit to the least loaded SM; the largest load
+    # The SMs of one load level take a run's units together: every SM's load is the same sum, in the same order, as
+    # unit by unit, so the makespan is bit for bit the unit-by-unit one (the levels are few: the screen stays cheap).
+    level = {0.0: min(sm_count, sum(count for count, _ in runs))}
+    heap = [0.0]
+    for count, tiles in runs:
+        while count:
+            load = heap[0]
+            sms = level[load]
+            moved = min(sms, count)
+            if moved == sms:
+                heapq.heappop(heap)
+                del level[load]
+            else:
+                level[load] = sms - moved
+            load = load + o_tiles + tiles
+            if load in level:
+                level[load] += moved
+            else:
+                level[load] = moved
+                heapq.heappush(heap, load)
+            count -= moved
+    return max(level)
+
+
+def _lpt_geometry(
+    T, rb, S
+):  # -> (P, rpc, p_big, rpc_small) of rb-tile big chunks and S small ones, or None
+    tiles = -(-T // 64)
+    if rb < 1 or S < 1:
+        return None
+    p_big = (tiles - 1) // rb
+    rs = -(-(tiles - p_big * rb) // S)
+    if p_big < 1 or p_big + S > 32:
+        return None
+    if S == 1 and rs == rb:
+        return (p_big + 1, 64 * rb, p_big + 1, 64 * rb)
+    if not 1 <= rs < rb:
+        return None
+    return (p_big + S, 64 * rb, p_big, 64 * rs)
+
+
+@functools.lru_cache(maxsize=4096)
+def _lpt_plan(
+    T, sm_count, o_tiles
+):  # -> (one-size makespan, best makespan, best geometry), or None
+    if T <= 0:
+        return None
+    P0, _, _, rpc0 = k7_chunks(T, sm_count)
+    rt = rpc0 // 64
+    baseline = _lpt_makespan(_lpt_units(T, (P0, rpc0, P0, rpc0)), sm_count, o_tiles)
+    best = None
+    for rb in range(max(1, rt - 6), rt + 1):
+        for S in range(1, 6):
+            geometry = _lpt_geometry(T, rb, S)
+            if geometry is None:
+                continue
+            key = (
+                _lpt_makespan(_lpt_units(T, geometry), sm_count, o_tiles),
+                geometry[0],
+                -rb,
+            )
+            if best is None or key < best[0]:
+                best = (key, geometry)
+    return None if best is None else (baseline, best[0][0], best[1])
+
+
+def lpt_chunks(
+    T, sm_count, arch
+):  # -> the column slab's two-size geometry (P, rpc, p_big, rpc_small), or None
+    calibration = BWD_SLAB_LPT[arch]
+    if calibration is None:
+        return None
+    o_tiles, keep = calibration
+    plan = _lpt_plan(T, sm_count, float(o_tiles))
+    if plan is None:
+        return None
+    baseline, makespan, geometry = plan
+    return geometry if makespan <= keep * baseline else None
+
+
+def bwd_slab_atomic_program(
+    T, sm_count, arch
+):  # -> "lpt" where lpt_chunks gives a geometry, else "dynr"
+    return "dynr" if lpt_chunks(T, sm_count, arch) is None else "lpt"
+
+
 def k6_grid(T, sm_count):  # static token chunks for the parameter partials -> (G6, R)
     groups = -(-T // 8)
     G6 = min(2 * sm_count, groups)
@@ -3988,6 +4245,45 @@ def host_plan(rows: int, sm_count: int, arch: str) -> dict[str, Any]:
     }
 
 
+def slab_plan(rows: int, sm_count: int, arch: str) -> dict[str, int]:
+    """The chunks of the column slab's ``lpt`` record for ``rows`` tokens: :func:`lpt_chunks`'s two-size geometry,
+    else the one-size chunks of :func:`k7_chunks` (``lpt_big_parts == lpt_parts``).  Read at call time (not cached:
+    :func:`_lpt_plan` caches the screen) and kept out of :func:`host_plan`, which the workspace envelope reads at
+    every 64-token tile.  A geometry that is not a two-size partition of the rows is a ``ValueError``."""
+
+    rows, sm_count = int(rows), int(sm_count)
+    if rows <= 0:
+        raise ValueError("rows must be positive")
+    if sm_count <= 0:
+        raise ValueError("sm_count must be positive")
+    parts, _, _, rows_per_chunk = k7_chunks(rows, sm_count)
+    geometry = lpt_chunks(rows, sm_count, arch) or (
+        parts,
+        rows_per_chunk,
+        parts,
+        rows_per_chunk,
+    )
+    P, rpc, p_big, rpc_small = (int(value) for value in geometry)
+    if not (
+        1 <= p_big <= P <= 32
+        and rpc > 0
+        and rpc % SLAB_TILE_T == 0
+        and rpc_small > 0
+        and rpc_small % SLAB_TILE_T == 0
+        and p_big * rpc + (P - p_big) * rpc_small >= rows
+    ):
+        raise ValueError(
+            f"lpt_chunks gave {tuple(geometry)} for {rows} rows: not a two-size geometry "
+            "(1 <= p_big <= P <= 32, positive multiples of 64 tokens covering the rows)"
+        )
+    return {
+        "lpt_parts": P,
+        "lpt_rows_per_chunk": rpc,
+        "lpt_big_parts": p_big,
+        "lpt_small_rows_per_chunk": rpc_small,
+    }
+
+
 _DTYPE_BYTES = {"bfloat16": 2, "float32": 4, "uint32": 4}
 
 
@@ -4067,9 +4363,10 @@ def rules_row(T: int, sm_count: int, arch: str) -> dict[str, Any]:
     columns included (``fn_split_program`` / ``fn_split_grid`` ... ``k5_program``,
     ``fwd_finish_program``; ``k4_grid`` is the residual mixing's grid of
     record): the deterministic package's row without its column-slab and
-    reduction program columns (this package has one column-slab record and no
-    reduction), with this package's ``bwd_workspace_bytes``.  ``T == 0`` is the
-    no-launch row (its T-dependent program columns are empty)."""
+    reduction program columns (this package's column-slab selection is its own,
+    :func:`bwd_slab_atomic_program`; no reduction), with this package's
+    ``bwd_workspace_bytes``.  ``T == 0`` is the no-launch row (its T-dependent
+    program columns are empty)."""
 
     row: dict[str, Any] = {
         "T": T,
@@ -4222,6 +4519,7 @@ PROGRAM_RULES = (
     "fwd_map_program",
     "fwd_coef_program",
     "bwd_token_program",
+    "bwd_slab_atomic_program",
 )
 
 
@@ -4293,23 +4591,25 @@ def selected_modules(
     round-3 coefficient-pass regimes keyed on the device's SM count; ``chunk_rows_band``:
     ``k6_grid(rows, sm_count).R`` lies in one of ``ranges`` -- the token-owner
     pass's regimes; ``program``: the named host rule (``fwd_map_program``,
-    ``fwd_coef_program`` or ``bwd_token_program``) at ``(rows, sm_count, arch)``
-    equals the record's program key -- the mapping-pass forms of sm_103a
-    outside the fit regime and
+    ``fwd_coef_program``, ``bwd_token_program`` or ``bwd_slab_atomic_program``)
+    at ``(rows, sm_count, arch)`` equals the record's program key -- the
+    mapping-pass forms of sm_103a outside the fit regime and
     of sm_100a above 8192 tokens (the ``nsx`` record ``__tk`` also where the rule
     names the ticket form ``tk_nsx_ct``, which is not exported and is bitwise
     ``nsx``; the ``units_fit`` record of ``ns96_g2_ol2l`` likewise admits the
     calls the rule names its unexported ticket form for), the
-    coefficient-pass forms of record and the token-owner forms on sm_107a;
+    coefficient-pass forms of record, the token-owner forms on sm_107a and the
+    column slab's two forms;
     ``run_time_iters``: every call whose ``sinkhorn_iters`` is not
     :data:`SINKHORN_ITERS` -- the run-time-count forms of the coefficient pass and
     the token-owner pass, which then stand in for every other record of their
     ``role``; ``None`` = every call); exactly the modules whose rule admits
     the call are launched, in route order.  The rules of record are
-    :func:`fn_split_program`, :func:`fwd_map_program`, :func:`fwd_coef_program`
-    and :func:`bwd_token_program` (the deterministic package's selection on
-    every route; the fn split and the column slab of ``bwd_finish`` are one
-    record each per architecture).
+    :func:`fn_split_program`, :func:`fwd_map_program`, :func:`fwd_coef_program`,
+    :func:`bwd_token_program` and :func:`bwd_slab_atomic_program` (the
+    deterministic package's selection on every route but the column slab's,
+    this package's column-slab rule; the fn split of ``bwd_finish`` is one
+    record per architecture).
     """
 
     rows, sinkhorn_iters = int(rows), int(sinkhorn_iters)
@@ -4357,9 +4657,9 @@ def selected_modules(
 PDL_PATHS = ("forward", "backward", "checkpoint")
 # Library stem -> the edge its records sit on (predecessor -> dependent).  The
 # bands are the deterministic package's on the edges this package has (the
-# atomic column slab, launched behind the fn split that the token-owner pass
-# releases at once, takes the deterministic column slab's K6->K7 bands; there
-# is no K7->K8 edge).
+# atomic column slab (both forms), launched behind the fn split that the
+# token-owner pass releases at once, takes the deterministic column slab's
+# K6->K7 bands; there is no K7->K8 edge).
 PDL_EDGES = {
     "cake_mhc_train_bwd_prepare": "K1->K5",
     "cake_mhc_train_bwd_slab_atomic": "K6->K7",
@@ -4472,9 +4772,9 @@ def launch_grid(
     launch ``min(ctas_per_sm * SM count, ceil(rows / group_rows))`` CTAs, each
     owning a static run of token groups (the token-owner pass).  ``slab_chunks``
     modules launch ``min(SM count, slabs * P)`` CTAs over (column slab, token
-    chunk) units (the column-slab pass; ``P`` from :func:`k7_chunks`; the
-    dynamic-schedule form draws the units from the backward workspace's
-    self-resetting ticket word).
+    chunk) units (the column-slab pass; ``P`` from :func:`k7_chunks`, or
+    :func:`slab_plan`'s ``lpt_parts`` for the ``lpt_chunks`` rule; both forms
+    draw the units from the backward workspace's self-resetting ticket word).
     ``rows`` must be positive; the public API returns empty outputs for zero
     rows without launching.
     """
@@ -4508,8 +4808,12 @@ def launch_grid(
             _ceil_div(rows, int(rule["group_rows"])),
         )
     elif kind == "slab_chunks":
-        plan = host_plan(rows, sm_count(device_index), device_arch(device_index))
-        grid_x = min(sm_count(device_index), int(rule["slabs"]) * plan["parts"])
+        sms, arch = sm_count(device_index), device_arch(device_index)
+        if rule["chunks_rule"] == "lpt_chunks":
+            parts = slab_plan(rows, sms, arch)["lpt_parts"]
+        else:
+            parts = host_plan(rows, sms, arch)["parts"]
+        grid_x = min(sms, int(rule["slabs"]) * parts)
     else:
         raise ValueError(f"unknown Cake mHC training grid rule: {kind!r}")
     return (max(grid_x, 1), 1, 1)
@@ -4656,6 +4960,7 @@ __all__ = [
     "TOKP_LAYOUT",
     "WORKSPACE_OF_KIND",
     "WORKSPACE_REGIONS",
+    "BWD_SLAB_LPT",
     "BWD_TOKEN_BANDS",
     "BWD_TOKEN_PROGRAM",
     "BWD_TOKEN_REGIMES",
@@ -4673,6 +4978,7 @@ __all__ = [
     "K5_GRID_BANDS",
     "PK_BANDS",
     "arch_for_capability",
+    "bwd_slab_atomic_program",
     "bwd_token_program",
     "device_arch",
     "enable_pdl",
@@ -4694,6 +5000,7 @@ __all__ = [
     "launch_grid",
     "library_name",
     "load",
+    "lpt_chunks",
     "pdl_edge",
     "route_applies",
     "route_key",
@@ -4704,6 +5011,7 @@ __all__ = [
     "rules_table",
     "run_module",
     "selected_modules",
+    "slab_plan",
     "sm_count",
     "specs_for_arch",
     "supported_hidden_sizes",
