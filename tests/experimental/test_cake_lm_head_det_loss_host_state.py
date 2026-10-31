@@ -14,11 +14,14 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 Host state of the deterministic chunked LM-head + loss backend across calls: the binding cache of the
-log-probability backward across training steps, and the per-thread state (the hidden valid-row count's pinned cell
-and event, its int32 constant, the dW side stream) under two threads on one device.
+log-probability backward across training steps and under threads that share it, and the per-thread state (the
+hidden valid-row count's pinned cell and event, its int32 constant, the dW side stream) under two threads on one
+device.
 """
 
 import threading
+from collections import OrderedDict
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -28,6 +31,7 @@ from tests.test_helpers.cake_lm_head_loss_reference import make_inputs
 from tests.test_helpers.cake_package import cake_package
 
 cake_backend = cake_package("cake_lm_head_det_loss", "cake_backend")
+opt_in = cake_package("cake_lm_head_det_loss", "cake_backend_opt_in")
 cake_jit = cake_package("cake_lm_head_det_loss", "cake_jit")
 
 SEED = 20261031
@@ -326,3 +330,64 @@ def test_device_hidden_count_arange_two_threads_two_streams(weight, monkeypatch)
         if not torch.equal(_bits(got[name]), ref)
     ]
     assert not wrong, wrong
+
+
+@pytest.mark.parametrize("module", ["backend", "opt_in"])
+def test_binding_cache_skips_what_another_threads_eviction_removed(module):
+    """Threads share the binding cache without a lock: a lookup whose key another thread evicts between its ``get``
+    and its recency update returns the binding (or eager launch) it found, and an eviction that another thread's
+    eviction emptied between its size check and its ``popitem`` stops -- no ``KeyError`` (the races, run
+    deterministically through the cache's ordered dicts)."""
+
+    # another thread evicts the key right after this thread's get
+    class EvictedAfterGet(OrderedDict):
+        def get(self, key, default=None):
+            value = super().get(key, default)
+            self.pop(key, None)
+            return value
+
+    # another thread's eviction empties it before this thread's popitem
+    class EmptiedBeforePop(OrderedDict):
+        def popitem(self, last=True):
+            self.clear()
+            return super().popitem(last=last)
+
+    be = {"backend": cake_backend, "opt_in": opt_in}[module]
+    binding, launch, record = object(), object(), object()
+    cache = be.BindingCache(capacity=1)
+    cache._bindings = EvictedAfterGet({("k",): binding})
+    assert cache.lookup(("k",)) is binding and cache.hits == 1
+    assert cache.lookup(("k",)) is None and cache.misses == 1
+    cache._eager = EvictedAfterGet({("f",): (record, launch)})
+    assert cache.eager_lookup(("f",), record) is launch
+    cache._bindings = EmptiedBeforePop({("a",): binding})
+    assert cache.remember(("b",), binding) is binding and len(cache) == 0
+    cache._bindings = EmptiedBeforePop({("a",): binding, ("b",): binding})
+    assert cache.configure(capacity=1) is cache and len(cache) == 0
+    cache.EAGER_CAPACITY = 1
+    cache._eager = EmptiedBeforePop({("a",): (record, launch)})
+    cache.eager_remember(("b",), record, launch)
+    assert len(cache._eager) == 0
+
+
+@pytest.mark.parametrize("module", ["backend", "opt_in"])
+def test_binding_cache_owned_bytes_while_another_thread_remembers(module):
+    """``owned_bytes`` sums a copy of the bindings: another thread that remembers a binding while it sums (run
+    deterministically from inside the read of a binding's size) raises no ``OrderedDict mutated during iteration``."""
+    be = {"backend": cake_backend, "opt_in": opt_in}[module]
+    cache = be.BindingCache(capacity=4)
+
+    class Binding:
+        def __init__(self, nbytes):
+            self.nbytes = nbytes
+
+        @property
+        def owned_bytes(self):
+            # another thread remembers a binding
+            cache.remember(("other", self.nbytes), SimpleNamespace(owned_bytes=0))
+            return self.nbytes
+
+    cache.remember(("a",), Binding(1))
+    cache.remember(("b",), Binding(2))
+    assert cache.owned_bytes == 3
+    assert len(cache) == 4
