@@ -5598,11 +5598,16 @@ def select_cake_fmha_context_route(
         # a shipped pack: the one-stage program of the pack the one-stage
         # choice names (:func:`_context_fp8_one_stage_choice`) and the page
         # size, where it predicts a gain over the launch chosen above.  A
-        # runtime-size call of at most the keys of that program's short-KV
-        # entry takes the entry's program, and keeps its launch where the
-        # program has none; it takes the smallest such pack whose tiles number
-        # at most :data:`_CONTEXT_FP8_SHORT_KV_ONE_STAGE_TILES`, where one
-        # exists.  Else the call keeps its launch.  An exact program's tiles
+        # short-KV runtime-size call takes the smallest such pack whose tiles
+        # number at most :data:`_CONTEXT_FP8_SHORT_KV_ONE_STAGE_TILES`, where
+        # one exists (pack 2 first for a page-64 call of at most
+        # :data:`_CONTEXT_FP8_SHORT_KV_PAGE64_PACK2_TOKENS` query tokens and at
+        # least :data:`_CONTEXT_FP8_SHORT_KV_PAGE64_PACK2_TILES` pack-2 tiles).
+        # Of at most the keys of the program's short-KV entry, it takes the
+        # entry's program; where the program has none, it runs the program
+        # itself if :data:`_CONTEXT_FP8_SHORT_KV_ONE_STAGE_PROGRAMS` names it
+        # and the pack is that smallest pack, and keeps its launch otherwise.
+        # Else the call keeps its launch.  An exact program's tiles
         # hold two query stages of its pack: at a smaller pack, one stage holds
         # every query token of a tile.
         one_stage = _CONTEXT_FP8_ONE_STAGE_ROUTES.get(target)
