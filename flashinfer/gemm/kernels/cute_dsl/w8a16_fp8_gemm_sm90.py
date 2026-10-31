@@ -444,7 +444,10 @@ class Sm90W8A16Fp8GemmKernel:
         gW_mnl = cute.local_tile(mW_mnl, (tile_m, tile_a), (None, None, None))
         # Fix-up views in 8-row vectors: the workspace (8, tile_m / 8, block columns),
         # the output (8, weight rows / 8, activation rows) and the bias (8, rows / 8).
-        n_rows_total = cute.size(mC_plain.shape[0])
+        # The output column stride is spelled 8 * (rows / 8) so the compiler can see
+        # that every 8-row vector is 16-byte aligned (as a plain dynamic row count it
+        # emitted eight 2-byte stores).
+        n_row_vecs = cute.size(mC_plain.shape[0]) // 8
         wv = cute.make_tensor(
             mW_plain.iterator,
             cute.make_layout(
@@ -454,12 +457,12 @@ class Sm90W8A16Fp8GemmKernel:
         cv = cute.make_tensor(
             mC_plain.iterator,
             cute.make_layout(
-                (8, n_rows_total // 8, cute.size(mC_plain.shape[1])),
-                stride=(1, 8, n_rows_total),
+                (8, n_row_vecs, cute.size(mC_plain.shape[1])),
+                stride=(1, 8, 8 * n_row_vecs),
             ),
         )
         bv = cute.make_tensor(
-            bias.iterator, cute.make_layout((8, n_rows_total // 8), stride=(1, 8))
+            bias.iterator, cute.make_layout((8, n_row_vecs), stride=(1, 8))
         )
 
         tAsA, tAgA = cpasync.tma_partition(
