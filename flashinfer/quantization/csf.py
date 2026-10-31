@@ -137,9 +137,10 @@ def expand_csf_scales(
         Contiguous int32 expert ids of any shape, such as the ``[num_tokens, top_k]`` routing
         of a fused MoE call. Only these experts are expanded and the rest of ``out`` keeps its
         bytes; ids outside ``[0, num_experts)`` are skipped. ``None`` expands every expert.
-        The routed expansion costs more as the ids grow, while ``None`` costs the same for any
-        routing: with 512 experts and top-10 routing on SM80, passing the ids was faster up to
-        64 tokens and ``None`` from 128 tokens.
+        An expert named more than once is expanded once: in each 128-row tile, every id is
+        compared with all the ids before it, so ``N`` ids take ``O(N^2)`` comparisons per tile.
+        ``None`` costs the same for any routing. Pass ids only for small routings; with 512
+        experts on SM80, for example, 640 ids expanded faster than ``None`` and 1280 slower.
     layout : SfLayout
         ``SfLayout.layout_128x4`` or ``SfLayout.layout_linear``.
     swap_row_halves : bool
