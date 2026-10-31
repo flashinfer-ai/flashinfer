@@ -307,9 +307,10 @@ def _blockscaled_dynamic_mma(
         a_sf = builtin.unrealized_conversion_cast([i32], [sfa_atom.iterator.value])
         b_sf = builtin.unrealized_conversion_cast([i32], [sfb_atom.iterator.value])
         dst = builtin.unrealized_conversion_cast([i32], [acc_atom.iterator.value])
-        desc = cutlass.Int32(descriptor | ((1 << 31) if width == 96 else 0)) | n_bits
-        desc = desc | (((cutlass.Int32(a_sf) >> 30) & 3) << 29)
-        desc = desc | (((cutlass.Int32(b_sf) >> 30) & 3) << 4)
+        # Both scale tensors start on TMEM words; K selects the byte within one.
+        sf_id = (start // tiled_mma.op.sf_vec_size) % 4
+        desc = descriptor | ((1 << 31) if width == 96 else 0)
+        desc = cutlass.Int32(desc | (sf_id << 29) | (sf_id << 4)) | n_bits
         start += width
         accumulate = k_tile != 0 if inner_k == 0 else True
         with cute.arch.elect_one():
@@ -746,7 +747,7 @@ class Sm100BlockScaledMoeEpilogue:
         return sf, scale
 
     @cute.jit
-    def _store(self, values, output, output_sf, row, channel, quantization):
+    def _convert(self, values, output_sf, row, channel, quantization):
         converted = cute.make_rmem_tensor((16,), self.output_dtype)
         if cutlass.const_expr(self.generate_sfc):
             sf, scale = quantization
@@ -760,13 +761,23 @@ class Sm100BlockScaledMoeEpilogue:
                     (values[i], values[i + 1]), (scale, scale)
                 )
         converted.store(values.load().to(self.output_dtype))
-        self._store_converted(converted, output, row, channel)
+        return converted
 
     @cute.jit
     def _store_converted(self, converted, output, row, channel):
-        target = cute.local_tile(output, (1, 16), (row, channel // 16))
+        count = (
+            cute.size(converted)
+            * converted.element_type.width
+            // self.output_dtype.width
+        )
+        target = cute.recast_tensor(
+            cute.coalesce(cute.local_tile(output, (1, count), (row, channel // count))),
+            converted.element_type,
+        )
         if cutlass.const_expr(self.use_fused_finalize):
-            for i in cutlass.range_constexpr(0, 16, 2):
+            converted = cute.recast_tensor(converted, self.output_dtype)
+            target = cute.recast_tensor(target, self.output_dtype)
+            for i in cutlass.range_constexpr(0, count, 2):
                 pair = cute.make_tensor(converted.iterator + i, cute.make_layout((2,)))
                 target_pair = cute.make_tensor(
                     target.iterator + i, cute.make_layout((2,))
@@ -776,8 +787,8 @@ class Sm100BlockScaledMoeEpilogue:
             cute.copy(
                 cute.make_copy_atom(
                     cute.nvgpu.CopyUniversalOp(),
-                    self.output_dtype,
-                    num_bits_per_copy=min(256, self.output_dtype.width * 16),
+                    converted.element_type,
+                    num_bits_per_copy=min(256, self.output_dtype.width * count),
                 ),
                 converted,
                 cute.coalesce(target),
@@ -888,13 +899,18 @@ class Sm100BlockScaledMoeEpilogue:
                     quantization = None
                     if cutlass.const_expr(self.generate_sfc):
                         quantization = self._quantization_params(absmax, norm_const)
-                    self._store(
+                    converted = self._convert(
                         values,
-                        output_tensor,
                         output_sf_tensor,
                         route_start + token_start + lane,
                         channel,
                         quantization,
+                    )
+                    self._store_converted(
+                        converted,
+                        output_tensor,
+                        route_start + token_start + lane,
+                        channel,
                     )
         elif cutlass.const_expr(
             self.activation_type is None
@@ -968,26 +984,35 @@ class Sm100BlockScaledMoeEpilogue:
             if cutlass.const_expr(self.generate_sfc and self.sf_vec_size == 32):
                 absmax = cute.arch.fmax(self._absmax(top), self._absmax(bottom))
                 shared_quantization = self._quantization_params(absmax, norm_const)
-            for half in cutlass.range_constexpr(2):
-                values = top if half == 0 else bottom
-                if cutlass.const_expr(self.generate_sfc and self.sf_vec_size == 16):
-                    absmax = self._absmax(values)
-                channel = channel_start + warp * 32 + half * 16
-                if token_start + lane < valid_tokens:
-                    if channel < output_tensor.shape[1]:
+            channel = channel_start + warp * 32
+            if token_start + lane < valid_tokens:
+                if channel < output_tensor.shape[1]:
+                    words_per_half = 16 * self.output_dtype.width // 32
+                    converted = cute.make_rmem_tensor(
+                        (2 * words_per_half,), cutlass.Uint32
+                    )
+                    for half in cutlass.range_constexpr(2):
+                        values = top if half == 0 else bottom
                         quantization = shared_quantization
                         if cutlass.const_expr(
                             self.generate_sfc and self.sf_vec_size == 16
                         ):
-                            quantization = self._quantization_params(absmax, norm_const)
-                        self._store(
+                            quantization = self._quantization_params(
+                                self._absmax(values), norm_const
+                            )
+                        fragment = self._convert(
                             values,
-                            output_tensor,
                             output_sf_tensor,
                             output_row,
-                            channel,
+                            channel + half * 16,
                             quantization,
                         )
+                        target = cute.make_tensor(
+                            converted.iterator + half * words_per_half,
+                            cute.make_layout((words_per_half,)),
+                        )
+                        target.store(fragment.load().bitcast(cutlass.Uint32))
+                    self._store_converted(converted, output_tensor, output_row, channel)
 
     @cute.jit
     def run_overlapping_fc1(
@@ -1240,7 +1265,7 @@ class Sm100BlockScaledMoeEpilogue:
                             channel_start + warp * 64,
                             route_start + group * tokens,
                         )
-                cute.arch.cp_async_bulk_commit_group()
+                    cute.arch.cp_async_bulk_commit_group()
             elif group * tokens < valid_tokens:
                 for sub in cutlass.range_constexpr(tokens // 32):
                     token_start = group * tokens + sub * 32

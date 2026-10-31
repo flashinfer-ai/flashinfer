@@ -49,7 +49,7 @@ from cutlass.utils.mixed_input_helpers import TransformMode
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass._mlir import ir
 from cutlass._mlir.dialects import builtin, llvm
-from cutlass.cutlass_dsl import Boolean, Int32, T, dsl_user_op
+from cutlass.cutlass_dsl import Boolean, Int32, dsl_user_op
 
 from flashinfer.tllm_enums import (
     ActivationType,
@@ -79,35 +79,28 @@ _TMA_CACHE_HINT_EVICT_FIRST = 0x12F0000000000000
 _TMA_CACHE_HINT_EVICT_LAST = 0x14F0000000000000
 
 
-@dsl_user_op
-def _w4a16_scaled_tanh(value, beta: float, loc=None, ip=None):
+@cute.jit
+def _w4a16_scaled_tanh_pair(values, beta: cutlass.Constexpr[float]):
     """Match MegaMoE's beta*tanh(value/beta) rounding for W4A16 SiTU."""
     # The reciprocal is rounded once from the Python beta. Keep the tanh's
     # multiply and subtraction separate, as in the existing MegaMoE oracle.
-    return cutlass.Float32(
-        llvm.inline_asm(
-            T.f32(),
-            [
-                cutlass.Float32(value).ir_value(loc=loc, ip=ip),
-                cutlass.Float32(beta).ir_value(loc=loc, ip=ip),
-                cutlass.Float32(1.0 / beta).ir_value(loc=loc, ip=ip),
-            ],
-            "{\n\t.reg .f32 x, exponent, denominator, inverse, result;\n\t"
-            "mul.rn.f32 x, $1, $3;\n\t"
-            "mul.rn.f32 x, x, 0fC038AA3B;\n\t"
-            "ex2.approx.ftz.f32 exponent, x;\n\t"
-            "add.rn.f32 denominator, exponent, 0f3F800000;\n\t"
-            "rcp.approx.ftz.f32 inverse, denominator;\n\t"
-            "mul.rn.f32 result, inverse, 0f40000000;\n\t"
-            "sub.rn.f32 result, result, 0f3F800000;\n\t"
-            "mul.rn.f32 $0, $2, result;\n\t}",
-            "=f,f,f,f",
-            has_side_effects=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
-            loc=loc,
-            ip=ip,
-        )
+    inv_beta = cutlass.Float32(1.0 / beta)
+    beta_f32 = cutlass.Float32(beta)
+    neg_two_log2e = cutlass.Float32(-2.885390043258667)
+    x = cute.arch.mul_packed_f32x2(values, (inv_beta, inv_beta), rnd="rn")
+    x = cute.arch.mul_packed_f32x2(x, (neg_two_log2e, neg_two_log2e), rnd="rn")
+    denominator = cute.arch.add_packed_f32x2(
+        (cute.math.exp2(x[0], fastmath=True), cute.math.exp2(x[1], fastmath=True)),
+        (1.0, 1.0),
+        rnd="rn",
     )
+    inverse = (
+        cute.arch.rcp_approx(denominator[0]),
+        cute.arch.rcp_approx(denominator[1]),
+    )
+    result = cute.arch.mul_packed_f32x2(inverse, (2.0, 2.0), rnd="rn")
+    result = cute.arch.sub_packed_f32x2(result, (1.0, 1.0), rnd="rn")
+    return cute.arch.mul_packed_f32x2((beta_f32, beta_f32), result, rnd="rn")
 
 
 def _align_n(x, alignment: int):
@@ -723,8 +716,17 @@ class Sm100W4A16GroupedGemmKernel:
         tArA_transform: cute.Tensor,
         tArA_transform_store: cute.Tensor,
         transform_tiler: cute.Layout,
-        k_tile_cnt: cutlass.Constexpr[int],
+        consumed_k: cutlass.Constexpr[int],
+        transform_group_idx: cutlass.Int32,
     ) -> tuple[pipeline.PipelineState, pipeline.PipelineState]:
+        k_tile_cnt = cute.ceil_div(consumed_k, self.mma_tiler[2])
+        group_k = self.mma_tiler[2] // self.num_transform_warpgroups
+        tail_k = consumed_k % self.mma_tiler[2]
+        transform_k_tiles = k_tile_cnt
+        if cutlass.const_expr(0 < tail_k <= self.mma_tiler[2] - group_k):
+            transform_k_tiles = k_tile_cnt - cutlass.Int32(
+                transform_group_idx >= cute.ceil_div(tail_k, group_k)
+            )
         a_load2trans_consumer_state.reset_count()
         peek_load2trans_full_status = cutlass.Boolean(1)
         if a_load2trans_consumer_state.count < k_tile_cnt:
@@ -762,56 +764,64 @@ class Sm100W4A16GroupedGemmKernel:
             )
             self._trace_transform_pop()
             self._trace_transform_push("transform_load_decode_nvfp4", _k_tile)
-            scale_stage_coord = (None,) * (cute.rank(tSsS_trans) - 1) + (
-                a_load2trans_consumer_state.index,
-            )
-            tSsS_slice = tSsS_trans[scale_stage_coord]
-            tSsS_slice_filtered = cute.make_tensor(
-                tSsS_slice.iterator,
-                cute.filter_zeros(tSsS_slice.layout),
-            )
-            cute.autovec_copy(tSsS_slice_filtered, tSrS_copy)
+            transform_valid = True
+            if cutlass.const_expr(0 < tail_k <= self.mma_tiler[2] - group_k):
+                transform_valid = _k_tile < transform_k_tiles
             cur_a_load2trans_consumer_state = a_load2trans_consumer_state.clone()
-            for idx in cutlass.range_constexpr(cute.size(tArA_load, mode=[1])):
-                cute.autovec_copy(
-                    tAsA_input_slice[(None, idx)],
-                    tArA_load[(None, idx)],
+            if transform_valid:
+                scale_stage_coord = (None,) * (cute.rank(tSsS_trans) - 1) + (
+                    a_load2trans_consumer_state.index,
                 )
-                if cutlass.const_expr(idx == cute.size(tArA_load, mode=[1]) - 1):
-                    a_load2trans_consumer_state.advance()
-                    if a_load2trans_consumer_state.count < k_tile_cnt:
-                        peek_load2trans_full_status = (
-                            a_load2trans_pipeline.consumer_try_wait(
-                                a_load2trans_consumer_state
+                tSsS_slice = tSsS_trans[scale_stage_coord]
+                tSsS_slice_filtered = cute.make_tensor(
+                    tSsS_slice.iterator,
+                    cute.filter_zeros(tSsS_slice.layout),
+                )
+                cute.autovec_copy(tSsS_slice_filtered, tSrS_copy)
+                for idx in cutlass.range_constexpr(cute.size(tArA_load, mode=[1])):
+                    cute.autovec_copy(
+                        tAsA_input_slice[(None, idx)],
+                        tArA_load[(None, idx)],
+                    )
+                    if cutlass.const_expr(idx == cute.size(tArA_load, mode=[1]) - 1):
+                        a_load2trans_consumer_state.advance()
+                        if a_load2trans_consumer_state.count < k_tile_cnt:
+                            peek_load2trans_full_status = (
+                                a_load2trans_pipeline.consumer_try_wait(
+                                    a_load2trans_consumer_state
+                                )
                             )
-                        )
-                packed_fragment = cute.recast_tensor(
-                    tArA_load[(None, idx)], cutlass.Uint8
-                ).load()
-                scale_slice = tSrS_load[(None, idx)]
-                scale_slice_compact = cute.make_tensor(
-                    scale_slice.iterator,
-                    cute.filter_zeros(scale_slice.layout),
-                )
-                scale_fragment = cute.recast_tensor(
-                    scale_slice_compact, cutlass.Uint8
-                ).load()
-                tensor_transformed = decode_nvfp4_fragment_to_bf16(
-                    packed_fragment,
-                    scale_fragment,
-                )
-                tArA_transform_store[(None, idx)].store(tensor_transformed)
+                    packed_fragment = cute.recast_tensor(
+                        tArA_load[(None, idx)], cutlass.Uint8
+                    ).load()
+                    scale_slice = tSrS_load[(None, idx)]
+                    scale_slice_compact = cute.make_tensor(
+                        scale_slice.iterator,
+                        cute.filter_zeros(scale_slice.layout),
+                    )
+                    scale_fragment = cute.recast_tensor(
+                        scale_slice_compact, cutlass.Uint8
+                    ).load()
+                    tensor_transformed = decode_nvfp4_fragment_to_bf16(
+                        packed_fragment,
+                        scale_fragment,
+                    )
+                    tArA_transform_store[(None, idx)].store(tensor_transformed)
+            else:
+                # Only the final stage can have a wholly unused K group.
+                a_load2trans_consumer_state.advance()
             self._trace_transform_pop()
 
             self._trace_transform_push("transform_store_commit_bf16", _k_tile)
             a_transform_stage_coord = (None,) * (cute.rank(tAsA_transform) - 1) + (
                 trans2mma_producer_state.index,
             )
-            mixed_input_utils.store_transformed_a(
-                tArA_transform,
-                tAsA_transform[a_transform_stage_coord],
-                dst_copy_a,
-            )
+            if transform_valid:
+                mixed_input_utils.store_transformed_a(
+                    tArA_transform,
+                    tAsA_transform[a_transform_stage_coord],
+                    dst_copy_a,
+                )
             self._finish_transform_stage(
                 a_load2trans_pipeline,
                 trans2mma_pipeline,
@@ -2125,7 +2135,8 @@ class Sm100W4A16GroupedGemmKernel:
                     tArA_transform,
                     tArA_transform_store,
                     transform_tiler,
-                    k_tile_cnt,
+                    mA_mkl.shape[1],
+                    transform_group_idx,
                 )
                 # Advance to next tile
                 tile_info_pipeline.consumer_wait(tile_info_consumer_state)
@@ -2388,9 +2399,8 @@ class Sm100W4A16GroupedGemmKernel:
                                 self.activation_type == ActivationType.Swiglu.value
                                 and self.situ_beta is not None
                             ):
-                                bounded_gate = (
-                                    _w4a16_scaled_tanh(gate_pair[0], self.situ_beta),
-                                    _w4a16_scaled_tanh(gate_pair[1], self.situ_beta),
+                                bounded_gate = _w4a16_scaled_tanh_pair(
+                                    gate_pair, self.situ_beta
                                 )
                                 gate_log2e = cute.arch.mul_packed_f32x2(
                                     gate_pair,
@@ -2413,13 +2423,8 @@ class Sm100W4A16GroupedGemmKernel:
                                 if cutlass.const_expr(
                                     self.situ_linear_beta is not None
                                 ):
-                                    up_pair = (
-                                        _w4a16_scaled_tanh(
-                                            up_pair[0], self.situ_linear_beta
-                                        ),
-                                        _w4a16_scaled_tanh(
-                                            up_pair[1], self.situ_linear_beta
-                                        ),
+                                    up_pair = _w4a16_scaled_tanh_pair(
+                                        up_pair, self.situ_linear_beta
                                     )
                                 result = cute.arch.mul_packed_f32x2(
                                     up_pair, situ_gate_pair
