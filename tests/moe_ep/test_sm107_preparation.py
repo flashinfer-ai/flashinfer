@@ -671,6 +671,46 @@ def test_quantized_staging_graph_masks_dirty_tail(
             graph.reset()
 
 
+@pytest.mark.parametrize("kind", ["nvfp4", "mxfp8_e4m3"])
+@pytest.mark.parametrize("check_routes", [None, "0", "1"])
+def test_fused_staging_routing_check_policy(monkeypatch, kind, check_routes):
+    from unittest.mock import Mock
+    from flashinfer.moe_ep.kernel_src.sm100 import cutedsl_megamoe as shared
+    from flashinfer.moe_ep.backends.mega.kernel.sm107.mxfp8_mxfp8_bf16_cutedsl.staging import (
+        stage_mega_moe_inputs as stage_mx,
+    )
+    from flashinfer.moe_ep.backends.mega.kernel.sm107.nvfp4_nvfp4_bf16_cutedsl.staging import (
+        stage_mega_moe_inputs as stage_nv,
+    )
+
+    monkeypatch.setenv("FLASHINFER_MEGA_FUSED_STAGE", "1")
+    monkeypatch.setenv("FLASHINFER_SM107_FUSED_ROUTE_CHECK", "1")
+    if check_routes is None:
+        monkeypatch.delenv("FLASHINFER_SM107_MEGA_CHECK_ROUTES", raising=False)
+    else:
+        monkeypatch.setenv("FLASHINFER_SM107_MEGA_CHECK_ROUTES", check_routes)
+    stage = Mock(wraps=shared.fused_quant_stage)
+    monkeypatch.setattr(shared, "fused_quant_stage", stage)
+    x = torch.ones(8, 128, device="cuda", dtype=torch.bfloat16)
+    ids = torch.tensor([0, -1], device="cuda", dtype=torch.int32).repeat(8, 1)
+    scores = torch.tensor([1.0, float("nan")], device="cuda").repeat(8, 1)
+    out = (
+        _buffers(8, 128, 2, torch.int32)
+        if kind == "nvfp4"
+        else (
+            torch.empty_like(x, dtype=torch.float8_e4m3fn),
+            torch.empty(8, 4, device="cuda", dtype=torch.float8_e8m0fnu),
+            torch.empty_like(ids),
+            torch.empty_like(scores),
+        )
+    )
+    (stage_nv if kind == "nvfp4" else stage_mx)(x, scores, ids, *out, num_experts=8)
+    torch.cuda.synchronize()
+    stage.assert_called_once()
+    assert stage.call_args.kwargs["num_experts"] == (8 if check_routes == "1" else None)
+    torch.testing.assert_close(out[3], scores, rtol=0, atol=0, equal_nan=True)
+
+
 def _invalid_staged_route(case, kind):
     """Require eager or captured staging to trap a route corrupted after warmup."""
     # A device assertion invalidates the CUDA context, so each case needs its

@@ -78,8 +78,8 @@ FP32. Activation and scale bytes are copied unchanged.
 Eligible BF16 inputs use fused quantization and staging for NVFP4 or MXFP8;
 unsupported layouts and score dtypes retain the Torch path. Set
 `FLASHINFER_MEGA_FUSED_STAGE=0` to use Torch staging. When enabled, routing
-validation runs inside eligible MXFP8 staging launches; other paths retain
-separate checks.
+validation runs inside eligible NVFP4 or MXFP8 staging launches; other paths
+retain separate checks.
 
 Routing value checks are off by default; the caller is responsible for valid
 routing. Set `FLASHINFER_SM107_MEGA_CHECK_ROUTES=1` to check ID ranges, duplicate

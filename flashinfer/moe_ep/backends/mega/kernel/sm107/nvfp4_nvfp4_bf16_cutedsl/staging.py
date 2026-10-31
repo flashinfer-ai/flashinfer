@@ -60,7 +60,7 @@ def stage_mega_moe_inputs(
     )
     check_routes = (
         num_experts is not None
-        and os.environ.get("FLASHINFER_SM107_MEGA_CHECK_ROUTES", "1") != "0"
+        and os.environ.get("FLASHINFER_SM107_MEGA_CHECK_ROUTES", "0") != "0"
     )
     fused_check = (
         check_routes
