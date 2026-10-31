@@ -344,3 +344,10 @@ Until then the C++ stays as-is and the DSL kernel lives beside it.
   Knobs removed: W8A16_DSL_KSPLIT (and the k-split code), W8A16_DSL_FIXUP_CUT,
   W8A16_DSL_FRAG, W8A16_DSL_AIN_SMEM, and the two tile-order knobs of today.  B300
   (sm103, umb-b300-023) runs both implementations correctly out of the box.
+- Sat 31 Oct 2026, 16:30: state after the cleanup (CUDA-graph tables, DSL vs C++, all 18
+  rows each): H100 -0.2 to -4.9%; GB200 -0.4 to -4.8%; B200 +0.1 worst (und.q 8192,
+  gate_up 8192), rest -0.1 to -3.8; B300 (50-call graphs) und.q 8192 +0.6 in the table,
+  -0.9 / -0.9 / -3.7 on three repeats, every other row -0.1 to -4.0.  Checks pass on
+  H100 (64 rows), GB200, B200, B300.  Plot: scratchpad w8a16_parity.png (four panels).
+  Next: swap the public op to the DSL path, tests under tests/gemm, docs; the per-die
+  dynamic tile counter for Blackwell as the follow-up perf item.
