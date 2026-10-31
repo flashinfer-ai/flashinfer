@@ -2112,7 +2112,9 @@ __device__ __forceinline__ void update_mdo_states(
           // Per-row clamp: fully masked rows (m == -inf) yield exp2(-inf) = 0, not NaN.
           const float m_scaled =
               max(m[mma_q][j] * sm_scale, -cuda::std::numeric_limits<float>::max());
-          float o_scale = math::ptx_exp2(m_prev * sm_scale - m_scaled);
+          // Match the rounding used for m_scaled. FMA contraction can otherwise
+          // make o_scale differ from 1 even when the running max is unchanged.
+          float o_scale = math::ptx_exp2(__fmul_rn(m_prev, sm_scale) - m_scaled);
           d[mma_q][j] *= o_scale;
 #pragma unroll
           for (uint32_t mma_d = 0; mma_d < KTraits::NUM_MMA_D_VO_TILE; ++mma_d) {
@@ -2124,13 +2126,13 @@ __device__ __forceinline__ void update_mdo_states(
 #pragma unroll
           for (uint32_t mma_kv = 0; mma_kv < KTraits::NUM_MMA_KV; ++mma_kv) {
             s_frag[mma_q][mma_kv][j * 2 + 0] =
-                math::ptx_exp2(s_frag[mma_q][mma_kv][j * 2 + 0] * sm_scale - m_scaled);
+                math::ptx_exp2(__fmul_rn(s_frag[mma_q][mma_kv][j * 2 + 0], sm_scale) - m_scaled);
             s_frag[mma_q][mma_kv][j * 2 + 1] =
-                math::ptx_exp2(s_frag[mma_q][mma_kv][j * 2 + 1] * sm_scale - m_scaled);
+                math::ptx_exp2(__fmul_rn(s_frag[mma_q][mma_kv][j * 2 + 1], sm_scale) - m_scaled);
             s_frag[mma_q][mma_kv][j * 2 + 4] =
-                math::ptx_exp2(s_frag[mma_q][mma_kv][j * 2 + 4] * sm_scale - m_scaled);
+                math::ptx_exp2(__fmul_rn(s_frag[mma_q][mma_kv][j * 2 + 4], sm_scale) - m_scaled);
             s_frag[mma_q][mma_kv][j * 2 + 5] =
-                math::ptx_exp2(s_frag[mma_q][mma_kv][j * 2 + 5] * sm_scale - m_scaled);
+                math::ptx_exp2(__fmul_rn(s_frag[mma_q][mma_kv][j * 2 + 5], sm_scale) - m_scaled);
           }
         }
       }
@@ -2169,10 +2171,11 @@ __device__ __forceinline__ void update_mdo_states(
           half2 m2s = make_half2(m_scaled_h, m_scaled_h);
 #pragma unroll
           for (uint32_t mma_kv = 0; mma_kv < KTraits::NUM_MMA_KV; ++mma_kv) {
+            // __hmul2_rn forbids HFMA2 contraction (see the float path above).
             *(half2*)&s_frag[mma_q][mma_kv][j * 2] =
-                math::ptx_exp2(*(half2*)&s_frag[mma_q][mma_kv][j * 2] * sm_scale - m2s);
-            *(half2*)&s_frag[mma_q][mma_kv][j * 2 + 4] =
-                math::ptx_exp2(*(half2*)&s_frag[mma_q][mma_kv][j * 2 + 4] * sm_scale - m2s);
+                math::ptx_exp2(__hmul2_rn(*(half2*)&s_frag[mma_q][mma_kv][j * 2], sm_scale) - m2s);
+            *(half2*)&s_frag[mma_q][mma_kv][j * 2 + 4] = math::ptx_exp2(
+                __hmul2_rn(*(half2*)&s_frag[mma_q][mma_kv][j * 2 + 4], sm_scale) - m2s);
           }
         }
       }
@@ -3927,7 +3930,8 @@ __device__ __forceinline__ void vosplit_softmax_store_p(
       float m_new = max(m_prev, mt);
       // Per-row clamp for fully masked rows (see update_mdo_states).
       const float m_new_scaled = max(m_new * sm_scale, -cuda::std::numeric_limits<float>::max());
-      o_scale[mma_q][j] = math::ptx_exp2(m_prev * sm_scale - m_new_scaled);
+      // __fmul_rn forbids FMA contraction; see update_mdo_states.
+      o_scale[mma_q][j] = math::ptx_exp2(__fmul_rn(m_prev, sm_scale) - m_new_scaled);
       d[mma_q][j] *= o_scale[mma_q][j];
       m[mma_q][j] = typename KTraits::DTypeQKAccum(m_new);
     }
@@ -3955,8 +3959,8 @@ __device__ __forceinline__ void vosplit_softmax_store_p(
           float p[4];
 #pragma unroll
           for (uint32_t k = 0; k < 2; ++k) {
-            p[k] = math::ptx_exp2(s[j * 2 + k] * sm_scale - m_new);
-            p[2 + k] = math::ptx_exp2(s[j * 2 + 4 + k] * sm_scale - m_new);
+            p[k] = math::ptx_exp2(__fmul_rn(s[j * 2 + k], sm_scale) - m_new);
+            p[2 + k] = math::ptx_exp2(__fmul_rn(s[j * 2 + 4 + k], sm_scale) - m_new);
           }
           dsum += (p[0] + p[2]) + (p[1] + p[3]);
           const uint32_t lo = __nv_cvt_float2_to_fp8x2(make_float2(p[0] * 256.f, p[1] * 256.f),
@@ -3971,8 +3975,10 @@ __device__ __forceinline__ void vosplit_softmax_store_p(
         } else {
 #pragma unroll
           for (uint32_t k = 0; k < 2; ++k) {  // reg positions j*2+{0,1} and j*2+{4,5}
-            float p0 = math::ptx_exp2(s_frag[mma_q][mma_kv][j * 2 + k] * sm_scale - m_new);
-            float p1 = math::ptx_exp2(s_frag[mma_q][mma_kv][j * 2 + 4 + k] * sm_scale - m_new);
+            float p0 =
+                math::ptx_exp2(__fmul_rn(s_frag[mma_q][mma_kv][j * 2 + k], sm_scale) - m_new);
+            float p1 =
+                math::ptx_exp2(__fmul_rn(s_frag[mma_q][mma_kv][j * 2 + 4 + k], sm_scale) - m_new);
             dsum += p0 + p1;
             const uint32_t col0 = mma_kv * 16 + 2 * (lane_idx % 4) + k;
             const uint32_t col1 = col0 + 8;
