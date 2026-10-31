@@ -73,6 +73,7 @@ class _BatchMLAPagedAttentionFa3Backend(_BatchMLAPagedAttentionFaBackendBase):
         output_dtype: torch.dtype,
         scale_mode: str,
         use_profiler: bool,
+        _workload_validated: bool = False,
     ) -> None:
         _validate_generated_fa_plan(
             backend="fa3",
@@ -111,6 +112,7 @@ class _BatchMLAPagedAttentionFa3Backend(_BatchMLAPagedAttentionFaBackendBase):
             q_data_type=q_data_type,
             kv_data_type=kv_data_type,
             use_profiler=use_profiler,
+            _workload_validated=_workload_validated,
         )
 
 
