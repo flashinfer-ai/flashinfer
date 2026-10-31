@@ -572,6 +572,9 @@ def _resolve_managed_store(
                     f"env {tuner._managed_cache.env_hash})."
                 )
             tuner._managed_cache = store
+            from .autotuner.protocol import _advance_execution_generation
+
+            _advance_execution_generation()
             # Deliberately NOT clearing _managed_decoded: it is keyed by
             # (root, env_hash, file_key), so entries decoded under other
             # identities coexist safely and are never served cross-identity.

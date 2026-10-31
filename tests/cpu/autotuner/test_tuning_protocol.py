@@ -59,6 +59,27 @@ def test_prepared_execution_generation_tracks_contexts_and_reload(managed):
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize("transition", ["context", "reload"])
+def test_prepared_execution_observes_other_threads(managed, transition):
+    from concurrent.futures import ThreadPoolExecutor
+    from flashinfer import autotune_v2
+    from flashinfer.autotune_cache import autotune_v2_reload
+
+    before = managed.protocol_context("test.protocol").execution_generation
+
+    def change():
+        if transition == "reload":
+            autotune_v2_reload()
+        else:
+            with autotune_v2(mode="replay", persistent_cache=False):
+                pass
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        executor.submit(change).result()
+    assert managed.protocol_context("test.protocol").execution_generation > before
+
+
+@pytest.mark.cpu_only
 def test_protocol_uses_shared_controls_and_statistics():
     tuner = reset_autotuner()
     protocol = RecordingProtocol()

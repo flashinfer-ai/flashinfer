@@ -580,8 +580,9 @@ def test_fixed_prepared_eager_execution_skips_collective_lookup(
     )
 
 
+@pytest.mark.parametrize("other_thread", [False, True])
 def test_prepared_execution_respects_scoped_and_empty_contexts(
-    state, monkeypatch, tmp_path
+    state, monkeypatch, tmp_path, other_thread
 ):
     from flashinfer.moe_ep.backends.mega.kernel.sm107 import automatic
     from flashinfer.moe_ep.kernel_src.sm107 import next_cutedsl_megamoe as package
@@ -610,8 +611,18 @@ def test_prepared_execution_respects_scoped_and_empty_contexts(
     with autotune_v2(cache_root=tmp_path / "scoped", cache_scope="context"):
         assert select() is True
     assert select() is False
-    with autotune_v2(mode="replay", cache_root=tmp_path / "scoped"):
-        pass
+
+    def attach():
+        with autotune_v2(mode="replay", cache_root=tmp_path / "scoped"):
+            pass
+
+    if other_thread:
+        from concurrent.futures import ThreadPoolExecutor
+
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            executor.submit(attach).result()
+    else:
+        attach()
     assert select() is True
     assert state.sweep.call_count == 2
 

@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 from contextvars import ContextVar
+from threading import Lock
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Generic, Protocol, TypeVar
 
@@ -26,11 +27,14 @@ def _protocol_cache_key(namespace: str, key: str) -> tuple[str, str, str]:
 
 # Scope identity is local and never enters a cache key or collective payload.
 _tuning_scope: ContextVar[object | None] = ContextVar("tuning_scope", default=None)
-_execution_generation: ContextVar[int] = ContextVar("execution_generation", default=0)
+_execution_generation = 0
+_execution_generation_lock = Lock()
 
 
 def _advance_execution_generation() -> None:
-    _execution_generation.set(_execution_generation.get() + 1)
+    global _execution_generation
+    with _execution_generation_lock:
+        _execution_generation += 1
 
 
 @dataclass(frozen=True)
@@ -50,13 +54,13 @@ class TuningContext:
 
     @property
     def execution_generation(self) -> int:
-        """Context transitions and explicit reloads invalidate prepared execution.
+        """Process-wide context and store transitions invalidate prepared execution.
 
         Unlike cache_identity, this does not change on rank-local cache clearing.
         Collective protocols can keep serving an agreed configuration until the
         next collective preparation point, without polling their peers.
         """
-        return _execution_generation.get()
+        return _execution_generation
 
     @property
     def skipped(self) -> bool:

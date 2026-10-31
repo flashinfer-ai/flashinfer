@@ -360,7 +360,8 @@ existing graphs; captured explicit handles require a new handle.
 Rubin automatic workspaces reuse their agreed configuration during ordinary
 eager execution, without selection collectives or cache lookups on each forward.
 The first forward after entering or leaving an autotune context reconciles the
-current cache and controls. This also covers a context that only attaches a store.
+current cache and controls. This also covers a context that only attaches a store,
+including an attachment from another thread.
 Explicit tuning and replay contexts keep collective checks enabled. After
 `autotune_v2_reload()` on every EP rank, the next eager forward reconciles the
 reloaded records. A rank-local `AutoTuner.clear_cache()` alone does not change a
