@@ -107,6 +107,7 @@ import torch.distributed as dist
 import tvm_ffi
 
 from . import (
+    _accumulator_layout,
     _alert_nondeterministic,
     _backward_accumulators,
     _cu_seqlens,
@@ -120,7 +121,7 @@ from . import (
     _weight,
 )
 from . import kcp_jit as _loader
-from .cake_jit import WIDTH, accumulator_layout, launch_grid, plan
+from .cake_jit import WIDTH, launch_grid, plan
 from .kcp_jit import load, route_modules, run_module, selected_modules
 
 HALO = WIDTH - 1  # history rows, tail rows and head rows per fragment
@@ -1094,7 +1095,7 @@ def _kcp_backward(
         )
     acc, acc_work = _backward_accumulators(
         None,
-        accumulator_layout(record, C, scalars["n_ch_tiles"]),
+        _accumulator_layout(record, C, scalars["n_ch_tiles"]),
         device=device,
         device_index=device_index,
         entry="cake_causal_conv1d_backward_kcp",
@@ -1228,7 +1229,7 @@ def _bwd_host(
                 raise ValueError(
                     f"C={C} spans more channel tiles than the backward's grid on this device holds"
                 )
-            e["layout"] = accumulator_layout(record, C, scalars["n_ch_tiles"])
+            e["layout"] = _accumulator_layout(record, C, scalars["n_ch_tiles"])
             e["scalars"] = _scalars(scalars)
             e["launches"] = tuple(
                 _launch_plan(

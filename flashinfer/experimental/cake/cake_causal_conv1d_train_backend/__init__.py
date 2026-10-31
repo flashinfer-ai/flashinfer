@@ -84,6 +84,7 @@ import warnings
 from typing import Optional
 
 import torch
+from torch.utils.weak import WeakIdKeyDictionary
 
 from . import cake_jit as _loader
 from .cake_jit import (
@@ -128,6 +129,14 @@ _FORWARD_WORKSPACES: dict[tuple[int, int], torch.Tensor] = {}
 # ticket counters, grown as needed.  Every launch leaves its accumulators and
 # counters zero, so the stream's buffer serves every later backward call on it.
 _BACKWARD_WORKSPACES: dict[tuple[int, int], torch.Tensor] = {}
+# The byte layout of a backward launch per accumulator rule, C and channel tile count (a pure function of them),
+# computed once: it is on the host path of every backward call before its launch.
+_LAYOUTS: dict[tuple, dict] = {}
+# The ``(acc, work)`` tensors of each backward workspace per layout, built once and reused while the workspace keeps
+# its storage: retyping two slices of the workspace before every launch costs about 3 us of host time in front of
+# the launch.  They alias the workspace's storage, not the tensor (``Tensor.set_``, no view base), so an entry dies
+# with its workspace; an entry whose workspace's storage moved (``resize_`` / ``set_``) is rebuilt.
+_ACCUMULATOR_VIEWS: WeakIdKeyDictionary = WeakIdKeyDictionary()
 # The torch dtype of each accumulator / counter dtype name of a workspace rule.
 _TORCH_DTYPES = {
     "float32": torch.float32,
@@ -575,6 +584,70 @@ def _forward_work(
     return held
 
 
+def _accumulator_layout(record: dict, C: int, n_ch_tiles: int) -> dict:
+    """:func:`cake_jit.accumulator_layout` of ``record``, computed once per accumulator rule, ``C`` and
+    ``n_ch_tiles`` (the returned mapping is shared: read it, never change it)."""
+
+    rule = record["workspace_rule"]
+    if rule is None:
+        return accumulator_layout(record, C, n_ch_tiles)  # raises naming the record
+    key = (rule["kind"], rule["acc"], rule["taps"], rule["work"], C, n_ch_tiles)
+    layout = _LAYOUTS.get(key)
+    if layout is None:
+        layout = _LAYOUTS[key] = accumulator_layout(record, C, n_ch_tiles)
+    return layout
+
+
+def _storage_view(
+    ws: torch.Tensor, byte_offset: int, count: int, dtype: torch.dtype
+) -> Optional[torch.Tensor]:
+    """``count`` ``dtype`` elements at ``byte_offset`` of the uint8 tensor ``ws``, aliasing its storage without
+    referencing ``ws`` itself; ``None`` when that offset is not a whole number of elements of the storage."""
+
+    start = ws.storage_offset() + int(byte_offset)
+    if start % dtype.itemsize:
+        return None
+    return torch.empty(0, dtype=dtype, device=ws.device).set_(
+        ws.untyped_storage(), start // dtype.itemsize, (int(count),), (1,)
+    )
+
+
+def _accumulator_views(
+    ws: torch.Tensor, layout: dict
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """The ``(acc, work)`` tensors of ``layout`` inside the validated uint8 workspace ``ws``: cached per workspace
+    and layout (see ``_ACCUMULATOR_VIEWS``)."""
+
+    key = (
+        layout["acc_dtype"],
+        layout["acc_elems"],
+        layout["work_dtype"],
+        layout["work_offset"],
+        layout["work_words"],
+    )
+    ptr = ws.data_ptr()
+    per_layout = _ACCUMULATOR_VIEWS.get(ws)
+    if per_layout is None:
+        per_layout = _ACCUMULATOR_VIEWS[ws] = {}
+    else:
+        held = per_layout.get(key)
+        if held is not None and held[0] == ptr:
+            return held[1], held[2]
+    acc_dtype = _TORCH_DTYPES[layout["acc_dtype"]]
+    work_dtype = _TORCH_DTYPES[layout["work_dtype"]]
+    acc = _storage_view(ws, 0, layout["acc_elems"], acc_dtype)
+    work = _storage_view(ws, layout["work_offset"], layout["work_words"], work_dtype)
+    if acc is None or work is None:  # a storage offset off the element grid: plain views, not cached
+        work_offset = int(layout["work_offset"])
+        acc = ws[: int(layout["acc_bytes"])].view(acc_dtype)
+        work = ws[work_offset : work_offset + 4 * int(layout["work_words"])].view(
+            work_dtype
+        )
+        return acc, work
+    per_layout[key] = (ptr, acc, work)
+    return acc, work
+
+
 def _backward_accumulators(
     workspace: object,
     layout: dict,
@@ -597,7 +670,8 @@ def _backward_accumulators(
     zero, so a zeroed buffer stays zero whatever ``C`` or route the next call
     has.  ``acc`` is a ``float32`` / ``float64`` view of ``layout["acc_elems"]``
     words at offset 0, ``work`` a ``uint32`` view of ``layout["work_words"]``
-    counters at ``layout["work_offset"]``.
+    counters at ``layout["work_offset"]``; both are built once per workspace and
+    layout (``_ACCUMULATOR_VIEWS``), except for the fresh buffer of a capture.
     """
 
     nbytes = int(layout["total_bytes"])
@@ -619,7 +693,14 @@ def _backward_accumulators(
                 "(a zeroed buffer)"
             )
     elif torch.cuda.is_current_stream_capturing():
+        # a fresh buffer of this capture: plain views, nothing cached
         ws = torch.zeros(nbytes, dtype=torch.uint8, device=device)
+        work_offset = int(layout["work_offset"])
+        acc = ws[: int(layout["acc_bytes"])].view(_TORCH_DTYPES[layout["acc_dtype"]])
+        work = ws[work_offset : work_offset + 4 * int(layout["work_words"])].view(
+            _TORCH_DTYPES[layout["work_dtype"]]
+        )
+        return acc, work
     else:
         key = (
             device_index,
@@ -629,12 +710,7 @@ def _backward_accumulators(
         if ws is None or ws.numel() < nbytes:
             ws = torch.zeros(nbytes, dtype=torch.uint8, device=device)
             _BACKWARD_WORKSPACES[key] = ws
-    acc_end = int(layout["acc_bytes"])
-    work_offset = int(layout["work_offset"])
-    work_end = work_offset + 4 * int(layout["work_words"])
-    acc = ws[:acc_end].view(_TORCH_DTYPES[layout["acc_dtype"]])
-    work = ws[work_offset:work_end].view(_TORCH_DTYPES[layout["work_dtype"]])
-    return acc, work
+    return _accumulator_views(ws, layout)
 
 
 def cake_causal_conv1d_train_forward(
@@ -852,7 +928,7 @@ def cake_causal_conv1d_train_backward(
     record = _loader.MODULES[names[0]]
     device_index = _device_index(device)
     scalars, grid = _launch(record, S, C, num_docs, device_index=device_index)
-    layout = accumulator_layout(record, C, scalars["n_ch_tiles"])
+    layout = _accumulator_layout(record, C, scalars["n_ch_tiles"])
     acc, work = _backward_accumulators(
         workspace,
         layout,

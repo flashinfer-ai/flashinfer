@@ -42,6 +42,7 @@ rendered the package (``build.json`` and ``csrc/``).
 
 from __future__ import annotations
 
+import gc
 import statistics
 
 import pytest
@@ -747,6 +748,47 @@ def test_workspace_validation() -> None:
             dy,
             workspace=torch.zeros(1, nbytes, dtype=torch.uint8, device=_device()),
         )
+
+
+def test_workspace_views_are_built_once_per_workspace() -> None:
+    """The ``acc`` / ``work`` tensors of a workspace are built once per layout and reused by later calls; they
+    alias its storage but not the tensor, follow the storage when it moves, and are dropped with the
+    workspace."""
+
+    S, C, docs = 1000, 1280, "perf"
+    device = _device()
+    x, w, cu, dy = _inputs(S, C, docs)
+    refs = reference_backward(x, w, cu, dy)
+    nbytes = pkg.cake_causal_conv1d_train_backward_workspace_bytes(
+        S, C, device, deterministic=False
+    )
+    workspace = pkg.cake_causal_conv1d_train_backward_workspace(
+        S, C, device, deterministic=False
+    )
+    entries = len(pkg._ACCUMULATOR_VIEWS)
+    for call in range(2):
+        dx, dw, _ = _backward(x, w, cu, dy, workspace=workspace)
+        _check_grads(dx, dw, None, refs, policy="bf16", label=f"call {call}")
+    held = pkg._ACCUMULATOR_VIEWS.get(workspace)
+    assert held is not None and len(held) == 1
+    ((ptr, acc, work),) = held.values()
+    assert ptr == workspace.data_ptr()
+    assert acc._base is None and work._base is None
+    storage = workspace.untyped_storage().data_ptr()
+    assert acc.untyped_storage().data_ptr() == storage
+    assert work.untyped_storage().data_ptr() == storage
+    moved = torch.zeros(nbytes, dtype=torch.uint8, device=device)
+    workspace.set_(moved.untyped_storage(), 0, (nbytes,), (1,))
+    del moved
+    dx, dw, _ = _backward(x, w, cu, dy, workspace=workspace)
+    _check_grads(dx, dw, None, refs, policy="bf16", label="moved storage")
+    ((ptr, acc, work),) = pkg._ACCUMULATOR_VIEWS.get(workspace).values()
+    assert ptr == workspace.data_ptr()
+    assert acc.untyped_storage().data_ptr() == workspace.untyped_storage().data_ptr()
+    assert int(torch.count_nonzero(workspace)) == 0
+    del workspace, held, acc, work
+    gc.collect()
+    assert len(pkg._ACCUMULATOR_VIEWS) == entries
 
 
 # ----------------------------------------------------------------------------------------------------------------
