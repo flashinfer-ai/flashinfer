@@ -127,6 +127,7 @@ def sr_hw_module():
 
 
 def _as_float(bits16: torch.Tensor) -> torch.Tensor:
+    """Reinterpret raw fp16 bit patterns (int16) as float64 values."""
     return bits16.view(torch.float16).to(torch.float64)
 
 
@@ -140,6 +141,7 @@ def _fp16_ulp(x: torch.Tensor) -> torch.Tensor:
 
 
 def _magnitude_grid(lo: float, hi: float, n: int, seed: int) -> torch.Tensor:
+    """Return n fp32 values log-spaced over [lo, hi] with random signs and jitter (deterministic per seed)."""
     g = torch.Generator().manual_seed(seed)
     mags = torch.logspace(
         torch.log10(torch.tensor(lo)),
@@ -158,6 +160,7 @@ def _magnitude_grid(lo: float, hi: float, n: int, seed: int) -> torch.Tensor:
 # ---------------------------------------------------------------------------
 @pytest.mark.parametrize("seed", [0, 7])
 def test_sw_sr_unbiased_full_range(sr_module, seed):
+    """Mean of the software SR over all 8192 random draws equals x (within 1/8192 ulp), 1e-8..1e3."""
     x = _magnitude_grid(1e-8, 1e3, 256, seed).cuda()
     out = _as_float(sr_module.sr_all_rand(x, 0))  # (n, 8192)
     mean = out.mean(dim=1)
@@ -179,6 +182,7 @@ def test_sw_sr_unbiased_full_range(sr_module, seed):
 # Test 2: no flush to zero for fp16-subnormal inputs (any GPU)
 # ---------------------------------------------------------------------------
 def test_sw_sr_no_flush_to_zero(sr_module):
+    """Subnormal-range inputs are not flushed to zero: P(out == 0) is exactly 1 - |x| / 2^-24."""
     # fp16-subnormal range [2^-24, 2^-14) plus values below the smallest subnormal.
     x = torch.cat(
         [
@@ -209,6 +213,7 @@ def test_sw_sr_no_flush_to_zero(sr_module):
 # ---------------------------------------------------------------------------
 @pytest.mark.parametrize("seed", [0, 42])
 def test_sw_sr_bit_identical_normal_range(sr_module, seed):
+    """For |x| >= 2^-14 (and overflow edges / NaN) the result is bit-identical to the previous formulation."""
     edge = torch.tensor(
         [
             _FP16_MIN_NORMAL,
@@ -242,6 +247,7 @@ def test_sw_sr_bit_identical_normal_range(sr_module, seed):
 # Test 3b: Inf is preserved (any GPU)
 # ---------------------------------------------------------------------------
 def test_sw_sr_inf_preserved(sr_module):
+    """+/-Inf stays +/-Inf for every random draw (the previous formulation produced NaN)."""
     x = torch.tensor([float("inf"), float("-inf")], dtype=torch.float32).cuda()
     bits = sr_module.sr_all_rand(x, 0).to(torch.int32) & 0xFFFF
     assert torch.all(bits[0] == 0x7C00), "+Inf must stay +Inf for every random draw"
@@ -252,6 +258,7 @@ def test_sw_sr_inf_preserved(sr_module):
 # Test 4: hardware cvt.rs vs software (cvt.rs GPUs only)
 # ---------------------------------------------------------------------------
 def test_sw_sr_matches_hw_distribution(sr_module, sr_hw_module):
+    """On cvt.rs GPUs: bitwise equal to hardware for fp16-normal inputs, same mean for subnormal inputs."""
     normal = _magnitude_grid(_FP16_MIN_NORMAL, 65000.0, 256, 3).cuda()
     hw = sr_hw_module.sr_all_rand(normal, 2)
     sw = sr_module.sr_all_rand(normal, 0)

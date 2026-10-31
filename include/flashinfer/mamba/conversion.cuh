@@ -215,9 +215,13 @@ __device__ __forceinline__ uint16_t cvt_rs_f16_sw(float x, uint32_t rand13) {
   if (rem > 0.0f) {
     uint16_t hi = static_cast<uint16_t>(lo + 1u);  // next fp16 away from zero (0x7BFF + 1 = Inf)
     float ulp = (hi == 0x7C00u) ? 32.0f : (__half2float(__ushort_as_half(hi)) - lo_f);
-    // Round up with probability rem / ulp; `rem / ulp * 8192` is an exact integer for normal
+    // ulp is a power of two (2^-24 .. 2^5), so its reciprocal is exact: flip the fp32 exponent
+    // (2^k -> 2^-k) and multiply instead of dividing.  rem * inv_ulp == rem / ulp bit for bit, so
+    // the rounding decisions are unchanged.
+    float inv_ulp = __uint_as_float(0x7F000000u - __float_as_uint(ulp));
+    // Round up with probability rem / ulp; `rem * inv_ulp * 8192` is an exact integer for normal
     // results.
-    if (static_cast<float>(rand13 & 0x1FFFu) >= 8192.0f - rem / ulp * 8192.0f) lo = hi;
+    if (static_cast<float>(rand13 & 0x1FFFu) >= 8192.0f - rem * inv_ulp * 8192.0f) lo = hi;
   }
 
   return sign16 | lo;
