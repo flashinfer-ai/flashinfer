@@ -131,21 +131,21 @@ def _dense_reference(q, kv, scale, meta, prefix, items, head_dim, group):
 @pytest.mark.parametrize("layout", ["NHD", "HND"])
 @pytest.mark.parametrize("group", [1, 2, 3])
 @pytest.mark.parametrize("policy", ["default", "no_split", "fixed_3_pages"])
-@pytest.mark.parametrize("prefix,items,query_tokens", [(17, 16, 71), (129, 8, None)])
-def test_mis_fp8_query_prefetch_bounds(
-    layout, group, policy, prefix, items, query_tokens
-):
+@pytest.mark.parametrize("prefix,items", [(17, 16), (129, 8)])
+def test_mis_fp8_query_prefetch_bounds(layout, group, policy, prefix, items):
     """Check FP8-query MIS prefetch against a dense reference on SM120."""
     if not torch.cuda.is_available():
         pytest.skip("requires CUDA")
     if get_compute_capability(torch.device("cuda:0")) != (12, 0):
         pytest.skip("FA2 FP8 query public API requires SM120")
+    # The e4m3-query kernel requires the single-warp-row CTA16 layout.
+    # Bound packed (query, head) rows, including non-power-of-two GQA.
     q16, kv16, meta, _, _ = _reference_case_maker()(
         [(prefix, [31] * items)],
         dtype=torch.float16,
         dim=256,
         group=group,
-        query_tokens=query_tokens,
+        query_tokens=16 // group,
     )
     q, kv = q16.to(torch.float8_e4m3fn), kv16.to(torch.float8_e4m3fn)
     reference, ref_lse = _dense_reference(q, kv, None, meta, prefix, items, 256, group)
@@ -162,6 +162,7 @@ def test_mis_fp8_query_prefetch_bounds(
         workspace, layout, backend="fa2"
     )
     wrapper.plan(**meta, **options)
+    assert wrapper._plan_info[3] == 16
     out, lse = wrapper.run(q, kv, return_lse=True)
     torch.testing.assert_close(out.cpu().float(), reference, rtol=1e-2, atol=1e-2)
     torch.testing.assert_close(lse.cpu(), ref_lse, rtol=1e-2, atol=1e-2)
