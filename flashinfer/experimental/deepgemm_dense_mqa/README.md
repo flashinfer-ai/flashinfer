@@ -187,7 +187,9 @@ architecture) that bound the single-launch 32-head routes, -- v10 --
 `fused_qle128_max_kv` (the KV bound of the single-launch fused `fp8:qle128:short` route: `1 < Q <= 128`),
 `fused_qle2048_max_kv` (the KV bound of the single-launch fused `fp8:qle2048:short` route: `128 < Q <= 2048`; a
 PER-ARCHITECTURE map `{"sm_100a": 34048, "sm_103a": 65536}` -- the logical `route_name` applies the most permissive
-bound, `served_route` the device's own) and `single_launch_precedence` (per architecture and overlap tier `le128` /
+bound, `served_route` the device's own; the per-architecture small-Q band `fused_qle2048_small_q_max_queries` /
+`fused_qle2048_small_q_max_kv` raises it to the band's KV bound for a query count up to the band's query bound -- sm_103a
+up to Q = 256 at K <= 65792, none on sm_100a (query bound 128)) and `single_launch_precedence` (per architecture and overlap tier `le128` /
 `le2048`, the consultation order of the two single-launch families `le_class` / `qle`; a reader must know every key --
 the schema version carries them together), -- v13 -- `h32_text_options` (per architecture, `{route: [option, ...]}` over the
 32-head routes whose delivered logits program is built with an adopted cache-hint / ordering option -- `scan_window_l2_prefetch`,

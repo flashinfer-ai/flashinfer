@@ -113,6 +113,17 @@ def _fused_qle2048_bounds():
     return {a: int(v) for a, v in _catalog()["policy"]["fused_qle2048_max_kv"].items()}
 
 
+def _fused_qle2048_bound(arch, queries):
+    """The KV bound of ``fp8:qle2048:short`` for ``queries`` on ``arch``: ``policy.fused_qle2048_max_kv[arch]``, raised to
+    ``policy.fused_qle2048_small_q_max_kv[arch]`` for a query count up to ``policy.fused_qle2048_small_q_max_queries[arch]``
+    (the small-Q band, measured per device; 128 -- no query count of the tier -- where an architecture has none)."""
+    policy = _catalog()["policy"]
+    bound = int(policy["fused_qle2048_max_kv"][arch])
+    if queries <= int(policy["fused_qle2048_small_q_max_queries"][arch]):
+        bound = max(bound, int(policy["fused_qle2048_small_q_max_kv"][arch]))
+    return bound
+
+
 @functools.cache
 def device_facts(device_index):
     """``(arch, sm_count)`` of one CUDA device through FlashInfer's cached device queries."""
@@ -377,7 +388,7 @@ def _route_name_on(
                     return f"{prefix}:qle128:short"
                 if tier == "le2048":
                     bound = (
-                        _fused_qle2048_bounds()[arch]
+                        _fused_qle2048_bound(arch, queries)
                         if qle2048_max_kv is None
                         else int(qle2048_max_kv)
                     )
@@ -404,7 +415,9 @@ def route_name(precision, queries, keys, num_heads=NUM_HEADS):
     single-launch fused Q <= 2048 program for ``128 < Q <= 2048`` and
     ``K <= policy.fused_qle2048_max_kv[arch]`` on the most permissive
     architecture -- the key is per architecture, 34048 on sm_100a and 65536 on
-    sm_103a; a device whose bound the K exceeds is served the next family or the
+    sm_103a, raised for a query count up to ``fused_qle2048_small_q_max_queries[arch]``
+    to ``fused_qle2048_small_q_max_kv[arch]`` (:func:`_fused_qle2048_bound`); a device
+    whose bound the K exceeds is served the next family or the
     two-launch tier route, :func:`served_route`); their K rule is each route
     record's ``kv_alignment`` for the device's architecture (256 for FP4, 256 or 1
     per FP8 route and architecture as the catalog publishes it) with the record's
@@ -448,7 +461,7 @@ def route_name(precision, queries, keys, num_heads=NUM_HEADS):
     precedence (``ValueError`` otherwise -- pass the device to :func:`served_route`).
     """
     arches = sorted(_catalog()["arches"])
-    union = max(_fused_qle2048_bounds().values())
+    union = max(_fused_qle2048_bound(a, queries) for a in arches)
     verdicts = {
         a: _route_name_on(
             precision, queries, keys, num_heads, a, qle2048_max_kv=union, scan_arch=None
