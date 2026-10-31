@@ -220,7 +220,8 @@ def test_the_loader_and_header_are_the_pinned_bytes_of_every_cake_package() -> N
     _manifest_or_skip()
     # Another package's copy, read from the repository (not imported: the vendored gate blocks flashinfer).
     other = (
-        Path(__file__).resolve().parents[2] / "flashinfer/experimental/cake_kda_train"
+        Path(__file__).resolve().parents[2]
+        / "flashinfer/experimental/cake_kda_det_train"
     )
     for relative in ("cake_build.py", "csrc/cake_ffi_checks.h"):
         assert (PACKAGE_DIR / relative).read_bytes() == (
