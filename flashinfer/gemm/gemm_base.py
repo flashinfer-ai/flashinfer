@@ -3206,8 +3206,28 @@ def fp8_gemm_sm100(
     runner(inputs=inputs, tactic=tactic)
 
 
-def _create_cutlass_fp4_gemm_module(module, op_name: str, tuner_name: str):
+def _sm120_fp4_gemm_tactic_is_stream_k(tactic: int) -> bool:
+    # CutlassFp4GemmRunner::getConfigs() in fp4_gemm_cutlass_template_sm120.h emits each
+    # tile shape as four configs: two data-parallel, then two stream-K.
+    return tactic % 4 >= 2
+
+
+def _create_cutlass_fp4_gemm_module(
+    module,
+    op_name: str,
+    tuner_name: str,
+    is_stream_k_tactic: Optional[Callable[[int], bool]] = None,
+):
     """Helper function to create cutlass FP4 GEMM module."""
+
+    def _stream_k_disabled() -> bool:
+        # A stream-K tactic sums a tile's K range in more than one CTA, so its result
+        # can differ in the last bits from the data-parallel tactics. When the
+        # autotuner picks by timing, the output then depends on which tactic won;
+        # this option limits the choice to data-parallel tactics.
+        return is_stream_k_tactic is not None and os.environ.get(
+            "FLASHINFER_FP4_GEMM_DISABLE_STREAM_K", "0"
+        ) not in ("0", "", "false", "False")
 
     def cutlass_fp4_gemm_runner():
         class CutlassFp4GemmRunner(TunableRunner):
@@ -3219,7 +3239,16 @@ def _create_cutlass_fp4_gemm_module(module, op_name: str, tuner_name: str):
                 inputs: List[torch.Tensor],
                 profile: OptimizationProfile,
             ) -> List[int]:
-                return list(range(module.fp4_gemm_tactic_num()))
+                tactics = list(range(module.fp4_gemm_tactic_num()))
+                if _stream_k_disabled():
+                    tactics = [t for t in tactics if not is_stream_k_tactic(t)]
+                return tactics
+
+            def validate_tactic(self, inputs: List[torch.Tensor], tactic: int) -> bool:
+                # Also rejects a stream-K tactic read back from a saved autotune cache.
+                return not (
+                    _stream_k_disabled() and tactic >= 0 and is_stream_k_tactic(tactic)
+                )
 
             def forward(
                 self,
@@ -3281,7 +3310,10 @@ def get_gemm_sm120_module_cutlass_fp4():
     """Get the SM120/121 FP4 GEMM module."""
     module = gen_gemm_sm120_module_cutlass_fp4().build_and_load()
     return _create_cutlass_fp4_gemm_module(
-        module, "flashinfer::cutlass_fp4_gemm_sm120", "cutlass_fp4_gemm_sm120"
+        module,
+        "flashinfer::cutlass_fp4_gemm_sm120",
+        "cutlass_fp4_gemm_sm120",
+        is_stream_k_tactic=_sm120_fp4_gemm_tactic_is_stream_k,
     )
 
 
