@@ -351,7 +351,12 @@ def sparse_host(no_accelerator_work):
     )
     _load_definitions(
         _PRIVATE,
-        ("CombinedSparseRouteView", "CombinedSparseTile", "bind_combined_sparse_views"),
+        (
+            "CombinedSparseRouteView",
+            "CombinedSparseTile",
+            "_live_lengths",
+            "bind_combined_sparse_views",
+        ),
         namespace,
     )
     return SimpleNamespace(memory=memory, **namespace)
@@ -463,10 +468,35 @@ def test_host_scalars_preserve_signed_wrap_and_boolean_complement():
     assert int(np.int64(_INT_MAX + 65)) == _INT_MAX + 65
 
 
-def test_binder_rejects_persistent_request_before_touching_inputs(sparse_host):
-    poison = object()
-    with pytest.raises(ValueError, match="nonpersistent request"):
-        sparse_host.bind_combined_sparse_views(poison, poison, poison, poison, 256)
+@pytest.mark.parametrize("k", (0, 192, 512))
+def test_persistent_binder_resolves_each_work_tile_request(sparse_host, k):
+    """A request-free (persistent) view binds whichever request names a tile.
+
+    Every request's gathered rows, masks and quads match a CTA bound to that
+    request once, including clamped and adversarial live lengths.
+    """
+    seq_lens = (0, 3, 300, 128)
+    topk_lens = (128, 128 + k // 2, _INT_MAX, _INT_MIN)
+    rows = [[(column * 7 + r) % 61 for column in range(128 + k)] for r in range(4)]
+    case = _case(sparse_host, k, seq_lens, topk_lens, rows=rows)
+    persistent, lengths = sparse_host.bind_combined_sparse_views(
+        case.table, case.seq, case.topk, case.pools, case.capacity
+    )
+    assert int(lengths[np.int32(3)]) == case.extent
+    for request in map(np.int32, range(4)):
+        bound, _ = sparse_host.bind_combined_sparse_views(
+            case.table, case.seq, case.topk, case.pools, case.capacity, request=request
+        )
+        for token in map(np.int32, range(case.capacity)):
+            assert int(persistent[token, request]) == int(bound[token, request])
+            assert bool(persistent.is_invalid(token, request)) == bool(
+                bound.is_invalid(token, request)
+            )
+        for token in map(np.int32, range(0, case.capacity, 4)):
+            for method in ("load_quad", "load_full_quad"):
+                got = getattr(persistent.select_source_tile(token, request), method)
+                want = getattr(bound.select_source_tile(token, request), method)
+                assert [int(v) for v in got(token)] == [int(v) for v in want(token)]
 
 
 @pytest.mark.parametrize("k,extent", _WIDTH_EXTENTS)
@@ -718,6 +748,9 @@ def test_structural_hooks_follow_core_sparse_length_tuple_convention(
             np.int32(1),
             np.int64(23),
             np.int64(17),
+            # A bound route no longer needs the per-request length tensors.
+            None,
+            None,
         )
     elif kind == "tile":
         original = case.routes.select_source_tile(np.int32(128), case.request)

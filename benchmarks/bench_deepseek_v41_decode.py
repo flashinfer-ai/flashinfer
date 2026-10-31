@@ -27,11 +27,11 @@ timing; replay includes inline live-metadata masking, selected-tile staging
 and joint attention/finalization. Cache writing, allocation, JIT, capture and
 host overhead are excluded for every arm.
 
-Prims-TS requires CuTe-DSL >= 4.8 with its bundled CUDA 13 compiler and a
-nonpersistent schedule; small batches split long KV lists across CTAs, merged by
-a separate reducer (rows record the split). Measured B200 Prims-TS and upstream FlashMLA latencies
-are recorded in examples/deepseek_v41/README.md; backend crossovers against the
-cute-dsl arm remain unmeasured.
+Prims-TS requires CuTe-DSL >= 4.8 with its bundled CUDA 13 compiler. Grids
+above one wave run persistently; small batches split long KV lists across CTAs,
+merged by a separate reducer (rows record the split). Measured B200 Prims-TS
+and upstream FlashMLA latencies are recorded in examples/deepseek_v41/README.md;
+backend crossovers against the cute-dsl arm remain unmeasured.
 See examples/deepseek_v41/README.md for scope and reproducer commands.
 """
 
@@ -313,7 +313,8 @@ def arm_metadata(name, args):
     if native_fp8:
         arithmetic = (
             "native E4M3 Q/K/V/P for SWA and main; "
-            "BK128/Keep-AB/M64/retained8/batch-selected KV split/nonpersistent; "
+            "BK128/Keep-AB/M64/retained8/batch-selected KV split/"
+            "persistent above one wave; "
             "original E4M3 Q, no BF16 query scratch"
         )
         global_conversion = (

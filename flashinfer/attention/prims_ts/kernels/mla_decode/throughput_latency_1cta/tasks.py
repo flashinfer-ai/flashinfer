@@ -246,7 +246,8 @@ def create_throughput_latency_softmax_task_impl(
             local_sum_arr,
             s_arr,
         ) = tmem_s.init_softmax_state()
-        if store_stats_before_p:
+        if store_stats_before_p and hasattr(p_resource, "init_materialize_state"):
+            # SMEM P prepares its stage view here; TMEM P needs no setup.
             p_resource.init_materialize_state()
 
         def store_stats(inst_idx: int):
@@ -425,7 +426,14 @@ def create_keeps_mma_ab_softmax_task(
     task_class=MlaDecodeTask,
     **kw,
 ) -> Task:
-    """Create the single-pipe softmax/P task for the keeps-MMA-AB path."""
+    """Create the single-pipe softmax/P task for the keeps-MMA-AB path.
+
+    Loop correction rescales O from the old/new maxima only, which are final
+    once update_softmax returns, so publish them before materializing P: the
+    correction then overlaps P materialization instead of following it, and
+    PV no longer waits for both in sequence. The running sum still updates
+    after P, before the tail stats that normalize the output.
+    """
     return create_throughput_latency_softmax_task_impl(
         tmem_s,
         tmem_softmax_local,
@@ -435,7 +443,7 @@ def create_keeps_mma_ab_softmax_task(
         cfg,
         inst_id=0,
         domain=domain,
-        store_stats_before_p=False,
+        store_stats_before_p=True,
         task_name="SoftmaxTask",
         task_class=task_class,
         **kw,

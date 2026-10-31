@@ -226,9 +226,12 @@ this convention does not establish equivalence to official token/block64 quantiz
 
 ### Kernel, capture and validation boundary
 
-Attention uses Keep-AB/M64/BK128/retained-KV8/nonpersistent scheduling, inline
-metadata and optional FP32 per-head sinks. An unsplit call is one finalizing
-kernel. A KV-split call (below) adds one PDL-chained reducer that merges the
+Attention uses Keep-AB/M64/BK128/retained-KV8 scheduling, inline metadata and
+optional FP32 per-head sinks. One CTA serves each request, except that an unsplit
+grid with more requests than SMs runs persistently: each CTA walks several
+requests, so one request's prologue and output overlap the next one's tiles.
+An unsplit call is one finalizing kernel. A KV-split call (below) adds one
+PDL-chained reducer that merges the
 BF16 partials, applies sinks once and writes output and LSE. The attention
 kernel launches with PDL: it waits for the preceding grid before reading any
 input, and grids of at most a quarter of the SMs release their dependents at
@@ -239,7 +242,9 @@ Sinks contain finite logits or -inf and affect output normalization exactly once
 empty rows produce exact zero output and -inf LSE. Effective Q/K/V must be finite.
 
 Loaders gather with `cp.async`; masked rows zero-fill without reading the cache.
-The SWA tile issues all four D128 stages at once into the initially empty KV ring.
+A CTA's first SWA tile issues all four D128 stages at once into the initially
+empty KV ring; a persistent CTA's later SWA tiles copy each stage after its own
+acquire, since the previous request's delayed PV may still read the ring.
 Each main tile stages its raw FP4 payload/scales into 36 KiB of SMEM, one commit
 group per D128 stage, and converts each stage from SMEM. These copies issue
 before the tile's first KV slot is acquired: reused slots are released only after
@@ -251,25 +256,29 @@ the loader warps that bound main-tile throughput). Final BF16
 rows pass through 16 KiB of SMEM so global stores write whole lines; each warp
 reads its staged rows before its predicated stores, and row sinks load before
 the correction task's first wait. Two metadata stages let the next tile's row
-IDs load during the current tile.
+IDs load during the current tile. Softmax publishes each tile's maxima before
+materializing P, so the O rescale overlaps P instead of following it; the
+rescale uses packed FP32 multiplies.
 
-When `8 * batch <= SMs` and the list spans at least three BK128 tiles (K >= 192),
-each request's tiles split over that many CTAs, one tile each: split 0 owns the
-SWA tile and every later split starts with a main tile. Splitting divides the
-loads and the FP4 conversion; each split rounds P against its own running
-maximum, within the same FP64 bound. Larger batches keep one KV split, where
-the extra partials and reducer cost more than they save (B200: 15.5 us against
-13.7 us for B=32, K=512).
+Small batches split each request over several CTAs in two ways. A KV split
+(lists of at least three BK128 tiles, K >= 192) gives each CTA a contiguous
+range of tiles: split 0 owns the SWA tile and every later split starts with a
+main tile. It divides the loads and the FP4 conversion; each split rounds P
+against its own running maximum, within the same FP64 bound. A V split over four
+(or two) CTAs gives each V owner the full QK over the K tile it retains and its
+own D128 slices of V, so it divides PV, correction and output work but not the
+loads or the conversion. Outputs match one V owner bitwise for the same KV split.
 
-Then, while `4 * batch * splits` (or `2 * ...`) CTAs still fit one wave, each
-request's V columns split over four (or two) CTAs. Every V owner computes the
-full QK over the K tile it retains and reads V from its own D128 slices of that
-tile, so the split divides PV, correction and output work but not the loads or
-the FP4 conversion. Outputs match one V owner bitwise for the same KV split.
+Every (KV split, V split) pair whose grid fits one wave is scored by the tiles one
+CTA walks, plus 0.9 (two V owners) or 2.5 (one), plus 1.2 for a KV split; the
+lowest score wins, ties keeping fewer splits. These weights reproduce every
+winner of a B200 sweep over B 1-96 and K 128-512. For example, K=512 uses one tile
+per split with four V owners at B=1-4, three splits with two V owners at B=16-24,
+and no KV split from B=32 (148 SMs).
 
 Capture requires caller output/workspace and eager warmup for the same declaration.
-The (KV split, V split) pair is a compiled specialization chosen from the batch
-size and K, so warm up a batch of each class that will be captured.
+The (KV split, V split, persistent) choice is a compiled specialization chosen
+from the batch size and K, so warm up a batch of each class that will be captured.
 Keep addresses alive/fixed and update values in place. Changing Python scales
 requires recapture, not recompilation. Concurrent calls need separate writable
 buffers or synchronization. Output/workspace cannot overlap inputs or each other;

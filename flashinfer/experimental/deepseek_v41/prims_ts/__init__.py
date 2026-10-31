@@ -31,6 +31,7 @@ def _compile(
     native_fp4=None,
     head_dim_ctas=1,
     kv_splits=1,
+    persistent=False,
 ):
     if torch.cuda.is_current_stream_capturing():
         raise ValueError("warm up the decode specialization before CUDA Graph capture")
@@ -64,7 +65,7 @@ def _compile(
 
     sm_count = device_sm_count(device_index)
     attention = adapter_kernel._make_fp8_attention(
-        compressed_k, sm_count, native_fp4, head_dim_ctas, kv_splits
+        compressed_k, sm_count, native_fp4, head_dim_ctas, kv_splits, persistent
     )
     decode_kernel = adapter_kernel.Fp8SwaDecodeKernel(attention, kv_splits)
     batch = cute.sym_int()
@@ -121,7 +122,7 @@ def _compile(
     native_root = Path(native_kernel.__file__).resolve().parents[3]
     return build_and_load_cute_dsl_kernel(
         "deepseek_v41_prims_ts_fp8",
-        f"h64_d512_swa128_c{compressed_k}_keep_bk128_kv8_split{kv_splits}_v{head_dim_ctas}_i64"
+        f"h64_d512_swa128_c{compressed_k}_keep_bk128_kv8_split{kv_splits}_v{head_dim_ctas}_p{int(persistent)}_i64"
         f"_shared_pertensor_joint_sink{int(has_sink)}"
         f"_nativefp4{int(native_fp4)}_sm{sm_count}_{key}",
         lambda: cute.compile[cute.FrontendNext](
@@ -154,29 +155,46 @@ def _compile(
     )
 
 
+# Relative partition costs, in BK128 tiles walked by one CTA, fitted to a B200
+# sweep of every (KV split, V split) pair (148 SMs, warm graphs, B 1-96, K 128-512):
+# fewer V owners leave more PV, correction and output work per CTA, and a KV
+# split adds BF16 partials plus the reducer. The scores reproduce every measured
+# winner, e.g. B16/K512 picks S3V2 (11.04 us) over S5V1 (11.35) and S1V4 (12.06).
+_V_OWNER_COST = {4: 0.0, 2: 0.9, 1: 2.5}
+_KV_SPLIT_COST = 1.2
+
+
 def _partition(batch, compressed_k, device_index):
-    """(KV splits, V owners) per request while the grid still fits one wave.
+    """(KV splits, V owners) per request, scored over every fitting pair.
 
-    KV splits divide the tile loads and FP4 conversion but add BF16 partials
-    and a separate reducer launch. Every V owner still loads and converts the
-    whole K tile, so a V split divides only PV, correction and output work.
-
-    Measured on B200 (148 SMs, warm graphs, K 128-512, B 1-96): one tile per
-    split (S = tiles) with the widest fitting V split is fastest up to B = 16;
-    from B = 32 an unsplit KV with a V split wins (S3V1 at B32/K512 took
-    15.5 us against 13.7 us for S1V4). Two-tile lists never benefit.
+    KV splits divide the tile loads and FP4 conversion; every V owner still
+    loads and converts the whole K tile, so a V split divides only PV,
+    correction and output work. Split grids must fit one wave; an unsplit
+    grid may take several. Ties keep fewer splits.
     """
     sm_count = device_sm_count(device_index)
     tiles = kv_tiles(compressed_k)
-    splits = 1
-    if (
-        tiles >= 3
-        and batch * 8 <= sm_count
-        and batch * tiles <= partial_slots(batch, compressed_k)
-    ):
-        splits = tiles
-    head_dim_ctas = next((v for v in (4, 2) if batch * splits * v <= sm_count), 1)
-    return splits, head_dim_ctas
+    slots = partial_slots(batch, compressed_k)
+    best = None
+    for splits in sorted({-(-tiles // per_split) for per_split in range(1, tiles + 1)}):
+        if splits > 1 and batch * splits > slots:
+            continue
+        for owners in (4, 2, 1):
+            if batch * splits * owners > sm_count and (splits > 1 or owners > 1):
+                continue
+            cost = (
+                -(-tiles // splits)
+                + _V_OWNER_COST[owners]
+                + (_KV_SPLIT_COST if splits > 1 else 0.0)
+            )
+            if best is None or cost < best[0]:
+                best = (cost, splits, owners)
+    return best[1], best[2]
+
+
+def _persistent(batch, kv_splits, device_index):
+    """Walk requests persistently once an unsplit grid exceeds one wave."""
+    return kv_splits == 1 and batch > device_sm_count(device_index)
 
 
 def decode_mixed(
@@ -221,6 +239,7 @@ def decode_mixed(
             has_sink=bound.sinks is not None,
             head_dim_ctas=head_dim_ctas,
             kv_splits=kv_splits,
+            persistent=_persistent(bound.batch, kv_splits, query.device.index),
         )
         partials = (
             views.partials[: bound.batch * kv_splits * PARTIAL_SLOT_BYTES]

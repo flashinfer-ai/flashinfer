@@ -83,8 +83,8 @@ def deepseek_v41_decode(*args, backend="cute-dsl", **kwargs):
 
     Prims-TS supports SM100, SM103 and SM107, with CuTe-DSL>=4.8 and its
     bundled CUDA13 compiler supporting the device's compile target. Its
-    Keep-AB/M64/BK128/retained-KV8/nonpersistent schedule jointly attends
-    SWA/main with inline metadata and sinks: one finalizing kernel, or for
+    Keep-AB/M64/BK128/retained-KV8 schedule, persistent above one wave, jointly
+    attends SWA/main with inline metadata and sinks: one finalizing kernel, or for
     small batches with K >= 192 KV splits merged by one PDL-chained reducer.
     Workspace contains private LSE, a K0 dummy and those split partials, not
     sanitized metadata.
