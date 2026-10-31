@@ -34,6 +34,10 @@ if [ -z "${PIP_CONSTRAINT:-}" ]; then
   unset _torch_pin
 fi
 
+# Resolve the DSL and its libraries together before metadata-only installs.
+# Otherwise its new .pth can run before the matching library wheel is present.
+bash "${SCRIPT_DIR}/install_cutlass_dsl.sh" || return 1
+
 # Install only what this branch moved past the image. Installing the full file
 # instead lets one drifted floor re-resolve every other requirement, which is how
 # torch has twice been swapped for a build that does not match the image.
@@ -58,10 +62,6 @@ case "${_reqs_status}" in
     ;;
 esac
 unset _reqs_output _reqs_status
-
-# The direct requirement sync above can update only the DSL metadata wheel.
-# Resolve its matching libraries before any CuTe DSL or quack import.
-bash "${SCRIPT_DIR}/install_cutlass_dsl.sh" || return 1
 
 # Install using only what the image carries; the check above covered the rest.
 # FLASHINFER_BUILD_NO_PIP keeps dropping isolation from activating the build
