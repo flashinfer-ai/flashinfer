@@ -321,3 +321,26 @@ Until then the C++ stays as-is and the DSL kernel lives beside it.
   the remaining Blackwell lead: the per-k-tile steady state of the 2-SM 256x128 tile.
   Leases: GB200 w8a16-gb8 (gb-nvl-057-compute09), B200 w8a16-b14 (umb-b200-248), B300
   w8a16-b300a (umb-b300-023, sm103, first-light check running), H100 h20 / h23.
+- Sat 31 Oct 2026, 13:30-16:00: Blackwell large M, investigated.  Peer: "still degrades at
+  large M, especially Blackwell".  Under graphs it does not (B200 +0.1% worst, GB200 all
+  under, B300 +0.2 .. +0.7 on gate_up 8192 across two runs), but the K sweeps show a real
+  per-k-tile slope deficit at boost clocks (GB200 2.7%, B200/B300 ~4% on 2sm256x128, 7-20%
+  on 2sm256x192 at N=6400) against a 17-20% lower fixed cost.  At ncu's locked clocks the
+  two kernels are both tensor-bound (96.0 / 96.4% pipe active) with equal cycles, so the
+  boost-clock deficit is a memory-side limit.  Counters at mlp.down 8192 (GB200): bytes
+  delivered into the SMs identical (4,194,311,296), DRAM identical, but the DSL reads
+  12-15% more L2 lines (27.2M vs 24.2M); single-tile problems read identical line counts
+  (513 / 1025 / 5121), two tiles per CTA already +0.8%, and the excess is 5-12% at every
+  M from 1024 up, so it is placement (which SMs run which tiles together), not drift.
+  The C++ launches one CTA pair per tile (grid 2560) and lets the hardware order them;
+  the DSL is persistent (grid 152, static stride).  Tile order (group 1/2/4/8, either
+  raster) never brings the DSL below 3.78 GB (C++ 3.25); a one-cluster-per-tile DSL
+  launch is 25-126% slower (its per-CTA start-up is far heavier than CUTLASS's).  Cluster
+  placement is regular (cluster z on SMs 2z-4, 2z-3 mod 152, dies split at cluster 40),
+  but a die-aware static split from SM ids would compute wrong results on a shared GPU
+  (late clusters reuse SM pairs), so the lever is a per-die dynamic tile counter (leader
+  CTA fetches, hands the tile to its peer over DSMEM, last cluster out resets).  Not
+  built: the rows are within target already; noted as the next Blackwell item.
+  Knobs removed: W8A16_DSL_KSPLIT (and the k-split code), W8A16_DSL_FIXUP_CUT,
+  W8A16_DSL_FRAG, W8A16_DSL_AIN_SMEM, and the two tile-order knobs of today.  B300
+  (sm103, umb-b300-023) runs both implementations correctly out of the box.
