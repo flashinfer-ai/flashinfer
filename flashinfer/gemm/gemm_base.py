@@ -106,6 +106,7 @@ from ..jit.gemm import gen_gemm_sm103_module_cutlass_fp4
 from ..jit.gemm import gen_gemm_sm100_module_cutlass_fp8
 from ..jit.gemm import gen_gemm_sm100_module_cutlass_mxfp8
 from ..jit.gemm import gen_gemm_sm120_module_cutlass_mxfp8
+from ..jit.gemm import gen_gemm_sm120_module_cutlass_fp8
 from ..jit.gemm import gen_gemm_sm100_module_cutlass_bf16
 from ..jit.gemm import gen_blackwell_bf16_bmm_module
 from ..jit.cake_program import CAPABILITY_TARGET
@@ -1945,10 +1946,187 @@ def get_gemm_sm120_module():
     return module
 
 
+def _sm120_fp8_gemm_tma_path_supported(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    scale_a: torch.Tensor,
+    scale_b: torch.Tensor,
+    out: torch.Tensor,
+) -> bool:
+    """Whether the per-tensor SM120 FP8 kernel can run ``a @ b`` as given.
+
+    The kernel reads A and D row-major and B column-major through TMA, so the
+    operands must be contiguous in that layout with 16-byte aligned rows and
+    base addresses, and both scales must be single floats.
+    """
+    b_t = b.transpose(-2, -1)
+    return (
+        a.dtype == torch.float8_e4m3fn
+        and b.dtype == torch.float8_e4m3fn
+        and scale_a.numel() == 1
+        and scale_b.numel() == 1
+        and scale_a.dtype == torch.float32
+        and scale_b.dtype == torch.float32
+        and a.is_contiguous()
+        and b_t.is_contiguous()
+        and out.is_contiguous()
+        and a.shape[-1] % 16 == 0
+        and b_t.shape[-2] % 8 == 0
+        and a.data_ptr() % 16 == 0
+        and b.data_ptr() % 16 == 0
+        and out.data_ptr() % 16 == 0
+    )
+
+
+def _sm120_groupwise_fp8_gemm(inputs: List[torch.Tensor]) -> torch.Tensor:
+    """Run SM120 FP8 GEMM through the groupwise-scaling kernel.
+
+    Fallback for inputs the per-tensor kernel cannot take. The groupwise kernel
+    needs N and K to be multiples of 128, so unaligned weights are zero-padded
+    and copied on every call.
+    """
+    a, b, scale_a, scale_b, out, workspace_buffer = inputs
+
+    # Handle both 2D (MM) and 3D (BMM) cases
+    # SM120/SM121 kernel now supports batch operations natively
+    if a.dim() == 2:
+        # 2D case: simple matrix multiplication
+        # Make B column-major for the kernel
+        b_col_major = b.transpose(-2, -1)
+    else:
+        # 3D case: batch matrix multiplication
+        # B is already in the right format [batch, k, n] (column-major)
+        b_col_major = b
+
+    # Determine dimensions first to know scale granularity
+    if a.dim() == 2:
+        n_dim = b_col_major.shape[0]
+        m_dim = a.shape[0]
+        k_dim = a.shape[1]
+        batch_size = 1
+    else:
+        n_dim = b_col_major.shape[2]  # BMM case: [batch, k, n]
+        m_dim = a.shape[1]
+        k_dim = a.shape[2]
+        batch_size = a.shape[0]
+
+    scale_gran_m = 1
+    scale_gran_n = 128
+    scale_gran_k = 128
+
+    # round up to the next multiple
+    def _pad_to_multiple(x, multiple):
+        return ((x + multiple - 1) // multiple) * multiple
+
+    # SM120/SM121 CUTLASS blockwise scaling requires:
+    # - N % 128 == 0 (ScaleGranularityN)
+    # - K % 128 == 0 (TileK)
+    # If not aligned, we pad and then slice the result
+    n_padded = _pad_to_multiple(n_dim, scale_gran_n)
+    k_padded = _pad_to_multiple(k_dim, scale_gran_k)
+    needs_n_padding = n_padded != n_dim
+    needs_k_padding = k_padded != k_dim
+
+    if not needs_k_padding and not needs_n_padding:
+        # No padding needed
+        a_padded = a
+        b_col_major_padded = b_col_major
+    else:
+        # Padding needed
+        if a.dim() == 2:
+            a_padded = a
+            if needs_k_padding:
+                a_padded = torch.nn.functional.pad(
+                    a_padded.contiguous(), (0, k_padded - k_dim)
+                )
+            b_col_major_padded = torch.zeros(
+                (n_padded, k_padded),
+                dtype=b_col_major.dtype,
+                device=b_col_major.device,
+            )
+            b_col_major_padded[:n_dim, :k_dim].copy_(b_col_major)
+        else:
+            a_padded = a
+            if needs_k_padding:
+                a_padded = torch.nn.functional.pad(
+                    a_padded.contiguous(), (0, k_padded - k_dim)
+                )
+
+            b_underlying_padded = torch.zeros(
+                (batch_size, n_padded, k_padded),
+                dtype=b_col_major.dtype,
+                device=b_col_major.device,
+            )
+            b_col_major_padded = b_underlying_padded.transpose(-2, -1)
+            b_col_major_padded[:, :k_dim, :n_dim].copy_(b_col_major)
+
+    # Create padded output if needed
+    if needs_n_padding:
+        if a.dim() == 2:
+            out_padded = torch.empty(
+                (m_dim, n_padded), device=out.device, dtype=out.dtype
+            )
+        else:
+            out_padded = torch.empty(
+                (batch_size, m_dim, n_padded),
+                device=out.device,
+                dtype=out.dtype,
+            )
+    else:
+        out_padded = out
+
+    # For scalar scales, create compatible shapes for SM120/SM121
+    if scale_a.numel() == 1:
+        scale_m_count = (batch_size * m_dim + scale_gran_m - 1) // scale_gran_m
+        scale_k_count = (k_padded + scale_gran_k - 1) // scale_gran_k
+        scale_a_expanded = (
+            scale_a.view(1, 1).expand(scale_m_count, scale_k_count).contiguous()
+        )
+    else:
+        scale_a_expanded = scale_a
+
+    if scale_b.numel() == 1:
+        scale_n_count = (batch_size * n_padded + scale_gran_n - 1) // scale_gran_n
+        scale_k_count = (k_padded + scale_gran_k - 1) // scale_gran_k
+        scale_b_expanded = (
+            scale_b.view(1, 1).expand(scale_n_count, scale_k_count).contiguous()
+        )
+    else:
+        scale_b_expanded = scale_b
+
+    # Call SM120/SM121 gemm_fp8_nt_groupwise (now handles both 2D and 3D)
+    get_gemm_sm120_module().gemm_fp8_nt_groupwise(
+        workspace_buffer,
+        a_padded,
+        b_col_major_padded,
+        scale_a_expanded,
+        scale_b_expanded,
+        out_padded,
+        scale_gran_m,  # scale_granularity_m
+        scale_gran_n,  # scale_granularity_n
+        scale_gran_k,  # scale_granularity_k (adjusted for small k)
+        "MN",  # scale_major_mode
+    )
+
+    # Slice the result if we padded
+    if needs_n_padding:
+        if a.dim() == 2:
+            out.copy_(out_padded[:, :n_dim])
+        else:
+            out.copy_(out_padded[:, :, :n_dim])
+
+    return out
+
+
 @functools.cache
 def get_gemm_sm120_module_cutlass_fp8():
-    """Get CUTLASS FP8 runner for SM120/SM121 using the groupwise scaling kernel."""
-    module = get_gemm_sm120_module()
+    """Get CUTLASS FP8 runner for SM120/SM121.
+
+    Per-tensor-scaled inputs in the TMA-friendly layout run the multi-tactic
+    ``fp8_gemm_cutlass_sm120`` kernels (small-M Pingpong tiles and 128-row
+    Cooperative tiles). Other inputs fall back to the groupwise-scaling kernel.
+    """
+    module = gen_gemm_sm120_module_cutlass_fp8().build_and_load()
 
     def cutlass_fp8_gemm_runner():
         class CutlassFp8GemmRunner(TunableRunner):
@@ -1957,8 +2135,9 @@ def get_gemm_sm120_module_cutlass_fp8():
                 inputs: List[torch.Tensor],
                 profile: OptimizationProfile,
             ) -> List[int]:
-                # TODO: add multi-tactic support when PingPong 64x128x128 schedule
-                # is implemented (see gemm_groupwise_sm120.cuh)
+                a, b, scale_a, scale_b, out, _ = inputs
+                if _sm120_fp8_gemm_tma_path_supported(a, b, scale_a, scale_b, out):
+                    return list(range(module.fp8_gemm_tactic_num()))
                 return [-1]
 
             def forward(
@@ -1969,143 +2148,18 @@ def get_gemm_sm120_module_cutlass_fp8():
                 **kwargs,
             ) -> torch.Tensor:
                 a, b, scale_a, scale_b, out, workspace_buffer = inputs
-
-                # Handle both 2D (MM) and 3D (BMM) cases
-                # SM120/SM121 kernel now supports batch operations natively
-                if a.dim() == 2:
-                    # 2D case: simple matrix multiplication
-                    # Make B column-major for the kernel
-                    b_col_major = b.transpose(-2, -1)
-                else:
-                    # 3D case: batch matrix multiplication
-                    # B is already in the right format [batch, k, n] (column-major)
-                    b_col_major = b
-
-                # Determine dimensions first to know scale granularity
-                if a.dim() == 2:
-                    n_dim = b_col_major.shape[0]
-                    m_dim = a.shape[0]
-                    k_dim = a.shape[1]
-                    batch_size = 1
-                else:
-                    n_dim = b_col_major.shape[2]  # BMM case: [batch, k, n]
-                    m_dim = a.shape[1]
-                    k_dim = a.shape[2]
-                    batch_size = a.shape[0]
-
-                scale_gran_m = 1
-                scale_gran_n = 128
-                scale_gran_k = 128
-
-                # round up to the next multiple
-                def _pad_to_multiple(x, multiple):
-                    return ((x + multiple - 1) // multiple) * multiple
-
-                # SM120/SM121 CUTLASS blockwise scaling requires:
-                # - N % 128 == 0 (ScaleGranularityN)
-                # - K % 128 == 0 (TileK)
-                # If not aligned, we pad and then slice the result
-                n_padded = _pad_to_multiple(n_dim, scale_gran_n)
-                k_padded = _pad_to_multiple(k_dim, scale_gran_k)
-                needs_n_padding = n_padded != n_dim
-                needs_k_padding = k_padded != k_dim
-
-                if not needs_k_padding and not needs_n_padding:
-                    # No padding needed
-                    a_padded = a
-                    b_col_major_padded = b_col_major
-                else:
-                    # Padding needed
-                    if a.dim() == 2:
-                        a_padded = a
-                        if needs_k_padding:
-                            a_padded = torch.nn.functional.pad(
-                                a_padded.contiguous(), (0, k_padded - k_dim)
-                            )
-                        b_col_major_padded = torch.zeros(
-                            (n_padded, k_padded),
-                            dtype=b_col_major.dtype,
-                            device=b_col_major.device,
-                        )
-                        b_col_major_padded[:n_dim, :k_dim].copy_(b_col_major)
-                    else:
-                        a_padded = a
-                        if needs_k_padding:
-                            a_padded = torch.nn.functional.pad(
-                                a_padded.contiguous(), (0, k_padded - k_dim)
-                            )
-
-                        b_underlying_padded = torch.zeros(
-                            (batch_size, n_padded, k_padded),
-                            dtype=b_col_major.dtype,
-                            device=b_col_major.device,
-                        )
-                        b_col_major_padded = b_underlying_padded.transpose(-2, -1)
-                        b_col_major_padded[:, :k_dim, :n_dim].copy_(b_col_major)
-
-                # Create padded output if needed
-                if needs_n_padding:
-                    if a.dim() == 2:
-                        out_padded = torch.empty(
-                            (m_dim, n_padded), device=out.device, dtype=out.dtype
-                        )
-                    else:
-                        out_padded = torch.empty(
-                            (batch_size, m_dim, n_padded),
-                            device=out.device,
-                            dtype=out.dtype,
-                        )
-                else:
-                    out_padded = out
-
-                # For scalar scales, create compatible shapes for SM120/SM121
-                if scale_a.numel() == 1:
-                    scale_m_count = (
-                        batch_size * m_dim + scale_gran_m - 1
-                    ) // scale_gran_m
-                    scale_k_count = (k_padded + scale_gran_k - 1) // scale_gran_k
-                    scale_a_expanded = (
-                        scale_a.view(1, 1)
-                        .expand(scale_m_count, scale_k_count)
-                        .contiguous()
-                    )
-                else:
-                    scale_a_expanded = scale_a
-
-                if scale_b.numel() == 1:
-                    scale_n_count = (
-                        batch_size * n_padded + scale_gran_n - 1
-                    ) // scale_gran_n
-                    scale_k_count = (k_padded + scale_gran_k - 1) // scale_gran_k
-                    scale_b_expanded = (
-                        scale_b.view(1, 1)
-                        .expand(scale_n_count, scale_k_count)
-                        .contiguous()
-                    )
-                else:
-                    scale_b_expanded = scale_b
-
-                # Call SM120/SM121 gemm_fp8_nt_groupwise (now handles both 2D and 3D)
-                module.gemm_fp8_nt_groupwise(
+                if not _sm120_fp8_gemm_tma_path_supported(a, b, scale_a, scale_b, out):
+                    return _sm120_groupwise_fp8_gemm(inputs)
+                # tactic -1 lets the kernel pick a tile from M.
+                module.fp8_gemm(
+                    a,
+                    b.transpose(-2, -1),
+                    scale_a,
+                    scale_b,
+                    out,
                     workspace_buffer,
-                    a_padded,
-                    b_col_major_padded,
-                    scale_a_expanded,
-                    scale_b_expanded,
-                    out_padded,
-                    scale_gran_m,  # scale_granularity_m
-                    scale_gran_n,  # scale_granularity_n
-                    scale_gran_k,  # scale_granularity_k (adjusted for small k)
-                    "MN",  # scale_major_mode
+                    tactic,
                 )
-
-                # Slice the result if we padded
-                if needs_n_padding:
-                    if a.dim() == 2:
-                        out.copy_(out_padded[:, :n_dim])
-                    else:
-                        out.copy_(out_padded[:, :, :n_dim])
-
                 return out
 
         return CutlassFp8GemmRunner()
