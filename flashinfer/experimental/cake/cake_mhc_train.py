@@ -13,8 +13,9 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
-Cake four-stream mHC training forward / backward (hidden 4096, 4 streams;
-SM100 / SM103 / SM107) with a selectable numerical mode.  The function, the
+Cake four-stream mHC training forward / backward (4 streams; hidden 4096 on
+SM100 / SM103 / SM107, and 5120 / 7168 on SM100 / SM103 with
+``deterministic=True`` only) with a selectable numerical mode.  The function, the
 tensor contracts, the workspaces and the autograd wiring are those of
 :mod:`flashinfer.cake_mhc_det_train` (documented there).
 
@@ -288,22 +289,34 @@ def is_cake_mhc_train_supported(
 
 @flashinfer_experimental_api(feature=_FEATURE)
 def cake_mhc_train_forward_workspace_bytes(
-    T: int, device: torch.device, *, deterministic: bool = True
+    T: int,
+    device: torch.device,
+    *,
+    hidden: int = _det_jit.HIDDEN,
+    deterministic: bool = True,
 ) -> int:
     """Bytes of the caller-owned forward workspace for up to ``T`` tokens on ``device``.
 
     The forward workspace has one layout for ``deterministic=True`` and ``deterministic=False`` (see
-    :func:`~flashinfer.cake_mhc_det_train.cake_mhc_det_train_forward_workspace_bytes`).
+    :func:`~flashinfer.cake_mhc_det_train.cake_mhc_det_train_forward_workspace_bytes`).  ``hidden`` is the
+    hidden size of the calls the buffer serves: 4096, 5120 or 7168 for ``deterministic=True``, 4096 for
+    ``deterministic=False`` (any other value raises ``ValueError``).
     """
 
     if _deterministic(deterministic, "cake_mhc_train_forward_workspace_bytes"):
-        return _det.cake_mhc_det_train_forward_workspace_bytes(T, device)
-    return _nd.cake_mhc_train_forward_workspace_bytes(T, device, deterministic=False)
+        return _det.cake_mhc_det_train_forward_workspace_bytes(T, device, hidden=hidden)
+    return _nd.cake_mhc_train_forward_workspace_bytes(
+        T, device, hidden=hidden, deterministic=False
+    )
 
 
 @flashinfer_experimental_api(feature=_FEATURE)
 def cake_mhc_train_backward_workspace_bytes(
-    T: int, device: torch.device, *, deterministic: bool = True
+    T: int,
+    device: torch.device,
+    *,
+    hidden: int = _det_jit.HIDDEN,
+    deterministic: bool = True,
 ) -> int:
     """Bytes of the caller-owned backward workspace for up to ``T`` tokens on ``device``.
 
@@ -312,35 +325,52 @@ def cake_mhc_train_backward_workspace_bytes(
     the same regions at the same offsets without the per-chunk FP32 ``dfn``
     partials (``P x 24 x 16384 x 4`` bytes, ``P <= 32``).  The size is the
     maximum over every token count up to ``T``; ``T == 0`` needs no workspace.
+    ``hidden`` as in :func:`cake_mhc_train_forward_workspace_bytes`.
     """
 
     if _deterministic(deterministic, "cake_mhc_train_backward_workspace_bytes"):
-        return _det.cake_mhc_det_train_backward_workspace_bytes(T, device)
-    return _nd.cake_mhc_train_backward_workspace_bytes(T, device, deterministic=False)
+        return _det.cake_mhc_det_train_backward_workspace_bytes(
+            T, device, hidden=hidden
+        )
+    return _nd.cake_mhc_train_backward_workspace_bytes(
+        T, device, hidden=hidden, deterministic=False
+    )
 
 
 @flashinfer_experimental_api(feature=_FEATURE)
 def cake_mhc_train_forward_workspace(
-    T: int, device: torch.device, *, deterministic: bool = True
+    T: int,
+    device: torch.device,
+    *,
+    hidden: int = _det_jit.HIDDEN,
+    deterministic: bool = True,
 ) -> torch.Tensor:
     """Allocate a zero-initialized forward workspace for ``deterministic=True`` or ``deterministic=False`` (one layout;
     see :func:`cake_mhc_train_forward_workspace_bytes`)."""
 
     if _deterministic(deterministic, "cake_mhc_train_forward_workspace"):
-        return _det.cake_mhc_det_train_forward_workspace(T, device)
-    return _nd.cake_mhc_train_forward_workspace(T, device, deterministic=False)
+        return _det.cake_mhc_det_train_forward_workspace(T, device, hidden=hidden)
+    return _nd.cake_mhc_train_forward_workspace(
+        T, device, hidden=hidden, deterministic=False
+    )
 
 
 @flashinfer_experimental_api(feature=_FEATURE)
 def cake_mhc_train_backward_workspace(
-    T: int, device: torch.device, *, deterministic: bool = True
+    T: int,
+    device: torch.device,
+    *,
+    hidden: int = _det_jit.HIDDEN,
+    deterministic: bool = True,
 ) -> torch.Tensor:
     """Allocate a zero-initialized backward workspace of the ``deterministic`` mode's layout (see
     :func:`cake_mhc_train_backward_workspace_bytes`)."""
 
     if _deterministic(deterministic, "cake_mhc_train_backward_workspace"):
-        return _det.cake_mhc_det_train_backward_workspace(T, device)
-    return _nd.cake_mhc_train_backward_workspace(T, device, deterministic=False)
+        return _det.cake_mhc_det_train_backward_workspace(T, device, hidden=hidden)
+    return _nd.cake_mhc_train_backward_workspace(
+        T, device, hidden=hidden, deterministic=False
+    )
 
 
 @flashinfer_experimental_api(feature=_FEATURE)
