@@ -1597,7 +1597,8 @@ def rope_quantize_fp8_append_paged_kv_cache(
         For GQA/MHA: ``(k_cache, v_cache)`` where:
             - k_cache: ``(max_pages, page_size, num_kv_heads, head_dim)`` or
               ``(max_pages, num_kv_heads, page_size, head_dim)`` depending on layout, in FP8
-            - v_cache: same shape as k_cache, in FP8
+            - v_cache: same shape as k_cache (the number of pages may differ), in FP8;
+              its strides may differ from k_cache's, e.g. padded rows
     kv_indices : torch.Tensor
         Page indices mapping, shape: ``(total_pages,)``. Typically ``torch.arange(total_pages)``.
     kv_indptr : torch.Tensor

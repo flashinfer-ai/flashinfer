@@ -517,6 +517,13 @@ void rope_quantize_append_paged_kv_cache(
     // Cache must be 4D
     CHECK_DIM(4, k_cache);
     CHECK_DIM(4, v_cache);
+    // K and V are addressed with one page size, head count and head dim (their strides may
+    // differ); only the number of pages may differ between the two caches.
+    for (int i = 1; i < 4; ++i) {
+      TVM_FFI_ICHECK_EQ(v_cache.size(i), k_cache.size(i))
+          << "v_cache and k_cache must have the same shape except for dim 0 (num_pages); dim " << i
+          << " differs";
+    }
   }
 
   // Extract Q strides
@@ -582,7 +589,8 @@ void rope_quantize_append_paged_kv_cache(
               enable_pdl, stream);
 
         } else {
-          // GQA/MHA: Construct paged_kv_t struct
+          // GQA/MHA: Construct paged_kv_t struct. The kernel reaches V only through
+          // get_v_ptr, so v_cache keeps its own strides (e.g. padded rows).
           auto k_strides = k_cache.strides();
           auto v_strides = v_cache.strides();
           uint32_t head_dim = rope_dim + no_rope_dim;
@@ -590,7 +598,7 @@ void rope_quantize_append_paged_kv_cache(
           paged_kv_t<c_quant_type, int32_t> paged_kv(
               num_kv_heads, page_size, head_dim, batch_size, kv_layout,
               static_cast<c_quant_type*>(k_cache.data_ptr()),
-              static_cast<c_quant_type*>(v_cache.data_ptr()), k_strides.data(),
+              static_cast<c_quant_type*>(v_cache.data_ptr()), k_strides.data(), v_strides.data(),
               static_cast<int32_t*>(kv_indices.data_ptr()),
               static_cast<int32_t*>(kv_indptr.data_ptr()),
               nullptr  // last_page_len not needed for this kernel
