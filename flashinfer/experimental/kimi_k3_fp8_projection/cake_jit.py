@@ -71,7 +71,7 @@ from ...jit.core import gen_jit_spec, sm100a_nvcc_flags, sm103a_nvcc_flags
 # * ``gemm`` / ``gemm_rstaged`` / ``gemm_tstore``   the persistent 2-CTA
 #   block-scaled tcgen05 GEMM (256 output columns per CTA pair, M > 256) with
 #   the register, staged-register or TMA-store epilogue; the instance tokens
-#   follow the stem in the order ``[_n<bn>][_g64][_k128][_cs<S>|_st|_gs[_ars]][_s<n>][_ts<n>][_sk|_skf<n>][_pdlb][_pf<D>]``
+#   follow the stem in the order ``[_n<bn>][_g64][_k128][_cs<S>|_st|_gs[_ars|_tns]][_s<n>][_ts<n>][_sk|_skf<n>][_pdlb][_pf<D>]``
 #   (``_n<bn>``: the bn-wide pair-tile form, 192, 224, 352 or 384 output columns
 #   per CTA pair -- ``_n224`` / ``_n352`` TMA-store programs only, round 12;
 #   ``_n384``: the 128 x 384 pair-tile form of the TMA-store / staged-register
@@ -100,7 +100,11 @@ from ...jit.core import gen_jit_spec, sm100a_nvcc_flags, sm103a_nvcc_flags
 #   slot; same output bits; ``_ars``: the A-resident form of the 256-wide
 #   ``_k128_gs`` program on the tabulated ``gemm_ars`` rows (K <= 512), round 12
 #   -- a CTA pair keeps its activation K range resident in shared memory across
-#   its tiles; the same launch; same output bits);
+#   its tiles; the same launch; same output bits; ``_tns``: the tail N split form
+#   of the 256-wide ``_k128_gs`` program on the tabulated ``gemm_tns`` rows
+#   (sm_100a), round 12 -- when the last wave holds at most half the pairs, its
+#   tiles run as 128-column halves on twice as many pairs; the same launch; same
+#   output bits);
 # * ``decode:t<tok>_p<stages>[_fused][_a<n>][_e<n>][_res][_r<xb>][_q<lanes>][_cs<C>]...[_tso][_dpf][_pi<n>][_xp]``
 #   the swap-AB split-K decode kernel for one token-tile width, TMA pipeline
 #   depth, in-CTA quantization (``_fused``), ``n`` TMEM accumulator sets
@@ -4913,7 +4917,7 @@ def gemm_kernel_key(base: str, pf: int = 0) -> str:
     static one-tile form of the same programs (one tile per CTA pair, no CLC work ring), table key ``gemm_static``, round 11; ``_gs``
     the static grid-stride form of the ``_k128`` / ``_n192_k128`` TMA-store programs (pair p owns tiles p + i P' over 2 P' CTAs, no
     CLC work ring), table key ``gemm_gs``, round 11; ``_ars`` (right after ``_gs``) its A-resident form at bn 256 and K <= 512, table key
-    ``gemm_ars``, round 12;
+    ``gemm_ars``, round 12; ``_tns`` (right after ``_gs``) its tail N split form at bn 256 on sm_100a, table key ``gemm_tns``, round 12;
     ``_s<n>`` / ``_ts<n>`` the operand-stage / staging-slot form of the TMA-store programs, table keys
     ``gemm_stages`` / ``gemm_ts_slots``, round 9; ``_pdlb`` the PDL-wait-after-weights form of the TMA-store /
     staged-register programs, table key ``gemm_pdlb``, round 11, closing the stem) plus ``_pf<D>`` when the shape's table row prefetches the weight
