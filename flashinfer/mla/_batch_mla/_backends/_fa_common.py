@@ -252,14 +252,24 @@ def _generated_fa_shared_bytes(backend, ckv, kpe, fp8_kv, smem_per_sm):
     return max(q_bytes + kv_bytes + repack + 2 * 64 * 4, 64 * ckv * 2)
 
 
-_FA_MAX_WORK_ITEMS = 16384
+# MLAPlan sizes its per-work arrays to max(16384, q tiles + clusters) entries.
+_FA_MIN_WORK_ITEMS = 16384
+_FA_DEFAULT_INT_WORKSPACE_BYTES = 8 * 1024 * 1024
 
 
-def _fa_plan_work_count(q_lens, kv_lens, num_heads, num_sm, causal):
+def _fa_plan_int_workspace_bytes(capacity, num_sm):
+    """Mirror MLAPlan's int workspace: nine int32 arrays per work item, five per SM."""
+    return 9 * ((4 * capacity + 15) // 16 * 16) + 5 * ((4 * num_sm + 15) // 16 * 16)
+
+
+def _fa_plan_work_count(
+    q_lens, kv_lens, num_heads, num_sm, causal, use_cuda_graph, int_workspace_bytes
+):
     """Mirror scheduler.cuh MLAPlan, excluding its heap ordering (not its splits).
 
-    Raise early when the unsplit tile count already exceeds native capacity;
-    otherwise return the exact split-aware count. Never allocate O(totalQ).
+    Raise early when the plan cannot fit its capacity or the int workspace;
+    otherwise return the exact split-aware count and the capacity. Never
+    allocate O(totalQ).
     """
     if not q_lens:
         raise _BackendPlanUnsupportedError(
@@ -275,9 +285,16 @@ def _fa_plan_work_count(q_lens, kv_lens, num_heads, num_sm, causal):
         )
     tile = 64 * cluster
     tile_counts = [(q * num_heads + tile - 1) // tile for q in q_lens]
-    if sum(tile_counts) > _FA_MAX_WORK_ITEMS:
+    capacity = max(_FA_MIN_WORK_ITEMS, sum(tile_counts) + clusters)
+    if use_cuda_graph and capacity > _FA_MIN_WORK_ITEMS:
+        # A captured graph keeps the plan's array offsets, so the capacity must not change.
         raise _BackendPlanUnsupportedError(
-            f"FA MLA needs at least {sum(tile_counts)} work items; native capacity is {_FA_MAX_WORK_ITEMS}."
+            f"FA MLA under CUDA graphs supports {_FA_MIN_WORK_ITEMS} work items; this plan needs {capacity}."
+        )
+    required = _fa_plan_int_workspace_bytes(capacity, num_sm)
+    if required > int_workspace_bytes:
+        raise _BackendPlanUnsupportedError(
+            f"FA MLA needs {required} int workspace bytes for {capacity} work items; the int workspace has {int_workspace_bytes}."
         )
     effective = []
     for q, kv, count in zip(q_lens, kv_lens, tile_counts, strict=True):
@@ -321,7 +338,7 @@ def _fa_plan_work_count(q_lens, kv_lens, num_heads, num_sm, causal):
         raise _BackendPlanUnsupportedError(
             "FA MLA KV split arithmetic exceeds the native int32 range."
         )
-    return sum(max(1, (kv + limit - 1) // limit) for kv in effective)
+    return sum(max(1, (kv + limit - 1) // limit) for kv in effective), capacity
 
 
 def _validate_fa_causal_tile_bound(
@@ -360,7 +377,15 @@ def _validate_fa_causal_tile_bound(
 
 
 def _validate_fa_plan_workload(
-    qo_indptr, kv_len_arr, num_heads, causal, device, backend, kv_data_type
+    qo_indptr,
+    kv_len_arr,
+    num_heads,
+    causal,
+    device,
+    backend,
+    kv_data_type,
+    use_cuda_graph,
+    int_workspace_bytes,
 ):
     offsets = qo_indptr.to(device="cpu", dtype=torch.int64).tolist()
     kv_lens = kv_len_arr.to(device="cpu", dtype=torch.int64).tolist()
@@ -371,12 +396,18 @@ def _validate_fa_plan_workload(
             "FA MLA requires query offsets for every KV request."
         )
     q_lens = [offsets[i + 1] - offsets[i] for i in range(len(kv_lens))]
-    count = _fa_plan_work_count(
-        q_lens, kv_lens, num_heads, get_device_sm_count(device), causal
+    count, capacity = _fa_plan_work_count(
+        q_lens,
+        kv_lens,
+        num_heads,
+        get_device_sm_count(device),
+        causal,
+        use_cuda_graph,
+        int_workspace_bytes,
     )
-    if count > _FA_MAX_WORK_ITEMS:
+    if count > capacity:
         raise _BackendPlanUnsupportedError(
-            f"FA MLA needs {count} work items including KV splits; native capacity is {_FA_MAX_WORK_ITEMS}."
+            f"FA MLA needs {count} work items including KV splits; native capacity is {capacity}."
         )
     if causal:
         _validate_fa_causal_tile_bound(
@@ -403,7 +434,9 @@ class _BatchMLAGeneratedFaMechanics:
         self.device = float_workspace_buffer.device
         if int_workspace_buffer is None:
             int_workspace_buffer = torch.empty(
-                (8 * 1024 * 1024,), dtype=torch.uint8, device=self.device
+                (_FA_DEFAULT_INT_WORKSPACE_BYTES,),
+                dtype=torch.uint8,
+                device=self.device,
             )
         if pin_memory_int_workspace_buffer is None:
             pin_memory_int_workspace_buffer = torch.empty(
@@ -590,6 +623,9 @@ class _BatchMLAGeneratedFaMechanics:
             self.device,
             self._backend,
             kv_data_type,
+            self._use_cuda_graph,
+            self._int_workspace_buffer.numel()
+            * self._int_workspace_buffer.element_size(),
         )
         cached_module = module_loader()
         qo_indptr_host = qo_indptr.to("cpu")
@@ -905,6 +941,11 @@ class _BatchMLAPagedAttentionFaBackendBase(
             args._float_workspace_buffer.device,
             cls._plan_capabilities.backend_name,
             args.kv_data_type,
+            args._use_cuda_graph,
+            _FA_DEFAULT_INT_WORKSPACE_BYTES
+            if args._graph_plan_int_workspace_buffer is None
+            else args._graph_plan_int_workspace_buffer.numel()
+            * args._graph_plan_int_workspace_buffer.element_size(),
         )
         # Mirror scheduler.cuh MLAPlan's two 16-byte-aligned partial buffers.
         # Classify capacity before JIT/native planning so other candidates can
