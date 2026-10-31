@@ -216,6 +216,9 @@ kernels that do not read NVFP4 K/V directly.
 
     nvfp4_kv_materialize_fp8
 
+.. autoclass:: NVFP4KVMaterializer
+    :members: run
+
 FP8 Quantization
 ----------------
 
