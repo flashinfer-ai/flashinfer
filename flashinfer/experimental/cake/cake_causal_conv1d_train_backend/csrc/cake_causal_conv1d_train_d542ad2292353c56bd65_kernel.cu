@@ -1417,6 +1417,7 @@ kernel_cake_causal_conv1d_train_d542ad2292353c56bd65(__nv_bfloat16* __restrict__
         red[i_9 * 128 + tid] = _sub_95;
     }
     __syncthreads();
+#if __CUDA_ARCH__ == 1000
     int c0_0 = (ct * ct_vec + v) * 8;
     if (sub == 0 && c0_0 < C) {
         float tot[32];
@@ -1433,9 +1434,34 @@ kernel_cake_causal_conv1d_train_d542ad2292353c56bd65(__nv_bfloat16* __restrict__
         }
         #pragma unroll
         for (int j_6 = 0; j_6 < 8; j_6++) {
+#else
+    int cb0 = ct * ct_vec * 8;
+    #pragma unroll 1
+    for (int q = tid; q < ct_vec * 8; q += 128) {
+        if (sub <= n_sub && cb0 + q < C) {
+            int vq = q >> 3;
+            int jq = q & 7;
+            float t4[4];
+#endif
             #pragma unroll
             for (int k_2 = 0; k_2 < 4; k_2++) {
+#if __CUDA_ARCH__ == 1000
                 asm volatile("red.global.add.f64 [%0], %1;" :: "l"(reinterpret_cast<uint64_t>(&dw_acc[soff + (c0_0 + j_6) * 4 + k_2])), "d"((double)tot[j_6 * 4 + k_2]) : "memory");
+#else
+                t4[k_2] = red[(jq * 4 + k_2) * 128 + vq];
+            }
+            #pragma unroll 1
+            for (int s_4 = 1; s_4 < n_sub; s_4++) {
+                int rq = s_4 * ct_vec + vq;
+                #pragma unroll
+                for (int k_3 = 0; k_3 < 4; k_3++) {
+                    t4[k_3] = t4[k_3] + red[(jq * 4 + k_3) * 128 + rq];
+                }
+            }
+            #pragma unroll
+            for (int k_4 = 0; k_4 < 4; k_4++) {
+                asm volatile("red.global.add.f64 [%0], %1;" :: "l"(reinterpret_cast<uint64_t>(&dw_acc[soff + (cb0 + q) * 4 + k_4])), "d"((double)t4[k_4]) : "memory");
+#endif
             }
         }
     }

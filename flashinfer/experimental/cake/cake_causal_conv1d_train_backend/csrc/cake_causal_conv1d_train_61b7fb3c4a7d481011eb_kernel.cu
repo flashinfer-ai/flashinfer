@@ -1527,42 +1527,33 @@ kernel_cake_causal_conv1d_train_61b7fb3c4a7d481011eb(__nv_bfloat16* __restrict__
         red[tid * 40 + i_9] = _sub_107;
     }
     __syncthreads();
-    int c0_0 = (ct * ct_vec + v) * 8;
-    if (sub == 0 && c0_0 < C) {
-        float tot[32];
-        #pragma unroll
-        for (int i_10 = 0; i_10 < 32; i_10++) {
-            tot[i_10] = red[v * 40 + i_10];
-        }
-        #pragma unroll 1
-        for (int s_7 = 1; s_7 < n_sub; s_7++) {
-            #pragma unroll
-            for (int i_11 = 0; i_11 < 32; i_11++) {
-                tot[i_11] = tot[i_11] + red[(s_7 * ct_vec + v) * 40 + i_11];
-            }
-        }
-        #pragma unroll
-        for (int j_10 = 0; j_10 < 8; j_10++) {
+    int cb0 = ct * ct_vec * 8;
+    #pragma unroll 1
+    for (int q = tid; q < ct_vec * 8; q += 128) {
+        if (sub <= n_sub && cb0 + q < C) {
+            int vq = q >> 3;
+            int jq = q & 7;
+            float t4[4];
             #pragma unroll
             for (int k_2 = 0; k_2 < 4; k_2++) {
-                asm volatile("red.global.add.f64 [%0], %1;" :: "l"(reinterpret_cast<uint64_t>(&dw_acc[soff + (c0_0 + j_10) * 4 + k_2])), "d"((double)tot[j_10 * 4 + k_2]) : "memory");
+                t4[k_2] = red[vq * 40 + jq * 4 + k_2];
             }
-        }
-        float totb[8];
-        #pragma unroll
-        for (int j_11 = 0; j_11 < 8; j_11++) {
-            totb[j_11] = red[v * 40 + (32 + j_11)];
-        }
-        #pragma unroll 1
-        for (int s_8 = 1; s_8 < n_sub; s_8++) {
+            float tb_2[1];
+            tb_2[0] = red[vq * 40 + 32 + jq];
+            #pragma unroll 1
+            for (int s_7 = 1; s_7 < n_sub; s_7++) {
+                int rq = s_7 * ct_vec + vq;
+                #pragma unroll
+                for (int k_3 = 0; k_3 < 4; k_3++) {
+                    t4[k_3] = t4[k_3] + red[rq * 40 + jq * 4 + k_3];
+                }
+                tb_2[0] = tb_2[0] + red[rq * 40 + 32 + jq];
+            }
             #pragma unroll
-            for (int j_12 = 0; j_12 < 8; j_12++) {
-                totb[j_12] = totb[j_12] + red[(s_8 * ct_vec + v) * 40 + (32 + j_12)];
+            for (int k_4 = 0; k_4 < 4; k_4++) {
+                asm volatile("red.global.add.f64 [%0], %1;" :: "l"(reinterpret_cast<uint64_t>(&dw_acc[soff + (cb0 + q) * 4 + k_4])), "d"((double)t4[k_4]) : "memory");
             }
-        }
-        #pragma unroll
-        for (int j_13 = 0; j_13 < 8; j_13++) {
-            asm volatile("red.global.add.f64 [%0], %1;" :: "l"(reinterpret_cast<uint64_t>(&dw_acc[soff + C * 4 + c0_0 + j_13])), "d"((double)totb[j_13]) : "memory");
+            asm volatile("red.global.add.f64 [%0], %1;" :: "l"(reinterpret_cast<uint64_t>(&dw_acc[soff + C * 4 + cb0 + q])), "d"((double)tb_2[0]) : "memory");
         }
     }
     asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
@@ -1584,7 +1575,7 @@ kernel_cake_causal_conv1d_train_61b7fb3c4a7d481011eb(__nv_bfloat16* __restrict__
         __threadfence();
         int ch0 = ct * ct_vec * 8;
         float a4[4];
-        float tb_2[1];
+        float tb_3[1];
         float z4[4];
         #pragma unroll
         for (int e = 0; e < 4; e++) {
@@ -1610,15 +1601,15 @@ kernel_cake_causal_conv1d_train_61b7fb3c4a7d481011eb(__nv_bfloat16* __restrict__
                 reinterpret_cast<int4*>(dw_acc + (c64_2 * 4))[0] = reinterpret_cast<int4*>(zd)[0];
                 reinterpret_cast<int4*>(dw_acc + (c64_2 * 4 + 2))[0] = reinterpret_cast<int4*>(zd)[0];
                 #pragma unroll
-                for (int s_9 = 1; s_9 < 4; s_9++) {
+                for (int s_8 = 1; s_8 < 4; s_8++) {
                     #pragma unroll
                     for (int e_2 = 0; e_2 < 4; e_2++) {
                         {
-                            e4[e_2] = *reinterpret_cast<const double*>(dw_acc + (cstride * (long long)s_9 + c64_2 * 4 + (long long)e_2));
+                            e4[e_2] = *reinterpret_cast<const double*>(dw_acc + (cstride * (long long)s_8 + c64_2 * 4 + (long long)e_2));
                         }
                     }
-                    reinterpret_cast<int4*>(dw_acc + (cstride * (long long)s_9 + c64_2 * 4))[0] = reinterpret_cast<int4*>(zd)[0];
-                    reinterpret_cast<int4*>(dw_acc + (cstride * (long long)s_9 + c64_2 * 4 + 2))[0] = reinterpret_cast<int4*>(zd)[0];
+                    reinterpret_cast<int4*>(dw_acc + (cstride * (long long)s_8 + c64_2 * 4))[0] = reinterpret_cast<int4*>(zd)[0];
+                    reinterpret_cast<int4*>(dw_acc + (cstride * (long long)s_8 + c64_2 * 4 + 2))[0] = reinterpret_cast<int4*>(zd)[0];
                     #pragma unroll
                     for (int e_3 = 0; e_3 < 4; e_3++) {
                         d4[e_3] = d4[e_3] + e4[e_3];
@@ -1645,18 +1636,18 @@ kernel_cake_causal_conv1d_train_61b7fb3c4a7d481011eb(__nv_bfloat16* __restrict__
                 }
                 *reinterpret_cast<unsigned long long*>(dw_acc + (bi)) = (unsigned long long)((unsigned long long)(zd[(0) + 0]));
                 #pragma unroll
-                for (int s_10 = 1; s_10 < 4; s_10++) {
+                for (int s_9 = 1; s_9 < 4; s_9++) {
                     {
-                        e4[0] = *reinterpret_cast<const double*>(dw_acc + (cstride * (long long)s_10 + bi));
+                        e4[0] = *reinterpret_cast<const double*>(dw_acc + (cstride * (long long)s_9 + bi));
                     }
-                    *reinterpret_cast<unsigned long long*>(dw_acc + (cstride * (long long)s_10 + bi)) = (unsigned long long)((unsigned long long)(zd[(0) + 0]));
+                    *reinterpret_cast<unsigned long long*>(dw_acc + (cstride * (long long)s_9 + bi)) = (unsigned long long)((unsigned long long)(zd[(0) + 0]));
                     tbd[0] = tbd[0] + e4[0];
                 }
-                tb_2[0] = (float)tbd[0];
+                tb_3[0] = (float)tbd[0];
                 if ((flags & 8) != 0) {
-                    *(reinterpret_cast<__nv_bfloat16*>(reinterpret_cast<__nv_bfloat16*>(db)) + (c64_2)) = (__nv_bfloat16)tb_2[0];
+                    *(reinterpret_cast<__nv_bfloat16*>(reinterpret_cast<__nv_bfloat16*>(db)) + (c64_2)) = (__nv_bfloat16)tb_3[0];
                 } else {
-                    *(reinterpret_cast<float*>(reinterpret_cast<float*>(db)) + (c64_2)) = tb_2[0];
+                    *(reinterpret_cast<float*>(reinterpret_cast<float*>(db)) + (c64_2)) = tb_3[0];
                 }
             }
         }
