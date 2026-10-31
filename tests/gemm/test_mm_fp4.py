@@ -20,7 +20,10 @@ from flashinfer.utils import (
     version_at_least,
     LibraryError,
 )
-from flashinfer.gemm.gemm_base import CUDNN_FP4_MXFP4_SM120_CUDNN_VERSION_ERROR
+from flashinfer.gemm.gemm_base import (
+    CUDNN_FP4_MXFP4_SM120_CUDNN_VERSION_ERROR,
+    _cudnn_gemm_fp4_requirement,
+)
 
 
 def _test_mm_fp4(
@@ -710,6 +713,153 @@ def _check_per_token_alpha_untuned(m, n, k, res_dtype):
 def test_mm_fp4_per_token_alpha_low_m_untuned(m, n, k, res_dtype):
     _skip_unless_per_token_alpha_gpu()
     _check_per_token_alpha_untuned(m, n, k, res_dtype)
+
+
+def _quantized_fp4_operands(m, n, k, use_nvfp4):
+    major, minor = get_compute_capability(torch.device("cuda"))
+    if not mm_fp4.is_backend_supported("cudnn", major * 10 + minor):
+        pytest.skip(f"cudnn fp4 backend unsupported on SM{major}{minor}")
+    a = torch.randn([m, k], device="cuda", dtype=torch.bfloat16)
+    b = torch.randn([n, k], device="cuda", dtype=torch.bfloat16)
+    if use_nvfp4:
+        one = torch.tensor(1.0, device="cuda")
+        a_fp4, a_sf = nvfp4_quantize(a, one, sfLayout=SfLayout.layout_128x4)
+        b_fp4, b_sf = nvfp4_quantize(b, one, sfLayout=SfLayout.layout_128x4)
+    else:
+        a_fp4, a_sf = mxfp4_quantize(a)
+        b_fp4, b_sf = mxfp4_quantize(b)
+    return a_fp4, a_sf, b_fp4, b_sf
+
+
+def _expect_cudnn_scale_error(
+    m, n, k, use_nvfp4, make_b_scale, match, make_a_scale=lambda a_sf: a_sf
+):
+    a_fp4, a_sf, b_fp4, b_sf = _quantized_fp4_operands(m, n, k, use_nvfp4)
+    out = torch.empty([m, n], device="cuda", dtype=torch.bfloat16)
+    try:
+        with pytest.raises(ValueError, match=match):
+            mm_fp4(
+                a_fp4,
+                b_fp4.T,
+                make_a_scale(a_sf),
+                make_b_scale(b_sf),
+                None,
+                torch.bfloat16,
+                out,
+                block_size=16 if use_nvfp4 else 32,
+                backend="cudnn",
+                use_nvfp4=use_nvfp4,
+            )
+    except (BackendSupportedError, LibraryError) as e:
+        pytest.skip(f"cudnn fp4 backend unavailable here: {e}")
+    except RuntimeError as e:
+        # _check_cudnn_fp4_availability raises RuntimeError when cuDNN or its FP4
+        # support is missing; any other RuntimeError is a real failure.
+        if "FP4 requires" in str(e) or "cuDNN is not available" in str(e):
+            pytest.skip(f"cudnn fp4 backend unavailable here: {e}")
+        raise
+
+
+# Regression anchors: the cuDNN path derives its block-scale descriptors from the
+# scale tensors' shapes and reads their bytes in the order fp4 quantization writes.
+# A B scale tensor in the quantizer's (n, k // block_size) orientation (not
+# transposed) used to reach cuDNN unchecked: silently wrong results for n != m (as at
+# the first test's shape), and an illegal-instruction fault for MXFP4 at
+# m = n = 128, k = 64. A contiguous copy of the transpose has the right shape but
+# the wrong byte order and gave wrong results (NaN at 128 x 256 x 512 for MXFP4).
+@pytest.mark.parametrize("use_nvfp4", [False, True])
+def test_mm_fp4_cudnn_rejects_untransposed_b_descale(use_nvfp4):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required")
+    _expect_cudnn_scale_error(
+        128, 256, 64, use_nvfp4, lambda b_sf: b_sf, "pass its transpose"
+    )
+
+
+@pytest.mark.parametrize("use_nvfp4", [False, True])
+def test_mm_fp4_cudnn_rejects_contiguous_copy_of_b_descale_transpose(use_nvfp4):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required")
+    _expect_cudnn_scale_error(
+        128,
+        256,
+        512,
+        use_nvfp4,
+        lambda b_sf: b_sf.T.contiguous(),
+        "not a contiguous copy",
+    )
+
+
+@pytest.mark.parametrize("use_nvfp4", [False, True])
+def test_mm_fp4_cudnn_rejects_untransposed_b_descale_square(use_nvfp4):
+    # k // block_size and n both pad to 128, so the shapes of the two orientations
+    # agree and only the stride tells them apart.
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required")
+    block_size = 16 if use_nvfp4 else 32
+    _expect_cudnn_scale_error(
+        128,
+        128,
+        128 * block_size,
+        use_nvfp4,
+        lambda b_sf: b_sf,
+        "not a contiguous copy",
+    )
+
+
+@pytest.mark.parametrize("use_nvfp4", [False, True])
+def test_mm_fp4_cudnn_rejects_relaid_out_a_descale(use_nvfp4):
+    # Right shape, storage re-ordered: a copy of the transpose viewed back.
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required")
+    _expect_cudnn_scale_error(
+        128,
+        256,
+        512,
+        use_nvfp4,
+        lambda b_sf: b_sf.T,
+        "not a re-laid-out copy",
+        make_a_scale=lambda a_sf: a_sf.T.contiguous().T,
+    )
+
+
+@pytest.mark.parametrize("use_nvfp4", [False, True])
+def test_mm_fp4_cudnn_auto_declines_untransposed_b_descale(use_nvfp4):
+    # With backend="auto" the cuDNN requirement returns False for a scale tensor
+    # the check rejects, so auto dispatch moves on to another backend instead of
+    # raising. backend="cudnn" first tells cuDNN FP4 unavailability (a library
+    # error, skipped) apart from a rejected layout, so the documented scales must
+    # then be accepted.
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required")
+    m, n, k = 128, 256, 64
+    a_fp4, a_sf, b_fp4, b_sf = _quantized_fp4_operands(m, n, k, use_nvfp4)
+    out = torch.empty([m, n], device="cuda", dtype=torch.bfloat16)
+
+    def accepted(b_scale, backend="auto"):
+        return _cudnn_gemm_fp4_requirement(
+            a_fp4,
+            b_fp4.T,
+            a_sf,
+            b_scale,
+            None,
+            torch.bfloat16,
+            out,
+            block_size=16 if use_nvfp4 else 32,
+            backend=backend,
+            use_nvfp4=use_nvfp4,
+        )
+
+    try:
+        accepted(b_sf.T, backend="cudnn")
+    except (BackendSupportedError, LibraryError) as e:
+        pytest.skip(f"cudnn fp4 backend unavailable here: {e}")
+    except RuntimeError as e:
+        if "FP4 requires" in str(e) or "cuDNN is not available" in str(e):
+            pytest.skip(f"cudnn fp4 backend unavailable here: {e}")
+        raise
+    assert accepted(b_sf.T) is True
+    assert accepted(b_sf) is False
 
 
 if __name__ == "__main__":

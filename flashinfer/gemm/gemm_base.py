@@ -8385,6 +8385,14 @@ def _cudnn_gemm_fp4_requirement(
     use_nvfp4: bool = True,
     enable_pdl: bool = True,  # unused
 ):
+    """Return whether the cuDNN backend can run this ``mm_fp4`` call.
+
+    The 8x4 scale-factor layout raises for any backend. Otherwise, with
+    ``backend="cudnn"`` an unsupported call raises: the library's errors when
+    cuDNN or its FP4 support is missing, and ``ValueError`` when a 2-D
+    block-scale tensor does not match the 128x4 layout. With ``backend="auto"``
+    such a call returns False, so another backend is chosen.
+    """
     if use_8x4_sf_layout:
         raise ValueError("Only TRTLLM FP4 GEMM supports 8x4 scale factor layout.")
 
@@ -8406,6 +8414,59 @@ def _cudnn_gemm_fp4_requirement(
         if backend != "cudnn":
             return False
         raise LibraryError(CUDNN_FP4_MXFP4_SM120_CUDNN_VERSION_ERROR)
+
+    # cuDNN builds its block-scale descriptors from the scale tensors' shapes and
+    # reads their bytes in the 128x4-swizzled order that fp4 quantization writes.
+    # A's scales must therefore be the quantizer's output as returned, and B's
+    # the transposed view of the quantizer's (n, k // block_size) output. The
+    # untransposed B tensor (wrong shape) and a re-laid-out copy of either
+    # (right shape, wrong byte order) are not rejected by cuDNN and give wrong
+    # results or fault the device. Each 2-D scale tensor is checked on its own.
+    if a.dim() == 2:
+        m, k, n = a.shape[0], a.shape[1] * 2, b.shape[1]
+        sf_m, sf_n, sf_k = _calculate_block_scale_dims(m, n, k, block_size)
+        a_bad_shape = a_descale.dim() == 2 and tuple(a_descale.shape) != (sf_m, sf_k)
+        a_bad_order = (
+            a_descale.dim() == 2
+            and not a_bad_shape
+            and tuple(a_descale.stride()) != (sf_k, 1)
+        )
+        b_bad_shape = b_descale.dim() == 2 and tuple(b_descale.shape) != (sf_k, sf_n)
+        b_bad_order = (
+            b_descale.dim() == 2
+            and not b_bad_shape
+            and tuple(b_descale.stride()) != (1, sf_k)
+        )
+        if a_bad_shape or a_bad_order or b_bad_shape or b_bad_order:
+            if backend != "cudnn":
+                return False
+            problems = []
+            if a_bad_shape or b_bad_shape:
+                problems.append(
+                    "cuDNN FP4 GEMM expects 128x4-layout block scales with a_descale "
+                    f"of shape {(sf_m, sf_k)} and b_descale of shape {(sf_k, sf_n)} "
+                    f"for m={m}, n={n}, k={k}, block_size={block_size}; got "
+                    f"{tuple(a_descale.shape)} and {tuple(b_descale.shape)}. If "
+                    "b_descale comes from fp4 quantization of B (n, k), pass its "
+                    "transpose."
+                )
+            if a_bad_order:
+                problems.append(
+                    "cuDNN FP4 GEMM reads a_descale in the byte order that fp4 "
+                    "quantization of A writes, so a_descale must be those scales "
+                    f"as returned, with stride {(sf_k, 1)}; got stride "
+                    f"{tuple(a_descale.stride())}. Pass the quantized scales "
+                    "unchanged, not a re-laid-out copy."
+                )
+            if b_bad_order:
+                problems.append(
+                    "cuDNN FP4 GEMM reads b_descale in the byte order that fp4 "
+                    "quantization of B (n, k) writes, so b_descale must be the "
+                    f"transposed view of those scales, with stride {(1, sf_k)}; got "
+                    f"stride {tuple(b_descale.stride())}. Pass the transpose of the "
+                    "quantized scales, not a contiguous copy of it."
+                )
+            raise ValueError(" ".join(problems))
 
     return True
 
@@ -10073,10 +10134,16 @@ def mm_fp4(
         Mat2 tensor, shape (k, n), should be column major, fp4 e2m1fn_x2 or uint8.
 
     a_descale: torch.Tensor
-        Block scale tensor for A, shape (m, k // block_size), float8_e4m3fn or uint8.
+        Block scale tensor for A, shape (m, k // block_size), float8_e4m3fn or uint8:
+        the scales that fp4 quantization of A returns, unchanged. With the 128x4
+        layout both dimensions are padded (m to a multiple of 128, k // block_size
+        to a multiple of 4).
 
     b_descale: torch.Tensor
-        Block scale tensor for B, shape (k, n // block_size), float8_e4m3fn or uint8.
+        Block scale tensor for B, shape (k // block_size, n), float8_e4m3fn or uint8:
+        the transpose of the (n, k // block_size) scales that fp4 quantization of B
+        returns. With the 128x4 layout both dimensions are padded (k // block_size to a
+        multiple of 4, n to a multiple of 128).
 
     alpha: Optional[torch.Tensor]
         Global scale tensor, float scalar, or a float32 tensor of ``m``
