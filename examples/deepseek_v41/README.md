@@ -385,40 +385,31 @@ and host overhead; these are not model-token latencies.
 
 ### Measured performance (B200)
 
-Warm CUDA Graph replay, 32 calls per replay, symmetric ABBA order, 3 rounds of
-30 samples; median us per call. Both arms ran in one process on one B200 (148
-SMs); per-round medians stayed within 0.3%. The fixture is the benchmark's seeded
-one: context 32768 per request, 128 SWA rows plus `K` selected FP4 main rows,
-H64/D512, sinks enabled. Each arm passed its own FP64 gate first. Toolchain:
-PyTorch 2.14.0+cu130, CuTe-DSL 4.8.0 (bundled CUDA 13.4).
+Prims-TS against FlashInfer's TRTLLM-GEN DSv4 sparse MLA decode
+(`trtllm_batch_decode_sparse_mla_dsv4(..., backend="trtllm-gen")`). Warm CUDA
+Graph replay, 32 calls per replay, symmetric ABBA order, 30 samples per arm;
+median us per call. Both arms ran in one process on one B200 (148 SMs), launched
+with PDL and passed the shared FP64 componentwise bound first. Each request has
+128 SWA rows plus `K` main rows selected from a 32768-token context; H64/D512,
+HND, sinks enabled, `bmm1_scale=512**-0.5`. Toolchain: PyTorch 2.11.0+cu128,
+CuTe-DSL 4.8.0 (bundled CUDA 13.4).
 
-The arms differ in precision contract. Prims-TS runs E4M3 x E4M3 QK and PV MMAs
-with E4M3 Q/SWA, main FP4 rounded to E4M3 and P quantized to E4M3. Upstream
-[FlashMLA](https://github.com/deepseek-ai/FlashMLA) (`395cb3a`, 2026-10-26, built
-with nvcc 13.3; its SM100 head64 no-split sparse decode kernels at these shapes)
-runs BF16 x BF16 MMAs with BF16 Q and P, over MXFP8 SWA and FP4 main exactly
-dequantized to BF16 from its per-token interleaved layout. B200 FP8 MMA peak is
-twice BF16, so part of the gap reflects that contract rather than scheduling.
+Both arms run E4M3 x E4M3 QK and PV MMAs on the same E4M3 Q and SWA. TRTLLM-GEN
+accepts only KV of Q's dtype, so its main pool is dense E4M3 (512 B/token)
+holding exactly the values Prims-TS stages on chip from its packed FP4 pool
+(288 B/token). The TRTLLM-GEN arm is not part of `bench_deepseek_v41_decode.py`.
 
-| Batch | K | Prims-TS before | Prims-TS after | FlashMLA | FlashMLA / after |
-|---:|---:|---:|---:|---:|---:|
-| 1 | 512 | 14.38 | 7.76 | 20.98 | 2.71 |
-| 1 | 128 | 8.22 | 6.71 | 12.21 | 1.82 |
-| 1 | 0 | 6.24 | 4.58 | 9.21 | 2.01 |
-| 16 | 512 | 14.74 | 11.45 | 21.39 | 1.87 |
-| 16 | 128 | 8.47 | 7.02 | 12.39 | 1.76 |
-| 64 | 512 | 16.56 | 13.20 | 21.90 | 1.66 |
-| 64 | 128 | 9.70 | 7.93 | 12.90 | 1.63 |
-| 128 | 512 | 18.27 | 15.19 | 23.66 | 1.56 |
-| 128 | 128 | 11.16 | 9.29 | 13.88 | 1.49 |
-| 128 | 0 | 8.51 | 6.76 | 10.51 | 1.56 |
-| 256 | 512 | 38.05 | 33.57 | 45.58 | 1.36 |
-| 256 | 128 | 20.76 | 17.99 | 27.64 | 1.54 |
-| 256 | 0 | 15.89 | 13.04 | 21.44 | 1.64 |
+| Batch | K=512 Prims-TS | K=512 TRTLLM-GEN | K=128 Prims-TS | K=128 TRTLLM-GEN | K=0 Prims-TS | K=0 TRTLLM-GEN |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 8.06 | 8.56 | 6.64 | 6.02 | 4.62 | 5.02 |
+| 4 | 8.12 | 9.08 | 6.71 | 6.27 | 5.00 | 5.44 |
+| 16 | 11.07 | 10.80 | 6.97 | 6.52 | 5.07 | 5.59 |
+| 24 | 11.55 | 12.38 | 7.05 | 6.59 | 5.12 | 5.68 |
+| 32 | 12.30 | 14.00 | 7.12 | 7.05 | 5.14 | 5.89 |
+| 64 | 13.01 | 17.33 | 7.83 | 8.58 | 5.89 | 7.18 |
+| 128 | 15.11 | 15.42 | 9.13 | 10.71 | 7.05 | 9.11 |
+| 149 | 26.80 | 25.23 | 15.55 | 16.24 | 11.27 | 13.08 |
+| 256 | 31.67 | 28.36 | 16.26 | 17.27 | 11.85 | 14.15 |
 
-"Before" is commit `5a584f72b` (the previous revision of this table) and "after"
-adds the packed FP4 conversion, small-batch KV splits, the single K0 tile, PDL
-and eight loader warps. Both snapshots ran back to back on the same GPU in the
-same container; their FlashMLA arms agreed within 2.2%. "After" chooses KV and V
-splits with the partition rule above (148 SMs): one KV tile per CTA for batches
-1-16 with K >= 192.
+TRTLLM-GEN is faster at K=512 for B=16 and B >= 149 and at K=128 for B <= 32;
+Prims-TS is faster for every other measured shape.
