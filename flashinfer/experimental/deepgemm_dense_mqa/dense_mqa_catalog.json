@@ -481,7 +481,7 @@
         ]
       },
       "first_tile_prefetch_max_queries_scan1024": 1024,
-      "fused_q1_max_kv": 131072,
+      "fused_q1_max_kv": 131328,
       "fused_scan1024_max_kv": 65536,
       "fused_scan32_max_kv": 1048576,
       "fused_scan_ceilings": [
@@ -489,8 +489,8 @@
         1024
       ]
     },
-    "fused_q128_max_kv": 131072,
-    "fused_q1_max_kv": 1048576,
+    "fused_q128_max_kv": 131328,
+    "fused_q1_max_kv": 1048832,
     "fused_qle128_max_kv": 4352,
     "fused_qle2048_max_kv": {
       "sm_100a": 34048,

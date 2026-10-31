@@ -44,7 +44,8 @@ _FP4_LUT = (
 # counts that are not 1, 16 or 128 (partial four-query blocks, 33 and 132
 # queries, and 2052/2053 queries on the unbounded metadata tier), plus one row
 # per two-launch route at the first KV length above its single-launch class's
-# policy bound, two rows past the fused Q <= 2048 route's union bound (the
+# policy bound (and one at the bound of the single-query chains and the FP8
+# Q = 128 text), two rows past the fused Q <= 2048 route's union bound (the
 # le2048 tier pairs), and the two 32-head rows whose KV length is not a multiple
 # of 256 (served where the served route record's ``kv_alignment`` is 1 for the
 # device's architecture; skipped elsewhere).
@@ -78,15 +79,18 @@ CASES = [
     ("fp8", 132, 2048),
     ("fp8", 33, 8192),
     ("fp8", 1, 1048832),
+    ("fp8", 1, 1049088),
     ("fp8", 16, 1048832),
     ("fp8", 3, 1048832),
     ("fp8", 128, 131328),
+    ("fp8", 128, 131584),
     ("fp8", 33, 1048832),
     ("fp8", 132, 8448),
     ("fp8", 130, 8448),
     ("fp8", 2052, 8448),
     ("fp8", 2053, 8448),
     ("fp4", 1, 131328),
+    ("fp4", 1, 131584),
     ("fp4", 16, 1048832),
     ("fp4", 33, 1048832),
     ("fp4", 130, 65792),
@@ -353,7 +357,8 @@ def test_dense_mqa_logits(precision, queries, keys):
         # (smallest covering block ceiling, its own KV bound), then the pair.
         ("fp4", 1, 4096, "fp4:q1:short"),
         ("fp4", 1, 131072, "fp4:q1:short"),
-        ("fp4", 1, 131328, "fp4:q1"),
+        ("fp4", 1, 131328, "fp4:q1:short"),
+        ("fp4", 1, 131584, "fp4:q1"),
         ("fp4", 7, 2048, "fp4:le32:short"),
         ("fp4", 16, 1048576, "fp4:le32:short"),
         ("fp4", 16, 1048832, "fp4:le16"),
@@ -373,10 +378,12 @@ def test_dense_mqa_logits(precision, queries, keys):
         # qualified by block kind (Q = 128 never takes a class), then the pair.
         ("fp8", 1, 4096, "fp8:q1:short"),
         ("fp8", 1, 1048576, "fp8:q1:short"),
-        ("fp8", 1, 1048832, "fp8:q1"),
+        ("fp8", 1, 1048832, "fp8:q1:short"),
+        ("fp8", 1, 1049088, "fp8:q1"),
         ("fp8", 128, 4096, "fp8:q128:short"),
         ("fp8", 128, 131072, "fp8:q128:short"),
-        ("fp8", 128, 131328, "fp8:full:le128"),
+        ("fp8", 128, 131328, "fp8:q128:short"),
+        ("fp8", 128, 131584, "fp8:full:le128"),
         (
             "fp8",
             128,
@@ -388,7 +395,7 @@ def test_dense_mqa_logits(precision, queries, keys):
             "fp8",
             128,
             131077,
-            "fp8:full:le128",
+            "fp8:q128:short",
         ),  # never the le32 class, never the fused Q <= 128 text (K > 4352)
         # On the overlap tiers (le128: 1 < Q <= 128, le2048: 128 < Q <= 2048) the published
         # ``single_launch_precedence`` of the tier decides between the v9 scan class and
