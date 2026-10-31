@@ -1523,8 +1523,9 @@ _THREAD_STATE = threading.local()
 def _thread_state(name: str) -> dict:
     """The calling thread's per-device dict ``name`` of the calls' host state -- ``"dw_streams"`` (device index ->
     (side stream, fork event), :func:`_dw_stream`), ``"cells"`` (device index -> (pinned int32 [1] cell, event),
-    :func:`_hidden_count_cell`) and ``"arange"`` (device index -> the growing int32 constant 1, 2, ..,
-    :func:`_hidden_count_arange`).  None is a tensor of a workspace or a binding.  Calls of different threads on one
+    :func:`_hidden_count_cell`), ``"arange"`` (device index -> the growing int32 constant 1, 2, ..,
+    :func:`_hidden_count_arange`) and ``"arange_streams"`` (device index -> the raw streams the constant was recorded
+    on).  None is a tensor of a workspace or a binding.  Calls of different threads on one
     device (each on its own stream) never share a stream, an event, a cell or the constant: one thread's call cannot
     re-record another's fork event, overwrite its count before the read, or reallocate the constant its queued
     kernels read; one thread runs one call at a time."""
@@ -1650,15 +1651,22 @@ def _hidden_count_cell(index: int) -> tuple:
 def _hidden_count_arange(index: int, T: int) -> torch.Tensor:
     """The calling thread's int32 constant ``1, 2, ..`` of device ``index`` with at least ``T`` entries (no kernel per
     call; grown by doubling), recorded on the current stream so a replaced constant is not reused before the
-    kernels queued on it have read it."""
+    kernels queued on it have read it.  The allocator keeps every recorded stream until the constant is freed, so
+    each stream is recorded once per constant (``"arange_streams"``), not once per call."""
     aranges = _thread_state("arange")
+    recorded = _thread_state("arange_streams")
     ar = aranges.get(index)
     if ar is None or ar.numel() < T:
         cap = max(int(T), 2 * (0 if ar is None else int(ar.numel())))
         ar = aranges[index] = torch.arange(
             1, cap + 1, dtype=torch.int32, device=torch.device("cuda", index)
         )
-    ar.record_stream(torch.cuda.current_stream(index))
+        recorded[index] = set()
+    seen = recorded[index]
+    raw = _current_raw_stream(index)
+    if raw not in seen:
+        ar.record_stream(torch.cuda.current_stream(index))
+        seen.add(raw)
     return ar
 
 
@@ -3235,6 +3243,16 @@ def _unit_scale(device: torch.device) -> torch.Tensor:
     return torch.ones((1,), dtype=torch.float32, device=device)
 
 
+def _current_raw_stream(index: int) -> int:
+    """The raw handle of torch's current stream on device ``index``."""
+    getter = getattr(torch._C, "_cuda_getCurrentRawStream", None)
+    return (
+        getter(index)
+        if getter is not None
+        else torch.cuda.current_stream(index).cuda_stream
+    )
+
+
 def _ffi_stream_context(index: int):
     """tvm-ffi environment-stream context for torch's current stream on device ``index``."""
     import tvm_ffi
@@ -3242,13 +3260,7 @@ def _ffi_stream_context(index: int):
     device = _FFI_DEVICES.get(index)
     if device is None:
         device = _FFI_DEVICES[index] = tvm_ffi.device(f"cuda:{index}")
-    getter = getattr(torch._C, "_cuda_getCurrentRawStream", None)
-    raw = (
-        getter(index)
-        if getter is not None
-        else torch.cuda.current_stream(index).cuda_stream
-    )
-    return tvm_ffi.use_raw_stream(device, raw)
+    return tvm_ffi.use_raw_stream(device, _current_raw_stream(index))
 
 
 def side_stream_schedule(

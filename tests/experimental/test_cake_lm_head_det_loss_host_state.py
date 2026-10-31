@@ -167,6 +167,34 @@ def test_hidden_count_state_is_per_thread():
     ) and torch.equal(b["arange"][:8].cpu(), torch.arange(1, 9, dtype=torch.int32))
 
 
+def test_hidden_count_arange_records_each_stream_once():
+    """The int32 constant is recorded once per stream it is used on, again on a new stream, and afresh after it grew."""
+    if not torch.cuda.is_available():
+        pytest.skip("requires a CUDA device")
+    index = torch.cuda.current_device()
+    got = {}
+
+    def run():
+        recorded = cake_backend._thread_state("arange_streams")
+        ar = cake_backend._hidden_count_arange(index, 8)
+        cake_backend._hidden_count_arange(index, 8)
+        got["one"] = len(recorded[index])
+        side = torch.cuda.Stream(index)
+        with torch.cuda.stream(side):
+            assert cake_backend._hidden_count_arange(index, 8) is ar
+            cake_backend._hidden_count_arange(index, 8)
+        got["two"] = len(recorded[index])
+        grown = cake_backend._hidden_count_arange(index, 2 * ar.numel() + 1)
+        got["grown"] = (grown is not ar, len(recorded[index]))
+        got["values"] = torch.equal(
+            grown.cpu(), torch.arange(1, grown.numel() + 1, dtype=torch.int32)
+        )
+
+    _run_threads(run, lambda: None)
+    assert got["one"] == 1 and got["two"] == 2
+    assert got["grown"] == (True, 1) and got["values"]
+
+
 def _policy_step(inp, chunk):
     X = inp.X.detach().requires_grad_(True)
     W = inp.W.detach().requires_grad_(True)
