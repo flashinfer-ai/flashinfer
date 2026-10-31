@@ -1495,6 +1495,57 @@ def test_cake_sparse_weight_gradient_drops_out_of_range_ids(dw):
     torch.testing.assert_close(got[1 : V + 1].double(), expect, rtol=1e-2, atol=2e-2)
 
 
+def test_cake_sparse_global_dw_zero_fill_bits():
+    """The global-mode sparse dW zero fill (FP32 words over the BF16 buffer) leaves +0 in every row that receives no
+    pair, even over reused all-ones memory, and every row has the bits of the same pass over a BF16 zero fill."""
+    _require_cake()
+    T, H, V = 96, 512, 1000
+    gen = torch.Generator().manual_seed(SEED)
+    counts = torch.randint(0, 9, (T,), generator=gen)
+    off = torch.zeros(T + 1, dtype=torch.int32)
+    off[1:] = torch.cumsum(counts, 0)
+    M = int(off[-1])
+    # ids below V // 2: rows V // 2 .. V - 1 receive no pair
+    ids = torch.randint(0, V // 2, (M,), generator=gen, dtype=torch.int32).to(CUDA)
+    X = torch.randn(T, H, generator=gen).to(torch.bfloat16).to(CUDA)
+    dz = torch.randn(M, generator=gen).to(torch.bfloat16).to(CUDA)
+
+    cx = cake_support._cake_context(CUDA)
+    problem = cake_support.SupportProblem(
+        num_rows=T,
+        hidden=H,
+        vocab=V,
+        num_pairs=M,
+        k_cap=8,
+        chunk=32,
+        has_labels=False,
+        has_teacher=False,
+    )
+    plan = cake_support.make_support_plan(
+        problem,
+        cx.arch,
+        cx.geometry,
+        cake_support._resolve_knobs("sparse", "global", None, None),
+    )
+    assert plan.dw_mode == "global"
+    off32 = off.to(CUDA)
+    active = cake_support._row_active(off32, None, False)
+    torch.cuda.synchronize()
+    # all-ones bits (a BF16 NaN) in the memory the fill reuses
+    junk = torch.full((V, H), -1, dtype=torch.int16, device=CUDA)
+    del junk
+    got = cake_support._sparse_dw(cx, plan, problem, X, ids, off32, dz, active)
+    rows, ld = cake_support._rows_operand(X)
+    ref = torch.zeros((V, H), dtype=torch.bfloat16, device=CUDA)
+    cake_support._sga_dw_range(
+        cx, plan, problem, rows, ld, ids, off32, dz, active, ref, "bf16", 0, M
+    )
+    torch.cuda.synchronize()
+    assert not got[V // 2 :].view(torch.int16).any()
+    assert torch.equal(got.view(torch.int16), ref.view(torch.int16))
+    assert got[: V // 2].view(torch.int16).any()
+
+
 @pytest.mark.parametrize("form", ["sparse", "dense vb256"])
 def test_cake_temperature_forms_bitwise(form):
     _require_cake()

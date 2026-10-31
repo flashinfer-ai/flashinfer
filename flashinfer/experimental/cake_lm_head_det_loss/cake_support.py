@@ -1456,7 +1456,10 @@ def _sparse_dw(
     V, H, M = problem.vocab, problem.hidden, problem.num_pairs
     rows, ld = _rows_operand(Xop)
     if plan.dw_mode == "global":
-        dW = torch.zeros((V, H), dtype=torch.bfloat16, device=cx.device)
+        # +0 written as FP32 zero words (H % 256 == 0: each row holds whole words): the same bits as a BF16 zero
+        # fill, at about twice its rate
+        dW = torch.empty((V, H), dtype=torch.bfloat16, device=cx.device)
+        dW.view(torch.float32).zero_()
         _sga_dw_range(
             cx, plan, problem, rows, ld, ids_rows, off32, dz, active, dW, "bf16", 0, M
         )
