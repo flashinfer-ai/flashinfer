@@ -3188,6 +3188,59 @@ def test_caller_owned_workspace_tail_written_between_runs_is_restored_before_the
         _assert_ticket_tail_zero(runner)
 
 
+def test_eager_entry_zeroes_a_caller_owned_tail_once_per_call(monkeypatch):
+    """The eager entry with a caller-owned workspace: ``prepare`` zeroes the ticket tail on the current stream and the run
+    that follows does not repeat the memset; a tail another kernel left non-zero before the call is still restored, so
+    every call stays bit-exact and leaves the word 0.  A prepared runner on the same buffer still zeroes it every run."""
+    _require_program()
+    device = torch.device("cuda", torch.cuda.current_device())
+    inputs = ref.make_random_inputs(
+        [600, 400], [600, 12000], top_k=1024, seed=75, device="cuda"
+    )
+    workspace = torch.empty(
+        _workspace_bytes(inputs, device), dtype=torch.uint8, device=device
+    )
+    expected = _cloned(_run(inputs))
+    runners, run_memsets = [], []
+    prepare = cake_backend.prepare_dsa_indexer_det_topk
+
+    def counting_prepare(*args, **kwargs):
+        runner = prepare(*args, **kwargs)
+        if runner.ticket_tail is not None:
+            tail = runner.ticket_tail
+            zero = tail.zero_
+            tail.zero_ = lambda: (run_memsets.append(1), zero())[1]
+        runners.append(runner)
+        return runner
+
+    monkeypatch.setattr(cake_backend, "prepare_dsa_indexer_det_topk", counting_prepare)
+    for fill in (7, 0xFF):
+        workspace.fill_(
+            fill
+        )  # what another kernel could leave in the buffer, the tail included
+        out = cake_backend.dsa_indexer_det_topk(
+            inputs.q,
+            inputs.k,
+            inputs.w,
+            inputs.cu_seqlens_q,
+            inputs.cu_seqlens_k,
+            **inputs.kwargs(),
+            workspace_buffer=workspace,
+        )
+        torch.cuda.synchronize()
+        assert ref.same_bits(out, expected), fill
+        _assert_ticket_tail_zero(runners[-1])
+    if runners[-1].ticket_tail is None:
+        pytest.skip("no ticket tail on this architecture")
+    assert runners[-1]._tail_shared and not run_memsets  # zeroed by prepare only
+    runner = runners[-1]
+    runner.ticket_tail.fill_(7)
+    out = runner()  # the prepared runner's own run restores a shared tail
+    torch.cuda.synchronize()
+    assert ref.same_bits(out, expected) and run_memsets == [1]
+    _assert_ticket_tail_zero(runner)
+
+
 def test_caller_owned_workspace_graph_replay_restores_the_tail():
     """A graph capturing a caller-owned runner carries the tail memset node: corrupting the tail between
     replays leaves every replay bit-exact and the tail 0 afterwards."""

@@ -215,7 +215,8 @@ that writes the registry verifies the record against them before it is frozen.
 * **No host synchronization**: the segment boundaries and offsets are read on
   the device only; the host uses `T`, `Tkv`, `S`, `ratio`, `top_k`, the SM
   count and the strides.  The eager entry point allocates the outputs and the
-  workspace (unless supplied) through the caching allocator; the prepared
+  workspace (unless supplied) through the caching allocator and zeroes the
+  ticket tail of a supplied workspace once per call; the prepared
   runner (`cake_backend.prepare_dsa_indexer_det_topk`) allocates nothing at launch
   and is CUDA-graph capturable.
 * **Launch structure**: scan, optional merge, finalize (see above).  No
