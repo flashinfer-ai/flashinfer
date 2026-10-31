@@ -91,6 +91,7 @@ from .parallel_reduction import (
     parallel_gmem_reduction_base_clusters,
     parallel_gmem_reduction_launch_shape,
     parallel_gmem_reduction_threads,
+    planned_split_window,
     run_parallel_gmem_reduction_kernel,
     supports_parallel_gmem_reduction,
 )
@@ -1805,6 +1806,7 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
         self.tile_size_q = tile_size_q
         self.explicit_split_kv = explicit_split_kv
         self.split_kv_capacity = split_kv_capacity
+        self.reduction_policy_splits = reduction_policy_splits
         self.explicit_persistent = explicit_persistent
         self.mask_type = normalize_mask_type(mask_type)
         self.sparse_profile = sparse_profile
@@ -1920,6 +1922,21 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
             self.parallel_reduction_elements_per_slice,
         )
 
+    def _reducer_planned_window(self, cfg) -> int | None:
+        """Unrolled reducer window for a runtime split count, if planned.
+
+        Runtime-split kernels keep the SM-bounded capacity in their scratch
+        layout. Unrolling around the planned count restores the static
+        reducer's load parallelism for that count and its bucket neighbors;
+        other counts stay correct on the chunked runtime path.
+        """
+
+        if not self.runtime_split_kv or self.reduction_policy_splits is None:
+            return None
+        return planned_split_window(
+            self.reduction_policy_splits, cfg.num_ctas_per_seq_kv
+        )
+
     def compile_topology_signature(self) -> tuple[object, ...]:
         """Describe batch-derived reducer choices without retaining batch."""
 
@@ -1928,7 +1945,7 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
             return ("no_separate_reducer",)
         if self.use_parallel_reduction or cfg.fuse_sparse_reduction:
             _, topology, elements = self._parallel_reduction_setup(cfg)
-            return ("parallel", topology, elements)
+            return ("parallel", topology, elements, self._reducer_planned_window(cfg))
         grid, smem, threads, reduction_ctas = gmem_reduction_launch_shape(
             cfg,
             cfg.seq_len_q,
@@ -2985,4 +3002,5 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
             self.output_quant,
             output_quant_args,
             requested_splits=requested_splits,
+            planned_window=self._reducer_planned_window(cfg),
         )

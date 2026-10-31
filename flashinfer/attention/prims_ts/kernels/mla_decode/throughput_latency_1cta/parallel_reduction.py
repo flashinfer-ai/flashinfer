@@ -40,6 +40,21 @@ from .config import MlaConfig
 
 GMEM_REDUCTION_WARP_LANES = 32
 GMEM_REDUCTION_WARPS_PER_CTA = 4
+# Runtime split counts are served by one unrolled window ending at the planned
+# count rounded up to this bucket. Only the bucket's tail is predicated, so
+# nearby plans share a kernel without the latency of a runtime-trip loop.
+GMEM_REDUCTION_PLANNED_SPLIT_BUCKET = 8
+# Counts outside that window walk fixed unrolled chunks. Clamped loads keep a
+# chunk's partials in flight together instead of one short unroll at a time.
+GMEM_REDUCTION_RUNTIME_SPLIT_CHUNK = 16
+
+
+def planned_split_window(planned_splits: int, capacity: int) -> int:
+    """Return the unrolled reducer window for a runtime-split plan."""
+
+    bucket = GMEM_REDUCTION_PLANNED_SPLIT_BUCKET
+    return min(capacity, (planned_splits + bucket - 1) // bucket * bucket)
+
 
 # The parallel reducer always uses 128 threads. Q8/Q16/Q32 assign one scalar
 # from a 128-element output band to each thread. Q64 uses up to one BF16 vec8
@@ -209,6 +224,7 @@ def _run_parallel_gmem_reduction_g1_shared_stats(
     output_quant_args=None,
     requested_splits=None,
     request_is_active=True,
+    planned_window: cutlass.Constexpr = None,
 ):
     """Reduce G1 partials with the compact row-shared schedule."""
 
@@ -398,22 +414,35 @@ def _run_parallel_gmem_reduction_g1_shared_stats(
             dim_idx,
         )
         # Pair FP32 channels while preserving each channel's split order.
-        unrolled_splits = (
-            cfg.num_ctas_per_seq_kv
-            if requested_splits is None
-            else GMEM_REDUCTION_WARP_LANES
-        )
-        if split_limit == Int32(unrolled_splits):
+        # Static splits unroll their exact count. Runtime splits unroll the
+        # planned window and predicate only its bucket tail; counts at or
+        # below window_floor never touch a predicated slot.
+        if cutlass.const_expr(requested_splits is None):
+            unrolled_splits = cfg.num_ctas_per_seq_kv
+            window_floor = unrolled_splits - 1
+        elif cutlass.const_expr(planned_window is None):
+            unrolled_splits = GMEM_REDUCTION_WARP_LANES
+            window_floor = unrolled_splits - 1
+        else:
+            unrolled_splits = planned_window
+            window_floor = max(unrolled_splits - GMEM_REDUCTION_PLANNED_SPLIT_BUCKET, 0)
+        last_split = split_limit - Int32(1)
+        if split_limit > Int32(window_floor) and split_limit <= Int32(unrolled_splits):
             for split_i in cutlass.range_constexpr(unrolled_splits):
                 split_idx = Int32(split_i)
+                load_idx = split_idx
+                if cutlass.const_expr(split_i > window_floor):
+                    # Clamp to a live split so the load needs no branch; its
+                    # zero weight drops the duplicate contribution.
+                    load_idx = split_idx if split_idx < split_limit else last_split
                 scale = Float32(
-                    smem_scale[
-                        row_in_slice * Int32(cfg.num_ctas_per_seq_kv) + split_idx
-                    ]
+                    smem_scale[row_in_slice * Int32(cfg.num_ctas_per_seq_kv) + load_idx]
                 )
+                if cutlass.const_expr(split_i > window_floor):
+                    scale = scale if split_idx < split_limit else Float32(0)
                 # Sparse inactive splits may leave their O partial untouched.
                 if not finalize_attention or scale > Float32(0):
-                    split_ptr = acc_row_ptr + Int64(split_i * cfg.head_dim_v)
+                    split_ptr = acc_row_ptr + Int64(load_idx) * Int64(cfg.head_dim_v)
                     if cutlass.const_expr(output_elements_per_thread == 1):
                         output_acc[0] += Float32(split_ptr.load()) * scale
                     else:
@@ -431,31 +460,38 @@ def _run_parallel_gmem_reduction_g1_shared_stats(
                                 (output_acc[elem_i], output_acc[elem_i + 1]),
                             )
         else:
-            for split_i in cutlass.range(split_limit, unroll=4):
-                split_idx = Int32(split_i)
-                scale = Float32(
-                    smem_scale[
-                        row_in_slice * Int32(cfg.num_ctas_per_seq_kv) + split_idx
-                    ]
-                )
-                if not finalize_attention or scale > Float32(0):
-                    split_ptr = acc_row_ptr + Int64(split_i) * Int64(cfg.head_dim_v)
-                    if cutlass.const_expr(output_elements_per_thread == 1):
-                        output_acc[0] += Float32(split_ptr.load()) * scale
-                    else:
-                        partial_o = split_ptr.load(
-                            count=output_elements_per_thread,
-                            alignment=output_elements_per_thread
-                            * cfg.partial_o_dtype_bytes,
-                        ).to(Float32)
-                        for elem_i in cutlass.range_constexpr(
-                            0, output_elements_per_thread, 2
-                        ):
-                            output_acc[elem_i], output_acc[elem_i + 1] = ffma2(
-                                (partial_o[elem_i], partial_o[elem_i + 1]),
-                                (scale, scale),
-                                (output_acc[elem_i], output_acc[elem_i + 1]),
-                            )
+            chunk = GMEM_REDUCTION_RUNTIME_SPLIT_CHUNK
+            num_chunks = (split_limit + Int32(chunk - 1)) // Int32(chunk)
+            for chunk_i in cutlass.range(num_chunks):
+                for lane_i in cutlass.range_constexpr(chunk):
+                    split_idx = chunk_i * Int32(chunk) + Int32(lane_i)
+                    load_idx = split_idx if split_idx < split_limit else last_split
+                    scale = Float32(
+                        smem_scale[
+                            row_in_slice * Int32(cfg.num_ctas_per_seq_kv) + load_idx
+                        ]
+                    )
+                    scale = scale if split_idx < split_limit else Float32(0)
+                    if not finalize_attention or scale > Float32(0):
+                        split_ptr = acc_row_ptr + Int64(load_idx) * Int64(
+                            cfg.head_dim_v
+                        )
+                        if cutlass.const_expr(output_elements_per_thread == 1):
+                            output_acc[0] += Float32(split_ptr.load()) * scale
+                        else:
+                            partial_o = split_ptr.load(
+                                count=output_elements_per_thread,
+                                alignment=output_elements_per_thread
+                                * cfg.partial_o_dtype_bytes,
+                            ).to(Float32)
+                            for elem_i in cutlass.range_constexpr(
+                                0, output_elements_per_thread, 2
+                            ):
+                                output_acc[elem_i], output_acc[elem_i + 1] = ffma2(
+                                    (partial_o[elem_i], partial_o[elem_i + 1]),
+                                    (scale, scale),
+                                    (output_acc[elem_i], output_acc[elem_i + 1]),
+                                )
 
         output_query_row = public_query_flat_row(
             cfg,
@@ -895,6 +931,7 @@ def run_parallel_gmem_reduction_kernel(
     output_quant: cutlass.Constexpr = None,
     output_quant_args=None,
     requested_splits=None,
+    planned_window: cutlass.Constexpr = None,
 ):
     """Reduce split-KV partials with row-shared local and peer statistics."""
 
@@ -928,6 +965,7 @@ def run_parallel_gmem_reduction_kernel(
             output_quant_args,
             requested_splits=requested_splits,
             request_is_active=request_is_active,
+            planned_window=planned_window,
         )
         return
 
