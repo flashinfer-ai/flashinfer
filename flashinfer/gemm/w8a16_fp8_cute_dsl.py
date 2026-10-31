@@ -104,6 +104,46 @@ def sm100_splits_for(m: int, n: int, k: int, num_sms: int) -> int:
     return 0
 
 
+def _sm100_streamk_substitute(m: int, n: int, k: int, num_sms: int) -> Tuple[int, int]:
+    """(algo, splits) for a problem the C++ dispatcher runs as stream-K: the DSL has
+    no stream-K, so the plain tiles and the split-K slice counts are scored by wave
+    quantization (whole waves of k-tiles, the last wave counted whole) plus the
+    split-K reduce (its fp32 partial traffic in k-tile-waves), and the cheapest wins.
+    Falls back to the plain 256x128 tile when K cannot be sliced."""
+    clusters = num_sms // 2 if num_sms > 1 else 1
+    ktiles = k // 128
+    w_tiles = _tiles(n, 256)
+
+    def plain(tile_a: int, eff: float) -> float:
+        return (
+            _tiles(w_tiles * _tiles(m, tile_a), clusters)
+            * ktiles
+            * (tile_a / 128)
+            / eff
+        )
+
+    best_algo, best_cost = 1, plain(128, 1.00)
+    for algo, tile_a, eff in ((7, 160, 0.96), (4, 192, 1.02)):
+        c = plain(tile_a, eff)
+        if c < best_cost:
+            best_algo, best_cost = algo, c
+    best_splits = 1
+    units = w_tiles * _tiles(m, 128)
+    # One k-tile-wave: the whole grid advancing one k-tile.  The reduce streams
+    # (splits + 0.5) * m * n fp32 words; the ratio to one k-tile-wave's MMA work is
+    # a constant of the machine (about 1/400 per byte-per-FLOP here).
+    reduce_per_split = 4.0 * m * n / (clusters * 2.0 * 128 * 128 * 128 * 2.0) * 400.0
+    for s in range(2, 9):
+        if ktiles % s != 0 or ktiles // s < 8:
+            continue
+        c = _tiles(units * s, clusters) * (ktiles // s) + reduce_per_split * (s + 0.5)
+        if c < best_cost:
+            best_algo, best_cost, best_splits = _SM100_SPLITK, c, s
+    if best_algo == _SM100_SPLITK:
+        return 1, best_splits
+    return best_algo, 1
+
+
 def sm100_pick_algo(m: int, n: int, k: int, num_sms: int) -> int:
     """W8A16Sm100PickAlgo: the launcher's variant for a problem."""
     if n <= 128 and m >= 16384:
@@ -291,10 +331,12 @@ def _sm100_plan(algo: int, m: int, n: int, k: int, num_sms: int) -> Tuple:
 
     if algo == 0:
         algo = sm100_pick_algo(m, n, k, num_sms)
-    if algo == _SM100_STREAMK:
-        algo = 1  # not ported yet
     splits = 1
-    if algo == _SM100_SPLITK:
+    if algo == _SM100_STREAMK:
+        # No stream-K here: the best of what this kernel has for a grid of two or
+        # three partly filled waves (a plain tile or split-K).
+        algo, splits = _sm100_streamk_substitute(m, n, k, num_sms)
+    elif algo == _SM100_SPLITK:
         splits = sm100_splits_for(m, n, k, num_sms)
         if splits < 2:
             raise ValueError(
