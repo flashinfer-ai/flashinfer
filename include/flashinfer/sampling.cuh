@@ -1991,6 +1991,7 @@ __global__ FLASHINFER_SAMPLING_LAUNCH_BOUNDS(BLOCK_THREADS) void ChainSpeculativ
   }
   // init the first rejected token to d
   temp_storage.sampled_id = d;
+  temp_storage.last_valid_id = -1;
   __syncthreads();
   sum_relu_q_minus_p = temp_storage.block_aggregate.value;
   float u = curand_uniform(&curand_state) * sum_relu_q_minus_p;
