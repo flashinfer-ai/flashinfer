@@ -642,6 +642,8 @@ class CpAsyncWarpSplitKKernel:
         k_tile_count = cute.size(weight, mode=[1]) // self.k_tile
 
         if warp_idx < _A_LOADER_WARPS:
+            # Weights are static parameters under PDL, so the weight loaders
+            # never wait for the preceding kernel.
             # Tile 0 has no mbarrier dependency: issue it before the init handshake
             # so its DRAM latency overlaps init and the CTA barrier.
             _issue_weight_tile(
@@ -731,6 +733,9 @@ class CpAsyncWarpSplitKKernel:
                 cute.arch.griddepcontrol_launch_dependents()
         else:
             if const_expr(self.has_bias):
+                # Unlike the weights, the bias may be written by the preceding kernel.
+                if const_expr(self.use_pdl):
+                    cute.arch.griddepcontrol_wait()
                 # Each reduce lane owns one output feature (32 % output_tile == 0).
                 # Issue the load here, after the CTA barrier: waiting on the first
                 # full stage hides its latency, whereas a load before the barrier
