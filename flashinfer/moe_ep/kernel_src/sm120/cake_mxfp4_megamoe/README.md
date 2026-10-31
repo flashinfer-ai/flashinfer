@@ -49,7 +49,7 @@ The device source is compiled per deployment with
 |---|---|---|
 | `MOE_RANKS` | EP world size | 2..32 (the generator-covered region; GPU-validated at 4, 8, 16; 32 compile-checked) |
 | `MOE_EXPERTS` | global routed experts (physical experts under EPLB) | `% MOE_RANKS == 0`, <= 128 per rank, <= 1024 |
-| `MOE_TOPK` | routed experts per token | 1..9 |
+| `MOE_TOPK` | routed experts per token | 1..16 |
 | `MOE_MAX_ROWS` | tokens per rank per call (capacity) | multiple of 128, <= 32640 (the row fields of the signed 32-bit `active_rows` kernel argument) |
 | `MOE_HIDDEN` | hidden size | multiple of 512, <= 7680 |
 | `MOE_INTERMEDIATE` | expert intermediate size | multiple of 128 |
@@ -57,6 +57,10 @@ The device source is compiled per deployment with
 | `MOE_SWIGLU_LIMIT` | SwiGLU clamp `L`: `gate <= L`, `-L <= up <= L` (10 = DeepSeek-V4); 0 = unclamped SwiGLU (DeepSeek-V3, Qwen3) | integer >= 0, default 10 |
 | `MOE_CODEC_OVF_BLOCKS` | raw-overflow capacity of the lossless BF16 return codec, in 64-value blocks per row (see below) | 16..256, default 16 |
 | `MOE_LSA_COPIERS` | copier CTAs of the copier instances (one per LSA destination of a rank) | 1..min(`MOE_RANKS` - 1, 16), default 1; set by the backend from the transport table |
+| `MOE_ACTIVATION` | gated activation after the clamp, routed and shared experts: 0 SwiGLU `silu(gate) * up`; 1 SwiGLU with `swiglu_alpha` / `swiglu_beta` `gate * sigmoid(alpha * gate) * (up + beta)`; 2 SiTU `beta * tanh(gate / beta) * sigmoid(gate) * up'`, `up' = lb * tanh(up / lb)` (`up' = up` when `lb = 0`) | 0 / 1 / 2, default 0 |
+| `MOE_ACT_P0` | activation parameter in 1/1000 units: `swiglu_alpha`, SiTU `beta` | 0 for SwiGLU, else 1..1000000 |
+| `MOE_ACT_P1` | activation parameter in 1/1000 units: `swiglu_beta`, SiTU `lb` (`situ_linear_beta`; 0 = unset) | 0..1000000; 0 for plain SwiGLU |
+| `MOE_RETURN_CODEC` | wire format of the expert results: 0 lossless BF16 codec, 1 int8 codes with one BF16 scale per 64 values (see below) | 0 / 1, default 0 |
 
 and `MOE_INSTANCE` from the wrapper: two row schedules (`m128`: 128-row tasks; `m64`: 64-row
 tasks, launched when no rank holds more than 512 tokens in the call) times two copier flavors
@@ -81,6 +85,16 @@ about 0.3 %, random test data stays far below the capacity.  Each extra block pe
 backend's `codec_overflow_blocks`; e.g. +2.9 GB at DeepSeek-V3 EP 8 / 8192 rows going from 16
 to 28 blocks).
 
+**int8 return codec (`MOE_RETURN_CODEC=1`, `return_codec="int8"`).** Each 64-value block of
+an expert result travels as a 2-byte header holding the BF16 scale `s = max(bf16(amax / 127),
+2^-126)` and 64 int8 codes `q = rne(clamp(x * (1 / s), -127, 127))` (reciprocal rounded to
+nearest).  A row is `hidden_size * 66 / 64` bytes (5280 B at hidden 5120, against 7840 B coded
+plus overflow for the lossless codec); there is no overflow area, so `MOE_CODEC_OVF_BLOCKS`
+does not apply and the codec has no overflow failure mode.  The combine adds `q * s` (exact in
+FP32) in the same slot order as the lossless path, so the output differs from it only by the
+per-value coding error, at most `s / 2`.  The return wire carries about 33 % fewer bytes and the
+result windows shrink accordingly.
+
 **Wait deadline.** Every device-side wait of the kernel that can depend on another rank (GIN
 and LSA signal waits, LSA slot arbitration) and every wait on another CTA's mailbox, queue or
 ring carries a wall-clock deadline of 600 s (`%globaltimer`, armed by the first unsatisfied
@@ -95,7 +109,8 @@ counter / mbarrier / grid waits, whose producers on the same GPU either progress
 
 The backend derives the parameters from the moe_ep configuration (`BootstrapConfig.world_size`,
 `FleetParams.num_experts / token_hidden_size / max_tokens_per_rank` rounded up to 128, the
-kernel config's `intermediate_size / top_k / shared_expert / swiglu_limit / codec_overflow_blocks`,
+kernel config's `intermediate_size / top_k / shared_expert / swiglu_limit / codec_overflow_blocks /
+return_codec` and `activation / swiglu_alpha / swiglu_beta / situ_beta / situ_linear_beta`,
 and `MOE_LSA_COPIERS` from the transport table) and evaluates the geometry (guards
 first, as a `MoEEpConfigError` in `validate_init`).
 

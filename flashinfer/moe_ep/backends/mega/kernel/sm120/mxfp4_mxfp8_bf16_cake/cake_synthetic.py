@@ -138,8 +138,14 @@ def make_layer(
     transport_table: Any = "all_gin",
     swiglu_limit: int = 10,
     codec_overflow_blocks: int = 16,
+    activation: dict[str, Any] | None = None,
+    return_codec: str = "bf16",
 ) -> Any:
-    """A :class:`~flashinfer.moe_ep.MoEEpLayer` on this backend (EP group = WORLD)."""
+    """A :class:`~flashinfer.moe_ep.MoEEpLayer` on this backend (EP group = WORLD).
+
+    ``activation``: optional kernel-config activation fields (``activation``,
+    ``swiglu_alpha``, ``swiglu_beta``, ``situ_beta``, ``situ_linear_beta``); default SwiGLU.
+    """
 
     from ...... import BootstrapConfig, FleetParams, MegaConfig, MoEEpLayer
     from .cake_config import (
@@ -163,6 +169,8 @@ def make_layer(
                 top_k=geometry.top_k,
                 swiglu_limit=swiglu_limit,
                 codec_overflow_blocks=codec_overflow_blocks,
+                **(activation or {}),
+                return_codec=return_codec,
                 shared_expert=SHARED_EXPERT_FP8_IN_KERNEL if shared else None,
                 transport_table=transport_table,
             ),
