@@ -1603,15 +1603,15 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t4096_sm103a(int* __restrict_
                             task_3[5] = _shfl_sync_24;
                         }
                         unsigned int expert_3 = 32 + lane;
-                        unsigned int tokens_1 = counts[1];
-                        unsigned int blocks_1 = (tokens_1 + 128 - 1) / 128;
+                        unsigned int tokens_2 = counts[1];
+                        unsigned int blocks_2 = (tokens_2 + 128 - 1) / 128;
                         unsigned int lane_offset_1 = offsets[1];
-                        unsigned int owner_mask_1 = __ballot_sync(0xFFFFFFFF, expert_3 < 384 && (pool_block >= lane_offset_1 && pool_block < lane_offset_1 + blocks_1));
+                        unsigned int owner_mask_1 = __ballot_sync(0xFFFFFFFF, expert_3 < 384 && (pool_block >= lane_offset_1 && pool_block < lane_offset_1 + blocks_2));
                         if (owner_mask_1 != 0) {
                             int _find_first_set_25 = __ffs(owner_mask_1);
                             unsigned int owner_lane_1 = _find_first_set_25 - 1;
                             unsigned int local_block_1 = pool_block - lane_offset_1;
-                            unsigned int valid_1 = ((tokens_1 - local_block_1 * 128) < (128) ? (tokens_1 - local_block_1 * 128) : (128));
+                            unsigned int valid_1 = ((tokens_2 - local_block_1 * 128) < (128) ? (tokens_2 - local_block_1 * 128) : (128));
                             unsigned int _shfl_sync_26 = __shfl_sync(0xFFFFFFFF, expert_3, owner_lane_1);
                             task_3[1] = _shfl_sync_26;
                             unsigned int _shfl_sync_27 = __shfl_sync(0xFFFFFFFF, local_block_1, owner_lane_1);
@@ -1620,15 +1620,15 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t4096_sm103a(int* __restrict_
                             task_3[5] = _shfl_sync_28;
                         }
                         unsigned int expert_4 = 64 + lane;
-                        unsigned int tokens_2 = counts[2];
-                        unsigned int blocks_2 = (tokens_2 + 128 - 1) / 128;
+                        unsigned int tokens_3 = counts[2];
+                        unsigned int blocks_3 = (tokens_3 + 128 - 1) / 128;
                         unsigned int lane_offset_2 = offsets[2];
-                        unsigned int owner_mask_2 = __ballot_sync(0xFFFFFFFF, expert_4 < 384 && (pool_block >= lane_offset_2 && pool_block < lane_offset_2 + blocks_2));
+                        unsigned int owner_mask_2 = __ballot_sync(0xFFFFFFFF, expert_4 < 384 && (pool_block >= lane_offset_2 && pool_block < lane_offset_2 + blocks_3));
                         if (owner_mask_2 != 0) {
                             int _find_first_set_29 = __ffs(owner_mask_2);
                             unsigned int owner_lane_2 = _find_first_set_29 - 1;
                             unsigned int local_block_2 = pool_block - lane_offset_2;
-                            unsigned int valid_2 = ((tokens_2 - local_block_2 * 128) < (128) ? (tokens_2 - local_block_2 * 128) : (128));
+                            unsigned int valid_2 = ((tokens_3 - local_block_2 * 128) < (128) ? (tokens_3 - local_block_2 * 128) : (128));
                             unsigned int _shfl_sync_30 = __shfl_sync(0xFFFFFFFF, expert_4, owner_lane_2);
                             task_3[1] = _shfl_sync_30;
                             unsigned int _shfl_sync_31 = __shfl_sync(0xFFFFFFFF, local_block_2, owner_lane_2);
@@ -1637,15 +1637,15 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t4096_sm103a(int* __restrict_
                             task_3[5] = _shfl_sync_32;
                         }
                         unsigned int expert_5 = 96 + lane;
-                        unsigned int tokens_3 = counts[3];
-                        unsigned int blocks_3 = (tokens_3 + 128 - 1) / 128;
+                        unsigned int tokens_4 = counts[3];
+                        unsigned int blocks_4 = (tokens_4 + 128 - 1) / 128;
                         unsigned int lane_offset_3 = offsets[3];
-                        unsigned int owner_mask_3 = __ballot_sync(0xFFFFFFFF, expert_5 < 384 && (pool_block >= lane_offset_3 && pool_block < lane_offset_3 + blocks_3));
+                        unsigned int owner_mask_3 = __ballot_sync(0xFFFFFFFF, expert_5 < 384 && (pool_block >= lane_offset_3 && pool_block < lane_offset_3 + blocks_4));
                         if (owner_mask_3 != 0) {
                             int _find_first_set_33 = __ffs(owner_mask_3);
                             unsigned int owner_lane_3 = _find_first_set_33 - 1;
                             unsigned int local_block_3 = pool_block - lane_offset_3;
-                            unsigned int valid_3 = ((tokens_3 - local_block_3 * 128) < (128) ? (tokens_3 - local_block_3 * 128) : (128));
+                            unsigned int valid_3 = ((tokens_4 - local_block_3 * 128) < (128) ? (tokens_4 - local_block_3 * 128) : (128));
                             unsigned int _shfl_sync_34 = __shfl_sync(0xFFFFFFFF, expert_5, owner_lane_3);
                             task_3[1] = _shfl_sync_34;
                             unsigned int _shfl_sync_35 = __shfl_sync(0xFFFFFFFF, local_block_3, owner_lane_3);
@@ -1654,15 +1654,15 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t4096_sm103a(int* __restrict_
                             task_3[5] = _shfl_sync_36;
                         }
                         unsigned int expert_6 = 128 + lane;
-                        unsigned int tokens_4 = counts[4];
-                        unsigned int blocks_4 = (tokens_4 + 128 - 1) / 128;
+                        unsigned int tokens_5 = counts[4];
+                        unsigned int blocks_5 = (tokens_5 + 128 - 1) / 128;
                         unsigned int lane_offset_4 = offsets[4];
-                        unsigned int owner_mask_4 = __ballot_sync(0xFFFFFFFF, expert_6 < 384 && (pool_block >= lane_offset_4 && pool_block < lane_offset_4 + blocks_4));
+                        unsigned int owner_mask_4 = __ballot_sync(0xFFFFFFFF, expert_6 < 384 && (pool_block >= lane_offset_4 && pool_block < lane_offset_4 + blocks_5));
                         if (owner_mask_4 != 0) {
                             int _find_first_set_37 = __ffs(owner_mask_4);
                             unsigned int owner_lane_4 = _find_first_set_37 - 1;
                             unsigned int local_block_4 = pool_block - lane_offset_4;
-                            unsigned int valid_4 = ((tokens_4 - local_block_4 * 128) < (128) ? (tokens_4 - local_block_4 * 128) : (128));
+                            unsigned int valid_4 = ((tokens_5 - local_block_4 * 128) < (128) ? (tokens_5 - local_block_4 * 128) : (128));
                             unsigned int _shfl_sync_38 = __shfl_sync(0xFFFFFFFF, expert_6, owner_lane_4);
                             task_3[1] = _shfl_sync_38;
                             unsigned int _shfl_sync_39 = __shfl_sync(0xFFFFFFFF, local_block_4, owner_lane_4);
@@ -1671,15 +1671,15 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t4096_sm103a(int* __restrict_
                             task_3[5] = _shfl_sync_40;
                         }
                         unsigned int expert_7 = 160 + lane;
-                        unsigned int tokens_5 = counts[5];
-                        unsigned int blocks_5 = (tokens_5 + 128 - 1) / 128;
+                        unsigned int tokens_6 = counts[5];
+                        unsigned int blocks_6 = (tokens_6 + 128 - 1) / 128;
                         unsigned int lane_offset_5 = offsets[5];
-                        unsigned int owner_mask_5 = __ballot_sync(0xFFFFFFFF, expert_7 < 384 && (pool_block >= lane_offset_5 && pool_block < lane_offset_5 + blocks_5));
+                        unsigned int owner_mask_5 = __ballot_sync(0xFFFFFFFF, expert_7 < 384 && (pool_block >= lane_offset_5 && pool_block < lane_offset_5 + blocks_6));
                         if (owner_mask_5 != 0) {
                             int _find_first_set_41 = __ffs(owner_mask_5);
                             unsigned int owner_lane_5 = _find_first_set_41 - 1;
                             unsigned int local_block_5 = pool_block - lane_offset_5;
-                            unsigned int valid_5 = ((tokens_5 - local_block_5 * 128) < (128) ? (tokens_5 - local_block_5 * 128) : (128));
+                            unsigned int valid_5 = ((tokens_6 - local_block_5 * 128) < (128) ? (tokens_6 - local_block_5 * 128) : (128));
                             unsigned int _shfl_sync_42 = __shfl_sync(0xFFFFFFFF, expert_7, owner_lane_5);
                             task_3[1] = _shfl_sync_42;
                             unsigned int _shfl_sync_43 = __shfl_sync(0xFFFFFFFF, local_block_5, owner_lane_5);
@@ -1688,15 +1688,15 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t4096_sm103a(int* __restrict_
                             task_3[5] = _shfl_sync_44;
                         }
                         unsigned int expert_8 = 192 + lane;
-                        unsigned int tokens_6 = counts[6];
-                        unsigned int blocks_6 = (tokens_6 + 128 - 1) / 128;
+                        unsigned int tokens_7 = counts[6];
+                        unsigned int blocks_7 = (tokens_7 + 128 - 1) / 128;
                         unsigned int lane_offset_6 = offsets[6];
-                        unsigned int owner_mask_6 = __ballot_sync(0xFFFFFFFF, expert_8 < 384 && (pool_block >= lane_offset_6 && pool_block < lane_offset_6 + blocks_6));
+                        unsigned int owner_mask_6 = __ballot_sync(0xFFFFFFFF, expert_8 < 384 && (pool_block >= lane_offset_6 && pool_block < lane_offset_6 + blocks_7));
                         if (owner_mask_6 != 0) {
                             int _find_first_set_45 = __ffs(owner_mask_6);
                             unsigned int owner_lane_6 = _find_first_set_45 - 1;
                             unsigned int local_block_6 = pool_block - lane_offset_6;
-                            unsigned int valid_6 = ((tokens_6 - local_block_6 * 128) < (128) ? (tokens_6 - local_block_6 * 128) : (128));
+                            unsigned int valid_6 = ((tokens_7 - local_block_6 * 128) < (128) ? (tokens_7 - local_block_6 * 128) : (128));
                             unsigned int _shfl_sync_46 = __shfl_sync(0xFFFFFFFF, expert_8, owner_lane_6);
                             task_3[1] = _shfl_sync_46;
                             unsigned int _shfl_sync_47 = __shfl_sync(0xFFFFFFFF, local_block_6, owner_lane_6);
@@ -1705,15 +1705,15 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t4096_sm103a(int* __restrict_
                             task_3[5] = _shfl_sync_48;
                         }
                         unsigned int expert_9 = 224 + lane;
-                        unsigned int tokens_7 = counts[7];
-                        unsigned int blocks_7 = (tokens_7 + 128 - 1) / 128;
+                        unsigned int tokens_8 = counts[7];
+                        unsigned int blocks_8 = (tokens_8 + 128 - 1) / 128;
                         unsigned int lane_offset_7 = offsets[7];
-                        unsigned int owner_mask_7 = __ballot_sync(0xFFFFFFFF, expert_9 < 384 && (pool_block >= lane_offset_7 && pool_block < lane_offset_7 + blocks_7));
+                        unsigned int owner_mask_7 = __ballot_sync(0xFFFFFFFF, expert_9 < 384 && (pool_block >= lane_offset_7 && pool_block < lane_offset_7 + blocks_8));
                         if (owner_mask_7 != 0) {
                             int _find_first_set_49 = __ffs(owner_mask_7);
                             unsigned int owner_lane_7 = _find_first_set_49 - 1;
                             unsigned int local_block_7 = pool_block - lane_offset_7;
-                            unsigned int valid_7 = ((tokens_7 - local_block_7 * 128) < (128) ? (tokens_7 - local_block_7 * 128) : (128));
+                            unsigned int valid_7 = ((tokens_8 - local_block_7 * 128) < (128) ? (tokens_8 - local_block_7 * 128) : (128));
                             unsigned int _shfl_sync_50 = __shfl_sync(0xFFFFFFFF, expert_9, owner_lane_7);
                             task_3[1] = _shfl_sync_50;
                             unsigned int _shfl_sync_51 = __shfl_sync(0xFFFFFFFF, local_block_7, owner_lane_7);
@@ -1722,15 +1722,15 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t4096_sm103a(int* __restrict_
                             task_3[5] = _shfl_sync_52;
                         }
                         unsigned int expert_10 = 256 + lane;
-                        unsigned int tokens_8 = counts[8];
-                        unsigned int blocks_8 = (tokens_8 + 128 - 1) / 128;
+                        unsigned int tokens_9 = counts[8];
+                        unsigned int blocks_9 = (tokens_9 + 128 - 1) / 128;
                         unsigned int lane_offset_8 = offsets[8];
-                        unsigned int owner_mask_8 = __ballot_sync(0xFFFFFFFF, expert_10 < 384 && (pool_block >= lane_offset_8 && pool_block < lane_offset_8 + blocks_8));
+                        unsigned int owner_mask_8 = __ballot_sync(0xFFFFFFFF, expert_10 < 384 && (pool_block >= lane_offset_8 && pool_block < lane_offset_8 + blocks_9));
                         if (owner_mask_8 != 0) {
                             int _find_first_set_53 = __ffs(owner_mask_8);
                             unsigned int owner_lane_8 = _find_first_set_53 - 1;
                             unsigned int local_block_8 = pool_block - lane_offset_8;
-                            unsigned int valid_8 = ((tokens_8 - local_block_8 * 128) < (128) ? (tokens_8 - local_block_8 * 128) : (128));
+                            unsigned int valid_8 = ((tokens_9 - local_block_8 * 128) < (128) ? (tokens_9 - local_block_8 * 128) : (128));
                             unsigned int _shfl_sync_54 = __shfl_sync(0xFFFFFFFF, expert_10, owner_lane_8);
                             task_3[1] = _shfl_sync_54;
                             unsigned int _shfl_sync_55 = __shfl_sync(0xFFFFFFFF, local_block_8, owner_lane_8);
@@ -1739,15 +1739,15 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t4096_sm103a(int* __restrict_
                             task_3[5] = _shfl_sync_56;
                         }
                         unsigned int expert_12 = 288 + lane;
-                        unsigned int tokens_9 = counts[9];
-                        unsigned int blocks_9 = (tokens_9 + 128 - 1) / 128;
+                        unsigned int tokens_10 = counts[9];
+                        unsigned int blocks_10 = (tokens_10 + 128 - 1) / 128;
                         unsigned int lane_offset_9 = offsets[9];
-                        unsigned int owner_mask_9 = __ballot_sync(0xFFFFFFFF, expert_12 < 384 && (pool_block >= lane_offset_9 && pool_block < lane_offset_9 + blocks_9));
+                        unsigned int owner_mask_9 = __ballot_sync(0xFFFFFFFF, expert_12 < 384 && (pool_block >= lane_offset_9 && pool_block < lane_offset_9 + blocks_10));
                         if (owner_mask_9 != 0) {
                             int _find_first_set_57 = __ffs(owner_mask_9);
                             unsigned int owner_lane_9 = _find_first_set_57 - 1;
                             unsigned int local_block_9 = pool_block - lane_offset_9;
-                            unsigned int valid_9 = ((tokens_9 - local_block_9 * 128) < (128) ? (tokens_9 - local_block_9 * 128) : (128));
+                            unsigned int valid_9 = ((tokens_10 - local_block_9 * 128) < (128) ? (tokens_10 - local_block_9 * 128) : (128));
                             unsigned int _shfl_sync_58 = __shfl_sync(0xFFFFFFFF, expert_12, owner_lane_9);
                             task_3[1] = _shfl_sync_58;
                             unsigned int _shfl_sync_59 = __shfl_sync(0xFFFFFFFF, local_block_9, owner_lane_9);
@@ -1756,15 +1756,15 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t4096_sm103a(int* __restrict_
                             task_3[5] = _shfl_sync_60;
                         }
                         unsigned int expert_13 = 320 + lane;
-                        unsigned int tokens_10 = counts[10];
-                        unsigned int blocks_10 = (tokens_10 + 128 - 1) / 128;
+                        unsigned int tokens_11 = counts[10];
+                        unsigned int blocks_11 = (tokens_11 + 128 - 1) / 128;
                         unsigned int lane_offset_10 = offsets[10];
-                        unsigned int owner_mask_10 = __ballot_sync(0xFFFFFFFF, expert_13 < 384 && (pool_block >= lane_offset_10 && pool_block < lane_offset_10 + blocks_10));
+                        unsigned int owner_mask_10 = __ballot_sync(0xFFFFFFFF, expert_13 < 384 && (pool_block >= lane_offset_10 && pool_block < lane_offset_10 + blocks_11));
                         if (owner_mask_10 != 0) {
                             int _find_first_set_61 = __ffs(owner_mask_10);
                             unsigned int owner_lane_10 = _find_first_set_61 - 1;
                             unsigned int local_block_10 = pool_block - lane_offset_10;
-                            unsigned int valid_10 = ((tokens_10 - local_block_10 * 128) < (128) ? (tokens_10 - local_block_10 * 128) : (128));
+                            unsigned int valid_10 = ((tokens_11 - local_block_10 * 128) < (128) ? (tokens_11 - local_block_10 * 128) : (128));
                             unsigned int _shfl_sync_62 = __shfl_sync(0xFFFFFFFF, expert_13, owner_lane_10);
                             task_3[1] = _shfl_sync_62;
                             unsigned int _shfl_sync_63 = __shfl_sync(0xFFFFFFFF, local_block_10, owner_lane_10);
@@ -1773,15 +1773,15 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t4096_sm103a(int* __restrict_
                             task_3[5] = _shfl_sync_64;
                         }
                         unsigned int expert_14 = 352 + lane;
-                        unsigned int tokens_11 = counts[11];
-                        unsigned int blocks_11 = (tokens_11 + 128 - 1) / 128;
+                        unsigned int tokens_12 = counts[11];
+                        unsigned int blocks_12 = (tokens_12 + 128 - 1) / 128;
                         unsigned int lane_offset_11 = offsets[11];
-                        unsigned int owner_mask_11 = __ballot_sync(0xFFFFFFFF, expert_14 < 384 && (pool_block >= lane_offset_11 && pool_block < lane_offset_11 + blocks_11));
+                        unsigned int owner_mask_11 = __ballot_sync(0xFFFFFFFF, expert_14 < 384 && (pool_block >= lane_offset_11 && pool_block < lane_offset_11 + blocks_12));
                         if (owner_mask_11 != 0) {
                             int _find_first_set_65 = __ffs(owner_mask_11);
                             unsigned int owner_lane_11 = _find_first_set_65 - 1;
                             unsigned int local_block_11 = pool_block - lane_offset_11;
-                            unsigned int valid_11 = ((tokens_11 - local_block_11 * 128) < (128) ? (tokens_11 - local_block_11 * 128) : (128));
+                            unsigned int valid_11 = ((tokens_12 - local_block_11 * 128) < (128) ? (tokens_12 - local_block_11 * 128) : (128));
                             unsigned int _shfl_sync_66 = __shfl_sync(0xFFFFFFFF, expert_14, owner_lane_11);
                             task_3[1] = _shfl_sync_66;
                             unsigned int _shfl_sync_67 = __shfl_sync(0xFFFFFFFF, local_block_11, owner_lane_11);
