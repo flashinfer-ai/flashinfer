@@ -739,6 +739,15 @@ Task-scheduled attention shares this cache through
 options, and embedded device-capacity constants. It hashes the attention source
 tree, including shared preparation, masks, and reductions. Occupancy queries
 are cached per device and cluster size by `_hardware.py`.
+PrimTS warm-up can use `_compile_cache.precompile_only()` to persist kernels
+without loading them, or `probe_cached()` to check their disk artifacts.
+`cache_compiled` bypasses the in-process memo in both modes; use it for new
+attention compiler entry points, including those returning kernel tuples.
+Sparse MLA caches validated geometry with an explicit device index. Native
+D512 single-token calls also reuse prepared pool/sink views after a full run;
+replanning clears those views, and dynamic query/index/output metadata is
+still checked with `validate=False`.
+
 
 ### Dispatch Macros
 
