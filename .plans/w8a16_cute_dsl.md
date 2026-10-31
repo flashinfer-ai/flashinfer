@@ -306,3 +306,18 @@ Until then the C++ stays as-is and the DSL kernel lives beside it.
   last table predates today's fixes).  Open: remove the W8A16_DSL_KSPLIT, W8A16_DSL_FRAG,
   W8A16_DSL_AIN_SMEM and W8A16_DSL_FIXUP_CUT knobs before the PR; swap the public op to
   the DSL; tests and docs.
+- Sat 31 Oct 2026, 12:00-13:30: CUDA-graph measurement (peer request: no timer tricks).
+  scratchpad graph_bench.py: per implementation and row a graph of 20 calls, each
+  preceded by a 256 MB memset (L2 flush) node, replayed 7 rounds alternating
+  implementations, CUDA events around the replay, the flush-only graph's time subtracted,
+  median.  DSL vs C++, all 18 rows per GPU: H100 (s4124-0017) -0.3 to -6.5%, gen.qkv 8192
+  +0.1%; GB200 (gb-nvl-057) -0.4 to -4.8%, every row under; B200 (umb-b200-248) -0.0 to
+  -3.8%, und.q 8192 and gate_up 8192 +0.1%.  Plot: scratchpad w8a16_parity.png.  Checks
+  pass on B200 (algos 1, 2, 4, 5, 7).  The Blackwell M=8192 rows that looked +1.4 / +2.4%
+  in the CUPTI bench on GB200 are -0.9 / -4.8% under graphs (the bench's per-iteration
+  flush plus the host gap left the GPU cooling and reclocking between launches).
+  GB200 K sweep at M=8192 (cold / hot): intercept 20% lower than C++ (36.5 vs 46.6 us at
+  K=320), slope ~2.7% higher (56.6 vs 55.1 ns per K between K=2560 and 5120), which is
+  the remaining Blackwell lead: the per-k-tile steady state of the 2-SM 256x128 tile.
+  Leases: GB200 w8a16-gb8 (gb-nvl-057-compute09), B200 w8a16-b14 (umb-b200-248), B300
+  w8a16-b300a (umb-b300-023, sm103, first-light check running), H100 h20 / h23.
