@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, replace
+from itertools import chain
 from typing import Optional, Sequence
 
 import torch
@@ -761,13 +762,13 @@ def _plan_table_words(
     end = layout["q_indptr"][0] + layout["q_indptr"][1]
     words = [0] * ((end - base) // 4)
     for name, values in (
-        ("work_table", [v for item in plan.items for v in item]),
+        ("work_table", chain.from_iterable(plan.items)),
         ("unit_first", plan.unit_first),
         ("row_splits", row_splits),
         ("q_indptr", q_indptr),
     ):
         offset, nbytes = layout[name]
-        values = [int(v) for v in values]
+        values = list(map(int, values))
         if len(values) * 4 != nbytes:
             raise ValueError(f"{name}: {len(values)} words for a {nbytes}-byte region")
         words[(offset - base) // 4 : (offset - base) // 4 + len(values)] = values
@@ -932,7 +933,11 @@ def max_nvfp4_mla_decode_workspace_size(
 
 def _carve(flat: torch.Tensor, layout: dict, name: str, dtype, shape):
     offset, nbytes = layout[name]
-    return flat[offset : offset + nbytes].view(dtype).view(shape)
+    region = flat[offset : offset + nbytes].view(dtype)
+    # A one-dimensional region already has its shape (no second view).
+    if len(shape) == 1 and region.shape[0] == shape[0]:
+        return region
+    return region.view(shape)
 
 
 def host_tables(
