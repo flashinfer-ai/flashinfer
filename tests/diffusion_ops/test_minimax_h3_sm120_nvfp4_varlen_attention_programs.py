@@ -359,7 +359,7 @@ def test_architecture_router_rejects_cross_routing(monkeypatch) -> None:
     ops._nvfp4_target.cache_clear()
 
 
-def _plan(bounds, num_heads=1):
+def _plan(bounds, num_heads=1, num_sms=188):
     tokens = bounds[-1]
     padded = max(1, -(-tokens // 128)) * 128
     tiles = sum(
@@ -374,6 +374,7 @@ def _plan(bounds, num_heads=1):
         padded_tokens=padded,
         num_heads=num_heads,
         num_units=tiles * num_heads,
+        grid=max(1, min(num_sms, tiles * num_heads)),
     )
 
 
@@ -1047,12 +1048,57 @@ def test_head_major_unit_rows_cover_every_unit_once() -> None:
     plan = _plan(bounds, heads)
     rows = ops._plan_rows_head_major(plan, torch.device("cpu", 0)).view(-1, 4).tolist()
     assert len(rows) == plan.num_units == 5 * heads
-    expected = [
+    head_major = [
         [seg, (head << 16) | tile, bounds[seg], bounds[seg + 1]]
         for head in range(heads)
         for seg, tile in ((1, 0), (1, 1), (3, 0), (3, 1), (3, 2))
     ]
-    assert rows == expected
+    # at most 4 x grid units: the whole table drains longest first (segment 3: 371 tokens, 3 key
+    # tiles; segment 1: 129 tokens, 2), equal key tiles in head-major order
+    assert rows == [r for r in head_major if r[0] == 3] + [
+        r for r in head_major if r[0] == 1
+    ]
+
+
+def test_head_major_unit_rows_drain_longest_first() -> None:
+    # Head by head, each head's units in segment and Q-tile order; the last 4 x grid units then
+    # run longest first (a stable sort by the segment's key tiles).
+    bounds = (0, 257, 4567, 4824)
+    plan = _plan(bounds, 56, num_sms=188)
+    rows = ops._plan_rows_head_major(plan, torch.device("cpu", 0)).view(-1, 4).tolist()
+    per_head = [
+        (seg, tile, a, b)
+        for seg, (a, b) in enumerate(zip(bounds[:-1], bounds[1:], strict=False))
+        for tile in range(-(-(b - a) // 128))
+    ]
+    head_major = [
+        [seg, (head << 16) | tile, a, b]
+        for head in range(56)
+        for seg, tile, a, b in per_head
+    ]
+    drain = len(head_major) - 4 * 188
+    assert len(rows) == plan.num_units == len(head_major) == 2240
+    assert rows[:drain] == head_major[:drain]
+    assert rows[drain:] == [r for r in head_major[drain:] if r[0] == 1] + [
+        r for r in head_major[drain:] if r[0] != 1
+    ]
+
+
+def test_head_major_unit_rows_keep_order_on_three_key_tile_counts() -> None:
+    # three key-tile counts (2, 3 and 5): the head-major order, no drain sort
+    bounds = (0, 129, 500, 1100)
+    plan = _plan(bounds, 4)
+    rows = ops._plan_rows_head_major(plan, torch.device("cpu", 0)).view(-1, 4).tolist()
+    per_head = [
+        (seg, tile, a, b)
+        for seg, (a, b) in enumerate(zip(bounds[:-1], bounds[1:], strict=False))
+        for tile in range(-(-(b - a) // 128))
+    ]
+    assert rows == [
+        [seg, (head << 16) | tile, a, b]
+        for head in range(4)
+        for seg, tile, a, b in per_head
+    ]
 
 
 @pytest.mark.parametrize(

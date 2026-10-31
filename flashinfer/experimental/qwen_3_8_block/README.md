@@ -50,8 +50,8 @@ the select window plan's constants, so a capture takes the SECOND run (one eager
 
 | form | entry point | step | what it reads and writes |
 |---|---|---|---|
-| decode | `qwen_3_8_block_bf16_decode`; `prepare_qwen_3_8_block_bf16("decode", ...)`; `Qwen38BlockWrapper` | a uniform `[batch, q_len]` step, `q_len = 1 + drafts` (up to 16 at four indexer heads) | reads the pools, the ring and the compressed-key cache through the stack's block tables; writes the step's K / V rows, ring rows and completed cache rows in place |
-| extend | `prepare_qwen_3_8_block_bf16("extend", ...)`; `Qwen38BlockWrapper` | a uniform `[batch, T]` chunk of every sequence behind its cached prefix `P = seq_lens[b] - T` (`seq_lens` AFTER the chunk; `batch x T <= 128` rows per run at this pin, `T <= max_pages x page_size`) | reads the pools, the ring (the prefix's last `cap` positions) and the compressed-key cache through the stack's tables; writes the chunk's K / V rows, its complete compressed blocks (the straddling one included) and the chunk's last `cap` raw keys into the ring, in the position-indexed form the decode step reads |
+| decode | `qwen_3_8_block_bf16_decode`; `prepare_qwen_3_8_block_bf16("decode", ...)`; `Qwen38BlockWrapper` | a uniform `[batch, q_len]` step, `q_len = 1 + drafts` (up to 16 at four indexer heads; `batch x q_len` up to 65,535 rows per run at this pin, see Errors) | reads the pools, the ring and the compressed-key cache through the stack's block tables; writes the step's K / V rows, ring rows and completed cache rows in place |
+| extend | `prepare_qwen_3_8_block_bf16("extend", ...)`; `Qwen38BlockWrapper` | a uniform `[batch, T]` chunk of every sequence behind its cached prefix `P = seq_lens[b] - T` (`seq_lens` AFTER the chunk; any `batch x T` up to 65,535 rows per run at this pin -- the vendored indexer's query compress launches with the run's row count as a CUDA grid dimension, see Errors --, `T <= max_pages x page_size`) | reads the pools, the ring (the prefix's last `cap` positions) and the compressed-key cache through the stack's tables; writes the chunk's K / V rows, its complete compressed blocks (the straddling one included) and the chunk's last `cap` raw keys into the ring, in the position-indexed form the decode step reads |
 | prefill | `prepare_qwen_3_8_block_bf16("prefill", ...)`; `Qwen38BlockWrapper` | the SAME plan form as `extend`, run with `seq_lens[b] == T` for every live sequence (`P = 0`: the first chunk of a prompt) -- one vendored form, two names | as `extend`; the caches start empty (nothing is read from the ring) |
 
 `prepare_qwen_3_8_block_bf16(form, ...)` returns the plan behind a form (`Qwen38BlockPlan`: `run`, `workspace_size`,
@@ -123,8 +123,9 @@ out = w.run(hidden_states, None, None, weights, w_o,
 ## A chunk, vLLM-shaped (the extend / prefill forms)
 
 ```python
-# init: one plan per (form, batch, T) bucket -- the chunk's rows T are uniform over the batch and batch x T <= 128 at this pin; the
-# ring must hold cap >= 3 rows per block (vLLM's 4), and every run binds a ring of exactly that cap
+# init: one plan per (form, batch, T) bucket -- the chunk's rows T are uniform over the batch, T up to the table's reach at any batch,
+# B x T <= 65,535 rows per run at this pin (a longer chunk is several runs);
+# the ring must hold cap >= 3 rows per block (vLLM's 4), and every run binds a ring of exactly that cap
 wx = Qwen38BlockWrapper(workspace, "UNIFIED", geometry=geometry)
 wx.plan("extend", weights=weights, w_o=w_o, kv_cache=layer.kv_cache, page_size=page_size, batch_size=B, q_len_per_req=T,
         block_table=block_table, index_kv_cache=compressed_key_cache, index_state_cache=raw_key_ring,
@@ -229,8 +230,10 @@ out = wx.run(hidden_states, cos, sin, weights, w_o,
    the execute path; the captured execute launches only kernels and replays bitwise an eager run (tested, over a new step too).
    EXTEND / PREFILL: the first `run` of a fresh plan uploads the select window plan's constants on its launch stream, so a capture takes
    the SECOND run -- ONE eager warm-up ON THE CAPTURE STREAM first (`plan.capture_warm_up_required`); the captured run then launches only
-   kernels and replays bitwise an eager run (tested, over a new chunk too). Under the 128-row bound of this pin every chunk's projections
-   ride the capture-safe JIT route.
+   kernels and replays bitwise an eager run (tested, over a new chunk too, and past 128 rows). Every chunk's projections ride the
+   capture-safe JIT route at every row count: the band slab's small-M tile up to 128 rows, the GEMM engine's own baseline tile for its
+   shape past them (the `6b21be0e0` pin; `plan.declaration["proj_tile"]` names it, `proj_capture_safe` / `out_proj_capture_safe` read the
+   vendored block's own flags).
 3. A captured graph replays over NEW values of `seq_lens`, `block_table`, `slot_mapping`, `index_state_slot_mapping`, the ring table,
    `hidden_states` and the caches' CONTENTS written in place into the SAME buffers (addresses are baked). The pad regime is the Qwen 3.5
    one: a padded entry is `seq_lens 0`, table row `0`, slot `-1`, ring block `0` (ring slot `-1`) -> `out` rows exactly 0, NO write to
@@ -263,7 +266,8 @@ extend run per layer; ragged chunks are several extend runs grouped by their len
 | condition | exception |
 |---|---|
 | a tensor-parallel shard whose fused slab or out projection is off the capture-safe small-M projection route on the device (the TP 2 / TP 4 slabs, N 7296 / 4224: 256 does not divide N and its 64-row weight tiles fit one wave; the vendored route's own arithmetic decides, at the part's SM count); the probe lists it as `proj_slab_route` -- a FlashInfer-side row, not an envelope row | `NotImplementedError` naming the projection, N, K and the SM count |
-| not cc 10.7; `nvidia-cutlass-dsl` absent, below 4.8.0 or without the Rubin target; f16 / fp8 activations on the bf16 entry; `head_dim != 256`, `d_model % 256`, `rope_dim` not 64 / 128; the indexer geometry off `index_head_dim 128` / `index_kv_heads 1` / `block_size 4` / `top_k` a multiple of 4 in [4, 512]; `index_list_form="shared"`; an `index_cache_dtype` other than bf16 / e4m3; `kv_cache_dtype=torch.float8_e4m3fn`; on the decode form `q_len_per_req x next_pow2(index_heads) > 64` (16 rows at four heads); a `page_size` the paged indexer does not address (not 16 / 32 / 64 / 128); `use_pdl=True` on the sparse chain; `fuse_prepare=False` with `rope_position_tables_only=True` (decode); on the extend / prefill forms `fuse_prepare=True`, an explicit `ring_slots=False` or `rope_position_tables_only=True`, and `batch_size x q_len_per_req > 128` rows per run | `NotImplementedError` naming the fact (the vendored decline text where one exists; `qwen_3_8_block_support` reports it without raising, and its `decode.declines` table carries every vendored row by key: `indexer_f16`, `indexer_head_dim`, `indexer_thd`, `indexer_query_rows`, `indexer_page_size`, `indexer_e4m3_pool`, `indexer_shared_list`, `shared_list_rows`, `fuse_prepare_rope_tables_unfused`, the extend step's `indexer_extend_fuse_prepare`, `indexer_extend_ring_slots`, `indexer_extend_rope_tables_only`, `indexer_extend_ring_rows`, `indexer_extend_chunk_rows`, plus the FlashInfer-side rows `proj_slab_route` and -- on the extend / prefill records -- `extend_proj_slab_rows`) |
+| on EVERY form ONE run of more than 65,535 rows (`batch_size x q_len_per_req`: e.g. batch 32 x `T` 2048 on extend / prefill, batch 4096 x `q_len` 16 on decode): at this pin the vendored indexer's query compress -- the decode step's and the extend step's share the launch -- runs with the run's row count as a CUDA grid dimension, which CUDA caps at 65,535, so a longer run would pass every other gate and fail at launch; the probe lists it as `indexer_extend_grid_rows` on every form record (one table for the three forms) and reports the bound (`extend_rows_grid_max`, `support.EXTEND_ROWS_GRID_MAX`) -- a FlashInfer-side row, not an envelope row; lifted once the compressor's grid is flattened in cuDNN Frontend and re-vendored | `NotImplementedError` naming the bound, the rows and the remedy (several uniform chunks or decode steps of at most 65,535 rows per run, or a smaller batch), before any vendored code |
+| not cc 10.7; `nvidia-cutlass-dsl` absent, below 4.8.0 or without the Rubin target; f16 / fp8 activations on the bf16 entry; `head_dim != 256`, `d_model % 256`, `rope_dim` not 64 / 128; the indexer geometry off `index_head_dim 128` / `index_kv_heads 1` / `block_size 4` / `top_k` a multiple of 4 in [4, 512]; `index_list_form="shared"`; an `index_cache_dtype` other than bf16 / e4m3; `kv_cache_dtype=torch.float8_e4m3fn`; on the decode form `q_len_per_req x next_pow2(index_heads) > 64` (16 rows at four heads); a `page_size` the paged indexer does not address (not 16 / 32 / 64 / 128); `use_pdl=True` on the sparse chain; `fuse_prepare=False` with `rope_position_tables_only=True` (decode); on the extend / prefill forms `fuse_prepare=True`, an explicit `ring_slots=False` or `rope_position_tables_only=True` | `NotImplementedError` naming the fact (the vendored decline text where one exists; `qwen_3_8_block_support` reports it without raising, and its `decode.declines` table carries every vendored row by key: `indexer_f16`, `indexer_head_dim`, `indexer_thd`, `indexer_query_rows`, `indexer_page_size`, `indexer_e4m3_pool`, `indexer_shared_list`, `shared_list_rows`, `fuse_prepare_rope_tables_unfused`, the extend step's `indexer_extend_fuse_prepare`, `indexer_extend_ring_slots`, `indexer_extend_rope_tables_only`, `indexer_extend_ring_rows`, `indexer_extend_chunk_rows`, plus the FlashInfer-side rows `proj_slab_route` and `indexer_extend_grid_rows` (above); ONE table for the three forms) |
 | a malformed operand (dtype, rank, shape, strides, alignment, device); a ring with `cap < q_len + 3` on decode or `cap < 3` on extend / prefill (the bound named), or on extend / prefill a ring at `run` of another capacity than the plan's (both named); `q_len_per_req > max_pages x page_size` on extend / prefill (the vendored `indexer_extend_chunk_rows` row's class, both numbers named); position tables shorter than `max_pages x page_size`; `index_state_slot_mapping` given / missing against the plan's `ring_slots`, or of another dtype than `slot_mapping`; `rope_cos` / `rope_sin` given under the table arm or missing under the per-token arm; `query_start_loc` / `num_actual_tokens` (a uniform step or chunk); `k_scale` / `v_scale` on bf16 pools; `max_pages` narrower than the table; the CSR triple | `ValueError` naming the operand and the expected form |
 | `prepare` / `plan` under capture; a cold functional bucket under capture; `clear_plan_cache()` under capture | `RuntimeError` naming the remedy |
 | a live sequence shorter than `T` (`0 < seq_lens[b] < T`), or one past the table's reach (`seq_lens[b] > max_pages x page_size`), on the extend / prefill forms | no exception: reported as `-2` / `-3` in the plan's workspace (device values; see the `seq_lens` argument) |
@@ -299,11 +303,15 @@ by the same tripwire.
   `indexer_kv_heads`, `indexer_compress_ratio` = `block_size`, `indexer_budget / compress_ratio` = `top_k`), `block_size` 4, `top_k` a
   multiple of 4 up to 512; text-only RoPE (the position tables are 1-D positions; mRoPE is the caller's to decline);
   decode `q_len_per_req <= 16` at four indexer heads (the paged scorer stages `q_len x next_pow2(index_heads) <= 64` query rows per
-  sequence); `batch x q_len <= 128` for a CAPTURED decode step (the band slab GEMM's capture-safe 128-row tile; a wider decode declaration
-  runs the graph route eagerly and cannot live in a CUDA graph -- `plan.declaration["capture_safe_rows"]` says so); on the extend / prefill
-  forms `batch x q_len_per_req <= 128` rows per run (the same band slab: past 128 rows its projection resolves to the cuDNN graph route,
-  which the vendored tree does not carry -- `extend_proj_slab_rows`, a typed decline at plan time; a longer prompt is several uniform chunks
-  of at most 128 rows per batch, grouped by their length) and `q_len_per_req <= max_pages x page_size`; TP 1 (24 / 2) is the served and
+  sequence) and `batch x q_len_per_req <= 65,535` rows per run (the launch-grid bound of this pin, shared with the extend / prefill forms:
+  `EXTEND_ROWS_GRID_MAX`); `batch x q_len <= 128` is the validated decode capture envelope (`DECODE_CAPTURE_ROWS_MAX`: the band slab GEMM's small-M
+  128-row tile; `plan.declaration["capture_safe_rows"]` reads it on the decode form -- past 128 rows the slab takes the GEMM engine's own
+  baseline tile on the same JIT route since the `6b21be0e0` pin, served by the tree, not validated by this package's decode cells); on the
+  extend / prefill forms any `batch x q_len_per_req` up to 65,535 rows per run (`EXTEND_ROWS_GRID_MAX`, the launch-grid bound of this pin:
+  the vendored indexer's query compress launches with the run's row count as a CUDA grid dimension -- a longer chunk is several runs; the
+  band slab's projection itself names a JIT tile at every row count since the `6b21be0e0` pin: the small-M tile up to 128 rows, the
+  engine's baseline past them -- the previous pin's 128-row bound and its `extend_proj_slab_rows` decline are retired) with
+  `q_len_per_req <= max_pages x page_size`; TP 1 (24 / 2) is the served and
   measured geometry; the TP 2 (12 / 1) and TP 4 (6 / 1) shards are declined by name (`proj_slab_route`: their slabs, N 7296 / 4224, are off
   the capture-safe small-M projection route on every served part -- see Errors); no LSE output, no sliding window, no soft-cap, no
   attention sink.
@@ -326,8 +334,8 @@ environment", for the full table.
 
 ## Where the kernels come from
 
-The backend is the Qwen 3.5 package's vendored cuDNN Frontend subset (`../qwen_3_5_block/_cudnn_frost/`, 160 files at the pinned commit
-`4c8e24355` of the cuDNN Frontend `develop` branch -- the block's forward with the in-block indexer's decode AND extend steps, the
+The backend is the Qwen 3.5 package's vendored cuDNN Frontend subset (`../qwen_3_5_block/_cudnn_frost/`, 161 files at the pinned commit
+`6b21be0e0` of the cuDNN Frontend `develop` branch -- the block's forward with the in-block indexer's decode AND extend steps, the
 block-sparse d256 core with its two bodies (the tcgen05 core and the lean decode tile, plus the visible-set helper they share), its paged
 indexer kernels (the fused prepare, the compress step, the paged scorer, the decode top-k, the dense kbar gather, the canonical-order
 kernel) and their DSL-free hosts (the `QSA` selection package), the `deepseek_sparse_attention` indexer scorer + top-k subtree the extend
@@ -343,8 +351,11 @@ schedule's split rule, the chain's programmatic-dependent-launch sites (served o
 every form), the LEAN decode tile of the sparse core behind the `sparse_tile_form` knob with its measured AUTO default on cc 10.7 (the bound
 counts the lean grid's own unit, `batch x H_kv <= 4` CTAs per chunk at every served step width; for this entry the batch 1 and 2 decode
 steps at `q_len_per_req 1`), the staged rounding mode of the fused split-combine store, the batch-1 gate-layout declaration fix and the
-FP8-projection mode of the dense serving forms (declared by the tree, not exposed here). `qwen_3_8_block_support(...).source` reports the
-pin at runtime (the same record as the Qwen 3.5 package's). The deployed process never imports the `cudnn` package nor the cuDNN library.
+FP8-projection mode of the dense serving forms (declared by the tree, not exposed here), and -- the `6b21be0e0` pin -- the projection GEMM
+driver's large-M rule: the indexer-band slab (N 13952 = 109 x 128, off the 256-column grid) takes the GEMM engine's own baseline tile for
+its shape past 128 rows on the same JIT-only route (capture-safe, no cuDNN handle; the rule reads the planner envelope the tile catalog
+publishes, so the graph-route planner stays out of the vendored tree), which is what lets the `extend` / `prefill` forms serve a chunk of
+any length. `qwen_3_8_block_support(...).source` reports the pin at runtime (the same record as the Qwen 3.5 package's). The deployed process never imports the `cudnn` package nor the cuDNN library.
 Re-vendoring: `../qwen_3_5_block/_vendoring/` (its README is the recipe; the tracer's `decode_qsa` and `extend_qsa` forms declare this
 package's routes: the lean kernel module is loaded by path on the batch-1 decode route and the extend step's kernels and the scorer
 subtree are imported on the extend route only, so the closure needs their traces).
@@ -365,12 +376,15 @@ bodies of the sparse core on one primed batch-1 step (the list and every written
 against the oracle, the workspace carve of each body), three carried steps with a rejected draft
 re-stepped (the cache rows bitwise a from-scratch compress of the accepted stream), CUDA-graph capture of the FIRST run under
 `set_sync_debug_mode("error")` replayed bitwise and over a new step, the functional decode captured through the plan cache and replayed
-after its eviction, a cached step under the same mode, the typed declines at plan time and at run time, the compiled-plan cache's reload,
+after its eviction, a cached step under the same mode, the typed declines at plan time (batch 4096 x `q_len` 16 -- 65,536 rows in one step -- declined by the
+launch-grid bound through the public decode entry at `prepare` and at the workspace query before any vendored code, 4095 x 16 passing the
+gate) and at run time, the compiled-plan cache's reload,
 the functional entry binding each call's own position tables on a cache hit (another pair, a missing pair, a short pair; CPU),
 the weight packer on both spellings bitwise the cuDNN Frontend loader, the position tables bitwise the per-token rows, the plan cache's
 key and ownership contract on CPU (the body knob a key; an extend bucket and a `"hf"` geometry their own plans), the admission grid (the
 probe's verdict == the vendored declaration's on geometries x step widths x list forms x cache dtypes x page sizes, the extend form's
-cells included; a planted drift of every mirrored constant fires the tripwire, the sparse-tile vocabulary and the extend step's rows
+cells included -- among them one run of 65,536 rows declined by the launch-grid bound, which the vendored declaration itself admits, and
+65,535 rows served, and the decode cell at batch 4096 x `q_len` 16 declined the same way while the vendored declaration admits it; a planted drift of every mirrored constant fires the tripwire, the sparse-tile vocabulary and the extend step's rows
 included), the body knob's device-free facts (the envelope's per-cell rule at cc 10.7: the lean tile at batch 1 / 2, the core past the
 bound and at `q_len 2`, the explicit bodies, no body over e4m3 pools; the host declaration's readbacks) and the import-isolation tests (the
 `cudnn` package blocked; the closure modules the routes added import alone, the lean kernel module, the extend step's two kernels and the
@@ -379,7 +393,9 @@ scorer subtree included).
 `test_extend.py` (the extend / prefill forms, on the GPU): the ladder against the two-stage oracle on the 24 / 2 geometry -- `T 128` at
 batch 1 behind `P 0` (the prefill), `6144`, `6145` and `6146` (the chunk start at every residue of the block grid), `T 64` at batch 2 with a
 dead entry, `T 20` at batch 4, one-row and two-row chunks that complete a block or carry the tail alone, cap 4 (a serving stack's) and
-cap 8, page 16 and 32 --, every complete block of the stream BITWISE the vendored compress kernel from scratch after the chunk (the
+cap 8, page 16 and 32, and PAST 128 rows (the `6b21be0e0` pin) the `T 512` and `T 2048` prefill chunks, `T 512` behind a 2048-token
+prefix, batch 4 x `T 512` with a dead entry and the e4m3 cache at `T 512`, each with the slab stage on the large-M tile and both
+projections capture-safe --, every complete block of the stream BITWISE the vendored compress kernel from scratch after the chunk (the
 primed prefix untouched, the straddling block written), the ring = the sequence's last `cap` raw keys, two runs bitwise with the side
 caches restored between them, `block_lens_out = min(top_k, n_vis)`; the e4m3 cache twin (the cache rows and the queries bitwise the e4m3
 compress); cache parity under both roundings (a `"hf"` geometry against the from-scratch compress compiled with `rounding="hf"`); a chunked
@@ -388,12 +404,16 @@ prefill `[125, 2, 1, 45, 128]` of a 301-token prompt through `prepare("prefill")
 and the cache's complete blocks are bitwise the from-scratch compress of the accepted stream; a padded sequence (`out` rows exactly 0, no
 cache / ring / pool row touched); the uniform-chunk contract's two device-value reports through `run`, beside a healthy and a dead
 sequence (a live sequence shorter than the chunk reported `-2`, one past the table's reach `-3`, read through the plan's workspace; nothing
-raised, `out` finite, the healthy sequence's rows, cache pages and ring block bitwise the contract-respecting run); the typed declines at plan time (the five vendored `indexer_extend_*` rows by text, the rows bound, the
-chunk bound, page 48, the e4m3 pool, `use_pdl=True`, the body vocabulary) and at run time (the missing ring slots or per-token tables, a ring
-of another cap than the plan's, int64 lengths, a short cache); CUDA-graph capture after ONE eager warm-up on the capture stream under
-`set_sync_debug_mode("error")` replayed bitwise and over a new chunk; the launch census by kernel NAME (the chunk compress, two compress
-launches, the gather, the canonical kernel, two cache writes, no paged scorer / decode top-k / fused prepare, no memset / memcpy; the count
-== the declaration's statement; a lowered select budget adds exactly the scorer pair per further window and is the budget the plan's declaration reports);
+raised, `out` finite, the healthy sequence's rows, cache pages and ring block bitwise the contract-respecting run); the typed declines at plan time (the five vendored `indexer_extend_*` rows by text, the
+chunk bound, page 48, the e4m3 pool, `use_pdl=True`, the body vocabulary; 129 and 130 rows pass the light gates; batch 32 x `T` 2048 --
+65,536 rows in one run -- declined by the launch-grid bound through the public entry, at `prepare` and at the workspace query, before any
+vendored code, 65,535 rows passing the gate) and at run time (the
+missing ring slots or per-token tables, a ring of another cap than the plan's, int64 lengths, a short cache); CUDA-graph capture after ONE
+eager warm-up on the capture stream under `set_sync_debug_mode("error")` replayed bitwise and over a new chunk, and the same past 128
+rows (`T 512` behind a 2048-token prefix); the launch census by kernel NAME (the chunk compress, two compress launches, the gather, the
+canonical kernel, two cache writes, no paged scorer / decode top-k / fused prepare, no memset / memcpy; the count == the declaration's
+statement; a lowered select budget adds exactly the scorer pair per further window and is the budget the plan's declaration reports) at
+80 rows and at 512 rows;
 `qwen_3_8_block_workspace_size`
 honest for the extend buckets (bf16 and e4m3, cap 4 and 8) and three runs allocating nothing; `"prefill"` and `"extend"` plans equal in
 their declaration but the form, a prefill run bitwise an extend run on the same inputs.
@@ -406,7 +426,8 @@ FlashInfer entry adds host work only (invisible under CUDA-graph replay), to be 
 before the PR leaves draft.
 
 Owner: @RomanAnders90. Tracking issue: #6805 (the Qwen 3.5 block's; the 3.8 sibling is its promised next step). Graduation intent:
-re-vendor at the cuDNN Frontend `develop` commit (the prefill / extend forms of the indexer landed with the `4c8e24355` pin), lift the
-128-row bound of the extend / prefill forms once the vendored projection GEMM names a JIT tile for the indexer-band slab past 128 rows,
-add a functional extend entry, finalise the signatures with the vLLM integration, then graduate with the Qwen 3.5 block to a stable
-attention namespace.
+re-vendor at the cuDNN Frontend `develop` commit (the prefill / extend forms of the indexer landed with the `4c8e24355` pin; the 128-row
+bound of the extend / prefill forms was lifted with the `6b21be0e0` pin, where the vendored projection GEMM names a JIT tile for the
+indexer-band slab at every row count; the launch-grid bound of one run -- 65,535 rows at this pin -- is lifted once the indexer's query
+compress launches over a flattened grid in cuDNN Frontend and that commit is re-vendored), add a functional extend entry, finalise the
+signatures with the vLLM integration, then graduate with the Qwen 3.5 block to a stable attention namespace.

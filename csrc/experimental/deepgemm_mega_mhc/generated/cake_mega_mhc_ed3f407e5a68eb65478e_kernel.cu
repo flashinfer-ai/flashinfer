@@ -4455,13 +4455,51 @@ kernel_cake_mega_mhc_ed3f407e5a68eb65478e(const __grid_constant__ CUtensorMap re
                 unsigned int floored_bits = __as_u32(max_noftz(scale_raw, 1e-10f));
                 float pow2 = __uint_as_float(floored_bits + 8388607 & 2139095040);
                 float scale = ((fp8_sf_ue8m0 != 0) ? pow2 : scale_raw);
+                float rcp_0_5 = approx_rcp(scale);
+                float _neg_110;
+                asm("neg.f32 %0, %1;" : "=f"(_neg_110) : "f"(scale));
+                float _fma_109;
+                asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(_fma_109) : "f"(_neg_110), "f"(rcp_0_5), "f"(1.0f));
+                float r_2;
+                asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(r_2) : "f"(rcp_0_5), "f"(_fma_109), "f"(rcp_0_5));
+                bool in_range_1 = scale >= 8.6736174e-19f && scale < 1.1529215e+18f;
                 float q_2[8];
                 #pragma unroll
                 for (int j_1 = 0; j_1 < 4; j_1++) {
-                    float _fdiv_109 = __fdiv_rn(__uint_as_float(normalized_words[j_1] << 16), scale);
-                    q_2[2 * j_1] = _fdiv_109;
-                    float _fdiv_110 = __fdiv_rn(__uint_as_float(normalized_words[j_1] & 4294901760u), scale);
-                    q_2[2 * j_1 + 1] = _fdiv_110;
+                    float lo_4 = __uint_as_float(normalized_words[j_1] << 16);
+                    float hi_4 = __uint_as_float(normalized_words[j_1] & 4294901760u);
+                    float q0;
+                    asm("mul.rn.f32 %0, %1, %2;" : "=f"(q0) : "f"(lo_4), "f"(r_2));
+                    float _neg_114;
+                    asm("neg.f32 %0, %1;" : "=f"(_neg_114) : "f"(lo_4));
+                    float _fma_113;
+                    asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(_fma_113) : "f"(scale), "f"(q0), "f"(_neg_114));
+                    float _neg_112;
+                    asm("neg.f32 %0, %1;" : "=f"(_neg_112) : "f"(_fma_113));
+                    float _fma_111;
+                    asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(_fma_111) : "f"(_neg_112), "f"(r_2), "f"(q0));
+                    q_2[2 * j_1] = _fma_111;
+                    float q0_0;
+                    asm("mul.rn.f32 %0, %1, %2;" : "=f"(q0_0) : "f"(hi_4), "f"(r_2));
+                    float _neg_118;
+                    asm("neg.f32 %0, %1;" : "=f"(_neg_118) : "f"(hi_4));
+                    float _fma_117;
+                    asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(_fma_117) : "f"(scale), "f"(q0_0), "f"(_neg_118));
+                    float _neg_116;
+                    asm("neg.f32 %0, %1;" : "=f"(_neg_116) : "f"(_fma_117));
+                    float _fma_115;
+                    asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(_fma_115) : "f"(_neg_116), "f"(r_2), "f"(q0_0));
+                    q_2[2 * j_1 + 1] = _fma_115;
+                }
+                int _warp_vote_119 = __all_sync(0xFFFFFFFF, in_range_1);
+                if (_warp_vote_119 == 0) {
+                    #pragma unroll
+                    for (int j_2 = 0; j_2 < 4; j_2++) {
+                        float _fdiv_120 = __fdiv_rn(__uint_as_float(normalized_words[j_2] << 16), scale);
+                        q_2[2 * j_2] = _fdiv_120;
+                        float _fdiv_121 = __fdiv_rn(__uint_as_float(normalized_words[j_2] & 4294901760u), scale);
+                        q_2[2 * j_2 + 1] = _fdiv_121;
+                    }
                 }
                 unsigned long long off_0 = (unsigned long long)token_1 * 4096 + (unsigned long long)(hidden_pack_1 * 256) + (unsigned long long)(lane_in_warp * 8);
                 unsigned int _packed_0[2];
@@ -4496,8 +4534,8 @@ kernel_cake_mega_mhc_ed3f407e5a68eb65478e(const __grid_constant__ CUtensorMap re
                 asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %2, 0; @p_ st.global.f32 [%0], %1; }" :: "l"(reinterpret_cast<uint64_t>(y_fp8_sf + sf_idx)), "f"(scale), "r"((unsigned int)(lane_in_warp % 16 == 0)) : "memory");
                 if (pack_1 + 1 < 4) {
                     #pragma unroll
-                    for (int j_2 = 0; j_2 < 4; j_2++) {
-                        weight_cache[j_2] = next_weight[j_2];
+                    for (int j_3 = 0; j_3 < 4; j_3++) {
+                        weight_cache[j_3] = next_weight[j_3];
                     }
                 }
             }
