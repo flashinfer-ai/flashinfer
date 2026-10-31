@@ -944,6 +944,11 @@ def _table_region(span: torch.Tensor, layout: dict, name: str) -> torch.Tensor:
     return span[first : first + nbytes // 4]
 
 
+def _as_u8(tensor: torch.Tensor) -> torch.Tensor:
+    """``tensor`` viewed as uint8 (itself when it already is)."""
+    return tensor if tensor.dtype is torch.uint8 else tensor.view(torch.uint8)
+
+
 def _carve(flat: torch.Tensor, layout: dict, name: str, dtype, shape):
     offset, nbytes = layout[name]
     region = flat[offset : offset + nbytes].view(dtype)
@@ -1245,7 +1250,8 @@ def prepare_nvfp4_batch_decode_with_kv_cache_mla(
     tensors = [query, query_scale, kv_cache, kv_scale, block_tables, seq_lens]
     tensors += [t for t in (sinks, out, lse, workspace_buffer) if t is not None]
     device = query.device
-    if not all(t.is_cuda and t.device == device for t in tensors):
+    # Every tensor on query's device, and that device a CUDA device.
+    if not query.is_cuda or not all(t.device == device for t in tensors):
         raise ValueError("Expected all tensors on one CUDA device")
     # The kernels address block_tables rows as ``b * max_pages + p``, the output
     # rows as ``row * 512`` and read the Q / KV rows through tensor maps whose
@@ -1285,7 +1291,10 @@ def prepare_nvfp4_batch_decode_with_kv_cache_mla(
     )
     decode_record = select_decode_record(plan, arch, num_sms)
     layout = workspace_layout(plan, batch=batch, num_heads=num_heads, q_len=q_len)
-    flat = workspace_buffer.view(-1).view(torch.uint8)
+    # A one-dimensional uint8 workspace is already the flat byte view.
+    flat = workspace_buffer
+    if flat.dtype is not torch.uint8 or flat.dim() != 1:
+        flat = flat.view(-1).view(torch.uint8)
     if flat.numel() < layout["total"]:
         raise ValueError(
             f"workspace_buffer needs {layout['total']} bytes for this batch "
@@ -1317,7 +1326,6 @@ def prepare_nvfp4_batch_decode_with_kv_cache_mla(
         plan.num_items, ITEM_FIELDS
     )
     unit_first = _table_region(table_span, layout, "unit_first")
-    row_splits = _table_region(table_span, layout, "row_splits")
     q_indptr = _table_region(table_span, layout, "q_indptr")
     sink_buffer = _carve(flat, layout, "sinks", torch.float32, (num_heads,))
     # The partial regions are not initialized: single-split items keep
@@ -1351,9 +1359,9 @@ def prepare_nvfp4_batch_decode_with_kv_cache_mla(
 
     main_kwargs = dict(
         Q=query.view(total_q * num_heads, ROW_BYTES),
-        QS=query_scale.view(torch.uint8).view(total_q * num_heads, SF_ROW_BYTES),
+        QS=_as_u8(query_scale).view(total_q * num_heads, SF_ROW_BYTES),
         KV=kv_cache.view(num_pages * PAGE_SIZE, ROW_BYTES),
-        KVS=kv_scale.view(torch.uint8).view(num_pages * PAGE_SIZE, SF_ROW_BYTES),
+        KVS=_as_u8(kv_scale).view(num_pages * PAGE_SIZE, SF_ROW_BYTES),
         # Bulk-tensor-store maps of the epilogue: O and the split-major partials
         # viewed as [rows, 512] BF16 (the single-split dummy is already 2-D).
         OT=out.view(rows_total, HEAD_DIM),
@@ -1386,15 +1394,18 @@ def prepare_nvfp4_batch_decode_with_kv_cache_mla(
         # Every other combine runs all total_q rows. select_reduce_record
         # picked it only for a contiguous range (split_row_range) of rows of
         # two splits, so the range is the first such row and their count.
+        # The combine's row_splits is carved here, from its first row on (the
+        # decode does not take it).
         first, rows = 0, total_q
         if reduce_record == REDUCE_TWO_SPLITS_RECORD:
             first, rows = row_splits_host.index(2), row_splits_host.count(2)
+        splits_first = (layout["row_splits"][0] - table_base) // 4 + first
         reduce_kwargs = dict(
             o=out[first:] if first else out,
             lse=lse[first:] if first else lse,
             partial_o=main_kwargs["PO"][first * num_heads :] if first else partial_o,
             partial_lse=partial_lse[first:] if first else partial_lse,
-            row_splits=row_splits[first:] if first else row_splits,
+            row_splits=table_span[splits_first : splits_first + total_q - first],
             total_q=total_q,
             num_heads=num_heads,
             max_splits=max_splits,
