@@ -1931,7 +1931,10 @@ def test_forward_backward_beside_a_resident_side_stream_kernel(row, device) -> N
     # the lead and about three times the call
     side_cycles = lead + int(3.0 * alone * clock_khz)
     beside = [timed(lead, side_cycles) for _ in range(SIDE_STREAM_ITERS)]
-    ratio = sorted(beside)[SIDE_STREAM_ITERS // 2] / alone
+    # A stage that waits for every SM is stretched to the end of the side kernel (about three calls past the start
+    # event) on every sample, so the fastest sample beside it carries the verdict; a median would also count the
+    # host and clock noise of a shared node.
+    ratio = min(beside) / alone
     assert ratio <= SIDE_STREAM_RATIO_MAX, (ratio, alone, beside)
     # the last call beside the side-stream kernel has the bits of the plain call
     got = {"d" + n: leaves[n].grad for n in ("q", "k", "v", "g", "beta")}
