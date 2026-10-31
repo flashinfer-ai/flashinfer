@@ -107,21 +107,21 @@ static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 byte
 #define SMEM_FN2_3_OFF 214016
 #define SMEM_FN2_3_STAGE_BYTES 8192
 #define SMEM_FN2_3_STRIDE 8192
-#define SMEM_FNW0_1_0_OFF 173056
+#define SMEM_FNW0_1_OFF 173056
+#define SMEM_FNW0_1_STAGE_BYTES 16384
+#define SMEM_FNW0_1_STRIDE 16384
+#define SMEM_FNW0_1_0_OFF 189440
 #define SMEM_FNW0_1_0_STAGE_BYTES 16384
 #define SMEM_FNW0_1_0_STRIDE 16384
-#define SMEM_FNW0_1_1_OFF 189440
+#define SMEM_FNW0_1_1_OFF 205824
 #define SMEM_FNW0_1_1_STAGE_BYTES 16384
 #define SMEM_FNW0_1_1_STRIDE 16384
-#define SMEM_FNW0_1_2_OFF 205824
-#define SMEM_FNW0_1_2_STAGE_BYTES 16384
-#define SMEM_FNW0_1_2_STRIDE 16384
-#define SMEM_XA0_1_0_OFF 1024
+#define SMEM_XA0_1_OFF 1024
+#define SMEM_XA0_1_STAGE_BYTES 16384
+#define SMEM_XA0_1_STRIDE 86016
+#define SMEM_XA0_1_0_OFF 17408
 #define SMEM_XA0_1_0_STAGE_BYTES 16384
 #define SMEM_XA0_1_0_STRIDE 86016
-#define SMEM_XA0_1_1_OFF 17408
-#define SMEM_XA0_1_1_STAGE_BYTES 16384
-#define SMEM_XA0_1_1_STRIDE 86016
 #define SMEM_DZN0_OFF 74752
 #define SMEM_DZN0_STAGE_BYTES 4096
 #define SMEM_DZN0_STRIDE 86016
@@ -344,16 +344,16 @@ kernel_cake_mhc_det_train_bwd_slab__xrsg(const __grid_constant__ CUtensorMap X, 
     const int fn2_0_addr_1_0 = smem + 205824;
     __nv_bfloat16* fn2_3 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 214016);
     const int fn2_0_addr_1_1 = smem + 214016;
-    __nv_bfloat16* fnw0_1_0 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 173056);
-    const int fnw0_addr_1_0 = smem + 173056;
-    __nv_bfloat16* fnw0_1_1 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 189440);
-    const int fnw0_addr_1_1 = smem + 189440;
-    __nv_bfloat16* fnw0_1_2 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 205824);
-    const int fnw0_addr_1_2 = smem + 205824;
-    __nv_bfloat16* xa0_1_0 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 1024);
-    const int xa0_addr_1_0 = smem + 1024;
-    __nv_bfloat16* xa0_1_1 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 17408);
-    const int xa0_addr_1_1 = smem + 17408;
+    __nv_bfloat16* fnw0_1 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 173056);
+    const int fnw0_addr_1 = smem + 173056;
+    __nv_bfloat16* fnw0_1_0 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 189440);
+    const int fnw0_addr_1_0 = smem + 189440;
+    __nv_bfloat16* fnw0_1_1 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 205824);
+    const int fnw0_addr_1_1 = smem + 205824;
+    __nv_bfloat16* xa0_1 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 1024);
+    const int xa0_addr_1 = smem + 1024;
+    __nv_bfloat16* xa0_1_0 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 17408);
+    const int xa0_addr_1_0 = smem + 17408;
     __nv_bfloat16* dzn0 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 74752);
     const int dzn0_addr = smem + 74752;
     __nv_bfloat16* dzn1 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 78848);
@@ -606,10 +606,10 @@ kernel_cake_mhc_det_train_bwd_slab__xrsg(const __grid_constant__ CUtensorMap X, 
                         asm volatile("tcgen05.fence::after_thread_sync;");
 #if __CUDA_ARCH__ == 1070
                         int _mma_a_lo_0 = make_warp_uniform((((dz0_addr_1_0) >> 4) & 0x7FFF) + (mm_stage) * 5376);
-                        int _mma_b_lo_0 = make_warp_uniform(((fnw0_addr_1_2) >> 4) & 0x7FFF);
+                        int _mma_b_lo_0 = make_warp_uniform(((fnw0_addr_1_1) >> 4) & 0x7FFF);
 #else
                         int _mma_a_lo_0 = make_warp_uniform((((dz0_addr_1_0) >> 4) & 0x3FFF) + (mm_stage) * 5376);
-                        int _mma_b_lo_0 = make_warp_uniform(((fnw0_addr_1_2) >> 4) & 0x3FFF);
+                        int _mma_b_lo_0 = make_warp_uniform(((fnw0_addr_1_1) >> 4) & 0x3FFF);
 #endif
                         asm volatile(
                     "{\n\t"
@@ -637,10 +637,10 @@ kernel_cake_mhc_det_train_bwd_slab__xrsg(const __grid_constant__ CUtensorMap X, 
                     :: "r"(_mma_a_lo_0), "r"(_mma_b_lo_0), "r"((tmem_accw + (acc_mm * 128))), "r"(0) : "memory");
 #if __CUDA_ARCH__ == 1070
                         int _mma_a_lo_1 = make_warp_uniform((((dz0_addr_1_2) >> 4) & 0x7FFF) + (mm_stage) * 5376);
-                        int _mma_b_lo_1 = make_warp_uniform(((fnw0_addr_1_0) >> 4) & 0x7FFF);
+                        int _mma_b_lo_1 = make_warp_uniform(((fnw0_addr_1) >> 4) & 0x7FFF);
 #else
                         int _mma_a_lo_1 = make_warp_uniform((((dz0_addr_1_2) >> 4) & 0x3FFF) + (mm_stage) * 5376);
-                        int _mma_b_lo_1 = make_warp_uniform(((fnw0_addr_1_0) >> 4) & 0x3FFF);
+                        int _mma_b_lo_1 = make_warp_uniform(((fnw0_addr_1) >> 4) & 0x3FFF);
 #endif
                         asm volatile(
                     "{\n\t"
@@ -668,10 +668,10 @@ kernel_cake_mhc_det_train_bwd_slab__xrsg(const __grid_constant__ CUtensorMap X, 
                     :: "r"(_mma_a_lo_1), "r"(_mma_b_lo_1), "r"((tmem_accw + (acc_mm * 128))), "r"(1) : "memory");
 #if __CUDA_ARCH__ == 1070
                         int _mma_a_lo_2 = make_warp_uniform((((dz0_addr_1_1) >> 4) & 0x7FFF) + (mm_stage) * 5376);
-                        int _mma_b_lo_2 = make_warp_uniform(((fnw0_addr_1_1) >> 4) & 0x7FFF);
+                        int _mma_b_lo_2 = make_warp_uniform(((fnw0_addr_1_0) >> 4) & 0x7FFF);
 #else
                         int _mma_a_lo_2 = make_warp_uniform((((dz0_addr_1_1) >> 4) & 0x3FFF) + (mm_stage) * 5376);
-                        int _mma_b_lo_2 = make_warp_uniform(((fnw0_addr_1_1) >> 4) & 0x3FFF);
+                        int _mma_b_lo_2 = make_warp_uniform(((fnw0_addr_1_0) >> 4) & 0x3FFF);
 #endif
                         asm volatile(
                     "{\n\t"
@@ -791,10 +791,10 @@ kernel_cake_mhc_det_train_bwd_slab__xrsg(const __grid_constant__ CUtensorMap X, 
                         int small_init = ((in_grp == 0) ? 1 : 0);
                         unsigned int sbuf = grp_mm % 2;
 #if __CUDA_ARCH__ == 1070
-                        int _mma_a_lo_6 = make_warp_uniform(((((xa0_addr_1_0) >> 4) & 0x7FFF) | 0x2000000) + (mm_stage) * 5376);
+                        int _mma_a_lo_6 = make_warp_uniform(((((xa0_addr_1) >> 4) & 0x7FFF) | 0x2000000) + (mm_stage) * 5376);
                         int _mma_b_lo_3 = make_warp_uniform(((((dzn0_addr) >> 4) & 0x7FFF) | 0x1000000) + (mm_stage) * 5376);
 #else
-                        int _mma_a_lo_6 = make_warp_uniform(((((xa0_addr_1_0) >> 4) & 0x3FFF) | 0x2000000) + (mm_stage) * 5376);
+                        int _mma_a_lo_6 = make_warp_uniform(((((xa0_addr_1) >> 4) & 0x3FFF) | 0x2000000) + (mm_stage) * 5376);
                         int _mma_b_lo_3 = make_warp_uniform(((((dzn0_addr) >> 4) & 0x3FFF) | 0x1000000) + (mm_stage) * 5376);
 #endif
                         asm volatile(
@@ -832,10 +832,10 @@ kernel_cake_mhc_det_train_bwd_slab__xrsg(const __grid_constant__ CUtensorMap X, 
                     "}\n"
                     :: "r"(_mma_a_lo_6), "r"(_mma_b_lo_3), "r"((tmem_dfb0 + (acc_mm * 32))), "r"(0) : "memory");
 #if __CUDA_ARCH__ == 1070
-                        int _mma_a_lo_7 = make_warp_uniform(((((xa0_addr_1_0) >> 4) & 0x7FFF) | 0x2000000) + (mm_stage) * 5376);
+                        int _mma_a_lo_7 = make_warp_uniform(((((xa0_addr_1) >> 4) & 0x7FFF) | 0x2000000) + (mm_stage) * 5376);
                         int _mma_b_lo_4 = make_warp_uniform(((((dzn1_addr) >> 4) & 0x7FFF) | 0x1000000) + (mm_stage) * 5376);
 #else
-                        int _mma_a_lo_7 = make_warp_uniform(((((xa0_addr_1_0) >> 4) & 0x3FFF) | 0x2000000) + (mm_stage) * 5376);
+                        int _mma_a_lo_7 = make_warp_uniform(((((xa0_addr_1) >> 4) & 0x3FFF) | 0x2000000) + (mm_stage) * 5376);
                         int _mma_b_lo_4 = make_warp_uniform(((((dzn1_addr) >> 4) & 0x3FFF) | 0x1000000) + (mm_stage) * 5376);
 #endif
                         asm volatile(
@@ -873,10 +873,10 @@ kernel_cake_mhc_det_train_bwd_slab__xrsg(const __grid_constant__ CUtensorMap X, 
                     "}\n"
                     :: "r"(_mma_a_lo_7), "r"(_mma_b_lo_4), "r"((tmem_dfs0 + (sbuf * 32))), "r"(((small_init) ? 0 : 1)) : "memory");
 #if __CUDA_ARCH__ == 1070
-                        int _mma_a_lo_8 = make_warp_uniform(((((xa0_addr_1_0) >> 4) & 0x7FFF) | 0x2000000) + (mm_stage) * 5376);
+                        int _mma_a_lo_8 = make_warp_uniform(((((xa0_addr_1) >> 4) & 0x7FFF) | 0x2000000) + (mm_stage) * 5376);
                         int _mma_b_lo_5 = make_warp_uniform(((((dzn2_addr) >> 4) & 0x7FFF) | 0x1000000) + (mm_stage) * 5376);
 #else
-                        int _mma_a_lo_8 = make_warp_uniform(((((xa0_addr_1_0) >> 4) & 0x3FFF) | 0x2000000) + (mm_stage) * 5376);
+                        int _mma_a_lo_8 = make_warp_uniform(((((xa0_addr_1) >> 4) & 0x3FFF) | 0x2000000) + (mm_stage) * 5376);
                         int _mma_b_lo_5 = make_warp_uniform(((((dzn2_addr) >> 4) & 0x3FFF) | 0x1000000) + (mm_stage) * 5376);
 #endif
                         asm volatile(
@@ -914,10 +914,10 @@ kernel_cake_mhc_det_train_bwd_slab__xrsg(const __grid_constant__ CUtensorMap X, 
                     "}\n"
                     :: "r"(_mma_a_lo_8), "r"(_mma_b_lo_5), "r"((tmem_dfs0 + (sbuf * 32))), "r"(1) : "memory");
 #if __CUDA_ARCH__ == 1070
-                        int _mma_a_lo_9 = make_warp_uniform(((((xa0_addr_1_1) >> 4) & 0x7FFF) | 0x2000000) + (mm_stage) * 5376);
+                        int _mma_a_lo_9 = make_warp_uniform(((((xa0_addr_1_0) >> 4) & 0x7FFF) | 0x2000000) + (mm_stage) * 5376);
                         int _mma_b_lo_6 = make_warp_uniform(((((dzn0_addr) >> 4) & 0x7FFF) | 0x1000000) + (mm_stage) * 5376);
 #else
-                        int _mma_a_lo_9 = make_warp_uniform(((((xa0_addr_1_1) >> 4) & 0x3FFF) | 0x2000000) + (mm_stage) * 5376);
+                        int _mma_a_lo_9 = make_warp_uniform(((((xa0_addr_1_0) >> 4) & 0x3FFF) | 0x2000000) + (mm_stage) * 5376);
                         int _mma_b_lo_6 = make_warp_uniform(((((dzn0_addr) >> 4) & 0x3FFF) | 0x1000000) + (mm_stage) * 5376);
 #endif
                         asm volatile(
@@ -955,10 +955,10 @@ kernel_cake_mhc_det_train_bwd_slab__xrsg(const __grid_constant__ CUtensorMap X, 
                     "}\n"
                     :: "r"(_mma_a_lo_9), "r"(_mma_b_lo_6), "r"((tmem_dfb1 + (acc_mm * 32))), "r"(0) : "memory");
 #if __CUDA_ARCH__ == 1070
-                        int _mma_a_lo_10 = make_warp_uniform(((((xa0_addr_1_1) >> 4) & 0x7FFF) | 0x2000000) + (mm_stage) * 5376);
+                        int _mma_a_lo_10 = make_warp_uniform(((((xa0_addr_1_0) >> 4) & 0x7FFF) | 0x2000000) + (mm_stage) * 5376);
                         int _mma_b_lo_7 = make_warp_uniform(((((dzn1_addr) >> 4) & 0x7FFF) | 0x1000000) + (mm_stage) * 5376);
 #else
-                        int _mma_a_lo_10 = make_warp_uniform(((((xa0_addr_1_1) >> 4) & 0x3FFF) | 0x2000000) + (mm_stage) * 5376);
+                        int _mma_a_lo_10 = make_warp_uniform(((((xa0_addr_1_0) >> 4) & 0x3FFF) | 0x2000000) + (mm_stage) * 5376);
                         int _mma_b_lo_7 = make_warp_uniform(((((dzn1_addr) >> 4) & 0x3FFF) | 0x1000000) + (mm_stage) * 5376);
 #endif
                         asm volatile(
@@ -996,10 +996,10 @@ kernel_cake_mhc_det_train_bwd_slab__xrsg(const __grid_constant__ CUtensorMap X, 
                     "}\n"
                     :: "r"(_mma_a_lo_10), "r"(_mma_b_lo_7), "r"((tmem_dfs1 + (sbuf * 32))), "r"(((small_init) ? 0 : 1)) : "memory");
 #if __CUDA_ARCH__ == 1070
-                        int _mma_a_lo_11 = make_warp_uniform(((((xa0_addr_1_1) >> 4) & 0x7FFF) | 0x2000000) + (mm_stage) * 5376);
+                        int _mma_a_lo_11 = make_warp_uniform(((((xa0_addr_1_0) >> 4) & 0x7FFF) | 0x2000000) + (mm_stage) * 5376);
                         int _mma_b_lo_8 = make_warp_uniform(((((dzn2_addr) >> 4) & 0x7FFF) | 0x1000000) + (mm_stage) * 5376);
 #else
-                        int _mma_a_lo_11 = make_warp_uniform(((((xa0_addr_1_1) >> 4) & 0x3FFF) | 0x2000000) + (mm_stage) * 5376);
+                        int _mma_a_lo_11 = make_warp_uniform(((((xa0_addr_1_0) >> 4) & 0x3FFF) | 0x2000000) + (mm_stage) * 5376);
                         int _mma_b_lo_8 = make_warp_uniform(((((dzn2_addr) >> 4) & 0x3FFF) | 0x1000000) + (mm_stage) * 5376);
 #endif
                         asm volatile(

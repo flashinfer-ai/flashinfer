@@ -48,6 +48,7 @@ token count.  On one buffer reused over realistic token-count sequences:
 
 from __future__ import annotations
 
+import gc
 import json
 import subprocess
 import sys
@@ -106,6 +107,21 @@ def warmup_jit():
         for spec in loader.specs_for_arch(arch):
             spec.build_and_load()
     yield
+
+
+@pytest.fixture(autouse=True)
+def collect_graphs():
+    """Free leftover CUDA graphs before and after each case.
+
+    Earlier tests in the same process may leave graphs behind:
+    ``torch.cuda.make_graphed_callables`` keeps its graphs in reference cycles,
+    so only the cyclic collector frees them; a collection that runs inside a
+    later capture would release a graph's memory pool there and invalidate
+    that capture.
+    """
+    gc.collect()
+    yield
+    gc.collect()
 
 
 @pytest.fixture(params=HIDDEN_SIZES, ids=lambda h: f"H{h}")
