@@ -1167,13 +1167,21 @@ def test_tinygemm2_tcgen05_windows(
 
     monkeypatch.setattr(routergemm, "get_compute_capability", lambda _: capability)
     monkeypatch.setattr(routergemm, "_multiprocessor_count", lambda _: 148)
+    # The routes do not depend on the toolkit: take the CUDA 13.4 side of the
+    # sm_107a check, and clear the cached enable check around the case.
+    monkeypatch.setattr(routergemm, "is_cuda_version_at_least", lambda _: True)
     monkeypatch.delenv("FLASHINFER_DISABLE_TINYGEMM2_TCGEN05", raising=False)
     input = torch.empty(batch_size, input_features, dtype=torch.bfloat16)
     weight = torch.empty(output_features, input_features, dtype=torch.bfloat16)
     out = torch.empty(batch_size, output_features, dtype=torch.bfloat16)
-    program = routergemm._tinygemm2_tcgen05_program(
-        input, weight, out, has_bias, use_pdl
-    )
+    enabled = routergemm._tinygemm2_tcgen05_enabled
+    enabled.cache_clear()
+    try:
+        program = routergemm._tinygemm2_tcgen05_program(
+            input, weight, out, has_bias, use_pdl
+        )
+    finally:
+        enabled.cache_clear()
     expected = (
         None
         if tile is None
