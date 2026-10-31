@@ -1899,20 +1899,22 @@ def test_gpu_router_padded_out_rows(op, splits):
 
 def test_gpu_router_misaligned_out_takes_the_deterministic_path():
     """An ``out`` 4 bytes off a 16-byte boundary: the call of this package runs the deterministic path, so it
-    refuses the forward exactly as the deterministic package does."""
+    refuses the single-split row-major forward exactly as the deterministic package does."""
     device, arch = _atomic_device_or_skip()
     X, W, _ = _router_inputs(1001, device, SEED + 22)
     storage = torch.empty(1001 * 256 + 4, device=device)
     out = storage[1 : 1 + 1001 * 256].view(1001, 256)
-    try:
-        det_backend.plan_router_fp32_det_gemm(X, W.t(), out)
-    except ValueError as exc:
-        with pytest.raises(ValueError, match=re.escape(str(exc)[:40])):
-            cake_backend.router_fp32_gemm(X, W.t(), out, deterministic=False)
-        return
-    pytest.skip(
-        "the deterministic package of this checkout plans a misaligned out (no refusal to compare against)"
-    )
+    with pytest.raises(ValueError, match="16-byte aligned") as refused:
+        det_backend.plan_router_fp32_det_gemm(X, W.t(), out, splits=1)
+    message = re.escape(str(refused.value))
+    with pytest.raises(ValueError, match=message):
+        cake_backend.plan_router_fp32_gemm(X, W.t(), out, splits=1, deterministic=False)
+    with pytest.raises(ValueError, match=message):
+        cake_backend.prepare_router_fp32_gemm(
+            X, W.t(), out, splits=1, deterministic=False
+        )
+    with pytest.raises(ValueError, match=message):
+        cake_backend.router_fp32_gemm(X, W.t(), out, splits=1, deterministic=False)
 
 
 # ---------------------------------------------------------------------------
