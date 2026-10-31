@@ -8089,6 +8089,14 @@ def _cudnn_gemm_fp4_requirement(
     use_nvfp4: bool = True,
     enable_pdl: bool = True,  # unused
 ):
+    """Return whether the cuDNN backend can run this ``mm_fp4`` call.
+
+    The 8x4 scale-factor layout raises for any backend. Otherwise, with
+    ``backend="cudnn"`` an unsupported call raises: the library's errors when
+    cuDNN or its FP4 support is missing, and ``ValueError`` when a 2-D
+    block-scale tensor does not match the 128x4 layout. With ``backend="auto"``
+    such a call returns False, so another backend is chosen.
+    """
     if use_8x4_sf_layout:
         raise ValueError("Only TRTLLM FP4 GEMM supports 8x4 scale factor layout.")
 
@@ -8111,18 +8119,34 @@ def _cudnn_gemm_fp4_requirement(
             return False
         raise LibraryError(CUDNN_FP4_MXFP4_SM120_CUDNN_VERSION_ERROR)
 
-    # cuDNN builds its block-scale descriptors from the scale tensors' shapes, so a
-    # B scale tensor passed in the quantizer's (n, k // block_size) orientation
-    # instead of its transpose is not rejected by cuDNN and can fault the device.
-    if a.dim() == 2 and a_descale.dim() == 2 and b_descale.dim() == 2:
+    # cuDNN builds its block-scale descriptors from the scale tensors' shapes and
+    # reads their bytes in the 128x4-swizzled order that fp4 quantization writes.
+    # B's scales must therefore be the transposed view of the quantizer's
+    # (n, k // block_size) output. The untransposed tensor (wrong shape) and a
+    # contiguous copy of the transpose (right shape, wrong byte order) are not
+    # rejected by cuDNN and give wrong results or fault the device. Each 2-D
+    # scale tensor is checked on its own.
+    if a.dim() == 2:
         m, k, n = a.shape[0], a.shape[1] * 2, b.shape[1]
         sf_m, sf_n, sf_k = _calculate_block_scale_dims(m, n, k, block_size)
-        if tuple(a_descale.shape) != (sf_m, sf_k) or tuple(b_descale.shape) != (
-            sf_k,
-            sf_n,
-        ):
+        a_bad = a_descale.dim() == 2 and tuple(a_descale.shape) != (sf_m, sf_k)
+        b_bad_shape = b_descale.dim() == 2 and tuple(b_descale.shape) != (sf_k, sf_n)
+        b_bad_order = (
+            b_descale.dim() == 2
+            and not b_bad_shape
+            and tuple(b_descale.stride()) != (1, sf_k)
+        )
+        if a_bad or b_bad_shape or b_bad_order:
             if backend != "cudnn":
                 return False
+            if b_bad_order and not a_bad:
+                raise ValueError(
+                    "cuDNN FP4 GEMM reads b_descale in the byte order that fp4 "
+                    "quantization of B (n, k) writes, so b_descale must be the "
+                    f"transposed view of those scales, with stride {(1, sf_k)}; got "
+                    f"stride {tuple(b_descale.stride())}. Pass the transpose of the "
+                    "quantized scales, not a contiguous copy of it."
+                )
             raise ValueError(
                 "cuDNN FP4 GEMM expects 128x4-layout block scales with a_descale of "
                 f"shape {(sf_m, sf_k)} and b_descale of shape {(sf_k, sf_n)} for "
