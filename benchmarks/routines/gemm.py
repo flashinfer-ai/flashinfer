@@ -182,7 +182,9 @@ def parse_gemm_args(line, parser):
         action="store_true",
         default=False,
         help=(
-            "Enable autotuner warmup for supported routines (mm_fp4, bmm_fp8, mm_fp8, bmm_mxfp8, mm_mxfp8, mm_bf16, bmm_bf16)."
+            "Enable autotuner warmup for supported routines (mm_fp4, mm_bf16_fp4, bmm_fp8, mm_fp8, "
+            "bmm_mxfp8, mm_mxfp8, mm_bf16, bmm_bf16). No effect for gemm_fp8_nt_groupwise, "
+            "group_gemm_fp8_nt_groupwise and tinygemm_bf16, whose backends never enter the AutoTuner."
         ),
     )
     parser.add_argument(
@@ -297,6 +299,11 @@ def testGemmFp8NtGroupwise(args):
     if len(backends) == 0:
         print("[ERROR] No backends to test. Exiting.")
         return
+
+    if getattr(args, "autotune", False):
+        # None of this routine's backends run through the FlashInfer AutoTuner,
+        # so say so instead of silently reporting an untuned result as tuned.
+        print("[INFO] --autotune has no effect for gemm_fp8_nt_groupwise")
 
     ## Prepare input tensors
     a_val = torch.randn((m, k), dtype=torch.float, device=device)
@@ -466,6 +473,11 @@ def testGroupGemmFp8NtGroupwise(args):
     if len(backends) == 0:
         print("[ERROR] No backends to test. Exiting.")
         return res
+
+    if getattr(args, "autotune", False):
+        # None of this routine's backends run through the FlashInfer AutoTuner,
+        # so say so instead of silently reporting an untuned result as tuned.
+        print("[INFO] --autotune has no effect for group_gemm_fp8_nt_groupwise")
 
     out_dtype = dtype_str_to_torch_dtype(args.out_dtype)
     if out_dtype not in [torch.bfloat16, torch.float16]:
@@ -2405,6 +2417,11 @@ def testTinygemmBf16(args):
     if len(backends) == 0:
         print("[ERROR] No backends passed validation. Exiting.")
         return res
+
+    if getattr(args, "autotune", False):
+        # None of this routine's backends run through the FlashInfer AutoTuner,
+        # so say so instead of silently reporting an untuned result as tuned.
+        print("[INFO] --autotune has no effect for tinygemm_bf16")
 
     def run_backend(backend, input, weight, bias, out, use_pdl):
         if backend != "tinygemm":
