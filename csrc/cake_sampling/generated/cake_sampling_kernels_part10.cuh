@@ -20,7 +20,6 @@
 // Target: compute capability 9.0 and newer
 // (rendered for sm_90a; compiled per -gencode target by the FlashInfer JIT); compile flags: none.
 #define CAKE_INF CUDART_INF_F
-#define NUM_MAIN_STAGES 1
 #define SMEM_HIST0_OFF 0
 #define SMEM_HIST0_STAGE_BYTES 8192
 #define SMEM_HIST0_STRIDE 8192
@@ -507,64 +506,64 @@ kernel_cake_radix_topk_c8_e32s_lg_nt(float* __restrict__ probs, int* __restrict_
         for (int c_1 = 0; c_1 < nchunks; c_1++) {
             int i_8 = start + c_1 * 16384 + tid * 4;
             if (i_8 < vocab) {
-                float v_0 = probs[row_base + (unsigned long long)i_8];
-                unsigned int bits_24 = __as_u32(v_0);
+                float v_1 = probs[row_base + (unsigned long long)i_8];
+                unsigned int bits_24 = __as_u32(v_1);
                 unsigned int key_24 = ((bits_24 <= 2139095040) ? bits_24 : 0);
                 unsigned int bucket_32 = key_24 >> 21;
                 atomicAdd(&hist0[bucket_32], 1);
             }
             int i_9 = start + c_1 * 16384 + (512 + tid) * 4;
             if (i_9 < vocab) {
-                float v_1 = probs[row_base + (unsigned long long)i_9];
-                unsigned int bits_25 = __as_u32(v_1);
+                float v_2 = probs[row_base + (unsigned long long)i_9];
+                unsigned int bits_25 = __as_u32(v_2);
                 unsigned int key_25 = ((bits_25 <= 2139095040) ? bits_25 : 0);
                 unsigned int bucket_33 = key_25 >> 21;
                 atomicAdd(&hist0[bucket_33], 1);
             }
             int i_10 = start + c_1 * 16384 + (1024 + tid) * 4;
             if (i_10 < vocab) {
-                float v_2 = probs[row_base + (unsigned long long)i_10];
-                unsigned int bits_26 = __as_u32(v_2);
+                float v_3 = probs[row_base + (unsigned long long)i_10];
+                unsigned int bits_26 = __as_u32(v_3);
                 unsigned int key_26 = ((bits_26 <= 2139095040) ? bits_26 : 0);
                 unsigned int bucket_34 = key_26 >> 21;
                 atomicAdd(&hist0[bucket_34], 1);
             }
             int i_11 = start + c_1 * 16384 + (1536 + tid) * 4;
             if (i_11 < vocab) {
-                float v_3 = probs[row_base + (unsigned long long)i_11];
-                unsigned int bits_27 = __as_u32(v_3);
+                float v_4 = probs[row_base + (unsigned long long)i_11];
+                unsigned int bits_27 = __as_u32(v_4);
                 unsigned int key_27 = ((bits_27 <= 2139095040) ? bits_27 : 0);
                 unsigned int bucket_35 = key_27 >> 21;
                 atomicAdd(&hist0[bucket_35], 1);
             }
             int i_12 = start + c_1 * 16384 + (2048 + tid) * 4;
             if (i_12 < vocab) {
-                float v_4 = probs[row_base + (unsigned long long)i_12];
-                unsigned int bits_28 = __as_u32(v_4);
+                float v_5 = probs[row_base + (unsigned long long)i_12];
+                unsigned int bits_28 = __as_u32(v_5);
                 unsigned int key_28 = ((bits_28 <= 2139095040) ? bits_28 : 0);
                 unsigned int bucket_36 = key_28 >> 21;
                 atomicAdd(&hist0[bucket_36], 1);
             }
             int i_13 = start + c_1 * 16384 + (2560 + tid) * 4;
             if (i_13 < vocab) {
-                float v_5 = probs[row_base + (unsigned long long)i_13];
-                unsigned int bits_29 = __as_u32(v_5);
+                float v_6 = probs[row_base + (unsigned long long)i_13];
+                unsigned int bits_29 = __as_u32(v_6);
                 unsigned int key_29 = ((bits_29 <= 2139095040) ? bits_29 : 0);
                 unsigned int bucket_37 = key_29 >> 21;
                 atomicAdd(&hist0[bucket_37], 1);
             }
             int i_14 = start + c_1 * 16384 + (3072 + tid) * 4;
             if (i_14 < vocab) {
-                float v_6 = probs[row_base + (unsigned long long)i_14];
-                unsigned int bits_30 = __as_u32(v_6);
+                float v_7 = probs[row_base + (unsigned long long)i_14];
+                unsigned int bits_30 = __as_u32(v_7);
                 unsigned int key_30 = ((bits_30 <= 2139095040) ? bits_30 : 0);
                 unsigned int bucket_38 = key_30 >> 21;
                 atomicAdd(&hist0[bucket_38], 1);
             }
             int i_15 = start + c_1 * 16384 + (3584 + tid) * 4;
             if (i_15 < vocab) {
-                float v_7 = probs[row_base + (unsigned long long)i_15];
-                unsigned int bits_31 = __as_u32(v_7);
+                float v_8 = probs[row_base + (unsigned long long)i_15];
+                unsigned int bits_31 = __as_u32(v_8);
                 unsigned int key_31 = ((bits_31 <= 2139095040) ? bits_31 : 0);
                 unsigned int bucket_39 = key_31 >> 21;
                 atomicAdd(&hist0[bucket_39], 1);
@@ -1166,10 +1165,10 @@ kernel_cake_radix_topk_c8_e32s_lg_nt(float* __restrict__ probs, int* __restrict_
         asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(owner_1) : "r"(((is_owner_1 != 0) ? (unsigned int)lane : 0)));
         unsigned int found_1;
         asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(found_1) : "r"(is_owner_1));
-        unsigned int pos_b_1 = __shfl_sync(0xFFFFFFFF, pos_1, owner_1);
-        unsigned int rem_b_1 = __shfl_sync(0xFFFFFFFF, rem_after_1, owner_1);
+        unsigned int pos_b_2 = __shfl_sync(0xFFFFFFFF, pos_1, owner_1);
+        unsigned int rem_b_2 = __shfl_sync(0xFFFFFFFF, rem_after_1, owner_1);
         unsigned int cnt_b_1 = __shfl_sync(0xFFFFFFFF, cnt_2, owner_1);
-        unsigned int lo_b_1 = __shfl_sync(0xFFFFFFFF, lo_sel_1, owner_1);
+        unsigned int lo_b_2 = __shfl_sync(0xFFFFFFFF, lo_sel_1, owner_1);
         unsigned int local_3 = ff2[0] + ff2[1] + ff2[2] + ff2[3];
         uint32_t _warp_scan_sum_76 = local_3;
         asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.down.b32 t|p, %0, %1, 31, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_76) : "r"(1));
@@ -1224,21 +1223,21 @@ kernel_cake_radix_topk_c8_e32s_lg_nt(float* __restrict__ probs, int* __restrict_
         asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(owner_2) : "r"(((is_owner_2 != 0) ? (unsigned int)lane : 0)));
         unsigned int found_2;
         asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(found_2) : "r"(is_owner_2));
-        unsigned int pos_b_2 = __shfl_sync(0xFFFFFFFF, pos_2, owner_2);
-        unsigned int rem_b_2 = __shfl_sync(0xFFFFFFFF, rem_after_2, owner_2);
+        unsigned int pos_b_3 = __shfl_sync(0xFFFFFFFF, pos_2, owner_2);
+        unsigned int rem_b_3 = __shfl_sync(0xFFFFFFFF, rem_after_2, owner_2);
         unsigned int cnt_b_2 = __shfl_sync(0xFFFFFFFF, cnt_3, owner_2);
-        unsigned int lo_b_2 = __shfl_sync(0xFFFFFFFF, lo_sel_2, owner_2);
+        unsigned int lo_b_3 = __shfl_sync(0xFFFFFFFF, lo_sel_2, owner_2);
         unsigned int b_need = 0;
         unsigned int mass_need = 0;
         if (found != 0) {
-            b_need = pos_b * 16 + pos_b_1;
-            mass_need = rem_need - rem_b_1 + cnt_b_1;
+            b_need = pos_b * 16 + pos_b_2;
+            mass_need = rem_need - rem_b_2 + cnt_b_1;
         }
         unsigned int b_cap = 0;
         unsigned int mass_cap = 0;
         if (found_0 != 0) {
-            b_cap = pos_b_0 * 16 + pos_b_2 + 1;
-            mass_cap = rem_cap - rem_b_2;
+            b_cap = pos_b_0 * 16 + pos_b_3 + 1;
+            mass_cap = rem_cap - rem_b_3;
         }
         if (lane == 0) {
             unsigned int _max_78 = ((b_need) > (b_cap) ? (b_need) : (b_cap));
@@ -6241,7 +6240,7 @@ kernel_cake_radix_topk_c8_e32s_lg_nt(float* __restrict__ probs, int* __restrict_
                     int idxs_14[4];
                     bool cands_30[4];
                     unsigned int before_30 = 0;
-                    unsigned int total_30 = 0;
+                    unsigned int total_31 = 0;
                     unsigned int bits_109 = __as_u32(vals_b[24]);
                     unsigned int key_109 = ((bits_109 <= 2139095040) ? bits_109 : 0);
                     keys_14[0] = key_109;
@@ -6249,7 +6248,7 @@ kernel_cake_radix_topk_c8_e32s_lg_nt(float* __restrict__ probs, int* __restrict_
                     cands_30[0] = b_lo <= keys_14[0] >> 21 && idxs_14[0] < vocab;
                     unsigned int m_56 = __ballot_sync(0xFFFFFFFF, cands_30[0]);
                     before_30 = before_30 + (unsigned int)__popc(m_56 & lt_mask_1_1);
-                    total_30 = total_30 + (unsigned int)__popc(m_56);
+                    total_31 = total_31 + (unsigned int)__popc(m_56);
                     unsigned int bits_110 = __as_u32(vals_b[25]);
                     unsigned int key_110 = ((bits_110 <= 2139095040) ? bits_110 : 0);
                     keys_14[1] = key_110;
@@ -6257,7 +6256,7 @@ kernel_cake_radix_topk_c8_e32s_lg_nt(float* __restrict__ probs, int* __restrict_
                     cands_30[1] = b_lo <= keys_14[1] >> 21 && idxs_14[1] < vocab;
                     unsigned int m_57 = __ballot_sync(0xFFFFFFFF, cands_30[1]);
                     before_30 = before_30 + (unsigned int)__popc(m_57 & lt_mask_1_1);
-                    total_30 = total_30 + (unsigned int)__popc(m_57);
+                    total_31 = total_31 + (unsigned int)__popc(m_57);
                     unsigned int bits_111 = __as_u32(vals_b[26]);
                     unsigned int key_111 = ((bits_111 <= 2139095040) ? bits_111 : 0);
                     keys_14[2] = key_111;
@@ -6265,7 +6264,7 @@ kernel_cake_radix_topk_c8_e32s_lg_nt(float* __restrict__ probs, int* __restrict_
                     cands_30[2] = b_lo <= keys_14[2] >> 21 && idxs_14[2] < vocab;
                     unsigned int m_58 = __ballot_sync(0xFFFFFFFF, cands_30[2]);
                     before_30 = before_30 + (unsigned int)__popc(m_58 & lt_mask_1_1);
-                    total_30 = total_30 + (unsigned int)__popc(m_58);
+                    total_31 = total_31 + (unsigned int)__popc(m_58);
                     unsigned int bits_112 = __as_u32(vals_b[27]);
                     unsigned int key_112 = ((bits_112 <= 2139095040) ? bits_112 : 0);
                     keys_14[3] = key_112;
@@ -6273,7 +6272,7 @@ kernel_cake_radix_topk_c8_e32s_lg_nt(float* __restrict__ probs, int* __restrict_
                     cands_30[3] = b_lo <= keys_14[3] >> 21 && idxs_14[3] < vocab;
                     unsigned int m_59 = __ballot_sync(0xFFFFFFFF, cands_30[3]);
                     before_30 = before_30 + (unsigned int)__popc(m_59 & lt_mask_1_1);
-                    total_30 = total_30 + (unsigned int)__popc(m_59);
+                    total_31 = total_31 + (unsigned int)__popc(m_59);
                     unsigned int own_30 = 0;
                     unsigned int pos_123 = n_1_1 + before_30 + own_30;
                     if (cands_30[0] && pos_123 < 1024) {
@@ -6311,12 +6310,12 @@ kernel_cake_radix_topk_c8_e32s_lg_nt(float* __restrict__ probs, int* __restrict_
                     if (cands_30[3]) {
                         own_30 = own_30 + 1;
                     }
-                    n_1_1 = n_1_1 + total_30;
+                    n_1_1 = n_1_1 + total_31;
                     unsigned int keys_15[4];
                     int idxs_15[4];
                     bool cands_31[4];
                     unsigned int before_31 = 0;
-                    unsigned int total_31 = 0;
+                    unsigned int total_32 = 0;
                     unsigned int bits_113 = __as_u32(vals_b[28]);
                     unsigned int key_113 = ((bits_113 <= 2139095040) ? bits_113 : 0);
                     keys_15[0] = key_113;
@@ -6324,7 +6323,7 @@ kernel_cake_radix_topk_c8_e32s_lg_nt(float* __restrict__ probs, int* __restrict_
                     cands_31[0] = b_lo <= keys_15[0] >> 21 && idxs_15[0] < vocab;
                     unsigned int m_60 = __ballot_sync(0xFFFFFFFF, cands_31[0]);
                     before_31 = before_31 + (unsigned int)__popc(m_60 & lt_mask_1_1);
-                    total_31 = total_31 + (unsigned int)__popc(m_60);
+                    total_32 = total_32 + (unsigned int)__popc(m_60);
                     unsigned int bits_114 = __as_u32(vals_b[29]);
                     unsigned int key_114 = ((bits_114 <= 2139095040) ? bits_114 : 0);
                     keys_15[1] = key_114;
@@ -6332,7 +6331,7 @@ kernel_cake_radix_topk_c8_e32s_lg_nt(float* __restrict__ probs, int* __restrict_
                     cands_31[1] = b_lo <= keys_15[1] >> 21 && idxs_15[1] < vocab;
                     unsigned int m_61 = __ballot_sync(0xFFFFFFFF, cands_31[1]);
                     before_31 = before_31 + (unsigned int)__popc(m_61 & lt_mask_1_1);
-                    total_31 = total_31 + (unsigned int)__popc(m_61);
+                    total_32 = total_32 + (unsigned int)__popc(m_61);
                     unsigned int bits_115 = __as_u32(vals_b[30]);
                     unsigned int key_115 = ((bits_115 <= 2139095040) ? bits_115 : 0);
                     keys_15[2] = key_115;
@@ -6340,7 +6339,7 @@ kernel_cake_radix_topk_c8_e32s_lg_nt(float* __restrict__ probs, int* __restrict_
                     cands_31[2] = b_lo <= keys_15[2] >> 21 && idxs_15[2] < vocab;
                     unsigned int m_62 = __ballot_sync(0xFFFFFFFF, cands_31[2]);
                     before_31 = before_31 + (unsigned int)__popc(m_62 & lt_mask_1_1);
-                    total_31 = total_31 + (unsigned int)__popc(m_62);
+                    total_32 = total_32 + (unsigned int)__popc(m_62);
                     unsigned int bits_116 = __as_u32(vals_b[31]);
                     unsigned int key_116 = ((bits_116 <= 2139095040) ? bits_116 : 0);
                     keys_15[3] = key_116;
@@ -6348,7 +6347,7 @@ kernel_cake_radix_topk_c8_e32s_lg_nt(float* __restrict__ probs, int* __restrict_
                     cands_31[3] = b_lo <= keys_15[3] >> 21 && idxs_15[3] < vocab;
                     unsigned int m_63 = __ballot_sync(0xFFFFFFFF, cands_31[3]);
                     before_31 = before_31 + (unsigned int)__popc(m_63 & lt_mask_1_1);
-                    total_31 = total_31 + (unsigned int)__popc(m_63);
+                    total_32 = total_32 + (unsigned int)__popc(m_63);
                     unsigned int own_31 = 0;
                     unsigned int pos_127 = n_1_1 + before_31 + own_31;
                     if (cands_31[0] && pos_127 < 1024) {
@@ -6386,7 +6385,7 @@ kernel_cake_radix_topk_c8_e32s_lg_nt(float* __restrict__ probs, int* __restrict_
                     if (cands_31[3]) {
                         own_31 = own_31 + 1;
                     }
-                    n_1_1 = n_1_1 + total_31;
+                    n_1_1 = n_1_1 + total_32;
                 } else {
                     unsigned int skeys_8[4];
                     int sidxs_8[4];
@@ -6940,85 +6939,85 @@ kernel_cake_radix_topk_c8_e32s_lg_nt(float* __restrict__ probs, int* __restrict_
     __syncthreads();
     unsigned int before = 0;
     unsigned int total = 0;
-    unsigned int v_8 = scal[16];
-    total = total + v_8;
-    if (warp > 0) {
-        before = before + v_8;
-    }
-    unsigned int v_9 = scal[17];
+    unsigned int v_9 = scal[16];
     total = total + v_9;
-    if (warp > 1) {
+    if (warp > 0) {
         before = before + v_9;
     }
-    unsigned int v_10 = scal[18];
+    unsigned int v_10 = scal[17];
     total = total + v_10;
-    if (warp > 2) {
+    if (warp > 1) {
         before = before + v_10;
     }
-    unsigned int v_11 = scal[19];
+    unsigned int v_11 = scal[18];
     total = total + v_11;
-    if (warp > 3) {
+    if (warp > 2) {
         before = before + v_11;
     }
-    unsigned int v_12 = scal[20];
+    unsigned int v_12 = scal[19];
     total = total + v_12;
-    if (warp > 4) {
+    if (warp > 3) {
         before = before + v_12;
     }
-    unsigned int v_13 = scal[21];
+    unsigned int v_13 = scal[20];
     total = total + v_13;
-    if (warp > 5) {
+    if (warp > 4) {
         before = before + v_13;
     }
-    unsigned int v_14 = scal[22];
+    unsigned int v_14 = scal[21];
     total = total + v_14;
-    if (warp > 6) {
+    if (warp > 5) {
         before = before + v_14;
     }
-    unsigned int v_15 = scal[23];
+    unsigned int v_15 = scal[22];
     total = total + v_15;
-    if (warp > 7) {
+    if (warp > 6) {
         before = before + v_15;
     }
-    unsigned int v_16 = scal[24];
+    unsigned int v_16 = scal[23];
     total = total + v_16;
-    if (warp > 8) {
+    if (warp > 7) {
         before = before + v_16;
     }
-    unsigned int v_17 = scal[25];
+    unsigned int v_17 = scal[24];
     total = total + v_17;
-    if (warp > 9) {
+    if (warp > 8) {
         before = before + v_17;
     }
-    unsigned int v_18 = scal[26];
+    unsigned int v_18 = scal[25];
     total = total + v_18;
-    if (warp > 10) {
+    if (warp > 9) {
         before = before + v_18;
     }
-    unsigned int v_19 = scal[27];
+    unsigned int v_19 = scal[26];
     total = total + v_19;
-    if (warp > 11) {
+    if (warp > 10) {
         before = before + v_19;
     }
-    unsigned int v_20 = scal[28];
+    unsigned int v_20 = scal[27];
     total = total + v_20;
-    if (warp > 12) {
+    if (warp > 11) {
         before = before + v_20;
     }
-    unsigned int v_21 = scal[29];
+    unsigned int v_21 = scal[28];
     total = total + v_21;
-    if (warp > 13) {
+    if (warp > 12) {
         before = before + v_21;
     }
-    unsigned int v_22 = scal[30];
+    unsigned int v_22 = scal[29];
     total = total + v_22;
-    if (warp > 14) {
+    if (warp > 13) {
         before = before + v_22;
     }
-    unsigned int v_23 = scal[31];
+    unsigned int v_23 = scal[30];
     total = total + v_23;
-    if (warp > 15) {
+    if (warp > 14) {
         before = before + v_23;
+    }
+    unsigned int v_24 = scal[31];
+    total = total + v_24;
+    if (warp > 15) {
+        before = before + v_24;
     }
     unsigned int ovf_w = __ballot_sync(0xFFFFFFFF, n_wu > 1024);
     if (tid == 0) {
@@ -7532,24 +7531,24 @@ kernel_cake_radix_topk_c8_e32s_lg_nt(float* __restrict__ probs, int* __restrict_
         if (fuse_on == 0) {
             asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");
         }
-        unsigned long long c_0 = comps[0];
-        if (c_0 < 9214364837600034816) {
-            unsigned int bucket_40 = (unsigned int)(c_0 >> 53);
+        unsigned long long c_1_1 = comps[0];
+        if (c_1_1 < 9214364837600034816) {
+            unsigned int bucket_40 = (unsigned int)(c_1_1 >> 53);
             atomicAdd(&hist1[bucket_40], 1);
         }
-        unsigned long long c_1_1 = comps[1];
-        if (c_1_1 < 9214364837600034816) {
-            unsigned int bucket_41 = (unsigned int)(c_1_1 >> 53);
+        unsigned long long c_2_1 = comps[1];
+        if (c_2_1 < 9214364837600034816) {
+            unsigned int bucket_41 = (unsigned int)(c_2_1 >> 53);
             atomicAdd(&hist1[bucket_41], 1);
         }
-        unsigned long long c_2_1 = comps[2];
-        if (c_2_1 < 9214364837600034816) {
-            unsigned int bucket_42 = (unsigned int)(c_2_1 >> 53);
+        unsigned long long c_3_1 = comps[2];
+        if (c_3_1 < 9214364837600034816) {
+            unsigned int bucket_42 = (unsigned int)(c_3_1 >> 53);
             atomicAdd(&hist1[bucket_42], 1);
         }
-        unsigned long long c_3_1 = comps[3];
-        if (c_3_1 < 9214364837600034816) {
-            unsigned int bucket_43 = (unsigned int)(c_3_1 >> 53);
+        unsigned long long c_4 = comps[3];
+        if (c_4 < 9214364837600034816) {
+            unsigned int bucket_43 = (unsigned int)(c_4 >> 53);
             atomicAdd(&hist1[bucket_43], 1);
         }
         for (int i_64 = tid; i_64 < 2048; i_64 += 512) {
@@ -7628,24 +7627,24 @@ kernel_cake_radix_topk_c8_e32s_lg_nt(float* __restrict__ probs, int* __restrict_
             done = 1;
         }
         if (done == 0) {
-            unsigned long long c_4 = comps[0];
-            unsigned int bucket_45 = (unsigned int)(c_4 >> 42 & 2047);
-            if (c_4 >> 53 == (unsigned long long)bucket_44) {
+            unsigned long long c_5 = comps[0];
+            unsigned int bucket_45 = (unsigned int)(c_5 >> 42 & 2047);
+            if (c_5 >> 53 == (unsigned long long)bucket_44) {
                 atomicAdd(&hist0[bucket_45], 1);
             }
-            unsigned long long c_5 = comps[1];
-            unsigned int bucket_46 = (unsigned int)(c_5 >> 42 & 2047);
-            if (c_5 >> 53 == (unsigned long long)bucket_44) {
+            unsigned long long c_6 = comps[1];
+            unsigned int bucket_46 = (unsigned int)(c_6 >> 42 & 2047);
+            if (c_6 >> 53 == (unsigned long long)bucket_44) {
                 atomicAdd(&hist0[bucket_46], 1);
             }
-            unsigned long long c_6 = comps[2];
-            unsigned int bucket_47 = (unsigned int)(c_6 >> 42 & 2047);
-            if (c_6 >> 53 == (unsigned long long)bucket_44) {
+            unsigned long long c_7 = comps[2];
+            unsigned int bucket_47 = (unsigned int)(c_7 >> 42 & 2047);
+            if (c_7 >> 53 == (unsigned long long)bucket_44) {
                 atomicAdd(&hist0[bucket_47], 1);
             }
-            unsigned long long c_7 = comps[3];
-            unsigned int bucket_48 = (unsigned int)(c_7 >> 42 & 2047);
-            if (c_7 >> 53 == (unsigned long long)bucket_44) {
+            unsigned long long c_8 = comps[3];
+            unsigned int bucket_48 = (unsigned int)(c_8 >> 42 & 2047);
+            if (c_8 >> 53 == (unsigned long long)bucket_44) {
                 atomicAdd(&hist0[bucket_48], 1);
             }
             for (int i_65 = tid; i_65 < 2048; i_65 += 512) {
@@ -7723,24 +7722,24 @@ kernel_cake_radix_topk_c8_e32s_lg_nt(float* __restrict__ probs, int* __restrict_
                 done = 1;
             }
             if (done == 0) {
-                unsigned long long c_8 = comps[0];
-                unsigned int bucket_51 = (unsigned int)(c_8 >> 32 & 1023);
-                if (c_8 >> 42 == prefix1) {
+                unsigned long long c_9 = comps[0];
+                unsigned int bucket_51 = (unsigned int)(c_9 >> 32 & 1023);
+                if (c_9 >> 42 == prefix1) {
                     atomicAdd(&hist1[bucket_51], 1);
                 }
-                unsigned long long c_9 = comps[1];
-                unsigned int bucket_52 = (unsigned int)(c_9 >> 32 & 1023);
-                if (c_9 >> 42 == prefix1) {
+                unsigned long long c_10 = comps[1];
+                unsigned int bucket_52 = (unsigned int)(c_10 >> 32 & 1023);
+                if (c_10 >> 42 == prefix1) {
                     atomicAdd(&hist1[bucket_52], 1);
                 }
-                unsigned long long c_10 = comps[2];
-                unsigned int bucket_53 = (unsigned int)(c_10 >> 32 & 1023);
-                if (c_10 >> 42 == prefix1) {
+                unsigned long long c_11 = comps[2];
+                unsigned int bucket_53 = (unsigned int)(c_11 >> 32 & 1023);
+                if (c_11 >> 42 == prefix1) {
                     atomicAdd(&hist1[bucket_53], 1);
                 }
-                unsigned long long c_11 = comps[3];
-                unsigned int bucket_54 = (unsigned int)(c_11 >> 32 & 1023);
-                if (c_11 >> 42 == prefix1) {
+                unsigned long long c_12 = comps[3];
+                unsigned int bucket_54 = (unsigned int)(c_12 >> 32 & 1023);
+                if (c_12 >> 42 == prefix1) {
                     atomicAdd(&hist1[bucket_54], 1);
                 }
                 for (int i_66 = tid; i_66 < 2048; i_66 += 512) {
@@ -7826,24 +7825,24 @@ kernel_cake_radix_topk_c8_e32s_lg_nt(float* __restrict__ probs, int* __restrict_
                         unsigned long long mask = (1 << (unsigned long long)nbits) - 1;
                         unsigned long long sh = (unsigned long long)shift;
                         unsigned long long hi = (unsigned long long)(shift + nbits);
-                        unsigned long long c_12 = comps[0];
-                        unsigned int bucket_57 = (unsigned int)(c_12 >> sh & mask);
-                        if (c_12 >> hi == tpre) {
+                        unsigned long long c_13 = comps[0];
+                        unsigned int bucket_57 = (unsigned int)(c_13 >> sh & mask);
+                        if (c_13 >> hi == tpre) {
                             atomicAdd(&hist0[bucket_57], 1);
                         }
-                        unsigned long long c_13 = comps[1];
-                        unsigned int bucket_58 = (unsigned int)(c_13 >> sh & mask);
-                        if (c_13 >> hi == tpre) {
+                        unsigned long long c_14 = comps[1];
+                        unsigned int bucket_58 = (unsigned int)(c_14 >> sh & mask);
+                        if (c_14 >> hi == tpre) {
                             atomicAdd(&hist0[bucket_58], 1);
                         }
-                        unsigned long long c_14 = comps[2];
-                        unsigned int bucket_59 = (unsigned int)(c_14 >> sh & mask);
-                        if (c_14 >> hi == tpre) {
+                        unsigned long long c_15 = comps[2];
+                        unsigned int bucket_59 = (unsigned int)(c_15 >> sh & mask);
+                        if (c_15 >> hi == tpre) {
                             atomicAdd(&hist0[bucket_59], 1);
                         }
-                        unsigned long long c_15 = comps[3];
-                        unsigned int bucket_60 = (unsigned int)(c_15 >> sh & mask);
-                        if (c_15 >> hi == tpre) {
+                        unsigned long long c_16 = comps[3];
+                        unsigned int bucket_60 = (unsigned int)(c_16 >> sh & mask);
+                        if (c_16 >> hi == tpre) {
                             atomicAdd(&hist0[bucket_60], 1);
                         }
                         __syncthreads();
@@ -7982,90 +7981,90 @@ kernel_cake_radix_topk_c8_e32s_lg_nt(float* __restrict__ probs, int* __restrict_
         }
         __syncthreads();
         unsigned int before_32 = 0;
-        unsigned int total_32 = 0;
+        unsigned int total_33 = 0;
         unsigned int ws_1_0 = warp_sums[0];
-        total_32 = total_32 + ws_1_0;
+        total_33 = total_33 + ws_1_0;
         if (warp > 0) {
             before_32 = before_32 + ws_1_0;
         }
         unsigned int ws_1_1 = warp_sums[1];
-        total_32 = total_32 + ws_1_1;
+        total_33 = total_33 + ws_1_1;
         if (warp > 1) {
             before_32 = before_32 + ws_1_1;
         }
         unsigned int ws_1_2 = warp_sums[2];
-        total_32 = total_32 + ws_1_2;
+        total_33 = total_33 + ws_1_2;
         if (warp > 2) {
             before_32 = before_32 + ws_1_2;
         }
         unsigned int ws_1_3 = warp_sums[3];
-        total_32 = total_32 + ws_1_3;
+        total_33 = total_33 + ws_1_3;
         if (warp > 3) {
             before_32 = before_32 + ws_1_3;
         }
         unsigned int ws_1_4 = warp_sums[4];
-        total_32 = total_32 + ws_1_4;
+        total_33 = total_33 + ws_1_4;
         if (warp > 4) {
             before_32 = before_32 + ws_1_4;
         }
         unsigned int ws_1_5 = warp_sums[5];
-        total_32 = total_32 + ws_1_5;
+        total_33 = total_33 + ws_1_5;
         if (warp > 5) {
             before_32 = before_32 + ws_1_5;
         }
         unsigned int ws_1_6 = warp_sums[6];
-        total_32 = total_32 + ws_1_6;
+        total_33 = total_33 + ws_1_6;
         if (warp > 6) {
             before_32 = before_32 + ws_1_6;
         }
         unsigned int ws_1_7 = warp_sums[7];
-        total_32 = total_32 + ws_1_7;
+        total_33 = total_33 + ws_1_7;
         if (warp > 7) {
             before_32 = before_32 + ws_1_7;
         }
         unsigned int ws_1_8 = warp_sums[8];
-        total_32 = total_32 + ws_1_8;
+        total_33 = total_33 + ws_1_8;
         if (warp > 8) {
             before_32 = before_32 + ws_1_8;
         }
         unsigned int ws_1_9 = warp_sums[9];
-        total_32 = total_32 + ws_1_9;
+        total_33 = total_33 + ws_1_9;
         if (warp > 9) {
             before_32 = before_32 + ws_1_9;
         }
         unsigned int ws_1_10 = warp_sums[10];
-        total_32 = total_32 + ws_1_10;
+        total_33 = total_33 + ws_1_10;
         if (warp > 10) {
             before_32 = before_32 + ws_1_10;
         }
         unsigned int ws_1_11 = warp_sums[11];
-        total_32 = total_32 + ws_1_11;
+        total_33 = total_33 + ws_1_11;
         if (warp > 11) {
             before_32 = before_32 + ws_1_11;
         }
         unsigned int ws_1_12 = warp_sums[12];
-        total_32 = total_32 + ws_1_12;
+        total_33 = total_33 + ws_1_12;
         if (warp > 12) {
             before_32 = before_32 + ws_1_12;
         }
         unsigned int ws_1_13 = warp_sums[13];
-        total_32 = total_32 + ws_1_13;
+        total_33 = total_33 + ws_1_13;
         if (warp > 13) {
             before_32 = before_32 + ws_1_13;
         }
         unsigned int ws_1_14 = warp_sums[14];
-        total_32 = total_32 + ws_1_14;
+        total_33 = total_33 + ws_1_14;
         if (warp > 14) {
             before_32 = before_32 + ws_1_14;
         }
         unsigned int ws_1_15 = warp_sums[15];
-        total_32 = total_32 + ws_1_15;
+        total_33 = total_33 + ws_1_15;
         if (warp > 15) {
             before_32 = before_32 + ws_1_15;
         }
         unsigned int excl = before_32 + incl - packed;
         __syncthreads();
-        unsigned int pos0 = (total_32 >> 12) + (excl & 4095);
+        unsigned int pos0 = (total_33 >> 12) + (excl & 4095);
         unsigned int pos_131 = pos0;
         if (sel[0]) {
             unsigned int g_4 = (unsigned int)tid;
@@ -8421,10 +8420,10 @@ kernel_cake_radix_topk_c8_e32s_lg_nt(float* __restrict__ probs, int* __restrict_
                 asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(owner_3) : "r"(((is_owner_3 != 0) ? (unsigned int)lane : 0)));
                 unsigned int found_3;
                 asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(found_3) : "r"(is_owner_3));
-                unsigned int pos_b_3 = __shfl_sync(0xFFFFFFFF, pos_132, owner_3);
-                unsigned int rem_b_3 = __shfl_sync(0xFFFFFFFF, rem_after_3, owner_3);
+                unsigned int pos_b_1 = __shfl_sync(0xFFFFFFFF, pos_132, owner_3);
+                unsigned int rem_b_1 = __shfl_sync(0xFFFFFFFF, rem_after_3, owner_3);
                 unsigned int cnt_b_4 = __shfl_sync(0xFFFFFFFF, cnt_8, owner_3);
-                unsigned int lo_b_3 = __shfl_sync(0xFFFFFFFF, lo_sel_3, owner_3);
+                unsigned int lo_b_1 = __shfl_sync(0xFFFFFFFF, lo_sel_3, owner_3);
                 unsigned int ff_1[4];
                 unsigned int lf_3[4];
                 ff_1[0] = 0;
@@ -8436,7 +8435,7 @@ kernel_cake_radix_topk_c8_e32s_lg_nt(float* __restrict__ probs, int* __restrict_
                 ff_1[3] = 0;
                 lf_3[3] = 0;
                 int quad_1 = lane & 3;
-                int off_3 = ((int)pos_b_3 * 16 + quad_1 * 4) * 4;
+                int off_3 = ((int)pos_b_1 * 16 + quad_1 * 4) * 4;
                 int r_3 = lane >> 2;
                 if (r_3 < 8) {
                     unsigned int words_56[4];
@@ -8537,30 +8536,30 @@ kernel_cake_radix_topk_c8_e32s_lg_nt(float* __restrict__ probs, int* __restrict_
                 unsigned int rem_after_3_1 = 0;
                 unsigned int cnt_9 = 0;
                 unsigned int lo_sel_3_1 = 0;
-                if (above_6_1 < rem_b_3 && rem_b_3 <= above_6_1 + local_10) {
+                if (above_6_1 < rem_b_1 && rem_b_1 <= above_6_1 + local_10) {
                     is_owner_3_1 = 1;
                     unsigned int s3_9 = above_6_1 + ff_1[3];
                     unsigned int s2_9 = s3_9 + ff_1[2];
                     unsigned int s1_9 = s2_9 + ff_1[1];
-                    if (rem_b_3 <= s3_9) {
+                    if (rem_b_1 <= s3_9) {
                         pos_131_1 = (unsigned int)(lane * 4 + 3);
-                        rem_after_3_1 = rem_b_3 - above_6_1;
+                        rem_after_3_1 = rem_b_1 - above_6_1;
                         cnt_9 = ff_1[3];
                         lo_sel_3_1 = lo_above_3_1;
-                    } else if (rem_b_3 <= s2_9) {
+                    } else if (rem_b_1 <= s2_9) {
                         pos_131_1 = (unsigned int)(lane * 4 + 2);
-                        rem_after_3_1 = rem_b_3 - s3_9;
+                        rem_after_3_1 = rem_b_1 - s3_9;
                         cnt_9 = ff_1[2];
                         lo_sel_3_1 = lo_above_3_1 + lf_3[3];
                     } else {
-                        if (rem_b_3 <= s1_9) {
+                        if (rem_b_1 <= s1_9) {
                             pos_131_1 = (unsigned int)(lane * 4 + 1);
-                            rem_after_3_1 = rem_b_3 - s2_9;
+                            rem_after_3_1 = rem_b_1 - s2_9;
                             cnt_9 = ff_1[1];
                             lo_sel_3_1 = lo_above_3_1 + lf_3[3] + lf_3[2];
                         } else {
                             pos_131_1 = (unsigned int)(lane * 4);
-                            rem_after_3_1 = rem_b_3 - s1_9;
+                            rem_after_3_1 = rem_b_1 - s1_9;
                             cnt_9 = ff_1[0];
                             lo_sel_3_1 = lo_above_3_1 + lf_3[3] + lf_3[2] + lf_3[1];
                         }
@@ -8570,15 +8569,15 @@ kernel_cake_radix_topk_c8_e32s_lg_nt(float* __restrict__ probs, int* __restrict_
                 asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(owner_3_1) : "r"(((is_owner_3_1 != 0) ? (unsigned int)lane : 0)));
                 unsigned int found_3_1;
                 asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(found_3_1) : "r"(is_owner_3_1));
-                unsigned int pos_b_3_1 = __shfl_sync(0xFFFFFFFF, pos_131_1, owner_3_1);
-                unsigned int rem_b_3_1 = __shfl_sync(0xFFFFFFFF, rem_after_3_1, owner_3_1);
+                unsigned int pos_b_4 = __shfl_sync(0xFFFFFFFF, pos_131_1, owner_3_1);
+                unsigned int rem_b_4 = __shfl_sync(0xFFFFFFFF, rem_after_3_1, owner_3_1);
                 unsigned int cnt_b_3_1 = __shfl_sync(0xFFFFFFFF, cnt_9, owner_3_1);
-                unsigned int lo_b_3_1 = __shfl_sync(0xFFFFFFFF, lo_sel_3_1, owner_3_1);
+                unsigned int lo_b_4 = __shfl_sync(0xFFFFFFFF, lo_sel_3_1, owner_3_1);
                 if (lane == 0) {
-                    scal[0] = pos_b_3 * 16 + pos_b_3_1;
-                    scal[1] = rem_b_3_1;
+                    scal[0] = pos_b_1 * 16 + pos_b_4;
+                    scal[1] = rem_b_4;
                     scal[2] = cnt_b_3_1;
-                    scal[9] = lo_b_3 + lo_b_3_1;
+                    scal[9] = lo_b_1 + lo_b_4;
                 }
             }
             __syncthreads();
@@ -8587,11 +8586,11 @@ kernel_cake_radix_topk_c8_e32s_lg_nt(float* __restrict__ probs, int* __restrict_
             unsigned int cnt_sel = scal[2];
             if (cnt_sel <= 2048) {
                 take_tail = 0;
-                unsigned int v_0_1 = 0;
+                unsigned int v_0 = 0;
                 if (tid == 0) {
-                    v_0_1 = scal[9];
+                    v_0 = scal[9];
                 }
-                unsigned int lo_above_w = v_0_1;
+                unsigned int lo_above_w = v_0;
                 unsigned int n_2 = 0;
                 int niter_2 = (int)(n_wu + 31 >> 5);
                 for (int j_2 = 0; j_2 < niter_2; j_2++) {
@@ -8607,86 +8606,86 @@ kernel_cake_radix_topk_c8_e32s_lg_nt(float* __restrict__ probs, int* __restrict_
                 }
                 __syncthreads();
                 unsigned int before_33 = 0;
-                unsigned int total_33 = 0;
-                unsigned int v_24 = scal[16];
-                total_33 = total_33 + v_24;
+                unsigned int total_34 = 0;
+                unsigned int v_25 = scal[16];
+                total_34 = total_34 + v_25;
                 if (warp > 0) {
-                    before_33 = before_33 + v_24;
-                }
-                unsigned int v_25 = scal[17];
-                total_33 = total_33 + v_25;
-                if (warp > 1) {
                     before_33 = before_33 + v_25;
                 }
-                unsigned int v_26 = scal[18];
-                total_33 = total_33 + v_26;
-                if (warp > 2) {
+                unsigned int v_26 = scal[17];
+                total_34 = total_34 + v_26;
+                if (warp > 1) {
                     before_33 = before_33 + v_26;
                 }
-                unsigned int v_27 = scal[19];
-                total_33 = total_33 + v_27;
-                if (warp > 3) {
+                unsigned int v_27 = scal[18];
+                total_34 = total_34 + v_27;
+                if (warp > 2) {
                     before_33 = before_33 + v_27;
                 }
-                unsigned int v_28 = scal[20];
-                total_33 = total_33 + v_28;
-                if (warp > 4) {
+                unsigned int v_28 = scal[19];
+                total_34 = total_34 + v_28;
+                if (warp > 3) {
                     before_33 = before_33 + v_28;
                 }
-                unsigned int v_29 = scal[21];
-                total_33 = total_33 + v_29;
-                if (warp > 5) {
+                unsigned int v_29 = scal[20];
+                total_34 = total_34 + v_29;
+                if (warp > 4) {
                     before_33 = before_33 + v_29;
                 }
-                unsigned int v_30 = scal[22];
-                total_33 = total_33 + v_30;
-                if (warp > 6) {
+                unsigned int v_30 = scal[21];
+                total_34 = total_34 + v_30;
+                if (warp > 5) {
                     before_33 = before_33 + v_30;
                 }
-                unsigned int v_31 = scal[23];
-                total_33 = total_33 + v_31;
-                if (warp > 7) {
+                unsigned int v_31 = scal[22];
+                total_34 = total_34 + v_31;
+                if (warp > 6) {
                     before_33 = before_33 + v_31;
                 }
-                unsigned int v_32 = scal[24];
-                total_33 = total_33 + v_32;
-                if (warp > 8) {
+                unsigned int v_32 = scal[23];
+                total_34 = total_34 + v_32;
+                if (warp > 7) {
                     before_33 = before_33 + v_32;
                 }
-                unsigned int v_33 = scal[25];
-                total_33 = total_33 + v_33;
-                if (warp > 9) {
+                unsigned int v_33 = scal[24];
+                total_34 = total_34 + v_33;
+                if (warp > 8) {
                     before_33 = before_33 + v_33;
                 }
-                unsigned int v_34 = scal[26];
-                total_33 = total_33 + v_34;
-                if (warp > 10) {
+                unsigned int v_34 = scal[25];
+                total_34 = total_34 + v_34;
+                if (warp > 9) {
                     before_33 = before_33 + v_34;
                 }
-                unsigned int v_35 = scal[27];
-                total_33 = total_33 + v_35;
-                if (warp > 11) {
+                unsigned int v_35 = scal[26];
+                total_34 = total_34 + v_35;
+                if (warp > 10) {
                     before_33 = before_33 + v_35;
                 }
-                unsigned int v_36 = scal[28];
-                total_33 = total_33 + v_36;
-                if (warp > 12) {
+                unsigned int v_36 = scal[27];
+                total_34 = total_34 + v_36;
+                if (warp > 11) {
                     before_33 = before_33 + v_36;
                 }
-                unsigned int v_37 = scal[29];
-                total_33 = total_33 + v_37;
-                if (warp > 13) {
+                unsigned int v_37 = scal[28];
+                total_34 = total_34 + v_37;
+                if (warp > 12) {
                     before_33 = before_33 + v_37;
                 }
-                unsigned int v_38 = scal[30];
-                total_33 = total_33 + v_38;
-                if (warp > 14) {
+                unsigned int v_38 = scal[29];
+                total_34 = total_34 + v_38;
+                if (warp > 13) {
                     before_33 = before_33 + v_38;
                 }
-                unsigned int v_39 = scal[31];
-                total_33 = total_33 + v_39;
-                if (warp > 15) {
+                unsigned int v_39 = scal[30];
+                total_34 = total_34 + v_39;
+                if (warp > 14) {
                     before_33 = before_33 + v_39;
+                }
+                unsigned int v_40 = scal[31];
+                total_34 = total_34 + v_40;
+                if (warp > 15) {
+                    before_33 = before_33 + v_40;
                 }
                 unsigned int lt_mask_2 = (1 << (unsigned int)lane) - 1;
                 unsigned int pos_133 = before_33;
@@ -8706,7 +8705,7 @@ kernel_cake_radix_topk_c8_e32s_lg_nt(float* __restrict__ probs, int* __restrict_
                     pos_133 = pos_133 + (unsigned int)__popc(m_64);
                 }
                 if (tid == 0) {
-                    scal[3] = total_33;
+                    scal[3] = total_34;
                 }
                 asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");
                 asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
@@ -9223,24 +9222,24 @@ kernel_cake_radix_topk_c8_e32s_lg_nt(float* __restrict__ probs, int* __restrict_
                     done_1 = 1;
                 }
                 if (done_1 == 0) {
-                    unsigned long long c_16 = comps2[0];
-                    unsigned int bucket_62_1 = (unsigned int)(c_16 >> 42 & 2047);
-                    if (c_16 >> 53 == (unsigned long long)bucket_sel_1) {
+                    unsigned long long c_17 = comps2[0];
+                    unsigned int bucket_62_1 = (unsigned int)(c_17 >> 42 & 2047);
+                    if (c_17 >> 53 == (unsigned long long)bucket_sel_1) {
                         atomicAdd(&hist0[bucket_62_1], 1);
                     }
-                    unsigned long long c_17 = comps2[1];
-                    unsigned int bucket_63 = (unsigned int)(c_17 >> 42 & 2047);
-                    if (c_17 >> 53 == (unsigned long long)bucket_sel_1) {
+                    unsigned long long c_18 = comps2[1];
+                    unsigned int bucket_63 = (unsigned int)(c_18 >> 42 & 2047);
+                    if (c_18 >> 53 == (unsigned long long)bucket_sel_1) {
                         atomicAdd(&hist0[bucket_63], 1);
                     }
-                    unsigned long long c_18 = comps2[2];
-                    unsigned int bucket_64 = (unsigned int)(c_18 >> 42 & 2047);
-                    if (c_18 >> 53 == (unsigned long long)bucket_sel_1) {
+                    unsigned long long c_19 = comps2[2];
+                    unsigned int bucket_64 = (unsigned int)(c_19 >> 42 & 2047);
+                    if (c_19 >> 53 == (unsigned long long)bucket_sel_1) {
                         atomicAdd(&hist0[bucket_64], 1);
                     }
-                    unsigned long long c_19 = comps2[3];
-                    unsigned int bucket_65 = (unsigned int)(c_19 >> 42 & 2047);
-                    if (c_19 >> 53 == (unsigned long long)bucket_sel_1) {
+                    unsigned long long c_20 = comps2[3];
+                    unsigned int bucket_65 = (unsigned int)(c_20 >> 42 & 2047);
+                    if (c_20 >> 53 == (unsigned long long)bucket_sel_1) {
                         atomicAdd(&hist0[bucket_65], 1);
                     }
                     for (int i_69 = tid; i_69 < 2048; i_69 += 512) {
@@ -9318,24 +9317,24 @@ kernel_cake_radix_topk_c8_e32s_lg_nt(float* __restrict__ probs, int* __restrict_
                         done_1 = 1;
                     }
                     if (done_1 == 0) {
-                        unsigned long long c_20 = comps2[0];
-                        unsigned int bucket_67 = (unsigned int)(c_20 >> 32 & 1023);
-                        if (c_20 >> 42 == prefix1_1) {
+                        unsigned long long c_21 = comps2[0];
+                        unsigned int bucket_67 = (unsigned int)(c_21 >> 32 & 1023);
+                        if (c_21 >> 42 == prefix1_1) {
                             atomicAdd(&hist1[bucket_67], 1);
                         }
-                        unsigned long long c_21 = comps2[1];
-                        unsigned int bucket_68 = (unsigned int)(c_21 >> 32 & 1023);
-                        if (c_21 >> 42 == prefix1_1) {
+                        unsigned long long c_22 = comps2[1];
+                        unsigned int bucket_68 = (unsigned int)(c_22 >> 32 & 1023);
+                        if (c_22 >> 42 == prefix1_1) {
                             atomicAdd(&hist1[bucket_68], 1);
                         }
-                        unsigned long long c_22 = comps2[2];
-                        unsigned int bucket_69 = (unsigned int)(c_22 >> 32 & 1023);
-                        if (c_22 >> 42 == prefix1_1) {
+                        unsigned long long c_23 = comps2[2];
+                        unsigned int bucket_69 = (unsigned int)(c_23 >> 32 & 1023);
+                        if (c_23 >> 42 == prefix1_1) {
                             atomicAdd(&hist1[bucket_69], 1);
                         }
-                        unsigned long long c_23 = comps2[3];
-                        unsigned int bucket_70 = (unsigned int)(c_23 >> 32 & 1023);
-                        if (c_23 >> 42 == prefix1_1) {
+                        unsigned long long c_24 = comps2[3];
+                        unsigned int bucket_70 = (unsigned int)(c_24 >> 32 & 1023);
+                        if (c_24 >> 42 == prefix1_1) {
                             atomicAdd(&hist1[bucket_70], 1);
                         }
                         for (int i_70 = tid; i_70 < 2048; i_70 += 512) {
@@ -9421,24 +9420,24 @@ kernel_cake_radix_topk_c8_e32s_lg_nt(float* __restrict__ probs, int* __restrict_
                                 unsigned long long mask_1 = (1 << (unsigned long long)nbits_1) - 1;
                                 unsigned long long sh_1 = (unsigned long long)shift_1;
                                 unsigned long long hi_1 = (unsigned long long)(shift_1 + nbits_1);
-                                unsigned long long c_24 = comps2[0];
-                                unsigned int bucket_73 = (unsigned int)(c_24 >> sh_1 & mask_1);
-                                if (c_24 >> hi_1 == tpre_1) {
+                                unsigned long long c_25 = comps2[0];
+                                unsigned int bucket_73 = (unsigned int)(c_25 >> sh_1 & mask_1);
+                                if (c_25 >> hi_1 == tpre_1) {
                                     atomicAdd(&hist0[bucket_73], 1);
                                 }
-                                unsigned long long c_25 = comps2[1];
-                                unsigned int bucket_74 = (unsigned int)(c_25 >> sh_1 & mask_1);
-                                if (c_25 >> hi_1 == tpre_1) {
+                                unsigned long long c_26 = comps2[1];
+                                unsigned int bucket_74 = (unsigned int)(c_26 >> sh_1 & mask_1);
+                                if (c_26 >> hi_1 == tpre_1) {
                                     atomicAdd(&hist0[bucket_74], 1);
                                 }
-                                unsigned long long c_26 = comps2[2];
-                                unsigned int bucket_75 = (unsigned int)(c_26 >> sh_1 & mask_1);
-                                if (c_26 >> hi_1 == tpre_1) {
+                                unsigned long long c_27 = comps2[2];
+                                unsigned int bucket_75 = (unsigned int)(c_27 >> sh_1 & mask_1);
+                                if (c_27 >> hi_1 == tpre_1) {
                                     atomicAdd(&hist0[bucket_75], 1);
                                 }
-                                unsigned long long c_27 = comps2[3];
-                                unsigned int bucket_76 = (unsigned int)(c_27 >> sh_1 & mask_1);
-                                if (c_27 >> hi_1 == tpre_1) {
+                                unsigned long long c_28 = comps2[3];
+                                unsigned int bucket_76 = (unsigned int)(c_28 >> sh_1 & mask_1);
+                                if (c_28 >> hi_1 == tpre_1) {
                                     atomicAdd(&hist0[bucket_76], 1);
                                 }
                                 __syncthreads();
@@ -9559,170 +9558,170 @@ kernel_cake_radix_topk_c8_e32s_lg_nt(float* __restrict__ probs, int* __restrict_
                 }
                 __syncthreads();
                 unsigned int before_34 = 0;
-                unsigned int total_34 = 0;
-                unsigned int v_40 = scal[32];
-                total_34 = total_34 + v_40;
+                unsigned int total_35 = 0;
+                unsigned int v_41 = scal[32];
+                total_35 = total_35 + v_41;
                 if (warp > 0) {
-                    before_34 = before_34 + v_40;
-                }
-                unsigned int v_41 = scal[33];
-                total_34 = total_34 + v_41;
-                if (warp > 1) {
                     before_34 = before_34 + v_41;
                 }
-                unsigned int v_42 = scal[34];
-                total_34 = total_34 + v_42;
-                if (warp > 2) {
+                unsigned int v_42 = scal[33];
+                total_35 = total_35 + v_42;
+                if (warp > 1) {
                     before_34 = before_34 + v_42;
                 }
-                unsigned int v_43 = scal[35];
-                total_34 = total_34 + v_43;
-                if (warp > 3) {
+                unsigned int v_43 = scal[34];
+                total_35 = total_35 + v_43;
+                if (warp > 2) {
                     before_34 = before_34 + v_43;
                 }
-                unsigned int v_44 = scal[36];
-                total_34 = total_34 + v_44;
-                if (warp > 4) {
+                unsigned int v_44 = scal[35];
+                total_35 = total_35 + v_44;
+                if (warp > 3) {
                     before_34 = before_34 + v_44;
                 }
-                unsigned int v_45 = scal[37];
-                total_34 = total_34 + v_45;
-                if (warp > 5) {
+                unsigned int v_45 = scal[36];
+                total_35 = total_35 + v_45;
+                if (warp > 4) {
                     before_34 = before_34 + v_45;
                 }
-                unsigned int v_46 = scal[38];
-                total_34 = total_34 + v_46;
-                if (warp > 6) {
+                unsigned int v_46 = scal[37];
+                total_35 = total_35 + v_46;
+                if (warp > 5) {
                     before_34 = before_34 + v_46;
                 }
-                unsigned int v_47 = scal[39];
-                total_34 = total_34 + v_47;
-                if (warp > 7) {
+                unsigned int v_47 = scal[38];
+                total_35 = total_35 + v_47;
+                if (warp > 6) {
                     before_34 = before_34 + v_47;
                 }
-                unsigned int v_48 = scal[40];
-                total_34 = total_34 + v_48;
-                if (warp > 8) {
+                unsigned int v_48 = scal[39];
+                total_35 = total_35 + v_48;
+                if (warp > 7) {
                     before_34 = before_34 + v_48;
                 }
-                unsigned int v_49 = scal[41];
-                total_34 = total_34 + v_49;
-                if (warp > 9) {
+                unsigned int v_49 = scal[40];
+                total_35 = total_35 + v_49;
+                if (warp > 8) {
                     before_34 = before_34 + v_49;
                 }
-                unsigned int v_50 = scal[42];
-                total_34 = total_34 + v_50;
-                if (warp > 10) {
+                unsigned int v_50 = scal[41];
+                total_35 = total_35 + v_50;
+                if (warp > 9) {
                     before_34 = before_34 + v_50;
                 }
-                unsigned int v_51 = scal[43];
-                total_34 = total_34 + v_51;
-                if (warp > 11) {
+                unsigned int v_51 = scal[42];
+                total_35 = total_35 + v_51;
+                if (warp > 10) {
                     before_34 = before_34 + v_51;
                 }
-                unsigned int v_52 = scal[44];
-                total_34 = total_34 + v_52;
-                if (warp > 12) {
+                unsigned int v_52 = scal[43];
+                total_35 = total_35 + v_52;
+                if (warp > 11) {
                     before_34 = before_34 + v_52;
                 }
-                unsigned int v_53 = scal[45];
-                total_34 = total_34 + v_53;
-                if (warp > 13) {
+                unsigned int v_53 = scal[44];
+                total_35 = total_35 + v_53;
+                if (warp > 12) {
                     before_34 = before_34 + v_53;
                 }
-                unsigned int v_54 = scal[46];
-                total_34 = total_34 + v_54;
-                if (warp > 14) {
+                unsigned int v_54 = scal[45];
+                total_35 = total_35 + v_54;
+                if (warp > 13) {
                     before_34 = before_34 + v_54;
                 }
-                unsigned int v_55 = scal[47];
-                total_34 = total_34 + v_55;
-                if (warp > 15) {
+                unsigned int v_55 = scal[46];
+                total_35 = total_35 + v_55;
+                if (warp > 14) {
                     before_34 = before_34 + v_55;
                 }
-                unsigned int before_35 = 0;
-                unsigned int total_35 = 0;
-                unsigned int v_56 = scal[48];
+                unsigned int v_56 = scal[47];
                 total_35 = total_35 + v_56;
-                if (warp > 0) {
-                    before_35 = before_35 + v_56;
+                if (warp > 15) {
+                    before_34 = before_34 + v_56;
                 }
-                unsigned int v_57 = scal[49];
-                total_35 = total_35 + v_57;
-                if (warp > 1) {
+                unsigned int before_35 = 0;
+                unsigned int total_36 = 0;
+                unsigned int v_57 = scal[48];
+                total_36 = total_36 + v_57;
+                if (warp > 0) {
                     before_35 = before_35 + v_57;
                 }
-                unsigned int v_58 = scal[50];
-                total_35 = total_35 + v_58;
-                if (warp > 2) {
+                unsigned int v_58 = scal[49];
+                total_36 = total_36 + v_58;
+                if (warp > 1) {
                     before_35 = before_35 + v_58;
                 }
-                unsigned int v_59 = scal[51];
-                total_35 = total_35 + v_59;
-                if (warp > 3) {
+                unsigned int v_59 = scal[50];
+                total_36 = total_36 + v_59;
+                if (warp > 2) {
                     before_35 = before_35 + v_59;
                 }
-                unsigned int v_60 = scal[52];
-                total_35 = total_35 + v_60;
-                if (warp > 4) {
+                unsigned int v_60 = scal[51];
+                total_36 = total_36 + v_60;
+                if (warp > 3) {
                     before_35 = before_35 + v_60;
                 }
-                unsigned int v_61 = scal[53];
-                total_35 = total_35 + v_61;
-                if (warp > 5) {
+                unsigned int v_61 = scal[52];
+                total_36 = total_36 + v_61;
+                if (warp > 4) {
                     before_35 = before_35 + v_61;
                 }
-                unsigned int v_62 = scal[54];
-                total_35 = total_35 + v_62;
-                if (warp > 6) {
+                unsigned int v_62 = scal[53];
+                total_36 = total_36 + v_62;
+                if (warp > 5) {
                     before_35 = before_35 + v_62;
                 }
-                unsigned int v_63 = scal[55];
-                total_35 = total_35 + v_63;
-                if (warp > 7) {
+                unsigned int v_63 = scal[54];
+                total_36 = total_36 + v_63;
+                if (warp > 6) {
                     before_35 = before_35 + v_63;
                 }
-                unsigned int v_64 = scal[56];
-                total_35 = total_35 + v_64;
-                if (warp > 8) {
+                unsigned int v_64 = scal[55];
+                total_36 = total_36 + v_64;
+                if (warp > 7) {
                     before_35 = before_35 + v_64;
                 }
-                unsigned int v_65 = scal[57];
-                total_35 = total_35 + v_65;
-                if (warp > 9) {
+                unsigned int v_65 = scal[56];
+                total_36 = total_36 + v_65;
+                if (warp > 8) {
                     before_35 = before_35 + v_65;
                 }
-                unsigned int v_66 = scal[58];
-                total_35 = total_35 + v_66;
-                if (warp > 10) {
+                unsigned int v_66 = scal[57];
+                total_36 = total_36 + v_66;
+                if (warp > 9) {
                     before_35 = before_35 + v_66;
                 }
-                unsigned int v_67 = scal[59];
-                total_35 = total_35 + v_67;
-                if (warp > 11) {
+                unsigned int v_67 = scal[58];
+                total_36 = total_36 + v_67;
+                if (warp > 10) {
                     before_35 = before_35 + v_67;
                 }
-                unsigned int v_68 = scal[60];
-                total_35 = total_35 + v_68;
-                if (warp > 12) {
+                unsigned int v_68 = scal[59];
+                total_36 = total_36 + v_68;
+                if (warp > 11) {
                     before_35 = before_35 + v_68;
                 }
-                unsigned int v_69 = scal[61];
-                total_35 = total_35 + v_69;
-                if (warp > 13) {
+                unsigned int v_69 = scal[60];
+                total_36 = total_36 + v_69;
+                if (warp > 12) {
                     before_35 = before_35 + v_69;
                 }
-                unsigned int v_70 = scal[62];
-                total_35 = total_35 + v_70;
-                if (warp > 14) {
+                unsigned int v_70 = scal[61];
+                total_36 = total_36 + v_70;
+                if (warp > 13) {
                     before_35 = before_35 + v_70;
                 }
-                unsigned int v_71 = scal[63];
-                total_35 = total_35 + v_71;
-                if (warp > 15) {
+                unsigned int v_71 = scal[62];
+                total_36 = total_36 + v_71;
+                if (warp > 14) {
                     before_35 = before_35 + v_71;
                 }
-                unsigned long long ebase = out_base + (unsigned long long)(total_35 + before_34);
+                unsigned int v_72 = scal[63];
+                total_36 = total_36 + v_72;
+                if (warp > 15) {
+                    before_35 = before_35 + v_72;
+                }
+                unsigned long long ebase = out_base + (unsigned long long)(total_36 + before_34);
                 unsigned int lt_mask_2_1 = (1 << (unsigned int)lane) - 1;
                 unsigned int pos_132_1 = 0;
                 int niter_2_1 = (int)(n_wu + 31 >> 5);
@@ -9759,26 +9758,26 @@ kernel_cake_radix_topk_c8_e32s_lg_nt(float* __restrict__ probs, int* __restrict_
             for (int p = 0; p < 3; p++) {
                 unsigned int shift_2 = ((p == 0) ? 21 : ((p == 1) ? 10 : 0));
                 unsigned int nbits_2 = ((p == 2) ? 10 : 11);
-                for (int c_28 = 0; c_28 < nsub; c_28++) {
-                    int i2_192 = start + c_28 * 2048 + tid;
+                for (int c_29 = 0; c_29 < nsub; c_29++) {
+                    int i2_192 = start + c_29 * 2048 + tid;
                     if (i2_192 < vocab) {
                         vals_t[0] = probs[row_base + (unsigned long long)i2_192];
                     } else {
                         vals_t[0] = 0.0f;
                     }
-                    int i2_193 = start + c_28 * 2048 + 512 + tid;
+                    int i2_193 = start + c_29 * 2048 + 512 + tid;
                     if (i2_193 < vocab) {
                         vals_t[1] = probs[row_base + (unsigned long long)i2_193];
                     } else {
                         vals_t[1] = 0.0f;
                     }
-                    int i2_194 = start + c_28 * 2048 + 1024 + tid;
+                    int i2_194 = start + c_29 * 2048 + 1024 + tid;
                     if (i2_194 < vocab) {
                         vals_t[2] = probs[row_base + (unsigned long long)i2_194];
                     } else {
                         vals_t[2] = 0.0f;
                     }
-                    int i2_195 = start + c_28 * 2048 + 1536 + tid;
+                    int i2_195 = start + c_29 * 2048 + 1536 + tid;
                     if (i2_195 < vocab) {
                         vals_t[3] = probs[row_base + (unsigned long long)i2_195];
                     } else {
@@ -10006,90 +10005,90 @@ kernel_cake_radix_topk_c8_e32s_lg_nt(float* __restrict__ probs, int* __restrict_
                 }
                 __syncthreads();
                 unsigned int before_36 = 0;
-                unsigned int total_36 = 0;
+                unsigned int total_37 = 0;
                 unsigned int ws_1_16 = warp_sums[0];
-                total_36 = total_36 + ws_1_16;
+                total_37 = total_37 + ws_1_16;
                 if (warp > 0) {
                     before_36 = before_36 + ws_1_16;
                 }
                 unsigned int ws_1_17 = warp_sums[1];
-                total_36 = total_36 + ws_1_17;
+                total_37 = total_37 + ws_1_17;
                 if (warp > 1) {
                     before_36 = before_36 + ws_1_17;
                 }
                 unsigned int ws_1_18 = warp_sums[2];
-                total_36 = total_36 + ws_1_18;
+                total_37 = total_37 + ws_1_18;
                 if (warp > 2) {
                     before_36 = before_36 + ws_1_18;
                 }
                 unsigned int ws_1_19 = warp_sums[3];
-                total_36 = total_36 + ws_1_19;
+                total_37 = total_37 + ws_1_19;
                 if (warp > 3) {
                     before_36 = before_36 + ws_1_19;
                 }
                 unsigned int ws_1_20 = warp_sums[4];
-                total_36 = total_36 + ws_1_20;
+                total_37 = total_37 + ws_1_20;
                 if (warp > 4) {
                     before_36 = before_36 + ws_1_20;
                 }
                 unsigned int ws_1_21 = warp_sums[5];
-                total_36 = total_36 + ws_1_21;
+                total_37 = total_37 + ws_1_21;
                 if (warp > 5) {
                     before_36 = before_36 + ws_1_21;
                 }
                 unsigned int ws_1_22 = warp_sums[6];
-                total_36 = total_36 + ws_1_22;
+                total_37 = total_37 + ws_1_22;
                 if (warp > 6) {
                     before_36 = before_36 + ws_1_22;
                 }
                 unsigned int ws_1_23 = warp_sums[7];
-                total_36 = total_36 + ws_1_23;
+                total_37 = total_37 + ws_1_23;
                 if (warp > 7) {
                     before_36 = before_36 + ws_1_23;
                 }
                 unsigned int ws_1_24 = warp_sums[8];
-                total_36 = total_36 + ws_1_24;
+                total_37 = total_37 + ws_1_24;
                 if (warp > 8) {
                     before_36 = before_36 + ws_1_24;
                 }
                 unsigned int ws_1_25 = warp_sums[9];
-                total_36 = total_36 + ws_1_25;
+                total_37 = total_37 + ws_1_25;
                 if (warp > 9) {
                     before_36 = before_36 + ws_1_25;
                 }
                 unsigned int ws_1_26 = warp_sums[10];
-                total_36 = total_36 + ws_1_26;
+                total_37 = total_37 + ws_1_26;
                 if (warp > 10) {
                     before_36 = before_36 + ws_1_26;
                 }
                 unsigned int ws_1_27 = warp_sums[11];
-                total_36 = total_36 + ws_1_27;
+                total_37 = total_37 + ws_1_27;
                 if (warp > 11) {
                     before_36 = before_36 + ws_1_27;
                 }
                 unsigned int ws_1_28 = warp_sums[12];
-                total_36 = total_36 + ws_1_28;
+                total_37 = total_37 + ws_1_28;
                 if (warp > 12) {
                     before_36 = before_36 + ws_1_28;
                 }
                 unsigned int ws_1_29 = warp_sums[13];
-                total_36 = total_36 + ws_1_29;
+                total_37 = total_37 + ws_1_29;
                 if (warp > 13) {
                     before_36 = before_36 + ws_1_29;
                 }
                 unsigned int ws_1_30 = warp_sums[14];
-                total_36 = total_36 + ws_1_30;
+                total_37 = total_37 + ws_1_30;
                 if (warp > 14) {
                     before_36 = before_36 + ws_1_30;
                 }
                 unsigned int ws_1_31 = warp_sums[15];
-                total_36 = total_36 + ws_1_31;
+                total_37 = total_37 + ws_1_31;
                 if (warp > 15) {
                     before_36 = before_36 + ws_1_31;
                 }
                 unsigned int excl_1 = before_36 + incl_1 - above_9_1;
                 __syncthreads();
-                gt_local = gt_local + total_36;
+                gt_local = gt_local + total_37;
                 if (p == 2) {
                     if (own > 0) {
                         scal[4] = own;
@@ -10146,26 +10145,26 @@ kernel_cake_radix_topk_c8_e32s_lg_nt(float* __restrict__ probs, int* __restrict_
             unsigned int take_rem = ((eq_prefix < remaining) ? _min_310 : 0);
             unsigned long long gt_run = out_base + (unsigned long long)gt_prefix;
             unsigned long long eq_run = out_base + (unsigned long long)(gt_total + eq_prefix);
-            for (int c_29 = 0; c_29 < nsub; c_29++) {
-                int i2_196 = start + c_29 * 2048 + tid;
+            for (int c_30 = 0; c_30 < nsub; c_30++) {
+                int i2_196 = start + c_30 * 2048 + tid;
                 if (i2_196 < vocab) {
                     vals_t[0] = probs[row_base + (unsigned long long)i2_196];
                 } else {
                     vals_t[0] = 0.0f;
                 }
-                int i2_197 = start + c_29 * 2048 + 512 + tid;
+                int i2_197 = start + c_30 * 2048 + 512 + tid;
                 if (i2_197 < vocab) {
                     vals_t[1] = probs[row_base + (unsigned long long)i2_197];
                 } else {
                     vals_t[1] = 0.0f;
                 }
-                int i2_198 = start + c_29 * 2048 + 1024 + tid;
+                int i2_198 = start + c_30 * 2048 + 1024 + tid;
                 if (i2_198 < vocab) {
                     vals_t[2] = probs[row_base + (unsigned long long)i2_198];
                 } else {
                     vals_t[2] = 0.0f;
                 }
-                int i2_199 = start + c_29 * 2048 + 1536 + tid;
+                int i2_199 = start + c_30 * 2048 + 1536 + tid;
                 if (i2_199 < vocab) {
                     vals_t[3] = probs[row_base + (unsigned long long)i2_199];
                 } else {
@@ -10174,8 +10173,8 @@ kernel_cake_radix_topk_c8_e32s_lg_nt(float* __restrict__ probs, int* __restrict_
                 unsigned int gt = 0;
                 unsigned int bits_151 = __as_u32(vals_t[0]);
                 unsigned int key_154 = ((bits_151 <= 2139095040) ? bits_151 : 0);
-                int i_vec = start + c_29 * 2048 + tid * 4;
-                int i_str = start + c_29 * 2048 + tid;
+                int i_vec = start + c_30 * 2048 + tid * 4;
+                int i_str = start + c_30 * 2048 + tid;
                 int i_73 = i_str;
                 int i_2_0 = i_73;
                 bool tie_1_0 = key_154 == threshold_t && i_2_0 < vocab;
@@ -10188,8 +10187,8 @@ kernel_cake_radix_topk_c8_e32s_lg_nt(float* __restrict__ probs, int* __restrict_
                 }
                 unsigned int bits_151_1 = __as_u32(vals_t[1]);
                 unsigned int key_151_1 = ((bits_151_1 <= 2139095040) ? bits_151_1 : 0);
-                int i_vec_0 = start + c_29 * 2048 + tid * 4 + 1;
-                int i_str_0 = start + c_29 * 2048 + 512 + tid;
+                int i_vec_0 = start + c_30 * 2048 + tid * 4 + 1;
+                int i_str_0 = start + c_30 * 2048 + 512 + tid;
                 int i_64_1 = i_str_0;
                 int i_2_1 = i_64_1;
                 bool tie_1_1 = key_151_1 == threshold_t && i_2_1 < vocab;
@@ -10202,8 +10201,8 @@ kernel_cake_radix_topk_c8_e32s_lg_nt(float* __restrict__ probs, int* __restrict_
                 }
                 unsigned int bits_152 = __as_u32(vals_t[2]);
                 unsigned int key_152_1 = ((bits_152 <= 2139095040) ? bits_152 : 0);
-                int i_vec_1 = start + c_29 * 2048 + tid * 4 + 2;
-                int i_str_1 = start + c_29 * 2048 + 1024 + tid;
+                int i_vec_1 = start + c_30 * 2048 + tid * 4 + 2;
+                int i_str_1 = start + c_30 * 2048 + 1024 + tid;
                 int i_65_1 = i_str_1;
                 int i_2_2 = i_65_1;
                 bool tie_1_2 = key_152_1 == threshold_t && i_2_2 < vocab;
@@ -10216,8 +10215,8 @@ kernel_cake_radix_topk_c8_e32s_lg_nt(float* __restrict__ probs, int* __restrict_
                 }
                 unsigned int bits_153 = __as_u32(vals_t[3]);
                 unsigned int key_153_1 = ((bits_153 <= 2139095040) ? bits_153 : 0);
-                int i_vec_2 = start + c_29 * 2048 + tid * 4 + 3;
-                int i_str_2 = start + c_29 * 2048 + 1536 + tid;
+                int i_vec_2 = start + c_30 * 2048 + tid * 4 + 3;
+                int i_str_2 = start + c_30 * 2048 + 1536 + tid;
                 int i_66_1 = i_str_2;
                 int i_2_3 = i_66_1;
                 bool tie_1_3 = key_153_1 == threshold_t && i_2_3 < vocab;
@@ -10247,84 +10246,84 @@ kernel_cake_radix_topk_c8_e32s_lg_nt(float* __restrict__ probs, int* __restrict_
                 }
                 __syncthreads();
                 unsigned int before_37 = 0;
-                unsigned int total_37 = 0;
+                unsigned int total_38 = 0;
                 unsigned int ws_1_32 = warp_sums[0];
-                total_37 = total_37 + ws_1_32;
+                total_38 = total_38 + ws_1_32;
                 if (warp > 0) {
                     before_37 = before_37 + ws_1_32;
                 }
                 unsigned int ws_1_33 = warp_sums[1];
-                total_37 = total_37 + ws_1_33;
+                total_38 = total_38 + ws_1_33;
                 if (warp > 1) {
                     before_37 = before_37 + ws_1_33;
                 }
                 unsigned int ws_1_34 = warp_sums[2];
-                total_37 = total_37 + ws_1_34;
+                total_38 = total_38 + ws_1_34;
                 if (warp > 2) {
                     before_37 = before_37 + ws_1_34;
                 }
                 unsigned int ws_1_35 = warp_sums[3];
-                total_37 = total_37 + ws_1_35;
+                total_38 = total_38 + ws_1_35;
                 if (warp > 3) {
                     before_37 = before_37 + ws_1_35;
                 }
                 unsigned int ws_1_36 = warp_sums[4];
-                total_37 = total_37 + ws_1_36;
+                total_38 = total_38 + ws_1_36;
                 if (warp > 4) {
                     before_37 = before_37 + ws_1_36;
                 }
                 unsigned int ws_1_37 = warp_sums[5];
-                total_37 = total_37 + ws_1_37;
+                total_38 = total_38 + ws_1_37;
                 if (warp > 5) {
                     before_37 = before_37 + ws_1_37;
                 }
                 unsigned int ws_1_38 = warp_sums[6];
-                total_37 = total_37 + ws_1_38;
+                total_38 = total_38 + ws_1_38;
                 if (warp > 6) {
                     before_37 = before_37 + ws_1_38;
                 }
                 unsigned int ws_1_39 = warp_sums[7];
-                total_37 = total_37 + ws_1_39;
+                total_38 = total_38 + ws_1_39;
                 if (warp > 7) {
                     before_37 = before_37 + ws_1_39;
                 }
                 unsigned int ws_1_40 = warp_sums[8];
-                total_37 = total_37 + ws_1_40;
+                total_38 = total_38 + ws_1_40;
                 if (warp > 8) {
                     before_37 = before_37 + ws_1_40;
                 }
                 unsigned int ws_1_41 = warp_sums[9];
-                total_37 = total_37 + ws_1_41;
+                total_38 = total_38 + ws_1_41;
                 if (warp > 9) {
                     before_37 = before_37 + ws_1_41;
                 }
                 unsigned int ws_1_42 = warp_sums[10];
-                total_37 = total_37 + ws_1_42;
+                total_38 = total_38 + ws_1_42;
                 if (warp > 10) {
                     before_37 = before_37 + ws_1_42;
                 }
                 unsigned int ws_1_43 = warp_sums[11];
-                total_37 = total_37 + ws_1_43;
+                total_38 = total_38 + ws_1_43;
                 if (warp > 11) {
                     before_37 = before_37 + ws_1_43;
                 }
                 unsigned int ws_1_44 = warp_sums[12];
-                total_37 = total_37 + ws_1_44;
+                total_38 = total_38 + ws_1_44;
                 if (warp > 12) {
                     before_37 = before_37 + ws_1_44;
                 }
                 unsigned int ws_1_45 = warp_sums[13];
-                total_37 = total_37 + ws_1_45;
+                total_38 = total_38 + ws_1_45;
                 if (warp > 13) {
                     before_37 = before_37 + ws_1_45;
                 }
                 unsigned int ws_1_46 = warp_sums[14];
-                total_37 = total_37 + ws_1_46;
+                total_38 = total_38 + ws_1_46;
                 if (warp > 14) {
                     before_37 = before_37 + ws_1_46;
                 }
                 unsigned int ws_1_47 = warp_sums[15];
-                total_37 = total_37 + ws_1_47;
+                total_38 = total_38 + ws_1_47;
                 if (warp > 15) {
                     before_37 = before_37 + ws_1_47;
                 }
@@ -10333,14 +10332,14 @@ kernel_cake_radix_topk_c8_e32s_lg_nt(float* __restrict__ probs, int* __restrict_
                 unsigned int running = excl_2 >> 12;
                 int f2 = tid;
                 if (f2 < 64) {
-                    unsigned int c_0_1 = cnt[f2];
+                    unsigned int c_0 = cnt[f2];
                     cnt[f2] = running;
-                    running = running + c_0_1;
+                    running = running + c_0;
                 }
                 __syncthreads();
                 unsigned int gt_slot = excl_2 & 4095;
-                unsigned int gt_total_46 = total_37 & 4095;
-                unsigned int eq_total = total_37 >> 12;
+                unsigned int gt_total_46 = total_38 & 4095;
+                unsigned int eq_total = total_38 >> 12;
                 unsigned int take_c = ((eq_total) < (take_rem) ? (eq_total) : (take_rem));
                 unsigned int lt_mask_3 = (1 << (unsigned int)lane) - 1;
                 unsigned int g = gt_slot;
@@ -10353,8 +10352,8 @@ kernel_cake_radix_topk_c8_e32s_lg_nt(float* __restrict__ probs, int* __restrict_
                 unsigned int bits_154 = __as_u32(vals_t[0]);
                 unsigned int key_154_1 = ((bits_154 <= 2139095040) ? bits_154 : 0);
                 keys[0] = key_154_1;
-                int i_vec_3 = start + c_29 * 2048 + tid * 4;
-                int i_str_3 = start + c_29 * 2048 + tid;
+                int i_vec_3 = start + c_30 * 2048 + tid * 4;
+                int i_str_3 = start + c_30 * 2048 + tid;
                 int i_67_1 = i_str_3;
                 idxs[0] = i_67_1;
                 ties[0] = keys[0] == threshold_t && idxs[0] < vocab;
@@ -10367,8 +10366,8 @@ kernel_cake_radix_topk_c8_e32s_lg_nt(float* __restrict__ probs, int* __restrict_
                 unsigned int bits_155 = __as_u32(vals_t[1]);
                 unsigned int key_155 = ((bits_155 <= 2139095040) ? bits_155 : 0);
                 keys[1] = key_155;
-                int i_vec_4 = start + c_29 * 2048 + tid * 4 + 1;
-                int i_str_4 = start + c_29 * 2048 + 512 + tid;
+                int i_vec_4 = start + c_30 * 2048 + tid * 4 + 1;
+                int i_str_4 = start + c_30 * 2048 + 512 + tid;
                 int i_68_1 = i_str_4;
                 idxs[1] = i_68_1;
                 ties[1] = keys[1] == threshold_t && idxs[1] < vocab;
@@ -10381,8 +10380,8 @@ kernel_cake_radix_topk_c8_e32s_lg_nt(float* __restrict__ probs, int* __restrict_
                 unsigned int bits_156 = __as_u32(vals_t[2]);
                 unsigned int key_156 = ((bits_156 <= 2139095040) ? bits_156 : 0);
                 keys[2] = key_156;
-                int i_vec_5 = start + c_29 * 2048 + tid * 4 + 2;
-                int i_str_5 = start + c_29 * 2048 + 1024 + tid;
+                int i_vec_5 = start + c_30 * 2048 + tid * 4 + 2;
+                int i_str_5 = start + c_30 * 2048 + 1024 + tid;
                 int i_69_1 = i_str_5;
                 idxs[2] = i_69_1;
                 ties[2] = keys[2] == threshold_t && idxs[2] < vocab;
@@ -10395,8 +10394,8 @@ kernel_cake_radix_topk_c8_e32s_lg_nt(float* __restrict__ probs, int* __restrict_
                 unsigned int bits_157 = __as_u32(vals_t[3]);
                 unsigned int key_157 = ((bits_157 <= 2139095040) ? bits_157 : 0);
                 keys[3] = key_157;
-                int i_vec_6 = start + c_29 * 2048 + tid * 4 + 3;
-                int i_str_6 = start + c_29 * 2048 + 1536 + tid;
+                int i_vec_6 = start + c_30 * 2048 + tid * 4 + 3;
+                int i_str_6 = start + c_30 * 2048 + 1536 + tid;
                 int i_70_1 = i_str_6;
                 idxs[3] = i_70_1;
                 ties[3] = keys[3] == threshold_t && idxs[3] < vocab;
@@ -10486,7 +10485,6 @@ kernel_cake_radix_topk_c8_e32s_lg_nt(float* __restrict__ probs, int* __restrict_
 } // extern "C"
 
 #undef CAKE_INF
-#undef NUM_MAIN_STAGES
 #undef SMEM_CLIST_OFF
 #undef SMEM_CLIST_STAGE_BYTES
 #undef SMEM_CLIST_STRIDE
@@ -10567,7 +10565,6 @@ kernel_cake_radix_topk_c8_e32s_lg_nt(float* __restrict__ probs, int* __restrict_
 #undef xbuf64_addr
 
 #define CAKE_INF CUDART_INF_F
-#define NUM_MAIN_STAGES 1
 #define SMEM_HIST0_OFF 0
 #define SMEM_HIST0_STAGE_BYTES 8192
 #define SMEM_HIST0_STRIDE 8192
@@ -10906,32 +10903,32 @@ kernel_cake_radix_topk_c2_e16s_lp_nt(float* __restrict__ probs, int* __restrict_
         for (int c_1 = 0; c_1 < nchunks; c_1++) {
             int i_4 = start + c_1 * 8192 + tid * 4;
             if (i_4 < vocab) {
-                float v_0 = probs[row_base + (unsigned long long)i_4];
-                unsigned int bits_12 = __as_u32(v_0);
+                float v_1 = probs[row_base + (unsigned long long)i_4];
+                unsigned int bits_12 = __as_u32(v_1);
                 unsigned int key_12 = ((bits_12 <= 2139095040) ? bits_12 : 0);
                 unsigned int bucket_16 = key_12 >> 21;
                 atomicAdd(&hist0[bucket_16], 1);
             }
             int i_5 = start + c_1 * 8192 + (512 + tid) * 4;
             if (i_5 < vocab) {
-                float v_1 = probs[row_base + (unsigned long long)i_5];
-                unsigned int bits_13 = __as_u32(v_1);
+                float v_2 = probs[row_base + (unsigned long long)i_5];
+                unsigned int bits_13 = __as_u32(v_2);
                 unsigned int key_13 = ((bits_13 <= 2139095040) ? bits_13 : 0);
                 unsigned int bucket_17 = key_13 >> 21;
                 atomicAdd(&hist0[bucket_17], 1);
             }
             int i_6 = start + c_1 * 8192 + (1024 + tid) * 4;
             if (i_6 < vocab) {
-                float v_2 = probs[row_base + (unsigned long long)i_6];
-                unsigned int bits_14 = __as_u32(v_2);
+                float v_3 = probs[row_base + (unsigned long long)i_6];
+                unsigned int bits_14 = __as_u32(v_3);
                 unsigned int key_14 = ((bits_14 <= 2139095040) ? bits_14 : 0);
                 unsigned int bucket_18 = key_14 >> 21;
                 atomicAdd(&hist0[bucket_18], 1);
             }
             int i_7 = start + c_1 * 8192 + (1536 + tid) * 4;
             if (i_7 < vocab) {
-                float v_3 = probs[row_base + (unsigned long long)i_7];
-                unsigned int bits_15 = __as_u32(v_3);
+                float v_4 = probs[row_base + (unsigned long long)i_7];
+                unsigned int bits_15 = __as_u32(v_4);
                 unsigned int key_15 = ((bits_15 <= 2139095040) ? bits_15 : 0);
                 unsigned int bucket_19 = key_15 >> 21;
                 atomicAdd(&hist0[bucket_19], 1);
@@ -13948,85 +13945,85 @@ kernel_cake_radix_topk_c2_e16s_lp_nt(float* __restrict__ probs, int* __restrict_
     __syncthreads();
     unsigned int before = 0;
     unsigned int total = 0;
-    unsigned int v_4 = scal[16];
-    total = total + v_4;
-    if (warp > 0) {
-        before = before + v_4;
-    }
-    unsigned int v_5 = scal[17];
+    unsigned int v_5 = scal[16];
     total = total + v_5;
-    if (warp > 1) {
+    if (warp > 0) {
         before = before + v_5;
     }
-    unsigned int v_6 = scal[18];
+    unsigned int v_6 = scal[17];
     total = total + v_6;
-    if (warp > 2) {
+    if (warp > 1) {
         before = before + v_6;
     }
-    unsigned int v_7 = scal[19];
+    unsigned int v_7 = scal[18];
     total = total + v_7;
-    if (warp > 3) {
+    if (warp > 2) {
         before = before + v_7;
     }
-    unsigned int v_8 = scal[20];
+    unsigned int v_8 = scal[19];
     total = total + v_8;
-    if (warp > 4) {
+    if (warp > 3) {
         before = before + v_8;
     }
-    unsigned int v_9 = scal[21];
+    unsigned int v_9 = scal[20];
     total = total + v_9;
-    if (warp > 5) {
+    if (warp > 4) {
         before = before + v_9;
     }
-    unsigned int v_10 = scal[22];
+    unsigned int v_10 = scal[21];
     total = total + v_10;
-    if (warp > 6) {
+    if (warp > 5) {
         before = before + v_10;
     }
-    unsigned int v_11 = scal[23];
+    unsigned int v_11 = scal[22];
     total = total + v_11;
-    if (warp > 7) {
+    if (warp > 6) {
         before = before + v_11;
     }
-    unsigned int v_12 = scal[24];
+    unsigned int v_12 = scal[23];
     total = total + v_12;
-    if (warp > 8) {
+    if (warp > 7) {
         before = before + v_12;
     }
-    unsigned int v_13 = scal[25];
+    unsigned int v_13 = scal[24];
     total = total + v_13;
-    if (warp > 9) {
+    if (warp > 8) {
         before = before + v_13;
     }
-    unsigned int v_14 = scal[26];
+    unsigned int v_14 = scal[25];
     total = total + v_14;
-    if (warp > 10) {
+    if (warp > 9) {
         before = before + v_14;
     }
-    unsigned int v_15 = scal[27];
+    unsigned int v_15 = scal[26];
     total = total + v_15;
-    if (warp > 11) {
+    if (warp > 10) {
         before = before + v_15;
     }
-    unsigned int v_16 = scal[28];
+    unsigned int v_16 = scal[27];
     total = total + v_16;
-    if (warp > 12) {
+    if (warp > 11) {
         before = before + v_16;
     }
-    unsigned int v_17 = scal[29];
+    unsigned int v_17 = scal[28];
     total = total + v_17;
-    if (warp > 13) {
+    if (warp > 12) {
         before = before + v_17;
     }
-    unsigned int v_18 = scal[30];
+    unsigned int v_18 = scal[29];
     total = total + v_18;
-    if (warp > 14) {
+    if (warp > 13) {
         before = before + v_18;
     }
-    unsigned int v_19 = scal[31];
+    unsigned int v_19 = scal[30];
     total = total + v_19;
-    if (warp > 15) {
+    if (warp > 14) {
         before = before + v_19;
+    }
+    unsigned int v_20 = scal[31];
+    total = total + v_20;
+    if (warp > 15) {
+        before = before + v_20;
     }
     unsigned int ovf_w = __ballot_sync(0xFFFFFFFF, n_wu > 1024);
     if (tid == 0) {
@@ -14184,24 +14181,24 @@ kernel_cake_radix_topk_c2_e16s_lp_nt(float* __restrict__ probs, int* __restrict_
                 }
                 acc_1_3 = acc_1_3 + lens[1];
             }
-            unsigned long long c_0 = comps_l[0];
-            if (c_0 < 9214364837600034816) {
-                unsigned int bucket_20 = (unsigned int)(c_0 >> 53);
+            unsigned long long c_1_1 = comps_l[0];
+            if (c_1_1 < 9214364837600034816) {
+                unsigned int bucket_20 = (unsigned int)(c_1_1 >> 53);
                 atomicAdd(&hist1[bucket_20], 1);
             }
-            unsigned long long c_1_1 = comps_l[1];
-            if (c_1_1 < 9214364837600034816) {
-                unsigned int bucket_21 = (unsigned int)(c_1_1 >> 53);
+            unsigned long long c_2_1 = comps_l[1];
+            if (c_2_1 < 9214364837600034816) {
+                unsigned int bucket_21 = (unsigned int)(c_2_1 >> 53);
                 atomicAdd(&hist1[bucket_21], 1);
             }
-            unsigned long long c_2_1 = comps_l[2];
-            if (c_2_1 < 9214364837600034816) {
-                unsigned int bucket_22 = (unsigned int)(c_2_1 >> 53);
+            unsigned long long c_3_1 = comps_l[2];
+            if (c_3_1 < 9214364837600034816) {
+                unsigned int bucket_22 = (unsigned int)(c_3_1 >> 53);
                 atomicAdd(&hist1[bucket_22], 1);
             }
-            unsigned long long c_3_1 = comps_l[3];
-            if (c_3_1 < 9214364837600034816) {
-                unsigned int bucket_23 = (unsigned int)(c_3_1 >> 53);
+            unsigned long long c_4 = comps_l[3];
+            if (c_4 < 9214364837600034816) {
+                unsigned int bucket_23 = (unsigned int)(c_4 >> 53);
                 atomicAdd(&hist1[bucket_23], 1);
             }
             hist0[tid] = 0;
@@ -14281,24 +14278,24 @@ kernel_cake_radix_topk_c2_e16s_lp_nt(float* __restrict__ probs, int* __restrict_
                 done = 1;
             }
             if (done == 0) {
-                unsigned long long c_4 = comps_l[0];
-                unsigned int bucket_25 = (unsigned int)(c_4 >> 42 & 2047);
-                if (c_4 >> 53 == (unsigned long long)bucket_24) {
+                unsigned long long c_5 = comps_l[0];
+                unsigned int bucket_25 = (unsigned int)(c_5 >> 42 & 2047);
+                if (c_5 >> 53 == (unsigned long long)bucket_24) {
                     atomicAdd(&hist0[bucket_25], 1);
                 }
-                unsigned long long c_5 = comps_l[1];
-                unsigned int bucket_26 = (unsigned int)(c_5 >> 42 & 2047);
-                if (c_5 >> 53 == (unsigned long long)bucket_24) {
+                unsigned long long c_6 = comps_l[1];
+                unsigned int bucket_26 = (unsigned int)(c_6 >> 42 & 2047);
+                if (c_6 >> 53 == (unsigned long long)bucket_24) {
                     atomicAdd(&hist0[bucket_26], 1);
                 }
-                unsigned long long c_6 = comps_l[2];
-                unsigned int bucket_27 = (unsigned int)(c_6 >> 42 & 2047);
-                if (c_6 >> 53 == (unsigned long long)bucket_24) {
+                unsigned long long c_7 = comps_l[2];
+                unsigned int bucket_27 = (unsigned int)(c_7 >> 42 & 2047);
+                if (c_7 >> 53 == (unsigned long long)bucket_24) {
                     atomicAdd(&hist0[bucket_27], 1);
                 }
-                unsigned long long c_7 = comps_l[3];
-                unsigned int bucket_28 = (unsigned int)(c_7 >> 42 & 2047);
-                if (c_7 >> 53 == (unsigned long long)bucket_24) {
+                unsigned long long c_8 = comps_l[3];
+                unsigned int bucket_28 = (unsigned int)(c_8 >> 42 & 2047);
+                if (c_8 >> 53 == (unsigned long long)bucket_24) {
                     atomicAdd(&hist0[bucket_28], 1);
                 }
                 hist1[tid] = 0;
@@ -14377,24 +14374,24 @@ kernel_cake_radix_topk_c2_e16s_lp_nt(float* __restrict__ probs, int* __restrict_
                     done = 1;
                 }
                 if (done == 0) {
-                    unsigned long long c_8 = comps_l[0];
-                    unsigned int bucket_31 = (unsigned int)(c_8 >> 32 & 1023);
-                    if (c_8 >> 42 == prefix1) {
+                    unsigned long long c_9 = comps_l[0];
+                    unsigned int bucket_31 = (unsigned int)(c_9 >> 32 & 1023);
+                    if (c_9 >> 42 == prefix1) {
                         atomicAdd(&hist1[bucket_31], 1);
                     }
-                    unsigned long long c_9 = comps_l[1];
-                    unsigned int bucket_32 = (unsigned int)(c_9 >> 32 & 1023);
-                    if (c_9 >> 42 == prefix1) {
+                    unsigned long long c_10 = comps_l[1];
+                    unsigned int bucket_32 = (unsigned int)(c_10 >> 32 & 1023);
+                    if (c_10 >> 42 == prefix1) {
                         atomicAdd(&hist1[bucket_32], 1);
                     }
-                    unsigned long long c_10 = comps_l[2];
-                    unsigned int bucket_33 = (unsigned int)(c_10 >> 32 & 1023);
-                    if (c_10 >> 42 == prefix1) {
+                    unsigned long long c_11 = comps_l[2];
+                    unsigned int bucket_33 = (unsigned int)(c_11 >> 32 & 1023);
+                    if (c_11 >> 42 == prefix1) {
                         atomicAdd(&hist1[bucket_33], 1);
                     }
-                    unsigned long long c_11 = comps_l[3];
-                    unsigned int bucket_34 = (unsigned int)(c_11 >> 32 & 1023);
-                    if (c_11 >> 42 == prefix1) {
+                    unsigned long long c_12 = comps_l[3];
+                    unsigned int bucket_34 = (unsigned int)(c_12 >> 32 & 1023);
+                    if (c_12 >> 42 == prefix1) {
                         atomicAdd(&hist1[bucket_34], 1);
                     }
                     hist0[tid] = 0;
@@ -14481,24 +14478,24 @@ kernel_cake_radix_topk_c2_e16s_lp_nt(float* __restrict__ probs, int* __restrict_
                             unsigned long long mask = (1 << (unsigned long long)nbits) - 1;
                             unsigned long long sh = (unsigned long long)shift;
                             unsigned long long hi = (unsigned long long)(shift + nbits);
-                            unsigned long long c_12 = comps_l[0];
-                            unsigned int bucket_37 = (unsigned int)(c_12 >> sh & mask);
-                            if (c_12 >> hi == tpre) {
+                            unsigned long long c_13 = comps_l[0];
+                            unsigned int bucket_37 = (unsigned int)(c_13 >> sh & mask);
+                            if (c_13 >> hi == tpre) {
                                 atomicAdd(&hist0[bucket_37], 1);
                             }
-                            unsigned long long c_13 = comps_l[1];
-                            unsigned int bucket_38 = (unsigned int)(c_13 >> sh & mask);
-                            if (c_13 >> hi == tpre) {
+                            unsigned long long c_14 = comps_l[1];
+                            unsigned int bucket_38 = (unsigned int)(c_14 >> sh & mask);
+                            if (c_14 >> hi == tpre) {
                                 atomicAdd(&hist0[bucket_38], 1);
                             }
-                            unsigned long long c_14 = comps_l[2];
-                            unsigned int bucket_39 = (unsigned int)(c_14 >> sh & mask);
-                            if (c_14 >> hi == tpre) {
+                            unsigned long long c_15 = comps_l[2];
+                            unsigned int bucket_39 = (unsigned int)(c_15 >> sh & mask);
+                            if (c_15 >> hi == tpre) {
                                 atomicAdd(&hist0[bucket_39], 1);
                             }
-                            unsigned long long c_15 = comps_l[3];
-                            unsigned int bucket_40 = (unsigned int)(c_15 >> sh & mask);
-                            if (c_15 >> hi == tpre) {
+                            unsigned long long c_16 = comps_l[3];
+                            unsigned int bucket_40 = (unsigned int)(c_16 >> sh & mask);
+                            if (c_16 >> hi == tpre) {
                                 atomicAdd(&hist0[bucket_40], 1);
                             }
                             __syncthreads();
@@ -15166,85 +15163,85 @@ kernel_cake_radix_topk_c2_e16s_lp_nt(float* __restrict__ probs, int* __restrict_
                 __syncthreads();
                 unsigned int before_17 = 0;
                 unsigned int total_16 = 0;
-                unsigned int v_20 = scal[16];
-                total_16 = total_16 + v_20;
-                if (warp > 0) {
-                    before_17 = before_17 + v_20;
-                }
-                unsigned int v_21 = scal[17];
+                unsigned int v_21 = scal[16];
                 total_16 = total_16 + v_21;
-                if (warp > 1) {
+                if (warp > 0) {
                     before_17 = before_17 + v_21;
                 }
-                unsigned int v_22 = scal[18];
+                unsigned int v_22 = scal[17];
                 total_16 = total_16 + v_22;
-                if (warp > 2) {
+                if (warp > 1) {
                     before_17 = before_17 + v_22;
                 }
-                unsigned int v_23 = scal[19];
+                unsigned int v_23 = scal[18];
                 total_16 = total_16 + v_23;
-                if (warp > 3) {
+                if (warp > 2) {
                     before_17 = before_17 + v_23;
                 }
-                unsigned int v_24 = scal[20];
+                unsigned int v_24 = scal[19];
                 total_16 = total_16 + v_24;
-                if (warp > 4) {
+                if (warp > 3) {
                     before_17 = before_17 + v_24;
                 }
-                unsigned int v_25 = scal[21];
+                unsigned int v_25 = scal[20];
                 total_16 = total_16 + v_25;
-                if (warp > 5) {
+                if (warp > 4) {
                     before_17 = before_17 + v_25;
                 }
-                unsigned int v_26 = scal[22];
+                unsigned int v_26 = scal[21];
                 total_16 = total_16 + v_26;
-                if (warp > 6) {
+                if (warp > 5) {
                     before_17 = before_17 + v_26;
                 }
-                unsigned int v_27 = scal[23];
+                unsigned int v_27 = scal[22];
                 total_16 = total_16 + v_27;
-                if (warp > 7) {
+                if (warp > 6) {
                     before_17 = before_17 + v_27;
                 }
-                unsigned int v_28 = scal[24];
+                unsigned int v_28 = scal[23];
                 total_16 = total_16 + v_28;
-                if (warp > 8) {
+                if (warp > 7) {
                     before_17 = before_17 + v_28;
                 }
-                unsigned int v_29 = scal[25];
+                unsigned int v_29 = scal[24];
                 total_16 = total_16 + v_29;
-                if (warp > 9) {
+                if (warp > 8) {
                     before_17 = before_17 + v_29;
                 }
-                unsigned int v_30 = scal[26];
+                unsigned int v_30 = scal[25];
                 total_16 = total_16 + v_30;
-                if (warp > 10) {
+                if (warp > 9) {
                     before_17 = before_17 + v_30;
                 }
-                unsigned int v_31 = scal[27];
+                unsigned int v_31 = scal[26];
                 total_16 = total_16 + v_31;
-                if (warp > 11) {
+                if (warp > 10) {
                     before_17 = before_17 + v_31;
                 }
-                unsigned int v_32 = scal[28];
+                unsigned int v_32 = scal[27];
                 total_16 = total_16 + v_32;
-                if (warp > 12) {
+                if (warp > 11) {
                     before_17 = before_17 + v_32;
                 }
-                unsigned int v_33 = scal[29];
+                unsigned int v_33 = scal[28];
                 total_16 = total_16 + v_33;
-                if (warp > 13) {
+                if (warp > 12) {
                     before_17 = before_17 + v_33;
                 }
-                unsigned int v_34 = scal[30];
+                unsigned int v_34 = scal[29];
                 total_16 = total_16 + v_34;
-                if (warp > 14) {
+                if (warp > 13) {
                     before_17 = before_17 + v_34;
                 }
-                unsigned int v_35 = scal[31];
+                unsigned int v_35 = scal[30];
                 total_16 = total_16 + v_35;
-                if (warp > 15) {
+                if (warp > 14) {
                     before_17 = before_17 + v_35;
+                }
+                unsigned int v_36 = scal[31];
+                total_16 = total_16 + v_36;
+                if (warp > 15) {
+                    before_17 = before_17 + v_36;
                 }
                 unsigned int lt_mask_3 = (1 << (unsigned int)lane) - 1;
                 unsigned int pos = before_17;
@@ -15421,24 +15418,24 @@ kernel_cake_radix_topk_c2_e16s_lp_nt(float* __restrict__ probs, int* __restrict_
                     done_1 = 1;
                 }
                 if (done_1 == 0) {
-                    unsigned long long c_16 = comps2[0];
-                    unsigned int bucket_42_1 = (unsigned int)(c_16 >> 42 & 2047);
-                    if (c_16 >> 53 == (unsigned long long)bucket_sel_1) {
+                    unsigned long long c_17 = comps2[0];
+                    unsigned int bucket_42_1 = (unsigned int)(c_17 >> 42 & 2047);
+                    if (c_17 >> 53 == (unsigned long long)bucket_sel_1) {
                         atomicAdd(&hist0[bucket_42_1], 1);
                     }
-                    unsigned long long c_17 = comps2[1];
-                    unsigned int bucket_43_1 = (unsigned int)(c_17 >> 42 & 2047);
-                    if (c_17 >> 53 == (unsigned long long)bucket_sel_1) {
+                    unsigned long long c_18 = comps2[1];
+                    unsigned int bucket_43_1 = (unsigned int)(c_18 >> 42 & 2047);
+                    if (c_18 >> 53 == (unsigned long long)bucket_sel_1) {
                         atomicAdd(&hist0[bucket_43_1], 1);
                     }
-                    unsigned long long c_18 = comps2[2];
-                    unsigned int bucket_44 = (unsigned int)(c_18 >> 42 & 2047);
-                    if (c_18 >> 53 == (unsigned long long)bucket_sel_1) {
+                    unsigned long long c_19 = comps2[2];
+                    unsigned int bucket_44 = (unsigned int)(c_19 >> 42 & 2047);
+                    if (c_19 >> 53 == (unsigned long long)bucket_sel_1) {
                         atomicAdd(&hist0[bucket_44], 1);
                     }
-                    unsigned long long c_19 = comps2[3];
-                    unsigned int bucket_45 = (unsigned int)(c_19 >> 42 & 2047);
-                    if (c_19 >> 53 == (unsigned long long)bucket_sel_1) {
+                    unsigned long long c_20 = comps2[3];
+                    unsigned int bucket_45 = (unsigned int)(c_20 >> 42 & 2047);
+                    if (c_20 >> 53 == (unsigned long long)bucket_sel_1) {
                         atomicAdd(&hist0[bucket_45], 1);
                     }
                     hist1[tid] = 0;
@@ -15517,24 +15514,24 @@ kernel_cake_radix_topk_c2_e16s_lp_nt(float* __restrict__ probs, int* __restrict_
                         done_1 = 1;
                     }
                     if (done_1 == 0) {
-                        unsigned long long c_20 = comps2[0];
-                        unsigned int bucket_48 = (unsigned int)(c_20 >> 32 & 1023);
-                        if (c_20 >> 42 == prefix1_1) {
+                        unsigned long long c_21 = comps2[0];
+                        unsigned int bucket_48 = (unsigned int)(c_21 >> 32 & 1023);
+                        if (c_21 >> 42 == prefix1_1) {
                             atomicAdd(&hist1[bucket_48], 1);
                         }
-                        unsigned long long c_21 = comps2[1];
-                        unsigned int bucket_49 = (unsigned int)(c_21 >> 32 & 1023);
-                        if (c_21 >> 42 == prefix1_1) {
+                        unsigned long long c_22 = comps2[1];
+                        unsigned int bucket_49 = (unsigned int)(c_22 >> 32 & 1023);
+                        if (c_22 >> 42 == prefix1_1) {
                             atomicAdd(&hist1[bucket_49], 1);
                         }
-                        unsigned long long c_22 = comps2[2];
-                        unsigned int bucket_50 = (unsigned int)(c_22 >> 32 & 1023);
-                        if (c_22 >> 42 == prefix1_1) {
+                        unsigned long long c_23 = comps2[2];
+                        unsigned int bucket_50 = (unsigned int)(c_23 >> 32 & 1023);
+                        if (c_23 >> 42 == prefix1_1) {
                             atomicAdd(&hist1[bucket_50], 1);
                         }
-                        unsigned long long c_23 = comps2[3];
-                        unsigned int bucket_51 = (unsigned int)(c_23 >> 32 & 1023);
-                        if (c_23 >> 42 == prefix1_1) {
+                        unsigned long long c_24 = comps2[3];
+                        unsigned int bucket_51 = (unsigned int)(c_24 >> 32 & 1023);
+                        if (c_24 >> 42 == prefix1_1) {
                             atomicAdd(&hist1[bucket_51], 1);
                         }
                         hist0[tid] = 0;
@@ -15621,24 +15618,24 @@ kernel_cake_radix_topk_c2_e16s_lp_nt(float* __restrict__ probs, int* __restrict_
                                 unsigned long long mask_1 = (1 << (unsigned long long)nbits_1) - 1;
                                 unsigned long long sh_1 = (unsigned long long)shift_1;
                                 unsigned long long hi_1 = (unsigned long long)(shift_1 + nbits_1);
-                                unsigned long long c_24 = comps2[0];
-                                unsigned int bucket_54 = (unsigned int)(c_24 >> sh_1 & mask_1);
-                                if (c_24 >> hi_1 == tpre_1) {
+                                unsigned long long c_25 = comps2[0];
+                                unsigned int bucket_54 = (unsigned int)(c_25 >> sh_1 & mask_1);
+                                if (c_25 >> hi_1 == tpre_1) {
                                     atomicAdd(&hist0[bucket_54], 1);
                                 }
-                                unsigned long long c_25 = comps2[1];
-                                unsigned int bucket_55 = (unsigned int)(c_25 >> sh_1 & mask_1);
-                                if (c_25 >> hi_1 == tpre_1) {
+                                unsigned long long c_26 = comps2[1];
+                                unsigned int bucket_55 = (unsigned int)(c_26 >> sh_1 & mask_1);
+                                if (c_26 >> hi_1 == tpre_1) {
                                     atomicAdd(&hist0[bucket_55], 1);
                                 }
-                                unsigned long long c_26 = comps2[2];
-                                unsigned int bucket_56 = (unsigned int)(c_26 >> sh_1 & mask_1);
-                                if (c_26 >> hi_1 == tpre_1) {
+                                unsigned long long c_27 = comps2[2];
+                                unsigned int bucket_56 = (unsigned int)(c_27 >> sh_1 & mask_1);
+                                if (c_27 >> hi_1 == tpre_1) {
                                     atomicAdd(&hist0[bucket_56], 1);
                                 }
-                                unsigned long long c_27 = comps2[3];
-                                unsigned int bucket_57 = (unsigned int)(c_27 >> sh_1 & mask_1);
-                                if (c_27 >> hi_1 == tpre_1) {
+                                unsigned long long c_28 = comps2[3];
+                                unsigned int bucket_57 = (unsigned int)(c_28 >> sh_1 & mask_1);
+                                if (c_28 >> hi_1 == tpre_1) {
                                     atomicAdd(&hist0[bucket_57], 1);
                                 }
                                 __syncthreads();
@@ -15761,167 +15758,167 @@ kernel_cake_radix_topk_c2_e16s_lp_nt(float* __restrict__ probs, int* __restrict_
                 __syncthreads();
                 unsigned int before_18 = 0;
                 unsigned int total_17 = 0;
-                unsigned int v_36 = scal[32];
-                total_17 = total_17 + v_36;
-                if (warp > 0) {
-                    before_18 = before_18 + v_36;
-                }
-                unsigned int v_37 = scal[33];
+                unsigned int v_37 = scal[32];
                 total_17 = total_17 + v_37;
-                if (warp > 1) {
+                if (warp > 0) {
                     before_18 = before_18 + v_37;
                 }
-                unsigned int v_38 = scal[34];
+                unsigned int v_38 = scal[33];
                 total_17 = total_17 + v_38;
-                if (warp > 2) {
+                if (warp > 1) {
                     before_18 = before_18 + v_38;
                 }
-                unsigned int v_39 = scal[35];
+                unsigned int v_39 = scal[34];
                 total_17 = total_17 + v_39;
-                if (warp > 3) {
+                if (warp > 2) {
                     before_18 = before_18 + v_39;
                 }
-                unsigned int v_40 = scal[36];
+                unsigned int v_40 = scal[35];
                 total_17 = total_17 + v_40;
-                if (warp > 4) {
+                if (warp > 3) {
                     before_18 = before_18 + v_40;
                 }
-                unsigned int v_41 = scal[37];
+                unsigned int v_41 = scal[36];
                 total_17 = total_17 + v_41;
-                if (warp > 5) {
+                if (warp > 4) {
                     before_18 = before_18 + v_41;
                 }
-                unsigned int v_42 = scal[38];
+                unsigned int v_42 = scal[37];
                 total_17 = total_17 + v_42;
-                if (warp > 6) {
+                if (warp > 5) {
                     before_18 = before_18 + v_42;
                 }
-                unsigned int v_43 = scal[39];
+                unsigned int v_43 = scal[38];
                 total_17 = total_17 + v_43;
-                if (warp > 7) {
+                if (warp > 6) {
                     before_18 = before_18 + v_43;
                 }
-                unsigned int v_44 = scal[40];
+                unsigned int v_44 = scal[39];
                 total_17 = total_17 + v_44;
-                if (warp > 8) {
+                if (warp > 7) {
                     before_18 = before_18 + v_44;
                 }
-                unsigned int v_45 = scal[41];
+                unsigned int v_45 = scal[40];
                 total_17 = total_17 + v_45;
-                if (warp > 9) {
+                if (warp > 8) {
                     before_18 = before_18 + v_45;
                 }
-                unsigned int v_46 = scal[42];
+                unsigned int v_46 = scal[41];
                 total_17 = total_17 + v_46;
-                if (warp > 10) {
+                if (warp > 9) {
                     before_18 = before_18 + v_46;
                 }
-                unsigned int v_47 = scal[43];
+                unsigned int v_47 = scal[42];
                 total_17 = total_17 + v_47;
-                if (warp > 11) {
+                if (warp > 10) {
                     before_18 = before_18 + v_47;
                 }
-                unsigned int v_48 = scal[44];
+                unsigned int v_48 = scal[43];
                 total_17 = total_17 + v_48;
-                if (warp > 12) {
+                if (warp > 11) {
                     before_18 = before_18 + v_48;
                 }
-                unsigned int v_49 = scal[45];
+                unsigned int v_49 = scal[44];
                 total_17 = total_17 + v_49;
-                if (warp > 13) {
+                if (warp > 12) {
                     before_18 = before_18 + v_49;
                 }
-                unsigned int v_50 = scal[46];
+                unsigned int v_50 = scal[45];
                 total_17 = total_17 + v_50;
-                if (warp > 14) {
+                if (warp > 13) {
                     before_18 = before_18 + v_50;
                 }
-                unsigned int v_51 = scal[47];
+                unsigned int v_51 = scal[46];
                 total_17 = total_17 + v_51;
-                if (warp > 15) {
+                if (warp > 14) {
                     before_18 = before_18 + v_51;
+                }
+                unsigned int v_52 = scal[47];
+                total_17 = total_17 + v_52;
+                if (warp > 15) {
+                    before_18 = before_18 + v_52;
                 }
                 unsigned int before_19 = 0;
                 unsigned int total_18 = 0;
-                unsigned int v_52 = scal[48];
-                total_18 = total_18 + v_52;
-                if (warp > 0) {
-                    before_19 = before_19 + v_52;
-                }
-                unsigned int v_53 = scal[49];
+                unsigned int v_53 = scal[48];
                 total_18 = total_18 + v_53;
-                if (warp > 1) {
+                if (warp > 0) {
                     before_19 = before_19 + v_53;
                 }
-                unsigned int v_54 = scal[50];
+                unsigned int v_54 = scal[49];
                 total_18 = total_18 + v_54;
-                if (warp > 2) {
+                if (warp > 1) {
                     before_19 = before_19 + v_54;
                 }
-                unsigned int v_55 = scal[51];
+                unsigned int v_55 = scal[50];
                 total_18 = total_18 + v_55;
-                if (warp > 3) {
+                if (warp > 2) {
                     before_19 = before_19 + v_55;
                 }
-                unsigned int v_56 = scal[52];
+                unsigned int v_56 = scal[51];
                 total_18 = total_18 + v_56;
-                if (warp > 4) {
+                if (warp > 3) {
                     before_19 = before_19 + v_56;
                 }
-                unsigned int v_57 = scal[53];
+                unsigned int v_57 = scal[52];
                 total_18 = total_18 + v_57;
-                if (warp > 5) {
+                if (warp > 4) {
                     before_19 = before_19 + v_57;
                 }
-                unsigned int v_58 = scal[54];
+                unsigned int v_58 = scal[53];
                 total_18 = total_18 + v_58;
-                if (warp > 6) {
+                if (warp > 5) {
                     before_19 = before_19 + v_58;
                 }
-                unsigned int v_59 = scal[55];
+                unsigned int v_59 = scal[54];
                 total_18 = total_18 + v_59;
-                if (warp > 7) {
+                if (warp > 6) {
                     before_19 = before_19 + v_59;
                 }
-                unsigned int v_60 = scal[56];
+                unsigned int v_60 = scal[55];
                 total_18 = total_18 + v_60;
-                if (warp > 8) {
+                if (warp > 7) {
                     before_19 = before_19 + v_60;
                 }
-                unsigned int v_61 = scal[57];
+                unsigned int v_61 = scal[56];
                 total_18 = total_18 + v_61;
-                if (warp > 9) {
+                if (warp > 8) {
                     before_19 = before_19 + v_61;
                 }
-                unsigned int v_62 = scal[58];
+                unsigned int v_62 = scal[57];
                 total_18 = total_18 + v_62;
-                if (warp > 10) {
+                if (warp > 9) {
                     before_19 = before_19 + v_62;
                 }
-                unsigned int v_63 = scal[59];
+                unsigned int v_63 = scal[58];
                 total_18 = total_18 + v_63;
-                if (warp > 11) {
+                if (warp > 10) {
                     before_19 = before_19 + v_63;
                 }
-                unsigned int v_64 = scal[60];
+                unsigned int v_64 = scal[59];
                 total_18 = total_18 + v_64;
-                if (warp > 12) {
+                if (warp > 11) {
                     before_19 = before_19 + v_64;
                 }
-                unsigned int v_65 = scal[61];
+                unsigned int v_65 = scal[60];
                 total_18 = total_18 + v_65;
-                if (warp > 13) {
+                if (warp > 12) {
                     before_19 = before_19 + v_65;
                 }
-                unsigned int v_66 = scal[62];
+                unsigned int v_66 = scal[61];
                 total_18 = total_18 + v_66;
-                if (warp > 14) {
+                if (warp > 13) {
                     before_19 = before_19 + v_66;
                 }
-                unsigned int v_67 = scal[63];
+                unsigned int v_67 = scal[62];
                 total_18 = total_18 + v_67;
-                if (warp > 15) {
+                if (warp > 14) {
                     before_19 = before_19 + v_67;
+                }
+                unsigned int v_68 = scal[63];
+                total_18 = total_18 + v_68;
+                if (warp > 15) {
+                    before_19 = before_19 + v_68;
                 }
                 unsigned long long ebase = out_base + (unsigned long long)(total_18 + before_18);
                 unsigned int lt_mask_2_1 = (1 << (unsigned int)lane) - 1;
@@ -15960,26 +15957,26 @@ kernel_cake_radix_topk_c2_e16s_lp_nt(float* __restrict__ probs, int* __restrict_
             for (int p = 0; p < 3; p++) {
                 unsigned int shift_2 = ((p == 0) ? 21 : ((p == 1) ? 10 : 0));
                 unsigned int nbits_2 = ((p == 2) ? 10 : 11);
-                for (int c_28 = 0; c_28 < nsub; c_28++) {
-                    int i2_96 = start + c_28 * 2048 + tid;
+                for (int c_29 = 0; c_29 < nsub; c_29++) {
+                    int i2_96 = start + c_29 * 2048 + tid;
                     if (i2_96 < vocab) {
                         vals_t[0] = probs[row_base + (unsigned long long)i2_96];
                     } else {
                         vals_t[0] = 0.0f;
                     }
-                    int i2_97 = start + c_28 * 2048 + 512 + tid;
+                    int i2_97 = start + c_29 * 2048 + 512 + tid;
                     if (i2_97 < vocab) {
                         vals_t[1] = probs[row_base + (unsigned long long)i2_97];
                     } else {
                         vals_t[1] = 0.0f;
                     }
-                    int i2_98 = start + c_28 * 2048 + 1024 + tid;
+                    int i2_98 = start + c_29 * 2048 + 1024 + tid;
                     if (i2_98 < vocab) {
                         vals_t[2] = probs[row_base + (unsigned long long)i2_98];
                     } else {
                         vals_t[2] = 0.0f;
                     }
-                    int i2_99 = start + c_28 * 2048 + 1536 + tid;
+                    int i2_99 = start + c_29 * 2048 + 1536 + tid;
                     if (i2_99 < vocab) {
                         vals_t[3] = probs[row_base + (unsigned long long)i2_99];
                     } else {
@@ -16276,26 +16273,26 @@ kernel_cake_radix_topk_c2_e16s_lp_nt(float* __restrict__ probs, int* __restrict_
             unsigned int take_rem = ((eq_prefix < remaining) ? _min_87 : 0);
             unsigned long long gt_run = out_base + (unsigned long long)gt_prefix;
             unsigned long long eq_run = out_base + (unsigned long long)(gt_total + eq_prefix);
-            for (int c_29 = 0; c_29 < nsub; c_29++) {
-                int i2_100 = start + c_29 * 2048 + tid;
+            for (int c_30 = 0; c_30 < nsub; c_30++) {
+                int i2_100 = start + c_30 * 2048 + tid;
                 if (i2_100 < vocab) {
                     vals_t[0] = probs[row_base + (unsigned long long)i2_100];
                 } else {
                     vals_t[0] = 0.0f;
                 }
-                int i2_101 = start + c_29 * 2048 + 512 + tid;
+                int i2_101 = start + c_30 * 2048 + 512 + tid;
                 if (i2_101 < vocab) {
                     vals_t[1] = probs[row_base + (unsigned long long)i2_101];
                 } else {
                     vals_t[1] = 0.0f;
                 }
-                int i2_102 = start + c_29 * 2048 + 1024 + tid;
+                int i2_102 = start + c_30 * 2048 + 1024 + tid;
                 if (i2_102 < vocab) {
                     vals_t[2] = probs[row_base + (unsigned long long)i2_102];
                 } else {
                     vals_t[2] = 0.0f;
                 }
-                int i2_103 = start + c_29 * 2048 + 1536 + tid;
+                int i2_103 = start + c_30 * 2048 + 1536 + tid;
                 if (i2_103 < vocab) {
                     vals_t[3] = probs[row_base + (unsigned long long)i2_103];
                 } else {
@@ -16304,8 +16301,8 @@ kernel_cake_radix_topk_c2_e16s_lp_nt(float* __restrict__ probs, int* __restrict_
                 unsigned int gt = 0;
                 unsigned int bits_75 = __as_u32(vals_t[0]);
                 unsigned int key_78 = ((bits_75 <= 2139095040) ? bits_75 : 0);
-                int i_vec = start + c_29 * 2048 + tid * 4;
-                int i_str = start + c_29 * 2048 + tid;
+                int i_vec = start + c_30 * 2048 + tid * 4;
+                int i_str = start + c_30 * 2048 + tid;
                 int i = i_str;
                 int i_2_0 = i;
                 bool tie_1_0 = key_78 == threshold_t && i_2_0 < vocab;
@@ -16318,8 +16315,8 @@ kernel_cake_radix_topk_c2_e16s_lp_nt(float* __restrict__ probs, int* __restrict_
                 }
                 unsigned int bits_75_1 = __as_u32(vals_t[1]);
                 unsigned int key_75_1 = ((bits_75_1 <= 2139095040) ? bits_75_1 : 0);
-                int i_vec_0 = start + c_29 * 2048 + tid * 4 + 1;
-                int i_str_0 = start + c_29 * 2048 + 512 + tid;
+                int i_vec_0 = start + c_30 * 2048 + tid * 4 + 1;
+                int i_str_0 = start + c_30 * 2048 + 512 + tid;
                 int i_32 = i_str_0;
                 int i_2_1 = i_32;
                 bool tie_1_1 = key_75_1 == threshold_t && i_2_1 < vocab;
@@ -16332,8 +16329,8 @@ kernel_cake_radix_topk_c2_e16s_lp_nt(float* __restrict__ probs, int* __restrict_
                 }
                 unsigned int bits_76 = __as_u32(vals_t[2]);
                 unsigned int key_76_1 = ((bits_76 <= 2139095040) ? bits_76 : 0);
-                int i_vec_1 = start + c_29 * 2048 + tid * 4 + 2;
-                int i_str_1 = start + c_29 * 2048 + 1024 + tid;
+                int i_vec_1 = start + c_30 * 2048 + tid * 4 + 2;
+                int i_str_1 = start + c_30 * 2048 + 1024 + tid;
                 int i_33 = i_str_1;
                 int i_2_2 = i_33;
                 bool tie_1_2 = key_76_1 == threshold_t && i_2_2 < vocab;
@@ -16346,8 +16343,8 @@ kernel_cake_radix_topk_c2_e16s_lp_nt(float* __restrict__ probs, int* __restrict_
                 }
                 unsigned int bits_77 = __as_u32(vals_t[3]);
                 unsigned int key_77_1 = ((bits_77 <= 2139095040) ? bits_77 : 0);
-                int i_vec_2 = start + c_29 * 2048 + tid * 4 + 3;
-                int i_str_2 = start + c_29 * 2048 + 1536 + tid;
+                int i_vec_2 = start + c_30 * 2048 + tid * 4 + 3;
+                int i_str_2 = start + c_30 * 2048 + 1536 + tid;
                 int i_34 = i_str_2;
                 int i_2_3 = i_34;
                 bool tie_1_3 = key_77_1 == threshold_t && i_2_3 < vocab;
@@ -16463,9 +16460,9 @@ kernel_cake_radix_topk_c2_e16s_lp_nt(float* __restrict__ probs, int* __restrict_
                 unsigned int running = excl_1 >> 12;
                 int f2 = tid;
                 if (f2 < 64) {
-                    unsigned int c_0_1 = cnt[f2];
+                    unsigned int c_0 = cnt[f2];
                     cnt[f2] = running;
-                    running = running + c_0_1;
+                    running = running + c_0;
                 }
                 __syncthreads();
                 unsigned int gt_slot = excl_1 & 4095;
@@ -16483,8 +16480,8 @@ kernel_cake_radix_topk_c2_e16s_lp_nt(float* __restrict__ probs, int* __restrict_
                 unsigned int bits_78 = __as_u32(vals_t[0]);
                 unsigned int key_78_1 = ((bits_78 <= 2139095040) ? bits_78 : 0);
                 keys[0] = key_78_1;
-                int i_vec_3 = start + c_29 * 2048 + tid * 4;
-                int i_str_3 = start + c_29 * 2048 + tid;
+                int i_vec_3 = start + c_30 * 2048 + tid * 4;
+                int i_str_3 = start + c_30 * 2048 + tid;
                 int i_35 = i_str_3;
                 idxs[0] = i_35;
                 ties[0] = keys[0] == threshold_t && idxs[0] < vocab;
@@ -16497,8 +16494,8 @@ kernel_cake_radix_topk_c2_e16s_lp_nt(float* __restrict__ probs, int* __restrict_
                 unsigned int bits_79 = __as_u32(vals_t[1]);
                 unsigned int key_79 = ((bits_79 <= 2139095040) ? bits_79 : 0);
                 keys[1] = key_79;
-                int i_vec_4 = start + c_29 * 2048 + tid * 4 + 1;
-                int i_str_4 = start + c_29 * 2048 + 512 + tid;
+                int i_vec_4 = start + c_30 * 2048 + tid * 4 + 1;
+                int i_str_4 = start + c_30 * 2048 + 512 + tid;
                 int i_36 = i_str_4;
                 idxs[1] = i_36;
                 ties[1] = keys[1] == threshold_t && idxs[1] < vocab;
@@ -16511,8 +16508,8 @@ kernel_cake_radix_topk_c2_e16s_lp_nt(float* __restrict__ probs, int* __restrict_
                 unsigned int bits_80 = __as_u32(vals_t[2]);
                 unsigned int key_80 = ((bits_80 <= 2139095040) ? bits_80 : 0);
                 keys[2] = key_80;
-                int i_vec_5 = start + c_29 * 2048 + tid * 4 + 2;
-                int i_str_5 = start + c_29 * 2048 + 1024 + tid;
+                int i_vec_5 = start + c_30 * 2048 + tid * 4 + 2;
+                int i_str_5 = start + c_30 * 2048 + 1024 + tid;
                 int i_37 = i_str_5;
                 idxs[2] = i_37;
                 ties[2] = keys[2] == threshold_t && idxs[2] < vocab;
@@ -16525,8 +16522,8 @@ kernel_cake_radix_topk_c2_e16s_lp_nt(float* __restrict__ probs, int* __restrict_
                 unsigned int bits_81 = __as_u32(vals_t[3]);
                 unsigned int key_81 = ((bits_81 <= 2139095040) ? bits_81 : 0);
                 keys[3] = key_81;
-                int i_vec_6 = start + c_29 * 2048 + tid * 4 + 3;
-                int i_str_6 = start + c_29 * 2048 + 1536 + tid;
+                int i_vec_6 = start + c_30 * 2048 + tid * 4 + 3;
+                int i_str_6 = start + c_30 * 2048 + 1536 + tid;
                 int i_38 = i_str_6;
                 idxs[3] = i_38;
                 ties[3] = keys[3] == threshold_t && idxs[3] < vocab;
@@ -16616,7 +16613,6 @@ kernel_cake_radix_topk_c2_e16s_lp_nt(float* __restrict__ probs, int* __restrict_
 } // extern "C"
 
 #undef CAKE_INF
-#undef NUM_MAIN_STAGES
 #undef SMEM_CLIST_OFF
 #undef SMEM_CLIST_STAGE_BYTES
 #undef SMEM_CLIST_STRIDE
@@ -16705,7 +16701,6 @@ kernel_cake_radix_topk_c2_e16s_lp_nt(float* __restrict__ probs, int* __restrict_
 #undef xbuf64_addr
 
 #define CAKE_INF CUDART_INF_F
-#define NUM_MAIN_STAGES 1
 #define SMEM_HIST0_OFF 0
 #define SMEM_HIST0_STAGE_BYTES 8192
 #define SMEM_HIST0_STRIDE 8192
@@ -17044,32 +17039,32 @@ kernel_cake_radix_topk_c4_e16s_lp_nt(float* __restrict__ probs, int* __restrict_
         for (int c_1 = 0; c_1 < nchunks; c_1++) {
             int i_4 = start + c_1 * 8192 + tid * 4;
             if (i_4 < vocab) {
-                float v_0 = probs[row_base + (unsigned long long)i_4];
-                unsigned int bits_12 = __as_u32(v_0);
+                float v_1 = probs[row_base + (unsigned long long)i_4];
+                unsigned int bits_12 = __as_u32(v_1);
                 unsigned int key_12 = ((bits_12 <= 2139095040) ? bits_12 : 0);
                 unsigned int bucket_16 = key_12 >> 21;
                 atomicAdd(&hist0[bucket_16], 1);
             }
             int i_5 = start + c_1 * 8192 + (512 + tid) * 4;
             if (i_5 < vocab) {
-                float v_1 = probs[row_base + (unsigned long long)i_5];
-                unsigned int bits_13 = __as_u32(v_1);
+                float v_2 = probs[row_base + (unsigned long long)i_5];
+                unsigned int bits_13 = __as_u32(v_2);
                 unsigned int key_13 = ((bits_13 <= 2139095040) ? bits_13 : 0);
                 unsigned int bucket_17 = key_13 >> 21;
                 atomicAdd(&hist0[bucket_17], 1);
             }
             int i_6 = start + c_1 * 8192 + (1024 + tid) * 4;
             if (i_6 < vocab) {
-                float v_2 = probs[row_base + (unsigned long long)i_6];
-                unsigned int bits_14 = __as_u32(v_2);
+                float v_3 = probs[row_base + (unsigned long long)i_6];
+                unsigned int bits_14 = __as_u32(v_3);
                 unsigned int key_14 = ((bits_14 <= 2139095040) ? bits_14 : 0);
                 unsigned int bucket_18 = key_14 >> 21;
                 atomicAdd(&hist0[bucket_18], 1);
             }
             int i_7 = start + c_1 * 8192 + (1536 + tid) * 4;
             if (i_7 < vocab) {
-                float v_3 = probs[row_base + (unsigned long long)i_7];
-                unsigned int bits_15 = __as_u32(v_3);
+                float v_4 = probs[row_base + (unsigned long long)i_7];
+                unsigned int bits_15 = __as_u32(v_4);
                 unsigned int key_15 = ((bits_15 <= 2139095040) ? bits_15 : 0);
                 unsigned int bucket_19 = key_15 >> 21;
                 atomicAdd(&hist0[bucket_19], 1);
@@ -20110,85 +20105,85 @@ kernel_cake_radix_topk_c4_e16s_lp_nt(float* __restrict__ probs, int* __restrict_
     __syncthreads();
     unsigned int before = 0;
     unsigned int total = 0;
-    unsigned int v_4 = scal[16];
-    total = total + v_4;
-    if (warp > 0) {
-        before = before + v_4;
-    }
-    unsigned int v_5 = scal[17];
+    unsigned int v_5 = scal[16];
     total = total + v_5;
-    if (warp > 1) {
+    if (warp > 0) {
         before = before + v_5;
     }
-    unsigned int v_6 = scal[18];
+    unsigned int v_6 = scal[17];
     total = total + v_6;
-    if (warp > 2) {
+    if (warp > 1) {
         before = before + v_6;
     }
-    unsigned int v_7 = scal[19];
+    unsigned int v_7 = scal[18];
     total = total + v_7;
-    if (warp > 3) {
+    if (warp > 2) {
         before = before + v_7;
     }
-    unsigned int v_8 = scal[20];
+    unsigned int v_8 = scal[19];
     total = total + v_8;
-    if (warp > 4) {
+    if (warp > 3) {
         before = before + v_8;
     }
-    unsigned int v_9 = scal[21];
+    unsigned int v_9 = scal[20];
     total = total + v_9;
-    if (warp > 5) {
+    if (warp > 4) {
         before = before + v_9;
     }
-    unsigned int v_10 = scal[22];
+    unsigned int v_10 = scal[21];
     total = total + v_10;
-    if (warp > 6) {
+    if (warp > 5) {
         before = before + v_10;
     }
-    unsigned int v_11 = scal[23];
+    unsigned int v_11 = scal[22];
     total = total + v_11;
-    if (warp > 7) {
+    if (warp > 6) {
         before = before + v_11;
     }
-    unsigned int v_12 = scal[24];
+    unsigned int v_12 = scal[23];
     total = total + v_12;
-    if (warp > 8) {
+    if (warp > 7) {
         before = before + v_12;
     }
-    unsigned int v_13 = scal[25];
+    unsigned int v_13 = scal[24];
     total = total + v_13;
-    if (warp > 9) {
+    if (warp > 8) {
         before = before + v_13;
     }
-    unsigned int v_14 = scal[26];
+    unsigned int v_14 = scal[25];
     total = total + v_14;
-    if (warp > 10) {
+    if (warp > 9) {
         before = before + v_14;
     }
-    unsigned int v_15 = scal[27];
+    unsigned int v_15 = scal[26];
     total = total + v_15;
-    if (warp > 11) {
+    if (warp > 10) {
         before = before + v_15;
     }
-    unsigned int v_16 = scal[28];
+    unsigned int v_16 = scal[27];
     total = total + v_16;
-    if (warp > 12) {
+    if (warp > 11) {
         before = before + v_16;
     }
-    unsigned int v_17 = scal[29];
+    unsigned int v_17 = scal[28];
     total = total + v_17;
-    if (warp > 13) {
+    if (warp > 12) {
         before = before + v_17;
     }
-    unsigned int v_18 = scal[30];
+    unsigned int v_18 = scal[29];
     total = total + v_18;
-    if (warp > 14) {
+    if (warp > 13) {
         before = before + v_18;
     }
-    unsigned int v_19 = scal[31];
+    unsigned int v_19 = scal[30];
     total = total + v_19;
-    if (warp > 15) {
+    if (warp > 14) {
         before = before + v_19;
+    }
+    unsigned int v_20 = scal[31];
+    total = total + v_20;
+    if (warp > 15) {
+        before = before + v_20;
     }
     unsigned int ovf_w = __ballot_sync(0xFFFFFFFF, n_wu > 1024);
     if (tid == 0) {
@@ -20404,24 +20399,24 @@ kernel_cake_radix_topk_c4_e16s_lp_nt(float* __restrict__ probs, int* __restrict_
                 }
                 acc_1_3 = acc_1_3 + lens[3];
             }
-            unsigned long long c_0 = comps_l[0];
-            if (c_0 < 9214364837600034816) {
-                unsigned int bucket_20 = (unsigned int)(c_0 >> 53);
+            unsigned long long c_1_1 = comps_l[0];
+            if (c_1_1 < 9214364837600034816) {
+                unsigned int bucket_20 = (unsigned int)(c_1_1 >> 53);
                 atomicAdd(&hist1[bucket_20], 1);
             }
-            unsigned long long c_1_1 = comps_l[1];
-            if (c_1_1 < 9214364837600034816) {
-                unsigned int bucket_21 = (unsigned int)(c_1_1 >> 53);
+            unsigned long long c_2_1 = comps_l[1];
+            if (c_2_1 < 9214364837600034816) {
+                unsigned int bucket_21 = (unsigned int)(c_2_1 >> 53);
                 atomicAdd(&hist1[bucket_21], 1);
             }
-            unsigned long long c_2_1 = comps_l[2];
-            if (c_2_1 < 9214364837600034816) {
-                unsigned int bucket_22 = (unsigned int)(c_2_1 >> 53);
+            unsigned long long c_3_1 = comps_l[2];
+            if (c_3_1 < 9214364837600034816) {
+                unsigned int bucket_22 = (unsigned int)(c_3_1 >> 53);
                 atomicAdd(&hist1[bucket_22], 1);
             }
-            unsigned long long c_3_1 = comps_l[3];
-            if (c_3_1 < 9214364837600034816) {
-                unsigned int bucket_23 = (unsigned int)(c_3_1 >> 53);
+            unsigned long long c_4 = comps_l[3];
+            if (c_4 < 9214364837600034816) {
+                unsigned int bucket_23 = (unsigned int)(c_4 >> 53);
                 atomicAdd(&hist1[bucket_23], 1);
             }
             hist0[tid] = 0;
@@ -20501,24 +20496,24 @@ kernel_cake_radix_topk_c4_e16s_lp_nt(float* __restrict__ probs, int* __restrict_
                 done = 1;
             }
             if (done == 0) {
-                unsigned long long c_4 = comps_l[0];
-                unsigned int bucket_25 = (unsigned int)(c_4 >> 42 & 2047);
-                if (c_4 >> 53 == (unsigned long long)bucket_24) {
+                unsigned long long c_5 = comps_l[0];
+                unsigned int bucket_25 = (unsigned int)(c_5 >> 42 & 2047);
+                if (c_5 >> 53 == (unsigned long long)bucket_24) {
                     atomicAdd(&hist0[bucket_25], 1);
                 }
-                unsigned long long c_5 = comps_l[1];
-                unsigned int bucket_26 = (unsigned int)(c_5 >> 42 & 2047);
-                if (c_5 >> 53 == (unsigned long long)bucket_24) {
+                unsigned long long c_6 = comps_l[1];
+                unsigned int bucket_26 = (unsigned int)(c_6 >> 42 & 2047);
+                if (c_6 >> 53 == (unsigned long long)bucket_24) {
                     atomicAdd(&hist0[bucket_26], 1);
                 }
-                unsigned long long c_6 = comps_l[2];
-                unsigned int bucket_27 = (unsigned int)(c_6 >> 42 & 2047);
-                if (c_6 >> 53 == (unsigned long long)bucket_24) {
+                unsigned long long c_7 = comps_l[2];
+                unsigned int bucket_27 = (unsigned int)(c_7 >> 42 & 2047);
+                if (c_7 >> 53 == (unsigned long long)bucket_24) {
                     atomicAdd(&hist0[bucket_27], 1);
                 }
-                unsigned long long c_7 = comps_l[3];
-                unsigned int bucket_28 = (unsigned int)(c_7 >> 42 & 2047);
-                if (c_7 >> 53 == (unsigned long long)bucket_24) {
+                unsigned long long c_8 = comps_l[3];
+                unsigned int bucket_28 = (unsigned int)(c_8 >> 42 & 2047);
+                if (c_8 >> 53 == (unsigned long long)bucket_24) {
                     atomicAdd(&hist0[bucket_28], 1);
                 }
                 hist1[tid] = 0;
@@ -20597,24 +20592,24 @@ kernel_cake_radix_topk_c4_e16s_lp_nt(float* __restrict__ probs, int* __restrict_
                     done = 1;
                 }
                 if (done == 0) {
-                    unsigned long long c_8 = comps_l[0];
-                    unsigned int bucket_31 = (unsigned int)(c_8 >> 32 & 1023);
-                    if (c_8 >> 42 == prefix1) {
+                    unsigned long long c_9 = comps_l[0];
+                    unsigned int bucket_31 = (unsigned int)(c_9 >> 32 & 1023);
+                    if (c_9 >> 42 == prefix1) {
                         atomicAdd(&hist1[bucket_31], 1);
                     }
-                    unsigned long long c_9 = comps_l[1];
-                    unsigned int bucket_32 = (unsigned int)(c_9 >> 32 & 1023);
-                    if (c_9 >> 42 == prefix1) {
+                    unsigned long long c_10 = comps_l[1];
+                    unsigned int bucket_32 = (unsigned int)(c_10 >> 32 & 1023);
+                    if (c_10 >> 42 == prefix1) {
                         atomicAdd(&hist1[bucket_32], 1);
                     }
-                    unsigned long long c_10 = comps_l[2];
-                    unsigned int bucket_33 = (unsigned int)(c_10 >> 32 & 1023);
-                    if (c_10 >> 42 == prefix1) {
+                    unsigned long long c_11 = comps_l[2];
+                    unsigned int bucket_33 = (unsigned int)(c_11 >> 32 & 1023);
+                    if (c_11 >> 42 == prefix1) {
                         atomicAdd(&hist1[bucket_33], 1);
                     }
-                    unsigned long long c_11 = comps_l[3];
-                    unsigned int bucket_34 = (unsigned int)(c_11 >> 32 & 1023);
-                    if (c_11 >> 42 == prefix1) {
+                    unsigned long long c_12 = comps_l[3];
+                    unsigned int bucket_34 = (unsigned int)(c_12 >> 32 & 1023);
+                    if (c_12 >> 42 == prefix1) {
                         atomicAdd(&hist1[bucket_34], 1);
                     }
                     hist0[tid] = 0;
@@ -20701,24 +20696,24 @@ kernel_cake_radix_topk_c4_e16s_lp_nt(float* __restrict__ probs, int* __restrict_
                             unsigned long long mask = (1 << (unsigned long long)nbits) - 1;
                             unsigned long long sh = (unsigned long long)shift;
                             unsigned long long hi = (unsigned long long)(shift + nbits);
-                            unsigned long long c_12 = comps_l[0];
-                            unsigned int bucket_37 = (unsigned int)(c_12 >> sh & mask);
-                            if (c_12 >> hi == tpre) {
+                            unsigned long long c_13 = comps_l[0];
+                            unsigned int bucket_37 = (unsigned int)(c_13 >> sh & mask);
+                            if (c_13 >> hi == tpre) {
                                 atomicAdd(&hist0[bucket_37], 1);
                             }
-                            unsigned long long c_13 = comps_l[1];
-                            unsigned int bucket_38 = (unsigned int)(c_13 >> sh & mask);
-                            if (c_13 >> hi == tpre) {
+                            unsigned long long c_14 = comps_l[1];
+                            unsigned int bucket_38 = (unsigned int)(c_14 >> sh & mask);
+                            if (c_14 >> hi == tpre) {
                                 atomicAdd(&hist0[bucket_38], 1);
                             }
-                            unsigned long long c_14 = comps_l[2];
-                            unsigned int bucket_39 = (unsigned int)(c_14 >> sh & mask);
-                            if (c_14 >> hi == tpre) {
+                            unsigned long long c_15 = comps_l[2];
+                            unsigned int bucket_39 = (unsigned int)(c_15 >> sh & mask);
+                            if (c_15 >> hi == tpre) {
                                 atomicAdd(&hist0[bucket_39], 1);
                             }
-                            unsigned long long c_15 = comps_l[3];
-                            unsigned int bucket_40 = (unsigned int)(c_15 >> sh & mask);
-                            if (c_15 >> hi == tpre) {
+                            unsigned long long c_16 = comps_l[3];
+                            unsigned int bucket_40 = (unsigned int)(c_16 >> sh & mask);
+                            if (c_16 >> hi == tpre) {
                                 atomicAdd(&hist0[bucket_40], 1);
                             }
                             __syncthreads();
@@ -21422,85 +21417,85 @@ kernel_cake_radix_topk_c4_e16s_lp_nt(float* __restrict__ probs, int* __restrict_
                 __syncthreads();
                 unsigned int before_17 = 0;
                 unsigned int total_16 = 0;
-                unsigned int v_20 = scal[16];
-                total_16 = total_16 + v_20;
-                if (warp > 0) {
-                    before_17 = before_17 + v_20;
-                }
-                unsigned int v_21 = scal[17];
+                unsigned int v_21 = scal[16];
                 total_16 = total_16 + v_21;
-                if (warp > 1) {
+                if (warp > 0) {
                     before_17 = before_17 + v_21;
                 }
-                unsigned int v_22 = scal[18];
+                unsigned int v_22 = scal[17];
                 total_16 = total_16 + v_22;
-                if (warp > 2) {
+                if (warp > 1) {
                     before_17 = before_17 + v_22;
                 }
-                unsigned int v_23 = scal[19];
+                unsigned int v_23 = scal[18];
                 total_16 = total_16 + v_23;
-                if (warp > 3) {
+                if (warp > 2) {
                     before_17 = before_17 + v_23;
                 }
-                unsigned int v_24 = scal[20];
+                unsigned int v_24 = scal[19];
                 total_16 = total_16 + v_24;
-                if (warp > 4) {
+                if (warp > 3) {
                     before_17 = before_17 + v_24;
                 }
-                unsigned int v_25 = scal[21];
+                unsigned int v_25 = scal[20];
                 total_16 = total_16 + v_25;
-                if (warp > 5) {
+                if (warp > 4) {
                     before_17 = before_17 + v_25;
                 }
-                unsigned int v_26 = scal[22];
+                unsigned int v_26 = scal[21];
                 total_16 = total_16 + v_26;
-                if (warp > 6) {
+                if (warp > 5) {
                     before_17 = before_17 + v_26;
                 }
-                unsigned int v_27 = scal[23];
+                unsigned int v_27 = scal[22];
                 total_16 = total_16 + v_27;
-                if (warp > 7) {
+                if (warp > 6) {
                     before_17 = before_17 + v_27;
                 }
-                unsigned int v_28 = scal[24];
+                unsigned int v_28 = scal[23];
                 total_16 = total_16 + v_28;
-                if (warp > 8) {
+                if (warp > 7) {
                     before_17 = before_17 + v_28;
                 }
-                unsigned int v_29 = scal[25];
+                unsigned int v_29 = scal[24];
                 total_16 = total_16 + v_29;
-                if (warp > 9) {
+                if (warp > 8) {
                     before_17 = before_17 + v_29;
                 }
-                unsigned int v_30 = scal[26];
+                unsigned int v_30 = scal[25];
                 total_16 = total_16 + v_30;
-                if (warp > 10) {
+                if (warp > 9) {
                     before_17 = before_17 + v_30;
                 }
-                unsigned int v_31 = scal[27];
+                unsigned int v_31 = scal[26];
                 total_16 = total_16 + v_31;
-                if (warp > 11) {
+                if (warp > 10) {
                     before_17 = before_17 + v_31;
                 }
-                unsigned int v_32 = scal[28];
+                unsigned int v_32 = scal[27];
                 total_16 = total_16 + v_32;
-                if (warp > 12) {
+                if (warp > 11) {
                     before_17 = before_17 + v_32;
                 }
-                unsigned int v_33 = scal[29];
+                unsigned int v_33 = scal[28];
                 total_16 = total_16 + v_33;
-                if (warp > 13) {
+                if (warp > 12) {
                     before_17 = before_17 + v_33;
                 }
-                unsigned int v_34 = scal[30];
+                unsigned int v_34 = scal[29];
                 total_16 = total_16 + v_34;
-                if (warp > 14) {
+                if (warp > 13) {
                     before_17 = before_17 + v_34;
                 }
-                unsigned int v_35 = scal[31];
+                unsigned int v_35 = scal[30];
                 total_16 = total_16 + v_35;
-                if (warp > 15) {
+                if (warp > 14) {
                     before_17 = before_17 + v_35;
+                }
+                unsigned int v_36 = scal[31];
+                total_16 = total_16 + v_36;
+                if (warp > 15) {
+                    before_17 = before_17 + v_36;
                 }
                 unsigned int lt_mask_3 = (1 << (unsigned int)lane) - 1;
                 unsigned int pos = before_17;
@@ -21797,24 +21792,24 @@ kernel_cake_radix_topk_c4_e16s_lp_nt(float* __restrict__ probs, int* __restrict_
                     done_1 = 1;
                 }
                 if (done_1 == 0) {
-                    unsigned long long c_16 = comps2[0];
-                    unsigned int bucket_42_1 = (unsigned int)(c_16 >> 42 & 2047);
-                    if (c_16 >> 53 == (unsigned long long)bucket_sel_1) {
+                    unsigned long long c_17 = comps2[0];
+                    unsigned int bucket_42_1 = (unsigned int)(c_17 >> 42 & 2047);
+                    if (c_17 >> 53 == (unsigned long long)bucket_sel_1) {
                         atomicAdd(&hist0[bucket_42_1], 1);
                     }
-                    unsigned long long c_17 = comps2[1];
-                    unsigned int bucket_43_1 = (unsigned int)(c_17 >> 42 & 2047);
-                    if (c_17 >> 53 == (unsigned long long)bucket_sel_1) {
+                    unsigned long long c_18 = comps2[1];
+                    unsigned int bucket_43_1 = (unsigned int)(c_18 >> 42 & 2047);
+                    if (c_18 >> 53 == (unsigned long long)bucket_sel_1) {
                         atomicAdd(&hist0[bucket_43_1], 1);
                     }
-                    unsigned long long c_18 = comps2[2];
-                    unsigned int bucket_44 = (unsigned int)(c_18 >> 42 & 2047);
-                    if (c_18 >> 53 == (unsigned long long)bucket_sel_1) {
+                    unsigned long long c_19 = comps2[2];
+                    unsigned int bucket_44 = (unsigned int)(c_19 >> 42 & 2047);
+                    if (c_19 >> 53 == (unsigned long long)bucket_sel_1) {
                         atomicAdd(&hist0[bucket_44], 1);
                     }
-                    unsigned long long c_19 = comps2[3];
-                    unsigned int bucket_45 = (unsigned int)(c_19 >> 42 & 2047);
-                    if (c_19 >> 53 == (unsigned long long)bucket_sel_1) {
+                    unsigned long long c_20 = comps2[3];
+                    unsigned int bucket_45 = (unsigned int)(c_20 >> 42 & 2047);
+                    if (c_20 >> 53 == (unsigned long long)bucket_sel_1) {
                         atomicAdd(&hist0[bucket_45], 1);
                     }
                     hist1[tid] = 0;
@@ -21893,24 +21888,24 @@ kernel_cake_radix_topk_c4_e16s_lp_nt(float* __restrict__ probs, int* __restrict_
                         done_1 = 1;
                     }
                     if (done_1 == 0) {
-                        unsigned long long c_20 = comps2[0];
-                        unsigned int bucket_48 = (unsigned int)(c_20 >> 32 & 1023);
-                        if (c_20 >> 42 == prefix1_1) {
+                        unsigned long long c_21 = comps2[0];
+                        unsigned int bucket_48 = (unsigned int)(c_21 >> 32 & 1023);
+                        if (c_21 >> 42 == prefix1_1) {
                             atomicAdd(&hist1[bucket_48], 1);
                         }
-                        unsigned long long c_21 = comps2[1];
-                        unsigned int bucket_49 = (unsigned int)(c_21 >> 32 & 1023);
-                        if (c_21 >> 42 == prefix1_1) {
+                        unsigned long long c_22 = comps2[1];
+                        unsigned int bucket_49 = (unsigned int)(c_22 >> 32 & 1023);
+                        if (c_22 >> 42 == prefix1_1) {
                             atomicAdd(&hist1[bucket_49], 1);
                         }
-                        unsigned long long c_22 = comps2[2];
-                        unsigned int bucket_50 = (unsigned int)(c_22 >> 32 & 1023);
-                        if (c_22 >> 42 == prefix1_1) {
+                        unsigned long long c_23 = comps2[2];
+                        unsigned int bucket_50 = (unsigned int)(c_23 >> 32 & 1023);
+                        if (c_23 >> 42 == prefix1_1) {
                             atomicAdd(&hist1[bucket_50], 1);
                         }
-                        unsigned long long c_23 = comps2[3];
-                        unsigned int bucket_51 = (unsigned int)(c_23 >> 32 & 1023);
-                        if (c_23 >> 42 == prefix1_1) {
+                        unsigned long long c_24 = comps2[3];
+                        unsigned int bucket_51 = (unsigned int)(c_24 >> 32 & 1023);
+                        if (c_24 >> 42 == prefix1_1) {
                             atomicAdd(&hist1[bucket_51], 1);
                         }
                         hist0[tid] = 0;
@@ -21997,24 +21992,24 @@ kernel_cake_radix_topk_c4_e16s_lp_nt(float* __restrict__ probs, int* __restrict_
                                 unsigned long long mask_1 = (1 << (unsigned long long)nbits_1) - 1;
                                 unsigned long long sh_1 = (unsigned long long)shift_1;
                                 unsigned long long hi_1 = (unsigned long long)(shift_1 + nbits_1);
-                                unsigned long long c_24 = comps2[0];
-                                unsigned int bucket_54 = (unsigned int)(c_24 >> sh_1 & mask_1);
-                                if (c_24 >> hi_1 == tpre_1) {
+                                unsigned long long c_25 = comps2[0];
+                                unsigned int bucket_54 = (unsigned int)(c_25 >> sh_1 & mask_1);
+                                if (c_25 >> hi_1 == tpre_1) {
                                     atomicAdd(&hist0[bucket_54], 1);
                                 }
-                                unsigned long long c_25 = comps2[1];
-                                unsigned int bucket_55 = (unsigned int)(c_25 >> sh_1 & mask_1);
-                                if (c_25 >> hi_1 == tpre_1) {
+                                unsigned long long c_26 = comps2[1];
+                                unsigned int bucket_55 = (unsigned int)(c_26 >> sh_1 & mask_1);
+                                if (c_26 >> hi_1 == tpre_1) {
                                     atomicAdd(&hist0[bucket_55], 1);
                                 }
-                                unsigned long long c_26 = comps2[2];
-                                unsigned int bucket_56 = (unsigned int)(c_26 >> sh_1 & mask_1);
-                                if (c_26 >> hi_1 == tpre_1) {
+                                unsigned long long c_27 = comps2[2];
+                                unsigned int bucket_56 = (unsigned int)(c_27 >> sh_1 & mask_1);
+                                if (c_27 >> hi_1 == tpre_1) {
                                     atomicAdd(&hist0[bucket_56], 1);
                                 }
-                                unsigned long long c_27 = comps2[3];
-                                unsigned int bucket_57 = (unsigned int)(c_27 >> sh_1 & mask_1);
-                                if (c_27 >> hi_1 == tpre_1) {
+                                unsigned long long c_28 = comps2[3];
+                                unsigned int bucket_57 = (unsigned int)(c_28 >> sh_1 & mask_1);
+                                if (c_28 >> hi_1 == tpre_1) {
                                     atomicAdd(&hist0[bucket_57], 1);
                                 }
                                 __syncthreads();
@@ -22137,167 +22132,167 @@ kernel_cake_radix_topk_c4_e16s_lp_nt(float* __restrict__ probs, int* __restrict_
                 __syncthreads();
                 unsigned int before_18 = 0;
                 unsigned int total_17 = 0;
-                unsigned int v_36 = scal[32];
-                total_17 = total_17 + v_36;
-                if (warp > 0) {
-                    before_18 = before_18 + v_36;
-                }
-                unsigned int v_37 = scal[33];
+                unsigned int v_37 = scal[32];
                 total_17 = total_17 + v_37;
-                if (warp > 1) {
+                if (warp > 0) {
                     before_18 = before_18 + v_37;
                 }
-                unsigned int v_38 = scal[34];
+                unsigned int v_38 = scal[33];
                 total_17 = total_17 + v_38;
-                if (warp > 2) {
+                if (warp > 1) {
                     before_18 = before_18 + v_38;
                 }
-                unsigned int v_39 = scal[35];
+                unsigned int v_39 = scal[34];
                 total_17 = total_17 + v_39;
-                if (warp > 3) {
+                if (warp > 2) {
                     before_18 = before_18 + v_39;
                 }
-                unsigned int v_40 = scal[36];
+                unsigned int v_40 = scal[35];
                 total_17 = total_17 + v_40;
-                if (warp > 4) {
+                if (warp > 3) {
                     before_18 = before_18 + v_40;
                 }
-                unsigned int v_41 = scal[37];
+                unsigned int v_41 = scal[36];
                 total_17 = total_17 + v_41;
-                if (warp > 5) {
+                if (warp > 4) {
                     before_18 = before_18 + v_41;
                 }
-                unsigned int v_42 = scal[38];
+                unsigned int v_42 = scal[37];
                 total_17 = total_17 + v_42;
-                if (warp > 6) {
+                if (warp > 5) {
                     before_18 = before_18 + v_42;
                 }
-                unsigned int v_43 = scal[39];
+                unsigned int v_43 = scal[38];
                 total_17 = total_17 + v_43;
-                if (warp > 7) {
+                if (warp > 6) {
                     before_18 = before_18 + v_43;
                 }
-                unsigned int v_44 = scal[40];
+                unsigned int v_44 = scal[39];
                 total_17 = total_17 + v_44;
-                if (warp > 8) {
+                if (warp > 7) {
                     before_18 = before_18 + v_44;
                 }
-                unsigned int v_45 = scal[41];
+                unsigned int v_45 = scal[40];
                 total_17 = total_17 + v_45;
-                if (warp > 9) {
+                if (warp > 8) {
                     before_18 = before_18 + v_45;
                 }
-                unsigned int v_46 = scal[42];
+                unsigned int v_46 = scal[41];
                 total_17 = total_17 + v_46;
-                if (warp > 10) {
+                if (warp > 9) {
                     before_18 = before_18 + v_46;
                 }
-                unsigned int v_47 = scal[43];
+                unsigned int v_47 = scal[42];
                 total_17 = total_17 + v_47;
-                if (warp > 11) {
+                if (warp > 10) {
                     before_18 = before_18 + v_47;
                 }
-                unsigned int v_48 = scal[44];
+                unsigned int v_48 = scal[43];
                 total_17 = total_17 + v_48;
-                if (warp > 12) {
+                if (warp > 11) {
                     before_18 = before_18 + v_48;
                 }
-                unsigned int v_49 = scal[45];
+                unsigned int v_49 = scal[44];
                 total_17 = total_17 + v_49;
-                if (warp > 13) {
+                if (warp > 12) {
                     before_18 = before_18 + v_49;
                 }
-                unsigned int v_50 = scal[46];
+                unsigned int v_50 = scal[45];
                 total_17 = total_17 + v_50;
-                if (warp > 14) {
+                if (warp > 13) {
                     before_18 = before_18 + v_50;
                 }
-                unsigned int v_51 = scal[47];
+                unsigned int v_51 = scal[46];
                 total_17 = total_17 + v_51;
-                if (warp > 15) {
+                if (warp > 14) {
                     before_18 = before_18 + v_51;
+                }
+                unsigned int v_52 = scal[47];
+                total_17 = total_17 + v_52;
+                if (warp > 15) {
+                    before_18 = before_18 + v_52;
                 }
                 unsigned int before_19 = 0;
                 unsigned int total_18 = 0;
-                unsigned int v_52 = scal[48];
-                total_18 = total_18 + v_52;
-                if (warp > 0) {
-                    before_19 = before_19 + v_52;
-                }
-                unsigned int v_53 = scal[49];
+                unsigned int v_53 = scal[48];
                 total_18 = total_18 + v_53;
-                if (warp > 1) {
+                if (warp > 0) {
                     before_19 = before_19 + v_53;
                 }
-                unsigned int v_54 = scal[50];
+                unsigned int v_54 = scal[49];
                 total_18 = total_18 + v_54;
-                if (warp > 2) {
+                if (warp > 1) {
                     before_19 = before_19 + v_54;
                 }
-                unsigned int v_55 = scal[51];
+                unsigned int v_55 = scal[50];
                 total_18 = total_18 + v_55;
-                if (warp > 3) {
+                if (warp > 2) {
                     before_19 = before_19 + v_55;
                 }
-                unsigned int v_56 = scal[52];
+                unsigned int v_56 = scal[51];
                 total_18 = total_18 + v_56;
-                if (warp > 4) {
+                if (warp > 3) {
                     before_19 = before_19 + v_56;
                 }
-                unsigned int v_57 = scal[53];
+                unsigned int v_57 = scal[52];
                 total_18 = total_18 + v_57;
-                if (warp > 5) {
+                if (warp > 4) {
                     before_19 = before_19 + v_57;
                 }
-                unsigned int v_58 = scal[54];
+                unsigned int v_58 = scal[53];
                 total_18 = total_18 + v_58;
-                if (warp > 6) {
+                if (warp > 5) {
                     before_19 = before_19 + v_58;
                 }
-                unsigned int v_59 = scal[55];
+                unsigned int v_59 = scal[54];
                 total_18 = total_18 + v_59;
-                if (warp > 7) {
+                if (warp > 6) {
                     before_19 = before_19 + v_59;
                 }
-                unsigned int v_60 = scal[56];
+                unsigned int v_60 = scal[55];
                 total_18 = total_18 + v_60;
-                if (warp > 8) {
+                if (warp > 7) {
                     before_19 = before_19 + v_60;
                 }
-                unsigned int v_61 = scal[57];
+                unsigned int v_61 = scal[56];
                 total_18 = total_18 + v_61;
-                if (warp > 9) {
+                if (warp > 8) {
                     before_19 = before_19 + v_61;
                 }
-                unsigned int v_62 = scal[58];
+                unsigned int v_62 = scal[57];
                 total_18 = total_18 + v_62;
-                if (warp > 10) {
+                if (warp > 9) {
                     before_19 = before_19 + v_62;
                 }
-                unsigned int v_63 = scal[59];
+                unsigned int v_63 = scal[58];
                 total_18 = total_18 + v_63;
-                if (warp > 11) {
+                if (warp > 10) {
                     before_19 = before_19 + v_63;
                 }
-                unsigned int v_64 = scal[60];
+                unsigned int v_64 = scal[59];
                 total_18 = total_18 + v_64;
-                if (warp > 12) {
+                if (warp > 11) {
                     before_19 = before_19 + v_64;
                 }
-                unsigned int v_65 = scal[61];
+                unsigned int v_65 = scal[60];
                 total_18 = total_18 + v_65;
-                if (warp > 13) {
+                if (warp > 12) {
                     before_19 = before_19 + v_65;
                 }
-                unsigned int v_66 = scal[62];
+                unsigned int v_66 = scal[61];
                 total_18 = total_18 + v_66;
-                if (warp > 14) {
+                if (warp > 13) {
                     before_19 = before_19 + v_66;
                 }
-                unsigned int v_67 = scal[63];
+                unsigned int v_67 = scal[62];
                 total_18 = total_18 + v_67;
-                if (warp > 15) {
+                if (warp > 14) {
                     before_19 = before_19 + v_67;
+                }
+                unsigned int v_68 = scal[63];
+                total_18 = total_18 + v_68;
+                if (warp > 15) {
+                    before_19 = before_19 + v_68;
                 }
                 unsigned long long ebase = out_base + (unsigned long long)(total_18 + before_18);
                 unsigned int lt_mask_2_1 = (1 << (unsigned int)lane) - 1;
@@ -22336,26 +22331,26 @@ kernel_cake_radix_topk_c4_e16s_lp_nt(float* __restrict__ probs, int* __restrict_
             for (int p = 0; p < 3; p++) {
                 unsigned int shift_2 = ((p == 0) ? 21 : ((p == 1) ? 10 : 0));
                 unsigned int nbits_2 = ((p == 2) ? 10 : 11);
-                for (int c_28 = 0; c_28 < nsub; c_28++) {
-                    int i2_96 = start + c_28 * 2048 + tid;
+                for (int c_29 = 0; c_29 < nsub; c_29++) {
+                    int i2_96 = start + c_29 * 2048 + tid;
                     if (i2_96 < vocab) {
                         vals_t[0] = probs[row_base + (unsigned long long)i2_96];
                     } else {
                         vals_t[0] = 0.0f;
                     }
-                    int i2_97 = start + c_28 * 2048 + 512 + tid;
+                    int i2_97 = start + c_29 * 2048 + 512 + tid;
                     if (i2_97 < vocab) {
                         vals_t[1] = probs[row_base + (unsigned long long)i2_97];
                     } else {
                         vals_t[1] = 0.0f;
                     }
-                    int i2_98 = start + c_28 * 2048 + 1024 + tid;
+                    int i2_98 = start + c_29 * 2048 + 1024 + tid;
                     if (i2_98 < vocab) {
                         vals_t[2] = probs[row_base + (unsigned long long)i2_98];
                     } else {
                         vals_t[2] = 0.0f;
                     }
-                    int i2_99 = start + c_28 * 2048 + 1536 + tid;
+                    int i2_99 = start + c_29 * 2048 + 1536 + tid;
                     if (i2_99 < vocab) {
                         vals_t[3] = probs[row_base + (unsigned long long)i2_99];
                     } else {
@@ -22676,26 +22671,26 @@ kernel_cake_radix_topk_c4_e16s_lp_nt(float* __restrict__ probs, int* __restrict_
             unsigned int take_rem = ((eq_prefix < remaining) ? _min_101 : 0);
             unsigned long long gt_run = out_base + (unsigned long long)gt_prefix;
             unsigned long long eq_run = out_base + (unsigned long long)(gt_total + eq_prefix);
-            for (int c_29 = 0; c_29 < nsub; c_29++) {
-                int i2_100 = start + c_29 * 2048 + tid;
+            for (int c_30 = 0; c_30 < nsub; c_30++) {
+                int i2_100 = start + c_30 * 2048 + tid;
                 if (i2_100 < vocab) {
                     vals_t[0] = probs[row_base + (unsigned long long)i2_100];
                 } else {
                     vals_t[0] = 0.0f;
                 }
-                int i2_101 = start + c_29 * 2048 + 512 + tid;
+                int i2_101 = start + c_30 * 2048 + 512 + tid;
                 if (i2_101 < vocab) {
                     vals_t[1] = probs[row_base + (unsigned long long)i2_101];
                 } else {
                     vals_t[1] = 0.0f;
                 }
-                int i2_102 = start + c_29 * 2048 + 1024 + tid;
+                int i2_102 = start + c_30 * 2048 + 1024 + tid;
                 if (i2_102 < vocab) {
                     vals_t[2] = probs[row_base + (unsigned long long)i2_102];
                 } else {
                     vals_t[2] = 0.0f;
                 }
-                int i2_103 = start + c_29 * 2048 + 1536 + tid;
+                int i2_103 = start + c_30 * 2048 + 1536 + tid;
                 if (i2_103 < vocab) {
                     vals_t[3] = probs[row_base + (unsigned long long)i2_103];
                 } else {
@@ -22704,8 +22699,8 @@ kernel_cake_radix_topk_c4_e16s_lp_nt(float* __restrict__ probs, int* __restrict_
                 unsigned int gt = 0;
                 unsigned int bits_75 = __as_u32(vals_t[0]);
                 unsigned int key_78 = ((bits_75 <= 2139095040) ? bits_75 : 0);
-                int i_vec = start + c_29 * 2048 + tid * 4;
-                int i_str = start + c_29 * 2048 + tid;
+                int i_vec = start + c_30 * 2048 + tid * 4;
+                int i_str = start + c_30 * 2048 + tid;
                 int i = i_str;
                 int i_2_0 = i;
                 bool tie_1_0 = key_78 == threshold_t && i_2_0 < vocab;
@@ -22718,8 +22713,8 @@ kernel_cake_radix_topk_c4_e16s_lp_nt(float* __restrict__ probs, int* __restrict_
                 }
                 unsigned int bits_75_1 = __as_u32(vals_t[1]);
                 unsigned int key_75_1 = ((bits_75_1 <= 2139095040) ? bits_75_1 : 0);
-                int i_vec_0 = start + c_29 * 2048 + tid * 4 + 1;
-                int i_str_0 = start + c_29 * 2048 + 512 + tid;
+                int i_vec_0 = start + c_30 * 2048 + tid * 4 + 1;
+                int i_str_0 = start + c_30 * 2048 + 512 + tid;
                 int i_32 = i_str_0;
                 int i_2_1 = i_32;
                 bool tie_1_1 = key_75_1 == threshold_t && i_2_1 < vocab;
@@ -22732,8 +22727,8 @@ kernel_cake_radix_topk_c4_e16s_lp_nt(float* __restrict__ probs, int* __restrict_
                 }
                 unsigned int bits_76 = __as_u32(vals_t[2]);
                 unsigned int key_76_1 = ((bits_76 <= 2139095040) ? bits_76 : 0);
-                int i_vec_1 = start + c_29 * 2048 + tid * 4 + 2;
-                int i_str_1 = start + c_29 * 2048 + 1024 + tid;
+                int i_vec_1 = start + c_30 * 2048 + tid * 4 + 2;
+                int i_str_1 = start + c_30 * 2048 + 1024 + tid;
                 int i_33 = i_str_1;
                 int i_2_2 = i_33;
                 bool tie_1_2 = key_76_1 == threshold_t && i_2_2 < vocab;
@@ -22746,8 +22741,8 @@ kernel_cake_radix_topk_c4_e16s_lp_nt(float* __restrict__ probs, int* __restrict_
                 }
                 unsigned int bits_77 = __as_u32(vals_t[3]);
                 unsigned int key_77_1 = ((bits_77 <= 2139095040) ? bits_77 : 0);
-                int i_vec_2 = start + c_29 * 2048 + tid * 4 + 3;
-                int i_str_2 = start + c_29 * 2048 + 1536 + tid;
+                int i_vec_2 = start + c_30 * 2048 + tid * 4 + 3;
+                int i_str_2 = start + c_30 * 2048 + 1536 + tid;
                 int i_34 = i_str_2;
                 int i_2_3 = i_34;
                 bool tie_1_3 = key_77_1 == threshold_t && i_2_3 < vocab;
@@ -22863,9 +22858,9 @@ kernel_cake_radix_topk_c4_e16s_lp_nt(float* __restrict__ probs, int* __restrict_
                 unsigned int running = excl_1 >> 12;
                 int f2 = tid;
                 if (f2 < 64) {
-                    unsigned int c_0_1 = cnt[f2];
+                    unsigned int c_0 = cnt[f2];
                     cnt[f2] = running;
-                    running = running + c_0_1;
+                    running = running + c_0;
                 }
                 __syncthreads();
                 unsigned int gt_slot = excl_1 & 4095;
@@ -22883,8 +22878,8 @@ kernel_cake_radix_topk_c4_e16s_lp_nt(float* __restrict__ probs, int* __restrict_
                 unsigned int bits_78 = __as_u32(vals_t[0]);
                 unsigned int key_78_1 = ((bits_78 <= 2139095040) ? bits_78 : 0);
                 keys[0] = key_78_1;
-                int i_vec_3 = start + c_29 * 2048 + tid * 4;
-                int i_str_3 = start + c_29 * 2048 + tid;
+                int i_vec_3 = start + c_30 * 2048 + tid * 4;
+                int i_str_3 = start + c_30 * 2048 + tid;
                 int i_35 = i_str_3;
                 idxs[0] = i_35;
                 ties[0] = keys[0] == threshold_t && idxs[0] < vocab;
@@ -22897,8 +22892,8 @@ kernel_cake_radix_topk_c4_e16s_lp_nt(float* __restrict__ probs, int* __restrict_
                 unsigned int bits_79 = __as_u32(vals_t[1]);
                 unsigned int key_79 = ((bits_79 <= 2139095040) ? bits_79 : 0);
                 keys[1] = key_79;
-                int i_vec_4 = start + c_29 * 2048 + tid * 4 + 1;
-                int i_str_4 = start + c_29 * 2048 + 512 + tid;
+                int i_vec_4 = start + c_30 * 2048 + tid * 4 + 1;
+                int i_str_4 = start + c_30 * 2048 + 512 + tid;
                 int i_36 = i_str_4;
                 idxs[1] = i_36;
                 ties[1] = keys[1] == threshold_t && idxs[1] < vocab;
@@ -22911,8 +22906,8 @@ kernel_cake_radix_topk_c4_e16s_lp_nt(float* __restrict__ probs, int* __restrict_
                 unsigned int bits_80 = __as_u32(vals_t[2]);
                 unsigned int key_80 = ((bits_80 <= 2139095040) ? bits_80 : 0);
                 keys[2] = key_80;
-                int i_vec_5 = start + c_29 * 2048 + tid * 4 + 2;
-                int i_str_5 = start + c_29 * 2048 + 1024 + tid;
+                int i_vec_5 = start + c_30 * 2048 + tid * 4 + 2;
+                int i_str_5 = start + c_30 * 2048 + 1024 + tid;
                 int i_37 = i_str_5;
                 idxs[2] = i_37;
                 ties[2] = keys[2] == threshold_t && idxs[2] < vocab;
@@ -22925,8 +22920,8 @@ kernel_cake_radix_topk_c4_e16s_lp_nt(float* __restrict__ probs, int* __restrict_
                 unsigned int bits_81 = __as_u32(vals_t[3]);
                 unsigned int key_81 = ((bits_81 <= 2139095040) ? bits_81 : 0);
                 keys[3] = key_81;
-                int i_vec_6 = start + c_29 * 2048 + tid * 4 + 3;
-                int i_str_6 = start + c_29 * 2048 + 1536 + tid;
+                int i_vec_6 = start + c_30 * 2048 + tid * 4 + 3;
+                int i_str_6 = start + c_30 * 2048 + 1536 + tid;
                 int i_38 = i_str_6;
                 idxs[3] = i_38;
                 ties[3] = keys[3] == threshold_t && idxs[3] < vocab;
@@ -23016,7 +23011,6 @@ kernel_cake_radix_topk_c4_e16s_lp_nt(float* __restrict__ probs, int* __restrict_
 } // extern "C"
 
 #undef CAKE_INF
-#undef NUM_MAIN_STAGES
 #undef SMEM_CLIST_OFF
 #undef SMEM_CLIST_STAGE_BYTES
 #undef SMEM_CLIST_STRIDE
@@ -23105,7 +23099,6 @@ kernel_cake_radix_topk_c4_e16s_lp_nt(float* __restrict__ probs, int* __restrict_
 #undef xbuf64_addr
 
 #define CAKE_INF CUDART_INF_F
-#define NUM_MAIN_STAGES 1
 #define SMEM_HIST0_OFF 0
 #define SMEM_HIST0_STAGE_BYTES 8192
 #define SMEM_HIST0_STRIDE 8192
@@ -23444,32 +23437,32 @@ kernel_cake_radix_topk_c8_e16s_lp_nt(float* __restrict__ probs, int* __restrict_
         for (int c_1 = 0; c_1 < nchunks; c_1++) {
             int i_4 = start + c_1 * 8192 + tid * 4;
             if (i_4 < vocab) {
-                float v_0 = probs[row_base + (unsigned long long)i_4];
-                unsigned int bits_12 = __as_u32(v_0);
+                float v_1 = probs[row_base + (unsigned long long)i_4];
+                unsigned int bits_12 = __as_u32(v_1);
                 unsigned int key_12 = ((bits_12 <= 2139095040) ? bits_12 : 0);
                 unsigned int bucket_16 = key_12 >> 21;
                 atomicAdd(&hist0[bucket_16], 1);
             }
             int i_5 = start + c_1 * 8192 + (512 + tid) * 4;
             if (i_5 < vocab) {
-                float v_1 = probs[row_base + (unsigned long long)i_5];
-                unsigned int bits_13 = __as_u32(v_1);
+                float v_2 = probs[row_base + (unsigned long long)i_5];
+                unsigned int bits_13 = __as_u32(v_2);
                 unsigned int key_13 = ((bits_13 <= 2139095040) ? bits_13 : 0);
                 unsigned int bucket_17 = key_13 >> 21;
                 atomicAdd(&hist0[bucket_17], 1);
             }
             int i_6 = start + c_1 * 8192 + (1024 + tid) * 4;
             if (i_6 < vocab) {
-                float v_2 = probs[row_base + (unsigned long long)i_6];
-                unsigned int bits_14 = __as_u32(v_2);
+                float v_3 = probs[row_base + (unsigned long long)i_6];
+                unsigned int bits_14 = __as_u32(v_3);
                 unsigned int key_14 = ((bits_14 <= 2139095040) ? bits_14 : 0);
                 unsigned int bucket_18 = key_14 >> 21;
                 atomicAdd(&hist0[bucket_18], 1);
             }
             int i_7 = start + c_1 * 8192 + (1536 + tid) * 4;
             if (i_7 < vocab) {
-                float v_3 = probs[row_base + (unsigned long long)i_7];
-                unsigned int bits_15 = __as_u32(v_3);
+                float v_4 = probs[row_base + (unsigned long long)i_7];
+                unsigned int bits_15 = __as_u32(v_4);
                 unsigned int key_15 = ((bits_15 <= 2139095040) ? bits_15 : 0);
                 unsigned int bucket_19 = key_15 >> 21;
                 atomicAdd(&hist0[bucket_19], 1);
@@ -23906,10 +23899,10 @@ kernel_cake_radix_topk_c8_e16s_lp_nt(float* __restrict__ probs, int* __restrict_
         asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(owner_1) : "r"(((is_owner_1 != 0) ? (unsigned int)lane : 0)));
         unsigned int found_1;
         asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(found_1) : "r"(is_owner_1));
-        unsigned int pos_b_1 = __shfl_sync(0xFFFFFFFF, pos_1, owner_1);
-        unsigned int rem_b_1 = __shfl_sync(0xFFFFFFFF, rem_after_1, owner_1);
+        unsigned int pos_b_2 = __shfl_sync(0xFFFFFFFF, pos_1, owner_1);
+        unsigned int rem_b_2 = __shfl_sync(0xFFFFFFFF, rem_after_1, owner_1);
         unsigned int cnt_b_1 = __shfl_sync(0xFFFFFFFF, cnt_2, owner_1);
-        unsigned int lo_b_1 = __shfl_sync(0xFFFFFFFF, lo_sel_1, owner_1);
+        unsigned int lo_b_2 = __shfl_sync(0xFFFFFFFF, lo_sel_1, owner_1);
         ff[0] = 0;
         lf[0] = 0;
         ff[1] = 0;
@@ -24053,21 +24046,21 @@ kernel_cake_radix_topk_c8_e16s_lp_nt(float* __restrict__ probs, int* __restrict_
         asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(owner_2) : "r"(((is_owner_2 != 0) ? (unsigned int)lane : 0)));
         unsigned int found_2;
         asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(found_2) : "r"(is_owner_2));
-        unsigned int pos_b_2 = __shfl_sync(0xFFFFFFFF, pos_2, owner_2);
-        unsigned int rem_b_2 = __shfl_sync(0xFFFFFFFF, rem_after_2, owner_2);
+        unsigned int pos_b_3 = __shfl_sync(0xFFFFFFFF, pos_2, owner_2);
+        unsigned int rem_b_3 = __shfl_sync(0xFFFFFFFF, rem_after_2, owner_2);
         unsigned int cnt_b_2 = __shfl_sync(0xFFFFFFFF, cnt_3, owner_2);
-        unsigned int lo_b_2 = __shfl_sync(0xFFFFFFFF, lo_sel_2, owner_2);
+        unsigned int lo_b_3 = __shfl_sync(0xFFFFFFFF, lo_sel_2, owner_2);
         unsigned int b_need = 0;
         unsigned int mass_need = 0;
         if (found != 0) {
-            b_need = pos_b * 16 + pos_b_1;
-            mass_need = rem_need - rem_b_1 + cnt_b_1;
+            b_need = pos_b * 16 + pos_b_2;
+            mass_need = rem_need - rem_b_2 + cnt_b_1;
         }
         unsigned int b_cap = 0;
         unsigned int mass_cap = 0;
         if (found_0 != 0) {
-            b_cap = pos_b_0 * 16 + pos_b_2 + 1;
-            mass_cap = rem_cap - rem_b_2;
+            b_cap = pos_b_0 * 16 + pos_b_3 + 1;
+            mass_cap = rem_cap - rem_b_3;
         }
         if (lane == 0) {
             unsigned int _max_74 = ((b_need) > (b_cap) ? (b_need) : (b_cap));
@@ -26961,85 +26954,85 @@ kernel_cake_radix_topk_c8_e16s_lp_nt(float* __restrict__ probs, int* __restrict_
     __syncthreads();
     unsigned int before = 0;
     unsigned int total = 0;
-    unsigned int v_4 = scal[16];
-    total = total + v_4;
-    if (warp > 0) {
-        before = before + v_4;
-    }
-    unsigned int v_5 = scal[17];
+    unsigned int v_5 = scal[16];
     total = total + v_5;
-    if (warp > 1) {
+    if (warp > 0) {
         before = before + v_5;
     }
-    unsigned int v_6 = scal[18];
+    unsigned int v_6 = scal[17];
     total = total + v_6;
-    if (warp > 2) {
+    if (warp > 1) {
         before = before + v_6;
     }
-    unsigned int v_7 = scal[19];
+    unsigned int v_7 = scal[18];
     total = total + v_7;
-    if (warp > 3) {
+    if (warp > 2) {
         before = before + v_7;
     }
-    unsigned int v_8 = scal[20];
+    unsigned int v_8 = scal[19];
     total = total + v_8;
-    if (warp > 4) {
+    if (warp > 3) {
         before = before + v_8;
     }
-    unsigned int v_9 = scal[21];
+    unsigned int v_9 = scal[20];
     total = total + v_9;
-    if (warp > 5) {
+    if (warp > 4) {
         before = before + v_9;
     }
-    unsigned int v_10 = scal[22];
+    unsigned int v_10 = scal[21];
     total = total + v_10;
-    if (warp > 6) {
+    if (warp > 5) {
         before = before + v_10;
     }
-    unsigned int v_11 = scal[23];
+    unsigned int v_11 = scal[22];
     total = total + v_11;
-    if (warp > 7) {
+    if (warp > 6) {
         before = before + v_11;
     }
-    unsigned int v_12 = scal[24];
+    unsigned int v_12 = scal[23];
     total = total + v_12;
-    if (warp > 8) {
+    if (warp > 7) {
         before = before + v_12;
     }
-    unsigned int v_13 = scal[25];
+    unsigned int v_13 = scal[24];
     total = total + v_13;
-    if (warp > 9) {
+    if (warp > 8) {
         before = before + v_13;
     }
-    unsigned int v_14 = scal[26];
+    unsigned int v_14 = scal[25];
     total = total + v_14;
-    if (warp > 10) {
+    if (warp > 9) {
         before = before + v_14;
     }
-    unsigned int v_15 = scal[27];
+    unsigned int v_15 = scal[26];
     total = total + v_15;
-    if (warp > 11) {
+    if (warp > 10) {
         before = before + v_15;
     }
-    unsigned int v_16 = scal[28];
+    unsigned int v_16 = scal[27];
     total = total + v_16;
-    if (warp > 12) {
+    if (warp > 11) {
         before = before + v_16;
     }
-    unsigned int v_17 = scal[29];
+    unsigned int v_17 = scal[28];
     total = total + v_17;
-    if (warp > 13) {
+    if (warp > 12) {
         before = before + v_17;
     }
-    unsigned int v_18 = scal[30];
+    unsigned int v_18 = scal[29];
     total = total + v_18;
-    if (warp > 14) {
+    if (warp > 13) {
         before = before + v_18;
     }
-    unsigned int v_19 = scal[31];
+    unsigned int v_19 = scal[30];
     total = total + v_19;
-    if (warp > 15) {
+    if (warp > 14) {
         before = before + v_19;
+    }
+    unsigned int v_20 = scal[31];
+    total = total + v_20;
+    if (warp > 15) {
+        before = before + v_20;
     }
     unsigned int ovf_w = __ballot_sync(0xFFFFFFFF, n_wu > 1024);
     if (tid == 0) {
@@ -27371,24 +27364,24 @@ kernel_cake_radix_topk_c8_e16s_lp_nt(float* __restrict__ probs, int* __restrict_
                 }
                 acc_1_3 = acc_1_3 + lens[7];
             }
-            unsigned long long c_0 = comps_l[0];
-            if (c_0 < 9214364837600034816) {
-                unsigned int bucket_20 = (unsigned int)(c_0 >> 53);
+            unsigned long long c_1_1 = comps_l[0];
+            if (c_1_1 < 9214364837600034816) {
+                unsigned int bucket_20 = (unsigned int)(c_1_1 >> 53);
                 atomicAdd(&hist1[bucket_20], 1);
             }
-            unsigned long long c_1_1 = comps_l[1];
-            if (c_1_1 < 9214364837600034816) {
-                unsigned int bucket_21 = (unsigned int)(c_1_1 >> 53);
+            unsigned long long c_2_1 = comps_l[1];
+            if (c_2_1 < 9214364837600034816) {
+                unsigned int bucket_21 = (unsigned int)(c_2_1 >> 53);
                 atomicAdd(&hist1[bucket_21], 1);
             }
-            unsigned long long c_2_1 = comps_l[2];
-            if (c_2_1 < 9214364837600034816) {
-                unsigned int bucket_22 = (unsigned int)(c_2_1 >> 53);
+            unsigned long long c_3_1 = comps_l[2];
+            if (c_3_1 < 9214364837600034816) {
+                unsigned int bucket_22 = (unsigned int)(c_3_1 >> 53);
                 atomicAdd(&hist1[bucket_22], 1);
             }
-            unsigned long long c_3_1 = comps_l[3];
-            if (c_3_1 < 9214364837600034816) {
-                unsigned int bucket_23 = (unsigned int)(c_3_1 >> 53);
+            unsigned long long c_4 = comps_l[3];
+            if (c_4 < 9214364837600034816) {
+                unsigned int bucket_23 = (unsigned int)(c_4 >> 53);
                 atomicAdd(&hist1[bucket_23], 1);
             }
             hist0[tid] = 0;
@@ -27468,24 +27461,24 @@ kernel_cake_radix_topk_c8_e16s_lp_nt(float* __restrict__ probs, int* __restrict_
                 done = 1;
             }
             if (done == 0) {
-                unsigned long long c_4 = comps_l[0];
-                unsigned int bucket_25 = (unsigned int)(c_4 >> 42 & 2047);
-                if (c_4 >> 53 == (unsigned long long)bucket_24) {
+                unsigned long long c_5 = comps_l[0];
+                unsigned int bucket_25 = (unsigned int)(c_5 >> 42 & 2047);
+                if (c_5 >> 53 == (unsigned long long)bucket_24) {
                     atomicAdd(&hist0[bucket_25], 1);
                 }
-                unsigned long long c_5 = comps_l[1];
-                unsigned int bucket_26 = (unsigned int)(c_5 >> 42 & 2047);
-                if (c_5 >> 53 == (unsigned long long)bucket_24) {
+                unsigned long long c_6 = comps_l[1];
+                unsigned int bucket_26 = (unsigned int)(c_6 >> 42 & 2047);
+                if (c_6 >> 53 == (unsigned long long)bucket_24) {
                     atomicAdd(&hist0[bucket_26], 1);
                 }
-                unsigned long long c_6 = comps_l[2];
-                unsigned int bucket_27 = (unsigned int)(c_6 >> 42 & 2047);
-                if (c_6 >> 53 == (unsigned long long)bucket_24) {
+                unsigned long long c_7 = comps_l[2];
+                unsigned int bucket_27 = (unsigned int)(c_7 >> 42 & 2047);
+                if (c_7 >> 53 == (unsigned long long)bucket_24) {
                     atomicAdd(&hist0[bucket_27], 1);
                 }
-                unsigned long long c_7 = comps_l[3];
-                unsigned int bucket_28 = (unsigned int)(c_7 >> 42 & 2047);
-                if (c_7 >> 53 == (unsigned long long)bucket_24) {
+                unsigned long long c_8 = comps_l[3];
+                unsigned int bucket_28 = (unsigned int)(c_8 >> 42 & 2047);
+                if (c_8 >> 53 == (unsigned long long)bucket_24) {
                     atomicAdd(&hist0[bucket_28], 1);
                 }
                 hist1[tid] = 0;
@@ -27564,24 +27557,24 @@ kernel_cake_radix_topk_c8_e16s_lp_nt(float* __restrict__ probs, int* __restrict_
                     done = 1;
                 }
                 if (done == 0) {
-                    unsigned long long c_8 = comps_l[0];
-                    unsigned int bucket_31 = (unsigned int)(c_8 >> 32 & 1023);
-                    if (c_8 >> 42 == prefix1) {
+                    unsigned long long c_9 = comps_l[0];
+                    unsigned int bucket_31 = (unsigned int)(c_9 >> 32 & 1023);
+                    if (c_9 >> 42 == prefix1) {
                         atomicAdd(&hist1[bucket_31], 1);
                     }
-                    unsigned long long c_9 = comps_l[1];
-                    unsigned int bucket_32 = (unsigned int)(c_9 >> 32 & 1023);
-                    if (c_9 >> 42 == prefix1) {
+                    unsigned long long c_10 = comps_l[1];
+                    unsigned int bucket_32 = (unsigned int)(c_10 >> 32 & 1023);
+                    if (c_10 >> 42 == prefix1) {
                         atomicAdd(&hist1[bucket_32], 1);
                     }
-                    unsigned long long c_10 = comps_l[2];
-                    unsigned int bucket_33 = (unsigned int)(c_10 >> 32 & 1023);
-                    if (c_10 >> 42 == prefix1) {
+                    unsigned long long c_11 = comps_l[2];
+                    unsigned int bucket_33 = (unsigned int)(c_11 >> 32 & 1023);
+                    if (c_11 >> 42 == prefix1) {
                         atomicAdd(&hist1[bucket_33], 1);
                     }
-                    unsigned long long c_11 = comps_l[3];
-                    unsigned int bucket_34 = (unsigned int)(c_11 >> 32 & 1023);
-                    if (c_11 >> 42 == prefix1) {
+                    unsigned long long c_12 = comps_l[3];
+                    unsigned int bucket_34 = (unsigned int)(c_12 >> 32 & 1023);
+                    if (c_12 >> 42 == prefix1) {
                         atomicAdd(&hist1[bucket_34], 1);
                     }
                     hist0[tid] = 0;
@@ -27668,24 +27661,24 @@ kernel_cake_radix_topk_c8_e16s_lp_nt(float* __restrict__ probs, int* __restrict_
                             unsigned long long mask = (1 << (unsigned long long)nbits) - 1;
                             unsigned long long sh = (unsigned long long)shift;
                             unsigned long long hi = (unsigned long long)(shift + nbits);
-                            unsigned long long c_12 = comps_l[0];
-                            unsigned int bucket_37 = (unsigned int)(c_12 >> sh & mask);
-                            if (c_12 >> hi == tpre) {
+                            unsigned long long c_13 = comps_l[0];
+                            unsigned int bucket_37 = (unsigned int)(c_13 >> sh & mask);
+                            if (c_13 >> hi == tpre) {
                                 atomicAdd(&hist0[bucket_37], 1);
                             }
-                            unsigned long long c_13 = comps_l[1];
-                            unsigned int bucket_38 = (unsigned int)(c_13 >> sh & mask);
-                            if (c_13 >> hi == tpre) {
+                            unsigned long long c_14 = comps_l[1];
+                            unsigned int bucket_38 = (unsigned int)(c_14 >> sh & mask);
+                            if (c_14 >> hi == tpre) {
                                 atomicAdd(&hist0[bucket_38], 1);
                             }
-                            unsigned long long c_14 = comps_l[2];
-                            unsigned int bucket_39 = (unsigned int)(c_14 >> sh & mask);
-                            if (c_14 >> hi == tpre) {
+                            unsigned long long c_15 = comps_l[2];
+                            unsigned int bucket_39 = (unsigned int)(c_15 >> sh & mask);
+                            if (c_15 >> hi == tpre) {
                                 atomicAdd(&hist0[bucket_39], 1);
                             }
-                            unsigned long long c_15 = comps_l[3];
-                            unsigned int bucket_40 = (unsigned int)(c_15 >> sh & mask);
-                            if (c_15 >> hi == tpre) {
+                            unsigned long long c_16 = comps_l[3];
+                            unsigned int bucket_40 = (unsigned int)(c_16 >> sh & mask);
+                            if (c_16 >> hi == tpre) {
                                 atomicAdd(&hist0[bucket_40], 1);
                             }
                             __syncthreads();
@@ -28437,10 +28430,10 @@ kernel_cake_radix_topk_c8_e16s_lp_nt(float* __restrict__ probs, int* __restrict_
                 asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(owner_3) : "r"(((is_owner_3 != 0) ? (unsigned int)lane : 0)));
                 unsigned int found_3;
                 asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(found_3) : "r"(is_owner_3));
-                unsigned int pos_b_3 = __shfl_sync(0xFFFFFFFF, pos_67, owner_3);
-                unsigned int rem_b_3 = __shfl_sync(0xFFFFFFFF, rem_after_3, owner_3);
+                unsigned int pos_b_1 = __shfl_sync(0xFFFFFFFF, pos_67, owner_3);
+                unsigned int rem_b_1 = __shfl_sync(0xFFFFFFFF, rem_after_3, owner_3);
                 unsigned int cnt_b_4 = __shfl_sync(0xFFFFFFFF, cnt_8, owner_3);
-                unsigned int lo_b_3 = __shfl_sync(0xFFFFFFFF, lo_sel_3, owner_3);
+                unsigned int lo_b_1 = __shfl_sync(0xFFFFFFFF, lo_sel_3, owner_3);
                 unsigned int ff_1[4];
                 unsigned int lf_1[4];
                 ff_1[0] = 0;
@@ -28452,7 +28445,7 @@ kernel_cake_radix_topk_c8_e16s_lp_nt(float* __restrict__ probs, int* __restrict_
                 ff_1[3] = 0;
                 lf_1[3] = 0;
                 int quad_1 = lane & 3;
-                int off_1 = ((int)pos_b_3 * 16 + quad_1 * 4) * 4;
+                int off_1 = ((int)pos_b_1 * 16 + quad_1 * 4) * 4;
                 int r_4 = lane >> 2;
                 if (r_4 < 8) {
                     unsigned int words_28[4];
@@ -28553,30 +28546,30 @@ kernel_cake_radix_topk_c8_e16s_lp_nt(float* __restrict__ probs, int* __restrict_
                 unsigned int rem_after_3_1 = 0;
                 unsigned int cnt_9 = 0;
                 unsigned int lo_sel_3_1 = 0;
-                if (above_6_1 < rem_b_3 && rem_b_3 <= above_6_1 + local_10) {
+                if (above_6_1 < rem_b_1 && rem_b_1 <= above_6_1 + local_10) {
                     is_owner_3_1 = 1;
                     unsigned int s3_9 = above_6_1 + ff_1[3];
                     unsigned int s2_9 = s3_9 + ff_1[2];
                     unsigned int s1_9 = s2_9 + ff_1[1];
-                    if (rem_b_3 <= s3_9) {
+                    if (rem_b_1 <= s3_9) {
                         pos_67_1 = (unsigned int)(lane * 4 + 3);
-                        rem_after_3_1 = rem_b_3 - above_6_1;
+                        rem_after_3_1 = rem_b_1 - above_6_1;
                         cnt_9 = ff_1[3];
                         lo_sel_3_1 = lo_above_3_1;
-                    } else if (rem_b_3 <= s2_9) {
+                    } else if (rem_b_1 <= s2_9) {
                         pos_67_1 = (unsigned int)(lane * 4 + 2);
-                        rem_after_3_1 = rem_b_3 - s3_9;
+                        rem_after_3_1 = rem_b_1 - s3_9;
                         cnt_9 = ff_1[2];
                         lo_sel_3_1 = lo_above_3_1 + lf_1[3];
                     } else {
-                        if (rem_b_3 <= s1_9) {
+                        if (rem_b_1 <= s1_9) {
                             pos_67_1 = (unsigned int)(lane * 4 + 1);
-                            rem_after_3_1 = rem_b_3 - s2_9;
+                            rem_after_3_1 = rem_b_1 - s2_9;
                             cnt_9 = ff_1[1];
                             lo_sel_3_1 = lo_above_3_1 + lf_1[3] + lf_1[2];
                         } else {
                             pos_67_1 = (unsigned int)(lane * 4);
-                            rem_after_3_1 = rem_b_3 - s1_9;
+                            rem_after_3_1 = rem_b_1 - s1_9;
                             cnt_9 = ff_1[0];
                             lo_sel_3_1 = lo_above_3_1 + lf_1[3] + lf_1[2] + lf_1[1];
                         }
@@ -28586,15 +28579,15 @@ kernel_cake_radix_topk_c8_e16s_lp_nt(float* __restrict__ probs, int* __restrict_
                 asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(owner_3_1) : "r"(((is_owner_3_1 != 0) ? (unsigned int)lane : 0)));
                 unsigned int found_3_1;
                 asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(found_3_1) : "r"(is_owner_3_1));
-                unsigned int pos_b_3_1 = __shfl_sync(0xFFFFFFFF, pos_67_1, owner_3_1);
-                unsigned int rem_b_3_1 = __shfl_sync(0xFFFFFFFF, rem_after_3_1, owner_3_1);
+                unsigned int pos_b_4 = __shfl_sync(0xFFFFFFFF, pos_67_1, owner_3_1);
+                unsigned int rem_b_4 = __shfl_sync(0xFFFFFFFF, rem_after_3_1, owner_3_1);
                 unsigned int cnt_b_3_1 = __shfl_sync(0xFFFFFFFF, cnt_9, owner_3_1);
-                unsigned int lo_b_3_1 = __shfl_sync(0xFFFFFFFF, lo_sel_3_1, owner_3_1);
+                unsigned int lo_b_4 = __shfl_sync(0xFFFFFFFF, lo_sel_3_1, owner_3_1);
                 if (lane == 0) {
-                    scal[0] = pos_b_3 * 16 + pos_b_3_1;
-                    scal[1] = rem_b_3_1;
+                    scal[0] = pos_b_1 * 16 + pos_b_4;
+                    scal[1] = rem_b_4;
                     scal[2] = cnt_b_3_1;
-                    scal[9] = lo_b_3 + lo_b_3_1;
+                    scal[9] = lo_b_1 + lo_b_4;
                 }
             }
             __syncthreads();
@@ -28603,11 +28596,11 @@ kernel_cake_radix_topk_c8_e16s_lp_nt(float* __restrict__ probs, int* __restrict_
             unsigned int cnt_sel = scal[2];
             if (cnt_sel <= 2048) {
                 take_tail = 0;
-                unsigned int v_0_1 = 0;
+                unsigned int v_0 = 0;
                 if (tid == 0) {
-                    v_0_1 = scal[9];
+                    v_0 = scal[9];
                 }
-                unsigned int lo_above_w = v_0_1;
+                unsigned int lo_above_w = v_0;
                 unsigned int n_2 = 0;
                 int niter_2 = (int)(n_wu + 31 >> 5);
                 for (int j_2 = 0; j_2 < niter_2; j_2++) {
@@ -28624,85 +28617,85 @@ kernel_cake_radix_topk_c8_e16s_lp_nt(float* __restrict__ probs, int* __restrict_
                 __syncthreads();
                 unsigned int before_17 = 0;
                 unsigned int total_16 = 0;
-                unsigned int v_20 = scal[16];
-                total_16 = total_16 + v_20;
-                if (warp > 0) {
-                    before_17 = before_17 + v_20;
-                }
-                unsigned int v_21 = scal[17];
+                unsigned int v_21 = scal[16];
                 total_16 = total_16 + v_21;
-                if (warp > 1) {
+                if (warp > 0) {
                     before_17 = before_17 + v_21;
                 }
-                unsigned int v_22 = scal[18];
+                unsigned int v_22 = scal[17];
                 total_16 = total_16 + v_22;
-                if (warp > 2) {
+                if (warp > 1) {
                     before_17 = before_17 + v_22;
                 }
-                unsigned int v_23 = scal[19];
+                unsigned int v_23 = scal[18];
                 total_16 = total_16 + v_23;
-                if (warp > 3) {
+                if (warp > 2) {
                     before_17 = before_17 + v_23;
                 }
-                unsigned int v_24 = scal[20];
+                unsigned int v_24 = scal[19];
                 total_16 = total_16 + v_24;
-                if (warp > 4) {
+                if (warp > 3) {
                     before_17 = before_17 + v_24;
                 }
-                unsigned int v_25 = scal[21];
+                unsigned int v_25 = scal[20];
                 total_16 = total_16 + v_25;
-                if (warp > 5) {
+                if (warp > 4) {
                     before_17 = before_17 + v_25;
                 }
-                unsigned int v_26 = scal[22];
+                unsigned int v_26 = scal[21];
                 total_16 = total_16 + v_26;
-                if (warp > 6) {
+                if (warp > 5) {
                     before_17 = before_17 + v_26;
                 }
-                unsigned int v_27 = scal[23];
+                unsigned int v_27 = scal[22];
                 total_16 = total_16 + v_27;
-                if (warp > 7) {
+                if (warp > 6) {
                     before_17 = before_17 + v_27;
                 }
-                unsigned int v_28 = scal[24];
+                unsigned int v_28 = scal[23];
                 total_16 = total_16 + v_28;
-                if (warp > 8) {
+                if (warp > 7) {
                     before_17 = before_17 + v_28;
                 }
-                unsigned int v_29 = scal[25];
+                unsigned int v_29 = scal[24];
                 total_16 = total_16 + v_29;
-                if (warp > 9) {
+                if (warp > 8) {
                     before_17 = before_17 + v_29;
                 }
-                unsigned int v_30 = scal[26];
+                unsigned int v_30 = scal[25];
                 total_16 = total_16 + v_30;
-                if (warp > 10) {
+                if (warp > 9) {
                     before_17 = before_17 + v_30;
                 }
-                unsigned int v_31 = scal[27];
+                unsigned int v_31 = scal[26];
                 total_16 = total_16 + v_31;
-                if (warp > 11) {
+                if (warp > 10) {
                     before_17 = before_17 + v_31;
                 }
-                unsigned int v_32 = scal[28];
+                unsigned int v_32 = scal[27];
                 total_16 = total_16 + v_32;
-                if (warp > 12) {
+                if (warp > 11) {
                     before_17 = before_17 + v_32;
                 }
-                unsigned int v_33 = scal[29];
+                unsigned int v_33 = scal[28];
                 total_16 = total_16 + v_33;
-                if (warp > 13) {
+                if (warp > 12) {
                     before_17 = before_17 + v_33;
                 }
-                unsigned int v_34 = scal[30];
+                unsigned int v_34 = scal[29];
                 total_16 = total_16 + v_34;
-                if (warp > 14) {
+                if (warp > 13) {
                     before_17 = before_17 + v_34;
                 }
-                unsigned int v_35 = scal[31];
+                unsigned int v_35 = scal[30];
                 total_16 = total_16 + v_35;
-                if (warp > 15) {
+                if (warp > 14) {
                     before_17 = before_17 + v_35;
+                }
+                unsigned int v_36 = scal[31];
+                total_16 = total_16 + v_36;
+                if (warp > 15) {
+                    before_17 = before_17 + v_36;
                 }
                 unsigned int lt_mask_3 = (1 << (unsigned int)lane) - 1;
                 unsigned int pos_68 = before_17;
@@ -29239,24 +29232,24 @@ kernel_cake_radix_topk_c8_e16s_lp_nt(float* __restrict__ probs, int* __restrict_
                     done_1 = 1;
                 }
                 if (done_1 == 0) {
-                    unsigned long long c_16 = comps2[0];
-                    unsigned int bucket_42_1 = (unsigned int)(c_16 >> 42 & 2047);
-                    if (c_16 >> 53 == (unsigned long long)bucket_sel_1) {
+                    unsigned long long c_17 = comps2[0];
+                    unsigned int bucket_42_1 = (unsigned int)(c_17 >> 42 & 2047);
+                    if (c_17 >> 53 == (unsigned long long)bucket_sel_1) {
                         atomicAdd(&hist0[bucket_42_1], 1);
                     }
-                    unsigned long long c_17 = comps2[1];
-                    unsigned int bucket_43 = (unsigned int)(c_17 >> 42 & 2047);
-                    if (c_17 >> 53 == (unsigned long long)bucket_sel_1) {
+                    unsigned long long c_18 = comps2[1];
+                    unsigned int bucket_43 = (unsigned int)(c_18 >> 42 & 2047);
+                    if (c_18 >> 53 == (unsigned long long)bucket_sel_1) {
                         atomicAdd(&hist0[bucket_43], 1);
                     }
-                    unsigned long long c_18 = comps2[2];
-                    unsigned int bucket_44 = (unsigned int)(c_18 >> 42 & 2047);
-                    if (c_18 >> 53 == (unsigned long long)bucket_sel_1) {
+                    unsigned long long c_19 = comps2[2];
+                    unsigned int bucket_44 = (unsigned int)(c_19 >> 42 & 2047);
+                    if (c_19 >> 53 == (unsigned long long)bucket_sel_1) {
                         atomicAdd(&hist0[bucket_44], 1);
                     }
-                    unsigned long long c_19 = comps2[3];
-                    unsigned int bucket_45 = (unsigned int)(c_19 >> 42 & 2047);
-                    if (c_19 >> 53 == (unsigned long long)bucket_sel_1) {
+                    unsigned long long c_20 = comps2[3];
+                    unsigned int bucket_45 = (unsigned int)(c_20 >> 42 & 2047);
+                    if (c_20 >> 53 == (unsigned long long)bucket_sel_1) {
                         atomicAdd(&hist0[bucket_45], 1);
                     }
                     hist1[tid] = 0;
@@ -29335,24 +29328,24 @@ kernel_cake_radix_topk_c8_e16s_lp_nt(float* __restrict__ probs, int* __restrict_
                         done_1 = 1;
                     }
                     if (done_1 == 0) {
-                        unsigned long long c_20 = comps2[0];
-                        unsigned int bucket_47 = (unsigned int)(c_20 >> 32 & 1023);
-                        if (c_20 >> 42 == prefix1_1) {
+                        unsigned long long c_21 = comps2[0];
+                        unsigned int bucket_47 = (unsigned int)(c_21 >> 32 & 1023);
+                        if (c_21 >> 42 == prefix1_1) {
                             atomicAdd(&hist1[bucket_47], 1);
                         }
-                        unsigned long long c_21 = comps2[1];
-                        unsigned int bucket_48 = (unsigned int)(c_21 >> 32 & 1023);
-                        if (c_21 >> 42 == prefix1_1) {
+                        unsigned long long c_22 = comps2[1];
+                        unsigned int bucket_48 = (unsigned int)(c_22 >> 32 & 1023);
+                        if (c_22 >> 42 == prefix1_1) {
                             atomicAdd(&hist1[bucket_48], 1);
                         }
-                        unsigned long long c_22 = comps2[2];
-                        unsigned int bucket_49 = (unsigned int)(c_22 >> 32 & 1023);
-                        if (c_22 >> 42 == prefix1_1) {
+                        unsigned long long c_23 = comps2[2];
+                        unsigned int bucket_49 = (unsigned int)(c_23 >> 32 & 1023);
+                        if (c_23 >> 42 == prefix1_1) {
                             atomicAdd(&hist1[bucket_49], 1);
                         }
-                        unsigned long long c_23 = comps2[3];
-                        unsigned int bucket_50 = (unsigned int)(c_23 >> 32 & 1023);
-                        if (c_23 >> 42 == prefix1_1) {
+                        unsigned long long c_24 = comps2[3];
+                        unsigned int bucket_50 = (unsigned int)(c_24 >> 32 & 1023);
+                        if (c_24 >> 42 == prefix1_1) {
                             atomicAdd(&hist1[bucket_50], 1);
                         }
                         hist0[tid] = 0;
@@ -29439,24 +29432,24 @@ kernel_cake_radix_topk_c8_e16s_lp_nt(float* __restrict__ probs, int* __restrict_
                                 unsigned long long mask_1 = (1 << (unsigned long long)nbits_1) - 1;
                                 unsigned long long sh_1 = (unsigned long long)shift_1;
                                 unsigned long long hi_1 = (unsigned long long)(shift_1 + nbits_1);
-                                unsigned long long c_24 = comps2[0];
-                                unsigned int bucket_53 = (unsigned int)(c_24 >> sh_1 & mask_1);
-                                if (c_24 >> hi_1 == tpre_1) {
+                                unsigned long long c_25 = comps2[0];
+                                unsigned int bucket_53 = (unsigned int)(c_25 >> sh_1 & mask_1);
+                                if (c_25 >> hi_1 == tpre_1) {
                                     atomicAdd(&hist0[bucket_53], 1);
                                 }
-                                unsigned long long c_25 = comps2[1];
-                                unsigned int bucket_54 = (unsigned int)(c_25 >> sh_1 & mask_1);
-                                if (c_25 >> hi_1 == tpre_1) {
+                                unsigned long long c_26 = comps2[1];
+                                unsigned int bucket_54 = (unsigned int)(c_26 >> sh_1 & mask_1);
+                                if (c_26 >> hi_1 == tpre_1) {
                                     atomicAdd(&hist0[bucket_54], 1);
                                 }
-                                unsigned long long c_26 = comps2[2];
-                                unsigned int bucket_55 = (unsigned int)(c_26 >> sh_1 & mask_1);
-                                if (c_26 >> hi_1 == tpre_1) {
+                                unsigned long long c_27 = comps2[2];
+                                unsigned int bucket_55 = (unsigned int)(c_27 >> sh_1 & mask_1);
+                                if (c_27 >> hi_1 == tpre_1) {
                                     atomicAdd(&hist0[bucket_55], 1);
                                 }
-                                unsigned long long c_27 = comps2[3];
-                                unsigned int bucket_56 = (unsigned int)(c_27 >> sh_1 & mask_1);
-                                if (c_27 >> hi_1 == tpre_1) {
+                                unsigned long long c_28 = comps2[3];
+                                unsigned int bucket_56 = (unsigned int)(c_28 >> sh_1 & mask_1);
+                                if (c_28 >> hi_1 == tpre_1) {
                                     atomicAdd(&hist0[bucket_56], 1);
                                 }
                                 __syncthreads();
@@ -29579,167 +29572,167 @@ kernel_cake_radix_topk_c8_e16s_lp_nt(float* __restrict__ probs, int* __restrict_
                 __syncthreads();
                 unsigned int before_18 = 0;
                 unsigned int total_17 = 0;
-                unsigned int v_36 = scal[32];
-                total_17 = total_17 + v_36;
-                if (warp > 0) {
-                    before_18 = before_18 + v_36;
-                }
-                unsigned int v_37 = scal[33];
+                unsigned int v_37 = scal[32];
                 total_17 = total_17 + v_37;
-                if (warp > 1) {
+                if (warp > 0) {
                     before_18 = before_18 + v_37;
                 }
-                unsigned int v_38 = scal[34];
+                unsigned int v_38 = scal[33];
                 total_17 = total_17 + v_38;
-                if (warp > 2) {
+                if (warp > 1) {
                     before_18 = before_18 + v_38;
                 }
-                unsigned int v_39 = scal[35];
+                unsigned int v_39 = scal[34];
                 total_17 = total_17 + v_39;
-                if (warp > 3) {
+                if (warp > 2) {
                     before_18 = before_18 + v_39;
                 }
-                unsigned int v_40 = scal[36];
+                unsigned int v_40 = scal[35];
                 total_17 = total_17 + v_40;
-                if (warp > 4) {
+                if (warp > 3) {
                     before_18 = before_18 + v_40;
                 }
-                unsigned int v_41 = scal[37];
+                unsigned int v_41 = scal[36];
                 total_17 = total_17 + v_41;
-                if (warp > 5) {
+                if (warp > 4) {
                     before_18 = before_18 + v_41;
                 }
-                unsigned int v_42 = scal[38];
+                unsigned int v_42 = scal[37];
                 total_17 = total_17 + v_42;
-                if (warp > 6) {
+                if (warp > 5) {
                     before_18 = before_18 + v_42;
                 }
-                unsigned int v_43 = scal[39];
+                unsigned int v_43 = scal[38];
                 total_17 = total_17 + v_43;
-                if (warp > 7) {
+                if (warp > 6) {
                     before_18 = before_18 + v_43;
                 }
-                unsigned int v_44 = scal[40];
+                unsigned int v_44 = scal[39];
                 total_17 = total_17 + v_44;
-                if (warp > 8) {
+                if (warp > 7) {
                     before_18 = before_18 + v_44;
                 }
-                unsigned int v_45 = scal[41];
+                unsigned int v_45 = scal[40];
                 total_17 = total_17 + v_45;
-                if (warp > 9) {
+                if (warp > 8) {
                     before_18 = before_18 + v_45;
                 }
-                unsigned int v_46 = scal[42];
+                unsigned int v_46 = scal[41];
                 total_17 = total_17 + v_46;
-                if (warp > 10) {
+                if (warp > 9) {
                     before_18 = before_18 + v_46;
                 }
-                unsigned int v_47 = scal[43];
+                unsigned int v_47 = scal[42];
                 total_17 = total_17 + v_47;
-                if (warp > 11) {
+                if (warp > 10) {
                     before_18 = before_18 + v_47;
                 }
-                unsigned int v_48 = scal[44];
+                unsigned int v_48 = scal[43];
                 total_17 = total_17 + v_48;
-                if (warp > 12) {
+                if (warp > 11) {
                     before_18 = before_18 + v_48;
                 }
-                unsigned int v_49 = scal[45];
+                unsigned int v_49 = scal[44];
                 total_17 = total_17 + v_49;
-                if (warp > 13) {
+                if (warp > 12) {
                     before_18 = before_18 + v_49;
                 }
-                unsigned int v_50 = scal[46];
+                unsigned int v_50 = scal[45];
                 total_17 = total_17 + v_50;
-                if (warp > 14) {
+                if (warp > 13) {
                     before_18 = before_18 + v_50;
                 }
-                unsigned int v_51 = scal[47];
+                unsigned int v_51 = scal[46];
                 total_17 = total_17 + v_51;
-                if (warp > 15) {
+                if (warp > 14) {
                     before_18 = before_18 + v_51;
+                }
+                unsigned int v_52 = scal[47];
+                total_17 = total_17 + v_52;
+                if (warp > 15) {
+                    before_18 = before_18 + v_52;
                 }
                 unsigned int before_19 = 0;
                 unsigned int total_18 = 0;
-                unsigned int v_52 = scal[48];
-                total_18 = total_18 + v_52;
-                if (warp > 0) {
-                    before_19 = before_19 + v_52;
-                }
-                unsigned int v_53 = scal[49];
+                unsigned int v_53 = scal[48];
                 total_18 = total_18 + v_53;
-                if (warp > 1) {
+                if (warp > 0) {
                     before_19 = before_19 + v_53;
                 }
-                unsigned int v_54 = scal[50];
+                unsigned int v_54 = scal[49];
                 total_18 = total_18 + v_54;
-                if (warp > 2) {
+                if (warp > 1) {
                     before_19 = before_19 + v_54;
                 }
-                unsigned int v_55 = scal[51];
+                unsigned int v_55 = scal[50];
                 total_18 = total_18 + v_55;
-                if (warp > 3) {
+                if (warp > 2) {
                     before_19 = before_19 + v_55;
                 }
-                unsigned int v_56 = scal[52];
+                unsigned int v_56 = scal[51];
                 total_18 = total_18 + v_56;
-                if (warp > 4) {
+                if (warp > 3) {
                     before_19 = before_19 + v_56;
                 }
-                unsigned int v_57 = scal[53];
+                unsigned int v_57 = scal[52];
                 total_18 = total_18 + v_57;
-                if (warp > 5) {
+                if (warp > 4) {
                     before_19 = before_19 + v_57;
                 }
-                unsigned int v_58 = scal[54];
+                unsigned int v_58 = scal[53];
                 total_18 = total_18 + v_58;
-                if (warp > 6) {
+                if (warp > 5) {
                     before_19 = before_19 + v_58;
                 }
-                unsigned int v_59 = scal[55];
+                unsigned int v_59 = scal[54];
                 total_18 = total_18 + v_59;
-                if (warp > 7) {
+                if (warp > 6) {
                     before_19 = before_19 + v_59;
                 }
-                unsigned int v_60 = scal[56];
+                unsigned int v_60 = scal[55];
                 total_18 = total_18 + v_60;
-                if (warp > 8) {
+                if (warp > 7) {
                     before_19 = before_19 + v_60;
                 }
-                unsigned int v_61 = scal[57];
+                unsigned int v_61 = scal[56];
                 total_18 = total_18 + v_61;
-                if (warp > 9) {
+                if (warp > 8) {
                     before_19 = before_19 + v_61;
                 }
-                unsigned int v_62 = scal[58];
+                unsigned int v_62 = scal[57];
                 total_18 = total_18 + v_62;
-                if (warp > 10) {
+                if (warp > 9) {
                     before_19 = before_19 + v_62;
                 }
-                unsigned int v_63 = scal[59];
+                unsigned int v_63 = scal[58];
                 total_18 = total_18 + v_63;
-                if (warp > 11) {
+                if (warp > 10) {
                     before_19 = before_19 + v_63;
                 }
-                unsigned int v_64 = scal[60];
+                unsigned int v_64 = scal[59];
                 total_18 = total_18 + v_64;
-                if (warp > 12) {
+                if (warp > 11) {
                     before_19 = before_19 + v_64;
                 }
-                unsigned int v_65 = scal[61];
+                unsigned int v_65 = scal[60];
                 total_18 = total_18 + v_65;
-                if (warp > 13) {
+                if (warp > 12) {
                     before_19 = before_19 + v_65;
                 }
-                unsigned int v_66 = scal[62];
+                unsigned int v_66 = scal[61];
                 total_18 = total_18 + v_66;
-                if (warp > 14) {
+                if (warp > 13) {
                     before_19 = before_19 + v_66;
                 }
-                unsigned int v_67 = scal[63];
+                unsigned int v_67 = scal[62];
                 total_18 = total_18 + v_67;
-                if (warp > 15) {
+                if (warp > 14) {
                     before_19 = before_19 + v_67;
+                }
+                unsigned int v_68 = scal[63];
+                total_18 = total_18 + v_68;
+                if (warp > 15) {
+                    before_19 = before_19 + v_68;
                 }
                 unsigned long long ebase = out_base + (unsigned long long)(total_18 + before_18);
                 unsigned int lt_mask_2_1 = (1 << (unsigned int)lane) - 1;
@@ -29778,26 +29771,26 @@ kernel_cake_radix_topk_c8_e16s_lp_nt(float* __restrict__ probs, int* __restrict_
             for (int p = 0; p < 3; p++) {
                 unsigned int shift_2 = ((p == 0) ? 21 : ((p == 1) ? 10 : 0));
                 unsigned int nbits_2 = ((p == 2) ? 10 : 11);
-                for (int c_28 = 0; c_28 < nsub; c_28++) {
-                    int i2_96 = start + c_28 * 2048 + tid;
+                for (int c_29 = 0; c_29 < nsub; c_29++) {
+                    int i2_96 = start + c_29 * 2048 + tid;
                     if (i2_96 < vocab) {
                         vals_t[0] = probs[row_base + (unsigned long long)i2_96];
                     } else {
                         vals_t[0] = 0.0f;
                     }
-                    int i2_97 = start + c_28 * 2048 + 512 + tid;
+                    int i2_97 = start + c_29 * 2048 + 512 + tid;
                     if (i2_97 < vocab) {
                         vals_t[1] = probs[row_base + (unsigned long long)i2_97];
                     } else {
                         vals_t[1] = 0.0f;
                     }
-                    int i2_98 = start + c_28 * 2048 + 1024 + tid;
+                    int i2_98 = start + c_29 * 2048 + 1024 + tid;
                     if (i2_98 < vocab) {
                         vals_t[2] = probs[row_base + (unsigned long long)i2_98];
                     } else {
                         vals_t[2] = 0.0f;
                     }
-                    int i2_99 = start + c_28 * 2048 + 1536 + tid;
+                    int i2_99 = start + c_29 * 2048 + 1536 + tid;
                     if (i2_99 < vocab) {
                         vals_t[3] = probs[row_base + (unsigned long long)i2_99];
                     } else {
@@ -30166,26 +30159,26 @@ kernel_cake_radix_topk_c8_e16s_lp_nt(float* __restrict__ probs, int* __restrict_
             unsigned int take_rem = ((eq_prefix < remaining) ? _min_218 : 0);
             unsigned long long gt_run = out_base + (unsigned long long)gt_prefix;
             unsigned long long eq_run = out_base + (unsigned long long)(gt_total + eq_prefix);
-            for (int c_29 = 0; c_29 < nsub; c_29++) {
-                int i2_100 = start + c_29 * 2048 + tid;
+            for (int c_30 = 0; c_30 < nsub; c_30++) {
+                int i2_100 = start + c_30 * 2048 + tid;
                 if (i2_100 < vocab) {
                     vals_t[0] = probs[row_base + (unsigned long long)i2_100];
                 } else {
                     vals_t[0] = 0.0f;
                 }
-                int i2_101 = start + c_29 * 2048 + 512 + tid;
+                int i2_101 = start + c_30 * 2048 + 512 + tid;
                 if (i2_101 < vocab) {
                     vals_t[1] = probs[row_base + (unsigned long long)i2_101];
                 } else {
                     vals_t[1] = 0.0f;
                 }
-                int i2_102 = start + c_29 * 2048 + 1024 + tid;
+                int i2_102 = start + c_30 * 2048 + 1024 + tid;
                 if (i2_102 < vocab) {
                     vals_t[2] = probs[row_base + (unsigned long long)i2_102];
                 } else {
                     vals_t[2] = 0.0f;
                 }
-                int i2_103 = start + c_29 * 2048 + 1536 + tid;
+                int i2_103 = start + c_30 * 2048 + 1536 + tid;
                 if (i2_103 < vocab) {
                     vals_t[3] = probs[row_base + (unsigned long long)i2_103];
                 } else {
@@ -30194,8 +30187,8 @@ kernel_cake_radix_topk_c8_e16s_lp_nt(float* __restrict__ probs, int* __restrict_
                 unsigned int gt = 0;
                 unsigned int bits_75 = __as_u32(vals_t[0]);
                 unsigned int key_78 = ((bits_75 <= 2139095040) ? bits_75 : 0);
-                int i_vec = start + c_29 * 2048 + tid * 4;
-                int i_str = start + c_29 * 2048 + tid;
+                int i_vec = start + c_30 * 2048 + tid * 4;
+                int i_str = start + c_30 * 2048 + tid;
                 int i = i_str;
                 int i_2_0 = i;
                 bool tie_1_0 = key_78 == threshold_t && i_2_0 < vocab;
@@ -30208,8 +30201,8 @@ kernel_cake_radix_topk_c8_e16s_lp_nt(float* __restrict__ probs, int* __restrict_
                 }
                 unsigned int bits_75_1 = __as_u32(vals_t[1]);
                 unsigned int key_75_1 = ((bits_75_1 <= 2139095040) ? bits_75_1 : 0);
-                int i_vec_0 = start + c_29 * 2048 + tid * 4 + 1;
-                int i_str_0 = start + c_29 * 2048 + 512 + tid;
+                int i_vec_0 = start + c_30 * 2048 + tid * 4 + 1;
+                int i_str_0 = start + c_30 * 2048 + 512 + tid;
                 int i_32 = i_str_0;
                 int i_2_1 = i_32;
                 bool tie_1_1 = key_75_1 == threshold_t && i_2_1 < vocab;
@@ -30222,8 +30215,8 @@ kernel_cake_radix_topk_c8_e16s_lp_nt(float* __restrict__ probs, int* __restrict_
                 }
                 unsigned int bits_76 = __as_u32(vals_t[2]);
                 unsigned int key_76_1 = ((bits_76 <= 2139095040) ? bits_76 : 0);
-                int i_vec_1 = start + c_29 * 2048 + tid * 4 + 2;
-                int i_str_1 = start + c_29 * 2048 + 1024 + tid;
+                int i_vec_1 = start + c_30 * 2048 + tid * 4 + 2;
+                int i_str_1 = start + c_30 * 2048 + 1024 + tid;
                 int i_33 = i_str_1;
                 int i_2_2 = i_33;
                 bool tie_1_2 = key_76_1 == threshold_t && i_2_2 < vocab;
@@ -30236,8 +30229,8 @@ kernel_cake_radix_topk_c8_e16s_lp_nt(float* __restrict__ probs, int* __restrict_
                 }
                 unsigned int bits_77 = __as_u32(vals_t[3]);
                 unsigned int key_77_1 = ((bits_77 <= 2139095040) ? bits_77 : 0);
-                int i_vec_2 = start + c_29 * 2048 + tid * 4 + 3;
-                int i_str_2 = start + c_29 * 2048 + 1536 + tid;
+                int i_vec_2 = start + c_30 * 2048 + tid * 4 + 3;
+                int i_str_2 = start + c_30 * 2048 + 1536 + tid;
                 int i_34 = i_str_2;
                 int i_2_3 = i_34;
                 bool tie_1_3 = key_77_1 == threshold_t && i_2_3 < vocab;
@@ -30353,9 +30346,9 @@ kernel_cake_radix_topk_c8_e16s_lp_nt(float* __restrict__ probs, int* __restrict_
                 unsigned int running = excl_1 >> 12;
                 int f2 = tid;
                 if (f2 < 64) {
-                    unsigned int c_0_1 = cnt[f2];
+                    unsigned int c_0 = cnt[f2];
                     cnt[f2] = running;
-                    running = running + c_0_1;
+                    running = running + c_0;
                 }
                 __syncthreads();
                 unsigned int gt_slot = excl_1 & 4095;
@@ -30373,8 +30366,8 @@ kernel_cake_radix_topk_c8_e16s_lp_nt(float* __restrict__ probs, int* __restrict_
                 unsigned int bits_78 = __as_u32(vals_t[0]);
                 unsigned int key_78_1 = ((bits_78 <= 2139095040) ? bits_78 : 0);
                 keys[0] = key_78_1;
-                int i_vec_3 = start + c_29 * 2048 + tid * 4;
-                int i_str_3 = start + c_29 * 2048 + tid;
+                int i_vec_3 = start + c_30 * 2048 + tid * 4;
+                int i_str_3 = start + c_30 * 2048 + tid;
                 int i_35 = i_str_3;
                 idxs[0] = i_35;
                 ties[0] = keys[0] == threshold_t && idxs[0] < vocab;
@@ -30387,8 +30380,8 @@ kernel_cake_radix_topk_c8_e16s_lp_nt(float* __restrict__ probs, int* __restrict_
                 unsigned int bits_79 = __as_u32(vals_t[1]);
                 unsigned int key_79 = ((bits_79 <= 2139095040) ? bits_79 : 0);
                 keys[1] = key_79;
-                int i_vec_4 = start + c_29 * 2048 + tid * 4 + 1;
-                int i_str_4 = start + c_29 * 2048 + 512 + tid;
+                int i_vec_4 = start + c_30 * 2048 + tid * 4 + 1;
+                int i_str_4 = start + c_30 * 2048 + 512 + tid;
                 int i_36 = i_str_4;
                 idxs[1] = i_36;
                 ties[1] = keys[1] == threshold_t && idxs[1] < vocab;
@@ -30401,8 +30394,8 @@ kernel_cake_radix_topk_c8_e16s_lp_nt(float* __restrict__ probs, int* __restrict_
                 unsigned int bits_80 = __as_u32(vals_t[2]);
                 unsigned int key_80 = ((bits_80 <= 2139095040) ? bits_80 : 0);
                 keys[2] = key_80;
-                int i_vec_5 = start + c_29 * 2048 + tid * 4 + 2;
-                int i_str_5 = start + c_29 * 2048 + 1024 + tid;
+                int i_vec_5 = start + c_30 * 2048 + tid * 4 + 2;
+                int i_str_5 = start + c_30 * 2048 + 1024 + tid;
                 int i_37 = i_str_5;
                 idxs[2] = i_37;
                 ties[2] = keys[2] == threshold_t && idxs[2] < vocab;
@@ -30415,8 +30408,8 @@ kernel_cake_radix_topk_c8_e16s_lp_nt(float* __restrict__ probs, int* __restrict_
                 unsigned int bits_81 = __as_u32(vals_t[3]);
                 unsigned int key_81 = ((bits_81 <= 2139095040) ? bits_81 : 0);
                 keys[3] = key_81;
-                int i_vec_6 = start + c_29 * 2048 + tid * 4 + 3;
-                int i_str_6 = start + c_29 * 2048 + 1536 + tid;
+                int i_vec_6 = start + c_30 * 2048 + tid * 4 + 3;
+                int i_str_6 = start + c_30 * 2048 + 1536 + tid;
                 int i_38 = i_str_6;
                 idxs[3] = i_38;
                 ties[3] = keys[3] == threshold_t && idxs[3] < vocab;
@@ -30506,7 +30499,6 @@ kernel_cake_radix_topk_c8_e16s_lp_nt(float* __restrict__ probs, int* __restrict_
 } // extern "C"
 
 #undef CAKE_INF
-#undef NUM_MAIN_STAGES
 #undef SMEM_CLIST_OFF
 #undef SMEM_CLIST_STAGE_BYTES
 #undef SMEM_CLIST_STRIDE
@@ -30595,7 +30587,6 @@ kernel_cake_radix_topk_c8_e16s_lp_nt(float* __restrict__ probs, int* __restrict_
 #undef xbuf64_addr
 
 #define CAKE_INF CUDART_INF_F
-#define NUM_MAIN_STAGES 1
 #define SMEM_HIST0_OFF 0
 #define SMEM_HIST0_STAGE_BYTES 8192
 #define SMEM_HIST0_STRIDE 8192
@@ -34881,85 +34872,85 @@ kernel_cake_radix_topk_c2_e16s_sp_lp_nt(float* __restrict__ probs, int* __restri
     __syncthreads();
     unsigned int before = 0;
     unsigned int total = 0;
-    unsigned int v_0 = scal[16];
-    total = total + v_0;
-    if (warp > 0) {
-        before = before + v_0;
-    }
-    unsigned int v_1 = scal[17];
+    unsigned int v_1 = scal[16];
     total = total + v_1;
-    if (warp > 1) {
+    if (warp > 0) {
         before = before + v_1;
     }
-    unsigned int v_2 = scal[18];
+    unsigned int v_2 = scal[17];
     total = total + v_2;
-    if (warp > 2) {
+    if (warp > 1) {
         before = before + v_2;
     }
-    unsigned int v_3 = scal[19];
+    unsigned int v_3 = scal[18];
     total = total + v_3;
-    if (warp > 3) {
+    if (warp > 2) {
         before = before + v_3;
     }
-    unsigned int v_4 = scal[20];
+    unsigned int v_4 = scal[19];
     total = total + v_4;
-    if (warp > 4) {
+    if (warp > 3) {
         before = before + v_4;
     }
-    unsigned int v_5 = scal[21];
+    unsigned int v_5 = scal[20];
     total = total + v_5;
-    if (warp > 5) {
+    if (warp > 4) {
         before = before + v_5;
     }
-    unsigned int v_6 = scal[22];
+    unsigned int v_6 = scal[21];
     total = total + v_6;
-    if (warp > 6) {
+    if (warp > 5) {
         before = before + v_6;
     }
-    unsigned int v_7 = scal[23];
+    unsigned int v_7 = scal[22];
     total = total + v_7;
-    if (warp > 7) {
+    if (warp > 6) {
         before = before + v_7;
     }
-    unsigned int v_8 = scal[24];
+    unsigned int v_8 = scal[23];
     total = total + v_8;
-    if (warp > 8) {
+    if (warp > 7) {
         before = before + v_8;
     }
-    unsigned int v_9 = scal[25];
+    unsigned int v_9 = scal[24];
     total = total + v_9;
-    if (warp > 9) {
+    if (warp > 8) {
         before = before + v_9;
     }
-    unsigned int v_10 = scal[26];
+    unsigned int v_10 = scal[25];
     total = total + v_10;
-    if (warp > 10) {
+    if (warp > 9) {
         before = before + v_10;
     }
-    unsigned int v_11 = scal[27];
+    unsigned int v_11 = scal[26];
     total = total + v_11;
-    if (warp > 11) {
+    if (warp > 10) {
         before = before + v_11;
     }
-    unsigned int v_12 = scal[28];
+    unsigned int v_12 = scal[27];
     total = total + v_12;
-    if (warp > 12) {
+    if (warp > 11) {
         before = before + v_12;
     }
-    unsigned int v_13 = scal[29];
+    unsigned int v_13 = scal[28];
     total = total + v_13;
-    if (warp > 13) {
+    if (warp > 12) {
         before = before + v_13;
     }
-    unsigned int v_14 = scal[30];
+    unsigned int v_14 = scal[29];
     total = total + v_14;
-    if (warp > 14) {
+    if (warp > 13) {
         before = before + v_14;
     }
-    unsigned int v_15 = scal[31];
+    unsigned int v_15 = scal[30];
     total = total + v_15;
-    if (warp > 15) {
+    if (warp > 14) {
         before = before + v_15;
+    }
+    unsigned int v_16 = scal[31];
+    total = total + v_16;
+    if (warp > 15) {
+        before = before + v_16;
     }
     unsigned int ovf_w = __ballot_sync(0xFFFFFFFF, n_wu > 1024);
     if (tid == 0) {
@@ -35117,24 +35108,24 @@ kernel_cake_radix_topk_c2_e16s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 }
                 acc_1_3 = acc_1_3 + lens[1];
             }
-            unsigned long long c_0 = comps_l[0];
-            if (c_0 < 9214364837600034816) {
-                unsigned int bucket_32 = (unsigned int)(c_0 >> 53);
+            unsigned long long c_1_1 = comps_l[0];
+            if (c_1_1 < 9214364837600034816) {
+                unsigned int bucket_32 = (unsigned int)(c_1_1 >> 53);
                 atomicAdd(&hist1[bucket_32], 1);
             }
-            unsigned long long c_1_1 = comps_l[1];
-            if (c_1_1 < 9214364837600034816) {
-                unsigned int bucket_33 = (unsigned int)(c_1_1 >> 53);
+            unsigned long long c_2 = comps_l[1];
+            if (c_2 < 9214364837600034816) {
+                unsigned int bucket_33 = (unsigned int)(c_2 >> 53);
                 atomicAdd(&hist1[bucket_33], 1);
             }
-            unsigned long long c_2 = comps_l[2];
-            if (c_2 < 9214364837600034816) {
-                unsigned int bucket_34 = (unsigned int)(c_2 >> 53);
+            unsigned long long c_3 = comps_l[2];
+            if (c_3 < 9214364837600034816) {
+                unsigned int bucket_34 = (unsigned int)(c_3 >> 53);
                 atomicAdd(&hist1[bucket_34], 1);
             }
-            unsigned long long c_3 = comps_l[3];
-            if (c_3 < 9214364837600034816) {
-                unsigned int bucket_35 = (unsigned int)(c_3 >> 53);
+            unsigned long long c_4 = comps_l[3];
+            if (c_4 < 9214364837600034816) {
+                unsigned int bucket_35 = (unsigned int)(c_4 >> 53);
                 atomicAdd(&hist1[bucket_35], 1);
             }
             hist0[tid] = 0;
@@ -35214,24 +35205,24 @@ kernel_cake_radix_topk_c2_e16s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 done = 1;
             }
             if (done == 0) {
-                unsigned long long c_4 = comps_l[0];
-                unsigned int bucket_37 = (unsigned int)(c_4 >> 42 & 2047);
-                if (c_4 >> 53 == (unsigned long long)bucket_36) {
+                unsigned long long c_5 = comps_l[0];
+                unsigned int bucket_37 = (unsigned int)(c_5 >> 42 & 2047);
+                if (c_5 >> 53 == (unsigned long long)bucket_36) {
                     atomicAdd(&hist0[bucket_37], 1);
                 }
-                unsigned long long c_5 = comps_l[1];
-                unsigned int bucket_38 = (unsigned int)(c_5 >> 42 & 2047);
-                if (c_5 >> 53 == (unsigned long long)bucket_36) {
+                unsigned long long c_6 = comps_l[1];
+                unsigned int bucket_38 = (unsigned int)(c_6 >> 42 & 2047);
+                if (c_6 >> 53 == (unsigned long long)bucket_36) {
                     atomicAdd(&hist0[bucket_38], 1);
                 }
-                unsigned long long c_6 = comps_l[2];
-                unsigned int bucket_39 = (unsigned int)(c_6 >> 42 & 2047);
-                if (c_6 >> 53 == (unsigned long long)bucket_36) {
+                unsigned long long c_7 = comps_l[2];
+                unsigned int bucket_39 = (unsigned int)(c_7 >> 42 & 2047);
+                if (c_7 >> 53 == (unsigned long long)bucket_36) {
                     atomicAdd(&hist0[bucket_39], 1);
                 }
-                unsigned long long c_7 = comps_l[3];
-                unsigned int bucket_40 = (unsigned int)(c_7 >> 42 & 2047);
-                if (c_7 >> 53 == (unsigned long long)bucket_36) {
+                unsigned long long c_8 = comps_l[3];
+                unsigned int bucket_40 = (unsigned int)(c_8 >> 42 & 2047);
+                if (c_8 >> 53 == (unsigned long long)bucket_36) {
                     atomicAdd(&hist0[bucket_40], 1);
                 }
                 hist1[tid] = 0;
@@ -35310,24 +35301,24 @@ kernel_cake_radix_topk_c2_e16s_sp_lp_nt(float* __restrict__ probs, int* __restri
                     done = 1;
                 }
                 if (done == 0) {
-                    unsigned long long c_8 = comps_l[0];
-                    unsigned int bucket_43 = (unsigned int)(c_8 >> 32 & 1023);
-                    if (c_8 >> 42 == prefix1) {
+                    unsigned long long c_9 = comps_l[0];
+                    unsigned int bucket_43 = (unsigned int)(c_9 >> 32 & 1023);
+                    if (c_9 >> 42 == prefix1) {
                         atomicAdd(&hist1[bucket_43], 1);
                     }
-                    unsigned long long c_9 = comps_l[1];
-                    unsigned int bucket_44 = (unsigned int)(c_9 >> 32 & 1023);
-                    if (c_9 >> 42 == prefix1) {
+                    unsigned long long c_10 = comps_l[1];
+                    unsigned int bucket_44 = (unsigned int)(c_10 >> 32 & 1023);
+                    if (c_10 >> 42 == prefix1) {
                         atomicAdd(&hist1[bucket_44], 1);
                     }
-                    unsigned long long c_10 = comps_l[2];
-                    unsigned int bucket_45 = (unsigned int)(c_10 >> 32 & 1023);
-                    if (c_10 >> 42 == prefix1) {
+                    unsigned long long c_11 = comps_l[2];
+                    unsigned int bucket_45 = (unsigned int)(c_11 >> 32 & 1023);
+                    if (c_11 >> 42 == prefix1) {
                         atomicAdd(&hist1[bucket_45], 1);
                     }
-                    unsigned long long c_11 = comps_l[3];
-                    unsigned int bucket_46 = (unsigned int)(c_11 >> 32 & 1023);
-                    if (c_11 >> 42 == prefix1) {
+                    unsigned long long c_12 = comps_l[3];
+                    unsigned int bucket_46 = (unsigned int)(c_12 >> 32 & 1023);
+                    if (c_12 >> 42 == prefix1) {
                         atomicAdd(&hist1[bucket_46], 1);
                     }
                     hist0[tid] = 0;
@@ -35414,24 +35405,24 @@ kernel_cake_radix_topk_c2_e16s_sp_lp_nt(float* __restrict__ probs, int* __restri
                             unsigned long long mask_1 = (1 << (unsigned long long)nbits) - 1;
                             unsigned long long sh = (unsigned long long)shift;
                             unsigned long long hi = (unsigned long long)(shift + nbits);
-                            unsigned long long c_12 = comps_l[0];
-                            unsigned int bucket_49 = (unsigned int)(c_12 >> sh & mask_1);
-                            if (c_12 >> hi == tpre) {
+                            unsigned long long c_13 = comps_l[0];
+                            unsigned int bucket_49 = (unsigned int)(c_13 >> sh & mask_1);
+                            if (c_13 >> hi == tpre) {
                                 atomicAdd(&hist0[bucket_49], 1);
                             }
-                            unsigned long long c_13 = comps_l[1];
-                            unsigned int bucket_50 = (unsigned int)(c_13 >> sh & mask_1);
-                            if (c_13 >> hi == tpre) {
+                            unsigned long long c_14 = comps_l[1];
+                            unsigned int bucket_50 = (unsigned int)(c_14 >> sh & mask_1);
+                            if (c_14 >> hi == tpre) {
                                 atomicAdd(&hist0[bucket_50], 1);
                             }
-                            unsigned long long c_14 = comps_l[2];
-                            unsigned int bucket_51 = (unsigned int)(c_14 >> sh & mask_1);
-                            if (c_14 >> hi == tpre) {
+                            unsigned long long c_15 = comps_l[2];
+                            unsigned int bucket_51 = (unsigned int)(c_15 >> sh & mask_1);
+                            if (c_15 >> hi == tpre) {
                                 atomicAdd(&hist0[bucket_51], 1);
                             }
-                            unsigned long long c_15 = comps_l[3];
-                            unsigned int bucket_52 = (unsigned int)(c_15 >> sh & mask_1);
-                            if (c_15 >> hi == tpre) {
+                            unsigned long long c_16 = comps_l[3];
+                            unsigned int bucket_52 = (unsigned int)(c_16 >> sh & mask_1);
+                            if (c_16 >> hi == tpre) {
                                 atomicAdd(&hist0[bucket_52], 1);
                             }
                             __syncthreads();
@@ -36099,85 +36090,85 @@ kernel_cake_radix_topk_c2_e16s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 __syncthreads();
                 unsigned int before_25 = 0;
                 unsigned int total_24 = 0;
-                unsigned int v_16 = scal[16];
-                total_24 = total_24 + v_16;
-                if (warp > 0) {
-                    before_25 = before_25 + v_16;
-                }
-                unsigned int v_17 = scal[17];
+                unsigned int v_17 = scal[16];
                 total_24 = total_24 + v_17;
-                if (warp > 1) {
+                if (warp > 0) {
                     before_25 = before_25 + v_17;
                 }
-                unsigned int v_18 = scal[18];
+                unsigned int v_18 = scal[17];
                 total_24 = total_24 + v_18;
-                if (warp > 2) {
+                if (warp > 1) {
                     before_25 = before_25 + v_18;
                 }
-                unsigned int v_19 = scal[19];
+                unsigned int v_19 = scal[18];
                 total_24 = total_24 + v_19;
-                if (warp > 3) {
+                if (warp > 2) {
                     before_25 = before_25 + v_19;
                 }
-                unsigned int v_20 = scal[20];
+                unsigned int v_20 = scal[19];
                 total_24 = total_24 + v_20;
-                if (warp > 4) {
+                if (warp > 3) {
                     before_25 = before_25 + v_20;
                 }
-                unsigned int v_21 = scal[21];
+                unsigned int v_21 = scal[20];
                 total_24 = total_24 + v_21;
-                if (warp > 5) {
+                if (warp > 4) {
                     before_25 = before_25 + v_21;
                 }
-                unsigned int v_22 = scal[22];
+                unsigned int v_22 = scal[21];
                 total_24 = total_24 + v_22;
-                if (warp > 6) {
+                if (warp > 5) {
                     before_25 = before_25 + v_22;
                 }
-                unsigned int v_23 = scal[23];
+                unsigned int v_23 = scal[22];
                 total_24 = total_24 + v_23;
-                if (warp > 7) {
+                if (warp > 6) {
                     before_25 = before_25 + v_23;
                 }
-                unsigned int v_24 = scal[24];
+                unsigned int v_24 = scal[23];
                 total_24 = total_24 + v_24;
-                if (warp > 8) {
+                if (warp > 7) {
                     before_25 = before_25 + v_24;
                 }
-                unsigned int v_25 = scal[25];
+                unsigned int v_25 = scal[24];
                 total_24 = total_24 + v_25;
-                if (warp > 9) {
+                if (warp > 8) {
                     before_25 = before_25 + v_25;
                 }
-                unsigned int v_26 = scal[26];
+                unsigned int v_26 = scal[25];
                 total_24 = total_24 + v_26;
-                if (warp > 10) {
+                if (warp > 9) {
                     before_25 = before_25 + v_26;
                 }
-                unsigned int v_27 = scal[27];
+                unsigned int v_27 = scal[26];
                 total_24 = total_24 + v_27;
-                if (warp > 11) {
+                if (warp > 10) {
                     before_25 = before_25 + v_27;
                 }
-                unsigned int v_28 = scal[28];
+                unsigned int v_28 = scal[27];
                 total_24 = total_24 + v_28;
-                if (warp > 12) {
+                if (warp > 11) {
                     before_25 = before_25 + v_28;
                 }
-                unsigned int v_29 = scal[29];
+                unsigned int v_29 = scal[28];
                 total_24 = total_24 + v_29;
-                if (warp > 13) {
+                if (warp > 12) {
                     before_25 = before_25 + v_29;
                 }
-                unsigned int v_30 = scal[30];
+                unsigned int v_30 = scal[29];
                 total_24 = total_24 + v_30;
-                if (warp > 14) {
+                if (warp > 13) {
                     before_25 = before_25 + v_30;
                 }
-                unsigned int v_31 = scal[31];
+                unsigned int v_31 = scal[30];
                 total_24 = total_24 + v_31;
-                if (warp > 15) {
+                if (warp > 14) {
                     before_25 = before_25 + v_31;
+                }
+                unsigned int v_32 = scal[31];
+                total_24 = total_24 + v_32;
+                if (warp > 15) {
+                    before_25 = before_25 + v_32;
                 }
                 unsigned int lt_mask_5 = (1 << (unsigned int)lane) - 1;
                 unsigned int pos = before_25;
@@ -36354,24 +36345,24 @@ kernel_cake_radix_topk_c2_e16s_sp_lp_nt(float* __restrict__ probs, int* __restri
                     done_1 = 1;
                 }
                 if (done_1 == 0) {
-                    unsigned long long c_16 = comps2[0];
-                    unsigned int bucket_54_1 = (unsigned int)(c_16 >> 42 & 2047);
-                    if (c_16 >> 53 == (unsigned long long)bucket_sel_1) {
+                    unsigned long long c_17 = comps2[0];
+                    unsigned int bucket_54_1 = (unsigned int)(c_17 >> 42 & 2047);
+                    if (c_17 >> 53 == (unsigned long long)bucket_sel_1) {
                         atomicAdd(&hist0[bucket_54_1], 1);
                     }
-                    unsigned long long c_17 = comps2[1];
-                    unsigned int bucket_55_1 = (unsigned int)(c_17 >> 42 & 2047);
-                    if (c_17 >> 53 == (unsigned long long)bucket_sel_1) {
+                    unsigned long long c_18 = comps2[1];
+                    unsigned int bucket_55_1 = (unsigned int)(c_18 >> 42 & 2047);
+                    if (c_18 >> 53 == (unsigned long long)bucket_sel_1) {
                         atomicAdd(&hist0[bucket_55_1], 1);
                     }
-                    unsigned long long c_18 = comps2[2];
-                    unsigned int bucket_56 = (unsigned int)(c_18 >> 42 & 2047);
-                    if (c_18 >> 53 == (unsigned long long)bucket_sel_1) {
+                    unsigned long long c_19 = comps2[2];
+                    unsigned int bucket_56 = (unsigned int)(c_19 >> 42 & 2047);
+                    if (c_19 >> 53 == (unsigned long long)bucket_sel_1) {
                         atomicAdd(&hist0[bucket_56], 1);
                     }
-                    unsigned long long c_19 = comps2[3];
-                    unsigned int bucket_57 = (unsigned int)(c_19 >> 42 & 2047);
-                    if (c_19 >> 53 == (unsigned long long)bucket_sel_1) {
+                    unsigned long long c_20 = comps2[3];
+                    unsigned int bucket_57 = (unsigned int)(c_20 >> 42 & 2047);
+                    if (c_20 >> 53 == (unsigned long long)bucket_sel_1) {
                         atomicAdd(&hist0[bucket_57], 1);
                     }
                     hist1[tid] = 0;
@@ -36450,24 +36441,24 @@ kernel_cake_radix_topk_c2_e16s_sp_lp_nt(float* __restrict__ probs, int* __restri
                         done_1 = 1;
                     }
                     if (done_1 == 0) {
-                        unsigned long long c_20 = comps2[0];
-                        unsigned int bucket_60 = (unsigned int)(c_20 >> 32 & 1023);
-                        if (c_20 >> 42 == prefix1_1) {
+                        unsigned long long c_21 = comps2[0];
+                        unsigned int bucket_60 = (unsigned int)(c_21 >> 32 & 1023);
+                        if (c_21 >> 42 == prefix1_1) {
                             atomicAdd(&hist1[bucket_60], 1);
                         }
-                        unsigned long long c_21 = comps2[1];
-                        unsigned int bucket_61 = (unsigned int)(c_21 >> 32 & 1023);
-                        if (c_21 >> 42 == prefix1_1) {
+                        unsigned long long c_22 = comps2[1];
+                        unsigned int bucket_61 = (unsigned int)(c_22 >> 32 & 1023);
+                        if (c_22 >> 42 == prefix1_1) {
                             atomicAdd(&hist1[bucket_61], 1);
                         }
-                        unsigned long long c_22 = comps2[2];
-                        unsigned int bucket_62 = (unsigned int)(c_22 >> 32 & 1023);
-                        if (c_22 >> 42 == prefix1_1) {
+                        unsigned long long c_23 = comps2[2];
+                        unsigned int bucket_62 = (unsigned int)(c_23 >> 32 & 1023);
+                        if (c_23 >> 42 == prefix1_1) {
                             atomicAdd(&hist1[bucket_62], 1);
                         }
-                        unsigned long long c_23 = comps2[3];
-                        unsigned int bucket_63 = (unsigned int)(c_23 >> 32 & 1023);
-                        if (c_23 >> 42 == prefix1_1) {
+                        unsigned long long c_24 = comps2[3];
+                        unsigned int bucket_63 = (unsigned int)(c_24 >> 32 & 1023);
+                        if (c_24 >> 42 == prefix1_1) {
                             atomicAdd(&hist1[bucket_63], 1);
                         }
                         hist0[tid] = 0;
@@ -36554,24 +36545,24 @@ kernel_cake_radix_topk_c2_e16s_sp_lp_nt(float* __restrict__ probs, int* __restri
                                 unsigned long long mask_2 = (1 << (unsigned long long)nbits_1) - 1;
                                 unsigned long long sh_1 = (unsigned long long)shift_1;
                                 unsigned long long hi_1 = (unsigned long long)(shift_1 + nbits_1);
-                                unsigned long long c_24 = comps2[0];
-                                unsigned int bucket_66 = (unsigned int)(c_24 >> sh_1 & mask_2);
-                                if (c_24 >> hi_1 == tpre_1) {
+                                unsigned long long c_25 = comps2[0];
+                                unsigned int bucket_66 = (unsigned int)(c_25 >> sh_1 & mask_2);
+                                if (c_25 >> hi_1 == tpre_1) {
                                     atomicAdd(&hist0[bucket_66], 1);
                                 }
-                                unsigned long long c_25 = comps2[1];
-                                unsigned int bucket_67 = (unsigned int)(c_25 >> sh_1 & mask_2);
-                                if (c_25 >> hi_1 == tpre_1) {
+                                unsigned long long c_26 = comps2[1];
+                                unsigned int bucket_67 = (unsigned int)(c_26 >> sh_1 & mask_2);
+                                if (c_26 >> hi_1 == tpre_1) {
                                     atomicAdd(&hist0[bucket_67], 1);
                                 }
-                                unsigned long long c_26 = comps2[2];
-                                unsigned int bucket_68 = (unsigned int)(c_26 >> sh_1 & mask_2);
-                                if (c_26 >> hi_1 == tpre_1) {
+                                unsigned long long c_27 = comps2[2];
+                                unsigned int bucket_68 = (unsigned int)(c_27 >> sh_1 & mask_2);
+                                if (c_27 >> hi_1 == tpre_1) {
                                     atomicAdd(&hist0[bucket_68], 1);
                                 }
-                                unsigned long long c_27 = comps2[3];
-                                unsigned int bucket_69 = (unsigned int)(c_27 >> sh_1 & mask_2);
-                                if (c_27 >> hi_1 == tpre_1) {
+                                unsigned long long c_28 = comps2[3];
+                                unsigned int bucket_69 = (unsigned int)(c_28 >> sh_1 & mask_2);
+                                if (c_28 >> hi_1 == tpre_1) {
                                     atomicAdd(&hist0[bucket_69], 1);
                                 }
                                 __syncthreads();
@@ -36694,167 +36685,167 @@ kernel_cake_radix_topk_c2_e16s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 __syncthreads();
                 unsigned int before_26 = 0;
                 unsigned int total_25 = 0;
-                unsigned int v_32 = scal[32];
-                total_25 = total_25 + v_32;
-                if (warp > 0) {
-                    before_26 = before_26 + v_32;
-                }
-                unsigned int v_33 = scal[33];
+                unsigned int v_33 = scal[32];
                 total_25 = total_25 + v_33;
-                if (warp > 1) {
+                if (warp > 0) {
                     before_26 = before_26 + v_33;
                 }
-                unsigned int v_34 = scal[34];
+                unsigned int v_34 = scal[33];
                 total_25 = total_25 + v_34;
-                if (warp > 2) {
+                if (warp > 1) {
                     before_26 = before_26 + v_34;
                 }
-                unsigned int v_35 = scal[35];
+                unsigned int v_35 = scal[34];
                 total_25 = total_25 + v_35;
-                if (warp > 3) {
+                if (warp > 2) {
                     before_26 = before_26 + v_35;
                 }
-                unsigned int v_36 = scal[36];
+                unsigned int v_36 = scal[35];
                 total_25 = total_25 + v_36;
-                if (warp > 4) {
+                if (warp > 3) {
                     before_26 = before_26 + v_36;
                 }
-                unsigned int v_37 = scal[37];
+                unsigned int v_37 = scal[36];
                 total_25 = total_25 + v_37;
-                if (warp > 5) {
+                if (warp > 4) {
                     before_26 = before_26 + v_37;
                 }
-                unsigned int v_38 = scal[38];
+                unsigned int v_38 = scal[37];
                 total_25 = total_25 + v_38;
-                if (warp > 6) {
+                if (warp > 5) {
                     before_26 = before_26 + v_38;
                 }
-                unsigned int v_39 = scal[39];
+                unsigned int v_39 = scal[38];
                 total_25 = total_25 + v_39;
-                if (warp > 7) {
+                if (warp > 6) {
                     before_26 = before_26 + v_39;
                 }
-                unsigned int v_40 = scal[40];
+                unsigned int v_40 = scal[39];
                 total_25 = total_25 + v_40;
-                if (warp > 8) {
+                if (warp > 7) {
                     before_26 = before_26 + v_40;
                 }
-                unsigned int v_41 = scal[41];
+                unsigned int v_41 = scal[40];
                 total_25 = total_25 + v_41;
-                if (warp > 9) {
+                if (warp > 8) {
                     before_26 = before_26 + v_41;
                 }
-                unsigned int v_42 = scal[42];
+                unsigned int v_42 = scal[41];
                 total_25 = total_25 + v_42;
-                if (warp > 10) {
+                if (warp > 9) {
                     before_26 = before_26 + v_42;
                 }
-                unsigned int v_43 = scal[43];
+                unsigned int v_43 = scal[42];
                 total_25 = total_25 + v_43;
-                if (warp > 11) {
+                if (warp > 10) {
                     before_26 = before_26 + v_43;
                 }
-                unsigned int v_44 = scal[44];
+                unsigned int v_44 = scal[43];
                 total_25 = total_25 + v_44;
-                if (warp > 12) {
+                if (warp > 11) {
                     before_26 = before_26 + v_44;
                 }
-                unsigned int v_45 = scal[45];
+                unsigned int v_45 = scal[44];
                 total_25 = total_25 + v_45;
-                if (warp > 13) {
+                if (warp > 12) {
                     before_26 = before_26 + v_45;
                 }
-                unsigned int v_46 = scal[46];
+                unsigned int v_46 = scal[45];
                 total_25 = total_25 + v_46;
-                if (warp > 14) {
+                if (warp > 13) {
                     before_26 = before_26 + v_46;
                 }
-                unsigned int v_47 = scal[47];
+                unsigned int v_47 = scal[46];
                 total_25 = total_25 + v_47;
-                if (warp > 15) {
+                if (warp > 14) {
                     before_26 = before_26 + v_47;
+                }
+                unsigned int v_48 = scal[47];
+                total_25 = total_25 + v_48;
+                if (warp > 15) {
+                    before_26 = before_26 + v_48;
                 }
                 unsigned int before_27 = 0;
                 unsigned int total_26 = 0;
-                unsigned int v_48 = scal[48];
-                total_26 = total_26 + v_48;
-                if (warp > 0) {
-                    before_27 = before_27 + v_48;
-                }
-                unsigned int v_49 = scal[49];
+                unsigned int v_49 = scal[48];
                 total_26 = total_26 + v_49;
-                if (warp > 1) {
+                if (warp > 0) {
                     before_27 = before_27 + v_49;
                 }
-                unsigned int v_50 = scal[50];
+                unsigned int v_50 = scal[49];
                 total_26 = total_26 + v_50;
-                if (warp > 2) {
+                if (warp > 1) {
                     before_27 = before_27 + v_50;
                 }
-                unsigned int v_51 = scal[51];
+                unsigned int v_51 = scal[50];
                 total_26 = total_26 + v_51;
-                if (warp > 3) {
+                if (warp > 2) {
                     before_27 = before_27 + v_51;
                 }
-                unsigned int v_52 = scal[52];
+                unsigned int v_52 = scal[51];
                 total_26 = total_26 + v_52;
-                if (warp > 4) {
+                if (warp > 3) {
                     before_27 = before_27 + v_52;
                 }
-                unsigned int v_53 = scal[53];
+                unsigned int v_53 = scal[52];
                 total_26 = total_26 + v_53;
-                if (warp > 5) {
+                if (warp > 4) {
                     before_27 = before_27 + v_53;
                 }
-                unsigned int v_54 = scal[54];
+                unsigned int v_54 = scal[53];
                 total_26 = total_26 + v_54;
-                if (warp > 6) {
+                if (warp > 5) {
                     before_27 = before_27 + v_54;
                 }
-                unsigned int v_55 = scal[55];
+                unsigned int v_55 = scal[54];
                 total_26 = total_26 + v_55;
-                if (warp > 7) {
+                if (warp > 6) {
                     before_27 = before_27 + v_55;
                 }
-                unsigned int v_56 = scal[56];
+                unsigned int v_56 = scal[55];
                 total_26 = total_26 + v_56;
-                if (warp > 8) {
+                if (warp > 7) {
                     before_27 = before_27 + v_56;
                 }
-                unsigned int v_57 = scal[57];
+                unsigned int v_57 = scal[56];
                 total_26 = total_26 + v_57;
-                if (warp > 9) {
+                if (warp > 8) {
                     before_27 = before_27 + v_57;
                 }
-                unsigned int v_58 = scal[58];
+                unsigned int v_58 = scal[57];
                 total_26 = total_26 + v_58;
-                if (warp > 10) {
+                if (warp > 9) {
                     before_27 = before_27 + v_58;
                 }
-                unsigned int v_59 = scal[59];
+                unsigned int v_59 = scal[58];
                 total_26 = total_26 + v_59;
-                if (warp > 11) {
+                if (warp > 10) {
                     before_27 = before_27 + v_59;
                 }
-                unsigned int v_60 = scal[60];
+                unsigned int v_60 = scal[59];
                 total_26 = total_26 + v_60;
-                if (warp > 12) {
+                if (warp > 11) {
                     before_27 = before_27 + v_60;
                 }
-                unsigned int v_61 = scal[61];
+                unsigned int v_61 = scal[60];
                 total_26 = total_26 + v_61;
-                if (warp > 13) {
+                if (warp > 12) {
                     before_27 = before_27 + v_61;
                 }
-                unsigned int v_62 = scal[62];
+                unsigned int v_62 = scal[61];
                 total_26 = total_26 + v_62;
-                if (warp > 14) {
+                if (warp > 13) {
                     before_27 = before_27 + v_62;
                 }
-                unsigned int v_63 = scal[63];
+                unsigned int v_63 = scal[62];
                 total_26 = total_26 + v_63;
-                if (warp > 15) {
+                if (warp > 14) {
                     before_27 = before_27 + v_63;
+                }
+                unsigned int v_64 = scal[63];
+                total_26 = total_26 + v_64;
+                if (warp > 15) {
+                    before_27 = before_27 + v_64;
                 }
                 unsigned long long ebase = out_base + (unsigned long long)(total_26 + before_26);
                 unsigned int lt_mask_4_1 = (1 << (unsigned int)lane) - 1;
@@ -36893,26 +36884,26 @@ kernel_cake_radix_topk_c2_e16s_sp_lp_nt(float* __restrict__ probs, int* __restri
             for (int p = 0; p < 3; p++) {
                 unsigned int shift_2 = ((p == 0) ? 21 : ((p == 1) ? 10 : 0));
                 unsigned int nbits_2 = ((p == 2) ? 10 : 11);
-                for (int c_28 = 0; c_28 < nsub; c_28++) {
-                    int i2_96 = start + c_28 * 2048 + tid;
+                for (int c_29 = 0; c_29 < nsub; c_29++) {
+                    int i2_96 = start + c_29 * 2048 + tid;
                     if (i2_96 < vocab) {
                         vals_t[0] = probs[row_base + (unsigned long long)i2_96];
                     } else {
                         vals_t[0] = 0.0f;
                     }
-                    int i2_97 = start + c_28 * 2048 + 512 + tid;
+                    int i2_97 = start + c_29 * 2048 + 512 + tid;
                     if (i2_97 < vocab) {
                         vals_t[1] = probs[row_base + (unsigned long long)i2_97];
                     } else {
                         vals_t[1] = 0.0f;
                     }
-                    int i2_98 = start + c_28 * 2048 + 1024 + tid;
+                    int i2_98 = start + c_29 * 2048 + 1024 + tid;
                     if (i2_98 < vocab) {
                         vals_t[2] = probs[row_base + (unsigned long long)i2_98];
                     } else {
                         vals_t[2] = 0.0f;
                     }
-                    int i2_99 = start + c_28 * 2048 + 1536 + tid;
+                    int i2_99 = start + c_29 * 2048 + 1536 + tid;
                     if (i2_99 < vocab) {
                         vals_t[3] = probs[row_base + (unsigned long long)i2_99];
                     } else {
@@ -37209,26 +37200,26 @@ kernel_cake_radix_topk_c2_e16s_sp_lp_nt(float* __restrict__ probs, int* __restri
             unsigned int take_rem = ((eq_prefix < remaining) ? _min_99 : 0);
             unsigned long long gt_run = out_base + (unsigned long long)gt_prefix;
             unsigned long long eq_run = out_base + (unsigned long long)(gt_total + eq_prefix);
-            for (int c_29 = 0; c_29 < nsub; c_29++) {
-                int i2_100 = start + c_29 * 2048 + tid;
+            for (int c_30 = 0; c_30 < nsub; c_30++) {
+                int i2_100 = start + c_30 * 2048 + tid;
                 if (i2_100 < vocab) {
                     vals_t[0] = probs[row_base + (unsigned long long)i2_100];
                 } else {
                     vals_t[0] = 0.0f;
                 }
-                int i2_101 = start + c_29 * 2048 + 512 + tid;
+                int i2_101 = start + c_30 * 2048 + 512 + tid;
                 if (i2_101 < vocab) {
                     vals_t[1] = probs[row_base + (unsigned long long)i2_101];
                 } else {
                     vals_t[1] = 0.0f;
                 }
-                int i2_102 = start + c_29 * 2048 + 1024 + tid;
+                int i2_102 = start + c_30 * 2048 + 1024 + tid;
                 if (i2_102 < vocab) {
                     vals_t[2] = probs[row_base + (unsigned long long)i2_102];
                 } else {
                     vals_t[2] = 0.0f;
                 }
-                int i2_103 = start + c_29 * 2048 + 1536 + tid;
+                int i2_103 = start + c_30 * 2048 + 1536 + tid;
                 if (i2_103 < vocab) {
                     vals_t[3] = probs[row_base + (unsigned long long)i2_103];
                 } else {
@@ -37237,8 +37228,8 @@ kernel_cake_radix_topk_c2_e16s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 unsigned int gt = 0;
                 unsigned int bits_93 = __as_u32(vals_t[0]);
                 unsigned int key_96 = ((bits_93 <= 2139095040) ? bits_93 : 0);
-                int i_vec = start + c_29 * 2048 + tid * 4;
-                int i_str = start + c_29 * 2048 + tid;
+                int i_vec = start + c_30 * 2048 + tid * 4;
+                int i_str = start + c_30 * 2048 + tid;
                 int i = i_str;
                 int i_2_0 = i;
                 bool tie_1_0 = key_96 == threshold_t && i_2_0 < vocab;
@@ -37251,8 +37242,8 @@ kernel_cake_radix_topk_c2_e16s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 }
                 unsigned int bits_93_1 = __as_u32(vals_t[1]);
                 unsigned int key_93_1 = ((bits_93_1 <= 2139095040) ? bits_93_1 : 0);
-                int i_vec_0 = start + c_29 * 2048 + tid * 4 + 1;
-                int i_str_0 = start + c_29 * 2048 + 512 + tid;
+                int i_vec_0 = start + c_30 * 2048 + tid * 4 + 1;
+                int i_str_0 = start + c_30 * 2048 + 512 + tid;
                 int i_24 = i_str_0;
                 int i_2_1 = i_24;
                 bool tie_1_1 = key_93_1 == threshold_t && i_2_1 < vocab;
@@ -37265,8 +37256,8 @@ kernel_cake_radix_topk_c2_e16s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 }
                 unsigned int bits_94 = __as_u32(vals_t[2]);
                 unsigned int key_94_1 = ((bits_94 <= 2139095040) ? bits_94 : 0);
-                int i_vec_1 = start + c_29 * 2048 + tid * 4 + 2;
-                int i_str_1 = start + c_29 * 2048 + 1024 + tid;
+                int i_vec_1 = start + c_30 * 2048 + tid * 4 + 2;
+                int i_str_1 = start + c_30 * 2048 + 1024 + tid;
                 int i_25 = i_str_1;
                 int i_2_2 = i_25;
                 bool tie_1_2 = key_94_1 == threshold_t && i_2_2 < vocab;
@@ -37279,8 +37270,8 @@ kernel_cake_radix_topk_c2_e16s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 }
                 unsigned int bits_95 = __as_u32(vals_t[3]);
                 unsigned int key_95_1 = ((bits_95 <= 2139095040) ? bits_95 : 0);
-                int i_vec_2 = start + c_29 * 2048 + tid * 4 + 3;
-                int i_str_2 = start + c_29 * 2048 + 1536 + tid;
+                int i_vec_2 = start + c_30 * 2048 + tid * 4 + 3;
+                int i_str_2 = start + c_30 * 2048 + 1536 + tid;
                 int i_26 = i_str_2;
                 int i_2_3 = i_26;
                 bool tie_1_3 = key_95_1 == threshold_t && i_2_3 < vocab;
@@ -37396,9 +37387,9 @@ kernel_cake_radix_topk_c2_e16s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 unsigned int running = excl_1 >> 12;
                 int f2 = tid;
                 if (f2 < 64) {
-                    unsigned int c_0_1 = cnt[f2];
+                    unsigned int c_0 = cnt[f2];
                     cnt[f2] = running;
-                    running = running + c_0_1;
+                    running = running + c_0;
                 }
                 __syncthreads();
                 unsigned int gt_slot = excl_1 & 4095;
@@ -37416,8 +37407,8 @@ kernel_cake_radix_topk_c2_e16s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 unsigned int bits_96 = __as_u32(vals_t[0]);
                 unsigned int key_96_1 = ((bits_96 <= 2139095040) ? bits_96 : 0);
                 keys[0] = key_96_1;
-                int i_vec_3 = start + c_29 * 2048 + tid * 4;
-                int i_str_3 = start + c_29 * 2048 + tid;
+                int i_vec_3 = start + c_30 * 2048 + tid * 4;
+                int i_str_3 = start + c_30 * 2048 + tid;
                 int i_27 = i_str_3;
                 idxs[0] = i_27;
                 ties[0] = keys[0] == threshold_t && idxs[0] < vocab;
@@ -37430,8 +37421,8 @@ kernel_cake_radix_topk_c2_e16s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 unsigned int bits_97 = __as_u32(vals_t[1]);
                 unsigned int key_97 = ((bits_97 <= 2139095040) ? bits_97 : 0);
                 keys[1] = key_97;
-                int i_vec_4 = start + c_29 * 2048 + tid * 4 + 1;
-                int i_str_4 = start + c_29 * 2048 + 512 + tid;
+                int i_vec_4 = start + c_30 * 2048 + tid * 4 + 1;
+                int i_str_4 = start + c_30 * 2048 + 512 + tid;
                 int i_28 = i_str_4;
                 idxs[1] = i_28;
                 ties[1] = keys[1] == threshold_t && idxs[1] < vocab;
@@ -37444,8 +37435,8 @@ kernel_cake_radix_topk_c2_e16s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 unsigned int bits_98 = __as_u32(vals_t[2]);
                 unsigned int key_98 = ((bits_98 <= 2139095040) ? bits_98 : 0);
                 keys[2] = key_98;
-                int i_vec_5 = start + c_29 * 2048 + tid * 4 + 2;
-                int i_str_5 = start + c_29 * 2048 + 1024 + tid;
+                int i_vec_5 = start + c_30 * 2048 + tid * 4 + 2;
+                int i_str_5 = start + c_30 * 2048 + 1024 + tid;
                 int i_29 = i_str_5;
                 idxs[2] = i_29;
                 ties[2] = keys[2] == threshold_t && idxs[2] < vocab;
@@ -37458,8 +37449,8 @@ kernel_cake_radix_topk_c2_e16s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 unsigned int bits_99 = __as_u32(vals_t[3]);
                 unsigned int key_99 = ((bits_99 <= 2139095040) ? bits_99 : 0);
                 keys[3] = key_99;
-                int i_vec_6 = start + c_29 * 2048 + tid * 4 + 3;
-                int i_str_6 = start + c_29 * 2048 + 1536 + tid;
+                int i_vec_6 = start + c_30 * 2048 + tid * 4 + 3;
+                int i_str_6 = start + c_30 * 2048 + 1536 + tid;
                 int i_30 = i_str_6;
                 idxs[3] = i_30;
                 ties[3] = keys[3] == threshold_t && idxs[3] < vocab;
@@ -37549,7 +37540,6 @@ kernel_cake_radix_topk_c2_e16s_sp_lp_nt(float* __restrict__ probs, int* __restri
 } // extern "C"
 
 #undef CAKE_INF
-#undef NUM_MAIN_STAGES
 #undef SMEM_CLIST_OFF
 #undef SMEM_CLIST_STAGE_BYTES
 #undef SMEM_CLIST_STRIDE
@@ -37638,7 +37628,6 @@ kernel_cake_radix_topk_c2_e16s_sp_lp_nt(float* __restrict__ probs, int* __restri
 #undef xbuf64_addr
 
 #define CAKE_INF CUDART_INF_F
-#define NUM_MAIN_STAGES 1
 #define SMEM_HIST0_OFF 0
 #define SMEM_HIST0_STAGE_BYTES 8192
 #define SMEM_HIST0_STRIDE 8192
@@ -41935,85 +41924,85 @@ kernel_cake_radix_topk_c4_e16s_sp_lp_nt(float* __restrict__ probs, int* __restri
     __syncthreads();
     unsigned int before = 0;
     unsigned int total = 0;
-    unsigned int v_0 = scal[16];
-    total = total + v_0;
-    if (warp > 0) {
-        before = before + v_0;
-    }
-    unsigned int v_1 = scal[17];
+    unsigned int v_1 = scal[16];
     total = total + v_1;
-    if (warp > 1) {
+    if (warp > 0) {
         before = before + v_1;
     }
-    unsigned int v_2 = scal[18];
+    unsigned int v_2 = scal[17];
     total = total + v_2;
-    if (warp > 2) {
+    if (warp > 1) {
         before = before + v_2;
     }
-    unsigned int v_3 = scal[19];
+    unsigned int v_3 = scal[18];
     total = total + v_3;
-    if (warp > 3) {
+    if (warp > 2) {
         before = before + v_3;
     }
-    unsigned int v_4 = scal[20];
+    unsigned int v_4 = scal[19];
     total = total + v_4;
-    if (warp > 4) {
+    if (warp > 3) {
         before = before + v_4;
     }
-    unsigned int v_5 = scal[21];
+    unsigned int v_5 = scal[20];
     total = total + v_5;
-    if (warp > 5) {
+    if (warp > 4) {
         before = before + v_5;
     }
-    unsigned int v_6 = scal[22];
+    unsigned int v_6 = scal[21];
     total = total + v_6;
-    if (warp > 6) {
+    if (warp > 5) {
         before = before + v_6;
     }
-    unsigned int v_7 = scal[23];
+    unsigned int v_7 = scal[22];
     total = total + v_7;
-    if (warp > 7) {
+    if (warp > 6) {
         before = before + v_7;
     }
-    unsigned int v_8 = scal[24];
+    unsigned int v_8 = scal[23];
     total = total + v_8;
-    if (warp > 8) {
+    if (warp > 7) {
         before = before + v_8;
     }
-    unsigned int v_9 = scal[25];
+    unsigned int v_9 = scal[24];
     total = total + v_9;
-    if (warp > 9) {
+    if (warp > 8) {
         before = before + v_9;
     }
-    unsigned int v_10 = scal[26];
+    unsigned int v_10 = scal[25];
     total = total + v_10;
-    if (warp > 10) {
+    if (warp > 9) {
         before = before + v_10;
     }
-    unsigned int v_11 = scal[27];
+    unsigned int v_11 = scal[26];
     total = total + v_11;
-    if (warp > 11) {
+    if (warp > 10) {
         before = before + v_11;
     }
-    unsigned int v_12 = scal[28];
+    unsigned int v_12 = scal[27];
     total = total + v_12;
-    if (warp > 12) {
+    if (warp > 11) {
         before = before + v_12;
     }
-    unsigned int v_13 = scal[29];
+    unsigned int v_13 = scal[28];
     total = total + v_13;
-    if (warp > 13) {
+    if (warp > 12) {
         before = before + v_13;
     }
-    unsigned int v_14 = scal[30];
+    unsigned int v_14 = scal[29];
     total = total + v_14;
-    if (warp > 14) {
+    if (warp > 13) {
         before = before + v_14;
     }
-    unsigned int v_15 = scal[31];
+    unsigned int v_15 = scal[30];
     total = total + v_15;
-    if (warp > 15) {
+    if (warp > 14) {
         before = before + v_15;
+    }
+    unsigned int v_16 = scal[31];
+    total = total + v_16;
+    if (warp > 15) {
+        before = before + v_16;
     }
     unsigned int ovf_w = __ballot_sync(0xFFFFFFFF, n_wu > 1024);
     if (tid == 0) {
@@ -42229,24 +42218,24 @@ kernel_cake_radix_topk_c4_e16s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 }
                 acc_1_3 = acc_1_3 + lens[3];
             }
-            unsigned long long c_0 = comps_l[0];
-            if (c_0 < 9214364837600034816) {
-                unsigned int bucket_32 = (unsigned int)(c_0 >> 53);
+            unsigned long long c_1_1 = comps_l[0];
+            if (c_1_1 < 9214364837600034816) {
+                unsigned int bucket_32 = (unsigned int)(c_1_1 >> 53);
                 atomicAdd(&hist1[bucket_32], 1);
             }
-            unsigned long long c_1_1 = comps_l[1];
-            if (c_1_1 < 9214364837600034816) {
-                unsigned int bucket_33 = (unsigned int)(c_1_1 >> 53);
+            unsigned long long c_2 = comps_l[1];
+            if (c_2 < 9214364837600034816) {
+                unsigned int bucket_33 = (unsigned int)(c_2 >> 53);
                 atomicAdd(&hist1[bucket_33], 1);
             }
-            unsigned long long c_2 = comps_l[2];
-            if (c_2 < 9214364837600034816) {
-                unsigned int bucket_34 = (unsigned int)(c_2 >> 53);
+            unsigned long long c_3 = comps_l[2];
+            if (c_3 < 9214364837600034816) {
+                unsigned int bucket_34 = (unsigned int)(c_3 >> 53);
                 atomicAdd(&hist1[bucket_34], 1);
             }
-            unsigned long long c_3 = comps_l[3];
-            if (c_3 < 9214364837600034816) {
-                unsigned int bucket_35 = (unsigned int)(c_3 >> 53);
+            unsigned long long c_4 = comps_l[3];
+            if (c_4 < 9214364837600034816) {
+                unsigned int bucket_35 = (unsigned int)(c_4 >> 53);
                 atomicAdd(&hist1[bucket_35], 1);
             }
             hist0[tid] = 0;
@@ -42326,24 +42315,24 @@ kernel_cake_radix_topk_c4_e16s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 done = 1;
             }
             if (done == 0) {
-                unsigned long long c_4 = comps_l[0];
-                unsigned int bucket_37 = (unsigned int)(c_4 >> 42 & 2047);
-                if (c_4 >> 53 == (unsigned long long)bucket_36) {
+                unsigned long long c_5 = comps_l[0];
+                unsigned int bucket_37 = (unsigned int)(c_5 >> 42 & 2047);
+                if (c_5 >> 53 == (unsigned long long)bucket_36) {
                     atomicAdd(&hist0[bucket_37], 1);
                 }
-                unsigned long long c_5 = comps_l[1];
-                unsigned int bucket_38 = (unsigned int)(c_5 >> 42 & 2047);
-                if (c_5 >> 53 == (unsigned long long)bucket_36) {
+                unsigned long long c_6 = comps_l[1];
+                unsigned int bucket_38 = (unsigned int)(c_6 >> 42 & 2047);
+                if (c_6 >> 53 == (unsigned long long)bucket_36) {
                     atomicAdd(&hist0[bucket_38], 1);
                 }
-                unsigned long long c_6 = comps_l[2];
-                unsigned int bucket_39 = (unsigned int)(c_6 >> 42 & 2047);
-                if (c_6 >> 53 == (unsigned long long)bucket_36) {
+                unsigned long long c_7 = comps_l[2];
+                unsigned int bucket_39 = (unsigned int)(c_7 >> 42 & 2047);
+                if (c_7 >> 53 == (unsigned long long)bucket_36) {
                     atomicAdd(&hist0[bucket_39], 1);
                 }
-                unsigned long long c_7 = comps_l[3];
-                unsigned int bucket_40 = (unsigned int)(c_7 >> 42 & 2047);
-                if (c_7 >> 53 == (unsigned long long)bucket_36) {
+                unsigned long long c_8 = comps_l[3];
+                unsigned int bucket_40 = (unsigned int)(c_8 >> 42 & 2047);
+                if (c_8 >> 53 == (unsigned long long)bucket_36) {
                     atomicAdd(&hist0[bucket_40], 1);
                 }
                 hist1[tid] = 0;
@@ -42422,24 +42411,24 @@ kernel_cake_radix_topk_c4_e16s_sp_lp_nt(float* __restrict__ probs, int* __restri
                     done = 1;
                 }
                 if (done == 0) {
-                    unsigned long long c_8 = comps_l[0];
-                    unsigned int bucket_43 = (unsigned int)(c_8 >> 32 & 1023);
-                    if (c_8 >> 42 == prefix1) {
+                    unsigned long long c_9 = comps_l[0];
+                    unsigned int bucket_43 = (unsigned int)(c_9 >> 32 & 1023);
+                    if (c_9 >> 42 == prefix1) {
                         atomicAdd(&hist1[bucket_43], 1);
                     }
-                    unsigned long long c_9 = comps_l[1];
-                    unsigned int bucket_44 = (unsigned int)(c_9 >> 32 & 1023);
-                    if (c_9 >> 42 == prefix1) {
+                    unsigned long long c_10 = comps_l[1];
+                    unsigned int bucket_44 = (unsigned int)(c_10 >> 32 & 1023);
+                    if (c_10 >> 42 == prefix1) {
                         atomicAdd(&hist1[bucket_44], 1);
                     }
-                    unsigned long long c_10 = comps_l[2];
-                    unsigned int bucket_45 = (unsigned int)(c_10 >> 32 & 1023);
-                    if (c_10 >> 42 == prefix1) {
+                    unsigned long long c_11 = comps_l[2];
+                    unsigned int bucket_45 = (unsigned int)(c_11 >> 32 & 1023);
+                    if (c_11 >> 42 == prefix1) {
                         atomicAdd(&hist1[bucket_45], 1);
                     }
-                    unsigned long long c_11 = comps_l[3];
-                    unsigned int bucket_46 = (unsigned int)(c_11 >> 32 & 1023);
-                    if (c_11 >> 42 == prefix1) {
+                    unsigned long long c_12 = comps_l[3];
+                    unsigned int bucket_46 = (unsigned int)(c_12 >> 32 & 1023);
+                    if (c_12 >> 42 == prefix1) {
                         atomicAdd(&hist1[bucket_46], 1);
                     }
                     hist0[tid] = 0;
@@ -42526,24 +42515,24 @@ kernel_cake_radix_topk_c4_e16s_sp_lp_nt(float* __restrict__ probs, int* __restri
                             unsigned long long mask_1 = (1 << (unsigned long long)nbits) - 1;
                             unsigned long long sh = (unsigned long long)shift;
                             unsigned long long hi = (unsigned long long)(shift + nbits);
-                            unsigned long long c_12 = comps_l[0];
-                            unsigned int bucket_49 = (unsigned int)(c_12 >> sh & mask_1);
-                            if (c_12 >> hi == tpre) {
+                            unsigned long long c_13 = comps_l[0];
+                            unsigned int bucket_49 = (unsigned int)(c_13 >> sh & mask_1);
+                            if (c_13 >> hi == tpre) {
                                 atomicAdd(&hist0[bucket_49], 1);
                             }
-                            unsigned long long c_13 = comps_l[1];
-                            unsigned int bucket_50 = (unsigned int)(c_13 >> sh & mask_1);
-                            if (c_13 >> hi == tpre) {
+                            unsigned long long c_14 = comps_l[1];
+                            unsigned int bucket_50 = (unsigned int)(c_14 >> sh & mask_1);
+                            if (c_14 >> hi == tpre) {
                                 atomicAdd(&hist0[bucket_50], 1);
                             }
-                            unsigned long long c_14 = comps_l[2];
-                            unsigned int bucket_51 = (unsigned int)(c_14 >> sh & mask_1);
-                            if (c_14 >> hi == tpre) {
+                            unsigned long long c_15 = comps_l[2];
+                            unsigned int bucket_51 = (unsigned int)(c_15 >> sh & mask_1);
+                            if (c_15 >> hi == tpre) {
                                 atomicAdd(&hist0[bucket_51], 1);
                             }
-                            unsigned long long c_15 = comps_l[3];
-                            unsigned int bucket_52 = (unsigned int)(c_15 >> sh & mask_1);
-                            if (c_15 >> hi == tpre) {
+                            unsigned long long c_16 = comps_l[3];
+                            unsigned int bucket_52 = (unsigned int)(c_16 >> sh & mask_1);
+                            if (c_16 >> hi == tpre) {
                                 atomicAdd(&hist0[bucket_52], 1);
                             }
                             __syncthreads();
@@ -43247,85 +43236,85 @@ kernel_cake_radix_topk_c4_e16s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 __syncthreads();
                 unsigned int before_25 = 0;
                 unsigned int total_24 = 0;
-                unsigned int v_16 = scal[16];
-                total_24 = total_24 + v_16;
-                if (warp > 0) {
-                    before_25 = before_25 + v_16;
-                }
-                unsigned int v_17 = scal[17];
+                unsigned int v_17 = scal[16];
                 total_24 = total_24 + v_17;
-                if (warp > 1) {
+                if (warp > 0) {
                     before_25 = before_25 + v_17;
                 }
-                unsigned int v_18 = scal[18];
+                unsigned int v_18 = scal[17];
                 total_24 = total_24 + v_18;
-                if (warp > 2) {
+                if (warp > 1) {
                     before_25 = before_25 + v_18;
                 }
-                unsigned int v_19 = scal[19];
+                unsigned int v_19 = scal[18];
                 total_24 = total_24 + v_19;
-                if (warp > 3) {
+                if (warp > 2) {
                     before_25 = before_25 + v_19;
                 }
-                unsigned int v_20 = scal[20];
+                unsigned int v_20 = scal[19];
                 total_24 = total_24 + v_20;
-                if (warp > 4) {
+                if (warp > 3) {
                     before_25 = before_25 + v_20;
                 }
-                unsigned int v_21 = scal[21];
+                unsigned int v_21 = scal[20];
                 total_24 = total_24 + v_21;
-                if (warp > 5) {
+                if (warp > 4) {
                     before_25 = before_25 + v_21;
                 }
-                unsigned int v_22 = scal[22];
+                unsigned int v_22 = scal[21];
                 total_24 = total_24 + v_22;
-                if (warp > 6) {
+                if (warp > 5) {
                     before_25 = before_25 + v_22;
                 }
-                unsigned int v_23 = scal[23];
+                unsigned int v_23 = scal[22];
                 total_24 = total_24 + v_23;
-                if (warp > 7) {
+                if (warp > 6) {
                     before_25 = before_25 + v_23;
                 }
-                unsigned int v_24 = scal[24];
+                unsigned int v_24 = scal[23];
                 total_24 = total_24 + v_24;
-                if (warp > 8) {
+                if (warp > 7) {
                     before_25 = before_25 + v_24;
                 }
-                unsigned int v_25 = scal[25];
+                unsigned int v_25 = scal[24];
                 total_24 = total_24 + v_25;
-                if (warp > 9) {
+                if (warp > 8) {
                     before_25 = before_25 + v_25;
                 }
-                unsigned int v_26 = scal[26];
+                unsigned int v_26 = scal[25];
                 total_24 = total_24 + v_26;
-                if (warp > 10) {
+                if (warp > 9) {
                     before_25 = before_25 + v_26;
                 }
-                unsigned int v_27 = scal[27];
+                unsigned int v_27 = scal[26];
                 total_24 = total_24 + v_27;
-                if (warp > 11) {
+                if (warp > 10) {
                     before_25 = before_25 + v_27;
                 }
-                unsigned int v_28 = scal[28];
+                unsigned int v_28 = scal[27];
                 total_24 = total_24 + v_28;
-                if (warp > 12) {
+                if (warp > 11) {
                     before_25 = before_25 + v_28;
                 }
-                unsigned int v_29 = scal[29];
+                unsigned int v_29 = scal[28];
                 total_24 = total_24 + v_29;
-                if (warp > 13) {
+                if (warp > 12) {
                     before_25 = before_25 + v_29;
                 }
-                unsigned int v_30 = scal[30];
+                unsigned int v_30 = scal[29];
                 total_24 = total_24 + v_30;
-                if (warp > 14) {
+                if (warp > 13) {
                     before_25 = before_25 + v_30;
                 }
-                unsigned int v_31 = scal[31];
+                unsigned int v_31 = scal[30];
                 total_24 = total_24 + v_31;
-                if (warp > 15) {
+                if (warp > 14) {
                     before_25 = before_25 + v_31;
+                }
+                unsigned int v_32 = scal[31];
+                total_24 = total_24 + v_32;
+                if (warp > 15) {
+                    before_25 = before_25 + v_32;
                 }
                 unsigned int lt_mask_5 = (1 << (unsigned int)lane) - 1;
                 unsigned int pos = before_25;
@@ -43622,24 +43611,24 @@ kernel_cake_radix_topk_c4_e16s_sp_lp_nt(float* __restrict__ probs, int* __restri
                     done_1 = 1;
                 }
                 if (done_1 == 0) {
-                    unsigned long long c_16 = comps2[0];
-                    unsigned int bucket_54_1 = (unsigned int)(c_16 >> 42 & 2047);
-                    if (c_16 >> 53 == (unsigned long long)bucket_sel_1) {
+                    unsigned long long c_17 = comps2[0];
+                    unsigned int bucket_54_1 = (unsigned int)(c_17 >> 42 & 2047);
+                    if (c_17 >> 53 == (unsigned long long)bucket_sel_1) {
                         atomicAdd(&hist0[bucket_54_1], 1);
                     }
-                    unsigned long long c_17 = comps2[1];
-                    unsigned int bucket_55_1 = (unsigned int)(c_17 >> 42 & 2047);
-                    if (c_17 >> 53 == (unsigned long long)bucket_sel_1) {
+                    unsigned long long c_18 = comps2[1];
+                    unsigned int bucket_55_1 = (unsigned int)(c_18 >> 42 & 2047);
+                    if (c_18 >> 53 == (unsigned long long)bucket_sel_1) {
                         atomicAdd(&hist0[bucket_55_1], 1);
                     }
-                    unsigned long long c_18 = comps2[2];
-                    unsigned int bucket_56 = (unsigned int)(c_18 >> 42 & 2047);
-                    if (c_18 >> 53 == (unsigned long long)bucket_sel_1) {
+                    unsigned long long c_19 = comps2[2];
+                    unsigned int bucket_56 = (unsigned int)(c_19 >> 42 & 2047);
+                    if (c_19 >> 53 == (unsigned long long)bucket_sel_1) {
                         atomicAdd(&hist0[bucket_56], 1);
                     }
-                    unsigned long long c_19 = comps2[3];
-                    unsigned int bucket_57 = (unsigned int)(c_19 >> 42 & 2047);
-                    if (c_19 >> 53 == (unsigned long long)bucket_sel_1) {
+                    unsigned long long c_20 = comps2[3];
+                    unsigned int bucket_57 = (unsigned int)(c_20 >> 42 & 2047);
+                    if (c_20 >> 53 == (unsigned long long)bucket_sel_1) {
                         atomicAdd(&hist0[bucket_57], 1);
                     }
                     hist1[tid] = 0;
@@ -43718,24 +43707,24 @@ kernel_cake_radix_topk_c4_e16s_sp_lp_nt(float* __restrict__ probs, int* __restri
                         done_1 = 1;
                     }
                     if (done_1 == 0) {
-                        unsigned long long c_20 = comps2[0];
-                        unsigned int bucket_60 = (unsigned int)(c_20 >> 32 & 1023);
-                        if (c_20 >> 42 == prefix1_1) {
+                        unsigned long long c_21 = comps2[0];
+                        unsigned int bucket_60 = (unsigned int)(c_21 >> 32 & 1023);
+                        if (c_21 >> 42 == prefix1_1) {
                             atomicAdd(&hist1[bucket_60], 1);
                         }
-                        unsigned long long c_21 = comps2[1];
-                        unsigned int bucket_61 = (unsigned int)(c_21 >> 32 & 1023);
-                        if (c_21 >> 42 == prefix1_1) {
+                        unsigned long long c_22 = comps2[1];
+                        unsigned int bucket_61 = (unsigned int)(c_22 >> 32 & 1023);
+                        if (c_22 >> 42 == prefix1_1) {
                             atomicAdd(&hist1[bucket_61], 1);
                         }
-                        unsigned long long c_22 = comps2[2];
-                        unsigned int bucket_62 = (unsigned int)(c_22 >> 32 & 1023);
-                        if (c_22 >> 42 == prefix1_1) {
+                        unsigned long long c_23 = comps2[2];
+                        unsigned int bucket_62 = (unsigned int)(c_23 >> 32 & 1023);
+                        if (c_23 >> 42 == prefix1_1) {
                             atomicAdd(&hist1[bucket_62], 1);
                         }
-                        unsigned long long c_23 = comps2[3];
-                        unsigned int bucket_63 = (unsigned int)(c_23 >> 32 & 1023);
-                        if (c_23 >> 42 == prefix1_1) {
+                        unsigned long long c_24 = comps2[3];
+                        unsigned int bucket_63 = (unsigned int)(c_24 >> 32 & 1023);
+                        if (c_24 >> 42 == prefix1_1) {
                             atomicAdd(&hist1[bucket_63], 1);
                         }
                         hist0[tid] = 0;
@@ -43822,24 +43811,24 @@ kernel_cake_radix_topk_c4_e16s_sp_lp_nt(float* __restrict__ probs, int* __restri
                                 unsigned long long mask_2 = (1 << (unsigned long long)nbits_1) - 1;
                                 unsigned long long sh_1 = (unsigned long long)shift_1;
                                 unsigned long long hi_1 = (unsigned long long)(shift_1 + nbits_1);
-                                unsigned long long c_24 = comps2[0];
-                                unsigned int bucket_66 = (unsigned int)(c_24 >> sh_1 & mask_2);
-                                if (c_24 >> hi_1 == tpre_1) {
+                                unsigned long long c_25 = comps2[0];
+                                unsigned int bucket_66 = (unsigned int)(c_25 >> sh_1 & mask_2);
+                                if (c_25 >> hi_1 == tpre_1) {
                                     atomicAdd(&hist0[bucket_66], 1);
                                 }
-                                unsigned long long c_25 = comps2[1];
-                                unsigned int bucket_67 = (unsigned int)(c_25 >> sh_1 & mask_2);
-                                if (c_25 >> hi_1 == tpre_1) {
+                                unsigned long long c_26 = comps2[1];
+                                unsigned int bucket_67 = (unsigned int)(c_26 >> sh_1 & mask_2);
+                                if (c_26 >> hi_1 == tpre_1) {
                                     atomicAdd(&hist0[bucket_67], 1);
                                 }
-                                unsigned long long c_26 = comps2[2];
-                                unsigned int bucket_68 = (unsigned int)(c_26 >> sh_1 & mask_2);
-                                if (c_26 >> hi_1 == tpre_1) {
+                                unsigned long long c_27 = comps2[2];
+                                unsigned int bucket_68 = (unsigned int)(c_27 >> sh_1 & mask_2);
+                                if (c_27 >> hi_1 == tpre_1) {
                                     atomicAdd(&hist0[bucket_68], 1);
                                 }
-                                unsigned long long c_27 = comps2[3];
-                                unsigned int bucket_69 = (unsigned int)(c_27 >> sh_1 & mask_2);
-                                if (c_27 >> hi_1 == tpre_1) {
+                                unsigned long long c_28 = comps2[3];
+                                unsigned int bucket_69 = (unsigned int)(c_28 >> sh_1 & mask_2);
+                                if (c_28 >> hi_1 == tpre_1) {
                                     atomicAdd(&hist0[bucket_69], 1);
                                 }
                                 __syncthreads();
@@ -43962,167 +43951,167 @@ kernel_cake_radix_topk_c4_e16s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 __syncthreads();
                 unsigned int before_26 = 0;
                 unsigned int total_25 = 0;
-                unsigned int v_32 = scal[32];
-                total_25 = total_25 + v_32;
-                if (warp > 0) {
-                    before_26 = before_26 + v_32;
-                }
-                unsigned int v_33 = scal[33];
+                unsigned int v_33 = scal[32];
                 total_25 = total_25 + v_33;
-                if (warp > 1) {
+                if (warp > 0) {
                     before_26 = before_26 + v_33;
                 }
-                unsigned int v_34 = scal[34];
+                unsigned int v_34 = scal[33];
                 total_25 = total_25 + v_34;
-                if (warp > 2) {
+                if (warp > 1) {
                     before_26 = before_26 + v_34;
                 }
-                unsigned int v_35 = scal[35];
+                unsigned int v_35 = scal[34];
                 total_25 = total_25 + v_35;
-                if (warp > 3) {
+                if (warp > 2) {
                     before_26 = before_26 + v_35;
                 }
-                unsigned int v_36 = scal[36];
+                unsigned int v_36 = scal[35];
                 total_25 = total_25 + v_36;
-                if (warp > 4) {
+                if (warp > 3) {
                     before_26 = before_26 + v_36;
                 }
-                unsigned int v_37 = scal[37];
+                unsigned int v_37 = scal[36];
                 total_25 = total_25 + v_37;
-                if (warp > 5) {
+                if (warp > 4) {
                     before_26 = before_26 + v_37;
                 }
-                unsigned int v_38 = scal[38];
+                unsigned int v_38 = scal[37];
                 total_25 = total_25 + v_38;
-                if (warp > 6) {
+                if (warp > 5) {
                     before_26 = before_26 + v_38;
                 }
-                unsigned int v_39 = scal[39];
+                unsigned int v_39 = scal[38];
                 total_25 = total_25 + v_39;
-                if (warp > 7) {
+                if (warp > 6) {
                     before_26 = before_26 + v_39;
                 }
-                unsigned int v_40 = scal[40];
+                unsigned int v_40 = scal[39];
                 total_25 = total_25 + v_40;
-                if (warp > 8) {
+                if (warp > 7) {
                     before_26 = before_26 + v_40;
                 }
-                unsigned int v_41 = scal[41];
+                unsigned int v_41 = scal[40];
                 total_25 = total_25 + v_41;
-                if (warp > 9) {
+                if (warp > 8) {
                     before_26 = before_26 + v_41;
                 }
-                unsigned int v_42 = scal[42];
+                unsigned int v_42 = scal[41];
                 total_25 = total_25 + v_42;
-                if (warp > 10) {
+                if (warp > 9) {
                     before_26 = before_26 + v_42;
                 }
-                unsigned int v_43 = scal[43];
+                unsigned int v_43 = scal[42];
                 total_25 = total_25 + v_43;
-                if (warp > 11) {
+                if (warp > 10) {
                     before_26 = before_26 + v_43;
                 }
-                unsigned int v_44 = scal[44];
+                unsigned int v_44 = scal[43];
                 total_25 = total_25 + v_44;
-                if (warp > 12) {
+                if (warp > 11) {
                     before_26 = before_26 + v_44;
                 }
-                unsigned int v_45 = scal[45];
+                unsigned int v_45 = scal[44];
                 total_25 = total_25 + v_45;
-                if (warp > 13) {
+                if (warp > 12) {
                     before_26 = before_26 + v_45;
                 }
-                unsigned int v_46 = scal[46];
+                unsigned int v_46 = scal[45];
                 total_25 = total_25 + v_46;
-                if (warp > 14) {
+                if (warp > 13) {
                     before_26 = before_26 + v_46;
                 }
-                unsigned int v_47 = scal[47];
+                unsigned int v_47 = scal[46];
                 total_25 = total_25 + v_47;
-                if (warp > 15) {
+                if (warp > 14) {
                     before_26 = before_26 + v_47;
+                }
+                unsigned int v_48 = scal[47];
+                total_25 = total_25 + v_48;
+                if (warp > 15) {
+                    before_26 = before_26 + v_48;
                 }
                 unsigned int before_27 = 0;
                 unsigned int total_26 = 0;
-                unsigned int v_48 = scal[48];
-                total_26 = total_26 + v_48;
-                if (warp > 0) {
-                    before_27 = before_27 + v_48;
-                }
-                unsigned int v_49 = scal[49];
+                unsigned int v_49 = scal[48];
                 total_26 = total_26 + v_49;
-                if (warp > 1) {
+                if (warp > 0) {
                     before_27 = before_27 + v_49;
                 }
-                unsigned int v_50 = scal[50];
+                unsigned int v_50 = scal[49];
                 total_26 = total_26 + v_50;
-                if (warp > 2) {
+                if (warp > 1) {
                     before_27 = before_27 + v_50;
                 }
-                unsigned int v_51 = scal[51];
+                unsigned int v_51 = scal[50];
                 total_26 = total_26 + v_51;
-                if (warp > 3) {
+                if (warp > 2) {
                     before_27 = before_27 + v_51;
                 }
-                unsigned int v_52 = scal[52];
+                unsigned int v_52 = scal[51];
                 total_26 = total_26 + v_52;
-                if (warp > 4) {
+                if (warp > 3) {
                     before_27 = before_27 + v_52;
                 }
-                unsigned int v_53 = scal[53];
+                unsigned int v_53 = scal[52];
                 total_26 = total_26 + v_53;
-                if (warp > 5) {
+                if (warp > 4) {
                     before_27 = before_27 + v_53;
                 }
-                unsigned int v_54 = scal[54];
+                unsigned int v_54 = scal[53];
                 total_26 = total_26 + v_54;
-                if (warp > 6) {
+                if (warp > 5) {
                     before_27 = before_27 + v_54;
                 }
-                unsigned int v_55 = scal[55];
+                unsigned int v_55 = scal[54];
                 total_26 = total_26 + v_55;
-                if (warp > 7) {
+                if (warp > 6) {
                     before_27 = before_27 + v_55;
                 }
-                unsigned int v_56 = scal[56];
+                unsigned int v_56 = scal[55];
                 total_26 = total_26 + v_56;
-                if (warp > 8) {
+                if (warp > 7) {
                     before_27 = before_27 + v_56;
                 }
-                unsigned int v_57 = scal[57];
+                unsigned int v_57 = scal[56];
                 total_26 = total_26 + v_57;
-                if (warp > 9) {
+                if (warp > 8) {
                     before_27 = before_27 + v_57;
                 }
-                unsigned int v_58 = scal[58];
+                unsigned int v_58 = scal[57];
                 total_26 = total_26 + v_58;
-                if (warp > 10) {
+                if (warp > 9) {
                     before_27 = before_27 + v_58;
                 }
-                unsigned int v_59 = scal[59];
+                unsigned int v_59 = scal[58];
                 total_26 = total_26 + v_59;
-                if (warp > 11) {
+                if (warp > 10) {
                     before_27 = before_27 + v_59;
                 }
-                unsigned int v_60 = scal[60];
+                unsigned int v_60 = scal[59];
                 total_26 = total_26 + v_60;
-                if (warp > 12) {
+                if (warp > 11) {
                     before_27 = before_27 + v_60;
                 }
-                unsigned int v_61 = scal[61];
+                unsigned int v_61 = scal[60];
                 total_26 = total_26 + v_61;
-                if (warp > 13) {
+                if (warp > 12) {
                     before_27 = before_27 + v_61;
                 }
-                unsigned int v_62 = scal[62];
+                unsigned int v_62 = scal[61];
                 total_26 = total_26 + v_62;
-                if (warp > 14) {
+                if (warp > 13) {
                     before_27 = before_27 + v_62;
                 }
-                unsigned int v_63 = scal[63];
+                unsigned int v_63 = scal[62];
                 total_26 = total_26 + v_63;
-                if (warp > 15) {
+                if (warp > 14) {
                     before_27 = before_27 + v_63;
+                }
+                unsigned int v_64 = scal[63];
+                total_26 = total_26 + v_64;
+                if (warp > 15) {
+                    before_27 = before_27 + v_64;
                 }
                 unsigned long long ebase = out_base + (unsigned long long)(total_26 + before_26);
                 unsigned int lt_mask_4_1 = (1 << (unsigned int)lane) - 1;
@@ -44161,26 +44150,26 @@ kernel_cake_radix_topk_c4_e16s_sp_lp_nt(float* __restrict__ probs, int* __restri
             for (int p = 0; p < 3; p++) {
                 unsigned int shift_2 = ((p == 0) ? 21 : ((p == 1) ? 10 : 0));
                 unsigned int nbits_2 = ((p == 2) ? 10 : 11);
-                for (int c_28 = 0; c_28 < nsub; c_28++) {
-                    int i2_96 = start + c_28 * 2048 + tid;
+                for (int c_29 = 0; c_29 < nsub; c_29++) {
+                    int i2_96 = start + c_29 * 2048 + tid;
                     if (i2_96 < vocab) {
                         vals_t[0] = probs[row_base + (unsigned long long)i2_96];
                     } else {
                         vals_t[0] = 0.0f;
                     }
-                    int i2_97 = start + c_28 * 2048 + 512 + tid;
+                    int i2_97 = start + c_29 * 2048 + 512 + tid;
                     if (i2_97 < vocab) {
                         vals_t[1] = probs[row_base + (unsigned long long)i2_97];
                     } else {
                         vals_t[1] = 0.0f;
                     }
-                    int i2_98 = start + c_28 * 2048 + 1024 + tid;
+                    int i2_98 = start + c_29 * 2048 + 1024 + tid;
                     if (i2_98 < vocab) {
                         vals_t[2] = probs[row_base + (unsigned long long)i2_98];
                     } else {
                         vals_t[2] = 0.0f;
                     }
-                    int i2_99 = start + c_28 * 2048 + 1536 + tid;
+                    int i2_99 = start + c_29 * 2048 + 1536 + tid;
                     if (i2_99 < vocab) {
                         vals_t[3] = probs[row_base + (unsigned long long)i2_99];
                     } else {
@@ -44501,26 +44490,26 @@ kernel_cake_radix_topk_c4_e16s_sp_lp_nt(float* __restrict__ probs, int* __restri
             unsigned int take_rem = ((eq_prefix < remaining) ? _min_113 : 0);
             unsigned long long gt_run = out_base + (unsigned long long)gt_prefix;
             unsigned long long eq_run = out_base + (unsigned long long)(gt_total + eq_prefix);
-            for (int c_29 = 0; c_29 < nsub; c_29++) {
-                int i2_100 = start + c_29 * 2048 + tid;
+            for (int c_30 = 0; c_30 < nsub; c_30++) {
+                int i2_100 = start + c_30 * 2048 + tid;
                 if (i2_100 < vocab) {
                     vals_t[0] = probs[row_base + (unsigned long long)i2_100];
                 } else {
                     vals_t[0] = 0.0f;
                 }
-                int i2_101 = start + c_29 * 2048 + 512 + tid;
+                int i2_101 = start + c_30 * 2048 + 512 + tid;
                 if (i2_101 < vocab) {
                     vals_t[1] = probs[row_base + (unsigned long long)i2_101];
                 } else {
                     vals_t[1] = 0.0f;
                 }
-                int i2_102 = start + c_29 * 2048 + 1024 + tid;
+                int i2_102 = start + c_30 * 2048 + 1024 + tid;
                 if (i2_102 < vocab) {
                     vals_t[2] = probs[row_base + (unsigned long long)i2_102];
                 } else {
                     vals_t[2] = 0.0f;
                 }
-                int i2_103 = start + c_29 * 2048 + 1536 + tid;
+                int i2_103 = start + c_30 * 2048 + 1536 + tid;
                 if (i2_103 < vocab) {
                     vals_t[3] = probs[row_base + (unsigned long long)i2_103];
                 } else {
@@ -44529,8 +44518,8 @@ kernel_cake_radix_topk_c4_e16s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 unsigned int gt = 0;
                 unsigned int bits_93 = __as_u32(vals_t[0]);
                 unsigned int key_96 = ((bits_93 <= 2139095040) ? bits_93 : 0);
-                int i_vec = start + c_29 * 2048 + tid * 4;
-                int i_str = start + c_29 * 2048 + tid;
+                int i_vec = start + c_30 * 2048 + tid * 4;
+                int i_str = start + c_30 * 2048 + tid;
                 int i = i_str;
                 int i_2_0 = i;
                 bool tie_1_0 = key_96 == threshold_t && i_2_0 < vocab;
@@ -44543,8 +44532,8 @@ kernel_cake_radix_topk_c4_e16s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 }
                 unsigned int bits_93_1 = __as_u32(vals_t[1]);
                 unsigned int key_93_1 = ((bits_93_1 <= 2139095040) ? bits_93_1 : 0);
-                int i_vec_0 = start + c_29 * 2048 + tid * 4 + 1;
-                int i_str_0 = start + c_29 * 2048 + 512 + tid;
+                int i_vec_0 = start + c_30 * 2048 + tid * 4 + 1;
+                int i_str_0 = start + c_30 * 2048 + 512 + tid;
                 int i_24 = i_str_0;
                 int i_2_1 = i_24;
                 bool tie_1_1 = key_93_1 == threshold_t && i_2_1 < vocab;
@@ -44557,8 +44546,8 @@ kernel_cake_radix_topk_c4_e16s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 }
                 unsigned int bits_94 = __as_u32(vals_t[2]);
                 unsigned int key_94_1 = ((bits_94 <= 2139095040) ? bits_94 : 0);
-                int i_vec_1 = start + c_29 * 2048 + tid * 4 + 2;
-                int i_str_1 = start + c_29 * 2048 + 1024 + tid;
+                int i_vec_1 = start + c_30 * 2048 + tid * 4 + 2;
+                int i_str_1 = start + c_30 * 2048 + 1024 + tid;
                 int i_25 = i_str_1;
                 int i_2_2 = i_25;
                 bool tie_1_2 = key_94_1 == threshold_t && i_2_2 < vocab;
@@ -44571,8 +44560,8 @@ kernel_cake_radix_topk_c4_e16s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 }
                 unsigned int bits_95 = __as_u32(vals_t[3]);
                 unsigned int key_95_1 = ((bits_95 <= 2139095040) ? bits_95 : 0);
-                int i_vec_2 = start + c_29 * 2048 + tid * 4 + 3;
-                int i_str_2 = start + c_29 * 2048 + 1536 + tid;
+                int i_vec_2 = start + c_30 * 2048 + tid * 4 + 3;
+                int i_str_2 = start + c_30 * 2048 + 1536 + tid;
                 int i_26 = i_str_2;
                 int i_2_3 = i_26;
                 bool tie_1_3 = key_95_1 == threshold_t && i_2_3 < vocab;
@@ -44688,9 +44677,9 @@ kernel_cake_radix_topk_c4_e16s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 unsigned int running = excl_1 >> 12;
                 int f2 = tid;
                 if (f2 < 64) {
-                    unsigned int c_0_1 = cnt[f2];
+                    unsigned int c_0 = cnt[f2];
                     cnt[f2] = running;
-                    running = running + c_0_1;
+                    running = running + c_0;
                 }
                 __syncthreads();
                 unsigned int gt_slot = excl_1 & 4095;
@@ -44708,8 +44697,8 @@ kernel_cake_radix_topk_c4_e16s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 unsigned int bits_96 = __as_u32(vals_t[0]);
                 unsigned int key_96_1 = ((bits_96 <= 2139095040) ? bits_96 : 0);
                 keys[0] = key_96_1;
-                int i_vec_3 = start + c_29 * 2048 + tid * 4;
-                int i_str_3 = start + c_29 * 2048 + tid;
+                int i_vec_3 = start + c_30 * 2048 + tid * 4;
+                int i_str_3 = start + c_30 * 2048 + tid;
                 int i_27 = i_str_3;
                 idxs[0] = i_27;
                 ties[0] = keys[0] == threshold_t && idxs[0] < vocab;
@@ -44722,8 +44711,8 @@ kernel_cake_radix_topk_c4_e16s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 unsigned int bits_97 = __as_u32(vals_t[1]);
                 unsigned int key_97 = ((bits_97 <= 2139095040) ? bits_97 : 0);
                 keys[1] = key_97;
-                int i_vec_4 = start + c_29 * 2048 + tid * 4 + 1;
-                int i_str_4 = start + c_29 * 2048 + 512 + tid;
+                int i_vec_4 = start + c_30 * 2048 + tid * 4 + 1;
+                int i_str_4 = start + c_30 * 2048 + 512 + tid;
                 int i_28 = i_str_4;
                 idxs[1] = i_28;
                 ties[1] = keys[1] == threshold_t && idxs[1] < vocab;
@@ -44736,8 +44725,8 @@ kernel_cake_radix_topk_c4_e16s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 unsigned int bits_98 = __as_u32(vals_t[2]);
                 unsigned int key_98 = ((bits_98 <= 2139095040) ? bits_98 : 0);
                 keys[2] = key_98;
-                int i_vec_5 = start + c_29 * 2048 + tid * 4 + 2;
-                int i_str_5 = start + c_29 * 2048 + 1024 + tid;
+                int i_vec_5 = start + c_30 * 2048 + tid * 4 + 2;
+                int i_str_5 = start + c_30 * 2048 + 1024 + tid;
                 int i_29 = i_str_5;
                 idxs[2] = i_29;
                 ties[2] = keys[2] == threshold_t && idxs[2] < vocab;
@@ -44750,8 +44739,8 @@ kernel_cake_radix_topk_c4_e16s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 unsigned int bits_99 = __as_u32(vals_t[3]);
                 unsigned int key_99 = ((bits_99 <= 2139095040) ? bits_99 : 0);
                 keys[3] = key_99;
-                int i_vec_6 = start + c_29 * 2048 + tid * 4 + 3;
-                int i_str_6 = start + c_29 * 2048 + 1536 + tid;
+                int i_vec_6 = start + c_30 * 2048 + tid * 4 + 3;
+                int i_str_6 = start + c_30 * 2048 + 1536 + tid;
                 int i_30 = i_str_6;
                 idxs[3] = i_30;
                 ties[3] = keys[3] == threshold_t && idxs[3] < vocab;
@@ -44841,7 +44830,6 @@ kernel_cake_radix_topk_c4_e16s_sp_lp_nt(float* __restrict__ probs, int* __restri
 } // extern "C"
 
 #undef CAKE_INF
-#undef NUM_MAIN_STAGES
 #undef SMEM_CLIST_OFF
 #undef SMEM_CLIST_STAGE_BYTES
 #undef SMEM_CLIST_STRIDE
@@ -44930,7 +44918,6 @@ kernel_cake_radix_topk_c4_e16s_sp_lp_nt(float* __restrict__ probs, int* __restri
 #undef xbuf64_addr
 
 #define CAKE_INF CUDART_INF_F
-#define NUM_MAIN_STAGES 1
 #define SMEM_HIST0_OFF 0
 #define SMEM_HIST0_STAGE_BYTES 8192
 #define SMEM_HIST0_STRIDE 8192
@@ -46096,10 +46083,10 @@ kernel_cake_radix_topk_c8_e16s_sp_lp_nt(float* __restrict__ probs, int* __restri
         asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(owner_1) : "r"(((is_owner_1 != 0) ? (unsigned int)lane : 0)));
         unsigned int found_1;
         asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(found_1) : "r"(is_owner_1));
-        unsigned int pos_b_1 = __shfl_sync(0xFFFFFFFF, pos_1, owner_1);
-        unsigned int rem_b_1 = __shfl_sync(0xFFFFFFFF, rem_after_1, owner_1);
+        unsigned int pos_b_2 = __shfl_sync(0xFFFFFFFF, pos_1, owner_1);
+        unsigned int rem_b_2 = __shfl_sync(0xFFFFFFFF, rem_after_1, owner_1);
         unsigned int cnt_b_1 = __shfl_sync(0xFFFFFFFF, cnt_2, owner_1);
-        unsigned int lo_b_1 = __shfl_sync(0xFFFFFFFF, lo_sel_1, owner_1);
+        unsigned int lo_b_2 = __shfl_sync(0xFFFFFFFF, lo_sel_1, owner_1);
         ff[0] = 0;
         lf[0] = 0;
         ff[1] = 0;
@@ -46243,21 +46230,21 @@ kernel_cake_radix_topk_c8_e16s_sp_lp_nt(float* __restrict__ probs, int* __restri
         asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(owner_2) : "r"(((is_owner_2 != 0) ? (unsigned int)lane : 0)));
         unsigned int found_2;
         asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(found_2) : "r"(is_owner_2));
-        unsigned int pos_b_2 = __shfl_sync(0xFFFFFFFF, pos_2, owner_2);
-        unsigned int rem_b_2 = __shfl_sync(0xFFFFFFFF, rem_after_2, owner_2);
+        unsigned int pos_b_3 = __shfl_sync(0xFFFFFFFF, pos_2, owner_2);
+        unsigned int rem_b_3 = __shfl_sync(0xFFFFFFFF, rem_after_2, owner_2);
         unsigned int cnt_b_2 = __shfl_sync(0xFFFFFFFF, cnt_3, owner_2);
-        unsigned int lo_b_2 = __shfl_sync(0xFFFFFFFF, lo_sel_2, owner_2);
+        unsigned int lo_b_3 = __shfl_sync(0xFFFFFFFF, lo_sel_2, owner_2);
         unsigned int b_need = 0;
         unsigned int mass_need = 0;
         if (found != 0) {
-            b_need = pos_b * 16 + pos_b_1;
-            mass_need = rem_need - rem_b_1 + cnt_b_1;
+            b_need = pos_b * 16 + pos_b_2;
+            mass_need = rem_need - rem_b_2 + cnt_b_1;
         }
         unsigned int b_cap = 0;
         unsigned int mass_cap = 0;
         if (found_0 != 0) {
-            b_cap = pos_b_0 * 16 + pos_b_2 + 1;
-            mass_cap = rem_cap - rem_b_2;
+            b_cap = pos_b_0 * 16 + pos_b_3 + 1;
+            mass_cap = rem_cap - rem_b_3;
         }
         if (lane == 0) {
             unsigned int _max_78 = ((b_need) > (b_cap) ? (b_need) : (b_cap));
@@ -49678,85 +49665,85 @@ kernel_cake_radix_topk_c8_e16s_sp_lp_nt(float* __restrict__ probs, int* __restri
     __syncthreads();
     unsigned int before = 0;
     unsigned int total = 0;
-    unsigned int v_0 = scal[16];
-    total = total + v_0;
-    if (warp > 0) {
-        before = before + v_0;
-    }
-    unsigned int v_1 = scal[17];
+    unsigned int v_1 = scal[16];
     total = total + v_1;
-    if (warp > 1) {
+    if (warp > 0) {
         before = before + v_1;
     }
-    unsigned int v_2 = scal[18];
+    unsigned int v_2 = scal[17];
     total = total + v_2;
-    if (warp > 2) {
+    if (warp > 1) {
         before = before + v_2;
     }
-    unsigned int v_3 = scal[19];
+    unsigned int v_3 = scal[18];
     total = total + v_3;
-    if (warp > 3) {
+    if (warp > 2) {
         before = before + v_3;
     }
-    unsigned int v_4 = scal[20];
+    unsigned int v_4 = scal[19];
     total = total + v_4;
-    if (warp > 4) {
+    if (warp > 3) {
         before = before + v_4;
     }
-    unsigned int v_5 = scal[21];
+    unsigned int v_5 = scal[20];
     total = total + v_5;
-    if (warp > 5) {
+    if (warp > 4) {
         before = before + v_5;
     }
-    unsigned int v_6 = scal[22];
+    unsigned int v_6 = scal[21];
     total = total + v_6;
-    if (warp > 6) {
+    if (warp > 5) {
         before = before + v_6;
     }
-    unsigned int v_7 = scal[23];
+    unsigned int v_7 = scal[22];
     total = total + v_7;
-    if (warp > 7) {
+    if (warp > 6) {
         before = before + v_7;
     }
-    unsigned int v_8 = scal[24];
+    unsigned int v_8 = scal[23];
     total = total + v_8;
-    if (warp > 8) {
+    if (warp > 7) {
         before = before + v_8;
     }
-    unsigned int v_9 = scal[25];
+    unsigned int v_9 = scal[24];
     total = total + v_9;
-    if (warp > 9) {
+    if (warp > 8) {
         before = before + v_9;
     }
-    unsigned int v_10 = scal[26];
+    unsigned int v_10 = scal[25];
     total = total + v_10;
-    if (warp > 10) {
+    if (warp > 9) {
         before = before + v_10;
     }
-    unsigned int v_11 = scal[27];
+    unsigned int v_11 = scal[26];
     total = total + v_11;
-    if (warp > 11) {
+    if (warp > 10) {
         before = before + v_11;
     }
-    unsigned int v_12 = scal[28];
+    unsigned int v_12 = scal[27];
     total = total + v_12;
-    if (warp > 12) {
+    if (warp > 11) {
         before = before + v_12;
     }
-    unsigned int v_13 = scal[29];
+    unsigned int v_13 = scal[28];
     total = total + v_13;
-    if (warp > 13) {
+    if (warp > 12) {
         before = before + v_13;
     }
-    unsigned int v_14 = scal[30];
+    unsigned int v_14 = scal[29];
     total = total + v_14;
-    if (warp > 14) {
+    if (warp > 13) {
         before = before + v_14;
     }
-    unsigned int v_15 = scal[31];
+    unsigned int v_15 = scal[30];
     total = total + v_15;
-    if (warp > 15) {
+    if (warp > 14) {
         before = before + v_15;
+    }
+    unsigned int v_16 = scal[31];
+    total = total + v_16;
+    if (warp > 15) {
+        before = before + v_16;
     }
     unsigned int ovf_w = __ballot_sync(0xFFFFFFFF, n_wu > 1024);
     if (tid == 0) {
@@ -50088,24 +50075,24 @@ kernel_cake_radix_topk_c8_e16s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 }
                 acc_1_3 = acc_1_3 + lens[7];
             }
-            unsigned long long c_0 = comps_l[0];
-            if (c_0 < 9214364837600034816) {
-                unsigned int bucket_32 = (unsigned int)(c_0 >> 53);
+            unsigned long long c_1_1 = comps_l[0];
+            if (c_1_1 < 9214364837600034816) {
+                unsigned int bucket_32 = (unsigned int)(c_1_1 >> 53);
                 atomicAdd(&hist1[bucket_32], 1);
             }
-            unsigned long long c_1_1 = comps_l[1];
-            if (c_1_1 < 9214364837600034816) {
-                unsigned int bucket_33 = (unsigned int)(c_1_1 >> 53);
+            unsigned long long c_2 = comps_l[1];
+            if (c_2 < 9214364837600034816) {
+                unsigned int bucket_33 = (unsigned int)(c_2 >> 53);
                 atomicAdd(&hist1[bucket_33], 1);
             }
-            unsigned long long c_2 = comps_l[2];
-            if (c_2 < 9214364837600034816) {
-                unsigned int bucket_34 = (unsigned int)(c_2 >> 53);
+            unsigned long long c_3 = comps_l[2];
+            if (c_3 < 9214364837600034816) {
+                unsigned int bucket_34 = (unsigned int)(c_3 >> 53);
                 atomicAdd(&hist1[bucket_34], 1);
             }
-            unsigned long long c_3 = comps_l[3];
-            if (c_3 < 9214364837600034816) {
-                unsigned int bucket_35 = (unsigned int)(c_3 >> 53);
+            unsigned long long c_4 = comps_l[3];
+            if (c_4 < 9214364837600034816) {
+                unsigned int bucket_35 = (unsigned int)(c_4 >> 53);
                 atomicAdd(&hist1[bucket_35], 1);
             }
             hist0[tid] = 0;
@@ -50185,24 +50172,24 @@ kernel_cake_radix_topk_c8_e16s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 done = 1;
             }
             if (done == 0) {
-                unsigned long long c_4 = comps_l[0];
-                unsigned int bucket_37 = (unsigned int)(c_4 >> 42 & 2047);
-                if (c_4 >> 53 == (unsigned long long)bucket_36) {
+                unsigned long long c_5 = comps_l[0];
+                unsigned int bucket_37 = (unsigned int)(c_5 >> 42 & 2047);
+                if (c_5 >> 53 == (unsigned long long)bucket_36) {
                     atomicAdd(&hist0[bucket_37], 1);
                 }
-                unsigned long long c_5 = comps_l[1];
-                unsigned int bucket_38 = (unsigned int)(c_5 >> 42 & 2047);
-                if (c_5 >> 53 == (unsigned long long)bucket_36) {
+                unsigned long long c_6 = comps_l[1];
+                unsigned int bucket_38 = (unsigned int)(c_6 >> 42 & 2047);
+                if (c_6 >> 53 == (unsigned long long)bucket_36) {
                     atomicAdd(&hist0[bucket_38], 1);
                 }
-                unsigned long long c_6 = comps_l[2];
-                unsigned int bucket_39 = (unsigned int)(c_6 >> 42 & 2047);
-                if (c_6 >> 53 == (unsigned long long)bucket_36) {
+                unsigned long long c_7 = comps_l[2];
+                unsigned int bucket_39 = (unsigned int)(c_7 >> 42 & 2047);
+                if (c_7 >> 53 == (unsigned long long)bucket_36) {
                     atomicAdd(&hist0[bucket_39], 1);
                 }
-                unsigned long long c_7 = comps_l[3];
-                unsigned int bucket_40 = (unsigned int)(c_7 >> 42 & 2047);
-                if (c_7 >> 53 == (unsigned long long)bucket_36) {
+                unsigned long long c_8 = comps_l[3];
+                unsigned int bucket_40 = (unsigned int)(c_8 >> 42 & 2047);
+                if (c_8 >> 53 == (unsigned long long)bucket_36) {
                     atomicAdd(&hist0[bucket_40], 1);
                 }
                 hist1[tid] = 0;
@@ -50281,24 +50268,24 @@ kernel_cake_radix_topk_c8_e16s_sp_lp_nt(float* __restrict__ probs, int* __restri
                     done = 1;
                 }
                 if (done == 0) {
-                    unsigned long long c_8 = comps_l[0];
-                    unsigned int bucket_43 = (unsigned int)(c_8 >> 32 & 1023);
-                    if (c_8 >> 42 == prefix1) {
+                    unsigned long long c_9 = comps_l[0];
+                    unsigned int bucket_43 = (unsigned int)(c_9 >> 32 & 1023);
+                    if (c_9 >> 42 == prefix1) {
                         atomicAdd(&hist1[bucket_43], 1);
                     }
-                    unsigned long long c_9 = comps_l[1];
-                    unsigned int bucket_44 = (unsigned int)(c_9 >> 32 & 1023);
-                    if (c_9 >> 42 == prefix1) {
+                    unsigned long long c_10 = comps_l[1];
+                    unsigned int bucket_44 = (unsigned int)(c_10 >> 32 & 1023);
+                    if (c_10 >> 42 == prefix1) {
                         atomicAdd(&hist1[bucket_44], 1);
                     }
-                    unsigned long long c_10 = comps_l[2];
-                    unsigned int bucket_45 = (unsigned int)(c_10 >> 32 & 1023);
-                    if (c_10 >> 42 == prefix1) {
+                    unsigned long long c_11 = comps_l[2];
+                    unsigned int bucket_45 = (unsigned int)(c_11 >> 32 & 1023);
+                    if (c_11 >> 42 == prefix1) {
                         atomicAdd(&hist1[bucket_45], 1);
                     }
-                    unsigned long long c_11 = comps_l[3];
-                    unsigned int bucket_46 = (unsigned int)(c_11 >> 32 & 1023);
-                    if (c_11 >> 42 == prefix1) {
+                    unsigned long long c_12 = comps_l[3];
+                    unsigned int bucket_46 = (unsigned int)(c_12 >> 32 & 1023);
+                    if (c_12 >> 42 == prefix1) {
                         atomicAdd(&hist1[bucket_46], 1);
                     }
                     hist0[tid] = 0;
@@ -50385,24 +50372,24 @@ kernel_cake_radix_topk_c8_e16s_sp_lp_nt(float* __restrict__ probs, int* __restri
                             unsigned long long mask_1 = (1 << (unsigned long long)nbits) - 1;
                             unsigned long long sh = (unsigned long long)shift;
                             unsigned long long hi = (unsigned long long)(shift + nbits);
-                            unsigned long long c_12 = comps_l[0];
-                            unsigned int bucket_49 = (unsigned int)(c_12 >> sh & mask_1);
-                            if (c_12 >> hi == tpre) {
+                            unsigned long long c_13 = comps_l[0];
+                            unsigned int bucket_49 = (unsigned int)(c_13 >> sh & mask_1);
+                            if (c_13 >> hi == tpre) {
                                 atomicAdd(&hist0[bucket_49], 1);
                             }
-                            unsigned long long c_13 = comps_l[1];
-                            unsigned int bucket_50 = (unsigned int)(c_13 >> sh & mask_1);
-                            if (c_13 >> hi == tpre) {
+                            unsigned long long c_14 = comps_l[1];
+                            unsigned int bucket_50 = (unsigned int)(c_14 >> sh & mask_1);
+                            if (c_14 >> hi == tpre) {
                                 atomicAdd(&hist0[bucket_50], 1);
                             }
-                            unsigned long long c_14 = comps_l[2];
-                            unsigned int bucket_51 = (unsigned int)(c_14 >> sh & mask_1);
-                            if (c_14 >> hi == tpre) {
+                            unsigned long long c_15 = comps_l[2];
+                            unsigned int bucket_51 = (unsigned int)(c_15 >> sh & mask_1);
+                            if (c_15 >> hi == tpre) {
                                 atomicAdd(&hist0[bucket_51], 1);
                             }
-                            unsigned long long c_15 = comps_l[3];
-                            unsigned int bucket_52 = (unsigned int)(c_15 >> sh & mask_1);
-                            if (c_15 >> hi == tpre) {
+                            unsigned long long c_16 = comps_l[3];
+                            unsigned int bucket_52 = (unsigned int)(c_16 >> sh & mask_1);
+                            if (c_16 >> hi == tpre) {
                                 atomicAdd(&hist0[bucket_52], 1);
                             }
                             __syncthreads();
@@ -51154,10 +51141,10 @@ kernel_cake_radix_topk_c8_e16s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(owner_3) : "r"(((is_owner_3 != 0) ? (unsigned int)lane : 0)));
                 unsigned int found_3;
                 asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(found_3) : "r"(is_owner_3));
-                unsigned int pos_b_3 = __shfl_sync(0xFFFFFFFF, pos_99, owner_3);
-                unsigned int rem_b_3 = __shfl_sync(0xFFFFFFFF, rem_after_3, owner_3);
+                unsigned int pos_b_1 = __shfl_sync(0xFFFFFFFF, pos_99, owner_3);
+                unsigned int rem_b_1 = __shfl_sync(0xFFFFFFFF, rem_after_3, owner_3);
                 unsigned int cnt_b_4 = __shfl_sync(0xFFFFFFFF, cnt_8, owner_3);
-                unsigned int lo_b_3 = __shfl_sync(0xFFFFFFFF, lo_sel_3, owner_3);
+                unsigned int lo_b_1 = __shfl_sync(0xFFFFFFFF, lo_sel_3, owner_3);
                 unsigned int ff_1[4];
                 unsigned int lf_1[4];
                 ff_1[0] = 0;
@@ -51169,7 +51156,7 @@ kernel_cake_radix_topk_c8_e16s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 ff_1[3] = 0;
                 lf_1[3] = 0;
                 int quad_1 = lane & 3;
-                int off_1 = ((int)pos_b_3 * 16 + quad_1 * 4) * 4;
+                int off_1 = ((int)pos_b_1 * 16 + quad_1 * 4) * 4;
                 int r_4 = lane >> 2;
                 if (r_4 < 8) {
                     unsigned int words_24[4];
@@ -51270,30 +51257,30 @@ kernel_cake_radix_topk_c8_e16s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 unsigned int rem_after_3_1 = 0;
                 unsigned int cnt_9 = 0;
                 unsigned int lo_sel_3_1 = 0;
-                if (above_6_1 < rem_b_3 && rem_b_3 <= above_6_1 + local_10) {
+                if (above_6_1 < rem_b_1 && rem_b_1 <= above_6_1 + local_10) {
                     is_owner_3_1 = 1;
                     unsigned int s3_9 = above_6_1 + ff_1[3];
                     unsigned int s2_9 = s3_9 + ff_1[2];
                     unsigned int s1_9 = s2_9 + ff_1[1];
-                    if (rem_b_3 <= s3_9) {
+                    if (rem_b_1 <= s3_9) {
                         pos_99_1 = (unsigned int)(lane * 4 + 3);
-                        rem_after_3_1 = rem_b_3 - above_6_1;
+                        rem_after_3_1 = rem_b_1 - above_6_1;
                         cnt_9 = ff_1[3];
                         lo_sel_3_1 = lo_above_3_1;
-                    } else if (rem_b_3 <= s2_9) {
+                    } else if (rem_b_1 <= s2_9) {
                         pos_99_1 = (unsigned int)(lane * 4 + 2);
-                        rem_after_3_1 = rem_b_3 - s3_9;
+                        rem_after_3_1 = rem_b_1 - s3_9;
                         cnt_9 = ff_1[2];
                         lo_sel_3_1 = lo_above_3_1 + lf_1[3];
                     } else {
-                        if (rem_b_3 <= s1_9) {
+                        if (rem_b_1 <= s1_9) {
                             pos_99_1 = (unsigned int)(lane * 4 + 1);
-                            rem_after_3_1 = rem_b_3 - s2_9;
+                            rem_after_3_1 = rem_b_1 - s2_9;
                             cnt_9 = ff_1[1];
                             lo_sel_3_1 = lo_above_3_1 + lf_1[3] + lf_1[2];
                         } else {
                             pos_99_1 = (unsigned int)(lane * 4);
-                            rem_after_3_1 = rem_b_3 - s1_9;
+                            rem_after_3_1 = rem_b_1 - s1_9;
                             cnt_9 = ff_1[0];
                             lo_sel_3_1 = lo_above_3_1 + lf_1[3] + lf_1[2] + lf_1[1];
                         }
@@ -51303,15 +51290,15 @@ kernel_cake_radix_topk_c8_e16s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(owner_3_1) : "r"(((is_owner_3_1 != 0) ? (unsigned int)lane : 0)));
                 unsigned int found_3_1;
                 asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(found_3_1) : "r"(is_owner_3_1));
-                unsigned int pos_b_3_1 = __shfl_sync(0xFFFFFFFF, pos_99_1, owner_3_1);
-                unsigned int rem_b_3_1 = __shfl_sync(0xFFFFFFFF, rem_after_3_1, owner_3_1);
+                unsigned int pos_b_4 = __shfl_sync(0xFFFFFFFF, pos_99_1, owner_3_1);
+                unsigned int rem_b_4 = __shfl_sync(0xFFFFFFFF, rem_after_3_1, owner_3_1);
                 unsigned int cnt_b_3_1 = __shfl_sync(0xFFFFFFFF, cnt_9, owner_3_1);
-                unsigned int lo_b_3_1 = __shfl_sync(0xFFFFFFFF, lo_sel_3_1, owner_3_1);
+                unsigned int lo_b_4 = __shfl_sync(0xFFFFFFFF, lo_sel_3_1, owner_3_1);
                 if (lane == 0) {
-                    scal[0] = pos_b_3 * 16 + pos_b_3_1;
-                    scal[1] = rem_b_3_1;
+                    scal[0] = pos_b_1 * 16 + pos_b_4;
+                    scal[1] = rem_b_4;
                     scal[2] = cnt_b_3_1;
-                    scal[9] = lo_b_3 + lo_b_3_1;
+                    scal[9] = lo_b_1 + lo_b_4;
                 }
             }
             __syncthreads();
@@ -51320,11 +51307,11 @@ kernel_cake_radix_topk_c8_e16s_sp_lp_nt(float* __restrict__ probs, int* __restri
             unsigned int cnt_sel = scal[2];
             if (cnt_sel <= 2048) {
                 take_tail = 0;
-                unsigned int v_0_0 = 0;
+                unsigned int v_0 = 0;
                 if (tid == 0) {
-                    v_0_0 = scal[9];
+                    v_0 = scal[9];
                 }
-                unsigned int lo_above_w = v_0_0;
+                unsigned int lo_above_w = v_0;
                 unsigned int n_4 = 0;
                 int niter_2 = (int)(n_wu + 31 >> 5);
                 for (int j_2 = 0; j_2 < niter_2; j_2++) {
@@ -51341,85 +51328,85 @@ kernel_cake_radix_topk_c8_e16s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 __syncthreads();
                 unsigned int before_25 = 0;
                 unsigned int total_24 = 0;
-                unsigned int v_16 = scal[16];
-                total_24 = total_24 + v_16;
-                if (warp > 0) {
-                    before_25 = before_25 + v_16;
-                }
-                unsigned int v_17 = scal[17];
+                unsigned int v_17 = scal[16];
                 total_24 = total_24 + v_17;
-                if (warp > 1) {
+                if (warp > 0) {
                     before_25 = before_25 + v_17;
                 }
-                unsigned int v_18 = scal[18];
+                unsigned int v_18 = scal[17];
                 total_24 = total_24 + v_18;
-                if (warp > 2) {
+                if (warp > 1) {
                     before_25 = before_25 + v_18;
                 }
-                unsigned int v_19 = scal[19];
+                unsigned int v_19 = scal[18];
                 total_24 = total_24 + v_19;
-                if (warp > 3) {
+                if (warp > 2) {
                     before_25 = before_25 + v_19;
                 }
-                unsigned int v_20 = scal[20];
+                unsigned int v_20 = scal[19];
                 total_24 = total_24 + v_20;
-                if (warp > 4) {
+                if (warp > 3) {
                     before_25 = before_25 + v_20;
                 }
-                unsigned int v_21 = scal[21];
+                unsigned int v_21 = scal[20];
                 total_24 = total_24 + v_21;
-                if (warp > 5) {
+                if (warp > 4) {
                     before_25 = before_25 + v_21;
                 }
-                unsigned int v_22 = scal[22];
+                unsigned int v_22 = scal[21];
                 total_24 = total_24 + v_22;
-                if (warp > 6) {
+                if (warp > 5) {
                     before_25 = before_25 + v_22;
                 }
-                unsigned int v_23 = scal[23];
+                unsigned int v_23 = scal[22];
                 total_24 = total_24 + v_23;
-                if (warp > 7) {
+                if (warp > 6) {
                     before_25 = before_25 + v_23;
                 }
-                unsigned int v_24 = scal[24];
+                unsigned int v_24 = scal[23];
                 total_24 = total_24 + v_24;
-                if (warp > 8) {
+                if (warp > 7) {
                     before_25 = before_25 + v_24;
                 }
-                unsigned int v_25 = scal[25];
+                unsigned int v_25 = scal[24];
                 total_24 = total_24 + v_25;
-                if (warp > 9) {
+                if (warp > 8) {
                     before_25 = before_25 + v_25;
                 }
-                unsigned int v_26 = scal[26];
+                unsigned int v_26 = scal[25];
                 total_24 = total_24 + v_26;
-                if (warp > 10) {
+                if (warp > 9) {
                     before_25 = before_25 + v_26;
                 }
-                unsigned int v_27 = scal[27];
+                unsigned int v_27 = scal[26];
                 total_24 = total_24 + v_27;
-                if (warp > 11) {
+                if (warp > 10) {
                     before_25 = before_25 + v_27;
                 }
-                unsigned int v_28 = scal[28];
+                unsigned int v_28 = scal[27];
                 total_24 = total_24 + v_28;
-                if (warp > 12) {
+                if (warp > 11) {
                     before_25 = before_25 + v_28;
                 }
-                unsigned int v_29 = scal[29];
+                unsigned int v_29 = scal[28];
                 total_24 = total_24 + v_29;
-                if (warp > 13) {
+                if (warp > 12) {
                     before_25 = before_25 + v_29;
                 }
-                unsigned int v_30 = scal[30];
+                unsigned int v_30 = scal[29];
                 total_24 = total_24 + v_30;
-                if (warp > 14) {
+                if (warp > 13) {
                     before_25 = before_25 + v_30;
                 }
-                unsigned int v_31 = scal[31];
+                unsigned int v_31 = scal[30];
                 total_24 = total_24 + v_31;
-                if (warp > 15) {
+                if (warp > 14) {
                     before_25 = before_25 + v_31;
+                }
+                unsigned int v_32 = scal[31];
+                total_24 = total_24 + v_32;
+                if (warp > 15) {
+                    before_25 = before_25 + v_32;
                 }
                 unsigned int lt_mask_5 = (1 << (unsigned int)lane) - 1;
                 unsigned int pos_100 = before_25;
@@ -51956,24 +51943,24 @@ kernel_cake_radix_topk_c8_e16s_sp_lp_nt(float* __restrict__ probs, int* __restri
                     done_1 = 1;
                 }
                 if (done_1 == 0) {
-                    unsigned long long c_16 = comps2[0];
-                    unsigned int bucket_54_1 = (unsigned int)(c_16 >> 42 & 2047);
-                    if (c_16 >> 53 == (unsigned long long)bucket_sel_1) {
+                    unsigned long long c_17 = comps2[0];
+                    unsigned int bucket_54_1 = (unsigned int)(c_17 >> 42 & 2047);
+                    if (c_17 >> 53 == (unsigned long long)bucket_sel_1) {
                         atomicAdd(&hist0[bucket_54_1], 1);
                     }
-                    unsigned long long c_17 = comps2[1];
-                    unsigned int bucket_55 = (unsigned int)(c_17 >> 42 & 2047);
-                    if (c_17 >> 53 == (unsigned long long)bucket_sel_1) {
+                    unsigned long long c_18 = comps2[1];
+                    unsigned int bucket_55 = (unsigned int)(c_18 >> 42 & 2047);
+                    if (c_18 >> 53 == (unsigned long long)bucket_sel_1) {
                         atomicAdd(&hist0[bucket_55], 1);
                     }
-                    unsigned long long c_18 = comps2[2];
-                    unsigned int bucket_56 = (unsigned int)(c_18 >> 42 & 2047);
-                    if (c_18 >> 53 == (unsigned long long)bucket_sel_1) {
+                    unsigned long long c_19 = comps2[2];
+                    unsigned int bucket_56 = (unsigned int)(c_19 >> 42 & 2047);
+                    if (c_19 >> 53 == (unsigned long long)bucket_sel_1) {
                         atomicAdd(&hist0[bucket_56], 1);
                     }
-                    unsigned long long c_19 = comps2[3];
-                    unsigned int bucket_57 = (unsigned int)(c_19 >> 42 & 2047);
-                    if (c_19 >> 53 == (unsigned long long)bucket_sel_1) {
+                    unsigned long long c_20 = comps2[3];
+                    unsigned int bucket_57 = (unsigned int)(c_20 >> 42 & 2047);
+                    if (c_20 >> 53 == (unsigned long long)bucket_sel_1) {
                         atomicAdd(&hist0[bucket_57], 1);
                     }
                     hist1[tid] = 0;
@@ -52052,24 +52039,24 @@ kernel_cake_radix_topk_c8_e16s_sp_lp_nt(float* __restrict__ probs, int* __restri
                         done_1 = 1;
                     }
                     if (done_1 == 0) {
-                        unsigned long long c_20 = comps2[0];
-                        unsigned int bucket_59 = (unsigned int)(c_20 >> 32 & 1023);
-                        if (c_20 >> 42 == prefix1_1) {
+                        unsigned long long c_21 = comps2[0];
+                        unsigned int bucket_59 = (unsigned int)(c_21 >> 32 & 1023);
+                        if (c_21 >> 42 == prefix1_1) {
                             atomicAdd(&hist1[bucket_59], 1);
                         }
-                        unsigned long long c_21 = comps2[1];
-                        unsigned int bucket_60 = (unsigned int)(c_21 >> 32 & 1023);
-                        if (c_21 >> 42 == prefix1_1) {
+                        unsigned long long c_22 = comps2[1];
+                        unsigned int bucket_60 = (unsigned int)(c_22 >> 32 & 1023);
+                        if (c_22 >> 42 == prefix1_1) {
                             atomicAdd(&hist1[bucket_60], 1);
                         }
-                        unsigned long long c_22 = comps2[2];
-                        unsigned int bucket_61 = (unsigned int)(c_22 >> 32 & 1023);
-                        if (c_22 >> 42 == prefix1_1) {
+                        unsigned long long c_23 = comps2[2];
+                        unsigned int bucket_61 = (unsigned int)(c_23 >> 32 & 1023);
+                        if (c_23 >> 42 == prefix1_1) {
                             atomicAdd(&hist1[bucket_61], 1);
                         }
-                        unsigned long long c_23 = comps2[3];
-                        unsigned int bucket_62 = (unsigned int)(c_23 >> 32 & 1023);
-                        if (c_23 >> 42 == prefix1_1) {
+                        unsigned long long c_24 = comps2[3];
+                        unsigned int bucket_62 = (unsigned int)(c_24 >> 32 & 1023);
+                        if (c_24 >> 42 == prefix1_1) {
                             atomicAdd(&hist1[bucket_62], 1);
                         }
                         hist0[tid] = 0;
@@ -52156,24 +52143,24 @@ kernel_cake_radix_topk_c8_e16s_sp_lp_nt(float* __restrict__ probs, int* __restri
                                 unsigned long long mask_2 = (1 << (unsigned long long)nbits_1) - 1;
                                 unsigned long long sh_1 = (unsigned long long)shift_1;
                                 unsigned long long hi_1 = (unsigned long long)(shift_1 + nbits_1);
-                                unsigned long long c_24 = comps2[0];
-                                unsigned int bucket_65 = (unsigned int)(c_24 >> sh_1 & mask_2);
-                                if (c_24 >> hi_1 == tpre_1) {
+                                unsigned long long c_25 = comps2[0];
+                                unsigned int bucket_65 = (unsigned int)(c_25 >> sh_1 & mask_2);
+                                if (c_25 >> hi_1 == tpre_1) {
                                     atomicAdd(&hist0[bucket_65], 1);
                                 }
-                                unsigned long long c_25 = comps2[1];
-                                unsigned int bucket_66 = (unsigned int)(c_25 >> sh_1 & mask_2);
-                                if (c_25 >> hi_1 == tpre_1) {
+                                unsigned long long c_26 = comps2[1];
+                                unsigned int bucket_66 = (unsigned int)(c_26 >> sh_1 & mask_2);
+                                if (c_26 >> hi_1 == tpre_1) {
                                     atomicAdd(&hist0[bucket_66], 1);
                                 }
-                                unsigned long long c_26 = comps2[2];
-                                unsigned int bucket_67 = (unsigned int)(c_26 >> sh_1 & mask_2);
-                                if (c_26 >> hi_1 == tpre_1) {
+                                unsigned long long c_27 = comps2[2];
+                                unsigned int bucket_67 = (unsigned int)(c_27 >> sh_1 & mask_2);
+                                if (c_27 >> hi_1 == tpre_1) {
                                     atomicAdd(&hist0[bucket_67], 1);
                                 }
-                                unsigned long long c_27 = comps2[3];
-                                unsigned int bucket_68 = (unsigned int)(c_27 >> sh_1 & mask_2);
-                                if (c_27 >> hi_1 == tpre_1) {
+                                unsigned long long c_28 = comps2[3];
+                                unsigned int bucket_68 = (unsigned int)(c_28 >> sh_1 & mask_2);
+                                if (c_28 >> hi_1 == tpre_1) {
                                     atomicAdd(&hist0[bucket_68], 1);
                                 }
                                 __syncthreads();
@@ -52296,167 +52283,167 @@ kernel_cake_radix_topk_c8_e16s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 __syncthreads();
                 unsigned int before_26 = 0;
                 unsigned int total_25 = 0;
-                unsigned int v_32 = scal[32];
-                total_25 = total_25 + v_32;
-                if (warp > 0) {
-                    before_26 = before_26 + v_32;
-                }
-                unsigned int v_33 = scal[33];
+                unsigned int v_33 = scal[32];
                 total_25 = total_25 + v_33;
-                if (warp > 1) {
+                if (warp > 0) {
                     before_26 = before_26 + v_33;
                 }
-                unsigned int v_34 = scal[34];
+                unsigned int v_34 = scal[33];
                 total_25 = total_25 + v_34;
-                if (warp > 2) {
+                if (warp > 1) {
                     before_26 = before_26 + v_34;
                 }
-                unsigned int v_35 = scal[35];
+                unsigned int v_35 = scal[34];
                 total_25 = total_25 + v_35;
-                if (warp > 3) {
+                if (warp > 2) {
                     before_26 = before_26 + v_35;
                 }
-                unsigned int v_36 = scal[36];
+                unsigned int v_36 = scal[35];
                 total_25 = total_25 + v_36;
-                if (warp > 4) {
+                if (warp > 3) {
                     before_26 = before_26 + v_36;
                 }
-                unsigned int v_37 = scal[37];
+                unsigned int v_37 = scal[36];
                 total_25 = total_25 + v_37;
-                if (warp > 5) {
+                if (warp > 4) {
                     before_26 = before_26 + v_37;
                 }
-                unsigned int v_38 = scal[38];
+                unsigned int v_38 = scal[37];
                 total_25 = total_25 + v_38;
-                if (warp > 6) {
+                if (warp > 5) {
                     before_26 = before_26 + v_38;
                 }
-                unsigned int v_39 = scal[39];
+                unsigned int v_39 = scal[38];
                 total_25 = total_25 + v_39;
-                if (warp > 7) {
+                if (warp > 6) {
                     before_26 = before_26 + v_39;
                 }
-                unsigned int v_40 = scal[40];
+                unsigned int v_40 = scal[39];
                 total_25 = total_25 + v_40;
-                if (warp > 8) {
+                if (warp > 7) {
                     before_26 = before_26 + v_40;
                 }
-                unsigned int v_41 = scal[41];
+                unsigned int v_41 = scal[40];
                 total_25 = total_25 + v_41;
-                if (warp > 9) {
+                if (warp > 8) {
                     before_26 = before_26 + v_41;
                 }
-                unsigned int v_42 = scal[42];
+                unsigned int v_42 = scal[41];
                 total_25 = total_25 + v_42;
-                if (warp > 10) {
+                if (warp > 9) {
                     before_26 = before_26 + v_42;
                 }
-                unsigned int v_43 = scal[43];
+                unsigned int v_43 = scal[42];
                 total_25 = total_25 + v_43;
-                if (warp > 11) {
+                if (warp > 10) {
                     before_26 = before_26 + v_43;
                 }
-                unsigned int v_44 = scal[44];
+                unsigned int v_44 = scal[43];
                 total_25 = total_25 + v_44;
-                if (warp > 12) {
+                if (warp > 11) {
                     before_26 = before_26 + v_44;
                 }
-                unsigned int v_45 = scal[45];
+                unsigned int v_45 = scal[44];
                 total_25 = total_25 + v_45;
-                if (warp > 13) {
+                if (warp > 12) {
                     before_26 = before_26 + v_45;
                 }
-                unsigned int v_46 = scal[46];
+                unsigned int v_46 = scal[45];
                 total_25 = total_25 + v_46;
-                if (warp > 14) {
+                if (warp > 13) {
                     before_26 = before_26 + v_46;
                 }
-                unsigned int v_47 = scal[47];
+                unsigned int v_47 = scal[46];
                 total_25 = total_25 + v_47;
-                if (warp > 15) {
+                if (warp > 14) {
                     before_26 = before_26 + v_47;
+                }
+                unsigned int v_48 = scal[47];
+                total_25 = total_25 + v_48;
+                if (warp > 15) {
+                    before_26 = before_26 + v_48;
                 }
                 unsigned int before_27 = 0;
                 unsigned int total_26 = 0;
-                unsigned int v_48 = scal[48];
-                total_26 = total_26 + v_48;
-                if (warp > 0) {
-                    before_27 = before_27 + v_48;
-                }
-                unsigned int v_49 = scal[49];
+                unsigned int v_49 = scal[48];
                 total_26 = total_26 + v_49;
-                if (warp > 1) {
+                if (warp > 0) {
                     before_27 = before_27 + v_49;
                 }
-                unsigned int v_50 = scal[50];
+                unsigned int v_50 = scal[49];
                 total_26 = total_26 + v_50;
-                if (warp > 2) {
+                if (warp > 1) {
                     before_27 = before_27 + v_50;
                 }
-                unsigned int v_51 = scal[51];
+                unsigned int v_51 = scal[50];
                 total_26 = total_26 + v_51;
-                if (warp > 3) {
+                if (warp > 2) {
                     before_27 = before_27 + v_51;
                 }
-                unsigned int v_52 = scal[52];
+                unsigned int v_52 = scal[51];
                 total_26 = total_26 + v_52;
-                if (warp > 4) {
+                if (warp > 3) {
                     before_27 = before_27 + v_52;
                 }
-                unsigned int v_53 = scal[53];
+                unsigned int v_53 = scal[52];
                 total_26 = total_26 + v_53;
-                if (warp > 5) {
+                if (warp > 4) {
                     before_27 = before_27 + v_53;
                 }
-                unsigned int v_54 = scal[54];
+                unsigned int v_54 = scal[53];
                 total_26 = total_26 + v_54;
-                if (warp > 6) {
+                if (warp > 5) {
                     before_27 = before_27 + v_54;
                 }
-                unsigned int v_55 = scal[55];
+                unsigned int v_55 = scal[54];
                 total_26 = total_26 + v_55;
-                if (warp > 7) {
+                if (warp > 6) {
                     before_27 = before_27 + v_55;
                 }
-                unsigned int v_56 = scal[56];
+                unsigned int v_56 = scal[55];
                 total_26 = total_26 + v_56;
-                if (warp > 8) {
+                if (warp > 7) {
                     before_27 = before_27 + v_56;
                 }
-                unsigned int v_57 = scal[57];
+                unsigned int v_57 = scal[56];
                 total_26 = total_26 + v_57;
-                if (warp > 9) {
+                if (warp > 8) {
                     before_27 = before_27 + v_57;
                 }
-                unsigned int v_58 = scal[58];
+                unsigned int v_58 = scal[57];
                 total_26 = total_26 + v_58;
-                if (warp > 10) {
+                if (warp > 9) {
                     before_27 = before_27 + v_58;
                 }
-                unsigned int v_59 = scal[59];
+                unsigned int v_59 = scal[58];
                 total_26 = total_26 + v_59;
-                if (warp > 11) {
+                if (warp > 10) {
                     before_27 = before_27 + v_59;
                 }
-                unsigned int v_60 = scal[60];
+                unsigned int v_60 = scal[59];
                 total_26 = total_26 + v_60;
-                if (warp > 12) {
+                if (warp > 11) {
                     before_27 = before_27 + v_60;
                 }
-                unsigned int v_61 = scal[61];
+                unsigned int v_61 = scal[60];
                 total_26 = total_26 + v_61;
-                if (warp > 13) {
+                if (warp > 12) {
                     before_27 = before_27 + v_61;
                 }
-                unsigned int v_62 = scal[62];
+                unsigned int v_62 = scal[61];
                 total_26 = total_26 + v_62;
-                if (warp > 14) {
+                if (warp > 13) {
                     before_27 = before_27 + v_62;
                 }
-                unsigned int v_63 = scal[63];
+                unsigned int v_63 = scal[62];
                 total_26 = total_26 + v_63;
-                if (warp > 15) {
+                if (warp > 14) {
                     before_27 = before_27 + v_63;
+                }
+                unsigned int v_64 = scal[63];
+                total_26 = total_26 + v_64;
+                if (warp > 15) {
+                    before_27 = before_27 + v_64;
                 }
                 unsigned long long ebase = out_base + (unsigned long long)(total_26 + before_26);
                 unsigned int lt_mask_4_1 = (1 << (unsigned int)lane) - 1;
@@ -52495,26 +52482,26 @@ kernel_cake_radix_topk_c8_e16s_sp_lp_nt(float* __restrict__ probs, int* __restri
             for (int p = 0; p < 3; p++) {
                 unsigned int shift_2 = ((p == 0) ? 21 : ((p == 1) ? 10 : 0));
                 unsigned int nbits_2 = ((p == 2) ? 10 : 11);
-                for (int c_28 = 0; c_28 < nsub; c_28++) {
-                    int i2_96 = start + c_28 * 2048 + tid;
+                for (int c_29 = 0; c_29 < nsub; c_29++) {
+                    int i2_96 = start + c_29 * 2048 + tid;
                     if (i2_96 < vocab) {
                         vals_t[0] = probs[row_base + (unsigned long long)i2_96];
                     } else {
                         vals_t[0] = 0.0f;
                     }
-                    int i2_97 = start + c_28 * 2048 + 512 + tid;
+                    int i2_97 = start + c_29 * 2048 + 512 + tid;
                     if (i2_97 < vocab) {
                         vals_t[1] = probs[row_base + (unsigned long long)i2_97];
                     } else {
                         vals_t[1] = 0.0f;
                     }
-                    int i2_98 = start + c_28 * 2048 + 1024 + tid;
+                    int i2_98 = start + c_29 * 2048 + 1024 + tid;
                     if (i2_98 < vocab) {
                         vals_t[2] = probs[row_base + (unsigned long long)i2_98];
                     } else {
                         vals_t[2] = 0.0f;
                     }
-                    int i2_99 = start + c_28 * 2048 + 1536 + tid;
+                    int i2_99 = start + c_29 * 2048 + 1536 + tid;
                     if (i2_99 < vocab) {
                         vals_t[3] = probs[row_base + (unsigned long long)i2_99];
                     } else {
@@ -52883,26 +52870,26 @@ kernel_cake_radix_topk_c8_e16s_sp_lp_nt(float* __restrict__ probs, int* __restri
             unsigned int take_rem = ((eq_prefix < remaining) ? _min_230 : 0);
             unsigned long long gt_run = out_base + (unsigned long long)gt_prefix;
             unsigned long long eq_run = out_base + (unsigned long long)(gt_total + eq_prefix);
-            for (int c_29 = 0; c_29 < nsub; c_29++) {
-                int i2_100 = start + c_29 * 2048 + tid;
+            for (int c_30 = 0; c_30 < nsub; c_30++) {
+                int i2_100 = start + c_30 * 2048 + tid;
                 if (i2_100 < vocab) {
                     vals_t[0] = probs[row_base + (unsigned long long)i2_100];
                 } else {
                     vals_t[0] = 0.0f;
                 }
-                int i2_101 = start + c_29 * 2048 + 512 + tid;
+                int i2_101 = start + c_30 * 2048 + 512 + tid;
                 if (i2_101 < vocab) {
                     vals_t[1] = probs[row_base + (unsigned long long)i2_101];
                 } else {
                     vals_t[1] = 0.0f;
                 }
-                int i2_102 = start + c_29 * 2048 + 1024 + tid;
+                int i2_102 = start + c_30 * 2048 + 1024 + tid;
                 if (i2_102 < vocab) {
                     vals_t[2] = probs[row_base + (unsigned long long)i2_102];
                 } else {
                     vals_t[2] = 0.0f;
                 }
-                int i2_103 = start + c_29 * 2048 + 1536 + tid;
+                int i2_103 = start + c_30 * 2048 + 1536 + tid;
                 if (i2_103 < vocab) {
                     vals_t[3] = probs[row_base + (unsigned long long)i2_103];
                 } else {
@@ -52911,8 +52898,8 @@ kernel_cake_radix_topk_c8_e16s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 unsigned int gt = 0;
                 unsigned int bits_93 = __as_u32(vals_t[0]);
                 unsigned int key_96 = ((bits_93 <= 2139095040) ? bits_93 : 0);
-                int i_vec = start + c_29 * 2048 + tid * 4;
-                int i_str = start + c_29 * 2048 + tid;
+                int i_vec = start + c_30 * 2048 + tid * 4;
+                int i_str = start + c_30 * 2048 + tid;
                 int i = i_str;
                 int i_2_0 = i;
                 bool tie_1_0 = key_96 == threshold_t && i_2_0 < vocab;
@@ -52925,8 +52912,8 @@ kernel_cake_radix_topk_c8_e16s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 }
                 unsigned int bits_93_1 = __as_u32(vals_t[1]);
                 unsigned int key_93_1 = ((bits_93_1 <= 2139095040) ? bits_93_1 : 0);
-                int i_vec_0 = start + c_29 * 2048 + tid * 4 + 1;
-                int i_str_0 = start + c_29 * 2048 + 512 + tid;
+                int i_vec_0 = start + c_30 * 2048 + tid * 4 + 1;
+                int i_str_0 = start + c_30 * 2048 + 512 + tid;
                 int i_24 = i_str_0;
                 int i_2_1 = i_24;
                 bool tie_1_1 = key_93_1 == threshold_t && i_2_1 < vocab;
@@ -52939,8 +52926,8 @@ kernel_cake_radix_topk_c8_e16s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 }
                 unsigned int bits_94 = __as_u32(vals_t[2]);
                 unsigned int key_94_1 = ((bits_94 <= 2139095040) ? bits_94 : 0);
-                int i_vec_1 = start + c_29 * 2048 + tid * 4 + 2;
-                int i_str_1 = start + c_29 * 2048 + 1024 + tid;
+                int i_vec_1 = start + c_30 * 2048 + tid * 4 + 2;
+                int i_str_1 = start + c_30 * 2048 + 1024 + tid;
                 int i_25 = i_str_1;
                 int i_2_2 = i_25;
                 bool tie_1_2 = key_94_1 == threshold_t && i_2_2 < vocab;
@@ -52953,8 +52940,8 @@ kernel_cake_radix_topk_c8_e16s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 }
                 unsigned int bits_95 = __as_u32(vals_t[3]);
                 unsigned int key_95_1 = ((bits_95 <= 2139095040) ? bits_95 : 0);
-                int i_vec_2 = start + c_29 * 2048 + tid * 4 + 3;
-                int i_str_2 = start + c_29 * 2048 + 1536 + tid;
+                int i_vec_2 = start + c_30 * 2048 + tid * 4 + 3;
+                int i_str_2 = start + c_30 * 2048 + 1536 + tid;
                 int i_26 = i_str_2;
                 int i_2_3 = i_26;
                 bool tie_1_3 = key_95_1 == threshold_t && i_2_3 < vocab;
@@ -53070,9 +53057,9 @@ kernel_cake_radix_topk_c8_e16s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 unsigned int running = excl_1 >> 12;
                 int f2 = tid;
                 if (f2 < 64) {
-                    unsigned int c_0_1 = cnt[f2];
+                    unsigned int c_0 = cnt[f2];
                     cnt[f2] = running;
-                    running = running + c_0_1;
+                    running = running + c_0;
                 }
                 __syncthreads();
                 unsigned int gt_slot = excl_1 & 4095;
@@ -53090,8 +53077,8 @@ kernel_cake_radix_topk_c8_e16s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 unsigned int bits_96 = __as_u32(vals_t[0]);
                 unsigned int key_96_1 = ((bits_96 <= 2139095040) ? bits_96 : 0);
                 keys[0] = key_96_1;
-                int i_vec_3 = start + c_29 * 2048 + tid * 4;
-                int i_str_3 = start + c_29 * 2048 + tid;
+                int i_vec_3 = start + c_30 * 2048 + tid * 4;
+                int i_str_3 = start + c_30 * 2048 + tid;
                 int i_27 = i_str_3;
                 idxs[0] = i_27;
                 ties[0] = keys[0] == threshold_t && idxs[0] < vocab;
@@ -53104,8 +53091,8 @@ kernel_cake_radix_topk_c8_e16s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 unsigned int bits_97 = __as_u32(vals_t[1]);
                 unsigned int key_97 = ((bits_97 <= 2139095040) ? bits_97 : 0);
                 keys[1] = key_97;
-                int i_vec_4 = start + c_29 * 2048 + tid * 4 + 1;
-                int i_str_4 = start + c_29 * 2048 + 512 + tid;
+                int i_vec_4 = start + c_30 * 2048 + tid * 4 + 1;
+                int i_str_4 = start + c_30 * 2048 + 512 + tid;
                 int i_28 = i_str_4;
                 idxs[1] = i_28;
                 ties[1] = keys[1] == threshold_t && idxs[1] < vocab;
@@ -53118,8 +53105,8 @@ kernel_cake_radix_topk_c8_e16s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 unsigned int bits_98 = __as_u32(vals_t[2]);
                 unsigned int key_98 = ((bits_98 <= 2139095040) ? bits_98 : 0);
                 keys[2] = key_98;
-                int i_vec_5 = start + c_29 * 2048 + tid * 4 + 2;
-                int i_str_5 = start + c_29 * 2048 + 1024 + tid;
+                int i_vec_5 = start + c_30 * 2048 + tid * 4 + 2;
+                int i_str_5 = start + c_30 * 2048 + 1024 + tid;
                 int i_29 = i_str_5;
                 idxs[2] = i_29;
                 ties[2] = keys[2] == threshold_t && idxs[2] < vocab;
@@ -53132,8 +53119,8 @@ kernel_cake_radix_topk_c8_e16s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 unsigned int bits_99 = __as_u32(vals_t[3]);
                 unsigned int key_99 = ((bits_99 <= 2139095040) ? bits_99 : 0);
                 keys[3] = key_99;
-                int i_vec_6 = start + c_29 * 2048 + tid * 4 + 3;
-                int i_str_6 = start + c_29 * 2048 + 1536 + tid;
+                int i_vec_6 = start + c_30 * 2048 + tid * 4 + 3;
+                int i_str_6 = start + c_30 * 2048 + 1536 + tid;
                 int i_30 = i_str_6;
                 idxs[3] = i_30;
                 ties[3] = keys[3] == threshold_t && idxs[3] < vocab;
@@ -53223,7 +53210,6 @@ kernel_cake_radix_topk_c8_e16s_sp_lp_nt(float* __restrict__ probs, int* __restri
 } // extern "C"
 
 #undef CAKE_INF
-#undef NUM_MAIN_STAGES
 #undef SMEM_CLIST_OFF
 #undef SMEM_CLIST_STAGE_BYTES
 #undef SMEM_CLIST_STRIDE
@@ -53312,7 +53298,6 @@ kernel_cake_radix_topk_c8_e16s_sp_lp_nt(float* __restrict__ probs, int* __restri
 #undef xbuf64_addr
 
 #define CAKE_INF CUDART_INF_F
-#define NUM_MAIN_STAGES 1
 #define SMEM_HIST0_OFF 0
 #define SMEM_HIST0_STAGE_BYTES 8192
 #define SMEM_HIST0_STRIDE 8192
@@ -57784,7 +57769,7 @@ kernel_cake_radix_topk_c4_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
             int idxs_6[4];
             bool cands_30[4];
             unsigned int before_30 = 0;
-            unsigned int total_30 = 0;
+            unsigned int total_31 = 0;
             unsigned int bits_23_1 = __as_u32(vals_a[24]);
             unsigned int key_23_1 = ((bits_23_1 <= 2139095040) ? bits_23_1 : 0);
             keys_6[0] = key_23_1;
@@ -57792,7 +57777,7 @@ kernel_cake_radix_topk_c4_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
             cands_30[0] = b_lo <= keys_6[0] >> 21 && idxs_6[0] < vocab;
             unsigned int m_24 = __ballot_sync(0xFFFFFFFF, cands_30[0]);
             before_30 = before_30 + (unsigned int)__popc(m_24 & lt_mask_2);
-            total_30 = total_30 + (unsigned int)__popc(m_24);
+            total_31 = total_31 + (unsigned int)__popc(m_24);
             unsigned int bits_24_1 = __as_u32(vals_a[25]);
             unsigned int key_24_1 = ((bits_24_1 <= 2139095040) ? bits_24_1 : 0);
             keys_6[1] = key_24_1;
@@ -57800,7 +57785,7 @@ kernel_cake_radix_topk_c4_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
             cands_30[1] = b_lo <= keys_6[1] >> 21 && idxs_6[1] < vocab;
             unsigned int m_25 = __ballot_sync(0xFFFFFFFF, cands_30[1]);
             before_30 = before_30 + (unsigned int)__popc(m_25 & lt_mask_2);
-            total_30 = total_30 + (unsigned int)__popc(m_25);
+            total_31 = total_31 + (unsigned int)__popc(m_25);
             unsigned int bits_25_1 = __as_u32(vals_a[26]);
             unsigned int key_25_1 = ((bits_25_1 <= 2139095040) ? bits_25_1 : 0);
             keys_6[2] = key_25_1;
@@ -57808,7 +57793,7 @@ kernel_cake_radix_topk_c4_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
             cands_30[2] = b_lo <= keys_6[2] >> 21 && idxs_6[2] < vocab;
             unsigned int m_26 = __ballot_sync(0xFFFFFFFF, cands_30[2]);
             before_30 = before_30 + (unsigned int)__popc(m_26 & lt_mask_2);
-            total_30 = total_30 + (unsigned int)__popc(m_26);
+            total_31 = total_31 + (unsigned int)__popc(m_26);
             unsigned int bits_26_1 = __as_u32(vals_a[27]);
             unsigned int key_26_1 = ((bits_26_1 <= 2139095040) ? bits_26_1 : 0);
             keys_6[3] = key_26_1;
@@ -57816,7 +57801,7 @@ kernel_cake_radix_topk_c4_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
             cands_30[3] = b_lo <= keys_6[3] >> 21 && idxs_6[3] < vocab;
             unsigned int m_27 = __ballot_sync(0xFFFFFFFF, cands_30[3]);
             before_30 = before_30 + (unsigned int)__popc(m_27 & lt_mask_2);
-            total_30 = total_30 + (unsigned int)__popc(m_27);
+            total_31 = total_31 + (unsigned int)__popc(m_27);
             unsigned int own_30 = 0;
             unsigned int pos_120 = n_2 + before_30 + own_30;
             if (cands_30[0] && pos_120 < 1024) {
@@ -57854,12 +57839,12 @@ kernel_cake_radix_topk_c4_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
             if (cands_30[3]) {
                 own_30 = own_30 + 1;
             }
-            n_2 = n_2 + total_30;
+            n_2 = n_2 + total_31;
             unsigned int keys_7[4];
             int idxs_7[4];
             bool cands_31[4];
             unsigned int before_31 = 0;
-            unsigned int total_31 = 0;
+            unsigned int total_32 = 0;
             unsigned int bits_27_1 = __as_u32(vals_a[28]);
             unsigned int key_27_1 = ((bits_27_1 <= 2139095040) ? bits_27_1 : 0);
             keys_7[0] = key_27_1;
@@ -57867,7 +57852,7 @@ kernel_cake_radix_topk_c4_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
             cands_31[0] = b_lo <= keys_7[0] >> 21 && idxs_7[0] < vocab;
             unsigned int m_28 = __ballot_sync(0xFFFFFFFF, cands_31[0]);
             before_31 = before_31 + (unsigned int)__popc(m_28 & lt_mask_2);
-            total_31 = total_31 + (unsigned int)__popc(m_28);
+            total_32 = total_32 + (unsigned int)__popc(m_28);
             unsigned int bits_28_1 = __as_u32(vals_a[29]);
             unsigned int key_28_1 = ((bits_28_1 <= 2139095040) ? bits_28_1 : 0);
             keys_7[1] = key_28_1;
@@ -57875,7 +57860,7 @@ kernel_cake_radix_topk_c4_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
             cands_31[1] = b_lo <= keys_7[1] >> 21 && idxs_7[1] < vocab;
             unsigned int m_29 = __ballot_sync(0xFFFFFFFF, cands_31[1]);
             before_31 = before_31 + (unsigned int)__popc(m_29 & lt_mask_2);
-            total_31 = total_31 + (unsigned int)__popc(m_29);
+            total_32 = total_32 + (unsigned int)__popc(m_29);
             unsigned int bits_29_1 = __as_u32(vals_a[30]);
             unsigned int key_29_1 = ((bits_29_1 <= 2139095040) ? bits_29_1 : 0);
             keys_7[2] = key_29_1;
@@ -57883,7 +57868,7 @@ kernel_cake_radix_topk_c4_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
             cands_31[2] = b_lo <= keys_7[2] >> 21 && idxs_7[2] < vocab;
             unsigned int m_30 = __ballot_sync(0xFFFFFFFF, cands_31[2]);
             before_31 = before_31 + (unsigned int)__popc(m_30 & lt_mask_2);
-            total_31 = total_31 + (unsigned int)__popc(m_30);
+            total_32 = total_32 + (unsigned int)__popc(m_30);
             unsigned int bits_30_1 = __as_u32(vals_a[31]);
             unsigned int key_30_1 = ((bits_30_1 <= 2139095040) ? bits_30_1 : 0);
             keys_7[3] = key_30_1;
@@ -57891,7 +57876,7 @@ kernel_cake_radix_topk_c4_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
             cands_31[3] = b_lo <= keys_7[3] >> 21 && idxs_7[3] < vocab;
             unsigned int m_31 = __ballot_sync(0xFFFFFFFF, cands_31[3]);
             before_31 = before_31 + (unsigned int)__popc(m_31 & lt_mask_2);
-            total_31 = total_31 + (unsigned int)__popc(m_31);
+            total_32 = total_32 + (unsigned int)__popc(m_31);
             unsigned int own_31 = 0;
             unsigned int pos_124 = n_2 + before_31 + own_31;
             if (cands_31[0] && pos_124 < 1024) {
@@ -57929,7 +57914,7 @@ kernel_cake_radix_topk_c4_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
             if (cands_31[3]) {
                 own_31 = own_31 + 1;
             }
-            n_2 = n_2 + total_31;
+            n_2 = n_2 + total_32;
         } else {
             unsigned int skeys_0[4];
             int sidxs_0[4];
@@ -58834,7 +58819,7 @@ kernel_cake_radix_topk_c4_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 int idxs_8[4];
                 bool cands_32[4];
                 unsigned int before_32 = 0;
-                unsigned int total_32 = 0;
+                unsigned int total_33 = 0;
                 unsigned int bits_162 = __as_u32(vals_b[0]);
                 unsigned int key_162 = ((bits_162 <= 2139095040) ? bits_162 : 0);
                 keys_8[0] = key_162;
@@ -58842,7 +58827,7 @@ kernel_cake_radix_topk_c4_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 cands_32[0] = b_lo <= keys_8[0] >> 21 && idxs_8[0] < vocab;
                 unsigned int m_32 = __ballot_sync(0xFFFFFFFF, cands_32[0]);
                 before_32 = before_32 + (unsigned int)__popc(m_32 & lt_mask_2_1);
-                total_32 = total_32 + (unsigned int)__popc(m_32);
+                total_33 = total_33 + (unsigned int)__popc(m_32);
                 unsigned int bits_62_1 = __as_u32(vals_b[1]);
                 unsigned int key_62_1 = ((bits_62_1 <= 2139095040) ? bits_62_1 : 0);
                 keys_8[1] = key_62_1;
@@ -58850,7 +58835,7 @@ kernel_cake_radix_topk_c4_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 cands_32[1] = b_lo <= keys_8[1] >> 21 && idxs_8[1] < vocab;
                 unsigned int m_33 = __ballot_sync(0xFFFFFFFF, cands_32[1]);
                 before_32 = before_32 + (unsigned int)__popc(m_33 & lt_mask_2_1);
-                total_32 = total_32 + (unsigned int)__popc(m_33);
+                total_33 = total_33 + (unsigned int)__popc(m_33);
                 unsigned int bits_63_1 = __as_u32(vals_b[2]);
                 unsigned int key_63_1 = ((bits_63_1 <= 2139095040) ? bits_63_1 : 0);
                 keys_8[2] = key_63_1;
@@ -58858,7 +58843,7 @@ kernel_cake_radix_topk_c4_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 cands_32[2] = b_lo <= keys_8[2] >> 21 && idxs_8[2] < vocab;
                 unsigned int m_34 = __ballot_sync(0xFFFFFFFF, cands_32[2]);
                 before_32 = before_32 + (unsigned int)__popc(m_34 & lt_mask_2_1);
-                total_32 = total_32 + (unsigned int)__popc(m_34);
+                total_33 = total_33 + (unsigned int)__popc(m_34);
                 unsigned int bits_64_1 = __as_u32(vals_b[3]);
                 unsigned int key_64_1 = ((bits_64_1 <= 2139095040) ? bits_64_1 : 0);
                 keys_8[3] = key_64_1;
@@ -58866,7 +58851,7 @@ kernel_cake_radix_topk_c4_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 cands_32[3] = b_lo <= keys_8[3] >> 21 && idxs_8[3] < vocab;
                 unsigned int m_35 = __ballot_sync(0xFFFFFFFF, cands_32[3]);
                 before_32 = before_32 + (unsigned int)__popc(m_35 & lt_mask_2_1);
-                total_32 = total_32 + (unsigned int)__popc(m_35);
+                total_33 = total_33 + (unsigned int)__popc(m_35);
                 unsigned int own_32 = 0;
                 unsigned int pos_128 = n_2_1 + before_32 + own_32;
                 if (cands_32[0] && pos_128 < 1024) {
@@ -58904,12 +58889,12 @@ kernel_cake_radix_topk_c4_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 if (cands_32[3]) {
                     own_32 = own_32 + 1;
                 }
-                n_2_1 = n_2_1 + total_32;
+                n_2_1 = n_2_1 + total_33;
                 unsigned int keys_9[4];
                 int idxs_9[4];
                 bool cands_33[4];
                 unsigned int before_33 = 0;
-                unsigned int total_33 = 0;
+                unsigned int total_34 = 0;
                 unsigned int bits_65_1 = __as_u32(vals_b[4]);
                 unsigned int key_65_1 = ((bits_65_1 <= 2139095040) ? bits_65_1 : 0);
                 keys_9[0] = key_65_1;
@@ -58917,7 +58902,7 @@ kernel_cake_radix_topk_c4_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 cands_33[0] = b_lo <= keys_9[0] >> 21 && idxs_9[0] < vocab;
                 unsigned int m_36 = __ballot_sync(0xFFFFFFFF, cands_33[0]);
                 before_33 = before_33 + (unsigned int)__popc(m_36 & lt_mask_2_1);
-                total_33 = total_33 + (unsigned int)__popc(m_36);
+                total_34 = total_34 + (unsigned int)__popc(m_36);
                 unsigned int bits_66_1 = __as_u32(vals_b[5]);
                 unsigned int key_66_1 = ((bits_66_1 <= 2139095040) ? bits_66_1 : 0);
                 keys_9[1] = key_66_1;
@@ -58925,7 +58910,7 @@ kernel_cake_radix_topk_c4_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 cands_33[1] = b_lo <= keys_9[1] >> 21 && idxs_9[1] < vocab;
                 unsigned int m_37 = __ballot_sync(0xFFFFFFFF, cands_33[1]);
                 before_33 = before_33 + (unsigned int)__popc(m_37 & lt_mask_2_1);
-                total_33 = total_33 + (unsigned int)__popc(m_37);
+                total_34 = total_34 + (unsigned int)__popc(m_37);
                 unsigned int bits_67_1 = __as_u32(vals_b[6]);
                 unsigned int key_67_1 = ((bits_67_1 <= 2139095040) ? bits_67_1 : 0);
                 keys_9[2] = key_67_1;
@@ -58933,7 +58918,7 @@ kernel_cake_radix_topk_c4_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 cands_33[2] = b_lo <= keys_9[2] >> 21 && idxs_9[2] < vocab;
                 unsigned int m_38 = __ballot_sync(0xFFFFFFFF, cands_33[2]);
                 before_33 = before_33 + (unsigned int)__popc(m_38 & lt_mask_2_1);
-                total_33 = total_33 + (unsigned int)__popc(m_38);
+                total_34 = total_34 + (unsigned int)__popc(m_38);
                 unsigned int bits_68_1 = __as_u32(vals_b[7]);
                 unsigned int key_68_1 = ((bits_68_1 <= 2139095040) ? bits_68_1 : 0);
                 keys_9[3] = key_68_1;
@@ -58941,7 +58926,7 @@ kernel_cake_radix_topk_c4_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 cands_33[3] = b_lo <= keys_9[3] >> 21 && idxs_9[3] < vocab;
                 unsigned int m_39 = __ballot_sync(0xFFFFFFFF, cands_33[3]);
                 before_33 = before_33 + (unsigned int)__popc(m_39 & lt_mask_2_1);
-                total_33 = total_33 + (unsigned int)__popc(m_39);
+                total_34 = total_34 + (unsigned int)__popc(m_39);
                 unsigned int own_33 = 0;
                 unsigned int pos_132 = n_2_1 + before_33 + own_33;
                 if (cands_33[0] && pos_132 < 1024) {
@@ -58979,12 +58964,12 @@ kernel_cake_radix_topk_c4_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 if (cands_33[3]) {
                     own_33 = own_33 + 1;
                 }
-                n_2_1 = n_2_1 + total_33;
+                n_2_1 = n_2_1 + total_34;
                 unsigned int keys_10[4];
                 int idxs_10[4];
                 bool cands_34[4];
                 unsigned int before_34 = 0;
-                unsigned int total_34 = 0;
+                unsigned int total_35 = 0;
                 unsigned int bits_69_1 = __as_u32(vals_b[8]);
                 unsigned int key_69_1 = ((bits_69_1 <= 2139095040) ? bits_69_1 : 0);
                 keys_10[0] = key_69_1;
@@ -58992,7 +58977,7 @@ kernel_cake_radix_topk_c4_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 cands_34[0] = b_lo <= keys_10[0] >> 21 && idxs_10[0] < vocab;
                 unsigned int m_40 = __ballot_sync(0xFFFFFFFF, cands_34[0]);
                 before_34 = before_34 + (unsigned int)__popc(m_40 & lt_mask_2_1);
-                total_34 = total_34 + (unsigned int)__popc(m_40);
+                total_35 = total_35 + (unsigned int)__popc(m_40);
                 unsigned int bits_70_1 = __as_u32(vals_b[9]);
                 unsigned int key_70_1 = ((bits_70_1 <= 2139095040) ? bits_70_1 : 0);
                 keys_10[1] = key_70_1;
@@ -59000,7 +58985,7 @@ kernel_cake_radix_topk_c4_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 cands_34[1] = b_lo <= keys_10[1] >> 21 && idxs_10[1] < vocab;
                 unsigned int m_41 = __ballot_sync(0xFFFFFFFF, cands_34[1]);
                 before_34 = before_34 + (unsigned int)__popc(m_41 & lt_mask_2_1);
-                total_34 = total_34 + (unsigned int)__popc(m_41);
+                total_35 = total_35 + (unsigned int)__popc(m_41);
                 unsigned int bits_71_1 = __as_u32(vals_b[10]);
                 unsigned int key_71_1 = ((bits_71_1 <= 2139095040) ? bits_71_1 : 0);
                 keys_10[2] = key_71_1;
@@ -59008,7 +58993,7 @@ kernel_cake_radix_topk_c4_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 cands_34[2] = b_lo <= keys_10[2] >> 21 && idxs_10[2] < vocab;
                 unsigned int m_42 = __ballot_sync(0xFFFFFFFF, cands_34[2]);
                 before_34 = before_34 + (unsigned int)__popc(m_42 & lt_mask_2_1);
-                total_34 = total_34 + (unsigned int)__popc(m_42);
+                total_35 = total_35 + (unsigned int)__popc(m_42);
                 unsigned int bits_72_1 = __as_u32(vals_b[11]);
                 unsigned int key_72_1 = ((bits_72_1 <= 2139095040) ? bits_72_1 : 0);
                 keys_10[3] = key_72_1;
@@ -59016,7 +59001,7 @@ kernel_cake_radix_topk_c4_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 cands_34[3] = b_lo <= keys_10[3] >> 21 && idxs_10[3] < vocab;
                 unsigned int m_43 = __ballot_sync(0xFFFFFFFF, cands_34[3]);
                 before_34 = before_34 + (unsigned int)__popc(m_43 & lt_mask_2_1);
-                total_34 = total_34 + (unsigned int)__popc(m_43);
+                total_35 = total_35 + (unsigned int)__popc(m_43);
                 unsigned int own_34 = 0;
                 unsigned int pos_136 = n_2_1 + before_34 + own_34;
                 if (cands_34[0] && pos_136 < 1024) {
@@ -59054,12 +59039,12 @@ kernel_cake_radix_topk_c4_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 if (cands_34[3]) {
                     own_34 = own_34 + 1;
                 }
-                n_2_1 = n_2_1 + total_34;
+                n_2_1 = n_2_1 + total_35;
                 unsigned int keys_11[4];
                 int idxs_11[4];
                 bool cands_35[4];
                 unsigned int before_35 = 0;
-                unsigned int total_35 = 0;
+                unsigned int total_36 = 0;
                 unsigned int bits_73_1 = __as_u32(vals_b[12]);
                 unsigned int key_73_1 = ((bits_73_1 <= 2139095040) ? bits_73_1 : 0);
                 keys_11[0] = key_73_1;
@@ -59067,7 +59052,7 @@ kernel_cake_radix_topk_c4_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 cands_35[0] = b_lo <= keys_11[0] >> 21 && idxs_11[0] < vocab;
                 unsigned int m_44 = __ballot_sync(0xFFFFFFFF, cands_35[0]);
                 before_35 = before_35 + (unsigned int)__popc(m_44 & lt_mask_2_1);
-                total_35 = total_35 + (unsigned int)__popc(m_44);
+                total_36 = total_36 + (unsigned int)__popc(m_44);
                 unsigned int bits_74_1 = __as_u32(vals_b[13]);
                 unsigned int key_74_1 = ((bits_74_1 <= 2139095040) ? bits_74_1 : 0);
                 keys_11[1] = key_74_1;
@@ -59075,7 +59060,7 @@ kernel_cake_radix_topk_c4_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 cands_35[1] = b_lo <= keys_11[1] >> 21 && idxs_11[1] < vocab;
                 unsigned int m_45 = __ballot_sync(0xFFFFFFFF, cands_35[1]);
                 before_35 = before_35 + (unsigned int)__popc(m_45 & lt_mask_2_1);
-                total_35 = total_35 + (unsigned int)__popc(m_45);
+                total_36 = total_36 + (unsigned int)__popc(m_45);
                 unsigned int bits_75_1 = __as_u32(vals_b[14]);
                 unsigned int key_75_1 = ((bits_75_1 <= 2139095040) ? bits_75_1 : 0);
                 keys_11[2] = key_75_1;
@@ -59083,7 +59068,7 @@ kernel_cake_radix_topk_c4_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 cands_35[2] = b_lo <= keys_11[2] >> 21 && idxs_11[2] < vocab;
                 unsigned int m_46 = __ballot_sync(0xFFFFFFFF, cands_35[2]);
                 before_35 = before_35 + (unsigned int)__popc(m_46 & lt_mask_2_1);
-                total_35 = total_35 + (unsigned int)__popc(m_46);
+                total_36 = total_36 + (unsigned int)__popc(m_46);
                 unsigned int bits_76_1 = __as_u32(vals_b[15]);
                 unsigned int key_76_1 = ((bits_76_1 <= 2139095040) ? bits_76_1 : 0);
                 keys_11[3] = key_76_1;
@@ -59091,7 +59076,7 @@ kernel_cake_radix_topk_c4_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 cands_35[3] = b_lo <= keys_11[3] >> 21 && idxs_11[3] < vocab;
                 unsigned int m_47 = __ballot_sync(0xFFFFFFFF, cands_35[3]);
                 before_35 = before_35 + (unsigned int)__popc(m_47 & lt_mask_2_1);
-                total_35 = total_35 + (unsigned int)__popc(m_47);
+                total_36 = total_36 + (unsigned int)__popc(m_47);
                 unsigned int own_35 = 0;
                 unsigned int pos_140 = n_2_1 + before_35 + own_35;
                 if (cands_35[0] && pos_140 < 1024) {
@@ -59129,12 +59114,12 @@ kernel_cake_radix_topk_c4_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 if (cands_35[3]) {
                     own_35 = own_35 + 1;
                 }
-                n_2_1 = n_2_1 + total_35;
+                n_2_1 = n_2_1 + total_36;
                 unsigned int keys_12[4];
                 int idxs_12[4];
                 bool cands_36[4];
                 unsigned int before_36 = 0;
-                unsigned int total_36 = 0;
+                unsigned int total_37 = 0;
                 unsigned int bits_77_1 = __as_u32(vals_b[16]);
                 unsigned int key_77_1 = ((bits_77_1 <= 2139095040) ? bits_77_1 : 0);
                 keys_12[0] = key_77_1;
@@ -59142,7 +59127,7 @@ kernel_cake_radix_topk_c4_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 cands_36[0] = b_lo <= keys_12[0] >> 21 && idxs_12[0] < vocab;
                 unsigned int m_48 = __ballot_sync(0xFFFFFFFF, cands_36[0]);
                 before_36 = before_36 + (unsigned int)__popc(m_48 & lt_mask_2_1);
-                total_36 = total_36 + (unsigned int)__popc(m_48);
+                total_37 = total_37 + (unsigned int)__popc(m_48);
                 unsigned int bits_78_1 = __as_u32(vals_b[17]);
                 unsigned int key_78_1 = ((bits_78_1 <= 2139095040) ? bits_78_1 : 0);
                 keys_12[1] = key_78_1;
@@ -59150,7 +59135,7 @@ kernel_cake_radix_topk_c4_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 cands_36[1] = b_lo <= keys_12[1] >> 21 && idxs_12[1] < vocab;
                 unsigned int m_49 = __ballot_sync(0xFFFFFFFF, cands_36[1]);
                 before_36 = before_36 + (unsigned int)__popc(m_49 & lt_mask_2_1);
-                total_36 = total_36 + (unsigned int)__popc(m_49);
+                total_37 = total_37 + (unsigned int)__popc(m_49);
                 unsigned int bits_79_1 = __as_u32(vals_b[18]);
                 unsigned int key_79_1 = ((bits_79_1 <= 2139095040) ? bits_79_1 : 0);
                 keys_12[2] = key_79_1;
@@ -59158,7 +59143,7 @@ kernel_cake_radix_topk_c4_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 cands_36[2] = b_lo <= keys_12[2] >> 21 && idxs_12[2] < vocab;
                 unsigned int m_50 = __ballot_sync(0xFFFFFFFF, cands_36[2]);
                 before_36 = before_36 + (unsigned int)__popc(m_50 & lt_mask_2_1);
-                total_36 = total_36 + (unsigned int)__popc(m_50);
+                total_37 = total_37 + (unsigned int)__popc(m_50);
                 unsigned int bits_80_1 = __as_u32(vals_b[19]);
                 unsigned int key_80_1 = ((bits_80_1 <= 2139095040) ? bits_80_1 : 0);
                 keys_12[3] = key_80_1;
@@ -59166,7 +59151,7 @@ kernel_cake_radix_topk_c4_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 cands_36[3] = b_lo <= keys_12[3] >> 21 && idxs_12[3] < vocab;
                 unsigned int m_51 = __ballot_sync(0xFFFFFFFF, cands_36[3]);
                 before_36 = before_36 + (unsigned int)__popc(m_51 & lt_mask_2_1);
-                total_36 = total_36 + (unsigned int)__popc(m_51);
+                total_37 = total_37 + (unsigned int)__popc(m_51);
                 unsigned int own_36 = 0;
                 unsigned int pos_144 = n_2_1 + before_36 + own_36;
                 if (cands_36[0] && pos_144 < 1024) {
@@ -59204,12 +59189,12 @@ kernel_cake_radix_topk_c4_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 if (cands_36[3]) {
                     own_36 = own_36 + 1;
                 }
-                n_2_1 = n_2_1 + total_36;
+                n_2_1 = n_2_1 + total_37;
                 unsigned int keys_13[4];
                 int idxs_13[4];
                 bool cands_37[4];
                 unsigned int before_37 = 0;
-                unsigned int total_37 = 0;
+                unsigned int total_38 = 0;
                 unsigned int bits_81_1 = __as_u32(vals_b[20]);
                 unsigned int key_81_1 = ((bits_81_1 <= 2139095040) ? bits_81_1 : 0);
                 keys_13[0] = key_81_1;
@@ -59217,7 +59202,7 @@ kernel_cake_radix_topk_c4_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 cands_37[0] = b_lo <= keys_13[0] >> 21 && idxs_13[0] < vocab;
                 unsigned int m_52 = __ballot_sync(0xFFFFFFFF, cands_37[0]);
                 before_37 = before_37 + (unsigned int)__popc(m_52 & lt_mask_2_1);
-                total_37 = total_37 + (unsigned int)__popc(m_52);
+                total_38 = total_38 + (unsigned int)__popc(m_52);
                 unsigned int bits_82_1 = __as_u32(vals_b[21]);
                 unsigned int key_82_1 = ((bits_82_1 <= 2139095040) ? bits_82_1 : 0);
                 keys_13[1] = key_82_1;
@@ -59225,7 +59210,7 @@ kernel_cake_radix_topk_c4_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 cands_37[1] = b_lo <= keys_13[1] >> 21 && idxs_13[1] < vocab;
                 unsigned int m_53 = __ballot_sync(0xFFFFFFFF, cands_37[1]);
                 before_37 = before_37 + (unsigned int)__popc(m_53 & lt_mask_2_1);
-                total_37 = total_37 + (unsigned int)__popc(m_53);
+                total_38 = total_38 + (unsigned int)__popc(m_53);
                 unsigned int bits_83_1 = __as_u32(vals_b[22]);
                 unsigned int key_83_1 = ((bits_83_1 <= 2139095040) ? bits_83_1 : 0);
                 keys_13[2] = key_83_1;
@@ -59233,7 +59218,7 @@ kernel_cake_radix_topk_c4_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 cands_37[2] = b_lo <= keys_13[2] >> 21 && idxs_13[2] < vocab;
                 unsigned int m_54 = __ballot_sync(0xFFFFFFFF, cands_37[2]);
                 before_37 = before_37 + (unsigned int)__popc(m_54 & lt_mask_2_1);
-                total_37 = total_37 + (unsigned int)__popc(m_54);
+                total_38 = total_38 + (unsigned int)__popc(m_54);
                 unsigned int bits_84_1 = __as_u32(vals_b[23]);
                 unsigned int key_84_1 = ((bits_84_1 <= 2139095040) ? bits_84_1 : 0);
                 keys_13[3] = key_84_1;
@@ -59241,7 +59226,7 @@ kernel_cake_radix_topk_c4_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 cands_37[3] = b_lo <= keys_13[3] >> 21 && idxs_13[3] < vocab;
                 unsigned int m_55 = __ballot_sync(0xFFFFFFFF, cands_37[3]);
                 before_37 = before_37 + (unsigned int)__popc(m_55 & lt_mask_2_1);
-                total_37 = total_37 + (unsigned int)__popc(m_55);
+                total_38 = total_38 + (unsigned int)__popc(m_55);
                 unsigned int own_37 = 0;
                 unsigned int pos_148 = n_2_1 + before_37 + own_37;
                 if (cands_37[0] && pos_148 < 1024) {
@@ -59279,12 +59264,12 @@ kernel_cake_radix_topk_c4_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 if (cands_37[3]) {
                     own_37 = own_37 + 1;
                 }
-                n_2_1 = n_2_1 + total_37;
+                n_2_1 = n_2_1 + total_38;
                 unsigned int keys_14[4];
                 int idxs_14[4];
                 bool cands_38[4];
                 unsigned int before_38 = 0;
-                unsigned int total_38 = 0;
+                unsigned int total_39 = 0;
                 unsigned int bits_85_1 = __as_u32(vals_b[24]);
                 unsigned int key_85_1 = ((bits_85_1 <= 2139095040) ? bits_85_1 : 0);
                 keys_14[0] = key_85_1;
@@ -59292,7 +59277,7 @@ kernel_cake_radix_topk_c4_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 cands_38[0] = b_lo <= keys_14[0] >> 21 && idxs_14[0] < vocab;
                 unsigned int m_56 = __ballot_sync(0xFFFFFFFF, cands_38[0]);
                 before_38 = before_38 + (unsigned int)__popc(m_56 & lt_mask_2_1);
-                total_38 = total_38 + (unsigned int)__popc(m_56);
+                total_39 = total_39 + (unsigned int)__popc(m_56);
                 unsigned int bits_86_1 = __as_u32(vals_b[25]);
                 unsigned int key_86_1 = ((bits_86_1 <= 2139095040) ? bits_86_1 : 0);
                 keys_14[1] = key_86_1;
@@ -59300,7 +59285,7 @@ kernel_cake_radix_topk_c4_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 cands_38[1] = b_lo <= keys_14[1] >> 21 && idxs_14[1] < vocab;
                 unsigned int m_57 = __ballot_sync(0xFFFFFFFF, cands_38[1]);
                 before_38 = before_38 + (unsigned int)__popc(m_57 & lt_mask_2_1);
-                total_38 = total_38 + (unsigned int)__popc(m_57);
+                total_39 = total_39 + (unsigned int)__popc(m_57);
                 unsigned int bits_87_1 = __as_u32(vals_b[26]);
                 unsigned int key_87_1 = ((bits_87_1 <= 2139095040) ? bits_87_1 : 0);
                 keys_14[2] = key_87_1;
@@ -59308,7 +59293,7 @@ kernel_cake_radix_topk_c4_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 cands_38[2] = b_lo <= keys_14[2] >> 21 && idxs_14[2] < vocab;
                 unsigned int m_58 = __ballot_sync(0xFFFFFFFF, cands_38[2]);
                 before_38 = before_38 + (unsigned int)__popc(m_58 & lt_mask_2_1);
-                total_38 = total_38 + (unsigned int)__popc(m_58);
+                total_39 = total_39 + (unsigned int)__popc(m_58);
                 unsigned int bits_88_1 = __as_u32(vals_b[27]);
                 unsigned int key_88_1 = ((bits_88_1 <= 2139095040) ? bits_88_1 : 0);
                 keys_14[3] = key_88_1;
@@ -59316,7 +59301,7 @@ kernel_cake_radix_topk_c4_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 cands_38[3] = b_lo <= keys_14[3] >> 21 && idxs_14[3] < vocab;
                 unsigned int m_59 = __ballot_sync(0xFFFFFFFF, cands_38[3]);
                 before_38 = before_38 + (unsigned int)__popc(m_59 & lt_mask_2_1);
-                total_38 = total_38 + (unsigned int)__popc(m_59);
+                total_39 = total_39 + (unsigned int)__popc(m_59);
                 unsigned int own_38 = 0;
                 unsigned int pos_152 = n_2_1 + before_38 + own_38;
                 if (cands_38[0] && pos_152 < 1024) {
@@ -59354,12 +59339,12 @@ kernel_cake_radix_topk_c4_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 if (cands_38[3]) {
                     own_38 = own_38 + 1;
                 }
-                n_2_1 = n_2_1 + total_38;
+                n_2_1 = n_2_1 + total_39;
                 unsigned int keys_15[4];
                 int idxs_15[4];
                 bool cands_39[4];
                 unsigned int before_39 = 0;
-                unsigned int total_39 = 0;
+                unsigned int total_40 = 0;
                 unsigned int bits_89_1 = __as_u32(vals_b[28]);
                 unsigned int key_89_1 = ((bits_89_1 <= 2139095040) ? bits_89_1 : 0);
                 keys_15[0] = key_89_1;
@@ -59367,7 +59352,7 @@ kernel_cake_radix_topk_c4_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 cands_39[0] = b_lo <= keys_15[0] >> 21 && idxs_15[0] < vocab;
                 unsigned int m_60 = __ballot_sync(0xFFFFFFFF, cands_39[0]);
                 before_39 = before_39 + (unsigned int)__popc(m_60 & lt_mask_2_1);
-                total_39 = total_39 + (unsigned int)__popc(m_60);
+                total_40 = total_40 + (unsigned int)__popc(m_60);
                 unsigned int bits_90_1 = __as_u32(vals_b[29]);
                 unsigned int key_90_1 = ((bits_90_1 <= 2139095040) ? bits_90_1 : 0);
                 keys_15[1] = key_90_1;
@@ -59375,7 +59360,7 @@ kernel_cake_radix_topk_c4_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 cands_39[1] = b_lo <= keys_15[1] >> 21 && idxs_15[1] < vocab;
                 unsigned int m_61 = __ballot_sync(0xFFFFFFFF, cands_39[1]);
                 before_39 = before_39 + (unsigned int)__popc(m_61 & lt_mask_2_1);
-                total_39 = total_39 + (unsigned int)__popc(m_61);
+                total_40 = total_40 + (unsigned int)__popc(m_61);
                 unsigned int bits_91_1 = __as_u32(vals_b[30]);
                 unsigned int key_91_1 = ((bits_91_1 <= 2139095040) ? bits_91_1 : 0);
                 keys_15[2] = key_91_1;
@@ -59383,7 +59368,7 @@ kernel_cake_radix_topk_c4_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 cands_39[2] = b_lo <= keys_15[2] >> 21 && idxs_15[2] < vocab;
                 unsigned int m_62 = __ballot_sync(0xFFFFFFFF, cands_39[2]);
                 before_39 = before_39 + (unsigned int)__popc(m_62 & lt_mask_2_1);
-                total_39 = total_39 + (unsigned int)__popc(m_62);
+                total_40 = total_40 + (unsigned int)__popc(m_62);
                 unsigned int bits_92_1 = __as_u32(vals_b[31]);
                 unsigned int key_92_1 = ((bits_92_1 <= 2139095040) ? bits_92_1 : 0);
                 keys_15[3] = key_92_1;
@@ -59391,7 +59376,7 @@ kernel_cake_radix_topk_c4_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 cands_39[3] = b_lo <= keys_15[3] >> 21 && idxs_15[3] < vocab;
                 unsigned int m_63 = __ballot_sync(0xFFFFFFFF, cands_39[3]);
                 before_39 = before_39 + (unsigned int)__popc(m_63 & lt_mask_2_1);
-                total_39 = total_39 + (unsigned int)__popc(m_63);
+                total_40 = total_40 + (unsigned int)__popc(m_63);
                 unsigned int own_39 = 0;
                 unsigned int pos_156 = n_2_1 + before_39 + own_39;
                 if (cands_39[0] && pos_156 < 1024) {
@@ -59429,7 +59414,7 @@ kernel_cake_radix_topk_c4_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 if (cands_39[3]) {
                     own_39 = own_39 + 1;
                 }
-                n_2_1 = n_2_1 + total_39;
+                n_2_1 = n_2_1 + total_40;
             } else {
                 unsigned int skeys_8[4];
                 int sidxs_8[4];
@@ -60334,7 +60319,7 @@ kernel_cake_radix_topk_c4_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                     int idxs_16[4];
                     bool cands_40[4];
                     unsigned int before_40 = 0;
-                    unsigned int total_40 = 0;
+                    unsigned int total_41 = 0;
                     unsigned int bits_164 = __as_u32(vals_a[0]);
                     unsigned int key_164 = ((bits_164 <= 2139095040) ? bits_164 : 0);
                     keys_16[0] = key_164;
@@ -60342,7 +60327,7 @@ kernel_cake_radix_topk_c4_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                     cands_40[0] = b_lo <= keys_16[0] >> 21 && idxs_16[0] < vocab;
                     unsigned int m_64 = __ballot_sync(0xFFFFFFFF, cands_40[0]);
                     before_40 = before_40 + (unsigned int)__popc(m_64 & lt_mask_3);
-                    total_40 = total_40 + (unsigned int)__popc(m_64);
+                    total_41 = total_41 + (unsigned int)__popc(m_64);
                     unsigned int bits_124_1 = __as_u32(vals_a[1]);
                     unsigned int key_124_1 = ((bits_124_1 <= 2139095040) ? bits_124_1 : 0);
                     keys_16[1] = key_124_1;
@@ -60350,7 +60335,7 @@ kernel_cake_radix_topk_c4_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                     cands_40[1] = b_lo <= keys_16[1] >> 21 && idxs_16[1] < vocab;
                     unsigned int m_65 = __ballot_sync(0xFFFFFFFF, cands_40[1]);
                     before_40 = before_40 + (unsigned int)__popc(m_65 & lt_mask_3);
-                    total_40 = total_40 + (unsigned int)__popc(m_65);
+                    total_41 = total_41 + (unsigned int)__popc(m_65);
                     unsigned int bits_125_1 = __as_u32(vals_a[2]);
                     unsigned int key_125_1 = ((bits_125_1 <= 2139095040) ? bits_125_1 : 0);
                     keys_16[2] = key_125_1;
@@ -60358,7 +60343,7 @@ kernel_cake_radix_topk_c4_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                     cands_40[2] = b_lo <= keys_16[2] >> 21 && idxs_16[2] < vocab;
                     unsigned int m_66 = __ballot_sync(0xFFFFFFFF, cands_40[2]);
                     before_40 = before_40 + (unsigned int)__popc(m_66 & lt_mask_3);
-                    total_40 = total_40 + (unsigned int)__popc(m_66);
+                    total_41 = total_41 + (unsigned int)__popc(m_66);
                     unsigned int bits_126_1 = __as_u32(vals_a[3]);
                     unsigned int key_126_1 = ((bits_126_1 <= 2139095040) ? bits_126_1 : 0);
                     keys_16[3] = key_126_1;
@@ -60366,7 +60351,7 @@ kernel_cake_radix_topk_c4_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                     cands_40[3] = b_lo <= keys_16[3] >> 21 && idxs_16[3] < vocab;
                     unsigned int m_67 = __ballot_sync(0xFFFFFFFF, cands_40[3]);
                     before_40 = before_40 + (unsigned int)__popc(m_67 & lt_mask_3);
-                    total_40 = total_40 + (unsigned int)__popc(m_67);
+                    total_41 = total_41 + (unsigned int)__popc(m_67);
                     unsigned int own_40 = 0;
                     unsigned int pos_160 = n_3 + before_40 + own_40;
                     if (cands_40[0] && pos_160 < 1024) {
@@ -60404,12 +60389,12 @@ kernel_cake_radix_topk_c4_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                     if (cands_40[3]) {
                         own_40 = own_40 + 1;
                     }
-                    n_3 = n_3 + total_40;
+                    n_3 = n_3 + total_41;
                     unsigned int keys_17[4];
                     int idxs_17[4];
                     bool cands_41[4];
                     unsigned int before_41 = 0;
-                    unsigned int total_41 = 0;
+                    unsigned int total_42 = 0;
                     unsigned int bits_127_1 = __as_u32(vals_a[4]);
                     unsigned int key_127_1 = ((bits_127_1 <= 2139095040) ? bits_127_1 : 0);
                     keys_17[0] = key_127_1;
@@ -60417,7 +60402,7 @@ kernel_cake_radix_topk_c4_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                     cands_41[0] = b_lo <= keys_17[0] >> 21 && idxs_17[0] < vocab;
                     unsigned int m_68 = __ballot_sync(0xFFFFFFFF, cands_41[0]);
                     before_41 = before_41 + (unsigned int)__popc(m_68 & lt_mask_3);
-                    total_41 = total_41 + (unsigned int)__popc(m_68);
+                    total_42 = total_42 + (unsigned int)__popc(m_68);
                     unsigned int bits_128_1 = __as_u32(vals_a[5]);
                     unsigned int key_128_1 = ((bits_128_1 <= 2139095040) ? bits_128_1 : 0);
                     keys_17[1] = key_128_1;
@@ -60425,7 +60410,7 @@ kernel_cake_radix_topk_c4_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                     cands_41[1] = b_lo <= keys_17[1] >> 21 && idxs_17[1] < vocab;
                     unsigned int m_69 = __ballot_sync(0xFFFFFFFF, cands_41[1]);
                     before_41 = before_41 + (unsigned int)__popc(m_69 & lt_mask_3);
-                    total_41 = total_41 + (unsigned int)__popc(m_69);
+                    total_42 = total_42 + (unsigned int)__popc(m_69);
                     unsigned int bits_129_1 = __as_u32(vals_a[6]);
                     unsigned int key_129_1 = ((bits_129_1 <= 2139095040) ? bits_129_1 : 0);
                     keys_17[2] = key_129_1;
@@ -60433,7 +60418,7 @@ kernel_cake_radix_topk_c4_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                     cands_41[2] = b_lo <= keys_17[2] >> 21 && idxs_17[2] < vocab;
                     unsigned int m_70 = __ballot_sync(0xFFFFFFFF, cands_41[2]);
                     before_41 = before_41 + (unsigned int)__popc(m_70 & lt_mask_3);
-                    total_41 = total_41 + (unsigned int)__popc(m_70);
+                    total_42 = total_42 + (unsigned int)__popc(m_70);
                     unsigned int bits_130_1 = __as_u32(vals_a[7]);
                     unsigned int key_130_1 = ((bits_130_1 <= 2139095040) ? bits_130_1 : 0);
                     keys_17[3] = key_130_1;
@@ -60441,7 +60426,7 @@ kernel_cake_radix_topk_c4_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                     cands_41[3] = b_lo <= keys_17[3] >> 21 && idxs_17[3] < vocab;
                     unsigned int m_71 = __ballot_sync(0xFFFFFFFF, cands_41[3]);
                     before_41 = before_41 + (unsigned int)__popc(m_71 & lt_mask_3);
-                    total_41 = total_41 + (unsigned int)__popc(m_71);
+                    total_42 = total_42 + (unsigned int)__popc(m_71);
                     unsigned int own_41 = 0;
                     unsigned int pos_164 = n_3 + before_41 + own_41;
                     if (cands_41[0] && pos_164 < 1024) {
@@ -60479,12 +60464,12 @@ kernel_cake_radix_topk_c4_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                     if (cands_41[3]) {
                         own_41 = own_41 + 1;
                     }
-                    n_3 = n_3 + total_41;
+                    n_3 = n_3 + total_42;
                     unsigned int keys_18[4];
                     int idxs_18[4];
                     bool cands_42[4];
                     unsigned int before_42 = 0;
-                    unsigned int total_42 = 0;
+                    unsigned int total_43 = 0;
                     unsigned int bits_131_1 = __as_u32(vals_a[8]);
                     unsigned int key_131_1 = ((bits_131_1 <= 2139095040) ? bits_131_1 : 0);
                     keys_18[0] = key_131_1;
@@ -60492,7 +60477,7 @@ kernel_cake_radix_topk_c4_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                     cands_42[0] = b_lo <= keys_18[0] >> 21 && idxs_18[0] < vocab;
                     unsigned int m_72 = __ballot_sync(0xFFFFFFFF, cands_42[0]);
                     before_42 = before_42 + (unsigned int)__popc(m_72 & lt_mask_3);
-                    total_42 = total_42 + (unsigned int)__popc(m_72);
+                    total_43 = total_43 + (unsigned int)__popc(m_72);
                     unsigned int bits_132_1 = __as_u32(vals_a[9]);
                     unsigned int key_132_1 = ((bits_132_1 <= 2139095040) ? bits_132_1 : 0);
                     keys_18[1] = key_132_1;
@@ -60500,7 +60485,7 @@ kernel_cake_radix_topk_c4_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                     cands_42[1] = b_lo <= keys_18[1] >> 21 && idxs_18[1] < vocab;
                     unsigned int m_73 = __ballot_sync(0xFFFFFFFF, cands_42[1]);
                     before_42 = before_42 + (unsigned int)__popc(m_73 & lt_mask_3);
-                    total_42 = total_42 + (unsigned int)__popc(m_73);
+                    total_43 = total_43 + (unsigned int)__popc(m_73);
                     unsigned int bits_133_1 = __as_u32(vals_a[10]);
                     unsigned int key_133_1 = ((bits_133_1 <= 2139095040) ? bits_133_1 : 0);
                     keys_18[2] = key_133_1;
@@ -60508,7 +60493,7 @@ kernel_cake_radix_topk_c4_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                     cands_42[2] = b_lo <= keys_18[2] >> 21 && idxs_18[2] < vocab;
                     unsigned int m_74 = __ballot_sync(0xFFFFFFFF, cands_42[2]);
                     before_42 = before_42 + (unsigned int)__popc(m_74 & lt_mask_3);
-                    total_42 = total_42 + (unsigned int)__popc(m_74);
+                    total_43 = total_43 + (unsigned int)__popc(m_74);
                     unsigned int bits_134_1 = __as_u32(vals_a[11]);
                     unsigned int key_134_1 = ((bits_134_1 <= 2139095040) ? bits_134_1 : 0);
                     keys_18[3] = key_134_1;
@@ -60516,7 +60501,7 @@ kernel_cake_radix_topk_c4_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                     cands_42[3] = b_lo <= keys_18[3] >> 21 && idxs_18[3] < vocab;
                     unsigned int m_75 = __ballot_sync(0xFFFFFFFF, cands_42[3]);
                     before_42 = before_42 + (unsigned int)__popc(m_75 & lt_mask_3);
-                    total_42 = total_42 + (unsigned int)__popc(m_75);
+                    total_43 = total_43 + (unsigned int)__popc(m_75);
                     unsigned int own_42 = 0;
                     unsigned int pos_168 = n_3 + before_42 + own_42;
                     if (cands_42[0] && pos_168 < 1024) {
@@ -60554,12 +60539,12 @@ kernel_cake_radix_topk_c4_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                     if (cands_42[3]) {
                         own_42 = own_42 + 1;
                     }
-                    n_3 = n_3 + total_42;
+                    n_3 = n_3 + total_43;
                     unsigned int keys_19[4];
                     int idxs_19[4];
                     bool cands_43[4];
                     unsigned int before_43 = 0;
-                    unsigned int total_43 = 0;
+                    unsigned int total_44 = 0;
                     unsigned int bits_135_1 = __as_u32(vals_a[12]);
                     unsigned int key_135_1 = ((bits_135_1 <= 2139095040) ? bits_135_1 : 0);
                     keys_19[0] = key_135_1;
@@ -60567,7 +60552,7 @@ kernel_cake_radix_topk_c4_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                     cands_43[0] = b_lo <= keys_19[0] >> 21 && idxs_19[0] < vocab;
                     unsigned int m_76 = __ballot_sync(0xFFFFFFFF, cands_43[0]);
                     before_43 = before_43 + (unsigned int)__popc(m_76 & lt_mask_3);
-                    total_43 = total_43 + (unsigned int)__popc(m_76);
+                    total_44 = total_44 + (unsigned int)__popc(m_76);
                     unsigned int bits_136_1 = __as_u32(vals_a[13]);
                     unsigned int key_136_1 = ((bits_136_1 <= 2139095040) ? bits_136_1 : 0);
                     keys_19[1] = key_136_1;
@@ -60575,7 +60560,7 @@ kernel_cake_radix_topk_c4_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                     cands_43[1] = b_lo <= keys_19[1] >> 21 && idxs_19[1] < vocab;
                     unsigned int m_77 = __ballot_sync(0xFFFFFFFF, cands_43[1]);
                     before_43 = before_43 + (unsigned int)__popc(m_77 & lt_mask_3);
-                    total_43 = total_43 + (unsigned int)__popc(m_77);
+                    total_44 = total_44 + (unsigned int)__popc(m_77);
                     unsigned int bits_137_1 = __as_u32(vals_a[14]);
                     unsigned int key_137_1 = ((bits_137_1 <= 2139095040) ? bits_137_1 : 0);
                     keys_19[2] = key_137_1;
@@ -60583,7 +60568,7 @@ kernel_cake_radix_topk_c4_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                     cands_43[2] = b_lo <= keys_19[2] >> 21 && idxs_19[2] < vocab;
                     unsigned int m_78 = __ballot_sync(0xFFFFFFFF, cands_43[2]);
                     before_43 = before_43 + (unsigned int)__popc(m_78 & lt_mask_3);
-                    total_43 = total_43 + (unsigned int)__popc(m_78);
+                    total_44 = total_44 + (unsigned int)__popc(m_78);
                     unsigned int bits_138_1 = __as_u32(vals_a[15]);
                     unsigned int key_138_1 = ((bits_138_1 <= 2139095040) ? bits_138_1 : 0);
                     keys_19[3] = key_138_1;
@@ -60591,7 +60576,7 @@ kernel_cake_radix_topk_c4_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                     cands_43[3] = b_lo <= keys_19[3] >> 21 && idxs_19[3] < vocab;
                     unsigned int m_79 = __ballot_sync(0xFFFFFFFF, cands_43[3]);
                     before_43 = before_43 + (unsigned int)__popc(m_79 & lt_mask_3);
-                    total_43 = total_43 + (unsigned int)__popc(m_79);
+                    total_44 = total_44 + (unsigned int)__popc(m_79);
                     unsigned int own_43 = 0;
                     unsigned int pos_172 = n_3 + before_43 + own_43;
                     if (cands_43[0] && pos_172 < 1024) {
@@ -60629,12 +60614,12 @@ kernel_cake_radix_topk_c4_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                     if (cands_43[3]) {
                         own_43 = own_43 + 1;
                     }
-                    n_3 = n_3 + total_43;
+                    n_3 = n_3 + total_44;
                     unsigned int keys_20[4];
                     int idxs_20[4];
                     bool cands_44[4];
                     unsigned int before_44 = 0;
-                    unsigned int total_44 = 0;
+                    unsigned int total_45 = 0;
                     unsigned int bits_139_1 = __as_u32(vals_a[16]);
                     unsigned int key_139_1 = ((bits_139_1 <= 2139095040) ? bits_139_1 : 0);
                     keys_20[0] = key_139_1;
@@ -60642,7 +60627,7 @@ kernel_cake_radix_topk_c4_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                     cands_44[0] = b_lo <= keys_20[0] >> 21 && idxs_20[0] < vocab;
                     unsigned int m_80 = __ballot_sync(0xFFFFFFFF, cands_44[0]);
                     before_44 = before_44 + (unsigned int)__popc(m_80 & lt_mask_3);
-                    total_44 = total_44 + (unsigned int)__popc(m_80);
+                    total_45 = total_45 + (unsigned int)__popc(m_80);
                     unsigned int bits_140_1 = __as_u32(vals_a[17]);
                     unsigned int key_140_1 = ((bits_140_1 <= 2139095040) ? bits_140_1 : 0);
                     keys_20[1] = key_140_1;
@@ -60650,7 +60635,7 @@ kernel_cake_radix_topk_c4_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                     cands_44[1] = b_lo <= keys_20[1] >> 21 && idxs_20[1] < vocab;
                     unsigned int m_81 = __ballot_sync(0xFFFFFFFF, cands_44[1]);
                     before_44 = before_44 + (unsigned int)__popc(m_81 & lt_mask_3);
-                    total_44 = total_44 + (unsigned int)__popc(m_81);
+                    total_45 = total_45 + (unsigned int)__popc(m_81);
                     unsigned int bits_141_1 = __as_u32(vals_a[18]);
                     unsigned int key_141_1 = ((bits_141_1 <= 2139095040) ? bits_141_1 : 0);
                     keys_20[2] = key_141_1;
@@ -60658,7 +60643,7 @@ kernel_cake_radix_topk_c4_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                     cands_44[2] = b_lo <= keys_20[2] >> 21 && idxs_20[2] < vocab;
                     unsigned int m_82 = __ballot_sync(0xFFFFFFFF, cands_44[2]);
                     before_44 = before_44 + (unsigned int)__popc(m_82 & lt_mask_3);
-                    total_44 = total_44 + (unsigned int)__popc(m_82);
+                    total_45 = total_45 + (unsigned int)__popc(m_82);
                     unsigned int bits_142_1 = __as_u32(vals_a[19]);
                     unsigned int key_142_1 = ((bits_142_1 <= 2139095040) ? bits_142_1 : 0);
                     keys_20[3] = key_142_1;
@@ -60666,7 +60651,7 @@ kernel_cake_radix_topk_c4_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                     cands_44[3] = b_lo <= keys_20[3] >> 21 && idxs_20[3] < vocab;
                     unsigned int m_83 = __ballot_sync(0xFFFFFFFF, cands_44[3]);
                     before_44 = before_44 + (unsigned int)__popc(m_83 & lt_mask_3);
-                    total_44 = total_44 + (unsigned int)__popc(m_83);
+                    total_45 = total_45 + (unsigned int)__popc(m_83);
                     unsigned int own_44 = 0;
                     unsigned int pos_176 = n_3 + before_44 + own_44;
                     if (cands_44[0] && pos_176 < 1024) {
@@ -60704,12 +60689,12 @@ kernel_cake_radix_topk_c4_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                     if (cands_44[3]) {
                         own_44 = own_44 + 1;
                     }
-                    n_3 = n_3 + total_44;
+                    n_3 = n_3 + total_45;
                     unsigned int keys_21[4];
                     int idxs_21[4];
                     bool cands_45[4];
                     unsigned int before_45 = 0;
-                    unsigned int total_45 = 0;
+                    unsigned int total_46 = 0;
                     unsigned int bits_143_1 = __as_u32(vals_a[20]);
                     unsigned int key_143_1 = ((bits_143_1 <= 2139095040) ? bits_143_1 : 0);
                     keys_21[0] = key_143_1;
@@ -60717,7 +60702,7 @@ kernel_cake_radix_topk_c4_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                     cands_45[0] = b_lo <= keys_21[0] >> 21 && idxs_21[0] < vocab;
                     unsigned int m_84 = __ballot_sync(0xFFFFFFFF, cands_45[0]);
                     before_45 = before_45 + (unsigned int)__popc(m_84 & lt_mask_3);
-                    total_45 = total_45 + (unsigned int)__popc(m_84);
+                    total_46 = total_46 + (unsigned int)__popc(m_84);
                     unsigned int bits_144_1 = __as_u32(vals_a[21]);
                     unsigned int key_144_1 = ((bits_144_1 <= 2139095040) ? bits_144_1 : 0);
                     keys_21[1] = key_144_1;
@@ -60725,7 +60710,7 @@ kernel_cake_radix_topk_c4_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                     cands_45[1] = b_lo <= keys_21[1] >> 21 && idxs_21[1] < vocab;
                     unsigned int m_85 = __ballot_sync(0xFFFFFFFF, cands_45[1]);
                     before_45 = before_45 + (unsigned int)__popc(m_85 & lt_mask_3);
-                    total_45 = total_45 + (unsigned int)__popc(m_85);
+                    total_46 = total_46 + (unsigned int)__popc(m_85);
                     unsigned int bits_145_1 = __as_u32(vals_a[22]);
                     unsigned int key_145_1 = ((bits_145_1 <= 2139095040) ? bits_145_1 : 0);
                     keys_21[2] = key_145_1;
@@ -60733,7 +60718,7 @@ kernel_cake_radix_topk_c4_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                     cands_45[2] = b_lo <= keys_21[2] >> 21 && idxs_21[2] < vocab;
                     unsigned int m_86 = __ballot_sync(0xFFFFFFFF, cands_45[2]);
                     before_45 = before_45 + (unsigned int)__popc(m_86 & lt_mask_3);
-                    total_45 = total_45 + (unsigned int)__popc(m_86);
+                    total_46 = total_46 + (unsigned int)__popc(m_86);
                     unsigned int bits_146_1 = __as_u32(vals_a[23]);
                     unsigned int key_146_1 = ((bits_146_1 <= 2139095040) ? bits_146_1 : 0);
                     keys_21[3] = key_146_1;
@@ -60741,7 +60726,7 @@ kernel_cake_radix_topk_c4_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                     cands_45[3] = b_lo <= keys_21[3] >> 21 && idxs_21[3] < vocab;
                     unsigned int m_87 = __ballot_sync(0xFFFFFFFF, cands_45[3]);
                     before_45 = before_45 + (unsigned int)__popc(m_87 & lt_mask_3);
-                    total_45 = total_45 + (unsigned int)__popc(m_87);
+                    total_46 = total_46 + (unsigned int)__popc(m_87);
                     unsigned int own_45 = 0;
                     unsigned int pos_180 = n_3 + before_45 + own_45;
                     if (cands_45[0] && pos_180 < 1024) {
@@ -60779,12 +60764,12 @@ kernel_cake_radix_topk_c4_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                     if (cands_45[3]) {
                         own_45 = own_45 + 1;
                     }
-                    n_3 = n_3 + total_45;
+                    n_3 = n_3 + total_46;
                     unsigned int keys_22[4];
                     int idxs_22[4];
                     bool cands_46[4];
                     unsigned int before_46 = 0;
-                    unsigned int total_46 = 0;
+                    unsigned int total_47 = 0;
                     unsigned int bits_147_1 = __as_u32(vals_a[24]);
                     unsigned int key_147_1 = ((bits_147_1 <= 2139095040) ? bits_147_1 : 0);
                     keys_22[0] = key_147_1;
@@ -60792,7 +60777,7 @@ kernel_cake_radix_topk_c4_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                     cands_46[0] = b_lo <= keys_22[0] >> 21 && idxs_22[0] < vocab;
                     unsigned int m_88 = __ballot_sync(0xFFFFFFFF, cands_46[0]);
                     before_46 = before_46 + (unsigned int)__popc(m_88 & lt_mask_3);
-                    total_46 = total_46 + (unsigned int)__popc(m_88);
+                    total_47 = total_47 + (unsigned int)__popc(m_88);
                     unsigned int bits_148_1 = __as_u32(vals_a[25]);
                     unsigned int key_148_1 = ((bits_148_1 <= 2139095040) ? bits_148_1 : 0);
                     keys_22[1] = key_148_1;
@@ -60800,7 +60785,7 @@ kernel_cake_radix_topk_c4_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                     cands_46[1] = b_lo <= keys_22[1] >> 21 && idxs_22[1] < vocab;
                     unsigned int m_89 = __ballot_sync(0xFFFFFFFF, cands_46[1]);
                     before_46 = before_46 + (unsigned int)__popc(m_89 & lt_mask_3);
-                    total_46 = total_46 + (unsigned int)__popc(m_89);
+                    total_47 = total_47 + (unsigned int)__popc(m_89);
                     unsigned int bits_149_1 = __as_u32(vals_a[26]);
                     unsigned int key_149_1 = ((bits_149_1 <= 2139095040) ? bits_149_1 : 0);
                     keys_22[2] = key_149_1;
@@ -60808,7 +60793,7 @@ kernel_cake_radix_topk_c4_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                     cands_46[2] = b_lo <= keys_22[2] >> 21 && idxs_22[2] < vocab;
                     unsigned int m_90 = __ballot_sync(0xFFFFFFFF, cands_46[2]);
                     before_46 = before_46 + (unsigned int)__popc(m_90 & lt_mask_3);
-                    total_46 = total_46 + (unsigned int)__popc(m_90);
+                    total_47 = total_47 + (unsigned int)__popc(m_90);
                     unsigned int bits_150_1 = __as_u32(vals_a[27]);
                     unsigned int key_150_1 = ((bits_150_1 <= 2139095040) ? bits_150_1 : 0);
                     keys_22[3] = key_150_1;
@@ -60816,7 +60801,7 @@ kernel_cake_radix_topk_c4_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                     cands_46[3] = b_lo <= keys_22[3] >> 21 && idxs_22[3] < vocab;
                     unsigned int m_91 = __ballot_sync(0xFFFFFFFF, cands_46[3]);
                     before_46 = before_46 + (unsigned int)__popc(m_91 & lt_mask_3);
-                    total_46 = total_46 + (unsigned int)__popc(m_91);
+                    total_47 = total_47 + (unsigned int)__popc(m_91);
                     unsigned int own_46 = 0;
                     unsigned int pos_184 = n_3 + before_46 + own_46;
                     if (cands_46[0] && pos_184 < 1024) {
@@ -60854,12 +60839,12 @@ kernel_cake_radix_topk_c4_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                     if (cands_46[3]) {
                         own_46 = own_46 + 1;
                     }
-                    n_3 = n_3 + total_46;
+                    n_3 = n_3 + total_47;
                     unsigned int keys_23[4];
                     int idxs_23[4];
                     bool cands_47[4];
                     unsigned int before_47 = 0;
-                    unsigned int total_47 = 0;
+                    unsigned int total_48 = 0;
                     unsigned int bits_151_1 = __as_u32(vals_a[28]);
                     unsigned int key_151_1 = ((bits_151_1 <= 2139095040) ? bits_151_1 : 0);
                     keys_23[0] = key_151_1;
@@ -60867,7 +60852,7 @@ kernel_cake_radix_topk_c4_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                     cands_47[0] = b_lo <= keys_23[0] >> 21 && idxs_23[0] < vocab;
                     unsigned int m_92 = __ballot_sync(0xFFFFFFFF, cands_47[0]);
                     before_47 = before_47 + (unsigned int)__popc(m_92 & lt_mask_3);
-                    total_47 = total_47 + (unsigned int)__popc(m_92);
+                    total_48 = total_48 + (unsigned int)__popc(m_92);
                     unsigned int bits_152_1 = __as_u32(vals_a[29]);
                     unsigned int key_152_1 = ((bits_152_1 <= 2139095040) ? bits_152_1 : 0);
                     keys_23[1] = key_152_1;
@@ -60875,7 +60860,7 @@ kernel_cake_radix_topk_c4_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                     cands_47[1] = b_lo <= keys_23[1] >> 21 && idxs_23[1] < vocab;
                     unsigned int m_93 = __ballot_sync(0xFFFFFFFF, cands_47[1]);
                     before_47 = before_47 + (unsigned int)__popc(m_93 & lt_mask_3);
-                    total_47 = total_47 + (unsigned int)__popc(m_93);
+                    total_48 = total_48 + (unsigned int)__popc(m_93);
                     unsigned int bits_153_1 = __as_u32(vals_a[30]);
                     unsigned int key_153_1 = ((bits_153_1 <= 2139095040) ? bits_153_1 : 0);
                     keys_23[2] = key_153_1;
@@ -60883,7 +60868,7 @@ kernel_cake_radix_topk_c4_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                     cands_47[2] = b_lo <= keys_23[2] >> 21 && idxs_23[2] < vocab;
                     unsigned int m_94 = __ballot_sync(0xFFFFFFFF, cands_47[2]);
                     before_47 = before_47 + (unsigned int)__popc(m_94 & lt_mask_3);
-                    total_47 = total_47 + (unsigned int)__popc(m_94);
+                    total_48 = total_48 + (unsigned int)__popc(m_94);
                     unsigned int bits_154_1 = __as_u32(vals_a[31]);
                     unsigned int key_154_1 = ((bits_154_1 <= 2139095040) ? bits_154_1 : 0);
                     keys_23[3] = key_154_1;
@@ -60891,7 +60876,7 @@ kernel_cake_radix_topk_c4_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                     cands_47[3] = b_lo <= keys_23[3] >> 21 && idxs_23[3] < vocab;
                     unsigned int m_95 = __ballot_sync(0xFFFFFFFF, cands_47[3]);
                     before_47 = before_47 + (unsigned int)__popc(m_95 & lt_mask_3);
-                    total_47 = total_47 + (unsigned int)__popc(m_95);
+                    total_48 = total_48 + (unsigned int)__popc(m_95);
                     unsigned int own_47 = 0;
                     unsigned int pos_188 = n_3 + before_47 + own_47;
                     if (cands_47[0] && pos_188 < 1024) {
@@ -60929,7 +60914,7 @@ kernel_cake_radix_topk_c4_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                     if (cands_47[3]) {
                         own_47 = own_47 + 1;
                     }
-                    n_3 = n_3 + total_47;
+                    n_3 = n_3 + total_48;
                 } else {
                     unsigned int skeys_16[4];
                     int sidxs_16[4];
@@ -61483,85 +61468,85 @@ kernel_cake_radix_topk_c4_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
     __syncthreads();
     unsigned int before = 0;
     unsigned int total = 0;
-    unsigned int v_0 = scal[16];
-    total = total + v_0;
-    if (warp > 0) {
-        before = before + v_0;
-    }
-    unsigned int v_1 = scal[17];
+    unsigned int v_1 = scal[16];
     total = total + v_1;
-    if (warp > 1) {
+    if (warp > 0) {
         before = before + v_1;
     }
-    unsigned int v_2 = scal[18];
+    unsigned int v_2 = scal[17];
     total = total + v_2;
-    if (warp > 2) {
+    if (warp > 1) {
         before = before + v_2;
     }
-    unsigned int v_3 = scal[19];
+    unsigned int v_3 = scal[18];
     total = total + v_3;
-    if (warp > 3) {
+    if (warp > 2) {
         before = before + v_3;
     }
-    unsigned int v_4 = scal[20];
+    unsigned int v_4 = scal[19];
     total = total + v_4;
-    if (warp > 4) {
+    if (warp > 3) {
         before = before + v_4;
     }
-    unsigned int v_5 = scal[21];
+    unsigned int v_5 = scal[20];
     total = total + v_5;
-    if (warp > 5) {
+    if (warp > 4) {
         before = before + v_5;
     }
-    unsigned int v_6 = scal[22];
+    unsigned int v_6 = scal[21];
     total = total + v_6;
-    if (warp > 6) {
+    if (warp > 5) {
         before = before + v_6;
     }
-    unsigned int v_7 = scal[23];
+    unsigned int v_7 = scal[22];
     total = total + v_7;
-    if (warp > 7) {
+    if (warp > 6) {
         before = before + v_7;
     }
-    unsigned int v_8 = scal[24];
+    unsigned int v_8 = scal[23];
     total = total + v_8;
-    if (warp > 8) {
+    if (warp > 7) {
         before = before + v_8;
     }
-    unsigned int v_9 = scal[25];
+    unsigned int v_9 = scal[24];
     total = total + v_9;
-    if (warp > 9) {
+    if (warp > 8) {
         before = before + v_9;
     }
-    unsigned int v_10 = scal[26];
+    unsigned int v_10 = scal[25];
     total = total + v_10;
-    if (warp > 10) {
+    if (warp > 9) {
         before = before + v_10;
     }
-    unsigned int v_11 = scal[27];
+    unsigned int v_11 = scal[26];
     total = total + v_11;
-    if (warp > 11) {
+    if (warp > 10) {
         before = before + v_11;
     }
-    unsigned int v_12 = scal[28];
+    unsigned int v_12 = scal[27];
     total = total + v_12;
-    if (warp > 12) {
+    if (warp > 11) {
         before = before + v_12;
     }
-    unsigned int v_13 = scal[29];
+    unsigned int v_13 = scal[28];
     total = total + v_13;
-    if (warp > 13) {
+    if (warp > 12) {
         before = before + v_13;
     }
-    unsigned int v_14 = scal[30];
+    unsigned int v_14 = scal[29];
     total = total + v_14;
-    if (warp > 14) {
+    if (warp > 13) {
         before = before + v_14;
     }
-    unsigned int v_15 = scal[31];
+    unsigned int v_15 = scal[30];
     total = total + v_15;
-    if (warp > 15) {
+    if (warp > 14) {
         before = before + v_15;
+    }
+    unsigned int v_16 = scal[31];
+    total = total + v_16;
+    if (warp > 15) {
+        before = before + v_16;
     }
     unsigned int ovf_w = __ballot_sync(0xFFFFFFFF, n_wu > 1024);
     if (tid == 0) {
@@ -61777,24 +61762,24 @@ kernel_cake_radix_topk_c4_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 }
                 acc_1_3 = acc_1_3 + lens[3];
             }
-            unsigned long long c_0 = comps_l[0];
-            if (c_0 < 9214364837600034816) {
-                unsigned int bucket_64 = (unsigned int)(c_0 >> 53);
+            unsigned long long c_1_1 = comps_l[0];
+            if (c_1_1 < 9214364837600034816) {
+                unsigned int bucket_64 = (unsigned int)(c_1_1 >> 53);
                 atomicAdd(&hist1[bucket_64], 1);
             }
-            unsigned long long c_1_1 = comps_l[1];
-            if (c_1_1 < 9214364837600034816) {
-                unsigned int bucket_65 = (unsigned int)(c_1_1 >> 53);
+            unsigned long long c_2 = comps_l[1];
+            if (c_2 < 9214364837600034816) {
+                unsigned int bucket_65 = (unsigned int)(c_2 >> 53);
                 atomicAdd(&hist1[bucket_65], 1);
             }
-            unsigned long long c_2 = comps_l[2];
-            if (c_2 < 9214364837600034816) {
-                unsigned int bucket_66 = (unsigned int)(c_2 >> 53);
+            unsigned long long c_3 = comps_l[2];
+            if (c_3 < 9214364837600034816) {
+                unsigned int bucket_66 = (unsigned int)(c_3 >> 53);
                 atomicAdd(&hist1[bucket_66], 1);
             }
-            unsigned long long c_3 = comps_l[3];
-            if (c_3 < 9214364837600034816) {
-                unsigned int bucket_67 = (unsigned int)(c_3 >> 53);
+            unsigned long long c_4 = comps_l[3];
+            if (c_4 < 9214364837600034816) {
+                unsigned int bucket_67 = (unsigned int)(c_4 >> 53);
                 atomicAdd(&hist1[bucket_67], 1);
             }
             for (int i_48 = tid; i_48 < 2048; i_48 += 512) {
@@ -61873,24 +61858,24 @@ kernel_cake_radix_topk_c4_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 done = 1;
             }
             if (done == 0) {
-                unsigned long long c_4 = comps_l[0];
-                unsigned int bucket_69 = (unsigned int)(c_4 >> 42 & 2047);
-                if (c_4 >> 53 == (unsigned long long)bucket_68) {
+                unsigned long long c_5 = comps_l[0];
+                unsigned int bucket_69 = (unsigned int)(c_5 >> 42 & 2047);
+                if (c_5 >> 53 == (unsigned long long)bucket_68) {
                     atomicAdd(&hist0[bucket_69], 1);
                 }
-                unsigned long long c_5 = comps_l[1];
-                unsigned int bucket_70 = (unsigned int)(c_5 >> 42 & 2047);
-                if (c_5 >> 53 == (unsigned long long)bucket_68) {
+                unsigned long long c_6 = comps_l[1];
+                unsigned int bucket_70 = (unsigned int)(c_6 >> 42 & 2047);
+                if (c_6 >> 53 == (unsigned long long)bucket_68) {
                     atomicAdd(&hist0[bucket_70], 1);
                 }
-                unsigned long long c_6 = comps_l[2];
-                unsigned int bucket_71 = (unsigned int)(c_6 >> 42 & 2047);
-                if (c_6 >> 53 == (unsigned long long)bucket_68) {
+                unsigned long long c_7 = comps_l[2];
+                unsigned int bucket_71 = (unsigned int)(c_7 >> 42 & 2047);
+                if (c_7 >> 53 == (unsigned long long)bucket_68) {
                     atomicAdd(&hist0[bucket_71], 1);
                 }
-                unsigned long long c_7 = comps_l[3];
-                unsigned int bucket_72 = (unsigned int)(c_7 >> 42 & 2047);
-                if (c_7 >> 53 == (unsigned long long)bucket_68) {
+                unsigned long long c_8 = comps_l[3];
+                unsigned int bucket_72 = (unsigned int)(c_8 >> 42 & 2047);
+                if (c_8 >> 53 == (unsigned long long)bucket_68) {
                     atomicAdd(&hist0[bucket_72], 1);
                 }
                 for (int i_49 = tid; i_49 < 2048; i_49 += 512) {
@@ -61968,24 +61953,24 @@ kernel_cake_radix_topk_c4_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                     done = 1;
                 }
                 if (done == 0) {
-                    unsigned long long c_8 = comps_l[0];
-                    unsigned int bucket_75 = (unsigned int)(c_8 >> 32 & 1023);
-                    if (c_8 >> 42 == prefix1) {
+                    unsigned long long c_9 = comps_l[0];
+                    unsigned int bucket_75 = (unsigned int)(c_9 >> 32 & 1023);
+                    if (c_9 >> 42 == prefix1) {
                         atomicAdd(&hist1[bucket_75], 1);
                     }
-                    unsigned long long c_9 = comps_l[1];
-                    unsigned int bucket_76 = (unsigned int)(c_9 >> 32 & 1023);
-                    if (c_9 >> 42 == prefix1) {
+                    unsigned long long c_10 = comps_l[1];
+                    unsigned int bucket_76 = (unsigned int)(c_10 >> 32 & 1023);
+                    if (c_10 >> 42 == prefix1) {
                         atomicAdd(&hist1[bucket_76], 1);
                     }
-                    unsigned long long c_10 = comps_l[2];
-                    unsigned int bucket_77 = (unsigned int)(c_10 >> 32 & 1023);
-                    if (c_10 >> 42 == prefix1) {
+                    unsigned long long c_11 = comps_l[2];
+                    unsigned int bucket_77 = (unsigned int)(c_11 >> 32 & 1023);
+                    if (c_11 >> 42 == prefix1) {
                         atomicAdd(&hist1[bucket_77], 1);
                     }
-                    unsigned long long c_11 = comps_l[3];
-                    unsigned int bucket_78 = (unsigned int)(c_11 >> 32 & 1023);
-                    if (c_11 >> 42 == prefix1) {
+                    unsigned long long c_12 = comps_l[3];
+                    unsigned int bucket_78 = (unsigned int)(c_12 >> 32 & 1023);
+                    if (c_12 >> 42 == prefix1) {
                         atomicAdd(&hist1[bucket_78], 1);
                     }
                     for (int i_50 = tid; i_50 < 2048; i_50 += 512) {
@@ -62071,24 +62056,24 @@ kernel_cake_radix_topk_c4_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                             unsigned long long mask_1 = (1 << (unsigned long long)nbits) - 1;
                             unsigned long long sh = (unsigned long long)shift;
                             unsigned long long hi = (unsigned long long)(shift + nbits);
-                            unsigned long long c_12 = comps_l[0];
-                            unsigned int bucket_81 = (unsigned int)(c_12 >> sh & mask_1);
-                            if (c_12 >> hi == tpre) {
+                            unsigned long long c_13 = comps_l[0];
+                            unsigned int bucket_81 = (unsigned int)(c_13 >> sh & mask_1);
+                            if (c_13 >> hi == tpre) {
                                 atomicAdd(&hist0[bucket_81], 1);
                             }
-                            unsigned long long c_13 = comps_l[1];
-                            unsigned int bucket_82 = (unsigned int)(c_13 >> sh & mask_1);
-                            if (c_13 >> hi == tpre) {
+                            unsigned long long c_14 = comps_l[1];
+                            unsigned int bucket_82 = (unsigned int)(c_14 >> sh & mask_1);
+                            if (c_14 >> hi == tpre) {
                                 atomicAdd(&hist0[bucket_82], 1);
                             }
-                            unsigned long long c_14 = comps_l[2];
-                            unsigned int bucket_83 = (unsigned int)(c_14 >> sh & mask_1);
-                            if (c_14 >> hi == tpre) {
+                            unsigned long long c_15 = comps_l[2];
+                            unsigned int bucket_83 = (unsigned int)(c_15 >> sh & mask_1);
+                            if (c_15 >> hi == tpre) {
                                 atomicAdd(&hist0[bucket_83], 1);
                             }
-                            unsigned long long c_15 = comps_l[3];
-                            unsigned int bucket_84 = (unsigned int)(c_15 >> sh & mask_1);
-                            if (c_15 >> hi == tpre) {
+                            unsigned long long c_16 = comps_l[3];
+                            unsigned int bucket_84 = (unsigned int)(c_16 >> sh & mask_1);
+                            if (c_16 >> hi == tpre) {
                                 atomicAdd(&hist0[bucket_84], 1);
                             }
                             __syncthreads();
@@ -62789,86 +62774,86 @@ kernel_cake_radix_topk_c4_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 }
                 __syncthreads();
                 unsigned int before_49 = 0;
-                unsigned int total_48 = 0;
-                unsigned int v_16 = scal[16];
-                total_48 = total_48 + v_16;
+                unsigned int total_49 = 0;
+                unsigned int v_17 = scal[16];
+                total_49 = total_49 + v_17;
                 if (warp > 0) {
-                    before_49 = before_49 + v_16;
-                }
-                unsigned int v_17 = scal[17];
-                total_48 = total_48 + v_17;
-                if (warp > 1) {
                     before_49 = before_49 + v_17;
                 }
-                unsigned int v_18 = scal[18];
-                total_48 = total_48 + v_18;
-                if (warp > 2) {
+                unsigned int v_18 = scal[17];
+                total_49 = total_49 + v_18;
+                if (warp > 1) {
                     before_49 = before_49 + v_18;
                 }
-                unsigned int v_19 = scal[19];
-                total_48 = total_48 + v_19;
-                if (warp > 3) {
+                unsigned int v_19 = scal[18];
+                total_49 = total_49 + v_19;
+                if (warp > 2) {
                     before_49 = before_49 + v_19;
                 }
-                unsigned int v_20 = scal[20];
-                total_48 = total_48 + v_20;
-                if (warp > 4) {
+                unsigned int v_20 = scal[19];
+                total_49 = total_49 + v_20;
+                if (warp > 3) {
                     before_49 = before_49 + v_20;
                 }
-                unsigned int v_21 = scal[21];
-                total_48 = total_48 + v_21;
-                if (warp > 5) {
+                unsigned int v_21 = scal[20];
+                total_49 = total_49 + v_21;
+                if (warp > 4) {
                     before_49 = before_49 + v_21;
                 }
-                unsigned int v_22 = scal[22];
-                total_48 = total_48 + v_22;
-                if (warp > 6) {
+                unsigned int v_22 = scal[21];
+                total_49 = total_49 + v_22;
+                if (warp > 5) {
                     before_49 = before_49 + v_22;
                 }
-                unsigned int v_23 = scal[23];
-                total_48 = total_48 + v_23;
-                if (warp > 7) {
+                unsigned int v_23 = scal[22];
+                total_49 = total_49 + v_23;
+                if (warp > 6) {
                     before_49 = before_49 + v_23;
                 }
-                unsigned int v_24 = scal[24];
-                total_48 = total_48 + v_24;
-                if (warp > 8) {
+                unsigned int v_24 = scal[23];
+                total_49 = total_49 + v_24;
+                if (warp > 7) {
                     before_49 = before_49 + v_24;
                 }
-                unsigned int v_25 = scal[25];
-                total_48 = total_48 + v_25;
-                if (warp > 9) {
+                unsigned int v_25 = scal[24];
+                total_49 = total_49 + v_25;
+                if (warp > 8) {
                     before_49 = before_49 + v_25;
                 }
-                unsigned int v_26 = scal[26];
-                total_48 = total_48 + v_26;
-                if (warp > 10) {
+                unsigned int v_26 = scal[25];
+                total_49 = total_49 + v_26;
+                if (warp > 9) {
                     before_49 = before_49 + v_26;
                 }
-                unsigned int v_27 = scal[27];
-                total_48 = total_48 + v_27;
-                if (warp > 11) {
+                unsigned int v_27 = scal[26];
+                total_49 = total_49 + v_27;
+                if (warp > 10) {
                     before_49 = before_49 + v_27;
                 }
-                unsigned int v_28 = scal[28];
-                total_48 = total_48 + v_28;
-                if (warp > 12) {
+                unsigned int v_28 = scal[27];
+                total_49 = total_49 + v_28;
+                if (warp > 11) {
                     before_49 = before_49 + v_28;
                 }
-                unsigned int v_29 = scal[29];
-                total_48 = total_48 + v_29;
-                if (warp > 13) {
+                unsigned int v_29 = scal[28];
+                total_49 = total_49 + v_29;
+                if (warp > 12) {
                     before_49 = before_49 + v_29;
                 }
-                unsigned int v_30 = scal[30];
-                total_48 = total_48 + v_30;
-                if (warp > 14) {
+                unsigned int v_30 = scal[29];
+                total_49 = total_49 + v_30;
+                if (warp > 13) {
                     before_49 = before_49 + v_30;
                 }
-                unsigned int v_31 = scal[31];
-                total_48 = total_48 + v_31;
-                if (warp > 15) {
+                unsigned int v_31 = scal[30];
+                total_49 = total_49 + v_31;
+                if (warp > 14) {
                     before_49 = before_49 + v_31;
+                }
+                unsigned int v_32 = scal[31];
+                total_49 = total_49 + v_32;
+                if (warp > 15) {
+                    before_49 = before_49 + v_32;
                 }
                 unsigned int lt_mask_5 = (1 << (unsigned int)lane) - 1;
                 unsigned int pos = before_49;
@@ -62888,7 +62873,7 @@ kernel_cake_radix_topk_c4_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                     pos = pos + (unsigned int)__popc(m_100);
                 }
                 if (tid == 0) {
-                    scal[3] = total_48;
+                    scal[3] = total_49;
                 }
                 asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");
                 asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
@@ -63165,24 +63150,24 @@ kernel_cake_radix_topk_c4_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                     done_1 = 1;
                 }
                 if (done_1 == 0) {
-                    unsigned long long c_16 = comps2[0];
-                    unsigned int bucket_86_1 = (unsigned int)(c_16 >> 42 & 2047);
-                    if (c_16 >> 53 == (unsigned long long)bucket_sel_1) {
+                    unsigned long long c_17 = comps2[0];
+                    unsigned int bucket_86_1 = (unsigned int)(c_17 >> 42 & 2047);
+                    if (c_17 >> 53 == (unsigned long long)bucket_sel_1) {
                         atomicAdd(&hist0[bucket_86_1], 1);
                     }
-                    unsigned long long c_17 = comps2[1];
-                    unsigned int bucket_87_1 = (unsigned int)(c_17 >> 42 & 2047);
-                    if (c_17 >> 53 == (unsigned long long)bucket_sel_1) {
+                    unsigned long long c_18 = comps2[1];
+                    unsigned int bucket_87_1 = (unsigned int)(c_18 >> 42 & 2047);
+                    if (c_18 >> 53 == (unsigned long long)bucket_sel_1) {
                         atomicAdd(&hist0[bucket_87_1], 1);
                     }
-                    unsigned long long c_18 = comps2[2];
-                    unsigned int bucket_88 = (unsigned int)(c_18 >> 42 & 2047);
-                    if (c_18 >> 53 == (unsigned long long)bucket_sel_1) {
+                    unsigned long long c_19 = comps2[2];
+                    unsigned int bucket_88 = (unsigned int)(c_19 >> 42 & 2047);
+                    if (c_19 >> 53 == (unsigned long long)bucket_sel_1) {
                         atomicAdd(&hist0[bucket_88], 1);
                     }
-                    unsigned long long c_19 = comps2[3];
-                    unsigned int bucket_89 = (unsigned int)(c_19 >> 42 & 2047);
-                    if (c_19 >> 53 == (unsigned long long)bucket_sel_1) {
+                    unsigned long long c_20 = comps2[3];
+                    unsigned int bucket_89 = (unsigned int)(c_20 >> 42 & 2047);
+                    if (c_20 >> 53 == (unsigned long long)bucket_sel_1) {
                         atomicAdd(&hist0[bucket_89], 1);
                     }
                     for (int i_53 = tid; i_53 < 2048; i_53 += 512) {
@@ -63260,24 +63245,24 @@ kernel_cake_radix_topk_c4_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                         done_1 = 1;
                     }
                     if (done_1 == 0) {
-                        unsigned long long c_20 = comps2[0];
-                        unsigned int bucket_92 = (unsigned int)(c_20 >> 32 & 1023);
-                        if (c_20 >> 42 == prefix1_1) {
+                        unsigned long long c_21 = comps2[0];
+                        unsigned int bucket_92 = (unsigned int)(c_21 >> 32 & 1023);
+                        if (c_21 >> 42 == prefix1_1) {
                             atomicAdd(&hist1[bucket_92], 1);
                         }
-                        unsigned long long c_21 = comps2[1];
-                        unsigned int bucket_93 = (unsigned int)(c_21 >> 32 & 1023);
-                        if (c_21 >> 42 == prefix1_1) {
+                        unsigned long long c_22 = comps2[1];
+                        unsigned int bucket_93 = (unsigned int)(c_22 >> 32 & 1023);
+                        if (c_22 >> 42 == prefix1_1) {
                             atomicAdd(&hist1[bucket_93], 1);
                         }
-                        unsigned long long c_22 = comps2[2];
-                        unsigned int bucket_94 = (unsigned int)(c_22 >> 32 & 1023);
-                        if (c_22 >> 42 == prefix1_1) {
+                        unsigned long long c_23 = comps2[2];
+                        unsigned int bucket_94 = (unsigned int)(c_23 >> 32 & 1023);
+                        if (c_23 >> 42 == prefix1_1) {
                             atomicAdd(&hist1[bucket_94], 1);
                         }
-                        unsigned long long c_23 = comps2[3];
-                        unsigned int bucket_95 = (unsigned int)(c_23 >> 32 & 1023);
-                        if (c_23 >> 42 == prefix1_1) {
+                        unsigned long long c_24 = comps2[3];
+                        unsigned int bucket_95 = (unsigned int)(c_24 >> 32 & 1023);
+                        if (c_24 >> 42 == prefix1_1) {
                             atomicAdd(&hist1[bucket_95], 1);
                         }
                         for (int i_54 = tid; i_54 < 2048; i_54 += 512) {
@@ -63363,24 +63348,24 @@ kernel_cake_radix_topk_c4_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                                 unsigned long long mask_2 = (1 << (unsigned long long)nbits_1) - 1;
                                 unsigned long long sh_1 = (unsigned long long)shift_1;
                                 unsigned long long hi_1 = (unsigned long long)(shift_1 + nbits_1);
-                                unsigned long long c_24 = comps2[0];
-                                unsigned int bucket_98 = (unsigned int)(c_24 >> sh_1 & mask_2);
-                                if (c_24 >> hi_1 == tpre_1) {
+                                unsigned long long c_25 = comps2[0];
+                                unsigned int bucket_98 = (unsigned int)(c_25 >> sh_1 & mask_2);
+                                if (c_25 >> hi_1 == tpre_1) {
                                     atomicAdd(&hist0[bucket_98], 1);
                                 }
-                                unsigned long long c_25 = comps2[1];
-                                unsigned int bucket_99 = (unsigned int)(c_25 >> sh_1 & mask_2);
-                                if (c_25 >> hi_1 == tpre_1) {
+                                unsigned long long c_26 = comps2[1];
+                                unsigned int bucket_99 = (unsigned int)(c_26 >> sh_1 & mask_2);
+                                if (c_26 >> hi_1 == tpre_1) {
                                     atomicAdd(&hist0[bucket_99], 1);
                                 }
-                                unsigned long long c_26 = comps2[2];
-                                unsigned int bucket_100 = (unsigned int)(c_26 >> sh_1 & mask_2);
-                                if (c_26 >> hi_1 == tpre_1) {
+                                unsigned long long c_27 = comps2[2];
+                                unsigned int bucket_100 = (unsigned int)(c_27 >> sh_1 & mask_2);
+                                if (c_27 >> hi_1 == tpre_1) {
                                     atomicAdd(&hist0[bucket_100], 1);
                                 }
-                                unsigned long long c_27 = comps2[3];
-                                unsigned int bucket_101 = (unsigned int)(c_27 >> sh_1 & mask_2);
-                                if (c_27 >> hi_1 == tpre_1) {
+                                unsigned long long c_28 = comps2[3];
+                                unsigned int bucket_101 = (unsigned int)(c_28 >> sh_1 & mask_2);
+                                if (c_28 >> hi_1 == tpre_1) {
                                     atomicAdd(&hist0[bucket_101], 1);
                                 }
                                 __syncthreads();
@@ -63501,170 +63486,170 @@ kernel_cake_radix_topk_c4_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 }
                 __syncthreads();
                 unsigned int before_50 = 0;
-                unsigned int total_49 = 0;
-                unsigned int v_32 = scal[32];
-                total_49 = total_49 + v_32;
+                unsigned int total_50 = 0;
+                unsigned int v_33 = scal[32];
+                total_50 = total_50 + v_33;
                 if (warp > 0) {
-                    before_50 = before_50 + v_32;
-                }
-                unsigned int v_33 = scal[33];
-                total_49 = total_49 + v_33;
-                if (warp > 1) {
                     before_50 = before_50 + v_33;
                 }
-                unsigned int v_34 = scal[34];
-                total_49 = total_49 + v_34;
-                if (warp > 2) {
+                unsigned int v_34 = scal[33];
+                total_50 = total_50 + v_34;
+                if (warp > 1) {
                     before_50 = before_50 + v_34;
                 }
-                unsigned int v_35 = scal[35];
-                total_49 = total_49 + v_35;
-                if (warp > 3) {
+                unsigned int v_35 = scal[34];
+                total_50 = total_50 + v_35;
+                if (warp > 2) {
                     before_50 = before_50 + v_35;
                 }
-                unsigned int v_36 = scal[36];
-                total_49 = total_49 + v_36;
-                if (warp > 4) {
+                unsigned int v_36 = scal[35];
+                total_50 = total_50 + v_36;
+                if (warp > 3) {
                     before_50 = before_50 + v_36;
                 }
-                unsigned int v_37 = scal[37];
-                total_49 = total_49 + v_37;
-                if (warp > 5) {
+                unsigned int v_37 = scal[36];
+                total_50 = total_50 + v_37;
+                if (warp > 4) {
                     before_50 = before_50 + v_37;
                 }
-                unsigned int v_38 = scal[38];
-                total_49 = total_49 + v_38;
-                if (warp > 6) {
+                unsigned int v_38 = scal[37];
+                total_50 = total_50 + v_38;
+                if (warp > 5) {
                     before_50 = before_50 + v_38;
                 }
-                unsigned int v_39 = scal[39];
-                total_49 = total_49 + v_39;
-                if (warp > 7) {
+                unsigned int v_39 = scal[38];
+                total_50 = total_50 + v_39;
+                if (warp > 6) {
                     before_50 = before_50 + v_39;
                 }
-                unsigned int v_40 = scal[40];
-                total_49 = total_49 + v_40;
-                if (warp > 8) {
+                unsigned int v_40 = scal[39];
+                total_50 = total_50 + v_40;
+                if (warp > 7) {
                     before_50 = before_50 + v_40;
                 }
-                unsigned int v_41 = scal[41];
-                total_49 = total_49 + v_41;
-                if (warp > 9) {
+                unsigned int v_41 = scal[40];
+                total_50 = total_50 + v_41;
+                if (warp > 8) {
                     before_50 = before_50 + v_41;
                 }
-                unsigned int v_42 = scal[42];
-                total_49 = total_49 + v_42;
-                if (warp > 10) {
+                unsigned int v_42 = scal[41];
+                total_50 = total_50 + v_42;
+                if (warp > 9) {
                     before_50 = before_50 + v_42;
                 }
-                unsigned int v_43 = scal[43];
-                total_49 = total_49 + v_43;
-                if (warp > 11) {
+                unsigned int v_43 = scal[42];
+                total_50 = total_50 + v_43;
+                if (warp > 10) {
                     before_50 = before_50 + v_43;
                 }
-                unsigned int v_44 = scal[44];
-                total_49 = total_49 + v_44;
-                if (warp > 12) {
+                unsigned int v_44 = scal[43];
+                total_50 = total_50 + v_44;
+                if (warp > 11) {
                     before_50 = before_50 + v_44;
                 }
-                unsigned int v_45 = scal[45];
-                total_49 = total_49 + v_45;
-                if (warp > 13) {
+                unsigned int v_45 = scal[44];
+                total_50 = total_50 + v_45;
+                if (warp > 12) {
                     before_50 = before_50 + v_45;
                 }
-                unsigned int v_46 = scal[46];
-                total_49 = total_49 + v_46;
-                if (warp > 14) {
+                unsigned int v_46 = scal[45];
+                total_50 = total_50 + v_46;
+                if (warp > 13) {
                     before_50 = before_50 + v_46;
                 }
-                unsigned int v_47 = scal[47];
-                total_49 = total_49 + v_47;
-                if (warp > 15) {
+                unsigned int v_47 = scal[46];
+                total_50 = total_50 + v_47;
+                if (warp > 14) {
                     before_50 = before_50 + v_47;
                 }
-                unsigned int before_51 = 0;
-                unsigned int total_50 = 0;
-                unsigned int v_48 = scal[48];
+                unsigned int v_48 = scal[47];
                 total_50 = total_50 + v_48;
-                if (warp > 0) {
-                    before_51 = before_51 + v_48;
+                if (warp > 15) {
+                    before_50 = before_50 + v_48;
                 }
-                unsigned int v_49 = scal[49];
-                total_50 = total_50 + v_49;
-                if (warp > 1) {
+                unsigned int before_51 = 0;
+                unsigned int total_51 = 0;
+                unsigned int v_49 = scal[48];
+                total_51 = total_51 + v_49;
+                if (warp > 0) {
                     before_51 = before_51 + v_49;
                 }
-                unsigned int v_50 = scal[50];
-                total_50 = total_50 + v_50;
-                if (warp > 2) {
+                unsigned int v_50 = scal[49];
+                total_51 = total_51 + v_50;
+                if (warp > 1) {
                     before_51 = before_51 + v_50;
                 }
-                unsigned int v_51 = scal[51];
-                total_50 = total_50 + v_51;
-                if (warp > 3) {
+                unsigned int v_51 = scal[50];
+                total_51 = total_51 + v_51;
+                if (warp > 2) {
                     before_51 = before_51 + v_51;
                 }
-                unsigned int v_52 = scal[52];
-                total_50 = total_50 + v_52;
-                if (warp > 4) {
+                unsigned int v_52 = scal[51];
+                total_51 = total_51 + v_52;
+                if (warp > 3) {
                     before_51 = before_51 + v_52;
                 }
-                unsigned int v_53 = scal[53];
-                total_50 = total_50 + v_53;
-                if (warp > 5) {
+                unsigned int v_53 = scal[52];
+                total_51 = total_51 + v_53;
+                if (warp > 4) {
                     before_51 = before_51 + v_53;
                 }
-                unsigned int v_54 = scal[54];
-                total_50 = total_50 + v_54;
-                if (warp > 6) {
+                unsigned int v_54 = scal[53];
+                total_51 = total_51 + v_54;
+                if (warp > 5) {
                     before_51 = before_51 + v_54;
                 }
-                unsigned int v_55 = scal[55];
-                total_50 = total_50 + v_55;
-                if (warp > 7) {
+                unsigned int v_55 = scal[54];
+                total_51 = total_51 + v_55;
+                if (warp > 6) {
                     before_51 = before_51 + v_55;
                 }
-                unsigned int v_56 = scal[56];
-                total_50 = total_50 + v_56;
-                if (warp > 8) {
+                unsigned int v_56 = scal[55];
+                total_51 = total_51 + v_56;
+                if (warp > 7) {
                     before_51 = before_51 + v_56;
                 }
-                unsigned int v_57 = scal[57];
-                total_50 = total_50 + v_57;
-                if (warp > 9) {
+                unsigned int v_57 = scal[56];
+                total_51 = total_51 + v_57;
+                if (warp > 8) {
                     before_51 = before_51 + v_57;
                 }
-                unsigned int v_58 = scal[58];
-                total_50 = total_50 + v_58;
-                if (warp > 10) {
+                unsigned int v_58 = scal[57];
+                total_51 = total_51 + v_58;
+                if (warp > 9) {
                     before_51 = before_51 + v_58;
                 }
-                unsigned int v_59 = scal[59];
-                total_50 = total_50 + v_59;
-                if (warp > 11) {
+                unsigned int v_59 = scal[58];
+                total_51 = total_51 + v_59;
+                if (warp > 10) {
                     before_51 = before_51 + v_59;
                 }
-                unsigned int v_60 = scal[60];
-                total_50 = total_50 + v_60;
-                if (warp > 12) {
+                unsigned int v_60 = scal[59];
+                total_51 = total_51 + v_60;
+                if (warp > 11) {
                     before_51 = before_51 + v_60;
                 }
-                unsigned int v_61 = scal[61];
-                total_50 = total_50 + v_61;
-                if (warp > 13) {
+                unsigned int v_61 = scal[60];
+                total_51 = total_51 + v_61;
+                if (warp > 12) {
                     before_51 = before_51 + v_61;
                 }
-                unsigned int v_62 = scal[62];
-                total_50 = total_50 + v_62;
-                if (warp > 14) {
+                unsigned int v_62 = scal[61];
+                total_51 = total_51 + v_62;
+                if (warp > 13) {
                     before_51 = before_51 + v_62;
                 }
-                unsigned int v_63 = scal[63];
-                total_50 = total_50 + v_63;
-                if (warp > 15) {
+                unsigned int v_63 = scal[62];
+                total_51 = total_51 + v_63;
+                if (warp > 14) {
                     before_51 = before_51 + v_63;
                 }
-                unsigned long long ebase = out_base + (unsigned long long)(total_50 + before_50);
+                unsigned int v_64 = scal[63];
+                total_51 = total_51 + v_64;
+                if (warp > 15) {
+                    before_51 = before_51 + v_64;
+                }
+                unsigned long long ebase = out_base + (unsigned long long)(total_51 + before_50);
                 unsigned int lt_mask_4_1 = (1 << (unsigned int)lane) - 1;
                 unsigned int pos_192 = 0;
                 int niter_2_1 = (int)(n_wu + 31 >> 5);
@@ -63701,26 +63686,26 @@ kernel_cake_radix_topk_c4_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
             for (int p = 0; p < 3; p++) {
                 unsigned int shift_2 = ((p == 0) ? 21 : ((p == 1) ? 10 : 0));
                 unsigned int nbits_2 = ((p == 2) ? 10 : 11);
-                for (int c_28 = 0; c_28 < nsub; c_28++) {
-                    int i2_192 = start + c_28 * 2048 + tid;
+                for (int c_29 = 0; c_29 < nsub; c_29++) {
+                    int i2_192 = start + c_29 * 2048 + tid;
                     if (i2_192 < vocab) {
                         vals_t[0] = probs[row_base + (unsigned long long)i2_192];
                     } else {
                         vals_t[0] = 0.0f;
                     }
-                    int i2_193 = start + c_28 * 2048 + 512 + tid;
+                    int i2_193 = start + c_29 * 2048 + 512 + tid;
                     if (i2_193 < vocab) {
                         vals_t[1] = probs[row_base + (unsigned long long)i2_193];
                     } else {
                         vals_t[1] = 0.0f;
                     }
-                    int i2_194 = start + c_28 * 2048 + 1024 + tid;
+                    int i2_194 = start + c_29 * 2048 + 1024 + tid;
                     if (i2_194 < vocab) {
                         vals_t[2] = probs[row_base + (unsigned long long)i2_194];
                     } else {
                         vals_t[2] = 0.0f;
                     }
-                    int i2_195 = start + c_28 * 2048 + 1536 + tid;
+                    int i2_195 = start + c_29 * 2048 + 1536 + tid;
                     if (i2_195 < vocab) {
                         vals_t[3] = probs[row_base + (unsigned long long)i2_195];
                     } else {
@@ -63900,90 +63885,90 @@ kernel_cake_radix_topk_c4_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 }
                 __syncthreads();
                 unsigned int before_52 = 0;
-                unsigned int total_51 = 0;
+                unsigned int total_52 = 0;
                 unsigned int ws_1_0 = warp_sums[0];
-                total_51 = total_51 + ws_1_0;
+                total_52 = total_52 + ws_1_0;
                 if (warp > 0) {
                     before_52 = before_52 + ws_1_0;
                 }
                 unsigned int ws_1_1 = warp_sums[1];
-                total_51 = total_51 + ws_1_1;
+                total_52 = total_52 + ws_1_1;
                 if (warp > 1) {
                     before_52 = before_52 + ws_1_1;
                 }
                 unsigned int ws_1_2 = warp_sums[2];
-                total_51 = total_51 + ws_1_2;
+                total_52 = total_52 + ws_1_2;
                 if (warp > 2) {
                     before_52 = before_52 + ws_1_2;
                 }
                 unsigned int ws_1_3 = warp_sums[3];
-                total_51 = total_51 + ws_1_3;
+                total_52 = total_52 + ws_1_3;
                 if (warp > 3) {
                     before_52 = before_52 + ws_1_3;
                 }
                 unsigned int ws_1_4 = warp_sums[4];
-                total_51 = total_51 + ws_1_4;
+                total_52 = total_52 + ws_1_4;
                 if (warp > 4) {
                     before_52 = before_52 + ws_1_4;
                 }
                 unsigned int ws_1_5 = warp_sums[5];
-                total_51 = total_51 + ws_1_5;
+                total_52 = total_52 + ws_1_5;
                 if (warp > 5) {
                     before_52 = before_52 + ws_1_5;
                 }
                 unsigned int ws_1_6 = warp_sums[6];
-                total_51 = total_51 + ws_1_6;
+                total_52 = total_52 + ws_1_6;
                 if (warp > 6) {
                     before_52 = before_52 + ws_1_6;
                 }
                 unsigned int ws_1_7 = warp_sums[7];
-                total_51 = total_51 + ws_1_7;
+                total_52 = total_52 + ws_1_7;
                 if (warp > 7) {
                     before_52 = before_52 + ws_1_7;
                 }
                 unsigned int ws_1_8 = warp_sums[8];
-                total_51 = total_51 + ws_1_8;
+                total_52 = total_52 + ws_1_8;
                 if (warp > 8) {
                     before_52 = before_52 + ws_1_8;
                 }
                 unsigned int ws_1_9 = warp_sums[9];
-                total_51 = total_51 + ws_1_9;
+                total_52 = total_52 + ws_1_9;
                 if (warp > 9) {
                     before_52 = before_52 + ws_1_9;
                 }
                 unsigned int ws_1_10 = warp_sums[10];
-                total_51 = total_51 + ws_1_10;
+                total_52 = total_52 + ws_1_10;
                 if (warp > 10) {
                     before_52 = before_52 + ws_1_10;
                 }
                 unsigned int ws_1_11 = warp_sums[11];
-                total_51 = total_51 + ws_1_11;
+                total_52 = total_52 + ws_1_11;
                 if (warp > 11) {
                     before_52 = before_52 + ws_1_11;
                 }
                 unsigned int ws_1_12 = warp_sums[12];
-                total_51 = total_51 + ws_1_12;
+                total_52 = total_52 + ws_1_12;
                 if (warp > 12) {
                     before_52 = before_52 + ws_1_12;
                 }
                 unsigned int ws_1_13 = warp_sums[13];
-                total_51 = total_51 + ws_1_13;
+                total_52 = total_52 + ws_1_13;
                 if (warp > 13) {
                     before_52 = before_52 + ws_1_13;
                 }
                 unsigned int ws_1_14 = warp_sums[14];
-                total_51 = total_51 + ws_1_14;
+                total_52 = total_52 + ws_1_14;
                 if (warp > 14) {
                     before_52 = before_52 + ws_1_14;
                 }
                 unsigned int ws_1_15 = warp_sums[15];
-                total_51 = total_51 + ws_1_15;
+                total_52 = total_52 + ws_1_15;
                 if (warp > 15) {
                     before_52 = before_52 + ws_1_15;
                 }
                 unsigned int excl = before_52 + incl - above_9;
                 __syncthreads();
-                gt_local = gt_local + total_51;
+                gt_local = gt_local + total_52;
                 if (p == 2) {
                     if (own > 0) {
                         scal[4] = own;
@@ -64040,26 +64025,26 @@ kernel_cake_radix_topk_c4_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
             unsigned int take_rem = ((eq_prefix < remaining) ? _min_185 : 0);
             unsigned long long gt_run = out_base + (unsigned long long)gt_prefix;
             unsigned long long eq_run = out_base + (unsigned long long)(gt_total + eq_prefix);
-            for (int c_29 = 0; c_29 < nsub; c_29++) {
-                int i2_196 = start + c_29 * 2048 + tid;
+            for (int c_30 = 0; c_30 < nsub; c_30++) {
+                int i2_196 = start + c_30 * 2048 + tid;
                 if (i2_196 < vocab) {
                     vals_t[0] = probs[row_base + (unsigned long long)i2_196];
                 } else {
                     vals_t[0] = 0.0f;
                 }
-                int i2_197 = start + c_29 * 2048 + 512 + tid;
+                int i2_197 = start + c_30 * 2048 + 512 + tid;
                 if (i2_197 < vocab) {
                     vals_t[1] = probs[row_base + (unsigned long long)i2_197];
                 } else {
                     vals_t[1] = 0.0f;
                 }
-                int i2_198 = start + c_29 * 2048 + 1024 + tid;
+                int i2_198 = start + c_30 * 2048 + 1024 + tid;
                 if (i2_198 < vocab) {
                     vals_t[2] = probs[row_base + (unsigned long long)i2_198];
                 } else {
                     vals_t[2] = 0.0f;
                 }
-                int i2_199 = start + c_29 * 2048 + 1536 + tid;
+                int i2_199 = start + c_30 * 2048 + 1536 + tid;
                 if (i2_199 < vocab) {
                     vals_t[3] = probs[row_base + (unsigned long long)i2_199];
                 } else {
@@ -64068,8 +64053,8 @@ kernel_cake_radix_topk_c4_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 unsigned int gt = 0;
                 unsigned int bits_189 = __as_u32(vals_t[0]);
                 unsigned int key_192 = ((bits_189 <= 2139095040) ? bits_189 : 0);
-                int i_vec = start + c_29 * 2048 + tid * 4;
-                int i_str = start + c_29 * 2048 + tid;
+                int i_vec = start + c_30 * 2048 + tid * 4;
+                int i_str = start + c_30 * 2048 + tid;
                 int i_57 = i_str;
                 int i_2_0 = i_57;
                 bool tie_1_0 = key_192 == threshold_t && i_2_0 < vocab;
@@ -64082,8 +64067,8 @@ kernel_cake_radix_topk_c4_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 }
                 unsigned int bits_189_1 = __as_u32(vals_t[1]);
                 unsigned int key_189_1 = ((bits_189_1 <= 2139095040) ? bits_189_1 : 0);
-                int i_vec_0 = start + c_29 * 2048 + tid * 4 + 1;
-                int i_str_0 = start + c_29 * 2048 + 512 + tid;
+                int i_vec_0 = start + c_30 * 2048 + tid * 4 + 1;
+                int i_str_0 = start + c_30 * 2048 + 512 + tid;
                 int i_48_1 = i_str_0;
                 int i_2_1 = i_48_1;
                 bool tie_1_1 = key_189_1 == threshold_t && i_2_1 < vocab;
@@ -64096,8 +64081,8 @@ kernel_cake_radix_topk_c4_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 }
                 unsigned int bits_190 = __as_u32(vals_t[2]);
                 unsigned int key_190_1 = ((bits_190 <= 2139095040) ? bits_190 : 0);
-                int i_vec_1 = start + c_29 * 2048 + tid * 4 + 2;
-                int i_str_1 = start + c_29 * 2048 + 1024 + tid;
+                int i_vec_1 = start + c_30 * 2048 + tid * 4 + 2;
+                int i_str_1 = start + c_30 * 2048 + 1024 + tid;
                 int i_49_1 = i_str_1;
                 int i_2_2 = i_49_1;
                 bool tie_1_2 = key_190_1 == threshold_t && i_2_2 < vocab;
@@ -64110,8 +64095,8 @@ kernel_cake_radix_topk_c4_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 }
                 unsigned int bits_191 = __as_u32(vals_t[3]);
                 unsigned int key_191_1 = ((bits_191 <= 2139095040) ? bits_191 : 0);
-                int i_vec_2 = start + c_29 * 2048 + tid * 4 + 3;
-                int i_str_2 = start + c_29 * 2048 + 1536 + tid;
+                int i_vec_2 = start + c_30 * 2048 + tid * 4 + 3;
+                int i_str_2 = start + c_30 * 2048 + 1536 + tid;
                 int i_50_1 = i_str_2;
                 int i_2_3 = i_50_1;
                 bool tie_1_3 = key_191_1 == threshold_t && i_2_3 < vocab;
@@ -64141,84 +64126,84 @@ kernel_cake_radix_topk_c4_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 }
                 __syncthreads();
                 unsigned int before_53 = 0;
-                unsigned int total_52 = 0;
+                unsigned int total_53 = 0;
                 unsigned int ws_1_16 = warp_sums[0];
-                total_52 = total_52 + ws_1_16;
+                total_53 = total_53 + ws_1_16;
                 if (warp > 0) {
                     before_53 = before_53 + ws_1_16;
                 }
                 unsigned int ws_1_17 = warp_sums[1];
-                total_52 = total_52 + ws_1_17;
+                total_53 = total_53 + ws_1_17;
                 if (warp > 1) {
                     before_53 = before_53 + ws_1_17;
                 }
                 unsigned int ws_1_18 = warp_sums[2];
-                total_52 = total_52 + ws_1_18;
+                total_53 = total_53 + ws_1_18;
                 if (warp > 2) {
                     before_53 = before_53 + ws_1_18;
                 }
                 unsigned int ws_1_19 = warp_sums[3];
-                total_52 = total_52 + ws_1_19;
+                total_53 = total_53 + ws_1_19;
                 if (warp > 3) {
                     before_53 = before_53 + ws_1_19;
                 }
                 unsigned int ws_1_20 = warp_sums[4];
-                total_52 = total_52 + ws_1_20;
+                total_53 = total_53 + ws_1_20;
                 if (warp > 4) {
                     before_53 = before_53 + ws_1_20;
                 }
                 unsigned int ws_1_21 = warp_sums[5];
-                total_52 = total_52 + ws_1_21;
+                total_53 = total_53 + ws_1_21;
                 if (warp > 5) {
                     before_53 = before_53 + ws_1_21;
                 }
                 unsigned int ws_1_22 = warp_sums[6];
-                total_52 = total_52 + ws_1_22;
+                total_53 = total_53 + ws_1_22;
                 if (warp > 6) {
                     before_53 = before_53 + ws_1_22;
                 }
                 unsigned int ws_1_23 = warp_sums[7];
-                total_52 = total_52 + ws_1_23;
+                total_53 = total_53 + ws_1_23;
                 if (warp > 7) {
                     before_53 = before_53 + ws_1_23;
                 }
                 unsigned int ws_1_24 = warp_sums[8];
-                total_52 = total_52 + ws_1_24;
+                total_53 = total_53 + ws_1_24;
                 if (warp > 8) {
                     before_53 = before_53 + ws_1_24;
                 }
                 unsigned int ws_1_25 = warp_sums[9];
-                total_52 = total_52 + ws_1_25;
+                total_53 = total_53 + ws_1_25;
                 if (warp > 9) {
                     before_53 = before_53 + ws_1_25;
                 }
                 unsigned int ws_1_26 = warp_sums[10];
-                total_52 = total_52 + ws_1_26;
+                total_53 = total_53 + ws_1_26;
                 if (warp > 10) {
                     before_53 = before_53 + ws_1_26;
                 }
                 unsigned int ws_1_27 = warp_sums[11];
-                total_52 = total_52 + ws_1_27;
+                total_53 = total_53 + ws_1_27;
                 if (warp > 11) {
                     before_53 = before_53 + ws_1_27;
                 }
                 unsigned int ws_1_28 = warp_sums[12];
-                total_52 = total_52 + ws_1_28;
+                total_53 = total_53 + ws_1_28;
                 if (warp > 12) {
                     before_53 = before_53 + ws_1_28;
                 }
                 unsigned int ws_1_29 = warp_sums[13];
-                total_52 = total_52 + ws_1_29;
+                total_53 = total_53 + ws_1_29;
                 if (warp > 13) {
                     before_53 = before_53 + ws_1_29;
                 }
                 unsigned int ws_1_30 = warp_sums[14];
-                total_52 = total_52 + ws_1_30;
+                total_53 = total_53 + ws_1_30;
                 if (warp > 14) {
                     before_53 = before_53 + ws_1_30;
                 }
                 unsigned int ws_1_31 = warp_sums[15];
-                total_52 = total_52 + ws_1_31;
+                total_53 = total_53 + ws_1_31;
                 if (warp > 15) {
                     before_53 = before_53 + ws_1_31;
                 }
@@ -64227,14 +64212,14 @@ kernel_cake_radix_topk_c4_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 unsigned int running = excl_1 >> 12;
                 int f2 = tid;
                 if (f2 < 64) {
-                    unsigned int c_0_1 = cnt[f2];
+                    unsigned int c_0 = cnt[f2];
                     cnt[f2] = running;
-                    running = running + c_0_1;
+                    running = running + c_0;
                 }
                 __syncthreads();
                 unsigned int gt_slot = excl_1 & 4095;
-                unsigned int gt_total_46 = total_52 & 4095;
-                unsigned int eq_total = total_52 >> 12;
+                unsigned int gt_total_46 = total_53 & 4095;
+                unsigned int eq_total = total_53 >> 12;
                 unsigned int take_c = ((eq_total) < (take_rem) ? (eq_total) : (take_rem));
                 unsigned int lt_mask_6 = (1 << (unsigned int)lane) - 1;
                 unsigned int g = gt_slot;
@@ -64247,8 +64232,8 @@ kernel_cake_radix_topk_c4_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 unsigned int bits_192 = __as_u32(vals_t[0]);
                 unsigned int key_192_1 = ((bits_192 <= 2139095040) ? bits_192 : 0);
                 keys[0] = key_192_1;
-                int i_vec_3 = start + c_29 * 2048 + tid * 4;
-                int i_str_3 = start + c_29 * 2048 + tid;
+                int i_vec_3 = start + c_30 * 2048 + tid * 4;
+                int i_str_3 = start + c_30 * 2048 + tid;
                 int i_51_1 = i_str_3;
                 idxs[0] = i_51_1;
                 ties[0] = keys[0] == threshold_t && idxs[0] < vocab;
@@ -64261,8 +64246,8 @@ kernel_cake_radix_topk_c4_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 unsigned int bits_193 = __as_u32(vals_t[1]);
                 unsigned int key_193 = ((bits_193 <= 2139095040) ? bits_193 : 0);
                 keys[1] = key_193;
-                int i_vec_4 = start + c_29 * 2048 + tid * 4 + 1;
-                int i_str_4 = start + c_29 * 2048 + 512 + tid;
+                int i_vec_4 = start + c_30 * 2048 + tid * 4 + 1;
+                int i_str_4 = start + c_30 * 2048 + 512 + tid;
                 int i_52_1 = i_str_4;
                 idxs[1] = i_52_1;
                 ties[1] = keys[1] == threshold_t && idxs[1] < vocab;
@@ -64275,8 +64260,8 @@ kernel_cake_radix_topk_c4_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 unsigned int bits_194 = __as_u32(vals_t[2]);
                 unsigned int key_194 = ((bits_194 <= 2139095040) ? bits_194 : 0);
                 keys[2] = key_194;
-                int i_vec_5 = start + c_29 * 2048 + tid * 4 + 2;
-                int i_str_5 = start + c_29 * 2048 + 1024 + tid;
+                int i_vec_5 = start + c_30 * 2048 + tid * 4 + 2;
+                int i_str_5 = start + c_30 * 2048 + 1024 + tid;
                 int i_53_1 = i_str_5;
                 idxs[2] = i_53_1;
                 ties[2] = keys[2] == threshold_t && idxs[2] < vocab;
@@ -64289,8 +64274,8 @@ kernel_cake_radix_topk_c4_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 unsigned int bits_195 = __as_u32(vals_t[3]);
                 unsigned int key_195 = ((bits_195 <= 2139095040) ? bits_195 : 0);
                 keys[3] = key_195;
-                int i_vec_6 = start + c_29 * 2048 + tid * 4 + 3;
-                int i_str_6 = start + c_29 * 2048 + 1536 + tid;
+                int i_vec_6 = start + c_30 * 2048 + tid * 4 + 3;
+                int i_str_6 = start + c_30 * 2048 + 1536 + tid;
                 int i_54_1 = i_str_6;
                 idxs[3] = i_54_1;
                 ties[3] = keys[3] == threshold_t && idxs[3] < vocab;
@@ -64380,7 +64365,6 @@ kernel_cake_radix_topk_c4_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
 } // extern "C"
 
 #undef CAKE_INF
-#undef NUM_MAIN_STAGES
 #undef SMEM_CLIST_OFF
 #undef SMEM_CLIST_STAGE_BYTES
 #undef SMEM_CLIST_STRIDE
@@ -64469,7 +64453,6 @@ kernel_cake_radix_topk_c4_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
 #undef xbuf64_addr
 
 #define CAKE_INF CUDART_INF_F
-#define NUM_MAIN_STAGES 1
 #define SMEM_HIST0_OFF 0
 #define SMEM_HIST0_STAGE_BYTES 8192
 #define SMEM_HIST0_STRIDE 8192
@@ -66177,10 +66160,10 @@ kernel_cake_radix_topk_c8_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
         asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(owner_1) : "r"(((is_owner_1 != 0) ? (unsigned int)lane : 0)));
         unsigned int found_1;
         asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(found_1) : "r"(is_owner_1));
-        unsigned int pos_b_1 = __shfl_sync(0xFFFFFFFF, pos_1, owner_1);
-        unsigned int rem_b_1 = __shfl_sync(0xFFFFFFFF, rem_after_1, owner_1);
+        unsigned int pos_b_2 = __shfl_sync(0xFFFFFFFF, pos_1, owner_1);
+        unsigned int rem_b_2 = __shfl_sync(0xFFFFFFFF, rem_after_1, owner_1);
         unsigned int cnt_b_1 = __shfl_sync(0xFFFFFFFF, cnt_2, owner_1);
-        unsigned int lo_b_1 = __shfl_sync(0xFFFFFFFF, lo_sel_1, owner_1);
+        unsigned int lo_b_2 = __shfl_sync(0xFFFFFFFF, lo_sel_1, owner_1);
         ff[0] = 0;
         lf[0] = 0;
         ff[1] = 0;
@@ -66324,21 +66307,21 @@ kernel_cake_radix_topk_c8_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
         asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(owner_2) : "r"(((is_owner_2 != 0) ? (unsigned int)lane : 0)));
         unsigned int found_2;
         asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(found_2) : "r"(is_owner_2));
-        unsigned int pos_b_2 = __shfl_sync(0xFFFFFFFF, pos_2, owner_2);
-        unsigned int rem_b_2 = __shfl_sync(0xFFFFFFFF, rem_after_2, owner_2);
+        unsigned int pos_b_3 = __shfl_sync(0xFFFFFFFF, pos_2, owner_2);
+        unsigned int rem_b_3 = __shfl_sync(0xFFFFFFFF, rem_after_2, owner_2);
         unsigned int cnt_b_2 = __shfl_sync(0xFFFFFFFF, cnt_3, owner_2);
-        unsigned int lo_b_2 = __shfl_sync(0xFFFFFFFF, lo_sel_2, owner_2);
+        unsigned int lo_b_3 = __shfl_sync(0xFFFFFFFF, lo_sel_2, owner_2);
         unsigned int b_need = 0;
         unsigned int mass_need = 0;
         if (found != 0) {
-            b_need = pos_b * 16 + pos_b_1;
-            mass_need = rem_need - rem_b_1 + cnt_b_1;
+            b_need = pos_b * 16 + pos_b_2;
+            mass_need = rem_need - rem_b_2 + cnt_b_1;
         }
         unsigned int b_cap = 0;
         unsigned int mass_cap = 0;
         if (found_0 != 0) {
-            b_cap = pos_b_0 * 16 + pos_b_2 + 1;
-            mass_cap = rem_cap - rem_b_2;
+            b_cap = pos_b_0 * 16 + pos_b_3 + 1;
+            mass_cap = rem_cap - rem_b_3;
         }
         if (lane == 0) {
             unsigned int _max_86 = ((b_need) > (b_cap) ? (b_need) : (b_cap));
@@ -69392,7 +69375,7 @@ kernel_cake_radix_topk_c8_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
             int idxs_6[4];
             bool cands_30[4];
             unsigned int before_30 = 0;
-            unsigned int total_30 = 0;
+            unsigned int total_31 = 0;
             unsigned int bits_23_1 = __as_u32(vals_a[24]);
             unsigned int key_23_1 = ((bits_23_1 <= 2139095040) ? bits_23_1 : 0);
             keys_6[0] = key_23_1;
@@ -69400,7 +69383,7 @@ kernel_cake_radix_topk_c8_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
             cands_30[0] = b_lo <= keys_6[0] >> 21 && idxs_6[0] < vocab;
             unsigned int m_24 = __ballot_sync(0xFFFFFFFF, cands_30[0]);
             before_30 = before_30 + (unsigned int)__popc(m_24 & lt_mask_2);
-            total_30 = total_30 + (unsigned int)__popc(m_24);
+            total_31 = total_31 + (unsigned int)__popc(m_24);
             unsigned int bits_24_1 = __as_u32(vals_a[25]);
             unsigned int key_24_1 = ((bits_24_1 <= 2139095040) ? bits_24_1 : 0);
             keys_6[1] = key_24_1;
@@ -69408,7 +69391,7 @@ kernel_cake_radix_topk_c8_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
             cands_30[1] = b_lo <= keys_6[1] >> 21 && idxs_6[1] < vocab;
             unsigned int m_25 = __ballot_sync(0xFFFFFFFF, cands_30[1]);
             before_30 = before_30 + (unsigned int)__popc(m_25 & lt_mask_2);
-            total_30 = total_30 + (unsigned int)__popc(m_25);
+            total_31 = total_31 + (unsigned int)__popc(m_25);
             unsigned int bits_25_1 = __as_u32(vals_a[26]);
             unsigned int key_25_1 = ((bits_25_1 <= 2139095040) ? bits_25_1 : 0);
             keys_6[2] = key_25_1;
@@ -69416,7 +69399,7 @@ kernel_cake_radix_topk_c8_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
             cands_30[2] = b_lo <= keys_6[2] >> 21 && idxs_6[2] < vocab;
             unsigned int m_26 = __ballot_sync(0xFFFFFFFF, cands_30[2]);
             before_30 = before_30 + (unsigned int)__popc(m_26 & lt_mask_2);
-            total_30 = total_30 + (unsigned int)__popc(m_26);
+            total_31 = total_31 + (unsigned int)__popc(m_26);
             unsigned int bits_26_1 = __as_u32(vals_a[27]);
             unsigned int key_26_1 = ((bits_26_1 <= 2139095040) ? bits_26_1 : 0);
             keys_6[3] = key_26_1;
@@ -69424,7 +69407,7 @@ kernel_cake_radix_topk_c8_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
             cands_30[3] = b_lo <= keys_6[3] >> 21 && idxs_6[3] < vocab;
             unsigned int m_27 = __ballot_sync(0xFFFFFFFF, cands_30[3]);
             before_30 = before_30 + (unsigned int)__popc(m_27 & lt_mask_2);
-            total_30 = total_30 + (unsigned int)__popc(m_27);
+            total_31 = total_31 + (unsigned int)__popc(m_27);
             unsigned int own_30 = 0;
             unsigned int pos_123 = n_2 + before_30 + own_30;
             if (cands_30[0] && pos_123 < 1024) {
@@ -69462,12 +69445,12 @@ kernel_cake_radix_topk_c8_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
             if (cands_30[3]) {
                 own_30 = own_30 + 1;
             }
-            n_2 = n_2 + total_30;
+            n_2 = n_2 + total_31;
             unsigned int keys_7[4];
             int idxs_7[4];
             bool cands_31[4];
             unsigned int before_31 = 0;
-            unsigned int total_31 = 0;
+            unsigned int total_32 = 0;
             unsigned int bits_27_1 = __as_u32(vals_a[28]);
             unsigned int key_27_1 = ((bits_27_1 <= 2139095040) ? bits_27_1 : 0);
             keys_7[0] = key_27_1;
@@ -69475,7 +69458,7 @@ kernel_cake_radix_topk_c8_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
             cands_31[0] = b_lo <= keys_7[0] >> 21 && idxs_7[0] < vocab;
             unsigned int m_28 = __ballot_sync(0xFFFFFFFF, cands_31[0]);
             before_31 = before_31 + (unsigned int)__popc(m_28 & lt_mask_2);
-            total_31 = total_31 + (unsigned int)__popc(m_28);
+            total_32 = total_32 + (unsigned int)__popc(m_28);
             unsigned int bits_28_1 = __as_u32(vals_a[29]);
             unsigned int key_28_1 = ((bits_28_1 <= 2139095040) ? bits_28_1 : 0);
             keys_7[1] = key_28_1;
@@ -69483,7 +69466,7 @@ kernel_cake_radix_topk_c8_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
             cands_31[1] = b_lo <= keys_7[1] >> 21 && idxs_7[1] < vocab;
             unsigned int m_29 = __ballot_sync(0xFFFFFFFF, cands_31[1]);
             before_31 = before_31 + (unsigned int)__popc(m_29 & lt_mask_2);
-            total_31 = total_31 + (unsigned int)__popc(m_29);
+            total_32 = total_32 + (unsigned int)__popc(m_29);
             unsigned int bits_29_1 = __as_u32(vals_a[30]);
             unsigned int key_29_1 = ((bits_29_1 <= 2139095040) ? bits_29_1 : 0);
             keys_7[2] = key_29_1;
@@ -69491,7 +69474,7 @@ kernel_cake_radix_topk_c8_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
             cands_31[2] = b_lo <= keys_7[2] >> 21 && idxs_7[2] < vocab;
             unsigned int m_30 = __ballot_sync(0xFFFFFFFF, cands_31[2]);
             before_31 = before_31 + (unsigned int)__popc(m_30 & lt_mask_2);
-            total_31 = total_31 + (unsigned int)__popc(m_30);
+            total_32 = total_32 + (unsigned int)__popc(m_30);
             unsigned int bits_30_1 = __as_u32(vals_a[31]);
             unsigned int key_30_1 = ((bits_30_1 <= 2139095040) ? bits_30_1 : 0);
             keys_7[3] = key_30_1;
@@ -69499,7 +69482,7 @@ kernel_cake_radix_topk_c8_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
             cands_31[3] = b_lo <= keys_7[3] >> 21 && idxs_7[3] < vocab;
             unsigned int m_31 = __ballot_sync(0xFFFFFFFF, cands_31[3]);
             before_31 = before_31 + (unsigned int)__popc(m_31 & lt_mask_2);
-            total_31 = total_31 + (unsigned int)__popc(m_31);
+            total_32 = total_32 + (unsigned int)__popc(m_31);
             unsigned int own_31 = 0;
             unsigned int pos_127 = n_2 + before_31 + own_31;
             if (cands_31[0] && pos_127 < 1024) {
@@ -69537,7 +69520,7 @@ kernel_cake_radix_topk_c8_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
             if (cands_31[3]) {
                 own_31 = own_31 + 1;
             }
-            n_2 = n_2 + total_31;
+            n_2 = n_2 + total_32;
         } else {
             unsigned int skeys_0[4];
             int sidxs_0[4];
@@ -70442,7 +70425,7 @@ kernel_cake_radix_topk_c8_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 int idxs_8[4];
                 bool cands_32[4];
                 unsigned int before_32 = 0;
-                unsigned int total_32 = 0;
+                unsigned int total_33 = 0;
                 unsigned int bits_162 = __as_u32(vals_b[0]);
                 unsigned int key_162 = ((bits_162 <= 2139095040) ? bits_162 : 0);
                 keys_8[0] = key_162;
@@ -70450,7 +70433,7 @@ kernel_cake_radix_topk_c8_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 cands_32[0] = b_lo <= keys_8[0] >> 21 && idxs_8[0] < vocab;
                 unsigned int m_32 = __ballot_sync(0xFFFFFFFF, cands_32[0]);
                 before_32 = before_32 + (unsigned int)__popc(m_32 & lt_mask_2_1);
-                total_32 = total_32 + (unsigned int)__popc(m_32);
+                total_33 = total_33 + (unsigned int)__popc(m_32);
                 unsigned int bits_62_1 = __as_u32(vals_b[1]);
                 unsigned int key_62_1 = ((bits_62_1 <= 2139095040) ? bits_62_1 : 0);
                 keys_8[1] = key_62_1;
@@ -70458,7 +70441,7 @@ kernel_cake_radix_topk_c8_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 cands_32[1] = b_lo <= keys_8[1] >> 21 && idxs_8[1] < vocab;
                 unsigned int m_33 = __ballot_sync(0xFFFFFFFF, cands_32[1]);
                 before_32 = before_32 + (unsigned int)__popc(m_33 & lt_mask_2_1);
-                total_32 = total_32 + (unsigned int)__popc(m_33);
+                total_33 = total_33 + (unsigned int)__popc(m_33);
                 unsigned int bits_63_1 = __as_u32(vals_b[2]);
                 unsigned int key_63_1 = ((bits_63_1 <= 2139095040) ? bits_63_1 : 0);
                 keys_8[2] = key_63_1;
@@ -70466,7 +70449,7 @@ kernel_cake_radix_topk_c8_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 cands_32[2] = b_lo <= keys_8[2] >> 21 && idxs_8[2] < vocab;
                 unsigned int m_34 = __ballot_sync(0xFFFFFFFF, cands_32[2]);
                 before_32 = before_32 + (unsigned int)__popc(m_34 & lt_mask_2_1);
-                total_32 = total_32 + (unsigned int)__popc(m_34);
+                total_33 = total_33 + (unsigned int)__popc(m_34);
                 unsigned int bits_64_1 = __as_u32(vals_b[3]);
                 unsigned int key_64_1 = ((bits_64_1 <= 2139095040) ? bits_64_1 : 0);
                 keys_8[3] = key_64_1;
@@ -70474,7 +70457,7 @@ kernel_cake_radix_topk_c8_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 cands_32[3] = b_lo <= keys_8[3] >> 21 && idxs_8[3] < vocab;
                 unsigned int m_35 = __ballot_sync(0xFFFFFFFF, cands_32[3]);
                 before_32 = before_32 + (unsigned int)__popc(m_35 & lt_mask_2_1);
-                total_32 = total_32 + (unsigned int)__popc(m_35);
+                total_33 = total_33 + (unsigned int)__popc(m_35);
                 unsigned int own_32 = 0;
                 unsigned int pos_131 = n_2_1 + before_32 + own_32;
                 if (cands_32[0] && pos_131 < 1024) {
@@ -70512,12 +70495,12 @@ kernel_cake_radix_topk_c8_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 if (cands_32[3]) {
                     own_32 = own_32 + 1;
                 }
-                n_2_1 = n_2_1 + total_32;
+                n_2_1 = n_2_1 + total_33;
                 unsigned int keys_9[4];
                 int idxs_9[4];
                 bool cands_33[4];
                 unsigned int before_33 = 0;
-                unsigned int total_33 = 0;
+                unsigned int total_34 = 0;
                 unsigned int bits_65_1 = __as_u32(vals_b[4]);
                 unsigned int key_65_1 = ((bits_65_1 <= 2139095040) ? bits_65_1 : 0);
                 keys_9[0] = key_65_1;
@@ -70525,7 +70508,7 @@ kernel_cake_radix_topk_c8_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 cands_33[0] = b_lo <= keys_9[0] >> 21 && idxs_9[0] < vocab;
                 unsigned int m_36 = __ballot_sync(0xFFFFFFFF, cands_33[0]);
                 before_33 = before_33 + (unsigned int)__popc(m_36 & lt_mask_2_1);
-                total_33 = total_33 + (unsigned int)__popc(m_36);
+                total_34 = total_34 + (unsigned int)__popc(m_36);
                 unsigned int bits_66_1 = __as_u32(vals_b[5]);
                 unsigned int key_66_1 = ((bits_66_1 <= 2139095040) ? bits_66_1 : 0);
                 keys_9[1] = key_66_1;
@@ -70533,7 +70516,7 @@ kernel_cake_radix_topk_c8_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 cands_33[1] = b_lo <= keys_9[1] >> 21 && idxs_9[1] < vocab;
                 unsigned int m_37 = __ballot_sync(0xFFFFFFFF, cands_33[1]);
                 before_33 = before_33 + (unsigned int)__popc(m_37 & lt_mask_2_1);
-                total_33 = total_33 + (unsigned int)__popc(m_37);
+                total_34 = total_34 + (unsigned int)__popc(m_37);
                 unsigned int bits_67_1 = __as_u32(vals_b[6]);
                 unsigned int key_67_1 = ((bits_67_1 <= 2139095040) ? bits_67_1 : 0);
                 keys_9[2] = key_67_1;
@@ -70541,7 +70524,7 @@ kernel_cake_radix_topk_c8_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 cands_33[2] = b_lo <= keys_9[2] >> 21 && idxs_9[2] < vocab;
                 unsigned int m_38 = __ballot_sync(0xFFFFFFFF, cands_33[2]);
                 before_33 = before_33 + (unsigned int)__popc(m_38 & lt_mask_2_1);
-                total_33 = total_33 + (unsigned int)__popc(m_38);
+                total_34 = total_34 + (unsigned int)__popc(m_38);
                 unsigned int bits_68_1 = __as_u32(vals_b[7]);
                 unsigned int key_68_1 = ((bits_68_1 <= 2139095040) ? bits_68_1 : 0);
                 keys_9[3] = key_68_1;
@@ -70549,7 +70532,7 @@ kernel_cake_radix_topk_c8_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 cands_33[3] = b_lo <= keys_9[3] >> 21 && idxs_9[3] < vocab;
                 unsigned int m_39 = __ballot_sync(0xFFFFFFFF, cands_33[3]);
                 before_33 = before_33 + (unsigned int)__popc(m_39 & lt_mask_2_1);
-                total_33 = total_33 + (unsigned int)__popc(m_39);
+                total_34 = total_34 + (unsigned int)__popc(m_39);
                 unsigned int own_33 = 0;
                 unsigned int pos_135 = n_2_1 + before_33 + own_33;
                 if (cands_33[0] && pos_135 < 1024) {
@@ -70587,12 +70570,12 @@ kernel_cake_radix_topk_c8_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 if (cands_33[3]) {
                     own_33 = own_33 + 1;
                 }
-                n_2_1 = n_2_1 + total_33;
+                n_2_1 = n_2_1 + total_34;
                 unsigned int keys_10[4];
                 int idxs_10[4];
                 bool cands_34[4];
                 unsigned int before_34 = 0;
-                unsigned int total_34 = 0;
+                unsigned int total_35 = 0;
                 unsigned int bits_69_1 = __as_u32(vals_b[8]);
                 unsigned int key_69_1 = ((bits_69_1 <= 2139095040) ? bits_69_1 : 0);
                 keys_10[0] = key_69_1;
@@ -70600,7 +70583,7 @@ kernel_cake_radix_topk_c8_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 cands_34[0] = b_lo <= keys_10[0] >> 21 && idxs_10[0] < vocab;
                 unsigned int m_40 = __ballot_sync(0xFFFFFFFF, cands_34[0]);
                 before_34 = before_34 + (unsigned int)__popc(m_40 & lt_mask_2_1);
-                total_34 = total_34 + (unsigned int)__popc(m_40);
+                total_35 = total_35 + (unsigned int)__popc(m_40);
                 unsigned int bits_70_1 = __as_u32(vals_b[9]);
                 unsigned int key_70_1 = ((bits_70_1 <= 2139095040) ? bits_70_1 : 0);
                 keys_10[1] = key_70_1;
@@ -70608,7 +70591,7 @@ kernel_cake_radix_topk_c8_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 cands_34[1] = b_lo <= keys_10[1] >> 21 && idxs_10[1] < vocab;
                 unsigned int m_41 = __ballot_sync(0xFFFFFFFF, cands_34[1]);
                 before_34 = before_34 + (unsigned int)__popc(m_41 & lt_mask_2_1);
-                total_34 = total_34 + (unsigned int)__popc(m_41);
+                total_35 = total_35 + (unsigned int)__popc(m_41);
                 unsigned int bits_71_1 = __as_u32(vals_b[10]);
                 unsigned int key_71_1 = ((bits_71_1 <= 2139095040) ? bits_71_1 : 0);
                 keys_10[2] = key_71_1;
@@ -70616,7 +70599,7 @@ kernel_cake_radix_topk_c8_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 cands_34[2] = b_lo <= keys_10[2] >> 21 && idxs_10[2] < vocab;
                 unsigned int m_42 = __ballot_sync(0xFFFFFFFF, cands_34[2]);
                 before_34 = before_34 + (unsigned int)__popc(m_42 & lt_mask_2_1);
-                total_34 = total_34 + (unsigned int)__popc(m_42);
+                total_35 = total_35 + (unsigned int)__popc(m_42);
                 unsigned int bits_72_1 = __as_u32(vals_b[11]);
                 unsigned int key_72_1 = ((bits_72_1 <= 2139095040) ? bits_72_1 : 0);
                 keys_10[3] = key_72_1;
@@ -70624,7 +70607,7 @@ kernel_cake_radix_topk_c8_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 cands_34[3] = b_lo <= keys_10[3] >> 21 && idxs_10[3] < vocab;
                 unsigned int m_43 = __ballot_sync(0xFFFFFFFF, cands_34[3]);
                 before_34 = before_34 + (unsigned int)__popc(m_43 & lt_mask_2_1);
-                total_34 = total_34 + (unsigned int)__popc(m_43);
+                total_35 = total_35 + (unsigned int)__popc(m_43);
                 unsigned int own_34 = 0;
                 unsigned int pos_139 = n_2_1 + before_34 + own_34;
                 if (cands_34[0] && pos_139 < 1024) {
@@ -70662,12 +70645,12 @@ kernel_cake_radix_topk_c8_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 if (cands_34[3]) {
                     own_34 = own_34 + 1;
                 }
-                n_2_1 = n_2_1 + total_34;
+                n_2_1 = n_2_1 + total_35;
                 unsigned int keys_11[4];
                 int idxs_11[4];
                 bool cands_35[4];
                 unsigned int before_35 = 0;
-                unsigned int total_35 = 0;
+                unsigned int total_36 = 0;
                 unsigned int bits_73_1 = __as_u32(vals_b[12]);
                 unsigned int key_73_1 = ((bits_73_1 <= 2139095040) ? bits_73_1 : 0);
                 keys_11[0] = key_73_1;
@@ -70675,7 +70658,7 @@ kernel_cake_radix_topk_c8_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 cands_35[0] = b_lo <= keys_11[0] >> 21 && idxs_11[0] < vocab;
                 unsigned int m_44 = __ballot_sync(0xFFFFFFFF, cands_35[0]);
                 before_35 = before_35 + (unsigned int)__popc(m_44 & lt_mask_2_1);
-                total_35 = total_35 + (unsigned int)__popc(m_44);
+                total_36 = total_36 + (unsigned int)__popc(m_44);
                 unsigned int bits_74_1 = __as_u32(vals_b[13]);
                 unsigned int key_74_1 = ((bits_74_1 <= 2139095040) ? bits_74_1 : 0);
                 keys_11[1] = key_74_1;
@@ -70683,7 +70666,7 @@ kernel_cake_radix_topk_c8_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 cands_35[1] = b_lo <= keys_11[1] >> 21 && idxs_11[1] < vocab;
                 unsigned int m_45 = __ballot_sync(0xFFFFFFFF, cands_35[1]);
                 before_35 = before_35 + (unsigned int)__popc(m_45 & lt_mask_2_1);
-                total_35 = total_35 + (unsigned int)__popc(m_45);
+                total_36 = total_36 + (unsigned int)__popc(m_45);
                 unsigned int bits_75_1 = __as_u32(vals_b[14]);
                 unsigned int key_75_1 = ((bits_75_1 <= 2139095040) ? bits_75_1 : 0);
                 keys_11[2] = key_75_1;
@@ -70691,7 +70674,7 @@ kernel_cake_radix_topk_c8_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 cands_35[2] = b_lo <= keys_11[2] >> 21 && idxs_11[2] < vocab;
                 unsigned int m_46 = __ballot_sync(0xFFFFFFFF, cands_35[2]);
                 before_35 = before_35 + (unsigned int)__popc(m_46 & lt_mask_2_1);
-                total_35 = total_35 + (unsigned int)__popc(m_46);
+                total_36 = total_36 + (unsigned int)__popc(m_46);
                 unsigned int bits_76_1 = __as_u32(vals_b[15]);
                 unsigned int key_76_1 = ((bits_76_1 <= 2139095040) ? bits_76_1 : 0);
                 keys_11[3] = key_76_1;
@@ -70699,7 +70682,7 @@ kernel_cake_radix_topk_c8_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 cands_35[3] = b_lo <= keys_11[3] >> 21 && idxs_11[3] < vocab;
                 unsigned int m_47 = __ballot_sync(0xFFFFFFFF, cands_35[3]);
                 before_35 = before_35 + (unsigned int)__popc(m_47 & lt_mask_2_1);
-                total_35 = total_35 + (unsigned int)__popc(m_47);
+                total_36 = total_36 + (unsigned int)__popc(m_47);
                 unsigned int own_35 = 0;
                 unsigned int pos_143 = n_2_1 + before_35 + own_35;
                 if (cands_35[0] && pos_143 < 1024) {
@@ -70737,12 +70720,12 @@ kernel_cake_radix_topk_c8_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 if (cands_35[3]) {
                     own_35 = own_35 + 1;
                 }
-                n_2_1 = n_2_1 + total_35;
+                n_2_1 = n_2_1 + total_36;
                 unsigned int keys_12[4];
                 int idxs_12[4];
                 bool cands_36[4];
                 unsigned int before_36 = 0;
-                unsigned int total_36 = 0;
+                unsigned int total_37 = 0;
                 unsigned int bits_77_1 = __as_u32(vals_b[16]);
                 unsigned int key_77_1 = ((bits_77_1 <= 2139095040) ? bits_77_1 : 0);
                 keys_12[0] = key_77_1;
@@ -70750,7 +70733,7 @@ kernel_cake_radix_topk_c8_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 cands_36[0] = b_lo <= keys_12[0] >> 21 && idxs_12[0] < vocab;
                 unsigned int m_48 = __ballot_sync(0xFFFFFFFF, cands_36[0]);
                 before_36 = before_36 + (unsigned int)__popc(m_48 & lt_mask_2_1);
-                total_36 = total_36 + (unsigned int)__popc(m_48);
+                total_37 = total_37 + (unsigned int)__popc(m_48);
                 unsigned int bits_78_1 = __as_u32(vals_b[17]);
                 unsigned int key_78_1 = ((bits_78_1 <= 2139095040) ? bits_78_1 : 0);
                 keys_12[1] = key_78_1;
@@ -70758,7 +70741,7 @@ kernel_cake_radix_topk_c8_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 cands_36[1] = b_lo <= keys_12[1] >> 21 && idxs_12[1] < vocab;
                 unsigned int m_49 = __ballot_sync(0xFFFFFFFF, cands_36[1]);
                 before_36 = before_36 + (unsigned int)__popc(m_49 & lt_mask_2_1);
-                total_36 = total_36 + (unsigned int)__popc(m_49);
+                total_37 = total_37 + (unsigned int)__popc(m_49);
                 unsigned int bits_79_1 = __as_u32(vals_b[18]);
                 unsigned int key_79_1 = ((bits_79_1 <= 2139095040) ? bits_79_1 : 0);
                 keys_12[2] = key_79_1;
@@ -70766,7 +70749,7 @@ kernel_cake_radix_topk_c8_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 cands_36[2] = b_lo <= keys_12[2] >> 21 && idxs_12[2] < vocab;
                 unsigned int m_50 = __ballot_sync(0xFFFFFFFF, cands_36[2]);
                 before_36 = before_36 + (unsigned int)__popc(m_50 & lt_mask_2_1);
-                total_36 = total_36 + (unsigned int)__popc(m_50);
+                total_37 = total_37 + (unsigned int)__popc(m_50);
                 unsigned int bits_80_1 = __as_u32(vals_b[19]);
                 unsigned int key_80_1 = ((bits_80_1 <= 2139095040) ? bits_80_1 : 0);
                 keys_12[3] = key_80_1;
@@ -70774,7 +70757,7 @@ kernel_cake_radix_topk_c8_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 cands_36[3] = b_lo <= keys_12[3] >> 21 && idxs_12[3] < vocab;
                 unsigned int m_51 = __ballot_sync(0xFFFFFFFF, cands_36[3]);
                 before_36 = before_36 + (unsigned int)__popc(m_51 & lt_mask_2_1);
-                total_36 = total_36 + (unsigned int)__popc(m_51);
+                total_37 = total_37 + (unsigned int)__popc(m_51);
                 unsigned int own_36 = 0;
                 unsigned int pos_147 = n_2_1 + before_36 + own_36;
                 if (cands_36[0] && pos_147 < 1024) {
@@ -70812,12 +70795,12 @@ kernel_cake_radix_topk_c8_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 if (cands_36[3]) {
                     own_36 = own_36 + 1;
                 }
-                n_2_1 = n_2_1 + total_36;
+                n_2_1 = n_2_1 + total_37;
                 unsigned int keys_13[4];
                 int idxs_13[4];
                 bool cands_37[4];
                 unsigned int before_37 = 0;
-                unsigned int total_37 = 0;
+                unsigned int total_38 = 0;
                 unsigned int bits_81_1 = __as_u32(vals_b[20]);
                 unsigned int key_81_1 = ((bits_81_1 <= 2139095040) ? bits_81_1 : 0);
                 keys_13[0] = key_81_1;
@@ -70825,7 +70808,7 @@ kernel_cake_radix_topk_c8_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 cands_37[0] = b_lo <= keys_13[0] >> 21 && idxs_13[0] < vocab;
                 unsigned int m_52 = __ballot_sync(0xFFFFFFFF, cands_37[0]);
                 before_37 = before_37 + (unsigned int)__popc(m_52 & lt_mask_2_1);
-                total_37 = total_37 + (unsigned int)__popc(m_52);
+                total_38 = total_38 + (unsigned int)__popc(m_52);
                 unsigned int bits_82_1 = __as_u32(vals_b[21]);
                 unsigned int key_82_1 = ((bits_82_1 <= 2139095040) ? bits_82_1 : 0);
                 keys_13[1] = key_82_1;
@@ -70833,7 +70816,7 @@ kernel_cake_radix_topk_c8_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 cands_37[1] = b_lo <= keys_13[1] >> 21 && idxs_13[1] < vocab;
                 unsigned int m_53 = __ballot_sync(0xFFFFFFFF, cands_37[1]);
                 before_37 = before_37 + (unsigned int)__popc(m_53 & lt_mask_2_1);
-                total_37 = total_37 + (unsigned int)__popc(m_53);
+                total_38 = total_38 + (unsigned int)__popc(m_53);
                 unsigned int bits_83_1 = __as_u32(vals_b[22]);
                 unsigned int key_83_1 = ((bits_83_1 <= 2139095040) ? bits_83_1 : 0);
                 keys_13[2] = key_83_1;
@@ -70841,7 +70824,7 @@ kernel_cake_radix_topk_c8_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 cands_37[2] = b_lo <= keys_13[2] >> 21 && idxs_13[2] < vocab;
                 unsigned int m_54 = __ballot_sync(0xFFFFFFFF, cands_37[2]);
                 before_37 = before_37 + (unsigned int)__popc(m_54 & lt_mask_2_1);
-                total_37 = total_37 + (unsigned int)__popc(m_54);
+                total_38 = total_38 + (unsigned int)__popc(m_54);
                 unsigned int bits_84_1 = __as_u32(vals_b[23]);
                 unsigned int key_84_1 = ((bits_84_1 <= 2139095040) ? bits_84_1 : 0);
                 keys_13[3] = key_84_1;
@@ -70849,7 +70832,7 @@ kernel_cake_radix_topk_c8_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 cands_37[3] = b_lo <= keys_13[3] >> 21 && idxs_13[3] < vocab;
                 unsigned int m_55 = __ballot_sync(0xFFFFFFFF, cands_37[3]);
                 before_37 = before_37 + (unsigned int)__popc(m_55 & lt_mask_2_1);
-                total_37 = total_37 + (unsigned int)__popc(m_55);
+                total_38 = total_38 + (unsigned int)__popc(m_55);
                 unsigned int own_37 = 0;
                 unsigned int pos_151 = n_2_1 + before_37 + own_37;
                 if (cands_37[0] && pos_151 < 1024) {
@@ -70887,12 +70870,12 @@ kernel_cake_radix_topk_c8_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 if (cands_37[3]) {
                     own_37 = own_37 + 1;
                 }
-                n_2_1 = n_2_1 + total_37;
+                n_2_1 = n_2_1 + total_38;
                 unsigned int keys_14[4];
                 int idxs_14[4];
                 bool cands_38[4];
                 unsigned int before_38 = 0;
-                unsigned int total_38 = 0;
+                unsigned int total_39 = 0;
                 unsigned int bits_85_1 = __as_u32(vals_b[24]);
                 unsigned int key_85_1 = ((bits_85_1 <= 2139095040) ? bits_85_1 : 0);
                 keys_14[0] = key_85_1;
@@ -70900,7 +70883,7 @@ kernel_cake_radix_topk_c8_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 cands_38[0] = b_lo <= keys_14[0] >> 21 && idxs_14[0] < vocab;
                 unsigned int m_56 = __ballot_sync(0xFFFFFFFF, cands_38[0]);
                 before_38 = before_38 + (unsigned int)__popc(m_56 & lt_mask_2_1);
-                total_38 = total_38 + (unsigned int)__popc(m_56);
+                total_39 = total_39 + (unsigned int)__popc(m_56);
                 unsigned int bits_86_1 = __as_u32(vals_b[25]);
                 unsigned int key_86_1 = ((bits_86_1 <= 2139095040) ? bits_86_1 : 0);
                 keys_14[1] = key_86_1;
@@ -70908,7 +70891,7 @@ kernel_cake_radix_topk_c8_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 cands_38[1] = b_lo <= keys_14[1] >> 21 && idxs_14[1] < vocab;
                 unsigned int m_57 = __ballot_sync(0xFFFFFFFF, cands_38[1]);
                 before_38 = before_38 + (unsigned int)__popc(m_57 & lt_mask_2_1);
-                total_38 = total_38 + (unsigned int)__popc(m_57);
+                total_39 = total_39 + (unsigned int)__popc(m_57);
                 unsigned int bits_87_1 = __as_u32(vals_b[26]);
                 unsigned int key_87_1 = ((bits_87_1 <= 2139095040) ? bits_87_1 : 0);
                 keys_14[2] = key_87_1;
@@ -70916,7 +70899,7 @@ kernel_cake_radix_topk_c8_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 cands_38[2] = b_lo <= keys_14[2] >> 21 && idxs_14[2] < vocab;
                 unsigned int m_58 = __ballot_sync(0xFFFFFFFF, cands_38[2]);
                 before_38 = before_38 + (unsigned int)__popc(m_58 & lt_mask_2_1);
-                total_38 = total_38 + (unsigned int)__popc(m_58);
+                total_39 = total_39 + (unsigned int)__popc(m_58);
                 unsigned int bits_88_1 = __as_u32(vals_b[27]);
                 unsigned int key_88_1 = ((bits_88_1 <= 2139095040) ? bits_88_1 : 0);
                 keys_14[3] = key_88_1;
@@ -70924,7 +70907,7 @@ kernel_cake_radix_topk_c8_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 cands_38[3] = b_lo <= keys_14[3] >> 21 && idxs_14[3] < vocab;
                 unsigned int m_59 = __ballot_sync(0xFFFFFFFF, cands_38[3]);
                 before_38 = before_38 + (unsigned int)__popc(m_59 & lt_mask_2_1);
-                total_38 = total_38 + (unsigned int)__popc(m_59);
+                total_39 = total_39 + (unsigned int)__popc(m_59);
                 unsigned int own_38 = 0;
                 unsigned int pos_155 = n_2_1 + before_38 + own_38;
                 if (cands_38[0] && pos_155 < 1024) {
@@ -70962,12 +70945,12 @@ kernel_cake_radix_topk_c8_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 if (cands_38[3]) {
                     own_38 = own_38 + 1;
                 }
-                n_2_1 = n_2_1 + total_38;
+                n_2_1 = n_2_1 + total_39;
                 unsigned int keys_15[4];
                 int idxs_15[4];
                 bool cands_39[4];
                 unsigned int before_39 = 0;
-                unsigned int total_39 = 0;
+                unsigned int total_40 = 0;
                 unsigned int bits_89_1 = __as_u32(vals_b[28]);
                 unsigned int key_89_1 = ((bits_89_1 <= 2139095040) ? bits_89_1 : 0);
                 keys_15[0] = key_89_1;
@@ -70975,7 +70958,7 @@ kernel_cake_radix_topk_c8_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 cands_39[0] = b_lo <= keys_15[0] >> 21 && idxs_15[0] < vocab;
                 unsigned int m_60 = __ballot_sync(0xFFFFFFFF, cands_39[0]);
                 before_39 = before_39 + (unsigned int)__popc(m_60 & lt_mask_2_1);
-                total_39 = total_39 + (unsigned int)__popc(m_60);
+                total_40 = total_40 + (unsigned int)__popc(m_60);
                 unsigned int bits_90_1 = __as_u32(vals_b[29]);
                 unsigned int key_90_1 = ((bits_90_1 <= 2139095040) ? bits_90_1 : 0);
                 keys_15[1] = key_90_1;
@@ -70983,7 +70966,7 @@ kernel_cake_radix_topk_c8_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 cands_39[1] = b_lo <= keys_15[1] >> 21 && idxs_15[1] < vocab;
                 unsigned int m_61 = __ballot_sync(0xFFFFFFFF, cands_39[1]);
                 before_39 = before_39 + (unsigned int)__popc(m_61 & lt_mask_2_1);
-                total_39 = total_39 + (unsigned int)__popc(m_61);
+                total_40 = total_40 + (unsigned int)__popc(m_61);
                 unsigned int bits_91_1 = __as_u32(vals_b[30]);
                 unsigned int key_91_1 = ((bits_91_1 <= 2139095040) ? bits_91_1 : 0);
                 keys_15[2] = key_91_1;
@@ -70991,7 +70974,7 @@ kernel_cake_radix_topk_c8_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 cands_39[2] = b_lo <= keys_15[2] >> 21 && idxs_15[2] < vocab;
                 unsigned int m_62 = __ballot_sync(0xFFFFFFFF, cands_39[2]);
                 before_39 = before_39 + (unsigned int)__popc(m_62 & lt_mask_2_1);
-                total_39 = total_39 + (unsigned int)__popc(m_62);
+                total_40 = total_40 + (unsigned int)__popc(m_62);
                 unsigned int bits_92_1 = __as_u32(vals_b[31]);
                 unsigned int key_92_1 = ((bits_92_1 <= 2139095040) ? bits_92_1 : 0);
                 keys_15[3] = key_92_1;
@@ -70999,7 +70982,7 @@ kernel_cake_radix_topk_c8_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 cands_39[3] = b_lo <= keys_15[3] >> 21 && idxs_15[3] < vocab;
                 unsigned int m_63 = __ballot_sync(0xFFFFFFFF, cands_39[3]);
                 before_39 = before_39 + (unsigned int)__popc(m_63 & lt_mask_2_1);
-                total_39 = total_39 + (unsigned int)__popc(m_63);
+                total_40 = total_40 + (unsigned int)__popc(m_63);
                 unsigned int own_39 = 0;
                 unsigned int pos_159 = n_2_1 + before_39 + own_39;
                 if (cands_39[0] && pos_159 < 1024) {
@@ -71037,7 +71020,7 @@ kernel_cake_radix_topk_c8_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 if (cands_39[3]) {
                     own_39 = own_39 + 1;
                 }
-                n_2_1 = n_2_1 + total_39;
+                n_2_1 = n_2_1 + total_40;
             } else {
                 unsigned int skeys_8[4];
                 int sidxs_8[4];
@@ -71942,7 +71925,7 @@ kernel_cake_radix_topk_c8_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                     int idxs_16[4];
                     bool cands_40[4];
                     unsigned int before_40 = 0;
-                    unsigned int total_40 = 0;
+                    unsigned int total_41 = 0;
                     unsigned int bits_164 = __as_u32(vals_a[0]);
                     unsigned int key_164 = ((bits_164 <= 2139095040) ? bits_164 : 0);
                     keys_16[0] = key_164;
@@ -71950,7 +71933,7 @@ kernel_cake_radix_topk_c8_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                     cands_40[0] = b_lo <= keys_16[0] >> 21 && idxs_16[0] < vocab;
                     unsigned int m_64 = __ballot_sync(0xFFFFFFFF, cands_40[0]);
                     before_40 = before_40 + (unsigned int)__popc(m_64 & lt_mask_3);
-                    total_40 = total_40 + (unsigned int)__popc(m_64);
+                    total_41 = total_41 + (unsigned int)__popc(m_64);
                     unsigned int bits_124_1 = __as_u32(vals_a[1]);
                     unsigned int key_124_1 = ((bits_124_1 <= 2139095040) ? bits_124_1 : 0);
                     keys_16[1] = key_124_1;
@@ -71958,7 +71941,7 @@ kernel_cake_radix_topk_c8_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                     cands_40[1] = b_lo <= keys_16[1] >> 21 && idxs_16[1] < vocab;
                     unsigned int m_65 = __ballot_sync(0xFFFFFFFF, cands_40[1]);
                     before_40 = before_40 + (unsigned int)__popc(m_65 & lt_mask_3);
-                    total_40 = total_40 + (unsigned int)__popc(m_65);
+                    total_41 = total_41 + (unsigned int)__popc(m_65);
                     unsigned int bits_125_1 = __as_u32(vals_a[2]);
                     unsigned int key_125_1 = ((bits_125_1 <= 2139095040) ? bits_125_1 : 0);
                     keys_16[2] = key_125_1;
@@ -71966,7 +71949,7 @@ kernel_cake_radix_topk_c8_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                     cands_40[2] = b_lo <= keys_16[2] >> 21 && idxs_16[2] < vocab;
                     unsigned int m_66 = __ballot_sync(0xFFFFFFFF, cands_40[2]);
                     before_40 = before_40 + (unsigned int)__popc(m_66 & lt_mask_3);
-                    total_40 = total_40 + (unsigned int)__popc(m_66);
+                    total_41 = total_41 + (unsigned int)__popc(m_66);
                     unsigned int bits_126_1 = __as_u32(vals_a[3]);
                     unsigned int key_126_1 = ((bits_126_1 <= 2139095040) ? bits_126_1 : 0);
                     keys_16[3] = key_126_1;
@@ -71974,7 +71957,7 @@ kernel_cake_radix_topk_c8_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                     cands_40[3] = b_lo <= keys_16[3] >> 21 && idxs_16[3] < vocab;
                     unsigned int m_67 = __ballot_sync(0xFFFFFFFF, cands_40[3]);
                     before_40 = before_40 + (unsigned int)__popc(m_67 & lt_mask_3);
-                    total_40 = total_40 + (unsigned int)__popc(m_67);
+                    total_41 = total_41 + (unsigned int)__popc(m_67);
                     unsigned int own_40 = 0;
                     unsigned int pos_163 = n_3 + before_40 + own_40;
                     if (cands_40[0] && pos_163 < 1024) {
@@ -72012,12 +71995,12 @@ kernel_cake_radix_topk_c8_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                     if (cands_40[3]) {
                         own_40 = own_40 + 1;
                     }
-                    n_3 = n_3 + total_40;
+                    n_3 = n_3 + total_41;
                     unsigned int keys_17[4];
                     int idxs_17[4];
                     bool cands_41[4];
                     unsigned int before_41 = 0;
-                    unsigned int total_41 = 0;
+                    unsigned int total_42 = 0;
                     unsigned int bits_127_1 = __as_u32(vals_a[4]);
                     unsigned int key_127_1 = ((bits_127_1 <= 2139095040) ? bits_127_1 : 0);
                     keys_17[0] = key_127_1;
@@ -72025,7 +72008,7 @@ kernel_cake_radix_topk_c8_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                     cands_41[0] = b_lo <= keys_17[0] >> 21 && idxs_17[0] < vocab;
                     unsigned int m_68 = __ballot_sync(0xFFFFFFFF, cands_41[0]);
                     before_41 = before_41 + (unsigned int)__popc(m_68 & lt_mask_3);
-                    total_41 = total_41 + (unsigned int)__popc(m_68);
+                    total_42 = total_42 + (unsigned int)__popc(m_68);
                     unsigned int bits_128_1 = __as_u32(vals_a[5]);
                     unsigned int key_128_1 = ((bits_128_1 <= 2139095040) ? bits_128_1 : 0);
                     keys_17[1] = key_128_1;
@@ -72033,7 +72016,7 @@ kernel_cake_radix_topk_c8_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                     cands_41[1] = b_lo <= keys_17[1] >> 21 && idxs_17[1] < vocab;
                     unsigned int m_69 = __ballot_sync(0xFFFFFFFF, cands_41[1]);
                     before_41 = before_41 + (unsigned int)__popc(m_69 & lt_mask_3);
-                    total_41 = total_41 + (unsigned int)__popc(m_69);
+                    total_42 = total_42 + (unsigned int)__popc(m_69);
                     unsigned int bits_129_1 = __as_u32(vals_a[6]);
                     unsigned int key_129_1 = ((bits_129_1 <= 2139095040) ? bits_129_1 : 0);
                     keys_17[2] = key_129_1;
@@ -72041,7 +72024,7 @@ kernel_cake_radix_topk_c8_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                     cands_41[2] = b_lo <= keys_17[2] >> 21 && idxs_17[2] < vocab;
                     unsigned int m_70 = __ballot_sync(0xFFFFFFFF, cands_41[2]);
                     before_41 = before_41 + (unsigned int)__popc(m_70 & lt_mask_3);
-                    total_41 = total_41 + (unsigned int)__popc(m_70);
+                    total_42 = total_42 + (unsigned int)__popc(m_70);
                     unsigned int bits_130_1 = __as_u32(vals_a[7]);
                     unsigned int key_130_1 = ((bits_130_1 <= 2139095040) ? bits_130_1 : 0);
                     keys_17[3] = key_130_1;
@@ -72049,7 +72032,7 @@ kernel_cake_radix_topk_c8_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                     cands_41[3] = b_lo <= keys_17[3] >> 21 && idxs_17[3] < vocab;
                     unsigned int m_71 = __ballot_sync(0xFFFFFFFF, cands_41[3]);
                     before_41 = before_41 + (unsigned int)__popc(m_71 & lt_mask_3);
-                    total_41 = total_41 + (unsigned int)__popc(m_71);
+                    total_42 = total_42 + (unsigned int)__popc(m_71);
                     unsigned int own_41 = 0;
                     unsigned int pos_167 = n_3 + before_41 + own_41;
                     if (cands_41[0] && pos_167 < 1024) {
@@ -72087,12 +72070,12 @@ kernel_cake_radix_topk_c8_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                     if (cands_41[3]) {
                         own_41 = own_41 + 1;
                     }
-                    n_3 = n_3 + total_41;
+                    n_3 = n_3 + total_42;
                     unsigned int keys_18[4];
                     int idxs_18[4];
                     bool cands_42[4];
                     unsigned int before_42 = 0;
-                    unsigned int total_42 = 0;
+                    unsigned int total_43 = 0;
                     unsigned int bits_131_1 = __as_u32(vals_a[8]);
                     unsigned int key_131_1 = ((bits_131_1 <= 2139095040) ? bits_131_1 : 0);
                     keys_18[0] = key_131_1;
@@ -72100,7 +72083,7 @@ kernel_cake_radix_topk_c8_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                     cands_42[0] = b_lo <= keys_18[0] >> 21 && idxs_18[0] < vocab;
                     unsigned int m_72 = __ballot_sync(0xFFFFFFFF, cands_42[0]);
                     before_42 = before_42 + (unsigned int)__popc(m_72 & lt_mask_3);
-                    total_42 = total_42 + (unsigned int)__popc(m_72);
+                    total_43 = total_43 + (unsigned int)__popc(m_72);
                     unsigned int bits_132_1 = __as_u32(vals_a[9]);
                     unsigned int key_132_1 = ((bits_132_1 <= 2139095040) ? bits_132_1 : 0);
                     keys_18[1] = key_132_1;
@@ -72108,7 +72091,7 @@ kernel_cake_radix_topk_c8_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                     cands_42[1] = b_lo <= keys_18[1] >> 21 && idxs_18[1] < vocab;
                     unsigned int m_73 = __ballot_sync(0xFFFFFFFF, cands_42[1]);
                     before_42 = before_42 + (unsigned int)__popc(m_73 & lt_mask_3);
-                    total_42 = total_42 + (unsigned int)__popc(m_73);
+                    total_43 = total_43 + (unsigned int)__popc(m_73);
                     unsigned int bits_133_1 = __as_u32(vals_a[10]);
                     unsigned int key_133_1 = ((bits_133_1 <= 2139095040) ? bits_133_1 : 0);
                     keys_18[2] = key_133_1;
@@ -72116,7 +72099,7 @@ kernel_cake_radix_topk_c8_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                     cands_42[2] = b_lo <= keys_18[2] >> 21 && idxs_18[2] < vocab;
                     unsigned int m_74 = __ballot_sync(0xFFFFFFFF, cands_42[2]);
                     before_42 = before_42 + (unsigned int)__popc(m_74 & lt_mask_3);
-                    total_42 = total_42 + (unsigned int)__popc(m_74);
+                    total_43 = total_43 + (unsigned int)__popc(m_74);
                     unsigned int bits_134_1 = __as_u32(vals_a[11]);
                     unsigned int key_134_1 = ((bits_134_1 <= 2139095040) ? bits_134_1 : 0);
                     keys_18[3] = key_134_1;
@@ -72124,7 +72107,7 @@ kernel_cake_radix_topk_c8_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                     cands_42[3] = b_lo <= keys_18[3] >> 21 && idxs_18[3] < vocab;
                     unsigned int m_75 = __ballot_sync(0xFFFFFFFF, cands_42[3]);
                     before_42 = before_42 + (unsigned int)__popc(m_75 & lt_mask_3);
-                    total_42 = total_42 + (unsigned int)__popc(m_75);
+                    total_43 = total_43 + (unsigned int)__popc(m_75);
                     unsigned int own_42 = 0;
                     unsigned int pos_171 = n_3 + before_42 + own_42;
                     if (cands_42[0] && pos_171 < 1024) {
@@ -72162,12 +72145,12 @@ kernel_cake_radix_topk_c8_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                     if (cands_42[3]) {
                         own_42 = own_42 + 1;
                     }
-                    n_3 = n_3 + total_42;
+                    n_3 = n_3 + total_43;
                     unsigned int keys_19[4];
                     int idxs_19[4];
                     bool cands_43[4];
                     unsigned int before_43 = 0;
-                    unsigned int total_43 = 0;
+                    unsigned int total_44 = 0;
                     unsigned int bits_135_1 = __as_u32(vals_a[12]);
                     unsigned int key_135_1 = ((bits_135_1 <= 2139095040) ? bits_135_1 : 0);
                     keys_19[0] = key_135_1;
@@ -72175,7 +72158,7 @@ kernel_cake_radix_topk_c8_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                     cands_43[0] = b_lo <= keys_19[0] >> 21 && idxs_19[0] < vocab;
                     unsigned int m_76 = __ballot_sync(0xFFFFFFFF, cands_43[0]);
                     before_43 = before_43 + (unsigned int)__popc(m_76 & lt_mask_3);
-                    total_43 = total_43 + (unsigned int)__popc(m_76);
+                    total_44 = total_44 + (unsigned int)__popc(m_76);
                     unsigned int bits_136_1 = __as_u32(vals_a[13]);
                     unsigned int key_136_1 = ((bits_136_1 <= 2139095040) ? bits_136_1 : 0);
                     keys_19[1] = key_136_1;
@@ -72183,7 +72166,7 @@ kernel_cake_radix_topk_c8_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                     cands_43[1] = b_lo <= keys_19[1] >> 21 && idxs_19[1] < vocab;
                     unsigned int m_77 = __ballot_sync(0xFFFFFFFF, cands_43[1]);
                     before_43 = before_43 + (unsigned int)__popc(m_77 & lt_mask_3);
-                    total_43 = total_43 + (unsigned int)__popc(m_77);
+                    total_44 = total_44 + (unsigned int)__popc(m_77);
                     unsigned int bits_137_1 = __as_u32(vals_a[14]);
                     unsigned int key_137_1 = ((bits_137_1 <= 2139095040) ? bits_137_1 : 0);
                     keys_19[2] = key_137_1;
@@ -72191,7 +72174,7 @@ kernel_cake_radix_topk_c8_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                     cands_43[2] = b_lo <= keys_19[2] >> 21 && idxs_19[2] < vocab;
                     unsigned int m_78 = __ballot_sync(0xFFFFFFFF, cands_43[2]);
                     before_43 = before_43 + (unsigned int)__popc(m_78 & lt_mask_3);
-                    total_43 = total_43 + (unsigned int)__popc(m_78);
+                    total_44 = total_44 + (unsigned int)__popc(m_78);
                     unsigned int bits_138_1 = __as_u32(vals_a[15]);
                     unsigned int key_138_1 = ((bits_138_1 <= 2139095040) ? bits_138_1 : 0);
                     keys_19[3] = key_138_1;
@@ -72199,7 +72182,7 @@ kernel_cake_radix_topk_c8_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                     cands_43[3] = b_lo <= keys_19[3] >> 21 && idxs_19[3] < vocab;
                     unsigned int m_79 = __ballot_sync(0xFFFFFFFF, cands_43[3]);
                     before_43 = before_43 + (unsigned int)__popc(m_79 & lt_mask_3);
-                    total_43 = total_43 + (unsigned int)__popc(m_79);
+                    total_44 = total_44 + (unsigned int)__popc(m_79);
                     unsigned int own_43 = 0;
                     unsigned int pos_175 = n_3 + before_43 + own_43;
                     if (cands_43[0] && pos_175 < 1024) {
@@ -72237,12 +72220,12 @@ kernel_cake_radix_topk_c8_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                     if (cands_43[3]) {
                         own_43 = own_43 + 1;
                     }
-                    n_3 = n_3 + total_43;
+                    n_3 = n_3 + total_44;
                     unsigned int keys_20[4];
                     int idxs_20[4];
                     bool cands_44[4];
                     unsigned int before_44 = 0;
-                    unsigned int total_44 = 0;
+                    unsigned int total_45 = 0;
                     unsigned int bits_139_1 = __as_u32(vals_a[16]);
                     unsigned int key_139_1 = ((bits_139_1 <= 2139095040) ? bits_139_1 : 0);
                     keys_20[0] = key_139_1;
@@ -72250,7 +72233,7 @@ kernel_cake_radix_topk_c8_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                     cands_44[0] = b_lo <= keys_20[0] >> 21 && idxs_20[0] < vocab;
                     unsigned int m_80 = __ballot_sync(0xFFFFFFFF, cands_44[0]);
                     before_44 = before_44 + (unsigned int)__popc(m_80 & lt_mask_3);
-                    total_44 = total_44 + (unsigned int)__popc(m_80);
+                    total_45 = total_45 + (unsigned int)__popc(m_80);
                     unsigned int bits_140_1 = __as_u32(vals_a[17]);
                     unsigned int key_140_1 = ((bits_140_1 <= 2139095040) ? bits_140_1 : 0);
                     keys_20[1] = key_140_1;
@@ -72258,7 +72241,7 @@ kernel_cake_radix_topk_c8_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                     cands_44[1] = b_lo <= keys_20[1] >> 21 && idxs_20[1] < vocab;
                     unsigned int m_81 = __ballot_sync(0xFFFFFFFF, cands_44[1]);
                     before_44 = before_44 + (unsigned int)__popc(m_81 & lt_mask_3);
-                    total_44 = total_44 + (unsigned int)__popc(m_81);
+                    total_45 = total_45 + (unsigned int)__popc(m_81);
                     unsigned int bits_141_1 = __as_u32(vals_a[18]);
                     unsigned int key_141_1 = ((bits_141_1 <= 2139095040) ? bits_141_1 : 0);
                     keys_20[2] = key_141_1;
@@ -72266,7 +72249,7 @@ kernel_cake_radix_topk_c8_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                     cands_44[2] = b_lo <= keys_20[2] >> 21 && idxs_20[2] < vocab;
                     unsigned int m_82 = __ballot_sync(0xFFFFFFFF, cands_44[2]);
                     before_44 = before_44 + (unsigned int)__popc(m_82 & lt_mask_3);
-                    total_44 = total_44 + (unsigned int)__popc(m_82);
+                    total_45 = total_45 + (unsigned int)__popc(m_82);
                     unsigned int bits_142_1 = __as_u32(vals_a[19]);
                     unsigned int key_142_1 = ((bits_142_1 <= 2139095040) ? bits_142_1 : 0);
                     keys_20[3] = key_142_1;
@@ -72274,7 +72257,7 @@ kernel_cake_radix_topk_c8_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                     cands_44[3] = b_lo <= keys_20[3] >> 21 && idxs_20[3] < vocab;
                     unsigned int m_83 = __ballot_sync(0xFFFFFFFF, cands_44[3]);
                     before_44 = before_44 + (unsigned int)__popc(m_83 & lt_mask_3);
-                    total_44 = total_44 + (unsigned int)__popc(m_83);
+                    total_45 = total_45 + (unsigned int)__popc(m_83);
                     unsigned int own_44 = 0;
                     unsigned int pos_179 = n_3 + before_44 + own_44;
                     if (cands_44[0] && pos_179 < 1024) {
@@ -72312,12 +72295,12 @@ kernel_cake_radix_topk_c8_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                     if (cands_44[3]) {
                         own_44 = own_44 + 1;
                     }
-                    n_3 = n_3 + total_44;
+                    n_3 = n_3 + total_45;
                     unsigned int keys_21[4];
                     int idxs_21[4];
                     bool cands_45[4];
                     unsigned int before_45 = 0;
-                    unsigned int total_45 = 0;
+                    unsigned int total_46 = 0;
                     unsigned int bits_143_1 = __as_u32(vals_a[20]);
                     unsigned int key_143_1 = ((bits_143_1 <= 2139095040) ? bits_143_1 : 0);
                     keys_21[0] = key_143_1;
@@ -72325,7 +72308,7 @@ kernel_cake_radix_topk_c8_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                     cands_45[0] = b_lo <= keys_21[0] >> 21 && idxs_21[0] < vocab;
                     unsigned int m_84 = __ballot_sync(0xFFFFFFFF, cands_45[0]);
                     before_45 = before_45 + (unsigned int)__popc(m_84 & lt_mask_3);
-                    total_45 = total_45 + (unsigned int)__popc(m_84);
+                    total_46 = total_46 + (unsigned int)__popc(m_84);
                     unsigned int bits_144_1 = __as_u32(vals_a[21]);
                     unsigned int key_144_1 = ((bits_144_1 <= 2139095040) ? bits_144_1 : 0);
                     keys_21[1] = key_144_1;
@@ -72333,7 +72316,7 @@ kernel_cake_radix_topk_c8_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                     cands_45[1] = b_lo <= keys_21[1] >> 21 && idxs_21[1] < vocab;
                     unsigned int m_85 = __ballot_sync(0xFFFFFFFF, cands_45[1]);
                     before_45 = before_45 + (unsigned int)__popc(m_85 & lt_mask_3);
-                    total_45 = total_45 + (unsigned int)__popc(m_85);
+                    total_46 = total_46 + (unsigned int)__popc(m_85);
                     unsigned int bits_145_1 = __as_u32(vals_a[22]);
                     unsigned int key_145_1 = ((bits_145_1 <= 2139095040) ? bits_145_1 : 0);
                     keys_21[2] = key_145_1;
@@ -72341,7 +72324,7 @@ kernel_cake_radix_topk_c8_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                     cands_45[2] = b_lo <= keys_21[2] >> 21 && idxs_21[2] < vocab;
                     unsigned int m_86 = __ballot_sync(0xFFFFFFFF, cands_45[2]);
                     before_45 = before_45 + (unsigned int)__popc(m_86 & lt_mask_3);
-                    total_45 = total_45 + (unsigned int)__popc(m_86);
+                    total_46 = total_46 + (unsigned int)__popc(m_86);
                     unsigned int bits_146_1 = __as_u32(vals_a[23]);
                     unsigned int key_146_1 = ((bits_146_1 <= 2139095040) ? bits_146_1 : 0);
                     keys_21[3] = key_146_1;
@@ -72349,7 +72332,7 @@ kernel_cake_radix_topk_c8_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                     cands_45[3] = b_lo <= keys_21[3] >> 21 && idxs_21[3] < vocab;
                     unsigned int m_87 = __ballot_sync(0xFFFFFFFF, cands_45[3]);
                     before_45 = before_45 + (unsigned int)__popc(m_87 & lt_mask_3);
-                    total_45 = total_45 + (unsigned int)__popc(m_87);
+                    total_46 = total_46 + (unsigned int)__popc(m_87);
                     unsigned int own_45 = 0;
                     unsigned int pos_183 = n_3 + before_45 + own_45;
                     if (cands_45[0] && pos_183 < 1024) {
@@ -72387,12 +72370,12 @@ kernel_cake_radix_topk_c8_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                     if (cands_45[3]) {
                         own_45 = own_45 + 1;
                     }
-                    n_3 = n_3 + total_45;
+                    n_3 = n_3 + total_46;
                     unsigned int keys_22[4];
                     int idxs_22[4];
                     bool cands_46[4];
                     unsigned int before_46 = 0;
-                    unsigned int total_46 = 0;
+                    unsigned int total_47 = 0;
                     unsigned int bits_147_1 = __as_u32(vals_a[24]);
                     unsigned int key_147_1 = ((bits_147_1 <= 2139095040) ? bits_147_1 : 0);
                     keys_22[0] = key_147_1;
@@ -72400,7 +72383,7 @@ kernel_cake_radix_topk_c8_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                     cands_46[0] = b_lo <= keys_22[0] >> 21 && idxs_22[0] < vocab;
                     unsigned int m_88 = __ballot_sync(0xFFFFFFFF, cands_46[0]);
                     before_46 = before_46 + (unsigned int)__popc(m_88 & lt_mask_3);
-                    total_46 = total_46 + (unsigned int)__popc(m_88);
+                    total_47 = total_47 + (unsigned int)__popc(m_88);
                     unsigned int bits_148_1 = __as_u32(vals_a[25]);
                     unsigned int key_148_1 = ((bits_148_1 <= 2139095040) ? bits_148_1 : 0);
                     keys_22[1] = key_148_1;
@@ -72408,7 +72391,7 @@ kernel_cake_radix_topk_c8_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                     cands_46[1] = b_lo <= keys_22[1] >> 21 && idxs_22[1] < vocab;
                     unsigned int m_89 = __ballot_sync(0xFFFFFFFF, cands_46[1]);
                     before_46 = before_46 + (unsigned int)__popc(m_89 & lt_mask_3);
-                    total_46 = total_46 + (unsigned int)__popc(m_89);
+                    total_47 = total_47 + (unsigned int)__popc(m_89);
                     unsigned int bits_149_1 = __as_u32(vals_a[26]);
                     unsigned int key_149_1 = ((bits_149_1 <= 2139095040) ? bits_149_1 : 0);
                     keys_22[2] = key_149_1;
@@ -72416,7 +72399,7 @@ kernel_cake_radix_topk_c8_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                     cands_46[2] = b_lo <= keys_22[2] >> 21 && idxs_22[2] < vocab;
                     unsigned int m_90 = __ballot_sync(0xFFFFFFFF, cands_46[2]);
                     before_46 = before_46 + (unsigned int)__popc(m_90 & lt_mask_3);
-                    total_46 = total_46 + (unsigned int)__popc(m_90);
+                    total_47 = total_47 + (unsigned int)__popc(m_90);
                     unsigned int bits_150_1 = __as_u32(vals_a[27]);
                     unsigned int key_150_1 = ((bits_150_1 <= 2139095040) ? bits_150_1 : 0);
                     keys_22[3] = key_150_1;
@@ -72424,7 +72407,7 @@ kernel_cake_radix_topk_c8_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                     cands_46[3] = b_lo <= keys_22[3] >> 21 && idxs_22[3] < vocab;
                     unsigned int m_91 = __ballot_sync(0xFFFFFFFF, cands_46[3]);
                     before_46 = before_46 + (unsigned int)__popc(m_91 & lt_mask_3);
-                    total_46 = total_46 + (unsigned int)__popc(m_91);
+                    total_47 = total_47 + (unsigned int)__popc(m_91);
                     unsigned int own_46 = 0;
                     unsigned int pos_187 = n_3 + before_46 + own_46;
                     if (cands_46[0] && pos_187 < 1024) {
@@ -72462,12 +72445,12 @@ kernel_cake_radix_topk_c8_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                     if (cands_46[3]) {
                         own_46 = own_46 + 1;
                     }
-                    n_3 = n_3 + total_46;
+                    n_3 = n_3 + total_47;
                     unsigned int keys_23[4];
                     int idxs_23[4];
                     bool cands_47[4];
                     unsigned int before_47 = 0;
-                    unsigned int total_47 = 0;
+                    unsigned int total_48 = 0;
                     unsigned int bits_151_1 = __as_u32(vals_a[28]);
                     unsigned int key_151_1 = ((bits_151_1 <= 2139095040) ? bits_151_1 : 0);
                     keys_23[0] = key_151_1;
@@ -72475,7 +72458,7 @@ kernel_cake_radix_topk_c8_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                     cands_47[0] = b_lo <= keys_23[0] >> 21 && idxs_23[0] < vocab;
                     unsigned int m_92 = __ballot_sync(0xFFFFFFFF, cands_47[0]);
                     before_47 = before_47 + (unsigned int)__popc(m_92 & lt_mask_3);
-                    total_47 = total_47 + (unsigned int)__popc(m_92);
+                    total_48 = total_48 + (unsigned int)__popc(m_92);
                     unsigned int bits_152_1 = __as_u32(vals_a[29]);
                     unsigned int key_152_1 = ((bits_152_1 <= 2139095040) ? bits_152_1 : 0);
                     keys_23[1] = key_152_1;
@@ -72483,7 +72466,7 @@ kernel_cake_radix_topk_c8_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                     cands_47[1] = b_lo <= keys_23[1] >> 21 && idxs_23[1] < vocab;
                     unsigned int m_93 = __ballot_sync(0xFFFFFFFF, cands_47[1]);
                     before_47 = before_47 + (unsigned int)__popc(m_93 & lt_mask_3);
-                    total_47 = total_47 + (unsigned int)__popc(m_93);
+                    total_48 = total_48 + (unsigned int)__popc(m_93);
                     unsigned int bits_153_1 = __as_u32(vals_a[30]);
                     unsigned int key_153_1 = ((bits_153_1 <= 2139095040) ? bits_153_1 : 0);
                     keys_23[2] = key_153_1;
@@ -72491,7 +72474,7 @@ kernel_cake_radix_topk_c8_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                     cands_47[2] = b_lo <= keys_23[2] >> 21 && idxs_23[2] < vocab;
                     unsigned int m_94 = __ballot_sync(0xFFFFFFFF, cands_47[2]);
                     before_47 = before_47 + (unsigned int)__popc(m_94 & lt_mask_3);
-                    total_47 = total_47 + (unsigned int)__popc(m_94);
+                    total_48 = total_48 + (unsigned int)__popc(m_94);
                     unsigned int bits_154_1 = __as_u32(vals_a[31]);
                     unsigned int key_154_1 = ((bits_154_1 <= 2139095040) ? bits_154_1 : 0);
                     keys_23[3] = key_154_1;
@@ -72499,7 +72482,7 @@ kernel_cake_radix_topk_c8_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                     cands_47[3] = b_lo <= keys_23[3] >> 21 && idxs_23[3] < vocab;
                     unsigned int m_95 = __ballot_sync(0xFFFFFFFF, cands_47[3]);
                     before_47 = before_47 + (unsigned int)__popc(m_95 & lt_mask_3);
-                    total_47 = total_47 + (unsigned int)__popc(m_95);
+                    total_48 = total_48 + (unsigned int)__popc(m_95);
                     unsigned int own_47 = 0;
                     unsigned int pos_191 = n_3 + before_47 + own_47;
                     if (cands_47[0] && pos_191 < 1024) {
@@ -72537,7 +72520,7 @@ kernel_cake_radix_topk_c8_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                     if (cands_47[3]) {
                         own_47 = own_47 + 1;
                     }
-                    n_3 = n_3 + total_47;
+                    n_3 = n_3 + total_48;
                 } else {
                     unsigned int skeys_16[4];
                     int sidxs_16[4];
@@ -73091,85 +73074,85 @@ kernel_cake_radix_topk_c8_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
     __syncthreads();
     unsigned int before = 0;
     unsigned int total = 0;
-    unsigned int v_0 = scal[16];
-    total = total + v_0;
-    if (warp > 0) {
-        before = before + v_0;
-    }
-    unsigned int v_1 = scal[17];
+    unsigned int v_1 = scal[16];
     total = total + v_1;
-    if (warp > 1) {
+    if (warp > 0) {
         before = before + v_1;
     }
-    unsigned int v_2 = scal[18];
+    unsigned int v_2 = scal[17];
     total = total + v_2;
-    if (warp > 2) {
+    if (warp > 1) {
         before = before + v_2;
     }
-    unsigned int v_3 = scal[19];
+    unsigned int v_3 = scal[18];
     total = total + v_3;
-    if (warp > 3) {
+    if (warp > 2) {
         before = before + v_3;
     }
-    unsigned int v_4 = scal[20];
+    unsigned int v_4 = scal[19];
     total = total + v_4;
-    if (warp > 4) {
+    if (warp > 3) {
         before = before + v_4;
     }
-    unsigned int v_5 = scal[21];
+    unsigned int v_5 = scal[20];
     total = total + v_5;
-    if (warp > 5) {
+    if (warp > 4) {
         before = before + v_5;
     }
-    unsigned int v_6 = scal[22];
+    unsigned int v_6 = scal[21];
     total = total + v_6;
-    if (warp > 6) {
+    if (warp > 5) {
         before = before + v_6;
     }
-    unsigned int v_7 = scal[23];
+    unsigned int v_7 = scal[22];
     total = total + v_7;
-    if (warp > 7) {
+    if (warp > 6) {
         before = before + v_7;
     }
-    unsigned int v_8 = scal[24];
+    unsigned int v_8 = scal[23];
     total = total + v_8;
-    if (warp > 8) {
+    if (warp > 7) {
         before = before + v_8;
     }
-    unsigned int v_9 = scal[25];
+    unsigned int v_9 = scal[24];
     total = total + v_9;
-    if (warp > 9) {
+    if (warp > 8) {
         before = before + v_9;
     }
-    unsigned int v_10 = scal[26];
+    unsigned int v_10 = scal[25];
     total = total + v_10;
-    if (warp > 10) {
+    if (warp > 9) {
         before = before + v_10;
     }
-    unsigned int v_11 = scal[27];
+    unsigned int v_11 = scal[26];
     total = total + v_11;
-    if (warp > 11) {
+    if (warp > 10) {
         before = before + v_11;
     }
-    unsigned int v_12 = scal[28];
+    unsigned int v_12 = scal[27];
     total = total + v_12;
-    if (warp > 12) {
+    if (warp > 11) {
         before = before + v_12;
     }
-    unsigned int v_13 = scal[29];
+    unsigned int v_13 = scal[28];
     total = total + v_13;
-    if (warp > 13) {
+    if (warp > 12) {
         before = before + v_13;
     }
-    unsigned int v_14 = scal[30];
+    unsigned int v_14 = scal[29];
     total = total + v_14;
-    if (warp > 14) {
+    if (warp > 13) {
         before = before + v_14;
     }
-    unsigned int v_15 = scal[31];
+    unsigned int v_15 = scal[30];
     total = total + v_15;
-    if (warp > 15) {
+    if (warp > 14) {
         before = before + v_15;
+    }
+    unsigned int v_16 = scal[31];
+    total = total + v_16;
+    if (warp > 15) {
+        before = before + v_16;
     }
     unsigned int ovf_w = __ballot_sync(0xFFFFFFFF, n_wu > 1024);
     if (tid == 0) {
@@ -73501,24 +73484,24 @@ kernel_cake_radix_topk_c8_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 }
                 acc_1_3 = acc_1_3 + lens[7];
             }
-            unsigned long long c_0 = comps_l[0];
-            if (c_0 < 9214364837600034816) {
-                unsigned int bucket_64 = (unsigned int)(c_0 >> 53);
+            unsigned long long c_1_1 = comps_l[0];
+            if (c_1_1 < 9214364837600034816) {
+                unsigned int bucket_64 = (unsigned int)(c_1_1 >> 53);
                 atomicAdd(&hist1[bucket_64], 1);
             }
-            unsigned long long c_1_1 = comps_l[1];
-            if (c_1_1 < 9214364837600034816) {
-                unsigned int bucket_65 = (unsigned int)(c_1_1 >> 53);
+            unsigned long long c_2 = comps_l[1];
+            if (c_2 < 9214364837600034816) {
+                unsigned int bucket_65 = (unsigned int)(c_2 >> 53);
                 atomicAdd(&hist1[bucket_65], 1);
             }
-            unsigned long long c_2 = comps_l[2];
-            if (c_2 < 9214364837600034816) {
-                unsigned int bucket_66 = (unsigned int)(c_2 >> 53);
+            unsigned long long c_3 = comps_l[2];
+            if (c_3 < 9214364837600034816) {
+                unsigned int bucket_66 = (unsigned int)(c_3 >> 53);
                 atomicAdd(&hist1[bucket_66], 1);
             }
-            unsigned long long c_3 = comps_l[3];
-            if (c_3 < 9214364837600034816) {
-                unsigned int bucket_67 = (unsigned int)(c_3 >> 53);
+            unsigned long long c_4 = comps_l[3];
+            if (c_4 < 9214364837600034816) {
+                unsigned int bucket_67 = (unsigned int)(c_4 >> 53);
                 atomicAdd(&hist1[bucket_67], 1);
             }
             for (int i_48 = tid; i_48 < 2048; i_48 += 512) {
@@ -73597,24 +73580,24 @@ kernel_cake_radix_topk_c8_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 done = 1;
             }
             if (done == 0) {
-                unsigned long long c_4 = comps_l[0];
-                unsigned int bucket_69 = (unsigned int)(c_4 >> 42 & 2047);
-                if (c_4 >> 53 == (unsigned long long)bucket_68) {
+                unsigned long long c_5 = comps_l[0];
+                unsigned int bucket_69 = (unsigned int)(c_5 >> 42 & 2047);
+                if (c_5 >> 53 == (unsigned long long)bucket_68) {
                     atomicAdd(&hist0[bucket_69], 1);
                 }
-                unsigned long long c_5 = comps_l[1];
-                unsigned int bucket_70 = (unsigned int)(c_5 >> 42 & 2047);
-                if (c_5 >> 53 == (unsigned long long)bucket_68) {
+                unsigned long long c_6 = comps_l[1];
+                unsigned int bucket_70 = (unsigned int)(c_6 >> 42 & 2047);
+                if (c_6 >> 53 == (unsigned long long)bucket_68) {
                     atomicAdd(&hist0[bucket_70], 1);
                 }
-                unsigned long long c_6 = comps_l[2];
-                unsigned int bucket_71 = (unsigned int)(c_6 >> 42 & 2047);
-                if (c_6 >> 53 == (unsigned long long)bucket_68) {
+                unsigned long long c_7 = comps_l[2];
+                unsigned int bucket_71 = (unsigned int)(c_7 >> 42 & 2047);
+                if (c_7 >> 53 == (unsigned long long)bucket_68) {
                     atomicAdd(&hist0[bucket_71], 1);
                 }
-                unsigned long long c_7 = comps_l[3];
-                unsigned int bucket_72 = (unsigned int)(c_7 >> 42 & 2047);
-                if (c_7 >> 53 == (unsigned long long)bucket_68) {
+                unsigned long long c_8 = comps_l[3];
+                unsigned int bucket_72 = (unsigned int)(c_8 >> 42 & 2047);
+                if (c_8 >> 53 == (unsigned long long)bucket_68) {
                     atomicAdd(&hist0[bucket_72], 1);
                 }
                 for (int i_49 = tid; i_49 < 2048; i_49 += 512) {
@@ -73692,24 +73675,24 @@ kernel_cake_radix_topk_c8_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                     done = 1;
                 }
                 if (done == 0) {
-                    unsigned long long c_8 = comps_l[0];
-                    unsigned int bucket_75 = (unsigned int)(c_8 >> 32 & 1023);
-                    if (c_8 >> 42 == prefix1) {
+                    unsigned long long c_9 = comps_l[0];
+                    unsigned int bucket_75 = (unsigned int)(c_9 >> 32 & 1023);
+                    if (c_9 >> 42 == prefix1) {
                         atomicAdd(&hist1[bucket_75], 1);
                     }
-                    unsigned long long c_9 = comps_l[1];
-                    unsigned int bucket_76 = (unsigned int)(c_9 >> 32 & 1023);
-                    if (c_9 >> 42 == prefix1) {
+                    unsigned long long c_10 = comps_l[1];
+                    unsigned int bucket_76 = (unsigned int)(c_10 >> 32 & 1023);
+                    if (c_10 >> 42 == prefix1) {
                         atomicAdd(&hist1[bucket_76], 1);
                     }
-                    unsigned long long c_10 = comps_l[2];
-                    unsigned int bucket_77 = (unsigned int)(c_10 >> 32 & 1023);
-                    if (c_10 >> 42 == prefix1) {
+                    unsigned long long c_11 = comps_l[2];
+                    unsigned int bucket_77 = (unsigned int)(c_11 >> 32 & 1023);
+                    if (c_11 >> 42 == prefix1) {
                         atomicAdd(&hist1[bucket_77], 1);
                     }
-                    unsigned long long c_11 = comps_l[3];
-                    unsigned int bucket_78 = (unsigned int)(c_11 >> 32 & 1023);
-                    if (c_11 >> 42 == prefix1) {
+                    unsigned long long c_12 = comps_l[3];
+                    unsigned int bucket_78 = (unsigned int)(c_12 >> 32 & 1023);
+                    if (c_12 >> 42 == prefix1) {
                         atomicAdd(&hist1[bucket_78], 1);
                     }
                     for (int i_50 = tid; i_50 < 2048; i_50 += 512) {
@@ -73795,24 +73778,24 @@ kernel_cake_radix_topk_c8_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                             unsigned long long mask_1 = (1 << (unsigned long long)nbits) - 1;
                             unsigned long long sh = (unsigned long long)shift;
                             unsigned long long hi = (unsigned long long)(shift + nbits);
-                            unsigned long long c_12 = comps_l[0];
-                            unsigned int bucket_81 = (unsigned int)(c_12 >> sh & mask_1);
-                            if (c_12 >> hi == tpre) {
+                            unsigned long long c_13 = comps_l[0];
+                            unsigned int bucket_81 = (unsigned int)(c_13 >> sh & mask_1);
+                            if (c_13 >> hi == tpre) {
                                 atomicAdd(&hist0[bucket_81], 1);
                             }
-                            unsigned long long c_13 = comps_l[1];
-                            unsigned int bucket_82 = (unsigned int)(c_13 >> sh & mask_1);
-                            if (c_13 >> hi == tpre) {
+                            unsigned long long c_14 = comps_l[1];
+                            unsigned int bucket_82 = (unsigned int)(c_14 >> sh & mask_1);
+                            if (c_14 >> hi == tpre) {
                                 atomicAdd(&hist0[bucket_82], 1);
                             }
-                            unsigned long long c_14 = comps_l[2];
-                            unsigned int bucket_83 = (unsigned int)(c_14 >> sh & mask_1);
-                            if (c_14 >> hi == tpre) {
+                            unsigned long long c_15 = comps_l[2];
+                            unsigned int bucket_83 = (unsigned int)(c_15 >> sh & mask_1);
+                            if (c_15 >> hi == tpre) {
                                 atomicAdd(&hist0[bucket_83], 1);
                             }
-                            unsigned long long c_15 = comps_l[3];
-                            unsigned int bucket_84 = (unsigned int)(c_15 >> sh & mask_1);
-                            if (c_15 >> hi == tpre) {
+                            unsigned long long c_16 = comps_l[3];
+                            unsigned int bucket_84 = (unsigned int)(c_16 >> sh & mask_1);
+                            if (c_16 >> hi == tpre) {
                                 atomicAdd(&hist0[bucket_84], 1);
                             }
                             __syncthreads();
@@ -74562,10 +74545,10 @@ kernel_cake_radix_topk_c8_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(owner_3) : "r"(((is_owner_3 != 0) ? (unsigned int)lane : 0)));
                 unsigned int found_3;
                 asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(found_3) : "r"(is_owner_3));
-                unsigned int pos_b_3 = __shfl_sync(0xFFFFFFFF, pos_195, owner_3);
-                unsigned int rem_b_3 = __shfl_sync(0xFFFFFFFF, rem_after_3, owner_3);
+                unsigned int pos_b_1 = __shfl_sync(0xFFFFFFFF, pos_195, owner_3);
+                unsigned int rem_b_1 = __shfl_sync(0xFFFFFFFF, rem_after_3, owner_3);
                 unsigned int cnt_b_4 = __shfl_sync(0xFFFFFFFF, cnt_8, owner_3);
-                unsigned int lo_b_3 = __shfl_sync(0xFFFFFFFF, lo_sel_3, owner_3);
+                unsigned int lo_b_1 = __shfl_sync(0xFFFFFFFF, lo_sel_3, owner_3);
                 unsigned int ff_1[4];
                 unsigned int lf_1[4];
                 ff_1[0] = 0;
@@ -74577,7 +74560,7 @@ kernel_cake_radix_topk_c8_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 ff_1[3] = 0;
                 lf_1[3] = 0;
                 int quad_1 = lane & 3;
-                int off_1 = ((int)pos_b_3 * 16 + quad_1 * 4) * 4;
+                int off_1 = ((int)pos_b_1 * 16 + quad_1 * 4) * 4;
                 int r_4 = lane >> 2;
                 if (r_4 < 8) {
                     unsigned int words_48[4];
@@ -74678,30 +74661,30 @@ kernel_cake_radix_topk_c8_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 unsigned int rem_after_3_1 = 0;
                 unsigned int cnt_9 = 0;
                 unsigned int lo_sel_3_1 = 0;
-                if (above_6_1 < rem_b_3 && rem_b_3 <= above_6_1 + local_10) {
+                if (above_6_1 < rem_b_1 && rem_b_1 <= above_6_1 + local_10) {
                     is_owner_3_1 = 1;
                     unsigned int s3_9 = above_6_1 + ff_1[3];
                     unsigned int s2_9 = s3_9 + ff_1[2];
                     unsigned int s1_9 = s2_9 + ff_1[1];
-                    if (rem_b_3 <= s3_9) {
+                    if (rem_b_1 <= s3_9) {
                         pos_195_1 = (unsigned int)(lane * 4 + 3);
-                        rem_after_3_1 = rem_b_3 - above_6_1;
+                        rem_after_3_1 = rem_b_1 - above_6_1;
                         cnt_9 = ff_1[3];
                         lo_sel_3_1 = lo_above_3_1;
-                    } else if (rem_b_3 <= s2_9) {
+                    } else if (rem_b_1 <= s2_9) {
                         pos_195_1 = (unsigned int)(lane * 4 + 2);
-                        rem_after_3_1 = rem_b_3 - s3_9;
+                        rem_after_3_1 = rem_b_1 - s3_9;
                         cnt_9 = ff_1[2];
                         lo_sel_3_1 = lo_above_3_1 + lf_1[3];
                     } else {
-                        if (rem_b_3 <= s1_9) {
+                        if (rem_b_1 <= s1_9) {
                             pos_195_1 = (unsigned int)(lane * 4 + 1);
-                            rem_after_3_1 = rem_b_3 - s2_9;
+                            rem_after_3_1 = rem_b_1 - s2_9;
                             cnt_9 = ff_1[1];
                             lo_sel_3_1 = lo_above_3_1 + lf_1[3] + lf_1[2];
                         } else {
                             pos_195_1 = (unsigned int)(lane * 4);
-                            rem_after_3_1 = rem_b_3 - s1_9;
+                            rem_after_3_1 = rem_b_1 - s1_9;
                             cnt_9 = ff_1[0];
                             lo_sel_3_1 = lo_above_3_1 + lf_1[3] + lf_1[2] + lf_1[1];
                         }
@@ -74711,15 +74694,15 @@ kernel_cake_radix_topk_c8_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(owner_3_1) : "r"(((is_owner_3_1 != 0) ? (unsigned int)lane : 0)));
                 unsigned int found_3_1;
                 asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(found_3_1) : "r"(is_owner_3_1));
-                unsigned int pos_b_3_1 = __shfl_sync(0xFFFFFFFF, pos_195_1, owner_3_1);
-                unsigned int rem_b_3_1 = __shfl_sync(0xFFFFFFFF, rem_after_3_1, owner_3_1);
+                unsigned int pos_b_4 = __shfl_sync(0xFFFFFFFF, pos_195_1, owner_3_1);
+                unsigned int rem_b_4 = __shfl_sync(0xFFFFFFFF, rem_after_3_1, owner_3_1);
                 unsigned int cnt_b_3_1 = __shfl_sync(0xFFFFFFFF, cnt_9, owner_3_1);
-                unsigned int lo_b_3_1 = __shfl_sync(0xFFFFFFFF, lo_sel_3_1, owner_3_1);
+                unsigned int lo_b_4 = __shfl_sync(0xFFFFFFFF, lo_sel_3_1, owner_3_1);
                 if (lane == 0) {
-                    scal[0] = pos_b_3 * 16 + pos_b_3_1;
-                    scal[1] = rem_b_3_1;
+                    scal[0] = pos_b_1 * 16 + pos_b_4;
+                    scal[1] = rem_b_4;
                     scal[2] = cnt_b_3_1;
-                    scal[9] = lo_b_3 + lo_b_3_1;
+                    scal[9] = lo_b_1 + lo_b_4;
                 }
             }
             __syncthreads();
@@ -74728,11 +74711,11 @@ kernel_cake_radix_topk_c8_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
             unsigned int cnt_sel = scal[2];
             if (cnt_sel <= 2048) {
                 take_tail = 0;
-                unsigned int v_0_0 = 0;
+                unsigned int v_0 = 0;
                 if (tid == 0) {
-                    v_0_0 = scal[9];
+                    v_0 = scal[9];
                 }
-                unsigned int lo_above_w = v_0_0;
+                unsigned int lo_above_w = v_0;
                 unsigned int n_4 = 0;
                 int niter_2 = (int)(n_wu + 31 >> 5);
                 for (int j_2 = 0; j_2 < niter_2; j_2++) {
@@ -74748,86 +74731,86 @@ kernel_cake_radix_topk_c8_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 }
                 __syncthreads();
                 unsigned int before_49 = 0;
-                unsigned int total_48 = 0;
-                unsigned int v_16 = scal[16];
-                total_48 = total_48 + v_16;
+                unsigned int total_49 = 0;
+                unsigned int v_17 = scal[16];
+                total_49 = total_49 + v_17;
                 if (warp > 0) {
-                    before_49 = before_49 + v_16;
-                }
-                unsigned int v_17 = scal[17];
-                total_48 = total_48 + v_17;
-                if (warp > 1) {
                     before_49 = before_49 + v_17;
                 }
-                unsigned int v_18 = scal[18];
-                total_48 = total_48 + v_18;
-                if (warp > 2) {
+                unsigned int v_18 = scal[17];
+                total_49 = total_49 + v_18;
+                if (warp > 1) {
                     before_49 = before_49 + v_18;
                 }
-                unsigned int v_19 = scal[19];
-                total_48 = total_48 + v_19;
-                if (warp > 3) {
+                unsigned int v_19 = scal[18];
+                total_49 = total_49 + v_19;
+                if (warp > 2) {
                     before_49 = before_49 + v_19;
                 }
-                unsigned int v_20 = scal[20];
-                total_48 = total_48 + v_20;
-                if (warp > 4) {
+                unsigned int v_20 = scal[19];
+                total_49 = total_49 + v_20;
+                if (warp > 3) {
                     before_49 = before_49 + v_20;
                 }
-                unsigned int v_21 = scal[21];
-                total_48 = total_48 + v_21;
-                if (warp > 5) {
+                unsigned int v_21 = scal[20];
+                total_49 = total_49 + v_21;
+                if (warp > 4) {
                     before_49 = before_49 + v_21;
                 }
-                unsigned int v_22 = scal[22];
-                total_48 = total_48 + v_22;
-                if (warp > 6) {
+                unsigned int v_22 = scal[21];
+                total_49 = total_49 + v_22;
+                if (warp > 5) {
                     before_49 = before_49 + v_22;
                 }
-                unsigned int v_23 = scal[23];
-                total_48 = total_48 + v_23;
-                if (warp > 7) {
+                unsigned int v_23 = scal[22];
+                total_49 = total_49 + v_23;
+                if (warp > 6) {
                     before_49 = before_49 + v_23;
                 }
-                unsigned int v_24 = scal[24];
-                total_48 = total_48 + v_24;
-                if (warp > 8) {
+                unsigned int v_24 = scal[23];
+                total_49 = total_49 + v_24;
+                if (warp > 7) {
                     before_49 = before_49 + v_24;
                 }
-                unsigned int v_25 = scal[25];
-                total_48 = total_48 + v_25;
-                if (warp > 9) {
+                unsigned int v_25 = scal[24];
+                total_49 = total_49 + v_25;
+                if (warp > 8) {
                     before_49 = before_49 + v_25;
                 }
-                unsigned int v_26 = scal[26];
-                total_48 = total_48 + v_26;
-                if (warp > 10) {
+                unsigned int v_26 = scal[25];
+                total_49 = total_49 + v_26;
+                if (warp > 9) {
                     before_49 = before_49 + v_26;
                 }
-                unsigned int v_27 = scal[27];
-                total_48 = total_48 + v_27;
-                if (warp > 11) {
+                unsigned int v_27 = scal[26];
+                total_49 = total_49 + v_27;
+                if (warp > 10) {
                     before_49 = before_49 + v_27;
                 }
-                unsigned int v_28 = scal[28];
-                total_48 = total_48 + v_28;
-                if (warp > 12) {
+                unsigned int v_28 = scal[27];
+                total_49 = total_49 + v_28;
+                if (warp > 11) {
                     before_49 = before_49 + v_28;
                 }
-                unsigned int v_29 = scal[29];
-                total_48 = total_48 + v_29;
-                if (warp > 13) {
+                unsigned int v_29 = scal[28];
+                total_49 = total_49 + v_29;
+                if (warp > 12) {
                     before_49 = before_49 + v_29;
                 }
-                unsigned int v_30 = scal[30];
-                total_48 = total_48 + v_30;
-                if (warp > 14) {
+                unsigned int v_30 = scal[29];
+                total_49 = total_49 + v_30;
+                if (warp > 13) {
                     before_49 = before_49 + v_30;
                 }
-                unsigned int v_31 = scal[31];
-                total_48 = total_48 + v_31;
-                if (warp > 15) {
+                unsigned int v_31 = scal[30];
+                total_49 = total_49 + v_31;
+                if (warp > 14) {
                     before_49 = before_49 + v_31;
+                }
+                unsigned int v_32 = scal[31];
+                total_49 = total_49 + v_32;
+                if (warp > 15) {
+                    before_49 = before_49 + v_32;
                 }
                 unsigned int lt_mask_5 = (1 << (unsigned int)lane) - 1;
                 unsigned int pos_196 = before_49;
@@ -74847,7 +74830,7 @@ kernel_cake_radix_topk_c8_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                     pos_196 = pos_196 + (unsigned int)__popc(m_100);
                 }
                 if (tid == 0) {
-                    scal[3] = total_48;
+                    scal[3] = total_49;
                 }
                 asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");
                 asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
@@ -75364,24 +75347,24 @@ kernel_cake_radix_topk_c8_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                     done_1 = 1;
                 }
                 if (done_1 == 0) {
-                    unsigned long long c_16 = comps2[0];
-                    unsigned int bucket_86_1 = (unsigned int)(c_16 >> 42 & 2047);
-                    if (c_16 >> 53 == (unsigned long long)bucket_sel_1) {
+                    unsigned long long c_17 = comps2[0];
+                    unsigned int bucket_86_1 = (unsigned int)(c_17 >> 42 & 2047);
+                    if (c_17 >> 53 == (unsigned long long)bucket_sel_1) {
                         atomicAdd(&hist0[bucket_86_1], 1);
                     }
-                    unsigned long long c_17 = comps2[1];
-                    unsigned int bucket_87 = (unsigned int)(c_17 >> 42 & 2047);
-                    if (c_17 >> 53 == (unsigned long long)bucket_sel_1) {
+                    unsigned long long c_18 = comps2[1];
+                    unsigned int bucket_87 = (unsigned int)(c_18 >> 42 & 2047);
+                    if (c_18 >> 53 == (unsigned long long)bucket_sel_1) {
                         atomicAdd(&hist0[bucket_87], 1);
                     }
-                    unsigned long long c_18 = comps2[2];
-                    unsigned int bucket_88 = (unsigned int)(c_18 >> 42 & 2047);
-                    if (c_18 >> 53 == (unsigned long long)bucket_sel_1) {
+                    unsigned long long c_19 = comps2[2];
+                    unsigned int bucket_88 = (unsigned int)(c_19 >> 42 & 2047);
+                    if (c_19 >> 53 == (unsigned long long)bucket_sel_1) {
                         atomicAdd(&hist0[bucket_88], 1);
                     }
-                    unsigned long long c_19 = comps2[3];
-                    unsigned int bucket_89 = (unsigned int)(c_19 >> 42 & 2047);
-                    if (c_19 >> 53 == (unsigned long long)bucket_sel_1) {
+                    unsigned long long c_20 = comps2[3];
+                    unsigned int bucket_89 = (unsigned int)(c_20 >> 42 & 2047);
+                    if (c_20 >> 53 == (unsigned long long)bucket_sel_1) {
                         atomicAdd(&hist0[bucket_89], 1);
                     }
                     for (int i_53 = tid; i_53 < 2048; i_53 += 512) {
@@ -75459,24 +75442,24 @@ kernel_cake_radix_topk_c8_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                         done_1 = 1;
                     }
                     if (done_1 == 0) {
-                        unsigned long long c_20 = comps2[0];
-                        unsigned int bucket_91 = (unsigned int)(c_20 >> 32 & 1023);
-                        if (c_20 >> 42 == prefix1_1) {
+                        unsigned long long c_21 = comps2[0];
+                        unsigned int bucket_91 = (unsigned int)(c_21 >> 32 & 1023);
+                        if (c_21 >> 42 == prefix1_1) {
                             atomicAdd(&hist1[bucket_91], 1);
                         }
-                        unsigned long long c_21 = comps2[1];
-                        unsigned int bucket_92 = (unsigned int)(c_21 >> 32 & 1023);
-                        if (c_21 >> 42 == prefix1_1) {
+                        unsigned long long c_22 = comps2[1];
+                        unsigned int bucket_92 = (unsigned int)(c_22 >> 32 & 1023);
+                        if (c_22 >> 42 == prefix1_1) {
                             atomicAdd(&hist1[bucket_92], 1);
                         }
-                        unsigned long long c_22 = comps2[2];
-                        unsigned int bucket_93 = (unsigned int)(c_22 >> 32 & 1023);
-                        if (c_22 >> 42 == prefix1_1) {
+                        unsigned long long c_23 = comps2[2];
+                        unsigned int bucket_93 = (unsigned int)(c_23 >> 32 & 1023);
+                        if (c_23 >> 42 == prefix1_1) {
                             atomicAdd(&hist1[bucket_93], 1);
                         }
-                        unsigned long long c_23 = comps2[3];
-                        unsigned int bucket_94 = (unsigned int)(c_23 >> 32 & 1023);
-                        if (c_23 >> 42 == prefix1_1) {
+                        unsigned long long c_24 = comps2[3];
+                        unsigned int bucket_94 = (unsigned int)(c_24 >> 32 & 1023);
+                        if (c_24 >> 42 == prefix1_1) {
                             atomicAdd(&hist1[bucket_94], 1);
                         }
                         for (int i_54 = tid; i_54 < 2048; i_54 += 512) {
@@ -75562,24 +75545,24 @@ kernel_cake_radix_topk_c8_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                                 unsigned long long mask_2 = (1 << (unsigned long long)nbits_1) - 1;
                                 unsigned long long sh_1 = (unsigned long long)shift_1;
                                 unsigned long long hi_1 = (unsigned long long)(shift_1 + nbits_1);
-                                unsigned long long c_24 = comps2[0];
-                                unsigned int bucket_97 = (unsigned int)(c_24 >> sh_1 & mask_2);
-                                if (c_24 >> hi_1 == tpre_1) {
+                                unsigned long long c_25 = comps2[0];
+                                unsigned int bucket_97 = (unsigned int)(c_25 >> sh_1 & mask_2);
+                                if (c_25 >> hi_1 == tpre_1) {
                                     atomicAdd(&hist0[bucket_97], 1);
                                 }
-                                unsigned long long c_25 = comps2[1];
-                                unsigned int bucket_98 = (unsigned int)(c_25 >> sh_1 & mask_2);
-                                if (c_25 >> hi_1 == tpre_1) {
+                                unsigned long long c_26 = comps2[1];
+                                unsigned int bucket_98 = (unsigned int)(c_26 >> sh_1 & mask_2);
+                                if (c_26 >> hi_1 == tpre_1) {
                                     atomicAdd(&hist0[bucket_98], 1);
                                 }
-                                unsigned long long c_26 = comps2[2];
-                                unsigned int bucket_99 = (unsigned int)(c_26 >> sh_1 & mask_2);
-                                if (c_26 >> hi_1 == tpre_1) {
+                                unsigned long long c_27 = comps2[2];
+                                unsigned int bucket_99 = (unsigned int)(c_27 >> sh_1 & mask_2);
+                                if (c_27 >> hi_1 == tpre_1) {
                                     atomicAdd(&hist0[bucket_99], 1);
                                 }
-                                unsigned long long c_27 = comps2[3];
-                                unsigned int bucket_100 = (unsigned int)(c_27 >> sh_1 & mask_2);
-                                if (c_27 >> hi_1 == tpre_1) {
+                                unsigned long long c_28 = comps2[3];
+                                unsigned int bucket_100 = (unsigned int)(c_28 >> sh_1 & mask_2);
+                                if (c_28 >> hi_1 == tpre_1) {
                                     atomicAdd(&hist0[bucket_100], 1);
                                 }
                                 __syncthreads();
@@ -75700,170 +75683,170 @@ kernel_cake_radix_topk_c8_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 }
                 __syncthreads();
                 unsigned int before_50 = 0;
-                unsigned int total_49 = 0;
-                unsigned int v_32 = scal[32];
-                total_49 = total_49 + v_32;
+                unsigned int total_50 = 0;
+                unsigned int v_33 = scal[32];
+                total_50 = total_50 + v_33;
                 if (warp > 0) {
-                    before_50 = before_50 + v_32;
-                }
-                unsigned int v_33 = scal[33];
-                total_49 = total_49 + v_33;
-                if (warp > 1) {
                     before_50 = before_50 + v_33;
                 }
-                unsigned int v_34 = scal[34];
-                total_49 = total_49 + v_34;
-                if (warp > 2) {
+                unsigned int v_34 = scal[33];
+                total_50 = total_50 + v_34;
+                if (warp > 1) {
                     before_50 = before_50 + v_34;
                 }
-                unsigned int v_35 = scal[35];
-                total_49 = total_49 + v_35;
-                if (warp > 3) {
+                unsigned int v_35 = scal[34];
+                total_50 = total_50 + v_35;
+                if (warp > 2) {
                     before_50 = before_50 + v_35;
                 }
-                unsigned int v_36 = scal[36];
-                total_49 = total_49 + v_36;
-                if (warp > 4) {
+                unsigned int v_36 = scal[35];
+                total_50 = total_50 + v_36;
+                if (warp > 3) {
                     before_50 = before_50 + v_36;
                 }
-                unsigned int v_37 = scal[37];
-                total_49 = total_49 + v_37;
-                if (warp > 5) {
+                unsigned int v_37 = scal[36];
+                total_50 = total_50 + v_37;
+                if (warp > 4) {
                     before_50 = before_50 + v_37;
                 }
-                unsigned int v_38 = scal[38];
-                total_49 = total_49 + v_38;
-                if (warp > 6) {
+                unsigned int v_38 = scal[37];
+                total_50 = total_50 + v_38;
+                if (warp > 5) {
                     before_50 = before_50 + v_38;
                 }
-                unsigned int v_39 = scal[39];
-                total_49 = total_49 + v_39;
-                if (warp > 7) {
+                unsigned int v_39 = scal[38];
+                total_50 = total_50 + v_39;
+                if (warp > 6) {
                     before_50 = before_50 + v_39;
                 }
-                unsigned int v_40 = scal[40];
-                total_49 = total_49 + v_40;
-                if (warp > 8) {
+                unsigned int v_40 = scal[39];
+                total_50 = total_50 + v_40;
+                if (warp > 7) {
                     before_50 = before_50 + v_40;
                 }
-                unsigned int v_41 = scal[41];
-                total_49 = total_49 + v_41;
-                if (warp > 9) {
+                unsigned int v_41 = scal[40];
+                total_50 = total_50 + v_41;
+                if (warp > 8) {
                     before_50 = before_50 + v_41;
                 }
-                unsigned int v_42 = scal[42];
-                total_49 = total_49 + v_42;
-                if (warp > 10) {
+                unsigned int v_42 = scal[41];
+                total_50 = total_50 + v_42;
+                if (warp > 9) {
                     before_50 = before_50 + v_42;
                 }
-                unsigned int v_43 = scal[43];
-                total_49 = total_49 + v_43;
-                if (warp > 11) {
+                unsigned int v_43 = scal[42];
+                total_50 = total_50 + v_43;
+                if (warp > 10) {
                     before_50 = before_50 + v_43;
                 }
-                unsigned int v_44 = scal[44];
-                total_49 = total_49 + v_44;
-                if (warp > 12) {
+                unsigned int v_44 = scal[43];
+                total_50 = total_50 + v_44;
+                if (warp > 11) {
                     before_50 = before_50 + v_44;
                 }
-                unsigned int v_45 = scal[45];
-                total_49 = total_49 + v_45;
-                if (warp > 13) {
+                unsigned int v_45 = scal[44];
+                total_50 = total_50 + v_45;
+                if (warp > 12) {
                     before_50 = before_50 + v_45;
                 }
-                unsigned int v_46 = scal[46];
-                total_49 = total_49 + v_46;
-                if (warp > 14) {
+                unsigned int v_46 = scal[45];
+                total_50 = total_50 + v_46;
+                if (warp > 13) {
                     before_50 = before_50 + v_46;
                 }
-                unsigned int v_47 = scal[47];
-                total_49 = total_49 + v_47;
-                if (warp > 15) {
+                unsigned int v_47 = scal[46];
+                total_50 = total_50 + v_47;
+                if (warp > 14) {
                     before_50 = before_50 + v_47;
                 }
-                unsigned int before_51 = 0;
-                unsigned int total_50 = 0;
-                unsigned int v_48 = scal[48];
+                unsigned int v_48 = scal[47];
                 total_50 = total_50 + v_48;
-                if (warp > 0) {
-                    before_51 = before_51 + v_48;
+                if (warp > 15) {
+                    before_50 = before_50 + v_48;
                 }
-                unsigned int v_49 = scal[49];
-                total_50 = total_50 + v_49;
-                if (warp > 1) {
+                unsigned int before_51 = 0;
+                unsigned int total_51 = 0;
+                unsigned int v_49 = scal[48];
+                total_51 = total_51 + v_49;
+                if (warp > 0) {
                     before_51 = before_51 + v_49;
                 }
-                unsigned int v_50 = scal[50];
-                total_50 = total_50 + v_50;
-                if (warp > 2) {
+                unsigned int v_50 = scal[49];
+                total_51 = total_51 + v_50;
+                if (warp > 1) {
                     before_51 = before_51 + v_50;
                 }
-                unsigned int v_51 = scal[51];
-                total_50 = total_50 + v_51;
-                if (warp > 3) {
+                unsigned int v_51 = scal[50];
+                total_51 = total_51 + v_51;
+                if (warp > 2) {
                     before_51 = before_51 + v_51;
                 }
-                unsigned int v_52 = scal[52];
-                total_50 = total_50 + v_52;
-                if (warp > 4) {
+                unsigned int v_52 = scal[51];
+                total_51 = total_51 + v_52;
+                if (warp > 3) {
                     before_51 = before_51 + v_52;
                 }
-                unsigned int v_53 = scal[53];
-                total_50 = total_50 + v_53;
-                if (warp > 5) {
+                unsigned int v_53 = scal[52];
+                total_51 = total_51 + v_53;
+                if (warp > 4) {
                     before_51 = before_51 + v_53;
                 }
-                unsigned int v_54 = scal[54];
-                total_50 = total_50 + v_54;
-                if (warp > 6) {
+                unsigned int v_54 = scal[53];
+                total_51 = total_51 + v_54;
+                if (warp > 5) {
                     before_51 = before_51 + v_54;
                 }
-                unsigned int v_55 = scal[55];
-                total_50 = total_50 + v_55;
-                if (warp > 7) {
+                unsigned int v_55 = scal[54];
+                total_51 = total_51 + v_55;
+                if (warp > 6) {
                     before_51 = before_51 + v_55;
                 }
-                unsigned int v_56 = scal[56];
-                total_50 = total_50 + v_56;
-                if (warp > 8) {
+                unsigned int v_56 = scal[55];
+                total_51 = total_51 + v_56;
+                if (warp > 7) {
                     before_51 = before_51 + v_56;
                 }
-                unsigned int v_57 = scal[57];
-                total_50 = total_50 + v_57;
-                if (warp > 9) {
+                unsigned int v_57 = scal[56];
+                total_51 = total_51 + v_57;
+                if (warp > 8) {
                     before_51 = before_51 + v_57;
                 }
-                unsigned int v_58 = scal[58];
-                total_50 = total_50 + v_58;
-                if (warp > 10) {
+                unsigned int v_58 = scal[57];
+                total_51 = total_51 + v_58;
+                if (warp > 9) {
                     before_51 = before_51 + v_58;
                 }
-                unsigned int v_59 = scal[59];
-                total_50 = total_50 + v_59;
-                if (warp > 11) {
+                unsigned int v_59 = scal[58];
+                total_51 = total_51 + v_59;
+                if (warp > 10) {
                     before_51 = before_51 + v_59;
                 }
-                unsigned int v_60 = scal[60];
-                total_50 = total_50 + v_60;
-                if (warp > 12) {
+                unsigned int v_60 = scal[59];
+                total_51 = total_51 + v_60;
+                if (warp > 11) {
                     before_51 = before_51 + v_60;
                 }
-                unsigned int v_61 = scal[61];
-                total_50 = total_50 + v_61;
-                if (warp > 13) {
+                unsigned int v_61 = scal[60];
+                total_51 = total_51 + v_61;
+                if (warp > 12) {
                     before_51 = before_51 + v_61;
                 }
-                unsigned int v_62 = scal[62];
-                total_50 = total_50 + v_62;
-                if (warp > 14) {
+                unsigned int v_62 = scal[61];
+                total_51 = total_51 + v_62;
+                if (warp > 13) {
                     before_51 = before_51 + v_62;
                 }
-                unsigned int v_63 = scal[63];
-                total_50 = total_50 + v_63;
-                if (warp > 15) {
+                unsigned int v_63 = scal[62];
+                total_51 = total_51 + v_63;
+                if (warp > 14) {
                     before_51 = before_51 + v_63;
                 }
-                unsigned long long ebase = out_base + (unsigned long long)(total_50 + before_50);
+                unsigned int v_64 = scal[63];
+                total_51 = total_51 + v_64;
+                if (warp > 15) {
+                    before_51 = before_51 + v_64;
+                }
+                unsigned long long ebase = out_base + (unsigned long long)(total_51 + before_50);
                 unsigned int lt_mask_4_1 = (1 << (unsigned int)lane) - 1;
                 unsigned int pos_196_1 = 0;
                 int niter_2_1 = (int)(n_wu + 31 >> 5);
@@ -75900,26 +75883,26 @@ kernel_cake_radix_topk_c8_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
             for (int p = 0; p < 3; p++) {
                 unsigned int shift_2 = ((p == 0) ? 21 : ((p == 1) ? 10 : 0));
                 unsigned int nbits_2 = ((p == 2) ? 10 : 11);
-                for (int c_28 = 0; c_28 < nsub; c_28++) {
-                    int i2_192 = start + c_28 * 2048 + tid;
+                for (int c_29 = 0; c_29 < nsub; c_29++) {
+                    int i2_192 = start + c_29 * 2048 + tid;
                     if (i2_192 < vocab) {
                         vals_t[0] = probs[row_base + (unsigned long long)i2_192];
                     } else {
                         vals_t[0] = 0.0f;
                     }
-                    int i2_193 = start + c_28 * 2048 + 512 + tid;
+                    int i2_193 = start + c_29 * 2048 + 512 + tid;
                     if (i2_193 < vocab) {
                         vals_t[1] = probs[row_base + (unsigned long long)i2_193];
                     } else {
                         vals_t[1] = 0.0f;
                     }
-                    int i2_194 = start + c_28 * 2048 + 1024 + tid;
+                    int i2_194 = start + c_29 * 2048 + 1024 + tid;
                     if (i2_194 < vocab) {
                         vals_t[2] = probs[row_base + (unsigned long long)i2_194];
                     } else {
                         vals_t[2] = 0.0f;
                     }
-                    int i2_195 = start + c_28 * 2048 + 1536 + tid;
+                    int i2_195 = start + c_29 * 2048 + 1536 + tid;
                     if (i2_195 < vocab) {
                         vals_t[3] = probs[row_base + (unsigned long long)i2_195];
                     } else {
@@ -76147,90 +76130,90 @@ kernel_cake_radix_topk_c8_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 }
                 __syncthreads();
                 unsigned int before_52 = 0;
-                unsigned int total_51 = 0;
+                unsigned int total_52 = 0;
                 unsigned int ws_1_0 = warp_sums[0];
-                total_51 = total_51 + ws_1_0;
+                total_52 = total_52 + ws_1_0;
                 if (warp > 0) {
                     before_52 = before_52 + ws_1_0;
                 }
                 unsigned int ws_1_1 = warp_sums[1];
-                total_51 = total_51 + ws_1_1;
+                total_52 = total_52 + ws_1_1;
                 if (warp > 1) {
                     before_52 = before_52 + ws_1_1;
                 }
                 unsigned int ws_1_2 = warp_sums[2];
-                total_51 = total_51 + ws_1_2;
+                total_52 = total_52 + ws_1_2;
                 if (warp > 2) {
                     before_52 = before_52 + ws_1_2;
                 }
                 unsigned int ws_1_3 = warp_sums[3];
-                total_51 = total_51 + ws_1_3;
+                total_52 = total_52 + ws_1_3;
                 if (warp > 3) {
                     before_52 = before_52 + ws_1_3;
                 }
                 unsigned int ws_1_4 = warp_sums[4];
-                total_51 = total_51 + ws_1_4;
+                total_52 = total_52 + ws_1_4;
                 if (warp > 4) {
                     before_52 = before_52 + ws_1_4;
                 }
                 unsigned int ws_1_5 = warp_sums[5];
-                total_51 = total_51 + ws_1_5;
+                total_52 = total_52 + ws_1_5;
                 if (warp > 5) {
                     before_52 = before_52 + ws_1_5;
                 }
                 unsigned int ws_1_6 = warp_sums[6];
-                total_51 = total_51 + ws_1_6;
+                total_52 = total_52 + ws_1_6;
                 if (warp > 6) {
                     before_52 = before_52 + ws_1_6;
                 }
                 unsigned int ws_1_7 = warp_sums[7];
-                total_51 = total_51 + ws_1_7;
+                total_52 = total_52 + ws_1_7;
                 if (warp > 7) {
                     before_52 = before_52 + ws_1_7;
                 }
                 unsigned int ws_1_8 = warp_sums[8];
-                total_51 = total_51 + ws_1_8;
+                total_52 = total_52 + ws_1_8;
                 if (warp > 8) {
                     before_52 = before_52 + ws_1_8;
                 }
                 unsigned int ws_1_9 = warp_sums[9];
-                total_51 = total_51 + ws_1_9;
+                total_52 = total_52 + ws_1_9;
                 if (warp > 9) {
                     before_52 = before_52 + ws_1_9;
                 }
                 unsigned int ws_1_10 = warp_sums[10];
-                total_51 = total_51 + ws_1_10;
+                total_52 = total_52 + ws_1_10;
                 if (warp > 10) {
                     before_52 = before_52 + ws_1_10;
                 }
                 unsigned int ws_1_11 = warp_sums[11];
-                total_51 = total_51 + ws_1_11;
+                total_52 = total_52 + ws_1_11;
                 if (warp > 11) {
                     before_52 = before_52 + ws_1_11;
                 }
                 unsigned int ws_1_12 = warp_sums[12];
-                total_51 = total_51 + ws_1_12;
+                total_52 = total_52 + ws_1_12;
                 if (warp > 12) {
                     before_52 = before_52 + ws_1_12;
                 }
                 unsigned int ws_1_13 = warp_sums[13];
-                total_51 = total_51 + ws_1_13;
+                total_52 = total_52 + ws_1_13;
                 if (warp > 13) {
                     before_52 = before_52 + ws_1_13;
                 }
                 unsigned int ws_1_14 = warp_sums[14];
-                total_51 = total_51 + ws_1_14;
+                total_52 = total_52 + ws_1_14;
                 if (warp > 14) {
                     before_52 = before_52 + ws_1_14;
                 }
                 unsigned int ws_1_15 = warp_sums[15];
-                total_51 = total_51 + ws_1_15;
+                total_52 = total_52 + ws_1_15;
                 if (warp > 15) {
                     before_52 = before_52 + ws_1_15;
                 }
                 unsigned int excl = before_52 + incl - above_9_1;
                 __syncthreads();
-                gt_local = gt_local + total_51;
+                gt_local = gt_local + total_52;
                 if (p == 2) {
                     if (own > 0) {
                         scal[4] = own;
@@ -76287,26 +76270,26 @@ kernel_cake_radix_topk_c8_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
             unsigned int take_rem = ((eq_prefix < remaining) ? _min_302 : 0);
             unsigned long long gt_run = out_base + (unsigned long long)gt_prefix;
             unsigned long long eq_run = out_base + (unsigned long long)(gt_total + eq_prefix);
-            for (int c_29 = 0; c_29 < nsub; c_29++) {
-                int i2_196 = start + c_29 * 2048 + tid;
+            for (int c_30 = 0; c_30 < nsub; c_30++) {
+                int i2_196 = start + c_30 * 2048 + tid;
                 if (i2_196 < vocab) {
                     vals_t[0] = probs[row_base + (unsigned long long)i2_196];
                 } else {
                     vals_t[0] = 0.0f;
                 }
-                int i2_197 = start + c_29 * 2048 + 512 + tid;
+                int i2_197 = start + c_30 * 2048 + 512 + tid;
                 if (i2_197 < vocab) {
                     vals_t[1] = probs[row_base + (unsigned long long)i2_197];
                 } else {
                     vals_t[1] = 0.0f;
                 }
-                int i2_198 = start + c_29 * 2048 + 1024 + tid;
+                int i2_198 = start + c_30 * 2048 + 1024 + tid;
                 if (i2_198 < vocab) {
                     vals_t[2] = probs[row_base + (unsigned long long)i2_198];
                 } else {
                     vals_t[2] = 0.0f;
                 }
-                int i2_199 = start + c_29 * 2048 + 1536 + tid;
+                int i2_199 = start + c_30 * 2048 + 1536 + tid;
                 if (i2_199 < vocab) {
                     vals_t[3] = probs[row_base + (unsigned long long)i2_199];
                 } else {
@@ -76315,8 +76298,8 @@ kernel_cake_radix_topk_c8_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 unsigned int gt = 0;
                 unsigned int bits_189 = __as_u32(vals_t[0]);
                 unsigned int key_192 = ((bits_189 <= 2139095040) ? bits_189 : 0);
-                int i_vec = start + c_29 * 2048 + tid * 4;
-                int i_str = start + c_29 * 2048 + tid;
+                int i_vec = start + c_30 * 2048 + tid * 4;
+                int i_str = start + c_30 * 2048 + tid;
                 int i_57 = i_str;
                 int i_2_0 = i_57;
                 bool tie_1_0 = key_192 == threshold_t && i_2_0 < vocab;
@@ -76329,8 +76312,8 @@ kernel_cake_radix_topk_c8_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 }
                 unsigned int bits_189_1 = __as_u32(vals_t[1]);
                 unsigned int key_189_1 = ((bits_189_1 <= 2139095040) ? bits_189_1 : 0);
-                int i_vec_0 = start + c_29 * 2048 + tid * 4 + 1;
-                int i_str_0 = start + c_29 * 2048 + 512 + tid;
+                int i_vec_0 = start + c_30 * 2048 + tid * 4 + 1;
+                int i_str_0 = start + c_30 * 2048 + 512 + tid;
                 int i_48_1 = i_str_0;
                 int i_2_1 = i_48_1;
                 bool tie_1_1 = key_189_1 == threshold_t && i_2_1 < vocab;
@@ -76343,8 +76326,8 @@ kernel_cake_radix_topk_c8_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 }
                 unsigned int bits_190 = __as_u32(vals_t[2]);
                 unsigned int key_190_1 = ((bits_190 <= 2139095040) ? bits_190 : 0);
-                int i_vec_1 = start + c_29 * 2048 + tid * 4 + 2;
-                int i_str_1 = start + c_29 * 2048 + 1024 + tid;
+                int i_vec_1 = start + c_30 * 2048 + tid * 4 + 2;
+                int i_str_1 = start + c_30 * 2048 + 1024 + tid;
                 int i_49_1 = i_str_1;
                 int i_2_2 = i_49_1;
                 bool tie_1_2 = key_190_1 == threshold_t && i_2_2 < vocab;
@@ -76357,8 +76340,8 @@ kernel_cake_radix_topk_c8_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 }
                 unsigned int bits_191 = __as_u32(vals_t[3]);
                 unsigned int key_191_1 = ((bits_191 <= 2139095040) ? bits_191 : 0);
-                int i_vec_2 = start + c_29 * 2048 + tid * 4 + 3;
-                int i_str_2 = start + c_29 * 2048 + 1536 + tid;
+                int i_vec_2 = start + c_30 * 2048 + tid * 4 + 3;
+                int i_str_2 = start + c_30 * 2048 + 1536 + tid;
                 int i_50_1 = i_str_2;
                 int i_2_3 = i_50_1;
                 bool tie_1_3 = key_191_1 == threshold_t && i_2_3 < vocab;
@@ -76388,84 +76371,84 @@ kernel_cake_radix_topk_c8_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 }
                 __syncthreads();
                 unsigned int before_53 = 0;
-                unsigned int total_52 = 0;
+                unsigned int total_53 = 0;
                 unsigned int ws_1_16 = warp_sums[0];
-                total_52 = total_52 + ws_1_16;
+                total_53 = total_53 + ws_1_16;
                 if (warp > 0) {
                     before_53 = before_53 + ws_1_16;
                 }
                 unsigned int ws_1_17 = warp_sums[1];
-                total_52 = total_52 + ws_1_17;
+                total_53 = total_53 + ws_1_17;
                 if (warp > 1) {
                     before_53 = before_53 + ws_1_17;
                 }
                 unsigned int ws_1_18 = warp_sums[2];
-                total_52 = total_52 + ws_1_18;
+                total_53 = total_53 + ws_1_18;
                 if (warp > 2) {
                     before_53 = before_53 + ws_1_18;
                 }
                 unsigned int ws_1_19 = warp_sums[3];
-                total_52 = total_52 + ws_1_19;
+                total_53 = total_53 + ws_1_19;
                 if (warp > 3) {
                     before_53 = before_53 + ws_1_19;
                 }
                 unsigned int ws_1_20 = warp_sums[4];
-                total_52 = total_52 + ws_1_20;
+                total_53 = total_53 + ws_1_20;
                 if (warp > 4) {
                     before_53 = before_53 + ws_1_20;
                 }
                 unsigned int ws_1_21 = warp_sums[5];
-                total_52 = total_52 + ws_1_21;
+                total_53 = total_53 + ws_1_21;
                 if (warp > 5) {
                     before_53 = before_53 + ws_1_21;
                 }
                 unsigned int ws_1_22 = warp_sums[6];
-                total_52 = total_52 + ws_1_22;
+                total_53 = total_53 + ws_1_22;
                 if (warp > 6) {
                     before_53 = before_53 + ws_1_22;
                 }
                 unsigned int ws_1_23 = warp_sums[7];
-                total_52 = total_52 + ws_1_23;
+                total_53 = total_53 + ws_1_23;
                 if (warp > 7) {
                     before_53 = before_53 + ws_1_23;
                 }
                 unsigned int ws_1_24 = warp_sums[8];
-                total_52 = total_52 + ws_1_24;
+                total_53 = total_53 + ws_1_24;
                 if (warp > 8) {
                     before_53 = before_53 + ws_1_24;
                 }
                 unsigned int ws_1_25 = warp_sums[9];
-                total_52 = total_52 + ws_1_25;
+                total_53 = total_53 + ws_1_25;
                 if (warp > 9) {
                     before_53 = before_53 + ws_1_25;
                 }
                 unsigned int ws_1_26 = warp_sums[10];
-                total_52 = total_52 + ws_1_26;
+                total_53 = total_53 + ws_1_26;
                 if (warp > 10) {
                     before_53 = before_53 + ws_1_26;
                 }
                 unsigned int ws_1_27 = warp_sums[11];
-                total_52 = total_52 + ws_1_27;
+                total_53 = total_53 + ws_1_27;
                 if (warp > 11) {
                     before_53 = before_53 + ws_1_27;
                 }
                 unsigned int ws_1_28 = warp_sums[12];
-                total_52 = total_52 + ws_1_28;
+                total_53 = total_53 + ws_1_28;
                 if (warp > 12) {
                     before_53 = before_53 + ws_1_28;
                 }
                 unsigned int ws_1_29 = warp_sums[13];
-                total_52 = total_52 + ws_1_29;
+                total_53 = total_53 + ws_1_29;
                 if (warp > 13) {
                     before_53 = before_53 + ws_1_29;
                 }
                 unsigned int ws_1_30 = warp_sums[14];
-                total_52 = total_52 + ws_1_30;
+                total_53 = total_53 + ws_1_30;
                 if (warp > 14) {
                     before_53 = before_53 + ws_1_30;
                 }
                 unsigned int ws_1_31 = warp_sums[15];
-                total_52 = total_52 + ws_1_31;
+                total_53 = total_53 + ws_1_31;
                 if (warp > 15) {
                     before_53 = before_53 + ws_1_31;
                 }
@@ -76474,14 +76457,14 @@ kernel_cake_radix_topk_c8_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 unsigned int running = excl_1 >> 12;
                 int f2 = tid;
                 if (f2 < 64) {
-                    unsigned int c_0_1 = cnt[f2];
+                    unsigned int c_0 = cnt[f2];
                     cnt[f2] = running;
-                    running = running + c_0_1;
+                    running = running + c_0;
                 }
                 __syncthreads();
                 unsigned int gt_slot = excl_1 & 4095;
-                unsigned int gt_total_46 = total_52 & 4095;
-                unsigned int eq_total = total_52 >> 12;
+                unsigned int gt_total_46 = total_53 & 4095;
+                unsigned int eq_total = total_53 >> 12;
                 unsigned int take_c = ((eq_total) < (take_rem) ? (eq_total) : (take_rem));
                 unsigned int lt_mask_6 = (1 << (unsigned int)lane) - 1;
                 unsigned int g = gt_slot;
@@ -76494,8 +76477,8 @@ kernel_cake_radix_topk_c8_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 unsigned int bits_192 = __as_u32(vals_t[0]);
                 unsigned int key_192_1 = ((bits_192 <= 2139095040) ? bits_192 : 0);
                 keys[0] = key_192_1;
-                int i_vec_3 = start + c_29 * 2048 + tid * 4;
-                int i_str_3 = start + c_29 * 2048 + tid;
+                int i_vec_3 = start + c_30 * 2048 + tid * 4;
+                int i_str_3 = start + c_30 * 2048 + tid;
                 int i_51_1 = i_str_3;
                 idxs[0] = i_51_1;
                 ties[0] = keys[0] == threshold_t && idxs[0] < vocab;
@@ -76508,8 +76491,8 @@ kernel_cake_radix_topk_c8_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 unsigned int bits_193 = __as_u32(vals_t[1]);
                 unsigned int key_193 = ((bits_193 <= 2139095040) ? bits_193 : 0);
                 keys[1] = key_193;
-                int i_vec_4 = start + c_29 * 2048 + tid * 4 + 1;
-                int i_str_4 = start + c_29 * 2048 + 512 + tid;
+                int i_vec_4 = start + c_30 * 2048 + tid * 4 + 1;
+                int i_str_4 = start + c_30 * 2048 + 512 + tid;
                 int i_52_1 = i_str_4;
                 idxs[1] = i_52_1;
                 ties[1] = keys[1] == threshold_t && idxs[1] < vocab;
@@ -76522,8 +76505,8 @@ kernel_cake_radix_topk_c8_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 unsigned int bits_194 = __as_u32(vals_t[2]);
                 unsigned int key_194 = ((bits_194 <= 2139095040) ? bits_194 : 0);
                 keys[2] = key_194;
-                int i_vec_5 = start + c_29 * 2048 + tid * 4 + 2;
-                int i_str_5 = start + c_29 * 2048 + 1024 + tid;
+                int i_vec_5 = start + c_30 * 2048 + tid * 4 + 2;
+                int i_str_5 = start + c_30 * 2048 + 1024 + tid;
                 int i_53_1 = i_str_5;
                 idxs[2] = i_53_1;
                 ties[2] = keys[2] == threshold_t && idxs[2] < vocab;
@@ -76536,8 +76519,8 @@ kernel_cake_radix_topk_c8_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
                 unsigned int bits_195 = __as_u32(vals_t[3]);
                 unsigned int key_195 = ((bits_195 <= 2139095040) ? bits_195 : 0);
                 keys[3] = key_195;
-                int i_vec_6 = start + c_29 * 2048 + tid * 4 + 3;
-                int i_str_6 = start + c_29 * 2048 + 1536 + tid;
+                int i_vec_6 = start + c_30 * 2048 + tid * 4 + 3;
+                int i_str_6 = start + c_30 * 2048 + 1536 + tid;
                 int i_54_1 = i_str_6;
                 idxs[3] = i_54_1;
                 ties[3] = keys[3] == threshold_t && idxs[3] < vocab;
@@ -76627,7 +76610,6 @@ kernel_cake_radix_topk_c8_e32s_sp_lp_nt(float* __restrict__ probs, int* __restri
 } // extern "C"
 
 #undef CAKE_INF
-#undef NUM_MAIN_STAGES
 #undef SMEM_CLIST_OFF
 #undef SMEM_CLIST_STAGE_BYTES
 #undef SMEM_CLIST_STRIDE
