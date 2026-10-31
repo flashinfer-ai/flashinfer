@@ -1220,10 +1220,13 @@ def swap_small_m(L: int, M: int, N: int, transposed_out: bool) -> bool:
 # T on GB300; the knobs after it are the row's program where the form yields (the 4096 -> 48 rule carries none: the
 # architecture default program runs there), and the planner drops a rule's form where the plan carries stream-K units,
 # the single-CTA form, another tile or output class, the register epilogue or a caller-forced pipeline knob, and refuses
-# a caller-forced form there.  Five sm_100a input-gradient rows (4096 -> 512, 4096 -> 1024, 5120 -> 512, 5120 -> 1024
-# and the kv_a 6144 -> 576) carry ``form`` ``w8``: the knob-free eight-warp program (``_w8``) measured faster than the
-# row's program above the pair spread at both T on GB200; the knobs after it are the row's program where the form
-# yields, and the raster group is the row's measured launch parameter.
+# a caller-forced form there.  Seven sm_100a input-gradient rows carry ``form``: 4096 -> 1024 and 5120 -> 1024 the
+# knob-free eight-warp program (``_w8``), 4096 -> 512 and the kv_a 6144 -> 576 the eight-warp program with the early
+# accumulator release and the loader-issued scheduling queries (``_w8rs``), and 5120 -> 512, 4096 -> 64 and 5120 -> 64
+# the one with the early accumulator release (``_w8r``).  Each measured faster than the row's program above the pair
+# spread at both T on GB200, except 4096 -> 64, 5120 -> 64 and the kv_a, where the form measured at least as fast as the
+# row's program there; the knobs after the form are the row's program where the form yields, and the raster group is the
+# row's measured launch parameter.
 ROW_RULES: dict[tuple, dict] = {
     ('sm_100a', False, False, False, False, False, 32, 6144, None): {"cta1": True},
     ('sm_100a', False, False, False, False, False, 128, 6144, None): {"cta1": True},
@@ -1240,9 +1243,10 @@ ROW_RULES: dict[tuple, dict] = {
     ('sm_100a', False, False, False, False, False, 4096, 2048, None): {"htail": True, "cgrp": True, "group_m": 16, "pro": 15},
     ('sm_100a', False, True, False, False, False, 2048, 4096, None): {"cgrp": True, "group_m": 16, "pro": 15},
     ('sm_100a', False, True, False, False, False, 6144, 128, None): {"slots": 2, "pd": 2, "pro": 15},
-    # the kv_a input gradient (6144 -> 576): the knob-free eight-warp program, the row's ten-warp knobs kept as its
-    # program where the form yields; the raster group of 12 row tiles is the row's measured launch parameter
-    ('sm_100a', False, True, False, False, False, 6144, 576, None): {"form": 'w8', "group_m": 12, "slots": 1, "epi": 'tma', "pd": 2, "pro": 15, "sk": False},
+    # the kv_a input gradient (6144 -> 576): the eight-warp program with the early accumulator release and the
+    # loader-issued scheduling queries, the row's ten-warp knobs kept as its program where the form yields; the raster
+    # group of 12 row tiles is the row's measured launch parameter
+    ('sm_100a', False, True, False, False, False, 6144, 576, None): {"form": 'w8rs', "group_m": 12, "slots": 1, "epi": 'tma', "pd": 2, "pro": 15, "sk": False},
     ('sm_100a', False, True, False, False, False, 6144, 2048, None): {"group_m": 8},
     ('sm_100a', False, True, False, False, False, 6144, 12288, None): {"cta_rows": 256, "group_m": 8, "ovl": True, "htail": True},
     ('sm_100a', False, True, False, False, True, 512, 256, None): {"cta_rows": 256, "group_m": 4, "batch_group": 4},
@@ -1390,17 +1394,17 @@ ROW_RULES: dict[tuple, dict] = {
     ('sm_100a', False, False, False, False, False, 17408, 5120, None): {"cgrp": True, "group_m": 12, "pro": 15},
     ('sm_100a', False, True, False, False, False, 4096, 32, None): {"epi": 'tma', "slots": 2, "pro": 15, "htail": True, "lw": True},
     ('sm_100a', False, True, False, False, False, 4096, 48, None): {"epi": 'tma', "slots": 2, "pro": 15, "htail": True, "lw": True},
-    ('sm_100a', False, True, False, False, False, 4096, 64, None): {"epi": 'tma', "slots": 2, "cta1": True, "pd": 3},
+    ('sm_100a', False, True, False, False, False, 4096, 64, None): {"form": 'w8r', "epi": 'tma', "slots": 1, "pro": 15, "pd": 2, "group_m": 8, "sk": False},
     ('sm_100a', False, True, False, False, False, 4096, 128, None): {"epi": 'tma', "slots": 2, "pro": 15, "pd": 2, "lw": True, "group_m": 32},
-    ('sm_100a', False, True, False, False, False, 4096, 512, None): {"form": 'w8', "epi": 'tma', "slots": 1, "pro": 15, "pd": 2, "group_m": 12, "sk": False},
+    ('sm_100a', False, True, False, False, False, 4096, 512, None): {"form": 'w8rs', "epi": 'tma', "slots": 1, "pro": 15, "pd": 2, "group_m": 12, "sk": False},
     ('sm_100a', False, True, False, False, False, 4096, 1024, None): {"form": 'w8', "pd": 2, "pro": 15, "group_m": 8, "sk": False},
     ('sm_100a', False, True, False, False, False, 4096, 4096, None): {"htail": True, "cgrp": True, "group_m": 16, "pro": 15},
     ('sm_100a', False, True, False, False, False, 4096, 12288, None): {"cta_rows": 256, "ovl": True, "htail": True, "cgrp": True, "group_m": 16},
     ('sm_100a', False, True, False, False, False, 5120, 32, None): {"epi": 'tma', "slots": 2, "pro": 15, "htail": True, "lw": True},
     ('sm_100a', False, True, False, False, False, 5120, 48, None): {"epi": 'tma', "slots": 2, "pro": 15, "htail": True, "lw": True},
-    ('sm_100a', False, True, False, False, False, 5120, 64, None): {"epi": 'tma', "slots": 2, "cta1": True, "pd": 3},
+    ('sm_100a', False, True, False, False, False, 5120, 64, None): {"form": 'w8r', "epi": 'tma', "slots": 1, "pro": 15, "pd": 2, "group_m": 8, "sk": False},
     ('sm_100a', False, True, False, False, False, 5120, 128, None): {"epi": 'tma', "slots": 2, "pro": 15, "pd": 2, "lw": True},
-    ('sm_100a', False, True, False, False, False, 5120, 512, None): {"form": 'w8', "epi": 'tma', "slots": 1, "pro": 15, "pd": 2, "group_m": 8, "sk": False},
+    ('sm_100a', False, True, False, False, False, 5120, 512, None): {"form": 'w8r', "epi": 'tma', "slots": 1, "pro": 15, "pd": 2, "group_m": 8, "sk": False},
     ('sm_100a', False, True, False, False, False, 5120, 1024, None): {"form": 'w8', "pd": 2, "pro": 15, "group_m": 8, "sk": False},
     ('sm_100a', False, True, False, False, False, 5120, 5120, None): {"cgrp": True, "group_m": 12, "pro": 15},
     ('sm_100a', False, True, False, False, False, 5120, 17408, None): {"cta_rows": 256, "ovr": True, "htail": True},

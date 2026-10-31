@@ -64,6 +64,7 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define SMEM_WORK_RESPONSE_STRIDE 16
 #define SMEM_TOTAL 222336
 #define THREADS 320
+#define LAUNCH_MIN_BLOCKS 1
 
 #include <math_constants.h>
 
@@ -160,7 +161,7 @@ __device__ __forceinline__ void tma_3d_gmem2smem_cta2(
 
 extern "C" {
 
-__global__ __launch_bounds__(320) __cluster_dims__(2,1,1) void
+__global__ __launch_bounds__(320, LAUNCH_MIN_BLOCKS) __cluster_dims__(2,1,1) void
 kernel_cake_dense_projection_det_gemm_59fb66ccddd67565e592(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap OUT32, const __grid_constant__ CUtensorMap OUT16, __nv_bfloat16* __restrict__ out, float* __restrict__ out32, float* __restrict__ ws, unsigned int* __restrict__ counters, int M, int N, int m_tiles, int n_tiles, int group_m, int promo_code, int k_iters, int ldo, int out_l, int num_cluster_tiles, int num_l, int num_full, int iters_per_unit, int sk_iters)
 {
     const int tid = threadIdx.x;
@@ -457,12 +458,12 @@ kernel_cake_dense_projection_det_gemm_59fb66ccddd67565e592(const __grid_constant
                     #pragma unroll 1
                     for (int seg_1 = 0; seg_1 < nseg_1; seg_1++) {
                         int u_2_1 = (int)this_bid_1 / 2 - num_full;
-                        int lin0_1_1 = u_2_1 * iters_per_unit;
-                        int lin1_raw_1_1 = lin0_1_1 + iters_per_unit;
+                        int lin0_2 = u_2_1 * iters_per_unit;
+                        int lin1_raw_1_1 = lin0_2 + iters_per_unit;
                         int lin1_1_1 = ((lin1_raw_1_1 > sk_iters) ? sk_iters : lin1_raw_1_1);
-                        int t_1 = lin0_1_1 / k_iters + seg_1;
+                        int t_1 = lin0_2 / k_iters + seg_1;
                         int tb_1 = t_1 * k_iters;
-                        int kb0_1 = lin0_1_1 - tb_1;
+                        int kb0_1 = lin0_2 - tb_1;
                         int kbeg_t_1 = ((kb0_1 > 0) ? kb0_1 : 0);
                         int ke0_1 = lin1_1_1 - tb_1;
                         int kend_t_1 = ((ke0_1 > k_iters) ? k_iters : ke0_1);
@@ -608,21 +609,21 @@ kernel_cake_dense_projection_det_gemm_59fb66ccddd67565e592(const __grid_constant
             #pragma unroll 1
             for (unsigned int _tile_iter_2 = 0; _tile_iter_2 < num_cluster_tiles; _tile_iter_2++) {
                 int u_3 = (int)this_bid_2 / 2 - num_full;
-                int lin0_2 = u_3 * iters_per_unit;
-                int lin1_raw_2 = lin0_2 + iters_per_unit;
+                int lin0_3 = u_3 * iters_per_unit;
+                int lin1_raw_2 = lin0_3 + iters_per_unit;
                 int lin1_2 = ((lin1_raw_2 > sk_iters) ? sk_iters : lin1_raw_2);
-                int n_tail_2 = (lin1_2 - 1) / k_iters - lin0_2 / k_iters + 1;
+                int n_tail_2 = (lin1_2 - 1) / k_iters - lin0_3 / k_iters + 1;
                 int n_2 = ((u_3 < 0) ? 1 : n_tail_2);
                 int nseg_2 = n_2;
                 #pragma unroll 1
                 for (int seg_2 = 0; seg_2 < nseg_2; seg_2++) {
                     int u_3_1 = (int)this_bid_2 / 2 - num_full;
-                    int lin0_2_1 = u_3_1 * iters_per_unit;
-                    int lin1_raw_2_1 = lin0_2_1 + iters_per_unit;
+                    int lin0_3_1 = u_3_1 * iters_per_unit;
+                    int lin1_raw_2_1 = lin0_3_1 + iters_per_unit;
                     int lin1_2_1 = ((lin1_raw_2_1 > sk_iters) ? sk_iters : lin1_raw_2_1);
-                    int t_2 = lin0_2_1 / k_iters + seg_2;
+                    int t_2 = lin0_3_1 / k_iters + seg_2;
                     int tb_2 = t_2 * k_iters;
-                    int kb0_2 = lin0_2_1 - tb_2;
+                    int kb0_2 = lin0_3_1 - tb_2;
                     int kbeg_t_2 = ((kb0_2 > 0) ? kb0_2 : 0);
                     int ke0_2 = lin1_2_1 - tb_2;
                     int kend_t_2 = ((ke0_2 > k_iters) ? k_iters : ke0_2);
@@ -645,7 +646,7 @@ kernel_cake_dense_projection_det_gemm_59fb66ccddd67565e592(const __grid_constant
                     int off_n_1 = bid_n_1 * 128;
                     int bidx = head_1;
                     int part_4 = ((kbeg_2 > 0) ? 1 : ((kend_2 < k_iters) ? 1 : 0));
-                    int slab = u_3_1 + tail_t_2;
+                    int slab = tail_t_2 * 3 + ((kbeg_2 > 0) ? 1 : 0) + ((kbeg_2 > iters_per_unit) ? 1 : 0);
                     int global_row = off_m_1 + local_row;
                     int row0 = off_m_1 + warp_row0;
                     int col0 = slice_col0;
@@ -708,16 +709,20 @@ kernel_cake_dense_projection_det_gemm_59fb66ccddd67565e592(const __grid_constant
                         asm volatile("tcgen05.fence::before_thread_sync;");
                         __syncwarp();
                         int cidx = tail_t_2 * 16 + cta_rank * 8 + (warp - 2);
+                        int slab0 = tail_t_2 * 3;
                         int u_first = tail_t_2 * k_iters / iters_per_unit;
                         int u_last = ((tail_t_2 + 1) * k_iters - 1) / iters_per_unit;
                         int nparts = u_last - u_first + 1;
-                        unsigned int inc = ((lane == 0) ? 1 : 0);
-                        int aidx = ((lane == 0) ? cidx : 4096 + (cta_rank * 8 + (warp - 2)) * 32 + lane);
-                        unsigned int _atomic_fetch_add_1;
-                        asm volatile("atom.acq_rel.gpu.global.add.u32 %0, [%1], %2;"
-                            : "=r"(_atomic_fetch_add_1) : "l"(&counters[aidx]), "r"(static_cast<uint32_t>(inc)) : "memory");
-                        unsigned int _shfl_sync_0 = __shfl_sync(0xFFFFFFFF, _atomic_fetch_add_1, 0);
-                        if (_shfl_sync_0 == (unsigned int)(nparts - 1)) {
+                        unsigned int old = 0;
+                        if (lane == 0) {
+                            unsigned int _atomic_fetch_add_0;
+                            asm volatile("atom.acq_rel.gpu.global.add.u32 %0, [%1], %2;"
+                                : "=r"(_atomic_fetch_add_0) : "l"(&counters[cidx]), "r"(static_cast<uint32_t>(1)) : "memory");
+                            old = _atomic_fetch_add_0;
+                        }
+                        unsigned int arrival = __shfl_sync(0xFFFFFFFF, old, 0);
+                        if (arrival == (unsigned int)(nparts - 1)) {
+                            __syncwarp();
                             #pragma unroll
                             for (int j_2 = 0; j_2 < 64; j_2++) {
                                 _tmem_load_0[j_2] = 0.0f;
@@ -726,7 +731,7 @@ kernel_cake_dense_projection_det_gemm_59fb66ccddd67565e592(const __grid_constant
                             #pragma unroll 1
                             for (int sidx = 0; sidx < nparts; sidx++) {
                                 int slice_id_1 = cta_rank * 8 + (warp - 2);
-                                unsigned long long off_1 = (unsigned long long)((u_first + sidx + tail_t_2) * 16 + slice_id_1) * 2048 + (unsigned long long)((col0 - slice_col0) * 32 + lane * 4);
+                                unsigned long long off_1 = (unsigned long long)((slab0 + sidx) * 16 + slice_id_1) * 2048 + (unsigned long long)((col0 - slice_col0) * 32 + lane * 4);
                                 unsigned long long off_0_1 = off_1;
                                 if (nvalid_1 >= 64) {
                                     #pragma unroll

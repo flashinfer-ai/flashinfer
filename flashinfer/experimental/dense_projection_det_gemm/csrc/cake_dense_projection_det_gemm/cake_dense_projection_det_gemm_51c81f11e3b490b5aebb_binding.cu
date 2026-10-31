@@ -345,6 +345,8 @@ void Run(TensorView a_A, TensorView a_B, TensorView a_OUT32, TensorView a_OUT16,
       << KERNEL_NAME << ": requires ((out_l >= (N * ldo)) || (ldo >= (num_l * out_l)))";
   TVM_FFI_CHECK((CheckedMul(CheckedSub(a_num_cluster_tiles, a_num_full), a_iters_per_unit) <= 2147483647LL), ValueError)
       << KERNEL_NAME << ": requires (((num_cluster_tiles - num_full) * iters_per_unit) <= 2147483647)";
+  TVM_FFI_CHECK(((CheckedSub(a_num_cluster_tiles, a_num_full) == 0LL) || (CheckedMul(2LL, a_iters_per_unit) >= a_k_iters)), ValueError)
+      << KERNEL_NAME << ": requires (((num_cluster_tiles - num_full) == 0) || ((2 * iters_per_unit) >= k_iters))";
   TVM_FFI_CHECK(grid_x > 0 && grid_y > 0 && grid_z > 0, ValueError)
       << KERNEL_NAME << ": the grid (" << grid_x << ", " << grid_y << ", " << grid_z << ") must be positive";
   TVM_FFI_CHECK(grid_x <= 2147483647 && grid_y <= 65535 && grid_z <= 65535, ValueError)
