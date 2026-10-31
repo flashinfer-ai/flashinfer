@@ -195,3 +195,15 @@ Until then the C++ stays as-is and the DSL kernel lives beside it.
   mlp.down 8192 -2.1%); M=1024 rows +2.5..+6.6% (one tile per CTA: prologue 0.8 us,
   first TMA -> first MMA 1.4 us, epilogue 1.5 us per tile).  The B200 bench itself is
   +-4% noisy run to run (C++ mlp.down 8192 measured 331..357); use ncu for B200.
+- Fri 30 Oct 2026, late night: Blackwell M=1024 rows.  Per-variant sweeps (GB200 bench,
+  B200 locked clocks) show the DSL at parity or ahead on every tile except 2sm256x160
+  and 2sm256x192, which the cost model picks for gen.qkv / attn.out at M=1024 (one or
+  two tiles per CTA): +3..6%.  The mainloop rate per column matches the 128-wide tile,
+  so the loss is per-tile fixed cost (C++ CTAs 35.4k cycles vs ours 38.2k on the 160
+  tile).  Tried and reverted: a single accumulator stage for one-tile launches (five
+  transformed-A stages instead of three: no change) and double-buffered TMEM loads in
+  the epilogue (1.82 -> 1.73 us per 160-wide tile: the subtile cost is the store path
+  and barriers, not the load).  Kept: 64-column epilogue subtiles where the tile allows
+  (1.5 -> 1.0 us per 128-wide tile).  Open: the 160 tile's five 32-column subtiles
+  (160 has no larger power-of-two divisor that fits a 128-byte TMA swizzle) and the
+  first-tile fill (~2.2 us from the first TMA to the first MMA).
