@@ -937,6 +937,28 @@ def test_registry_records_reference_the_build_manifest():
             record
         ), name
         assert set(record["knobs"]) == set(loader.KNOB_KEYS), name
+        pdl = record["knobs"]["pdl"]
+        assert record["launch"]["use_pdl"] is pdl, name
+        assert name.endswith(loader.PDL_SUFFIX) == pdl, name
+        kernel_text = (PACKAGE_DIR / f"csrc/{record['library']}_kernel.cu").read_text()
+        binding_text = (
+            PACKAGE_DIR / f"csrc/{record['library']}_binding.cu"
+        ).read_text()
+        # A pdl build waits on the preceding grid and launches with the PDL
+        # attribute; a plain build does neither.
+        assert ("ProgrammaticStreamSerialization" in binding_text) == pdl, name
+        if pdl:
+            plain = loader.MODULES[name.removesuffix(loader.PDL_SUFFIX)]
+            assert record["arches"] == [
+                arch for arch in plain["arches"] if arch in loader.PDL_POLICY["arches"]
+            ], name
+            assert {**record["knobs"], "pdl": False} == plain["knobs"], name
+            assert record["arg_plan"] == plain["arg_plan"], name
+            assert record["grid_rule"] == plain["grid_rule"], name
+            assert "griddepcontrol.wait" in kernel_text, name
+            assert "griddepcontrol.launch_dependents" not in kernel_text, name
+        else:
+            assert "griddepcontrol" not in kernel_text, name
         assert tuple(record["launch"]["block"]) == (loader.THREADS, 1, 1), name
         kind = record["grid_rule"]["kind"]
         assert kind in GRID_RULES, name
@@ -1441,6 +1463,98 @@ def test_stage_policy_only_selects_shipped_builds(arch):
 def test_stage_policy_rejects_unsupported_heads():
     with pytest.raises(ValueError):
         _stage(("sm_100a", 16, 2, 1, 1, 64, 148, False, 1, False))
+
+
+# ----------------------------------------------------------------------------------------------
+# Programmatic dependent launch (CPU): ``enable_pdl`` takes the selected stage's pdl
+# build on SM100 / SM103 except where ``PDL_POLICY`` keeps the plain build;
+# ``enable_pdl=False`` is the plain selection.
+
+_PDL_TABLE: dict[tuple[str, int, int, int, int, bool], bool] = {
+    # (arch, Hq, Hkv, num_rows, num_requests, is_prefill) -> the pdl build is taken
+    ("sm_90a", 8, 1, 32, 32, False): False,
+    ("sm_90a", 64, 8, 32, 32, False): False,
+    ("sm_100a", 8, 1, 32, 32, False): True,
+    ("sm_103a", 8, 1, 32, 32, False): True,
+    ("sm_100a", 8, 1, 128, 128, False): True,
+    ("sm_100a", 8, 1, 129, 129, False): False,
+    ("sm_100a", 8, 1, 160, 160, False): False,
+    ("sm_103a", 8, 1, 160, 160, False): True,
+    ("sm_103a", 8, 1, 186, 186, False): True,
+    ("sm_103a", 8, 1, 187, 187, False): False,
+    ("sm_100a", 8, 1, 223, 223, False): False,
+    ("sm_103a", 8, 1, 224, 224, False): True,
+    ("sm_100a", 8, 1, 160, 160, True): True,
+    ("sm_103a", 8, 1, 8192, 1, True): True,
+    ("sm_100a", 64, 8, 239, 239, False): True,
+    ("sm_103a", 64, 8, 240, 240, False): False,
+    ("sm_100a", 64, 8, 128, 8, True): True,
+    ("sm_103a", 64, 8, 516, 4, True): False,
+    ("sm_100a", 64, 8, 1024, 1, True): False,
+}
+
+
+def test_pdl_policy_table_is_well_formed():
+    policy = loader.PDL_POLICY
+    assert set(policy) == {"arches", "constants", "rule", "version"}
+    assert tuple(policy["arches"]) == ("sm_100a", "sm_103a")
+    assert loader.PDL_SUFFIX == "_pdl" and loader.KNOB_KEYS[-1] == "pdl"
+
+
+@pytest.mark.parametrize("key,expected", list(_PDL_TABLE.items()))
+def test_enable_pdl_takes_the_pdl_build_where_the_policy_admits_it(key, expected):
+    arch, hq, hkv, rows, reqs, prefill = key
+    problem = dict(
+        arch=arch,
+        num_rows=rows,
+        num_requests=reqs,
+        page_size=64,
+        num_sms=148,
+        is_prefill=prefill,
+        max_pages_per_request=33,
+        has_out_kv=False,
+        quant_policy=1,
+    )
+    plain = loader.stage_for(hq, hkv, **problem)
+    assert loader.stage_for(hq, hkv, enable_pdl=False, **problem) == plain
+    assert not plain.endswith(loader.PDL_SUFFIX)
+    chosen = loader.stage_for(hq, hkv, enable_pdl=True, **problem)
+    assert chosen == (plain + loader.PDL_SUFFIX if expected else plain)
+    assert chosen in loader.stages_for(arch)
+    enabled = loader.pdl_enabled(
+        hq, hkv, arch=arch, num_rows=rows, num_requests=reqs, is_prefill=prefill
+    )
+    assert enabled is expected
+
+
+@pytest.mark.parametrize("arch", loader.ARCHES)
+def test_enable_pdl_only_selects_shipped_builds(arch):
+    shipped = set(loader.stages_for(arch))
+    for hq, hkv in loader.SUPPORTED_HEADS:
+        for reqs in (0, 1, 8, 16, 32, 128, 160, 200, 256, 512):
+            for rows in sorted({reqs, 1, 128, 239, 240, 4096, 8192}):
+                for prefill in (False, True):
+                    for pages, out_kv in ((33, False), (129, True)):
+                        for sms in (132, 148, 152):
+                            problem = dict(
+                                arch=arch,
+                                num_rows=rows,
+                                num_requests=reqs,
+                                page_size=64,
+                                num_sms=sms,
+                                is_prefill=prefill,
+                                max_pages_per_request=pages,
+                                has_out_kv=out_kv,
+                                quant_policy=1,
+                            )
+                            plain = loader.stage_for(hq, hkv, **problem)
+                            chosen = loader.stage_for(
+                                hq, hkv, enable_pdl=True, **problem
+                            )
+                            assert chosen in shipped, (arch, hq, hkv, rows, reqs)
+                            assert chosen in (plain, plain + loader.PDL_SUFFIX)
+                            if arch == "sm_90a":
+                                assert chosen == plain
 
 
 # ----------------------------------------------------------------------------------------------
