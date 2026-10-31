@@ -15,7 +15,8 @@ limitations under the License.
 
 Multi-GPU rows of the non-deterministic ``cake_causal_conv1d_multi_kcp(..., deterministic=False)`` (the q / k / v
 convolutions of a layer with one halo exchange per direction) on the deterministic multi suite's partitions, W = 2 /
-4 / 8 over NCCL.  Per row and rank, for every tensor:
+4 / 8 over NCCL, plus W = 16 rows (``-k w16``) on zigzag and per-document zigzag partitions (eager, and graph replay
+on the per-document one).  Per row and rank, for every tensor:
 
 - ``y`` and ``dx`` are bitwise the non-deterministic single calls' and the deterministic multi call's; ``y`` is also
   bitwise the single-rank zero-history convolution; each ``dweight`` partial is within the package budget of the
@@ -66,6 +67,13 @@ apply_to_package()
 
 DW_ATOL, DW_RTOL = 5e-2, 1e-4
 NONDET = {"deterministic": False}
+# W = 16 (16-way context parallelism) on the deterministic rows' packs, for the layouts any world size partitions;
+# the per-document zigzag row also runs under graph replay.
+ROWS_W16 = [
+    ((3000,), 16, "zigzag", (256, 256, 256)),
+    ((2048, 5, 3000, 1), 16, "zigzag_per_document", (384, 384, 384)),
+]
+GRAPH_ROWS_W16 = [ROWS_W16[1]]
 
 
 def _ratio(a: torch.Tensor, b: torch.Tensor, scale: float = 1.0) -> float:
@@ -419,11 +427,11 @@ def _launch(row, graph: bool) -> None:
     assert report["pass"], report
 
 
-@pytest.mark.parametrize("row", ROWS, ids=_row_id)
+@pytest.mark.parametrize("row", ROWS + ROWS_W16, ids=_row_id)
 def test_nondeterministic_multi_rows(row) -> None:
     _launch(row, graph=False)
 
 
-@pytest.mark.parametrize("row", GRAPH_ROWS, ids=_row_id)
+@pytest.mark.parametrize("row", GRAPH_ROWS + GRAPH_ROWS_W16, ids=_row_id)
 def test_nondeterministic_multi_graph_replay_rows(row) -> None:
     _launch(row, graph=True)

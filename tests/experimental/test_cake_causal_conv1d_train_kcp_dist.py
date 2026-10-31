@@ -15,8 +15,9 @@ limitations under the License.
 
 Multi-GPU rows of the non-deterministic ``cake_causal_conv1d_kcp(..., deterministic=False)``: ``W`` ranks over NCCL
 (W = 2 / 4 / 8) on the deterministic KCP suite's partitions (contiguous, zigzag, per-document zigzag, ragged tables
-with a zero-token rank, one-token fragments, a fragment that reads its history from three predecessor ranks).  Per
-row and rank:
+with a zero-token rank, one-token fragments, a fragment that reads its history from three predecessor ranks), plus
+W = 16 rows (``-k w16``) on the layouts any world size partitions: contiguous, zigzag and per-document zigzag (the
+ragged tables are written for at most eight ranks).  Per row and rank:
 
 - ``y`` is bitwise the single-rank zero-history convolution of the whole pack on the rank's tokens (anchor) and
   the deterministic KCP call's; ``dx`` is bitwise the deterministic KCP call's;
@@ -70,6 +71,12 @@ apply_to_package()
 
 DW_ATOL, DW_RTOL = 5e-2, 1e-4
 REPEATS = 20
+# W = 16 (16-way context parallelism) on the deterministic rows' packs, for the layouts any world size partitions.
+ROWS_W16 = [
+    ((100, 640, 77, 1000, 129), 16, "contiguous", 512),
+    ((3000,), 16, "zigzag", 256),
+    ((2048, 5, 3000, 1), 16, "zigzag_per_document", 384),
+]
 
 
 def _run_rank(
@@ -379,7 +386,7 @@ def _supported() -> bool:
     return is_cake_causal_conv1d_train_supported(torch.device("cuda"))
 
 
-@pytest.mark.parametrize("row", ROWS, ids=_row_id)
+@pytest.mark.parametrize("row", ROWS + ROWS_W16, ids=_row_id)
 def test_nondeterministic_kcp_rows(row) -> None:
     W = row[1]
     ntasks = int(os.environ.get("SLURM_NTASKS", "1"))
