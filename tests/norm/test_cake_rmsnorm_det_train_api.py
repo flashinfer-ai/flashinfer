@@ -25,6 +25,8 @@ backend package.
 
 from __future__ import annotations
 
+import re
+
 import pytest
 import torch
 
@@ -126,3 +128,74 @@ def test_facade_entry_points_match_the_backend(hidden: int) -> None:
     dx_backend, dw_backend = backend.cake_rmsnorm_det_train_backward(g, x, w, rstd)
     assert torch.equal(dx, dx_backend) and torch.equal(dw, dw_backend)
     assert torch.equal(cake_rmsnorm_det(x, w, eps), backend.cake_rmsnorm_det(x, w, eps))
+
+
+# "Beside kernels resident on other streams" in the facade docstring lists, per
+# architecture, the calls whose kernels need a whole SM.  A list item names an
+# architecture set ("SM100 / SM103:") and the calls: "the residual-fused H <h>
+# backward" (every token count) or "the forward / backward of H <h> above <t>
+# tokens" (every program window above ``t``).
+_WHOLE_SM_ITEM = re.compile(
+    r"the residual-fused H (\d+) backward|the (forward|backward) of H (\d+) above (\d+) tokens"
+)
+
+
+def _documented_whole_sm() -> dict[str, set[tuple[str, int, bool, int]]]:
+    """``arch -> {(kind, hidden, residual, above)}`` from the facade docstring."""
+    import flashinfer.cake_rmsnorm_det_train as facade
+
+    out: dict[str, set[tuple[str, int, bool, int]]] = {}
+    for item in re.split(r"\n- ", facade.__doc__ or "")[1:]:
+        text = " ".join(item.split("\n\n")[0].split())
+        head = re.match(r"((?:SM1\d\d)(?: / SM1\d\d)*):", text)
+        if head is None:
+            continue
+        for sm in re.findall(r"SM1\d\d", head.group(1)):
+            entries = out.setdefault(f"sm_{sm[2:]}a", set())
+            for residual_hidden, kind, hidden, above in _WHOLE_SM_ITEM.findall(text):
+                if residual_hidden:
+                    entries.add(("bwd", int(residual_hidden), True, 0))
+                else:
+                    entries.add(
+                        (
+                            "fwd" if kind == "forward" else "bwd",
+                            int(hidden),
+                            False,
+                            int(above),
+                        )
+                    )
+    return out
+
+
+def test_documented_whole_sm_calls_match_the_program_table() -> None:
+    """The facade's whole-SM lists name every architecture of the package, each
+    listed call names a shipped route of that architecture whose token
+    threshold is an edge of the route's program windows (with BF16 and FP32
+    weights alike), and the lists are the stall test's ``WHOLE_SM`` table, which
+    checks them on the device."""
+    from tests.norm.test_cake_rmsnorm_det_train_stall import WHOLE_SM
+
+    documented = _documented_whole_sm()
+    assert set(documented) == set(loader.ARCHES)
+    assert all(documented.values())
+    for arch, entries in documented.items():
+        assert entries == set(WHOLE_SM[arch]), arch
+        for kind, hidden, residual, above in entries:
+            dtypes = loader.weight_dtypes(arch, hidden, kind, residual)
+            assert dtypes, (arch, kind, hidden, residual)
+            for w_dtype in dtypes:
+                edges = {
+                    low
+                    for low, _high, _library in program_windows(
+                        arch, hidden, kind, residual, w_dtype
+                    )
+                }
+                assert above in edges, (
+                    arch,
+                    kind,
+                    hidden,
+                    residual,
+                    w_dtype,
+                    above,
+                    edges,
+                )

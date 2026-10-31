@@ -33,16 +33,19 @@ launch grids other than the production one (a CTA count that is not the slot
 count claims the same chunk table), and the workspace counters are zero after
 every call.
 
-The backward beside a kernel resident on every SM (issue #7548, item 2): a
-backward main kernel needs a large shared-memory carveout, so a side kernel
-holding every SM with the default carveout delays its start until the side
-kernel exits (documented in :mod:`flashinfer.cake_rmsnorm_det_train`).  The
-documented remedy is checked here: with the side kernel's preferred carveout
-set to the maximum shared memory, the backward and the forward start beside it
-and cost at most ``MAX_ALL_SM_EXTRA_MS`` more than alone, far below the side
-kernel's ``ALL_SM_SPIN_MS`` lifetime.  The residual route and the programs in
-``WHOLE_SM_ABOVE`` need a whole SM and are not checked.  Every side CTA records its SM, and a run counts
-only when the side kernel holds every SM.
+Calls beside a kernel resident on every SM (issue #7548, item 2; the rules
+of :mod:`flashinfer.cake_rmsnorm_det_train`): for every program window of every
+route of the device's architecture (forward and backward, BF16 and FP32
+weights, residual routes included), at the window's middle token count, the
+call is timed alone and beside a side kernel of one CTA per SM launched with
+the max-shared carveout.  Beside a 128-thread side CTA without shared memory
+exactly the windows of ``WHOLE_SM`` wait (cost at least ``MIN_WAIT_MS`` more,
+the side kernel lives ``ALL_SM_SPIN_MS``) and every other window starts (at
+most ``MAX_ALL_SM_EXTRA_MS`` more).  Beside a side CTA holding
+``RESIDENT_SMEM_BYTES`` of dynamic shared memory every window outside
+``WHOLE_SM`` still starts, and beside one KB more some window outside it waits.
+Every side CTA records its SM, and a run counts only when the side kernel holds
+every SM; the outputs of every call are bitwise those of the first alone call.
 """
 
 from __future__ import annotations
@@ -267,41 +270,86 @@ def test_dw_is_bitwise_independent_of_the_launch_grid(
     monkeypatch.setattr(loader, "launch_grid", production)
 
 
-# Item 2 of issue #7548: a side kernel of one 128-thread CTA per SM, each CTA
-# spinning ``ALL_SM_SPIN_MS`` of wall time (``%globaltimer``) after recording its
-# SM.  A backward that waits for it takes the rest of that lifetime; one that
+# Item 2 of issue #7548 and the "Beside kernels resident on other streams" rules of
+# :mod:`flashinfer.cake_rmsnorm_det_train`: a side kernel of one CTA per SM, each
+# CTA spinning ``ALL_SM_SPIN_MS`` of wall time (``%globaltimer``) after recording
+# its SM, launched with the max-shared carveout.  A call that waits for it takes
+# the rest of that lifetime (at least ``MIN_WAIT_MS`` more than alone); one that
 # starts beside it costs at most ``MAX_ALL_SM_EXTRA_MS`` more than alone.
 ALL_SM_SPIN_MS = 50.0
 ALL_SM_THREADS = 128
 ALL_SM_PRE_SLEEP_CYCLES = 2_000_000
-ALL_SM_TOKENS = (256, 1024, 4096, 16384)
 ALL_SM_RUNS = 5
 ALL_SM_TRIES = 4
 MAX_ALL_SM_EXTRA_MS = 1.0
+MIN_WAIT_MS = 0.5 * ALL_SM_SPIN_MS
 # cudaSharedmemCarveoutMaxShared
 CARVEOUT_MAX_SHARED = 100
-# Programs that need a whole SM wait beside a kernel resident on every SM
-# whatever its carveout (documented in :mod:`flashinfer.cake_rmsnorm_det_train`):
-# (capability, kind, hidden) -> the token counts above which the call does.
-WHOLE_SM_ABOVE = {
-    ((10, 7), "bwd", 1536): 1024,
-    ((10, 7), "bwd", 2048): 256,
-    ((10, 7), "bwd", 4096): 1024,
-    ((10, 7), "fwd", 6144): 4096,
+# The calls that need a whole SM, with BF16 and FP32 weights alike (the facade's
+# per-architecture list): arch -> (kind, hidden, residual, above), every window
+# of the route above ``above`` tokens.
+WHOLE_SM = {
+    "sm_100a": (("bwd", 6144, True, 0),),
+    "sm_103a": (("bwd", 6144, True, 0),),
+    "sm_107a": (
+        ("bwd", 6144, True, 0),
+        ("bwd", 1536, False, 1024),
+        ("bwd", 2048, False, 256),
+        ("bwd", 4096, False, 1024),
+        ("fwd", 6144, False, 4096),
+    ),
+}
+# The largest dynamic shared memory (bytes) one resident CTA per SM may hold
+# while every call outside ``WHOLE_SM`` still starts beside it (the facade's
+# 27 KB / 24 KB); one KB more makes some call wait.
+RESIDENT_SMEM_BYTES = {
+    "sm_100a": 27 * 1024,
+    "sm_103a": 27 * 1024,
+    "sm_107a": 24 * 1024,
 }
 
 
-def _skip_if_whole_sm(kind: str, hidden: int, rows: int) -> None:
-    above = WHOLE_SM_ABOVE.get((_capability(), kind, hidden))
-    if above is not None and rows > above:
-        pytest.skip(
-            f"the {kind} of hidden={hidden} above {above} rows needs a whole SM"
-        )
+def _arch() -> str:
+    return loader.arch_for_capability(_capability())
+
+
+def _needs_whole_sm(
+    arch: str, kind: str, hidden: int, residual: bool, above: int
+) -> bool:
+    """Whether the window starting above ``above`` tokens is in ``WHOLE_SM``."""
+    return any(
+        (kind, hidden, residual) == entry[:3] and above >= entry[3]
+        for entry in WHOLE_SM.get(arch, ())
+    )
+
+
+def _windows(arch: str) -> list[tuple[str, int, bool, str, int, int | None, int]]:
+    """``(kind, hidden, residual, w dtype, above, at_most, rows)`` of every
+    program window of every route on ``arch``, ``rows`` its middle token count."""
+    out = []
+    for hidden, _eps in WIDTHS:
+        for kind in ("fwd", "bwd"):
+            for residual in (False, True):
+                for w_dtype in loader.weight_dtypes(arch, hidden, kind, residual):
+                    for above, at_most, _library in loader.program_windows(
+                        arch, hidden, kind, residual, w_dtype
+                    ):
+                        rows = (
+                            max(above + 1, min(2 * above, 65536))
+                            if at_most is None
+                            else (above + 1 + at_most) // 2
+                        )
+                        out.append(
+                            (kind, hidden, residual, w_dtype, above, at_most, rows)
+                        )
+    return out
 
 
 _SPIN_KERNEL = "cake_rmsnorm_det_train_stall_spin"
 _SPIN_SOURCE = r"""
 extern "C" __global__ void cake_rmsnorm_det_train_stall_spin(unsigned long long ns, int* smids) {
+    // The launch's dynamic shared memory (possibly none) is held for the CTA's
+    // lifetime without being touched.
     if (threadIdx.x == 0) {
         unsigned int smid;
         asm volatile("mov.u32 %0, %%smid;" : "=r"(smid));
@@ -325,9 +373,10 @@ def _checked(result):
 
 class _AllSmSpin:
     """A side kernel of one CTA per SM (NVRTC + driver API, so the preferred
-    shared-memory carveout can be set on it)."""
+    shared-memory carveout can be set on it), holding ``smem_bytes`` of dynamic
+    shared memory per CTA."""
 
-    def __init__(self, carveout: int) -> None:
+    def __init__(self, carveout: int, smem_bytes: int = 0) -> None:
         from cuda.bindings import driver, nvrtc
 
         self._driver = driver
@@ -356,6 +405,15 @@ class _AllSmSpin:
                 carveout,
             )
         )
+        self.smem_bytes = int(smem_bytes)
+        if self.smem_bytes:
+            _checked(
+                driver.cuFuncSetAttribute(
+                    self._func,
+                    driver.CUfunction_attribute.CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                    self.smem_bytes,
+                )
+            )
         self.sms = torch.cuda.get_device_properties(device).multi_processor_count
         self.smids = torch.full((self.sms,), -1, dtype=torch.int32, device=device)
 
@@ -374,7 +432,7 @@ class _AllSmSpin:
                 ALL_SM_THREADS,
                 1,
                 1,
-                0,
+                self.smem_bytes,
                 self._driver.CUstream(stream.cuda_stream),
                 params,
                 0,
@@ -417,8 +475,10 @@ def _alone(call):
     return start.elapsed_time(end), out
 
 
-def _all_sm_medians(call, carveout: int):
-    spin = _AllSmSpin(carveout)
+def _all_sm_extra(call, spin: _AllSmSpin) -> float | None:
+    """Median time beside ``spin`` minus median time alone (ms); the outputs of
+    every call are bitwise the first alone call's.  ``None`` when the side
+    kernel did not hold every SM."""
     side = torch.cuda.Stream()
     for _ in range(WARMUP):
         _alone(call)
@@ -427,73 +487,95 @@ def _all_sm_medians(call, carveout: int):
         alone.append(_alone(call))
         timed = _beside_all_sms(call, spin, side)
         if timed is None:
-            pytest.skip(
-                f"the side kernel did not hold all {spin.sms} SMs in {ALL_SM_TRIES} launches"
-            )
+            return None
         busy.append(timed)
-    return (
-        statistics.median(t for t, _ in alone),
-        statistics.median(t for t, _ in busy),
-        alone,
-        busy,
+    reference = alone[0][1]
+    for _t, out in alone[1:] + busy:
+        assert all(torch.equal(a, b) for a, b in zip(out, reference, strict=True))
+    return statistics.median(t for t, _ in busy) - statistics.median(
+        t for t, _ in alone
     )
 
 
-@pytest.mark.parametrize("rows", ALL_SM_TOKENS)
-@pytest.mark.parametrize(
-    "hidden,residual", [r for r in ROUTES if not r[1]], ids=lambda v: str(v)
-)
-def test_backward_starts_beside_an_all_sm_kernel_with_the_max_shared_carveout(
-    hidden: int, residual: bool, rows: int
-) -> None:
-    _skip_unless_route(hidden, residual)
-    _skip_if_whole_sm("bwd", hidden, rows)
+def _window_call(kind: str, hidden: int, residual: bool, w_dtype: str, rows: int):
     x, w, g, g_h, rstd = _inputs(rows, hidden, residual)
+    if w_dtype == "f32":
+        w = w.float()
+    if kind == "fwd":
+        u = g if residual else None
+
+        def call():
+            out = (
+                cake_rmsnorm_det_train_forward(x, w, EPS[hidden], residual=u)
+                if residual
+                else cake_rmsnorm_det_train_forward(x, w, EPS[hidden])
+            )
+            return tuple(t.clone() for t in out)
+
+        return call
     workspace = cake_rmsnorm_det_train_backward_workspace(
         rows, hidden, _device(), residual=residual
     )
 
     def call():
-        return _backward(x, w, g, g_h, rstd, workspace)[1].clone()
+        return tuple(t.clone() for t in _backward(x, w, g, g_h, rstd, workspace))
 
-    alone_ms, busy_ms, alone, busy = _all_sm_medians(call, CARVEOUT_MAX_SHARED)
-    print(
-        f"ALL_SM hidden={hidden} rows={rows} carveout=max_shared "
-        f"alone_ms={alone_ms:.4f} busy_ms={busy_ms:.4f} extra_ms={busy_ms - alone_ms:.4f}"
-    )
-    reference = alone[0][1]
-    for _t, dw in alone[1:] + busy:
-        assert torch.equal(dw, reference), (
-            f"hidden={hidden} rows={rows}: dw differs beside the all-SM kernel"
+    return call
+
+
+def _beside(spin: _AllSmSpin) -> tuple[list[tuple], list[tuple]]:
+    """Every program window of the device's architecture (``_windows``) split
+    into the windows whose call waits for ``spin`` and those whose call starts
+    beside it."""
+    arch = _arch()
+    waits, starts = [], []
+    for window in _windows(arch):
+        kind, hidden, residual, w_dtype, _above, _at_most, rows = window
+        extra = _all_sm_extra(_window_call(kind, hidden, residual, w_dtype, rows), spin)
+        print(
+            f"ALL_SM {arch} side_smem={spin.smem_bytes} window={window} extra_ms={extra}"
         )
-    assert busy_ms - alone_ms <= MAX_ALL_SM_EXTRA_MS, (
-        f"hidden={hidden} rows={rows}: backward alone {alone_ms:.4f} ms, beside an all-SM "
-        f"kernel with the max-shared carveout {busy_ms:.4f} ms (at most "
-        f"{MAX_ALL_SM_EXTRA_MS} ms more; the side kernel lives {ALL_SM_SPIN_MS} ms)"
+        if extra is None:
+            pytest.skip(
+                f"the side kernel did not hold all {spin.sms} SMs in {ALL_SM_TRIES} launches"
+            )
+        assert extra >= MIN_WAIT_MS or extra <= MAX_ALL_SM_EXTRA_MS, (
+            f"{window}: {extra:.3f} ms more beside the side kernel, neither a start "
+            f"(at most {MAX_ALL_SM_EXTRA_MS} ms) nor a wait (at least {MIN_WAIT_MS} ms)"
+        )
+        (waits if extra >= MIN_WAIT_MS else starts).append(window)
+    return waits, starts
+
+
+def _listed(window: tuple) -> bool:
+    kind, hidden, residual, _w_dtype, above, _at_most, _rows = window
+    return _needs_whole_sm(_arch(), kind, hidden, residual, above)
+
+
+def test_calls_beside_an_all_sm_kernel_with_the_max_shared_carveout() -> None:
+    """Beside one resident 128-thread CTA per SM without shared memory and with
+    the max-shared carveout, exactly the windows of ``WHOLE_SM`` wait; every
+    other window of every route starts beside it."""
+    waits, starts = _beside(_AllSmSpin(CARVEOUT_MAX_SHARED))
+    assert starts
+    listed = [window for window in waits + starts if _listed(window)]
+    assert sorted(waits) == sorted(listed), (
+        f"wait but not in WHOLE_SM: {sorted(set(waits) - set(listed))}; "
+        f"in WHOLE_SM but start: {sorted(set(listed) - set(waits))}"
     )
 
 
-@pytest.mark.parametrize("rows", ALL_SM_TOKENS)
-@pytest.mark.parametrize("hidden", [h for h, _eps in WIDTHS], ids=lambda v: str(v))
-def test_forward_starts_beside_an_all_sm_kernel_with_the_max_shared_carveout(
-    hidden: int, rows: int
-) -> None:
-    _skip_unless_route(hidden, False)
-    _skip_if_whole_sm("fwd", hidden, rows)
-    x, w, _g, _g_h, _rstd = _inputs(rows, hidden, False)
-
-    def call():
-        return cake_rmsnorm_det_train_forward(x, w, EPS[hidden])[0]
-
-    alone_ms, busy_ms, alone, busy = _all_sm_medians(call, CARVEOUT_MAX_SHARED)
-    print(
-        f"ALL_SM_FWD hidden={hidden} rows={rows} carveout=max_shared "
-        f"alone_ms={alone_ms:.4f} busy_ms={busy_ms:.4f} extra_ms={busy_ms - alone_ms:.4f}"
+def test_calls_beside_an_all_sm_kernel_holding_shared_memory() -> None:
+    """Beside one resident CTA per SM holding ``RESIDENT_SMEM_BYTES`` of
+    dynamic shared memory (max-shared carveout) every window outside
+    ``WHOLE_SM`` starts; beside one KB more some other window waits."""
+    limit = RESIDENT_SMEM_BYTES[_arch()]
+    waits, starts = _beside(_AllSmSpin(CARVEOUT_MAX_SHARED, limit))
+    assert starts
+    assert all(_listed(window) for window in waits), (
+        f"wait beside {limit} B: {[w for w in waits if not _listed(w)]}"
     )
-    reference = alone[0][1]
-    for _t, y in alone[1:] + busy:
-        assert torch.equal(y, reference)
-    assert busy_ms - alone_ms <= MAX_ALL_SM_EXTRA_MS, (
-        f"hidden={hidden} rows={rows}: forward alone {alone_ms:.4f} ms, beside an all-SM "
-        f"kernel with the max-shared carveout {busy_ms:.4f} ms (at most {MAX_ALL_SM_EXTRA_MS} ms more)"
+    more, _starts = _beside(_AllSmSpin(CARVEOUT_MAX_SHARED, limit + 1024))
+    assert any(not _listed(window) for window in more), (
+        f"no window outside WHOLE_SM waits beside {limit + 1024} B"
     )
