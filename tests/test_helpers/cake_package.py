@@ -55,6 +55,11 @@ PACKAGES: dict[str, str] = {
 }
 # Compatibility key: suites that name the causal conv1d package ``cake_causal_conv1d_train`` load the det package.
 PACKAGES["cake_causal_conv1d_train"] = PACKAGES["cake_causal_conv1d_det_train"]
+# The non-deterministic causal conv1d package (``deterministic=False``).  Its key carries the namespace because
+# ``cake_causal_conv1d_train`` stays the det package's compatibility key above.
+PACKAGES["cake.cake_causal_conv1d_train"] = (
+    "flashinfer.experimental.cake.cake_causal_conv1d_train_backend"
+)
 
 
 def cake_package(name: str, submodule: str | None = None) -> ModuleType:
