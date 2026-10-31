@@ -1,3 +1,4 @@
+import ast
 import bisect
 import contextlib
 import copy
@@ -1392,6 +1393,29 @@ class ProfilingCacheKey:
         return str(self.key_fields)
 
 
+def _is_profile(profile: Any) -> bool:
+    """Whether *profile* is a tuple of int tuples, like a ``nearest_profile``."""
+    return isinstance(profile, tuple) and all(
+        isinstance(shape, tuple) and all(type(v) is int for v in shape)
+        for shape in profile
+    )
+
+
+@functools.lru_cache(maxsize=16384)
+def _parse_file_key_profile(text: str) -> tuple[tuple[int, ...], ...] | None:
+    """Parse the ``nearest_profile`` part of a ``ProfilingCacheKey.file_key``.
+
+    Returns ``None`` when *text* is not a tuple of int tuples.  Cached because
+    file keys are immutable and every lookup above the tuned range rescans
+    them (see ``AutoTuner._top_tuned_profile``).
+    """
+    try:
+        profile = ast.literal_eval(text)
+    except (SyntaxError, ValueError, TypeError, RecursionError):
+        return None
+    return profile if _is_profile(profile) else None
+
+
 @dataclass
 class AutoTunerStatistics:
     """Statistics collected by the AutoTuner.
@@ -1843,6 +1867,9 @@ class AutoTuner:
         self._logged_cache_miss_oor: set[tuple[str, tuple[tuple[int, ...], ...]]] = (
             set()
         )
+        # (custom_op, requested profile) pairs already logged as served from
+        # the largest tuned bucket (see _top_tuned_profile).
+        self._logged_top_bucket: set[tuple[str, tuple[tuple[int, ...], ...]]] = set()
         # Set when new profiling results are added; cleared on save.
         self._dirty = False
         self._dirty_seq = 0
@@ -2171,6 +2198,10 @@ class AutoTuner:
             3. Bundled package configs (legacy .py files)
             4. Fallback tactic (-1)
 
+        Outside tuning mode, a lookup that misses because its bucket lies
+        above every bucket tuned for the op is retried at the largest tuned
+        bucket before falling back (see :meth:`_top_tuned_profile`).
+
         Args:
             custom_op (str): The name of the custom operation to be tuned
             runners (List[TunableRunner]): List of candidate implementations to profile
@@ -2198,6 +2229,70 @@ class AutoTuner:
             synthesis-invariant; see: TunableRunner.get_cache_key_extras.
         """
         with self._lock:
+            result = self._search_cache_impl(
+                custom_op,
+                runners,
+                input_shapes,
+                tuning_config,
+                inputs,
+                require_profiling_policy=require_profiling_policy,
+            )
+            # In tuning mode a miss means "profile this bucket", so only
+            # lookup-only searches fall back to the top tuned bucket. Replay
+            # reports exact coverage, so a clamped hit would hide a miss.
+            if (
+                result[0]
+                or self.is_tuning_mode
+                or require_profiling_policy
+                or self._v2_local.replay_report is not None
+                or self._v2_local.strict_replay
+            ):
+                return result
+            top_profile = self._top_tuned_profile(
+                custom_op, runners, input_shapes, tuning_config, inputs
+            )
+            if top_profile is None:
+                return result
+            top_result = self._search_cache_impl(
+                custom_op,
+                runners,
+                input_shapes,
+                tuning_config,
+                inputs,
+                nearest_profile=top_profile,
+            )
+            if not top_result[0]:
+                return result
+            requested = self._find_nearest_profile(input_shapes, tuning_config)
+            log_key = (custom_op, requested)
+            if log_key not in self._logged_top_bucket:
+                self._logged_top_bucket.add(log_key)
+                logger.info(
+                    f"[AutoTuner]: {custom_op} profile {requested} is above the "
+                    f"largest tuned bucket; using the config tuned for "
+                    f"{top_profile} (runner="
+                    f"{runners[top_result[1]].__class__.__name__}, "
+                    f"tactic={top_result[2]!r})"
+                )
+            return top_result
+
+    def _search_cache_impl(
+        self,
+        custom_op: str,
+        runners: list[TunableRunner],
+        input_shapes: tuple[tuple[int, ...], ...],
+        tuning_config: TuningConfig,
+        inputs: list[torch.Tensor] | None = None,
+        *,
+        require_profiling_policy: bool = False,
+        nearest_profile: tuple[tuple[int, ...], ...] | None = None,
+    ) -> tuple[bool, int, Any, OptimizationProfile | None]:
+        """Search sources 1-4 of :meth:`search_cache` for one profile.
+
+        ``nearest_profile``, when given, is used as the cache-key profile
+        instead of the bucket-mapped ``input_shapes``.
+        """
+        with self._lock:
             report = self._v2_local.replay_report
             require_profiling_policy |= self._v2_local.strict_replay
             rejections: list[str] | None = [] if report is not None else None
@@ -2218,6 +2313,7 @@ class AutoTuner:
                     input_shapes,
                     tuning_config,
                     r.get_cache_key_extras(inputs) if inputs is not None else (),
+                    nearest_profile=nearest_profile,
                 )
                 runner_keys.append((r_id, cache_key))
                 if cache_key in winners:
@@ -2436,6 +2532,132 @@ class AutoTuner:
                         f"input_shapes={input_shapes}, reasons={reasons}"
                     )
             return False, 0, -1, None
+
+    def _top_tuned_profile(
+        self,
+        custom_op: str,
+        runners: list[TunableRunner],
+        input_shapes: tuple[tuple[int, ...], ...],
+        tuning_config: TuningConfig,
+        inputs: list[torch.Tensor] | None,
+    ) -> tuple[tuple[int, ...], ...] | None:
+        """Return the largest tuned profile for a lookup above the tuned range.
+
+        A lookup's bucket can lie above every bucket tuned for the op: the
+        runtime size exceeds the tuned sizes, or tuning ran under
+        ``autotune(tuning_buckets=...)`` and stored its top bucket under a
+        value the op's own ``map_to_tuning_buckets`` never produces (e.g.
+        21504 stored as 21504 but looked up as its next power of two, 32768).
+        Either way the lookup would silently use the untuned fallback.
+
+        Candidates are the tuned profiles in the active in-memory partition,
+        the user-loaded configs and the hydrated entries of the active
+        managed store whose op, runner, cache-key extras and non-dynamic dims
+        match this lookup.  The legacy bundled package configs
+        (``FLASHINFER_AUTOTUNER_LOAD_FROM_FILE=1``) are looked up by key and
+        are not scanned.  Every dynamic dim whose bucket exceeds all
+        candidates is set to the largest candidate value; the others keep
+        their bucket.
+
+        Returns:
+            The clamped profile, or ``None`` when no dynamic dim lies above
+            the tuned range (lookups below or between tuned buckets keep
+            missing).
+        """
+        specs = tuning_config.dynamic_tensor_specs
+        winners = self._winner_cache()
+        store = self._active_managed_store
+        # Untuned processes take this path on every call; keep it cheap.
+        file_configs = self._file_configs and not self._isolate_legacy_configs
+        if not specs or not (winners or file_configs or store is not None):
+            return None
+        runner_ids = [
+            (
+                r.__class__.__name__,
+                hash(r),
+                r.get_cache_key_extras(inputs) if inputs is not None else (),
+            )
+            for r in runners
+        ]
+
+        tuned = [
+            key.nearest_profile
+            for key in winners
+            if key.custom_op == custom_op
+            and (key.runner_class_name, key.runner_hash, key.extras) in runner_ids
+        ]
+        if file_configs:
+            excluded = self._excluded_file_keys.get(self._winner_cache_identity(), ())
+            # file_key is str((custom_op, runner_class_name, profile, extras)).
+            affixes = [
+                (f"({custom_op!r}, {name!r}, ", f", {extras!r})")
+                for name, _, extras in runner_ids
+            ]
+            for file_key in self._file_configs:
+                if file_key in excluded:
+                    continue
+                for prefix, suffix in affixes:
+                    if (
+                        len(file_key) > len(prefix) + len(suffix)
+                        and file_key.startswith(prefix)
+                        and file_key.endswith(suffix)
+                    ):
+                        profile = _parse_file_key_profile(
+                            file_key[len(prefix) : -len(suffix)]
+                        )
+                        if profile is not None:
+                            tuned.append(profile)
+                        break
+        if store is not None:
+            store_id = (str(store.root), store.env_hash)
+            fields = [(custom_op, name, extras) for name, _, extras in runner_ids]
+            tuned.extend(
+                key_fields[2]
+                for root, env_hash, key_fields in self._managed_decoded
+                if (root, env_hash) == store_id
+                and len(key_fields) == 4
+                and (key_fields[0], key_fields[1], key_fields[3]) in fields
+                and _is_profile(key_fields[2])
+            )
+        if not tuned:
+            return None
+
+        requested = self._find_nearest_profile(input_shapes, tuning_config)
+        # (input_idx, dim_idx) pairs of each spec; linked dims share a bucket.
+        # dim_idx may be negative (e.g. -2 for M of an (M, K) operand).
+        spec_dims = [
+            tuple(
+                (i, d % len(requested[i]))
+                for i, d in zip(spec.input_idx, spec.dim_idx, strict=True)
+            )
+            for spec in specs
+        ]
+        dynamic = {dim for dims in spec_dims for dim in dims}
+
+        def same_static_dims(profile: tuple[tuple[int, ...], ...]) -> bool:
+            return len(profile) == len(requested) and all(
+                len(shape) == len(req_shape)
+                and all(
+                    (i, d) in dynamic or v == req_v
+                    for d, (v, req_v) in enumerate(zip(shape, req_shape, strict=True))
+                )
+                for i, (shape, req_shape) in enumerate(
+                    zip(profile, requested, strict=True)
+                )
+            )
+
+        tuned = [profile for profile in tuned if same_static_dims(profile)]
+        if not tuned:
+            return None
+        clamped = [list(shape) for shape in requested]
+        for dims in spec_dims:
+            i0, d0 = dims[0]
+            top = max(profile[i0][d0] for profile in tuned)
+            if requested[i0][d0] > top:
+                for i, d in dims:
+                    clamped[i][d] = top
+        top_profile = tuple(tuple(shape) for shape in clamped)
+        return None if top_profile == requested else top_profile
 
     def _apply_tuning_overrides(self, tuning_config: TuningConfig) -> TuningConfig:
         """Return a ``TuningConfig`` with active context overrides applied.
@@ -2716,9 +2938,11 @@ class AutoTuner:
                     # results *for this specific custom_op* in the
                     # current process but this particular input shape
                     # still falls back, that almost always means the
-                    # runtime input is *outside the tuned range* (e.g.
-                    # ``max_num_tokens`` was 2048 during tuning,
-                    # runtime sees 4000).  This is a silent perf
+                    # runtime input is *outside the tuned range*: below
+                    # or between the tuned buckets, or with static dims
+                    # that were never tuned (buckets above the largest
+                    # tuned one are served from it by search_cache).
+                    # This is a silent perf
                     # regression: the fallback tactic is correct but
                     # not optimised for this shape.  Warn once per
                     # unique (op, profile-signature) pair so the user
@@ -4209,12 +4433,15 @@ class AutoTuner:
         input_shapes: tuple[tuple[int, ...], ...],
         tuning_config: TuningConfig,
         extras: tuple[Any, ...] = (),
+        nearest_profile: tuple[tuple[int, ...], ...] | None = None,
     ) -> ProfilingCacheKey:
+        if nearest_profile is None:
+            nearest_profile = cls._find_nearest_profile(input_shapes, tuning_config)
         return ProfilingCacheKey(
             custom_op=custom_op,
             runner_class_name=runner.__class__.__name__,
             runner_hash=hash(runner),
-            nearest_profile=cls._find_nearest_profile(input_shapes, tuning_config),
+            nearest_profile=nearest_profile,
             extras=extras,
         )
 
@@ -4839,6 +5066,7 @@ class AutoTuner:
             self._observed_cache_generations.clear()
             self._logged_file_hits.clear()
             self._logged_cache_miss_oor.clear()
+            self._logged_top_bucket.clear()
             self._dirty = False
             self._dirty_seq = 0
             self._winner_partitions.clear()
