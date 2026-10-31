@@ -805,57 +805,83 @@ FAST_DIV_TOKENS = [[1, 128], [1024, 1048576]]
 FAST_DIV_DETERMINISTIC = True
 # The fast coefficient-chain forms of programs on sm_107a (the same launch and
 # outputs): the BF16-output tailpipe program ("bf16"), the FP8 group-128
-# weight-staging tail form in the raw scale mode and a selection without the
-# mode ("fp8_group128"), the FP8 group-128 UE8M0 tailpipe program in the UE8M0
-# mode ("fp8_group128_ue8m0") and the NVFP4 tailpipe program ("nvfp4"). The
+# weight-staging tail form ("fp8_group128") and plain program
+# ("fp8_group128_plain") in the raw scale mode and a selection without the
+# mode, the FP8 group-128 UE8M0 tailpipe program in the UE8M0 mode
+# ("fp8_group128_ue8m0") and the NVFP4 tailpipe program ("nvfp4"). The
 # loader launches each in its program's regime at the token counts of
 # FAST_CHAIN_TOKENS (the launches outside the deterministic mode) and of
 # FAST_CHAIN_DETERMINISTIC_TOKENS (deterministic launches), inclusive ranges.
 FAST_CHAIN_PROGRAMS = {
     "bf16": "cake_mega_mhc_eacfb4131fb2c035d8a9",
     "fp8_group128": "cake_mega_mhc_cc415e5a555e838177f7",
+    "fp8_group128_plain": "cake_mega_mhc_f2a295521599a18c6b86",
     "fp8_group128_ue8m0": "cake_mega_mhc_c74bb9bb0a67abd4c72a",
     "nvfp4": "cake_mega_mhc_d5d1da31e8a83833d6da",
 }
 FAST_CHAIN_REGIMES = {
     "bf16": "tailpipe",
     "fp8_group128": "tailpipe_wsmem",
+    "fp8_group128_plain": "bf16",
     "fp8_group128_ue8m0": "tailpipe",
     "nvfp4": "tailpipe",
 }
 FAST_CHAIN_TOKENS = {
     "bf16": [[385, 832]],
     "fp8_group128": [[5185, 1048576]],
+    "fp8_group128_plain": [[193, 384]],
     "fp8_group128_ue8m0": [[385, 832]],
     "nvfp4": [[833, 1008]],
 }
 FAST_CHAIN_DETERMINISTIC_TOKENS = {
-    "bf16": [[1, 1024]],
+    "bf16": [[1, 1279]],
     "fp8_group128": [],
+    "fp8_group128_plain": [],
     "fp8_group128_ue8m0": [],
     "nvfp4": [],
 }
 FAST_CHAIN_ARCHES = ["sm_107a"]
+# The UE8M0 mode's deterministic launches of the plain variant's regime ("bf16")
+# that the UE8M0 tailpipe program takes on UE8M0_ARCHES (the same 16 splits and
+# launch, so the same outputs): the token counts of
+# UE8M0_DETERMINISTIC_TAIL_TOKENS (inclusive ranges).
+UE8M0_DETERMINISTIC_TAIL_TOKENS = [[1024, 3328]]
 
 
 def _fast_chain_program(layout, regime, arch, tokens, deterministic, ue8m0=None):
     """The fast_chain program a launch of ``layout`` in ``regime`` on ``arch``
     takes (``ue8m0``: the FP8 scale mode; the UE8M0 mode reads the
-    "fp8_group128_ue8m0" key), or None where its regime's program keeps the
-    launch."""
-    key = layout + "_ue8m0" if layout == "fp8_group128" and ue8m0 else layout
-    if (
-        key not in FAST_CHAIN_PROGRAMS
-        or arch not in FAST_CHAIN_ARCHES
-        or regime != FAST_CHAIN_REGIMES[key]
-    ):
-        return None
-    ranges = (FAST_CHAIN_DETERMINISTIC_TOKENS if deterministic else FAST_CHAIN_TOKENS)[
-        key
-    ]
-    if any(first <= tokens <= last for first, last in ranges):
-        return FAST_CHAIN_PROGRAMS[key]
+    "fp8_group128_ue8m0" key, the other modes the layout's key and its "_plain"
+    key), or None where its regime's program keeps the launch."""
+    if layout == "fp8_group128" and ue8m0:
+        keys = [layout + "_ue8m0"]
+    else:
+        keys = [layout, layout + "_plain"]
+    for key in keys:
+        if (
+            key not in FAST_CHAIN_PROGRAMS
+            or arch not in FAST_CHAIN_ARCHES
+            or regime != FAST_CHAIN_REGIMES[key]
+        ):
+            continue
+        ranges = (
+            FAST_CHAIN_DETERMINISTIC_TOKENS if deterministic else FAST_CHAIN_TOKENS
+        )[key]
+        if any(first <= tokens <= last for first, last in ranges):
+            return FAST_CHAIN_PROGRAMS[key]
     return None
+
+
+def _ue8m0_program(regime, tokens, deterministic):
+    """The UE8M0 program a launch in ``regime`` on sm_107a takes where no
+    fast_chain route names it: the UE8M0 tailpipe program at the deterministic
+    launches of UE8M0_DETERMINISTIC_TAIL_TOKENS in the plain regime, else the
+    regime's own."""
+    if regime == "bf16" and deterministic:
+        for first, last in UE8M0_DETERMINISTIC_TAIL_TOKENS:
+            if first <= tokens <= last:
+                return UE8M0_PROGRAMS["tailpipe"]
+    return UE8M0_PROGRAMS[regime]
 
 
 def _variant_program(layout, regime, arch, ue8m0=True):
@@ -1027,6 +1053,7 @@ def test_h4096_tail_program_follows_the_split_count(num_sms):
         r
         for r in _runtime.ROUTES
         if r["program"] in (FAST_DIV_PROGRAM, *FAST_CHAIN_PROGRAMS.values())
+        or "tokens" in r
     ]
     keyed = [
         r
@@ -1688,8 +1715,8 @@ def test_h4096_every_program_ships_for_every_listed_architecture():
     }
     pow2 = set(UE8M0_PROGRAMS.values())
     chain = set(FAST_CHAIN_PROGRAMS.values())
-    assert len(h4096) == 17 and len(tails) == 4 and tails < set(h4096)
-    assert len(chain) == 4 and chain < set(h4096) and not chain & tails
+    assert len(h4096) == 18 and len(tails) == 4 and tails < set(h4096)
+    assert len(chain) == 5 and chain < set(h4096) and not chain & tails
     assert len(pow2) == 3 and pow2 < set(h4096) and not pow2 & tails
     assert FAST_DIV_PROGRAM in h4096 and FAST_DIV_PROGRAM not in pow2 | tails
     for name in h4096:
@@ -1771,12 +1798,32 @@ def test_h4096_fp8_ue8m0_routes_select_the_pow2_programs():
         assert pow2["arg_plan"] == plain["arg_plan"]
         assert pow2["launch"] == plain["launch"]
         assert pow2["kernel_symbol"] != plain["kernel_symbol"]
-        route = [r for r in _runtime.ROUTES if r["program"] == UE8M0_PROGRAMS[regime]]
+        route = [
+            r
+            for r in _runtime.ROUTES
+            if r["program"] == UE8M0_PROGRAMS[regime] and "tokens" not in r
+        ]
         twin = [r for r in _runtime.ROUTES if r["program"] == programs[regime]]
         assert len(route) == len(twin) == 1, regime
         assert route[0]["fp8_sf_ue8m0"] is True
         rest = {k: v for k, v in route[0].items() if k != "fp8_sf_ue8m0"}
         assert dict(rest, program=None) == dict(twin[0], program=None)
+    # The deterministic tail routes: the UE8M0 plain route keyed on
+    # "deterministic" and "tokens" with the UE8M0 tailpipe program, ahead of it;
+    # the tailpipe record has the plain record's arg_plan, launch and options.
+    tail, plain = UE8M0_PROGRAMS["tailpipe"], UE8M0_PROGRAMS["bf16"]
+    routes = [r for r in _runtime.ROUTES if r["program"] == tail and "tokens" in r]
+    (route,) = [r for r in _runtime.ROUTES if r["program"] == plain]
+    assert [r["tokens"] for r in routes] == [UE8M0_DETERMINISTIC_TAIL_TOKENS]
+    for r in routes:
+        assert r["deterministic"] is True
+        assert _runtime.ROUTES.index(r) < _runtime.ROUTES.index(route)
+        rest = {k: v for k, v in r.items() if k not in ("tokens", "deterministic")}
+        assert dict(rest, program=None) == dict(route, program=None)
+    record, base = _runtime.PROGRAMS[tail], _runtime.PROGRAMS[plain]
+    assert record["arg_plan"] == base["arg_plan"]
+    assert record["launch"] == base["launch"]
+    assert record["compile_options"] == base["compile_options"]
 
 
 def test_h4096_fp8_raw_fast_div_routes_select_the_fast_div_program():
@@ -1843,7 +1890,7 @@ def test_h4096_fp8_raw_fast_div_routes_select_the_fast_div_program():
                 )
                 assert _runtime.select_program(
                     *key, "sm_107a", regime=regime, fp8_sf_ue8m0=True, **launch
-                ) == (ue8m0_chain or UE8M0_PROGRAMS[regime], {})
+                ) == (ue8m0_chain or _ue8m0_program(regime, t, deterministic), {})
                 if regime != "bf16":
                     continue
                 for arch in ("sm_100a", "sm_103a"):
@@ -1867,13 +1914,14 @@ def test_h4096_fast_chain_routes_select_the_fast_chain_programs():
     plains = {
         "bf16": TAIL_PROGRAMS["tailpipe"],
         "fp8_group128": VARIANT_PROGRAMS["fp8_group128"]["tailpipe_wsmem"],
+        "fp8_group128_plain": VARIANT_PROGRAMS["fp8_group128"]["bf16"],
         "fp8_group128_ue8m0": UE8M0_PROGRAMS["tailpipe"],
         "nvfp4": VARIANT_PROGRAMS["nvfp4"]["tailpipe"],
     }
     assert set(FAST_CHAIN_PROGRAMS) == set(plains)
     for name, program in FAST_CHAIN_PROGRAMS.items():
-        layout = name.removesuffix("_ue8m0")
-        ue8m0 = name != layout
+        layout = name.removesuffix("_ue8m0").removesuffix("_plain")
+        ue8m0 = name.endswith("_ue8m0")
         plain = plains[name]
         record, base = _runtime.PROGRAMS[program], _runtime.PROGRAMS[plain]
         assert _runtime.record_arches(record) == FAST_CHAIN_ARCHES
@@ -1883,7 +1931,9 @@ def test_h4096_fast_chain_routes_select_the_fast_chain_programs():
         assert record["compile_options"] == base["compile_options"]
         assert record["kernel_symbol"] != base["kernel_symbol"]
         routes = [r for r in _runtime.ROUTES if r["program"] == program]
-        (route,) = [r for r in _runtime.ROUTES if r["program"] == plain]
+        (route,) = [
+            r for r in _runtime.ROUTES if r["program"] == plain and "tokens" not in r
+        ]
         assert routes and all(
             _runtime.ROUTES.index(r) < _runtime.ROUTES.index(route) for r in routes
         )
@@ -1939,7 +1989,10 @@ def test_h4096_fast_chain_routes_select_the_fast_chain_programs():
                         )
                         if got[0] == FAST_DIV_PROGRAM:
                             continue  # the fast-division routes (their own test)
-                        assert got == (want or kept, {}), (name, other, t, mode)
+                        held = (
+                            _ue8m0_program(other, t, deterministic) if ue8m0 else kept
+                        )
+                        assert got == (want or held, {}), (name, other, t, mode)
                     if layout == "fp8_group128":
                         got = _runtime.select_program(
                             *key,
