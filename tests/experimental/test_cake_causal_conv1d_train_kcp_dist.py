@@ -330,13 +330,26 @@ def _run_rank(
         timed.dx = dx_t
         return start.elapsed_time(end)
 
+    def side_kernel_ms() -> float:
+        torch.cuda.synchronize(device)
+        with torch.cuda.stream(side):
+            start.record()
+            torch.cuda._sleep(10_000_000)
+            end.record()
+        torch.cuda.synchronize(device)
+        return start.elapsed_time(end)
+
     for _ in range(3):
         timed(False)
     alone = statistics.median(timed(False) for _ in range(7))
     busy = statistics.median(timed(True) for _ in range(7))
-    info["side_kernel_ms"] = {"alone": alone, "busy": busy}
+    sleep = side_kernel_ms()
+    info["side_kernel_ms"] = {"alone": alone, "busy": busy, "side": sleep}
     flags["side_kernel_dx_bitwise"] = same(timed.dx, det["dx"])
-    flags["side_kernel_no_stall"] = busy <= 2.0 * alone
+    # A stall waits for the side kernel, so busy reaches its sleep (milliseconds).
+    # These rows are tiny: one more wave of CTAs beside the SM that the side kernel
+    # holds can exceed 2x alone (about 0.1 ms) without a stall.
+    flags["side_kernel_no_stall"] = busy <= max(2.0 * alone, 0.5 * sleep)
     flag_list = [None] * W
     info_list = [None] * W
     dist.all_gather_object(flag_list, flags)
