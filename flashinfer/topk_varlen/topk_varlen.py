@@ -66,7 +66,7 @@ import torch
 
 from ..api_logging import flashinfer_api
 from ..trace.templates.topk import top_k_varlen_trace
-from ..topk import _ROW_STATES_NBYTES, get_topk_module
+from ..topk import _get_row_states_buffer, get_topk_module
 
 from ..cute_dsl.availability import is_cute_dsl_available
 
@@ -923,9 +923,14 @@ def _compile_radix(
             cute.runtime.make_fake_compact_tensor(
                 cute_dtype, (sym_rows, sym_n), stride_order=(1, 0), assumed_align=16
             ),
+            # The single-CTA kernel guards every row_states access with
+            # const_expr(ctas_per_group > 1) and compiles them away, so it takes
+            # no row_states tensor, like the absent output_values below.
             cute.runtime.make_fake_compact_tensor(
                 cutlass.Int32, (max_num_groups, _RADIX_STATE_SIZE), stride_order=(1, 0)
-            ),
+            )
+            if ctas_per_group > 1
+            else None,
             cute.runtime.make_fake_compact_tensor(
                 cutlass.Int32, (sym_groups,), stride_order=(0,)
             ),
@@ -1267,11 +1272,7 @@ def _run_radix_cutlass(
     # offsets=zeros: output indices are local column indices (0..N-1), no shift.
     offsets = torch.zeros(num_rows, dtype=torch.int32, device=logits.device)
 
-    # Fresh zeroed state keeps concurrent calls disjoint and initializes the
-    # inter-CTA synchronization counters for every launch.
-    row_states_buffer = torch.zeros(
-        _ROW_STATES_NBYTES, dtype=torch.uint8, device=logits.device
-    )
+    row_states_buffer = _get_row_states_buffer("radix_topk_row_states", logits.device)
     # Write directly into out_indices — no second allocation or copy_ needed.
     get_topk_module().radix_topk_ragged_transform(
         logits,
@@ -1379,14 +1380,27 @@ def _run_radix(
         num_sms,
     )
 
-    # Fresh zeroed state keeps concurrent calls disjoint and initializes the
-    # inter-CTA synchronization counters for every launch.
+    # row_states holds the global histograms + inter-CTA barrier counters used
+    # when ctas_per_group > 1. max_num_groups must equal the compile-time value
+    # (both = num_sms // ctas_per_group) so the buffer matches the grid.
+    #
+    # The single-CTA regime compiles every row_states access away (see
+    # _compile_radix), so it passes no buffer at all. The multi-CTA regime takes
+    # the worst-case num_sms rows once per stream and slices them to the grid, so
+    # the buffer never has to grow between calls with different ctas_per_group.
     max_num_groups = max(1, num_sms // ctas_per_group)
-    row_states = torch.zeros(
-        (max_num_groups, _RADIX_STATE_SIZE),
-        dtype=torch.int32,
-        device=logits.device,
-    )
+    row_states = None
+    if ctas_per_group > 1:
+        state_nbytes = max_num_groups * _RADIX_STATE_SIZE * 4  # int32 -> 4 bytes
+        row_states = (
+            _get_row_states_buffer(
+                "radix_varlen_row_states",
+                logits.device,
+                num_sms * _RADIX_STATE_SIZE * 4,
+            )[:state_nbytes]
+            .view(torch.int32)
+            .view(max_num_groups, _RADIX_STATE_SIZE)
+        )
 
     compiled(
         logits,

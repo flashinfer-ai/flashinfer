@@ -11,7 +11,7 @@ through FlashInfer.  The package registries (``cake_jit.py`` / ``jit.py`` /
 
 The manifest's ``package`` field is the dotted import path of the package
 directory (``flashinfer.experimental.cake_mok_bf16``,
-``flashinfer.cake_rmsnorm_train_backend``): the one spelling every exporter
+``flashinfer.cake_rmsnorm_det_train_backend``): the one spelling every exporter
 writes and this checker compares (``Package.name``); a directory path is not
 accepted.  ``name`` is the unique key of ``libraries``; ``closure_sha256`` is
 not unique (two entries of one program and architecture, for example two tile
@@ -253,18 +253,18 @@ def refs_generic(package_dir: Path, loader: str) -> set[str]:
     return generic_library_refs(module_literals(package_dir / loader))
 
 
-def refs_lm_head_loss(package_dir: Path, loader: str) -> set[str]:
+def refs_lm_head_det_loss(package_dir: Path, loader: str) -> set[str]:
     """Compact rows ``[unit, arg_plan, launch, grid_x, grid_y, grid_z]`` per stage of a per-architecture record;
-    the stage's library stem is ``cake_lm_head_loss_<unit>``."""
+    the stage's library stem is ``cake_lm_head_det_loss_<unit>``."""
     registry = module_literals(package_dir / loader)["_REGISTRY"]
     return {
-        f"cake_lm_head_loss_{row[0]}_{compact['arch']}"
+        f"cake_lm_head_det_loss_{row[0]}_{compact['arch']}"
         for compact in registry.values()
         for row in compact["stages"].values()
     }
 
 
-def refs_moe_grouped_gemm(package_dir: Path, loader: str) -> set[str]:
+def refs_moe_grouped_det_gemm(package_dir: Path, loader: str) -> set[str]:
     """Route stages bind a program and its compile-line specializations; the build is
     ``<library><tag>_<arch>`` for every architecture the route and the program share."""
     literals = module_literals(package_dir / loader)
@@ -285,6 +285,11 @@ def refs_moe_grouped_gemm(package_dir: Path, loader: str) -> set[str]:
     return refs
 
 
+# The non-deterministic package ``flashinfer.experimental.cake.cake_moe_grouped_gemm`` has the same registry shape
+# (``PROGRAMS`` + ``ROUTES`` with per-stage specializations).
+refs_moe_grouped_gemm = refs_moe_grouped_det_gemm
+
+
 def refs_stepfun(package_dir: Path, loader: str) -> set[str]:
     """Compact rows keyed by the 20-hex program digest (``_PROGRAMS``; the library stem is
     ``_PREFIX + digest``), every program built for every architecture of ``ARCHES``."""
@@ -301,6 +306,14 @@ def refs_shipped_modules(package_dir: Path, loader: str) -> set[str]:
     """A registry whose ``MODULES`` literal holds the shipped records and whose other tables (``TEST_MODULES``)
     hold programs of a side manifest ``build.json`` never lists: the generic walk over ``MODULES`` alone."""
     return generic_library_refs(module_literals(package_dir / loader)["MODULES"])
+
+
+def refs_with_kcp(package_dir: Path, loader: str) -> set[str]:
+    """A package whose ``build.json`` also lists the programs of its context-parallel registry ``kcp_jit.py``: the
+    generic walk over ``loader`` and the ``MODULES`` records of ``kcp_jit.py``."""
+    return refs_generic(package_dir, loader) | refs_shipped_modules(
+        package_dir, "kcp_jit.py"
+    )
 
 
 def refs_mok_bf16(package_dir: Path, loader: str) -> set[str]:
@@ -321,7 +334,7 @@ class Package:
     refs: Callable[[Path, str], set[str]]
 
 
-# dsa_train, kda_train, dsa_indexer, the rmsnorm, the mhc training, the causal conv1d, the ulysses, the NVFP4 SVDQuant GEMM, the Sage
+# dsa_train, kda_det_train, dsa_indexer, the rmsnorm, the mhc training, the causal conv1d, the ulysses, the NVFP4 SVDQuant GEMM, the Sage
 # block-sparse attention, the fused QK RoPE append (BF16 / FP8), the experimental NVFP4 attention, the SM90 VSA,
 # the Kimi-K3 AttnRes, the experimental FP8 1D1D GEMM (deepgemm_fp8_gemm) and the experimental batched FP8 projection (deepgemm_batched_gemm) backends are read with the generic walker (a mapping carrying ``library`` under an ``arches`` /
 # ``arch`` scope).  Their exporters' registry shapes fit it: a record carries ``arches`` and either ``library`` itself
@@ -329,20 +342,38 @@ class Package:
 # nvfp4_attention, vsa_sm90, Kimi-K3 AttnRes, deepgemm_fp8_gemm and deepgemm_batched_gemm MODULES) or per-stage sub-records carrying ``library`` (dsa_train).
 PACKAGES: tuple[Package, ...] = (
     Package(
-        "flashinfer.cake_rmsnorm_train_backend",
-        "flashinfer/cake_rmsnorm_train_backend",
+        "flashinfer.cake_rmsnorm_det_train_backend",
+        "flashinfer/cake_rmsnorm_det_train_backend",
         "cake_jit.py",
         refs_generic,
     ),
     Package(
-        "flashinfer.cake_causal_conv1d_train_backend",
-        "flashinfer/cake_causal_conv1d_train_backend",
+        "flashinfer.cake_causal_conv1d_det_train_backend",
+        "flashinfer/cake_causal_conv1d_det_train_backend",
         "cake_jit.py",
-        refs_generic,
+        refs_with_kcp,
+    ),
+    Package(
+        "flashinfer.experimental.cake.cake_causal_conv1d_train_backend",
+        "flashinfer/experimental/cake/cake_causal_conv1d_train_backend",
+        "cake_jit.py",
+        refs_with_kcp,
     ),
     Package(
         "flashinfer.cake_gated_act_mxfp8_backend",
         "flashinfer/cake_gated_act_mxfp8_backend",
+        "cake_jit.py",
+        refs_generic,
+    ),
+    Package(
+        "flashinfer.cake_rmsnorm_silu_gate_det_train_backend",
+        "flashinfer/cake_rmsnorm_silu_gate_det_train_backend",
+        "cake_jit.py",
+        refs_generic,
+    ),
+    Package(
+        "flashinfer.cake_rmsnorm_silu_gate_train_backend",
+        "flashinfer/cake_rmsnorm_silu_gate_train_backend",
         "cake_jit.py",
         refs_generic,
     ),
@@ -371,8 +402,20 @@ PACKAGES: tuple[Package, ...] = (
         refs_generic,
     ),
     Package(
-        "flashinfer.cake_mhc_train_backend",
-        "flashinfer/cake_mhc_train_backend",
+        "flashinfer.cake_mhc_det_train_backend",
+        "flashinfer/cake_mhc_det_train_backend",
+        "cake_jit.py",
+        refs_generic,
+    ),
+    Package(
+        "flashinfer.cake_mhc_det_train_head_backend",
+        "flashinfer/cake_mhc_det_train_head_backend",
+        "cake_jit.py",
+        refs_generic,
+    ),
+    Package(
+        "flashinfer.experimental.cake.cake_mhc_train_backend",
+        "flashinfer/experimental/cake/cake_mhc_train_backend",
         "cake_jit.py",
         refs_generic,
     ),
@@ -383,34 +426,46 @@ PACKAGES: tuple[Package, ...] = (
         refs_generic,
     ),
     Package(
-        "flashinfer.experimental.cake_dsa_indexer",
-        "flashinfer/experimental/cake_dsa_indexer",
+        "flashinfer.experimental.cake_dsa_indexer_det",
+        "flashinfer/experimental/cake_dsa_indexer_det",
         "cake_jit.py",
         refs_generic,
     ),
     Package(
-        "flashinfer.experimental.cake_kda_train",
-        "flashinfer/experimental/cake_kda_train",
+        "flashinfer.experimental.cake_kda_det_train",
+        "flashinfer/experimental/cake_kda_det_train",
         "cake_jit.py",
         refs_generic,
     ),
     Package(
-        "flashinfer.experimental.cake_gdn_train",
-        "flashinfer/experimental/cake_gdn_train",
+        "flashinfer.experimental.cake_kda_det_train_kcp",
+        "flashinfer/experimental/cake_kda_det_train_kcp",
+        "cake_kcp_jit.py",
+        refs_shipped_modules,
+    ),
+    Package(
+        "flashinfer.experimental.cake_gdn_det_train_kcp",
+        "flashinfer/experimental/cake_gdn_det_train_kcp",
         "cake_jit.py",
         refs_shipped_modules,
     ),
     Package(
-        "flashinfer.experimental.cake_moe_grouped_gemm",
-        "flashinfer/experimental/cake_moe_grouped_gemm",
+        "flashinfer.experimental.cake_moe_grouped_det_gemm",
+        "flashinfer/experimental/cake_moe_grouped_det_gemm",
+        "cake_jit.py",
+        refs_moe_grouped_det_gemm,
+    ),
+    Package(
+        "flashinfer.experimental.cake.cake_moe_grouped_gemm",
+        "flashinfer/experimental/cake/cake_moe_grouped_gemm",
         "cake_jit.py",
         refs_moe_grouped_gemm,
     ),
     Package(
-        "flashinfer.experimental.cake_lm_head_loss",
-        "flashinfer/experimental/cake_lm_head_loss",
+        "flashinfer.experimental.cake_lm_head_det_loss",
+        "flashinfer/experimental/cake_lm_head_det_loss",
         "cake_jit.py",
-        refs_lm_head_loss,
+        refs_lm_head_det_loss,
     ),
     Package(
         "flashinfer.experimental.cake_mok_bf16",
@@ -419,8 +474,8 @@ PACKAGES: tuple[Package, ...] = (
         refs_mok_bf16,
     ),
     Package(
-        "flashinfer.experimental.dense_projection_gemm",
-        "flashinfer/experimental/dense_projection_gemm",
+        "flashinfer.experimental.dense_projection_det_gemm",
+        "flashinfer/experimental/dense_projection_det_gemm",
         "cake_jit.py",
         refs_generic,
     ),
@@ -469,6 +524,18 @@ PACKAGES: tuple[Package, ...] = (
     Package(
         "flashinfer.experimental.sm110_xqa",
         "flashinfer/experimental/sm110_xqa",
+        "cake_jit.py",
+        refs_generic,
+    ),
+    Package(
+        "flashinfer.experimental.cake_gdn_det_train",
+        "flashinfer/experimental/cake_gdn_det_train",
+        "cake_jit.py",
+        refs_generic,
+    ),
+    Package(
+        "flashinfer.experimental.cake_gqa_train",
+        "flashinfer/experimental/cake_gqa_train",
         "cake_jit.py",
         refs_generic,
     ),

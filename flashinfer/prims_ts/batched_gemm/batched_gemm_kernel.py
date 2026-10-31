@@ -21,6 +21,7 @@ Entry points:
 """
 
 import os
+from dataclasses import replace
 from typing import Any
 
 from ..cutlass_dsl import require_cutlass_dsl_experimental, task_scheduling_scope
@@ -49,8 +50,6 @@ from cutlass.experimental.task_scheduling.memory import (
     TmemAllocator,
 )
 from cutlass.experimental.task_scheduling.resources import (
-    PdlLaunchBarrier,
-    PdlWaitBarrier,
     PipelineConfig,
     TileSchedulerConfig,
     WorkQueue,
@@ -70,7 +69,14 @@ from .batched_gemm_config import (
     resolve_early_exit_max_token_ctas,
     uses_routed_sfa_tma_desc,
     uses_routed_sfb_tma_desc,
+    uses_sfa_tma_desc,
+    uses_sfb_tma_desc,
     validate_config,
+)
+from .batched_gemm_cga import (
+    verifier_clc_consumer_threads,
+    has_multiple_umma_atoms,
+    runtime_cga_coords,
 )
 from .batched_gemm_resources import (
     GmemAResource,
@@ -120,6 +126,8 @@ from .batched_gemm_tasks import (
     create_load_sfab_task,
     create_epilogue_task_dsfp8,
 )
+from .mixed_cga_ts import CgaTask
+from .pdl_resources import PdlLaunchBarrier, PdlWaitBarrier
 from cutlass.experimental import primitives as prims
 
 TMA_DIM_MAX = 1 << 31
@@ -143,16 +151,83 @@ def _task_manager_verify_enabled() -> bool:
 
 
 def _pdl_wait_completed_before_tasks(cfg: BatchedGemmConfig) -> bool:
-    return bool(cfg.do_pdl_wait_for_num_non_exiting_ctas)
+    return bool(cfg.use_pdl and cfg.use_early_exit and not cfg.skip_early_exit_pdl)
+
+
+def _register_pipeline_smem_resources(smem_allocator, *resources) -> None:
+    """Register SMEM barriers owned by resources whose data lives elsewhere.
+
+    TMEM and virtual barrier resources have no SMEM data requirements, but their
+    TaskManager pipelines still allocate two 8-byte mbarriers per stage.  They
+    must therefore be registered with the SMEM allocator as well as with their
+    data allocator so the unified allocation and capacity report include those
+    barriers.
+    """
+    for resource in resources:
+        if resource is not None:
+            smem_allocator.add_resource(resource)
+
+
+def _make_tmem_ptr_smem_allocation() -> SmemAllocation:
+    """Create the typed TMEM-pointer slot with explicit barrier alignment.
+
+    Only the first four bytes hold the Int32 TMEM pointer.  The unified SMEM
+    allocator starts its mbarrier region at the next 8-byte boundary, so reserve
+    that padding explicitly.  This keeps TaskManager's reported data size equal
+    to the number of data bytes actually allocated before the barriers.
+    """
+    return SmemAllocation(
+        "tmem_ptr_i32",
+        size_bytes=8,
+        dtype=cutlass.Int32,
+        count=1,
+        alignment=8,
+    )
+
+
+def _verify_rank_gated_register_donation(tasks) -> None:
+    """Require CTA-rank-gated tasks to issue setmaxnreg on skipped ranks."""
+    invalid_tasks = [
+        task.name
+        for task in tasks
+        if getattr(task, "run_only_on_cta_id", None) is not None
+        and getattr(task, "num_registers", None) is not None
+        and not isinstance(task, CgaTask)
+    ]
+    if invalid_tasks:
+        raise ValueError(
+            "CTA-rank-gated tasks with register budgets must use CgaTask so "
+            "their idle peer-CTA warps execute setmaxnreg: "
+            f"{invalid_tasks}"
+        )
 
 
 class _ProductionTaskManager(TaskManager):
+    """Task manager that retains launch-safety checks without debug analysis.
+
+    Schedule simulation and allocator reports are intentionally debug-only,
+    but register redistribution is part of the hardware execution contract.
+    Keep its inexpensive structural and capacity checks enabled for every
+    kernel so an invalid ``setmaxnreg`` configuration fails during assembly
+    instead of partially admitting a multiwarp task on the GPU.
+    """
+
     def print_and_verify(self) -> None:
-        return None
+        _verify_rank_gated_register_donation(self.tasks)
+        self._verify_warp_group_registers()
+        self._verify_register_budget()
+        self._verify_smem_capacity()
+        self._verify_tmem_capacity()
 
 
-def _round_up_tmem_columns(num_columns: int) -> int:
-    """tcgen05_alloc requires a power-of-two column count in [32, 512]."""
+def _round_up_tmem_columns(num_columns: int, *, sm_arch: int = 100) -> int:
+    """Round to a legal tcgen05 allocation for Blackwell or Rubin."""
+    if sm_arch == 107 and num_columns > 512:
+        if num_columns > 576:
+            raise ValueError(
+                f"SM107 TMEM allocation exceeds 576 columns: {num_columns}"
+            )
+        return ((num_columns + 31) // 32) * 32
     return max(32, 1 << (num_columns - 1).bit_length())
 
 
@@ -165,6 +240,48 @@ def _require_even_divide(value: int, divisor: int, name: str) -> int:
     return value // divisor
 
 
+def _tma_format_for_dtype(dtype_kind: int, native_fp4: bool = False):
+    """Select the operand TMA format, including native Rubin MXFP4."""
+    if cutlass.const_expr(dtype_kind == int(DType.BF16)):
+        return cuda.TensorMapDataFormat.DEFAULT
+    if cutlass.const_expr(dtype_kind in (int(DType.MXE4M3), int(DType.E4M3))):
+        return cuda.TensorMapDataFormat.BYTE
+    if cutlass.const_expr(dtype_kind == int(DType.MXE2M1)):
+        if cutlass.const_expr(native_fp4):
+            return cuda.TensorMapDataFormat.B4X16
+        return cuda.TensorMapDataFormat.B4X16_P64
+    return cuda.TensorMapDataFormat.B4X16
+
+
+def _tma_box_k_for_dtype(
+    cfg: BatchedGemmConfig, dtype_kind: int, native_fp4: bool = False
+) -> int:
+    """Return the regular operand TMA box width in K elements."""
+    if cutlass.const_expr(dtype_kind == int(DType.BF16)):
+        return 64
+    if cutlass.const_expr(native_fp4 and dtype_kind == int(DType.MXE2M1)):
+        # CastA owns a dedicated full-tile loader. Native Rubin MXFP4 uses
+        # regular FP4 boxes; a 512-wide box can leave the completion barrier
+        # unsatisfied.
+        return cfg.tile_k if cfg.has_cast_a else min(cfg.tile_k, 256)
+    if cutlass.const_expr(
+        dtype_kind in (int(DType.MXE2M1), int(DType.MXE4M3), int(DType.E4M3))
+    ):
+        return 128
+    return 256
+
+
+def _tma_swizzle_for_fastest_dim_bytes(num_bytes: int):
+    """Select the TMA swizzle matching one physical SMEM row."""
+    if cutlass.const_expr(num_bytes % 128 == 0):
+        return cuda.TensorMapSwizzle.s128b
+    if cutlass.const_expr(num_bytes % 64 == 0):
+        return cuda.TensorMapSwizzle.s64b
+    if cutlass.const_expr(num_bytes % 32 == 0):
+        return cuda.TensorMapSwizzle.s32b
+    return cuda.TensorMapSwizzle.none
+
+
 # ---------------------------------------------------------------------------
 # Pipeline config builder (shared between validation + GPU paths)
 # ---------------------------------------------------------------------------
@@ -173,10 +290,10 @@ def _require_even_divide(value: int, divisor: int, name: str) -> int:
 def _make_pipeline_configs(cfg):
     """Build all PipelineConfig objects for the given config."""
     one_thread = pipeline.CooperativeGroup(pipeline.Agent.Thread)
-    cluster_vmnk = (cfg.cluster_m, 1, 1, 1)
+    cluster_vmnk = (cfg.umma_cta_count, 1, 1, 1)
 
-    smem_a_num_bytes = cfg.num_bytes_a_tma_per_stage * cfg.cluster_m
-    smem_b_num_bytes = cfg.num_bytes_b_tma_per_stage * cfg.cluster_m
+    smem_a_num_bytes = cfg.num_bytes_a_tma_per_stage * cfg.umma_cta_count
+    smem_b_num_bytes = cfg.num_bytes_b_tma_per_stage * cfg.umma_cta_count
     smem_a_producer = one_thread
     smem_b_producer = one_thread
     smem_a_producer_signaling = SignalingThreads.All
@@ -186,49 +303,57 @@ def _make_pipeline_configs(cfg):
     routed_tma_producer_signaling = (
         SignalingThreads.CtaLeader | SignalingThreads.TaskWarpLeader
     )
+    if has_multiple_umma_atoms(cfg):
+        # Each TMA-to-UMMA resource in a multi-atom physical CGA arms its
+        # atom-relative full-barrier owners lane-parallel from one producer
+        # warp. This is required even when that operand's payload is local;
+        # later non-UMMA path-specific configs replace this signaling.
+        smem_a_producer_signaling = routed_tma_producer_signaling
+        smem_b_producer_signaling = routed_tma_producer_signaling
     if cfg.has_tma_route:
         if cfg.is_swap_ab:
-            smem_b_num_bytes = cfg.num_bytes_b_tma_per_stage * (
-                cfg.cluster_m if cfg.split_b_across_ctas else 1
-            )
             smem_b_producer_signaling = routed_tma_producer_signaling
             smem_b_num_bytes_per_warp_per_cta = _require_even_divide(
                 smem_b_num_bytes,
-                cfg.cluster_m * max(1, cfg.num_load_b_warps),
+                cfg.umma_cta_count * max(1, cfg.warp_layout.num_load_b_warps),
                 "smem_b_num_bytes_per_warp_per_cta",
             )
         else:
-            smem_a_num_bytes = cfg.num_bytes_a_tma_per_stage * cfg.cluster_m
+            smem_a_num_bytes = cfg.num_bytes_a_tma_per_stage * cfg.umma_cta_count
             smem_a_producer_signaling = routed_tma_producer_signaling
             smem_a_num_bytes_per_warp_per_cta = _require_even_divide(
                 smem_a_num_bytes,
-                cfg.cluster_m * max(1, cfg.num_load_a_warps),
+                cfg.umma_cta_count * max(1, cfg.warp_layout.num_load_a_warps),
                 "smem_a_num_bytes_per_warp_per_cta",
             )
-    if cfg.has_cluster:
+    if cfg.uses_two_cta_mma:
         if smem_a_num_bytes_per_warp_per_cta is None:
             smem_a_num_bytes_per_warp_per_cta = _require_even_divide(
                 smem_a_num_bytes,
-                cfg.cluster_m * max(1, cfg.num_load_a_warps),
+                cfg.umma_cta_count * max(1, cfg.warp_layout.num_load_a_warps),
                 "smem_a_num_bytes_per_warp_per_cta",
             )
         if smem_b_num_bytes_per_warp_per_cta is None:
             smem_b_num_bytes_per_warp_per_cta = _require_even_divide(
                 smem_b_num_bytes,
-                cfg.cluster_m * max(1, cfg.num_load_b_warps),
+                cfg.umma_cta_count * max(1, cfg.warp_layout.num_load_b_warps),
                 "smem_b_num_bytes_per_warp_per_cta",
             )
 
     if cfg.has_cast_a:
+        # CastA consumes an independently loaded A tile in every CTA.  This is
+        # a local TMA-to-async pipeline, not the leader-issued multicast path
+        # used by TMA-to-UMMA resources under a wider physical CGA. Every CTA
+        # that issues the local TMA must therefore arm its own full barrier.
         smem_a_cfg = PipelineConfig.create_tma_async_pipeline_cfg(
             num_stages=cfg.num_stages_a,
             num_bytes=cfg.num_bytes_a_tma_per_stage,
             producer_group=smem_a_producer,
             consumer_group=pipeline.CooperativeGroup(
-                pipeline.Agent.Thread, cfg.num_cast_a_warps * 32
+                pipeline.Agent.Thread, cfg.warp_layout.num_cast_a_warps * 32
             ),
             cta_layout_vmnk=cluster_vmnk,
-            producer_signaling_threads=smem_a_producer_signaling,
+            producer_signaling_threads=SignalingThreads.All,
             consumer_signaling_threads=SignalingThreads.All,
         )
     else:
@@ -257,14 +382,14 @@ def _make_pipeline_configs(cfg):
     smem_sfa_cfg = None
     smem_sfb_cfg = None
     if cfg.has_scale_factor_a:
-        smem_sfa_num_bytes = cfg.num_bytes_sfa_per_stage * cfg.cluster_m
+        smem_sfa_num_bytes = cfg.num_bytes_sfa_per_stage * cfg.umma_cta_count
         smem_sfa_num_bytes_per_warp_per_cta = (
             _require_even_divide(
                 smem_sfa_num_bytes,
-                cfg.cluster_m * max(1, cfg.num_load_sfa_warps),
+                cfg.umma_cta_count * max(1, cfg.warp_layout.num_load_sfa_warps),
                 "smem_sfa_num_bytes_per_warp_per_cta",
             )
-            if cfg.has_cluster
+            if cfg.uses_two_cta_mma
             else None
         )
         smem_sfa_cfg = PipelineConfig.create_tma_umma_pipeline_cfg(
@@ -273,8 +398,13 @@ def _make_pipeline_configs(cfg):
             producer_group=one_thread,
             consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
             cta_layout_vmnk=cluster_vmnk,
+            producer_signaling_threads=(
+                routed_tma_producer_signaling
+                if has_multiple_umma_atoms(cfg)
+                else SignalingThreads.All
+            ),
             consumer_signaling_threads=SignalingThreads.CtaLeader,
-            advance_on_wait=cfg.has_cluster and cfg.use_combined_sfab_copy,
+            advance_on_wait=cfg.uses_two_cta_mma and cfg.use_combined_sfab_copy,
             num_bytes_per_warp_per_cta=smem_sfa_num_bytes_per_warp_per_cta,
         )
         if cfg.has_cast_a:
@@ -283,7 +413,7 @@ def _make_pipeline_configs(cfg):
                 num_bytes=cfg.num_bytes_sfa_per_stage,
                 producer_group=one_thread,
                 consumer_group=pipeline.CooperativeGroup(
-                    pipeline.Agent.Thread, cfg.num_cast_a_warps * 32
+                    pipeline.Agent.Thread, cfg.warp_layout.num_cast_a_warps * 32
                 ),
                 cta_layout_vmnk=cluster_vmnk,
                 consumer_signaling_threads=SignalingThreads.All,
@@ -292,7 +422,7 @@ def _make_pipeline_configs(cfg):
             # Linear SFA SMEM layout is consumed by the four-warp LDS+STTM
             # CopySfA task.
             sfa_tma_num_bytes_per_warp = (
-                cfg.num_bytes_sfa_per_stage // cfg.num_load_sfa_warps
+                cfg.num_bytes_sfa_per_stage // cfg.warp_layout.num_load_sfa_warps
             )
             smem_sfa_cfg = PipelineConfig.create_tma_async_pipeline_cfg(
                 num_stages=cfg.num_stages_smem_sfa,
@@ -301,17 +431,17 @@ def _make_pipeline_configs(cfg):
                 # With no separate CTA barrier, wait for every LDS+STTM copy
                 # thread before allowing the producer to reuse this stage.
                 consumer_group=pipeline.CooperativeGroup(
-                    pipeline.Agent.Thread, cfg.num_copy_sfa_warps * 32
+                    pipeline.Agent.Thread, cfg.warp_layout.num_copy_sfa_warps * 32
                 ),
                 cta_layout_vmnk=None,
                 producer_signaling_threads=SignalingThreads.TaskWarpLeader,
                 consumer_signaling_threads=SignalingThreads.All,
                 num_bytes_per_warp_per_cta=sfa_tma_num_bytes_per_warp,
             )
-    if cfg.has_scale_factors:
+    if cfg.has_input_block_scaling:
         smem_sfb_num_bytes = (
-            cfg.num_bytes_sfb_per_stage * cfg.cluster_m
-            if cfg.has_cluster
+            cfg.num_bytes_sfb_per_stage * cfg.umma_cta_count
+            if cfg.uses_two_cta_mma
             and not (
                 cfg.sfb_smem_to_tmem_copy == int(SfSmemToTmemCopy.LDS_STTM)
                 and cfg.smem_sfb_layout == int(SfLayout.R8c4)
@@ -321,10 +451,10 @@ def _make_pipeline_configs(cfg):
         smem_sfb_num_bytes_per_warp_per_cta = (
             _require_even_divide(
                 smem_sfb_num_bytes,
-                cfg.cluster_m * max(1, cfg.num_load_sfb_warps),
+                cfg.umma_cta_count * max(1, cfg.warp_layout.num_load_sfb_warps),
                 "smem_sfb_num_bytes_per_warp_per_cta",
             )
-            if cfg.has_cluster
+            if cfg.uses_two_cta_mma
             and not (
                 cfg.sfb_smem_to_tmem_copy == int(SfSmemToTmemCopy.LDS_STTM)
                 and cfg.smem_sfb_layout == int(SfLayout.R8c4)
@@ -337,6 +467,11 @@ def _make_pipeline_configs(cfg):
             producer_group=one_thread,
             consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
             cta_layout_vmnk=cluster_vmnk,
+            producer_signaling_threads=(
+                routed_tma_producer_signaling
+                if has_multiple_umma_atoms(cfg)
+                else SignalingThreads.All
+            ),
             consumer_signaling_threads=SignalingThreads.CtaLeader,
             num_bytes_per_warp_per_cta=smem_sfb_num_bytes_per_warp_per_cta,
         )
@@ -351,17 +486,17 @@ def _make_pipeline_configs(cfg):
                 # producer warp. TMA-routed compact SFB distributes the
                 # generated gather4 row work over num_load_sfb_warps, so each
                 # arrival must expect only that warp's slice of the stage.
-                sfb_tma_num_bytes //= cfg.num_load_sfb_warps
+                sfb_tma_num_bytes //= cfg.warp_layout.num_load_sfb_warps
             smem_sfb_cfg = PipelineConfig.create_tma_async_pipeline_cfg(
                 num_stages=cfg.num_stages_smem_sfb,
                 num_bytes=sfb_tma_num_bytes,
                 producer_group=pipeline.CooperativeGroup(
-                    pipeline.Agent.Thread, cfg.num_load_sfb_warps
+                    pipeline.Agent.Thread, cfg.warp_layout.num_load_sfb_warps
                 ),
                 # With no separate CTA barrier, wait for every LDS+STTM copy
                 # thread before allowing the producer to reuse this stage.
                 consumer_group=pipeline.CooperativeGroup(
-                    pipeline.Agent.Thread, cfg.num_copy_sfb_warps * 32
+                    pipeline.Agent.Thread, cfg.warp_layout.num_copy_sfb_warps * 32
                 ),
                 cta_layout_vmnk=None,
                 consumer_signaling_threads=SignalingThreads.All,
@@ -383,7 +518,7 @@ def _make_pipeline_configs(cfg):
             # and no leader-routed (CtaLeader) signaling -- in contrast to the
             # R128c4/UTCCP path, which does multiply.
             sfb_tma_num_bytes_per_warp = (
-                cfg.num_bytes_sfb_per_stage // cfg.num_load_sfb_warps
+                cfg.num_bytes_sfb_per_stage // cfg.warp_layout.num_load_sfb_warps
             )
             smem_sfb_cfg = PipelineConfig.create_tma_async_pipeline_cfg(
                 num_stages=cfg.num_stages_smem_sfb,
@@ -392,7 +527,7 @@ def _make_pipeline_configs(cfg):
                 # With no separate CTA barrier, wait for every LDS+STTM copy
                 # thread before allowing the producer to reuse this stage.
                 consumer_group=pipeline.CooperativeGroup(
-                    pipeline.Agent.Thread, cfg.num_copy_sfb_warps * 32
+                    pipeline.Agent.Thread, cfg.warp_layout.num_copy_sfb_warps * 32
                 ),
                 cta_layout_vmnk=None,
                 producer_signaling_threads=SignalingThreads.TaskWarpLeader,
@@ -403,7 +538,8 @@ def _make_pipeline_configs(cfg):
         num_stages=cfg.num_stages_tmem_acc,
         producer_group=one_thread,
         consumer_group=pipeline.CooperativeGroup(
-            pipeline.Agent.Thread, cfg.num_epilogue_warps * 32 * cfg.cluster_m
+            pipeline.Agent.Thread,
+            cfg.warp_layout.num_epilogue_warps * 32 * cfg.umma_cta_count,
         ),
         cta_layout_vmnk=cluster_vmnk,
         producer_signaling_threads=SignalingThreads.CtaLeader,
@@ -417,7 +553,8 @@ def _make_pipeline_configs(cfg):
         result["tmem_cast_a"] = PipelineConfig.create_async_umma_pipeline_cfg(
             num_stages=cfg.num_stages_cast_a,
             producer_group=pipeline.CooperativeGroup(
-                pipeline.Agent.Thread, cfg.num_cast_a_warps * 32 * cfg.cluster_m
+                pipeline.Agent.Thread,
+                cfg.warp_layout.num_cast_a_warps * 32 * cfg.umma_cta_count,
             ),
             consumer_group=one_thread,
             cta_layout_vmnk=cluster_vmnk,
@@ -428,13 +565,19 @@ def _make_pipeline_configs(cfg):
     # Gather (LDGSTS) pipeline for routed activations
     if cfg.has_gather:
         gather_consumer_wait_signaling = (
-            SignalingThreads.All if cfg.has_cluster and cfg.num_sync_warps > 0 else None
+            SignalingThreads.All
+            if cfg.uses_two_cta_mma and cfg.warp_layout.num_sync_warps > 0
+            else None
         )
-        gather_producer_threads = cfg.num_gather_warps * 32
+        gather_producer_threads = (
+            cfg.warp_layout.num_load_b_warps
+            if cfg.is_swap_ab
+            else cfg.warp_layout.num_load_a_warps
+        ) * 32
         gather_producer_op = pipeline.PipelineOp.AsyncLoad
         gather_advance_on_acquire = False
         if cfg.fuse_operand_sf_loads:
-            gather_producer_threads *= cfg.cluster_m
+            gather_producer_threads *= cfg.umma_cta_count
             gather_producer_op = pipeline.PipelineOp.AsyncThread
             gather_advance_on_acquire = True
         gather_cfg = PipelineConfig.create_async_umma_pipeline_cfg(
@@ -453,13 +596,13 @@ def _make_pipeline_configs(cfg):
         result["smem_gather"] = gather_cfg
 
     # 2-CTA + gather: proxy barrier for cross-CTA sync
-    if cfg.has_gather and cfg.has_cluster:
+    if cfg.has_gather and cfg.uses_two_cta_mma:
         proxy_cfg = PipelineConfig.create_async_umma_pipeline_cfg(
             # validate_config() requires equal A/B depths for this path.
             num_stages=cfg.num_stages_a,
             producer_group=pipeline.CooperativeGroup(
                 pipeline.Agent.Thread,
-                32 * cfg.cluster_m,  # SyncTask warp × CTAs
+                32 * cfg.umma_cta_count,  # SyncTask warp × CTAs
             ),
             consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
             cta_layout_vmnk=cluster_vmnk,
@@ -470,29 +613,44 @@ def _make_pipeline_configs(cfg):
 
     if cfg.has_scale_factor_a:
         result["smem_sfa"] = smem_sfa_cfg
-    if cfg.has_scale_factors:
+    if cfg.has_input_block_scaling:
         result["smem_sfb"] = smem_sfb_cfg
-        # LDGSTS SF uses cp.async producer work.  The exact
-        # clustered R128c4 SFB path drains cp.async groups, then uses a
-        # normal AsyncThread producer_commit into the 2-CTA UMMA full barrier.
-        # Compact low-N SFB keeps generic Async because CopySfB performs
-        # LDS+STTM directly.
+        # LDGSTS SF uses cp.async producer work.  A clustered routed operand
+        # consumed by 2-CTA UMMA drains cp.async groups, then uses an
+        # AsyncThread producer_commit to join both CTAs at the leading CTA's
+        # full barrier.  Compact low-N SFB keeps generic Async because CopySfB
+        # performs LDS+STTM directly.
         if cfg.has_routed_sfs and cfg.uses_ldgsts_routed_sfs:
             ldgsts_consumer_signaling = (
-                SignalingThreads.CtaLeader if cfg.has_cluster else SignalingThreads.All
+                SignalingThreads.CtaLeader
+                if cfg.uses_two_cta_mma
+                else SignalingThreads.All
             )
-            ldgsts_sfa_producer_warps = max(1, cfg.num_load_sfa_warps)
-            ldgsts_sfb_producer_warps = max(1, cfg.num_load_sfb_warps)
+            ldgsts_sfa_producer_warps = max(1, cfg.warp_layout.num_load_sfa_warps)
+            ldgsts_sfb_producer_warps = max(1, cfg.warp_layout.num_load_sfb_warps)
+            ldgsts_sfa_producer_threads = ldgsts_sfa_producer_warps * 32
+            ldgsts_sfa_producer_op = pipeline.PipelineOp.AsyncLoad
+            if cfg.uses_two_cta_mma and not cfg.is_swap_ab:
+                # The routed A scale-factor tile is split across both CTAs of
+                # the UMMA atom, while the fused S2T consumer runs only in the
+                # leading CTA.  A local cp.async mbarrier would let that
+                # consumer proceed as soon as CTA 0 finishes, racing CTA 1's
+                # half of SMEM.  Drain cp.async on each producer thread, then
+                # route all umma_cta_count * num_load_sfa_warps * 32 software
+                # arrivals to the atom leader.  The current 2-CTA/four-warp
+                # shape therefore matches TRTLLM-gen's 256-arrival barrier.
+                ldgsts_sfa_producer_threads *= cfg.umma_cta_count
+                ldgsts_sfa_producer_op = pipeline.PipelineOp.AsyncThread
             ldgsts_sfa_cfg = PipelineConfig.create_async_umma_pipeline_cfg(
                 num_stages=cfg.num_stages_smem_sfa,
                 producer_group=pipeline.CooperativeGroup(
                     pipeline.Agent.Thread,
-                    ldgsts_sfa_producer_warps * 32,
+                    ldgsts_sfa_producer_threads,
                 ),
                 consumer_group=one_thread,
                 cta_layout_vmnk=cluster_vmnk,
                 consumer_signaling_threads=ldgsts_consumer_signaling,
-                producer_op=pipeline.PipelineOp.AsyncLoad,
+                producer_op=ldgsts_sfa_producer_op,
             )
             if cfg.is_swap_ab and cfg.sfb_smem_to_tmem_copy == int(
                 SfSmemToTmemCopy.LDS_STTM
@@ -502,7 +660,7 @@ def _make_pipeline_configs(cfg):
                 # Generated clustered tile64/N192 kernels use a per-CTA
                 # CutlassCpAsyncPipeline here: one LoadSfB producer warp feeds
                 # the four local CopySfB warps, so the producer group is not
-                # scaled by cluster_m.
+                # scaled by umma_cta_count.
                 ldgsts_sfb_cfg = PipelineConfig.create_async_async_pipeline_cfg(
                     num_stages=cfg.num_stages_smem_sfb,
                     producer_group=pipeline.CooperativeGroup(
@@ -510,7 +668,7 @@ def _make_pipeline_configs(cfg):
                         ldgsts_sfb_producer_warps * 32,
                     ),
                     consumer_group=pipeline.CooperativeGroup(
-                        pipeline.Agent.Thread, cfg.num_copy_sfb_warps * 32
+                        pipeline.Agent.Thread, cfg.warp_layout.num_copy_sfb_warps * 32
                     ),
                     cta_layout_vmnk=cluster_vmnk,
                     producer_op=pipeline.PipelineOp.AsyncLoad,
@@ -519,8 +677,8 @@ def _make_pipeline_configs(cfg):
                 sfb_producer_threads = ldgsts_sfb_producer_warps * 32
                 sfb_producer_op = pipeline.PipelineOp.AsyncLoad
                 sfb_advance_on_acquire = False
-                if cfg.has_cluster and cfg.is_swap_ab and cfg.tile_n >= 128:
-                    sfb_producer_threads *= cfg.cluster_m
+                if cfg.uses_two_cta_mma and cfg.is_swap_ab and cfg.tile_n >= 128:
+                    sfb_producer_threads *= cfg.umma_cta_count
                     sfb_producer_op = pipeline.PipelineOp.AsyncThread
                     sfb_advance_on_acquire = True
                 ldgsts_sfb_cfg = PipelineConfig.create_async_umma_pipeline_cfg(
@@ -533,7 +691,7 @@ def _make_pipeline_configs(cfg):
                     cta_layout_vmnk=cluster_vmnk,
                     consumer_signaling_threads=ldgsts_consumer_signaling,
                     producer_op=sfb_producer_op,
-                    advance_on_wait=cfg.has_cluster and cfg.use_combined_sfab_copy,
+                    advance_on_wait=cfg.uses_two_cta_mma and cfg.use_combined_sfab_copy,
                     advance_on_acquire=sfb_advance_on_acquire,
                 )
             if cfg.is_swap_ab:
@@ -544,10 +702,12 @@ def _make_pipeline_configs(cfg):
     # TmemSf pipeline: the combined tcgen05_cp path uses, so
     # the full-barrier commit is a UMMA/TCGen05 producer arrival.  Compact SFB
     # uses LDS+STTM and keeps async-producer + UMMA-consumer semantics.
-    if cfg.has_scale_factors and cfg.uses_unfused_tmem_sf_copy:
+    if cfg.has_input_block_scaling and (
+        cfg.has_input_block_scaling and not cfg.fuse_sf_copy_to_mma
+    ):
         if cfg.use_combined_sfab_copy:
             result["tmem_sfab"] = PipelineConfig.create_umma_umma_pipeline_cfg(
-                num_stages=max(cfg.num_stages_tmem_sfa, cfg.num_stages_tmem_sfb),
+                num_stages=cfg.num_stages_tmem_sfa,
                 producer_group=one_thread,
                 consumer_group=one_thread,
                 cta_layout_vmnk=cluster_vmnk,
@@ -555,14 +715,14 @@ def _make_pipeline_configs(cfg):
                 consumer_signaling_threads=SignalingThreads.CtaLeader,
             )
         else:
-            tmem_sfb_producer_threads = cfg.num_copy_sfb_warps * 32
+            tmem_sfb_producer_threads = cfg.warp_layout.num_copy_sfb_warps * 32
             tmem_sfb_producer_signaling = SignalingThreads.CtaLeader
-            if cfg.has_cluster and cfg.sfb_smem_to_tmem_copy == int(
+            if cfg.uses_two_cta_mma and cfg.sfb_smem_to_tmem_copy == int(
                 SfSmemToTmemCopy.LDS_STTM
             ):
                 # Generated compact SFB STTM runs the CopySfB warpgroup in every
                 # CTA and uses cluster-scoped AsyncUmma-style signaling.
-                tmem_sfb_producer_threads *= cfg.cluster_m
+                tmem_sfb_producer_threads *= cfg.umma_cta_count
                 tmem_sfb_producer_signaling = SignalingThreads.All
             tmem_sfa_cfg = PipelineConfig.create_umma_umma_pipeline_cfg(
                 num_stages=cfg.num_stages_tmem_sfa,
@@ -596,11 +756,12 @@ def _make_pipeline_configs(cfg):
                 tmem_sfa_cfg = PipelineConfig.create_async_umma_pipeline_cfg(
                     num_stages=cfg.num_stages_tmem_sfa,
                     producer_group=pipeline.CooperativeGroup(
-                        pipeline.Agent.Thread, cfg.num_copy_sfa_warps * 32
+                        pipeline.Agent.Thread,
+                        cfg.warp_layout.num_copy_sfa_warps * 32 * cfg.umma_cta_count,
                     ),
                     consumer_group=one_thread,
                     cta_layout_vmnk=cluster_vmnk,
-                    producer_signaling_threads=SignalingThreads.CtaLeader,
+                    producer_signaling_threads=SignalingThreads.All,
                     consumer_signaling_threads=SignalingThreads.CtaLeader,
                 )
             result["tmem_sfa"] = tmem_sfa_cfg
@@ -612,15 +773,16 @@ def _make_pipeline_configs(cfg):
     # warp issues cp.async for 32 activation floats + 1 weight float per
     # K-tile, the epilogue waits per K-tile and FMAs the dequant into the
     # partial accumulator before the configured FP32 output cast.
-    if cfg.has_deepseek_fp8:
+    if cfg.use_deepseek_fp8:
         result["smem_dsfp8_sfab"] = PipelineConfig.create_async_async_pipeline_cfg(
             num_stages=cfg.num_stages_smem_sfa,
             producer_group=pipeline.CooperativeGroup(
                 pipeline.Agent.Thread,
-                max(1, cfg.num_load_sfab_warps) * 32,
+                max(1, cfg.warp_layout.num_load_sfab_warps) * 32,
             ),
             consumer_group=pipeline.CooperativeGroup(
-                pipeline.Agent.Thread, cfg.num_epilogue_warps * 32 * cfg.cluster_m
+                pipeline.Agent.Thread,
+                cfg.warp_layout.num_epilogue_warps * 32 * cfg.umma_cta_count,
             ),
             cta_layout_vmnk=cluster_vmnk,
             producer_op=pipeline.PipelineOp.AsyncLoad,
@@ -628,59 +790,7 @@ def _make_pipeline_configs(cfg):
 
     # CLC dynamic persistent WorkQueue pipeline
     if cfg.is_persistent:
-        clc_cluster_scale = cfg.cluster_m if cfg.has_cluster else 1
-        num_clc_consumer_threads = 0
-
-        def add_clc_consumer_warps(
-            num_warps: int, *, leader_only: bool = False
-        ) -> None:
-            nonlocal num_clc_consumer_threads
-            cta_scale = 1 if leader_only else clc_cluster_scale
-            num_clc_consumer_threads += 32 * cta_scale * num_warps
-
-        # ClcFetchAsync routes all consumer arrives to CTA0's empty barrier.
-        # Generated clustered kernels mix all-CTA consumers (load/epilogue)
-        # with leader-only consumers (MMA/WorkId), so count each task by its
-        # actual CTA ownership.
-        add_clc_consumer_warps(cfg.num_load_a_warps)
-        add_clc_consumer_warps(cfg.num_load_b_warps)
-        add_clc_consumer_warps(cfg.num_epilogue_warps)
-        add_clc_consumer_warps(cfg.num_padding_warps)
-        add_clc_consumer_warps(cfg.num_gather_warps)
-        add_clc_consumer_warps(cfg.num_sync_warps)
-        add_clc_consumer_warps(cfg.num_cast_a_warps)
-        add_clc_consumer_warps(cfg.num_mma_warps, leader_only=cfg.has_cluster)
-        add_clc_consumer_warps(cfg.num_workid_warps, leader_only=cfg.has_cluster)
-        if cfg.has_scale_factor_a and not cfg.fuse_operand_sf_loads:
-            add_clc_consumer_warps(cfg.num_load_sfa_warps)
-        if cfg.has_deepseek_fp8:
-            add_clc_consumer_warps(cfg.num_load_sfab_warps)
-        if cfg.has_scale_factors:
-            if not cfg.fuse_operand_sf_loads:
-                add_clc_consumer_warps(cfg.num_load_sfb_warps)
-            if cfg.use_combined_sfab_copy:
-                add_clc_consumer_warps(
-                    cfg.num_copy_sfa_warps,
-                    leader_only=cfg.has_cluster,
-                )
-            else:
-                add_clc_consumer_warps(
-                    cfg.num_copy_sfa_warps,
-                    leader_only=cfg.has_cluster,
-                )
-                add_clc_consumer_warps(
-                    cfg.num_copy_sfb_warps,
-                    # Keep in sync with CopySfBTask.run_only_on_cta_id: CopySfB
-                    # runs on every CTA for the per-CTA LDS+STTM paths (compact
-                    # R8c4 and Linear routed-TMA SFB), and leader-only otherwise.
-                    leader_only=cfg.has_cluster
-                    and cfg.sfb_smem_to_tmem_copy != int(SfSmemToTmemCopy.LDS_STTM)
-                    and not (
-                        cfg.has_routed_sfs
-                        and cfg.uses_tma_routed_sfs
-                        and cfg.is_swap_ab
-                    ),
-                )
+        num_clc_consumer_threads = verifier_clc_consumer_threads(cfg)
         workid_cfg = PipelineConfig.create_clc_fetch_async_pipeline_cfg(
             num_stages=cfg.num_stages_workid,
             num_bytes=16,  # CLC response is 16 bytes
@@ -814,7 +924,7 @@ def _build_schedule_validate(cfg, num_k_tiles=4):
             smem_a = smem_gather
             task_list = [gather, load_b]
 
-        if cfg.has_cluster and cfg.num_sync_warps > 0:
+        if cfg.uses_two_cta_mma and cfg.warp_layout.num_sync_warps > 0:
             proxy_cluster = ProxyClusterBarrierResource(
                 cfg=cfg,
                 pipeline_config=pcfgs.get("proxy"),
@@ -827,7 +937,7 @@ def _build_schedule_validate(cfg, num_k_tiles=4):
                 tma_smem,
                 work_queue,
                 num_k_tiles,
-                sync_warp_idx=cfg.sync_warp_idx,
+                sync_warp_idx=cfg.warp_layout.sync_warp_idx,
             )
             task_list.append(sync)
     elif cfg.has_tma_route:
@@ -926,7 +1036,7 @@ def _build_schedule_validate(cfg, num_k_tiles=4):
             num_k_tiles,
         )
         task_list += [load_sfa, cast_a]
-    if cfg.has_scale_factors:
+    if cfg.has_input_block_scaling:
         gmem_sfa = GmemSfAResource(cfg=cfg, name="GmemSfA")
         gmem_sfb = GmemSfBResource(cfg=cfg, name="GmemSfB")
         if cfg.has_routed_sfs and cfg.uses_ldgsts_routed_sfs:
@@ -963,7 +1073,7 @@ def _build_schedule_validate(cfg, num_k_tiles=4):
             tmem_sfab = TmemSfABResource(
                 cfg=cfg, pipeline_config=pcfgs["tmem_sfab"], name="TmemSfAb"
             )
-        elif cfg.uses_unfused_tmem_sf_copy:
+        elif cfg.has_input_block_scaling and not cfg.fuse_sf_copy_to_mma:
             # Separate CopySf tasks: TmemSf with pipelines
             if cfg.is_swap_ab:
                 tmem_sfa = TmemSfAResource(
@@ -1055,7 +1165,7 @@ def _build_schedule_validate(cfg, num_k_tiles=4):
             )
             task_list += [load_sfa, load_sfb]
 
-        if cfg.uses_unfused_tmem_sf_copy:
+        if cfg.has_input_block_scaling and not cfg.fuse_sf_copy_to_mma:
             if cfg.use_combined_sfab_copy:
                 copy_sfab = create_copy_sfab_task(
                     cfg, smem_sfa, smem_sfb, tmem_sfab, work_queue, num_k_tiles
@@ -1084,7 +1194,9 @@ def _build_schedule_validate(cfg, num_k_tiles=4):
             proxy_cluster=proxy_cluster,
             tmem_cast_a=tmem_cast_a,
         )
-    elif cfg.has_scale_factors and cfg.uses_unfused_tmem_sf_copy:
+    elif cfg.has_input_block_scaling and (
+        cfg.has_input_block_scaling and not cfg.fuse_sf_copy_to_mma
+    ):
         if cfg.use_combined_sfab_copy:
             mma = create_mma_task(
                 cfg,
@@ -1112,7 +1224,7 @@ def _build_schedule_validate(cfg, num_k_tiles=4):
                 tmem_sfa=tmem_sfa,
                 tmem_sfb=tmem_sfb,
             )
-    elif cfg.has_scale_factors:
+    elif cfg.has_input_block_scaling:
         mma = create_mma_task(
             cfg,
             smem_a,
@@ -1137,7 +1249,7 @@ def _build_schedule_validate(cfg, num_k_tiles=4):
             proxy_cluster=proxy_cluster,
         )
     smem_dsfp8_sfab = None
-    if cfg.has_deepseek_fp8:
+    if cfg.use_deepseek_fp8:
         # DeepSeek FP8 uses the normal MMA producer and a per-K-tile epilogue
         # drain that also consumes SmemDeepSeekSfAb dequant scales.
         smem_dsfp8_sfab = SmemDeepSeekSfAbResource(
@@ -1161,7 +1273,7 @@ def _build_schedule_validate(cfg, num_k_tiles=4):
         epi = create_epilogue_task(cfg, tmem_c, gmem_c, work_queue, num_k_tiles)
         task_list += [mma, epi]
 
-    if cfg.num_padding_warps > 0:
+    if cfg.warp_layout.num_padding_warps > 0:
         pad = create_padding_task(cfg, work_queue, num_k_tiles)
         task_list.append(pad)
     # WorkScheduleTask (CLC persistent only)
@@ -1180,7 +1292,9 @@ def _build_schedule_validate(cfg, num_k_tiles=4):
         smem_b: [gmem_b],
         gmem_c: [tmem_c],
     }
-    if cfg.has_scale_factors and cfg.uses_unfused_tmem_sf_copy:
+    if cfg.has_input_block_scaling and (
+        cfg.has_input_block_scaling and not cfg.fuse_sf_copy_to_mma
+    ):
         resource_dependency_graph[smem_sfa] = [gmem_sfa]
         resource_dependency_graph[smem_sfb] = [gmem_sfb]
         ab_dependencies = [smem_a, smem_b]
@@ -1197,7 +1311,7 @@ def _build_schedule_validate(cfg, num_k_tiles=4):
                 tmem_sfa,
                 tmem_sfb,
             ]
-    elif cfg.has_scale_factors:
+    elif cfg.has_input_block_scaling:
         resource_dependency_graph[smem_sfa] = [gmem_sfa]
         resource_dependency_graph[smem_sfb] = [gmem_sfb]
         ab_dependencies = [smem_a, smem_b]
@@ -1220,7 +1334,7 @@ def _build_schedule_validate(cfg, num_k_tiles=4):
         else:
             resource_dependency_graph[tmem_c] = [smem_a, smem_b]
 
-    if cfg.has_deepseek_fp8 and smem_dsfp8_sfab is not None:
+    if cfg.use_deepseek_fp8 and smem_dsfp8_sfab is not None:
         # SmemDeepSeekSfAb's GMEM source is raw kernel-param pointers
         # (params.ptrSfA/ptrSfB), not an TS Gmem resource. PDL still orders
         # those raw GMEM reads when a wait resource is present.
@@ -1243,11 +1357,11 @@ def _build_schedule_validate(cfg, num_k_tiles=4):
         resource_dependency_graph[pdl_wait_resource] = []
         if cfg.is_swap_ab:
             resource_dependency_graph[gmem_b] = [pdl_wait_resource]
-            if cfg.has_scale_factors:
+            if cfg.has_input_block_scaling:
                 resource_dependency_graph[gmem_sfb] = [pdl_wait_resource]
         else:
             resource_dependency_graph[gmem_a] = [pdl_wait_resource]
-            if cfg.has_cast_a or cfg.has_scale_factors:
+            if cfg.has_cast_a or cfg.has_input_block_scaling:
                 resource_dependency_graph[gmem_sfa] = [pdl_wait_resource]
 
     # SMEM allocator
@@ -1255,15 +1369,25 @@ def _build_schedule_validate(cfg, num_k_tiles=4):
     smem_resources = (smem_a, smem_b)
     if cfg.has_cast_a:
         smem_resources = smem_resources + (smem_sfa,)
-    if cfg.has_scale_factors:
+    if cfg.has_input_block_scaling:
         smem_resources = smem_resources + (smem_sfa, smem_sfb)
-    if cfg.has_deepseek_fp8 and smem_dsfp8_sfab is not None:
+    if cfg.use_deepseek_fp8 and smem_dsfp8_sfab is not None:
         smem_resources = smem_resources + (smem_dsfp8_sfab,)
     if cfg.is_persistent:
         smem_resources = smem_resources + (work_queue,)
     smem_resources = smem_resources + (gmem_c,)
     for r in smem_resources:
         smem_allocator.add_resource(r)
+    _register_pipeline_smem_resources(
+        smem_allocator,
+        tmem_c,
+        tmem_cast_a,
+        tmem_sfa,
+        tmem_sfb,
+        tmem_sfab,
+        proxy_cluster,
+        work_throttle,
+    )
     if cutlass.const_expr(cfg.aliases_c_scratch_with_ab):
         # Alias SmemA/B with GmemC scratch to save SMEM when the generated
         # schedule does not require a disjoint epilogue staging window.
@@ -1275,6 +1399,22 @@ def _build_schedule_validate(cfg, num_k_tiles=4):
                 [gmem_c._alloc_sc],
             ]
         )
+    # Mirror the standalone infrastructure slots allocated by the GPU kernel
+    # below so validation reports the same dynamic-SMEM total as compilation.
+    smem_allocator.add_tmem_ptr(_make_tmem_ptr_smem_allocation())
+    if cfg.uses_two_cta_mma:
+        smem_allocator.add(
+            SmemAllocation("tmem_dealloc_mbar", dtype=cutlass.Int64, alignment=8)
+        )
+    if cfg.is_persistent:
+        smem_allocator.add(
+            SmemAllocation(
+                "clc_response",
+                dtype=cutlass.Int128,
+                count=cfg.num_stages_workid,
+                alignment=16,
+            )
+        )
     smem_allocator.compute_layout()
 
     # TMEM allocator
@@ -1283,7 +1423,9 @@ def _build_schedule_validate(cfg, num_k_tiles=4):
     tmem_allocator.add_resource(tmem_c)
     if cfg.has_cast_a:
         tmem_allocator.add_resource(tmem_cast_a)
-    if cfg.has_scale_factors and cfg.uses_unfused_tmem_sf_copy:
+    if cfg.has_input_block_scaling and (
+        cfg.has_input_block_scaling and not cfg.fuse_sf_copy_to_mma
+    ):
         if cfg.use_combined_sfab_copy:
             tmem_allocator.add_resource(tmem_sfab)
         else:
@@ -1341,11 +1483,14 @@ def _build_batched_gemm_task_manager(
         cfg,
         num_k_tiles=num_k_tiles,
     )
+    _verify_rank_gated_register_donation(task_list)
     return TaskManager(
         tasks=task_list,
         resource_dependency_graph=dep_graph,
         smem_allocator=smem_alloc,
         tmem_allocator=tmem_alloc,
+        smem_capacity_bytes=cfg.smem_capacity_bytes,
+        tmem_capacity_columns=cfg.tmem_capacity_columns,
         assume_pdl_wait_completed=_pdl_wait_completed_before_tasks(cfg),
         exhaustive_deadlock_race_check=_exhaustive_deadlock_race_check_enabled(),
         verbose=verbose,
@@ -1362,8 +1507,8 @@ def _batched_gemm_kernel_bf16_body(
     tma_a_desc: cutlass.GridConstant[cuda.TensorMap],
     tma_b_desc: cutlass.GridConstant[cuda.TensorMap],
     tma_c_desc: cutlass.GridConstant[cuda.TensorMap],
-    tma_sfa_desc: cutlass.GridConstant[cuda.TensorMap],
-    tma_sfb_desc: cutlass.GridConstant[cuda.TensorMap],
+    tma_sfa_desc: cutlass.GridConstant[cuda.TensorMap] | None,
+    tma_sfb_desc: cutlass.GridConstant[cuda.TensorMap] | None,
     c_tensor: cute.Tensor,
     sf_c_tensor: cute.Tensor,
     bias_tensor: cute.Tensor,
@@ -1383,6 +1528,8 @@ def _batched_gemm_kernel_bf16_body(
     sfa_gmem_tensor: cute.Tensor,  # SF GMEM for LDGSTS SF (dummy when not LDGSTS)
     sfb_gmem_tensor: cute.Tensor,  # SF GMEM for LDGSTS SF (dummy when not LDGSTS)
     problem_m: cutlass.Int32,
+    c_row_stride: cutlass.Int32,
+    sf_c_m_offset: cutlass.Int32,
     problem_n: cutlass.Int32,
     problem_k: cutlass.Int32,
     num_tokens: cutlass.Int32,
@@ -1402,13 +1549,33 @@ def _batched_gemm_kernel_bf16_body(
 
     warp_idx = cute.arch.warp_idx()
 
+    if cutlass.const_expr(cfg.record_runtime_cga_shapes):
+        dim_x, dim_y, _, cga_rank, _, _ = runtime_cga_coords()
+        if (cga_rank == Int32(0)) & (warp_idx == Int32(0)) & prims.elect_sync():
+            if (dim_x == Int32(cfg.cluster_dim_x)) & (
+                dim_y == Int32(cfg.cluster_dim_y)
+            ):
+                cute.arch.atomic_add(
+                    num_non_exiting_ctas_tensor.iterator + Int32(1),
+                    Int32(1),
+                    sem="relaxed",
+                    scope="gpu",
+                )
+            else:
+                cute.arch.atomic_add(
+                    num_non_exiting_ctas_tensor.iterator + Int32(2),
+                    Int32(1),
+                    sem="relaxed",
+                    scope="gpu",
+                )
+
     pcfgs = _make_pipeline_configs(cfg)
 
     num_non_exiting_ctas_value = None
     if cutlass.const_expr(
         cfg.is_persistent
         and cfg.use_early_exit
-        and cfg.do_pdl_wait_for_num_non_exiting_ctas
+        and (cfg.use_pdl and cfg.use_early_exit)
         and not _pdl_wait_completed_before_tasks(cfg)
     ):
         num_non_exiting_ctas_view = cutlass.make_array_view(num_non_exiting_ctas_tensor)
@@ -1421,8 +1588,11 @@ def _batched_gemm_kernel_bf16_body(
     tma_c_ptr = tma_c_desc.get_ptr()
     prims.prefetch_tensormap(tma_a_ptr)
     prims.prefetch_tensormap(tma_b_ptr)
-    if cutlass.const_expr(cfg.has_scale_factors):
+    if cutlass.const_expr(uses_sfa_tma_desc(cfg)):
+        assert tma_sfa_desc is not None
         prims.prefetch_tensormap(tma_sfa_desc.get_ptr())
+    if cutlass.const_expr(uses_sfb_tma_desc(cfg)):
+        assert tma_sfb_desc is not None
         prims.prefetch_tensormap(tma_sfb_desc.get_ptr())
     prims.prefetch_tensormap(tma_c_ptr)
 
@@ -1551,6 +1721,7 @@ def _batched_gemm_kernel_bf16_body(
     tmem_cast_a = None
 
     if cutlass.const_expr(cfg.has_cast_a):
+        assert tma_sfa_desc is not None
         tma_sfa_ptr = tma_sfa_desc.get_ptr()
         gmem_sfa = GmemSfAResource(
             cfg=cfg,
@@ -1571,9 +1742,15 @@ def _batched_gemm_kernel_bf16_body(
         )
 
     # Scale factor resources (FP4/FP8 only)
-    if cutlass.const_expr(cfg.has_scale_factors):
-        tma_sfa_ptr = tma_sfa_desc.get_ptr()
-        tma_sfb_ptr = tma_sfb_desc.get_ptr()
+    if cutlass.const_expr(cfg.has_input_block_scaling):
+        tma_sfa_ptr = None
+        tma_sfb_ptr = None
+        if cutlass.const_expr(uses_sfa_tma_desc(cfg)):
+            assert tma_sfa_desc is not None
+            tma_sfa_ptr = tma_sfa_desc.get_ptr()
+        if cutlass.const_expr(uses_sfb_tma_desc(cfg)):
+            assert tma_sfb_desc is not None
+            tma_sfb_ptr = tma_sfb_desc.get_ptr()
         gmem_sfa = GmemSfAResource(
             cfg=cfg,
             tile_idx_view=tile_idx_view,
@@ -1629,7 +1806,7 @@ def _batched_gemm_kernel_bf16_body(
             mn_limit_sf = cutlass.make_array_view(mn_limit_tensor)
             # SF GMEM stride is the number of scale-factor elements per row,
             # padded to 16-byte alignment. NVFP4 uses K/16; MX uses K/32.
-            sf_stride_unpadded = problem_k // Int32(cfg.sf_vec_size)
+            sf_stride_unpadded = problem_k // Int32(cfg.input_sf_block_size_a)
             sf_stride = (sf_stride_unpadded + Int32(15)) // Int32(16) * Int32(16)
             if cutlass.const_expr(cfg.is_swap_ab):
                 # SFB is routed (activations)
@@ -1691,7 +1868,9 @@ def _batched_gemm_kernel_bf16_body(
                 pipeline_config=pcfgs["tmem_sfab"],
                 name="TmemSfAb",
             )
-        elif cutlass.const_expr(cfg.uses_unfused_tmem_sf_copy):
+        elif cutlass.const_expr(
+            (cfg.has_input_block_scaling and not cfg.fuse_sf_copy_to_mma)
+        ):
             # Routed SF uses TmemSfRouteResource (LDS+STTM).
             # Non-routed SF uses standard TmemSfA/BResource (tcgen05_cp S2T).
             # Both get AsyncUmma pipeline for separate CopySf tasks.
@@ -1746,7 +1925,7 @@ def _batched_gemm_kernel_bf16_body(
             tmem_sfb = TmemSfBResource(cfg=cfg, pipeline_config=None, name="TmemSfB")
 
     smem_dsfp8_sfab = None
-    if cutlass.const_expr(cfg.has_deepseek_fp8):
+    if cutlass.const_expr(cfg.use_deepseek_fp8):
         smem_dsfp8_sfab = SmemDeepSeekSfAbResource(
             cfg=cfg,
             sfa_gmem_base=cutlass.make_array_view(sfa_gmem_tensor),
@@ -1781,15 +1960,184 @@ def _batched_gemm_kernel_bf16_body(
         mn_limit_view=mn_limit_view,
         total_num_padded_tokens_tensor=total_num_padded_tokens_tensor,
         problem_m=problem_m,
+        c_row_stride=c_row_stride,
+        sf_c_m_offset=sf_c_m_offset,
         problem_n=problem_n,
         name="GmemC",
     )
 
+    proxy_cluster = None
+    if cutlass.const_expr(
+        cfg.has_gather and cfg.uses_two_cta_mma and cfg.warp_layout.num_sync_warps > 0
+    ):
+        proxy_cluster = ProxyClusterBarrierResource(
+            cfg=cfg,
+            pipeline_config=pcfgs.get("proxy"),
+            name="ProxyCluster",
+        )
+
+    # SMEM allocator
+    smem_allocator = SmemAllocator()
+    smem_resources: tuple[Any, ...] = (smem_a, smem_b)
+    if cutlass.const_expr(cfg.has_cast_a):
+        smem_resources = smem_resources + (smem_sfa,)
+    if cutlass.const_expr(cfg.has_input_block_scaling):
+        smem_resources = smem_resources + (smem_sfa, smem_sfb)
+    if cutlass.const_expr(cfg.use_deepseek_fp8):
+        smem_resources = smem_resources + (smem_dsfp8_sfab,)
+    smem_resources = smem_resources + (gmem_c,)
+    for r in smem_resources:
+        smem_allocator.add_resource(r)
+    _register_pipeline_smem_resources(
+        smem_allocator,
+        tmem_c,
+        tmem_cast_a,
+        tmem_sfa,
+        tmem_sfb,
+        tmem_sfab,
+        proxy_cluster,
+    )
+    if cutlass.const_expr(cfg.aliases_c_scratch_with_ab):
+        alloc_a = smem_a._alloc if hasattr(smem_a, "_alloc") else smem_a._alloc_a
+        alloc_b = smem_b._alloc if hasattr(smem_b, "_alloc") else smem_b._alloc_b
+        smem_allocator.add_alias_group(
+            [
+                [alloc_a, alloc_b],
+                [gmem_c._alloc_sc],
+            ]
+        )
+    tmem_ptr_alloc = smem_allocator.add_tmem_ptr(_make_tmem_ptr_smem_allocation())
+    tmem_dealloc_mbar_alloc = None
+    if cutlass.const_expr(cfg.uses_two_cta_mma):
+        tmem_dealloc_mbar_alloc = smem_allocator.add(
+            SmemAllocation("tmem_dealloc_mbar", dtype=cutlass.Int64, alignment=8)
+        )
+
+    # Keep the persistent scheduler's response and software-pipeline barriers
+    # in the unified dynamic-SMEM block.  A standalone ``alloc_smem`` object
+    # makes the CUDA function reserve a separate 1 KiB static-SMEM region,
+    # which unnecessarily reduces the opt-in dynamic-SMEM ceiling.
+    clc_response_alloc = None
+    workid_barrier_alloc = None
+    work_throttle_barrier_alloc = None
+    fast_drain_response_alloc = None
+    fast_drain_mbar_alloc = None
+    if cutlass.const_expr(cfg.is_persistent):
+        clc_response_alloc = smem_allocator.add(
+            SmemAllocation(
+                "clc_response",
+                dtype=cutlass.Int128,
+                count=cfg.num_stages_workid,
+                alignment=16,
+            )
+        )
+        workid_barrier_alloc = smem_allocator.add(
+            SmemAllocation(
+                "workid_mbarriers",
+                dtype=cutlass.Int64,
+                count=2 * cfg.num_stages_workid,
+                alignment=8,
+            )
+        )
+        if cutlass.const_expr(cfg.use_work_throttle_barrier):
+            work_throttle_barrier_alloc = smem_allocator.add(
+                SmemAllocation(
+                    "work_throttle_mbarriers",
+                    dtype=cutlass.Int64,
+                    count=2 * cfg.num_stages_workid,
+                    alignment=8,
+                )
+            )
+        if cutlass.const_expr(cfg.use_clc_fast_drain):
+            fast_drain_response_alloc = smem_allocator.add(
+                SmemAllocation(
+                    "fast_drain_clc_responses",
+                    dtype=cutlass.Int128,
+                    count=4,
+                    alignment=16,
+                )
+            )
+            fast_drain_mbar_alloc = smem_allocator.add(
+                SmemAllocation(
+                    "fast_drain_mbarrier",
+                    dtype=cutlass.Int64,
+                    count=1,
+                    alignment=8,
+                )
+            )
+    smem_allocator.compute_layout()
+
+    clc_response_ptr = None
+    fast_drain_response_ptr = None
+    fast_drain_mbar_ptr = None
+    if cutlass.const_expr(cfg.is_persistent):
+        # Materialize the unified block now because the CLC scheduler config
+        # needs its response pointer before TaskManager setup. ``allocate()``
+        # is idempotent, so TaskManager will reuse this same block later.
+        smem_allocator.allocate()
+        clc_response_ptr = cute.make_ptr(
+            cutlass.Int128,
+            smem_allocator.smem_base.data_ptr() + clc_response_alloc.offset,
+            mem_space=cutlass.AddressSpace.smem,
+        )
+        workid_barrier_ptr = cute.make_ptr(
+            cutlass.Int64,
+            smem_allocator.smem_base.data_ptr() + workid_barrier_alloc.offset,
+            mem_space=cutlass.AddressSpace.smem,
+        )
+        pcfgs["workid"] = replace(pcfgs["workid"], barrier_ptr=workid_barrier_ptr)
+        if cutlass.const_expr(cfg.use_work_throttle_barrier):
+            work_throttle_barrier_ptr = cute.make_ptr(
+                cutlass.Int64,
+                smem_allocator.smem_base.data_ptr()
+                + work_throttle_barrier_alloc.offset,
+                mem_space=cutlass.AddressSpace.smem,
+            )
+            pcfgs["work_throttle"] = replace(
+                pcfgs["work_throttle"], barrier_ptr=work_throttle_barrier_ptr
+            )
+        if cutlass.const_expr(cfg.use_clc_fast_drain):
+            fast_drain_response_ptr = cute.make_ptr(
+                cutlass.Int128,
+                smem_allocator.smem_base.data_ptr() + fast_drain_response_alloc.offset,
+                mem_space=cutlass.AddressSpace.smem,
+            )
+            fast_drain_mbar_ptr = cute.make_ptr(
+                cutlass.Int64,
+                smem_allocator.smem_base.data_ptr() + fast_drain_mbar_alloc.offset,
+                mem_space=cutlass.AddressSpace.smem,
+            )
+
+    # TMEM allocator
+    tmem_allocator = TmemAllocator()
+    # C first (accumulator at offset 0, matching nvfp4_gemm reference)
+    tmem_allocator.add_resource(tmem_c)
+    if cutlass.const_expr(cfg.has_cast_a):
+        tmem_allocator.add_resource(tmem_cast_a)
+    if cutlass.const_expr(
+        cfg.has_input_block_scaling
+        and (cfg.has_input_block_scaling and not cfg.fuse_sf_copy_to_mma)
+    ):
+        if cutlass.const_expr(cfg.use_combined_sfab_copy):
+            tmem_allocator.add_resource(tmem_sfab)
+        else:
+            tmem_allocator.add_resource(tmem_sfa)
+            tmem_allocator.add_resource(tmem_sfb)
+    tmem_allocator.compute_layout()
+
+    pdl_wait_completed_before_tasks = cutlass.const_expr(
+        _pdl_wait_completed_before_tasks(cfg)
+    )
     # WorkQueue — CLC persistent or static (non-persistent)
     if cutlass.const_expr(cfg.is_persistent):
+        num_non_exiting_ctas_value = None
         if cutlass.const_expr(
             cfg.use_early_exit
-            and (not cfg.use_pdl or _pdl_wait_completed_before_tasks(cfg))
+            and (
+                not cfg.use_pdl
+                or pdl_wait_completed_before_tasks
+                or cfg.skip_early_exit_pdl
+            )
         ):
             num_non_exiting_ctas_view = cutlass.make_array_view(
                 num_non_exiting_ctas_tensor
@@ -1797,7 +2145,6 @@ def _batched_gemm_kernel_bf16_body(
             num_non_exiting_ctas_value = num_non_exiting_ctas_view.load(
                 idx=Int32(0), vector_size=1
             )[0]
-        clc_response_ptr = cute.arch.alloc_smem(cutlass.Int128, cfg.num_stages_workid)
         tile_sched_cfg = (
             TileSchedulerConfig.create_clc_dynamic_persistent_tile_scheduler_params(
                 tile_scheduler_params=tile_sched_params,
@@ -1809,6 +2156,8 @@ def _batched_gemm_kernel_bf16_body(
             cfg=cfg,
             num_non_exiting_ctas_tensor=num_non_exiting_ctas_tensor,
             num_non_exiting_ctas_value=num_non_exiting_ctas_value,
+            fast_drain_response_ptr=fast_drain_response_ptr,
+            fast_drain_mbar_ptr=fast_drain_mbar_ptr,
             pipeline_config=pcfgs["workid"],
             name="WorkQueue",
         )
@@ -1826,57 +2175,6 @@ def _batched_gemm_kernel_bf16_body(
             pipeline_config=pcfgs["work_throttle"],
             name="WorkThrottle",
         )
-
-    # SMEM allocator
-    smem_allocator = SmemAllocator()
-    smem_resources: tuple[Any, ...] = (smem_a, smem_b)
-    if cutlass.const_expr(cfg.has_cast_a):
-        smem_resources = smem_resources + (smem_sfa,)
-    if cutlass.const_expr(cfg.has_scale_factors):
-        smem_resources = smem_resources + (smem_sfa, smem_sfb)
-    if cutlass.const_expr(cfg.has_deepseek_fp8):
-        smem_resources = smem_resources + (smem_dsfp8_sfab,)
-    if cutlass.const_expr(cfg.is_persistent):
-        smem_resources = smem_resources + (work_queue,)
-    smem_resources = smem_resources + (gmem_c,)
-    for r in smem_resources:
-        smem_allocator.add_resource(r)
-    if cutlass.const_expr(cfg.aliases_c_scratch_with_ab):
-        alloc_a = smem_a._alloc if hasattr(smem_a, "_alloc") else smem_a._alloc_a
-        alloc_b = smem_b._alloc if hasattr(smem_b, "_alloc") else smem_b._alloc_b
-        smem_allocator.add_alias_group(
-            [
-                [alloc_a, alloc_b],
-                [gmem_c._alloc_sc],
-            ]
-        )
-    tmem_ptr_alloc = smem_allocator.add_tmem_ptr(
-        SmemAllocation("tmem_ptr_i32", dtype=cutlass.Int32, alignment=4)
-    )
-    tmem_dealloc_mbar_alloc = None
-    if cutlass.const_expr(cfg.has_cluster):
-        tmem_dealloc_mbar_alloc = smem_allocator.add(
-            SmemAllocation("tmem_dealloc_mbar", dtype=cutlass.Int64, alignment=8)
-        )
-    smem_allocator.compute_layout()
-
-    # TMEM allocator
-    tmem_allocator = TmemAllocator()
-    # C first (accumulator at offset 0, matching nvfp4_gemm reference)
-    tmem_allocator.add_resource(tmem_c)
-    if cutlass.const_expr(cfg.has_cast_a):
-        tmem_allocator.add_resource(tmem_cast_a)
-    if cutlass.const_expr(cfg.has_scale_factors and cfg.uses_unfused_tmem_sf_copy):
-        if cutlass.const_expr(cfg.use_combined_sfab_copy):
-            tmem_allocator.add_resource(tmem_sfab)
-        else:
-            tmem_allocator.add_resource(tmem_sfa)
-            tmem_allocator.add_resource(tmem_sfb)
-    tmem_allocator.compute_layout()
-
-    pdl_wait_completed_before_tasks = cutlass.const_expr(
-        _pdl_wait_completed_before_tasks(cfg)
-    )
     pdl_wait_resource = (
         PdlWaitBarrier(name="PdlWait")
         if cutlass.const_expr(cfg.use_pdl and not pdl_wait_completed_before_tasks)
@@ -1887,7 +2185,6 @@ def _batched_gemm_kernel_bf16_body(
     )
 
     # Tasks
-    proxy_cluster = None
     if cutlass.const_expr(cfg.has_gather):
         if cutlass.const_expr(cfg.is_swap_ab):
             if cutlass.const_expr(cfg.fuse_operand_sf_loads):
@@ -1956,12 +2253,9 @@ def _batched_gemm_kernel_bf16_body(
             task_list = [gather, load_b]
 
         # 2-CTA + gather: add proxy barrier + sync task
-        if cutlass.const_expr(cfg.has_cluster and cfg.num_sync_warps > 0):
-            proxy_cluster = ProxyClusterBarrierResource(
-                cfg=cfg,
-                pipeline_config=pcfgs.get("proxy"),
-                name="ProxyCluster",
-            )
+        if cutlass.const_expr(
+            cfg.uses_two_cta_mma and cfg.warp_layout.num_sync_warps > 0
+        ):
             sync = create_sync_task(
                 cfg,
                 proxy_cluster,
@@ -1969,7 +2263,7 @@ def _batched_gemm_kernel_bf16_body(
                 tma_smem,
                 work_queue,
                 k_tile_cnt,
-                sync_warp_idx=cfg.sync_warp_idx,
+                sync_warp_idx=cfg.warp_layout.sync_warp_idx,
             )
             task_list.append(sync)
     else:
@@ -2026,7 +2320,9 @@ def _batched_gemm_kernel_bf16_body(
         )
         task_list += [load_sfa, cast_a]
 
-    if cutlass.const_expr(cfg.has_scale_factors and not cfg.fuse_operand_sf_loads):
+    if cutlass.const_expr(
+        cfg.has_input_block_scaling and not cfg.fuse_operand_sf_loads
+    ):
         load_sfa = create_load_sfa_task(
             cfg,
             gmem_sfa,
@@ -2054,7 +2350,9 @@ def _batched_gemm_kernel_bf16_body(
             ),
         )
         task_list += [load_sfa, load_sfb]
-        if cutlass.const_expr(cfg.uses_unfused_tmem_sf_copy):
+        if cutlass.const_expr(
+            (cfg.has_input_block_scaling and not cfg.fuse_sf_copy_to_mma)
+        ):
             # Separate CopySf tasks for SMEM→TMEM when SF is routed.
             if cutlass.const_expr(cfg.use_combined_sfab_copy):
                 copy_sfab = create_copy_sfab_task(
@@ -2072,11 +2370,14 @@ def _batched_gemm_kernel_bf16_body(
 
     # With separate CopySf: MMA consumes TmemSf, not SmemSf.
     # Otherwise MMA consumes SmemSf and does fused S2T in producer_work.
-    if cutlass.const_expr(cfg.has_scale_factors and cfg.uses_unfused_tmem_sf_copy):
+    if cutlass.const_expr(
+        cfg.has_input_block_scaling
+        and (cfg.has_input_block_scaling and not cfg.fuse_sf_copy_to_mma)
+    ):
         # MMA consumes TmemSf — SF already in TMEM from CopySf tasks
         smem_sfa_for_mma = None
         smem_sfb_for_mma = None
-    elif cutlass.const_expr(cfg.has_scale_factors):
+    elif cutlass.const_expr(cfg.has_input_block_scaling):
         # MMA consumes SmemSf — does fused S2T in producer_work
         smem_sfa_for_mma = smem_sfa
         smem_sfb_for_mma = smem_sfb
@@ -2087,8 +2388,8 @@ def _batched_gemm_kernel_bf16_body(
     tmem_sfa_for_mma = (
         tmem_sfa
         if cutlass.const_expr(
-            cfg.has_scale_factors
-            and cfg.uses_unfused_tmem_sf_copy
+            cfg.has_input_block_scaling
+            and (cfg.has_input_block_scaling and not cfg.fuse_sf_copy_to_mma)
             and not cfg.use_combined_sfab_copy
         )
         else None
@@ -2096,15 +2397,17 @@ def _batched_gemm_kernel_bf16_body(
     tmem_sfb_for_mma = (
         tmem_sfb
         if cutlass.const_expr(
-            cfg.has_scale_factors
-            and cfg.uses_unfused_tmem_sf_copy
+            cfg.has_input_block_scaling
+            and (cfg.has_input_block_scaling and not cfg.fuse_sf_copy_to_mma)
             and not cfg.use_combined_sfab_copy
         )
         else None
     )
     tmem_sfab_for_mma = (
         tmem_sfab
-        if cutlass.const_expr(cfg.has_scale_factors and cfg.use_combined_sfab_copy)
+        if cutlass.const_expr(
+            cfg.has_input_block_scaling and cfg.use_combined_sfab_copy
+        )
         else None
     )
     tmem_cast_a_for_mma = tmem_cast_a if cutlass.const_expr(cfg.has_cast_a) else None
@@ -2124,7 +2427,7 @@ def _batched_gemm_kernel_bf16_body(
         tmem_sfab=tmem_sfab_for_mma,
         tmem_cast_a=tmem_cast_a_for_mma,
     )
-    if cutlass.const_expr(cfg.has_deepseek_fp8):
+    if cutlass.const_expr(cfg.use_deepseek_fp8):
         load_sfab = create_load_sfab_task(
             cfg,
             smem_dsfp8_sfab,
@@ -2141,7 +2444,7 @@ def _batched_gemm_kernel_bf16_body(
         epi = create_epilogue_task(cfg, tmem_c, gmem_c, work_queue, k_tile_cnt)
         task_list += [mma, epi]
 
-    if cutlass.const_expr(cfg.num_padding_warps > 0):
+    if cutlass.const_expr(cfg.warp_layout.num_padding_warps > 0):
         pad = create_padding_task(cfg, work_queue, k_tile_cnt)
         task_list.append(pad)
     # WorkScheduleTask (CLC persistent only)
@@ -2159,12 +2462,17 @@ def _batched_gemm_kernel_bf16_body(
         smem_b: [gmem_b],
         gmem_c: [tmem_c],
     }
-    if cutlass.const_expr(cfg.has_scale_factors and cfg.uses_unfused_tmem_sf_copy):
+    if cutlass.const_expr(
+        cfg.has_input_block_scaling
+        and (cfg.has_input_block_scaling and not cfg.fuse_sf_copy_to_mma)
+    ):
         resource_dependency_graph[smem_sfa] = [gmem_sfa]
         resource_dependency_graph[smem_sfb] = [gmem_sfb]
         ab_dependencies = [smem_a, smem_b]
         if cutlass.const_expr(
-            cfg.has_gather and cfg.has_cluster and cfg.num_sync_warps > 0
+            cfg.has_gather
+            and cfg.uses_two_cta_mma
+            and cfg.warp_layout.num_sync_warps > 0
         ):
             resource_dependency_graph[proxy_cluster] = ab_dependencies
             ab_dependencies = [proxy_cluster]
@@ -2180,12 +2488,14 @@ def _batched_gemm_kernel_bf16_body(
                 tmem_sfa,
                 tmem_sfb,
             ]
-    elif cutlass.const_expr(cfg.has_scale_factors):
+    elif cutlass.const_expr(cfg.has_input_block_scaling):
         resource_dependency_graph[smem_sfa] = [gmem_sfa]
         resource_dependency_graph[smem_sfb] = [gmem_sfb]
         ab_dependencies = [smem_a, smem_b]
         if cutlass.const_expr(
-            cfg.has_gather and cfg.has_cluster and cfg.num_sync_warps > 0
+            cfg.has_gather
+            and cfg.uses_two_cta_mma
+            and cfg.warp_layout.num_sync_warps > 0
         ):
             resource_dependency_graph[proxy_cluster] = ab_dependencies
             ab_dependencies = [proxy_cluster]
@@ -2196,14 +2506,16 @@ def _batched_gemm_kernel_bf16_body(
         resource_dependency_graph[smem_sfa] = [gmem_sfa]
         resource_dependency_graph[tmem_cast_a] = [smem_a, smem_sfa]
         if cutlass.const_expr(
-            cfg.has_gather and cfg.has_cluster and cfg.num_sync_warps > 0
+            cfg.has_gather
+            and cfg.uses_two_cta_mma
+            and cfg.warp_layout.num_sync_warps > 0
         ):
             resource_dependency_graph[proxy_cluster] = [smem_b]
             resource_dependency_graph[tmem_c] = [tmem_cast_a, proxy_cluster]
         else:
             resource_dependency_graph[tmem_c] = [tmem_cast_a, smem_b]
     elif cutlass.const_expr(
-        cfg.has_gather and cfg.has_cluster and cfg.num_sync_warps > 0
+        cfg.has_gather and cfg.uses_two_cta_mma and cfg.warp_layout.num_sync_warps > 0
     ):
         # 2-CTA+gather: MMA depends on proxy (which depends on gather+TMA)
         resource_dependency_graph[proxy_cluster] = [smem_a, smem_b]
@@ -2211,7 +2523,7 @@ def _batched_gemm_kernel_bf16_body(
     else:
         resource_dependency_graph[tmem_c] = [smem_a, smem_b]
 
-    if cutlass.const_expr(cfg.has_deepseek_fp8):
+    if cutlass.const_expr(cfg.use_deepseek_fp8):
         resource_dependency_graph[smem_dsfp8_sfab] = (
             [pdl_wait_resource]
             if cutlass.const_expr(pdl_wait_resource is not None)
@@ -2236,12 +2548,13 @@ def _batched_gemm_kernel_bf16_body(
         resource_dependency_graph[pdl_wait_resource] = []
         if cutlass.const_expr(cfg.is_swap_ab):
             resource_dependency_graph[gmem_b] = [pdl_wait_resource]
-            if cutlass.const_expr(cfg.has_scale_factors):
+            if cutlass.const_expr(cfg.has_input_block_scaling):
                 resource_dependency_graph[gmem_sfb] = [pdl_wait_resource]
         else:
             resource_dependency_graph[gmem_a] = [pdl_wait_resource]
-            if cutlass.const_expr(cfg.has_cast_a or cfg.has_scale_factors):
+            if cutlass.const_expr(cfg.has_cast_a or cfg.has_input_block_scaling):
                 resource_dependency_graph[gmem_sfa] = [pdl_wait_resource]
+    _verify_rank_gated_register_donation(task_list)
     task_manager_cls = (
         TaskManager if _task_manager_verify_enabled() else _ProductionTaskManager
     )
@@ -2250,6 +2563,9 @@ def _batched_gemm_kernel_bf16_body(
         resource_dependency_graph=resource_dependency_graph,
         smem_allocator=smem_allocator,
         tmem_allocator=tmem_allocator,
+        smem_capacity_bytes=cfg.smem_capacity_bytes,
+        tmem_capacity_columns=cfg.tmem_capacity_columns,
+        verbose=cutlass.const_expr(_task_manager_verify_enabled()),
         assume_pdl_wait_completed=pdl_wait_completed_before_tasks,
         exhaustive_deadlock_race_check=cutlass.const_expr(
             _exhaustive_deadlock_race_check_enabled()
@@ -2270,9 +2586,8 @@ def _batched_gemm_kernel_bf16_body(
             token_cta_idx = block_n
         else:
             token_cta_idx = block_m
-        is_active_cta = (
-            token_cta_idx // Int32(cfg.token_metadata_stride) < num_non_exiting_ctas
-        )
+        token_cga_idx = token_cta_idx // Int32(cfg.token_cluster_dim)
+        is_active_cta = token_cga_idx < num_non_exiting_ctas
     else:
         is_active_cta = True
 
@@ -2287,7 +2602,7 @@ def _batched_gemm_kernel_bf16_body(
         tmem_ptr_i32 = smem_allocator.get(tmem_ptr_alloc)
         tmem_dealloc_mbar = None
         tmem_dealloc_mbar_ptr = None
-        if cutlass.const_expr(cfg.has_cluster):
+        if cutlass.const_expr(cfg.uses_two_cta_mma):
             tmem_dealloc_mbar = smem_allocator.get(tmem_dealloc_mbar_alloc)
             tmem_dealloc_mbar_ptr = cute.make_ptr(
                 cutlass.Int64,
@@ -2303,24 +2618,25 @@ def _batched_gemm_kernel_bf16_body(
             tmem_ptr_i32.data_ptr(),
             cutlass.AddressSpace.smem,
         )
-        cluster_vmnk = cute.make_layout((cfg.cluster_m, 1, 1, 1))
+        cluster_vmnk = cute.make_layout((cfg.umma_cta_count, 1, 1, 1))
         pipeline.pipeline_init_arrive(cluster_vmnk, is_relaxed=True)
         pipeline.pipeline_init_wait(cluster_vmnk)
 
         # TMEM allocation
-        # Allocate enough columns for both the explicit TS layout and generated
-        # kernel fixed offsets. cfg.tmem_total_cols is derived from KernelTraits-style
-        # formulas and includes the tile256 max-overlap lower bound.
+        # Allocate enough columns for both the explicit task-resource layout
+        # and the config-derived footprint.
         num_tmem_cols = _round_up_tmem_columns(
-            max(tmem_allocator.total_tmem_columns, cfg.tmem_total_cols)
+            max(tmem_allocator.total_tmem_columns, cfg.tmem_required_cols),
+            sm_arch=cfg.sm_arch,
         )
         if warp_idx == 0:
             cute.arch.alloc_tmem(
                 num_tmem_cols,
                 tmem_ptr_smem,
-                is_two_cta=cfg.has_cluster,
+                is_two_cta=cfg.uses_two_cta_mma,
+                arch=cfg.arch_name,
             )
-            cute.arch.relinquish_tmem_alloc_permit(is_two_cta=cfg.has_cluster)
+            cute.arch.relinquish_tmem_alloc_permit(is_two_cta=cfg.uses_two_cta_mma)
 
         # Sync warps that need TMEM
         prims.barrier_cta_sync()
@@ -2332,54 +2648,60 @@ def _batched_gemm_kernel_bf16_body(
         # before deallocating from the first epilogue warp.  For CTA_2 dealloc, the
         # first epilogue warp from each peer CTA performs the 32-thread rendezvous
         # before issuing the collective dealloc.
-        if cutlass.const_expr(cfg.has_cluster):
-            epilogue_end = cfg.epilogue_warp_idx + cfg.num_epilogue_warps
+        if cutlass.const_expr(cfg.uses_two_cta_mma):
+            epilogue_end = (
+                cfg.warp_layout.epilogue_warp_idx + cfg.warp_layout.num_epilogue_warps
+            )
             prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
-            if (warp_idx >= Int32(cfg.epilogue_warp_idx)) & (
+            if (warp_idx >= Int32(cfg.warp_layout.epilogue_warp_idx)) & (
                 warp_idx < Int32(epilogue_end)
             ):
                 prims.barrier_cta_sync(
                     barrier_id=10,
-                    thread_count=cfg.num_epilogue_warps * 32,
+                    thread_count=cfg.warp_layout.num_epilogue_warps * 32,
                 )
-                if warp_idx == Int32(cfg.epilogue_warp_idx):
+                if warp_idx == Int32(cfg.warp_layout.epilogue_warp_idx):
                     cta_rank_in_cluster = cute.arch.block_idx_in_cluster()
                     peer_cta_rank = cta_rank_in_cluster ^ 1
                     cute.arch.mbarrier_arrive(tmem_dealloc_mbar_ptr, peer_cta_rank)
                     cute.arch.mbarrier_wait(tmem_dealloc_mbar_ptr, 0)
-                    tmem_ptr_raw = prims.shfl_sync(
-                        thread_mask=0xFFFFFFFF,
-                        val=Int32(tmem_ptr_i32.load()),
-                        offset=0,
-                        mask_and_clamp=0x1F,
-                        kind=prims.Shfl.IDX,
-                        return_value_and_is_valid=False,
+                    tmem_ptr = cute.arch.retrieve_tmem_ptr(
+                        cutlass.Float32,
+                        16,
+                        tmem_ptr_smem,
                     )
-                    tmem_ptr = prims.make_tmem_ptr(tmem_ptr_raw, cutlass.Float32)
-                    prims.tcgen05_dealloc(tmem_ptr, num_tmem_cols, group=cfg.cta_group)
+                    cute.arch.dealloc_tmem(
+                        tmem_ptr,
+                        num_tmem_cols,
+                        is_two_cta=True,
+                        arch=cfg.arch_name,
+                    )
         else:
-            epilogue_end = cfg.epilogue_warp_idx + cfg.num_epilogue_warps
+            epilogue_end = (
+                cfg.warp_layout.epilogue_warp_idx + cfg.warp_layout.num_epilogue_warps
+            )
             prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
             if cutlass.const_expr(cfg.use_full_tmem_dealloc_barrier):
                 prims.barrier_cta_sync()
-            if (warp_idx >= Int32(cfg.epilogue_warp_idx)) & (
+            if (warp_idx >= Int32(cfg.warp_layout.epilogue_warp_idx)) & (
                 warp_idx < Int32(epilogue_end)
             ):
                 prims.barrier_cta_sync(
                     barrier_id=10,
-                    thread_count=cfg.num_epilogue_warps * 32,
+                    thread_count=cfg.warp_layout.num_epilogue_warps * 32,
                 )
-                if warp_idx == Int32(cfg.epilogue_warp_idx):
-                    tmem_ptr_raw = prims.shfl_sync(
-                        thread_mask=0xFFFFFFFF,
-                        val=Int32(tmem_ptr_i32.load()),
-                        offset=0,
-                        mask_and_clamp=0x1F,
-                        kind=prims.Shfl.IDX,
-                        return_value_and_is_valid=False,
+                if warp_idx == Int32(cfg.warp_layout.epilogue_warp_idx):
+                    tmem_ptr = cute.arch.retrieve_tmem_ptr(
+                        cutlass.Float32,
+                        16,
+                        tmem_ptr_smem,
                     )
-                    tmem_ptr = prims.make_tmem_ptr(tmem_ptr_raw, cutlass.Float32)
-                    prims.tcgen05_dealloc(tmem_ptr, num_tmem_cols, group=cfg.cta_group)
+                    cute.arch.dealloc_tmem(
+                        tmem_ptr,
+                        num_tmem_cols,
+                        is_two_cta=False,
+                        arch=cfg.arch_name,
+                    )
 
 
 @cute.kernel
@@ -2387,8 +2709,8 @@ def batched_gemm_kernel_bf16(
     tma_a_desc: cutlass.GridConstant[cuda.TensorMap],
     tma_b_desc: cutlass.GridConstant[cuda.TensorMap],
     tma_c_desc: cutlass.GridConstant[cuda.TensorMap],
-    tma_sfa_desc: cutlass.GridConstant[cuda.TensorMap],
-    tma_sfb_desc: cutlass.GridConstant[cuda.TensorMap],
+    tma_sfa_desc: cutlass.GridConstant[cuda.TensorMap] | None,
+    tma_sfb_desc: cutlass.GridConstant[cuda.TensorMap] | None,
     c_tensor: cute.Tensor,
     sf_c_tensor: cute.Tensor,
     bias_tensor: cute.Tensor,
@@ -2408,6 +2730,8 @@ def batched_gemm_kernel_bf16(
     sfa_gmem_tensor: cute.Tensor,
     sfb_gmem_tensor: cute.Tensor,
     problem_m: cutlass.Int32,
+    c_row_stride: cutlass.Int32,
+    sf_c_m_offset: cutlass.Int32,
     problem_n: cutlass.Int32,
     problem_k: cutlass.Int32,
     num_tokens: cutlass.Int32,
@@ -2416,24 +2740,9 @@ def batched_gemm_kernel_bf16(
     cfg: cutlass.Constexpr[BatchedGemmConfig],
     early_exit_max_token_ctas: cutlass.Int32,
 ) -> None:
-    if cutlass.const_expr(cfg.do_pdl_wait_for_num_non_exiting_ctas):
-        prims.griddepcontrol(kind=prims.GridDepAction.WAIT)
+    if cutlass.const_expr(_pdl_wait_completed_before_tasks(cfg)):
+        cute.arch.griddepcontrol_wait()
 
-    if cutlass.const_expr(cfg.use_early_exit and not cfg.is_persistent):
-        # Dynamic-batch kernels launch a max token-CTA grid for
-        # CUDA graph reuse and skip inactive CTAs before touching routing tables.
-        num_non_exiting_ctas_view = cutlass.make_array_view(num_non_exiting_ctas_tensor)
-        num_non_exiting_ctas = num_non_exiting_ctas_view.load(
-            idx=Int32(0), vector_size=1
-        )[0]
-        block_m, block_n, _ = cute.arch.block_idx()
-        if cutlass.const_expr(cfg.is_swap_ab):
-            token_cta_idx = block_n
-        else:
-            token_cta_idx = block_m
-        # Early exit: DSL 4.8 rejects allocator list appends under a runtime `if`.
-        if token_cta_idx // Int32(cfg.token_metadata_stride) >= num_non_exiting_ctas:
-            prims.exit()
     _batched_gemm_kernel_bf16_body(
         tma_a_desc,
         tma_b_desc,
@@ -2459,6 +2768,8 @@ def batched_gemm_kernel_bf16(
         sfa_gmem_tensor,
         sfb_gmem_tensor,
         problem_m,
+        c_row_stride,
+        sf_c_m_offset,
         problem_n,
         problem_k,
         num_tokens,
@@ -2498,6 +2809,8 @@ def gemm(
     gemm1_clamp_limit_raw_ptr,
     problem_size: tuple,
     early_exit_max_token_ctas: cutlass.Int32,
+    c_row_stride: cutlass.Int32,
+    sf_c_m_offset: cutlass.Int32,
     cfg: cutlass.Constexpr[BatchedGemmConfig],
     stream,
 ):
@@ -2505,7 +2818,6 @@ def gemm(
     m, n, k, num_experts_dim, num_tokens = problem_size
     compute_warp_layout(cfg)
     validate_config(cfg, problem_mnk=(m, n, k))
-    from cutlass.experimental.cuda import TensorMapDataFormat
 
     # Typed pointers passed from host-side make_ptr (cute.runtime.make_ptr)
     a_ptr = a_raw_ptr
@@ -2584,44 +2896,19 @@ def gemm(
         )
     b_tensor = cute.make_tensor(b_ptr, b_layout)
 
-    def _tma_format_for_dtype(dtype_kind: int, native_fp4: bool = False):
-        if cutlass.const_expr(dtype_kind == int(DType.BF16)):
-            return TensorMapDataFormat.DEFAULT
-        if cutlass.const_expr(dtype_kind in (int(DType.MXE4M3), int(DType.E4M3))):
-            return TensorMapDataFormat.BYTE
-        if cutlass.const_expr(dtype_kind == int(DType.MXE2M1)):
-            if cutlass.const_expr(native_fp4):
-                return TensorMapDataFormat.B4X16
-            return TensorMapDataFormat.B4X16_P64
-        return TensorMapDataFormat.B4X16
-
-    def _tma_box_k_for_dtype(dtype_kind: int, native_fp4: bool = False):
-        if cutlass.const_expr(dtype_kind == int(DType.BF16)):
-            return 64
-        if cutlass.const_expr(native_fp4):
-            return cfg.tile_k
-        if cutlass.const_expr(
-            dtype_kind in (int(DType.MXE2M1), int(DType.MXE4M3), int(DType.E4M3))
-        ):
-            return 128
-        return 256
-
-    def _tma_swizzle_for_fastest_dim_bytes(num_bytes: int):
-        if cutlass.const_expr(num_bytes % 128 == 0):
-            return cuda.TensorMapSwizzle.s128b
-        if cutlass.const_expr(num_bytes % 64 == 0):
-            return cuda.TensorMapSwizzle.s64b
-        if cutlass.const_expr(num_bytes % 32 == 0):
-            return cuda.TensorMapSwizzle.s32b
-        return cuda.TensorMapSwizzle.none
-
-    # TMA descriptors for A and B: MX FP4 expands to 8-bit SMEM staging, so
-    # A/B formats and box widths must be selected independently.
-    tma_format_a = _tma_format_for_dtype(cfg.dtype_a_kind, cfg.has_cast_a)
-    tma_format_b = _tma_format_for_dtype(cfg.dtype_b_kind)
-    tma_swizzle = cuda.TensorMapSwizzle.s128b
-    a_box_k = _tma_box_k_for_dtype(cfg.dtype_a_kind, cfg.has_cast_a)
-    b_box_k = _tma_box_k_for_dtype(cfg.dtype_b_kind)
+    # TMA descriptors for A and B: K32 MXFP4 expands to 8-bit SMEM while Rubin
+    # K64 keeps native 4-bit staging, so select each operand independently.
+    native_mx_fp4 = cfg.uses_native_mx_fp4_operands
+    tma_format_a = _tma_format_for_dtype(cfg.dtype_a, cfg.has_cast_a or native_mx_fp4)
+    tma_format_b = _tma_format_for_dtype(cfg.dtype_b, native_mx_fp4)
+    a_box_k = _tma_box_k_for_dtype(cfg, cfg.dtype_a, cfg.has_cast_a or native_mx_fp4)
+    b_box_k = _tma_box_k_for_dtype(cfg, cfg.dtype_b, native_mx_fp4)
+    a_tma_swizzle = _tma_swizzle_for_fastest_dim_bytes(
+        a_box_k * cfg.dtype_a_smem_bits // 8
+    )
+    b_tma_swizzle = _tma_swizzle_for_fastest_dim_bytes(
+        b_box_k * cfg.dtype_b_smem_bits // 8
+    )
 
     if cutlass.const_expr(cfg.uses_block_major_k_weight_a):
         a_tile_block_k = cfg.block_major_k_tile_block_elems
@@ -2634,7 +2921,7 @@ def gemm(
                 1,
             ),
             stride_order=(0, 1, 2, 3),
-            swizzle=tma_swizzle,
+            swizzle=a_tma_swizzle,
             tma_format=tma_format_a,
         )
     elif cutlass.const_expr(cfg.has_tma_route and not cfg.is_swap_ab):
@@ -2642,7 +2929,7 @@ def gemm(
             tensor=a_tensor,
             box_dims=(a_box_k, 1),
             stride_order=(0, 1),
-            swizzle=tma_swizzle,
+            swizzle=a_tma_swizzle,
             tma_format=tma_format_a,
         )
     elif cutlass.const_expr(cfg.use_bf16_kbox_tma_a):
@@ -2650,7 +2937,7 @@ def gemm(
             tensor=a_tensor,
             box_dims=(64, cfg.tile_m, cfg.tile_k // 64, 1),
             stride_order=(0, 1, 2, 3),
-            swizzle=tma_swizzle,
+            swizzle=a_tma_swizzle,
             tma_format=tma_format_a,
         )
     elif cutlass.const_expr(cfg.use_tma_oob_opt_a):
@@ -2658,7 +2945,7 @@ def gemm(
             tensor=a_tensor,
             box_dims=(a_box_k, cfg.tile_m, 1, 1),
             stride_order=(0, 1, 2, 3),
-            swizzle=tma_swizzle,
+            swizzle=a_tma_swizzle,
             tma_format=tma_format_a,
         )
     else:
@@ -2666,7 +2953,7 @@ def gemm(
             tensor=a_tensor,
             box_dims=(a_box_k, cfg.tile_m, 1),
             stride_order=(0, 1, 2),
-            swizzle=tma_swizzle,
+            swizzle=a_tma_swizzle,
             tma_format=tma_format_a,
         )
 
@@ -2675,13 +2962,13 @@ def gemm(
             tensor=b_tensor,
             box_dims=(b_box_k, 1),
             stride_order=(0, 1),
-            swizzle=tma_swizzle,
+            swizzle=b_tma_swizzle,
             tma_format=tma_format_b,
         )
     else:
         b_box_rows = cfg.tile_n
         if cutlass.const_expr(cfg.split_b_across_ctas):
-            b_box_rows = cfg.tile_n // cfg.cluster_m
+            b_box_rows = cfg.tile_n // cfg.umma_cta_count
         if cutlass.const_expr(cfg.uses_block_major_k_weight_b):
             b_tile_block_k = cfg.block_major_k_tile_block_elems
             tma_b_desc = cuda.create_tensor_map_tiled_from_tensor(
@@ -2693,7 +2980,7 @@ def gemm(
                     1,
                 ),
                 stride_order=(0, 1, 2, 3),
-                swizzle=tma_swizzle,
+                swizzle=b_tma_swizzle,
                 tma_format=tma_format_b,
             )
         elif cutlass.const_expr(cfg.use_tma_oob_opt_b):
@@ -2701,7 +2988,7 @@ def gemm(
                 tensor=b_tensor,
                 box_dims=(b_box_k, b_box_rows, 1, 1),
                 stride_order=(0, 1, 2, 3),
-                swizzle=tma_swizzle,
+                swizzle=b_tma_swizzle,
                 tma_format=tma_format_b,
             )
         else:
@@ -2709,7 +2996,7 @@ def gemm(
                 tensor=b_tensor,
                 box_dims=(b_box_k, b_box_rows, 1),
                 stride_order=(0, 1, 2),
-                swizzle=tma_swizzle,
+                swizzle=b_tma_swizzle,
                 tma_format=tma_format_b,
             )
 
@@ -2718,7 +3005,7 @@ def gemm(
     tma_sfa_desc = None
     tma_sfb_desc = None
     if cutlass.const_expr(cfg.has_scale_factor_a):
-        sf_vec_size = cfg.sf_vec_size
+        sf_vec_size = cfg.input_sf_block_size_a
         sf_tma_ptr_dtype = cutlass.Uint8
         # Each K-block = 4 SF atoms. dim0 = tile_mn * 4 / 2 (uint16 packing)
         k_atoms_per_block = 4
@@ -2738,8 +3025,8 @@ def gemm(
         if cutlass.const_expr(not cfg.is_swap_ab):
             sfb_outer_rows = n * num_experts_dim
 
-        # SFA descriptor: routed TMA gather4 (2D linear) or regular tiled SF layout.
-        # LDGSTS-routed SF bypasses TensorMap encoding and uses raw GMEM tensors.
+        # SFA descriptor: routed TMA gather4 (2D linear) or regular tiled SF
+        # layout. LDGSTS-routed SFA leaves the descriptor unset.
         if cutlass.const_expr(uses_routed_sfa_tma_desc(cfg)):
             # Bound the descriptor by physical input rows, not padded output
             # capacity, so invalid gather rows receive TMA zero-fill.
@@ -2759,7 +3046,7 @@ def gemm(
                 swizzle=routed_sf_swizzle,
                 tma_format=cuda.TensorMapDataFormat.BYTE,
             )
-        else:
+        elif cutlass.const_expr(uses_sfa_tma_desc(cfg)):
             # Tiled SF layout. L is folded into the outer dimension for
             # weights and absent for expanded activations. Only the generated
             # split R128c4 descriptor remains rank-4; the legacy tiled
@@ -2818,8 +3105,8 @@ def gemm(
                     tma_format=cuda.TensorMapDataFormat.DEFAULT,
                 )
 
-        # SFB descriptor: routed TMA gather4 (2D linear) or regular tiled SF layout.
-        # LDGSTS-routed SF bypasses TensorMap encoding and uses raw GMEM tensors.
+        # SFB descriptor: routed TMA gather4 (2D linear) or regular tiled SF
+        # layout. LDGSTS-routed SFB leaves the descriptor unset.
         if cutlass.const_expr(uses_routed_sfb_tma_desc(cfg)):
             # Routed SF storage has one row per input token. Padded output
             # capacity can exceed this allocation and is not its TMA extent.
@@ -2838,10 +3125,10 @@ def gemm(
                 swizzle=routed_sf_swizzle,
                 tma_format=cuda.TensorMapDataFormat.BYTE,
             )
-        else:
+        elif cutlass.const_expr(uses_sfb_tma_desc(cfg)):
             # Tiled SF layout with the same folded-weight/no-L-activation
             # convention as SFA. Legacy tiled descriptors are rank-3.
-            if cutlass.const_expr(cfg.uses_rank4_sfb_tma):
+            if cutlass.const_expr(cfg.uses_split_r128c4_sfb_tma_desc):
                 sfb_outer_tiles = (sfb_outer_rows + 127) // 128
                 sfb_tile_outer = (cfg.tile_n + 127) // 128
                 sfb_layout = cute.make_layout(
@@ -2925,16 +3212,17 @@ def gemm(
             launch_num_tiles_n = early_exit_max_token_ctas
         else:
             launch_num_tiles_m = early_exit_max_token_ctas
-    block = cfg.threads_per_cta
-    cluster_shape = cfg.cluster_shape
+    block = cfg.warp_layout.threads_per_cta
+    cluster_shape = cfg.preferred_cluster_shape
+    fallback_cluster_shape = cfg.fallback_cluster_shape
 
     if cutlass.const_expr(cfg.is_persistent):
-        clc_raster_along_m = True
         tile_sched_params = utils.ClcDynamicPersistentTileSchedulerParams(
             (launch_num_tiles_m, launch_num_tiles_n, 1),
             cluster_shape,
             1,
-            clc_raster_along_m,
+            cfg.raster_along_m,
+            fallback_cluster_shape_mnk=fallback_cluster_shape,
         )
         grid = utils.ClcDynamicPersistentTileScheduler.get_grid_shape(tile_sched_params)
     else:
@@ -2942,18 +3230,26 @@ def gemm(
         tile_sched_params = utils.PersistentTileSchedulerParams(
             (launch_num_tiles_m, launch_num_tiles_n, 1),
             cluster_shape,
+            fallback_cluster_shape_mnk=fallback_cluster_shape,
         )
-        grid = (launch_num_tiles_m, launch_num_tiles_n, 1)
+        grid = (
+            cute.ceil_div(launch_num_tiles_m, cluster_shape[0]) * cluster_shape[0],
+            cute.ceil_div(launch_num_tiles_n, cluster_shape[1]) * cluster_shape[1],
+            1,
+        )
 
     # C output tensor
     output_m_for_c = m
+    output_n_for_c = n
     if cutlass.const_expr(cfg.is_swap_ab and cfg.has_gated_epilogue):
         output_m_for_c = m // Int32(2)
+    if cutlass.const_expr(not cfg.is_swap_ab and cfg.has_gated_epilogue):
+        output_n_for_c = n // Int32(2)
     if cutlass.const_expr(cfg.is_swap_ab):
         # SwapAB: C is (M, N) in M-major (column-major) layout.
         # M = hidden dim (stride-1), N = tokens (stride-M).
         if cutlass.const_expr(cfg.use_tma_store and cfg.use_tma_oob_opt):
-            if cutlass.const_expr(cfg.has_epilogue_quant):
+            if cutlass.const_expr(cfg.has_output_block_scaling):
                 c_layout = cute.make_layout(
                     (
                         cute.assume(output_m_for_c, 32),
@@ -2963,9 +3259,9 @@ def gemm(
                     ),
                     stride=(
                         1,
-                        cute.assume(output_m_for_c, 32),
-                        TMA_XLARGE_N - output_m_for_c,
-                        cute.assume(output_m_for_c, 32),
+                        cute.assume(c_row_stride, 32),
+                        TMA_XLARGE_N - c_row_stride,
+                        cute.assume(c_row_stride, 32),
                     ),
                 )
             else:
@@ -2978,26 +3274,24 @@ def gemm(
                     ),
                     stride=(
                         1,
-                        cute.assume(output_m_for_c, 32),
-                        TMA_XLARGE_N - output_m_for_c,
-                        cute.assume(output_m_for_c, 32),
+                        cute.assume(c_row_stride, 32),
+                        TMA_XLARGE_N - c_row_stride,
+                        cute.assume(c_row_stride, 32),
                     ),
                 )
         else:
+            # Extent is this launch's width; stride is the shared buffer pitch.
             c_layout = cute.make_layout(
                 (cute.assume(output_m_for_c, 32), cute.assume(n, 16)),
-                stride=(1, cute.assume(output_m_for_c, 32)),
+                stride=(1, cute.assume(c_row_stride, 32)),
             )
     else:
         # Non-swapAB: C is (M, N) row-major.
-        output_n_for_c = (
-            n // Int32(2) if cutlass.const_expr(cfg.has_gated_epilogue) else n
-        )
         c_layout = cute.make_layout(
             (cute.assume(m, 32), cute.assume(output_n_for_c, 16)),
             stride=(cute.assume(output_n_for_c, 16), 1),
         )
-    if cutlass.const_expr(cfg.has_epilogue_quant or cfg.uses_fp8_output):
+    if cutlass.const_expr(cfg.has_output_block_scaling or cfg.uses_fp8_output):
         c_quant_dtype = (
             cutlass.Float8E4M3FN
             if cfg.uses_mxfp8_output_quant or cfg.uses_fp8_output
@@ -3009,22 +3303,26 @@ def gemm(
         )
     else:
         c_tensor = cute.make_tensor(c_raw_ptr, c_layout)
-    if cutlass.const_expr(cfg.is_swap_ab and cfg.use_tma_store):
-        tma_store_cols = cfg.epi_tile_n
-    else:
-        tma_store_cols = cfg.non_swap_tma_store_cols
-    if cutlass.const_expr(cfg.has_epilogue_quant):
-        if cutlass.const_expr(cfg.use_tma_store and cfg.is_swap_ab):
+    tma_store_cols = cfg.tma_store_cols
+    if cutlass.const_expr(cfg.has_output_block_scaling):
+        if cutlass.const_expr(cfg.use_tma_store):
             if cutlass.const_expr(cfg.uses_mxfp8_output_quant):
-                tma_c_swizzle = cuda.TensorMapSwizzle.s64b
                 tma_c_format = cuda.TensorMapDataFormat.BYTE
             else:
-                tma_c_swizzle = cuda.TensorMapSwizzle.s32b
                 tma_c_format = cuda.TensorMapDataFormat.B4X16
-            if cutlass.const_expr(cfg.use_tma_oob_opt):
+            tma_c_swizzle = _tma_swizzle_for_fastest_dim_bytes(cfg.c_tma_swizzle_bytes)
+            if cutlass.const_expr(not cfg.is_swap_ab):
                 tma_c_desc = cuda.create_tensor_map_tiled_from_tensor(
                     tensor=c_tensor,
-                    box_dims=(cfg.tile_m // 2, cfg.epi_tile_n, 1, 1),
+                    box_dims=(cfg.tile_m, tma_store_cols),
+                    stride_order=(1, 0),
+                    swizzle=tma_c_swizzle,
+                    tma_format=tma_c_format,
+                )
+            elif cutlass.const_expr(cfg.use_tma_oob_opt):
+                tma_c_desc = cuda.create_tensor_map_tiled_from_tensor(
+                    tensor=c_tensor,
+                    box_dims=(cfg.swap_tma_store_rows, tma_store_cols, 1, 1),
                     stride_order=(0, 1, 2, 3),
                     swizzle=tma_c_swizzle,
                     tma_format=tma_c_format,
@@ -3032,7 +3330,7 @@ def gemm(
             else:
                 tma_c_desc = cuda.create_tensor_map_tiled_from_tensor(
                     tensor=c_tensor,
-                    box_dims=(cfg.tile_m // 2, cfg.epi_tile_n),
+                    box_dims=(cfg.swap_tma_store_rows, tma_store_cols),
                     stride_order=(0, 1),
                     swizzle=tma_c_swizzle,
                     tma_format=tma_c_format,
@@ -3042,18 +3340,23 @@ def gemm(
             # descriptor so the common kernel signature stays stable.
             tma_c_desc = tma_a_desc
     else:
-        if cutlass.const_expr(cfg.is_swap_ab and cfg.use_tma_store):
-            tma_store_rows = 64
+        if cutlass.const_expr(not cfg.use_tma_store):
+            # Direct STG paths never consume a C TensorMap. Reuse an existing
+            # valid descriptor as the placeholder required by the common
+            # kernel signature. Besides avoiding unnecessary setup, this is
+            # required for narrow gated outputs whose unused row-major C map
+            # cannot form a valid TMA box/stride combination.
+            tma_c_desc = tma_a_desc
+        elif cutlass.const_expr(cfg.is_swap_ab):
             if cutlass.const_expr(cfg.uses_fp8_output):
                 tma_c_format = cuda.TensorMapDataFormat.BYTE
-                tma_c_swizzle = cuda.TensorMapSwizzle.s64b
             else:
                 tma_c_format = cuda.TensorMapDataFormat.DEFAULT
-                tma_c_swizzle = cuda.TensorMapSwizzle.s128b
+            tma_c_swizzle = _tma_swizzle_for_fastest_dim_bytes(cfg.c_tma_swizzle_bytes)
             if cutlass.const_expr(cfg.use_tma_oob_opt):
                 tma_c_desc = cuda.create_tensor_map_tiled_from_tensor(
                     tensor=c_tensor,
-                    box_dims=(tma_store_rows, tma_store_cols, 1, 1),
+                    box_dims=(cfg.swap_tma_store_rows, tma_store_cols, 1, 1),
                     stride_order=(0, 1, 2, 3),
                     swizzle=tma_c_swizzle,
                     tma_format=tma_c_format,
@@ -3061,7 +3364,7 @@ def gemm(
             else:
                 tma_c_desc = cuda.create_tensor_map_tiled_from_tensor(
                     tensor=c_tensor,
-                    box_dims=(tma_store_rows, tma_store_cols),
+                    box_dims=(cfg.swap_tma_store_rows, tma_store_cols),
                     stride_order=(0, 1),
                     swizzle=tma_c_swizzle,
                     tma_format=tma_c_format,
@@ -3071,14 +3374,7 @@ def gemm(
                 tma_c_format = cuda.TensorMapDataFormat.BYTE
             else:
                 tma_c_format = cuda.TensorMapDataFormat.DEFAULT
-            tma_c_swizzle = cuda.TensorMapSwizzle.none
-            if cutlass.const_expr(cfg.use_swizzled_non_swap_tma):
-                box_bytes = tma_store_cols * cfg.dtype_c_bits // 8
-                tma_c_swizzle = {
-                    32: cuda.TensorMapSwizzle.s32b,
-                    64: cuda.TensorMapSwizzle.s64b,
-                    128: cuda.TensorMapSwizzle.s128b,
-                }[box_bytes]
+            tma_c_swizzle = _tma_swizzle_for_fastest_dim_bytes(cfg.c_tma_swizzle_bytes)
             tma_c_desc = cuda.create_tensor_map_tiled_from_tensor(
                 tensor=c_tensor,
                 box_dims=(cfg.tile_m, tma_store_cols),
@@ -3090,19 +3386,23 @@ def gemm(
     output_m_for_sf = m
     if cutlass.const_expr(cfg.is_swap_ab and cfg.has_gated_epilogue):
         output_m_for_sf = m // Int32(2)
-    if cutlass.const_expr(cfg.has_epilogue_quant):
-        sf_tokens = n if cutlass.const_expr(cfg.is_swap_ab) else m
-        if cutlass.const_expr(not cfg.is_swap_ab):
-            output_m_for_sf = n // Int32(2)
+    if cutlass.const_expr(cfg.has_output_block_scaling):
         sf_block_m = Int32(cfg.output_sf_block_size_c)
         sf_group_m = sf_block_m * Int32(4)
+        sf_block_axis = output_m_for_sf
+        sf_outer_axis = n
+        if cutlass.const_expr(cfg.is_swap_ab):
+            sf_block_axis = c_row_stride
+        else:
+            sf_block_axis = output_n_for_c
+            sf_outer_axis = m
         if cutlass.const_expr(cfg.sf_layout_c == int(SfLayout.R8c4)):
-            sf_c_elems = ((sf_tokens + Int32(7)) // Int32(8)) * (
-                ((output_m_for_sf + sf_group_m - Int32(1)) // sf_group_m) * Int32(32)
+            sf_c_elems = ((sf_outer_axis + Int32(7)) // Int32(8)) * (
+                ((sf_block_axis + sf_group_m - Int32(1)) // sf_group_m) * Int32(32)
             )
         else:
-            sf_c_elems = ((sf_tokens + Int32(127)) // Int32(128)) * (
-                ((output_m_for_sf + sf_group_m - Int32(1)) // sf_group_m) * Int32(512)
+            sf_c_elems = ((sf_outer_axis + Int32(127)) // Int32(128)) * (
+                ((sf_block_axis + sf_group_m - Int32(1)) // sf_group_m) * Int32(512)
             )
         sf_c_layout = cute.make_layout((sf_c_elems,), stride=(1,))
     elif cutlass.const_expr(cfg.has_deepseek_fp8_c_scale):
@@ -3161,16 +3461,17 @@ def gemm(
         per_token_sf_layout,
     )
 
-    # tile_idx and mn_limit use CGA indices on the token dimension.
-    # Keep num_token_tiles in CTA units until applying the metadata stride.
+    # tile_idx and mn_limit are indexed by CGA-scoped TileToken entries.
+    # non-swapAB: tokens = M → tileM * cga_dim.x.  swapAB: tokens = N →
+    # tileN * cga_dim.y.
     if cutlass.const_expr(cfg.is_swap_ab):
         num_token_tiles = num_tiles_n
     else:
         num_token_tiles = num_tiles_m
-    num_token_tiles = (
-        num_token_tiles + cfg.token_metadata_stride - 1
-    ) // cfg.token_metadata_stride
-    tile_idx_layout = cute.make_layout((num_token_tiles,), stride=(1,))
+    num_token_cgas = (
+        num_token_tiles + cfg.token_cluster_dim - 1
+    ) // cfg.token_cluster_dim
+    tile_idx_layout = cute.make_layout((num_token_cgas,), stride=(1,))
     tile_idx_tensor = cute.make_tensor(tile_idx_raw_ptr, tile_idx_layout)
 
     # Route map (gather only; dummy 1-element when off)
@@ -3181,11 +3482,15 @@ def gemm(
         route_map_layout = cute.make_layout((1,), stride=(1,))
     route_map_tensor = cute.make_tensor(route_map_raw_ptr, route_map_layout)
 
-    # mn_limit: TRT-LLM Gen absolute end-row limit per token tile.
-    mn_limit_layout = cute.make_layout((num_token_tiles,), stride=(1,))
+    # mn_limit: TRT-LLM Gen absolute end-row limit per token CGA.
+    mn_limit_layout = cute.make_layout((num_token_cgas,), stride=(1,))
     mn_limit_tensor = cute.make_tensor(mn_limit_raw_ptr, mn_limit_layout)
+    num_non_exiting_ctas_elems = (
+        3 if cutlass.const_expr(cfg.record_runtime_cga_shapes) else 1
+    )
     num_non_exiting_ctas_tensor = cute.make_tensor(
-        num_non_exiting_ctas_raw_ptr, cute.make_layout((1,), stride=(1,))
+        num_non_exiting_ctas_raw_ptr,
+        cute.make_layout((num_non_exiting_ctas_elems,), stride=(1,)),
     )
     total_num_padded_tokens_tensor = cute.make_tensor(
         total_num_padded_tokens_raw_ptr, cute.make_layout((1,), stride=(1,))
@@ -3196,14 +3501,8 @@ def gemm(
         cute.recast_ptr(act_raw_ptr, dtype=cutlass.Uint8), act_layout
     )
 
-    # SF TMA descriptors: real only for operands that have scale factors.
-    if cutlass.const_expr(not cfg.has_scale_factor_a):
-        tma_sfa_desc = tma_a_desc  # dummy, never accessed
-    if cutlass.const_expr(not cfg.has_scale_factor_b):
-        tma_sfb_desc = tma_b_desc  # dummy, never accessed
-
     # SF GMEM tensors for LDGSTS SF loading.
-    if cutlass.const_expr(cfg.has_deepseek_fp8):
+    if cutlass.const_expr(cfg.use_deepseek_fp8):
         # DeepSeek FP8 uses FP32 per-K dequant scales;
         # routed MX/NVFP4 uses packed E4M3/E8M0 bytes.
         ds_k_blocks = (k + Int32(cfg.tile_k - 1)) // Int32(cfg.tile_k)
@@ -3232,8 +3531,12 @@ def gemm(
         sf_dtype = (
             cutlass.Float8E8M0FNU if cfg.uses_mx_scale_factors else cutlass.Float8E4M3FN
         )
-        sfa_gmem_layout = cute.make_layout((m * (k // cfg.sf_vec_size),), stride=(1,))
-        sfb_gmem_layout = cute.make_layout((n * (k // cfg.sf_vec_size),), stride=(1,))
+        sfa_gmem_layout = cute.make_layout(
+            (m * (k // cfg.input_sf_block_size_a),), stride=(1,)
+        )
+        sfb_gmem_layout = cute.make_layout(
+            (n * (k // cfg.input_sf_block_size_a),), stride=(1,)
+        )
         sfa_gmem_tensor = cute.make_tensor(
             cute.recast_ptr(sfa_ptr, dtype=sf_dtype), sfa_gmem_layout
         )
@@ -3251,7 +3554,7 @@ def gemm(
             cute.make_layout((1,), stride=(1,)),
         )
 
-    batched_gemm_kernel_bf16(
+    kernel = batched_gemm_kernel_bf16(
         tma_a_desc,
         tma_b_desc,
         tma_c_desc,
@@ -3276,6 +3579,8 @@ def gemm(
         sfa_gmem_tensor,
         sfb_gmem_tensor,
         m,
+        c_row_stride,
+        sf_c_m_offset,
         n,
         k,
         num_tokens,
@@ -3283,10 +3588,23 @@ def gemm(
         tile_sched_params,
         cfg,
         early_exit_max_token_ctas,
-    ).launch(
-        grid=grid,
-        block=[block, 1, 1],
-        cluster=list(cluster_shape),
-        stream=stream,
-        use_pdl=bool(cfg.use_pdl),
     )
+    if cutlass.const_expr(cfg.fallback_cluster_shape is not None):
+        # Flexible launch: CUDA may select either complete physical shape.
+        assert fallback_cluster_shape is not None
+        kernel.launch(
+            grid=grid,
+            block=[block, 1, 1],
+            cluster=list(cluster_shape),
+            fallback_cluster=list(fallback_cluster_shape),
+            stream=stream,
+            use_pdl=bool(cfg.use_pdl),
+        )
+    else:
+        kernel.launch(
+            grid=grid,
+            block=[block, 1, 1],
+            cluster=list(cluster_shape),
+            stream=stream,
+            use_pdl=bool(cfg.use_pdl),
+        )

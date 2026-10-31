@@ -195,6 +195,10 @@ run_comm() {
   "${TORCHRUN}" --nproc_per_node="${NPROC_MULTIRANK}" -m pytest \
     "${MOE_EP_PYTEST_FLAGS[@]}" \
     tests/moe_ep/test_moe_ep_communication_multirank.py -v || return 1
+  # NVLink one-sided's Lamport transport against its fence transport.
+  "${TORCHRUN}" --nproc_per_node="${NPROC_MULTIRANK}" -m pytest \
+    "${MOE_EP_PYTEST_FLAGS[@]}" \
+    tests/moe_ep/test_nvlink_one_sided_lamport.py -v || return 1
   # Spawns one process per EP rank itself; cases needing more GPUs skip.
   "${PY}" -m pytest "${MOE_EP_PYTEST_FLAGS[@]}" tests/moe_ep/test_nvlink_one_sided.py -v
 }

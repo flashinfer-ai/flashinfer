@@ -47,6 +47,18 @@ def test_blackwell_genphase_graph(
 
 @pytest.mark.gpu_2
 @pytest.mark.arch_blackwell
+@pytest.mark.parametrize("kind", ["mxfp8_e5m2", "nvfp4", "mxfp4_mxfp8"])
+@pytest.mark.parametrize("early", [True, False])
+def test_blackwell_genphase_dtype_graph(sparse_ep_runtime, kind, early):
+    """Replay mixed empty, sparse and dense ranks for every block-scaled format."""
+    from .test_nvfp4_cutedsl_kernel_vs_reference import _run_blackwell_genphase_graph
+
+    rank, world = sparse_ep_runtime
+    _run_blackwell_genphase_graph(rank, world, 129, early, 128, 4, kind)
+
+
+@pytest.mark.gpu_2
+@pytest.mark.arch_blackwell
 @pytest.mark.parametrize(
     "mode,token_back_mode,tuning,in_kernel_fc2_reduce,alpha_source",
     [

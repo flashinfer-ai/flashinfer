@@ -976,7 +976,7 @@ def autotune(
             ``autotune(skip_ops={"B"})`` inside an outer
             ``autotune(skip_ops={"A"})`` skips both ``"A"`` and ``"B"``.
             Common op names: ``"fp4_gemm"``, ``"bf16_gemm"``,
-            ``"fp8_gemm"``, ``"mxfp8_gemm"``.
+            ``"bf16_gemm_pdl_auto"``, ``"fp8_gemm"``, ``"mxfp8_gemm"``.
         cuda_graph_profile_replays: Number of CUDA graph samples per profiling
             repeat. Operations configured for hot L2 use back-to-back replays;
             operations configured with ``use_cold_l2_cache=True`` flush L2
@@ -1229,6 +1229,8 @@ def set_autotune_process_group(
     the process-group timeout. Delegated protocols own their coordination.
     Serving with tuning disabled performs no collectives. Set the group before
     the first tuning call and clear it after the coordinated warmup.
+    CUPTI availability and initialization are checked collectively before
+    candidate execution. A tracing failure makes every rank use CUDA events.
 
     Example::
 
@@ -1453,6 +1455,20 @@ class _CuptiInfraError(RuntimeError):
     process instead of marking every tactic as failed."""
 
 
+def _sync_cupti_status(status: int) -> int:
+    """Agree on success (0), tracing failure (1), or candidate failure (2)."""
+    if _tune_process_group is None:
+        return status
+
+    import torch.distributed as dist
+
+    backend = str(dist.get_backend(_tune_process_group)).lower()
+    device = "cuda" if backend == "nccl" else "cpu"
+    result = torch.tensor([status], dtype=torch.int32, device=device)
+    dist.all_reduce(result, op=dist.ReduceOp.MAX, group=_tune_process_group)
+    return int(result.item())
+
+
 @functools.cache
 def _load_cupti():
     """Return the ``cupti`` module if cupti-python >= 13 is usable, else None.
@@ -1502,6 +1518,8 @@ def _cupti_measure_spans(
     repeat: int,
     prologue: Optional[Callable[[], None]] = None,
     check_ready: Optional[Callable[[str | None], None]] = None,
+    *,
+    prepare: Optional[Callable[[], None]] = None,
 ) -> list[float]:
     """Time *run_iteration* ``repeat`` times, returning per-iteration GPU
     kernel spans in milliseconds (first kernel start to last kernel end,
@@ -1518,12 +1536,13 @@ def _cupti_measure_spans(
     GPU-side timestamps, so host launch latency is structurally excluded —
     no delay kernel needed.  Deliberately no ``cupti.finalize()`` (this runs
     once per tactic; flush + disable suffices) and deliberately
-    per-measurement enable/disable (session-scoped tracing would instrument
-    every intervening warmup/synthesis kernel).
+    per-measurement enable/disable so tracing does not stay active between
+    candidates.
 
     Collective callers can supply ``check_ready`` to agree on initialization
     before launching any kernels. It receives the local error or None and must
-    raise on every rank if any rank failed initialization.
+    raise on every rank if any rank failed initialization. ``prepare`` runs once
+    after that check, outside the measured windows, for warmup and graph capture.
 
     Raises:
         _CuptiInfraError: CUPTI activity tracing could not be initialised
@@ -1574,6 +1593,8 @@ def _cupti_measure_spans(
     try:
         if check_ready is not None:
             check_ready(None)
+        if prepare is not None:
+            prepare()
         for _ in range(repeat):
             if prologue is not None:
                 prologue()
@@ -3758,37 +3779,44 @@ class AutoTuner:
         # fallback).
         profile_exc: Optional[BaseException] = None
         try:
-            # The CUPTI route stays INSIDE this try so a rank using it still
-            # reaches the all-reduce below on failure (cardinality invariant),
-            # and its measured time participates in the cross-rank mean like
-            # any other.  A CUPTI *infrastructure* failure (single-subscriber
-            # conflict) is not a tactic failure: fall back to the CUDA-event
-            # path for this and all later measurements.
-            use_cupti = (
-                measure_policy is not None
-                and measure_policy.timer == "cupti"
-                and not self._cupti_disabled
-                and _load_cupti() is not None
+            cupti_requested = (
+                measure_policy is not None and measure_policy.timer == "cupti"
             )
+            use_cupti = False
+            cupti_error = None
+            if cupti_requested:
+                available = not self._cupti_disabled and _load_cupti() is not None
+                use_cupti = _sync_cupti_status(int(not available)) == 0
             if use_cupti:
                 try:
                     avg_time = self._profile_single_kernel_cupti(
                         runner, inputs, tactic, tuning_config, **kwargs
                     )
                 except _CuptiInfraError as e:
-                    # Legacy CUPTI activity tracing is single-subscriber; an
-                    # attached profiler breaks it (CUDA 13.3's multi-subscriber
-                    # V2 APIs lift this once cupti-python exposes them).
-                    self._cupti_disabled = True
+                    cupti_error = e
+                except BaseException as e:  # noqa: BLE001
+                    profile_exc = e
+                # Missing activity records can fail after execution. Agree on
+                # fallback before any rank starts another round of launches.
+                status = _sync_cupti_status(
+                    2 if profile_exc is not None else int(cupti_error is not None)
+                )
+                if status == 2:
+                    avg_time = float("inf")
+                elif status == 1:
                     use_cupti = False
+            if cupti_requested and not use_cupti:
+                if not self._cupti_disabled:
+                    reason = cupti_error or "CUPTI unavailable on a tuning rank"
                     logger.warning(
-                        f"[Autotuner]: CUPTI activity tracing failed ({e}); "
+                        f"[Autotuner]: CUPTI activity tracing failed ({reason}); "
                         f"falling back to CUDA-event timing for the rest of "
                         f"this process.  NOTE: entries tuned in this session "
                         f"are event-timed even though the store identity says "
                         f"timer='cupti' -- re-tune without the conflicting "
                         f"profiler for faithful measurements."
                     )
+                self._cupti_disabled = True
             if not use_cupti:
                 delayed_events = tuning_config.use_cold_l2_cache or not (
                     (
@@ -3958,44 +3986,60 @@ class AutoTuner:
 
         Raises:
             _CuptiInfraError: propagated from ``_cupti_measure_spans`` when
-                CUPTI tracing cannot initialise.  ``_profile_single_kernel``
-                catches it and disables the cupti path for the process; a
-                new caller must handle it or it will surface as a crash.
+                tracing cannot initialize or returns no kernel records.
+                ``_profile_single_kernel`` coordinates CUDA-event fallback
+                across the tuning group.
         """
+
+        def check_ready(error):
+            if _sync_cupti_status(int(error is not None)):
+                raise _CuptiInfraError(
+                    error or "CUPTI initialization failed on another tuning rank"
+                )
+
         with _profile_measurement_scope():
-            for _ in range(self.warmup):
-                runner(inputs, tactic=tactic, **kwargs)
-
+            graph = None
             flush_buffer = None
-            if tuning_config.use_cold_l2_cache:
-                device = next(
-                    (t.device for t in inputs if isinstance(t, torch.Tensor)),
-                    torch.device("cuda"),
-                )
-                flush_buffer = torch.empty(
-                    self._get_l2_cache_size_in_bytes() * 3,
-                    device=device,
-                    dtype=torch.int8,
-                )
 
-            # The flush is a fill kernel; keep it OUT of the measured window by
-            # running it as the per-iteration prologue (synced before the span).
-            prologue = flush_buffer.zero_ if flush_buffer is not None else None
-
-            if tuning_config.use_cuda_graph:
-                torch.cuda.synchronize()
-                graph = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(graph):
+            def prepare():
+                nonlocal graph, flush_buffer
+                for _ in range(self.warmup):
                     runner(inputs, tactic=tactic, **kwargs)
 
-                run_iteration = graph.replay
-            else:
+                if tuning_config.use_cold_l2_cache:
+                    device = next(
+                        (t.device for t in inputs if isinstance(t, torch.Tensor)),
+                        torch.device("cuda"),
+                    )
+                    flush_buffer = torch.empty(
+                        self._get_l2_cache_size_in_bytes() * 3,
+                        device=device,
+                        dtype=torch.int8,
+                    )
 
-                def run_iteration():
+                if tuning_config.use_cuda_graph:
+                    torch.cuda.synchronize()
+                    graph = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(graph):
+                        runner(inputs, tactic=tactic, **kwargs)
+
+            def run_iteration():
+                if graph is None:
                     runner(inputs, tactic=tactic, **kwargs)
+                else:
+                    graph.replay()
+
+            def prologue():
+                # zero_ launches a fill kernel; exclude it from the span.
+                if flush_buffer is not None:
+                    flush_buffer.zero_()
 
             spans_ms = _cupti_measure_spans(
-                run_iteration, self.repeat, prologue=prologue
+                run_iteration,
+                self.repeat,
+                prologue=prologue,
+                check_ready=check_ready,
+                prepare=prepare,
             )
 
         # Median, not mean: robust to first-iteration instrumentation

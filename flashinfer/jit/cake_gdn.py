@@ -44,6 +44,8 @@ CakeGDNArch = Literal["sm_100a", "sm_103a", "sm_107a"]
 
 _EXPORT_SCHEMA = "flashinfer-cake-gdn-decode-standalone-export-v1"
 _DEFINE_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_RECORD_NAME = re.compile(r"^(decode|prefill)_(.+)_[0-9a-f]{12}$")
+_RECORD_TMA_ABI = {"decode": "pointer", "prefill": "grid_constant"}
 _ARCH_ACTIVE_CLUSTERS: dict[CakeGDNArch, int] = {
     "sm_100a": 148,
     "sm_103a": 160,
@@ -131,7 +133,47 @@ def _manifest() -> dict[str, Any]:
         raise RuntimeError(
             f"unexpected Cake GDN manifest schema at {path}: {manifest.get('schema')!r}"
         )
+    for record in manifest["variants"]:
+        _derive_record_fields(record)
     return manifest
+
+
+def _derive_record_fields(record: dict[str, Any]) -> None:
+    """Fill the record fields the export derives from its name and outputs.
+
+    ``<domain>_<schedule>_<12 hex>`` names every record: ``domain`` is its
+    first token, ``source_schedule`` is
+    ``flashinfer.cake_gdn.generated.<domain>:<schedule>``, ``tma_abi`` is
+    fixed per domain, ``host_binding.entry`` is ``run_<name>`` and the
+    record-level ``architectures`` is the sorted union of its outputs'.  A
+    field the manifest spells out must agree with the derived value.
+    """
+
+    name = record["name"]
+    match = _RECORD_NAME.match(name)
+    if match is None:
+        raise RuntimeError(f"unparseable Cake GDN record name {name!r}")
+    domain, schedule = match.groups()
+    derived: dict[str, Any] = {
+        "domain": domain,
+        "source_schedule": f"flashinfer.cake_gdn.generated.{domain}:{schedule}",
+        "tma_abi": _RECORD_TMA_ABI[domain],
+        "architectures": sorted(
+            {arch for output in record["outputs"] for arch in output["architectures"]}
+        ),
+    }
+    targets = [
+        (record, "", derived),
+        (record["host_binding"], "host_binding.", {"entry": f"run_{name}"}),
+    ]
+    for target, prefix, fields in targets:
+        for field, value in fields.items():
+            if field in target and target[field] != value:
+                raise RuntimeError(
+                    f"Cake GDN record {name!r} spells {prefix}{field}="
+                    f"{target[field]!r}; its name and outputs derive {value!r}"
+                )
+            target[field] = value
 
 
 def _kernel_record(name: str) -> dict[str, Any]:
@@ -283,12 +325,18 @@ def compile_cake_gdn_cubin(name: str, arch: CakeGDNArch) -> Path:
 
 
 _HOST_SHIM_PLACEHOLDER = re.compile(r"@([A-Z][A-Z0-9_]*)@")
+_HOST_SHIM_CONDITIONAL = re.compile(
+    r"^//@if (\w+)\n(.*?)^//@else\n(.*?)^//@endif\n", re.S | re.M
+)
 
 
 def render_cake_gdn_host_shim(record: dict[str, Any]) -> str:
     """Render the TVM-FFI host shim of one variant from its class template.
 
     ``host_binding.template`` names the template under ``host/templates/``.
+    A ``//@if metadata_i64`` / ``//@else`` / ``//@endif`` block of lines keeps
+    its first arm for a record whose ``metadata_i64`` is true and its second
+    arm otherwise; the directive lines are dropped before the placeholders.
     ``@ENTRY@``, ``@MODULE_IDENT@``, ``@CUDA_SYMBOL@`` and ``@SHIM_NAMESPACE@``
     come from ``host_binding``; every other ``@NAME@`` placeholder takes the
     value of ``host_binding.params[NAME]``.  The result is byte-identical to
@@ -297,6 +345,13 @@ def render_cake_gdn_host_shim(record: dict[str, Any]) -> str:
 
     host = record["host_binding"]
     template = (_source_dir() / host["template"]).read_text(encoding="utf-8")
+    flags = {"metadata_i64": bool(record.get("metadata_i64", False))}
+    template = _HOST_SHIM_CONDITIONAL.sub(
+        lambda match: match.group(2) if flags[match.group(1)] else match.group(3),
+        template,
+    )
+    if "//@" in template:
+        raise RuntimeError(f"{host['template']} has an unresolved host-shim directive")
     values = {
         "ENTRY": host["entry"],
         "MODULE_IDENT": host["module_ident"],

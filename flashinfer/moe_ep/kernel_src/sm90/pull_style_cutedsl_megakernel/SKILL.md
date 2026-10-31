@@ -137,6 +137,12 @@ not picked them up):
   builder shares its byte/row parameters between formats. Reapply these hooks
   when updating the drop, and
   compare complete MX and NV cubins before accepting a refactor.
+  The NV scale ring overrides `_weight_sf_stage_count`; reapply the base
+  hook for scale barrier storage and pipeline sizing independently of AB.
+  Shared MX producer/FC2 loops use `_weight_sf_decoupled` (default false)
+  and `_weight_sf_state` (default identity); the NV shim supplies only the
+  delayed scale-producer loop and early-release policy. Preserve these hooks
+  when reapplying the scale-ring extension.
 
 ## Layout
 

@@ -21,7 +21,8 @@ of the compact MoE layout (skipped, output rows unspecified) and expert runs
 start on multiples of ``alignment`` rows (128-multiples select the single-run
 schedule, other multiples of 32 the slower multi-run schedule).  When the
 packed words are DeepGEMM's MN-major activation words and the row-repeated
-weight words and ``N`` is a multiple of 256, the host may route a problem to
+weight words and ``N`` is a multiple of 256 (also an odd multiple of 128,
+see :func:`bs_swap_small_route`), the host may route a problem to
 the swap-AB programs (:func:`bs_swap_route_for_shape`): the weight rows fill
 the 256-row side of a two-CTA MMA and the routed tokens its N side.  With the
 same words, a single-run layout of at most 128 routed rows per group runs the
@@ -78,6 +79,11 @@ DEEPK_C2_AB6_SCALE1_ROUTE = "deepk_c2_ab6_scale1_n256_or_m4096"
 DEEPK_C2_KG1_ROUTE = "deepk_c2_kg1_non_kg4_k_blocks"
 DEEPK_C2_SCALAR_OUTPUT_ROUTE = "deepk_c2_scalar_output"
 DEEPK_C2_KG1_DIRECT_STORE_ROUTE = "deepk_c2_kg1_direct_store_m32"
+# The KG1 program with 128 x 64 tiles: a KG1 launch of more than
+# DIRECT_STORE_MAX_ROWS rows whose 128 x 64 tiles fit in one wave, and an AB6
+# launch of more than DIRECT_STORE_MAX_ROWS rows that is a single 128 x 128 tile
+# at K = 512 (see _launch_plan).
+DEEPK_C2_KG1_N64_ROUTE = "deepk_c2_kg1_n64_k_blocks"
 DEEPK_C2_AB6_SCALE1_DIRECT_STORE_ROUTE = "deepk_c2_ab6_scale1_direct_store_m32"
 DEEPK_N256_ROUTE = "deepk_n256_ab4_three_panel_kg4"
 DEEPK_CG2_RECURRENCE_ROUTE = "deepk_cg2_ab5_x16_pair_wait_kg4"
@@ -89,6 +95,18 @@ DEEPK_CG2_AB7_BSCALE_PREFETCH_ROUTE = "deepk_cg2_ab7_bscale_prefetch_kg4"
 # cut on the device from m_indices.  Selected only from the layout that
 # ``validate_indices`` reads (see ``prepare_group_gemm_fp8_nt_groupwise_contiguous``).
 DEEPK_C2_KG1_EXPERT_ALIGNED_ROUTE = "deepk_c2_kg1_expert_aligned"
+# The KG1 program with 128 x 64 tiles that computes the expert runs of each
+# 128-row window in separate CTAs.  Selected only from the same layout, for an
+# expert-aligned launch whose CTAs fit in one wave (see _window_segment_plan).
+DEEPK_C2_KG1_WSEG_ROUTE = "deepk_c2_kg1_wseg"
+# The window-segment program's launch contract: its kernel requires
+# 1 <= M <= WSEG_MAX_M and WSEG_MIN_N <= N <= WSEG_MAX_N, which its host shim
+# checks and which keep its window-tile pairs ((M + 127) // 128) * (N // 64)
+# in [1, 2**30].  The route is taken only inside it
+# (_window_segment_launch_ok).
+WSEG_MAX_M = 1 << 24
+WSEG_MIN_N = 64
+WSEG_MAX_N = 1 << 19
 # The expert-aligned program keeps one tile-table entry per expert in shared memory.
 EXPERT_ALIGNED_MAX_GROUPS = 255
 # Block-scaled (packed UE8M0 scale) family.
@@ -389,6 +407,8 @@ BS_SWAP_RUN32_ROUTE = "bs_ue8m0_swap_run32"
 BS_SWAP_S16_ROUTE = "bs_ue8m0_swap_s16"
 BS_SWAP_CARRY_S16_ROUTE = "bs_ue8m0_swap_carry_s16"
 BS_SWAP_RP32_ROUTE = "bs_ue8m0_swap_rp32"
+BS_SWAP_RP32_S11_ROUTE = "bs_ue8m0_swap_rp32_s11"
+BS_SWAP_C1_ROUTE = "bs_ue8m0_swap_c1"
 BS_SWAP_ROUTES = frozenset(
     {
         BS_SWAP_ROUTE,
@@ -397,6 +417,8 @@ BS_SWAP_ROUTES = frozenset(
         BS_SWAP_S16_ROUTE,
         BS_SWAP_CARRY_S16_ROUTE,
         BS_SWAP_RP32_ROUTE,
+        BS_SWAP_RP32_S11_ROUTE,
+        BS_SWAP_C1_ROUTE,
     }
 )
 BS_SWAP_ARCHS = frozenset({"sm_100a", "sm_103a"})
@@ -417,6 +439,182 @@ BS_SWAP_RP32_TILE_BOUND = {"sm_100a": (BS_SUB_ROWS, 1), "sm_103a": (BS_BLOCK_M, 
 BS_SWAP_RP32_ARCHS = frozenset(BS_SWAP_RP32_TILE_BOUND)
 BS_SWAP_RP32_MAX_ALIGNMENT = 64
 BS_SWAP_RP32_MAX_ROWS = 1536
+# On these architectures the 32-row-block program also serves the single-run
+# layouts (an alignment that is a multiple of 128) of more than
+# BS_SWAP_RP32_DENSE_MIN_ROWS rows per group, ahead of the other routes, while
+# its launch is one pass of two-CTA clusters, ``2 * ceil(m / 32) * n / 256``
+# CTAs of at most ``sm_count``: each cluster then streams one 32 x 256 tile's
+# weights, where the 128-row programs would leave most SMs idle.
+BS_SWAP_RP32_DENSE_ARCHS = frozenset({"sm_100a"})
+BS_SWAP_RP32_DENSE_MIN_ROWS = 128
+# The small-block swap-AB programs (32-row M blocks on a compact A slot, so
+# more stages fit in shared memory) serve these architectures, ahead of the
+# other swap-AB routes, while their launch is one wave on the device:
+# BS_SWAP_RP32_S11_ROUTE (two-CTA clusters, 11 stages) for any alignment at
+# K of at least BS_SWAP_RP32_S11_MIN_K, ``2 * ceil(m / 32) * n / 256``
+# CTAs of at most ``sm_count``; BS_SWAP_C1_ROUTE (one CTA per 32-row block
+# and 128-row weight tile, no cluster) for the 32-row alignment at
+# BS_SWAP_C1_MIN_K <= K <= BS_SWAP_C1_MAX_K and N of at most
+# BS_SWAP_C1_MAX_N, ``ceil(m / 32) * n / 128`` CTAs of at most ``sm_count``.
+# The other swap-AB programs need N a multiple of 256; BS_SWAP_C1_ROUTE's
+# 128-row weight tile also serves N an odd multiple of 128 for the multi-run
+# layouts (an alignment of 32, 64 or 96 rows modulo 128) at
+# BS_SWAP_C1_N128_MIN_K <= K <= BS_SWAP_C1_N128_MAX_K, with the same one-wave
+# bound.  Without ``sm_count`` none of these is taken.
+BS_SWAP_SMALL_ARCHS = frozenset({"sm_103a"})
+BS_SWAP_RP32_S11_MIN_K = 2048
+BS_SWAP_C1_ALIGNMENT = 32
+BS_SWAP_C1_MIN_K = 256
+BS_SWAP_C1_MAX_K = 512
+BS_SWAP_C1_MAX_N = 512
+BS_SWAP_C1_N128_MIN_K = 128
+BS_SWAP_C1_N128_MAX_K = 512
+# On these architectures the small-block programs also take launches of more
+# than one wave, ahead of the other swap-AB routes: at most
+# BS_SWAP_SM100_SMALL_TILES_PER_SM one-CTA tiles (32 x 128, ``ceil(m / 32) *
+# n / 128`` of them) per SM and K of at most BS_SWAP_SM100_SMALL_MAX_K.  They
+# serve the multi-run layouts within the 32-row-block program's bounds (an
+# alignment of at most BS_SWAP_RP32_MAX_ALIGNMENT, ``m`` of at most
+# BS_SWAP_RP32_MAX_ROWS) at N a multiple of 256, and any layout at N an odd
+# multiple of 128 with BS_SWAP_C1_N128_MIN_K <= K <= BS_SWAP_C1_N128_MAX_K.
+# BS_SWAP_RP32_S11_ROUTE takes N a multiple of 256 at K of at least
+# BS_SWAP_RP32_S11_MIN_K while its launch is one wave or the layout has at
+# most BS_SWAP_SM100_S11_MAX_BLOCKS 32-row blocks; BS_SWAP_C1_ROUTE takes the
+# others.  Without ``sm_count`` none of these is taken.
+BS_SWAP_SM100_SMALL_ARCHS = frozenset({"sm_100a"})
+BS_SWAP_SM100_SMALL_MAX_K = 4096
+BS_SWAP_SM100_SMALL_TILES_PER_SM = 3
+BS_SWAP_SM100_S11_MAX_BLOCKS = 20
+# These compact layouts, ``(m, n, k, alignment)``, keep the other swap-AB
+# routes on BS_SWAP_SM100_SMALL_ARCHS: on a 148-SM B200 the small-block
+# programs were less than 3 % faster than those routes on them, or slower.
+BS_SWAP_SM100_SMALL_KEEP = frozenset(
+    {
+        (256, 4096, 1024, 32),
+        (384, 1024, 128, 32),
+        (384, 2048, 1024, 32),
+        (384, 2560, 2048, 32),
+        (384, 3072, 1024, 32),
+        (512, 2048, 1024, 32),
+        (512, 2048, 2048, 32),
+        (512, 2048, 2048, 64),
+        (512, 2560, 2048, 32),
+        (512, 3072, 1024, 32),
+        (640, 1024, 512, 32),
+        (640, 1024, 768, 32),
+        (640, 1024, 1024, 32),
+        (768, 1536, 1024, 32),
+        (896, 1024, 512, 64),
+        (896, 1280, 1024, 64),
+        (1152, 512, 256, 32),
+        (1152, 1024, 512, 32),
+        (1152, 1024, 1024, 32),
+        (1280, 512, 4096, 32),
+    }
+)
+
+
+def _bs_swap_small_route_sm100(
+    m: int, n: int, k: int, *, alignment: int, sm_count: int
+) -> str | None:
+    """The small-block route of ``BS_SWAP_SM100_SMALL_ARCHS`` (see :func:`bs_swap_small_route`)."""
+    if (m, n, k, alignment) in BS_SWAP_SM100_SMALL_KEEP:
+        return None
+    blocks = math.ceil(m / BS_SUB_ROWS)
+    if (
+        k > BS_SWAP_SM100_SMALL_MAX_K
+        or blocks * (n // 128) > BS_SWAP_SM100_SMALL_TILES_PER_SM * sm_count
+    ):
+        return None
+    if n % 256:
+        if BS_SWAP_C1_N128_MIN_K <= k <= BS_SWAP_C1_N128_MAX_K:
+            return BS_SWAP_C1_ROUTE
+        return None
+    if (
+        alignment % BS_BLOCK_M == 0
+        or alignment > BS_SWAP_RP32_MAX_ALIGNMENT
+        or m > BS_SWAP_RP32_MAX_ROWS
+    ):
+        return None
+    if k >= BS_SWAP_RP32_S11_MIN_K and (
+        2 * blocks * (n // 256) <= sm_count or blocks <= BS_SWAP_SM100_S11_MAX_BLOCKS
+    ):
+        return BS_SWAP_RP32_S11_ROUTE
+    return BS_SWAP_C1_ROUTE
+
+
+def bs_swap_small_route(
+    m: int, n: int, k: int, *, alignment: int, arch: str, sm_count: int | None
+) -> str | None:
+    """Select a small-block swap-AB route, or ``None`` for the other swap-AB routes.
+
+    Only with a known ``sm_count``, N a multiple of 128, K a multiple of 128
+    and an alignment that is a multiple of 32.  On ``BS_SWAP_SMALL_ARCHS``
+    only while the launch is one wave:
+
+    - ``BS_SWAP_RP32_S11_ROUTE`` for N a multiple of 256 and
+      K >= ``BS_SWAP_RP32_S11_MIN_K`` when
+      ``2 * ceil(m / 32) * n / 256 <= sm_count`` (two CTAs per 32 x 256 tile);
+    - ``BS_SWAP_C1_ROUTE`` when ``ceil(m / 32) * n / 128 <= sm_count`` (one
+      CTA per 32 x 128 tile): for N a multiple of 256, an alignment of
+      ``BS_SWAP_C1_ALIGNMENT`` rows, ``BS_SWAP_C1_MIN_K <= k <=
+      BS_SWAP_C1_MAX_K`` and ``n <= BS_SWAP_C1_MAX_N``; for N an odd
+      multiple of 128, an alignment that is not a multiple of 128 (the
+      multi-run layouts) and ``BS_SWAP_C1_N128_MIN_K <= k <=
+      BS_SWAP_C1_N128_MAX_K``.
+
+    On ``BS_SWAP_SM100_SMALL_ARCHS`` (same preconditions) a launch may take
+    up to ``BS_SWAP_SM100_SMALL_TILES_PER_SM`` one-CTA tiles per SM, at K of
+    at most ``BS_SWAP_SM100_SMALL_MAX_K``:
+
+    - for N a multiple of 256, the multi-run layouts with an alignment of at
+      most ``BS_SWAP_RP32_MAX_ALIGNMENT`` and ``m`` of at most
+      ``BS_SWAP_RP32_MAX_ROWS``: ``BS_SWAP_RP32_S11_ROUTE`` at
+      K >= ``BS_SWAP_RP32_S11_MIN_K`` when ``2 * ceil(m / 32) * n / 256 <=
+      sm_count`` or ``ceil(m / 32) <= BS_SWAP_SM100_S11_MAX_BLOCKS``,
+      ``BS_SWAP_C1_ROUTE`` otherwise;
+    - for N an odd multiple of 128, any alignment at
+      ``BS_SWAP_C1_N128_MIN_K <= k <= BS_SWAP_C1_N128_MAX_K``:
+      ``BS_SWAP_C1_ROUTE``.
+
+    On ``BS_SWAP_SM100_SMALL_ARCHS`` the layouts of ``BS_SWAP_SM100_SMALL_KEEP``
+    keep the other swap-AB routes.
+
+    Every 32-row block of a layout whose alignment is a multiple of 32 holds
+    one group's rows, so both programs serve the single-run and the multi-run
+    layouts.
+    """
+    if (
+        (arch not in BS_SWAP_SMALL_ARCHS and arch not in BS_SWAP_SM100_SMALL_ARCHS)
+        or sm_count is None
+        or n % 128
+        or k % BS_BLOCK_K
+        or alignment % BS_SUB_ROWS
+    ):
+        return None
+    if arch in BS_SWAP_SM100_SMALL_ARCHS:
+        return _bs_swap_small_route_sm100(
+            m, n, k, alignment=alignment, sm_count=sm_count
+        )
+    blocks = math.ceil(m / BS_SUB_ROWS)
+    if n % 256:
+        if (
+            alignment % BS_BLOCK_M
+            and BS_SWAP_C1_N128_MIN_K <= k <= BS_SWAP_C1_N128_MAX_K
+            and blocks * (n // 128) <= sm_count
+        ):
+            return BS_SWAP_C1_ROUTE
+        return None
+    if k >= BS_SWAP_RP32_S11_MIN_K and 2 * blocks * (n // 256) <= sm_count:
+        return BS_SWAP_RP32_S11_ROUTE
+    if (
+        alignment == BS_SWAP_C1_ALIGNMENT
+        and BS_SWAP_C1_MIN_K <= k <= BS_SWAP_C1_MAX_K
+        and n <= BS_SWAP_C1_MAX_N
+        and blocks * (n // 128) <= sm_count
+    ):
+        return BS_SWAP_C1_ROUTE
+    return None
 
 
 def bs_swap_route_for_shape(
@@ -435,8 +633,12 @@ def bs_swap_route_for_shape(
     per group, ``(m - num_groups * (alignment - 1)) / num_groups``: the compact
     layout less each group's largest alignment padding.
 
-    - Keep the non-swapped routes when N is not a multiple of 256 (the swapped
-      tile height) or the group count is unknown.
+    - Take the route of :func:`bs_swap_small_route` when it selects one
+      (``BS_SWAP_SMALL_ARCHS`` one wave of CTAs, ``BS_SWAP_SM100_SMALL_ARCHS``
+      up to ``BS_SWAP_SM100_SMALL_TILES_PER_SM`` tiles per SM; any group
+      count; its one-CTA program also takes N an odd multiple of 128).
+    - Otherwise keep the non-swapped routes when N is not a multiple of 256
+      (the swapped tile height) or the group count is unknown.
     - Swap every layout whose alignment is not a multiple of 128 (the 32-row
       multi-run layouts) through ``BS_SWAP_RUN32_ROUTE``; on
       ``BS_SWAP_RP32_ARCHS``, an alignment of at most
@@ -445,6 +647,10 @@ def bs_swap_route_for_shape(
       tiles meet the architecture's ``BS_SWAP_RP32_TILE_BOUND``
       (``factor * ceil(m / rows) * n / 256 <= sm_count``); with ``sm_count``
       ``None`` it keeps ``BS_SWAP_RUN32_ROUTE``.
+    - On ``BS_SWAP_RP32_DENSE_ARCHS`` a single-run layout of more than
+      ``BS_SWAP_RP32_DENSE_MIN_ROWS`` rows takes ``BS_SWAP_RP32_ROUTE`` when
+      ``2 * ceil(m / 32) * n / 256 <= sm_count`` (one pass of two-CTA
+      clusters); with ``sm_count`` ``None`` the rules below apply.
     - For K <= 512, swap at 2 <= rows <= 20, and at 1 <= rows < 2 when K <= 256.
     - For longer K, keep below 0.75 rows and swap below 100 rows.  From 100
       rows, sm_100a swaps for N >= 1024, or for K >= 2048 when the BLOCK_N
@@ -460,7 +666,14 @@ def bs_swap_route_for_shape(
     The choice never changes the output bits: every route accumulates each
     output in the same K order.
     """
-    if arch not in BS_SWAP_ARCHS or n % 256 or k % BS_BLOCK_K:
+    if arch not in BS_SWAP_ARCHS or n % 128 or k % BS_BLOCK_K:
+        return None
+    small = bs_swap_small_route(
+        m, n, k, alignment=alignment, arch=arch, sm_count=sm_count
+    )
+    if small is not None:
+        return small
+    if n % 256:
         return None
     single_run = alignment % BS_BLOCK_M == 0
     if not single_run:
@@ -478,6 +691,13 @@ def bs_swap_route_for_shape(
         return None
     # rows = routed / num_groups; compared without division.
     routed = m - num_groups * (alignment - 1)
+    if (
+        arch in BS_SWAP_RP32_DENSE_ARCHS
+        and sm_count is not None
+        and routed > BS_SWAP_RP32_DENSE_MIN_ROWS * num_groups
+        and 2 * math.ceil(m / BS_SUB_ROWS) * (n // 256) <= sm_count
+    ):
+        return BS_SWAP_RP32_ROUTE
     if k <= 512:
         swap = 2 * num_groups <= routed <= 20 * num_groups or (
             k <= 256 and num_groups <= routed < 2 * num_groups
@@ -575,7 +795,9 @@ def launch_plan(
     :func:`bs_route_for_shape`.  An FP32-scale problem takes :func:`_route`
     with the SM count.  A KG1 / AB6 launch of at most ``DIRECT_STORE_MAX_ROWS``
     rows on at most ``DIRECT_STORE_MAX_CTAS`` CTAs runs that route's
-    direct-store program.
+    direct-store program; a KG1 launch of more rows whose 128 x 64 tiles fit
+    in one wave runs the KG1 program with 128 x 64 tiles, and so does an AB6
+    launch of more rows that is a single 128 x 128 tile at K = 512.
     """
     return _launch_plan(
         m,
@@ -647,6 +869,22 @@ def _launch_plan(
     route = resolve_route_for_grid(route, n, grid)
     if m <= DIRECT_STORE_MAX_ROWS and grid[0] <= DIRECT_STORE_MAX_CTAS:
         route = _DIRECT_STORE_ROUTE.get(route, route)
+    elif route == DEEPK_C2_KG1_ROUTE and m > DIRECT_STORE_MAX_ROWS:
+        n64_tiles = math.ceil(m / 128) * math.ceil(n / 64)
+        if n64_tiles <= sm_count:
+            route, grid = DEEPK_C2_KG1_N64_ROUTE, (n64_tiles, 1, 1)
+    elif (
+        route == DEEPK_C2_AB6_SCALE1_ROUTE
+        and m > DIRECT_STORE_MAX_ROWS
+        and math.ceil(m / 128) * math.ceil(n / 128) == 1
+        and k == 512
+    ):
+        # Both programs compute each output element with the same MMA chain, so
+        # the bytes are the same; two 128 x 64 tiles finish sooner than one tile.
+        route, grid = (
+            DEEPK_C2_KG1_N64_ROUTE,
+            (math.ceil(m / 128) * math.ceil(n / 64), 1, 1),
+        )
     return route, grid
 
 
@@ -711,19 +949,22 @@ def _validate_indices(
     layout_tile_m: Optional[int] = None,
     layout_tile_rows: int = 128,
     read_alignment: bool = False,
-) -> tuple[Optional[tuple[int, int, int, int]], Optional[bool]]:
+) -> tuple[Optional[tuple[int, int, int, int, int]], Optional[bool]]:
     """Check the routing contract (in range, sorted) with one device-to-host transfer.
 
     With ``allow_padding`` the value ``-1`` marks padding rows; the remaining
     entries must still be nondecreasing.  Returns ``(layout, aligned)``, both
     ``None`` unless asked for; the caller uses them only to choose a route.
     With ``layout_tile_m`` (no padding) the same transfer also reads
-    ``layout = (inner_starts, run_starts, expert_tiles, max_offset)``: the
+    ``layout = (inner_starts, run_starts, expert_tiles, max_offset,
+    window_runs)``: the
     number of expert runs starting at a row that is not a multiple of
     ``layout_tile_m`` (so a ``layout_tile_m``-row tile spans two experts), the
     number of expert runs starting after row 0, the number of
     ``layout_tile_rows``-row tiles when no tile spans two experts, and the
-    largest offset of such an inner start within its tile (0 without one).
+    largest offset of such an inner start within its tile (0 without one),
+    and the largest number of expert runs in one ``layout_tile_rows``-row
+    window (at least 1).
     With ``read_alignment`` (no padding) it also reads ``aligned``: whether
     every expert run starts on a multiple of 256 rows (see :func:`_route`).
     """
@@ -757,8 +998,18 @@ def _validate_indices(
             stats.append(run_starts.sum())
             stats.append(((rows - run_first) % layout_tile_rows == 0).sum() + 1)
             stats.append(torch.where(inner, offset, torch.zeros_like(offset)).max())
+            window_starts = run_starts & (rows % layout_tile_rows != 0)
+            per_window = torch.zeros(
+                math.ceil(indices.numel() / layout_tile_rows),
+                dtype=torch.int64,
+                device=indices.device,
+            )
+            per_window.index_add_(
+                0, rows // layout_tile_rows, window_starts.to(torch.int64)
+            )
+            stats.append(per_window.max() + 1)
         else:
-            stats += [zero, zero, zero + 1, zero]
+            stats += [zero, zero, zero + 1, zero, zero + 1]
     values = torch.stack(stats).tolist()
     lowest, highest, unsorted = values[:3]
     if lowest < (-1 if allow_padding else 0) or highest >= groups:
@@ -773,10 +1024,12 @@ def _validate_indices(
     aligned: Optional[bool] = None
     if read_alignment:
         aligned, extra = extra[0] == 0, extra[1:]
-    layout: Optional[tuple[int, int, int, int]] = None
+    layout: Optional[tuple[int, int, int, int, int]] = None
     if layout_tile_m is not None:
-        inner, starts, expert_tiles, max_offset = (int(v) for v in extra[:4])
-        layout = inner, starts, expert_tiles, max_offset
+        inner, starts, expert_tiles, max_offset, window_runs = (
+            int(v) for v in extra[:5]
+        )
+        layout = inner, starts, expert_tiles, max_offset, window_runs
     return layout, aligned
 
 
@@ -870,6 +1123,44 @@ def _expert_aligned_plan(
     _, tile_n, _ = route_geometry(DEEPK_C2_KG1_EXPERT_ALIGNED_ROUTE)
     ctas = max(1, min(expert_tiles * math.ceil(n / tile_n), sm_count))
     return DEEPK_C2_KG1_EXPERT_ALIGNED_ROUTE, (ctas, 1, 1)
+
+
+def _window_segment_launch_ok(m: int, n: int, grid: tuple[int, int, int]) -> bool:
+    """Whether a window-segment launch of ``m`` x ``n`` rows and columns at
+    ``grid`` keeps the program's launch contract (see ``WSEG_MAX_M``); outside
+    it the host keeps the expert-aligned program."""
+    return (
+        1 <= m <= WSEG_MAX_M
+        and WSEG_MIN_N <= n <= WSEG_MAX_N
+        and grid[0] >= 1
+        and grid[1] == 1
+        and grid[2] == 1
+    )
+
+
+def _window_segment_plan(
+    arch: str, m: int, n: int, window_runs: int, *, sm_count: int
+) -> Optional[tuple[str, tuple[int, int, int]]]:
+    """``(route, grid)`` of the window-segment program for a layout whose
+    128-row windows hold at most ``window_runs`` expert runs, or ``None``
+    when its CTAs do not fit in one wave, the launch is outside the program's
+    contract (:func:`_window_segment_launch_ok`) or ``arch`` has no such
+    program.
+
+    The program gives each window ``window_runs`` CTAs per 128 x 64 column
+    tile, CTA ``j`` computing runs ``j, j + window_runs, ...`` of its window,
+    so here each CTA computes at most one run.  It reads the runs from
+    ``m_indices`` on the device at every launch: a later ``m_indices`` with
+    more runs per window stays correct, its CTAs computing several runs.
+    """
+    if not _route_registered(arch, DEEPK_C2_KG1_WSEG_ROUTE):
+        return None
+    tile_m, tile_n, _ = route_geometry(DEEPK_C2_KG1_WSEG_ROUTE)
+    ctas = math.ceil(m / tile_m) * window_runs * math.ceil(n / tile_n)
+    grid = (ctas, 1, 1)
+    if ctas > sm_count or not _window_segment_launch_ok(m, n, grid):
+        return None
+    return DEEPK_C2_KG1_WSEG_ROUTE, grid
 
 
 def _packed_scale_strides(
@@ -1292,10 +1583,16 @@ def prepare_group_gemm_fp8_nt_groupwise_contiguous(
         and at most 255 experts, when at least 90% of the runs start inside a
         tile of the shape's route and one starts at least half a tile in, the
         launch uses the expert-aligned program, whose tiles never span two
-        experts.  These choices affect speed only.  Every program computes the
-        same bits for any valid ``m_indices``, so indices that change after
-        preparation (rebound at ``launch`` or rewritten before a graph replay)
-        stay correct; only the chosen program may be slower for them.
+        experts.  Such a launch uses the window-segment program instead when
+        its CTAs (the 128-row windows x the most expert runs in one window x
+        the 64-column tiles) fit in one wave and the shape keeps its launch
+        contract (``1 <= M <= 2**24``, ``64 <= N <= 2**19``): each CTA
+        computes one expert run of a 128-row window, so one window may hold
+        several experts.  These choices affect speed only.  Every program
+        computes the same bits for any valid ``m_indices``, so indices that
+        change after preparation (rebound at ``launch`` or rewritten before a
+        graph replay) stay correct; only the chosen program may be slower for
+        them.
     fill_padding : bool
         Accept ``-1`` padding rows in ``m_indices`` (promotion family).  The
         prepared object owns an ``(M,)`` int32 plus ``(M,)`` int64 scratch and
@@ -1305,7 +1602,8 @@ def prepare_group_gemm_fp8_nt_groupwise_contiguous(
         Block-scaled family only: the row alignment of expert runs in the
         compact layout, a positive multiple of 32.  Multiples of 128 run the
         single-run schedule; other values the slower 32-row multi-run schedule.
-        The swap-AB routes need ``N`` a multiple of 256, ``M`` a multiple of
+        The swap-AB routes need ``N`` a multiple of 256 (128 for the one-CTA
+        program of :func:`bs_swap_small_route`), ``M`` a multiple of
         128, the MN-major ``a_scale`` words and the row-repeated ``b_scale``
         words; other problems run the non-swapped routes.  The store16
         programs need the same ``M`` and words, an ``alignment`` multiple of
@@ -1459,6 +1757,9 @@ def prepare_group_gemm_fp8_nt_groupwise_contiguous(
         and _expert_aligned_preferred(layout[0], layout[1], layout[3], layout_tile_m)
     ):
         route, grid = _expert_aligned_plan(n, layout[2], sm_count=sm_count)
+        window_plan = _window_segment_plan(arch, m, n, layout[4], sm_count=sm_count)
+        if window_plan is not None:
+            route, grid = window_plan
     module_name = select_module(arch, route)
     program = PROGRAMS[MODULES[module_name]["program"]]
     module = load_cake_grouped_fp8_gemm_module(module_name)

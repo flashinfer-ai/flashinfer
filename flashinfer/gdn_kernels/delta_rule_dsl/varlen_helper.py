@@ -29,6 +29,89 @@ def is_integer_dtype(dtype: torch.dtype) -> bool:
     return dtype in _INTEGER_DTYPES
 
 
+def check_slot_args(
+    num_seqs: int,
+    num_sab_heads: int,
+    D: int,
+    device: torch.device,
+    use_state_indices: bool,
+    needs_checkpointing: bool,
+    beta: torch.Tensor | None,
+    state_checkpoints: torch.Tensor | None,
+    output_state_indices: torch.Tensor | None,
+    checkpoint_state_indices: torch.Tensor | None,
+    prefix_lens: torch.Tensor | None,
+) -> None:
+    """Validate the slot-addressing arguments of the non-CP prefill kernels."""
+    for name, tensor, shape in (
+        ("output_state_indices", output_state_indices, (num_seqs,)),
+        ("checkpoint_state_indices", checkpoint_state_indices, None),
+        ("prefix_lens", prefix_lens, (num_seqs,)),
+    ):
+        if tensor is None:
+            continue
+        if not is_integer_dtype(tensor.dtype):
+            raise RuntimeError(f"{name} must have an integer dtype, got {tensor.dtype}")
+        if tensor.ndim != 1 or (shape is not None and tuple(tensor.shape) != shape):
+            raise RuntimeError(
+                f"{name} must be 1D{'' if shape is None else f' of shape {shape}'}, "
+                f"got {tuple(tensor.shape)}"
+            )
+        if tensor.device != device:
+            raise RuntimeError(f"{name} must be on {device}, got {tensor.device}")
+        if not tensor.is_contiguous():
+            raise RuntimeError(f"{name} must be contiguous")
+    if output_state_indices is not None and not use_state_indices:
+        raise RuntimeError("output_state_indices requires state_indices")
+    if (
+        checkpoint_state_indices is not None or prefix_lens is not None
+    ) and not needs_checkpointing:
+        raise RuntimeError(
+            "checkpoint_state_indices and prefix_lens require "
+            "checkpoint_every_n_tokens > 0"
+        )
+    if prefix_lens is not None and beta is None:
+        # Padding rows before an unaligned prefix are identity rows built from
+        # a zero beta; pass ones for an ungated beta.
+        raise RuntimeError("prefix_lens requires beta")
+    if checkpoint_state_indices is not None and (
+        state_checkpoints.ndim != 4
+        or tuple(state_checkpoints.shape[1:]) != (num_sab_heads, D, D)
+        or state_checkpoints.stride()[1:] != (D * D, D, 1)
+        or state_checkpoints.stride(0) < num_sab_heads * D * D
+    ):
+        raise RuntimeError(
+            "state_checkpoints must be a pool [C, H, D, D] of dense [H, D, D] "
+            f"rows with checkpoint_state_indices, got shape "
+            f"{tuple(state_checkpoints.shape)} stride {state_checkpoints.stride()}"
+        )
+
+
+def checkpoint_row_align(state_checkpoints: torch.Tensor) -> int:
+    """Alignment, in elements, of every row of a checkpoint pool: the largest
+    power of two up to 16 bytes that divides both the base address and the
+    row stride. Part of the compile key, so the row stores can be vectorized
+    for any pool without assuming more than the pool guarantees."""
+    size = state_checkpoints.element_size()
+    return math.gcd(
+        16 // size, state_checkpoints.stride(0), state_checkpoints.data_ptr() // size
+    )
+
+
+def check_checkpoint_key_range(
+    num_entries: int, every_n_tokens: int, num_tokens: int
+) -> None:
+    """The slot checkpoint paths find a checkpoint's entry through the 32-bit
+    key ``(first entry - 1) * N + offset`` plus the block end (see
+    ``checkpoint_entry_key`` in the kernels); keep it in range."""
+    if (num_entries + 2) * every_n_tokens + num_tokens >= 2**31:
+        raise RuntimeError(
+            "checkpoint indexing exceeds 32 bits: "
+            f"({num_entries} entries + 2) * checkpoint_every_n_tokens "
+            f"{every_n_tokens} + {num_tokens} tokens >= 2**31"
+        )
+
+
 def integer_dtype_to_cutlass(dtype: torch.dtype) -> type[cutlass.Numeric]:
     try:
         return {

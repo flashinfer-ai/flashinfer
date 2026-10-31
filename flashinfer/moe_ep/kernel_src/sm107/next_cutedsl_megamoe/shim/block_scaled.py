@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import dataclasses
 import math
-from typing import Any, Literal, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Literal, Optional, Tuple
 
 import torch
 
@@ -37,6 +37,9 @@ from . import comm
 from .dependencies import require_sm107_dsl
 from .kernel_helpers import Mxfp8BlockSize, Nvfp4BlockSize, swizzled_flat_sf_size
 from .tuning_state import AutoTuningState
+
+if TYPE_CHECKING:
+    from flashinfer.moe_ep.tensors import MoEEpTensors
 
 Sm107QuantKind = Literal["nvfp4", "mxfp8_e4m3", "mxfp8_e5m2", "mxfp4_mxfp8"]
 Sm107TokenBackMode = Literal["epi_warps", "standalone_warps", "reuse_dispatch_warps"]
@@ -470,6 +473,7 @@ class Sm107BlockScaledSymmBuffer:
     """
 
     def __init__(self, config: Sm107BlockScaledMoeConfig) -> None:
+        """Allocate session buffers, including independent NVFP4 default scalars."""
         comm.ensure_not_capturing("SM107 mega workspace allocation")
         _require_sm107()
         _configure_dsl_arch()
@@ -500,8 +504,9 @@ class Sm107BlockScaledSymmBuffer:
             (tokens, cfg.num_topk), -1, dtype=torch.int32, device="cuda"
         )
         # Stable local-expert pointers allow per-call scaling updates in graphs.
-        # Per-call tensors are bound as launch arguments (bind_scalars); other
-        # values and defaults are copied in by the backend staging call.
+        # Mutable tensors serve explicit low-level calls and layout fallbacks.
+        # Backend defaults bind a separate read-only ones tensor, which cannot
+        # be overwritten by another layer or graph using these mutable tensors.
         for name in _SCALAR_NAMES:
             setattr(
                 self,
@@ -512,6 +517,11 @@ class Sm107BlockScaledSymmBuffer:
                 if cfg.quant_kind == "nvfp4"
                 else None,
             )
+        self._default_scalar = (
+            torch.ones(cfg.experts_per_rank, dtype=torch.float32, device=self.device)
+            if cfg.quant_kind == "nvfp4"
+            else None
+        )
         if self.topk_idx.data_ptr() % 16 != 0:
             raise RuntimeError("routing index tensor must be 16-byte aligned.")
 
@@ -519,11 +529,17 @@ class Sm107BlockScaledSymmBuffer:
         self._staged_tokens: Optional[int] = None
         self._destroyed = False
         self._tuning_state = AutoTuningState()
+        self._tuning_inputs: tuple[MoEEpTensors, bool] | None = None
         self._routing_checks: dict[tuple, Any] = {}
         # Missing scalar bindings use the workspace's own tensors.
         self._bound_scalars: dict = {}
 
     def _allocate_execution_state(self) -> None:
+        """Allocate reduction buffers and scratch, then reset cached bindings.
+
+        Peer-written buffers use symmetric allocations; separate-reduce output
+        stays local and may be replaced by a caller output at launch time.
+        """
         cfg, kernel = self.config, self.kernel
         tokens = cfg.padded_tokens_per_rank
         # In-kernel reduce: the combine peer-writes (red.add) each topk term
@@ -586,6 +602,7 @@ class Sm107BlockScaledSymmBuffer:
         self._launch_weights: Optional[
             Tuple[TransformedBlockScaledWeights, TransformedBlockScaledWeights]
         ] = None
+        self._launch_output: Optional[torch.Tensor] = None
 
     @staticmethod
     def _build_kernel(cfg: Sm107BlockScaledMoeConfig):
@@ -732,8 +749,21 @@ class Sm107BlockScaledSymmBuffer:
         self,
         transformed_l1: TransformedBlockScaledWeights,
         transformed_l2: TransformedBlockScaledWeights,
+        output: Optional[torch.Tensor] = None,
     ) -> dict:
+        """Bind weights, workspaces, scalars, and output on the current stream.
+
+        Output defaults to the workspace buffer. Its dynamic row extent lets
+        one compiled kernel serve caller outputs with different live lengths.
+        """
         stream = torch.cuda.current_stream()
+        if output is None:
+            output = self.output_activation
+        # Separate reduction can write only the live rows, directly into the
+        # caller's output. Keep the row extent dynamic so warmed kernels also
+        # accept another batch size during CUDA graph capture.
+        output_cute = _to_cute(output, dynamic_leading=False)
+        output_cute.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1))
         return {
             "activation": _to_cute(self.x),
             "activation_sf": _to_cute(self.x_sf),
@@ -743,7 +773,7 @@ class Sm107BlockScaledSymmBuffer:
             "fc1_weight_sf": _to_cute(transformed_l1[1]),
             "fc2_weight": _to_cute(transformed_l2[0]),
             "fc2_weight_sf": _to_cute(transformed_l2[1]),
-            "output_activation": _to_cute(self.output_activation),
+            "output_activation": output_cute,
             "local_workspace": _to_cute_ptr(self.local_workspace),
             "shared_workspace": _to_cute_ptr(self.shared_workspace),
             "peer_rank_ptr_mapper_host": self._peer_mapper(),
@@ -759,12 +789,28 @@ class Sm107BlockScaledSymmBuffer:
         self,
         transformed_l1: TransformedBlockScaledWeights,
         transformed_l2: TransformedBlockScaledWeights,
+        *,
+        output: Optional[torch.Tensor] = None,
     ) -> None:
         """Compile and bind the selected kernel without launching it."""
         import cutlass.cute as cute
 
         if self._destroyed:
             raise RuntimeError("cannot launch a destroyed SM107 workspace.")
+        if output is not None and (
+            self.config.reduce_topk_in_kernel
+            or output.ndim != 2
+            or not (0 < output.shape[0] <= self.config.max_tokens_per_rank)
+            or output.shape[1] != self.config.hidden
+            or output.dtype != torch.bfloat16
+            or output.device != self.device
+            or not output.is_contiguous()
+            or output.data_ptr() % 16
+        ):
+            raise ValueError(
+                "Direct output requires separate reduction and an aligned, "
+                "contiguous BF16 matrix with live rows on the workspace device."
+            )
         if (
             self.device.type == "cuda"
             and self.device.index != torch.cuda.current_device()
@@ -784,6 +830,9 @@ class Sm107BlockScaledSymmBuffer:
                 for name in _SCALAR_NAMES
                 if self.config.quant_kind == "nvfp4"
             ),
+            None
+            if output is None
+            else (output.data_ptr(), output.shape, output.stride()),
             torch.cuda.current_stream().cuda_stream,
         )
         if self._compiled is None or self._launch_key != key:
@@ -791,23 +840,30 @@ class Sm107BlockScaledSymmBuffer:
                 comm.ensure_not_capturing("SM107 mega kernel compile")
             # DLPack metadata binding and stream conversion are host-only.
             # A warmed workspace may bind another layer or stream in capture.
-            kwargs = self._runtime_kwargs(transformed_l1, transformed_l2)
+            kwargs = (
+                self._runtime_kwargs(transformed_l1, transformed_l2)
+                if output is None
+                else self._runtime_kwargs(transformed_l1, transformed_l2, output)
+            )
             if self._compiled is None:
                 self._compiled = cute.compile(self.kernel, **kwargs)
             self._launch_key = key
             self._launch_kwargs = kwargs
             # Keep pointers alive until the cached bindings are replaced.
             self._launch_weights = (transformed_l1, transformed_l2)
+            self._launch_output = output
 
     def launch(
         self,
         transformed_l1: TransformedBlockScaledWeights,
         transformed_l2: TransformedBlockScaledWeights,
+        *,
+        output: Optional[torch.Tensor] = None,
     ) -> None:
         """Compile on first use, then launch the fused mega kernel."""
         if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
             self._tuning_state.graph_captured = True
-        self.prepare(transformed_l1, transformed_l2)
+        self.prepare(transformed_l1, transformed_l2, output=output)
         if self.config.reduce_topk_in_kernel:
             # red.add accumulation base: zero the output every launch.
             self.output_activation.zero_()
@@ -827,9 +883,11 @@ class Sm107BlockScaledSymmBuffer:
         self._compiled(**self._launch_kwargs)
 
     def _release_execution_state(self) -> None:
+        """Drop cached tensor references and free owned symmetric buffers."""
         self._compiled = None
         self._launch_kwargs = None
         self._launch_weights = None
+        self._launch_output = None
         self._launch_key = None
         self._pre_reduced_activation = None
         self._pre_reduced_activation_sf = None
@@ -869,6 +927,7 @@ class Sm107BlockScaledSymmBuffer:
         self.prepare(transformed_l1, transformed_l2)
 
     def destroy(self) -> None:
+        """Drain outstanding work and collectively release the session buffers."""
         if self._destroyed:
             return
         comm.ensure_not_capturing("SM107 mega workspace free")
@@ -876,6 +935,7 @@ class Sm107BlockScaledSymmBuffer:
         torch.cuda.synchronize()
         self._release_execution_state()
         self._routing_checks.clear()
+        self._tuning_inputs = None
         self._bound_scalars = {}
         for name in ("x", "x_sf", "topk_weights"):
             comm.free_sym_tensor(getattr(self, name, None))
@@ -886,6 +946,7 @@ class Sm107BlockScaledSymmBuffer:
             forget_staged_tokens(self.topk_idx)
         self.topk_idx = None
         self.fc1_alpha = self.fc2_alpha = self.fc1_norm_const = None
+        self._default_scalar = None
         self._destroyed = True
 
 
@@ -1074,6 +1135,20 @@ def sm107_block_scaled_mega_moe(
     _validate_weight_leg(
         "fc2", transformed_l2, fc2_shape, fc2_sf, cfg, symm_buffer.device
     )
+
+    if (
+        y is not None
+        and num_tokens > 0
+        and not cfg.reduce_topk_in_kernel
+        and y.is_contiguous()
+        and y.data_ptr() % 16 == 0
+    ):
+        # TopkReduce runs locally and needs no symmetric output allocation.
+        # REDG still uses the workspace's registered symmetric destination.
+        symm_buffer.launch(transformed_l1, transformed_l2, output=y[:num_tokens])
+        if sync:
+            torch.cuda.synchronize()
+        return None
 
     symm_buffer.launch(transformed_l1, transformed_l2)
     out = symm_buffer.output_activation[:num_tokens]

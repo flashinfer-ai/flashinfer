@@ -68,8 +68,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import flashinfer  # noqa: E402
 from flashinfer import chunked_lm_head as public_lm_head  # noqa: E402
 from flashinfer.api_logging import ExperimentalWarning  # noqa: E402
-from flashinfer.chunked_lm_head import chunked_lm_head_logprob, chunked_lm_head_loss  # noqa: E402
-from flashinfer.experimental.cake_lm_head_loss import cake_backend  # noqa: E402
+from flashinfer.chunked_lm_head import (
+    chunked_lm_head_det_logprob,
+    chunked_lm_head_det_loss,
+)  # noqa: E402
+from flashinfer.experimental.cake_lm_head_det_loss import cake_backend  # noqa: E402
 from flashinfer.testing import bench_gpu_time  # noqa: E402
 from tests.test_helpers.cake_lm_head_loss_reference import (  # noqa: E402
     DEFAULT_H,
@@ -498,11 +501,11 @@ class ArmCake(ArmAutograd):
     def forward(self):
         inp = self.inp
         if self.entry == "logprob":
-            logp = chunked_lm_head_logprob(
+            logp = chunked_lm_head_det_logprob(
                 self.X, self.W, inp.labels, chunk_size=self.chunk, backend="cake"
             )
             return dict(loss=_downstream_loss(logp, inp), logp=logp)
-        loss, logp = chunked_lm_head_loss(
+        loss, logp = chunked_lm_head_det_loss(
             self.X,
             self.W,
             inp.labels,

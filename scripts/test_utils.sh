@@ -851,8 +851,8 @@ record_no_result_test() {
     local test_file=$1
     NO_RESULT_TESTS="$NO_RESULT_TESTS\n  - $test_file"
     NO_RESULT_COUNT=$((NO_RESULT_COUNT + 1))
-    # Deliberately do not set EXIT_CODE. Missing result artifacts are reported
-    # for triage, but they should not fail the whole CI job.
+    # A crash or timeout must fail the job even when pytest cannot write JUnit.
+    EXIT_CODE=1
 }
 
 # Describe which execution artifacts are missing for a test file

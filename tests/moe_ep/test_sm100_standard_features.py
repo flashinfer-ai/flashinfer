@@ -33,9 +33,14 @@ from flashinfer.moe_ep.kernel_src.sm100 import next_cutedsl_megamoe as pkg
         ("nvfp4", "situ", "PERSISTENT", True, "nvfp4", False),
         ("nvfp4", "minimax", "DEFAULT", True, "bf16", True),
         ("mxfp8_e4m3", "situ_unbounded", "DEFAULT", True, "bf16", True),
+        ("mxfp4_mxfp8", "minimax", "PERSISTENT", False, "bf16", False),
+        ("mxfp4_mxfp8", "situ_unbounded", "NONE", True, "bf16", False),
+        ("mxfp4_mxfp8", "minimax", "DEFAULT", True, "bf16", True),
     ],
 )
-def test_standard_features(kind, activation, mode, early, wire, in_kernel, monkeypatch):
+def test_standard_features(
+    kind, activation, mode, early, wire, in_kernel, monkeypatch, *, autotune=False
+):
     if not torch.cuda.is_available():
         pytest.skip("requires Blackwell")
     rank, world = (
@@ -48,6 +53,8 @@ def test_standard_features(kind, activation, mode, early, wire, in_kernel, monke
     if world == 1:
         monkeypatch.setenv("MEGA_NO_DIST", "1")
     capacity, hidden, intermediate, topk, experts = 129, 384, 192, 3, 8 * world
+    if kind == "mxfp4_mxfp8":
+        intermediate = 256
     rng = torch.Generator(device="cuda").manual_seed(731 + rank)
     x = torch.randn(capacity, hidden, generator=rng, device="cuda").bfloat16()
     weights = moe_ep.MoEWeightPack(
@@ -77,6 +84,8 @@ def test_standard_features(kind, activation, mode, early, wire, in_kernel, monke
         enable_in_kernel_fc2_reduce=in_kernel,
         knobs={"in_kernel_fc2_reduce": True} if in_kernel else None,
     )
+    if autotune:
+        options["knobs"] = "auto"
     if activation.startswith("minimax"):
         options.update(swiglu_alpha=1.702, swiglu_beta=1.0, gate_up_clamp=7.0)
     else:
@@ -92,6 +101,8 @@ def test_standard_features(kind, activation, mode, early, wire, in_kernel, monke
             enable_fc1_activation_per_token_scale=activation.endswith("scale"),
             **options,
         )
+    elif kind == "mxfp4_mxfp8":
+        config = moe_ep.Sm100_Mxfp8_Mxfp4_Bf16_Cutedsl_MegaMoeConfig(**options)
     else:
         config = moe_ep.Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig(
             kernel_name="sm100_mxfp8_mxfp8_bf16_cutedsl_next",
@@ -150,6 +161,8 @@ def test_standard_features(kind, activation, mode, early, wire, in_kernel, monke
     graph = None
     try:
         layer.warmup(current)
+        if autotune:
+            assert layer.get_tuned_knobs()
         ws = layer._ensure_workspace()
         if mode != "NONE":
             owned = layer.forward(current)

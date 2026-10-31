@@ -206,7 +206,10 @@ _GRID_AXES = {"grid_x": 0, "grid_y": 1, "grid_z": 2}
 
 
 class MSASparseAttentionWorkspace:
-    """Caller-owned storage for SM100/SM103 MSA CUDA graph capture.
+    """Caller-owned storage for MSA CUDA graph capture on SM100/SM103.
+
+    On SM107, this workspace is supported only by the packed-NVFP4 paged-KV
+    prefill and decode routes.
 
     Construct one workspace per captured sparse-attention invocation. Warm it
     by calling the operation eagerly with the exact tensors, options, and CUDA

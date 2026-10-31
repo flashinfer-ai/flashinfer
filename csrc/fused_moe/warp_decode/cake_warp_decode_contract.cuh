@@ -522,7 +522,7 @@ constexpr Schedule SelectSm100aSchedule(const Shape& shape) {
   if (IsGeometry(shape, 4096, 2048, 256, 6)) {
     // Fixed top-k6 finalizers do not use the generic unroll/workfeed fields.
     if (shape.num_tokens <= 8) {
-      const bool ordered = shape.num_tokens >= 7;
+      const bool ordered = shape.num_tokens >= 8;
       return {true,
               Geometry::kH4096I2048E256K6,
               RouteLayout::kDirect,
@@ -533,7 +533,8 @@ constexpr Schedule SelectSm100aSchedule(const Shape& shape) {
               0,
               0};
     }
-    const RoutePacker planner = shape.num_tokens <= 10 ? RoutePacker::kSortedShort
+    const RoutePacker planner = shape.num_tokens <= 9 ? RoutePacker::kCountRank
+                                : shape.num_tokens <= 10 ? RoutePacker::kSortedShort
                                 : (shape.num_tokens == 11 || shape.num_tokens == 23)
                                     ? RoutePacker::kCountRank
                                     : RoutePacker::kGeneral;
@@ -692,8 +693,8 @@ constexpr Schedule SelectSm100aSchedule(const Shape& shape) {
   }
 
   if (IsGeometry(shape, 2048, 1536, 60, 4)) {
-    // T14 joins the packed general route of T15..T32.
-    if (shape.num_tokens >= 14) {
+    // T12..T14 join the packed general route of T15..T32.
+    if (shape.num_tokens >= 12) {
       return {true,
               Geometry::kH2048I1536E60K4,
               RouteLayout::kGpuPacked,
@@ -961,7 +962,12 @@ static_assert(SelectSm100aSchedule(E60Shape(1)).fc1 == Fc1Schedule::kPersistent)
 static_assert(SelectSm100aSchedule(E60Shape(2)).fc1 == Fc1Schedule::kPersistent);
 static_assert(SelectSm100aSchedule(E60Shape(10)).route_layout == RouteLayout::kDirect);
 static_assert(SelectSm100aSchedule(E60Shape(11)).route_layout == RouteLayout::kDirect);
-static_assert(SelectSm100aSchedule(E60Shape(13)).route_layout == RouteLayout::kDirect);
+static_assert(SelectSm100aSchedule(E60Shape(12)).route_layout == RouteLayout::kGpuPacked);
+static_assert(SelectSm100aSchedule(E60Shape(12)).route_packer == RoutePacker::kGeneral);
+static_assert(SelectSm100aSchedule(E60Shape(12)).workfeed_ctas == 144);
+static_assert(SelectSm100aSchedule(E60Shape(13)).route_layout == RouteLayout::kGpuPacked);
+static_assert(SelectSm100aSchedule(E60Shape(13)).route_packer == RoutePacker::kGeneral);
+static_assert(SelectSm100aSchedule(E60Shape(13)).workfeed_ctas == 144);
 static_assert(SelectSm100aSchedule(E60Shape(14)).route_layout == RouteLayout::kGpuPacked);
 static_assert(SelectSm100aSchedule(E60Shape(14)).route_packer == RoutePacker::kGeneral);
 static_assert(SelectSm100aSchedule(E60Shape(14)).workfeed_ctas == 144);

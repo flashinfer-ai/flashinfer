@@ -45,7 +45,7 @@ from .cudnn.prefill import (
     CudnnPrefillGraph,
     _PrefillMetadata,
     _CudnnPrefillPlan,
-    prepare_cudnn_batch_prefill,
+    _reuse_cudnn_prefill_preparation,
 )
 from .jit.attention._lazy import _LazyPagedKVStrideModule
 from .jit import (
@@ -300,6 +300,7 @@ def get_customize_batch_prefill_module(
     use_token_head_sf: bool = False,
     paged_kv_stride_mode: BatchPrefillPagedKVStrideMode = "runtime",
     module_surface: BatchPrefillModuleSurface = "full",
+    v_sf_swizzled: bool = False,
 ):
     return gen_customize_batch_prefill_module(
         backend,
@@ -324,6 +325,7 @@ def get_customize_batch_prefill_module(
         use_token_head_sf,
         paged_kv_stride_mode=paged_kv_stride_mode,
         module_surface=module_surface,
+        v_sf_swizzled=v_sf_swizzled,
     ).build_and_load()
 
 
@@ -3160,6 +3162,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         self._cudnn_block_tables: Optional[torch.Tensor] = None
         self._cudnn_q_lens_buffer: Optional[torch.Tensor] = None
         self._cudnn_prepared: Optional[CudnnPrefillGraph] = None
+        self._cudnn_prepared_cache: list[CudnnPrefillGraph] = []
         self._cudnn_plan: Optional[_CudnnPrefillPlan] = None
         self._cudnn_paged_bounds: Optional[Tuple[int, int]] = None
         self._cudnn_qo_indptr_buffer: Optional[torch.Tensor] = None
@@ -3204,6 +3207,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         _check_workspace_buffer_alignment(int_workspace_buffer, "int_workspace_buffer")
         self._float_workspace_buffer = float_workspace_buffer
         self._cudnn_prepared = None
+        self._cudnn_prepared_cache.clear()
         self._int_workspace_buffer = int_workspace_buffer
         self._pin_memory_int_workspace_buffer = torch.empty(
             self._int_workspace_buffer.shape,
@@ -3354,7 +3358,30 @@ class BatchPrefillWithPagedKVCacheWrapper:
         >>> wrapper.plan(...)
         """
         if self._backend == "cute-dsl-prims":
-            return (0, 0)
+            qo_indptr_host = qo_indptr.to("cpu")
+            if seq_lens is None:
+                kv_lens_arr_host = get_seq_lens(
+                    paged_kv_indptr.to("cpu"),
+                    paged_kv_last_page_len.to("cpu"),
+                    page_size,
+                )
+            else:
+                kv_lens_arr_host = seq_lens.cpu().flatten().to(torch.int32)
+            assert self._prims_backend is not None
+            float_bytes = self._prims_backend.paged_workspace_size(
+                qo_indptr_host=qo_indptr_host,
+                seqlens_kv_host=kv_lens_arr_host,
+                num_qo_heads=num_qo_heads,
+                num_kv_heads=num_kv_heads,
+                head_dim=head_dim_qk,
+                o_dtype=canonicalize_torch_dtype(o_data_type or q_data_type),
+                page_size=page_size,
+                causal=causal,
+                fixed_split_size=fixed_split_size or -1,
+                disable_split_kv=disable_split_kv,
+                use_cuda_graph=self._use_cuda_graph,
+            )
+            return (float_bytes, 0)
 
         _check_workspace_buffer_alignment(
             self._float_workspace_buffer, "float_workspace_buffer"
@@ -3497,6 +3524,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     "BatchPrefillWithPagedKVCacheWrapper.workspace_size",
                 )
             )
+            args.append(False)  # fixed_uniform_q_len
         float_workspace_size, int_workspace_size = module.workspace_size(*args)
         return int(float_workspace_size), int(int_workspace_size)
 
@@ -4111,7 +4139,6 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 token_pos_in_items_ptr=token_pos_in_items_ptr,
                 max_item_len_ptr=max_item_len_ptr,
                 max_sequence_kv=max_sequence_kv,
-                fixed_split_size=fixed_split_size,
             )
             if block_tables is None:
                 block_tables = _build_block_tables_from_paged_kv_indices(
@@ -4138,6 +4165,10 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 page_size=page_size,
                 causal=causal,
                 sm_scale=sm_scale,
+                float_workspace_buffer=self._float_workspace_buffer,
+                fixed_split_size=fixed_split_size,
+                disable_split_kv=disable_split_kv,
+                use_cuda_graph=self._use_cuda_graph,
             )
         elif self._jit_module is not None:
             self._cached_module = self._jit_module
@@ -4226,6 +4257,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     "BatchPrefillWithPagedKVCacheWrapper.plan",
                 )
                 args.append(forwarded_uniform_q_len)
+                args.append(False)  # fixed_uniform_q_len
             self._plan_info = self._cached_module.plan(
                 *args,
             )
@@ -4270,10 +4302,10 @@ class BatchPrefillWithPagedKVCacheWrapper:
         self._seq_lens_kv = seq_lens
         self._seq_lens_q = seq_lens_q if seq_lens_q is not None else seq_lens
 
-        # Old cuDNN captures still own this table after auto selects FA2.
+        # Old cuDNN captures retain lengths even with a caller-owned table.
         # Refresh their metadata during plan; replay cannot rebind pointers.
         if self._backend == "cudnn" or (
-            self.is_cuda_graph_enabled and self._cudnn_block_tables is not None
+            self.is_cuda_graph_enabled and self._cudnn_q_lens_buffer is not None
         ):
             if self._backend == "cudnn" and (
                 pos_encoding_mode != "NONE"
@@ -4567,7 +4599,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
         Parameters
         ----------
         q : torch.Tensor
-            The query tensor, shape: ``[qo_indptr[-1], num_qo_heads, head_dim]``
+            The query tensor, shape:
+            ``[qo_indptr[-1], num_qo_heads, head_dim_qk]``
         paged_kv_cache : Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
             The paged KV-Cache stored as a tuple of tensors or a single tensor:
 
@@ -4581,6 +4614,12 @@ class BatchPrefillWithPagedKVCacheWrapper:
               ``[max_num_pages, 2, num_kv_heads, page_size, head_dim]`` if
               :attr:`kv_layout` is ``HND``. Where ``paged_kv_cache[:, 0]`` is the key-cache and
               ``paged_kv_cache[:, 1]`` is the value-cache.
+
+            In these shapes, ``head_dim`` is ``head_dim_qk`` for the key cache and
+            ``head_dim_vo`` for the value cache. For NVFP4 ``torch.uint8`` caches,
+            the stored last dimensions are ``head_dim_qk // 2`` and
+            ``head_dim_vo // 2``, respectively. A single 5-D tensor requires equal
+            key and value storage widths.
 
         *args
             Additional arguments for custom kernels.
@@ -4632,9 +4671,13 @@ class BatchPrefillWithPagedKVCacheWrapper:
               and ``[num_pages, 2, num_kv_heads, page_size, head_dim // 16]`` if :attr:`kv_layout` is ``HND``,
               where dim 1 holds k (index 0) and v (index 1) scales.
 
+            For the tuple form, ``head_dim`` is ``head_dim_qk`` in ``k_scales``
+            and ``head_dim_vo`` in ``v_scales``. A single 5-D tensor requires
+            equal key and value scale widths.
+
             Both tensors have dtype ``torch.float8_e4m3fn``. ``k_scales`` uses a linear
             (row-major) layout, while ``v_scales`` must use TRT-LLM's 4-token interleaved
-            layout within each ``[page_size, head_dim // 16]`` tile if backend is `trtllm-gen`. Use
+            layout within each ``[page_size, head_dim_vo // 16]`` tile if backend is `trtllm-gen`. Use
             :func:`flashinfer.fp4_quantization.nvfp4_quantize_paged_kv_cache` to produce
             correctly formatted scale factors.
 
@@ -4667,10 +4710,12 @@ class BatchPrefillWithPagedKVCacheWrapper:
         Returns
         -------
         Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
-            If :attr:`return_lse` is ``False``, the attention output, shape: ``[qo_indptr[-1], num_qo_heads, head_dim]``.
+            If :attr:`return_lse` is ``False``, the attention output, shape:
+            ``[qo_indptr[-1], num_qo_heads, head_dim_vo]``.
             If :attr:`return_lse` is ``True``, a tuple of two tensors:
 
-            * The attention output, shape: ``[qo_indptr[-1], num_qo_heads, head_dim]``.
+            * The attention output, shape:
+              ``[qo_indptr[-1], num_qo_heads, head_dim_vo]``.
             * The logsumexp of attention output, shape: ``[qo_indptr[-1], num_qo_heads]``
               (``lse_layout="NH"``, default) or ``[num_qo_heads, qo_indptr[-1]]``
               (``"HN"``), in the base selected by :attr:`lse_base`.
@@ -5055,13 +5100,15 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     q.size(0) if native_hn else 0,
                     lse_base=lse_base,
                 ):
-                    prepared = self._cudnn_prepared = prepare_cudnn_batch_prefill(
+                    prepared = self._cudnn_prepared = _reuse_cudnn_prefill_preparation(
+                        self._cudnn_prepared_cache,
                         q,
                         k_cache,
                         v_cache,
                         sm_scale,
                         self._float_workspace_buffer,
-                        metadata=plan.build_metadata(return_lse),
+                        plan=plan,
+                        return_lse=return_lse,
                         stats_head_stride=q.size(0) if native_hn else 0,
                         lse_base=lse_base,
                     )
@@ -5584,6 +5631,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         # [total_tokens, num_qo_heads]; token-unit, so it is qo_indptr itself.
         self._cudnn_stats_offsets: Optional[torch.Tensor] = None
         self._cudnn_prepared: Optional[CudnnPrefillGraph] = None
+        self._cudnn_prepared_cache: list[CudnnPrefillGraph] = []
         self._cudnn_plan: Optional[_CudnnPrefillPlan] = None
         # cuDNN < 9.27, single-token GQA batch with zero-length requests: the
         # packed LSE cannot be served (NVBug 6783545); run() refuses it.
@@ -5627,6 +5675,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         """
         self._float_workspace_buffer = float_workspace_buffer
         self._cudnn_prepared = None
+        self._cudnn_prepared_cache.clear()
         self._int_workspace_buffer = int_workspace_buffer
         self._pin_memory_int_workspace_buffer = torch.empty(
             self._int_workspace_buffer.shape,
@@ -6072,8 +6121,12 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 token_pos_in_items_ptr=token_pos_in_items_ptr,
                 max_item_len_ptr=max_item_len_ptr,
                 max_sequence_kv=max_sequence_kv,
-                fixed_split_size=fixed_split_size,
             )
+            if fixed_split_size not in (-1, None):
+                raise NotImplementedError(
+                    "backend='cute-dsl-prims' does not support "
+                    f"fixed_split_size={fixed_split_size} with ragged K/V"
+                )
             assert self._prims_backend is not None
             self._prims_backend.plan_ragged(
                 qo_indptr=self._qo_indptr_buf,
@@ -6568,6 +6621,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                         "BatchPrefillWithRaggedKVCacheWrapper.plan",
                     )
                 )
+                args.append(False)  # fixed_uniform_q_len
             self._plan_info = self._cached_module.plan(
                 *args,
             )
@@ -7153,13 +7207,15 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                     q.size(0) if native_hn else 0,
                     lse_base=lse_base,
                 ):
-                    prepared = self._cudnn_prepared = prepare_cudnn_batch_prefill(
+                    prepared = self._cudnn_prepared = _reuse_cudnn_prefill_preparation(
+                        self._cudnn_prepared_cache,
                         q,
                         k,
                         v,
                         sm_scale,
                         self._float_workspace_buffer,
-                        metadata=plan.build_metadata(return_lse),
+                        plan=plan,
+                        return_lse=return_lse,
                         stats_head_stride=q.size(0) if native_hn else 0,
                         lse_base=lse_base,
                     )
@@ -8560,6 +8616,10 @@ def trtllm_batch_context_with_kv_cache(
         When :attr:`kv_layout` is ``NHD``, scale tensors are transposed to HND internally
         (incurring a ``.contiguous()`` copy). Use ``HND`` for better performance.
 
+        For a ``head_dim`` without an NVFP4 KV context kernel, convert the pages to FP8
+        with :func:`flashinfer.quantization.kernels.nvfp4_kv_materialize_fp8` and pass
+        the FP8 cache instead.
+
         **Contiguity requirements (trtllm-gen backend):**
 
         - The last two dims (``page_size``, ``head_dim // 16``) **must** be contiguous
@@ -8810,7 +8870,11 @@ def trtllm_batch_context_with_kv_cache(
 
     if isinstance(bmm1_scale, torch.Tensor):
         assert bmm1_scale.dtype == torch.float32
-        bmm1_scale = bmm1_scale * log2e
+        # The cake backend takes a device bmm1 scale as given: its device-scale
+        # programs convert it to log2 form themselves, which saves this extra
+        # launch.
+        if backend != "cake":
+            bmm1_scale = bmm1_scale * log2e
     if isinstance(bmm2_scale, torch.Tensor):
         assert bmm2_scale.dtype == torch.float32
     _check_block_tables_shape(block_tables, uses_shared_paged_kv_idx)
@@ -8886,18 +8950,19 @@ def trtllm_batch_context_with_kv_cache(
             # skip-softmax probe. Both exact routes and compat_v1 consume the
             # disabled form at the FFI boundary.
             skip_softmax_threshold_scale_factor = None
-        # A device-scale program reads both scales through device pointers
-        # (bmm1 in log2 form). The other context adapters consume host scalar
-        # scales: device scalar values are resolved only after route
-        # selection, preserving their public value while converting bmm1 back
-        # from log2 form.
+        # A device-scale program reads both scales through device pointers and
+        # converts the raw bmm1 scale to log2 form itself. The other context
+        # adapters consume host scalar scales: device scalar values are
+        # resolved only after route selection. bmm1 keeps the value of the
+        # FP32 log2 product converted back (the value these adapters always
+        # received).
         if (
             cake_route is None
             or cake_route.program is None
             or not cake_route.device_scales
         ):
             if isinstance(bmm1_scale, torch.Tensor):
-                bmm1_scale = float(bmm1_scale.item()) / log2e
+                bmm1_scale = float((bmm1_scale * log2e).item()) / log2e
             if isinstance(bmm2_scale, torch.Tensor):
                 bmm2_scale = float(bmm2_scale.item())
         run_func = get_cake_fmha_context_module(

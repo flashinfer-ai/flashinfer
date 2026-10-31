@@ -21,10 +21,13 @@ from .cake_runner import (
     FUSED_DISPATCH_MAX_ROUTES,
     FUSED_DISPATCH_MAX_TOKENS,
     Sm90CakeBf16MoERunner,
+    WCX_MAX_TOKENS_ENV,
 )
 from .cake_weights import (
     GATE_UP_GROUP,
     Sm90CakeBf16Weights,
+    Sm90CakeWcxWeights,
+    encode_sm90_cake_wcx,
     interleave_gate_up,
     make_sm90_cake_bf16_weights,
 )
@@ -40,6 +43,9 @@ __all__ = [
     "GATE_UP_GROUP",
     "Sm90CakeBf16MoERunner",
     "Sm90CakeBf16Weights",
+    "Sm90CakeWcxWeights",
+    "WCX_MAX_TOKENS_ENV",
+    "encode_sm90_cake_wcx",
     "gen_sm90_cake_bf16_combine_prereduced_module",
     "gen_sm90_cake_bf16_combine_tail_module",
     "gen_sm90_cake_bf16_combine_tail_prereduced_module",
