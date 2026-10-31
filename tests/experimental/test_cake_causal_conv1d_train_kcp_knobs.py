@@ -386,7 +386,7 @@ def test_every_kcp_entry_refuses_a_deterministic_mode() -> None:
             ctx, None, None, d.get("deterministic", True), 1, x, w
         ),
     }  # fmt: skip
-    for name, call in calls.items():
+    for call in calls.values():
         for kwargs in ({}, {"deterministic": True}, {"deterministic": 0}, {"deterministic": None}):
             with pytest.raises(ValueError, match="deterministic=False"):
                 call(kwargs)

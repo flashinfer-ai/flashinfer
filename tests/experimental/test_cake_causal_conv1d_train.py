@@ -1003,7 +1003,7 @@ def test_every_entry_requires_deterministic_false() -> None:
         for kwargs in ({}, {"deterministic": True}, {"deterministic": 0}, {"deterministic": None}):
             with pytest.raises(ValueError, match="deterministic=False"):
                 call(kwargs)
-        call({"deterministic": False})
+        assert call({"deterministic": False}) is not None, name
 
 
 def test_torch_deterministic_mode_alerts_on_the_backward() -> None:

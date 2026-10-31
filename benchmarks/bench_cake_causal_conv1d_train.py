@@ -331,7 +331,7 @@ def bench_row(tokens: int, channels: int, *, route: Route, device: torch.device,
         if f"{phase}_{kind}_us" in det and f"{phase}_{kind}_us" in nondet
     }
     if "det" in grads and "nondet" in grads:
-        (dx_d, dw_d, *rest_d), (dx_n, dw_n, *rest_n) = grads["det"], grads["nondet"]
+        (dx_d, dw_d, *_), (dx_n, dw_n, *_) = grads["det"], grads["nondet"]
         result["check"] = {
             "dx_bitwise_equal": bool(torch.equal(dx_d, dx_n)),
             "dweight_max_rel_diff": float(
