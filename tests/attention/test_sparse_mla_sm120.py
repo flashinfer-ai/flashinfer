@@ -2425,6 +2425,82 @@ def test_sparse_mla_sm120_dsv4_1_dual_fp4_extra_trtllm_entry(num_tokens: int) ->
     torch.testing.assert_close(output.squeeze(1), ref_out, atol=5e-2, rtol=5e-2)
 
 
+def test_sparse_mla_sm120_dsv4_1_fp4_ca_without_compressed_cache() -> None:
+    """The fp4_ca format describes the compressed cache only; a SWA-only call
+    (no compressed segment) under the same model-level format must run the
+    plain single-cache DSV4_1 path and match fp8_dsv41 bit for bit."""
+    torch.manual_seed(3)
+    device = torch.device("cuda")
+    num_tokens, num_heads = 4, 64
+    topk = 128
+    d_qk, d_v = 512, 512
+    page_block_size = 64
+    num_blocks = 64
+    s_kv = num_blocks * page_block_size
+
+    kv_bf16 = (
+        torch.randn(
+            num_blocks, page_block_size, 1, d_qk, device=device, dtype=torch.bfloat16
+        )
+        / 10.0
+    ).clamp(-1, 1)
+    kv_packed = quantize_kv_dsv4_1(kv_bf16)
+    kv_dequant = dequantize_kv_dsv4_1(kv_packed)
+
+    q = (
+        torch.randn(num_tokens, num_heads, d_qk, device=device, dtype=torch.bfloat16)
+        / 10.0
+    ).clamp(-1, 1)
+    indices = torch.randint(
+        0, s_kv, (num_tokens, topk), device=device, dtype=torch.int32
+    )
+
+    sm_scale = d_qk**-0.5
+    ref_out, _ = _ref_sparse_attn(q, kv_dequant, indices, sm_scale, d_v)
+
+    outputs = {}
+    for cache_format in ("fp8_dsv41", "fp8_dsv41_fp4_ca"):
+        outputs[cache_format] = flashinfer.mla.trtllm_batch_decode_sparse_mla_dsv4(
+            query=q.unsqueeze(1),
+            swa_kv_cache=kv_packed,
+            workspace_buffer=torch.empty(1, dtype=torch.int8, device=device),
+            sparse_indices=indices,
+            swa_topk_lens=torch.full(
+                (num_tokens,), topk, dtype=torch.int32, device=device
+            ),
+            bmm1_scale=sm_scale,
+            kv_layout="NHD",
+            kv_cache_format=cache_format,
+        )
+
+    torch.testing.assert_close(
+        outputs["fp8_dsv41_fp4_ca"].squeeze(1), ref_out, atol=5e-2, rtol=5e-2
+    )
+    assert torch.equal(outputs["fp8_dsv41_fp4_ca"], outputs["fp8_dsv41"])
+
+    # The legacy direct binding applies the same normalization.
+    from flashinfer.mla._sparse_mla_sm120 import _api as sm
+
+    output = torch.zeros(
+        (num_tokens, num_heads, d_v), dtype=torch.bfloat16, device=device
+    )
+    out_lse = torch.zeros((num_tokens, num_heads), dtype=torch.float32, device=device)
+    mid_out, mid_lse = _make_decode_scratch(num_tokens, num_heads, topk, d_v, device)
+    sm.sparse_mla_sm120_decode_dsv4(
+        q,
+        kv_packed,
+        indices,
+        mid_out,
+        mid_lse,
+        output,
+        out_lse,
+        sm_scale,
+        model_type=sm._MODEL_TYPE_DSV4_1,
+        extra_fp4=True,
+    )
+    torch.testing.assert_close(output, ref_out, atol=5e-2, rtol=5e-2)
+
+
 def test_sparse_mla_sm120_decode_dsv4_1_masked_rows_ignore_poisoned_slot_zero() -> None:
     """DSV4_1 decode gathers the shared zero row for masked candidates: slot 0
     is poisoned with 0xFF (NaN FP8 values, +inf UE8M0 scales) and must not leak."""
