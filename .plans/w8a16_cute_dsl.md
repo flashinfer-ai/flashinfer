@@ -166,3 +166,18 @@ Until then the C++ stays as-is and the DSL kernel lives beside it.
   locked clocks (ncu) and with 5 iterations the two kernels are identical; the 200-
   iteration run shows the DSL 10% slower -> a sustained-clock / power effect, not
   kernel work.
+- Fri 30 Oct 2026, evening: the split-K reduces.  Hopper und.kv M=1024 (128x128 split-K,
+  8 slices) was +8%: cutting the fused fix-up in stages showed GEMM + partial store at
+  parity with the C++ GEMM (11.7 vs 11.55 us) and the fix-up at 4.0 us against the C++
+  reduce kernel's 3.1 + 0.3 us gap.  Fixes: monotonic 64-bit tail counters (each slice
+  adds lcm(1..16)/splits and waits for the next stride boundary; the atomic's return
+  tells the last slice it is last, no reset, no second count) and 16-byte output stores
+  (the output view's column stride spelled 8 * (rows / 8); with the dynamic row count
+  the compiler emitted eight 2-byte stores).  15.8 -> 14.8 us (C++ 14.7).  Blackwell:
+  the separate reduce kernel loaded the second and later slices as eight 4-byte loads
+  (a host-computed stride arrives as an opaque integer); views built inside the kernel
+  fix it, GB200 und.kv 1024 reduce 4.8 -> 3.55 us, rows 15.0/15.1 and 21.8/21.9 (DSL
+  ahead).  B200 (x86, lease w8a16-b12) baseline differs from the GB200: M=8192 rows of
+  gate_up / gen.qkv / mlp.down 4-13% behind on the same tile, at M=4096 the DSL wins
+  most tiles -> suspected power-cap clock effect (B200 1000 W); measuring clocks and
+  profiling at locked clocks next.
