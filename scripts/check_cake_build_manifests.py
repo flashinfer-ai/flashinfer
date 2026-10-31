@@ -253,12 +253,12 @@ def refs_generic(package_dir: Path, loader: str) -> set[str]:
     return generic_library_refs(module_literals(package_dir / loader))
 
 
-def refs_lm_head_loss(package_dir: Path, loader: str) -> set[str]:
+def refs_lm_head_det_loss(package_dir: Path, loader: str) -> set[str]:
     """Compact rows ``[unit, arg_plan, launch, grid_x, grid_y, grid_z]`` per stage of a per-architecture record;
-    the stage's library stem is ``cake_lm_head_loss_<unit>``."""
+    the stage's library stem is ``cake_lm_head_det_loss_<unit>``."""
     registry = module_literals(package_dir / loader)["_REGISTRY"]
     return {
-        f"cake_lm_head_loss_{row[0]}_{compact['arch']}"
+        f"cake_lm_head_det_loss_{row[0]}_{compact['arch']}"
         for compact in registry.values()
         for row in compact["stages"].values()
     }
@@ -308,6 +308,14 @@ def refs_shipped_modules(package_dir: Path, loader: str) -> set[str]:
     return generic_library_refs(module_literals(package_dir / loader)["MODULES"])
 
 
+def refs_with_kcp(package_dir: Path, loader: str) -> set[str]:
+    """A package whose ``build.json`` also lists the programs of its context-parallel registry ``kcp_jit.py``: the
+    generic walk over ``loader`` and the ``MODULES`` records of ``kcp_jit.py``."""
+    return refs_generic(package_dir, loader) | refs_shipped_modules(
+        package_dir, "kcp_jit.py"
+    )
+
+
 def refs_mok_bf16(package_dir: Path, loader: str) -> set[str]:
     """``sources.json``: role -> {library, arches, arguments}."""
     registry = json.loads((package_dir / loader).read_text())
@@ -340,10 +348,10 @@ PACKAGES: tuple[Package, ...] = (
         refs_generic,
     ),
     Package(
-        "flashinfer.cake_causal_conv1d_train_backend",
-        "flashinfer/cake_causal_conv1d_train_backend",
+        "flashinfer.cake_causal_conv1d_det_train_backend",
+        "flashinfer/cake_causal_conv1d_det_train_backend",
         "cake_jit.py",
-        refs_generic,
+        refs_with_kcp,
     ),
     Package(
         "flashinfer.cake_gated_act_mxfp8_backend",
@@ -436,10 +444,10 @@ PACKAGES: tuple[Package, ...] = (
         refs_moe_grouped_gemm,
     ),
     Package(
-        "flashinfer.experimental.cake_lm_head_loss",
-        "flashinfer/experimental/cake_lm_head_loss",
+        "flashinfer.experimental.cake_lm_head_det_loss",
+        "flashinfer/experimental/cake_lm_head_det_loss",
         "cake_jit.py",
-        refs_lm_head_loss,
+        refs_lm_head_det_loss,
     ),
     Package(
         "flashinfer.experimental.cake_mok_bf16",

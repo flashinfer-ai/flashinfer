@@ -86,7 +86,7 @@ exclude = [
 # Cake-exported packages (flashinfer-ai/flashinfer#6553): the generated csrc tree plus the
 # build manifest (build.json) their cake_build loader reads; prebuilt aot/ libraries never ship.
 "flashinfer.cake_rmsnorm_det_train_backend" = ["csrc/**", "build.json"]
-"flashinfer.cake_causal_conv1d_train_backend" = ["csrc/**", "build.json"]
+"flashinfer.cake_causal_conv1d_det_train_backend" = ["csrc/**", "build.json"]
 "flashinfer.cake_ulysses_backend" = ["csrc/**", "build.json"]
 "flashinfer.cake_fused_qk_rope_append_backend" = ["csrc/**", "build.json"]
 "flashinfer.cake_nvfp4_svdquant_gemm_backend" = ["csrc/**", "build.json"]
@@ -105,7 +105,7 @@ exclude = [
 "flashinfer.experimental.cake_gdn_det_train" = ["csrc/**", "build.json"]
 "flashinfer.experimental.cake_gqa_train" = ["csrc/**", "build.json"]
 "flashinfer.experimental.cake_rubin_mla_nvfp4_decode" = ["csrc/**", "build.json"]
-"flashinfer.experimental.cake_lm_head_loss" = ["csrc/**", "build.json"]
+"flashinfer.experimental.cake_lm_head_det_loss" = ["csrc/**", "build.json"]
 "flashinfer.experimental.cake_mok_bf16" = ["csrc/*.cu", "csrc/*/*.cu", "csrc/*.h", "sources.json", "build.json", "README.md"]
 "flashinfer.experimental.nvfp4_attention" = ["csrc/**", "build.json"]
 "flashinfer.experimental.deepgemm_fp8_gemm" = ["csrc/**", "build.json", "DEEPGEMM_NOTICE.txt"]
