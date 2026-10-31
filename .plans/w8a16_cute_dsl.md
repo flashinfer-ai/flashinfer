@@ -207,3 +207,15 @@ Until then the C++ stays as-is and the DSL kernel lives beside it.
   (1.5 -> 1.0 us per 128-wide tile).  Open: the 160 tile's five 32-column subtiles
   (160 has no larger power-of-two divisor that fits a 128-byte TMA swizzle) and the
   first-tile fill (~2.2 us from the first TMA to the first MMA).
+- Sat 31 Oct 2026, ~00:00: fixed-cost intercepts (B200 ncu, K = 1..16 k-tiles, M=1024 N=2560,
+  C++ / DSL us at one k-tile): 2sm256x128 9.06 / 8.67, 1sm128x128 8.74 / 8.38 (DSL ahead),
+  2sm256x160 8.77 / 9.60 (+0.83; slope 442 vs 461 ns per k-tile), 2sm256x192 8.80 / 10.02
+  (+1.2; slopes equal at 514 ns).  Cycle counters: epilogue busy per tile 2866 (128, two
+  64-column subtiles), 3358 (192, three), 3918 (160, five 32-column subtiles), end-of-kernel
+  store drain included.  The CUTLASS SM100 epilogue issues the same per-subtile sequence
+  (fence, barrier, TMA store by one warp, commit, acquire, barrier) and EpilogueTileAuto.
+  Global-timer phases below ~1 us are quantization noise (the timer ticks coarsely); use
+  the %clock accumulators.  H100 five-round table: all rows within +-1.3% except one
+  throttled-GPU artifact (gate_up 8192 +17% while all times ran 30% slow; an isolated
+  rerun gave 713.7 / 699.2).  Remaining Blackwell gap: gen.qkv / attn.out at M=1024
+  (+4..6%, 160-wide tile, one tile per CTA) and mlp.down 1024 (+2.4%).

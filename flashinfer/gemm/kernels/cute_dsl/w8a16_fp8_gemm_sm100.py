@@ -976,7 +976,34 @@ class Sm100W8A16Fp8GemmKernel:
                 k_tile_base = tile_l * k_tile_cnt
                 b_load2mma_producer_state.reset_count()
                 for _k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
-                    b_load2mma_pipeline.producer_acquire(b_load2mma_producer_state)
+                    # Peek first: a free stage then skips the blocking wait and the
+                    # acquire is just the transaction-count arrive.
+                    b_stage_free = b_load2mma_pipeline.producer_try_acquire(
+                        b_load2mma_producer_state
+                    )
+                    if cutlass.const_expr(self.debug):
+                        with cute.arch.elect_one():
+                            first = (dbg_tiles == 0).to(cutlass.Int32) * (
+                                _k_tile == 0
+                            ).to(cutlass.Int32) == 1
+                            dbg[dbg_base + _slot_if(first, 37)] = global_timer_lo(37)
+                            dbg[dbg_base + _slot_if(first, 38)] = b_stage_free.to(
+                                cutlass.Int32
+                            )
+                    b_load2mma_pipeline.producer_acquire(
+                        b_load2mma_producer_state, b_stage_free
+                    )
+                    if cutlass.const_expr(self.debug):
+                        with cute.arch.elect_one():
+                            dbg[
+                                dbg_base
+                                + _slot_if(
+                                    (dbg_tiles == 0).to(cutlass.Int32)
+                                    * (_k_tile == 0).to(cutlass.Int32)
+                                    == 1,
+                                    35,
+                                )
+                            ] = global_timer_lo(35)
                     cute.copy(
                         tma_atom_b,
                         tBgB_slice[
@@ -989,6 +1016,17 @@ class Sm100W8A16Fp8GemmKernel:
                         mcast_mask=b_full_mcast_mask,
                     )
                     b_load2mma_pipeline.producer_commit(b_load2mma_producer_state)
+                    if cutlass.const_expr(self.debug):
+                        with cute.arch.elect_one():
+                            dbg[
+                                dbg_base
+                                + _slot_if(
+                                    (dbg_tiles == 0).to(cutlass.Int32)
+                                    * (_k_tile == 0).to(cutlass.Int32)
+                                    == 1,
+                                    36,
+                                )
+                            ] = global_timer_lo(36)
                     b_load2mma_producer_state.advance()
                 if cutlass.const_expr(self.debug):
                     dbg_tiles += 1
