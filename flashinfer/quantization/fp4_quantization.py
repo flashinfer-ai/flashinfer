@@ -1666,11 +1666,6 @@ def nvfp4_quantize(
     ``nvfp4_4over6`` is explicit and ``a_global_sf`` is readable without a
     device synchronization.
     """
-    if backend in ("cuda", "cute-dsl"):
-        _check_block_scale_quantization_support(
-            torch.device("cuda", torch.cuda.current_device()), "nvfp4_quantize"
-        )
-
     nvfp4_4over6_config = resolve_nvfp4_4over6(nvfp4_4over6)
     nvfp4_4over6_is_explicit = nvfp4_4over6 is not _UNSET
     if per_token_activation:
@@ -1682,7 +1677,15 @@ def nvfp4_quantize(
             raise ValueError(
                 "out_scale is only supported with backend='cute-dsl' or 'cake'"
             )
+    elif out_scale is not None:
+        raise ValueError("out_scale is only supported with per_token_activation=True")
 
+    if backend in ("cuda", "cute-dsl"):
+        _check_block_scale_quantization_support(
+            torch.device("cuda", torch.cuda.current_device()), "nvfp4_quantize"
+        )
+
+    if per_token_activation:
         sf_layout = SfLayout.layout_linear if do_shuffle else sfLayout
         if do_shuffle:
             assert sfLayout == SfLayout.layout_128x4
@@ -1790,8 +1793,6 @@ def nvfp4_quantize(
             raise ValueError(
                 f"Unknown backend: {backend}. Must be 'cuda', 'cute-dsl' or 'cake'."
             )
-    elif out_scale is not None:
-        raise ValueError("out_scale is only supported with per_token_activation=True")
     elif backend == "cuda":
         if expanded_idx_to_permuted_idx is not None:
             raise ValueError(
