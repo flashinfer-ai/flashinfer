@@ -21,20 +21,51 @@ ported and checked row by row by the export):
 
 | kind | program | when |
 | --- | --- | --- |
-| `small_m_direct:k{K}` | one token per 256-thread CTA, every source register-resident (the first three unpacked to f32 once), no TMA / mbarrier / TMEM; one cross-warp exchange for all K+1 statistics pairs | `M <= 16` for every `K` (per-architecture table `_SMALL_M_DIRECT_MAX_M`); selected ahead of every other dense program |
-| `small_m_cluster{2,4}:k{K}` | the same program split over a cluster of 2 or 4 CTAs per token (128 / 64 threads each); each warp pushes its statistics pairs into every CTA's table over DSM, one cluster barrier per exchange, identical reduction order | the `K` entries of the per-architecture table `_SMALL_M_CLUSTER` (absent `K` -> one CTA per token) |
-| `native_{k5,k6,k7,k8,m128}` | installed native ports, 148 CTAs x 288 threads, three sources per chunk, depth 2 | the measured cells of the 148-SM parts (`M = 1` for K5 / K6 / K7, `M <= 256` cells for K4, small `M` / `M = 256` for K8) |
+| `small_m_direct:k{K}` | one token per 256-thread CTA, every source register-resident (the first three unpacked to f32 once), no TMA / mbarrier / TMEM; one cross-warp exchange for all K+1 statistics pairs | `M <= _SMALL_M_DIRECT_MAX_M[arch][K]` (256 / 512 for K0-K3, 128 for K4-K7, 64 for K8); selected ahead of every other dense program |
+| `small_m_cluster{2,4}:k{K}` | the same program split over a cluster of 2 or 4 CTAs per token (128 / 64 threads each); each warp pushes its statistics pairs into every CTA's table over DSM, one cluster barrier per exchange, identical reduction order | the `(K, M band)` entries of the per-architecture table `_SMALL_M_CLUSTER` (K4-K8 at the smallest `M`; absent `K` or `M` above the last band -> one CTA per token) |
+| `native_{k5,k7,k8,m128}` | installed native ports, one 288-thread CTA per SM (grid = the device's SM count: 148 on B200 / B300, 152 on GB300), three sources per chunk, depth 2 | the measured cells above the small-M table on the qualified SM counts `NATIVE_SM_COUNTS`: `M = 1024` (`sm_100a`) / `M = 256` (`sm_103a`) for K4 (`native_m128`), `M = 256` for K8 (`native_k8`), the round-2 native cells of the `R2_NATIVE_CELLS` table (K7 / K8 / M128), and the K5 cells of `R2_NATIVE_CELLS` (`native_k5`, whose consumed-slot release every consumer thread performs): `M = 192 / 256 / 768` on `sm_103a`, `M = 192 / 256 / 384 / 768 / 1024 / 1536 / 2048` on `sm_100a` |
 | `k0_tma` | exact `K = 0` persistent path (bulk-copy fed, no TMEM); grid 2x/3x the SM count at `M` 256-1024 | `num_blocks == 0` |
-| `persistent` | persistent TMEM common path, 288 threads, `nc` sources per chunk (1..5), depth 2 or 3, retraced per cell | every other dense call with `delta` and `output_norm_weight` and no snapshot write |
-| `direct` | one 256-thread CTA per token | no `delta`, snapshot write, no output norm, or row-padded layouts |
+| `persistent` | persistent TMEM common path, 288 threads, `nc` sources per chunk (1..5), depth 2 or 3, retraced per cell | every other dense call with `delta` and `output_norm_weight` and no snapshot write; a key's `_crfnone` suffix names the fence-authored twin of its program (built with `consumed_release_fence_mode="none"`: the kernel states its own tcgen05 fences; schedule label `_authored_fences`; where the twin's source differs from the fenced program's by one fence line only, its entry builds the fenced program's source with `-DCAKE_AUTHORED_FENCES`), which the twelve `sm_100a` K2 / K3 cells of `R2_PERSISTENT_KEY_CELLS` at `M >= 2048` run |
+| `direct` | one 256-thread CTA per token (bootstrap program) | a call outside the dense path (no `delta`, a snapshot write below `K`, no output norm, or a row-padded layout); the key encodes the semantics and three variants are registered (`direct:k0_d0_w1_n1`, `direct:k4_d0_w0_n1`, `direct:k8_d1_w0_n0`). Every other variant has no registered program and raises `NotImplementedError`. The registered bindings require contiguous tensors: a row-padded layout that maps onto a registered variant is rejected by the binding's contiguity check at launch |
 
 `KERNELS[arch][kernel_key]` in `cake_jit.py` names the registered module of a
-plan; a call whose program is not registered raises `NotImplementedError`
-(`generated_program_available` answers without raising).  The checkout registers
-the programs of the Kimi-K3 evaluation: `M` in {1, 2, 4, ..., 16384} x `K` in
-{0, 1, 4, 8}, every `K` at `M` = 1 / 4096, and the semantic variants at `M` =
-1 / 3 / 7 / 17, with and without programmatic dependent launch, on `sm_100a`
-and `sm_103a` (148 SMs).
+plan.  The checkout registers the programs measured on the Kimi-K3 evaluation
+grid: `M` in {1, 2, 4, ..., 16384} x `K` in {0, 1, 4, 8}, every `K` at `M` = 1 /
+4096, and the semantic variants at `M` = 1 / 3 / 7 / 17, with and without
+programmatic dependent launch, on `sm_100a` and `sm_103a`.  The route
+tables above describe every dense call; when they name a schedule variant the
+checkout does not register (a token count off the grid, `K` 5-7 at mid `M`, ...),
+`plan_route` substitutes the closest registered variant of the same program
+family and block count (`small_m`: the same cluster size without the chunk
+suffix, then cluster 2, cluster 4, direct; `persistent`: the same-`K` variant
+with the same `nc` / depth, then the same `nc`, then any, in a fixed order) and
+records the table key in `RoutePlan.fallback_from`; the substituted plan's
+`route_id` ends in `.registered_fallback`.  Measured cells always run their
+exact program.  `generated_program_available` answers whether the resolved
+program is registered without raising; a call whose resolved program is not
+registered raises `NotImplementedError`.
+
+## Tested physical configurations
+
+`plan_route` resolves every grid from the device's SM count
+(`torch.cuda.get_device_properties(device).multi_processor_count`, never spoofed):
+the persistent programs launch `min(M, SMs)` CTAs (the balanced 128-CTA grid at
+`M` 256-512), the `K = 0` path 2x / 3x the SM count at its promoted cells, and the
+native ports one CTA per SM on the qualified counts `NATIVE_SM_COUNTS = (148, 152)`
+(on a 152-SM part the native K8 / M128 cells measured 0.83 / 0.96 of the persistent
+fallback they would otherwise take).  The programs themselves are SM-count
+agnostic (grid-stride token loops); the configurations below are the ones the
+export protocol measured end to end.
+
+| device | arch | SMs | driver | status |
+| --- | --- | --- | --- | --- |
+| NVIDIA B200 | `sm_100a` | 148 | 580.82.07 | qualified (export protocol, 148-SM configuration) |
+| NVIDIA B300 | `sm_103a` | 148 | 580.126.09 | qualified (export protocol, 148-SM configuration) |
+| NVIDIA GB300 | `sm_103a` | 152 | 580.159.03 | qualified (export protocol, 152-SM configuration; the rows below the per-row gate against the pinned vLLM op are listed in the delivery summary) |
+| NVIDIA GB200 | `sm_100a` | 152 | not recorded (no export stage) | admitted by the same policy and programs; on GB200 hardware the package GPU tests pass and the native ports were timed against the persistent fallback at 152 SMs (faster on every measured cell); no export stage of this delivery |
+
+Any other SM count is served by the persistent / small-M / `K = 0` families with
+grids derived from the actual count; no such configuration has been benchmarked.
 
 ## Correctness contract
 
@@ -44,6 +75,25 @@ Output within `atol 8e-2 / rtol 3e-2` of the independent FP32 reference
 
 ## Generated sources
 
-`csrc/cake_kimi_k3_attn_res/<arch>/*.cu` (device + TVM-FFI binding per module)
-and the `MODULES` / `KERNELS` literals of `cake_jit.py` are receipt-bound
-exporter output: do not edit by hand.
+`csrc/cake_kimi_k3_attn_res_<digest>_kernel.cu` holds one device source per
+class of programs that share it: a program whose source is another program's
+up to the record digest, up to the placement of one line between the SM100
+and SM103 programs of one schedule, or up to one fence line builds that
+program's source.  A shared source takes its kernel symbol from
+`-DCAKE_PROGRAM_KERNEL` (`#ifndef CAKE_PROGRAM_KERNEL` keeps the file's own
+symbol as the default), places the moved line under
+`#if __CUDA_ARCH__ == 1000` / `#if __CUDA_ARCH__ != 1000` and drops the fence
+line under `#ifndef CAKE_AUTHORED_FENCES` (`-DCAKE_AUTHORED_FENCES` on the
+fence-free entry).  The five launch bindings
+`csrc/cake_kimi_k3_attn_res_{common,small_m_cluster,small_m_direct,direct,k0_tma}_binding.cu`,
+one per argument-plan form, take the kernel symbol, the dynamic shared memory
+bytes, the CTA threads, the cluster size, the last snapshot row and the
+write-index arm from the `-D` names of each `build.json` entry's `nvcc_flags`
+(`CAKE_PROGRAM_KERNEL`, `CAKE_BIND_SMEM`, `CAKE_BIND_THREADS`,
+`CAKE_BIND_CLUSTER`, `CAKE_BIND_KM`, `CAKE_BIND_WRITE_IDX`); a missing
+selector is a compile error.  `MODULES_ROWS`, `ARG_PLANS`, `KERNELS` and
+`ROUTES` of `cake_jit.py` (`MODULES` is the expansion of the rows over the
+plans) and `build.json` (the sources, digests and flags of every entry) are
+receipt-bound exporter output: do not edit by hand.  The shared sources, the
+five launch bindings, the `-D` selectors and the tabular registry are a hand
+fold of the exported literals pending exporter regeneration.

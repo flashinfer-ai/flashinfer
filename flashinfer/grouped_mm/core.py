@@ -18,11 +18,16 @@ from typing import Optional
 
 import torch
 
-from ..api_logging import flashinfer_api
-from ..utils import backend_requirement, supported_compute_capability
+from ..api_logging import flashinfer_api, warn_experimental_backend_once
+from ..utils import (
+    backend_requirement,
+    get_compute_capability,
+    supported_compute_capability,
+)
 from .cudnn import (
     _CUDNN_MOE_MIN_VERSION,
     _check_cudnn_version,
+    _cudnn_moe_block_scale_min_version,
     _run_cudnn_moe_block_scale_grouped_gemm_fp4,
     _run_cudnn_moe_block_scale_grouped_gemm_mxfp8,
     _run_cudnn_moe_grouped_gemm,
@@ -114,7 +119,7 @@ def grouped_mm_bf16(
         Output data type.  ``torch.bfloat16`` (default) or ``torch.float16``, ``torch.float32``.
     backend : str
         Backend selector.  ``"cudnn"`` (default), or the experimental
-        ``"cake"`` backend (:mod:`flashinfer.experimental.cake_moe_grouped_gemm`,
+        ``"cake"`` backend (:mod:`flashinfer.experimental.cake_moe_grouped_det_gemm`,
         SM100 / SM103 / SM107): generated ragged BF16 programs that read
         ``m_indptr`` on the device, need no padding, produce bfloat16 outputs
         only and require ``n % 256 == 0`` and ``k % 64 == 0``.  Naming it is the
@@ -140,11 +145,12 @@ def grouped_mm_bf16(
     >>> out_cake = flashinfer.grouped_mm.grouped_mm_bf16(a, b, m_indptr, backend="cake")
     """
     if backend == "cake":
-        from ..experimental.cake_moe_grouped_gemm.cake_backend import (
-            grouped_mm_bf16_cake,
+        warn_experimental_backend_once("grouped_mm_bf16", "cake")
+        from ..experimental.cake_moe_grouped_det_gemm.cake_backend import (
+            grouped_det_mm_bf16_cake,
         )
 
-        return grouped_mm_bf16_cake(
+        return grouped_det_mm_bf16_cake(
             a, b, m_indptr, out=out, out_dtype=out_dtype, tactic=tactic
         )
 
@@ -165,7 +171,7 @@ def grouped_mm_bf16(
 # =========================================================================
 
 
-@supported_compute_capability([89, 90, 100, 103, 110, 120, 121])
+@supported_compute_capability([89, 90, 100, 103, 107, 110, 120, 121])
 def _check_grouped_mm_fp8(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -299,7 +305,7 @@ def grouped_mm_fp8(
 # =========================================================================
 
 
-@supported_compute_capability([100, 103, 110, 120, 121])
+@supported_compute_capability([100, 103, 107, 110, 120, 121])
 def _check_grouped_mm_mxfp8(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -420,7 +426,10 @@ def grouped_mm_mxfp8(
         out_dtype = out.dtype
 
     if backend == "cudnn":
-        _check_cudnn_version(_CUDNN_MOE_MIN_VERSION, "grouped_mm_mxfp8")
+        major, minor = get_compute_capability(a.device)
+        _check_cudnn_version(
+            _cudnn_moe_block_scale_min_version(major * 10 + minor), "grouped_mm_mxfp8"
+        )
         return _run_cudnn_moe_block_scale_grouped_gemm_mxfp8(
             a,
             b,
@@ -440,7 +449,7 @@ def grouped_mm_mxfp8(
 # =========================================================================
 
 
-@supported_compute_capability([100, 103, 110, 120, 121])
+@supported_compute_capability([100, 103, 107, 110, 120, 121])
 def _check_grouped_mm_fp4(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -588,7 +597,10 @@ def grouped_mm_fp4(
         out_dtype = out.dtype
 
     if backend == "cudnn":
-        _check_cudnn_version(_CUDNN_MOE_MIN_VERSION, "grouped_mm_fp4")
+        major, minor = get_compute_capability(a.device)
+        _check_cudnn_version(
+            _cudnn_moe_block_scale_min_version(major * 10 + minor), "grouped_mm_fp4"
+        )
         return _run_cudnn_moe_block_scale_grouped_gemm_fp4(
             a,
             b,

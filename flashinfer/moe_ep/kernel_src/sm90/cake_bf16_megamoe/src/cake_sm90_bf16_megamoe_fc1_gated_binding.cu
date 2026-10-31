@@ -28,7 +28,7 @@
 extern "C" __global__ void kernel_cake_sm90_bf16_megamoe_fc1_gated(unsigned int num_experts, unsigned int shape_n, unsigned int shape_k, float clamp_limit, const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap W, long long* __restrict__ offsets, __nv_bfloat16* __restrict__ D);
 
 
-namespace cake_host_shim_ea0f2b6888e54d87 {
+namespace cake_host_shim_eb8949ca791e3b41 {
 
 using tvm::ffi::TensorView;
 
@@ -141,10 +141,17 @@ inline CUtensorMap EncodeTma_W(const TensorView& t) {
   return tm;
 }
 
-void Run(int64_t arg_num_experts, int64_t arg_shape_n, int64_t arg_shape_k, double arg_clamp_limit, TensorView arg_A, TensorView arg_W, TensorView arg_offsets, TensorView arg_D, int64_t grid_x, int64_t grid_y, int64_t grid_z) {
+void Launch(int64_t arg_num_experts, int64_t arg_shape_n, int64_t arg_shape_k, double arg_clamp_limit, TensorView arg_A, TensorView arg_W, TensorView arg_offsets, TensorView arg_D, int64_t grid_x, int64_t grid_y, int64_t grid_z, bool use_pdl) {
   DLDevice dev = arg_A.device();
   tvm::ffi::CUDADeviceGuard device_guard(dev.device_id);
-  TVM_FFI_CHECK_CUDA_ERROR(cudaSetDevice(dev.device_id));  // binds the context for the encoders
+  {
+    // Bind the primary context for the tensor-map encoders once per thread and device.
+    static thread_local int encoder_context_device = -1;
+    if (encoder_context_device != dev.device_id) {
+      TVM_FFI_CHECK_CUDA_ERROR(cudaSetDevice(dev.device_id));
+      encoder_context_device = dev.device_id;
+    }
+  }
   TVM_FFI_CHECK(arg_num_experts >= 0LL && arg_num_experts <= 4294967295LL, ValueError)
       << "scalar 'num_experts' value " << arg_num_experts
       << " is outside u32 range [0, 4294967295]";
@@ -192,7 +199,7 @@ void Run(int64_t arg_num_experts, int64_t arg_shape_n, int64_t arg_shape_k, doub
   dim3 block(384u, 1u, 1u);
 
   // Extended direct-source launch for a linked CUDA kernel symbol.
-  cudaLaunchAttribute attrs[2]{};
+  cudaLaunchAttribute attrs[3]{};
   int n = 0;
   attrs[n].id = cudaLaunchAttributeClusterDimension;
   attrs[n].val.clusterDim.x = 2u;
@@ -202,6 +209,11 @@ void Run(int64_t arg_num_experts, int64_t arg_shape_n, int64_t arg_shape_k, doub
   attrs[n].id = cudaLaunchAttributeClusterSchedulingPolicyPreference;
   attrs[n].val.clusterSchedulingPolicyPreference = cudaClusterSchedulingPolicySpread;
   ++n;
+  if (use_pdl) {  // programmatic dependent launch behind the previous kernel of the round
+    attrs[n].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attrs[n].val.programmaticStreamSerializationAllowed = 1;
+    ++n;
+  }
   cudaLaunchConfig_t config{};
   config.gridDim = grid;
   config.blockDim = block;
@@ -216,6 +228,15 @@ void Run(int64_t arg_num_experts, int64_t arg_shape_n, int64_t arg_shape_k, doub
       << cudaGetErrorString(launch_status);
 }
 
-}  // namespace cake_host_shim_ea0f2b6888e54d87
+void Run(int64_t arg_num_experts, int64_t arg_shape_n, int64_t arg_shape_k, double arg_clamp_limit, TensorView arg_A, TensorView arg_W, TensorView arg_offsets, TensorView arg_D, int64_t grid_x, int64_t grid_y, int64_t grid_z) {
+  Launch(arg_num_experts, arg_shape_n, arg_shape_k, arg_clamp_limit, arg_A, arg_W, arg_offsets, arg_D, grid_x, grid_y, grid_z, false);
+}
 
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, cake_host_shim_ea0f2b6888e54d87::Run);
+void RunPdl(int64_t arg_num_experts, int64_t arg_shape_n, int64_t arg_shape_k, double arg_clamp_limit, TensorView arg_A, TensorView arg_W, TensorView arg_offsets, TensorView arg_D, int64_t grid_x, int64_t grid_y, int64_t grid_z) {
+  Launch(arg_num_experts, arg_shape_n, arg_shape_k, arg_clamp_limit, arg_A, arg_W, arg_offsets, arg_D, grid_x, grid_y, grid_z, true);
+}
+
+}  // namespace cake_host_shim_eb8949ca791e3b41
+
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, cake_host_shim_eb8949ca791e3b41::Run);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(run_pdl, cake_host_shim_eb8949ca791e3b41::RunPdl);

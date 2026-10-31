@@ -24,6 +24,8 @@ from typing import Optional, Sequence, Tuple
 
 import torch
 
+from flashinfer.moe_ep._compat import deprecated_aliases
+
 Mxfp8BlockSize = 32
 Nvfp4BlockSize = 16
 GateUpInterleave = 16  # fixed by the swap-AB gated-act epilogue (gate/up stripe)
@@ -489,6 +491,26 @@ def _quantize_fc2_wire(
     return quantize_mxfp8_block32(act, data_dtype)
 
 
+def round_trip_combine(tensor: torch.Tensor, combine_dtype: str) -> torch.Tensor:
+    """Emulate FC2 return quantization and dequantization before top-k reduction."""
+    value = tensor.to(torch.bfloat16).float()
+    if combine_dtype == "bf16":
+        return value
+    if combine_dtype == "nvfp4":
+        blocks = value.reshape(*value.shape[:-1], -1, 16)
+        # The wire stores BF16 amax, unlike the E4M3 scales used by NVFP4 weights.
+        amax = blocks.abs().amax(dim=-1)
+        scale = amax * (1.0 / 6.0)
+        encoded = blocks * torch.where(scale > 0, scale.reciprocal(), 0).unsqueeze(-1)
+        packed = pack_f32_to_fp4(encoded.reshape(value.shape))
+        return unpack_fp4_to_f32(packed) * scale.repeat_interleave(16, dim=-1)
+    if combine_dtype == "mxfp8":
+        data, sf = quantize_mxfp8_block32(value, torch.float8_e4m3fn)
+        return data.float() * scale_to_f32(sf).repeat_interleave(32, dim=-1)
+    raise ValueError(f"unsupported combine_dtype {combine_dtype!r}")
+
+
+@deprecated_aliases(apply_topk_at_fc1="apply_routing_weights_before_fc2")
 def compute_megamoe_reference_sm107_block_scaled(
     x_data: torch.Tensor,
     x_sf: torch.Tensor,
@@ -502,9 +524,10 @@ def compute_megamoe_reference_sm107_block_scaled(
     quant_kind: str,
     local_expert_offset: int,
     gate_up_clamp: Optional[float],
-    apply_topk_at_fc1: bool,
+    apply_routing_weights_before_fc2: bool,
     num_tokens: Optional[int] = None,
     weight_scales_are_swizzled: bool = False,
+    combine_dtype: str = "bf16",
     return_fp32: bool = False,
     situ_beta: Optional[float] = None,
     situ_linear_beta: Optional[float] = None,
@@ -563,7 +586,7 @@ def compute_megamoe_reference_sm107_block_scaled(
             act = (up * gate).reshape(-1, intermediate)
         else:
             act = (up * (gate * torch.sigmoid(gate))).reshape(-1, intermediate)
-        if apply_topk_at_fc1:
+        if apply_routing_weights_before_fc2:
             act = act * topk_weights[src_t, src_k].to(torch.float32).unsqueeze(-1)
         # In-kernel FC2-input requantization (the FC1->FC2 wire format).
         norm_const = 1.0 if fc1_norm_const is None else fc1_norm_const[local_e]
@@ -578,8 +601,8 @@ def compute_megamoe_reference_sm107_block_scaled(
         term = act @ w2.transpose(0, 1)
         if fc2_alpha is not None:
             term = term * fc2_alpha[local_e]
-        term = term.to(torch.bfloat16).to(torch.float32)
-        if not apply_topk_at_fc1:
+        term = round_trip_combine(term, combine_dtype)
+        if not apply_routing_weights_before_fc2:
             term = term * topk_weights[src_t, src_k].to(torch.float32).unsqueeze(-1)
         output.index_add_(0, src_t, term)
 
@@ -603,6 +626,7 @@ __all__ = [
     "quantize_mxfp8_block32",
     "quantize_nvfp4_block16",
     "round_up",
+    "round_trip_combine",
     "scale_to_f32",
     "swizzled_flat_sf_size",
     "to_blocked",

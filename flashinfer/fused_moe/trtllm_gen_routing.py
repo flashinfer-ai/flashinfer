@@ -33,7 +33,7 @@ from flashinfer.utils import (
 
 # The trtllm_gen_routing module is compiled for SM 10.x and 12.x only (same
 # gate as the fused_moe_trtllm_sm100 module the routing kernels ship in).
-_TRTLLM_GEN_ROUTING_SUPPORTED_CC = [100, 103, 120, 121]
+_TRTLLM_GEN_ROUTING_SUPPORTED_CC = [100, 103, 107, 120, 121]
 
 
 def _max_num_ctas_in_batch_dim(

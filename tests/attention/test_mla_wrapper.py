@@ -7,23 +7,29 @@ you may not use this file except in compliance with the License.
 
 import gc
 import math
+import os
+from pathlib import Path
+import subprocess
+import sys
 import warnings
 import weakref
 
 import pytest
 import torch
 
+import flashinfer
 from flashinfer.mla._batch_mla import _wrapper
 from flashinfer.mla._batch_mla._backends._capabilities import (
     MLAPlanCapabilities,
     _BackendPlanUnsupportedError,
 )
+from flashinfer.utils import is_sm90a_supported
 
 
 COMMON_PLAN_KWARGS = dict(
     num_heads=16,
-    head_dim_ckv=4,
-    head_dim_kpe=2,
+    head_dim_ckv=8,
+    head_dim_kpe=8,
     page_size=1,
     causal=False,
     sm_scale=0.125,
@@ -127,7 +133,7 @@ def test_batch_mla_module_proxy_rejects_invalid_workspace_prefix(
 
 def _minimal_uninitialized_wrapper(wrapper_cls, *, use_cuda_graph=False):
     wrapper = wrapper_cls.__new__(wrapper_cls)
-    wrapper._float_workspace_buffer = torch.empty(16, dtype=torch.uint8)
+    wrapper._float_workspace_buffer = torch.empty(256 * 1024, dtype=torch.uint8)
     wrapper._int_workspace_buffer = torch.empty(16, dtype=torch.uint8)
     wrapper._pin_memory_int_workspace_buffer = torch.empty(16, dtype=torch.uint8)
     wrapper._use_cuda_graph = use_cuda_graph
@@ -155,7 +161,7 @@ def _patch_fake_fa_module(monkeypatch, fake_module):
 
     import flashinfer.mla._batch_mla._backends._fa_common as fa_common
 
-    # These tests model the native planner with tiny 4/2-dimensional CPU tensors.
+    # These tests model the native planner with tiny 8/8-dimensional CPU tensors.
     # Keep metadata/transaction behavior real; mock the native support boundary
     # alongside the native implementation. Native support has separate tests.
     for module in (fa_common, fa2_backend, fa3_backend):
@@ -163,6 +169,8 @@ def _patch_fake_fa_module(monkeypatch, fake_module):
             module, "_validate_generated_fa_plan", lambda **kwargs: None
         )
     monkeypatch.setattr(fa_common, "_validate_fa_plan_workload", lambda *args: None)
+    # Model one SM while keeping the real workspace-capacity check enabled.
+    monkeypatch.setattr(fa_common, "get_device_sm_count", lambda device: 1)
     monkeypatch.setattr(fa2_backend, "get_batch_mla_module", lambda *args: fake_module)
     monkeypatch.setattr(fa3_backend, "get_batch_mla_module", lambda *args: fake_module)
 
@@ -361,10 +369,10 @@ def test_legacy_flat_plan_temporarily_keeps_dynamic_lse(monkeypatch):
     with pytest.warns(DeprecationWarning):
         wrapper.plan(*csr, **COMMON_PLAN_KWARGS)
 
-    q_nope = torch.empty(2, 16, 4, dtype=torch.bfloat16)
-    q_pe = torch.empty(2, 16, 2, dtype=torch.bfloat16)
-    ckv_cache = torch.empty(2, 1, 4, dtype=torch.bfloat16)
-    kpe_cache = torch.empty(2, 1, 2, dtype=torch.bfloat16)
+    q_nope = torch.empty(2, 16, 8, dtype=torch.bfloat16)
+    q_pe = torch.empty(2, 16, 8, dtype=torch.bfloat16)
+    ckv_cache = torch.empty(9, 1, 8, dtype=torch.bfloat16)
+    kpe_cache = torch.empty(9, 1, 8, dtype=torch.bfloat16)
     with warnings.catch_warnings(record=True) as recorded:
         warnings.simplefilter("always")
         _, lse_base2 = wrapper.run(q_nope, q_pe, ckv_cache, kpe_cache, return_lse=True)
@@ -448,10 +456,9 @@ def test_positional_run_arguments_warn_once_per_wrapper(monkeypatch):
     _patch_fake_fa_module(monkeypatch, _FakeBatchMLAModule())
     wrapper = _minimal_uninitialized_wrapper(mla.BatchMLAPagedAttentionWrapper)
     wrapper.plan(metadata=_dense_metadata(), **COMMON_PLAN_KWARGS)
-    query = torch.empty(2, 16, 6, dtype=torch.bfloat16)
-    kv_cache = torch.empty(2, 1, 6, dtype=torch.bfloat16)
-    q_nope, q_pe = query.split((4, 2), dim=-1)
-    ckv_cache, kpe_cache = kv_cache.split((4, 2), dim=-1)
+    query, kv_cache = _packed_inputs()
+    q_nope, q_pe = query.split((8, 8), dim=-1)
+    ckv_cache, kpe_cache = kv_cache.split((8, 8), dim=-1)
 
     with warnings.catch_warnings(record=True) as recorded:
         warnings.simplefilter("always")
@@ -480,10 +487,9 @@ def test_legacy_run_tensor_keywords_warn_once_at_caller(monkeypatch):
     _patch_fake_fa_module(monkeypatch, _FakeBatchMLAModule())
     wrapper = _minimal_uninitialized_wrapper(mla.BatchMLAPagedAttentionWrapper)
     wrapper.plan(metadata=_dense_metadata(), **COMMON_PLAN_KWARGS)
-    query = torch.empty(2, 16, 6, dtype=torch.bfloat16)
-    kv_cache = torch.empty(2, 1, 6, dtype=torch.bfloat16)
-    q_nope, q_pe = query.split((4, 2), dim=-1)
-    ckv_cache, kpe_cache = kv_cache.split((4, 2), dim=-1)
+    query, kv_cache = _packed_inputs()
+    q_nope, q_pe = query.split((8, 8), dim=-1)
+    ckv_cache, kpe_cache = kv_cache.split((8, 8), dim=-1)
 
     with warnings.catch_warnings(record=True) as recorded:
         warnings.simplefilter("always")
@@ -525,10 +531,9 @@ def test_each_legacy_run_tensor_group_warns(monkeypatch, legacy_group):
         kv_cache_layout="split",
         **COMMON_PLAN_KWARGS,
     )
-    query = torch.empty(2, 16, 6, dtype=torch.bfloat16)
-    kv_cache = torch.empty(2, 1, 6, dtype=torch.bfloat16)
-    q_nope, q_pe = query.split((4, 2), dim=-1)
-    ckv_cache, kpe_cache = kv_cache.split((4, 2), dim=-1)
+    query, kv_cache = _packed_inputs()
+    q_nope, q_pe = query.split((8, 8), dim=-1)
+    ckv_cache, kpe_cache = kv_cache.split((8, 8), dim=-1)
     run_kwargs = {"query": query, "kv_cache": kv_cache}
     if legacy_group == "query":
         run_kwargs.pop("query")
@@ -561,10 +566,9 @@ def test_legacy_run_tensor_groups_share_one_warning_per_wrapper(monkeypatch):
         kv_cache_layout="split",
         **COMMON_PLAN_KWARGS,
     )
-    query = torch.empty(2, 16, 6, dtype=torch.bfloat16)
-    kv_cache = torch.empty(2, 1, 6, dtype=torch.bfloat16)
-    q_nope, q_pe = query.split((4, 2), dim=-1)
-    ckv_cache, kpe_cache = kv_cache.split((4, 2), dim=-1)
+    query, kv_cache = _packed_inputs()
+    q_nope, q_pe = query.split((8, 8), dim=-1)
+    ckv_cache, kpe_cache = kv_cache.split((8, 8), dim=-1)
 
     with warnings.catch_warnings(record=True) as recorded:
         warnings.simplefilter("always")
@@ -591,14 +595,13 @@ def test_structural_split_run_does_not_warn_for_legacy_tensor_arguments(monkeypa
         kv_cache_layout="split",
         **COMMON_PLAN_KWARGS,
     )
-    query = torch.empty(2, 16, 6, dtype=torch.bfloat16)
-    kv_cache = torch.empty(2, 1, 6, dtype=torch.bfloat16)
+    query, kv_cache = _packed_inputs()
 
     with warnings.catch_warnings(record=True) as recorded:
         warnings.simplefilter("always")
         wrapper.run(
-            query=query.split((4, 2), dim=-1),
-            kv_cache=kv_cache.split((4, 2), dim=-1),
+            query=query.split((8, 8), dim=-1),
+            kv_cache=kv_cache.split((8, 8), dim=-1),
         )
 
     assert not any(
@@ -638,7 +641,7 @@ def test_plan_rejects_surplus_and_duplicate_legacy_arguments(monkeypatch):
         torch.tensor([0], dtype=torch.int32),
         torch.tensor([1], dtype=torch.int32),
     )
-    tail = (16, 4, 2, 1, False, 0.125, torch.bfloat16, torch.bfloat16, False)
+    tail = (16, 8, 8, 1, False, 0.125, torch.bfloat16, torch.bfloat16, False)
 
     with pytest.raises(TypeError):
         wrapper.plan(*csr, *tail, "surplus")
@@ -736,7 +739,9 @@ def test_failed_backend_replan_keeps_previous_runnable_backend(
         wrapper, kernel = _planned_cutile_wrapper(monkeypatch)
         plan_kwargs = _cutile_contract_plan_kwargs()
         query, cache = _cutile_contract_inputs()
-        monkeypatch.setattr(cutile_backend, "get_cutile_mla_decode", lambda: fail_plan)
+        monkeypatch.setattr(
+            cutile_backend, "get_cutile_mla_decode", lambda device: fail_plan
+        )
         old_indices = None
     else:
         kernel = _FakeBatchMLAModule()
@@ -750,12 +755,12 @@ def test_failed_backend_replan_keeps_previous_runnable_backend(
         )
         wrapper.plan(**plan_kwargs)
         query = (
-            torch.zeros(2, 16, 4, dtype=torch.bfloat16),
-            torch.zeros(2, 16, 2, dtype=torch.bfloat16),
+            torch.zeros(2, 16, 8, dtype=torch.bfloat16),
+            torch.zeros(2, 16, 8, dtype=torch.bfloat16),
         )
         cache = (
-            torch.zeros(9, 1, 4, dtype=torch.bfloat16),
-            torch.zeros(9, 1, 2, dtype=torch.bfloat16),
+            torch.zeros(9, 1, 8, dtype=torch.bfloat16),
+            torch.zeros(9, 1, 8, dtype=torch.bfloat16),
         )
         old_indices = wrapper._kv_indices_buf.clone()
         failing = _FakeBatchMLAModule()
@@ -881,8 +886,7 @@ def test_run_rejects_planned_value_contract_mismatch(
     _patch_fake_fa_module(monkeypatch, fake_module)
     wrapper = _minimal_uninitialized_wrapper(mla.BatchMLAPagedAttentionWrapper)
     wrapper.plan(metadata=_dense_metadata(), **COMMON_PLAN_KWARGS, **plan_kwargs)
-    query = torch.empty(2, 16, 6, dtype=torch.bfloat16)
-    kv_cache = torch.empty(2, 1, 6, dtype=torch.bfloat16)
+    query, kv_cache = _packed_inputs()
 
     with pytest.raises(ValueError, match=match):
         wrapper.run(query=query, kv_cache=kv_cache, **run_kwargs)
@@ -895,9 +899,8 @@ def test_run_returns_caller_owned_output_and_lse_by_identity(monkeypatch):
     _patch_fake_fa_module(monkeypatch, fake_module)
     wrapper = _minimal_uninitialized_wrapper(mla.BatchMLAPagedAttentionWrapper)
     wrapper.plan(metadata=_dense_metadata(), lse_mode="base2", **COMMON_PLAN_KWARGS)
-    query = torch.empty(2, 16, 6, dtype=torch.bfloat16)
-    kv_cache = torch.empty(2, 1, 6, dtype=torch.bfloat16)
-    out = torch.empty(2, 16, 4, dtype=torch.bfloat16)
+    query, kv_cache = _packed_inputs()
+    out = torch.empty(2, 16, 8, dtype=torch.bfloat16)
     lse = torch.empty(2, 16, dtype=torch.float32)
 
     actual_out, actual_lse = wrapper.run(
@@ -906,6 +909,22 @@ def test_run_returns_caller_owned_output_and_lse_by_identity(monkeypatch):
 
     assert actual_out is out
     assert actual_lse is lse
+
+
+def test_explicit_fa2_run_does_not_prepare_tuning_inputs(monkeypatch):
+    import flashinfer.mla as mla
+
+    _patch_fake_fa_module(monkeypatch, _FakeBatchMLAModule())
+    wrapper = _minimal_uninitialized_wrapper(mla.BatchMLAPagedAttentionWrapper)
+    wrapper.plan(metadata=_dense_metadata(), **COMMON_PLAN_KWARGS)
+    query, kv_cache = _packed_inputs()
+    monkeypatch.setattr(
+        wrapper._planned_backend,
+        "_prepare_planned_inputs",
+        lambda *args: pytest.fail("eager run must not prepare tuning inputs"),
+    )
+    out = torch.empty(2, 16, 8, dtype=torch.bfloat16)
+    assert wrapper.run(query=query, kv_cache=kv_cache, out=out) is out
 
 
 def _cutlass_plan_kwargs(page_size=64):
@@ -1141,21 +1160,58 @@ def test_batch_mla_wrapper_public_imports_remain_compatible():
     assert hasattr(mla, "MLAPlanMetadata")
 
 
+def test_batch_mla_wrapper_imports_without_cute_dsl():
+    """Registering the Rubin backend must not require the optional DSL."""
+    env = os.environ.copy()
+    env["PYTHONPATH"] = os.pathsep.join(
+        filter(None, (str(Path(__file__).parents[2]), env.get("PYTHONPATH")))
+    )
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            """
+import importlib.util
+import sys
+
+sys.modules["cutlass"] = None
+assert importlib.util.find_spec("cutlass") is None
+
+import flashinfer
+from flashinfer.mla import BatchMLAPagedAttentionWrapper
+from flashinfer.cute_dsl.availability import is_cute_dsl_available
+
+assert flashinfer.BatchMLAPagedAttentionWrapper is BatchMLAPagedAttentionWrapper
+assert not is_cute_dsl_available()
+assert "flashinfer.cute_dsl.attention" not in sys.modules
+""",
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 # Structural wrapper inputs and plan/run contracts
 
 
 def _packed_inputs():
-    query = torch.empty(2, COMMON_PLAN_KWARGS["num_heads"], 6, dtype=torch.bfloat16)
-    kv_cache = torch.empty(2, COMMON_PLAN_KWARGS["page_size"], 6, dtype=torch.bfloat16)
+    width = COMMON_PLAN_KWARGS["head_dim_ckv"] + COMMON_PLAN_KWARGS["head_dim_kpe"]
+    query = torch.empty(2, COMMON_PLAN_KWARGS["num_heads"], width, dtype=torch.bfloat16)
+    kv_cache = torch.empty(
+        9, COMMON_PLAN_KWARGS["page_size"], width, dtype=torch.bfloat16
+    )
     return query, kv_cache
 
 
 def _independent_split_inputs():
-    q_nope = torch.empty(2, COMMON_PLAN_KWARGS["num_heads"], 4, dtype=torch.bfloat16)
-    q_pe = torch.empty(2, COMMON_PLAN_KWARGS["num_heads"], 2, dtype=torch.bfloat16)
-    ckv_cache = torch.empty(2, COMMON_PLAN_KWARGS["page_size"], 4, dtype=torch.bfloat16)
-    kpe_cache = torch.empty(2, COMMON_PLAN_KWARGS["page_size"], 2, dtype=torch.bfloat16)
-    return (q_nope, q_pe), (ckv_cache, kpe_cache)
+    widths = (COMMON_PLAN_KWARGS["head_dim_ckv"], COMMON_PLAN_KWARGS["head_dim_kpe"])
+    return tuple(
+        tuple(part.contiguous() for part in tensor.split(widths, dim=-1))
+        for tensor in _packed_inputs()
+    )
 
 
 def test_packed_plan_rejects_independent_split_without_copy(monkeypatch):
@@ -1196,13 +1252,13 @@ def test_packed_plan_accepts_adjacent_split_views(monkeypatch):
     query, kv_cache = _packed_inputs()
 
     out = wrapper.run(
-        query=(query[..., :4], query[..., 4:]),
-        kv_cache=(kv_cache[..., :4], kv_cache[..., 4:]),
+        query=(query[..., :8], query[..., 8:]),
+        kv_cache=(kv_cache[..., :8], kv_cache[..., 8:]),
     )
 
-    assert out.shape == query[..., :4].shape
-    assert fake_module.run_args[3].data_ptr() == query[..., :4].data_ptr()
-    assert fake_module.run_args[4].data_ptr() == query[..., 4:].data_ptr()
+    assert out.shape == query[..., :8].shape
+    assert fake_module.run_args[3].data_ptr() == query[..., :8].data_ptr()
+    assert fake_module.run_args[4].data_ptr() == query[..., 8:].data_ptr()
 
 
 def test_packed_plan_accepts_independent_zero_width_split_without_copy(monkeypatch):
@@ -1217,10 +1273,10 @@ def test_packed_plan_accepts_independent_zero_width_split_without_copy(monkeypat
         kv_cache_layout="packed",
         **{**COMMON_PLAN_KWARGS, "head_dim_kpe": 0},
     )
-    q_nope = torch.empty(2, 16, 4, dtype=torch.bfloat16)
+    q_nope = torch.empty(2, 16, 8, dtype=torch.bfloat16)
     q_pe = torch.empty(2, 16, 0, dtype=torch.bfloat16)
-    ckv_cache = torch.empty(2, 1, 4, dtype=torch.bfloat16)
-    kpe_cache = torch.empty(2, 1, 0, dtype=torch.bfloat16)
+    ckv_cache = torch.empty(9, 1, 8, dtype=torch.bfloat16)
+    kpe_cache = torch.empty(9, 1, 0, dtype=torch.bfloat16)
 
     out = wrapper.run(
         query=(q_nope, q_pe),
@@ -1292,6 +1348,7 @@ def test_structural_parser_rejects_malformed_tuple_grammar(value, match):
         ("rank", "rank 3"),
         ("leading_shape", "shapes must match"),
         ("dtype", "dtypes must match"),
+        ("device", "devices must match"),
         ("width", "last dimensions"),
     ],
 )
@@ -1306,6 +1363,8 @@ def test_split_structural_inputs_are_validated(mutation, match):
         right = torch.empty(1, 3, 2, dtype=torch.bfloat16)
     elif mutation == "dtype":
         right = right.float()
+    elif mutation == "device":
+        right = torch.empty_like(right, device="meta")
     elif mutation == "width":
         right = torch.empty(2, 3, 3, dtype=torch.bfloat16)
 
@@ -2144,8 +2203,10 @@ def _skip_if_planned_backend_runtime_is_unavailable(backend):
             pytest.skip("xqa planned MLA requires a supported SM12x/CUDA configuration")
         return
 
-    if capability not in ((10, 0), (10, 3)):
-        pytest.skip(f"{backend} planned MLA requires SM100/SM103, got {capability}")
+    if capability not in ((10, 0), (10, 3), (10, 7)):
+        pytest.skip(
+            f"{backend} planned MLA requires SM100/SM103/SM107, got {capability}"
+        )
     if backend == "cutile":
         pytest.importorskip("cuda.tile.compilation")
         from flashinfer.cutile.cutile_common import is_cuda_tile_available
@@ -2734,8 +2795,11 @@ def test_cute_dsl_alias_does_not_hide_planning_errors(monkeypatch, error_type, m
 
 @pytest.fixture
 def cutile_sm100():
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 0):
-        pytest.skip("prepared cuTile acceptance requires SM100")
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in (
+        (10, 0),
+        (10, 7),
+    ):
+        pytest.skip("prepared cuTile acceptance requires SM100/SM107")
     pytest.importorskip("cuda.tile.compilation")
     from flashinfer.cutile.cutile_common import is_cuda_tile_available
 
@@ -2819,7 +2883,7 @@ def _cutile_reference(query, cache, lengths, table, scale=None):
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("heads", [64, 128])
+@pytest.mark.parametrize("heads", [64, 128, 192])
 @pytest.mark.parametrize("page", [1, 2])
 def test_cutile_small_page_large_batch_numerics(cutile_sm100, dtype, heads, page):
     """Small key tiles must remain correct with the large-batch launch policy."""
@@ -2949,7 +3013,7 @@ def _patch_fake_cutile_kernel(monkeypatch, kernel):
         cutile_backend, "_get_compute_capability", lambda device: (10, 0)
     )
     monkeypatch.setattr(
-        cutile_backend, "get_cutile_mla_decode", lambda: lambda **kwargs: kernel
+        cutile_backend, "get_cutile_mla_decode", lambda device: lambda **kwargs: kernel
     )
 
 
@@ -3008,6 +3072,71 @@ def _planned_cutile_wrapper(monkeypatch, *, use_cuda_graph=False, metadata=None)
     return wrapper, kernel
 
 
+@pytest.mark.parametrize("planned_supported", [False, True])
+def test_cutile_availability_uses_planned_device(monkeypatch, planned_supported):
+    import importlib.metadata
+
+    from flashinfer.cutile import cutile_common
+    from flashinfer.mla import BatchMLAPagedAttentionWrapper
+    from flashinfer.mla._batch_mla._backends import cutile_backend, _cutile_prepared
+
+    # Model a mixed-GPU process without launching kernels. CPU storage represents
+    # the planned device; the implicit current device has the opposite support.
+    target = torch.device("cpu")
+    current = [100]
+    original_version = importlib.metadata.version
+    monkeypatch.setattr(
+        importlib.metadata,
+        "version",
+        lambda name: "1.4.0" if name == "cuda-tile" else original_version(name),
+    )
+    original_find_spec = cutile_common.importlib.util.find_spec
+    monkeypatch.setattr(
+        cutile_common.importlib.util,
+        "find_spec",
+        lambda name: object() if name == "cuda.tile.tune" else original_find_spec(name),
+    )
+    monkeypatch.setattr(cutile_common, "_find_tileiras_binary", lambda: "tileiras")
+    monkeypatch.setattr(
+        cutile_common, "_tileiras_supports_arch", lambda _, arch: arch == "sm_100"
+    )
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_capability",
+        lambda device=None: (
+            (10, (0 if planned_supported else 7))
+            if device == target
+            else (10, current[0] - 100)
+        ),
+    )
+    monkeypatch.setattr(cutile_backend, "_get_compute_capability", lambda _: (10, 7))
+    kernel = _FakeCutileKernel()
+    monkeypatch.setattr(
+        _cutile_prepared, "prepare_cutile_mla_decode", lambda **kwargs: kernel
+    )
+    cutile_backend.get_cutile_mla_decode.cache_clear()
+    try:
+        # A successful lookup on another device must not approve this target.
+        cutile_backend.get_cutile_mla_decode(torch.device("cuda:0"))
+        if planned_supported:
+            cutile_backend.get_cutile_mla_decode.cache_clear()
+            current[0] = 107
+        wrapper = BatchMLAPagedAttentionWrapper(
+            torch.empty(1024, dtype=torch.uint8), backend="cutile"
+        )
+        if planned_supported:
+            wrapper.plan(**_cutile_contract_plan_kwargs())
+            query, kv_cache = _cutile_contract_inputs()
+            wrapper.run(query=query, kv_cache=kv_cache)
+            assert len(kernel.calls) == 1
+        else:
+            with pytest.raises(_BackendPlanUnsupportedError, match="compiler"):
+                wrapper.plan(**_cutile_contract_plan_kwargs())
+    finally:
+        cutile_backend.get_cutile_mla_decode.cache_clear()
+
+
 def test_cutile_lazy_kernel_lookup_and_retained_dense_metadata(monkeypatch):
     from flashinfer.mla import BatchMLAPagedAttentionWrapper
 
@@ -3020,8 +3149,8 @@ def test_cutile_lazy_kernel_lookup_and_retained_dense_metadata(monkeypatch):
         cutile_backend, "_get_compute_capability", lambda device: (10, 0)
     )
 
-    def get_kernel():
-        getter_calls.append(None)
+    def get_kernel(device):
+        getter_calls.append(device)
         return lambda **kwargs: kernel
 
     monkeypatch.setattr(cutile_backend, "get_cutile_mla_decode", get_kernel)
@@ -3033,14 +3162,14 @@ def test_cutile_lazy_kernel_lookup_and_retained_dense_metadata(monkeypatch):
     assert getter_calls == []
 
     wrapper.plan(**_cutile_contract_plan_kwargs(metadata))
-    assert getter_calls == [None]
+    assert getter_calls == [wrapper.device]
 
     query, kv_cache = _cutile_contract_inputs()
     out = torch.empty_like(query[0])
     actual = wrapper.run(query=query, kv_cache=kv_cache, out=out)
 
     assert actual is out
-    assert getter_calls == [None]
+    assert getter_calls == [wrapper.device]
     assert len(kernel.calls) == 1
     call = kernel.calls[0]
     assert call["q_nope"] is query[0]
@@ -3182,7 +3311,7 @@ def test_cutile_plan_rejects_unsupported_contracts(monkeypatch, plan_overrides):
         lambda device: (10, 0),
     )
 
-    def unexpected_preparation():
+    def unexpected_preparation(device):
         pytest.fail("unsupported cuTile plan attempted native preparation")
 
     monkeypatch.setattr(
@@ -3217,7 +3346,7 @@ def test_cutile_rejects_unsupported_head_counts(num_heads):
         _validate_cutile_num_heads(num_heads)
 
 
-@pytest.mark.parametrize("capability", [(10, 0), (10, 3), (12, 0), (12, 1)])
+@pytest.mark.parametrize("capability", [(10, 0), (10, 3), (10, 7), (12, 0), (12, 1)])
 def test_cutile_plan_accepts_supported_blackwell_architectures(monkeypatch, capability):
     from flashinfer.mla import BatchMLAPagedAttentionWrapper
     from flashinfer.mla._batch_mla._backends import cutile_backend
@@ -3227,7 +3356,7 @@ def test_cutile_plan_accepts_supported_blackwell_architectures(monkeypatch, capa
         cutile_backend, "_get_compute_capability", lambda device: capability
     )
     monkeypatch.setattr(
-        cutile_backend, "get_cutile_mla_decode", lambda: lambda **kwargs: kernel
+        cutile_backend, "get_cutile_mla_decode", lambda device: lambda **kwargs: kernel
     )
     wrapper = BatchMLAPagedAttentionWrapper(
         torch.empty(1024, dtype=torch.uint8), backend="cutile"
@@ -3248,7 +3377,7 @@ def test_cutile_plan_rejects_undemonstrated_architectures(monkeypatch, capabilit
         cutile_backend, "_get_compute_capability", lambda device: capability
     )
 
-    def unexpected_preparation():
+    def unexpected_preparation(device):
         pytest.fail("unsupported cuTile plan attempted native preparation")
 
     monkeypatch.setattr(
@@ -3361,7 +3490,7 @@ def _rollback_plan_args(*, graph=False, **overrides):
             "metadata": _dense_metadata(),
             "output_dtype": torch.bfloat16,
             "kv_layout": "combined",
-            "_float_workspace_buffer": torch.full((128,), 17, dtype=torch.uint8),
+            "_float_workspace_buffer": torch.full((256 * 1024,), 17, dtype=torch.uint8),
             "_use_cuda_graph": graph,
             "_qo_indptr_buf": torch.full((3,), -1, dtype=torch.int32),
             "_kv_indptr_buf": torch.full((3,), -1, dtype=torch.int32),
@@ -3598,3 +3727,221 @@ def test_wrapper_warns_once_after_successful_backend_plan(
                     {"automatic": backend == "auto"},
                 ),
             ]
+
+
+@pytest.mark.parametrize("head_dim_ckv", [128, 256], ids=["ckv128", "ckv256"])
+@pytest.mark.parametrize(
+    "dtype,head_dim_kpe,causal,max_kv_len",
+    [(torch.bfloat16, 64, False, 257), (torch.float16, 0, True, 129)],
+    ids=["bf16-multi-tile", "fp16-causal-no-pe"],
+)
+def test_mla_fa3_ckv_width(head_dim_ckv, dtype, head_dim_kpe, causal, max_kv_len):
+    # PV must advance its value descriptor by the actual row width. A fixed
+    # CKV512 stride silently corrupts CKV256 and reads out of bounds for CKV128.
+    device = torch.device("cuda:0")
+    if not is_sm90a_supported(device):
+        pytest.skip("fa3 backend requires SM90a")
+    torch.manual_seed(917)
+    num_heads, page_size = 16, 16
+    kv_lengths = [max_kv_len - 12, max_kv_len]
+    page_counts = [(n + page_size - 1) // page_size for n in kv_lengths]
+    query = (
+        torch.randn(
+            4, num_heads, head_dim_ckv + head_dim_kpe, device=device, dtype=dtype
+        )
+        * 0.5
+    )
+    kv = (
+        torch.randn(
+            sum(page_counts),
+            page_size,
+            head_dim_ckv + head_dim_kpe,
+            device=device,
+            dtype=dtype,
+        )
+        * 0.5
+    )
+    indices = torch.arange(sum(page_counts), device=device, dtype=torch.int32).flip(0)
+    kv_offsets = [0, page_counts[0], sum(page_counts)]
+    wrapper = flashinfer.mla.BatchMLAPagedAttentionWrapper(
+        torch.empty(128 * 1024**2, device=device, dtype=torch.uint8), backend="fa3"
+    )
+    wrapper.plan(
+        metadata=flashinfer.mla.MLAPlanMetadata.csr(
+            torch.tensor([0, 1, 4], device=device, dtype=torch.int32),
+            torch.tensor(kv_offsets, device=device, dtype=torch.int32),
+            indices,
+            torch.tensor(kv_lengths, device=device, dtype=torch.int32),
+        ),
+        num_heads=num_heads,
+        head_dim_ckv=head_dim_ckv,
+        head_dim_kpe=head_dim_kpe,
+        page_size=page_size,
+        causal=causal,
+        sm_scale=0.125,
+        q_data_type=dtype,
+        kv_data_type=dtype,
+        lse_mode="basee",
+        enable_pdl=False,
+    )
+    out, lse = wrapper.run(
+        query=query, kv_cache=kv, return_lse=True, return_lse_base_on_e=True
+    )
+    torch.cuda.synchronize()
+    for batch, (start, end) in enumerate(((0, 1), (1, 4))):
+        pages = indices[kv_offsets[batch] : kv_offsets[batch + 1]].long()
+        keys = (
+            kv[pages]
+            .reshape(-1, head_dim_ckv + head_dim_kpe)[: kv_lengths[batch]]
+            .float()
+        )
+        scores = torch.einsum("qhd,kd->qhk", query[start:end].float(), keys) * 0.125
+        if causal:
+            positions = (
+                torch.arange(end - start, device=device) + len(keys) - (end - start)
+            )
+            mask = torch.arange(len(keys), device=device)[None, :] > positions[:, None]
+            scores.masked_fill_(mask[:, None, :], -float("inf"))
+        expected = scores.softmax(-1) @ keys[:, :head_dim_ckv]
+        torch.testing.assert_close(
+            out[start:end].float(), expected, rtol=1e-2, atol=1e-2
+        )
+        torch.testing.assert_close(
+            lse[start:end], scores.logsumexp(-1), rtol=1e-2, atol=1e-2
+        )
+
+
+@pytest.mark.parametrize("backend", ["fa2", "fa3"])
+def test_mla_page_index_uint32_overflow_regression(backend):
+    # Regression for the int64 widening in mla.cuh / mla_hopper.cuh
+    # (`indices[q] * ckv_stride_page`). For a contiguous
+    # [num_pages, page_size, head_dim_ckv] cache with page_size=32 and
+    # head_dim_ckv=512, ckv_stride_page = 16384 elements. Any page index
+    # >= 2^32 / 16384 = 262144 makes the multiplication overflow uint32 and
+    # — pre-fix — silently wraps to the wrong page (no crash, wrong output).
+    device = torch.device("cuda:0")
+    if backend == "fa3" and not is_sm90a_supported(device):
+        pytest.skip("fa3 backend requires SM90a")
+
+    page_size, head_dim_ckv, head_dim_kpe, num_heads = 32, 512, 64, 128
+    # 262144 * (32 * 512) = 2^32 exactly — the smallest index that overflows.
+    OVERFLOW_START = 262144
+    NUM_PAGES = 26  # matches the 26-page decode scenario from the original repro
+    total_num_pages = OVERFLOW_START + NUM_PAGES  # 262170
+    kv_len = NUM_PAGES * page_size
+
+    # Big cache alone is ~9.66 GiB (bf16/fp16). Skip on small-memory runners.
+    if torch.cuda.mem_get_info(device)[0] < 12 * (1 << 30):
+        pytest.skip("needs ≥12 GiB free VRAM to force the 32-bit overflow")
+
+    torch.manual_seed(0)
+    torch.set_grad_enabled(False)
+    dtype = torch.float16
+    sm_scale = 1.0 / ((128 + 64) ** 0.5)
+
+    real_ckv = torch.randn(
+        NUM_PAGES, page_size, head_dim_ckv, device=device, dtype=dtype
+    )
+    real_kpe = torch.randn(
+        NUM_PAGES, page_size, head_dim_kpe, device=device, dtype=dtype
+    )
+    q_nope = torch.randn(1, num_heads, head_dim_ckv, device=device, dtype=dtype)
+    q_pe = torch.randn(1, num_heads, head_dim_kpe, device=device, dtype=dtype)
+    workspace = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device=device)
+
+    def _run(ckv_cache, kpe_cache, page_indices):
+        w = flashinfer.mla.BatchMLAPagedAttentionWrapper(workspace, backend=backend)
+        w.plan(
+            torch.tensor([0, 1], dtype=torch.int32, device=device),  # qo_indptr
+            torch.tensor([0, len(page_indices)], dtype=torch.int32, device=device),
+            page_indices,
+            torch.tensor([kv_len], dtype=torch.int32, device=device),
+            num_heads,
+            head_dim_ckv,
+            head_dim_kpe,
+            page_size,
+            False,
+            sm_scale,
+            dtype,
+            dtype,
+        )
+        return w.run(q_nope, q_pe, ckv_cache, kpe_cache)
+
+    # Overflow path: big contiguous cache; real data lives at [OVERFLOW_START, end).
+    # stride(0) = page_size * head_dim_ckv = 16384 matches the reference below,
+    # so only the page-index arithmetic differs between the two runs.
+    ckv_big = torch.zeros(
+        total_num_pages, page_size, head_dim_ckv, device=device, dtype=dtype
+    )
+    kpe_big = torch.zeros(
+        total_num_pages, page_size, head_dim_kpe, device=device, dtype=dtype
+    )
+    ckv_big[OVERFLOW_START:] = real_ckv
+    kpe_big[OVERFLOW_START:] = real_kpe
+    big_indices = torch.arange(
+        OVERFLOW_START, total_num_pages, dtype=torch.int32, device=device
+    )
+    out = _run(ckv_big, kpe_big, big_indices)
+    del ckv_big, kpe_big
+    torch.cuda.empty_cache()
+
+    # Reference: same data, same stride(0), but page indices < overflow threshold.
+    ref_indices = torch.arange(NUM_PAGES, dtype=torch.int32, device=device)
+    ref = _run(real_ckv, real_kpe, ref_indices)
+
+    torch.testing.assert_close(out, ref, atol=1e-3, rtol=1e-3)
+
+
+@pytest.mark.parametrize(
+    "backend_name,output_dtype,admitted",
+    [
+        ("cute-dsl-monolithic", torch.float8_e4m3fn, True),
+        ("cute-dsl-monolithic", torch.float8_e5m2, False),
+        ("cute-dsl-modular", torch.float8_e4m3fn, False),
+        ("cute-dsl-rubin-mtp", torch.float8_e4m3fn, True),
+        ("cute-dsl-rubin-mtp", torch.bfloat16, False),
+    ],
+)
+def test_cute_planned_fp8_output_admission(
+    monkeypatch, backend_name, output_dtype, admitted
+):
+    from types import SimpleNamespace
+
+    from flashinfer.cute_dsl import availability
+    from flashinfer.mla._batch_mla._backends import _cute_dsl_common as common
+    from flashinfer.mla._batch_mla._backends import cute_dsl_rubin_mtp_backend as mtp
+
+    monkeypatch.setattr(common, "get_compute_capability", lambda device: (10, 7))
+    monkeypatch.setattr(mtp, "get_compute_capability", lambda device: (10, 7))
+    monkeypatch.setattr(availability, "is_cute_dsl_arch_supported", lambda *args: True)
+    monkeypatch.setattr(availability, "cute_dsl_compile_arch", lambda *args: "sm_107a")
+    args = SimpleNamespace(
+        _float_workspace_buffer=torch.empty(0, dtype=torch.uint8),
+        _use_cuda_graph=False,
+        num_heads=128,
+        head_dim_ckv=512,
+        head_dim_kpe=64,
+        page_size=64,
+        q_data_type=torch.float8_e4m3fn,
+        kv_data_type=torch.float8_e4m3fn,
+        output_dtype=output_dtype,
+        sm_scale=0.125,
+        use_profiler=False,
+        enable_pdl=False,
+        use_sinks=False,
+        lse_mode="basee",
+        kv_layout="combined",
+        output_scale="none",
+        scale_mode="bmm-scalar",
+        skip_softmax=False,
+        query_kind="packed",
+        kv_kind="packed",
+        query_layout="packed",
+        kv_cache_layout="packed",
+    )
+    backend = _wrapper._BACKEND_TYPES[backend_name]
+    if admitted:
+        backend.preflight_plan_from_wrapper(args)
+    else:
+        with pytest.raises(_BackendPlanUnsupportedError):
+            backend.preflight_plan_from_wrapper(args)

@@ -26,8 +26,8 @@ def _require_blackwell():
     if not is_cuda_tile_available():
         pytest.skip("cuTile compiler toolchain is unavailable")
     capability = get_compute_capability(torch.device("cuda"))
-    if capability not in {(10, 0), (10, 3), (12, 0), (12, 1)}:
-        pytest.skip("cuTile MLA decode requires SM100, SM103, SM120, or SM121")
+    if capability not in {(10, 0), (10, 3), (10, 7), (12, 0), (12, 1)}:
+        pytest.skip("cuTile MLA decode requires SM100, SM103, SM107, SM120, or SM121")
 
 
 def _torch_mla_decode_ref(
@@ -682,8 +682,11 @@ def _forbidden(*args, **kwargs):
 
 @pytest.fixture
 def cutile_sm100():
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 0):
-        pytest.skip("prepared cuTile acceptance requires SM100")
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in (
+        (10, 0),
+        (10, 7),
+    ):
+        pytest.skip("prepared cuTile acceptance requires SM100/SM107")
     pytest.importorskip("cuda.tile.compilation")
     from flashinfer.cutile.cutile_common import is_cuda_tile_available
 

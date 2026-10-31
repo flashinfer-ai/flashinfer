@@ -10,6 +10,8 @@ from typing import Callable, Literal, Optional, Tuple
 
 import torch
 
+from flashinfer.moe_ep._compat import deprecated_aliases
+
 from .comm import (
     _CompiledMega,
     _compute_peer_offsets,
@@ -21,6 +23,7 @@ from .comm import (
 )
 
 
+@deprecated_aliases(apply_topk_in_fc1="apply_routing_weights_before_fc2")
 @dataclasses.dataclass(frozen=True)
 class MegaMoEBf16Config:
     """Compile-time and launch-time BF16 MegaMoE configuration."""
@@ -48,8 +51,9 @@ class MegaMoEBf16Config:
         "epi_warps", "standalone_warps", "reuse_dispatch_warps"
     ] = "epi_warps"
     gate_up_clamp: Optional[float] = None
-    apply_topk_in_fc1: bool = True
+    apply_routing_weights_before_fc2: bool = True
     enable_iket: bool = False
+    use_custom_finalize: bool = dataclasses.field(default=False, kw_only=True)
 
     def __post_init__(self) -> None:
         if self.world_size < 1 or not 0 <= self.rank < self.world_size:
@@ -85,6 +89,12 @@ class MegaMoEBf16Config:
             raise ValueError(
                 "in_kernel_fc2_reduce requires standalone or reused dispatch token-back."
             )
+        if self.use_custom_finalize and (
+            self.enable_in_kernel_fc2_reduce or self.in_kernel_fc2_reduce
+        ):
+            raise ValueError(
+                "use_custom_finalize requires in_kernel_fc2_reduce to be disabled."
+            )
 
     @property
     def num_experts_per_rank(self) -> int:
@@ -98,7 +108,7 @@ class MegaMoEBf16Inputs:
     topk_weights: torch.Tensor
     fc1_weight: torch.Tensor
     fc2_weight: torch.Tensor
-    combine_output: torch.Tensor
+    output_activation: torch.Tensor
 
 
 class MegaMoEBf16Frontend:
@@ -126,14 +136,18 @@ class MegaMoEBf16Frontend:
 
     def apply_knobs(self, knobs: dict) -> None:
         """Apply a validated BF16 tuning configuration and invalidate its compile."""
-        from .tuner import describe_invalid_knobs, is_valid_bf16_for_config, with_knobs
+        from .tuner import (
+            describe_invalid_knobs,
+            is_valid_bf16_for_config,
+            with_checked_knobs,
+        )
 
         if not is_valid_bf16_for_config(self.config, knobs):
             raise ValueError(
                 f"unsupported BF16 MegaMoE knobs {knobs}: "
                 f"{describe_invalid_knobs(self.config, knobs, is_valid_bf16_for_config)}."
             )
-        new_config = with_knobs(self.config, knobs)
+        new_config = with_checked_knobs(self.config, knobs)
         if new_config != self._config:
             ensure_not_capturing("apply_knobs (config change)")
             self._release_workspace()
@@ -179,8 +193,9 @@ class MegaMoEBf16Frontend:
             c.in_kernel_fc2_reduce,
             c.token_back_mode,
             self._gate_up_clamp,
-            c.apply_topk_in_fc1,
+            c.apply_routing_weights_before_fc2,
             c.enable_iket,
+            c.use_custom_finalize,
         )
 
     def _ensure_compiled(self, inputs: MegaMoEBf16Inputs) -> _CompiledMega:
@@ -222,12 +237,13 @@ class MegaMoEBf16Frontend:
             max_tokens_per_rank=c.num_tokens_per_rank,
             hidden=c.hidden,
             fc2_in_kernel_topk_reduce=c.in_kernel_fc2_reduce,
+            skip_topk_reduce=c.use_custom_finalize,
             token_back_by_dispatch=c.token_back_mode != "epi_warps",
             token_back_mode=c.token_back_mode,
             epi_flag_batch=c.epi_flag_batch,
             flag_batch=c.flag_batch,
             gate_up_clamp=self._gate_up_clamp,
-            apply_topk_in_fc1=c.apply_topk_in_fc1,
+            apply_topk_in_fc1=c.apply_routing_weights_before_fc2,
         )
         local_bytes, shared_bytes = kernel.get_workspace_sizes()
         local_workspace = torch.zeros(local_bytes, dtype=torch.uint8, device="cuda")
@@ -270,9 +286,11 @@ class MegaMoEBf16Frontend:
             "fc1_weight": self._to_cute(inputs.fc1_weight),
             "fc2_weight": self._to_cute(inputs.fc2_weight),
             "fc1_c": None,
-            "combine_output": self._to_cute(inputs.combine_output),
+            "output_activation": self._to_cute(inputs.output_activation),
             "local_workspace": self._to_cute(mega.local_workspace, static_layout=True),
-            "shared_workspace": self._to_cute(mega.shared_workspace),
+            "shared_workspace": self._to_cute(
+                mega.shared_workspace, static_layout=True
+            ),
             "peer_rank_ptr_mapper_host": mapper,
             "stream": cuda.CUstream(torch.cuda.current_stream().cuda_stream),
         }
@@ -284,6 +302,7 @@ class MegaMoEBf16Frontend:
         num_tokens: Optional[int] = None,
         sync: bool = False,
     ) -> torch.Tensor:
+        """Launch with cached bindings that track the output's live layout."""
         n = inputs.activation.shape[0] if num_tokens is None else num_tokens
         self._validate(inputs, n)
         mega = self._ensure_compiled(inputs)
@@ -293,18 +312,43 @@ class MegaMoEBf16Frontend:
             inputs.topk_weights.data_ptr(),
             inputs.fc1_weight.data_ptr(),
             inputs.fc2_weight.data_ptr(),
-            inputs.combine_output.data_ptr(),
+            inputs.output_activation.data_ptr(),
+            tuple(inputs.output_activation.shape),
+            tuple(inputs.output_activation.stride()),
             torch.cuda.current_stream().cuda_stream,
         )
         if mega.launch_key != key:
             mega.launch_kwargs = self._runtime_kwargs(inputs, mega)
             mega.launch_key = key
         if self.config.in_kernel_fc2_reduce:
-            inputs.combine_output.zero_()
+            inputs.output_activation.zero_()
         mega.compiled(**mega.launch_kwargs)
         if sync and not torch.cuda.is_current_stream_capturing():
             torch.cuda.synchronize()
-        return inputs.combine_output[:n]
+        return inputs.output_activation[:n]
+
+    def custom_finalize_workspace(
+        self,
+    ) -> Tuple[torch.Tensor, torch.Tensor, dict]:
+        """Return the zero-copy per-route partials and their canonical root descriptor."""
+        if not self.config.use_custom_finalize:
+            raise RuntimeError("custom finalize mode is not enabled")
+        mega = self._mega
+        if mega is None or mega.compiled is None:
+            raise RuntimeError(
+                "custom finalize workspace is unavailable before compilation"
+            )
+        descriptor = mega.kernel.topk_reduce_input_region()
+        root = mega.shared_workspace
+        byte_offset = int(descriptor["byte_offset"])
+        nbytes = int(descriptor["nbytes"])
+        raw = root.narrow(0, byte_offset, nbytes)
+        partials = raw.view(torch.bfloat16).view(tuple(descriptor["shape"]))
+        if partials.data_ptr() != root.data_ptr() + byte_offset:
+            raise RuntimeError("borrowed combine view does not match its root offset")
+        if partials.data_ptr() % int(descriptor["alignment"]):
+            raise RuntimeError("borrowed combine view violates canonical alignment")
+        return partials, root, dict(descriptor)
 
     def make_launch_thunk(self, inputs: MegaMoEBf16Inputs) -> Callable[[], None]:
         self._validate(inputs, inputs.activation.shape[0])
@@ -314,7 +358,7 @@ class MegaMoEBf16Frontend:
         if self.config.in_kernel_fc2_reduce:
 
             def thunk():
-                inputs.combine_output.zero_()
+                inputs.output_activation.zero_()
                 compiled(**kwargs)
 
             return thunk
@@ -326,6 +370,7 @@ class MegaMoEBf16Frontend:
             return thunk
 
     def _validate(self, inputs: MegaMoEBf16Inputs, num_tokens: int) -> None:
+        """Check padded inputs and the admitted live-output row count."""
         c = self.config
         if not 0 <= num_tokens <= c.num_tokens_per_rank:
             raise ValueError(
@@ -365,9 +410,18 @@ class MegaMoEBf16Frontend:
             or inputs.fc2_weight.dtype != torch.bfloat16
         ):
             raise ValueError("BF16 MegaMoE weights must be bfloat16.")
-        topk_dim = 1 if c.in_kernel_fc2_reduce else c.num_topk
-        if inputs.combine_output.shape != (c.num_tokens_per_rank, topk_dim, c.hidden):
-            raise ValueError("combine_output has an invalid shape.")
+        output_rows = {c.num_tokens_per_rank}
+        if not c.in_kernel_fc2_reduce and not c.use_custom_finalize:
+            output_rows.add(num_tokens)
+        if (
+            not inputs.output_activation.is_cuda
+            or inputs.output_activation.ndim != 2
+            or inputs.output_activation.shape[0] not in output_rows
+            or inputs.output_activation.shape[1] != c.hidden
+        ):
+            raise ValueError("output_activation has an invalid shape.")
+        if inputs.output_activation.dtype != torch.bfloat16:
+            raise ValueError("output_activation must be bfloat16.")
 
     def _release_workspace(self) -> None:
         if self._mega is not None:
@@ -387,21 +441,17 @@ class MegaMoEBf16SymmBuffer:
     x: torch.Tensor
     topk_idx: torch.Tensor
     topk_weights: torch.Tensor
-    combine_output: torch.Tensor
-    reduced_output: torch.Tensor
+    output_activation: torch.Tensor
     _frontend: MegaMoEBf16Frontend
     _sym_roots: list[torch.Tensor] = field(default_factory=list)
     _destroyed: bool = False
-
-    @property
-    def kernel_combine_output(self) -> torch.Tensor:
-        """The tensor the kernel writes: reduced rows under ikr, else partials."""
-        if self._frontend.config.in_kernel_fc2_reduce:
-            return self.reduced_output
-        return self.combine_output
+    _unfinalized_route_map: torch.Tensor | None = None
+    _unfinalized_weights: torch.Tensor | None = None
 
     def destroy(self) -> None:
         if not self._destroyed:
+            self._unfinalized_route_map = None
+            self._unfinalized_weights = None
             self._frontend.release()
             for root in self._sym_roots:
                 free_sym_tensor(root)
@@ -428,7 +478,9 @@ def get_symm_buffer_for_bf16_mega_moe(
     *,
     gate_up_clamp: Optional[float] = None,
     activation_clamp: Optional[float] = None,
+    apply_routing_weights_before_fc2: bool = True,
     enable_in_kernel_fc2_reduce: bool = False,
+    use_custom_finalize: bool = False,
     knobs: Optional[dict] = None,
 ) -> MegaMoEBf16SymmBuffer:
     clamp = resolve_gate_up_clamp(
@@ -438,7 +490,7 @@ def get_symm_buffer_for_bf16_mega_moe(
     from .tuner import (
         describe_invalid_knobs,
         is_valid_bf16_for_config,
-        with_knobs,
+        with_checked_knobs,
     )
 
     if knobs is None:
@@ -451,6 +503,7 @@ def get_symm_buffer_for_bf16_mega_moe(
             topk=num_topk,
             max_tokens=num_max_tokens,
             enable_in_kernel_fc2_reduce=enable_in_kernel_fc2_reduce,
+            use_custom_finalize=use_custom_finalize,
         )
     cfg = MegaMoEBf16Config(
         rank=rank,
@@ -461,22 +514,22 @@ def get_symm_buffer_for_bf16_mega_moe(
         hidden=hidden,
         intermediate=intermediate,
         gate_up_clamp=clamp,
+        apply_routing_weights_before_fc2=apply_routing_weights_before_fc2,
         enable_in_kernel_fc2_reduce=enable_in_kernel_fc2_reduce,
+        use_custom_finalize=use_custom_finalize,
     )
     if not is_valid_bf16_for_config(cfg, knobs):
         raise ValueError(
             f"unsupported BF16 MegaMoE knobs {knobs}: "
             f"{describe_invalid_knobs(cfg, knobs, is_valid_bf16_for_config)}."
         )
-    cfg = with_knobs(cfg, knobs)
+    cfg = with_checked_knobs(cfg, knobs)
 
     x = sym_zeros((num_max_tokens, hidden), torch.bfloat16)
     topk_idx = sym_zeros((num_max_tokens, num_topk), torch.int64)
     topk_idx.fill_(-1)
     topk_weights = sym_zeros((num_max_tokens, num_topk), torch.float32)
-    # We need to allocate both since we dont always know what final knobs will be selected
-    combine_output = sym_zeros((num_max_tokens, num_topk, hidden), torch.bfloat16)
-    reduced_output = sym_zeros((num_max_tokens, 1, hidden), torch.bfloat16)
+    output_activation = sym_zeros((num_max_tokens, hidden), torch.bfloat16)
     return MegaMoEBf16SymmBuffer(
         num_total_experts,
         num_max_tokens,
@@ -488,10 +541,9 @@ def get_symm_buffer_for_bf16_mega_moe(
         x,
         topk_idx,
         topk_weights,
-        combine_output,
-        reduced_output,
+        output_activation,
         MegaMoEBf16Frontend(cfg),
-        [x, topk_idx, topk_weights, combine_output, reduced_output],
+        [x, topk_idx, topk_weights, output_activation],
     )
 
 
@@ -507,11 +559,11 @@ def bf16_mega_moe(
     fast_math: bool = True,
     sync: bool = False,
 ) -> Optional[torch.Tensor]:
+    """Write caller output directly when eligible, or return a borrowed view."""
     del fast_math
     if symm_buffer._destroyed:
         raise RuntimeError("symm_buffer.destroy() was already called.")
     n = symm_buffer.num_max_tokens if num_tokens is None else num_tokens
-    in_kernel_reduce = symm_buffer._frontend.config.in_kernel_fc2_reduce
     if y is not None and (
         y.shape != (n, symm_buffer.hidden) or y.dtype != torch.bfloat16
     ):
@@ -521,6 +573,19 @@ def bf16_mega_moe(
     )
     if clamp is not None:
         symm_buffer._frontend.set_gate_up_clamp(clamp)
+    config = symm_buffer._frontend.config
+    # Form A's terminal reducer bounds its stores by the output's row count.
+    # Form B atomically writes a full-capacity symmetric target on peer GPUs,
+    # so it must retain the owned workspace and the final copy.
+    direct_output = (
+        y is not None
+        and n > 0
+        and not config.in_kernel_fc2_reduce
+        and not config.use_custom_finalize
+        and y.device == symm_buffer.output_activation.device
+        and y.is_contiguous()
+        and y.data_ptr() % 16 == 0
+    )
     result = symm_buffer._frontend.run(
         MegaMoEBf16Inputs(
             symm_buffer.x,
@@ -528,19 +593,14 @@ def bf16_mega_moe(
             symm_buffer.topk_weights,
             transformed_l1[0],
             transformed_l2[0],
-            symm_buffer.kernel_combine_output,
+            y if direct_output else symm_buffer.output_activation,
         ),
         num_tokens=n,
         sync=False,
     )
-    if in_kernel_reduce:
-        out = result[:, 0]
-        if y is not None:
-            y.copy_(out)
-    else:
-        # Reduce straight into the result buffer
-        out = y if y is not None else symm_buffer.reduced_output[:n, 0]
-        torch.sum(result, dim=1, out=out)
+    out = result
+    if y is not None and not direct_output:
+        y.copy_(out)
 
     if sync and not torch.cuda.is_current_stream_capturing():
         torch.cuda.synchronize()
@@ -675,22 +735,10 @@ def bf16_mega_launch_thunk(
             symm_buffer.topk_weights,
             transformed_l1[0],
             transformed_l2[0],
-            symm_buffer.kernel_combine_output,
+            symm_buffer.output_activation,
         )
     )
-    if symm_buffer._frontend.config.in_kernel_fc2_reduce:
-        return launch
-
-    # Form A's host reduce is part of the forward; a thunk without it would
-    # under-report the deterministic path against ikr.
-    partials = symm_buffer.combine_output
-    out = symm_buffer.reduced_output[:, 0]
-
-    def thunk() -> None:
-        launch()
-        torch.sum(partials, dim=1, out=out)
-
-    return thunk
+    return launch
 
 
 __all__ = [

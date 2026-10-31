@@ -64,6 +64,8 @@ def _reference(x, ids, route_weights, w1q, w1sf, w2q, w2sf, activation):
     for token in range(x.shape[0]):
         for slot in range(ids.shape[1]):
             expert = int(ids[token, slot])
+            if expert < 0:  # unrouted pair
+                continue
             gate_up = xdeq[token].float() @ w1[expert].t()
             linear, gate = gate_up[:intermediate], gate_up[intermediate:]
             gate = gate.clamp(max=activation.limit)
@@ -123,3 +125,90 @@ def test_sm12x_fp8_unified_runner_matches_reference(activation, enable_pdl):
     got = MoELayer(config, device=x.device)(act_pack, weight_pack)
     ref = _reference(x, ids, route_weights, w1q, w1sf, w2q, w2sf, activation)
     assert calc_diff(got.float(), ref) < 2e-2
+
+
+def _mask_unrouted(ids, pattern):
+    """Mark unrouted slots the way vLLM pads CUDA-graph rows: expert id -1,
+    with the routing weight left non-zero, so only the id can skip them."""
+    num_tokens, top_k = ids.shape
+    if pattern == "tail":
+        masked = torch.zeros_like(ids, dtype=torch.bool)
+        masked[num_tokens - max(1, num_tokens // 4) :] = True
+    elif pattern == "all":
+        masked = torch.ones_like(ids, dtype=torch.bool)
+    elif pattern == "mixed":
+        token = torch.arange(num_tokens, device=ids.device)[:, None]
+        slot = torch.arange(top_k, device=ids.device)[None, :]
+        masked = (token + slot) % 2 == 0
+    else:
+        raise ValueError(pattern)
+    return ids.masked_fill(masked, -1)
+
+
+@pytest.mark.parametrize("pattern", ["tail", "all", "mixed"])
+@pytest.mark.parametrize("tokens", [8, 80], ids=["decode", "prefill"])
+def test_sm12x_fp8_unified_runner_skips_unrouted(tokens, pattern):
+    """A negative expert id is an unrouted pair (vLLM CUDA-graph padding):
+    it must contribute nothing, so fully unrouted tokens are exact zeros and
+    the routed pairs still match the reference."""
+    if not (torch.cuda.is_available() and is_sm120a_supported(torch.device("cuda"))):
+        pytest.skip("requires an SM120a device")
+    torch.manual_seed(11)
+    # top_k * tokens <= 256 takes the single-CTA decode route, > 256 the prefill one.
+    experts, top_k, hidden, intermediate = 32, 4, 512, 512
+    activation = SwiGLU()
+    x = torch.randn(tokens, hidden, device="cuda", dtype=torch.bfloat16) / 10
+    w1 = torch.randn(
+        experts, 2 * intermediate, hidden, device="cuda", dtype=torch.bfloat16
+    ) / math.sqrt(hidden)
+    w2 = torch.randn(
+        experts, hidden, intermediate, device="cuda", dtype=torch.bfloat16
+    ) / math.sqrt(intermediate)
+    token = torch.arange(tokens, device="cuda")
+    ids = torch.stack(
+        [(token + 7 * slot) % experts for slot in range(top_k)], dim=1
+    ).to(torch.int32)
+    route_weights = torch.softmax(torch.randn(tokens, top_k, device="cuda"), dim=1)
+    w1q, w1sf_packed, w1sf = _quantize_weights(w1)
+    w2q, w2sf_packed, w2sf = _quantize_weights(w2)
+    weight_pack = MoEWeightPack()
+    backend = SM12xFp8Config()
+    weight_pack.prepare_for(
+        "sm12x_fp8",
+        backend.prepare_weights(w1q, w1sf_packed, w2q, w2sf_packed),
+    )
+    config = MoEConfig(
+        routing=RoutingConfig(num_experts=experts, top_k=top_k),
+        quant=QuantConfig(
+            weight=QuantFormat.DeepSeekFp8,
+            activation=QuantFormat.DeepSeekFp8,
+            per_token_scale=False,
+        ),
+        experts=ExpertConfig(intermediate_size=intermediate, local_num_experts=experts),
+        activation=activation,
+        backend=BackendOptions(candidates=(backend,)),
+        execution=ExecutionConfig(enable_pdl=False),
+    )
+    layer = MoELayer(config, device=x.device)
+
+    def run(topk_ids):
+        act_pack = MoEActivationPack(
+            hidden_states_q=x,
+            hidden_states_scale=None,
+            topk_ids=topk_ids,
+            topk_weights=route_weights,
+        )
+        return layer(act_pack, weight_pack)
+
+    # An all-routed call first leaves stale rows in the recycled scratch.
+    run(ids)
+    masked_ids = _mask_unrouted(ids, pattern)
+    got = run(masked_ids).float()
+    torch.cuda.synchronize()
+    assert torch.isfinite(got).all()
+    fully_masked = (masked_ids < 0).all(dim=1)
+    assert torch.equal(got[fully_masked], torch.zeros_like(got[fully_masked]))
+    routed = ~fully_masked
+    if routed.any():
+        ref = _reference(x, masked_ids, route_weights, w1q, w1sf, w2q, w2sf, activation)
+        assert calc_diff(got[routed], ref[routed]) < 2e-2

@@ -2,8 +2,9 @@
 
 The active generic kernel is the `1667b47a` upstream export; see
 [VENDOR.md](VENDOR.md) for the full pin and [SKILL.md](SKILL.md) for refreshes.
-The export also includes GenPhase, but the FlashInfer backend/benchmark does not
-yet select it. Compressed-combine variants remain separate integration work.
+Select GenPhase with `kernel_variant="genphase"` on a backend config or
+`--kernel-variant genphase` in the offline tuner. The generic inference kernel
+also supports `combine_dtype="nvfp4"` and `combine_dtype="mxfp8"`.
 Historical `92dd334` knob profiles are candidate settings for this newer
 kernel, not new measurements; tuning caches from that drop are invalidated.
 
@@ -20,6 +21,72 @@ Use `--dtype mxfp4_mxfp8 --arch sm107` for mixed-format offline tuning, or
 MXFP8 activation staging and uses packed E2M1 weights with block-32 E8M0
 scales. Its tuning cache entries are separate from the MXFP8-weight entries.
 
+For contiguous BF16 inputs and top-k up to 32, NVFP4 and MXFP8 staging check route
+bounds, duplicate experts and finite unmasked scores in the quantization kernel.
+These checks remain active during graph replay. Unsupported layouts and
+prequantized inputs retain separate routing validation. Set
+`FLASHINFER_SM107_FUSED_ROUTE_CHECK=0` to use separate validation for diagnostics.
+
+NVFP4 and MXFP8 staging also mask trailing routing rows in the quantization launch,
+including when replaying graphs with different live row counts in a shared
+workspace. Empty inputs and tails exceeding 16 routing elements per live CTA
+thread retain a separate parallel fill. Set
+`FLASHINFER_SM107_FUSED_TAIL_MASK=0` to use the separate tail clear for diagnostics.
+
+NVFP4 backend defaults for `fc1_alpha`, `fc2_alpha`, and `fc1_norm_const`
+bind a workspace-owned read-only ones tensor instead of filling three tensors
+on every call. Explicit contiguous FP32 tensors are also bound directly; other
+layouts retain the copy path. The default tensor is separate from mutable
+workspace scalar storage so pooled layers and captured graphs cannot overwrite
+each other's default values. Valid strided FP32 vectors are accepted on the
+first invocation as well as after warmup; shape, device and positive-finite
+value checks still apply.
+
+## NVFP4 staging measurements (2026-10-29)
+
+Native EP8 on eight Rubin SM107 GPUs, H=4096, intermediate=2048, 256 experts,
+top-6, uniform routing, no shared experts, BF16 combine, early routing weights,
+gate/up clamp=10 and default scalar parameters. Clocks are not locked and
+knob-cache lookup is disabled. Route checks, fused-route-check eligibility,
+fused staging and fused-tail eligibility are all enabled. The pre-optimization
+MoE source at `c4ea1741afa2829f9bdcc716473f2f08e23d0bcb` matches the PR parent.
+The optimized NVFP4 implementation is the one recorded at `a568d2e8c`.
+
+Each full-forward value averages two runs, taking the maximum of the eight
+per-rank medians over five rounds of 40 CUDA Graph calls per run. Before and
+after runs alternate; there is no L2 flush or per-call barrier.
+
+| Live rows / capacity | Before full forward (µs) | After full forward (µs) | Latency reduction |
+| ---: | ---: | ---: | ---: |
+| 32 / 256 | 98.22 | 92.03 | 6.30% |
+| 192 / 256 | 104.39 | 95.78 | 8.25% |
+| 256 / 256 | 105.17 | 97.26 | 7.52% |
+
+At 192 live rows, full-forward launches drop from eleven to four on every
+rank. Compute-only timing remains approximately unchanged: 92.99 versus
+93.34 µs. Numerical oracles and graph/eager parity pass at all measured points.
+
+### Standalone-tail fallback
+
+A fresh comparison uses one live row and capacity 1024 at the same geometry,
+five rounds of 40 captured calls per revision. There are 6138 trailing route
+elements, exceeding the live CTA's 128 threads times the 16-elements/thread
+limit (2048), so the optimized path retains the standalone tail fill.
+
+| Scope | Before (µs) | After (µs) |
+| --- | ---: | ---: |
+| Input staging only | 13.06 | 8.18 |
+| Compute only | 51.90 | 52.26 |
+| Full forward | 59.81 | 54.72 |
+
+Profiles on every rank show staging decreasing from seven launches to two
+(quantization/checks plus the standalone fill), and full forward from ten to
+five; compute retains three launches. Full-forward latency decreases by
+8.51%. Stage captures preserve the quantized activation, scales and routes
+bitwise; full/compute calls match the sampled oracle and graph/eager outputs.
+The three timing scopes are captured independently and must not be added or
+subtracted to infer component costs under unlocked clocks.
+
 ## What the benchmark measures
 
 `benchmarks/moe_ep/backends/mega/kernel/sm107/bench_moe_ep_sm107_block_scaled_mega.py` reports:
@@ -28,9 +95,11 @@ scales. Its tuning cache entries are separate from the MXFP8-weight entries.
   required output/reset operations and dispatch, both GEMMs, and combine.
 - `--mode compute`: inputs staged once, then backend `compute()` with a
   preallocated owned output reused across calls. Includes the backend wrapper,
-  required resets/reduction, kernel, and output copy, but no recurring input staging.
+  required resets/reduction and kernel, but no recurring input staging. Separate
+  reduction writes aligned contiguous outputs directly; other layouts and
+  in-kernel reduction use a workspace output followed by a copy.
 - `--mode forward`: public `MoEEpLayer.forward()` with BF16 inputs, including
-  validation, Torch quantization/staging, owned output handling, and the kernel.
+  validation, quantization/staging, owned output handling, and the kernel.
 - `--execution eager|graph`: eager launches or replay of a warmed CUDA
   graph. These are separate series, not interchangeable measurements.
 
@@ -104,7 +173,95 @@ measured MXFP8 optimum.
 
 Engine configuration has the same distinction: `knobs=None` preserves
 explicit fields, `knobs="cache"` performs lookup with heuristic fallback,
-and a dictionary overrides fields. Online `knobs="auto"` is unsupported.
+and a dictionary overrides fields. `knobs="auto"` also permits collective
+tuning during a FlashInfer `autotune_v2()` warmup. It uses the same candidates
+and sampled numerical checks as the offline tuner.
+
+Automatic selection checks FlashInfer records first, then the MegaMoE cache
+file, using the same capacity/live-token buckets and numerical compatibility
+rules. Replay can import a compatible file record into memory. Tuning requires
+matching measurement provenance; an older record without it triggers a search.
+Every selected winner is also written to the configured MegaMoE file, including on a
+FlashInfer cache hit. Disabling the MegaMoE file with
+`FLASHINFER_MOE_EP_KNOB_CACHE=off` does not disable FlashInfer's cache.
+The installed winner and its cache identity belong to the workspace. Returning
+to an earlier store or policy reselects from that store if a different winner
+has since been installed.
+
+Compatibility uses the existing MegaMoE backend revision, standard FlashInfer
+v2 environment metadata, and numerical, device and resource checks. Python
+source files are not hashed for tuning compatibility. Update `BACKEND_REVISION`
+in `shim/knob_cache.py` when kernel or knob semantics invalidate previous results.
+
+Without an enabled autotune context, an automatic layer can install a cached
+winner; a miss uses its initial heuristic configuration and leaves tuning
+pending. Initial allocation does not read either cache, so rank-local files
+cannot change allocation before collective selection. All EP ranks must enter
+matching contexts and forwards. Use `autotune_v2()` for automatic persistent
+output. The protocol publishes on EP rank zero; every rank participates in
+selection and execution:
+
+```python
+with autotune_v2():
+    layer.warmup(tensors)  # Construct the layer with knobs="auto".
+```
+
+A later process can load the managed store with `autotune_v2(mode="replay")`.
+No `cache=` filename is required. `persistent_cache=False` disables both managed
+storage and the MegaMoE compatibility file for the context. Protocol records
+are not read or written by the v1 JSON API.
+
+`tuning_buckets` and `round_up=True` are not supported for automatic selection
+and raise before cache lookup or tuning. Prepare workspaces with the desired
+capacities instead; selection retains MegaMoE's capacity/live-token lookup.
+
+The default measurement preserves the native CUDA-event loop. Explicit
+`MeasurementPolicy(execution_mode="eager")` includes per-call host overhead;
+`execution_mode="cuda_graph"` captures and replays the prepared candidate.
+`cold_l2=True` flushes L2 before each measured invocation, outside its timed
+interval. Every mode measures the kernel boundary without input staging and
+takes the median of matched maximum-rank samples. Policies have separate cache
+identities. Capture-unsupported candidates are skipped collectively; GPU launch
+failures abort. The diagnostic CUPTI timer uses a collective CUDA-event fallback
+if tracing is unavailable on any rank, as in the framework's ordinary profiler.
+
+Tune before CUDA graph capture. Automatic workspaces are private to their
+layer. Winner installation retains staged inputs and transformed weights and
+can replace output buffers, kernel scratch and compiled state. Reacquire borrowed
+output views after selection. Once captured, a workspace cannot
+install another winner. A later Python forward that needs selection replaces
+the default workspace before staging inputs and keeps the old storage alive
+until layer destruction. Existing graphs continue to use their original
+workspace. The replacement shares transformed weights and needs its own graph
+capture. Tuning and graph replay must run sequentially.
+Repeated capture and replacement can retain more than two workspaces. Use
+explicit handles when old workspaces need to be released before layer destruction.
+Each eager automatic forward coordinates selection across the EP group, even
+when this rank needs no change. A peer may have invalidated its local cache.
+Default workspaces also coordinate replacement before allocating storage.
+CUDA graph replay does not run these host checks.
+
+For explicit lifetime control, use `layer.create_workspace(capacity)` on an
+automatic layer. Each handle has independent storage and selection state, even
+at the same capacity. Pass it to `warmup(..., workspace=handle)` inside the v2
+context, then capture `forward(..., workspace=handle)`. Handles keep stable
+addresses after capture; later tuning requires another handle. Destroy a handle
+collectively only after retiring its referencing graphs and synchronizing all
+work that uses it. A store/policy switch or `autotune_v2_reload()` invalidates
+the automatic selection's local identity.
+Automatic handles accept the offline `live_tokens` profile hint but warn at
+creation that it does not affect automatic selection. Their lookup uses the
+actual warmup or forward batch, taking the maximum live count across EP ranks.
+`layer.get_tuned_knobs(workspace=handle)` returns that handle's selected
+configuration; omitting `workspace` returns the default workspace's result.
+Neither getter allocates or performs selection.
+Warm up again before capture after changing the cache or measurement policy.
+If the new store has no compatible winner and tuning is disabled, an uncaptured
+workspace returns to its initial configuration instead of keeping the old
+store's winner. Captured explicit handles retain their prepared configuration.
+Adding `moe_ep.sm107.cutedsl.native.v1` to `skip_ops` forces initial knobs without
+cache lookup or search. Apply it before capture; a captured explicit handle
+with a selected winner requires a new handle to prepare the fallback.
 
 ## Benchmark workloads
 
@@ -144,8 +301,9 @@ Use `compute` / eager with per-iteration L2 flushing, 20 warmups / 50 samples,
 three independent process repetitions, and rank-zero median for the historical
 comparison. Kernel/forward characterization uses eager/graph without flushing;
 EP2/8 are scaling experiments, not matches to the historical EP4 table.
-DeepGEMM is excluded from this campaign. Quantized NVFP4/MXFP8 combine paths
-exist in vendored source but their FlashInfer integration is deferred.
+DeepGEMM is excluded from this campaign. The benchmark CLI exposes BF16 combine
+and in-kernel reduction. Select GenPhase and quantized combine through the
+backend API or offline tuner.
 
 Example primary-series invocation (repeat for each geometry, variant and token
 count above, starting a fresh process for each point):
@@ -198,6 +356,14 @@ Report Torch staging cost separately when evaluating a fused staging implementat
 
 ## Offline tuning
 
+The CLI always searches afresh and leaves its input workspace unchanged. It
+writes each winner to the managed FlashInfer v2 store and the MegaMoE file on
+EP rank zero. The default store is `FLASHINFER_CACHE_DIR/autotune`;
+`FLASHINFER_AUTOTUNE_CACHE_DIR` overrides its root directory. Applications use
+`autotune_v2()` or `autotune_v2(mode="replay")` to reuse these results.
+The managed record and MegaMoE file include implementation, dependency,
+fixed-resource and measurement compatibility information.
+
 Use a separate cache file for each qualification job to avoid concurrent
 writers. Start with the regular candidate grid; use a schedule sweep with
 production-like skew after correctness passes:
@@ -212,8 +378,9 @@ timeout --kill-after=15s 3600s torchrun --standalone --nproc_per_node=4 \
 ```
 
 The tuner verifies collective candidate agreement, rejects invalid geometry
-before symmetric allocation, checks sampled outputs against a Torch oracle,
-then measures isolated CUDA-event launches. It reduces each iteration with
+before symmetric allocation, prepares each candidate on every rank before
+launching, checks sampled outputs against a Torch oracle, then measures isolated
+CUDA-event launches. Preparation failures are reported across the EP group. It reduces each iteration with
 MAX across ranks before taking the median. Only a candidate passing the
 numerical checks can enter the cache. Runtime failures stop the job;
 relaunch in fresh workers instead of continuing on a failed CUDA context.
@@ -228,8 +395,8 @@ reference and every candidate. The layer API also accepts distinct values per
 local expert; see the [normalization contract](../../../../../docs/design_docs/moe_ep_sm107_qualification.md#nvfp4-normalization).
 
 The cache distinguishes the SM107 implementation revision, geometry,
-quantization, activation and beta parameters, gate/up clamp, early/late routing
-weights, and nondeterminism permission.
+quantization, kernel variant, combine format, activation and beta parameters,
+gate/up clamp, early/late routing weights, and nondeterminism permission.
 Legacy entries from the original PR are ignored. In-kernel reduction is
 excluded by default; `--allow-nondeterministic` opts it into tuning.
 Engine-side cache lookup requires `in_kernel_fc2_reduce=True` to permit
@@ -237,3 +404,61 @@ such an entry, and early routing weights are mandatory for that mode.
 Record accuracy and replay variability for any selected nondeterministic
 configuration. Retune after changing the kernel, compiler, device
 partition, topology, or relevant runtime configuration.
+
+## GenPhase selection
+
+Set `kernel_variant="genphase"`, `cluster_shape_mn=(4, 1)`, and
+`fc2_use_bulk=True` on a Rubin backend config. GenPhase accepts at most 1024
+tokens per rank and uses BF16 combine. It supports separate reduction with
+either routing-weight position; in-kernel reduction requires early weights.
+Mixed clusters and token-back tuning do not apply to this composition.
+Tile K must be 256 for NVFP4 activations or 128 for MXFP8 activations so that
+each gathered row occupies one 128-byte swizzle atom.
+
+Use `--kernel-variant genphase` with the offline tuner. Its candidates and
+cache entries are separate from the generic inference kernel. A cache miss
+uses the fixed GenPhase cluster and bulk-store settings.
+
+GenPhase also accepts `mma_tiler_mnk=(256, 64, 128)` for MXFP8 E4M3
+activations and weights, or mixed MXFP4 weights with MXFP8 activations.
+The default candidate menu includes this tile with cluster `(4, 1)` and
+one FC2 TMA stage. MXFP8 E4M3 also admits an explicitly selected `(2, 1)`
+cluster; mixed MXFP4/MXFP8 requires `(4, 1)`. NVFP4 activations do not
+support this N64 tile. N64 is a tile dimension, not the number of live tokens.
+Gather4 issuance follows the live rows in each tile, including partially
+filled tiles, while retaining matching barrier transaction counts.
+
+For N64 with `world_size > 1`, use `schedule_policy=("grouped", None)`.
+Multirank phase-interleave is rejected before allocation or compilation after
+an EP2 liveness failure. `is_valid_sm107` applies this same restriction when
+filtering the candidate menu for a concrete configuration. EP1 phase-interleave
+remains admitted; the N128/N256 schedule rules are unchanged.
+
+Retune to compare the additional candidates for your workload. The default
+kernel family remains `inference`; these candidates do not automatically
+select GenPhase for existing callers.
+
+Both families mask invalid route slots during separate BF16 top-k reduction,
+so their production launch can omit clearing the combine payload first.
+This internal optimization applies without a caller API change. Quantized
+combine and in-kernel top-k reduction retain their existing clearing paths.
+
+## Quantized combine selection
+
+Set `combine_dtype="nvfp4"` or `combine_dtype="mxfp8"` on a Rubin backend
+config, or pass `--combine-dtype nvfp4` or `--combine-dtype mxfp8` to the SM107
+offline tuner. This compresses each
+expert's FC2 return payload before top-k reduction. It does not change weight
+or activation precision, and the final output remains BF16.
+
+NVFP4 combine uses packed E2M1 values with a BF16 amax per 16 elements.
+MXFP8 combine uses E4M3 values with an E8M0 scale per 32 elements. Both
+require `kernel_variant="inference"` and `in_kernel_fc2_reduce=False`. Each format has
+separate workspace and tuning-cache entries. Numerical checks include the
+return quantization before applying late routing weights and reducing experts.
+
+The peer-facing bulk store does not support FP4 payloads. With
+`token_back_mode="epi_warps"`, use `fc2_use_bulk=False`. Bulk stores are legal
+when `standalone_warps` or `reuse_dispatch_warps` returns the data from a local
+buffer. The NVFP4 combine cache fallback keeps epilogue warps and disables bulk
+stores. MXFP8 combine supports the peer-facing bulk store.

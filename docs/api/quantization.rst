@@ -203,16 +203,40 @@ linear (non-swizzled) block-scale layout.
     nvfp4_kv_dequantize_paged
     nvfp4_quantize_paged_kv_cache
 
+NVFP4 KV Cache Materialization
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Materialize the active pages of a paged NVFP4 KV cache as FP8 for attention
+kernels that do not read NVFP4 K/V directly.
+
+.. currentmodule:: flashinfer.quantization.kernels.nvfp4_kv_materialize
+
+.. autosummary::
+    :toctree: ../generated
+
+    nvfp4_kv_materialize_fp8
+
 FP8 Quantization
 ----------------
+
+.. currentmodule:: flashinfer.quantization
 
 .. autosummary::
     :toctree: ../generated
 
     mxfp8_quantize
     mxfp8_grouped_quantize
+    silu_and_mul_mxfp8_experts_quantize
     mxfp8_dequantize_host
     per_token_group_quant_8bit
+
+.. note::
+
+    ``mxfp8_grouped_quantize`` and ``silu_and_mul_mxfp8_experts_quantize``
+    require SM100+. The default ``"cutile"`` backend of
+    ``mxfp8_grouped_quantize`` requires ``cuda.tile`` (a ``requirements.txt``
+    dependency) and ``"cake"`` requires compute capability 10.0 or 10.3.
+    ``K`` must be divisible by 32 and is padded internally to 128-column tiles.
 
 Fused gated-activation MXFP8 quantization
 -----------------------------------------
@@ -224,12 +248,6 @@ Fused gated-activation MXFP8 quantization
 
     silu_and_mul_mxfp8_quantize
     silu_and_mul_mxfp8_quantize_backward
-
-.. note::
-
-    ``mxfp8_grouped_quantize`` uses a cuTile backend and requires SM100+ and
-    ``cuda.tile`` (a ``requirements.txt`` dependency). ``K`` must be divisible
-    by 32 and is padded internally to 128-column tiles.
 
 CuTe-DSL Quantization Kernels (experimental)
 --------------------------------------------

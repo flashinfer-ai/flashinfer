@@ -43,6 +43,280 @@ def _reference(q, k, v, q_lens, kv_lens, scale):
     return torch.cat(outputs), torch.cat(stats)
 
 
+@pytest.mark.parametrize("paged", [False, True])
+@pytest.mark.parametrize("return_lse", [False, True])
+def test_prepared_history_alternating_shapes_and_retained_capture(paged, return_lse):
+    """Revisit preparations with fresh bindings, then replay after their eviction."""
+    if not cudnn_prefill._cudnn_supports_direct_seqlens(torch.bfloat16, mixed=paged):
+        pytest.skip("requires direct cuDNN cumulative sequence lengths")
+    torch.manual_seed(79)
+    workspace = torch.empty(128 << 20, device="cuda", dtype=torch.uint8)
+    cls = (
+        flashinfer.BatchPrefillWithPagedKVCacheWrapper
+        if paged
+        else flashinfer.BatchPrefillWithRaggedKVCacheWrapper
+    )
+    wrapper = cls(workspace, "NHD", backend="cudnn")
+    scale = 128**-0.5
+    cases = []
+    for batch in [1, 3]:
+        q = torch.randn(batch * 4, 4, 128, device="cuda", dtype=torch.bfloat16)
+        k = torch.randn(batch * 16, 2, 128, device="cuda", dtype=q.dtype)
+        v = torch.randn_like(k)
+        cases.append(
+            (q, k, v, torch.empty_like(q), torch.empty(batch * 4, 4, device="cuda"))
+        )
+
+    def plan(case, scale_value):
+        q, k, v, _, _ = case
+        batch = q.size(0) // 4
+        qo = torch.arange(batch + 1, dtype=torch.int32) * 4
+        kv = torch.arange(batch + 1, dtype=torch.int32) * 16
+        if paged:
+            wrapper.plan(
+                qo,
+                torch.arange(batch + 1, dtype=torch.int32),
+                torch.arange(batch, dtype=torch.int32),
+                torch.full((batch,), 16, dtype=torch.int32),
+                4,
+                2,
+                128,
+                16,
+                q_data_type=q.dtype,
+                sm_scale=scale_value,
+                seq_lens=torch.full((batch,), 16, dtype=torch.int32, device="cuda"),
+                seq_lens_q=torch.full((batch,), 4, dtype=torch.int32, device="cuda"),
+                max_token_per_sequence=4,
+                max_sequence_kv=16,
+                block_tables=torch.arange(batch, dtype=torch.int32, device="cuda").view(
+                    batch, 1
+                ),
+            )
+        else:
+            wrapper.plan(qo, kv, 4, 2, 128, q_data_type=q.dtype, sm_scale=scale_value)
+
+    def run(case):
+        q, k, v, out, lse = case
+        kwargs = dict(out=out, return_lse=return_lse)
+        if return_lse:
+            kwargs["lse"] = lse
+        if paged:
+            wrapper.run(q, (k.view(-1, 16, 2, 128), v.view(-1, 16, 2, 128)), **kwargs)
+        else:
+            wrapper.run(q, k, v, **kwargs)
+
+    def check(case, scale_value):
+        q, k, v, out, lse = case
+        batch = q.size(0) // 4
+        ref, stats = _reference(q, k, v, [4] * batch, [16] * batch, scale_value)
+        torch.testing.assert_close(out.float(), ref, atol=1e-2, rtol=1e-2)
+        if return_lse:
+            torch.testing.assert_close(lse, stats, atol=1e-3, rtol=1e-3)
+
+    seen = {}
+    for i in range(6):
+        index = i % 2
+        case = cases[index]
+        # Replace runtime Q/K/V/O objects even when returning to the same shape.
+        if i >= 2:
+            case = cases[index] = tuple(t.clone() for t in case)
+            case[0].mul_(0.75)
+            case[2].neg_()
+        plan(case, scale)
+        run(case)
+        check(case, scale)
+        assert wrapper._cudnn_prepared is seen.setdefault(
+            index, wrapper._cudnn_prepared
+        )
+
+    captured_case = cases[1]
+    # Explicitly retain the metadata passed to the captured call. Eager wrappers
+    # do not promise to update a previous capture's metadata on later plan().
+    captured_metadata = wrapper._cudnn_plan
+    capture = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(capture):
+        run(captured_case)
+    for multiplier in [2, 3, 4, 5]:
+        plan(cases[0], scale * multiplier)
+        run(cases[0])
+        check(cases[0], scale * multiplier)
+    assert all(
+        prepared not in wrapper._cudnn_prepared_cache for prepared in seen.values()
+    )
+    assert len(wrapper._cudnn_prepared_cache) == 4
+    assert captured_metadata is not wrapper._cudnn_plan
+    captured_case[0].mul_(0.5)
+    captured_case[2].neg_()
+    captured_case[3].fill_(torch.nan)
+    captured_case[4].fill_(torch.nan)
+    capture.replay()
+    check(captured_case, scale)
+
+
+@pytest.mark.parametrize("backend", ["auto", "cudnn"])
+@pytest.mark.parametrize("graph_mode", [False, True])
+def test_first_ragged_auto_plan_preserves_captured_prefixes(
+    monkeypatch, backend, graph_mode
+):
+    if not cudnn_prefill._cudnn_supports_direct_seqlens(torch.bfloat16):
+        pytest.skip("requires direct cuDNN cumulative sequence lengths")
+    # Exercise auto resolving to cuDNN without pinning the selection heuristics.
+    monkeypatch.setattr(
+        flashinfer.prefill, "determine_attention_backend", lambda *a, **kw: "cudnn"
+    )
+    torch.manual_seed(53)
+    q = torch.randn(20, 4, 128, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(42, 2, 128, device="cuda", dtype=q.dtype)
+    v = torch.randn_like(k)
+    qo = torch.tensor([0, 3, 20], dtype=torch.int32)
+    kv = torch.tensor([0, 9, 42], dtype=torch.int32)
+    buffers = (
+        dict(qo_indptr_buf=qo.cuda(), kv_indptr_buf=kv.cuda()) if graph_mode else {}
+    )
+    wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
+        torch.empty(128 << 20, device="cuda", dtype=torch.uint8),
+        backend=backend,
+        use_cuda_graph=graph_mode,
+        **buffers,
+    )
+
+    def plan():
+        wrapper.plan(qo, kv, 4, 2, 128, q_data_type=q.dtype)
+
+    plan()
+    assert wrapper._backend == "cudnn"
+    ref, ref_lse = _reference(q, k, v, [3, 17], [9, 33], 128**-0.5)
+    out, lse = wrapper.run(q, k, v, return_lse=True)
+    prefixes = (wrapper._qo_indptr_buf.data_ptr(), wrapper._kv_indptr_buf.data_ptr())
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        wrapper.run(q, k, v, out=out, lse=lse, return_lse=True)
+    plan()
+    # Capture stores these addresses. Check their stability before freed storage
+    # can be reused, making the old-code failure deterministic and safe.
+    assert prefixes == (
+        wrapper._qo_indptr_buf.data_ptr(),
+        wrapper._kv_indptr_buf.data_ptr(),
+    )
+    rebound, rebound_lse = wrapper.run(q.clone(), k.clone(), -v, return_lse=True)
+    torch.testing.assert_close(rebound.float(), -ref, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(rebound_lse, ref_lse, atol=1e-3, rtol=1e-3)
+    v.mul_(0.5)
+    out.fill_(float("nan"))
+    lse.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out.float(), ref * 0.5, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(lse, ref_lse, atol=1e-3, rtol=1e-3)
+
+
+@pytest.mark.parametrize(
+    "require_ordered", [False, True], ids=["compatible", "ordered"]
+)
+def test_prepared_ragged_interleaved_wrappers_capture_replan(
+    monkeypatch, require_ordered
+):
+    """Shared graph-cache entries must not share shapes or changing bindings."""
+    if not cudnn_prefill._cudnn_supports_direct_seqlens(torch.bfloat16):
+        pytest.skip("requires direct cuDNN cumulative sequence lengths")
+    if require_ordered and not cudnn_prefill.supports_ordered_cudnn_execution(
+        cudnn_prefill.cudnn.pygraph
+    ):
+        pytest.skip("requires FE ordered tensor execution support")
+    torch.manual_seed(52)
+    scale = 128**-0.5
+    cases = []
+    for q_lens, kv_lens in (([3, 14], [9, 22]), ([9, 2], [7, 16])):
+        wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
+            torch.empty(128 << 20, device="cuda", dtype=torch.uint8),
+            backend="cudnn",
+            use_cuda_graph=True,
+            qo_indptr_buf=torch.empty(3, device="cuda", dtype=torch.int32),
+            kv_indptr_buf=torch.empty(3, device="cuda", dtype=torch.int32),
+        )
+        q = torch.randn(sum(q_lens), 4, 128, device="cuda", dtype=torch.bfloat16)
+        k = torch.randn(sum(kv_lens), 2, 128, device="cuda", dtype=q.dtype)
+        v = torch.randn_like(k)
+        out = torch.empty_like(q)
+        lse = torch.empty(q.shape[:2], device=q.device)
+        cases.append((wrapper, q, k, v, out, lse, q_lens, kv_lens))
+
+    def plan(case):
+        wrapper, _, _, _, _, _, q_lens, kv_lens = case
+        wrapper.plan(
+            torch.tensor([0, q_lens[0], sum(q_lens)], dtype=torch.int32),
+            torch.tensor([0, kv_lens[0], sum(kv_lens)], dtype=torch.int32),
+            4,
+            2,
+            128,
+            causal=False,
+            q_data_type=torch.bfloat16,
+            sm_scale=scale,
+        )
+
+    def run(case):
+        wrapper, q, k, v, out, lse, _, _ = case
+        return wrapper.run(q, k, v, out=out, lse=lse, return_lse=True)
+
+    def check(case):
+        _, q, k, v, out, lse, q_lens, kv_lens = case
+        ref, ref_lse = _reference(q, k, v, q_lens, kv_lens, scale)
+        torch.testing.assert_close(out.float(), ref, atol=1e-2, rtol=1e-2)
+        torch.testing.assert_close(lse, ref_lse, atol=1e-3, rtol=1e-3)
+
+    # Prepare both before capture. Their shapes fall in the same override class.
+    for case in cases:
+        plan(case)
+        run(case)
+        check(case)
+    if require_ordered:
+        original_execute = cudnn_prefill.cudnn.pygraph.execute
+
+        def require_tensor_sequence(self, tensors, *args, tensor_uids=None, **kwargs):
+            assert tensor_uids is not None, "ordered execution fell back to a mapping"
+            assert isinstance(tensors, (tuple, list))
+            return original_execute(
+                self, tensors, *args, tensor_uids=tensor_uids, **kwargs
+            )
+
+        # Include graph instances created after replan/workspace replacement.
+        # The same consumer contract applies to native and FROST providers.
+        monkeypatch.setattr(
+            cudnn_prefill.cudnn.pygraph, "execute", require_tensor_sequence
+        )
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run(cases[0])
+
+    # A second wrapper and replacement workspace cannot mutate captured bindings.
+    other = cases[1][0]
+    other.reset_workspace_buffer(
+        torch.empty_like(other._float_workspace_buffer), other._int_workspace_buffer
+    )
+    run(cases[1])
+    check(cases[1])
+
+    # Replan within the captured bounds, updating the registered indptr buffers.
+    first = cases[0]
+    first[-2].reverse()
+    first[-1].reverse()
+    plan(first)
+    first[1].mul_(0.5)
+    first[4].fill_(torch.nan)
+    first[5].fill_(torch.nan)
+    graph.replay()
+    check(first)
+
+    # The next eager call must use the caller's current stream, not capture's.
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        first[3].neg_()
+        run(first)
+    torch.cuda.current_stream().wait_stream(stream)
+    check(first)
+
+
 @pytest.mark.parametrize("return_lse", [False, True])
 def test_prepared_ragged_rebind_replan_workspace(return_lse):
     if not cudnn_prefill._cudnn_supports_direct_seqlens(torch.bfloat16):
@@ -273,7 +547,7 @@ def test_cudnn_paged_rejects_noncontiguous_buffers_before_dispatch(monkeypatch, 
         pytest.fail("a noncontiguous output buffer reached cuDNN dispatch")
 
     monkeypatch.setattr(
-        flashinfer.prefill, "prepare_cudnn_batch_prefill", unexpected_dispatch
+        flashinfer.prefill, "_reuse_cudnn_prefill_preparation", unexpected_dispatch
     )
     monkeypatch.setattr(
         flashinfer.prefill, "cudnn_batch_prefill_with_kv_cache", unexpected_dispatch

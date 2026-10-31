@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, Any, cast
 from ..tuning import finish_sweep
 
 if TYPE_CHECKING:
-    from .....kernel_src.sm107.next_cutedsl_megamoe import Sm107QuantKind
+    from .automatic import RubinBackend
 
 
 def _backend_module(quant_kind: str, name: str):
@@ -86,16 +86,11 @@ def _dummy_transformed_weights(args, rank: int, world_size: int, quant_kind: str
     )
 
 
-def _stage_dummy_inputs(args, rank, symm_buffer, live_tokens: int, quant_kind: str):
-    """Random activations + near-uniform distinct top-k routing, staged."""
+def _dummy_inputs(args, rank, live_tokens: int):
+    """BF16 activations and near-uniform distinct top-k routing."""
     import torch
 
-    staging_mod = _backend_module(quant_kind, "staging")
-    extra = (
-        {"input_norm_const": args.input_norm_const}
-        if quant_kind == "nvfp4"
-        else {"kind": quant_kind}
-    )
+    from .....tensors import MoEEpTensors
 
     generator = torch.Generator(device="cuda").manual_seed(args.seed + 13 * rank)
     x = torch.randn(
@@ -112,20 +107,7 @@ def _stage_dummy_inputs(args, rank, symm_buffer, live_tokens: int, quant_kind: s
     topk_weights = (
         torch.rand(live_tokens, args.topk, device="cuda", generator=generator) + 0.5
     )
-    staged = staging_mod.stage_mega_moe_inputs(
-        x,
-        topk_weights,
-        topk_ids,
-        symm_buffer.x,
-        symm_buffer.x_sf,
-        symm_buffer.topk_idx,
-        symm_buffer.topk_weights,
-        **extra,
-    )
-    symm_buffer.note_staged_tokens(staged)
-    if quant_kind == "nvfp4":
-        for name in ("fc1_alpha", "fc2_alpha", "fc1_norm_const"):
-            getattr(symm_buffer, name).fill_(getattr(args, name))
+    return MoEEpTensors(x, topk_ids, topk_weights)
 
 
 def tune_one(
@@ -136,8 +118,6 @@ def tune_one(
     import torch
 
     from .....kernel_src.sm107.next_cutedsl_megamoe import (
-        autotune_sm107_block_scaled_mega_moe,
-        get_symm_buffer_for_sm107_block_scaled_mega_moe,
         resolve_knobs,
         sm107_candidates,
         sm107_schedule_candidates,
@@ -151,23 +131,77 @@ def tune_one(
     try:
         transformed = _dummy_transformed_weights(args, rank, world_size, quant_kind)
         l1, l2 = transformed
-        # Candidates copy inputs from this session; its kernel is never launched.
-        symm_buffer = get_symm_buffer_for_sm107_block_scaled_mega_moe(
-            args.num_experts,
-            max_tokens,
-            args.topk,
-            args.hidden,
-            args.intermediate,
-            rank,
-            world_size,
-            quant_kind=cast("Sm107QuantKind", quant_kind),
+        from .....config import BootstrapConfig, FleetParams
+        from .....core.kernel.registry import create_mega_kernel
+        from .forward_tuning import ForwardExecution
+        from .nvfp4_nvfp4_bf16_cutedsl.config import (
+            Sm107_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
+        )
+        from .mxfp8_mxfp8_bf16_cutedsl.config import (
+            Sm107_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig,
+        )
+        from .mxfp8_mxfp4_bf16_cutedsl.config import (
+            Sm107_Mxfp8_Mxfp4_Bf16_Cutedsl_MegaMoeConfig,
+        )
+
+        config_type = (
+            Sm107_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig
+            if quant_kind == "nvfp4"
+            else Sm107_Mxfp8_Mxfp4_Bf16_Cutedsl_MegaMoeConfig
+            if quant_kind == "mxfp4_mxfp8"
+            else Sm107_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig
+        )
+        extra = (
+            {
+                "input_norm_const": args.input_norm_const,
+                **{
+                    name: torch.full(
+                        (args.num_experts // world_size,),
+                        getattr(args, name),
+                        device="cuda",
+                        dtype=torch.float32,
+                    )
+                    for name in ("fc1_alpha", "fc2_alpha", "fc1_norm_const")
+                    if getattr(args, name) != 1.0
+                },
+            }
+            if quant_kind == "nvfp4"
+            else {}
+            if quant_kind == "mxfp4_mxfp8"
+            else {"kind": quant_kind}
+        )
+        config = config_type(
+            intermediate_size=args.intermediate,
+            top_k=args.topk,
+            knobs="auto",
+            kernel_variant=args.kernel_variant,
+            combine_dtype=args.combine_dtype,
             gate_up_clamp=args.gate_up_clamp,
             activation=args.activation,
             situ_beta=args.situ_beta,
             situ_linear_beta=args.situ_linear_beta,
+            in_kernel_fc2_reduce=args.allow_nondeterministic,
+            **extra,
         )
-        _stage_dummy_inputs(args, rank, symm_buffer, live_tokens, quant_kind)
-        y = torch.empty(live_tokens, args.hidden, device="cuda", dtype=torch.bfloat16)
+        backend = cast("RubinBackend", create_mega_kernel(config))
+        backend.bind_ep_bootstrap(BootstrapConfig(rank=rank, world_size=world_size))
+        fleet = FleetParams(args.num_experts, max_tokens, args.hidden)
+        symm_buffer = backend._allocate_workspace(fleet)
+        tensors = _dummy_inputs(args, rank, live_tokens)
+        output = torch.empty(
+            live_tokens, args.hidden, device="cuda", dtype=torch.bfloat16
+        )
+        backend.stage_inputs(tensors, symm_buffer, quantize_input=True)
+        execution = ForwardExecution(
+            backend, tensors, quantize_input=True, output=output
+        )
+
+        def tune_forward(y, l1, l2, workspace, **kwargs):
+            # finish_sweep may have replaced the routing with a skewed workload.
+            if args.skew is not None:
+                tensors.topk_ids.copy_(workspace.topk_idx[:live_tokens])
+                tensors.topk_weights.copy_(workspace.topk_weights[:live_tokens])
+            return execution.tune(l1, l2, workspace, **kwargs)
 
         if args.sweep == "schedule":
             if args.base_knobs:
@@ -178,6 +212,8 @@ def tune_one(
             else:
                 base, src = resolve_knobs(
                     dtype=quant_kind,
+                    kernel_variant=args.kernel_variant,
+                    combine_dtype=args.combine_dtype,
                     world_size=world_size,
                     hidden=args.hidden,
                     intermediate=args.intermediate,
@@ -191,11 +227,15 @@ def tune_one(
                 )
                 if rank == 0:
                     print(f"[moe_ep-tune] schedule sweep base ({src}): {base}")
-            candidates = sm107_schedule_candidates(base)
+            candidates = sm107_schedule_candidates(
+                base, kernel_variant=args.kernel_variant
+            )
         else:
             candidates = sm107_candidates(
                 quant_kind,
-                allow_in_kernel_fc2_reduce=args.allow_nondeterministic,
+                allow_in_kernel_fc2_reduce=args.allow_nondeterministic
+                and args.combine_dtype == "bf16",
+                kernel_variant=args.kernel_variant,
             )
 
         return finish_sweep(
@@ -204,11 +244,16 @@ def tune_one(
             max_tokens,
             live_tokens,
             symm_buffer,
-            y,
+            output,
             l1,
             l2,
             candidates,
-            autotune_sm107_block_scaled_mega_moe,
+            tune_forward,
+            tune_kwargs={
+                "force_tune": True,
+                "install_winner": False,
+                "allow_nondeterministic": args.allow_nondeterministic,
+            },
         )
     except BaseException:
         # A rank-local GPU failure must escape to the job supervisor without
@@ -223,9 +268,13 @@ def tune_one(
 def run_tuning(args, quant_kind: str) -> int:
     """Initialize the runtime and tune each token-capacity bucket."""
     import torch
+    from flashinfer.autotuner import AutoTuner
+    from flashinfer import autotune_v2
 
-    if args.combine_dtype != "bf16":
-        raise SystemExit("the SM107 backends are wired for bf16 combine only")
+    if args.combine_dtype not in ("bf16", "nvfp4", "mxfp8"):
+        raise SystemExit("SM107 supports bf16, nvfp4, or mxfp8 combine")
+    if args.kernel_variant == "genphase" and args.combine_dtype != "bf16":
+        raise SystemExit("GenPhase requires BF16 combine")
     from .validation import validate_input_norm_const
 
     for name in ("input_norm_const", "fc1_alpha", "fc2_alpha", "fc1_norm_const"):
@@ -257,8 +306,9 @@ def run_tuning(args, quant_kind: str) -> int:
             bootstrap, sm107_block_scaled_runtime_requirements(bootstrap)
         )
     try:
-        for max_tokens in args.max_tokens:
-            tune_one(args, rank, world_size, max_tokens, quant_kind)
+        with autotune_v2():
+            for max_tokens in args.max_tokens:
+                tune_one(args, rank, world_size, max_tokens, quant_kind)
         torch.cuda.synchronize()
     except BaseException:
         runtime = None
@@ -272,6 +322,8 @@ def run_tuning(args, quant_kind: str) -> int:
         from .....kernel_src.sm107.next_cutedsl_megamoe import knob_cache_path
 
         print(
-            f"[moe_ep-tune] done; cache: {knob_cache_path() or 'DISABLED'}", flush=True
+            f"[moe_ep-tune] done; MegaMoE cache: {knob_cache_path() or 'DISABLED'}; "
+            f"FlashInfer cache: {AutoTuner.get()._active_managed_store.env_dir}",
+            flush=True,
         )
     return 0

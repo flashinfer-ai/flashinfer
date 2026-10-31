@@ -22,8 +22,12 @@ def prepare_fp8_batched_gemm(
     BF16 output accepts an optional alpha scalar. Dynamic FP8 output returns
     (E4M3 values, int32 packed per-32 UE8M0 scale words[T,H*N/128]); scale
     storage is column-major with T padded to4. Alpha and FP8 do not compose.
-    run() submits the prepared projection on the current PyTorch stream,
-    including descriptor updates and launch overhead, without allocation.
+    The schedule is selected from the token count, the device SM count and
+    the epilogue; a token count whose schedule is not exported raises
+    NotImplementedError at preparation. run() submits the prepared
+    projection on the current PyTorch stream, including launch overhead,
+    without allocation. ``descriptor_workspace`` is accepted for signature
+    stability and ignored: tensor maps travel by value with every launch.
     """
     from .experimental.deepgemm_batched_gemm.batched_gemm import BatchedGemmPlan
 

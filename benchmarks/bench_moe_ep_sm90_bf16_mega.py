@@ -25,7 +25,8 @@ Times two arms at identical routing and expert weights on every EP rank:
   FC2 with fp32 accumulation and a bf16 intermediate, bf16 combine wire, bf16
   output), selected with ``MegaConfig(megakernel=
   Sm90_Bf16_Bf16_Bf16_PushCake_MegaMoeConfig(intermediate_size, top_k,
-  capacity_factor, dedup_dispatch, clamp_limit), quantize_input=True,
+  capacity_factor, dedup_dispatch, clamp_limit, wcx_max_tokens),
+  quantize_input=True,
   preprocess_weights=True)``.
 * ``b1`` -- the same-precision split baseline through the same ``MoEEpLayer``:
   ``SplitConfig(comm=NCCLEPConfig(), kernel=<CUTLASS BF16 split kernel>)`` over
@@ -231,10 +232,26 @@ def _parse_args() -> argparse.Namespace:
     )
     p.add_argument("--capacity-factor", type=float, default=1.0)
     p.add_argument(
+        "--combine-wire",
+        choices=("prereduced", "prereduced_hilo", "per_route"),
+        default=None,
+        help="cand combine wire: prereduced (default; one pre-reduced bf16 row per "
+        "(token, source rank)) or per_route (one row per route, the round-1 wire "
+        "kept for A/B); default follows FLASHINFER_SM90_CAKE_BF16_COMBINE_WIRE",
+    )
+    p.add_argument(
         "--clamp-limit",
         type=float,
         default=None,
         help="cand FC1 gate/up clamp (fp32, before SwiGLU); default none",
+    )
+    p.add_argument(
+        "--wcx-max-tokens",
+        type=int,
+        default=None,
+        help="cand: decode rounds with at most this many local tokens (<= 128) read "
+        "the lossless compressed (WCX) expert weights; 0 = off; default follows "
+        "FLASHINFER_SM90_CAKE_BF16_WCX_MAX_TOKENS (off)",
     )
     p.add_argument("--warmup", type=int, default=3)
     p.add_argument("--iters", type=int, default=20)
@@ -412,6 +429,8 @@ def _build_cand(args, world: int, rank: int, pack, max_tokens: int):
                 capacity_factor=args.capacity_factor,
                 dedup_dispatch=args.dedup_dispatch,
                 clamp_limit=args.clamp_limit,
+                combine_wire=args.combine_wire,
+                wcx_max_tokens=args.wcx_max_tokens,
             ),
             quantize_input=True,
             preprocess_weights=True,

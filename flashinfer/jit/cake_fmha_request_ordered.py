@@ -1,4 +1,4 @@
-"""JIT loader for the generated SM103 request-ordered paged-decode program."""
+"""JIT loader for the generated SM103 request-ordered paged-decode programs."""
 
 from __future__ import annotations
 
@@ -20,7 +20,7 @@ from .core import logger
 
 
 _MANIFEST_NAME = "cake_fmha_request_ordered_paged_decode_manifest.json"
-_SCHEMA = "flashinfer.cake_fmha_request_ordered_paged_decode.v1"
+_SCHEMA = "flashinfer.cake_fmha_request_ordered_paged_decode.v2"
 _CONTRACT = {
     "head_dim": 256,
     "kv_dtype": "float8_e4m3fn",
@@ -32,20 +32,22 @@ _CONTRACT = {
     "request_order": "optional_device_int32",
     "softmax_accumulation_dtype": "float32",
 }
+_KINDS = ("persistent", "two_wave", "low_q1_cga")
+_SPECIALIZATIONS = ("Q_LEN", "WRITE_LSE", "NUM_SPLIT")
 
 
 @dataclass(frozen=True)
 class CakeFmhaRequestOrderedModuleSpec:
-    """One authenticated generated source pair."""
+    """One program instantiation: a device source, its launcher and its defines."""
 
     name: str
-    closure_sha256: str
     device_path: Path
     binding_path: Path
     module_ident: str
     kernel_symbol: str
     ffi_entry: str
     compile_options: tuple[str, ...]
+    defines: tuple[tuple[str, int], ...]
     tma_workspace_bytes: int
 
 
@@ -73,12 +75,8 @@ def _source_root() -> Path:
     )
 
 
-def _sha256(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
-
-
-def _verified_source(root: Path, value: object, digest: object, label: str) -> Path:
-    _require(isinstance(value, str) and bool(value), f"{label}.path")
+def _source(root: Path, value: object, label: str) -> Path:
+    _require(isinstance(value, str) and bool(value), f"{label}")
     assert isinstance(value, str)
     relative = PurePosixPath(value)
     _require(
@@ -86,40 +84,32 @@ def _verified_source(root: Path, value: object, digest: object, label: str) -> P
         and ".." not in relative.parts
         and relative.parts[:2] == ("generated", "sm_103a")
         and len(relative.parts) == 3,
-        f"{label}.path",
+        f"{label}",
     )
     path = root.joinpath(*relative.parts)
-    _require(path.is_file(), f"{label}.path does not exist")
-    _require(
-        isinstance(digest, str)
-        and len(digest) == 64
-        and all(character in "0123456789abcdef" for character in digest),
-        f"{label}.sha256",
-    )
-    _require(_sha256(path) == digest, f"{label}.sha256 mismatch")
+    _require(path.is_file(), f"{label} does not exist")
     return path
+
+
+def _identifier(value: object) -> bool:
+    return isinstance(value, str) and bool(value) and value.replace("_", "a").isalnum()
 
 
 @functools.cache
 def get_cake_fmha_request_ordered_manifest() -> dict[str, Any]:
-    """Load and authenticate the generated-program route ledger."""
+    """Load the module table: programs, their defines and the exact exported routes."""
 
     root = _source_root()
     payload: Any = json.loads((root / _MANIFEST_NAME).read_text())
     _require(isinstance(payload, dict), "root")
     _require(payload.get("schema") == _SCHEMA, "schema")
     _require(payload.get("target") == "sm_103a", "target")
-    _require(payload.get("shape_count") == 43, "shape_count")
-    _require(payload.get("module_count") == 13, "module_count")
     _require(payload.get("contract") == _CONTRACT, "contract")
     modules = payload.get("modules")
-    routes = payload.get("routes")
-    _require(isinstance(modules, list) and len(modules) == 13, "modules")
-    _require(isinstance(routes, list) and len(routes) == 43, "routes")
-    names: set[str] = set()
+    _require(isinstance(modules, list) and bool(modules), "modules")
+    modules_by_name: dict[str, dict[str, Any]] = {}
     for index, module in enumerate(modules):
         _require(isinstance(module, dict), f"modules[{index}]")
-        _require(module.get("arch") == "sm_103a", f"modules[{index}].arch")
         name = module.get("name")
         _require(
             isinstance(name, str)
@@ -127,39 +117,11 @@ def get_cake_fmha_request_ordered_manifest() -> dict[str, Any]:
             and name.replace("_", "").isalnum(),
             f"modules[{index}].name",
         )
-        _require(name not in names, f"duplicate module {name}")
-        names.add(name)
-        _verified_source(
-            root,
-            module.get("device_path"),
-            module.get("device_sha256"),
-            f"modules[{index}].device",
-        )
-        _verified_source(
-            root,
-            module.get("binding_path"),
-            module.get("binding_sha256"),
-            f"modules[{index}].binding",
-        )
-        closure = module.get("closure_sha256")
-        _require(
-            isinstance(closure, str)
-            and len(closure) == 64
-            and all(character in "0123456789abcdef" for character in closure),
-            f"modules[{index}].closure_sha256",
-        )
+        _require(name not in modules_by_name, f"duplicate module {name}")
+        _source(root, module.get("device_path"), f"modules[{index}].device_path")
+        _source(root, module.get("binding_path"), f"modules[{index}].binding_path")
         for field in ("module_ident", "kernel_symbol", "ffi_entry"):
-            value = module.get(field)
-            _require(
-                isinstance(value, str)
-                and bool(value)
-                and value.replace("_", "a").isalnum(),
-                f"modules[{index}].{field}",
-            )
-        _require(
-            module.get("binding_mode") == "embedded_cubin",
-            f"modules[{index}].binding_mode",
-        )
+            _require(_identifier(module.get(field)), f"modules[{index}].{field}")
         _require(
             module.get("compile_options") == ["--use_fast_math"],
             f"modules[{index}].compile_options",
@@ -168,19 +130,62 @@ def get_cake_fmha_request_ordered_manifest() -> dict[str, Any]:
             module.get("tma_workspace_bytes") == 384,
             f"modules[{index}].tma_workspace_bytes",
         )
-    route_names: set[str] = set()
-    for index, route in enumerate(routes):
-        _require(isinstance(route, dict), f"routes[{index}]")
-        shape = route.get("shape")
+        defines = module.get("defines")
         _require(
-            isinstance(shape, str) and bool(shape) and shape not in route_names,
-            f"routes[{index}].shape",
+            isinstance(defines, dict)
+            and set(defines) <= set(_SPECIALIZATIONS)
+            and all(isinstance(value, int) for value in defines.values()),
+            f"modules[{index}].defines",
         )
-        route_names.add(shape)
-        _require(route.get("module_name") in names, f"routes[{index}].module_name")
-        plan = route.get("build_plan")
-        _require(isinstance(plan, dict), f"routes[{index}].build_plan")
-        _require(plan.get("q_len") in (1, 6), f"routes[{index}].build_plan.q_len")
+        _require(module.get("kind") in _KINDS, f"modules[{index}].kind")
+        _require(module.get("q_len") in (1, 6), f"modules[{index}].q_len")
+        _require(
+            isinstance(module.get("write_lse"), bool), f"modules[{index}].write_lse"
+        )
+        _require(
+            isinstance(module.get("num_split"), int) and module["num_split"] >= 1,
+            f"modules[{index}].num_split",
+        )
+        expected_defines = {
+            "Q_LEN": module["q_len"],
+            "NUM_SPLIT": module["num_split"],
+            "WRITE_LSE": int(module["write_lse"]),
+        }
+        _require(
+            all(defines[key] == expected_defines[key] for key in defines),
+            f"modules[{index}].defines disagree with q_len/num_split/write_lse",
+        )
+        modules_by_name[name] = module
+    routes = payload.get("exact_routes")
+    _require(isinstance(routes, list), "exact_routes")
+    for index, route in enumerate(routes):
+        _require(isinstance(route, dict), f"exact_routes[{index}]")
+        _require(
+            route.get("module") in modules_by_name, f"exact_routes[{index}].module"
+        )
+        target = modules_by_name[route["module"]]
+        _require(
+            route.get("q_len") == target["q_len"]
+            and route.get("write_lse") is target["write_lse"],
+            f"exact_routes[{index}] disagrees with module {route['module']}",
+        )
+        lengths = route.get("kv_lens")
+        _require(
+            isinstance(lengths, dict)
+            and isinstance(lengths.get("period"), list)
+            and bool(lengths["period"])
+            and all(isinstance(value, int) for value in lengths["period"])
+            and isinstance(lengths.get("count"), int)
+            and lengths["count"] >= len(lengths["period"]),
+            f"exact_routes[{index}].kv_lens",
+        )
+        grid = route.get("grid")
+        _require(
+            isinstance(grid, list)
+            and len(grid) == 3
+            and all(isinstance(v, int) for v in grid),
+            f"exact_routes[{index}].grid",
+        )
     return payload
 
 
@@ -196,36 +201,30 @@ def get_cake_fmha_request_ordered_module_spec(
     module = matches[0]
     spec = CakeFmhaRequestOrderedModuleSpec(
         name=name,
-        closure_sha256=module["closure_sha256"],
-        device_path=_verified_source(
-            root,
-            module["device_path"],
-            module["device_sha256"],
-            f"module {name} device",
-        ),
-        binding_path=_verified_source(
-            root,
-            module["binding_path"],
-            module["binding_sha256"],
-            f"module {name} binding",
-        ),
+        device_path=_source(root, module["device_path"], f"module {name} device"),
+        binding_path=_source(root, module["binding_path"], f"module {name} binding"),
         module_ident=module["module_ident"],
         kernel_symbol=module["kernel_symbol"],
         ffi_entry=module["ffi_entry"],
         compile_options=tuple(module["compile_options"]),
+        defines=tuple(sorted(module["defines"].items())),
         tma_workspace_bytes=module["tma_workspace_bytes"],
     )
     binding = spec.binding_path.read_text(encoding="utf-8")
-    _require(
-        binding.count(f"TVM_FFI_EMBED_CUBIN({spec.module_ident});") == 1,
-        f"module {name} embedded-cubin declaration",
+    shared = "CAKE_RO_EMBED(CAKE_RO_MODULE_IDENT);" in binding
+    embed = (
+        "CAKE_RO_EMBED(CAKE_RO_MODULE_IDENT);"
+        if shared
+        else f"TVM_FFI_EMBED_CUBIN({spec.module_ident});"
+    )
+    _require(binding.count(embed) == 1, f"module {name} embedded-cubin declaration")
+    module_global = (
+        "CAKE_RO_CONCAT(EmbedCubinModule_, CAKE_RO_MODULE_IDENT)::Global()"
+        if shared
+        else f"EmbedCubinModule_{spec.module_ident}::Global()"
     )
     _require(
-        binding.count(
-            f"EmbedCubinModule_{spec.module_ident}::Global()->mod.GetKernel("
-            f'"{spec.kernel_symbol}")'
-        )
-        == 1,
+        binding.count(f'{module_global}->mod.GetKernel("{spec.kernel_symbol}")') == 1,
         f"module {name} kernel lookup",
     )
     _require(
@@ -285,6 +284,7 @@ def _nvrtc_options(spec: CakeFmhaRequestOrderedModuleSpec) -> tuple[str, ...]:
         if (cccl / "cuda/std").is_dir():
             options.append(f"-I{cccl}")
     options.extend(spec.compile_options)
+    options.extend(f"-D{name}={value}" for name, value in spec.defines)
     return tuple(options)
 
 
@@ -376,8 +376,10 @@ def _cached_cubin(
     identity = hashlib.sha256(
         json.dumps(
             {
-                "closure_sha256": spec.closure_sha256,
+                "binding_sha256": _file_identity(spec.binding_path)["sha256"],
                 "compile_options": list(_nvrtc_options(spec)),
+                "device_sha256": _file_identity(spec.device_path)["sha256"],
+                "module_ident": spec.module_ident,
                 "nvrtc_toolchain": _nvrtc_toolchain_identity(),
                 "target": "sm_103a",
             },
@@ -439,7 +441,7 @@ def _cached_cubin(
 
 @functools.cache
 def load_cake_fmha_request_ordered_module(name: str):
-    """NVRTC-compile and load one exact SM103 generated-program member."""
+    """NVRTC-compile and load one SM103 program instantiation."""
 
     import torch
     from tvm_ffi import cpp
@@ -459,7 +461,7 @@ def load_cake_fmha_request_ordered_module(name: str):
             str(root.parents[2] / "include"),
             str(jit_env.FLASHINFER_CSRC_DIR),
         ],
-        extra_cflags=["-O3"],
+        extra_cflags=["-O3", f"-DCAKE_RO_MODULE_IDENT={spec.module_ident}"],
         extra_ldflags=["-lcuda"],
         build_directory=str(build_directory),
     )

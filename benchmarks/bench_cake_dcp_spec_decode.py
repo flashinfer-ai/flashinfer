@@ -55,7 +55,7 @@ from flashinfer.cake_dcp import (
     get_dcp_spec_workspace_size_bytes,
     run_dcp_spec_decode,
 )
-from flashinfer.jit.cake_fmha import CAKE_FMHA_MANIFEST_SHA256
+from flashinfer.jit.cake_fmha import CAKE_FMHA_JIT_TAG
 from flashinfer.testing import bench_gpu_time_with_cupti
 from flashinfer.utils import get_compute_capability
 
@@ -662,7 +662,7 @@ def main() -> int:
         "compute_capability": ".".join(map(str, get_compute_capability(device))),
         "arch": _device_arch(device),
         "sm_count": properties.multi_processor_count,
-        "manifest_sha256_12": CAKE_FMHA_MANIFEST_SHA256[:12],
+        "jit_tag": CAKE_FMHA_JIT_TAG,
         "torch": torch.__version__,
         "timing": "CUPTI, cold L2"
         + (

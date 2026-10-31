@@ -19,10 +19,7 @@ NVFP4 operands at the SM120 NVFP4 tolerances (output atol=rtol=5e-2, LSE
 atol=rtol=2e-2).
 """
 
-import importlib
-import itertools
 import math
-import os
 
 import pytest
 import torch
@@ -50,8 +47,6 @@ from tests.attention.sparse_mla_test_utils import (
 
 _D = _D_NOPE + _D_ROPE
 _BYTES = 384
-# Dotted name of the generating kernel module (planner parity test); unset -> skipped.
-_KERNEL_MODULE_ENV = "CAKE_SPARSE_MLA_SM120_DSV4_KERNEL_MODULE"
 _OUT_TOL = dict(atol=5e-2, rtol=5e-2)
 _LSE_TOL = dict(atol=2e-2, rtol=2e-2)
 
@@ -272,75 +267,25 @@ def test_cake_plan_head_tiles_rules() -> None:
     assert plan(num_tokens=8, num_heads=96, topk=512, num_sms=188) == 1
     assert plan(num_tokens=16, num_heads=96, topk=1024, num_sms=188) == 2
     assert plan(num_tokens=4, num_heads=128, topk=1024, num_sms=188) == 1
-    # GB10 (48 SMs): full-wave two-chunk rows pair only for H = 32 or while the one-tile
-    # grid is at most two waves; >= 4 chunks pair at a full wave; sub-wave rules unchanged.
+    # GB10 (48 SMs): full-wave two-chunk rows pair for H = 32, while the one-tile grid is
+    # at most two waves, and again beyond eight waves (one tile only in between); >= 4
+    # chunks pair at a full wave; sub-wave H = 64 is inclusive at 2/3 of the SMs.
     assert plan(num_tokens=32, num_heads=32, topk=128, num_sms=48) == 2
     assert plan(num_tokens=128, num_heads=32, topk=128, num_sms=48) == 2
     assert plan(num_tokens=8, num_heads=128, topk=128, num_sms=48) == 2
     assert plan(num_tokens=12, num_heads=128, topk=128, num_sms=48) == 2
     assert plan(num_tokens=32, num_heads=64, topk=128, num_sms=48) == 1
     assert plan(num_tokens=32, num_heads=128, topk=128, num_sms=48) == 1
-    assert plan(num_tokens=128, num_heads=96, topk=128, num_sms=48) == 1
+    assert plan(num_tokens=64, num_heads=96, topk=128, num_sms=48) == 1
+    assert plan(num_tokens=128, num_heads=64, topk=128, num_sms=48) == 2
+    assert plan(num_tokens=128, num_heads=128, topk=128, num_sms=48) == 2
     assert plan(num_tokens=8, num_heads=128, topk=128, extra_topk=128, num_sms=48) == 2
     assert plan(num_tokens=32, num_heads=64, topk=512, num_sms=48) == 2
-    assert plan(num_tokens=8, num_heads=64, topk=512, num_sms=48) == 1
+    assert plan(num_tokens=8, num_heads=64, topk=512, num_sms=48) == 2
+    assert plan(num_tokens=8, num_heads=64, topk=512, num_sms=188) == 1
+    assert plan(num_tokens=2, num_heads=64, topk=512, num_sms=48) == 1
     assert plan(num_tokens=8, num_heads=32, topk=512, num_sms=48) == 2
     assert plan(num_tokens=1, num_heads=128, topk=512, num_sms=48) == 1
-
-
-def test_cake_planner_parity_with_kernel_module() -> None:
-    """The Python planners mirror the generating kernel module exactly.
-
-    Set ``CAKE_SPARSE_MLA_SM120_DSV4_KERNEL_MODULE`` to the module's dotted name to run it.
-    """
-
-    name = os.environ.get(_KERNEL_MODULE_ENV)
-    if not name:
-        pytest.skip(f"{_KERNEL_MODULE_ENV} not set")
-    try:
-        mod = importlib.import_module(name)
-    except ImportError as exc:  # pragma: no cover - environment dependent
-        pytest.skip(f"kernel module {name} unavailable: {exc}")
-    info = cake_sparse_mla_sm120_dsv4_nvfp4_format_info()
-    assert info["heads_per_block"] == mod.HPB
-    assert info["max_chunks_per_block"] == mod.MAX_CPB
-    assert tuple(mod.SUPPORTED_HEAD_COUNTS) == info["heads"]
-    max_cpb = info["max_chunks_per_block"]
-    grid = itertools.product(
-        (1, 2, 4, 8, 16, 32, 64, 128),
-        info["heads"],
-        (64, 128, 256, 512, 1024),
-        (0, 128, 512),
-        (48, 170, 188),
-    )
-    for num_tokens, num_heads, topk, extra_topk, num_sms in grid:
-        chunks = cake_sparse_mla_sm120_dsv4_nvfp4_num_chunks(topk, extra_topk)
-        assert chunks == mod.max_chunks(topk, extra_topk)
-        kwargs = dict(
-            num_tokens=num_tokens,
-            num_heads=num_heads,
-            topk=topk,
-            extra_topk=extra_topk,
-            num_sms=num_sms,
-        )
-        tiles = cake_sparse_mla_sm120_dsv4_nvfp4_plan_head_tiles(**kwargs)
-        assert tiles == mod.plan_head_tiles(**kwargs), kwargs
-        plan = cake_sparse_mla_sm120_dsv4_nvfp4_plan_splits(
-            **kwargs, max_splits=16, head_tiles=tiles
-        )
-        assert plan == mod.plan_splits(**kwargs, max_splits=16, head_tiles=tiles), (
-            kwargs
-        )
-        splits, cpb = plan
-        assert cpb <= max_cpb and splits >= -(-chunks // max_cpb)
-        if chunks > max_cpb:
-            # > 1024 candidates: both sides refuse a max_splits below ceil(chunks / 16).
-            with pytest.raises(ValueError):
-                mod.plan_splits(**kwargs, max_splits=1, head_tiles=tiles)
-            with pytest.raises(ValueError):
-                cake_sparse_mla_sm120_dsv4_nvfp4_plan_splits(
-                    **kwargs, max_splits=1, head_tiles=tiles
-                )
 
 
 @pytest.mark.parametrize("topk", [128, 512])

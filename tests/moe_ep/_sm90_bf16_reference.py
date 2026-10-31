@@ -103,6 +103,7 @@ def compare_bf16(
         "mismatches": bad,
         "numel": int(err.numel()),
         "max_abs_err": float(err.max().item()) if err.numel() else 0.0,
+        "mean_abs_err": float(err.mean().item()) if err.numel() else 0.0,
         "rel_l2": float((err.norm() / exp.norm().clamp_min(1e-12)).item())
         if err.numel()
         else 0.0,

@@ -22,7 +22,7 @@ TransformedMegaWeights = Tuple[
     Tuple["torch.Tensor", "torch.Tensor"],
 ]
 
-Mxfp8Kind = Literal["mxfp8_e4m3", "mxfp8_e5m2"]
+Mxfp8Kind = Literal["mxfp8_e4m3", "mxfp8_e5m2", "mxfp4_mxfp8"]
 
 
 def _fc1_weight_from_w13(
@@ -77,9 +77,40 @@ def preprocess_mega_weights(
     kind: Mxfp8Kind = "mxfp8_e4m3",
     gate_up_clamp: float | None = None,
     activation_clamp: float | None = None,
+    kernel_variant: Literal["inference", "genphase"] = "inference",
 ) -> TransformedMegaWeights:
     """bf16 (or pre-quantized) weights → MXFP8 + swizzled-SF mega layout."""
     import torch
+
+    if kernel_variant == "genphase":
+        from ......kernel_src.sm100.next_cutedsl_megamoe import (
+            preprocess_genphase_prequantized_weights,
+            preprocess_genphase_weights,
+        )
+
+        if isinstance(weights, PrequantizedMoEWeights):
+            return preprocess_genphase_prequantized_weights(
+                weights.w13,
+                weights.w2,
+                _as_mxfp8_scale(weights.w13_scale),
+                _as_mxfp8_scale(weights.w2_scale),
+                quant_kind=kind,
+                hidden_size=hidden_size,
+                intermediate_size=intermediate_size,
+            )
+        if weights.w13.ndim != 3 or weights.w13.shape[1:] != (
+            2 * intermediate_size,
+            hidden_size,
+        ):
+            raise ValueError("GenPhase w13 must have canonical shape [E, 2I, H].")
+        return preprocess_genphase_weights(
+            weights.w13,
+            weights.w2,
+            quant_kind=kind,
+            intermediate_size=intermediate_size,
+        )
+    if kernel_variant != "inference":
+        raise ValueError(f"unsupported kernel_variant {kernel_variant!r}")
 
     # Backend talks only to the cutedsl_megamoe shim (never src/ directly); the
     # shim exposes the cutlass-pulling stacking helper lazily via the boundary.

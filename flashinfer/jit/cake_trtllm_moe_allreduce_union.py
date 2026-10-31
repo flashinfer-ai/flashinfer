@@ -21,20 +21,23 @@ of a route (``world_rank`` is a kernel argument), PDL and the cooperative
 launch are runtime launch flags, and the SM100/SM103 programs share one source
 (the only per-architecture statement is guarded by ``__CUDA_ARCH__``).  Every
 kernel is compiled per architecture together with the one launcher
-translation unit ``cake_trtllm_moe_allreduce_union_launcher.cu``.
+translation unit ``cake_trtllm_moe_allreduce_union_launcher.cu``; a kernel
+whose record names a ``source`` is built from that sibling kernel's
+translation unit, with the record's ``defines`` selecting its program text.
 
 ``KERNELS`` lists the kernels; ``ROUTES`` maps one route key
 ``(arch, world_size, dtype, launch_with_pdl, specialization)`` to the kernel
-(or the per-rank kernels of a rank-specialised route) and its residency
-parameters; ``_REVIEWED_SPECIALIZATIONS`` selects a specialization for the
-reviewed ``(token_num, num_experts)`` points.
+and its residency parameters; ``_SPECIALIZATION_RULES`` selects a
+specialization for the reviewed ``num_experts`` and token ranges, and
+``_WIDE_MLP_CLASSES`` names the classes whose program outside those ranges is
+``wide_mlp`` (``generic`` otherwise).
 """
 
 from __future__ import annotations
 
 import functools
 from pathlib import Path
-from typing import Literal, NamedTuple, Optional, Sequence, Union
+from typing import Literal, NamedTuple, Optional, Sequence
 
 import torch
 
@@ -65,24 +68,35 @@ _DTYPE_CTYPE = {"float16": "__half", "bfloat16": "__nv_bfloat16"}
 
 
 class Kernel(NamedTuple):
-    """One generated kernel translation unit."""
+    """One generated kernel program.
+
+    ``source`` names the sibling kernel whose translation unit builds this
+    program (``None``: the kernel's own ``<name>.cu``); ``defines`` are the
+    compile definitions that select this program's text in that source.
+    ``role_threads`` are the threads of each CTA beside the token's (a warp
+    outside the work warps): the launcher holds ``block - role_threads`` CTA
+    threads times ``cluster`` to one token.
+    """
 
     dtype: str
     world_size: int
     block: int
     cluster: int
+    source: Optional[str] = None
+    defines: tuple[str, ...] = ()
+    role_threads: int = 0
 
 
 class Route(NamedTuple):
-    """The kernel(s) and residency of one route.
+    """The kernel and residency of one route.
 
-    ``kernel`` is one kernel name, or one name per rank for the rank-specialised
-    routes.  ``persistent_ctas_per_sm`` and ``max_persistent_clusters`` size the
-    persistent cluster grid (see :func:`launch_grid_x`); ``cooperative`` launches
-    one co-resident cluster per token.
+    ``kernel`` is the kernel name.  ``persistent_ctas_per_sm`` and
+    ``max_persistent_clusters`` size the persistent cluster grid (see
+    :func:`launch_grid_x`); ``cooperative`` launches one co-resident cluster per
+    token.
     """
 
-    kernel: Union[str, tuple[str, ...]]
+    kernel: str
     persistent_ctas_per_sm: int
     max_persistent_clusters: Optional[int]
     cooperative: bool
@@ -90,147 +104,159 @@ class Route(NamedTuple):
 
 KERNELS: dict[str, Kernel] = {
     "ws2_bf16_wide_mlp": Kernel("bfloat16", 2, 224, 4),
-    "ws2_bf16_wide_mlp_cta1": Kernel("bfloat16", 2, 896, 1),
-    "ws2_bf16_pipe2_u4": Kernel("bfloat16", 2, 224, 4),
-    "ws2_bf16_pipe2_u4_b5": Kernel("bfloat16", 2, 224, 4),
-    "ws2_f16_pipe2_u4_b5": Kernel("float16", 2, 224, 4),
     "ws2_f16_wide_mlp": Kernel("float16", 2, 224, 4),
-    "ws4_bf16_clrfirst": Kernel("bfloat16", 4, 224, 4),
     "ws4_bf16_generic": Kernel("bfloat16", 4, 224, 4),
-    "ws4_bf16_wide_mlp_t1_e8_serial_clear_cta1": Kernel("bfloat16", 4, 896, 1),
-    "ws4_bf16_pipe2_u4_b5": Kernel("bfloat16", 4, 224, 4),
     "ws4_bf16_wide_mlp": Kernel("bfloat16", 4, 224, 4),
-    "ws4_f16_pipe2_u4_b5": Kernel("float16", 4, 224, 4),
     "ws4_f16_wide_mlp": Kernel("float16", 4, 224, 4),
-    "ws4_f16_wide_mlp_t128_e16_owner_forward_rank0": Kernel("float16", 4, 224, 4),
-    "ws4_f16_wide_mlp_t128_e16_owner_forward_rank1": Kernel("float16", 4, 224, 4),
-    "ws4_f16_wide_mlp_t128_e16_owner_forward_rank2": Kernel("float16", 4, 224, 4),
-    "ws4_f16_wide_mlp_t128_e16_owner_forward_rank3": Kernel("float16", 4, 224, 4),
     "ws8_bf16_generic": Kernel("bfloat16", 8, 224, 4),
-    "ws8_bf16_sm100_ws8_mid": Kernel("bfloat16", 8, 224, 4),
-    "ws8_bf16_pipe1_u4_b5": Kernel("bfloat16", 8, 224, 4),
     "ws8_f16_generic": Kernel("float16", 8, 224, 4),
-    "ws8_f16_pipe1_u4_b5": Kernel("float16", 8, 224, 4),
-    "ws8_f16_sm100_ws8_mid": Kernel("float16", 8, 224, 4),
-    "ws2_bf16_sm103_t1": Kernel("bfloat16", 2, 224, 4),
     "ws2_bf16_generic": Kernel("bfloat16", 2, 224, 4),
-    "ws2_bf16_pipe1_u4_b5": Kernel("bfloat16", 2, 224, 4),
     "ws2_f16_generic": Kernel("float16", 2, 224, 4),
-    "ws2_f16_pipe1_u4_b5": Kernel("float16", 2, 224, 4),
-    "ws4_bf16_sm103_t1_t1_e8_serial_clear": Kernel("bfloat16", 4, 224, 4),
-    "ws8_bf16_pipe1": Kernel("bfloat16", 8, 224, 4),
-    "ws8_bf16_push_g": Kernel("bfloat16", 8, 224, 4),
-    "ws8_bf16_sm103_t1": Kernel("bfloat16", 8, 224, 4),
-    "ws8_f16_push_g": Kernel("float16", 8, 224, 4),
+    "ws2_bf16_lat_b4": Kernel("bfloat16", 2, 224, 4),
+    "ws2_f16_lat_b4": Kernel("float16", 2, 224, 4),
+    "ws2_bf16_lat_late_b5": Kernel("bfloat16", 2, 224, 4),
+    "ws2_f16_lat_late_b5": Kernel("float16", 2, 224, 4),
+    "ws4_bf16_two_shot_b4": Kernel("bfloat16", 4, 224, 4),
+    "ws4_f16_two_shot_b4": Kernel("float16", 4, 224, 4),
+    "ws4_bf16_two_shot_b5": Kernel("bfloat16", 4, 224, 4),
+    "ws4_f16_two_shot_b5": Kernel("float16", 4, 224, 4),
+    "ws8_bf16_two_shot_b4": Kernel("bfloat16", 8, 224, 4),
+    "ws8_bf16_two_shot_b5": Kernel("bfloat16", 8, 224, 4),
+    "ws8_f16_two_shot_b5": Kernel("float16", 8, 224, 4),
+    "ws2_bf16_lat_t1": Kernel("bfloat16", 2, 224, 4),
+    "ws2_bf16_lat_t1f": Kernel("bfloat16", 2, 256, 4, role_threads=32),
+    "ws4_bf16_lat_t1": Kernel("bfloat16", 4, 224, 4),
+    "ws4_bf16_lat_t1f": Kernel("bfloat16", 4, 256, 4, role_threads=32),
+    "ws8_bf16_lat_t1": Kernel("bfloat16", 8, 224, 4),
+    "ws8_bf16_lat_t1f": Kernel("bfloat16", 8, 256, 4, role_threads=32),
+    "ws8_bf16_two_shot_il_b4": Kernel("bfloat16", 8, 224, 4),
+    "ws8_f16_two_shot_il_b4": Kernel("float16", 8, 224, 4),
 }
 
 ROUTES: dict[tuple[str, int, str, bool, str], Route] = {
+    ("sm_100a", 2, "bfloat16", False, "lat_b4"): Route(
+        "ws2_bf16_lat_b4", 4, 142, False
+    ),
+    ("sm_100a", 2, "bfloat16", False, "lat_late_b5"): Route(
+        "ws2_bf16_lat_late_b5", 5, 175, False
+    ),
+    ("sm_100a", 2, "bfloat16", False, "lat_t1"): Route("ws2_bf16_lat_t1", 2, 71, False),
+    ("sm_100a", 2, "bfloat16", False, "lat_t1f"): Route(
+        "ws2_bf16_lat_t1f", 2, 71, False
+    ),
     ("sm_100a", 2, "bfloat16", False, "wide_mlp"): Route(
         "ws2_bf16_wide_mlp", 4, None, False
     ),
-    ("sm_100a", 2, "bfloat16", False, "wide_mlp_cta1"): Route(
-        "ws2_bf16_wide_mlp_cta1", 1, None, False
-    ),
-    ("sm_100a", 2, "bfloat16", True, "pipe2_u4"): Route(
-        "ws2_bf16_pipe2_u4", 4, None, False
-    ),
-    ("sm_100a", 2, "bfloat16", True, "pipe2_u4_b5"): Route(
-        "ws2_bf16_pipe2_u4_b5", 5, 175, False
+    ("sm_100a", 2, "bfloat16", True, "lat_b4"): Route("ws2_bf16_lat_b4", 4, 142, False),
+    ("sm_100a", 2, "bfloat16", True, "lat_late_b5"): Route(
+        "ws2_bf16_lat_late_b5", 5, 175, False
     ),
     ("sm_100a", 2, "bfloat16", True, "wide_mlp"): Route(
         "ws2_bf16_wide_mlp", 4, None, False
     ),
-    ("sm_100a", 2, "float16", False, "pipe2_u4_b5"): Route(
-        "ws2_f16_pipe2_u4_b5", 5, 175, False
+    ("sm_100a", 2, "float16", False, "lat_b4"): Route("ws2_f16_lat_b4", 4, 142, False),
+    ("sm_100a", 2, "float16", False, "lat_late_b5"): Route(
+        "ws2_f16_lat_late_b5", 5, 175, False
     ),
     ("sm_100a", 2, "float16", False, "wide_mlp"): Route(
         "ws2_f16_wide_mlp", 4, None, False
     ),
-    ("sm_100a", 2, "float16", True, "pipe2_u4_b5"): Route(
-        "ws2_f16_pipe2_u4_b5", 5, 175, False
+    ("sm_100a", 2, "float16", True, "lat_b4"): Route("ws2_f16_lat_b4", 4, 142, False),
+    ("sm_100a", 2, "float16", True, "lat_late_b5"): Route(
+        "ws2_f16_lat_late_b5", 5, 175, False
     ),
     ("sm_100a", 2, "float16", True, "wide_mlp"): Route(
         "ws2_f16_wide_mlp", 4, None, False
     ),
-    ("sm_100a", 4, "bfloat16", False, "clrfirst"): Route(
-        "ws4_bf16_clrfirst", 4, None, False
-    ),
     ("sm_100a", 4, "bfloat16", False, "generic"): Route(
         "ws4_bf16_generic", 4, None, False
     ),
-    ("sm_100a", 4, "bfloat16", False, "wide_mlp_t1_e8_serial_clear_cta1"): Route(
-        "ws4_bf16_wide_mlp_t1_e8_serial_clear_cta1", 1, None, False
+    ("sm_100a", 4, "bfloat16", False, "lat_t1"): Route("ws4_bf16_lat_t1", 2, 71, False),
+    ("sm_100a", 4, "bfloat16", False, "lat_t1f"): Route(
+        "ws4_bf16_lat_t1f", 2, 71, False
+    ),
+    ("sm_100a", 4, "bfloat16", False, "two_shot_b4"): Route(
+        "ws4_bf16_two_shot_b4", 4, 142, False
     ),
     ("sm_100a", 4, "bfloat16", True, "generic"): Route(
         "ws4_bf16_generic", 4, None, False
     ),
-    ("sm_100a", 4, "bfloat16", True, "pipe2_u4_b5"): Route(
-        "ws4_bf16_pipe2_u4_b5", 5, 175, False
+    ("sm_100a", 4, "bfloat16", True, "two_shot_b4"): Route(
+        "ws4_bf16_two_shot_b4", 4, 142, False
     ),
-    ("sm_100a", 4, "bfloat16", True, "wide_mlp"): Route(
-        "ws4_bf16_wide_mlp", 3, None, False
+    ("sm_100a", 4, "bfloat16", True, "two_shot_b5"): Route(
+        "ws4_bf16_two_shot_b5", 5, 175, False
     ),
-    ("sm_100a", 4, "float16", False, "pipe2_u4_b5"): Route(
-        "ws4_f16_pipe2_u4_b5", 5, 175, False
+    ("sm_100a", 4, "float16", False, "two_shot_b4"): Route(
+        "ws4_f16_two_shot_b4", 4, 142, False
+    ),
+    ("sm_100a", 4, "float16", False, "two_shot_b5"): Route(
+        "ws4_f16_two_shot_b5", 5, 175, False
     ),
     ("sm_100a", 4, "float16", False, "wide_mlp"): Route(
         "ws4_f16_wide_mlp", 4, None, False
     ),
-    ("sm_100a", 4, "float16", False, "wide_mlp_t64_e12_resident"): Route(
-        "ws4_f16_wide_mlp", 1, None, True
+    ("sm_100a", 4, "float16", True, "two_shot_b4"): Route(
+        "ws4_f16_two_shot_b4", 4, 142, False
     ),
-    ("sm_100a", 4, "float16", True, "pipe2_u4_b5"): Route(
-        "ws4_f16_pipe2_u4_b5", 5, 175, False
+    ("sm_100a", 4, "float16", True, "two_shot_b5"): Route(
+        "ws4_f16_two_shot_b5", 5, 175, False
     ),
     ("sm_100a", 4, "float16", True, "wide_mlp"): Route(
         "ws4_f16_wide_mlp", 4, None, False
     ),
-    ("sm_100a", 4, "float16", True, "wide_mlp_t128_e16_owner_forward"): Route(
-        (
-            "ws4_f16_wide_mlp_t128_e16_owner_forward_rank0",
-            "ws4_f16_wide_mlp_t128_e16_owner_forward_rank1",
-            "ws4_f16_wide_mlp_t128_e16_owner_forward_rank2",
-            "ws4_f16_wide_mlp_t128_e16_owner_forward_rank3",
-        ),
-        1,
-        None,
-        True,
-    ),
     ("sm_100a", 8, "bfloat16", False, "generic"): Route(
         "ws8_bf16_generic", 4, None, False
     ),
-    ("sm_100a", 8, "bfloat16", False, "sm100_ws8_mid"): Route(
-        "ws8_bf16_sm100_ws8_mid", 4, None, False
+    ("sm_100a", 8, "bfloat16", False, "lat_t1"): Route("ws8_bf16_lat_t1", 2, 71, False),
+    ("sm_100a", 8, "bfloat16", False, "lat_t1f"): Route(
+        "ws8_bf16_lat_t1f", 2, 71, False
+    ),
+    ("sm_100a", 8, "bfloat16", False, "two_shot_b4"): Route(
+        "ws8_bf16_two_shot_b4", 4, 142, False
+    ),
+    ("sm_100a", 8, "bfloat16", False, "two_shot_il_b4"): Route(
+        "ws8_bf16_two_shot_il_b4", 4, 142, False
     ),
     ("sm_100a", 8, "bfloat16", True, "generic"): Route(
         "ws8_bf16_generic", 4, None, False
     ),
-    ("sm_100a", 8, "bfloat16", True, "pipe1_u4_b5"): Route(
-        "ws8_bf16_pipe1_u4_b5", 5, 175, False
+    ("sm_100a", 8, "bfloat16", True, "two_shot_b4"): Route(
+        "ws8_bf16_two_shot_b4", 4, 142, False
     ),
-    ("sm_100a", 8, "bfloat16", True, "sm100_ws8_mid"): Route(
-        "ws8_bf16_sm100_ws8_mid", 4, None, False
+    ("sm_100a", 8, "bfloat16", True, "two_shot_b5"): Route(
+        "ws8_bf16_two_shot_b5", 5, 175, False
+    ),
+    ("sm_100a", 8, "bfloat16", True, "two_shot_il_b4"): Route(
+        "ws8_bf16_two_shot_il_b4", 4, 142, False
     ),
     ("sm_100a", 8, "float16", False, "generic"): Route(
         "ws8_f16_generic", 4, None, False
     ),
-    ("sm_100a", 8, "float16", False, "pipe1_u4_b5"): Route(
-        "ws8_f16_pipe1_u4_b5", 5, 175, False
+    ("sm_100a", 8, "float16", False, "two_shot_b5"): Route(
+        "ws8_f16_two_shot_b5", 5, 175, False
     ),
-    ("sm_100a", 8, "float16", False, "sm100_ws8_mid"): Route(
-        "ws8_f16_sm100_ws8_mid", 4, None, False
+    ("sm_100a", 8, "float16", False, "two_shot_il_b4"): Route(
+        "ws8_f16_two_shot_il_b4", 4, 142, False
     ),
     ("sm_100a", 8, "float16", True, "generic"): Route(
         "ws8_f16_generic", 4, None, False
     ),
-    ("sm_100a", 8, "float16", True, "pipe1_u4_b5"): Route(
-        "ws8_f16_pipe1_u4_b5", 5, 175, False
+    ("sm_100a", 8, "float16", True, "two_shot_b5"): Route(
+        "ws8_f16_two_shot_b5", 5, 175, False
     ),
-    ("sm_100a", 8, "float16", True, "sm100_ws8_mid"): Route(
-        "ws8_f16_sm100_ws8_mid", 4, None, False
+    ("sm_100a", 8, "float16", True, "two_shot_il_b4"): Route(
+        "ws8_f16_two_shot_il_b4", 4, 142, False
     ),
-    ("sm_103a", 2, "bfloat16", False, "sm103_t1"): Route(
-        "ws2_bf16_sm103_t1", 1, None, False
+    ("sm_103a", 2, "bfloat16", False, "lat_b4"): Route(
+        "ws2_bf16_lat_b4", 4, 142, False
+    ),
+    ("sm_103a", 2, "bfloat16", False, "lat_late_b5"): Route(
+        "ws2_bf16_lat_late_b5", 5, 175, False
+    ),
+    ("sm_103a", 2, "bfloat16", False, "lat_t1"): Route("ws2_bf16_lat_t1", 2, 71, False),
+    ("sm_103a", 2, "bfloat16", False, "lat_t1f"): Route(
+        "ws2_bf16_lat_t1f", 2, 71, False
     ),
     ("sm_103a", 2, "bfloat16", False, "wide_mlp"): Route(
         "ws2_bf16_wide_mlp", 4, None, False
@@ -238,29 +264,30 @@ ROUTES: dict[tuple[str, int, str, bool, str], Route] = {
     ("sm_103a", 2, "bfloat16", True, "generic"): Route(
         "ws2_bf16_generic", 5, None, False
     ),
-    ("sm_103a", 2, "bfloat16", True, "pipe1_u4_b5"): Route(
-        "ws2_bf16_pipe1_u4_b5", 5, 175, False
-    ),
-    ("sm_103a", 2, "bfloat16", True, "wide_mlp"): Route(
-        "ws2_bf16_wide_mlp", 4, None, False
+    ("sm_103a", 2, "bfloat16", True, "lat_b4"): Route("ws2_bf16_lat_b4", 4, 142, False),
+    ("sm_103a", 2, "bfloat16", True, "lat_late_b5"): Route(
+        "ws2_bf16_lat_late_b5", 5, 175, False
     ),
     ("sm_103a", 2, "float16", False, "generic"): Route(
         "ws2_f16_generic", 5, None, False
     ),
-    ("sm_103a", 2, "float16", False, "pipe1_u4_b5"): Route(
-        "ws2_f16_pipe1_u4_b5", 5, 175, False
+    ("sm_103a", 2, "float16", False, "lat_b4"): Route("ws2_f16_lat_b4", 4, 142, False),
+    ("sm_103a", 2, "float16", False, "lat_late_b5"): Route(
+        "ws2_f16_lat_late_b5", 5, 175, False
     ),
     ("sm_103a", 2, "float16", True, "generic"): Route(
         "ws2_f16_generic", 5, None, False
     ),
-    ("sm_103a", 2, "float16", True, "pipe1_u4_b5"): Route(
-        "ws2_f16_pipe1_u4_b5", 5, 175, False
+    ("sm_103a", 2, "float16", True, "lat_b4"): Route("ws2_f16_lat_b4", 4, 142, False),
+    ("sm_103a", 2, "float16", True, "lat_late_b5"): Route(
+        "ws2_f16_lat_late_b5", 5, 175, False
     ),
-    ("sm_103a", 2, "float16", True, "wide_mlp"): Route(
-        "ws2_f16_wide_mlp", 4, None, False
+    ("sm_103a", 4, "bfloat16", False, "lat_t1"): Route("ws4_bf16_lat_t1", 2, 71, False),
+    ("sm_103a", 4, "bfloat16", False, "lat_t1f"): Route(
+        "ws4_bf16_lat_t1f", 2, 71, False
     ),
-    ("sm_103a", 4, "bfloat16", False, "sm103_t1_t1_e8_serial_clear"): Route(
-        "ws4_bf16_sm103_t1_t1_e8_serial_clear", 1, None, False
+    ("sm_103a", 4, "bfloat16", False, "two_shot_b4"): Route(
+        "ws4_bf16_two_shot_b4", 4, 142, False
     ),
     ("sm_103a", 4, "bfloat16", False, "wide_mlp"): Route(
         "ws4_bf16_wide_mlp", 4, None, False
@@ -268,132 +295,190 @@ ROUTES: dict[tuple[str, int, str, bool, str], Route] = {
     ("sm_103a", 4, "bfloat16", True, "generic"): Route(
         "ws4_bf16_generic", 5, None, False
     ),
-    ("sm_103a", 4, "bfloat16", True, "pipe2_u4_b5"): Route(
-        "ws4_bf16_pipe2_u4_b5", 5, 175, False
+    ("sm_103a", 4, "bfloat16", True, "two_shot_b4"): Route(
+        "ws4_bf16_two_shot_b4", 4, 142, False
     ),
-    ("sm_103a", 4, "bfloat16", True, "wide_mlp"): Route(
-        "ws4_bf16_wide_mlp", 4, None, False
+    ("sm_103a", 4, "bfloat16", True, "two_shot_b5"): Route(
+        "ws4_bf16_two_shot_b5", 5, 175, False
     ),
-    ("sm_103a", 4, "float16", False, "pipe2_u4_b5"): Route(
-        "ws4_f16_pipe2_u4_b5", 5, 175, False
+    ("sm_103a", 4, "float16", False, "two_shot_b4"): Route(
+        "ws4_f16_two_shot_b4", 4, 142, False
+    ),
+    ("sm_103a", 4, "float16", False, "two_shot_b5"): Route(
+        "ws4_f16_two_shot_b5", 5, 175, False
     ),
     ("sm_103a", 4, "float16", False, "wide_mlp"): Route(
         "ws4_f16_wide_mlp", 4, None, False
     ),
-    ("sm_103a", 4, "float16", False, "wide_mlp_t64_e12_resident"): Route(
-        "ws4_f16_wide_mlp", 1, None, True
+    ("sm_103a", 4, "float16", True, "two_shot_b4"): Route(
+        "ws4_f16_two_shot_b4", 4, 142, False
     ),
-    ("sm_103a", 4, "float16", True, "pipe2_u4_b5"): Route(
-        "ws4_f16_pipe2_u4_b5", 5, 175, False
+    ("sm_103a", 4, "float16", True, "two_shot_b5"): Route(
+        "ws4_f16_two_shot_b5", 5, 175, False
     ),
     ("sm_103a", 4, "float16", True, "wide_mlp"): Route(
         "ws4_f16_wide_mlp", 4, None, False
     ),
-    ("sm_103a", 4, "float16", True, "wide_mlp_t128_e16_owner_forward"): Route(
-        (
-            "ws4_f16_wide_mlp_t128_e16_owner_forward_rank0",
-            "ws4_f16_wide_mlp_t128_e16_owner_forward_rank1",
-            "ws4_f16_wide_mlp_t128_e16_owner_forward_rank2",
-            "ws4_f16_wide_mlp_t128_e16_owner_forward_rank3",
-        ),
-        1,
-        None,
-        True,
-    ),
     ("sm_103a", 8, "bfloat16", False, "generic"): Route(
         "ws8_bf16_generic", 4, None, False
     ),
-    ("sm_103a", 8, "bfloat16", False, "pipe1"): Route("ws8_bf16_pipe1", 3, None, False),
-    ("sm_103a", 8, "bfloat16", False, "push_g"): Route(
-        "ws8_bf16_push_g", 4, None, False
+    ("sm_103a", 8, "bfloat16", False, "lat_t1"): Route("ws8_bf16_lat_t1", 2, 71, False),
+    ("sm_103a", 8, "bfloat16", False, "lat_t1f"): Route(
+        "ws8_bf16_lat_t1f", 2, 71, False
     ),
-    ("sm_103a", 8, "bfloat16", False, "sm103_t1"): Route(
-        "ws8_bf16_sm103_t1", 1, None, False
+    ("sm_103a", 8, "bfloat16", False, "two_shot_b4"): Route(
+        "ws8_bf16_two_shot_b4", 4, 142, False
+    ),
+    ("sm_103a", 8, "bfloat16", False, "two_shot_il_b4"): Route(
+        "ws8_bf16_two_shot_il_b4", 4, 142, False
     ),
     ("sm_103a", 8, "bfloat16", True, "generic"): Route(
         "ws8_bf16_generic", 4, None, False
     ),
-    ("sm_103a", 8, "bfloat16", True, "pipe1_u4_b5"): Route(
-        "ws8_bf16_pipe1_u4_b5", 5, 175, False
+    ("sm_103a", 8, "bfloat16", True, "two_shot_b4"): Route(
+        "ws8_bf16_two_shot_b4", 4, 142, False
     ),
-    ("sm_103a", 8, "bfloat16", True, "push_g"): Route(
-        "ws8_bf16_push_g", 4, None, False
+    ("sm_103a", 8, "bfloat16", True, "two_shot_b5"): Route(
+        "ws8_bf16_two_shot_b5", 5, 175, False
+    ),
+    ("sm_103a", 8, "bfloat16", True, "two_shot_il_b4"): Route(
+        "ws8_bf16_two_shot_il_b4", 4, 142, False
     ),
     ("sm_103a", 8, "float16", False, "generic"): Route(
         "ws8_f16_generic", 4, None, False
     ),
-    ("sm_103a", 8, "float16", False, "pipe1_u4_b5"): Route(
-        "ws8_f16_pipe1_u4_b5", 5, 175, False
+    ("sm_103a", 8, "float16", False, "two_shot_b5"): Route(
+        "ws8_f16_two_shot_b5", 5, 175, False
     ),
-    ("sm_103a", 8, "float16", False, "push_g"): Route("ws8_f16_push_g", 4, None, False),
+    ("sm_103a", 8, "float16", False, "two_shot_il_b4"): Route(
+        "ws8_f16_two_shot_il_b4", 4, 142, False
+    ),
     ("sm_103a", 8, "float16", True, "generic"): Route(
         "ws8_f16_generic", 4, None, False
     ),
-    ("sm_103a", 8, "float16", True, "pipe1_u4_b5"): Route(
-        "ws8_f16_pipe1_u4_b5", 5, 175, False
+    ("sm_103a", 8, "float16", True, "two_shot_b5"): Route(
+        "ws8_f16_two_shot_b5", 5, 175, False
     ),
-    ("sm_103a", 8, "float16", True, "push_g"): Route("ws8_f16_push_g", 4, None, False),
+    ("sm_103a", 8, "float16", True, "two_shot_il_b4"): Route(
+        "ws8_f16_two_shot_il_b4", 4, 142, False
+    ),
 }
 
-# (arch, world_size, dtype, launch_with_pdl, token_num, num_experts) -> specialization
-_REVIEWED_SPECIALIZATIONS: dict[tuple[str, int, str, bool, int, int], str] = {
-    ("sm_100a", 2, "bfloat16", False, 1, 8): "wide_mlp_cta1",
-    ("sm_100a", 2, "bfloat16", False, 128, 16): "wide_mlp",
-    ("sm_100a", 2, "bfloat16", False, 256, 8): "wide_mlp",
-    ("sm_100a", 2, "bfloat16", True, 64, 8): "wide_mlp",
-    ("sm_100a", 2, "bfloat16", True, 256, 12): "pipe2_u4",
-    ("sm_100a", 2, "bfloat16", True, 2048, 12): "pipe2_u4_b5",
-    ("sm_100a", 2, "float16", False, 64, 12): "wide_mlp",
-    ("sm_100a", 2, "float16", False, 2048, 8): "pipe2_u4_b5",
-    ("sm_100a", 2, "float16", True, 128, 16): "wide_mlp",
-    ("sm_100a", 2, "float16", True, 2048, 16): "pipe2_u4_b5",
-    ("sm_100a", 4, "bfloat16", False, 1, 8): "wide_mlp_t1_e8_serial_clear_cta1",
-    ("sm_100a", 4, "bfloat16", False, 128, 16): "clrfirst",
-    ("sm_100a", 4, "bfloat16", True, 64, 8): "wide_mlp",
-    ("sm_100a", 4, "bfloat16", True, 2048, 12): "pipe2_u4_b5",
-    ("sm_100a", 4, "float16", False, 64, 12): "wide_mlp_t64_e12_resident",
-    ("sm_100a", 4, "float16", False, 2048, 8): "pipe2_u4_b5",
-    ("sm_100a", 4, "float16", True, 128, 16): "wide_mlp_t128_e16_owner_forward",
-    ("sm_100a", 4, "float16", True, 2048, 16): "pipe2_u4_b5",
-    ("sm_100a", 8, "bfloat16", False, 128, 16): "sm100_ws8_mid",
-    ("sm_100a", 8, "bfloat16", True, 64, 8): "sm100_ws8_mid",
-    ("sm_100a", 8, "bfloat16", True, 2048, 12): "pipe1_u4_b5",
-    ("sm_100a", 8, "float16", False, 64, 12): "sm100_ws8_mid",
-    ("sm_100a", 8, "float16", False, 2048, 8): "pipe1_u4_b5",
-    ("sm_100a", 8, "float16", True, 128, 16): "sm100_ws8_mid",
-    ("sm_100a", 8, "float16", True, 2048, 16): "pipe1_u4_b5",
-    ("sm_103a", 2, "bfloat16", False, 1, 8): "sm103_t1",
-    ("sm_103a", 2, "bfloat16", False, 128, 16): "wide_mlp",
-    ("sm_103a", 2, "bfloat16", False, 256, 8): "wide_mlp",
-    ("sm_103a", 2, "bfloat16", True, 64, 8): "wide_mlp",
-    ("sm_103a", 2, "bfloat16", True, 2048, 12): "pipe1_u4_b5",
-    ("sm_103a", 2, "float16", False, 2048, 8): "pipe1_u4_b5",
-    ("sm_103a", 2, "float16", True, 128, 16): "wide_mlp",
-    ("sm_103a", 2, "float16", True, 2048, 16): "pipe1_u4_b5",
-    ("sm_103a", 4, "bfloat16", False, 1, 8): "sm103_t1_t1_e8_serial_clear",
-    ("sm_103a", 4, "bfloat16", False, 128, 16): "wide_mlp",
-    ("sm_103a", 4, "bfloat16", False, 256, 8): "wide_mlp",
-    ("sm_103a", 4, "bfloat16", True, 64, 8): "wide_mlp",
-    ("sm_103a", 4, "bfloat16", True, 256, 12): "wide_mlp",
-    ("sm_103a", 4, "bfloat16", True, 2048, 12): "pipe2_u4_b5",
-    ("sm_103a", 4, "float16", False, 64, 12): "wide_mlp_t64_e12_resident",
-    ("sm_103a", 4, "float16", False, 2048, 8): "pipe2_u4_b5",
-    ("sm_103a", 4, "float16", True, 128, 16): "wide_mlp_t128_e16_owner_forward",
-    ("sm_103a", 4, "float16", True, 2048, 16): "pipe2_u4_b5",
-    ("sm_103a", 8, "bfloat16", False, 1, 8): "sm103_t1",
-    ("sm_103a", 8, "bfloat16", False, 128, 16): "push_g",
-    ("sm_103a", 8, "bfloat16", False, 256, 8): "pipe1",
-    ("sm_103a", 8, "bfloat16", True, 64, 8): "push_g",
-    ("sm_103a", 8, "bfloat16", True, 256, 12): "push_g",
-    ("sm_103a", 8, "bfloat16", True, 2048, 12): "pipe1_u4_b5",
-    ("sm_103a", 8, "float16", False, 64, 12): "push_g",
-    ("sm_103a", 8, "float16", False, 2048, 8): "pipe1_u4_b5",
-    ("sm_103a", 8, "float16", True, 128, 16): "push_g",
-    ("sm_103a", 8, "float16", True, 2048, 16): "pipe1_u4_b5",
+# (arch, world_size, dtype, launch_with_pdl, num_experts) ->
+#     ((token_lo, token_hi, specialization), ...)
+# Inclusive token ranges, sorted and non-overlapping: a launch whose token_num
+# falls inside a range runs that specialization; every other launch runs the
+# class program.  Each range is the token span the specialization was measured
+# correct and at least 2 % faster than the class program over.
+_SPECIALIZATION_RULES: dict[
+    tuple[str, int, str, bool, int], tuple[tuple[int, int, str], ...]
+] = {
+    ("sm_100a", 2, "bfloat16", False, 8): (
+        (1, 1, "lat_t1f"),
+        (2, 32, "lat_t1"),
+        (192, 384, "lat_late_b5"),
+    ),
+    ("sm_100a", 2, "bfloat16", False, 16): ((96, 192, "lat_b4"),),
+    ("sm_100a", 2, "bfloat16", True, 8): ((32, 96, "lat_b4"),),
+    ("sm_100a", 2, "bfloat16", True, 12): (
+        (192, 384, "lat_late_b5"),
+        (1536, 2048, "lat_late_b5"),
+    ),
+    ("sm_100a", 2, "float16", False, 8): ((1536, 2048, "lat_late_b5"),),
+    ("sm_100a", 2, "float16", False, 12): ((32, 96, "lat_b4"),),
+    ("sm_100a", 2, "float16", True, 16): (
+        (96, 192, "lat_b4"),
+        (1536, 2048, "lat_late_b5"),
+    ),
+    ("sm_100a", 4, "bfloat16", False, 8): (
+        (1, 1, "lat_t1f"),
+        (2, 32, "lat_t1"),
+        (192, 384, "two_shot_b4"),
+    ),
+    ("sm_100a", 4, "bfloat16", False, 16): ((96, 192, "two_shot_b4"),),
+    ("sm_100a", 4, "bfloat16", True, 8): ((32, 96, "two_shot_b4"),),
+    ("sm_100a", 4, "bfloat16", True, 12): (
+        (192, 384, "two_shot_b4"),
+        (1536, 2048, "two_shot_b5"),
+    ),
+    ("sm_100a", 4, "float16", False, 8): ((1536, 2048, "two_shot_b5"),),
+    ("sm_100a", 4, "float16", False, 12): ((32, 96, "two_shot_b4"),),
+    ("sm_100a", 4, "float16", True, 16): (
+        (96, 192, "two_shot_b4"),
+        (1536, 2048, "two_shot_b5"),
+    ),
+    ("sm_100a", 8, "bfloat16", False, 8): (
+        (1, 1, "lat_t1f"),
+        (2, 32, "lat_t1"),
+        (192, 384, "two_shot_b4"),
+    ),
+    ("sm_100a", 8, "bfloat16", False, 16): ((96, 192, "two_shot_il_b4"),),
+    ("sm_100a", 8, "bfloat16", True, 8): ((32, 96, "two_shot_il_b4"),),
+    ("sm_100a", 8, "bfloat16", True, 12): (
+        (192, 384, "two_shot_b4"),
+        (1536, 2048, "two_shot_b5"),
+    ),
+    ("sm_100a", 8, "float16", False, 8): ((1536, 2048, "two_shot_b5"),),
+    ("sm_100a", 8, "float16", False, 12): ((32, 96, "two_shot_il_b4"),),
+    ("sm_100a", 8, "float16", True, 16): (
+        (96, 192, "two_shot_il_b4"),
+        (1536, 2048, "two_shot_b5"),
+    ),
+    ("sm_103a", 2, "bfloat16", False, 8): (
+        (1, 1, "lat_t1f"),
+        (2, 32, "lat_t1"),
+        (192, 384, "lat_late_b5"),
+    ),
+    ("sm_103a", 2, "bfloat16", False, 16): ((96, 192, "lat_b4"),),
+    ("sm_103a", 2, "bfloat16", True, 8): ((32, 96, "lat_b4"),),
+    ("sm_103a", 2, "bfloat16", True, 12): (
+        (192, 384, "lat_late_b5"),
+        (1536, 2048, "lat_late_b5"),
+    ),
+    ("sm_103a", 2, "float16", False, 8): ((1536, 2048, "lat_late_b5"),),
+    ("sm_103a", 2, "float16", False, 12): ((32, 96, "lat_b4"),),
+    ("sm_103a", 2, "float16", True, 16): (
+        (96, 192, "lat_b4"),
+        (1536, 2048, "lat_late_b5"),
+    ),
+    ("sm_103a", 4, "bfloat16", False, 8): (
+        (1, 1, "lat_t1f"),
+        (2, 32, "lat_t1"),
+        (192, 384, "two_shot_b4"),
+    ),
+    ("sm_103a", 4, "bfloat16", False, 16): ((96, 192, "two_shot_b4"),),
+    ("sm_103a", 4, "bfloat16", True, 8): ((32, 96, "two_shot_b4"),),
+    ("sm_103a", 4, "bfloat16", True, 12): (
+        (192, 384, "two_shot_b4"),
+        (1536, 2048, "two_shot_b5"),
+    ),
+    ("sm_103a", 4, "float16", False, 8): ((1536, 2048, "two_shot_b5"),),
+    ("sm_103a", 4, "float16", False, 12): ((32, 96, "two_shot_b4"),),
+    ("sm_103a", 4, "float16", True, 16): (
+        (96, 192, "two_shot_b4"),
+        (1536, 2048, "two_shot_b5"),
+    ),
+    ("sm_103a", 8, "bfloat16", False, 8): (
+        (1, 1, "lat_t1f"),
+        (2, 32, "lat_t1"),
+        (192, 384, "two_shot_b4"),
+    ),
+    ("sm_103a", 8, "bfloat16", False, 16): ((96, 192, "two_shot_il_b4"),),
+    ("sm_103a", 8, "bfloat16", True, 8): ((32, 96, "two_shot_il_b4"),),
+    ("sm_103a", 8, "bfloat16", True, 12): (
+        (192, 384, "two_shot_b4"),
+        (1536, 2048, "two_shot_b5"),
+    ),
+    ("sm_103a", 8, "float16", False, 8): ((1536, 2048, "two_shot_b5"),),
+    ("sm_103a", 8, "float16", False, 12): ((32, 96, "two_shot_il_b4"),),
+    ("sm_103a", 8, "float16", True, 16): (
+        (96, 192, "two_shot_il_b4"),
+        (1536, 2048, "two_shot_b5"),
+    ),
 }
 
 # (arch, world_size, dtype, launch_with_pdl) classes whose program is the
-# ``wide_mlp`` schedule for every token count outside the reviewed points.
+# ``wide_mlp`` schedule for every token count outside the rules' ranges.
 _WIDE_MLP_CLASSES: tuple[tuple[str, int, str, bool], ...] = (
     ("sm_100a", 2, "bfloat16", False),
     ("sm_100a", 2, "bfloat16", True),
@@ -418,10 +503,6 @@ def arch_for_capability(device_capability: Sequence[int]) -> Optional[str]:
     )
 
 
-def exported_arches() -> tuple[str, ...]:
-    return tuple(sorted({key[0] for key in ROUTES}))
-
-
 def select_specialization(
     arch: str,
     world_size: int,
@@ -430,20 +511,28 @@ def select_specialization(
     token_num: int,
     active_experts: int,
 ) -> str:
-    """Return the specialization name for one launch configuration."""
+    """Return the specialization name for one launch configuration.
 
-    reviewed = _REVIEWED_SPECIALIZATIONS.get(
+    The token-range rule of the ``(arch, world_size, dtype, launch_with_pdl,
+    active_experts)`` key that holds ``token_num`` wins; outside every range the
+    class program runs (``wide_mlp`` for the ``_WIDE_MLP_CLASSES`` classes,
+    ``generic`` otherwise).
+    """
+
+    token_num = int(token_num)
+    rules = _SPECIALIZATION_RULES.get(
         (
             str(arch),
             int(world_size),
             str(dtype_name),
             bool(launch_with_pdl),
-            int(token_num),
             int(active_experts),
-        )
+        ),
+        (),
     )
-    if reviewed is not None:
-        return reviewed
+    for token_lo, token_hi, specialization in rules:
+        if token_lo <= token_num <= token_hi:
+            return specialization
     if (
         str(arch),
         int(world_size),
@@ -455,7 +544,13 @@ def select_specialization(
 
 
 def route_applies(*, world_size: int, device_capability: Sequence[int]) -> bool:
-    """Whether the union has programs for this (architecture, world size)."""
+    """Whether the union has programs for this (architecture, world size).
+
+    The union owns exactly the (architecture, world size) scopes it has routes
+    for, with or without the all-reduce output: a call without
+    ``moe_allreduce_out`` runs the same kernels against a loader-owned scratch
+    tensor, so the caller's output selection does not narrow the scope.
+    """
 
     arch = arch_for_capability(device_capability)
     return arch is not None and (arch, int(world_size)) in _EXPORTED_SCOPES
@@ -531,11 +626,7 @@ def route_kernel(route: Route, world_rank: int, world_size: int) -> str:
 
     if not 0 <= int(world_rank) < int(world_size):
         raise ValueError(f"world_rank must be in [0, {world_size}), got {world_rank}")
-    if isinstance(route.kernel, str):
-        return route.kernel
-    if len(route.kernel) != int(world_size):
-        raise RuntimeError("rank-specialised route does not carry one kernel per rank")
-    return route.kernel[int(world_rank)]
+    return route.kernel
 
 
 def launch_grid_x(
@@ -550,11 +641,12 @@ def launch_grid_x(
     the SM-bounded persistent cluster grid that keeps ``persistent_ctas_per_sm``
     CTAs resident on every SM, capped at ``max_persistent_clusters`` clusters
     where the route records a co-residency cap.  ``cluster_ctas`` is the
-    kernel's cluster width (four 224-thread CTAs per token, or one 896-thread
-    CTA).  Every cluster of the persistent grid must be co-resident (each
-    cluster publishes all of its tiles before it polls the peers' same-index
-    tiles); the recorded cap is the exporter's ``cuOccupancyMaxActiveClusters``
-    answer on the architecture it was measured on and is never raised here."""
+    kernel's cluster width (four CTAs per token of 224 threads, or of 256
+    with a 32-thread role warp, or one 896-thread CTA).  Every cluster of the
+    persistent grid must be co-resident (each cluster publishes all of its
+    tiles before it polls the peers' same-index tiles); the recorded cap is
+    the exporter's ``cuOccupancyMaxActiveClusters`` answer on the architecture
+    it was measured on and is never raised here."""
 
     ctas_per_sm = int(persistent_ctas_per_sm)
     if ctas_per_sm < 1:
@@ -595,7 +687,7 @@ def _source_dir() -> Path:
 
 
 def kernel_source(name: str) -> Path:
-    return _source_dir() / KERNEL_DIR / f"{name}.cu"
+    return _source_dir() / KERNEL_DIR / f"{KERNELS[name].source or name}.cu"
 
 
 def kernel_symbol(name: str) -> str:
@@ -603,15 +695,27 @@ def kernel_symbol(name: str) -> str:
 
 
 def kernel_defines(name: str) -> list[str]:
-    """Preprocessor definitions that bind the launcher to one kernel."""
+    """Preprocessor definitions that bind the launcher to one kernel.
+
+    The kernel's own ``defines`` follow the five launcher definitions and,
+    for a kernel with role threads, ``CAKE_UNION_ROLE_THREADS``; they select
+    the kernel's program text in a shared source (see ``Kernel``).
+    """
 
     kernel = KERNELS[name]
+    role = (
+        [f"-DCAKE_UNION_ROLE_THREADS={kernel.role_threads}"]
+        if kernel.role_threads
+        else []
+    )
     return [
         f"-DCAKE_UNION_KERNEL={kernel_symbol(name)}",
         f"-DCAKE_UNION_DTYPE={_DTYPE_CTYPE[kernel.dtype]}",
         f"-DCAKE_UNION_WORLD_SIZE={kernel.world_size}",
         f"-DCAKE_UNION_BLOCK={kernel.block}",
         f"-DCAKE_UNION_CLUSTER={kernel.cluster}",
+        *role,
+        *kernel.defines,
     ]
 
 
@@ -669,10 +773,18 @@ def run_cake_moe_allreduce_union(
     norm_out: torch.Tensor,
     weight_bias: Optional[float],
 ) -> None:
-    """Select and launch one union kernel for the caller's validated tensors."""
+    """Select and launch one union kernel for the caller's validated tensors.
+
+    ``moe_allreduce_out`` may be ``None``: the kernels always store the
+    all-reduce output, so the call then writes into a loader-owned scratch
+    tensor (``scratch_allreduce_output``).
+    ``scale_factor`` belongs to the public API's quant path; the union kernels
+    emit no quant output and take no scale factor.
+    """
 
     if backend != "cake":
         raise ValueError(f"backend must be 'cake', got {backend!r}")
+    del scale_factor
     world_size = int(world_size)
     if world_size not in WORLD_SIZES:
         raise ValueError(
@@ -710,12 +822,6 @@ def run_cake_moe_allreduce_union(
     )
     name = route_kernel(route, int(world_rank), world_size)
     kernel = KERNELS[name]
-    if moe_allreduce_out is None:
-        moe_allreduce_out = scratch_allreduce_output(
-            moe_reduction_active_experts_token_input.device,
-            moe_reduction_active_experts_token_input.dtype,
-            int(token_num),
-        )
     grid_x = launch_grid_x(
         int(token_num),
         route.cooperative,
@@ -724,6 +830,12 @@ def run_cake_moe_allreduce_union(
         kernel.cluster,
         route.max_persistent_clusters,
     )
+    if moe_allreduce_out is None:
+        moe_allreduce_out = scratch_allreduce_output(
+            moe_reduction_active_experts_token_input.device,
+            moe_reduction_active_experts_token_input.dtype,
+            int(token_num),
+        )
     load(name, arch).run(
         moe_reduction_active_experts_token_input,
         moe_reduction_scale_input,
@@ -756,7 +868,6 @@ __all__ = [
     "Route",
     "arch_for_capability",
     "compile_flags",
-    "exported_arches",
     "kernel_defines",
     "kernel_source",
     "kernel_symbol",

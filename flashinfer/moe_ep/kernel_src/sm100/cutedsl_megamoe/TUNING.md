@@ -14,16 +14,98 @@ single GB200 node (4x GPUs, EP=4) at a DeepSeek-V3-like geometry:
 recipe (hardware, container, versions, harness invocation) is in the
 "Sweep methodology" and "Runbook" sections below.
 
+## BF16 input and output fusion
+
+BF16-activation CuTeDSL backends share a single staging launch for the
+activation, expert IDs, routing weights and full routing-capacity tail.
+The vectorized path requires contiguous CUDA tensors and 16-byte-aligned
+BF16 activation pointers. Unsupported layouts, overlapping planes and
+`FLASHINFER_MEGA_FUSED_STAGE=0` retain the Torch copies. Every captured
+invocation masks the full routing tail, including empty batches; it does
+not infer tail validity from host live-token counts.
+
+Prepared staging bindings are immutable and private to each host thread;
+only compiled code is shared. Every call rechecks tensor pointers, shapes,
+strides, dtypes and devices before reusing a binding. This avoids repeating
+eligibility checks and descriptor preparation without allowing interleaved
+calls to replace each other's launch arguments.
+
+For BF16×BF16 with the separate terminal reducer, a contiguous, aligned
+caller output is bound directly to that reducer. Its live row count bounds
+the reduction, avoiding both padded-row reduction and the workspace-to-output
+copy. Launch bindings include output shape and stride so views sharing an
+address can have different live lengths. In-kernel atomic reduction retains
+its full-capacity symmetric target. Empty, strided and unaligned caller
+outputs retain the workspace copy. Warm the required layouts before graph
+capture.
+
+### Rubin measurements (2026-10-29)
+
+Native SM107, eight Rubin GPUs, EP8, hidden 4096, intermediate 2048,
+256 experts, top-6, capacity 256, uniform routing and no shared experts.
+The BF16 intermediate and combine use early routing weights and a gate/up
+clamp of 10. GPU clocks were not locked. The baseline BF16 integration
+files match revision `9f51f1aa1415dbdd22ddbfe6aa29069196a5a2b7`.
+
+These are full public forward calls including input staging and caller
+output. Each value averages two runs; each run takes the maximum of the
+eight per-rank medians over five rounds of 40 CUDA Graph calls. Session
+order alternates by round. DeepGEMM is an unchanged control, averaged over
+the four before/after runs, with weight localization disabled. Its source
+revision is `5081f8513af57e61696de4f4f04b0e707ffb503e`, compiled for the
+compatible `sm_100f` target; FlashInfer targets native `sm_107a`.
+
+| Tokens/rank | Before (µs) | After (µs) | Latency reduction | DeepGEMM control (µs) |
+| ---: | ---: | ---: | ---: | ---: |
+| 32 | 268.27 | 263.09 | 1.93% | 206.77 |
+| 192 | 277.86 | 271.58 | 2.26% | 219.40 |
+| 256 | 278.34 | 273.59 | 1.70% | 221.64 |
+
+At 192 live tokens, every rank's profile drops from seven full-call
+launches to three: fused staging, the main kernel and terminal reduction.
+Numerical oracles and graph/eager parity pass at all measured points.
+Existing BF16/BF16×MXFP8 tests also passed at EP4 on SM107. This experiment
+did not qualify SM100/SM103 hardware. The remaining DeepGEMM gap is
+predominantly in the main compute kernel.
+
+### CPU submission follow-up (2026-10-29)
+
+Single-GPU SM107 staging-only measurements use H=4096, capacity=256,
+top-k=6, BF16 activations, int64 IDs and FP32 scores. CPU submission is
+the median of seven alternating rounds of 100 warmed calls, with CUDA
+synchronization after the timed submission interval. GPU intervals use
+40 staging calls per captured graph and 30 replays per round. Clocks are
+not locked. `copies` sets `FLASHINFER_MEGA_FUSED_STAGE=0`; `reviewed fused`
+is the implementation at `b5188e586`, and `prepared` uses thread-private
+bindings with runtime storage/layout checks.
+
+| Live rows | CPU copies (µs) | CPU reviewed fused (µs) | CPU prepared (µs) | GPU copies (µs) | GPU prepared (µs) |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 22.03 | 25.16 | 14.28 | 5.83 | 1.93 |
+| 32 | 21.91 | 24.96 | 14.03 | 5.84 | 1.97 |
+| 192 | 21.95 | 24.77 | 13.84 | 6.53 | 2.13 |
+| 256 | 15.13 | 24.06 | 13.29 | 5.76 | 2.15 |
+
+An EP8 full-forward comparison at the geometry above, intermediate=2048,
+256 experts and 192 live rows keeps direct output enabled on both sides
+and changes only staging. Five alternating batches of 20 eager calls give
+maximum per-rank median CPU submission of 202.43 µs for copies versus
+184.52 µs for prepared staging. Completed batch wall time, including the
+final CUDA synchronization, is approximately flat: 648.11 versus
+645.19 µs per call, with scheduling jitter in individual rounds. Full-call
+CUDA Graph intervals are 274.54 versus 270.90 µs. These scopes do not
+measure serving latency and are distinct from the full-PR table above.
+
+A forced two-thread interleaving with native GPU buffers reproduced the
+reviewed cache's pointer swap and passed with private bindings. Another
+400 concurrent calls and same-tensor storage/shape/stride changes passed
+staging equality checks.
+
 ## Microbenchmark results (2026-07-22, e2e_pipelined p50 µs)
 
-Measured at the `4_5_2-perf-fix` branch tip (`7d538173`) on
-**nvidia-cutlass-dsl 4.5.2** — the new default runtime (see "CuTe-DSL
-runtime sensitivity" below; the MR!27 WAR makes 4.5.2 the perf floor).
-Reproduces the previous reference (2026-07-21, dsl 4.6.1, tip `29e2d2f8`,
-CSV `model_shapes_20260721_111314_deepseek_v3.csv`) within run noise at
-every cell. Default geometry (7168 hidden / 2048 inter / 256 experts /
-top-8), 4x GB200, heuristic knobs, speedup vs `sm100_fp8_fp4_bf16_deepgemm` in parens;
-CSV `moe_ep_benchmark/model_shapes/results/model_shapes_20260722_130237.csv`:
+Measured with `nvidia-cutlass-dsl==4.5.2`, using the mainloop workaround
+below. Geometry: hidden 7168, intermediate 2048, 256 experts, top-8,
+4x GB200. Ratios compare against `sm100_fp8_fp4_bf16_deepgemm`.
 
 | tok/rank | dg     | nvfp4 bf16     | +ikr           | +combine_nvfp4     | +combine_mxfp8 |
 |---------:|-------:|---------------:|---------------:|-------------------:|---------------:|
@@ -169,13 +251,12 @@ path) and `fi_dg` run the mxfp4 checkpoint.
   kernel property.
 - The headline decode cell reproduces at this branch tip within 0.6%.
 - **2026-07-22 revalidation on nvidia-cutlass-dsl 4.5.2** (vLLM 0.25.1's own
-  pin, no force-upgrade — the MR!27 WAR makes 4.5.2 the perf floor): the
+  pin, no force-upgrade — the mainloop workaround makes 4.5.2 the perf floor): the
   prefill-8k cell reproduces on the same metric (native 45,582 / fi_nvfp4
   53,623 tok/s = 1.176x); the decode-1k check was recorded as **total tok/s**
   (prompt + output: native 32,086 / fi_nvfp4 34,263 = 1.068x), a different
   metric from the headline's output tok/s — it corroborates the 1.07x speedup
-  ratio rather than the absolute cells (vllm_e2e RUNS.md runs 41-42,
-  `requick452_*.json`).
+  ratio rather than the absolute cells.
 
 ## Historical note: nvfp4 numbers before 2026-07-15 are invalid
 
@@ -195,8 +276,8 @@ noise (<= ~4% per cell); the tables above are the current reference.
 
 ## CuTe-DSL runtime sensitivity: `nvidia-cutlass-dsl[cu13]==4.5.2` (2026-07-15) — OBSOLETE
 
-> **OBSOLETE (2026-07-22):** the regression below is fixed by the MR!27
-> mainloop WAR (see the follow-up subsection) — 4.5.2 now runs at full
+> **OBSOLETE (2026-07-22):** the regression below is fixed by the mainloop
+> workaround (see the follow-up subsection) — 4.5.2 now runs at full
 > parity for both nvfp4 and mxfp8, and the perf floor is 4.5.2, not 4.6.1.
 > Kept for the record of what unpatched 4.5.2 codegen did.
 
@@ -230,13 +311,12 @@ Takeaways:
 Conclusion (2026-07-15): treat **4.6.1 as a performance floor**, not just a
 compile-compatibility floor — 4.5.2 is functional but leaves ~1.3-1.5x of
 nvfp4 kernel performance on the table.
-**Superseded for nvfp4 on 2026-07-22 by the MR!27 mainloop WAR — see the
+**Superseded for nvfp4 on 2026-07-22 by the mainloop workaround — see the
 follow-up below.**
 
-### Follow-up 2026-07-22: MR!27 mainloop WAR recovers nvfp4 on 4.5.2
+### Follow-up 2026-07-22: mainloop workaround recovers nvfp4 on 4.5.2
 
-`cutedsl_megamoe` MR!27 (ported in the `4_5_2-perf-fix` branch, single file
-`src/moe_nvfp4_swapab/kernel_fc12.py`) peels the last k-tile out of the
+`src/moe_nvfp4_swapab/kernel_fc12.py` peels the last k-tile out of the
 MMA-consumer mainloop when `cutlass.__version__ == 4.5.2` exactly
 (`cutlass.const_expr`-gated, so 4.6.1+ traces are unchanged). Rerun of the
 same sweep recipe with 4.5.2 pinned (CSVs
@@ -256,8 +336,8 @@ This matches the 4.6.1 reference table above within run noise at every
 point (e.g. nvfp4 bf16 428.0 vs 428.5 @1024, 609.3 vs 625.6 @2048, 1859.7
 vs 1923.5 @8192), i.e. the 34-54% regression is fully recovered and the
 dg-crossover / large-token win shape is restored. Correctness: the full
-`tests/moe_ep/run_tests.sh all` suite passed under pinned 4.5.2 (all 8
-sections, 2026-07-22, job 2427254).
+`tests/moe_ep/run_tests.sh all` suite passed under pinned 4.5.2 (all eight
+sections, 2026-07-22).
 
 mxfp8 needs no WAR: a same-day 4.5.2 sweep
 (`sweep_20260722_114210_fi_mega.csv`) matches the 4.6.1 mxfp8 reference
@@ -280,19 +360,9 @@ match the fast reference** — the codegen regression existed only in
 4.5.2 and was fixed upstream in 4.5.3, so the WAR's exact `== 4.5.2` gate
 is correct and every published version >= 4.5.2 runs at full performance.
 
-Support statement: **>= 4.5.2 at full performance** (4.5.2 via the MR!27
-WAR; 4.5.3 / 4.6.0 / 4.6.1 verified natively fast); < 4.5.2 unsupported
+Support statement: **>= 4.5.2 at full performance** (4.5.2 via the mainloop
+workaround; 4.5.3 / 4.6.0 / 4.6.1 verified natively fast); < 4.5.2 unsupported
 (4.5.0 fails at `cute.compile`, 4.5.1 unmeasured — the shim warns).
-
-The 4.7.0.dev internal drop (`nvidia-cutlass-dsl-internal`
-`0.3.0+20260721052439.f58f4a5`) also measures fast: nvfp4
-427.0/614.2/1907.7 µs @1024/2048/8192 (`sweep_20260722_142421_fi_mega.csv`)
-— compiles and runs cleanly. Note internal wheels report their own version
-scheme (`cutlass.__version__ == "0.3.0"`, dist name
-`nvidia-cutlass-dsl-internal`), so on internal drops the ==4.5.2 WAR gate
-is always OFF and the shim's <4.5.2 warning silently skips (dist lookup
-misses) — both are the right behavior as long as internal drops carry the
-4.5.3+ codegen fix, which this one does.
 
 ## The knob system (`shim/tuner.py`, `shim/autotune.py`)
 
@@ -389,12 +459,69 @@ a shape comes in:
   `FLASHINFER_AUTOTUNER_LOAD_FROM_FILE` are NOT wired into this path.
 - The single slot is deliberate: each `_CompiledMega` pins symmetric-heap
   (NVSHMEM) workspaces, so keeping N candidates alive would multiply
-  symmetric memory.  `_mega_compile_key()` already covers every knob, so a
-  per-key dict (e.g. small+large profile selected per-launch by token
-  count) is the natural upgrade if per-shape dispatch is ever needed;
-  today the deployment pattern is per-role knob caches instead (one
-  prefill-tuned and one decode-tuned cache file, selected per engine role
-  via `FLASHINFER_MOE_EP_KNOB_CACHE` — validated in the vLLM e2e runs).
+  symmetric memory. Each `layer.create_workspace(capacity)` profile owns
+  one compiled slot, so callers can select a decode or prefill workspace
+  whose capacity has an offline winner in the same knob cache.
+
+### Caller finalization for BF16, MXFP8, BF16xMXFP8 and W4A16
+
+SM100 BF16, MXFP8, BF16xMXFP8 and W4A16 MegaMoE also accept
+`finalize_mode=FinalizeMode.NONE` in their kernel configs. Call `layer.forward_unfinalized(t)` to receive borrowed, contiguous
+BF16 `[T * top_k, hidden]` rows, FP32 `[T, top_k]` remaining routing weights,
+and an int32 `[T, top_k]` identity route map. Consume the results on the current
+stream before the pooled workspace is reused. EP communication completes even
+on zero-token ranks; warm up on all ranks before CUDA graph capture.
+
+BF16 applies routing weights in FC1 by default and returns remaining weights of one.
+MXFP8 and BF16xMXFP8 always apply them in FC1 and return ones.
+W4A16 returns the staged routing weights by default, or ones with
+`apply_routing_weights_before_fc2=True`. Caller finalization can use:
+
+```python
+rows, weights, route_map = layer.forward_unfinalized(t)
+partials = rows[route_map.long()].float()
+output = (partials * weights.unsqueeze(-1)).sum(dim=1).bfloat16()
+```
+
+W4A16's built-in weighted reducer uses fused multiply-add. A caller's separate
+multiply and sum can therefore round differently despite identical per-route rows.
+
+These backends require `enable_in_kernel_fc2_reduce=False` and reject
+`knobs="auto"` in this mode. Use `knobs=None` or an explicit knob dictionary.
+The `--no-do-finalize` offline tuning CLI remains specific to SM100 NVFP4.
+
+### Offline tuning for unfinalized NVFP4 output
+
+Use `--no-do-finalize` to tune SM100 NVFP4 for a serving configuration with
+`finalize_mode=FinalizeMode.NONE`. EP communication completes; `forward_unfinalized()` returns
+BF16 `[T * top_k, hidden]` GEMM2 rows, FP32 `[T, top_k]` remaining weights, and
+an int32 `[T, top_k]` identity map for the caller's final reduction. All three
+results borrow workspace storage. The default `--do-finalize`
+includes finalization. Match the serving configuration's routing-weight
+placement with `--apply-routing-weights-before-fc2` (default) or
+`--no-apply-routing-weights-before-fc2`:
+
+```bash
+torchrun --nproc_per_node=4 -m flashinfer.moe_ep.tune \
+    --arch sm100 --dtype nvfp4 --hidden 7168 --intermediate 2048 \
+    --num-experts 256 --topk 8 --max-tokens 64 2048 \
+    --no-do-finalize --no-apply-routing-weights-before-fc2
+```
+
+This mode requires BF16 combine and deterministic reduction. Each candidate
+prepares a fresh launch thunk before timing; the measured operation excludes
+input staging, output copying, and the caller's finalizer. The existing offline
+sweep synchronizes launches and selects the slowest-rank median latency.
+Finalized and unfinalized output, and both routing-weight placements, have separate
+cache entries. Older entries without an output-mode field describe reduced
+output; entries from the removed explicit startup tuner are ignored.
+
+Use the actual per-rank workspace capacities for `--max-tokens`. The cache records
+`--live-tokens` alongside capacity, so distinct workload winners at the same
+capacity can share one cache file. Serving loads the winner with
+`knobs=None` and the matching `finalize_mode` / `apply_routing_weights_before_fc2` settings,
+falling back to the heuristic on a cache miss. Retune NVFP4 entries previously
+recorded without the correct routing-weight placement.
 
 ### Session setup + steady-state forward (`knobs=None` / explicit dict)
 
@@ -545,7 +672,8 @@ plumbed through `get_symm_buffer_for_mega_moe` and the backend configs
   large terms nearly cancel the agreement is bounded by the bf16 ULP of the
   largest TERM — validate with a row-scaled band (tests'
   `_assert_ikr_close`: K x 2^-8 x safety 8 x row max), never a flat
-  atol/rtol.  Requires `apply_topk_in_fc1=True` + bf16 combine wire.
+  atol/rtol. Requires `apply_routing_weights_before_fc2=True` + bf16 combine
+  wire.
 - `combine_dtype` — quantized cross-rank combine wire (`"mxfp8"` =
   `32e4m3xe8m0`, 2x less NVLink combine traffic; `"nvfp4"` = `16e2m1xbf16`,
   4x less).  Numerics tradeoff (wire-quantizes the per-topk fc2 outputs);
@@ -603,17 +731,10 @@ Takeaways at this (single-node NVLink) geometry, from the 2026-07-21 sweep:
 
 ### Sweep methodology + environment (reproduce recipe)
 
-**Hardware / software.**  One GB200 node, 4x NVIDIA GB200 (sm_100, cc
-10.0) over NVLink, driver 580.173.02.  Pyxis container image
-`flashinfer-ep-pt2605-mega_moe_ep-20260712.sqsh` (NGC 26.05 base):
-torch `2.12.0a0+5aff3928d8.nv26.05`, CUDA 13.2, `cuda-bindings 13.2.0`,
-`triton 3.7.0+nv26.5`, `deep_gemm 2.5.0+891d57b`,
-`nvshmem4py-cu13 0.3.1`; `nvidia-cutlass-dsl` upgraded in-container to
-**4.6.1** (>=4.5.2 suffices since the 2026-07-22 MR!27 WAR; the reference
-numbers were measured on 4.6.1 and 4.5.2 reproduces them within noise).
-FlashInfer = this branch,
-editable-installed inside the container
-(`PIP_CONSTRAINT="" BUILD_NIXL_EP=0 pip install --no-build-isolation -e .`).
+**Hardware / software.** One GB200 node with four GPUs (SM100, compute
+capability 10.0) over NVLink. Use a CUDA 13 environment with PyTorch,
+DeepGEMM, NVSHMEM and `nvidia-cutlass-dsl[cu13]>=4.5.2`. Install this
+checkout with `pip install --no-build-isolation -e .`.
 
 **Harness.**  `moe_ep_benchmark/bench_moe_ep_mega.py` via
 `SECTION=fi_mega GPUS=4 SEQ_LENS="1024 2048 4096 8192" run_sweep.sh`
@@ -647,16 +768,16 @@ CSVs.  `sm100_fp8_fp4_bf16_deepgemm` has no thunk API, so its "kernel" number lo
 
 ### Runbook (rerun the sweep)
 
-The harness lives at <https://github.com/mhoqueanik/moe_ep_benchmark>
-(bench env-knob reference in its README.md; SLURM/container details in
-its RUNBOOK.md).  `MEGA_IKR` / `MEGA_COMBINE_DTYPE` land in bench commit
-`a15fb01`.  On a SLURM + pyxis cluster with the image above:
+The harness lives at <https://github.com/mhoqueanik/moe_ep_benchmark>.
+Its README documents the benchmark flags. For a Slurm/Pyxis run, set
+`MEGA_BENCH_IMAGE` to a container image with the dependencies above:
 
 ```bash
-export ROOT=/path/to/workspace          # holds the image, the bench repo,
-export REPO=$ROOT/flashinfer-moe_ep     # and the flashinfer checkout
+export ROOT=/path/to/workspace
+export REPO=$ROOT/flashinfer
+export MEGA_BENCH_IMAGE=/path/to/prepared-image.sqsh
 srun -A <account> -p batch -N 1 --ntasks-per-node=1 --time=04:00:00 \
-  --container-image="$ROOT/flashinfer-ep-pt2605-mega_moe_ep-20260712.sqsh" \
+  --container-image="$MEGA_BENCH_IMAGE" \
   --container-mounts="$ROOT:$ROOT" --container-workdir="$REPO" \
   bash -lc '
     export FLASHINFER_DISABLE_VERSION_CHECK=1

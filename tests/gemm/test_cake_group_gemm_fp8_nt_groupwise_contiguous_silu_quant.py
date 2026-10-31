@@ -1,6 +1,8 @@
 # Copyright (c) 2026 by FlashInfer team.
 # SPDX-License-Identifier: Apache-2.0
-"""Tests for the generated SM100a fused grouped FP8 gate_up GEMM + SwiGLU + FP8 quantization program."""
+"""Tests for the generated Blackwell fused grouped FP8 gate_up GEMM + SwiGLU + FP8 quantization programs."""
+
+import random
 
 import pytest
 import torch
@@ -15,12 +17,18 @@ from flashinfer.gemm.cake_grouped_fp8_fused_silu_quant import (
     ACT_ROUTES,
     ACT_WIDE_MIN_ITEMS,
     ACT_WIDE_ROUTE,
+    CTA_CAP,
     FUSED_MIXED_ROUTE,
     FUSED_ROUTE,
     FUSED_ROUTES,
     GEMM_BACKEND_CAKE,
     GEMM_BACKEND_CUTE,
+    MIXED_CTA_CAPS,
+    ROUTE_MODEL_GEOMETRY,
+    ROUTE_MODELS_CAP,
     SMALL_M_MAX,
+    TINY_MIXED_MAX_K,
+    TINY_MIXED_MAX_UNITS,
     act_items,
     fused_tile_counts,
     is_group_gemm_fp8_nt_groupwise_contiguous_silu_quant_prepared_available,
@@ -28,8 +36,13 @@ from flashinfer.gemm.cake_grouped_fp8_fused_silu_quant import (
     mixed_clusters,
     routing_blocks,
     select_route,
+    select_route_and_cap,
     small_m_gemm_backend,
     tail_launch_grid,
+)
+from flashinfer.jit.gemm.cake_grouped_fp8_fused_silu_quant import (
+    SUPPORTED_COMPUTE_CAPABILITIES,
+    device_arch,
 )
 from flashinfer.quantization import per_token_group_quant_8bit
 
@@ -39,13 +52,28 @@ EPS = 1e-10
 ATOL = RTOL = 0.1
 
 
+def _small_m_route(n2, k, group_blocks):
+    """Route of a known small-M routing: the mixed schedule for a tiny routing (no
+    pair tile, at most TINY_MIXED_MAX_UNITS odd-tail units, K <= TINY_MIXED_MAX_K),
+    else the GEMM + act route."""
+    pair_tiles, odd_units = fused_tile_counts(n2, group_blocks)
+    tiny = (
+        pair_tiles == 0
+        and 0 < odd_units <= TINY_MIXED_MAX_UNITS
+        and k <= TINY_MIXED_MAX_K
+    )
+    return FUSED_MIXED_ROUTE if tiny else ACT_ROUTE
+
+
 @pytest.fixture(autouse=True)
 def _require_generated_program():
     if not torch.cuda.is_available():
         pytest.skip("requires CUDA")
     device = torch.device("cuda")
-    if torch.cuda.get_device_capability(device) != (10, 0):
-        pytest.skip("generated fused grouped FP8 gate_up programs target SM100a only")
+    if torch.cuda.get_device_capability(device) not in SUPPORTED_COMPUTE_CAPABILITIES:
+        pytest.skip(
+            "generated fused grouped FP8 gate_up programs target SM100a and SM103a"
+        )
     if not is_group_gemm_fp8_nt_groupwise_contiguous_silu_quant_prepared_available(
         device
     ):
@@ -340,7 +368,7 @@ def test_prepared_matches_torch_reference_chain(group_counts, n2, k, arbitrary_s
     # GEMM + act kernel, or pair kernel + PDL tail kernel; the mixed-schedule route is one kernel
     assert prepared.num_kernels == (1 if prepared.route == FUSED_MIXED_ROUTE else 2)
     if m < SMALL_M_MAX:
-        assert prepared.route == ACT_ROUTE
+        assert prepared.route == _small_m_route(n2, k, routing_blocks(group_counts))
     if prepared.route in ACT_ROUTES:
         assert prepared.gemm_backend == small_m_gemm_backend(m, n2, k)
         assert prepared.gemm_backend == (
@@ -445,17 +473,29 @@ def test_launch_plan_matches_prepared(group_counts, n2, k, expected_route):
         group_counts, n2, k, seed=664, device=device
     )
     sm_count = torch.cuda.get_device_properties(device).multi_processor_count
+    arch = device_arch(torch.cuda.current_device())
     m = sum(group_counts)
     blocks = routing_blocks(group_counts)
-    # without the routing the plan is shape-only; with it (and K) the routing-aware rule applies
-    shape_route, _ = launch_plan(m, n2, sm_count=sm_count, k=k)
+    # without the routing the plan is shape-only; with it (and K) the routing-aware rule applies,
+    # and with the device's architecture the CTA-cap rule of the mixed-schedule route
+    shape_route, _ = launch_plan(m, n2, sm_count=sm_count, k=k, arch=arch)
     assert shape_route == select_route(m, n2, sm_count=sm_count, k=k)
     if expected_route is not None:
         assert shape_route == expected_route
-    route, grid = launch_plan(m, n2, sm_count=sm_count, group_blocks=blocks, k=k)
-    assert route == select_route(m, n2, sm_count=sm_count, group_blocks=blocks, k=k)
+    route, grid = launch_plan(
+        m, n2, sm_count=sm_count, group_blocks=blocks, k=k, arch=arch
+    )
+    rule_route, cta_cap = select_route_and_cap(
+        m, n2, sm_count=sm_count, group_blocks=blocks, k=k, arch=arch
+    )
+    assert route == rule_route
+    if cta_cap == CTA_CAP:
+        assert route == select_route(m, n2, sm_count=sm_count, group_blocks=blocks, k=k)
+    else:
+        assert route == FUSED_MIXED_ROUTE
+        assert cta_cap in MIXED_CTA_CAPS and cta_cap <= sm_count
     if m < SMALL_M_MAX:
-        assert route == ACT_ROUTE
+        assert route == _small_m_route(n2, k, blocks)
     prepared = prepare_group_gemm_fp8_nt_groupwise_contiguous_silu_quant(
         a, b, a_scale, b_scale, m_indices, validate_indices=True
     )
@@ -468,14 +508,22 @@ def test_launch_plan_matches_prepared(group_counts, n2, k, expected_route):
     )
     if route == FUSED_ROUTE:
         assert grid[0] % 2 == 0 and grid[0] <= 128
-        tail = tail_launch_grid(m, n2, sm_count=sm_count)
-        assert prepared.tail_grid == tail and 1 <= tail[0] <= sm_count
+        # with the routing known the tail grid covers the odd-tail units (at least
+        # one CTA); without it, every block
+        odd_units = fused_tile_counts(n2, blocks)[1]
+        tail = tail_launch_grid(m, n2, sm_count=sm_count, odd_units=odd_units)
+        assert prepared.tail_grid == tail
+        assert tail[0] == max(1, min(odd_units, sm_count))
         assert set(prepared.stage_grids) == {"pair", "tail"}
+        if unvalidated.route == FUSED_ROUTE:
+            assert unvalidated.tail_grid == tail_launch_grid(m, n2, sm_count=sm_count)
     elif route == FUSED_MIXED_ROUTE:
         pair_tiles, odd_units = fused_tile_counts(n2, blocks)
-        clusters = mixed_clusters(pair_tiles, odd_units, sm_count=sm_count)
+        clusters = mixed_clusters(
+            pair_tiles, odd_units, sm_count=sm_count, cta_cap=cta_cap
+        )
         assert clusters >= 1  # one cluster per pair tile or solo unit up to the cap
-        assert grid == (2 * clusters, 1, 1) and grid[0] <= 128
+        assert grid == (2 * clusters, 1, 1) and grid[0] <= cta_cap
         assert prepared.tail_grid is None
         assert set(prepared.stage_grids) == {"main"}
         assert prepared.num_kernels == 1
@@ -600,6 +648,97 @@ def test_routing_blocks_and_fused_tile_counts():
     assert small_grid == (2048, 1, 1)  # 8192 items, one warp each, four per CTA
 
 
+# Picks of the CTA-cap rule on the measured MoE rows at [2H = 2048, K = 4096] per device model; rows not listed
+# keep select_route's route at CTA_CAP.
+CTA_CAP_RULE_PICKS: dict[tuple[str, int], dict[str, tuple[str, int]]] = {
+    ("sm_100a", 148): {
+        "m8192_sixteen_odd": (FUSED_MIXED_ROUTE, 148),
+    },
+    ("sm_103a", 152): {
+        "m8192_sixteen_odd": (FUSED_MIXED_ROUTE, 148),
+    },
+}
+CTA_CAP_RULE_ROWS = {
+    "wide_ep32_gate_up_uniform": [256] * 16,
+    "wide_ep32_gate_up_random_aligned": [256, 0, 512, 0, 384, 640, 128, 384]
+    + [256, 0, 128, 128, 384, 384, 512, 0],
+    "wide_ep32_gate_up_all_odd": [384] * 8 + [128] * 8,
+    "wide_ep32_gate_up_all_one_block": [128] * 16,
+    "wide_ep32_gate_up_mixed_tail": [640, 128, 384, 0, 896, 128, 384, 256]
+    + [128, 0, 384, 128, 256, 128, 128, 128],
+    "wide_ep32_gate_up_two_odd": [128, 384] + [256] * 14,
+    "m8192_max": [512] * 16,
+    "m8192_sixteen_odd": [640] * 8 + [384] * 8,
+}
+
+
+def test_select_route_and_cap_rule():
+    """The CTA-cap rule moves a routing only to the mixed-schedule route above 128 CTAs, only on a
+    device with a model, at the model's geometry with the routing known; every other call keeps
+    select_route's route at 128 CTAs."""
+    rng = random.Random(1356)
+    routings = []
+    for _ in range(400):
+        blocks = [0] * 16
+        for _ in range(rng.randint(8, 64)):
+            blocks[rng.randrange(16)] += 1
+        n2, k = rng.choice([(2048, 4096)] * 6 + [(2048, 2048), (1024, 4096)])
+        routings.append(([128 * b for b in blocks], n2, k))
+    routings += [(counts, 2048, 4096) for counts in CTA_CAP_RULE_ROWS.values()]
+    devices = dict.fromkeys([*ROUTE_MODELS_CAP, ("sm_100a", 148), ("sm_103a", 152)])
+    for arch, sm_count in devices:
+        changed = 0
+        for counts, n2, k in routings:
+            m = sum(counts)
+            blocks = routing_blocks(counts)
+            route, cap = select_route_and_cap(
+                m, n2, sm_count=sm_count, group_blocks=blocks, k=k, arch=arch
+            )
+            base = select_route(m, n2, sm_count=sm_count, group_blocks=blocks, k=k)
+            if cap == CTA_CAP:
+                assert route == base
+            else:
+                changed += 1
+                assert (arch, sm_count) in ROUTE_MODELS_CAP
+                assert route == FUSED_MIXED_ROUTE
+                assert cap in MIXED_CTA_CAPS and cap <= sm_count
+                assert m >= SMALL_M_MAX and (n2, k) == ROUTE_MODEL_GEOMETRY
+                pair_tiles, odd_units = fused_tile_counts(n2, blocks)
+                clusters = mixed_clusters(
+                    pair_tiles, odd_units, sm_count=sm_count, cta_cap=cap
+                )
+                assert launch_plan(
+                    m, n2, sm_count=sm_count, group_blocks=blocks, k=k, arch=arch
+                ) == (FUSED_MIXED_ROUTE, (2 * clusters, 1, 1))
+            # no architecture, no routing, no K or another SM count: no CTA-cap rule
+            assert select_route_and_cap(
+                m, n2, sm_count=sm_count, group_blocks=blocks, k=k
+            ) == (base, CTA_CAP)
+            assert select_route_and_cap(
+                m, n2, sm_count=sm_count, group_blocks=blocks, arch=arch
+            ) == (select_route(m, n2, sm_count=sm_count, group_blocks=blocks), CTA_CAP)
+            assert select_route_and_cap(m, n2, sm_count=sm_count, k=k, arch=arch) == (
+                select_route(m, n2, sm_count=sm_count, k=k),
+                CTA_CAP,
+            )
+            assert select_route_and_cap(
+                m, n2, sm_count=sm_count - 16, group_blocks=blocks, k=k, arch=arch
+            ) == (
+                select_route(m, n2, sm_count=sm_count - 16, group_blocks=blocks, k=k),
+                CTA_CAP,
+            )
+        if (arch, sm_count) not in ROUTE_MODELS_CAP:
+            assert changed == 0
+    for (arch, sm_count), picks in CTA_CAP_RULE_PICKS.items():
+        for name, counts in CTA_CAP_RULE_ROWS.items():
+            m = sum(counts)
+            blocks = routing_blocks(counts)
+            base = select_route(m, 2048, sm_count=sm_count, group_blocks=blocks, k=4096)
+            assert select_route_and_cap(
+                m, 2048, sm_count=sm_count, group_blocks=blocks, k=4096, arch=arch
+            ) == picks.get(name, (base, CTA_CAP))
+
+
 @pytest.mark.parametrize(
     "group_counts,n2,k",
     [
@@ -616,10 +755,7 @@ def test_cuda_graph_replay_after_first_launch(group_counts, n2, k):
     prepared = prepare_group_gemm_fp8_nt_groupwise_contiguous_silu_quant(
         a, b, a_scale, b_scale, m_indices
     )
-    prepared.launch()  # initializes the private descriptor storage
-    torch.cuda.synchronize()
-    eager_q = prepared.out_q.clone()
-    eager_s = prepared.out_s.clone()
+    # Tensor maps travel by value: the very first launch is captured, no eager warm-up launch.
     stream = torch.cuda.Stream(device=device)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.stream(stream), torch.cuda.graph(graph, stream=stream):
@@ -629,12 +765,381 @@ def test_cuda_graph_replay_after_first_launch(group_counts, n2, k):
     torch.cuda.synchronize()
     graph.replay()
     torch.cuda.synchronize()
+    replay_q = prepared.out_q.clone()
+    replay_s = prepared.out_s.clone()
+    prepared.launch()
+    torch.cuda.synchronize()
     # the replay reproduces the eager launch bit for bit (same kernels, same inputs) ...
-    assert torch.equal(prepared.out_q.view(torch.uint8), eager_q.view(torch.uint8))
-    assert torch.equal(prepared.out_s, eager_s)
+    assert torch.equal(prepared.out_q.view(torch.uint8), replay_q.view(torch.uint8))
+    assert torch.equal(prepared.out_s, replay_s)
     # ... and matches the chain where the chain can run
     ref_q, ref_s = _chain_or_skip(a, b, a_scale, b_scale, m_indices)
     _assert_matches(prepared.out_q, prepared.out_s, ref_q, ref_s)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.device_count() < 2,
+    reason="requires two CUDA devices",
+)
+@pytest.mark.parametrize(
+    "group_counts,n2,k,expected_route",
+    [
+        pytest.param([256, 256], 256, 512, ACT_ROUTE, id="act_cute_gemm"),
+        pytest.param([128, 128, 100], 256, 1024, ACT_ROUTE, id="act_cake_gemm"),
+        pytest.param([128], 256, 512, FUSED_MIXED_ROUTE, id="tiny_mixed"),
+        pytest.param([256] * 8 + [128], 256, 512, FUSED_ROUTE, id="pair_tail"),
+    ],
+)
+def test_launch_on_non_current_device(group_counts, n2, k, expected_route):
+    """launch() enters no device or stream context: with cuda:0 current, a launch of
+    a cuda:1 problem runs on cuda:1's current stream (eager, on a side stream and
+    under a graph capture) and writes the same bits as a launch under
+    ``torch.cuda.device(1)``."""
+    dev1 = torch.device("cuda", 1)
+    if torch.cuda.get_device_capability(dev1) not in SUPPORTED_COMPUTE_CAPABILITIES:
+        pytest.skip("cuda:1 is not an SM100a / SM103a device")
+    with torch.cuda.device(0):
+        a, b, a_scale, b_scale, m_indices = _make_inputs(
+            group_counts, n2, k, seed=669, device=dev1
+        )
+        prepared = prepare_group_gemm_fp8_nt_groupwise_contiguous_silu_quant(
+            a, b, a_scale, b_scale, m_indices, group_counts=group_counts
+        )
+        assert prepared.route == expected_route
+        out_q, out_s = prepared.out_q, prepared.out_s
+
+        def poison():
+            out_q.view(torch.uint8).fill_(0xFF)
+            out_s.fill_(float("nan"))
+            torch.cuda.synchronize(dev1)
+
+        def assert_same_bits(ref_q, ref_s):
+            assert torch.equal(out_q.view(torch.uint8), ref_q.view(torch.uint8))
+            assert torch.equal(out_s.view(torch.int32), ref_s.view(torch.int32))
+
+        with torch.cuda.device(1):
+            prepared.launch()
+            torch.cuda.synchronize()
+            g, u = _reference_halves(_reference_gemm(a, b, a_scale, b_scale, m_indices))
+            _assert_quantizes_reference(out_q, out_s, g, u)
+        ref_q, ref_s = out_q.clone(), out_s.clone()
+
+        # eager, cuda:0 current
+        poison()
+        prepared.launch()
+        assert torch.cuda.current_device() == 0
+        torch.cuda.synchronize(dev1)
+        assert_same_bits(ref_q, ref_s)
+
+        # side stream of cuda:1 made current there, cuda:0 current again
+        poison()
+        side = torch.cuda.Stream(device=dev1)
+        side.wait_stream(torch.cuda.current_stream(dev1))
+        with torch.cuda.stream(side):
+            torch.cuda.set_device(0)
+            prepared.launch()
+            torch.cuda.set_device(1)
+        side.synchronize()
+        assert_same_bits(ref_q, ref_s)
+
+        # graph capture on cuda:1 with cuda:0 current during the launch
+        graph = torch.cuda.CUDAGraph()
+        capture = torch.cuda.Stream(device=dev1)
+        with torch.cuda.graph(graph, stream=capture):
+            torch.cuda.set_device(0)
+            prepared.launch()
+            torch.cuda.set_device(1)
+        poison()
+        graph.replay()
+        torch.cuda.synchronize(dev1)
+        assert_same_bits(ref_q, ref_s)
+        del graph
+
+
+def _random_aligned_counts(rng, groups, max_blocks):
+    """Random rows per expert under the routing contract: 128-row multiples (empties allowed) and
+    one optional partial final block; the total never exceeds ``max_blocks`` blocks."""
+    blocks = [0] * groups
+    for _ in range(rng.randint(1, max_blocks)):
+        blocks[rng.randrange(groups)] += 1
+    counts = [b * 128 for b in blocks]
+    last = max(i for i, c in enumerate(counts) if c)
+    counts[last] -= rng.choice(
+        (0, 0, rng.randint(1, 127))
+    )  # partial final block on some rows
+    return counts
+
+
+RANDOM_TOKEN_CASES = [
+    pytest.param(
+        seed,
+        groups,
+        max_blocks,
+        n2,
+        k,
+        id=f"s{seed}_g{groups}_b{max_blocks}_n{n2}_k{k}",
+    )
+    for seed, groups, max_blocks, n2, k in (
+        (1, 4, 8, 256, 512),
+        (2, 8, 16, 512, 1024),
+        (3, 16, 24, 2048, 4096),
+        (4, 16, 40, 2048, 4096),
+        (5, 16, 64, 2048, 4096),
+        (6, 6, 12, 768, 2048),
+        (7, 32, 64, 1024, 1024),
+        (8, 16, 33, 2048, 4096),
+    )
+]
+
+
+@pytest.mark.parametrize("seed,groups,max_blocks,n2,k", RANDOM_TOKEN_CASES)
+def test_random_token_counts_match_torch_reference(seed, groups, max_blocks, n2, k):
+    device = torch.device("cuda")
+    rng = random.Random(seed)
+    group_counts = _random_aligned_counts(rng, groups, max_blocks)
+    a, b, a_scale, b_scale, m_indices = _make_inputs(
+        group_counts,
+        n2,
+        k,
+        seed=670 + seed,
+        device=device,
+        arbitrary_scales=bool(seed % 2),
+    )
+    prepared = prepare_group_gemm_fp8_nt_groupwise_contiguous_silu_quant(
+        a, b, a_scale, b_scale, m_indices, validate_indices=True
+    )
+    out_q, out_s = prepared.launch()
+    torch.cuda.synchronize()
+    g, u = _reference_halves(_reference_gemm(a, b, a_scale, b_scale, m_indices))
+    _assert_quantizes_reference(out_q, out_s, g, u)
+
+
+@pytest.mark.parametrize(
+    "group_counts,n2,k",
+    [
+        pytest.param([256] * 16, 2048, 4096, id="uniform"),
+        pytest.param([384] * 8 + [128] * 8, 2048, 4096, id="all_odd"),
+        pytest.param([128] * 16, 2048, 4096, id="all_one_block"),
+        pytest.param([128, 128, 100], 256, 1024, id="small_m_partial_tail"),
+    ],
+)
+def test_group_counts_route_without_device_work(group_counts, n2, k):
+    """Caller-supplied rows per expert select the routing-aware route without touching m_indices."""
+    device = torch.device("cuda")
+    a, b, a_scale, b_scale, m_indices = _make_inputs(
+        group_counts, n2, k, seed=668, device=device
+    )
+    validated = prepare_group_gemm_fp8_nt_groupwise_contiguous_silu_quant(
+        a, b, a_scale, b_scale, m_indices, validate_indices=True
+    )
+    from_counts = prepare_group_gemm_fp8_nt_groupwise_contiguous_silu_quant(
+        a, b, a_scale, b_scale, m_indices, group_counts=group_counts
+    )
+    assert (from_counts.route, from_counts.grid, from_counts.stage_grids) == (
+        validated.route,
+        validated.grid,
+        validated.stage_grids,
+    )
+    both = prepare_group_gemm_fp8_nt_groupwise_contiguous_silu_quant(
+        a,
+        b,
+        a_scale,
+        b_scale,
+        m_indices,
+        group_counts=group_counts,
+        validate_indices=True,
+    )
+    assert both.route == validated.route
+    out_q, out_s = from_counts.launch()
+    torch.cuda.synchronize()
+    g, u = _reference_halves(_reference_gemm(a, b, a_scale, b_scale, m_indices))
+    _assert_quantizes_reference(out_q, out_s, g, u)
+
+
+def test_caller_owned_outputs_and_workspace():
+    device = torch.device("cuda")
+    group_counts, n2, k = [128, 128, 100], 256, 1024
+    a, b, a_scale, b_scale, m_indices = _make_inputs(
+        group_counts, n2, k, seed=669, device=device
+    )
+    m, h = sum(group_counts), n2 // 2
+    out_q = torch.empty((m, h), dtype=torch.float8_e4m3fn, device=device)
+    out_s = torch.empty((m, h // GROUP_SIZE), dtype=torch.float32, device=device)
+    workspace = torch.empty((m, n2), dtype=torch.bfloat16, device=device)
+    prepared = prepare_group_gemm_fp8_nt_groupwise_contiguous_silu_quant(
+        a, b, a_scale, b_scale, m_indices, out_q=out_q, out_s=out_s, workspace=workspace
+    )
+    assert prepared.route in ACT_ROUTES
+    q, s = prepared.launch()
+    torch.cuda.synchronize()
+    assert q.data_ptr() == out_q.data_ptr() and s.data_ptr() == out_s.data_ptr()
+    g, u = _reference_halves(_reference_gemm(a, b, a_scale, b_scale, m_indices))
+    _assert_quantizes_reference(out_q, out_s, g, u)
+    torch.testing.assert_close(
+        workspace.float(),
+        _reference_gemm(a, b, a_scale, b_scale, m_indices).float(),
+        atol=3e-2,
+        rtol=3e-2,
+    )
+
+
+@pytest.mark.parametrize(
+    "group_counts,n2,k",
+    [
+        pytest.param([128, 128, 100], 256, 1024, id="small_m_cake_gemm"),
+        pytest.param([128, 256], 256, 512, id="small_m_cute_gemm"),
+        pytest.param([256] * 8, 256, 512, id="fused"),
+        pytest.param([128] * 16, 2048, 4096, id="wide_all_one_block"),
+    ],
+)
+def test_launch_rebinds_per_call_operands(group_counts, n2, k):
+    """One prepared object per layer: the token operands and outputs are swapped per call without copies."""
+    device = torch.device("cuda")
+    a, b, a_scale, b_scale, m_indices = _make_inputs(
+        group_counts, n2, k, seed=672, device=device
+    )
+    prepared = prepare_group_gemm_fp8_nt_groupwise_contiguous_silu_quant(
+        a, b, a_scale, b_scale, m_indices, group_counts=group_counts
+    )
+    a2, _, a_scale2, _, _ = _make_inputs(group_counts, n2, k, seed=673, device=device)
+    m_indices2 = m_indices.clone()
+    out_q2 = torch.empty_like(prepared.out_q)
+    out_s2 = torch.empty_like(prepared.out_s)
+    rebound = dict(
+        a=a2, a_scale=a_scale2, m_indices=m_indices2, out_q=out_q2, out_s=out_s2
+    )
+    q, s = prepared.launch(**rebound)
+    assert q is out_q2 and s is out_s2
+    torch.cuda.synchronize()
+    g, u = _reference_halves(_reference_gemm(a2, b, a_scale2, b_scale, m_indices2))
+    _assert_quantizes_reference(out_q2, out_s2, g, u)
+    # The prepared operands are untouched and still bound.
+    q, s = prepared.launch()
+    assert q is prepared.out_q and s is prepared.out_s
+    torch.cuda.synchronize()
+    g, u = _reference_halves(_reference_gemm(a, b, a_scale, b_scale, m_indices))
+    _assert_quantizes_reference(q, s, g, u)
+    # A captured rebound launch replays onto the rebound tensors.
+    expected_q, expected_s = out_q2.clone(), out_s2.clone()
+    stream = torch.cuda.Stream(device=device)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.stream(stream), torch.cuda.graph(graph, stream=stream):
+        prepared.launch(**rebound)
+    out_q2.view(torch.uint8).fill_(0xFF)
+    out_s2.fill_(float("nan"))
+    torch.cuda.synchronize()
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(out_q2.view(torch.uint8), expected_q.view(torch.uint8))
+    assert torch.equal(out_s2, expected_s)
+    with pytest.raises(ValueError, match="a must have shape"):
+        prepared.launch(a=a2[:128].contiguous())
+    with pytest.raises(ValueError, match="out_s must have shape"):
+        prepared.launch(out_s=out_s2[:, :0].contiguous())
+
+
+@pytest.mark.parametrize(
+    "real_counts,n2,k",
+    [
+        pytest.param([100, 128, 5, 0, 250], 256, 512, id="small_m"),
+        pytest.param(
+            [200, 0, 37, 256, 129, 300, 1, 255, 128, 64, 99, 180],
+            256,
+            512,
+            id="large_m",
+        ),
+    ],
+)
+def test_fill_padding_accepts_compact_layout(real_counts, n2, k):
+    """-1 padding rows (compact MoE layout) are forward-filled onto the preceding expert."""
+    device = torch.device("cuda")
+    padded = [-(-c // 128) * 128 for c in real_counts]
+    a, b, a_scale, b_scale, _ = _make_inputs(padded, n2, k, seed=674, device=device)
+    rows = []
+    for g, (c, p) in enumerate(zip(real_counts, padded, strict=True)):
+        rows += [g] * c + [-1] * (p - c)
+    m_indices = torch.tensor(rows, dtype=torch.int32, device=device)
+    with pytest.raises(ValueError, match="fill_padding"):
+        prepare_group_gemm_fp8_nt_groupwise_contiguous_silu_quant(
+            a, b, a_scale, b_scale, m_indices, validate_indices=True
+        )
+    unsorted = m_indices.clone()
+    unsorted[: real_counts[0]] = len(real_counts) - 1
+    with pytest.raises(ValueError, match="m_indices must be sorted"):
+        prepare_group_gemm_fp8_nt_groupwise_contiguous_silu_quant(
+            a,
+            b,
+            a_scale,
+            b_scale,
+            unsorted,
+            validate_indices=True,
+            fill_padding=True,
+        )
+    prepared = prepare_group_gemm_fp8_nt_groupwise_contiguous_silu_quant(
+        a, b, a_scale, b_scale, m_indices, validate_indices=True, fill_padding=True
+    )
+    # group_counts count the padding rows that follow each expert
+    from_counts = prepare_group_gemm_fp8_nt_groupwise_contiguous_silu_quant(
+        a, b, a_scale, b_scale, m_indices, group_counts=padded, fill_padding=True
+    )
+    assert from_counts.route == prepared.route
+    filled = torch.clamp(torch.cummax(m_indices, 0).values, min=0)
+    valid = m_indices >= 0
+    out_q, out_s = prepared.launch()
+    torch.cuda.synchronize()
+    g, u = _reference_halves(_reference_gemm(a, b, a_scale, b_scale, filled))
+    _assert_quantizes_reference(out_q[valid], out_s[valid], g[valid], u[valid])
+    # Graph capture includes the two forward-fill kernels.
+    expected_q, expected_s = out_q.clone(), out_s.clone()
+    stream = torch.cuda.Stream(device=device)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.stream(stream), torch.cuda.graph(graph, stream=stream):
+        prepared.launch()
+    out_q.view(torch.uint8).fill_(0xFF)
+    out_s.fill_(float("nan"))
+    torch.cuda.synchronize()
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(
+        out_q[valid].view(torch.uint8), expected_q[valid].view(torch.uint8)
+    )
+    assert torch.equal(out_s[valid], expected_s[valid])
+
+
+def test_re_preparing_per_step_retains_no_device_memory():
+    """A new routing per step re-prepares the launch on the fused routes; nothing accumulates."""
+    device = torch.device("cuda")
+    rng = random.Random(671)
+    n2, k, groups = 256, 512, 8
+    b = torch.randn((groups, n2, k), device=device).to(torch.float8_e4m3fn)
+    b_scale = torch.ones((groups, n2 // 128, k // 128), device=device)
+    torch.cuda.synchronize()
+    torch.cuda.empty_cache()
+    baseline = torch.cuda.memory_allocated(device)
+    for _ in range(12):
+        counts = _random_aligned_counts(rng, groups, 32)
+        counts = [
+            c - c % 128 for c in counts
+        ]  # fused routes: whole blocks, M >= SMALL_M_MAX
+        while sum(counts) < SMALL_M_MAX:
+            counts[rng.randrange(groups)] += 128
+        m = sum(counts)
+        a = torch.randn((m, k), device=device).to(torch.float8_e4m3fn)
+        a_scale = torch.ones((m, k // 128), device=device)
+        m_indices = torch.repeat_interleave(
+            torch.arange(groups, dtype=torch.int32, device=device),
+            torch.tensor(counts, dtype=torch.int64, device=device),
+        ).contiguous()
+        prepared = prepare_group_gemm_fp8_nt_groupwise_contiguous_silu_quant(
+            a, b, a_scale, b_scale, m_indices, group_counts=counts
+        )
+        assert prepared.route in FUSED_ROUTES
+        out_q, out_s = prepared.launch()
+        torch.cuda.synchronize()
+        assert torch.isfinite(out_s).all()
+        del prepared, out_q, out_s, a, a_scale, m_indices
+    torch.cuda.synchronize()
+    assert torch.cuda.memory_allocated(device) == baseline
 
 
 def test_rejects_invalid_inputs():
@@ -669,6 +1174,20 @@ def test_rejects_invalid_inputs():
     with pytest.raises(ValueError, match="multiple of 128 rows"):
         prepare_group_gemm_fp8_nt_groupwise_contiguous_silu_quant(
             a, b, a_scale, b_scale, unaligned, validate_indices=True
+        )
+    with pytest.raises(ValueError, match="group_counts must"):
+        prepare_group_gemm_fp8_nt_groupwise_contiguous_silu_quant(
+            a, b, a_scale, b_scale, m_indices, group_counts=[100, 156]
+        )
+    with pytest.raises(ValueError, match="disagree with m_indices"):
+        prepare_group_gemm_fp8_nt_groupwise_contiguous_silu_quant(
+            a,
+            b,
+            a_scale,
+            b_scale,
+            m_indices,
+            group_counts=[256, 0],
+            validate_indices=True,
         )
     with pytest.raises(ValueError, match="M must be at most 8192"):
         big_a, big_b, big_as, big_bs, big_idx = _make_inputs(

@@ -30,14 +30,23 @@ from ......jit.core import JitSpec, gen_jit_spec, sm90a_nvcc_flags
 
 __all__ = [
     "GROUPED_GEMM_STAGES",
+    "GROUPED_GEMM_WCX_STAGES",
+    "gen_sm90_cake_bf16_combine_per_route_module",
+    "gen_sm90_cake_bf16_combine_prereduced_module",
     "gen_sm90_cake_bf16_combine_tail_module",
+    "gen_sm90_cake_bf16_combine_tail_prereduced_module",
     "gen_sm90_cake_bf16_compact_module",
+    "gen_sm90_cake_bf16_dispatch_grid_module",
     "gen_sm90_cake_bf16_dispatch_module",
     "gen_sm90_cake_bf16_grouped_gemm_module",
     "grouped_gemm_manifest",
     "grouped_gemm_record",
+    "sm90_cake_bf16_combine_per_route_uri",
+    "sm90_cake_bf16_combine_prereduced_uri",
+    "sm90_cake_bf16_combine_tail_prereduced_uri",
     "sm90_cake_bf16_combine_tail_uri",
     "sm90_cake_bf16_compact_uri",
+    "sm90_cake_bf16_dispatch_grid_uri",
     "sm90_cake_bf16_dispatch_uri",
 ]
 
@@ -63,6 +72,31 @@ _COMBINE_TAIL_SOURCES: _Sources = (
 )
 _DISPATCH_SOURCES: _Sources = (
     ("cake_dispatch_fused_bf16.cu", _SOURCE_DIR / "cake_dispatch_fused_bf16.cu"),
+    ("sm90_push_a2a.cuh", _PROTOCOL_HEADER),
+)
+_DISPATCH_GRID_SOURCES: _Sources = (
+    ("cake_dispatch_grid_bf16.cu", _SOURCE_DIR / "cake_dispatch_grid_bf16.cu"),
+    ("sm90_push_a2a.cuh", _PROTOCOL_HEADER),
+)
+_COMBINE_PREREDUCED_SOURCES: _Sources = (
+    (
+        "cake_combine_prereduced_bf16.cu",
+        _SOURCE_DIR / "cake_combine_prereduced_bf16.cu",
+    ),
+    ("sm90_push_a2a.cuh", _PROTOCOL_HEADER),
+)
+_COMBINE_PER_ROUTE_SOURCES: _Sources = (
+    (
+        "cake_combine_per_route_bf16.cu",
+        _SOURCE_DIR / "cake_combine_per_route_bf16.cu",
+    ),
+    ("sm90_push_a2a.cuh", _PROTOCOL_HEADER),
+)
+_COMBINE_TAIL_PREREDUCED_SOURCES: _Sources = (
+    (
+        "cake_combine_tail_prereduced_bf16.cu",
+        _SOURCE_DIR / "cake_combine_tail_prereduced_bf16.cu",
+    ),
     ("sm90_push_a2a.cuh", _PROTOCOL_HEADER),
 )
 
@@ -176,6 +210,78 @@ def gen_sm90_cake_bf16_dispatch_module() -> JitSpec:
     )
 
 
+def sm90_cake_bf16_dispatch_grid_uri(cuda_flags: tuple[str, ...] | None = None) -> str:
+    """Content-addressed name of the grid-strided large-round dispatch module."""
+    return _module_uri(
+        "sm90_cake_bf16_dispatch_grid", _DISPATCH_GRID_SOURCES, cuda_flags
+    )
+
+
+def gen_sm90_cake_bf16_dispatch_grid_module() -> JitSpec:
+    """JIT spec of ``sm90_cake_dispatch_grid_bf16`` (round opening + count + reserve + store_publish + prefix, one cooperative launch over the co-resident blocks)."""
+    return _gen_module(
+        "sm90_cake_bf16_dispatch_grid",
+        _DISPATCH_GRID_SOURCES,
+        "cake_dispatch_grid_bf16.cu",
+    )
+
+
+def sm90_cake_bf16_combine_prereduced_uri(
+    cuda_flags: tuple[str, ...] | None = None,
+) -> str:
+    """Content-addressed name of the pre-reduced combine publish module."""
+    return _module_uri(
+        "sm90_cake_bf16_combine_prereduced", _COMBINE_PREREDUCED_SOURCES, cuda_flags
+    )
+
+
+def gen_sm90_cake_bf16_combine_prereduced_module() -> JitSpec:
+    """JIT spec of ``sm90_cake_combine_prereduced_bf16`` (group build + fp32 pre-reduce + one bf16 row per (token, source rank))."""
+    return _gen_module(
+        "sm90_cake_bf16_combine_prereduced",
+        _COMBINE_PREREDUCED_SOURCES,
+        "cake_combine_prereduced_bf16.cu",
+    )
+
+
+def sm90_cake_bf16_combine_per_route_uri(
+    cuda_flags: tuple[str, ...] | None = None,
+) -> str:
+    """Content-addressed name of the per-route combine publish module."""
+    return _module_uri(
+        "sm90_cake_bf16_combine_per_route", _COMBINE_PER_ROUTE_SOURCES, cuda_flags
+    )
+
+
+def gen_sm90_cake_bf16_combine_per_route_module() -> JitSpec:
+    """JIT spec of ``sm90_cake_combine_per_route_bf16`` (per-route publish, self-resetting counters, PDL-capable)."""
+    return _gen_module(
+        "sm90_cake_bf16_combine_per_route",
+        _COMBINE_PER_ROUTE_SOURCES,
+        "cake_combine_per_route_bf16.cu",
+    )
+
+
+def sm90_cake_bf16_combine_tail_prereduced_uri(
+    cuda_flags: tuple[str, ...] | None = None,
+) -> str:
+    """Content-addressed name of the pre-reduced combine-tail module."""
+    return _module_uri(
+        "sm90_cake_bf16_combine_tail_prereduced",
+        _COMBINE_TAIL_PREREDUCED_SOURCES,
+        cuda_flags,
+    )
+
+
+def gen_sm90_cake_bf16_combine_tail_prereduced_module() -> JitSpec:
+    """JIT spec of ``sm90_cake_combine_tail_prereduced_bf16`` (wait + source-rank-ordered reduce + ack)."""
+    return _gen_module(
+        "sm90_cake_bf16_combine_tail_prereduced",
+        _COMBINE_TAIL_PREREDUCED_SOURCES,
+        "cake_combine_tail_prereduced_bf16.cu",
+    )
+
+
 # ---------------------------------------------------------------------------
 # Generated expert-grouped GEMMs (FC1 fused SwiGLU / FC1 + clamp / FC2)
 # ---------------------------------------------------------------------------
@@ -188,7 +294,23 @@ def gen_sm90_cake_bf16_dispatch_module() -> JitSpec:
 _GROUPED_GEMM_PACKAGE = "cake_sm90_bf16_megamoe"
 _GROUPED_GEMM_ARCH = "sm_90a"
 _GROUPED_GEMM_MANIFEST = _SOURCE_DIR / f"{_GROUPED_GEMM_PACKAGE}_manifest.json"
-GROUPED_GEMM_STAGES = ("fc1_gated", "fc1_gated_clamp", "fc2")
+# FC2 early-start pair (runner fc2_early_max_tokens): FC1 variants that release
+# per-m-tile readiness counters and an FC2 that claims its tiles dynamically.
+GROUPED_GEMM_EARLY_STAGES = ("fc1_gated_signal", "fc1_gated_clamp_signal", "fc2_early")
+# WCX decode rounds (runner wcx_max_tokens): the early-start pair in swap-AB form
+# reading compressed expert weights (Sm90CakeWcxWeights); same protocol, same bits.
+GROUPED_GEMM_WCX_STAGES = (
+    "fc1_gated_signal_swap",
+    "fc1_gated_clamp_signal_swap",
+    "fc2_early_swap",
+)
+GROUPED_GEMM_STAGES = (
+    "fc1_gated",
+    "fc1_gated_clamp",
+    "fc2",
+    *GROUPED_GEMM_EARLY_STAGES,
+    *GROUPED_GEMM_WCX_STAGES,
+)
 
 
 def _manifest_path() -> Path:
@@ -229,7 +351,7 @@ def grouped_gemm_manifest() -> dict[str, Any]:
 
 
 def grouped_gemm_record(stage: str) -> dict[str, Any]:
-    """Manifest record of one generated stage (``fc1_gated`` / ``fc1_gated_clamp`` / ``fc2``)."""
+    """Manifest record of one generated stage (``GROUPED_GEMM_STAGES``)."""
     if stage not in GROUPED_GEMM_STAGES:
         raise ValueError(
             f"unknown grouped GEMM stage {stage!r}; expected one of {GROUPED_GEMM_STAGES}"

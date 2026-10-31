@@ -1,7 +1,8 @@
 # MXFP8 MegaMoE EP16
 
 This directory contains experimental JIT-only CUDA and CuTe-DSL backends for a
-fixed MXFP8 MegaMoE configuration on exact SM103a devices.
+fixed MXFP8 MegaMoE configuration on SM100 and SM103 devices (compute
+capability 10.0 or 10.3).
 
 The public entry points are
 `flashinfer.moe_ep.CakeMxfp8MegaMoeEp16` and
@@ -29,9 +30,30 @@ backend selection or fallback.
 
 CuTe-DSL requires the appropriate FlashInfer CUDA extra (`cu12` or `cu13`) and
 its CUTLASS DSL dependency. The CuTe modules are loaded lazily only when this
-backend is selected. They are compiled for `sm_103a` through FlashInfer's CuTe
-JIT cache; if `CUTE_DSL_ARCH` is set, it must also select `sm_103a`. Initial
-compilation belongs to session setup, not the forward path.
+backend is selected. They are compiled for the device's exact architecture
+through FlashInfer's CuTe JIT cache; if `CUTE_DSL_ARCH` is set, it must name
+that architecture. Initial compilation belongs to session setup, not the
+forward path.
+
+## Generated sources
+
+`csrc/cake_mxfp8_megamoe_ep16/` holds one architecture-neutral source closure:
+
+- `cake_mxfp8_megamoe_ep16_fused_kernel.cu` with the fused kernel body in
+  `cake_mxfp8_megamoe_ep16_fused_body.cuh`. The body is included once per
+  token specialization (`CAKE_MEGAMOE_RETURN_ALL_CTA` 0 for 16 and 64 tokens
+  per rank, 1 for 32), so both kernel symbols come from one text. Both return
+  the FC2 route terms with relaxed system-scope stores into the source rank's
+  route-term words, which the reducer waits on. The host binding selects the
+  symbol by token count.
+- the ordered route reducer and the tvm-ffi binding;
+- `cute/`: the CuTe-DSL fused kernel (`compile_program(return_all_cta, arch)`)
+  and reducer (`compile_program(arch)`).
+
+The JIT loader builds one module per admitted architecture that is also a
+FlashInfer build target (`FLASHINFER_CUDA_ARCH_LIST` or the visible devices):
+`sm_100a` and `sm_103a`. The manifest lists the sources and launch facts; it
+does not re-verify digests at import time.
 
 ## Supported contract
 
@@ -42,7 +64,17 @@ compilation belongs to session setup, not the forward path.
 - BF16 activations and outputs with MXFP8 expert weights
 - immutable routing prepared with the session, with at most 64 routes assigned
   to any expert across all ranks
-- exact compute capability 10.3 and NVSHMEM symmetric memory
+- compute capability 10.0 or 10.3 and NVSHMEM symmetric memory
+
+The top-k reducer waits for every route term of the forward. Routing outside
+this contract (for example routing changed in place after the session is
+created) leaves route terms unwritten and hangs the forward on all ranks.
+
+End-to-end EP16 correctness and performance were measured on 16 GB300 GPUs
+(SM103). The SM100 target is admitted from the same source: the device text
+has no architecture-dependent code and uses only instructions shared by both
+targets; it is compile-proven on B200, and the 16-rank test has not been run
+there.
 
 CUDA session construction materializes eight fixed-address TMA descriptors with
 one setup kernel. CuTe-DSL prepares tensor-map dimensions and strides on the
@@ -51,8 +83,11 @@ host and passes descriptors by value through the compiled host entry.
 Both implementations synchronize before session construction returns. Each
 forward then uses exactly two kernels: the first publishes and dispatches BF16
 rows, executes FC1 and FC2, and returns one contribution per route; the second
-reduces the eight route contributions in a fixed order. Neither implementation
-allocates device storage in the forward path. CUDA Graph capture is not supported.
+reduces the eight route contributions in a fixed order. The CUDA kernel stores
+each rank's routes into that rank's slot on every rank, and each BF16 row into
+that rank's slot on the ranks that own the row's experts, so dispatch reads rows
+and routes from local memory. Neither implementation allocates device storage in
+the forward path. CUDA Graph capture is not supported.
 Calls on one session must be serialized on a single CUDA stream. Recreate the
 session after 14,913,080 forwards, before its signed grid-counter epoch would
 overflow.

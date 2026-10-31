@@ -19,7 +19,24 @@ export CUDA_MAJOR CUDA_MINOR
 
 mkdir -p "${FLASHINFER_CI_CACHE}" "${REPO_ROOT}/sccache-stats"
 
-docker run --rm \
+# Keep docker run's default cached-image behavior, but retry transient registry
+# failures before starting a build. Never retry the build itself.
+if ! docker image inspect "${DOCKER_IMAGE}" >/dev/null 2>&1; then
+  for attempt in 1 2 3 4; do
+    if docker pull "${DOCKER_IMAGE}"; then
+      break
+    fi
+    if (( attempt == 4 )); then
+      echo "Failed to pull ${DOCKER_IMAGE} after ${attempt} attempts" >&2
+      exit 1
+    fi
+    delay=$(( 5 * 2 ** (attempt - 1) ))
+    echo "Image pull failed; retrying in ${delay}s (attempt $(( attempt + 1 ))/4)" >&2
+    sleep "${delay}"
+  done
+fi
+
+docker run --rm --pull=never \
   -v "${REPO_ROOT}:/workspace" \
   -v "${FLASHINFER_CI_CACHE}:/ci-cache" \
   -e AOT_MAX_JOBS_CAP="${AOT_MAX_JOBS_CAP:-0}" \

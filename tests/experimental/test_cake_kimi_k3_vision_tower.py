@@ -14,16 +14,20 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-import hashlib
+import contextlib
+import dataclasses
 import math
-import struct
+import re
+import sys
+import types
+from pathlib import Path
 
 import pytest
 import torch
 import torch.nn.functional as F
 
 from flashinfer.experimental.kimi_k3_vision_tower import cake_backend as cb
-from flashinfer.experimental.kimi_k3_vision_tower import cake_jit
+from flashinfer.experimental.kimi_k3_vision_tower import cake_build, cake_jit
 from flashinfer.experimental.kimi_k3_vision_tower.cake_backend import (
     FFN,
     GEMM_BLOCK_M,
@@ -42,7 +46,6 @@ from flashinfer.experimental.kimi_k3_vision_tower.cake_backend import (
     PROJECTOR_EPS,
     QKV_HIDDEN,
     QKV_N,
-    REQUIRED_KERNEL_KEYS,
     SOFTMAX_SCALE,
     SUPPORTED_COMPUTE_CAPABILITIES,
     TEXT_HIDDEN,
@@ -68,6 +71,8 @@ ATOL = RTOL = 1e-2
 # Persistent-grid capacity of B200 / B300 in 2-CTA clusters (148 SMs).
 GRID_CLUSTERS = 74
 SM_COUNT = 148
+# Encoder layers of the evaluation contract's rows.
+CONTRACT_LAYERS = 27
 
 # grid_thws batches: single images, a ragged multi-segment batch and a t = 3 video group.
 SMALL_GRIDS = [
@@ -166,11 +171,12 @@ def test_select_tile_config_buckets():
         "pos": ("xs_pf", "xs_pf", "s_e8_pf", "s_e8_pf"),
         "pos_sqxw": ("xs_pf", "xs_pf", "s_e8_pf", "s_e8_pf"),
         "norm_qkv_rope": ("xs_cs_pf", "s_cs", "l_e8_cs", "l_e8_cs"),
-        "residual_wo": ("xs_pf", "xs_pf", "s_e8_pf", "m_tma1"),
-        "residual_wo_sqxw": ("xs_pf", "xs_pf", "s_e8_pf", "m_tma1"),
+        "residual_wo": ("xs_pf", "xs_pf", "s_e8_pf", "l_e8_tma1x"),
+        "residual_wo_sqxw": ("xs_pf", "xs_pf", "s_e8_pf", "l_e8_tma1x"),
         "residual_fc1": ("xs_k4_pf", "xs_pf", "l_e8_pf", "m_p"),
         "residual_fc1_sqxw": ("xs_k4_pf", "xs_pf", "l_e8_pf", "m_p"),
-        "norm_gelu": ("xs", "s", "l_e8", "l_e8"),
+        # norm_gelu (K = 1024) takes the eight-warp pair tile m_e8 above NG_M_E8_MIN_M (768 rows).
+        "norm_gelu": ("xs", "m_e8", "l_e8", "l_e8"),
         # Round 4: the projector GEMMs take the stream-K twin ``l_sk`` inside the tile-census
         # window (gelu_erf at 10764: 688 pair tiles on 74 clusters, tail 22 = 30 %, saving 7 %).
         "gelu_erf": ("xs", "s", "l", "l_sk"),
@@ -190,16 +196,29 @@ def test_select_tile_config_buckets():
         "pos": [(1, "xs_pf"), (1025, "s_e8_pf")],
         "pos_sqxw": [(1, "xs_pf"), (1025, "s_e8_pf")],
         # Round 5: the eight-warp 256 x 128 pair tile inside (QKV_M_E8_MIN_M, M_E8_MAX_M] (norm_qkv_rope) /
-        # (NG_S_LIMIT, M_E8_MAX_M] (norm_gelu); Cake ``_m_e8_twin``.
+        # (NG_M_E8_MIN_M, M_E8_MAX_M] (norm_gelu); Cake ``_m_e8_twin``.  Inside (QKV_M_E8_MIN_M, L_E8_HALF_MAX_M] a
+        # 256 x 256 census whose tail fits one half-round keeps the 256-wide tile (2305 .. 2560 / 2816 on 148 SMs);
+        # norm_qkv_rope keeps 128 x 64 up to QKV_XS_LIMIT (512 rows).
         "norm_qkv_rope": [
             (1, "xs_cs_pf"),
-            (769, "s_cs"),
+            (513, "s_cs"),
             (1537, "l_e8_cs"),
-            (2305, "m_e8_cs"),
+            (2561, "m_e8_cs"),
             (4097, "l_e8_cs"),
         ],
-        "residual_wo": [(1, "xs_pf"), (1025, "s_e8_pf"), (6145, "m_tma1")],
-        "residual_wo_sqxw": [(1, "xs_pf"), (1025, "s_e8_pf"), (6145, "m_tma1")],
+        # The out-proj pair branch: m_tma1 up to 8191, the 256 x 256 tile from WO_PAIR_BANDS' 8192 on.
+        "residual_wo": [
+            (1, "xs_pf"),
+            (1025, "s_e8_pf"),
+            (6145, "m_tma1"),
+            (8192, "l_e8_tma1x"),
+        ],
+        "residual_wo_sqxw": [
+            (1, "xs_pf"),
+            (1025, "s_e8_pf"),
+            (6145, "m_tma1"),
+            (8192, "l_e8_tma1x"),
+        ],
         # Round 5 (Cake ``_fc1_sk_twin``): ``m_sk`` where the 256 x 256 census leaves 1..4 tiles in an extra round
         # (4609..4864 -> 76 pair tiles on 74 clusters), ``l_sk`` from 3.4 ideal rounds (15873) up to FC1_SK_L_MAX_M.
         "residual_fc1": [
@@ -222,18 +241,19 @@ def test_select_tile_config_buckets():
             (8193, "m_p"),
             (15873, "l_sk"),
         ],
+        # The (512, 768] 128 x 64 window is gelu_erf's (K = 4096) alone.
         "norm_gelu": [
             (1, "xs"),
             (257, "s"),
-            (513, "xs"),
-            (769, "s"),
-            (1657, "m_e8"),
+            (769, "m_e8"),
+            (2305, "l_e8"),
+            (2817, "m_e8"),
             (4097, "l_e8"),
         ],
         # Round 4 / 5: ``l`` <-> ``l_sk`` alternate per 128-row tile pair inside the pair-tile range wherever
         # the census leaves a tail of <= 30 % of the 74 clusters worth >= 6.5 % of the rounds OR (round 5) a
         # tail of <= 60 % worth >= 9 % (Cake ``_sk_twin``; identical to the Cake rule over M = 1 .. 65536 at the
-        # round-5 head, copied from ``exports/kimi_k3_vision_tower`` ``_gemm_tile``).
+        # round-5 head, copied from the Cake export's ``_gemm_tile``).
         "gelu_erf": [
             (1, "xs"),
             (257, "s"),
@@ -301,7 +321,8 @@ def test_select_tile_config_buckets():
         assert not (cfg.sk and (cfg.tail or cfg.ksplit != 1 or cfg.cta_group != 2))
     # The stream-K twins exist for the pair tiles of the projector GEMMs (census window; above 16 rounds,
     # M > 17792 for gelu_erf, the window can no longer be met) and, round 5, of residual_fc1 (m_sk at the
-    # 4609..4864 census point, l_sk for 15873 <= M <= FC1_SK_L_MAX_M); no other form takes one.
+    # 4609..4864 census point, l_sk for 15873 <= M <= FC1_SK_L_MAX_M, its column-first twin l_sk_cf inside the
+    # arch's windows); no other form takes one.
     for variant in expect:
         if variant not in ("gelu_erf", "rmsnorm", "residual_fc1", "residual_fc1_sqxw"):
             assert not any(
@@ -317,15 +338,51 @@ def test_select_tile_config_buckets():
     assert [m for m, name in fc1 if name == "m_sk"] == [4609, 4737]
     l_sk = [m for m, name in fc1 if name == "l_sk"]
     assert (l_sk[0], l_sk[-1], len(l_sk)) == (15873, 105857, 704)
-    assert select_tile_config("residual_fc1_sqxw", cb.FC1_SK_L_MAX_M).name == "l_sk"
+    l_sk_cf = [
+        m for m, name in fc1 if name == "l_sk_cf"
+    ]  # no arch: the union of the arches' windows
+    assert (l_sk_cf[0], l_sk_cf[-1], len(l_sk_cf)) == (105985, 152961, 368)
+    assert cb.FC1_SK_L_MAX_M == 153088
+    assert select_tile_config("residual_fc1_sqxw", cb.FC1_SK_L_MAX_M).name == "l_sk_cf"
     assert base("residual_fc1_sqxw", cb.FC1_SK_L_MAX_M + 1).name == "m_p"
-    assert base("residual_fc1_sqxw", 153088).name == "m_p"
-    assert select_tile_config("residual_fc1_sqxw", 153088).name == "m_p"
-    # The census counts cover every routing window of the module (fc1 l_sk up to 105984, PDL windows) plus
-    # the rule boundaries and the PDL window edges on M.
-    assert cb.GEMM_CENSUS_LIMIT == 105984 + GEMM_BLOCK_M
+    # The column-first raster twin (same tile geometry) inside each arch's inclusive token windows, and the fc1
+    # forms' TMA-epilogue tile inside FC1_TMA_WINDOWS (both arches).
+    for name, twin in cb.COLS_FIRST_TWINS.items():
+        assert TILE_CONFIGS[twin] == dataclasses.replace(TILE_CONFIGS[name], name=twin)
+    assert cb.FC1_TMA_TILE == "l_e8_tma1x_h" and TILE_CONFIGS["l_e8_tma1x_h"].half
+    for arch, m, name in (
+        ("sm_100a", 10764, "l_e8_tma1x_h"),
+        ("sm_100a", 10765, "m_p"),
+        ("sm_100a", 11340, "l_e8_tma1x_h"),
+        ("sm_100a", 14100, "l_e8_tma1x_h"),
+        ("sm_100a", 14101, "m_p_h"),
+        ("sm_100a", 16508, "l_sk_cf"),
+        ("sm_100a", 16576, "l_sk"),
+        ("sm_100a", 19136, "l_sk_cf"),
+        ("sm_100a", 43056, "l_sk_cf"),
+        ("sm_100a", 105984, "l_sk_cf"),
+        ("sm_103a", 10764, "l_e8_tma1x_h"),
+        ("sm_103a", 11340, "l_e8_tma1x_h"),
+        ("sm_103a", 14100, "l_e8_tma1x_h"),
+        ("sm_103a", 16576, "l_sk_cf"),
+        ("sm_103a", 19140, "l_sk_cf"),
+        ("sm_103a", 43068, "l_sk_cf"),
+        ("sm_103a", 105984, "l_sk_cf"),
+        ("sm_103a", 105983, "l_sk"),
+        ("sm_100a", 153088, "l_sk_cf"),
+        ("sm_103a", 153088, "l_sk_cf"),
+    ):
+        for variant in cb.COLS_FIRST_VARIANTS:
+            assert select_tile_config(variant, m, arch=arch).name == name, (
+                variant,
+                arch,
+                m,
+            )
+    # The census counts cover every routing window of the module (fc1 l_sk up to 153088, PDL windows, the
+    # column-first twin windows) plus the rule boundaries and the window edges on M.
+    assert cb.GEMM_CENSUS_LIMIT == 153088 + GEMM_BLOCK_M
     counts = cb.gemm_census_counts("gelu_erf")
-    assert counts[:3] == (1, 129, 143) and {
+    assert counts[:5] == (1, 64, 65, 129, 143) and {
         143,
         144,
         638,
@@ -334,8 +391,14 @@ def test_select_tile_config_buckets():
         1196,
         1197,
     } <= set(counts)
-    assert {4096, 4097, 2304, 2305, 105984, 105985} <= set(
+    assert {4096, 4097, 2304, 2305, 768, 769, 3072, 3073, 153088, 153089} <= set(
         cb.gemm_census_counts("norm_gelu")
+    )
+    assert {10763, 10764, 10765, 11339, 11340, 11341, 14099, 14100, 14101} <= set(
+        cb.gemm_census_counts("residual_fc1_sqxw")
+    )
+    assert {16508, 16576, 19135, 19136, 19140, 19141, 43055, 43069} <= set(
+        cb.gemm_census_counts("residual_fc1_sqxw")
     )
     # The tail split-K twins are opt-in in Cake and never selected.
     for variant in expect:
@@ -356,21 +419,25 @@ def test_select_tile_config_buckets():
     )  # 72 > 70: a >= 97 %-full half round is a tie
     assert cb.half_tail_split(74 * 4, 74) == 0 and cb.half_tail_split(50, 74) == 0
     for variant, m, name in (
-        ("norm_gelu", 2552, "m_e8_h"),
+        # 2552: inside (QKV_M_E8_MIN_M, L_E8_HALF_MAX_M] the 256 x 256 census (160 tiles, tail 12) fits one
+        # half-round, so norm_gelu keeps l_e8 and takes its half twin.
+        ("norm_gelu", 2552, "l_e8_h"),
         ("residual_wo_sqxw", 2552, "s_e8_pf_h"),
-        ("residual_wo_sqxw", 19136, "m_tma1_h"),
-        ("residual_wo_sqxw", 8192, "m_tma1"),  # HALF_MIN_ROUNDS: 4 rounds
-        ("residual_wo_sqxw", 12288, "m_tma1_h"),  # 6 rounds
-        ("residual_wo_sqxw", 10764, "m_tma1"),
+        # The out-proj 256 x 256 tile: 4 column tiles per pair row on 74 clusters.
+        ("residual_wo_sqxw", 19136, "l_e8_tma1x_h"),  # 300 tiles, tail 4
+        ("residual_wo_sqxw", 8192, "l_e8_tma1x"),  # 128 tiles, tail 54: 108 > 70
+        ("residual_wo_sqxw", 12288, "l_e8_tma1x"),  # 192 tiles, tail 44: 88 > 70
+        ("residual_wo_sqxw", 10764, "l_e8_tma1x_h"),  # 172 tiles, tail 24
+        (
+            "residual_wo_sqxw",
+            7168,
+            "m_tma1",
+        ),  # m_tma1 runs below 8192, short of its 6 rounds
         ("residual_wo_sqxw", 4144, "s_e8_pf"),
         ("norm_qkv_rope", 4144, "l_e8_cs_h"),
         ("norm_qkv_rope", 1152, "s_cs_h"),
-        (
-            "norm_qkv_rope",
-            576,
-            "xs_cs_pf",
-        ),  # HALF_ROUTE_EXCLUDE: the xs tile never takes its twin
-        ("norm_gelu", 576, "xs"),
+        ("norm_qkv_rope", 576, "s_cs_h"),
+        ("norm_gelu", 576, "s_h"),
         ("norm_qkv_rope", 256, "xs_cs_pf"),
         ("rmsnorm", 4144, "l_h"),
         ("gelu_erf", 1196, "s_h"),
@@ -378,9 +445,10 @@ def test_select_tile_config_buckets():
             "gelu_erf",
             638,
             "xs",
-        ),  # HALF_ROUTE_EXCLUDE: (gelu_erf, xs) never takes its twin
-        ("residual_wo_sqxw", 66564, "m_tma1"),  # 33 rounds > HALF_MAX_ROUNDS
-        ("residual_wo_sqxw", 43056, "m_tma1_h"),  # 20 rounds: twin kept
+        ),  # (gelu_erf, xs) never takes its twin
+        ("residual_wo_sqxw", 66564, "l_e8_tma1x_h"),  # 15 rounds, tail 8
+        ("residual_wo_sqxw", 43056, "l_e8_tma1x_h"),  # 10 rounds, tail 10
+        ("residual_wo_sqxw", 153088, "l_e8_tma1x"),  # 33 rounds > HALF_MAX_ROUNDS
         ("norm_gelu", 66564, "l_e8"),
         ("norm_gelu", 153088, "l_e8"),
         ("norm_gelu", 19140, "l_e8_h"),
@@ -416,16 +484,22 @@ def test_select_tile_config_buckets():
             getattr(b, f) for f in fields
         ), name
     assert not any(select_tile_config("pos_sqxw", m).half for m in range(1, 65537, 128))
-    # Final-head limits (Cake HALF_MAX_ROUNDS / HALF_ROUTE_EXCLUDE): no twin past 24 persistent rounds, never at the xs tile.
-    assert cb.HALF_MAX_ROUNDS == 24 and set(cb.HALF_ROUTE_EXCLUDE) == {
-        ("gelu_erf", "xs"),
-        ("norm_gelu", "xs"),
-        ("norm_qkv_rope", "xs_cs_pf"),
-    }
-    # m_tma1_h needs >= 6 persistent rounds (8192 = 4 rounds regressed the batch8_448 tower row on B200); 12288 keeps it.
+    # norm_gelu keeps its m_e8 tile whole (no half-N twin).
+    assert not any(
+        select_tile_config("norm_gelu", m).name == "m_e8_h" for m in range(1, 20001)
+    )
+    # Final-head limits (Cake HALF_MAX_ROUNDS; the xs twins Cake excludes on every form are not in the catalogue).
+    assert cb.HALF_MAX_ROUNDS == 24
+    assert not any(name.startswith("xs") for name in cb.HALF_TWIN.values())
+    # m_tma1_h needs >= 6 persistent rounds; the out-proj runs m_tma1 only below WO_PAIR_BANDS' 8192 (at most 4 rounds
+    # on 74 clusters), so its half twin is never launched there.
     assert cb.HALF_MIN_ROUNDS == {"m_tma1": 6}
-    assert select_tile_config("residual_wo_sqxw", 8192).name == "m_tma1"
-    assert select_tile_config("residual_wo_sqxw", 12288).name == "m_tma1_h"
+    assert cb.WO_PAIR_BANDS == ((8192, 2**30, "l_e8_tma1x"),)
+    assert not any(
+        select_tile_config("residual_wo_sqxw", m).half for m in range(6145, 8192)
+    )
+    assert select_tile_config("residual_wo_sqxw", 8191).name == "m_tma1"
+    assert select_tile_config("residual_wo_sqxw", 8192).name == "l_e8_tma1x"
     assert not any(
         select_tile_config(variant, m).name in ("xs_h", "xs_cs_pf_h")
         for variant in ("gelu_erf", "norm_gelu", "norm_qkv_rope")
@@ -433,22 +507,16 @@ def test_select_tile_config_buckets():
     )
     assert all(
         not select_tile_config(variant, m).half
-        for variant in ("residual_wo_sqxw", "norm_gelu", "norm_qkv_rope")
+        for variant in ("norm_gelu", "norm_qkv_rope")
         for m in (66564, 105984, 153088)
     )
     assert not any(
         cfg.half and (cfg.sk or cfg.tail or cfg.ksplit > 1)
         for cfg in TILE_CONFIGS.values()
     )
-    # Without a packed table the ``_cs`` tiles fall back to their FP32-table base.
+    # The host always passes the packed RoPE table: a ``_cs`` tile is launched as is.
     assert (
         launch_tile_config("norm_qkv_rope", TILE_CONFIGS["xs_cs_pf"]).name == "xs_cs_pf"
-    )
-    assert (
-        launch_tile_config(
-            "norm_qkv_rope", TILE_CONFIGS["xs_cs_pf"], rope_table=False
-        ).name
-        == "xs"
     )
 
 
@@ -467,8 +535,6 @@ def test_gemm_launch_geometry():
     assert geo.cluster_tiles == (geo.m_tiles // 2) * (QKV_N // 256)
     assert geo.grid == (2 * min(geo.cluster_tiles, SM_COUNT // 2), 1, 1)
     assert (geo.full_tiles, geo.tail_split) == (geo.cluster_tiles, 1)
-    with pytest.raises(NotImplementedError):
-        gemm_launch_geometry("norm_qkv_rope", TILE_CONFIGS["l_e8_t"], 4144, SM_COUNT)
     # Stream-K twin (round 4): the full rounds stay data-parallel; the 22-tile tail of gelu_erf
     # at M = 10764 (688 pair tiles on 74 clusters) is cut into q = 22 k-steps per cluster
     # (ceil(22 x 64 / 74) = 20, raised to ceil(64 / (SK_MAX_CONTRIB - 1)) = 22).
@@ -488,144 +554,33 @@ def test_gemm_launch_geometry():
     geo = gemm_launch_geometry("residual_fc1_sqxw", cfg, 4784, SM_COUNT)
     assert (geo.grid, geo.m_tiles, geo.cluster_tiles) == ((148, 1, 1), 38, 152)
     assert (geo.full_tiles, geo.tail_split) == (148, 22)
-    cfg = select_tile_config("residual_fc1_sqxw", 16576)
+    cfg = select_tile_config("residual_fc1_sqxw", 16576, arch="sm_100a")
     assert cfg.name == "l_sk"
     geo = gemm_launch_geometry("residual_fc1_sqxw", cfg, 16576, SM_COUNT)
     assert (geo.grid, geo.m_tiles, geo.cluster_tiles) == ((148, 1, 1), 130, 260)
     assert (geo.full_tiles, geo.tail_split) == (222, 33)
+    # sm_103a runs its column-first twin there: the same geometry.
+    cfg = select_tile_config("residual_fc1_sqxw", 16576, arch="sm_103a")
+    assert cfg.name == "l_sk_cf" and cfg.sk
+    assert gemm_launch_geometry("residual_fc1_sqxw", cfg, 16576, SM_COUNT) == geo
     # Round 6 half-N twins: the full rounds stay whole tiles; the ``half_tail_split`` tail runs as half items
-    # (norm_gelu at 2552: 20 pair rows / 2 x 32 column tiles = 320 tiles on 74 clusters, tail 24 -> 48 <= 70).
+    # (norm_gelu at 2552: 20 pair rows / 2 x 16 column tiles = 160 tiles on 74 clusters, tail 12 -> 24 <= 70).
     cfg = select_tile_config("norm_gelu", 2552)
-    assert cfg.name == "m_e8_h" and cfg.half
+    assert cfg.name == "l_e8_h" and cfg.half
     geo = gemm_launch_geometry("norm_gelu", cfg, 2552, SM_COUNT)
-    assert (geo.grid, geo.m_tiles, geo.cluster_tiles) == ((148, 1, 1), 20, 320)
-    assert (geo.full_tiles, geo.tail_split) == (296, 1)
-    # The out-proj TMA-epilogue twin at 19136 (150 pair rows / 2 x 8 column tiles = 600 tiles, tail 8).
+    assert (geo.grid, geo.m_tiles, geo.cluster_tiles) == ((148, 1, 1), 20, 160)
+    assert (geo.full_tiles, geo.tail_split) == (148, 1)
+    # The out-proj 256 x 256 TMA-epilogue tile's half twin at 19136 (150 pair rows / 2 x 4 column tiles = 300 tiles,
+    # tail 4).
     cfg = select_tile_config("residual_wo_sqxw", 19136)
-    assert cfg.name == "m_tma1_h"
+    assert cfg.name == "l_e8_tma1x_h"
     geo = gemm_launch_geometry("residual_wo_sqxw", cfg, 19136, SM_COUNT)
-    assert (geo.cluster_tiles, geo.full_tiles, geo.tail_split) == (600, 592, 1)
+    assert (geo.cluster_tiles, geo.full_tiles, geo.tail_split) == (300, 296, 1)
     # The base tile of a half twin keeps the whole-tile geometry.
     geo = gemm_launch_geometry(
-        "residual_wo_sqxw", TILE_CONFIGS["m_tma1"], 19136, SM_COUNT
+        "residual_wo_sqxw", TILE_CONFIGS["l_e8_tma1x"], 19136, SM_COUNT
     )
-    assert (geo.cluster_tiles, geo.full_tiles, geo.tail_split) == (600, 600, 1)
-
-
-def test_required_kernel_keys():
-    # The plain SPLIT_KV form is reachable only on sm_103a (segments < 576 tokens or > 10764
-    # tokens); on sm_100a every SPLIT_KV row runs the ring3 form.
-    assert set(REQUIRED_KERNEL_KEYS) == {"sm_100a", "sm_103a"}
-    assert "attention:tiles1" not in REQUIRED_KERNEL_KEYS["sm_100a"]
-    assert "attention:tiles1" in REQUIRED_KERNEL_KEYS["sm_103a"]
-    # Round 6: the attention forms are the census of the plan rule (single segments of every 128-token step to
-    # 70016 + the routing thresholds' edges + the contract rows); the literal copied into the module must equal
-    # the recomputed census.  The wide (UNIT_PREFETCH) build exists for every layout below the arch's token
-    # limit, the split build (+ ``attention_merge``) wherever the automatic tail split fires.
-    for arch, keys in REQUIRED_KERNEL_KEYS.items():
-        assert cb.ATTENTION_FORM_KEYS[arch] == cb.attention_census_keys(arch), arch
-        # With the export's coverage rows every reachable key is registered: the declaration is empty.
-        assert (
-            cb.UNCOVERED_KERNEL_KEYS[arch] == ()
-            and cb.REGISTERED_KERNEL_KEYS[arch] == keys
-        ), arch
-        assert "attention:ring3" in keys
-        assert "attention:tiles2" in keys
-        assert "attention:ring3:wide" in keys and "attention:tiles2:wide" in keys
-        assert "attention:ring3:split" in keys and "attention_merge" in keys
-        assert "merge" in keys
-        assert "rmsnorm_apply" in keys
-        assert len(keys) == len(set(keys))
-        # The declared uncovered keys are reachable-but-unexercised keys; the registered set is the rest.
-        assert set(cb.UNCOVERED_KERNEL_KEYS[arch]) <= set(keys)
-        assert (
-            tuple(k for k in keys if k not in cb.UNCOVERED_KERNEL_KEYS[arch])
-            == cb.REGISTERED_KERNEL_KEYS[arch]
-        )
-    assert {
-        "attention:tiles2:split",
-        "attention:tiles1:split",
-        "attention:tiles1:wide",
-    } <= set(REQUIRED_KERNEL_KEYS["sm_103a"])
-    assert not any(
-        ":split" in k and "tiles2" in k for k in REQUIRED_KERNEL_KEYS["sm_100a"]
-    )
-    assert (
-        len(REQUIRED_KERNEL_KEYS["sm_100a"]),
-        len(REQUIRED_KERNEL_KEYS["sm_103a"]),
-    ) == (72, 76)  # xs twins never routed (xs-tile HALF_ROUTE_EXCLUDE)
-    for keys in REQUIRED_KERNEL_KEYS.values():
-        gemm_keys = [k for k in keys if k.startswith("gemm:")]
-        # Small-M tiles of the per-layer forms are always inside their PDL_EARLY window: only the pdle
-        # binary is reachable; the large-M tiles exist in both forms (window bound inside their range).
-        assert (
-            "gemm:pos_sqxw:xs_pf" in gemm_keys
-            and "gemm:pos_sqxw:xs_pf:pdle" not in gemm_keys
-        )
-        assert "gemm:residual_fc1_sqxw:xs_k4_pf:pdle" in gemm_keys
-        assert "gemm:residual_fc1:xs_k4_pf:pdle" in gemm_keys
-        assert "gemm:residual_wo_sqxw:m_tma1" in gemm_keys
-        assert "gemm:residual_wo_sqxw:m_tma1:pdle" in gemm_keys
-        assert "gemm:residual_wo_sqxw:s_e8_pf:pdle" in gemm_keys
-        assert "gemm:residual_fc1:s_e8_pf:pdle" in gemm_keys
-        assert (
-            "gemm:norm_qkv_rope:l_e8_cs" in gemm_keys
-            and "gemm:norm_qkv_rope:l_e8_cs:pdle" in gemm_keys
-            and "gemm:gelu_erf:l" in gemm_keys
-        )
-        # Round 4 / 5: the stream-K twins of the projector GEMMs and (round 5) of residual_fc1.
-        assert "gemm:gelu_erf:l_sk" in gemm_keys and "gemm:rmsnorm:l_sk" in gemm_keys
-        assert (
-            "gemm:residual_fc1_sqxw:m_sk" in gemm_keys
-            and "gemm:residual_fc1:l_sk" in gemm_keys
-        )
-        assert not any(
-            k.split(":")[2].endswith("_sk")
-            for k in gemm_keys
-            if k.split(":")[1]
-            not in ("gelu_erf", "rmsnorm", "residual_fc1", "residual_fc1_sqxw")
-        )
-        # Round 5: the PDL_EARLY binaries inside the census windows; never on stream-K / pos tiles, and the
-        # plain PDL binary of a tile is registered only where it is reachable (e.g. norm_qkv_rope s_cs at
-        # 769..1536 is always inside the window -> only its pdle form exists).
-        pdle = [k for k in gemm_keys if k.endswith(":pdle")]
-        # Round 6 (final head, rounds cap 24 / xs tile excluded): + 21 half-N twin keys (10 twins in their reachable
-        # PDL forms; the xs twins are never routed) = 64 GEMM keys, 39 of them pdle.
-        half = [k for k in gemm_keys if TILE_CONFIGS[k.split(":")[2]].half]
-        assert len(pdle) == 39 and len(gemm_keys) == len(set(gemm_keys)) == 64
-        assert len(half) == 21 and {k.split(":")[2] for k in half} == set(
-            cb.HALF_TWIN.values()
-        ) - {"xs_h", "xs_cs_pf_h"}
-        assert (
-            "gemm:residual_wo_sqxw:m_tma1_h:pdle" in half
-            and "gemm:residual_wo_sqxw:m_tma1_h" in half
-        )
-        assert not any(k.split(":")[2] in ("xs_h", "xs_cs_pf_h") for k in gemm_keys)
-        assert (
-            "gemm:gelu_erf:xs_h" not in gemm_keys
-            and "gemm:gelu_erf:xs_h:pdle" not in gemm_keys
-        )
-        assert (
-            "gemm:residual_wo_sqxw:m_tma1_h" in half
-            and "gemm:residual_wo_sqxw:m_tma1" in gemm_keys
-        )
-        assert (
-            "gemm:norm_gelu:m_e8:pdle" in pdle
-            and "gemm:norm_qkv_rope:m_e8_cs:pdle" in pdle
-        )
-        assert (
-            "gemm:norm_qkv_rope:s_cs:pdle" in pdle
-            and "gemm:norm_qkv_rope:s_cs" not in gemm_keys
-        )
-        assert "gemm:gelu_erf:l:pdle" not in pdle and "gemm:gelu_erf:l" in gemm_keys
-        assert not any(
-            TILE_CONFIGS[k.split(":")[2]].sk or k.split(":")[1] == "pos_sqxw"
-            for k in pdle
-        )
-        # Every registered GEMM tile is a production (non-tail) config.
-        assert not any(TILE_CONFIGS[k.split(":")[2]].tail for k in gemm_keys)
-        # Only the launched variants (the ``_sq``-only forms are not part of the tower).
-        assert not any(k.split(":")[1].endswith("_sq") for k in gemm_keys)
+    assert (geo.cluster_tiles, geo.full_tiles, geo.tail_split) == (300, 300, 1)
 
 
 def test_pdl_early_window_and_exclusions():
@@ -645,7 +600,6 @@ def test_pdl_early_window_and_exclusions():
     assert not cb.pdl_early_selected("pos_sqxw", TILE_CONFIGS["xs_pf"], 4)
     assert not cb.pdl_early_selected("residual_fc1_sqxw", TILE_CONFIGS["m_sk"], 4784)
     assert not cb.pdl_early_selected("residual_fc1_sqxw", TILE_CONFIGS["l_sk"], 16576)
-    assert not cb.pdl_early_selected("norm_gelu", TILE_CONFIGS["l_e8_t"], 4144)
     assert cb.pdl_early_selected("residual_fc1_sqxw", TILE_CONFIGS["l_e8_pf"], 4144)
     assert cb.gemm_stage_key("residual_fc1_sqxw", 4784) == "gemm:residual_fc1_sqxw:m_sk"
     assert (
@@ -666,1213 +620,246 @@ def test_pdl_early_window_and_exclusions():
     )
 
 
-# Logical GEMM kernel key per launched variant of every contract row (T = total tokens, N = merged tokens),
-# copied ONCE from the Cake export protocol at the round-6 head (``exports/kimi_k3_vision_tower/export.py``
-# ``stage_kernels`` on ``kimi_k3_vision_gemm`` with the half-N tail routing on; arch-independent).  The mirror
-# must reproduce it exactly: a disagreement here means the host launches another binary than the source route.
-CONTRACT_ROW_GEMM_KEYS = {
-    "img_224": (
-        256,
-        64,
-        (
-            "xs_pf",
-            "xs_cs_pf:pdle",
-            "xs_pf:pdle",
-            "xs:pdle",
-            "xs_k4_pf:pdle",
-            "xs_k4_pf:pdle",
-            "xs",
-            "s",
-        ),
-    ),
-    "img_336": (
-        576,
-        144,
-        (
-            "xs_pf",
-            "xs_cs_pf:pdle",
-            "xs_pf:pdle",
-            "xs:pdle",
-            "xs_pf:pdle",
-            "xs_pf:pdle",
-            "xs:pdle",
-            "s:pdle",
-        ),
-    ),
-    "img_448": (
-        1024,
-        256,
-        (
-            "xs_pf",
-            "s_cs:pdle",
-            "xs_pf:pdle",
-            "s:pdle",
-            "xs_pf:pdle",
-            "xs_pf:pdle",
-            "xs:pdle",
-            "s:pdle",
-        ),
-    ),
-    "img_640x480": (
-        1656,
-        414,
-        (
-            "s_e8_pf",
-            "l_e8_cs:pdle",
-            "s_e8_pf:pdle",
-            "s:pdle",
-            "s_e8_pf:pdle",
-            "s_e8_pf:pdle",
-            "s:pdle",
-            "s:pdle",
-        ),
-    ),
-    "img_800x600": (
-        2552,
-        638,
-        (
-            "s_e8_pf",
-            "m_e8_cs:pdle",
-            "s_e8_pf_h:pdle",
-            "m_e8_h:pdle",
-            "l_e8_pf:pdle",
-            "l_e8_pf:pdle",
-            "xs:pdle",
-            "s:pdle",
-        ),
-    ),
-    "img_1024x768": (
-        4144,
-        1036,
-        (
-            "s_e8_pf",
-            "l_e8_cs_h:pdle",
-            "s_e8_pf:pdle",
-            "l_e8:pdle",
-            "l_e8_pf:pdle",
-            "l_e8_pf:pdle",
-            "s",
-            "l",
-        ),
-    ),
-    "img_1280x720": (
-        4784,
-        1196,
-        (
-            "s_e8_pf",
-            "l_e8_cs:pdle",
-            "s_e8_pf_h:pdle",
-            "l_e8_h:pdle",
-            "m_sk",
-            "m_sk",
-            "s_h:pdle",
-            "l:pdle",
-        ),
-    ),
-    "img_1920x1080": (
-        10764,
-        2691,
-        (
-            "s_e8_pf",
-            "l_e8_cs_h",
-            "m_tma1:pdle",
-            "l_e8_h:pdle",
-            "m_p:pdle",
-            "m_p:pdle",
-            "l_sk",
-            "l_sk",
-        ),
-    ),
-    "doc_1240x1754": (
-        11340,
-        2835,
-        (
-            "s_e8_pf",
-            "l_e8_cs",
-            "m_tma1:pdle",
-            "l_e8:pdle",
-            "m_p:pdle",
-            "m_p:pdle",
-            "l_sk",
-            "l_sk",
-        ),
-    ),
-    "img_2560x1440": (
-        19136,
-        4784,
-        (
-            "s_e8_pf",
-            "l_e8_cs_h",
-            "m_tma1_h:pdle",
-            "l_e8_h:pdle",
-            "l_sk",
-            "l_sk",
-            "l_sk",
-            "l_sk",
-        ),
-    ),
-    "img_3840x2160": (
-        43056,
-        10764,
-        ("s_e8_pf", "l_e8_cs", "m_tma1_h:pdle", "l_e8", "l_sk", "l_sk", "l_sk", "l_h"),
-    ),
-    "img_max_4096sq": (
-        66564,
-        16641,
-        ("s_e8_pf", "l_e8_cs", "m_tma1", "l_e8", "l_sk", "l_sk", "l_h", "l"),
-    ),
-    "batch4_1024x768": (
-        16576,
-        4144,
-        (
-            "s_e8_pf",
-            "l_e8_cs",
-            "m_tma1_h:pdle",
-            "l_e8_h:pdle",
-            "l_sk",
-            "l_sk",
-            "l",
-            "l_h",
-        ),
-    ),
-    "batch8_448": (
-        8192,
-        2048,
-        (
-            "s_e8_pf",
-            "l_e8_cs:pdle",
-            "m_tma1:pdle",
-            "l_e8:pdle",
-            "l_e8_pf:pdle",
-            "l_e8_pf:pdle",
-            "l",
-            "l_sk",
-        ),
-    ),
-    "mixed_1080p_xga_448_336": (
-        16508,
-        4127,
-        (
-            "s_e8_pf",
-            "l_e8_cs",
-            "m_tma1_h:pdle",
-            "l_e8_h:pdle",
-            "l_sk",
-            "l_sk",
-            "l",
-            "l_h",
-        ),
-    ),
-    "video_720p_4f": (
-        19136,
-        1196,
-        (
-            "s_e8_pf",
-            "l_e8_cs_h",
-            "m_tma1_h:pdle",
-            "l_e8_h:pdle",
-            "l_sk",
-            "l_sk",
-            "s_h:pdle",
-            "l:pdle",
-        ),
-    ),
-    "video_1080p_4f": (
-        43056,
-        2691,
-        ("s_e8_pf", "l_e8_cs", "m_tma1_h:pdle", "l_e8", "l_sk", "l_sk", "l_sk", "l_sk"),
-    ),
-    "video_720p_32f": (
-        153088,
-        9568,
-        ("s_e8_pf", "l_e8_cs", "m_tma1", "l_e8", "m_p", "m_p", "l_sk", "l_h"),
-    ),
-    "video_480p_64f": (
-        105984,
-        6624,
-        ("s_e8_pf", "l_e8_cs", "m_tma1", "l_e8", "l_sk", "l_sk", "l", "l"),
-    ),
-    "smoke_2x2": (
-        4,
-        1,
-        (
-            "xs_pf",
-            "xs_cs_pf:pdle",
-            "xs_pf:pdle",
-            "xs:pdle",
-            "xs_k4_pf:pdle",
-            "xs_k4_pf:pdle",
-            "xs",
-            "s",
-        ),
-    ),
-    "smoke_ragged": (
-        264,
-        62,
-        (
-            "xs_pf",
-            "xs_cs_pf:pdle",
-            "xs_pf:pdle",
-            "s:pdle",
-            "xs_pf:pdle",
-            "xs_pf:pdle",
-            "xs",
-            "s",
-        ),
-    ),
-    "smoke_t3": (
-        360,
-        58,
-        (
-            "xs_pf",
-            "xs_cs_pf:pdle",
-            "xs_pf:pdle",
-            "s:pdle",
-            "xs_pf:pdle",
-            "xs_pf:pdle",
-            "xs",
-            "s",
-        ),
-    ),
-}
-# Attention plan of every contract row per arch, copied ONCE from the Cake export protocol at the round-6 head
-# (``attention_layout_for`` on the declared 74 clusters): (kernel key, num_clusters (lever G), full_clusters,
-# kv_split_used, split_units, num_merge_units, num_partial_slots, total_tiles (LPT items), SHA-256[:16] of the
-# int32 unit table, SHA-256[:16] of the int32 merge table).  The mirror must reproduce every field: the tables
-# are the kernel's schedule, the key its binary, the slot counts its workspace.
-CONTRACT_ROW_ATTENTION = {
-    "sm_100a": {
-        "img_224": (
-            "attention:ring3:wide",
-            12,
-            12,
-            0,
-            0,
-            0,
-            0,
-            12,
-            "8dc39d05e6a1b61b",
-            "374708fff7719dd5",
-        ),
-        "img_336": (
-            "attention:ring3:wide",
-            36,
-            36,
-            0,
-            0,
-            0,
-            0,
-            36,
-            "01a4d3047853e88b",
-            "374708fff7719dd5",
-        ),
-        "img_448": (
-            "attention:ring3:wide",
-            48,
-            48,
-            0,
-            0,
-            0,
-            0,
-            48,
-            "d5e1f9cf2ac3be40",
-            "374708fff7719dd5",
-        ),
-        "img_640x480": (
-            "attention:tiles2:wide",
-            48,
-            48,
-            0,
-            0,
-            0,
-            0,
-            48,
-            "69d72df06ddb1032",
-            "374708fff7719dd5",
-        ),
-        "img_800x600": (
-            "attention:ring3",
-            74,
-            74,
-            0,
-            0,
-            0,
-            0,
-            120,
-            "05a2c1b599bd463e",
-            "374708fff7719dd5",
-        ),
-        "img_1024x768": (
-            "attention:ring3",
-            74,
-            74,
-            0,
-            0,
-            0,
-            0,
-            204,
-            "8c428633e996a951",
-            "374708fff7719dd5",
-        ),
-        "img_1280x720": (
-            "attention:ring3:split",
-            74,
-            74,
-            8,
-            6,
-            6,
-            48,
-            270,
-            "f4f6a909615ec614",
-            "8889695a6129acbb",
-        ),
-        "img_1920x1080": (
-            "attention:ring3",
-            74,
-            74,
-            0,
-            0,
-            0,
-            0,
-            516,
-            "d6835ab01d74d3ed",
-            "374708fff7719dd5",
-        ),
-        "doc_1240x1754": (
-            "attention:ring3:split",
-            74,
-            74,
-            3,
-            22,
-            22,
-            66,
-            584,
-            "1f6790075de470dd",
-            "2c21babbdd3df33e",
-        ),
-        "img_2560x1440": (
-            "attention:ring3:split",
-            74,
-            74,
-            6,
-            12,
-            12,
-            72,
-            960,
-            "57a0037136a9ef45",
-            "c356a03d75341001",
-        ),
-        "img_3840x2160": (
-            "attention:ring3",
-            74,
-            74,
-            0,
-            0,
-            0,
-            0,
-            2028,
-            "edfcd398d98ca384",
-            "374708fff7719dd5",
-        ),
-        "img_max_4096sq": (
-            "attention:ring3",
-            74,
-            74,
-            0,
-            0,
-            0,
-            0,
-            3132,
-            "a453e647915b348e",
-            "374708fff7719dd5",
-        ),
-        "batch4_1024x768": (
-            "attention:ring3",
-            74,
-            74,
-            0,
-            0,
-            0,
-            0,
-            816,
-            "0f7e19d7832bee62",
-            "374708fff7719dd5",
-        ),
-        "batch8_448": (
-            "attention:ring3",
-            74,
-            74,
-            0,
-            0,
-            0,
-            0,
-            384,
-            "c9243b00d347dc5f",
-            "374708fff7719dd5",
-        ),
-        "mixed_1080p_xga_448_336": (
-            "attention:ring3",
-            74,
-            74,
-            0,
-            0,
-            0,
-            0,
-            804,
-            "49f7331ec01d6bac",
-            "374708fff7719dd5",
-        ),
-        "video_720p_4f": (
-            "attention:ring3:split",
-            74,
-            74,
-            6,
-            12,
-            12,
-            72,
-            960,
-            "57a0037136a9ef45",
-            "c356a03d75341001",
-        ),
-        "video_1080p_4f": (
-            "attention:ring3",
-            74,
-            74,
-            0,
-            0,
-            0,
-            0,
-            2028,
-            "edfcd398d98ca384",
-            "374708fff7719dd5",
-        ),
-        "video_720p_32f": (
-            "attention:ring3",
-            74,
-            74,
-            0,
-            0,
-            0,
-            0,
-            7200,
-            "fbc24b65c594de8d",
-            "374708fff7719dd5",
-        ),
-        "video_480p_64f": (
-            "attention:ring3",
-            74,
-            74,
-            0,
-            0,
-            0,
-            0,
-            4992,
-            "abf3788f53b38382",
-            "374708fff7719dd5",
-        ),
-        "smoke_2x2": (
-            "attention:ring3:wide",
-            12,
-            12,
-            0,
-            0,
-            0,
-            0,
-            12,
-            "a70bf2297dbae29e",
-            "374708fff7719dd5",
-        ),
-        "smoke_ragged": (
-            "attention:ring3:wide",
-            48,
-            48,
-            0,
-            0,
-            0,
-            0,
-            48,
-            "6f008a8b3862535b",
-            "374708fff7719dd5",
-        ),
-        "smoke_t3": (
-            "attention:ring3:wide",
-            24,
-            24,
-            0,
-            0,
-            0,
-            0,
-            24,
-            "3773d0b422bd84f1",
-            "374708fff7719dd5",
-        ),
-    },
-    "sm_103a": {
-        "img_224": (
-            "attention:tiles1:wide",
-            12,
-            12,
-            0,
-            0,
-            0,
-            0,
-            12,
-            "8dc39d05e6a1b61b",
-            "374708fff7719dd5",
-        ),
-        "img_336": (
-            "attention:ring3:wide",
-            36,
-            36,
-            0,
-            0,
-            0,
-            0,
-            36,
-            "01a4d3047853e88b",
-            "374708fff7719dd5",
-        ),
-        "img_448": (
-            "attention:ring3:wide",
-            48,
-            48,
-            0,
-            0,
-            0,
-            0,
-            48,
-            "d5e1f9cf2ac3be40",
-            "374708fff7719dd5",
-        ),
-        "img_640x480": (
-            "attention:tiles2:wide",
-            48,
-            48,
-            0,
-            0,
-            0,
-            0,
-            48,
-            "69d72df06ddb1032",
-            "374708fff7719dd5",
-        ),
-        "img_800x600": (
-            "attention:tiles2:wide",
-            60,
-            60,
-            0,
-            0,
-            0,
-            0,
-            60,
-            "7020b1e7dd6da2b0",
-            "374708fff7719dd5",
-        ),
-        "img_1024x768": (
-            "attention:ring3",
-            74,
-            74,
-            0,
-            0,
-            0,
-            0,
-            204,
-            "8c428633e996a951",
-            "374708fff7719dd5",
-        ),
-        "img_1280x720": (
-            "attention:ring3:split",
-            74,
-            74,
-            8,
-            6,
-            6,
-            48,
-            270,
-            "f4f6a909615ec614",
-            "8889695a6129acbb",
-        ),
-        "img_1920x1080": (
-            "attention:ring3",
-            74,
-            74,
-            0,
-            0,
-            0,
-            0,
-            516,
-            "d6835ab01d74d3ed",
-            "374708fff7719dd5",
-        ),
-        "doc_1240x1754": (
-            "attention:tiles2",
-            74,
-            74,
-            0,
-            0,
-            0,
-            0,
-            276,
-            "ace7acbbbaf47beb",
-            "374708fff7719dd5",
-        ),
-        "img_2560x1440": (
-            "attention:tiles2:split",
-            74,
-            74,
-            6,
-            12,
-            12,
-            72,
-            516,
-            "f0bb3cf1cb1403ee",
-            "c356a03d75341001",
-        ),
-        "img_3840x2160": (
-            "attention:tiles2",
-            74,
-            74,
-            0,
-            0,
-            0,
-            0,
-            1020,
-            "6be5feeab5bd8689",
-            "374708fff7719dd5",
-        ),
-        "img_max_4096sq": (
-            "attention:tiles2",
-            74,
-            74,
-            0,
-            0,
-            0,
-            0,
-            1572,
-            "655b06763b58c054",
-            "374708fff7719dd5",
-        ),
-        "batch4_1024x768": (
-            "attention:tiles2",
-            74,
-            74,
-            0,
-            0,
-            0,
-            0,
-            432,
-            "af3808b8d8c7b0fc",
-            "374708fff7719dd5",
-        ),
-        "batch8_448": (
-            "attention:tiles2",
-            64,
-            74,
-            0,
-            0,
-            0,
-            0,
-            192,
-            "da0969352c22543a",
-            "374708fff7719dd5",
-        ),
-        "mixed_1080p_xga_448_336": (
-            "attention:tiles2",
-            74,
-            74,
-            0,
-            0,
-            0,
-            0,
-            420,
-            "61089c1bd776c07d",
-            "374708fff7719dd5",
-        ),
-        "video_720p_4f": (
-            "attention:tiles2:split",
-            74,
-            74,
-            6,
-            12,
-            12,
-            72,
-            516,
-            "f0bb3cf1cb1403ee",
-            "c356a03d75341001",
-        ),
-        "video_1080p_4f": (
-            "attention:tiles2",
-            74,
-            74,
-            0,
-            0,
-            0,
-            0,
-            1020,
-            "6be5feeab5bd8689",
-            "374708fff7719dd5",
-        ),
-        "video_720p_32f": (
-            "attention:tiles2",
-            74,
-            74,
-            0,
-            0,
-            0,
-            0,
-            3648,
-            "e933e1bc19fa853d",
-            "374708fff7719dd5",
-        ),
-        "video_480p_64f": (
-            "attention:tiles2",
-            74,
-            74,
-            0,
-            0,
-            0,
-            0,
-            2496,
-            "2428d97f8a8d8d9e",
-            "374708fff7719dd5",
-        ),
-        "smoke_2x2": (
-            "attention:tiles2:wide",
-            12,
-            12,
-            0,
-            0,
-            0,
-            0,
-            12,
-            "a70bf2297dbae29e",
-            "374708fff7719dd5",
-        ),
-        "smoke_ragged": (
-            "attention:tiles1:wide",
-            48,
-            48,
-            0,
-            0,
-            0,
-            0,
-            48,
-            "6f008a8b3862535b",
-            "374708fff7719dd5",
-        ),
-        "smoke_t3": (
-            "attention:tiles1:wide",
-            24,
-            24,
-            0,
-            0,
-            0,
-            0,
-            24,
-            "3773d0b422bd84f1",
-            "374708fff7719dd5",
-        ),
-    },
-}
-
-# Export-only coverage rows of the Cake export (tag ``coverage``; ``cake_backend.COVERAGE_ROW_GRIDS``): the minimal
-# grid_thws set reaching every key the 22 contract rows do not.  Same fields as the contract tables, copied ONCE from
-# the round-6 export protocol at the final head (half-N routing with HALF_MAX_ROUNDS / HALF_ROUTE_EXCLUDE).
-COVERAGE_ROW_GEMM_KEYS = {
-    "cov_batch11_224": (
-        2816,
-        704,
-        (
-            "s_e8_pf",
-            "m_e8_cs_h:pdle",
-            "s_e8_pf_h:pdle",
-            "m_e8:pdle",
-            "l_e8_pf:pdle",
-            "l_e8_pf:pdle",
-            "xs",
-            "s_h",
-        ),
-    ),
-    "cov_img_476x476": (
-        1156,
-        289,
-        (
-            "s_e8_pf",
-            "s_cs_h:pdle",
-            "s_e8_pf:pdle",
-            "s_h:pdle",
-            "s_e8_pf:pdle",
-            "s_e8_pf:pdle",
-            "s:pdle",
-            "s_h:pdle",
-        ),
-    ),
-    "cov_img_2436x392": (
-        4872,
-        1218,
-        (
-            "s_e8_pf",
-            "l_e8_cs:pdle",
-            "s_e8_pf_h:pdle",
-            "l_e8_h:pdle",
-            "l_e8_pf_h:pdle",
-            "l_e8_pf_h:pdle",
-            "s_h",
-            "l",
-        ),
-    ),
-    "cov_img_3948x700": (
-        14100,
-        3525,
-        (
-            "s_e8_pf",
-            "l_e8_cs",
-            "m_tma1_h:pdle",
-            "l_e8_h:pdle",
-            "m_p_h:pdle",
-            "m_p_h:pdle",
-            "l_sk",
-            "l_sk",
-        ),
-    ),
-    "cov_img_2324x140": (
-        1660,
-        415,
-        (
-            "s_e8_pf",
-            "l_e8_cs:pdle",
-            "s_e8_pf:pdle",
-            "m_e8_h:pdle",
-            "s_e8_pf:pdle",
-            "s_e8_pf:pdle",
-            "s:pdle",
-            "s:pdle",
-        ),
-    ),
-    "cov_img_4060x924": (
-        19140,
-        4785,
-        (
-            "s_e8_pf",
-            "l_e8_cs_h",
-            "m_tma1_h:pdle",
-            "l_e8_h",
-            "l_sk",
-            "l_sk",
-            "l_sk",
-            "l_sk",
-        ),
-    ),
-    "cov_img_3108x2716": (
-        43068,
-        10767,
-        ("s_e8_pf", "l_e8_cs", "m_tma1_h", "l_e8", "l_sk", "l_sk", "l_sk", "l_h"),
-    ),
-}
-COVERAGE_ROW_ATTENTION = {
-    "sm_100a": {
-        "cov_batch11_224": (
-            "attention:ring3",
-            74,
-            74,
-            0,
-            0,
-            0,
-            0,
-            132,
-            "3f6de94edb8864a1",
-            "374708fff7719dd5",
-        ),
-        "cov_img_476x476": (
-            "attention:ring3:wide",
-            60,
-            60,
-            0,
-            0,
-            0,
-            0,
-            60,
-            "1fc6f659ea0252a3",
-            "374708fff7719dd5",
-        ),
-        "cov_img_2436x392": (
-            "attention:ring3:split",
-            74,
-            74,
-            4,
-            18,
-            18,
-            72,
-            294,
-            "12d73246532b0940",
-            "f9e1fdf2f536ad8d",
-        ),
-        "cov_img_3948x700": (
-            "attention:ring3:split",
-            74,
-            74,
-            8,
-            6,
-            6,
-            48,
-            714,
-            "108060c6dd410ccb",
-            "8889695a6129acbb",
-        ),
-        "cov_img_2324x140": (
-            "attention:tiles2",
-            48,
-            48,
-            0,
-            0,
-            0,
-            0,
-            48,
-            "c9c3ccc504a09214",
-            "374708fff7719dd5",
-        ),
-        "cov_img_4060x924": (
-            "attention:ring3:split",
-            74,
-            74,
-            6,
-            12,
-            12,
-            72,
-            960,
-            "57a0037136a9ef45",
-            "c356a03d75341001",
-        ),
-        "cov_img_3108x2716": (
-            "attention:ring3",
-            74,
-            74,
-            0,
-            0,
-            0,
-            0,
-            2028,
-            "edfcd398d98ca384",
-            "374708fff7719dd5",
-        ),
-    },
-    "sm_103a": {
-        "cov_batch11_224": (
-            "attention:tiles1",
-            74,
-            74,
-            0,
-            0,
-            0,
-            0,
-            132,
-            "3f6de94edb8864a1",
-            "374708fff7719dd5",
-        ),
-        "cov_img_476x476": (
-            "attention:ring3:wide",
-            60,
-            60,
-            0,
-            0,
-            0,
-            0,
-            60,
-            "1fc6f659ea0252a3",
-            "374708fff7719dd5",
-        ),
-        "cov_img_2436x392": (
-            "attention:ring3:split",
-            74,
-            74,
-            4,
-            18,
-            18,
-            72,
-            294,
-            "12d73246532b0940",
-            "f9e1fdf2f536ad8d",
-        ),
-        "cov_img_3948x700": (
-            "attention:tiles1:split",
-            74,
-            74,
-            8,
-            6,
-            6,
-            48,
-            714,
-            "108060c6dd410ccb",
-            "8889695a6129acbb",
-        ),
-        "cov_img_2324x140": (
-            "attention:tiles2:wide",
-            48,
-            48,
-            0,
-            0,
-            0,
-            0,
-            48,
-            "1ae2f65026fab5b7",
-            "374708fff7719dd5",
-        ),
-        "cov_img_4060x924": (
-            "attention:tiles2:split",
-            74,
-            74,
-            6,
-            12,
-            12,
-            72,
-            516,
-            "f0bb3cf1cb1403ee",
-            "c356a03d75341001",
-        ),
-        "cov_img_3108x2716": (
-            "attention:tiles2",
-            74,
-            74,
-            0,
-            0,
-            0,
-            0,
-            1020,
-            "6be5feeab5bd8689",
-            "374708fff7719dd5",
-        ),
-    },
-}
-
-CONTRACT_ROW_VARIANTS = (
-    "pos_sqxw",
-    "norm_qkv_rope",
-    "residual_wo_sqxw",
-    "norm_gelu",
-    "residual_fc1_sqxw",
-    "residual_fc1",
-    "gelu_erf",
-    "rmsnorm",
-)
-
-
-def test_contract_row_kernel_keys_match_cake_protocol():
-    assert set(CONTRACT_ROW_VARIANTS) == set(cb.PRODUCTION_GEMM_VARIANTS)
-    assert set(COVERAGE_ROW_GEMM_KEYS) == set(cb.COVERAGE_ROW_GRIDS)
-    assert not (set(COVERAGE_ROW_GEMM_KEYS) & set(CONTRACT_ROW_GEMM_KEYS))
-    for label, (total, merged, tiles) in {
-        **CONTRACT_ROW_GEMM_KEYS,
-        **COVERAGE_ROW_GEMM_KEYS,
-    }.items():
-        expected = {
-            variant: f"gemm:{variant}:{tile}"
-            for variant, tile in zip(CONTRACT_ROW_VARIANTS, tiles, strict=True)
-        }
-        assert cb.gemm_kernel_keys_for(total, merged, SM_COUNT) == expected, label
-        # Every key of every row is registered as reachable on both architectures.
-        for arch in SUPPORTED_COMPUTE_CAPABILITIES.values():
-            assert set(expected.values()) <= set(REQUIRED_KERNEL_KEYS[arch]), (
-                label,
-                arch,
+@pytest.mark.parametrize("arch", sorted(SUPPORTED_COMPUTE_CAPABILITIES.values()))
+def test_small_m_twins_route_per_arch(arch):
+    # The pre-wait weight prefetch twins (``*_wpl``: the PDL_EARLY QKV / FC0 / FC1 forms up to TINY_M_LIMIT rows)
+    # and the 64-row A-box twins (``*_ab``: the merger GEMMs up to A_BOX_MAX_M rows, outside the PDL_EARLY window)
+    # replace their base tile only on the arches of their scope; the twin keeps the base TileConfig.
+    wpl, ab = arch in cb.WEIGHT_PF_LEAD_ARCHES, arch in cb.A_BOX_ARCHES
+    for variant, base, twin in (
+        ("norm_qkv_rope", "xs_cs_pf", "xs_cs_pf_wpl"),
+        ("norm_gelu", "xs", "xs_wpl"),
+        ("residual_fc1", "xs_k4_pf", "xs_k4_pf_wpl"),
+        ("residual_fc1_sqxw", "xs_k4_pf", "xs_k4_pf_wpl"),
+    ):
+        for m in (1, 256):
+            assert cb.gemm_stage_key(variant, m, arch=arch) == (
+                f"gemm:{variant}:{twin if wpl else base}:pdle"
             )
-
-    # ... and the census names nothing the rows cannot reach (the exporter refuses both directions).
-    def gemm_keys(tables):
-        return {
-            f"gemm:{variant}:{tile}"
-            for _t, _n, tiles in tables.values()
-            for variant, tile in zip(CONTRACT_ROW_VARIANTS, tiles, strict=True)
-        }
-
-    contract, coverage = (
-        gemm_keys(CONTRACT_ROW_GEMM_KEYS),
-        gemm_keys(COVERAGE_ROW_GEMM_KEYS),
+        assert cb.gemm_stage_key(variant, 1) == f"gemm:{variant}:{base}:pdle"
+    assert cb.gemm_stage_key("norm_qkv_rope", 257, arch=arch) == (
+        "gemm:norm_qkv_rope:xs_cs_pf:pdle"
     )
-    # Round 6: the census reaches half-N twin / displaced-PDL keys at token counts no contract row has; the export's
-    # coverage rows reach exactly those, so the declared gap (``UNCOVERED_KERNEL_KEYS``) is empty and the census
-    # equals the union of both row sets.
-    for arch in SUPPORTED_COMPUTE_CAPABILITIES.values():
-        census = {k for k in REQUIRED_KERNEL_KEYS[arch] if k.startswith("gemm:")}
-        assert contract <= census, arch
-        assert census - contract and census - contract <= coverage, (
-            arch,
-            sorted(census - contract),
-        )
-        assert census == contract | coverage, arch
-        assert cb.UNCOVERED_KERNEL_KEYS[arch] == ()
+    assert cb.gemm_stage_key("residual_wo_sqxw", 256, arch=arch) == (
+        "gemm:residual_wo_sqxw:xs_pf:pdle"
+    )
+    for variant, base, twin in (("gelu_erf", "xs", "xs_ab"), ("rmsnorm", "s", "s_ab")):
+        for m in (1, 64):
+            assert cb.gemm_stage_key(variant, m, arch=arch) == (
+                f"gemm:{variant}:{twin if ab else base}"
+            )
+        assert cb.gemm_stage_key(variant, 65, arch=arch) == f"gemm:{variant}:{base}"
+        assert cb.gemm_stage_key(variant, 64) == f"gemm:{variant}:{base}"
+    for base, twin in (
+        *cb.WEIGHT_PF_LEAD_TWINS.items(),
+        *((name, t) for (_v, name), t in cb.A_BOX_TWINS.items()),
+    ):
+        assert dataclasses.replace(TILE_CONFIGS[twin], name=base) == TILE_CONFIGS[base]
 
 
-def _int32_sha256(values):
-    return hashlib.sha256(struct.pack(f"<{len(values)}i", *values)).hexdigest()
-
-
-@pytest.mark.parametrize("arch", sorted(CONTRACT_ROW_ATTENTION))
-def test_contract_row_attention_match_cake_protocol(arch):
-    labels = set(CONTRACT_ROW_ATTENTION[arch])
-    assert labels == set(cb.CONTRACT_ROW_GRIDS) == set(CONTRACT_ROW_GEMM_KEYS)
-    assert set(COVERAGE_ROW_ATTENTION[arch]) == set(cb.COVERAGE_ROW_GRIDS)
-    assert set(COVERAGE_ROW_ATTENTION[arch]) == set(COVERAGE_ROW_GEMM_KEYS)
-    grids_of = {**cb.CONTRACT_ROW_GRIDS, **cb.COVERAGE_ROW_GRIDS}
-    totals = {**CONTRACT_ROW_GEMM_KEYS, **COVERAGE_ROW_GEMM_KEYS}
-    covered = set()
-    contract_forms = set()
-    rows = {**CONTRACT_ROW_ATTENTION[arch], **COVERAGE_ROW_ATTENTION[arch]}
-    for label, expected in rows.items():
-        grids = grids_of[label]
-        total, _n, _tiles = totals[label]
-        cu = cu_seqlens_of(grids)
-        assert cu[-1] == total, label
-        plan = build_attention_plan(
-            cu, torch.device("cpu"), HEADS, grid_clusters=GRID_CLUSTERS, arch=arch
+@pytest.mark.parametrize("arch", sorted(SUPPORTED_COMPUTE_CAPABILITIES.values()))
+def test_qkv_576_token_twin_routes_per_arch(arch):
+    # The QKV GEMM's same-tile pre-wait weight prefetch twin (``s_cs_h_wpl``) replaces its
+    # PDL_EARLY half-N tile at exactly QKV_T576_M rows, on the arches of QKV_T576_ARCHES only;
+    # every other token count and variant keeps its tile, and the twin keeps the base TileConfig.
+    on = arch in cb.QKV_T576_ARCHES
+    assert sorted(cb.QKV_T576_ARCHES) == ["sm_103a"] and cb.QKV_T576_M == 576
+    assert cb.QKV_T576_TWINS == {("norm_qkv_rope", "s_cs_h"): "s_cs_h_wpl"}
+    m = cb.QKV_T576_M
+    assert cb.gemm_stage_key("norm_qkv_rope", m) == "gemm:norm_qkv_rope:s_cs_h:pdle"
+    assert cb.gemm_stage_key("norm_qkv_rope", m, arch=arch) == (
+        f"gemm:norm_qkv_rope:{'s_cs_h_wpl' if on else 's_cs_h'}:pdle"
+    )
+    for other in (m - 1, m + 1):
+        assert cb.gemm_stage_key("norm_qkv_rope", other, arch=arch) == (
+            cb.gemm_stage_key("norm_qkv_rope", other)
         )
-        got = (
-            plan.kernel_key,
-            plan.num_clusters,
-            plan.full_clusters,
-            plan.kv_split_used,
-            plan.split_units,
-            plan.num_merge_units,
-            plan.num_partial_slots,
-            plan.total_tiles,
-            _int32_sha256(plan.unit_table.tolist())[:16],
-            _int32_sha256(plan.merge_table.tolist())[:16],
-        )
-        assert got == expected, (label, arch, got)
-        assert plan.kernel_key in REQUIRED_KERNEL_KEYS[arch]
-        assert plan.kernel_key not in cb.UNCOVERED_KERNEL_KEYS[arch], (label, arch)
-        assert (plan.num_merge_units > 0) == (":split" in plan.kernel_key)
-        assert (plan.num_merge_units > 0) == (plan.kv_split is not None)
-        assert plan.unit_words == 2 + 2 * (plan.wide or plan.kv_split is not None)
-        assert plan.unit_table.numel() == max(plan.unit_words * plan.total_tiles, 2)
-        assert plan.merge_table.numel() == 4 * max(plan.num_merge_units, 1)
-        # The split rows: every split unit is one merge unit; each part owns one partial slot.
-        assert plan.num_partial_slots == plan.split_units * plan.kv_split_used
-        assert plan.total_tiles == plan.total_units + plan.split_units * (
-            plan.kv_split_used - 1
-        )
-        assert plan.part_rows == 2 * plan.tiles_per_cta * 128
-        assert (
-            plan.num_clusters
-            <= plan.full_clusters
-            == min(GRID_CLUSTERS, plan.total_tiles)
-        )
-        covered.add(plan.kernel_key)
-        if plan.num_merge_units:
-            covered.add(cb.ATTENTION_MERGE_KERNEL_KEY)
-        if label in CONTRACT_ROW_ATTENTION[arch]:
-            contract_forms.add(plan.kernel_key)
-    # The attention forms the rows exercise are exactly the registered ones (= the census with the coverage rows).
-    forms = {k for k in cb.REGISTERED_KERNEL_KEYS[arch] if k.startswith("attention")}
-    assert covered == forms, (arch, covered ^ forms)
-    # ... and the coverage rows exist for the forms the contract rows miss.
-    missing = forms - contract_forms - {cb.ATTENTION_MERGE_KERNEL_KEY}
+    for variant in cb.GEMM_VARIANTS:
+        if variant != "norm_qkv_rope":
+            for c in (m - 1, m, m + 1):
+                assert "s_cs_h_wpl" not in cb.gemm_stage_key(variant, c, arch=arch)
     assert (
-        missing
-        == {
-            "sm_100a": {"attention:tiles2"},
-            "sm_103a": {"attention:tiles1", "attention:tiles1:split"},
-        }[arch]
-    ), (arch, missing)
+        dataclasses.replace(TILE_CONFIGS["s_cs_h_wpl"], name="s_cs_h")
+        == TILE_CONFIGS["s_cs_h"]
+    )
+    assert {m - 1, m, m + 1} <= set(cb.gemm_census_counts("norm_qkv_rope"))
+
+
+@pytest.mark.parametrize("arch", sorted(SUPPORTED_COMPUTE_CAPABILITIES.values()))
+def test_ready_counter_key_contract(arch):
+    """The ready counters gate batch8_448 (8192 tokens) on sm_103a at 148 SMs on all three edges: its plan lists the
+    five twin keys after its GEMM keys, the twins are required and registered there (on no other arch), the counter
+    words are the plan's last zeroed u32 workspace, and every encoder launch takes its twin and wait target; a plan
+    of one layer, another token count or another arch keeps the base launches and allocates no counter words."""
+    on = arch in cb.READY_COUNTER_ARCHES
+    plan = build_kimi_k3_vision_plan(
+        CONTRACT_GRIDS["batch8_448"],
+        "cpu",
+        num_layers=CONTRACT_LAYERS,
+        sm_count=SM_COUNT,
+        arch=arch,
+    )
+    assert plan.total_tokens == 8192
+    assert plan.ready_counters == (("E1", "E2", "E3") if on else ())
+    for edge in cb.READY_COUNTER_EDGES:
+        early = cb.ready_counter_early_clusters(edge, 8192, SM_COUNT, plan.gemm_configs)
+        assert early > 0, edge
+    twins = list(cb.READY_COUNTER_KEYS)
+    gemm = list(dict.fromkeys(plan.gemm_kernel_keys.values()))
+    keys = list(cb.plan_kernel_keys(plan))
+    assert keys[: len(gemm)] == gemm
+    if on:
+        assert keys[len(gemm) : len(gemm) + len(twins)] == twins
+    else:
+        assert not set(twins) & set(keys)
+    assert (set(twins) <= set(cb.REQUIRED_KERNEL_KEYS[arch])) is on
+    assert (set(twins) <= set(cb.REGISTERED_KERNEL_KEYS[arch])) is on
+    if cake_jit.route_available(arch):
+        assert cake_jit.route_available(arch, tuple(twins)) is on
+    for variant, (base, twin) in cb.READY_COUNTER_TILES.items():
+        assert plan.gemm_kernel_keys[variant] == f"gemm:{variant}:{base}:pdle"
+        assert cb.READY_COUNTER_KEYS[list(cb.READY_COUNTER_TILES).index(variant)] == (
+            f"gemm:{variant}:{twin}:pdle"
+        )
+    if on:
+        assert list(plan.workspace)[-1] == "ready_counters"
+        words = plan.workspace["ready_counters"]
+        assert words.shape == (cb.READY_COUNTER_SLOTS * cb.READY_COUNTER_STRIDE,)
+        assert words.dtype == torch.uint32
+        assert int(words.view(torch.int32).count_nonzero()) == 0
+    else:
+        assert "ready_counters" not in plan.workspace
+    for layer in range(CONTRACT_LAYERS - 1):
+        expected = {
+            "norm_qkv_rope": None if layer == 0 else ("l_e8_cs_rcw", 4 * layer),
+            "residual_wo_sqxw": ("l_e8_tma1x_rcp", 0),
+            "norm_gelu": ("l_e8_rcwp", 4 * (layer + 1)),
+            "residual_fc1_sqxw": ("l_e8_pf_rcwp", 16 * (layer + 1)),
+        }
+        for variant, want in expected.items():
+            if want is not None and on:
+                want = (f"gemm:{variant}:{want[0]}:pdle", want[1])
+            else:
+                want = None
+            got = cb.ready_counter_launch(plan, variant, layer)
+            assert got == want, (variant, layer)
+    last = cb.ready_counter_launch(plan, "residual_fc1", CONTRACT_LAYERS - 1)
+    assert last == (("gemm:residual_fc1:l_e8_pf_rcc:pdle", 0) if on else None)
+    if on:
+        with pytest.raises(RuntimeError, match="below the last layer"):
+            cb.ready_counter_launch(plan, "residual_fc1_sqxw", CONTRACT_LAYERS - 1)
+    assert cb.ready_counter_launch(plan, "pos_sqxw", 0) is None
+    for grids, layers in (
+        (CONTRACT_GRIDS["batch8_448"], 1),
+        ([(1, 32, 32)] * 7, CONTRACT_LAYERS),
+        (CONTRACT_GRIDS["img_1920x1080"], CONTRACT_LAYERS),
+    ):
+        other = build_kimi_k3_vision_plan(
+            grids, "cpu", num_layers=layers, sm_count=SM_COUNT, arch=arch
+        )
+        assert other.ready_counters == () and "ready_counters" not in other.workspace
+        assert not set(twins) & set(cb.plan_kernel_keys(other))
+
+
+@pytest.mark.parametrize("arch", sorted(SUPPORTED_COMPUTE_CAPABILITIES.values()))
+def test_export_rows_plan_onto_registered_programs(arch):
+    """Every grid batch of the export's rows (the contract rows and the coverage rows) plans on the
+    CPU, with the census device's SM count, onto kernels this checkout registers for ``arch``, and the
+    attention plan's tables and partial workspace agree with its own geometry."""
+    if not cake_jit.route_available(arch):
+        pytest.skip(f"no generated Kimi-K3 vision tower program registered for {arch}")
+    for label, grids in {**cb.CONTRACT_ROW_GRIDS, **cb.COVERAGE_ROW_GRIDS}.items():
+        plan = build_kimi_k3_vision_plan(
+            grids, "cpu", num_layers=CONTRACT_LAYERS, sm_count=SM_COUNT, arch=arch
+        )
+        keys = cb.plan_kernel_keys(plan)
+        missing = [k for k in keys if not cake_jit.route_available(arch, (k,))]
+        assert not missing, (label, arch, missing)
+        attn = plan.attention
+        assert (attn.num_merge_units > 0) == (":split" in attn.kernel_key)
+        assert (attn.num_merge_units > 0) == (attn.kv_split is not None)
+        assert attn.unit_words == 2 + 2 * (attn.wide or attn.kv_split is not None)
+        assert attn.unit_table.numel() == max(attn.unit_words * attn.total_tiles, 2)
+        assert attn.merge_table.numel() == 4 * max(attn.num_merge_units, 1)
+        assert attn.num_partial_slots == attn.split_units * attn.kv_split_used
+        assert attn.total_tiles == attn.total_units + attn.split_units * (
+            attn.kv_split_used - 1
+        )
+        assert attn.part_rows == 2 * attn.tiles_per_cta * 128
+        assert (
+            attn.num_clusters
+            <= attn.full_clusters
+            == min(GRID_CLUSTERS, attn.total_tiles)
+        )
+        if attn.num_merge_units:
+            assert cb.ATTENTION_MERGE_KERNEL_KEY in keys
+        for stage_key in keys:
+            name = cake_jit.kernel_module_name(arch, stage_key)
+            assert arch in cake_jit.MODULES[name]["arches"], (label, stage_key)
+            assert cake_jit.MODULES[name]["arg_plan"] in cake_jit.ARG_PLANS
+
+
+def test_registry_keys_and_programs_agree():
+    """Every logical kernel key of an architecture names a registered program built for
+    it (and ``kernel_module_name`` returns that program), every registered program is
+    reached by a key on each architecture it is built for, and a key an architecture lacks
+    is rejected the way the host plan expects."""
+    assert tuple(cake_jit.KERNELS) == cake_jit.ARCHES
+    reached = {name: set() for name in cake_jit.MODULES}
+    for arch, table in cake_jit.KERNELS.items():
+        assert list(table) == sorted(table)
+        for key, name in table.items():
+            record = cake_jit.MODULES[name]
+            assert arch in record["arches"], (arch, key, name)
+            assert record["arg_plan"] in cake_jit.ARG_PLANS, (arch, key, name)
+            assert cake_jit.kernel_module_name(arch, key) == name
+            reached[name].add(arch)
+    for name, record in cake_jit.MODULES.items():
+        assert reached[name] == set(record["arches"]), name
+    every_key = {key for table in cake_jit.KERNELS.values() for key in table}
+    for arch, table in cake_jit.KERNELS.items():
+        for key in sorted(every_key - set(table)):
+            assert not cake_jit.route_available(arch, (key,))
+            with pytest.raises(NotImplementedError):
+                cake_jit.kernel_module_name(arch, key)
+    with pytest.raises(NotImplementedError):
+        cake_jit.kernel_module_name("sm_90a", cake_jit.MERGE_KERNEL_KEY)
+
+
+def test_registry_records_reference_the_build_manifest():
+    """Every ``MODULES`` record names one ``build.json`` entry per architecture it is built
+    for (schema ``cake-build/1``): the entry's sources exist under ``csrc/`` with their
+    digests and a closure digest, ``--use_fast_math`` is an entry flag exactly for the GEMM
+    and attention programs and ptxas ``--opt-level=1`` exactly for the attention programs;
+    every entry is referenced (pure text; no module is built)."""
+    manifest = cake_build.manifest()
+    assert manifest["schema"] == "cake-build/1"
+    assert manifest["package"] == cake_jit.__name__.rsplit(".", 1)[0]
+    libraries = cake_build.libraries_by_name()
+    package = Path(cake_build.__file__).resolve().parent
+    referenced = set()
+    for name, record in cake_jit.MODULES.items():
+        assert record["library"] == name and record["kernel"] == f"kernel_{name}"
+        assert record["launch"]["use_pdl"] is True
+        assert record["launch"]["cooperative"] is False
+        for arch in record["arches"]:
+            library = cake_jit.library_name(name, arch)
+            referenced.add(library)
+            entry = libraries[library]
+            assert entry["arch"] == arch and entry["entry"] == "run"
+            assert entry["sources"] and set(entry["sha256"]) == set(entry["sources"])
+            for source in entry["sources"]:
+                assert source.startswith("csrc/") and (package / source).is_file(), (
+                    source
+                )
+            assert re.fullmatch(r"[0-9a-f]{64}", entry["closure_sha256"])
+            flags = entry["nvcc_flags"]
+            fast = record["arg_plan"] in ("gemm", "attention")
+            assert ("--use_fast_math" in flags) is fast, (name, arch)
+            assert ("--ptxas-options=--opt-level=1" in flags) is (
+                record["arg_plan"] == "attention"
+            ), (name, arch)
+    assert referenced == set(libraries)
 
 
 @pytest.mark.parametrize("label,grids", list(CONTRACT_GRIDS.items()))
@@ -2088,6 +1075,42 @@ def test_attention_plan_layout_rule():
         cake_jit.parse_attention_kernel_key("attention:ring3:split:wide")
 
 
+def test_forced_kv_split_never_launches_the_split_build_idle(monkeypatch):
+    """The forced four-way tail split of the 4096 x 4096 image on sm_103a (``FORCED_KV_SPLIT``) cuts 18 tail units
+    on 74 clusters; on a grid whose rounds its 1572 two-tile units fill exactly (12 or 131 clusters) it cuts none,
+    and the plan is the automatic one: whole units, no idle partial-output build."""
+    cu = cu_seqlens_of(CONTRACT_GRIDS["img_max_4096sq"])
+    cpu = torch.device("cpu")
+    forced = build_attention_plan(
+        cu, cpu, HEADS, grid_clusters=GRID_CLUSTERS, arch="sm_103a"
+    )
+    assert (
+        forced.kernel_key,
+        forced.kv_split,
+        forced.split_units,
+        forced.num_merge_units,
+    ) == ("attention:tiles2:split", 4, 18, 18)
+    idle = {
+        clusters: build_attention_plan(
+            cu, cpu, HEADS, grid_clusters=clusters, arch="sm_103a"
+        )
+        for clusters in (12, 131)
+    }
+    monkeypatch.setattr(cb, "FORCED_KV_SPLIT", {})
+    for clusters, plan in idle.items():
+        auto = build_attention_plan(
+            cu, cpu, HEADS, grid_clusters=clusters, arch="sm_103a"
+        )
+        assert plan.total_units % clusters == 0
+        assert (plan.kernel_key, plan.kv_split, plan.num_merge_units) == (
+            "attention:tiles2",
+            None,
+            0,
+        )
+        assert auto.kernel_key == plan.kernel_key and auto.kv_split is None
+        assert torch.equal(auto.unit_table, plan.unit_table)
+
+
 def test_attention_plan_drops_empty_segments():
     plan = build_attention_plan(
         [0, 0, 640, 640, 1200], torch.device("cpu"), HEADS, grid_clusters=5
@@ -2151,7 +1174,7 @@ def test_prepare_weights_no_folding():
     assert not prepared.patch_proj[HIDDEN:, :POS_SHIFT].any()
     lw = weights["layers"][0]
     # The RMSNorm weights stay separate (applied on the activation side by the
-    # residual epilogues); every layer tensor is a contiguous copy of the input.
+    # residual epilogues); every layer tensor is the (contiguous) input tensor itself.
     assert set(prepared.layers[0]) == {"norm0", "wqkv", "wo", "norm1", "fc0", "fc1"}
     for name, tensor in prepared.layers[0].items():
         assert torch.equal(tensor, lw[name]) and tensor.is_contiguous()
@@ -2227,12 +1250,13 @@ def test_plan_on_cpu_device_needs_sm_count():
     assert sk_plan.gemm_kernel_keys["norm_qkv_rope"] == "gemm:norm_qkv_rope:l_e8_cs_h"
     assert (
         sk_plan.gemm_kernel_keys["residual_wo_sqxw"]
-        == "gemm:residual_wo_sqxw:m_tma1:pdle"
+        == "gemm:residual_wo_sqxw:l_e8_tma1x_h:pdle"
     )
     assert sk_plan.gemm_kernel_keys["norm_gelu"] == "gemm:norm_gelu:l_e8_h:pdle"
+    # (the fc1 forms' TMA-epilogue tile at 10764, on both arches)
     assert (
         sk_plan.gemm_kernel_keys["residual_fc1_sqxw"]
-        == "gemm:residual_fc1_sqxw:m_p:pdle"
+        == "gemm:residual_fc1_sqxw:l_e8_tma1x_h:pdle"
     )
     assert plan.gemm_kernel_keys == {
         "pos_sqxw": "gemm:pos_sqxw:xs_pf",
@@ -2647,7 +1671,10 @@ def test_prepared_runner_graph_replay_and_no_allocation():
     runner = prepare_kimi_k3_vision_tower(
         pixels, grids, prepared, out, plan=plan, pos_rows=pos_rows
     )
-    merge = int(plan.attention.num_merge_units > 0)
+    # The merge launch follows a split plan's attention, except where the split builds merge in the kernel.
+    merge = int(
+        plan.attention.num_merge_units > 0 and not cb.in_kernel_merge(plan.arch)
+    )
     assert runner.plan is plan and runner.launch_count == 1 + 2 * (5 + merge) + 4
     expected_stages = set(cb.STAGE_NAMES) - (
         set() if merge else {"layer_attention_merge"}
@@ -2686,6 +1713,222 @@ def test_prepared_runner_graph_replay_and_no_allocation():
     assert metadata["attention_kernel_key"] == plan.attention.kernel_key
     assert metadata["attention_merge"] is bool(merge)
     assert metadata["attention_kernel_key"] in cb.REGISTERED_KERNEL_KEYS[plan.arch]
+
+
+def test_ready_counters_match_the_base_launches():
+    """batch8_448 on a GPU whose plan the ready counters gate (sm_103a): the counter-gated forward equals the plan's
+    base launches bitwise, after a first forward, after five back-to-back forwards without a host synchronization and
+    through CUDA-graph replay (also with new pixel values); the counters are zero again after every forward."""
+    arch = _require_program()
+    grids = CONTRACT_GRIDS["batch8_448"]
+    layers = 3
+    device, weights, pixels, cos, sin, pos_rows, out = _inputs(grids, layers, seed=9)
+    prepared = prepare_kimi_k3_vision_weights(weights)
+    plan = build_kimi_k3_vision_plan(grids, device, num_layers=layers)
+    if not plan.ready_counters:
+        pytest.skip(
+            f"no ready-counter plan for this batch on {arch} ({plan.sm_count} SMs)"
+        )
+    runner = prepare_kimi_k3_vision_tower(
+        pixels, grids, prepared, out, plan=plan, pos_rows=pos_rows
+    )
+    torch.cuda.synchronize()
+    metadata = runner.route_metadata
+    assert metadata["ready_counter_edges"] == ["E1", "E2", "E3"]
+    assert set(metadata["ready_counter_keys"].values()) == set(cb.READY_COUNTER_KEYS)
+    # every layer's out-proj, fc0 and fc1 but the first layer's QKV: 4 per layer, less one
+    assert metadata["ready_counter_launches"] == 4 * layers - 1
+    assert runner.launch_count == len(runner.stage_launches)
+    reference = torch.full_like(out, float("nan"))
+    base = dataclasses.replace(
+        runner,
+        out=reference,
+        launches=cb._launch_sequence(
+            plan, prepared, pixels, pos_rows, reference, ready_counters=False
+        ),
+        stage_launches=(),
+    )
+    words = plan.workspace["ready_counters"]
+
+    def cleared() -> bool:
+        return int(words.view(torch.int32).count_nonzero()) == 0
+
+    base.launch()
+    torch.cuda.synchronize()
+    expected = reference.clone()
+    assert torch.isfinite(expected.float()).all()
+    runner.launch()
+    torch.cuda.synchronize()
+    assert torch.equal(out, expected) and cleared()
+    out.fill_(float("nan"))
+    for _ in range(5):
+        runner.launch()
+    torch.cuda.synchronize()
+    assert torch.equal(out, expected) and cleared()
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.stream(stream), torch.cuda.graph(graph, stream=stream):
+        runner.launch()
+    torch.cuda.current_stream().wait_stream(stream)
+    torch.cuda.synchronize()
+    for _ in range(3):
+        out.fill_(float("nan"))
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(out, expected) and cleared()
+    pixels.mul_(-1.0)
+    base.launch()
+    torch.cuda.synchronize()
+    flipped = reference.clone()
+    assert not torch.equal(flipped, expected)
+    out.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(out, flipped) and cleared()
+
+
+class _Interrupt(BaseException):
+    """A host-side abort between two launches (like KeyboardInterrupt, not an Exception)."""
+
+
+def test_ready_counters_clear_after_an_interrupted_forward():
+    """batch8_448 on a GPU whose plan the ready counters gate (sm_103a): a forward cut short on the host (an entry that
+    raises between two launches: after layer 0's out-proj, after layer 1's FC0, and before the last FC1, which clears
+    the counters) leaves the counters zero once the stream drains, and the next forward with new pixel values equals
+    the plan's base launches bitwise, eager and through CUDA-graph replay after replays of the same graph."""
+    arch = _require_program()
+    grids = CONTRACT_GRIDS["batch8_448"]
+    layers = 3
+    device, weights, pixels, cos, sin, pos_rows, out = _inputs(grids, layers, seed=11)
+    prepared = prepare_kimi_k3_vision_weights(weights)
+    plan = build_kimi_k3_vision_plan(grids, device, num_layers=layers)
+    if not plan.ready_counters:
+        pytest.skip(
+            f"no ready-counter plan for this batch on {arch} ({plan.sm_count} SMs)"
+        )
+    runner = prepare_kimi_k3_vision_tower(
+        pixels, grids, prepared, out, plan=plan, pos_rows=pos_rows
+    )
+    torch.cuda.synchronize()
+    reference = torch.full_like(out, float("nan"))
+    base = dataclasses.replace(
+        runner,
+        out=reference,
+        launches=cb._launch_sequence(
+            plan, prepared, pixels, pos_rows, reference, ready_counters=False
+        ),
+        stage_launches=(),
+    )
+    words = plan.workspace["ready_counters"]
+
+    def cleared() -> bool:
+        return int(words.view(torch.int32).count_nonzero()) == 0
+
+    aborted = pixels.clone()
+    pixels.mul_(-1.0)
+    following = pixels.clone()
+    base.launch()
+    torch.cuda.synchronize()
+    expected = reference.clone()
+    assert torch.isfinite(expected.float()).all()
+
+    def at(stage, layer):
+        return next(
+            index
+            for index, item in enumerate(runner.launches)
+            if item.stage == stage and item.layer == layer
+        )
+
+    cuts = (
+        at("layer_out_proj", 0) + 1,
+        at("layer_norm_fc0_gelu", 1) + 1,
+        at("layer_fc1_last", layers - 1),
+    )
+
+    def stop(*arguments):
+        raise _Interrupt
+
+    def interrupt(cut):
+        launches = list(runner.launches)
+        launches.insert(cut, dataclasses.replace(launches[cut], entry=stop))
+        pixels.copy_(aborted)
+        with pytest.raises(_Interrupt):
+            dataclasses.replace(runner, launches=tuple(launches)).launch()
+        torch.cuda.synchronize()
+        assert cleared()
+        pixels.copy_(following)
+        out.fill_(float("nan"))
+
+    for cut in cuts:
+        interrupt(cut)
+        runner.launch()
+        torch.cuda.synchronize()
+        assert torch.equal(out, expected) and cleared()
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.stream(stream), torch.cuda.graph(graph, stream=stream):
+        runner.launch()
+    torch.cuda.current_stream().wait_stream(stream)
+    torch.cuda.synchronize()
+    for cut in cuts:
+        for _ in range(2):
+            graph.replay()
+        interrupt(cut)
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(out, expected) and cleared()
+
+
+class _ClearFailed(RuntimeError):
+    """The zeroing of the ready counters failing in its turn (e.g. on a broken stream)."""
+
+
+@pytest.mark.parametrize("clear_fails", [False, True])
+def test_an_interrupted_launch_reraises_its_own_exception(monkeypatch, clear_fails):
+    """Host only: launch() of a counter-gated plan cut short between two launches enqueues one zeroing of the counters
+    and re-raises the original exception, also when the zeroing raises in its turn (on Python 3.11+ a note on the
+    original then names that failure); a plan without ready counters leaves its workspace alone."""
+    monkeypatch.setattr(
+        cb, "tvm_ffi", types.SimpleNamespace(use_torch_stream=contextlib.nullcontext)
+    )
+    events = []
+
+    class Words:
+        def zero_(self):
+            events.append("zero")
+            if clear_fails:
+                raise _ClearFailed("the stream is broken")
+
+    def ran(*arguments):
+        events.append("ran")
+
+    def stop(*arguments):
+        raise _Interrupt
+
+    def runner(ready_counters):
+        plan = types.SimpleNamespace(
+            ready_counters=ready_counters, workspace={"ready_counters": Words()}
+        )
+        launches = tuple(
+            cb._Launch("layer_out_proj", 0, "", {}, entry, ())
+            for entry in (ran, stop, ran)
+        )
+        return cb.KimiK3VisionTowerRunner(plan, None, None, None, None, launches)
+
+    with pytest.raises(_Interrupt) as raised:
+        runner(("E1", "E2", "E3")).launch()
+    assert events == ["ran", "zero"]
+    notes = getattr(raised.value, "__notes__", [])
+    if clear_fails and sys.version_info >= (3, 11):
+        assert len(notes) == 1 and "_ClearFailed" in notes[0]
+    else:
+        assert notes == []
+    events.clear()
+    with pytest.raises(_Interrupt):
+        runner(()).launch()
+    assert events == ["ran"]
 
 
 def test_one_shot_api():

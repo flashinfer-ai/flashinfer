@@ -47,11 +47,10 @@ Contract (shared with the SM120 ``"sparse"`` backend for this format):
   (sigmoid gate of the output, logaddexp into LSE).
 * An empty row (no valid slot in either cache) writes zeros and ``-inf`` LSE,
   or ``sink * log2(e) * lse_scale`` when ``attn_sink`` is given.
-* ``compute_precision``: ``"bf16"`` (default; both caches dequantized exactly
-  to BF16 on chip, BF16 x BF16 QK with fp32 accumulation, fp32 softmax, BF16 P,
-  fp32 PV accumulation and split merge, one BF16 output rounding) or
-  ``"fp8"`` (an optional, separately validated route with FP8 QK; only
-  available when the generated family exports it).
+* ``compute_precision``: ``"bf16"`` (the default and only route: both caches
+  dequantized exactly to BF16 on chip, BF16 x BF16 QK with fp32 accumulation,
+  fp32 softmax, BF16 P, fp32 PV accumulation and split merge, one BF16 output
+  rounding).
 * Split-K: ``num_splits`` CTAs per (token, head block) write BF16 / fp32
   partials to caller-owned ``mid_out`` ``[T, H, S, 512]`` / ``mid_lse``
   ``[T, H, S]`` (``S >= num_splits``); a merge launch combines them.
@@ -64,12 +63,11 @@ from __future__ import annotations
 import functools
 from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import Dict, Optional, Sequence, Tuple
+from typing import Dict, Optional, Sequence, Tuple, Union
 
 import torch
 
 from ...jit.cake_sparse_mla_sm120_dsv41_mixed import (
-    cake_sparse_mla_sm120_dsv41_mixed_available,
     cake_sparse_mla_sm120_dsv41_mixed_manifest,
     gen_cake_sparse_mla_sm120_dsv41_mixed_module,
 )
@@ -93,25 +91,17 @@ EXTRA_DATA_BYTES = 256
 EXTRA_SCALE_BYTES = 32
 EXTRA_SCALE_GROUP = 16
 
-# Numerics routes. "default" (the wrapper's construction default) resolves to the BF16 route:
+# Numerics route. "default" (the wrapper's construction default) resolves to the BF16 route:
 # the DeepSeek-V4.1 formats are QAT-trained with the query kept at high precision, and the
 # BF16 route is the one whose quantization points are not lower than FlashInfer's
 # ``compute_precision="bf16"`` baseline. "nvfp4" is never valid for this format.
-COMPUTE_PRECISIONS: Tuple[str, ...] = ("bf16", "fp8")
+COMPUTE_PRECISIONS: Tuple[str, ...] = ("bf16",)
 DEFAULT_COMPUTE_PRECISION = "bf16"
-_PRECISION_CODES: Dict[str, int] = {"bf16": 0, "fp8": 1}
 
 
 @dataclass(frozen=True)
 class CakeDsv41MixedGeometry:
-    """Kernel-family geometry the planners and the scratch layout depend on.
-
-    Read from the generated manifest when the family is present in the tree;
-    ``provisional`` marks the pre-export placeholder (the SM120 DSv4 NVFP4 decode
-    geometry) used so the host side and its CPU tests stay runnable before the
-    kernels land. Nothing is guessed at launch time: loading the kernel module
-    requires the manifest.
-    """
+    """Kernel-family geometry the planners and the scratch layout depend on, read from the generated manifest."""
 
     heads_per_block: int
     candidates_per_chunk: int
@@ -120,33 +110,13 @@ class CakeDsv41MixedGeometry:
     head_counts: Tuple[int, ...]
     two_tile_head_counts: Tuple[int, ...]
     precisions: Tuple[str, ...]
-    provisional: bool
     kernel_commit: Optional[str]
-
-
-# TODO(mixed-cache kernel): provisional until the exporter writes the manifest; mirrors the
-# mixed-cache kernel module's v1 constants (16-head CTA tiles, 64-candidate chunks for both
-# caches, 16-chunk index table, head counts 8 and every multiple of 16 up to 128, BF16 route
-# only, no two-tile instances).
-PROVISIONAL_GEOMETRY = CakeDsv41MixedGeometry(
-    heads_per_block=16,
-    candidates_per_chunk=64,
-    extra_candidates_per_chunk=64,
-    max_chunks_per_block=16,
-    head_counts=(8, 16, 32, 48, 64, 80, 96, 112, 128),
-    two_tile_head_counts=(),
-    precisions=("bf16",),
-    provisional=True,
-    kernel_commit=None,
-)
 
 
 @functools.cache
 def kernel_geometry() -> CakeDsv41MixedGeometry:
-    """Geometry of the exported family, or :data:`PROVISIONAL_GEOMETRY` before the export."""
+    """Geometry of the exported family (``FileNotFoundError`` when the family is absent from this tree)."""
 
-    if not cake_sparse_mla_sm120_dsv41_mixed_available():
-        return PROVISIONAL_GEOMETRY
     manifest = cake_sparse_mla_sm120_dsv41_mixed_manifest()
     if (
         int(manifest["main_bytes_per_token"]) != MAIN_BYTES_PER_TOKEN
@@ -158,27 +128,139 @@ def kernel_geometry() -> CakeDsv41MixedGeometry:
             f"bytes per token; this route serves {MAIN_BYTES_PER_TOKEN} / {EXTRA_BYTES_PER_TOKEN}"
         )
     precisions = tuple(str(p) for p in manifest["precisions"])
-    unknown = sorted(set(precisions) - set(COMPUTE_PRECISIONS))
-    if unknown or DEFAULT_COMPUTE_PRECISION not in precisions:
+    if precisions != COMPUTE_PRECISIONS:
         raise ValueError(
             f"Cake SM120 DSv4.1 mixed-cache manifest exports precisions {precisions}; "
-            f"expected a subset of {COMPUTE_PRECISIONS} containing {DEFAULT_COMPUTE_PRECISION!r}"
+            f"this route serves {COMPUTE_PRECISIONS}"
         )
     return CakeDsv41MixedGeometry(
         heads_per_block=int(manifest["heads_per_block"]),
         candidates_per_chunk=int(manifest["candidates_per_chunk"]),
-        extra_candidates_per_chunk=int(
-            manifest.get("extra_candidates_per_chunk", manifest["candidates_per_chunk"])
-        ),
+        extra_candidates_per_chunk=int(manifest["extra_candidates_per_chunk"]),
         max_chunks_per_block=int(manifest["max_chunks_per_block"]),
         head_counts=tuple(int(h) for h in manifest["head_counts"]),
-        two_tile_head_counts=tuple(
-            int(h) for h in manifest.get("two_tile_head_counts", ())
-        ),
+        two_tile_head_counts=tuple(int(h) for h in manifest["two_tile_head_counts"]),
         precisions=precisions,
-        provisional=False,
-        kernel_commit=str(manifest.get("kernel_commit", "")) or None,
+        kernel_commit=str(manifest["kernel_commit"]),
     )
+
+
+@dataclass(frozen=True)
+class CakeDsv41MixedVariant:
+    """One exact variant of the exported family: ``decode`` / ``merge`` name the bodies it selects."""
+
+    name: str
+    decode: str
+    merge: str
+
+
+@dataclass(frozen=True)
+class CakeDsv41MixedDispatch:
+    """The exported family's exact-variant dispatch (manifest ``dispatch`` / ``variants`` / ``decode_kernels``).
+
+    Every variant is an exact render of the same kernel (bit-identical up to fp32
+    re-association); the choice is a pure performance decision the kernel module
+    fitted per card (SM count: 170 = RTX 5090, 188 = RTX PRO 6000, 48 with unified
+    memory = GB10), cache layout, head count and token bucket, with separate cells
+    for ragged rows (per-token lengths) and a fallback for toolchains without the
+    direct BF16x2 converts (CUDA < 13.2).  ``pow2_page_only_parts`` are the variant
+    parts that resolve pages with a shift and a mask: the host drops them from the
+    dispatched label unless every page size in use is a power of two, and the export
+    carries the stripped body next to every such cell.  ``decode_bodies`` maps
+    ``(heads, dual, decode variant)`` to ``(binding index, tiles per CTA, dynamic SMEM
+    bytes)`` and ``merge_bodies`` maps ``(heads, merge variant)`` to its binding index.
+    """
+
+    token_buckets: Tuple[Tuple[Optional[int], str], ...]
+    unified_memory_sm_count: int
+    rules: Dict[Tuple[int, bool, int, bool], Dict[str, str]]
+    fallback_dual_two_tile_variant: str
+    pow2_page_only_parts: Tuple[str, ...]
+    variants: Dict[str, CakeDsv41MixedVariant]
+    decode_bodies: Dict[Tuple[int, bool, str], Tuple[int, int, int]]
+    merge_bodies: Dict[Tuple[int, str], int]
+
+
+DEFAULT_VARIANT = "default"
+
+
+def dispatch_from_manifest(manifest: dict) -> CakeDsv41MixedDispatch:
+    """Build the dispatch tables from a manifest (pure; the CPU tests feed synthetic manifests)."""
+
+    d = manifest["dispatch"]
+    pow2_parts = tuple(str(p) for p in d["pow2_page_only_parts"])
+    rules: Dict[Tuple[int, bool, int, bool], Dict[str, str]] = {}
+    for rule in d["rules"]:
+        key = (
+            int(rule["sm_count"]),
+            bool(rule["dual"]),
+            int(rule["heads"]),
+            bool(rule["ragged"]),
+        )
+        if key in rules:
+            raise ValueError(f"duplicate dispatch rule {key}")
+        rules[key] = {str(b): str(v) for b, v in rule["buckets"].items()}
+    variants = {
+        str(v["name"]): CakeDsv41MixedVariant(
+            str(v["name"]), str(v["decode"]), str(v["merge"])
+        )
+        for v in manifest["variants"]
+    }
+    if next(iter(variants), None) != DEFAULT_VARIANT:
+        raise ValueError("the variant table must list the plain render first")
+    decode_bodies = {
+        (int(k["heads"]), bool(k["dual"]), str(k["variant"])): (
+            index,
+            int(k["tiles"]),
+            int(k["smem_bytes"]),
+        )
+        for index, k in enumerate(manifest["decode_kernels"])
+    }
+    merge_bodies = {
+        (int(k["heads"]), str(k["variant"])): index
+        for index, k in enumerate(manifest["merge_kernels"])
+    }
+
+    def has_bodies(heads: int, dual: bool, label: str) -> bool:
+        v = variants.get(label)
+        return (
+            v is not None
+            and (heads, dual, v.decode) in decode_bodies
+            and (heads, v.merge) in merge_bodies
+        )
+
+    for key, buckets in rules.items():
+        for bucket, label in buckets.items():
+            if not has_bodies(key[2], key[1], label):
+                raise ValueError(
+                    f"dispatch cell {key}/{bucket} -> {label!r} has no exported body"
+                )
+            fallback = _strip_pow2_only_parts(label, pow2_parts)
+            if fallback != label and not has_bodies(key[2], key[1], fallback):
+                raise ValueError(
+                    f"dispatch cell {key}/{bucket} -> {label!r} has no exported body for its "
+                    f"non-power-of-two page fallback {fallback!r}"
+                )
+    return CakeDsv41MixedDispatch(
+        token_buckets=tuple(
+            (None if hi is None else int(hi), str(name))
+            for hi, name in d["token_buckets"]
+        ),
+        unified_memory_sm_count=int(d["unified_memory_sm_count"]),
+        rules=rules,
+        fallback_dual_two_tile_variant=str(d["fallback_dual_two_tile_variant"]),
+        pow2_page_only_parts=pow2_parts,
+        variants=variants,
+        decode_bodies=decode_bodies,
+        merge_bodies=merge_bodies,
+    )
+
+
+@functools.cache
+def kernel_dispatch() -> CakeDsv41MixedDispatch:
+    """Dispatch tables of the exported family."""
+
+    return dispatch_from_manifest(cake_sparse_mla_sm120_dsv41_mixed_manifest())
 
 
 def cake_sparse_mla_sm120_dsv41_mixed_format_info() -> dict:
@@ -204,9 +286,9 @@ def cake_sparse_mla_sm120_dsv41_mixed_format_info() -> dict:
         "two_tile_heads": geometry.two_tile_head_counts,
         "compute_precisions": geometry.precisions,
         "default_compute_precision": DEFAULT_COMPUTE_PRECISION,
+        "variants": tuple(kernel_dispatch().variants),
         "runtime_page": True,
         "runtime_extra_page": True,
-        "kernels_available": not geometry.provisional,
         "kernel_commit": geometry.kernel_commit,
     }
 
@@ -223,7 +305,7 @@ def normalize_compute_precision(compute_precision: str) -> str:
     if compute_precision not in COMPUTE_PRECISIONS:
         raise ValueError(
             "backend='cake' with kv_cache_format='fp8_dsv41_fp4_ca' supports "
-            f"compute_precision 'default', 'bf16' or 'fp8', got {compute_precision!r}"
+            f"compute_precision 'default' or 'bf16', got {compute_precision!r}"
         )
     return compute_precision
 
@@ -276,6 +358,129 @@ def cake_sparse_mla_sm120_dsv41_mixed_plan_head_tiles(
     return 2 if num_heads in g.two_tile_head_counts else 1
 
 
+def cake_sparse_mla_sm120_dsv41_mixed_token_bucket(
+    num_tokens: int, *, dispatch: Optional[CakeDsv41MixedDispatch] = None
+) -> str:
+    """The token bucket of a decode call (the nearest measured representative row: T = 1 | 8 | 32 | 64 | 128)."""
+
+    d = dispatch or kernel_dispatch()
+    for hi, name in d.token_buckets:
+        if hi is None or int(num_tokens) <= hi:
+            return name
+    raise ValueError("token buckets must end in an open bucket")
+
+
+def _is_pow2(value: int) -> bool:
+    return int(value) > 0 and (int(value) & (int(value) - 1)) == 0
+
+
+def _strip_pow2_only_parts(label: str, parts: Sequence[str]) -> str:
+    """Drop the shift-and-mask page-resolve parts from a variant label (``default`` when nothing is left)."""
+
+    if label == DEFAULT_VARIANT or not parts:
+        return label
+    kept = [p for p in label.split("+") if p not in parts]
+    return "+".join(kept) if kept else DEFAULT_VARIANT
+
+
+def cake_sparse_mla_sm120_dsv41_mixed_plan_variant(
+    *,
+    num_tokens: int,
+    num_heads: int,
+    dual: bool,
+    num_sms: int,
+    unified_memory: bool,
+    ragged: bool,
+    direct_cvt: bool = True,
+    pow2_pages: bool = True,
+    dispatch: Optional[CakeDsv41MixedDispatch] = None,
+    geometry: Optional[CakeDsv41MixedGeometry] = None,
+) -> str:
+    """Return the exact variant the host launches for one decode call (``"default"`` = the plain render).
+
+    Mirrors the kernel module's ``default_variant`` + ``strip_pow2_only_parts``: the
+    dispatch is keyed by the SM count (170 = RTX 5090, 188 = RTX PRO 6000, 48 with
+    unified memory = GB10), the cache layout (``dual`` = main + compressed cache), the
+    head count and the token bucket; ``ragged`` (per-token ``topk_length`` /
+    ``extra_topk_length`` given) consults the ragged cells first; ``direct_cvt`` is
+    the toolchain probe -- without the direct BF16x2 converts (CUDA < 13.2) every
+    measured card (the two SM120 cards and the GB10) runs the manifest's fallback
+    variant on dual two-tile head counts and the plain render elsewhere.  Any other
+    card, or a unified-memory part that is not the GB10, keeps the plain render.
+    ``pow2_pages`` says whether every page size in use (main, and the compressed cache
+    when ``dual``) is a power of two; otherwise the shift-and-mask page-resolve parts
+    (``pw``) are dropped from the label and the same variant's generic-division body runs.
+    """
+
+    d = dispatch or kernel_dispatch()
+    g = geometry or kernel_geometry()
+    label = _table_variant(
+        num_tokens=num_tokens,
+        num_heads=num_heads,
+        dual=dual,
+        num_sms=num_sms,
+        unified_memory=unified_memory,
+        ragged=ragged,
+        direct_cvt=direct_cvt,
+        dispatch=d,
+        geometry=g,
+    )
+    return (
+        label if pow2_pages else _strip_pow2_only_parts(label, d.pow2_page_only_parts)
+    )
+
+
+def _table_variant(
+    *,
+    num_tokens: int,
+    num_heads: int,
+    dual: bool,
+    num_sms: int,
+    unified_memory: bool,
+    ragged: bool,
+    direct_cvt: bool,
+    dispatch: CakeDsv41MixedDispatch,
+    geometry: CakeDsv41MixedGeometry,
+) -> str:
+    """The dispatch tables' label before the page-size rule (``default_variant`` in the kernel module)."""
+
+    d = dispatch
+    g = geometry
+    sms = int(num_sms)
+    if sms < 1:
+        raise ValueError(f"num_sms must be positive, got {num_sms}")
+    if bool(unified_memory) != (sms == d.unified_memory_sm_count):
+        return DEFAULT_VARIANT
+    if not direct_cvt:
+        # SM120 and the GB10 alike (both measured on CUDA 12.9 / 13.0): the two-tile dual
+        # renders take the fallback body, single-cache and one-tile renders the plain one.
+        two_tile = int(num_heads) in g.two_tile_head_counts
+        return (
+            d.fallback_dual_two_tile_variant if (dual and two_tile) else DEFAULT_VARIANT
+        )
+    bucket = cake_sparse_mla_sm120_dsv41_mixed_token_bucket(num_tokens, dispatch=d)
+    key = (sms, bool(dual), int(num_heads))
+    if ragged:
+        cells = d.rules.get(key + (True,))
+        if cells and bucket in cells:
+            return cells[bucket]
+    cells = d.rules.get(key + (False,))
+    if not cells:
+        return DEFAULT_VARIANT
+    return cells.get(bucket, DEFAULT_VARIANT)
+
+
+@functools.cache
+def _direct_cvt_toolchain() -> bool:
+    """True when the nvcc that builds the family accepts PTX ISA 9.2 (CUDA >= 13.2): the direct BF16x2 convert path."""
+
+    from packaging.version import Version
+
+    from ...jit.cpp_ext import get_cuda_version
+
+    return get_cuda_version() >= Version("13.2")
+
+
 def cake_sparse_mla_sm120_dsv41_mixed_plan_splits(
     *,
     num_tokens: int,
@@ -286,6 +491,7 @@ def cake_sparse_mla_sm120_dsv41_mixed_plan_splits(
     max_splits: int = 16,
     head_tiles: int = 1,
     unified_memory: bool = False,
+    ragged: bool = False,
     geometry: Optional[CakeDsv41MixedGeometry] = None,
 ) -> Tuple[int, int]:
     """Return ``(num_splits, chunks_per_block)`` for one decode call.
@@ -297,6 +503,9 @@ def cake_sparse_mla_sm120_dsv41_mixed_plan_splits(
     * one chunk never splits; two chunks split in two only on a discrete-memory
       card whose unsplit grid is below a tenth of the SMs (the halved serial
       chain wins 4-15 % there and loses 8-38 % on larger grids);
+    * ``ragged`` (per-token ``topk_length`` / ``extra_topk_length`` given) is the
+      hint the quarter-to-half-SM 10-chunk grids use to take four splits on the
+      RTX PRO 6000 (the dense rows of the same grid keep three);
     * ``unified_memory`` (GB10, CC 12.1): split in two while the doubled grid
       stays within two thirds of the SMs, keep doubling while the grid stays
       within half the SMs, always with at least two chunks per CTA; a >= 8-chunk
@@ -359,7 +568,8 @@ def cake_sparse_mla_sm120_dsv41_mixed_plan_splits(
             splits = want
         else:
             # Fewest chunks per CTA whose split grid still fits ~1.15 waves (the SM-level
-            # chain is latency-bound: the longest CTAs that keep every SM busy win).
+            # chain is latency-bound: the longest CTAs that keep every SM busy win; a
+            # 1.4-1.5-wave grid loses 8-23 %).
             grid_cap = num_sms * 23 // 20
             chosen = None
             for cpb in range(1, max_cpb + 1):
@@ -372,23 +582,87 @@ def cake_sparse_mla_sm120_dsv41_mixed_plan_splits(
             if chosen is not None:
                 splits = chosen
             elif base_ctas >= num_sms and chunks >= 8:
-                # Full grid: the smallest of 2 / 3 splits whose grid ends in a wave at least half full.
-                for s in (2, 3):
+                # Full grid: the smallest of 1 / 2 / 3 splits whose grid fills its waves to at
+                # least 90 % on average (waves / ceil(waves)); one CTA per SM, so a grid of
+                # 3.01 waves pays for four.
+                for s in (1, 2, 3):
                     if max(splits, s) > max_splits:
                         break
-                    tail = (base_ctas * s) % num_sms
-                    if tail == 0 or tail * 2 >= num_sms:
+                    full_waves = -(-base_ctas * s // num_sms)
+                    if base_ctas * s * 10 >= 9 * num_sms * full_waves:
                         splits = max(splits, s)
                         break
+            # The fewest-cpb-within-1.15-waves choice puts the 64-CTA T = 32 grids of 6 and 18
+            # chunks and the 96-CTA 10-chunk grid onto 192 CTAs (1.02 / 1.13 waves), where they
+            # lose 8-44 % to the neighbouring split count: two splits (128 CTAs) for 6 and >= 16
+            # chunks when the unsplit grid is between a quarter and a half of the SMs; four
+            # splits (3 chunks, ~2 waves) for 10 chunks when it is between a half and two thirds.
+            if (
+                num_sms // 4 <= base_ctas <= num_sms // 2
+                and (chunks == 6 or chunks >= 16)
+                and min_splits <= 2 <= max_splits
+            ):
+                splits = 2
+            elif (
+                num_sms // 2 < base_ctas <= num_sms * 2 // 3
+                and chunks == 10
+                and max_splits >= 4
+            ):
+                splits = 4
+            # Ragged rows (per-token lengths) of the 10-chunk quarter-to-half-SM grid take four
+            # splits where the quadrupled grid stays within 1.4 waves (188 SMs: 256 CTAs = 1.36
+            # waves; 170 SMs: 1.51 waves keeps three): the short, uneven CTAs fill the second wave.
+            if (
+                ragged
+                and chunks == 10
+                and num_sms // 4 <= base_ctas <= num_sms // 2
+                and max_splits >= 4
+                and base_ctas * 4 * 5 <= num_sms * 7
+            ):
+                splits = 4
     cpb = -(-chunks // splits)
     splits = -(-chunks // cpb)
     return splits, cpb
 
 
-def _is_unified_memory_device(device: torch.device) -> bool:
-    """GB10 (CC 12.1) is the only unified-LPDDR5x SM12x part; the planner keys off it."""
+@dataclass(frozen=True)
+class _DeviceFacts:
+    """The device facts the host plans with (queried once per device)."""
 
-    return tuple(torch.cuda.get_device_capability(device)) == (12, 1)
+    num_sms: int
+    unified_memory: bool
+    smem_optin: int
+
+
+@functools.cache
+def _device_facts(device: torch.device) -> _DeviceFacts:
+    """SM count, unified memory (GB10, CC 12.1: the only unified-LPDDR5x SM12x part; the planner and the
+    head-block-major grid order key off it) and the dynamic shared memory a block may opt into."""
+
+    props = torch.cuda.get_device_properties(device)
+    if props.major != 12:
+        raise ValueError(
+            "Cake SM120 DSv4.1 mixed-cache sparse MLA requires compute capability 12.x, got "
+            f"{props.major}.{props.minor}"
+        )
+    return _DeviceFacts(
+        num_sms=int(props.multi_processor_count),
+        unified_memory=(props.major, props.minor) == (12, 1),
+        smem_optin=int(props.shared_memory_per_block_optin),
+    )
+
+
+@dataclass(frozen=True)
+class _Plan:
+    """One decode call's resolved launch: the exact variant, its bodies and the split plan."""
+
+    variant: str
+    head_tiles: int
+    num_splits: int
+    chunks_per_block: int
+    decode_body: int
+    merge_body: int
+    hb_major: bool
 
 
 def _resolve_plan(
@@ -397,57 +671,118 @@ def _resolve_plan(
     num_heads: int,
     topk: int,
     extra_topk: int,
+    dual: bool,
+    ragged: bool,
     device: torch.device,
     num_splits: Optional[int],
     max_splits: int,
-    head_tiles: Optional[int],
-) -> Tuple[int, int, int]:
-    """Resolve ``(head_tiles, num_splits, chunks_per_block)`` like the kernel module's launcher."""
+    variant: Optional[str],
+    page_size: int,
+    extra_page_size: int,
+) -> _Plan:
+    """Resolve the exact variant, its decode / merge bodies and the split plan like the kernel module's launcher.
+
+    The exact variant comes from the dispatch tables (or the caller's ``variant`` pin);
+    the page sizes decide whether the shift-and-mask page-resolve parts may run (a
+    dispatched label drops them, a pinned one is rejected); its decode body fixes the
+    tiles per CTA of the launch (``t1`` bodies use one tile where the plain render uses
+    two); the split planner counts the plain render's grid like the kernel module's
+    launcher.
+    """
 
     g = kernel_geometry()
-    num_sms = _num_sms(device)
-    ht = (
-        int(head_tiles)
-        if head_tiles is not None
-        else cake_sparse_mla_sm120_dsv41_mixed_plan_head_tiles(
+    d = kernel_dispatch()
+    facts = _device_facts(device)
+    pow2_pages = _is_pow2(page_size) and (not dual or _is_pow2(extra_page_size))
+    label = (
+        str(variant)
+        if variant is not None
+        else cake_sparse_mla_sm120_dsv41_mixed_plan_variant(
+            num_tokens=num_tokens,
+            num_heads=num_heads,
+            dual=dual,
+            num_sms=facts.num_sms,
+            unified_memory=facts.unified_memory,
+            ragged=ragged,
+            direct_cvt=_direct_cvt_toolchain(),
+            pow2_pages=pow2_pages,
+            dispatch=d,
+            geometry=g,
+        )
+    )
+    v = d.variants.get(label)
+    if v is None:
+        raise ValueError(
+            f"unknown exact variant {label!r}; this export carries {list(d.variants)}"
+        )
+    if (
+        not pow2_pages
+        and _strip_pow2_only_parts(label, d.pow2_page_only_parts) != label
+    ):
+        pages = f"page_size={page_size}" + (
+            f", extra_page_size={extra_page_size}" if dual else ""
+        )
+        raise ValueError(
+            f"exact variant {label!r} resolves pages with a shift and a mask "
+            f"({' / '.join(p for p in label.split('+') if p in d.pow2_page_only_parts)}) and needs "
+            f"power-of-two page sizes; got {pages}"
+        )
+    decode = d.decode_bodies.get((int(num_heads), bool(dual), v.decode))
+    merge_body = d.merge_bodies.get((int(num_heads), v.merge))
+    if decode is None or merge_body is None:
+        raise ValueError(
+            f"exact variant {label!r} is not exported for {num_heads} heads with "
+            f"{'dual' if dual else 'main-only'} caches"
+        )
+    decode_body, tiles, smem_bytes = decode
+    if smem_bytes > facts.smem_optin:
+        raise ValueError(
+            f"exact variant {label!r} needs {smem_bytes} bytes of dynamic shared memory per block; "
+            f"the device allows {facts.smem_optin}"
+        )
+    chunks = cake_sparse_mla_sm120_dsv41_mixed_num_chunks(topk, extra_topk, geometry=g)
+    if num_splits is None:
+        # The split planner was fitted on the plain render's grid and the kernel module keeps counting that grid
+        # for every variant (a `t1` body launches twice the head blocks of the plan it was measured with).
+        plain_tiles = cake_sparse_mla_sm120_dsv41_mixed_plan_head_tiles(
             num_tokens=num_tokens,
             num_heads=num_heads,
             topk=topk,
             extra_topk=extra_topk,
-            num_sms=num_sms,
+            num_sms=facts.num_sms,
             geometry=g,
         )
-    )
-    fixed_ht = 2 if num_heads in g.two_tile_head_counts else 1
-    if ht != fixed_ht:
-        raise ValueError(
-            f"head_tiles={ht} is not valid for {num_heads} heads: the exported mixed-cache kernels use "
-            f"{fixed_ht} tile(s) per CTA for this head count"
-        )
-    chunks = cake_sparse_mla_sm120_dsv41_mixed_num_chunks(topk, extra_topk, geometry=g)
-    if num_splits is None:
         splits, cpb = cake_sparse_mla_sm120_dsv41_mixed_plan_splits(
             num_tokens=num_tokens,
             num_heads=num_heads,
             topk=topk,
             extra_topk=extra_topk,
-            num_sms=num_sms,
+            num_sms=facts.num_sms,
             max_splits=max_splits,
-            head_tiles=ht,
-            unified_memory=_is_unified_memory_device(device),
+            head_tiles=plain_tiles,
+            unified_memory=facts.unified_memory,
+            ragged=ragged,
             geometry=g,
         )
-        return ht, splits, cpb
-    num_splits = int(num_splits)
-    if num_splits < 1:
-        raise ValueError(f"num_splits must be positive, got {num_splits}")
-    cpb = -(-chunks // num_splits)
-    if cpb > g.max_chunks_per_block:
-        raise ValueError(
-            f"num_splits={num_splits} leaves {cpb} chunks per CTA; the index table holds at most "
-            f"{g.max_chunks_per_block}"
-        )
-    return ht, -(-chunks // cpb), cpb
+    else:
+        if int(num_splits) < 1:
+            raise ValueError(f"num_splits must be positive, got {num_splits}")
+        cpb = -(-chunks // int(num_splits))
+        if cpb > g.max_chunks_per_block:
+            raise ValueError(
+                f"num_splits={num_splits} leaves {cpb} chunks per CTA; the index table holds at most "
+                f"{g.max_chunks_per_block}"
+            )
+        splits = -(-chunks // cpb)
+    return _Plan(
+        variant=label,
+        head_tiles=tiles,
+        num_splits=splits,
+        chunks_per_block=cpb,
+        decode_body=decode_body,
+        merge_body=merge_body,
+        hb_major=facts.unified_memory,
+    )
 
 
 def cake_sparse_mla_sm120_dsv41_mixed_scratch_bytes(
@@ -458,11 +793,6 @@ def cake_sparse_mla_sm120_dsv41_mixed_scratch_bytes(
     chunks = cake_sparse_mla_sm120_dsv41_mixed_num_chunks(topk, extra_topk)
     rows = int(num_tokens) * int(num_heads)
     return rows * chunks * (_D_V * 2 + 4) + rows * 4 + 3 * 16
-
-
-@functools.cache
-def _num_sms(device: torch.device) -> int:
-    return int(torch.cuda.get_device_properties(device).multi_processor_count)
 
 
 # ---------------------------------------------------------------------------
@@ -598,13 +928,10 @@ def _normalize_length(
 # Kernel module.
 # ---------------------------------------------------------------------------
 
-# TODO(mixed-cache kernel / exporter): provisional binding ABI. It mirrors the SM120 DSv4 NVFP4
-# family's generated TVM-FFI entry without its ``head_tiles`` scalar (the mixed-cache kernel has no
-# two-tile instance) and with one extra scalar ``precision`` (0 = bf16 route, 1 = fp8 route) that
-# selects the kernel instance. The exporter fills ``manifest["decode_params"]`` /
-# ``manifest["merge_params"]`` from the rendered kernel signatures and ``manifest["binding_params"]``
-# from its binding template; this list is the host-side expectation and is checked against the
-# manifest when the module loads.
+# Binding ABI of the generated TVM-FFI entry (the manifest's ``binding_params`` must match it; checked when the
+# module loads). ``decode_body`` / ``merge_body`` index the manifest's ``decode_kernels`` / ``merge_kernels``,
+# ``hb_major`` is the grid order (head blocks of a token adjacent on the GB10), and the binding derives the split
+# count from ``chunks_per_block``.
 BINDING_PARAMS: Tuple[str, ...] = (
     "q",
     "kv_cache",
@@ -622,9 +949,10 @@ BINDING_PARAMS: Tuple[str, ...] = (
     "page_stride_bytes",
     "extra_page_size",
     "extra_page_stride_bytes",
-    "num_splits",
     "chunks_per_block",
-    "precision",
+    "decode_body",
+    "merge_body",
+    "hb_major",
     "sm_scale",
     "lse_scale",
     "enable_pdl",
@@ -644,14 +972,13 @@ def _resolve_enable_pdl(enable_pdl: Optional[bool], device: torch.device) -> boo
 
 @functools.cache
 def get_cake_sparse_mla_sm120_dsv41_mixed_module():
-    """Build and load the generated family; raises ``FileNotFoundError`` before the export."""
+    """Build and load the generated family; raises ``FileNotFoundError`` when it is absent from this tree."""
 
     manifest = cake_sparse_mla_sm120_dsv41_mixed_manifest()
-    binding_params = tuple(manifest.get("binding_params", BINDING_PARAMS))
-    if binding_params != BINDING_PARAMS:
+    if tuple(manifest["binding_params"]) != BINDING_PARAMS:
         raise ValueError(
             "Cake SM120 DSv4.1 mixed-cache binding parameter list changed: manifest "
-            f"{list(binding_params)} vs host {list(BINDING_PARAMS)}; update BINDING_PARAMS and "
+            f"{manifest['binding_params']} vs host {list(BINDING_PARAMS)}; update BINDING_PARAMS and "
             "the launch below together"
         )
     module = gen_cake_sparse_mla_sm120_dsv41_mixed_module().build_and_load()
@@ -678,9 +1005,10 @@ def get_cake_sparse_mla_sm120_dsv41_mixed_module():
         page_stride_bytes: int,
         extra_page_size: int,
         extra_page_stride_bytes: int,
-        num_splits: int,
         chunks_per_block: int,
-        precision: int,
+        decode_body: int,
+        merge_body: int,
+        hb_major: bool,
         sm_scale: float,
         lse_scale: float,
         enable_pdl: bool,
@@ -702,9 +1030,10 @@ def get_cake_sparse_mla_sm120_dsv41_mixed_module():
             page_stride_bytes,
             extra_page_size,
             extra_page_stride_bytes,
-            num_splits,
             chunks_per_block,
-            precision,
+            decode_body,
+            merge_body,
+            hb_major,
             sm_scale,
             lse_scale,
             enable_pdl,
@@ -717,48 +1046,43 @@ def get_cake_sparse_mla_sm120_dsv41_mixed_module():
     return SimpleNamespace(decode=_decode, raw_decode=entry)
 
 
-@supported_compute_capability([120, 121])
-def cake_sparse_mla_sm120_dsv41_mixed_decode(
+@dataclass(frozen=True)
+class _DecodeCall:
+    """One validated decode call: the normalized operands and the resolved plan."""
+
+    q: torch.Tensor
+    kv_flat: torch.Tensor
+    page_size: int
+    page_stride: int
+    indices: torch.Tensor
+    extra_flat: Optional[torch.Tensor]
+    extra_page_size: int
+    extra_page_stride: int
+    extra_indices: Optional[torch.Tensor]
+    topk_length: Optional[torch.Tensor]
+    extra_topk_length: Optional[torch.Tensor]
+    attn_sink: Optional[torch.Tensor]
+    plan: _Plan
+
+
+def _prepare_decode(
     q: torch.Tensor,
     kv_cache: torch.Tensor,
     indices: torch.Tensor,
-    output: torch.Tensor,
-    out_lse: torch.Tensor,
-    sm_scale: float,
     *,
-    topk_length: Optional[torch.Tensor] = None,
-    attn_sink: Optional[torch.Tensor] = None,
-    extra_kv_cache: Optional[torch.Tensor] = None,
-    extra_indices: Optional[torch.Tensor] = None,
-    extra_topk_length: Optional[torch.Tensor] = None,
-    mid_out: Optional[torch.Tensor] = None,
-    mid_lse: Optional[torch.Tensor] = None,
-    lse_scale: float = 1.0,
-    num_splits: Optional[int] = None,
-    max_splits: int = 16,
-    head_tiles: Optional[int] = None,
-    compute_precision: str = DEFAULT_COMPUTE_PRECISION,
-    enable_pdl: Optional[bool] = None,
-) -> Dict[str, int]:
-    """Run the allocation-free Cake SM120 DSv4.1 mixed-cache sparse-MLA decode.
+    topk_length: Optional[torch.Tensor],
+    attn_sink: Optional[torch.Tensor],
+    extra_kv_cache: Optional[torch.Tensor],
+    extra_indices: Optional[torch.Tensor],
+    extra_topk_length: Optional[torch.Tensor],
+    num_splits: Optional[int],
+    max_splits: int,
+    variant: Optional[str],
+    compute_precision: str,
+) -> _DecodeCall:
+    """Validate and normalize one decode call's inputs and resolve its plan (once per call)."""
 
-    ``kv_cache`` is the 528-byte FP8 main (SWA) pool and ``extra_kv_cache`` the
-    optional 288-byte V41_FP4 compressed pool, each with its own positive
-    runtime page size and 16-byte-multiple page stride. Writes ``output`` and
-    ``out_lse`` in place and returns the resolved plan ``{"head_tiles",
-    "num_splits", "chunks_per_block", "precision"}``. ``mid_out`` / ``mid_lse``
-    are required when the plan splits (``num_splits > 1``); size them with
-    :func:`cake_sparse_mla_sm120_dsv41_mixed_num_chunks` splits to cover every
-    plan. ``head_tiles`` and ``num_splits`` override the planners.
-    """
-
-    precision = normalize_compute_precision(compute_precision)
-    geometry = kernel_geometry()
-    if precision not in geometry.precisions:
-        raise ValueError(
-            f"compute_precision={precision!r} is not exported by the Cake SM120 DSv4.1 "
-            f"mixed-cache family (available: {geometry.precisions})"
-        )
+    normalize_compute_precision(compute_precision)
     if q.ndim != 3 or q.shape[-1] != _D_QK:
         raise ValueError(f"q must be [T, H, {_D_QK}], got {tuple(q.shape)}")
     if q.dtype != torch.bfloat16 or not q.is_cuda or not q.is_contiguous():
@@ -769,28 +1093,11 @@ def cake_sparse_mla_sm120_dsv41_mixed_decode(
         raise ValueError(
             f"Cake SM120 DSv4.1 mixed-cache sparse MLA supports {heads} query heads, got {num_heads}"
         )
-    if (
-        output.shape != q.shape
-        or output.dtype != torch.bfloat16
-        or not output.is_contiguous()
-    ):
-        raise ValueError(
-            f"output must be a contiguous bfloat16 tensor of shape {tuple(q.shape)}"
-        )
-    if (
-        out_lse.shape != (num_tokens, num_heads)
-        or out_lse.dtype != torch.float32
-        or not out_lse.is_contiguous()
-    ):
-        raise ValueError(
-            f"out_lse must be a contiguous float32 tensor of shape {(num_tokens, num_heads)}"
-        )
     if (extra_kv_cache is None) != (extra_indices is None):
         raise ValueError("extra_kv_cache and extra_indices must be provided together")
     if extra_topk_length is not None and extra_indices is None:
         raise ValueError("extra_topk_length requires extra_indices")
     indices = _normalize_indices(indices, "indices", num_tokens)
-    topk = int(indices.shape[1])
     kv_flat, page_size, page_stride = _cache_geometry(
         kv_cache, "kv_cache", bytes_per_token=MAIN_BYTES_PER_TOKEN
     )
@@ -818,16 +1125,68 @@ def cake_sparse_mla_sm120_dsv41_mixed_decode(
                 f"attn_sink must be a 1-D float32 tensor with at least {num_heads} entries"
             )
         attn_sink = attn_sink.contiguous()
-    ht, splits, cpb = _resolve_plan(
+    plan = _resolve_plan(
         num_tokens=num_tokens,
         num_heads=num_heads,
-        topk=topk,
+        topk=int(indices.shape[1]),
         extra_topk=extra_topk,
+        dual=extra_flat is not None,
+        ragged=topk_length is not None or extra_topk_length is not None,
         device=q.device,
         num_splits=num_splits,
         max_splits=max_splits,
-        head_tiles=head_tiles,
+        variant=variant,
+        page_size=page_size,
+        extra_page_size=extra_page_size,
     )
+    return _DecodeCall(
+        q=q,
+        kv_flat=kv_flat,
+        page_size=page_size,
+        page_stride=page_stride,
+        indices=indices,
+        extra_flat=extra_flat,
+        extra_page_size=extra_page_size,
+        extra_page_stride=extra_page_stride,
+        extra_indices=extra_indices if extra_flat is not None else None,
+        topk_length=topk_length,
+        extra_topk_length=extra_topk_length,
+        attn_sink=attn_sink,
+        plan=plan,
+    )
+
+
+def _launch_decode(
+    call: _DecodeCall,
+    output: torch.Tensor,
+    out_lse: torch.Tensor,
+    mid_out: Optional[torch.Tensor],
+    mid_lse: Optional[torch.Tensor],
+    sm_scale: float,
+    lse_scale: float,
+    enable_pdl: Optional[bool],
+) -> None:
+    """Check the outputs and the split scratch against the plan, then launch."""
+
+    q, plan = call.q, call.plan
+    num_tokens, num_heads = int(q.shape[0]), int(q.shape[1])
+    if (
+        output.shape != q.shape
+        or output.dtype != torch.bfloat16
+        or not output.is_contiguous()
+    ):
+        raise ValueError(
+            f"output must be a contiguous bfloat16 tensor of shape {tuple(q.shape)}"
+        )
+    if (
+        out_lse.shape != (num_tokens, num_heads)
+        or out_lse.dtype != torch.float32
+        or not out_lse.is_contiguous()
+    ):
+        raise ValueError(
+            f"out_lse must be a contiguous float32 tensor of shape {(num_tokens, num_heads)}"
+        )
+    splits = plan.num_splits
     if splits > 1:
         if mid_out is None or mid_lse is None:
             raise ValueError(
@@ -860,33 +1219,91 @@ def cake_sparse_mla_sm120_dsv41_mixed_decode(
         mid_lse = None
     get_cake_sparse_mla_sm120_dsv41_mixed_module().decode(
         q,
-        kv_flat,
-        indices,
-        extra_flat,
-        extra_indices if extra_flat is not None else None,
-        topk_length,
-        extra_topk_length,
-        attn_sink,
+        call.kv_flat,
+        call.indices,
+        call.extra_flat,
+        call.extra_indices,
+        call.topk_length,
+        call.extra_topk_length,
+        call.attn_sink,
         output,
         out_lse,
         mid_out,
         mid_lse,
-        page_size,
-        page_stride,
-        extra_page_size,
-        extra_page_stride,
-        splits,
-        cpb,
-        _PRECISION_CODES[precision],
+        call.page_size,
+        call.page_stride,
+        call.extra_page_size,
+        call.extra_page_stride,
+        plan.chunks_per_block,
+        plan.decode_body,
+        plan.merge_body,
+        plan.hb_major,
         float(sm_scale),
         float(lse_scale),
         _resolve_enable_pdl(enable_pdl, q.device),
     )
+
+
+@supported_compute_capability([120, 121])
+def cake_sparse_mla_sm120_dsv41_mixed_decode(
+    q: torch.Tensor,
+    kv_cache: torch.Tensor,
+    indices: torch.Tensor,
+    output: torch.Tensor,
+    out_lse: torch.Tensor,
+    sm_scale: float,
+    *,
+    topk_length: Optional[torch.Tensor] = None,
+    attn_sink: Optional[torch.Tensor] = None,
+    extra_kv_cache: Optional[torch.Tensor] = None,
+    extra_indices: Optional[torch.Tensor] = None,
+    extra_topk_length: Optional[torch.Tensor] = None,
+    mid_out: Optional[torch.Tensor] = None,
+    mid_lse: Optional[torch.Tensor] = None,
+    lse_scale: float = 1.0,
+    num_splits: Optional[int] = None,
+    max_splits: int = 16,
+    variant: Optional[str] = None,
+    compute_precision: str = DEFAULT_COMPUTE_PRECISION,
+    enable_pdl: Optional[bool] = None,
+) -> Dict[str, Union[int, str]]:
+    """Run the allocation-free Cake SM120 DSv4.1 mixed-cache sparse-MLA decode.
+
+    ``kv_cache`` is the 528-byte FP8 main (SWA) pool and ``extra_kv_cache`` the
+    optional 288-byte V41_FP4 compressed pool, each with its own positive
+    runtime page size and 16-byte-multiple page stride. Writes ``output`` and
+    ``out_lse`` in place and returns the resolved plan ``{"variant", "head_tiles",
+    "num_splits", "chunks_per_block"}``. ``mid_out`` / ``mid_lse`` are required
+    when the plan splits (``num_splits > 1``); size them with
+    :func:`cake_sparse_mla_sm120_dsv41_mixed_num_chunks` splits to cover every
+    plan. ``variant`` pins an exact variant of the export (every variant computes
+    the same result; see :func:`cake_sparse_mla_sm120_dsv41_mixed_plan_variant`)
+    and ``num_splits`` overrides the split planner.
+    """
+
+    call = _prepare_decode(
+        q,
+        kv_cache,
+        indices,
+        topk_length=topk_length,
+        attn_sink=attn_sink,
+        extra_kv_cache=extra_kv_cache,
+        extra_indices=extra_indices,
+        extra_topk_length=extra_topk_length,
+        num_splits=num_splits,
+        max_splits=max_splits,
+        variant=variant,
+        compute_precision=compute_precision,
+    )
+    _launch_decode(
+        call, output, out_lse, mid_out, mid_lse, sm_scale, lse_scale, enable_pdl
+    )
+    plan = call.plan
     return {
-        "head_tiles": ht,
-        "num_splits": splits,
-        "chunks_per_block": cpb,
-        "precision": _PRECISION_CODES[precision],
+        "variant": plan.variant,
+        "head_tiles": plan.head_tiles,
+        "num_splits": plan.num_splits,
+        "chunks_per_block": plan.chunks_per_block,
     }
 
 
@@ -904,45 +1321,38 @@ def _cake_dsv41_mixed_sparse_mla_decode(
     extra_topk_length: Optional[torch.Tensor] = None,
     lse_scale: float = 1.0,
     num_splits: Optional[int] = None,
-    head_tiles: Optional[int] = None,
+    variant: Optional[str] = None,
     compute_precision: str = DEFAULT_COMPUTE_PRECISION,
     enable_pdl: Optional[bool] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Allocating convenience entry (tests / benchmarks): returns ``(output, out_lse)``."""
 
-    if q.ndim != 3:
-        raise ValueError(f"q must be [T, H, {_D_QK}], got {tuple(q.shape)}")
-    num_tokens, num_heads = int(q.shape[0]), int(q.shape[1])
-    topk = int(indices.shape[-1])
-    extra_topk = int(extra_indices.shape[-1]) if extra_indices is not None else 0
-    chunks = cake_sparse_mla_sm120_dsv41_mixed_num_chunks(topk, extra_topk)
-    mid_out = torch.empty(
-        (num_tokens, num_heads, chunks, _D_V), dtype=torch.bfloat16, device=q.device
-    )
-    mid_lse = torch.empty(
-        (num_tokens, num_heads, chunks), dtype=torch.float32, device=q.device
-    )
-    output = torch.empty_like(q)
-    out_lse = torch.empty((num_tokens, num_heads), dtype=torch.float32, device=q.device)
-    cake_sparse_mla_sm120_dsv41_mixed_decode(
+    call = _prepare_decode(
         q,
         kv_cache,
         indices,
-        output,
-        out_lse,
-        sm_scale,
         topk_length=topk_length,
         attn_sink=attn_sink,
         extra_kv_cache=extra_kv_cache,
         extra_indices=extra_indices,
         extra_topk_length=extra_topk_length,
-        mid_out=mid_out,
-        mid_lse=mid_lse,
-        lse_scale=lse_scale,
         num_splits=num_splits,
-        head_tiles=head_tiles,
+        max_splits=16,
+        variant=variant,
         compute_precision=compute_precision,
-        enable_pdl=enable_pdl,
+    )
+    num_tokens, num_heads = int(q.shape[0]), int(q.shape[1])
+    splits = call.plan.num_splits
+    mid_out = torch.empty(
+        (num_tokens, num_heads, splits, _D_V), dtype=torch.bfloat16, device=q.device
+    )
+    mid_lse = torch.empty(
+        (num_tokens, num_heads, splits), dtype=torch.float32, device=q.device
+    )
+    output = torch.empty_like(q)
+    out_lse = torch.empty((num_tokens, num_heads), dtype=torch.float32, device=q.device)
+    _launch_decode(
+        call, output, out_lse, mid_out, mid_lse, sm_scale, lse_scale, enable_pdl
     )
     return output, out_lse
 
@@ -969,22 +1379,22 @@ def functional_run(
 
     from ._prepared import _workspace_tensor_view
 
-    num_tokens, num_heads = int(q.shape[0]), int(q.shape[1])
-    indices = _normalize_indices(indices, "indices", num_tokens)
-    if extra_indices is not None:
-        extra_indices = _normalize_indices(extra_indices, "extra_indices", num_tokens)
-    topk = int(indices.shape[1])
-    extra_topk = int(extra_indices.shape[1]) if extra_indices is not None else 0
-    ht, splits, _ = _resolve_plan(
-        num_tokens=num_tokens,
-        num_heads=num_heads,
-        topk=topk,
-        extra_topk=extra_topk,
-        device=q.device,
+    call = _prepare_decode(
+        q,
+        cache,
+        indices,
+        topk_length=lengths,
+        attn_sink=sink,
+        extra_kv_cache=extra,
+        extra_indices=extra_indices,
+        extra_topk_length=extra_lengths,
         num_splits=None,
         max_splits=16,
-        head_tiles=None,
+        variant=None,
+        compute_precision=compute_precision,
     )
+    num_tokens, num_heads = int(q.shape[0]), int(q.shape[1])
+    splits = call.plan.num_splits
     requirements: list[tuple[tuple[int, ...], torch.dtype]] = []
     if splits > 1:
         requirements.append(((num_tokens, num_heads, splits, _D_V), torch.bfloat16))
@@ -998,6 +1408,12 @@ def functional_run(
             workspace, byte_offset=offset, shape=shape, dtype=dtype, alignment=16
         )
         if view is None:
+            topk = int(call.indices.shape[1])
+            extra_topk = (
+                int(call.extra_indices.shape[1])
+                if call.extra_indices is not None
+                else 0
+            )
             raise ValueError(
                 "attention workspace insufficient for the resolved Cake plan: need at least "
                 f"{cake_sparse_mla_sm120_dsv41_mixed_scratch_bytes(num_tokens, num_heads, topk, extra_topk)} "
@@ -1008,26 +1424,7 @@ def functional_run(
     mid_out = views[0] if splits > 1 else None
     mid_lse = views[1] if splits > 1 else None
     result = lse if lse is not None else views[-1]
-    cake_sparse_mla_sm120_dsv41_mixed_decode(
-        q,
-        cache,
-        indices,
-        output,
-        result,
-        scale,
-        topk_length=lengths,
-        attn_sink=sink,
-        extra_kv_cache=extra,
-        extra_indices=extra_indices,
-        extra_topk_length=extra_lengths,
-        mid_out=mid_out,
-        mid_lse=mid_lse,
-        lse_scale=lse_scale,
-        num_splits=splits,
-        head_tiles=ht,
-        compute_precision=compute_precision,
-        enable_pdl=enable_pdl,
-    )
+    _launch_decode(call, output, result, mid_out, mid_lse, scale, lse_scale, enable_pdl)
     return result
 
 
@@ -1087,22 +1484,21 @@ def wrapper_run(
         raise ValueError(
             "backend='cake' on the DSv4.1 mixed cache is a decode-only route; prefill_impl must be None or 'auto'"
         )
-    precision = normalize_compute_precision(compute_precision)
-    indices = _normalize_indices(indices, "indices", num_tokens)
-    if extra_indices is not None:
-        extra_indices = _normalize_indices(extra_indices, "extra_indices", num_tokens)
-    topk = int(indices.shape[1])
-    extra_topk = int(extra_indices.shape[1]) if extra_indices is not None else 0
-    ht, splits, _ = _resolve_plan(
-        num_tokens=num_tokens,
-        num_heads=num_heads,
-        topk=topk,
-        extra_topk=extra_topk,
-        device=q.device,
+    call = _prepare_decode(
+        q,
+        kv_cache,
+        indices,
+        topk_length=topk_length,
+        attn_sink=attn_sink,
+        extra_kv_cache=extra_kv_cache,
+        extra_indices=extra_indices,
+        extra_topk_length=extra_topk_length,
         num_splits=None,
         max_splits=16,
-        head_tiles=None,
+        variant=None,
+        compute_precision=compute_precision,
     )
+    splits = call.plan.num_splits
     if (mid_out is None) != (mid_lse is None):
         raise ValueError("mid_out and mid_lse must be provided together")
     if splits > 1 and mid_out is None:
@@ -1123,43 +1519,27 @@ def wrapper_run(
             raise ValueError(
                 "out_lse must be a contiguous [num_tokens, num_heads] float32 buffer"
             )
-    cake_sparse_mla_sm120_dsv41_mixed_decode(
-        q,
-        kv_cache,
-        indices,
-        output,
-        lse,
-        sm_scale,
-        topk_length=topk_length,
-        attn_sink=attn_sink,
-        extra_kv_cache=extra_kv_cache,
-        extra_indices=extra_indices,
-        extra_topk_length=extra_topk_length,
-        mid_out=mid_out,
-        mid_lse=mid_lse,
-        lse_scale=lse_scale,
-        num_splits=splits,
-        head_tiles=ht,
-        compute_precision=precision,
-        enable_pdl=enable_pdl,
-    )
+    _launch_decode(call, output, lse, mid_out, mid_lse, sm_scale, lse_scale, enable_pdl)
     return lse if return_lse else None
 
 
 __all__ = [
     "BINDING_PARAMS",
     "COMPUTE_PRECISIONS",
+    "CakeDsv41MixedDispatch",
     "CakeDsv41MixedGeometry",
+    "CakeDsv41MixedVariant",
     "DEFAULT_COMPUTE_PRECISION",
+    "DEFAULT_VARIANT",
     "EXTRA_BYTES_PER_TOKEN",
     "MAIN_BYTES_PER_TOKEN",
-    "PROVISIONAL_GEOMETRY",
     "cache_page_geometry",
     "cake_sparse_mla_sm120_dsv41_mixed_decode",
     "cake_sparse_mla_sm120_dsv41_mixed_format_info",
     "cake_sparse_mla_sm120_dsv41_mixed_num_chunks",
     "cake_sparse_mla_sm120_dsv41_mixed_plan_head_tiles",
     "cake_sparse_mla_sm120_dsv41_mixed_plan_splits",
+    "cake_sparse_mla_sm120_dsv41_mixed_plan_variant",
     "cake_sparse_mla_sm120_dsv41_mixed_scratch_bytes",
     "cake_sparse_mla_sm120_dsv41_mixed_supported_heads",
     "get_cake_sparse_mla_sm120_dsv41_mixed_module",

@@ -32,9 +32,40 @@ def gen_mla_module() -> JitSpec:
     )
 
 
+def gen_mla_swa_sm90_module() -> JitSpec:
+    """BF16 Page64 DOTS-style sliding-window MLA, six frozen SM90 tactics."""
+    return gen_jit_spec(
+        "mla_swa_sm90",
+        [jit_env.FLASHINFER_CSRC_DIR / "mla_swa_sm90.cu"],
+        extra_cuda_cflags=current_compilation_context.get_nvcc_flags_list(
+            supported_major_versions=[9]
+        )
+        + ["-O3", "--use_fast_math", "--expt-relaxed-constexpr"],
+    )
+
+
 def gen_sparse_mla_nvfp4_sm120_module() -> JitSpec:
     """Compatibility alias: the NVFP4 route lives in the unified SM120 module."""
     return gen_sparse_mla_sm120_module()
+
+
+def gen_sparse_mla_dsv4_nvfp4_cache_ops_module() -> JitSpec:
+    """DSv4 NVFP4 cache pack / append kernels only.
+
+    The quantizer (E2M1 codes via ``cvt.rn.satfinite.e2m1x2``, E4M3 group scales, bit-exact
+    BF16 RoPE copy) is architecture-generic for compute capability 10.0 and above, so one
+    module serves SM100 / SM103 (``backend="cake"``) and SM120 / SM121 (``backend="sparse"``).
+    Unlike :func:`gen_sparse_mla_sm120_module` it does not pull in the SM120 attention
+    kernels, which do not build for ``sm_100a`` / ``sm_103a``.
+    """
+    nvcc_flags = current_compilation_context.get_nvcc_flags_list(
+        supported_major_versions=[10, 12]
+    )
+    return gen_jit_spec(
+        "sparse_mla_dsv4_nvfp4_cache_ops",
+        [jit_env.FLASHINFER_CSRC_DIR / "sparse_mla_sm120/dsv4_nvfp4_cache_ops.cu"],
+        extra_cuda_cflags=nvcc_flags,
+    )
 
 
 def gen_sparse_mla_nvfp4_sm120_tile_module() -> JitSpec:
