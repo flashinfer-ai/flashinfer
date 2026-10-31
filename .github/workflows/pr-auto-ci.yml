@@ -1,0 +1,565 @@
+# Auto-trigger CI for approved PRs when an authorized org member has
+# specified a test scope via `@flashinfer-bot run <paths>`.
+#
+# When a PR receives an approval (or a new commit is pushed to an
+# already-approved PR), this workflow checks the comment history for a
+# previous `@flashinfer-bot run <paths>` command from an authorized user.
+# If one is found, it applies the run-ci label to start CI — the same
+# mechanism used by @flashinfer-bot run.
+#
+# The PR author does NOT need to be an org member — any community PR
+# that has been approved and has a scoped run from an authorized user
+# will auto-trigger.
+#
+# Scope preservation:
+#   The auto-trigger ONLY runs if a previous `@flashinfer-bot run <paths>`
+#   command from an authorized user exists in the PR's history. If no scope
+#   was ever specified, the workflow does NOT trigger — contributors must
+#   explicitly scope their CI runs.
+#   Multiple scoped commands for the same commit are aggregated (union of
+#   paths). A new commit with its own scoped commands replaces the previous
+#   scope; a new commit without any inherits the most recent scope.
+#   The scope is published as ci/test-scope-N commit statuses on the HEAD SHA,
+#   exactly as ci-bot-commands.yml does, so pr-test.yml reads it the same way.
+#
+# Guards:
+#   - At least one approving review must exist for the PR.
+#   - An authorized user must have posted `@flashinfer-bot run <paths>`.
+#   - A CI run must not already be in-flight or passed for the HEAD SHA.
+#   - On new pushes (synchronize), any queued or in-progress runs for the
+#     previous HEAD SHA are cancelled before the new run starts — no wasted
+#     GPU time on stale commits.
+#   - The run-ci label is applied via the bot PAT so the labeled event
+#     triggers pr-test.yml (GITHUB_TOKEN events don't trigger workflows).
+#
+# Triggers and tokens:
+#   Most PRs come from forks. On `pull_request` / `pull_request_review`
+#   events from a fork, GITHUB_TOKEN is read-only and secrets are withheld,
+#   so publishing scope statuses, cancelling stale runs and applying the
+#   label all fail. This workflow therefore runs only in the base repo's
+#   context:
+#     - New pushes: `pull_request_target` (synchronize).
+#     - Approvals:  pr-auto-ci-review.yml (unprivileged, does no work)
+#                   completes, which fires this workflow via `workflow_run`.
+#   Both run this file from the base branch with a write token and secrets.
+#   That is safe only because this workflow never checks out or executes PR
+#   code: the checkout below is the base branch, and the PR is read purely
+#   through the API. Do not add a checkout of the PR head.
+#   Every fact about the PR (number, head SHA, approval) is re-read from the
+#   API rather than taken from the triggering event.
+
+name: Auto CI on Approval
+
+on:
+  pull_request_target:
+    branches: [main]
+    types: [synchronize]
+  workflow_run:
+    workflows: ["Auto CI review relay"]
+    types: [completed]
+
+permissions:
+  contents: read
+  pull-requests: write
+  statuses: write   # publish ci/test-scope-N commit statuses
+  actions: write    # cancel stale runs on synchronize
+
+jobs:
+  # A step cannot mark its job "skipped" — only a job-level `if:` can. The
+  # approval check therefore runs as its own job, and auto-ci is gated on its
+  # output so an unapproved PR reports the "Auto-trigger CI" check as skipped
+  # rather than as a green no-op.
+  approval:
+    # Shown in the PR checks list as "Auto CI on Approval / approval gate".
+    # GitHub cannot hide a job's check run, so the name marks it as part of
+    # auto-CI rather than a separate check.
+    name: approval gate
+    # Only run on the canonical repo. For approvals, only act when the relay
+    # actually ran (it is skipped for non-approving reviews and non-main PRs).
+    if: >-
+      github.repository == 'flashinfer-ai/flashinfer'
+      && (
+        github.event_name == 'pull_request_target'
+        || (github.event_name == 'workflow_run'
+            && github.event.workflow_run.event == 'pull_request_review'
+            && github.event.workflow_run.conclusion == 'success')
+      )
+    runs-on: ubuntu-latest
+    outputs:
+      approved: ${{ steps.approval-check.outputs.approved }}
+      pr_number: ${{ steps.approval-check.outputs.pr_number }}
+    steps:
+      - name: Resolve PR and check it has an approval
+        id: approval-check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_PR: ${{ github.event.pull_request.number }}
+          RUN_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -o pipefail
+
+          if [[ "$EVENT_NAME" == "pull_request_target" ]]; then
+            CANDIDATES="$EVENT_PR"
+          else
+            # workflow_run leaves pull_requests[] empty for fork PRs, so find
+            # the open PR(s) into main whose head is the reviewed SHA.
+            CANDIDATES=$(gh api --paginate \
+              "/repos/${REPO}/pulls?state=open&base=main&per_page=100" \
+              --jq '.[] | {number, sha: .head.sha}' \
+              | jq -r --arg sha "$RUN_HEAD_SHA" 'select(.sha == $sha) | .number')
+          fi
+
+          for PR in $CANDIDATES; do
+            APPROVED=$(gh pr view "$PR" --repo "$REPO" --json reviews \
+              --jq '[.reviews[]
+                     | select(.state == "APPROVED"
+                              and (.authorAssociation | IN("OWNER","MEMBER","COLLABORATOR")))] | length')
+            if [[ "${APPROVED:-0}" -gt 0 ]]; then
+              echo "PR #$PR has $APPROVED approval(s)"
+              echo "pr_number=$PR" >> "$GITHUB_OUTPUT"
+              echo "approved=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "PR #$PR has no approvals"
+          done
+
+          if [[ -z "$CANDIDATES" ]]; then
+            echo "No open PR into main has head $RUN_HEAD_SHA (pushed since the review?)"
+          fi
+          echo "approved=false" >> "$GITHUB_OUTPUT"
+
+  auto-ci:
+    name: Auto-trigger CI
+    needs: approval
+    # Skipped (not green) when the PR is unapproved, or when the approval job
+    # itself was skipped (non-canonical repo / non-approving review).
+    if: needs.approval.outputs.approved == 'true'
+    runs-on: ubuntu-latest
+    concurrency:
+      group: pr-auto-ci-${{ needs.approval.outputs.pr_number }}
+      cancel-in-progress: false
+    steps:
+      # Base branch only (the default for pull_request_target and
+      # workflow_run). This job holds a write token and secrets; never check
+      # out the PR head here.
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Resolve PR metadata
+        id: pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ needs.approval.outputs.pr_number }}
+        run: |
+          echo "number=$PR_NUMBER" >> "$GITHUB_OUTPUT"
+
+          PR_JSON=$(gh pr view "$PR_NUMBER" \
+            --repo "${{ github.repository }}" \
+            --json headRefOid,headRefName,headRepository,headRepositoryOwner,author,labels)
+
+          HEAD_SHA=$(echo "$PR_JSON" | jq -r '.headRefOid')
+          HEAD_REF=$(echo "$PR_JSON" | jq -r '.headRefName')
+          HEAD_REPO=$(echo "$PR_JSON" | jq -r '"\(.headRepositoryOwner.login // "")/\(.headRepository.name // "")"')
+          AUTHOR=$(echo "$PR_JSON" | jq -r '.author.login')
+          HAS_RUN_CI=$(echo "$PR_JSON" | jq '[.labels[].name] | index("run-ci") != null')
+
+          echo "head_sha=$HEAD_SHA" >> "$GITHUB_OUTPUT"
+          {
+            echo "head_ref<<EOF_HEAD_REF"
+            echo "$HEAD_REF"
+            echo "EOF_HEAD_REF"
+          } >> "$GITHUB_OUTPUT"
+          echo "head_repo=$HEAD_REPO" >> "$GITHUB_OUTPUT"
+          echo "author=$AUTHOR" >> "$GITHUB_OUTPUT"
+          echo "has_run_ci=$HAS_RUN_CI" >> "$GITHUB_OUTPUT"
+
+      - name: Check for existing CI run on this SHA
+        id: ci-check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
+          HEAD_REF: ${{ steps.pr.outputs.head_ref }}
+          HEAD_REPO: ${{ steps.pr.outputs.head_repo }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          # Decide whether a REAL pr-test.yml run already exists for this SHA.
+          #
+          # pr-test.yml fires on every pull_request action (opened,
+          # synchronize, labeled, ...). Only a `labeled` + run-ci event passes
+          # its gate; every other run skips all downstream jobs and still
+          # concludes "success". The run list cannot tell these apart — its
+          # `event` field is just "pull_request" for all of them — so we look
+          # at pr-test's Setup job instead: it runs only when the gate
+          # authorized the run, and is skipped (or absent) on a no-op.
+          #
+          # A real run is matched to its Setup check run through the run's
+          # check_suite_id, which keeps a same-named job from another
+          # workflow from counting.
+          #
+          # Gate delay: for ~6-7s after a run-ci label is applied (measured on
+          # recent runs, almost all of it runner queue time), that run's gate
+          # is still running and Setup does not exist yet, so the run would
+          # look like a no-op. Waiting 15s before querying lets any
+          # run labeled just before this one (e.g. a manual
+          # `@flashinfer-bot run`) create its Setup check run first. A label
+          # applied after the query can still restart a run through pr-test's
+          # cancel-in-progress group, but never duplicates or misses one.
+          #
+          # API failures fail this step instead of guessing; every later step
+          # requires needs_ci == 'true', so nothing is triggered.
+          # Steps run under `bash -e` without pipefail by default; without it a
+          # failed `gh api` piped into `jq -s` would yield [] and look like
+          # "no runs", re-triggering CI on an API outage.
+          set -o pipefail
+          REPO="${{ github.repository }}"
+
+          echo "Waiting 15s for any just-labeled pr-test run to pass its gate"
+          sleep 15
+
+          RUNS=$(gh api --paginate -X GET \
+            "/repos/${REPO}/actions/workflows/pr-test.yml/runs" \
+            -f head_sha="$HEAD_SHA" -F per_page=100 \
+            --jq '.workflow_runs[] | {id, check_suite_id, status, conclusion}' \
+            | jq -s '.') || {
+              echo "::error::Could not list pr-test.yml runs for $HEAD_SHA"
+              exit 1
+            }
+
+          SETUP=$(gh api --paginate -X GET \
+            "/repos/${REPO}/commits/${HEAD_SHA}/check-runs" \
+            -f check_name=Setup -f filter=all -F per_page=100 \
+            --jq '.check_runs[] | {suite: .check_suite.id, status, conclusion}' \
+            | jq -s '.') || {
+              echo "::error::Could not list Setup check runs for $HEAD_SHA"
+              exit 1
+            }
+
+          # pr-test runs whose Setup job was not skipped. A queued or running
+          # Setup has a null conclusion, so it counts as real too.
+          REAL=$(jq -n --argjson runs "$RUNS" --argjson setup "$SETUP" '
+            ($setup | map(select(.conclusion != "skipped") | .suite)) as $real
+            | $runs | map(select(.check_suite_id as $s | any($real[]; . == $s)))')
+
+          echo "pr-test.yml runs on $HEAD_SHA: $(jq length <<< "$RUNS") total, $(jq length <<< "$REAL") real"
+
+          # Any finished real run blocks a re-trigger, failures included: a
+          # failure on this SHA is a real result (pr-test.yml does not retry),
+          # and re-running unchanged code would only burn GPU time. Cancelled
+          # runs never produced a result, so they do not block.
+          FINISHED=$(jq '[.[] | select(.status == "completed" and .conclusion != "cancelled")] | length' <<< "$REAL")
+          ACTIVE=$(jq '[.[] | select(.status != "completed")] | length' <<< "$REAL")
+
+          if [[ "$FINISHED" -gt 0 ]]; then
+            echo "CI already completed for $HEAD_SHA ($FINISHED finished real run(s)); not re-triggering"
+            echo "needs_ci=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # For synchronize events (new push), cancel any stale runs from the
+          # previous HEAD. The new commit supersedes the old one, so letting
+          # those runs finish wastes GPU time and blocks runners.
+          #
+          # Filter by head repository to avoid cancelling runs from a different
+          # fork that happens to share the same branch name.
+          if [[ "$EVENT_NAME" == "pull_request_target" ]]; then
+            # Use the workflow runs API directly — gh run list doesn't expose
+            # head_repository, which we need to avoid cancelling runs from a
+            # different fork that shares the same branch name.
+            WORKFLOW_ID=$(gh api "/repos/${{ github.repository }}/actions/workflows/pr-test.yml" \
+              --jq '.id' 2>/dev/null) || WORKFLOW_ID=""
+
+            if [[ -n "$WORKFLOW_ID" ]]; then
+              STALE_RUNS=$(gh api -X GET "/repos/${{ github.repository }}/actions/workflows/${WORKFLOW_ID}/runs" \
+                -f branch="$HEAD_REF" -f event=pull_request -F per_page=50 \
+                --jq "[.workflow_runs[]
+                  | select(.head_sha != \"${HEAD_SHA}\"
+                    and (.status == \"in_progress\" or .status == \"queued\")
+                    and .head_repository.full_name == \"${HEAD_REPO}\")]
+                  | .[].id" \
+                2>/dev/null) || STALE_RUNS=""
+            else
+              echo "::warning::Could not resolve pr-test.yml workflow ID; skipping stale run cancellation"
+              STALE_RUNS=""
+            fi
+
+            for RUN_ID in $STALE_RUNS; do
+              echo "Cancelling stale run $RUN_ID (previous commit)"
+              gh run cancel "$RUN_ID" --repo "${{ github.repository }}" 2>/dev/null || true
+            done
+          fi
+
+          # A real run already queued or in progress for THIS SHA — no need to
+          # re-trigger. (Stale runs cancelled above are on other SHAs.)
+          if [[ "$ACTIVE" -gt 0 ]]; then
+            echo "CI already active for $HEAD_SHA ($ACTIVE real run(s))"
+            echo "needs_ci=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "No real CI run active or passed for $HEAD_SHA"
+            echo "needs_ci=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Scan the PR's comment history for `@flashinfer-bot run <paths>` commands
+      # from authorized users via the timeline API (which interleaves commits
+      # and comments chronologically). The scope rules are:
+      #
+      #   - Multiple scoped commands on the SAME commit are aggregated (union
+      #     of paths): successive runs on one commit extend the scope.
+      #   - A new commit that has its OWN scoped commands replaces the previous
+      #     scope entirely.
+      #   - A new commit with NO scoped commands inherits the most recent
+      #     scope — the scope carries forward until explicitly overridden.
+      #
+      # If no scoped run was ever requested, scope_args is empty,
+      # has_scope is false, and the workflow skips publish-scope and
+      # label application — CI is not auto-triggered without a scope.
+      - name: Detect previous scoped run from comments
+        id: scope
+        if: >-
+          steps.ci-check.outputs.needs_ci == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.FLASHINFER_GITHUB_TOKEN || github.token }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
+          REPO: ${{ github.repository }}
+          ORG: ${{ github.repository_owner }}
+          TEAM: ci-users
+        run: |
+          # Fetch comment author + body pairs. We authorise each candidate
+          # against the same repo-role / ci-users team check that
+          # ci-bot-commands.yml uses, so an org member who is not in ci-users
+          # and has no write access cannot influence the test scope.
+
+          # Pre-fetch ci-users team members once (same call as ci-bot-commands).
+          TEAM_MEMBERS=$(gh api --paginate \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "/orgs/${ORG}/teams/${TEAM}/members" \
+            --jq '.[].login' 2>/dev/null) || TEAM_MEMBERS=""
+
+          is_authorized() {
+            local LOGIN="$1"
+            # Repo role check (admin/maintain/write/triage).
+            local ROLE
+            ROLE=$(gh api \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "/repos/${REPO}/collaborators/${LOGIN}/permission" \
+              --jq '.role_name' 2>/dev/null) || ROLE="none"
+            case "$ROLE" in
+              admin|maintain|write|triage) return 0 ;;
+            esac
+            # ci-users team membership.
+            if printf '%s\n' "$TEAM_MEMBERS" | grep -qx "$LOGIN"; then
+              return 0
+            fi
+            return 1
+          }
+
+          # Use the PR timeline API to associate comments with commits.
+          # The timeline interleaves "committed" and "commented" events
+          # chronologically. We track which SHA was HEAD when each comment
+          # was posted. Only scoped commands on the CURRENT HEAD SHA matter.
+          # Multiple scoped commands on the same (current) commit are
+          # aggregated; scopes on older commits are discarded entirely.
+
+          TIMELINE=$(gh api --paginate \
+            "/repos/${REPO}/issues/${PR_NUMBER}/timeline" \
+            -H "Accept: application/vnd.github.mockingbird-preview+json" \
+            --jq '.[] | @base64' 2>/dev/null) || TIMELINE=""
+
+          CURRENT_SHA=""
+          LAST_SCOPE=""         # most recent commit's aggregated scope (carries forward)
+          PENDING_SCOPE=""      # scope being built for the current commit
+          while IFS= read -r encoded; do
+            [[ -z "$encoded" ]] && continue
+            EVENT=$(echo "$encoded" | base64 -d | jq -r '.event // ""')
+
+            # Track the most recent commit SHA seen so far.
+            if [[ "$EVENT" == "committed" ]]; then
+              NEW_SHA=$(echo "$encoded" | base64 -d | jq -r '.sha // ""')
+              if [[ -n "$NEW_SHA" && "$NEW_SHA" != "$CURRENT_SHA" ]]; then
+                # Finalise the previous commit: if it had any scoped commands,
+                # promote them to LAST_SCOPE (overriding whatever came before).
+                # If it had none, LAST_SCOPE carries forward unchanged.
+                if [[ -n "$PENDING_SCOPE" ]]; then
+                  LAST_SCOPE="$PENDING_SCOPE"
+                fi
+                CURRENT_SHA="$NEW_SHA"
+                PENDING_SCOPE=""
+              fi
+              continue
+            fi
+
+            # Only process issue comments.
+            [[ "$EVENT" == "commented" ]] || continue
+
+            COMMENT_BODY=$(echo "$encoded" | base64 -d | jq -r '.body // ""')
+            COMMENT_LOGIN=$(echo "$encoded" | base64 -d | jq -r '.actor.login // .user.login // ""')
+
+            MATCH=$(printf '%s' "$COMMENT_BODY" | tr -d '\r' \
+              | awk '
+                  /^[[:space:]]*```/ { if (!f) { f = 1; d = "b" } else if (d == "b") { f = 0 }; next }
+                  /^[[:space:]]*~~~/ { if (!f) { f = 1; d = "t" } else if (d == "t") { f = 0 }; next }
+                  !f
+                ' \
+              | grep -iEm1 '^[[:space:]]*@flashinfer-bot[[:space:]]+run[[:space:]]+\S' \
+              | sed -E 's/^[[:space:]]*@[Ff]lashinfer-bot[[:space:]]+run[[:space:]]+//' \
+              | sed -E 's/[[:space:]]+$//') || MATCH=""
+
+            if [[ -n "$MATCH" ]]; then
+              if is_authorized "$COMMENT_LOGIN"; then
+                if [[ -n "$PENDING_SCOPE" ]]; then
+                  PENDING_SCOPE="$PENDING_SCOPE $MATCH"
+                else
+                  PENDING_SCOPE="$MATCH"
+                fi
+              else
+                echo "Skipping scope from unauthorized commenter: $COMMENT_LOGIN"
+              fi
+            fi
+          done <<< "$TIMELINE"
+
+          # Finalise the last commit in the timeline.
+          if [[ -n "$PENDING_SCOPE" ]]; then
+            LAST_SCOPE="$PENDING_SCOPE"
+          fi
+
+          if [[ -z "$LAST_SCOPE" ]]; then
+            echo "No previous scoped run found; skipping auto-trigger (scope required)"
+            echo "scope_args=" >> "$GITHUB_OUTPUT"
+            echo "has_scope=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Found scope: $LAST_SCOPE"
+            echo "scope_args=$LAST_SCOPE" >> "$GITHUB_OUTPUT"
+            echo "has_scope=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Publish the scope as ci/test-scope-N commit statuses, mirroring
+      # ci-bot-commands.yml exactly so pr-test.yml reads it the same way.
+      # Uses the validated-and-chunked output from experimental_test_scope.py.
+      #
+      # This step runs even when scope_args is empty — it clears any stale
+      # scope statuses left by a previous ci-bot-commands run on this SHA,
+      # ensuring pr-test.yml sees a clean slate and runs the full suite.
+      - name: Publish test scope
+        id: publish-scope
+        if: >-
+          steps.ci-check.outputs.needs_ci == 'true'
+          && steps.scope.outputs.has_scope == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
+          SCOPE_ARGS: ${{ steps.scope.outputs.scope_args }}
+        run: |
+          # Helper: clear all existing ci/test-scope-N statuses on this SHA so
+          # pr-test.yml sees no scope and runs the full suite. Fails the step
+          # if the lookup or any clearing POST fails — we must not apply the
+          # run-ci label while stale narrow-scope statuses might remain.
+          clear_stale_scopes() {
+            local MAX
+            MAX=$(gh api "/repos/${{ github.repository }}/commits/${HEAD_SHA}/status" \
+              --jq '[.statuses[].context
+                | select(test("^ci/test-scope-[0-9]+$"))
+                | sub("^ci/test-scope-"; "") | tonumber] | max // 0')
+            MAX=${MAX:-0}
+            for ((i = 1; i <= MAX; i++)); do
+              gh api -X POST "/repos/${{ github.repository }}/statuses/${HEAD_SHA}" \
+                -f state=success \
+                -f context="ci/test-scope-$i" \
+                -f description="" > /dev/null
+            done
+          }
+
+          # If no scope was detected, this step shouldn't run (gated by
+          # has_scope == 'true'), but guard defensively.
+          if [[ -z "$SCOPE_ARGS" ]]; then
+            echo "::error::Publish-scope reached with empty scope"
+            exit 1
+          fi
+
+          # Validate and chunk the scope paths using the same script as
+          # ci-bot-commands.yml. If validation fails, clear any stale scope
+          # statuses and fall back to the full suite rather than blocking —
+          # the author can always re-scope with @flashinfer-bot run <paths>.
+          if ! SCOPE=$(python3 scripts/pr_checks/experimental_test_scope.py \
+                --targets "$SCOPE_ARGS" --root tests/ --no-check-exists --test-path \
+                2>/tmp/scope_err); then
+            echo "::warning::Previous scope failed validation ($(cat /tmp/scope_err)); aborting auto-trigger"
+            clear_stale_scopes
+            exit 1
+          fi
+
+          if ! CHUNKED=$(python3 scripts/pr_checks/experimental_test_scope.py \
+                --targets "$SCOPE" --root tests/ --no-check-exists --chunk 140 \
+                2>/tmp/scope_err); then
+            echo "::warning::Scope chunking failed ($(cat /tmp/scope_err)); aborting auto-trigger"
+            clear_stale_scopes
+            exit 1
+          fi
+
+          mapfile -t CHUNKS <<< "$CHUNKED"
+
+          # Find the high-water mark of existing scope statuses on this SHA.
+          # Fail the step if the API call fails — publishing new chunks without
+          # knowing PREV_MAX could leave stale higher-numbered chunks in place,
+          # creating a corrupted scope.
+          PREV_MAX=$(gh api "/repos/${{ github.repository }}/commits/${HEAD_SHA}/status" \
+            --jq '[.statuses[].context
+              | select(test("^ci/test-scope-[0-9]+$"))
+              | sub("^ci/test-scope-"; "") | tonumber] | max // 0')
+          PREV_MAX=${PREV_MAX:-0}
+
+          publish_chunk() {
+            gh api -X POST "/repos/${{ github.repository }}/statuses/${HEAD_SHA}" \
+              -f state=success \
+              -f context="ci/test-scope-$1" \
+              -f description="$2" > /dev/null
+          }
+
+          for i in "${!CHUNKS[@]}"; do
+            publish_chunk "$((i + 1))" "${CHUNKS[$i]}"
+          done
+          # Blank out any leftover higher-numbered chunks from a previous scope.
+          for ((i = ${#CHUNKS[@]} + 1; i <= PREV_MAX; i++)); do
+            publish_chunk "$i" ""
+          done
+
+          echo "Published scope in ${#CHUNKS[@]} chunk(s): ${CHUNKS[*]}"
+
+      - name: Apply run-ci label
+        if: >-
+          steps.ci-check.outputs.needs_ci == 'true'
+          && steps.scope.outputs.has_scope == 'true'
+          && steps.publish-scope.outcome != 'failure'
+        env:
+          # Use the bot PAT so the labeled event triggers pr-test.yml.
+          # (Events from GITHUB_TOKEN do not trigger other workflows.)
+          # Unavailable when secrets are not passed to the run (e.g. fork PRs);
+          # the step then exits early with a notice.
+          # (The `secrets` context cannot be used in a step-level `if:`.)
+          GH_TOKEN: ${{ secrets.FLASHINFER_BOT_TOKEN }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          HAS_RUN_CI: ${{ steps.pr.outputs.has_run_ci }}
+        run: |
+          if [[ -z "$GH_TOKEN" ]]; then
+            echo "::notice::FLASHINFER_BOT_TOKEN is unavailable to this run; skipping the run-ci label"
+            exit 0
+          fi
+
+          echo "Auto-triggering CI for PR #$PR_NUMBER"
+
+          # Remove first if present (re-applying emits no event).
+          if [[ "$HAS_RUN_CI" == "true" ]]; then
+            gh pr edit "$PR_NUMBER" \
+              --repo "${{ github.repository }}" \
+              --remove-label "run-ci"
+          fi
+
+          gh pr edit "$PR_NUMBER" \
+            --repo "${{ github.repository }}" \
+            --add-label "run-ci"
+
+          echo "::notice::Auto-applied run-ci label — CI will start for $(echo "${{ steps.pr.outputs.head_sha }}" | cut -c1-8)"
