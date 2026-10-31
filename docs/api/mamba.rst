@@ -130,9 +130,9 @@ Interaction with ``torch.use_deterministic_algorithms(True)``:
   deterministic package.
 * The backend entry points never fall back.  The entry points that launch the
   unordered reduction (the single-rank backward, the KCP backward, the KCP
-  multi backward, and so the autograd backward) call
-  ``torch._C._alert_not_deterministic``: a ``RuntimeError``, or a warning with
-  ``warn_only=True``.  The forward and the checkpoint recompute run the
+  multi backward, and so the autograd backward) raise PyTorch's alert for an
+  operation without a deterministic implementation: a ``RuntimeError``, or a
+  ``UserWarning`` with ``warn_only=True``.  The forward and the checkpoint recompute run the
   deterministic forward programs and do not alert.
 * Every backend entry point raises ``ValueError`` unless
   ``deterministic=False``: the backend has no deterministic programs.

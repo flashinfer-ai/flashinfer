@@ -326,5 +326,14 @@ def test_multi_torch_deterministic_mode_alerts() -> None:
             conv_kcp.cake_causal_conv1d_multi_backward_kcp(
                 xs, ws, ctx, dys, hists, **NONDET
             )
+        torch.use_deterministic_algorithms(True, warn_only=True)
+        with pytest.warns(UserWarning, match="cake_causal_conv1d_multi_backward_kcp"):
+            dxs, dws = conv_kcp.cake_causal_conv1d_multi_backward_kcp(
+                xs, ws, ctx, dys, hists, **NONDET
+            )
+        ref = _singles(ctx, xs, ws, dys)
+        for i, r in enumerate(ref):
+            assert _same(dxs[i], r["dx"]), i
+            _close(dws[i], r["dw"], f"warn_only dweight {i}")
     finally:
         torch.use_deterministic_algorithms(prev, warn_only=prev_warn)

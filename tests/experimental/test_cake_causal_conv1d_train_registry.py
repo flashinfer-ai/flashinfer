@@ -31,6 +31,8 @@ import filecmp
 import hashlib
 import inspect
 import re
+import warnings
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -74,6 +76,13 @@ CHANNELS = (
     8192,
 )
 TOKENS = (1, 1000, 65536, 98304, 147456, 250340)
+
+
+@contextmanager
+def warnings_recorded():
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        yield caught
 
 
 def _strip(record: dict, *fields: str) -> dict:
@@ -365,6 +374,72 @@ def test_entry_points_refuse_a_deterministic_mode_first() -> None:
         with pytest.raises((ValueError, RuntimeError)) as info:
             call({"deterministic": False})
         assert "deterministic=False" not in str(info.value), name
+
+
+@pytest.mark.cpu_only
+def test_alert_helper_in_both_torch_modes(monkeypatch) -> None:
+    """The backend's own non-determinism alert (no private PyTorch hook: ``torch._C._alert_not_deterministic`` is
+    absent from some PyTorch builds, so it is removed here): silent with torch's deterministic algorithms off, a
+    ``RuntimeError`` naming the entry and the deterministic package when on, a ``UserWarning`` with the same naming
+    under ``warn_only=True``.  The KCP module uses the same helper."""
+
+    from flashinfer.experimental.cake.cake_causal_conv1d_train_backend import kcp as conv_kcp
+
+    assert conv_kcp._alert_nondeterministic is pkg._alert_nondeterministic
+    monkeypatch.delattr(torch._C, "_alert_not_deterministic", raising=False)
+    prev, prev_warn = (
+        torch.are_deterministic_algorithms_enabled(),
+        torch.is_deterministic_algorithms_warn_only_enabled(),
+    )
+    try:
+        torch.use_deterministic_algorithms(False)
+        with warnings_recorded() as caught:
+            pkg._alert_nondeterministic("probe_entry")
+        assert caught == []
+        torch.use_deterministic_algorithms(True)
+        with pytest.raises(RuntimeError, match="probe_entry does not have a deterministic implementation") as info:
+            pkg._alert_nondeterministic("probe_entry")
+        assert "flashinfer.cake_causal_conv1d_det_train" in str(info.value)
+        assert "warn_only=True" in str(info.value)
+        torch.use_deterministic_algorithms(True, warn_only=True)
+        with pytest.warns(UserWarning, match="probe_entry does not have a deterministic implementation") as record:
+            pkg._alert_nondeterministic("probe_entry")
+        assert any("flashinfer.cake_causal_conv1d_det_train" in str(w.message) for w in record)
+    finally:
+        torch.use_deterministic_algorithms(prev, warn_only=prev_warn)
+
+
+@pytest.mark.cpu_only
+def test_backward_entries_alert_before_any_device_work(monkeypatch) -> None:
+    """Under torch's deterministic mode the single-rank backward alerts after argument validation and before any
+    allocation or launch, and the forward does not alert.  Checked without a device: zero-token CPU tensors with the
+    device / placement checks stubbed (the zero-token path returns before any device query)."""
+
+    monkeypatch.setattr(pkg, "_device_arch", lambda device: "sm_100a")
+    monkeypatch.setattr(pkg, "_check_placement", lambda *a, **k: None)
+    launched = []
+    monkeypatch.setattr(pkg, "run_module", lambda *a, **k: launched.append(a))
+    x = torch.empty(0, 16, dtype=torch.bfloat16)
+    w = torch.zeros(16, 4, dtype=torch.float32)
+    cu = torch.tensor([0, 0], dtype=torch.int32)
+    prev, prev_warn = (
+        torch.are_deterministic_algorithms_enabled(),
+        torch.is_deterministic_algorithms_warn_only_enabled(),
+    )
+    try:
+        torch.use_deterministic_algorithms(True)
+        with pytest.raises(RuntimeError, match="cake_causal_conv1d_train_backward does not have"):
+            pkg.cake_causal_conv1d_train_backward(x, w, cu, x, deterministic=False)
+        # The forward runs the deterministic forward programs: no alert.
+        y = pkg.cake_causal_conv1d_train_forward(x, w, cu, deterministic=False)
+        assert tuple(y.shape) == (0, 16)
+        torch.use_deterministic_algorithms(True, warn_only=True)
+        with pytest.warns(UserWarning, match="cake_causal_conv1d_train_backward does not have"):
+            dx, dw = pkg.cake_causal_conv1d_train_backward(x, w, cu, x, deterministic=False)
+        assert tuple(dx.shape) == (0, 16) and torch.equal(dw, torch.zeros_like(dw))
+    finally:
+        torch.use_deterministic_algorithms(prev, warn_only=prev_warn)
+    assert launched == []
 
 
 @pytest.mark.cpu_only

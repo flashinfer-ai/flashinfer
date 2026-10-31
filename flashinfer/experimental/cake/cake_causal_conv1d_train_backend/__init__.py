@@ -45,9 +45,10 @@ and raises a ``ValueError`` unless it is ``False`` -- this package has no
 deterministic programs, so the call must opt in explicitly (the facade routes
 ``deterministic=True`` to the deterministic package).  With
 ``torch.use_deterministic_algorithms(True)`` the entry points that launch the
-unordered reduction (the backward, hence the autograd backward) call
-``torch._C._alert_not_deterministic`` (a ``RuntimeError``, or a warning under
-``warn_only=True``) and never fall back.  The forward is deterministic (the
+unordered reduction (the backward, hence the autograd backward) raise
+PyTorch's alert for an operation without a deterministic implementation (a
+``RuntimeError``, or a ``UserWarning`` under ``warn_only=True``) and never fall
+back.  The forward is deterministic (the
 det programs' bits) and does not alert.
 
 Host design (the knobs are keywords; no environment variable):
@@ -79,6 +80,7 @@ Host design (the knobs are keywords; no environment variable):
 from __future__ import annotations
 
 import functools
+import warnings
 from typing import Optional
 
 import torch
@@ -173,12 +175,29 @@ def _require_nondeterministic(deterministic: object, entry: str) -> None:
 
 
 def _alert_nondeterministic(entry: str) -> None:
-    """``torch._C._alert_not_deterministic(entry)`` when torch's deterministic algorithms are enabled (a
-    ``RuntimeError``, or a warning under ``warn_only=True``); nothing otherwise.  Called by the entry points that
-    launch the unordered reduction, before they launch."""
+    """PyTorch's alert for an operation without a deterministic implementation, when torch's deterministic
+    algorithms are enabled: a ``RuntimeError``, or a ``UserWarning`` under
+    ``torch.use_deterministic_algorithms(True, warn_only=True)``; nothing otherwise.  Called by the entry points that
+    launch the unordered reduction (the single-rank backward, the KCP backward and the KCP multi backward), before
+    they allocate, launch or exchange anything.  The alert is raised here, not through a private PyTorch hook
+    (PyTorch exposes no public Python entry for it)."""
 
-    if torch.are_deterministic_algorithms_enabled():
-        torch._C._alert_not_deterministic(entry)
+    if not torch.are_deterministic_algorithms_enabled():
+        return
+    if torch.is_deterministic_algorithms_warn_only_enabled():
+        warnings.warn(
+            f"{entry} does not have a deterministic implementation, but you set "
+            "'torch.use_deterministic_algorithms(True, warn_only=True)'; "
+            "flashinfer.cake_causal_conv1d_det_train is the deterministic package",
+            stacklevel=3,
+        )
+        return
+    raise RuntimeError(
+        f"{entry} does not have a deterministic implementation, but you set "
+        "'torch.use_deterministic_algorithms(True)'; flashinfer.cake_causal_conv1d_det_train is "
+        "the deterministic package, or use the 'warn_only=True' option if that is acceptable for your "
+        "application"
+    )
 
 
 def is_cake_causal_conv1d_train_supported(device: torch.device) -> bool:
@@ -759,8 +778,9 @@ def cake_causal_conv1d_train_backward(
         ``dbias`` needs ``bias``.  Every element is overwritten.
     deterministic : bool
         Must be ``False`` (``ValueError`` otherwise).  Under
-        ``torch.use_deterministic_algorithms(True)`` the call raises (or warns
-        with ``warn_only=True``) through ``torch._C._alert_not_deterministic``.
+        ``torch.use_deterministic_algorithms(True)`` the call raises a
+        ``RuntimeError`` (a ``UserWarning`` with ``warn_only=True``) before it
+        launches.
 
     Returns
     -------

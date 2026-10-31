@@ -53,8 +53,8 @@ cross-rank reduction of ``dweight`` stays the framework's.
 Numerical-mode keyword: every public entry takes ``deterministic: bool = True``
 and raises a ``ValueError`` unless it is ``False``; with
 ``torch.use_deterministic_algorithms(True)`` the backward entries (hence the
-autograd backward) call ``torch._C._alert_not_deterministic`` and never fall
-back.
+autograd backward) raise PyTorch's non-determinism alert (a ``RuntimeError``,
+or a ``UserWarning`` with ``warn_only=True``) and never fall back.
 
 Shipped host path (this revision;
 ``HOST_TRIM_DEFAULT = 1``): the context-derived host work of the eager halo
@@ -964,8 +964,8 @@ def cake_causal_conv1d_backward_kcp(
     and the main program folds them in one ordinary launch.  Every rank calls this function once per layer, in the
     same order.  ``graph`` as in the forward (the backward's key holds the forward's ``hist`` pointer, so its capture
     follows the forward's by one call).  ``deterministic`` must be ``False`` (``ValueError`` otherwise); under
-    ``torch.use_deterministic_algorithms(True)`` the call raises (or warns with ``warn_only=True``) through
-    ``torch._C._alert_not_deterministic`` before it launches or exchanges anything.
+    ``torch.use_deterministic_algorithms(True)`` the call raises a ``RuntimeError`` (a ``UserWarning`` with
+    ``warn_only=True``) before it launches or exchanges anything.
     """
 
     _require_nondeterministic(deterministic, "cake_causal_conv1d_backward_kcp")
