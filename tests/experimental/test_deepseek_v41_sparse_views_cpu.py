@@ -354,6 +354,7 @@ def sparse_host(no_accelerator_work):
         (
             "CombinedSparseRouteView",
             "CombinedSparseTile",
+            "_clamp_live_lengths",
             "_live_lengths",
             "bind_combined_sparse_views",
         ),
@@ -483,10 +484,19 @@ def test_persistent_binder_resolves_each_work_tile_request(sparse_host, k):
         case.table, case.seq, case.topk, case.pools, case.capacity
     )
     assert int(lengths[np.int32(3)]) == case.extent
+    # The generic loader snapshots the unbound view's raw lengths per tile.
+    assert not persistent.is_bound and persistent.has_extra
     for request in map(np.int32, range(4)):
         bound, _ = sparse_host.bind_combined_sparse_views(
             case.table, case.seq, case.topk, case.pools, case.capacity, request=request
         )
+        assert bound.is_bound
+        snapshot = persistent.bind_query_row(
+            request,
+            persistent.primary_lengths[request],
+            persistent.extra_lengths[request],
+        )
+        assert (int(snapshot.sl), int(snapshot.cl)) == (int(bound.sl), int(bound.cl))
         for token in map(np.int32, range(case.capacity)):
             assert int(persistent[token, request]) == int(bound[token, request])
             assert bool(persistent.is_invalid(token, request)) == bool(

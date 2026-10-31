@@ -35,6 +35,13 @@ class CombinedSparseRouteView(SparseKVIndices):
         ) = values
         self.capacity = capacity
         self.shape = (capacity, self.indices.shape[0])
+        # The generic loader snapshots unbound views' lengths once per work
+        # tile. Here those are the raw live seq/top-k lengths, clamped by
+        # bind_query_row; a bound view already carries its scalar lengths.
+        self.is_bound = self.row is not None
+        self.primary_lengths = self.seq_lens
+        self.extra_lengths = self.topk_lens
+        self.has_extra = True
 
     def __extract_mlir_values__(self):
         return cutlass.extract_mlir_values(self.values)
@@ -46,14 +53,19 @@ class CombinedSparseRouteView(SparseKVIndices):
 
     @cute.jit
     def bind_query_row(self, query_row, primary_length=None, extra_length=None):
-        del primary_length, extra_length
         if cutlass.const_expr(self.row is not None):
             # A nonpersistent CTA bound its request's metadata once.
             return self
         row = Int64(query_row)
-        swa_length, main_length = _live_lengths(
-            self.indices, self.seq_lens, self.topk_lens, row
-        )
+        if cutlass.const_expr(primary_length is None):
+            swa_length, main_length = _live_lengths(
+                self.indices, self.seq_lens, self.topk_lens, row
+            )
+        else:
+            # Reuse the raw seq/top-k lengths snapshotted for this work tile.
+            swa_length, main_length = _clamp_live_lengths(
+                self.indices, primary_length, extra_length
+            )
         return CombinedSparseRouteView(
             (self.indices, row, swa_length, main_length, self.sc, self.cc, None, None),
             self.capacity,
@@ -165,17 +177,20 @@ class CombinedSparseTile(SparseSourceTile):
 
 
 @cute.jit
-def _live_lengths(indices, seq_lens, topk_lens, request):
+def _clamp_live_lengths(indices, seq_len, topk_len):
     compressed_k = indices.shape[1] - 128
-    swa_length = cute.math.min(
-        cute.math.max(Int32(seq_lens[request]), Int32(0)), Int32(128)
-    )
+    swa_length = cute.math.min(cute.math.max(Int32(seq_len), Int32(0)), Int32(128))
     # Clamp before subtracting128 so malformed INT_MIN never wraps around.
     main_length = cute.math.min(
-        cute.math.max(Int32(topk_lens[request]), Int32(128)),
+        cute.math.max(Int32(topk_len), Int32(128)),
         Int32(128 + compressed_k),
     ) - Int32(128)
     return swa_length, main_length
+
+
+@cute.jit
+def _live_lengths(indices, seq_lens, topk_lens, request):
+    return _clamp_live_lengths(indices, seq_lens[request], topk_lens[request])
 
 
 @cute.jit

@@ -152,10 +152,12 @@ class TmemCorrResource(MlaResource):
     _tail_sink: object = None
 
     def _prefetches_tail_sink(self):
-        # Keep-AB fused epilogues read one sink per row-owning lane.
+        # Keep-AB fused epilogues read one sink per row-owning lane. WS native-E
+        # maps lanes to rows differently; its tail keeps the direct sink load.
         return (
             self.inst_id == 1
             and self.cfg.kernel_variant == "keeps_mma_ab"
+            and not self.cfg.ws_native_e
             and self.cfg.fuse_sparse_epilogue
             and self.attention_sinks is not None
         )
