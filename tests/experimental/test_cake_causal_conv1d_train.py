@@ -113,6 +113,9 @@ REPEAT_CASES = (
     (4097, 1160, (1000, 0, 3, 3094)),
 )
 PRECISION_CASES = ((250340, 512, "perf"), (250340, 1280, "perf"))
+# Wide channel counts on every route: C = 4096 (four documents, one empty) and C = 10240 (a packed q / k / v
+# projection width), at small S.
+WIDE_CASES = ((4097, 4096, (1000, 0, 3, 3094)), (2048, 10240, "perf"))
 PRECISION_REPEATS = 5
 # S x C > 2^31 elements (64-bit offsets) at a token count past the sm_107a token floor.
 LARGE_CASE = (262401, 8192, "perf")
@@ -594,6 +597,46 @@ def test_routes_match_reference(case, combo) -> None:
         if got is None:
             continue
         assert got.dtype == expected.dtype, f"{name} {label}"
+        atol, rtol = _grad_tolerance(policy, got.dtype)
+        _assert_within(
+            got.float(),
+            expected.float(),
+            atol=atol,
+            rtol=rtol,
+            label=f"{name} vs det {label}",
+        )
+
+
+@pytest.mark.parametrize("kind", tuple(ROUTE_SETTINGS))
+@pytest.mark.parametrize("case", WIDE_CASES, ids=_case_id)
+def test_wide_channel_rows(case, kind, record_property) -> None:
+    """C = 4096 and C = 10240 on every backward route (the fp32g routes included): ``y``, ``dx``, ``dweight`` and
+    ``dbias`` against the reference; ``y`` / ``dx`` bitwise the deterministic package's and its ``dweight`` /
+    ``dbias`` within the route's budget of the deterministic ones (when that package is importable)."""
+
+    _require_route(kind)
+    S, C, docs = case
+    label = f"{kind} {case}"
+    x, w, cu, dy, b, policy = _route_inputs(S, C, docs, kind, key=3)
+    y = _forward(x, w, cu, bias=b)
+    _assert_within(
+        y, reference_forward(x, w, cu, b), atol=Y_ATOL, rtol=Y_RTOL, label=f"y {label}"
+    )
+    dx, dw, db = _backward(x, w, cu, dy, b, policy)
+    refs = reference_backward(x, w, cu, dy, b=b, policy=policy)
+    worst_dw, worst_db = _check_grads(dx, dw, db, refs, policy=policy, label=label)
+    record_property("dweight_worst_ratio_to_budget", worst_dw)
+    det = _det_or_none()
+    if det is None:
+        return
+    assert torch.equal(y, det.cake_causal_conv1d_det_train_forward(x, w, cu, bias=b)), (
+        f"y differs from the deterministic package ({label})"
+    )
+    dx_d, dw_d, db_d = _det_backward(det, x, w, cu, dy, b, policy)
+    assert torch.equal(dx, dx_d), f"dx differs from the deterministic package ({label})"
+    for got, expected, name in ((dw, dw_d, "dweight"), (db, db_d, "dbias")):
+        if got is None:
+            continue
         atol, rtol = _grad_tolerance(policy, got.dtype)
         _assert_within(
             got.float(),

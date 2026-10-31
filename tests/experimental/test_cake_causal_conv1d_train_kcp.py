@@ -15,7 +15,7 @@ limitations under the License.
 
 Single-GPU tests of the non-deterministic KCP convolution (``cake_causal_conv1d_kcp(..., deterministic=False)``): one
 process, world size 1, no process group (the halo exchange of one rank is the identity), on the deterministic KCP
-suite's rows, contexts and FP64 oracle.
+suite's rows, contexts and FP64 oracle, plus a C = 10240 row for (a) and (b).
 
 (a) ``y`` and ``hist`` are bitwise the deterministic KCP forward's (the same programs); ``dx`` is bitwise the
     deterministic KCP backward's (the same per-thread arithmetic and fold); the FP32 ``dweight`` partial is within
@@ -64,6 +64,9 @@ apply_to_package()
 
 REPEATS = 20
 NONDET = {"deterministic": False}
+# Beside the deterministic suite's rows: C = 10240 (a packed q / k / v projection width), a fragment cut inside each
+# of two documents.
+WIDE_ROWS = [("wide-qkv", (2000, 1003), (1, 2, 1997, 1003), 10240)]
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available()
@@ -104,7 +107,9 @@ def _same(a, b, *, scale=1.0) -> bool:
     return True
 
 
-@pytest.mark.parametrize("name,lens,cuts,C", ROWS, ids=[r[0] for r in ROWS])
+@pytest.mark.parametrize(
+    "name,lens,cuts,C", ROWS + WIDE_ROWS, ids=[r[0] for r in ROWS + WIDE_ROWS]
+)
 def test_forward_is_the_deterministic_forward(name, lens, cuts, C):
     device = torch.device("cuda")
     p = _problem(lens, cuts, C, device)
@@ -117,7 +122,9 @@ def test_forward_is_the_deterministic_forward(name, lens, cuts, C):
     _assert_within(y, y_ref[p.l2g], atol=Y_ATOL, rtol=Y_RTOL, label="y vs FP64 oracle")
 
 
-@pytest.mark.parametrize("name,lens,cuts,C", ROWS, ids=[r[0] for r in ROWS])
+@pytest.mark.parametrize(
+    "name,lens,cuts,C", ROWS + WIDE_ROWS, ids=[r[0] for r in ROWS + WIDE_ROWS]
+)
 def test_backward_repeats_dx_bitwise_dweight_within_budget(
     name, lens, cuts, C, record_property
 ):
