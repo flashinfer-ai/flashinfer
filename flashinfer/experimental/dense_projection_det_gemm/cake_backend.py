@@ -4477,6 +4477,13 @@ def plan_router_fp32_det_gemm(
     splits = int(splits)
     if splits < 1:
         raise ValueError("router_fp32_det_gemm: splits must be >= 1")
+    # one split stores straight into ``out``: the row-major store (kk / kn) writes 16-byte vectors, the
+    # transposed store (nn_t) one fp32 element at a time; more splits store into the workspace and reduce into ``out``
+    if splits == 1 and not transposed and out.data_ptr() % 16 != 0:
+        raise ValueError(
+            "router_fp32_det_gemm: out must start at a 16-byte aligned address "
+            f"(the single-split {layout} launch stores 16-byte vectors into it)"
+        )
     m_tiles = _ceil_div(M_eff, ROUTER_BLOCK_M)
     m_tiles += m_tiles % CTA_GROUP
     n_tiles = _ceil_div(N_eff, ROUTER_BLOCK_N)

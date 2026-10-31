@@ -5271,6 +5271,46 @@ def test_router_layout_classification_and_swap():
         )
 
 
+def _offset_out(rows, cols, offset, device="cpu"):
+    """A contiguous fp32 ``out [rows, cols]`` that starts ``offset`` elements (4 bytes each) past a 16-byte
+    boundary."""
+    storage = torch.empty(rows * cols + 4, device=device)
+    base = (-storage.data_ptr() % 16) // 4  # elements up to the first 16-byte boundary
+    out = storage[base + offset : base + offset + rows * cols].view(rows, cols)
+    assert out.data_ptr() % 16 == 4 * offset
+    return out
+
+
+def test_router_planner_refuses_a_misaligned_out_of_a_single_split_row_major_store():
+    """A single-split ``kk`` / ``kn`` launch stores 16-byte vectors straight into ``out``: an ``out`` that starts
+    4 or 8 bytes past a 16-byte boundary is refused (the kernel would fault with a misaligned address).  A
+    split-K launch stores into its workspace and the transposed ``nn_t`` store writes one element at a time,
+    so those plan with such an ``out``; an aligned ``out`` plans every layout."""
+    T, K, N = 100, 6144, 256
+    X, W, G = torch.empty(T, K), torch.empty(N, K), torch.empty(T, N)
+    cases = dict(kk=(X, W.t(), T, N), kn=(G, W, T, K), nn_t=(G.t(), X, N, K))
+    for layout, (A, B, rows, cols) in cases.items():
+        for splits in sorted({1, 2, ROUTER_SPLITS[layout]}):
+            plan, *_ = plan_router_fp32_det_gemm(
+                A, B, _offset_out(rows, cols, 0), splits=splits
+            )
+            assert (plan.layout, plan.splits) == (layout, splits)
+            for offset in (1, 2):
+                out = _offset_out(rows, cols, offset)
+                if splits == 1 and layout != "nn_t":
+                    with pytest.raises(ValueError, match="16-byte aligned address"):
+                        plan_router_fp32_det_gemm(A, B, out, splits=splits)
+                else:
+                    plan, *_ = plan_router_fp32_det_gemm(A, B, out, splits=splits)
+                    assert (plan.layout, plan.splits) == (layout, splits)
+    # the production split counts: the input gradient (kn, one split) refuses, the forward (kk, 4) and the
+    # weight gradient (nn_t, 6) plan
+    with pytest.raises(ValueError, match="16-byte aligned address"):
+        plan_router_fp32_det_gemm(G, W, _offset_out(T, K, 1))
+    assert plan_router_fp32_det_gemm(X, W.t(), _offset_out(T, N, 1))[0].splits == 4
+    assert plan_router_fp32_det_gemm(G.t(), X, _offset_out(N, K, 1))[0].splits == 6
+
+
 def test_split_fp32_to_bf16x3_is_exact_and_allocation_free_in_place():
     g = torch.Generator().manual_seed(SEED)
     src = torch.randn(64, 96, generator=g) * torch.logspace(-3, 3, 96)
@@ -8737,6 +8777,57 @@ def test_router_rows_match_fp64_reference_and_rerun_bit_exact(op, T):
     after = torch.cuda.memory_stats()
     assert after["allocation.all.allocated"] - before["allocation.all.allocated"] == 1
     assert len(cake_backend._K2_CACHE) == 1 and torch.equal(again, v["out"])
+
+
+@pytest.mark.parametrize("op, T", [("fwd", 257), ("dgrad", 257), ("wgrad", 1001)])
+def test_router_misaligned_out_is_refused_or_matches_fp64_reference(op, T):
+    """An ``out`` 4 bytes past a 16-byte boundary on the device: a single-split ``kk`` / ``kn`` launch is refused
+    on both host paths before anything is launched (its 16-byte vector store would fault with a misaligned
+    address); the split-K launches and the transposed ``nn_t`` store write the bits of an aligned ``out`` and
+    match the FP64 reference."""
+    if not _device_supported():
+        pytest.skip(
+            "requires a device with a registered generated instance "
+            f"(compute capability {_registered_capabilities()})"
+        )
+    v = _router_inputs(op, T, seed=SEED + 22)
+    plan, *_ = plan_router_fp32_det_gemm(v["A"], v["B"], v["out"])
+    _require_program(plan.template)
+    rows, cols = (int(s) for s in v["out"].shape)
+    expected = torch.matmul(v["A"].double(), v["B"].double())
+    for splits in sorted({1, 2, ROUTER_SPLITS[plan.layout]}):
+        aligned = _offset_out(rows, cols, 0, device="cuda")
+        shifted = _offset_out(rows, cols, 1, device="cuda")
+        eager = _offset_out(rows, cols, 1, device="cuda")
+        cake_backend.clear_convenience_caches()
+        if splits == 1 and not plan.transposed_out:
+            with pytest.raises(ValueError, match="16-byte aligned address"):
+                prepare_router_fp32_det_gemm(v["A"], v["B"], shifted, splits=splits)
+            with pytest.raises(ValueError, match="16-byte aligned address"):
+                cake_backend.router_fp32_det_gemm(v["A"], v["B"], eager, splits=splits)
+            torch.cuda.synchronize()  # nothing was launched: the context stays healthy
+            prepare_router_fp32_det_gemm(
+                v["A"], v["B"], aligned, splits=splits
+            ).launch()
+            outs = [aligned]
+        else:
+            prepare_router_fp32_det_gemm(
+                v["A"], v["B"], aligned, splits=splits
+            ).launch()
+            prepare_router_fp32_det_gemm(
+                v["A"], v["B"], shifted, splits=splits
+            ).launch()
+            cake_backend.router_fp32_det_gemm(v["A"], v["B"], eager, splits=splits)
+            outs = [shifted, eager]
+        torch.cuda.synchronize()
+        for out in outs:
+            assert torch.equal(out, aligned), splits
+        diff = (aligned.double() - expected).abs()
+        rel_fro = float(diff.norm() / expected.norm())
+        assert bool(torch.isfinite(aligned).all()) and rel_fro <= ROUTER_REL_FRO_MAX, (
+            splits,
+            rel_fro,
+        )
 
 
 def test_fused_split_matches_the_torch_chain_bit_exactly():
