@@ -5,7 +5,7 @@ Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-http://www.apache.org/licenses/LICENSE-2.0
+  http://www.apache.org/licenses/LICENSE-2.0
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -13,780 +13,1237 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
-Cake backend: MiniMax-M3 ICP decode indexer chain (SM100 / SM103).
+Cake backend of the MiniMax-M3 index-context-parallel (ICP) indexer.
 
-Two generated programs serve one decode step of the index-context-parallel
-(ICP) indexer on every rank of a 2- or 4-rank group:
+The index keys of a sequence are sharded across the ``world`` ranks of a
+tensor-parallel group; every rank holds every index head's query.  Each entry
+point here validates tensor metadata on the host (never tensor contents), picks
+the program of its role for the device's exact architecture and launches it on
+the current stream.  Nothing allocates, synchronizes or reads a device value,
+except the eager host plan :func:`index_score_sharded_plan`.
 
-* the **fused scorer** -- one CTA per (request, split) streams this rank's
-  FP8 index-key fragments of the request's pages with TMA, scores the
-  request's query rows against them with tensor-core MMAs and keeps, in its
-  epilogue, each (token, head) row's top-16 (canonical key: score descending,
-  global block id ascending) as compact candidate lists in a per-row pool;
-* the **exchange merge** -- one CTA per (token, head) row merges the row's
-  lists into the rank-local top-16, pushes the 16 words into the owner rank's
-  symmetric pool and, on the rows whose head this rank owns, polls the peers'
-  words and writes the merged, forced-block-injected global ids ascending
-  into ``out``.
+Layouts (``P`` page size, ``W`` world size, ``R = P // W`` local rows per page,
+``r`` rank, ``c`` local page column):
 
-Preparation validates the tensors on the host from their metadata only (no
-device reads), decides the split count from the device's SM count and the
-pool / merge geometry from the block table's column count, binds both
-programs and returns a runner that launches with no allocation and no host
-synchronization, so it can be captured into a CUDA Graph.  The exchange is a
-collective: every rank of the group launches the same chain for the same
-step, and the status word of each rank's workspace must be read (outside
-capture) after a step; a non-zero value is fatal for the step.
+* P128 interleaved: local row ``i`` of column ``c`` is global key
+  ``128 c + i W + r``; every rank holds part of every B128 block.
+* P256, ``W = 2``: rank ``r`` holds the 128 contiguous keys from
+  ``256 c + 128 r``, the complete block ``2 c + r``.
+* P256, ``W = 4``: rank ``r`` holds the 64 contiguous keys from
+  ``256 c + 64 r``; block ``2 c + r // 2`` spans ranks ``{2 (r // 2), 2 (r // 2) + 1}``.
+
+A score is the raw FP32 maximum over the block's visible local keys of
+``q . k`` (no scale, NaN ignored, ``-0.0`` written as ``+0.0``, ``-inf`` when
+no local key is visible).  Selection ranks scores descending (NaN as
+``-inf``, forced blocks first) and breaks exact ties toward the lower global
+B128 id.  A Top16 row is 16 raw score words then 16 global ids ascending,
+padded with ``(-inf, -1)``.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Any, Callable, Optional
+import dataclasses
+import math
+from typing import Any, Optional
 
 import torch
-import tvm_ffi
 
-from ...utils import get_compute_capability, get_device_sm_count
-from .cake_jit import (
-    ARG_PLANS,
-    POLICY,
-    PROGRAMS,
-    load_program,
-    merge_programs,
-    programs_for,
-    scorer_programs,
-    select_merge_program,
-    select_scorer_program,
-)
-from .cake_workspace import NUM_HEADS, OUT_POISON, TOPK, MSAIcpIndexerWorkspace
+from . import cake_jit
 
 HEAD_DIM = 128
-WORLD_SIZES = (2, 4)
-PAGE_SIZES = (128, 256)
-MAX_QUERY_LEN = 8
-TMA_ALIGN = 16
-TRANSPORT_ID_LIMIT = (1 << 20) - 1  # 20-bit block ids in the transport word
-SUPPORTED_COMPUTE_CAPABILITIES = {
-    (10, 0): "sm_100a",
-    (10, 3): "sm_103a",
-}
-# Launch phases of the exchange merge: the real transport, or the serialised
-# push / poll halves the single-process emulation of several ranks uses.
-PHASE_PUSH_POLL = 0
-PHASE_PUSH_ONLY = 1
-PHASE_POLL_ONLY = 2
-DEFAULT_TIMEOUT_US = 50_000.0
+TOPK = 16
+# Words of a legacy (int32) row and of a tagged (int64) row.
+ROW_WORDS = 2 * TOPK + 1
+TAGGED_WORDS = 2 * TOPK
+NUM_SLOT_SETS = 3
+# A prefill merge runs the prefill program (``merge_prefill``: one exchange,
+# no spin).  A legacy decode merge of at least this many tokens runs one token
+# per CTA (``merge_legacy``); every other decode merge (tagged rows, fewer
+# tokens) runs 4 per CTA (``merge``).
+LEGACY_MERGE_MIN_TOKENS = 8
+# The merge ranks at most this many B128 blocks per token.
+MAX_BLOCKS = 8192
+# Upper bound (exclusive) of the score-row width the selectors accept.
+MAX_SELECT_COLUMNS = 12288
+PLAN_WORKSPACE_BYTES = 32 * 1024 * 1024
+SUPPORTED_WORLD_SIZES = (2, 4)
+SUPPORTED_PAGE_SIZES = (128, 256)
+# v1 scope: the MiniMax-M3 indexer's four index heads.
+NUM_INDEX_HEADS = 4
+# The decode scorer packs ``H * max_decode_query_len`` query rows per tile.
+MAX_DECODE_ROWS = 32
+DEFAULT_SPIN_LIMIT = 1 << 26
+_INT32_MAX = (1 << 31) - 1
+_FP8 = torch.float8_e4m3fn
 
 
-def _policy(key: str):
-    if key not in POLICY:
-        raise NotImplementedError(
-            f"the generated ICP indexer registry of this checkout carries no planning constant {key!r}"
-        )
-    return POLICY[key]
-
-
-# ---------------------------------------------------------------------------
-# Device geometry
-# ---------------------------------------------------------------------------
-
-
-def arch_for(device: torch.device) -> Optional[str]:
-    return SUPPORTED_COMPUTE_CAPABILITIES.get(get_compute_capability(device))
-
-
-def generated_program_available(device: torch.device) -> bool:
-    """True when this checkout registers both chain programs for ``device``."""
-    arch = arch_for(device)
-    return (
-        arch is not None and bool(scorer_programs(arch)) and bool(merge_programs(arch))
-    )
-
-
-# ---------------------------------------------------------------------------
-# Host planning (mirrors of the source's host policy; the registry POLICY
-# literal carries the constants so both sides plan identically)
-# ---------------------------------------------------------------------------
-
-
-def pool_layout(nreq: int, split_count: int, bpt: int, slots: int) -> dict[str, int]:
-    """Entry layout of one pool row for a request of ``nreq`` blocks on this rank.
-
-    The scorer's (request, split) CTAs hold ``bpt``-block tiles in ``slots``
-    epilogue warps; the layout gives the list count and the list lengths of
-    the ``r`` splits with one extra tile (A) and the remaining splits (B) and
-    the row extent ``E`` the merge reads.
+@dataclasses.dataclass(frozen=True)
+class MSAIcpScorePlan:
+    """A prefill scorer plan: the segment metadata it was built from and the
+    caller-owned storage it lives in (``packed_work_range`` /
+    ``packed_work_info``; ``workspace`` is accepted for MSA compatibility and
+    unused).  ``columns`` is the B128 column bound ``ceil(max_seq_len / 128)``.
     """
-    nreq, split_count, bpt, slots = int(nreq), int(split_count), int(bpt), int(slots)
-    ns = min(nreq, split_count)
-    q, r = divmod(nreq, split_count)
-    ta = (q + bpt) // bpt
-    tb = (q + bpt - 1) // bpt
-    va, vb = min(ta, slots), min(tb, slots)
-    ca = min(TOPK, ((ta + slots - 1) // slots) * bpt)
-    cb = min(TOPK, ((tb + slots - 1) // slots) * bpt)
-    la, lb = r * va, (ns - r) * vb
-    return dict(r=r, vA=va, vB=vb, cA=ca, cB=cb, LA=la, LB=lb, E=ca * la + cb * lb)
 
-
-def merge_geometry(e_row_max: int, *, min_w: int = 1) -> dict[str, int]:
-    """Merge CTA geometry for rows of up to ``e_row_max`` entries: warps per CTA
-    (``POLICY['merge_w_policy']``, at least ``min_w``), even entries per thread
-    and chunk (at most ``POLICY['merge_epl_max']``), the chunk size and the
-    chunks a maximal row takes; ``pool_stride = chunk * chunks``."""
-    e_row_max = max(1, int(e_row_max))
-    w_policy = [(int(bound), int(wp)) for bound, wp in _policy("merge_w_policy")]
-    w_default = int(_policy("merge_w_default"))
-    w_max = int(_policy("merge_w_max"))
-    epl_max = int(_policy("merge_epl_max"))
-    w = next((wp for bound, wp in w_policy if e_row_max <= bound), w_default)
-    w = max(int(w), int(min_w))
-    if w not in (1, 2, 4, 8, w_max):
-        raise ValueError(f"merge warps per CTA must be 1, 2, 4, 8 or {w_max}, got {w}")
-    epl = min(epl_max, max(2, -(-e_row_max // (32 * w))))
-    epl += epl & 1
-    if epl < 2 or epl % 2 or epl > epl_max:
-        raise ValueError(
-            f"merge entries per thread must be even and in 2..{epl_max}, got {epl}"
-        )
-    chunk = 32 * w * epl
-    chunks = -(-e_row_max // chunk)
-    return dict(
-        w=int(w), epl=int(epl), chunk=chunk, chunks=chunks, pool_stride=chunk * chunks
-    )
-
-
-def pool_geometry(
-    nreq_bound: int, split_count: int, bpt: int, slots: int, *, world_size: int
-) -> dict[str, int]:
-    """Merge geometry and pool stride covering every request of up to ``nreq_bound``
-    blocks on this rank (the block table's column count: the structural bound).
-    The exchange tail keeps ``16 * world_size`` entries one per thread, so the
-    CTA has at least ``16 * world_size / 32`` warps."""
-    nreq_bound = int(nreq_bound)
-    e_max = max(
-        pool_layout(n, split_count, bpt, slots)["E"] for n in range(nreq_bound + 1)
-    )
-    min_w = max(1, (TOPK * int(world_size)) // 32)
-    g = merge_geometry(e_max, min_w=min_w)
-    return dict(
-        E_row_max=e_max,
-        w=g["w"],
-        epl=g["epl"],
-        chunk=g["chunk"],
-        chunks=g["chunks"],
-        pool_stride=g["pool_stride"],
-        nreq_bound=nreq_bound,
-    )
-
-
-def default_split_count(batch: int, sm_count: int, ctas_per_sm: int) -> int:
-    """Largest split that keeps every scorer CTA resident at once (one wave, no tail)."""
-    return max(1, (int(sm_count) * int(ctas_per_sm)) // max(1, int(batch)))
-
-
-@dataclass(frozen=True)
-class ChainPlan:
-    """The frozen launch plan of one chain geometry on one device."""
-
-    arch: str
-    world_size: int
-    query_len: int
-    rows_per_rank: int
-    page_size: int
+    qo_segment_lens: torch.Tensor
+    kv_segment_lens: torch.Tensor
+    qo_segment_offsets: torch.Tensor
+    kv_segment_offsets: torch.Tensor
+    qo_offset: torch.Tensor
+    packed_work_range: torch.Tensor
+    packed_work_info: torch.Tensor
+    workspace: torch.Tensor
+    total_q: int
+    num_qo_heads: int
     batch: int
-    block_table_columns: int
-    sm_count: int
-    scorer_program: str
-    merge_program: str
-    bpt: int
-    slots: int
-    stages: int
-    ctas_per_sm: int
-    split_count: int
-    merge_warps: int
-    merge_entries_per_thread: int
-    pool_stride: int
-    e_row_max: int
-
-    def as_dict(self) -> dict[str, Any]:
-        return dict(self.__dict__)
+    max_query_len: int
+    columns: int
+    uniform: bool = False
 
 
-def plan_chain(
-    arch: str,
-    *,
-    world_size: int,
-    query_len: int,
-    rows_per_rank: int,
-    page_size: int,
-    batch: int,
-    block_table_columns: int,
-    sm_count: int,
-) -> ChainPlan:
-    """Programs, split count and pool / merge geometry for one chain geometry.
+# --------------------------------------------------------------------------- checks
 
-    Fails closed (``NotImplementedError``) when the checkout registers no
-    scorer program for the index geometry or no exchange merge for the
-    resulting merge geometry.
-    """
-    scorer = select_scorer_program(
-        arch, query_len=query_len, rows_per_rank=rows_per_rank, page_size=page_size
-    )
-    record = PROGRAMS[scorer]
-    split = default_split_count(batch, sm_count, int(record["ctas_per_sm"]))
-    geometry = pool_geometry(
-        block_table_columns,
-        split,
-        int(record["bpt"]),
-        int(record["slots"]),
-        world_size=world_size,
-    )
-    merge = select_merge_program(
-        arch,
-        world_size=world_size,
-        warps=geometry["w"],
-        entries_per_thread=geometry["epl"],
-    )
-    merge_record = PROGRAMS[merge]
-    production = _policy("merge_production")
-    if bool(merge_record["late_wait"]) != bool(production["late_wait"]) or bool(
-        merge_record["small_fast"]
-    ) != bool(production["small_fast"]):
-        raise NotImplementedError(
-            f"the registered exchange merge {merge!r} is not the production variant {production}"
+
+def _device_index(t: torch.Tensor) -> int:
+    if not t.is_cuda:
+        raise ValueError("Cake MSA ICP indexer tensors must be CUDA tensors")
+    return t.device.index if t.device.index is not None else torch.cuda.current_device()
+
+
+def _same_device(device: torch.device, **tensors: Optional[torch.Tensor]) -> None:
+    for name, t in tensors.items():
+        if t is not None and t.device != device:
+            raise ValueError(f"{name} is on {t.device}, expected {device}")
+
+
+def _vector(name: str, t: torch.Tensor, dtype: torch.dtype, size: int) -> None:
+    if t.dtype != dtype or t.ndim != 1 or t.numel() != size or not t.is_contiguous():
+        raise ValueError(
+            f"{name} must be a contiguous 1-D {dtype} tensor of {size} elements"
         )
-    if str(record["pdl_trigger"]) != str(production["scorer_pdl_trigger"]):
-        raise NotImplementedError(
-            f"the registered scorer {scorer!r} triggers PDL at {record['pdl_trigger']!r}; the production chain "
-            f"expects {production['scorer_pdl_trigger']!r}"
+
+
+def _heads(h: int) -> None:
+    if h != NUM_INDEX_HEADS:
+        raise ValueError(
+            f"the Cake MSA ICP indexer supports {NUM_INDEX_HEADS} index heads "
+            f"(MiniMax-M3); got {h}"
         )
-    return ChainPlan(
-        arch=arch,
-        world_size=int(world_size),
-        query_len=int(query_len),
-        rows_per_rank=int(rows_per_rank),
-        page_size=int(page_size),
-        batch=int(batch),
-        block_table_columns=int(block_table_columns),
-        sm_count=int(sm_count),
-        scorer_program=scorer,
-        merge_program=merge,
-        bpt=int(record["bpt"]),
-        slots=int(record["slots"]),
-        stages=int(record["stages"]),
-        ctas_per_sm=int(record["ctas_per_sm"]),
-        split_count=int(split),
-        merge_warps=int(geometry["w"]),
-        merge_entries_per_thread=int(geometry["epl"]),
-        pool_stride=int(geometry["pool_stride"]),
-        e_row_max=int(geometry["E_row_max"]),
-    )
 
 
-# ---------------------------------------------------------------------------
-# Buffers
-# ---------------------------------------------------------------------------
+def _world(world_size: int, rank: int) -> None:
+    if world_size not in SUPPORTED_WORLD_SIZES or not 0 <= rank < world_size:
+        raise ValueError(
+            f"world_size must be 2 or 4 and 0 <= rank < world_size; got {world_size}, {rank}"
+        )
 
 
-def allocate_pool(
-    total_tokens: int, pool_stride: int, device: torch.device
-) -> dict[str, Any]:
-    """Candidate pool between the two programs: int32 ``[T * 4, pool_stride, 2]``
-    (sortable key bits, global block id) pairs padded with the pad pair, plus
-    ``row_meta`` int32 ``[T * 4]`` (each row's entry extent, written by the
-    scorer).  Entries at or beyond a row's extent are never read, so the pool
-    is never cleared between steps."""
-    pool = torch.empty(
-        (int(total_tokens) * NUM_HEADS, int(pool_stride), 2),
-        dtype=torch.int32,
-        device=device,
-    )
-    pool[..., 0] = int(_policy("pad_key"))
-    pool[..., 1] = int(_policy("pad_id"))
-    return dict(
-        pool=pool,
-        row_meta=torch.zeros(
-            (int(total_tokens) * NUM_HEADS,), dtype=torch.int32, device=device
-        ),
-        pool_stride=int(pool_stride),
-    )
+def _query(name: str, q: torch.Tensor) -> None:
+    if (
+        q.dtype != _FP8
+        or q.ndim != 3
+        or q.shape[2] != HEAD_DIM
+        or not q.is_contiguous()
+    ):
+        raise ValueError(
+            f"{name} must be a contiguous float8_e4m3fn [T, H, 128] tensor"
+        )
+    _heads(q.shape[1])
 
 
-def allocate_candidates(total_tokens: int, device: torch.device) -> torch.Tensor:
-    """Rank-local merged lists: fp32 ``[T, 4, 16, 2]`` = (score, int32 id bits), best first, (-inf, -1) padded."""
-    return torch.empty(
-        (int(total_tokens), NUM_HEADS, TOPK, 2), dtype=torch.float32, device=device
-    )
+def _index_k(name: str, k: torch.Tensor, world_size: int, page_size: int) -> int:
+    """The rank's K shard ``[pages, P / W, 128]``; returns the local rows per page.
 
-
-def allocate_out(
-    total_tokens: int, world_size: int, device: torch.device
-) -> torch.Tensor:
-    """Owner output: int32 ``[T, 4 // world_size, 16]`` merged global block ids ascending, -1 tail."""
-    return torch.full(
-        (int(total_tokens), NUM_HEADS // int(world_size), TOPK),
-        OUT_POISON,
-        dtype=torch.int32,
-        device=device,
-    )
-
-
-# ---------------------------------------------------------------------------
-# Runner
-# ---------------------------------------------------------------------------
-
-
-def _bind(
-    program: str,
-    arch: str,
-    role: str,
-    values: dict[str, Any],
-    grid: tuple[int, int, int],
-):
-    """Order ``values`` by the role's generated argument plan and load the program."""
-    grid_values = dict(zip(("grid_x", "grid_y", "grid_z"), grid, strict=True))
-    arguments = []
-    for kind, name in ARG_PLANS[role]:
-        if kind == "grid":
-            arguments.append(int(grid_values[name]))
-        elif name in values:
-            arguments.append(values[name])
-        else:
-            raise ValueError(
-                f"the {role} program's argument plan names {name!r}, which this backend does not bind"
-            )
-    module = load_program(program, arch)
-    return module.run, tuple(arguments)
-
-
-@dataclass
-class MSAIcpIndexerRunner:
-    """Launch one prepared decode step of the ICP indexer chain on this rank.
-
-    ``launch()`` submits the fused scorer and the exchange merge on the
-    current stream with no allocation and no host synchronization and returns
-    ``out``.  Every tensor is read on device at each launch, so the same
-    runner (or a CUDA Graph capturing it) stays valid when the caller writes
-    new queries, keys, page ids or lengths into the bound buffers; the
-    workspace generation words advance per launch and keep the peers in step.
-    Prepare a new runner when shapes, dtypes, bindings or the workspace change.
-
-    After a step completes, read ``workspace.status_value()`` (outside any
-    capture); a non-zero status is fatal for the step: 1 = NaN among the
-    ordinary candidate scores, 2 = a row's list layout exceeded the pool
-    stride, 4 = the merge's refine loop made no progress (a pool this scorer
-    did not write), 8 = a poll passed ``timeout_us`` (the missing peer words
-    merged as absent), 16 = ``n_ordinary == 16`` together with a forced block.
-    Reset the workspace before reusing it after a non-zero status.
+    Rows are dense (``stride(2) == 1``, ``stride(1) == 128``); the page pitch
+    ``stride(0)`` may exceed the page, in multiples of 16 bytes.
     """
-
-    plan: ChainPlan
-    workspace: MSAIcpIndexerWorkspace
-    out: torch.Tensor
-    candidates: torch.Tensor
-    pool: dict[str, Any]
-    status: torch.Tensor
-    scorer_entry: Callable[..., Any]
-    scorer_arguments: tuple
-    merge_entry: Callable[..., Any]
-    merge_arguments: dict[int, tuple]
-    retained: tuple
-
-    def launch_scorer(self) -> None:
-        with tvm_ffi.use_torch_stream():
-            self.scorer_entry(*self.scorer_arguments)
-
-    def launch_merge(self, phase: int = PHASE_PUSH_POLL) -> None:
-        """The exchange merge; ``phase`` 1 / 2 are the serialised push / poll halves of the emulation."""
-        with tvm_ffi.use_torch_stream():
-            self.merge_entry(*self.merge_arguments[int(phase)])
-
-    def launch(self) -> torch.Tensor:
-        self.launch_scorer()
-        self.launch_merge(PHASE_PUSH_POLL)
-        return self.out
-
-    __call__ = launch
-
-    @property
-    def scorer_grid(self) -> tuple[int, int, int]:
-        return (self.plan.batch, self.plan.split_count, 1)
-
-    @property
-    def merge_grid(self) -> tuple[int, int, int]:
-        return (int(self.out.shape[0]) * NUM_HEADS, 1, 1)
+    rows = page_size // world_size
+    if (
+        k.dtype != _FP8
+        or k.ndim != 3
+        or k.shape[1] != rows
+        or k.shape[2] != HEAD_DIM
+        or k.stride(2) != 1
+        or k.stride(1) != HEAD_DIM
+        or k.stride(0) < rows * HEAD_DIM
+        or k.stride(0) % 16
+        or k.data_ptr() % 16
+    ):
+        raise ValueError(
+            f"{name} must be a float8_e4m3fn [pages, {rows}, 128] view with dense rows, "
+            "a 16-byte aligned base and a page pitch that is a multiple of 16 bytes"
+        )
+    return rows
 
 
-# ---------------------------------------------------------------------------
-# Validation and preparation
-# ---------------------------------------------------------------------------
-
-
-def _check(
-    tensor: torch.Tensor,
+def _score_rows(
     name: str,
-    dtype: torch.dtype,
-    shape: tuple[int, ...],
-    *,
-    contiguous: bool = True,
-):
-    if not isinstance(tensor, torch.Tensor):
-        raise ValueError(f"{name} must be a tensor")
-    if tensor.dtype != dtype:
-        raise ValueError(f"{name} must be {dtype}, got {tensor.dtype}")
-    if tuple(tensor.shape) != tuple(shape):
+    s: torch.Tensor,
+    tokens: int,
+    heads: int,
+    min_cols: int,
+    max_cols: Optional[int] = None,
+) -> int:
+    """FP32 ``[T, H, K]`` rows with ``stride(2) == 1`` and non-overlapping
+    rows; returns ``K``."""
+    if (
+        s.dtype != torch.float32
+        or s.ndim != 3
+        or s.shape[0] != tokens
+        or s.shape[1] != heads
+        or s.stride(2) != 1
+        or s.stride(1) < s.shape[2]
+        or s.stride(0) < heads * s.stride(1)
+    ):
         raise ValueError(
-            f"{name} must have shape {tuple(shape)}, got {tuple(tensor.shape)}"
+            f"{name} must be float32 [{tokens}, {heads}, K] with unit last stride and "
+            "non-overlapping rows"
         )
-    if contiguous and not tensor.is_contiguous():
-        raise ValueError(f"{name} must be contiguous")
+    cols = s.shape[2]
+    if cols < max(1, min_cols) or (max_cols is not None and cols >= max_cols):
+        bound = f" and below {max_cols}" if max_cols is not None else ""
+        raise ValueError(
+            f"{name} has {cols} columns; it needs at least {max(1, min_cols)}{bound}"
+        )
+    return cols
 
 
-def validate_msa_icp_indexer_inputs(
-    index_q: torch.Tensor,
-    index_k: torch.Tensor,
-    block_table: torch.Tensor,
-    query_start_loc: torch.Tensor,
-    seq_lens: torch.Tensor,
-    positions: torch.Tensor,
-    active_rows: torch.Tensor,
-    forced_column: torch.Tensor,
-    forced_block: torch.Tensor,
-    n_ordinary: torch.Tensor,
-    *,
-    workspace: MSAIcpIndexerWorkspace,
-    query_len: int,
-    out: Optional[torch.Tensor],
-    candidates: Optional[torch.Tensor],
+def _block_table(bt: torch.Tensor, batch: int, min_cols: int) -> None:
+    if (
+        bt.dtype != torch.int32
+        or bt.ndim != 2
+        or bt.shape[0] != batch
+        or bt.shape[1] < min_cols
+        or bt.stride(1) != 1
+    ):
+        raise ValueError(
+            f"block_table must be int32 [{batch}, >= {min_cols}] with unit last stride"
+        )
+
+
+def _forced(force_begin_blocks: int, force_end_blocks: int) -> None:
+    if (
+        force_begin_blocks < 0
+        or force_end_blocks < 0
+        or force_begin_blocks + force_end_blocks > TOPK
+    ):
+        raise ValueError(
+            "forced begin/end blocks must be non-negative with a sum of at most 16"
+        )
+
+
+def _index_map(index_scale: int, index_offset: int) -> None:
+    if index_scale not in (1, 2) or not 0 <= index_offset < index_scale:
+        raise ValueError(
+            "index_scale must be 1 or 2 and 0 <= index_offset < index_scale"
+        )
+
+
+def _spin(spin_limit: int) -> None:
+    if not 0 < spin_limit <= _INT32_MAX:
+        raise ValueError("spin_limit must be in (0, 2**31 - 1]")
+
+
+def _errors(errors: torch.Tensor) -> None:
+    if (
+        errors.dtype != torch.int32
+        or errors.ndim != 1
+        or errors.numel() < 1
+        or not errors.is_contiguous()
+    ):
+        raise ValueError(
+            "errors must be a contiguous int32 tensor of at least one element"
+        )
+
+
+def index_layout(page_size: int, world_size: int, rank: int) -> tuple[int, int]:
+    """``(index_scale, index_offset)`` mapping a local score column to its
+    global B128 id: ``(1, 0)`` for P128, ``(2, rank * 2 // world_size)`` for P256."""
+    if page_size == 256:
+        return 2, rank * 2 // world_size
+    return 1, 0
+
+
+# --------------------------------------------------------------------------- sizing (host only)
+
+
+def index_score_plan_storage(
+    *, num_qo_heads: int, total_q: int, batch: int, device: torch.device
 ) -> dict[str, int]:
-    """Check dtypes, shapes and strides against the kernels' contract from metadata alone.
+    """Element counts of a prefill plan's caller-owned storage: int64
+    ``packed_work_range`` (one per SM), int64 ``packed_work_info`` and the uint8
+    ``workspace`` bytes."""
+    if num_qo_heads < 1 or total_q < 1 or batch < 1:
+        raise ValueError("num_qo_heads, total_q and batch must be positive")
+    index = torch.device(device).index
+    return {
+        "work_range_numel": cake_jit.sm_count(
+            torch.cuda.current_device() if index is None else index
+        ),
+        "work_info_numel": ((total_q + 127) // 128 + batch - 1) * num_qo_heads,
+        "workspace_bytes": PLAN_WORKSPACE_BYTES,
+    }
 
-    Returns ``total_tokens``, ``request_count``, ``rows_per_rank``,
-    ``page_size``, ``num_pages`` and ``block_table_columns``.  Device
-    placement is checked by :func:`prepare_msa_icp_indexer`.  The device
-    contents the kernels rely on -- ``query_start_loc[0] == 0``,
-    ``query_start_loc[-1] == total_tokens``, every request of at most
-    ``query_len`` tokens, page ids inside ``index_k``, ``n_ordinary <= 15``
-    whenever ``forced_block >= 0`` -- are the caller's contract and are not
-    read here.
 
-    One launch covers the whole batch: tokens ``0 .. total_tokens - 1`` of
-    ``index_q`` are the launch window, every per-token tensor is indexed by
-    that token, and the window occupies rows ``0 .. total_tokens - 1`` of the
-    workspace (``total_tokens <= tokens_cap``).  The kernels' ``token_begin``
-    argument is bound as 0.
+def index_score_columns(max_seq_len: int, page_size: int) -> int:
+    """Score columns of a prefill row: ``ceil(max_seq_len / 128)`` B128 blocks
+    for P128, half of that (rounded up, one column per local page) for the
+    compact P256 rows."""
+    if page_size not in SUPPORTED_PAGE_SIZES or max_seq_len < 1:
+        raise ValueError("page_size must be 128 or 256 and max_seq_len positive")
+    blocks = (max_seq_len + 127) // 128
+    return (blocks + 1) // 2 if page_size == 256 else blocks
+
+
+def decode_score_columns(max_model_len: int, page_size: int) -> int:
+    """Score columns of a decode row: ``min(8192, ceil(L / (4 P)) * 4)``."""
+    if page_size not in SUPPORTED_PAGE_SIZES or max_model_len < 1:
+        raise ValueError("page_size must be 128 or 256 and max_model_len positive")
+    return min(MAX_BLOCKS, (max_model_len + 4 * page_size - 1) // (4 * page_size) * 4)
+
+
+def decode_pool_bytes(
+    *, max_decode_tokens: int, num_heads: int = NUM_INDEX_HEADS
+) -> int:
+    """Bytes of the fused decode path's candidate pool: one sorted 16-entry
+    list of 64-bit keys per (token, head, split) for up to 128 splits."""
+    if max_decode_tokens < 1:
+        raise ValueError("max_decode_tokens must be positive")
+    _heads(num_heads)
+    return max_decode_tokens * num_heads * cake_jit.MAX_DECODE_SPLITS * TOPK * 8
+
+
+def comm_layout(world_size: int, heads_per_rank: int, capacity: int) -> dict[str, Any]:
+    """Layout of the caller's decode receive storage (one symmetric int32
+    allocation per rank, zeroed once and never reset).
+
+    ``storage_words`` int32 words hold the legacy rows (int32
+    ``legacy_shape = [3, W, hpr, capacity, 33]`` at byte offset 0) followed by
+    the tagged rows (int64 ``tagged_shape = [3, W, hpr, capacity, 32]`` at
+    ``tagged_offset_bytes``).  A rank's ``recv_bases`` entry ``p`` is peer
+    ``p``'s storage address (plus ``tagged_offset_bytes`` for tagged mode).
+    ``generations_shape`` / ``expected_shape`` are the int32 publish and merge
+    counters (zeroed together with the storage on every rank).  Tagged mode
+    requires consecutive uses of one slot set to be at least two sparse layers
+    apart, including across steps; legacy mode has no distance requirement.
     """
-    query_len = int(query_len)
-    if not 1 <= query_len <= MAX_QUERY_LEN:
-        raise ValueError(f"query_len must be in [1, {MAX_QUERY_LEN}], got {query_len}")
-    if not isinstance(workspace, MSAIcpIndexerWorkspace):
-        raise ValueError("workspace must be an MSAIcpIndexerWorkspace")
-    if getattr(workspace, "destroyed", False):
-        raise ValueError("the workspace has been destroyed")
-    world_size = int(workspace.world_size)
-    if world_size not in WORLD_SIZES:
-        raise ValueError(
-            f"the ICP indexer chain runs on a world of {WORLD_SIZES} ranks, got {world_size}"
-        )
+    _world(world_size, 0)
+    if heads_per_rank < 1 or capacity < 1:
+        raise ValueError("heads_per_rank and capacity must be positive")
+    rows = NUM_SLOT_SETS * world_size * heads_per_rank * capacity
+    legacy_words = rows * ROW_WORDS
+    tagged_offset_bytes = legacy_words * 4
+    if tagged_offset_bytes % 8:
+        raise ValueError("the tagged rows would not be 8-byte aligned")
+    return {
+        "storage_words": legacy_words + rows * 2 * TAGGED_WORDS,
+        "legacy_offset_bytes": 0,
+        "tagged_offset_bytes": tagged_offset_bytes,
+        "legacy_shape": (
+            NUM_SLOT_SETS,
+            world_size,
+            heads_per_rank,
+            capacity,
+            ROW_WORDS,
+        ),
+        "tagged_shape": (
+            NUM_SLOT_SETS,
+            world_size,
+            heads_per_rank,
+            capacity,
+            TAGGED_WORDS,
+        ),
+        "generations_shape": (NUM_SLOT_SETS, world_size * heads_per_rank, capacity),
+        "expected_shape": (NUM_SLOT_SETS, heads_per_rank, capacity),
+    }
+
+
+def decode_splits(
+    name: str, batch: int, device_index: int, cap: int = cake_jit.MAX_DECODE_SPLITS
+) -> int:
+    """Splits per decode request: one wave of the scorer
+    (``num_sms * ctas_per_sm // batch``), at least 1 and at most ``cap``
+    (128 for the score plane, :data:`cake_jit.TOPK16_SPLIT_CAP` of the
+    architecture for the fused path's lists).  Host metadata only."""
+    resident = cake_jit.sm_count(device_index) * cake_jit.ctas_per_sm(name)
+    return max(1, min(cap, cake_jit.MAX_DECODE_SPLITS, resident // max(batch, 1)))
+
+
+# The split rule of the score plane on sm_103a at 32 local K rows per page
+# (P128 at world 4), whose record runs four CTAs per SM: from
+# ``PLANE_R32_LARGE_BATCH`` requests on, a request takes at most
+# ``PLANE_R32_LARGE_BATCH_SPLITS`` splits.  One wave there is 38-43 splits at
+# batch 14-16; the measured end-to-end decode step (world 4, P128, GB300) is
+# faster at 32 splits than at one wave.
+# Below that batch, and on every other layout and architecture, the plane
+# takes one wave (:func:`decode_splits`).  The plane's scores do not depend on
+# the split count.
+PLANE_R32_ARCH = "sm_103a"
+PLANE_R32_LARGE_BATCH = 14
+PLANE_R32_LARGE_BATCH_SPLITS = 32
+
+
+def plane_splits(name: str, rows: int, arch: str, batch: int, device_index: int) -> int:
+    """Splits per request of the score plane record ``name`` (built for
+    ``rows`` local K rows per page on ``arch``): one wave
+    (:func:`decode_splits`), at most ``PLANE_R32_LARGE_BATCH_SPLITS`` for the
+    rows 32 plane on ``PLANE_R32_ARCH`` at ``PLANE_R32_LARGE_BATCH`` or more
+    requests.  A function of the record, the architecture, the batch and the
+    device's SM count only (host metadata: no device read, no environment)."""
+    splits = decode_splits(name, batch, device_index)
+    if arch == PLANE_R32_ARCH and rows == 32 and batch >= PLANE_R32_LARGE_BATCH:
+        splits = min(splits, PLANE_R32_LARGE_BATCH_SPLITS)
+    return splits
+
+
+# --------------------------------------------------------------------------- prefill
+
+
+def index_score_sharded_plan_device(
+    qo_segment_lens: torch.Tensor,
+    kv_segment_lens: torch.Tensor,
+    qo_segment_offsets: torch.Tensor,
+    kv_segment_offsets: torch.Tensor,
+    qo_offset: torch.Tensor,
+    num_qo_heads: int,
+    *,
+    total_q: int,
+    max_query_len: int,
+    max_seq_len: int,
+    packed_work_range: torch.Tensor,
+    packed_work_info: torch.Tensor,
+    workspace: torch.Tensor,
+) -> MSAIcpScorePlan:
+    batch = qo_segment_lens.numel()
+    dev = _device_index(qo_segment_lens)
+    device = qo_segment_lens.device
+    for name, t, size in (
+        ("qo_segment_lens", qo_segment_lens, batch),
+        ("kv_segment_lens", kv_segment_lens, batch),
+        ("qo_segment_offsets", qo_segment_offsets, batch + 1),
+        ("kv_segment_offsets", kv_segment_offsets, batch + 1),
+        ("qo_offset", qo_offset, batch),
+    ):
+        _vector(name, t, torch.int32, size)
+    if batch < 1 or total_q < 1 or not 0 < max_query_len <= total_q or max_seq_len < 1:
+        raise ValueError("invalid query/sequence bounds")
+    _heads(num_qo_heads)
+    storage = index_score_plan_storage(
+        num_qo_heads=num_qo_heads, total_q=total_q, batch=batch, device=device
+    )
+    _vector(
+        "packed_work_range", packed_work_range, torch.int64, storage["work_range_numel"]
+    )
     if (
-        not isinstance(index_q, torch.Tensor)
-        or index_q.dtype != torch.float8_e4m3fn
-        or index_q.ndim != 3
+        packed_work_info.dtype != torch.int64
+        or packed_work_info.ndim != 1
+        or not packed_work_info.is_contiguous()
+        or packed_work_info.numel() < storage["work_info_numel"]
     ):
         raise ValueError(
-            f"index_q must be float8_e4m3fn [total_tokens, {NUM_HEADS}, {HEAD_DIM}]"
+            f"packed_work_info must be contiguous int64 with at least "
+            f"{storage['work_info_numel']} elements"
         )
-    total_tokens = int(index_q.shape[0])
-    if tuple(index_q.shape[1:]) != (NUM_HEADS, HEAD_DIM) or not index_q.is_contiguous():
-        raise ValueError(
-            f"index_q must be contiguous float8_e4m3fn [total_tokens, {NUM_HEADS}, {HEAD_DIM}]"
-        )
-    if total_tokens < 1 or total_tokens % query_len:
-        raise ValueError(
-            "index_q rows must be request_count * query_len with a positive request_count"
-        )
-    request_count = total_tokens // query_len
     if (
-        not isinstance(index_k, torch.Tensor)
-        or index_k.dtype != torch.float8_e4m3fn
-        or index_k.ndim != 3
+        workspace.dtype != torch.uint8
+        or not workspace.is_contiguous()
+        or workspace.numel() < PLAN_WORKSPACE_BYTES
     ):
         raise ValueError(
-            f"index_k must be a float8_e4m3fn [num_pages, rows_per_rank, {HEAD_DIM}] view"
+            "workspace must be a contiguous uint8 tensor of at least 32 MiB"
         )
-    num_pages, rows_per_rank = int(index_k.shape[0]), int(index_k.shape[1])
-    if int(index_k.shape[2]) != HEAD_DIM:
-        raise ValueError(f"index_k rows must hold {HEAD_DIM} FP8 values")
-    strides = tuple(int(s) for s in index_k.stride())
-    if strides[2] != 1 or strides[1] != HEAD_DIM:
-        raise ValueError(
-            f"index_k must hold each page's {rows_per_rank} x {HEAD_DIM} bytes contiguously (strides {strides})"
-        )
-    if strides[0] < rows_per_rank * HEAD_DIM or strides[0] % TMA_ALIGN:
-        raise ValueError(
-            f"index_k page pitch must be a multiple of {TMA_ALIGN} bytes covering the fragment, got {strides[0]}"
-        )
-    if index_k.data_ptr() % TMA_ALIGN:
-        raise ValueError(f"index_k must start at a {TMA_ALIGN}-byte aligned address")
-    page_size = rows_per_rank * world_size
-    if page_size not in PAGE_SIZES:
-        raise ValueError(
-            f"rows_per_rank {rows_per_rank} x world_size {world_size} is not an admitted page size {PAGE_SIZES}"
-        )
-    if page_size == 256 and world_size != 2:
-        raise ValueError("256-token pages are admitted for a world of 2 ranks only")
-    if (
-        not isinstance(block_table, torch.Tensor)
-        or block_table.dtype != torch.int32
-        or block_table.ndim != 2
+    _same_device(
+        device,
+        kv_segment_lens=kv_segment_lens,
+        qo_segment_offsets=qo_segment_offsets,
+        kv_segment_offsets=kv_segment_offsets,
+        qo_offset=qo_offset,
+        packed_work_range=packed_work_range,
+        packed_work_info=packed_work_info,
+        workspace=workspace,
+    )
+    arch = cake_jit.device_arch(dev)
+    plan = MSAIcpScorePlan(
+        qo_segment_lens=qo_segment_lens,
+        kv_segment_lens=kv_segment_lens,
+        qo_segment_offsets=qo_segment_offsets,
+        kv_segment_offsets=kv_segment_offsets,
+        qo_offset=qo_offset,
+        packed_work_range=packed_work_range,
+        packed_work_info=packed_work_info,
+        workspace=workspace,
+        total_q=int(total_q),
+        num_qo_heads=int(num_qo_heads),
+        batch=batch,
+        max_query_len=int(max_query_len),
+        columns=(int(max_seq_len) + 127) // 128,
+    )
+    name = cake_jit.route("plan", None, arch)
+    cake_jit.run_module(
+        name,
+        {
+            "qo_lens": qo_segment_lens,
+            "kv_lens": kv_segment_lens,
+            "qo_indptr": qo_segment_offsets,
+            "kv_indptr": kv_segment_offsets,
+            "qo_offset": qo_offset,
+            "work_range": packed_work_range,
+            "work_info": packed_work_info,
+            "batch": batch,
+            "num_heads": plan.num_qo_heads,
+            "num_ctas": packed_work_range.numel(),
+            "total_q": plan.total_q,
+            "columns": plan.columns,
+        },
+        grid=cake_jit.launch_grid(name),
+        arch=arch,
+    )
+    return plan
+
+
+def index_score_sharded_plan(
+    qo_segment_lens: torch.Tensor,
+    kv_segment_lens: torch.Tensor,
+    num_qo_heads: int,
+    *,
+    qo_offset: torch.Tensor,
+    device: Optional[torch.device] = None,
+) -> MSAIcpScorePlan:
+    """Eager host plan: reads the CPU segment lengths, allocates the plan
+    storage on ``device`` and runs the device plan (not for CUDA Graphs)."""
+    lens = [qo_segment_lens, kv_segment_lens, qo_offset]
+    if any(
+        t.device.type != "cpu" or t.dtype != torch.int32 or t.ndim != 1 for t in lens
     ):
-        raise ValueError("block_table must be int32 [request_count, columns]")
-    if int(block_table.shape[0]) != request_count or not block_table.is_contiguous():
-        raise ValueError(
-            f"block_table must be contiguous int32 [{request_count}, columns]"
-        )
-    columns = int(block_table.shape[1])
-    if columns < 1:
-        raise ValueError("block_table must hold at least one column")
-    if columns * 2 >= TRANSPORT_ID_LIMIT:
-        raise ValueError(
-            "the transport word holds 20-bit block ids: the block table admits ids beyond that range"
-        )
-    _check(query_start_loc, "query_start_loc", torch.int32, (request_count + 1,))
-    _check(seq_lens, "seq_lens", torch.int32, (request_count,))
-    _check(positions, "positions", torch.int64, (total_tokens,))
-    _check(active_rows, "active_rows", torch.uint8, (total_tokens,))
-    _check(forced_column, "forced_column", torch.int32, (total_tokens,))
-    _check(forced_block, "forced_block", torch.int32, (total_tokens,))
-    _check(n_ordinary, "n_ordinary", torch.int32, (total_tokens,))
-    if total_tokens > int(workspace.tokens_cap):
-        raise ValueError(
-            f"{total_tokens} tokens exceed the workspace capacity of {workspace.tokens_cap} tokens"
-        )
-    if int(workspace.stamp_rows) < total_tokens * NUM_HEADS:
-        raise ValueError("the workspace stamps fewer rows than the merge launch writes")
-    heads_local = NUM_HEADS // world_size
-    if out is not None:
-        _check(out, "out", torch.int32, (total_tokens, heads_local, TOPK))
-    if candidates is not None:
-        _check(
-            candidates, "candidates", torch.float32, (total_tokens, NUM_HEADS, TOPK, 2)
-        )
-    return dict(
-        total_tokens=total_tokens,
-        request_count=request_count,
-        rows_per_rank=rows_per_rank,
-        page_size=page_size,
-        num_pages=num_pages,
-        block_table_columns=columns,
-        world_size=world_size,
+        raise ValueError("host plan segment metadata must be 1-D int32 CPU tensors")
+    batch = qo_segment_lens.numel()
+    if batch < 1 or kv_segment_lens.numel() != batch or qo_offset.numel() != batch:
+        raise ValueError("segment metadata must have one entry per segment")
+    device = (
+        torch.device("cuda", torch.cuda.current_device())
+        if device is None
+        else torch.device(device)
+    )
+    zero = torch.zeros(1, dtype=torch.int32)
+    qo_indptr = torch.cat([zero, torch.cumsum(qo_segment_lens, 0, dtype=torch.int32)])
+    kv_indptr = torch.cat([zero, torch.cumsum(kv_segment_lens, 0, dtype=torch.int32)])
+    total_q = int(qo_indptr[-1])
+    storage = index_score_plan_storage(
+        num_qo_heads=num_qo_heads, total_q=max(total_q, 1), batch=batch, device=device
+    )
+    to = dict(device=device)
+    return index_score_sharded_plan_device(
+        qo_segment_lens.to(**to),
+        kv_segment_lens.to(**to),
+        qo_indptr.to(**to),
+        kv_indptr.to(**to),
+        qo_offset.to(**to),
+        num_qo_heads,
+        total_q=max(total_q, 1),
+        max_query_len=max(int(qo_segment_lens.max()), 1),
+        max_seq_len=max(int(kv_segment_lens.max()), 1),
+        packed_work_range=torch.empty(
+            storage["work_range_numel"], dtype=torch.int64, **to
+        ),
+        packed_work_info=torch.empty(
+            storage["work_info_numel"], dtype=torch.int64, **to
+        ),
+        workspace=torch.empty(storage["workspace_bytes"], dtype=torch.uint8, **to),
     )
 
 
-def prepare_msa_icp_indexer(
+def index_score_sharded(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    block_table: torch.Tensor,
+    plan: MSAIcpScorePlan,
+    *,
+    rank: int,
+    max_score: torch.Tensor,
+    sm_scale: float = 1.0,
+    initialize: bool = True,
+    tp: int = 2,
+    compact: bool = False,
+    enable_pdl: bool = False,
+) -> None:
+    _world(tp, rank)
+    _query("q", q)
+    if not isinstance(plan, MSAIcpScorePlan):
+        raise ValueError(
+            "plan must come from msa_icp_index_score_sharded_plan[_device]"
+        )
+    if plan.total_q != q.shape[0] or plan.num_qo_heads != q.shape[1]:
+        raise ValueError("q does not match the plan's total_q / num_qo_heads")
+    if not math.isfinite(sm_scale):
+        raise ValueError("sm_scale must be finite (scores are raw maxima)")
+    page_size = k.shape[1] * tp if k.ndim == 3 else 0
+    if page_size not in SUPPORTED_PAGE_SIZES:
+        raise ValueError("k must hold 128 / tp or 256 / tp rows per page")
+    rows = _index_k("k", k, tp, page_size)
+    blocks_per_page = page_size // 128
+    if compact and blocks_per_page != 2:
+        raise ValueError("compact scores require P256 shards")
+    cols = (plan.columns + 1) // 2 if compact else plan.columns
+    t, h = q.shape[0], q.shape[1]
+    k_cols = _score_rows("max_score", max_score, t, h, cols)
+    _block_table(
+        block_table, plan.batch, (plan.columns + blocks_per_page - 1) // blocks_per_page
+    )
+    dev = _device_index(q)
+    _same_device(
+        q.device,
+        k=k,
+        block_table=block_table,
+        max_score=max_score,
+        work_range=plan.packed_work_range,
+    )
+    arch = cake_jit.device_arch(dev)
+    if initialize:
+        max_score.fill_(float("-inf"))
+    index_scale, index_offset = index_layout(page_size, tp, rank) if compact else (1, 0)
+    name = cake_jit.route("score", rows, arch, page=page_size)
+    cake_jit.run_module(
+        name,
+        {
+            # The TMA descriptors read FP8 bytes.
+            "q": q.view(torch.uint8),
+            "k": k.view(torch.uint8),
+            "block_table": block_table,
+            "qo_lens": plan.qo_segment_lens,
+            "kv_lens": plan.kv_segment_lens,
+            "qo_indptr": plan.qo_segment_offsets,
+            "kv_indptr": plan.kv_segment_offsets,
+            "qo_offset": plan.qo_offset,
+            "work_range": plan.packed_work_range,
+            "work_info": plan.packed_work_info,
+            "max_score": max_score,
+            "batch": plan.batch,
+            "total_q": t,
+            "num_tokens": t,
+            "num_heads": h,
+            "num_ctas": plan.packed_work_range.numel(),
+            "columns": plan.columns,
+            "score_cols": k_cols,
+            "rank": rank,
+            "world": tp,
+            "page_size": page_size,
+            "compact": int(compact),
+            "index_scale": index_scale,
+            "index_offset": index_offset,
+            "bt_stride": block_table.stride(0),
+            "score_stride_t": max_score.stride(0),
+            "score_stride_h": max_score.stride(1),
+        },
+        grid=cake_jit.launch_grid(name, sm_count=plan.packed_work_range.numel()),
+        arch=arch,
+        enable_pdl=enable_pdl,
+    )
+
+
+def topk_select_prefill(
+    scores: torch.Tensor,
+    num_valid_pages: torch.Tensor,
+    carrier: torch.Tensor,
+    *,
+    force_begin_blocks: int = 0,
+    force_end_blocks: int = 0,
+    index_scale: int = 1,
+    index_offset: int = 0,
+) -> None:
+    if scores.ndim != 3:
+        raise ValueError("scores must be float32 [T, H, K]")
+    t, h = scores.shape[0], scores.shape[1]
+    _heads(h)
+    k_cols = _score_rows("scores", scores, t, h, 1, MAX_SELECT_COLUMNS)
+    _vector("num_valid_pages", num_valid_pages, torch.int32, t)
+    if (
+        carrier.dtype != torch.int32
+        or carrier.ndim != 3
+        or tuple(carrier.shape) != (h, t, ROW_WORDS)
+        or carrier.stride(2) != 1
+        or carrier.stride(1) < ROW_WORDS
+        or carrier.stride(0) < t * carrier.stride(1)
+    ):
+        raise ValueError(
+            f"carrier must be int32 [{h}, {t}, 33] with unit last stride and non-overlapping rows"
+        )
+    _forced(force_begin_blocks, force_end_blocks)
+    _index_map(index_scale, index_offset)
+    dev = _device_index(scores)
+    _same_device(scores.device, num_valid_pages=num_valid_pages, carrier=carrier)
+    if t == 0:
+        return
+    arch = cake_jit.device_arch(dev)
+    name = cake_jit.route("select_prefill", None, arch)
+    cake_jit.run_module(
+        name,
+        {
+            "scores": scores,
+            "num_valid_pages": num_valid_pages,
+            "carrier": carrier,
+            "num_tokens": t,
+            "total_q": t,
+            "num_heads": h,
+            "score_cols": k_cols,
+            "score_stride_t": scores.stride(0),
+            "score_stride_h": scores.stride(1),
+            "carrier_stride_h": carrier.stride(0),
+            "carrier_stride_t": carrier.stride(1),
+            "force_begin": force_begin_blocks,
+            "force_end": force_end_blocks,
+            "index_scale": index_scale,
+            "index_offset": index_offset,
+        },
+        grid=cake_jit.launch_grid(name, tokens=t, heads=h),
+        arch=arch,
+    )
+
+
+# --------------------------------------------------------------------------- decode
+
+
+def decode_index_score_sharded(
     index_q: torch.Tensor,
     index_k: torch.Tensor,
     block_table: torch.Tensor,
-    query_start_loc: torch.Tensor,
     seq_lens: torch.Tensor,
-    positions: torch.Tensor,
-    active_rows: torch.Tensor,
-    forced_column: torch.Tensor,
-    forced_block: torch.Tensor,
-    n_ordinary: torch.Tensor,
+    score_out: torch.Tensor,
     *,
-    workspace: MSAIcpIndexerWorkspace,
-    query_len: int,
-    out: Optional[torch.Tensor] = None,
-    candidates: Optional[torch.Tensor] = None,
-    timeout_us: float = DEFAULT_TIMEOUT_US,
-    backend: str = "cake",
-) -> MSAIcpIndexerRunner:
-    """Validate and bind one decode step of the ICP indexer chain on this rank.
-
-    The only allocations are the candidate pool between the two programs,
-    the two small scratch words and the optional ``out`` / ``candidates``
-    outputs when the caller does not pass them; the returned runner launches
-    with none.  The split count follows the device's SM count and the
-    scorer's resident CTAs per SM; the merge geometry follows the block
-    table's column count (every request the buffers admit).  The generated
-    programs for the index geometry and the resulting merge geometry must be
-    registered in this checkout (``NotImplementedError`` otherwise).  One
-    launch covers all ``total_tokens`` tokens of ``index_q`` (the kernels'
-    launch window starts at token 0).
-    """
-    if backend != "cake":
-        raise ValueError("the ICP indexer chain supports backend='cake'")
-    meta = validate_msa_icp_indexer_inputs(
-        index_q,
-        index_k,
-        block_table,
-        query_start_loc,
-        seq_lens,
-        positions,
-        active_rows,
-        forced_column,
-        forced_block,
-        n_ordinary,
-        workspace=workspace,
-        query_len=query_len,
-        out=out,
-        candidates=candidates,
-    )
-    device = index_q.device
-    tensors = [
-        index_q,
-        index_k,
-        block_table,
-        query_start_loc,
-        seq_lens,
-        positions,
-        active_rows,
-        forced_column,
-        forced_block,
-        n_ordinary,
-    ]
-    tensors += [t for t in (out, candidates) if t is not None]
-    if not all(t.is_cuda and t.device == device for t in tensors):
-        raise ValueError("Expected all tensors on one CUDA device")
-    if workspace.device != device:
+    rank: int,
+    world_size: int,
+    page_size: int,
+    decode_query_len: int,
+    max_decode_query_len: int,
+    enable_pdl: bool = False,
+) -> None:
+    _world(world_size, rank)
+    if page_size not in SUPPORTED_PAGE_SIZES:
+        raise ValueError("page_size must be 128 or 256")
+    _query("index_q", index_q)
+    rows = _index_k("index_k", index_k, world_size, page_size)
+    t, h = index_q.shape[0], index_q.shape[1]
+    batch = block_table.shape[0] if block_table.ndim == 2 else -1
+    _block_table(block_table, batch, 1)
+    _vector("seq_lens", seq_lens, torch.int32, batch)
+    if (
+        not 1 <= decode_query_len <= max_decode_query_len
+        or h * max_decode_query_len > MAX_DECODE_ROWS
+    ):
         raise ValueError(
-            f"the workspace lives on {workspace.device}, the tensors on {device}"
+            "need 1 <= decode_query_len <= max_decode_query_len and "
+            f"num_heads * max_decode_query_len <= {MAX_DECODE_ROWS}"
         )
-    arch = arch_for(device)
-    if arch is None:
-        capability = get_compute_capability(device)
-        raise ValueError(
-            "the ICP indexer chain requires compute capability 10.0 or 10.3 "
-            f"(got {capability[0]}.{capability[1]})"
-        )
-    if float(timeout_us) <= 0.0:
-        raise ValueError("timeout_us must be positive")
-    total_tokens, request_count = meta["total_tokens"], meta["request_count"]
-    world_size = meta["world_size"]
-    plan = plan_chain(
-        arch,
-        world_size=world_size,
-        query_len=int(query_len),
-        rows_per_rank=meta["rows_per_rank"],
-        page_size=meta["page_size"],
-        batch=request_count,
-        block_table_columns=meta["block_table_columns"],
-        sm_count=get_device_sm_count(device),
-    )
-    if out is None:
-        out = allocate_out(total_tokens, world_size, device)
-    if candidates is None:
-        candidates = allocate_candidates(total_tokens, device)
-    pool = allocate_pool(total_tokens, plan.pool_stride, device)
-    status = workspace.status
-    # The fused scorer writes lists only; its score / validity plane pointers are
-    # never dereferenced, so one-element carriers with a zero stride are bound.
-    plane_score = torch.zeros((1,), dtype=torch.float32, device=device)
-    plane_valid = torch.zeros((1,), dtype=torch.uint8, device=device)
-    scorer_gen = torch.zeros((1,), dtype=torch.int32, device=device)
-    q2d = index_q.view(torch.uint8).reshape(total_tokens * NUM_HEADS, HEAD_DIM)
-    k_u8 = index_k.view(torch.uint8)
-    scorer_values = dict(
-        Q=q2d,
-        K=k_u8,
+    if t != batch * decode_query_len:
+        raise ValueError("index_q must hold batch * decode_query_len tokens")
+    cols = _score_rows("score_out", score_out, t, h, 1, MAX_BLOCKS + 1)
+    if cols % 4:
+        raise ValueError("score_out columns must be a multiple of 4")
+    dev = _device_index(index_q)
+    _same_device(
+        index_q.device,
+        index_k=index_k,
         block_table=block_table,
-        score=plane_score,
-        valid=plane_valid,
         seq_lens=seq_lens,
-        query_start_loc=query_start_loc,
-        positions=positions,
-        active_rows=active_rows,
-        total_tokens=total_tokens,
-        token_begin=0,
-        token_count=total_tokens,
-        request_begin=0,
-        score_stride=0,
-        block_table_stride=meta["block_table_columns"],
-        split_count=plan.split_count,
-        rank=int(workspace.rank),
-        forced_column=forced_column,
-        pool=pool["pool"],
-        pool_stride=pool["pool_stride"],
-        row_meta=pool["row_meta"],
-        status=status,
-        gen_ctr=scorer_gen,
-        x_region_stride=0,
-        x_par_stride=0,
+        score_out=score_out,
     )
-    scorer_grid = (request_count, plan.split_count, 1)
-    scorer_entry, scorer_arguments = _bind(
-        plan.scorer_program, arch, "scorer", scorer_values, scorer_grid
+    if batch == 0:
+        return
+    arch = cake_jit.device_arch(dev)
+    name = cake_jit.route("decode_plane", rows, arch)
+    splits = plane_splits(name, rows, arch, batch, dev)
+    cake_jit.run_module(
+        name,
+        {
+            "q": index_q.view(torch.uint8),
+            "k": index_k.view(torch.uint8),
+            "block_table": block_table,
+            "seq_lens": seq_lens,
+            "scores": score_out,
+            # Read only by the list form; any int32 vector serves the plane.
+            "num_valid_pages": seq_lens,
+            "columns": cols,
+            "init_blocks": 0,
+            "local_blocks": 0,
+            "batch": batch,
+            "num_tokens": t,
+            "num_heads": h,
+            "query_len": decode_query_len,
+            "splits": splits,
+            "score_cols": cols,
+            "rank": rank,
+            "world": world_size,
+            "page_size": page_size,
+            "bt_stride": block_table.stride(0),
+            "score_stride_t": score_out.stride(0),
+            "score_stride_h": score_out.stride(1),
+        },
+        grid=cake_jit.launch_grid(name, batch=batch, splits=splits),
+        arch=arch,
+        enable_pdl=enable_pdl,
     )
-    merge_common = dict(
-        pool=pool["pool"],
-        row_meta=pool["row_meta"],
-        query_start_loc=query_start_loc,
-        candidates=candidates.view(torch.int32),
-        status=status,
-        pool_stride=pool["pool_stride"],
-        request_count=request_count,
-        forced_block=forced_block,
-        n_ordinary=n_ordinary,
-        out=out,
-        rank=int(workspace.rank),
-        token_begin=0,
-        timeout_ns=int(float(timeout_us) * 1000.0),
-        **workspace.merge_bindings(),
-    )
-    merge_grid = (total_tokens * NUM_HEADS, 1, 1)
-    merge_arguments: dict[int, tuple] = {}
-    merge_entry = None
-    for phase in (PHASE_PUSH_POLL, PHASE_PUSH_ONLY, PHASE_POLL_ONLY):
-        merge_entry, merge_arguments[phase] = _bind(
-            plan.merge_program,
-            arch,
-            "merge",
-            dict(merge_common, x_phase=phase),
-            merge_grid,
+
+
+def _publish_checks(
+    num_tokens: int,
+    num_heads: int,
+    num_valid_pages: torch.Tensor,
+    recv_bases: torch.Tensor,
+    errors: torch.Tensor,
+    generations: Optional[torch.Tensor],
+    *,
+    slot: int,
+    rank: int,
+    world_size: int,
+    heads_per_rank: int,
+    capacity: int,
+    force_begin_blocks: int,
+    force_end_blocks: int,
+    spin_limit: int,
+    index_scale: int,
+    index_offset: int,
+) -> None:
+    _world(world_size, rank)
+    if world_size * heads_per_rank != num_heads:
+        raise ValueError("scores must hold world_size * heads_per_rank heads")
+    _heads(num_heads)
+    if slot not in range(NUM_SLOT_SETS):
+        raise ValueError("slot must be 0, 1 or 2")
+    if not 0 <= num_tokens <= capacity:
+        raise ValueError("the token count exceeds the receive capacity")
+    _vector("num_valid_pages", num_valid_pages, torch.int32, num_tokens)
+    _vector("recv_bases", recv_bases, torch.int64, world_size)
+    _errors(errors)
+    if generations is not None and (
+        generations.dtype != torch.int32
+        or tuple(generations.shape) != (NUM_SLOT_SETS, num_heads, capacity)
+        or not generations.is_contiguous()
+    ):
+        raise ValueError(
+            f"generations must be contiguous int32 [3, {num_heads}, {capacity}]"
         )
-    assert merge_entry is not None
-    return MSAIcpIndexerRunner(
-        plan=plan,
-        workspace=workspace,
-        out=out,
-        candidates=candidates,
+    _forced(force_begin_blocks, force_end_blocks)
+    _spin(spin_limit)
+    _index_map(index_scale, index_offset)
+
+
+def topk_select_publish(
+    scores: torch.Tensor,
+    num_valid_pages: torch.Tensor,
+    recv_bases: torch.Tensor,
+    errors: torch.Tensor,
+    *,
+    slot: int,
+    rank: int,
+    world_size: int,
+    heads_per_rank: int,
+    capacity: int,
+    force_begin_blocks: int,
+    force_end_blocks: int,
+    spin_limit: int = DEFAULT_SPIN_LIMIT,
+    enable_pdl: bool = False,
+    generations: Optional[torch.Tensor] = None,
+    index_scale: int = 1,
+    index_offset: int = 0,
+    _trusted: bool = False,
+) -> None:
+    # ``_trusted``: receive bases, errors and generations come from a comm the
+    # caller's ``check_comm`` validated, the scalars from its validated plan
+    # and ``slot`` is in range; the per-call tensors are still checked.
+    if scores.ndim != 3:
+        raise ValueError("scores must be float32 [T, H, K]")
+    t, h = scores.shape[0], scores.shape[1]
+    k_cols = _score_rows("scores", scores, t, h, 1, MAX_SELECT_COLUMNS)
+    dev = _device_index(scores)
+    if _trusted:
+        _heads(h)
+        if t > capacity:
+            raise ValueError("the token count exceeds the receive capacity")
+        _vector("num_valid_pages", num_valid_pages, torch.int32, t)
+        _same_device(
+            scores.device, num_valid_pages=num_valid_pages, recv_bases=recv_bases
+        )
+    else:
+        _publish_checks(
+            t,
+            h,
+            num_valid_pages,
+            recv_bases,
+            errors,
+            generations,
+            slot=slot,
+            rank=rank,
+            world_size=world_size,
+            heads_per_rank=heads_per_rank,
+            capacity=capacity,
+            force_begin_blocks=force_begin_blocks,
+            force_end_blocks=force_end_blocks,
+            spin_limit=spin_limit,
+            index_scale=index_scale,
+            index_offset=index_offset,
+        )
+        _same_device(
+            scores.device,
+            num_valid_pages=num_valid_pages,
+            recv_bases=recv_bases,
+            errors=errors,
+            generations=generations,
+        )
+    if t == 0:
+        return
+    arch = cake_jit.device_arch(dev)
+    name = cake_jit.route("select_publish", None, arch)
+    cake_jit.run_module(
+        name,
+        {
+            "scores": scores,
+            "num_valid_pages": num_valid_pages,
+            "recv_bases": recv_bases,
+            "errors": errors,
+            # The legacy kernel never touches it; any int32 pointer serves.
+            "generations": errors if generations is None else generations,
+            "num_tokens": t,
+            "total_q": t,
+            "num_heads": h,
+            "heads_per_rank": heads_per_rank,
+            "score_cols": k_cols,
+            "score_stride_t": scores.stride(0),
+            "score_stride_h": scores.stride(1),
+            "slot": slot,
+            "rank": rank,
+            "world": world_size,
+            "capacity": capacity,
+            "force_begin": force_begin_blocks,
+            "force_end": force_end_blocks,
+            "spin_limit": spin_limit,
+            "tagged": int(generations is not None),
+            "index_scale": index_scale,
+            "index_offset": index_offset,
+        },
+        grid=cake_jit.launch_grid(name, tokens=t, heads=h),
+        arch=arch,
+        enable_pdl=enable_pdl,
+    )
+
+
+def decode_score_publish(
+    index_q: torch.Tensor,
+    index_k: torch.Tensor,
+    block_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    num_valid_pages: torch.Tensor,
+    pool: torch.Tensor,
+    recv_bases: torch.Tensor,
+    errors: torch.Tensor,
+    *,
+    rank: int,
+    world_size: int,
+    page_size: int,
+    decode_query_len: int,
+    slot: int,
+    capacity: int,
+    force_begin_blocks: int,
+    force_end_blocks: int,
+    spin_limit: int = DEFAULT_SPIN_LIMIT,
+    generations: Optional[torch.Tensor] = None,
+    enable_pdl: bool = True,
+) -> None:
+    _world(world_size, rank)
+    if page_size not in SUPPORTED_PAGE_SIZES:
+        raise ValueError("page_size must be 128 or 256")
+    _query("index_q", index_q)
+    rows = _index_k("index_k", index_k, world_size, page_size)
+    t, h = index_q.shape[0], index_q.shape[1]
+    batch = block_table.shape[0] if block_table.ndim == 2 else -1
+    _block_table(block_table, batch, 1)
+    _vector("seq_lens", seq_lens, torch.int32, batch)
+    if decode_query_len < 1 or h * decode_query_len > MAX_DECODE_ROWS:
+        raise ValueError(
+            f"need decode_query_len >= 1 and num_heads * decode_query_len <= {MAX_DECODE_ROWS}"
+        )
+    if t != batch * decode_query_len:
+        raise ValueError("index_q must hold batch * decode_query_len tokens")
+    if (
+        pool.dtype != torch.uint8
+        or not pool.is_contiguous()
+        or pool.numel() < decode_pool_bytes(max_decode_tokens=max(t, 1), num_heads=h)
+        or pool.numel() % 8
+        or pool.data_ptr() % 16
+    ):
+        raise ValueError(
+            "pool must be contiguous 16-byte aligned uint8 of a multiple of 8 and at least "
+            "msa_icp_decode_pool_bytes bytes"
+        )
+    index_scale, index_offset = index_layout(page_size, world_size, rank)
+    _publish_checks(
+        t,
+        h,
+        num_valid_pages,
+        recv_bases,
+        errors,
+        generations,
+        slot=slot,
+        rank=rank,
+        world_size=world_size,
+        heads_per_rank=h // world_size,
+        capacity=capacity,
+        force_begin_blocks=force_begin_blocks,
+        force_end_blocks=force_end_blocks,
+        spin_limit=spin_limit,
+        index_scale=index_scale,
+        index_offset=index_offset,
+    )
+    dev = _device_index(index_q)
+    _same_device(
+        index_q.device,
+        index_k=index_k,
+        block_table=block_table,
+        seq_lens=seq_lens,
+        num_valid_pages=num_valid_pages,
         pool=pool,
-        status=status,
-        scorer_entry=scorer_entry,
-        scorer_arguments=scorer_arguments,
-        merge_entry=merge_entry,
-        merge_arguments=merge_arguments,
-        retained=(q2d, k_u8, plane_score, plane_valid, scorer_gen),
+        recv_bases=recv_bases,
+        errors=errors,
+        generations=generations,
+    )
+    if batch == 0:
+        return
+    arch = cake_jit.device_arch(dev)
+    scorer = cake_jit.route("decode_topk", rows, arch)
+    publisher = cake_jit.route("topk16_publish", None, arch)
+    splits = decode_splits(scorer, batch, dev, cap=cake_jit.TOPK16_SPLIT_CAP[arch])
+    values = {
+        "q": index_q.view(torch.uint8),
+        "k": index_k.view(torch.uint8),
+        "block_table": block_table,
+        "seq_lens": seq_lens,
+        "num_valid_pages": num_valid_pages,
+        # uint64 keys: one 16-entry list per (token, head, split), rows of
+        # MAX_DECODE_SPLITS lists.
+        "pool": pool.view(torch.uint64),
+        "pool_row_stride": cake_jit.MAX_DECODE_SPLITS * TOPK,
+        "recv_bases": recv_bases,
+        "errors": errors,
+        "generations": errors if generations is None else generations,
+        "batch": batch,
+        "num_tokens": t,
+        "total_q": t,
+        "num_heads": h,
+        "heads_per_rank": h // world_size,
+        "query_len": decode_query_len,
+        "splits": splits,
+        "rank": rank,
+        "world": world_size,
+        "page_size": page_size,
+        "bt_stride": block_table.stride(0),
+        "slot": slot,
+        "capacity": capacity,
+        "force_begin": force_begin_blocks,
+        "force_end": force_end_blocks,
+        # The scorer's names of the forced blocks and of the candidate column
+        # bound (one local column per block-table page).
+        "init_blocks": force_begin_blocks,
+        "local_blocks": force_end_blocks,
+        "columns": block_table.shape[1],
+        "spin_limit": spin_limit,
+        "tagged": int(generations is not None),
+        "index_scale": index_scale,
+        "index_offset": index_offset,
+    }
+    cake_jit.run_module(
+        scorer,
+        values,
+        grid=cake_jit.launch_grid(scorer, batch=batch, splits=splits),
+        arch=arch,
+        enable_pdl=enable_pdl,
+    )
+    cake_jit.run_module(
+        publisher,
+        values,
+        grid=cake_jit.launch_grid(publisher, tokens=t, heads=h),
+        arch=arch,
+        enable_pdl=enable_pdl,
+    )
+
+
+def merge_role(*, prefill: bool, tagged: bool, num_tokens: int) -> str:
+    """The merge role of one call (launch metadata only, every arch):
+    ``merge_prefill`` for a prefill merge, ``merge_legacy`` for a legacy decode
+    merge of at least ``LEGACY_MERGE_MIN_TOKENS`` tokens, else ``merge``."""
+    if prefill:
+        return "merge_prefill"
+    if not tagged and num_tokens >= LEGACY_MERGE_MIN_TOKENS:
+        return "merge_legacy"
+    return "merge"
+
+
+def merge_candidates(
+    recv_slot: torch.Tensor,
+    num_valid_pages: torch.Tensor,
+    output: torch.Tensor,
+    errors: torch.Tensor,
+    *,
+    init_blocks: int,
+    local_blocks: int,
+    spin_limit: int = DEFAULT_SPIN_LIMIT,
+    enable_pdl: bool = False,
+    expected_generations: Optional[torch.Tensor] = None,
+    prefill: bool = False,
+    _trusted: bool = False,
+) -> None:
+    # ``_trusted``: the caller (MSAIcpIndexerPlan.decode) passes one slot of
+    # receive rows and counters its ``check_comm`` validated, and its own
+    # validated scalars; only the per-call tensors are checked here.
+    tagged = expected_generations is not None
+    if not _trusted:
+        if prefill and (tagged or enable_pdl):
+            raise ValueError(
+                "the prefill merge takes neither expected_generations nor enable_pdl"
+            )
+        if recv_slot.ndim != 4:
+            raise ValueError("recv_slot must be [world, heads_per_rank, capacity, row]")
+    world, hpr, capacity, row = recv_slot.shape
+    if not _trusted:
+        if world not in SUPPORTED_WORLD_SIZES:
+            raise ValueError("recv_slot must hold 2 or 4 sources")
+        want_dtype, want_row = (
+            (torch.int64, TAGGED_WORDS) if tagged else (torch.int32, ROW_WORDS)
+        )
+        if (
+            recv_slot.dtype != want_dtype
+            or row != want_row
+            or recv_slot.stride(-1) != 1
+        ):
+            raise ValueError(
+                f"recv_slot must be {want_dtype} [..., {want_row}] with unit last stride"
+                + (" (tagged rows)" if tagged else " (legacy rows)")
+            )
+        _heads(world * hpr)
+    if (
+        output.dtype != torch.int32
+        or output.ndim != 3
+        or output.shape[1] != hpr
+        or output.shape[2] != TOPK
+        or output.stride(-1) != 1
+    ):
+        raise ValueError(f"output must be int32 [T, {hpr}, 16] with unit last stride")
+    t = output.shape[0]
+    if t > capacity:
+        raise ValueError("output holds more tokens than the receive capacity")
+    _vector("num_valid_pages", num_valid_pages, torch.int32, t)
+    dev = _device_index(recv_slot)
+    if _trusted:
+        _same_device(recv_slot.device, num_valid_pages=num_valid_pages, output=output)
+    else:
+        _errors(errors)
+        if tagged and (
+            expected_generations.dtype != torch.int32
+            or tuple(expected_generations.shape) != (hpr, capacity)
+            or not expected_generations.is_contiguous()
+        ):
+            raise ValueError(
+                f"expected_generations must be contiguous int32 [{hpr}, {capacity}]"
+            )
+        if init_blocks < 0 or local_blocks < 0:
+            raise ValueError("init_blocks and local_blocks must be non-negative")
+        _spin(spin_limit)
+        _same_device(
+            recv_slot.device,
+            num_valid_pages=num_valid_pages,
+            output=output,
+            errors=errors,
+            expected_generations=expected_generations,
+        )
+    if t == 0:
+        return
+    arch = cake_jit.device_arch(dev)
+    role = merge_role(prefill=prefill, tagged=tagged, num_tokens=t)
+    name = cake_jit.route(role, None, arch)
+    # One program reads both row forms through int32 words: a tagged row is
+    # its 32 int64 words viewed as 64 int32 words (strides in int32 elements).
+    words = recv_slot.view(torch.int32) if tagged else recv_slot
+    cake_jit.run_module(
+        name,
+        {
+            "recv": words,
+            "num_valid_pages": num_valid_pages,
+            "output": output,
+            "errors": errors,
+            # Read only when tagged; any int32 pointer serves otherwise.
+            "expected": num_valid_pages
+            if expected_generations is None
+            else expected_generations,
+            "num_tokens": t,
+            "heads_per_rank": hpr,
+            "world": world,
+            "capacity": capacity,
+            "recv_stride_src": words.stride(0),
+            "recv_stride_h": words.stride(1),
+            "recv_stride_t": words.stride(2),
+            "out_stride_t": output.stride(0),
+            "out_stride_h": output.stride(1),
+            "init_blocks": init_blocks,
+            "local_blocks": local_blocks,
+            "spin_limit": spin_limit,
+            "tagged": int(tagged),
+            "prefill": int(prefill),
+        },
+        grid=cake_jit.launch_grid(name, tokens=t, heads=hpr),
+        arch=arch,
+        enable_pdl=enable_pdl,
+    )
+
+
+def warmup(device: torch.device) -> None:
+    """Load (build on first use) every program of the device's architecture,
+    each kernel resident in the device's context (every role a call may
+    launch: plan, scorers, select / publish, merges).  Run on every rank
+    before the first exchange and before CUDA Graph capture."""
+    index = torch.device(device).index
+    index = torch.cuda.current_device() if index is None else index
+    arch = cake_jit.device_arch(index)
+    with torch.cuda.device(index):
+        for name, record in cake_jit.MODULES.items():
+            if arch in record["arches"]:
+                cake_jit.load(name, arch)
+
+
+def is_supported(device: torch.device | str | int | None = None) -> bool:
+    """Whether ``device`` is an exported architecture of this backend."""
+    if not torch.cuda.is_available():
+        return False
+    index = (
+        torch.device("cuda", device).index
+        if isinstance(device, int)
+        else (
+            torch.cuda.current_device()
+            if device is None or torch.device(device).index is None
+            else torch.device(device).index
+        )
+    )
+    return (
+        cake_jit.arch_for_capability(torch.cuda.get_device_capability(index))
+        is not None
     )
 
 
 __all__ = [
-    "ChainPlan",
-    "DEFAULT_TIMEOUT_US",
-    "HEAD_DIM",
-    "MSAIcpIndexerRunner",
-    "NUM_HEADS",
-    "PHASE_POLL_ONLY",
-    "PHASE_PUSH_ONLY",
-    "PHASE_PUSH_POLL",
-    "SUPPORTED_COMPUTE_CAPABILITIES",
-    "TOPK",
-    "allocate_candidates",
-    "allocate_out",
-    "allocate_pool",
-    "arch_for",
-    "default_split_count",
-    "generated_program_available",
-    "merge_geometry",
-    "merge_programs",
-    "plan_chain",
-    "pool_geometry",
-    "pool_layout",
-    "prepare_msa_icp_indexer",
-    "programs_for",
-    "scorer_programs",
-    "validate_msa_icp_indexer_inputs",
+    "MSAIcpScorePlan",
+    "comm_layout",
+    "decode_index_score_sharded",
+    "decode_pool_bytes",
+    "decode_score_columns",
+    "decode_score_publish",
+    "decode_splits",
+    "index_layout",
+    "index_score_columns",
+    "index_score_plan_storage",
+    "index_score_sharded",
+    "index_score_sharded_plan",
+    "index_score_sharded_plan_device",
+    "is_supported",
+    "merge_candidates",
+    "merge_role",
+    "plane_splits",
+    "topk_select_prefill",
+    "topk_select_publish",
+    "warmup",
 ]

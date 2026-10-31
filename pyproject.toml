@@ -117,6 +117,7 @@ exclude = [
 "flashinfer.experimental.nvfp4_mla_decode" = ["csrc/**", "build.json"]
 "flashinfer.experimental.nvfp4_sparse_mla_decode" = ["csrc/**", "build.json"]
 "flashinfer.experimental.cake_dsa_indexer_det" = ["csrc/**", "build.json"]
+"flashinfer.experimental.cake_msa_icp_indexer" = ["csrc/**", "build.json"]
 "flashinfer.experimental.deepgemm_batched_gemm" = ["csrc/**", "build.json", "DEEPGEMM_NOTICE.txt"]
 # Generated sources and the build manifest (build.json) of the experimental exact-SM100a/SM103a Kimi-K3
 # attention-residual (AttnRes) backend; its cake_build loader compiles them on demand, prebuilt aot/ libraries never ship.
