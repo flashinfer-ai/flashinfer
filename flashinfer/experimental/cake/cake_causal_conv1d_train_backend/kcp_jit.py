@@ -104,7 +104,7 @@ MODULES: dict[str, dict[str, Any]] = {
     # package's prefix; no cross-CTA reduction, so its outputs are bitwise the det program's).
     # TODO-EXPORT: name, kernel, kernel_symbol and library are placeholders until the exporter renders the
     # program.
-    "cake_causal_conv1d_train_TODOEXPORT_fwd_kcp": {
+    "cake_causal_conv1d_train_675940a7a4fc0dba4b53_kcp": {
         "arches": [
             "sm_100a",
             "sm_103a",
@@ -138,8 +138,8 @@ MODULES: dict[str, dict[str, Any]] = {
             },
             "kind": "co_resident",
         },
-        "kernel": "cake_causal_conv1d_train_TODOEXPORT_fwd_kcp",
-        "kernel_symbol": "kernel_cake_causal_conv1d_train_TODOEXPORT_fwd_kcp",
+        "kernel": "cake_causal_conv1d_train_675940a7a4fc0dba4b53_kcp",
+        "kernel_symbol": "kernel_cake_causal_conv1d_train_675940a7a4fc0dba4b53_kcp",
         "launch": {
             "block": (128, 1, 1),
             "cluster": (1, 1, 1),
@@ -147,7 +147,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 33792,
             "use_pdl": False,
         },
-        "library": "cake_causal_conv1d_train_TODOEXPORT_fwd_kcp",
+        "library": "cake_causal_conv1d_train_675940a7a4fc0dba4b53_kcp",
         "logical": {
             "C": "C",
             "S": "S",
@@ -177,7 +177,7 @@ MODULES: dict[str, dict[str, Any]] = {
     # TODO-EXPORT: name, kernel, kernel_symbol and library are placeholders until the exporter renders the
     # program; ``dynamic_smem_bytes`` 0 is the placeholder of a program whose shared memory follows the kernel;
     # ``ctas_per_sm`` starts at the det program's co-residency (to be confirmed by the render).
-    "cake_causal_conv1d_train_TODOEXPORT_bwd_kcp": {
+    "cake_causal_conv1d_train_d994e1963ad7724c9c64_kcp": {
         "arches": [
             "sm_100a",
             "sm_103a",
@@ -222,16 +222,16 @@ MODULES: dict[str, dict[str, Any]] = {
             },
             "kind": "occupancy",
         },
-        "kernel": "cake_causal_conv1d_train_TODOEXPORT_bwd_kcp",
-        "kernel_symbol": "kernel_cake_causal_conv1d_train_TODOEXPORT_bwd_kcp",
+        "kernel": "cake_causal_conv1d_train_d994e1963ad7724c9c64_kcp",
+        "kernel_symbol": "kernel_cake_causal_conv1d_train_d994e1963ad7724c9c64_kcp",
         "launch": {
             "block": (128, 1, 1),
             "cluster": (1, 1, 1),
             "cooperative": False,
-            "dynamic_smem_bytes": 0,
+            "dynamic_smem_bytes": 50176,
             "use_pdl": False,
         },
-        "library": "cake_causal_conv1d_train_TODOEXPORT_bwd_kcp",
+        "library": "cake_causal_conv1d_train_d994e1963ad7724c9c64_kcp",
         "logical": {
             "C": "C",
             "S": "S",
@@ -274,7 +274,7 @@ MODULES: dict[str, dict[str, Any]] = {
     # TODO-EXPORT: name, kernel, kernel_symbol and library are placeholders until the exporter renders the
     # program; ``dynamic_smem_bytes`` 0 is the placeholder of a program whose shared memory follows the kernel;
     # ``ctas_per_sm`` starts at the det program's co-residency (to be confirmed by the render).
-    "cake_causal_conv1d_train_TODOEXPORT_bwd_mb2_kcp": {
+    "cake_causal_conv1d_train_777e24f8771c3f7abdf8_kcp": {
         "arches": [
             "sm_107a",
         ],
@@ -315,16 +315,16 @@ MODULES: dict[str, dict[str, Any]] = {
             },
             "kind": "occupancy",
         },
-        "kernel": "cake_causal_conv1d_train_TODOEXPORT_bwd_mb2_kcp",
-        "kernel_symbol": "kernel_cake_causal_conv1d_train_TODOEXPORT_bwd_mb2_kcp",
+        "kernel": "cake_causal_conv1d_train_777e24f8771c3f7abdf8_kcp",
+        "kernel_symbol": "kernel_cake_causal_conv1d_train_777e24f8771c3f7abdf8_kcp",
         "launch": {
             "block": (128, 1, 1),
             "cluster": (1, 1, 1),
             "cooperative": False,
-            "dynamic_smem_bytes": 0,
+            "dynamic_smem_bytes": 50176,
             "use_pdl": False,
         },
-        "library": "cake_causal_conv1d_train_TODOEXPORT_bwd_mb2_kcp",
+        "library": "cake_causal_conv1d_train_777e24f8771c3f7abdf8_kcp",
         "logical": {
             "C": "C",
             "S": "S",
@@ -365,7 +365,7 @@ MODULES: dict[str, dict[str, Any]] = {
     # TODO-EXPORT: name, kernel, kernel_symbol and library are placeholders until the exporter renders the
     # program; ``dynamic_smem_bytes`` 0 is the placeholder of a program whose shared memory follows the kernel;
     # ``ctas_per_sm`` starts at the det program's co-residency (to be confirmed by the render).
-    "cake_causal_conv1d_train_TODOEXPORT_bwd_st8_kcp": {
+    "cake_causal_conv1d_train_584216799fed8caece3a_kcp": {
         "arches": [
             "sm_100a",
             "sm_103a",
@@ -412,16 +412,16 @@ MODULES: dict[str, dict[str, Any]] = {
             },
             "kind": "occupancy",
         },
-        "kernel": "cake_causal_conv1d_train_TODOEXPORT_bwd_st8_kcp",
-        "kernel_symbol": "kernel_cake_causal_conv1d_train_TODOEXPORT_bwd_st8_kcp",
+        "kernel": "cake_causal_conv1d_train_584216799fed8caece3a_kcp",
+        "kernel_symbol": "kernel_cake_causal_conv1d_train_584216799fed8caece3a_kcp",
         "launch": {
             "block": (128, 1, 1),
             "cluster": (1, 1, 1),
             "cooperative": False,
-            "dynamic_smem_bytes": 0,
+            "dynamic_smem_bytes": 82944,
             "use_pdl": False,
         },
-        "library": "cake_causal_conv1d_train_TODOEXPORT_bwd_st8_kcp",
+        "library": "cake_causal_conv1d_train_584216799fed8caece3a_kcp",
         "logical": {
             "C": "C",
             "S": "S",
@@ -466,7 +466,7 @@ MODULES: dict[str, dict[str, Any]] = {
     # package's prefix; no cross-CTA reduction, so its outputs are bitwise the det program's).
     # TODO-EXPORT: name, kernel, kernel_symbol and library are placeholders until the exporter renders the
     # program.
-    "cake_causal_conv1d_train_TODOEXPORT_bwd_head_kcp": {
+    "cake_causal_conv1d_train_17cd42fb05079bbbf840_kcp": {
         "arches": [
             "sm_100a",
             "sm_103a",
@@ -498,8 +498,8 @@ MODULES: dict[str, dict[str, Any]] = {
             },
             "kind": "co_resident",
         },
-        "kernel": "cake_causal_conv1d_train_TODOEXPORT_bwd_head_kcp",
-        "kernel_symbol": "kernel_cake_causal_conv1d_train_TODOEXPORT_bwd_head_kcp",
+        "kernel": "cake_causal_conv1d_train_17cd42fb05079bbbf840_kcp",
+        "kernel_symbol": "kernel_cake_causal_conv1d_train_17cd42fb05079bbbf840_kcp",
         "launch": {
             "block": (128, 1, 1),
             "cluster": (1, 1, 1),
@@ -507,7 +507,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 0,
             "use_pdl": False,
         },
-        "library": "cake_causal_conv1d_train_TODOEXPORT_bwd_head_kcp",
+        "library": "cake_causal_conv1d_train_17cd42fb05079bbbf840_kcp",
         "logical": {
             "C": "C",
             "S": "S",
@@ -533,38 +533,38 @@ MODULES: dict[str, dict[str, Any]] = {
 ROUTES: dict[str, dict[str, list[str]]] = {
     "sm_100a": {
         "kcp_bwd": [
-            "cake_causal_conv1d_train_TODOEXPORT_bwd_kcp",
-            "cake_causal_conv1d_train_TODOEXPORT_bwd_st8_kcp",
+            "cake_causal_conv1d_train_d994e1963ad7724c9c64_kcp",
+            "cake_causal_conv1d_train_584216799fed8caece3a_kcp",
         ],
         "kcp_bwd_head": [
-            "cake_causal_conv1d_train_TODOEXPORT_bwd_head_kcp",
+            "cake_causal_conv1d_train_17cd42fb05079bbbf840_kcp",
         ],
         "kcp_fwd": [
-            "cake_causal_conv1d_train_TODOEXPORT_fwd_kcp",
+            "cake_causal_conv1d_train_675940a7a4fc0dba4b53_kcp",
         ],
     },
     "sm_103a": {
         "kcp_bwd": [
-            "cake_causal_conv1d_train_TODOEXPORT_bwd_kcp",
-            "cake_causal_conv1d_train_TODOEXPORT_bwd_st8_kcp",
+            "cake_causal_conv1d_train_d994e1963ad7724c9c64_kcp",
+            "cake_causal_conv1d_train_584216799fed8caece3a_kcp",
         ],
         "kcp_bwd_head": [
-            "cake_causal_conv1d_train_TODOEXPORT_bwd_head_kcp",
+            "cake_causal_conv1d_train_17cd42fb05079bbbf840_kcp",
         ],
         "kcp_fwd": [
-            "cake_causal_conv1d_train_TODOEXPORT_fwd_kcp",
+            "cake_causal_conv1d_train_675940a7a4fc0dba4b53_kcp",
         ],
     },
     "sm_107a": {
         "kcp_bwd": [
-            "cake_causal_conv1d_train_TODOEXPORT_bwd_mb2_kcp",
-            "cake_causal_conv1d_train_TODOEXPORT_bwd_st8_kcp",
+            "cake_causal_conv1d_train_777e24f8771c3f7abdf8_kcp",
+            "cake_causal_conv1d_train_584216799fed8caece3a_kcp",
         ],
         "kcp_bwd_head": [
-            "cake_causal_conv1d_train_TODOEXPORT_bwd_head_kcp",
+            "cake_causal_conv1d_train_17cd42fb05079bbbf840_kcp",
         ],
         "kcp_fwd": [
-            "cake_causal_conv1d_train_TODOEXPORT_fwd_kcp",
+            "cake_causal_conv1d_train_675940a7a4fc0dba4b53_kcp",
         ],
     },
 }
