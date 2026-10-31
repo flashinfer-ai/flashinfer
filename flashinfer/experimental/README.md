@@ -343,6 +343,15 @@ default in supported framework releases. A request for default or supported
 release-path integration is a signal that the feature should be considered
 for graduation.
 
+Release wheels published to PyPI do not carry the experimental packages'
+generated kernel sources (`csrc/**` and `csrc/experimental/**`): the release
+workflow builds with `FLASHINFER_WHEEL_EXCLUDE_EXPERIMENTAL_SOURCES=1` so that
+`flashinfer-python` stays under PyPI's per-file size limit (#7977). The Python
+modules stay importable and the first kernel load of such a feature raises;
+`flashinfer/experimental/KERNEL_SOURCES_EXCLUDED.txt` in the wheel says so.
+Nightly wheels on https://flashinfer.ai/whl and source installs include the
+sources, matching the audience above.
+
 ## Graduation checklist
 
 To graduate a feature to stable:

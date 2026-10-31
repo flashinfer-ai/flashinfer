@@ -861,6 +861,7 @@ match what the code uses today; values are strings unless noted.
 | `FLASHINFER_CAKE_LM_HEAD_LOSS_BINDING_CACHE` | `1` | `flashinfer/chunked_lm_head.py` | Read once when `flashinfer.chunked_lm_head` is imported and applied through `cake_backend.BINDING_CACHE.configure` when the wrapper first reaches the backend (the first call of either entry point): `0` disables the per-process LRU cache of compiled bindings. Direct users of the package call `configure` themselves. |
 | `FLASHINFER_CAKE_LM_HEAD_LOSS_BINDING_CACHE_CAPACITY` | `64` | `flashinfer/chunked_lm_head.py` | Capacity of that binding cache, read once at the same import (a value that is not a positive integer raises `ValueError`; unset or blank keeps the default) and applied through `configure` on the same first use. |
 | `FLASHINFER_JIT_CACHE_PROVIDER_ARCHS` | required | `flashinfer-jit-cache/build_backend.py` | Space-separated provider architectures added to a shim wheel's exact `Requires-Dist` metadata. |
+| `FLASHINFER_WHEEL_EXCLUDE_EXPERIMENTAL_SOURCES` | unset | `build_backend.py` (`_slim_wheel`) | `1` leaves the experimental packages' generated kernel sources (`flashinfer/experimental/*/csrc/**`, `csrc/experimental/**`) out of the built `flashinfer-python` wheel and adds `flashinfer/experimental/KERNEL_SOURCES_EXCLUDED.txt`; the release workflow sets it so the PyPI wheel stays under PyPI's 100 MB file limit (#7977). Nightlies and source installs keep the sources. Experimental APIs still import; their first kernel load raises. Independent of the flag, every built wheel is re-deflated at level 9 and the vendored 3rdparty trees outside the header directories are dropped. |
 | `FLASHINFER_JIT_CACHE_PROVIDER_ARCH` | required | `flashinfer-jit-cache-provider/package_config.py` | Select exactly one architecture, such as `9.0a` or `sm120f`, when building a binary provider wheel. |
 
 Release/nightly JIT-cache provider builds run sccache in server-side mode and
@@ -1099,6 +1100,7 @@ for every provider and its shim when producing CUDA-specific or nightly wheels.
   - `csrc` → `flashinfer/data/csrc`
   - `include` → `flashinfer/data/include`
 - **Version**: Generated in `flashinfer/_build_meta.py` from `version.txt`
+- **Wheel post-processing**: `build_backend.build_wheel` rewrites the finished wheel (`_slim_wheel`): level-9 deflate, the vendored 3rdparty Python trees that `packages.find` sweeps in are dropped, and with `FLASHINFER_WHEEL_EXCLUDE_EXPERIMENTAL_SOURCES=1` (release workflow only) the experimental kernel sources are left out; RECORD is regenerated. Covered by `tests/cpu/test_build_backend_slim_wheel.py`.
 
 ## External Integrations
 
