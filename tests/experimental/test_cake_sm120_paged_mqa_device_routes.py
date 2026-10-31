@@ -26,9 +26,11 @@ reuse shipped sequences, so the GPU checks launch them on an SM120 device (with
 the device SM count monkeypatched to the table's key); the synthetic ``dyn``
 route checks the plan-private schedule binding without a launch.  Every
 committed device route also launches, driven by one of its table entries, and
-must score the default route's bits; the first committed static and ``dyn``
-routes also replay from a CUDA Graph on changed contents, and the one-shot
-entry runs the ``dyn`` one.
+must score the default route's bits; the first committed static, ``par`` and
+``dyn`` routes also replay from a CUDA Graph on changed contents, and the
+one-shot entry runs the ``dyn`` one.  ``par`` routes (the CTA-parallel static
+scheduler) must write the reference schedule, keep the default route's
+metadata atom count, and leave the entries next to them on their own routes.
 """
 
 import copy
@@ -204,9 +206,37 @@ def test_ctx_windows_are_ordered_and_contiguous(catalog):
         assert _runtime.ctx_window(high) == after
 
 
+def _is_par_tag(tag):
+    """A ``par`` device route tag: ``par`` or ``<tag>_par``."""
+    return tag == "par" or tag.endswith("_par")
+
+
+def _scheduler_kernels(catalog):
+    """Kernel sources of the single-warp scheduler and of its CTA-parallel version.
+
+    The single-warp scheduler is the program of the metadata route; the
+    CTA-parallel version is the other scheduler module that binds the same
+    arguments (the ``dyn`` scheduler also binds its pool parameters).
+    """
+    programs = catalog["programs"]
+    metadata = catalog["routes"][catalog["policy"]["metadata_route"]]
+    ((_stage, name),) = metadata["stages"]
+    single = programs[name]
+    par = {
+        record["sources"][0]
+        for other, record in programs.items()
+        if record["kind"] == "module"
+        and other != name
+        and record["arg_plan"] == single["arg_plan"]
+    }
+    return single["sources"][0], par
+
+
 def _check_device_routes(catalog, *, check_files):
     from flashinfer.jit import env
 
+    single, par = _scheduler_kernels(catalog)
+    assert len(par) <= 1, sorted(par)
     policy = catalog["policy"]
     rule = policy["device_rule"]
     windows = rule["ctx_windows"]
@@ -280,6 +310,11 @@ def _check_device_routes(catalog, *, check_files):
             assert int(policy["threads"]["metadata_dyn"]) > 0
         else:
             assert schedule == {"kind": "static"}, name
+            # The sequence starts with the single-warp scheduler, or with its
+            # CTA-parallel version exactly when the tag ends in ``par``.
+            first = program["sources"][0]
+            assert first in {single, *par}, (name, first)
+            assert _is_par_tag(match.group(5)) == (first in par), (name, first)
         if check_files:
             for source in program["sources"]:
                 path = env.FLASHINFER_CSRC_DIR / source.removeprefix("csrc/")
@@ -1005,12 +1040,38 @@ def _schedule_kind(route):
     return _runtime.route_schedule(_runtime.route_record(route))["kind"]
 
 
+def _scheduler(route):
+    """Scheduler of a device route: ``"static"``, ``"par"`` or ``"dyn"``.
+
+    ``"par"`` is the CTA-parallel static scheduler, told by the first source
+    of the route's sequence.
+    """
+    catalog = _runtime._catalog()
+    record = _runtime.route_record(route)
+    kind = _schedule_kind(route)
+    _single, par = _scheduler_kernels(catalog)
+    first = catalog["programs"][record["sequence"]]["sources"][0]
+    if kind == "static" and first in par:
+        return "par"
+    return kind
+
+
 def _replay_cases():
-    """The first committed static and the first committed ``dyn`` device route."""
+    """The first committed device route of each scheduler: static, par and ``dyn``."""
     picked = {}
     for case in _committed_route_cases():
-        picked.setdefault(_schedule_kind(case[0]), case)
-    return [picked[kind] for kind in ("static", "dyn") if kind in picked]
+        picked.setdefault(_scheduler(case[0]), case)
+    return [picked[kind] for kind in ("static", "par", "dyn") if kind in picked]
+
+
+def _par_cases():
+    """The first committed ``<tag>_par`` and ``par`` route of each device table."""
+    picked = {}
+    for case in _committed_route_cases():
+        route, sms = case[0], case[1]
+        if _scheduler(route) == "par":
+            picked.setdefault((sms, route.rsplit(":", 1)[1] == "par"), case)
+    return [picked[key] for key in sorted(picked)]
 
 
 def _committed_route_plan(monkeypatch, case, seed):
@@ -1047,10 +1108,12 @@ def _committed_route_plan(monkeypatch, case, seed):
 def test_committed_device_route_graph_replay(monkeypatch, case):
     """CUDA Graph replay of a committed device route follows changed tensor contents.
 
-    One static and one ``dyn`` route: the replay scores the eager bits, then on
-    changed weights and context lengths the reference and the default route's
-    bits.  A ``dyn`` route's counter word is zero after every replay and the
-    caller's ``schedule_meta`` stays unwritten.
+    One static, one ``par`` and one ``dyn`` route: the replay scores the eager
+    bits, then on changed weights and context lengths the reference and the
+    default route's bits.  A static or ``par`` route rewrites the caller's
+    ``schedule_meta`` to the reference schedule of the changed lengths.  A
+    ``dyn`` route's counter word is zero after every replay and the caller's
+    ``schedule_meta`` stays unwritten.
     """
     data, args, caller, _hint, plan = _committed_route_plan(monkeypatch, case, 59)
     dyn = plan.schedule["kind"] == "dyn"
@@ -1079,6 +1142,10 @@ def test_committed_device_route_graph_replay(monkeypatch, case):
         graph.replay()
     stream.synchronize()
     _check(plan.logical_output, _reference(data), data, plan.output)
+    if not dyn:
+        split, atoms = _runtime.split_kv(), plan.num_next_n_atoms
+        expected = _schedule_reference(data["context_lens"], split, atoms, plan.num_sms)
+        assert caller.cpu().tolist() == expected
     default = prepare_sm120_paged_mqa_logits(*args)
     default.output.fill_(float("nan"))
     default.run()
@@ -1114,3 +1181,151 @@ def test_committed_dyn_route_one_shot_entry(monkeypatch, case):
     assert torch.equal(one_shot[inside], plan.logical_output[inside])
     assert _counter_word(plan) == 0
     assert bool((caller == -7).all())
+
+
+# ---------------------------------------------------------------------------
+# par routes: the CTA-parallel static scheduler
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "case",
+    _par_cases()
+    or [pytest.param(None, marks=pytest.mark.skip(reason="no committed par route"))],
+    ids=lambda case: case[0] if case else "none",
+)
+def test_par_route_writes_the_reference_schedule(monkeypatch, case):
+    """A ``par`` route writes the reference schedule into the caller's buffer.
+
+    The caller's ``schedule_meta`` starts poisoned; after the run it holds the
+    independent mirror's schedule for the route's atom count, which the
+    metadata entry returns for the same call, and the logits score the
+    reference.
+    """
+    data, _args, caller, hint, plan = _committed_route_plan(monkeypatch, case, 67)
+    route, sms, key, _batch = case
+    heads, page_kv = (int(v) for v in TABLE_KEY.match(key).group(1, 2))
+    assert _scheduler(route) == "par"
+    assert plan.schedule_meta is caller and plan.dyn_schedule is None
+    assert plan.num_next_n_atoms == _runtime.route_next_n_atoms(plan.route)
+    plan.output.fill_(float("nan"))
+    plan.run()
+    torch.cuda.synchronize()
+    expected = _schedule_reference(
+        data["context_lens"], _runtime.split_kv(), plan.num_next_n_atoms, sms
+    )
+    assert caller.cpu().tolist() == expected
+    _check(plan.logical_output, _reference(data), data, plan.output)
+    meta = get_paged_mqa_logits_metadata(
+        data["context_lens"], page_kv, sms, num_heads=heads, max_context_hint=hint
+    )
+    assert meta.cpu().tolist() == expected
+
+
+def test_default_par_route_keeps_the_metadata_atoms():
+    """A ``par`` route keeps the default route's Q atom and metadata atom count.
+
+    For every table entry that names a ``par`` route, at a hint inside the
+    window where the entry applies, the route is the default route's ``par``
+    route with the default route's atom, and the atom count the metadata entry
+    uses on that device (:func:`next_n_atoms` with the device arguments) is the
+    default rule's.
+    """
+    catalog = _runtime._catalog()
+    device = catalog["device_routes"]
+    checked = 0
+    for sms, table in sorted(catalog["policy"]["device_rule"]["tables"].items()):
+        for key, entries in sorted(table.items()):
+            heads, page_kv, next_n, _atom, window = TABLE_KEY.match(key).groups()
+            heads, page_kv, next_n = int(heads), int(page_kv), int(next_n)
+            for batch, route in entries:
+                if route is None or route.rsplit(":", 1)[1] != "par":
+                    continue
+                case = (route, int(sms), key, int(batch))
+                hint = _route_hint(case, heads, page_kv, next_n, window)
+                default = _runtime.route_name(heads, page_kv, next_n, batch, hint)
+                assert route == f"{default}:par", (case, default)
+                record, base = device[route], catalog["routes"][default]
+                for field in ("next_n_atom", "atom_variant"):
+                    assert record[field] == base[field], (case, field)
+                on_device = dict(
+                    page_kv=page_kv, cta_budget=int(sms), device_sms=int(sms)
+                )
+                atoms = _runtime.next_n_atoms(next_n, batch, heads, hint, **on_device)
+                assert atoms == _runtime.next_n_atoms(next_n, batch, heads, hint)
+                assert atoms == _runtime.route_next_n_atoms(base), case
+                checked += 1
+    assert checked
+
+
+def _key_hint(heads, next_n, batch, atom, window):
+    """A hint inside ``window`` where the default rule picks ``atom`` at ``batch``."""
+    low, high = (int(bound) for bound in _runtime.device_rule()["ctx_windows"][window])
+    grid = [int(1.3 * c) for c in WINDOW_CONTEXTS if low <= int(1.3 * c) < high]
+    for hint in (*grid, low, high - 1):
+        if _runtime.atom_variant(heads, next_n, batch, hint) == atom:
+            return hint
+    raise AssertionError(f"no hint in {window} [{low}, {high}) picks {atom} at {batch}")
+
+
+def test_boundary_entries_resolve_to_their_sibling():
+    """An entry listed next to a par entry keeps its own route at its batch.
+
+    Every par route has a sibling of the same geometry and Q atom: the tuned
+    route ``<tag>`` of ``<tag>_par`` and the default route of ``par``.  A
+    ``<tag>`` entry next to a ``<tag>_par`` entry resolves to ``<tag>``, and a
+    ``null`` entry next to a ``par`` entry to the default route.
+    """
+    catalog = _runtime._catalog()
+    device, routes = catalog["device_routes"], catalog["routes"]
+    fields = (
+        "num_heads",
+        "page_kv",
+        "next_n",
+        "next_n_atom",
+        "atom_variant",
+        "kernel_launches",
+        "clean_logits",
+    )
+    for name, record in device.items():
+        tag = name.rsplit(":", 1)[1]
+        if not _is_par_tag(tag):
+            continue
+        if tag == "par":
+            sibling = routes[name.removesuffix(":par")]
+        else:
+            sibling = device[name.removesuffix("_par")]
+            assert _runtime.route_schedule(sibling) == {"kind": "static"}, name
+        assert [record[k] for k in fields] == [sibling[k] for k in fields], name
+        assert record["sequence"] != sibling["sequence"], name
+    checked = {"static": 0, "null": 0}
+    for sms, table in sorted(catalog["policy"]["device_rule"]["tables"].items()):
+        for key, entries in sorted(table.items()):
+            heads, page_kv, next_n, atom, window = TABLE_KEY.match(key).groups()
+            heads, page_kv, next_n = int(heads), int(page_kv), int(next_n)
+            for at, (batch, route) in enumerate(entries):
+                beside = [
+                    entries[i][1] for i in (at - 1, at + 1) if 0 <= i < len(entries)
+                ]
+                if route is None:
+                    if not any(r and r.rsplit(":", 1)[1] == "par" for r in beside):
+                        continue
+                    kind = "null"
+                elif f"{route}_par" in beside:
+                    kind = "static"
+                else:
+                    continue
+                hint = _key_hint(heads, next_n, batch, atom, window)
+                got = _runtime.resolve_route(
+                    heads,
+                    page_kv,
+                    next_n,
+                    batch,
+                    hint,
+                    cta_budget=int(sms),
+                    device_sms=int(sms),
+                )
+                default = _runtime.route_name(heads, page_kv, next_n, batch, hint)
+                assert got == (route or default), (sms, key, batch, kind)
+                checked[kind] += 1
+    assert checked["static"] and checked["null"], checked
