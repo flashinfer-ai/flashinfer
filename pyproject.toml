@@ -85,7 +85,7 @@ exclude = [
 "flashinfer.experimental.b12x.loader" = ["*.c", "*.h"]
 # Cake-exported packages (flashinfer-ai/flashinfer#6553): the generated csrc tree plus the
 # build manifest (build.json) their cake_build loader reads; prebuilt aot/ libraries never ship.
-"flashinfer.cake_rmsnorm_train_backend" = ["csrc/**", "build.json"]
+"flashinfer.cake_rmsnorm_det_train_backend" = ["csrc/**", "build.json"]
 "flashinfer.cake_causal_conv1d_train_backend" = ["csrc/**", "build.json"]
 "flashinfer.cake_ulysses_backend" = ["csrc/**", "build.json"]
 "flashinfer.cake_fused_qk_rope_append_backend" = ["csrc/**", "build.json"]
@@ -97,7 +97,7 @@ exclude = [
 "flashinfer.cake_mhc_det_train_backend" = ["csrc/**", "build.json"]
 "flashinfer.cake_mhc_det_train_head_backend" = ["csrc/**", "build.json"]
 "flashinfer.cake_gated_act_mxfp8_backend" = ["csrc/**", "build.json"]
-"flashinfer.cake_rmsnorm_silu_gate_train_backend" = ["csrc/**", "build.json"]
+"flashinfer.cake_rmsnorm_silu_gate_det_train_backend" = ["csrc/**", "build.json"]
 "flashinfer.experimental.cake_dsa_train" = ["csrc/**", "build.json"]
 "flashinfer.experimental.cake_kda_train" = ["csrc/**", "build.json"]
 "flashinfer.experimental.cake_gdn_det_train_kcp" = ["csrc/**", "build.json", "build.test.json"]
@@ -113,7 +113,7 @@ exclude = [
 "flashinfer.experimental.msa_nvfp4_decode" = ["csrc/**"]
 "flashinfer.experimental.nvfp4_mla_decode" = ["csrc/**", "build.json"]
 "flashinfer.experimental.nvfp4_sparse_mla_decode" = ["csrc/**", "build.json"]
-"flashinfer.experimental.cake_dsa_indexer" = ["csrc/**", "build.json"]
+"flashinfer.experimental.cake_dsa_indexer_det" = ["csrc/**", "build.json"]
 "flashinfer.experimental.deepgemm_batched_gemm" = ["csrc/**", "build.json", "DEEPGEMM_NOTICE.txt"]
 # Generated sources and the build manifest (build.json) of the experimental exact-SM100a/SM103a Kimi-K3
 # attention-residual (AttnRes) backend; its cake_build loader compiles them on demand, prebuilt aot/ libraries never ship.

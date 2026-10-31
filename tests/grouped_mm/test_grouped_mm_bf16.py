@@ -103,6 +103,30 @@ class TestGroupedMmBf16:
         torch.testing.assert_close(out, ref, atol=0.125, rtol=0.125)
 
     @requires_cudnn_moe
+    def test_single_expert_rows_beyond_last_offset(self):
+        """One expert with spare rows after ``m_indptr[-1]`` (the unified MoE
+        runners' padded buffers): the expert's rows match the reference.
+
+        Rows past ``m_indptr[-1]`` are outside the documented ``out[start:end]``
+        contract. The second assertion pins only that the cuDNN >= 9.28
+        explicit-boundary encoding keeps the row coverage of the segment-starts
+        encoding (the last segment ends at ``a.shape[0]``), so ``out=None``
+        never returns uninitialized rows there; change it together with
+        ``_cudnn_moe_first_token_offset``."""
+        torch.manual_seed(5)
+        cum_m, used, k, n = 256, 192, 256, 256
+
+        a = torch.randn(cum_m, k, dtype=torch.bfloat16, device="cuda")
+        b = torch.randn(1, n, k, dtype=torch.bfloat16, device="cuda")
+        m_indptr = torch.tensor([0, used], dtype=torch.int32, device="cuda")
+
+        out = grouped_mm_bf16(a, b, m_indptr)
+        ref = (a.float() @ b[0].float().T).to(torch.bfloat16)
+
+        torch.testing.assert_close(out[:used], ref[:used], atol=0.125, rtol=0.125)
+        torch.testing.assert_close(out[used:], ref[used:], atol=0.125, rtol=0.125)
+
+    @requires_cudnn_moe
     def test_preallocated_output(self):
         """Pass a pre-allocated output tensor."""
         torch.manual_seed(3)

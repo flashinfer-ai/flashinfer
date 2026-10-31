@@ -272,31 +272,67 @@ from .norm import rmsnorm as rmsnorm
 from .norm import rmsnorm_quant as rmsnorm_quant
 from .norm import fused_rmsnorm_silu as fused_rmsnorm_silu
 from .norm import fused_qk_rmsnorm_rope as fused_qk_rmsnorm_rope
-from .cake_rmsnorm_train import CakeRMSNormFunction as CakeRMSNormFunction
-from .cake_rmsnorm_train import cake_rmsnorm as cake_rmsnorm
-from .cake_rmsnorm_train import (
+from .cake_rmsnorm_det_train import CakeRMSNormDetFunction as CakeRMSNormDetFunction
+from .cake_rmsnorm_det_train import cake_rmsnorm_det as cake_rmsnorm_det
+from .cake_rmsnorm_det_train import (
+    cake_rmsnorm_det_train_backward as cake_rmsnorm_det_train_backward,
+)
+from .cake_rmsnorm_det_train import (
+    cake_rmsnorm_det_train_backward_workspace_bytes as cake_rmsnorm_det_train_backward_workspace_bytes,
+)
+from .cake_rmsnorm_det_train import (
+    cake_rmsnorm_det_train_forward as cake_rmsnorm_det_train_forward,
+)
+
+# The names before the det rename (the same objects).
+from .cake_rmsnorm_det_train import CakeRMSNormFunction as CakeRMSNormFunction
+from .cake_rmsnorm_det_train import cake_rmsnorm as cake_rmsnorm
+from .cake_rmsnorm_det_train import (
     cake_rmsnorm_train_backward as cake_rmsnorm_train_backward,
 )
-from .cake_rmsnorm_train import (
+from .cake_rmsnorm_det_train import (
     cake_rmsnorm_train_backward_workspace_bytes as cake_rmsnorm_train_backward_workspace_bytes,
 )
-from .cake_rmsnorm_train import (
+from .cake_rmsnorm_det_train import (
     cake_rmsnorm_train_forward as cake_rmsnorm_train_forward,
 )
-from .cake_rmsnorm_silu_gate_train import (
+from . import cake_rmsnorm_train as cake_rmsnorm_train
+from . import cake_rmsnorm_train_backend as cake_rmsnorm_train_backend
+from .cake_rmsnorm_silu_gate_det_train import (
+    CakeRMSNormSiLUGateDetFunction as CakeRMSNormSiLUGateDetFunction,
+)
+from .cake_rmsnorm_silu_gate_det_train import (
+    cake_rmsnorm_silu_gate_det as cake_rmsnorm_silu_gate_det,
+)
+from .cake_rmsnorm_silu_gate_det_train import (
+    cake_rmsnorm_silu_gate_det_train_backward as cake_rmsnorm_silu_gate_det_train_backward,
+)
+from .cake_rmsnorm_silu_gate_det_train import (
+    cake_rmsnorm_silu_gate_det_train_backward_workspace_bytes as cake_rmsnorm_silu_gate_det_train_backward_workspace_bytes,
+)
+from .cake_rmsnorm_silu_gate_det_train import (
+    cake_rmsnorm_silu_gate_det_train_forward as cake_rmsnorm_silu_gate_det_train_forward,
+)
+
+# The names before the det rename (the same objects).
+from .cake_rmsnorm_silu_gate_det_train import (
     CakeRMSNormSiLUGateFunction as CakeRMSNormSiLUGateFunction,
 )
-from .cake_rmsnorm_silu_gate_train import (
+from .cake_rmsnorm_silu_gate_det_train import (
     cake_rmsnorm_silu_gate as cake_rmsnorm_silu_gate,
 )
-from .cake_rmsnorm_silu_gate_train import (
+from .cake_rmsnorm_silu_gate_det_train import (
     cake_rmsnorm_silu_gate_train_backward as cake_rmsnorm_silu_gate_train_backward,
 )
-from .cake_rmsnorm_silu_gate_train import (
+from .cake_rmsnorm_silu_gate_det_train import (
     cake_rmsnorm_silu_gate_train_backward_workspace_bytes as cake_rmsnorm_silu_gate_train_backward_workspace_bytes,
 )
-from .cake_rmsnorm_silu_gate_train import (
+from .cake_rmsnorm_silu_gate_det_train import (
     cake_rmsnorm_silu_gate_train_forward as cake_rmsnorm_silu_gate_train_forward,
+)
+from . import cake_rmsnorm_silu_gate_train as cake_rmsnorm_silu_gate_train
+from . import (
+    cake_rmsnorm_silu_gate_train_backend as cake_rmsnorm_silu_gate_train_backend,
 )
 from .cake_causal_conv1d_train import (
     CakeCausalConv1dFunction as CakeCausalConv1dFunction,

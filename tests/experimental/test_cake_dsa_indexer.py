@@ -40,10 +40,10 @@ import torch
 from tests.test_helpers import cake_dsa_indexer_reference as ref
 from tests.test_helpers.cake_package import cake_package
 
-cake_backend = cake_package("cake_dsa_indexer", "cake_backend")
-cake_build = cake_package("cake_dsa_indexer", "cake_build")
-cake_jit = cake_package("cake_dsa_indexer", "cake_jit")
-cake_policy = cake_package("cake_dsa_indexer", "cake_policy")
+cake_backend = cake_package("cake_dsa_indexer_det", "cake_backend")
+cake_build = cake_package("cake_dsa_indexer_det", "cake_build")
+cake_jit = cake_package("cake_dsa_indexer_det", "cake_jit")
+cake_policy = cake_package("cake_dsa_indexer_det", "cake_policy")
 ABI_CONTRACT = cake_backend.ABI_CONTRACT
 CONTRACT_SCALARS = cake_backend.CONTRACT_SCALARS
 CONTRACT_TENSORS = cake_backend.CONTRACT_TENSORS
@@ -54,14 +54,14 @@ SUPPORTED_COMPUTE_CAPABILITIES = cake_backend.SUPPORTED_COMPUTE_CAPABILITIES
 ZERO_SIGN_POLICIES = cake_backend.ZERO_SIGN_POLICIES
 arch_for = cake_backend.arch_for
 bind_program = cake_backend.bind_program
-dsa_indexer_workspace_size = cake_backend.dsa_indexer_workspace_size
+dsa_indexer_det_workspace_size = cake_backend.dsa_indexer_det_workspace_size
 generated_program_available = cake_backend.generated_program_available
-plan_dsa_indexer_topk = cake_backend.plan_dsa_indexer_topk
+plan_dsa_indexer_det_topk = cake_backend.plan_dsa_indexer_det_topk
 policy_for = cake_backend.policy_for
-prepare_dsa_indexer_topk = cake_backend.prepare_dsa_indexer_topk
+prepare_dsa_indexer_det_topk = cake_backend.prepare_dsa_indexer_det_topk
 program_for = cake_backend.program_for
 record_zero_sign_policy = cake_backend.record_zero_sign_policy
-validate_dsa_indexer_inputs = cake_backend.validate_dsa_indexer_inputs
+validate_dsa_indexer_det_inputs = cake_backend.validate_dsa_indexer_det_inputs
 visible_key_count = cake_backend.visible_key_count
 visible_key_counts = cake_backend.visible_key_counts
 MERGE_KEY = cake_policy.MERGE_KEY
@@ -211,7 +211,7 @@ def _require_program():
 
 
 def _run(inputs: ref.IndexerInputs, **extra):
-    out = cake_backend.dsa_indexer_topk(
+    out = cake_backend.dsa_indexer_det_topk(
         inputs.q,
         inputs.k,
         inputs.w,
@@ -225,7 +225,7 @@ def _run(inputs: ref.IndexerInputs, **extra):
 
 
 def _plan(inputs: ref.IndexerInputs, **extra):
-    return plan_dsa_indexer_topk(
+    return plan_dsa_indexer_det_topk(
         inputs.num_queries,
         inputs.num_keys,
         inputs.num_segments,
@@ -448,55 +448,93 @@ def test_registry_records_are_well_formed():
         assert cake_jit.PROGRAMS[keys[MERGE_KEY]]["role"] == "merge"
 
 
-_PROGRAM_KERNEL_FLAG = "-DCAKE_PROGRAM_KERNEL="
-_PROGRAM_KERNEL_DEFAULT = "#define CAKE_PROGRAM_KERNEL "
+_UNIT_SOURCE = re.compile(
+    r"^csrc/cake_dsa_indexer_det_topk/"
+    r"(cake_dsa_indexer_det_topk_[0-9a-f]{20})_(kernel|binding)\.cu$"
+)
+_PROGRAM_IDENTIFIER = re.compile(r"cake_dsa_indexer_det_topk_[0-9a-f]{20}")
+_KNOB_DEFINE = re.compile(r"^-D(CAKE_INDEXER_[A-Z0-9_]+)=(-?[0-9]+)$")
+_KERNEL_DEFINES = ("CAKE_PROGRAM_KERNEL",)
+_BINDING_DEFINES = (
+    "CAKE_KERNEL_SYMBOL",
+    "CAKE_PROGRAM_SHIM",
+    "CAKE_BINDING_THREADS",
+    "CAKE_BINDING_SMEM",
+)
+
+
+def _unit(entry, index, kind):
+    # The exported unit whose file the entry compiles as its kernel (index 0) or
+    # binding (index 1) translation unit.
+    match = _UNIT_SOURCE.match(entry["sources"][index])
+    assert match is not None and match.group(2) == kind, (entry["name"], kind)
+    return match.group(1)
+
+
+def _defaults(text, macro):
+    # The ``#ifndef`` default of ``macro`` in ``text`` (the program the shared unit
+    # was exported for): a list of at most one value.
+    return re.findall(
+        rf"^#ifndef {macro}\n#define {macro} (\S+)\n#endif$", text, re.MULTILINE
+    )
+
+
+def _defines(entry):
+    # The ``-D`` definitions of the entry's compile line, by macro.
+    found = {}
+    for flag in entry["nvcc_flags"]:
+        if flag.startswith("-D"):
+            macro, _, value = flag[2:].partition("=")
+            assert macro not in found, (entry["name"], flag)
+            found[macro] = value
+    return found
 
 
 def test_shared_kernel_sources_keep_distinct_symbols():
-    # Programs that differ only in their constants (scan lever twins, finalize
-    # groups) build one kernel translation unit: the program whose source it is
-    # names its symbol through the file's ``CAKE_PROGRAM_KERNEL`` default, every
-    # other entry names its own symbol on the compile line.  All libraries of one
-    # architecture load into one process, so every entry must still produce
-    # ``kernel_<program>``.
+    # Programs whose kernel text differs only in a few constants (a scan lever-twin
+    # group, the rank-finalize programs of one window form) build one kernel
+    # translation unit: it names its kernel ``CAKE_PROGRAM_KERNEL`` and reads those
+    # constants from ``CAKE_INDEXER_<KNOB>``, each with an ``#ifndef`` default
+    # naming the program the unit was exported for; every other entry passes its
+    # own values with ``-D``.  A program with a unit of its own spells its symbol.
+    # All libraries of one architecture load into one process, so every entry must
+    # still produce ``kernel_<program>``, and every definition an entry passes must
+    # be one its source reads.
     package = cake_jit.__file__.rsplit("/", 1)[0]
     symbols = {}
     for entry in cake_build.manifest()["libraries"]:
         name, arch = entry["name"], entry["arch"]
         assert name.endswith(f"_{arch}"), name
         program = name[: -len(arch) - 1]
-        kernel_source = entry["sources"][0]
-        assert kernel_source.endswith("_kernel.cu"), (name, kernel_source)
-        with open(os.path.join(package, kernel_source)) as source:
-            defaults = [
-                line[len(_PROGRAM_KERNEL_DEFAULT) :].strip()
-                for line in source
-                if line.startswith(_PROGRAM_KERNEL_DEFAULT)
-            ]
-        flags = [f for f in entry["nvcc_flags"] if f.startswith(_PROGRAM_KERNEL_FLAG)]
-        assert len(flags) <= 1 and len(defaults) <= 1, (name, flags, defaults)
-        if program in kernel_source:
-            # the file's own program: a default, when present, names its own symbol
-            assert defaults in ([], [f"kernel_{program}"]), (name, defaults)
+        unit = _unit(entry, 0, "kernel")
+        with open(os.path.join(package, entry["sources"][0])) as source:
+            text = source.read()
+        defines = _defines(entry)
+        for macro, value in defines.items():
+            if macro in _BINDING_DEFINES:
+                continue
+            if macro not in _KERNEL_DEFINES:
+                assert _KNOB_DEFINE.match(f"-D{macro}={value}"), (name, macro)
+            assert len(_defaults(text, macro)) == 1, (name, macro)
+        defaults = _defaults(text, "CAKE_PROGRAM_KERNEL")
+        if not defaults:
+            # a unit of its own: the source spells the program's symbol
+            assert unit == program and "CAKE_PROGRAM_KERNEL" not in defines, name
+            assert f"kernel_{program}(" in text, name
+            symbol = f"kernel_{program}"
         else:
-            # another program's translation unit: the symbol comes from the compile line
-            assert flags, (name, kernel_source)
-        if flags:
-            symbol = flags[0][len(_PROGRAM_KERNEL_FLAG) :]
-        else:
-            symbol = defaults[0] if defaults else f"kernel_{program}"
+            # a shared unit: its own program takes the default, every other program
+            # names its symbol on the compile line
+            assert defaults == [f"kernel_{unit}"], (name, defaults)
+            assert "CAKE_PROGRAM_KERNEL(" in text, name
+            assert ("CAKE_PROGRAM_KERNEL" in defines) == (unit != program), name
+            symbol = defines.get("CAKE_PROGRAM_KERNEL", defaults[0])
         assert symbol == f"kernel_{program}", (name, symbol)
         symbols.setdefault(program, set()).add(symbol)
     assert set(symbols) == set(cake_jit.PROGRAMS)
     assert len({s for group in symbols.values() for s in group}) == len(symbols)
 
 
-_PROGRAM_SHIM_FLAG = "-DCAKE_PROGRAM_SHIM="
-_PROGRAM_SHIM_DEFAULT = "#define CAKE_PROGRAM_SHIM "
-_HOST_SHIM_NAMESPACE = re.compile(r"^cake_host_shim_[0-9a-f]{16}$")
-_PROGRAM_IDENTIFIER = re.compile(
-    r"cake_dsa_indexer_topk_[0-9a-f]{20}|cake_host_shim_[0-9a-f]{16}"
-)
 _CHECK_OPEN = re.compile(r"\bTVM_FFI_CHECK(?:_CUDA_ERROR)?\(")
 
 
@@ -527,75 +565,65 @@ def _check_conditions(text):
 
 
 def test_shared_binding_sources_keep_distinct_namespaces():
-    # Programs whose exported binding text differs only in the kernel symbol, the
-    # host-shim namespace and the launch constants build one binding translation
-    # unit: it declares and launches ``CAKE_PROGRAM_KERNEL`` and exports ``run`` from
-    # namespace ``CAKE_PROGRAM_SHIM``, both defaulting to the program the file was
-    # exported for; every other entry names its own symbol and namespace on the
-    # compile line.  All libraries of one architecture load into one process, so
-    # every entry must still export a distinct namespace, and no check condition may
-    # spell a macro (``TVM_FFI_CHECK`` stringizes its condition unexpanded).
+    # Programs whose launcher text differs only in the kernel symbol, the host-shim
+    # namespace, the block size and the dynamic shared memory build one binding
+    # translation unit: it declares and launches ``CAKE_KERNEL_SYMBOL`` with
+    # ``CAKE_BINDING_THREADS`` / ``CAKE_BINDING_SMEM`` and exports ``run`` from
+    # namespace ``CAKE_PROGRAM_SHIM``, each with an ``#ifndef`` default naming the
+    # program the file was exported for; every other entry passes its own values
+    # with ``-D``.  A program with a binding of its own spells its names.  All
+    # libraries of one architecture load into one process, so every entry must
+    # still export a distinct namespace, and no check condition may spell a macro
+    # (``TVM_FFI_CHECK`` stringizes its condition unexpanded).
     package = cake_jit.__file__.rsplit("/", 1)[0]
-    with open(
-        os.path.join(
-            package, "csrc/cake_dsa_indexer_topk/cake_dsa_indexer_topk_host_common.cuh"
-        )
-    ) as header:
-        assert not [c for c in _check_conditions(header.read()) if "CAKE_" in c]
     namespaces = {}
     for entry in cake_build.manifest()["libraries"]:
         name, arch = entry["name"], entry["arch"]
         program = name[: -len(arch) - 1]
-        binding_source = entry["sources"][1]
-        assert binding_source.endswith("_binding.cu"), (name, entry["sources"])
-        with open(os.path.join(package, binding_source)) as source:
+        unit = _unit(entry, 1, "binding")
+        with open(os.path.join(package, entry["sources"][1])) as source:
             text = source.read()
         lines = text.splitlines()
-        assert lines.count("namespace CAKE_PROGRAM_SHIM {") == 1, name
-        assert 'extern "C" __global__ void CAKE_PROGRAM_KERNEL(' in text, name
-        assert "TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, CAKE_PROGRAM_SHIM::Run);" in text
         assert "TVM_FFI_DLL_EXPORT_TYPED_FUNC(build_cuda_version, " in text, name
         assert not [
             c for c in _check_conditions(text) if "CAKE_" in c or "SMEM_TOTAL" in c
         ], name
-        kernel_defaults = [
-            line[len(_PROGRAM_KERNEL_DEFAULT) :].strip()
-            for line in lines
-            if line.startswith(_PROGRAM_KERNEL_DEFAULT)
-        ]
-        shim_defaults = [
-            line[len(_PROGRAM_SHIM_DEFAULT) :].strip()
-            for line in lines
-            if line.startswith(_PROGRAM_SHIM_DEFAULT)
-        ]
-        assert len(kernel_defaults) == 1 and len(shim_defaults) == 1, name
-        # every other mention of a program identifier goes through the two macros
-        assert not [
-            line
-            for line in lines
-            if _PROGRAM_IDENTIFIER.search(line)
-            and not line.startswith(("#define CAKE_PROGRAM_", "//"))
-        ], name
-        shim_flags = [
-            f for f in entry["nvcc_flags"] if f.startswith(_PROGRAM_SHIM_FLAG)
-        ]
-        kernel_flags = [
-            f for f in entry["nvcc_flags"] if f.startswith(_PROGRAM_KERNEL_FLAG)
-        ]
-        assert len(shim_flags) <= 1 and len(kernel_flags) <= 1, (name, entry)
-        if program in binding_source:
-            # the file's own program: the defaults name it; a flag, when present, agrees
-            assert kernel_defaults == [f"kernel_{program}"], (name, kernel_defaults)
-            assert shim_flags in ([], [_PROGRAM_SHIM_FLAG + shim_defaults[0]]), name
+        defines = _defines(entry)
+        defaults = {macro: _defaults(text, macro) for macro in _BINDING_DEFINES}
+        if not any(defaults.values()):
+            # a binding of its own: the source spells the program's names
+            assert unit == program, name
+            assert not [m for m in _BINDING_DEFINES if m in defines], (name, defines)
+            namespace = f"cake_binding_kernel_{program}"
+            assert lines.count(f"namespace {namespace} {{") == 1, name
+            assert f'extern "C" __global__ void kernel_{program}(' in text, name
+            assert f"TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, {namespace}::Run);" in text
         else:
-            # another program's translation unit: symbol and namespace come from the
-            # compile line
-            assert kernel_flags == [f"{_PROGRAM_KERNEL_FLAG}kernel_{program}"], name
-            assert shim_flags, (name, binding_source)
-        namespace = (
-            shim_flags[0][len(_PROGRAM_SHIM_FLAG) :] if shim_flags else shim_defaults[0]
-        )
-        assert _HOST_SHIM_NAMESPACE.match(namespace), (name, namespace)
+            assert all(len(found) == 1 for found in defaults.values()), (name, defaults)
+            assert defaults["CAKE_KERNEL_SYMBOL"] == [f"kernel_{unit}"], name
+            assert defaults["CAKE_PROGRAM_SHIM"] == [f"cake_binding_kernel_{unit}"]
+            assert lines.count("namespace CAKE_PROGRAM_SHIM {") == 1, name
+            assert 'extern "C" __global__ void CAKE_KERNEL_SYMBOL(' in text, name
+            assert "TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, CAKE_PROGRAM_SHIM::Run);" in text
+            # every other mention of a program identifier goes through the macros
+            assert not [
+                line
+                for line in lines
+                if _PROGRAM_IDENTIFIER.search(line)
+                and not line.startswith(("#define CAKE_", "//"))
+            ], name
+            if unit == program:
+                assert "CAKE_KERNEL_SYMBOL" not in defines, name
+                assert "CAKE_PROGRAM_SHIM" not in defines, name
+            else:
+                # another program's binding: symbol and namespace come from the
+                # compile line
+                assert defines.get("CAKE_KERNEL_SYMBOL") == f"kernel_{program}", name
+                assert "CAKE_PROGRAM_SHIM" in defines, name
+            namespace = defines.get(
+                "CAKE_PROGRAM_SHIM", defaults["CAKE_PROGRAM_SHIM"][0]
+            )
+        assert namespace == f"cake_binding_kernel_{program}", (name, namespace)
         namespaces.setdefault(program, set()).add(namespace)
     assert set(namespaces) == set(cake_jit.PROGRAMS)
     assert all(len(found) == 1 for found in namespaces.values()), namespaces
@@ -1575,7 +1603,7 @@ def test_shipped_floor_rule_keeps_the_pooled_workspace_small():
     layout) of a packed batch, here the CP16 zigzag rank-0 geometry of the Z3cp row with its keys pooled 4:1, takes
     8192-slot candidate buffers (57 MiB on 152 SMs with six queries per unit, the pre-16384-floor plan: check period 16),
     where the 16384-slot floor on every top_k needed 114 MiB and check period 32; ``candidate_multiplier=32`` restores
-    that plan; a top_k 2048 call of the same geometry keeps the previous record's 16384 slots; ``dsa_indexer_workspace_size``
+    that plan; a top_k 2048 call of the same geometry keeps the previous record's 16384 slots; ``dsa_indexer_det_workspace_size``
     agrees.  sm_103a sets no rule: the same call keeps its 16384-slot buffers (114 MiB, check period 32), the plan of the
     previous package there."""
     pooled = dict(
@@ -1607,13 +1635,13 @@ def test_shipped_floor_rule_keeps_the_pooled_workspace_small():
         == 16384
     )
     assert (
-        dsa_indexer_workspace_size(
+        dsa_indexer_det_workspace_size(
             10624, 43824, 16, top_k=512, ratio=4, arch="sm_100a", num_sms=152
         )
         == new.workspace_bytes
     )
     assert (
-        dsa_indexer_workspace_size(
+        dsa_indexer_det_workspace_size(
             10624,
             43824,
             16,
@@ -1632,7 +1660,7 @@ def test_shipped_floor_rule_keeps_the_pooled_workspace_small():
     assert (kept.cand_cap, kept.check_period) == (16384, 32)
     assert kept.workspace_bytes == 152 * 6 * 16384 * 8 + tail == 119537664 + tail
     assert (
-        dsa_indexer_workspace_size(
+        dsa_indexer_det_workspace_size(
             10624, 43824, 16, top_k=512, ratio=4, arch="sm_103a", num_sms=152
         )
         == kept.workspace_bytes
@@ -1765,7 +1793,7 @@ def test_shipped_sample_shift_rule_by_architecture():
         ("sm_107a", 4096, {}, 250),
         ("sm_103a", 4096, {"sample_shift_permille": 250}, 250),
     ):
-        plan = plan_dsa_indexer_topk(
+        plan = plan_dsa_indexer_det_topk(
             16384, 16384, 1, top_k=K, arch=arch, num_sms=152, **knobs
         )
         assert plan.sample_shift_permille == shift, (arch, K, knobs)
@@ -1857,7 +1885,7 @@ def _host_inputs(total_q=6, total_k=10, segments=(0, 2, 6), key_segments=(0, 3, 
 
 
 def _validate(h):
-    return validate_dsa_indexer_inputs(
+    return validate_dsa_indexer_det_inputs(
         h.q,
         h.k,
         h.w,
@@ -2443,7 +2471,7 @@ def test_dispatch_rows_are_exact_and_plan_matches_runner(seg_q, seg_k, top_k):
     )
     bound = max(inputs.seg_k_len)  # the caller's bound on every key segment (lever RW)
     plan = _plan(inputs, max_seqlen_k=bound)
-    runner = prepare_dsa_indexer_topk(
+    runner = prepare_dsa_indexer_det_topk(
         inputs.q,
         inputs.k,
         inputs.w,
@@ -2533,24 +2561,27 @@ def test_far_sample_knob_is_validated_on_the_host():
         pytest.skip("placeholder registry")
     for arch in cake_jit.ARCHES:
         grid = _FROZEN_GRIDS[arch][0]
-        plan = plan_dsa_indexer_topk(1024, 4096, 1, top_k=256, arch=arch, num_sms=grid)
+        plan = plan_dsa_indexer_det_topk(
+            1024, 4096, 1, top_k=256, arch=arch, num_sms=grid
+        )
         assert plan.far_sample in (0, 1)
         assert plan.far_sample == policy_for(arch).far_sample
         for value in (0, 1):
             assert (
-                plan_dsa_indexer_topk(
+                plan_dsa_indexer_det_topk(
                     1024, 4096, 1, top_k=256, arch=arch, num_sms=grid, far_sample=value
                 ).far_sample
                 == value
             )
         for bad in (2, -1, True):
             with pytest.raises(ValueError, match="far_sample"):
-                plan_dsa_indexer_topk(
+                plan_dsa_indexer_det_topk(
                     1024, 4096, 1, top_k=256, arch=arch, num_sms=grid, far_sample=bad
                 )
 
 
 PARTITION_KNOBS = (
+    {"grid_ctas": 2},
     {"grid_ctas": 37},
     {"candidate_multiplier": 2},
     {"check_period": 1},
@@ -2575,6 +2606,40 @@ def test_partition_knobs_do_not_change_results(knobs):
     _judge_ok(base, ref.select_reference(inputs))
     other = _run(inputs, **knobs)
     assert ref.same_bits(base, other), f"partition knob {knobs} changed the result"
+
+
+# The exact cases (cutoff ties, signed zeros, large tie groups, ...) under the partition and sampling knobs: the
+# id rule (a tied score keeps the larger id) and the zero rule (+0.0 == -0.0) select the same keys with the same
+# score bits however the keys are split across CTAs, buffered, checked or sampled, and every row stays in
+# positional order (ascending ids, padding only at the tail).
+EXACT_CASE_KNOBS = (
+    {"grid_ctas": 2},
+    {"grid_ctas": 37},
+    {"candidate_multiplier": 2},
+    {"check_period": 1},
+    {"sample_tiles_max": 0},
+    {"sample_shift_permille": -500},
+    {"far_sample": 1},
+)
+
+
+def _assert_positional_order(ids: torch.Tensor) -> None:
+    valid = ids >= 0
+    flags = valid.to(torch.int32)
+    assert torch.equal(flags, flags.cummin(dim=1).values), "padding before a valid id"
+    assert bool(((ids[:, 1:] > ids[:, :-1]) | ~valid[:, 1:]).all()), "ids not ascending"
+
+
+@pytest.mark.parametrize("name", list(ref.EXACT_CASES))
+def test_exact_cases_are_knob_invariant(name):
+    _require_program()
+    inputs = ref.make_exact_case(name, "cuda")
+    base = _run(inputs)
+    _judge_ok(base, ref.select_reference(inputs, order="sequential"), exact_bits=True)
+    _assert_positional_order(base[0])
+    for knobs in EXACT_CASE_KNOBS:
+        other = _run(inputs, **knobs)
+        assert ref.same_bits(base, other), f"{name}: knob {knobs} changed the result"
 
 
 # -- the attention-sink + local-band distribution (flashinfer-ai/flashinfer#7042) ----------------------------------
@@ -2728,7 +2793,7 @@ def test_prepared_runner_graph_capture_and_replay():
         [600, 400], [600, 12000], top_k=1024, seed=50, device="cuda"
     )
     eager = _run(inputs)
-    runner = prepare_dsa_indexer_topk(
+    runner = prepare_dsa_indexer_det_topk(
         inputs.q,
         inputs.k,
         inputs.w,
@@ -2779,7 +2844,7 @@ def _assert_ticket_tail_zero(runner) -> None:
 
 
 def _prepare(inputs: ref.IndexerInputs, **extra):
-    return prepare_dsa_indexer_topk(
+    return prepare_dsa_indexer_det_topk(
         inputs.q,
         inputs.k,
         inputs.w,
@@ -2832,7 +2897,7 @@ def test_prepared_runner_ticket_tail_is_zero_at_prepare_after_runs_and_after_a_f
 
 
 def _workspace_bytes(inputs: ref.IndexerInputs, device: torch.device) -> int:
-    return dsa_indexer_workspace_size(
+    return dsa_indexer_det_workspace_size(
         inputs.num_queries,
         inputs.num_keys,
         inputs.num_segments,
@@ -2967,7 +3032,7 @@ def test_workspace_bound_is_respected():
         [900, 300], [900, 7000], top_k=2048, seed=60, device="cuda"
     )
     device = torch.device("cuda", torch.cuda.current_device())
-    nbytes = dsa_indexer_workspace_size(
+    nbytes = dsa_indexer_det_workspace_size(
         inputs.num_queries,
         inputs.num_keys,
         inputs.num_segments,
@@ -2990,7 +3055,7 @@ def test_workspace_bound_is_respected():
     scores = torch.empty(
         (inputs.num_queries, inputs.top_k), dtype=torch.float32, device=device
     )
-    runner = prepare_dsa_indexer_topk(
+    runner = prepare_dsa_indexer_det_topk(
         inputs.q,
         inputs.k,
         inputs.w,
@@ -3017,7 +3082,7 @@ def test_workspace_bound_is_respected():
     )
     _judge_ok(out, ref.select_reference(inputs))
     with pytest.raises(ValueError, match="workspace_buffer needs"):
-        prepare_dsa_indexer_topk(
+        prepare_dsa_indexer_det_topk(
             inputs.q,
             inputs.k,
             inputs.w,
@@ -3035,7 +3100,7 @@ def test_empty_rows_and_no_keys_are_all_padding():
     k = torch.zeros((5, HEAD_DIM), dtype=torch.bfloat16, device=device)
     w = torch.zeros((0, NUM_HEADS), dtype=torch.float32, device=device)
     cu = torch.tensor([0, 0], dtype=torch.int32, device=device)
-    indices, scores = cake_backend.dsa_indexer_topk(
+    indices, scores = cake_backend.dsa_indexer_det_topk(
         q, k, w, cu, torch.tensor([0, 5], dtype=torch.int32, device=device), top_k=8
     )
     assert tuple(indices.shape) == (0, 8) and tuple(scores.shape) == (0, 8)
@@ -3148,10 +3213,10 @@ def test_device_facts_are_queried_once_per_device(monkeypatch):
     for dev in (device, torch.device("cuda"), None, index, f"cuda:{index}"):
         for _ in range(3):
             assert arch_for(dev) == SUPPORTED_COMPUTE_CAPABILITIES[capability]
-            plan = plan_dsa_indexer_topk(1024, 4096, 1, top_k=256, device=dev)
+            plan = plan_dsa_indexer_det_topk(1024, 4096, 1, top_k=256, device=dev)
             assert plan.grid == sms
             assert (
-                dsa_indexer_workspace_size(1024, 4096, 1, top_k=256, device=dev)
+                dsa_indexer_det_workspace_size(1024, 4096, 1, top_k=256, device=dev)
                 == plan.workspace_bytes
             )
     assert properties.call_count == 1 and capabilities.call_count == 0
@@ -3173,7 +3238,7 @@ def test_prepared_calls_perform_no_device_queries_after_warm_up(monkeypatch):
     monkeypatch.setattr(torch.cuda, "get_device_properties", boom)
     monkeypatch.setattr(torch.cuda, "get_device_capability", boom)
     again = _run(inputs)
-    runner = prepare_dsa_indexer_topk(
+    runner = prepare_dsa_indexer_det_topk(
         inputs.q,
         inputs.k,
         inputs.w,
@@ -3198,7 +3263,7 @@ def test_policy_is_validated_once_per_architecture(monkeypatch):
         policy = policy_for(arch)
         validate.reset_mock()
         assert policy_for(arch) is policy
-        plan_dsa_indexer_topk(
+        plan_dsa_indexer_det_topk(
             1024, 4096, 1, top_k=256, arch=arch, num_sms=_FROZEN_GRIDS[arch][0]
         )
         assert validate.call_count == 0, arch
