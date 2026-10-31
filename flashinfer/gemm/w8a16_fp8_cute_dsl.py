@@ -198,13 +198,6 @@ def _get_sm100_kernel(
     # Bytes of weight each transform thread converts per step: a whole stage when K
     # is one k-tile (no pipelining to overlap), 32 otherwise (as the W4A16 kernel).
     transform_fragment_size = 128 if k == mma_tiler[2] else 32
-    # EXPERIMENT knobs (tuning sweeps): fragment bytes and transformed-A in smem.
-    import os
-
-    if os.environ.get("W8A16_DSL_FRAG"):
-        transform_fragment_size = int(os.environ["W8A16_DSL_FRAG"])
-    if os.environ.get("W8A16_DSL_AIN_SMEM"):
-        a_in_smem = os.environ["W8A16_DSL_AIN_SMEM"] == "1"
     key = (
         algo,
         act_dtype,

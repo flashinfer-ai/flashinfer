@@ -125,13 +125,6 @@ class Sm90W8A16Fp8GemmKernel:
         self.has_tail = has_tail
         self.enable_pdl = enable_pdl
         self.acc_dtype = cutlass.Float32
-        # EXPERIMENT: cut the tail fix-up: 1 = partial store only, 2 = + publish, count
-        # and spin, 3 = + reduce loads (no output store), 0 = everything.
-        import os
-
-        self.fixup_cut = int(os.environ.get("W8A16_DSL_FIXUP_CUT", "0"))
-        # EXPERIMENT: 0 disables the shared-item k-split under ping-pong.
-        self.ksplit_enabled = os.environ.get("W8A16_DSL_KSPLIT", "0") == "1"
 
         # Two consumer warpgroups either way.  Cooperative (128 weight rows): both work
         # on one tile, 64 rows each.  Ping-pong (64 rows): each owns every other tile of
@@ -450,16 +443,6 @@ class Sm90W8A16Fp8GemmKernel:
             ),
             w_smem_layout_staged.outer,
         )
-        # Ping-pong, CTA with a single work item: group 1's accumulators cross to
-        # group 0 through the (then idle) activation stages, (element, thread) with
-        # consecutive threads 16 bytes apart.
-        acc_per_thread = tile_m * tile_a // 128
-        sRed = cute.make_tensor(
-            cute.recast_ptr(storage.sB.data_ptr(), dtype=self.acc_dtype),
-            cute.make_layout(
-                ((4, acc_per_thread // 4), 128), stride=((1, 512), 4)
-            ),
-        )
         sBias = storage.bias_tile.get_tensor(
             cute.make_layout((tile_m, 2), stride=(1, tile_m))
         )
@@ -584,7 +567,6 @@ class Sm90W8A16Fp8GemmKernel:
                         sB,
                         sC,
                         sW,
-                        sRed,
                         sBias,
                         tma_atom_c,
                         gC_mnl,
@@ -619,7 +601,6 @@ class Sm90W8A16Fp8GemmKernel:
                         sB,
                         sC,
                         sW,
-                        sRed,
                         sBias,
                         tma_atom_c,
                         gC_mnl,
@@ -655,7 +636,6 @@ class Sm90W8A16Fp8GemmKernel:
                     sB,
                     sC,
                     sW,
-                    sRed,
                     sBias,
                     tma_atom_c,
                     gC_mnl,
@@ -693,7 +673,6 @@ class Sm90W8A16Fp8GemmKernel:
         sB: cute.Tensor,
         sC: cute.Tensor,
         sW: cute.Tensor,
-        sRed: cute.Tensor,
         sBias: cute.Tensor,
         tma_atom_c: cute.CopyAtom,
         gC_mnl: cute.Tensor,
@@ -725,7 +704,6 @@ class Sm90W8A16Fp8GemmKernel:
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         # Thread index within the tiled MMA / epilogue copies, and within its warpgroup.
         ctid = tidx % 128 if self.pingpong else tidx - 128
-        wg_tid = tidx % 128
         epi_store_warp = 4 + 4 * cg if self.pingpong else 4
         epi_barrier = pipeline.NamedBarrier(
             barrier_id=1 + cg, num_threads=self.num_epi_threads
@@ -791,8 +769,6 @@ class Sm90W8A16Fp8GemmKernel:
         rD_shape = cute.shape(thr_copy_r2s.partition_S(sC))
         tRS_rD = cute.make_rmem_tensor(rD_shape[:3], self.acc_dtype)
         tRS_rD_out = cute.make_rmem_tensor(rD_shape[:3], self.c_dtype)
-        m_subs = tile_m // self.epi_tile[0]
-        n_subs = tile_a // self.epi_tile[1]
         tma_store_pipeline = pipeline.PipelineTmaStore.create(
             num_stages=self.epi_stage,
             producer_group=pipeline.CooperativeGroup(
@@ -813,44 +789,20 @@ class Sm90W8A16Fp8GemmKernel:
         work_step = gdx * (2 if self.pingpong else 1)
         lin = cutlass.Int32(bidx + cg * gdx)
         order_phase = cutlass.Int32(1 - cg)
-        # Ping-pong with fewer items than CTAs (this CTA has only item bidx): both
-        # groups work on that item, group cg on the k-tiles of parity cg, each skipping
-        # the other's stage after its own, and group 1 hands its accumulators to group
-        # 0 through smem before the epilogue (k_split).  The groups then run their
-        # mainloops concurrently, so the order barriers are bypassed.
-        k_split = cutlass.Boolean(False)
-        if cutlass.const_expr(self.pingpong and self.ksplit_enabled):
-            if bidx < total_work and bidx + gdx >= total_work:
-                _, _, _, _, k_cnt0, _, _ = self._work_item(
-                    cutlass.Int32(bidx),
-                    body_items,
-                    tail_splits,
-                    k_tiles_total,
-                    weight_tiles,
-                    act_tiles,
-                    group,
-                )
-                k_split = k_cnt0 >= 2
-        reduce_barrier = pipeline.NamedBarrier(barrier_id=3, num_threads=256)
         if cutlass.const_expr(self.pingpong and cg == 1):
-            if k_split:
-                lin = cutlass.Int32(bidx)
+            # Skip the stages of the other group's first item (work item bidx).
+            _, _, _, _, k_skip0, _, _ = self._work_item(
+                cutlass.Int32(bidx),
+                body_items,
+                tail_splits,
+                k_tiles_total,
+                weight_tiles,
+                act_tiles,
+                group,
+            )
+            for _ in cutlass.range(0, k_skip0, 1, unroll=1):
                 read_state.advance()
                 release_state.advance()
-            else:
-                # Skip the stages of the other group's first item (work item bidx).
-                _, _, _, _, k_skip0, _, _ = self._work_item(
-                    cutlass.Int32(bidx),
-                    body_items,
-                    tail_splits,
-                    k_tiles_total,
-                    weight_tiles,
-                    act_tiles,
-                    group,
-                )
-                for _ in cutlass.range(0, k_skip0, 1, unroll=1):
-                    read_state.advance()
-                    release_state.advance()
         tiles_done = cutlass.Int32(0)
         k_skip = cutlass.Int32(0)  # loop-carried: a stable type on every path
         while lin < total_work:
@@ -866,12 +818,7 @@ class Sm90W8A16Fp8GemmKernel:
                 )
             )
             if cutlass.const_expr(self.pingpong):
-                if not k_split:
-                    cute.arch.mbarrier_wait(order_bar + cg, order_phase)
-            # This group's k-tiles of the item (every other one under k_split).
-            k_tiles_own = k_tile_cnt
-            if k_split:
-                k_tiles_own = (k_tile_cnt + 1 - cg) // 2
+                cute.arch.mbarrier_wait(order_bar + cg, order_phase)
 
             # ---- mainloop
             accumulators.fill(0.0)
@@ -885,8 +832,6 @@ class Sm90W8A16Fp8GemmKernel:
             ab_pipeline.consumer_wait(read_state)
             stage = cutlass.Int32(read_state.index)
             read_state.advance()
-            if k_split:
-                read_state.advance()
             # Loads run two k-blocks ahead of the wgmma, converts one ahead, as the
             # CUTLASS mainloop: the smem latency and the ALU work hide behind the
             # tensor core.
@@ -913,7 +858,7 @@ class Sm90W8A16Fp8GemmKernel:
                     # mainloop does the same: a cold try_wait costs ~100 cycles).
                     # Only when a next k-tile exists: try_wait on a stage nobody
                     # fills suspends the thread until the hardware time limit.
-                    if k_tiles_own > 1:
+                    if k_tile_cnt > 1:
                         next_full = ab_pipeline.consumer_try_wait(read_state)
                 if cutlass.const_expr(kb + 2 < num_k_blocks):
                     a_words[kb + 2] = self._a_loads(kb + 2, stage_addr, a_unit_off)
@@ -925,12 +870,10 @@ class Sm90W8A16Fp8GemmKernel:
             # pending, then the previous stage is released at the last k-block (all
             # its wgmma are done) and the registers of k-block kb + 1 are refilled
             # (their reader, k-block kb + 1 of the previous k-tile, is done).
-            for _k_tile in cutlass.range(1, k_tiles_own, 1, unroll=1):
+            for _k_tile in cutlass.range(1, k_tile_cnt, 1, unroll=1):
                 ab_pipeline.consumer_wait(read_state, next_full)
                 stage = cutlass.Int32(read_state.index)
                 read_state.advance()
-                if k_split:
-                    read_state.advance()
                 stage_addr_k = a_smem_addr + stage * a_stage_bytes
                 a_words_k = {}
                 a_words_k[0] = self._a_loads(0, stage_addr_k, a_unit_off)
@@ -950,13 +893,11 @@ class Sm90W8A16Fp8GemmKernel:
                     warpgroup.commit_group()
                     warpgroup.wait_group(k_wait_max)
                     if cutlass.const_expr(kb == 0):
-                        if _k_tile + 1 < k_tiles_own:
+                        if _k_tile + 1 < k_tile_cnt:
                             next_full = ab_pipeline.consumer_try_wait(read_state)
                     if cutlass.const_expr(kb == num_k_blocks - 1):
                         ab_pipeline.consumer_release(release_state)
                         release_state.advance()
-                        if k_split:
-                            release_state.advance()
                     if cutlass.const_expr(kb + 2 < num_k_blocks):
                         a_words_k[kb + 2] = self._a_loads(
                             kb + 2, stage_addr_k, a_unit_off
@@ -965,101 +906,82 @@ class Sm90W8A16Fp8GemmKernel:
                         self._a_convert(tCrA_mma, kb + 1, a_words_k[kb + 1])
                 warpgroup.fence()
             if cutlass.const_expr(self.pingpong):
-                if not k_split:
-                    # The other group's mainloop may start; this one drains behind it.
-                    cute.arch.mbarrier_arrive(order_bar + (1 - cg))
+                # The other group's mainloop may start; this one drains behind it.
+                cute.arch.mbarrier_arrive(order_bar + (1 - cg))
             warpgroup.wait_group(0)
             ab_pipeline.consumer_release(release_state)
             release_state.advance()
-            # Under ping-pong only one group runs the epilogue of a k_split item.
-            runs_epilogue = cutlass.Boolean(True)
             if cutlass.const_expr(self.pingpong):
-                if k_split:
-                    # Both groups are past their last wgmma after the barrier, and the
-                    # producer has nothing more to load, so the stages are free.
-                    reduce_barrier.arrive_and_wait()
-                    if cutlass.const_expr(cg == 1):
-                        for i in cutlass.range_constexpr(cute.size(accumulators)):
-                            sRed[(i, ctid)] = accumulators[i]
-                        runs_epilogue = cutlass.Boolean(False)
-                    reduce_barrier.arrive_and_wait()
-                    if cutlass.const_expr(cg == 0):
-                        for i in cutlass.range_constexpr(cute.size(accumulators)):
-                            accumulators[i] = accumulators[i] + sRed[(i, ctid)]
-                else:
-                    # Skip the stages of the other group's next item (if it exists).
-                    lin_other = lin + gdx
-                    k_skip = cutlass.Int32(0)
-                    if lin_other < total_work:
-                        _, _, _, _, k_cnt_other, _, _ = self._work_item(
-                            lin_other,
-                            body_items,
-                            tail_splits,
-                            k_tiles_total,
-                            weight_tiles,
-                            act_tiles,
-                            group,
-                        )
-                        k_skip = k_cnt_other
-                    for _ in cutlass.range(0, k_skip, 1, unroll=1):
-                        read_state.advance()
-                        release_state.advance()
-                    cute.arch.mbarrier_wait(order_bar + 2 + cg, order_phase)
+                # Skip the stages of the other group's next item (if it exists).
+                lin_other = lin + gdx
+                k_skip = cutlass.Int32(0)
+                if lin_other < total_work:
+                    _, _, _, _, k_cnt_other, _, _ = self._work_item(
+                        lin_other,
+                        body_items,
+                        tail_splits,
+                        k_tiles_total,
+                        weight_tiles,
+                        act_tiles,
+                        group,
+                    )
+                    k_skip = k_cnt_other
+                for _ in cutlass.range(0, k_skip, 1, unroll=1):
+                    read_state.advance()
+                    release_state.advance()
+                cute.arch.mbarrier_wait(order_bar + 2 + cg, order_phase)
 
             # ---- epilogue.  Plain tile: D = scale * acc (+ bias[row]), cast, TMA store
             # into the output per (tile_m x 32) subtile.  Tail item: the fp32
             # accumulator into its workspace block.
-            if runs_epilogue:
-                self._epilogue(
-                    cg,
-                    lin,
-                    tile_idx,
-                    m_tile,
-                    n_tile,
-                    is_tail,
-                    slice_idx,
-                    tiles_done,
-                    tidx,
-                    warp_idx,
-                    ctid,
-                    thread_row,
-                    epi_store_warp,
-                    epi_barrier,
-                    accumulators,
-                    tiled_copy_r2s,
-                    tma_atom_c,
-                    tma_store_pipeline,
-                    sC,
-                    tRS_sD,
-                    tRS_rAcc,
-                    tRS_cAcc,
-                    tRS_rD,
-                    tRS_rD_out,
-                    sW,
-                    sBias,
-                    tma_atom_w,
-                    gC_mnl,
-                    gW_mnl,
-                    wv,
-                    cv,
-                    bv,
-                    counters,
-                    scale,
-                    bias,
-                    weight_rows,
-                    act_rows,
-                    body_items,
-                    tail_splits,
-                )
+            self._epilogue(
+                cg,
+                lin,
+                tile_idx,
+                m_tile,
+                n_tile,
+                is_tail,
+                slice_idx,
+                tiles_done,
+                tidx,
+                warp_idx,
+                ctid,
+                thread_row,
+                epi_store_warp,
+                epi_barrier,
+                accumulators,
+                tiled_copy_r2s,
+                tma_atom_c,
+                tma_store_pipeline,
+                sC,
+                tRS_sD,
+                tRS_rAcc,
+                tRS_cAcc,
+                tRS_rD,
+                tRS_rD_out,
+                sW,
+                sBias,
+                tma_atom_w,
+                gC_mnl,
+                gW_mnl,
+                wv,
+                cv,
+                bv,
+                counters,
+                scale,
+                bias,
+                weight_rows,
+                act_rows,
+                body_items,
+                tail_splits,
+            )
             if cutlass.const_expr(self.pingpong):
-                if not k_split:
-                    # The other group reuses the epilogue smem next: every TMA store
-                    # of this tile must have read it (the store wait is per issuing
-                    # thread).
-                    tma_store_pipeline.producer_tail()
-                    epi_barrier.arrive_and_wait()
-                    cute.arch.mbarrier_arrive(order_bar + 2 + (1 - cg))
-                    order_phase ^= 1
+                # The other group reuses the epilogue smem next: every TMA store of
+                # this tile must have read it (the store wait is per issuing thread).
+                tma_store_pipeline.producer_tail()
+                epi_barrier.arrive_and_wait()
+                cute.arch.mbarrier_arrive(order_bar + 2 + (1 - cg))
+                order_phase ^= 1
             tiles_done += 1
             lin += work_step
         tma_store_pipeline.producer_tail()
@@ -1157,7 +1079,7 @@ class Sm90W8A16Fp8GemmKernel:
                     cute.group_modes(sW, 0, 2),
                     tCgW_epi,
                 )
-                for m_sub in cutlass.range_constexpr(0 if self.fixup_cut == 4 else m_subs):
+                for m_sub in cutlass.range_constexpr(m_subs):
                     for n_sub in cutlass.range_constexpr(n_subs):
                         base = (m_sub * n_subs + n_sub) * size_tRS_rW
                         for b in cutlass.range_constexpr(n8_blocks):
@@ -1180,7 +1102,9 @@ class Sm90W8A16Fp8GemmKernel:
                         # everyone may write it and the store of this subtile can
                         # be issued.
                         if warp_idx == epi_store_warp:
-                            cute.arch.cp_async_bulk_wait_group(self.epi_stage - 2, read=True)
+                            cute.arch.cp_async_bulk_wait_group(
+                                self.epi_stage - 2, read=True
+                            )
                         epi_barrier.arrive_and_wait()
                         if warp_idx == epi_store_warp:
                             cute.copy(
@@ -1286,8 +1210,6 @@ class Sm90W8A16Fp8GemmKernel:
             barrier_id=barrier_id, num_threads=self.num_epi_threads
         )
         counter_addr = counters.iterator.toint() + tail_tile * 8
-        if cutlass.const_expr(self.fixup_cut == 1 or self.fixup_cut == 4):
-            return
         # ``etid``: the thread's index within the tile's epilogue group (both consumer
         # warpgroups under cooperative, its own under ping-pong).
         if warp_idx == epi_store_warp:
@@ -1302,8 +1224,6 @@ class Sm90W8A16Fp8GemmKernel:
                 nanosleep(64)
                 seen = ld_acquire_gpu_u64(counter_addr)
         epi_barrier.arrive_and_wait()
-        if cutlass.const_expr(self.fixup_cut == 2):
-            return
 
         # This slice's columns: [slice * q + min(slice, rem), ...), q = tile_a / splits.
         q = tile_a // tail_splits
@@ -1336,11 +1256,7 @@ class Sm90W8A16Fp8GemmKernel:
                     acc = scale_val * acc
                     if cutlass.const_expr(self.has_bias):
                         acc = acc + bv[(None, w_row // 8)].load().to(cutlass.Float32)
-                    if cutlass.const_expr(self.fixup_cut == 3):
-                        if acc[0] == 12345.0:
-                            cv[(None, w_row // 8, act_row)].store(acc.to(cv.element_type))
-                    else:
-                        cv[(None, w_row // 8, act_row)].store(acc.to(cv.element_type))
+                    cv[(None, w_row // 8, act_row)].store(acc.to(cv.element_type))
 
     # ------------------------------------------------------- output epilogue
     @cute.jit
