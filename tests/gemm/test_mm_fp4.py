@@ -725,7 +725,9 @@ def _quantized_fp4_operands(m, n, k, use_nvfp4):
     return a_fp4, a_sf, b_fp4, b_sf
 
 
-def _expect_cudnn_scale_error(m, n, k, use_nvfp4, make_b_scale, match):
+def _expect_cudnn_scale_error(
+    m, n, k, use_nvfp4, make_b_scale, match, make_a_scale=lambda a_sf: a_sf
+):
     a_fp4, a_sf, b_fp4, b_sf = _quantized_fp4_operands(m, n, k, use_nvfp4)
     out = torch.empty([m, n], device="cuda", dtype=torch.bfloat16)
     try:
@@ -733,7 +735,7 @@ def _expect_cudnn_scale_error(m, n, k, use_nvfp4, make_b_scale, match):
             mm_fp4(
                 a_fp4,
                 b_fp4.T,
-                a_sf,
+                make_a_scale(a_sf),
                 make_b_scale(b_sf),
                 None,
                 torch.bfloat16,
@@ -822,3 +824,19 @@ def test_mm_fp4_l2_policy_rule():
     # other kernels are untouched
     assert mm_fp4_l2_policy(8, (128, 8), True, "sm100sk") is None
     assert mm_fp4_l2_policy(8, (128, 8), True, "sm103") is None
+
+
+@pytest.mark.parametrize("use_nvfp4", [False, True])
+def test_mm_fp4_cudnn_rejects_relaid_out_a_descale(use_nvfp4):
+    # Right shape, storage re-ordered: a copy of the transpose viewed back.
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required")
+    _expect_cudnn_scale_error(
+        128,
+        256,
+        512,
+        use_nvfp4,
+        lambda b_sf: b_sf.T,
+        "not a re-laid-out copy",
+        make_a_scale=lambda a_sf: a_sf.T.contiguous().T,
+    )
