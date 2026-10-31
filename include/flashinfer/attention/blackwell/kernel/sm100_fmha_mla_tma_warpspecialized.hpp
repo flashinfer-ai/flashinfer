@@ -859,13 +859,13 @@ struct Sm100FmhaMlaKernelTmaWarpspecialized {
     Tensor sKC = make_tensor(make_smem_ptr(shared_tensors.smem_kc.begin()), SmemLayoutKC{});
     Tensor sVC = make_tensor(make_smem_ptr(shared_tensors.smem_vc.begin()), SmemLayoutVC{});
 
-    auto make_copy_for = [](auto sT) {
+    auto make_copy_for = [](auto sT, auto copy_op) {
       auto rT_a = sT.layout()(_, _, _, _0{});
       auto rT = make_ordered_layout(shape(rT_a), stride(rT_a));
       auto threads = Int<kNumLoadWarps * cutlass::NumThreadsPerWarp>{};
       auto values = Int<sizeof(uint128_t) / sizeof(Element)>{};
       return make_cotiled_copy(
-          Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS<uint128_t>, Element>{},
+          Copy_Atom<decltype(copy_op), Element>{},
           make_ordered_layout(make_shape(threads, values), make_stride(_1{}, _0{})), rT);
     };
 
@@ -886,9 +886,9 @@ struct Sm100FmhaMlaKernelTmaWarpspecialized {
       }
     };
 
-    auto tiled_copy_q = make_copy_for(sQ);
-    auto tiled_copy_kc = make_copy_for(sKC);
-    auto tiled_copy_vc = make_copy_for(sVC);
+    auto tiled_copy_q = make_copy_for(sQ, SM80_CP_ASYNC_CACHEALWAYS<uint128_t>{});
+    auto tiled_copy_kc = make_copy_for(sKC, SM80_CP_ASYNC_CACHEALWAYS<uint128_t>{});
+    auto tiled_copy_vc = make_copy_for(sVC, SM80_CP_ASYNC_CACHEALWAYS_ZFILL<uint128_t>{});
 
     auto thr_copy_q =
         tiled_copy_q.get_thread_slice(threadIdx.x % (kNumLoadWarps * cutlass::NumThreadsPerWarp));
@@ -953,6 +953,32 @@ struct Sm100FmhaMlaKernelTmaWarpspecialized {
     auto tKCgCL = thr_copy_kc.partition_S(tSgCL);
     auto tKCgKR = thr_copy_kc.partition_S(tSgKR);
     auto tVCgCLT = thr_copy_vc.partition_S(tOgCLT);
+
+    // (d, k) coordinates of the V copies
+    auto cCLT = make_identity_tensor(make_shape(D_latent, paged_K * paged_B));
+    auto gcCLT = local_tile(cCLT, TileShapePV{}, make_coord(_, _, _), Step<X, _1, _1>{});
+    auto tVCcCLT = thr_copy_vc.partition_S(cta_mma_pv.partition_B(gcCLT));
+
+    // like copy_split, but zero-fills V rows past seq_len, which may hold NaN
+    // (page tails, unused page table slots) and would leak through 0 * NaN in P @ V
+    int seq_len = K;
+    auto copy_split_v = [&](auto src, auto dst, auto coord) {
+      auto src_v = group_modes<1, rank_v<decltype(src)>>(src);
+      auto dst_v = group_modes<1, rank_v<decltype(dst)>>(dst);
+      auto coord_v = group_modes<1, rank_v<decltype(coord)>>(coord);
+
+      auto src_v_ptrs = make_tensor<Element*>(size<1>(src_v));
+      for (int i = 0; i < size<1>(src_v); i++) {
+        src_v_ptrs(i) = &src_v(_0{}, i);
+      }
+
+      for (int i = 0; i < size<1>(src_v); i++) {
+        auto src_v_i = make_tensor(make_gmem_ptr(src_v_ptrs(i)), make_shape(shape<0>(src_v)),
+                                   make_stride(make_stride(_1{}, _0{})));
+        bool in_bounds = get<1>(coord_v(_0{}, i)) < seq_len;
+        tiled_copy_vc.with(in_bounds).call(src_v_i, dst_v(_, i));
+      }
+    };
 
     // latent is first in memory, so let's load it first always
     // startup: alternate Q and K, set tx count appropriately, for k_idx = 0
@@ -1028,8 +1054,9 @@ struct Sm100FmhaMlaKernelTmaWarpspecialized {
       for (int i = 0; i < IterationsPV_K; i++) {
         for (int j = 0; j < IterationsPV_N; j++) {
           load_stage([&](int index) {
-            copy_split(tiled_copy_vc, tVCgCLT(_, _, _, _, j, IterationsPV_K * (k_index - 1) + i),
-                       tVCsVC(_, _, _, _, index));
+            copy_split_v(tVCgCLT(_, _, _, _, j, IterationsPV_K * (k_index - 1) + i),
+                         tVCsVC(_, _, _, _, index),
+                         tVCcCLT(_, _, _, _, j, IterationsPV_K * (k_index - 1) + i));
           });
         }
       }
@@ -1046,8 +1073,9 @@ struct Sm100FmhaMlaKernelTmaWarpspecialized {
     for (int i = 0; i < IterationsPV_K; i++) {
       for (int j = 0; j < IterationsPV_N; j++) {
         load_stage([&](int index) {
-          copy_split(tiled_copy_vc, tVCgCLT(_, _, _, _, j, IterationsPV_K * (k_index - 1) + i),
-                     tVCsVC(_, _, _, _, index));
+          copy_split_v(tVCgCLT(_, _, _, _, j, IterationsPV_K * (k_index - 1) + i),
+                       tVCsVC(_, _, _, _, index),
+                       tVCcCLT(_, _, _, _, j, IterationsPV_K * (k_index - 1) + i));
         });
       }
     }
