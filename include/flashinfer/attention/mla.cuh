@@ -880,7 +880,7 @@ __device__ __forceinline__ void write_o(typename KTraits::SharedStorage* smem_st
     uint32_t o_smem_offset_w = o_smem.template get_permuted_offset<UPCAST_STRIDE_FINAL_O>(
         warp_idx_in_wg * 16 + lane_idx % 16,
         warpgroup_idx * NUM_MMA_D_CKV + mma_d * 2 + lane_idx / 16);
-    o_smem.template stmatrix_m8n8x4(o_smem_offset_w, o_frag_f16);
+    o_smem.stmatrix_m8n8x4(o_smem_offset_w, o_frag_f16);
 #else
     uint32_t o_smem_offset_w = o_smem.template get_permuted_offset<UPCAST_STRIDE_FINAL_O>(
         warp_idx_in_wg * 16 + lane_idx / 4, warpgroup_idx * NUM_MMA_D_CKV + mma_d * 2);
@@ -919,7 +919,7 @@ __device__ __forceinline__ void write_o(typename KTraits::SharedStorage* smem_st
 #pragma unroll
       for (uint32_t mma_d = 0; mma_d < NUM_MMA_D_CKV / 8; ++mma_d) {
         if (q_idx < q_len) {
-          o_smem.template store_128b(o_smem_offset_w, o_partial_ptr);
+          o_smem.template store_128b<DTypeO>(o_smem_offset_w, o_partial_ptr);
         }
         o_partial_ptr += 8 * upcast_size<DTypeO>();
         o_smem_offset_w = o_smem.template advance_offset_by_column<8>(o_smem_offset_w, mma_d);
@@ -960,7 +960,7 @@ __device__ __forceinline__ void write_o(typename KTraits::SharedStorage* smem_st
 #pragma unroll
       for (uint32_t mma_d = 0; mma_d < NUM_MMA_D_CKV / 8; ++mma_d) {
         if (q < q_len) {
-          o_smem.template store_128b(o_smem_offset_w, o_final_ptr);
+          o_smem.template store_128b<DTypeO>(o_smem_offset_w, o_final_ptr);
         }
         o_final_ptr += 8 * upcast_size<DTypeO>();
         o_smem_offset_w = o_smem.template advance_offset_by_column<8>(o_smem_offset_w, mma_d);

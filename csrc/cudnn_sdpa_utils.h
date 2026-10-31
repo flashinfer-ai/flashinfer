@@ -364,7 +364,7 @@ typedef struct FastDivisor {
 typedef struct strides {
   int64_t strides[4];
 
-  int __attribute__((host)) __attribute__((device)) operator[](int i) const { return strides[i]; }
+  int __host__ __device__ operator[](int i) const { return strides[i]; }
 } strides_t;
 
 }  // namespace cudnn_sdpa

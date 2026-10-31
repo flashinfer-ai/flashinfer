@@ -3,6 +3,9 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 
+#ifdef _MSC_VER
+#include <string>
+#endif
 #include <stdexcept>
 
 #include "utils.h"

@@ -54,7 +54,8 @@ struct Traits_tile_size</* GRANULAR = */ true, STEP, S, D, DV, K_PER_MMA> {
     // D =512: CTA_O_TILE_K=16
     // D =256: CTA_O_TILE_K=32
     // D<=128: CTA_O_TILE_K=64
-    CTA_O_TILE_K = std::max(K_PER_MMA, DV > 256 ? 16 : (DV > 128 ? 32 : 64))
+    CTA_O_TILE_K_BASE = DV > 256 ? 16 : (DV > 128 ? 32 : 64),
+    CTA_O_TILE_K = K_PER_MMA > CTA_O_TILE_K_BASE ? K_PER_MMA : CTA_O_TILE_K_BASE
   };
 };
 

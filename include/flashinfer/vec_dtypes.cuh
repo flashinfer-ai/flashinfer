@@ -33,7 +33,11 @@ namespace flashinfer {
 #define FLASHINFER_HARDWARE_FP8_CONVERSION_ENABLED
 #endif
 
+#ifdef _WIN32
+#define FLASHINFER_INLINE inline [[msvc::forceinline]] __device__
+#else
 #define FLASHINFER_INLINE inline __attribute__((always_inline)) __device__
+#endif
 
 __device__ __forceinline__ void st_global_release(int4 const& val, int4* addr) {
   asm volatile("st.release.global.sys.v4.b32 [%4], {%0, %1, %2, %3};" ::"r"(val.x), "r"(val.y),

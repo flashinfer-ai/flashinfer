@@ -95,8 +95,10 @@ __global__ void selective_state_update_kernel_simple(SelectiveStateUpdateParams 
   bool const dt_softplus = params.dt_softplus;
 
   // State scale pointer (only used when scaleState == true)
-  [[maybe_unused]] auto* __restrict__ state_scale =
-      reinterpret_cast<state_scale_t*>(params.state_scale);
+  [[maybe_unused]] state_scale_t* __restrict__ state_scale = nullptr;
+  if constexpr (scaleState) {
+    state_scale = reinterpret_cast<state_scale_t*>(params.state_scale);
+  }
 
   // Load device-side Philox seed once into a register
   [[maybe_unused]] int64_t const rand_seed = params.rand_seed ? *params.rand_seed : 0;
@@ -130,10 +132,11 @@ __global__ void selective_state_update_kernel_simple(SelectiveStateUpdateParams 
   if constexpr (scaleState) {
     state_scale += state_batch * params.state_scale_stride_batch + head * DIM;
   }
-  [[maybe_unused]] auto* __restrict__ dst_state_scale =
-      scaleState ? reinterpret_cast<state_scale_t*>(params.state_scale) +
-                       dst_state_batch * params.state_scale_stride_batch + head * DIM
-                 : nullptr;
+  [[maybe_unused]] state_scale_t* __restrict__ dst_state_scale = nullptr;
+  if constexpr (scaleState) {
+    dst_state_scale = reinterpret_cast<state_scale_t*>(params.state_scale) +
+                      dst_state_batch * params.state_scale_stride_batch + head * DIM;
+  }
 
   __shared__ SharedStorageSimple<input_t, state_scale_t, ROWS_PER_BLOCK, DSTATE> sram;
 
@@ -650,8 +653,10 @@ __global__ void selective_state_update_kernel_producer_consumer_vertical(
   auto const* __restrict__ z = reinterpret_cast<input_t const*>(params.z);
   auto const* __restrict__ state_batch_indices =
       reinterpret_cast<stateIndex_t const*>(params.state_batch_indices);
-  [[maybe_unused]] auto* __restrict__ state_scale =
-      reinterpret_cast<state_scale_t*>(params.state_scale);
+  [[maybe_unused]] state_scale_t* __restrict__ state_scale = nullptr;
+  if constexpr (scaleState) {
+    state_scale = reinterpret_cast<state_scale_t*>(params.state_scale);
+  }
 
   // Load device-side Philox seed once into a register
   [[maybe_unused]] int64_t const rand_seed = params.rand_seed ? *params.rand_seed : 0;
