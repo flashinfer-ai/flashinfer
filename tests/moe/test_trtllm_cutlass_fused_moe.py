@@ -2060,8 +2060,8 @@ def dequant_mxfp8_batches(
 )
 @pytest.mark.parametrize("use_autotune", [False, True])
 @pytest.mark.skipif(
-    torch.cuda.get_device_capability()[0] not in [10, 11, 12],
-    reason="MXFP8xMXFP4 is only supported on SM100, SM110 and SM120/SM121",
+    torch.cuda.get_device_capability()[0] not in [10, 11],
+    reason="MXFP8xMXFP4 CUTLASS is only supported on SM100/SM103/SM107/SM110 (#7179)",
 )
 @_CUTLASS_MOE_ARCH_SKIP
 def test_moe_mxfp8_mxfp4(
@@ -3229,8 +3229,8 @@ def test_moe_nvfp4_ndim_padding_safety(
 @pytest.mark.parametrize("top_k", NDIM_PADDING_TOP_K)
 @pytest.mark.parametrize("intermediate_size", NDIM_PADDING_INTERMEDIATE_SIZES)
 @pytest.mark.skipif(
-    torch.cuda.get_device_capability()[0] not in [10, 11, 12],
-    reason="MXFP8xMXFP4 is only supported on SM100, SM110 and SM120/SM121",
+    torch.cuda.get_device_capability()[0] not in [10, 11],
+    reason="MXFP8xMXFP4 CUTLASS is only supported on SM100/SM103/SM107/SM110 (#7179)",
 )
 @_CUTLASS_MOE_ARCH_SKIP
 def test_moe_mxfp8_mxfp4_ndim_padding_safety(

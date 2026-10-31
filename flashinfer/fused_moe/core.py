@@ -1625,6 +1625,20 @@ def cutlass_fused_moe(
         )
 
     device_arch = f"{major * 10 + minor}"
+    arch = major * 10 + minor
+
+    # MXFP4 weights are passed as int64-packed tiles. Refuse SM12x before JIT
+    # build / autotune so vLLM ``flashinfer_cutlass`` fails loud (#7179).
+    if use_mxfp8_act_scaling and fc1_expert_weights.dtype == torch.int64:
+        from .api import _CUTLASS_MXFP8_MXFP4_ARCHS
+
+        if arch not in _CUTLASS_MXFP8_MXFP4_ARCHS:
+            raise NotImplementedError(
+                "CUTLASS MXFP8×MXFP4 fused MoE is unsupported on "
+                f"SM{arch}; supported architectures are {_CUTLASS_MXFP8_MXFP4_ARCHS}. "
+                "On SM12x use SM12xMxfp8Mxfp4Config (CuteDSL) instead "
+                "(https://github.com/flashinfer-ai/flashinfer/issues/7179)."
+            )
 
     if use_wfp4afp8_humming and device_arch != "90":
         raise NotImplementedError(
@@ -1809,6 +1823,17 @@ def cutlass_fused_moe_workspace_size(
     with torch.cuda.device(device):
         major, minor = get_compute_capability(device)
         device_arch = f"{major * 10 + minor}"
+        arch = major * 10 + minor
+        if use_mxfp8_act_scaling and weight_dtype == torch.int64:
+            from .api import _CUTLASS_MXFP8_MXFP4_ARCHS
+
+            if arch not in _CUTLASS_MXFP8_MXFP4_ARCHS:
+                raise NotImplementedError(
+                    "CUTLASS MXFP8×MXFP4 fused MoE is unsupported on "
+                    f"SM{arch}; supported architectures are {_CUTLASS_MXFP8_MXFP4_ARCHS}. "
+                    "On SM12x use SM12xMxfp8Mxfp4Config (CuteDSL) instead "
+                    "(https://github.com/flashinfer-ai/flashinfer/issues/7179)."
+                )
         return get_cutlass_fused_moe_module(
             device_arch
         ).cutlass_fused_moe_workspace_size(
