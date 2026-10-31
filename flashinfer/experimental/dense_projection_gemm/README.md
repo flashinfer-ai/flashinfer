@@ -30,7 +30,7 @@ Every entry point of `cake_backend` takes the keyword-only `deterministic: bool 
 | K1 forward (`projection_forward`, `kk` layouts) | deterministic program (whole output tiles; a recomputed forward reproduces its result) |
 | K1 input gradient (`projection_dgrad`, `kn` layouts) | deterministic program (whole output tiles) |
 | K1 weight gradient (`projection_wgrad`, `nn` layouts) | split-K over the ragged token count (`k1_plan`): every split writes its FP32 partial tile to a workspace slot; the last split of a tile to arrive (a per-tile ticket counter) adds the other slots in arrival order and rounds once into `out`, then returns the counter to zero |
-| K2 forward (`router_forward`, `kk`) | stream-K over the K blocks (`router_units`): whole tiles store the one-split result, tiles split between two units TMA reduce-add into `out` (zeroed first, on the same stream); at most two partials per element, so the result repeats bit for bit (`0 + a + b == 0 + b + a`) and recomputed router logits and top-k match |
+| K2 forward (`router_forward`, `kk`) | stream-K over the K blocks (`router_units`): whole tiles store the one-split result, tiles split between two units TMA reduce-add into `out` (zeroed before the program, on the same stream); at most two partials per element, so the result repeats bit for bit (`0 + a + b == 0 + b + a`) and recomputed router logits and top-k match |
 | K2 input gradient (`router_dgrad`, `kn`) | deterministic program (one split) |
 | K2 weight gradient (`router_wgrad`, `nn_t`) | stream-K as the forward, any number of partials per element (`router_units`) |
 | BF16x3 split (`split_fp32_to_bf16x3_`) | the deterministic stage (exact) |
@@ -75,7 +75,9 @@ initialization) and the ticket counters (`tiles * 512` words, zero at creation, 
 launch).  A prepared launch owns both; the convenience path keeps them in an arena per (device, stream), so
 concurrent launches on different streams never share them.  After an aborted launch, call
 `PreparedAtomicGemm.reset_counters()` (or `clear_convenience_caches()`).  A K2 launch with part tiles zeroes `out` on
-the launch stream first; prepared launches of both programs allocate nothing and can be captured in a CUDA graph.
+the launch stream (one memset) between the split and the program; prepared launches of both programs allocate nothing
+and can be captured in a CUDA graph.  A prepared K2 launch binds everything but the stream when prepared (its FFI
+arguments are converted once), so a call issues its launches back to back.
 
 ## Benchmark
 

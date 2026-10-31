@@ -72,10 +72,12 @@ import threading
 import warnings
 from collections import OrderedDict
 from dataclasses import dataclass, field
+from functools import cached_property
 from types import ModuleType
 from typing import Any, Callable, Optional, Union
 
 import torch
+import tvm_ffi
 
 from . import cake_jit
 
@@ -662,8 +664,8 @@ def router_units_of(
 
 
 def router_has_part_tiles(m_pairs: int, n_tiles: int, k_iters: int, units: int) -> bool:
-    """Whether a launch adds into ``out`` anywhere (then ``out`` is zeroed first): some span of the partition starts
-    inside a row-tile pair."""
+    """Whether a launch adds into ``out`` anywhere (then ``out`` is zeroed before the program): some span of the
+    partition starts inside a row-tile pair."""
     steps, spans = m_pairs * k_iters, units // n_tiles
     return any(span * steps // spans % k_iters for span in range(1, spans))
 
@@ -757,7 +759,7 @@ def router_units(
 class AtomicRouterPlan:
     """The host plan of one K2 launch of this package (the launched, possibly swapped GEMM ``[M, N] = [M, K] @
     [K, N]``): ``m_tiles / 2 x n_tiles`` tiles of ``256 x 128``, their ``k_iters`` K blocks cut into ``units``
-    stream-K spans (``2 * units`` CTAs); with part tiles the launch zeroes ``out`` first."""
+    stream-K spans (``2 * units`` CTAs); with part tiles the launch zeroes ``out`` before the program."""
 
     M: int
     N: int
@@ -784,9 +786,10 @@ class AtomicRouterPlan:
     def grid(self) -> tuple[int, int, int]:
         return (2 * self.units, 1, 1)
 
-    @property
+    @cached_property
     def part_tiles(self) -> bool:
-        """Whether some segment adds into ``out`` (the launch zeroes ``out`` first)."""
+        """Whether some segment adds into ``out`` (the launch zeroes ``out`` before its program runs); computed once
+        per plan."""
         return router_has_part_tiles(
             self.m_pairs, self.n_tiles, self.k_iters, self.units
         )
@@ -949,6 +952,81 @@ class _AtomicLaunch:
         self.entry(*self.arguments)
 
 
+def _converted_launch(launch: Any) -> _AtomicLaunch:
+    """A bound launch (this package's or the deterministic package's) whose tensor arguments are converted to
+    ``tvm_ffi.Tensor`` once: a prepared launch binds fixed tensors, and converting a torch tensor on every call is
+    the larger part of the host time of an FFI call.  The converted tensors keep their torch tensors alive."""
+    arguments = tuple(
+        tvm_ffi.from_dlpack(a, require_contiguous=False)
+        if isinstance(a, torch.Tensor)
+        else a
+        for a in launch.arguments
+    )
+    return _AtomicLaunch(launch.module, launch.entry, arguments, launch.grid)
+
+
+# ``cuda.bindings.driver`` once imported (``False``: unavailable, the K2 fill of ``out`` then runs ``out.zero_()``).
+_CU_DRIVER: Any = None
+
+
+def _cu_driver() -> Any:
+    global _CU_DRIVER
+    if _CU_DRIVER is None:
+        try:
+            from cuda.bindings import driver as cu_driver
+        except ImportError:
+            cu_driver = False
+        _CU_DRIVER = cu_driver
+    return _CU_DRIVER
+
+
+@dataclass(frozen=True)
+class _OutFill:
+    """The zero fill of a K2 ``out`` with part tiles (row-major fp32 rows of ``pitch`` bytes, unit inner stride) on a
+    raw stream of device ``index``: one driver memset -- ``cuMemsetD32Async`` over contiguous rows,
+    ``cuMemsetD2D32Async`` over padded ones; a memset node under graph capture -- in a fraction of the host time of
+    ``out.zero_()``.  The memset runs in the thread's current context, so it is issued only when torch's current
+    device is ``index`` (the FFI call before it has then bound that device's context to the thread); otherwise,
+    without ``cuda.bindings``, or when the driver refuses the call, ``out.zero_()`` fills ``out`` on the same
+    stream."""
+
+    out: torch.Tensor = field(repr=False)
+    index: int
+    ptr: int
+    rows: int
+    cols: int
+    pitch: int
+
+    def __call__(self, stream: int) -> None:
+        cu = _CU_DRIVER
+        if cu and torch.cuda.current_device() == self.index:
+            if self.rows == 1 or self.pitch == 4 * self.cols:
+                (status,) = cu.cuMemsetD32Async(
+                    self.ptr, 0, self.rows * self.cols, stream
+                )
+            else:
+                (status,) = cu.cuMemsetD2D32Async(
+                    self.ptr, self.pitch, 0, self.cols, self.rows, stream
+                )
+            if status == cu.CUresult.CUDA_SUCCESS:
+                return
+        self.out.zero_()
+
+
+def _out_fill(out: torch.Tensor, index: int) -> _OutFill:
+    """The :class:`_OutFill` of a K2 ``out`` (a planned view: fp32, unit inner stride, row stride a multiple of 4
+    elements) on device ``index``."""
+    _cu_driver()
+    return _OutFill(
+        out,
+        index,
+        int(out.data_ptr()),
+        int(out.shape[0]),
+        int(out.shape[1]),
+        int(out.stride(0)) * out.element_size(),
+    )
+
+
 def _order_atomic_arguments(
     module_name: str, plan, values: dict[str, Any], grid: tuple[int, int, int]
 ) -> list:
@@ -1065,9 +1143,11 @@ class PreparedAtomicGemm:
 @dataclass
 class PreparedAtomicRouterGemm:
     """One prepared K2 launch of this package: the retained BF16x3 stack of the second operand (re-split from the
-    bound fp32 view on every ``launch()`` by the deterministic package's split stage), ``out`` zeroed on the stream
-    when a segment adds into it, and the stream-K program.  ``launch()`` writes ``out`` and returns it without
-    allocating; it captures into a CUDA graph (split, memset, kernel)."""
+    bound fp32 view on every ``launch()`` by the deterministic package's split stage), then ``out`` zeroed on the
+    stream (one memset, :class:`_OutFill`) when a segment adds into it, then the stream-K program.  Everything but
+    the current stream is bound when prepared (the FFI arguments converted once, the fill's pointer and pitch), so a
+    call issues its launches back to back.  ``launch()`` writes ``out`` and returns it without allocating; it
+    captures into a CUDA graph (split, memset, kernel)."""
 
     module_name: str
     arch: str
@@ -1077,6 +1157,7 @@ class PreparedAtomicRouterGemm:
     device_index: int = 0
     _launch: Optional[_AtomicLaunch] = field(default=None, repr=False)
     _split: Optional[Any] = field(default=None, repr=False)
+    _fill: Optional[_OutFill] = field(default=None, repr=False)
 
     @property
     def template(self) -> str:
@@ -1097,14 +1178,16 @@ class PreparedAtomicRouterGemm:
     def launch(self) -> torch.Tensor:
         assert self._launch is not None
         det = deterministic_backend()
-        t = self.tensors
+        index = self.device_index
+        stream = det._current_raw_stream(index)
         if self._split is None:
+            t = self.tensors
             det.split_fp32_to_bf16x3_det_(t["split_src"], t["parts"], t["resid"])
-        if self.plan.part_tiles:
-            self.out.zero_()
-        with det._ffi_stream_context(self.device_index):
+        with det._ffi_stream_context(index, stream):
             if self._split is not None:
                 self._split()
+            if self._fill is not None:
+                self._fill(stream)
             self._launch()
         return self.out
 
@@ -1225,25 +1308,29 @@ def _prepare_atomic_k2(
         )
     module_name = cake_jit.select_module(arch, plan.template)
     values = _k2_values(plan, A=a_view, parts=parts, out=out)
-    launch = bind_launch(module_name, values, plan.grid, arch)
+    launch = _converted_launch(bind_launch(module_name, values, plan.grid, arch))
     split_launch = None
     if split_module is not None:
         n = split_src.numel()
-        split_launch = det.bind_launch(
-            split_module,
-            det._split_values(split_src, parts, n),
-            det._split_grid(n),
-            arch,
+        split_launch = _converted_launch(
+            det.bind_launch(
+                split_module,
+                det._split_values(split_src, parts, n),
+                det._split_grid(n),
+                arch,
+            )
         )
+    index = det._device_index(device)
     return PreparedAtomicRouterGemm(
         module_name=module_name,
         arch=arch,
         plan=plan,
         out=out,
         tensors=tensors,
-        device_index=det._device_index(device),
+        device_index=index,
         _launch=launch,
         _split=split_launch,
+        _fill=_out_fill(out, index) if plan.part_tiles else None,
     )
 
 
@@ -1354,7 +1441,8 @@ def _atomic_arena_for(index: int, stream: int, device: torch.device) -> _AtomicA
 @dataclass
 class _CachedAtomic:
     """A planned launch of the convenience path: the plan (``None``: the row runs the deterministic program), the
-    program entry and argument plan, the arena of its (device, stream) and, for K2, the fused split's module."""
+    program entry and argument plan, the arena of its (device, stream) and, for K2, the fused split's module with its
+    entry and argument plan."""
 
     plan: Any
     arch: str = ""
@@ -1363,6 +1451,8 @@ class _CachedAtomic:
     arg_plan: Optional[list] = field(default=None, repr=False)
     arena: Optional[_AtomicArena] = field(default=None, repr=False)
     split_module: Optional[str] = None
+    split_entry: Optional[Callable[..., Any]] = field(default=None, repr=False)
+    split_arg_plan: Optional[list] = field(default=None, repr=False)
 
 
 def _release_atomic_entry(entry: _CachedAtomic) -> None:
@@ -1505,6 +1595,16 @@ def _launch_cached_atomic_k2(
                         arena.require("k2_split_scratch", split_src.numel())
                     module_name = cake_jit.select_module(arch, plan.template)
                     fn, arg_plan = _atomic_entry(module_name, plan.grid, arch)
+                    split_fn, split_arg_plan = None, None
+                    if split_module is not None:
+                        record = det.MODULES[split_module]
+                        split_fn = getattr(
+                            det.load_cake_dense_projection_det_gemm_module(
+                                split_module, arch
+                            ),
+                            record["ffi_entry"],
+                        )
+                        split_arg_plan = det.arg_plan_of(record)
                     entry = _CachedAtomic(
                         plan=plan,
                         arch=arch,
@@ -1513,6 +1613,8 @@ def _launch_cached_atomic_k2(
                         arg_plan=arg_plan,
                         arena=arena,
                         split_module=split_module,
+                        split_entry=split_fn,
+                        split_arg_plan=split_arg_plan,
                     )
                 entry = _cache_insert(_K2_ATOMIC_CACHE, key, entry)
     plan = entry.plan
@@ -1528,20 +1630,23 @@ def _launch_cached_atomic_k2(
         if entry.split_module is None:
             resid = arena.buffers["k2_split_scratch"][:n].view(split_src.shape)
             det.split_fp32_to_bf16x3_det_(split_src, parts, resid)
-        if plan.part_tiles:
-            out.zero_()
         values = _k2_values(plan, A=a_view, parts=parts, out=out)
         arguments = _order_atomic_arguments(
             entry.module_name, entry.arg_plan, values, plan.grid
         )
         with det._ffi_stream_context(index, stream):
-            if entry.split_module is not None:
-                det.bind_launch(
-                    entry.split_module,
-                    det._split_values(split_src, parts, n),
-                    det._split_grid(n),
-                    entry.arch,
-                )()
+            if entry.split_entry is not None:
+                grid = det._split_grid(n)
+                entry.split_entry(
+                    *_order_atomic_arguments(
+                        entry.split_module,
+                        entry.split_arg_plan,
+                        det._split_values(split_src, parts, n),
+                        grid,
+                    )
+                )
+            if plan.part_tiles:
+                _out_fill(out, index)(stream)
             fn(*arguments)
     return out
 

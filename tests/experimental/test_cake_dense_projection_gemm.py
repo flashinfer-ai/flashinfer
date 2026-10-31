@@ -895,6 +895,51 @@ def test_k2_planner_plans_the_stream_k_router(monkeypatch):
     assert cake_backend.plan_atomic_router(*dgrad, **kw)[0] is None
 
 
+def test_k2_out_fill_is_one_driver_memset_with_a_zero_fallback(monkeypatch):
+    """The fill of a K2 ``out`` with part tiles: one ``cuMemsetD32Async`` over contiguous rows, one
+    ``cuMemsetD2D32Async`` (pitch in bytes) over padded rows, on the stream it is given; ``out.zero_()`` when torch's
+    current device is another device, when the driver refuses the call, or without ``cuda.bindings``."""
+    calls = []
+
+    class Driver:
+        class CUresult:
+            CUDA_SUCCESS = 0
+
+        status = 0
+
+        def cuMemsetD32Async(self, ptr, value, count, stream):
+            calls.append(("1d", ptr, value, count, stream))
+            return (self.status,)
+
+        def cuMemsetD2D32Async(self, ptr, pitch, value, width, height, stream):
+            calls.append(("2d", ptr, pitch, value, width, height, stream))
+            return (self.status,)
+
+    driver = Driver()
+    monkeypatch.setattr(cake_backend, "_CU_DRIVER", driver)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 1)
+    dense = torch.full((6, 8), 7.0)
+    padded = torch.full((6, 12), 7.0)[:, :8]
+    cake_backend._out_fill(dense, 1)(1234)
+    cake_backend._out_fill(padded, 1)(99)
+    assert calls == [
+        ("1d", dense.data_ptr(), 0, 48, 1234),
+        ("2d", padded.data_ptr(), 48, 0, 8, 6, 99),
+    ]
+    assert bool((dense == 7).all()) and bool((padded == 7).all())
+    calls.clear()
+    cake_backend._out_fill(dense, 0)(1234)  # another current device
+    assert calls == [] and bool((dense == 0).all())
+    driver.status = 1  # the driver refuses the memset
+    cake_backend._out_fill(padded, 1)(99)
+    assert len(calls) == 1 and bool((padded == 0).all())
+    base = torch.full((6, 12), 7.0)
+    monkeypatch.setattr(cake_backend, "_CU_DRIVER", False)  # no cuda.bindings
+    cake_backend._out_fill(base[:, :8], 1)(99)
+    assert len(calls) == 1 and bool((base[:, :8] == 0).all())
+    assert bool((base[:, 8:] == 7).all())
+
+
 @pytest.mark.parametrize("shift_elems, ldo", [(1, 256), (2, 256), (0, 258)])
 def test_k2_misaligned_out_takes_the_deterministic_path(monkeypatch, shift_elems, ldo):
     """An ``out`` the reduce-add map cannot address (off a 16-byte boundary, or rows not a multiple of 4 elements)
@@ -1650,6 +1695,34 @@ def test_gpu_router_entry_points_reach_the_stream_k_program(router_rule):
         lambda: cake_backend.router_forward(X, W, first, deterministic=False),
         cake_jit.select_module(arch, plan.template),
     )
+
+
+@pytest.mark.parametrize("op, splits", [("fwd", 2), ("wgrad", 4)])
+def test_gpu_router_padded_out_rows(op, splits):
+    """An ``out`` whose rows are padded (row stride above the row length): the prepared launch and the
+    convenience path fill and write only ``out``'s elements -- the padding keeps its values -- and meet the gate."""
+    device, arch = _atomic_device_or_skip()
+    X, W, G = _router_inputs(ROUTER_T, device, SEED + 23)
+    A, B, dense = _router_case(op, X, W, G)
+    rows, cols = dense.shape
+    storage = torch.full((rows, cols + 64), 7.0, device=device)
+    out = storage[:, :cols]
+    prepared = _router_prepare(A, B, out, splits, arch)
+    assert prepared.plan.part_tiles
+    ref = A.double() @ B.double()
+    for launch in (
+        prepared.launch,
+        lambda: cake_backend.router_fp32_gemm(
+            A, B, out, splits=splits, deterministic=False
+        ),
+    ):
+        for _ in range(3):
+            out.fill_(float("nan"))
+            launch()
+            torch.cuda.synchronize()
+            assert bool(torch.isfinite(out).all())
+            assert _rel_fro(out, ref) <= ROUTER_REL_FRO_MAX
+            assert bool((storage[:, cols:] == 7.0).all())
 
 
 def test_gpu_router_misaligned_out_takes_the_deterministic_path():
