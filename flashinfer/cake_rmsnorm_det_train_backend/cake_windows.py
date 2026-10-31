@@ -580,8 +580,9 @@ PROGRAM_WINDOWS: dict[str, dict[str, tuple[tuple[int, int | None, str], ...]]] =
 }
 
 # Per architecture and route: the upper edge of every window but the last and the measured
-# class of the outputs across it: "same" (bitwise identical on the common rows), "ulp" (the
-# forward's one-ulp differences), "dx" (the backward kernel switch), "unmeasured".
+# class of the outputs across it: "same" (bitwise identical on the common rows), "ulp" (y
+# moves by at most one BF16 ulp, rstd by at most two FP32 ulps, three on R200 (216 SMs) at
+# the residual route's edge 1024), "dx" (the backward kernel switch), "unmeasured".
 EDGES: dict[str, dict[str, tuple[tuple[int, str], ...]]] = {
     "sm_100a": {
         "bwd_h1536": ((1024, "same"), (4096, "same"), (32768, "same")),
@@ -629,18 +630,10 @@ EDGES: dict[str, dict[str, tuple[tuple[int, str], ...]]] = {
         "fwd_w32_h4096": ((640, "ulp"), (1024, "same"), (6144, "same")),
         "fwd_h512": ((1024, "ulp"), (4096, "same"), (24576, "same")),
         "fwd_w32_h512": ((1024, "ulp"), (4096, "same"), (24576, "same")),
-        "fwd_h5120": ((640, "same"), (6144, "unmeasured")),
-        "fwd_w32_h5120": (
-            (640, "unmeasured"),
-            (6144, "unmeasured"),
-            (16384, "unmeasured"),
-        ),
+        "fwd_h5120": ((640, "same"), (6144, "same")),
+        "fwd_w32_h5120": ((640, "same"), (6144, "same"), (16384, "same")),
         "fwd_h6144": ((768, "same"), (1024, "same")),
-        "fwd_w32_h6144": (
-            (768, "unmeasured"),
-            (1024, "unmeasured"),
-            (6144, "unmeasured"),
-        ),
+        "fwd_w32_h6144": ((768, "same"), (1024, "same"), (6144, "same")),
         "fwd_residual_h6144": ((256, "same"), (1024, "ulp")),
         "fwd_w32_residual_h6144": ((256, "same"), (1024, "ulp")),
     },
@@ -709,10 +702,10 @@ EDGES: dict[str, dict[str, tuple[tuple[int, str], ...]]] = {
         "fwd_w32_h4096": ((640, "ulp"), (1024, "same"), (3072, "same"), (6144, "same")),
         "fwd_h512": ((1024, "ulp"), (4096, "same"), (16384, "same")),
         "fwd_w32_h512": ((1024, "ulp"), (4096, "same"), (16384, "same")),
-        "fwd_h5120": ((640, "same"), (6144, "unmeasured")),
-        "fwd_w32_h5120": ((640, "unmeasured"), (6144, "unmeasured")),
+        "fwd_h5120": ((640, "same"), (6144, "same")),
+        "fwd_w32_h5120": ((640, "same"), (6144, "same")),
         "fwd_h6144": ((1024, "same"),),
-        "fwd_w32_h6144": ((1024, "unmeasured"), (6144, "unmeasured")),
+        "fwd_w32_h6144": ((1024, "same"), (6144, "same")),
         "fwd_residual_h6144": ((256, "same"), (1024, "ulp")),
         "fwd_w32_residual_h6144": ((256, "same"), (1024, "ulp")),
     },
@@ -737,21 +730,13 @@ EDGES: dict[str, dict[str, tuple[tuple[int, str], ...]]] = {
         "fwd_w32_h1536": ((2048, "ulp"), (12288, "same")),
         "fwd_h2048": ((1024, "ulp"), (8192, "same"), (12288, "same"), (16384, "same")),
         "fwd_w32_h2048": (
-            (1024, "unmeasured"),
-            (8192, "unmeasured"),
-            (12288, "unmeasured"),
-            (16384, "unmeasured"),
+            (1024, "ulp"),
+            (8192, "same"),
+            (12288, "same"),
+            (16384, "same"),
         ),
-        "fwd_h256": (
-            (6144, "unmeasured"),
-            (32768, "unmeasured"),
-            (98304, "unmeasured"),
-        ),
-        "fwd_w32_h256": (
-            (6144, "unmeasured"),
-            (32768, "unmeasured"),
-            (98304, "unmeasured"),
-        ),
+        "fwd_h256": ((6144, "same"), (32768, "same"), (98304, "same")),
+        "fwd_w32_h256": ((6144, "same"), (32768, "same"), (98304, "same")),
         "fwd_h4096": (
             (512, "ulp"),
             (1024, "same"),
@@ -760,27 +745,27 @@ EDGES: dict[str, dict[str, tuple[tuple[int, str], ...]]] = {
             (49152, "same"),
         ),
         "fwd_w32_h4096": (
-            (512, "unmeasured"),
-            (1024, "unmeasured"),
-            (4096, "unmeasured"),
-            (20480, "unmeasured"),
-            (49152, "unmeasured"),
+            (512, "ulp"),
+            (1024, "same"),
+            (4096, "same"),
+            (20480, "same"),
+            (49152, "same"),
         ),
         "fwd_h512": ((256, "same"), (6144, "same")),
         "fwd_w32_h512": ((256, "same"), (6144, "same")),
         "fwd_h5120": (
-            (512, "unmeasured"),
-            (1152, "unmeasured"),
-            (6144, "unmeasured"),
-            (20480, "unmeasured"),
-            (49152, "unmeasured"),
+            (512, "same"),
+            (1152, "same"),
+            (6144, "same"),
+            (20480, "same"),
+            (49152, "same"),
         ),
         "fwd_w32_h5120": (
-            (512, "unmeasured"),
-            (1152, "unmeasured"),
-            (6144, "unmeasured"),
-            (20480, "unmeasured"),
-            (49152, "unmeasured"),
+            (512, "same"),
+            (1152, "same"),
+            (6144, "same"),
+            (20480, "same"),
+            (49152, "same"),
         ),
         "fwd_h6144": ((1024, "same"), (4096, "same")),
         "fwd_w32_h6144": ((1024, "same"), (4096, "same")),
@@ -849,8 +834,10 @@ Measured on B200 (sm_100a), GB300 (sm_103a) and R200 (sm_107a).
 The windows per architecture and route, ``(above, at_most]`` and the program (the first
 8 hex digits of its name).  The mark after a window names the measured outcome
 at its upper edge, which the package tests hold: ``=`` bitwise-identical outputs on the
-common rows across it, ``~`` the forward's one-ulp differences, ``dx`` the backward
-kernel switch, ``?`` not yet measured (the tests bound the differences there).
+common rows across it, ``~`` the forward's measured differences (``y`` by at most one
+BF16 ulp, ``rstd`` by at most two FP32 ulps, three on R200 (216 SMs) at the residual
+route's edge 1024), ``dx`` the backward kernel switch, ``?`` not yet measured (the tests
+bound the differences there).
 
 The FP32-weight routes (``fwd_w32_...``) select among the FP32-weight twins of the
 same programs over the same windows, with the same outcome at every edge, and are not
@@ -868,14 +855,14 @@ its own windows.
   (1024, 6144] d447b7f6 = (6144, inf) fd913ecd
 * ``sm_100a`` ``fwd_h512``: (0, 1024] 8757f6da ~ (1024, 4096] 7673978d =
   (4096, 24576] 3d20ab4a = (24576, inf) 3430e5d9
-* ``sm_100a`` ``fwd_h5120``: (0, 640] 5eef28cd = (640, 6144] b5e173f5 ?
+* ``sm_100a`` ``fwd_h5120``: (0, 640] 5eef28cd = (640, 6144] b5e173f5 =
   (6144, inf) 5eef28cd
-* ``sm_100a`` ``fwd_w32_h5120``: (0, 640] ba28d2c0 ? (640, 6144] 9ecb62c2 ?
-  (6144, 16384] b49de9b4 ? (16384, inf) 9ecb62c2
+* ``sm_100a`` ``fwd_w32_h5120``: (0, 640] ba28d2c0 = (640, 6144] 9ecb62c2 =
+  (6144, 16384] b49de9b4 = (16384, inf) 9ecb62c2
 * ``sm_100a`` ``fwd_h6144``: (0, 768] bad4db91 = (768, 1024] bad4db91 =
   (1024, inf) 288d7b1d
-* ``sm_100a`` ``fwd_w32_h6144``: (0, 768] 2763cd5e ? (768, 1024] 2763cd5e ?
-  (1024, 6144] 3d619cd1 ? (6144, inf) 5f89e5fd
+* ``sm_100a`` ``fwd_w32_h6144``: (0, 768] 2763cd5e = (768, 1024] 2763cd5e =
+  (1024, 6144] 3d619cd1 = (6144, inf) 5f89e5fd
 * ``sm_100a`` ``fwd_residual_h6144``: (0, 256] 308da182 = (256, 1024] 03bdf566 ~
   (1024, inf) e646bbdb
 * ``sm_103a`` ``fwd_h1536``: (0, 1536] 1ea88523 ~ (1536, 3584] 2fdbab2a =
@@ -890,12 +877,12 @@ its own windows.
   (1024, 3072] d447b7f6 = (3072, 6144] d447b7f6 = (6144, inf) fd913ecd
 * ``sm_103a`` ``fwd_h512``: (0, 1024] 8757f6da ~ (1024, 4096] 7673978d =
   (4096, 16384] 3d20ab4a = (16384, inf) 3430e5d9
-* ``sm_103a`` ``fwd_h5120``: (0, 640] 5eef28cd = (640, 6144] b5e173f5 ?
+* ``sm_103a`` ``fwd_h5120``: (0, 640] 5eef28cd = (640, 6144] b5e173f5 =
   (6144, inf) 5eef28cd
-* ``sm_103a`` ``fwd_w32_h5120``: (0, 640] 1defffdf ? (640, 6144] 9ecb62c2 ?
+* ``sm_103a`` ``fwd_w32_h5120``: (0, 640] 1defffdf = (640, 6144] 9ecb62c2 =
   (6144, inf) 9ecb62c2
 * ``sm_103a`` ``fwd_h6144``: (0, 1024] bad4db91 = (1024, inf) 288d7b1d
-* ``sm_103a`` ``fwd_w32_h6144``: (0, 1024] 2763cd5e ? (1024, 6144] 2763cd5e ?
+* ``sm_103a`` ``fwd_w32_h6144``: (0, 1024] 2763cd5e = (1024, 6144] 2763cd5e =
   (6144, inf) 5f89e5fd
 * ``sm_103a`` ``fwd_residual_h6144``: (0, 256] 308da182 = (256, 1024] 03bdf566 ~
   (1024, inf) e646bbdb
@@ -903,23 +890,23 @@ its own windows.
   (12288, inf) 682675bd
 * ``sm_107a`` ``fwd_h2048``: (0, 1024] b44107e0 ~ (1024, 8192] a4da8513 =
   (8192, 12288] 0ad4d53c = (12288, 16384] 0ad4d53c = (16384, inf) bde56bd5
-* ``sm_107a`` ``fwd_w32_h2048``: (0, 1024] 0da8e18d ? (1024, 8192] a72c6ece ?
-  (8192, 12288] 595f5060 ? (12288, 16384] 40210950 ? (16384, inf) 40210950
-* ``sm_107a`` ``fwd_h256``: (0, 6144] c5ca409f ? (6144, 32768] bbb05314 ?
-  (32768, 98304] 466331ff ? (98304, inf) 37f66318
+* ``sm_107a`` ``fwd_w32_h2048``: (0, 1024] 0da8e18d ~ (1024, 8192] a72c6ece =
+  (8192, 12288] 595f5060 = (12288, 16384] 40210950 = (16384, inf) 40210950
+* ``sm_107a`` ``fwd_h256``: (0, 6144] c5ca409f = (6144, 32768] bbb05314 =
+  (32768, 98304] 466331ff = (98304, inf) 37f66318
 * ``sm_107a`` ``fwd_h4096``: (0, 512] 8392d1a0 ~ (512, 1024] fd913ecd =
   (1024, 4096] d447b7f6 = (4096, 20480] bf933e16 = (20480, 49152] bf933e16 =
   (49152, inf) fd913ecd
-* ``sm_107a`` ``fwd_w32_h4096``: (0, 512] 4371270e ? (512, 1024] f0db3068 ?
-  (1024, 4096] f9f3423b ? (4096, 20480] f9f3423b ? (20480, 49152] f9f3423b ?
+* ``sm_107a`` ``fwd_w32_h4096``: (0, 512] 4371270e ~ (512, 1024] f0db3068 =
+  (1024, 4096] f9f3423b = (4096, 20480] f9f3423b = (20480, 49152] f9f3423b =
   (49152, inf) f9f3423b
 * ``sm_107a`` ``fwd_h512``: (0, 256] 7673978d = (256, 6144] 2a42e5c0 =
   (6144, inf) 60f47c5d
-* ``sm_107a`` ``fwd_h5120``: (0, 512] fd1097c4 ? (512, 1152] 5eef28cd ?
-  (1152, 6144] b5e173f5 ? (6144, 20480] 044d4a2a ? (20480, 49152] 044d4a2a ?
+* ``sm_107a`` ``fwd_h5120``: (0, 512] fd1097c4 = (512, 1152] 5eef28cd =
+  (1152, 6144] b5e173f5 = (6144, 20480] 044d4a2a = (20480, 49152] 044d4a2a =
   (49152, inf) 5eef28cd
-* ``sm_107a`` ``fwd_w32_h5120``: (0, 512] ba28d2c0 ? (512, 1152] 1defffdf ?
-  (1152, 6144] 9ecb62c2 ? (6144, 20480] b49de9b4 ? (20480, 49152] b49de9b4 ?
+* ``sm_107a`` ``fwd_w32_h5120``: (0, 512] ba28d2c0 = (512, 1152] 1defffdf =
+  (1152, 6144] 9ecb62c2 = (6144, 20480] b49de9b4 = (20480, 49152] b49de9b4 =
   (49152, inf) b49de9b4
 * ``sm_107a`` ``fwd_h6144``: (0, 1024] bad4db91 = (1024, 4096] cf1d0554 =
   (4096, inf) e7f4221a
@@ -958,8 +945,10 @@ Measured on B200 (sm_100a), GB300 (sm_103a) and R200 (sm_107a).
 The windows per architecture and route, ``(above, at_most]`` and the program (the first
 8 hex digits of its name).  The mark after a window names the measured outcome
 at its upper edge, which the package tests hold: ``=`` bitwise-identical outputs on the
-common rows across it, ``~`` the forward's one-ulp differences, ``dx`` the backward
-kernel switch, ``?`` not yet measured (the tests bound the differences there).
+common rows across it, ``~`` the forward's measured differences (``y`` by at most one
+BF16 ulp, ``rstd`` by at most two FP32 ulps, three on R200 (216 SMs) at the residual
+route's edge 1024), ``dx`` the backward kernel switch, ``?`` not yet measured (the tests
+bound the differences there).
 
 The FP32-weight routes (``bwd_w32_...``) select among the FP32-weight twins of the
 same programs over the same windows, with the same outcome at every edge, and are not
