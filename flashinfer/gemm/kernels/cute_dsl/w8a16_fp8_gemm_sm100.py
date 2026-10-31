@@ -37,7 +37,11 @@ from cutlass.utils.mixed_input_helpers import TransformMode
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cute.arch import griddepcontrol_launch_dependents, griddepcontrol_wait
 
-from .w8a16_fp8_gemm_sm100_utils import convert_e4m3_fragment, global_timer_lo
+from .w8a16_fp8_gemm_sm100_utils import (
+    clock_lo,
+    convert_e4m3_fragment,
+    global_timer_lo,
+)
 
 
 def _slot_if(cond: cutlass.Boolean, slot: int) -> cutlass.Int32:
@@ -228,45 +232,37 @@ class Sm100W8A16Fp8GemmKernel:
                 transform_tidx,
             )
         )
-        # The two transform warpgroups split a stage's A between them.  The partition
-        # is (copy, M-blocks, K-blocks, blocks, stages); into TMEM the per-thread blocks
-        # sit in mode 3 (the 32x32b store repeats), into smem the cotiled copy puts them
-        # in mode 1 and mode 3 is 1, so split whichever mode the two groups divide.
+        # A stage's per-thread A is converted in two halves, one after the other, so a
+        # half's registers (16 B of e4m3 per block, 32 B of 16-bit values) bound the
+        # register use.  The partition is (copy, M-blocks, K-blocks, blocks, stages);
+        # into TMEM the per-thread blocks sit in mode 3 (the 32x32b store repeats),
+        # into smem the cotiled copy puts them in mode 1 and mode 3 is 1, so halve
+        # whichever mode divides.  ``_transform_tile`` picks a half with a static index.
         split_mode = 3 if cute.size(tAsA_input, mode=[3]) % 2 == 0 else 1
         num_transform_blocks = cute.size(tAsA_input, mode=[split_mode])
-        assert num_transform_blocks % self.num_transform_warpgroups == 0, (
-            "A blocks must divide evenly across transform warpgroups: partitioned A is "
+        assert num_transform_blocks % 2 == 0, (
+            "A blocks must split into two halves: partitioned A is "
             f"{tAsA_input.shape} (source {self.transform_a_source}, tile "
             f"{self.cta_tile_shape_mnk})"
         )
-        blocks_per_transform_group = (
-            num_transform_blocks // self.num_transform_warpgroups
+        transform_half_tiler = tuple(
+            num_transform_blocks // 2 if i == split_mode else None for i in range(5)
         )
-        transform_group_tiler = tuple(
-            blocks_per_transform_group if i == split_mode else None for i in range(5)
-        )
-        transform_group_coord = tuple(
-            (None, transform_group_idx) if i == split_mode else None for i in range(5)
-        )
-        tAsA_input = cute.logical_divide(tAsA_input, transform_group_tiler)[
-            transform_group_coord
-        ]
-        tAsA_transform = cute.logical_divide(tAsA_transform, transform_group_tiler)[
-            transform_group_coord
-        ]
-
-        a_stage_coord = (None,) * (cute.rank(tAsA_input) - 1) + (0,)
+        tAsA_input = cute.logical_divide(tAsA_input, transform_half_tiler)
+        tAsA_transform = cute.logical_divide(tAsA_transform, transform_half_tiler)
+        half0 = self._transform_half_coord(split_mode, 0)
+        a_stage_coord = (None,) * (cute.rank(tAsA_input[half0]) - 1) + (0,)
         tArA = cute.make_rmem_tensor(
-            tAsA_input[a_stage_coord].shape, tAsA_input.element_type
+            tAsA_input[half0][a_stage_coord].shape, tAsA_input.element_type
         )
         tArA_transform = cute.make_rmem_tensor(
-            tAsA_input[a_stage_coord].shape, self.mma_dtype
+            tAsA_input[half0][a_stage_coord].shape, self.mma_dtype
         )
 
         # Convert in fragments of transform_fragment_size bytes so the smem loads of one
         # fragment overlap the conversion of the previous one.
         transform_tiler_size = min(
-            cute.size(cute.coalesce(tAsA_input.layout), mode=[0]),
+            cute.size(cute.coalesce(tAsA_input[half0].layout), mode=[0]),
             self.transform_fragment_size,
         )
         assert transform_tiler_size % 4 == 0, "fragments convert whole 32-bit words"
@@ -285,7 +281,19 @@ class Sm100W8A16Fp8GemmKernel:
             tArA_transform,
             tArA_transform_store,
             transform_tiler,
+            split_mode,
         )
+
+    @staticmethod
+    def _transform_half_coord(split_mode: int, half: int):
+        """Coordinate selecting half ``half`` of a stage's per-thread A blocks."""
+        return tuple((None, half) if i == split_mode else None for i in range(5))
+
+    def _dbg_clock(self, tag: int):
+        """``%clock`` in debug mode, 0 otherwise (trace-time choice, no code when off)."""
+        if self.debug:
+            return clock_lo(tag)
+        return cutlass.Int32(0)
 
     @cute.jit
     def _transform_tile(
@@ -301,75 +309,109 @@ class Sm100W8A16Fp8GemmKernel:
         tArA_transform: cute.Tensor,
         tArA_transform_store: cute.Tensor,
         transform_tiler: cute.Layout,
+        split_mode: cutlass.Constexpr,
         k_tile_cnt: cutlass.Int32,
-    ) -> tuple[pipeline.PipelineState, pipeline.PipelineState]:
+        k_parity: cutlass.Int32,
+        group_idx: cutlass.Int32,
+        wait_a: cutlass.Int32,
+        wait_stage: cutlass.Int32,
+        cyc_convert: cutlass.Int32,
+        cyc_store: cutlass.Int32,
+        cyc_pre: cutlass.Int32,
+        cyc_post: cutlass.Int32,
+    ):
+        """One tile's k-tiles for transform warpgroup ``group_idx``.
+
+        The two transform warpgroups take alternate k-tiles of the kernel's k-tile
+        sequence (group g the k-tiles whose global index has parity g; ``k_parity`` is
+        the parity of this tile's first k-tile).  A k-tile's chain of smem loads,
+        conversions, transformed store and fence is latency-bound, so with every warp
+        on the same k-tile the MMA starved; alternating lets one group's chain overlap
+        the other's.  Both pipeline states still step through every k-tile.
+
+        Returns the advanced states and, in debug mode, the cycle accumulators grown:
+        ``wait_a`` / ``wait_stage`` waiting for a raw A stage / a free transformed stage,
+        ``cyc_convert`` / ``cyc_store`` the load-and-convert and store-and-fence phases,
+        ``cyc_pre`` / ``cyc_post`` the rest before and after them."""
         a_load2trans_consumer_state.reset_count()
-        peek_load2trans_full_status = cutlass.Boolean(1)
-        if a_load2trans_consumer_state.count < k_tile_cnt:
-            peek_load2trans_full_status = a_load2trans_pipeline.consumer_try_wait(
-                a_load2trans_consumer_state
-            )
         trans2mma_producer_state.reset_count()
-        peek_trans2mma_empty_status = cutlass.Boolean(1)
-        if trans2mma_producer_state.count < k_tile_cnt:
-            peek_trans2mma_empty_status = trans2mma_pipeline.producer_try_acquire(
-                trans2mma_producer_state
-            )
-
-        for _k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
-            a_load2trans_pipeline.consumer_wait(
-                a_load2trans_consumer_state, peek_load2trans_full_status
-            )
-            a_stage_coord = (None,) * (cute.rank(tAsA_input) - 1) + (
-                a_load2trans_consumer_state.index,
-            )
-            tAsA_input_slice = tAsA_input[a_stage_coord]
-            tAsA_input_slice = cute.flat_divide(tAsA_input_slice, transform_tiler)
-            tAsA_input_slice = cute.group_modes(
-                tAsA_input_slice, 1, cute.rank(tAsA_input_slice)
-            )
-            trans2mma_pipeline.producer_acquire(
-                trans2mma_producer_state, peek_trans2mma_empty_status
-            )
-            cur_a_load2trans_consumer_state = a_load2trans_consumer_state.clone()
-            for idx in cutlass.range_constexpr(cute.size(tArA_load, mode=[1])):
-                cute.autovec_copy(tAsA_input_slice[(None, idx)], tArA_load[(None, idx)])
-                if cutlass.const_expr(idx == cute.size(tArA_load, mode=[1]) - 1):
-                    a_load2trans_consumer_state.advance()
-                    if a_load2trans_consumer_state.count < k_tile_cnt:
-                        peek_load2trans_full_status = (
-                            a_load2trans_pipeline.consumer_try_wait(
-                                a_load2trans_consumer_state
-                            )
+        for k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
+            if (k_parity + k_tile) % 2 == group_idx:
+                t_a0 = self._dbg_clock(50)
+                a_load2trans_pipeline.consumer_wait(a_load2trans_consumer_state)
+                t_a1 = self._dbg_clock(51)
+                if cutlass.const_expr(self.debug):
+                    wait_a += t_a1 - t_a0
+                t_s0 = self._dbg_clock(52)
+                trans2mma_pipeline.producer_acquire(trans2mma_producer_state)
+                if cutlass.const_expr(self.debug):
+                    wait_stage += clock_lo(53) - t_s0
+                t_c0 = self._dbg_clock(60)
+                if cutlass.const_expr(self.debug):
+                    cyc_pre += t_c0 - t_a1
+                for half in cutlass.range_constexpr(2):
+                    half_coord = self._transform_half_coord(split_mode, half)
+                    tAsA_input_half = tAsA_input[half_coord]
+                    tAsA_transform_half = tAsA_transform[half_coord]
+                    a_stage_coord = (None,) * (cute.rank(tAsA_input_half) - 1) + (
+                        a_load2trans_consumer_state.index,
+                    )
+                    a_transform_stage_coord = (None,) * (
+                        cute.rank(tAsA_transform_half) - 1
+                    ) + (trans2mma_producer_state.index,)
+                    tAsA_input_slice = tAsA_input_half[a_stage_coord]
+                    tAsA_input_slice = cute.flat_divide(
+                        tAsA_input_slice, transform_tiler
+                    )
+                    tAsA_input_slice = cute.group_modes(
+                        tAsA_input_slice, 1, cute.rank(tAsA_input_slice)
+                    )
+                    for idx in cutlass.range_constexpr(cute.size(tArA_load, mode=[1])):
+                        cute.autovec_copy(
+                            tAsA_input_slice[(None, idx)], tArA_load[(None, idx)]
                         )
-                packed_fragment = cute.recast_tensor(
-                    tArA_load[(None, idx)], cutlass.Uint8
-                ).load()
-                tArA_transform_store[(None, idx)].store(
-                    convert_e4m3_fragment(packed_fragment, self.mma_dtype)
-                )
-
-            a_transform_stage_coord = (None,) * (cute.rank(tAsA_transform) - 1) + (
-                trans2mma_producer_state.index,
-            )
-            mixed_input_utils.store_transformed_a(
-                tArA_transform, tAsA_transform[a_transform_stage_coord], dst_copy_a
-            )
-            if cutlass.const_expr(
-                self.transform_a_source == tcgen05.OperandSource.TMEM
-            ):
-                cute.arch.fence_view_async_tmem_store()
-            else:
-                cute.arch.fence_proxy("async.shared", space="cta")
-            a_load2trans_pipeline.consumer_release(cur_a_load2trans_consumer_state)
-            trans2mma_pipeline.producer_commit(trans2mma_producer_state)
+                        packed_fragment = cute.recast_tensor(
+                            tArA_load[(None, idx)], cutlass.Uint8
+                        ).load()
+                        tArA_transform_store[(None, idx)].store(
+                            convert_e4m3_fragment(packed_fragment, self.mma_dtype)
+                        )
+                    mixed_input_utils.store_transformed_a(
+                        tArA_transform,
+                        tAsA_transform_half[a_transform_stage_coord],
+                        dst_copy_a,
+                    )
+                t_s1 = self._dbg_clock(61)
+                if cutlass.const_expr(self.debug):
+                    cyc_convert += t_s1 - t_c0
+                # The raw stage goes back to the TMA producer once the converts have
+                # consumed it; the transformed stores are fenced before the commit.
+                a_load2trans_pipeline.consumer_release(a_load2trans_consumer_state)
+                if cutlass.const_expr(
+                    self.transform_a_source == tcgen05.OperandSource.TMEM
+                ):
+                    cute.arch.fence_view_async_tmem_store()
+                else:
+                    cute.arch.fence_proxy("async.shared", space="cta")
+                t_s2 = self._dbg_clock(62)
+                if cutlass.const_expr(self.debug):
+                    cyc_store += t_s2 - t_s1
+                trans2mma_pipeline.producer_commit(trans2mma_producer_state)
+                if cutlass.const_expr(self.debug):
+                    cyc_post += clock_lo(63) - t_s2
+            a_load2trans_consumer_state.advance()
             trans2mma_producer_state.advance()
-            if trans2mma_producer_state.count < k_tile_cnt:
-                peek_trans2mma_empty_status = trans2mma_pipeline.producer_try_acquire(
-                    trans2mma_producer_state
-                )
 
-        return a_load2trans_consumer_state, trans2mma_producer_state
+        return (
+            a_load2trans_consumer_state,
+            trans2mma_producer_state,
+            wait_a,
+            wait_stage,
+            cyc_convert,
+            cyc_store,
+            cyc_pre,
+            cyc_post,
+        )
 
     # --------------------------------------------------------------- launch
     @cute.jit
@@ -627,7 +669,7 @@ class Sm100W8A16Fp8GemmKernel:
             producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
             consumer_group=pipeline.CooperativeGroup(
                 pipeline.Agent.Thread,
-                self.num_mcast_ctas_a * self.num_transform_warps,
+                self.num_mcast_ctas_a * (self.num_transform_warps // 2),
             ),
             tx_count=self.num_tma_load_bytes_a,
             cta_layout_vmnk=cluster_layout_vmnk,
@@ -640,7 +682,7 @@ class Sm100W8A16Fp8GemmKernel:
             barrier_storage=storage.a_trans2mma_full_mbar_ptr.data_ptr(),
             num_stages=self.num_trans2mma_stage,
             producer_group=pipeline.CooperativeGroup(
-                pipeline.Agent.Thread, 32 * self.num_transform_warps * cta_v_size
+                pipeline.Agent.Thread, 32 * (self.num_transform_warps // 2) * cta_v_size
             ),
             consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
             cta_layout_vmnk=cluster_layout_vmnk,
@@ -1035,6 +1077,7 @@ class Sm100W8A16Fp8GemmKernel:
                 tArA_transform,
                 tArA_transform_store,
                 transform_tiler,
+                split_mode,
             ) = self._setup_transform_partitions(
                 tiled_mma,
                 copy_atom_a_input,
@@ -1059,6 +1102,15 @@ class Sm100W8A16Fp8GemmKernel:
                 pipeline.PipelineUserType.Producer, self.num_trans2mma_stage
             )
             dbg_tiles = cutlass.Int32(0)
+            xf_wait_a = cutlass.Int32(0)
+            xf_wait_stage = cutlass.Int32(0)
+            xf_cyc_convert = cutlass.Int32(0)
+            xf_cyc_store = cutlass.Int32(0)
+            xf_cyc_pre = cutlass.Int32(0)
+            xf_cyc_post = cutlass.Int32(0)
+            # Parity of the global index of this tile's first k-tile (see _transform_tile).
+            xf_k_parity = cutlass.Int32(0)
+            xf_clock0 = self._dbg_clock(54)
             if cutlass.const_expr(self.debug):
                 if warp_idx == self.transform_warp_id[0]:
                     with cute.arch.elect_one():
@@ -1068,7 +1120,16 @@ class Sm100W8A16Fp8GemmKernel:
                     if warp_idx == self.transform_warp_id[0]:
                         with cute.arch.elect_one():
                             dbg[dbg_base + 11] = cutlass.Int32(1)
-                a_load2trans_consumer_state, trans2mma_producer_state = (
+                (
+                    a_load2trans_consumer_state,
+                    trans2mma_producer_state,
+                    xf_wait_a,
+                    xf_wait_stage,
+                    xf_cyc_convert,
+                    xf_cyc_store,
+                    xf_cyc_pre,
+                    xf_cyc_post,
+                ) = (
                     self._transform_tile(
                         a_load2trans_pipeline,
                         trans2mma_pipeline,
@@ -1081,9 +1142,19 @@ class Sm100W8A16Fp8GemmKernel:
                         tArA_transform,
                         tArA_transform_store,
                         transform_tiler,
+                        split_mode,
                         k_tile_cnt,
+                        xf_k_parity,
+                        transform_group_idx,
+                        xf_wait_a,
+                        xf_wait_stage,
+                        xf_cyc_convert,
+                        xf_cyc_store,
+                        xf_cyc_pre,
+                        xf_cyc_post,
                     )
                 )
+                xf_k_parity = (xf_k_parity + k_tile_cnt) % 2
                 if cutlass.const_expr(self.debug):
                     dbg_tiles += 1
                     if warp_idx == self.transform_warp_id[0]:
@@ -1097,6 +1168,16 @@ class Sm100W8A16Fp8GemmKernel:
                     tile_info_pipeline, tile_info_consumer_state, sTile_info
                 )
             trans2mma_pipeline.producer_tail(trans2mma_producer_state)
+            if cutlass.const_expr(self.debug):
+                if warp_idx == self.transform_warp_id[0]:
+                    with cute.arch.elect_one():
+                        dbg[dbg_base + 43] = xf_wait_a
+                        dbg[dbg_base + 44] = xf_wait_stage
+                        dbg[dbg_base + 60] = xf_cyc_convert
+                        dbg[dbg_base + 61] = xf_cyc_store
+                        dbg[dbg_base + 62] = xf_cyc_pre
+                        dbg[dbg_base + 63] = xf_cyc_post
+                        dbg[dbg_base + 48] = clock_lo(55) - xf_clock0
 
         # ---- MMA warp.
         if warp_idx == self.mma_warp_id:
@@ -1131,6 +1212,12 @@ class Sm100W8A16Fp8GemmKernel:
                 pipeline.PipelineUserType.Producer, self.num_acc_stage
             )
             dbg_tiles = cutlass.Int32(0)
+            # Debug wait accounting (cycles): inputs (transformed A + B stages), a free
+            # accumulator stage, k-tiles seen, and the warp's total.
+            mma_wait_in = cutlass.Int32(0)
+            mma_wait_acc = cutlass.Int32(0)
+            mma_ktiles = cutlass.Int32(0)
+            mma_clock0 = self._dbg_clock(40)
             if cutlass.const_expr(self.debug):
                 with cute.arch.elect_one():
                     dbg[dbg_base + 21] = global_timer_lo(21)
@@ -1149,12 +1236,16 @@ class Sm100W8A16Fp8GemmKernel:
                     if cutlass.const_expr(self.debug):
                         with cute.arch.elect_one():
                             dbg[dbg_base + 12] = cutlass.Int32(1)
+                    t_acc0 = self._dbg_clock(41)
                     acc_pipeline.producer_acquire(acc_producer_state)
+                    if cutlass.const_expr(self.debug):
+                        mma_wait_acc += clock_lo(42) - t_acc0
                     tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
                     for _k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
                         if cutlass.const_expr(self.debug):
                             with cute.arch.elect_one():
                                 dbg[dbg_base + 12] = cutlass.Int32(2)
+                        t_in0 = self._dbg_clock(43)
                         trans2mma_pipeline.consumer_wait(
                             trans2mma_consumer_state, peek_trans2mma_full_status
                         )
@@ -1163,6 +1254,8 @@ class Sm100W8A16Fp8GemmKernel:
                                 dbg[dbg_base + 12] = cutlass.Int32(3)
                         b_load2mma_pipeline.consumer_wait(b_load2mma_consumer_state)
                         if cutlass.const_expr(self.debug):
+                            mma_wait_in += clock_lo(44) - t_in0
+                            mma_ktiles += 1
                             with cute.arch.elect_one():
                                 dbg[dbg_base + 12] = cutlass.Int32(4)
                                 dbg[
@@ -1222,6 +1315,12 @@ class Sm100W8A16Fp8GemmKernel:
                     tile_info_pipeline, tile_info_consumer_state, sTile_info
                 )
             acc_pipeline.producer_tail(acc_producer_state)
+            if cutlass.const_expr(self.debug):
+                with cute.arch.elect_one():
+                    dbg[dbg_base + 40] = mma_wait_in
+                    dbg[dbg_base + 41] = mma_wait_acc
+                    dbg[dbg_base + 42] = mma_ktiles
+                    dbg[dbg_base + 47] = clock_lo(47) - mma_clock0
 
         # ---- epilogue warps: D = scale * acc (+ bias[row]), cast, TMA store.
         if warp_idx < self.mma_warp_id:
@@ -1303,6 +1402,8 @@ class Sm100W8A16Fp8GemmKernel:
             )
             dbg_tiles = cutlass.Int32(0)
             epi_tile_count = cutlass.Int32(0)
+            epi_wait_acc = cutlass.Int32(0)
+            epi_clock0 = self._dbg_clock(56)
             while work_tile.is_valid_tile:
                 m_base = work_tile.cta_coord_m * self.cta_tile_shape_mnk[0]
                 # The tile's activation offset within C: its K-slice's rows follow
@@ -1357,8 +1458,10 @@ class Sm100W8A16Fp8GemmKernel:
                 ]
                 tTR_tAcc = cute.group_modes(tTR_tAcc, 3, cute.rank(tTR_tAcc))
 
+                t_e0 = self._dbg_clock(57)
                 acc_pipeline.consumer_wait(acc_consumer_state)
                 if cutlass.const_expr(self.debug):
+                    epi_wait_acc += clock_lo(58) - t_e0
                     if epi_tidx == 0:
                         dbg[dbg_base + 13] = cutlass.Int32(2)
                         dbg[dbg_base + _slot_if(epi_tile_count == 0, 24)] = (
@@ -1481,6 +1584,10 @@ class Sm100W8A16Fp8GemmKernel:
             self.epilog_sync_barrier.arrive_and_wait()
             tmem.free(tmem_ptr)
             c_pipeline.producer_tail()
+            if cutlass.const_expr(self.debug):
+                if epi_tidx == 0:
+                    dbg[dbg_base + 45] = epi_wait_acc
+                    dbg[dbg_base + 49] = clock_lo(59) - epi_clock0
 
         if cutlass.const_expr(self.enable_pdl):
             if warp_idx == self.mma_warp_id:

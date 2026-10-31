@@ -448,6 +448,21 @@ def nanosleep(ns: int, *, loc=None, ip=None) -> None:
 
 
 @dsl_user_op
+def clock_lo(tag: int, *, loc=None, ip=None) -> cutlass.Int32:
+    """``%clock`` (SM cycle counter, low 32 bits); debug-mode wait accounting only.
+    ``tag`` distinguishes call sites (see ``global_timer_lo``)."""
+    val = _asm_op(
+        Uint32.mlir_type,
+        [],
+        f"mov.u32 $0, %clock; // {int(tag)}",
+        "=r",
+        loc=loc,
+        ip=ip,
+    )
+    return cutlass.Int32(val)
+
+
+@dsl_user_op
 def global_timer_lo(tag: int, *, loc=None, ip=None) -> cutlass.Int32:
     """Low 32 bits of ``%globaltimer`` (nanoseconds); debug-mode timelines only.
     ``tag`` is unused by the asm: it makes every call site a distinct op (a no-argument
