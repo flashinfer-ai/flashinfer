@@ -47,6 +47,7 @@ PACKAGES: dict[str, str] = {
     "sm110_xqa": "flashinfer.experimental.sm110_xqa",
     "cake_gdn_det_train": "flashinfer.experimental.cake_gdn_det_train",
     "cake_gqa_train": "flashinfer.experimental.cake_gqa_train",
+    "cake.cake_mhc_train": "flashinfer.experimental.cake.cake_mhc_train_backend",
 }
 # Compatibility key: suites that name the causal conv1d package ``cake_causal_conv1d_train`` load the det package.
 PACKAGES["cake_causal_conv1d_train"] = PACKAGES["cake_causal_conv1d_det_train"]
