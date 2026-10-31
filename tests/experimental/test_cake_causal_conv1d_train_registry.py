@@ -383,7 +383,9 @@ def test_alert_helper_in_both_torch_modes(monkeypatch) -> None:
     ``RuntimeError`` naming the entry and the deterministic package when on, a ``UserWarning`` with the same naming
     under ``warn_only=True``.  The KCP module uses the same helper."""
 
-    from flashinfer.experimental.cake.cake_causal_conv1d_train_backend import kcp as conv_kcp
+    from flashinfer.experimental.cake.cake_causal_conv1d_train_backend import (
+        kcp as conv_kcp,
+    )
 
     assert conv_kcp._alert_nondeterministic is pkg._alert_nondeterministic
     monkeypatch.delattr(torch._C, "_alert_not_deterministic", raising=False)
@@ -397,14 +399,22 @@ def test_alert_helper_in_both_torch_modes(monkeypatch) -> None:
             pkg._alert_nondeterministic("probe_entry")
         assert caught == []
         torch.use_deterministic_algorithms(True)
-        with pytest.raises(RuntimeError, match="probe_entry does not have a deterministic implementation") as info:
+        with pytest.raises(
+            RuntimeError,
+            match="probe_entry does not have a deterministic implementation",
+        ) as info:
             pkg._alert_nondeterministic("probe_entry")
         assert "flashinfer.cake_causal_conv1d_det_train" in str(info.value)
         assert "warn_only=True" in str(info.value)
         torch.use_deterministic_algorithms(True, warn_only=True)
-        with pytest.warns(UserWarning, match="probe_entry does not have a deterministic implementation") as record:
+        with pytest.warns(
+            UserWarning,
+            match="probe_entry does not have a deterministic implementation",
+        ) as record:
             pkg._alert_nondeterministic("probe_entry")
-        assert any("flashinfer.cake_causal_conv1d_det_train" in str(w.message) for w in record)
+        assert any(
+            "flashinfer.cake_causal_conv1d_det_train" in str(w.message) for w in record
+        )
     finally:
         torch.use_deterministic_algorithms(prev, warn_only=prev_warn)
 
@@ -428,14 +438,20 @@ def test_backward_entries_alert_before_any_device_work(monkeypatch) -> None:
     )
     try:
         torch.use_deterministic_algorithms(True)
-        with pytest.raises(RuntimeError, match="cake_causal_conv1d_train_backward does not have"):
+        with pytest.raises(
+            RuntimeError, match="cake_causal_conv1d_train_backward does not have"
+        ):
             pkg.cake_causal_conv1d_train_backward(x, w, cu, x, deterministic=False)
         # The forward runs the deterministic forward programs: no alert.
         y = pkg.cake_causal_conv1d_train_forward(x, w, cu, deterministic=False)
         assert tuple(y.shape) == (0, 16)
         torch.use_deterministic_algorithms(True, warn_only=True)
-        with pytest.warns(UserWarning, match="cake_causal_conv1d_train_backward does not have"):
-            dx, dw = pkg.cake_causal_conv1d_train_backward(x, w, cu, x, deterministic=False)
+        with pytest.warns(
+            UserWarning, match="cake_causal_conv1d_train_backward does not have"
+        ):
+            dx, dw = pkg.cake_causal_conv1d_train_backward(
+                x, w, cu, x, deterministic=False
+            )
         assert tuple(dx.shape) == (0, 16) and torch.equal(dw, torch.zeros_like(dw))
     finally:
         torch.use_deterministic_algorithms(prev, warn_only=prev_warn)
