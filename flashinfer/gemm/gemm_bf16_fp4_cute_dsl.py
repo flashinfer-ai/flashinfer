@@ -1039,7 +1039,7 @@ def _cute_dsl_bf16_fp4_runner(enable_pdl: bool = True) -> TunableRunner:
                 # occupancy multiplies the co-resident CTA slots per SM, so
                 # occ2 x split-K fits 2x the pieces in one wave.
                 slots = sm_count * cfg[6]
-                base_waves = -(-tiles // sm_count)
+                base_waves = -(-tiles // slots)
                 split_waves = (-(-tiles * splits // slots)) / splits
                 return split_waves <= 0.75 * base_waves
 
