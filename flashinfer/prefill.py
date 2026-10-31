@@ -2506,6 +2506,25 @@ def _build_block_tables_from_paged_kv_indices(
     return out
 
 
+def _fa2_metadata_to_host(wrapper, qo_indptr, kv_indptr, last_page_len):
+    """Refresh wrapper-owned pinned metadata and wait before CPU consumption."""
+    sizes = (qo_indptr.numel(), kv_indptr.numel(), last_page_len.numel())
+    cached = getattr(wrapper, "_fa2_host_metadata", None)
+    if cached is None or cached[0] != sizes:
+        storage = torch.empty(
+            sum(sizes), dtype=torch.int32, device="cpu", pin_memory=True
+        )
+        cached = (sizes, storage.split(sizes))
+        wrapper._fa2_host_metadata = cached
+    buffers = cached[1]
+    for host, device in zip(
+        buffers, (qo_indptr, kv_indptr, last_page_len), strict=True
+    ):
+        host.copy_(device, non_blocking=True)
+    torch.cuda.current_stream(wrapper.device).synchronize()
+    return buffers
+
+
 def _paged_kv_host_metadata(indptr, last_page_len, seq_lens, page_size):
     indptr_host = indptr.to("cpu")
     last_host = last_page_len.to("cpu")
@@ -3834,23 +3853,86 @@ class BatchPrefillWithPagedKVCacheWrapper:
         self._token_pos_in_items_len = token_pos_in_items_len
         self._max_item_len_ptr = max_item_len_ptr
 
-        # NOTE(Zihao): only required if qo_indptr/paged_kv_indptr are device tensors
-        qo_indptr_host = qo_indptr.to("cpu")
-        self._qo_indptr_last = int(qo_indptr_host[-1])
+        # A supplied KV bound can let auto select cuDNN without reading KV
+        # metadata back. Batch copies only when the existing path needs all
+        # three arrays, and serialize planning on each wrapper as before.
+        stage_fa2 = (
+            self._backend == "fa2"
+            and self._jit_module is None
+            and not self.is_cuda_graph_enabled
+            and batch_size > 0
+            and max_sequence_kv is None
+            and qo_indptr.dtype
+            == paged_kv_indptr.dtype
+            == paged_kv_last_page_len.dtype
+            == torch.int32
+            and qo_indptr.is_cuda
+            and qo_indptr.device
+            == paged_kv_indptr.device
+            == paged_kv_last_page_len.device
+            == self.device
+        )
+        if stage_fa2:
+            qo_indptr_host, paged_kv_indptr_host, paged_kv_last_page_len_host = (
+                _fa2_metadata_to_host(
+                    self, qo_indptr, paged_kv_indptr, paged_kv_last_page_len
+                )
+            )
+        else:
+            qo_indptr_host = qo_indptr.to("cpu")
+        # Lists avoid tiny CPU tensor operators for the validated small-batch
+        # case; larger batches retain tensor length arithmetic.
+        small_fa2 = stage_fa2 and batch_size <= 4
+        if small_fa2:
+            q_boundaries = qo_indptr_host.tolist()
+            self._qo_indptr_last = q_boundaries[-1]
+        else:
+            self._qo_indptr_last = int(qo_indptr_host[-1])
         total_num_rows = self._qo_indptr_last
         if max_token_per_sequence is not None:
             self._max_q_len = max_token_per_sequence
+        elif small_fa2:
+            self._max_q_len = max(
+                end - start
+                for start, end in zip(q_boundaries[:-1], q_boundaries[1:], strict=True)
+            )
         else:
             self._max_q_len = (qo_indptr_host[1:] - qo_indptr_host[:-1]).max().item()
 
         kv_lens_arr_host = None
         if max_sequence_kv is None:
-            paged_kv_indptr_host, paged_kv_last_page_len_host, kv_lens_arr_host = (
-                _paged_kv_host_metadata(
-                    paged_kv_indptr, paged_kv_last_page_len, seq_lens, page_size
+            if small_fa2 and seq_lens is None:
+                pages = paged_kv_indptr_host.tolist()
+                tails = paged_kv_last_page_len_host.tolist()
+                # Keep get_seq_lens semantics, including zero-page requests.
+                kv_lengths = [
+                    max(end - start - 1, 0) * page_size + tail
+                    for start, end, tail in zip(
+                        pages[:-1], pages[1:], tails, strict=True
+                    )
+                ]
+                kv_lens_arr_host = torch.tensor(
+                    kv_lengths, dtype=torch.int32, device="cpu"
                 )
+            elif stage_fa2:
+                kv_lens_arr_host = (
+                    get_seq_lens(
+                        paged_kv_indptr_host, paged_kv_last_page_len_host, page_size
+                    )
+                    if seq_lens is None
+                    else seq_lens.cpu().flatten().to(torch.int32)
+                )
+            else:
+                paged_kv_indptr_host, paged_kv_last_page_len_host, kv_lens_arr_host = (
+                    _paged_kv_host_metadata(
+                        paged_kv_indptr, paged_kv_last_page_len, seq_lens, page_size
+                    )
+                )
+            self._max_kv_len = (
+                max(kv_lengths)
+                if small_fa2 and seq_lens is None
+                else kv_lens_arr_host.max().item()
             )
-            self._max_kv_len = kv_lens_arr_host.max().item()
         else:
             self._max_kv_len = max_sequence_kv
 
