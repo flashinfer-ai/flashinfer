@@ -83,6 +83,9 @@ __all__ = [
     "GRID_DISPATCH_MIN_TOKENS_ENV",
     "PUBLISH_FORM_ENV",
     "Sm90CakeBf16MoERunner",
+    "WCX_MAX_TOKENS",
+    "WCX_MAX_TOKENS_ENV",
+    "WCX_MAX_TOKENS_LIMIT",
 ]
 
 # Fast-path kernel selection.  Each toggle defaults to the fused kernel; "0" /
@@ -215,6 +218,19 @@ FC2_EARLY_WINDOWS: dict[tuple[int, int, int, int, int], tuple[int, int]] = {
     (7168, 2048, 256, 8, 4): (128, 1024),
     (7168, 3072, 384, 6, 8): (512, 1024),
 }
+# Compressed expert weights (WCX) in decode rounds: rounds with 0 < local tokens
+# <= this bound that run the FC2 early-start pair read the layer's WCX copies
+# (Sm90CakeBf16Weights.wcx, attached by encode_sm90_cake_wcx) through the
+# swap-AB pair instead of the bf16 pair: fewer weight bytes per round, same
+# tiles, same products in the same order, same bits.  Opt-in, 0 (default)
+# disables it: no WCX module is built and the layer needs no WCX copies.  The
+# bound is at most WCX_MAX_TOKENS_LIMIT (decode rounds).  FC1 and FC2 switch
+# together, only in early-start rounds, and only for a layer whose weights
+# carry WCX copies (a layer that fell back to bf16 keeps the bf16 pair).
+# Rank-local, so ranks may differ per round.
+WCX_MAX_TOKENS_ENV = "FLASHINFER_SM90_CAKE_BF16_WCX_MAX_TOKENS"
+WCX_MAX_TOKENS = 0
+WCX_MAX_TOKENS_LIMIT = 128
 # Receiver-side prefix inside the single-launch dispatches (fused_begin 2): 1
 # (default) = the small-round fused dispatch and the grid dispatch compute the
 # integer prefix sums over the E x ep (expert, source) keys with the whole block,
@@ -346,6 +362,22 @@ def _form(value: int | None, env: str, name: str) -> int:
 def _fc2_early_max_tokens_default() -> int:
     raw = os.environ.get(FC2_EARLY_MAX_TOKENS_ENV)
     return FC2_EARLY_MAX_TOKENS if raw is None else int(raw.strip())
+
+
+def wcx_max_tokens_default() -> int:
+    """``WCX_MAX_TOKENS_ENV`` (unset or empty: ``WCX_MAX_TOKENS`` = 0, off)."""
+    raw = os.environ.get(WCX_MAX_TOKENS_ENV, "").strip()
+    return WCX_MAX_TOKENS if raw == "" else int(raw)
+
+
+def validate_wcx_max_tokens(value: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"wcx_max_tokens must be an int, got {value!r}")
+    if not 0 <= value <= WCX_MAX_TOKENS_LIMIT:
+        raise ValueError(
+            f"wcx_max_tokens must be in [0, {WCX_MAX_TOKENS_LIMIT}] (decode rounds), got {value!r}"
+        )
+    return value
 
 
 def _direct_place_default(ep: int) -> bool:
@@ -525,6 +557,7 @@ class Sm90CakeBf16MoERunner:
         direct_place: bool | None = None,
         direct_place_min_tokens: int | None = None,
         fc2_early_windows: bool | None = None,
+        wcx_max_tokens: int | None = None,
     ) -> None:
         self.pipe = pipe
         self._state = _RunnerState.IDLE
@@ -624,6 +657,10 @@ class Sm90CakeBf16MoERunner:
         )
         self._fc2_early_window: tuple[int, int] | None = None  # fixed after the JIT
         self._gemm_sched: torch.Tensor | None = None
+        self._wcx_max_tokens = validate_wcx_max_tokens(
+            wcx_max_tokens_default() if wcx_max_tokens is None else wcx_max_tokens
+        )  # effective value fixed after the JIT
+        self._wcx_rounds = 0
         self._prefix_form = _form(prefix_form, PREFIX_FORM_ENV, "prefix_form")
         if direct_place is None:
             requested = _direct_place_default(pipe.ep)
@@ -775,6 +812,18 @@ class Sm90CakeBf16MoERunner:
             )
             if not early_ok:
                 self._fc2_early_max_tokens = 0
+            # WCX decode rounds ride on the early-start pair of the decode window
+            # (fc2_early_max_tokens; the per-shape windows start above 128 tokens):
+            # built here (eagerly) when enabled
+            if self._wcx_max_tokens > 0:
+                if (
+                    early_ok
+                    and self._fc2_early_max_tokens > 0
+                    and getattr(self.gemm, "supports_wcx", False)
+                ):
+                    self.gemm.prepare_wcx()
+                else:
+                    self._wcx_max_tokens = 0
             if early_ok and self._fc2_early_windows:
                 self._fc2_early_window = fc2_early_window_for(
                     pipe.H, self.I, pipe.E * pipe.ep, pipe.K, pipe.ep
@@ -850,6 +899,16 @@ class Sm90CakeBf16MoERunner:
     def fc2_early_max_tokens(self) -> int:
         """Largest round (local tokens) that starts FC2 in FC1's tail wave (0 = off)."""
         return self._fc2_early_max_tokens
+
+    @property
+    def wcx_max_tokens(self) -> int:
+        """Largest decode round (local tokens) that reads the WCX weight copies (0 = off)."""
+        return self._wcx_max_tokens
+
+    @property
+    def wcx_rounds(self) -> int:
+        """Rounds issued through the WCX pair by this runner (host count, per issue / capture)."""
+        return self._wcx_rounds
 
     @property
     def fc2_early_windows(self) -> bool:
@@ -1367,8 +1426,24 @@ class Sm90CakeBf16MoERunner:
                     )
                     else None
                 )
+                # WCX decode round: the swap-AB early pair on the layer's compressed copies
+                # (FC1 and FC2 switch together; same bits as the early pair)
+                wcx = (
+                    weights.wcx
+                    if sched is not None and 0 < num_tokens <= self._wcx_max_tokens
+                    else None
+                )
                 with _record_stage("fc1", nv):
-                    if sched is not None:
+                    if wcx is not None:
+                        self.gemm.fc1_wcx(
+                            self.a1,
+                            wcx,
+                            pipe._offsets,
+                            self.h2,
+                            pdl=bool(self._pdl & PDL_EDGE_FC1),
+                            sched=sched,
+                        )
+                    elif sched is not None:
                         self.gemm.fc1(
                             self.a1,
                             weights.w13,
@@ -1386,7 +1461,17 @@ class Sm90CakeBf16MoERunner:
                             pdl=bool(self._pdl & PDL_EDGE_FC1),
                         )
                 with _record_stage("fc2", nv):
-                    if sched is not None:
+                    if wcx is not None:
+                        self.gemm.fc2_wcx(
+                            self.h2,
+                            wcx,
+                            pipe._offsets,
+                            self.y,
+                            pdl=bool(self._pdl & PDL_EDGE_FC2),
+                            sched=sched,
+                        )
+                        self._wcx_rounds += 1
+                    elif sched is not None:
                         self.gemm.fc2(
                             self.h2,
                             weights.w2,

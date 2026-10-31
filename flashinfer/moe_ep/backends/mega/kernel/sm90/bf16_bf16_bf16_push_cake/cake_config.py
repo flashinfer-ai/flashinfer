@@ -134,6 +134,23 @@ class Sm90_Bf16_Bf16_Bf16_PushCake_MegaMoeConfig:
     smallest round whose routes carry ``2**25`` elements: ``586`` at hidden 7168
     and top-k 8, ``781`` at 7168 and 6, ``1366`` at 4096 and 6; at other EP sizes
     ``513``, the grid-dispatch bound).
+
+    ``wcx_max_tokens`` (opt-in, default off) makes decode rounds with at most
+    that many local tokens (``0 < T <= wcx_max_tokens <= 128``) read lossless
+    compressed copies of the expert weights (WCX) through the swap-AB variant
+    of the FC2 early-start pair: fewer weight bytes per round, same products in
+    the same order, same bits.  It applies only in rounds that run the early
+    start of the decode window (``fc2_early_max_tokens`` > 0; otherwise off).  The compressed copies are kept
+    next to the bf16 weights (dual format): each MoE layer's expert memory on
+    a rank grows by about 0.77 x its bf16 expert bytes (Gaussian weights; the
+    exact figure depends on the weights' exponent spread).  A layer whose
+    weights need more than 188 escape slots in a stage, or whose geometry has
+    no WCX unit (``hidden_size % 512 != 0`` or ``intermediate_size % 256 != 0``),
+    keeps the bf16 pair (warned once).  Pre-transformed weights
+    (``preprocess_weights=False``) carry the copies only when built with
+    ``encode_sm90_cake_wcx``.  ``0`` disables it: nothing is encoded
+    or built.  ``None`` reads ``FLASHINFER_SM90_CAKE_BF16_WCX_MAX_TOKENS``
+    (default ``0``).
     """
 
     intermediate_size: int
@@ -158,3 +175,4 @@ class Sm90_Bf16_Bf16_Bf16_PushCake_MegaMoeConfig:
     direct_place: bool | None = None
     direct_place_min_tokens: int | None = None
     fc2_early_windows: bool | None = None
+    wcx_max_tokens: int | None = None
