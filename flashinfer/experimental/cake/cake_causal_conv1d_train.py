@@ -30,6 +30,10 @@ Every entry point takes ``deterministic: bool = True``:
 * With ``torch.use_deterministic_algorithms(True)`` a call with
   ``deterministic=False`` runs the deterministic package and warns once
   (``UserWarning``): determinism requested anywhere is never silently dropped.
+  The backend itself never falls back: its entry points that launch the
+  unordered reduction (the backward, hence the autograd backward) call
+  ``torch._C._alert_not_deterministic``; its forward (the deterministic
+  forward programs' bits) does not alert.
   Under that fallback a caller-owned backward ``workspace`` (a
   ``deterministic=False`` buffer) is not passed on; the deterministic package
   allocates its own.
@@ -418,7 +422,11 @@ def cake_causal_conv1d(
         (:class:`CakeCausalConv1dFunction`), whose backward is one launch with
         unordered ``dweight`` / ``dbias`` reductions.  The mode is chosen at the
         forward call (torch's deterministic mode then turns ``False`` into
-        ``True`` with a one-time warning) and the backward runs the same package.
+        ``True`` with a one-time warning) and the backward runs the same package:
+        when torch's deterministic mode is turned on between a non-deterministic
+        forward and its backward, that backward alerts
+        (``torch._C._alert_not_deterministic``: a ``RuntimeError``, or a warning
+        with ``warn_only=True``).
 
     Returns
     -------

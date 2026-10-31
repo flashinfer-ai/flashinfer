@@ -124,7 +124,7 @@ def test_forward_records_are_the_deterministic_forward_records() -> None:
 @pytest.mark.cpu_only
 def test_backward_records_are_one_launch_with_accumulators() -> None:
     """Every backward program replaces the deterministic program + reduce pair of the same route position: the
-    deterministic arguments without ``partial``, plus ``acc`` / ``work`` and the gradient outs it now stores
+    deterministic arguments without ``partial``, plus ``dw_acc`` / ``work`` and the gradient outs it now stores
     (``dw``, and ``db`` on the bias routes); the same build geometry, block, cluster, architectures and selection
     rule; an ordinary occupancy-sized launch without PDL; an ``accumulators`` workspace of the route's dtype and
     tap count."""
@@ -136,12 +136,14 @@ def test_backward_records_are_one_launch_with_accumulators() -> None:
         label = (arch, kind, name)
         assert record["role"] == "bwd" and record["arches"] == det["arches"], label
         assert record["ffi_entry"] == det["ffi_entry"], label
-        expected = (_args(det) - {"partial"}) | {"acc", "work", "dw"} | ({"db"} if bias else set())
+        expected = (_args(det) - {"partial"}) | {"dw_acc", "work", "dw"} | ({"db"} if bias else set())
         assert _args(record) == expected, label
         assert [k for k, _ in record["arg_plan"][-3:]] == ["grid", "grid", "grid"], label
         assert set(record["logical"]) == _args(record), label
         assert set(record["logical"].values()) <= vocabulary, label
         assert record["logical"].get("x_map", "x") == "x" and record["logical"].get("dy_map", "dy") == "dy"
+        # The global accumulators: kernel parameter ``dw_acc`` (the det fragments' ``acc`` is a register), logical ``acc``.
+        assert record["logical"]["dw_acc"] == "acc" and record["logical"]["work"] == "work", label
         assert ("flags" in _args(record)) is (kind != "bwd"), label
         grid, det_grid = record["grid_rule"], det["grid_rule"]
         assert grid["kind"] == "occupancy" and grid["cooperative"] is False, label

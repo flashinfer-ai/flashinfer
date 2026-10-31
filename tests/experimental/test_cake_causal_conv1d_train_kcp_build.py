@@ -16,7 +16,8 @@ limitations under the License.
 The KCP registry (``kcp_jit``) of the non-deterministic causal convolution training package against the
 deterministic package's: the forward and head programs are the deterministic ones (only their names differ); the
 main backward programs keep the deterministic route positions, selection rule, build geometry and arguments, with
-the ``partial`` rows replaced by zeroed FP32 ``acc`` / uint32 ``work`` accumulators, an ordinary occupancy-sized
+the ``partial`` rows replaced by zeroed FP32 accumulators (kernel parameter ``dw_acc``, logical ``acc``) and uint32
+``work`` ticket counters, an ordinary occupancy-sized
 launch (no cooperative attribute, no grid barrier) and the workspace size of the legacy channel-tile rule the KCP
 path plans with.  No device is needed; nothing is built or launched.
 """
@@ -96,14 +97,17 @@ def test_main_backward_records_are_ordinary_launches_with_accumulators() -> None
         label = (arch, name)
         assert record["role"] == "kcp_bwd" and record["arches"] == det["arches"], label
         assert record["ffi_entry"] == det["ffi_entry"] == "run", label
-        assert _args(record) == (_args(det) - {"partial"}) | {"acc", "work"}, label
+        assert _args(record) == (_args(det) - {"partial"}) | {"dw_acc", "work"}, label
+        assert record["logical"]["dw_acc"] == "acc" and record["logical"]["work"] == "work", label
         assert [k for k, _ in record["arg_plan"][-3:]] == ["grid", "grid", "grid"], label
         assert set(record["logical"]) == _args(record), label
         assert set(record["logical"].values()) <= vocabulary, label
         grid = record["grid_rule"]
         assert grid["kind"] == "occupancy" and grid["cooperative"] is False, label
         assert grid["geometry"] == det["grid_rule"]["geometry"], label
-        assert grid["grid_mult"] == {a: 1 for a in record["arches"]}, label
+        # ``grid_mult`` (a rendered leaf): one positive factor per architecture of the record.
+        assert set(grid["grid_mult"]) == set(record["arches"]), label
+        assert all(isinstance(f, int) and f >= 1 for f in grid["grid_mult"].values()), label
         assert isinstance(grid["ctas_per_sm"], int) and grid["ctas_per_sm"] >= 1, label
         launch = record["launch"]
         assert launch["cooperative"] is False and launch["use_pdl"] is False, label
