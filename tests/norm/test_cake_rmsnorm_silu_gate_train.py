@@ -20,20 +20,22 @@ the ``deterministic=False`` path of :mod:`flashinfer.cake_rmsnorm_silu_gate_trai
 
 ``y``, ``dx`` and ``dz`` must lie within one BF16 ulp of an independent FP64
 reference, and ``dx`` and ``dz`` must be the same bits on every launch and on
-every path (streams, CUDA Graph replays, autograd, ``compute_grad_weight``).
-The weight gradient, whose FP64 cross-CTA sum depends on scheduling, is held to
-the deterministic suite's budget, ``|dw - dw64| <= |dw64| * 2^-7 + sum|terms| *
+every path (streams, CUDA Graph replays, autograd, ``compute_grad_weight``,
+grids smaller than the row blocks).  The weight gradient, whose FP32 runs and
+FP64 cross-CTA sum depend on which row blocks each CTA claims, is held to the
+deterministic suite's budget, ``|dw - dw64| <= |dw64| * 2^-7 + sum|terms| *
 2^-20``, worst case over repeated launches.  The matrix covers dynamic token and
 head counts (``H = 48`` and small or irregular row counts), ``[T, H, 128]``
 strided and flattened layouts, near-zero variance, saturated gates, FP32 and
-BF16 weight gradients, accumulation, ``compute_grad_weight=False``, empty work,
-a workspace reused across shapes (zero after every call), a workspace with
-nonzero scratch returned to zero by ``cake_rmsnorm_silu_gate_train_reset_workspace``,
-two streams with their own workspaces, CUDA Graph capture and replay, the
-autograd wrapper (non-reentrant checkpointing included), the state a
-checkpointed step keeps (FlashInfer issue #7039) and the mode policy: every
-compute and workspace entry point refuses any ``deterministic`` but ``False``,
-and the backward alerts under ``torch.use_deterministic_algorithms(True)``.
+BF16 weight gradients, accumulation, ``compute_grad_weight=False``, grids of 1,
+3 and 7 CTAs (every CTA claims), empty work, a workspace reused across shapes
+(zero after every call), a workspace with nonzero scratch returned to zero by
+``cake_rmsnorm_silu_gate_train_reset_workspace``, two streams with their own
+workspaces, CUDA Graph capture and replay, the autograd wrapper (non-reentrant
+checkpointing included), the state a checkpointed step keeps (FlashInfer issue
+#7039) and the mode policy: every compute and workspace entry point refuses any
+``deterministic`` but ``False``, and the backward alerts under
+``torch.use_deterministic_algorithms(True)``.
 
 This suite exercises the package alone, named once through
 ``tests.test_helpers.cake_package`` (so a vendored copy runs it unchanged), and
@@ -350,7 +352,7 @@ def test_weight_gradient_accumulation():
     assert (err <= (2 * dw64).abs() * 2.0**-6 + mag1 * 2.0**-18).all()
 
 
-def test_compute_grad_weight_false_touches_no_weight_state():
+def test_compute_grad_weight_false_touches_no_weight_state(monkeypatch):
     x, z, w, dy = make(257, 48, seed=12)
     # dx and dz do not depend on whether the weight gradient is computed
     dx_d, dz_d, _ = backward(dy, x, z, w, EPS)
@@ -364,15 +366,69 @@ def test_compute_grad_weight_false_touches_no_weight_state():
     torch.cuda.synchronize()
     assert torch.equal(main, torch.full_like(main, 3.0))
     assert not bool(ws.any())
-    # without a workspace: nothing is allocated for the weight gradient
+    # without a workspace: the launch still takes the arrival ticket and claims
+    # row blocks, on the stream's workspace of the BF16 module, left zero
+    monkeypatch.setattr(pkg, "_STREAM_WORKSPACES", {})
     dx, dz, dw = backward(dy, x, z, w, EPS, compute_grad_weight=False)
     assert dw is None
     assert torch.equal(dx, dx_d) and torch.equal(dz, dz_d)
+    torch.cuda.synchronize()
+    key = (
+        torch.cuda.current_device(),
+        torch.cuda.current_stream().cuda_stream,
+        _routes()["bwd_bf16"],
+    )
+    assert list(pkg._STREAM_WORKSPACES) == [key]
+    sums, done = pkg._STREAM_WORKSPACES[key]
+    assert not bool(sums.any()) and done.view(torch.int32).tolist() == [0, 0]
     # autograd with a weight that needs no gradient
     xa, za = (t.clone().requires_grad_(True) for t in (x, z))
     gated_rmsnorm(xa, za, w, EPS).backward(dy)
     assert torch.equal(xa.grad, dx_d) and torch.equal(za.grad, dz_d)
     assert w.grad is None
+
+
+@pytest.mark.parametrize("ctas", [1, 3, 7])
+def test_backward_at_grids_smaller_than_the_row_blocks(ctas, monkeypatch):
+    """The host's grid forced to ``ctas`` CTAs for 771 row blocks, so every CTA
+    claims blocks from the claim counter (on any SM count): ``dx`` and ``dz``
+    the bits of the host's grid; ``dw`` (BF16 and FP32, alone and accumulated)
+    within budget; ``compute_grad_weight=False`` leaves ``grad_weight`` as it
+    is; the workspace is zero after every launch."""
+    x, z, w, dy = make(257, 48, seed=12)
+    dx_d, dz_d, _ = backward(dy, x, z, w, EPS)
+    dw64 = fp64_reference(dy, x, z, w, EPS)[3]
+    mag = magnitudes(dy, x, z, EPS)
+    ws = workspace_for(257 * 48, x.device)
+    monkeypatch.setattr(pkg, "backward_ctas", lambda name, rows, sm_count: ctas)
+    for dtype in (torch.bfloat16, torch.float32):
+        what = f"{dtype} at {ctas} CTAs"
+        dw = torch.empty(D, dtype=dtype, device="cuda")
+        dx, dz, _ = backward(dy, x, z, w, EPS, grad_weight=dw, workspace=ws)
+        assert torch.equal(dx, dx_d) and torch.equal(dz, dz_d), what
+        assert_dw_within(dw, dw64, mag, what=f"dw {what}")
+        assert not bool(ws.any()), what
+        main = torch.full((D,), 0.25, dtype=dtype, device="cuda")
+        backward(
+            dy,
+            x,
+            z,
+            w,
+            EPS,
+            grad_weight=main,
+            accumulate_grad_weight=True,
+            workspace=ws,
+        )
+        assert_dw_within(main, 0.25 + dw64, mag, what=f"accumulated dw {what}")
+        assert not bool(ws.any()), what
+        main = torch.full((D,), 3.0, dtype=dtype, device="cuda")
+        dx, dz, dw = backward(
+            dy, x, z, w, EPS, grad_weight=main, compute_grad_weight=False, workspace=ws
+        )
+        assert dw is None
+        assert torch.equal(dx, dx_d) and torch.equal(dz, dz_d), what
+        assert torch.equal(main, torch.full_like(main, 3.0)), what
+        assert not bool(ws.any()), what
 
 
 @pytest.mark.parametrize("shape", [(0, 48, D), (5, 0, D), (0, D)])
@@ -465,9 +521,9 @@ def test_workspace_errors():
 
 
 def test_reset_workspace_clears_nonzero_scratch():
-    """A caller workspace whose FP64 accumulators and arrival words hold garbage
-    (written by something other than the backward) is zeroed by
-    ``reset_workspace``; backward launches at two different shapes and
+    """A caller workspace whose FP64 accumulators, arrival ticket and claim
+    counter hold garbage (written by something other than the backward) is
+    zeroed by ``reset_workspace``; backward launches at two different shapes and
     weight-gradient dtypes then run on it in sequence, within the FP64 budget,
     and leave it zero."""
     device = torch.device("cuda")
@@ -479,8 +535,9 @@ def test_reset_workspace_clears_nonzero_scratch():
     arch = loader.device_arch(torch.cuda.current_device())
     for role in ("bwd_bf16", "bwd_f32"):
         word = loader.workspace_elements(loader.route_module(arch, role)) - 1
-        # the low 32 bits of the counter element: a stale arrival count
-        ws[word : word + 1].view(torch.int32)[0] = 3
+        # both 32-bit words of the dw_done element: a stale arrival ticket and
+        # a stale block count
+        ws[word : word + 1].view(torch.int32).fill_(3)
     assert bool(ws.ne(0).all())
     reset_workspace(ws)
     torch.cuda.synchronize()
@@ -781,7 +838,7 @@ def test_registry_records_reference_the_build_manifest():
         if record["role"] == "fwd":
             assert record["grid_rule"]["kind"] == "row_blocks"
         else:
-            assert record["grid_rule"]["kind"] == "row_chunks"
+            assert record["grid_rule"]["kind"] == "row_claims"
             plan = [key for _kind, key in record["arg_plan"]]
             assert {"dw_sums", "dw_done", "dw", "weight_grad"} <= set(plan), name
             assert loader.workspace_elements(name) == record["dw_slots"] * D + 1
@@ -796,22 +853,19 @@ def test_registry_records_reference_the_build_manifest():
 
 @pytest.mark.parametrize("sm_count", [148, 160, 224])
 @pytest.mark.parametrize("rows", [1, 48, 6191, 49488, 98304, 1440000, 1584000])
-def test_backward_chunk_rule(rows, sm_count):
-    # The fewest whole waves of ctas_per_sm CTAs per SM with at most
-    # max_blocks_per_cta blocks per CTA, the fewest blocks per CTA that fit
-    # those waves (no partly filled last wave beyond one CTA's blocks); every
-    # row covered.
+def test_backward_cta_rule(rows, sm_count):
+    # One CTA per block of rows_per_cta rows, at most ctas_per_sm CTAs per SM
+    # (one wave); past 64 blocks the CTAs claim the blocks in chunks from the
+    # workspace's claim counter, so a smaller grid still covers every row.
     for role in ("bwd_bf16", "bwd_f32"):
         name = loader.route_module("sm_100a", role)
-        rule = loader.MODULES[name]["grid_rule"]
-        chunks, per_cta = loader.backward_chunks(name, rows, sm_count)
+        record = loader.MODULES[name]
+        rule = record["grid_rule"]
+        ctas = loader.backward_ctas(name, rows, sm_count)
         blocks = -(-rows // rule["rows_per_cta"])
         wave = rule["ctas_per_sm"] * sm_count
-        waves = -(-blocks // (wave * rule["max_blocks_per_cta"]))
-        assert 1 <= per_cta <= rule["max_blocks_per_cta"]
-        assert (chunks - 1) * per_cta < blocks <= chunks * per_cta
-        assert (waves - 1) * wave < chunks <= waves * wave
-        assert per_cta == 1 or blocks > (per_cta - 1) * waves * wave
+        assert ctas == min(blocks, wave)
+        assert loader.launch_grid(record, rows=rows, ctas=ctas) == (ctas, 1, 1)
 
 
 def test_calls_without_workspace_share_one_buffer_per_stream():
@@ -823,7 +877,8 @@ def test_calls_without_workspace_share_one_buffer_per_stream():
     held = [v for k, v in pkg._STREAM_WORKSPACES.items() if k[1] == stream]
     assert held, "a call without a workspace keeps one per stream"
     for sums, done in held:
-        assert sums.abs().max().item() == 0 and int(done.item()) == 0
+        assert sums.abs().max().item() == 0
+        assert done.view(torch.int32).tolist() == [0, 0]
     side = torch.cuda.Stream()
     with torch.cuda.stream(side):
         backward(dy, x, z, w, 1e-6)

@@ -27,11 +27,14 @@ decorations and the user-facing documentation live in
 Numerical contract against the deterministic package: the forward is the
 deterministic package's forward kernel rendered here (it has no reduction, so
 its bits are the same); the backward is one kernel that writes ``dx`` and ``dz``
-exactly as the deterministic backward does and adds each CTA's FP64
-weight-gradient column sums into FP64 accumulators of the workspace with
-atomics; the CTA that arrives last rounds the sum once into ``dw`` and zeroes
-the accumulators.  The order of the FP64 additions depends on scheduling, so
-``dw`` can move by one rounding of its dtype from call to call.
+exactly as the deterministic backward does, sums the weight gradient of the
+row blocks each CTA takes (past 64 blocks, the chunks it claims) in FP32 runs
+of at most 16 rows folded into FP64, and adds each CTA's FP64 column sums into
+FP64 accumulators of the workspace with atomics; the CTA that arrives last
+rounds the sum once into ``dw`` and zeroes the workspace.  The claimed blocks,
+and so the FP32 runs, and the order of the FP64 additions depend on
+scheduling: ``dw`` can move from call to call, always within the deterministic
+backward's error bound ``|dw64| * 2^-7 + sum|terms| * 2^-20`` per column.
 
 Numerical-mode keyword: every compute and workspace entry point (and the
 forward of :class:`CakeRMSNormSiLUGateFunction`) takes
@@ -55,26 +58,46 @@ Host design (the input layout rules are the deterministic package's):
   leading shape), each with its own token and head strides; a layout the
   kernels cannot read is materialized once as a contiguous copy.
 - The backward's workspace is ``cake_jit.workspace_elements`` FP64 elements:
-  the accumulators, then one element whose first four bytes are the 32-bit
-  arrival counter (``4 * 128 + 1`` elements, 4104 bytes, for every shipped
-  backward module).  The kernel leaves all of it zero, so a workspace zeroed
-  once serves every later call on its stream, of any shape and either
-  weight-gradient dtype, and every CUDA Graph replay, with no host write.  A
-  caller workspace must come from
-  :func:`cake_rmsnorm_silu_gate_train_backward_workspace` (zero-filled), or be
-  zeroed with :func:`cake_rmsnorm_silu_gate_train_reset_workspace` after
+  the accumulators, then one 8-byte element holding the two 32-bit words of
+  ``dw_done``, its first four bytes the arrival ticket and its last four the
+  claim counter: ``4 * 128 + 1`` elements, 4104 bytes, for every shipped
+  backward module.  Every backward launch takes a ticket (and past 64 row
+  blocks claims its blocks from the counter), also one with
+  ``compute_grad_weight=False``, so every backward launch uses a workspace.
+  The kernel leaves all of it zero, so a workspace zeroed once serves every
+  later call on its stream, of any shape and either weight-gradient dtype, and
+  every CUDA Graph replay, with no host write.  A caller workspace must come
+  from :func:`cake_rmsnorm_silu_gate_train_backward_workspace` (zero-filled),
+  or be zeroed with :func:`cake_rmsnorm_silu_gate_train_reset_workspace` after
   anything else wrote into it (a launch that did not complete, another use of
   the buffer); the kernel never needs a reset between its own calls.
 - Retained state (FlashInfer issue #7039): the autograd function saves only
   ``x``, ``z`` and ``weight`` through ``save_for_backward``, so a non-reentrant
   checkpointed forward keeps nothing but its output.  A backward without a
-  caller workspace uses the zero-filled workspace of its (device, stream,
-  backward module), allocated on first use and kept in ``_STREAM_WORKSPACES``
-  for later calls: 4104 bytes each, at most one per weight-gradient dtype (two
-  backward modules) for every stream that ran such a backward.  A call during
-  CUDA Graph capture allocates its own workspace instead, owned by the graph.
-- No call synchronizes the host or the device; every kernel runs on the
-  current torch stream with a plain (non-persistent, non-cooperative) grid.
+  caller workspace (``compute_grad_weight=False`` included: it runs the BF16
+  weight-gradient module) uses the zero-filled workspace of its (device,
+  stream, backward module), allocated on first use and kept in
+  ``_STREAM_WORKSPACES`` for later calls: 4104 bytes each, at most one per
+  weight-gradient dtype (two backward modules) for every stream that ran such
+  a backward.  A call during CUDA Graph capture allocates its own workspace
+  instead, owned by the graph.
+- Grids: the forward launches one CTA per block of 16 rows.  The backward
+  launches ``cake_jit.backward_ctas`` CTAs, ``G = min(row blocks,
+  ctas_per_sm * SMs)`` with ``ctas_per_sm = 4``, so at most one wave.  With at
+  most 64 row blocks CTA ``c`` takes block ``c`` and nothing is claimed.  Past
+  that, thread 0 of every CTA claims chunks of consecutive blocks with a
+  relaxed atomic add on the workspace's claim counter, from a table of halving
+  rounds that ends in one-block chunks, so a CTA that starts late takes fewer
+  blocks, and a CTA that becomes resident after the table ran out leaves
+  without a row.  Each thread folds its FP32 sums into FP64 after at most 16
+  of its rows.  No kernel is cooperative and no CTA waits for another; no call
+  synchronizes the host or the device, and every kernel runs on the current
+  torch stream.
+- Beside kernels resident on other streams (FlashInfer issue #7548; observed
+  on B200, sm_100a): each backward CTA needs 16640 bytes of dynamic shared
+  memory, so a kernel holding every SM with a small shared-memory carveout
+  delays the backward's start until it exits;
+  :mod:`flashinfer.cake_rmsnorm_silu_gate_train` documents the remedy.
 """
 
 from __future__ import annotations
@@ -95,7 +118,7 @@ from .cake_jit import (
     ROLES,
     ROUTES,
     arch_for_capability,
-    backward_chunks,
+    backward_ctas,
     route_module,
     workspace_elements,
 )
@@ -391,8 +414,8 @@ def cake_rmsnorm_silu_gate_train_backward_workspace_bytes(
 ) -> int:
     """Bytes of the caller-owned backward workspace for ``rows`` rows
     (``T * H``) on ``device``: the FP64 weight-gradient accumulators and the
-    32-bit arrival counter, a few KiB whatever ``rows``.  ``deterministic`` must
-    be ``False``.
+    8-byte word of the arrival ticket and the claim counter, a few KiB whatever
+    ``rows``.  ``deterministic`` must be ``False``.
     """
 
     _require_nondeterministic(
@@ -432,7 +455,8 @@ def cake_rmsnorm_silu_gate_train_reset_workspace(
     workspace: torch.Tensor, *, deterministic: bool = True
 ) -> None:
     """Return a caller-owned backward workspace to its first-use state: zero its
-    FP64 accumulators and its 32-bit arrival counter.
+    FP64 accumulators and the two 32-bit words of its last element (the arrival
+    ticket and the claim counter).
 
     Every backward leaves its workspace zero, so reuse across calls, shapes,
     weight-gradient dtypes and CUDA Graph replays needs no reset.  A workspace
@@ -456,19 +480,21 @@ def cake_rmsnorm_silu_gate_train_reset_workspace(
     workspace.zero_()
 
 
-# The workspaces of calls without a caller workspace: one per (device, stream,
-# backward module), zero-filled once and kept for the process (4104 bytes each,
-# at most two per stream).  Every backward leaves its workspace zero and the
-# calls of one stream run in order, so they share it (no allocation and no fill
-# per call).  A call during CUDA Graph capture allocates its own instead, so a
-# graph replayed on another stream never shares a buffer with eager calls.
+# The workspaces of calls without a caller workspace (every backward launch
+# needs one: it takes the arrival ticket, and claims row blocks past 64): one
+# per (device, stream, backward module), zero-filled once and kept for the
+# process (4104 bytes each, at most two per stream).  Every backward leaves its
+# workspace zero and the calls of one stream run in order, so they share it (no
+# allocation and no fill per call).  A call during CUDA Graph capture allocates
+# its own instead, so a graph replayed on another stream never shares a buffer
+# with eager calls.
 _STREAM_WORKSPACES: dict[tuple[int, int, str], tuple[torch.Tensor, torch.Tensor]] = {}
 
 
 def _stream_workspace_views(
     name: str, arch: str, device: torch.device
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """``(FP64 accumulators, uint32 arrival counter)`` of backward module
+    """``(FP64 accumulators, uint32 dw_done words)`` of backward module
     ``name`` for a call without a caller workspace."""
 
     if torch.cuda.is_current_stream_capturing():
@@ -514,13 +540,15 @@ def _check_workspace(
 def _workspace_views(
     workspace: torch.Tensor, name: str, device: torch.device
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """``(FP64 accumulators, uint32 arrival counter)`` of backward module
-    ``name`` on a caller's workspace."""
+    """``(FP64 accumulators, uint32 dw_done words)`` of backward module
+    ``name`` on a caller's workspace: ``dw_done`` views both 32-bit words of
+    the last element, ``[0]`` the arrival ticket and ``[1]`` the claim
+    counter."""
 
     elements = workspace_elements(name)
     flat = _check_workspace(workspace, device, elements)
     sums = flat[: elements - 1]
-    done = flat[elements - 1 : elements].view(torch.uint32)[:1]
+    done = flat[elements - 1 : elements].view(torch.uint32)
     return sums, done
 
 
@@ -581,17 +609,14 @@ def _backward(
     name = route_module(
         arch, "bwd_f32" if dw is not None and dw.dtype == torch.float32 else "bwd_bf16"
     )
-    chunks, blocks_per_cta = backward_chunks(
-        name, rows, _sm_count_of_index(_device_index(device))
-    )
+    ctas = backward_ctas(name, rows, _sm_count_of_index(_device_index(device)))
+    # Every launch, weight_grad=0 included, takes the arrival ticket (and past
+    # 64 row blocks claims its blocks from the claim counter), and leaves both
+    # words zero.
     if workspace is not None:
         sums, done = _workspace_views(workspace, name, device)
-    elif dw is not None:
-        sums, done = _stream_workspace_views(name, arch, device)
     else:
-        # weight_grad=0: the kernel reads and writes none of these.
-        sums = torch.empty((0,), dtype=torch.float64, device=device)
-        done = torch.empty((0,), dtype=torch.uint32, device=device)
+        sums, done = _stream_workspace_views(name, arch, device)
     values = {
         "dy": gv,
         "x": xv,
@@ -611,8 +636,7 @@ def _backward(
         "z_tok": z_tok,
         "z_head": z_head,
         "eps": float(eps),
-        "blocks_per_cta": blocks_per_cta,
-        "chunks": chunks,
+        "ctas": ctas,
         "accumulate": 1 if accumulate_grad_weight else 0,
         "weight_grad": 1 if dw is not None else 0,
     }
@@ -645,11 +669,14 @@ def cake_rmsnorm_silu_gate_train_backward(
     r"""SiLU-gated RMSNorm backward of this package: ``dx``, ``dz`` and the
     weight gradient.
 
-    One kernel: ``dx`` and ``dz`` are the deterministic backward's bits, and each
-    CTA adds its FP64 column sums into the FP64 accumulators of the workspace
-    with atomics; the CTA that arrives last rounds the sum once into ``dw``
-    (adding ``grad_weight``'s value first when accumulating) and zeroes the
-    workspace.  The arguments are those of
+    One kernel of at most one wave of CTAs (past 64 row blocks they claim the
+    blocks in chunks from the workspace's claim counter): ``dx`` and ``dz`` are
+    the deterministic backward's bits, and each CTA adds its FP64 column sums
+    into the FP64 accumulators of the workspace with atomics; the CTA that
+    arrives last rounds the sum once into ``dw`` (adding ``grad_weight``'s value
+    first when accumulating) and zeroes the workspace.  Every call with rows
+    uses a workspace, also with ``compute_grad_weight=False``.  The arguments
+    are those of
     :func:`flashinfer.cake_rmsnorm_silu_gate_train.cake_rmsnorm_silu_gate_train_backward`;
     ``workspace`` is this package's FP64 buffer
     (:func:`cake_rmsnorm_silu_gate_train_backward_workspace`) or ``None`` (the

@@ -969,20 +969,23 @@ def test_compute_grad_weight_false_matches_the_deterministic_package(
 
 @requires_device
 def test_reset_workspace_then_reuse_across_shapes(determinism_setting) -> None:
-    """A workspace with nonzero scratch (garbage FP64 accumulators and arrival
-    words) zeroed by ``cake_rmsnorm_silu_gate_train_reset_workspace(...,
-    deterministic=False)``, then reused without a reset over the backend
-    suite's sequence of shapes, weight-gradient dtypes and accumulation:
-    ``dx`` and ``dz`` are the deterministic package's bits, ``dw`` lies within
-    the budget of the deterministic ``dw`` and of the FP64 reference, and the
-    workspace is zero after every call."""
+    """A workspace with nonzero scratch (garbage FP64 accumulators, arrival
+    ticket and claim counter) zeroed by
+    ``cake_rmsnorm_silu_gate_train_reset_workspace(..., deterministic=False)``,
+    then reused without a reset over the backend suite's sequence of shapes,
+    weight-gradient dtypes and accumulation: ``dx`` and ``dz`` are the
+    deterministic package's bits, ``dw`` lies within the budget of the
+    deterministic ``dw`` and of the FP64 reference, and the workspace is zero
+    after every call."""
     device = torch.device("cuda")
     ws = nd_workspace(1, device)
     g = torch.Generator(device="cuda").manual_seed(70)
     ws.copy_(
         torch.randn(ws.shape, dtype=torch.float64, device=device, generator=g) * 1e3
     )
-    # a stale count in the low 32 bits of every element, the arrival word included
+    # a stale count in the low 32 bits of every element, the arrival ticket
+    # included; the high 32 bits, the claim counter's among them, keep the
+    # random values' nonzero bits
     ws.view(torch.int32)[0::2] = 3
     assert bool(ws.ne(0).all())
     nd_reset(ws)

@@ -44,13 +44,17 @@ dispatches on it here:
 * ``deterministic=False`` runs the standalone non-deterministic package
   ``flashinfer.cake_rmsnorm_silu_gate_train_backend``: the same forward kernel
   (it has no reduction, so ``y`` has the same bits) and a one-kernel backward
-  whose ``dx`` and ``dz`` are the deterministic backward's bits and whose CTAs
-  add their FP64 weight-gradient column sums into FP64 accumulators with
-  atomics; the CTA that arrives last rounds the sum once into the weight
-  gradient.  The order of those FP64 additions depends on scheduling, so the
-  weight gradient can differ by one rounding of its dtype between calls; the
-  error bound is the deterministic backward's.  That package's entry points
-  take ``deterministic=False`` only (any other value is a ``ValueError``).
+  whose ``dx`` and ``dz`` are the deterministic backward's bits.  Its CTAs
+  take row blocks (past 64 blocks they claim them in chunks), sum the weight
+  gradient in FP32 runs of at most 16 rows folded into FP64, and add their FP64
+  column sums into FP64 accumulators with atomics; the CTA that arrives last
+  rounds the sum once into the weight gradient.  Which blocks each CTA claims,
+  and so the rows of each FP32 run, and the order of the FP64 additions depend
+  on scheduling: the weight gradient can differ between calls, always within
+  the deterministic backward's error bound ``|dw64| * 2^-7 + sum|terms| *
+  2^-20`` per column (``dw64`` the exact sum of the ``terms``).  That
+  package's entry points take ``deterministic=False`` only (any other value is
+  a ``ValueError``).
 * ``deterministic=False`` while ``torch.use_deterministic_algorithms(True)`` is
   in effect raises ``RuntimeError``; with ``warn_only=True`` it warns and runs
   the deterministic package.  A call that asks for determinism never runs the
@@ -70,16 +74,34 @@ string) is a ``TypeError`` and selects neither package.
 The non-deterministic backward's workspace
 (``cake_rmsnorm_silu_gate_train_backward_workspace(T * H, device,
 deterministic=False)``, 4104 bytes whatever ``T * H``) holds the FP64
-accumulators and the arrival counter.  The kernel leaves it zero: allocate it
-once, reuse it across calls, shapes, both weight-gradient dtypes and CUDA Graph
-replays without a reset, and give each stream that may run a backward at the
-same time its own buffer.  A buffer that did not come from that factory, or
+accumulators, the arrival ticket and the claim counter the backward's CTAs
+claim row blocks from past 64 blocks; every launch of that backward uses one,
+also with ``compute_grad_weight=False``.  The kernel leaves it zero: allocate
+it once, reuse it across calls, shapes, both weight-gradient dtypes and CUDA
+Graph replays without a reset, and give each stream that may run a backward at
+the same time its own buffer.  A buffer that did not come from that factory, or
 that anything else wrote into, must be zeroed with
 ``cake_rmsnorm_silu_gate_train_reset_workspace(ws, deterministic=False)``
 before its next backward.  It is not interchangeable with the deterministic
 package's partial buffer.  Calls without a workspace use one 4104-byte buffer
 per device, stream and weight-gradient dtype, kept for later calls; the
 autograd node retains nothing else.
+
+Beside kernels resident on other streams (FlashInfer issue #7548; observed on
+B200, sm_100a): each CTA of the non-deterministic backward needs 16640 bytes of
+dynamic shared memory (an SM of sm_100a holds four such CTAs), and an SM serves
+it only once it can switch to a shared-memory carveout that holds it.  A kernel
+on another stream whose CTAs hold every SM with a small carveout (for example a
+long-running kernel with little or no shared memory and the default carveout)
+therefore delays that backward's start until the kernel exits.  Setting
+``cudaFuncAttributePreferredSharedMemoryCarveout`` to
+``cudaSharedmemCarveoutMaxShared`` on such a resident kernel, or giving it a
+large dynamic shared-memory allocation, lets the backward start beside it.  The
+deterministic backward also waits for such a kernel when that kernel has no
+shared memory and the default or the maximum-L1 carveout; both forwards start
+beside it whatever its carveout.  The non-deterministic backward launches at
+most one wave of CTAs; past 64 row blocks they claim the blocks in chunks from
+the workspace's claim counter, so a CTA that starts late takes fewer blocks.
 
 Usage::
 
@@ -256,8 +278,8 @@ def cake_rmsnorm_silu_gate_train_backward_workspace_bytes(
     the backward call with the same flag runs.  ``True``: the deterministic
     package's FP32 partial buffer, which grows with ``rows``
     (:func:`flashinfer.cake_rmsnorm_silu_gate_det_train.cake_rmsnorm_silu_gate_det_train_backward_workspace_bytes`).
-    ``False``: the FP64 weight-gradient accumulators and the 32-bit arrival
-    counter, a few KiB whatever ``rows``.
+    ``False``: the FP64 weight-gradient accumulators and the 8-byte word of
+    the arrival ticket and the claim counter, a few KiB whatever ``rows``.
     """
 
     if _resolve_deterministic(
@@ -307,13 +329,13 @@ def cake_rmsnorm_silu_gate_train_reset_workspace(
 ) -> None:
     """Return a caller-owned backward workspace to its first-use state.
 
-    ``False``: zero the FP64 accumulators and the 32-bit arrival counter of a
-    non-deterministic workspace (a contiguous FP64 CUDA tensor of at least
-    :func:`cake_rmsnorm_silu_gate_train_backward_workspace_bytes` bytes; all of
-    it is zeroed) with one fill on the current stream of its device, without a
-    host synchronization.  The non-deterministic backward leaves its workspace
-    zero, so reuse across calls, shapes, weight-gradient dtypes and CUDA Graph
-    replays needs no reset; a buffer that did not come from
+    ``False``: zero the FP64 accumulators, the arrival ticket and the claim
+    counter of a non-deterministic workspace (a contiguous FP64 CUDA tensor of
+    at least :func:`cake_rmsnorm_silu_gate_train_backward_workspace_bytes`
+    bytes; all of it is zeroed) with one fill on the current stream of its
+    device, without a host synchronization.  The non-deterministic backward
+    leaves its workspace zero, so reuse across calls, shapes, weight-gradient
+    dtypes and CUDA Graph replays needs no reset; a buffer that did not come from
     :func:`cake_rmsnorm_silu_gate_train_backward_workspace`, or that anything
     else wrote into (a launch that did not complete, another use of the buffer),
     needs one before its next backward.  ``True``: the deterministic backward
@@ -386,7 +408,9 @@ def cake_rmsnorm_silu_gate_train_backward(
     compute_grad_weight : bool
         ``False`` skips the weight-gradient reduction and returns ``None`` for
         it; the non-deterministic kernel then touches neither ``grad_weight``
-        nor the workspace.
+        nor the workspace's accumulators, but its CTAs still take the arrival
+        ticket (and past 64 row blocks claim their blocks from the claim
+        counter), so it uses a workspace too (and leaves it zero).
     workspace : torch.Tensor, optional
         Caller-owned buffer from :func:`cake_rmsnorm_silu_gate_train_backward_workspace`
         called with the same ``deterministic`` flag: the deterministic
@@ -406,16 +430,19 @@ def cake_rmsnorm_silu_gate_train_backward(
         FP64 over the chunks in an order fixed by the row count, rounded once,
         so repeated calls return the same bits.  ``False`` runs one kernel of
         the non-deterministic package: the same ``dx`` and ``dz`` bits, and each
-        CTA adds its FP64 column sums of the same FP32 runs into FP64
-        accumulators with atomics; the CTA that arrives last rounds the sum once
-        into ``dw`` (adding ``grad_weight``'s value first when accumulating).
-        The order of those FP64 additions depends on scheduling, so ``dw`` can
-        differ by one rounding of its dtype between calls; its error bound is
-        the deterministic backward's.  ``False`` is refused with
-        ``RuntimeError`` while ``torch.use_deterministic_algorithms(True)`` is
-        in effect; with ``warn_only=True`` it warns and runs the deterministic
-        backward (which then allocates its own buffer in place of a
-        non-deterministic ``workspace``).
+        CTA sums the rows of the blocks it takes (past 64 blocks, the chunks it
+        claims) in FP32 runs of at most 16 rows folded into FP64 and adds its
+        FP64 column sums into FP64 accumulators with atomics; the CTA that
+        arrives last rounds the sum once into ``dw`` (adding ``grad_weight``'s
+        value first when accumulating).  The claimed blocks, and so the FP32
+        runs, and the order of the FP64 additions depend on scheduling: ``dw``
+        can differ between calls, always within the deterministic backward's
+        error bound ``|dw64| * 2^-7 + sum|terms| * 2^-20`` per column.
+        ``False`` is refused with ``RuntimeError`` while
+        ``torch.use_deterministic_algorithms(True)`` is in effect; with
+        ``warn_only=True`` it warns and runs the deterministic backward (which
+        then allocates its own buffer in place of a non-deterministic
+        ``workspace``).
 
     Returns
     -------

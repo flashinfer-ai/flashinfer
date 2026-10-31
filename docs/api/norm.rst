@@ -98,9 +98,12 @@ took its ``det`` names. Every entry point takes the keyword ``deterministic``
   (``flashinfer.cake_rmsnorm_silu_gate_train_backend``, whose compute and
   workspace entry points take ``deterministic=False`` only): the same forward
   kernel and a one-kernel backward: ``dx`` and ``dz`` are the deterministic
-  backward's bits, and the CTAs add their FP64 weight-gradient column sums into
-  FP64 accumulators of the workspace in the order they finish, so the weight
-  gradient can differ by one rounding of its dtype between calls. The workspace
+  backward's bits, and the CTAs take row blocks (past 64 blocks they claim
+  them in chunks from the workspace's claim counter) and add their FP64
+  weight-gradient column sums into FP64 accumulators of the workspace in the
+  order they finish. The claimed blocks, and so the FP32 partial sums, and that
+  order depend on scheduling: the weight gradient can differ between calls,
+  always within the deterministic backward's error bound. The workspace
   (``cake_rmsnorm_silu_gate_train_backward_workspace(..., deterministic=False)``,
   a few KiB whatever the token count) is zero after every call: zero it once
   and reuse it, one per concurrently running stream. A buffer that anything
