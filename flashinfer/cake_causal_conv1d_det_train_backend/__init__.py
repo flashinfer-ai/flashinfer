@@ -42,6 +42,17 @@ Host design (the knobs are keywords; no environment variable):
 - The backward workspace is sized for every backward program of the device's
   architecture (the bias programs' partials carry a fifth, dbias, slab), so one
   buffer serves every route, token count and CUDA Graph.
+- ``bwd_grid_mult`` (keyword-only, default 1, one of ``BWD_GRID_MULTS``): an
+  opt-in finer static partition of the backward's token axis.  The main
+  program launches ``bwd_grid_mult`` times its default untrimmed grid, so each
+  CTA's token stream is that much shorter and a CTA that finds no free slot
+  beside a kernel of another stream (an NCCL collective) delays the call by a
+  shorter stream; the alone time grows a little.  The programs are the same
+  (their partition follows the launch's CTA count); ``dx`` keeps its bits and
+  ``dweight`` / ``dbias`` sum more partial rows in another fixed order, so
+  they are bitwise reproducible per ``bwd_grid_mult`` and differ in their last
+  bits from the default.  The workspace grows with it (size it with the same
+  ``bwd_grid_mult``).
 - The forward (the dynamic token-chunk programs) takes its token chunks from
   int32 counters, two per channel tile, in a forward workspace that is zero
   before its first launch and that every launch leaves zero: a caller-owned
@@ -97,6 +108,10 @@ SUPPORTED_COMPUTE_CAPABILITIES: tuple[tuple[int, int], ...] = tuple(
 PARAMETER_DTYPES = (torch.float32, torch.bfloat16)
 # The two SiLU'-evaluation policies of the weight gradient (``silu_grad_preactivation``).
 SILU_GRAD_PREACTIVATIONS = ("bf16", "fp32")
+# The backward main grid multiples a call may choose (``bwd_grid_mult``): 1 is the
+# default grid; 2, 3 and 4 launch that many times its untrimmed CTA count.  The
+# registry's ``GRID_MULT_CHOICES``.
+BWD_GRID_MULTS: tuple[int, ...] = tuple(_loader.GRID_MULT_CHOICES)
 # The forward workspaces of the calls that pass none: (device index, CUDA stream
 # handle) -> a zeroed int32 buffer, grown as needed.  The launches of one stream
 # run in order and each leaves its counters zero, so the stream's buffer serves
@@ -305,6 +320,19 @@ def _silu_grad_preactivation(value: object) -> str:
     return str(value)
 
 
+def _bwd_grid_mult(value: object) -> int:
+    """Validate ``bwd_grid_mult``: an ``int`` (``TypeError`` otherwise, ``bool`` included) in ``BWD_GRID_MULTS``
+    (``ValueError`` otherwise)."""
+
+    if type(value) is not int:
+        raise TypeError(
+            f"bwd_grid_mult must be an int, one of {BWD_GRID_MULTS}, got {type(value).__name__} {value!r}"
+        )
+    if value not in BWD_GRID_MULTS:
+        raise ValueError(f"bwd_grid_mult must be one of {BWD_GRID_MULTS}, got {value}")
+    return value
+
+
 def _scalars(scalars: dict[str, int]) -> dict[str, int]:
     """The launch scalars :func:`cake_jit.plan` produced (``flags`` is set beside them by the caller)."""
 
@@ -344,7 +372,13 @@ def _route(arch: str, kind: str, *, needs: str, C: int, S: int) -> tuple[str, ..
 
 
 def _launch(
-    record: dict, S: int, C: int, num_docs: int, *, device_index: int
+    record: dict,
+    S: int,
+    C: int,
+    num_docs: int,
+    *,
+    device_index: int,
+    bwd_grid_mult: int = 1,
 ) -> tuple[dict[str, int], tuple[int, int, int]]:
     """The kernel scalars and the grid of one launch of ``record`` (the host plan of ``cake_jit``).
 
@@ -352,7 +386,9 @@ def _launch(
     a CTA of the launched program's grid on the device: a ``C`` beyond ``grid
     x threads x vec`` channels is refused rather than left partly unwritten.
     The caller launches this grid (``run_module`` / ``run_modules`` ``grid``),
-    so a call plans it once.
+    so a call plans it once.  A backward ``bwd_grid_mult`` above 1 launches
+    that many times the record's untrimmed grid (``launch_grid`` without the
+    row), never trimmed to whole channel-tile ranks.
     """
 
     scalars = plan(
@@ -362,7 +398,10 @@ def _launch(
         geometry=record["grid_rule"]["geometry"],
         role=record["role"],
     )
-    grid = launch_grid(record, device_index=device_index, C=C, S=S)
+    if bwd_grid_mult == 1:
+        grid = launch_grid(record, device_index=device_index, C=C, S=S)
+    else:
+        grid = (launch_grid(record, device_index=device_index)[0] * bwd_grid_mult, 1, 1)
     if scalars["n_ch_tiles"] > grid[0]:
         raise ValueError(
             f"C={C} spans {scalars['n_ch_tiles']} channel tiles but the launch grid on this "
@@ -371,8 +410,23 @@ def _launch(
     return scalars, grid
 
 
+def _workspace_bytes(
+    owner: dict, C: int, *, device_index: int, bwd_grid_mult: int
+) -> int:
+    """Bytes of ``owner``'s partial rows for ``C`` channels at ``bwd_grid_mult`` (1: ``workspace_layout``'s)."""
+
+    layout = workspace_layout(owner, C, device_index=device_index)
+    if bwd_grid_mult == 1:
+        return int(layout["total_bytes"])
+    _, _, n_ch_tiles = _loader.channel_split(
+        C, geometry=owner["grid_rule"]["geometry"], role=owner["role"]
+    )
+    rows = partial_rows(int(layout["grid"]) * bwd_grid_mult, n_ch_tiles)
+    return partial_bytes(owner, C, rows)
+
+
 def cake_causal_conv1d_det_train_backward_workspace_bytes(
-    S: int, C: int, device: torch.device
+    S: int, C: int, device: torch.device, *, bwd_grid_mult: int = 1
 ) -> int:
     """Bytes of the caller-owned backward workspace for ``C`` channels on ``device``.
 
@@ -392,9 +446,13 @@ def cake_causal_conv1d_det_train_backward_workspace_bytes(
     for every caller) and, as it depends on ``C`` and the device only, every
     token count; the main program fully writes the rows the reduce program
     sums, so the buffer needs no zeroing between launches or CUDA Graph
-    replays.
+    replays.  ``bwd_grid_mult`` (one of ``BWD_GRID_MULTS``, default 1) sizes
+    it for backward calls of that ``bwd_grid_mult``, whose grids are that many
+    times larger: a buffer serves the calls of every ``bwd_grid_mult`` up to the
+    one it was sized for.
     """
 
+    bwd_grid_mult = _bwd_grid_mult(bwd_grid_mult)
     device = torch.device(device)
     S, C = int(S), int(C)
     if S < 0:
@@ -406,17 +464,21 @@ def cake_causal_conv1d_det_train_backward_workspace_bytes(
     arch = _device_arch(device)
     device_index = _device_index(device)
     return max(
-        int(workspace_layout(owner, C, device_index=device_index)["total_bytes"])
+        _workspace_bytes(
+            owner, C, device_index=device_index, bwd_grid_mult=bwd_grid_mult
+        )
         for owner in workspace_owners(arch)
     )
 
 
 def cake_causal_conv1d_det_train_backward_workspace(
-    S: int, C: int, device: torch.device
+    S: int, C: int, device: torch.device, *, bwd_grid_mult: int = 1
 ) -> torch.Tensor:
     """Allocate a backward workspace (see ``..._workspace_bytes``; no zeroing is needed)."""
 
-    nbytes = cake_causal_conv1d_det_train_backward_workspace_bytes(S, C, device)
+    nbytes = cake_causal_conv1d_det_train_backward_workspace_bytes(
+        S, C, device, bwd_grid_mult=bwd_grid_mult
+    )
     return torch.empty(nbytes, dtype=torch.uint8, device=torch.device(device))
 
 
@@ -499,7 +561,13 @@ def _forward_work(
 
 
 def _partial_view(
-    workspace: object, record: dict, *, C: int, rows: int, device: torch.device
+    workspace: object,
+    record: dict,
+    *,
+    C: int,
+    rows: int,
+    device: torch.device,
+    bwd_grid_mult: int = 1,
 ) -> torch.Tensor:
     """The FP32 ``[rows, C, taps]`` capacity view of this launch's partial rows inside ``workspace``.
 
@@ -518,10 +586,11 @@ def _partial_view(
         raise ValueError("workspace must be 16-byte aligned")
     nbytes = partial_bytes(record, C, rows)
     if ws.numel() < nbytes:
+        sized = "" if bwd_grid_mult == 1 else f", bwd_grid_mult={bwd_grid_mult}"
         raise ValueError(
             f"workspace holds {ws.numel()} bytes; this call needs at least "
             f"{nbytes}; allocate "
-            "cake_causal_conv1d_det_train_backward_workspace_bytes(S, C, device) bytes"
+            f"cake_causal_conv1d_det_train_backward_workspace_bytes(S, C, device{sized}) bytes"
         )
     taps = int(record["workspace_rule"]["taps"])
     return ws[:nbytes].view(torch.float32).view(rows, C, taps)
@@ -626,6 +695,7 @@ def cake_causal_conv1d_det_train_backward(
     dx: Optional[torch.Tensor] = None,
     dweight: Optional[torch.Tensor] = None,
     dbias: Optional[torch.Tensor] = None,
+    bwd_grid_mult: int = 1,
 ) -> tuple[torch.Tensor, ...]:
     r"""Packed width-4 depthwise causal convolution + SiLU, training backward.
 
@@ -650,6 +720,15 @@ def cake_causal_conv1d_det_train_backward(
         Preallocated outputs: BF16 of ``x``'s shape, ``[C, 4]`` and ``[C]``
         (FP32 or BF16 each; the parameter's dtype when omitted), contiguous.
         ``dbias`` needs ``bias``.
+    bwd_grid_mult : {1, 2, 3, 4}
+        Opt-in finer static partition of the token axis (default 1, the
+        default grid): the main program launches ``bwd_grid_mult`` times its
+        untrimmed grid.  ``dx`` is bitwise the default's; ``dweight`` /
+        ``dbias`` sum more partial rows in another fixed order (bitwise
+        reproducible per ``bwd_grid_mult``, last bits differ from the
+        default).  A ``workspace`` must be sized with the same or a larger
+        ``bwd_grid_mult``.  ``TypeError`` for a non-int, ``ValueError`` for
+        another value.
 
     Returns
     -------
@@ -683,6 +762,7 @@ def cake_causal_conv1d_det_train_backward(
     """
 
     policy = _silu_grad_preactivation(silu_grad_preactivation)
+    bwd_grid_mult = _bwd_grid_mult(bwd_grid_mult)
     x = _require_tensor(x, "x")
     device = x.device
     arch = _device_arch(device)
@@ -745,12 +825,23 @@ def cake_causal_conv1d_det_train_backward(
             "partial workspace"
         )
     device_index = _device_index(device)
-    scalars, grid = _launch(record, S, C, num_docs, device_index=device_index)
+    scalars, grid = _launch(
+        record, S, C, num_docs, device_index=device_index, bwd_grid_mult=bwd_grid_mult
+    )
     grid_x = grid[0]
     if workspace is None:
-        workspace = cake_causal_conv1d_det_train_backward_workspace(S, C, device)
+        workspace = cake_causal_conv1d_det_train_backward_workspace(
+            S, C, device, bwd_grid_mult=bwd_grid_mult
+        )
     rows = partial_rows(grid_x, scalars["n_ch_tiles"])
-    partial = _partial_view(workspace, record, C=C, rows=rows, device=device)
+    partial = _partial_view(
+        workspace,
+        record,
+        C=C,
+        rows=rows,
+        device=device,
+        bwd_grid_mult=bwd_grid_mult,
+    )
     values: dict[str, object] = {
         "x": x_flat,
         "w": w,
@@ -785,8 +876,8 @@ def cake_causal_conv1d_det_train_backward(
 class CakeCausalConv1dDetFunction(torch.autograd.Function):
     """Autograd wrapper saving only ``(x, weight, cu_seqlens, bias)`` for the backward.
 
-    ``forward(x, weight, cu_seqlens, bias=None, silu_grad_preactivation="bf16")``
-    returns ``y``; the backward runs the fused ``dx`` + deterministic
+    ``forward(x, weight, cu_seqlens, bias=None, silu_grad_preactivation="bf16",
+    bwd_grid_mult=1)`` returns ``y``; the backward runs the fused ``dx`` + deterministic
     ``dweight`` (+ ``dbias``) pair of launches of :func:`cake_causal_conv1d_det_train_backward`
     on the incoming gradient (materialized as a contiguous BF16 tensor when
     autograd hands over another layout or dtype) and returns the gradients of
@@ -794,10 +885,21 @@ class CakeCausalConv1dDetFunction(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, x, weight, cu_seqlens, bias=None, silu_grad_preactivation="bf16"):
+    def forward(
+        ctx,
+        x,
+        weight,
+        cu_seqlens,
+        bias=None,
+        silu_grad_preactivation="bf16",
+        bwd_grid_mult=1,
+    ):
+        policy = _silu_grad_preactivation(silu_grad_preactivation)
+        bwd_grid_mult = _bwd_grid_mult(bwd_grid_mult)
         y = cake_causal_conv1d_det_train_forward(x, weight, cu_seqlens, bias=bias)
         ctx.save_for_backward(x, weight, cu_seqlens, bias)
-        ctx.silu_grad_preactivation = _silu_grad_preactivation(silu_grad_preactivation)
+        ctx.silu_grad_preactivation = policy
+        ctx.bwd_grid_mult = bwd_grid_mult
         return y
 
     @staticmethod
@@ -813,9 +915,10 @@ class CakeCausalConv1dDetFunction(torch.autograd.Function):
             dy,
             bias=bias,
             silu_grad_preactivation=ctx.silu_grad_preactivation,
+            bwd_grid_mult=ctx.bwd_grid_mult,
         )
         dbias = grads[2] if bias is not None else None
-        return grads[0], grads[1], None, dbias, None
+        return grads[0], grads[1], None, dbias, None, None
 
 
 def cake_causal_conv1d_det(
@@ -825,6 +928,7 @@ def cake_causal_conv1d_det(
     bias: Optional[torch.Tensor] = None,
     *,
     silu_grad_preactivation: str = "bf16",
+    bwd_grid_mult: int = 1,
 ) -> torch.Tensor:
     """Autograd-enabled packed width-4 depthwise causal convolution + SiLU.
 
@@ -842,6 +946,10 @@ def cake_causal_conv1d_det(
     silu_grad_preactivation : {"bf16", "fp32"}
         The weight gradient's SiLU' policy (see
         :func:`cake_causal_conv1d_det_train_backward`).
+    bwd_grid_mult : {1, 2, 3, 4}
+        The backward's opt-in finer partition (default 1; see
+        :func:`cake_causal_conv1d_det_train_backward`); checked here, used by the
+        backward.
 
     Returns
     -------
@@ -852,7 +960,7 @@ def cake_causal_conv1d_det(
     """
 
     return CakeCausalConv1dDetFunction.apply(
-        x, weight, cu_seqlens, bias, silu_grad_preactivation
+        x, weight, cu_seqlens, bias, silu_grad_preactivation, bwd_grid_mult
     )
 
 
@@ -879,6 +987,7 @@ is_cake_causal_conv1d_train_supported = is_cake_causal_conv1d_det_train_supporte
 
 __all__ = [
     "ARCHES",
+    "BWD_GRID_MULTS",
     "PARAMETER_DTYPES",
     "SILU_GRAD_PREACTIVATIONS",
     "SUPPORTED_COMPUTE_CAPABILITIES",

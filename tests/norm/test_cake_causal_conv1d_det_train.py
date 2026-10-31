@@ -225,6 +225,8 @@ ROUTE_SETTINGS = {
     "bwd_bias_fp32g": dict(weight_dtype=F32, bias_dtype=F32, policy="fp32"),
 }
 NEW_BWD_KINDS = ("bwd_dt", "bwd_bias", "bwd_fp32g", "bwd_bias_fp32g")
+# The opt-in backward grid multiples beside the default 1 (``bwd_grid_mult``).
+OPT_IN_GRID_MULTS = (2, 3, 4)
 # The forward route each backward route's inputs select.
 FORWARD_OF = {
     "bwd": "fwd",
@@ -570,9 +572,11 @@ def _check(
     dbias_dtype=None,
     workspace=None,
     label: str = "",
+    bwd_grid_mult: int = 1,
 ) -> None:
     """Forward and backward of one problem against the reference; ``b`` adds the bias path, ``policy`` the
-    SiLU' policy, ``dweight_dtype`` / ``dbias_dtype`` preallocate the gradient outs in that dtype."""
+    SiLU' policy, ``dweight_dtype`` / ``dbias_dtype`` preallocate the gradient outs in that dtype,
+    ``bwd_grid_mult`` the backward's opt-in grid multiple."""
 
     if x is None:
         x, w, cu, dy = _inputs(S, C, docs)
@@ -609,6 +613,7 @@ def _check(
         workspace=workspace,
         dweight=dw_out,
         dbias=db_out,
+        bwd_grid_mult=bwd_grid_mult,
     )
     assert len(grads) == (2 if b is None else 3), label
     dx, dw = grads[0], grads[1]
@@ -1991,6 +1996,215 @@ def test_workspace_bytes_and_layout() -> None:
         cake_causal_conv1d_det_train_backward_workspace_bytes(-1, 512, device)
     with pytest.raises(ValueError):
         cake_causal_conv1d_det_train_backward_workspace_bytes(1, 130, device)
+
+
+def test_bwd_grid_mult_is_validated_before_any_launch(monkeypatch) -> None:
+    """``bwd_grid_mult`` is a keyword-only int of ``BWD_GRID_MULTS`` on the backward, the autograd entry point
+    and the workspace helpers: another type (``bool`` included) raises ``TypeError`` and another int
+    ``ValueError``, before any launch and also when ``S == 0``."""
+
+    assert (1, *OPT_IN_GRID_MULTS) == pkg.BWD_GRID_MULTS == loader.GRID_MULT_CHOICES
+    device = _device()
+    launched = []
+    monkeypatch.setattr(
+        pkg, "run_module", lambda *args, **kwargs: launched.append(args)
+    )
+    monkeypatch.setattr(
+        pkg, "run_modules", lambda *args, **kwargs: launched.append(args)
+    )
+    C = 512
+    x, w, cu, dy = _inputs(1000, C, "perf")
+    empty = torch.empty(0, C, dtype=torch.bfloat16, device=device)
+    cu_empty = torch.zeros(1, dtype=torch.int32, device=device)
+    for bad, error in (
+        (True, TypeError),
+        (2.0, TypeError),
+        ("2", TypeError),
+        (None, TypeError),
+        (0, ValueError),
+        (5, ValueError),
+        (-1, ValueError),
+    ):
+        with pytest.raises(error, match="bwd_grid_mult"):
+            cake_causal_conv1d_det_train_backward(x, w, cu, dy, bwd_grid_mult=bad)
+        with pytest.raises(error, match="bwd_grid_mult"):
+            cake_causal_conv1d_det_train_backward(
+                empty, w, cu_empty, empty, bwd_grid_mult=bad
+            )
+        with pytest.raises(error, match="bwd_grid_mult"):
+            cake_causal_conv1d_det(x, w, cu, bwd_grid_mult=bad)
+        with pytest.raises(error, match="bwd_grid_mult"):
+            cake_causal_conv1d_det_train_backward_workspace_bytes(
+                1, C, device, bwd_grid_mult=bad
+            )
+        with pytest.raises(error, match="bwd_grid_mult"):
+            cake_causal_conv1d_det_train_backward_workspace(
+                1, C, device, bwd_grid_mult=bad
+            )
+    assert launched == []
+    with pytest.raises(TypeError):
+        cake_causal_conv1d_det_train_backward_workspace_bytes(1, C, device, 2)
+
+
+def test_bwd_grid_mult_workspace_bytes() -> None:
+    """At ``bwd_grid_mult`` k the public workspace holds every backward program's partial rows of k times its
+    untrimmed grid (the largest over the architecture's programs), grows with k, depends on ``C`` and the
+    device only, and k = 1 is the default size; a workspace sized for a smaller k is refused naming k."""
+
+    device = _device()
+    arch = _arch()
+    owners = loader.workspace_owners(arch)
+    for C in (128, 136, 1280, 8192):
+        default = cake_causal_conv1d_det_train_backward_workspace_bytes(1, C, device)
+        assert default == cake_causal_conv1d_det_train_backward_workspace_bytes(
+            1, C, device, bwd_grid_mult=1
+        )
+        previous = default
+        for k in OPT_IN_GRID_MULTS:
+            got = cake_causal_conv1d_det_train_backward_workspace_bytes(
+                1, C, device, bwd_grid_mult=k
+            )
+            expected = 0
+            for owner in owners:
+                _, _, n_ch_tiles = loader.channel_split(
+                    C, geometry=owner["grid_rule"]["geometry"], role=owner["role"]
+                )
+                grid = loader.launch_grid(owner, device_index=device.index)[0]
+                rows = loader.partial_rows(k * grid, n_ch_tiles)
+                expected = max(expected, loader.partial_bytes(owner, C, rows))
+            assert got == expected > previous, (C, k)
+            assert got == cake_causal_conv1d_det_train_backward_workspace_bytes(
+                262401, C, device, bwd_grid_mult=k
+            )
+            assert (
+                cake_causal_conv1d_det_train_backward_workspace(
+                    1, C, device, bwd_grid_mult=k
+                ).numel()
+                == got
+            )
+            previous = got
+    S, C, docs = 1000, 512, "perf"
+    x, w, cu, dy = _inputs(S, C, docs)
+    small = cake_causal_conv1d_det_train_backward_workspace(S, C, device)
+    with pytest.raises(ValueError, match="bwd_grid_mult=4"):
+        cake_causal_conv1d_det_train_backward(
+            x, w, cu, dy, workspace=small, bwd_grid_mult=4
+        )
+
+
+@pytest.mark.parametrize("kind", tuple(ROUTE_SETTINGS))
+def test_bwd_grid_mult_launches_k_times_the_untrimmed_grid(kind, monkeypatch) -> None:
+    """At ``bwd_grid_mult`` k > 1 the selected program launches k times its untrimmed grid (never trimmed to
+    whole ranks) with that CTA count as the reduce program's ``main_ctas`` and a partial view of its rows; at
+    k = 1 the default grid of the row.  The program selection does not depend on k."""
+
+    _require_route(kind)
+    arch = _arch()
+    device = _device()
+    launched = []
+
+    def record_launches(launches, values, *, device_index):
+        launched.append((list(launches), dict(values)))
+
+    monkeypatch.setattr(pkg, "run_modules", record_launches)
+    for S, C, docs in ((1000, 512, "perf"), (4097, 1280, (1000, 0, 3, 3094))):
+        x, w, cu, dy, b, policy = _route_inputs(S, C, docs, kind)
+        main = loader.selected_modules(arch, kind, C=C, S=S)[0]
+        record = loader.MODULES[main]
+        _, _, n_ch_tiles = loader.channel_split(
+            C, geometry=record["grid_rule"]["geometry"], role=record["role"]
+        )
+        untrimmed = loader.launch_grid(record, device_index=device.index)[0]
+        for k in (1, *OPT_IN_GRID_MULTS):
+            launched.clear()
+            _backward(x, w, cu, dy, b, policy, bwd_grid_mult=k)
+            ((launches, values),) = launched
+            assert [name for name, _ in launches] == [main, record["reduce"]]
+            grid = launches[0][1]
+            if k == 1:
+                assert grid == loader.launch_grid(
+                    record, device_index=device.index, C=C, S=S
+                )
+            else:
+                assert grid == (k * untrimmed, 1, 1), (kind, S, C, k)
+            assert launches[1][1] is None
+            assert values["main_ctas"] == grid[0]
+            assert tuple(values["partial"].shape) == (
+                loader.partial_rows(grid[0], n_ch_tiles),
+                C,
+                record["workspace_rule"]["taps"],
+            )
+
+
+@pytest.mark.parametrize("bwd_grid_mult", OPT_IN_GRID_MULTS)
+@pytest.mark.parametrize("kind", tuple(ROUTE_SETTINGS))
+def test_bwd_grid_mult_gradients(kind, bwd_grid_mult) -> None:
+    """At every opt-in ``bwd_grid_mult`` and route: ``dx`` is bitwise the default's; ``dweight`` / ``dbias``
+    are within the route's tolerance of the reference and bitwise equal over three launches into a
+    NaN-poisoned workspace and a fresh one (the programs rewrite every partial row of their larger grid)."""
+
+    _require_route(kind)
+    k = bwd_grid_mult
+    for S, C, docs in ROUTE_CASES:
+        x, w, cu, dy, b, policy = _route_inputs(S, C, docs, kind)
+        _check(S, C, docs, x=x, w=w, cu=cu, dy=dy, b=b, policy=policy, bwd_grid_mult=k)
+        default = _backward(x, w, cu, dy, b, policy)
+        workspace = cake_causal_conv1d_det_train_backward_workspace(
+            S, C, _device(), bwd_grid_mult=k
+        )
+        runs = []
+        for _repeat in range(3):
+            workspace.view(torch.float32).fill_(float("nan"))
+            runs.append(
+                _backward(x, w, cu, dy, b, policy, workspace=workspace, bwd_grid_mult=k)
+            )
+        runs.append(_backward(x, w, cu, dy, b, policy, bwd_grid_mult=k))
+        assert torch.equal(runs[0][0], default[0]), (kind, S, C, k, "dx")
+        for run in runs[1:]:
+            for got, expected, name in zip(
+                run, runs[0], ("dx", "dweight", "dbias"), strict=True
+            ):
+                if expected is None:
+                    continue
+                assert torch.isfinite(got.float()).all(), (kind, S, C, k, name)
+                assert torch.equal(got, expected), (kind, S, C, k, name)
+
+
+@pytest.mark.parametrize("kind", ("bwd", "bwd_bias_fp32g"))
+def test_autograd_passes_bwd_grid_mult(kind) -> None:
+    """``cake_causal_conv1d_det(..., bwd_grid_mult=k)`` hands k to its backward: the gradients are the
+    backward's at k."""
+
+    _require_route(kind)
+    S, C, docs = 4097, 1280, (1000, 0, 3, 3094)
+    x0, w0, cu, dy, b0, policy = _route_inputs(S, C, docs, kind, key=5)
+    for k in OPT_IN_GRID_MULTS:
+        x = x0.detach().clone().requires_grad_(True)
+        w = w0.detach().clone().requires_grad_(True)
+        b = None if b0 is None else b0.detach().clone().requires_grad_(True)
+        cake_causal_conv1d_det(
+            x, w, cu, b, silu_grad_preactivation=policy, bwd_grid_mult=k
+        ).backward(dy)
+        dx_ref, dw_ref, db_ref = _backward(x0, w0, cu, dy, b0, policy, bwd_grid_mult=k)
+        assert torch.equal(x.grad, dx_ref) and torch.equal(w.grad, dw_ref), (kind, k)
+        if b is not None:
+            assert torch.equal(b.grad, db_ref), (kind, k)
+
+
+@pytest.mark.parametrize("case", PRECISION_CASES, ids=_case_id)
+def test_fp32_grad_perf_size_precision_at_bwd_grid_mult(case) -> None:
+    """The fp32 policy's perf-size precision gate holds at every opt-in ``bwd_grid_mult``."""
+
+    _require_route("bwd_fp32g")
+    S, C, docs = case
+    x, w, cu, dy = _inputs(S, C, docs)
+    _dx, dw_ref, _ = reference_backward(x, w, cu, dy, policy="fp32")
+    for k in OPT_IN_GRID_MULTS:
+        _dx, dw, _ = _backward(x, w, cu, dy, None, "fp32", bwd_grid_mult=k)
+        rel_l2 = _rel_l2(dw, dw_ref)
+        print(f"S={S} C={C} bwd_grid_mult={k}: fp32-policy dweight rel-L2 {rel_l2:.3e}")
+        assert rel_l2 <= FP32G_REL_L2_GATE, (S, C, k, rel_l2)
+    torch.cuda.empty_cache()
 
 
 # Forward workspace rows: whole-row and multi-sub-tile tiles, the forward's fallback tiles (1344, 1600), a

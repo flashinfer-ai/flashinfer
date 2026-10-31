@@ -39,7 +39,11 @@ comparator: ``--weight-dtype bfloat16`` (BF16 taps and a BF16 ``dweight``: the
 ``--bias float32|bfloat16`` (the ``*_bias`` programs; FLA's conv takes the bias,
 eager adds it after the taps) and ``--silu-grad-preactivation fp32`` (the
 ``*_fp32g`` programs; FLA has no such option, so its row is its default
-backward, a speed-only comparison).  The JSON records the backward route.
+backward, a speed-only comparison).  ``--bwd-grid-mult 2|3|4`` runs the Cake
+backward at that opt-in grid multiple (``bwd_grid_mult``, a finer static
+partition of the token axis; its workspace sized for it); the other
+comparators have no such option.  The JSON records the backward route and the
+multiple.
 
 ``--side-kernel`` adds, per row and comparator, the backward's wall latency on
 its stream (CUDA events, median of seven calls after three warm-ups) alone and
@@ -57,6 +61,7 @@ Example::
     python benchmarks/bench_cake_causal_conv1d_det_train.py --channels 512 --tokens 250340 --json out.json
     python benchmarks/bench_cake_causal_conv1d_det_train.py --weight-dtype bfloat16 --bias bfloat16
     python benchmarks/bench_cake_causal_conv1d_det_train.py --silu-grad-preactivation fp32 --channels 512 1280
+    python benchmarks/bench_cake_causal_conv1d_det_train.py --bwd-grid-mult 3 --side-kernel nccl-like --skip fla eager_fp32
 """
 
 from __future__ import annotations
@@ -76,6 +81,7 @@ from flashinfer.cake_causal_conv1d_det_train import (
     cake_causal_conv1d_det_train_forward_workspace,
     is_cake_causal_conv1d_det_train_supported,
 )
+from flashinfer.cake_causal_conv1d_det_train_backend import BWD_GRID_MULTS
 from flashinfer.cake_causal_conv1d_det_train_backend import cake_jit as loader
 from flashinfer.testing import bench_gpu_time
 
@@ -123,11 +129,12 @@ void spin(int64_t ctas, int64_t threads, int64_t cycles) {
 @dataclass(frozen=True)
 class Mode:
     """The route of a run: the taps' dtype (and the ``dweight``'s), the bias dtype (``None``: no bias) and the
-    SiLU' policy of the weight gradient."""
+    SiLU' policy of the weight gradient; and the Cake backward's opt-in grid multiple."""
 
     weight_dtype: torch.dtype = torch.float32
     bias_dtype: Optional[torch.dtype] = None
     silu_grad_preactivation: str = "bf16"
+    bwd_grid_mult: int = 1
 
     def backward_route(self) -> str:
         return loader.backward_route(
@@ -144,6 +151,7 @@ class Mode:
             else str(self.bias_dtype).removeprefix("torch."),
             "silu_grad_preactivation": self.silu_grad_preactivation,
             "backward_route": self.backward_route(),
+            "bwd_grid_mult": self.bwd_grid_mult,
         }
 
 
@@ -283,7 +291,7 @@ class Cake(Comparator):
             None if b is None else torch.empty(channels, dtype=b.dtype, device=x.device)
         )
         workspace = cake_causal_conv1d_det_train_backward_workspace(
-            tokens, channels, x.device
+            tokens, channels, x.device, bwd_grid_mult=mode.bwd_grid_mult
         )
         forward_workspace = cake_causal_conv1d_det_train_forward_workspace(
             tokens, channels, x.device
@@ -307,6 +315,7 @@ class Cake(Comparator):
                 dx=dx,
                 dweight=dw,
                 dbias=db,
+                bwd_grid_mult=mode.bwd_grid_mult,
             )
 
         return fwd, bwd
@@ -408,11 +417,20 @@ def _selected_program(arch: str, tokens: int, channels: int, mode: Mode) -> str:
     return loader.selected_modules(arch, mode.backward_route(), C=channels, S=tokens)[0]
 
 
-def _partial_rows(program: str, channels: int, *, device_index: int) -> int:
-    """The FP32 partial rows of ``program``'s own grid (the public workspace is sized for the largest grid)."""
+def _partial_rows(
+    program: str, channels: int, *, device_index: int, bwd_grid_mult: int = 1
+) -> int:
+    """The FP32 partial rows of ``program``'s own grid (the public workspace is sized for the largest grid); at
+    ``bwd_grid_mult`` k > 1 of k times its untrimmed grid."""
 
     record = loader.MODULES[program]
-    return loader.workspace_layout(record, channels, device_index=device_index)["rows"]
+    layout = loader.workspace_layout(record, channels, device_index=device_index)
+    if bwd_grid_mult == 1:
+        return layout["rows"]
+    _, _, n_ch_tiles = loader.channel_split(
+        channels, geometry=record["grid_rule"]["geometry"], role=record["role"]
+    )
+    return loader.partial_rows(int(layout["grid"]) * bwd_grid_mult, n_ch_tiles)
 
 
 def bench_row(
@@ -442,7 +460,9 @@ def bench_row(
     )
     arch = loader.arch_for_capability(torch.cuda.get_device_capability(device))
     program = _selected_program(arch, tokens, channels, mode)
-    partial_rows = _partial_rows(program, channels, device_index=device.index)
+    partial_rows = _partial_rows(
+        program, channels, device_index=device.index, bwd_grid_mult=mode.bwd_grid_mult
+    )
     result = {
         "tokens": tokens,
         "channels": channels,
@@ -547,6 +567,13 @@ def main(argv: Optional[list[str]] = None) -> int:
         help="the weight gradient's SiLU' policy (fp32: the _fp32g routes; FLA keeps its own backward)",
     )
     parser.add_argument(
+        "--bwd-grid-mult",
+        type=int,
+        choices=BWD_GRID_MULTS,
+        default=1,
+        help="the Cake backward's opt-in grid multiple (bwd_grid_mult; 1: the default grid)",
+    )
+    parser.add_argument(
         "--side-kernel",
         choices=sorted(SIDE_KERNELS),
         default=None,
@@ -557,6 +584,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         weight_dtype=DTYPES[args.weight_dtype],
         bias_dtype=None if args.bias == "none" else DTYPES[args.bias],
         silu_grad_preactivation=args.silu_grad_preactivation,
+        bwd_grid_mult=args.bwd_grid_mult,
     )
 
     device = torch.device("cuda", torch.cuda.current_device())

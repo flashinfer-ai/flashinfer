@@ -104,6 +104,14 @@ Usage::
     ws = cake_causal_conv1d_det_train_backward_workspace(S, C, x.device)
     dx, dweight = cake_causal_conv1d_det_train_backward(x, weight, cu_seqlens, dy, workspace=ws)
 
+    # opt-in finer backward partition (1, 2, 3 or 4; default 1) for a backward
+    # that overlaps kernels of other streams: same dx, dweight in another fixed
+    # order, a larger workspace
+    ws3 = cake_causal_conv1d_det_train_backward_workspace(S, C, x.device, bwd_grid_mult=3)
+    dx, dweight = cake_causal_conv1d_det_train_backward(
+        x, weight, cu_seqlens, dy, workspace=ws3, bwd_grid_mult=3
+    )
+
     # caller-owned forward workspace (zeroed int32 token-chunk counters, left zero
     # by every launch: keep one per stream and reuse it for every later call)
     fws = cake_causal_conv1d_det_train_forward_workspace(S, C, x.device)
@@ -213,6 +221,7 @@ def cake_causal_conv1d_det_train_backward(
     dx: Optional[torch.Tensor] = None,
     dweight: Optional[torch.Tensor] = None,
     dbias: Optional[torch.Tensor] = None,
+    bwd_grid_mult: int = 1,
 ) -> tuple[torch.Tensor, ...]:
     r"""Packed width-4 depthwise causal convolution + SiLU, training backward.
 
@@ -260,6 +269,19 @@ def cake_causal_conv1d_det_train_backward(
         Preallocated outputs: BF16 of ``x``'s shape, ``[C, 4]`` and ``[C]``
         (each FP32 or BF16; the parameter's dtype when omitted), contiguous.
         ``dbias`` needs ``bias``.
+    bwd_grid_mult : {1, 2, 3, 4}
+        Opt-in finer static partition of the token axis; default 1 (the
+        default programs, grid and bits).  The main program launches
+        ``bwd_grid_mult`` times its default CTA count, so each CTA streams
+        that much fewer tokens and a CTA that has to wait for a kernel of
+        another stream (an NCCL collective) to free a slot delays the call by
+        a shorter stream; the call alone is somewhat slower.  ``dx`` is bitwise
+        the default's; ``dweight`` / ``dbias`` sum more partial rows in another
+        fixed order (bitwise reproducible per ``bwd_grid_mult``, last bits differ
+        from the default).  A ``workspace`` must come from
+        :func:`cake_causal_conv1d_det_train_backward_workspace` with the same (or a
+        larger) ``bwd_grid_mult``.  ``TypeError`` for a non-int, ``ValueError``
+        for another value.
 
     Returns
     -------
@@ -283,6 +305,7 @@ def cake_causal_conv1d_det_train_backward(
         dx=dx,
         dweight=dweight,
         dbias=dbias,
+        bwd_grid_mult=bwd_grid_mult,
     )
 
 
@@ -294,6 +317,7 @@ def cake_causal_conv1d_det(
     bias: Optional[torch.Tensor] = None,
     *,
     silu_grad_preactivation: str = "bf16",
+    bwd_grid_mult: int = 1,
 ) -> torch.Tensor:
     """Autograd-enabled packed width-4 depthwise causal convolution + SiLU.
 
@@ -311,6 +335,9 @@ def cake_causal_conv1d_det(
     silu_grad_preactivation : {"bf16", "fp32"}
         The weight gradient's SiLU' policy (see
         :func:`cake_causal_conv1d_det_train_backward`).
+    bwd_grid_mult : {1, 2, 3, 4}
+        The backward's opt-in finer partition (default 1; see
+        :func:`cake_causal_conv1d_det_train_backward`).
 
     Returns
     -------
@@ -323,7 +350,12 @@ def cake_causal_conv1d_det(
     """
 
     return _backend.cake_causal_conv1d_det(
-        x, weight, cu_seqlens, bias, silu_grad_preactivation=silu_grad_preactivation
+        x,
+        weight,
+        cu_seqlens,
+        bias,
+        silu_grad_preactivation=silu_grad_preactivation,
+        bwd_grid_mult=bwd_grid_mult,
     )
 
 
