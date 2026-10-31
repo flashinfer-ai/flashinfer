@@ -590,7 +590,7 @@ kernel_cake_fmha_context_fp8_290a4ce6ad5aa95368d1(const __grid_constant__ CUtens
                 int causal_row;
                 unsigned int num_masked_iters;
                 int kv_shift = seqlen_kv_bh - seqlen_q_bh;
-                causal_row = (m_block * 2 + stage) * 128 + (unsigned int)((warp % 4 * 32 + lane) / 1) + (unsigned int)kv_shift;
+                causal_row = (m_block * 2 + stage) * 128 + (unsigned int)(warp % 4 * 32 + lane) + (unsigned int)kv_shift;
                 int causal_row_min = (m_block * 2 + stage) * 128 + (unsigned int)kv_shift;
                 unsigned int n_block_no_mask_limit = (causal_row_min + 1) / BLOCK_N;
                 num_masked_iters = num_n_blocks - n_block_no_mask_limit;
@@ -2398,8 +2398,8 @@ kernel_cake_fmha_context_fp8_290a4ce6ad5aa95368d1(const __grid_constant__ CUtens
                 unsigned int _max_0_1 = ((num_n_blocks_1) > (1) ? (num_n_blocks_1) : (1));
                 num_n_blocks_1 = _max_0_1;
                 int q_head_base = unit_1;
-                int row_tok = (warp % 4 * 32 + lane) / 1;
-                int row_head = q_head_base + (warp % 4 * 32 + lane) % 1;
+                int row_tok = warp % 4 * 32 + lane;
+                int row_head = q_head_base;
                 int tok_base = cu_seq_lens_q[b_idx_1];
                 mbarrier_arrive(p_full_addr);
                 mbarrier_arrive(p_full_addr + 8);
