@@ -46,11 +46,14 @@ the q / k tiles staged by TMA, one CTA per (chunk, key head); same bits),
 route; the serial and split scans serve the backward's recompute), ``stitch``
 (the segment stitch of both directions), ``fwd_ho`` (the forward scan and the
 output in one tcgen05 kernel), ``dv_local``, the adjoint register scans
-``dhu_r<vb>k<ks>`` with their pre-scans, ``dhu_tc2`` (the serial adjoint scan
-with ``dv_local`` fused, tcgen05, TMA ring fills), ``dqkwg``,
-``wy_bwd`` / ``wy_bwd_bf16``, ``finalize`` / ``finalize_mlp``, and ``tail_g2``
-/ ``tail_g2_bf16`` (``dqkwg``, the WY pullback and the finalize of a
-value-head group of two in one tcgen05 cluster kernel).  Every launch is a
+``dhu_r<vb>k<ks>`` with their pre-scans, ``dhu_pre_dvl_r64k1`` (the ``(64, 1)``
+pre-scan with the ``dv_local`` tiles of its chunks computed in the CTA),
+``dhu_tc2`` (the serial adjoint scan with ``dv_local`` fused, tcgen05, TMA ring
+fills), ``dqkwg``, ``wy_bwd`` / ``wy_bwd_bf16``, ``finalize`` /
+``finalize_mlp``, ``tail_g2`` / ``tail_g2_bf16`` (``dqkwg``, the WY pullback
+and the finalize of a value-head group of two in one tcgen05 cluster kernel)
+and ``tail_g3`` / ``tail_g3_bf16`` (the same for a value-head group of three,
+a three-CTA cluster).  Every launch is a
 plain stream-ordered launch: nothing cooperative, no PDL (the chain may put
 two launches of one stage on two streams, each over its own sequences).
 """
@@ -91,6 +94,7 @@ STAGES = (
     "dhu_r64k1",
     "dhu_pre_r32k2",
     "dhu_pre_r64k1",
+    "dhu_pre_dvl_r64k1",
     "dhu_tc2",
     "dqkwg",
     "wy_bwd",
@@ -99,6 +103,8 @@ STAGES = (
     "finalize_mlp",
     "tail_g2",
     "tail_g2_bf16",
+    "tail_g3",
+    "tail_g3_bf16",
 )
 
 MODULES: dict[str, dict[str, Any]] = {
@@ -894,6 +900,48 @@ MODULES: dict[str, dict[str, Any]] = {
         "scan": {"k_split": 1, "max_segment_chunks": 128, "v_block": 64},
         "stage": "dhu_pre_r64k1",
     },
+    "dhu_pre_dvl_r64k1": {
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
+        "arg_plan": [
+            ["buffer", "qn"],
+            ["buffer", "kn"],
+            ["buffer", "w"],
+            ["buffer", "do"],
+            ["buffer", "g_cs"],
+            ["buffer", "dht"],
+            ["buffer", "dh_out"],
+            ["buffer", "dv2"],
+            ["buffer", "dh0"],
+            ["buffer", "seg_state"],
+            ["buffer", "chunk_start"],
+            ["buffer", "chunk_len"],
+            ["buffer", "seg_chunk_start"],
+            ["buffer", "seg_seq"],
+            ["buffer", "seq_chunk_start"],
+            ["parameter", "num_heads"],
+            ["parameter", "num_v_heads"],
+            ["parameter", "use_final_state_grad"],
+            ["parameter", "store_initial_state_grad"],
+            ["parameter", "scale"],
+            ["buffer", "seg_flag"],
+            ["parameter", "warmup_thresh_log2"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "kernel_symbol": "kernel_cake_gdn_det_train_b6801b520db4ab4f96e4",
+        "launch": {
+            "block": (128, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 157696,
+            "use_pdl": False,
+        },
+        "library": "cake_gdn_det_train_b6801b520db4ab4f96e4",
+        "scan": {"k_split": 1, "max_segment_chunks": 128, "v_block": 64},
+        "stage": "dhu_pre_dvl_r64k1",
+    },
     "dhu_tc2": {
         "arches": ["sm_100a", "sm_103a", "sm_107a"],
         "arg_plan": [
@@ -1214,6 +1262,92 @@ MODULES: dict[str, dict[str, Any]] = {
         },
         "library": "cake_gdn_det_train_16278f860de548514cf8",
         "stage": "tail_g2_bf16",
+    },
+    "tail_g3": {
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
+        "arg_plan": [
+            ["buffer", "qn"],
+            ["buffer", "kn"],
+            ["buffer", "rstd_q"],
+            ["buffer", "rstd_k"],
+            ["buffer", "v_new"],
+            ["buffer", "do"],
+            ["buffer", "dv2"],
+            ["buffer", "h"],
+            ["buffer", "dh"],
+            ["buffer", "g_cs"],
+            ["buffer", "v"],
+            ["buffer", "A"],
+            ["buffer", "beta"],
+            ["buffer", "dq_out"],
+            ["buffer", "dk_out"],
+            ["buffer", "dg_out"],
+            ["buffer", "dv_out"],
+            ["buffer", "dbeta_out"],
+            ["buffer", "chunk_start"],
+            ["buffer", "chunk_len"],
+            ["parameter", "num_heads"],
+            ["parameter", "num_v_heads"],
+            ["parameter", "scale"],
+            ["parameter", "normalize_qk"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "kernel_symbol": "kernel_cake_gdn_det_train_89b37d912fd283131f44",
+        "launch": {
+            "block": (256, 1, 1),
+            "cluster": (3, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 108160,
+            "use_pdl": False,
+        },
+        "library": "cake_gdn_det_train_89b37d912fd283131f44",
+        "stage": "tail_g3",
+    },
+    "tail_g3_bf16": {
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
+        "arg_plan": [
+            ["buffer", "qn"],
+            ["buffer", "kn"],
+            ["buffer", "rstd_q"],
+            ["buffer", "rstd_k"],
+            ["buffer", "v_new"],
+            ["buffer", "do"],
+            ["buffer", "dv2"],
+            ["buffer", "h"],
+            ["buffer", "dh"],
+            ["buffer", "g_cs"],
+            ["buffer", "v"],
+            ["buffer", "A"],
+            ["buffer", "beta"],
+            ["buffer", "dq_out"],
+            ["buffer", "dk_out"],
+            ["buffer", "dg_out"],
+            ["buffer", "dv_out"],
+            ["buffer", "dbeta_out"],
+            ["buffer", "chunk_start"],
+            ["buffer", "chunk_len"],
+            ["parameter", "num_heads"],
+            ["parameter", "num_v_heads"],
+            ["parameter", "scale"],
+            ["parameter", "normalize_qk"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "kernel_symbol": "kernel_cake_gdn_det_train_2e03b684eb372f46395f",
+        "launch": {
+            "block": (256, 1, 1),
+            "cluster": (3, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 108160,
+            "use_pdl": False,
+        },
+        "library": "cake_gdn_det_train_2e03b684eb372f46395f",
+        "stage": "tail_g3_bf16",
     },
 }
 
