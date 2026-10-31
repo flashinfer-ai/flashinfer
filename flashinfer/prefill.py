@@ -2517,7 +2517,7 @@ def _paged_kv_host_metadata(indptr, last_page_len, seq_lens, page_size):
     return indptr_host, last_host, lengths
 
 
-def _blackwell_paged_auto_cudnn(
+def _paged_auto_cudnn(
     device,
     layout,
     q_dtype,
@@ -2553,9 +2553,15 @@ def _blackwell_paged_auto_cudnn(
         and page_size == 16
         # Cheap upper-bound rejection before querying optional runtime support.
         and total_q * hq * max_kv >= 8 * 1024 * 1024
-        and get_compute_capability(device) == (10, 0)
-        and _cudnn_supports_paged_auto()
     ):
+        return False
+    capability = get_compute_capability(device)
+    # Rubin admission is limited to the short-query prefix domain.
+    if capability != (10, 0) and not (
+        capability == (10, 7) and prefix and max_q <= 128
+    ):
+        return False
+    if not _cudnn_supports_paged_auto():
         return False
     # Pair Q with its own KV length when host metadata is already available.
     # For device-only lengths, preserve the existing upper-bound policy:
@@ -3895,7 +3901,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     not self.is_cuda_graph_enabled
                     or self._qo_indptr_buf.dtype == torch.int32
                 )
-                and _blackwell_paged_auto_cudnn(
+                and _paged_auto_cudnn(
                     self.device,
                     self._kv_layout,
                     q_data_type,
