@@ -4545,6 +4545,14 @@ _CONTEXT_FP8_ONE_STAGE_MIN_ROWS = 64
 _CONTEXT_FP8_ONE_STAGE_ROWS_GAIN: dict[str, frozenset[int]] = {
     "sm103a": frozenset({64}),
 }
+# Per target, the most keys of a launch of one KV block per tile that takes
+# the one-stage pack ranked fastest wherever the one-stage costs predict it
+# faster than the launch's schedule, without the split margins: with one
+# 128-key block per tile the one-stage tile drops the empty second stage's
+# products, softmax and epilogue, which the costs (fitted over 768 .. 6016
+# keys) undercount (timed B200: 32 query tokens, heads 32/32, page 64, 1 .. 4
+# requests ran 0.8 .. 1.1 us faster one-stage, predicted 0.3 us).
+_CONTEXT_FP8_ONE_BLOCK_ONE_STAGE_KEYS: dict[str, int] = {"sm100a": 128}
 
 
 def _context_fp8_tile_blocks(
@@ -4914,7 +4922,8 @@ def _context_fp8_one_stage_choice(
     (:data:`_CONTEXT_FP8_ONE_STAGE_COSTS`, its unit scaled by the tile's query
     rows, :data:`_CONTEXT_FP8_ONE_STAGE_ROWS`) is taken where predicted faster
     than ``current`` under the split cost model by the split margins (with
-    the unscaled unit).  Every
+    the unscaled unit), or at all for a launch of at most the keys of
+    :data:`_CONTEXT_FP8_ONE_BLOCK_ONE_STAGE_KEYS` (one KV block per tile).  Every
     query row meets the same KV blocks in the same order as in a whole tile
     of two stages (the blocks a tile of two stages adds above a row's keys
     are fully masked for it)."""
@@ -4969,7 +4978,10 @@ def _context_fp8_one_stage_choice(
             candidate_time = candidate_rank
         if candidate_rank < best_rank:
             best, best_time, best_rank = candidate, candidate_time, candidate_rank
-    if best is not None and _context_fp8_split_gain(time, best_time):
+    one_block = max_kv_len <= _CONTEXT_FP8_ONE_BLOCK_ONE_STAGE_KEYS.get(target, 0)
+    if best is not None and (
+        _context_fp8_split_gain(time, best_time) or (one_block and best_time < time)
+    ):
         return best
     return None
 

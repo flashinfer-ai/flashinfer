@@ -1461,6 +1461,9 @@ _ONE_STAGE_ROWS = [
     (2, 32, 1024, 32, 8),
     (1, 32, 128, 32, 4),
     (16, 32, 512, 32, 8),
+    (2, 32, 128, 32, 1),
+    (4, 32, 128, 32, 1),
+    (2, 16, 64, 32, 8),
 ]
 
 
@@ -1473,11 +1476,12 @@ def test_cake_fmha_context_fp8_one_stage_choice(target) -> None:
     query rows (``_CONTEXT_FP8_ONE_STAGE_ROWS``), and faster than the call's
     launch (its split choice, else whole tiles) by the split margins under
     the unscaled unit (at the page sizes of
-    ``_CONTEXT_FP8_ONE_STAGE_ROWS_GAIN``, sm103a page 64: the scaled unit);
-    else ``None``.  2
-    requests of 128 query tokens over 1500 keys, heads 32/4, take pack 1's
-    one-stage program on both targets; calls of more than 128 query tokens
-    keep their launch."""
+    ``_CONTEXT_FP8_ONE_STAGE_ROWS_GAIN``, sm103a page 64: the scaled unit),
+    or at all for a launch of at most the keys of
+    ``_CONTEXT_FP8_ONE_BLOCK_ONE_STAGE_KEYS`` (sm100a, one KV block); else
+    ``None``.  2 requests of 128 query tokens over 1500 keys, heads 32/4, take
+    pack 1's one-stage program on both targets; calls of more than 128 query
+    tokens keep their launch."""
 
     sm_count = _SM_COUNT[target]
     choose = cake_api._context_fp8_one_stage_choice
@@ -1508,7 +1512,13 @@ def test_cake_fmha_context_fp8_one_stage_choice(target) -> None:
             )
             if best is None or rank < best[2]:
                 best = (candidate, one, rank)
-        gain = best is not None and cake_api._context_fp8_split_gain(time, best[1])
+        one_block = kv_len <= cake_api._CONTEXT_FP8_ONE_BLOCK_ONE_STAGE_KEYS.get(
+            target, 0
+        )
+        gain = best is not None and (
+            cake_api._context_fp8_split_gain(time, best[1])
+            or (one_block and best[2] < time and best[1] < time)
+        )
         assert chosen == (best[0] if gain else None), row
         # a page size the target names in _CONTEXT_FP8_ONE_STAGE_ROWS_GAIN:
         # the gain takes the scaled unit (the rank)
@@ -1520,6 +1530,12 @@ def test_cake_fmha_context_fp8_one_stage_choice(target) -> None:
     current = cake_api._context_fp8_split_choice(target, 2, 128, 1500, 32, 8, sm_count)
     current = current if current is not None else (8, None)
     assert choose(target, 2, 128, 1500, 32, 8, sm_count, current) == 1
+    # sm100a launches of one KV block per tile (2 requests of 32 query tokens
+    # over 128 keys, heads 32/32) take the one-stage program though its
+    # predicted gain is below the split margins; sm103a keeps the margins.
+    assert cake_api._CONTEXT_FP8_ONE_BLOCK_ONE_STAGE_KEYS == {"sm100a": 128}
+    one_block = choose(target, 2, 32, 128, 32, 1, sm_count, (1, None))
+    assert one_block == (1 if target == "sm100a" else None)
     # without a cost model the call keeps its launch
     assert choose("sm90a", 2, 128, 1500, 32, 8, sm_count, (8, None)) is None
 
