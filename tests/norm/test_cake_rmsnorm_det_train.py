@@ -1514,6 +1514,59 @@ def test_registry_records_reference_the_build_manifest() -> None:
     assert (package / "csrc" / "cake_ffi_checks.h").is_file()
 
 
+# The per-element dw bound of the H = 5120 contract at the largest row counts of its long-chunk window: every element
+# of dw within atol = rtol = 1e-4 of the FP64 sum of the same products (g, x and the FP32 rstd the forward returned),
+# where an FP32 chunk sum over many rows accumulates the most rounding.  A few seeds per case; BF16 and FP32 weight.
+DW_ELEMENT_TOL = 1e-4
+LARGE_ROW_DW_ROWS = (40960, 65536)
+
+
+def _dw_fp64(g: torch.Tensor, x: torch.Tensor, rstd: torch.Tensor) -> torch.Tensor:
+    dw = torch.zeros(x.shape[-1], dtype=torch.float64, device=x.device)
+    for start in range(0, x.shape[0], 8192):
+        stop = min(start + 8192, x.shape[0])
+        dw += (
+            g[start:stop].double()
+            * x[start:stop].double()
+            * rstd[start:stop, None].double()
+        ).sum(0)
+    return dw
+
+
+@pytest.mark.parametrize("rows", LARGE_ROW_DW_ROWS)
+@pytest.mark.parametrize("fp32_weight", (False, True))
+@pytest.mark.parametrize("seed", (0, 1, 2))
+def test_large_row_dw_meets_the_per_element_bound(
+    rows: int, fp32_weight: bool, seed: int
+) -> None:
+    hidden = 5120
+    if fp32_weight:
+        _skip_unless_fp32_routes(hidden, False)
+    else:
+        _skip_unless_hidden(hidden)
+    generator = _generator(hidden, rows, fp32_weight, seed, 97)
+    x = _rows(rows, hidden, generator=generator)
+    g = _rows(rows, hidden, generator=generator)
+    if fp32_weight:
+        w = 1.0 + 0.1 * torch.randn(
+            hidden, dtype=torch.float32, device=_device(), generator=generator
+        )
+    else:
+        w = _weight(hidden, generator)
+    _y, rstd = cake_rmsnorm_det_train_forward(x, w, EPS[hidden])
+    _dx, dw = cake_rmsnorm_det_train_backward(g, x, w, rstd)
+    reference = _dw_fp64(g, x, rstd)
+    ratio = (dw.double() - reference).abs() / (
+        DW_ELEMENT_TOL + DW_ELEMENT_TOL * reference.abs()
+    )
+    worst = int(ratio.argmax())
+    assert float(ratio.max()) <= 1.0, (
+        f"rows={rows} fp32_weight={fp32_weight} seed={seed}: dw[{worst}] = "
+        f"{float(dw[worst])!r} vs FP64 {float(reference[worst])!r} "
+        f"({float(ratio.max()):.3f} x the bound, {int((ratio > 1).sum())} elements over)"
+    )
+
+
 def test_dw_not_worse_than_eager_fp32_over_the_matrix() -> None:
     """Aggregate dw gate: the kernel's dw error is not worse than the eager FP32 path over the checked matrix.
 
