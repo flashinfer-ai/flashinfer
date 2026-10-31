@@ -501,6 +501,8 @@ def build_throughput_latency_mla_task_manager(
     verbose: bool = False,
     exhaustive_deadlock_race_check: bool = False,
     requested_splits=None,
+    kv_producer=None,
+    kv_producer_args=None,
 ) -> tuple[TaskManager, object]:
     """Build the throughput-latency 1CTA MLA TaskManager for validation or execution.
 
@@ -519,6 +521,12 @@ def build_throughput_latency_mla_task_manager(
         use_clc_dynamic_scheduler,
         use_static_persistent_scheduler,
     )
+    if kv_producer is not None and (
+        not cfg.single_kv_pipe or cfg.kernel_variant != "keeps_mma_ab"
+    ):
+        raise ValueError(
+            "custom KV producers require the single-pipe Keep-AB task graph"
+        )
     if cfg.single_kv_pipe:
         return _make_single_kv_pipe_task_graph(
             cfg,
@@ -559,6 +567,8 @@ def build_throughput_latency_mla_task_manager(
             verbose=verbose,
             exhaustive_deadlock_race_check=exhaustive_deadlock_race_check,
             requested_splits=requested_splits,
+            kv_producer=kv_producer,
+            kv_producer_args=kv_producer_args,
         )
 
     agent = pipeline.Agent
@@ -1220,6 +1230,8 @@ def _make_single_kv_pipe_task_graph(
     verbose: bool = False,
     exhaustive_deadlock_race_check: bool = False,
     requested_splits=None,
+    kv_producer=None,
+    kv_producer_args=None,
 ) -> tuple[TaskManager, object]:
     """Build the single-stream 1CTA task graph.
 
@@ -1284,27 +1296,37 @@ def _make_single_kv_pipe_task_graph(
         cta_layout_vmnk=cta_layout_vmnk,
         consumer_signaling_threads=SignalingThreads.CtaLeader,
     )
-    smem_kv_cfg = PipelineConfig.create_tma_umma_pipeline_cfg(
-        num_stages=cfg.kv_stages,
-        num_bytes=cfg.whole_kv_tile_bytes
-        if cfg.whole_kv_tile
-        else cfg.kv_smem_tile_bytes,
-        num_bytes_per_warp_per_cta=(
-            (cfg.whole_kv_tile_bytes if cfg.whole_kv_tile else cfg.kv_smem_tile_bytes)
-            // cfg.load_num_warps
-            if cfg.load_num_warps > 1
-            else None
-        ),
-        producer_group=tma_group,
-        producer_signaling_threads=(
-            SignalingThreads.TaskWarpLeader
-            if cfg.load_num_warps > 1
-            else SignalingThreads.All
-        ),
-        consumer_group=umma_group,
-        cta_layout_vmnk=cta_layout_vmnk,
-        consumer_signaling_threads=SignalingThreads.CtaLeader,
-    )
+    if kv_producer is None:
+        smem_kv_cfg = PipelineConfig.create_tma_umma_pipeline_cfg(
+            num_stages=cfg.kv_stages,
+            num_bytes=cfg.whole_kv_tile_bytes
+            if cfg.whole_kv_tile
+            else cfg.kv_smem_tile_bytes,
+            num_bytes_per_warp_per_cta=(
+                (
+                    cfg.whole_kv_tile_bytes
+                    if cfg.whole_kv_tile
+                    else cfg.kv_smem_tile_bytes
+                )
+                // cfg.load_num_warps
+                if cfg.load_num_warps > 1
+                else None
+            ),
+            producer_group=tma_group,
+            producer_signaling_threads=(
+                SignalingThreads.TaskWarpLeader
+                if cfg.load_num_warps > 1
+                else SignalingThreads.All
+            ),
+            consumer_group=umma_group,
+            cta_layout_vmnk=cta_layout_vmnk,
+            consumer_signaling_threads=SignalingThreads.CtaLeader,
+        )
+    else:
+        # Thread-written stages publish arrivals, not TMA completion bytes.
+        smem_kv_cfg = kv_producer.pipeline_config(
+            cfg, load_group, umma_group, cta_layout_vmnk
+        )
     if cfg.sparse_reuse_kv:
         smem_kv_cfg = dataclass_replace(smem_kv_cfg, advance_on_wait=True)
     tmem_s_cfg = PipelineConfig.create_umma_async_pipeline_cfg(
@@ -1384,7 +1406,7 @@ def _make_single_kv_pipe_task_graph(
         cta_idx_q=cta_idx_q,
         name="ll_mla_q64_smem_q",
     )
-    smem_kv = SmemKvResource(
+    smem_kv_args = dict(
         cfg=cfg,
         pipeline_config=smem_kv_cfg,
         tma_desc_c_latent=tma_desc_c_latent,
@@ -1405,6 +1427,11 @@ def _make_single_kv_pipe_task_graph(
         cta_idx_kv=cta_idx_kv,
         cta_idx_head_dim_v=cta_idx_head_dim_v,
         name="ll_mla_q64_smem_kv",
+    )
+    smem_kv = (
+        SmemKvResource(**smem_kv_args)
+        if kv_producer is None
+        else kv_producer.make_resource(kv_producer_args, **smem_kv_args)
     )
     if cfg.q_tma_stage:
         smem_q.kv_alias_ref = smem_kv
@@ -1774,6 +1801,7 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
         kv_cache_format: str = "native",
         extra_kv_cache_format: str = "native",
         fixed_seqlen: bool = False,
+        kv_producer=None,
     ):
         """Initialize one selected physical tile profile over logical flat Q rows.
 
@@ -1817,12 +1845,16 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
             )
         )
         self.fixed_seqlen = fixed_seqlen
+        self.kv_producer = kv_producer
         self.output_quant = None
         # Sparse attention binds separate source lists; dense attention uses
         # the ordinary page table. Both reuse the staged KV loaders.
         self.direct_sparse = False
         self.assume_valid_prefix = False
         self.direct_sparse_capacities = (0, 0)
+        self.coalesce_keeps_output = False
+        self.use_pdl = False
+        self.pdl_entry_trigger_max_ctas = 0
 
         cfg = self._make_config()
         # Parallel standalone reduction requires a fixed split profile and a
@@ -1953,7 +1985,7 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
             cfg = dataclass_replace(
                 cfg, seq_len_q=0, logical_seq_len_q=0, num_ctas_per_seq_q=0
             )
-        return (
+        signature = (
             cfg,
             self.acc_dtype,
             self.lse_dtype,
@@ -1964,6 +1996,9 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
             self.compile_topology_signature(),
             self.output_quant,
         )
+        if self.kv_producer is not None:
+            signature += (self.kv_producer.compile_signature(),)
+        return signature
 
     def _make_config(self):
         """Create the static throughput-latency MLA config for this wrapper."""
@@ -2010,6 +2045,14 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
                 direct_inputs=self.direct_sparse,
                 assume_valid_prefix=self.assume_valid_prefix,
                 source_capacities=self.direct_sparse_capacities,
+            )
+        if self.coalesce_keeps_output:
+            cfg = dataclass_replace(cfg, coalesce_keeps_output=True)
+        if self.use_pdl:
+            cfg = dataclass_replace(
+                cfg,
+                use_pdl=True,
+                pdl_entry_trigger_max_ctas=self.pdl_entry_trigger_max_ctas,
             )
         if self.split_kv_capacity is not None and cfg.use_multi_ctas_kv == 1:
             cfg = dataclass_replace(cfg, num_ctas_per_seq_kv=self.split_kv_capacity)
@@ -2148,8 +2191,9 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
             q_rope.stride[2] == q_rope.shape[0] * q_rope.stride[0],
             "q_rope must be compact across the head and query dimensions",
         )
-        if cutlass.const_expr(c_latent.stride[1] != 1 or c_rope.stride[1] != 1):
-            raise ValueError("c_latent and c_rope must have leading dimension 1")
+        if cutlass.const_expr(self.kv_producer is None):
+            if cutlass.const_expr(c_latent.stride[1] != 1 or c_rope.stride[1] != 1):
+                raise ValueError("c_latent and c_rope must have leading dimension 1")
         if cutlass.const_expr(o.stride[1] != 1):
             raise ValueError("o must have leading dimension 1")
         runtime_assert(
@@ -2286,125 +2330,139 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
         else:
             tma_desc_q_rope = tma_desc_q_latent
 
-        c_latent_tma = cute.make_tensor(
-            c_latent.iterator,
-            cute.select(c_latent.layout, mode=[1, 0, 2]),
-        )
-        if cutlass.const_expr(cfg.num_tokens_per_page == 1):
-            # Sparse routes address individual rows (Gather4 row maps). D512:
-            # the unused RoPE descriptor slot carries the independent
-            # compressed-pool map. D576: it carries the RoPE columns.
-            c_rows = cute.make_tensor(
-                c_latent.iterator,
-                cute.make_layout(
-                    (c_latent.shape[1], c_latent.shape[2]),
-                    stride=(c_latent.stride[1], c_latent.stride[2]),
-                ),
-            )
-            c_extra_rows = cute.make_tensor(
-                c_rope.iterator,
-                cute.make_layout(
-                    (c_rope.shape[1], c_rope.shape[2]),
-                    stride=(c_rope.stride[1], c_rope.stride[2]),
-                ),
-            )
-            tma_desc_c_latent = create_tensor_map_tiled_from_view(
-                c_rows,
-                box_dims=(tma_box0, 1),
-                stride_order=(0, 1),
-                swizzle=cuda.TensorMapSwizzle.s128b,
-                l2_promotion=cuda.TensorMapL2Promotion.l2_128b,
-            )
-            tma_desc_c_rope = create_tensor_map_tiled_from_view(
-                c_extra_rows,
-                box_dims=(cfg.rope_dim if cfg.sparse_d576_reload else tma_box0, 1),
-                stride_order=(0, 1),
-                swizzle=(
-                    cuda.TensorMapSwizzle.s64b
-                    if cfg.sparse_d576_reload
-                    else cuda.TensorMapSwizzle.s128b
-                ),
-                l2_promotion=cuda.TensorMapL2Promotion.l2_128b,
-            )
+        kv_producer_args = None
+        if cutlass.const_expr(self.kv_producer is not None):
+            # Keep packed storage out of native tensor-map creation. Unused
+            # descriptor ABI slots alias Q; only Q is prefetched below.
+            kv_producer_args = (c_latent, c_rope)
+            tma_desc_c_latent = tma_desc_q_latent
+            tma_desc_c_rope = tma_desc_q_latent
+            tma_desc_v = tma_desc_q_latent
+            tma_desc_bulk_extra = tma_desc_q_latent
+            tma_desc_sparse_rope = tma_desc_q_latent
+            tma_desc_sparse_extra_rope = tma_desc_q_latent
         else:
-            tma_desc_c_latent = create_tensor_map_tiled_from_view(
-                c_latent_tma,
-                box_dims=(tma_box0, tma_page_tokens, 1),
-                stride_order=(0, 1, 2),
-                swizzle=cuda.TensorMapSwizzle.s128b,
-                l2_promotion=cuda.TensorMapL2Promotion.l2_128b,
+            c_latent_tma = cute.make_tensor(
+                c_latent.iterator,
+                cute.select(c_latent.layout, mode=[1, 0, 2]),
             )
+            if cutlass.const_expr(cfg.num_tokens_per_page == 1):
+                # Sparse routes address individual rows (Gather4 row maps). D512:
+                # the unused RoPE descriptor slot carries the independent
+                # compressed-pool map. D576: it carries the RoPE columns.
+                c_rows = cute.make_tensor(
+                    c_latent.iterator,
+                    cute.make_layout(
+                        (c_latent.shape[1], c_latent.shape[2]),
+                        stride=(c_latent.stride[1], c_latent.stride[2]),
+                    ),
+                )
+                c_extra_rows = cute.make_tensor(
+                    c_rope.iterator,
+                    cute.make_layout(
+                        (c_rope.shape[1], c_rope.shape[2]),
+                        stride=(c_rope.stride[1], c_rope.stride[2]),
+                    ),
+                )
+                tma_desc_c_latent = create_tensor_map_tiled_from_view(
+                    c_rows,
+                    box_dims=(tma_box0, 1),
+                    stride_order=(0, 1),
+                    swizzle=cuda.TensorMapSwizzle.s128b,
+                    l2_promotion=cuda.TensorMapL2Promotion.l2_128b,
+                )
+                tma_desc_c_rope = create_tensor_map_tiled_from_view(
+                    c_extra_rows,
+                    box_dims=(cfg.rope_dim if cfg.sparse_d576_reload else tma_box0, 1),
+                    stride_order=(0, 1),
+                    swizzle=(
+                        cuda.TensorMapSwizzle.s64b
+                        if cfg.sparse_d576_reload
+                        else cuda.TensorMapSwizzle.s128b
+                    ),
+                    l2_promotion=cuda.TensorMapL2Promotion.l2_128b,
+                )
+            else:
+                tma_desc_c_latent = create_tensor_map_tiled_from_view(
+                    c_latent_tma,
+                    box_dims=(tma_box0, tma_page_tokens, 1),
+                    stride_order=(0, 1, 2),
+                    swizzle=cuda.TensorMapSwizzle.s128b,
+                    l2_promotion=cuda.TensorMapL2Promotion.l2_128b,
+                )
 
-        if cutlass.const_expr(cfg.rope_dim > 0 and cfg.num_tokens_per_page != 1):
-            c_rope_tma = cute.make_tensor(
-                c_rope.iterator,
-                cute.select(c_rope.layout, mode=[1, 0, 2]),
-            )
-            c_rope_swizzle = cuda.TensorMapSwizzle.s128b
-            if cutlass.const_expr(cfg.is_fp8_qkv() and cfg.rope_dim == 64):
-                c_rope_swizzle = cuda.TensorMapSwizzle.s64b
-            tma_desc_c_rope = create_tensor_map_tiled_from_view(
-                c_rope_tma,
-                box_dims=(min(tma_box0, cfg.rope_dim), tma_page_tokens, 1),
-                stride_order=(0, 1, 2),
-                swizzle=c_rope_swizzle,
-                l2_promotion=cuda.TensorMapL2Promotion.l2_128b,
-            )
-        elif cutlass.const_expr(cfg.num_tokens_per_page != 1):
-            tma_desc_c_rope = tma_desc_c_latent
+            if cutlass.const_expr(cfg.rope_dim > 0 and cfg.num_tokens_per_page != 1):
+                c_rope_tma = cute.make_tensor(
+                    c_rope.iterator,
+                    cute.select(c_rope.layout, mode=[1, 0, 2]),
+                )
+                c_rope_swizzle = cuda.TensorMapSwizzle.s128b
+                if cutlass.const_expr(cfg.is_fp8_qkv() and cfg.rope_dim == 64):
+                    c_rope_swizzle = cuda.TensorMapSwizzle.s64b
+                tma_desc_c_rope = create_tensor_map_tiled_from_view(
+                    c_rope_tma,
+                    box_dims=(min(tma_box0, cfg.rope_dim), tma_page_tokens, 1),
+                    stride_order=(0, 1, 2),
+                    swizzle=c_rope_swizzle,
+                    l2_promotion=cuda.TensorMapL2Promotion.l2_128b,
+                )
+            elif cutlass.const_expr(cfg.num_tokens_per_page != 1):
+                tma_desc_c_rope = tma_desc_c_latent
 
-        tma_desc_v = tma_desc_c_latent
-        tma_desc_bulk_extra = tma_desc_c_rope
-        tma_desc_sparse_rope = tma_desc_c_latent
-        tma_desc_sparse_extra_rope = tma_desc_c_rope
-        if cutlass.const_expr(
-            cfg.num_tokens_per_page == 1 and not cfg.sparse_d576_reload
-        ):
-            # Generic sparse bulk maps are separate from query RoPE. The
-            # native reload schedule uses its compact 64-column RoPE map.
-            rows_per_issuer = 32
-            tma_desc_v = create_tensor_map_tiled_from_view(
-                c_rows,
-                box_dims=(tma_box0, rows_per_issuer),
-                stride_order=(0, 1),
-                swizzle=cuda.TensorMapSwizzle.s128b,
-                l2_promotion=cuda.TensorMapL2Promotion.l2_128b,
-            )
-            tma_desc_bulk_extra = create_tensor_map_tiled_from_view(
-                c_extra_rows,
-                box_dims=(tma_box0, rows_per_issuer),
-                stride_order=(0, 1),
-                swizzle=cuda.TensorMapSwizzle.s128b,
-                l2_promotion=cuda.TensorMapL2Promotion.l2_128b,
-            )
+            tma_desc_v = tma_desc_c_latent
+            tma_desc_bulk_extra = tma_desc_c_rope
+            tma_desc_sparse_rope = tma_desc_c_latent
+            tma_desc_sparse_extra_rope = tma_desc_c_rope
+            if cutlass.const_expr(
+                cfg.num_tokens_per_page == 1 and not cfg.sparse_d576_reload
+            ):
+                # Generic sparse bulk maps are separate from query RoPE. The
+                # native reload schedule uses its compact 64-column RoPE map.
+                rows_per_issuer = 32
+                tma_desc_v = create_tensor_map_tiled_from_view(
+                    c_rows,
+                    box_dims=(tma_box0, rows_per_issuer),
+                    stride_order=(0, 1),
+                    swizzle=cuda.TensorMapSwizzle.s128b,
+                    l2_promotion=cuda.TensorMapL2Promotion.l2_128b,
+                )
+                tma_desc_bulk_extra = create_tensor_map_tiled_from_view(
+                    c_extra_rows,
+                    box_dims=(tma_box0, rows_per_issuer),
+                    stride_order=(0, 1),
+                    swizzle=cuda.TensorMapSwizzle.s128b,
+                    l2_promotion=cuda.TensorMapL2Promotion.l2_128b,
+                )
 
-        if cutlass.const_expr(
-            cfg.num_tokens_per_page == 1
-            and cfg.rope_dim
-            and not cfg.has_nvfp4_kv
-            and not cfg.sparse_d576_reload
-        ):
-            tma_desc_sparse_rope = make_sparse_rope_map(c_latent, cfg.qkv_dtype_bytes)
-            tma_desc_sparse_extra_rope = make_sparse_rope_map(
-                c_rope, cfg.qkv_dtype_bytes
-            )
+            if cutlass.const_expr(
+                cfg.num_tokens_per_page == 1
+                and cfg.rope_dim
+                and not cfg.has_nvfp4_kv
+                and not cfg.sparse_d576_reload
+            ):
+                tma_desc_sparse_rope = make_sparse_rope_map(
+                    c_latent, cfg.qkv_dtype_bytes
+                )
+                tma_desc_sparse_extra_rope = make_sparse_rope_map(
+                    c_rope, cfg.qkv_dtype_bytes
+                )
 
-        if cutlass.const_expr(cfg.has_nvfp4_kv):
-            (
-                tma_desc_c_latent,
-                tma_desc_c_rope,
-                tma_desc_v,
-                tma_desc_bulk_extra,
-                tma_desc_sparse_rope,
-                tma_desc_sparse_extra_rope,
-            ) = make_nvfp4_kv_maps(
-                c_latent,
-                c_rope,
-                cfg.rope_dim,
-                whole_record=cfg.async_nvfp4_kv_gather,
-                primary_format=cfg.kv_cache_format,
-                extra_format=cfg.extra_kv_cache_format,
-            )
+            if cutlass.const_expr(cfg.has_nvfp4_kv):
+                (
+                    tma_desc_c_latent,
+                    tma_desc_c_rope,
+                    tma_desc_v,
+                    tma_desc_bulk_extra,
+                    tma_desc_sparse_rope,
+                    tma_desc_sparse_extra_rope,
+                ) = make_nvfp4_kv_maps(
+                    c_latent,
+                    c_rope,
+                    cfg.rope_dim,
+                    whole_record=cfg.async_nvfp4_kv_gather,
+                    primary_format=cfg.kv_cache_format,
+                    extra_format=cfg.extra_kv_cache_format,
+                )
 
         scale_softmax_log2 = softmax_scale * LOG2_E
         use_gmem_reduction = cutlass.const_expr(
@@ -2500,13 +2558,14 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
             q_latent,
             requested_splits=requested_splits,
             max_q_len=max_q_len,
+            kv_producer_args=kv_producer_args,
         ).launch(
             grid=grid,
             block=[cfg.threads_per_cta, 1, 1],
             cluster=cluster_shape,
             stream=stream,
             min_blocks_per_mp=1,
-            use_pdl=acc_o is not None,
+            use_pdl=acc_o is not None or cfg.use_pdl,
         )
         if cutlass.const_expr(acc_o is not None):
             if cutlass.const_expr(
@@ -2630,12 +2689,24 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
         q_nope_tensor: cute.Tensor = None,
         requested_splits=None,
         max_q_len: cutlass.Int32 = 0,
+        kv_producer_args=None,
     ):
         """Execute one flat-Q, batch, KV-split, and V head-dimension tile."""
         cfg = self.runtime_config(max_q_len)
-        if cutlass.const_expr(acc_o is not None):
-            # Match the PDL launch before reading live metadata or sparse scales.
+        if cutlass.const_expr(cfg.use_pdl or acc_o is not None):
+            # A PDL launch can start before the preceding grid completes, so
+            # every input read below (metadata, Q, KV, sinks) waits for it.
             prims.griddepcontrol(kind=prims.GridDepAction.WAIT)
+        if cutlass.const_expr(cfg.use_pdl and cfg.pdl_entry_trigger_max_ctas > 0):
+            # Dependents (the reducer, the next decode) wait for this whole
+            # grid before any read, so a small grid releases them now: their
+            # launch and prologue overlap it instead of following it.
+            pdl_thread_idx, _, _ = cute.arch.thread_idx()
+            grid_x, grid_y, grid_z = cute.arch.grid_dim()
+            if pdl_thread_idx == Int32(0) and grid_x * grid_y * grid_z <= Int32(
+                cfg.pdl_entry_trigger_max_ctas
+            ):
+                prims.griddepcontrol(kind=prims.GridDepAction.LAUNCH_DEPENDENTS)
 
         if cutlass.const_expr(cfg.sparse_direct):
             from ..helpers.sparse_indices import bind_sparse_kv_indices
@@ -2644,21 +2715,36 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
             request = None
             if cutlass.const_expr(cfg.use_persistent_scheduler != 1):
                 request = cutlass.Int64(cute.arch.block_idx()[2])
-            capacity = ((cutlass.Int32(si.shape[-1]) + 127) // 128) * 128
-            if cutlass.const_expr(cfg.sparse_direct_capacities[1] > 0):
-                capacity = capacity + ((cutlass.Int32(ci.shape[-1]) + 127) // 128) * 128
-            capacity = cute.math.max(cutlass.Int32(256), capacity)
-            page_offsets, cache_seqs = bind_sparse_kv_indices(
-                si,
-                ci,
-                sl,
-                cl,
-                capacity,
-                query_row=request,
-                assume_valid_prefix=cfg.sparse_valid_prefix,
-                has_extra=cfg.sparse_direct_capacities[1] > 0,
-                primary_tensor_scale=ks if cfg.kv_cache_format == "fp8" else None,
-            )
+            if cutlass.const_expr(
+                self.kv_producer is not None
+                and hasattr(self.kv_producer, "bind_sparse_views")
+            ):
+                page_offsets, cache_seqs = self.kv_producer.bind_sparse_views(
+                    si,
+                    sl,
+                    cl,
+                    kv_producer_args,
+                    cfg.total_kv_tiles * cfg.tile_size_kv,
+                    request=request,
+                )
+            else:
+                capacity = ((cutlass.Int32(si.shape[-1]) + 127) // 128) * 128
+                if cutlass.const_expr(cfg.sparse_direct_capacities[1] > 0):
+                    capacity = (
+                        capacity + ((cutlass.Int32(ci.shape[-1]) + 127) // 128) * 128
+                    )
+                capacity = cute.math.max(cutlass.Int32(256), capacity)
+                page_offsets, cache_seqs = bind_sparse_kv_indices(
+                    si,
+                    ci,
+                    sl,
+                    cl,
+                    capacity,
+                    query_row=request,
+                    assume_valid_prefix=cfg.sparse_valid_prefix,
+                    has_extra=cfg.sparse_direct_capacities[1] > 0,
+                    primary_tensor_scale=ks if cfg.kv_cache_format == "fp8" else None,
+                )
             sparse_epilogue_params = sinks
         else:
             sparse_epilogue_params = None
@@ -2759,11 +2845,14 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
 
         if warp_idx == Int32(cfg.load_warp_idx):
             prims.prefetch_tensormap(tma_desc_q_latent.get_ptr())
-            prims.prefetch_tensormap(tma_desc_q_rope.get_ptr())
-            prims.prefetch_tensormap(tma_desc_c_latent.get_ptr())
-            prims.prefetch_tensormap(tma_desc_c_rope.get_ptr())
-            prims.prefetch_tensormap(tma_desc_v.get_ptr())
-            if cutlass.const_expr(cfg.sparse_direct):
+            if cutlass.const_expr(self.kv_producer is None):
+                prims.prefetch_tensormap(tma_desc_q_rope.get_ptr())
+                prims.prefetch_tensormap(tma_desc_c_latent.get_ptr())
+                prims.prefetch_tensormap(tma_desc_c_rope.get_ptr())
+                prims.prefetch_tensormap(tma_desc_v.get_ptr())
+            if cutlass.const_expr(
+                cfg.sparse_direct and sparse_epilogue_params is not None
+            ):
                 lane = cute.arch.thread_idx()[0] % 32
                 if lane < (cfg.logical_num_heads_q + 31) // 32:
                     address = sparse_epilogue_params.iterator.toint() + cutlass.Int64(
@@ -2814,7 +2903,15 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
             use_clc_dynamic_scheduler=use_clc_dynamic,
             use_static_persistent_scheduler=use_static_persistent,
             requested_splits=requested_splits,
+            kv_producer=self.kv_producer,
+            kv_producer_args=kv_producer_args,
         )
+        if cutlass.const_expr(has_runtime_activity_guard):
+            # Initialize resource containers outside runtime control flow; only
+            # task bodies skip inactive Q tiles and pruned KV splits.
+            for task in task_manager.tasks:
+                assert isinstance(task, MlaDecodeTask)
+                task._runtime_body_active = run_task_graph
         task_manager.setup_resources_and_tasks()
         smem_allocator = task_manager.smem_allocator
         assert smem_allocator is not None
@@ -2867,10 +2964,9 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
                 barrier_id=TMEM_LIFECYCLE_BARRIER_ID,
                 thread_count=cfg.threads_per_cta,
             )
+        task_manager.run()
         if cutlass.const_expr(has_runtime_activity_guard):
-            if run_task_graph:
-                task_manager.run()
-            elif query_tile_is_active:
+            if not run_task_graph and query_tile_is_active:
                 if cutlass.const_expr(cfg.use_cluster_reduction == 1):
                     # Publish an online-softmax identity and retain this rank's
                     # configured cluster row-owner reduction duties.
@@ -2895,10 +2991,6 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
                         cta_idx_head_dim_v,
                         head_idx,
                     )
-        else:
-            # In particular, SQ1/S2 without packed-Q metadata lowers to the
-            # original straight-line task graph with no runtime activity test.
-            task_manager.run()
         prims.barrier_cta_sync(
             barrier_id=TMEM_LIFECYCLE_BARRIER_ID,
             thread_count=cfg.threads_per_cta,
@@ -2914,10 +3006,11 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
                 cfg.tmem_alloc_cols,
                 group=prims.CTAGroup.CTA_1,
             )
-        if cutlass.const_expr(acc_o is not None):
+        if cutlass.const_expr(acc_o is not None or cfg.use_pdl):
             # Every CTA in the producer grid must release the dependent
-            # reducer, including runtime-padded Q/split CTAs that skipped the
-            # task graph. One elected thread emits the convergent CTA signal.
+            # reducer or next PDL launch, including runtime-padded Q/split CTAs
+            # that skipped the task graph. One elected thread emits the
+            # convergent CTA signal.
             thread_idx, _, _ = cute.arch.thread_idx()
             if thread_idx == Int32(0):
                 prims.griddepcontrol(kind=prims.GridDepAction.LAUNCH_DEPENDENTS)

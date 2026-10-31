@@ -197,6 +197,16 @@ class MlaConfig(Nvfp4KVConfig):
     fuse_sparse_cluster_epilogue: bool = False
     fuse_sparse_reduction: bool = False
     sparse_direct: bool = False
+    # Keep-AB direct BF16 output staged through SMEM for full-line stores.
+    coalesce_keeps_output: bool = False
+    # Programmatic dependent launch for the attention kernel itself: it waits
+    # for the preceding grid before any input read and releases dependents.
+    use_pdl: bool = False
+    # Grids of at most this many CTAs release PDL dependents right after the
+    # entry wait instead of at exit (0: never). Dependents always wait for the
+    # whole grid; an early release only moves their launch and prologue onto
+    # SMs this grid leaves idle, which crowds them once the grid is large.
+    pdl_entry_trigger_max_ctas: int = 0
     sparse_valid_prefix: bool = False
     sparse_direct_capacities: tuple[int, int] = (0, 0)
     # Planned KV tiles per instruction group (1 Keeps, 2 Swaps); zero selects
@@ -1933,8 +1943,9 @@ def configure_sparse_mla(
         raise ValueError(
             "one-instance Swap-AB requires a supported tile/loader layout, one V owner and no cluster reduction"
         )
-    if reuse and cfg.num_ctas_per_head_dim != 1:
-        raise ValueError("retained KV requires one V owner")
+    if reuse and cfg.num_ctas_per_head_dim != 1 and not keep:
+        # Keep-AB V owners read their own D128 slices of the retained K tile.
+        raise ValueError("retained KV with a V split requires Keep-AB")
     if profile.kv_tile_size not in (64, 128) or (
         profile.kv_tile_size == 64 and (not keep or cfg.is_fp8_qkv() or not reuse)
     ):
