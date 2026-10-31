@@ -578,9 +578,13 @@ class TuningConfig:
         """L2 measurement policy recorded in persisted profiling provenance."""
         if not self.use_cold_l2_cache:
             return "hot"
+        # "read": L2 is evicted by reading the flush buffer (``_flush_l2``).
+        # Entries measured under the earlier write-based flush carry "cold" /
+        # "cold-chain:N", which no longer match, so those tactics are
+        # remeasured instead of reused.
         if self.uses_cold_chain:
-            return f"cold-chain:{self.cold_chain_launches}"
-        return "cold"
+            return f"cold-read-chain:{self.cold_chain_launches}"
+        return "cold-read"
 
 
 class ValueProfileArena:
@@ -1511,6 +1515,37 @@ def _load_cupti():
             f"unavailable ({e}); falling back to CUDA events."
         )
         return None
+
+
+def _make_l2_flush_buffer(num_bytes: int, device: torch.device) -> torch.Tensor:
+    """Allocate a zero-filled buffer of at least ``num_bytes`` for ``_flush_l2``.
+
+    Zero-filled (one write, when the buffer is allocated) so the float32
+    view holds known values; ``_flush_l2`` itself never writes it. One flush
+    runs here, before any caller's barrier or timing loop, so the reduction's
+    scratch is already in PyTorch's caching allocator and later flushes on the
+    same stream (the current one; all three callers flush on it) do not allocate
+    device memory. The allocator keeps freed blocks per stream, so a flush on
+    another stream could still allocate.
+    """
+    flush_buffer = torch.zeros((num_bytes + 3) // 4, dtype=torch.float32, device=device)
+    _flush_l2(flush_buffer)
+    return flush_buffer
+
+
+def _flush_l2(flush_buffer: torch.Tensor) -> None:
+    """Evict L2 by reading ``flush_buffer`` (one reduction kernel, no writes).
+
+    Writing the buffer instead (``zero_()``) leaves L2 full of dirty lines,
+    and the next timed kernel pays their write-back as its own misses evict
+    them. That cost differs between tactics (latency-bound kernels pay the
+    most), so it can reorder them. Reading leaves clean lines. The buffer is
+    float32 and the sum accumulates in float32, so the reduction reads the
+    buffer in place: PyTorch's eager integer sum (int8/int32 input, int64
+    accumulation) first materializes a converted copy of the whole buffer,
+    which is a write (observed as a separate copy kernel in the profiler).
+    """
+    flush_buffer.sum(dtype=torch.float32)
 
 
 def _cupti_measure_spans(
@@ -3595,10 +3630,8 @@ class AutoTuner:
             # Twice L2 matches the standalone benchmark policy and prevents
             # static operands passed through kwargs (for example MoE weights)
             # from remaining resident between samples.
-            flush_buffer = torch.empty(
-                2 * self._get_l2_cache_size_in_bytes(device.index),
-                dtype=torch.int8,
-                device=device,
+            flush_buffer = _make_l2_flush_buffer(
+                2 * self._get_l2_cache_size_in_bytes(device.index), device
             )
             num_samples = repeat * profile_replays
             graph = torch.cuda.CUDAGraph() if tuning_config.use_cuda_graph else None
@@ -3648,7 +3681,7 @@ class AutoTuner:
                     delay_kernel(delay_kernel_time_usec)
 
                 for sample_idx in range(num_samples):
-                    flush_buffer.zero_()
+                    _flush_l2(flush_buffer)
                     starts[sample_idx].record(stream)
                     if graph is not None:
                         graph.replay()
@@ -3975,8 +4008,8 @@ class AutoTuner:
         of a multi-kernel tactic are honestly included, queue-saturation
         effects are not (see ``MeasurementPolicy``).
 
-        Cold-L2 is achieved by zeroing an L2-sized flush buffer once per
-        iteration.  ``zero_()`` dispatches a fill KERNEL (not a memset), so
+        Cold-L2 is achieved by reading an L2-sized flush buffer once per
+        iteration (``_flush_l2``).  The read is a reduction KERNEL, so
         it is handed to ``_cupti_measure_spans`` as a prologue that runs and
         is synced BEFORE the correlation window opens; running it inside the
         window would fold ~100 us of flush into the tactic's measured span
@@ -4011,10 +4044,8 @@ class AutoTuner:
                         (t.device for t in inputs if isinstance(t, torch.Tensor)),
                         torch.device("cuda"),
                     )
-                    flush_buffer = torch.empty(
-                        self._get_l2_cache_size_in_bytes() * 3,
-                        device=device,
-                        dtype=torch.int8,
+                    flush_buffer = _make_l2_flush_buffer(
+                        self._get_l2_cache_size_in_bytes() * 3, device
                     )
 
                 if tuning_config.use_cuda_graph:
@@ -4030,9 +4061,9 @@ class AutoTuner:
                     graph.replay()
 
             def prologue():
-                # zero_ launches a fill kernel; exclude it from the span.
+                # The flush launches a reduction kernel; exclude it from the span.
                 if flush_buffer is not None:
-                    flush_buffer.zero_()
+                    _flush_l2(flush_buffer)
 
             spans_ms = _cupti_measure_spans(
                 run_iteration,
