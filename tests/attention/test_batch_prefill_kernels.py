@@ -1542,6 +1542,68 @@ def test_batch_prefill_with_paged_kv_cache_multi_item_scoring(
         numpy.testing.assert_allclose(o_i_np, o_ref_i_np, rtol=1e-3, atol=1e-3)
 
 
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("group_size", [1, 3])
+@pytest.mark.parametrize("num_items, item_len", [(17, 7), (32, 15)])
+def test_batch_prefill_with_paged_kv_cache_multi_item_scoring_padded_tail(
+    dtype, group_size, num_items, item_len
+):
+    # When the prefix -> item jump lands on the last KV tile, rows past kv_len in that tile must
+    # be zero-filled, not loaded: NaN in the unused entries of the last page would reach the
+    # output through P * V even with P == 0. The prefix sweep moves the jump onto the last tile.
+    page_size, num_kv_heads, head_dim = 16, 4, 128
+    num_qo_heads = num_kv_heads * group_size
+    qo_len = num_items * (item_len + 1)
+    workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device="cuda")
+    token_pos_in_items = (torch.arange(qo_len, device="cuda") % (item_len + 1)).to(
+        torch.uint16
+    )
+    for prefix_len in range(800, 1160, 7):
+        kv_len = prefix_len + qo_len
+        num_pages = (kv_len + page_size - 1) // page_size
+        last_page_len = (kv_len - 1) % page_size + 1
+        if last_page_len == page_size:
+            continue
+        torch.manual_seed(prefix_len)
+        q = torch.randn(qo_len, num_qo_heads, head_dim, device="cuda", dtype=dtype)
+        kv_data = torch.randn(
+            num_pages, 2, page_size, num_kv_heads, head_dim, device="cuda", dtype=dtype
+        )
+        outputs = []
+        for tail_fill in (0.0, float("nan")):
+            kv_data[-1, :, last_page_len:] = tail_fill
+            # The skip lives in the FA2 kernel; "auto" would pick FA3 on SM90.
+            wrapper = flashinfer.prefill.BatchPrefillWithPagedKVCacheWrapper(
+                workspace_buffer, "NHD", backend="fa2"
+            )
+            wrapper.plan(
+                torch.tensor([0, qo_len], dtype=torch.int32, device="cuda"),
+                torch.tensor([0, num_pages], dtype=torch.int32, device="cuda"),
+                torch.arange(num_pages, dtype=torch.int32, device="cuda"),
+                torch.tensor([last_page_len], dtype=torch.int32, device="cuda"),
+                num_qo_heads,
+                num_kv_heads,
+                head_dim,
+                page_size,
+                causal=True,
+                q_data_type=dtype,
+                kv_data_type=dtype,
+                prefix_len_ptr=torch.tensor(
+                    [prefix_len], dtype=torch.uint32, device="cuda"
+                ),
+                token_pos_in_items_ptr=token_pos_in_items,
+                token_pos_in_items_len=qo_len,
+                max_item_len_ptr=torch.tensor(
+                    [item_len], dtype=torch.uint16, device="cuda"
+                ),
+                disable_split_kv=True,
+            )
+            outputs.append(wrapper.run(q, kv_data))
+        torch.testing.assert_close(
+            outputs[1], outputs[0], rtol=0, atol=0, msg=f"prefix_len={prefix_len}"
+        )
+
+
 @pytest.mark.parametrize("batch_size", [1, 4])
 @pytest.mark.parametrize("kv_len", [128, 256])
 @pytest.mark.parametrize("qo_len", [64, 128])

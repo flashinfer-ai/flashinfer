@@ -4655,6 +4655,10 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
                 : 0;
         const uint32_t next_packed_page_iter_base =
             packed_page_iter_base + (1 + prefetch_skip_step) * CTA_TILE_KV;
+        // Must include the MIS skip like the page base above, so the chunk_size predicate of the
+        // next-tile loads zero-fills rows past the end of a skipped-to tile instead of loading
+        // them.
+        const uint32_t next_kv_idx_base = (iter + 1 + prefetch_skip_step) * CTA_TILE_KV;
         if constexpr (!KTraits::USE_KV_SHARED_SMEM) {
           packed_page_iter_base = next_packed_page_iter_base;
 #pragma unroll
@@ -4795,18 +4799,18 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
           cp_async::wait_group<0>();
         } else {
           page_produce_kv<false, KTraits>(&smem_storage, &k_smem_offset_w, paged_kv.k_data,
-                                          (iter + 1) * CTA_TILE_KV, thr_local_kv_offset_k,
-                                          chunk_size, warp_idx, lane_idx);
-          page_produce_kv_sf<false, KTraits>(
-              &smem_storage, maybe_k_cache_sf, packed_page_iter_base,
-              last_indptr * (uint32_t)paged_kv.page_size, kv_head_idx, k_sf_stride_page,
-              k_sf_stride_h, k_sf_stride_n, paged_kv.page_size, paged_kv.indices,
-              (iter + 1) * CTA_TILE_KV, chunk_size, warp_idx, lane_idx);
+                                          next_kv_idx_base, thr_local_kv_offset_k, chunk_size,
+                                          warp_idx, lane_idx);
+          page_produce_kv_sf<false, KTraits>(&smem_storage, maybe_k_cache_sf, packed_page_iter_base,
+                                             last_indptr * (uint32_t)paged_kv.page_size,
+                                             kv_head_idx, k_sf_stride_page, k_sf_stride_h,
+                                             k_sf_stride_n, paged_kv.page_size, paged_kv.indices,
+                                             next_kv_idx_base, chunk_size, warp_idx, lane_idx);
           page_produce_kv_token_head_sf<false, KTraits>(
               &smem_storage, reinterpret_cast<const float*>(maybe_k_cache_sf),
               packed_page_iter_base, last_indptr * (uint32_t)paged_kv.page_size, kv_head_idx,
               k_sf_stride_page, k_sf_stride_h, k_sf_stride_n, paged_kv.page_size, paged_kv.indices,
-              (iter + 1) * CTA_TILE_KV, chunk_size, warp_idx, lane_idx);
+              next_kv_idx_base, chunk_size, warp_idx, lane_idx);
           cp_async::commit_group();
           cp_async::wait_group<1>();
         }
@@ -4850,35 +4854,35 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
         if constexpr (KTraits::USE_KV_SHARED_SMEM) {
           page_produce_kv_on_the_fly<false, KTraits>(
               &smem_storage, &k_smem_offset_w, paged_kv.k_data, paged_kv,
-              next_packed_page_iter_base, last_indptr, kv_head_idx, (iter + 1) * CTA_TILE_KV,
-              chunk_size, warp_idx, lane_idx);
+              next_packed_page_iter_base, last_indptr, kv_head_idx, next_kv_idx_base, chunk_size,
+              warp_idx, lane_idx);
           page_produce_kv_token_head_sf<false, KTraits>(
               &smem_storage, reinterpret_cast<const float*>(maybe_k_cache_sf),
               next_packed_page_iter_base, last_indptr * (uint32_t)paged_kv.page_size, kv_head_idx,
               k_sf_stride_page, k_sf_stride_h, k_sf_stride_n, paged_kv.page_size, paged_kv.indices,
-              (iter + 1) * CTA_TILE_KV, chunk_size, warp_idx, lane_idx);
+              next_kv_idx_base, chunk_size, warp_idx, lane_idx);
           cp_async::commit_group();
           packed_page_iter_base = next_packed_page_iter_base;
         } else {
           if constexpr (SAME_KV_STRIDES) {
             page_produce_kv<true, KTraits>(&smem_storage, &v_smem_offset_w, paged_kv.v_data,
-                                           (iter + 1) * CTA_TILE_KV, thr_local_kv_offset_k,
-                                           chunk_size, warp_idx, lane_idx);
+                                           next_kv_idx_base, thr_local_kv_offset_k, chunk_size,
+                                           warp_idx, lane_idx);
           } else {
             page_produce_kv<true, KTraits>(&smem_storage, &v_smem_offset_w, paged_kv.v_data,
-                                           (iter + 1) * CTA_TILE_KV, thr_local_kv_offset_v,
-                                           chunk_size, warp_idx, lane_idx);
+                                           next_kv_idx_base, thr_local_kv_offset_v, chunk_size,
+                                           warp_idx, lane_idx);
           }
-          page_produce_kv_sf<true, KTraits>(
-              &smem_storage, maybe_v_cache_sf, packed_page_iter_base,
-              last_indptr * (uint32_t)paged_kv.page_size, kv_head_idx, v_sf_stride_page,
-              v_sf_stride_h, v_sf_stride_n, paged_kv.page_size, paged_kv.indices,
-              (iter + 1) * CTA_TILE_KV, chunk_size, warp_idx, lane_idx);
+          page_produce_kv_sf<true, KTraits>(&smem_storage, maybe_v_cache_sf, packed_page_iter_base,
+                                            last_indptr * (uint32_t)paged_kv.page_size, kv_head_idx,
+                                            v_sf_stride_page, v_sf_stride_h, v_sf_stride_n,
+                                            paged_kv.page_size, paged_kv.indices, next_kv_idx_base,
+                                            chunk_size, warp_idx, lane_idx);
           page_produce_kv_token_head_sf<true, KTraits>(
               &smem_storage, reinterpret_cast<const float*>(maybe_v_cache_sf),
               packed_page_iter_base, last_indptr * (uint32_t)paged_kv.page_size, kv_head_idx,
               v_sf_stride_page, v_sf_stride_h, v_sf_stride_n, paged_kv.page_size, paged_kv.indices,
-              (iter + 1) * CTA_TILE_KV, chunk_size, warp_idx, lane_idx);
+              next_kv_idx_base, chunk_size, warp_idx, lane_idx);
           cp_async::commit_group();
         }
       }
