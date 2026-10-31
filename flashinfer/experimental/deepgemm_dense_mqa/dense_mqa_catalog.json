@@ -9837,6 +9837,16 @@
                 "cake_deepgemm_dense_mqa_72ba84de495cdb32a8de"
               ]
             ]
+          },
+          {
+            "kv_max": 32768,
+            "max_queries": 36,
+            "stages": [
+              [
+                "logits",
+                "cake_deepgemm_dense_mqa_72ba84de495cdb32a8de"
+              ]
+            ]
           }
         ]
       }

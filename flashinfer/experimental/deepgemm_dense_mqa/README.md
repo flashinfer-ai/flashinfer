@@ -32,7 +32,8 @@ FP8 `le32` (warp scan, `1 < Q < 128`) / `le768` (CTA scan, `128 < Q <= 3072`) qu
 first-tile L2 prefetch -- identical logits and schedule words -- on the forms the per-architecture list
 `fp4.first_tile_prefetch_forms[arch]` names: `q1` on both architectures, `le32` on sm_103a only (one route
 `fp4:le32:short`, whose route record binds the prefetch program on sm_103a and the plain warp-scan program on
-sm_100a; its sm_100a stage bucket launches the warp-scan text with the prefetch for `K <= 4096`), and `qle1024` on both: the FP4 `le1024` class is then served as `fp4:qle1024:short` for
+sm_100a; its sm_100a stage buckets launch the warp-scan text with the prefetch for `K <= 4096`, and for
+`K <= 32768` when `Q <= 36`), and `qle1024` on both: the FP4 `le1024` class is then served as `fp4:qle1024:short` for
 `128 < Q <= fp4.first_tile_prefetch_max_queries_scan1024` -- the same CTA-scan program with the prefetch -- and as
 `fp4:le1024:short` above that query count) -- or `qle`, the fused
 tiered texts `fp8:qle128:short` (`1 < Q <= 128`, `K <= fused_qle128_max_kv`) and
@@ -278,14 +279,15 @@ schedule-meta producer routes `paged:fp8:meta:v<N>` add their launch geometry: `
 A `:kvsplit` or `:short` route record may also carry `stage_buckets` (optional; the schema stays `dense_mqa.v13`:
 a reader that ignores the key launches `stages`, and each bucket program computes the same logits and schedule words as
 the record's program): `{arch: [{"kv_max": K, "stages": [[stage, program], ...]}, ...]}`, per architecture a list in
-strictly increasing `kv_max`. A plan on `arch` whose KV length `K = kv.shape[0]` is at most an entry's `kv_max` launches
-the first such entry's `stages`; any other K launches the record's `stages`. An entry keeps the record's stage names and
+strictly increasing `kv_max`; an entry may also spell `"max_queries": Q`. A plan on `arch` whose KV length
+`K = kv.shape[0]` is at most an entry's `kv_max` (and whose query count is at most the entry's `max_queries`, where it
+spells one) launches the first such entry's `stages`; any other plan launches the record's `stages`. An entry keeps the record's stage names and
 order and names, per stage, on a `:kvsplit` route of the `full` kind the program the route's `partial`-kind twin (the
 same name with `partial` for `full`) launches on `arch` -- a program that handles every query count of the full kind --
 and on a `:kvsplit` route of the `partial` kind or a `:short` route a program of its own that no route's `stages` name, each with the record's host call
 (`arg_plan`, `compile_flags`, `ffi_entry`, `kind`, `role`, `standalone`). The route name, its admission, its K rule
 (`kv_min`, `kv_alignment`) and its metadata buffer are the record's; no fallback of `served_route` lands on a
-`:kvsplit` route. `route_stages(record, arch, K)` applies the rule; `program_names(route, arch)` lists the record's
+`:kvsplit` route. `route_stages(record, arch, K, queries)` applies the rule; `program_names(route, arch)` lists the record's
 programs, then the bucket programs.
 Routes: 32 heads `fp8:q1:short`, `fp8:q1`, `fp8:q128:short`, `fp8:{full,partial}:le32:short`, `fp8:{full,partial}:le768:short`,
 `fp8:qle128:short` (one `logits` stage, the program `fp8_fused_qle128` -- bound per architecture since v13: the
@@ -296,7 +298,7 @@ published order on both architectures),
 `128 < Q <= 2048`), `fp8:{full,partial}:<tier>`, `fp4:q1:short`, `fp4:q1`, `fp4:le32:short` (one `logits` stage whose
 program is bound per architecture: the warp-scan text with the first-tile L2 prefetch where
 `fp4.first_tile_prefetch_forms[arch]` lists `le32` -- sm_103a -- and without it elsewhere -- sm_100a, whose
-`stage_buckets` launch the prefetch text for `K <= 4096`), `fp4:qle1024:short` (one
+`stage_buckets` launch the prefetch text for `K <= 4096`, and for `K <= 32768` when `Q <= 36`), `fp4:qle1024:short` (one
 `logits` stage, the program `fp4_fused_scan1024_pf`: the 1024-block CTA-scan text with the first-tile L2 prefetch, for
 `128 < Q <= fp4.first_tile_prefetch_max_queries_scan1024` where the forms list `qle1024`), `fp4:le1024:short` (the same class
 above that query count, program `fp4_fused_scan1024`), `fp4:<tier>`
