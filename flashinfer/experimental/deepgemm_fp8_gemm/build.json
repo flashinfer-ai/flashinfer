@@ -52,14 +52,14 @@
     }
   },
   "generator": {
-    "cake_revision": "ec8ee046ea9f8691145091f7fff60fe83f024376",
-    "cuda": "13.4.92",
-    "rendered_at": "2026-10-20T23:25:25Z"
+    "cake_revision": "2aa3949d9e5ccfe1fc51fe6e2a50f562a1155c4a",
+    "cuda": "13.5.0",
+    "rendered_at": "2026-10-24T05:41:33Z"
   },
   "libraries": [
     {
       "arch": "sm_100a",
-      "closure_sha256": "a7a723edf016c223d293309cd05c82ac341bac57b3c49333c3542676b74d61c6",
+      "closure_sha256": "74aa65210d335baa6950a647b44d67b350b1b8b9ce472590880694a177f78081",
       "entry": "run",
       "gencode": "-gencode=arch=compute_100a,code=sm_100a",
       "min_cuda": "12.8",
@@ -69,7 +69,7 @@
       "path": "aot/cake_deepgemm_fp8_gemm_18870a6ac8a0a8be9883_sm_100a.so",
       "sha256": {
         "csrc/cake_deepgemm_fp8_gemm_18870a6ac8a0a8be9883_binding.cu": "98adb7af1fc2297b1727233e3715d9c31dd0255f78011e938f36712563febd92",
-        "csrc/cake_deepgemm_fp8_gemm_18870a6ac8a0a8be9883_kernel.cu": "672a14441295a8988633e90d75fd8c80b383a25a9f4b051682d2ec3469034833"
+        "csrc/cake_deepgemm_fp8_gemm_18870a6ac8a0a8be9883_kernel.cu": "d14760ba92d00f1f39be1f65e8d50161c232fefe4d1e873d7969baf7c3879ccf"
       },
       "sources": [
         "csrc/cake_deepgemm_fp8_gemm_18870a6ac8a0a8be9883_kernel.cu",
@@ -78,7 +78,7 @@
     },
     {
       "arch": "sm_103a",
-      "closure_sha256": "138c13a02eef1549800ce8435be1ea2597e2f26056de332316e245968411dcd2",
+      "closure_sha256": "7c51cdcc18db52aae294bd1cfd06848001b9532c4acc8fc449b916d738533465",
       "entry": "run",
       "gencode": "-gencode=arch=compute_103a,code=sm_103a",
       "min_cuda": "12.9",
@@ -88,7 +88,7 @@
       "path": "aot/cake_deepgemm_fp8_gemm_18870a6ac8a0a8be9883_sm_103a.so",
       "sha256": {
         "csrc/cake_deepgemm_fp8_gemm_18870a6ac8a0a8be9883_binding.cu": "98adb7af1fc2297b1727233e3715d9c31dd0255f78011e938f36712563febd92",
-        "csrc/cake_deepgemm_fp8_gemm_18870a6ac8a0a8be9883_kernel.cu": "672a14441295a8988633e90d75fd8c80b383a25a9f4b051682d2ec3469034833"
+        "csrc/cake_deepgemm_fp8_gemm_18870a6ac8a0a8be9883_kernel.cu": "d14760ba92d00f1f39be1f65e8d50161c232fefe4d1e873d7969baf7c3879ccf"
       },
       "sources": [
         "csrc/cake_deepgemm_fp8_gemm_18870a6ac8a0a8be9883_kernel.cu",
@@ -97,7 +97,7 @@
     },
     {
       "arch": "sm_100a",
-      "closure_sha256": "06d7225941f209ab9e8662e96002e368b15cb490e734c30049dcec9589acfaa5",
+      "closure_sha256": "a47683028f346309b56d22e3f20208a15f2892be1a65ca9695e21dd218153497",
       "entry": "run",
       "gencode": "-gencode=arch=compute_100a,code=sm_100a",
       "min_cuda": "12.8",
@@ -107,7 +107,7 @@
       "path": "aot/cake_deepgemm_fp8_gemm_3806a6e9116000fd4200_sm_100a.so",
       "sha256": {
         "csrc/cake_deepgemm_fp8_gemm_3806a6e9116000fd4200_binding.cu": "069f4eb1c02a78c6e4476bcadac03768e6071551b508e7e922054d10a5ddaee7",
-        "csrc/cake_deepgemm_fp8_gemm_3806a6e9116000fd4200_kernel.cu": "98819a124177a806affd541a447864b64907ef108fff425f6df3f8a227d5dc00"
+        "csrc/cake_deepgemm_fp8_gemm_3806a6e9116000fd4200_kernel.cu": "2e0053ae4be24c84723e7239136f1fab9db5a15730a6b5bd99e74a743b9811bc"
       },
       "sources": [
         "csrc/cake_deepgemm_fp8_gemm_3806a6e9116000fd4200_kernel.cu",
@@ -116,7 +116,7 @@
     },
     {
       "arch": "sm_103a",
-      "closure_sha256": "11b36700c19049e0580a0046619192ae5faed8526909ce3466d9a06841bf12e7",
+      "closure_sha256": "0ff32f28c70f486ad9abb0654303288d874d2be769e1591d52f6d91277741383",
       "entry": "run",
       "gencode": "-gencode=arch=compute_103a,code=sm_103a",
       "min_cuda": "12.9",
@@ -126,7 +126,7 @@
       "path": "aot/cake_deepgemm_fp8_gemm_3806a6e9116000fd4200_sm_103a.so",
       "sha256": {
         "csrc/cake_deepgemm_fp8_gemm_3806a6e9116000fd4200_binding.cu": "069f4eb1c02a78c6e4476bcadac03768e6071551b508e7e922054d10a5ddaee7",
-        "csrc/cake_deepgemm_fp8_gemm_3806a6e9116000fd4200_kernel.cu": "98819a124177a806affd541a447864b64907ef108fff425f6df3f8a227d5dc00"
+        "csrc/cake_deepgemm_fp8_gemm_3806a6e9116000fd4200_kernel.cu": "2e0053ae4be24c84723e7239136f1fab9db5a15730a6b5bd99e74a743b9811bc"
       },
       "sources": [
         "csrc/cake_deepgemm_fp8_gemm_3806a6e9116000fd4200_kernel.cu",
