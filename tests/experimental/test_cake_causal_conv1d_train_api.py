@@ -45,10 +45,6 @@ import flashinfer.cake_causal_conv1d_train_kcp as kcp_facade
 import flashinfer.experimental.cake.cake_causal_conv1d_train as facade
 import flashinfer.experimental.cake.cake_causal_conv1d_train_backend as backend
 from flashinfer.api_logging import ExperimentalWarning
-from tests.test_helpers.cake_causal_conv1d_early_render import apply_to_package
-
-# Test-only: the early render's backward rules predate the required ``slots`` (the package applies no default).
-apply_to_package()
 
 SUPPORTED_CAPABILITIES = ((10, 0), (10, 3), (10, 7))
 SEED = 8066

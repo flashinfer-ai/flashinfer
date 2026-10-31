@@ -57,10 +57,6 @@ from tests.test_cake_causal_conv1d_det_train_kcp import (
     _problem,
     _reference,
 )
-from tests.test_helpers.cake_causal_conv1d_early_render import apply_to_package
-
-# Test-only: the early render's backward rules predate the required ``slots`` (the package applies no default).
-apply_to_package()
 
 REPEATS = 20
 NONDET = {"deterministic": False}
