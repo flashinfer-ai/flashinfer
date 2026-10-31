@@ -18,7 +18,7 @@ limitations under the License.
 
 Times the *complete operator* -- scoring, exact selection, ascending-id
 ordering, aligned scores and padding, including the workspace traffic -- of
-``flashinfer.experimental.cake_dsa_indexer`` against two torch + FlashInfer
+``flashinfer.experimental.cake_dsa_indexer_det`` against two torch + FlashInfer
 compositions of the same contract on representative rows (32 heads, head
 dimension 128, BF16 ``q`` / ``k``, FP32 ``w``, iid Gaussian inputs with a
 peaked variant):
@@ -72,7 +72,7 @@ only where ``narrow`` is registered for the row's fit); the recorded
 ``plan`` and workspace bytes are the forced policy's, see
 ``forced_policy``), ``cake_main`` / ``cake_main_nosample`` (a
 second copy of the package loaded from ``--main-package DIR``, e.g. the
-``flashinfer/experimental/cake_dsa_indexer``
+``flashinfer/experimental/cake_dsa_indexer_det``
 directory of a FlashInfer main checkout, in the same process: the package is
 self-contained -- relative imports, ``Path(__file__)`` manifest, JIT names
 salted by its own closure digests -- so both versions run on the same input
@@ -109,7 +109,7 @@ Usage::
     python benchmarks/bench_cake_dsa_indexer.py [--rows P1 S2 ...] [--arms cake,chunked_pipeline,materialized_fp32]
         [--reps 20] [--strided-k] [--verify] [--json out.json]
     python benchmarks/bench_cake_dsa_indexer.py --rows sink --arms cake,cake_nosample,cake_main,cake_main_nosample
-        --main-package /path/to/main/flashinfer/experimental/cake_dsa_indexer --cupti-required --json out.json
+        --main-package /path/to/main/flashinfer/experimental/cake_dsa_indexer_det --cupti-required --json out.json
     python benchmarks/bench_cake_dsa_indexer.py --rows sink --arms cake,cake_far,cake_aa,cake_far_aa --cupti-required --json out.json
     python benchmarks/bench_cake_dsa_indexer.py --rows sink --arms cake,cake_wide,cake_l6,cake_pair_l6,cake_wide_c1 --cupti-required --json out.json
 """
@@ -134,7 +134,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import flashinfer  # noqa: E402
 from flashinfer.api_logging import ExperimentalWarning  # noqa: E402
-from flashinfer.experimental.cake_dsa_indexer import cake_backend  # noqa: E402
+from flashinfer.experimental.cake_dsa_indexer_det import cake_backend  # noqa: E402
 from flashinfer.testing import bench_gpu_time  # noqa: E402
 from flashinfer.topk import TopKTieBreak  # noqa: E402
 from tests.test_helpers import cake_dsa_indexer_reference as ref  # noqa: E402
@@ -704,9 +704,17 @@ def row_extra(inputs) -> dict:
     return {}
 
 
+def backend_api(backend, name: str):
+    """The callable ``name`` of ``backend``; a baseline package copy that predates the ``_det`` names (see
+    ``--main-package``) provides the same callable under its previous name (``plan_dsa_indexer_det_topk`` ->
+    ``plan_dsa_indexer_topk``)."""
+    fn = getattr(backend, name, None)
+    return fn if fn is not None else getattr(backend, name.replace("_det", "", 1))
+
+
 def plan_record(backend, inputs, knobs: dict) -> dict:
     """The host plan of ``backend`` for ``inputs`` under ``knobs`` (the record of truth of what each arm ran)."""
-    plan = backend.plan_dsa_indexer_topk(
+    plan = backend_api(backend, "plan_dsa_indexer_det_topk")(
         inputs.num_queries,
         inputs.num_keys,
         inputs.num_segments,
@@ -739,7 +747,7 @@ def forced_policy(backend, overrides: dict):
     """Rebind ``backend.policy_for`` to the architecture's registry record with ``overrides`` applied.
 
     The forced-dispatch arms measure the same package under another host dispatch rule without touching it:
-    ``plan_dsa_indexer_topk`` and ``prepare_dsa_indexer_topk`` look ``policy_for`` up on the module at every call, so
+    ``plan_dsa_indexer_det_topk`` and ``prepare_dsa_indexer_det_topk`` look ``policy_for`` up on the module at every call, so
     the workspace bound, the plan record and the prepared launches of an arm built inside this scope all follow the
     forced policy (``DispatchPolicy.from_record`` validates the record as it does the registry's); the original
     ``functools.cache`` function is restored on exit.
@@ -779,7 +787,9 @@ class CakeArm(Arm):
             else contextlib.nullcontext()
         )
         with scope:  # one scope: the workspace bound, the plan record and prepare see the same policy
-            self.workspace_bytes = self.backend.dsa_indexer_workspace_size(
+            self.workspace_bytes = backend_api(
+                self.backend, "dsa_indexer_det_workspace_size"
+            )(
                 inputs.num_queries,
                 inputs.num_keys,
                 inputs.num_segments,
@@ -797,7 +807,7 @@ class CakeArm(Arm):
                 (inputs.num_queries, inputs.top_k), dtype=torch.float32, device=dev
             )
             self.plan = plan_record(self.backend, inputs, self.knobs)
-            self.runner = self.backend.prepare_dsa_indexer_topk(
+            self.runner = backend_api(self.backend, "prepare_dsa_indexer_det_topk")(
                 inputs.q,
                 inputs.k,
                 inputs.w,
@@ -1168,7 +1178,7 @@ def main():
     parser.add_argument(
         "--main-package",
         default=None,
-        help="directory of a second copy of the package (e.g. a FlashInfer main checkout's flashinfer/experimental/cake_dsa_indexer) for the cake_main arms",
+        help="directory of a second copy of the package (e.g. a FlashInfer main checkout's flashinfer/experimental/cake_dsa_indexer_det) for the cake_main arms",
     )
     parser.add_argument(
         "--cupti-required",
