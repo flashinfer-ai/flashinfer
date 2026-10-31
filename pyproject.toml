@@ -105,6 +105,7 @@ exclude = [
 "flashinfer.experimental.cake_kda_det_train_kcp" = ["csrc/**", "build.json", "build.test.json"]
 "flashinfer.experimental.cake_gdn_det_train_kcp" = ["csrc/**", "build.json", "build.test.json"]
 "flashinfer.experimental.cake_gdn_det_train" = ["csrc/**", "build.json"]
+"flashinfer.experimental.cake.cake_gdn_train" = ["csrc/**", "build.json"]
 "flashinfer.experimental.cake_gqa_train" = ["csrc/**", "build.json"]
 "flashinfer.experimental.cake_rubin_mla_nvfp4_decode" = ["csrc/**", "build.json"]
 "flashinfer.experimental.cake_lm_head_det_loss" = ["csrc/**", "build.json"]
