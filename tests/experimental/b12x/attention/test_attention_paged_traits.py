@@ -71,7 +71,9 @@ def test_paged_decode_fp8_traits_match_flashinfer_shape_rules() -> None:
     assert traits.shared_storage_bytes == 66048
 
 
-def test_paged_extend_fp8_traits_expand_kv_tile_without_duplicate_bf16_cache() -> None:
+def test_paged_extend_fp8_traits_expand_kv_tile_without_duplicate_bf16_cache(
+    monkeypatch,
+) -> None:
     q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q = _make_inputs(
         q_seqlens=[6, 5, 7, 4],
         cache_seqlens=[97, 81, 113, 68],
@@ -84,6 +86,17 @@ def test_paged_extend_fp8_traits_expand_kv_tile_without_duplicate_bf16_cache() -
         cache_seqlens,
         cu_seqlens_q,
     )
+    # The KV tile grows with shared memory; pin the SM12x limits so the
+    # expectation does not follow the CI GPU (228 KiB on SM90/SM100).
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda _device: SimpleNamespace(
+            shared_memory_per_multiprocessor=102400,
+            shared_memory_per_block_optin=101376,
+        ),
+    )
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _device: (12, 0))
     traits = select_paged_forward_traits_from_plan(plan)
 
     assert traits.cta_tile_q == 64
@@ -95,7 +108,16 @@ def test_paged_extend_fp8_traits_expand_kv_tile_without_duplicate_bf16_cache() -
     assert traits.shared_storage_bytes == 49152
 
 
-def test_paged_fp8_traits_use_more_kv_mmas_than_bf16_traits() -> None:
+def test_paged_fp8_traits_use_more_kv_mmas_than_bf16_traits(monkeypatch) -> None:
+    # Pin the SM12x shared-memory limits, as above.
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda _device: SimpleNamespace(
+            shared_memory_per_multiprocessor=102400,
+            shared_memory_per_block_optin=101376,
+        ),
+    )
     fp8_traits = select_paged_forward_traits(
         cta_tile_q=32,
         head_dim_qk=256,
