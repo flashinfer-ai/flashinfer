@@ -15,7 +15,8 @@ limitations under the License.
 """
 
 # The dense projection GEMM package's names: the canonical (det) names, the former names kept as aliases of the
-# same objects (functions, classes, modules), and no former spelling left in the generated registry, manifest or
+# same objects (functions, classes), the former import path (since #8069 the package with an explicit numerical mode,
+# whose default runs these canonical objects), and no former spelling left in the generated registry, manifest or
 # sources.  CPU only: nothing here launches a kernel.
 
 import importlib
@@ -75,7 +76,50 @@ def test_former_names_are_the_canonical_objects(former, canonical):
     assert obj.__name__ == canonical
     assert inspect.unwrap(obj).__name__ == canonical
     assert obj.__module__ == f"{PACKAGE}.cake_backend"
-    assert getattr(_module(FORMER_PACKAGE, "cake_backend"), former) is obj
+    former_backend = _module(FORMER_PACKAGE, "cake_backend")
+    assert former_backend.DETERMINISTIC_NAMES[former] == canonical
+    if inspect.isclass(obj):
+        assert getattr(former_backend, former) is obj
+    else:
+        entry = getattr(former_backend, former)
+        assert entry is not obj
+        assert inspect.signature(entry).parameters["deterministic"].default is True
+
+
+# former entry point -> its positional arguments (sentinels)
+ARITY = {
+    "dense_projection_gemm": 3,
+    "plan_dense_projection_gemm": 3,
+    "plan_router_fp32_gemm": 3,
+    "prepare_dense_projection_gemm": 3,
+    "prepare_projection_wgrad": 3,
+    "prepare_router_fp32_gemm": 3,
+    "projection_dgrad": 2,
+    "projection_forward": 2,
+    "projection_wgrad": 2,
+    "router_dgrad": 2,
+    "router_forward": 2,
+    "router_fp32_gemm": 3,
+    "router_wgrad": 2,
+    "split_fp32_to_bf16x3_": 3,
+}
+
+
+@pytest.mark.parametrize("former", sorted(ARITY))
+def test_the_former_path_defaults_to_the_canonical_object(monkeypatch, former):
+    """The default of the former path's entry point is the canonical object with the caller's arguments: the same
+    program, so the same bits (flashinfer-ai/flashinfer#8069 keeps the deterministic default)."""
+    calls = []
+    result = object()
+
+    def canonical(*args, **kwargs):
+        calls.append(args)
+        return result
+
+    monkeypatch.setattr(_module(PACKAGE, "cake_backend"), API[former], canonical)
+    args = tuple(object() for _ in range(ARITY[former]))
+    assert getattr(_module(FORMER_PACKAGE, "cake_backend"), former)(*args) is result
+    assert len(calls) == 1 and calls[0][: len(args)] == args
 
 
 def test_the_loader_keeps_its_former_name():
@@ -86,14 +130,12 @@ def test_the_loader_keeps_its_former_name():
 
 
 @pytest.mark.parametrize("name", MODULES)
-def test_the_former_package_path_names_the_same_modules(name):
-    assert _module(FORMER_PACKAGE, name) is _module(PACKAGE, name)
+def test_the_former_package_path_is_its_own_package(name):
+    """The former import path is the package with the numerical mode (its own modules and programs); the
+    canonical package never imports it."""
+    assert _module(FORMER_PACKAGE, name) is not _module(PACKAGE, name)
     former = importlib.import_module(FORMER_PACKAGE)
     assert Path(former.__file__).parent.name == "dense_projection_gemm"
-    assert not [
-        p for p in (Path(former.__file__).parent / "csrc").rglob("*") if p.is_file()
-    ]
-    assert not (Path(former.__file__).parent / "build.json").exists()
 
 
 def _former_lines(text: str) -> list[str]:
