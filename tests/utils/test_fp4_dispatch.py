@@ -4,6 +4,7 @@ from unittest.mock import Mock
 
 import pytest
 import torch
+from torch._subclasses.fake_tensor import FakeTensorMode
 
 from flashinfer import utils
 from flashinfer.quantization import fp4_quantization as fp4
@@ -22,6 +23,31 @@ def _quantize(name, x, backend, kwargs):
     if name == "nvfp4_quantize":
         kwargs = {"a_global_sf": torch.ones(1), **kwargs}
     return getattr(fp4, name)(x, backend=backend, **kwargs)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("backend", ["cuda", "cute-dsl"])
+def test_nvfp4_per_token_sf_vec_size_rejected_before_unsupported_arch(
+    monkeypatch, backend
+):
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 3)
+    capability_query = Mock(return_value=(9, 0))
+    monkeypatch.setattr(utils, "get_compute_capability", capability_query)
+
+    with FakeTensorMode():
+        x = torch.empty((2, 32), dtype=torch.bfloat16, device="cuda:3")
+        with pytest.raises(
+            ValueError,
+            match="Per-token NVFP4 quantization only supports sf_vec_size=16",
+        ):
+            _quantize(
+                "nvfp4_quantize",
+                x,
+                backend,
+                {"per_token_activation": True, "sf_vec_size": 32},
+            )
+
+    capability_query.assert_not_called()
 
 
 @pytest.mark.cpu_only
