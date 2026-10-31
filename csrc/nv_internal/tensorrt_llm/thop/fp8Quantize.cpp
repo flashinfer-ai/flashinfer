@@ -122,7 +122,8 @@ void mxfp8_quantize_host(TensorView x_fp32, TensorView fp8_tensor, TensorView sc
       local_amax *= (1.f / 448.0f);
 
       uint8_t scale_ue8m0 = float_to_ue8m0(local_amax);
-      auto const inv_scale = (scale_ue8m0 == 0) ? 1 : exp2f(127 - static_cast<float>(scale_ue8m0));
+      auto const inv_scale =
+          (local_amax == 0.0f) ? 0.0f : exp2f(127 - static_cast<float>(scale_ue8m0));
 
       scale_ue8m08sf_ptr[computeSFIndex(ti, group, data_shape[0], groups_per_hidden_dim, layout)] =
           scale_ue8m0;
@@ -161,9 +162,7 @@ void mxfp8_dequantize_host(TensorView value_e4m3, TensorView scale_ue8m08sf,
       uint8_t fp8_scale = scale_ue8m08sf_ptr[computeSFIndex(ti, group, data_shape[0],
                                                             groups_per_hidden_dim, layout)];
 
-      float scale_float;
-      uint32_t scale_float_u32 = uint32_t(fp8_scale) << 23;
-      memcpy(&scale_float, &scale_float_u32, sizeof(scale_float));
+      float scale_float = exp2f(static_cast<float>(fp8_scale) - 127.0f);
 
       for (int ki = 0; ki < sf_vec_size; ++ki) {
         uint8_t fp8_u8_repr = fp8_ptr[ki];

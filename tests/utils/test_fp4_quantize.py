@@ -405,18 +405,20 @@ def _is_cute_dsl_available():
         return False
 
 
+@pytest.mark.parametrize("backend", MXFP4_BACKENDS)
 @pytest.mark.parametrize("is_sf_swizzled_layout", [False, True])
 @torch.inference_mode()
-def test_mxfp4_cute_dsl_preserves_min_scale_blocks(
+def test_mxfp4_preserves_min_scale_blocks(
+    backend: str,
     is_sf_swizzled_layout: bool,
 ) -> None:
     if not torch.cuda.is_available() or not _is_fp4_supported(torch.device("cuda")):
         pytest.skip("MXFP4 quantization requires SM100 or newer")
-    if not _is_cute_dsl_available():
+    if backend == "cute-dsl" and not _is_cute_dsl_available():
         pytest.skip("CuTe-DSL is not available")
 
     values: torch.Tensor = torch.tensor(
-        [2, -2, 6, 12, 0, 0, 0, 0], dtype=torch.float64, device="cuda"
+        [2, -2, 6, 12, 0.5, -0.5, 8, 0], dtype=torch.float64, device="cuda"
     ) * (2.0**-127)
     x: torch.Tensor = values.to(torch.bfloat16).repeat_interleave(32).repeat((32, 1))
     torch.testing.assert_close(
@@ -425,7 +427,7 @@ def test_mxfp4_cute_dsl_preserves_min_scale_blocks(
 
     quantized, scales = mxfp4_quantize(
         a=x,
-        backend="cute-dsl",
+        backend=backend,
         sfLayout=(
             SfLayout.layout_128x4 if is_sf_swizzled_layout else SfLayout.layout_linear
         ),
@@ -436,7 +438,7 @@ def test_mxfp4_cute_dsl_preserves_min_scale_blocks(
         else scales.reshape((x.shape[0], -1))
     )
     expected_scales: torch.Tensor = torch.tensor(
-        [0, 0, 0, 1, 0, 0, 0, 0], dtype=torch.uint8, device="cuda"
+        [0, 0, 0, 1, 0, 0, 1, 0], dtype=torch.uint8, device="cuda"
     ).expand_as(linear_scales)
     torch.testing.assert_close(
         actual=linear_scales, expected=expected_scales, rtol=0, atol=0

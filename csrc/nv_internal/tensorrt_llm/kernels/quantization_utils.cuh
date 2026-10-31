@@ -264,7 +264,7 @@ inline __device__ float reciprocal_approximate_ftz(float a) {
 
 __device__ __forceinline__ float exp2f_rcp(uint8_t exp) {
   constexpr uint32_t FP32_EXPONENT_BIAS = 127;
-  return (exp == 0) ? 1 : exp2f(FP32_EXPONENT_BIAS - static_cast<float>(exp));
+  return exp2f(FP32_EXPONENT_BIAS - static_cast<float>(exp));
 }
 
 __device__ __forceinline__ float e2m1_code_to_float(uint8_t code) {
@@ -471,8 +471,8 @@ __device__ std::conditional_t<CVT_ELTS_PER_THREAD == 16, uint64_t, uint32_t> cvt
   if constexpr (UE8M0_SF) {
     __nv_fp8_e8m0 tmp;
     // Scale the max value to the range of E2m1.
-    vecMax *= reciprocal_approximate_ftz(6.0f);
-    tmp.__x = __nv_cvt_float_to_e8m0(vecMax, __NV_SATFINITE, cudaRoundPosInf);
+    float const sfValue = vecMax * reciprocal_approximate_ftz(6.0f);
+    tmp.__x = __nv_cvt_float_to_e8m0(sfValue, __NV_SATFINITE, cudaRoundPosInf);
 
     fp8SFVal = tmp.__x;
     outputScale = vecMax != 0 ? exp2f_rcp(fp8SFVal) : 0.0f;
@@ -704,8 +704,8 @@ cvt_warp_fp16_to_fp4_with_vec_max(PackedVec<Type, CVT_ELTS_PER_THREAD>& vec, flo
   if constexpr (UE8M0_SF) {
     __nv_fp8_e8m0 tmp;
     // Scale the max value to the range of E2m1.
-    vecMax *= reciprocal_approximate_ftz(6.0f);
-    tmp.__x = __nv_cvt_float_to_e8m0(vecMax, __NV_SATFINITE, cudaRoundPosInf);
+    float const sfValue = vecMax * reciprocal_approximate_ftz(6.0f);
+    tmp.__x = __nv_cvt_float_to_e8m0(sfValue, __NV_SATFINITE, cudaRoundPosInf);
 
     fp8SFVal = tmp.__x;
     outputScale = vecMax != 0 ? exp2f_rcp(fp8SFVal) : 0.0f;
@@ -811,17 +811,17 @@ __device__ uint64_t cvt_warp_fp8_to_fp4(PackedVec<Type, CVT_ELTS_PER_THREAD>& ve
   if constexpr (UE8M0_SF) {
     __nv_fp8_e8m0 tmp;
     tmp.__x = __nv_cvt_float_to_e8m0(SFValue, __NV_SATFINITE, cudaRoundPosInf);
-    SFValueNarrow = static_cast<float>(tmp);
     fp8SFVal = tmp.__x;
+    outputScale = vecMax != 0 ? SFScaleVal * exp2f_rcp(fp8SFVal) : 0.0f;
   } else {
     // Here SFValue is always positive, so E4M3 is the same as UE4M3.
     __nv_fp8_e4m3 tmp = __nv_fp8_e4m3(SFValue);
     fp8SFVal = tmp.__x;
     SFValueNarrow = static_cast<float>(tmp);
+    // Get the output scale.
+    // Recipe: final_scale = reciprocal(fp32(fp8(SFValue * SFScaleVal))) * reciprocal(SFScaleVal))
+    outputScale = SFValue != 0 ? SFScaleVal * reciprocal_approximate_ftz(SFValueNarrow) : 0.0f;
   }
-  // Get the output scale.
-  // Recipe: final_scale = reciprocal(fp32(fp8(SFValue * SFScaleVal))) * reciprocal(SFScaleVal))
-  float outputScale = SFValue != 0 ? SFScaleVal * reciprocal_approximate_ftz(SFValueNarrow) : 0.0f;
 
   if (SFout) {
     // Write the SF to global memory (STG.8).
@@ -883,13 +883,11 @@ __device__ std::conditional_t<CVT_ELTS_PER_THREAD == 16, uint4, uint64_t> cvt_wa
   // Write the SF to global memory (STG.8).
   __nv_fp8_e8m0 tmpSFVal;
   tmpSFVal.__x = __nv_cvt_float_to_e8m0(SFValue, __NV_SATFINITE, cudaRoundPosInf);
-  SFValue = static_cast<float>(tmpSFVal);
   fp8SFVal = tmpSFVal.__x;
-  // Get the output scale (reciprocal of the SFValue).
-  // Note: Check SFValue != 0 (not vecMax != 0) because E8M0 conversion can underflow
-  // very small vecMax values to zero. Using vecMax != 0 would cause division by zero
-  // (reciprocal of 0 = infinity), leading to NaN when multiplied with denormal inputs.
-  float outputScale = SFValue != 0.f ? reciprocal_approximate_ftz(SFValue) : 0.0f;
+  // Byte 0 in UE8M0 encodes 2^-127, whose reciprocal 2^127 is a normal finite float32.
+  // Guard on vecMax != 0.f so all-zero blocks map to 0 while non-zero blocks at the
+  // minimum UE8M0 scale are scaled by 2^127 instead of flushing to zero under FTZ.
+  float outputScale = vecMax != 0.f ? exp2f_rcp(fp8SFVal) : 0.0f;
 
   if (SFout) {
     // Write the SF to global memory (STG.8).
