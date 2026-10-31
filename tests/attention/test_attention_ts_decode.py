@@ -2660,6 +2660,77 @@ _DECODE_PUBLIC_SURFACES = (
 )
 
 
+def test_decode_compile_identity_distinguishes_scale_argument_types():
+    from dataclasses import replace
+
+    from flashinfer.attention.prims_ts._compile_cache import _compile_cache_key
+    from flashinfer.attention.prims_ts.decode import _DecodeCompileSpec, _dtype_key
+
+    host_spec = _DecodeCompileSpec(
+        device_index=0,
+        config_items=(),
+        num_qo_heads=8,
+        num_kv_heads=2,
+        head_dim=128,
+        page_size=32,
+        q_dtype_key=_dtype_key(torch.float8_e4m3fn),
+        k_dtype_key=_dtype_key(torch.float8_e4m3fn),
+        v_dtype_key=_dtype_key(torch.float8_e4m3fn),
+        out_dtype_key=_dtype_key(torch.bfloat16),
+        packed_query=False,
+        max_active_clusters=1,
+        kv_prefix_mode="dynamic",
+        kv_lengths_mode="dynamic",
+    )
+    device_spec = replace(host_spec, use_device_scales=True)
+    assert host_spec != device_spec
+    host_key = _compile_cache_key(host_spec, "--opt-level 3")
+    device_key = _compile_cache_key(device_spec, "--opt-level 3")
+    assert host_key is not None and device_key is not None
+    assert host_key != device_key
+    assert device_key == _compile_cache_key(
+        replace(device_spec, device_index=1), "--opt-level 3"
+    )
+
+
+@pytest.mark.parametrize("validate", [False, True])
+@pytest.mark.parametrize(
+    "use_device_scales,softmax_scale,output_scale,error",
+    [
+        (True, None, 1.0, "softmax_scale must be"),
+        (True, 0.125, 1.0, "softmax_scale must be"),
+        (True, torch.ones(1), torch.ones(1), "softmax_scale must be"),
+        (False, torch.ones(1), 1.0, "device scales require"),
+        (False, 0.125, torch.ones(1), "device scales require"),
+    ],
+)
+def test_attention_ts_decode_scale_types_must_match_plan(
+    monkeypatch, validate, use_device_scales, softmax_scale, output_scale, error
+):
+    from types import SimpleNamespace
+
+    wrapper = BatchDecodePagedTSWrapper()
+    wrapper._plan_state = SimpleNamespace(
+        use_device_scales=use_device_scales, device=torch.device("cuda:0")
+    )
+
+    def no_host_read(*args, **kwargs):
+        raise AssertionError("scale type checks must not read tensor values")
+
+    monkeypatch.setattr(torch.Tensor, "__float__", no_host_read)
+    monkeypatch.setattr(torch.Tensor, "item", no_host_read)
+    with pytest.raises(ValueError, match=error):
+        wrapper.run(
+            None,
+            None,
+            None,
+            None,
+            softmax_scale=softmax_scale,
+            output_scale=output_scale,
+            validate=validate,
+        )
+
+
 def test_attention_ts_decode_wrapper_has_compile_oriented_contract() -> None:
     """Freeze the compile-oriented plan/run split."""
 
@@ -2719,6 +2790,7 @@ def test_attention_ts_decode_wrapper_has_compile_oriented_contract() -> None:
         "split_kv",
         "validate",
         "initialize_workspace",
+        "use_device_scales",
     )
     run_parameters = inspect.signature(BatchDecodePagedTSWrapper.run).parameters
     assert tuple(run_parameters) == (
@@ -2848,7 +2920,12 @@ def test_attention_ts_decode_public_surfaces_have_no_internal_tuning_knobs() -> 
     assert violations == []
 
 
-def test_attention_ts_decode_bound_wrapper_trace_uses_plan_state():
+@pytest.mark.parametrize(
+    "output_dtype,use_device_scales", [(torch.float16, False), (torch.bfloat16, True)]
+)
+def test_attention_ts_decode_bound_wrapper_trace_uses_plan_state(
+    output_dtype, use_device_scales
+):
     """Trace packed-Q shape and planned output dtype from the live wrapper."""
     from flashinfer.fi_trace import fi_trace
 
@@ -2863,6 +2940,10 @@ def test_attention_ts_decode_bound_wrapper_trace_uses_plan_state():
         "block_tables": torch.tensor(((0, -1), (1, 2)), dtype=torch.int32),
         "qo_indptr": torch.tensor((0, 2, 5), dtype=torch.int32),
     }
+
+    if use_device_scales:
+        kwargs["softmax_scale"] = torch.ones(1)
+        kwargs["output_scale"] = torch.ones(1)
 
     with pytest.raises(
         ValueError,
@@ -2882,7 +2963,7 @@ def test_attention_ts_decode_bound_wrapper_trace_uses_plan_state():
             "storage_page_size": 32,
             "packed_query": True,
             "seq_len_q": 3,
-            "out_dtype": torch.float16,
+            "out_dtype": output_dtype,
             "mask_type": "causal",
             "window_left": -1,
             "max_kv_len": 64,
@@ -2890,10 +2971,12 @@ def test_attention_ts_decode_bound_wrapper_trace_uses_plan_state():
             "kv_lengths_mode": "dynamic",
             "planned_seq_lens_kv_host": None,
             "planned_seq_lens_kv_device": None,
+            "use_device_scales": use_device_scales,
         },
     )()
     for required_name in (
         "seq_lens_kv",
+        *(("softmax_scale", "output_scale") if use_device_scales else ()),
         "block_tables",
         "qo_indptr",
     ):
@@ -2903,7 +2986,14 @@ def test_attention_ts_decode_bound_wrapper_trace_uses_plan_state():
             fi_trace(wrapper.run, **incomplete_kwargs)
 
     defn = fi_trace(wrapper.run, **kwargs)
-    assert defn["name"].startswith("prims_ts_decode_wrapper_tuple_fp16_output_packed_q")
+    dtype_suffix = "bf16" if output_dtype == torch.bfloat16 else "fp16"
+    assert defn["name"].startswith(
+        f"prims_ts_decode_wrapper_tuple_{dtype_suffix}_output_packed_q"
+    )
+    for name in ("softmax_scale", "output_scale"):
+        assert defn["inputs"][name].get("shape") == (
+            ["scale_size"] if use_device_scales else None
+        )
     assert defn["inputs"]["q"]["shape"] == [
         "total_q",
         "num_qo_heads",
@@ -2911,7 +3001,7 @@ def test_attention_ts_decode_bound_wrapper_trace_uses_plan_state():
     ]
     assert defn["outputs"]["output"] == {
         "shape": ["total_q", "num_qo_heads", "head_dim"],
-        "dtype": "float16",
+        "dtype": str(output_dtype).removeprefix("torch."),
         "param": "out",
     }
     assert defn["axes"]["max_q_len"]["value"] == 3
@@ -4989,6 +5079,7 @@ def test_attention_ts_decode_run_validate_false_skips_explicit_checks(
             "compiled_reducer": None,
             "planned_seq_lens_kv_host": None,
             "planned_seq_lens_kv_device": None,
+            "use_device_scales": False,
         },
     )()
     runtime = object()
@@ -5052,6 +5143,7 @@ def test_attention_ts_decode_run_validates_control_and_q_mode(
             "batch_size": 2,
             "planned_seq_lens_kv_host": None,
             "planned_seq_lens_kv_device": None,
+            "use_device_scales": False,
         },
     )()
     args = (object(), object(), object(), object())
@@ -5075,6 +5167,7 @@ def test_attention_ts_decode_run_validates_control_and_q_mode(
             "batch_size": 2,
             "planned_seq_lens_kv_host": None,
             "planned_seq_lens_kv_device": None,
+            "use_device_scales": False,
         },
     )()
     with pytest.raises(ValueError, match="qo_indptr cannot be used"):
