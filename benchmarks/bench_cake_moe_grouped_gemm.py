@@ -82,9 +82,11 @@ AUTOGRAD_OPS = OPS[3:]
 BLOCK_OPS = ("block", "block_es")
 AUTOGRAD_NOTES = {
     "step": "checkpointed 2 x fwd + bwd",
-    "step_es": "checkpointed fwd + bwd, early stop on",
+    "step_es": "checkpointed step, early stop on (the recompute skips the GEMM only "
+    "where its inputs are saved before it launches)",
     "block": "checkpointed gate_up, silu(a) * b, down: 2 x fwd + bwd",
-    "block_es": "checkpointed gate_up, silu(a) * b, down: fwd + bwd, early stop on",
+    "block_es": "checkpointed gate_up, silu(a) * b, down, early stop on (gate_up is "
+    "always recomputed; down only where its inputs are saved before it launches)",
 }
 E4_GROUPS = {
     112576: {

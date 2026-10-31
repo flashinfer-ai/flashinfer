@@ -27,7 +27,7 @@ limitations under the License.
 # ``CakeGroupedMm.apply`` returns, so autograd saves ``x``, ``w`` and ``offs``
 # before the GEMM runs, as it does for a built-in op: a non-reentrant
 # checkpoint with early stop on (the torch default) then skips the recomputed
-# GEMM when nothing after it in the checkpointed region saves a tensor.
+# GEMM when these are the last saves of the innermost checkpointed region.
 
 from __future__ import annotations
 
@@ -183,9 +183,9 @@ def cake_grouped_mm(
         ``torch.use_deterministic_algorithms(True)`` the backward raises the
         non-determinism alert (no fallback).  The forward GEMM runs after
         autograd saved ``x``, ``w`` and ``offs``: under a non-reentrant
-        checkpoint with early stop on, the recomputation skips it when no op
-        after it in the checkpointed region saves a tensor, as for a built-in
-        op.
+        checkpoint with early stop on, the recomputation skips it when these
+        are the last saves of the innermost checkpointed region, as for a
+        built-in op.
     """
     _require_deterministic_false(deterministic, "cake_grouped_mm")
     if x.dtype != torch.bfloat16 or w.dtype != torch.bfloat16:

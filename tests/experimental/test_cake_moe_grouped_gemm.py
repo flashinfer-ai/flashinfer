@@ -1503,11 +1503,7 @@ def _step(fn, leaves, grads, ckpt=None, early_stop=True, context_fn=None):
     and the backward, then the backward of the output(s) with ``grads``.  Returns
     ``(outputs, leaf gradients)``, both tuples, the outputs detached."""
     kwargs = {} if context_fn is None else {"context_fn": context_fn}
-    stop = (
-        contextlib.nullcontext()
-        if early_stop
-        else torch.utils.checkpoint.set_checkpoint_early_stop(False)
-    )
+    stop = torch.utils.checkpoint.set_checkpoint_early_stop(bool(early_stop))
     with stop:
         if ckpt is None:
             out = fn(*leaves)
