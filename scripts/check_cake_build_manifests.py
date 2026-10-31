@@ -492,6 +492,12 @@ PACKAGES: tuple[Package, ...] = (
         refs_generic,
     ),
     Package(
+        "flashinfer.experimental.dense_projection_gemm",
+        "flashinfer/experimental/dense_projection_gemm",
+        "cake_jit.py",
+        refs_generic,
+    ),
+    Package(
         "flashinfer.experimental.cake_stepfun_moe",
         "flashinfer/experimental/cake_stepfun_moe",
         "cake_jit.py",
