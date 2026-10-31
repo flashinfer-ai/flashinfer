@@ -81,10 +81,10 @@ from __future__ import annotations
 
 import functools
 import warnings
-from typing import Optional
+import weakref
+from typing import Callable, Optional
 
 import torch
-from torch.utils.weak import WeakIdKeyDictionary
 
 from . import cake_jit as _loader
 from .cake_jit import (
@@ -136,7 +136,11 @@ _LAYOUTS: dict[tuple, dict] = {}
 # its storage: retyping two slices of the workspace before every launch costs about 3 us of host time in front of
 # the launch.  They alias the workspace's storage, not the tensor (``Tensor.set_``, no view base), so an entry dies
 # with its workspace; an entry whose workspace's storage moved (``resize_`` / ``set_``) is rebuilt.
-_ACCUMULATOR_VIEWS: WeakIdKeyDictionary = WeakIdKeyDictionary()
+# ``id(workspace) -> (weak reference to the workspace, {layout key: (data_ptr, acc, work)})``: a lookup is one dict
+# hit and one weak-reference call (a ``WeakIdKeyDictionary`` builds a key object and runs Python-level hash and
+# equality on every lookup); an entry only serves the workspace its weak reference still names, and the reference's
+# callback drops the entry when the workspace dies.
+_ACCUMULATOR_VIEWS: dict[int, tuple[weakref.ref, dict]] = {}
 # The torch dtype of each accumulator / counter dtype name of a workspace rule.
 _TORCH_DTYPES = {
     "float32": torch.float32,
@@ -560,6 +564,21 @@ def cake_causal_conv1d_train_forward_workspace(
     return torch.zeros(nbytes // 4, dtype=torch.int32, device=torch.device(device))
 
 
+# torch's getter of the raw current-stream handle (``torch.cuda.current_stream(i).cuda_stream`` without building a
+# ``torch.cuda.Stream``); ``None`` on a torch build without it.
+_CURRENT_RAW_STREAM = getattr(torch._C, "_cuda_getCurrentRawStream", None)
+
+
+def _current_stream_handle(device_index: int) -> int:
+    """The handle of the device's current CUDA stream, the key of the package's per-stream workspaces: the value of
+    ``torch.cuda.current_stream(device_index).cuda_stream``, read without building a ``torch.cuda.Stream`` object
+    (about 1 us of host time in front of every launch that uses a package workspace)."""
+
+    if _CURRENT_RAW_STREAM is not None:
+        return int(_CURRENT_RAW_STREAM(device_index))
+    return int(torch.cuda.current_stream(device_index).cuda_stream)
+
+
 def _forward_work(
     workspace: object, words: int, *, device: torch.device, device_index: int
 ) -> Optional[torch.Tensor]:
@@ -593,7 +612,7 @@ def _forward_work(
         return None
     if torch.cuda.is_current_stream_capturing():
         return torch.zeros(words, dtype=torch.int32, device=device)
-    key = (device_index, int(torch.cuda.current_stream(device_index).cuda_stream))
+    key = (device_index, _current_stream_handle(device_index))
     held = _FORWARD_WORKSPACES.get(key)
     if held is None or held.numel() < words:
         held = torch.zeros(words, dtype=torch.int32, device=device)
@@ -637,6 +656,18 @@ def _storage_view(
     )
 
 
+def _drop_accumulator_views(ident: int) -> Callable[[weakref.ref], None]:
+    """The weak-reference callback of the ``_ACCUMULATOR_VIEWS`` entry of the workspace with ``id`` ``ident``: it
+    drops that entry, unless a later workspace with the same ``id`` already holds it."""
+
+    def drop(ref: weakref.ref) -> None:
+        hit = _ACCUMULATOR_VIEWS.get(ident)
+        if hit is not None and hit[0] is ref:
+            del _ACCUMULATOR_VIEWS[ident]
+
+    return drop
+
+
 def _accumulator_views(
     ws: torch.Tensor, layout: dict
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -651,10 +682,16 @@ def _accumulator_views(
         layout["work_words"],
     )
     ptr = ws.data_ptr()
-    per_layout = _ACCUMULATOR_VIEWS.get(ws)
-    if per_layout is None:
-        per_layout = _ACCUMULATOR_VIEWS[ws] = {}
+    ident = id(ws)
+    hit = _ACCUMULATOR_VIEWS.get(ident)
+    if hit is None or hit[0]() is not ws:
+        per_layout: dict = {}
+        _ACCUMULATOR_VIEWS[ident] = (
+            weakref.ref(ws, _drop_accumulator_views(ident)),
+            per_layout,
+        )
     else:
+        per_layout = hit[1]
         held = per_layout.get(key)
         if held is not None and held[0] == ptr:
             return held[1], held[2]
@@ -728,10 +765,7 @@ def _backward_accumulators(
         )
         return acc, work
     else:
-        key = (
-            device_index,
-            int(torch.cuda.current_stream(device_index).cuda_stream),
-        )
+        key = (device_index, _current_stream_handle(device_index))
         ws = _BACKWARD_WORKSPACES.get(key)
         if ws is None or ws.numel() < nbytes:
             ws = torch.zeros(nbytes, dtype=torch.uint8, device=device)

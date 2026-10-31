@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import gc
 import statistics
+import weakref
 
 import pytest
 import torch
@@ -994,10 +995,17 @@ def test_workspace_validation() -> None:
         )
 
 
+def _held_views(workspace: torch.Tensor) -> dict | None:
+    """The package's cached ``{layout key: (data_ptr, acc, work)}`` of ``workspace`` (``None`` without an entry)."""
+
+    hit = pkg._ACCUMULATOR_VIEWS.get(id(workspace))
+    return hit[1] if hit is not None and hit[0]() is workspace else None
+
+
 def test_workspace_views_are_built_once_per_workspace() -> None:
     """The ``acc`` / ``work`` tensors of a workspace are built once per layout and reused by later calls; they
     alias its storage but not the tensor, follow the storage when it moves, and are dropped with the
-    workspace."""
+    workspace; an entry left under the workspace's ``id`` by a dead workspace is never served."""
 
     S, C, docs = 1000, 1280, "perf"
     device = _device()
@@ -1013,7 +1021,7 @@ def test_workspace_views_are_built_once_per_workspace() -> None:
     for call in range(2):
         dx, dw, _ = _backward(x, w, cu, dy, workspace=workspace)
         _check_grads(dx, dw, None, refs, policy="bf16", label=f"call {call}")
-    held = pkg._ACCUMULATOR_VIEWS.get(workspace)
+    held = _held_views(workspace)
     assert held is not None and len(held) == 1
     ((ptr, acc, work),) = held.values()
     assert ptr == workspace.data_ptr()
@@ -1026,9 +1034,26 @@ def test_workspace_views_are_built_once_per_workspace() -> None:
     del moved
     dx, dw, _ = _backward(x, w, cu, dy, workspace=workspace)
     _check_grads(dx, dw, None, refs, policy="bf16", label="moved storage")
-    ((ptr, acc, work),) = pkg._ACCUMULATOR_VIEWS.get(workspace).values()
+    ((ptr, acc, work),) = _held_views(workspace).values()
     assert ptr == workspace.data_ptr()
     assert acc.untyped_storage().data_ptr() == workspace.untyped_storage().data_ptr()
+    assert int(torch.count_nonzero(workspace)) == 0
+    # The entry of a dead workspace under this workspace's id (an id reused before the entry was dropped), with
+    # views into other buffers: the call must not serve it but rebuild the views on this workspace.
+    dead = torch.empty(0)
+    ((key, _),) = held.items()
+    pkg._ACCUMULATOR_VIEWS[id(workspace)] = (
+        weakref.ref(dead),
+        {key: (workspace.data_ptr(), torch.zeros_like(acc), torch.zeros_like(work))},
+    )
+    del dead
+    assert pkg._ACCUMULATOR_VIEWS[id(workspace)][0]() is None
+    dx, dw, _ = _backward(x, w, cu, dy, workspace=workspace)
+    _check_grads(dx, dw, None, refs, policy="bf16", label="dead entry under the id")
+    ((ptr, acc, work),) = _held_views(workspace).values()
+    assert ptr == workspace.data_ptr()
+    assert acc.untyped_storage().data_ptr() == workspace.untyped_storage().data_ptr()
+    assert work.untyped_storage().data_ptr() == workspace.untyped_storage().data_ptr()
     assert int(torch.count_nonzero(workspace)) == 0
     del workspace, held, acc, work
     gc.collect()
