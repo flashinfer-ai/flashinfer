@@ -170,9 +170,7 @@ kernel_cake_rmsnorm_silu_gate_train_32301367ce4fa8110271(__nv_bfloat16* __restri
     int nblocks = (rows + 15) / 16;
     int bound = 0;
     if (nblocks <= num_bids) {
-        if (nblocks <= 64) {
-            bound = nblocks;
-        }
+        bound = nblocks;
     }
     int rest = nblocks - bound;
     int ticket = 2147483647;
@@ -343,6 +341,17 @@ kernel_cake_rmsnorm_silu_gate_train_32301367ce4fa8110271(__nv_bfloat16* __restri
                         (&zs_0[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_6[_pair]) & 0xffff0000u);
                     }
                 }
+#if __CUDA_ARCH__ == 1070
+#else
+            }
+            if (i + 1 < 1) {
+                int nrow_0 = (((u + 1) * 16 + group) < (rows - 1) ? ((u + 1) * 16 + group) : (rows - 1));
+                uint32_t nq_0 = (heads.divisor != 1) ? (__umulhi((uint32_t)((unsigned int)nrow_0), heads.multiplier) >> heads.shift_right) : (uint32_t)((unsigned int)nrow_0);
+                uint32_t nh_0 = (uint32_t)((unsigned int)nrow_0) - nq_0 * (uint32_t)(heads.divisor);
+                asm volatile("prefetch.global.L2 [%0];" :: "l"((uint64_t)(dy + ((long long)nq_0 * dy_tok + (long long)nh_0 * dy_head + (long long)col))));
+                asm volatile("prefetch.global.L2 [%0];" :: "l"((uint64_t)(x + ((long long)nq_0 * x_tok + (long long)nh_0 * x_head + (long long)col))));
+                asm volatile("prefetch.global.L2 [%0];" :: "l"((uint64_t)(z + ((long long)nq_0 * z_tok + (long long)nh_0 * z_head + (long long)col))));
+#endif
             }
             float total_0 = 0.0f;
             total_0 = __fmaf_rn(xs_0[0], xs_0[0], total_0);
@@ -943,8 +952,10 @@ kernel_cake_rmsnorm_silu_gate_train_32301367ce4fa8110271(__nv_bfloat16* __restri
         t_size = (t_size + 1) / 2;
         trips = trips + (t_rem + t_sl - 1) / t_sl;
     }
+    int claim_at = -1;
     #pragma unroll 1
     for (int it = 0; it < trips; it++) {
+        int half = it % 2 * 2;
         if (tid == 0) {
             int begin = 0;
             int count = 0;
@@ -988,22 +999,28 @@ kernel_cake_rmsnorm_silu_gate_train_32301367ce4fa8110271(__nv_bfloat16* __restri
             int e_size_7 = tab[30];
             begin = ((e_first_7 <= ticket) ? e_base_7 + (ticket - e_first_7) * e_size_7 : begin);
             count = ((e_first_7 <= ticket) ? e_size_7 : count);
+            ticket = 2147483647;
+            claim_at = -1;
             if (count > 0) {
-                ticket = 2147483647;
                 if (it < trips - 1) {
-                    unsigned int _atomic_fetch_add_110 = atomicAdd(&dw_done[1], 1);
-                    ticket = (int)_atomic_fetch_add_110;
+                    claim_at = count - 1;
                 }
             }
-            cell[0] = begin;
-            cell[1] = count;
+            cell[half] = begin;
+            cell[half + 1] = count;
         }
         __syncthreads();
-        int chunk_lo = cell[0];
-        int chunk_n = cell[1];
+        int chunk_lo = cell[half];
+        int chunk_n = cell[half + 1];
         if (chunk_n > 0) {
             #pragma unroll 1
             for (int i_1 = 0; i_1 < chunk_n; i_1++) {
+                if (tid == 0) {
+                    if (i_1 == claim_at) {
+                        unsigned int _atomic_fetch_add_110 = atomicAdd(&dw_done[1], 1);
+                        ticket = (int)_atomic_fetch_add_110;
+                    }
+                }
                 int u_1 = bound + chunk_lo + i_1;
                 int row_1 = u_1 * 16 + group;
                 int src_1 = ((row_1) < (rows - 1) ? (row_1) : (rows - 1));
@@ -1057,6 +1074,17 @@ kernel_cake_rmsnorm_silu_gate_train_32301367ce4fa8110271(__nv_bfloat16* __restri
                         }
                     }
                 }
+#if __CUDA_ARCH__ == 1070
+#else
+                if (i_1 + 1 < chunk_n) {
+                    int nrow_1 = (((u_1 + 1) * 16 + group) < (rows - 1) ? ((u_1 + 1) * 16 + group) : (rows - 1));
+                    uint32_t nq_1 = (heads.divisor != 1) ? (__umulhi((uint32_t)((unsigned int)nrow_1), heads.multiplier) >> heads.shift_right) : (uint32_t)((unsigned int)nrow_1);
+                    uint32_t nh_1 = (uint32_t)((unsigned int)nrow_1) - nq_1 * (uint32_t)(heads.divisor);
+                    asm volatile("prefetch.global.L2 [%0];" :: "l"((uint64_t)(dy + ((long long)nq_1 * dy_tok + (long long)nh_1 * dy_head + (long long)col))));
+                    asm volatile("prefetch.global.L2 [%0];" :: "l"((uint64_t)(x + ((long long)nq_1 * x_tok + (long long)nh_1 * x_head + (long long)col))));
+                    asm volatile("prefetch.global.L2 [%0];" :: "l"((uint64_t)(z + ((long long)nq_1 * z_tok + (long long)nh_1 * z_head + (long long)col))));
+                }
+#endif
                 float total_1 = 0.0f;
                 total_1 = __fmaf_rn(xs_1[0], xs_1[0], total_1);
                 total_1 = __fmaf_rn(xs_1[1], xs_1[1], total_1);
@@ -1620,7 +1648,6 @@ kernel_cake_rmsnorm_silu_gate_train_32301367ce4fa8110271(__nv_bfloat16* __restri
                 }
             }
         }
-        __syncthreads();
     }
     if (folded != 0) {
         fold[group * 128 + col] = fold[group * 128 + col] + (double)acc[0];

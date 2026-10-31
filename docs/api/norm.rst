@@ -98,8 +98,9 @@ took its ``det`` names. Every entry point takes the keyword ``deterministic``
   (``flashinfer.cake_rmsnorm_silu_gate_train_backend``, whose compute and
   workspace entry points take ``deterministic=False`` only): the same forward
   kernel and a one-kernel backward: ``dx`` and ``dz`` are the deterministic
-  backward's bits, and the CTAs take row blocks (past 64 blocks they claim
-  them in chunks from the workspace's claim counter) and add their FP64
+  backward's bits, and the CTAs take row blocks (each CTA its own block when
+  the grid has a CTA for every block; past one wave of CTAs they claim the
+  blocks in chunks from the workspace's claim counter) and add their FP64
   weight-gradient column sums into FP64 accumulators of the workspace in the
   order they finish. The claimed blocks, and so the FP32 partial sums, and that
   order depend on scheduling: the weight gradient can differ between calls,

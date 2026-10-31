@@ -18,11 +18,12 @@ non-deterministic backward (``deterministic=False``) beside a kernel resident
 on another stream (the concurrent-launch contract of issues #7038 and #7548).
 
 The forward launches a plain grid of independent CTAs.  The backward launches
-at most one wave of CTAs: with at most 64 row blocks each CTA takes its own
-block; past that the CTAs claim the blocks in chunks of consecutive blocks
-from the workspace's claim counter, chunks that shrink to single blocks at the
-end, so a CTA that starts late takes fewer blocks (one that becomes resident
-after every chunk was claimed takes none).  The CTAs add their weight-gradient
+at most one wave of CTAs: when the grid has a CTA for every row block, each
+CTA takes its own block; past one wave the CTAs claim every block in chunks of
+consecutive blocks from the workspace's claim counter, chunks that shrink to
+single blocks at the end, each CTA its next chunk as the last block of its
+current one starts, so a CTA that starts late takes fewer blocks (one that
+becomes resident after every chunk was claimed takes none).  The CTAs add their weight-gradient
 sums into FP64 accumulators and take a ticket on the arrival word; whichever
 CTA arrives last finishes the sum, and no CTA waits for another.  Beside a
 long-resident one-thread kernel on another stream each call must keep its
@@ -207,11 +208,15 @@ CARVEOUT_MAX_SHARED = 100
 PROPORTIONAL_SIDES = ((1, 128), (16, 640), (32, 640))
 PROPORTIONAL_BLOCKS_PER_CTA = (16, 160)
 PROPORTIONAL_RUNS = 7
-# PLACEHOLDER, provisional and not measured yet: the noise margin of busy /
-# alone over N / (N - k) plus one row block's share.  Set it from the re-probe
-# of the claiming backward on B200, GB300 and R200 (the largest measured excess
-# plus a noise margin), then record the probe hosts and jobs here.
-PROPORTIONAL_SLACK = 0.05
+# The noise margin of busy / alone over N / (N - k) plus one row block's
+# share.  Measured with this backward beside these tests' side kernels (1 x
+# 128, 16 x 640 and 32 x 640, default carveout) at 16 and 160 row blocks per
+# CTA, the median of 11 to 13 alternating alone / busy pairs: the largest
+# excess was -0.0074 on B200 (148 SMs; nsc-svg-slurm-1-gpu-129, job 2451658),
+# -0.0065 on GB300 (152 SMs; nvl72d148-T17, job 1459208) and -0.0084 on R200
+# (212 SMs; hecate0089, job 920765), and the largest excess of a single pair
+# +0.0081 (R200).  0.02 is that worst pair plus a margin for noise.
+PROPORTIONAL_SLACK = 0.02
 # The backend suite's weight-gradient budget:
 # |dw - dw64| <= |dw64| * 2^-7 + sum|terms| * 2^-20.
 DW_REL_TOL = 2.0**-7

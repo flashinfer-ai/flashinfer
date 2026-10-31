@@ -28,8 +28,9 @@ Numerical contract against the deterministic package: the forward is the
 deterministic package's forward kernel rendered here (it has no reduction, so
 its bits are the same); the backward is one kernel that writes ``dx`` and ``dz``
 exactly as the deterministic backward does, sums the weight gradient of the
-row blocks each CTA takes (past 64 blocks, the chunks it claims) in FP32 runs
-of at most 16 rows folded into FP64, and adds each CTA's FP64 column sums into
+row blocks each CTA takes (its own block when the grid has a CTA for every
+block, else the chunks it claims) in FP32 runs of at most 16 rows folded into
+FP64, and adds each CTA's FP64 column sums into
 FP64 accumulators of the workspace with atomics; the CTA that arrives last
 rounds the sum once into ``dw`` and zeroes the workspace.  The claimed blocks,
 and so the FP32 runs, and the order of the FP64 additions depend on
@@ -61,8 +62,8 @@ Host design (the input layout rules are the deterministic package's):
   the accumulators, then one 8-byte element holding the two 32-bit words of
   ``dw_done``, its first four bytes the arrival ticket and its last four the
   claim counter: ``4 * 128 + 1`` elements, 4104 bytes, for every shipped
-  backward module.  Every backward launch takes a ticket (and past 64 row
-  blocks claims its blocks from the counter), also one with
+  backward module.  Every backward launch takes a ticket (and past one wave
+  of row blocks claims its blocks from the counter), also one with
   ``compute_grad_weight=False``, so every backward launch uses a workspace.
   The kernel leaves all of it zero, so a workspace zeroed once serves every
   later call on its stream, of any shape and either weight-gradient dtype, and
@@ -86,13 +87,16 @@ Host design (the input layout rules are the deterministic package's):
   (see ``_RESERVES``; with none ready, the graph zero-fills one of its own).
 - Grids: the forward launches one CTA per block of 16 rows.  The backward
   launches ``cake_jit.backward_ctas`` CTAs, ``G = min(row blocks,
-  ctas_per_sm * SMs)`` with ``ctas_per_sm = 4``, so at most one wave.  With at
-  most 64 row blocks CTA ``c`` takes block ``c`` and nothing is claimed.  Past
-  that, thread 0 of every CTA claims chunks of consecutive blocks with a
-  relaxed atomic add on the workspace's claim counter, from a table of halving
-  rounds that ends in one-block chunks, so a CTA that starts late takes fewer
-  blocks, and a CTA that becomes resident after the table ran out leaves
-  without a row.  Each thread folds its FP32 sums into FP64 after at most 16
+  ctas_per_sm * SMs)`` with ``ctas_per_sm = 4``, so at most one wave.  When
+  ``G`` is the number of row blocks, CTA ``c`` takes block ``c`` and nothing
+  is claimed.  Past one wave, thread 0 of every CTA claims every block in
+  chunks of consecutive blocks with a relaxed atomic add on the workspace's
+  claim counter, from a table of halving rounds that ends in one-block
+  chunks: its first chunk as the CTA starts and each next one as the last
+  block of its current chunk starts, so a CTA holds one chunk at a time, a CTA
+  that starts late takes fewer blocks, and a CTA that becomes resident after
+  the table ran out leaves without a row.  Each thread folds its FP32 sums
+  into FP64 after at most 16
   of its rows.  No kernel is cooperative and no CTA waits for another; no call
   synchronizes the host or the device, and every kernel runs on the current
   torch stream.
@@ -485,7 +489,8 @@ def cake_rmsnorm_silu_gate_train_reset_workspace(
 
 
 # The workspaces of calls without a caller workspace (every backward launch
-# needs one: it takes the arrival ticket, and claims row blocks past 64): one
+# needs one: it takes the arrival ticket, and claims row blocks past one
+# wave): one
 # per (device, stream, backward module), zero-filled once and kept for the
 # process (4104 bytes each, at most two per stream).  Every backward leaves its
 # workspace zero and the calls of one stream run in order, so they share it (no
@@ -723,8 +728,8 @@ def _backward(
     )
     ctas = backward_ctas(name, rows, _sm_count_of_index(_device_index(device)))
     # Every launch, weight_grad=0 included, takes the arrival ticket (and past
-    # 64 row blocks claims its blocks from the claim counter), and leaves both
-    # words zero.
+    # one wave of row blocks claims its blocks from the claim counter), and
+    # leaves both words zero.
     if workspace is not None:
         sums, done = _workspace_views(workspace, name, device)
     else:
@@ -781,8 +786,9 @@ def cake_rmsnorm_silu_gate_train_backward(
     r"""SiLU-gated RMSNorm backward of this package: ``dx``, ``dz`` and the
     weight gradient.
 
-    One kernel of at most one wave of CTAs (past 64 row blocks they claim the
-    blocks in chunks from the workspace's claim counter): ``dx`` and ``dz`` are
+    One kernel of at most one wave of CTAs (one row block each when the grid
+    has a CTA for every block; past one wave they claim the blocks in chunks
+    from the workspace's claim counter): ``dx`` and ``dz`` are
     the deterministic backward's bits, and each CTA adds its FP64 column sums
     into the FP64 accumulators of the workspace with atomics; the CTA that
     arrives last rounds the sum once into ``dw`` (adding ``grad_weight``'s value

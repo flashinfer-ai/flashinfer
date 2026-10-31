@@ -38,11 +38,13 @@ runs on an architecture.
 
 Grids (:func:`launch_grid`): the forward launches one CTA per block of
 ``rows_per_cta`` rows; the backward launches :func:`backward_ctas` CTAs, one
-per block but at most ``ctas_per_sm`` per SM (one wave).  With at most 64
-blocks, CTA ``c`` takes block ``c``; past that the CTAs claim the blocks from
-the claim counter of the workspace, in chunks of consecutive blocks that
-shrink to single blocks at the end, so a CTA that starts late takes fewer
-blocks.  The kernel folds each thread's FP32 sums into
+per block but at most ``ctas_per_sm`` per SM (one wave).  When the grid has
+a CTA for every block, CTA ``c`` takes block ``c`` and claims nothing;
+otherwise the CTAs claim every block from the claim counter of the
+workspace, in chunks of consecutive blocks that shrink to single blocks at
+the end, each CTA claiming its next chunk as the last block of its current
+one starts, so a CTA holds one chunk at a time and one that starts late
+takes fewer blocks.  The kernel folds each thread's FP32 sums into
 FP64 after at most 16 of its rows, so a thread sums at most 16 terms in FP32 at
 any grid: within the deterministic backward's error budget on every input.  No
 module is cooperative and no CTA waits for another inside a kernel: a kernel
@@ -54,9 +56,9 @@ The workspace of the backward is ``dw_slots * 128`` FP64 accumulators and one
 8-byte word holding two 32-bit words, the arrival ticket and the claim counter
 (:func:`workspace_elements` FP64 elements in all), zero when a launch starts
 and zero again when it ends: a zero-filled workspace stays reusable for any
-later call on its stream.  Every backward launch takes the ticket and claims
-blocks, also one that computes no weight gradient, so every backward launch
-needs the workspace.
+later call on its stream.  Every backward launch takes the ticket, and
+claims blocks when the rows have more blocks than one wave, also one that
+computes no weight gradient, so every backward launch needs the workspace.
 
 The program name ``cake_rmsnorm_silu_gate_train_<20 hex>`` is the first twenty
 hex digits of the SHA-256 of the compact JSON ``{"build": <build keywords,
@@ -352,9 +354,10 @@ def route_module(arch: str, role: str) -> str:
 def backward_ctas(name: str, rows: int, sm_count: int) -> int:
     """CTAs of the backward module ``name`` for ``rows`` rows on a device with
     ``sm_count`` SMs: one per block of ``rows_per_cta`` rows, at most
-    ``ctas_per_sm * sm_count`` (one wave).  Past 64 blocks the kernel's CTAs
-    claim the blocks from the workspace's claim counter, so the count only
-    bounds how many CTAs share the rows."""
+    ``ctas_per_sm * sm_count`` (one wave).  Block ``c`` is CTA ``c``'s while
+    every block has a CTA; past one wave the kernel's CTAs claim every block
+    from the workspace's claim counter, so the count only bounds how many
+    CTAs share the rows."""
 
     rule = MODULES[name]["grid_rule"]
     if rule["kind"] != "row_claims":

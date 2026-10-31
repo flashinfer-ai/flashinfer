@@ -45,7 +45,8 @@ dispatches on it here:
   ``flashinfer.cake_rmsnorm_silu_gate_train_backend``: the same forward kernel
   (it has no reduction, so ``y`` has the same bits) and a one-kernel backward
   whose ``dx`` and ``dz`` are the deterministic backward's bits.  Its CTAs
-  take row blocks (past 64 blocks they claim them in chunks), sum the weight
+  take row blocks (one block each when the grid has a CTA for every block;
+  past one wave of CTAs they claim the blocks in chunks), sum the weight
   gradient in FP32 runs of at most 16 rows folded into FP64, and add their FP64
   column sums into FP64 accumulators with atomics; the CTA that arrives last
   rounds the sum once into the weight gradient.  Which blocks each CTA claims,
@@ -75,8 +76,9 @@ The non-deterministic backward's workspace
 (``cake_rmsnorm_silu_gate_train_backward_workspace(T * H, device,
 deterministic=False)``, 4104 bytes whatever ``T * H``) holds the FP64
 accumulators, the arrival ticket and the claim counter the backward's CTAs
-claim row blocks from past 64 blocks; every launch of that backward uses one,
-also with ``compute_grad_weight=False``.  The kernel leaves it zero: allocate
+claim row blocks from when the rows have more blocks than one wave of CTAs;
+every launch of that backward uses one, also with
+``compute_grad_weight=False``.  The kernel leaves it zero: allocate
 it once, reuse it across calls, shapes, both weight-gradient dtypes and CUDA
 Graph replays without a reset, and give each stream that may run a backward at
 the same time its own buffer.  A buffer that did not come from that factory, or
@@ -104,8 +106,10 @@ large dynamic shared-memory allocation, lets the backward start beside it.  The
 deterministic backward also waits for such a kernel when that kernel has no
 shared memory and the default or the maximum-L1 carveout; both forwards start
 beside it whatever its carveout.  The non-deterministic backward launches at
-most one wave of CTAs; past 64 row blocks they claim the blocks in chunks from
-the workspace's claim counter, so a CTA that starts late takes fewer blocks.
+most one wave of CTAs.  When the grid has a CTA for every row block, CTA ``c``
+takes block ``c``; past one wave the CTAs claim every block in chunks from the
+workspace's claim counter, each CTA its next chunk as the last block of its
+current one starts, so a CTA that starts late takes fewer blocks.
 
 Usage::
 
@@ -413,8 +417,8 @@ def cake_rmsnorm_silu_gate_train_backward(
         ``False`` skips the weight-gradient reduction and returns ``None`` for
         it; the non-deterministic kernel then touches neither ``grad_weight``
         nor the workspace's accumulators, but its CTAs still take the arrival
-        ticket (and past 64 row blocks claim their blocks from the claim
-        counter), so it uses a workspace too (and leaves it zero).
+        ticket (and past one wave of row blocks claim their blocks from the
+        claim counter), so it uses a workspace too (and leaves it zero).
     workspace : torch.Tensor, optional
         Caller-owned buffer from :func:`cake_rmsnorm_silu_gate_train_backward_workspace`
         called with the same ``deterministic`` flag: the deterministic
@@ -435,9 +439,10 @@ def cake_rmsnorm_silu_gate_train_backward(
         FP64 over the chunks in an order fixed by the row count, rounded once,
         so repeated calls return the same bits.  ``False`` runs one kernel of
         the non-deterministic package: the same ``dx`` and ``dz`` bits, and each
-        CTA sums the rows of the blocks it takes (past 64 blocks, the chunks it
-        claims) in FP32 runs of at most 16 rows folded into FP64 and adds its
-        FP64 column sums into FP64 accumulators with atomics; the CTA that
+        CTA sums the rows of the blocks it takes (its own block when the grid
+        has a CTA for every block, else the chunks it claims) in FP32 runs of
+        at most 16 rows folded into FP64 and adds its FP64 column sums into
+        FP64 accumulators with atomics; the CTA that
         arrives last rounds the sum once into ``dw`` (adding ``grad_weight``'s
         value first when accumulating).  The claimed blocks, and so the FP32
         runs, and the order of the FP64 additions depend on scheduling: ``dw``

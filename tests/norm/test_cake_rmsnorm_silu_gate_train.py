@@ -1025,7 +1025,7 @@ def test_registry_records_reference_the_build_manifest():
 @pytest.mark.parametrize("rows", [1, 48, 6191, 49488, 98304, 1440000, 1584000])
 def test_backward_cta_rule(rows, sm_count):
     # One CTA per block of rows_per_cta rows, at most ctas_per_sm CTAs per SM
-    # (one wave); past 64 blocks the CTAs claim the blocks in chunks from the
+    # (one wave); past one wave the CTAs claim the blocks in chunks from the
     # workspace's claim counter, so a smaller grid still covers every row.
     for role in ("bwd_bf16", "bwd_f32"):
         name = loader.route_module("sm_100a", role)
