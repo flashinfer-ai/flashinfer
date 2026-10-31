@@ -52,10 +52,11 @@ def warmup_jit():
         "k": [256, 512, 1024, 4096],
         "input_dtype": [torch.bfloat16],
         "weight_dtype": [torch.bfloat16],
+        "enable_pdl": [True, False],
     },
     regular=pairwise_product_cases,
 )
-def test_fp8_blockscale_gemm_sm90(m, n, k, input_dtype, weight_dtype):
+def test_fp8_blockscale_gemm_sm90(m, n, k, input_dtype, weight_dtype, enable_pdl):
     """Test FP8 block-scale GEMM with swapAB optimization.
 
     This test focuses on the usage: BF16 inputs with internal quantization.
@@ -83,7 +84,7 @@ def test_fp8_blockscale_gemm_sm90(m, n, k, input_dtype, weight_dtype):
     reference = torch.matmul(input, weight.T)
 
     # Run FP8 block-scale GEMM
-    output = fp8_blockscale_gemm_sm90(input, weight)
+    output = fp8_blockscale_gemm_sm90(input, weight, enable_pdl=enable_pdl)
 
     # Verify output shape
     assert output.shape == (m, n), f"Expected shape {(m, n)}, got {output.shape}"

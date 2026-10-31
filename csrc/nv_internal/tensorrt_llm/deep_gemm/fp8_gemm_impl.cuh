@@ -111,6 +111,9 @@ __global__ void __launch_bounds__(
     cute::prefetch_tma_descriptor(reinterpret_cast<cute::TmaDescriptor const*>(&tensor_map_d));
   }
   __syncwarp();
+  // Launched with PDL: wait for the kernel that produced the activations and
+  // their scales before any TMA load (a no-op without the launch attribute).
+  asm volatile("griddepcontrol.wait;" ::: "memory");
 
   // Align to 1024 bytes for swizzle-128B
   extern __shared__ __align__(1024) uint8_t smem_buffer[];
@@ -491,6 +494,9 @@ __global__ void __launch_bounds__(
     cute::prefetch_tma_descriptor(reinterpret_cast<cute::TmaDescriptor const*>(&tensor_map_d));
   }
   __syncwarp();
+  // Launched with PDL: wait for the kernel that produced the activations and
+  // their scales before any TMA load (a no-op without the launch attribute).
+  asm volatile("griddepcontrol.wait;" ::: "memory");
 
   // Align to 1024 bytes for swizzle-128B
   extern __shared__ __align__(1024) uint8_t smem_buffer[];
