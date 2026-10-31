@@ -712,6 +712,45 @@ def test_mm_fp4_per_token_alpha_low_m_untuned(m, n, k, res_dtype):
     _check_per_token_alpha_untuned(m, n, k, res_dtype)
 
 
+# Regression anchor: the cuDNN path derives its block-scale descriptors from the
+# scale tensors' shapes. A B scale tensor in the quantizer's (n, k // block_size)
+# orientation (not transposed) used to reach cuDNN unchecked: silently wrong results
+# for n != m (as at this test's shape), and an illegal-instruction fault for MXFP4 at
+# m = n = 128, k = 64.
+@pytest.mark.parametrize("use_nvfp4", [False, True])
+def test_mm_fp4_cudnn_rejects_untransposed_b_descale(use_nvfp4):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required")
+    m, n, k = 128, 256, 64
+    a = torch.randn([m, k], device="cuda", dtype=torch.bfloat16)
+    b = torch.randn([n, k], device="cuda", dtype=torch.bfloat16)
+    if use_nvfp4:
+        one = torch.tensor(1.0, device="cuda")
+        a_fp4, a_sf = nvfp4_quantize(a, one, sfLayout=SfLayout.layout_128x4)
+        b_fp4, b_sf = nvfp4_quantize(b, one, sfLayout=SfLayout.layout_128x4)
+    else:
+        a_fp4, a_sf = mxfp4_quantize(a)
+        b_fp4, b_sf = mxfp4_quantize(b)
+    block_size = 16 if use_nvfp4 else 32
+    out = torch.empty([m, n], device="cuda", dtype=torch.bfloat16)
+    try:
+        with pytest.raises(ValueError, match="pass its transpose"):
+            mm_fp4(
+                a_fp4,
+                b_fp4.T,
+                a_sf,
+                b_sf,  # not transposed
+                None,
+                torch.bfloat16,
+                out,
+                block_size=block_size,
+                backend="cudnn",
+                use_nvfp4=use_nvfp4,
+            )
+    except (BackendSupportedError, LibraryError) as e:
+        pytest.skip(f"cudnn fp4 backend unavailable here: {e}")
+
+
 if __name__ == "__main__":
     pytest.main([__file__])
 
