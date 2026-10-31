@@ -4528,6 +4528,14 @@ _CONTEXT_FP8_ONE_STAGE_ROWS: dict[str, float] = {
     "sm103a": 0.71,
 }
 _CONTEXT_FP8_ONE_STAGE_MIN_ROWS = 64
+# Per target, the page sizes whose one-stage programs' gain over the current
+# launch also takes the unit scaled by the tile's query rows (as the ranking
+# does, and as the split model scales the current launch's unit): the page-64
+# one-stage programs with the short-KV chain, whose tiles of fewer query rows
+# timed faster than the unscaled unit predicts (GB300).
+_CONTEXT_FP8_ONE_STAGE_ROWS_GAIN: dict[str, frozenset[int]] = {
+    "sm103a": frozenset({64}),
+}
 
 
 def _context_fp8_tile_blocks(
@@ -4882,11 +4890,13 @@ def _context_fp8_one_stage_choice(
     pack: int,
     sm_count: int,
     current: tuple[int, tuple[int, int, int] | None],
+    page_size: int | None = None,
 ) -> int | None:
     """The pack of the one-stage launch of a call whose runtime pack is
     ``pack`` and whose launch is ``current`` (its pack and split plan, ``None``
     for whole tiles), or ``None`` where it keeps that launch (a pure function
-    of its arguments, cached).
+    of its arguments, cached).  For a page size the target names in
+    :data:`_CONTEXT_FP8_ONE_STAGE_ROWS_GAIN`, the gain takes the scaled unit.
 
     The candidates are ``pack`` and the smaller shipped packs dividing it whose
     tiles hold every query token in one stage (``max_q_len <= 128 / pack``),
@@ -4946,6 +4956,8 @@ def _context_fp8_one_stage_choice(
         candidate_rank = _context_fp8_split_makespan(
             tiles, sm_count, 0, 1, 1, rank_costs
         )
+        if page_size in _CONTEXT_FP8_ONE_STAGE_ROWS_GAIN.get(target, ()):
+            candidate_time = candidate_rank
         if candidate_rank < best_rank:
             best, best_time, best_rank = candidate, candidate_time, candidate_rank
     if best is not None and _context_fp8_split_gain(time, best_time):
@@ -5546,6 +5558,7 @@ def select_cake_fmha_context_route(
                 stage_pack,
                 sm_count,
                 (pack_g, split_plan),
+                page_size,
             )
             short_tiles = _CONTEXT_FP8_SHORT_KV_ONE_STAGE_TILES.get(target)
             short_pack = None
