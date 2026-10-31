@@ -25,7 +25,7 @@ from typing import Literal
 import pytest
 import torch
 
-from flashinfer.autotuner import autotune
+from flashinfer.autotuner import AutoTuner, autotune
 from flashinfer import (
     ActivationType,
     RoutingMethodType,
@@ -41,6 +41,7 @@ from flashinfer.fused_moe import (
     prims_ts_bf16_routed_moe,
     prims_ts_fp4_block_scale_moe,
     prims_ts_fp4_block_scale_routed_moe,
+    prims_ts_fp4_block_scale_routed_moe_precompile,
     trtllm_bf16_moe,
     trtllm_bf16_routed_moe,
     trtllm_fp4_block_scale_moe,
@@ -53,6 +54,8 @@ from flashinfer.fused_moe import (
     trtllm_mxint4_block_scale_routed_moe,
 )
 from flashinfer.fused_moe.core import Fp8QuantizationType
+from flashinfer.prims_ts.batched_gemm import batched_gemm_run
+from flashinfer.prims_ts.moe.compile_cache import clear_compiled_gemm_cache
 from flashinfer.prims_ts.utils import is_prims_ts_available
 from flashinfer.utils import device_support_pdl, get_compute_capability
 
@@ -472,16 +475,13 @@ def test_prims_ts_fp4_nvfp4_routed_renormalize_smoke():
     )
 
 
-def test_prims_ts_fp4_nvfp4_routed_modes_match_logits():
-    compute_capability = get_compute_capability(torch.device(device="cuda"))
-    if compute_capability not in [(10, 0), (10, 3)]:
-        pytest.skip("The Prims-TS NVFP4 MoE kernel requires an SM100 or SM103 GPU.")
-    if not is_prims_ts_available():
-        pytest.skip("Prims-TS dependencies are unavailable")
+def _prims_ts_nvfp4_routed_case(num_tokens: int):
+    """Shuffled NVFP4 weights and routed inputs: 64 experts, top-8, Swiglu.
 
-    torch.manual_seed(0)
+    Returns the FP4 quantizer, the quantized data, the routing logits, the
+    top-k ids and weights, and the keyword arguments of the Prims-TS ops.
+    """
     device = torch.device("cuda:0")
-    num_tokens = 32
     hidden_size = 512
     intermediate_size = 512
     num_experts = 64
@@ -594,6 +594,20 @@ def test_prims_ts_fp4_nvfp4_routed_modes_match_logits():
         per_token_scale=None,
         tune_max_num_tokens=4096,
     )
+    return moe_impl, quant_data, routing_logits, topk_ids, topk_weights, common_kwargs
+
+
+def test_prims_ts_fp4_nvfp4_routed_modes_match_logits():
+    compute_capability = get_compute_capability(torch.device(device="cuda"))
+    if compute_capability not in [(10, 0), (10, 3)]:
+        pytest.skip("The Prims-TS NVFP4 MoE kernel requires an SM100 or SM103 GPU.")
+    if not is_prims_ts_available():
+        pytest.skip("Prims-TS dependencies are unavailable")
+
+    torch.manual_seed(0)
+    _, _, routing_logits, topk_ids, topk_weights, common_kwargs = (
+        _prims_ts_nvfp4_routed_case(num_tokens=32)
+    )
 
     with autotune(False):
         logits_output = prims_ts_fp4_block_scale_moe(
@@ -611,6 +625,72 @@ def test_prims_ts_fp4_nvfp4_routed_modes_match_logits():
 
     check_accuracy(logits_output, packed_output, atol=1e-2, rtol=1e-2, percent=0.99)
     check_accuracy(logits_output, unpacked_output, atol=1e-2, rtol=1e-2, percent=0.99)
+
+
+def test_prims_ts_fp4_nvfp4_routed_precompile_covers_untuned_calls(monkeypatch):
+    """After the precompile, untuned calls of any size compile no kernel."""
+    compute_capability = get_compute_capability(torch.device(device="cuda"))
+    if compute_capability not in [(10, 0), (10, 3), (10, 7)]:
+        pytest.skip("The Prims-TS NVFP4 MoE kernel requires an SM100/103/107 GPU.")
+    if not is_prims_ts_available():
+        pytest.skip("Prims-TS dependencies are unavailable")
+
+    torch.manual_seed(0)
+    moe_impl, quant_data, _, topk_ids, topk_weights, common_kwargs = (
+        _prims_ts_nvfp4_routed_case(num_tokens=4)
+    )
+    # Tuned tactics from other tests would bypass the untuned path: use a fresh
+    # tuner, and restore the shared one with its cache after the test.
+    monkeypatch.setattr(AutoTuner, "_instance", AutoTuner())
+    # Kernels that other tests compiled would hide a configuration the
+    # precompile misses.
+    torch.cuda.synchronize()
+    clear_compiled_gemm_cache()
+    prims_ts_fp4_block_scale_routed_moe_precompile(
+        (topk_ids, topk_weights),
+        **{
+            name: value
+            for name, value in common_kwargs.items()
+            if name not in ("do_finalize", "tune_max_num_tokens")
+        },
+    )
+
+    compiled = []
+    compile_for_launch = batched_gemm_run._compile_for_launch
+
+    def recording_compile_for_launch(io, stream):
+        compiled.append(io["cfg"])
+        return compile_for_launch(io, stream)
+
+    monkeypatch.setattr(
+        batched_gemm_run, "_compile_for_launch", recording_compile_for_launch
+    )
+    hidden_size = 2 * common_kwargs["hidden_states"].shape[-1]
+    num_experts = common_kwargs["num_experts"]
+    # With 64 experts and top-8, the untuned tile grows past 128, 256, 512 and
+    # 1024 tokens. The counts are multiples of 128: quantize_inputs reshapes the
+    # swizzled scale factors, padded to 128 rows, to one row per token.
+    for num_tokens in (1, 256, 384, 640, 1152, 3072):
+        inputs = moe_impl.quantize_inputs(
+            torch.randn((num_tokens, hidden_size), device="cuda", dtype=torch.bfloat16),
+            quant_data["hidden_states_scale_global"],
+        )
+        weights, ids = torch.topk(
+            torch.rand((num_tokens, num_experts), device="cuda"),
+            common_kwargs["top_k"],
+            dim=-1,
+        )
+        with autotune(False):
+            prims_ts_fp4_block_scale_routed_moe(
+                (ids.to(torch.int32), weights.to(torch.bfloat16)),
+                **{
+                    **common_kwargs,
+                    "hidden_states": inputs["hidden_states"],
+                    "hidden_states_scale": inputs["hidden_states_scale"],
+                },
+            )
+
+    assert compiled == []
 
 
 def _run_trtllm_gen_fp8_routed_fused_moe_case(

@@ -151,6 +151,7 @@ _PRIMS_TS_LAZY_EXPORTS = {
     "prims_ts_fp4_block_scale_moe": ".backends.prims_ts.fp4_op",
     "prims_ts_fp4_block_scale_moe_partitioned": ".backends.prims_ts.fp4_op",
     "prims_ts_fp4_block_scale_routed_moe": ".backends.prims_ts.fp4_op",
+    "prims_ts_fp4_block_scale_routed_moe_precompile": ".backends.prims_ts.fp4_op",
 }
 
 
@@ -462,6 +463,7 @@ __all__ = [
     "prims_ts_fp4_block_scale_moe",
     "prims_ts_fp4_block_scale_moe_partitioned",
     "prims_ts_fp4_block_scale_routed_moe",
+    "prims_ts_fp4_block_scale_routed_moe_precompile",
     "prims_ts_fp8_block_scale_moe",
     "prims_ts_fp8_block_scale_moe_partitioned",
     "prims_ts_fp8_block_scale_routed_moe",
