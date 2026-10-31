@@ -19,13 +19,15 @@ Backend suite of the Cake deterministic GDN chunked-training package
 Without a device: the registry (one record per stage and architecture, the argument plans of the call sites, the
 scan constants, the ``dhu_tc2`` selection constants and the ``prep_tma`` window), the build manifest (every record's
 library, the recorded source digests), the launch entries (one resolution per stage and device, then the cached FFI
-entry; the first launch's errors), the plan pins, the finalize rule, the ``dhu_tc2`` selection rule and the
-two-stream groups on the campaign rows, the ``prep_tma`` dispatch window and the host chunk / segment tables.  On SM100 / SM103 / SM107: the six outputs ``o, dq, dk, dv, dg, dbeta`` against an FP64 token recurrence on
+entry; the first launch's errors), the plan pins, the finalize rule, the ``dhu_tc2`` selection rule, the split pass-2 rule on the campaign rows and
+the #7074 packs and the two-stream groups on the campaign rows, the ``prep_tma`` dispatch window and the host chunk / segment tables.  On SM100 / SM103 / SM107: the six outputs ``o, dq, dk, dv, dg, dbeta`` against an FP64 token recurrence on
 packed layouts (host and device table routes, FP32 and BF16 ``beta``, every register-scan configuration, the serial
-and segment-parallel scans, both adjoint scans, both preps, the fused tail of a value-head group of two and the
-unfused tail with both finalize stages, the recompute and uncached forms, the un-normalized ``q`` / ``k`` form), the
+and segment-parallel scans, both adjoint scans, both preps, the fused tails of a value-head group of two and of three
+and the unfused tail with both finalize stages, the recompute and uncached forms, the un-normalized ``q`` / ``k`` form), the
 initial / final state with its gradients (also through empty sequences), the pre-scan capacity, the bitwise
-contracts: two runs, the two table routes on one plan, the longest-first dispatch order against the caller's (and its
+contracts: two runs, the two table routes on one plan, a split plan's pass 2 on ``dhu_tc2`` after the fused pre-scan
+against ``dv_local`` and the register one, the fused tail of a value-head group of three against the unfused one with
+either finalize, the longest-first dispatch order against the caller's (and its
 tables without a device), two streams against one (and the groups' rule without a device, caller-stream allocations
 between and during two-stream calls, a CUDA graph capture and one side stream per caller stream), the launches on the
 caller's stream (one and two streams) and from cached entries, the two preps, ``q`` / ``k`` off the tensor maps' 16-byte
@@ -308,10 +310,8 @@ def _preps(stages) -> set[str]:
 # --------------------------------------------------------------------------- registry and manifest (no device)
 
 
-FUSED_TAIL_STAGES = (
-    "tail_g2",
-    "tail_g2_bf16",
-)  # two-CTA clusters: the two value heads of a key head
+# the fused tails' cluster sizes: one CTA per value head of a key head
+FUSED_TAIL_STAGES = {"tail_g2": 2, "tail_g2_bf16": 2, "tail_g3": 3, "tail_g3_bf16": 3}
 
 
 def test_former_names_are_aliases_of_the_det_names() -> None:
@@ -329,7 +329,7 @@ def test_former_names_are_aliases_of_the_det_names() -> None:
 
 
 def test_registry_records_are_well_formed() -> None:
-    assert len(cake_jit.STAGES) == 29 and len(set(cake_jit.STAGES)) == 29
+    assert len(cake_jit.STAGES) == 32 and len(set(cake_jit.STAGES)) == 32
     assert set(cake_chain.LAUNCH_ARGS) == set(cake_jit.STAGES)
     for arch in ARCHES:
         for stage in cake_jit.STAGES:
@@ -347,9 +347,7 @@ def test_registry_records_are_well_formed() -> None:
         assert rec["kernel_symbol"] == "kernel_" + rec["library"], name
         launch = rec["launch"]
         assert launch["cooperative"] is False and launch["use_pdl"] is False, name
-        assert launch["cluster"] == (
-            (2, 1, 1) if rec["stage"] in FUSED_TAIL_STAGES else (1, 1, 1)
-        ), name
+        assert launch["cluster"] == (FUSED_TAIL_STAGES.get(rec["stage"], 1), 1, 1), name
         assert len(launch["block"]) == 3 and launch["block"][0] % 32 == 0, name
         assert launch["dynamic_smem_bytes"] >= 0, name
         # the record's kernel parameters are the call site's, possibly reordered (the chain reorders them)
@@ -382,6 +380,8 @@ def test_scan_records_carry_the_planner_constants() -> None:
             and const["t_unit"] > 0
             and const["c_dvl"] > 0
         ), arch
+        gain, min_saving = cake_chain._sdt_constants(arch)
+        assert 0 < gain <= 1 and min_saving >= 0, arch
         ctas_per_sm, window = cake_chain._prep_tma_constants(arch)
         if arch == "sm_107a":  # window 1.0: no plain-prep band
             assert ctas_per_sm > 0 and window == 1.0, arch
@@ -592,6 +592,61 @@ def test_dhu_tc_rule_on_the_campaign_rows(arch, monkeypatch) -> None:
         assert rec["select"] is selected, (row, rec)
         if row == "r01":
             assert abs(rec["T_tc"] - r01_tc) < 0.1, rec
+
+
+# The split (64, 1) adjoint plans of the campaign rows and the #7074 packs on each device, and the ones whose pass 2
+# the split rule runs on dhu_tc2 (measured faster there; the other split plans keep the register pass 2).
+_REAL_3 = (5406, 3448, 3896)
+_REAL_7 = (4199, 2781, 4282, 4448, 4723, 5804, 3863)
+SDT_ROWS = (
+    ("r01", (4096,) * 4, 16),
+    ("r02", _REAL_3, 16),
+    ("r03", (4096,) * 8, 16),
+    ("r04", _REAL_7, 16),
+    ("r07", (16384,), 16),
+    ("r08", (4096,) * 4, 32),
+    ("r10", (16384,), 32),
+    ("issue", (131071, 87531, 43385), 6),
+    ("P3", (128147, 131027), 6),
+    ("P1", (126565, 32714, 33696, 15081, 22979, 10782), 6),
+    ("A16", (11000, 12000, 9768), 48),
+)
+_SDT_SPLIT_SM100 = {"r02", "r04", "r07", "r10", "issue", "P3", "P1"}
+SDT_SPLIT = {
+    "sm_100a": _SDT_SPLIT_SM100,
+    "sm_103a": _SDT_SPLIT_SM100,
+    "sm_107a": _SDT_SPLIT_SM100 | {"r01", "r03", "r08", "A16"},
+}
+# with the dv_local stage the register form needs priced in, every split (64, 1) row of these layouts runs pass 2 on
+# dhu_tc2 (sm_100a r07: a 41 us priced saving, above the 40 us floor)
+SDT_SELECTED = SDT_SPLIT
+
+
+@pytest.mark.parametrize("arch", sorted(RULE_DEVICES))
+def test_sdt_rule_on_the_split_rows(arch, monkeypatch) -> None:
+    props, _r01_tc = RULE_DEVICES[arch]
+    monkeypatch.setattr(cake_chain, "_device_props", lambda _index: props)
+    monkeypatch.setattr(cake_backend, "device_arch", lambda _index: arch)
+    split, selected = set(), set()
+    for row, seq_lens, num_v_heads in SDT_ROWS:
+        _fwd, bwd = cake_chain.scan_plans(
+            sum(seq_lens), len(seq_lens), num_v_heads, 0, seq_lens
+        )
+        chunks = tuple(-(-n // 64) for n in seq_lens)
+        if bwd.segment_len == 0 or max(chunks) <= bwd.segment_len:
+            continue
+        if tuple(bwd.config) != cake_chain.SDT_CONFIG:
+            continue
+        split.add(row)
+        rec = cake_chain.sdt_pricing(chunks, bwd.segment_len, num_v_heads, 0)
+        assert rec["select"] is (
+            rec["T_tc2"] <= rec["gain"] * rec["T_reg2"]
+            and rec["saving"] >= rec["min_saving"]
+        ), (row, rec)
+        if rec["select"]:
+            selected.add(row)
+    assert split == SDT_SPLIT[arch]
+    assert selected == SDT_SELECTED[arch]
 
 
 def test_two_stream_split_rule() -> None:
@@ -942,8 +997,9 @@ def test_segments_beyond_the_prescan_capacity_raise(device) -> None:
         {"scan_config": (64, 1), "segment_chunks": 0, "dhu_scan": "tc"},
         {"scan_config": (32, 2), "segment_chunks": 4, "dhu_scan": "reg"},
         {"scan_config": (64, 1), "segment_chunks": 6, "dhu_scan": "reg"},
+        {"scan_config": (64, 1), "segment_chunks": 6, "dhu_scan": "tc"},
     ],
-    ids=["serial-32x2", "serial-dhu-tc", "split-32x2", "split-64x1"],
+    ids=["serial-32x2", "serial-dhu-tc", "split-32x2", "split-64x1", "split-64x1-tc"],
 )
 def test_table_routes_agree_bitwise(pins, device) -> None:
     seq_lens = (1500, 77, 640)
@@ -1018,6 +1074,7 @@ def _small_device(monkeypatch, device, sm_count: int) -> None:
     )
     monkeypatch.setattr(cake_chain, "_META_FRONT", {})
     monkeypatch.setattr(cake_chain, "_DHU_AUTO", {})
+    monkeypatch.setattr(cake_chain, "_SDT_AUTO", {})
 
 
 def _record_streams(monkeypatch) -> list[tuple[str, int]]:
@@ -1083,6 +1140,90 @@ def test_two_streams_match_one_stream(
     if lpt and save_state:
         ref = _reference(inputs, seq_lens, initial_state=h0, dht=dht)
         _assert_close_to_reference(runs[0], ref, names)
+
+
+@pytest.mark.parametrize(
+    "beta_dtype", [torch.bfloat16, torch.float32], ids=["bf16beta", "fp32beta"]
+)
+@pytest.mark.parametrize("heads", [(2, 4), (2, 6)], ids=["g2", "g3"])
+def test_split_pass2_on_dhu_tc2_matches_the_register_pass2(
+    heads, beta_dtype, device, monkeypatch
+) -> None:
+    # a split (64, 1) plan's pass 2 on dhu_tc2 from the stitched segment states against the register pass 2 at the
+    # same segment table: the same bits on every output, with an initial state and a final-state gradient
+    seq_lens = (1500, 77, 640)
+    inputs = _inputs(seq_lens, heads, beta_dtype, device, seed=83)
+    gen = torch.Generator().manual_seed(89)
+    h0 = (
+        0.1 * torch.randn(len(seq_lens), heads[1], HEAD_DIM, HEAD_DIM, generator=gen)
+    ).to(device)
+    dht = torch.randn(len(seq_lens), heads[1], HEAD_DIM, HEAD_DIM, generator=gen).to(
+        device
+    )
+    launches = _record_streams(monkeypatch)
+    names = OUTPUT_NAMES + ("final_state", "dh0")
+    runs = {}
+    for scan in ("tc", "reg"):
+        start = len(launches)
+        runs[scan] = _run(inputs, seq_lens, initial_state=h0, output_final_state=True, dht=dht, scan_config=(64, 1),
+                          segment_chunks=6, dhu_scan=scan)  # fmt: skip
+        stages = [stage for stage, _stream in launches[start:]]
+        assert "stitch" in stages, stages
+        # the tc form: the fused pre-scan computes the dv_local tiles it reads, no dv_local stage
+        want = (
+            ("dhu_pre_dvl_r64k1", "dhu_tc2")
+            if scan == "tc"
+            else ("dv_local", "dhu_pre_r64k1", "dhu_r64k1")
+        )
+        other = (
+            ("dv_local", "dhu_pre_r64k1", "dhu_r64k1")
+            if scan == "tc"
+            else ("dhu_pre_dvl_r64k1", "dhu_tc2")
+        )
+        assert all(x in stages for x in want) and not any(x in stages for x in other), (
+            scan,
+            stages,
+        )
+    _assert_bitwise(runs["tc"], runs["reg"], names)
+
+
+@pytest.mark.parametrize(
+    "beta_dtype", [torch.bfloat16, torch.float32], ids=["bf16beta", "fp32beta"]
+)
+@pytest.mark.parametrize("route", ["host", "device"])
+def test_group_of_three_tail_matches_the_unfused_tail(
+    route, beta_dtype, device, monkeypatch
+) -> None:
+    # HV = 3 H: the fused tail_g3 against dqkwg + the WY pullback + each finalize (a finalize pin keeps the three
+    # stages): the same bits on every output, with an initial state and a final-state gradient
+    seq_lens, heads = (1500, 77, 640, 1), (2, 6)
+    inputs = _inputs(seq_lens, heads, beta_dtype, device, seed=97)
+    gen = torch.Generator().manual_seed(101)
+    h0 = (
+        0.1 * torch.randn(len(seq_lens), heads[1], HEAD_DIM, HEAD_DIM, generator=gen)
+    ).to(device)
+    dht = torch.randn(len(seq_lens), heads[1], HEAD_DIM, HEAD_DIM, generator=gen).to(
+        device
+    )
+    stages = _record_launches(monkeypatch)
+    names = OUTPUT_NAMES + ("final_state", "dh0")
+    tail = "tail_g3_bf16" if beta_dtype == torch.bfloat16 else "tail_g3"
+    runs = {}
+    for fin in ("", "finalize", "finalize_mlp"):
+        start = len(stages)
+        pins = {"finalize": fin} if fin else {}
+        runs[fin] = _run(inputs, seq_lens, route=route, initial_state=h0, output_final_state=True, dht=dht,
+                         **pins)  # fmt: skip
+        got = stages[start:]
+        if fin:
+            assert fin in got and "dqkwg" in got and tail not in got, (fin, got)
+        else:
+            assert tail in got and "dqkwg" not in got, got
+            assert not any(stage.startswith(("wy_bwd", "finalize")) for stage in got), (
+                got
+            )
+    _assert_bitwise(runs[""], runs["finalize"], names)
+    _assert_bitwise(runs[""], runs["finalize_mlp"], names)
 
 
 def test_two_streams_survive_interleaved_allocations(device, monkeypatch) -> None:

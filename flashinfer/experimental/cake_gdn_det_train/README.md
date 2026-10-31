@@ -71,10 +71,15 @@ for Q or K not 16-byte aligned.  Both preps give the same bits.  A long sequence
 split into segments: a pre-scan and a stitch then give every segment its start
 state.  The backward runs the adjoint scan, either `dv_local` plus a register
 scan or, on a serial plan, the tcgen05 scan with `dv_local` fused (`dhu_tc2`),
-which a host-side cost rule selects on the host-table route.  For a value-head
-group of two (`HV == 2 * H`) one fused tcgen05 kernel then computes `dq`, `dk`,
-`dv`, `dg` and `dbeta`; other groups run `dqkwg`, the WY pullback and the
-finalize.
+which a host-side cost rule selects on the host-table route.  On that route a
+split `(64, 1)` plan runs the second pass of its adjoint scan on `dhu_tc2`,
+from the stitched segment states, where a second cost rule prices it at most
+0.95 of `dv_local` plus the register pass and, on `sm_100a`, at least 40 us
+cheaper; its pre-scan then computes the `dv_local` tiles of its chunks itself,
+so no `dv_local` stage runs.  Both forms give the same bits.  For a value-head
+group of two (`HV == 2 * H`) or of three (`HV == 3 * H`) one fused tcgen05
+cluster kernel then computes `dq`, `dk`, `dv`, `dg` and `dbeta`; other groups
+run `dqkwg`, the WY pullback and the finalize.
 
 On the host-table route the long sequences start first.  The tables list the
 sequences by chunk count, longest first (ties in the caller's order); every
@@ -109,9 +114,9 @@ captured in a CUDA graph (warm it up first, like any captured call).
 |---|---|---|
 | `scan_config` | planner | register-scan `(value block, key split)` of both scans: `(32, 2)`, `(32, 1)` or `(64, 1)` |
 | `segment_chunks` | planner | segment length in chunks of the segment-parallel scans; `0` forces the serial scan; lengths above 128 (the chunks one pre-scan CTA covers) are not supported: a call whose plan then splits a sequence raises `ValueError` |
-| `finalize` | by size | finalize of the unfused tail (`HV != 2 * H`): `"finalize"` or `"finalize_mlp"` (the latter needs `HV == 3 * H`) |
+| `finalize` | by size | finalize of the unfused tail (`HV != 2 * H`): `"finalize"` or `"finalize_mlp"` (the latter needs `HV == 3 * H`); for `HV == 3 * H` a pin runs the unfused tail instead of the fused kernel (the same bits) |
 | `warmup_log2` | `-10 / ln 2` | warm-up threshold of the pre-scans |
-| `dhu_scan` | rule | adjoint scan of a serial plan: `"reg"` (`dv_local` + register scan) or `"tc"` (`dhu_tc2`) |
+| `dhu_scan` | rule | adjoint scan of a serial plan: `"reg"` (`dv_local` + register scan) or `"tc"` (`dhu_tc2`); also the second pass of a split `(64, 1)` plan on the host-table route (`"tc"` with the fused pre-scan; the same bits) |
 | `prep` | rule | forward prep: `"plain"` or `"tma"` (`prep_tma`; Q or K not 16-byte aligned still take the plain prep) |
 | `save_state` | `True` | keep the forward's `w`, `u`, `h`, `v_new` for the backward; `False` recomputes them |
 | `host_cache` | `True` | keep the chunk tables, the `dhu_tc2` selections and the per-stream workspaces between calls |

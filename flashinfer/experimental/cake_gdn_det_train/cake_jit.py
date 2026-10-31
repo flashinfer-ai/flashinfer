@@ -28,9 +28,12 @@ chunks one pre-scan CTA covers); ``dhu_tc2`` carries the per-architecture
 constants of its selection rule (``select``: the tcgen05 scan's per-step time
 at low and full residency ``t_lat`` / ``t_full``, the register scan's time per
 planner cost unit ``t_unit`` and the ``dv_local`` time of one (chunk, value
-head) tile on one SM ``c_dvl``, in microseconds) and ``prep_tma`` the window
-of its dispatch rule (``select``: the plain prep runs for ``slots < CTAs <=
-window x slots``, ``slots = ctas_per_sm x SMs``, ``CTAs = chunks x H``).  The derived leaves
+head) tile on one SM ``c_dvl``, in microseconds; for the pass 2 of a split
+plan, the gain ``sdt_gain`` its priced time must reach against ``dv_local`` +
+the register pass 2 and the least priced saving ``sdt_min_saving`` in
+microseconds) and ``prep_tma`` the window of its dispatch rule (``select``:
+the plain prep runs for ``slots < CTAs <= window x slots``, ``slots =
+ctas_per_sm x SMs``, ``CTAs = chunks x H``).  The derived leaves
 (``library``, ``kernel_symbol``, ``launch``, ``arg_plan``) are written by the
 exporter from the rendered binding; ``library`` is the program identity
 (``cake_gdn_det_train_<20 hex>``), so a kernel swap renames it.  ``MODULES``
@@ -982,18 +985,25 @@ MODULES: dict[str, dict[str, Any]] = {
         "select": {
             "sm_100a": {
                 "c_dvl": 2.021,
+                "sdt_gain": 0.95,
+                # B200: on short host-bound layouts a priced saving below 40 us did not reach the wall time
+                "sdt_min_saving": 40.0,
                 "t_full": 2.683,
                 "t_lat": 2.37,
                 "t_unit": 1.726,
             },
             "sm_103a": {
                 "c_dvl": 1.85,
+                "sdt_gain": 0.95,
+                "sdt_min_saving": 0.0,
                 "t_full": 2.293,
                 "t_lat": 2.204,
                 "t_unit": 1.599,
             },
             "sm_107a": {
                 "c_dvl": 1.696,
+                "sdt_gain": 0.95,
+                "sdt_min_saving": 0.0,
                 "t_full": 2.357,
                 "t_lat": 1.708,
                 "t_unit": 1.329,
