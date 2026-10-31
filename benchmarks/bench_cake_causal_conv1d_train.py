@@ -91,8 +91,10 @@ WALL_WARMUPS = 3
 WALL_SAMPLES = 20
 AHEAD_WARMUPS = 2
 AHEAD_SAMPLES = 10
-AHEAD_MIN_MS = 2.0  # the spin kernel ahead of a ckpt sample lasts at least this long ...
-AHEAD_ENQUEUE_FACTOR = 3.0  # ... and this many times the longest enqueue seen while warming up
+# The spin kernel ahead of a ckpt sample lasts at least AHEAD_MIN_MS and AHEAD_ENQUEUE_FACTOR times the longest
+# enqueue seen while warming up.
+AHEAD_MIN_MS = 2.0
+AHEAD_ENQUEUE_FACTOR = 3.0
 SIDE_KERNEL_CYCLES = 10_000_000
 SIDE_KERNEL_WARMUPS = 3
 SIDE_KERNEL_SAMPLES = 7
@@ -490,7 +492,8 @@ def bench_row(
     result["speedup_range"] = {}
     for key in keys:
         ratios = [
-            d / n for d, n in zip(samples["det"][key], samples["nondet"][key], strict=True)
+            d / n
+            for d, n in zip(samples["det"][key], samples["nondet"][key], strict=True)
         ]
         result["speedup_range"][key] = [min(ratios), max(ratios)]
     if "det" in grads and "nondet" in grads:

@@ -561,7 +561,9 @@ def test_manifest_checker_lists_the_package() -> None:
     try:
         path = str(PACKAGE_DIR.relative_to(REPO))
     except ValueError:
-        pytest.skip(f"the package is imported from {PACKAGE_DIR}, outside this checkout")
+        pytest.skip(
+            f"the package is imported from {PACKAGE_DIR}, outside this checkout"
+        )
     entries = [p for p in checker.PACKAGES if p.name == pkg.__name__]
     assert len(entries) == 1, entries
     (entry,) = entries
