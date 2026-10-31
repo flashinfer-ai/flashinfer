@@ -7,6 +7,7 @@ import torch
 from tests.test_helpers.parametrize import pairwise_product_cases, parametrize_product
 from tests.test_helpers.pdl import late_store
 from tests.test_helpers.utils_fp4 import (
+    cast_from_fp4,
     nvfp4_global_decode_scale_te,
     nvfp4_global_encode_scale_te,
     pack_fp4_values,
@@ -559,6 +560,51 @@ def _is_cute_dsl_available():
         return True
     except ImportError:
         return False
+
+
+@pytest.mark.parametrize("backend", MXFP4_BACKENDS)
+@pytest.mark.parametrize("is_sf_swizzled_layout", [False, True])
+@torch.inference_mode()
+def test_mxfp4_preserves_min_scale_blocks(
+    backend: str,
+    is_sf_swizzled_layout: bool,
+) -> None:
+    if not torch.cuda.is_available() or not _is_fp4_supported(torch.device("cuda")):
+        pytest.skip("MXFP4 quantization requires SM100 or newer")
+    if backend == "cute-dsl" and not _is_cute_dsl_available():
+        pytest.skip("CuTe-DSL is not available")
+
+    values: torch.Tensor = torch.tensor(
+        [2, -2, 6, 12, 0.5, -0.5, 8, 0], dtype=torch.float64, device="cuda"
+    ) * (2.0**-127)
+    x: torch.Tensor = values.to(torch.bfloat16).repeat_interleave(32).repeat((32, 1))
+    torch.testing.assert_close(
+        actual=x[0, ::32].double(), expected=values, rtol=0, atol=0
+    )
+
+    quantized, scales = mxfp4_quantize(
+        a=x,
+        backend=backend,
+        sfLayout=(
+            SfLayout.layout_128x4 if is_sf_swizzled_layout else SfLayout.layout_linear
+        ),
+    )
+    linear_scales: torch.Tensor = (
+        unswizzle_sf(sf=scales, row=x.shape[0], col=x.shape[1], scaling_vector_size=32)
+        if is_sf_swizzled_layout
+        else scales.reshape((x.shape[0], -1))
+    )
+    expected_scales: torch.Tensor = torch.tensor(
+        [0, 0, 0, 1, 0, 0, 1, 0], dtype=torch.uint8, device="cuda"
+    ).expand_as(linear_scales)
+    torch.testing.assert_close(
+        actual=linear_scales, expected=expected_scales, rtol=0, atol=0
+    )
+
+    decoded: torch.Tensor = cast_from_fp4(quantized).double() * torch.exp2(
+        linear_scales.double() - 127
+    ).repeat_interleave(repeats=32, dim=1)
+    torch.testing.assert_close(actual=decoded, expected=x.double(), rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("backend", MXFP4_BACKENDS)
