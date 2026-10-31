@@ -537,6 +537,85 @@ def test_capture_cannot_accept_a_cache_change_without_selection(state, monkeypat
     state.sweep.assert_not_called()
 
 
+@pytest.mark.parametrize("winner", [None, {"fc2_use_bulk": False}])
+def test_fixed_prepared_eager_execution_skips_collective_lookup(
+    state, monkeypatch, winner
+):
+    from flashinfer.moe_ep.backends.mega.kernel.sm107 import automatic
+    from flashinfer.autotune_cache import autotune_v2_reload
+
+    backend = SimpleNamespace(
+        _kernel_config=SimpleNamespace(knobs="auto"),
+        ep_world_size=2,
+        ep_comm_group=None,
+    )
+    workspace = state.workspace
+    context = automatic.tuning_context()
+    workspace._tuning_state.record_selection(winner, context.cache_identity, None)
+    workspace._tuning_state.lookup_scope = (context.scope, context.cache_identity)
+
+    def gather(values, value, **kwargs):
+        values[:] = [value, value]
+
+    monkeypatch.setattr(torch.distributed, "all_gather_object", gather)
+    automatic.prepare_auto_configuration(backend, workspace, (None, None), None, 4)
+
+    def unexpected(*args, **kwargs):
+        raise AssertionError("prepared execution must not poll tuning state")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(torch.distributed, "all_gather_object", unexpected)
+        patch.setattr(automatic, "needs_selection", unexpected)
+        state.tuner.clear_cache()
+        for _ in range(3):
+            _stage_for_auto(workspace)
+            assert not automatic.coordinate_workspace_replacement(backend, workspace)
+            automatic.prepare_auto_configuration(
+                backend, workspace, (None, None), None, 4
+            )
+            assert workspace._tuning_inputs is None
+    autotune_v2_reload()
+    assert not automatic.prepared_for_serving(
+        workspace._tuning_state, automatic.tuning_context()
+    )
+
+
+def test_prepared_execution_respects_scoped_and_empty_contexts(
+    state, monkeypatch, tmp_path
+):
+    from flashinfer.moe_ep.backends.mega.kernel.sm107 import automatic
+    from flashinfer.moe_ep.kernel_src.sm107 import next_cutedsl_megamoe as package
+
+    monkeypatch.setenv("FLASHINFER_MOE_EP_KNOB_CACHE", "off")
+    monkeypatch.setattr(package, "sm107_candidates", lambda *a, **k: [{}])
+    backend = SimpleNamespace(
+        _kernel_config=SimpleNamespace(knobs="auto", in_kernel_fc2_reduce=False),
+        ep_world_size=1,
+        ep_comm_group=None,
+    )
+    workspace = state.workspace
+    state.sweep.side_effect = [
+        ({"fc2_use_bulk": False}, 1.0, 1),
+        ({"fc2_use_bulk": True}, 1.0, 1),
+    ]
+
+    def select():
+        _stage_for_auto(workspace)
+        automatic.prepare_auto_configuration(backend, workspace, (None, None), None, 4)
+        return automatic.get_tuned_knobs(workspace)["fc2_use_bulk"]
+
+    with autotune_v2(cache_root=tmp_path / "ambient"):
+        assert select() is False
+    assert select() is False
+    with autotune_v2(cache_root=tmp_path / "scoped", cache_scope="context"):
+        assert select() is True
+    assert select() is False
+    with autotune_v2(mode="replay", cache_root=tmp_path / "scoped"):
+        pass
+    assert select() is True
+    assert state.sweep.call_count == 2
+
+
 @pytest.mark.parametrize("change", ["store", "policy"])
 def test_replay_winner_invalidates_previous_tuning_identity(
     state, monkeypatch, tmp_path, change

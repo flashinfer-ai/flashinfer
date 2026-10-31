@@ -16,6 +16,27 @@ from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe import (
 )
 
 
+def assert_prepared_eager_execution(
+    layer, tensors, kind, monkeypatch, *, workspace=None
+):
+    """Prepared forwards must not repeat selection or collective cache checks."""
+    from flashinfer.autotuner import AutoTuner, TuningContext
+    import torch.distributed as dist
+
+    expected = layer.forward(tensors, workspace=workspace).clone()
+
+    def unexpected(*args, **kwargs):
+        raise AssertionError("prepared eager execution entered automatic selection")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(dist, "all_gather_object", unexpected)
+        patch.setattr(AutoTuner.get(), "choose_with_protocol", unexpected)
+        patch.setattr(TuningContext, "cache_identity", property(unexpected))
+        for _ in range(3):
+            actual = layer.forward(tensors, workspace=workspace)
+            assert_reference(actual, expected, kind)
+
+
 def quantize(tensor, kind, norm=1.0):
     if tensor.numel() == 0:
         nvfp4 = kind == "nvfp4"

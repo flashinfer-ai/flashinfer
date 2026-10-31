@@ -9,6 +9,7 @@ if TYPE_CHECKING:
     import torch
 
     from flashinfer.autotuner import TuningContext
+    from .....core.tuning_state import AutoTuningState
     from .....kernel_src.sm107.next_cutedsl_megamoe.shim.block_scaled import (
         Sm107BlockScaledSymmBuffer,
         TransformedBlockScaledWeights,
@@ -55,6 +56,29 @@ def tuning_identity(context: TuningContext) -> tuple:
     return context.cache_identity, measurement_settings(context)
 
 
+def prepared_for_serving(state: AutoTuningState, context: TuningContext) -> bool:
+    # Explicit contexts retain collective cache checks, including rank-local
+    # invalidation. Bare forwards reuse the last agreed workspace until a
+    # context transition or coordinated reload requires preparation again.
+    return (
+        context.scope is None
+        and not context.tuning_enabled
+        and state.serving_generation == context.execution_generation
+    )
+
+
+def record_prepared(state: AutoTuningState, context: TuningContext) -> None:
+    import torch
+
+    state.serving_generation = (
+        context.execution_generation
+        if context.scope is None
+        and not context.tuning_enabled
+        and not (torch.cuda.is_available() and torch.cuda.is_current_stream_capturing())
+        else None
+    )
+
+
 def coordinate_workspace_replacement(
     backend: RubinBackend, workspace: Sm107BlockScaledSymmBuffer
 ) -> bool:
@@ -71,6 +95,8 @@ def coordinate_workspace_replacement(
                 "Warm up Rubin automatic selection after changing the cache "
                 "or measurement policy, before CUDA graph capture."
             )
+        return False
+    if prepared_for_serving(state, context):
         return False
     replace = (
         state.graph_captured
@@ -118,6 +144,9 @@ def prepare_auto_configuration(
     inputs = getattr(workspace, "_tuning_inputs", None)
     workspace._tuning_inputs = None
     context = tuning_context()
+    state = workspace._tuning_state
+    if prepared_for_serving(state, context):
+        return
     select = needs_selection(workspace, context)
     import torch
 
@@ -134,6 +163,7 @@ def prepare_auto_configuration(
             raise ValueError("EP ranks disagree on whether MegaMoE tuning is enabled")
         select = any(pending for _, pending in decisions)
     if not select:
+        record_prepared(state, context)
         return
     from .....kernel_src.sm107.next_cutedsl_megamoe import (
         KNOB_KEYS,
@@ -141,7 +171,6 @@ def prepare_auto_configuration(
     )
 
     cfg = workspace.config
-    state = workspace._tuning_state
     if state.initial_knobs is None:
         state.initial_knobs = {name: getattr(cfg, name) for name in KNOB_KEYS}
     candidates = sm107_candidates(
@@ -171,6 +200,7 @@ def prepare_auto_configuration(
     )
     if winner is None and state.graph_captured:
         # Captured explicit handles retain their prepared configuration.
+        record_prepared(state, context)
         return
     if winner is None and state.winner is not None:
         from .....kernel_src.sm107.next_cutedsl_megamoe.shim.autotune import (
@@ -192,3 +222,4 @@ def prepare_auto_configuration(
         if winner is not None and context.tuning_enabled
         else None,
     )
+    record_prepared(state, context)

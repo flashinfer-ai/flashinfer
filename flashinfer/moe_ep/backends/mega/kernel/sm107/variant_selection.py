@@ -16,6 +16,7 @@ from .....core.kernel.base import MegaKernelBackend
 from .....core.tuning_state import AutoTuningState
 from .....core.validation.common import MoEEpConfigError
 from .forward_tuning import ForwardExecution
+from .automatic import prepared_for_serving, record_prepared
 
 if TYPE_CHECKING:
     from .....config import FleetParams
@@ -215,6 +216,8 @@ class RubinVariantBackend(MegaKernelBackend):
                     "Warm up variant selection after changing the autotune context"
                 )
             return False
+        if prepared_for_serving(state, context):
+            return False
         replace = (
             state.graph_captured
             and _pending(state, context)
@@ -266,7 +269,7 @@ class RubinVariantBackend(MegaKernelBackend):
         state = workspace._tuning_state
         if torch.cuda.is_current_stream_capturing():
             state.graph_captured = True
-        else:
+        elif not prepared_for_serving(state, context):
             decisions = self._gather(
                 (
                     context.tuning_enabled,
@@ -301,6 +304,7 @@ class RubinVariantBackend(MegaKernelBackend):
                     workspace.workspace,
                     quantize_input=workspace.quantize_input,
                 )
+            record_prepared(state, context)
         workspace.tensors = None
         return workspace.kernel.compute(
             workspace.workspace, transformed_weights, output=output

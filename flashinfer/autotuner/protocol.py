@@ -26,6 +26,11 @@ def _protocol_cache_key(namespace: str, key: str) -> tuple[str, str, str]:
 
 # Scope identity is local and never enters a cache key or collective payload.
 _tuning_scope: ContextVar[object | None] = ContextVar("tuning_scope", default=None)
+_execution_generation: ContextVar[int] = ContextVar("execution_generation", default=0)
+
+
+def _advance_execution_generation() -> None:
+    _execution_generation.set(_execution_generation.get() + 1)
 
 
 @dataclass(frozen=True)
@@ -42,6 +47,16 @@ class TuningContext:
     tuning_enabled: bool
     force_tune: bool
     scope: object | None = None
+
+    @property
+    def execution_generation(self) -> int:
+        """Context transitions and explicit reloads invalidate prepared execution.
+
+        Unlike cache_identity, this does not change on rank-local cache clearing.
+        Collective protocols can keep serving an agreed configuration until the
+        next collective preparation point, without polling their peers.
+        """
+        return _execution_generation.get()
 
     @property
     def skipped(self) -> bool:

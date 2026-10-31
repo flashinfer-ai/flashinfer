@@ -350,6 +350,37 @@ def test_compute_releases_staged_tensors(protocol, monkeypatch, phase):
     owner.kernel.compute.assert_called_once()
 
 
+@pytest.mark.parametrize("winner", [None, {"variant": "inference", "knobs": {}}])
+def test_prepared_eager_execution_does_not_poll_cache_or_peers(
+    protocol, monkeypatch, winner
+):
+    protocol, _ = protocol
+    backend, owner = protocol.backend, protocol.owner
+    state = owner._tuning_state
+    context = selection._context()
+    state.record_selection(winner, selection._cache_identity(context), None)
+    state.lookup_scope = (context.scope, selection._cache_identity(context))
+    backend.compute(owner, (None, None), output=None)
+
+    def unexpected(*args, **kwargs):
+        raise AssertionError("prepared execution must not poll tuning state")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(backend, "_gather", unexpected)
+        patch.setattr(selection, "_cache_identity", unexpected)
+        # Rank-local invalidation is reconciled in an explicit context.
+        AutoTuner.get().clear_cache()
+        for _ in range(3):
+            assert not backend.coordinate_workspace_replacement(owner)
+            backend.compute(owner, (None, None), output=None)
+            assert owner.tensors is None
+    with autotune_v2(mode="replay", persistent_cache=False):
+        assert not selection.prepared_for_serving(state, selection._context())
+        assert selection._pending(state, selection._context())
+    # Even an empty context must invalidate bare execution preparation.
+    assert not selection.prepared_for_serving(state, selection._context())
+
+
 def test_install_prepares_independent_storage_before_releasing_previous(
     protocol, monkeypatch
 ):

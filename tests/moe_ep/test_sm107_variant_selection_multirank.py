@@ -14,6 +14,7 @@ from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe.shim import (
     autotune as native,
 )
 from tests.moe_ep.sm107_test_utils import (
+    assert_prepared_eager_execution,
     assert_reference,
     canonical_reference,
     quantize,
@@ -159,6 +160,7 @@ def test_variant_search_replay_and_handoff(
             assert_reference(layer.forward(tensors), expected, kind)
         assert layer._workspace is old
         assert not calls
+        assert_prepared_eager_execution(layer, tensors, kind, monkeypatch)
         with autotune_v2(**context_options):
             layer.warmup(tensors)
         assert calls == expected_calls
@@ -171,6 +173,7 @@ def test_variant_search_replay_and_handoff(
             assert_reference(layer.forward(tensors), expected, kind)
         if scenario == "cupti":
             assert not tuner._cupti_disabled
+        assert_prepared_eager_execution(layer, tensors, kind, monkeypatch)
         graph.replay()
         torch.cuda.synchronize()
         assert_reference(old_output, expected, kind)
@@ -217,6 +220,9 @@ def test_variant_search_replay_and_handoff(
             )
             assert_reference(replay.forward(tensors, workspace=handle), expected, kind)
         assert calls == expected_calls
+        assert_prepared_eager_execution(
+            replay, tensors, kind, monkeypatch, workspace=handle
+        )
         handle.destroy()
         records = tuner.get_protocol_records(selection.NAMESPACE)
         choices = [replay.get_tuned_config().kernel_variant, replay.get_tuned_knobs()]

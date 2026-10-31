@@ -660,6 +660,7 @@ def autotune_v2_reload() -> None:
     when next selected. Reload inside a context scope raises ``RuntimeError``.
     """
     from .autotuner import AutoTuner
+    from .autotuner.protocol import _advance_execution_generation
 
     tuner = AutoTuner.get()
     if tuner._v2_local.active and tuner._v2_local.cache_scope == "context":
@@ -686,6 +687,7 @@ def autotune_v2_reload() -> None:
             # store's final published state is wanted -- serving afterwards
             # is warm from memory rather than paying a disk read per key.
             _hydrate_from_store(tuner, store)
+        _advance_execution_generation()
     logger.info(
         "[Autotuner]: autotune_v2_reload(): in-memory winners dropped; "
         "lookups now serve the managed store's current state."

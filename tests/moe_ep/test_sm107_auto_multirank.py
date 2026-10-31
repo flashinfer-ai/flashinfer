@@ -30,6 +30,7 @@ from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe.shim import (
     tuning_protocol,
 )
 from tests.moe_ep.sm107_test_utils import (
+    assert_prepared_eager_execution,
     assert_reference,
     canonical_reference,
     quantize,
@@ -227,6 +228,7 @@ def test_rubin_auto_persistence_and_capture(
             )
 
         assert_reference(layer.forward(tensors), reference(), kind)
+        assert_prepared_eager_execution(layer, tensors, kind, monkeypatch)
         old_graph.replay()
         torch.cuda.synchronize()
         assert_reference(old_output, reference(), kind)
@@ -311,6 +313,9 @@ def test_rubin_auto_persistence_and_capture(
             cached.warmup(tensors, workspace=handle)
         assert len(calls) == 1
         assert handle._backend_workspace is not cached._workspace
+        assert_prepared_eager_execution(
+            cached, tensors, kind, monkeypatch, workspace=handle
+        )
         graph.replay()
         torch.cuda.synchronize()
         assert_reference(output, reference(), kind)

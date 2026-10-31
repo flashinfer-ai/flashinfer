@@ -36,6 +36,29 @@ class RecordingProtocol:
 
 
 @pytest.mark.cpu_only
+def test_prepared_execution_generation_tracks_contexts_and_reload(managed):
+    from flashinfer import autotune_v2
+    from flashinfer.autotune_cache import autotune_v2_reload
+
+    def generation():
+        return managed.protocol_context("test.protocol").execution_generation
+
+    before = generation()
+    managed.clear_cache()
+    assert generation() == before
+    with autotune_v2(mode="replay", persistent_cache=False):
+        entered = generation()
+        assert entered > before
+        with autotune(False):
+            assert generation() > entered
+        exited_inner = generation()
+    assert generation() > exited_inner
+    before = generation()
+    autotune_v2_reload()
+    assert generation() > before
+
+
+@pytest.mark.cpu_only
 def test_protocol_uses_shared_controls_and_statistics():
     tuner = reset_autotuner()
     protocol = RecordingProtocol()
