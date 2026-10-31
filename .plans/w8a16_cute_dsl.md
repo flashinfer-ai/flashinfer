@@ -270,3 +270,18 @@ Until then the C++ stays as-is and the DSL kernel lives beside it.
   dynamo wrapper (a third), CuTe pointer objects built per call for an already compiled
   kernel.  Plan cached per shape, pointers built only at compile, raw stream handle:
   12 us per call, half the C++ op's.  Checks pass on H100 (algos 2, 7, 9, 12) and GB200.
+- Sat 31 Oct 2026, 08:30-10:00: the Hopper ping-pong gap, found and closed.  A K sweep
+  (CUPTI, M=4096, hot and cold L2) separated fixed cost from slope: the DSL 64x128 kernel
+  had a lower intercept but a 4-10% steeper slope (hot: 4.06 vs 3.69 ns per K).  SASS of
+  the two steady-state loops side by side (same LDS.U16 x4 / PRMT / SHL / LOP3 / HMUL2 /
+  HGMMA.64x128x16 per k-block, DEPBAR.LE 3): the one structural difference is that
+  CUTLASS issues SYNCS.PHASECHK.TRYWAIT on the next stage's full barrier right after the
+  first HGMMA of the current k-tile and blocks at the loop top only if that probe failed;
+  the DSL issued the blocking wait cold at the top.  Same probe now (consumer_try_wait
+  token into consumer_wait).  First attempt probed unconditionally and cost 3.5 us per
+  tile: try_wait on a stage nobody fills suspends the thread until the hardware time
+  limit, so the probe is skipped on an item's last k-tile.  Result (h23): 64x128 slope
+  3.41 ns per K (C++ 3.59); und.kv 4096 26.91 -> 26.56 cold (C++ 26.91), 22.98 -> 21.41
+  hot; 64x256 gen.qkv 4096 139.10 -> 135.95 (C++ 139.10).  Five-round H100 table: 17 of
+  18 rows DSL ahead (-0.1 to -4.8%), mlp.down 8192 +1.1% (a long row that swings with the
+  node's thermals: -3.4 / +0.8 / +1.3 / +1.1 across runs; being re-measured).
