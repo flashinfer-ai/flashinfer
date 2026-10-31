@@ -616,15 +616,16 @@ def test_fp32_grad_perf_size_precision(case, record_property) -> None:
 
 
 def test_document_isolation() -> None:
-    """Perturbing one document changes no output or ``dx`` row of another document."""
+    """Perturbing one document (the 3-token document, rows 1000..1002) changes no output or ``dx`` row of another
+    document."""
 
     S, C, docs = 4097, 512, (1000, 0, 3, 3094)
     x, w, cu, dy = _inputs(S, C, docs, key=5)
     y, (dx, _, _) = _forward(x, w, cu), _backward(x, w, cu, dy)
     x2 = x.clone()
-    x2[1003:1006] = torch.randn(3, C, device=_device()).to(BF16)
+    x2[1000:1003] = torch.randn(3, C, device=_device()).to(BF16)
     y2, (dx2, _, _) = _forward(x2, w, cu), _backward(x2, w, cu, dy)
-    others = torch.cat([torch.arange(0, 1003), torch.arange(1006, S)]).to(_device())
+    others = torch.cat([torch.arange(0, 1000), torch.arange(1003, S)]).to(_device())
     assert torch.equal(y[others], y2[others]) and torch.equal(dx[others], dx2[others])
 
 
