@@ -50,7 +50,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define CAKE_INF CUDART_INF_F
 #define TMEM_NCOLS 256
 #define TMEM_ACC_COLS_OFFSET 0
-#define NUM_MAIN_STAGES 1
 #define SMEM_S_DO_OFF 0
 #define SMEM_S_DO_STAGE_BYTES 16384
 #define SMEM_S_DO_STRIDE 16384

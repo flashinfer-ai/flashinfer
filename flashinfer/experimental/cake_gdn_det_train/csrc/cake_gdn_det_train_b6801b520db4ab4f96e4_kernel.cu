@@ -48,7 +48,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 }
 
 #define CAKE_INF CUDART_INF_F
-#define NUM_MAIN_STAGES 1
 #define SMEM_S_KN_OFF 0
 #define SMEM_S_KN_STAGE_BYTES 16384
 #define SMEM_S_KN_STRIDE 65536
@@ -511,10 +510,10 @@ kernel_cake_gdn_det_train_b6801b520db4ab4f96e4(__nv_bfloat16* __restrict__ qn, _
         int next_g_off = 64 - g_off;
         int _max_10 = ((num_chunks - rev - 2) > (0) ? (num_chunks - rev - 2) : (0));
         int _min_1_1 = ((_max_10) < (1) ? (_max_10) : (1));
-        int tok_1 = tid;
+        int tok_2 = tid;
         g_far[0] = 0.0f;
-        if (tok_1 < _min_1_1 * 64) {
-            g_far[0] = g_cs[(long long)(tok0 - 128 + tok_1) * (long long)num_v_heads + (long long)hv];
+        if (tok_2 < _min_1_1 * 64) {
+            g_far[0] = g_cs[(long long)(tok0 - 128 + tok_2) * (long long)num_v_heads + (long long)hv];
         }
         if (num_chunks > rev + 1) {
             int next_tok0 = tok0 - 64;
@@ -761,10 +760,10 @@ kernel_cake_gdn_det_train_b6801b520db4ab4f96e4(__nv_bfloat16* __restrict__ qn, _
             for (int half = 0; half < 2; half++) {
                 #pragma unroll
                 for (int e_1 = 0; e_1 < 2; e_1++) {
-                    int tok_1_0 = (tb * 2 + half) * 8 + quad * 2 + e_1;
+                    int tok_1 = (tb * 2 + half) * 8 + quad * 2 + e_1;
                     float decay = 0.0f;
-                    if (tok_1_0 < n_valid) {
-                        float _exp2_18 = approx_exp2(g_last - s_g[g_off + tok_1_0]);
+                    if (tok_1 < n_valid) {
+                        float _exp2_18 = approx_exp2(g_last - s_g[g_off + tok_1]);
                         decay = _exp2_18;
                     }
                     float dl_a = ((e_1 == 0) ? __uint_as_float(dvl_frag[half * 2] << 16) : __uint_as_float(dvl_frag[half * 2] & 4294901760u));
