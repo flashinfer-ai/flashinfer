@@ -3687,13 +3687,28 @@ def test_logprob_entry_matches_unchunked():
         inp.X, inp.W, inp.labels, fr.lse, inp.dlogp, chunk_size=64, backend="reference"
     )
     assert torch.equal(dx, result["dX"]) and torch.equal(dw, result["dW"])
-    plain = cake_backend.forward_logprob(
-        inp.X, inp.W, inp.labels, chunk_size=64, backend="reference", compact_rows=False
-    )
+    # the compacted and uncompacted statistics in one thread: a multi-threaded CPU GEMM may split the rows of the two
+    # shapes differently (a different summation order); the bits are compared for one fixed order
+    threads = torch.get_num_threads()
+    torch.set_num_threads(1)
+    try:
+        one = cake_backend.forward_logprob(
+            inp.X, inp.W, inp.labels, chunk_size=64, backend="reference"
+        )
+        plain = cake_backend.forward_logprob(
+            inp.X,
+            inp.W,
+            inp.labels,
+            chunk_size=64,
+            backend="reference",
+            compact_rows=False,
+        )
+    finally:
+        torch.set_num_threads(threads)
     assert (
         tuple(plain.lse.shape) == (inp.T,)
         and plain.row_index is None
-        and torch.equal(plain.lse[inp.valid], fr.lse)
+        and torch.equal(plain.lse[inp.valid], one.lse)
     )
     with pytest.raises(
         ValueError, match="lse"
