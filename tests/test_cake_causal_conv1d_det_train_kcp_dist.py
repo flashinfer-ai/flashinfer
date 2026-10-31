@@ -30,7 +30,7 @@ fragment that reads its history from three predecessor ranks).  Per row and rank
 - the handle retains exactly the history pool: ``nbytes() == n_hist_rows * C * 2``, the bytes still allocated after
   the checkpointed forward are that pool (0 for the plain checkpoint).
 
-Two launch forms (as ``tests/experimental/test_cake_kda_train_kcp_dist.py``): ``torch.multiprocessing`` (``pytest``:
+Two launch forms (as ``tests/experimental/test_cake_kda_det_train_kcp_dist.py``): ``torch.multiprocessing`` (``pytest``:
 skipped when fewer than ``W`` CUDA devices are visible) and one process per Slurm task (``SLURM_NTASKS == W``; the
 rendezvous from ``MASTER_ADDR`` / ``MASTER_PORT``; rows of another ``W`` are skipped under a multi-task step).
 """
