@@ -1,4 +1,5 @@
 import gc
+import importlib
 import json
 import random
 import tracemalloc
@@ -1515,16 +1516,16 @@ def test_cold_l2_profile_uses_full_flush_buffer(monkeypatch):
         cuda_graph_profile_replays=2,
     )
     allocations = []
-    original_empty = torch.empty
+    implementation = importlib.import_module("flashinfer.autotuner.autotuner")
+    original_make = implementation._make_l2_flush_buffer
 
-    def tracked_empty(*args, **kwargs):
-        result = original_empty(*args, **kwargs)
-        if kwargs.get("dtype") == torch.int8:
-            allocations.append((result.numel(), result.device))
+    def tracked_make(num_bytes, device):
+        result = original_make(num_bytes, device)
+        allocations.append((result.numel() * result.element_size(), result.device))
         return result
 
     monkeypatch.setattr(tuner, "_get_l2_cache_size_in_bytes", lambda device_id: 4096)
-    monkeypatch.setattr(torch, "empty", tracked_empty)
+    monkeypatch.setattr(implementation, "_make_l2_flush_buffer", tracked_make)
     monkeypatch.setattr(
         "flashinfer.autotuner.autotuner.delay_kernel", lambda delay_us: None
     )
