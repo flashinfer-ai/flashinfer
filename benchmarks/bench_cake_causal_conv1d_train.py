@@ -105,14 +105,18 @@ class Route:
     def describe(self) -> dict:
         return {
             "weight_dtype": str(self.weight_dtype).removeprefix("torch."),
-            "bias_dtype": None if self.bias_dtype is None else str(self.bias_dtype).removeprefix("torch."),
+            "bias_dtype": None
+            if self.bias_dtype is None
+            else str(self.bias_dtype).removeprefix("torch."),
             "silu_grad_preactivation": self.silu_grad_preactivation,
             "backward_route": self.backward_route(),
         }
 
 
 def perf_rows() -> list[tuple[int, int]]:
-    return [(tokens, P1_CHANNELS) for tokens in P1_TOKENS] + [(P2_TOKENS, c) for c in P2_CHANNELS]
+    return [(tokens, P1_CHANNELS) for tokens in P1_TOKENS] + [
+        (P2_TOKENS, c) for c in P2_CHANNELS
+    ]
 
 
 def doc_lengths(tokens: int) -> tuple[int, ...]:
@@ -180,9 +184,14 @@ def _memory(fn: Callable[[], object], device: torch.device) -> dict:
     return {"peak_temp_bytes": int(peak), "retained_bytes": int(retained)}
 
 
-def _latency_beside(fn: Callable[[], object], device: torch.device) -> tuple[float, float]:
+def _latency_beside(
+    fn: Callable[[], object], device: torch.device
+) -> tuple[float, float]:
     side = torch.cuda.Stream(device=device)
-    start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+    start, end = (
+        torch.cuda.Event(enable_timing=True),
+        torch.cuda.Event(enable_timing=True),
+    )
 
     def timed(beside: bool) -> float:
         torch.cuda.synchronize(device)
@@ -204,19 +213,33 @@ def _latency_beside(fn: Callable[[], object], device: torch.device) -> tuple[flo
 
 
 class Problem:
-    def __init__(self, tokens: int, channels: int, route: Route, device: torch.device) -> None:
+    def __init__(
+        self, tokens: int, channels: int, route: Route, device: torch.device
+    ) -> None:
         generator = torch.Generator(device=device).manual_seed(SEED)
         self.lens = doc_lengths(tokens)
-        self.cu = torch.tensor([0, *torch.tensor(self.lens).cumsum(0).tolist()], dtype=torch.int32, device=device)
-        self.x = torch.randn(tokens, channels, device=device, generator=generator, dtype=torch.bfloat16)
+        self.cu = torch.tensor(
+            [0, *torch.tensor(self.lens).cumsum(0).tolist()],
+            dtype=torch.int32,
+            device=device,
+        )
+        self.x = torch.randn(
+            tokens, channels, device=device, generator=generator, dtype=torch.bfloat16
+        )
         # N(0, 0.25): variance 0.25, standard deviation 0.5 (the bias too).
-        self.w = (torch.randn(channels, WIDTH, device=device, generator=generator) * 0.5).to(route.weight_dtype)
+        self.w = (
+            torch.randn(channels, WIDTH, device=device, generator=generator) * 0.5
+        ).to(route.weight_dtype)
         self.b = (
             None
             if route.bias_dtype is None
-            else (torch.randn(channels, device=device, generator=generator) * 0.5).to(route.bias_dtype)
+            else (torch.randn(channels, device=device, generator=generator) * 0.5).to(
+                route.bias_dtype
+            )
         )
-        self.dy = torch.randn(tokens, channels, device=device, generator=generator, dtype=torch.bfloat16)
+        self.dy = torch.randn(
+            tokens, channels, device=device, generator=generator, dtype=torch.bfloat16
+        )
 
 
 def _calls(p: Problem, route: Route, deterministic: bool, *, own_workspace: bool):
@@ -233,8 +256,12 @@ def _calls(p: Problem, route: Route, deterministic: bool, *, own_workspace: bool
     db = None if p.b is None else torch.empty(channels, dtype=p.b.dtype, device=device)
     fws = bws = None
     if own_workspace:
-        fws = conv.cake_causal_conv1d_train_forward_workspace(tokens, channels, device, deterministic=deterministic)
-        bws = conv.cake_causal_conv1d_train_backward_workspace(tokens, channels, device, deterministic=deterministic)
+        fws = conv.cake_causal_conv1d_train_forward_workspace(
+            tokens, channels, device, deterministic=deterministic
+        )
+        bws = conv.cake_causal_conv1d_train_backward_workspace(
+            tokens, channels, device, deterministic=deterministic
+        )
 
     def fwd():
         return conv.cake_causal_conv1d_train_forward(
@@ -258,7 +285,12 @@ def _calls(p: Problem, route: Route, deterministic: bool, *, own_workspace: bool
 
     def layer(x_, w_, b_):
         return conv.cake_causal_conv1d(
-            x_, w_, p.cu, b_, silu_grad_preactivation=route.silu_grad_preactivation, deterministic=deterministic
+            x_,
+            w_,
+            p.cu,
+            b_,
+            silu_grad_preactivation=route.silu_grad_preactivation,
+            deterministic=deterministic,
         )
 
     def ckpt():
@@ -274,17 +306,27 @@ def _calls(p: Problem, route: Route, deterministic: bool, *, own_workspace: bool
         for leaf in leaves:
             leaf.grad = None
 
-    return {"fwd": fwd, "bwd": bwd, "step": step, "ckpt": ckpt, "ckpt_memory": ckpt_dropping_grads}
+    return {
+        "fwd": fwd,
+        "bwd": bwd,
+        "step": step,
+        "ckpt": ckpt,
+        "ckpt_memory": ckpt_dropping_grads,
+    }
 
 
-def bench_row(tokens: int, channels: int, *, route: Route, device: torch.device, side_kernel: bool) -> dict:
+def bench_row(
+    tokens: int, channels: int, *, route: Route, device: torch.device, side_kernel: bool
+) -> dict:
     p = Problem(tokens, channels, route, device)
     arch = loader.arch_for_capability(torch.cuda.get_device_capability(device))
     result: dict = {
         "tokens": tokens,
         "channels": channels,
         "documents": list(p.lens),
-        "nondet_program": loader.selected_modules(arch, route.backward_route(), C=channels, S=tokens)[0],
+        "nondet_program": loader.selected_modules(
+            arch, route.backward_route(), C=channels, S=tokens
+        )[0],
         **route.describe(),
         "modes": {},
     }
@@ -311,10 +353,16 @@ def bench_row(tokens: int, channels: int, *, route: Route, device: torch.device,
             for phase in PHASES:
                 entry[f"{phase}_gpu_us"] = _gpu_ms(calls[phase]) * 1e3
                 wall, host = _host_ms(calls[phase], device)
-                entry[f"{phase}_wall_us"], entry[f"{phase}_host_us"] = wall * 1e3, host * 1e3
+                entry[f"{phase}_wall_us"], entry[f"{phase}_host_us"] = (
+                    wall * 1e3,
+                    host * 1e3,
+                )
             if side_kernel:
                 alone, beside = _latency_beside(calls["bwd"], device)
-                entry["bwd_alone_us"], entry["bwd_beside_us"] = alone * 1e3, beside * 1e3
+                entry["bwd_alone_us"], entry["bwd_beside_us"] = (
+                    alone * 1e3,
+                    beside * 1e3,
+                )
                 entry["bwd_beside_ratio"] = beside / alone
             out = calls["bwd"]()
             torch.cuda.synchronize(device)
@@ -335,7 +383,10 @@ def bench_row(tokens: int, channels: int, *, route: Route, device: torch.device,
         result["check"] = {
             "dx_bitwise_equal": bool(torch.equal(dx_d, dx_n)),
             "dweight_max_rel_diff": float(
-                ((dw_n.double() - dw_d.double()).abs().max() / dw_d.double().abs().max().clamp_min(1e-30)).item()
+                (
+                    (dw_n.double() - dw_d.double()).abs().max()
+                    / dw_d.double().abs().max().clamp_min(1e-30)
+                ).item()
             ),
         }
     return result
@@ -375,19 +426,45 @@ def _format(result: dict) -> list[str]:
 
 
 def main(argv: Optional[list[str]] = None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--tokens", type=int, nargs="*", default=None,
-                        help="packed token counts S; with --channels the rows are their product (default: the matrix)")
-    parser.add_argument("--channels", type=int, nargs="*", default=None, help="channel counts C")
-    parser.add_argument("--json", type=str, default=None, help="write all rows to this JSON file")
-    parser.add_argument("--weight-dtype", choices=sorted(DTYPES), default="float32",
-                        help="dtype of the taps and of dweight (bfloat16: the _dt routes)")
-    parser.add_argument("--bias", choices=("none", *sorted(DTYPES)), default="none",
-                        help="add a per-channel bias of this dtype (the _bias routes)")
-    parser.add_argument("--silu-grad-preactivation", choices=("bf16", "fp32"), default="bf16",
-                        help="the weight gradient's SiLU' policy (fp32: the _fp32g routes)")
-    parser.add_argument("--side-kernel", action="store_true",
-                        help="also time the backward's wall latency alone and beside a 1-thread kernel on another stream")
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument(
+        "--tokens",
+        type=int,
+        nargs="*",
+        default=None,
+        help="packed token counts S; with --channels the rows are their product (default: the matrix)",
+    )
+    parser.add_argument(
+        "--channels", type=int, nargs="*", default=None, help="channel counts C"
+    )
+    parser.add_argument(
+        "--json", type=str, default=None, help="write all rows to this JSON file"
+    )
+    parser.add_argument(
+        "--weight-dtype",
+        choices=sorted(DTYPES),
+        default="float32",
+        help="dtype of the taps and of dweight (bfloat16: the _dt routes)",
+    )
+    parser.add_argument(
+        "--bias",
+        choices=("none", *sorted(DTYPES)),
+        default="none",
+        help="add a per-channel bias of this dtype (the _bias routes)",
+    )
+    parser.add_argument(
+        "--silu-grad-preactivation",
+        choices=("bf16", "fp32"),
+        default="bf16",
+        help="the weight gradient's SiLU' policy (fp32: the _fp32g routes)",
+    )
+    parser.add_argument(
+        "--side-kernel",
+        action="store_true",
+        help="also time the backward's wall latency alone and beside a 1-thread kernel on another stream",
+    )
     args = parser.parse_args(argv)  # fmt: skip
     route = Route(
         weight_dtype=DTYPES[args.weight_dtype],
@@ -397,22 +474,38 @@ def main(argv: Optional[list[str]] = None) -> int:
     warnings.simplefilter("ignore", ExperimentalWarning)
     device = torch.device("cuda", torch.cuda.current_device())
     for mode, deterministic in MODES.items():
-        if not conv.is_cake_causal_conv1d_train_supported(device, deterministic=deterministic):
-            raise SystemExit(f"the {mode} package has no exported route on this device (or is not rendered)")
+        if not conv.is_cake_causal_conv1d_train_supported(
+            device, deterministic=deterministic
+        ):
+            raise SystemExit(
+                f"the {mode} package has no exported route on this device (or is not rendered)"
+            )
     if torch.are_deterministic_algorithms_enabled():
-        raise SystemExit("torch.use_deterministic_algorithms(True) would run both modes deterministically")
+        raise SystemExit(
+            "torch.use_deterministic_algorithms(True) would run both modes deterministically"
+        )
     arch = loader.arch_for_capability(torch.cuda.get_device_capability(device))
     if route.backward_route() not in loader.ROUTES[arch]:
-        raise SystemExit(f"the {route.backward_route()} route is not exported for {arch}")
-    print(f"device {torch.cuda.get_device_name(device)} {arch} CUDA {torch.version.cuda} torch {torch.__version__}")
+        raise SystemExit(
+            f"the {route.backward_route()} route is not exported for {arch}"
+        )
+    print(
+        f"device {torch.cuda.get_device_name(device)} {arch} CUDA {torch.version.cuda} torch {torch.__version__}"
+    )
     print(f"route: {route.describe()}")
     if args.tokens is None and args.channels is None:
         rows = perf_rows()
     else:
-        rows = [(s, c) for s in (args.tokens or [P2_TOKENS]) for c in (args.channels or [P1_CHANNELS])]
+        rows = [
+            (s, c)
+            for s in (args.tokens or [P2_TOKENS])
+            for c in (args.channels or [P1_CHANNELS])
+        ]
     results = []
     for tokens, channels in rows:
-        result = bench_row(tokens, channels, route=route, device=device, side_kernel=args.side_kernel)
+        result = bench_row(
+            tokens, channels, route=route, device=device, side_kernel=args.side_kernel
+        )
         results.append(result)
         for line in _format(result):
             print(line, flush=True)
@@ -422,7 +515,9 @@ def main(argv: Optional[list[str]] = None) -> int:
                 {
                     "device": torch.cuda.get_device_name(device),
                     "capability": list(torch.cuda.get_device_capability(device)),
-                    "sm_count": torch.cuda.get_device_properties(device).multi_processor_count,
+                    "sm_count": torch.cuda.get_device_properties(
+                        device
+                    ).multi_processor_count,
                     "cuda": torch.version.cuda,
                     "torch": torch.__version__,
                     "route": route.describe(),

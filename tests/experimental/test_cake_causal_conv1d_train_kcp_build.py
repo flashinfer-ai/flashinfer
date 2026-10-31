@@ -37,8 +37,26 @@ det_kcp_jit = cake_package("cake_causal_conv1d_det_train", "kcp_jit")
 
 ARCHES = ("sm_100a", "sm_103a", "sm_107a")
 NAME_FIELDS = ("kernel", "kernel_symbol", "library")
-PROGRAM_NAME = re.compile(r"cake_causal_conv1d_train_(?:TODOEXPORT_[a-z0-9_]+|[0-9a-f]{20})_kcp")
-CHANNELS = (8, 128, 256, 504, 512, 768, 1016, 1024, 1160, 1280, 1344, 1536, 2048, 4096, 8192)
+PROGRAM_NAME = re.compile(
+    r"cake_causal_conv1d_train_(?:TODOEXPORT_[a-z0-9_]+|[0-9a-f]{20})_kcp"
+)
+CHANNELS = (
+    8,
+    128,
+    256,
+    504,
+    512,
+    768,
+    1016,
+    1024,
+    1160,
+    1280,
+    1344,
+    1536,
+    2048,
+    4096,
+    8192,
+)
 ACCUMULATORS = {"acc": "float32", "kind": "accumulators", "taps": 4, "work": "uint32"}
 
 
@@ -63,10 +81,17 @@ def _pairs():
 def test_routes_mirror_the_deterministic_kcp_registry() -> None:
     assert kcp_jit.KINDS == det_kcp_jit.KINDS == ("kcp_fwd", "kcp_bwd", "kcp_bwd_head")
     assert kcp_jit.ARCHES == det_kcp_jit.ARCHES == ARCHES
-    routed = {name for by_kind in kcp_jit.ROUTES.values() for names in by_kind.values() for name in names}
+    routed = {
+        name
+        for by_kind in kcp_jit.ROUTES.values()
+        for names in by_kind.values()
+        for name in names
+    }
     assert set(kcp_jit.MODULES) == routed
     assert not set(kcp_jit.MODULES) & set(det_kcp_jit.MODULES)
-    assert not set(kcp_jit.MODULES) & set(cake_jit.MODULES), "the KCP programs are not the zero-history ones"
+    assert not set(kcp_jit.MODULES) & set(cake_jit.MODULES), (
+        "the KCP programs are not the zero-history ones"
+    )
     for name, record in kcp_jit.MODULES.items():
         assert PROGRAM_NAME.fullmatch(name), name
         assert record["library"] == record["kernel"] == name
@@ -98,8 +123,12 @@ def test_main_backward_records_are_ordinary_launches_with_accumulators() -> None
         assert record["role"] == "kcp_bwd" and record["arches"] == det["arches"], label
         assert record["ffi_entry"] == det["ffi_entry"] == "run", label
         assert _args(record) == (_args(det) - {"partial"}) | {"dw_acc", "work"}, label
-        assert record["logical"]["dw_acc"] == "acc" and record["logical"]["work"] == "work", label
-        assert [k for k, _ in record["arg_plan"][-3:]] == ["grid", "grid", "grid"], label
+        assert (
+            record["logical"]["dw_acc"] == "acc" and record["logical"]["work"] == "work"
+        ), label
+        assert [k for k, _ in record["arg_plan"][-3:]] == ["grid", "grid", "grid"], (
+            label
+        )
         assert set(record["logical"]) == _args(record), label
         assert set(record["logical"].values()) <= vocabulary, label
         grid = record["grid_rule"]
@@ -107,12 +136,17 @@ def test_main_backward_records_are_ordinary_launches_with_accumulators() -> None
         assert grid["geometry"] == det["grid_rule"]["geometry"], label
         # ``grid_mult`` (a rendered leaf): one positive factor per architecture of the record.
         assert set(grid["grid_mult"]) == set(record["arches"]), label
-        assert all(isinstance(f, int) and f >= 1 for f in grid["grid_mult"].values()), label
+        assert all(isinstance(f, int) and f >= 1 for f in grid["grid_mult"].values()), (
+            label
+        )
         assert isinstance(grid["ctas_per_sm"], int) and grid["ctas_per_sm"] >= 1, label
         launch = record["launch"]
         assert launch["cooperative"] is False and launch["use_pdl"] is False, label
         assert launch["block"] == det["launch"]["block"], label
-        assert isinstance(launch["dynamic_smem_bytes"], int) and launch["dynamic_smem_bytes"] >= 0
+        assert (
+            isinstance(launch["dynamic_smem_bytes"], int)
+            and launch["dynamic_smem_bytes"] >= 0
+        )
         assert kcp_jit.select_rule(record) == det_kcp_jit.select_rule(det), label
         assert record["workspace_rule"] == ACCUMULATORS, label
 
@@ -142,7 +176,10 @@ def test_kcp_backward_workspace(arch) -> None:
         layout = kcp_jit.accumulator_layout(owners[0], C, n_ch_tiles)
         assert layout["acc_dtype"] == "float32" and layout["acc_elems"] == 4 * C
         expected = -(-(-(-16 * C // 16) * 16 + 4 * n_ch_tiles) // 16) * 16
-        assert kcp_jit.workspace_bytes(arch, C) == layout["total_bytes"] == expected, (arch, C)
+        assert kcp_jit.workspace_bytes(arch, C) == layout["total_bytes"] == expected, (
+            arch,
+            C,
+        )
 
 
 @pytest.mark.cpu_only
@@ -152,6 +189,8 @@ def test_head_grid_is_the_deterministic_rule() -> None:
         (det_head,) = det_kcp_jit.ROUTES[arch]["kcp_bwd_head"]
         for n_frag in (0, 1, 3, 17):
             for C in CHANNELS:
-                assert kcp_jit.head_grid(kcp_jit.MODULES[head], n_frag=n_frag, C=C) == det_kcp_jit.head_grid(
+                assert kcp_jit.head_grid(
+                    kcp_jit.MODULES[head], n_frag=n_frag, C=C
+                ) == det_kcp_jit.head_grid(
                     det_kcp_jit.MODULES[det_head], n_frag=n_frag, C=C
                 )

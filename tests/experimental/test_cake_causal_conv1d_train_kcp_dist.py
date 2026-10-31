@@ -64,13 +64,17 @@ DW_ATOL, DW_RTOL = 5e-2, 1e-4
 REPEATS = 20
 
 
-def _run_rank(rank: int, W: int, row, port: int, result_dir: str | None, local_id: int) -> dict:
+def _run_rank(
+    rank: int, W: int, row, port: int, result_dir: str | None, local_id: int
+) -> dict:
     from torch.utils.checkpoint import checkpoint
 
     from flashinfer import cake_causal_conv1d_det_train as conv
     from flashinfer import cake_causal_conv1d_train_kcp as kcp_api
     from flashinfer.cake_causal_conv1d_det_train_backend import kcp as det_kcp
-    from flashinfer.experimental.cake.cake_causal_conv1d_train_backend import kcp as conv_kcp
+    from flashinfer.experimental.cake.cake_causal_conv1d_train_backend import (
+        kcp as conv_kcp,
+    )
     from flashinfer.experimental.cake_kda_train import cake_kcp_plan as plan
 
     lengths, _w, layout, C = row
@@ -94,10 +98,14 @@ def _run_rank(rank: int, W: int, row, port: int, result_dir: str | None, local_i
     n_hist = int(ctx.halo.n_hist_rows)
 
     def leaves():
-        return x.detach().clone().requires_grad_(True), w.detach().clone().requires_grad_(True)
+        return x.detach().clone().requires_grad_(
+            True
+        ), w.detach().clone().requires_grad_(True)
 
     def fn(x_, w_, h_):
-        return kcp_api.cake_causal_conv1d_kcp(x_, w_, ctx, recompute_handle=h_, deterministic=False)
+        return kcp_api.cake_causal_conv1d_kcp(
+            x_, w_, ctx, recompute_handle=h_, deterministic=False
+        )
 
     def run(mode: str, handle=None, *, twice: bool = False, reentrant: bool = False):
         xl, wl = leaves()
@@ -108,7 +116,13 @@ def _run_rank(rank: int, W: int, row, port: int, result_dir: str | None, local_i
                 kw = (
                     {"use_reentrant": True}
                     if reentrant
-                    else {"use_reentrant": False, "context_fn": lambda: (contextlib.nullcontext(), cc.recompute_cm())}
+                    else {
+                        "use_reentrant": False,
+                        "context_fn": lambda: (
+                            contextlib.nullcontext(),
+                            cc.recompute_cm(),
+                        ),
+                    }
                 )
                 y = checkpoint(fn, xl, wl, handle, **kw)
             else:
@@ -127,14 +141,21 @@ def _run_rank(rank: int, W: int, row, port: int, result_dir: str | None, local_i
             if twice:
                 y.backward(dy)
         out = {"y": y.detach(), "dx": xl.grad, "dw": wl.grad}
-        counts = {t: {p: cc.get(t, p) for p in ("orig", "recompute", "bwd")} for t in ("calls", "waits")}
+        counts = {
+            t: {p: cc.get(t, p) for p in ("orig", "recompute", "bwd")}
+            for t in ("calls", "waits")
+        }
         return out, counts
 
     def bits(t: torch.Tensor) -> torch.Tensor:
-        return t.contiguous().view(torch.int16 if t.element_size() == 2 else torch.int32)
+        return t.contiguous().view(
+            torch.int16 if t.element_size() == 2 else torch.int32
+        )
 
     def same(a: torch.Tensor, b: torch.Tensor) -> bool:
-        return a.dtype == b.dtype and a.shape == b.shape and torch.equal(bits(a), bits(b))
+        return (
+            a.dtype == b.dtype and a.shape == b.shape and torch.equal(bits(a), bits(b))
+        )
 
     def ratio(a: torch.Tensor, b: torch.Tensor, scale: float = 1.0) -> float:
         """The worst ``|a - b| / (atol + rtol |b|)`` at ``scale`` x the budget (``<= 1``: within budget)."""
@@ -144,10 +165,16 @@ def _run_rank(rank: int, W: int, row, port: int, result_dir: str | None, local_i
         a, b = a.double(), b.double()
         if not torch.isfinite(a).all():
             return float("inf")
-        return float(((a - b).abs() / (scale * DW_ATOL + scale * DW_RTOL * b.abs())).max())
+        return float(
+            ((a - b).abs() / (scale * DW_ATOL + scale * DW_RTOL * b.abs())).max()
+        )
 
     def eq(a, b, scale: float = 1.0) -> bool:
-        return same(a["y"], b["y"]) and same(a["dx"], b["dx"]) and ratio(a["dw"], b["dw"], scale) <= 1.0
+        return (
+            same(a["y"], b["y"])
+            and same(a["dx"], b["dx"])
+            and ratio(a["dw"], b["dw"], scale) <= 1.0
+        )
 
     flags: dict[str, bool] = {}
     info: dict[str, object] = {"n_hist_rows": n_hist, "T_r": int(x.shape[0])}
@@ -169,7 +196,9 @@ def _run_rank(rank: int, W: int, row, port: int, result_dir: str | None, local_i
     cu_dev = torch.tensor(cu, dtype=torch.int32, device=device)
     y_single = conv.cake_causal_conv1d_det(x_all.to(device), w, cu_dev)
     flags["y_eq_single_rank"] = same(direct["y"], _local(part, rank, cu, y_single))
-    flags["y_dx_eq_deterministic"] = same(direct["y"], det["y"]) and same(direct["dx"], det["dx"])
+    flags["y_dx_eq_deterministic"] = same(direct["y"], det["y"]) and same(
+        direct["dx"], det["dx"]
+    )
     flags["dw_within_budget_of_deterministic"] = ratio(direct["dw"], det["dw"]) <= 1.0
     # Repeated launches: dx bitwise every time, dweight within budget every time.
     worst, patterns, dx_ok = 0.0, set(), True
@@ -178,7 +207,11 @@ def _run_rank(rank: int, W: int, row, port: int, result_dir: str | None, local_i
         dx_ok = dx_ok and same(again["dx"], det["dx"]) and same(again["y"], det["y"])
         worst = max(worst, ratio(again["dw"], det["dw"]))
         patterns.add(bytes(again["dw"].contiguous().view(torch.uint8).cpu().numpy()))
-    info["repeats"] = {"n": REPEATS, "worst_dw_ratio_to_budget": worst, "distinct_dw_patterns": len(patterns)}
+    info["repeats"] = {
+        "n": REPEATS,
+        "worst_dw_ratio_to_budget": worst,
+        "distinct_dw_patterns": len(patterns),
+    }
     flags["repeats_dx_bitwise"] = dx_ok
     flags["repeats_dw_within_budget"] = worst <= 1.0
     # The rank partials' sum (the framework's reduction) against the deterministic partials' sum.
@@ -212,8 +245,16 @@ def _run_rank(rank: int, W: int, row, port: int, result_dir: str | None, local_i
     info["counts"]["nested_out"], info["counts"]["nested_in"] = c_nest_out, c_nest_in
     flags["nested_out_eq_direct"] = eq(nest_out, direct)
     flags["nested_in_eq_direct"] = eq(nest_in, direct)
-    flags["nested_out_counts"] = c_nest_out["calls"] == {"orig": 1, "recompute": 0, "bwd": 1}
-    flags["nested_in_counts"] = c_nest_in["calls"] == {"orig": 1, "recompute": 1, "bwd": 1}
+    flags["nested_out_counts"] = c_nest_out["calls"] == {
+        "orig": 1,
+        "recompute": 0,
+        "bwd": 1,
+    }
+    flags["nested_in_counts"] = c_nest_in["calls"] == {
+        "orig": 1,
+        "recompute": 1,
+        "bwd": 1,
+    }
     retained = {}
     for name, h in (("plain", None), ("handle", conv_kcp.RecomputeHandleKcp())):
         xl, wl = leaves()
@@ -229,7 +270,10 @@ def _run_rank(rank: int, W: int, row, port: int, result_dir: str | None, local_i
     flags["retained"] = retained["plain"] == 0 and retained["handle"] == n_hist * C * 2
     # A kernel resident on another stream of every rank (#7038 / #7548).
     side = torch.cuda.Stream(device=device)
-    start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+    start, end = (
+        torch.cuda.Event(enable_timing=True),
+        torch.cuda.Event(enable_timing=True),
+    )
     _, hist = conv_kcp.cake_causal_conv1d_forward_kcp(x, w, ctx, deterministic=False)
 
     def timed(with_side_kernel: bool) -> float:
@@ -239,7 +283,9 @@ def _run_rank(rank: int, W: int, row, port: int, result_dir: str | None, local_i
             with torch.cuda.stream(side):
                 torch.cuda._sleep(10_000_000)
         start.record()
-        dx_t, _ = conv_kcp.cake_causal_conv1d_backward_kcp(x, w, ctx, dy, hist, deterministic=False)
+        dx_t, _ = conv_kcp.cake_causal_conv1d_backward_kcp(
+            x, w, ctx, dy, hist, deterministic=False
+        )
         end.record()
         torch.cuda.synchronize(device)
         timed.dx = dx_t
@@ -261,14 +307,18 @@ def _run_rank(rank: int, W: int, row, port: int, result_dir: str | None, local_i
         "row": _row_id(row),
         "torch": torch.__version__,
         "flags": {k: all(f[k] for f in flag_list) for k in flags},
-        "failing_ranks": {k: [r for r, f in enumerate(flag_list) if not f[k]] for k in flags},
+        "failing_ranks": {
+            k: [r for r, f in enumerate(flag_list) if not f[k]] for k in flags
+        },
         "info_by_rank": info_list,
     }
     report["pass"] = all(report["flags"].values())
     dist.barrier()
     if rank == 0 and result_dir:
         os.makedirs(result_dir, exist_ok=True)
-        with open(os.path.join(result_dir, "nondet-" + _row_id(row) + ".json"), "w") as fh:
+        with open(
+            os.path.join(result_dir, "nondet-" + _row_id(row) + ".json"), "w"
+        ) as fh:
             json.dump(report, fh, indent=1, default=str)
     return report
 
@@ -301,7 +351,9 @@ def test_nondeterministic_kcp_rows(row) -> None:
         if ntasks != W:
             pytest.skip(f"a {ntasks}-task Slurm step runs the W={ntasks} rows only")
         if not _supported():
-            pytest.skip("the non-deterministic conv package is not rendered or does not support this device")
+            pytest.skip(
+                "the non-deterministic conv package is not rendered or does not support this device"
+            )
         report = _run_rank(
             int(os.environ["SLURM_PROCID"]),
             W,
@@ -313,13 +365,19 @@ def test_nondeterministic_kcp_rows(row) -> None:
         assert report["pass"], report
         return
     if not _supported():
-        pytest.skip("the non-deterministic conv package is not rendered or does not support this device")
+        pytest.skip(
+            "the non-deterministic conv package is not rendered or does not support this device"
+        )
     if torch.cuda.device_count() < W:
         pytest.skip(f"{W} CUDA devices required, {torch.cuda.device_count()} visible")
     with tempfile.TemporaryDirectory(prefix="cake_conv_kcp_nondet_dist_") as tmp:
         result_dir = os.environ.get("KCP_TEST_RESULT_DIR") or tmp
         mp.start_processes(
-            _spawn_entry, args=(W, row, _free_port(), result_dir), nprocs=W, join=True, start_method="spawn"
+            _spawn_entry,
+            args=(W, row, _free_port(), result_dir),
+            nprocs=W,
+            join=True,
+            start_method="spawn",
         )
         with open(os.path.join(result_dir, "nondet-" + _row_id(row) + ".json")) as fh:
             report = json.load(fh)

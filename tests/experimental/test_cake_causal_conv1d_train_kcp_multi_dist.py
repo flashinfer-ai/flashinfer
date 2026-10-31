@@ -66,7 +66,9 @@ def _ratio(a: torch.Tensor, b: torch.Tensor, scale: float = 1.0) -> float:
 
 def _eq(a, b, n: int, scale: float = 1.0) -> bool:
     return all(
-        _same(a[i]["y"], b[i]["y"]) and _same(a[i]["dx"], b[i]["dx"]) and _ratio(a[i]["dw"], b[i]["dw"], scale) <= 1.0
+        _same(a[i]["y"], b[i]["y"])
+        and _same(a[i]["dx"], b[i]["dx"])
+        and _ratio(a[i]["dw"], b[i]["dw"], scale) <= 1.0
         for i in range(n)
     )
 
@@ -77,7 +79,9 @@ def _run_rank(rank: int, W: int, row, port: int, result_dir, local_id: int) -> d
     from flashinfer import cake_causal_conv1d_det_train as conv
     from flashinfer import cake_causal_conv1d_det_train_kcp as det_api
     from flashinfer import cake_causal_conv1d_train_kcp as kcp_api
-    from flashinfer.experimental.cake.cake_causal_conv1d_train_backend import kcp as conv_kcp
+    from flashinfer.experimental.cake.cake_causal_conv1d_train_backend import (
+        kcp as conv_kcp,
+    )
 
     Cs = row[3]
     n = len(Cs)
@@ -95,7 +99,9 @@ def _run_rank(rank: int, W: int, row, port: int, result_dir, local_id: int) -> d
             if det:
                 return det_api.cake_causal_conv1d_det_multi_kcp(a_x, a_w, ctx)
             if multi:
-                return kcp_api.cake_causal_conv1d_multi_kcp(a_x, a_w, ctx, recompute_handle=a_h[0], **NONDET)
+                return kcp_api.cake_causal_conv1d_multi_kcp(
+                    a_x, a_w, ctx, recompute_handle=a_h[0], **NONDET
+                )
             return tuple(
                 kcp_api.cake_causal_conv1d_kcp(x, w, ctx, recompute_handle=h, **NONDET)
                 for x, w, h in zip(a_x, a_w, a_h, strict=True)
@@ -103,7 +109,9 @@ def _run_rank(rank: int, W: int, row, port: int, result_dir, local_id: int) -> d
 
         return fn
 
-    def run(multi: bool, mode: str, handles=None, *, twice=False, reentrant=False, det=False):
+    def run(
+        multi: bool, mode: str, handles=None, *, twice=False, reentrant=False, det=False
+    ):
         fn = layer(multi, det)
         if handles is None:
             handles = [None] if multi else [None] * n
@@ -113,37 +121,58 @@ def _run_rank(rank: int, W: int, row, port: int, result_dir, local_id: int) -> d
             if mode == "direct":
                 ys = fn(*xl, *wl, *handles)
             elif mode == "ckpt":
-                kw = {"use_reentrant": True} if reentrant else {"use_reentrant": False, "context_fn": ctx_fn}
+                kw = (
+                    {"use_reentrant": True}
+                    if reentrant
+                    else {"use_reentrant": False, "context_fn": ctx_fn}
+                )
                 ys = checkpoint(fn, *xl, *wl, *handles, **kw)
             else:
 
                 def outer(*args):
-                    hh = [conv_kcp.RecomputeHandleKcp()] if mode == "nested_in" else list(args[2 * n :])
+                    hh = (
+                        [conv_kcp.RecomputeHandleKcp()]
+                        if mode == "nested_in"
+                        else list(args[2 * n :])
+                    )
                     yi = checkpoint(fn, *args[: 2 * n], *hh, use_reentrant=False)
                     return tuple(y * torch.ones_like(y) for y in yi)
 
-                ys = checkpoint(outer, *xl, *wl, *handles, use_reentrant=False, context_fn=ctx_fn)
+                ys = checkpoint(
+                    outer, *xl, *wl, *handles, use_reentrant=False, context_fn=ctx_fn
+                )
             cc.phase = "bwd"
             torch.autograd.backward(list(ys), list(dys), retain_graph=twice)
             if twice:
                 torch.autograd.backward(list(ys), list(dys))
-        out = [{"y": y.detach(), "dx": x.grad, "dw": w.grad} for y, x, w in zip(ys, xl, wl, strict=True)]
+        out = [
+            {"y": y.detach(), "dx": x.grad, "dw": w.grad}
+            for y, x, w in zip(ys, xl, wl, strict=True)
+        ]
         rec = cc.record()
-        counts = {t: {p: rec[t].get(p, 0) for p in ("orig", "recompute", "bwd")} for t in ("calls", "waits")}
+        counts = {
+            t: {p: rec[t].get(p, 0) for p in ("orig", "recompute", "bwd")}
+            for t in ("calls", "waits")
+        }
         return out, counts
 
     def table(o, r, b):
         return {"orig": o, "recompute": r, "bwd": b}
 
     flags: dict[str, bool] = {}
-    info: dict[str, object] = {"n_hist_rows": int(ctx.halo.n_hist_rows), "T_r": int(xs[0].shape[0])}
+    info: dict[str, object] = {
+        "n_hist_rows": int(ctx.halo.n_hist_rows),
+        "T_r": int(xs[0].shape[0]),
+    }
     det, _ = run(True, "direct", det=True)
     s_direct, cs_direct = run(False, "direct")
     m_direct, cm_direct = run(True, "direct")
     m_plain, cm_plain = run(True, "ckpt")
     m_handle, cm_handle = run(True, "ckpt", [conv_kcp.RecomputeHandleKcp()])
     m_plain_re, _ = run(True, "ckpt", reentrant=True)
-    m_handle_re, cm_handle_re = run(True, "ckpt", [conv_kcp.RecomputeHandleKcp()], reentrant=True)
+    m_handle_re, cm_handle_re = run(
+        True, "ckpt", [conv_kcp.RecomputeHandleKcp()], reentrant=True
+    )
     m_twice, cm_twice = run(True, "ckpt", [conv_kcp.RecomputeHandleKcp()], twice=True)
     m_nest_out, cm_nest_out = run(True, "nested_out", [conv_kcp.RecomputeHandleKcp()])
     m_nest_in, cm_nest_in = run(True, "nested_in", [conv_kcp.RecomputeHandleKcp()])
@@ -154,7 +183,15 @@ def _run_rank(rank: int, W: int, row, port: int, result_dir, local_id: int) -> d
     }  # fmt: skip
     cu_dev = torch.tensor(cu, dtype=torch.int32, device=device)
     flags["y_eq_single_rank"] = all(
-        _same(m_direct[i]["y"], _local(part, rank, cu, conv.cake_causal_conv1d_det(xs_all[i].to(device), ws[i], cu_dev)))
+        _same(
+            m_direct[i]["y"],
+            _local(
+                part,
+                rank,
+                cu,
+                conv.cake_causal_conv1d_det(xs_all[i].to(device), ws[i], cu_dev),
+            ),
+        )
         for i in range(n)
     )
     flags["multi_eq_deterministic"] = _eq(m_direct, det, n)
@@ -169,7 +206,9 @@ def _run_rank(rank: int, W: int, row, port: int, result_dir, local_id: int) -> d
         and _ratio(m_twice[i]["dw"], m_direct[i]["dw"] + m_direct[i]["dw"], 2.0) <= 1.0
         for i in range(n)
     )
-    info["worst_dw_ratio_vs_det"] = max(_ratio(m_direct[i]["dw"], det[i]["dw"]) for i in range(n))
+    info["worst_dw_ratio_vs_det"] = max(
+        _ratio(m_direct[i]["dw"], det[i]["dw"]) for i in range(n)
+    )
     flags["counts"] = (
         cs_direct["calls"] == table(n, 0, n)
         and cm_direct["calls"] == table(1, 0, 1)
@@ -183,8 +222,12 @@ def _run_rank(rank: int, W: int, row, port: int, result_dir, local_id: int) -> d
     return _report(W, row, flags, info, result_dir, rank, "nondet-multi")
 
 
-def _run_rank_graph(rank: int, W: int, row, port: int, result_dir, local_id: int) -> dict:
-    from flashinfer.experimental.cake.cake_causal_conv1d_train_backend import kcp as conv_kcp
+def _run_rank_graph(
+    rank: int, W: int, row, port: int, result_dir, local_id: int
+) -> dict:
+    from flashinfer.experimental.cake.cake_causal_conv1d_train_backend import (
+        kcp as conv_kcp,
+    )
 
     device, part, cu, ctx, xs_all, xs, ws, dys = _setup(rank, W, row, port, local_id)
     ref = []
@@ -195,13 +238,22 @@ def _run_rank_graph(rank: int, W: int, row, port: int, result_dir, local_id: int
     events, ok, worst = [], True, 0.0
     try:
         for _ in range(4):
-            ys, hists = conv_kcp.cake_causal_conv1d_multi_forward_kcp(xs, ws, ctx, graph="replay", **NONDET)
+            ys, hists = conv_kcp.cake_causal_conv1d_multi_forward_kcp(
+                xs, ws, ctx, graph="replay", **NONDET
+            )
             events.append(conv_kcp.LAST_CALL["fwd_multi"]["graph_event"])
-            dxs, dws = conv_kcp.cake_causal_conv1d_multi_backward_kcp(xs, ws, ctx, dys, hists, graph="replay", **NONDET)
+            dxs, dws = conv_kcp.cake_causal_conv1d_multi_backward_kcp(
+                xs, ws, ctx, dys, hists, graph="replay", **NONDET
+            )
             events.append(conv_kcp.LAST_CALL["bwd_multi"]["graph_event"])
             torch.cuda.synchronize(device)
             for i, (y, hist, dx, dw) in enumerate(ref):
-                ok = ok and _same(ys[i], y) and _same(hists[i], hist) and _same(dxs[i], dx)
+                ok = (
+                    ok
+                    and _same(ys[i], y)
+                    and _same(hists[i], hist)
+                    and _same(dxs[i], dx)
+                )
                 worst = max(worst, _ratio(dws[i], dw))
     finally:
         torch.cuda.synchronize(device)
@@ -211,13 +263,28 @@ def _run_rank_graph(rank: int, W: int, row, port: int, result_dir, local_id: int
     elif int(ctx.halo.n_hist_rows) == 0:
         expected = ["eager", "eager", "capture", "capture"] + ["replay"] * 4
     else:
-        expected = ["eager", "eager", "capture", "eager", "replay", "capture", "replay", "replay"]
-    flags = {"graph_y_hist_dx_bitwise": ok, "graph_dw_within_budget": worst <= 1.0, "graph_events": events == expected}
+        expected = [
+            "eager",
+            "eager",
+            "capture",
+            "eager",
+            "replay",
+            "capture",
+            "replay",
+            "replay",
+        ]
+    flags = {
+        "graph_y_hist_dx_bitwise": ok,
+        "graph_dw_within_budget": worst <= 1.0,
+        "graph_events": events == expected,
+    }
     info = {"events": events, "worst_dw_ratio": worst, "T_r": int(xs[0].shape[0])}
     return _report(W, row, flags, info, result_dir, rank, "nondet-graph")
 
 
-def _spawn_entry(rank: int, W: int, row, port: int, result_dir: str, graph: bool) -> None:
+def _spawn_entry(
+    rank: int, W: int, row, port: int, result_dir: str, graph: bool
+) -> None:
     try:
         fn = _run_rank_graph if graph else _run_rank
         report = fn(rank, W, row, port, result_dir, rank)
@@ -248,7 +315,9 @@ def _launch(row, graph: bool) -> None:
         if ntasks != W:
             pytest.skip(f"a {ntasks}-task Slurm step runs the W={ntasks} rows only")
         if not _supported():
-            pytest.skip("the non-deterministic conv package is not rendered or does not support this device")
+            pytest.skip(
+                "the non-deterministic conv package is not rendered or does not support this device"
+            )
         fn = _run_rank_graph if graph else _run_rank
         report = fn(
             int(os.environ["SLURM_PROCID"]),
@@ -261,13 +330,19 @@ def _launch(row, graph: bool) -> None:
         assert report["pass"], report
         return
     if not _supported():
-        pytest.skip("the non-deterministic conv package is not rendered or does not support this device")
+        pytest.skip(
+            "the non-deterministic conv package is not rendered or does not support this device"
+        )
     if torch.cuda.device_count() < W:
         pytest.skip(f"{W} CUDA devices required, {torch.cuda.device_count()} visible")
     with tempfile.TemporaryDirectory(prefix="cake_conv_kcp_nondet_multi_dist_") as tmp:
         result_dir = os.environ.get("KCP_TEST_RESULT_DIR") or tmp
         mp.start_processes(
-            _spawn_entry, args=(W, row, _free_port(), result_dir, graph), nprocs=W, join=True, start_method="spawn"
+            _spawn_entry,
+            args=(W, row, _free_port(), result_dir, graph),
+            nprocs=W,
+            join=True,
+            start_method="spawn",
         )
         with open(os.path.join(result_dir, f"{tag}-{_row_id(row)}.json")) as fh:
             report = json.load(fh)

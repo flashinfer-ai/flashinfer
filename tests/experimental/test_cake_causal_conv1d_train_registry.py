@@ -51,8 +51,28 @@ REPO = Path(__file__).resolve().parents[2]
 ARCHES = ("sm_100a", "sm_103a", "sm_107a")
 NAME_FIELDS = ("kernel", "kernel_symbol", "library")
 # A placeholder name until the exporter renders the package, then the identity rule's prefix + 20 hex digits.
-PROGRAM_NAME = re.compile(r"cake_causal_conv1d_train_(?:TODOEXPORT_[a-z0-9_]+|[0-9a-f]{20})")
-CHANNELS = (8, 128, 136, 256, 512, 768, 1024, 1160, 1280, 1344, 1536, 1600, 1920, 2048, 2560, 4096, 8192)
+PROGRAM_NAME = re.compile(
+    r"cake_causal_conv1d_train_(?:TODOEXPORT_[a-z0-9_]+|[0-9a-f]{20})"
+)
+CHANNELS = (
+    8,
+    128,
+    136,
+    256,
+    512,
+    768,
+    1024,
+    1160,
+    1280,
+    1344,
+    1536,
+    1600,
+    1920,
+    2048,
+    2560,
+    4096,
+    8192,
+)
 TOKENS = (1, 1000, 65536, 98304, 147456, 250340)
 
 
@@ -96,7 +116,10 @@ def test_routes_mirror_the_deterministic_package() -> None:
     for arch in ARCHES:
         assert set(cake_jit.ROUTES[arch]) == set(det_jit.ROUTES[arch]), arch
     routed = {
-        name for by_kind in cake_jit.ROUTES.values() for names in by_kind.values() for name in names
+        name
+        for by_kind in cake_jit.ROUTES.values()
+        for names in by_kind.values()
+        for name in names
     }
     # No reduce program: every record is a routed forward or backward program.
     assert set(cake_jit.MODULES) == routed
@@ -118,7 +141,11 @@ def test_forward_records_are_the_deterministic_forward_records() -> None:
 
     for arch, kind, name, det_name in _pairs("fwd"):
         record, det = cake_jit.MODULES[name], det_jit.MODULES[det_name]
-        assert _strip(record, *NAME_FIELDS) == _strip(det, *NAME_FIELDS), (arch, kind, name)
+        assert _strip(record, *NAME_FIELDS) == _strip(det, *NAME_FIELDS), (
+            arch,
+            kind,
+            name,
+        )
 
 
 @pytest.mark.cpu_only
@@ -136,14 +163,25 @@ def test_backward_records_are_one_launch_with_accumulators() -> None:
         label = (arch, kind, name)
         assert record["role"] == "bwd" and record["arches"] == det["arches"], label
         assert record["ffi_entry"] == det["ffi_entry"], label
-        expected = (_args(det) - {"partial"}) | {"dw_acc", "work", "dw"} | ({"db"} if bias else set())
+        expected = (
+            (_args(det) - {"partial"})
+            | {"dw_acc", "work", "dw"}
+            | ({"db"} if bias else set())
+        )
         assert _args(record) == expected, label
-        assert [k for k, _ in record["arg_plan"][-3:]] == ["grid", "grid", "grid"], label
+        assert [k for k, _ in record["arg_plan"][-3:]] == ["grid", "grid", "grid"], (
+            label
+        )
         assert set(record["logical"]) == _args(record), label
         assert set(record["logical"].values()) <= vocabulary, label
-        assert record["logical"].get("x_map", "x") == "x" and record["logical"].get("dy_map", "dy") == "dy"
+        assert (
+            record["logical"].get("x_map", "x") == "x"
+            and record["logical"].get("dy_map", "dy") == "dy"
+        )
         # The global accumulators: kernel parameter ``dw_acc`` (the det fragments' ``acc`` is a register), logical ``acc``.
-        assert record["logical"]["dw_acc"] == "acc" and record["logical"]["work"] == "work", label
+        assert (
+            record["logical"]["dw_acc"] == "acc" and record["logical"]["work"] == "work"
+        ), label
         assert ("flags" in _args(record)) is (kind != "bwd"), label
         grid, det_grid = record["grid_rule"], det["grid_rule"]
         assert grid["kind"] == "occupancy" and grid["cooperative"] is False, label
@@ -155,7 +193,10 @@ def test_backward_records_are_one_launch_with_accumulators() -> None:
         assert launch["cooperative"] is False and launch["use_pdl"] is False, label
         assert launch["block"] == det["launch"]["block"], label
         assert launch["cluster"] == det["launch"]["cluster"], label
-        assert isinstance(launch["dynamic_smem_bytes"], int) and launch["dynamic_smem_bytes"] >= 0
+        assert (
+            isinstance(launch["dynamic_smem_bytes"], int)
+            and launch["dynamic_smem_bytes"] >= 0
+        )
         assert cake_jit.select_rule(record) == det_jit.select_rule(det), label
         assert record["workspace_rule"] == {
             "acc": "float64" if kind.endswith("fp32g") else "float32",
@@ -180,8 +221,14 @@ def test_selection_matches_the_deterministic_package(arch) -> None:
                 assert new.index(name) == det.index(det_name), (arch, kind, C, S)
                 record, det_record = cake_jit.MODULES[name], det_jit.MODULES[det_name]
                 geometry = record["grid_rule"]["geometry"]
-                assert cake_jit.plan(S, C, 3, geometry=geometry, role=record["role"]) == det_jit.plan(
-                    S, C, 3, geometry=det_record["grid_rule"]["geometry"], role=det_record["role"]
+                assert cake_jit.plan(
+                    S, C, 3, geometry=geometry, role=record["role"]
+                ) == det_jit.plan(
+                    S,
+                    C,
+                    3,
+                    geometry=det_record["grid_rule"]["geometry"],
+                    role=det_record["role"],
                 ), (arch, kind, C, S)
 
 
@@ -234,14 +281,25 @@ def test_backward_workspace_serves_every_backward_program(arch) -> None:
     (40 bytes per channel)."""
 
     owner = cake_jit.workspace_record(arch)
-    assert owner["workspace_rule"]["acc"] == "float64" and owner["workspace_rule"]["taps"] == 5
+    assert (
+        owner["workspace_rule"]["acc"] == "float64"
+        and owner["workspace_rule"]["taps"] == 5
+    )
     owners = cake_jit.workspace_owners(arch)
-    assert len(owners) == sum(len(cake_jit.route_modules(arch, kind)) for kind in cake_jit.backward_kinds(arch))
+    assert len(owners) == sum(
+        len(cake_jit.route_modules(arch, kind))
+        for kind in cake_jit.backward_kinds(arch)
+    )
     for C in CHANNELS:
         nbytes = cake_jit.backward_workspace_bytes(arch, C)
         for record in owners:
-            _, _, n_ch_tiles = cake_jit.channel_split(C, geometry=record["grid_rule"]["geometry"], role="bwd")
-            assert cake_jit.accumulator_layout(record, C, n_ch_tiles)["total_bytes"] <= nbytes, (arch, C)
+            _, _, n_ch_tiles = cake_jit.channel_split(
+                C, geometry=record["grid_rule"]["geometry"], role="bwd"
+            )
+            assert (
+                cake_jit.accumulator_layout(record, C, n_ch_tiles)["total_bytes"]
+                <= nbytes
+            ), (arch, C)
         assert nbytes == _align16(_align16(40 * C) + 4 * cake_jit.channel_split(
             C, geometry=owner["grid_rule"]["geometry"], role="bwd")[2])  # fmt: skip
 
@@ -266,7 +324,9 @@ def test_entry_points_take_the_deterministic_keyword() -> None:
         p = inspect.signature(getattr(pkg, name)).parameters["deterministic"]
         assert p.kind is inspect.Parameter.KEYWORD_ONLY and p.default is True, name
         assert name in pkg.__all__
-    p = inspect.signature(pkg.CakeCausalConv1dFunction.forward).parameters["deterministic"]
+    p = inspect.signature(pkg.CakeCausalConv1dFunction.forward).parameters[
+        "deterministic"
+    ]
     assert p.default is True
     assert "CakeCausalConv1dFunction" in pkg.__all__
 
@@ -291,7 +351,13 @@ def test_entry_points_refuse_a_deterministic_mode_first() -> None:
         "bwd_ws_bytes": lambda d: pkg.cake_causal_conv1d_train_backward_workspace_bytes(8, 16, cpu, **d),
     }  # fmt: skip
     for name, call in calls.items():
-        for kwargs in ({}, {"deterministic": True}, {"deterministic": 0}, {"deterministic": None}, {"deterministic": "False"}):
+        for kwargs in (
+            {},
+            {"deterministic": True},
+            {"deterministic": 0},
+            {"deterministic": None},
+            {"deterministic": "False"},
+        ):
             with pytest.raises(ValueError, match="deterministic=False") as info:
                 call(kwargs)
             assert "flashinfer.cake_causal_conv1d_det_train" in str(info.value), name
@@ -316,10 +382,14 @@ def test_unrendered_package_reports_unsupported() -> None:
 
 @pytest.mark.cpu_only
 def test_package_wiring() -> None:
-    assert pkg.__name__ == "flashinfer.experimental.cake.cake_causal_conv1d_train_backend"
+    assert (
+        pkg.__name__ == "flashinfer.experimental.cake.cake_causal_conv1d_train_backend"
+    )
     tree = ast.parse((REPO / "flashinfer/experimental/cake/__init__.py").read_text())
     assert ast.get_docstring(tree)
-    assert not [node for node in tree.body if isinstance(node, (ast.Import, ast.ImportFrom))]
+    assert not [
+        node for node in tree.body if isinstance(node, (ast.Import, ast.ImportFrom))
+    ]
     assert len(tree.body) == 1, "flashinfer.experimental.cake holds a docstring only"
     try:
         import tomllib
@@ -354,12 +424,20 @@ def test_build_manifest_lists_every_program() -> None:
                     continue
                 entry = libraries[registry.library_name(name, arch)]
                 assert entry["arch"] == arch and entry["entry"] == "run", library
-                assert entry["sources"] == [f"csrc/{name}_kernel.cu", f"csrc/{name}_binding.cu"]
+                assert entry["sources"] == [
+                    f"csrc/{name}_kernel.cu",
+                    f"csrc/{name}_binding.cu",
+                ]
                 assert "--use_fast_math" not in entry["nvcc_flags"], library
-                assert {"--prec-div=true", "--prec-sqrt=true", "--ftz=false"} <= set(entry["nvcc_flags"])
+                assert {"--prec-div=true", "--prec-sqrt=true", "--ftz=false"} <= set(
+                    entry["nvcc_flags"]
+                )
                 for source in entry["sources"]:
                     path = PACKAGE_DIR / source
                     assert path.is_file(), source
-                    assert hashlib.sha256(path.read_bytes()).hexdigest() == entry["sha256"][source], source
+                    assert (
+                        hashlib.sha256(path.read_bytes()).hexdigest()
+                        == entry["sha256"][source]
+                    ), source
                 referenced.add(library)
     assert referenced == set(libraries)

@@ -231,9 +231,7 @@ def cake_causal_conv1d_train_forward_workspace_bytes(
             f"deterministic must be a bool, got {type(deterministic).__name__}"
         )
     if deterministic:
-        return _det().cake_causal_conv1d_det_train_forward_workspace_bytes(
-            S, C, device
-        )
+        return _det().cake_causal_conv1d_det_train_forward_workspace_bytes(S, C, device)
     return _backend().cake_causal_conv1d_train_forward_workspace_bytes(
         S, C, device, deterministic=False
     )

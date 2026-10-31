@@ -98,7 +98,11 @@ ROUTE_CASES = (
     (4097, 1344, (1000, 0, 3, 3094)),
 )
 # A large row per architecture class for the run-to-run checks (many CTAs per channel tile race on the accumulators).
-REPEAT_CASES = ((65536, 512, "perf"), (65536, 1280, "perf"), (4097, 1160, (1000, 0, 3, 3094)))
+REPEAT_CASES = (
+    (65536, 512, "perf"),
+    (65536, 1280, "perf"),
+    (4097, 1160, (1000, 0, 3, 3094)),
+)
 PRECISION_CASES = ((250340, 512, "perf"), (250340, 1280, "perf"))
 PRECISION_REPEATS = 5
 GRAPH_CASES = (
@@ -382,9 +386,7 @@ def _assert_within(actual, expected, *, atol, rtol, label) -> float:
 
 
 def _forward(x, w, cu, **kwargs) -> torch.Tensor:
-    return pkg.cake_causal_conv1d_train_forward(
-        x, w, cu, deterministic=False, **kwargs
-    )
+    return pkg.cake_causal_conv1d_train_forward(x, w, cu, deterministic=False, **kwargs)
 
 
 def _backward(x, w, cu, dy, b=None, policy="bf16", **kwargs):
@@ -501,17 +503,29 @@ def test_matches_the_deterministic_package(case, kind, record_property) -> None:
     )
     dx, dw, db = _backward(x, w, cu, dy, b, policy)
     dx_d, dw_d, db_d = _det_backward(det, x, w, cu, dy, b, policy)
-    assert torch.equal(dx, dx_d), f"dx differs from the deterministic package ({kind} {case})"
+    assert torch.equal(dx, dx_d), (
+        f"dx differs from the deterministic package ({kind} {case})"
+    )
     atol, rtol = _grad_tolerance(policy, dw.dtype)
     worst = _assert_within(
-        dw.float(), dw_d.float(), atol=atol, rtol=rtol, label=f"dweight vs det {kind} {case}"
+        dw.float(),
+        dw_d.float(),
+        atol=atol,
+        rtol=rtol,
+        label=f"dweight vs det {kind} {case}",
     )
-    record_property("dweight_vs_det_max_abs", float((dw.double() - dw_d.double()).abs().max()))
+    record_property(
+        "dweight_vs_det_max_abs", float((dw.double() - dw_d.double()).abs().max())
+    )
     record_property("dweight_vs_det_worst_ratio_to_budget", worst)
     if db is not None:
         atol, rtol = _grad_tolerance(policy, db.dtype)
         _assert_within(
-            db.float(), db_d.float(), atol=atol, rtol=rtol, label=f"dbias vs det {kind} {case}"
+            db.float(),
+            db_d.float(),
+            atol=atol,
+            rtol=rtol,
+            label=f"dbias vs det {kind} {case}",
         )
 
 
@@ -538,7 +552,9 @@ def test_repeated_launches_worst_case(case, kind, record_property) -> None:
         if dx0 is None:
             dx0 = dx.clone()
         else:
-            assert torch.equal(dx, dx0), f"dx changed at repeat {repeat} ({kind} {case})"
+            assert torch.equal(dx, dx0), (
+                f"dx changed at repeat {repeat} ({kind} {case})"
+            )
         r_dw, r_db = _check_grads(
             dx, dw, db, refs, policy=policy, label=f"{kind} {case} repeat {repeat}"
         )
@@ -560,7 +576,9 @@ def test_repeated_launches_worst_case(case, kind, record_property) -> None:
     except Exception:  # noqa: BLE001 - parity only where the det package is importable
         return
     dx_d, _, _ = _det_backward(det, x, w, cu, dy, b, policy)
-    assert torch.equal(dx0, dx_d), f"dx differs from the deterministic package ({kind} {case})"
+    assert torch.equal(dx0, dx_d), (
+        f"dx differs from the deterministic package ({kind} {case})"
+    )
 
 
 def _rel_l2(actual: torch.Tensor, expected: torch.Tensor) -> float:
@@ -666,7 +684,9 @@ def test_changed_shapes_reuse_one_zero_workspace(kind) -> None:
             refs = reference_backward(x, w, cu, dy, b=b, policy=policy)
             kwargs = {"workspace": workspace} if own else {}
             dx, dw, db = _backward(x, w, cu, dy, b, policy, **kwargs)
-            _check_grads(dx, dw, db, refs, policy=policy, label=f"{kind} S={S} C={C} own={own}")
+            _check_grads(
+                dx, dw, db, refs, policy=policy, label=f"{kind} S={S} C={C} own={own}"
+            )
             held = workspace if own else _stream_workspace(device)
             assert held is not None
             assert int(torch.count_nonzero(held)) == 0, (
@@ -681,7 +701,11 @@ def test_nan_poisoned_outputs_are_overwritten(kind) -> None:
         x, w, cu, dy, b, policy = _route_inputs(S, C, docs, kind, key=7)
         dx = torch.full_like(x, float("nan"))
         dw = torch.full((C, WIDTH), float("nan"), dtype=w.dtype, device=_device())
-        db = None if b is None else torch.full((C,), float("nan"), dtype=b.dtype, device=_device())
+        db = (
+            None
+            if b is None
+            else torch.full((C,), float("nan"), dtype=b.dtype, device=_device())
+        )
         y = torch.full_like(x, float("nan"))
         _forward(x, w, cu, bias=b, out=y)
         got = _backward(x, w, cu, dy, b, policy, dx=dx, dweight=dw, dbias=db)
@@ -700,14 +724,28 @@ def test_workspace_validation() -> None:
         S, C, _device(), deterministic=False
     )
     with pytest.raises(ValueError, match="workspace holds"):
-        _backward(x, w, cu, dy, workspace=torch.zeros(16, dtype=torch.uint8, device=_device()))
+        _backward(
+            x, w, cu, dy, workspace=torch.zeros(16, dtype=torch.uint8, device=_device())
+        )
     with pytest.raises(ValueError, match="uint8"):
-        _backward(x, w, cu, dy, workspace=torch.zeros(nbytes // 4, dtype=torch.int32, device=_device()))
+        _backward(
+            x,
+            w,
+            cu,
+            dy,
+            workspace=torch.zeros(nbytes // 4, dtype=torch.int32, device=_device()),
+        )
     with pytest.raises(ValueError, match="aligned"):
         big = torch.zeros(nbytes + 16, dtype=torch.uint8, device=_device())
         _backward(x, w, cu, dy, workspace=big[1 : nbytes + 1])
     with pytest.raises(ValueError, match="1-D"):
-        _backward(x, w, cu, dy, workspace=torch.zeros(1, nbytes, dtype=torch.uint8, device=_device()))
+        _backward(
+            x,
+            w,
+            cu,
+            dy,
+            workspace=torch.zeros(1, nbytes, dtype=torch.uint8, device=_device()),
+        )
 
 
 # ----------------------------------------------------------------------------------------------------------------
@@ -731,14 +769,30 @@ def _capture_and_replay(cases, kind: str, *, key: int, own_workspace: bool) -> i
         dw = torch.empty(C, WIDTH, dtype=w.dtype, device=device)
         db = None if b is None else torch.empty(C, dtype=b.dtype, device=device)
         workspace = (
-            pkg.cake_causal_conv1d_train_backward_workspace(S, C, device, deterministic=False)
+            pkg.cake_causal_conv1d_train_backward_workspace(
+                S, C, device, deterministic=False
+            )
             if own_workspace
             else None
         )
 
-        def step(x=x, w=w, cu=cu, dy=dy, b=b, policy=policy, y=y, dx=dx, dw=dw, db=db, ws=workspace):
+        def step(
+            x=x,
+            w=w,
+            cu=cu,
+            dy=dy,
+            b=b,
+            policy=policy,
+            y=y,
+            dx=dx,
+            dw=dw,
+            db=db,
+            ws=workspace,
+        ):
             _forward(x, w, cu, bias=b, out=y)
-            _backward(x, w, cu, dy, b, policy, workspace=ws, dx=dx, dweight=dw, dbias=db)
+            _backward(
+                x, w, cu, dy, b, policy, workspace=ws, dx=dx, dweight=dw, dbias=db
+            )
 
         side = torch.cuda.Stream(device=device)
         side.wait_stream(torch.cuda.current_stream(device))
@@ -750,9 +804,22 @@ def _capture_and_replay(cases, kind: str, *, key: int, own_workspace: bool) -> i
         with torch.cuda.graph(graph, stream=side):
             step()
         torch.cuda.synchronize(device)
-        captured.append((graph, (x, w, cu, dy, b), (y, dx, dw, db), (eager_y, eager_dx), refs, policy, workspace))
+        captured.append(
+            (
+                graph,
+                (x, w, cu, dy, b),
+                (y, dx, dw, db),
+                (eager_y, eager_dx),
+                refs,
+                policy,
+                workspace,
+            )
+        )
     replays = 0
-    for graph, _alive, (y, dx, dw, db), (eager_y, eager_dx), refs, policy, workspace in captured:
+    for graph, _alive, (y, dx, dw, db), (
+        eager_y,
+        eager_dx,
+    ), refs, policy, workspace in captured:
         for _replay in range(GRAPH_REPLAYS):
             for t in (y, dx, dw, db):
                 if t is not None:
@@ -760,9 +827,15 @@ def _capture_and_replay(cases, kind: str, *, key: int, own_workspace: bool) -> i
             graph.replay()
             torch.cuda.synchronize(device)
             replays += 1
-            assert torch.equal(y, eager_y), f"y of replay {replays} differs from eager ({kind})"
-            assert torch.equal(dx, eager_dx), f"dx of replay {replays} differs from eager ({kind})"
-            _check_grads(dx, dw, db, refs, policy=policy, label=f"replay {replays} ({kind})")
+            assert torch.equal(y, eager_y), (
+                f"y of replay {replays} differs from eager ({kind})"
+            )
+            assert torch.equal(dx, eager_dx), (
+                f"dx of replay {replays} differs from eager ({kind})"
+            )
+            _check_grads(
+                dx, dw, db, refs, policy=policy, label=f"replay {replays} ({kind})"
+            )
             if workspace is not None:
                 assert int(torch.count_nonzero(workspace)) == 0
     return replays
@@ -790,12 +863,18 @@ def test_two_streams_with_two_workspaces() -> None:
     streams = [torch.cuda.Stream(device=device) for _ in problems]
     for own in (True, False):
         workspaces = [
-            pkg.cake_causal_conv1d_train_backward_workspace(S, C, device, deterministic=False) if own else None
+            pkg.cake_causal_conv1d_train_backward_workspace(
+                S, C, device, deterministic=False
+            )
+            if own
+            else None
             for _ in problems
         ]
         results = [None, None]
         torch.cuda.synchronize(device)
-        for i, ((x, w, cu, dy), stream) in enumerate(zip(problems, streams, strict=True)):
+        for i, ((x, w, cu, dy), stream) in enumerate(
+            zip(problems, streams, strict=True)
+        ):
             with torch.cuda.stream(stream):
                 kwargs = {"workspace": workspaces[i]} if own else {}
                 results[i] = _backward(x, w, cu, dy, **kwargs)
@@ -803,7 +882,9 @@ def test_two_streams_with_two_workspaces() -> None:
         for i, stream in enumerate(streams):
             dx, dw, _ = results[i]
             assert torch.equal(dx, expected[i][0]), f"dx of stream {i} (own={own})"
-            _check_grads(dx, dw, None, refs[i], policy="bf16", label=f"stream {i} own={own}")
+            _check_grads(
+                dx, dw, None, refs[i], policy="bf16", label=f"stream {i} own={own}"
+            )
             if own:
                 assert int(torch.count_nonzero(workspaces[i])) == 0
             else:
@@ -846,13 +927,18 @@ def test_backward_is_one_launch_with_zeroed_accumulators(monkeypatch) -> None:
         acc_dtype = torch.float64 if "fp32g" in kind else torch.float32
         taps = 5 if "bias" in kind else 4
         assert values["acc"].dtype == acc_dtype and values["acc"].numel() == taps * C
-        assert values["work"].dtype == torch.uint32 and values["work"].numel() == values["n_ch_tiles"]
+        assert (
+            values["work"].dtype == torch.uint32
+            and values["work"].numel() == values["n_ch_tiles"]
+        )
         assert layout["acc_elems"] == taps * C
         assert acc_nonzero == 0 and work_nonzero == 0
         assert {"x", "w", "cu", "dy", "dx", "dw", "acc", "work"} <= set(values)
 
 
-def test_backward_keeps_its_speed_beside_a_resident_side_kernel(record_property) -> None:
+def test_backward_keeps_its_speed_beside_a_resident_side_kernel(
+    record_property,
+) -> None:
     """FlashInfer issues #7038 / #7548: one 1-thread kernel resident on another stream must not stall the
     one-launch backward (``busy <= 2 x alone``, medians of 7 after 3 warm-ups, CUDA events on the current stream);
     ``dx`` is bitwise unchanged beside it and ``dweight`` stays within budget."""
@@ -860,7 +946,9 @@ def test_backward_keeps_its_speed_beside_a_resident_side_kernel(record_property)
     device = _device()
     S, C, docs = 261393, 512, "perf"
     x, w, cu, dy = _inputs(S, C, docs)
-    workspace = pkg.cake_causal_conv1d_train_backward_workspace(S, C, device, deterministic=False)
+    workspace = pkg.cake_causal_conv1d_train_backward_workspace(
+        S, C, device, deterministic=False
+    )
     dx = torch.empty_like(x)
     dw = torch.empty(C, WIDTH, dtype=torch.float32, device=device)
     side = torch.cuda.Stream(device=device)
@@ -884,12 +972,16 @@ def test_backward_keeps_its_speed_beside_a_resident_side_kernel(record_property)
     alone = statistics.median(timed(False) for _ in range(7))
     dx_alone, dw_alone = dx.clone(), dw.clone()
     busy = statistics.median(timed(True) for _ in range(7))
-    print(f"backward alone {alone:.3f} ms, beside a resident kernel {busy:.3f} ms ({busy / alone:.2f}x)")
+    print(
+        f"backward alone {alone:.3f} ms, beside a resident kernel {busy:.3f} ms ({busy / alone:.2f}x)"
+    )
     record_property("backward_alone_ms", f"{alone:.4f}")
     record_property("backward_beside_side_kernel_ms", f"{busy:.4f}")
     record_property("busy_over_alone", f"{busy / alone:.3f}")
     assert torch.equal(dx, dx_alone), "dx changed beside the side kernel"
-    _assert_within(dw, dw_alone, atol=DW_ATOL, rtol=DW_RTOL, label="dweight beside the side kernel")
+    _assert_within(
+        dw, dw_alone, atol=DW_ATOL, rtol=DW_RTOL, label="dweight beside the side kernel"
+    )
     assert busy <= 2.0 * alone, (
         f"the backward stalled behind a kernel resident on another stream: {busy:.3f} ms vs {alone:.3f} ms"
     )
@@ -908,7 +1000,9 @@ def test_zero_tokens_return_empty_outputs() -> None:
     db_out = torch.full((C,), float("nan"), dtype=BF16, device=_device())
     dx, dw, db = _backward(x, w, cu, x, b, "fp32", dweight=dw_out, dbias=db_out)
     assert dw is dw_out and db is db_out
-    assert torch.equal(dw, torch.zeros_like(dw)) and torch.equal(db, torch.zeros_like(db))
+    assert torch.equal(dw, torch.zeros_like(dw)) and torch.equal(
+        db, torch.zeros_like(db)
+    )
 
 
 # ----------------------------------------------------------------------------------------------------------------
@@ -930,13 +1024,20 @@ def test_autograd_end_to_end(kind) -> None:
         x = x0.detach().clone().requires_grad_(True)
         w = w0.detach().clone().requires_grad_(True)
         b = None if b0 is None else b0.detach().clone().requires_grad_(True)
-        y = pkg.cake_causal_conv1d(x, w, cu, b, silu_grad_preactivation=policy, deterministic=False)
+        y = pkg.cake_causal_conv1d(
+            x, w, cu, b, silu_grad_preactivation=policy, deterministic=False
+        )
         assert torch.equal(y.detach(), _forward(x0, w0, cu, bias=b0))
         y.backward(incoming)
         assert x.grad.dtype == BF16 and torch.equal(x.grad, dx_direct)
         assert w.grad.dtype == w0.dtype and (b is None or b.grad.dtype == b0.dtype)
         _check_grads(
-            x.grad, w.grad, None if b is None else b.grad, refs, policy=policy, label=f"autograd {kind}"
+            x.grad,
+            w.grad,
+            None if b is None else b.grad,
+            refs,
+            policy=policy,
+            label=f"autograd {kind}",
         )
 
 
@@ -957,13 +1058,19 @@ def test_non_reentrant_checkpoint_is_two_forwards_and_a_backward() -> None:
         b = b0.detach().clone().requires_grad_(True)
 
         def layer(x, w, b):
-            return pkg.cake_causal_conv1d(x, w, cu, b, silu_grad_preactivation=policy, deterministic=False)
+            return pkg.cake_causal_conv1d(
+                x, w, cu, b, silu_grad_preactivation=policy, deterministic=False
+            )
 
         y = checkpoint(layer, x, w, b, use_reentrant=False) if ckpt else layer(x, w, b)
         y.backward(dy)
         results.append((y.detach(), x.grad, w.grad, b.grad))
-        _check_grads(x.grad, w.grad, b.grad, refs, policy=policy, label=f"checkpoint={ckpt}")
-    assert torch.equal(results[0][0], results[1][0]) and torch.equal(results[0][1], results[1][1])
+        _check_grads(
+            x.grad, w.grad, b.grad, refs, policy=policy, label=f"checkpoint={ckpt}"
+        )
+    assert torch.equal(results[0][0], results[1][0]) and torch.equal(
+        results[0][1], results[1][1]
+    )
 
 
 def test_gradient_accumulation() -> None:
@@ -978,7 +1085,13 @@ def test_gradient_accumulation() -> None:
         pkg.cake_causal_conv1d(x0, w, cu, deterministic=False).backward(g)
     _, dw1, _ = reference_backward(x0, w0, cu, dy)
     _, dw2, _ = reference_backward(x0, w0, cu, dy2)
-    _assert_within(w.grad, dw1 + dw2, atol=2 * DW_ATOL, rtol=2 * DW_RTOL, label="accumulated dweight")
+    _assert_within(
+        w.grad,
+        dw1 + dw2,
+        atol=2 * DW_ATOL,
+        rtol=2 * DW_RTOL,
+        label="accumulated dweight",
+    )
 
 
 # ----------------------------------------------------------------------------------------------------------------
@@ -1000,7 +1113,12 @@ def test_every_entry_requires_deterministic_false() -> None:
         "fwd_ws_bytes": lambda d: pkg.cake_causal_conv1d_train_forward_workspace_bytes(S, C, device, **d),
     }  # fmt: skip
     for name, call in calls.items():
-        for kwargs in ({}, {"deterministic": True}, {"deterministic": 0}, {"deterministic": None}):
+        for kwargs in (
+            {},
+            {"deterministic": True},
+            {"deterministic": 0},
+            {"deterministic": None},
+        ):
             with pytest.raises(ValueError, match="deterministic=False"):
                 call(kwargs)
         assert call({"deterministic": False}) is not None, name
@@ -1029,7 +1147,14 @@ def test_torch_deterministic_mode_alerts_on_the_backward() -> None:
         torch.use_deterministic_algorithms(True, warn_only=True)
         with pytest.warns(UserWarning, match="cake_causal_conv1d_train_backward"):
             dx, dw, _ = _backward(x, w, cu, dy)
-        _check_grads(dx, dw, None, reference_backward(x, w, cu, dy), policy="bf16", label="warn_only")
+        _check_grads(
+            dx,
+            dw,
+            None,
+            reference_backward(x, w, cu, dy),
+            policy="bf16",
+            label="warn_only",
+        )
     finally:
         torch.use_deterministic_algorithms(prev, warn_only=prev_warn)
 
@@ -1046,7 +1171,9 @@ def test_argument_validation() -> None:
         _forward(x, w, cu.long())
     with pytest.raises(ValueError, match="shape"):
         _backward(x, w, cu, dy[: S - 1])
-    with pytest.raises(ValueError, match="weight must be torch.float32 or torch.bfloat16"):
+    with pytest.raises(
+        ValueError, match="weight must be torch.float32 or torch.bfloat16"
+    ):
         _backward(x, w.half(), cu, dy)
     with pytest.raises(ValueError, match="dbias"):
         _backward(x, w, cu, dy, dbias=torch.empty_like(b))
@@ -1075,7 +1202,10 @@ def test_registry_records_reference_the_build_manifest() -> None:
 
     manifest = cake_build.manifest()
     assert manifest["schema"] == "cake-build/1"
-    assert manifest["package"] == "flashinfer.experimental.cake.cake_causal_conv1d_train_backend"
+    assert (
+        manifest["package"]
+        == "flashinfer.experimental.cake.cake_causal_conv1d_train_backend"
+    )
     libraries = cake_build.libraries_by_name()
     kcp_loader = cake_package(KEY, "kcp_jit")
     referenced = set()
@@ -1086,6 +1216,9 @@ def test_registry_records_reference_the_build_manifest() -> None:
             assert record["kernel_symbol"] == f"kernel_{name}"
             for arch in record["arches"]:
                 entry = libraries[f"{name}_{arch}"]
-                assert entry["sources"] == [f"csrc/{name}_kernel.cu", f"csrc/{name}_binding.cu"]
+                assert entry["sources"] == [
+                    f"csrc/{name}_kernel.cu",
+                    f"csrc/{name}_binding.cu",
+                ]
                 referenced.add(entry["name"])
     assert referenced == set(libraries)

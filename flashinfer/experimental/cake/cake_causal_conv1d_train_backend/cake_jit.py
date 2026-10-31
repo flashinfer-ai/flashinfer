@@ -3153,9 +3153,7 @@ def accumulator_layout(
     rule = _accumulator_rule(record)
     C, n_ch_tiles = int(C), int(n_ch_tiles)
     if C <= 0 or n_ch_tiles <= 0:
-        raise ValueError(
-            f"C and n_ch_tiles must be positive, got {(C, n_ch_tiles)}"
-        )
+        raise ValueError(f"C and n_ch_tiles must be positive, got {(C, n_ch_tiles)}")
     acc_elems = int(rule["taps"]) * C
     acc_bytes = acc_elems * ACCUMULATOR_DTYPES[rule["acc"]]
     work_offset = _align(acc_bytes)

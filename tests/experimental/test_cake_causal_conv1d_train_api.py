@@ -94,21 +94,29 @@ def recorded(monkeypatch):
     """Both packages replaced by recorders behind the single-rank facade; the fallback warnings reset."""
 
     log: list = []
-    det_names = [d for d, _ in ENTRIES.values()] + list(HELPERS.values()) + [
-        "is_cake_causal_conv1d_det_train_supported"
-    ]
-    nondet_names = [n for _, n in ENTRIES.values()] + list(HELPERS) + [
-        "is_cake_causal_conv1d_train_supported"
-    ]
+    det_names = (
+        [d for d, _ in ENTRIES.values()]
+        + list(HELPERS.values())
+        + ["is_cake_causal_conv1d_det_train_supported"]
+    )
+    nondet_names = (
+        [n for _, n in ENTRIES.values()]
+        + list(HELPERS)
+        + ["is_cake_causal_conv1d_train_supported"]
+    )
     monkeypatch.setattr(facade, "_det", lambda: _namespace("det", det_names, log))
-    monkeypatch.setattr(facade, "_backend", lambda: _namespace("nondet", nondet_names, log))
+    monkeypatch.setattr(
+        facade, "_backend", lambda: _namespace("nondet", nondet_names, log)
+    )
     monkeypatch.setattr(facade, "_FALLBACK_WARNED", set())
     yield log
 
 
 @pytest.fixture
 def kcp_recorded(monkeypatch):
-    from flashinfer.experimental.cake.cake_causal_conv1d_train_backend import kcp as kcp_backend
+    from flashinfer.experimental.cake.cake_causal_conv1d_train_backend import (
+        kcp as kcp_backend,
+    )
 
     log: list = []
     for name, det_name in KCP_ENTRIES.items():
@@ -160,15 +168,20 @@ def test_entry_points_dispatch_by_keyword(recorded) -> None:
         args, kwargs = calls[entry]
         for mode in ({}, {"deterministic": True}):
             recorded.clear()
-            assert _quiet(lambda: getattr(facade, entry)(*args, **kwargs, **mode))[0] == f"det.{det_name}"
+            assert (
+                _quiet(lambda: getattr(facade, entry)(*args, **kwargs, **mode))[0]
+                == f"det.{det_name}"
+            )
             ((name, got_args, got_kwargs),) = recorded
             assert got_args == args and got_kwargs == kwargs, entry
         recorded.clear()
-        assert _quiet(lambda: getattr(facade, entry)(*args, **kwargs, deterministic=False))[0] == (
-            f"nondet.{nondet_name}"
-        )
+        assert _quiet(
+            lambda: getattr(facade, entry)(*args, **kwargs, deterministic=False)
+        )[0] == (f"nondet.{nondet_name}")
         ((name, got_args, got_kwargs),) = recorded
-        assert got_args == args and got_kwargs == {**kwargs, "deterministic": False}, entry
+        assert got_args == args and got_kwargs == {**kwargs, "deterministic": False}, (
+            entry
+        )
 
 
 @pytest.mark.cpu_only
@@ -178,17 +191,27 @@ def test_helpers_dispatch_by_keyword(recorded) -> None:
         recorded.clear()
         assert getattr(facade, helper)(64, 256, device) == f"det.{det_name}"
         assert recorded[-1][1:] == ((64, 256, device), {})
-        assert getattr(facade, helper)(64, 256, device, deterministic=False) == f"nondet.{helper}"
+        assert (
+            getattr(facade, helper)(64, 256, device, deterministic=False)
+            == f"nondet.{helper}"
+        )
         assert recorded[-1][1:] == ((64, 256, device), {"deterministic": False})
-    assert facade.is_cake_causal_conv1d_train_supported(device) == "det.is_cake_causal_conv1d_det_train_supported"
-    assert facade.is_cake_causal_conv1d_train_supported(device, deterministic=False) == (
-        "nondet.is_cake_causal_conv1d_train_supported"
+    assert (
+        facade.is_cake_causal_conv1d_train_supported(device)
+        == "det.is_cake_causal_conv1d_det_train_supported"
     )
+    assert facade.is_cake_causal_conv1d_train_supported(
+        device, deterministic=False
+    ) == ("nondet.is_cake_causal_conv1d_train_supported")
 
 
 @pytest.mark.cpu_only
 def test_mode_must_be_a_bool(recorded) -> None:
-    positional = {"cake_causal_conv1d_train_forward": 3, "cake_causal_conv1d_train_backward": 4, "cake_causal_conv1d": 3}
+    positional = {
+        "cake_causal_conv1d_train_forward": 3,
+        "cake_causal_conv1d_train_backward": 4,
+        "cake_causal_conv1d": 3,
+    }
     for bad in (0, 1, None, "False", torch.tensor(False)):
         for entry in ENTRIES:
             args = (None,) * positional[entry]
@@ -199,35 +222,53 @@ def test_mode_must_be_a_bool(recorded) -> None:
                 getattr(facade, helper)(64, 256, torch.device("cpu"), deterministic=bad)
         for entry in KCP_ENTRIES:
             with pytest.raises(TypeError, match="deterministic must be a bool"):
-                _quiet(lambda: getattr(kcp_facade, entry)(None, None, None, deterministic=bad))
+                _quiet(
+                    lambda: getattr(kcp_facade, entry)(
+                        None, None, None, deterministic=bad
+                    )
+                )
     assert recorded == []
 
 
 @pytest.mark.cpu_only
-def test_torch_deterministic_mode_falls_back_and_warns_once(recorded, torch_deterministic) -> None:
+def test_torch_deterministic_mode_falls_back_and_warns_once(
+    recorded, torch_deterministic
+) -> None:
     x, w, cu, dy, ws = (object() for _ in range(5))
     for entry, (det_name, _) in ENTRIES.items():
         args = (x, w, cu, dy) if entry.endswith("backward") else (x, w, cu)
         for repeat in range(3):
             recorded.clear()
-            result, fallback = _quiet(lambda: getattr(facade, entry)(*args, deterministic=False))
+            result, fallback = _quiet(
+                lambda: getattr(facade, entry)(*args, deterministic=False)
+            )
             assert result == f"det.{det_name}", entry
             assert len(fallback) == (1 if repeat == 0 else 0), (entry, repeat)
             assert fallback == [] or fallback[0].category is UserWarning
-            assert fallback == [] or f"{entry}(deterministic=False)" in str(fallback[0].message)
+            assert fallback == [] or f"{entry}(deterministic=False)" in str(
+                fallback[0].message
+            )
     # A non-deterministic backward workspace is not handed to the deterministic package; a deterministic call's is.
     recorded.clear()
-    _quiet(lambda: facade.cake_causal_conv1d_train_backward(x, w, cu, dy, workspace=ws, deterministic=False))
+    _quiet(
+        lambda: facade.cake_causal_conv1d_train_backward(
+            x, w, cu, dy, workspace=ws, deterministic=False
+        )
+    )
     assert recorded[-1][2]["workspace"] is None
     _quiet(lambda: facade.cake_causal_conv1d_train_backward(x, w, cu, dy, workspace=ws))
     assert recorded[-1][2]["workspace"] is ws
     # The forward workspace (the same int32 counters in both packages) is passed on.
-    _quiet(lambda: facade.cake_causal_conv1d_train_forward(x, w, cu, workspace=ws, deterministic=False))
+    _quiet(
+        lambda: facade.cake_causal_conv1d_train_forward(
+            x, w, cu, workspace=ws, deterministic=False
+        )
+    )
     assert recorded[-1][2]["workspace"] is ws
     # The helpers size the package their keyword names, whatever torch's mode.
-    assert facade.cake_causal_conv1d_train_backward_workspace_bytes(1, 8, "cpu", deterministic=False) == (
-        "nondet.cake_causal_conv1d_train_backward_workspace_bytes"
-    )
+    assert facade.cake_causal_conv1d_train_backward_workspace_bytes(
+        1, 8, "cpu", deterministic=False
+    ) == ("nondet.cake_causal_conv1d_train_backward_workspace_bytes")
 
 
 @pytest.mark.cpu_only
@@ -236,23 +277,41 @@ def test_kcp_facade_dispatch(kcp_recorded) -> None:
     for entry, det_name in KCP_ENTRIES.items():
         for mode in ({}, {"deterministic": True}):
             kcp_recorded.clear()
-            result, _ = _quiet(lambda: getattr(kcp_facade, entry)(x, w, ctx, recompute_handle=handle, **mode))
+            result, _ = _quiet(
+                lambda: getattr(kcp_facade, entry)(
+                    x, w, ctx, recompute_handle=handle, **mode
+                )
+            )
             assert result == f"det.{det_name}"
-            assert kcp_recorded == [(f"det.{det_name}", (x, w, ctx), {"recompute_handle": handle})]
+            assert kcp_recorded == [
+                (f"det.{det_name}", (x, w, ctx), {"recompute_handle": handle})
+            ]
         kcp_recorded.clear()
-        result, _ = _quiet(lambda: getattr(kcp_facade, entry)(x, w, ctx, recompute_handle=handle, deterministic=False))
+        result, _ = _quiet(
+            lambda: getattr(kcp_facade, entry)(
+                x, w, ctx, recompute_handle=handle, deterministic=False
+            )
+        )
         assert result == f"nondet.{entry}"
         assert kcp_recorded == [
-            (f"nondet.{entry}", (x, w, ctx), {"recompute_handle": handle, "deterministic": False})
+            (
+                f"nondet.{entry}",
+                (x, w, ctx),
+                {"recompute_handle": handle, "deterministic": False},
+            )
         ]
 
 
 @pytest.mark.cpu_only
-def test_kcp_facade_falls_back_under_torch_deterministic_mode(kcp_recorded, torch_deterministic) -> None:
+def test_kcp_facade_falls_back_under_torch_deterministic_mode(
+    kcp_recorded, torch_deterministic
+) -> None:
     x, w, ctx = (object() for _ in range(3))
     for entry, det_name in KCP_ENTRIES.items():
         for repeat in range(2):
-            result, fallback = _quiet(lambda: getattr(kcp_facade, entry)(x, w, ctx, deterministic=False))
+            result, fallback = _quiet(
+                lambda: getattr(kcp_facade, entry)(x, w, ctx, deterministic=False)
+            )
             assert result == f"det.{det_name}"
             assert len(fallback) == (1 if repeat == 0 else 0), (entry, repeat)
 
@@ -262,7 +321,9 @@ def test_kcp_facade_falls_back_under_torch_deterministic_mode(kcp_recorded, torc
 
 
 def _parameters(fn) -> list[tuple]:
-    return [(p.name, p.kind, p.default) for p in inspect.signature(fn).parameters.values()]
+    return [
+        (p.name, p.kind, p.default) for p in inspect.signature(fn).parameters.values()
+    ]
 
 
 @pytest.mark.cpu_only
@@ -273,15 +334,23 @@ def test_facade_signatures_mirror_the_packages() -> None:
     for entry, (det_name, nondet_name) in ENTRIES.items():
         mine = _parameters(getattr(facade, entry))
         assert mine == _parameters(getattr(backend, nondet_name)), entry
-        assert mine[-1] == ("deterministic", inspect.Parameter.KEYWORD_ONLY, True), entry
+        assert mine[-1] == ("deterministic", inspect.Parameter.KEYWORD_ONLY, True), (
+            entry
+        )
         assert mine[:-1] == _parameters(getattr(det_facade, det_name)), entry
     for helper in HELPERS:
-        assert _parameters(getattr(facade, helper)) == _parameters(getattr(backend, helper)), helper
-    from flashinfer.experimental.cake.cake_causal_conv1d_train_backend import kcp as kcp_backend
+        assert _parameters(getattr(facade, helper)) == _parameters(
+            getattr(backend, helper)
+        ), helper
+    from flashinfer.experimental.cake.cake_causal_conv1d_train_backend import (
+        kcp as kcp_backend,
+    )
 
     for entry, det_name in KCP_ENTRIES.items():
         mine = _parameters(getattr(kcp_facade, entry))
-        assert mine[-1] == ("deterministic", inspect.Parameter.KEYWORD_ONLY, True), entry
+        assert mine[-1] == ("deterministic", inspect.Parameter.KEYWORD_ONLY, True), (
+            entry
+        )
         assert mine[:-1] == _parameters(getattr(det_kcp_facade, det_name)), entry
         theirs = {name for name, *_ in _parameters(getattr(kcp_backend, entry))}
         assert {name for name, *_ in mine} <= theirs, entry
@@ -292,8 +361,12 @@ def test_entry_points_are_experimental() -> None:
     for entry in ENTRIES:
         assert getattr(getattr(facade, entry), "is_experimental", False) is True, entry
     for entry in KCP_ENTRIES:
-        assert getattr(getattr(kcp_facade, entry), "is_experimental", False) is True, entry
-    assert set(facade.__all__) >= set(ENTRIES) | set(HELPERS) | {"is_cake_causal_conv1d_train_supported"}
+        assert getattr(getattr(kcp_facade, entry), "is_experimental", False) is True, (
+            entry
+        )
+    assert set(facade.__all__) >= set(ENTRIES) | set(HELPERS) | {
+        "is_cake_causal_conv1d_train_supported"
+    }
     assert set(kcp_facade.__all__) == set(KCP_ENTRIES) | {"RecomputeHandleKcp"}
     assert facade.CakeCausalConv1dFunction is backend.CakeCausalConv1dFunction
 
@@ -304,15 +377,26 @@ def test_deterministic_and_legacy_names_are_unchanged() -> None:
     same-spelled names live in other modules only."""
 
     assert flashinfer.cake_causal_conv1d is det_facade.cake_causal_conv1d_det
-    assert flashinfer.cake_causal_conv1d_train_forward is det_facade.cake_causal_conv1d_det_train_forward
-    assert flashinfer.cake_causal_conv1d_train_backward is det_facade.cake_causal_conv1d_det_train_backward
+    assert (
+        flashinfer.cake_causal_conv1d_train_forward
+        is det_facade.cake_causal_conv1d_det_train_forward
+    )
+    assert (
+        flashinfer.cake_causal_conv1d_train_backward
+        is det_facade.cake_causal_conv1d_det_train_backward
+    )
     assert flashinfer.CakeCausalConv1dFunction is det_facade.CakeCausalConv1dDetFunction
     assert flashinfer.cake_causal_conv1d_train is det_facade
-    assert det_facade.cake_causal_conv1d_kcp is det_kcp_facade.cake_causal_conv1d_det_kcp
+    assert (
+        det_facade.cake_causal_conv1d_kcp is det_kcp_facade.cake_causal_conv1d_det_kcp
+    )
     for entry in ENTRIES:
         assert getattr(det_facade, entry) is not getattr(facade, entry), entry
     assert det_facade.CakeCausalConv1dFunction is not facade.CakeCausalConv1dFunction
-    assert det_kcp_facade.cake_causal_conv1d_det_kcp is not kcp_facade.cake_causal_conv1d_kcp
+    assert (
+        det_kcp_facade.cake_causal_conv1d_det_kcp
+        is not kcp_facade.cake_causal_conv1d_kcp
+    )
 
 
 @pytest.mark.cpu_only
@@ -333,7 +417,9 @@ def test_core_does_not_import_the_experimental_package() -> None:
         "assert not kcp, kcp\n"
         "print('IMPORT_ISOLATION_OK')\n"
     )
-    r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=600)
+    r = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, timeout=600
+    )
     assert r.returncode == 0 and "IMPORT_ISOLATION_OK" in r.stdout, (r.stdout, r.stderr)
 
 
@@ -377,13 +463,21 @@ def test_facade_returns_the_packages_bits() -> None:
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", ExperimentalWarning)
         y_det = det_facade.cake_causal_conv1d_det_train_forward(x, w, cu, bias=b)
-        assert torch.equal(facade.cake_causal_conv1d_train_forward(x, w, cu, bias=b), y_det)
-        y_nondet = facade.cake_causal_conv1d_train_forward(x, w, cu, bias=b, deterministic=False)
+        assert torch.equal(
+            facade.cake_causal_conv1d_train_forward(x, w, cu, bias=b), y_det
+        )
+        y_nondet = facade.cake_causal_conv1d_train_forward(
+            x, w, cu, bias=b, deterministic=False
+        )
         assert torch.equal(y_nondet, y_det)
-        det_grads = det_facade.cake_causal_conv1d_det_train_backward(x, w, cu, dy, bias=b)
+        det_grads = det_facade.cake_causal_conv1d_det_train_backward(
+            x, w, cu, dy, bias=b
+        )
         grads = facade.cake_causal_conv1d_train_backward(x, w, cu, dy, bias=b)
         assert all(torch.equal(a, e) for a, e in zip(grads, det_grads, strict=True))
-        ws = facade.cake_causal_conv1d_train_backward_workspace(S, C, _device(), deterministic=False)
+        ws = facade.cake_causal_conv1d_train_backward_workspace(
+            S, C, _device(), deterministic=False
+        )
         assert ws.dtype == torch.uint8 and int(torch.count_nonzero(ws)) == 0
         assert ws.numel() == facade.cake_causal_conv1d_train_backward_workspace_bytes(
             S, C, _device(), deterministic=False
@@ -397,7 +491,9 @@ def test_facade_returns_the_packages_bits() -> None:
         torch.testing.assert_close(db, det_grads[2], atol=DW_ATOL, rtol=DW_RTOL)
         assert facade.cake_causal_conv1d_train_forward_workspace_bytes(
             S, C, _device(), deterministic=False
-        ) == det_facade.cake_causal_conv1d_det_train_forward_workspace_bytes(S, C, _device())
+        ) == det_facade.cake_causal_conv1d_det_train_forward_workspace_bytes(
+            S, C, _device()
+        )
 
 
 @gpu
@@ -415,19 +511,27 @@ def test_autograd_in_both_modes() -> None:
             results[mode] = (y.detach(), x.grad, w.grad, b.grad)
     assert torch.equal(results[True][0], results[False][0])
     assert torch.equal(results[True][1], results[False][1])
-    torch.testing.assert_close(results[False][2], results[True][2], atol=DW_ATOL, rtol=DW_RTOL)
-    torch.testing.assert_close(results[False][3], results[True][3], atol=DW_ATOL, rtol=DW_RTOL)
+    torch.testing.assert_close(
+        results[False][2], results[True][2], atol=DW_ATOL, rtol=DW_RTOL
+    )
+    torch.testing.assert_close(
+        results[False][3], results[True][3], atol=DW_ATOL, rtol=DW_RTOL
+    )
 
 
 @gpu
-def test_torch_deterministic_mode_runs_the_deterministic_package(torch_deterministic, monkeypatch) -> None:
+def test_torch_deterministic_mode_runs_the_deterministic_package(
+    torch_deterministic, monkeypatch
+) -> None:
     monkeypatch.setattr(facade, "_FALLBACK_WARNED", set())
     x0, w0, cu, dy, _ = _problem()
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", ExperimentalWarning)
         expected = det_facade.cake_causal_conv1d_det_train_backward(x0, w0, cu, dy)
         with pytest.warns(UserWarning, match=FALLBACK):
-            got = facade.cake_causal_conv1d_train_backward(x0, w0, cu, dy, deterministic=False)
+            got = facade.cake_causal_conv1d_train_backward(
+                x0, w0, cu, dy, deterministic=False
+            )
         assert all(torch.equal(a, e) for a, e in zip(got, expected, strict=True))
         x = x0.clone().requires_grad_(True)
         w = w0.clone().requires_grad_(True)

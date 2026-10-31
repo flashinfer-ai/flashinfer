@@ -1381,7 +1381,9 @@ class CakeCausalConv1dFunctionKcp(torch.autograd.Function):
     refused with graph replay (keyword or knob) and inside a CUDA-graph capture."""
 
     @staticmethod
-    def forward(fn_ctx, x_local, weight, ctx, graph=None, handle=None, deterministic=True):
+    def forward(
+        fn_ctx, x_local, weight, ctx, graph=None, handle=None, deterministic=True
+    ):
         _require_nondeterministic(deterministic, "CakeCausalConv1dFunctionKcp")
         if handle is None:
             y, hist = cake_causal_conv1d_forward_kcp(
@@ -1417,7 +1419,13 @@ class CakeCausalConv1dFunctionKcp(torch.autograd.Function):
             grad_y = torch.zeros_like(x_local)
         dy = grad_y.to(torch.bfloat16).contiguous()
         dx, dweight = cake_causal_conv1d_backward_kcp(
-            x_local, weight, fn_ctx.kcp, dy, hist, graph=fn_ctx.graph, deterministic=False
+            x_local,
+            weight,
+            fn_ctx.kcp,
+            dy,
+            hist,
+            graph=fn_ctx.graph,
+            deterministic=False,
         )
         return dx, dweight, None, None, None, None
 

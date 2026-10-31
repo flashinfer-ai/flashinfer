@@ -28,7 +28,9 @@ import types
 import pytest
 import torch
 
-from flashinfer.experimental.cake.cake_causal_conv1d_train_backend import kcp as conv_kcp
+from flashinfer.experimental.cake.cake_causal_conv1d_train_backend import (
+    kcp as conv_kcp,
+)
 
 
 @pytest.mark.cpu_only
@@ -387,7 +389,12 @@ def test_every_kcp_entry_refuses_a_deterministic_mode() -> None:
         ),
     }  # fmt: skip
     for call in calls.values():
-        for kwargs in ({}, {"deterministic": True}, {"deterministic": 0}, {"deterministic": None}):
+        for kwargs in (
+            {},
+            {"deterministic": True},
+            {"deterministic": 0},
+            {"deterministic": None},
+        ):
             with pytest.raises(ValueError, match="deterministic=False"):
                 call(kwargs)
 
@@ -405,9 +412,13 @@ def test_kcp_signatures_carry_the_deterministic_keyword() -> None:
         conv_kcp.cake_causal_conv1d_multi_backward_kcp,
     ):
         p = inspect.signature(fn).parameters["deterministic"]
-        assert p.kind is inspect.Parameter.KEYWORD_ONLY and p.default is True, fn.__name__
+        assert p.kind is inspect.Parameter.KEYWORD_ONLY and p.default is True, (
+            fn.__name__
+        )
     assert not hasattr(conv_kcp, "KcpRecomputeHandle")
-    assert not any("det" in name.replace("deterministic", "") for name in conv_kcp.__all__)
+    assert not any(
+        "det" in name.replace("deterministic", "") for name in conv_kcp.__all__
+    )
 
 
 @pytest.mark.cpu_only
