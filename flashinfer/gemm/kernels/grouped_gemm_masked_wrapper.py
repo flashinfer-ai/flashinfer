@@ -31,10 +31,16 @@ Architecture-specific implementations:
 - SM107 (Rubin):           grouped_gemm_masked_rubin.py
 """
 
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Union
 
 import torch
 
+from flashinfer.tllm_enums import (
+    ActivationType,
+    DEFAULT_SWIGLU_ALPHA,
+    DEFAULT_SWIGLU_BETA,
+    DEFAULT_SWIGLU_LIMIT,
+)
 from flashinfer.utils import get_compute_capability
 from flashinfer.api_logging import flashinfer_api
 from flashinfer.trace.templates.gemm import grouped_gemm_nt_masked_trace
@@ -63,6 +69,12 @@ def grouped_gemm_nt_masked(
     barrier_flag_multicast: Optional[torch.Tensor] = None,
     is_combine_fusion: bool = False,
     is_swap_ab: bool = False,
+    activation_type: Optional[Union[ActivationType, int]] = None,
+    swiglu_alpha: float = DEFAULT_SWIGLU_ALPHA,
+    swiglu_beta: float = DEFAULT_SWIGLU_BETA,
+    swiglu_limit: float = DEFAULT_SWIGLU_LIMIT,
+    alpha_up: Optional[torch.Tensor] = None,
+    a_per_token_scale: Optional[torch.Tensor] = None,
     **kwargs,
 ):
     r"""Masked, batched, block-scaled GEMM on Blackwell (SM100/SM103) and Rubin (SM107).
@@ -140,6 +152,33 @@ def grouped_gemm_nt_masked(
     is_swap_ab : bool
         If ``True``, swap the ``lhs``/``rhs`` input tensors.  Defaults to
         ``False``.
+    activation_type : Optional[Union[ActivationType, int]]
+        Gated activation fused into the epilogue (SM100/SM103 only).  Only
+        ``ActivationType.Swiglu`` is supported.  ``None`` (the default) keeps
+        the plain GEMM epilogue.  When set, ``B`` and ``SFB`` rows must be
+        interleaved in 64-row blocks with the up projection first,
+        ``[up_0:64, gate_0:64, up_64:128, gate_64:128, ...]``, ``n`` must be a
+        multiple of ``mma_tiler_mn[1]``, and ``out`` has shape
+        ``(m, n / 2, l)``.  Each output element is
+        ``gate * sigmoid(swiglu_alpha * gate) * (up + swiglu_beta)`` with
+        ``gate = min(alpha * s * acc_gate, swiglu_limit)``,
+        ``up = clamp(alpha_up * s * acc_up, -swiglu_limit, swiglu_limit)``
+        and ``s`` the optional per-row ``a_per_token_scale``.  Requires
+        ``mma_tiler_mn`` ``(128, 128)`` or ``(128, 256)`` and does not support
+        combine fusion, ``is_swap_ab`` or ``dst_signals``.
+    swiglu_alpha : float
+        Sigmoid multiplier of the gated activation.  Defaults to ``1.0``.
+    swiglu_beta : float
+        Bias added to the up projection.  Defaults to ``0.0``.
+    swiglu_limit : float
+        Clamp limit of the gated activation.  Defaults to the float32 maximum.
+    alpha_up : Optional[torch.Tensor]
+        Optional contiguous ``float32`` tensor of shape ``(l,)`` scaling the up
+        projection when the up and gate weights have different global scales.
+        Defaults to ``alpha``.
+    a_per_token_scale : Optional[torch.Tensor]
+        Optional contiguous ``float32`` tensor of shape ``(l, m)`` holding a
+        per-row scale of ``A``, applied before the gated activation.
     **kwargs
         Additional keyword arguments.  Currently recognized:
 
@@ -227,6 +266,9 @@ def grouped_gemm_nt_masked(
                 ("barrier_flag_multicast", barrier_flag_multicast, None),
                 ("is_combine_fusion", is_combine_fusion, False),
                 ("is_swap_ab", is_swap_ab, False),
+                ("activation_type", activation_type, None),
+                ("alpha_up", alpha_up, None),
+                ("a_per_token_scale", a_per_token_scale, None),
             )
             if value is not default
         ]
@@ -282,6 +324,12 @@ def grouped_gemm_nt_masked(
             barrier_flag_multicast=barrier_flag_multicast,
             is_combine_fusion=is_combine_fusion,
             is_swap_ab=is_swap_ab,
+            activation_type=activation_type,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
+            swiglu_limit=swiglu_limit,
+            alpha_up=alpha_up,
+            a_per_token_scale=a_per_token_scale,
             **kwargs,
         )
 
