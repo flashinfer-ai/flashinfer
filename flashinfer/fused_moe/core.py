@@ -4837,10 +4837,14 @@ def _validate_fused_shared_experts(
             f"num_fused_shared_experts={n_fused_shared}, local_expert_offset={local_expert_offset}, "
             f"local_num_experts={local_num_experts}, num_experts={num_experts}."
         )
-    if routing_method_type != RoutingMethodType.DeepSeekV3.value:
+    # Every routing kernel except Llama4 (top-1 only) appends the shared-expert slots.
+    if routing_method_type in (
+        RoutingMethodType.Llama4.value,
+        RoutingMethodType.Unspecified.value,
+    ):
         raise ValueError(
-            "Fused shared experts (num_fused_shared_experts > 0) are only supported "
-            "with DeepSeekV3 routing_method_type."
+            "Fused shared experts (num_fused_shared_experts > 0) are not supported "
+            f"with routing_method_type={RoutingMethodType(routing_method_type)!r}."
         )
     return n_fused_shared
 

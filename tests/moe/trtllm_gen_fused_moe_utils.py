@@ -4023,6 +4023,15 @@ def run_moe_test(
         raise NotImplementedError(
             f"Routing method {routing_method_type} not implemented"
         )
+    if (
+        num_fused_shared_experts > 0
+        and routing_method_type != RoutingMethodType.DeepSeekV3
+    ):
+        # The other references are routed-only; append the shared experts
+        # (ids [E, E + S) at weight 1.0) the way routing_reference_no_aux does.
+        permute_info = routing_reference(
+            scores, top_k, padding, num_fused_shared_experts
+        )
 
     # Build the real FC1 LoRA delta from the generated hidden states + routing.
     if gemm1_lora_delta is None and gemm1_lora_args is not None:

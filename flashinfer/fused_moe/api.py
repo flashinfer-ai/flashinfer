@@ -3461,10 +3461,13 @@ class MoEConfig:
         if s == 0:
             return
 
-        # Only DeepSeekV3 routing emits shared-expert slots.
-        if self.routing.method is not RoutingMethodType.DeepSeekV3:
+        # Every routing kernel except Llama4 (top-1 only) emits shared-expert slots.
+        if self.routing.method in (
+            RoutingMethodType.Llama4,
+            RoutingMethodType.Unspecified,
+        ):
             raise ValueError(
-                "num_fused_shared_experts > 0 requires DeepSeekV3 routing, got "
+                "num_fused_shared_experts > 0 is not supported with "
                 f"method={self.routing.method!r}."
             )
 

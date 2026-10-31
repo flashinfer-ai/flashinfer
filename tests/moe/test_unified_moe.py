@@ -4546,10 +4546,35 @@ class TestFusedSharedExpertsConfig:
         with pytest.raises(ValueError, match="must be >= 0"):
             ExpertConfig(intermediate_size=512, num_fused_shared_experts=-1)
 
-    def test_non_deepseek_routing_rejected(self):
-        # Only the DeepSeek routing kernel emits the appended shared slots.
-        with pytest.raises(ValueError, match="requires DeepSeekV3 routing"):
-            self._cfg(num_shared=1, routing=dict(method=RoutingMethodType.Default))
+    def test_llama4_routing_rejected(self):
+        # Llama4's top-1 kernel is the one router without the appended shared slots.
+        with pytest.raises(ValueError, match="not supported with method"):
+            self._cfg(
+                num_shared=1,
+                routing=dict(
+                    method=RoutingMethodType.Llama4,
+                    top_k=1,
+                    n_group=None,
+                    topk_group=None,
+                    routed_scaling_factor=None,
+                ),
+            )
+
+    @pytest.mark.parametrize(
+        "method", [RoutingMethodType.MiniMax2, RoutingMethodType.Renormalize]
+    )
+    def test_custom_routing_accepted(self, method):
+        # routingCustom methods append the shared slots too (issue #7810).
+        cfg = self._cfg(
+            num_shared=1,
+            routing=dict(
+                method=method,
+                n_group=None,
+                topk_group=None,
+                routed_scaling_factor=None,
+            ),
+        )
+        assert cfg.experts.num_fused_shared_experts == 1
 
     def test_top_k_plus_shared_bounded(self):
         # MaxSupportedTopExperts == 32 applies to the *fused* total.
