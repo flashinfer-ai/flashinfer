@@ -208,20 +208,22 @@ def test_cute_dsl_jit_case(monkeypatch):
     )
     o = torch.empty(total, H, D, device=DEVICE, dtype=torch.bfloat16)
 
-    cubin_mod.cute_dsl_fmha_ragged_prefill(
-        q=q,
-        k=k,
-        v=v,
-        o=o,
-        qo_indptr=qo,
-        kv_indptr=kv,
-        is_causal=False,
-        sm_scale=sm,
-        max_qo_len=s,
-        max_kv_len=s,
-    )
     ref = _ragged_ref(qr, kr, vr, qo, kv, sm, causal=False)
-    torch.testing.assert_close(o.float(), ref.float(), atol=3e-2, rtol=3e-2)
+    for enable_pdl in (False, True):
+        cubin_mod.cute_dsl_fmha_ragged_prefill(
+            q=q,
+            k=k,
+            v=v,
+            o=o,
+            qo_indptr=qo,
+            kv_indptr=kv,
+            is_causal=False,
+            sm_scale=sm,
+            max_qo_len=s,
+            max_kv_len=s,
+            enable_pdl=enable_pdl,
+        )
+        torch.testing.assert_close(o.float(), ref.float(), atol=3e-2, rtol=3e-2)
 
 
 def test_batch_prefill_cute_dsl_alibi():
@@ -305,7 +307,9 @@ def _blockscaled_dequant(x_bshd, qk_mode):
 @pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float8_e4m3fn])
 def test_blockscaled_quantize_and_prefill(qk_mode, causal, out_dtype):
     """End-to-end block-scaled path: fused quantizer -> SF -> FMHA kernel."""
-    from flashinfer.cute_dsl.attention.fmha.quantize import quantize_blockscaled_qk
+    from flashinfer.cute_dsl.attention.fmha.quantize import (
+        quantize_blockscaled_qk,
+    )
     from flashinfer.attention.cute_dsl.fmha_blockscaled import (
         cute_dsl_fmha_blockscaled_prefill,
     )

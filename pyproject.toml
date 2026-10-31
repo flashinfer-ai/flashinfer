@@ -245,8 +245,8 @@ exclude = [
   "flashinfer/attention/prims_ts/kernels/",
   "3rdparty/",
   "flashinfer/data/cutlass/",
-  "flashinfer/cute_dsl/attention/fmha/fmha.py",
-  "flashinfer/cute_dsl/attention/fmha/fmha_blockscaled.py",
+  "flashinfer/cute_dsl/attention/fmha/sm100/fmha.py",
+  "flashinfer/cute_dsl/attention/fmha/sm100/fmha_blockscaled.py",
   "flashinfer/cute_dsl/attention/fmha/helpers/",
   "flashinfer/prims_ts/",
   "flashinfer/moe_ep/kernel_src/sm100/cutedsl_megamoe/src/",
@@ -292,8 +292,8 @@ exclude = [
 # Ruff infers the target from project.requires-python.
 extend-exclude = [
   "flashinfer/fused_moe/backends/cudnn_frost/artifacts/*/sources/",
-  "flashinfer/cute_dsl/attention/fmha/fmha.py",
-  "flashinfer/cute_dsl/attention/fmha/fmha_blockscaled.py",
+  "flashinfer/cute_dsl/attention/fmha/sm100/fmha.py",
+  "flashinfer/cute_dsl/attention/fmha/sm100/fmha_blockscaled.py",
   "flashinfer/cute_dsl/attention/fmha/helpers",
   "flashinfer/moe_ep/kernel_src/sm100/cutedsl_megamoe/src",
   "flashinfer/moe_ep/kernel_src/sm100/next_cutedsl_megamoe/src",
