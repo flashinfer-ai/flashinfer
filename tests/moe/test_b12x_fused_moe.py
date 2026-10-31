@@ -3779,6 +3779,101 @@ def _class_def(path, name):
     raise AssertionError(f"{name} not found in {path}")
 
 
+def _function_def(path, name):
+    for node in ast.walk(ast.parse(path.read_text())):
+        if isinstance(node, ast.FunctionDef) and node.name == name:
+            return node
+    raise AssertionError(f"{name} not found in {path}")
+
+
+def test_w4a16_large_weight_banks_stay_static_and_64_bit():
+    """Weight banks past 2**31 elements must meet no 32-bit size or offset math.
+
+    Host side: the banks cross the compile boundary as static-layout tensors
+    (compile-time fakes plus a ``from_dlpack`` wrap at launch), so their size
+    never reaches the DSL runtime's 32-bit dynamic-shape packing. Kernel side:
+    the expert and tile offsets into a bank are ``Int64``, so
+    ``expert_idx * words_per_expert`` cannot wrap past ``INT32_MAX``.
+    """
+    path = _FUSED_MOE_DIR / "cute_dsl" / "blackwell_sm12x" / "moe_w4a16_kernel.py"
+
+    compile_fn = _function_def(path, "compile_w4a16_fused_moe")
+    fake_values = [
+        node.value
+        for node in ast.walk(compile_fn)
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name) and target.id in ("w13_fake", "w2_fake")
+            for target in node.targets
+        )
+    ]
+    # One w13/w2 pair per weight layout, every one a static-shape fake.
+    assert len(fake_values) == 6
+    for value in fake_values:
+        assert isinstance(value, ast.Call)
+        assert ast.unparse(value.func) == "cute.runtime.make_fake_compact_tensor"
+
+    kernel = _class_def(path, "W4A16FusedMoeKernel")
+    call = next(
+        node
+        for node in kernel.body
+        if isinstance(node, ast.FunctionDef) and node.name == "__call__"
+    )
+    annotations = {
+        arg.arg: ast.unparse(arg.annotation) if arg.annotation else None
+        for arg in call.args.args
+    }
+    assert annotations["w13_i32_flat"] == "cute.Tensor"
+    assert annotations["w2_i32_flat"] == "cute.Tensor"
+
+    launch = _function_def(path, "_w4a16_fused_moe_launch_flat")
+    compiled_call = next(
+        node
+        for node in ast.walk(launch)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "compiled"
+    )
+    assert [ast.unparse(arg) for arg in compiled_call.args[1:3]] == [
+        "w13_arg",
+        "w2_arg",
+    ]
+    # Both banks are re-bound to a static-layout from_dlpack before the call,
+    # not left to the implicit TensorAdapter that marks the layout dynamic.
+    wrapped = {
+        node.targets[0].id
+        for node in ast.walk(launch)
+        if isinstance(node, ast.Assign)
+        and len(node.targets) == 1
+        and isinstance(node.targets[0], ast.Name)
+        and isinstance(node.value, ast.Call)
+        and ast.unparse(node.value.func) == "cute.runtime.from_dlpack"
+        and any(
+            keyword.arg == "assumed_align" and ast.unparse(keyword.value) == "16"
+            for keyword in node.value.keywords
+        )
+        and node.lineno < compiled_call.lineno
+    }
+    assert {"w13_arg", "w2_arg"} <= wrapped
+
+    gemm = _class_def(path, "W4A16GemmKernel")
+    methods = {n.name: n for n in gemm.body if isinstance(n, ast.FunctionDef)}
+    stream_source = ast.unparse(methods["_tile_stream_offsets"])
+    assert "b_expert_off = Int64" in stream_source
+    assert "Int64(expert_idx)" in stream_source
+    stagers = {
+        name: method
+        for name, method in methods.items()
+        if any(arg.arg == "b_gl_rd_base" for arg in method.args.args)
+    }
+    assert "_stage_k_tile_async" in stagers
+    for name, method in stagers.items():
+        annotation = next(
+            arg.annotation for arg in method.args.args if arg.arg == "b_gl_rd_base"
+        )
+        assert ast.unparse(annotation) == "Int64", name
+
+
 def _self_deps(class_def, entry):
     """All ``self.<attr>`` reads reachable from method ``entry``."""
     methods = {n.name: n for n in class_def.body if isinstance(n, ast.FunctionDef)}
