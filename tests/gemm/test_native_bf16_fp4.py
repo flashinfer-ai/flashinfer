@@ -295,6 +295,71 @@ def test_autotuned_tactic_matches_reference(m, n, k, alpha_value, out_dtype):
     torch.testing.assert_close(result.float(), ref, atol=2e-3, rtol=8e-3)
 
 
+def test_parallel_compile_into_empty_cache(monkeypatch, tmp_path):
+    """The worker subprocesses compile this bucket's candidates, and another
+    bucket's ahead of it, into the disk cache before profiling needs them."""
+    from flashinfer.gemm.kernels.native_bf16_fp4 import compile_pool, runner
+    from flashinfer.jit import env as jit_env
+    from flashinfer.jit.cute_dsl_core import JitSpecCuteDsl, _hash_source_files
+
+    jit_dir = tmp_path / jit_env.FLASHINFER_JIT_DIR.relative_to(
+        jit_env.FLASHINFER_BASE_DIR
+    )
+    monkeypatch.setenv("FLASHINFER_WORKSPACE_BASE", str(tmp_path))
+    monkeypatch.setenv("FLASHINFER_NATIVE_W4A16_COMPILE_WORKERS", "4")
+    monkeypatch.setattr(jit_env, "FLASHINFER_JIT_DIR", jit_dir)
+    monkeypatch.setattr(runner, "_COMPILED", {})
+    monkeypatch.setattr(runner, "_INFLIGHT", {})
+    monkeypatch.setattr(runner, "_AHEAD_DONE", set())
+    monkeypatch.setattr(runner, "_AHEAD_MS", (1, 2))
+    compile_pool.POOL.shutdown()
+    r = runner.get_runner()
+    n, k = 256, 1024
+
+    def on_disk(m, tactic):
+        module, name, compile_fn, key_files = runner._kernel_spec(
+            m, n, k, torch.bfloat16, True, True, tactic
+        )
+        return JitSpecCuteDsl(
+            module, name, compile_fn, _hash_source_files(key_files)
+        ).is_compiled
+
+    try:
+        for m in (1, 2):
+            a, b, sf, weight = make_case(m, n, k, seed=m)
+            alpha = torch.tensor([0.5], device="cuda")
+            out = torch.empty((m, n), device="cuda", dtype=torch.bfloat16)
+            inputs = [a, b, sf, alpha, out, True]
+            tactics = r._get_tactics(inputs, for_tuning=True)
+            assert not r.precompile_tactics(inputs, tactics, None)
+            assert all(on_disk(m, t) for t in tactics)
+            ref = (a.float() @ weight.T) * 0.5
+            for tactic in tactics:
+                out.fill_(float("nan"))
+                r(inputs, tactic=tactic)
+                torch.testing.assert_close(out.float(), ref, atol=2e-3, rtol=8e-3)
+    finally:
+        compile_pool.POOL.shutdown()
+
+
+def test_hung_compile_worker_times_out(monkeypatch):
+    """A worker that never answers is killed, so preparation cannot hang."""
+    import sys
+
+    from flashinfer.jit import cute_dsl_compile_pool
+
+    pool = cute_dsl_compile_pool.CompilePool(__name__, lambda: 2, "test")
+    pool.argv = (sys.executable, "-c", "import time; time.sleep(600)")
+    monkeypatch.setattr(cute_dsl_compile_pool, "JOB_TIMEOUT_SECONDS", 1.0)
+    try:
+        futures = pool.submit([[0]] * 4, "sm_120a")
+        errors = [fut.result(timeout=60) for fut in futures]
+        assert all(errors)
+        assert any("TimeoutError" in err for err in errors)
+    finally:
+        pool.shutdown()
+
+
 def test_invalid_weight_layout_is_rejected():
     """A prepared int32 tile bank must never be interpreted as canonical bytes."""
     a, b, sf, _ = make_case(1, 128, 128)
