@@ -226,3 +226,18 @@ Until then the C++ stays as-is and the DSL kernel lives beside it.
   reverted rather than debugged: the whole epilogue is ~2 us of the 27 us row.  The
   160 / 192 fixed-cost gap (+0.8 / +1.2 us vs C++ at one k-tile; 128 and 1-SM tiles are
   0.4 us ahead) remains open; the epilogue is not the main part of it.
+- Sat 31 Oct 2026, 02:00-04:30: the Blackwell small-M gap, found.  Three parts, all
+  measured with %clock stamps (the global timer is only good for cross-CTA skew):
+  (1) start-up: the tile derivation divided by two dynamic cluster counts (~0.4k cycles
+  on every warp) and the TMA / scheduler warps waited at the TMEM-allocation barrier
+  (~0.5k cycles) -> magic-number divides computed per launch, barrier only for TMEM
+  users; (2) the TMA warps' suspending barrier wait and the activation pipeline depth
+  were not it (tight poll and a sixth B stage changed nothing; the MMA's "waiting for
+  B" is tensor-pipe backpressure); (3) the real one: a partial last activation tile
+  (M not a multiple of the tile: 1024 vs 160 / 192) went through the predicated SIMT
+  store, ~1.7 us slower than the TMA store, and those CTAs ended the kernel (per-CTA
+  finish spread 2.3 us).  TMA stores clip out-of-bounds rows, so partial tiles use
+  them whenever the output is final (split-K partials keep SIMT: slices abut).  GB200
+  M=1024 rows now: gen.qkv -4.0%, attn.out -3.9%, mlp.down -1.8%, und.q -4.7%.  The
+  C++ kernel has an opt-in -DW8A16_SM100_TRACE clock trace (block 0 roles, per-CTA
+  end times) that made the per-phase comparison possible.
