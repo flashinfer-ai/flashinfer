@@ -600,11 +600,12 @@ ROUTER_RULES: dict[tuple[str, str, int, int], Optional[Union[str, int]]] = {
     ("sm_100a", "kk", 4096, 256): None, ("sm_100a", "kk", 5120, 256): None, ("sm_100a", "kk", 6144, 256): None,
     ("sm_103a", "kk", 4096, 256): None, ("sm_103a", "kk", 5120, 256): None, ("sm_103a", "kk", 6144, 256): None,
     ("sm_107a", "kk", 4096, 256): None, ("sm_107a", "kk", 5120, 256): None, ("sm_107a", "kk", 6144, 256): None,
-    # the weight gradient: the "waves" partition where the deterministic plan's last wave is sparse (hidden 5120);
-    # hidden 4096 and 6144 keep the deterministic plan (fuller waves: the margin does not survive a resident kernel)
+    # the weight gradient: the "waves" partition where the deterministic plan's last wave is sparse (hidden 5120 on
+    # sm_100a / sm_103a); hidden 4096 and 6144 keep the deterministic plan (fuller waves: the margin does not survive a
+    # resident kernel); on sm_107a hidden 5120 loses next to a kernel holding 32 SMs at 16172 tokens (CUDA graphs)
     ("sm_100a", "nn_t", 4096, 256): None, ("sm_100a", "nn_t", 5120, 256): "waves", ("sm_100a", "nn_t", 6144, 256): None,
     ("sm_103a", "nn_t", 4096, 256): None, ("sm_103a", "nn_t", 5120, 256): "waves", ("sm_103a", "nn_t", 6144, 256): None,
-    ("sm_107a", "nn_t", 4096, 256): None, ("sm_107a", "nn_t", 5120, 256): "waves", ("sm_107a", "nn_t", 6144, 256): None,
+    ("sm_107a", "nn_t", 4096, 256): None, ("sm_107a", "nn_t", 5120, 256): None, ("sm_107a", "nn_t", 6144, 256): None,
 }
 # fmt: on
 #: The forward's largest explicit split count: an element of the forward takes at most two partials, so a forward

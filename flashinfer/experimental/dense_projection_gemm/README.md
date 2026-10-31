@@ -80,7 +80,7 @@ deterministic program.
 |---|---|---|---|
 | `sm_100a` (>= 148 SMs) | `4096 -> 32, 48, 64`; `5120 -> 32, 48, 64`; `6144 -> 32`: (64, 2).  `4096 -> 128`: deterministic (measured, missed) | deterministic (4 splits) | hidden 5120, 256 experts: `"waves"`; hidden 4096 / 6144: deterministic (6 splits) |
 | `sm_103a` (>= 148 SMs) | `4096 -> 32, 48, 64`; `5120 -> 32, 48, 64`; `6144 -> 32`: (64, 2); `5120 -> 128`, `6144 -> 128`: (128, 2).  `4096 -> 128`: deterministic (measured, missed) | deterministic (4 splits) | hidden 5120, 256 experts: `"waves"`; hidden 4096 / 6144: deterministic (6 splits) |
-| `sm_107a` (>= 216 SMs) | `4096 -> 32` BF16 (64, 4), FP32 (64, 3); `4096 -> 48` FP32 (64, 3); `4096 -> 64` BF16 (64, 4), FP32 (64, 3); `5120 -> 32` (64, 3); `5120 -> 48`, `5120 -> 64` FP32 (64, 3); `6144 -> 32` (64, 3); `8192 -> 128` (128, 2); `4096 -> 512` BF16 (256, 3), FP32 (128, 1) `p = 1`; `5120 -> 512` FP32 (128, 1) `p = 1`; `4096 -> 1024` FP32 (256, 1) `p = 1`; `5120 -> 1024` (256, 1) `p = 1`; `4096 -> 4096` FP32 (128, 1) `p = 1`.  `4096 -> 128`: deterministic (measured, missed) | deterministic (4 splits) | hidden 5120, 256 experts: `"waves"`; hidden 4096 / 6144: deterministic (6 splits) |
+| `sm_107a` (>= 216 SMs) | `4096 -> 32` BF16 (64, 4), FP32 (64, 3); `4096 -> 48` FP32 (64, 3); `4096 -> 64` BF16 (64, 4), FP32 (64, 3); `5120 -> 32` (64, 3); `5120 -> 48`, `5120 -> 64` FP32 (64, 3); `6144 -> 32` (64, 3); `8192 -> 128` (128, 2); `4096 -> 512` BF16 (256, 3), FP32 (128, 1) `p = 1`; `5120 -> 512` FP32 (128, 1) `p = 1`; `4096 -> 1024` FP32 (256, 1) `p = 1`; `5120 -> 1024` (256, 1) `p = 1`; `4096 -> 4096` FP32 (128, 1) `p = 1`.  `4096 -> 128`: deterministic (measured, missed) | deterministic (4 splits) | deterministic (6 splits); hidden 5120 measured, missed (432 `"waves"` units lose next to a kernel holding 32 SMs) |
 
 *Table: the rows that run this package's programs.  `4096 -> 128` misses on `sm_100a` / `sm_103a` next to a kernel
 holding 32 SMs (its 128 CTAs no longer fit the free SMs) and on `sm_107a` at 16384 tokens.  The `sm_107a` one-split
@@ -90,8 +90,8 @@ T + 63` (shorter token counts run the deterministic program).*
 `"waves"` (`router_waves`) launches whole waves of the device's CTA pairs (`pairs = sm_count // 2`): `c * pairs`
 units with `c = max(2, round(tiles * k_iters / (68 * pairs))) + 1`, and only where the deterministic plan's six
 splits fill their last wave below 80 % (`w / ceil(w)`, `w = 6 * tiles / pairs`); otherwise the row runs the
-deterministic program.  At hidden 5120 and 16k tokens that is 380 units on 152 SMs and 432 on 216 SMs; on 148 SMs
-the deterministic plan's last wave is 81 % full and the row runs the deterministic program.
+deterministic program.  At hidden 5120 and 16k tokens that is 380 units on 152 SMs; on 148 SMs the deterministic
+plan's last wave is 81 % full and the row runs the deterministic program.
 
 `prepare_*` and `plan_*` take `splits` (and, for K1, `block_n`) to force a plan, for tests and measurements; the K2
 forward takes at most two splits.  `benchmarks/bench_cake_dense_projection_gemm.py` prints, per row, the

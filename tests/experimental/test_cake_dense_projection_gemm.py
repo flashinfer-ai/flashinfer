@@ -881,15 +881,17 @@ def test_router_units_policy(monkeypatch):
                 )
                 is None
             )
-    # weight gradient, hidden 5120: the "waves" partition (whole waves of the CTA pairs of the device)
+    # weight gradient, hidden 5120: the "waves" partition (whole waves of the CTA pairs of the device) on sm_100a /
+    # sm_103a; sm_107a measured, missed (the partition would be 432 units)
     for arch in ("sm_100a", "sm_103a"):
         assert (
             cake_backend.router_units("nn_t", arch=arch, sm_count=152, **wgrad5120)
             == 380
         )
+    assert cake_backend.ROUTER_RULES[("sm_107a", "nn_t", 5120, 256)] is None
     assert (
         cake_backend.router_units("nn_t", arch="sm_107a", sm_count=216, **wgrad5120)
-        == 432
+        is None
     )
     assert (
         cake_backend.router_units("nn_t", arch="sm_100a", sm_count=148, **wgrad5120)
