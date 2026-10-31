@@ -49,6 +49,7 @@ from flashinfer.gdn_kernels.gdn_decode_nontranspose import (  # noqa: E402
     _nontranspose_kernel_name,
 )
 from flashinfer.gdn_kernels.gdn_decode_pretranspose import (  # noqa: E402
+    _decode_launch_config,
     _get_compiled_decode_kernel,
     _pretranspose_kernel_name,
 )
@@ -635,3 +636,21 @@ def test_nontranspose_disk_cache_round_trip(monkeypatch, tmp_path):
     )
     torch.testing.assert_close(out1, out2, atol=0, rtol=0)
     torch.testing.assert_close(state1, state2, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize(
+    "cc,B,HV,V,expected",
+    [
+        ((10, 0), 1, 24, 128, (2, 16)),
+        ((9, 0), 2, 32, 128, (2, 16)),
+        ((10, 0), 1, 32, 192, (2, 8)),
+        ((8, 9), 8, 24, 128, (2, 8)),
+        ((10, 0), 8, 48, 128, (3, 4)),
+        ((10, 0), 128, 24, 128, (3, 4)),
+        ((10, 7), 1, 24, 128, (2, 8)),
+        ((10, 7), 32, 24, 128, (3, 4)),
+        ((10, 7), 128, 24, 128, (5, 4)),
+    ],
+)
+def test_pretranspose_launch_config_by_state_count(cc, B, HV, V, expected):
+    assert _decode_launch_config(*cc, B, HV, V) == expected
