@@ -135,3 +135,16 @@ Until then the C++ stays as-is and the DSL kernel lives beside it.
   behind; the cost model picks the ping-pong tiles on 8 of 18 rows, which run here as
   single-warpgroup tiles (half the wgmma issue) -> implementing true ping-pong next;
   stream-K rows (gate_up 4096/8192, mlp.down 1024) pay the wave quantization (+17%).
+- Sat 31 Oct 2026, later: Hopper tuning.  Ping-pong schedule added (ordered mbarriers
+  between the two consumer warpgroups), the e4m3 pair conversion runs straight from the
+  16-bit load register, the weight stage is addressed as its own swizzled tensor (static
+  element offsets).  H100 table (C++ / DSL us): und.q 30.4/33.1, 107.1/107.3, 210.5/211.5;
+  und.kv 14.6/15.1, 26.9/29.4, 44.0/45.7; gen.qkv 40.5/43.2, 138.7/147.4, 261.0/262.9;
+  attn.out 36.0/38.1, 114.2/120.7, 224.9/236.5; gate_up 107.6/108.2, 342.1/375.3,
+  677.5/754.5; mlp.down 118.6/142.4, 332.5/365.6, 673.2/728.8.  Cooperative plain rows at
+  parity; ping-pong rows 3-9% behind (ncu: still +30% ALU / FMA instructions and 2x
+  branch ops against the C++ mainloop); the three stream-K rows 10-20% behind (wave
+  quantization: 800 tiles / 132 SMs); mlp.down 4096/8192 (128x256 plain, K 6400) 8-10%.
+  DSL lessons: a tensor returned from or passed through a @cute.jit helper leaves layout
+  values in the helper's region (inline instead); a kernel must use its layout arguments,
+  not self's host-side values; a tensor rebound inside a staged loop becomes loop-carried.
