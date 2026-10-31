@@ -21,13 +21,28 @@ and the fp32 weight gradient of the balanced E=4 rows; plus one checkpointed
 training step per (projection, distribution) -- ``2 x forward + backward``
 through the autograd wrapper under ``torch.utils.checkpoint`` (non-reentrant,
 early stop off so that every arm recomputes its forward), both gradients included.
+Opt-in autograd rows over the same distributions: ``step_es``, that step with
+checkpoint early stop on (the torch default: an arm whose inputs are saved
+before its GEMM launches, ``cake`` and ``torch._grouped_mm``, skips the
+recomputed forward); ``block`` / ``block_es``, one checkpointed MoE expert
+block with early stop off / on -- gate_up, ``silu(a) * b`` on its two halves,
+down, with the gradients of ``x``, ``w1`` and ``w2`` -- in which only the
+recompute of the down GEMM can be skipped.  The rate of these rows counts the
+useful work only (forward, data and weight gradient of each GEMM); the ``step``
+rows keep their earlier count, which includes the recomputed forward.
 
 Arms: ``cake_det`` (the deterministic package,
 ``flashinfer.experimental.cake_moe_grouped_det_gemm``), ``cake``
 (``flashinfer.experimental.cake.cake_moe_grouped_gemm`` with
 ``deterministic=False``), ``torch._grouped_mm``, a per-group cuBLAS loop with
 host-known bounds and ``flashinfer.grouped_mm.grouped_mm_bf16`` (cuDNN; fwd /
-dgrad only).  Each row reports the median time with a cold L2 between
+dgrad only); opt-in ``cake_inforward``, ``cake`` through a direct
+``CakeGroupedMm.apply(x, w, offs, False)``, whose forward GEMM launches inside
+``forward`` so that a checkpoint always recomputes it (autograd rows only; when
+it runs with ``cake``, the JSON records the elements in which their outputs and
+gradients differ -- none in the output and ``x.grad``).  ``--census`` adds the
+CUDA kernel count of one call per arm (``torch.profiler``).  Each row reports
+the median time with a cold L2 between
 iterations (and the 10th / 90th percentiles), the peak device memory one
 preparation and launch takes beyond its inputs and output (the Cake arms'
 kept stream workspaces included: they are dropped before the measurement) and
@@ -40,6 +55,7 @@ program for the device is dropped.
 Usage::
 
     python benchmarks/bench_cake_moe_grouped_gemm.py [--ops fwd,wgrad,step] [--rows e4_m112576] [--arms cake_det,cake] [--cupti] [--json out.json]
+    python benchmarks/bench_cake_moe_grouped_gemm.py --ops step,step_es,block,block_es --arms cake_det,cake,cake_inforward,torch_grouped_mm [--census]
 """
 
 import argparse
@@ -47,6 +63,7 @@ import json
 import math
 
 import torch
+import torch.profiler
 import torch.utils.checkpoint
 
 from flashinfer.experimental.cake import cake_moe_grouped_gemm as pkg
@@ -58,7 +75,17 @@ from flashinfer.experimental.cake_moe_grouped_det_gemm.cake_autograd import (
 from flashinfer.testing import bench_gpu_time
 
 PROJECTIONS = {"gate_up": (4096, 6144), "down": (6144, 2048)}  # (N, K)
-OPS = ("fwd", "dgrad", "wgrad", "step")
+BLOCK = "gate_up_down"  # the expert block's projections: gate_up, silu(a) * b, down
+OPS = ("fwd", "dgrad", "wgrad", "step", "step_es", "block", "block_es")
+DEFAULT_OPS = OPS[:4]  # the earlier row set
+AUTOGRAD_OPS = OPS[3:]
+BLOCK_OPS = ("block", "block_es")
+AUTOGRAD_NOTES = {
+    "step": "checkpointed 2 x fwd + bwd",
+    "step_es": "checkpointed fwd + bwd, early stop on",
+    "block": "checkpointed gate_up, silu(a) * b, down: 2 x fwd + bwd",
+    "block_es": "checkpointed gate_up, silu(a) * b, down: fwd + bwd, early stop on",
+}
 E4_GROUPS = {
     112576: {
         "balanced": [28128, 28128, 28128, 28192],
@@ -81,7 +108,11 @@ def build_rows():
     rows = []
 
     def add(op, proj, sizes, out_dtype, group):
-        n, k = PROJECTIONS[proj]
+        if proj == BLOCK:
+            # The block's output and input width: the hidden size.
+            n, k = PROJECTIONS["down"][0], PROJECTIONS["gate_up"][1]
+        else:
+            n, k = PROJECTIONS[proj]
         dist = group if group in ("skewed", "one_empty") else "balanced"
         dtype_tag = "f32" if out_dtype == torch.float32 else "bf16"
         label = f"{op}_{proj}_e{len(sizes)}_m{sum(sizes)}_{dist}_{dtype_tag}"
@@ -117,13 +148,51 @@ def build_rows():
                 add("step", proj, sizes, torch.bfloat16, dist)
         for e in EXPERT_COUNTS:
             add("step", proj, [EXPERT_COUNT_SUM_M // e] * e, torch.bfloat16, "balanced")
+    assert len(rows) == 76
+    # The step's distributions: the step with checkpoint early stop on, and one
+    # checkpointed expert block with early stop off / on.
+    step_dists = [
+        (sizes, dist) for dists in E4_GROUPS.values() for dist, sizes in dists.items()
+    ] + [([EXPERT_COUNT_SUM_M // e] * e, "balanced") for e in EXPERT_COUNTS]
+    for proj in PROJECTIONS:
+        for sizes, dist in step_dists:
+            add("step_es", proj, sizes, torch.bfloat16, dist)
+    for op in BLOCK_OPS:
+        for sizes, dist in step_dists:
+            add(op, BLOCK, sizes, torch.bfloat16, dist)
     return rows
 
 
-def make_inputs(row, device, seed):
+def row_flops(row):
+    """The row's FLOPs.  An autograd row counts the forward, data and weight gradient
+    of each GEMM (useful work, no recompute), except ``step``, which keeps its earlier
+    count with the recomputed forward included."""
+    sum_m = sum(row["sizes"])
+    projs = ("gate_up", "down") if row["op"] in BLOCK_OPS else (row["proj"],)
+    flops = sum(2.0 * sum_m * n * k for n, k in (PROJECTIONS[p] for p in projs))
+    if row["op"] == "step":
+        return flops * 4  # two forward passes, the data and the weight gradient
+    if row["op"] in AUTOGRAD_OPS:
+        return flops * 3
+    return flops
+
+
+def make_inputs(row, device, seed=0):
     torch.manual_seed(seed)
     sizes, n, k = row["sizes"], row["N"], row["K"]
     sum_m, e = sum(sizes), len(sizes)
+    if row["op"] in BLOCK_OPS:
+        # x [sum_m, H], w1 (gate_up) [E, 2 I, H], w2 (down) [E, H, I], g [sum_m, H].
+        (n1, k1), (n2, k2) = PROJECTIONS["gate_up"], PROJECTIONS["down"]
+        s1, s2 = 1.0 / math.sqrt(k1), 1.0 / math.sqrt(k2)
+        x = torch.randn(sum_m, k1, dtype=torch.bfloat16, device=device).mul_(s1)
+        w1 = torch.randn(e, n1, k1, dtype=torch.bfloat16, device=device).mul_(s1)
+        w2 = torch.randn(e, n2, k2, dtype=torch.bfloat16, device=device).mul_(s2)
+        g = torch.randn(sum_m, n2, dtype=torch.bfloat16, device=device)
+        offs = torch.tensor(sizes, dtype=torch.int32, device=device).cumsum(
+            0, dtype=torch.int32
+        )
+        return dict(x=x, w1=w1, w2=w2, g=g, offs=offs, out=None)
     scale = 1.0 / math.sqrt(k)
     x = torch.randn(sum_m, k, dtype=torch.bfloat16, device=device).mul_(scale)
     w = torch.randn(e, n, k, dtype=torch.bfloat16, device=device).mul_(scale)
@@ -164,41 +233,74 @@ def _plan_note(launch):
     return f"{launch.record_name} stages={'+'.join(launch.stages) or 'none'} {shown}"
 
 
-def _step(autograd_fn, t):
-    """``2 x forward + backward``: a non-reentrant checkpointed forward and its backward
-    (which recomputes the forward), with both gradients.
-
-    Checkpoint early stop is off, so every arm recomputes its forward GEMM.  With it
-    on, the recompute of a built-in op such as ``torch._grouped_mm`` stops before its
-    kernel (its saved tensors are its inputs) and that arm would do one GEMM less."""
-    x = t["x"].detach().requires_grad_(True)
-    w = t["w"].detach().requires_grad_(True)
+def _checkpointed(region, t, names, early_stop):
+    """A callable running ``region(*leaves, offs)`` under a non-reentrant checkpoint
+    and its backward with ``t["g"]``, the leaves being ``t[name]`` requiring grad.  It
+    returns the region's output and the leaves, whose ``.grad`` holds that call's
+    gradients."""
+    leaves = [t[name].detach().requires_grad_(True) for name in names]
     g, offs = t["g"], t["offs"]
 
     def run():
-        x.grad = None
-        w.grad = None
-        with torch.utils.checkpoint.set_checkpoint_early_stop(False):
+        for leaf in leaves:
+            leaf.grad = None
+        with torch.utils.checkpoint.set_checkpoint_early_stop(early_stop):
             y = torch.utils.checkpoint.checkpoint(
-                autograd_fn, x, w, offs, use_reentrant=False
+                region, *leaves, offs, use_reentrant=False
             )
             y.backward(g)
+        return y, leaves
 
     return run
+
+
+def _step(autograd_fn, t, early_stop=False):
+    """A non-reentrant checkpointed ``y = autograd_fn(x, w, offs)`` and its backward
+    (which replays the forward), with both gradients.
+
+    Early stop off (the ``step`` rows): every arm recomputes its forward GEMM,
+    ``2 x forward + backward``.  On (the torch default, the ``step_es`` rows): the
+    recompute stops once the region saved its last tensor, so an arm whose inputs are
+    saved before its GEMM launches (``torch._grouped_mm``, ``cake_grouped_mm``) does one
+    GEMM less, and one that launches inside ``Function.forward`` (``cake_det``,
+    ``cake_inforward``) still recomputes it."""
+    return _checkpointed(autograd_fn, t, ("x", "w"), early_stop)
+
+
+def _block(mm, t, early_stop=False):
+    """One checkpointed MoE expert block and its backward, with the gradients of ``x``,
+    ``w1`` and ``w2``: ``a, b = mm(x, w1, offs).chunk(2, -1)`` (gate_up), then
+    ``mm(silu(a) * b, w2, offs)`` (down).  SiLU and the product save tensors after the
+    gate_up GEMM, so with early stop on only the recompute of down can be skipped."""
+
+    def region(x, w1, w2, offs):
+        a, b = mm(x, w1, offs).chunk(2, -1)
+        return mm(torch.nn.functional.silu(a) * b, w2, offs)
+
+    return _checkpointed(region, t, ("x", "w1", "w2"), early_stop)
+
+
+def _autograd(mm, row, t):
+    """The timed callable of an autograd row with ``mm(x, w, offs)`` as its GEMM."""
+    op = row["op"]
+    if op in BLOCK_OPS:
+        return _block(mm, t, early_stop=op == "block_es")
+    return _step(mm, t, early_stop=op == "step_es")
 
 
 def _cake_arm(backend, row, t):
     op = row["op"]
     deterministic = backend is det_cb
-    if op == "step":
+    if op in AUTOGRAD_OPS:
         if deterministic:
-            fn = _step(lambda x, w, offs: cake_grouped_det_mm(x, w, offs), t)
+            fn = _autograd(lambda x, w, offs: cake_grouped_det_mm(x, w, offs), row, t)
         else:
-            fn = _step(
+            fn = _autograd(
                 lambda x, w, offs: pkg.cake_grouped_mm(x, w, offs, deterministic=False),
+                row,
                 t,
             )
-        return fn, None, "checkpointed 2 x fwd + bwd (autograd)"
+        return fn, None, f"{AUTOGRAD_NOTES[op]} (autograd)"
     args = (t["x"], t["w"]) if op == "fwd" else (t["g"], t["w"])
     if op == "wgrad":
         args = (t["g"], t["x"])
@@ -227,8 +329,27 @@ def cake_arm(row, t):
     return _cake_arm(cb, row, t)
 
 
+def cake_inforward_arm(row, t):
+    """``cake`` through a direct ``CakeGroupedMm.apply``: the forward GEMM launches
+    inside ``forward``, before autograd saves the inputs, as before the wrapper
+    deferred it (the internal control of the autograd rows)."""
+    op = row["op"]
+    if op not in AUTOGRAD_OPS:
+        raise NotImplementedError("the in-forward control has autograd rows only")
+    fn = _autograd(
+        lambda x, w, offs: pkg.CakeGroupedMm.apply(x, w, offs, False), row, t
+    )
+    return fn, None, f"{AUTOGRAD_NOTES[op]} (direct CakeGroupedMm.apply)"
+
+
 def torch_grouped_mm_arm(row, t):
     op, fn = row["op"], torch._grouped_mm
+    if op in AUTOGRAD_OPS:
+
+        def mm(a, b, o):
+            return fn(a, b.transpose(1, 2), offs=o)
+
+        return _autograd(mm, row, t), None, f"{AUTOGRAD_NOTES[op]} (torch autograd)"
     x, w, g, offs = t["x"], t["w"], t["g"], t["offs"]
     if op == "fwd":
         return (
@@ -238,12 +359,6 @@ def torch_grouped_mm_arm(row, t):
         )
     if op == "dgrad":
         return (lambda: fn(g, w, offs=offs)), None, "g @ w"
-    if op == "step":
-
-        def mm(a, b, o):
-            return fn(a, b.transpose(1, 2), offs=o)
-
-        return _step(mm, t), None, "checkpointed 2 x fwd + bwd (torch autograd)"
     kwargs = {"out_dtype": torch.float32} if row["out_dtype"] == torch.float32 else {}
     try:
         probe = fn(g.t(), x, offs=offs, **kwargs)
@@ -263,7 +378,7 @@ def torch_grouped_mm_arm(row, t):
 
 def per_expert_cublas_arm(row, t):
     op = row["op"]
-    if op == "step":
+    if op in AUTOGRAD_OPS:
         raise NotImplementedError("no autograd form of the per-group loop")
     x, w, g, out = t["x"], t["w"], t["g"], t["out"]
     bounds = _bounds(row["sizes"])
@@ -306,7 +421,7 @@ def cudnn_grouped_mm_arm(row, t):
     from flashinfer.grouped_mm import grouped_mm_bf16
 
     op = row["op"]
-    if op in ("wgrad", "step"):
+    if op == "wgrad" or op in AUTOGRAD_OPS:
         raise NotImplementedError(
             "grouped_mm_bf16 has no K-offset (weight gradient) form"
         )
@@ -329,8 +444,9 @@ ARM_BUILDERS = {
     "torch_grouped_mm": torch_grouped_mm_arm,
     "per_expert_cublas": per_expert_cublas_arm,
     "cudnn_grouped_mm": cudnn_grouped_mm_arm,
+    "cake_inforward": cake_inforward_arm,
 }
-CAKE_BACKENDS = {"cake_det": det_cb, "cake": cb}
+CAKE_BACKENDS = {"cake_det": det_cb, "cake": cb, "cake_inforward": cb}
 
 
 def _times_ms(fn, cupti):
@@ -376,14 +492,49 @@ def _error_vs_det(row, t, outs):
     return dict(budget_fraction=err, differing_elements=differing)
 
 
+def _autograd_outputs(fn):
+    """The output and the leaf gradients of one call of an autograd row's callable."""
+    y, leaves = fn()
+    return [y.detach()] + [leaf.grad for leaf in leaves]
+
+
+def _cake_vs_inforward(row, grads):
+    """The count of elements in which the ``cake`` and ``cake_inforward`` output and
+    gradients differ (the output and ``x.grad`` must be equal; a weight gradient may
+    differ where its split tail is unordered)."""
+    if len(grads) < 2:
+        return None
+    names = ("out", "x.grad", "w1.grad", "w2.grad")
+    if row["op"] not in BLOCK_OPS:
+        names = ("y", "x.grad", "w.grad")
+    pairs = zip(names, grads["cake"], grads["cake_inforward"], strict=True)
+    return {name: int((a != b).sum()) for name, a, b in pairs}
+
+
+def _kernel_census(fn, device):
+    """The CUDA kernels (copies and memsets excluded) of one call of the warm ``fn``."""
+    torch.cuda.synchronize(device)
+    with torch.profiler.profile(
+        activities=[torch.profiler.ProfilerActivity.CUDA]
+    ) as prof:
+        fn()
+        torch.cuda.synchronize(device)
+    return sum(
+        1
+        for e in prof.events()
+        if e.device_type == torch.autograd.DeviceType.CUDA
+        and not e.name.startswith(("Memcpy", "Memset"))
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     parser.add_argument(
         "--ops",
-        default=",".join(OPS),
-        help="comma-separated subset of fwd,dgrad,wgrad,step",
+        default=",".join(DEFAULT_OPS),
+        help=f"comma-separated subset of {','.join(OPS)}",
     )
     parser.add_argument(
         "--rows",
@@ -393,10 +544,16 @@ def main():
     parser.add_argument(
         "--arms",
         default=",".join(ARMS),
-        help=f"comma-separated subset of {','.join(ARMS)}",
+        help=f"comma-separated subset of {','.join(ARM_BUILDERS)}",
     )
     parser.add_argument(
         "--cupti", action="store_true", help="time with CUPTI instead of CUDA events"
+    )
+    parser.add_argument(
+        "--census",
+        action="store_true",
+        help="count the CUDA kernels of one call per arm with torch.profiler after "
+        "timing it (a separate run: the profiler may perturb later timings)",
     )
     parser.add_argument(
         "--no-memory", action="store_true", help="skip the peak-memory measurement"
@@ -412,6 +569,8 @@ def main():
     unknown = [a for a in arms if a not in ARM_BUILDERS]
     if unknown:
         parser.error(f"unknown arms {unknown}")
+    if args.census and args.cupti:
+        parser.error("--census profiles with torch.profiler; run it without --cupti")
     for arm, backend in CAKE_BACKENDS.items():
         if arm in arms and not backend.generated_program_available(device):
             print(
@@ -429,9 +588,7 @@ def main():
         ):
             continue
         t = make_inputs(row, device, args.seed)
-        flops = 2.0 * sum(row["sizes"]) * row["N"] * row["K"]
-        if row["op"] == "step":
-            flops *= 4  # two forward passes, the data and the weight gradient
+        flops = row_flops(row)
         record = dict(
             label=row["label"],
             op=row["op"],
@@ -444,7 +601,9 @@ def main():
         # Alternate the arm order between measured rows so that no arm always runs first.
         row_arms = arms if len(results) % 2 == 0 else arms[::-1]
         record["arm_order"] = list(row_arms)
-        cells, outs = {}, {}
+        # An autograd row run by both cake and cake_inforward compares their results.
+        check = row["op"] in AUTOGRAD_OPS and {"cake", "cake_inforward"} <= set(arms)
+        cells, outs, grads = {}, {}, {}
         for arm in row_arms:
             try:
                 fn, _launch, note = ARM_BUILDERS[arm](row, t)
@@ -455,6 +614,11 @@ def main():
                     fn()
                     torch.cuda.synchronize(device)
                     outs[arm] = t["out"].clone()
+                if check and arm in ("cake", "cake_inforward"):
+                    grads[arm] = _autograd_outputs(fn)
+                    torch.cuda.synchronize(device)
+                if args.census:
+                    entry["kernels"] = _kernel_census(fn, device)
                 del fn, _launch
                 if not args.no_memory:
                     entry["peak_mib"], entry["retained_mib"] = _memory(
@@ -472,13 +636,18 @@ def main():
             ratio = cake_ms / det_ms
         record["cake_over_det"] = ratio
         record["cake_vs_det_output"] = _error_vs_det(row, t, outs)
+        if check:
+            record["cake_vs_inforward"] = _cake_vs_inforward(row, grads)
         results.append(record)
         print(
             f"{row['label']:48s} {sum(row['sizes']):7d} "
             + " ".join(f"{cells[arm]:>24s}" for arm in arms)
             + (f" {ratio:8.4f}" if ratio else f" {'n/a':>8s}")
         )
-        del t, outs
+        differing = record.get("cake_vs_inforward") or {}
+        if any(differing.get(name) for name in ("y", "out", "x.grad")):
+            print(f"# {row['label']}: cake differs from cake_inforward {differing}")
+        del t, outs, grads
         torch.cuda.empty_cache()
 
     ratios = [r["cake_over_det"] for r in results if r["cake_over_det"]]
