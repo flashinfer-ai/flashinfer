@@ -287,7 +287,11 @@ def _probe(fn: Callable[[], object], device: torch.device) -> dict:
 
 
 def _bits(t: torch.Tensor) -> torch.Tensor:
-    return t.detach().contiguous().view(torch.int16 if t.element_size() == 2 else torch.int32)
+    return (
+        t.detach()
+        .contiguous()
+        .view(torch.int16 if t.element_size() == 2 else torch.int32)
+    )
 
 
 class Problem:
@@ -314,16 +318,30 @@ class Problem:
         fragments = [f for f in self.part.fragments[rank] if f.length > 0]
 
         def shard(t: torch.Tensor) -> torch.Tensor:
-            pieces = [t[cu[f.doc] + f.off : cu[f.doc] + f.off + f.length] for f in fragments]
+            pieces = [
+                t[cu[f.doc] + f.off : cu[f.doc] + f.off + f.length] for f in fragments
+            ]
             return torch.cat(pieces, 0).contiguous() if pieces else t[:0].clone()
 
         generator = torch.Generator(device=device).manual_seed(SEED)
         self.xs, self.ws, self.dys = [], [], []
         for _ in range(tensors):
-            x = torch.randn(tokens, channels, device=device, generator=generator, dtype=torch.bfloat16)
+            x = torch.randn(
+                tokens,
+                channels,
+                device=device,
+                generator=generator,
+                dtype=torch.bfloat16,
+            )
             # N(0, 0.25) taps, as the single-rank benchmark's.
             w = torch.randn(channels, WIDTH, device=device, generator=generator) * 0.5
-            dy = torch.randn(tokens, channels, device=device, generator=generator, dtype=torch.bfloat16)
+            dy = torch.randn(
+                tokens,
+                channels,
+                device=device,
+                generator=generator,
+                dtype=torch.bfloat16,
+            )
             self.xs.append(shard(x))
             self.ws.append(w.contiguous())
             self.dys.append(shard(dy))
@@ -416,21 +434,36 @@ def _check(p: Problem, device: torch.device) -> dict:
         ys = calls["record"]()
         g = calls["bwd"]()
         torch.cuda.synchronize(device)
-        outs[mode] = ([y.detach().clone() for y in ys], [(dx.clone(), dw.clone()) for dx, dw in g])
+        outs[mode] = (
+            [y.detach().clone() for y in ys],
+            [(dx.clone(), dw.clone()) for dx, dw in g],
+        )
     (ys_d, g_d), (ys_n, g_n) = outs["det"], outs["nondet"]
     worst_ratio, worst_rel = 0.0, 0.0
-    for (dx_d, dw_d), (dx_n, dw_n) in zip(g_d, g_n, strict=True):
+    for (_, dw_d), (_, dw_n) in zip(g_d, g_n, strict=True):
         diff = (dw_n.double() - dw_d.double()).abs()
-        worst_ratio = max(worst_ratio, float((diff / (DW_ATOL + DW_RTOL * dw_d.double().abs())).max()))
-        worst_rel = max(worst_rel, float(diff.max() / dw_d.double().abs().max().clamp_min(1e-30)))
+        worst_ratio = max(
+            worst_ratio, float((diff / (DW_ATOL + DW_RTOL * dw_d.double().abs())).max())
+        )
+        worst_rel = max(
+            worst_rel, float(diff.max() / dw_d.double().abs().max().clamp_min(1e-30))
+        )
     flags = {
-        "y_bitwise": all(torch.equal(_bits(a), _bits(b)) for a, b in zip(ys_d, ys_n, strict=True)),
+        "y_bitwise": all(
+            torch.equal(_bits(a), _bits(b)) for a, b in zip(ys_d, ys_n, strict=True)
+        ),
         "dx_bitwise": all(
             torch.equal(_bits(a[0]), _bits(b[0])) for a, b in zip(g_d, g_n, strict=True)
         ),
         "dweight_within_budget": worst_ratio <= 1.0,
     }
-    ranks = _gather({**flags, "dweight_ratio_to_budget": worst_ratio, "dweight_max_rel_diff": worst_rel})
+    ranks = _gather(
+        {
+            **flags,
+            "dweight_ratio_to_budget": worst_ratio,
+            "dweight_max_rel_diff": worst_rel,
+        }
+    )
     return {
         **{key: all(r[key] for r in ranks) for key in flags},
         "dweight_ratio_to_budget": max(r["dweight_ratio_to_budget"] for r in ranks),
@@ -477,14 +510,24 @@ def bench_row(
             for when in ("first", "steady"):
                 if phase == "bwd":
                     calls["record"]()
-                probe = {"fwd": calls["fwd"], "bwd": calls["bwd_once"], "ckpt": calls["ckpt_memory"]}[phase]
+                probe = {
+                    "fwd": calls["fwd"],
+                    "bwd": calls["bwd_once"],
+                    "ckpt": calls["ckpt_memory"],
+                }[phase]
                 entries[mode][f"{phase}_{when}"] = _probe(probe, device)
     # Interleaved rounds: every phase of both modes per round, the first mode alternating.
     timed = {mode: _calls(p, deterministic) for mode, deterministic in MODES.items()}
     for calls in timed.values():
         calls["record"]()
-    samples = {mode: {f"{phase}_{kind}": [] for phase in PHASES for kind in KINDS} for mode in MODES}
-    per_rank = {mode: {f"{phase}_{kind}": [] for phase in PHASES for kind in ("gpu", "ahead")} for mode in MODES}
+    samples = {
+        mode: {f"{phase}_{kind}": [] for phase in PHASES for kind in KINDS}
+        for mode in MODES
+    }
+    per_rank = {
+        mode: {f"{phase}_{kind}": [] for phase in PHASES for kind in ("gpu", "ahead")}
+        for mode in MODES
+    }
     late = {mode: 0 for mode in MODES}
     order = list(MODES)
     for index in range(args.rounds):
@@ -498,7 +541,12 @@ def bench_row(
                 wall, host = _wall_ms(calls[phase], device)
                 per_rank[mode][f"{phase}_gpu"].append([t * 1e3 for t in gpu])
                 per_rank[mode][f"{phase}_ahead"].append([t * 1e3 for t in aheads])
-                for kind, value in (("gpu", max(gpu)), ("ahead", max(aheads)), ("wall", wall), ("host", host)):
+                for kind, value in (
+                    ("gpu", max(gpu)),
+                    ("ahead", max(aheads)),
+                    ("wall", wall),
+                    ("host", host),
+                ):
                     samples[mode][f"{phase}_{kind}"].append(value * 1e3)
     for mode in MODES:
         entry = entries[mode]
@@ -511,11 +559,15 @@ def bench_row(
     result["modes"] = entries
     keys = [f"{phase}_{kind}" for phase in PHASES for kind in KINDS]
     result["speedup"] = {
-        key: entries["det"][f"{key}_us"] / entries["nondet"][f"{key}_us"] for key in keys
+        key: entries["det"][f"{key}_us"] / entries["nondet"][f"{key}_us"]
+        for key in keys
     }
     result["speedup_range"] = {}
     for key in keys:
-        ratios = [d / n for d, n in zip(samples["det"][key], samples["nondet"][key], strict=True)]
+        ratios = [
+            d / n
+            for d, n in zip(samples["det"][key], samples["nondet"][key], strict=True)
+        ]
         result["speedup_range"][key] = [min(ratios), max(ratios)]
     result["check"] = _check(p, device)
     del p
@@ -543,7 +595,9 @@ def _format(result: dict, world: int) -> list[str]:
             f"[{result['speedup_range'][f'{phase}_{kind}'][0]:5.3f}, {result['speedup_range'][f'{phase}_{kind}'][1]:5.3f}]"
             for kind in ("gpu", "ahead", "wall")
         )
-        lines.append(f"{head} {phase:4s} | det {cells[0]} | nondet {cells[1]} | det/nondet {ratios}")
+        lines.append(
+            f"{head} {phase:4s} | det {cells[0]} | nondet {cells[1]} | det/nondet {ratios}"
+        )
     for mode, entry in (("det", det), ("nondet", nondet)):
         first, steady = entry["bwd_first"], entry["bwd_steady"]
         lines.append(
@@ -552,7 +606,9 @@ def _format(result: dict, world: int) -> list[str]:
             f"{steady['peak_temp_bytes']} B | ckpt steady peak temp {entry['ckpt_steady']['peak_temp_bytes']} B "
             f"retained {entry['ckpt_steady']['retained_bytes']} B | ahead_late {entry['ahead_late']}"
         )
-    lines.append(f"{head} tokens per rank {result['tokens_local']} check {result['check']}")
+    lines.append(
+        f"{head} tokens per rank {result['tokens_local']} check {result['check']}"
+    )
     return lines
 
 
@@ -567,31 +623,49 @@ def main(argv: Optional[list[str]] = None) -> int:
         default=None,
         help="whole-pack token counts S; with --channels the rows are their product (default: the matrix)",
     )
-    parser.add_argument("--channels", type=int, nargs="*", default=None, help="channel counts C")
+    parser.add_argument(
+        "--channels", type=int, nargs="*", default=None, help="channel counts C"
+    )
     parser.add_argument(
         "--tensors",
         type=int,
         default=1,
         help="convolutions per layer: 1 runs cake_causal_conv1d_kcp, more run cake_causal_conv1d_multi_kcp",
     )
-    parser.add_argument("--layout", choices=LAYOUTS, default="contiguous", help="the KCP partition layout")
+    parser.add_argument(
+        "--layout",
+        choices=LAYOUTS,
+        default="contiguous",
+        help="the KCP partition layout",
+    )
     parser.add_argument(
         "--rounds",
         type=int,
         default=ROUNDS,
         help="interleaved det / nondet timing rounds (each value: the median over the rounds, with its range)",
     )
-    parser.add_argument("--json", type=str, default=None, help="rank 0 writes all rows to this JSON file")
+    parser.add_argument(
+        "--json",
+        type=str,
+        default=None,
+        help="rank 0 writes all rows to this JSON file",
+    )
     args = parser.parse_args(argv)
     if args.rounds < 1 or args.tensors < 1:
         parser.error("--rounds and --tensors must be at least 1")
     warnings.simplefilter("ignore", ExperimentalWarning)
     rank, world, device = _init()
     for mode, deterministic in MODES.items():
-        if not conv.is_cake_causal_conv1d_train_supported(device, deterministic=deterministic):
-            raise SystemExit(f"the {mode} package has no exported route on this device (or is not rendered)")
+        if not conv.is_cake_causal_conv1d_train_supported(
+            device, deterministic=deterministic
+        ):
+            raise SystemExit(
+                f"the {mode} package has no exported route on this device (or is not rendered)"
+            )
     if torch.are_deterministic_algorithms_enabled():
-        raise SystemExit("torch.use_deterministic_algorithms(True) would run both modes deterministically")
+        raise SystemExit(
+            "torch.use_deterministic_algorithms(True) would run both modes deterministically"
+        )
     if rank == 0:
         print(
             f"device {torch.cuda.get_device_name(device)} CUDA {torch.version.cuda} torch {torch.__version__} "
@@ -600,11 +674,23 @@ def main(argv: Optional[list[str]] = None) -> int:
     if args.tokens is None and args.channels is None:
         rows = perf_rows()
     else:
-        rows = [(s, c) for s in (args.tokens or [P2_TOKENS]) for c in (args.channels or [P1_CHANNELS])]
+        rows = [
+            (s, c)
+            for s in (args.tokens or [P2_TOKENS])
+            for c in (args.channels or [P1_CHANNELS])
+        ]
     ahead = _GpuAhead(device)
     results = []
     for tokens, channels in rows:
-        result = bench_row(tokens, channels, args=args, rank=rank, world=world, device=device, ahead=ahead)
+        result = bench_row(
+            tokens,
+            channels,
+            args=args,
+            rank=rank,
+            world=world,
+            device=device,
+            ahead=ahead,
+        )
         results.append(result)
         if rank == 0:
             for line in _format(result, world):
@@ -621,7 +707,9 @@ def main(argv: Optional[list[str]] = None) -> int:
                     {
                         "device": torch.cuda.get_device_name(device),
                         "capability": list(torch.cuda.get_device_capability(device)),
-                        "sm_count": torch.cuda.get_device_properties(device).multi_processor_count,
+                        "sm_count": torch.cuda.get_device_properties(
+                            device
+                        ).multi_processor_count,
                         "cuda": torch.version.cuda,
                         "torch": torch.__version__,
                         "world": world,
