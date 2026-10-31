@@ -1506,6 +1506,9 @@ def _tinygemm2_tcgen05_enabled(
 ) -> bool:
     if disabled == "1" or compute_capability not in _TINYGEMM2_TCGEN05_WINDOWS:
         return False
+    # The sm_107a programs need CUDA 13.4, as tinygemm2_sm100 does on SM107.
+    if compute_capability == (10, 7) and not is_cuda_version_at_least("13.4"):
+        return False
     return version_at_least(torch.version.cuda, "12.8")
 
 

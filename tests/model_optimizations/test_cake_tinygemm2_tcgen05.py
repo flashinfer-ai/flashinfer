@@ -1182,6 +1182,36 @@ def test_tinygemm2_tcgen05_windows(
     assert program == expected
 
 
+def test_tinygemm2_tcgen05_sm107_needs_cuda_13_4(monkeypatch):
+    """On SM107 the generated programs serve a call only with CUDA 13.4 or later;
+    older toolkits keep the reference kernel."""
+    import flashinfer.gemm.routergemm as routergemm
+
+    monkeypatch.setattr(routergemm, "get_compute_capability", lambda _: (10, 7))
+    monkeypatch.setattr(routergemm, "_multiprocessor_count", lambda _: 212)
+    input = torch.empty(9, 2048, dtype=torch.bfloat16)
+    weight = torch.empty(4224, 2048, dtype=torch.bfloat16)
+    out = torch.empty(9, 4224, dtype=torch.bfloat16)
+    # The enable check is cached per (escape hatch, capability): clear it around
+    # each patched toolkit version and after the test.
+    enabled = routergemm._tinygemm2_tcgen05_enabled
+    try:
+        monkeypatch.setattr(routergemm, "is_cuda_version_at_least", lambda _: True)
+        enabled.cache_clear()
+        assert (
+            routergemm._tinygemm2_tcgen05_program(input, weight, out, False, False)
+            == "PACKED_NOBIAS"
+        )
+        monkeypatch.setattr(routergemm, "is_cuda_version_at_least", lambda _: False)
+        enabled.cache_clear()
+        assert (
+            routergemm._tinygemm2_tcgen05_program(input, weight, out, False, False)
+            is None
+        )
+    finally:
+        enabled.cache_clear()
+
+
 def test_tinygemm2_tcgen05_disabled_and_unaligned(monkeypatch):
     """The escape hatch, a tensor-map-unaligned operand and, for ACCUMULATORS, an
     output that is not 32-byte aligned keep the kernels the call runs otherwise."""
