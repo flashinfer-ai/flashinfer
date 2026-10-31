@@ -51,6 +51,13 @@ smaller_mla_dimensions = MLAHeadDimensions(
     kv_lora_rank=256,
 )
 
+compact_query_mla_dimensions = MLAHeadDimensions(
+    qk_nope_head_dim=64,
+    qk_rope_head_dim=64,
+    v_head_dim=128,
+    kv_lora_rank=512,
+)
+
 nope_mla_dimensions = MLAHeadDimensions(
     qk_nope_head_dim=256,
     qk_rope_head_dim=0,
@@ -61,6 +68,7 @@ nope_mla_dimensions = MLAHeadDimensions(
 supported_mla_head_dimensions = [
     deepseek_mla_dimensions,
     smaller_mla_dimensions,
+    compact_query_mla_dimensions,
     nope_mla_dimensions,
 ]
 
