@@ -926,7 +926,8 @@ def test_keep_ab_runtime_task_cache(scheduler, monkeypatch):
         assert cfg.kernel_variant == "keeps_mma_ab"
         assert cfg.num_insts_kv == 1
         assert cfg.tile_size_q == cfg.tile_size_kv == 64
-        assert cfg.seq_len_kv == 768
+        # Generic sparse kernels take the KV capacity at run time.
+        assert cfg.seq_len_kv is None
         assert cfg.num_ctas_per_seq_kv == cfg.num_ctas_per_head_dim == 1
         assert cfg.fixed_sparse_kv_tiles == 0
         assert cfg.kv_stages == 8
