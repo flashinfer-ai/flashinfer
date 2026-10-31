@@ -1,0 +1,244 @@
+"""Runtime cache compatibility and numerical GEMM provider-loading tests."""
+
+import json
+
+import pytest
+import torch
+
+from flashinfer.jit import cute_dsl_core as cache
+from flashinfer.jit import env as jit_env
+from flashinfer.jit.cute_dsl_aot import _compile_aot_kernel
+from flashinfer.jit.gemm.cute_dsl_fp4 import MM_FP4_OPERATION
+
+
+def test_source_fingerprint_survives_install_relocation(tmp_path):
+    trees = []
+    for name in ("checkout", "site-packages"):
+        tree = tmp_path / name
+        (tree / "kernels").mkdir(parents=True)
+        (tree / "entry.py").write_text("entry")
+        (tree / "kernels" / "kernel.py").write_text("kernel")
+        trees.append((tree / "entry.py", tree / "kernels" / "kernel.py"))
+    assert cache._hash_source_files(trees[0]) == cache._hash_source_files(
+        trees[1][::-1]
+    )
+    trees[1][1].write_text("changed")
+    assert cache._hash_source_files(trees[0]) != cache._hash_source_files(trees[1])
+
+
+@pytest.mark.parametrize(
+    "mismatch", [None, "source_sha256", "cute_dsl_version", "arch", "corrupt"]
+)
+def test_provider_objects_are_loaded_read_only(monkeypatch, tmp_path, mismatch):
+    monkeypatch.setenv("CUTE_DSL_ARCH", "sm_100a")
+    monkeypatch.setenv("FLASHINFER_DISABLE_JIT", "1")
+    monkeypatch.setattr(jit_env, "FLASHINFER_JIT_DIR", tmp_path / "writable")
+    spec = cache.JitSpecCuteDsl(
+        "mm_fp4", "test", lambda: pytest.fail("compiled"), "source"
+    )
+    provider_dir = tmp_path / "installed"
+    module_dir = provider_dir / spec.module_dir_name
+    module_dir.mkdir(parents=True)
+    obj = module_dir / spec.object_path.name
+    obj.write_bytes(b"object")
+    meta = dict(spec.expected_meta)
+    if mismatch in meta:
+        meta[mismatch] = "incompatible"
+    (module_dir / "meta.json").write_text(json.dumps(meta))
+    provider = jit_env.AOTProvider(
+        "sm100a",
+        "provider",
+        "test",
+        provider_dir,
+        frozenset({"sm100a"}),
+        frozenset({spec.module_dir_name}),
+    )
+    monkeypatch.setattr(jit_env, "FLASHINFER_AOT_PROVIDERS", (provider,))
+
+    def load(path):
+        assert path == obj
+        if mismatch == "corrupt":
+            raise ValueError("invalid object")
+        return "loaded"
+
+    monkeypatch.setattr(spec, "_load_object", load)
+    if mismatch:
+        from flashinfer.jit import MissingJITCacheError
+
+        with pytest.raises(MissingJITCacheError):
+            spec.build_and_load()
+    else:
+        assert spec.is_compiled
+        assert spec.build_and_load() == "loaded"
+    assert not spec.module_dir.exists()
+    assert obj.read_bytes() == b"object"
+
+
+@pytest.mark.parametrize(
+    "use_nvfp4,per_token,family,pdl",
+    [
+        (True, False, "sm100", True),
+        (False, False, "sm100", False),
+        (True, True, "sm100", False),
+        (False, True, "sm100", True),
+        (True, False, "sm100sk", True),
+        (True, False, "sm103", False),
+        (True, False, "sm107", False),
+    ],
+)
+def test_fp4_runs_from_provider_with_jit_disabled(
+    monkeypatch, tmp_path, use_nvfp4, per_token, family, pdl
+):
+    if not torch.cuda.is_available():
+        pytest.skip("Requires SM100/103/107 GPU")
+    major, minor = torch.cuda.get_device_capability()
+    if (major, minor) not in ((10, 0), (10, 3), (10, 7)):
+        pytest.skip("Requires SM100/103/107 GPU")
+    if family in ("sm103", "sm107") and minor != 7:
+        pytest.skip("Requires Rubin kernel families")
+    if minor == 7 and per_token:
+        pytest.skip("Public per-token alpha is not supported on Rubin")
+    import cutlass.cute as cute
+    from flashinfer.gemm import gemm_base
+    from flashinfer.gemm.gemm_mm_fp4_cute_dsl import (
+        _blockscaled_kernel_disk_name,
+        _mm_fp4_cache_key,
+    )
+
+    arch = f"sm{major}{minor}a"
+    monkeypatch.setenv("CUTE_DSL_ARCH", arch.replace("sm", "sm_", 1))
+    monkeypatch.setattr(jit_env, "FLASHINFER_JIT_DIR", tmp_path / "build")
+    monkeypatch.setattr(jit_env, "FLASHINFER_AOT_PROVIDERS", ())
+    m = 8 if family == "sm100sk" else 128
+    tactic = {
+        "sm100": ((128, 128), (1, 1), False, False, "sm100", None),
+        "sm100sk": ((128, 8), (1, 1), True, False, "sm100sk", 2),
+        "sm103": ((128, 128), (1, 1), False, False, "sm103", False),
+        "sm107": ((128, 128), (1, 1), False, False, "sm107", (128, 128, 128, 256, 0)),
+    }[family]
+
+    config = _mm_fp4_cache_key(
+        16 if use_nvfp4 else 32,
+        tactic,
+        pdl,
+        torch.bfloat16,
+        "m" if per_token else None,
+        "b_ef" if family == "sm100" else None,
+    )
+    name = _blockscaled_kernel_disk_name(config, 1, None)
+    _compile_aot_kernel(MM_FP4_OPERATION, name, config, arch, tmp_path / "build")
+    module_name = f"mm_fp4_{arch}_cute_dsl"
+    provider = jit_env.AOTProvider(
+        arch,
+        "test-provider",
+        "test",
+        tmp_path / "build",
+        frozenset({arch}),
+        frozenset({module_name}),
+    )
+    monkeypatch.setattr(jit_env, "FLASHINFER_AOT_PROVIDERS", (provider,))
+    monkeypatch.setattr(jit_env, "FLASHINFER_JIT_DIR", tmp_path / "empty")
+    monkeypatch.setattr(gemm_base, "_CUTE_DSL_MM_FP4_KERNEL_CACHE", {})
+    # The DSL initializes a separate device-occupancy probe with cute.compile.
+    # Warm that probe before forbidding GEMM compilation below.
+    from flashinfer.cute_dsl.utils import get_max_active_clusters
+
+    get_max_active_clusters(2 if family == "sm100sk" else 1)
+    monkeypatch.setenv("FLASHINFER_DISABLE_JIT", "1")
+    monkeypatch.setattr(
+        cute, "compile", lambda *args, **kwargs: pytest.fail("JIT compiled")
+    )
+    # FP4 code 2 is 1.0; E4M3 code 56 and E8M0 code 127 are both 1.0.
+    a = torch.full((m, 256), 0x22, dtype=torch.uint8, device="cuda")
+    b = torch.full((128, 256), 0x22, dtype=torch.uint8, device="cuda")
+    scales = torch.full(
+        (128, 32), 56 if use_nvfp4 else 127, dtype=torch.uint8, device="cuda"
+    )
+    alpha = torch.linspace(0.5, 1.0, m if per_token else 1, device="cuda")
+    out = torch.empty((m, 128), dtype=torch.bfloat16, device="cuda")
+    runner = gemm_base._cute_dsl_gemm_fp4_runner(
+        major, minor, pdl, out.dtype, use_nvfp4
+    )
+    runner.forward(
+        (a, b.T, scales, scales.T, alpha, None, out, None, None, None), tactic=tactic
+    )
+    expected = (
+        (512 * alpha).expand(128, m).T if per_token else torch.full_like(out, 256)
+    )
+    torch.testing.assert_close(out.float(), expected.float(), rtol=0.01, atol=0)
+    assert not (tmp_path / "empty" / module_name).exists()
+
+
+@pytest.mark.parametrize("family", ["persistent", "cluster_splitk", "native_sm107"])
+def test_mxfp8_runs_from_provider_with_jit_disabled(monkeypatch, tmp_path, family):
+    if not torch.cuda.is_available():
+        pytest.skip("Requires SM100/103/107 GPU")
+    major, minor = torch.cuda.get_device_capability()
+    if (major, minor) not in ((10, 0), (10, 3), (10, 7)):
+        pytest.skip("Requires SM100/103/107 GPU")
+    native = family == "native_sm107"
+    if native and minor != 7:
+        pytest.skip("Native Rubin kernel requires SM107")
+    import cutlass.cute as cute
+    from flashinfer.gemm import gemm_base
+    from flashinfer.gemm.gemm_mm_fp4_cute_dsl import _blockscaled_kernel_disk_name
+    from flashinfer.gemm.gemm_mm_mxfp8_cute_dsl import _mm_mxfp8_cache_key
+    from flashinfer.jit.gemm.cute_dsl_mxfp8 import MM_MXFP8_OPERATION
+
+    arch = f"sm{major}{minor}a"
+    monkeypatch.setenv("CUTE_DSL_ARCH", arch.replace("sm", "sm_", 1))
+    monkeypatch.setattr(jit_env, "FLASHINFER_JIT_DIR", tmp_path / "build")
+    monkeypatch.setattr(jit_env, "FLASHINFER_AOT_PROVIDERS", ())
+    split = family == "cluster_splitk"
+    m, n, k = (8 if split else 128), 128, 1024
+    tactic = (
+        ((128, 128), (1, 1), False, 128)
+        if native
+        else ((128, 8), (1, 1), True, False, 2)
+        if split
+        else ((128, 128), (1, 1), False, False, 1)
+    )
+    config = _mm_mxfp8_cache_key(tactic, False, torch.bfloat16, native_sm107=native)
+    name = _blockscaled_kernel_disk_name(config, 1, None)
+    _compile_aot_kernel(MM_MXFP8_OPERATION, name, config, arch, tmp_path / "build")
+    module_name = f"mm_mxfp8_{arch}_cute_dsl"
+    provider = jit_env.AOTProvider(
+        arch,
+        "test-provider",
+        "test",
+        tmp_path / "build",
+        frozenset({arch}),
+        frozenset({module_name}),
+    )
+    monkeypatch.setattr(jit_env, "FLASHINFER_AOT_PROVIDERS", (provider,))
+    monkeypatch.setattr(jit_env, "FLASHINFER_JIT_DIR", tmp_path / "empty")
+    monkeypatch.setattr(gemm_base, "_CUTE_DSL_MM_MXFP8_KERNEL_CACHE", {})
+    monkeypatch.setattr(gemm_base, "_CUTE_DSL_MM_MXFP8_SM107_KERNEL_CACHE", {})
+    # The DSL initializes a separate device-occupancy probe with cute.compile.
+    # Warm that probe before forbidding GEMM compilation below.
+    from flashinfer.cute_dsl.utils import get_max_active_clusters
+
+    get_max_active_clusters(2 if family == "cluster_splitk" else 1)
+    monkeypatch.setenv("FLASHINFER_DISABLE_JIT", "1")
+    monkeypatch.setattr(
+        cute, "compile", lambda *args, **kwargs: pytest.fail("JIT compiled")
+    )
+    a = torch.ones((m, k), device="cuda").to(torch.float8_e4m3fn)
+    b = torch.ones((n, k), device="cuda").to(torch.float8_e4m3fn).T
+    a_sf = torch.full(
+        (((m + 127) // 128) * (k // 128) * 512,), 127, dtype=torch.uint8, device="cuda"
+    )
+    b_sf = torch.full(
+        (((n + 127) // 128) * (k // 128) * 512,), 127, dtype=torch.uint8, device="cuda"
+    )
+    out = torch.empty((m, n), dtype=torch.bfloat16, device="cuda")
+    runner = (
+        gemm_base._cute_dsl_gemm_mxfp8_sm107_runner(out.dtype)
+        if native
+        else gemm_base._cute_dsl_gemm_mxfp8_runner(major, minor, False, out.dtype)
+    )
+    runner.forward((a, b, a_sf, b_sf, None, out, None), tactic=tactic)
+    torch.testing.assert_close(
+        out.float(), torch.full_like(out.float(), k), rtol=0, atol=0
+    )
+    assert not (tmp_path / "empty" / module_name).exists()

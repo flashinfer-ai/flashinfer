@@ -507,7 +507,8 @@ FlashInfer uses `CompilationContext` to manage CUDA architecture targets. Some k
 
 **How it works:**
 - Auto-detects GPUs in system or reads `FLASHINFER_CUDA_ARCH_LIST` environment variable
-- CuTe-DSL FP4 MM compilation parallelism can be controlled with `FLASHINFER_MM_FP4_CUTE_DSL_COMPILE_WORKERS`
+- CuTe-DSL AOT worker parallelism is controlled with `FLASHINFER_CUTE_DSL_AOT_WORKERS`; runtime FP4 autotuner precompilation uses `FLASHINFER_MM_FP4_CUTE_DSL_COMPILE_WORKERS`
+- To package another CuTe-DSL operation, register a `CuteDslAOTOperation` in `flashinfer/jit/cute_dsl_aot.py`. Its adapter owns supported architectures, named configurations, and a `JitSpecCuteDsl` factory; the shared builder handles spawned compilation, strict exports, and packaging. See `flashinfer/jit/gemm/cute_dsl_fp4.py` and `cute_dsl_mxfp8.py` for FP4 and MXFP8 adapters. MXFP8 packages the SM100 persistent/cluster split-K and native SM107 families for SM100a/103a/107a; its experimental warp split-K path remains JIT-only because it specializes on N/K. Keep tactic enumeration and kernel construction in the operation implementation, outside `gemm_base.py`.
 - JIT modules specify `supported_major_versions=[9, 10, 11, 12]` to limit compilation to specific SM versions
 - If GPU not supported → `RuntimeError: No supported CUDA architectures found`
 
@@ -1084,6 +1085,13 @@ python -m build --no-isolation --wheel flashinfer-jit-cache-provider
 export FLASHINFER_JIT_CACHE_PROVIDER_ARCHS="9.0a"
 python -m build --no-isolation --wheel flashinfer-jit-cache
 ```
+
+Provider builds explicitly enable `add_cute_dsl`; generic AOT builds default it
+to false. Matching CuTe objects also require the builder's Python ABI, Torch,
+TVM-FFI, and DSL fingerprint; otherwise runtime falls back to JIT.
+CuTe GEMM exports package BF16 output for vLLM v0.32.0 API modes while
+retaining autotuning tactics. FP16 and other API modes remain available
+through runtime JIT.
 
 The provider build runs `flashinfer/aot.py`, which calls the registered
 `gen_*_module()` functions and pre-compiles them for exactly one architecture.
