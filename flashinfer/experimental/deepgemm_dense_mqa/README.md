@@ -37,7 +37,7 @@ sm_100a), and `qle1024` on both: the FP4 `le1024` class is then served as `fp4:q
 `fp4:le1024:short` above that query count) -- or `qle`, the fused
 tiered texts `fp8:qle128:short` (`1 < Q <= 128`, `K <= fused_qle128_max_kv`) and
 `fp8:qle2048:short` (`128 < Q <= 2048`, `K <= policy.fused_qle2048_max_kv[arch]` -- 34048 on
-sm_100a, 65536 on sm_103a, the one per-architecture bound; every CTA recomputes the tiered
+sm_100a, 65536 on sm_103a, a per-architecture bound like the FP4 scan-class bounds; every CTA recomputes the tiered
 schedule). The published order is `["qle", "le_class"]` on both tiers and both architectures
 (the fused tiered text while `K` is within its bound, the scan class of the query count above
 it -- the order the paired measurement adopted; `["le_class", "qle"]` would restore the v9
@@ -177,7 +177,9 @@ are aliases -- the 64-head routes have no metadata stage and no query bound),
 the shipped 32-head `fused_q1_max_kv` / `fused_q128_max_kv`, -- v9 -- the FP8
 in-kernel scan classes `fused_scan_ceilings` (`[32, 768]` query blocks) with one KV bound each
 (`fused_scan32_max_kv`, `fused_scan768_max_kv`) and the `fp4` block (`fused_q1_max_kv`, `fused_scan_ceilings`
-`[32, 1024]`, `fused_scan32_max_kv`, `fused_scan1024_max_kv`, `first_tile_prefetch_max_queries_scan1024`: the query
+`[32, 1024]`, `fused_scan32_max_kv`, `fused_scan1024_max_kv` -- each a PER-ARCHITECTURE map, `{"sm_100a": 1048576,
+"sm_103a": 1048832}` and `{"sm_100a": 65536, "sm_103a": 65792}`: the logical `route_name` applies the most permissive
+bound, `served_route` the device's own --, `first_tile_prefetch_max_queries_scan1024`: the query
 count up to which the 1024-block FP4 class is served by `fp4:qle1024:short`, its first-tile-prefetch program, instead of
 `fp4:le1024:short`, and the PER-ARCHITECTURE map `first_tile_prefetch_forms` -- `{"sm_100a": ["q1", "qle1024"],
 "sm_103a": ["q1", "le32", "qle1024"]}` -- naming the single-launch forms whose program carries the prefetch on each
