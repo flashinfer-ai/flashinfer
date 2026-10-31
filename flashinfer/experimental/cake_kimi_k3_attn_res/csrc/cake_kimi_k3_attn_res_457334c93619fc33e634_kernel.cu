@@ -211,7 +211,7 @@ __device__ __forceinline__ __nv_bfloat162 __as_bf16x2(unsigned int v) {
 extern "C" {
 
 __global__ __launch_bounds__(288, LAUNCH_MIN_BLOCKS) void
-kernel_cake_kimi_k3_attn_res_4ac5c1421d046cfa1082(__nv_bfloat16* __restrict__ out, __nv_bfloat16* __restrict__ prefix, __nv_bfloat16* __restrict__ delta, __nv_bfloat16* __restrict__ blocks, __nv_bfloat16* __restrict__ norm_weight, __nv_bfloat16* __restrict__ qk_weight, __nv_bfloat16* __restrict__ output_norm_weight, unsigned long long blocks_m_stride, unsigned long long blocks_k_stride, float eps, float output_norm_eps, int M)
+kernel_cake_kimi_k3_attn_res_457334c93619fc33e634(__nv_bfloat16* __restrict__ out, __nv_bfloat16* __restrict__ prefix, __nv_bfloat16* __restrict__ delta, __nv_bfloat16* __restrict__ blocks, __nv_bfloat16* __restrict__ norm_weight, __nv_bfloat16* __restrict__ qk_weight, __nv_bfloat16* __restrict__ output_norm_weight, unsigned long long blocks_m_stride, unsigned long long blocks_k_stride, float eps, float output_norm_eps, int M)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -299,7 +299,7 @@ kernel_cake_kimi_k3_attn_res_4ac5c1421d046cfa1082(__nv_bfloat16* __restrict__ ou
                 #pragma unroll
                 for (int chunk = 0; chunk < 2; chunk++) {
                     const int source_base = chunk * 4;
-                    const int remaining_sources = 7 - source_base;
+                    const int remaining_sources = 6 - source_base;
                     const int active_rows = ((remaining_sources > 4) ? 4 : remaining_sources);
                     mbarrier_wait(consumed_addr + (producer_stage) * 8, _phase_consumed);
                     if (elect_sync()) {
@@ -309,8 +309,8 @@ kernel_cake_kimi_k3_attn_res_4ac5c1421d046cfa1082(__nv_bfloat16* __restrict__ ou
                         #pragma unroll
                         for (int source_in_chunk = 0; source_in_chunk < 4; source_in_chunk++) {
                             const int source = source_base + source_in_chunk;
-                            if (source < 7) {
-                                if (source == 6) {
+                            if (source < 6) {
+                                if (source == 5) {
                                     asm volatile(
                                         "cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes "
                                         "[%0], [%1], %2, [%3];"
@@ -470,7 +470,7 @@ kernel_cake_kimi_k3_attn_res_4ac5c1421d046cfa1082(__nv_bfloat16* __restrict__ ou
                 #pragma unroll
                 for (int chunk_1 = 0; chunk_1 < 2; chunk_1++) {
                     const int source_base_1 = chunk_1 * 4;
-                    const int remaining_sources_1 = 7 - source_base_1;
+                    const int remaining_sources_1 = 6 - source_base_1;
                     const int active_rows_1 = ((remaining_sources_1 > 4) ? 4 : remaining_sources_1);
                     mbarrier_wait(ready_addr + (consumer_stage) * 8, _phase_ready);
                     asm volatile("tcgen05.fence::after_thread_sync;");
@@ -490,9 +490,9 @@ kernel_cake_kimi_k3_attn_res_4ac5c1421d046cfa1082(__nv_bfloat16* __restrict__ ou
                             #pragma unroll
                             for (int source_in_chunk_2 = 0; source_in_chunk_2 < 4; source_in_chunk_2++) {
                                 const int source_1 = source_base_1 + source_in_chunk_2;
-                                if (source_1 < 7) {
+                                if (source_1 < 6) {
                                     unsigned int prefix_words[2];
-                                    if (source_1 == 6) {
+                                    if (source_1 == 5) {
                                         int prefix_offset = consumer_stage * 4 * 7168 + (unsigned int)(source_in_chunk_2 * 7168) + (unsigned int)hidden_base_2;
                                         reinterpret_cast<unsigned long long*>(prefix_words)[0] = *reinterpret_cast<const unsigned long long*>(v_bufs + prefix_offset);
                                     } else {
@@ -516,7 +516,7 @@ kernel_cake_kimi_k3_attn_res_4ac5c1421d046cfa1082(__nv_bfloat16* __restrict__ ou
                                             values[value_idx_3] = unpack_bf16[value_idx_3];
                                         }
                                     }
-                                    if (source_1 == 6) {
+                                    if (source_1 == 5) {
                                         unsigned int delta_words[2];
                                         reinterpret_cast<unsigned long long*>(delta_words)[0] = *reinterpret_cast<const unsigned long long*>(delta_bufs + (consumer_stage * 7168 + (unsigned int)hidden_base_2));
                                         #pragma unroll
@@ -559,9 +559,9 @@ kernel_cake_kimi_k3_attn_res_4ac5c1421d046cfa1082(__nv_bfloat16* __restrict__ ou
                             #pragma unroll
                             for (int source_in_chunk_3 = 0; source_in_chunk_3 < 4; source_in_chunk_3++) {
                                 const int source_2 = source_base_1 + source_in_chunk_3;
-                                if (source_2 < 7) {
+                                if (source_2 < 6) {
                                     unsigned int prefix_words_1[4];
-                                    if (source_2 == 6) {
+                                    if (source_2 == 5) {
                                         int prefix_offset_1 = consumer_stage * 4 * 7168 + (unsigned int)(source_in_chunk_3 * 7168) + (unsigned int)hidden_base_3;
                                         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                                             : "=r"(*reinterpret_cast<uint32_t*>(&prefix_words_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&prefix_words_1[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&prefix_words_1[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&prefix_words_1[(0) + 3]))
@@ -587,7 +587,7 @@ kernel_cake_kimi_k3_attn_res_4ac5c1421d046cfa1082(__nv_bfloat16* __restrict__ ou
                                             values_1[value_idx_6] = unpack_bf16_1[value_idx_6];
                                         }
                                     }
-                                    if (source_2 == 6) {
+                                    if (source_2 == 5) {
                                         unsigned int delta_words_1[4];
                                         reinterpret_cast<int4*>(delta_words_1)[0] = reinterpret_cast<int4*>(delta_bufs + (consumer_stage * 7168 + (unsigned int)hidden_base_3))[0];
                                         #pragma unroll
@@ -636,6 +636,9 @@ kernel_cake_kimi_k3_attn_res_4ac5c1421d046cfa1082(__nv_bfloat16* __restrict__ ou
                         }
                     }
                     asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
+                    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+                    asm volatile("tcgen05.fence::before_thread_sync;");
+                    mbarrier_arrive(consumed_addr + (consumer_stage) * 8);
                     unsigned int stats_stage_base = consumer_stage * 64;
                     #pragma unroll
                     for (int source_in_chunk_4 = 0; source_in_chunk_4 < 4; source_in_chunk_4++) {
@@ -711,10 +714,6 @@ kernel_cake_kimi_k3_attn_res_4ac5c1421d046cfa1082(__nv_bfloat16* __restrict__ ou
                             float _shfl_sync_20 = __shfl_sync(0xFFFFFFFF, local_logit, source_in_chunk_5 * 8);
                             logits[source_in_chunk_5] = _shfl_sync_20;
                         }
-                    }
-                    if (chunk_1 != 1) {
-                        asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-                        mbarrier_arrive(consumed_addr + (consumer_stage) * 8);
                     }
                     float weights[4];
                     float new_max = 0.0f;
@@ -804,10 +803,8 @@ kernel_cake_kimi_k3_attn_res_4ac5c1421d046cfa1082(__nv_bfloat16* __restrict__ ou
                     }
                     s_running = __fmaf_rn(s_running, correction, weight_sum);
                     m_running = new_max;
-                    if (chunk_1 != 1) {
-                        consumer_stage += 1;
-                        if (consumer_stage == 2) { consumer_stage = 0; _phase_ready ^= 1; }
-                    }
+                    consumer_stage += 1;
+                    if (consumer_stage == 2) { consumer_stage = 0; _phase_ready ^= 1; }
                 }
                 float output_norm_first_values[8];
                 float2 local_output_sum_pair = make_float2(0.0f, 0.0f);
@@ -829,10 +826,6 @@ kernel_cake_kimi_k3_attn_res_4ac5c1421d046cfa1082(__nv_bfloat16* __restrict__ ou
                 asm volatile("tcgen05.fence::before_thread_sync;");
                 asm volatile("barrier.sync 1, 256;" ::: "memory");
                 float total_output_sum_sq = ((lane < 8) ? output_stats[output_stats_stage_base + (unsigned int)lane] : 0.0f);
-                asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-                mbarrier_arrive(consumed_addr + (consumer_stage) * 8);
-                consumer_stage += 1;
-                if (consumer_stage == 2) { consumer_stage = 0; _phase_ready ^= 1; }
                 float _shfl_down_sync_24 = __shfl_down_sync(0xFFFFFFFF, total_output_sum_sq, 4, 8);
                 total_output_sum_sq += _shfl_down_sync_24;
                 float _shfl_down_sync_25 = __shfl_down_sync(0xFFFFFFFF, total_output_sum_sq, 2, 8);
