@@ -83,3 +83,37 @@ an autograd wrapper that saves only its inputs.
     cake_rmsnorm_silu_gate_det_train_backward_workspace_bytes
     cake_rmsnorm_silu_gate_det_train_backward_workspace
     CakeRMSNormSiLUGateDetFunction
+
+Training SiLU-gated RMSNorm, opt-in non-deterministic weight gradient (Cake)
+---------------------------------------------------------------------------
+
+The names the training SiLU-gated RMSNorm had before the deterministic package
+took its ``det`` names. Every entry point takes the keyword ``deterministic``
+(default ``True``):
+
+* ``deterministic=True`` runs the deterministic package above and returns its
+  bits.
+* ``deterministic=False`` runs the same forward kernel and a one-kernel
+  backward: ``dx`` and ``dz`` are the deterministic backward's bits, and the
+  CTAs add their FP64 weight-gradient column sums into FP64 accumulators of the
+  workspace in the order they finish, so the weight gradient can differ by one
+  rounding of its dtype between calls. The workspace
+  (``cake_rmsnorm_silu_gate_train_backward_workspace(..., deterministic=False)``,
+  a few KiB whatever the token count) is zero after every call: zero it once
+  and reuse it, one per concurrently running stream.
+* Under ``torch.use_deterministic_algorithms(True)``, ``deterministic=False``
+  raises ``RuntimeError``; with ``warn_only=True`` it warns and runs the
+  deterministic kernels.
+
+.. currentmodule:: flashinfer.cake_rmsnorm_silu_gate_train
+
+.. autosummary::
+    :toctree: ../generated
+
+    cake_rmsnorm_silu_gate
+    cake_rmsnorm_silu_gate_train_forward
+    cake_rmsnorm_silu_gate_train_backward
+    cake_rmsnorm_silu_gate_train_backward_workspace_bytes
+    cake_rmsnorm_silu_gate_train_backward_workspace
+    CakeRMSNormSiLUGateFunction
+    is_cake_rmsnorm_silu_gate_train_supported
