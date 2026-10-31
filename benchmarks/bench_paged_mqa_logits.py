@@ -26,6 +26,12 @@ current GPU and report two numbers per cell:
   several times graph_ms; a serving stack that launches eagerly should look at
   this one.
 
+``--calls-per-graph N`` (N > 1) captures N back-to-back calls that share one
+schedule computed outside the graph, as a serving stack's indexer layers do, and
+reports graph_ms per call.  Consecutive launches are where programmatic
+dependent launch (``enable_pdl``, ``--disable-pdl`` to compare) overlaps one
+call's prologue with the previous call's tail; one call per replay cannot show it.
+
 The fp4 next_n=4 atom decomposition is a fixed internal rule (direct on Rubin,
 two atoms of 2 on SM100/SM103) chosen from a forced-decomposition sweep run
 with this script's timing methodology on B100 and Rubin -- see the policy
@@ -49,6 +55,7 @@ import time
 import torch
 
 from flashinfer import (
+    compute_paged_mqa_logits_schedule,
     fp4_paged_mqa_logits,
     fp8_paged_mqa_logits,
     min_block_table_width,
@@ -132,13 +139,25 @@ def _make_inputs(kind, batch, seq_len, next_n, block_size, device, num_heads):
     return (q, q_sf, kv, weights, block_tables, seq_lens, seq_len)
 
 
-def _call(kind, args, out):
+def _call(kind, args, out, enable_pdl, schedule_meta=None):
+    kw = dict(out=out, enable_pdl=enable_pdl, schedule_meta=schedule_meta)
     if kind == "fp8":
-        return fp8_paged_mqa_logits(*args, out=out)
-    return fp4_paged_mqa_logits(*args, out=out)
+        return fp8_paged_mqa_logits(*args, **kw)
+    return fp4_paged_mqa_logits(*args, **kw)
 
 
-def bench_one(kind, batch, seq_len, next_n, block_size, iters, device, num_heads):
+def bench_one(
+    kind,
+    batch,
+    seq_len,
+    next_n,
+    block_size,
+    iters,
+    device,
+    num_heads,
+    enable_pdl,
+    calls_per_graph,
+):
     args = _make_inputs(kind, batch, seq_len, next_n, block_size, device, num_heads)
     rows = batch * next_n
     # NaN-filled so the self-check below is deterministic: an unwritten cell
@@ -152,7 +171,7 @@ def bench_one(kind, batch, seq_len, next_n, block_size, iters, device, num_heads
     )
 
     # Warm: JIT compile + schedule-bucket compile happen here, outside timing.
-    _call(kind, args, out)
+    _call(kind, args, out, enable_pdl)
     torch.cuda.synchronize()
     # Self-check on exactly the region the API defines: row b*next_n + t holds
     # scores for positions 0 .. seq_lens[b] - next_n + t (see the Returns
@@ -173,10 +192,17 @@ def bench_one(kind, batch, seq_len, next_n, block_size, iters, device, num_heads
             "or the kernel left a defined cell unwritten"
         )
 
-    # Graph replay: device work only (the schedule recompute is captured too).
+    # Graph replay: device work only (the schedule recompute is captured too,
+    # unless --calls-per-graph shares one precomputed schedule).
     g = torch.cuda.CUDAGraph()
+    schedule = None
+    if calls_per_graph > 1:
+        schedule = compute_paged_mqa_logits_schedule(
+            args[-2], next_n=next_n, variant=kind
+        )
     with torch.cuda.graph(g):
-        _call(kind, args, out)
+        for _ in range(calls_per_graph):
+            _call(kind, args, out, enable_pdl, schedule)
     g.replay()
     torch.cuda.synchronize()
     start, stop = torch.cuda.Event(True), torch.cuda.Event(True)
@@ -187,16 +213,16 @@ def bench_one(kind, batch, seq_len, next_n, block_size, iters, device, num_heads
             g.replay()
         stop.record()
         torch.cuda.synchronize()
-        reps.append(start.elapsed_time(stop) / iters)
+        reps.append(start.elapsed_time(stop) / (iters * calls_per_graph))
     graph_ms = sorted(reps)[len(reps) // 2]
 
     # Eager wall-clock: the full public path, host dispatch included.
     for _ in range(10):
-        _call(kind, args, out)
+        _call(kind, args, out, enable_pdl)
     torch.cuda.synchronize()
     t0 = time.perf_counter()
     for _ in range(iters):
-        _call(kind, args, out)
+        _call(kind, args, out, enable_pdl)
     torch.cuda.synchronize()
     eager_ms = (time.perf_counter() - t0) / iters * 1e3
     return graph_ms, eager_ms
@@ -221,6 +247,19 @@ def main():
         "GLM-style indexer); fp4 requires 64 and other values are skipped for it.",
     )
     p.add_argument("--iters", type=int, default=100)
+    p.add_argument(
+        "--calls-per-graph",
+        type=int,
+        default=1,
+        help="back-to-back calls per captured graph, sharing one precomputed "
+        "schedule; graph_ms is reported per call",
+    )
+    p.add_argument(
+        "--disable-pdl",
+        action="store_true",
+        help="launch without programmatic dependent launch (default: enabled "
+        "where the device supports it)",
+    )
     args = p.parse_args()
 
     dev = torch.device("cuda", torch.cuda.current_device())
@@ -249,6 +288,8 @@ def main():
                                 args.iters,
                                 dev,
                                 heads,
+                                False if args.disable_pdl else None,
+                                args.calls_per_graph,
                             )
                         except (ValueError, RuntimeError) as e:
                             print(
