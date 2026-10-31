@@ -72,7 +72,7 @@ __device__ __forceinline__ float2 cake_bf16x2_to_f32x2(__nv_bfloat162 v) {
 extern "C" {
 
 __global__ __launch_bounds__(128) void
-kernel_cake_mhc_train_fn_split_atomic__tv128_t128(float* __restrict__ fn, __nv_bfloat16* __restrict__ fnTp, float* __restrict__ dfn, int accumulate)
+kernel_cake_mhc_train_fn_split_atomic__tv128_t128_dep(float* __restrict__ fn, __nv_bfloat16* __restrict__ fnTp, float* __restrict__ dfn, int accumulate)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -85,6 +85,7 @@ kernel_cake_mhc_train_fn_split_atomic__tv128_t128(float* __restrict__ fn, __nv_b
     const int cta_rank = 0;
 
     // === Task calls (declaration order) ===
+    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
     int lane_1 = tid % 32;
     int warp_1 = tid / 32;
     int n = lane_1 % 4 * 8;
@@ -202,6 +203,7 @@ kernel_cake_mhc_train_fn_split_atomic__tv128_t128(float* __restrict__ fn, __nv_b
         _packed_2[_lp + 3] = *(uint32_t*)&_bf2;
     }
     reinterpret_cast<int4*>(fnTp + dst_2)[0] = reinterpret_cast<int4*>(_packed_2)[0];
+    asm volatile("griddepcontrol.wait;" ::: "memory");
 }
 
 } // extern "C"
