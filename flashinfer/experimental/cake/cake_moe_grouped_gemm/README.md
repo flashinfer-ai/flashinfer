@@ -71,8 +71,11 @@ deterministic bits). bf16 operands, fp32 accumulation, one round-to-nearest
 rounding to bf16 (or the fp32 store), the layouts, the offsets contract (no
 host synchronisation, no caller padding), the exact zeros of empty groups in
 overwrite mode and the deterministic package's error budgets are unchanged.
-The descriptor-ring and short-group fixes of #6570 and the fixes of #7038,
-#7039 and #7548 live in the shared kernel body and host plan. A floating-point
+The descriptor-ring and short-group fixes of #6570 live in the shared kernel
+body and host plan. The kernels use no cooperative launch, and the autograd
+entry saves only the tensors that backward reads; the latency under resident
+kernels and the shared-memory carveout wait of #7038 and #7548 are not
+addressed by this package. A floating-point
 sum below the smallest normal fp32 flushes to zero in the reduction (the
 deterministic tail reduce keeps it), well inside the error budget.
 
