@@ -13,12 +13,13 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
-Cake four-stream mHC training forward / backward (hidden 4096, 4 streams;
-SM100 / SM103 / SM107).
+Cake four-stream mHC training forward / backward (4 streams; hidden size
+``H`` in {4096, 5120, 7168}, taken per call from ``X.shape[2]``; SM100 / SM103
+at all three sizes, SM107 at 4096).
 
 The function (FP32 arithmetic, BF16 activation boundaries)::
 
-    u = float32(X).reshape(T, 16384)
+    u = float32(X).reshape(T, 4 * H)
     r = rsqrt(mean(u * u, axis=-1) + 1e-5)
     z = (u * r) @ fn.T                                   # [T, 24]
     pre  = sigmoid(z[:, :4]  * scale[0] + base[:4]) + 1e-6
@@ -26,7 +27,7 @@ The function (FP32 arithmetic, BF16 activation boundaries)::
     C = row_softmax((z[:, 8:] * scale[2] + base[8:]).reshape(T, 4, 4)) + 1e-6
     C = C / (column_sum(C) + 1e-6); 19 x { row-normalize; column-normalize }
     U[t, d] = BF16(sum_i pre[t, i] X[t, i, d])
-    B = external_branch(U)                               # attention / MLP, BF16 [T, 4096]
+    B = external_branch(U)                               # attention / MLP, BF16 [T, H]
     Y[t, j, d] = BF16(post[t, j] B[t, d] + sum_i C[t, i, j] X[t, i, d])
 
 Forward: ``forward_prepare`` (``U`` and a 256-byte FP32 statistics record per
@@ -52,12 +53,15 @@ recomputed from ``X`` in the backward with bitwise the same gradients
 statistics to the prepare node's backward on autograd edges, so nothing of a
 connection stays alive once its backward has run.  Workspaces are caller-held
 (``*_workspace_bytes`` / ``*_workspace``) and the submit path allocates
-nothing.  All tensors are contiguous: ``X``, ``Y``, ``dY``, ``dX`` BF16
-``[T, 4, 4096]``; ``U``, ``B``, ``dU``, ``dB`` BF16 ``[T, 4096]``; ``fn`` FP32
-``[24, 16384]``; ``scale`` FP32 ``[3]``; ``base`` FP32 ``[24]``.  The token
-count ``T`` is a runtime scalar: it may change between calls, ``T == 1`` is
-supported and ``T == 0`` returns empty outputs without launching.  Every
-behaviour switch is a keyword argument with its default in the docstring.
+nothing; a workspace serves the calls of the hidden size it was sized for
+(``hidden=``, default 4096) up to ``T`` tokens.  All tensors are contiguous:
+``X``, ``Y``, ``dY``, ``dX`` BF16 ``[T, 4, H]``; ``U``, ``B``, ``dU``, ``dB``
+BF16 ``[T, H]``; ``fn`` FP32 ``[24, 4H]``; ``scale`` FP32 ``[3]``; ``base``
+FP32 ``[24]``.  The token count ``T`` is a runtime scalar: it may change
+between calls, ``T == 1`` is supported and ``T == 0`` returns empty outputs
+without launching.  Calls of different hidden sizes may be mixed in one
+process.  Every behaviour
+switch is a keyword argument with its default in the docstring.
 
 Usage::
 
@@ -74,8 +78,8 @@ Usage::
     Y = cake_mhc_det_train_finish(X, branch(U), handle)
 
     # caller-owned workspaces (zero-initialized; the kernels leave them reusable)
-    ws_f = cake_mhc_det_train_forward_workspace(T, X.device)
-    ws_b = cake_mhc_det_train_backward_workspace(T, X.device)
+    ws_f = cake_mhc_det_train_forward_workspace(T, X.device, hidden=X.shape[2])
+    ws_b = cake_mhc_det_train_backward_workspace(T, X.device, hidden=X.shape[2])
 
 The model's head, the stream mean ``Y = mean_i X[:, i, :]`` of the last
 layer's four streams, has its own kernels (hidden 4096, 5120 and 7168; 4096
@@ -138,10 +142,12 @@ def cake_mhc_det_train_forward_prepare(
     Parameters
     ----------
     X : torch.Tensor
-        BF16 ``[T, 4, 4096]`` contiguous residual streams (``T`` is a runtime
-        scalar; ``T == 0`` returns empty outputs without launching).
+        BF16 ``[T, 4, H]`` contiguous residual streams (``T`` is a runtime
+        scalar; ``T == 0`` returns empty outputs without launching).  The
+        hidden size ``H = X.shape[2]`` is 4096, 5120 or 7168 on SM100 / SM103
+        and 4096 on SM107.
     fn : torch.Tensor
-        FP32 ``[24, 16384]`` contiguous mapping matrix.
+        FP32 ``[24, 4H]`` contiguous mapping matrix.
     scale : torch.Tensor
         FP32 ``[3]`` group scales of the pre / post / Sinkhorn logits.
     base : torch.Tensor
@@ -157,12 +163,12 @@ def cake_mhc_det_train_forward_prepare(
         the run-time-count programs of the coefficient and token-owner passes.  A
         count above 64 raises ``NotImplementedError``.
     out : torch.Tensor, optional
-        Preallocated BF16 ``[T, 4096]`` contiguous ``U``.
+        Preallocated BF16 ``[T, H]`` contiguous ``U``.
     stats_out : torch.Tensor, optional
         Preallocated FP32 ``[T, 64]`` contiguous statistics record.
     workspace : torch.Tensor, optional
-        Caller-owned ``uint8`` buffer from :func:`cake_mhc_det_train_forward_workspace`;
-        a per-device default buffer is used when omitted.
+        Caller-owned ``uint8`` buffer from :func:`cake_mhc_det_train_forward_workspace`
+        (``hidden=X.shape[2]``); a per-device default buffer is used when omitted.
 
     Returns
     -------
@@ -203,9 +209,9 @@ def cake_mhc_det_train_forward_stats(
     Parameters
     ----------
     X : torch.Tensor
-        BF16 ``[T, 4, 4096]`` contiguous residual streams.
+        BF16 ``[T, 4, H]`` contiguous residual streams.
     fn : torch.Tensor
-        FP32 ``[24, 16384]`` contiguous mapping matrix.
+        FP32 ``[24, 4H]`` contiguous mapping matrix.
     scale : torch.Tensor
         FP32 ``[3]`` group scales.
     base : torch.Tensor
@@ -220,7 +226,8 @@ def cake_mhc_det_train_forward_stats(
     stats_out : torch.Tensor, optional
         Preallocated FP32 ``[T, 64]`` contiguous statistics record.
     workspace : torch.Tensor, optional
-        Caller-owned forward workspace (:func:`cake_mhc_det_train_forward_workspace`).
+        Caller-owned forward workspace (:func:`cake_mhc_det_train_forward_workspace`,
+        ``hidden=X.shape[2]``).
 
     Returns
     -------
@@ -255,18 +262,18 @@ def cake_mhc_det_train_forward_finish(
     Parameters
     ----------
     X : torch.Tensor
-        BF16 ``[T, 4, 4096]`` contiguous residual streams (the ``forward_prepare`` input).
+        BF16 ``[T, 4, H]`` contiguous residual streams (the ``forward_prepare`` input).
     B : torch.Tensor
-        BF16 ``[T, 4096]`` contiguous output of the external branch applied to ``U``.
+        BF16 ``[T, H]`` contiguous output of the external branch applied to ``U``.
     stats : torch.Tensor
         FP32 ``[T, 64]`` record returned by :func:`cake_mhc_det_train_forward_prepare`
         (or :func:`cake_mhc_det_train_forward_stats`).
     out : torch.Tensor, optional
-        Preallocated BF16 ``[T, 4, 4096]`` contiguous ``Y``.
+        Preallocated BF16 ``[T, 4, H]`` contiguous ``Y``.
 
     Returns
     -------
-    BF16 ``Y`` of shape ``[T, 4, 4096]``; the FP32 sum is rounded once.
+    BF16 ``Y`` of shape ``[T, 4, H]``; the FP32 sum is rounded once.
     """
 
     return _backend.cake_mhc_det_train_forward_finish(X, B, stats, out=out)
@@ -287,15 +294,16 @@ def cake_mhc_det_train_backward_prepare(
     Parameters
     ----------
     dY : torch.Tensor
-        BF16 ``[T, 4, 4096]`` contiguous gradient of ``Y``.
+        BF16 ``[T, 4, H]`` contiguous gradient of ``Y``.
     B : torch.Tensor
-        BF16 ``[T, 4096]`` contiguous branch output of the forward.
+        BF16 ``[T, H]`` contiguous branch output of the forward.
     X : torch.Tensor
-        BF16 ``[T, 4, 4096]`` contiguous residual streams of the forward.
+        BF16 ``[T, 4, H]`` contiguous residual streams of the forward
+        (``H = X.shape[2]``).
     stats : torch.Tensor
         FP32 ``[T, 64]`` record of the forward.
     dB : torch.Tensor, optional
-        Preallocated BF16 ``[T, 4096]`` contiguous output.
+        Preallocated BF16 ``[T, H]`` contiguous output.
     grad_stats_out : torch.Tensor, optional
         Preallocated FP32 ``[T, 32]`` contiguous output.
 
@@ -338,16 +346,17 @@ def cake_mhc_det_train_backward_finish(
     Parameters
     ----------
     X : torch.Tensor
-        BF16 ``[T, 4, 4096]`` contiguous residual streams of the forward.
+        BF16 ``[T, 4, H]`` contiguous residual streams of the forward
+        (``H = X.shape[2]``).
     dY : torch.Tensor
-        BF16 ``[T, 4, 4096]`` contiguous gradient of ``Y``.
+        BF16 ``[T, 4, H]`` contiguous gradient of ``Y``.
     dU : torch.Tensor
-        BF16 ``[T, 4096]`` contiguous gradient of ``U`` from the branch backward.
+        BF16 ``[T, H]`` contiguous gradient of ``U`` from the branch backward.
     B : torch.Tensor, optional
-        BF16 ``[T, 4096]`` branch output of the forward; accepted for the
+        BF16 ``[T, H]`` branch output of the forward; accepted for the
         prepare / finish symmetry and validated when given, not read.
     fn : torch.Tensor
-        FP32 ``[24, 16384]`` contiguous mapping matrix of the forward.
+        FP32 ``[24, 4H]`` contiguous mapping matrix of the forward.
     scale : torch.Tensor
         FP32 ``[3]`` group scales of the forward.
     base : torch.Tensor
@@ -369,12 +378,12 @@ def cake_mhc_det_train_backward_finish(
         ``True``: the caller passes all three and the fixed-order sums are added
         to their current values (reproducible across consecutive accumulations).
     workspace : torch.Tensor, optional
-        Caller-owned ``uint8`` buffer from :func:`cake_mhc_det_train_backward_workspace`;
-        a per-device default buffer is used when omitted.
+        Caller-owned ``uint8`` buffer from :func:`cake_mhc_det_train_backward_workspace`
+        (``hidden=X.shape[2]``); a per-device default buffer is used when omitted.
     dX : torch.Tensor, optional
-        Preallocated BF16 ``[T, 4, 4096]`` contiguous output.
+        Preallocated BF16 ``[T, 4, H]`` contiguous output.
     dfn : torch.Tensor, optional
-        Preallocated FP32 ``[24, 16384]`` contiguous output (required with ``accumulate=True``).
+        Preallocated FP32 ``[24, 4H]`` contiguous output (required with ``accumulate=True``).
     dscale : torch.Tensor, optional
         Preallocated FP32 ``[3]`` output (required with ``accumulate=True``).
     dbase : torch.Tensor, optional
@@ -430,9 +439,10 @@ def cake_mhc_det_train_prepare(
     Parameters
     ----------
     X : torch.Tensor
-        BF16 ``[T, 4, 4096]`` contiguous residual streams (may require gradients).
+        BF16 ``[T, 4, H]`` contiguous residual streams (may require gradients;
+        ``H = X.shape[2]``).
     fn : torch.Tensor
-        FP32 ``[24, 16384]`` contiguous mapping matrix (may require gradients).
+        FP32 ``[24, 4H]`` contiguous mapping matrix (may require gradients).
     scale : torch.Tensor
         FP32 ``[3]`` group scales (may require gradients).
     base : torch.Tensor
@@ -449,13 +459,15 @@ def cake_mhc_det_train_prepare(
         ``False``: they are dropped after the forward and recomputed from ``X``
         in the backward (checkpoint replay); the gradients are bitwise the same.
     workspace : torch.Tensor, optional
-        Caller-owned forward workspace; a per-device default when omitted.
+        Caller-owned forward workspace (``hidden=X.shape[2]``); a per-device
+        default when omitted.
     backward_workspace : torch.Tensor, optional
-        Caller-owned backward workspace; a per-device default when omitted.
+        Caller-owned backward workspace (``hidden=X.shape[2]``); a per-device
+        default when omitted.
 
     Returns
     -------
-    ``(U, handle)``: BF16 ``U`` of shape ``[T, 4096]`` and the handle of this
+    ``(U, handle)``: BF16 ``U`` of shape ``[T, H]`` and the handle of this
     prepare node for one :func:`cake_mhc_det_train_finish`.  The backward of the
     prepare node returns the single-cast ``dX`` and FP32 ``dfn``, ``dscale``,
     ``dbase``.
@@ -482,9 +494,9 @@ def cake_mhc_det_train_finish(X: torch.Tensor, B: torch.Tensor, handle) -> torch
     Parameters
     ----------
     X : torch.Tensor
-        The BF16 ``[T, 4, 4096]`` tensor passed to :func:`cake_mhc_det_train_prepare`.
+        The BF16 ``[T, 4, H]`` tensor passed to :func:`cake_mhc_det_train_prepare`.
     B : torch.Tensor
-        BF16 ``[T, 4096]`` output of the external branch applied to ``U`` (may require gradients).
+        BF16 ``[T, H]`` output of the external branch applied to ``U`` (may require gradients).
     handle : object
         The handle returned by :func:`cake_mhc_det_train_prepare`, for one finish.  A
         reentrant checkpoint region (``use_reentrant=True``) holds both calls or
@@ -492,7 +504,7 @@ def cake_mhc_det_train_finish(X: torch.Tensor, B: torch.Tensor, handle) -> torch
 
     Returns
     -------
-    BF16 ``Y`` of shape ``[T, 4, 4096]``.  Its backward returns ``dB`` for the
+    BF16 ``Y`` of shape ``[T, 4, H]``.  Its backward returns ``dB`` for the
     branch and no gradient for ``X`` (the residual-mixing contribution is part
     of the single-cast ``dX`` of the prepare node).
     """
