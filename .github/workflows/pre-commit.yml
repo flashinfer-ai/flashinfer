@@ -20,4 +20,6 @@ jobs:
       run: python3 ci/validate_cuda_versions.py
     - name: Test compile cache lifecycle (CPU only)
       run: python3 -m unittest discover -s ci/tests -p 'test_compile_cache.py' -v
+    - name: Test dependency-based test selection (CPU only)
+      run: python3 -m unittest discover -s scripts/tests -p 'test_select_tests.py' -v
     - uses: pre-commit/action@v3.0.1
