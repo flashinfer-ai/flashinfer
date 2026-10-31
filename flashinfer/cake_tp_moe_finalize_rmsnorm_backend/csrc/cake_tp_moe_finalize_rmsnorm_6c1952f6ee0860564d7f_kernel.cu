@@ -425,85 +425,85 @@ kernel_cake_tp_moe_finalize_rmsnorm_6c1952f6ee0860564d7f(__nv_bfloat16* __restri
             packets[0 + 3] = _uv4_30.w;
         }
     }
-    int ridx1 = idx8[1];
-    if (ridx1 >= 0 && ridx1 < rows) {
+    int ridx_0 = idx8[1];
+    if (ridx_0 >= 0 && ridx_0 < rows) {
         {
-            uint4 _uv4_31 = *reinterpret_cast<const uint4*>(gemm2 + ((long long)ridx1 * (long long)row_stride + col64) + 0);
+            uint4 _uv4_31 = *reinterpret_cast<const uint4*>(gemm2 + ((long long)ridx_0 * (long long)row_stride + col64) + 0);
             packets[4 + 0] = _uv4_31.x;
             packets[4 + 1] = _uv4_31.y;
             packets[4 + 2] = _uv4_31.z;
             packets[4 + 3] = _uv4_31.w;
         }
     }
-    int ridx2 = idx8[2];
-    if (ridx2 >= 0 && ridx2 < rows) {
+    int ridx_1 = idx8[2];
+    if (ridx_1 >= 0 && ridx_1 < rows) {
         {
-            uint4 _uv4_32 = *reinterpret_cast<const uint4*>(gemm2 + ((long long)ridx2 * (long long)row_stride + col64) + 0);
+            uint4 _uv4_32 = *reinterpret_cast<const uint4*>(gemm2 + ((long long)ridx_1 * (long long)row_stride + col64) + 0);
             packets[8 + 0] = _uv4_32.x;
             packets[8 + 1] = _uv4_32.y;
             packets[8 + 2] = _uv4_32.z;
             packets[8 + 3] = _uv4_32.w;
         }
     }
-    int ridx3 = idx8[3];
-    if (ridx3 >= 0 && ridx3 < rows) {
+    int ridx_2 = idx8[3];
+    if (ridx_2 >= 0 && ridx_2 < rows) {
         {
-            uint4 _uv4_33 = *reinterpret_cast<const uint4*>(gemm2 + ((long long)ridx3 * (long long)row_stride + col64) + 0);
+            uint4 _uv4_33 = *reinterpret_cast<const uint4*>(gemm2 + ((long long)ridx_2 * (long long)row_stride + col64) + 0);
             packets[12 + 0] = _uv4_33.x;
             packets[12 + 1] = _uv4_33.y;
             packets[12 + 2] = _uv4_33.z;
             packets[12 + 3] = _uv4_33.w;
         }
     }
-    int ridx4 = idx8[4];
-    if (ridx4 >= 0 && ridx4 < rows) {
+    int ridx_3 = idx8[4];
+    if (ridx_3 >= 0 && ridx_3 < rows) {
         {
-            uint4 _uv4_34 = *reinterpret_cast<const uint4*>(gemm2 + ((long long)ridx4 * (long long)row_stride + col64) + 0);
+            uint4 _uv4_34 = *reinterpret_cast<const uint4*>(gemm2 + ((long long)ridx_3 * (long long)row_stride + col64) + 0);
             packets[16 + 0] = _uv4_34.x;
             packets[16 + 1] = _uv4_34.y;
             packets[16 + 2] = _uv4_34.z;
             packets[16 + 3] = _uv4_34.w;
         }
     }
-    int ridx5 = idx8[5];
-    if (ridx5 >= 0 && ridx5 < rows) {
+    int ridx_4 = idx8[5];
+    if (ridx_4 >= 0 && ridx_4 < rows) {
         {
-            uint4 _uv4_35 = *reinterpret_cast<const uint4*>(gemm2 + ((long long)ridx5 * (long long)row_stride + col64) + 0);
+            uint4 _uv4_35 = *reinterpret_cast<const uint4*>(gemm2 + ((long long)ridx_4 * (long long)row_stride + col64) + 0);
             packets[20 + 0] = _uv4_35.x;
             packets[20 + 1] = _uv4_35.y;
             packets[20 + 2] = _uv4_35.z;
             packets[20 + 3] = _uv4_35.w;
         }
     }
-    int ridx6 = idx8[6];
-    if (ridx6 >= 0 && ridx6 < rows) {
+    int ridx_5 = idx8[6];
+    if (ridx_5 >= 0 && ridx_5 < rows) {
         {
-            uint4 _uv4_36 = *reinterpret_cast<const uint4*>(gemm2 + ((long long)ridx6 * (long long)row_stride + col64) + 0);
+            uint4 _uv4_36 = *reinterpret_cast<const uint4*>(gemm2 + ((long long)ridx_5 * (long long)row_stride + col64) + 0);
             packets[24 + 0] = _uv4_36.x;
             packets[24 + 1] = _uv4_36.y;
             packets[24 + 2] = _uv4_36.z;
             packets[24 + 3] = _uv4_36.w;
         }
     }
-    int ridx7 = idx8[7];
-    if (ridx7 >= 0 && ridx7 < rows) {
+    int ridx_6 = idx8[7];
+    if (ridx_6 >= 0 && ridx_6 < rows) {
         {
-            uint4 _uv4_37 = *reinterpret_cast<const uint4*>(gemm2 + ((long long)ridx7 * (long long)row_stride + col64) + 0);
+            uint4 _uv4_37 = *reinterpret_cast<const uint4*>(gemm2 + ((long long)ridx_6 * (long long)row_stride + col64) + 0);
             packets[28 + 0] = _uv4_37.x;
             packets[28 + 1] = _uv4_37.y;
             packets[28 + 2] = _uv4_37.z;
             packets[28 + 3] = _uv4_37.w;
         }
     }
-    unsigned int raw0[4];
-    raw0[0] = packets[0];
-    raw0[1] = packets[1];
-    raw0[2] = packets[2];
-    raw0[3] = packets[3];
+    unsigned int raw0_1_0[4];
+    raw0_1_0[0] = packets[0];
+    raw0_1_0[1] = packets[1];
+    raw0_1_0[2] = packets[2];
+    raw0_1_0[3] = packets[3];
     uint32_t _packed16_sanitize_0[4];
     #pragma unroll
     for (int _p16s_word = 0; _p16s_word < 4; ++_p16s_word) {
-        uint32_t _p16s_carrier_38 = static_cast<uint32_t>(raw0[_p16s_word]);
+        uint32_t _p16s_carrier_38 = static_cast<uint32_t>(raw0_1_0[_p16s_word]);
         uint32_t _p16s_lo_38 = _p16s_carrier_38 & 0x0000ffffu;
         uint32_t _p16s_hi_38 = (_p16s_carrier_38 >> 16) & 0x0000ffffu;
         if (_p16s_lo_38 == 0x00008000u) _p16s_lo_38 = 0u;
@@ -515,15 +515,15 @@ kernel_cake_tp_moe_finalize_rmsnorm_6c1952f6ee0860564d7f(__nv_bfloat16* __restri
         __builtin_assume(__isGlobal(_gst_39));
         reinterpret_cast<int4*>(_gst_39)[0] = reinterpret_cast<int4*>(_packed16_sanitize_0)[0];
     }
-    unsigned int raw1[4];
-    raw1[0] = packets[4];
-    raw1[1] = packets[5];
-    raw1[2] = packets[6];
-    raw1[3] = packets[7];
+    unsigned int raw0_1_1[4];
+    raw0_1_1[0] = packets[4];
+    raw0_1_1[1] = packets[5];
+    raw0_1_1[2] = packets[6];
+    raw0_1_1[3] = packets[7];
     uint32_t _packed16_sanitize_1[4];
     #pragma unroll
     for (int _p16s_word = 0; _p16s_word < 4; ++_p16s_word) {
-        uint32_t _p16s_carrier_40 = static_cast<uint32_t>(raw1[_p16s_word]);
+        uint32_t _p16s_carrier_40 = static_cast<uint32_t>(raw0_1_1[_p16s_word]);
         uint32_t _p16s_lo_40 = _p16s_carrier_40 & 0x0000ffffu;
         uint32_t _p16s_hi_40 = (_p16s_carrier_40 >> 16) & 0x0000ffffu;
         if (_p16s_lo_40 == 0x00008000u) _p16s_lo_40 = 0u;
@@ -535,15 +535,15 @@ kernel_cake_tp_moe_finalize_rmsnorm_6c1952f6ee0860564d7f(__nv_bfloat16* __restri
         __builtin_assume(__isGlobal(_gst_41));
         reinterpret_cast<int4*>(_gst_41)[0] = reinterpret_cast<int4*>(_packed16_sanitize_1)[0];
     }
-    unsigned int raw2[4];
-    raw2[0] = packets[8];
-    raw2[1] = packets[9];
-    raw2[2] = packets[10];
-    raw2[3] = packets[11];
+    unsigned int raw0_1_2[4];
+    raw0_1_2[0] = packets[8];
+    raw0_1_2[1] = packets[9];
+    raw0_1_2[2] = packets[10];
+    raw0_1_2[3] = packets[11];
     uint32_t _packed16_sanitize_2[4];
     #pragma unroll
     for (int _p16s_word = 0; _p16s_word < 4; ++_p16s_word) {
-        uint32_t _p16s_carrier_42 = static_cast<uint32_t>(raw2[_p16s_word]);
+        uint32_t _p16s_carrier_42 = static_cast<uint32_t>(raw0_1_2[_p16s_word]);
         uint32_t _p16s_lo_42 = _p16s_carrier_42 & 0x0000ffffu;
         uint32_t _p16s_hi_42 = (_p16s_carrier_42 >> 16) & 0x0000ffffu;
         if (_p16s_lo_42 == 0x00008000u) _p16s_lo_42 = 0u;
@@ -555,15 +555,15 @@ kernel_cake_tp_moe_finalize_rmsnorm_6c1952f6ee0860564d7f(__nv_bfloat16* __restri
         __builtin_assume(__isGlobal(_gst_43));
         reinterpret_cast<int4*>(_gst_43)[0] = reinterpret_cast<int4*>(_packed16_sanitize_2)[0];
     }
-    unsigned int raw3[4];
-    raw3[0] = packets[12];
-    raw3[1] = packets[13];
-    raw3[2] = packets[14];
-    raw3[3] = packets[15];
+    unsigned int raw0_1_3[4];
+    raw0_1_3[0] = packets[12];
+    raw0_1_3[1] = packets[13];
+    raw0_1_3[2] = packets[14];
+    raw0_1_3[3] = packets[15];
     uint32_t _packed16_sanitize_3[4];
     #pragma unroll
     for (int _p16s_word = 0; _p16s_word < 4; ++_p16s_word) {
-        uint32_t _p16s_carrier_44 = static_cast<uint32_t>(raw3[_p16s_word]);
+        uint32_t _p16s_carrier_44 = static_cast<uint32_t>(raw0_1_3[_p16s_word]);
         uint32_t _p16s_lo_44 = _p16s_carrier_44 & 0x0000ffffu;
         uint32_t _p16s_hi_44 = (_p16s_carrier_44 >> 16) & 0x0000ffffu;
         if (_p16s_lo_44 == 0x00008000u) _p16s_lo_44 = 0u;
@@ -575,15 +575,15 @@ kernel_cake_tp_moe_finalize_rmsnorm_6c1952f6ee0860564d7f(__nv_bfloat16* __restri
         __builtin_assume(__isGlobal(_gst_45));
         reinterpret_cast<int4*>(_gst_45)[0] = reinterpret_cast<int4*>(_packed16_sanitize_3)[0];
     }
-    unsigned int raw4[4];
-    raw4[0] = packets[16];
-    raw4[1] = packets[17];
-    raw4[2] = packets[18];
-    raw4[3] = packets[19];
+    unsigned int raw0_1_4[4];
+    raw0_1_4[0] = packets[16];
+    raw0_1_4[1] = packets[17];
+    raw0_1_4[2] = packets[18];
+    raw0_1_4[3] = packets[19];
     uint32_t _packed16_sanitize_4[4];
     #pragma unroll
     for (int _p16s_word = 0; _p16s_word < 4; ++_p16s_word) {
-        uint32_t _p16s_carrier_46 = static_cast<uint32_t>(raw4[_p16s_word]);
+        uint32_t _p16s_carrier_46 = static_cast<uint32_t>(raw0_1_4[_p16s_word]);
         uint32_t _p16s_lo_46 = _p16s_carrier_46 & 0x0000ffffu;
         uint32_t _p16s_hi_46 = (_p16s_carrier_46 >> 16) & 0x0000ffffu;
         if (_p16s_lo_46 == 0x00008000u) _p16s_lo_46 = 0u;
@@ -595,15 +595,15 @@ kernel_cake_tp_moe_finalize_rmsnorm_6c1952f6ee0860564d7f(__nv_bfloat16* __restri
         __builtin_assume(__isGlobal(_gst_47));
         reinterpret_cast<int4*>(_gst_47)[0] = reinterpret_cast<int4*>(_packed16_sanitize_4)[0];
     }
-    unsigned int raw5[4];
-    raw5[0] = packets[20];
-    raw5[1] = packets[21];
-    raw5[2] = packets[22];
-    raw5[3] = packets[23];
+    unsigned int raw0_1_5[4];
+    raw0_1_5[0] = packets[20];
+    raw0_1_5[1] = packets[21];
+    raw0_1_5[2] = packets[22];
+    raw0_1_5[3] = packets[23];
     uint32_t _packed16_sanitize_5[4];
     #pragma unroll
     for (int _p16s_word = 0; _p16s_word < 4; ++_p16s_word) {
-        uint32_t _p16s_carrier_48 = static_cast<uint32_t>(raw5[_p16s_word]);
+        uint32_t _p16s_carrier_48 = static_cast<uint32_t>(raw0_1_5[_p16s_word]);
         uint32_t _p16s_lo_48 = _p16s_carrier_48 & 0x0000ffffu;
         uint32_t _p16s_hi_48 = (_p16s_carrier_48 >> 16) & 0x0000ffffu;
         if (_p16s_lo_48 == 0x00008000u) _p16s_lo_48 = 0u;
@@ -615,15 +615,15 @@ kernel_cake_tp_moe_finalize_rmsnorm_6c1952f6ee0860564d7f(__nv_bfloat16* __restri
         __builtin_assume(__isGlobal(_gst_49));
         reinterpret_cast<int4*>(_gst_49)[0] = reinterpret_cast<int4*>(_packed16_sanitize_5)[0];
     }
-    unsigned int raw6[4];
-    raw6[0] = packets[24];
-    raw6[1] = packets[25];
-    raw6[2] = packets[26];
-    raw6[3] = packets[27];
+    unsigned int raw0_1_6[4];
+    raw0_1_6[0] = packets[24];
+    raw0_1_6[1] = packets[25];
+    raw0_1_6[2] = packets[26];
+    raw0_1_6[3] = packets[27];
     uint32_t _packed16_sanitize_6[4];
     #pragma unroll
     for (int _p16s_word = 0; _p16s_word < 4; ++_p16s_word) {
-        uint32_t _p16s_carrier_50 = static_cast<uint32_t>(raw6[_p16s_word]);
+        uint32_t _p16s_carrier_50 = static_cast<uint32_t>(raw0_1_6[_p16s_word]);
         uint32_t _p16s_lo_50 = _p16s_carrier_50 & 0x0000ffffu;
         uint32_t _p16s_hi_50 = (_p16s_carrier_50 >> 16) & 0x0000ffffu;
         if (_p16s_lo_50 == 0x00008000u) _p16s_lo_50 = 0u;
@@ -635,15 +635,15 @@ kernel_cake_tp_moe_finalize_rmsnorm_6c1952f6ee0860564d7f(__nv_bfloat16* __restri
         __builtin_assume(__isGlobal(_gst_51));
         reinterpret_cast<int4*>(_gst_51)[0] = reinterpret_cast<int4*>(_packed16_sanitize_6)[0];
     }
-    unsigned int raw7[4];
-    raw7[0] = packets[28];
-    raw7[1] = packets[29];
-    raw7[2] = packets[30];
-    raw7[3] = packets[31];
+    unsigned int raw0_1_7[4];
+    raw0_1_7[0] = packets[28];
+    raw0_1_7[1] = packets[29];
+    raw0_1_7[2] = packets[30];
+    raw0_1_7[3] = packets[31];
     uint32_t _packed16_sanitize_7[4];
     #pragma unroll
     for (int _p16s_word = 0; _p16s_word < 4; ++_p16s_word) {
-        uint32_t _p16s_carrier_52 = static_cast<uint32_t>(raw7[_p16s_word]);
+        uint32_t _p16s_carrier_52 = static_cast<uint32_t>(raw0_1_7[_p16s_word]);
         uint32_t _p16s_lo_52 = _p16s_carrier_52 & 0x0000ffffu;
         uint32_t _p16s_hi_52 = (_p16s_carrier_52 >> 16) & 0x0000ffffu;
         if (_p16s_lo_52 == 0x00008000u) _p16s_lo_52 = 0u;
@@ -705,7 +705,7 @@ kernel_cake_tp_moe_finalize_rmsnorm_6c1952f6ee0860564d7f(__nv_bfloat16* __restri
     s8_0[5] = _unpack_bf16_2[5];
     s8_0[6] = _unpack_bf16_2[6];
     s8_0[7] = _unpack_bf16_2[7];
-    float _unpack_bf16_3[8];
+    float unpack_bf16_0[8];
     #pragma unroll
     for (int _pair = 0; _pair < 4; _pair++) {
         asm volatile(
@@ -713,18 +713,18 @@ kernel_cake_tp_moe_finalize_rmsnorm_6c1952f6ee0860564d7f(__nv_bfloat16* __restri
             "shl.b32 %0, %2, 16;\n\t"
             "and.b32 %1, %2, 0xffff0000;\n\t"
             "}\n"
-            : "=f"((&_unpack_bf16_3[_pair * 2])[0]), "=f"((&_unpack_bf16_3[_pair * 2])[1])
+            : "=f"((&unpack_bf16_0[_pair * 2])[0]), "=f"((&unpack_bf16_0[_pair * 2])[1])
             : "r"(_sysv_poll_group_0[4 + _pair]));
     }
-    s8_0[0] = s8_0[0] + _unpack_bf16_3[0];
-    s8_0[1] = s8_0[1] + _unpack_bf16_3[1];
-    s8_0[2] = s8_0[2] + _unpack_bf16_3[2];
-    s8_0[3] = s8_0[3] + _unpack_bf16_3[3];
-    s8_0[4] = s8_0[4] + _unpack_bf16_3[4];
-    s8_0[5] = s8_0[5] + _unpack_bf16_3[5];
-    s8_0[6] = s8_0[6] + _unpack_bf16_3[6];
-    s8_0[7] = s8_0[7] + _unpack_bf16_3[7];
-    float _unpack_bf16_4[8];
+    s8_0[0] = s8_0[0] + unpack_bf16_0[0];
+    s8_0[1] = s8_0[1] + unpack_bf16_0[1];
+    s8_0[2] = s8_0[2] + unpack_bf16_0[2];
+    s8_0[3] = s8_0[3] + unpack_bf16_0[3];
+    s8_0[4] = s8_0[4] + unpack_bf16_0[4];
+    s8_0[5] = s8_0[5] + unpack_bf16_0[5];
+    s8_0[6] = s8_0[6] + unpack_bf16_0[6];
+    s8_0[7] = s8_0[7] + unpack_bf16_0[7];
+    float unpack_bf16_1[8];
     #pragma unroll
     for (int _pair = 0; _pair < 4; _pair++) {
         asm volatile(
@@ -732,18 +732,18 @@ kernel_cake_tp_moe_finalize_rmsnorm_6c1952f6ee0860564d7f(__nv_bfloat16* __restri
             "shl.b32 %0, %2, 16;\n\t"
             "and.b32 %1, %2, 0xffff0000;\n\t"
             "}\n"
-            : "=f"((&_unpack_bf16_4[_pair * 2])[0]), "=f"((&_unpack_bf16_4[_pair * 2])[1])
+            : "=f"((&unpack_bf16_1[_pair * 2])[0]), "=f"((&unpack_bf16_1[_pair * 2])[1])
             : "r"(_sysv_poll_group_0[8 + _pair]));
     }
-    s8_0[0] = s8_0[0] + _unpack_bf16_4[0];
-    s8_0[1] = s8_0[1] + _unpack_bf16_4[1];
-    s8_0[2] = s8_0[2] + _unpack_bf16_4[2];
-    s8_0[3] = s8_0[3] + _unpack_bf16_4[3];
-    s8_0[4] = s8_0[4] + _unpack_bf16_4[4];
-    s8_0[5] = s8_0[5] + _unpack_bf16_4[5];
-    s8_0[6] = s8_0[6] + _unpack_bf16_4[6];
-    s8_0[7] = s8_0[7] + _unpack_bf16_4[7];
-    float _unpack_bf16_5[8];
+    s8_0[0] = s8_0[0] + unpack_bf16_1[0];
+    s8_0[1] = s8_0[1] + unpack_bf16_1[1];
+    s8_0[2] = s8_0[2] + unpack_bf16_1[2];
+    s8_0[3] = s8_0[3] + unpack_bf16_1[3];
+    s8_0[4] = s8_0[4] + unpack_bf16_1[4];
+    s8_0[5] = s8_0[5] + unpack_bf16_1[5];
+    s8_0[6] = s8_0[6] + unpack_bf16_1[6];
+    s8_0[7] = s8_0[7] + unpack_bf16_1[7];
+    float unpack_bf16_2[8];
     #pragma unroll
     for (int _pair = 0; _pair < 4; _pair++) {
         asm volatile(
@@ -751,18 +751,18 @@ kernel_cake_tp_moe_finalize_rmsnorm_6c1952f6ee0860564d7f(__nv_bfloat16* __restri
             "shl.b32 %0, %2, 16;\n\t"
             "and.b32 %1, %2, 0xffff0000;\n\t"
             "}\n"
-            : "=f"((&_unpack_bf16_5[_pair * 2])[0]), "=f"((&_unpack_bf16_5[_pair * 2])[1])
+            : "=f"((&unpack_bf16_2[_pair * 2])[0]), "=f"((&unpack_bf16_2[_pair * 2])[1])
             : "r"(_sysv_poll_group_0[12 + _pair]));
     }
-    s8_0[0] = s8_0[0] + _unpack_bf16_5[0];
-    s8_0[1] = s8_0[1] + _unpack_bf16_5[1];
-    s8_0[2] = s8_0[2] + _unpack_bf16_5[2];
-    s8_0[3] = s8_0[3] + _unpack_bf16_5[3];
-    s8_0[4] = s8_0[4] + _unpack_bf16_5[4];
-    s8_0[5] = s8_0[5] + _unpack_bf16_5[5];
-    s8_0[6] = s8_0[6] + _unpack_bf16_5[6];
-    s8_0[7] = s8_0[7] + _unpack_bf16_5[7];
-    float _unpack_bf16_6[8];
+    s8_0[0] = s8_0[0] + unpack_bf16_2[0];
+    s8_0[1] = s8_0[1] + unpack_bf16_2[1];
+    s8_0[2] = s8_0[2] + unpack_bf16_2[2];
+    s8_0[3] = s8_0[3] + unpack_bf16_2[3];
+    s8_0[4] = s8_0[4] + unpack_bf16_2[4];
+    s8_0[5] = s8_0[5] + unpack_bf16_2[5];
+    s8_0[6] = s8_0[6] + unpack_bf16_2[6];
+    s8_0[7] = s8_0[7] + unpack_bf16_2[7];
+    float unpack_bf16_3[8];
     #pragma unroll
     for (int _pair = 0; _pair < 4; _pair++) {
         asm volatile(
@@ -770,18 +770,18 @@ kernel_cake_tp_moe_finalize_rmsnorm_6c1952f6ee0860564d7f(__nv_bfloat16* __restri
             "shl.b32 %0, %2, 16;\n\t"
             "and.b32 %1, %2, 0xffff0000;\n\t"
             "}\n"
-            : "=f"((&_unpack_bf16_6[_pair * 2])[0]), "=f"((&_unpack_bf16_6[_pair * 2])[1])
+            : "=f"((&unpack_bf16_3[_pair * 2])[0]), "=f"((&unpack_bf16_3[_pair * 2])[1])
             : "r"(_sysv_poll_group_0[16 + _pair]));
     }
-    s8_0[0] = s8_0[0] + _unpack_bf16_6[0];
-    s8_0[1] = s8_0[1] + _unpack_bf16_6[1];
-    s8_0[2] = s8_0[2] + _unpack_bf16_6[2];
-    s8_0[3] = s8_0[3] + _unpack_bf16_6[3];
-    s8_0[4] = s8_0[4] + _unpack_bf16_6[4];
-    s8_0[5] = s8_0[5] + _unpack_bf16_6[5];
-    s8_0[6] = s8_0[6] + _unpack_bf16_6[6];
-    s8_0[7] = s8_0[7] + _unpack_bf16_6[7];
-    float _unpack_bf16_7[8];
+    s8_0[0] = s8_0[0] + unpack_bf16_3[0];
+    s8_0[1] = s8_0[1] + unpack_bf16_3[1];
+    s8_0[2] = s8_0[2] + unpack_bf16_3[2];
+    s8_0[3] = s8_0[3] + unpack_bf16_3[3];
+    s8_0[4] = s8_0[4] + unpack_bf16_3[4];
+    s8_0[5] = s8_0[5] + unpack_bf16_3[5];
+    s8_0[6] = s8_0[6] + unpack_bf16_3[6];
+    s8_0[7] = s8_0[7] + unpack_bf16_3[7];
+    float unpack_bf16_4[8];
     #pragma unroll
     for (int _pair = 0; _pair < 4; _pair++) {
         asm volatile(
@@ -789,18 +789,18 @@ kernel_cake_tp_moe_finalize_rmsnorm_6c1952f6ee0860564d7f(__nv_bfloat16* __restri
             "shl.b32 %0, %2, 16;\n\t"
             "and.b32 %1, %2, 0xffff0000;\n\t"
             "}\n"
-            : "=f"((&_unpack_bf16_7[_pair * 2])[0]), "=f"((&_unpack_bf16_7[_pair * 2])[1])
+            : "=f"((&unpack_bf16_4[_pair * 2])[0]), "=f"((&unpack_bf16_4[_pair * 2])[1])
             : "r"(_sysv_poll_group_0[20 + _pair]));
     }
-    s8_0[0] = s8_0[0] + _unpack_bf16_7[0];
-    s8_0[1] = s8_0[1] + _unpack_bf16_7[1];
-    s8_0[2] = s8_0[2] + _unpack_bf16_7[2];
-    s8_0[3] = s8_0[3] + _unpack_bf16_7[3];
-    s8_0[4] = s8_0[4] + _unpack_bf16_7[4];
-    s8_0[5] = s8_0[5] + _unpack_bf16_7[5];
-    s8_0[6] = s8_0[6] + _unpack_bf16_7[6];
-    s8_0[7] = s8_0[7] + _unpack_bf16_7[7];
-    float _unpack_bf16_8[8];
+    s8_0[0] = s8_0[0] + unpack_bf16_4[0];
+    s8_0[1] = s8_0[1] + unpack_bf16_4[1];
+    s8_0[2] = s8_0[2] + unpack_bf16_4[2];
+    s8_0[3] = s8_0[3] + unpack_bf16_4[3];
+    s8_0[4] = s8_0[4] + unpack_bf16_4[4];
+    s8_0[5] = s8_0[5] + unpack_bf16_4[5];
+    s8_0[6] = s8_0[6] + unpack_bf16_4[6];
+    s8_0[7] = s8_0[7] + unpack_bf16_4[7];
+    float unpack_bf16_5[8];
     #pragma unroll
     for (int _pair = 0; _pair < 4; _pair++) {
         asm volatile(
@@ -808,18 +808,18 @@ kernel_cake_tp_moe_finalize_rmsnorm_6c1952f6ee0860564d7f(__nv_bfloat16* __restri
             "shl.b32 %0, %2, 16;\n\t"
             "and.b32 %1, %2, 0xffff0000;\n\t"
             "}\n"
-            : "=f"((&_unpack_bf16_8[_pair * 2])[0]), "=f"((&_unpack_bf16_8[_pair * 2])[1])
+            : "=f"((&unpack_bf16_5[_pair * 2])[0]), "=f"((&unpack_bf16_5[_pair * 2])[1])
             : "r"(_sysv_poll_group_0[24 + _pair]));
     }
-    s8_0[0] = s8_0[0] + _unpack_bf16_8[0];
-    s8_0[1] = s8_0[1] + _unpack_bf16_8[1];
-    s8_0[2] = s8_0[2] + _unpack_bf16_8[2];
-    s8_0[3] = s8_0[3] + _unpack_bf16_8[3];
-    s8_0[4] = s8_0[4] + _unpack_bf16_8[4];
-    s8_0[5] = s8_0[5] + _unpack_bf16_8[5];
-    s8_0[6] = s8_0[6] + _unpack_bf16_8[6];
-    s8_0[7] = s8_0[7] + _unpack_bf16_8[7];
-    float _unpack_bf16_9[8];
+    s8_0[0] = s8_0[0] + unpack_bf16_5[0];
+    s8_0[1] = s8_0[1] + unpack_bf16_5[1];
+    s8_0[2] = s8_0[2] + unpack_bf16_5[2];
+    s8_0[3] = s8_0[3] + unpack_bf16_5[3];
+    s8_0[4] = s8_0[4] + unpack_bf16_5[4];
+    s8_0[5] = s8_0[5] + unpack_bf16_5[5];
+    s8_0[6] = s8_0[6] + unpack_bf16_5[6];
+    s8_0[7] = s8_0[7] + unpack_bf16_5[7];
+    float unpack_bf16_6[8];
     #pragma unroll
     for (int _pair = 0; _pair < 4; _pair++) {
         asm volatile(
@@ -827,17 +827,17 @@ kernel_cake_tp_moe_finalize_rmsnorm_6c1952f6ee0860564d7f(__nv_bfloat16* __restri
             "shl.b32 %0, %2, 16;\n\t"
             "and.b32 %1, %2, 0xffff0000;\n\t"
             "}\n"
-            : "=f"((&_unpack_bf16_9[_pair * 2])[0]), "=f"((&_unpack_bf16_9[_pair * 2])[1])
+            : "=f"((&unpack_bf16_6[_pair * 2])[0]), "=f"((&unpack_bf16_6[_pair * 2])[1])
             : "r"(_sysv_poll_group_0[28 + _pair]));
     }
-    s8_0[0] = s8_0[0] + _unpack_bf16_9[0];
-    s8_0[1] = s8_0[1] + _unpack_bf16_9[1];
-    s8_0[2] = s8_0[2] + _unpack_bf16_9[2];
-    s8_0[3] = s8_0[3] + _unpack_bf16_9[3];
-    s8_0[4] = s8_0[4] + _unpack_bf16_9[4];
-    s8_0[5] = s8_0[5] + _unpack_bf16_9[5];
-    s8_0[6] = s8_0[6] + _unpack_bf16_9[6];
-    s8_0[7] = s8_0[7] + _unpack_bf16_9[7];
+    s8_0[0] = s8_0[0] + unpack_bf16_6[0];
+    s8_0[1] = s8_0[1] + unpack_bf16_6[1];
+    s8_0[2] = s8_0[2] + unpack_bf16_6[2];
+    s8_0[3] = s8_0[3] + unpack_bf16_6[3];
+    s8_0[4] = s8_0[4] + unpack_bf16_6[4];
+    s8_0[5] = s8_0[5] + unpack_bf16_6[5];
+    s8_0[6] = s8_0[6] + unpack_bf16_6[6];
+    s8_0[7] = s8_0[7] + unpack_bf16_6[7];
     unsigned int s8_0_bf16[4];
     #pragma unroll
     for (int _lp = 0; _lp < 4; _lp++) {
@@ -1002,30 +1002,30 @@ kernel_cake_tp_moe_finalize_rmsnorm_6c1952f6ee0860564d7f(__nv_bfloat16* __restri
     acc8[7] = __fmaf_rn(o2_0_7, wk0, acc8[7]);
     unsigned int lo4[4];
     unsigned int hi4[4];
-    unsigned int blo0 = __as_u32(acc8[0]);
-    unsigned int bhi0 = __as_u32(acc8[4]);
-    unsigned int slo0 = ((blo0 == 2147483648u) ? 0 : blo0);
-    unsigned int shi0 = ((bhi0 == 2147483648u) ? 0 : bhi0);
-    lo4[0] = slo0;
-    hi4[0] = shi0;
-    unsigned int blo1 = __as_u32(acc8[1]);
-    unsigned int bhi1 = __as_u32(acc8[5]);
-    unsigned int slo1 = ((blo1 == 2147483648u) ? 0 : blo1);
-    unsigned int shi1 = ((bhi1 == 2147483648u) ? 0 : bhi1);
-    lo4[1] = slo1;
-    hi4[1] = shi1;
-    unsigned int blo2 = __as_u32(acc8[2]);
-    unsigned int bhi2 = __as_u32(acc8[6]);
-    unsigned int slo2 = ((blo2 == 2147483648u) ? 0 : blo2);
-    unsigned int shi2 = ((bhi2 == 2147483648u) ? 0 : bhi2);
-    lo4[2] = slo2;
-    hi4[2] = shi2;
-    unsigned int blo3 = __as_u32(acc8[3]);
-    unsigned int bhi3 = __as_u32(acc8[7]);
-    unsigned int slo3 = ((blo3 == 2147483648u) ? 0 : blo3);
-    unsigned int shi3 = ((bhi3 == 2147483648u) ? 0 : bhi3);
-    lo4[3] = slo3;
-    hi4[3] = shi3;
+    unsigned int blo0_1_0 = __as_u32(acc8[0]);
+    unsigned int bhi0_1_0 = __as_u32(acc8[4]);
+    unsigned int slo0_1_0 = ((blo0_1_0 == 2147483648u) ? 0 : blo0_1_0);
+    unsigned int shi0_1_0 = ((bhi0_1_0 == 2147483648u) ? 0 : bhi0_1_0);
+    lo4[0] = slo0_1_0;
+    hi4[0] = shi0_1_0;
+    unsigned int blo0_1_1 = __as_u32(acc8[1]);
+    unsigned int bhi0_1_1 = __as_u32(acc8[5]);
+    unsigned int slo0_1_1 = ((blo0_1_1 == 2147483648u) ? 0 : blo0_1_1);
+    unsigned int shi0_1_1 = ((bhi0_1_1 == 2147483648u) ? 0 : bhi0_1_1);
+    lo4[1] = slo0_1_1;
+    hi4[1] = shi0_1_1;
+    unsigned int blo0_1_2 = __as_u32(acc8[2]);
+    unsigned int bhi0_1_2 = __as_u32(acc8[6]);
+    unsigned int slo0_1_2 = ((blo0_1_2 == 2147483648u) ? 0 : blo0_1_2);
+    unsigned int shi0_1_2 = ((bhi0_1_2 == 2147483648u) ? 0 : bhi0_1_2);
+    lo4[2] = slo0_1_2;
+    hi4[2] = shi0_1_2;
+    unsigned int blo0_1_3 = __as_u32(acc8[3]);
+    unsigned int bhi0_1_3 = __as_u32(acc8[7]);
+    unsigned int slo0_1_3 = ((blo0_1_3 == 2147483648u) ? 0 : blo0_1_3);
+    unsigned int shi0_1_3 = ((bhi0_1_3 == 2147483648u) ? 0 : bhi0_1_3);
+    lo4[3] = slo0_1_3;
+    hi4[3] = shi0_1_3;
     unsigned long long mc_lo = b_mcast + (unsigned long long)((b_cur + rank64 * 4096) * 4);
     int lane_odd = lane & 1;
     long long mc_i = (long long)mc_lo - (long long)lane * 16;
