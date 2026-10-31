@@ -17,6 +17,8 @@ from cutlass.utils import (
     ClcDynamicPersistentTileSchedulerParams,
 )
 
+from flashinfer.cute_dsl.work_tile_info import WorkTileInfo as _WorkTileInfoBase
+
 from .cute_dsl_utils import ParamsBase
 
 from . import kernel_utils as utils
@@ -85,7 +87,7 @@ class ClcState(ParamsBase):
         self._pipeline.producer_tail(self._producer_state, loc=loc, ip=ip)
 
 
-class WorkTileInfo(cutlass.utils.WorkTileInfo):
+class WorkTileInfo(_WorkTileInfoBase):
     """Altered WorkTileInfo which includes four axes: (block, head, batch, split)"""
 
     @override
