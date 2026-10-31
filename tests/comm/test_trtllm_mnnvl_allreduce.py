@@ -19,6 +19,7 @@ from flashinfer.norm import rmsnorm
 # Test helpers
 from tests.test_helpers.comm import (
     _get_rank_info_from_env,
+    get_world_size_from_env,
     init_torch_distributed_from_mpi,
 )
 from tests.test_helpers.utils_fp4 import (
@@ -447,6 +448,12 @@ def run_mnnvl_ar_full(
     if gpus_per_node == 0:
         pytest.skip("MNNVL allreduce test requires at least one CUDA device per node")
 
+    # Skip before initializing torch.distributed so a skipped test leaves no
+    # process group behind.
+    world_size = get_world_size_from_env()
+    if world_size < 2:
+        pytest.skip(f"This test requires at least 2 ranks, got {world_size}")
+
     _set_device_from_launcher_local_rank()
 
     # Initialize torch.distributed (safe to call if already initialized)
@@ -454,10 +461,6 @@ def run_mnnvl_ar_full(
 
     # Get rank info from torch.distributed
     rank = dist.get_rank()
-    world_size = dist.get_world_size()
-
-    if world_size < 2:
-        pytest.skip(f"This test requires at least 2 ranks, got {world_size}")
 
     mapping = Mapping(
         world_size=world_size,
@@ -841,12 +844,13 @@ def test_mnnvl_allreduce_quant_unified(
     if torch.cuda.device_count() == 0:
         pytest.skip("MNNVL quant test requires CUDA")
 
+    world_size = get_world_size_from_env()
+    if world_size < 2:
+        pytest.skip(f"This test requires at least 2 ranks, got {world_size}")
+
     _set_device_from_launcher_local_rank()
     init_torch_distributed_from_mpi()
     rank = dist.get_rank()
-    world_size = dist.get_world_size()
-    if world_size < 2:
-        pytest.skip(f"This test requires at least 2 ranks, got {world_size}")
 
     mapping = Mapping(
         world_size=world_size,
@@ -966,12 +970,13 @@ def test_mnnvl_nvfp4_rejects_fp32(
     if torch.cuda.device_count() == 0:
         pytest.skip("MNNVL quant test requires CUDA")
 
+    world_size = get_world_size_from_env()
+    if world_size < 2:
+        pytest.skip(f"This test requires at least 2 ranks, got {world_size}")
+
     _set_device_from_launcher_local_rank()
     init_torch_distributed_from_mpi()
     rank = dist.get_rank()
-    world_size = dist.get_world_size()
-    if world_size < 2:
-        pytest.skip(f"This test requires at least 2 ranks, got {world_size}")
 
     mapping = Mapping(
         world_size=world_size,
