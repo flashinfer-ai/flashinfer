@@ -14,9 +14,25 @@ from ....attention.prims_ts.kernels.mla_decode.helpers.sparse_indices import (
 
 
 class CombinedSparseRouteView(SparseKVIndices):
+    """Routes one request's combined table; persistent schedules bind per tile.
+
+    A nonpersistent CTA binds its request's row and live lengths once. A
+    persistent view keeps the length tensors and binds whichever request each
+    work tile names; both see the same per-row values.
+    """
+
     def __init__(self, values, capacity):
         self.values = values
-        self.indices, self.row, self.sl, self.cl, self.sc, self.cc = values
+        (
+            self.indices,
+            self.row,
+            self.sl,
+            self.cl,
+            self.sc,
+            self.cc,
+            self.seq_lens,
+            self.topk_lens,
+        ) = values
         self.capacity = capacity
         self.shape = (capacity, self.indices.shape[0])
 
@@ -30,26 +46,36 @@ class CombinedSparseRouteView(SparseKVIndices):
 
     @cute.jit
     def bind_query_row(self, query_row, primary_length=None, extra_length=None):
-        # The producer binds original metadata once for this nonpersistent CTA.
-        del query_row, primary_length, extra_length
-        return self
+        del primary_length, extra_length
+        if cutlass.const_expr(self.row is not None):
+            # A nonpersistent CTA bound its request's metadata once.
+            return self
+        row = Int64(query_row)
+        swa_length, main_length = _live_lengths(
+            self.indices, self.seq_lens, self.topk_lens, row
+        )
+        return CombinedSparseRouteView(
+            (self.indices, row, swa_length, main_length, self.sc, self.cc, None, None),
+            self.capacity,
+        )
 
     @cute.jit
     def select_source_tile(
         self, token, query_row=None, *, for_mask: cutlass.Constexpr[bool] = False
     ):
-        del query_row, for_mask
+        del for_mask
+        routes = self.bind_query_row(query_row)
         compressed = token >= Int32(128)
-        address = self.indices.iterator.toint() + self.row * Int64(
-            self.indices.stride[0]
+        address = routes.indices.iterator.toint() + routes.row * Int64(
+            routes.indices.stride[0]
         ) * Int64(4)
         indices = cute.make_tensor(
             cute.make_ptr(Int32, address, assumed_align=4),
-            cute.make_layout((self.indices.shape[1],), stride=(1,)),
+            cute.make_layout((routes.indices.shape[1],), stride=(1,)),
         )
         origin = Int32(128) if compressed else Int32(0)
-        length = self.cl if compressed else self.sl
-        capacity = self.cc if compressed else self.sc
+        length = routes.cl if compressed else routes.sl
+        capacity = routes.cc if compressed else routes.sc
         tag = Int32(-2147483648) if compressed else Int32(0)
         return CombinedSparseTile((indices, origin, length, capacity, tag))
 
@@ -139,11 +165,7 @@ class CombinedSparseTile(SparseSourceTile):
 
 
 @cute.jit
-def bind_combined_sparse_views(
-    indices, seq_lens, topk_lens, pools, capacity, request=None
-):
-    if cutlass.const_expr(request is None):
-        raise ValueError("V4.1 combined metadata requires a nonpersistent request")
+def _live_lengths(indices, seq_lens, topk_lens, request):
     compressed_k = indices.shape[1] - 128
     swa_length = cute.math.min(
         cute.math.max(Int32(seq_lens[request]), Int32(0)), Int32(128)
@@ -153,17 +175,35 @@ def bind_combined_sparse_views(
         cute.math.max(Int32(topk_lens[request]), Int32(128)),
         Int32(128 + compressed_k),
     ) - Int32(128)
-    routes = CombinedSparseRouteView(
-        (
-            indices,
-            request,
-            swa_length,
-            main_length,
-            Int64(cute.size(pools[1])) // Int64(512),
-            Int64(cute.size(pools[0])) // Int64(288),
-        ),
-        capacity,
-    )
+    return swa_length, main_length
+
+
+@cute.jit
+def bind_combined_sparse_views(
+    indices, seq_lens, topk_lens, pools, capacity, request=None
+):
+    compressed_k = indices.shape[1] - 128
+    swa_capacity = Int64(cute.size(pools[1])) // Int64(512)
+    main_capacity = Int64(cute.size(pools[0])) // Int64(288)
+    if cutlass.const_expr(request is None):
+        # Persistent schedules bind each work tile's request when routing it.
+        values = (indices, None, None, None, swa_capacity, main_capacity)
+        routes = CombinedSparseRouteView((*values, seq_lens, topk_lens), capacity)
+    else:
+        swa_length, main_length = _live_lengths(indices, seq_lens, topk_lens, request)
+        routes = CombinedSparseRouteView(
+            (
+                indices,
+                request,
+                swa_length,
+                main_length,
+                swa_capacity,
+                main_capacity,
+                None,
+                None,
+            ),
+            capacity,
+        )
     # Fixed SWA HEAD/main LOOP origins must not depend on valid counts.
     extent = Int32(128 + ((compressed_k + 127) // 128) * 128)
     return routes, SparseKVLengths((None, None, extent, indices.shape[0]))

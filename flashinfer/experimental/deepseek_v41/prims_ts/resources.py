@@ -759,15 +759,15 @@ class MixedFp8SmemKvResource(Fp4Fp8SmemKvResource):
         # which serialized one L2 round trip per row. Invalid rows use
         # src-size 0 (zero fill, no global read) at the always-mapped row 0.
         #
-        # The SWA HEAD is the first use of the nonpersistent KV ring, so its
+        # A nonpersistent SWA HEAD is the first use of the KV ring, so its
         # four D128 stages are physical stages 0-3 and already empty. Stage 0
         # issues all four (one commit group each); stage s then waits only for
         # its own group before the inherited fence and all-writer commit.
-        if cutlass.const_expr(self.cfg.use_persistent_scheduler == 1):
-            raise ValueError("V4.1 SWA prefetch requires a nonpersistent KV ring")
+        # A persistent CTA reaches later SWA tiles with stages that the previous
+        # work item's delayed PV may still read, so each stage copies only after
+        # its own acquire. The loader has slack for the serialized latency: a
+        # persistent tile period is bound by softmax, not by staging.
         if cutlass.const_expr(stage_idx == 0):
-            stage_bytes = self.cfg.kv_smem_stage_elements * self.cfg.qkv_dtype_bytes
-            stage_dst = stage_base.data_ptr().toint(cutlass.Int32)
             swa_base = self.swa_cache.iterator.toint() + cutlass.Int64(dim)
             rows = []
             # Eight lanes per row: four rows per group.
@@ -797,18 +797,29 @@ class MixedFp8SmemKvResource(Fp4Fp8SmemKvResource):
                         cutlass.Int32(16) if ok else cutlass.Int32(0),
                     )
                 )
-            for stage in cutlass.range_constexpr(4):
-                for offset, src, size in rows:
-                    _cp_async_16(
-                        stage_dst + stage * stage_bytes + offset,
-                        src + stage * 128,
-                        size,
-                    )
-                _cp_async_commit()
-        # Each writer completes its own copies before the inherited
-        # async-proxy fence and all-writer commit; UMMA semantics match the
-        # previous thread stores.
-        _cp_async_wait_group(3 - stage_idx)
+            # All four stage calls of the tile reuse these row addresses.
+            self._swa_rows = rows
+        stage_dst = stage_base.data_ptr().toint(cutlass.Int32)
+        if cutlass.const_expr(self.cfg.use_persistent_scheduler == 1):
+            for offset, src, size in self._swa_rows:
+                _cp_async_16(stage_dst + offset, src + stage_idx * 128, size)
+            _cp_async_commit()
+            _cp_async_wait_group(0)
+        else:
+            if cutlass.const_expr(stage_idx == 0):
+                stage_bytes = self.cfg.kv_smem_stage_elements * self.cfg.qkv_dtype_bytes
+                for stage in cutlass.range_constexpr(4):
+                    for offset, src, size in self._swa_rows:
+                        _cp_async_16(
+                            stage_dst + stage * stage_bytes + offset,
+                            src + stage * 128,
+                            size,
+                        )
+                    _cp_async_commit()
+            # Each writer completes its own copies before the inherited
+            # async-proxy fence and all-writer commit; UMMA semantics match
+            # the previous thread stores.
+            _cp_async_wait_group(3 - stage_idx)
 
     @cute.jit
     def _load_main_stage(

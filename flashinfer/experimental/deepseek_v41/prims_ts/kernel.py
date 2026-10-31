@@ -11,7 +11,7 @@ import cutlass.cute as cute
 
 
 def _make_fp8_attention(
-    compressed_k, sm_count, native_fp4, head_dim_ctas=1, kv_splits=1
+    compressed_k, sm_count, native_fp4, head_dim_ctas=1, kv_splits=1, persistent=False
 ):
     from ....attention.prims_ts.kernels.mla_decode.sparse_policy import SparseMlaProfile
     from ....attention.prims_ts.kernels.mla_decode.throughput_latency_1cta.kernel import (
@@ -48,20 +48,22 @@ def _make_fp8_attention(
             # reducer merges the BF16 partials and applies sinks once.
             num_ctas_per_seq_kv=kv_splits,
             use_multi_ctas_kv=int(kv_splits > 1),
-            use_persistent_scheduler=0,
+            # More requests than SMs: each CTA walks several, overlapping one
+            # request's prologue and output with the previous one's tiles.
+            use_persistent_scheduler=int(persistent),
         ),
         logical_num_heads=64,
         logical_seq_len_q=1,
         tile_size_q=64,
         explicit_split_kv=kv_splits,
-        explicit_persistent=False,
+        explicit_persistent=persistent,
         reduction_mode="gmem_separate",
         mask_type="dense",
         sparse_profile=SparseMlaProfile(
             family="keep",
             tile_size_q=64,
             split_kv=kv_splits,
-            scheduler="nonpersistent",
+            scheduler="static" if persistent else "nonpersistent",
             head_dim_ctas=head_dim_ctas,
             # Eight loader warps halve each warp's FP4 conversion and SWA gather.
             gather_issue_warps=8,
@@ -71,6 +73,8 @@ def _make_fp8_attention(
             # Two index stages let the next tile's row IDs load while the
             # loaders still stage the current tile.
             page_pipeline_stages=2,
+            # Rescale O with packed FP32 multiplies.
+            paired_correction=True,
         ),
         finalize_output=True,
         kv_producer=MixedFp8KvProducer(native_fp4=native_fp4),
