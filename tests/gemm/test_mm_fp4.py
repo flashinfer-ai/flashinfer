@@ -20,7 +20,10 @@ from flashinfer.utils import (
     version_at_least,
     LibraryError,
 )
-from flashinfer.gemm.gemm_base import CUDNN_FP4_MXFP4_SM120_CUDNN_VERSION_ERROR
+from flashinfer.gemm.gemm_base import (
+    CUDNN_FP4_MXFP4_SM120_CUDNN_VERSION_ERROR,
+    _cudnn_gemm_fp4_requirement,
+)
 
 
 def _test_mm_fp4(
@@ -840,3 +843,34 @@ def test_mm_fp4_cudnn_rejects_relaid_out_a_descale(use_nvfp4):
         "not a re-laid-out copy",
         make_a_scale=lambda a_sf: a_sf.T.contiguous().T,
     )
+
+
+@pytest.mark.parametrize("use_nvfp4", [False, True])
+def test_mm_fp4_cudnn_auto_declines_untransposed_b_descale(use_nvfp4):
+    # With backend="auto" the cuDNN requirement returns False for a scale tensor
+    # the check rejects, so auto dispatch moves on to another backend instead of
+    # raising. The documented scales must be accepted first; otherwise cuDNN FP4
+    # is unavailable here and the False below would prove nothing.
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required")
+    m, n, k = 128, 256, 64
+    a_fp4, a_sf, b_fp4, b_sf = _quantized_fp4_operands(m, n, k, use_nvfp4)
+    out = torch.empty([m, n], device="cuda", dtype=torch.bfloat16)
+
+    def accepted(b_scale):
+        return _cudnn_gemm_fp4_requirement(
+            a_fp4,
+            b_fp4.T,
+            a_sf,
+            b_scale,
+            None,
+            torch.bfloat16,
+            out,
+            block_size=16 if use_nvfp4 else 32,
+            backend="auto",
+            use_nvfp4=use_nvfp4,
+        )
+
+    if not accepted(b_sf.T):
+        pytest.skip("cudnn fp4 backend unavailable here")
+    assert accepted(b_sf) is False
