@@ -28,8 +28,8 @@ comparators report the sum of their kernels' GPU time.
 
 Example::
 
-    python benchmarks/bench_cake_rmsnorm_train.py --hidden 6144 --rows 16231 65536
-    python benchmarks/bench_cake_rmsnorm_train.py --residual --json out.json
+    python benchmarks/bench_cake_rmsnorm_det_train.py --hidden 6144 --rows 16231 65536
+    python benchmarks/bench_cake_rmsnorm_det_train.py --residual --json out.json
 """
 
 from __future__ import annotations
@@ -43,13 +43,13 @@ from typing import Callable, Optional
 import torch
 
 import flashinfer
-from flashinfer.cake_rmsnorm_train import (
-    cake_rmsnorm_train_backward,
-    cake_rmsnorm_train_backward_workspace,
-    cake_rmsnorm_train_forward,
-    is_cake_rmsnorm_train_supported,
+from flashinfer.cake_rmsnorm_det_train import (
+    cake_rmsnorm_det_train_backward,
+    cake_rmsnorm_det_train_backward_workspace,
+    cake_rmsnorm_det_train_forward,
+    is_cake_rmsnorm_det_train_supported,
 )
-from flashinfer.cake_rmsnorm_train_backend import cake_jit as loader
+from flashinfer.cake_rmsnorm_det_train_backend import cake_jit as loader
 from flashinfer.testing import bench_gpu_time
 
 WIDTHS = ((6144, 1e-5), (4096, 1e-5), (2048, 1e-6), (1536, 1e-6), (512, 1e-6))
@@ -258,19 +258,19 @@ class Cake(Comparator):
         h_new = torch.empty_like(x) if u is not None else None
         dx = torch.empty_like(x)
         dw = torch.empty(hidden, dtype=torch.float32, device=x.device)
-        workspace = cake_rmsnorm_train_backward_workspace(
+        workspace = cake_rmsnorm_det_train_backward_workspace(
             rows, hidden, x.device, residual=u is not None
         )
         normalized = h_new if u is not None else x
 
         def fwd():
-            cake_rmsnorm_train_forward(
+            cake_rmsnorm_det_train_forward(
                 x, w, eps, residual=u, out=y, rstd=rstd, residual_out=h_new
             )
             return y
 
         def bwd(g, g_h=None):
-            cake_rmsnorm_train_backward(
+            cake_rmsnorm_det_train_backward(
                 g,
                 normalized,
                 w,
@@ -416,8 +416,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     args = parser.parse_args(argv)
 
     device = torch.device("cuda", torch.cuda.current_device())
-    if not is_cake_rmsnorm_train_supported(device):
-        raise SystemExit("cake_rmsnorm_train has no exported route on this device")
+    if not is_cake_rmsnorm_det_train_supported(device):
+        raise SystemExit("cake_rmsnorm_det_train has no exported route on this device")
     comparators = []
     for comparator in COMPARATORS:
         if comparator.name in args.skip:
@@ -433,7 +433,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     if args.residual:
         plans += [(6144, r, True) for r in args.rows if 6144 in args.hidden]
     for hidden, rows, residual in plans:
-        if not is_cake_rmsnorm_train_supported(device, hidden):
+        if not is_cake_rmsnorm_det_train_supported(device, hidden):
             print(f"H={hidden}: no exported route on this device, skipped")
             continue
         result = bench_row(

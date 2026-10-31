@@ -48,8 +48,8 @@ concurrent-launch measurement of issue #7038.
 
 Example::
 
-    python benchmarks/bench_cake_rmsnorm_silu_gate_train.py --tokens 30193 32737 32388 --heads 48
-    python benchmarks/bench_cake_rmsnorm_silu_gate_train.py --side-stream --json out.json
+    python benchmarks/bench_cake_rmsnorm_silu_gate_det_train.py --tokens 30193 32737 32388 --heads 48
+    python benchmarks/bench_cake_rmsnorm_silu_gate_det_train.py --side-stream --json out.json
 """
 
 from __future__ import annotations
@@ -62,12 +62,12 @@ from typing import Callable, Optional
 import torch
 import torch.utils.checkpoint
 
-from flashinfer.cake_rmsnorm_silu_gate_train import (
-    cake_rmsnorm_silu_gate,
-    cake_rmsnorm_silu_gate_train_backward,
-    cake_rmsnorm_silu_gate_train_backward_workspace,
-    cake_rmsnorm_silu_gate_train_backward_workspace_bytes,
-    cake_rmsnorm_silu_gate_train_forward,
+from flashinfer.cake_rmsnorm_silu_gate_det_train import (
+    cake_rmsnorm_silu_gate_det,
+    cake_rmsnorm_silu_gate_det_train_backward,
+    cake_rmsnorm_silu_gate_det_train_backward_workspace,
+    cake_rmsnorm_silu_gate_det_train_backward_workspace_bytes,
+    cake_rmsnorm_silu_gate_det_train_forward,
 )
 from flashinfer.testing import bench_gpu_time
 
@@ -126,7 +126,7 @@ def _comparators(eps: float) -> dict[str, Callable]:
     """name -> ``f(x, z, w)``, a differentiable forward."""
 
     found: dict[str, Callable] = {
-        "cake": lambda x, z, w: cake_rmsnorm_silu_gate(x, z, w, eps),
+        "cake": lambda x, z, w: cake_rmsnorm_silu_gate_det(x, z, w, eps),
     }
     try:
         from fla.modules.fused_norm_gate import rms_norm_gated
@@ -208,9 +208,11 @@ def bench_row(
             )
         }
         if name == "cake":
-            fwd_ms = _time(lambda: cake_rmsnorm_silu_gate_train_forward(x, z, w, eps))
+            fwd_ms = _time(
+                lambda: cake_rmsnorm_silu_gate_det_train_forward(x, z, w, eps)
+            )
             bwd_ms = _time(
-                lambda: cake_rmsnorm_silu_gate_train_backward(dy, x, z, w, eps)
+                lambda: cake_rmsnorm_silu_gate_det_train_backward(dy, x, z, w, eps)
             )
         else:
             fwd_ms = _time(train_fwd)
@@ -229,18 +231,18 @@ def bench_row(
         del y, grads
         result[name] = row
     cake = result["cake"]
-    cake["workspace_bytes"] = cake_rmsnorm_silu_gate_train_backward_workspace_bytes(
+    cake["workspace_bytes"] = cake_rmsnorm_silu_gate_det_train_backward_workspace_bytes(
         T * H, x.device
     )
     if side_stream:
         y = torch.empty_like(x)
-        ws = cake_rmsnorm_silu_gate_train_backward_workspace(T * H, x.device)
+        ws = cake_rmsnorm_silu_gate_det_train_backward_workspace(T * H, x.device)
         cake["side_stream"] = {
             "fwd": _beside_resident(
-                lambda: cake_rmsnorm_silu_gate_train_forward(x, z, w, eps, out=y)
+                lambda: cake_rmsnorm_silu_gate_det_train_forward(x, z, w, eps, out=y)
             ),
             "bwd": _beside_resident(
-                lambda: cake_rmsnorm_silu_gate_train_backward(
+                lambda: cake_rmsnorm_silu_gate_det_train_backward(
                     dy, x, z, w, eps, workspace=ws
                 )
             ),

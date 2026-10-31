@@ -50,17 +50,17 @@ FP32 statistics and accumulation, one FP32 reciprocal RMS saved per row,
 fused ``dx`` + deterministic FP32 ``dw`` backward, optional residual-add
 fusion and an autograd wrapper.
 
-.. currentmodule:: flashinfer.cake_rmsnorm_train
+.. currentmodule:: flashinfer.cake_rmsnorm_det_train
 
 .. autosummary::
     :toctree: ../generated
 
-    cake_rmsnorm
-    cake_rmsnorm_train_forward
-    cake_rmsnorm_train_backward
-    cake_rmsnorm_train_backward_workspace_bytes
-    cake_rmsnorm_train_backward_workspace
-    CakeRMSNormFunction
+    cake_rmsnorm_det
+    cake_rmsnorm_det_train_forward
+    cake_rmsnorm_det_train_backward
+    cake_rmsnorm_det_train_backward_workspace_bytes
+    cake_rmsnorm_det_train_backward_workspace
+    CakeRMSNormDetFunction
 
 Training SiLU-gated RMSNorm (Cake)
 ----------------------------------
@@ -72,14 +72,14 @@ inputs, outputs and gradients, a weight shared by every token and head whose
 gradient is summed in a fixed order (repeated calls return the same bits), and
 an autograd wrapper that saves only its inputs.
 
-.. currentmodule:: flashinfer.cake_rmsnorm_silu_gate_train
+.. currentmodule:: flashinfer.cake_rmsnorm_silu_gate_det_train
 
 .. autosummary::
     :toctree: ../generated
 
-    cake_rmsnorm_silu_gate
-    cake_rmsnorm_silu_gate_train_forward
-    cake_rmsnorm_silu_gate_train_backward
-    cake_rmsnorm_silu_gate_train_backward_workspace_bytes
-    cake_rmsnorm_silu_gate_train_backward_workspace
-    CakeRMSNormSiLUGateFunction
+    cake_rmsnorm_silu_gate_det
+    cake_rmsnorm_silu_gate_det_train_forward
+    cake_rmsnorm_silu_gate_det_train_backward
+    cake_rmsnorm_silu_gate_det_train_backward_workspace_bytes
+    cake_rmsnorm_silu_gate_det_train_backward_workspace
+    CakeRMSNormSiLUGateDetFunction

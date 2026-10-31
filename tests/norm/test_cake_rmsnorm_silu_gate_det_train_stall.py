@@ -40,14 +40,16 @@ import torch
 
 from tests.test_helpers.cake_package import cake_package
 
-pkg = cake_package("cake_rmsnorm_silu_gate_train")
-cake_rmsnorm_silu_gate_train_backward = pkg.cake_rmsnorm_silu_gate_train_backward
-cake_rmsnorm_silu_gate_train_backward_workspace = (
-    pkg.cake_rmsnorm_silu_gate_train_backward_workspace
+pkg = cake_package("cake_rmsnorm_silu_gate_det_train")
+cake_rmsnorm_silu_gate_det_train_backward = (
+    pkg.cake_rmsnorm_silu_gate_det_train_backward
 )
-cake_rmsnorm_silu_gate_train_forward = pkg.cake_rmsnorm_silu_gate_train_forward
-is_cake_rmsnorm_silu_gate_train_supported = (
-    pkg.is_cake_rmsnorm_silu_gate_train_supported
+cake_rmsnorm_silu_gate_det_train_backward_workspace = (
+    pkg.cake_rmsnorm_silu_gate_det_train_backward_workspace
+)
+cake_rmsnorm_silu_gate_det_train_forward = pkg.cake_rmsnorm_silu_gate_det_train_forward
+is_cake_rmsnorm_silu_gate_det_train_supported = (
+    pkg.is_cake_rmsnorm_silu_gate_det_train_supported
 )
 
 D = 128
@@ -69,7 +71,7 @@ SEED = 7075
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available()
-    or not is_cake_rmsnorm_silu_gate_train_supported(torch.device("cuda")),
+    or not is_cake_rmsnorm_silu_gate_det_train_supported(torch.device("cuda")),
     reason="Cake SiLU-gated RMSNorm training needs an SM100 / SM103 / SM107 GPU",
 )
 
@@ -111,15 +113,15 @@ def test_keeps_its_speed_beside_a_resident_kernel(stage: str, tokens: int) -> No
         y = torch.empty_like(x)
 
         def call():
-            return (cake_rmsnorm_silu_gate_train_forward(x, z, w, EPS, out=y),)
+            return (cake_rmsnorm_silu_gate_det_train_forward(x, z, w, EPS, out=y),)
 
     else:
-        workspace = cake_rmsnorm_silu_gate_train_backward_workspace(
+        workspace = cake_rmsnorm_silu_gate_det_train_backward_workspace(
             tokens * H, x.device
         )
 
         def call():
-            return cake_rmsnorm_silu_gate_train_backward(
+            return cake_rmsnorm_silu_gate_det_train_backward(
                 dy, x, z, w, EPS, workspace=workspace
             )
 

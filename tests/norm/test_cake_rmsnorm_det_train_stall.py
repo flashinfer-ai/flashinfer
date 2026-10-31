@@ -36,7 +36,7 @@ every call.
 The backward beside a kernel resident on every SM (issue #7548, item 2): a
 backward main kernel needs a large shared-memory carveout, so a side kernel
 holding every SM with the default carveout delays its start until the side
-kernel exits (documented in :mod:`flashinfer.cake_rmsnorm_train`).  The
+kernel exits (documented in :mod:`flashinfer.cake_rmsnorm_det_train`).  The
 documented remedy is checked here: with the side kernel's preferred carveout
 set to the maximum shared memory, the backward and the forward start beside it
 and cost at most ``MAX_ALL_SM_EXTRA_MS`` more than alone, far below the side
@@ -55,12 +55,14 @@ import torch
 
 from tests.test_helpers.cake_package import cake_package
 
-pkg = cake_package("cake_rmsnorm_train")
-loader = cake_package("cake_rmsnorm_train", "cake_jit")
-cake_rmsnorm_train_backward = pkg.cake_rmsnorm_train_backward
-cake_rmsnorm_train_backward_workspace = pkg.cake_rmsnorm_train_backward_workspace
-cake_rmsnorm_train_forward = pkg.cake_rmsnorm_train_forward
-is_cake_rmsnorm_train_supported = pkg.is_cake_rmsnorm_train_supported
+pkg = cake_package("cake_rmsnorm_det_train")
+loader = cake_package("cake_rmsnorm_det_train", "cake_jit")
+cake_rmsnorm_det_train_backward = pkg.cake_rmsnorm_det_train_backward
+cake_rmsnorm_det_train_backward_workspace = (
+    pkg.cake_rmsnorm_det_train_backward_workspace
+)
+cake_rmsnorm_det_train_forward = pkg.cake_rmsnorm_det_train_forward
+is_cake_rmsnorm_det_train_supported = pkg.is_cake_rmsnorm_det_train_supported
 
 SUPPORTED_CAPABILITIES = ((10, 0), (10, 3), (10, 7))
 WIDTHS = ((6144, 1e-5), (4096, 1e-5), (2048, 1e-6), (1536, 1e-6), (512, 1e-6))
@@ -97,13 +99,13 @@ def _supported() -> bool:
     return (
         torch.cuda.is_available()
         and _capability() in SUPPORTED_CAPABILITIES
-        and is_cake_rmsnorm_train_supported(_device())
+        and is_cake_rmsnorm_det_train_supported(_device())
     )
 
 
 pytestmark = pytest.mark.skipif(
     not _supported(),
-    reason="cake_rmsnorm_train needs an SM100 / SM103 / SM107 device with exported routes",
+    reason="cake_rmsnorm_det_train needs an SM100 / SM103 / SM107 device with exported routes",
 )
 
 
@@ -117,7 +119,7 @@ def warmup_jit():
 
 
 def _skip_unless_route(hidden: int, residual: bool) -> None:
-    if not is_cake_rmsnorm_train_supported(_device(), hidden):
+    if not is_cake_rmsnorm_det_train_supported(_device(), hidden):
         pytest.skip(f"hidden={hidden} has no exported route on this device")
     if residual and not loader.route_applies(
         device_capability=_capability(), hidden=hidden, kind="bwd", residual=True
@@ -134,7 +136,7 @@ def _inputs(rows: int, hidden: int, residual: bool):
     w = (1 + 0.1 * torch.randn(hidden, **kwargs)).to(torch.bfloat16)
     g = torch.randn(rows, hidden, **kwargs).to(torch.bfloat16)
     g_h = torch.randn(rows, hidden, **kwargs).to(torch.bfloat16) if residual else None
-    _y, rstd = cake_rmsnorm_train_forward(x, w, EPS[hidden])
+    _y, rstd = cake_rmsnorm_det_train_forward(x, w, EPS[hidden])
     return x, w, g, g_h, rstd
 
 
@@ -142,7 +144,7 @@ def _backward(x, w, g, g_h, rstd, workspace):
     kwargs = {"workspace": workspace}
     if g_h is not None:
         kwargs["g_residual"] = g_h
-    return cake_rmsnorm_train_backward(g, x, w, rstd, **kwargs)
+    return cake_rmsnorm_det_train_backward(g, x, w, rstd, **kwargs)
 
 
 def _timed(call, *, side: torch.cuda.Stream | None) -> tuple[float, torch.Tensor]:
@@ -173,7 +175,7 @@ def test_backward_keeps_its_speed_beside_a_resident_kernel(
 ) -> None:
     _skip_unless_route(hidden, residual)
     x, w, g, g_h, rstd = _inputs(rows, hidden, residual)
-    workspace = cake_rmsnorm_train_backward_workspace(
+    workspace = cake_rmsnorm_det_train_backward_workspace(
         rows, hidden, _device(), residual=residual
     )
     side = torch.cuda.Stream()
@@ -226,7 +228,7 @@ def test_dw_is_bitwise_independent_of_the_launch_grid(
 
     _skip_unless_route(hidden, residual)
     x, w, g, g_h, rstd = _inputs(rows, hidden, residual)
-    workspace = cake_rmsnorm_train_backward_workspace(
+    workspace = cake_rmsnorm_det_train_backward_workspace(
         rows, hidden, _device(), residual=residual
     )
     reference = _backward(x, w, g, g_h, rstd, workspace)[1].clone()
@@ -271,7 +273,7 @@ MAX_ALL_SM_EXTRA_MS = 1.0
 # cudaSharedmemCarveoutMaxShared
 CARVEOUT_MAX_SHARED = 100
 # Programs that need a whole SM wait beside a kernel resident on every SM
-# whatever its carveout (documented in :mod:`flashinfer.cake_rmsnorm_train`):
+# whatever its carveout (documented in :mod:`flashinfer.cake_rmsnorm_det_train`):
 # (capability, kind, hidden) -> the token counts above which the call does.
 WHOLE_SM_ABOVE = {
     ((10, 7), "bwd", 1536): 1024,
@@ -289,9 +291,9 @@ def _skip_if_whole_sm(kind: str, hidden: int, rows: int) -> None:
         )
 
 
-_SPIN_KERNEL = "cake_rmsnorm_train_stall_spin"
+_SPIN_KERNEL = "cake_rmsnorm_det_train_stall_spin"
 _SPIN_SOURCE = r"""
-extern "C" __global__ void cake_rmsnorm_train_stall_spin(unsigned long long ns, int* smids) {
+extern "C" __global__ void cake_rmsnorm_det_train_stall_spin(unsigned long long ns, int* smids) {
     if (threadIdx.x == 0) {
         unsigned int smid;
         asm volatile("mov.u32 %0, %%smid;" : "=r"(smid));
@@ -439,7 +441,7 @@ def test_backward_starts_beside_an_all_sm_kernel_with_the_max_shared_carveout(
     _skip_unless_route(hidden, residual)
     _skip_if_whole_sm("bwd", hidden, rows)
     x, w, g, g_h, rstd = _inputs(rows, hidden, residual)
-    workspace = cake_rmsnorm_train_backward_workspace(
+    workspace = cake_rmsnorm_det_train_backward_workspace(
         rows, hidden, _device(), residual=residual
     )
 
@@ -473,7 +475,7 @@ def test_forward_starts_beside_an_all_sm_kernel_with_the_max_shared_carveout(
     x, w, _g, _g_h, _rstd = _inputs(rows, hidden, False)
 
     def call():
-        return cake_rmsnorm_train_forward(x, w, EPS[hidden])[0]
+        return cake_rmsnorm_det_train_forward(x, w, EPS[hidden])[0]
 
     alone_ms, busy_ms, alone, busy = _all_sm_medians(call, CARVEOUT_MAX_SHARED)
     print(

@@ -31,8 +31,8 @@ This suite exercises the backend package alone: it names the package once,
 through ``tests.test_helpers.cake_package``, and imports nothing else from
 flashinfer, so a build that vendors the package under another import path
 runs it unchanged after pointing that table entry at its package.  The
-``flashinfer.cake_rmsnorm_train`` facade and the ``flashinfer`` top-level
-exposure are covered by ``test_cake_rmsnorm_train_api.py``.
+``flashinfer.cake_rmsnorm_det_train`` facade and the ``flashinfer`` top-level
+exposure are covered by ``test_cake_rmsnorm_det_train_api.py``.
 """
 
 from __future__ import annotations
@@ -46,17 +46,19 @@ import torch
 
 from tests.test_helpers.cake_package import cake_package
 
-pkg = cake_package("cake_rmsnorm_train")
-cake_build = cake_package("cake_rmsnorm_train", "cake_build")
-loader = cake_package("cake_rmsnorm_train", "cake_jit")
-cake_rmsnorm = pkg.cake_rmsnorm
-cake_rmsnorm_train_backward = pkg.cake_rmsnorm_train_backward
-cake_rmsnorm_train_backward_workspace = pkg.cake_rmsnorm_train_backward_workspace
-cake_rmsnorm_train_backward_workspace_bytes = (
-    pkg.cake_rmsnorm_train_backward_workspace_bytes
+pkg = cake_package("cake_rmsnorm_det_train")
+cake_build = cake_package("cake_rmsnorm_det_train", "cake_build")
+loader = cake_package("cake_rmsnorm_det_train", "cake_jit")
+cake_rmsnorm_det = pkg.cake_rmsnorm_det
+cake_rmsnorm_det_train_backward = pkg.cake_rmsnorm_det_train_backward
+cake_rmsnorm_det_train_backward_workspace = (
+    pkg.cake_rmsnorm_det_train_backward_workspace
 )
-cake_rmsnorm_train_forward = pkg.cake_rmsnorm_train_forward
-is_cake_rmsnorm_train_supported = pkg.is_cake_rmsnorm_train_supported
+cake_rmsnorm_det_train_backward_workspace_bytes = (
+    pkg.cake_rmsnorm_det_train_backward_workspace_bytes
+)
+cake_rmsnorm_det_train_forward = pkg.cake_rmsnorm_det_train_forward
+is_cake_rmsnorm_det_train_supported = pkg.is_cake_rmsnorm_det_train_supported
 
 SUPPORTED_CAPABILITIES = ((10, 0), (10, 3), (10, 7))
 WIDTHS = ((6144, 1e-5), (4096, 1e-5), (2048, 1e-6), (1536, 1e-6), (512, 1e-6))
@@ -92,13 +94,13 @@ def _supported() -> bool:
     return (
         torch.cuda.is_available()
         and _capability() in SUPPORTED_CAPABILITIES
-        and is_cake_rmsnorm_train_supported(_device())
+        and is_cake_rmsnorm_det_train_supported(_device())
     )
 
 
 pytestmark = pytest.mark.skipif(
     not _supported(),
-    reason="cake_rmsnorm_train needs an SM100 / SM103 / SM107 device with exported routes",
+    reason="cake_rmsnorm_det_train needs an SM100 / SM103 / SM107 device with exported routes",
 )
 
 
@@ -116,7 +118,7 @@ def warmup_jit():
 
 
 def _skip_unless_hidden(hidden: int) -> None:
-    if not is_cake_rmsnorm_train_supported(_device(), hidden):
+    if not is_cake_rmsnorm_det_train_supported(_device(), hidden):
         pytest.skip(f"hidden={hidden} has no exported route on this device")
 
 
@@ -283,7 +285,7 @@ def _check_case(
     g = _rows(rows, hidden, stride_pad=g_pad, generator=generator)
     g_h = _rows(rows, hidden, generator=generator) if residual else None
 
-    outputs = cake_rmsnorm_train_forward(x, w, eps, residual=u)
+    outputs = cake_rmsnorm_det_train_forward(x, w, eps, residual=u)
     y_ref, rstd_ref, h_new_ref = _reference_forward(x, w, eps, residual=u)
     y, rstd = outputs[0], outputs[1]
     assert tuple(y.shape) == (rows, hidden) and y.is_contiguous()
@@ -302,7 +304,7 @@ def _check_case(
         assert len(outputs) == 2
         normalized = x
 
-    dx, dw = cake_rmsnorm_train_backward(g, normalized, w, rstd, g_residual=g_h)
+    dx, dw = cake_rmsnorm_det_train_backward(g, normalized, w, rstd, g_residual=g_h)
     dx_ref, dw_ref = _reference_backward(g, normalized, w, eps, g_h=g_h)
     assert tuple(dx.shape) == (rows, hidden) and dx.is_contiguous()
     _assert_bf16_close(dx, dx_ref, f"dx {label}")
@@ -371,7 +373,7 @@ def test_forward_programs_switch_on_row_count(hidden: int, residual: bool) -> No
         x = _rows(rows, hidden, generator=generator)
         w = _weight(hidden, generator)
         u = _rows(rows, hidden, generator=generator) if residual else None
-        outputs = cake_rmsnorm_train_forward(x, w, eps, residual=u)
+        outputs = cake_rmsnorm_det_train_forward(x, w, eps, residual=u)
         y_ref, rstd_ref, h_new_ref = _reference_forward(x, w, eps, residual=u)
         label = f"hidden={hidden} residual={residual} rows={rows}"
         _assert_bf16_close(outputs[0], y_ref, f"y {label}")
@@ -512,7 +514,7 @@ def test_misaligned_layouts_are_materialized(
     )
     label = f"hidden={hidden} layout={layout} residual={residual}"
 
-    outputs = cake_rmsnorm_train_forward(x, w, eps, residual=u)
+    outputs = cake_rmsnorm_det_train_forward(x, w, eps, residual=u)
     y_ref, rstd_ref, h_new_ref = _reference_forward(x, w, eps, residual=u)
     y, rstd = outputs[0], outputs[1]
     assert y.is_contiguous() and tuple(y.shape) == (rows, hidden)
@@ -522,7 +524,7 @@ def test_misaligned_layouts_are_materialized(
         assert torch.equal(outputs[2], h_new_ref), f"h_new {label}"
     # Caller-provided outputs with the same awkward layout are honoured by copy-back.
     y_user = _misaligned_rows(rows, hidden, layout, generator=generator)
-    outputs_user = cake_rmsnorm_train_forward(x, w, eps, residual=u, out=y_user)
+    outputs_user = cake_rmsnorm_det_train_forward(x, w, eps, residual=u, out=y_user)
     assert outputs_user[0] is y_user and torch.equal(y_user, y), (
         f"out copy-back {label}"
     )
@@ -530,13 +532,13 @@ def test_misaligned_layouts_are_materialized(
     # Backward: the normalized tensor, both gradients and the dx buffer are misaligned views.
     normalized = _misaligned_rows(rows, hidden, layout, generator=generator)
     normalized.copy_(outputs[2] if residual else x)
-    dx, dw = cake_rmsnorm_train_backward(g, normalized, w, rstd, g_residual=g_h)
+    dx, dw = cake_rmsnorm_det_train_backward(g, normalized, w, rstd, g_residual=g_h)
     dx_ref, dw_ref = _reference_backward(g, normalized, w, eps, g_h=g_h)
     assert dx.is_contiguous() and tuple(dx.shape) == (rows, hidden)
     _assert_bf16_close(dx, dx_ref, f"dx {label}")
     _assert_dw(dw, dw_ref, g, normalized, rstd, f"dw {label}")
     dx_user = _misaligned_rows(rows, hidden, layout, generator=generator)
-    dx_again, dw_again = cake_rmsnorm_train_backward(
+    dx_again, dw_again = cake_rmsnorm_det_train_backward(
         g, normalized, w, rstd, g_residual=g_h, dx=dx_user
     )
     assert dx_again is dx_user and torch.equal(dx_user, dx), f"dx copy-back {label}"
@@ -566,19 +568,19 @@ def test_half_vector_aligned_weight_is_materialized(hidden: int) -> None:
     assert w.is_contiguous() and w.data_ptr() % 32 == 16, "test layout"
     label = f"hidden={hidden} 16-byte aligned w"
 
-    y, rstd = cake_rmsnorm_train_forward(x, w, eps)
+    y, rstd = cake_rmsnorm_det_train_forward(x, w, eps)
     y_ref, rstd_ref, _ = _reference_forward(x, w, eps)
     _assert_bf16_close(y, y_ref, f"y {label}")
     assert _rel_l2(rstd, rstd_ref) <= RSTD_REL_L2, f"rstd {label}"
-    y_aligned, rstd_aligned = cake_rmsnorm_train_forward(x, w_aligned, eps)
+    y_aligned, rstd_aligned = cake_rmsnorm_det_train_forward(x, w_aligned, eps)
     assert torch.equal(y, y_aligned) and torch.equal(rstd, rstd_aligned), label
 
     g = _rows(rows, hidden, generator=generator)
-    dx, dw = cake_rmsnorm_train_backward(g, x, w, rstd)
+    dx, dw = cake_rmsnorm_det_train_backward(g, x, w, rstd)
     dx_ref, dw_ref = _reference_backward(g, x, w, eps)
     _assert_bf16_close(dx, dx_ref, f"dx {label}")
     _assert_dw(dw, dw_ref, g, x, rstd, f"dw {label}")
-    dx_aligned, dw_aligned = cake_rmsnorm_train_backward(g, x, w_aligned, rstd)
+    dx_aligned, dw_aligned = cake_rmsnorm_det_train_backward(g, x, w_aligned, rstd)
     assert torch.equal(dx, dx_aligned) and torch.equal(dw, dw_aligned), label
 
 
@@ -588,9 +590,9 @@ def test_zero_rows(hidden: int) -> None:
     generator = _generator(hidden, 0)
     x = torch.empty(0, hidden, dtype=torch.bfloat16, device=_device())
     w = _weight(hidden, generator)
-    y, rstd = cake_rmsnorm_train_forward(x, w, EPS[hidden])
+    y, rstd = cake_rmsnorm_det_train_forward(x, w, EPS[hidden])
     assert tuple(y.shape) == (0, hidden) and tuple(rstd.shape) == (0,)
-    dx, dw = cake_rmsnorm_train_backward(x, x, w, rstd)
+    dx, dw = cake_rmsnorm_det_train_backward(x, x, w, rstd)
     assert tuple(dx.shape) == (0, hidden)
     assert torch.equal(dw, torch.zeros_like(dw))
 
@@ -604,8 +606,8 @@ def test_deterministic_dw_is_bitwise_reproducible(hidden: int, rows: int) -> Non
     x = _rows(rows, hidden, generator=generator)
     w = _weight(hidden, generator)
     g = _rows(rows, hidden, generator=generator)
-    _y, rstd = cake_rmsnorm_train_forward(x, w, eps)
-    workspace = cake_rmsnorm_train_backward_workspace(rows, hidden, _device())
+    _y, rstd = cake_rmsnorm_det_train_forward(x, w, eps)
+    workspace = cake_rmsnorm_det_train_backward_workspace(rows, hidden, _device())
     results = []
     for _repeat in range(3):
         dx = torch.full(
@@ -616,10 +618,12 @@ def test_deterministic_dw_is_bitwise_reproducible(hidden: int, rows: int) -> Non
         # rewrite every chunk they read.
         begin = loader.COUNTERS_BYTES
         workspace[begin : begin + 4 * hidden].view(torch.float32).fill_(float("nan"))
-        cake_rmsnorm_train_backward(g, x, w, rstd, workspace=workspace, dx=dx, dw=dw)
+        cake_rmsnorm_det_train_backward(
+            g, x, w, rstd, workspace=workspace, dx=dx, dw=dw
+        )
         torch.cuda.synchronize()
         results.append((dx.clone(), dw.clone()))
-    fresh = cake_rmsnorm_train_backward(g, x, w, rstd)
+    fresh = cake_rmsnorm_det_train_backward(g, x, w, rstd)
     for dx, dw in results[1:]:
         assert torch.equal(dx, results[0][0])
         assert torch.equal(dw, results[0][1])
@@ -684,7 +688,7 @@ def test_backward_reuses_a_poisoned_workspace_across_row_counts(
     descending = sorted(rows_set, reverse=True)
     order = descending + descending[-2::-1]
     eps = EPS[hidden]
-    workspace = cake_rmsnorm_train_backward_workspace(
+    workspace = cake_rmsnorm_det_train_backward_workspace(
         max(rows_set), hidden, _device(), residual=residual
     )
     for rows in order:
@@ -695,13 +699,13 @@ def test_backward_reuses_a_poisoned_workspace_across_row_counts(
         if residual:
             u = _rows(rows, hidden, generator=generator)
             g_h = _rows(rows, hidden, generator=generator)
-            _y, rstd, normalized = cake_rmsnorm_train_forward(x, w, eps, residual=u)
+            _y, rstd, normalized = cake_rmsnorm_det_train_forward(x, w, eps, residual=u)
         else:
             g_h = None
-            _y, rstd = cake_rmsnorm_train_forward(x, w, eps)
+            _y, rstd = cake_rmsnorm_det_train_forward(x, w, eps)
             normalized = x
         workspace[loader.COUNTERS_BYTES :].view(torch.float32).fill_(float("nan"))
-        dx, dw = cake_rmsnorm_train_backward(
+        dx, dw = cake_rmsnorm_det_train_backward(
             g, normalized, w, rstd, g_residual=g_h, workspace=workspace
         )
         dx_ref, dw_ref = _reference_backward(g, normalized, w, eps, g_h=g_h)
@@ -723,8 +727,8 @@ def test_changing_rows_in_one_process_does_not_rebuild(hidden: int) -> None:
     for rows in (1, 65, 16172, 7, 16231, 255):
         x = _rows(rows, hidden, generator=generator)
         g = _rows(rows, hidden, generator=generator)
-        y, rstd = cake_rmsnorm_train_forward(x, w, eps)
-        dx, dw = cake_rmsnorm_train_backward(g, x, w, rstd)
+        y, rstd = cake_rmsnorm_det_train_forward(x, w, eps)
+        dx, dw = cake_rmsnorm_det_train_backward(g, x, w, rstd)
         y_ref, rstd_ref, _ = _reference_forward(x, w, eps)
         dx_ref, dw_ref = _reference_backward(g, x, w, eps)
         _assert_bf16_close(y, y_ref, f"y rows={rows}")
@@ -748,8 +752,8 @@ def test_backward_accepts_gradient_views(hidden: int, view: str) -> None:
         g = _rows(1, hidden, generator=generator).expand(rows, hidden)
     else:
         g = _rows(rows, hidden, stride_pad="2H", generator=generator)
-    _y, rstd = cake_rmsnorm_train_forward(x, w, eps)
-    dx, dw = cake_rmsnorm_train_backward(g, x, w, rstd)
+    _y, rstd = cake_rmsnorm_det_train_forward(x, w, eps)
+    dx, dw = cake_rmsnorm_det_train_backward(g, x, w, rstd)
     dx_ref, dw_ref = _reference_backward(g, x, w, eps)
     _assert_bf16_close(dx, dx_ref, f"dx view={view}")
     _assert_dw(dw, dw_ref, g, x, rstd, f"dw view={view}")
@@ -800,7 +804,7 @@ def test_autograd_end_to_end(hidden: int, residual: bool, rows: int) -> None:
     x = x0.detach().clone().requires_grad_(True)
     w = w0.detach().clone().requires_grad_(True)
     u = u0.detach().clone().requires_grad_(True) if residual else None
-    outputs = cake_rmsnorm(x, w, eps, residual=u)
+    outputs = cake_rmsnorm_det(x, w, eps, residual=u)
     if residual:
         y, h_new = outputs
         torch.autograd.backward([y, h_new], [grad_y, grad_h])
@@ -825,16 +829,16 @@ def test_autograd_end_to_end(hidden: int, residual: bool, rows: int) -> None:
 @pytest.mark.parametrize("hidden", HIDDEN_SIZES)
 def test_workspace_bytes_and_layout(hidden: int) -> None:
     _skip_unless_hidden(hidden)
-    small = cake_rmsnorm_train_backward_workspace_bytes(1, hidden, _device())
-    middle = cake_rmsnorm_train_backward_workspace_bytes(129, hidden, _device())
-    large = cake_rmsnorm_train_backward_workspace_bytes(65536, hidden, _device())
+    small = cake_rmsnorm_det_train_backward_workspace_bytes(1, hidden, _device())
+    middle = cake_rmsnorm_det_train_backward_workspace_bytes(129, hidden, _device())
+    large = cake_rmsnorm_det_train_backward_workspace_bytes(65536, hidden, _device())
     assert small > 0 and small % 256 == 0 and large % 256 == 0
     assert small <= middle <= large
-    workspace = cake_rmsnorm_train_backward_workspace(65536, hidden, _device())
+    workspace = cake_rmsnorm_det_train_backward_workspace(65536, hidden, _device())
     assert workspace.dtype == torch.uint8 and workspace.numel() == large
     assert torch.count_nonzero(workspace) == 0
     with pytest.raises(ValueError):
-        cake_rmsnorm_train_backward_workspace_bytes(-1, hidden, _device())
+        cake_rmsnorm_det_train_backward_workspace_bytes(-1, hidden, _device())
 
 
 @pytest.mark.parametrize("hidden", HIDDEN_SIZES)
@@ -845,28 +849,28 @@ def test_argument_validation(hidden: int) -> None:
     x = _rows(8, hidden, generator=generator)
     w = _weight(hidden, generator)
     with pytest.raises(ValueError):
-        cake_rmsnorm_train_forward(x.float(), w, eps)
+        cake_rmsnorm_det_train_forward(x.float(), w, eps)
     with pytest.raises(ValueError):
-        cake_rmsnorm_train_forward(x, w.float(), eps)
+        cake_rmsnorm_det_train_forward(x, w.float(), eps)
     with pytest.raises(ValueError):
-        cake_rmsnorm_train_forward(x[:, 1:], w[1:], eps)
+        cake_rmsnorm_det_train_forward(x[:, 1:], w[1:], eps)
     # An odd row stride is accepted (materialized once), not rejected.
     odd = _rows(8, hidden, stride_pad=8, generator=generator)
     odd_view = odd.as_strided((8, hidden), (hidden + 4, 1))
-    y_odd, _rstd_odd = cake_rmsnorm_train_forward(odd_view, w, eps)
+    y_odd, _rstd_odd = cake_rmsnorm_det_train_forward(odd_view, w, eps)
     y_odd_ref, _, _ = _reference_forward(odd_view, w, eps)
     _assert_bf16_close(y_odd, y_odd_ref, "y odd row stride")
-    y, rstd = cake_rmsnorm_train_forward(x, w, eps)
+    y, rstd = cake_rmsnorm_det_train_forward(x, w, eps)
     with pytest.raises(ValueError):
-        cake_rmsnorm_train_backward(y, x, w, rstd, deterministic=False)
+        cake_rmsnorm_det_train_backward(y, x, w, rstd, deterministic=False)
     with pytest.raises(ValueError):
-        cake_rmsnorm_train_backward(y, x, w, rstd.double())
+        cake_rmsnorm_det_train_backward(y, x, w, rstd.double())
     tiny = torch.zeros(256, dtype=torch.uint8, device=_device())
     with pytest.raises(ValueError):
-        cake_rmsnorm_train_backward(y, x, w, rstd, workspace=tiny)
+        cake_rmsnorm_det_train_backward(y, x, w, rstd, workspace=tiny)
     cpu = torch.zeros(8, hidden, dtype=torch.bfloat16)
     with pytest.raises(ValueError):
-        cake_rmsnorm_train_forward(cpu, w.cpu(), eps)
+        cake_rmsnorm_det_train_forward(cpu, w.cpu(), eps)
 
 
 def test_registry_records_reference_the_build_manifest() -> None:

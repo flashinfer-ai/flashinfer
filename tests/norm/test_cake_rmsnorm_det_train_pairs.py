@@ -30,8 +30,8 @@ import torch
 
 from tests.test_helpers.cake_package import cake_package
 
-pkg = cake_package("cake_rmsnorm_train")
-loader = cake_package("cake_rmsnorm_train", "cake_jit")
+pkg = cake_package("cake_rmsnorm_det_train")
+loader = cake_package("cake_rmsnorm_det_train", "cake_jit")
 
 SUPPORTED_CAPABILITIES = ((10, 0), (10, 3), (10, 7))
 HIDDEN_SIZES = (6144, 4096, 2048, 1536, 512)
@@ -385,7 +385,7 @@ def _supported() -> bool:
     return (
         torch.cuda.is_available()
         and torch.cuda.get_device_capability(_device()) in SUPPORTED_CAPABILITIES
-        and pkg.is_cake_rmsnorm_train_supported(_device())
+        and pkg.is_cake_rmsnorm_det_train_supported(_device())
     )
 
 
@@ -395,11 +395,11 @@ def _supported() -> bool:
 )
 @pytest.mark.parametrize("hidden", HIDDEN_SIZES)
 def test_workspace_puts_the_counters_first_and_grows_with_the_rows(hidden: int) -> None:
-    if not pkg.is_cake_rmsnorm_train_supported(_device(), hidden):
+    if not pkg.is_cake_rmsnorm_det_train_supported(_device(), hidden):
         pytest.skip(f"hidden={hidden} has no exported route on this device")
     device = _device()
     sizes = [
-        pkg.cake_rmsnorm_train_backward_workspace_bytes(rows, hidden, device)
+        pkg.cake_rmsnorm_det_train_backward_workspace_bytes(rows, hidden, device)
         for rows in (1, 129, 4096, 16384, 65536)
     ]
     assert sizes == sorted(sizes) and all(size % 256 == 0 for size in sizes)
@@ -452,6 +452,6 @@ def test_workspace_puts_the_counters_first_and_grows_with_the_rows(hidden: int) 
             loader.launch_grid(stripped, 4096, device_index=0)
         with pytest.raises(ValueError, match="tail_div"):
             loader.workspace_layout(stripped, 4096, device_index=0)
-    workspace = pkg.cake_rmsnorm_train_backward_workspace(65536, hidden, device)
+    workspace = pkg.cake_rmsnorm_det_train_backward_workspace(65536, hidden, device)
     assert workspace.dtype == torch.uint8 and workspace.numel() == sizes[-1]
     assert torch.count_nonzero(workspace[: loader.COUNTERS_BYTES]) == 0

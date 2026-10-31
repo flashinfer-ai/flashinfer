@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 Tests of the Cake SiLU-gated RMSNorm training forward / backward
-(:mod:`flashinfer.cake_rmsnorm_silu_gate_train`): ``RMSNorm(x) * w * SiLU(z)``
+(:mod:`flashinfer.cake_rmsnorm_silu_gate_det_train`): ``RMSNorm(x) * w * SiLU(z)``
 against the eager FP32 operation (one final BF16 cast) and an independent
 FP64 reference, over dynamic token and head counts, irregular tails, strided
 layouts, near-zero variance, saturated gates, gradient accumulation,
@@ -23,9 +23,9 @@ gradient.
 
 This suite exercises the backend package alone: it names the package once,
 through ``tests.test_helpers.cake_package``, and imports nothing else from
-flashinfer.  The ``flashinfer.cake_rmsnorm_silu_gate_train`` facade and the
+flashinfer.  The ``flashinfer.cake_rmsnorm_silu_gate_det_train`` facade and the
 ``flashinfer`` top-level exposure are covered by
-``test_cake_rmsnorm_silu_gate_train_api.py``.
+``test_cake_rmsnorm_silu_gate_det_train_api.py``.
 """
 
 from pathlib import Path
@@ -36,20 +36,22 @@ import torch.utils.checkpoint
 
 from tests.test_helpers.cake_package import cake_package
 
-pkg = cake_package("cake_rmsnorm_silu_gate_train")
-cake_build = cake_package("cake_rmsnorm_silu_gate_train", "cake_build")
-loader = cake_package("cake_rmsnorm_silu_gate_train", "cake_jit")
-cake_rmsnorm_silu_gate = pkg.cake_rmsnorm_silu_gate
-cake_rmsnorm_silu_gate_train_backward = pkg.cake_rmsnorm_silu_gate_train_backward
-cake_rmsnorm_silu_gate_train_backward_workspace = (
-    pkg.cake_rmsnorm_silu_gate_train_backward_workspace
+pkg = cake_package("cake_rmsnorm_silu_gate_det_train")
+cake_build = cake_package("cake_rmsnorm_silu_gate_det_train", "cake_build")
+loader = cake_package("cake_rmsnorm_silu_gate_det_train", "cake_jit")
+cake_rmsnorm_silu_gate_det = pkg.cake_rmsnorm_silu_gate_det
+cake_rmsnorm_silu_gate_det_train_backward = (
+    pkg.cake_rmsnorm_silu_gate_det_train_backward
 )
-cake_rmsnorm_silu_gate_train_backward_workspace_bytes = (
-    pkg.cake_rmsnorm_silu_gate_train_backward_workspace_bytes
+cake_rmsnorm_silu_gate_det_train_backward_workspace = (
+    pkg.cake_rmsnorm_silu_gate_det_train_backward_workspace
 )
-cake_rmsnorm_silu_gate_train_forward = pkg.cake_rmsnorm_silu_gate_train_forward
-is_cake_rmsnorm_silu_gate_train_supported = (
-    pkg.is_cake_rmsnorm_silu_gate_train_supported
+cake_rmsnorm_silu_gate_det_train_backward_workspace_bytes = (
+    pkg.cake_rmsnorm_silu_gate_det_train_backward_workspace_bytes
+)
+cake_rmsnorm_silu_gate_det_train_forward = pkg.cake_rmsnorm_silu_gate_det_train_forward
+is_cake_rmsnorm_silu_gate_det_train_supported = (
+    pkg.is_cake_rmsnorm_silu_gate_det_train_supported
 )
 
 D = 128
@@ -59,7 +61,7 @@ BF16_RTOL = 2.0**-7
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available()
-    or not is_cake_rmsnorm_silu_gate_train_supported(torch.device("cuda")),
+    or not is_cake_rmsnorm_silu_gate_det_train_supported(torch.device("cuda")),
     reason="Cake SiLU-gated RMSNorm training needs an SM100 / SM103 / SM107 GPU",
 )
 
@@ -158,8 +160,8 @@ def eager_grads(dy, x, z, w, eps):
 
 
 def check_all(x, z, w, dy, eps):
-    y = cake_rmsnorm_silu_gate_train_forward(x, z, w, eps)
-    dx, dz, dw = cake_rmsnorm_silu_gate_train_backward(dy, x, z, w, eps)
+    y = cake_rmsnorm_silu_gate_det_train_forward(x, z, w, eps)
+    dx, dz, dw = cake_rmsnorm_silu_gate_det_train_backward(dy, x, z, w, eps)
     assert y.dtype == dx.dtype == dz.dtype == dw.dtype == torch.bfloat16
     assert y.shape == dx.shape == dz.shape == x.shape and dw.shape == (D,)
     y64, dx64, dz64, dw64 = fp64_reference(dy, x, z, w, eps)
@@ -229,15 +231,15 @@ def test_issue_shapes(T):
 
 def test_weight_gradient_is_deterministic():
     x, z, w, dy = make(32737, 48, seed=5)
-    first = cake_rmsnorm_silu_gate_train_backward(dy, x, z, w, EPS)[2]
+    first = cake_rmsnorm_silu_gate_det_train_backward(dy, x, z, w, EPS)[2]
     for _ in range(5):
-        again = cake_rmsnorm_silu_gate_train_backward(dy, x, z, w, EPS)[2]
+        again = cake_rmsnorm_silu_gate_det_train_backward(dy, x, z, w, EPS)[2]
         assert torch.equal(first.view(torch.int16), again.view(torch.int16))
     fp32 = torch.empty(D, dtype=torch.float32, device="cuda")
-    cake_rmsnorm_silu_gate_train_backward(dy, x, z, w, EPS, grad_weight=fp32)
+    cake_rmsnorm_silu_gate_det_train_backward(dy, x, z, w, EPS, grad_weight=fp32)
     for _ in range(3):
         again = torch.empty_like(fp32)
-        cake_rmsnorm_silu_gate_train_backward(dy, x, z, w, EPS, grad_weight=again)
+        cake_rmsnorm_silu_gate_det_train_backward(dy, x, z, w, EPS, grad_weight=again)
         assert torch.equal(fp32.view(torch.int32), again.view(torch.int32))
 
 
@@ -247,10 +249,10 @@ def test_weight_gradient_accumulation():
     _, _, _, dw64 = fp64_reference(dy, x, z, w, EPS)
     _, _, _, dw64b = fp64_reference(dy2, x2, z2, w, EPS)
     main = torch.full((D,), 0.25, dtype=torch.float32, device="cuda")
-    cake_rmsnorm_silu_gate_train_backward(
+    cake_rmsnorm_silu_gate_det_train_backward(
         dy, x, z, w, EPS, grad_weight=main, accumulate_grad_weight=True
     )
-    cake_rmsnorm_silu_gate_train_backward(
+    cake_rmsnorm_silu_gate_det_train_backward(
         dy2, x2, z2, w, EPS, grad_weight=main, accumulate_grad_weight=True
     )
     want = 0.25 + dw64 + dw64b
@@ -259,9 +261,9 @@ def test_weight_gradient_accumulation():
     xa = x.clone().requires_grad_(True)
     wa = w.clone().requires_grad_(True)
     za = z.clone().requires_grad_(True)
-    cake_rmsnorm_silu_gate(xa, za, wa, EPS).backward(dy)
-    cake_rmsnorm_silu_gate(xa, za, wa, EPS).backward(dy)
-    single = cake_rmsnorm_silu_gate_train_backward(dy, x, z, w, EPS)
+    cake_rmsnorm_silu_gate_det(xa, za, wa, EPS).backward(dy)
+    cake_rmsnorm_silu_gate_det(xa, za, wa, EPS).backward(dy)
+    single = cake_rmsnorm_silu_gate_det_train_backward(dy, x, z, w, EPS)
     assert torch.equal(xa.grad, single[0] + single[0])
     assert torch.equal(za.grad, single[1] + single[1])
     assert torch.equal(wa.grad, single[2] + single[2])
@@ -270,10 +272,10 @@ def test_weight_gradient_accumulation():
 def test_autograd_matches_functional_and_checkpoint():
     x, z, w, dy = make(513, 48, seed=8)
     xa, za, wa = (t.clone().requires_grad_(True) for t in (x, z, w))
-    y = cake_rmsnorm_silu_gate(xa, za, wa, EPS)
+    y = cake_rmsnorm_silu_gate_det(xa, za, wa, EPS)
     y.backward(dy)
-    y_ref = cake_rmsnorm_silu_gate_train_forward(x, z, w, EPS)
-    dx, dz, dw = cake_rmsnorm_silu_gate_train_backward(dy, x, z, w, EPS)
+    y_ref = cake_rmsnorm_silu_gate_det_train_forward(x, z, w, EPS)
+    dx, dz, dw = cake_rmsnorm_silu_gate_det_train_backward(dy, x, z, w, EPS)
     assert torch.equal(y, y_ref)
     assert (
         torch.equal(xa.grad, dx)
@@ -290,7 +292,7 @@ def test_autograd_matches_functional_and_checkpoint():
 
     xb, zb, wb = (t.clone().requires_grad_(True) for t in (x, z, w))
     with torch.autograd.graph.saved_tensors_hooks(pack, lambda t: t):
-        cake_rmsnorm_silu_gate(xb, zb, wb, EPS)
+        cake_rmsnorm_silu_gate_det(xb, zb, wb, EPS)
     assert sorted(saved) == sorted(
         [
             (torch.bfloat16, x.numel(), xb.data_ptr()),
@@ -302,7 +304,7 @@ def test_autograd_matches_functional_and_checkpoint():
     # Non-reentrant activation checkpointing replays the forward in the backward.
     xc, zc, wc = (t.clone().requires_grad_(True) for t in (x, z, w))
     yc = torch.utils.checkpoint.checkpoint(
-        cake_rmsnorm_silu_gate, xc, zc, wc, EPS, use_reentrant=False
+        cake_rmsnorm_silu_gate_det, xc, zc, wc, EPS, use_reentrant=False
     )
     yc.backward(dy)
     assert torch.equal(yc, y_ref)
@@ -315,12 +317,12 @@ def test_autograd_matches_functional_and_checkpoint():
 
 def test_side_stream_and_no_host_sync():
     x, z, w, dy = make(2049, 48, seed=9)
-    want_y = cake_rmsnorm_silu_gate_train_forward(x, z, w, EPS)
-    want = cake_rmsnorm_silu_gate_train_backward(dy, x, z, w, EPS)
-    ws = cake_rmsnorm_silu_gate_train_backward_workspace(
+    want_y = cake_rmsnorm_silu_gate_det_train_forward(x, z, w, EPS)
+    want = cake_rmsnorm_silu_gate_det_train_backward(dy, x, z, w, EPS)
+    ws = cake_rmsnorm_silu_gate_det_train_backward_workspace(
         x.shape[0] * x.shape[1], x.device
     )
-    assert ws.numel() * 4 == cake_rmsnorm_silu_gate_train_backward_workspace_bytes(
+    assert ws.numel() * 4 == cake_rmsnorm_silu_gate_det_train_backward_workspace_bytes(
         x.shape[0] * x.shape[1], x.device
     )
     stream = torch.cuda.Stream()
@@ -328,8 +330,10 @@ def test_side_stream_and_no_host_sync():
     torch.cuda.set_sync_debug_mode("error")
     try:
         with torch.cuda.stream(stream):
-            y = cake_rmsnorm_silu_gate_train_forward(x, z, w, EPS)
-            got = cake_rmsnorm_silu_gate_train_backward(dy, x, z, w, EPS, workspace=ws)
+            y = cake_rmsnorm_silu_gate_det_train_forward(x, z, w, EPS)
+            got = cake_rmsnorm_silu_gate_det_train_backward(
+                dy, x, z, w, EPS, workspace=ws
+            )
     finally:
         torch.cuda.set_sync_debug_mode("default")
     torch.cuda.current_stream().wait_stream(stream)
@@ -340,16 +344,16 @@ def test_side_stream_and_no_host_sync():
 
 def test_cuda_graph_capture():
     x, z, w, dy = make(300, 48, seed=10)
-    want_y = cake_rmsnorm_silu_gate_train_forward(x, z, w, EPS)
-    want = cake_rmsnorm_silu_gate_train_backward(dy, x, z, w, EPS)
+    want_y = cake_rmsnorm_silu_gate_det_train_forward(x, z, w, EPS)
+    want = cake_rmsnorm_silu_gate_det_train_backward(dy, x, z, w, EPS)
     y = torch.empty_like(x)
     dx, dz = torch.empty_like(x), torch.empty_like(x)
     dw = torch.empty(D, dtype=torch.bfloat16, device="cuda")
-    ws = cake_rmsnorm_silu_gate_train_backward_workspace(300 * 48, x.device)
+    ws = cake_rmsnorm_silu_gate_det_train_backward_workspace(300 * 48, x.device)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        cake_rmsnorm_silu_gate_train_forward(x, z, w, EPS, out=y)
-        cake_rmsnorm_silu_gate_train_backward(
+        cake_rmsnorm_silu_gate_det_train_forward(x, z, w, EPS, out=y)
+        cake_rmsnorm_silu_gate_det_train_backward(
             dy, x, z, w, EPS, grad_x=dx, grad_z=dz, grad_weight=dw, workspace=ws
         )
     graph.replay()
@@ -365,22 +369,22 @@ def test_cuda_graph_capture():
 def test_empty_and_errors():
     x = torch.empty(0, 48, D, dtype=torch.bfloat16, device="cuda")
     w = torch.ones(D, dtype=torch.bfloat16, device="cuda")
-    assert cake_rmsnorm_silu_gate_train_forward(x, x, w).shape == x.shape
-    dx, dz, dw = cake_rmsnorm_silu_gate_train_backward(x, x, x, w)
+    assert cake_rmsnorm_silu_gate_det_train_forward(x, x, w).shape == x.shape
+    dx, dz, dw = cake_rmsnorm_silu_gate_det_train_backward(x, x, x, w)
     assert dx.shape == x.shape and torch.equal(dw, torch.zeros_like(dw))
     good = torch.randn(4, 2, D, device="cuda").bfloat16()
     with pytest.raises(ValueError):
-        cake_rmsnorm_silu_gate_train_forward(good.float(), good, w)
+        cake_rmsnorm_silu_gate_det_train_forward(good.float(), good, w)
     with pytest.raises(ValueError):
-        cake_rmsnorm_silu_gate_train_forward(good, good[:, :1], w)
+        cake_rmsnorm_silu_gate_det_train_forward(good, good[:, :1], w)
     with pytest.raises(ValueError):
-        cake_rmsnorm_silu_gate_train_forward(
+        cake_rmsnorm_silu_gate_det_train_forward(
             torch.randn(4, 64, device="cuda").bfloat16(),
             torch.randn(4, 64, device="cuda").bfloat16(),
             w[:64],
         )
     with pytest.raises(ValueError):
-        cake_rmsnorm_silu_gate_train_backward(
+        cake_rmsnorm_silu_gate_det_train_backward(
             good, good, good, w, accumulate_grad_weight=True
         )
 
@@ -391,7 +395,7 @@ def test_registry_records_reference_the_build_manifest():
     package's kernel and binding sources and the precise-arithmetic flags."""
     manifest = cake_build.manifest()
     assert manifest["schema"] == "cake-build/1"
-    assert manifest["package"] == "flashinfer.cake_rmsnorm_silu_gate_train_backend"
+    assert manifest["package"] == "flashinfer.cake_rmsnorm_silu_gate_det_train_backend"
     libraries = cake_build.libraries_by_name()
     package = Path(cake_build.__file__).parent
     for arch in loader.ARCHES:
