@@ -285,3 +285,24 @@ Until then the C++ stays as-is and the DSL kernel lives beside it.
   hot; 64x256 gen.qkv 4096 139.10 -> 135.95 (C++ 139.10).  Five-round H100 table: 17 of
   18 rows DSL ahead (-0.1 to -4.8%), mlp.down 8192 +1.1% (a long row that swings with the
   node's thermals: -3.4 / +0.8 / +1.3 / +1.1 across runs; being re-measured).
+- Sat 31 Oct 2026, 10:00-11:30: Hopper epilogue fixed cost.  K sweeps of the cooperative
+  128x256 tile (M=8192 N=5120): slope equal or better, intercept +3.5 us (+6.7% at K=320),
+  i.e. ~0.36 us per tile.  Cause: two epilogue staging buffers made the storing warp wait
+  for every outstanding TMA store before each subtile's barrier, so the previous store's
+  smem read sat on the critical path eight times per tile.  Three buffers (wait for all
+  but the newest) where they do not cost a mainloop stage: K=320 +6.7% -> +0.2%, K=5120
+  +3.1% -> +0.8% cold / -0.7% hot.  The 64x256 tile keeps two (a third dropped it from 6
+  to 5 mainloop stages and lost more than it gained).  K sweeps of every tile the bench
+  uses are now at or under parity at K=5120: 64x128 -2.3%, 64x256 -0.0%, 128x192 -0.1%,
+  128x256 -1.0% (M=1024 N=6400) / +0.8% (M=8192 N=5120).
+  Final five-round H100 table (h23): 15 of 18 rows under parity, -0.2 to -9.4%; und.q
+  8192 +0.6, gen.qkv 8192 +1.6, gate_up 1024 +3.5 in that run, but the node's 8192 rows
+  swing 30% between runs (gen.qkv 8192 C++ 282 then 331 us) and gate_up 1024 came back
+  -0.5% on a seven-round rerun.  Under ncu locked clocks (both kernels identical
+  conditions): und.q 8192 -0.3%, gen.qkv 8192 -0.4%, gate_up 8192 -0.2%, mlp.down 8192
+  +0.3%, gate_up 1024 -0.1%.  GB200 three-round table: 16 of 18 under parity; the two
+  8192 rows throttle in the bench (+1.4 / +2.4) and were -0.2 / -0.4% at locked clocks
+  earlier.  Plot: scratchpad w8a16_parity.png.  B200 lease w8a16-b13 still queued (its
+  last table predates today's fixes).  Open: remove the W8A16_DSL_KSPLIT, W8A16_DSL_FRAG,
+  W8A16_DSL_AIN_SMEM and W8A16_DSL_FIXUP_CUT knobs before the PR; swap the public op to
+  the DSL; tests and docs.
