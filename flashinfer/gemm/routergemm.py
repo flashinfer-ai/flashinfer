@@ -1027,7 +1027,10 @@ class _Tcgen05Window(NamedTuple):
 # 6784 and up to 7167 output features at inputs of 2112 to 2304 that are a multiple of
 # 64, 6 and 7 rows at 4096 output features and an input of 2048, and 8 rows above 6784
 # and up to 7056 output features at the inputs of 7169 to 8184 that are not a multiple
-# of 64.  On sm_100a, after the windows above, PACKED_BOX8 and PACKED_M64_N8 first
+# of 64.  Then PACKED serves 9 to 16 rows without a bias at 4097 to 16384 output
+# features and inputs of 1024 to 16384, also where its grid takes more than one wave,
+# except above 6784 output features at inputs above 12288, where PACKED_M64_N16 serves
+# them.  On sm_100a, after the windows above, PACKED_BOX8 and PACKED_M64_N8 first
 # serve rows without a bias in windows from 3584 output features and an input of 2048.
 # At 8192 output features and inputs of 2048 to 8192, PACKED_M64_N8 serves 1 to 8 rows
 # when the input is a multiple of 64 and PACKED_BOX8 serves the other inputs.
@@ -1477,6 +1480,9 @@ _SM107 = (
     ),
     _Tcgen05Window("PACKED_M64_N8", 6, 7, False, 4096, 4096, 2048, 2048),
     _Tcgen05Window("PACKED_M64_N8", 8, 8, False, 6785, 7056, 7169, 8184),
+    _Tcgen05Window("PACKED", 9, 16, False, 4097, 6784, 1024, 16384),
+    _Tcgen05Window("PACKED", 9, 16, False, 6785, 16384, 1024, 12288),
+    _Tcgen05Window("PACKED_M64_N16", 9, 16, False, 6785, 16384, 12289, 16384),
     _Tcgen05Window("PACKED", 9, 16, True, 3584, 4096, 2112, 6144),
     *_SM107_SMALL_ACTIVATIONS,
     *_many_rows_nobias(1728),
