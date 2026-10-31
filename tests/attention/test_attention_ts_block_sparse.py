@@ -2825,6 +2825,8 @@ def test_gqa_runtime_uses_distinct_q_and_kv_head_shapes() -> None:
         row_route_offsets=torch.zeros(2, dtype=torch.int32),
         route_workspace=torch.zeros(4, dtype=torch.int32),
         page_size=None,
+        sm_scale=1.0 / math.sqrt(_HEAD_DIM),
+        output_scale=1.0,
     )
     q = torch.empty((1, 8, 8, _HEAD_DIM), dtype=torch.float16)
     k = torch.empty((1, 64, 1, _HEAD_DIM), dtype=torch.float16)
@@ -2950,6 +2952,7 @@ def test_contiguous_launch_forwards_the_exact_compiled_adapter_abi() -> None:
             None,  # v_scale
             None,  # v_mean
             1.25,
+            1.0,
         )
     ]
 
@@ -3021,6 +3024,7 @@ def test_paged_launch_forwards_caller_live_lengths_to_attention() -> None:
             19,
             23,
             1.25,
+            1.0,
         )
     ]
 

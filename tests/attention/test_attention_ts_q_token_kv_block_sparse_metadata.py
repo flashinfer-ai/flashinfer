@@ -371,6 +371,8 @@ def test_q_token_kv_block_sparse_wrapper_matches_plan_run_grammar() -> None:
         "q_dtype",
         "kv_dtype",
         "out_dtype",
+        "sm_scale",
+        "v_scale",
     )
     run_parameters = inspect.signature(QTokenKvBlockSparsePagedTSWrapper.run).parameters
     assert tuple(run_parameters) == (

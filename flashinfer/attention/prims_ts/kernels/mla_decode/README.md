@@ -17,10 +17,18 @@ upstream. K/V use one shared latent head; output has 512 channels.
 These are architectural/model recipes; the API takes capability and format
 parameters. NVFP4 has embedded block16 E4M3 scales and no global storage scale.
 Only the primary pool may use per-tensor FP8 in a mixed recipe. Its
-`kv_cache_scale` is a positive Python number passed as a runtime FP32 kernel
-argument, as are `softmax_scale` and `output_scale`. Scale values do not create
-JIT variants. CUDA graphs capture these values; use graph parameter updates or
-recapture when changing them for replay.
+`kv_cache_scale`, `softmax_scale`, and `output_scale` independently accept a
+positive finite Python number or a contiguous CUDA FP32 tensor of shape `(1,)`.
+`kv_cache_scale` describes the per-tensor FP8 primary storage, while the other
+two multiply QK logits and the complete attention output. Other primary formats
+require the identity storage descale and do not accept a device `kv_cache_scale`.
+Dense MLA exposes the two attention multipliers with the same type contract.
+Plan defaults infer each type; omitted run operands inherit those defaults and
+overrides must keep their planned types. Types create JIT variants, while values
+and addresses do not. CUDA graphs retain float values and tensor addresses;
+updating device contents in place preserves dynamic scale changes on replay.
+See [global scale operands](../../README.md#global-scale-operands) for validation
+and storage lifetimes.
 D512 includes rotated channels in the ordinary 512-channel storage; D576 has a
 separate QK-only 64-channel RoPE tail. Record diagrams and scale-byte ordering
 are documented in [helpers/nvfp4_kv.py](helpers/nvfp4_kv.py).
@@ -43,8 +51,8 @@ formats, narrower heads, extra pools and sinks retain their qualified paths.
 Sparse public LSE is natural-log; dense optional final LSE is base 2. Split
 scratch stays base 2 until the final store. An empty sparse row writes zero output and negative-infinity LSE. Native
 cache pools accept flat `[rows,D]` storage as well as paged views; indices always
-include each pool's physical row stride. Scale arguments remain host-runtime
-values with the same graph-capture semantics on both schedules.
+include each pool's physical row stride. Both MLA schedules support independent
+float/device global operands with the same graph-capture semantics.
 An omitted `softmax_scale` uses `1/sqrt(D)` for query width D on every cache
 format. Supply the model's effective attention/Q/K scale explicitly when its
 normalization dimension differs from the absorbed query width.
