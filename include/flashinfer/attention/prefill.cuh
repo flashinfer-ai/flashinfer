@@ -4491,6 +4491,14 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
       [[maybe_unused]] size_t thr_local_kv_offset_v[KTraits::USE_KV_SHARED_SMEM || SAME_KV_STRIDES
                                                         ? 1
                                                         : NUM_PAGED_KV_OFFSETS];
+      // FP8 KV with the 16-row query tile (tensor-core decode, short-query prefill): the next
+      // tile's page ids are loaded at the top of the iteration but turned into offsets only right
+      // before page_produce_kv, so the page-table load overlaps Q*K^T instead of stalling the warp.
+      // Larger query tiles are compute-bound and spill more with the extra live values; 16-bit KV
+      // is bandwidth-bound and its lower register count can move it to 3 CTAs/SM on B200, which the
+      // planner's 2-CTA/SM grid does not account for.
+      constexpr bool kDeferPageOffset = sizeof(DTypeKV) == 1 && !is_fp4_type_v<DTypeKV> &&
+                                        CTA_TILE_Q == 16 && !KTraits::USE_KV_SHARED_SMEM;
 
       uint32_t k_smem_offset_r = k_smem.template get_permuted_offset<UPCAST_STRIDE_K>(
                    get_warp_idx_kv<KTraits>(tid.z) * NUM_MMA_KV * 16 + 8 * (lane_idx / 16) +
@@ -4655,6 +4663,8 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
                 : 0;
         const uint32_t next_packed_page_iter_base =
             packed_page_iter_base + (1 + prefetch_skip_step) * CTA_TILE_KV;
+        [[maybe_unused]] IdType thr_page_id[kDeferPageOffset ? NUM_PAGED_KV_OFFSETS : 1];
+        [[maybe_unused]] uint32_t thr_entry_idx[kDeferPageOffset ? NUM_PAGED_KV_OFFSETS : 1];
         if constexpr (!KTraits::USE_KV_SHARED_SMEM) {
           packed_page_iter_base = next_packed_page_iter_base;
 #pragma unroll
@@ -4670,11 +4680,18 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
             constexpr uint32_t fp4_pack_factor = is_fp4_type_v<DTypeKV> ? 2 : 1;
             const uint32_t feat_idx =
                 (lane_idx % KV_THR_LAYOUT_COL) * upcast_size<DTypeKV>() / fp4_pack_factor;
-            thr_local_kv_offset_k[i] = paged_kv.protective_get_k_offset(
-                page_iter, kv_head_idx, entry_idx, feat_idx, last_indptr);
-            if constexpr (!SAME_KV_STRIDES) {
-              thr_local_kv_offset_v[i] = paged_kv.protective_get_v_offset(
+            if constexpr (kDeferPageOffset) {
+              // Rows past the last page are masked by kv_len in page_produce_kv, so page 0 only
+              // has to give an in-bounds address.
+              thr_page_id[i] = page_iter < last_indptr ? __ldg(paged_kv.indices + page_iter) : 0;
+              thr_entry_idx[i] = entry_idx;
+            } else {
+              thr_local_kv_offset_k[i] = paged_kv.protective_get_k_offset(
                   page_iter, kv_head_idx, entry_idx, feat_idx, last_indptr);
+              if constexpr (!SAME_KV_STRIDES) {
+                thr_local_kv_offset_v[i] = paged_kv.protective_get_v_offset(
+                    page_iter, kv_head_idx, entry_idx, feat_idx, last_indptr);
+              }
             }
           }
         }
@@ -4794,6 +4811,18 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
           cp_async::commit_group();
           cp_async::wait_group<0>();
         } else {
+          if constexpr (kDeferPageOffset) {
+            const uint32_t feat_idx = (lane_idx % KV_THR_LAYOUT_COL) * upcast_size<DTypeKV>();
+#pragma unroll
+            for (uint32_t i = 0; i < NUM_PAGED_KV_OFFSETS; ++i) {
+              thr_local_kv_offset_k[i] =
+                  paged_kv.get_elem_offset(thr_page_id[i], kv_head_idx, thr_entry_idx[i], feat_idx);
+              if constexpr (!SAME_KV_STRIDES) {
+                thr_local_kv_offset_v[i] = paged_kv.get_v_elem_offset(thr_page_id[i], kv_head_idx,
+                                                                      thr_entry_idx[i], feat_idx);
+              }
+            }
+          }
           page_produce_kv<false, KTraits>(&smem_storage, &k_smem_offset_w, paged_kv.k_data,
                                           (iter + 1) * CTA_TILE_KV, thr_local_kv_offset_k,
                                           chunk_size, warp_idx, lane_idx);
