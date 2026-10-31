@@ -15,7 +15,7 @@ import cutlass
 import cutlass.cute as cute
 from cutlass._mlir import ir
 from cutlass._mlir.dialects import llvm, vector
-from cutlass.cutlass_dsl import Uint32, dsl_user_op
+from cutlass.cutlass_dsl import Uint16, Uint32, dsl_user_op
 
 # ``cvt.rn.bf16x2.e4m3x2`` (PTX ISA 9.2, sm_100+) converts a pair in one instruction;
 # it needs CUDA 13.2 or newer.  Older toolkits take the four-instruction ALU chain.
@@ -122,6 +122,81 @@ def convert_e4m3_fragment(
     return cute.TensorSSA(result_vector, (count,), mma_dtype)
 
 
+# One e4m3 pair held in a 16-bit register ($1) -> one bf16x2 / f16x2 word ($0).  The
+# pair is widened to a word (high half zero) and the 4-byte converters above run on
+# it; only lane 0 / 1 (the two real bytes) are kept, so the selector is the low one.
+_E4M3X2_TO_BF16X2_ALU_H = """
+{
+    .reg .b32 s, k;
+    .reg .b16 z;
+    mov.b16 z, 0;
+    mov.b32 s, {$1, z};
+    mov.b32 k, 0x7B807B80;
+    prmt.b32 s, s, 0, 0x9180;
+    shl.b32 s, s, 4;
+    and.b32 s, s, 0x87F087F0;
+    mul.rn.bf16x2 $0, s, k;
+}
+"""
+_E4M3X2_TO_BF16X2_NATIVE_H = "cvt.rn.bf16x2.e4m3x2 $0, $1;"
+_E4M3X2_TO_F16X2_H = "cvt.rn.f16x2.e4m3x2 $0, $1;"
+
+
+def _asm_for_pair(mma_dtype: type[cutlass.Numeric], native_cvt: bool) -> str:
+    if mma_dtype is cutlass.BFloat16:
+        return (
+            _E4M3X2_TO_BF16X2_NATIVE_H
+            if native_cvt and _HAS_NATIVE_E4M3_BF16_CVT
+            else _E4M3X2_TO_BF16X2_ALU_H
+        )
+    if mma_dtype is cutlass.Float16:
+        return _E4M3X2_TO_F16X2_H
+    raise ValueError(f"W8A16 converts e4m3 to bf16 or fp16, not {mma_dtype}")
+
+
+@dsl_user_op
+def convert_e4m3_pairs(
+    pairs: cute.TensorSSA,
+    mma_dtype: type[cutlass.Numeric],
+    native_cvt: bool = True,
+    *,
+    loc=None,
+    ip=None,
+) -> cute.TensorSSA:
+    """Convert e4m3 pairs (``Uint16`` SSA, each holding two consecutive weights) to
+    ``mma_dtype`` values in the same order, one pair per asm statement, straight from
+    the 16-bit register the pair was loaded into.  The Hopper mainloop loads its A
+    fragment as 16-bit units (two consecutive k of one row); converting whole 32-bit
+    words would first have the compiler pack bytes into words, which doubled the ALU
+    work of the conversion."""
+    count = cute.size(pairs.shape)
+    half_type = ir.VectorType.get([count], Uint16.mlir_type, loc=loc)
+    halves_vector = llvm.bitcast(
+        half_type, pairs.ir_value(loc=loc, ip=ip), loc=loc, ip=ip
+    )
+    asm = _asm_for_pair(mma_dtype, native_cvt)
+    out_words: list[ir.Value] = []
+    for idx in range(count):
+        half = vector.extract(halves_vector, [], [idx], loc=loc, ip=ip)
+        word = llvm.inline_asm(
+            Uint32.mlir_type,
+            [half],
+            asm,
+            "=r,h",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+        out_words.append(word)
+    out_words_type = ir.VectorType.get([count], Uint32.mlir_type, loc=loc)
+    out_words_vector = vector.from_elements(out_words_type, out_words, loc=loc, ip=ip)
+    result_type = ir.VectorType.get([2 * count], mma_dtype.mlir_type, loc=loc)
+    result_vector = llvm.bitcast(result_type, out_words_vector, loc=loc, ip=ip)
+    return cute.TensorSSA(result_vector, (2 * count,), mma_dtype)
+
+
 @dsl_user_op
 def global_timer_lo(tag: int, *, loc=None, ip=None) -> cutlass.Int32:
     """Low 32 bits of ``%globaltimer`` (nanoseconds); debug-mode timelines only.
@@ -141,4 +216,4 @@ def global_timer_lo(tag: int, *, loc=None, ip=None) -> cutlass.Int32:
     return cutlass.Int32(val)
 
 
-__all__ = ["convert_e4m3_fragment", "global_timer_lo"]
+__all__ = ["convert_e4m3_fragment", "convert_e4m3_pairs", "global_timer_lo"]

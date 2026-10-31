@@ -40,7 +40,7 @@ import cutlass.utils as utils
 import cutlass.utils.hopper_helpers as sm90_utils
 from cutlass.cute.nvgpu import cpasync, warpgroup
 
-from .w8a16_fp8_gemm_sm100_utils import convert_e4m3_fragment
+from .w8a16_fp8_gemm_sm100_utils import convert_e4m3_pairs
 
 
 class Sm90W8A16Fp8GemmKernel:
@@ -524,6 +524,9 @@ class Sm90W8A16Fp8GemmKernel:
         # fp8 fragment of the same shape the smem copy fills.
         tCrA_mma = thr_mma.make_fragment_A(tCsA[(None, None, None, 0)])
         tCrA_load = cute.make_fragment_like(tCrA_mma, self.a_dtype)
+        # The fragment's smem -> register copy moves 16-bit units (two consecutive k of
+        # one row, the wgmma A fragment's granularity); the convert then takes each
+        # unit from its own register (convert_e4m3_pairs).
         smem_copy_atom_a = cute.make_copy_atom(
             cute.nvgpu.CopyUniversalOp(), self.a_dtype, num_bits_per_copy=16
         )
@@ -844,9 +847,9 @@ class Sm90W8A16Fp8GemmKernel:
         tCrA_mma: cute.Tensor,
         kb: cutlass.Constexpr,
     ):
-        packed = cute.recast_tensor(tCrA_load[(None, None, kb)], cutlass.Uint8).load()
+        pairs = cute.recast_tensor(tCrA_load[(None, None, kb)], cutlass.Uint16).load()
         tCrA_mma[(None, None, kb)].store(
-            convert_e4m3_fragment(packed, self.mma_dtype, native_cvt=False)
+            convert_e4m3_pairs(pairs, self.mma_dtype, native_cvt=False)
         )
 
     # ----------------------------------------------------------------- launch
