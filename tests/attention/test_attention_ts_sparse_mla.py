@@ -1744,8 +1744,8 @@ def test_tensor_fp8_nvfp4_host_scales_packed_capacity_graph(heads, capacity):
             owners.append((graph, out, lse, qo_indptr))
         assert compile_calls.call_count == 1
         for name in ("softmax_scale", "output_scale", "kv_cache_scale"):
-            invalid = dict(kwargs, **{name: torch.tensor(1.0, device="cuda")})
-            with pytest.raises(TypeError, match="Python int or float"):
+            invalid = dict(kwargs, **{name: torch.tensor([1.0], device="cuda")})
+            with pytest.raises(TypeError, match="same scalar/tensor type"):
                 wrapper.run(query[:capacity], primary, indices, lengths, **invalid)
         with pytest.raises(ValueError, match="packed query total rows"):
             wrapper.run(query, primary, indices, lengths)

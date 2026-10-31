@@ -85,11 +85,13 @@ mla_paged_decode_h16_ckv512_kpe64_ps64.json
 mla_swa_decode_sq1_h64_d1088_dv1024_ps64.json
 attention_ts_decode_tuple_multi_q_sq4_h32_kv4_d128_ps32.json
 prims_ts_decode_wrapper_tuple_multi_q_causal_sq4_maxq4_maxk2048_wl-1_pf0_um0_h32_kv4_d128_ps32.json
+prims_ts_decode_wrapper_tuple_multi_q_causal_sq4_maxq4_maxk2048_wl-1_pf0_um0_h32_kv4_d128_ps32_scales_ft.json
 prims_ts_decode_wrapper_tuple_multi_q_causal_plan_seq_lens_sq4_maxq4_maxk2048_wl-1_pf1_um1_h32_kv4_d128_ps32.json
 attention_ts_decode_tuple_encoded_page4_multi_q_sq4_h32_kv4_d128_sps4_ps32.json
 prims_ts_decode_wrapper_tuple_encoded_page4_multi_q_causal_sq4_maxq4_maxk2048_wl-1_pf0_um0_h32_kv4_d128_sps4_ps32.json
 prims_ts_decode_wrapper_tuple_encoded_page4_multi_q_causal_plan_seq_lens_sq4_maxq4_maxk2048_wl-1_pf1_um1_h32_kv4_d128_sps4_ps32.json
 prims_ts_decode_mla_one_shot_h128_d_qk576_ckv512_kpe64_ps32_sq4.json
+prims_ts_decode_mla_one_shot_h128_d_qk576_ckv512_kpe64_ps32_sq4_scales_tf.json
 prims_ts_decode_mla_wrapper_causal_maxq4_maxk2048_h128_d_qk576_ckv512_kpe64_ps32_sq4.json
 mm_bf16_fp4_cudnn_N2048_K7168_block_size16.json
 mm_bf16_fp4_cute_dsl_N2048_K7168_block_size16.json
@@ -123,6 +125,7 @@ pcie_ipc_all_gather_tp4_h6144.json
 pcie_ipc_reduce_scatter_tp4_h6144.json
 prims_ts_block_sparse_h8_kv8_d128_qb64_kb64.json
 prims_ts_block_sparse_dense_h8_kv8_d128_qb64_kb64.json
+prims_ts_block_sparse_dense_h8_kv8_d128_qb64_kb64_scales_tt.json
 prims_ts_block_sparse_wrapper_h8_kv8_d128.json
 prims_ts_block_sparse_wrapper_dense_h8_kv8_d128.json
 prims_ts_paged_block_sparse_combined_h8_kv8_d128_qb64_kb64_ps64.json
@@ -1028,6 +1031,20 @@ block_sparse_attention.fi_trace(
     kv_block_size=bs_kv_block,
     use_block_sparse=False,
     mask_type="dense",
+    out=bs_out,
+)
+
+# Device global multipliers remain tensor inputs in the benchmark schema.
+block_sparse_attention.fi_trace(
+    save_dir=SAVE_DIR,
+    q=bs_q,
+    k=bs_k,
+    v=bs_v,
+    q_block_size=bs_q_block,
+    kv_block_size=bs_kv_block,
+    use_block_sparse=False,
+    sm_scale=torch.full((1,), bs_D**-0.5, dtype=torch.float32, device=device),
+    output_scale=torch.full((1,), 0.75, dtype=torch.float32, device=device),
     out=bs_out,
 )
 
@@ -2819,6 +2836,31 @@ for _pts_semantic_PS in (32, 4):
                 _pts_block_tables,
             )
 
+        if _pts_semantic_PS == 32:
+            # Mixed float/tensor ABI, with the tensor inherited from the plan.
+            _pts_output_scale = torch.full(
+                (1,), 0.75, dtype=torch.float32, device=device
+            )
+            _pts_wrapper.plan(
+                _pts_q.device,
+                _pts_B,
+                _pts_Hq,
+                _pts_Hkv,
+                _pts_D,
+                _pts_semantic_PS,
+                _pts_SK,
+                max_q_len=_pts_SQ,
+                q_dtype=_pts_q.dtype,
+                k_dtype=_pts_k.dtype,
+                v_dtype=_pts_v.dtype,
+                out_dtype=torch.bfloat16,
+                mask_type="causal",
+                softmax_scale=_pts_D**-0.5,
+                output_scale=_pts_output_scale,
+                workspace_buffer=_pts_workspace,
+            )
+            _pts_wrapper.run(_pts_q, _pts_cache, _pts_seq_lens, _pts_block_tables)
+
 
 # PrimTS MLA decode: the same causal SQ4 contract through all three public
 # surfaces (SM100/SM103 only).
@@ -2867,6 +2909,23 @@ with contextlib.suppress(Exception):
         qk_rope_head_dim=_pmla_KPE,
         mask_type="causal",
         max_kv_len=_pmla_SK,
+    )
+
+    # The reverse mixed ABI: device QK multiplier and host output multiplier.
+    _attention_ts_mla_decode.fi_trace(
+        save_dir=SAVE_DIR,
+        query=_pmla_q,
+        kv_cache=_pmla_cache,
+        block_tables=_pmla_block_tables,
+        seq_lens_kv=_pmla_seq_lens,
+        kv_lora_rank=_pmla_CKV,
+        qk_rope_head_dim=_pmla_KPE,
+        mask_type="causal",
+        max_kv_len=_pmla_SK,
+        softmax_scale=torch.full(
+            (1,), _pmla_D**-0.5, dtype=torch.float32, device=device
+        ),
+        output_scale=0.75,
     )
 
     _pmla_workspace_size = _prims_ts_mla_ws_size(
