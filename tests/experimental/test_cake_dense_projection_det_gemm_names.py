@@ -15,7 +15,7 @@ limitations under the License.
 """
 
 # The dense projection GEMM package's names: the canonical (det) names, the former names kept as aliases of the
-# same objects (functions, classes), the former import path (since #8069 the package with an explicit numerical mode,
+# same objects (functions, classes), the former import path (now the package with an explicit numerical mode,
 # whose default runs these canonical objects), and no former spelling left in the generated registry, manifest or
 # sources.  CPU only: nothing here launches a kernel.
 
@@ -108,7 +108,7 @@ ARITY = {
 @pytest.mark.parametrize("former", sorted(ARITY))
 def test_the_former_path_defaults_to_the_canonical_object(monkeypatch, former):
     """The default of the former path's entry point is the canonical object with the caller's arguments: the same
-    program, so the same bits (flashinfer-ai/flashinfer#8069 keeps the deterministic default)."""
+    program, so the same bits (the numerical mode keeps the deterministic default)."""
     calls = []
     result = object()
 

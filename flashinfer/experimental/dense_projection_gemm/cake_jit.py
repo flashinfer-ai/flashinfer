@@ -69,7 +69,7 @@ KERNELS: dict[str, dict[str, str]] = {
 # The architectures this package registers programs for (``KERNELS`` keys and every record's ``arches`` are drawn
 # from it).
 ARCHES = ("sm_100a", "sm_103a", "sm_107a")
-TRACKING_ISSUE = "flashinfer-ai/flashinfer#8069"
+TRACKING_ISSUE = "flashinfer-ai/flashinfer#5677"  # the dense projection GEMM family (both numerical modes)
 
 #: The program-name prefix of this package and of the deterministic package.
 PROGRAM_PREFIX = "cake_dense_projection_gemm_"

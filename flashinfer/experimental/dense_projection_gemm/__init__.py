@@ -16,13 +16,13 @@ limitations under the License.
 
 # Experimental Cake backend: the GLM-5.2 dense projection GEMMs for training
 # and the FP32 router-gate GEMM on SM100 / SM103 / SM107 with an explicit
-# numerical mode (flashinfer-ai/flashinfer#8069).  Every entry point of
+# numerical mode (flashinfer-ai/flashinfer#5677).  Every entry point of
 # ``cake_backend`` takes the keyword-only ``deterministic: bool = True``: the
 # default calls the deterministic package
 # (``flashinfer.experimental.dense_projection_det_gemm``: the same programs and
 # the same bits as before this package existed); ``deterministic=False`` selects
-# the programs of this package, which reduce split-K partials with unordered
-# FP32 adds.  Importing this package imports nothing: ``cake_backend``,
+# the programs of this package, which add split-K partials in the order they
+# finish.  Importing this package imports nothing: ``cake_backend``,
 # ``cake_jit`` and ``cake_build`` load on first attribute access.
 
 __all__ = ["cake_backend", "cake_build", "cake_jit"]
