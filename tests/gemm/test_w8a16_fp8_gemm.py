@@ -19,13 +19,12 @@ import torch
 import torch.nn.functional as F
 
 from flashinfer.gemm import w8a16_fp8_gemm, w8a16_fp8_gemm_workspace_bytes
-from flashinfer.gemm.w8a16_fp8 import get_w8a16_fp8_gemm_module
 from flashinfer.utils import get_compute_capability
 
 
 @pytest.fixture(autouse=True)
 def _needs_hopper_or_blackwell():
-    """The op has Hopper (sm_90a) and Blackwell (sm_100a) builds only."""
+    """The op has Hopper (sm_90a) and Blackwell (sm_100a / sm_103a) kernels only."""
     if get_compute_capability(torch.device("cuda"))[0] not in (9, 10):
         pytest.skip("w8a16_fp8_gemm needs Hopper or Blackwell")
 
@@ -272,25 +271,31 @@ def test_w8a16_fp8_gemm_workspace_bytes_extreme_dims():
 
 
 def test_w8a16_fp8_gemm_workspace_bytes_splitk_overflow():
-    """A forced split-K at large dimensions asks for `splits x M x N` fp32 partials.
-    Within the admitted tile count that stays far inside the signed 64-bit range the
-    query returns in, and it is reported exactly (plus the CUTLASS scheduler
-    workspace, if any) even though no one would allocate it; the split policies
-    themselves must not overflow on the way there (the Blackwell long-K rule compares
-    wave counts scaled by the split count).  Dimensions whose partials would leave the
-    range are rejected by the tile-count bound before the query is asked."""
+    """The split policies and the workspace query must not overflow at large
+    dimensions.  On Blackwell a forced split-K asks for `splits x M x N` fp32
+    partials, which within the admitted tile count stays far inside the signed
+    64-bit range the query returns in, and is reported exactly even though no one
+    would allocate it (the long-K rule compares wave counts scaled by the split
+    count).  On Hopper the split-K variants run a one-wave fused tail: a grid
+    whose slices cannot all be resident runs the plain tile and needs no
+    workspace, so the query reports 0 there.  Dimensions whose partials would
+    leave the range are rejected by the tile-count bound before the query is
+    asked."""
     dev = torch.device("cuda")
     algo = {9: "128x128_splitk", 10: "2sm256x128_splitk"}[_major()]
     big = _MAX_DIM
     # 2 slices x 2^20 x 2^19 floats = 2^42 bytes (4 TiB).  The forced split on this
     # short K is the smallest, 2.
-    assert w8a16_fp8_gemm_workspace_bytes(2**20, 2**19, 1024, dev, algo) >= 2**42
-    # 2 slices x (2^31 - 256) x 448 floats, about 7.7 TB.
-    assert (
-        w8a16_fp8_gemm_workspace_bytes(big, 448, 1024, dev, algo) >= 2 * big * 448 * 4
-    )
-    # Long K with a large grid: the wave-fill split rules run at their extremes.
-    assert w8a16_fp8_gemm_workspace_bytes(2**20, 2**19, 2**30, dev, algo) >= 2**42
+    expect_partials = _major() == 10
+    for m, n, k, floor in [
+        (2**20, 2**19, 1024, 2**42),
+        # 2 slices x (2^31 - 256) x 448 floats, about 7.7 TB.
+        (big, 448, 1024, 2 * big * 448 * 4),
+        # Long K with a large grid: the wave-fill split rules run at their extremes.
+        (2**20, 2**19, 2**30, 2**42),
+    ]:
+        need = w8a16_fp8_gemm_workspace_bytes(m, n, k, dev, algo)
+        assert need >= floor if expect_partials else need == 0, (m, n, k, need)
     # The launcher's own choice at the extreme dimensions never picks a split it cannot
     # size (the Hopper cost model's partials cap is evaluated without overflowing).
     for m, n, k in [(big, 448, 1024), (2**20, 2**19, 2**30), (8, 8, big)]:
@@ -432,9 +437,9 @@ def test_w8a16_fp8_gemm_forced_splitk_unsplittable_k():
     )  # K % 16 == 0, but neither 64 x (2 x 8) nor 128 x 2 divides it
     act = torch.randn(m, k, device=dev, dtype=torch.bfloat16)
     w_fp8, scale = _quantize(torch.randn(n, k, device=dev) * 0.02)
-    with pytest.raises(RuntimeError, match="cannot slice K=960"):
+    with pytest.raises(ValueError, match="cannot slice K=960"):
         w8a16_fp8_gemm_workspace_bytes(m, n, k, dev, algo)
-    with pytest.raises(RuntimeError, match="cannot slice K=960"):
+    with pytest.raises(ValueError, match="cannot slice K=960"):
         w8a16_fp8_gemm(act, w_fp8, scale, algo=algo)
     # The launcher's own choice never asks for an impossible split.
     assert w8a16_fp8_gemm_workspace_bytes(m, n, k, dev) >= 0
@@ -629,6 +634,7 @@ _ALGOS_SM90 = [
     "64x128",
     "128x128_splitk",
     "128x256_splitk",
+    "64x128_splitk",
 ]
 
 
@@ -767,9 +773,9 @@ def test_w8a16_fp8_gemm_minimal_splitk(algo, dtype):
     assert w8a16_fp8_gemm_workspace_bytes(m, n, k, dev, algo) >= 2 * m * n * 4
     out = w8a16_fp8_gemm(act, w_fp8, scale, bias=bias, algo=algo)
     _check_against_reference(out, act, w_fp8, scale, bias, (algo, dtype))
-    with pytest.raises(RuntimeError, match=f"cannot slice K={k_short}"):
+    with pytest.raises(ValueError, match=f"cannot slice K={k_short}"):
         w8a16_fp8_gemm_workspace_bytes(m, n, k_short, dev, algo)
-    with pytest.raises(RuntimeError, match=f"cannot slice K={k_short}"):
+    with pytest.raises(ValueError, match=f"cannot slice K={k_short}"):
         w8a16_fp8_gemm(
             act[:, :k_short].contiguous(),
             w_fp8[:, :k_short].contiguous(),
@@ -853,161 +859,3 @@ def test_w8a16_fp8_gemm_caller_workspace_reuse(algo, dtype):
         assert torch.isnan(obuf[:pad_el]).all() and torch.isnan(obuf[-pad_el:]).all()
         _check_against_reference(out, act, w_fp8, sc, bias, (algo, dtype, mi))
     assert (buf[:pad] == 0x7F).all() and (buf[-pad:] == 0x7F).all()
-
-
-# ---------------------------------------------------------------------------
-# The native boundary, called directly
-# ---------------------------------------------------------------------------
-
-
-def test_w8a16_fp8_gemm_native_invalid_device():
-    """Invalid native device IDs raise without leaving a CUDA error that would make
-    the next valid split-K reduction fail. Wide IDs must not narrow to a valid one."""
-    dev = torch.device("cuda", torch.cuda.current_device())
-    mod = get_w8a16_fp8_gemm_module(dev, torch.bfloat16)
-    algo = {9: 10, 10: 5}[_major()]
-    m, n, k = 16, 128, 1024
-    need = mod.w8a16_fp8_gemm_workspace_bytes(m, n, k, dev.index, algo)
-    assert need > 0
-    workspace = torch.empty(need, device=dev, dtype=torch.uint8)
-    act = torch.ones(m, k, device=dev, dtype=torch.bfloat16)
-    weight = torch.ones(n, k, device=dev).to(torch.float8_e4m3fn)
-    scale = torch.tensor([0.5], device=dev)
-    out = torch.empty(m, n, device=dev, dtype=torch.bfloat16)
-    expected = torch.full_like(out, 512.0)
-
-    for invalid in (-1, torch.cuda.device_count(), 2**32 + dev.index, -(2**32)):
-        with pytest.raises(RuntimeError, match="CUDA device"):
-            mod.w8a16_fp8_gemm_workspace_bytes(m, n, k, invalid, algo)
-        mod.w8a16_fp8_gemm(out, act, weight, scale, None, workspace, algo)
-        torch.cuda.synchronize()
-        assert torch.equal(out, expected)
-
-
-def test_w8a16_fp8_gemm_native_checks():
-    """The module's own FFI entry points reject what the contract says they reject,
-    independently of the Python guards: the other activation dtype, misaligned out
-    and workspace, out / workspace overlapping an input, a missing or short workspace
-    for a variant that needs one (also when auto picked it: on Blackwell the launcher's
-    own choice at this small shape needs scratch, which the Python wrapper allocates
-    silently), dimensions past the bounds, and algo codes outside the table, including
-    values whose low 32 bits are a valid code (an int64 narrowed to int would accept
-    them).  The context is alive afterwards: a valid direct call still computes."""
-    dev = torch.device("cuda")
-    major = _major()
-    mod = get_w8a16_fp8_gemm_module(dev, torch.bfloat16)
-    m, n, k = 16, 128, 1024
-    act = torch.ones(m, k, device=dev, dtype=torch.bfloat16)
-    w_fp8 = torch.ones(n, k, device=dev).to(torch.float8_e4m3fn)
-    scale = torch.tensor([0.5], device=dev)
-    out = torch.empty(m, n, device=dev, dtype=torch.bfloat16)
-    launch = mod.w8a16_fp8_gemm
-    query = mod.w8a16_fp8_gemm_workspace_bytes
-    idx = dev.index if dev.index is not None else torch.cuda.current_device()
-    # What the launcher's own choice needs here (0 on Hopper, scratch on Blackwell).
-    ws_auto_bytes = query(m, n, k, idx, 0)
-    ws_auto = (
-        torch.empty(ws_auto_bytes, device=dev, dtype=torch.uint8)
-        if ws_auto_bytes
-        else None
-    )
-    # A forced variant that needs scratch at a larger problem, for the capacity check.
-    first_valid = 2 if major == 9 else 1
-    m2, n2, k2 = 1024, 1024, 8192
-    code_ws, need = next(
-        (code, query(m2, n2, k2, idx, code))
-        for code in range(first_valid, 8)
-        if query(m2, n2, k2, idx, code) > 0
-    )
-    act2 = torch.ones(m2, k2, device=dev, dtype=torch.bfloat16)
-    w2 = torch.ones(n2, k2, device=dev).to(torch.float8_e4m3fn)
-    out2 = torch.empty(m2, n2, device=dev, dtype=torch.bfloat16)
-    with pytest.raises(RuntimeError, match="workspace too small: 0 bytes"):
-        launch(out2, act2, w2, scale, None, None, code_ws)
-    with pytest.raises(RuntimeError, match=f"workspace too small: {need - 16} bytes"):
-        launch(
-            out2,
-            act2,
-            w2,
-            scale,
-            None,
-            torch.empty(need - 16, device=dev, dtype=torch.uint8),
-            code_ws,
-        )
-    if ws_auto is None:
-        # Hopper's choice here needs no scratch, so an unneeded buffer is simply unused;
-        # on Blackwell the same call without one must say so.
-        launch(
-            out,
-            act,
-            w_fp8,
-            scale,
-            None,
-            torch.empty(64, device=dev, dtype=torch.uint8),
-            0,
-        )
-    else:
-        with pytest.raises(RuntimeError, match="workspace too small: 0 bytes"):
-            launch(out, act, w_fp8, scale, None, None, 0)
-
-    # The bf16 module refuses fp16 activations (one module per dtype).
-    with pytest.raises(RuntimeError):
-        launch(out.half(), act.half(), w_fp8, scale, None, None, 0)
-    # Misaligned out / workspace (contiguous views at a one-element offset).
-    out_off = torch.empty(m * n + 1, device=dev, dtype=torch.bfloat16)[1:].view(m, n)
-    with pytest.raises(RuntimeError, match="aligned"):
-        launch(out_off, act, w_fp8, scale, None, None, 0)
-    ws_off = torch.empty(1 << 20, device=dev, dtype=torch.uint8)[1:]
-    with pytest.raises(RuntimeError, match="aligned"):
-        launch(out, act, w_fp8, scale, None, ws_off, 0)
-    # Overlap: out on act's storage (a square problem), workspace on the weight.
-    sq = torch.ones(k, k, device=dev, dtype=torch.bfloat16)
-    w_sq = torch.ones(k, k, device=dev).to(torch.float8_e4m3fn)
-    with pytest.raises(RuntimeError, match="out must not overlap act"):
-        launch(sq, sq, w_sq, scale, None, None, 0)
-    ws_on_w = w_fp8.view(torch.uint8).view(-1)
-    with pytest.raises(RuntimeError, match="workspace must not overlap weight"):
-        launch(out, act, w_fp8, scale, None, ws_on_w, 0)
-    # Dimension bounds at the native boundary.
-    with pytest.raises(RuntimeError, match="at most"):
-        query(_MAX_DIM + 8, 8, 16, idx, 0)
-    with pytest.raises(RuntimeError, match="too large"):
-        query(_MAX_DIM, _MAX_DIM, 1024, idx, 0)
-    # Algo codes: reserved, past the table, negative, and 2**32 + valid (low 32 bits
-    # are 0 = auto or a real variant).
-    reserved = 1 if major == 9 else 8
-    for code in (reserved, 99, -1, 2**32, 2**32 + first_valid, 2**40 + first_valid):
-        with pytest.raises(RuntimeError, match="algo"):
-            query(m, n, k, idx, code)
-        with pytest.raises(RuntimeError, match="algo"):
-            launch(out, act, w_fp8, scale, None, ws_auto, code)
-    # Still alive: a direct valid call computes 0.5 * K.
-    launch(out, act, w_fp8, scale, None, ws_auto, 0)
-    torch.cuda.synchronize()
-    assert torch.equal(out, torch.full((m, n), 512.0, device=dev, dtype=torch.bfloat16))
-
-
-def test_w8a16_fp8_gemm_kernel_units_without_ffi_headers():
-    """The units that instantiate the kernels include no TVM-FFI header.
-
-    csrc/tvm_ffi_utils.h puts ``using tvm::ffi::Tensor`` at global scope, which
-    makes the unqualified ``Tensor`` in CUTLASS's sm100 epilogue ambiguous with
-    cute::Tensor under nvcc 12.9 and 13.x; the kernels are therefore compiled
-    apart from the launcher.  Checked on the sources (no GPU needed): the kernel
-    units and the config header they include must not pull that header in.
-    """
-    from flashinfer.jit import env as jit_env
-
-    for fname in (
-        "w8a16_fp8_gemm_kernels.cu",
-        "w8a16_fp8_gemm_sm100_kernels.cu",
-        "w8a16_fp8_gemm_config.jinja",
-    ):
-        text = (jit_env.FLASHINFER_CSRC_DIR / fname).read_text()
-        includes = [
-            line.strip() for line in text.splitlines() if line.startswith("#include")
-        ]
-        assert not any("tvm" in inc or "ffi" in inc for inc in includes), (
-            fname,
-            includes,
-        )

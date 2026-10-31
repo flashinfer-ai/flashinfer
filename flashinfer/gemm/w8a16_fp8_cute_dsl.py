@@ -16,13 +16,12 @@ limitations under the License.
 
 """W8A16 FP8 GEMM, CuTe-DSL kernels (Blackwell and Hopper).
 
-Same contract as the C++ op in ``w8a16_fp8.py``:
-``out[M, N] = act[M, K] @ (fp8_weight[N, K] * scale).T (+ bias[N])``.  While the
-two implementations coexist this module is reached through
-``w8a16_fp8_gemm_cute_dsl``; the variant selection (``algo`` codes, tile walk) is
-the C++ dispatchers' (``include/flashinfer/gemm/w8a16_sm100/dispatch.hpp`` and
-``tile_order.hpp``, ``w8a16_sm90/dispatch.hpp`` and ``tile_order.hpp``) ported
-line by line so the two run the same kernel for a problem.
+``out[M, N] = act[M, K] @ (fp8_weight[N, K] * scale).T (+ bias[N])``; the public
+entry with its argument checks is ``flashinfer.gemm.w8a16_fp8_gemm``.  This module
+holds the variant selection (``algo`` codes, cost models, tile walk) and the
+launch of the Hopper and Blackwell CuTe-DSL kernels under ``kernels/cute_dsl/``.
+The selection rules were ported from the CUTLASS C++ implementation this port
+replaced and validated against it shape by shape.
 """
 
 import math
@@ -33,7 +32,7 @@ import torch
 
 from ..utils import get_compute_capability, get_device_sm_count
 
-# Blackwell tile configurations by algo code (W8A16Sm100Algo): (weight rows, activation
+# Blackwell tile configurations by algo code: (weight rows, activation
 # rows, k) per MMA tile, 2SM MMA, cluster, transformed A kept in smem.
 _SM100_TILES: Dict[int, Tuple[Tuple[int, int, int], bool, Tuple[int, int], bool]] = {
     1: ((256, 128, 128), True, (2, 1), False),  # 2sm256x128
@@ -51,7 +50,7 @@ def _tiles(x: int, t: int) -> int:
 
 
 def _sm100_split_k(m: int, n: int, k: int, num_sms: int) -> int:
-    """W8A16Sm100SplitK: slices for the 256x128 tile (1 = do not split)."""
+    """slices for the 256x128 tile (1 = do not split)."""
     if k % 128 != 0:
         return 1
     clusters = num_sms // 2 if num_sms > 1 else 1
@@ -76,7 +75,7 @@ def _sm100_split_k(m: int, n: int, k: int, num_sms: int) -> int:
 
 
 def _sm100_use_stream_k(m: int, n: int, k: int, num_sms: int) -> bool:
-    """W8A16Sm100UseStreamK."""
+    """"""
     if k % 128 != 0 or k // 128 < 64:
         return False
     clusters = num_sms // 2 if num_sms > 1 else 1
@@ -89,7 +88,7 @@ def _sm100_use_stream_k(m: int, n: int, k: int, num_sms: int) -> bool:
 
 
 def sm100_splits_for(m: int, n: int, k: int, num_sms: int) -> int:
-    """W8A16Sm100SplitsFor: the split-K slice count actually used: the model's
+    """the split-K slice count actually used: the model's
     choice, or, when the variant is forced on a grid the model would not split,
     the smallest s >= 2 dividing the k-tile count.  0 = K cannot be split."""
     s = _sm100_split_k(m, n, k, num_sms)
@@ -145,7 +144,7 @@ def _sm100_streamk_substitute(m: int, n: int, k: int, num_sms: int) -> Tuple[int
 
 
 def sm100_pick_algo(m: int, n: int, k: int, num_sms: int) -> int:
-    """W8A16Sm100PickAlgo: the launcher's variant for a problem."""
+    """the launcher's variant for a problem."""
     if n <= 128 and m >= 16384:
         return 2
     if _sm100_use_stream_k(m, n, k, num_sms):
@@ -170,7 +169,7 @@ def sm100_pick_algo(m: int, n: int, k: int, num_sms: int) -> int:
 
 
 def sm100_pick_swizzle(m: int, n: int, k: int) -> int:
-    """W8A16Sm100PickSwizzle: L2 tile group in clusters (1 = plain raster)."""
+    """L2 tile group in clusters (1 = plain raster)."""
     weight_bytes = n * k
     if weight_bytes < (64 << 20) or m < 4096:
         return 1
@@ -356,59 +355,52 @@ def _sm100_plan(algo: int, m: int, n: int, k: int, num_sms: int) -> Tuple:
     return plan
 
 
+def w8a16_fp8_gemm_workspace_bytes(
+    m: int, n: int, k: int, device: torch.device, algo: int = 0
+) -> int:
+    """Scratch bytes a call needs (0 = none): the fp32 partials of a Blackwell
+    split-K run (``splits * m * n * 4``) or of a Hopper split tail (one
+    ``tile_a x tile_w`` fp32 block per tail slice).  A pure function of the
+    shape and the device's SM count; ``algo`` as :func:`w8a16_fp8_gemm_cute_dsl`."""
+    num_sms = get_device_sm_count(device)
+    if get_compute_capability(device)[0] == 9:
+        tile_algo, _body_items, tail_splits, tail_tiles, _group = _sm90_plan(
+            algo, m, n, k, num_sms
+        )
+        tile_w, tile_a = _SM90_TILES[tile_algo]
+        return tail_tiles * tail_splits * tile_a * tile_w * 4
+    _algo, splits, _swizzle, _raster, _clusters = _sm100_plan(algo, m, n, k, num_sms)
+    return splits * m * n * 4 if splits > 1 else 0
+
+
 def w8a16_fp8_gemm_cute_dsl(
     act: torch.Tensor,
     weight: torch.Tensor,
     weight_scale: torch.Tensor,
-    bias: Optional[torch.Tensor] = None,
-    out: Optional[torch.Tensor] = None,
+    bias: Optional[torch.Tensor],
+    out: torch.Tensor,
     algo: int = 0,
+    workspace: Optional[torch.Tensor] = None,
     debug_buffer: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
-    """Blackwell W8A16 GEMM in CuTe-DSL.  ``algo`` as the C++ op's codes (0 = the
-    dispatcher's choice); split-K and stream-K codes are not implemented yet and
-    fall back to the plain 256x128 tile.  ``debug_buffer``: an Int32 tensor of at
-    least 64 * 4096 entries (pinned host memory to watch a hang) that the kernel's
-    debug build writes its per-CTA progress into; None = the production build."""
+) -> None:
+    """Launch the W8A16 GEMM (``out = act @ dequant(weight).T + bias``) on
+    validated 2-D tensors: ``act`` [M, K] fp16 / bf16, ``weight`` [N, K] e4m3,
+    ``weight_scale`` one fp32, ``bias`` [N] or None, ``out`` [M, N], all
+    contiguous and 16-byte aligned on one Hopper or Blackwell device (the public
+    :func:`flashinfer.gemm.w8a16_fp8_gemm` checks that).  ``algo``: a code of the
+    architecture's table (0 = the model's choice).  ``workspace``: a buffer of at
+    least :func:`w8a16_fp8_gemm_workspace_bytes` bytes, or None to allocate when
+    needed.  ``debug_buffer`` (Blackwell): an Int32 tensor of at least 64 * 4096
+    entries the kernel's debug build writes its per-CTA progress into."""
     import cutlass
 
-    if act.dtype not in (torch.bfloat16, torch.float16):
-        raise ValueError(f"act must be bf16 or fp16, got {act.dtype}")
-    if weight.dtype != torch.float8_e4m3fn:
-        raise ValueError(f"weight must be float8_e4m3fn, got {weight.dtype}")
-    major = get_compute_capability(act.device)[0]
-    if major not in (9, 10):
-        raise RuntimeError(
-            "the CuTe-DSL W8A16 kernel runs on Hopper and Blackwell only"
-        )
-    if act.dim() != 2 or weight.dim() != 2 or weight.shape[1] != act.shape[1]:
-        raise ValueError(
-            f"act [M, K] and weight [N, K] must share K, got {tuple(act.shape)} and "
-            f"{tuple(weight.shape)}"
-        )
     m, k = act.shape
     n = weight.shape[0]
-    if out is None:
-        out = torch.empty((m, n), dtype=act.dtype, device=act.device)
-    if out.shape != (m, n) or out.dtype != act.dtype:
-        raise ValueError(f"out must be [{m}, {n}] {act.dtype}")
-    if weight_scale.dtype != torch.float32 or weight_scale.numel() != 1:
-        raise ValueError("weight_scale must be one fp32 value")
-    if bias is not None and (bias.dtype != act.dtype or bias.numel() != n):
-        raise ValueError(f"bias must be [{n}] {act.dtype}")
-    for name, t in (("act", act), ("weight", weight), ("out", out), ("bias", bias)):
-        if t is not None and not t.is_contiguous():
-            raise ValueError(f"{name} must be contiguous")
-    # TMA needs 16-byte rows: 16 fp8 weights, 8 16-bit activations / outputs.
-    if k % 16 != 0 or n % 8 != 0:
-        raise ValueError(f"K must be a multiple of 16 and N of 8, got K={k}, N={n}")
-    for name, t in (("act", act), ("weight", weight), ("out", out)):
-        if t.data_ptr() % 16:
-            raise ValueError(f"{name} must be 16-byte aligned")
-    if major == 9:
+    if get_compute_capability(act.device)[0] == 9:
         if debug_buffer is not None:
             raise ValueError("debug_buffer is a Blackwell-kernel feature")
-        return _w8a16_fp8_gemm_sm90(act, weight, weight_scale, bias, out, algo)
+        _w8a16_fp8_gemm_sm90(act, weight, weight_scale, bias, out, algo, workspace)
+        return
     plan = _sm100_plan(algo, m, n, k, get_device_sm_count(act.device))
     algo, splits, swizzle_size, raster_along_m, max_active_clusters = plan
     # Split-K: the 256x128 tile over `splits` K-slices writing fp32 partials, then
@@ -416,7 +408,7 @@ def w8a16_fp8_gemm_cute_dsl(
     # no scale / bias.
     partials = None
     if splits > 1:
-        partials = torch.empty((splits, m, n), dtype=torch.float32, device=act.device)
+        partials = _scratch(workspace, (splits, m, n), torch.float32, act.device)
     k_slice = k // splits
     has_bias = bias is not None
     act_ctype = cutlass.BFloat16 if act.dtype == torch.bfloat16 else cutlass.Float16
@@ -480,12 +472,10 @@ def w8a16_fp8_gemm_cute_dsl(
             m * n // 8,
             stream,
         )
-    return out
 
 
 # ======================================================================= Hopper
-# The C++ Hopper dispatcher (``w8a16_sm90/dispatch.hpp``, ``tile_order.hpp``) ported.
-# Tile configurations by algo code (W8A16Sm90Algo): (weight rows, activation rows).
+# Tile configurations by algo code: (weight rows, activation rows).
 _SM90_TILES: Dict[int, Tuple[int, int]] = {
     2: (128, 256),
     3: (128, 192),
@@ -562,7 +552,7 @@ def _sm90_pick_splits(t, m: int, n: int, k: int, num_sms: int) -> int:
 
 
 def sm90_splits_for(algo: int, m: int, n: int, k: int, num_sms: int) -> int:
-    """W8A16Sm90SplitsFor: the model's split, or the smallest legal one when the
+    """the model's split, or the smallest legal one when the
     variant is forced; 1 = K cannot be sliced."""
     t = _sm90_tile_of(algo)
     s = _sm90_pick_splits(t, m, n, k, num_sms)
@@ -623,7 +613,7 @@ def _sm90_pick_by_cost(m: int, n: int, k: int, num_sms: int) -> int:
 
 
 def sm90_pick_algo(m: int, n: int, k: int, num_sms: int) -> int:
-    """W8A16Sm90PickAlgo: the cost model up to M = 8192, wave-count rules above."""
+    """the cost model up to M = 8192, wave-count rules above."""
     units = _tiles(n, 128) * _tiles(m, 256)
     waves = units / max(num_sms, 1)
     frac = waves - math.floor(waves)
@@ -653,7 +643,7 @@ def sm90_pick_algo(m: int, n: int, k: int, num_sms: int) -> int:
 
 
 def sm90_pick_group(m: int, n: int, k: int, tile_w: int) -> int:
-    """W8A16Sm90PickGroup: activation tiles per L2 group (1 = ungrouped)."""
+    """activation tiles per L2 group (1 = ungrouped)."""
     if n * k < 40 * 1000 * 1000 or m < 16384:
         return 1
     return 4 if _tiles(n, tile_w) >= 64 else 2
@@ -731,7 +721,7 @@ def sm90_tail_plan(
 ) -> Tuple[int, int, int]:
     """The work decomposition of a Hopper variant: (tile algo, body tiles, tail
     splits).  Plain tiles: every tile whole.  Split-K codes: no body, every tile cut
-    into W8A16Sm90SplitsFor slices.  Stream-K codes: the whole waves plain and the
+    into ``sm90_splits_for`` slices.  Stream-K codes: the whole waves plain and the
     last partial wave cut into the slice count that best fills the SMs (fewest rounds
     of the shortest slices under the workspace cap), or plain when CUTLASS's own
     stream-K would run data-parallel (no tail, or a tail of at least half a wave)."""
@@ -805,7 +795,8 @@ def _w8a16_fp8_gemm_sm90(
     bias: Optional[torch.Tensor],
     out: torch.Tensor,
     algo: int,
-) -> torch.Tensor:
+    workspace: Optional[torch.Tensor],
+) -> None:
     """The Hopper path of ``w8a16_fp8_gemm_cute_dsl`` (inputs already validated)."""
     import cutlass
 
@@ -818,14 +809,10 @@ def _w8a16_fp8_gemm_sm90(
     tile_w, tile_a = _SM90_TILES[tile_algo]
     has_tail = tail_tiles > 0
     tail_blocks = tail_tiles * tail_splits
-    workspace = (
-        torch.empty(
-            (max(tail_blocks, 1), tile_a, tile_w),
-            dtype=torch.float32,
-            device=act.device,
-        )
+    partials = (
+        _scratch(workspace, (tail_blocks, tile_a, tile_w), torch.float32, act.device)
         if has_tail
-        else weight_scale
+        else weight_scale  # any valid pointer when unused
     )
     counters = _sm90_tail_counters(act.device, tail_tiles) if has_tail else weight_scale
     has_bias = bias is not None
@@ -838,7 +825,7 @@ def _w8a16_fp8_gemm_sm90(
         (cutlass.Float32, weight_scale.data_ptr(), 4),
         (bias_ctype, bias_tensor.data_ptr(), 4),
         (act_ctype, out.data_ptr(), 16),
-        (cutlass.Float32, workspace.data_ptr(), 16),
+        (cutlass.Float32, partials.data_ptr(), 16),
         (cutlass.Int64, counters.data_ptr(), 8),
     )
     stream = _raw_stream(act.device)
@@ -862,7 +849,7 @@ def _w8a16_fp8_gemm_sm90(
         weight_scale.data_ptr(),
         bias_tensor.data_ptr(),
         out.data_ptr(),
-        workspace.data_ptr(),
+        partials.data_ptr(),
         counters.data_ptr(),
         n,
         m,
@@ -872,7 +859,20 @@ def _w8a16_fp8_gemm_sm90(
         tail_splits,
         stream,
     )
-    return out
+
+
+def _scratch(
+    workspace: Optional[torch.Tensor], shape: Tuple, dtype: torch.dtype, device
+) -> torch.Tensor:
+    """A ``shape`` tensor of ``dtype`` carved from the caller's ``workspace`` (its
+    leading bytes; the caller sized it with :func:`w8a16_fp8_gemm_workspace_bytes`)
+    or freshly allocated when none was passed."""
+    numel = 1
+    for d in shape:
+        numel *= d
+    if workspace is None:
+        return torch.empty(shape, dtype=dtype, device=device)
+    return workspace.view(torch.uint8).flatten()[: numel * 4].view(dtype).view(shape)
 
 
 def cute_gmem():

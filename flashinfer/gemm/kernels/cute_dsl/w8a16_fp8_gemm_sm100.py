@@ -17,9 +17,9 @@ The epilogue applies the per-tensor scale (fp32, read on device) and the optiona
 per-N bias in fp32 and stores through TMA (SIMT for a partial last activation tile).
 
 Warp roles (16 warps): 0-3 epilogue, 4 MMA, 5 scheduler, 6 weight TMA, 7 activation
-TMA, 8-15 transform.  Same structure as the C++ kernel in
-``include/flashinfer/gemm/w8a16_sm100/`` and as FlashInfer's dense W4A16 kernel
-(``dense_gemm_bf16_fp4_sm100.py``), from which this file is derived.
+TMA, 8-15 transform.  Same structure as FlashInfer's dense W4A16 kernel
+(``dense_gemm_bf16_fp4_sm100.py``), from which this file is derived, and as the
+CUTLASS C++ W8A16 kernel this port replaced.
 """
 
 from math import ceil, log2
@@ -132,7 +132,9 @@ class Sm100W8A16Fp8GemmKernel:
         self.num_tmem_user_threads = 32 * (
             len(self.epilog_warp_id) + 1 + self.num_transform_warps
         )
-        self.tmem_ptr_sync_barrier = pipeline.NamedBarrier(2, self.num_tmem_user_threads)
+        self.tmem_ptr_sync_barrier = pipeline.NamedBarrier(
+            2, self.num_tmem_user_threads
+        )
         self.sched_sync_barrier = pipeline.NamedBarrier(5, 32)
 
         self.smem_buffer_align_bytes = 1024
@@ -1102,9 +1104,7 @@ class Sm100W8A16Fp8GemmKernel:
                     with cute.arch.elect_one():
                         dbg[dbg_base + 1] = dbg_tiles
                         dbg[dbg_base + 9] = cutlass.Int32(2)
-                        dbg[dbg_base + _slot_if(dbg_tiles == 1, 19)] = clock_lo(
-                            19
-                        )
+                        dbg[dbg_base + _slot_if(dbg_tiles == 1, 19)] = clock_lo(19)
                 work_tile, tile_info_consumer_state, tile_l = self._next_work_tile(
                     tile_info_pipeline, tile_info_consumer_state, sTile_info
                 )
@@ -1254,30 +1254,28 @@ class Sm100W8A16Fp8GemmKernel:
                     xf_cyc_store,
                     xf_cyc_pre,
                     xf_cyc_post,
-                ) = (
-                    self._transform_tile(
-                        a_load2trans_pipeline,
-                        trans2mma_pipeline,
-                        a_load2trans_consumer_state,
-                        trans2mma_producer_state,
-                        dst_copy_a,
-                        tAsA_input,
-                        tAsA_transform,
-                        tArA_load,
-                        tArA_transform,
-                        tArA_transform_store,
-                        transform_tiler,
-                        split_mode,
-                        k_tile_cnt,
-                        xf_k_parity,
-                        transform_group_idx,
-                        xf_wait_a,
-                        xf_wait_stage,
-                        xf_cyc_convert,
-                        xf_cyc_store,
-                        xf_cyc_pre,
-                        xf_cyc_post,
-                    )
+                ) = self._transform_tile(
+                    a_load2trans_pipeline,
+                    trans2mma_pipeline,
+                    a_load2trans_consumer_state,
+                    trans2mma_producer_state,
+                    dst_copy_a,
+                    tAsA_input,
+                    tAsA_transform,
+                    tArA_load,
+                    tArA_transform,
+                    tArA_transform_store,
+                    transform_tiler,
+                    split_mode,
+                    k_tile_cnt,
+                    xf_k_parity,
+                    transform_group_idx,
+                    xf_wait_a,
+                    xf_wait_stage,
+                    xf_cyc_convert,
+                    xf_cyc_store,
+                    xf_cyc_pre,
+                    xf_cyc_post,
                 )
                 xf_k_parity = (xf_k_parity + k_tile_cnt) % 2
                 if cutlass.const_expr(self.debug):
@@ -1286,9 +1284,7 @@ class Sm100W8A16Fp8GemmKernel:
                         with cute.arch.elect_one():
                             dbg[dbg_base + 3] = dbg_tiles
                             dbg[dbg_base + 11] = cutlass.Int32(2)
-                            dbg[dbg_base + _slot_if(dbg_tiles == 1, 29)] = (
-                                clock_lo(29)
-                            )
+                            dbg[dbg_base + _slot_if(dbg_tiles == 1, 29)] = clock_lo(29)
                 work_tile, tile_info_consumer_state, tile_l = self._next_work_tile(
                     tile_info_pipeline, tile_info_consumer_state, sTile_info
                 )
@@ -1436,9 +1432,7 @@ class Sm100W8A16Fp8GemmKernel:
                     with cute.arch.elect_one():
                         dbg[dbg_base + 4] = dbg_tiles
                         dbg[dbg_base + 12] = cutlass.Int32(5)
-                        dbg[dbg_base + _slot_if(dbg_tiles == 1, 23)] = clock_lo(
-                            23
-                        )
+                        dbg[dbg_base + _slot_if(dbg_tiles == 1, 23)] = clock_lo(23)
                         dbg[dbg_base + 27] = clock_lo(27)
                 work_tile, tile_info_consumer_state, tile_l = self._next_work_tile(
                     tile_info_pipeline, tile_info_consumer_state, sTile_info
@@ -1597,9 +1591,7 @@ class Sm100W8A16Fp8GemmKernel:
                     epi_wait_acc += clock_lo(58) - t_e0
                     if epi_tidx == 0:
                         dbg[dbg_base + 13] = cutlass.Int32(2)
-                        dbg[dbg_base + _slot_if(epi_tile_count == 0, 24)] = (
-                            clock_lo(24)
-                        )
+                        dbg[dbg_base + _slot_if(epi_tile_count == 0, 24)] = clock_lo(24)
                 # Scale and bias are read after the accumulator wait so that under PDL
                 # they are ordered behind the preceding grid too.
                 scale_val = cutlass.Float32(scale[0])
@@ -1635,8 +1627,8 @@ class Sm100W8A16Fp8GemmKernel:
                         # The load's latency lands on the first use; charge the wait
                         # for the first element here so the phases separate.
                         probe = tTR_rAcc[0]
-                        epi_cyc_ld += clock_lo(61) - t_l0 + (probe == 12345.0).to(
-                            cutlass.Int32
+                        epi_cyc_ld += (
+                            clock_lo(61) - t_l0 + (probe == 12345.0).to(cutlass.Int32)
                         )
                     t_c0 = self._dbg_clock(62)
                     m_thr_slice = m_thr_offset[(None, None, None, subtile_idx)]
@@ -1654,8 +1646,8 @@ class Sm100W8A16Fp8GemmKernel:
                         tTR_rAcc.store(scale_val * tTR_rAcc.load())
                     if cutlass.const_expr(self.debug and subtile_idx == 0):
                         if epi_tidx == 0:
-                            dbg[dbg_base + _slot_if(epi_tile_count == 0, 6)] = (
-                                clock_lo(6)
+                            dbg[dbg_base + _slot_if(epi_tile_count == 0, 6)] = clock_lo(
+                                6
                             )
 
                     # A partial last activation tile goes through the TMA store as well
@@ -1731,9 +1723,7 @@ class Sm100W8A16Fp8GemmKernel:
                 if cutlass.const_expr(self.debug):
                     dbg_tiles += 1
                     if epi_tidx == 0:
-                        dbg[dbg_base + _slot_if(epi_tile_count == 1, 25)] = (
-                            clock_lo(25)
-                        )
+                        dbg[dbg_base + _slot_if(epi_tile_count == 1, 25)] = clock_lo(25)
                         dbg[dbg_base + 26] = global_timer_lo(26)
                         dbg[dbg_base + 5] = dbg_tiles
                         dbg[dbg_base + 13] = cutlass.Int32(3)

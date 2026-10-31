@@ -387,40 +387,6 @@ def make_kernel(
     return run
 
 
-def make_dsl(
-    act: torch.Tensor,
-    w_fp8: torch.Tensor,
-    scale: torch.Tensor,
-    bias,
-    algo: str | None = None,
-    out: torch.Tensor | None = None,
-) -> Callable[[], torch.Tensor]:
-    """The CuTe-DSL kernel (``--impls dsl``), same contract and algo names as the
-    C++ one; ``dsl:<algo>`` columns pin a variant like ``kernel:<algo>``."""
-    from flashinfer.gemm.w8a16_fp8 import (
-        W8A16_FP8_GEMM_ALGOS_SM90,
-        W8A16_FP8_GEMM_ALGOS_SM100,
-    )
-    from flashinfer.gemm.w8a16_fp8_cute_dsl import w8a16_fp8_gemm_cute_dsl
-
-    if out is None:
-        out = torch.empty(
-            act.shape[0], w_fp8.shape[0], dtype=act.dtype, device=act.device
-        )
-    table = (
-        W8A16_FP8_GEMM_ALGOS_SM90
-        if torch.cuda.get_device_capability(act.device)[0] == 9
-        else W8A16_FP8_GEMM_ALGOS_SM100
-    )
-    code = 0 if algo in (None, "auto") else table[algo]
-    scale1 = scale.reshape(1).contiguous()
-
-    def run() -> torch.Tensor:
-        return w8a16_fp8_gemm_cute_dsl(act, w_fp8, scale1, bias, out=out, algo=code)
-
-    return run
-
-
 # ---------------------------------------------------------------------------
 # Per-shape benchmark
 # ---------------------------------------------------------------------------
@@ -487,10 +453,6 @@ def bench_shape(args, layer: str, tp: int, m: int, n: int, k: int) -> Row:
         if kernel_out is None:
             kernel_out = torch.empty(m, n, dtype=dtype, device=dev)
         impls[name] = make_kernel(act, w_fp8, scale, bias, algo=algo, out=kernel_out)
-    for name, algo in _dsl_variants(args):
-        if kernel_out is None:
-            kernel_out = torch.empty(m, n, dtype=dtype, device=dev)
-        impls[name] = make_dsl(act, w_fp8, scale, bias, algo=algo, out=kernel_out)
 
     max_abs: dict[str, float] = {}
     max_rel: dict[str, float] = {}
@@ -590,7 +552,7 @@ def _kernel_gate(
     floor so an exactly-fp32-accumulating reference isn't penalised for a tiny
     cast-copy error).
     """
-    kernel_cols = [c for c in impls if c.startswith(("kernel", "dsl"))]
+    kernel_cols = [c for c in impls if c.startswith("kernel")]
     if not kernel_cols:
         return None
     cast_err = max_abs.get("cast")
@@ -638,24 +600,9 @@ def _kernel_variants(args) -> list[tuple[str, str | None]]:
     return out
 
 
-def _dsl_variants(args) -> list[tuple[str, str | None]]:
-    """(column name, algo) for the CuTe-DSL columns, mirroring _kernel_variants."""
-    out: list[tuple[str, str | None]] = []
-    if "dsl" in args.impls:
-        if args.algo:
-            out += [(f"dsl:{a}", None if a == "auto" else a) for a in args.algo]
-        else:
-            out.append(("dsl", None))
-    return out
-
-
 def _impl_cols(args) -> list[str]:
     cols = [i for i in ("cast", "cublas") if i in args.impls]
-    return (
-        cols
-        + [name for name, _ in _kernel_variants(args)]
-        + [name for name, _ in _dsl_variants(args)]
-    )
+    return cols + [name for name, _ in _kernel_variants(args)]
 
 
 def table_header(args) -> str:
@@ -699,7 +646,7 @@ def print_table(rows: list[Row], args) -> None:
 def write_csv(rows: list[Row], path: str, args) -> None:
     variants = [
         name for name, _ in _kernel_variants(args) if name.startswith("kernel:")
-    ] + [name for name, _ in _dsl_variants(args)]
+    ]
     with open(path, "w", newline="") as f:
         w = csv.writer(f)
         w.writerow(
@@ -787,7 +734,7 @@ def parse_args(argv=None):
         "--impls",
         nargs="+",
         default=["cast", "cublas", "kernel"],
-        choices=["cast", "cublas", "kernel", "dsl"],
+        choices=["cast", "cublas", "kernel"],
     )
     p.add_argument("--iters", type=int, default=50)
     p.add_argument(

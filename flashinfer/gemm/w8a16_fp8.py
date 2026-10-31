@@ -20,22 +20,8 @@ from typing import Optional
 import torch
 
 from ..api_logging import flashinfer_api
-from ..jit.gemm.w8a16_fp8 import (
-    gen_w8a16_fp8_gemm_module,
-    gen_w8a16_fp8_gemm_sm100_module,
-)
 from ..utils import get_compute_capability, register_custom_op, register_fake_op
-
-
-@functools.cache
-def _get_module(major: int, act_dtype: torch.dtype):
-    if major == 9:
-        return gen_w8a16_fp8_gemm_module(act_dtype).build_and_load()
-    if major == 10:
-        return gen_w8a16_fp8_gemm_sm100_module(act_dtype).build_and_load()
-    raise RuntimeError(
-        f"w8a16_fp8_gemm needs Hopper (sm_90a) or Blackwell (sm_100a), got SM {major}x"
-    )
+from . import w8a16_fp8_cute_dsl as _dsl
 
 
 def _resolve_device(device: Optional[torch.device]) -> torch.device:
@@ -89,16 +75,12 @@ def _check_disjoint(
         )
 
 
-def get_w8a16_fp8_gemm_module(
-    device: Optional[torch.device] = None, act_dtype: torch.dtype = torch.bfloat16
-):
-    """Kernel module for ``device`` (current device when omitted) and activation dtype.
-
-    One JIT module per (architecture, activation dtype): Hopper or Blackwell build,
-    fp16 or bf16.  The first call for a pair compiles it; the other dtype is never
-    compiled unless used."""
-    device = _resolve_device(device)
-    return _get_module(get_compute_capability(device)[0], act_dtype)
+def _check_arch(device: torch.device) -> None:
+    major = get_compute_capability(device)[0]
+    if major not in (9, 10):
+        raise RuntimeError(
+            f"w8a16_fp8_gemm needs Hopper (sm_90a) or Blackwell (sm_100a), got SM {major}x"
+        )
 
 
 @register_custom_op("flashinfer::w8a16_fp8_gemm", mutates_args=("out",))
@@ -111,8 +93,8 @@ def _w8a16_fp8_gemm_impl(
     workspace: Optional[torch.Tensor],
     algo: int,
 ) -> None:
-    get_w8a16_fp8_gemm_module(act.device, act.dtype).w8a16_fp8_gemm(
-        out, act, weight, weight_scale, bias, workspace, algo
+    _dsl.w8a16_fp8_gemm_cute_dsl(
+        act, weight, weight_scale, bias, out, algo, workspace=workspace
     )
 
 
@@ -130,18 +112,12 @@ def _w8a16_fp8_gemm_impl_fake(
 
 
 @functools.cache
-def _workspace_bytes(
-    m: int, n: int, k: int, device_index: int, algo: int, act_dtype: torch.dtype
-) -> int:
-    """Bytes of workspace this problem needs on this device (0 = none).
-
-    The size does not depend on the activation dtype; ``act_dtype`` only picks
-    which module answers, so the GEMM call never loads a second one."""
-    return int(
-        get_w8a16_fp8_gemm_module(
-            torch.device("cuda", device_index), act_dtype
-        ).w8a16_fp8_gemm_workspace_bytes(m, n, k, device_index, algo)
-    )
+def _workspace_bytes(m: int, n: int, k: int, device_index: int, algo: int) -> int:
+    """Bytes of workspace this problem needs on this device (0 = none): the fp32
+    partials of a split-K run, when the variant (forced or chosen) splits K."""
+    device = torch.device("cuda", device_index)
+    _check_arch(device)
+    return _dsl.w8a16_fp8_gemm_workspace_bytes(m, n, k, device, algo)
 
 
 def w8a16_fp8_gemm_workspace_bytes(
@@ -173,8 +149,7 @@ def w8a16_fp8_gemm_workspace_bytes(
         several shapes from one buffer takes the maximum over them.
     act_dtype: torch.dtype
         The activation dtype the call will use.  The size is the same for
-        fp16 and bf16; passing the dtype you will call with avoids compiling
-        the other dtype's module.
+        fp16 and bf16; the argument is accepted for callers that pass it.
 
     Returns
     -------
@@ -189,23 +164,21 @@ def w8a16_fp8_gemm_workspace_bytes(
         A shape outside the bounds above, an unknown ``algo``, or a non-CUDA
         device.
     RuntimeError
-        Raised by the native launcher (for ``m > 0``): a split-K ``algo`` on a
-        ``k`` that cannot be sliced, or a byte count that leaves the signed
-        64-bit range.
+        A device that is not Hopper or Blackwell.
+    ValueError
+        A split-K ``algo`` on a ``k`` that cannot be sliced (for ``m > 0``).
     """
     device = _resolve_device(device)
     _check_dims(m, n, k)
     algo_code = _algo_code(algo, device)
     if m == 0:
         return 0
-    return _workspace_bytes(m, n, k, device.index, algo_code, act_dtype)
+    return _workspace_bytes(m, n, k, device.index, algo_code)
 
 
-# The kernels and CUTLASS's tile schedulers index with 32-bit ints: a dimension needs
-# headroom for the largest tile (256) in the tile-count ceiling division, which CuTe
-# evaluates as `(dim + tile) - 1`, so `dim + 256` itself must fit; and the output tile
-# count (times the split count, at most 8) must fit an int.  The launchers check the same
-# bounds.
+# The kernels index with 32-bit ints: a dimension needs headroom for the largest
+# tile (256) in the tile-count ceiling division, so `dim + 256` itself must fit; and
+# the output tile count (times the split count, at most 8) must fit an int.
 _MAX_DIM = 2**31 - 512
 _MAX_TILES64 = (2**31 - 1) // 8  # 64x64 output tiles
 
@@ -231,8 +204,8 @@ def _check_dims(m: int, n: int, k: int) -> None:
         raise ValueError(f"N must be a multiple of 8 (16-byte output rows), got N={n}")
 
 
-# Blackwell kernel variants selectable through ``algo``.  The codes are the
-# W8A16Sm100Algo enum values in include/flashinfer/gemm/w8a16_sm100/dispatch.hpp.
+# Blackwell kernel variants selectable through ``algo`` (``_SM100_TILES`` in
+# w8a16_fp8_cute_dsl.py).  The stream-K code runs the best of the other variants.
 W8A16_FP8_GEMM_ALGOS_SM100: dict[str, int] = {
     "auto": 0,
     "2sm256x128": 1,
@@ -246,9 +219,8 @@ W8A16_FP8_GEMM_ALGOS_SM100: dict[str, int] = {
 
 
 # Hopper kernel variants selectable through ``algo`` (weight rows x activation rows per
-# CTA tile, plus the stream-K and split-K decompositions).  The codes are the
-# W8A16Sm90Algo enum values in include/flashinfer/gemm/w8a16_sm90/dispatch.hpp; code 1
-# is reserved.
+# CTA tile, plus the stream-K and split-K decompositions; ``_SM90_TILES`` in
+# w8a16_fp8_cute_dsl.py).  Code 1 is reserved.
 W8A16_FP8_GEMM_ALGOS_SM90: dict[str, int] = {
     "auto": 0,
     "128x256": 2,
@@ -261,7 +233,7 @@ W8A16_FP8_GEMM_ALGOS_SM90: dict[str, int] = {
     "64x128": 9,
     "128x128_splitk": 10,
     "128x256_splitk": 11,
-    "64x128_splitk": 12,  # CuTe-DSL only (the C++ dispatcher has no code 12)
+    "64x128_splitk": 12,
 }
 
 
@@ -348,17 +320,21 @@ def w8a16_fp8_gemm(
         (``<weight rows>x<activation rows>[_streamk|_splitk]``).
         ``None`` / ``"auto"`` = the launcher decides.  This is the only
         override; there are no environment variables.  A ``_splitk`` variant
-        is rejected with a RuntimeError on a ``K`` it cannot slice (Hopper:
+        is rejected with a ValueError on a ``K`` it cannot slice (Hopper:
         ``K`` a multiple of 64 whose 64-deep tile count divides into 2..8
         equal slices of at least 8 tiles; Blackwell: ``K`` a multiple of 128
-        whose 128-deep tile count has a divisor in 2..8).
+        whose 128-deep tile count has a divisor in 2..8).  On Hopper the
+        split-K variants reduce their slices inside the kernel, which needs
+        all slices of the grid resident at once: forced on a grid of more
+        tiles than that allows, they run the tile plain (no workspace).  The
+        ``_streamk`` names select the best of the other variants for the
+        problem (there is no stream-K kernel).
 
     Notes
     -----
-    Runs on Hopper (``sm_90a``) and Blackwell (``sm_100a``).  The kernels are
-    JIT-compiled on first use (one module per architecture and activation
-    dtype, so the first bf16 call compiles only the bf16 module and the first
-    fp16 call only the fp16 one) and are not part of the AOT packages.
+    Runs on Hopper (``sm_90a``) and Blackwell (``sm_100a`` / ``sm_103a``).  The
+    kernels are CuTe-DSL, compiled on first use per architecture, tile variant,
+    activation dtype and bias presence, and are not part of the AOT packages.
 
     Shapes and layout: ``K`` must be a multiple of 16 and ``N`` a multiple of
     8, both non-zero, and ``M`` (the product of ``act``'s leading dimensions,
@@ -399,10 +375,8 @@ def w8a16_fp8_gemm(
         contiguity, alignment, aliasing, an unknown ``algo``, a ``workspace``
         shorter than the query's answer), before anything is launched.
     RuntimeError
-        Raised by the native launcher, also before launch: a split-K ``algo``
-        on a ``K`` it cannot slice, or a workspace byte count that leaves the
-        signed 64-bit range.  A launch failure reported by the CUDA runtime
-        surfaces the same way.
+        A device that is not Hopper or Blackwell, or a launch failure reported
+        by the CUDA runtime.
     """
     if act.dtype not in (torch.float16, torch.bfloat16):
         raise ValueError(f"act must be float16 or bfloat16, got {act.dtype}")
@@ -429,6 +403,7 @@ def w8a16_fp8_gemm(
             f"weight and weight_scale must be on act's device {act.device}, got "
             f"{weight.device} and {weight_scale.device}"
         )
+    _check_arch(device)
     algo_code = _algo_code(algo, device)
     # No implicit copies: a non-contiguous act (row slice, transposed last dim,
     # permuted leading dims) is the caller's to .contiguous() if they want that.
@@ -467,7 +442,7 @@ def w8a16_fp8_gemm(
     out2d = out.view(-1, n)
     _check_aligned(act2d, "act")
     _check_aligned(out2d, "out")
-    ws_bytes = _workspace_bytes(m, n, k, device.index, algo_code, act.dtype)
+    ws_bytes = _workspace_bytes(m, n, k, device.index, algo_code)
     ws = _select_workspace(workspace, ws_bytes, act.device)
     _w8a16_fp8_gemm_impl(out2d, act2d, weight, weight_scale, bias, ws, algo_code)
     return out
