@@ -125,6 +125,7 @@ from .cake_backend import (
     dw_cast_tma_rule,
     dw_stream_mode,
     dx_max_slices,
+    dx_slices_fit,
     dx_wide_items,
     forward_early_keys,
     gemm_scalars,
@@ -528,11 +529,23 @@ def make_plan(
             raise ValueError(
                 f"gemm_tuning dx k_slices={explicit_k}: the registered program serves 1 .. {int(dx_max_slices)} dX slices"
             )
+        k_iters = int(problem.vocab) // int(geometry.k_block)
+        if dx_slices_fit(explicit_k, k_iters) != explicit_k:
+            raise ValueError(
+                f"gemm_tuning dx k_slices={explicit_k}: V = {problem.vocab} has {k_iters} K steps, which "
+                f"{explicit_k} slices of {-(-k_iters // explicit_k)} steps do not all reach"
+            )
         slices = tuple(explicit_k for _ in chunks)
     elif need_dx and int(dx_max_slices) > 1:
         slices = tuple(
             recommended_k_slices(
-                rows_c, problem.hidden, num_sms, dx_max_slices, geometry, dx_resident
+                rows_c,
+                problem.hidden,
+                num_sms,
+                dx_max_slices,
+                geometry,
+                dx_resident,
+                vocab=problem.vocab,
             )
             for _, rows_c in chunks
         )
@@ -3040,6 +3053,7 @@ def _check_budget_call(backend: str, grad_weight_dtype) -> None:
 def _dx_ws_slabs(
     rows: int,
     hidden: int,
+    vocab: int,
     chunk: int,
     num_sms: int,
     dx_max: int,
@@ -3055,7 +3069,9 @@ def _dx_ws_slabs(
         return 0
     return (
         max(
-            recommended_k_slices(rows_c, hidden, num_sms, dx_max, geometry, resident)
+            recommended_k_slices(
+                rows_c, hidden, num_sms, dx_max, geometry, resident, vocab=vocab
+            )
             for _, rows_c in plan_chunks(rows, chunk)
         )
         - 1
@@ -3098,6 +3114,7 @@ def _budget_plan(
         slabs = _dx_ws_slabs(
             int(rows),
             int(hidden),
+            int(vocab),
             int(chunk),
             num_sms,
             dx_max_slices(stages),

@@ -494,7 +494,10 @@ gather and logits GEMM ran before the count was known, see
   temporary bucket) that the host adds into `dX_acc` in fixed slab order (one
   RN add per element per slab, no atomics).  The slice count of a chunk
   follows from its row count and the SM count
-  (`cake_backend.recommended_k_slices`), so it is deterministic in the shapes.
+  (`cake_backend.recommended_k_slices`) and is then fitted to the `V / 64`
+  K steps (`cake_backend.dx_slices_fit`: the largest count whose
+  `ceil(k_iters / k_slices)`-step slices all hold a K step, e.g. 2 in place of
+  3 at `V` = 256), so it is deterministic in the shapes.
   Both forms exist with the 512-column pair tile (the default) and the
   256-column tile (`_tn256`), see the structural forms below.
 * `gemm_dw_acc`: `dW_acc = fp32(dz_c^T @ X_c)` on the first chunk,
@@ -634,7 +637,8 @@ table ring depth 4, keeps that form and turns the `_swab` rule off.
 `"swap_ab": true` applies to every chunk; it raises with such a `"stages"`,
 with a nonzero `"split"`, on an architecture without the swapped program
 (only SM103 has it), and on a chunk whose dX tile is the 256-column one
-(pin `"tile_n": 512` as well).
+(pin `"tile_n": 512` as well).  A `"k_slices"` pin that leaves a slice without
+a K step raises (e.g. 3 slices over `V` = 256's four K steps).
 
 Grid rules live in the registry record (e.g. `rows_c/8` CTAs for
 `row_finalize`, `V/8/1024 x rows_c` for `row_grad`) and are evaluated by the
