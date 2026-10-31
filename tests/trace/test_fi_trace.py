@@ -170,6 +170,26 @@ def test_all_registered_trace_templates_have_check():
     assert not missing
 
 
+@pytest.mark.parametrize(
+    "precision",
+    [
+        {"epi_dtype": torch.float16},
+        {"acc_dtype": torch.float16},
+        {"output_dtype": torch.bfloat16},
+    ],
+)
+def test_fp8_paged_mqa_logits_trace_rejects_unsupported_precision(precision):
+    """Trace precision rejection happens before tensor/shape extraction."""
+    from flashinfer.trace.templates.attn_scores import fp8_paged_mqa_logits_trace
+
+    with pytest.raises(ValueError, match="FP8 logits trace supports only"):
+        fi_trace(flashinfer.fp8_paged_mqa_logits, **precision)
+    with pytest.raises(ValueError, match="FP8 logits trace supports only"):
+        fp8_paged_mqa_logits_trace.reference(
+            None, None, None, None, None, 0, **precision
+        )
+
+
 def test_norm_trace_check_tolerances_match_unit_tests():
     from flashinfer.trace.templates.norm import (
         fused_add_rmsnorm_quant_trace,

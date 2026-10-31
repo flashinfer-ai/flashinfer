@@ -84,6 +84,18 @@ def _pack_fused_kv_fp8(kv_fp8, kv_scales, block_size, head_dim):
     return fused.view(num_blocks, block_size, 1, head_dim + 4)
 
 
+def _validate_fp8_logits_trace_precision(
+    output_dtype=torch.float32,
+    epi_dtype=torch.float32,
+    acc_dtype=torch.float32,
+):
+    """Keep unsupported arithmetic precision out of the FP32 trace recipe."""
+    if epi_dtype is not torch.float32 or acc_dtype is not torch.float32:
+        raise ValueError("FP8 logits trace supports only FP32 epi_dtype and acc_dtype")
+    if output_dtype not in (torch.float32, torch.float16):
+        raise ValueError("FP8 logits trace supports only FP32 or FP16 output_dtype")
+
+
 @torch.no_grad()
 def _fp8_paged_mqa_logits_reference(
     q,
@@ -93,11 +105,17 @@ def _fp8_paged_mqa_logits_reference(
     seq_lens,
     max_seq_len,
     output_dtype=torch.float32,
+    math_mode="relu_strict",
+    *,
+    epi_dtype=torch.float32,
+    acc_dtype=torch.float32,
 ):
     """Pure-torch reference operating on the packed FP8 API inputs.
 
     Unpacks ``kv_fused`` (flat [all KV][all scales] per block) back into fp8 KV
-    and fp32 per-token scales, then reproduces the kernel math."""
+    and fp32 per-token scales. Only FP32 epilogue/accumulation is modeled;
+    output conversion happens at the final store, not in intermediate math."""
+    _validate_fp8_logits_trace_precision(output_dtype, epi_dtype, acc_dtype)
     num_blocks, block_size, _one, row_bytes = kv_fused.shape
     head_dim = row_bytes - 4
     B, next_n, H, _D = q.shape
@@ -123,17 +141,24 @@ def _fp8_paged_mqa_logits_reference(
     for b in range(B):
         seq_len = int(seq_lens[b].item())
         q_pos = torch.arange(seq_len - next_n, seq_len, device=device)
-        w = weights[b * next_n : (b + 1) * next_n, :].to(output_dtype)
+        w = weights[b * next_n : (b + 1) * next_n, :].float()
         for blk in range((seq_len + block_size - 1) // block_size):
             phys = int(block_tables[b, blk].item())
             k = kv_fp8[phys].float()
-            sc = scales[phys].to(output_dtype)
+            sc = scales[phys].float()
             kpos = torch.arange(blk * block_size, (blk + 1) * block_size, device=device)
             mask = (kpos[None, :] < seq_len) & (kpos[None, :] <= q_pos[:, None])
             qk = torch.matmul(q_f32[b].permute(1, 0, 2), k.T)
             qk = torch.where(mask[None, :, :], qk, torch.zeros(1, device=device))
-            qk = torch.relu(qk).to(output_dtype)
-            weighted = (w.T[:, :, None] * qk).sum(dim=0) * sc[None, :]
+            if math_mode == "relu_fast":
+                activated = qk + qk.abs()
+                scale = sc * 0.5
+            elif math_mode == "relu_strict":
+                activated = torch.relu(qk)
+                scale = sc
+            else:
+                raise ValueError("unknown FP8 math_mode")
+            weighted = (w.T[:, :, None] * activated).sum(dim=0) * scale[None, :]
             # max_seq_len is a free axis and need not be block-aligned, so
             # the last physical block can extend past the output width. Clip
             # both the destination and the right-hand side to it.
@@ -150,7 +175,9 @@ def _fp8_paged_mqa_logits_reference(
     return logits
 
 
-_fp8_paged_mqa_logits_reference._trace_reference_dependencies = ()
+_fp8_paged_mqa_logits_reference._trace_reference_dependencies = (
+    _validate_fp8_logits_trace_precision,
+)
 
 
 def _paged_mqa_logits_masked_check(
@@ -240,10 +267,13 @@ def _fp8_paged_mqa_logits_init(
     head_dim: int = 128,
     block_size: int = 64,
     max_seq_len: int = 4096,
+    output_dtype: torch.dtype = torch.float32,
+    math_mode: str = "relu_strict",
     device: str = "cuda",
     seed: int = 0,
 ):
     """Build valid inputs for ``flashinfer.fp8_paged_mqa_logits`` (all rows at max_seq_len)."""
+    _validate_fp8_logits_trace_precision(output_dtype)
     torch.manual_seed(seed)
     seq_lens = torch.full((batch_size,), max_seq_len, dtype=torch.int32, device=device)
     block_tables, num_blocks = _make_paged_block_table(seq_lens, block_size, device)
@@ -266,6 +296,8 @@ def _fp8_paged_mqa_logits_init(
         "block_tables": block_tables,
         "seq_lens": seq_lens,
         "max_seq_len": max_seq_len,
+        "output_dtype": output_dtype,
+        "math_mode": math_mode,
     }
 
 
@@ -273,10 +305,32 @@ _fp8_paged_mqa_logits_init._trace_init_dependencies = (  # type: ignore[attr-def
     _ceil_to_ue8m0_fp,
     _make_paged_block_table,
     _pack_fused_kv_fp8,
+    _validate_fp8_logits_trace_precision,
 )
 
 
-fp8_paged_mqa_logits_trace = TraceTemplate(
+class _FP8LogitsTraceTemplate(TraceTemplate):
+    """Reject scorer semantics the exported ordinary FP32 recipe cannot model."""
+
+    def build_fi_trace_fn(self, fi_api):
+        base_fi_trace = super().build_fi_trace_fn(fi_api)
+
+        def fi_trace(save_dir=None, name=None, **kwargs):
+            if {"query_metadata", "output_rows", "kernel_config"} & kwargs.keys():
+                raise TypeError(
+                    "grouped scorer options are private and cannot be traced"
+                )
+            _validate_fp8_logits_trace_precision(
+                kwargs.get("output_dtype", torch.float32),
+                kwargs.get("epi_dtype", torch.float32),
+                kwargs.get("acc_dtype", torch.float32),
+            )
+            return base_fi_trace(save_dir=save_dir, name=name, **kwargs)
+
+        return fi_trace
+
+
+fp8_paged_mqa_logits_trace = _FP8LogitsTraceTemplate(
     op_type="paged_mqa_logits",
     name_prefix="fp8_paged_mqa_logits",
     description=(
@@ -325,11 +379,21 @@ fp8_paged_mqa_logits_trace = TraceTemplate(
             ["batch_size"], dtype="int32", description="Per-request KV length."
         ),
         "max_seq_len": Scalar("int32", description="Maximum KV sequence length."),
+        "output_dtype": Scalar(
+            "dtype", optional=True, description="Final storage dtype; FP32 by default."
+        ),
+        "math_mode": Scalar(
+            "string",
+            optional=True,
+            description="FP32 epilogue policy: relu_strict (default) or relu_fast.",
+        ),
     },
     outputs={
         "logits": Tensor(
             ["num_rows", "max_seq_len"],
             dtype="float32",
+            dtype_from="out",
+            dtype_from_scalar="output_dtype",
             description="Attention-score logits.",
         ),
     },

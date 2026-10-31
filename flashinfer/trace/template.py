@@ -558,6 +558,10 @@ class TraceTemplate:
         For wrapper-class APIs (paged decode/prefill, MLA), the init returns
         ``{"plan": {...}, "run": {...}}`` so the caller can call
         ``wrapper.plan(**inputs["plan"])`` then ``wrapper.run(**inputs["run"])``.
+        Capacity-planned wrappers can also return a ``"constructor"`` dict;
+        instantiate the wrapper with those static options before planning.
+        Capacity workspace is reserved by construction, followed by ``"plan"``
+        for shared step metadata and ``"run"`` for each layer.
 
         The function's source is embedded in the dumped JSON (under the
         ``"init"`` key) so an external benchmark can extract and re-run it.
