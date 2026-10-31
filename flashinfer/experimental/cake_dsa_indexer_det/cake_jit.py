@@ -726,6 +726,7 @@ POLICY: dict[str, dict[str, Any]] = {
         "split_units": ["l6", "narrow"],
         "pair_rule": [128.0, 256.0, 512],
         "pair_units": ["l6"],
+        "l6_solo_rule": None,
         "snake_default": False,
         "snake_rule": None,
         "tile_unroll_default": 1,
@@ -799,6 +800,7 @@ POLICY: dict[str, dict[str, Any]] = {
         "split_units": ["l6", "narrow"],
         "pair_rule": [64.0, 1024.0, 512],
         "pair_units": ["l6"],
+        "l6_solo_rule": None,
         "snake_default": False,
         "snake_rule": None,
         "tile_unroll_default": 1,
@@ -872,6 +874,7 @@ POLICY: dict[str, dict[str, Any]] = {
         "split_units": ["narrow", "wide"],
         "pair_rule": [0.0, 4096.0, 512],
         "pair_units": ["l6", "narrow", "wide"],
+        "l6_solo_rule": [128.0, 2],
         "snake_default": False,
         "snake_rule": [
             ["l6", "narrow", "pair_l6", "pair_narrow", "pair_wide", "wide"],

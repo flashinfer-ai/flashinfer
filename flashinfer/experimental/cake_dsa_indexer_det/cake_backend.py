@@ -594,6 +594,7 @@ def plan_dsa_indexer_det_topk(
         finalize_threads=finalize_threads,
         max_seqlen_k=max_seqlen_k,
         outputs_aligned=bool(outputs_aligned),
+        scan_keys=PROGRAM_KEYS.get(arch, {}),
     )
 
 
@@ -618,21 +619,29 @@ def dsa_indexer_det_workspace_size(
     ``T x n_split x top_k x entry_bytes`` when the dispatch splits the key
     ranges.  The dispatch, and with it the bound, depends on ``T``, ``Tkv``,
     ``S``, ``ratio`` and ``top_k``; prepare a call's buffer for its own geometry
-    (or for the largest bound over the geometries it will serve).
+    (or for the largest bound over the geometries it will serve).  The bound
+    covers both sampling modes: where the record's ``l6_solo_rule`` gives a
+    call with the sampled first threshold off (``sample_tiles_max=0``) another
+    unit geometry than the sampled default, the larger of the two plans.
     """
-    choice = plan_dsa_indexer_det_topk(
-        num_queries,
-        num_keys,
-        num_segments,
-        top_k=top_k,
-        ratio=ratio,
-        device=device,
-        arch=arch,
-        grid_ctas=grid_ctas,
-        num_sms=num_sms,
-        candidate_multiplier=candidate_multiplier,
+    return max(
+        int(
+            plan_dsa_indexer_det_topk(
+                num_queries,
+                num_keys,
+                num_segments,
+                top_k=top_k,
+                ratio=ratio,
+                device=device,
+                arch=arch,
+                grid_ctas=grid_ctas,
+                num_sms=num_sms,
+                candidate_multiplier=candidate_multiplier,
+                sample_tiles_max=sample_tiles_max,
+            ).workspace_bytes
+        )
+        for sample_tiles_max in (None, 0)
     )
-    return int(choice.workspace_bytes)
 
 
 # ---------------------------------------------------------------------------

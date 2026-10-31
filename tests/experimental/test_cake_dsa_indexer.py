@@ -29,6 +29,7 @@ limitations under the License.
 # public entry point (``flashinfer.dsa_indexer``) and its experimental-API
 # warning contract are covered by ``test_cake_dsa_indexer_api.py``.
 
+import itertools
 import os
 import re
 from types import SimpleNamespace
@@ -106,6 +107,7 @@ _COMMON = dict(
     split_max=32,
     split_min_range_tiles=64,
     split_units=["l6", "narrow", "wide"],
+    l6_solo_rule=None,
     snake_default=False,
     tile_unroll_default=1,
     tile_unroll_factor=2,
@@ -345,6 +347,9 @@ def test_registry_records_are_well_formed():
                 if k.startswith("scan:pair_")
             }
         ), arch
+        # the unpaired three-warpgroup preference needs the unpaired l6 program
+        if policy.l6_solo_rule is not None:
+            assert "scan:l6:u1:s0:f0" in keys, arch
         # the key-range split serves exactly the unit geometries whose split program the architecture registers
         assert policy.split_units == sorted(
             {
@@ -714,6 +719,15 @@ def test_policy_record_round_trip_and_validation():
         dict(split_units=["split_l6"]),
         dict(split_units=["wide", "l6"]),
         dict(split_units=["l6", "l6"]),
+        # the unpaired three-warpgroup preference: [max mean unit tiles >= 0, min segments >= 1] or None
+        dict(l6_solo_rule=128),
+        dict(l6_solo_rule=[]),
+        dict(l6_solo_rule=[128.0]),
+        dict(l6_solo_rule=[128.0, 2, 1]),
+        dict(l6_solo_rule=[-1.0, 2]),
+        dict(l6_solo_rule=[128.0, 0]),
+        dict(l6_solo_rule=[128.0, 2.0]),
+        dict(l6_solo_rule=[True, 2]),
         # the units the CTA pair serves: an ascending list of unit geometries, not empty while pair_rule is set
         dict(pair_units="l6"),
         dict(pair_units=["pair_l6"]),
@@ -1495,7 +1509,7 @@ def test_policy_selects_registered_programs_on_a_dense_geometry_grid():
     fails closed by name on an unregistered program, so a selectable but unregistered program is a production failure
     (round 2 review: ``scan:narrow:u1:s1:f1`` on sm_107a at 6018 queries x 11754 keys was selectable but unregistered).
     Both sample modes: the unsampled plan family (``sample_tiles_max=0``, the ``*_unsampled`` capacity values) is
-    otherwise unseen by the grid."""
+    otherwise unseen by the grid.  With and without the registry: ``l6_solo_rule`` is on only with it."""
     if not cake_jit.PROGRAM_KEYS:
         pytest.skip("placeholder registry")
     for arch, keys in cake_jit.PROGRAM_KEYS.items():
@@ -1508,7 +1522,9 @@ def test_policy_selects_registered_programs_on_a_dense_geometry_grid():
                 ):  # lever RW: S equal segments and one long segment
                     bounds += sorted({-(-Tkv // S), Tkv})
                 for bound in bounds:
-                    for sample_tiles_max in (None, 0):
+                    for sample_tiles_max, scan_keys in itertools.product(
+                        (None, 0), (None, keys)
+                    ):
                         choice = select_program(
                             policy,
                             num_queries=T,
@@ -1519,6 +1535,7 @@ def test_policy_selects_registered_programs_on_a_dense_geometry_grid():
                             grid=grid,
                             sample_tiles_max=sample_tiles_max,
                             max_seqlen_k=bound,
+                            scan_keys=scan_keys,
                         )
                         selected = [choice.scan_key, choice.finalize_key] + (
                             [MERGE_KEY] if choice.n_split > 1 else []
@@ -1534,6 +1551,7 @@ def test_policy_selects_registered_programs_on_a_dense_geometry_grid():
                                 top_k,
                                 bound,
                                 sample_tiles_max,
+                                scan_keys is None,
                                 key,
                             )
 
@@ -1593,6 +1611,7 @@ def test_split_units_keep_every_split_plan_registered():
                                 top_k=2048,
                                 grid=grid,
                                 sample_tiles_max=sample,
+                                scan_keys=keys,
                             )
                             assert c.scan_key in keys, (
                                 arch,
@@ -1603,6 +1622,111 @@ def test_split_units_keep_every_split_plan_registered():
                                 sample,
                                 c.scan_key,
                             )
+
+
+def test_l6_solo_rule_prefers_the_unpaired_l6_unit_where_registered_and_unsplit():
+    """sm_107a's ``l6_solo_rule`` [128.0, 2]: a call that does not split takes the three-warpgroup unit without a CTA pair
+    with sampling off always, and sampled with >= 2 segments or <= 128 mean unit tiles; never where the l6 unit would
+    split, where the plan splits, or where the program it picks (here ``scan:l6:u1:s1:f0``) is not registered.  The
+    workspace bound covers both sampling modes."""
+    if not cake_jit.PROGRAM_KEYS:
+        pytest.skip("placeholder registry")
+    p, keys = policy_for("sm_107a"), cake_jit.PROGRAM_KEYS["sm_107a"]
+    assert p.l6_solo_rule == [128.0, 2]
+    plain = DispatchPolicy.from_record(dict(p.record(), l6_solo_rule=None))
+
+    def plans(T, Tkv, S, sample):
+        kw = dict(
+            num_queries=T,
+            num_keys=Tkv,
+            num_segments=S,
+            ratio=1,
+            top_k=2048,
+            grid=212,
+            sample_tiles_max=sample,
+        )
+        return select_program(p, scan_keys=keys, **kw), select_program(
+            plain, scan_keys=keys, **kw
+        )
+
+    def solo(c):
+        return (c.kind, c.block_q, c.pair, c.n_split, c.grid_ctas) == (
+            "l6",
+            6,
+            False,
+            1,
+            212,
+        ) and c.scan_key in keys
+
+    # one causal 64k document (256 mean tiles): sampled keeps the snake pair wide program, unsampled takes l6
+    rule, base = plans(65536, 65536, 1, None)
+    assert rule == base and base.scan_key == "scan:pair_wide:u1:s1:f1"
+    rule, base = plans(65536, 65536, 1, 0)
+    assert (
+        solo(rule) and rule.scan_key == "scan:l6:u1:s1:f1" and base.kind == "pair_wide"
+    )
+    # eight causal 8k documents (32 mean tiles, >= 2 segments): the pair l6 program becomes unpaired in both modes
+    for sample in (None, 0):
+        rule, base = plans(65536, 65536, 8, sample)
+        assert solo(rule) and rule.scan_key == "scan:l6:u1:s1:f1", sample
+        assert base.scan_key == "scan:pair_l6:u1:s1:f1", sample
+    # one sampled document of 100 mean tiles (<= 128): unpaired l6
+    rule, base = plans(16384, 16384 // 2 + 100 * 128, 1, None)
+    assert solo(rule) and base.kind != "l6"
+    # one causal 256k document (1024 mean tiles, no sampled fit): the unpaired l6 key would be scan:l6:u1:s1:f0, which is not
+    # registered, so the unsampled call keeps the pair wide program
+    assert "scan:l6:u1:s1:f0" not in keys
+    rule, base = plans(262144, 262144, 1, 0)
+    assert rule == base and base.scan_key == "scan:pair_wide:u1:s1:f0"
+    # a split call keeps its split (4 queries over 22018 keys: five narrow splits)
+    rule, base = plans(4, 22018, 1, 0)
+    assert rule == base and (base.kind, base.n_split) == ("split", 5)
+    # 600 queries over 100 mean tiles: the l6 unit would split two ways (no split_l6 program), so the plan stays
+    assert p.split_rule_for(600, 600 // 2 + 100 * 128, 1, 1, 212, p.block_q_l6) == 2
+    rule, base = plans(600, 600 // 2 + 100 * 128, 1, 0)
+    assert rule == base and base.kind != "l6"
+    # without a registry the rule stays off: the unsampled 64k document keeps the pair wide program
+    assert (
+        select_program(
+            p,
+            num_queries=65536,
+            num_keys=65536,
+            num_segments=1,
+            ratio=1,
+            top_k=2048,
+            grid=212,
+            sample_tiles_max=0,
+        ).scan_key
+        == "scan:pair_wide:u1:s1:f1"
+    )
+    # the backend plan passes the registry's keys; the workspace bound is the larger of the two sampling modes: 1024 queries
+    # over 200 mean tiles keep the four-query pair narrow unit sampled and take the six-query l6 unit unsampled
+    geometry = (1024, 1024 // 2 + 200 * 128, 1)
+    sampled = plan_dsa_indexer_det_topk(
+        *geometry, top_k=2048, arch="sm_107a", num_sms=212
+    )
+    unsampled = plan_dsa_indexer_det_topk(
+        *geometry, top_k=2048, arch="sm_107a", num_sms=212, sample_tiles_max=0
+    )
+    assert (sampled.kind, sampled.block_q) == ("pair_narrow", 4)
+    assert solo(unsampled) and unsampled.scan_key == "scan:l6:u1:s0:f0"
+    assert unsampled.workspace_bytes > sampled.workspace_bytes
+    assert (
+        dsa_indexer_det_workspace_size(
+            *geometry, top_k=2048, arch="sm_107a", num_sms=212
+        )
+        == unsampled.workspace_bytes
+    )
+    # the other architectures carry no rule: both sampling modes keep the same unit and pair
+    for arch in ("sm_100a", "sm_103a"):
+        assert policy_for(arch).l6_solo_rule is None
+        a = plan_dsa_indexer_det_topk(
+            65536, 65536, 1, top_k=2048, arch=arch, num_sms=148
+        )
+        b = plan_dsa_indexer_det_topk(
+            65536, 65536, 1, top_k=2048, arch=arch, num_sms=148, sample_tiles_max=0
+        )
+        assert (a.kind, a.block_q, a.pair) == (b.kind, b.block_q, b.pair), arch
 
 
 def test_sample_fit_kinds_name_exactly_the_registered_sampled_fit_programs():
