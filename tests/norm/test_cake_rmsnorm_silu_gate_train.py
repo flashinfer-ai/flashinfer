@@ -13,26 +13,34 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
-Tests of the Cake SiLU-gated RMSNorm training kernels with the opt-in
-non-deterministic weight gradient (``deterministic=False`` of
-:mod:`flashinfer.cake_rmsnorm_silu_gate_train`): ``RMSNorm(x) * w * SiLU(z)``.
+Backend suite of the Cake SiLU-gated RMSNorm training package with the opt-in
+non-deterministic weight gradient (``flashinfer.cake_rmsnorm_silu_gate_train_backend``,
+the ``deterministic=False`` path of :mod:`flashinfer.cake_rmsnorm_silu_gate_train`):
+``RMSNorm(x) * w * SiLU(z)``.
 
-``y``, ``dx`` and ``dz`` must equal the deterministic package's bits and lie
-within one BF16 ulp of an independent FP64 reference.  The weight gradient,
-whose FP64 cross-CTA sum depends on scheduling, is held to the deterministic
-suite's budget, ``|dw - dw64| <= |dw64| * 2^-7 + sum|terms| * 2^-20``, worst
-case over repeated launches, and to the same budget against the deterministic
-package's ``dw``.  The matrix covers dynamic token and head counts (``H = 48``
-and small or irregular row counts), ``[T, H, 128]`` strided and flattened
-layouts, near-zero variance, saturated gates, FP32 and BF16 weight gradients,
-accumulation, ``compute_grad_weight=False``, empty work, a workspace reused
-across shapes (zero after every call), two streams with their own workspaces,
-CUDA Graph capture and replay and the autograd wrapper (non-reentrant
-checkpointing included).
+``y``, ``dx`` and ``dz`` must lie within one BF16 ulp of an independent FP64
+reference, and ``dx`` and ``dz`` must be the same bits on every launch and on
+every path (streams, CUDA Graph replays, autograd, ``compute_grad_weight``).
+The weight gradient, whose FP64 cross-CTA sum depends on scheduling, is held to
+the deterministic suite's budget, ``|dw - dw64| <= |dw64| * 2^-7 + sum|terms| *
+2^-20``, worst case over repeated launches.  The matrix covers dynamic token and
+head counts (``H = 48`` and small or irregular row counts), ``[T, H, 128]``
+strided and flattened layouts, near-zero variance, saturated gates, FP32 and
+BF16 weight gradients, accumulation, ``compute_grad_weight=False``, empty work,
+a workspace reused across shapes (zero after every call), a workspace with
+nonzero scratch returned to zero by ``cake_rmsnorm_silu_gate_train_reset_workspace``,
+two streams with their own workspaces, CUDA Graph capture and replay, the
+autograd wrapper (non-reentrant checkpointing included), the state a
+checkpointed step keeps (FlashInfer issue #7039) and the mode policy: every
+compute and workspace entry point refuses any ``deterministic`` but ``False``,
+and the backward alerts under ``torch.use_deterministic_algorithms(True)``.
 
-This suite exercises the backend packages alone, through
-``tests.test_helpers.cake_package``; the facade, the ``flashinfer`` top level,
-the default (deterministic) dispatch and the interplay with
+This suite exercises the package alone, named once through
+``tests.test_helpers.cake_package`` (so a vendored copy runs it unchanged), and
+imports nothing else from flashinfer.  The comparisons against the
+deterministic package (``y``, ``dx`` and ``dz`` bitwise, ``dw`` within the
+budget of the deterministic ``dw``), the facade, the ``flashinfer`` top level,
+the default (deterministic) dispatch and the facade's interplay with
 ``torch.use_deterministic_algorithms`` are
 ``test_cake_rmsnorm_silu_gate_train_api.py``'s.
 """
@@ -40,6 +48,7 @@ the default (deterministic) dispatch and the interplay with
 from __future__ import annotations
 
 import functools
+import warnings
 from pathlib import Path
 
 import pytest
@@ -48,11 +57,10 @@ import torch.utils.checkpoint
 
 from tests.test_helpers.cake_package import cake_package
 
-pkg = cake_package("cake_rmsnorm_silu_gate_train")
-cake_build = cake_package("cake_rmsnorm_silu_gate_train", "cake_build")
-loader = cake_package("cake_rmsnorm_silu_gate_train", "cake_jit")
-deterministic_package = cake_package("cake_rmsnorm_silu_gate_det_train")
-deterministic_loader = cake_package("cake_rmsnorm_silu_gate_det_train", "cake_jit")
+KEY = "cake_rmsnorm_silu_gate_train"
+pkg = cake_package(KEY)
+cake_build = cake_package(KEY, "cake_build")
+loader = cake_package(KEY, "cake_jit")
 forward = functools.partial(
     pkg.cake_rmsnorm_silu_gate_train_forward, deterministic=False
 )
@@ -65,9 +73,10 @@ workspace_for = functools.partial(
 workspace_bytes = functools.partial(
     pkg.cake_rmsnorm_silu_gate_train_backward_workspace_bytes, deterministic=False
 )
+reset_workspace = functools.partial(
+    pkg.cake_rmsnorm_silu_gate_train_reset_workspace, deterministic=False
+)
 gated_rmsnorm = functools.partial(pkg.cake_rmsnorm_silu_gate, deterministic=False)
-deterministic_forward = deterministic_package.cake_rmsnorm_silu_gate_det_train_forward
-deterministic_backward = deterministic_package.cake_rmsnorm_silu_gate_det_train_backward
 
 D = 128
 EPS = 1e-6
@@ -77,6 +86,31 @@ BF16_RTOL = 2.0**-7
 # of the terms' magnitudes (the deterministic suite's).
 DW_MAG_TOL = 2.0**-20
 REPEATS = 10
+# The refusal of every entry point for a ``deterministic`` other than ``False``.
+REFUSAL = "computes non-deterministically and takes deterministic=False"
+# PyTorch's alert of the backward under its deterministic algorithms.
+ALERT = "does not have a deterministic implementation"
+
+# The accuracy matrix; test_cake_rmsnorm_silu_gate_train_api.py runs the same
+# cases against the deterministic package.
+SHAPES = [
+    (1, 1),
+    (1, 48),
+    (3, 48),
+    (5, 48),
+    (13, 48),
+    (17, 7),
+    (255, 2),
+    (1031, 48),
+    (4097, 16),
+    (2, 64),
+    (33, 1),
+]
+LAYOUTS = ["flat", "projection", "head_major", "misaligned"]
+EDGE_DATA = ["near_zero", "saturated"]
+EPSILONS = [1e-5, 1e-3]
+ISSUE_TOKENS = [30193, 32737, 32388]
+FP32_SHAPES = [(7, 48), (1031, 48), (32737, 48)]
 
 
 def _supported() -> bool:
@@ -216,14 +250,11 @@ def make(T, H, *, layout="contiguous", data="normal", seed=0, device="cuda"):
 
 
 def check_all(x, z, w, dy, eps, *, dw_dtype=torch.bfloat16, repeats=REPEATS) -> int:
-    """Forward and ``repeats`` backward launches against the FP64 reference and
-    the deterministic package; returns the number of distinct ``dw`` bit
-    patterns over the launches."""
+    """Forward and ``repeats`` backward launches against the FP64 reference,
+    ``dx`` and ``dz`` the same bits on every launch; returns the number of
+    distinct ``dw`` bit patterns over the launches."""
     y = forward(x, z, w, eps)
     assert y.dtype == torch.bfloat16 and y.shape == x.shape
-    assert torch.equal(y, deterministic_forward(x, z, w, eps)), (
-        "y vs the deterministic package"
-    )
     y64, dx64, dz64, dw64 = fp64_reference(dy, x, z, w, eps)
     mag = magnitudes(dy, x, z, eps)
     assert_bf16_close(y, y64, what="y vs FP64")
@@ -235,69 +266,55 @@ def check_all(x, z, w, dy, eps, *, dw_dtype=torch.bfloat16, repeats=REPEATS) -> 
             else torch.empty(D, dtype=dw_dtype, device=x.device)
         )
 
-    dx_d, dz_d, dw_d = deterministic_backward(dy, x, z, w, eps, grad_weight=out())
     patterns = set()
+    first = None
     for _ in range(repeats):
         dx, dz, dw = backward(dy, x, z, w, eps, grad_weight=out())
         assert dx.dtype == dz.dtype == torch.bfloat16 and dw.dtype == dw_dtype
         assert dx.shape == dz.shape == x.shape and dw.shape == (D,)
-        assert torch.equal(dx, dx_d), "dx vs the deterministic package"
-        assert torch.equal(dz, dz_d), "dz vs the deterministic package"
+        if first is None:
+            first = dx, dz
+        assert torch.equal(dx, first[0]), "dx vs the first launch"
+        assert torch.equal(dz, first[1]), "dz vs the first launch"
         assert_dw_within(dw, dw64, mag, what="dw vs FP64")
-        assert_dw_within(dw, dw_d, mag, what="dw vs the deterministic package")
         patterns.add(bytes(dw.view(torch.uint8).cpu().numpy()))
     assert_bf16_close(dz, dz64, what="dz vs FP64")
     assert_bf16_close(dx, dx64, what="dx vs FP64")
     return len(patterns)
 
 
-@pytest.mark.parametrize(
-    "T,H",
-    [
-        (1, 1),
-        (1, 48),
-        (3, 48),
-        (5, 48),
-        (13, 48),
-        (17, 7),
-        (255, 2),
-        (1031, 48),
-        (4097, 16),
-        (2, 64),
-        (33, 1),
-    ],
-)
+@pytest.mark.parametrize("T,H", SHAPES)
 def test_forward_backward_shapes(T, H):
     x, z, w, dy = make(T, H)
     check_all(x, z, w, dy, EPS)
 
 
-@pytest.mark.parametrize("layout", ["flat", "projection", "head_major", "misaligned"])
+@pytest.mark.parametrize("layout", LAYOUTS)
 def test_layouts(layout):
     x, z, w, dy = make(65, 48, layout=layout, seed=1)
     check_all(x, z, w, dy, EPS)
 
 
-@pytest.mark.parametrize("data", ["near_zero", "saturated"])
+@pytest.mark.parametrize("data", EDGE_DATA)
 def test_edge_values(data):
     x, z, w, dy = make(37, 48, data=data, seed=2)
     check_all(x, z, w, dy, EPS)
 
 
-@pytest.mark.parametrize("eps", [1e-5, 1e-3])
+@pytest.mark.parametrize("eps", EPSILONS)
 def test_epsilon(eps):
     x, z, w, dy = make(19, 48, seed=3)
     check_all(x, z, w, dy, eps)
 
 
-@pytest.mark.parametrize("T", [30193, 32737, 32388])
+@pytest.mark.parametrize("T", ISSUE_TOKENS)
 def test_issue_shapes(T):
     x, z, w, dy = make(T, 48, seed=4)
     patterns = check_all(x, z, w, dy, EPS)
     print(f"DW_PATTERNS T={T} H=48 repeats={REPEATS} distinct={patterns}")
 
 
-@pytest.mark.parametrize("T,H", [(7, 48), (1031, 48), (32737, 48)])
+@pytest.mark.parametrize("T,H", FP32_SHAPES)
 def test_fp32_weight_gradient(T, H):
     x, z, w, dy = make(T, H, seed=5)
     check_all(x, z, w, dy, EPS, dw_dtype=torch.float32)
@@ -315,25 +332,18 @@ def test_weight_gradient_accumulation():
     bound = (first.abs() + want.abs()) * BF16_RTOL + mag * DW_MAG_TOL
     for dtype in (torch.float32, torch.bfloat16):
         main = torch.full((D,), 0.25, dtype=dtype, device="cuda")
-        main_reference = main.clone()
         for args in ((dy, x, z), (dy2, x2, z2)):
             backward(*args, w, EPS, grad_weight=main, accumulate_grad_weight=True)
-            deterministic_backward(
-                *args, w, EPS, grad_weight=main_reference, accumulate_grad_weight=True
-            )
         assert ((main.double() - want).abs() <= bound).all(), dtype
-        assert ((main.double() - main_reference.double()).abs() <= 2 * bound).all(), (
-            dtype
-        )
         if dtype == torch.float32:
             assert torch.allclose(main.double(), want, rtol=1e-5, atol=1e-3)
     # autograd accumulation into .grad over two microbatches
     xa, za, wa = (t.clone().requires_grad_(True) for t in (x, z, w))
     gated_rmsnorm(xa, za, wa, EPS).backward(dy)
     gated_rmsnorm(xa, za, wa, EPS).backward(dy)
-    dx_d, dz_d, _ = deterministic_backward(dy, x, z, w, EPS)
-    assert torch.equal(xa.grad, dx_d + dx_d)
-    assert torch.equal(za.grad, dz_d + dz_d)
+    dx1, dz1, _ = backward(dy, x, z, w, EPS)
+    assert torch.equal(xa.grad, dx1 + dx1)
+    assert torch.equal(za.grad, dz1 + dz1)
     # Two BF16 weight gradients within budget, summed in BF16 by autograd.
     mag1 = magnitudes(dy, x, z, EPS)
     err = (wa.grad.double() - 2 * dw64).abs()
@@ -342,7 +352,8 @@ def test_weight_gradient_accumulation():
 
 def test_compute_grad_weight_false_touches_no_weight_state():
     x, z, w, dy = make(257, 48, seed=12)
-    dx_d, dz_d, _ = deterministic_backward(dy, x, z, w, EPS, compute_grad_weight=False)
+    # dx and dz do not depend on whether the weight gradient is computed
+    dx_d, dz_d, _ = backward(dy, x, z, w, EPS)
     ws = workspace_for(257 * 48, x.device)
     main = torch.full((D,), 3.0, dtype=torch.float32, device="cuda")
     dx, dz, dw = backward(
@@ -422,10 +433,11 @@ def test_workspace_reused_across_shapes_without_reset():
         )
         torch.cuda.synchronize()
         assert not bool(ws.any()), (T, H, dtype)
-        dx_d, dz_d, _ = deterministic_backward(dy, x, z, w, EPS)
-        assert torch.equal(dx, dx_d) and torch.equal(dz, dz_d), (T, H)
+        _, dx64, dz64, dw64 = fp64_reference(dy, x, z, w, EPS)
+        assert_bf16_close(dx, dx64, what=f"dx T={T} H={H}")
+        assert_bf16_close(dz, dz64, what=f"dz T={T} H={H}")
         assert dw.dtype == dtype
-        want = fp64_reference(dy, x, z, w, EPS)[3] + start
+        want = dw64 + start
         assert_dw_within(
             dw, want, magnitudes(dy, x, z, EPS), what=f"dw T={T} H={H} {dtype}"
         )
@@ -433,14 +445,11 @@ def test_workspace_reused_across_shapes_without_reset():
 
 def test_workspace_errors():
     x, z, w, dy = make(65, 48, seed=13)
-    deterministic_ws = (
-        deterministic_package.cake_rmsnorm_silu_gate_det_train_backward_workspace(
-            65 * 48, x.device
-        )
-    )
-    with pytest.raises(ValueError, match="FP64"):
-        backward(dy, x, z, w, EPS, workspace=deterministic_ws)
     elements = workspace_for(1, x.device).numel()
+    # an FP32 buffer of the same size (the deterministic package's kind)
+    fp32 = torch.zeros(2 * elements, dtype=torch.float32, device="cuda")
+    with pytest.raises(ValueError, match="FP64"):
+        backward(dy, x, z, w, EPS, workspace=fp32)
     with pytest.raises(ValueError, match="FP64"):
         backward(
             dy,
@@ -455,9 +464,93 @@ def test_workspace_errors():
         backward(dy, x, z, w, EPS, workspace=strided)
 
 
+def test_reset_workspace_clears_nonzero_scratch():
+    """A caller workspace whose FP64 accumulators and arrival words hold garbage
+    (written by something other than the backward) is zeroed by
+    ``reset_workspace``; backward launches at two different shapes and
+    weight-gradient dtypes then run on it in sequence, within the FP64 budget,
+    and leave it zero."""
+    device = torch.device("cuda")
+    ws = workspace_for(1, device)
+    g = torch.Generator(device="cuda").manual_seed(60)
+    ws.copy_(
+        torch.randn(ws.shape, dtype=torch.float64, device=device, generator=g) * 1e3
+    )
+    arch = loader.device_arch(torch.cuda.current_device())
+    for role in ("bwd_bf16", "bwd_f32"):
+        word = loader.workspace_elements(loader.route_module(arch, role)) - 1
+        # the low 32 bits of the counter element: a stale arrival count
+        ws[word : word + 1].view(torch.int32)[0] = 3
+    assert bool(ws.ne(0).all())
+    reset_workspace(ws)
+    torch.cuda.synchronize()
+    assert not bool(ws.any())
+    for i, (T, H, dtype) in enumerate(
+        ((1031, 48, torch.bfloat16), (33, 7, torch.float32))
+    ):
+        x, z, w, dy = make(T, H, seed=61 + i)
+        gw = (
+            None
+            if dtype == torch.bfloat16
+            else torch.empty(D, dtype=dtype, device=device)
+        )
+        dx, dz, dw = backward(dy, x, z, w, EPS, grad_weight=gw, workspace=ws)
+        _, dx64, dz64, dw64 = fp64_reference(dy, x, z, w, EPS)
+        assert_bf16_close(dx, dx64, what=f"dx T={T} H={H}")
+        assert_bf16_close(dz, dz64, what=f"dz T={T} H={H}")
+        assert dw.dtype == dtype
+        assert_dw_within(
+            dw, dw64, magnitudes(dy, x, z, EPS), what=f"dw T={T} H={H} {dtype}"
+        )
+        torch.cuda.synchronize()
+        assert not bool(ws.any()), (T, H)
+
+
+def test_reset_workspace_of_a_zero_workspace_is_a_no_op(launches):
+    """Resetting a zero workspace keeps it zero and in place, launches no module
+    and does not synchronize the host; the next backward is unaffected."""
+    x, z, w, dy = make(129, 48, seed=62)
+    ws = workspace_for(129 * 48, x.device)
+    ptr = ws.data_ptr()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        reset_workspace(ws)
+    finally:
+        torch.cuda.set_sync_debug_mode("default")
+    torch.cuda.synchronize()
+    assert ws.data_ptr() == ptr and not bool(ws.any())
+    assert launches == []
+    _, _, dw = backward(dy, x, z, w, EPS, workspace=ws)
+    dw64, mag = fp64_reference(dy, x, z, w, EPS)[3], magnitudes(dy, x, z, EPS)
+    assert_dw_within(dw, dw64, mag, what="dw after a reset of a zero workspace")
+    torch.cuda.synchronize()
+    assert not bool(ws.any())
+
+
+def test_reset_workspace_errors():
+    elements = workspace_for(1, torch.device("cuda")).numel()
+    with pytest.raises(TypeError):
+        reset_workspace(None)
+    for bad in (
+        torch.zeros(elements, dtype=torch.float32, device="cuda"),
+        torch.zeros(elements - 1, dtype=torch.float64, device="cuda"),
+        torch.zeros(2 * elements, dtype=torch.float64, device="cuda")[::2],
+    ):
+        with pytest.raises(ValueError, match="FP64"):
+            reset_workspace(bad)
+        assert not bool(bad.any())
+    with pytest.raises(ValueError, match="CUDA"):
+        reset_workspace(torch.zeros(elements, dtype=torch.float64))
+    ws = workspace_for(1, torch.device("cuda"))
+    for mode in ({}, {"deterministic": True}, {"deterministic": None}):
+        with pytest.raises(ValueError, match=REFUSAL):
+            pkg.cake_rmsnorm_silu_gate_train_reset_workspace(ws, **mode)
+
+
 def test_two_streams_with_their_own_workspaces():
     cases = [make(4097, 48, seed=30), make(1031, 16, seed=31)]
-    refs = [deterministic_backward(dy, x, z, w, EPS) for x, z, w, dy in cases]
+    # dx and dz of one launch on the current stream
+    refs = [backward(dy, x, z, w, EPS) for x, z, w, dy in cases]
     references = [
         (fp64_reference(dy, x, z, w, EPS)[3], magnitudes(dy, x, z, EPS))
         for x, z, w, dy in cases
@@ -484,13 +577,12 @@ def test_two_streams_with_their_own_workspaces():
 
 def test_side_stream_and_no_host_sync():
     x, z, w, dy = make(2049, 48, seed=9)
-    want_y = deterministic_forward(x, z, w, EPS)
-    dx_d, dz_d, _ = deterministic_backward(dy, x, z, w, EPS)
     dw64, mag = fp64_reference(dy, x, z, w, EPS)[3], magnitudes(dy, x, z, EPS)
     ws = workspace_for(x.shape[0] * x.shape[1], x.device)
-    # Load both modules before the sync-checked region.
-    forward(x, z, w, EPS)
-    backward(dy, x, z, w, EPS, workspace=ws)
+    # Load both modules before the sync-checked region; the bits of y, dx and dz
+    # on the current stream.
+    want_y = forward(x, z, w, EPS)
+    dx_d, dz_d, _ = backward(dy, x, z, w, EPS, workspace=ws)
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     torch.cuda.set_sync_debug_mode("error")
@@ -547,9 +639,10 @@ def test_cuda_graph_capture_and_replay():
         dys.copy_(dyn)
         graph.replay()
         torch.cuda.synchronize()
-        assert torch.equal(y, deterministic_forward(xn, zn, w, EPS)), k
-        dx_d, dz_d, _ = deterministic_backward(dyn, xn, zn, w, EPS)
-        assert torch.equal(dx, dx_d) and torch.equal(dz, dz_d), k
+        # the replay against eager launches on the same inputs
+        assert torch.equal(y, forward(xn, zn, w, EPS)), k
+        dx_e, dz_e, _ = backward(dyn, xn, zn, w, EPS)
+        assert torch.equal(dx, dx_e) and torch.equal(dz, dz_e), k
         dw64, mag = fp64_reference(dyn, xn, zn, w, EPS)[3], magnitudes(dyn, xn, zn, EPS)
         assert_dw_within(dw, dw64, mag, what=f"replay {k} dw")
         assert not bool(ws.any()), k
@@ -562,8 +655,9 @@ def test_cuda_graph_capture_and_replay():
 
 def test_autograd_matches_functional_and_checkpoint(launches):
     x, z, w, dy = make(513, 48, seed=8)
-    y_ref = deterministic_forward(x, z, w, EPS)
-    dx_d, dz_d, dw_d = deterministic_backward(dy, x, z, w, EPS)
+    # the functional entry points' bits
+    y_ref = forward(x, z, w, EPS)
+    dx_d, dz_d, _ = backward(dy, x, z, w, EPS)
     dw64, mag = fp64_reference(dy, x, z, w, EPS)[3], magnitudes(dy, x, z, EPS)
 
     def check(y, xg, zg, wg, what):
@@ -571,7 +665,6 @@ def test_autograd_matches_functional_and_checkpoint(launches):
         assert torch.equal(xg, dx_d) and torch.equal(zg, dz_d), what
         assert wg.dtype == torch.bfloat16, what
         assert_dw_within(wg, dw64, mag, what=f"{what} dw vs FP64")
-        assert_dw_within(wg, dw_d, mag, what=f"{what} dw vs the deterministic package")
 
     xa, za, wa = (t.clone().requires_grad_(True) for t in (x, z, w))
     y = gated_rmsnorm(xa, za, wa, EPS)
@@ -620,13 +713,14 @@ def test_nondeterministic_mode_launches_this_package(launches):
     assert launches == [routes["fwd"], routes["bwd_bf16"], routes["bwd_f32"]], launches
     for name in launches:
         assert name.startswith("cake_rmsnorm_silu_gate_train_"), name
-        assert name not in deterministic_loader.MODULES, name
     assert loader.MODULES[routes["bwd_bf16"]]["role"] == "bwd_bf16"
     assert loader.MODULES[routes["bwd_f32"]]["role"] == "bwd_f32"
-    # The default runs the deterministic package: nothing through this registry.
+    # The default is refused before any launch.
     launches.clear()
-    pkg.cake_rmsnorm_silu_gate_train_forward(x, z, w, EPS)
-    pkg.cake_rmsnorm_silu_gate_train_backward(dy, x, z, w, EPS)
+    with pytest.raises(ValueError, match=REFUSAL):
+        pkg.cake_rmsnorm_silu_gate_train_forward(x, z, w, EPS)
+    with pytest.raises(ValueError, match=REFUSAL):
+        pkg.cake_rmsnorm_silu_gate_train_backward(dy, x, z, w, EPS)
     assert launches == []
 
 
@@ -735,3 +829,162 @@ def test_calls_without_workspace_share_one_buffer_per_stream():
         backward(dy, x, z, w, 1e-6)
     side.synchronize()
     assert any(k[1] == side.cuda_stream for k in pkg._STREAM_WORKSPACES)
+
+
+def test_checkpointed_steps_keep_only_the_stream_workspace(monkeypatch):
+    """FlashInfer issue #7039: a non-reentrant checkpointed forward keeps nothing
+    alive but its output, and once the first step has run, every checkpointed
+    forward and backward leaves ``torch.cuda.memory_allocated()`` unchanged.  The
+    one buffer kept across steps is the workspace of the backward without a
+    caller workspace: one per (device, stream, backward module), of
+    ``workspace_bytes`` bytes."""
+    monkeypatch.setattr(pkg, "_STREAM_WORKSPACES", {})
+    # Small enough for the caching allocator's small pool, whose blocks are the
+    # requested sizes rounded up to 512 bytes.
+    x, z, w, dy = make(17, 48, seed=63)
+    leaves = [t.clone().requires_grad_(True) for t in (x, z, w)]
+    for leaf in leaves:
+        leaf.grad = torch.zeros_like(leaf)
+
+    def checkpointed():
+        return torch.utils.checkpoint.checkpoint(
+            gated_rmsnorm, *leaves, EPS, use_reentrant=False
+        )
+
+    torch.cuda.synchronize()
+    before = torch.cuda.memory_allocated()
+    checkpointed().backward(dy)  # loads the modules, allocates the workspace
+    torch.cuda.synchronize()
+    kept = torch.cuda.memory_allocated() - before
+    nbytes = workspace_bytes(1, x.device)
+    key = (
+        torch.cuda.current_device(),
+        torch.cuda.current_stream().cuda_stream,
+        _routes()["bwd_bf16"],
+    )
+    assert list(pkg._STREAM_WORKSPACES) == [key]
+    sums, _ = pkg._STREAM_WORKSPACES[key]
+    assert sums.untyped_storage().nbytes() == nbytes
+    assert nbytes <= kept < nbytes + 512, (kept, nbytes)
+    base = torch.cuda.memory_allocated()
+    for step in range(3):
+        y = checkpointed()
+        torch.cuda.synchronize()
+        retained = torch.cuda.memory_allocated() - base - y.untyped_storage().nbytes()
+        assert retained == 0, (step, retained)
+        y.backward(dy)
+        del y
+        torch.cuda.synchronize()
+        assert torch.cuda.memory_allocated() == base, step
+    assert list(pkg._STREAM_WORKSPACES) == [key]
+
+
+# ``deterministic`` values other than the bool ``False`` (``{}``: the default).
+MODES = (
+    {},
+    {"deterministic": True},
+    {"deterministic": None},
+    {"deterministic": 0},
+    {"deterministic": 1},
+    {"deterministic": "False"},
+)
+
+
+def _mode_calls(**mode) -> dict:
+    """One call per entry point of the package with ``mode`` on valid operands."""
+    x, z, w, dy = make(5, 48, seed=64)
+    ws = workspace_for(1, x.device)
+    flag = tuple(mode.values())
+    return {
+        "cake_rmsnorm_silu_gate_train_forward": lambda: pkg.cake_rmsnorm_silu_gate_train_forward(x, z, w, EPS, **mode),
+        "cake_rmsnorm_silu_gate_train_backward": lambda: pkg.cake_rmsnorm_silu_gate_train_backward(dy, x, z, w, EPS, **mode),
+        "cake_rmsnorm_silu_gate_train_backward_workspace": lambda: pkg.cake_rmsnorm_silu_gate_train_backward_workspace(1, x.device, **mode),
+        "cake_rmsnorm_silu_gate_train_backward_workspace_bytes": lambda: pkg.cake_rmsnorm_silu_gate_train_backward_workspace_bytes(1, x.device, **mode),
+        "cake_rmsnorm_silu_gate_train_reset_workspace": lambda: pkg.cake_rmsnorm_silu_gate_train_reset_workspace(ws, **mode),
+        "cake_rmsnorm_silu_gate": lambda: pkg.cake_rmsnorm_silu_gate(x, z, w, EPS, **mode),
+        "CakeRMSNormSiLUGateFunction": lambda: pkg.CakeRMSNormSiLUGateFunction.apply(x, z, w, EPS, *flag),
+    }  # fmt: skip
+
+
+@pytest.mark.parametrize(
+    "mode", MODES, ids=["default", "true", "none", "zero", "one", "string"]
+)
+def test_entry_points_refuse_a_deterministic_mode(mode, launches):
+    """Any ``deterministic`` but the bool ``False`` (the default ``True``
+    included) is a ``ValueError`` naming the entry point and the deterministic
+    package, before any launch, also under PyTorch's deterministic algorithms
+    (the refusal precedes the alert).  The support query, a capability probe
+    that launches nothing, answers for every value."""
+    calls = _mode_calls(**mode)
+    assert set(calls) == set(pkg.__all__) - {
+        "ARCHES",
+        "SUPPORTED_COMPUTE_CAPABILITIES",
+        "is_cake_rmsnorm_silu_gate_train_supported",
+    }
+    for enabled, warn_only in ((False, False), (True, False), (True, True)):
+        torch.use_deterministic_algorithms(enabled, warn_only=warn_only)
+        assert (
+            pkg.is_cake_rmsnorm_silu_gate_train_supported(torch.device("cuda"), **mode)
+            is True
+        )
+        for name, call in calls.items():
+            with pytest.raises(ValueError, match=f"^{name} {REFUSAL}") as info:
+                call()
+            assert (
+                "flashinfer.cake_rmsnorm_silu_gate_det_train is the deterministic package"
+                in str(info.value)
+            ), name
+    assert launches == []
+
+
+def test_backward_alerts_under_deterministic_algorithms(launches):
+    """Under ``torch.use_deterministic_algorithms(True)`` the paths that launch
+    the unordered weight-gradient sum -- the backward with
+    ``compute_grad_weight=True`` and the autograd backward when ``weight`` needs
+    a gradient, also for a node built before the mode was enabled -- raise
+    PyTorch's alert before any launch; under ``warn_only=True`` they warn and
+    run the non-deterministic backward (never a fallback).  The forward, the
+    workspace entry points, the reset, the support query and the backward
+    without the weight gradient run without a warning."""
+    x, z, w, dy = make(257, 48, seed=65)
+    dw64, mag = fp64_reference(dy, x, z, w, EPS)[3], magnitudes(dy, x, z, EPS)
+    ws = workspace_for(1, x.device)
+    routes = _routes()
+
+    def leaves(weight_grad=True):
+        return (
+            x.clone().requires_grad_(True),
+            z.clone().requires_grad_(True),
+            w.clone().requires_grad_(weight_grad),
+        )
+
+    node = gated_rmsnorm(*leaves(), EPS)  # built with the mode off
+    torch.use_deterministic_algorithms(True)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        forward(x, z, w, EPS)
+        assert workspace_bytes(1, x.device) == workspace_for(1, x.device).numel() * 8
+        reset_workspace(ws)
+        assert pkg.is_cake_rmsnorm_silu_gate_train_supported(
+            x.device, deterministic=False
+        )
+        assert backward(dy, x, z, w, EPS, compute_grad_weight=False)[2] is None
+        xa, za, wa = leaves(weight_grad=False)
+        gated_rmsnorm(xa, za, wa, EPS).backward(dy)
+        assert xa.grad is not None and wa.grad is None
+    launches.clear()
+    with pytest.raises(RuntimeError, match=ALERT):
+        backward(dy, x, z, w, EPS)
+    with pytest.raises(RuntimeError, match=ALERT):
+        node.backward(dy)
+    assert launches == []
+    torch.use_deterministic_algorithms(True, warn_only=True)
+    with pytest.warns(UserWarning, match=ALERT):
+        _, _, dw = backward(dy, x, z, w, EPS)
+    assert_dw_within(dw, dw64, mag, what="warn_only dw")
+    xa, za, wa = leaves()
+    y = gated_rmsnorm(xa, za, wa, EPS)
+    with pytest.warns(UserWarning, match=ALERT):
+        y.backward(dy)
+    assert_dw_within(wa.grad, dw64, mag, what="warn_only autograd dw")
+    assert launches == [routes["bwd_bf16"], routes["fwd"], routes["bwd_bf16"]], launches

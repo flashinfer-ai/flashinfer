@@ -89,21 +89,30 @@ Training SiLU-gated RMSNorm, opt-in non-deterministic weight gradient (Cake)
 
 The names the training SiLU-gated RMSNorm had before the deterministic package
 took its ``det`` names. Every entry point takes the keyword ``deterministic``
-(default ``True``):
+(default ``True``; a value that is not a ``bool`` raises ``TypeError``), and
+``CakeRMSNormSiLUGateFunction`` takes it as its last forward input:
 
 * ``deterministic=True`` runs the deterministic package above and returns its
   bits.
-* ``deterministic=False`` runs the same forward kernel and a one-kernel
-  backward: ``dx`` and ``dz`` are the deterministic backward's bits, and the
-  CTAs add their FP64 weight-gradient column sums into FP64 accumulators of the
-  workspace in the order they finish, so the weight gradient can differ by one
-  rounding of its dtype between calls. The workspace
+* ``deterministic=False`` runs the standalone non-deterministic package
+  (``flashinfer.cake_rmsnorm_silu_gate_train_backend``, whose compute and
+  workspace entry points take ``deterministic=False`` only): the same forward
+  kernel and a one-kernel backward: ``dx`` and ``dz`` are the deterministic
+  backward's bits, and the CTAs add their FP64 weight-gradient column sums into
+  FP64 accumulators of the workspace in the order they finish, so the weight
+  gradient can differ by one rounding of its dtype between calls. The workspace
   (``cake_rmsnorm_silu_gate_train_backward_workspace(..., deterministic=False)``,
   a few KiB whatever the token count) is zero after every call: zero it once
-  and reuse it, one per concurrently running stream.
+  and reuse it, one per concurrently running stream. A buffer that anything
+  else wrote into is zeroed with
+  ``cake_rmsnorm_silu_gate_train_reset_workspace(..., deterministic=False)``.
 * Under ``torch.use_deterministic_algorithms(True)``, ``deterministic=False``
-  raises ``RuntimeError``; with ``warn_only=True`` it warns and runs the
-  deterministic kernels.
+  raises ``RuntimeError`` from the compute, workspace and autograd entry
+  points; with ``warn_only=True`` they warn and run the deterministic kernels.
+  The backward of a ``deterministic=False`` autograd node that runs after the
+  mode was enabled raises PyTorch's alert (``warn_only=True``: a warning, then
+  the non-deterministic backward). The support query and the workspace reset
+  do not depend on that setting.
 
 .. currentmodule:: flashinfer.cake_rmsnorm_silu_gate_train
 
@@ -115,5 +124,6 @@ took its ``det`` names. Every entry point takes the keyword ``deterministic``
     cake_rmsnorm_silu_gate_train_backward
     cake_rmsnorm_silu_gate_train_backward_workspace_bytes
     cake_rmsnorm_silu_gate_train_backward_workspace
+    cake_rmsnorm_silu_gate_train_reset_workspace
     CakeRMSNormSiLUGateFunction
     is_cake_rmsnorm_silu_gate_train_supported

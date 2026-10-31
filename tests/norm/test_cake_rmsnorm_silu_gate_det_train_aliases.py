@@ -19,9 +19,11 @@ Within each det namespace (the ``flashinfer.cake_rmsnorm_silu_gate_det_train`` f
 every compatibility name is the same object as its det name and stays out of ``__all__``.  The names before the
 det rename at the ``flashinfer`` top level, the module ``flashinfer.cake_rmsnorm_silu_gate_train`` and the package
 ``flashinfer.cake_rmsnorm_silu_gate_train_backend`` are the package with the deterministic default and the opt-in
-non-deterministic weight gradient: their own objects and modules, with the pre-rename ``__all__``, whose default
-calls run the det package (``test_cake_rmsnorm_silu_gate_train_api.py`` holds the bits).  Both module paths are
-also attributes of the ``flashinfer`` package after a plain ``import flashinfer`` (checked in fresh interpreters).
+non-deterministic weight gradient: their own objects and modules, with the pre-rename ``__all__`` plus the
+workspace reset; the module's default calls run the det package, and the standalone backend package takes
+``deterministic=False`` only (``test_cake_rmsnorm_silu_gate_train_api.py`` holds the dispatch and the bits).  Both
+module paths are also attributes of the ``flashinfer`` package after a plain ``import flashinfer`` (checked in fresh
+interpreters).
 """
 
 from __future__ import annotations
@@ -111,13 +113,27 @@ def test_det_entry_points_are_the_decorated_defs() -> None:
     assert getattr(facade, old).__name__ == new
 
 
-# The ``__all__`` of the legacy facade and backend package: the names before the det rename.
-LEGACY_ALL = sorted(["ARCHES", "SUPPORTED_COMPUTE_CAPABILITIES", *NAMES])
-# The legacy facade's own ``flashinfer_api`` wrappers; its other names are the backend package's objects.
+# The ``__all__`` of the legacy facade and backend package: the names before the det rename and the workspace
+# reset of the non-deterministic backward.
+LEGACY_ALL = sorted(
+    [
+        "ARCHES",
+        "SUPPORTED_COMPUTE_CAPABILITIES",
+        "cake_rmsnorm_silu_gate_train_reset_workspace",
+        *NAMES,
+    ]
+)
+# The legacy facade's own entry points (``flashinfer_api`` wrappers and the autograd function; they dispatch on
+# ``deterministic``); its other names are the backend package's objects.
 LEGACY_FACADE_DEFS = (
+    "CakeRMSNormSiLUGateFunction",
     "cake_rmsnorm_silu_gate",
     "cake_rmsnorm_silu_gate_train_backward",
+    "cake_rmsnorm_silu_gate_train_backward_workspace",
+    "cake_rmsnorm_silu_gate_train_backward_workspace_bytes",
     "cake_rmsnorm_silu_gate_train_forward",
+    "cake_rmsnorm_silu_gate_train_reset_workspace",
+    "is_cake_rmsnorm_silu_gate_train_supported",
 )
 
 
