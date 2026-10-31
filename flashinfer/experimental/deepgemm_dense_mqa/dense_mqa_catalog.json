@@ -5431,6 +5431,86 @@
       ],
       "standalone": true
     },
+    "cake_deepgemm_dense_mqa_72ba84de495cdb32a8de": {
+      "arches": [
+        "sm_100a"
+      ],
+      "arg_plan": [
+        [
+          "tma_buffer",
+          "Q"
+        ],
+        [
+          "tma_buffer",
+          "KV"
+        ],
+        [
+          "tma_buffer",
+          "Weights"
+        ],
+        [
+          "tma_buffer",
+          "SF_Q"
+        ],
+        [
+          "tma_buffer",
+          "SF_KV"
+        ],
+        [
+          "buffer",
+          "Logits"
+        ],
+        [
+          "buffer",
+          "cu_seq_len_k_start"
+        ],
+        [
+          "buffer",
+          "cu_seq_len_k_end"
+        ],
+        [
+          "parameter",
+          "seq_len"
+        ],
+        [
+          "parameter",
+          "seq_len_kv"
+        ],
+        [
+          "parameter",
+          "stride_logits"
+        ],
+        [
+          "parameter",
+          "num_q_blocks"
+        ],
+        [
+          "buffer",
+          "ScheduleMeta"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "compile_flags": [],
+      "ffi_entry": "run",
+      "kind": "module",
+      "role": "kernel",
+      "sources": [
+        "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_72ba84de495cdb32a8de_kernel.cu",
+        "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_72ba84de495cdb32a8de_binding.cu"
+      ],
+      "standalone": true
+    },
     "cake_deepgemm_dense_mqa_76983cd8926bee02337c": {
       "arches": [
         "sm_100a"
@@ -9746,7 +9826,20 @@
             "sm_103a": "cake_deepgemm_dense_mqa_b5075ee0d768303ec888"
           }
         ]
-      ]
+      ],
+      "stage_buckets": {
+        "sm_100a": [
+          {
+            "kv_max": 4096,
+            "stages": [
+              [
+                "logits",
+                "cake_deepgemm_dense_mqa_72ba84de495cdb32a8de"
+              ]
+            ]
+          }
+        ]
+      }
     },
     "fp4:q1": {
       "block_q": 4,
