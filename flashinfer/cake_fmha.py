@@ -683,6 +683,17 @@ _CONTEXT_FP8_RUNTIME_PACKS = (8, 4, 2)
 # tiles than this ran slower (timed GB300: 1 .. 16 requests of 16 .. 128 query
 # tokens over 64 .. 128 keys, heads 32/4, 32/8 and 64/8).
 _CONTEXT_FP8_SHORT_KV_ONE_STAGE_TILES: dict[str, int] = {"sm103a": 64}
+# Per target, the one-stage programs a short-KV call of that pack (the smallest
+# of at most :data:`_CONTEXT_FP8_SHORT_KV_ONE_STAGE_TILES` tiles) runs as they
+# are: the page-64 programs whose short-KV chain (the entry L2 warm-up of the
+# static first tile and the partial block's single masking pass) serves a tile
+# of one KV block (timed GB300: 1 and 2 requests of 32 query tokens over 128
+# keys, heads 32/8 and 32/16, ran faster than the two-stage program).
+_CONTEXT_FP8_SHORT_KV_ONE_STAGE_PROGRAMS: dict[str, frozenset[str]] = {
+    "sm103a": frozenset(
+        f"RUNTIME_PACK{pack}_PAGE64_PX_Q1" for pack in (*_CONTEXT_FP8_RUNTIME_PACKS, 1)
+    ),
+}
 # The FP8 split-KV context programs: the runtime-size schedule and arguments,
 # with the key range of the first ``split_tiles`` tiles split over work units
 # of ``split_blocks`` KV blocks (at most ``num_splits`` per tile), whose FP32
@@ -5537,8 +5548,9 @@ def select_cake_fmha_context_route(
                 (pack_g, split_plan),
             )
             short_tiles = _CONTEXT_FP8_SHORT_KV_ONE_STAGE_TILES.get(target)
+            short_pack = None
             if short_runtime and runtime_pack is not None and short_tiles is not None:
-                one_stage_pack = next(
+                short_pack = next(
                     (
                         candidate
                         for candidate in (1, *reversed(_CONTEXT_FP8_RUNTIME_PACKS))
@@ -5547,8 +5559,10 @@ def select_cake_fmha_context_route(
                         and max_q_len <= 128 // candidate
                         and batch_size * (num_q_heads // candidate) <= short_tiles
                     ),
-                    one_stage_pack,
+                    None,
                 )
+                if short_pack is not None:
+                    one_stage_pack = short_pack
             one_stage_program = (
                 None
                 if one_stage_pack is None
@@ -5559,9 +5573,14 @@ def select_cake_fmha_context_route(
                 short = _CONTEXT_FP8_SHORT_KV_ROUTES.get(target, {}).get(
                     one_stage_program
                 )
-                one_stage_program = (
-                    short[0] if short and max_kv_len <= short[1] else None
-                )
+                if short and max_kv_len <= short[1]:
+                    one_stage_program = short[0]
+                elif not (
+                    short_pack is not None
+                    and one_stage_program
+                    in _CONTEXT_FP8_SHORT_KV_ONE_STAGE_PROGRAMS.get(target, ())
+                ):
+                    one_stage_program = None
             if one_stage_pack is not None and one_stage_program is not None:
                 program = one_stage_program
                 pack_g = one_stage_pack
