@@ -213,9 +213,14 @@ the two packages' time ratio inside a group, for the cells whose groups agree):
 
 | shapes | what this package runs differently | B200 | GB300 |
 |---|---|---|---|
-| `g1_*`, `g4_*` (`G` 1 or 4, at least 2048 chunks x `HV`) | the `"tail"` tail (and the priced table on the `4x4096` ones) | 1.23-1.24 (without `g1_16x4096_h8`, `g1_4x4096_h16`) | 1.28-1.42 |
-| `r01`, `r02`, `r07`, `r10`, the `(2, 6)` packs `issue`, `P3`, `P1`, the pairs `(8, 24)`, `(4, 12)`, `(2, 6)`; `r04` and `(1, 3)` on B200 | the adjoint table priced for `dhu_tc2` | 1.02-1.15 (without `(1, 3)`) | 1.04-1.15 |
-| the other shapes, among them `(16, 48)`, `A16`, `64x4096` and `g3_*` | nothing: the deterministic package's programs and tables | 0.99-1.00 (without `r09_16x4096_h16`) | 0.99-1.00 |
+| `g1_*`, `g4_*` (`G` 1 or 4, at least 2048 chunks x `HV`) | the `"tail"` tail (and the priced table on the `4x4096` ones) | 1.23-1.46 | 1.28-1.42 |
+| `r01`, `r02`, `r07`, `r10`, the `(2, 6)` packs `issue`, `P3`, `P1`, the pairs `(8, 24)`, `(4, 12)`, `(2, 6)`; `r04` and `(1, 3)` on B200 | the adjoint table priced for `dhu_tc2` | 1.02-1.15 (without power-capped: `p7074_P1_241817x6_h2`) | 1.04-1.15 |
+| the other shapes, among them `(16, 48)`, `A16`, `64x4096` and `g3_*` | nothing: the deterministic package's programs and tables | 0.99-1.00 (without `r09_16x4096_h16`; power-capped: `r05_16x4096_h8`, `r06_real15x4.3k_h8`) | 0.99-1.00 |
+
+A shape named power-capped is left out of that cell: the GPU ran at its power
+limit for 5 % or more of the samples of one of the two packages there, so the
+cell waits for a sustained measurement (cool-down, warm-up, then at least 300
+steady samples per block).
 
 On the re-planned head pairs `(8, 24)`, `(4, 12)` and `(2, 6)` the forward +
 backward measures 1.10 (without `(4, 12)`, `(2, 6)`) on B200 and 1.06-1.11 on GB300, the checkpointed
