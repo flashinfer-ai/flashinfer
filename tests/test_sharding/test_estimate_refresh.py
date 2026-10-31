@@ -8,10 +8,12 @@ from pathlib import Path
 import pytest
 
 from scripts.rebuild_test_duration_estimates import _prune_scope
+from scripts.test_sharding.estimates import EstimateBook
 from scripts.test_sharding.models import CollectedNode, Plan, PlanningOptions
 from scripts.test_sharding.observations import (
     EstimateRefresh,
     ObservedCase,
+    ObservedOverhead,
     adjust_first_case_warmup,
     refresh_estimates,
 )
@@ -123,6 +125,41 @@ def test_refresh_is_byte_reproducible_and_decreases_gradually(tmp_path: Path) ->
         ),
     )
     assert second_file.read_bytes() == first_bytes
+
+
+@pytest.mark.parametrize(
+    ("duration_suffix", "overhead_suffix"),
+    [(".csv", ".csv"), (".csv.gz", ".csv.gz")],
+)
+def test_refresh_preserves_readable_estimate_formats(
+    tmp_path: Path, duration_suffix: str, overhead_suffix: str
+) -> None:
+    request = EstimateRefresh(
+        duration_file=tmp_path / f"duration{duration_suffix}",
+        overhead_file=tmp_path / f"overhead{overhead_suffix}",
+        summary_file=tmp_path / "summary.csv",
+    )
+    nodeid = "tests/test_sample.py::test_case[0]"
+    observations = [_observation(nodeid, 10)]
+    overheads = [
+        ObservedOverhead(
+            profile="profile",
+            source_file="tests/test_sample.py",
+            process_startup_seconds=2,
+            source_warmup_seconds=3,
+            run_id="run",
+            batch_id="batch",
+        )
+    ]
+
+    refresh_estimates(observations, overheads, request)
+    refresh_estimates(observations, overheads, request)
+    book = EstimateBook.from_files(request.duration_file, request.overhead_file)
+
+    assert book.lookup_runtime(nodeid, 99).seconds == 12
+    assert book.overhead_ms_runtime("tests/test_sample.py", 99) == 6000
+    assert book.durations[0].sample_count == 2
+    assert book.overheads[0].sample_count == 2
 
 
 def test_prune_scope_resolves_test_path_from_repository_root(
