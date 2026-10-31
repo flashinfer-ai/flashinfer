@@ -596,14 +596,14 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t4096_sm103a(int* __restrict_
             asm volatile("barrier.sync 10, 128;" ::: "memory");
             int h1_count[3];
             int h1_base[3];
-            h1_count[0] = smem_hist[disp_tid + 0];
+            h1_count[0] = smem_hist[disp_tid];
             h1_base[0] = 0;
             h1_count[1] = smem_hist[disp_tid + 128];
             h1_base[1] = 0;
             h1_count[2] = smem_hist[disp_tid + 256];
             h1_base[2] = 0;
             if (h1_count[0] > 0) {
-                int _atomic_fetch_add_1 = atomicAdd(&expert_counts[disp_tid + 0], h1_count[0]);
+                int _atomic_fetch_add_1 = atomicAdd(&expert_counts[disp_tid], h1_count[0]);
                 h1_base[0] = _atomic_fetch_add_1;
             }
             if (h1_count[1] > 0) {
@@ -614,7 +614,7 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t4096_sm103a(int* __restrict_
                 int _atomic_fetch_add_3 = atomicAdd(&expert_counts[disp_tid + 256], h1_count[2]);
                 h1_base[2] = _atomic_fetch_add_3;
             }
-            smem_hist[disp_tid + 0] = h1_base[0];
+            smem_hist[disp_tid] = h1_base[0];
             smem_hist[disp_tid + 128] = h1_base[1];
             smem_hist[disp_tid + 256] = h1_base[2];
             asm volatile("barrier.sync 10, 128;" ::: "memory");
@@ -1585,204 +1585,204 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t4096_sm103a(int* __restrict_
                         task_3[5] = 0;
                         task_3[6] = shape_n;
                         task_3[7] = shape_k;
-                        unsigned int expert_11 = lane;
-                        unsigned int tokens_12 = counts[0];
-                        unsigned int blocks_13 = (tokens_12 + 128 - 1) / 128;
-                        unsigned int lane_offset = offsets[0];
-                        unsigned int owner_mask = __ballot_sync(0xFFFFFFFF, expert_11 < 384 && (pool_block >= lane_offset && pool_block < lane_offset + blocks_13));
-                        if (owner_mask != 0) {
-                            int _find_first_set_21 = __ffs(owner_mask);
+                        unsigned int expert_0 = lane;
+                        unsigned int tokens_0 = counts[0];
+                        unsigned int blocks_0 = (tokens_0 + 128 - 1) / 128;
+                        unsigned int lane_offset_0 = offsets[0];
+                        unsigned int owner_mask_0 = __ballot_sync(0xFFFFFFFF, expert_0 < 384 && (pool_block >= lane_offset_0 && pool_block < lane_offset_0 + blocks_0));
+                        if (owner_mask_0 != 0) {
+                            int _find_first_set_21 = __ffs(owner_mask_0);
                             unsigned int owner_lane = _find_first_set_21 - 1;
-                            unsigned int local_block = pool_block - lane_offset;
-                            unsigned int valid = ((tokens_12 - local_block * 128) < (128) ? (tokens_12 - local_block * 128) : (128));
-                            unsigned int _shfl_sync_22 = __shfl_sync(0xFFFFFFFF, expert_11, owner_lane);
+                            unsigned int local_block = pool_block - lane_offset_0;
+                            unsigned int valid = ((tokens_0 - local_block * 128) < (128) ? (tokens_0 - local_block * 128) : (128));
+                            unsigned int _shfl_sync_22 = __shfl_sync(0xFFFFFFFF, expert_0, owner_lane);
                             task_3[1] = _shfl_sync_22;
                             unsigned int _shfl_sync_23 = __shfl_sync(0xFFFFFFFF, local_block, owner_lane);
                             task_3[2] = _shfl_sync_23;
                             unsigned int _shfl_sync_24 = __shfl_sync(0xFFFFFFFF, valid, owner_lane);
                             task_3[5] = _shfl_sync_24;
                         }
-                        unsigned int expert_14 = 32 + lane;
-                        unsigned int tokens_15 = counts[1];
-                        unsigned int blocks_16 = (tokens_15 + 128 - 1) / 128;
-                        unsigned int lane_offset_17 = offsets[1];
-                        unsigned int owner_mask_18 = __ballot_sync(0xFFFFFFFF, expert_14 < 384 && (pool_block >= lane_offset_17 && pool_block < lane_offset_17 + blocks_16));
-                        if (owner_mask_18 != 0) {
-                            int _find_first_set_25 = __ffs(owner_mask_18);
+                        unsigned int expert_3 = 32 + lane;
+                        unsigned int tokens_1 = counts[1];
+                        unsigned int blocks_1 = (tokens_1 + 128 - 1) / 128;
+                        unsigned int lane_offset_1 = offsets[1];
+                        unsigned int owner_mask_1 = __ballot_sync(0xFFFFFFFF, expert_3 < 384 && (pool_block >= lane_offset_1 && pool_block < lane_offset_1 + blocks_1));
+                        if (owner_mask_1 != 0) {
+                            int _find_first_set_25 = __ffs(owner_mask_1);
                             unsigned int owner_lane_1 = _find_first_set_25 - 1;
-                            unsigned int local_block_1 = pool_block - lane_offset_17;
-                            unsigned int valid_1 = ((tokens_15 - local_block_1 * 128) < (128) ? (tokens_15 - local_block_1 * 128) : (128));
-                            unsigned int _shfl_sync_26 = __shfl_sync(0xFFFFFFFF, expert_14, owner_lane_1);
+                            unsigned int local_block_1 = pool_block - lane_offset_1;
+                            unsigned int valid_1 = ((tokens_1 - local_block_1 * 128) < (128) ? (tokens_1 - local_block_1 * 128) : (128));
+                            unsigned int _shfl_sync_26 = __shfl_sync(0xFFFFFFFF, expert_3, owner_lane_1);
                             task_3[1] = _shfl_sync_26;
                             unsigned int _shfl_sync_27 = __shfl_sync(0xFFFFFFFF, local_block_1, owner_lane_1);
                             task_3[2] = _shfl_sync_27;
                             unsigned int _shfl_sync_28 = __shfl_sync(0xFFFFFFFF, valid_1, owner_lane_1);
                             task_3[5] = _shfl_sync_28;
                         }
-                        unsigned int expert_19 = 64 + lane;
-                        unsigned int tokens_21 = counts[2];
-                        unsigned int blocks_22 = (tokens_21 + 128 - 1) / 128;
-                        unsigned int lane_offset_23 = offsets[2];
-                        unsigned int owner_mask_24 = __ballot_sync(0xFFFFFFFF, expert_19 < 384 && (pool_block >= lane_offset_23 && pool_block < lane_offset_23 + blocks_22));
-                        if (owner_mask_24 != 0) {
-                            int _find_first_set_29 = __ffs(owner_mask_24);
+                        unsigned int expert_4 = 64 + lane;
+                        unsigned int tokens_2 = counts[2];
+                        unsigned int blocks_2 = (tokens_2 + 128 - 1) / 128;
+                        unsigned int lane_offset_2 = offsets[2];
+                        unsigned int owner_mask_2 = __ballot_sync(0xFFFFFFFF, expert_4 < 384 && (pool_block >= lane_offset_2 && pool_block < lane_offset_2 + blocks_2));
+                        if (owner_mask_2 != 0) {
+                            int _find_first_set_29 = __ffs(owner_mask_2);
                             unsigned int owner_lane_2 = _find_first_set_29 - 1;
-                            unsigned int local_block_2 = pool_block - lane_offset_23;
-                            unsigned int valid_2 = ((tokens_21 - local_block_2 * 128) < (128) ? (tokens_21 - local_block_2 * 128) : (128));
-                            unsigned int _shfl_sync_30 = __shfl_sync(0xFFFFFFFF, expert_19, owner_lane_2);
+                            unsigned int local_block_2 = pool_block - lane_offset_2;
+                            unsigned int valid_2 = ((tokens_2 - local_block_2 * 128) < (128) ? (tokens_2 - local_block_2 * 128) : (128));
+                            unsigned int _shfl_sync_30 = __shfl_sync(0xFFFFFFFF, expert_4, owner_lane_2);
                             task_3[1] = _shfl_sync_30;
                             unsigned int _shfl_sync_31 = __shfl_sync(0xFFFFFFFF, local_block_2, owner_lane_2);
                             task_3[2] = _shfl_sync_31;
                             unsigned int _shfl_sync_32 = __shfl_sync(0xFFFFFFFF, valid_2, owner_lane_2);
                             task_3[5] = _shfl_sync_32;
                         }
-                        unsigned int expert_25 = 96 + lane;
-                        unsigned int tokens_27 = counts[3];
-                        unsigned int blocks_28 = (tokens_27 + 128 - 1) / 128;
-                        unsigned int lane_offset_29 = offsets[3];
-                        unsigned int owner_mask_30 = __ballot_sync(0xFFFFFFFF, expert_25 < 384 && (pool_block >= lane_offset_29 && pool_block < lane_offset_29 + blocks_28));
-                        if (owner_mask_30 != 0) {
-                            int _find_first_set_33 = __ffs(owner_mask_30);
+                        unsigned int expert_5 = 96 + lane;
+                        unsigned int tokens_3 = counts[3];
+                        unsigned int blocks_3 = (tokens_3 + 128 - 1) / 128;
+                        unsigned int lane_offset_3 = offsets[3];
+                        unsigned int owner_mask_3 = __ballot_sync(0xFFFFFFFF, expert_5 < 384 && (pool_block >= lane_offset_3 && pool_block < lane_offset_3 + blocks_3));
+                        if (owner_mask_3 != 0) {
+                            int _find_first_set_33 = __ffs(owner_mask_3);
                             unsigned int owner_lane_3 = _find_first_set_33 - 1;
-                            unsigned int local_block_3 = pool_block - lane_offset_29;
-                            unsigned int valid_3 = ((tokens_27 - local_block_3 * 128) < (128) ? (tokens_27 - local_block_3 * 128) : (128));
-                            unsigned int _shfl_sync_34 = __shfl_sync(0xFFFFFFFF, expert_25, owner_lane_3);
+                            unsigned int local_block_3 = pool_block - lane_offset_3;
+                            unsigned int valid_3 = ((tokens_3 - local_block_3 * 128) < (128) ? (tokens_3 - local_block_3 * 128) : (128));
+                            unsigned int _shfl_sync_34 = __shfl_sync(0xFFFFFFFF, expert_5, owner_lane_3);
                             task_3[1] = _shfl_sync_34;
                             unsigned int _shfl_sync_35 = __shfl_sync(0xFFFFFFFF, local_block_3, owner_lane_3);
                             task_3[2] = _shfl_sync_35;
                             unsigned int _shfl_sync_36 = __shfl_sync(0xFFFFFFFF, valid_3, owner_lane_3);
                             task_3[5] = _shfl_sync_36;
                         }
-                        unsigned int expert_31 = 128 + lane;
-                        unsigned int tokens_33 = counts[4];
-                        unsigned int blocks_34 = (tokens_33 + 128 - 1) / 128;
-                        unsigned int lane_offset_35 = offsets[4];
-                        unsigned int owner_mask_36 = __ballot_sync(0xFFFFFFFF, expert_31 < 384 && (pool_block >= lane_offset_35 && pool_block < lane_offset_35 + blocks_34));
-                        if (owner_mask_36 != 0) {
-                            int _find_first_set_37 = __ffs(owner_mask_36);
+                        unsigned int expert_6 = 128 + lane;
+                        unsigned int tokens_4 = counts[4];
+                        unsigned int blocks_4 = (tokens_4 + 128 - 1) / 128;
+                        unsigned int lane_offset_4 = offsets[4];
+                        unsigned int owner_mask_4 = __ballot_sync(0xFFFFFFFF, expert_6 < 384 && (pool_block >= lane_offset_4 && pool_block < lane_offset_4 + blocks_4));
+                        if (owner_mask_4 != 0) {
+                            int _find_first_set_37 = __ffs(owner_mask_4);
                             unsigned int owner_lane_4 = _find_first_set_37 - 1;
-                            unsigned int local_block_4 = pool_block - lane_offset_35;
-                            unsigned int valid_4 = ((tokens_33 - local_block_4 * 128) < (128) ? (tokens_33 - local_block_4 * 128) : (128));
-                            unsigned int _shfl_sync_38 = __shfl_sync(0xFFFFFFFF, expert_31, owner_lane_4);
+                            unsigned int local_block_4 = pool_block - lane_offset_4;
+                            unsigned int valid_4 = ((tokens_4 - local_block_4 * 128) < (128) ? (tokens_4 - local_block_4 * 128) : (128));
+                            unsigned int _shfl_sync_38 = __shfl_sync(0xFFFFFFFF, expert_6, owner_lane_4);
                             task_3[1] = _shfl_sync_38;
                             unsigned int _shfl_sync_39 = __shfl_sync(0xFFFFFFFF, local_block_4, owner_lane_4);
                             task_3[2] = _shfl_sync_39;
                             unsigned int _shfl_sync_40 = __shfl_sync(0xFFFFFFFF, valid_4, owner_lane_4);
                             task_3[5] = _shfl_sync_40;
                         }
-                        unsigned int expert_37 = 160 + lane;
-                        unsigned int tokens_39 = counts[5];
-                        unsigned int blocks_40 = (tokens_39 + 128 - 1) / 128;
-                        unsigned int lane_offset_41 = offsets[5];
-                        unsigned int owner_mask_42 = __ballot_sync(0xFFFFFFFF, expert_37 < 384 && (pool_block >= lane_offset_41 && pool_block < lane_offset_41 + blocks_40));
-                        if (owner_mask_42 != 0) {
-                            int _find_first_set_41 = __ffs(owner_mask_42);
+                        unsigned int expert_7 = 160 + lane;
+                        unsigned int tokens_5 = counts[5];
+                        unsigned int blocks_5 = (tokens_5 + 128 - 1) / 128;
+                        unsigned int lane_offset_5 = offsets[5];
+                        unsigned int owner_mask_5 = __ballot_sync(0xFFFFFFFF, expert_7 < 384 && (pool_block >= lane_offset_5 && pool_block < lane_offset_5 + blocks_5));
+                        if (owner_mask_5 != 0) {
+                            int _find_first_set_41 = __ffs(owner_mask_5);
                             unsigned int owner_lane_5 = _find_first_set_41 - 1;
-                            unsigned int local_block_5 = pool_block - lane_offset_41;
-                            unsigned int valid_5 = ((tokens_39 - local_block_5 * 128) < (128) ? (tokens_39 - local_block_5 * 128) : (128));
-                            unsigned int _shfl_sync_42 = __shfl_sync(0xFFFFFFFF, expert_37, owner_lane_5);
+                            unsigned int local_block_5 = pool_block - lane_offset_5;
+                            unsigned int valid_5 = ((tokens_5 - local_block_5 * 128) < (128) ? (tokens_5 - local_block_5 * 128) : (128));
+                            unsigned int _shfl_sync_42 = __shfl_sync(0xFFFFFFFF, expert_7, owner_lane_5);
                             task_3[1] = _shfl_sync_42;
                             unsigned int _shfl_sync_43 = __shfl_sync(0xFFFFFFFF, local_block_5, owner_lane_5);
                             task_3[2] = _shfl_sync_43;
                             unsigned int _shfl_sync_44 = __shfl_sync(0xFFFFFFFF, valid_5, owner_lane_5);
                             task_3[5] = _shfl_sync_44;
                         }
-                        unsigned int expert_43 = 192 + lane;
-                        unsigned int tokens_44 = counts[6];
-                        unsigned int blocks_45 = (tokens_44 + 128 - 1) / 128;
-                        unsigned int lane_offset_46 = offsets[6];
-                        unsigned int owner_mask_47 = __ballot_sync(0xFFFFFFFF, expert_43 < 384 && (pool_block >= lane_offset_46 && pool_block < lane_offset_46 + blocks_45));
-                        if (owner_mask_47 != 0) {
-                            int _find_first_set_45 = __ffs(owner_mask_47);
+                        unsigned int expert_8 = 192 + lane;
+                        unsigned int tokens_6 = counts[6];
+                        unsigned int blocks_6 = (tokens_6 + 128 - 1) / 128;
+                        unsigned int lane_offset_6 = offsets[6];
+                        unsigned int owner_mask_6 = __ballot_sync(0xFFFFFFFF, expert_8 < 384 && (pool_block >= lane_offset_6 && pool_block < lane_offset_6 + blocks_6));
+                        if (owner_mask_6 != 0) {
+                            int _find_first_set_45 = __ffs(owner_mask_6);
                             unsigned int owner_lane_6 = _find_first_set_45 - 1;
-                            unsigned int local_block_6 = pool_block - lane_offset_46;
-                            unsigned int valid_6 = ((tokens_44 - local_block_6 * 128) < (128) ? (tokens_44 - local_block_6 * 128) : (128));
-                            unsigned int _shfl_sync_46 = __shfl_sync(0xFFFFFFFF, expert_43, owner_lane_6);
+                            unsigned int local_block_6 = pool_block - lane_offset_6;
+                            unsigned int valid_6 = ((tokens_6 - local_block_6 * 128) < (128) ? (tokens_6 - local_block_6 * 128) : (128));
+                            unsigned int _shfl_sync_46 = __shfl_sync(0xFFFFFFFF, expert_8, owner_lane_6);
                             task_3[1] = _shfl_sync_46;
                             unsigned int _shfl_sync_47 = __shfl_sync(0xFFFFFFFF, local_block_6, owner_lane_6);
                             task_3[2] = _shfl_sync_47;
                             unsigned int _shfl_sync_48 = __shfl_sync(0xFFFFFFFF, valid_6, owner_lane_6);
                             task_3[5] = _shfl_sync_48;
                         }
-                        unsigned int expert_48 = 224 + lane;
-                        unsigned int tokens_49 = counts[7];
-                        unsigned int blocks_50 = (tokens_49 + 128 - 1) / 128;
-                        unsigned int lane_offset_51 = offsets[7];
-                        unsigned int owner_mask_52 = __ballot_sync(0xFFFFFFFF, expert_48 < 384 && (pool_block >= lane_offset_51 && pool_block < lane_offset_51 + blocks_50));
-                        if (owner_mask_52 != 0) {
-                            int _find_first_set_49 = __ffs(owner_mask_52);
+                        unsigned int expert_9 = 224 + lane;
+                        unsigned int tokens_7 = counts[7];
+                        unsigned int blocks_7 = (tokens_7 + 128 - 1) / 128;
+                        unsigned int lane_offset_7 = offsets[7];
+                        unsigned int owner_mask_7 = __ballot_sync(0xFFFFFFFF, expert_9 < 384 && (pool_block >= lane_offset_7 && pool_block < lane_offset_7 + blocks_7));
+                        if (owner_mask_7 != 0) {
+                            int _find_first_set_49 = __ffs(owner_mask_7);
                             unsigned int owner_lane_7 = _find_first_set_49 - 1;
-                            unsigned int local_block_7 = pool_block - lane_offset_51;
-                            unsigned int valid_7 = ((tokens_49 - local_block_7 * 128) < (128) ? (tokens_49 - local_block_7 * 128) : (128));
-                            unsigned int _shfl_sync_50 = __shfl_sync(0xFFFFFFFF, expert_48, owner_lane_7);
+                            unsigned int local_block_7 = pool_block - lane_offset_7;
+                            unsigned int valid_7 = ((tokens_7 - local_block_7 * 128) < (128) ? (tokens_7 - local_block_7 * 128) : (128));
+                            unsigned int _shfl_sync_50 = __shfl_sync(0xFFFFFFFF, expert_9, owner_lane_7);
                             task_3[1] = _shfl_sync_50;
                             unsigned int _shfl_sync_51 = __shfl_sync(0xFFFFFFFF, local_block_7, owner_lane_7);
                             task_3[2] = _shfl_sync_51;
                             unsigned int _shfl_sync_52 = __shfl_sync(0xFFFFFFFF, valid_7, owner_lane_7);
                             task_3[5] = _shfl_sync_52;
                         }
-                        unsigned int expert_53 = 256 + lane;
-                        unsigned int tokens_54 = counts[8];
-                        unsigned int blocks_55 = (tokens_54 + 128 - 1) / 128;
-                        unsigned int lane_offset_56 = offsets[8];
-                        unsigned int owner_mask_57 = __ballot_sync(0xFFFFFFFF, expert_53 < 384 && (pool_block >= lane_offset_56 && pool_block < lane_offset_56 + blocks_55));
-                        if (owner_mask_57 != 0) {
-                            int _find_first_set_53 = __ffs(owner_mask_57);
+                        unsigned int expert_10 = 256 + lane;
+                        unsigned int tokens_8 = counts[8];
+                        unsigned int blocks_8 = (tokens_8 + 128 - 1) / 128;
+                        unsigned int lane_offset_8 = offsets[8];
+                        unsigned int owner_mask_8 = __ballot_sync(0xFFFFFFFF, expert_10 < 384 && (pool_block >= lane_offset_8 && pool_block < lane_offset_8 + blocks_8));
+                        if (owner_mask_8 != 0) {
+                            int _find_first_set_53 = __ffs(owner_mask_8);
                             unsigned int owner_lane_8 = _find_first_set_53 - 1;
-                            unsigned int local_block_8 = pool_block - lane_offset_56;
-                            unsigned int valid_8 = ((tokens_54 - local_block_8 * 128) < (128) ? (tokens_54 - local_block_8 * 128) : (128));
-                            unsigned int _shfl_sync_54 = __shfl_sync(0xFFFFFFFF, expert_53, owner_lane_8);
+                            unsigned int local_block_8 = pool_block - lane_offset_8;
+                            unsigned int valid_8 = ((tokens_8 - local_block_8 * 128) < (128) ? (tokens_8 - local_block_8 * 128) : (128));
+                            unsigned int _shfl_sync_54 = __shfl_sync(0xFFFFFFFF, expert_10, owner_lane_8);
                             task_3[1] = _shfl_sync_54;
                             unsigned int _shfl_sync_55 = __shfl_sync(0xFFFFFFFF, local_block_8, owner_lane_8);
                             task_3[2] = _shfl_sync_55;
                             unsigned int _shfl_sync_56 = __shfl_sync(0xFFFFFFFF, valid_8, owner_lane_8);
                             task_3[5] = _shfl_sync_56;
                         }
-                        unsigned int expert_58 = 288 + lane;
-                        unsigned int tokens_59 = counts[9];
-                        unsigned int blocks_60 = (tokens_59 + 128 - 1) / 128;
-                        unsigned int lane_offset_61 = offsets[9];
-                        unsigned int owner_mask_62 = __ballot_sync(0xFFFFFFFF, expert_58 < 384 && (pool_block >= lane_offset_61 && pool_block < lane_offset_61 + blocks_60));
-                        if (owner_mask_62 != 0) {
-                            int _find_first_set_57 = __ffs(owner_mask_62);
+                        unsigned int expert_12 = 288 + lane;
+                        unsigned int tokens_9 = counts[9];
+                        unsigned int blocks_9 = (tokens_9 + 128 - 1) / 128;
+                        unsigned int lane_offset_9 = offsets[9];
+                        unsigned int owner_mask_9 = __ballot_sync(0xFFFFFFFF, expert_12 < 384 && (pool_block >= lane_offset_9 && pool_block < lane_offset_9 + blocks_9));
+                        if (owner_mask_9 != 0) {
+                            int _find_first_set_57 = __ffs(owner_mask_9);
                             unsigned int owner_lane_9 = _find_first_set_57 - 1;
-                            unsigned int local_block_9 = pool_block - lane_offset_61;
-                            unsigned int valid_9 = ((tokens_59 - local_block_9 * 128) < (128) ? (tokens_59 - local_block_9 * 128) : (128));
-                            unsigned int _shfl_sync_58 = __shfl_sync(0xFFFFFFFF, expert_58, owner_lane_9);
+                            unsigned int local_block_9 = pool_block - lane_offset_9;
+                            unsigned int valid_9 = ((tokens_9 - local_block_9 * 128) < (128) ? (tokens_9 - local_block_9 * 128) : (128));
+                            unsigned int _shfl_sync_58 = __shfl_sync(0xFFFFFFFF, expert_12, owner_lane_9);
                             task_3[1] = _shfl_sync_58;
                             unsigned int _shfl_sync_59 = __shfl_sync(0xFFFFFFFF, local_block_9, owner_lane_9);
                             task_3[2] = _shfl_sync_59;
                             unsigned int _shfl_sync_60 = __shfl_sync(0xFFFFFFFF, valid_9, owner_lane_9);
                             task_3[5] = _shfl_sync_60;
                         }
-                        unsigned int expert_63 = 320 + lane;
-                        unsigned int tokens_64 = counts[10];
-                        unsigned int blocks_65 = (tokens_64 + 128 - 1) / 128;
-                        unsigned int lane_offset_66 = offsets[10];
-                        unsigned int owner_mask_67 = __ballot_sync(0xFFFFFFFF, expert_63 < 384 && (pool_block >= lane_offset_66 && pool_block < lane_offset_66 + blocks_65));
-                        if (owner_mask_67 != 0) {
-                            int _find_first_set_61 = __ffs(owner_mask_67);
+                        unsigned int expert_13 = 320 + lane;
+                        unsigned int tokens_10 = counts[10];
+                        unsigned int blocks_10 = (tokens_10 + 128 - 1) / 128;
+                        unsigned int lane_offset_10 = offsets[10];
+                        unsigned int owner_mask_10 = __ballot_sync(0xFFFFFFFF, expert_13 < 384 && (pool_block >= lane_offset_10 && pool_block < lane_offset_10 + blocks_10));
+                        if (owner_mask_10 != 0) {
+                            int _find_first_set_61 = __ffs(owner_mask_10);
                             unsigned int owner_lane_10 = _find_first_set_61 - 1;
-                            unsigned int local_block_10 = pool_block - lane_offset_66;
-                            unsigned int valid_10 = ((tokens_64 - local_block_10 * 128) < (128) ? (tokens_64 - local_block_10 * 128) : (128));
-                            unsigned int _shfl_sync_62 = __shfl_sync(0xFFFFFFFF, expert_63, owner_lane_10);
+                            unsigned int local_block_10 = pool_block - lane_offset_10;
+                            unsigned int valid_10 = ((tokens_10 - local_block_10 * 128) < (128) ? (tokens_10 - local_block_10 * 128) : (128));
+                            unsigned int _shfl_sync_62 = __shfl_sync(0xFFFFFFFF, expert_13, owner_lane_10);
                             task_3[1] = _shfl_sync_62;
                             unsigned int _shfl_sync_63 = __shfl_sync(0xFFFFFFFF, local_block_10, owner_lane_10);
                             task_3[2] = _shfl_sync_63;
                             unsigned int _shfl_sync_64 = __shfl_sync(0xFFFFFFFF, valid_10, owner_lane_10);
                             task_3[5] = _shfl_sync_64;
                         }
-                        unsigned int expert_68 = 352 + lane;
-                        unsigned int tokens_69 = counts[11];
-                        unsigned int blocks_70 = (tokens_69 + 128 - 1) / 128;
-                        unsigned int lane_offset_71 = offsets[11];
-                        unsigned int owner_mask_72 = __ballot_sync(0xFFFFFFFF, expert_68 < 384 && (pool_block >= lane_offset_71 && pool_block < lane_offset_71 + blocks_70));
-                        if (owner_mask_72 != 0) {
-                            int _find_first_set_65 = __ffs(owner_mask_72);
+                        unsigned int expert_14 = 352 + lane;
+                        unsigned int tokens_11 = counts[11];
+                        unsigned int blocks_11 = (tokens_11 + 128 - 1) / 128;
+                        unsigned int lane_offset_11 = offsets[11];
+                        unsigned int owner_mask_11 = __ballot_sync(0xFFFFFFFF, expert_14 < 384 && (pool_block >= lane_offset_11 && pool_block < lane_offset_11 + blocks_11));
+                        if (owner_mask_11 != 0) {
+                            int _find_first_set_65 = __ffs(owner_mask_11);
                             unsigned int owner_lane_11 = _find_first_set_65 - 1;
-                            unsigned int local_block_11 = pool_block - lane_offset_71;
-                            unsigned int valid_11 = ((tokens_69 - local_block_11 * 128) < (128) ? (tokens_69 - local_block_11 * 128) : (128));
-                            unsigned int _shfl_sync_66 = __shfl_sync(0xFFFFFFFF, expert_68, owner_lane_11);
+                            unsigned int local_block_11 = pool_block - lane_offset_11;
+                            unsigned int valid_11 = ((tokens_11 - local_block_11 * 128) < (128) ? (tokens_11 - local_block_11 * 128) : (128));
+                            unsigned int _shfl_sync_66 = __shfl_sync(0xFFFFFFFF, expert_14, owner_lane_11);
                             task_3[1] = _shfl_sync_66;
                             unsigned int _shfl_sync_67 = __shfl_sync(0xFFFFFFFF, local_block_11, owner_lane_11);
                             task_3[2] = _shfl_sync_67;

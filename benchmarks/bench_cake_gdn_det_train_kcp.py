@@ -16,7 +16,7 @@ limitations under the License.
 Benchmark of the context-parallel (KCP) Cake packed GDN training step: one
 process per rank (``torchrun --nproc_per_node N``), every rank timing the
 module boundary of its fragments -- the KCP causal convolution
-(``flashinfer.cake_causal_conv1d_train.cake_causal_conv1d_kcp``, 10,240
+(``flashinfer.cake_causal_conv1d_det_train.cake_causal_conv1d_kcp``, 10,240
 channels) followed by the KCP GDN step (``flashinfer.cake_gdn_det_train_kcp.chunk_gdn_det_kcp``)
 -- with CUDA events, the slowest rank's time counting for the iteration.
 
@@ -75,8 +75,8 @@ from torch.utils.checkpoint import checkpoint
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from flashinfer.cake_causal_conv1d_train import (  # noqa: E402
-    cake_causal_conv1d,
+from flashinfer.cake_causal_conv1d_det_train import (  # noqa: E402
+    cake_causal_conv1d_det,
     cake_causal_conv1d_kcp,
 )
 from flashinfer.cake_gdn_det_train_kcp import (  # noqa: E402
@@ -267,7 +267,7 @@ def _local_arm(problem: dict[str, Any], boundary: str) -> Callable[[], None] | N
     cu = local["cu_seqlens"]
 
     def forward(q, k, v, g, beta, x, w):
-        y = cake_causal_conv1d(x, w, cu)
+        y = cake_causal_conv1d_det(x, w, cu)
         out = chunk_gdn(q, k, v, g, beta, cu)
         return y, out
 

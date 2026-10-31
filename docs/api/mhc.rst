@@ -82,3 +82,64 @@ torch computes it for BF16 ``X`` ``[T, 4, H]``,
     cake_mhc_det_train_head
     CakeMHCDetTrainHeadFunction
     is_cake_mhc_det_train_head_supported
+
+Training mHC with a selectable numerical mode (Cake, experimental)
+------------------------------------------------------------------
+
+``flashinfer.experimental.cake.cake_mhc_train`` is the same training function
+with a ``deterministic: bool = True`` keyword on every entry point except
+``cake_mhc_train_finish`` (it follows the package of its handle),
+``cake_mhc_train_reset_workspace`` and ``route_key``.
+
+* ``deterministic=True`` (default) runs ``flashinfer.cake_mhc_det_train``
+  unchanged.
+* ``deterministic=False`` runs the non-deterministic package
+  ``flashinfer.experimental.cake.cake_mhc_train_backend``. Its backward has no
+  final reduction kernel: the column-slab pass adds the ``dfn`` sum of every
+  (column slab, token chunk) unit into ``dfn`` with FP32 reductions and folds
+  ``dscale`` / ``dbase`` in the same grid.
+
+Numerical contract of ``deterministic=False``: only the summation order of
+``dfn`` varies from run to run. Each element lies within ``P`` FP32 roundings
+of the fixed-order sum (``P <= 32`` token chunks), and the FP32 reduction
+flushes subnormal addends and results to zero. ``dX``, ``dscale``, ``dbase``,
+the forward, the statistics replay and ``backward_prepare`` are bitwise the
+deterministic values.
+
+Interaction with ``torch.use_deterministic_algorithms(True)``:
+
+* The entry points of ``flashinfer.experimental.cake.cake_mhc_train`` run the
+  deterministic package for ``deterministic=False`` and warn once per process
+  (``UserWarning``).
+* The non-deterministic package never falls back. Its ``backward_finish`` and
+  the backward of its prepare node raise PyTorch's alert for an operation
+  without a deterministic implementation (``RuntimeError``; with
+  ``warn_only=True`` a ``UserWarning``) right before they launch the ``dfn``
+  reduction: after their operands pass, and only for ``T > 0``. The prepare
+  node alerts also when the mode was enabled between its forward and its
+  backward. Its forward,
+  statistics, ``backward_prepare`` and workspace entry points do not alert.
+* Every compute and workspace entry point of the non-deterministic package
+  raises ``ValueError`` unless ``deterministic=False``.
+
+Workspaces: the forward workspace has one layout in both modes. The
+``deterministic=False`` backward workspace is the deterministic one at the same
+offsets without the per-chunk FP32 ``dfn`` partials (``P x 24 x 16384 x 4``
+bytes), so ``cake_mhc_train_backward_workspace(T, device, deterministic=True)``
+serves both modes and ``deterministic=False`` sizes the smaller one. When the
+deterministic mode turns a ``deterministic=False`` call with a caller-owned
+backward workspace that is too small for the deterministic layout into the
+deterministic backward, the call runs on a private zeroed companion buffer of
+that workspace, never on the shared default buffer. Inside a CUDA graph
+capture a missing companion raises ``ValueError``.
+
+The head (``cake_mhc_det_train_head*``) has no cross-token reduction and no
+counterpart in this module; use the deterministic names above.
+
+Names: ``flashinfer.cake_mhc_det_train.cake_mhc_det_train_<name>`` ->
+``flashinfer.experimental.cake.cake_mhc_train.cake_mhc_train_<name>``,
+``is_cake_mhc_det_train_supported`` -> ``is_cake_mhc_train_supported`` and
+``CakeMHCDetTrain<Node>Function`` -> ``CakeMHCTrain<Node>Function`` (the
+non-deterministic package's nodes). The legacy module
+``flashinfer.cake_mhc_train`` keeps the same ``cake_mhc_train_*`` names as
+aliases of the deterministic objects, without a ``deterministic`` keyword.
