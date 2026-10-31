@@ -215,8 +215,15 @@ current key and at most `window_left` preceding keys. Pages wholly before the
 earliest visible key in a query group are not loaded, so recycled storage outside
 the window cannot introduce NaNs into PV. The first partially visible page is
 retained. `softmax_scale` defaults to
-`1 / sqrt(D)` and `output_scale` defaults to 1; supplied scales must be finite,
-positive Python scalars representable as positive `float32` values.
+`1 / sqrt(D)` and `output_scale` defaults to 1. Each independently accepts a
+positive finite Python number or a contiguous CUDA FP32 tensor of shape `(1,)`.
+Plan defaults select the operand types; `run()` inherits omitted values and
+requires same-type overrides. This applies to the reusable wrapper, prepared
+plan, and one-shot APIs. QToken-KV-block sparse uses the equivalent names
+`sm_scale` and `v_scale`. Device scales are loaded before the existing arithmetic;
+reducers merge already-scaled partials without reapplying the multipliers.
+See [global scale operands](../../README.md#global-scale-operands) for value
+validation, cache identity, and graph-replay lifetimes.
 
 D64 NVFP4 K/V with page size 16 remains unsupported because its native staging
 produces a misaligned access. Other transformed profiles use the normal

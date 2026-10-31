@@ -751,8 +751,8 @@ whenever supplied to an enabled plan, even if the return flag is false.
 LSE excludes output scaling and removes internal FP8 probability amplification.
 Keep output and LSE buffers disjoint from live inputs and workspace.
 Sparse MLA retains its existing `return_lse` contract: natural-log QK LSE
-before the attention-sink contribution. Its scale arguments also accept scalar
-CUDA FP32 tensors, while dense wrappers use host scalar scale operands.
+before the attention-sink contribution. Global scale operands follow the same
+float-or-device contract across dense and sparse attention.
 
 Context and dense FMHA decode plans additionally support
 `use_attention_sinks=True`, binding `attention_sinks` on every run. This FP32
@@ -770,13 +770,65 @@ Dense context, FMHA decode and MLA decode use `softmax_scale` / `output_scale`.
 Where applicable, their public interfaces use `q_dtype` / `k_dtype` / `v_dtype` /
 `kv_dtype` / `out_dtype`, `packed_query`, `num_qo_heads`, `seq_lens_kv`, and
 `max_kv_len`. Sparse MLA uses `attention_sinks` and `use_attention_sinks`.
-The QK scale is in natural-exponential units; context converts it to base two
-internally. Context planning sets defaults that `run()` may override. Context
-and FMHA decode default to `1 / sqrt(D)`; MLA retains its default of 1.
-Context scales are host FP32 scalar operands; device scale tensors are not
-supported. Captured graphs retain the scalar values used during capture;
-changing them requires recapture. Scalar values are validated on the host and do not specialize JIT. Packed NVFP4 block
-scales remain a separate input contract.
+
+### Global scale operands
+
+Each global scale independently accepts a positive finite Python number or a
+contiguous CUDA FP32 tensor of shape `(1,)` on the attention device. Tensor
+contents must be positive and finite; metadata validation never reads those
+contents back to the host. Callers maintain that value contract. QK scales use
+natural-exponential units for both types; conversion to base two is internal.
+
+| Public family | Global operands |
+| --- | --- |
+| Contiguous and paged context | `softmax_scale`, `output_scale` |
+| Paged decode, including prepared and one-shot execution | `softmax_scale`, `output_scale` |
+| QToken-KV-block sparse attention | `sm_scale`, `v_scale` |
+| Contiguous and paged block-sparse attention | `sm_scale`, `output_scale` |
+| Dense MLA | `softmax_scale`, `output_scale` |
+| Sparse MLA | `softmax_scale`, `output_scale`; `kv_cache_scale` for a per-tensor FP8 primary pool |
+
+Pass defaults to `plan()` (or the prepared-plan constructor). Their types select
+the kernel argument signature independently: float/float, float/tensor,
+tensor/float, and tensor/tensor. `run()` with `None` inherits the corresponding
+planned operand; an override must keep that operand's planned type. One-shot
+calls infer types directly from the supplied operands. Replan to change a type.
+Only types specialize compiled code: values and tensor addresses are runtime
+arguments, excluded from compilation keys. Warm up the required signature before
+CUDA graph capture.
+
+Context, FMHA decode, and block-sparse attention default their QK multiplier to
+`1 / sqrt(D)`; dense MLA defaults to 1, and sparse MLA to `1 / sqrt(query_width)`.
+Output multipliers and sparse storage descales default to 1. The output multiplier
+scales the complete attention result, including any restored Sage V mean, and
+never changes LSE. Structured Sage/VC block and channel scales, NVFP4 block
+scales, and the fused MLA output-quantization buffer `out_scale` remain separate
+contracts.
+
+For dynamic per-tensor FP8 inputs, GPU preparation can write
+`attention_scale * q_descale * k_descale` and `v_descale` into the global scale
+buffers. Attention consumes them in stream order without a device-to-host
+readback. Float operands remain runtime FP32 kernel parameters; their numeric
+values are not compiled into the kernel.
+
+A captured graph retains float values and device-buffer addresses from capture.
+Update tensor contents in place before replay, while keeping their storage alive
+and avoiding concurrent writes during attention. Replacing a tensor object or
+changing a Python float only affects later eager launches or new captures; it
+does not update an existing graph. The plan retains references to its default
+scale tensors; callers retain any tensors supplied as run-time overrides.
+
+```python
+# Continue from a planned decode configuration, selecting only a device V scale.
+v_descale = torch.ones(1, dtype=torch.float32, device=device)
+wrapper.plan(
+    device, batch_size, num_qo_heads, num_kv_heads, head_dim, page_size,
+    max_kv_len, softmax_scale=head_dim**-0.5, output_scale=v_descale,
+)
+# The attention run inherits v_descale. A preceding GPU quantizer can update
+# its contents for each input, including inside the captured graph.
+out = wrapper.run(q, paged_kv_cache, seq_lens_kv, block_tables)
+```
 
 ### Runtime split-KV policy
 

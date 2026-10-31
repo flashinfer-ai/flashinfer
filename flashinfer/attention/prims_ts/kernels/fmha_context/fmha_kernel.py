@@ -3317,7 +3317,7 @@ class FmhaTs:
         k_cute: cute.Tensor,
         v_cute: cute.Tensor,
         o_cute: cute.Tensor,
-        scale_softmax_log2: Float32,
+        scale_softmax_log2: Float32 | cute.Tensor,
         output_scale: Float32 | cute.Tensor,
         max_active_clusters: int,
         stream: cuda_drv.CUstream,
@@ -3346,9 +3346,10 @@ class FmhaTs:
         an outlier plan. VC-Attention-QK8 also takes the Q and K dequant scales
         as ``[H, B, blocks]`` tables with one scale per 128-token block.
 
-        ``scale_softmax_log2`` and ``output_scale`` are runtime float32 scalar
-        operands, normally ``log2(e) / sqrt(d)`` and ``1.0``. FP8 callers fold
-        scalar Q/K/V dequantization and output quantization scales into them.
+        Each global scale independently accepts a float32 scalar or a (1,)
+        float32 device tensor. Host softmax operands use log2 units; device
+        softmax operands use natural-exponential units and convert on device.
+        FP8 callers fold Q/K/V descales and output quantization into them.
 
         VC-Attention additionally binds tile means and a static repair-tile count.
         Its output_scale is a per-channel V scale table.
@@ -3751,7 +3752,7 @@ class FmhaTs:
             | utils.ClcDynamicPersistentTileSchedulerParams
             | None
         ),
-        scale_softmax_log2: Float32,
+        scale_softmax_log2: Float32 | cute.Tensor,
         output_scale: Float32 | cute.Tensor,
         num_kv_tiles: Int32,
         num_seq_tiles: Int32,
@@ -3777,8 +3778,10 @@ class FmhaTs:
     ) -> None:
         """Warp-specialised persistent FMHA TS kernel.
 
-        ``scale_softmax_log2`` and ``output_scale`` are runtime float32 scalar
-        operands passed through task-local resource dataflow.
+        Global scale operands specialize independently as floats or device
+        tensors. Device softmax scales use natural-exponential units. After
+        loading/conversion, resources carry scalar values through task dataflow.
+        VC output scales remain a per-channel table.
         ``sage_scales`` is the prepared per-block/channel scale buffer.
 
         Structure:
@@ -3798,6 +3801,14 @@ class FmhaTs:
             cfg = copy(cfg)
             cfg.fixed_dense_k_tail = dense_tail_capacity
         cfg.num_seq_tiles = num_seq_tiles
+        # Host scalars arrive in log2 units; device scalar buffers retain the
+        # public natural-exponential units until this load.
+        if cutlass.const_expr(isinstance(scale_softmax_log2, cute.Tensor)):
+            scale_softmax_log2 = scale_softmax_log2[0] * Float32(1.4426950408889634)
+        if cutlass.const_expr(
+            isinstance(output_scale, cute.Tensor) and not cfg.vc_attention
+        ):
+            output_scale = output_scale[0]
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
 
         # 1. Prefetch TMA descriptors on load warp

@@ -18,7 +18,6 @@ from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 import copy
 import math
-import struct
 import functools
 from typing import Any, Literal, Optional, cast
 
@@ -26,6 +25,13 @@ import torch
 
 from ._compile_cache import build_and_load_attention_kernel
 from ._hardware import get_max_active_clusters
+from ._scales import (
+    GlobalScale,
+    fake_scale,
+    normalize_scale,
+    resolve_scale,
+    scale_types,
+)
 
 
 from .kernels.mla_decode.helpers.nvfp4_kv import (
@@ -53,7 +59,6 @@ from .decode import (
     _validate_mask,
     _validate_page_size,
     _validate_positive_int,
-    _validate_scale,
     _validate_runtime_device,
     _validate_workspace_buffer,
     _workspace_section_view,
@@ -110,6 +115,7 @@ class _MLADecodeCompileSpec:
     kernel: Any = field(compare=False, hash=False, repr=False)
     write_final_lse: bool = True
     lse_mode: str = "none"
+    scale_types: tuple[bool, bool, bool] = (False, False, False)
 
 
 @dataclass(frozen=True)
@@ -153,6 +159,8 @@ class _MLADecodePlanState:
     split_kv: int
     softmax_rescale_threshold_log2: float = 0.0
     lse_mode: str = "none"
+    softmax_scale: GlobalScale = 1.0
+    output_scale: GlobalScale = 1.0
 
 
 @dataclass(frozen=True)
@@ -184,8 +192,8 @@ class _MLARuntime:
     normalized_cache: torch.Tensor
     out: torch.Tensor
     num_physical_pages: int
-    softmax_scale: float
-    output_scale: float
+    softmax_scale: GlobalScale
+    output_scale: GlobalScale
     extra_cache: Optional[torch.Tensor] = None
     sparse_inputs: Optional[tuple] = None
     output_quant_args: Optional[tuple] = None
@@ -1153,6 +1161,7 @@ def _make_mla_decode_compile_spec(
     lse_mode: str = "none",
     runtime_kv_lengths: bool = False,
     write_final_lse: bool = True,
+    scale_types: tuple[bool, bool, bool] = (False, False, False),
 ) -> _MLADecodeCompileSpec:
     """Keep policy resolution plan-specific and JIT identity batch-free."""
 
@@ -1177,6 +1186,7 @@ def _make_mla_decode_compile_spec(
         kernel=kernel,
         lse_mode=lse_mode,
         write_final_lse=write_final_lse,
+        scale_types=scale_types,
     )
 
 
@@ -1358,7 +1368,7 @@ def _get_compiled_mla_decode(
             cache_seqs_fake,
             cache_seqs_fake,
             sink,
-            cutlass.Float32(1.0),
+            fake_scale(compile_spec.scale_types[2]),
         )
     stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
 
@@ -1385,8 +1395,8 @@ def _get_compiled_mla_decode(
                 cache_seqs_fake,
                 qo_indptr_fake,
                 sparse_inputs_fake,
-                cutlass.Float32(1.0),
-                cutlass.Float32(1.0),
+                fake_scale(compile_spec.scale_types[0]),
+                fake_scale(compile_spec.scale_types[1]),
                 stream_fake,
                 output_quant_args=output_quant_args,
                 max_q_len=cutlass.Int32(0),
@@ -1498,8 +1508,8 @@ def _prepare_mla_runtime(
     q_dtype: torch.dtype,
     kv_dtype: torch.dtype,
     out_dtype: torch.dtype,
-    softmax_scale: float,
-    output_scale: float,
+    softmax_scale: GlobalScale,
+    output_scale: GlobalScale,
     out: Optional[torch.Tensor],
     validate: bool,
 ) -> _MLARuntime:
@@ -1540,8 +1550,10 @@ def _prepare_mla_runtime(
                 f"kv_cache dtype must match the launch ({kv_dtype}), "
                 f"got {normalized_cache.dtype}"
             )
-        effective_softmax_scale = _validate_scale(softmax_scale, "softmax_scale")
-        effective_output_scale = _validate_scale(output_scale, "output_scale")
+        effective_softmax_scale = normalize_scale(
+            softmax_scale, "softmax_scale", device
+        )
+        effective_output_scale = normalize_scale(output_scale, "output_scale", device)
     else:
         normalized_cache = kv_cache[:, 0] if kv_cache.ndim == 4 else kv_cache
         num_physical_pages = int(normalized_cache.shape[0])
@@ -1673,6 +1685,8 @@ class BatchMLADecodePagedTSWrapper:
         kv_dtype: torch.dtype,
         out_dtype: torch.dtype,
         mask_type: Literal["dense", "causal"] = "causal",
+        softmax_scale: GlobalScale = 1.0,
+        output_scale: GlobalScale = 1.0,
         lse_mode: Literal["none", "base2"] = "none",
         workspace_buffer: Optional[torch.Tensor] = None,
         validate: bool = True,
@@ -1680,8 +1694,12 @@ class BatchMLADecodePagedTSWrapper:
     ) -> None:
         """Compile one static MLA shape and bind its reusable workspace.
 
-        Planning consumes only compile-time geometry, capacity, dtype, and
-        storage-mode inputs. Request metadata belongs exclusively to
+        Planning consumes geometry, capacity, dtype, storage-mode inputs, and
+        default scale operands. Each scale independently accepts a positive host
+        float or a contiguous CUDA FP32 tensor of shape (1,) on the plan device.
+        Types select the compiled signature; values and addresses do not. Tensor
+        contents must remain positive and finite. No scale data is read on CPU.
+        Request metadata belongs exclusively to
         :meth:`run` and is never retained by the wrapper. A successful re-plan
         atomically replaces the previous immutable state; a failed re-plan
         leaves that state usable.
@@ -1787,6 +1805,8 @@ class BatchMLADecodePagedTSWrapper:
         )
 
         device, device_index = _resolve_cuda_device(device)
+        softmax_scale = normalize_scale(softmax_scale, "softmax_scale", device)
+        output_scale = normalize_scale(output_scale, "output_scale", device)
         if validate:
             _validate_runtime_device(device)
 
@@ -1823,6 +1843,7 @@ class BatchMLADecodePagedTSWrapper:
             lse_mode=lse_mode,
             runtime_kv_lengths=True,
             write_final_lse=lse_mode != "none",
+            scale_types=(*scale_types(softmax_scale, output_scale), False),
         )
         policy = spec.policy
         workspace_layout = _make_mla_workspace_layout(
@@ -1868,6 +1889,8 @@ class BatchMLADecodePagedTSWrapper:
             compiled=compiled,
             policy=policy,
             split_kv=spec.split_kv,
+            softmax_scale=softmax_scale,
+            output_scale=output_scale,
             lse_mode=lse_mode,
             softmax_rescale_threshold_log2=softmax_rescale_threshold_log2,
         )
@@ -1882,8 +1905,8 @@ class BatchMLADecodePagedTSWrapper:
         *,
         qo_indptr: Optional[torch.Tensor] = None,
         max_q_len: int | None = None,
-        softmax_scale: float = 1.0,
-        output_scale: float = 1.0,
+        softmax_scale: GlobalScale | None = None,
+        output_scale: GlobalScale | None = None,
         out: Optional[torch.Tensor] = None,
         lse: Optional[torch.Tensor] = None,
         return_lse: bool = False,
@@ -1903,8 +1926,11 @@ class BatchMLADecodePagedTSWrapper:
 
         Fixed queries use [B, Sq, H, 576]; packed queries use [total_q, H, 576] and
         qo_indptr with nonnegative per-request deltas. All-empty packed Q is a no-op.
-        softmax_scale and output_scale are finite positive host QK and V/output scales.
-        The dense MLA interface does not expose attention sinks.
+        softmax_scale and output_scale independently accept host floats or CUDA
+        FP32 tensors of shape (1,). None inherits the plan default; overrides must
+        match its scalar/tensor type. Tensor contents must remain positive and
+        finite, and can change at stable addresses between graph replays. Host
+        values are captured by value. The dense MLA interface has no sinks.
         max_q_len covers the live Q lengths within plan capacity. Validation
         infers an omitted bound from existing metadata; trusted packed calls
         default to plan capacity without a readback. This bound is runtime."""
@@ -1915,6 +1941,12 @@ class BatchMLADecodePagedTSWrapper:
         state = self._plan_state
         if state is None:
             raise RuntimeError("plan() must be called before run()")
+        softmax_scale = resolve_scale(
+            softmax_scale, state.softmax_scale, "softmax_scale", state.device
+        )
+        output_scale = resolve_scale(
+            output_scale, state.output_scale, "output_scale", state.device
+        )
         runtime_qo_indptr = qo_indptr if state.packed_query else None
         runtime = _prepare_mla_runtime(
             query,
@@ -1992,8 +2024,8 @@ def batch_mla_decode_with_paged_kv_cache(
     qk_rope_head_dim: int = _MLA_ROPE_DIM,
     mask_type: Literal["dense", "causal"] = "causal",
     max_kv_len: Optional[int] = None,
-    softmax_scale: float = 1.0,
-    output_scale: float = 1.0,
+    softmax_scale: GlobalScale = 1.0,
+    output_scale: GlobalScale = 1.0,
     out: Optional[torch.Tensor] = None,
     lse: Optional[torch.Tensor] = None,
     return_lse: bool = False,
@@ -2035,7 +2067,7 @@ def batch_mla_decode_with_paged_kv_cache(
         Attention mask mode.
     max_kv_len : int, optional
         Static K/V length bound; defaults to the metadata maximum.
-    softmax_scale, output_scale : float
+    softmax_scale, output_scale : float or torch.Tensor
         QK and value/output scaling factors.
     out : torch.Tensor, optional
         Caller-owned output tensor.
@@ -2163,6 +2195,8 @@ def batch_mla_decode_with_paged_kv_cache(
         kv_dtype=normalized_cache.dtype,
         out_dtype=out_dtype,
         mask_type=mask_type,
+        softmax_scale=softmax_scale,
+        output_scale=output_scale,
         workspace_buffer=workspace_buffer,
         validate=validate,
         tuning=tuning,
@@ -2783,10 +2817,12 @@ class BatchSparseMLADecodePagedTSWrapper:
     Input/output/workspace storage must not overlap; this is an unchecked
     caller precondition. Separate wrappers/workspaces are needed per stream.
 
-    Planning compiles one kernel with host-runtime FP32 scale arguments.
-    Scale values may change between launches without recompiling. CUDA graphs
-    capture their values, so new values require graph parameter updates or
-    recapture. For a
+    Planning infers each scale's scalar/tensor type independently. Host scales
+    are runtime FP32 arguments; tensor scales are contiguous CUDA FP32 buffers
+    of shape (1,) on the plan device. Values and addresses are not compile keys.
+    CUDA graphs capture host values or tensor addresses. Update tensor contents
+    at those addresses to change scales on replay, keeping them positive/finite.
+    For a
     fixed dispatch profile over a range of independent sparse query rows,
     plan with ``batch_size=1``, ``packed_query=True`` and
     ``max_q_len=row_capacity``. Run with ``[rows,H,D]`` queries and
@@ -2828,6 +2864,9 @@ class BatchSparseMLADecodePagedTSWrapper:
         num_output_groups=None,
         tuning=None,
         kv_lora_rank=512,
+        softmax_scale: GlobalScale | None = None,
+        output_scale: GlobalScale = 1.0,
+        kv_cache_scale: GlobalScale = 1.0,
     ):
         """Plan D512/D576 attention over one primary and an optional extra pool.
 
@@ -2841,7 +2880,8 @@ class BatchSparseMLADecodePagedTSWrapper:
         then 32 E4M3 scales, with block b stored at 320 + 8*(b%4) + b//4.
         ``kv_cache_format="fp8"`` selects D512 per-tensor E4M3 storage:
         512 bytes per token with no scale trailer. Pass its positive tensor
-        descale as ``kv_cache_scale`` to run(). Pair it with
+        descale as ``kv_cache_scale`` when planning, then optionally override it
+        with the same scalar/tensor type in run(). Pair it with
         ``extra_kv_cache_format="nvfp4"`` for FP8 SWA and compressed NVFP4 KV.
         The extra format defaults to NVFP4 for an FP8 primary, otherwise to
         the primary format. D512 supports NVFP4 in both pools or FP8 primary
@@ -2930,6 +2970,22 @@ class BatchSparseMLADecodePagedTSWrapper:
                 kv_lora_rank=kv_lora_rank,
             )
         )
+        softmax_scale = normalize_scale(
+            (512 + qk_rope_head_dim) ** -0.5
+            if softmax_scale is None
+            else softmax_scale,
+            "softmax_scale",
+            device,
+        )
+        output_scale = normalize_scale(output_scale, "output_scale", device)
+        kv_cache_scale = normalize_scale(kv_cache_scale, "kv_cache_scale", device)
+        if kv_cache_format != "fp8" and (
+            isinstance(kv_cache_scale, torch.Tensor) or kv_cache_scale != 1.0
+        ):
+            raise ValueError("kv_cache_scale is only supported for an FP8 primary pool")
+        spec = replace(
+            spec, scale_types=scale_types(softmax_scale, output_scale, kv_cache_scale)
+        )
         kernel = spec.kernel
         reload_d576 = (
             profile.family == "keep" and kernel._make_config().sparse_d576_reload
@@ -2990,6 +3046,9 @@ class BatchSparseMLADecodePagedTSWrapper:
             buffers=buffers,
             workspace=workspace,
             compiled=compiled,
+            softmax_scale=softmax_scale,
+            output_scale=output_scale,
+            kv_cache_scale=kv_cache_scale,
             assume_valid_prefix=assume_valid_prefix,
             requested_splits=splits,
             default_cl=torch.full(
@@ -3011,21 +3070,6 @@ class BatchSparseMLADecodePagedTSWrapper:
         )
 
         self.workspace_size_bytes = byte_end
-
-    @staticmethod
-    def host_scale(value, name):
-        """Validate and round a host scalar to the runtime kernel's FP32 ABI."""
-        if isinstance(value, bool) or not isinstance(value, (int, float)):
-            raise TypeError(f"{name} must be a Python int or float")
-        if not math.isfinite(value) or value <= 0:
-            raise ValueError(f"{name} must be positive and finite")
-        try:
-            rounded = struct.unpack("f", struct.pack("f", float(value)))[0]
-        except OverflowError as error:
-            raise ValueError(f"{name} must be representable in float32") from error
-        if not math.isfinite(rounded) or rounded <= 0:
-            raise ValueError(f"{name} must be positive finite float32")
-        return rounded
 
     def _pool(self, cache, name):
         """Validate one cache pool and expose its physical rows without repacking storage."""
@@ -3122,9 +3166,9 @@ class BatchSparseMLADecodePagedTSWrapper:
         extra_indices=None,
         extra_lengths=None,
         qo_indptr=None,
-        softmax_scale=None,
-        output_scale=1.0,
-        kv_cache_scale=1.0,
+        softmax_scale: GlobalScale | None = None,
+        output_scale: GlobalScale | None = None,
+        kv_cache_scale: GlobalScale | None = None,
         attention_sinks=None,
         out=None,
         lse=None,
@@ -3155,21 +3199,24 @@ class BatchSparseMLADecodePagedTSWrapper:
         Q must already use the planned dtype and include the required query
         RoPE; run() performs neither Q quantization nor query rotation.
 
-        ``softmax_scale`` and ``output_scale`` are positive finite Python
-        host scalars, passed as runtime FP32 kernel arguments. They are already combined:
+        ``softmax_scale`` and ``output_scale`` independently accept positive finite
+        host floats or contiguous CUDA FP32 tensors of shape (1,). None inherits
+        the plan default; overrides must match its scalar/tensor type. They are
+        already combined:
         softmax_scale = attention_scale * q_descale * kv_descale;
         output_scale = output_multiplier * kv_descale. Both pools share that
         KV descale. These multiply QK scores and the weighted stored V values,
         respectively; sink logits are not multiplied by softmax_scale. The
         output multiplier applies before fused RoPE/quantization. ``out_scale``
         instead holds the generated per-block quantization scales.
-        Combine scales on the host before each launch. Their values are not
-        compilation keys. CUDA graphs capture the supplied values; changing
-        them for replay requires graph parameter updates or recapture.
+        Combine scales before each launch on CPU or GPU. Their values are not
+        compilation keys. CUDA graphs capture float values or tensor addresses;
+        updating tensor contents at captured addresses changes replay scales
+        without a host readback. Tensor contents must stay positive and finite.
 
         For ``kv_cache_format="fp8"``, ``kv_cache_scale`` is the independent
-        positive host-runtime per-tensor descale of the primary pool. It accepts
-        a Python scalar; leave it at the default 1.0
+        per-tensor descale of the primary pool. It accepts either scale type;
+        leave it at the host default 1.0
         for other formats. The extra pool is NVFP4 and has no tensor descale.
         The primary scale is applied internally to both K and V; do not also
         fold it into softmax_scale/output_scale.
@@ -3208,8 +3255,6 @@ class BatchSparseMLADecodePagedTSWrapper:
         state = self._state
         if state is None:
             raise RuntimeError("plan() must be called before run()")
-        if softmax_scale is None:
-            softmax_scale = state["query_dim"] ** -0.5
         _validate_query(
             query,
             packed_query=state["packed_query"],
@@ -3278,10 +3323,18 @@ class BatchSparseMLADecodePagedTSWrapper:
             raise ValueError("attention_sinks must be contiguous CUDA FP32[H]")
         if validate and torch.isnan(attention_sinks).any().item():
             raise ValueError("attention_sinks must not contain NaN")
-        softmax_scale = self.host_scale(softmax_scale, "softmax_scale")
-        output_scale = self.host_scale(output_scale, "output_scale")
-        kv_cache_scale = self.host_scale(kv_cache_scale, "kv_cache_scale")
-        if state["kv_cache_format"] != "fp8" and kv_cache_scale != 1.0:
+        softmax_scale = resolve_scale(
+            softmax_scale, state["softmax_scale"], "softmax_scale", state["device"]
+        )
+        output_scale = resolve_scale(
+            output_scale, state["output_scale"], "output_scale", state["device"]
+        )
+        kv_cache_scale = resolve_scale(
+            kv_cache_scale, state["kv_cache_scale"], "kv_cache_scale", state["device"]
+        )
+        if state["kv_cache_format"] != "fp8" and (
+            isinstance(kv_cache_scale, torch.Tensor) or kv_cache_scale != 1.0
+        ):
             raise ValueError("kv_cache_scale is only supported for an FP8 primary pool")
         quant = state["output_quant"]
         output_quant_args = None
@@ -3417,6 +3470,8 @@ def get_prims_ts_sparse_mla_decode_workspace_size(*plan_args, **plan_kwargs):
     compiling a kernel. Bind the resulting byte buffer to the wrapper constructor
     and call plan() before graph capture; run() is the prepared standalone launch.
     """
+    for name in ("softmax_scale", "output_scale", "kv_cache_scale"):
+        plan_kwargs.pop(name, None)
     _, _, _, _, size_bytes, _, _ = _resolve_sparse_mla_plan(*plan_args, **plan_kwargs)
     return size_bytes
 
@@ -3436,9 +3491,9 @@ def batch_sparse_mla_decode_with_paged_kv_cache(
     kv_layout="NHD",
     kv_cache_format="native",
     extra_kv_cache_format=None,
-    softmax_scale=None,
-    output_scale=1.0,
-    kv_cache_scale=1.0,
+    softmax_scale: GlobalScale | None = None,
+    output_scale: GlobalScale = 1.0,
+    kv_cache_scale: GlobalScale = 1.0,
     attention_sinks=None,
     out=None,
     lse=None,
@@ -3497,6 +3552,9 @@ def batch_sparse_mla_decode_with_paged_kv_cache(
         out_scale_format=out_scale_format,
         num_output_groups=num_output_groups,
         tuning=tuning,
+        softmax_scale=softmax_scale,
+        output_scale=output_scale,
+        kv_cache_scale=kv_cache_scale,
     )
     return wrapper.run(
         query,

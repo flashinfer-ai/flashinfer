@@ -2576,8 +2576,8 @@ def _run_decode_gen_active(
     o_iter: cute.Pointer,
     g_s_k: Int32,
     g_h_k: Int32,
-    scale_softmax_log2: Float32,
-    output_scale: Float32,
+    scale_softmax_log2: Float32 | cute.Pointer,
+    output_scale: Float32 | cute.Pointer,
     g_seqlens_kv: cute.Pointer | DirectSparseMetadataView,
     g_cu_seqlens_q: cute.Pointer | UniformQueryOffsets,
     g_page_idx_kv: cute.Pointer | DirectSparseMetadataView,
@@ -2627,6 +2627,24 @@ def _run_decode_gen_active(
     overlaunched packed-Q tile without threading TaskManager state through a
     dynamic branch.
     """
+
+    # Device scales may still be produced by the preceding PDL grid.
+    if cutlass.const_expr(
+        cfg.use_pdl
+        and (
+            isinstance(scale_softmax_log2, cute.Pointer)
+            or isinstance(output_scale, cute.Pointer)
+        )
+    ):
+        prims.griddepcontrol(kind=prims.GridDepAction.WAIT)
+
+    # Device scales are produced in regular units by GPU preprocessing.
+    if cutlass.const_expr(isinstance(scale_softmax_log2, cute.Pointer)):
+        scale_softmax_log2 = cute.make_tensor(scale_softmax_log2, cute.make_layout(1))[
+            0
+        ] * Float32(math.log2(math.e))
+    if cutlass.const_expr(isinstance(output_scale, cute.Pointer)):
+        output_scale = cute.make_tensor(output_scale, cute.make_layout(1))[0]
 
     warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
 
@@ -2937,8 +2955,8 @@ def _run_decode_gen_runtime_prefix(
     o_iter: cute.Pointer,
     g_s_k: Int32,
     g_h_k: Int32,
-    scale_softmax_log2: Float32,
-    output_scale: Float32,
+    scale_softmax_log2: Float32 | cute.Pointer,
+    output_scale: Float32 | cute.Pointer,
     g_seqlens_kv: cute.Pointer | DirectSparseMetadataView,
     g_cu_seqlens_q: cute.Pointer | UniformQueryOffsets,
     g_page_idx_kv: cute.Pointer | DirectSparseMetadataView,
@@ -3142,8 +3160,8 @@ def decode_gen_kernel(
     o_iter: cute.Pointer,
     g_s_k: Int32,
     g_h_k: Int32,
-    scale_softmax_log2: Float32,
-    output_scale: Float32,
+    scale_softmax_log2: Float32 | cute.Pointer,
+    output_scale: Float32 | cute.Pointer,
     g_seqlens_kv: cute.Pointer | DirectSparseMetadataView,
     g_cu_seqlens_q: cute.Pointer | UniformQueryOffsets,
     g_page_idx_kv: cute.Pointer | DirectSparseMetadataView,
@@ -3429,8 +3447,8 @@ def fmha_decode_launch(
     partial_stats_iter: cute.Pointer,
     split_kv_counter_iter: cute.Pointer,
     attention_sinks_iter: cute.Pointer,
-    softmax_scale: Float32,
-    output_scale: Float32,
+    softmax_scale: Float32 | cute.Pointer,
+    output_scale: Float32 | cute.Pointer,
     kv_b_stride: Int32,
     max_active_clusters: Int32,
     stream: cuda_drv.CUstream,
@@ -3465,6 +3483,9 @@ def fmha_decode_launch(
     its Q, K and V scales from the prepared scales (``_SageScaleLayout``).
     """
     log2_e = math.log2(math.e)
+    scale_log2 = softmax_scale
+    if cutlass.const_expr(not isinstance(softmax_scale, cute.Pointer)):
+        scale_log2 = Float32(softmax_scale * log2_e)
     if cutlass.const_expr(requested_splits is not None):
         # Prepare the reciprocal once on the host; counts stay runtime operands.
         requested_splits = (
@@ -3854,7 +3875,7 @@ def fmha_decode_launch(
                 o_iter,
                 s_k,
                 h_k,
-                Float32(softmax_scale * log2_e),
+                scale_log2,
                 output_scale,
                 seqlens_kv_iter,
                 cu_seqlens_q_iter,
@@ -3911,7 +3932,8 @@ def fmha_block_sparse_launch(
     row_route_offsets_iter: cute.Pointer,
     row_route_counts_iter: cute.Pointer,
     route_metadata_iter: cute.Pointer,
-    softmax_scale: Float32,
+    softmax_scale: Float32 | cute.Pointer,
+    output_scale: Float32 | cute.Pointer,
     stream: cuda_drv.CUstream,
     cfg: cutlass.Constexpr[FmhaDecodeConfig],
     seq_len_kv: cutlass.Constexpr[int | None],
@@ -3937,7 +3959,9 @@ def fmha_block_sparse_launch(
     if cutlass.const_expr(cfg.use_block_sparse_proxy_routes and cfg.use_paged_kv):
         raise ValueError("block-sparse proxy routes require contiguous K/V")
 
-    log2_e = math.log2(math.e)
+    scale_softmax_log2 = softmax_scale
+    if cutlass.const_expr(not isinstance(softmax_scale, cute.Pointer)):
+        scale_softmax_log2 = Float32(softmax_scale * math.log2(math.e))
     b, h_q, h_k, s_k, d = problem_shape
     h_r = h_q // h_k
     q_seq = Int32(cfg.max_seq_len_q)
@@ -4165,8 +4189,8 @@ def fmha_block_sparse_launch(
         o_iter,
         s_k,
         h_k,
-        Float32(softmax_scale * log2_e),
-        Float32(1.0),
+        scale_softmax_log2,
+        output_scale,
         seqlens_kv_iter,
         null_i32_ptr,
         null_i32_ptr,

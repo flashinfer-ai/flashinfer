@@ -45,6 +45,13 @@ import torch
 
 from ._compile_cache import build_and_load_attention_kernel
 from ._hardware import get_max_active_clusters
+from ._scales import (
+    GlobalScale,
+    fake_scale,
+    normalize_scale,
+    resolve_scale,
+    scale_types,
+)
 
 from .vc_attention import (
     VCAttentionConfig,
@@ -184,8 +191,8 @@ class _ContextPlanState:
     """Atomically published state for one compiled contiguous context plan."""
 
     geometry: _ContextPlanGeometry
-    scale_softmax_log2: float
-    output_scale: float
+    softmax_scale: GlobalScale
+    output_scale: GlobalScale
     empty_i32: torch.Tensor
     variable_window_padded_starts: Optional[torch.Tensor]
     variable_window_cta_starts: torch.Tensor
@@ -229,8 +236,8 @@ class _PagedContextPlanState:
     """Atomically published state for one compiled paged-context plan."""
 
     geometry: _PagedContextPlanGeometry
-    scale_softmax_log2: float
-    output_scale: float
+    softmax_scale: GlobalScale
+    output_scale: GlobalScale
     compiled: Callable[..., None]
     policy: tuple[tuple[str, object], ...]
     lse_mode: str = "none"
@@ -282,6 +289,7 @@ class _ContextCompileSpec:
     use_attention_sinks: bool = False
     runtime_lengths: bool = False
     shape_signature: tuple[int, ...] = ()
+    scale_types: tuple[bool, bool] = (False, False)
     # A Sage plan's prepared scale layout; the kernel reads the scales.
     sage_scale_layout: _SageScaleLayout | None = None
 
@@ -312,6 +320,7 @@ class _PagedContextCompileSpec:
     use_attention_sinks: bool = False
     runtime_lengths: bool = False
     shape_signature: tuple[int, ...] = ()
+    scale_types: tuple[bool, bool] = (False, False)
 
 
 def _make_context_kernel(
@@ -1892,6 +1901,7 @@ def _context_compile_spec(
     runtime_lengths: bool | None = None,
     lse_mode: str = "none",
     use_attention_sinks: bool = False,
+    scale_types: tuple[bool, bool] = (False, False),
 ) -> _ContextCompileSpec:
     """Keep resource/precision choices static and ordinary lengths runtime."""
     fixed_seqlen = geometry.sage is not None or geometry.vc is not None
@@ -1926,6 +1936,7 @@ def _context_compile_spec(
         runtime_lengths=runtime_lengths,
         lse_mode=lse_mode,
         use_attention_sinks=use_attention_sinks,
+        scale_types=scale_types,
         scheduler=_resolve_context_scheduler(geometry),
         two_cta_umma=_two_cta_umma_geometry_eligible(geometry),
         vc=geometry.vc,
@@ -1942,6 +1953,7 @@ def _paged_context_compile_spec(
     runtime_lengths: bool = False,
     lse_mode: str = "none",
     use_attention_sinks: bool = False,
+    scale_types: tuple[bool, bool] = (False, False),
 ) -> _PagedContextCompileSpec:
     """Build the paged compile key, including separate QK and PV dtype keys."""
     return _PagedContextCompileSpec(
@@ -1966,6 +1978,7 @@ def _paged_context_compile_spec(
         runtime_lengths=True,
         lse_mode=lse_mode,
         use_attention_sinks=use_attention_sinks,
+        scale_types=scale_types,
         scheduler=_resolve_paged_context_scheduler(geometry),
     )
 
@@ -2094,7 +2107,7 @@ def _get_compiled_context(
         out: cute.Tensor,
         lse: cute.Tensor | None,
         attention_sinks: cute.Tensor | None,
-        scale_softmax_log2: cutlass.Float32,
+        scale_softmax_log2: cutlass.Float32 | cute.Tensor,
         output_scale: cutlass.Float32 | cute.Tensor,
         qo_indptr: cute.Tensor,
         kv_indptr: cute.Tensor,
@@ -2204,8 +2217,8 @@ def _get_compiled_context(
         if compile_spec.lse_mode != "none"
         else None
     )
-    scale_fake = cutlass.Float32(1.0)
-    output_scale_fake = cutlass.Float32(1.0)
+    scale_fake = fake_scale(compile_spec.scale_types[0])
+    output_scale_fake = fake_scale(compile_spec.scale_types[1])
     if vc_attention:
         output_scale_fake = fake_compact(
             cutlass.Float32, (batch_size, num_qo_heads, head_dim_vo), 64
@@ -2417,8 +2430,8 @@ def _get_compiled_paged_context(
         out: cute.Tensor,
         lse: cute.Tensor | None,
         attention_sinks: cute.Tensor | None,
-        scale_softmax_log2: cutlass.Float32,
-        output_scale: cutlass.Float32,
+        scale_softmax_log2: cutlass.Float32 | cute.Tensor,
+        output_scale: cutlass.Float32 | cute.Tensor,
         qo_indptr: cute.Tensor,
         block_tables: cute.Tensor,
         seq_lens_kv: cute.Tensor,
@@ -2483,8 +2496,8 @@ def _get_compiled_paged_context(
         if compile_spec.lse_mode != "none"
         else None
     )
-    scale_fake = cutlass.Float32(1.0)
-    output_scale_fake = cutlass.Float32(1.0)
+    scale_fake = fake_scale(compile_spec.scale_types[0])
+    output_scale_fake = fake_scale(compile_spec.scale_types[1])
     qo_indptr_fake = fake_compact(cutlass.Int32, (runtime_num_q_offsets,), 4)
     runtime_page_columns = cute.sym_int()
     runtime_block_table_row_stride = cute.sym_int()
@@ -2868,6 +2881,13 @@ def _variable_window_buffers(geometry, empty_i32):
     return padded_starts, cta_starts
 
 
+def _context_softmax_operand(scale: GlobalScale) -> GlobalScale:
+    """Preserve host FP32 conversion; device scalars convert inside the kernel."""
+    if isinstance(scale, torch.Tensor):
+        return scale
+    return _validate_scale(scale * math.log2(math.e), "softmax_scale * log2(e)")
+
+
 class BatchPrefillTSWrapper:
     """Reusable contiguous context attention with eager planning.
 
@@ -2903,8 +2923,8 @@ class BatchPrefillTSWrapper:
         packed_query: bool = False,
         mask_type: Literal["dense", "causal", "variable_window"] = "dense",
         window_left: int = -1,
-        softmax_scale: Optional[float] = None,
-        output_scale: float = 1.0,
+        softmax_scale: Optional[GlobalScale] = None,
+        output_scale: GlobalScale = 1.0,
         vc_config: Optional[VCAttentionConfig] = None,
         lse_mode: Literal["none", "base2"] = "none",
         use_attention_sinks: bool = False,
@@ -2925,7 +2945,11 @@ class BatchPrefillTSWrapper:
         Complete planning outside CUDA graph capture. Replanning replaces owned
         resources and invalidates previous graphs; finish their launches first.
         lse_mode='base2' enables final LSE stores, and use_attention_sinks enables
-        a per-run sink binding. Context scales are positive host scalar defaults.
+        a per-run sink binding. Each global scale independently accepts a positive
+        host float or a contiguous CUDA FP32 tensor of shape (1,) on this device.
+        Tensor values must remain finite and positive; metadata validation never
+        reads them back. Types specialize the kernel, while values and addresses
+        do not. Softmax scales use natural-exponential units for either type.
         Sage plans use BF16 output by default and require per-run Sage scales.
         Sage V-mean restoration cannot be combined with attention sinks.
         Equivalent plans reuse policy and compiled-kernel caches.
@@ -2984,11 +3008,9 @@ class BatchPrefillTSWrapper:
         geometry = replace(geometry, vc=vc_config)
         if softmax_scale is None:
             softmax_scale = geometry.head_dim**-0.5
-        scale_softmax_log2 = _validate_scale(
-            _validate_scale(softmax_scale, "softmax_scale") * math.log2(math.e),
-            "softmax_scale * log2(e)",
-        )
-        output_scale = _validate_scale(output_scale, "output_scale")
+        softmax_scale = normalize_scale(softmax_scale, "softmax_scale", geometry.device)
+        output_scale = normalize_scale(output_scale, "output_scale", geometry.device)
+        _context_softmax_operand(softmax_scale)
         vc_output_scale_buffer = (
             torch.empty(
                 (
@@ -3031,11 +3053,12 @@ class BatchPrefillTSWrapper:
                 runtime_lengths=vc_config is None,
                 lse_mode=lse_mode,
                 use_attention_sinks=use_attention_sinks,
+                scale_types=scale_types(softmax_scale, output_scale),
             )
         )
         self._plan_state = _ContextPlanState(
             geometry=geometry,
-            scale_softmax_log2=scale_softmax_log2,
+            softmax_scale=softmax_scale,
             output_scale=output_scale,
             empty_i32=empty_i32,
             variable_window_padded_starts=variable_window_padded_starts,
@@ -3067,8 +3090,8 @@ class BatchPrefillTSWrapper:
         lse: Optional[torch.Tensor] = None,
         return_lse: bool = False,
         attention_sinks: Optional[torch.Tensor] = None,
-        softmax_scale: Optional[float] = None,
-        output_scale: Optional[float] = None,
+        softmax_scale: Optional[GlobalScale] = None,
+        output_scale: Optional[GlobalScale] = None,
         vc: Optional[VCAttentionParams] = None,
         sage: Optional[SageAttentionParams] = None,
         validate: bool = True,
@@ -3092,9 +3115,12 @@ class BatchPrefillTSWrapper:
         Packed inputs require qo_indptr and kv_indptr. Variable-window fixed inputs
         require inclusive start/end bounds; ends must be nondecreasing within each
         request, while starts may be unordered. Optional CTA minima avoid refreshing
-        wrapper-owned fallback scratch. Scale overrides are finite positive host
-        scalars: softmax_scale is the effective QK scale, and
-        output_scale scales V/output. They are runtime kernel operands, not JIT keys.
+        wrapper-owned fallback scratch. Scale overrides must match each planned
+        float/tensor kind, even with validate=False; None inherits the default.
+        softmax_scale is the effective QK scale in natural-exponential units,
+        and output_scale scales V/output. CUDA FP32 scales have shape (1,).
+        Keep tensor buffers alive and update their contents before replay;
+        captured floats remain fixed. Scale values and addresses are not JIT keys.
 
         Enabled attention_sinks supplies compact CUDA FP32 [Hq] natural-log sink
         logits after QK scaling. Values must be finite or -inf; validation checks only
@@ -3234,18 +3260,12 @@ class BatchPrefillTSWrapper:
             runtime_window_starts = state.empty_i32
             runtime_window_ends = state.empty_i32
             runtime_window_cta_starts = state.empty_i32
-        scale_softmax_log2 = (
-            state.scale_softmax_log2
-            if softmax_scale is None
-            else _validate_scale(
-                _validate_scale(softmax_scale, "softmax_scale") * math.log2(math.e),
-                "softmax_scale * log2(e)",
-            )
+        softmax_scale = resolve_scale(
+            softmax_scale, state.softmax_scale, "softmax_scale", geometry.device
         )
-        output_scale = (
-            state.output_scale
-            if output_scale is None
-            else _validate_scale(output_scale, "output_scale")
+        scale_softmax_log2 = _context_softmax_operand(softmax_scale)
+        output_scale = resolve_scale(
+            output_scale, state.output_scale, "output_scale", geometry.device
         )
         if vc_output_scale is not None:
             output_scale = torch.mul(
@@ -3342,8 +3362,8 @@ class BatchPrefillPagedTSWrapper:
         page_size: int = _DEFAULT_PAGED_KV_PAGE_SIZE,
         mask_type: Literal["dense", "causal"] = "dense",
         window_left: int = -1,
-        softmax_scale: Optional[float] = None,
-        output_scale: float = 1.0,
+        softmax_scale: Optional[GlobalScale] = None,
+        output_scale: GlobalScale = 1.0,
         lse_mode: Literal["none", "base2"] = "none",
         use_attention_sinks: bool = False,
         uniform_packed_lengths: bool = False,
@@ -3359,7 +3379,11 @@ class BatchPrefillPagedTSWrapper:
         Complete planning outside CUDA graph capture. Replanning replaces owned
         resources and invalidates previous graphs; finish their launches first.
         lse_mode='base2' enables final LSE stores, and use_attention_sinks enables
-        a per-run sink binding. Context scales are positive host scalar defaults.
+        a per-run sink binding. Each global scale independently accepts a positive
+        host float or a contiguous CUDA FP32 tensor of shape (1,) on this device.
+        Tensor values must remain finite and positive; metadata validation never
+        reads them back. Types specialize the kernel, while values and addresses
+        do not. Softmax scales use natural-exponential units for either type.
         Equivalent plans reuse policy and compiled-kernel caches."""
 
         lse_mode = validate_lse_mode(lse_mode)
@@ -3392,17 +3416,16 @@ class BatchPrefillPagedTSWrapper:
         )
         if softmax_scale is None:
             softmax_scale = geometry.head_dim**-0.5
-        scale_softmax_log2 = _validate_scale(
-            _validate_scale(softmax_scale, "softmax_scale") * math.log2(math.e),
-            "softmax_scale * log2(e)",
-        )
-        output_scale = _validate_scale(output_scale, "output_scale")
+        softmax_scale = normalize_scale(softmax_scale, "softmax_scale", geometry.device)
+        output_scale = normalize_scale(output_scale, "output_scale", geometry.device)
+        _context_softmax_operand(softmax_scale)
         compiled, policy = _get_compiled_paged_context(
             _paged_context_compile_spec(
                 geometry,
                 runtime_lengths=True,
                 lse_mode=lse_mode,
                 use_attention_sinks=use_attention_sinks,
+                scale_types=scale_types(softmax_scale, output_scale),
             )
         )
         policy = tuple(
@@ -3412,7 +3435,7 @@ class BatchPrefillPagedTSWrapper:
         # Publish one immutable state object only after every fallible step.
         self._plan_state = _PagedContextPlanState(
             geometry=geometry,
-            scale_softmax_log2=scale_softmax_log2,
+            softmax_scale=softmax_scale,
             output_scale=output_scale,
             compiled=compiled,
             policy=policy,
@@ -3436,8 +3459,8 @@ class BatchPrefillPagedTSWrapper:
         lse: Optional[torch.Tensor] = None,
         return_lse: bool = False,
         attention_sinks: Optional[torch.Tensor] = None,
-        softmax_scale: Optional[float] = None,
-        output_scale: Optional[float] = None,
+        softmax_scale: Optional[GlobalScale] = None,
+        output_scale: Optional[GlobalScale] = None,
         validate: bool = True,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """Launch packed-Q context with live offsets, page tables and KV lengths.
@@ -3473,8 +3496,12 @@ class BatchPrefillPagedTSWrapper:
         ``max_kv_len``. For a causal plan with ``has_q_offset=False``, every
         request must additionally satisfy ``Sq[b] == Sk[b]``.
 
-        Scale overrides are finite positive host scalars in the same units as the
-        contiguous wrapper. Enabled attention_sinks is a compact CUDA FP32 [Hq]
+        Scale overrides independently retain each planned float/tensor kind, even
+        with validate=False; None inherits the default. CUDA FP32 scale tensors
+        have shape (1,) and must remain finite and positive. Softmax units match
+        the contiguous wrapper. Keep captured scale buffers alive and update
+        their contents before replay; captured floats remain fixed.
+        Enabled attention_sinks is a compact CUDA FP32 [Hq]
         vector of finite or -inf natural-log sink logits after QK scaling, with zero
         V contribution. Sink values and cache zero-tail promises are caller-owned."""
 
@@ -3514,18 +3541,12 @@ class BatchPrefillPagedTSWrapper:
                 max_q_len = geometry.max_q_len
             if max_kv_len is None:
                 max_kv_len = geometry.max_kv_len
-        scale_softmax_log2 = (
-            state.scale_softmax_log2
-            if softmax_scale is None
-            else _validate_scale(
-                _validate_scale(softmax_scale, "softmax_scale") * math.log2(math.e),
-                "softmax_scale * log2(e)",
-            )
+        softmax_scale = resolve_scale(
+            softmax_scale, state.softmax_scale, "softmax_scale", geometry.device
         )
-        output_scale = (
-            state.output_scale
-            if output_scale is None
-            else _validate_scale(output_scale, "output_scale")
+        scale_softmax_log2 = _context_softmax_operand(softmax_scale)
+        output_scale = resolve_scale(
+            output_scale, state.output_scale, "output_scale", geometry.device
         )
 
         if out is None:
@@ -3575,8 +3596,8 @@ def batch_prefill(
     window_left: int = -1,
     variable_window_token_starts: Optional[torch.Tensor] = None,
     variable_window_token_ends: Optional[torch.Tensor] = None,
-    softmax_scale: Optional[float] = None,
-    output_scale: float = 1.0,
+    softmax_scale: Optional[GlobalScale] = None,
+    output_scale: GlobalScale = 1.0,
     out_dtype: Optional[torch.dtype] = None,
     out: Optional[torch.Tensor] = None,
     vc: Optional[VCAttentionParams] = None,
@@ -3617,10 +3638,13 @@ def batch_prefill(
         ``0 <= starts[b, q] <= ends[b, q] < Sk``.
         Ends must be nondecreasing along Q within each batch item; starts
         need not be ordered.
-    softmax_scale : float, optional
-        Softmax scale; defaults to the inverse square root of head size.
-    output_scale : float
-        Scale applied to the attention output.
+    softmax_scale : float or torch.Tensor, optional
+        Softmax scale in natural-exponential units; defaults to the inverse
+        square root of head size. Tensor scales are contiguous CUDA FP32 (1,)
+        buffers on Q's device, with finite positive values.
+    output_scale : float or torch.Tensor
+        Scale applied to the attention output, independently using a host float
+        or a CUDA FP32 (1,) buffer with finite positive values.
     out_dtype : torch.dtype, optional
         Output dtype; defaults to ``out.dtype`` when ``out`` is provided,
         otherwise the query dtype.
@@ -3745,8 +3769,8 @@ def batch_prefill_with_paged_kv_cache(
     kv_layout: Literal["HND", "NHD"] = "HND",
     mask_type: Literal["dense", "causal"] = "dense",
     window_left: int = -1,
-    softmax_scale: Optional[float] = None,
-    output_scale: float = 1.0,
+    softmax_scale: Optional[GlobalScale] = None,
+    output_scale: GlobalScale = 1.0,
     out_dtype: Optional[torch.dtype] = None,
     out: Optional[torch.Tensor] = None,
     lse: Optional[torch.Tensor] = None,
@@ -3792,10 +3816,13 @@ def batch_prefill_with_paged_kv_cache(
         Attention mask mode.
     window_left : int
         Left sliding-window extent, or ``-1`` to disable the window.
-    softmax_scale : float, optional
-        Softmax scale; defaults to the inverse square root of head size.
-    output_scale : float
-        Scale applied to the attention output.
+    softmax_scale : float or torch.Tensor, optional
+        Softmax scale in natural-exponential units; defaults to the inverse
+        square root of head size. Tensor scales are contiguous CUDA FP32 (1,)
+        buffers on Q's device, with finite positive values.
+    output_scale : float or torch.Tensor
+        Scale applied to the attention output, independently using a host float
+        or a CUDA FP32 (1,) buffer with finite positive values.
     out_dtype : torch.dtype, optional
         Output dtype; defaults to ``out.dtype`` when ``out`` is provided,
         otherwise the query dtype.

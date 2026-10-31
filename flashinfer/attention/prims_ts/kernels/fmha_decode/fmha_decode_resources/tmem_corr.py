@@ -960,7 +960,7 @@ class TmemCorrResource(DecodeGenResourceBase):
     ) -> Float32 | None:
         """Dequantize ``count`` output columns per V channel in place.
 
-        Column ``c`` becomes ``value * norm_scale * sfV[c] + v_mean[c]``, read
+        Column ``c`` becomes ``value * norm_scale * sfV[c] + output_scale * v_mean[c]``, read
         from the work tile's staged ``SageVScalesResource`` block, so the
         normalization is consumed here and the caller continues with the unit
         scale. A row without mass has no V contribution and keeps a zero
@@ -975,6 +975,8 @@ class TmemCorrResource(DecodeGenResourceBase):
             self._sage_v_scales, first_col=first_col, count=count
         )
         if cutlass.const_expr(cfg.sage_v_mean):
+            for value_idx in cutlass.range_constexpr(count):
+                v_means[value_idx] *= self.output_scale
             if not row_has_mass:
                 for value_idx in cutlass.range_constexpr(count):
                     v_means[value_idx] = Float32(0.0)

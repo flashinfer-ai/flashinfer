@@ -47,8 +47,9 @@ current tensors/metadata and launches the prepared execution.
 
 The contiguous plan fixes `packed` (BSHD or THD); paged plans also fix page size
 and optional `uniform_packed_lengths`, `has_q_offset`, and zero-V-tail promises.
-Plans retain host scalar defaults without device scale tensors. Variable-window
-plans allocate fallback CTA-minimum metadata; paged plans need no scratch.
+Plans retain float or CUDA tensor defaults for each global scale independently.
+Variable-window plans allocate fallback CTA-minimum metadata; paged plans need
+no scratch.
 Validation can read metadata values on the host. Trusted/captured execution uses
 `validate=False` and stable addresses, with callers owning all preconditions.
 
@@ -156,9 +157,15 @@ for an active page indexes the physical cache.
 For request `b`, bottom-right causal row `i` can see through
 `Sk[b] - Sq[b] + i`. With `window_left=W>0`, the row retains that key and at
 most `W` preceding keys. `softmax_scale` defaults to `1 / sqrt(Dqk)` and
-`output_scale` defaults to 1; supplied scales must be finite, positive, and
-representable as positive `float32` values. All scale inputs are finite positive host scalars; no device scale tensors
-are allocated or accepted.
+`output_scale` defaults to 1. Each independently accepts a Python number or a
+contiguous CUDA FP32 tensor of shape `(1,)`. Values must be positive and finite;
+tensor values are a caller obligation and are never read on the host. Planning
+infers types from these defaults; `run()` inherits omitted operands and accepts
+same-type overrides. The contract applies to contiguous, paged, Sage, and VC
+plans. VC's per-channel scale table remains a separate tensor and is composed
+with the global output multiplier on the GPU. See
+[global scale operands](../../README.md#global-scale-operands) for compilation
+and CUDA graph lifetimes.
 
 For packed contiguous attention, planning fixes model semantics. Every run supplies `qo_indptr` and `kv_indptr`; their
 values and packed tensor totals may change between runs while preserving the
@@ -387,7 +394,7 @@ runtime tensors alive until every graph using that plan is destroyed.
   tensors and the decode kernel's coverage are in
   [Sage attention](../../README.md#sage-attention).
 - Re-plan either wrapper after changing a static capacity, head or dtype
-  geometry, mask, window, or default scale; page size and explicit metadata
+  geometry, mask, window, or scale type; page size and explicit metadata
   promises are also static for paged plans. Request tensors and metadata may
   change between completed runs while remaining within the static plan and its
   promises.
