@@ -103,7 +103,8 @@ class CakeGroupedMm(torch.autograd.Function):
     :func:`cake_grouped_mm` the forward GEMM runs after autograd saved ``x``,
     ``w`` and ``offs``, so a checkpoint's early stop can skip it; a direct
     ``CakeGroupedMm.apply(x, w, offs, False)`` launches inside ``forward``
-    and a checkpoint always recomputes it.
+    and a checkpoint always recomputes it, as does the wrapper under
+    ``torch.jit.trace`` and ``torch.compile``.
     """
 
     @staticmethod
@@ -190,8 +191,9 @@ def cake_grouped_mm(
     _require_deterministic_false(deterministic, "cake_grouped_mm")
     if x.dtype != torch.bfloat16 or w.dtype != torch.bfloat16:
         raise ValueError(f"x and w must be bfloat16 (got {x.dtype} and {w.dtype})")
-    if torch.jit.is_tracing():
-        # A trace records ``apply`` only; keep the launch inside ``forward``.
+    if torch.jit.is_tracing() or torch.compiler.is_compiling():
+        # A trace records ``apply`` only, and Dynamo cannot lift the deferred
+        # launch out of a checkpointed region: keep the launch inside ``forward``.
         return CakeGroupedMm.apply(x, w, offs, deterministic)
     # ``apply`` saves x, w and offs; a checkpoint recomputation may stop inside it.
     y = CakeGroupedMm.apply(x, w, offs, deterministic, _DEFER_FWD)

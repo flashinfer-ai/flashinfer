@@ -2037,7 +2037,9 @@ def test_wrapper_under_jit_trace(monkeypatch):
 def test_wrapper_under_torch_compile(backend):
     """``torch.compile`` (``backend``) of a non-reentrant checkpointed region through the
     wrapper gives the bits of the eager checkpointed step (``Y``, ``dX``, ``dW`` of the
-    256-wide k tile).  Where the compiled step raises, the control arm (direct ``apply``)
+    256-wide k tile); under Dynamo the wrapper keeps the launch inside ``forward``
+    (Dynamo cannot lift the deferred launch out of the checkpointed region).  Where the
+    compiled step raises, the control arm (direct ``apply``)
     must raise the same exception type, and the case is skipped with that failure as the
     reason (a limit the wrapper did not introduce); a failure of the wrapper alone fails."""
     import torch._dynamo
