@@ -565,7 +565,10 @@ def _workspace_views(
 # Default workspaces of the convenience path (``workspace=None``): one buffer
 # per (device, kind, power-of-two token bucket), allocated on first use, so a
 # caller that passes no workspace allocates at most log2(T_max) buffers per
-# device while the caller-held path never allocates.
+# device while the caller-held path never allocates.  Every stream and every
+# graph replay on the device shares a bucket's buffer: calls that can run
+# concurrently on different streams pass caller-owned workspaces.  No buffer is
+# created during a CUDA graph capture (its zero fill would only be recorded).
 _DEFAULT_WORKSPACES: dict[tuple[int, str, int], torch.Tensor] = {}
 
 
@@ -574,6 +577,16 @@ def _default_workspace(kind: str, rows: int, device: torch.device) -> torch.Tens
     key = (_device_index(device), kind, bucket)
     found = _DEFAULT_WORKSPACES.get(key)
     if found is None:
+        # The fill runs on the current stream of ``device`` (the stream the
+        # call launches on), which need not be the current device's stream.
+        with torch.cuda.device(key[0]):
+            capturing = torch.cuda.is_current_stream_capturing()
+        if capturing:
+            raise ValueError(
+                f"no default {kind} workspace exists for T={rows} (token-count bucket {bucket}) and none can "
+                "be allocated during a CUDA graph capture: run the call once with deterministic=False and the "
+                "same token count before the capture, or pass a caller-owned workspace"
+            )
         found = torch.zeros(
             _workspace_bytes(kind, bucket, device), dtype=torch.uint8, device=device
         )

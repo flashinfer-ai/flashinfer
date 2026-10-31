@@ -8,14 +8,17 @@ int32 ``context_lens [B, next_n]`` (the schedule is sized from each request's
 last token, every token masks with its own length) and an int32 ``block_table
 [B, S]`` with unit column stride.
 
-A call is a real TWO-kernel sequence: the single-warp scheduler writes
+A call is a real TWO-kernel sequence: the static scheduler writes
 ``schedule_meta [num_sms + 1, 2]`` and the persistent logits program walks the
-half-open ``(q_atom, kv_split)`` range it finds there.  Both kernels arrive as
-ONE generated prepared-sequence binding, so ``plan.run()`` is a single FFI
-submission with the per-stage programmatic-dependent-launch attributes intact.
-``get_paged_mqa_logits_metadata`` launches the scheduler alone through its own
-standalone program, so it returns a real schedule (unlike the SM100 dense
-family's placeholder).
+half-open ``(q_atom, kv_split)`` range it finds there.  The scheduler is the
+single-warp one, or, on a device route whose tag ends in ``par``, its
+CTA-parallel version, which writes the same ``schedule_meta`` bit for bit.
+Both kernels arrive as ONE generated prepared-sequence binding, so
+``plan.run()`` is a single FFI submission with the per-stage
+programmatic-dependent-launch attributes intact.
+``get_paged_mqa_logits_metadata`` launches the single-warp scheduler alone
+through its own standalone program, so it returns a real schedule (unlike the
+SM100 dense family's placeholder).
 
 Routes are selected from host-known scalars only: head count, page size,
 ``next_n``, the batch (``context_lens.shape[0]``) and the optional
