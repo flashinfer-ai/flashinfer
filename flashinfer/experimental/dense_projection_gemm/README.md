@@ -20,49 +20,78 @@ Every entry point of `cake_backend` takes the keyword-only `deterministic: bool 
 | call | runs |
 |---|---|
 | `deterministic=True` (default) | the deterministic package's canonical entry point with the same arguments: the same programs, the same bits, the same errors |
-| `deterministic=False` | this package's programs on the rows their planners take (below); the deterministic programs for every other row and operation |
+| `deterministic=False` | this package's programs on the rows that carry a measured verdict for the device (below); the deterministic programs for every other row and operation |
 | `deterministic=False` under `torch.use_deterministic_algorithms(True)` | `RuntimeError`; with `warn_only=True` a `UserWarning` and the deterministic path |
 
-*Table: what a call runs, by its `deterministic` argument.*
+*Table: what a call runs, by its `deterministic` argument.  The default does not read PyTorch's setting: it is
+deterministic already.*
 
 | operation | `deterministic=False` |
 |---|---|
 | K1 forward (`projection_forward`, `kk` layouts) | deterministic program (whole output tiles; a recomputed forward reproduces its result) |
 | K1 input gradient (`projection_dgrad`, `kn` layouts) | deterministic program (whole output tiles) |
-| K1 weight gradient (`projection_wgrad`, `nn` layouts) | split-K over the ragged token count (`k1_plan`): every split writes its FP32 partial tile to a workspace slot; the last split of a tile to arrive (a per-tile ticket counter) adds the other slots in arrival order and rounds once into `out`, then returns the counter to zero |
-| K2 forward (`router_forward`, `kk`) | stream-K over the K blocks (`router_units`): whole tiles store the one-split result, tiles split between two units TMA reduce-add into `out` (zeroed before the program, on the same stream); at most two partials per element, so the result repeats bit for bit (`0 + a + b == 0 + b + a`) and recomputed router logits and top-k match |
+| K1 weight gradient (`projection_wgrad`, `nn` layouts) | the rows of `K1_SPLIT_RULES`: split-K over the ragged token count -- every split writes its FP32 partial tile to a workspace slot; the last split of a tile to arrive (a per-tile ticket counter) adds the other slots in arrival order and rounds once into `out`, then returns the counter to zero.  Every other row: deterministic program |
+| K2 forward (`router_forward`, `kk`) | deterministic program (its four splits) on every row; an explicit `splits` of 1 or 2 runs this package's stream-K program (at most two partials per element) |
 | K2 input gradient (`router_dgrad`, `kn`) | deterministic program (one split) |
-| K2 weight gradient (`router_wgrad`, `nn_t`) | stream-K as the forward, any number of partials per element (`router_units`) |
+| K2 weight gradient (`router_wgrad`, `nn_t`) | the rows of `ROUTER_RULES` with a partition: stream-K over the K blocks -- whole tiles store the one-split result, tiles split between units TMA reduce-add into `out` (zeroed before the program, on the same stream).  Every other row: deterministic program (its six splits) |
 | BF16x3 split (`split_fp32_to_bf16x3_`) | the deterministic stage (exact) |
 
 *Table: the routing of `deterministic=False` (`cake_backend.ROUTES`).*
 
-Run to run, the K1 weight gradient with two splits and the K2 forward repeat bit for bit (two partials per
-element); a K1 plan with three or more splits and the K2 weight gradient vary in the last bits.  Every result stays
-within the deterministic package's accuracy budgets.
+## Numerics, architectures and parallelism
+
+| property | contract |
+|---|---|
+| operands and accumulation | BF16 operands with FP32 accumulation (K1); FP32 operands split exactly into three BF16 terms with FP32 accumulation (K2).  No silent TF32 or BF16 for the router |
+| accuracy | the deterministic package's budgets against FP64 of the exact operands, worst over repeated runs: BF16 out `atol = rtol = 1e-2`; FP32 out relative Frobenius error `<= 5e-5` and max error `<= 1e-3 * max abs(ref)`; router `<= 2e-6` relative Frobenius error and no row whose top-8 experts differ from FP64 (outside near ties of the 8th and 9th logits) |
+| rounding | each output element is rounded once, from its complete FP32 sum |
+| subnormals | kept: K1 adds the partials with IEEE round-to-nearest adds, K2 reduces with the TMA reduce-add; nothing flushes to zero |
+| run-to-run bits, K1 | two splits (every `sm_100a` and `sm_103a` row, `sm_107a` `8192 -> 128`): repeat bit for bit (one add of two values); one split (`sm_107a` rows marked `p = 1` below): repeat bit for bit (whole tiles); three or four splits (the other `sm_107a` rows): vary in the last bits |
+| run-to-run bits, K2 | forward: the deterministic program's bits; weight gradient on a `ROUTER_RULES` partition: varies in the last bits (more than two partials per element); with an explicit forward `splits` of 1 or 2: repeats bit for bit (`0 + a + b == 0 + b + a`), so recomputed router logits and top-k match |
+| architectures | `sm_100a`, `sm_103a`, `sm_107a`: one `-gencode=arch=compute_<arch>,code=sm_<arch>` build per program, minimum CUDA 12.8 / 12.9 / 13.4 (`build.json`) |
+| streams and threads | planning takes a module lock; the convenience path keeps one workspace arena per (device, stream); prepared launches own their workspace |
+| CUDA graphs | prepared launches allocate nothing on the device and capture into a CUDA graph (K2: the split, the memset of `out`, the program); no host synchronization |
+| other kernels on the device | the programs walk their work persistently over at most `sm_count // 2` CTA pairs and wait on no CTA that is not resident; every routed row was measured next to a kernel holding 8, 16 or 32 SMs on another stream (no more than 3 % slower than the deterministic plan there) |
+| context parallelism (KCP) | not applicable: a local operator on the caller's CP-local shards; no collectives; the reduction of parameter gradients across ranks stays with the caller |
+| autograd, checkpointing, gradient accumulation | none in either package: callers compose the forward and both gradients; `out` is overwritten, not accumulated into |
+
+*Table: the numerical, architecture and parallelism matrix of `deterministic=False`.*
 
 ## Planners and rule tables
 
 A planner decides, per row and device, whether `deterministic=False` runs this package's program and with which
 parameters; a row it leaves runs the deterministic program (`plan_dense_projection_gemm` /
-`plan_router_fp32_gemm` say which).
+`plan_router_fp32_gemm` say which).  Only measured rows carry a program: a row runs this package's program where
+that program was faster than the deterministic package's shipped plan of the row in a one-sided paired sign test
+(p < 0.05) with a median time ratio below 0.99, both in eager launches and in CUDA graph replays, at token counts
+16172 to 16384, and no more than 3 % slower than that plan next to a kernel holding 8, 16 or 32 SMs on another
+stream.  A `None` entry is a measured row that missed; a row without an entry was not measured.  Both run the
+deterministic program.
 
 | table | key | value |
 |---|---|---|
 | `K1_SPLIT_RULES` | `(arch, L, M, N, out_dtype)`: the transposed-store launch `out[l, n, m]` (`M` = the stored inner extent, `d_in` of a weight gradient; `N` = its rows, `d_out`), `out_dtype` `"bf16"` / `"f32"` | `(block_n, num_splits)` (this package's program) or `None` (the deterministic program) |
-| `K1_MIN_SM_COUNT` | `arch` | the fewest SMs for this package's K1 programs (`sm_107a`: 216) |
-| `ROUTER_RULES` | `(arch, layout, hidden, experts)`: `layout` `"kk"` (forward, `hidden = K`) or `"nn_t"` (weight gradient, `hidden` = the launch's `M`), `experts` = the launch's `N` | a partition spec (`"forward"`, `"pairs"`, `"tiles"`, `"S<n>"` or a unit count) or `None` (the deterministic program) |
+| `K1_MIN_SM_COUNT` | `arch` | the fewest SMs for the K1 verdicts of the architecture (`sm_100a` / `sm_103a`: 148, `sm_107a`: 216) |
+| `ROUTER_RULES` | `(arch, layout, hidden, experts)`: `layout` `"kk"` (forward, `hidden = K`) or `"nn_t"` (weight gradient, `hidden` = the launch's `M`), `experts` = the launch's `N` | a partition spec (`"waves"`, `"forward"`, `"pairs"`, `"tiles"`, `"S<n>"` or a unit count) or `None` (the deterministic program) |
 
-*Table: the rule tables (empty as shipped; an entry replaces the planner for its row).*
+*Table: the rule tables.*
 
-| architecture | K1 weight gradient | K2 forward | K2 weight gradient |
+| architecture | K1 weight gradient `d_in -> d_out` (`block_n`, `num_splits`), BF16 and FP32 out unless marked | K2 forward | K2 weight gradient |
 |---|---|---|---|
-| `sm_100a` | `d_out <= 128`, `d_in <= 6144`, `L == 1` and `2 * ceil(d_in / 256) * ceil(d_out / 64) <= sm_count // 2`: `(64, 2)` | one unit per CTA pair, at most one per tile | one unit per CTA pair; `hidden >= 6144`: deterministic program |
-| `sm_103a` | `d_out <= 128`, `d_in <= 6144`, `L == 1`: two splits of 64-wide tiles (`d_out <= 64` or when they fit one wave of CTA pairs) else of 128-wide tiles, if they fit one wave | as `sm_100a` | one unit per CTA pair |
-| `sm_107a` | `K1_SM107A_TABLE` (22 measured `(d_in, d_out, out_dtype)` rows), `sm_count >= 216` only | as `sm_100a` | one unit per CTA pair |
+| `sm_100a` (>= 148 SMs) | `4096 -> 32, 48, 64`; `5120 -> 32, 48, 64`; `6144 -> 32`: (64, 2).  `4096 -> 128`: deterministic (measured, missed) | deterministic (4 splits) | hidden 5120, 256 experts: `"waves"`; hidden 4096 / 6144: deterministic (6 splits) |
+| `sm_103a` (>= 148 SMs) | `4096 -> 32, 48, 64`; `5120 -> 32, 48, 64`; `6144 -> 32`: (64, 2); `5120 -> 128`, `6144 -> 128`: (128, 2).  `4096 -> 128`: deterministic (measured, missed) | deterministic (4 splits) | hidden 5120, 256 experts: `"waves"`; hidden 4096 / 6144: deterministic (6 splits) |
+| `sm_107a` (>= 216 SMs) | `4096 -> 32` BF16 (64, 4), FP32 (64, 3); `4096 -> 48` FP32 (64, 3); `4096 -> 64` BF16 (64, 4), FP32 (64, 3); `5120 -> 32` (64, 3); `5120 -> 48`, `5120 -> 64` FP32 (64, 3); `6144 -> 32` (64, 3); `8192 -> 128` (128, 2); `4096 -> 512` BF16 (256, 3), FP32 (128, 1) `p = 1`; `5120 -> 512` FP32 (128, 1) `p = 1`; `4096 -> 1024` FP32 (256, 1) `p = 1`; `5120 -> 1024` (256, 1) `p = 1`; `4096 -> 4096` FP32 (128, 1) `p = 1`.  `4096 -> 128`: deterministic (measured, missed) | deterministic (4 splits) | hidden 5120, 256 experts: `"waves"`; hidden 4096 / 6144: deterministic (6 splits) |
 
-*Table: the planners (`K1_PLANNERS`, `router_default_spec`).  Every K1 choice also needs `num_splits * 64 <=
+*Table: the rows that run this package's programs.  `4096 -> 128` misses on `sm_100a` / `sm_103a` next to a kernel
+holding 32 SMs (its 128 CTAs no longer fit the free SMs) and on `sm_107a` at 16384 tokens.  The `sm_107a` one-split
+rows store whole tiles: they win where the deterministic package's `sm_107a` program of the row is slower.  Every K1 choice also needs `num_splits * 64 <=
 T + 63` (shorter token counts run the deterministic program).*
+
+`"waves"` (`router_waves`) launches whole waves of the device's CTA pairs (`pairs = sm_count // 2`): `c * pairs`
+units with `c = max(2, round(tiles * k_iters / (68 * pairs))) + 1`, and only where the deterministic plan's six
+splits fill their last wave below 80 % (`w / ceil(w)`, `w = 6 * tiles / pairs`); otherwise the row runs the
+deterministic program.  At hidden 5120 and 16k tokens that is 380 units on 152 SMs and 432 on 216 SMs; on 148 SMs
+the deterministic plan's last wave is 81 % full and the row runs the deterministic program.
 
 `prepare_*` and `plan_*` take `splits` (and, for K1, `block_n`) to force a plan, for tests and measurements; the K2
 forward takes at most two splits.  `benchmarks/bench_cake_dense_projection_gemm.py` prints, per row, the
@@ -84,17 +113,34 @@ arguments are converted once), so a call issues its launches back to back.
 `benchmarks/bench_cake_dense_projection_gemm.py` times every row of the deterministic family's benchmark with the arms
 `det` (the deterministic package's prepared launch), `atomic` (`deterministic=False`), `atomic_p1` (the same
 program at one split), `cublas` (`torch.matmul`), `cublaslt` (a cuBLASLt heuristic sweep) and `bf16x9` (cuBLAS FP32
-in `CUBLAS_FP32_EMULATED_BF16X9_MATH`, the router rows), in paired groups, eager and in CUDA graphs.
+in `CUBLAS_FP32_EMULATED_BF16X9_MATH`, the router rows), in paired groups, eager and in CUDA graphs; `--resident`
+re-times `det` and `atomic` next to a kernel holding `--resident-sms` SMs on another stream.
 
 ## Names
 
 This import path held the dense projection GEMM package until #8046 renamed it to `dense_projection_det_gemm`; #8046
 left it as an alias of the renamed modules.  The names keep their spelling and, with the default, their behavior:
 
+| name before #8046 (`dense_projection_gemm.cake_backend`) | deterministic package (`dense_projection_det_gemm.cake_backend`) | this path |
+|---|---|---|
+| `dense_projection_gemm` | `dense_projection_det_gemm` | `dense_projection_gemm(..., deterministic=True)` |
+| `projection_forward`, `projection_dgrad`, `projection_wgrad` | `projection_det_forward`, `projection_det_dgrad`, `projection_det_wgrad` | the same names with `deterministic=` |
+| `prepare_dense_projection_gemm`, `prepare_projection_wgrad` | `prepare_dense_projection_det_gemm`, `prepare_projection_det_wgrad` | the same names with `deterministic=` |
+| `plan_dense_projection_gemm` | `plan_dense_projection_det_gemm` | the same name with `deterministic=` |
+| `router_fp32_gemm`, `router_forward`, `router_dgrad`, `router_wgrad` | `router_fp32_det_gemm`, `router_det_forward`, `router_det_dgrad`, `router_det_wgrad` | the same names with `deterministic=` |
+| `prepare_router_fp32_gemm`, `plan_router_fp32_gemm` | `prepare_router_fp32_det_gemm`, `plan_router_fp32_det_gemm` | the same names with `deterministic=` |
+| `split_fp32_to_bf16x3_` | `split_fp32_to_bf16x3_det_` | the same name with `deterministic=` (the deterministic stage in both modes) |
+| `instance_symbol`, `router_symbol` | `instance_symbol`, `router_symbol` | the same names with `deterministic=` |
+| `GemmPlan`, `PreparedGemm` | `DetGemmPlan`, `PreparedDetGemm` | read through; `deterministic=False` plans `AtomicGemmPlan`, `PreparedAtomicGemm` |
+| `RouterPlan`, `PreparedRouterGemm` | `RouterDetPlan`, `PreparedRouterDetGemm` | read through; `deterministic=False` plans `AtomicRouterPlan`, `PreparedAtomicRouterGemm` |
+| every other module name (`ROW_RULES`, `stream_k_plan`, `wgrad_views`, ...) | the same name | read through to the deterministic package |
+| program templates `dense_proj_gemm_*`, `router_fp32_gemm_<layout>`, `split_fp32_bf16x3` | `dense_proj_det_gemm_*`, `router_fp32_det_gemm_<layout>`, `split_fp32_det_bf16x3` | this package's templates are new: `dense_proj_gemm_atomic_nn_n<64\|128\|256>[_f32]_t`, `router_fp32_gemm_atomic_{kk,nn_t}` |
+
+*Table: the names before #8046, their deterministic names, and what this path offers (`cake_backend.DETERMINISTIC_NAMES`).*
+
 | name (`flashinfer.experimental.dense_projection_gemm`) | default | `deterministic=False` |
 |---|---|---|
-| `cake_backend.{dense_projection_gemm, projection_forward, projection_dgrad, projection_wgrad, prepare_dense_projection_gemm, prepare_projection_wgrad, plan_dense_projection_gemm, router_fp32_gemm, router_forward, router_dgrad, router_wgrad, prepare_router_fp32_gemm, plan_router_fp32_gemm, split_fp32_to_bf16x3_, instance_symbol, router_symbol}` | the deterministic package's `*_det_*` object (`cake_backend.DETERMINISTIC_NAMES`) | this package's schedule (table above) |
-| `cake_backend.{GemmPlan, PreparedGemm, RouterPlan, PreparedRouterGemm}` and every other name of the module before #8046 (`ROW_RULES`, `stream_k_plan`, `wgrad_views`, ...) | read through to the deterministic package | -- |
+| the entry points of the table above | the deterministic package's `*_det_*` object | this package's schedule (routing table above) |
 | `cake_backend.clear_convenience_caches` | clears the caches and arenas of both packages | -- |
 | `cake_jit.{MODULES, KERNELS, ARG_PLANS}` | this package's programs only | -- |
 | `cake_jit.select_module`, `cake_jit.load_cake_dense_projection_gemm_module` | a deterministic template or program resolves through the deterministic package | -- |

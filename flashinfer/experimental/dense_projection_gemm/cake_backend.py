@@ -37,14 +37,16 @@ Every entry point takes the keyword-only argument ``deterministic: bool = True``
     ``out[l, n, m]``: each of ``L x m_tiles x n_tiles`` tiles is cut into ``num_splits`` K ranges; every split stores
     its FP32 partial into its own workspace slot and takes a ticket, and the split that draws the last ticket adds
     the other ``num_splits - 1`` partials with IEEE round-to-nearest adds, rounds once and stores (:func:`k1_plan`
-    chooses the tile width and the split count; a row it does not take runs the deterministic program).  Two splits
-    add ``own + other``, one add of two values, so a two-split row repeats bit for bit; three or more add in the
-    order the splits finish;
-  - the K2 forward and weight gradient: a stream-K partition of the (tile, K block) steps into ``units`` spans
-    (:func:`router_units`); a segment that covers its tile's whole K range stores the deterministic program's
-    one-split bits, any other adds its partial into ``out`` with a TMA reduce-add (``out`` is zeroed on the launch's
-    stream first).  The forward's partition gives every element at most two partials, ``0 + a + b == 0 + b + a``, so a
-    forward recomputed under activation checkpointing gives the same logits and the same top-k.
+    reads the tile width and the split count from the measured verdicts of :data:`K1_SPLIT_RULES`; every other row
+    runs the deterministic program).  Two splits add ``own + other``, one add of two values, so a two-split row
+    repeats bit for bit; three or more add in the order the splits finish;
+  - the K2 weight gradient (and a forward given an explicit split count): a stream-K partition of the (tile, K
+    block) steps into ``units`` spans (:func:`router_units` reads the measured verdicts of :data:`ROUTER_RULES`;
+    every other row runs the deterministic program); a segment that covers its tile's whole K range stores the
+    deterministic program's one-split bits, any other adds its partial into ``out`` with a TMA reduce-add (``out``
+    is zeroed on the launch's stream first).  A forward partition gives every element at most two partials,
+    ``0 + a + b == 0 + b + a``, so a forward recomputed under activation checkpointing gives the same logits and the
+    same top-k.
 
   Every other operation -- the K1 forward and input gradient, the K2 input gradient, the BF16x3 split -- runs the
   deterministic programs in both modes: it has no cross-CTA reduction to relax.
@@ -67,6 +69,7 @@ deterministic package (module ``__getattr__``); assigning one here does not chan
 
 from __future__ import annotations
 
+import math
 import re
 import threading
 import warnings
@@ -180,16 +183,16 @@ def _resolve_deterministic(deterministic: bool, api: str) -> bool:
 # ---------------------------------------------------------------------------
 
 #: The program family each operation runs with ``deterministic=False``: ``"atomic"`` -- this package's planner and
-#: programs (the planner may still keep a row on the deterministic program, see :func:`k1_plan` /
-#: :func:`router_units`) -- or ``"det"`` -- the deterministic package's programs in both modes.  K1 operations are
-#: keyed by the operand layouts of the launched GEMM (``kk`` forward, ``kn`` input gradient, ``nn`` weight gradient;
-#: ``nk`` has no training use), K2 by the layout class of ``router_layout_class``.
+#: programs (the planner keeps every row without a measured verdict on the deterministic program, see
+#: :func:`k1_plan` / :func:`router_units`) -- or ``"det"`` -- the deterministic package's programs in both modes.  K1
+#: operations are keyed by the operand layouts of the launched GEMM (``kk`` forward, ``kn`` input gradient, ``nn``
+#: weight gradient; ``nk`` has no training use), K2 by the layout class of ``router_layout_class``.
 ROUTES: dict[str, str] = {
     "k1_kk": "det",  # forward: no cross-CTA reduction (whole output tiles); feeds the recompute of checkpointing
     "k1_kn": "det",  # input gradient: whole output tiles
     "k1_nk": "det",
     "k1_nn": "atomic",  # weight gradient: split-K over the ragged token count
-    "k2_kk": "atomic",  # router forward: at most two partials per element (reproducible)
+    "k2_kk": "atomic",  # router forward: no verdict ships (deterministic plan); an explicit split count <= 2 runs it
     "k2_kn": "det",  # router input gradient: one split
     "k2_nn_t": "atomic",  # router weight gradient: stream-K over the token count
     "split": "det",  # the exact BF16x3 split of the router's second operand
@@ -242,7 +245,7 @@ K1_COUNTER_WORDS = 512  # ticket words per K1 tile: 16 epilogue warp slices x 32
 K1_BLOCK_N_CHOICES = (64, 128, 256)
 
 # ---------------------------------------------------------------------------
-# K1 planner: the rule table and the per-architecture planners
+# K1 planner: the measured verdicts
 # ---------------------------------------------------------------------------
 #
 # A K1 launch of this package is the transposed-store GEMM ``out[l, n, m] = sum_k A[l, k, m] B[l, k, n]``: ``M`` is
@@ -251,89 +254,57 @@ K1_BLOCK_N_CHOICES = (64, 128, 256)
 
 #: Per-row verdicts of the K1 weight gradient, ``(arch, L, M, N, out_dtype) -> (block_n, num_splits)`` (this
 #: package's program with that tile width and split count) or ``-> None`` (the deterministic program); ``M`` / ``N``
-#: as above, ``out_dtype`` ``"bf16"`` or ``"f32"``.  A verdict replaces the architecture's planner
-#: (:data:`K1_PLANNERS`) for its row; a row without one takes the planner.  The table ships empty: the planners hold
-#: the measured choices.
-K1_SPLIT_RULES: dict[tuple[str, int, int, int, str], Optional[tuple[int, int]]] = {}
-#: The fewest SMs a device of the architecture needs for this package's K1 programs (the verdicts and the planner);
-#: a device with fewer runs every K1 row on the deterministic program.  The sm_107a table was measured on 216-SM parts.
-K1_MIN_SM_COUNT: dict[str, int] = {"sm_107a": 216}
-#: The sm_107a planner, ``(M, N, out_dtype) -> (block_n, num_splits)`` for ``L == 1``: the measured winners at
-#: ``T`` near 16k.  The ``num_splits == 1`` rows store whole tiles (one rounding, deterministic): they win on the FP32
-#: rows where the deterministic package's sm_107a program is slower.
-K1_SM107A_TABLE: dict[tuple[int, int, str], tuple[int, int]] = {
-    (4096, 32, "bf16"): (64, 4),
-    (4096, 64, "bf16"): (64, 4),
-    (4096, 128, "bf16"): (64, 3),
-    (5120, 32, "bf16"): (64, 3),
-    (6144, 32, "bf16"): (64, 3),
-    (8192, 128, "bf16"): (128, 2),
-    (4096, 512, "bf16"): (256, 3),
-    (5120, 1024, "bf16"): (256, 1),
-    (4096, 32, "f32"): (64, 3),
-    (4096, 48, "f32"): (64, 3),
-    (4096, 64, "f32"): (64, 3),
-    (4096, 128, "f32"): (64, 3),
-    (5120, 32, "f32"): (64, 3),
-    (5120, 48, "f32"): (64, 3),
-    (5120, 64, "f32"): (64, 3),
-    (6144, 32, "f32"): (64, 3),
-    (8192, 128, "f32"): (128, 2),
-    (4096, 512, "f32"): (128, 1),
-    (5120, 512, "f32"): (128, 1),
-    (4096, 1024, "f32"): (256, 1),
-    (5120, 1024, "f32"): (256, 1),
-    (4096, 4096, "f32"): (128, 1),
+#: as above, ``out_dtype`` ``"bf16"`` or ``"f32"``.  A row carries a program only where that program was measured
+#: faster than the deterministic package's shipped plan of the row: a one-sided paired sign test (p < 0.05) with a
+#: median time ratio below 0.99, in eager launches and in CUDA graph replays, at token counts 16172 to 16384, and no
+#: more than 3 % slower than that plan next to a kernel holding 8, 16 or 32 SMs on another stream.  A ``None`` entry
+#: is a measured row that missed; a row without an entry was not measured.  Both run the deterministic program.
+# fmt: off
+K1_SPLIT_RULES: dict[tuple[str, int, int, int, str], Optional[tuple[int, int]]] = {
+    # sm_100a: two splits of 64-wide tiles (one wave of the CTA pairs; two partials, bitwise reproducible).  d_out 128
+    # at d_in 4096 (128 CTAs) loses to the deterministic plan next to a kernel holding 32 SMs
+    ("sm_100a", 1, 4096, 32, "bf16"): (64, 2), ("sm_100a", 1, 4096, 32, "f32"): (64, 2),
+    ("sm_100a", 1, 4096, 48, "bf16"): (64, 2), ("sm_100a", 1, 4096, 48, "f32"): (64, 2),
+    ("sm_100a", 1, 4096, 64, "bf16"): (64, 2), ("sm_100a", 1, 4096, 64, "f32"): (64, 2),
+    ("sm_100a", 1, 4096, 128, "bf16"): None, ("sm_100a", 1, 4096, 128, "f32"): None,
+    ("sm_100a", 1, 5120, 32, "bf16"): (64, 2), ("sm_100a", 1, 5120, 32, "f32"): (64, 2),
+    ("sm_100a", 1, 5120, 48, "bf16"): (64, 2), ("sm_100a", 1, 5120, 48, "f32"): (64, 2),
+    ("sm_100a", 1, 5120, 64, "bf16"): (64, 2), ("sm_100a", 1, 5120, 64, "f32"): (64, 2),
+    ("sm_100a", 1, 6144, 32, "bf16"): (64, 2), ("sm_100a", 1, 6144, 32, "f32"): (64, 2),
+    # sm_103a: two splits of 64-wide tiles, of 128-wide tiles for d_out = 128 at d_in >= 5120 (one wave); d_out 128 at
+    # d_in 4096 as on sm_100a
+    ("sm_103a", 1, 4096, 32, "bf16"): (64, 2), ("sm_103a", 1, 4096, 32, "f32"): (64, 2),
+    ("sm_103a", 1, 4096, 48, "bf16"): (64, 2), ("sm_103a", 1, 4096, 48, "f32"): (64, 2),
+    ("sm_103a", 1, 4096, 64, "bf16"): (64, 2), ("sm_103a", 1, 4096, 64, "f32"): (64, 2),
+    ("sm_103a", 1, 4096, 128, "bf16"): None, ("sm_103a", 1, 4096, 128, "f32"): None,
+    ("sm_103a", 1, 5120, 32, "bf16"): (64, 2), ("sm_103a", 1, 5120, 32, "f32"): (64, 2),
+    ("sm_103a", 1, 5120, 48, "bf16"): (64, 2), ("sm_103a", 1, 5120, 48, "f32"): (64, 2),
+    ("sm_103a", 1, 5120, 64, "bf16"): (64, 2), ("sm_103a", 1, 5120, 64, "f32"): (64, 2),
+    ("sm_103a", 1, 5120, 128, "bf16"): (128, 2), ("sm_103a", 1, 5120, 128, "f32"): (128, 2),
+    ("sm_103a", 1, 6144, 32, "bf16"): (64, 2), ("sm_103a", 1, 6144, 32, "f32"): (64, 2),
+    ("sm_103a", 1, 6144, 128, "bf16"): (128, 2), ("sm_103a", 1, 6144, 128, "f32"): (128, 2),
+    # sm_107a (216 SMs): two to four splits; the one-split rows store whole tiles (deterministic) and win where the
+    # deterministic package's sm_107a program of the row is slower
+    ("sm_107a", 1, 4096, 32, "bf16"): (64, 4), ("sm_107a", 1, 4096, 32, "f32"): (64, 3),
+    ("sm_107a", 1, 4096, 48, "f32"): (64, 3),
+    ("sm_107a", 1, 4096, 64, "bf16"): (64, 4), ("sm_107a", 1, 4096, 64, "f32"): (64, 3),
+    ("sm_107a", 1, 4096, 128, "bf16"): None, ("sm_107a", 1, 4096, 128, "f32"): None,
+    ("sm_107a", 1, 4096, 512, "bf16"): (256, 3), ("sm_107a", 1, 4096, 512, "f32"): (128, 1),
+    ("sm_107a", 1, 4096, 1024, "f32"): (256, 1),
+    ("sm_107a", 1, 4096, 4096, "f32"): (128, 1),
+    ("sm_107a", 1, 5120, 32, "bf16"): (64, 3), ("sm_107a", 1, 5120, 32, "f32"): (64, 3),
+    ("sm_107a", 1, 5120, 48, "f32"): (64, 3),
+    ("sm_107a", 1, 5120, 64, "f32"): (64, 3),
+    ("sm_107a", 1, 5120, 512, "f32"): (128, 1),
+    ("sm_107a", 1, 5120, 1024, "bf16"): (256, 1), ("sm_107a", 1, 5120, 1024, "f32"): (256, 1),
+    ("sm_107a", 1, 6144, 32, "bf16"): (64, 3), ("sm_107a", 1, 6144, 32, "f32"): (64, 3),
+    ("sm_107a", 1, 8192, 128, "bf16"): (128, 2), ("sm_107a", 1, 8192, 128, "f32"): (128, 2),
 }
-
-
-def _k1_tiles(L: int, M: int, N: int, block_n: int) -> int:
-    return int(L) * _ceil_div(M, K1_PAIR_ROWS) * _ceil_div(N, block_n)
-
-
-def _k1_planner_sm_100a(
-    *, L: int, M: int, N: int, out_f32: bool, sm_count: int
-) -> Optional[tuple[int, int]]:
-    """sm_100a: the thin weight gradients (``N <= 128``, ``M <= 6144``) whose two splits of 64-wide tiles fit one
-    wave of the CTA pairs run ``(64, 2)``; every other row runs the deterministic program."""
-    if L != 1 or N > 128 or M > 6144:
-        return None
-    if 2 * _k1_tiles(L, M, N, 64) > sm_count // 2:
-        return None
-    return 64, 2
-
-
-def _k1_planner_sm_103a(
-    *, L: int, M: int, N: int, out_f32: bool, sm_count: int
-) -> Optional[tuple[int, int]]:
-    """sm_103a: the thin weight gradients (``N <= 128``, ``M <= 6144``) run two splits, of 64-wide tiles when
-    ``N <= 64`` or when two splits of them fit one wave of the CTA pairs, else of 128-wide tiles, as long as two
-    splits of the chosen tiles fit one wave; every other row runs the deterministic program."""
-    if L != 1 or N > 128 or M > 6144:
-        return None
-    pairs = sm_count // 2
-    block_n = 64 if (N <= 64 or 2 * _k1_tiles(L, M, N, 64) <= pairs) else 128
-    if 2 * _k1_tiles(L, M, N, block_n) > pairs:
-        return None
-    return block_n, 2
-
-
-def _k1_planner_sm_107a(
-    *, L: int, M: int, N: int, out_f32: bool, sm_count: int
-) -> Optional[tuple[int, int]]:
-    """sm_107a: the rows of :data:`K1_SM107A_TABLE`; every other row runs the deterministic program."""
-    if L != 1:
-        return None
-    return K1_SM107A_TABLE.get((int(M), int(N), "f32" if out_f32 else "bf16"))
-
-
-#: The K1 planner of each architecture: ``planner(L=, M=, N=, out_f32=, sm_count=) -> (block_n, num_splits)`` or
-#: ``None`` (the deterministic program).  The planners read the device's CTA pairs as ``sm_count // 2``.
-K1_PLANNERS: dict[str, Callable[..., Optional[tuple[int, int]]]] = {
-    "sm_100a": _k1_planner_sm_100a,
-    "sm_103a": _k1_planner_sm_103a,
-    "sm_107a": _k1_planner_sm_107a,
-}
+# fmt: on
+#: The fewest SMs a device of the architecture needs for the verdicts of :data:`K1_SPLIT_RULES`; a device with fewer
+#: runs every K1 row on the deterministic program.  Every sm_100a / sm_103a verdict fits one wave of 74 CTA pairs; the
+#: sm_107a verdicts were measured on 216-SM parts.
+K1_MIN_SM_COUNT: dict[str, int] = {"sm_100a": 148, "sm_103a": 148, "sm_107a": 216}
 
 
 def k1_splits_fit(splits: int, K: int) -> bool:
@@ -354,27 +325,14 @@ def k1_plan(
 ) -> Optional[tuple[int, int]]:
     """``(block_n, num_splits)`` of this package's K1 program for the transposed-store launch ``out[l, n, m]``
     (``M``, ``N`` as in the comment above; ``K`` the token count) on a device of ``sm_count`` SMs, or ``None``: the
-    row runs the deterministic program.  The row's verdict in :data:`K1_SPLIT_RULES` first, else the architecture's
-    planner (:data:`K1_PLANNERS`); a device below :data:`K1_MIN_SM_COUNT` and a ``K`` too short for the split count
-    (:func:`k1_splits_fit`) run the deterministic program."""
+    row runs the deterministic program.  The row's verdict in :data:`K1_SPLIT_RULES`; a row without one, a device
+    below :data:`K1_MIN_SM_COUNT` and a ``K`` too short for the split count (:func:`k1_splits_fit`) run the
+    deterministic program."""
     if int(sm_count) < K1_MIN_SM_COUNT.get(arch, 0):
         return None
-    key = (arch, int(L), int(M), int(N), "f32" if out_f32 else "bf16")
-    if key in K1_SPLIT_RULES:
-        choice = K1_SPLIT_RULES[key]
-    else:
-        planner = K1_PLANNERS.get(arch)
-        choice = (
-            None
-            if planner is None
-            else planner(
-                L=int(L),
-                M=int(M),
-                N=int(N),
-                out_f32=bool(out_f32),
-                sm_count=int(sm_count),
-            )
-        )
+    choice = K1_SPLIT_RULES.get(
+        (arch, int(L), int(M), int(N), "f32" if out_f32 else "bf16")
+    )
     if choice is None:
         return None
     block_n, splits = (int(v) for v in choice)
@@ -623,21 +581,58 @@ def _k1_values(
 
 
 # ---------------------------------------------------------------------------
-# K2 planner: the stream-K partition and the rule table
+# K2 planner: the stream-K partition and the measured verdicts
 # ---------------------------------------------------------------------------
 
 #: Per-row verdicts of the router, ``(arch, layout, hidden, experts) -> spec``: ``layout`` ``"kk"`` (the forward,
 #: ``hidden = K``) or ``"nn_t"`` (the swapped weight gradient, ``hidden`` = the launch's ``M``), ``experts`` = the
-#: launch's ``N``.  A partition spec of :func:`router_units_of` (``"forward"``, ``"pairs"``, ``"tiles"``, ``"S<n>"``
-#: or a unit count) runs this package's program; ``None`` runs the deterministic program (its production split
-#: count).  A verdict replaces :func:`router_default_spec` for its row; the table ships empty.
-ROUTER_RULES: dict[tuple[str, str, int, int], Optional[Union[str, int]]] = {}
-#: The router weight gradient of these architectures runs the deterministic program from this hidden size up (its
-#: unit count matches the deterministic program's split work there, and the measured margin is within noise).
-ROUTER_WGRAD_DET_FROM: dict[str, int] = {"sm_100a": 6144}
+#: launch's ``N``.  A partition spec -- ``"waves"`` (:func:`router_waves`) or one of :func:`router_units_of`
+#: (``"forward"``, ``"pairs"``, ``"tiles"``, ``"S<n>"`` or a unit count) -- runs this package's program; ``None`` runs
+#: the deterministic program (its production split count).  A row carries a spec only where that partition was
+#: measured faster than the deterministic package's shipped plan: a one-sided paired sign test (p < 0.05) with a
+#: median time ratio below 0.99, in eager launches and in CUDA graph replays, at token counts 16172 and 16231, and no
+#: more than 3 % slower than that plan next to a kernel holding 8, 16 or 32 SMs on another stream.  A ``None`` entry
+#: is a measured row that missed; a row without an entry was not measured.  Both run the deterministic program.
+# fmt: off
+ROUTER_RULES: dict[tuple[str, str, int, int], Optional[Union[str, int]]] = {
+    # the forward: no partition replay-safe under recompute (at most two partials per element) holds its margin next
+    # to a resident kernel; the deterministic plan (four splits) on every architecture
+    ("sm_100a", "kk", 4096, 256): None, ("sm_100a", "kk", 5120, 256): None, ("sm_100a", "kk", 6144, 256): None,
+    ("sm_103a", "kk", 4096, 256): None, ("sm_103a", "kk", 5120, 256): None, ("sm_103a", "kk", 6144, 256): None,
+    ("sm_107a", "kk", 4096, 256): None, ("sm_107a", "kk", 5120, 256): None, ("sm_107a", "kk", 6144, 256): None,
+    # the weight gradient: the "waves" partition where the deterministic plan's last wave is sparse (hidden 5120);
+    # hidden 4096 and 6144 keep the deterministic plan (fuller waves: the margin does not survive a resident kernel)
+    ("sm_100a", "nn_t", 4096, 256): None, ("sm_100a", "nn_t", 5120, 256): "waves", ("sm_100a", "nn_t", 6144, 256): None,
+    ("sm_103a", "nn_t", 4096, 256): None, ("sm_103a", "nn_t", 5120, 256): "waves", ("sm_103a", "nn_t", 6144, 256): None,
+    ("sm_107a", "nn_t", 4096, 256): None, ("sm_107a", "nn_t", 5120, 256): "waves", ("sm_107a", "nn_t", 6144, 256): None,
+}
+# fmt: on
 #: The forward's largest explicit split count: an element of the forward takes at most two partials, so a forward
 #: recomputed under activation checkpointing repeats bit for bit (``0 + a + b == 0 + b + a``).
 ROUTER_FORWARD_MAX_SPLITS = 2
+#: The deterministic package's production split count of the router weight gradient (its ``ROUTER_SPLITS["nn_t"]``):
+#: the plan the ``"waves"`` partition is measured against.
+ROUTER_DET_WGRAD_SPLITS = 6
+#: The ``"waves"`` partition: about this many K blocks (32 elements each) of one tile per unit ...
+ROUTER_WAVE_K_BLOCKS = 68
+#: ... and only where the deterministic plan fills its last wave of CTA pairs below this fraction
+#: (``w / ceil(w)``, ``w = ROUTER_DET_WGRAD_SPLITS * tiles / pairs``).
+ROUTER_WAVE_MAX_DET_FILL = 0.8
+
+
+def router_waves(
+    m_pairs: int, n_tiles: int, k_iters: int, sm_count: int
+) -> Optional[int]:
+    """The ``"waves"`` unit count on a device of ``sm_count`` SMs (CTA pairs ``sm_count // 2``): whole waves of the
+    CTA pairs, ``c * pairs`` units with ``c = max(2, round(tiles * k_iters / (ROUTER_WAVE_K_BLOCKS * pairs))) + 1``
+    (spans of about ``ROUTER_WAVE_K_BLOCKS`` K blocks of a tile, one wave more, so a kernel holding SMs on another
+    stream delays a fine last wave rather than a coarse one), or ``None`` (the deterministic program) where the
+    deterministic plan's last wave is at least :data:`ROUTER_WAVE_MAX_DET_FILL` full."""
+    tiles, pairs = m_pairs * n_tiles, max(1, int(sm_count) // 2)
+    det_waves = ROUTER_DET_WGRAD_SPLITS * tiles / pairs
+    if det_waves / math.ceil(det_waves) >= ROUTER_WAVE_MAX_DET_FILL:
+        return None
+    return (max(2, round(tiles * k_iters / (ROUTER_WAVE_K_BLOCKS * pairs))) + 1) * pairs
 
 
 def router_units_of(
@@ -677,18 +672,6 @@ def router_at_most_two_partials(m_pairs: int, n_tiles: int, units: int) -> bool:
     return units <= tiles or units == 2 * tiles
 
 
-def router_default_spec(arch: str, layout: str, hidden: int) -> Optional[str]:
-    """The partition of a router row without a verdict: the forward (``kk``) ``"forward"``, the weight gradient
-    (``nn_t``) ``"pairs"``, or ``None`` (the deterministic program) from :data:`ROUTER_WGRAD_DET_FROM` up."""
-    if layout == "kk":
-        return "forward"
-    if layout == "nn_t":
-        if int(hidden) >= ROUTER_WGRAD_DET_FROM.get(arch, 1 << 62):
-            return None
-        return "pairs"
-    return None
-
-
 def _router_grid(M: int, N: int, K: int) -> tuple[int, int, int]:
     """``(m_tiles, n_tiles, k_iters)`` of a router launch: an even count of 128-row tiles (a CTA pair owns two
     adjacent ones), the 128-column tiles and the 32-element K blocks."""
@@ -715,7 +698,7 @@ def router_units(
     * a caller's ``splits``: ``splits`` units per tile (``1``: every tile stored whole, the deterministic program's
       one-split bits -- the control of a measurement); the forward takes at most
       :data:`ROUTER_FORWARD_MAX_SPLITS`.
-    * otherwise the row's verdict in :data:`ROUTER_RULES`, else :func:`router_default_spec`.
+    * otherwise the row's verdict in :data:`ROUTER_RULES`; a row without one runs the deterministic program.
 
     A forward partition must give every element at most two partials (:func:`router_at_most_two_partials`):
     ``ValueError`` otherwise."""
@@ -723,6 +706,7 @@ def router_units(
         return None
     m_tiles, n_tiles, k_iters = _router_grid(M, N, K)
     m_pairs = m_tiles // 2
+    spec: Optional[Union[str, int]]
     if splits is not None:
         s = int(splits)
         if not 1 <= s <= k_iters:
@@ -735,15 +719,12 @@ def router_units(
                 f"splits (more partials per element do not repeat bit for bit under recompute), got {s}; use "
                 "deterministic=True for more"
             )
-        spec: Optional[Union[str, int]] = f"S{s}"
+        spec = f"S{s}"
     else:
         hidden = K if layout == "kk" else M
-        key = (arch, layout, int(hidden), int(N))
-        spec = (
-            ROUTER_RULES[key]
-            if key in ROUTER_RULES
-            else router_default_spec(arch, layout, hidden)
-        )
+        spec = ROUTER_RULES.get((arch, layout, int(hidden), int(N)))
+        if spec == "waves":
+            spec = router_waves(m_pairs, n_tiles, k_iters, sm_count)
         if spec is None:
             return None
     units = router_units_of(spec, m_pairs, n_tiles, k_iters, sm_count)
@@ -1958,8 +1939,9 @@ def router_fp32_gemm(
     deterministic: bool = True,
 ) -> torch.Tensor:
     """``out[m, n] = sum_k A[m, k] B[k, n]`` for fp32 views through the BF16x3 emulation (the cached convenience
-    path).  ``deterministic=False`` runs the ``kk`` / ``nn_t`` classes on this package's stream-K program, whose
-    part tiles add into ``out`` in the order they finish, instead of the fixed-order split-K sum."""
+    path).  ``deterministic=False`` runs the ``kk`` / ``nn_t`` rows the planner takes (:func:`router_units`) on this
+    package's stream-K program, whose part tiles add into ``out`` in the order they finish, instead of the
+    fixed-order split-K sum; every other row runs the deterministic program."""
     det = _resolve_deterministic(deterministic, "router_fp32_gemm")
     return _router_gemm(A, B, out, splits, det)
 
@@ -1973,8 +1955,9 @@ def router_forward(
     deterministic: bool = True,
 ) -> torch.Tensor:
     """``out[T, N] = X[T, K] @ W[N, K].T`` in FP32 through the emulation; ``splits`` defaults to the deterministic
-    package's production count (4), or with ``deterministic=False`` to the forward partition of
-    :func:`router_units` (at most two partials per element: the logits repeat bit for bit)."""
+    package's production count (4).  With ``deterministic=False`` a row runs this package's program only with an
+    explicit ``splits`` (at most two partials per element: the logits repeat bit for bit) or a verdict of
+    :data:`ROUTER_RULES` (none ships for the forward), else the deterministic program."""
     if _resolve_deterministic(deterministic, "router_forward"):
         return _det_entry("router_forward")(X, W, out, **_splits_kw(splits))
     if out is None:
@@ -2005,7 +1988,8 @@ def router_wgrad(
 ) -> torch.Tensor:
     """``out[N, K] = G[T, N].T @ X[T, K]`` in FP32: the swapped GEMM ``X.T @ G`` with a transposed store;
     ``splits`` defaults to the deterministic package's production count (6), or with ``deterministic=False`` to the
-    weight-gradient partition of :func:`router_units`."""
+    partition of the row's verdict in :data:`ROUTER_RULES` (:func:`router_units`; a row without one runs the
+    deterministic program)."""
     if _resolve_deterministic(deterministic, "router_wgrad"):
         return _det_entry("router_wgrad")(G, X, out, **_splits_kw(splits))
     if out is None:
